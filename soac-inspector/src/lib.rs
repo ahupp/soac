@@ -232,7 +232,7 @@ fn lower_source_recorded(source: &str) -> Result<soac_blockpy::LoweringResult, A
 
 fn inspector_function_payload(function: &BlockPyFunction<CodegenModuleShape>) -> Value {
     json!({
-        "functionId": function.function_id.packed().to_string(),
+        "functionId": function.function_id.to_packed_runtime_u64().to_string(),
         "qualname": function.names.qualname,
         "displayName": function.names.display_name,
         "bindName": function.names.bind_name,
@@ -353,7 +353,7 @@ pub fn profile_module_id_from_env(module_name: &str) -> Result<Option<u32>, Stri
             if function_id == FunctionId::global() {
                 continue;
             }
-            return Ok(Some(function_id.module_id()));
+            return Ok(Some(function_id.runtime_module_id().as_u32()));
         }
     }
     Ok(None)
@@ -515,7 +515,8 @@ fn corresponding_runtime_function<'a>(
         .callable_defs
         .iter()
         .find(|function| {
-            function.function_id.function_id() == requested_function.function_id.function_id()
+            function.function_id.local_function_id()
+                == requested_function.function_id.local_function_id()
         })
         .or_else(|| {
             module
@@ -669,7 +670,7 @@ pub fn render_jit_clif_for_module_with_options(
         resolved_entry: format!(
             "{}::__dp_fn_{}::{}",
             resolved_qualname,
-            resolved_function_id.packed(),
+            resolved_function_id.to_packed_runtime_u64(),
             entry_label
         ),
     })
@@ -690,7 +691,7 @@ fn render_jit_clif(
     rendered.resolved_entry = format!(
         "{}::__dp_fn_{}::{}",
         qualname.unwrap_or("<unknown>"),
-        function_id.packed(),
+        function_id.to_packed_runtime_u64(),
         entry_label
     );
     Ok(rendered)
@@ -735,7 +736,7 @@ async fn handle_speedscope_profile(
 
 fn parse_packed_function_id(raw: &str) -> Result<FunctionId, ApiError> {
     raw.parse::<u64>()
-        .map(FunctionId::from_packed)
+        .map(FunctionId::from_packed_runtime_u64)
         .map_err(|err| ApiError::bad_request(format!("invalid functionId '{raw}': {err}")))
 }
 

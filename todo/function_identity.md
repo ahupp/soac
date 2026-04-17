@@ -115,6 +115,9 @@ Use explicit resolution steps at artifact boundaries:
    - `module_id()` -> `runtime_module_id()`;
    - `function_id()` -> `local_function_id()`;
    - `packed()` -> `to_packed_runtime_u64()`.
+   Done for the transitional `FunctionId` wrapper. `RuntimeFunctionId` and
+   `SerializedFunctionId` still keep their compact-type-specific accessor names
+   until the final wrapper rename/removal.
 3. Introduce `PersistentFunctionId` and use it for optimization-plan targets.
    Done for runtime/precompile resolution; serialized targets now resolve to
    `PersistentFunctionId` before they are mapped to process-local ids.

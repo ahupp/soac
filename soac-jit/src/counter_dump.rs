@@ -256,11 +256,11 @@ impl CounterDumpRowArchive {
             site_kind: row.site_kind.clone(),
             function_id: row
                 .function_id
-                .map(FunctionId::packed)
+                .map(FunctionId::to_packed_runtime_u64)
                 .unwrap_or(COUNTER_DUMP_NONE_FUNCTION_ID),
             current_function_id: row
                 .current_function_id
-                .map(FunctionId::packed)
+                .map(FunctionId::to_packed_runtime_u64)
                 .unwrap_or(COUNTER_DUMP_NONE_FUNCTION_ID),
             instr_block_label: instr_id
                 .map(|instr_id| instr_id.block_label().as_u32())
@@ -365,9 +365,9 @@ impl<'a> CounterDumpRecordView<'a> {
             kind: row.kind.as_str(),
             site_kind: row.site_kind.as_str(),
             function_id: (function_id != COUNTER_DUMP_NONE_FUNCTION_ID)
-                .then_some(FunctionId::from_packed(function_id)),
+                .then_some(FunctionId::from_packed_runtime_u64(function_id)),
             current_function_id: (current_function_id != COUNTER_DUMP_NONE_FUNCTION_ID)
-                .then_some(FunctionId::from_packed(current_function_id)),
+                .then_some(FunctionId::from_packed_runtime_u64(current_function_id)),
             instr_id: if row.has_instr_id {
                 Some(InstrId::new(
                     BlockLabel::from_index(instr_block_label as usize),
@@ -530,7 +530,7 @@ fn call_target_specialization_entries(
             if observed_value == 0 {
                 continue;
             }
-            let observed_function_id = FunctionId::from_packed(observed_value);
+            let observed_function_id = FunctionId::from_packed_runtime_u64(observed_value);
             if observed_function_id == FunctionId::global() {
                 continue;
             }
@@ -590,11 +590,14 @@ pub fn render_call_target_specializations(
         let key = format!(
             "{}|{}|{}|{}",
             entry.module_name,
-            entry.site_function_id.packed(),
+            entry.site_function_id.to_packed_runtime_u64(),
             entry.instr_id.block_label().as_u32(),
             entry.instr_id.instr_index_in_block(),
         );
-        let target_key = format!("{key}|{}", entry.observed_function_id.packed());
+        let target_key = format!(
+            "{key}|{}",
+            entry.observed_function_id.to_packed_runtime_u64()
+        );
         if seen_targets.insert(target_key) {
             if !targets.contains_key(&key) {
                 ordered_keys.push(key.clone());
@@ -602,7 +605,7 @@ pub fn render_call_target_specializations(
             targets
                 .entry(key)
                 .or_default()
-                .push(entry.observed_function_id.packed());
+                .push(entry.observed_function_id.to_packed_runtime_u64());
         }
     }
     let mut out = String::new();
@@ -1407,7 +1410,7 @@ mod tests {
                     function_qualname: Some("pkg.mod.f".to_string()),
                     block_label: None,
                     value: 11,
-                    observed_value: Some(FunctionId::new(1, 9).packed()),
+                    observed_value: Some(FunctionId::new(1, 9).to_packed_runtime_u64()),
                     max_overcount: Some(1),
                 },
                 CounterDumpRow {
@@ -1421,7 +1424,7 @@ mod tests {
                     function_qualname: Some("pkg.mod.f".to_string()),
                     block_label: None,
                     value: 5,
-                    observed_value: Some(FunctionId::new(1, 10).packed()),
+                    observed_value: Some(FunctionId::new(1, 10).to_packed_runtime_u64()),
                     max_overcount: Some(0),
                 },
                 CounterDumpRow {
@@ -1435,7 +1438,7 @@ mod tests {
                     function_qualname: Some("pkg.mod.g".to_string()),
                     block_label: None,
                     value: 4,
-                    observed_value: Some(FunctionId::global().packed()),
+                    observed_value: Some(FunctionId::global().to_packed_runtime_u64()),
                     max_overcount: Some(0),
                 },
                 CounterDumpRow {

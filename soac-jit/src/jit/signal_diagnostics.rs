@@ -109,7 +109,7 @@ pub(crate) fn register_jit_code_range(
     slot.entry_kind_len
         .store(entry_kind.len(), Ordering::Relaxed);
     slot.function_id
-        .store(function_id.packed(), Ordering::Relaxed);
+        .store(function_id.to_packed_runtime_u64(), Ordering::Relaxed);
     slot.bb_offsets_ptr.store(bb_offsets_ptr, Ordering::Relaxed);
     slot.bb_offsets_len.store(bb_offsets_len, Ordering::Relaxed);
     // Publish the entry last so the signal handler never observes partially initialized metadata.

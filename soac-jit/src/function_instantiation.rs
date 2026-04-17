@@ -781,7 +781,7 @@ pub fn make_function_from_python_args(
     let module_globals = module_globals.unwrap_or_else(|| py.None());
     make_function(
         py,
-        FunctionId::from_packed(function_id),
+        FunctionId::from_packed_runtime_u64(function_id),
         expected_kind,
         captures.bind(py).as_any(),
         param_defaults.bind(py).as_any(),
@@ -835,7 +835,7 @@ pub unsafe extern "C" fn soac_jit_make_function_with_closure(
         let module_globals = unsafe { Bound::from_borrowed_ptr(py, module_globals) };
         match make_function(
             py,
-            FunctionId::from_packed(function_id),
+            FunctionId::from_packed_runtime_u64(function_id),
             expected_kind,
             &captures,
             &param_defaults,

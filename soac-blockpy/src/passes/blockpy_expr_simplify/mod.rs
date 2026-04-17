@@ -353,7 +353,7 @@ fn make_function_id_from_literal(expr: &Expr) -> Option<crate::block_py::Functio
         .to_string()
         .parse()
         .ok()
-        .map(crate::block_py::FunctionId::from_packed)
+        .map(crate::block_py::FunctionId::from_packed_runtime_u64)
 }
 
 fn string_arg_from_core_expr(expr: InstrWithAwaitAndYield) -> Option<String> {

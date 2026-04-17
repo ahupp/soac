@@ -52,7 +52,7 @@ fn print_usage() {
 fn format_counter_row(row: &CounterDumpRowView<'_>) -> String {
     let observed_value = if row.kind == "call_hot_targets" {
         row.observed_value
-            .map(FunctionId::from_packed)
+            .map(FunctionId::from_packed_runtime_u64)
             .map(|function_id| format!("observed_function_id={function_id}"))
             .unwrap_or_else(|| "observed_function_id=-".to_string())
     } else {
@@ -71,10 +71,10 @@ fn format_counter_row(row: &CounterDumpRowView<'_>) -> String {
         row.kind,
         row.site_kind,
         row.function_id
-            .map(|function_id| function_id.packed().to_string())
+            .map(|function_id| function_id.to_packed_runtime_u64().to_string())
             .unwrap_or_else(|| "-".to_string()),
         row.current_function_id
-            .map(|function_id| function_id.packed().to_string())
+            .map(|function_id| function_id.to_packed_runtime_u64().to_string())
             .unwrap_or_else(|| "-".to_string()),
         row.instr_id
             .map(|instr_id| instr_id.to_string())
@@ -153,8 +153,8 @@ fn main() -> Result<(), String> {
                     "scope": row.scope,
                     "kind": row.kind,
                     "site_kind": row.site_kind,
-                    "function_id": row.function_id.map(|function_id| function_id.packed()),
-                    "current_function_id": row.current_function_id.map(|function_id| function_id.packed()),
+                    "function_id": row.function_id.map(|function_id| function_id.to_packed_runtime_u64()),
+                    "current_function_id": row.current_function_id.map(|function_id| function_id.to_packed_runtime_u64()),
                     "instr_id": row.instr_id.map(|instr_id| instr_id.to_string()),
                     "function_qualname": row.function_qualname,
                     "block_label": row.block_label,
@@ -245,13 +245,22 @@ mod tests {
 
         let rendered = format_counter_row(&row);
         assert!(
-            rendered
-                .contains(format!("site_function_id={}", FunctionId::new(1, 7).packed()).as_str()),
+            rendered.contains(
+                format!(
+                    "site_function_id={}",
+                    FunctionId::new(1, 7).to_packed_runtime_u64()
+                )
+                .as_str()
+            ),
             "{rendered}"
         );
         assert!(
             rendered.contains(
-                format!("current_function_id={}", FunctionId::new(1, 7).packed()).as_str()
+                format!(
+                    "current_function_id={}",
+                    FunctionId::new(1, 7).to_packed_runtime_u64()
+                )
+                .as_str()
             ),
             "{rendered}"
         );
@@ -279,13 +288,22 @@ mod tests {
 
         let rendered = format_counter_row(&row);
         assert!(
-            rendered
-                .contains(format!("site_function_id={}", FunctionId::global().packed()).as_str()),
+            rendered.contains(
+                format!(
+                    "site_function_id={}",
+                    FunctionId::global().to_packed_runtime_u64()
+                )
+                .as_str()
+            ),
             "{rendered}"
         );
         assert!(
             rendered.contains(
-                format!("current_function_id={}", FunctionId::global().packed()).as_str()
+                format!(
+                    "current_function_id={}",
+                    FunctionId::global().to_packed_runtime_u64()
+                )
+                .as_str()
             ),
             "{rendered}"
         );
@@ -304,7 +322,7 @@ mod tests {
             function_qualname: Some("pkg.mod.f"),
             block_label: None,
             value: 11,
-            observed_value: Some(FunctionId::new(1, 9).packed()),
+            observed_value: Some(FunctionId::new(1, 9).to_packed_runtime_u64()),
             max_overcount: Some(1),
         };
 
@@ -333,7 +351,7 @@ mod tests {
                     function_qualname: Some("pkg.mod.f".to_string()),
                     block_label: None,
                     value: 11,
-                    observed_value: Some(FunctionId::new(1, 9).packed()),
+                    observed_value: Some(FunctionId::new(1, 9).to_packed_runtime_u64()),
                     max_overcount: Some(1),
                 },
                 CounterDumpRow {
@@ -347,7 +365,7 @@ mod tests {
                     function_qualname: Some("pkg.mod.f".to_string()),
                     block_label: None,
                     value: 5,
-                    observed_value: Some(FunctionId::new(1, 10).packed()),
+                    observed_value: Some(FunctionId::new(1, 10).to_packed_runtime_u64()),
                     max_overcount: Some(0),
                 },
                 CounterDumpRow {
@@ -361,7 +379,7 @@ mod tests {
                     function_qualname: Some("pkg.mod.g".to_string()),
                     block_label: None,
                     value: 4,
-                    observed_value: Some(FunctionId::global().packed()),
+                    observed_value: Some(FunctionId::global().to_packed_runtime_u64()),
                     max_overcount: Some(0),
                 },
                 CounterDumpRow {

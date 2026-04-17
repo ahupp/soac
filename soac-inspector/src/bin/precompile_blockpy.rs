@@ -295,16 +295,16 @@ fn module_id_for_record(record: &CounterDumpRecordView<'_>) -> Result<Option<u32
                 continue;
             }
             match module_id {
-                Some(current) if current != function_id.module_id() => {
+                Some(current) if current != function_id.runtime_module_id().as_u32() => {
                     return Err(format!(
                         "counter record for module {} mixes function ids from module ids {} and {}",
                         record.module_name()?,
                         current,
-                        function_id.module_id()
+                        function_id.runtime_module_id().as_u32()
                     ));
                 }
                 Some(_) => {}
-                None => module_id = Some(function_id.module_id()),
+                None => module_id = Some(function_id.runtime_module_id().as_u32()),
             }
         }
     }

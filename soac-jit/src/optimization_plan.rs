@@ -244,7 +244,7 @@ impl ProfileEvidenceStore {
                         if observed_value == 0 {
                             continue;
                         }
-                        let observed = FunctionId::from_packed(observed_value);
+                        let observed = FunctionId::from_packed_runtime_u64(observed_value);
                         if observed == FunctionId::global() {
                             continue;
                         }
@@ -366,7 +366,7 @@ impl ProfileEvidenceStore {
         if function_id == FunctionId::global()
             || self
                 .ambiguous_module_runtime_ids
-                .contains(&function_id.module_id())
+                .contains(&function_id.runtime_module_id().as_u32())
         {
             return None;
         }
@@ -375,7 +375,7 @@ impl ProfileEvidenceStore {
             .cloned()
             .or_else(|| {
                 self.module_targets_by_runtime_id
-                    .get(&function_id.module_id())
+                    .get(&function_id.runtime_module_id().as_u32())
                     .map(|module_target| {
                         PersistentFunctionId::new(
                             ModuleContentId::new(
@@ -419,7 +419,11 @@ impl ProfileEvidenceStore {
         if function_id == FunctionId::global() {
             return;
         }
-        self.record_module_target(function_id.module_id(), module_name, source_hash);
+        self.record_module_target(
+            function_id.runtime_module_id().as_u32(),
+            module_name,
+            source_hash,
+        );
         self.function_targets.entry(function_id).or_insert_with(|| {
             PersistentFunctionId::new(
                 ModuleContentId::new(module_name, source_hash),
@@ -1285,14 +1289,14 @@ mod tests {
                 function_id,
                 instr_id,
                 1,
-                Some(target_id.packed()),
+                Some(target_id.to_packed_runtime_u64()),
             ),
             row(
                 "call_hot_targets",
                 function_id,
                 instr_id,
                 1,
-                Some(target_id.packed()),
+                Some(target_id.to_packed_runtime_u64()),
             ),
             row("operator_hot_shapes", function_id, instr_id, 1, Some(257)),
             row("branch_outcomes", function_id, instr_id, 2, Some(1)),
@@ -1450,7 +1454,7 @@ mod tests {
                 caller_id,
                 instr_id,
                 1,
-                Some(target_id.packed()),
+                Some(target_id.to_packed_runtime_u64()),
             )],
             module_keys: Vec::new(),
             type_keys: Vec::new(),

@@ -1003,7 +1003,7 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
         } else {
             unsafe {
                 soac_jit_make_function_with_closure(
-                    make_function.function_id().packed(),
+                    make_function.function_id().to_packed_runtime_u64(),
                     make_function_kind_abi_tag(make_function.kind),
                     captures.cast::<ffi::PyObject>(),
                     param_defaults.cast::<ffi::PyObject>(),
@@ -1451,7 +1451,10 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
             ffi::Py_DECREF(callable.cast::<ffi::PyObject>());
         }
         Ok(unsafe {
-            ffi::PyBool_FromLong((packed == guard.function_id.packed()) as libc::c_long).cast()
+            ffi::PyBool_FromLong(
+                (packed == guard.function_id.to_packed_runtime_u64()) as libc::c_long,
+            )
+            .cast()
         })
     }
 

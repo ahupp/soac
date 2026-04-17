@@ -1007,7 +1007,7 @@ pub unsafe fn registered_clif_function_id(
     if packed == 0 {
         return Ok(None);
     }
-    Ok(Some(FunctionId::from_packed(packed)))
+    Ok(Some(FunctionId::from_packed_runtime_u64(packed)))
 }
 
 pub unsafe fn registered_clif_type_function_id(
@@ -1024,7 +1024,7 @@ pub unsafe fn registered_clif_type_function_id(
     if packed == 0 {
         return Ok(None);
     }
-    Ok(Some(FunctionId::from_packed(packed)))
+    Ok(Some(FunctionId::from_packed_runtime_u64(packed)))
 }
 
 unsafe fn register_owner_type_for_function(
@@ -1405,7 +1405,7 @@ unsafe fn register_owner_types_from_type(
     if let Some(function_id) = constructor_function_id {
         if PyType_SetSoacMetadata(
             owner_type as *mut ffi::PyObject,
-            function_id.packed(),
+            function_id.to_packed_runtime_u64(),
             ptr::null_mut(),
             None,
         ) != 0
@@ -2161,7 +2161,7 @@ pub(crate) unsafe fn register_clif_direct_metadata(
     let data_ptr = make_clif_function_data(function, function_id, module_runtime)?;
     if PyFunction_SetSoacMetadata(
         function,
-        function_id.packed(),
+        function_id.to_packed_runtime_u64(),
         data_ptr,
         Some(free_clif_function_data),
     ) != 0
@@ -2229,7 +2229,7 @@ pub unsafe fn register_clif_vectorcall(
         let data_ptr = make_clif_function_data(function, function_id, module_runtime)?;
         if PyFunction_SetSoacMetadata(
             function,
-            function_id.packed(),
+            function_id.to_packed_runtime_u64(),
             data_ptr,
             Some(free_clif_function_data),
         ) != 0
@@ -2244,7 +2244,7 @@ pub unsafe fn register_clif_vectorcall(
         let data_ptr = make_clif_function_data(function, function_id, module_runtime)?;
         if PyFunction_SetSoacMetadata(
             function,
-            function_id.packed(),
+            function_id.to_packed_runtime_u64(),
             data_ptr,
             Some(free_clif_function_data),
         ) != 0
@@ -2282,7 +2282,7 @@ pub unsafe fn register_clif_vectorcall(
     data.compiled_vectorcall_entry = Some(entry);
     if PyFunction_SetSoacMetadata(
         function,
-        function_id.packed(),
+        function_id.to_packed_runtime_u64(),
         data_ptr,
         Some(free_clif_function_data),
     ) != 0
@@ -2658,7 +2658,7 @@ mod tests {
             assert_eq!(
                 PyFunction_SetSoacMetadata(
                     function,
-                    function_id.packed(),
+                    function_id.to_packed_runtime_u64(),
                     metadata,
                     Some(free_test_soac_metadata),
                 ),
@@ -2672,7 +2672,7 @@ mod tests {
             );
             assert_eq!(
                 PyFunction_GetSoacFunctionId(function),
-                function_id.packed(),
+                function_id.to_packed_runtime_u64(),
                 "packed function id should round-trip"
             );
             assert_eq!(
@@ -2716,7 +2716,7 @@ mod tests {
             assert_eq!(
                 PyType_SetSoacMetadata(
                     class_obj,
-                    function_id.packed(),
+                    function_id.to_packed_runtime_u64(),
                     metadata,
                     Some(free_test_soac_metadata),
                 ),
@@ -2730,7 +2730,7 @@ mod tests {
             );
             assert_eq!(
                 PyType_GetSoacFunctionId(class_obj),
-                function_id.packed(),
+                function_id.to_packed_runtime_u64(),
                 "packed type function id should round-trip"
             );
             assert_eq!(
@@ -2773,7 +2773,7 @@ mod tests {
             assert_eq!(
                 PyFunction_SetSoacMetadata(
                     init_function,
-                    function_id.packed(),
+                    function_id.to_packed_runtime_u64(),
                     ptr::null_mut(),
                     None,
                 ),
@@ -2784,7 +2784,7 @@ mod tests {
                 .expect("owner type registration should succeed");
             assert_eq!(
                 PyType_GetSoacFunctionId(cls.as_ptr()),
-                function_id.packed(),
+                function_id.to_packed_runtime_u64(),
                 "owner type registration should attach packed __init__ function id"
             );
             assert_eq!(
@@ -2875,7 +2875,7 @@ mod tests {
             assert_eq!(
                 PyFunction_SetSoacMetadata(
                     init_function,
-                    function_id.packed(),
+                    function_id.to_packed_runtime_u64(),
                     ptr::null_mut(),
                     None,
                 ),
@@ -2909,7 +2909,7 @@ mod tests {
             assert_eq!(
                 PyFunction_SetSoacMetadata(
                     init_function,
-                    function_id.packed(),
+                    function_id.to_packed_runtime_u64(),
                     ptr::null_mut(),
                     None,
                 ),

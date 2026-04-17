@@ -187,7 +187,7 @@ impl SharedModuleState {
         if let Some(function) = self.lookup_function(function_id) {
             return Ok(Some(function.clone()));
         }
-        if function_id.module_id() == self.module_id() {
+        if function_id.runtime_module_id().as_u32() == self.module_id() {
             return Ok(None);
         }
         Ok(compile_session
@@ -266,7 +266,9 @@ impl SharedModuleState {
         if function_id == FunctionId::global() {
             return Ok(None);
         }
-        if function_id != FunctionId::global() && function_id.module_id() != self.module_id() {
+        if function_id != FunctionId::global()
+            && function_id.runtime_module_id().as_u32() != self.module_id()
+        {
             let Some((shared_state, _function)) =
                 compile_session.lookup_shared_function(function_id)?
             else {

@@ -51,7 +51,7 @@ fn main() -> Result<(), String> {
     for function in &output.codegen_module.callable_defs {
         println!(
             "{}\t{}",
-            function.function_id.packed(),
+            function.function_id.to_packed_runtime_u64(),
             function.names.qualname
         );
     }

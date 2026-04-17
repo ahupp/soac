@@ -48,7 +48,10 @@ impl SharedModuleStateRegistry {
     }
 
     fn for_function_id(&self, function_id: FunctionId) -> Option<Arc<SharedModuleState>> {
-        let index = self.by_module_id.get(&function_id.module_id()).copied()?;
+        let index = self
+            .by_module_id
+            .get(&function_id.runtime_module_id().as_u32())
+            .copied()?;
         self.retained.get(index).cloned()
     }
 

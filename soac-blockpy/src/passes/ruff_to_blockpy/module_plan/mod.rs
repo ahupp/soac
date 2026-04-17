@@ -159,7 +159,7 @@ fn build_lowered_function_instantiation_expr(
     };
     let base_function_expr = py_expr!(
         "__soac__.make_function({function_id:literal}, {kind:literal}, {closure:expr}, {param_defaults:expr}, {annotate_fn:expr})",
-        function_id = function_id.packed(),
+        function_id = function_id.to_packed_runtime_u64(),
         kind = kind_name,
         closure = py_expr!("()"),
         param_defaults = param_defaults_expr.clone(),

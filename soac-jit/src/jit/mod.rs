@@ -381,7 +381,7 @@ fn direct_function_symbol_scope_for_shared_state(
     let mut scope = String::from("shared_");
     push_shared_module_symbol_identity_for_shared_state(&mut scope, shared_state);
     scope.push_str("_fn_");
-    scope.push_str(function_id.packed().to_string().as_str());
+    scope.push_str(function_id.to_packed_runtime_u64().to_string().as_str());
     scope
 }
 
@@ -3672,7 +3672,7 @@ fn emit_jit_batch_codegen_log(
         module_name,
         package_name,
         root_function_id = %root_function.function_id,
-        root_function_logical_id = root_function.function_id.function_id(),
+        root_function_logical_id = root_function.function_id.local_function_id().as_u32(),
         root_function_qualname = root_function.names.qualname.as_str(),
         batch_function_count = u64::try_from(batch_function_count).unwrap_or(u64::MAX),
         functions_to_define_count = u64::try_from(functions_to_define_count).unwrap_or(u64::MAX),
@@ -4907,7 +4907,7 @@ pub(crate) fn lookup_precompiled_direct_function_handle(
         event = "soac.precompiled_direct_function_hit",
         module = shared_state.module_name.as_str(),
         source_hash = format_args!("0x{:016x}", shared_state.source_hash()),
-        function_id = function.function_id.function_id(),
+        function_id = function.function_id.local_function_id().as_u32(),
         qualname = function.names.qualname.as_str(),
         symbol = symbol.as_str(),
         "soac_precompiled_direct_function_hit",
@@ -13532,10 +13532,10 @@ fn owner_attr_function_id_for_type_ref(
         return Ok(None);
     };
     let packed = unsafe { crate::PyFunction_GetSoacFunctionId(callable as *mut ffi::PyObject) };
-    if packed == FunctionId::global().packed() {
+    if packed == FunctionId::global().to_packed_runtime_u64() {
         return Ok(None);
     }
-    Ok(Some(FunctionId::from_packed(packed)))
+    Ok(Some(FunctionId::from_packed_runtime_u64(packed)))
 }
 
 fn ensure_reloc_callable_symbol_registered(
@@ -14011,7 +14011,7 @@ fn emit_exact_function_id_match_bool01(
     let id_matches = fb.ins().icmp_imm(
         ir::condcodes::IntCC::Equal,
         actual_id,
-        expected_function_id.packed() as i64,
+        expected_function_id.to_packed_runtime_u64() as i64,
     );
     let truth = emit_i32_bool01_from_cond(fb, id_matches, ctx).expect_i32_bool01("function guard");
     fb.ins().jump(done_block, &[ir::BlockArg::Value(truth)]);
@@ -17412,7 +17412,7 @@ fn emit_codegen_simple_call_with_local_env(
                     if let Some(counter_id) = call_target_counter {
                         let callee_id = fb.ins().iconst(
                             emit_ctx.consts.i64_ty,
-                            specialization.function_id.packed() as i64,
+                            specialization.function_id.to_packed_runtime_u64() as i64,
                         );
                         emit_record_call_target_sample(fb, counter_id, callee_id, emit_ctx);
                     }
@@ -17609,7 +17609,7 @@ fn emit_codegen_simple_call_with_local_env(
                 if let Some(counter_id) = call_target_counter {
                     let callee_id = fb.ins().iconst(
                         emit_ctx.consts.i64_ty,
-                        specialization.function_id.packed() as i64,
+                        specialization.function_id.to_packed_runtime_u64() as i64,
                     );
                     emit_record_call_target_sample(fb, counter_id, callee_id, emit_ctx);
                 }
@@ -17901,7 +17901,7 @@ fn emit_codegen_simple_call_with_local_env(
                     let is_match = fb.ins().icmp_imm(
                         ir::condcodes::IntCC::Equal,
                         callee_id,
-                        specialization.function_id.packed() as i64,
+                        specialization.function_id.to_packed_runtime_u64() as i64,
                     );
                     let is_match = fb.ins().band(is_match, callable_is_exact_function);
                     fb.ins().brif(is_match, direct_block, &[], miss_block, &[]);
@@ -18054,7 +18054,7 @@ fn emit_codegen_make_function_with_closure_with_local_env(
 ) -> ir::Value {
     let function_id = fb.ins().iconst(
         emit_ctx.consts.i64_ty,
-        make_function.function_id().packed() as i64,
+        make_function.function_id().to_packed_runtime_u64() as i64,
     );
     let kind = fb.ins().iconst(
         emit_ctx.consts.i64_ty,
@@ -19663,7 +19663,7 @@ fn emit_typed_codegen_direct_callable_specialization_result_with_local_env(
             let is_match = fb.ins().icmp_imm(
                 ir::condcodes::IntCC::Equal,
                 callee_id,
-                specialization.function_id.packed() as i64,
+                specialization.function_id.to_packed_runtime_u64() as i64,
             );
             let is_match = fb.ins().band(is_match, callable_is_exact_function);
             fb.ins().brif(is_match, direct_block, &[], miss_block, &[]);
@@ -21817,7 +21817,7 @@ fn collect_process_jit_batch_functions<'a>(
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     let mut queue = VecDeque::new();
-    let root_module_id = root.function_id.module_id();
+    let root_module_id = root.function_id.runtime_module_id();
     seen.insert(root.function_id);
     queue.push_back(ProcessJitBatchFunction {
         function: root.clone(),
@@ -21850,7 +21850,7 @@ fn collect_process_jit_batch_functions<'a>(
                 if function.function.execution_mode() != FunctionExecutionMode::Jit {
                     continue;
                 }
-                if function.function.function_id.module_id() != root_module_id {
+                if function.function.function_id.runtime_module_id() != root_module_id {
                     continue;
                 }
                 queue.push_back(function);
@@ -21866,7 +21866,7 @@ fn collect_process_jit_batch_functions<'a>(
                 if function.function.execution_mode() != FunctionExecutionMode::Jit {
                     continue;
                 }
-                if function.function.function_id.module_id() != root_module_id {
+                if function.function.function_id.runtime_module_id() != root_module_id {
                     continue;
                 }
                 if is_synthetic_class_helper_function(&function.function) {
@@ -23662,7 +23662,7 @@ fn default_direct_function_symbol(
 }
 
 fn direct_function_symbol_scope(function_id: FunctionId, symbol_id: u64) -> String {
-    format!("fn_{}_{}", function_id.packed(), symbol_id)
+    format!("fn_{}_{}", function_id.to_packed_runtime_u64(), symbol_id)
 }
 
 fn direct_function_backend_name(
@@ -23678,7 +23678,14 @@ fn direct_function_backend_name(
         ),
         None => {
             name.push_str("module_id:");
-            name.push_str(function.function_id.module_id().to_string().as_str());
+            name.push_str(
+                function
+                    .function_id
+                    .runtime_module_id()
+                    .as_u32()
+                    .to_string()
+                    .as_str(),
+            );
         }
     }
     name.push(':');
@@ -24405,7 +24412,7 @@ fn precompile_external_direct_call_target_functions(
     }
     Ok(target_ids
         .into_iter()
-        .filter(|function_id| function_id.module_id() != current_module_id)
+        .filter(|function_id| function_id.runtime_module_id().as_u32() != current_module_id)
         .filter_map(|function_id| {
             module_index
                 .function(function_id)
@@ -26079,11 +26086,9 @@ fn build_cranelift_run_bb_specialized_function(
                     .deopt_points_for_block(codegen_block.label)
                     .all(|point| point.id.function_id == function.function_id)
             );
-            debug_assert!(
-                emit_ctx.inline_plan.functions.keys().all(
-                    |function_id| function_id.module_id() == module.module_name_gen.module_id()
-                )
-            );
+            debug_assert!(emit_ctx.inline_plan.functions.keys().all(|function_id| {
+                function_id.runtime_module_id().as_u32() == module.module_name_gen.module_id()
+            }));
             emit_ctx.require_deopt_point_at_block_entry(codegen_block.label)?;
             let _block_refcount_plan = emit_ctx.refcount_plan.block(codegen_block.label);
 

@@ -68,7 +68,7 @@ fn parse_args() -> Result<Args, String> {
     }
     let function_id = positionals[1]
         .parse::<u64>()
-        .map(FunctionId::from_packed)
+        .map(FunctionId::from_packed_runtime_u64)
         .map_err(|err| format!("invalid function_id '{}': {err}", positionals[1]))?;
     Ok(Args {
         source: PathBuf::from(&positionals[0]),
@@ -123,8 +123,8 @@ fn main() -> Result<(), String> {
         None
     };
     let function_id = profile_module_id
-        .filter(|_| args.function_id.module_id() == 0)
-        .map(|module_id| FunctionId::new(module_id, args.function_id.function_id()))
+        .filter(|_| args.function_id.runtime_module_id().as_u32() == 0)
+        .map(|module_id| FunctionId::new(module_id, args.function_id.local_function_id().as_u32()))
         .unwrap_or(args.function_id);
     let module = if let Some(module_id) = profile_module_id {
         lower_source_to_codegen_module_with_module_id(&source, module_id)?

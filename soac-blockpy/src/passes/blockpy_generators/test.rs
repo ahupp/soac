@@ -59,7 +59,7 @@ fn build_closure_backed_generator_factory_block(
 ) -> Block<InstrRuff> {
     let resume_entry = py_expr!(
         "__dp_make_function({function_id:literal}, \"function\", __dp_tuple(), __dp_tuple(), None)",
-        function_id = resume_function_id.packed(),
+        function_id = resume_function_id.to_packed_runtime_u64(),
     );
 
     let generator_expr = if is_async_generator {

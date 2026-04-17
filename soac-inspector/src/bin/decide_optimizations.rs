@@ -578,7 +578,7 @@ mod test {
                     function_qualname: Some("f".to_string()),
                     block_label: Some("bb0".to_string()),
                     value: 1,
-                    observed_value: Some(FunctionId::new(8, 2).packed()),
+                    observed_value: Some(FunctionId::new(8, 2).to_packed_runtime_u64()),
                     max_overcount: None,
                 },
                 CounterDumpRow {

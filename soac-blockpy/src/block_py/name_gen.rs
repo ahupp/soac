@@ -129,8 +129,12 @@ impl RuntimeFunctionId {
         Self::GLOBAL
     }
 
-    pub const fn packed(self) -> u64 {
+    pub const fn to_packed_runtime_u64(self) -> u64 {
         self.0
+    }
+
+    pub const fn packed(self) -> u64 {
+        self.to_packed_runtime_u64()
     }
 
     pub const fn module_id(self) -> RuntimeModuleId {
@@ -174,7 +178,7 @@ impl SerializedFunctionId {
         Self(((module_id.as_u32() as u64) << 32) | function_id.as_u32() as u64)
     }
 
-    pub const fn from_packed(packed: u64) -> Self {
+    pub const fn from_packed_runtime_u64(packed: u64) -> Self {
         Self(packed)
     }
 
@@ -297,12 +301,12 @@ impl FunctionId {
         Self(((module_id as u64) << 32) | function_id as u64)
     }
 
-    pub const fn from_packed(packed: u64) -> Self {
+    pub const fn from_packed_runtime_u64(packed: u64) -> Self {
         Self(packed)
     }
 
     pub const fn from_runtime(runtime_id: RuntimeFunctionId) -> Self {
-        Self(runtime_id.packed())
+        Self(runtime_id.to_packed_runtime_u64())
     }
 
     pub const fn from_runtime_parts(
@@ -316,16 +320,8 @@ impl FunctionId {
         Self::GLOBAL
     }
 
-    pub const fn packed(self) -> u64 {
+    pub const fn to_packed_runtime_u64(self) -> u64 {
         self.0
-    }
-
-    pub const fn module_id(self) -> u32 {
-        (self.0 >> 32) as u32
-    }
-
-    pub const fn function_id(self) -> u32 {
-        self.0 as u32
     }
 
     pub const fn runtime_id(self) -> RuntimeFunctionId {
@@ -355,13 +351,23 @@ impl From<FunctionId> for RuntimeFunctionId {
 
 impl fmt::Debug for FunctionId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}", self.module_id(), self.function_id())
+        write!(
+            f,
+            "{}:{}",
+            self.runtime_module_id(),
+            self.local_function_id()
+        )
     }
 }
 
 impl fmt::Display for FunctionId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}", self.module_id(), self.function_id())
+        write!(
+            f,
+            "{}:{}",
+            self.runtime_module_id(),
+            self.local_function_id()
+        )
     }
 }
 
@@ -467,8 +473,8 @@ impl FunctionNameGen {
         let current = self.state.next_tmp_id.fetch_add(1, Ordering::Relaxed);
         ast::name::Name::new(format!(
             "_dp_{prefix}_{}_{}_{}",
-            self.state.function_id.module_id(),
-            self.state.function_id.function_id(),
+            self.state.function_id.runtime_module_id(),
+            self.state.function_id.local_function_id(),
             current
         ))
     }
@@ -536,7 +542,10 @@ mod tests {
         let runtime_id = RuntimeFunctionId::new(RuntimeModuleId::new(17), LocalFunctionId::new(42));
         let function_id = FunctionId::from_runtime(runtime_id);
 
-        assert_eq!(function_id.packed(), runtime_id.packed());
+        assert_eq!(
+            function_id.to_packed_runtime_u64(),
+            runtime_id.to_packed_runtime_u64()
+        );
         assert_eq!(function_id.runtime_module_id(), RuntimeModuleId::new(17));
         assert_eq!(function_id.local_function_id(), LocalFunctionId::new(42));
         assert_eq!(RuntimeFunctionId::from(function_id), runtime_id);

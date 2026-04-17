@@ -288,7 +288,7 @@ impl FunctionIdRemapper {
         if function_id == FunctionId::global() {
             function_id
         } else {
-            FunctionId::new(self.new_module_id, function_id.function_id())
+            FunctionId::new(self.new_module_id, function_id.local_function_id().as_u32())
         }
     }
 }
@@ -392,13 +392,19 @@ fn recovered_module_name_gen(module: &BlockPyModule<CodegenModuleShape>) -> Modu
     let module_id = module
         .callable_defs
         .first()
-        .map(|function| function.function_id.module_id())
+        .map(|function| function.function_id.runtime_module_id().as_u32())
         .unwrap_or(0);
     let next_function_id = module
         .callable_defs
         .iter()
-        .filter(|function| function.function_id.module_id() == module_id)
-        .map(|function| function.function_id.function_id().saturating_add(1))
+        .filter(|function| function.function_id.runtime_module_id().as_u32() == module_id)
+        .map(|function| {
+            function
+                .function_id
+                .local_function_id()
+                .as_u32()
+                .saturating_add(1)
+        })
         .max()
         .unwrap_or(1)
         .max(1);
@@ -556,12 +562,15 @@ def g(y):
         let max_function_id = loaded
             .callable_defs
             .iter()
-            .map(|function| function.function_id.function_id())
+            .map(|function| function.function_id.local_function_id().as_u32())
             .max()
             .expect("test module should have callable defs");
         let recovered_next_function = loaded.module_name_gen.next_function_name_gen();
         assert_eq!(
-            recovered_next_function.function_id().function_id(),
+            recovered_next_function
+                .function_id()
+                .local_function_id()
+                .as_u32(),
             max_function_id + 1
         );
 
@@ -655,7 +664,7 @@ def outer():
 
         assert_eq!(module.module_name_gen.module_id(), 99);
         for function in &module.callable_defs {
-            assert_eq!(function.function_id.module_id(), 99);
+            assert_eq!(function.function_id.runtime_module_id().as_u32(), 99);
             assert_eq!(function.name_gen.function_id(), function.function_id);
         }
         let make_function_ids = collect_make_function_with_closure_ids(&module);
@@ -665,7 +674,7 @@ def outer():
         );
         for function_id in make_function_ids {
             assert_eq!(
-                function_id.module_id(),
+                function_id.runtime_module_id().as_u32(),
                 99,
                 "cached MakeFunctionWithClosure ids must point at the remapped module id"
             );
@@ -778,29 +787,29 @@ def outer(value):
             .as_ref()
             .expect("prepared codegen cache should be preserved");
         for function_id in prepared.escape_summary.functions.keys() {
-            assert_eq!(function_id.module_id(), 111);
+            assert_eq!(function_id.runtime_module_id().as_u32(), 111);
         }
         for function_id in prepared.inline_plan.functions.keys() {
-            assert_eq!(function_id.module_id(), 111);
+            assert_eq!(function_id.runtime_module_id().as_u32(), 111);
         }
         for (key, _) in prepared.value_facts.expr_facts() {
-            assert_eq!(key.function_id.module_id(), 111);
+            assert_eq!(key.function_id.runtime_module_id().as_u32(), 111);
         }
         for ((function_id, _), _) in prepared.value_facts.block_entry_facts() {
-            assert_eq!(function_id.module_id(), 111);
+            assert_eq!(function_id.runtime_module_id().as_u32(), 111);
         }
         for function_id in prepared.ownership_plan.functions.keys() {
-            assert_eq!(function_id.module_id(), 111);
+            assert_eq!(function_id.runtime_module_id().as_u32(), 111);
         }
         for function_id in prepared.local_env_plan.functions.keys() {
-            assert_eq!(function_id.module_id(), 111);
+            assert_eq!(function_id.runtime_module_id().as_u32(), 111);
         }
         for function_id in prepared.local_env_resume_plan.functions.keys() {
-            assert_eq!(function_id.module_id(), 111);
+            assert_eq!(function_id.runtime_module_id().as_u32(), 111);
         }
         for function_plan in prepared.local_env_resume_plan.functions.values() {
             for entry in &function_plan.entries {
-                assert_eq!(entry.point.function_id().module_id(), 111);
+                assert_eq!(entry.point.function_id().runtime_module_id().as_u32(), 111);
             }
         }
     }
