@@ -985,3 +985,24 @@ benchmarked throughput delta, and the headline pre/post numbers.
 - post-change benchmark:
   - specialized pass, 1M loops x1: `231468 loops/s`
   - no-refcount diagnostic, 1M loops x1: `350192 loops/s`
+
+## 2026-04-17 - Specialize exact-int if comparisons
+
+- jj change id: `mysmommr`
+- summary: profiled exact-int comparisons used directly as `if` conditions now
+  lower to a scalar `I32Bool01` truth value instead of materializing a Python
+  bool and calling generic truthiness. Guard-miss deopt is used only when the
+  reachable continuation locals are materialized; otherwise the local generic
+  fallback remains in place.
+- throughput: `-1.41%` specialized pystone median; no-refcount diagnostic
+  `+3.30%`; code size `-5.64%`
+- pre-change benchmark:
+  - specialized pass, 1M loops x3: `255615`, `260022`, `256151 loops/s`
+  - no-refcount diagnostic, 1M loops x3: `336643`, `339285`, `349507 loops/s`
+  - pystone JIT code bytes: `392208`
+- post-change benchmark:
+  - specialized pass, 1M loops x5: `252544`, `243623`, `249279`, `260897`,
+    `259273 loops/s`
+  - no-refcount diagnostic, 1M loops x5: `345491`, `351148`, `349593`,
+    `350474`, `353850 loops/s`
+  - pystone JIT code bytes: `370090`

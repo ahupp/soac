@@ -913,17 +913,28 @@ exact-list/exact-int arms and share generic fallback paths.
 - If the profiled shape is exact `int`/`int`, comparisons such as
   `Eq`, `Ne`, `Lt`, `Le`, `Gt`, and `Ge` use the direct exact-int helper path
   instead of generic `PyObject_RichCompare` lowering.
-- If value facts prove both operands are exact `int`, comparison codegen
-  guards compact exact `PyLong` layout, unboxes both operands, emits a direct
-  integer comparison, and materializes the boolean singleton without calling
-  either `PyObject_RichCompare` or the profiled helper.
+- When the comparison is consumed by `I32Bool01` demand, such as an
+  `if` condition, the profiled exact-int path guards compact exact `PyLong`
+  layout, unboxes both operands, emits a direct integer comparison, and
+  branches on the scalar result without calling `PyObject_RichCompare` or
+  `dp_jit_is_true`.
+- When the comparison is consumed as a Python object, compact exact `PyLong`
+  operands still use a direct integer comparison and then materialize the
+  boolean singleton without calling `PyObject_RichCompare`.
 - On guard miss, comparison specialization uses the same deopt-or-fallback
   behavior as exact-int binary operators.
+- A guard miss only uses `dp_jit_deopt_resume` when the continuation is
+  replay-safe and every local that can be read by the reachable continuation
+  tail is definitely materialized by the planned resume entry. If not, codegen
+  keeps the local generic fallback path so unbound/null block-param state cannot
+  be mis-reconstructed by the deopt interpreter.
 
 ### Limitations / Soundness / Extensions
 
 - Current limitations:
   - only exact `int`/`int`
+  - non-compact `PyLong` values guard-miss instead of using bigint-specific
+    fast-path code
   - no string/bytes/tuple/list comparison specialization
 - Soundness boundary:
   - exact-shape guarded, otherwise deopt to the generic continuation or

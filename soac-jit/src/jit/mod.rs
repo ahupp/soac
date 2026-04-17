@@ -57,15 +57,15 @@ use soac_blockpy::passes::{
     CodegenModuleShape, ConstructorFieldValue, DirectFunctionIdGuardTest,
     DirectReceiverTypeVersionGuardTest, FactStore, FunctionRefcountPlan, InlineCallee,
     InlinePlanModule, InstrResolved, InstrTyped, LocalEnvResumeBinding, LocalEnvResumeBindingState,
-    LocalEnvResumePoint, LocalEnvResumeStatePrecision, LocalEnvResumeValueSource, LocalRefState,
-    PyExactType, PyObjFacts, RefcountActionKind, RefcountReleaseReason, RefcountSite,
-    RuntimeHelperId, TypedAttrAccessPlan, TypedAttrOwnerRef, TypedCall, TypedCallAccessPlan,
-    TypedCodegenModuleShape, TypedDirectCallArgPlan, TypedDirectCallArgSource,
-    TypedDirectCallGuardTest, TypedDirectCallGuardTestKind, TypedDirectCallableCall,
-    TypedDirectCallableCallGuard, TypedDirectConstructorCallGuard, TypedDirectFunctionCallGuard,
-    TypedDirectMethodCall, TypedDirectMethodCallGuard, TypedGetAttr, TypedGuardedCallableCall,
-    TypedGuardedMethodCall, TypedIndexedFieldGuard, TypedPlannedResult, TypedPyObjectOwnershipPlan,
-    TypedSetAttr, ValueFacts, annotate_typed_function_planned_results,
+    LocalEnvResumeEntry, LocalEnvResumePoint, LocalEnvResumeStatePrecision,
+    LocalEnvResumeValueSource, LocalRefState, PyExactType, PyObjFacts, RefcountActionKind,
+    RefcountReleaseReason, RefcountSite, RuntimeHelperId, TypedAttrAccessPlan, TypedAttrOwnerRef,
+    TypedCall, TypedCallAccessPlan, TypedCodegenModuleShape, TypedDirectCallArgPlan,
+    TypedDirectCallArgSource, TypedDirectCallGuardTest, TypedDirectCallGuardTestKind,
+    TypedDirectCallableCall, TypedDirectCallableCallGuard, TypedDirectConstructorCallGuard,
+    TypedDirectFunctionCallGuard, TypedDirectMethodCall, TypedDirectMethodCallGuard, TypedGetAttr,
+    TypedGuardedCallableCall, TypedGuardedMethodCall, TypedIndexedFieldGuard, TypedPlannedResult,
+    TypedPyObjectOwnershipPlan, TypedSetAttr, ValueFacts, annotate_typed_function_planned_results,
     annotate_typed_function_result_demands, annotate_typed_function_value_facts,
     assign_missing_codegen_function_instr_ids,
     build_cross_module_direct_method_inline_fragment_to_target,
@@ -5076,6 +5076,7 @@ pub(crate) enum RuntimeJitDeoptUnsupportedReason {
     MissingPlanRecord,
     UnsupportedBlockTail,
     ReplayUnsafeGuardOperand,
+    UnmaterializedContinuationLocal,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -5632,6 +5633,332 @@ fn runtime_jit_deopt_guard_miss_supported(
         return Err(RuntimeJitDeoptUnsupportedReason::ReplayUnsafeGuardOperand);
     }
     Ok(())
+}
+
+fn runtime_jit_deopt_guard_miss_resume_entry_supported(
+    function: &BlockPyFunction<CodegenModuleShape>,
+    point: LocalEnvResumePoint,
+    entry: &LocalEnvResumeEntry,
+) -> Result<(), RuntimeJitDeoptUnsupportedReason> {
+    let continuation = runtime_jit_deopt_continuation_for_point(function, point);
+    if let Some(reason) = continuation.unsupported_reason() {
+        return Err(reason);
+    }
+    let Some(cursor) = continuation.initial_cursor() else {
+        return Err(RuntimeJitDeoptUnsupportedReason::UnsupportedBlockTail);
+    };
+    for location in runtime_jit_deopt_continuation_local_reads(function, cursor)? {
+        let Some(binding) = entry.binding_for_location(location) else {
+            return Err(RuntimeJitDeoptUnsupportedReason::UnmaterializedContinuationLocal);
+        };
+        if binding.binding != LocalEnvResumeBindingState::Bound
+            || matches!(binding.source, LocalEnvResumeValueSource::Unbound)
+        {
+            return Err(RuntimeJitDeoptUnsupportedReason::UnmaterializedContinuationLocal);
+        }
+    }
+    Ok(())
+}
+
+fn runtime_jit_deopt_continuation_local_reads(
+    function: &BlockPyFunction<CodegenModuleShape>,
+    cursor: RuntimeJitDeoptCursor,
+) -> Result<HashSet<LocalLocation>, RuntimeJitDeoptUnsupportedReason> {
+    let Some(storage_layout) = function.storage_layout().as_ref() else {
+        return Ok(HashSet::new());
+    };
+    let blocks_by_label = function
+        .blocks
+        .iter()
+        .map(|block| (block.label, block))
+        .collect::<HashMap<_, _>>();
+    let location_by_name = storage_layout
+        .stack_slots()
+        .iter()
+        .enumerate()
+        .map(|(slot, name)| {
+            (
+                name.clone(),
+                LocalLocation(u32::try_from(slot).expect("local slot index should fit in u32")),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let owned_cell_locations = runtime_jit_deopt_owned_cell_locations(function, &location_by_name);
+    let mut reads = HashSet::new();
+    let mut visited = HashSet::new();
+    let mut worklist = VecDeque::from([cursor]);
+    while let Some(cursor) = worklist.pop_front() {
+        if !visited.insert((cursor.block(), cursor.body_index())) {
+            continue;
+        }
+        let Some(block) = blocks_by_label.get(&cursor.block()).copied() else {
+            return Err(RuntimeJitDeoptUnsupportedReason::MissingBlock);
+        };
+        let Some(body_tail) = block.body.get(cursor.body_index()..) else {
+            return Err(RuntimeJitDeoptUnsupportedReason::UnsupportedBlockTail);
+        };
+        let mut defs = HashSet::new();
+        for instr in body_tail {
+            runtime_jit_deopt_collect_local_reads(
+                instr,
+                &defs,
+                &location_by_name,
+                &owned_cell_locations,
+                &mut reads,
+            );
+            runtime_jit_deopt_mark_local_definition(instr, &owned_cell_locations, &mut defs);
+        }
+        runtime_jit_deopt_collect_term_local_reads(
+            &block.term,
+            &defs,
+            &location_by_name,
+            &owned_cell_locations,
+            &mut reads,
+        );
+        if let Some(edge) = &block.exc_edge {
+            runtime_jit_deopt_collect_edge_local_reads(edge, &defs, &location_by_name, &mut reads);
+            worklist.push_back(RuntimeJitDeoptCursor::at_block_entry(edge.target));
+        }
+        match &block.term {
+            BlockTerm::Jump(edge) => {
+                runtime_jit_deopt_collect_edge_local_reads(
+                    edge,
+                    &defs,
+                    &location_by_name,
+                    &mut reads,
+                );
+                worklist.push_back(RuntimeJitDeoptCursor::at_block_entry(edge.target));
+            }
+            BlockTerm::IfTerm(if_term) => {
+                worklist.push_back(RuntimeJitDeoptCursor::at_block_entry(if_term.then_label));
+                worklist.push_back(RuntimeJitDeoptCursor::at_block_entry(if_term.else_label));
+            }
+            BlockTerm::BranchTable(branch) => {
+                for target in &branch.targets {
+                    worklist.push_back(RuntimeJitDeoptCursor::at_block_entry(*target));
+                }
+                worklist.push_back(RuntimeJitDeoptCursor::at_block_entry(branch.default_label));
+            }
+            BlockTerm::Raise(_) | BlockTerm::Return(_) => {}
+        }
+    }
+    Ok(reads)
+}
+
+fn runtime_jit_deopt_owned_cell_locations(
+    function: &BlockPyFunction<CodegenModuleShape>,
+    location_by_name: &HashMap<String, LocalLocation>,
+) -> HashMap<u32, LocalLocation> {
+    let Some(storage_layout) = function.storage_layout().as_ref() else {
+        return HashMap::new();
+    };
+    storage_layout
+        .cellvars
+        .iter()
+        .chain(storage_layout.runtime_cells.iter())
+        .enumerate()
+        .filter_map(|(slot, cell)| {
+            let location = location_by_name.get(cell.storage_name.as_str()).copied()?;
+            let slot = u32::try_from(slot).expect("owned cell slot should fit in u32");
+            Some((slot, location))
+        })
+        .collect()
+}
+
+fn runtime_jit_deopt_mark_local_definition(
+    expr: &InstrCodegen,
+    owned_cell_locations: &HashMap<u32, LocalLocation>,
+    defs: &mut HashSet<LocalLocation>,
+) {
+    match expr {
+        InstrCodegen::Store(op) => {
+            if let Some(location) = op.name.local_location().or_else(|| {
+                let CellLocation::Owned(slot) = op.name.cell_location()? else {
+                    return None;
+                };
+                matches!(op.value.as_ref(), InstrCodegen::MakeCell(_))
+                    .then(|| owned_cell_locations.get(&slot).copied())
+                    .flatten()
+            }) {
+                defs.insert(location);
+            }
+        }
+        InstrCodegen::Del(op) => {
+            if let Some(location) = op.name.local_location() {
+                defs.insert(location);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn runtime_jit_deopt_collect_local_reads(
+    expr: &InstrCodegen,
+    defs: &HashSet<LocalLocation>,
+    location_by_name: &HashMap<String, LocalLocation>,
+    owned_cell_locations: &HashMap<u32, LocalLocation>,
+    reads: &mut HashSet<LocalLocation>,
+) {
+    struct LocalReadCollector<'a> {
+        defs: &'a HashSet<LocalLocation>,
+        location_by_name: &'a HashMap<String, LocalLocation>,
+        owned_cell_locations: &'a HashMap<u32, LocalLocation>,
+        reads: &'a mut HashSet<LocalLocation>,
+    }
+
+    impl Visit<InstrCodegen> for LocalReadCollector<'_> {
+        fn visit_instr(&mut self, expr: &InstrCodegen)
+        where
+            InstrCodegen: ChildVisitable<InstrCodegen>,
+        {
+            match expr {
+                InstrCodegen::Load(op) => {
+                    if let Some(location) = op.name.local_location() {
+                        runtime_jit_deopt_mark_local_read(location, self.defs, self.reads);
+                    }
+                    if let Some(cell_location) = op.name.cell_location() {
+                        runtime_jit_deopt_mark_cell_read(
+                            cell_location,
+                            self.defs,
+                            self.owned_cell_locations,
+                            self.reads,
+                        );
+                    }
+                }
+                InstrCodegen::Del(op) => {
+                    if let Some(location) = op.name.local_location() {
+                        runtime_jit_deopt_mark_local_read(location, self.defs, self.reads);
+                    }
+                    if let Some(cell_location) = op.name.cell_location() {
+                        runtime_jit_deopt_mark_cell_read(
+                            cell_location,
+                            self.defs,
+                            self.owned_cell_locations,
+                            self.reads,
+                        );
+                    }
+                }
+                InstrCodegen::Store(op) => {
+                    if let Some(cell_location) = op.name.cell_location() {
+                        runtime_jit_deopt_mark_cell_read(
+                            cell_location,
+                            self.defs,
+                            self.owned_cell_locations,
+                            self.reads,
+                        );
+                    }
+                }
+                InstrCodegen::CellRef(op) => runtime_jit_deopt_mark_cell_read(
+                    op.location,
+                    self.defs,
+                    self.owned_cell_locations,
+                    self.reads,
+                ),
+                _ => {}
+            }
+            expr.visit_children(self);
+        }
+
+        fn visit_block_arg(&mut self, arg: &BlockArg) {
+            if let BlockArg::Name(name) = arg
+                && let Some(location) = self.location_by_name.get(name)
+            {
+                runtime_jit_deopt_mark_local_read(*location, self.defs, self.reads);
+            }
+        }
+    }
+
+    LocalReadCollector {
+        defs,
+        location_by_name,
+        owned_cell_locations,
+        reads,
+    }
+    .visit_instr(expr);
+}
+
+fn runtime_jit_deopt_collect_term_local_reads(
+    term: &BlockTerm<InstrCodegen>,
+    defs: &HashSet<LocalLocation>,
+    location_by_name: &HashMap<String, LocalLocation>,
+    owned_cell_locations: &HashMap<u32, LocalLocation>,
+    reads: &mut HashSet<LocalLocation>,
+) {
+    struct TermReadCollector<'a> {
+        defs: &'a HashSet<LocalLocation>,
+        location_by_name: &'a HashMap<String, LocalLocation>,
+        owned_cell_locations: &'a HashMap<u32, LocalLocation>,
+        reads: &'a mut HashSet<LocalLocation>,
+    }
+
+    impl Visit<InstrCodegen> for TermReadCollector<'_> {
+        fn visit_instr(&mut self, expr: &InstrCodegen)
+        where
+            InstrCodegen: ChildVisitable<InstrCodegen>,
+        {
+            runtime_jit_deopt_collect_local_reads(
+                expr,
+                self.defs,
+                self.location_by_name,
+                self.owned_cell_locations,
+                self.reads,
+            );
+        }
+
+        fn visit_block_arg(&mut self, arg: &BlockArg) {
+            if let BlockArg::Name(name) = arg
+                && let Some(location) = self.location_by_name.get(name)
+            {
+                runtime_jit_deopt_mark_local_read(*location, self.defs, self.reads);
+            }
+        }
+    }
+
+    TermReadCollector {
+        defs,
+        location_by_name,
+        owned_cell_locations,
+        reads,
+    }
+    .visit_term(term);
+}
+
+fn runtime_jit_deopt_collect_edge_local_reads(
+    edge: &BlockEdge,
+    defs: &HashSet<LocalLocation>,
+    location_by_name: &HashMap<String, LocalLocation>,
+    reads: &mut HashSet<LocalLocation>,
+) {
+    for arg in &edge.args {
+        if let BlockArg::Name(name) = arg
+            && let Some(location) = location_by_name.get(name)
+        {
+            runtime_jit_deopt_mark_local_read(*location, defs, reads);
+        }
+    }
+}
+
+fn runtime_jit_deopt_mark_local_read(
+    location: LocalLocation,
+    defs: &HashSet<LocalLocation>,
+    reads: &mut HashSet<LocalLocation>,
+) {
+    if !defs.contains(&location) {
+        reads.insert(location);
+    }
+}
+
+fn runtime_jit_deopt_mark_cell_read(
+    cell_location: CellLocation,
+    defs: &HashSet<LocalLocation>,
+    owned_cell_locations: &HashMap<u32, LocalLocation>,
+    reads: &mut HashSet<LocalLocation>,
+) {
+    if let CellLocation::Owned(slot) = cell_location
+        && let Some(location) = owned_cell_locations.get(&slot)
+    {
+        runtime_jit_deopt_mark_local_read(*location, defs, reads);
+    }
 }
 
 fn runtime_jit_deopt_guard_operand_replay_safe(expr: &InstrCodegen) -> bool {
@@ -7993,6 +8320,11 @@ impl JitEmitCtx<'_> {
             .find(|function| function.function_id == self.function_id)
             .ok_or(RuntimeJitDeoptUnsupportedReason::MissingFunction)?;
         runtime_jit_deopt_guard_miss_supported(function, point, pre_guard_operands)?;
+        let entry = self
+            .deopt_resume_plan
+            .entry(point)
+            .ok_or(RuntimeJitDeoptUnsupportedReason::MissingPlanRecord)?;
+        runtime_jit_deopt_guard_miss_resume_entry_supported(function, point, entry)?;
         let deopt_exit = self
             .require_deopt_record_ref(point)
             .map_err(|_| RuntimeJitDeoptUnsupportedReason::MissingPlanRecord)?;
@@ -9840,6 +10172,32 @@ impl<'a, 'b, 'mc, 'c, 'd, Env: JitCodegenEnv> intrinsics::OperationEmitState<'b,
         emit_owned_bool_from_cond(self.fb, cond, self.ctx)
     }
 
+    fn emit_i32_bool01_from_pyobject_truthiness(
+        &mut self,
+        value: ir::Value,
+        facts: PyObjFacts,
+        borrowed: bool,
+        invert: bool,
+    ) -> ir::Value {
+        let is_true_ref = self.func_imports.get_or_panic(
+            self.codegen_env,
+            &mut self.fb.func,
+            &DP_JIT_IS_TRUE_IMPORT,
+        );
+        let mut truth = emit_truthy_from_pyobject_value(
+            self.fb,
+            value,
+            facts,
+            is_true_ref,
+            self.ctx,
+            !borrowed,
+        );
+        if invert {
+            truth = emit_i32_bool01_not(self.fb, truth, self.ctx);
+        }
+        truth.expect_i32_bool01("PyObject truthiness")
+    }
+
     fn emit_owned_bool_from_pyobject_truthiness(
         &mut self,
         value: ir::Value,
@@ -9965,6 +10323,32 @@ impl<'a, 'b, 'mc, 'c, 'd, Env: JitCodegenEnv> intrinsics::OperationEmitState<'b,
 
     fn emit_owned_bool_from_cond(&mut self, cond: ir::Value) -> ir::Value {
         emit_owned_bool_from_cond(self.fb, cond, self.ctx)
+    }
+
+    fn emit_i32_bool01_from_pyobject_truthiness(
+        &mut self,
+        value: ir::Value,
+        facts: PyObjFacts,
+        borrowed: bool,
+        invert: bool,
+    ) -> ir::Value {
+        let is_true_ref = self.func_imports.get_or_panic(
+            self.codegen_env,
+            &mut self.fb.func,
+            &DP_JIT_IS_TRUE_IMPORT,
+        );
+        let mut truth = emit_truthy_from_pyobject_value(
+            self.fb,
+            value,
+            facts,
+            is_true_ref,
+            self.ctx,
+            !borrowed,
+        );
+        if invert {
+            truth = emit_i32_bool01_not(self.fb, truth, self.ctx);
+        }
+        truth.expect_i32_bool01("PyObject truthiness")
     }
 
     fn emit_owned_bool_from_pyobject_truthiness(
@@ -11892,6 +12276,18 @@ fn emit_owned_bool_from_i32_result(
     result: ir::Value,
     ctx: &JitEmitCtx<'_>,
 ) -> ir::Value {
+    let truth = emit_i32_bool01_from_i32_result_or_error(fb, result, ctx);
+    let (bool_value, _, _) =
+        emit_to_python_bool(fb, SoacValue::i32(truth, IntFacts::i32_bool01()), ctx)
+            .expect_pyobject("bool materialize");
+    bool_value
+}
+
+fn emit_i32_bool01_from_i32_result_or_error(
+    fb: &mut FunctionBuilder<'_>,
+    result: ir::Value,
+    ctx: &JitEmitCtx<'_>,
+) -> ir::Value {
     let is_error = fb.ins().icmp_imm(ir::condcodes::IntCC::Equal, result, -1);
     let ok_block = fb.create_block();
     fb.ins().brif(
@@ -11903,9 +12299,7 @@ fn emit_owned_bool_from_i32_result(
     );
     fb.switch_to_block(ok_block);
     let truth = emit_i32_bool01_from_i32_result(fb, result, ctx);
-    let (bool_value, _, _) =
-        emit_to_python_bool(fb, truth, ctx).expect_pyobject("bool materialize");
-    bool_value
+    truth.expect_i32_bool01("i32 result truthiness")
 }
 
 fn emit_owned_bool_from_pyobject_truthiness(
@@ -20222,6 +20616,26 @@ fn emit_typed_codegen_i32_bool01_result_with_local_env(
     codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<EmitResult, String> {
+    let direct_bool_expr = match expr {
+        InstrTyped::BinOp(_) => Some(expr),
+        InstrTyped::Truthy(op) if matches!(op.value(), InstrTyped::BinOp(_)) => Some(op.value()),
+        _ => None,
+    };
+    if let Some(direct_bool_expr) = direct_bool_expr {
+        let mut intrinsic_state = LocalEnvCodegenIntrinsicEmitState {
+            fb,
+            local_env,
+            ctx: emit_ctx,
+            codegen_env,
+            func_imports,
+        };
+        if let Some(truth_i32) =
+            intrinsics::emit_typed_i32_bool01_operation(direct_bool_expr, &mut intrinsic_state)
+        {
+            return Ok(EmitResult::i32(truth_i32, IntFacts::i32_bool01()));
+        }
+    }
+
     let is_true_ref = func_imports.get(codegen_env, &mut fb.func, &DP_JIT_IS_TRUE_IMPORT)?;
     let value = emit_typed_codegen_expr_value_with_local_env(
         fb,
@@ -20880,7 +21294,6 @@ fn emit_codegen_term(
     emit_ctx: &JitEmitCtx<'_>,
     codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
-    is_true_ref: ir::FuncRef,
     pyobject_to_i64_ref: ir::FuncRef,
     raise_exc_ref: ir::FuncRef,
     current_exception_name: Option<&str>,
@@ -20968,6 +21381,8 @@ fn emit_codegen_term(
                     .expect_i32_bool01("direct receiver type-version guard")
                 }
                 _ => {
+                    let is_true_ref =
+                        func_imports.get(codegen_env, &mut fb.func, &DP_JIT_IS_TRUE_IMPORT)?;
                     let test_value = emit_codegen_expr_value_with_local_env(
                         fb,
                         &if_term.test,
@@ -21092,7 +21507,6 @@ fn emit_typed_codegen_term(
     emit_ctx: &JitEmitCtx<'_>,
     codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
-    is_true_ref: ir::FuncRef,
     pyobject_to_i64_ref: ir::FuncRef,
     raise_exc_ref: ir::FuncRef,
     current_exception_name: Option<&str>,
@@ -21296,7 +21710,6 @@ fn emit_typed_codegen_term(
         emit_ctx,
         codegen_env,
         func_imports,
-        is_true_ref,
         pyobject_to_i64_ref,
         raise_exc_ref,
         current_exception_name,
@@ -25279,8 +25692,6 @@ fn build_cranelift_run_bb_specialized_function(
             &mut fb.func,
             &DP_JIT_LOAD_RUNTIME_OBJ_BY_ID_IMPORT,
         );
-        let is_true_ref =
-            func_imports.get_or_panic(codegen_env, &mut fb.func, &DP_JIT_IS_TRUE_IMPORT);
         let raise_exc_ref =
             func_imports.get_or_panic(codegen_env, &mut fb.func, &DP_JIT_RAISE_FROM_EXC_IMPORT);
         let push_handled_exception_ref = func_imports.get_or_panic(
@@ -25687,7 +26098,6 @@ fn build_cranelift_run_bb_specialized_function(
                 term_emit_ctx,
                 codegen_env,
                 &mut func_imports,
-                is_true_ref,
                 pyobject_to_i64_ref,
                 raise_exc_ref,
                 codegen_block.exception_param(),

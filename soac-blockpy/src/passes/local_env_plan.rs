@@ -550,17 +550,16 @@ pub fn plan_function_locals(
                 } else {
                     PlannedLocalStorage::StackSlot
                 };
-                let binding_facts =
-                    if explicit_param_names.contains(name.as_str()) || is_function_param_on_entry {
-                        ParamBindingFacts::DefinitelyBound
-                    } else if is_must_bound_on_entry {
-                        match storage {
-                            PlannedLocalStorage::BlockParam => ParamBindingFacts::DefinitelyBound,
-                            PlannedLocalStorage::StackSlot => ParamBindingFacts::CheckedLocalValue,
-                        }
-                    } else {
-                        ParamBindingFacts::MaybeUnbound
-                    };
+                let binding_facts = if is_function_param_on_entry {
+                    ParamBindingFacts::DefinitelyBound
+                } else if is_must_bound_on_entry {
+                    match storage {
+                        PlannedLocalStorage::BlockParam => ParamBindingFacts::DefinitelyBound,
+                        PlannedLocalStorage::StackSlot => ParamBindingFacts::CheckedLocalValue,
+                    }
+                } else {
+                    ParamBindingFacts::MaybeUnbound
+                };
                 let provenance = if explicit_param_names.contains(name.as_str()) {
                     ParamProvenance::ExplicitBlockParam(location)
                 } else if is_function_param_on_entry {
@@ -875,11 +874,11 @@ fn local_ref_kind_for_block_entry(
     if is_entry_block && function.params.iter().any(|param| param.name == name) {
         return LocalRefKind::Owned;
     }
-    if is_explicit_block_param {
-        return LocalRefKind::Owned;
-    }
     if is_must_bound_on_entry {
         return LocalRefKind::Owned;
+    }
+    if is_explicit_block_param {
+        return LocalRefKind::Unknown;
     }
     LocalRefKind::Unbound
 }
