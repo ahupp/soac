@@ -367,6 +367,14 @@ impl SharedModuleState {
                     | "global_indexed_fallback"
                     | "field_indexed_hit"
                     | "field_indexed_fallback"
+                    | "operator_specialized_hit"
+                    | "operator_specialized_fallback"
+                    | "getitem_specialized_hit"
+                    | "getitem_specialized_fallback"
+                    | "setitem_specialized_hit"
+                    | "setitem_specialized_fallback"
+                    | "call_direct_hit"
+                    | "call_direct_fallback"
                     | "deopt_entry_guard_miss"
             ) {
                 continue;

@@ -1379,7 +1379,7 @@ benchmark benchmark_loops="1000000" verify_loops="100000" results_root="bench" r
     run_apply_pass enabled 1
   } 2>&1 | tee "$report"
 
-  python3 "$REPO_ROOT/scripts/summarize_benchmark_result.py" \
+  "$VENV_DIR/bin/python" "$REPO_ROOT/scripts/summarize_benchmark_result.py" \
     "$result_dir" \
     --json-out "$result_dir/summary.json" \
     | tee "$result_dir/summary.txt" \

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import re
 from collections import defaultdict
@@ -11,6 +12,15 @@ from typing import Any
 
 
 RAW_LOOPS_PER_S_RE = re.compile(r"^\s*(\d+)\s+(\d+)\s+loops/s\s*$")
+RUNTIME_FALLBACK_KINDS = {
+    "global_indexed_fallback",
+    "field_indexed_fallback",
+    "operator_specialized_fallback",
+    "getitem_specialized_fallback",
+    "setitem_specialized_fallback",
+    "call_direct_fallback",
+}
+DEOPT_CALL_KIND = "deopt_entry_guard_miss"
 
 
 def parse_args() -> argparse.Namespace:
@@ -211,9 +221,84 @@ def parse_jit_code_size(jit_bb_map_path: Path) -> dict[str, Any] | None:
     }
 
 
+def parse_specialization_runtime_stats(events_path: Path) -> dict[str, Any]:
+    by_kind: dict[str, int] = defaultdict(int)
+    if events_path.is_file():
+        for line in events_path.read_text().splitlines():
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if record.get("event") != "soac.specialization_runtime":
+                continue
+            kind = str(record.get("kind") or "")
+            try:
+                value = int(record.get("value") or 0)
+            except (TypeError, ValueError):
+                continue
+            if value <= 0:
+                continue
+            by_kind[kind] += value
+
+    guard_failures = by_kind.get(DEOPT_CALL_KIND, 0) + sum(
+        by_kind.get(kind, 0) for kind in RUNTIME_FALLBACK_KINDS
+    )
+    return {
+        "deopt_calls": by_kind.get(DEOPT_CALL_KIND, 0),
+        "guard_failures": guard_failures,
+        "by_kind": dict(sorted(by_kind.items())),
+        "source": str(events_path),
+    }
+
+
+def parse_specialization_counter_dump_stats(counter_dump_path: Path) -> dict[str, Any] | None:
+    if not counter_dump_path.is_file():
+        return None
+
+    try:
+        soac = importlib.import_module("soac")
+        ext = soac._soac_ext
+    except Exception:
+        return None
+
+    try:
+        records = json.loads(ext.inspect_counter_dump_json(str(counter_dump_path)))["records"]
+    except Exception:
+        return None
+
+    by_kind: dict[str, int] = defaultdict(int)
+    for record in records:
+        for row in record.get("rows", []):
+            kind = str(row.get("kind") or "")
+            try:
+                value = int(row.get("value") or 0)
+            except (TypeError, ValueError):
+                continue
+            if value <= 0:
+                continue
+            by_kind[kind] += value
+
+    guard_failures = by_kind.get(DEOPT_CALL_KIND, 0) + sum(
+        by_kind.get(kind, 0) for kind in RUNTIME_FALLBACK_KINDS
+    )
+    return {
+        "deopt_calls": by_kind.get(DEOPT_CALL_KIND, 0),
+        "guard_failures": guard_failures,
+        "by_kind": dict(sorted(by_kind.items())),
+        "source": str(counter_dump_path),
+    }
+
+
+def parse_specialization_stats(result_dir: Path) -> dict[str, Any]:
+    return parse_specialization_counter_dump_stats(result_dir / "counters" / "verify.bin") or (
+        parse_specialization_runtime_stats(result_dir / "counters" / "events.jsonl")
+    )
+
+
 def format_summary(summary: dict[str, Any]) -> str:
     benchmark = summary["benchmark"]
     code_size = summary.get("jit_code_size")
+    runtime_stats = summary.get("specialization_runtime") or {}
 
     def maybe(value: Any) -> str:
         return "n/a" if value is None or value == "" else str(value)
@@ -245,7 +330,15 @@ def format_summary(summary: dict[str, Any]) -> str:
         f"{maybe(benchmark['apply_refcounts_disabled_loops_per_s_min'])}",
         "apply max loops/s (refcounts disabled): "
         f"{maybe(benchmark['apply_refcounts_disabled_loops_per_s_max'])}",
+        f"specialization stats source: {maybe(runtime_stats.get('source'))}",
+        f"specialization deopt calls: {maybe(runtime_stats.get('deopt_calls'))}",
+        f"specialization guard failures: {maybe(runtime_stats.get('guard_failures'))}",
     ]
+    by_kind = runtime_stats.get("by_kind") or {}
+    if by_kind:
+        lines.append("specialization counters by kind:")
+        for kind, value in by_kind.items():
+            lines.append(f"  {kind}: {value}")
 
     if code_size is None:
         lines.append("latest pystone jit code size: n/a")
@@ -278,6 +371,7 @@ def main() -> int:
         "result_dir": str(result_dir),
         "benchmark": parse_benchmark_report(result_dir / "benchmark.txt"),
         "jit_code_size": parse_jit_code_size(result_dir / "counters" / "jit-bb-map.jsonl"),
+        "specialization_runtime": parse_specialization_stats(result_dir),
     }
 
     if args.json_out is not None:
