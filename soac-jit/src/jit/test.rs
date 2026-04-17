@@ -3656,6 +3656,32 @@ def build(values):
     }
 
     #[test]
+    fn typed_planned_result_extra_marks_module_constant_inputs_immortal() {
+        let attr_instr_id = InstrId::new(BlockLabel::from_index(0), 1);
+        let mut constants = TestConstantPool::default();
+        let function = with_single_test_block(
+            test_function(),
+            vec![],
+            ret_term(op_expr(GetAttr::new(
+                name_expr(test_name("obj")),
+                with_instr_id(constants.string_expr("field"), attr_instr_id),
+            ))),
+        );
+        let mut module = test_module(ModuleNameGen::new(0), vec![function]);
+        module.module_constants = constants.module_constants;
+        let facts = infer_module_value_facts(&module);
+        let mut typed_function = lower_codegen_function_to_typed(module.callable_defs[0].clone());
+        annotate_typed_function_value_facts(&mut typed_function, &facts);
+        refresh_typed_function_value_facts(&mut typed_function);
+        let typed_function = annotate_test_result_demands_and_plans(typed_function);
+
+        assert_eq!(
+            typed_planned_result_for_instr_id(&typed_function, attr_instr_id),
+            Some(PlannedResult::PYOBJECT_IMMORTAL)
+        );
+    }
+
+    #[test]
     fn typed_result_demand_extra_marks_local_store_rhs_pyobject_owned() {
         let mut constants = TestConstantPool::default();
         let store_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
@@ -4773,6 +4799,21 @@ def build(values):
                 None,
             ),
             Some(false)
+        );
+
+        let mut immortal_extra = TypedInstrExtra::default();
+        immortal_extra.set_planned_result(PlannedResult::PYOBJECT_IMMORTAL);
+        let immortal_expr = InstrTyped::Load(
+            Load::<InstrTyped>::new(test_constant_name(0)).with_extra(immortal_extra),
+        );
+        assert_eq!(
+            typed_expr_planned_pyobject_input_is_borrowed_from_local_env(
+                &immortal_expr,
+                &LocalEnv::default(),
+                &stack_slots,
+                None,
+            ),
+            Some(true)
         );
     }
 
@@ -16428,7 +16469,7 @@ def f(x, y):
     }
 
     #[test]
-    fn render_specialized_jit_assignments_sync_function_state_slots() {
+    fn specialized_jit_assignment_to_direct_entry_param_avoids_stack_mirror() {
         let blocks = [1usize as ObjPtr];
         let mut constants = TestConstantPool::default();
         let mut function = with_single_test_block(
@@ -16436,17 +16477,22 @@ def f(x, y):
             vec![assign_stmt(test_name("x"), constants.int_expr(7))],
             ret_term(name_expr(test_name("x"))),
         );
+        function.params = ParamSpec {
+            params: vec![test_param("x", ParamKind::Any, false)],
+        };
         set_stack_slots(&mut function, &["x"]);
-        let rendered = render_test_jit_function_with_module_constants(
-            &function,
-            &blocks,
-            constants.module_constants,
-        );
-        assert!(
-            rendered.contains("store.i64")
-                || rendered.contains("stack_store")
-                || rendered.contains("store notrap"),
-            "assignment-backed JIT plans should update mirrored function-state slots:\n{rendered}"
+        let mut module = test_module(ModuleNameGen::new(0), vec![function.clone()]);
+        module.module_constants = constants.module_constants;
+        let function = module.callable_defs[0].clone();
+        let module_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+        let built =
+            build_test_jit_function_with_constants(&module, &function, &blocks, &module_constants);
+        assert_eq!(
+            count_opcode(&built.ctx.func, ir::Opcode::StackStore),
+            0,
+            "direct-entry param assignments should stay in LocalEnv without stack-slot mirroring:\n{}",
+            built.ctx.func.display()
         );
     }
 
@@ -16924,7 +16970,10 @@ def f(x, y):
             let deopt_helpers = import_user_names_for_symbols(&built, &["dp_jit_deopt_resume"]);
             let generic_call_helpers = import_user_names_for_symbols(
                 &built,
-                &[DP_JIT_PY_CALL_POSITIONAL_THREE_IMPORT.symbol],
+                &[
+                    DP_JIT_PY_CALL_POSITIONAL_THREE_IMPORT.symbol,
+                    DP_JIT_PY_VECTORCALL_IMPORT.symbol,
+                ],
             );
             assert_eq!(
                 count_direct_calls_to_runtime_helpers(&built.ctx.func, &deopt_helpers),
@@ -16964,7 +17013,10 @@ def f(x, y):
             let deopt_helpers = import_user_names_for_symbols(&built, &["dp_jit_deopt_resume"]);
             let generic_call_helpers = import_user_names_for_symbols(
                 &built,
-                &[DP_JIT_PY_CALL_POSITIONAL_THREE_IMPORT.symbol],
+                &[
+                    DP_JIT_PY_CALL_POSITIONAL_THREE_IMPORT.symbol,
+                    DP_JIT_PY_VECTORCALL_IMPORT.symbol,
+                ],
             );
             assert_eq!(
                 count_direct_calls_to_runtime_helpers(&built.ctx.func, &deopt_helpers),
@@ -16972,7 +17024,10 @@ def f(x, y):
                 "replay-unsafe callable expressions should keep the local fallback instead of deopt"
             );
             assert_eq!(
-                count_direct_calls_to_runtime_helpers(&built.ctx.func, &generic_call_helpers),
+                count_cold_block_direct_calls_to_runtime_helpers(
+                    &built.ctx.func,
+                    &generic_call_helpers
+                ),
                 1,
                 "replay-unsafe callable expressions should still emit the generic fallback call"
             );

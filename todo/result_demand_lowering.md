@@ -163,6 +163,10 @@ input ownership instead of dropping back to legacy expression-shape checks.
 Plain positional generic typed calls now use the same typed input emission path
 when no runtime-helper, unpacking, keyword, or direct-specialization case needs
 the legacy call emitter.
+Guarded/profiler-derived direct callable and constructor specializations now
+also emit callable and positional arguments from typed operands, including their
+cold generic fallback path, so planned borrowed/immortal input ownership
+survives the specialization guard lowering.
 Typed attribute get/set fallback and indexed field get/set emission now also
 consume typed PyObject input ownership and release only operands that were
 actually materialized as owned temporaries.

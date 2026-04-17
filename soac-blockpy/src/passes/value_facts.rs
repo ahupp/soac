@@ -247,6 +247,11 @@ impl PyObjFacts {
         self
     }
 
+    pub const fn with_immortal_refcount(mut self) -> Self {
+        self.refcount = RefcountFact::Immortal;
+        self
+    }
+
     pub const fn runtime_helper(helper: RuntimeHelperId) -> Self {
         Self {
             ty: TypeFact::Unknown,
@@ -870,10 +875,16 @@ fn module_constant_load_fact(index: u32, module_constant_facts: &[ValueFacts]) -
         .get(index as usize)
         .copied()
         .map(|facts| match facts {
-            ValueFacts::PyObj(py_facts) => ValueFacts::PyObj(py_facts.with_module_constant(index)),
+            ValueFacts::PyObj(py_facts) => ValueFacts::PyObj(
+                py_facts
+                    .with_module_constant(index)
+                    .with_immortal_refcount(),
+            ),
             ValueFacts::I32(_) | ValueFacts::I64(_) | ValueFacts::Bool(_) => facts,
         })
-        .unwrap_or_else(|| ValueFacts::PyObj(PyObjFacts::module_constant(index)))
+        .unwrap_or_else(|| {
+            ValueFacts::PyObj(PyObjFacts::module_constant(index).with_immortal_refcount())
+        })
 }
 
 fn infer_module_constant_facts(expr: &InstrResolved) -> ValueFacts {
@@ -938,8 +949,8 @@ pub fn infer_module_value_facts(module: &BlockPyModule<CodegenModuleShape>) -> F
 #[cfg(test)]
 mod test {
     use super::{
-        infer_module_value_facts, BoolSingletonFact, CallableFact, EnvFacts, PyExactType,
-        PyObjFacts, RefcountFact, RuntimeHelperId, ThrowSpec, ValueFacts,
+        infer_module_value_facts, BoolSingletonFact, CallableFact, EnvFacts, ProvenanceFact,
+        PyExactType, PyObjFacts, RefcountFact, RuntimeHelperId, ThrowSpec, ValueFacts,
     };
     use crate::block_py::{
         BlockTerm, CallArgPositional, CallDirect, ChildVisitable, FunctionId, HasMeta,
@@ -1149,6 +1160,17 @@ def f(x, flag):
         assert_eq!(py_facts.bool_singleton, BoolSingletonFact::IsFalse);
         assert_eq!(py_facts.refcount, RefcountFact::Immortal);
         assert_eq!(py_facts.is_truthy(), Some(false));
+    }
+
+    #[test]
+    fn infers_immortal_refcount_for_module_constant_loads() {
+        let py_facts = returned_py_facts("'field'");
+        assert!(py_facts.is_exact_type(PyExactType::Str));
+        assert_eq!(py_facts.refcount, RefcountFact::Immortal);
+        assert!(matches!(
+            py_facts.provenance,
+            ProvenanceFact::ModuleConstant(_)
+        ));
     }
 
     #[test]

@@ -5,6 +5,22 @@ optimization attempts made by Codex agents. Keep entries succinct: what
 changed or was tried, which jj change id carried it when landed, the
 benchmarked throughput delta, and the headline pre/post numbers.
 
+## 2026-04-17 - Preserve typed direct-call and module-constant ownership
+
+- jj change id: `vwopwllm`
+- summary: Guarded direct-call and constructor specialization now keep callable
+  and positional operands in typed form through guard, direct, and cold fallback
+  emission. Module-constant PyObject facts are also marked immortal, matching
+  runtime materialization, so borrowed/immortal ownership survives into generated
+  code.
+- throughput: `+3.29%` median with pinned benchmark
+- pre-change benchmark:
+  - specialized pass, 1M loops x3: `248185`, `261597`, `255189 loops/s`
+- post-change benchmark:
+  - specialized pass, 1M loops x3: `262954`, `263587`, `265192 loops/s`
+- refcount counters: unchanged in a 100k-loop verify run
+- code size: `506671` to `485210 bytes` total pystone code size
+
 ## 2026-04-17 - Preserve typed attribute operand ownership
 
 - jj change id: `snwwtlsy`
