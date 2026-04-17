@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    soac_blockpy::init_logging()?;
+    soac_config::init_logging()?;
     prepare_python();
 
     let host = std::env::var("HOST").unwrap_or_else(|_| "127.0.0.1".to_string());

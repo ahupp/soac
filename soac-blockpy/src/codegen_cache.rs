@@ -59,6 +59,42 @@ pub struct CachedCodegenModuleMetadata {
     pub cache_identity: String,
 }
 
+pub fn pre_optimization_module_cache_identity(
+    build_identity: &str,
+    runtime_names_as_globals: bool,
+) -> String {
+    format!("{build_identity};runtime_names_as_globals={runtime_names_as_globals}")
+}
+
+pub fn pre_optimization_module_cache_metadata(
+    source: PythonModuleCacheSource,
+    module_name: &str,
+    source_hash: u64,
+    build_identity: &str,
+    runtime_names_as_globals: bool,
+) -> CachedCodegenModuleMetadata {
+    CachedCodegenModuleMetadata {
+        source,
+        module_name: module_name.to_string(),
+        source_hash,
+        cache_identity: pre_optimization_module_cache_identity(
+            build_identity,
+            runtime_names_as_globals,
+        ),
+    }
+}
+
+pub fn pre_optimization_module_cache_path(
+    cache_root: &Path,
+    source: PythonModuleCacheSource,
+    module_name: &str,
+    _source_hash: u64,
+    _build_identity: &str,
+    _runtime_names_as_globals: bool,
+) -> std::result::Result<PathBuf, String> {
+    codegen_module_cache_path(cache_root, source, module_name).map_err(|err| err.to_string())
+}
+
 #[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct CachedCodegenModule {
     pub metadata: CachedCodegenModuleMetadata,

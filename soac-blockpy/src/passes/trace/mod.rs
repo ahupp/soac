@@ -5,10 +5,10 @@ use crate::block_py::{
     IncrementCounter, InstrCodegen, InstrResolved, Load, Meta, NameLocation, ResolvedName,
     RuntimeName, StringLiteral, Tuple, Visit, WithMeta,
 };
-use crate::env_config::{SoacEnvConfig, SpecializationMode};
 use crate::passes::{
     CodegenModuleShape, CounterBuilder, LocalEnvResumeModulePlan, LocalEnvResumePoint,
 };
+use soac_config::{SoacEnvConfig, SpecializationMode};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -1738,9 +1738,16 @@ dependencies = [
  "ruff_text_size",
  "serde_json",
  "similar",
+ "soac-config",
  "soac-core",
  "soac-macros",
  "tracing",
+]
+
+[[package]]
+name = "soac-config"
+version = "0.1.0"
+dependencies = [
  "tracing-subscriber",
 ]
 
@@ -1755,6 +1762,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "soac-cpython"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "pyo3",
+]
+
+[[package]]
 name = "soac-inspector"
 version = "0.1.0"
 dependencies = [
@@ -1766,6 +1781,8 @@ dependencies = [
  "serde",
  "serde_json",
  "soac-blockpy",
+ "soac-config",
+ "soac-cpython",
  "soac-jit",
  "tokio",
  "tower",
@@ -1793,6 +1810,8 @@ dependencies = [
  "ruff_python_ast",
  "serde_json",
  "soac-blockpy",
+ "soac-config",
+ "soac-cpython",
  "tracing",
 ]
 
@@ -1810,8 +1829,11 @@ name = "soac-pyo3"
 version = "0.1.0"
 dependencies = [
  "pyo3",
+ "rkyv",
  "serde_json",
  "soac-blockpy",
+ "soac-config",
+ "soac-cpython",
  "soac-jit",
  "tracing",
 ]

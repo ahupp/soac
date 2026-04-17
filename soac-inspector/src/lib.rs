@@ -24,7 +24,6 @@ use soac_jit::{
 };
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
-use std::sync::Once;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tower_http::services::ServeDir;
 
@@ -35,7 +34,6 @@ pub use soac_jit::counter_dump::{
 };
 
 static NEXT_WEB_MODULE_ID: AtomicU64 = AtomicU64::new(1);
-static PYTHON_INIT: Once = Once::new();
 
 #[derive(Clone)]
 pub struct AppState {
@@ -136,44 +134,8 @@ pub fn app_with_state(state: AppState) -> Router {
 }
 
 pub fn prepare_python() {
-    PYTHON_INIT.call_once(|| {
-        configure_embedded_python_env();
-        Python::initialize();
-    });
-}
-
-fn configure_embedded_python_env() {
-    let repo_root = repo_root();
-    let python_home = repo_root.join("vendor/cpython");
-    let mut python_path_entries = vec![python_home.join("Lib")];
-    if let Some(build_lib_dir) = find_python_build_lib_dir(&python_home) {
-        python_path_entries.push(build_lib_dir);
-    }
-    let python_path =
-        std::env::join_paths(python_path_entries).expect("vendored CPython paths should be valid");
-    // Configure the embedded interpreter to use the vendored CPython tree
-    // before the first interpreter initialization.
-    unsafe {
-        std::env::set_var("PYTHONHOME", &python_home);
-        std::env::set_var("PYTHONPATH", &python_path);
-    }
-}
-
-fn find_python_build_lib_dir(python_home: &Path) -> Option<PathBuf> {
-    let build_dir = python_home.join("build");
-    let entries = std::fs::read_dir(build_dir).ok()?;
-    for entry in entries {
-        let path = entry.ok()?.path();
-        if path.is_dir()
-            && path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("lib."))
-        {
-            return Some(path);
-        }
-    }
-    None
+    soac_cpython::initialize_vendored_python("soac-inspector")
+        .expect("embedded Python should initialize");
 }
 
 fn find_venv_site_packages(repo_root: &Path) -> Option<PathBuf> {

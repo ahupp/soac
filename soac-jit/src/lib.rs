@@ -33,8 +33,6 @@ pub(crate) fn python_runtime_test_lock() -> &'static Mutex<()> {
 
 use pyo3::ffi;
 use pyo3::prelude::*;
-#[cfg(test)]
-use pyo3::types::PyAnyMethods;
 use soac_blockpy::block_py::{FunctionExecutionMode, FunctionKind, ParamKind, RuntimeFunctionId};
 use soac_blockpy::passes::CodegenModuleShape;
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
@@ -48,92 +46,13 @@ use std::time::Instant;
 use tracing::info;
 
 #[cfg(test)]
-pub(crate) fn test_repo_root() -> &'static std::path::Path {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("workspace crate should have a repo-root parent")
-}
-
-#[cfg(test)]
-fn vendored_python_home_for_test() -> std::path::PathBuf {
-    test_repo_root().join("vendor").join("cpython")
-}
-
-#[cfg(test)]
-fn vendored_python_build_lib_dir_for_test(python_home: &std::path::Path) -> std::path::PathBuf {
-    let rel_build_dir = std::fs::read_to_string(python_home.join("pybuilddir.txt"))
-        .expect("vendored CPython pybuilddir.txt should exist");
-    python_home.join(rel_build_dir.trim())
-}
-
-#[cfg(test)]
-pub(crate) fn test_extension_staging_dir() -> std::path::PathBuf {
-    let staging_dir = test_repo_root()
-        .join("target")
-        .join("debug")
-        .join("test-ext");
-    let source_ext = test_repo_root()
-        .join("target")
-        .join("debug")
-        .join("lib_soac_ext.so");
-    let staged_ext = staging_dir.join("_soac_ext.so");
-    std::fs::create_dir_all(&staging_dir).expect("test extension staging dir should exist");
-    if source_ext.exists() {
-        let needs_symlink = std::fs::read_link(&staged_ext)
-            .map(|target| target != source_ext)
-            .unwrap_or(true);
-        if needs_symlink {
-            if std::fs::symlink_metadata(&staged_ext).is_ok() {
-                std::fs::remove_file(&staged_ext)
-                    .expect("stale staged _soac_ext should be removable");
-            }
-            std::os::unix::fs::symlink(&source_ext, &staged_ext)
-                .expect("staged _soac_ext symlink should be creatable");
-        }
-    }
-    staging_dir
-}
-
-#[cfg(test)]
-fn test_python_import_paths(python_home: &std::path::Path) -> Vec<std::path::PathBuf> {
-    vec![
-        python_home.join("Lib"),
-        vendored_python_build_lib_dir_for_test(python_home),
-        test_repo_root().join("soac_py").join("src"),
-        test_extension_staging_dir(),
-    ]
+pub(crate) fn test_repo_root() -> std::path::PathBuf {
+    soac_cpython::repo_root()
 }
 
 #[cfg(test)]
 pub(crate) fn initialize_test_python() {
-    let python_home = vendored_python_home_for_test();
-    let import_paths = test_python_import_paths(&python_home);
-    let python_path = std::env::join_paths(&import_paths).expect("test PYTHONPATH should join");
-    unsafe {
-        std::env::set_var("PYTHONHOME", &python_home);
-        std::env::set_var("PYTHONPATH", python_path);
-    }
-    Python::initialize();
-    Python::attach(|py| {
-        let sys_path = py
-            .import("sys")
-            .expect("sys should import")
-            .getattr("path")
-            .expect("sys.path should exist");
-        for path in import_paths.iter().rev() {
-            let path = path.to_string_lossy().into_owned();
-            let present = sys_path
-                .call_method1("__contains__", (path.as_str(),))
-                .expect("sys.path membership should work")
-                .extract::<bool>()
-                .expect("sys.path membership should return bool");
-            if !present {
-                sys_path
-                    .call_method1("insert", (0, path.as_str()))
-                    .expect("sys.path should accept test import path");
-            }
-        }
-    });
+    soac_cpython::initialize_test_python("soac-jit-test").expect("test Python should initialize");
 }
 
 #[cfg(test)]

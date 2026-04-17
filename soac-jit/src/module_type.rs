@@ -16,11 +16,11 @@ use soac_blockpy::block_py::{
     DeoptEntrySource, FunctionExecutionMode, RuntimeFunctionId, RuntimeName,
 };
 use soac_blockpy::codegen_cache::PythonModuleCacheSource;
-use soac_blockpy::env_config::SoacEnvConfig;
 use soac_blockpy::passes::{
     CodegenModuleShape, InlinePlanModule, plan_module_inlining,
     specialization_runtime_logging_enabled, summarize_module_escapes,
 };
+use soac_config::SoacEnvConfig;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, c_int, c_void};
 use std::fs::{OpenOptions, create_dir_all};

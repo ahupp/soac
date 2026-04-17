@@ -7,8 +7,8 @@ use std::process::Command;
 
 use soac_blockpy::block_py::BlockPyModule;
 use soac_blockpy::fixture::{parse_fixture, render_fixture, FixtureBlock};
+use soac_blockpy::lower_python_to_blockpy_for_testing;
 use soac_blockpy::passes::CodegenModuleShape;
-use soac_blockpy::{init_logging, lower_python_to_blockpy_for_testing};
 use tracing::{enabled, trace, Level};
 
 struct SnapshotSummaryRow {
@@ -393,7 +393,7 @@ fn write_summary(summary: &[SnapshotSummaryRow]) -> Result<(), String> {
 }
 
 fn main() -> Result<(), String> {
-    init_logging()?;
+    soac_config::init_logging()?;
     fs::create_dir_all(snapshot_dir()?)
         .map_err(|err| format!("failed to create snapshot dir: {}", err))?;
     let args: Vec<String> = env::args().skip(1).collect();

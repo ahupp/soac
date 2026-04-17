@@ -11,16 +11,12 @@ use ruff_python_codegen::{Generator, Indentation};
 pub use ruff_python_parser::ParseError;
 use ruff_source_file::LineEnding;
 use ruff_text_size::TextRange;
-use std::fs::{self, OpenOptions};
-use std::path::Path;
-use std::sync::Arc;
+use soac_config::{init_logging_with_config, SoacEnvConfig};
 use std::time::{Duration, Instant};
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 pub mod block_py;
 pub mod codegen_cache;
 mod driver;
-pub mod env_config;
 pub mod fixture;
 mod namegen;
 pub mod pass_tracker;
@@ -68,63 +64,6 @@ impl From<AnyhowError> for LoweringError {
     }
 }
 
-fn open_soac_log_file(path: &Path) -> std::io::Result<Arc<std::fs::File>> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map(Arc::new)
-}
-
-pub fn init_logging() -> std::result::Result<(), String> {
-    let config = env_config::SoacEnvConfig::from_env()?;
-    init_logging_with_config(&config)
-}
-
-pub fn init_logging_with_config(
-    config: &env_config::SoacEnvConfig,
-) -> std::result::Result<(), String> {
-    let env_config::SoacLogConfig { filter, json_path } = config.soac_log().clone();
-    let filter = EnvFilter::builder()
-        .parse(filter)
-        .map_err(|err| format!("failed to parse SOAC_LOG filter: {err}"))?;
-    let registry = tracing_subscriber::registry().with(filter);
-    if let Some(json_path) = json_path {
-        match open_soac_log_file(&json_path) {
-            Ok(json_file) => {
-                let json_layer = fmt::layer()
-                    .json()
-                    .flatten_event(true)
-                    .with_writer(move || {
-                        json_file
-                            .try_clone()
-                            .expect("failed to clone SOAC_LOG json file")
-                    });
-                let _ = registry.with(json_layer).try_init();
-            }
-            Err(err) => {
-                eprintln!(
-                    "[soac logging] failed to open SOAC_LOG json file {}: {err}",
-                    json_path.display()
-                );
-                return Err(format!(
-                    "failed to open SOAC_LOG json file {}: {err}",
-                    json_path.display()
-                ));
-            }
-        }
-    } else {
-        let fmt_layer = fmt::layer()
-            .with_writer(std::io::stderr)
-            .with_ansi(!cfg!(test));
-        let _ = registry.with(fmt_layer).try_init();
-    }
-    Ok(())
-}
-
 pub struct LoweringResult<P = RecordingPassTracker> {
     pub total_time: Duration,
     pub codegen_module: BlockPyModule<CodegenModuleShape>,
@@ -156,7 +95,7 @@ fn lower_python_to_blockpy_with_tracker_and_options<P>(
 where
     P: PassTracker,
 {
-    let env_config = env_config::SoacEnvConfig::from_env().map_err(anyhow::Error::msg)?;
+    let env_config = SoacEnvConfig::from_env().map_err(anyhow::Error::msg)?;
     init_logging_with_config(&env_config).map_err(anyhow::Error::msg)?;
     namegen::reset_namegen_state();
     let total_start = Instant::now();

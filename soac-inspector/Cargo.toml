@@ -8,6 +8,8 @@ build = "build.rs"
 anyhow = { version = "1.0.100", features = ["backtrace"] }
 axum = "0.8"
 soac-blockpy = { path = "../soac-blockpy" }
+soac-config = { path = "../soac-config" }
+soac-cpython = { path = "../soac-cpython" }
 pyo3 = { workspace = true }
 rkyv = { version = "0.8", features = ["alloc"] }
 serde = { version = "1", features = ["derive"] }

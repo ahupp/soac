@@ -2226,44 +2226,24 @@ mod tests {
             return;
         }
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        let prior = std::env::var_os(soac_blockpy::env_config::SOAC_JIT_PERF_HELPER_FRAMES_ENV);
-        unsafe { std::env::remove_var(soac_blockpy::env_config::SOAC_JIT_PERF_HELPER_FRAMES_ENV) };
+        let prior = std::env::var_os(soac_config::SOAC_JIT_PERF_HELPER_FRAMES_ENV);
+        unsafe { std::env::remove_var(soac_config::SOAC_JIT_PERF_HELPER_FRAMES_ENV) };
         assert!(!crate::config::jit_perf_helper_frames_enabled().unwrap());
 
-        unsafe {
-            std::env::set_var(
-                soac_blockpy::env_config::SOAC_JIT_PERF_HELPER_FRAMES_ENV,
-                "1",
-            )
-        };
+        unsafe { std::env::set_var(soac_config::SOAC_JIT_PERF_HELPER_FRAMES_ENV, "1") };
         assert!(crate::config::jit_perf_helper_frames_enabled().unwrap());
 
-        unsafe {
-            std::env::set_var(
-                soac_blockpy::env_config::SOAC_JIT_PERF_HELPER_FRAMES_ENV,
-                "0",
-            )
-        };
+        unsafe { std::env::set_var(soac_config::SOAC_JIT_PERF_HELPER_FRAMES_ENV, "0") };
         assert!(!crate::config::jit_perf_helper_frames_enabled().unwrap());
 
-        unsafe {
-            std::env::set_var(
-                soac_blockpy::env_config::SOAC_JIT_PERF_HELPER_FRAMES_ENV,
-                "",
-            )
-        };
+        unsafe { std::env::set_var(soac_config::SOAC_JIT_PERF_HELPER_FRAMES_ENV, "") };
         assert!(crate::config::jit_perf_helper_frames_enabled().is_err());
 
         match prior {
             Some(value) => unsafe {
-                std::env::set_var(
-                    soac_blockpy::env_config::SOAC_JIT_PERF_HELPER_FRAMES_ENV,
-                    value,
-                )
+                std::env::set_var(soac_config::SOAC_JIT_PERF_HELPER_FRAMES_ENV, value)
             },
-            None => unsafe {
-                std::env::remove_var(soac_blockpy::env_config::SOAC_JIT_PERF_HELPER_FRAMES_ENV)
-            },
+            None => unsafe { std::env::remove_var(soac_config::SOAC_JIT_PERF_HELPER_FRAMES_ENV) },
         }
     }
 }

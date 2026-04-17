@@ -2,25 +2,26 @@ use cranelift_codegen::isa::TargetIsa;
 use cranelift_codegen::settings;
 use cranelift_codegen::settings::Configurable;
 pub use soac_blockpy::codegen_cache::CachedCodegenModuleMetadata;
-use soac_blockpy::codegen_cache::module_optimization_plan_path as blockpy_module_optimization_plan_path;
-#[cfg(test)]
-pub(crate) use soac_blockpy::env_config::SOAC_JIT_EMIT_REFCOUNTS_ENV;
-pub(crate) use soac_blockpy::env_config::SpecializationMode;
-use soac_blockpy::env_config::{
-    background_jit_enabled_from_env,
-    counter_dump_input_path_from_env as blockpy_counter_dump_input_path_from_env,
-    counter_dump_output_path_from_env as blockpy_counter_dump_output_path_from_env,
-    cranelift_opt_level_from_env, eager_clif_compile_requested_from_env,
-    jit_compile_workers_from_env, jit_perf_helper_frames_enabled_from_env,
-    jit_refcount_emission_enabled_from_env,
-    module_cache_root_from_env_or_repo as blockpy_module_cache_root_from_env_or_repo,
+use soac_blockpy::codegen_cache::{
+    module_optimization_plan_path as blockpy_module_optimization_plan_path,
     pre_optimization_module_cache_identity as blockpy_pre_optimization_module_cache_identity,
     pre_optimization_module_cache_metadata as blockpy_pre_optimization_module_cache_metadata,
     pre_optimization_module_cache_path as blockpy_pre_optimization_module_cache_path,
-    precompiled_library_path_from_env as blockpy_precompiled_library_path_from_env,
-    profiled_cold_blocks_enabled_from_env,
-    soac_work_dir_from_env as blockpy_soac_work_dir_from_env,
-    specialization_mode_from_env as blockpy_specialization_mode_from_env,
+};
+#[cfg(test)]
+pub(crate) use soac_config::SOAC_JIT_EMIT_REFCOUNTS_ENV;
+pub(crate) use soac_config::SpecializationMode;
+use soac_config::{
+    background_jit_enabled_from_env,
+    counter_dump_input_path_from_env as config_counter_dump_input_path_from_env,
+    counter_dump_output_path_from_env as config_counter_dump_output_path_from_env,
+    cranelift_opt_level_from_env, eager_clif_compile_requested_from_env,
+    jit_compile_workers_from_env, jit_perf_helper_frames_enabled_from_env,
+    jit_refcount_emission_enabled_from_env,
+    module_cache_root_from_env_or_repo as config_module_cache_root_from_env_or_repo,
+    precompiled_library_path_from_env as config_precompiled_library_path_from_env,
+    profiled_cold_blocks_enabled_from_env, soac_work_dir_from_env as config_soac_work_dir_from_env,
+    specialization_mode_from_env as config_specialization_mode_from_env,
 };
 use std::path::Path;
 use std::path::PathBuf;
@@ -94,15 +95,15 @@ impl CraneliftTargetConfig {
 }
 
 pub fn soac_work_dir_from_env() -> Result<Option<PathBuf>, String> {
-    blockpy_soac_work_dir_from_env()
+    config_soac_work_dir_from_env()
 }
 
 pub fn counter_dump_input_path_from_env() -> Result<Option<PathBuf>, String> {
-    blockpy_counter_dump_input_path_from_env()
+    config_counter_dump_input_path_from_env()
 }
 
 pub(crate) fn counter_dump_output_path_from_env() -> Result<Option<PathBuf>, String> {
-    blockpy_counter_dump_output_path_from_env()
+    config_counter_dump_output_path_from_env()
 }
 
 pub(crate) fn profiled_cold_blocks_enabled() -> Result<bool, String> {
@@ -116,7 +117,7 @@ pub(crate) fn jit_refcount_emission_enabled() -> Result<bool, String> {
 pub fn module_cache_root_from_env_or_repo(
     repo_root: Option<&Path>,
 ) -> Result<Option<PathBuf>, String> {
-    blockpy_module_cache_root_from_env_or_repo(repo_root)
+    config_module_cache_root_from_env_or_repo(repo_root)
 }
 
 pub fn pre_optimization_module_cache_identity(
@@ -170,7 +171,7 @@ pub fn module_optimization_plan_path(
 }
 
 pub(crate) fn precompiled_library_path_from_env() -> Result<Option<PathBuf>, String> {
-    blockpy_precompiled_library_path_from_env()
+    config_precompiled_library_path_from_env()
 }
 
 pub fn eager_clif_compile_requested() -> Result<bool, String> {
@@ -200,6 +201,6 @@ pub(crate) fn behavior_change_indexed_stores_enabled() -> Result<bool, String> {
 }
 
 pub(crate) fn specialization_mode_from_env() -> Result<Option<SpecializationMode>, String> {
-    blockpy_specialization_mode_from_env()
+    config_specialization_mode_from_env()
 }
 pub use soac_blockpy::codegen_cache::PythonModuleCacheSource;

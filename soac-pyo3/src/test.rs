@@ -60,25 +60,7 @@ fn python_runtime_test_lock() -> &'static Mutex<()> {
 }
 
 fn initialize_test_python() {
-    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("workspace crate should have a repo-root parent");
-    let python_home = repo_root.join("vendor").join("cpython");
-    unsafe {
-        std::env::set_var("PYTHONHOME", &python_home);
-    }
-    let rel_build_dir = std::fs::read_to_string(python_home.join("pybuilddir.txt"))
-        .expect("vendored CPython pybuilddir.txt should exist");
-    let python_path = std::env::join_paths([
-        python_home.join("Lib"),
-        python_home.join(rel_build_dir.trim()),
-        repo_root.join("soac_py").join("src"),
-    ])
-    .expect("test PYTHONPATH should join");
-    unsafe {
-        std::env::set_var("PYTHONPATH", python_path);
-    }
-    Python::initialize();
+    soac_cpython::initialize_test_python("soac-pyo3-test").expect("test Python should initialize");
 }
 
 unsafe fn class_dict_function(

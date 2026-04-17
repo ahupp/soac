@@ -274,7 +274,7 @@ fn lowering_verify_mode_adds_refcount_counters_only_in_verify() {
 
     {
         let _opt_mode = EnvVarGuard::set("SOAC_OPT_MODE", "verify");
-        let config = crate::env_config::SoacEnvConfig::from_env().unwrap();
+        let config = soac_config::SoacEnvConfig::from_env().unwrap();
         assert!(refcount_counter_instrumentation_enabled(&config));
         let lowered = lower_python_to_blockpy_for_testing(source)
             .expect("transform should succeed")
@@ -299,7 +299,7 @@ fn lowering_verify_mode_adds_refcount_counters_only_in_verify() {
 
     for mode in ["profile", "apply"] {
         let _opt_mode = EnvVarGuard::set("SOAC_OPT_MODE", mode);
-        let config = crate::env_config::SoacEnvConfig::from_env().unwrap();
+        let config = soac_config::SoacEnvConfig::from_env().unwrap();
         assert!(!refcount_counter_instrumentation_enabled(&config));
         let lowered = lower_python_to_blockpy_for_testing(source)
             .expect("transform should succeed")

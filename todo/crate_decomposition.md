@@ -56,6 +56,42 @@ Contents:
 - scope/storage-layout data
 - counter site definitions
 
+### `soac-config`
+
+Own typed environment parsing and process logging setup.
+
+Completed: extracted into the `soac-config` workspace crate. Direct runtime and entrypoint
+consumers now import config and logging from `soac-config`; no `soac-blockpy` compatibility
+re-export remains. The remaining BlockPy cache metadata/path helpers live with the cache format in
+`soac-blockpy::codegen_cache` until the cache/profile formats are split further.
+
+Contents:
+
+- SOAC env-var parsing
+- tracing initialization
+- shared runtime/test/benchmark config structs
+- config validation and defaulting
+
+### `soac-cpython`
+
+Own shared embedded CPython initialization.
+
+Completed: extracted the duplicated vendored-CPython setup used by Rust tests and inspector tools
+into the `soac-cpython` workspace crate. Rust embedded-Python paths now initialize through
+CPython pre-init path configuration instead of mutating process-global `PYTHONHOME`/`PYTHONPATH`.
+Test initialization also centralizes `_soac_ext` staging and `sys.path` repair.
+
+This is intentionally narrower than the proposed `soac-cpython-runtime` crate below: it owns
+interpreter startup and path setup, not SOAC module state, callback ownership, or runtime helper
+registration.
+
+Contents:
+
+- vendored CPython path discovery
+- CPython pre-init interpreter path configuration
+- Rust test `_soac_ext` staging
+- shared `sys.path` insertion helpers
+
 ## Proposed Crates
 
 ### `soac-ir`
@@ -100,21 +136,6 @@ pass-only edits do not force recompilation of the JIT backend or extension crate
 
 The existing `soac-blockpy` crate can temporarily become a compatibility facade that re-exports
 `soac-ir` and `soac-lowering` APIs while callsites are migrated.
-
-### `soac-config`
-
-Own typed environment parsing and process logging setup.
-
-Likely contents:
-
-- SOAC env-var parsing
-- tracing initialization
-- shared runtime/test/benchmark config structs
-- config validation and defaulting
-
-This should keep `tracing-subscriber` and env parsing out of foundational crates like `soac-ir`.
-Entry points should construct config once and pass typed config into consumers rather than reading
-env vars at consumption sites.
 
 ### `soac-profile`
 
@@ -204,15 +225,16 @@ keeps web dependencies out of non-web rendering and offline analysis tools.
 5. Change `soac-jit`, `soac-pyo3`, `soac-inspector`, and offline tools to import shared IR from
    `soac-ir` where possible.
 6. Add `soac-lowering` and move passes, driver, transformer, and template code there.
-7. Move env parsing and logging setup into `soac-config`.
+7. Done: move env parsing and logging setup into `soac-config`.
 8. Move counter/profile schemas and serialization into `soac-profile`.
 9. Split `soac-jit/src/jit/mod.rs` into internal modules along backend responsibility boundaries.
 10. Extract `soac-codegen-model` after the shared descriptors are visible and no longer buried in
     backend emission code.
 11. Extract `soac-cranelift` from the internal backend modules.
-12. Extract `soac-cpython-runtime` only after the PyO3/CPython ownership boundary is clear.
-13. Split inspector web code from `soac-inspector-core`.
-14. Re-measure the same compile scenarios from step 1 and keep the results with this todo or in a
+12. Done: extract shared embedded-CPython initialization into `soac-cpython`.
+13. Extract `soac-cpython-runtime` only after the PyO3/CPython ownership boundary is clear.
+14. Split inspector web code from `soac-inspector-core`.
+15. Re-measure the same compile scenarios from step 1 and keep the results with this todo or in a
     dedicated compile-time note.
 
 ## Expected Compile-Time Wins

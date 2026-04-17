@@ -5,7 +5,6 @@ use crate::codegen_cache::{
     store_codegen_module_cache, validate_codegen_module_cache_metadata, CachedCodegenModule,
     CachedCodegenModuleMetadata, CachedPreparedCodegen,
 };
-use crate::env_config::SoacEnvConfig;
 use crate::pass_tracker::PassTracker;
 use crate::passes::ast_to_ast::ast_rewrite::rewrite_with_pass;
 use crate::passes::ast_to_ast::context::Context;
@@ -24,6 +23,7 @@ use crate::passes::{
 use crate::{ParseError, Result};
 use ruff_python_ast::{self as ast, Stmt};
 use ruff_python_parser::parse_module;
+use soac_config::SoacEnvConfig;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 

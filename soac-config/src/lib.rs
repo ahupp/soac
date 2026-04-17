@@ -1,8 +1,8 @@
-use crate::codegen_cache::{
-    codegen_module_cache_path, CachedCodegenModuleMetadata, PythonModuleCacheSource,
-};
 use std::env::{self, VarError};
+use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 pub const SOAC_OPT_MODE_ENV: &str = "SOAC_OPT_MODE";
 pub const SOAC_WORK_DIR_ENV: &str = "SOAC_WORK_DIR";
@@ -104,6 +104,61 @@ pub struct SoacEnvConfig {
     soac_exec_trace: Option<String>,
     soac_log: SoacLogConfig,
     soac_log_explicit: bool,
+}
+
+fn open_soac_log_file(path: &Path) -> std::io::Result<Arc<std::fs::File>> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map(Arc::new)
+}
+
+pub fn init_logging() -> Result<(), String> {
+    let config = SoacEnvConfig::from_env()?;
+    init_logging_with_config(&config)
+}
+
+pub fn init_logging_with_config(config: &SoacEnvConfig) -> Result<(), String> {
+    let SoacLogConfig { filter, json_path } = config.soac_log().clone();
+    let filter = EnvFilter::builder()
+        .parse(filter)
+        .map_err(|err| format!("failed to parse SOAC_LOG filter: {err}"))?;
+    let registry = tracing_subscriber::registry().with(filter);
+    if let Some(json_path) = json_path {
+        match open_soac_log_file(&json_path) {
+            Ok(json_file) => {
+                let json_layer = fmt::layer()
+                    .json()
+                    .flatten_event(true)
+                    .with_writer(move || {
+                        json_file
+                            .try_clone()
+                            .expect("failed to clone SOAC_LOG json file")
+                    });
+                let _ = registry.with(json_layer).try_init();
+            }
+            Err(err) => {
+                eprintln!(
+                    "[soac logging] failed to open SOAC_LOG json file {}: {err}",
+                    json_path.display()
+                );
+                return Err(format!(
+                    "failed to open SOAC_LOG json file {}: {err}",
+                    json_path.display()
+                ));
+            }
+        }
+    } else {
+        let fmt_layer = fmt::layer()
+            .with_writer(std::io::stderr)
+            .with_ansi(!cfg!(test));
+        let _ = registry.with(fmt_layer).try_init();
+    }
+    Ok(())
 }
 
 impl SoacEnvConfig {
@@ -356,42 +411,6 @@ pub fn module_cache_root_from_env_or_repo(
 
 pub fn precompiled_library_path_from_env() -> Result<Option<PathBuf>, String> {
     env_path(SOAC_PRECOMPILED_LIBRARY_ENV)
-}
-
-pub fn pre_optimization_module_cache_identity(
-    build_identity: &str,
-    runtime_names_as_globals: bool,
-) -> String {
-    format!("{build_identity};runtime_names_as_globals={runtime_names_as_globals}")
-}
-
-pub fn pre_optimization_module_cache_metadata(
-    source: PythonModuleCacheSource,
-    module_name: &str,
-    source_hash: u64,
-    build_identity: &str,
-    runtime_names_as_globals: bool,
-) -> CachedCodegenModuleMetadata {
-    CachedCodegenModuleMetadata {
-        source,
-        module_name: module_name.to_string(),
-        source_hash,
-        cache_identity: pre_optimization_module_cache_identity(
-            build_identity,
-            runtime_names_as_globals,
-        ),
-    }
-}
-
-pub fn pre_optimization_module_cache_path(
-    cache_root: &Path,
-    source: PythonModuleCacheSource,
-    module_name: &str,
-    _source_hash: u64,
-    _build_identity: &str,
-    _runtime_names_as_globals: bool,
-) -> Result<PathBuf, String> {
-    codegen_module_cache_path(cache_root, source, module_name).map_err(|err| err.to_string())
 }
 
 pub fn compile_mode_from_env() -> Result<CompileMode, String> {

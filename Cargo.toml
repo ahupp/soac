@@ -2,6 +2,8 @@
 members = [
     "soac-blockpy",
     "soac-core",
+    "soac-config",
+    "soac-cpython",
     "soac-pyo3",
     "soac-jit",
     "soac-inspector",
@@ -10,6 +12,8 @@ members = [
 default-members = [
     "soac-blockpy",
     "soac-core",
+    "soac-config",
+    "soac-cpython",
     "soac-pyo3",
     "soac-jit",
     "soac-inspector",

@@ -140,7 +140,7 @@ fn decide_optimizations_for_counter_dump(
 
 #[pymodule]
 fn _soac_ext(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
-    soac_blockpy::init_logging().map_err(PyRuntimeError::new_err)?;
+    soac_config::init_logging().map_err(PyRuntimeError::new_err)?;
     soac_jit::install_sigill_diagnostics().map_err(PyRuntimeError::new_err)?;
     PyModule::import(py, "soac.bootstrap")?;
     module.add(

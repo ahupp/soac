@@ -2,15 +2,16 @@
 
 ## File Responsibilities
 
-Thin `soac-jit` facade over centralized environment parsing in `soac_blockpy::env_config`, plus construction of Cranelift
-target ISA settings for runtime JIT and offline object generation. This keeps call sites from reading environment variables
-directly while preserving crate-local visibility choices.
+Thin `soac-jit` facade over centralized environment parsing in `soac_config`, plus construction of Cranelift target ISA
+settings for runtime JIT and offline object generation. This keeps call sites from reading environment variables directly
+while preserving crate-local visibility choices. BlockPy module-cache path and metadata helpers are forwarded from
+`soac_blockpy::codegen_cache`.
 
 ## Datatypes
 
 - `CraneliftTargetConfig`: normalized Cranelift target options: optimization level, PIC mode, frame-pointer preservation, and
   machine-code CFG metadata emission.
-- Re-exported `SpecializationMode`: profile/verify/apply specialization mode parsed by `soac_blockpy`.
+- Re-exported `SpecializationMode`: profile/verify/apply specialization mode parsed by `soac_config`.
 - Test-only re-export `SOAC_JIT_EMIT_REFCOUNTS_ENV`: environment variable name used by tests.
 
 ## Functions
@@ -38,7 +39,7 @@ directly while preserving crate-local visibility choices.
 
 ## Context Read
 
-- `soac-blockpy/src/env_config.rs`
+- `soac-config/src/lib.rs`
+- `soac-blockpy/src/codegen_cache.rs`
 - `soac-jit/src/jit/mod.rs`
 - `soac-jit/src/module_type.rs`
-
