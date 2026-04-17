@@ -594,8 +594,9 @@ fn emit_specialized_getattr<'fb>(
     let attr_name = codegen_constant_string_value(state.ctx().module, op.attr.as_ref())?;
     let specializations = state
         .ctx()
-        .field_index_specializations
-        .get(attr_name)?
+        .field_index_specializations_by_instr
+        .get(&instr_id)
+        .or_else(|| state.ctx().field_index_specializations.get(attr_name))?
         .iter()
         .cloned()
         .collect::<Vec<_>>();
@@ -752,8 +753,9 @@ fn emit_specialized_setattr<'fb>(
     let attr_name = codegen_constant_string_value(state.ctx().module, op.attr.as_ref())?;
     let specializations = state
         .ctx()
-        .field_index_specializations
-        .get(attr_name)?
+        .field_index_specializations_by_instr
+        .get(&instr_id)
+        .or_else(|| state.ctx().field_index_specializations.get(attr_name))?
         .iter()
         .cloned()
         .collect::<Vec<_>>();

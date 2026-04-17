@@ -1,8 +1,11 @@
-use crate::counter_dump::CounterDumpFile;
+use crate::counter_dump::{CounterDumpFile, collect_type_key_layouts, collect_type_table};
 use anyhow::{Context, Result, bail};
-use soac_blockpy::block_py::{BlockPyModule, FunctionId, InstrId};
+use soac_blockpy::block_py::{
+    BlockPyFunction, BlockPyModule, ChildVisitable, FunctionId, HasSemanticInstrId, InstrCodegen,
+    InstrId, Literal, NameLocation, Visit,
+};
 use soac_blockpy::codegen_cache::{CachedCodegenModuleMetadata, PythonModuleCacheSource};
-use soac_blockpy::passes::CodegenModuleShape;
+use soac_blockpy::passes::{CodegenModuleShape, InstrResolved};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -13,6 +16,7 @@ pub struct FunctionProfileEvidence {
     pub operator_specializations: HashMap<InstrId, Vec<u64>>,
     pub getitem_specializations: HashMap<InstrId, Vec<u64>>,
     pub setitem_specializations: HashMap<InstrId, Vec<u64>>,
+    pub field_index_specializations: HashMap<InstrId, Vec<PlannedIndexedFieldSpecialization>>,
     pub branch_prefer_true: HashMap<InstrId, bool>,
 }
 
@@ -20,6 +24,7 @@ pub struct FunctionProfileEvidence {
 pub struct ProfileEvidenceStore {
     functions: HashMap<(String, FunctionId), FunctionProfileEvidence>,
     module_source_hashes: HashMap<String, u64>,
+    field_index_specializations_by_attr: HashMap<String, Vec<PlannedIndexedFieldSpecialization>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -63,14 +68,47 @@ pub struct PlannedAlternative {
 
 #[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum PlannedGuard {
-    FunctionId { function_id: FunctionId },
-    ObservedShape { family: ShapeFamily, shape: u64 },
+    FunctionId {
+        function_id: FunctionId,
+    },
+    ObservedShape {
+        family: ShapeFamily,
+        shape: u64,
+    },
+    IndexedField {
+        specialization: PlannedIndexedFieldSpecialization,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum PlannedAction {
-    DirectCall { function_id: FunctionId },
-    SpecializedShape { family: ShapeFamily, shape: u64 },
+    DirectCall {
+        function_id: FunctionId,
+    },
+    SpecializedShape {
+        family: ShapeFamily,
+        shape: u64,
+    },
+    IndexedField {
+        specialization: PlannedIndexedFieldSpecialization,
+    },
+}
+
+#[derive(
+    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
+pub struct PlannedIndexedFieldSpecialization {
+    pub owner_type: PlannedTypeKey,
+    pub attr_name: String,
+    pub expected_index: u32,
+}
+
+#[derive(
+    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
+pub struct PlannedTypeKey {
+    pub module_name: String,
+    pub qualname: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -97,7 +135,7 @@ impl ProfileEvidenceStore {
         let mut store = Self::default();
         let mut branch_counts = HashMap::<(String, FunctionId, InstrId), [u64; 2]>::new();
 
-        for record in records {
+        for record in &records {
             let module_name = record
                 .module_name()
                 .map_err(anyhow::Error::msg)?
@@ -178,6 +216,32 @@ impl ProfileEvidenceStore {
             }
         }
 
+        let type_table = collect_type_table(records.as_slice()).map_err(anyhow::Error::msg)?;
+        let type_key_layouts =
+            collect_type_key_layouts(records.as_slice()).map_err(anyhow::Error::msg)?;
+        for (type_id, layouts) in type_key_layouts {
+            let Some(type_key) = type_table.get(&type_id) else {
+                continue;
+            };
+            for layout in layouts {
+                let specialization = PlannedIndexedFieldSpecialization {
+                    owner_type: PlannedTypeKey {
+                        module_name: type_key.module_name.clone(),
+                        qualname: type_key.qualname.clone(),
+                    },
+                    attr_name: layout.key,
+                    expected_index: layout.index,
+                };
+                push_unique(
+                    store
+                        .field_index_specializations_by_attr
+                        .entry(specialization.attr_name.clone())
+                        .or_default(),
+                    specialization,
+                );
+            }
+        }
+
         for ((module_name, function_id, instr_id), [false_count, true_count]) in branch_counts {
             if false_count == 0 && true_count == 0 {
                 continue;
@@ -207,6 +271,15 @@ impl ProfileEvidenceStore {
     pub fn module_source_hash(&self, module_name: &str) -> Option<u64> {
         self.module_source_hashes.get(module_name).copied()
     }
+
+    pub fn field_index_specializations_for_attr(
+        &self,
+        attr_name: &str,
+    ) -> Option<&[PlannedIndexedFieldSpecialization]> {
+        self.field_index_specializations_by_attr
+            .get(attr_name)
+            .map(Vec::as_slice)
+    }
 }
 
 impl OptimizationPlan {
@@ -221,7 +294,7 @@ impl OptimizationPlan {
             .filter_map(|function| {
                 let evidence = evidence_store
                     .for_function(metadata.module_name.as_str(), function.function_id);
-                let decisions = decisions_from_evidence(&evidence);
+                let decisions = decisions_for_function(module, function, evidence_store, &evidence);
                 (!decisions.is_empty()).then(|| FunctionOptimizationPlan {
                     function_id: function.function_id,
                     qualname: function.names.qualname.clone(),
@@ -369,6 +442,20 @@ fn apply_alternative_to_evidence(
                 shape,
             );
         }
+        PlannedAction::IndexedField { ref specialization } => {
+            validate_alternative_guard(
+                alternative,
+                |guard| matches!(guard, PlannedGuard::IndexedField { specialization: guarded } if guarded == specialization),
+                "field-index alternative",
+            )?;
+            push_unique(
+                evidence
+                    .field_index_specializations
+                    .entry(instr_id)
+                    .or_default(),
+                specialization.clone(),
+            );
+        }
     }
     Ok(())
 }
@@ -414,6 +501,7 @@ fn decisions_from_evidence(evidence: &FunctionProfileEvidence) -> Vec<Optimizati
         &evidence.setitem_specializations,
         U64DecisionKind::SetItem,
     );
+    extend_field_index_decisions(&mut decisions, &evidence.field_index_specializations);
     let mut branch_decisions = evidence
         .branch_prefer_true
         .iter()
@@ -448,6 +536,32 @@ fn extend_call_target_decisions(
                     .map(|function_id| PlannedAlternative {
                         guards: vec![PlannedGuard::FunctionId { function_id }],
                         action: PlannedAction::DirectCall { function_id },
+                    })
+                    .collect(),
+            ),
+        });
+    }
+}
+
+fn extend_field_index_decisions(
+    decisions: &mut Vec<OptimizationDecision>,
+    values_by_instr: &HashMap<InstrId, Vec<PlannedIndexedFieldSpecialization>>,
+) {
+    let mut entries = values_by_instr.iter().collect::<Vec<_>>();
+    entries.sort_by_key(|(instr_id, _values)| **instr_id);
+    for (instr_id, values) in entries {
+        let mut values = values.clone();
+        values.sort();
+        decisions.push(OptimizationDecision {
+            instr_id: *instr_id,
+            replacement: guarded_replacement(
+                values
+                    .into_iter()
+                    .map(|specialization| PlannedAlternative {
+                        guards: vec![PlannedGuard::IndexedField {
+                            specialization: specialization.clone(),
+                        }],
+                        action: PlannedAction::IndexedField { specialization },
                     })
                     .collect(),
             ),
@@ -526,10 +640,110 @@ fn decision_variant_rank(decision: &OptimizationDecision) -> u8 {
                     family: ShapeFamily::SetItem,
                     ..
                 } => 3,
+                PlannedAction::IndexedField { .. } => 4,
             })
-            .unwrap_or(4),
-        PlannedReplacement::BranchPreference { .. } => 5,
+            .unwrap_or(5),
+        PlannedReplacement::BranchPreference { .. } => 6,
     }
+}
+
+fn decisions_for_function(
+    module: &BlockPyModule<CodegenModuleShape>,
+    function: &BlockPyFunction<CodegenModuleShape>,
+    evidence_store: &ProfileEvidenceStore,
+    evidence: &FunctionProfileEvidence,
+) -> Vec<OptimizationDecision> {
+    let mut evidence = evidence.clone();
+    add_field_index_evidence_for_function(module, function, evidence_store, &mut evidence);
+    decisions_from_evidence(&evidence)
+}
+
+fn add_field_index_evidence_for_function(
+    module: &BlockPyModule<CodegenModuleShape>,
+    function: &BlockPyFunction<CodegenModuleShape>,
+    evidence_store: &ProfileEvidenceStore,
+    evidence: &mut FunctionProfileEvidence,
+) {
+    struct Collector<'a> {
+        module: &'a BlockPyModule<CodegenModuleShape>,
+        evidence_store: &'a ProfileEvidenceStore,
+        evidence: &'a mut FunctionProfileEvidence,
+    }
+
+    impl Collector<'_> {
+        fn collect_attr(&mut self, instr_id: InstrId, attr_expr: &InstrCodegen) {
+            let Some(attr_name) = codegen_constant_string_value(self.module, attr_expr) else {
+                return;
+            };
+            let Some(specializations) = self
+                .evidence_store
+                .field_index_specializations_for_attr(attr_name)
+            else {
+                return;
+            };
+            for specialization in specializations {
+                push_unique(
+                    self.evidence
+                        .field_index_specializations
+                        .entry(instr_id)
+                        .or_default(),
+                    specialization.clone(),
+                );
+            }
+        }
+    }
+
+    impl Visit<InstrCodegen> for Collector<'_> {
+        fn visit_instr(&mut self, expr: &InstrCodegen)
+        where
+            InstrCodegen: ChildVisitable<InstrCodegen>,
+        {
+            match expr {
+                InstrCodegen::GetAttr(op) => {
+                    self.collect_attr(op.semantic_instr_id(), op.attr.as_ref());
+                }
+                InstrCodegen::SetAttr(op) => {
+                    self.collect_attr(op.semantic_instr_id(), op.attr.as_ref());
+                }
+                _ => {}
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    let mut collector = Collector {
+        module,
+        evidence_store,
+        evidence,
+    };
+    collector.visit_fn(function);
+}
+
+fn module_constant_string_value<'a>(
+    module: &'a BlockPyModule<CodegenModuleShape>,
+    constant_index: u32,
+) -> Option<&'a str> {
+    let InstrResolved::Literal(literal) = module.module_constants.get(constant_index as usize)?
+    else {
+        return None;
+    };
+    let Literal::StringLiteral(literal) = literal.as_literal() else {
+        return None;
+    };
+    Some(literal.value.as_str())
+}
+
+fn codegen_constant_string_value<'a>(
+    module: &'a BlockPyModule<CodegenModuleShape>,
+    expr: &InstrCodegen,
+) -> Option<&'a str> {
+    let InstrCodegen::Load(load) = expr else {
+        return None;
+    };
+    let NameLocation::Constant(constant_index) = load.name.location else {
+        return None;
+    };
+    module_constant_string_value(module, constant_index)
 }
 
 fn decision_instr_id(decision: &OptimizationDecision) -> InstrId {
@@ -599,6 +813,9 @@ fn format_guard(guard: &PlannedGuard) -> String {
         PlannedGuard::ObservedShape { family, shape } => {
             format!("{}Shape({shape})", format_shape_family(*family))
         }
+        PlannedGuard::IndexedField { specialization } => {
+            format!("IndexedField({})", format_indexed_field(specialization))
+        }
     }
 }
 
@@ -608,7 +825,20 @@ fn format_action(action: &PlannedAction) -> String {
         PlannedAction::SpecializedShape { family, shape } => {
             format!("Specialized{}({shape})", format_shape_family(*family))
         }
+        PlannedAction::IndexedField { specialization } => {
+            format!("IndexedField({})", format_indexed_field(specialization))
+        }
     }
+}
+
+fn format_indexed_field(specialization: &PlannedIndexedFieldSpecialization) -> String {
+    format!(
+        "{}.{} attr={} index={}",
+        specialization.owner_type.module_name,
+        specialization.owner_type.qualname,
+        specialization.attr_name,
+        specialization.expected_index
+    )
 }
 
 fn format_fallback(fallback: &PlannedFallback) -> &'static str {
@@ -639,7 +869,7 @@ fn push_observed_shape(
     push_unique(shapes_by_instr.entry(instr_id).or_default(), observed_value);
 }
 
-fn push_unique<T: Copy + Eq>(values: &mut Vec<T>, value: T) {
+fn push_unique<T: Eq>(values: &mut Vec<T>, value: T) {
     if !values.contains(&value) {
         values.push(value);
     }
@@ -648,7 +878,10 @@ fn push_unique<T: Copy + Eq>(values: &mut Vec<T>, value: T) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::counter_dump::{CounterDumpRecord, CounterDumpRow};
+    use crate::counter_dump::{
+        CounterDumpRecord, CounterDumpRow, CounterDumpTypeKey, CounterDumpTypeKeyLayout,
+        CounterDumpTypeTableEntry,
+    };
     use soac_blockpy::block_py::{BlockLabel, InstrId};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -658,6 +891,14 @@ mod tests {
         let function_id = FunctionId::new(7, 1);
         let instr_id = InstrId::new(BlockLabel::from_index(3), 4);
         let target_id = FunctionId::new(7, 2);
+        let field_specialization = PlannedIndexedFieldSpecialization {
+            owner_type: PlannedTypeKey {
+                module_name: "pkg.types".to_string(),
+                qualname: "Point".to_string(),
+            },
+            attr_name: "x".to_string(),
+            expected_index: 2,
+        };
         let rows = vec![
             row(
                 "call_hot_targets",
@@ -683,8 +924,18 @@ mod tests {
             package_name: None,
             rows,
             module_keys: Vec::new(),
-            type_keys: Vec::new(),
-            type_table: Vec::new(),
+            type_keys: vec![CounterDumpTypeKeyLayout {
+                owner_type_id: 44,
+                key: "x".to_string(),
+                index: 2,
+            }],
+            type_table: vec![CounterDumpTypeTableEntry {
+                type_id: 44,
+                key: CounterDumpTypeKey {
+                    module_name: "pkg.types".to_string(),
+                    qualname: "Point".to_string(),
+                },
+            }],
         };
         let path = unique_counter_path();
         fs::write(path.as_path(), record.encode().unwrap()).unwrap();
@@ -703,7 +954,15 @@ mod tests {
             &vec![257]
         );
         assert_eq!(evidence.branch_prefer_true.get(&instr_id), Some(&true));
+        assert_eq!(
+            store.field_index_specializations_for_attr("x").unwrap(),
+            &[field_specialization.clone()]
+        );
 
+        let mut evidence = evidence;
+        evidence
+            .field_index_specializations
+            .insert(instr_id, vec![field_specialization.clone()]);
         let decisions = decisions_from_evidence(&evidence);
         assert!(matches!(
             decisions[0].replacement,
@@ -757,6 +1016,13 @@ mod tests {
                 .get(&instr_id)
                 .unwrap(),
             &vec![257]
+        );
+        assert_eq!(
+            planned_function
+                .field_index_specializations
+                .get(&instr_id)
+                .unwrap(),
+            &vec![field_specialization]
         );
         assert_eq!(
             planned_function.branch_prefer_true.get(&instr_id),

@@ -154,9 +154,12 @@ mod test {
         CachedCodegenModuleMetadata, PythonModuleCacheSource, codegen_module_cache_path,
     };
     use soac_blockpy::{LoweringOptions, lower_python_to_blockpy_recorded_with_options};
-    use soac_jit::counter_dump::{CounterDumpRecord, CounterDumpRow};
+    use soac_jit::counter_dump::{
+        CounterDumpRecord, CounterDumpRow, CounterDumpTypeKey, CounterDumpTypeKeyLayout,
+        CounterDumpTypeTableEntry,
+    };
     use soac_jit::module_type::hash_module_source;
-    use soac_jit::optimization_plan::PlannedReplacement;
+    use soac_jit::optimization_plan::{PlannedAction, PlannedReplacement};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     const TEST_BUILD_IDENTITY: &str = "test-build-identity";
@@ -165,7 +168,7 @@ mod test {
     fn emits_mod_opt_under_requested_root() {
         let root = unique_temp_dir();
         let module_name = "pkg.mod";
-        let source = "def f(a, b):\n    return a + b\n";
+        let source = "def f(obj):\n    return obj.x\n";
         let source_hash = hash_module_source(source);
         let metadata = CachedCodegenModuleMetadata {
             source: PythonModuleCacheSource::Project,
@@ -231,11 +234,29 @@ mod test {
         assert_eq!(plan.source_hash, source_hash);
         assert_eq!(plan.functions.len(), 1);
         assert_eq!(plan.functions[0].function_id, function_id);
-        assert_eq!(plan.functions[0].decisions.len(), 2);
+        assert_eq!(plan.functions[0].decisions.len(), 3);
         assert!(matches!(
             plan.functions[0].decisions[0].replacement,
             PlannedReplacement::Guarded { .. }
         ));
+        assert!(
+            plan.functions[0].decisions.iter().any(|decision| {
+                let PlannedReplacement::Guarded { alternatives, .. } = &decision.replacement else {
+                    return false;
+                };
+                alternatives.iter().any(|alternative| {
+                    matches!(
+                        alternative.action,
+                        PlannedAction::IndexedField { ref specialization }
+                            if specialization.attr_name == "x"
+                                && specialization.expected_index == 2
+                                && specialization.owner_type.module_name == "pkg.types"
+                                && specialization.owner_type.qualname == "Point"
+                    )
+                })
+            }),
+            "expected a per-instruction indexed-field decision"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -280,8 +301,18 @@ mod test {
                 },
             ],
             module_keys: Vec::new(),
-            type_keys: Vec::new(),
-            type_table: Vec::new(),
+            type_keys: vec![CounterDumpTypeKeyLayout {
+                owner_type_id: 44,
+                key: "x".to_string(),
+                index: 2,
+            }],
+            type_table: vec![CounterDumpTypeTableEntry {
+                type_id: 44,
+                key: CounterDumpTypeKey {
+                    module_name: "pkg.types".to_string(),
+                    qualname: "Point".to_string(),
+                },
+            }],
         }
     }
 

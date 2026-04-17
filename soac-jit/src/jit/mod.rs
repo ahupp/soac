@@ -26,7 +26,9 @@ use crate::function_instantiation::{
 };
 use crate::module_constants::{ModuleCodegenConstants, ModuleConstantId};
 use crate::module_type::{CounterRuntimeSlot, SharedModuleState, build_counter_storage_layout};
-use crate::optimization_plan::{FunctionProfileEvidence, load_optimization_plan};
+use crate::optimization_plan::{
+    FunctionProfileEvidence, PlannedIndexedFieldSpecialization, load_optimization_plan,
+};
 use cranelift_codegen::cfg_printer::CFGPrinter;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::inline::{Inline, InlineCommand};
@@ -1271,9 +1273,18 @@ fn predeclare_specialization_type_imports(
     profile: &SpecializationProfile<'_>,
 ) -> Result<(), String> {
     let mut type_refs = HashSet::new();
-    for specializations in profile.field_index_specializations()?.values() {
+    for specializations in profile.counter_field_index_specializations()?.values() {
         for specialization in specializations {
             type_refs.insert(specialization.owner_type_ref.clone());
+        }
+    }
+    for evidence in profile.planned_evidence.values() {
+        for planned_specializations in evidence.field_index_specializations.values() {
+            for planned in planned_specializations {
+                if let Some(specialization) = field_index_specialization_from_planned(planned)? {
+                    type_refs.insert(specialization.owner_type_ref);
+                }
+            }
         }
     }
     for type_ref in type_refs {
@@ -7579,6 +7590,7 @@ struct JitEmitCtx<'mc> {
     field_indexed_fallback_counter_ids: &'mc HashMap<InstrId, CounterId>,
     deopt_entry_guard_miss_counter_ids: &'mc HashMap<usize, CounterId>,
     field_index_specializations: &'mc HashMap<String, Vec<FieldIndexSpecialization>>,
+    field_index_specializations_by_instr: &'mc HashMap<InstrId, Vec<FieldIndexSpecialization>>,
     behavior_change_indexed_stores: bool,
     allow_local_only_slot_backed_stores: bool,
     exception_forwarded_local_names: Option<&'mc [String]>,
@@ -8405,7 +8417,7 @@ fn record_profiled_direct_call_incompatibility(
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct FieldIndexSpecialization {
     expected_index: u32,
     owner_type_ref: RelocTypeRef,
@@ -11970,43 +11982,53 @@ fn annotate_typed_attr_accesses(
     module: &BlockPyModule<CodegenModuleShape>,
     function: &mut BlockPyFunction<TypedCodegenModuleShape>,
     field_index_specializations: &HashMap<String, Vec<FieldIndexSpecialization>>,
+    field_index_specializations_by_instr: &HashMap<InstrId, Vec<FieldIndexSpecialization>>,
     specialize_stores: bool,
 ) -> usize {
     struct Annotator<'a> {
         module: &'a BlockPyModule<CodegenModuleShape>,
         field_index_specializations: &'a HashMap<String, Vec<FieldIndexSpecialization>>,
+        field_index_specializations_by_instr: &'a HashMap<InstrId, Vec<FieldIndexSpecialization>>,
         specialize_stores: bool,
         count: usize,
+    }
+
+    impl Annotator<'_> {
+        fn guards_for_attr(
+            &self,
+            instr_id: InstrId,
+            attr: &InstrTyped,
+        ) -> Option<Vec<TypedIndexedFieldGuard>> {
+            self.field_index_specializations_by_instr
+                .get(&instr_id)
+                .or_else(|| {
+                    typed_constant_string_value(self.module, attr)
+                        .and_then(|attr_name| self.field_index_specializations.get(attr_name))
+                })
+                .filter(|specializations| !specializations.is_empty())
+                .map(|specializations| {
+                    specializations
+                        .iter()
+                        .map(FieldIndexSpecialization::to_typed_guard)
+                        .collect::<Vec<_>>()
+                })
+        }
     }
 
     impl VisitMut<InstrTyped> for Annotator<'_> {
         fn visit_instr_mut(&mut self, expr: &mut InstrTyped) {
             match expr {
                 InstrTyped::GetAttrTyped(op) => {
-                    if let Some(guards) = typed_constant_string_value(self.module, op.attr.as_ref())
-                        .and_then(|attr_name| self.field_index_specializations.get(attr_name))
-                        .filter(|specializations| !specializations.is_empty())
-                        .map(|specializations| {
-                            specializations
-                                .iter()
-                                .map(FieldIndexSpecialization::to_typed_guard)
-                                .collect::<Vec<_>>()
-                        })
+                    if let Some(guards) =
+                        self.guards_for_attr(op.semantic_instr_id(), op.attr.as_ref())
                     {
                         op.access = TypedAttrAccessPlan::ProfiledIndexedField { guards };
                         self.count += 1;
                     }
                 }
                 InstrTyped::SetAttrTyped(op) if self.specialize_stores => {
-                    if let Some(guards) = typed_constant_string_value(self.module, op.attr.as_ref())
-                        .and_then(|attr_name| self.field_index_specializations.get(attr_name))
-                        .filter(|specializations| !specializations.is_empty())
-                        .map(|specializations| {
-                            specializations
-                                .iter()
-                                .map(FieldIndexSpecialization::to_typed_guard)
-                                .collect::<Vec<_>>()
-                        })
+                    if let Some(guards) =
+                        self.guards_for_attr(op.semantic_instr_id(), op.attr.as_ref())
                     {
                         op.access = TypedAttrAccessPlan::ProfiledIndexedField { guards };
                         self.count += 1;
@@ -12021,6 +12043,7 @@ fn annotate_typed_attr_accesses(
     let mut annotator = Annotator {
         module,
         field_index_specializations,
+        field_index_specializations_by_instr,
         specialize_stores,
         count: 0,
     };
@@ -12357,6 +12380,7 @@ struct FunctionSpecializationInputs {
     getitem_specializations: HashMap<InstrId, Vec<u64>>,
     setitem_specializations: HashMap<InstrId, Vec<u64>>,
     field_index_specializations: HashMap<String, Vec<FieldIndexSpecialization>>,
+    field_index_specializations_by_instr: HashMap<InstrId, Vec<FieldIndexSpecialization>>,
     branch_prefer_true: HashMap<InstrId, bool>,
     cold_block_labels: HashSet<BlockLabel>,
     behavior_change_indexed_stores: bool,
@@ -12430,7 +12454,10 @@ impl FunctionSpecializationInputs {
             operator_specializations: profile.operator_specializations(function.function_id)?,
             getitem_specializations: profile.getitem_specializations(function.function_id)?,
             setitem_specializations: profile.setitem_specializations(function.function_id)?,
-            field_index_specializations: profile.field_index_specializations()?,
+            field_index_specializations: profile
+                .field_index_specializations(function.function_id)?,
+            field_index_specializations_by_instr: profile
+                .field_index_specializations_by_instr(function.function_id)?,
             branch_prefer_true: profile.branch_preferences(function.function_id)?,
             cold_block_labels: profile.cold_block_labels(function)?,
             behavior_change_indexed_stores: profile.behavior_change_indexed_stores
@@ -12569,13 +12596,45 @@ impl<'a> SpecializationProfile<'a> {
         read_branch_preferences_from_file(path, module_name, function_id)
     }
 
-    fn field_index_specializations(
+    fn counter_field_index_specializations(
         &self,
     ) -> Result<HashMap<String, Vec<FieldIndexSpecialization>>, String> {
         let Some(path) = existing_counter_dump_path(self.counter_dump_path.as_deref()) else {
             return Ok(HashMap::new());
         };
         load_field_index_specializations_from_path(path)
+    }
+
+    fn field_index_specializations(
+        &self,
+        function_id: FunctionId,
+    ) -> Result<HashMap<String, Vec<FieldIndexSpecialization>>, String> {
+        if self.planned_evidence.contains_key(&function_id) {
+            return Ok(HashMap::new());
+        }
+        self.counter_field_index_specializations()
+    }
+
+    fn field_index_specializations_by_instr(
+        &self,
+        function_id: FunctionId,
+    ) -> Result<HashMap<InstrId, Vec<FieldIndexSpecialization>>, String> {
+        let Some(evidence) = self.planned_evidence.get(&function_id) else {
+            return Ok(HashMap::new());
+        };
+        let mut out = HashMap::new();
+        for (instr_id, planned_specializations) in &evidence.field_index_specializations {
+            let mut specializations = Vec::new();
+            for planned in planned_specializations {
+                if let Some(specialization) = field_index_specialization_from_planned(planned)? {
+                    push_unique_specialization(&mut specializations, specialization);
+                }
+            }
+            if !specializations.is_empty() {
+                out.insert(*instr_id, specializations);
+            }
+        }
+        Ok(out)
     }
 
     fn cold_block_labels(
@@ -13106,6 +13165,40 @@ fn field_index_specialization_for_type(
         owner_type_ref,
         type_version,
     }))
+}
+
+fn field_index_specialization_from_planned(
+    planned: &PlannedIndexedFieldSpecialization,
+) -> Result<Option<FieldIndexSpecialization>, String> {
+    let type_key = CounterDumpTypeKey {
+        module_name: planned.owner_type.module_name.clone(),
+        qualname: planned.owner_type.qualname.clone(),
+    };
+    let Some(owner_type) = resolve_type_key_to_type(&type_key)? else {
+        return Ok(None);
+    };
+    prime_field_index_layout(
+        owner_type,
+        &[CollectedTypeKeyLayout {
+            owner_type_id: 0,
+            key: planned.attr_name.clone(),
+            index: planned.expected_index,
+        }],
+    )?;
+    field_index_specialization_for_type(
+        owner_type,
+        planned.attr_name.as_str(),
+        planned.expected_index,
+    )
+}
+
+fn push_unique_specialization(
+    specializations: &mut Vec<FieldIndexSpecialization>,
+    specialization: FieldIndexSpecialization,
+) {
+    if !specializations.contains(&specialization) {
+        specializations.push(specialization);
+    }
 }
 
 fn load_field_index_specializations_from_path(
@@ -23656,6 +23749,7 @@ fn prepare_specialized_typed_function(
     function: &BlockPyFunction<CodegenModuleShape>,
     value_facts: &FactStore,
     field_index_specializations: &HashMap<String, Vec<FieldIndexSpecialization>>,
+    field_index_specializations_by_instr: &HashMap<InstrId, Vec<FieldIndexSpecialization>>,
     specialize_field_stores: bool,
     call_specialization_ctx: &CallSpecializationCtx<'_>,
     call_target_specializations: &HashMap<InstrId, Vec<FunctionId>>,
@@ -23669,6 +23763,7 @@ fn prepare_specialized_typed_function(
         module,
         &mut typed_function,
         field_index_specializations,
+        field_index_specializations_by_instr,
         specialize_field_stores,
     );
     annotate_typed_call_accesses(
@@ -23858,6 +23953,8 @@ fn build_cranelift_run_bb_specialized_function(
     let getitem_specializations = specialization_inputs.getitem_specializations;
     let setitem_specializations = specialization_inputs.setitem_specializations;
     let field_index_specializations = specialization_inputs.field_index_specializations;
+    let field_index_specializations_by_instr =
+        specialization_inputs.field_index_specializations_by_instr;
     let branch_prefer_true = specialization_inputs.branch_prefer_true;
     let cold_block_labels = specialization_inputs.cold_block_labels;
     let behavior_change_indexed_stores = specialization_inputs.behavior_change_indexed_stores;
@@ -23913,6 +24010,7 @@ fn build_cranelift_run_bb_specialized_function(
         function,
         value_facts,
         &field_index_specializations,
+        &field_index_specializations_by_instr,
         behavior_change_indexed_stores,
         &call_specialization_ctx,
         &call_target_specializations,
@@ -24551,6 +24649,7 @@ fn build_cranelift_run_bb_specialized_function(
                 branch_outcome_counter_ids: &branch_outcome_counter_ids,
                 branch_prefer_true: &branch_prefer_true,
                 field_index_specializations: &field_index_specializations,
+                field_index_specializations_by_instr: &field_index_specializations_by_instr,
                 behavior_change_indexed_stores,
                 allow_local_only_slot_backed_stores: true,
                 exception_forwarded_local_names: exc_dispatches[index]
