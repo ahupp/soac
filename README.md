@@ -352,11 +352,12 @@ globals are out of scope for now.
   `SOAC_PRECOMPILED_LIBRARY` to the resulting
   `.so` to let runtime direct-function setup use matching precompiled entries.
 
-- `cargo run -p soac-inspector --bin decide_optimizations -- --counters <profile.bin> --module-root <modules-root> --out <root-dir>`
-  Load a counter dump once, scan a cached BlockPy module root for `mod.blockpy`
-  files, and write binary optimization-decision artifacts under `<root-dir>`
+- `cargo run -p soac-inspector --bin decide_optimizations -- --counters <profile.bin> --out <modules-root>`
+  Load a counter dump once, scan the cached BlockPy module root for
+  `mod.blockpy` files, and write sibling binary optimization-decision artifacts
   using stable module artifact paths such as `python-stdlib/typing/mod.opt`.
-  Pass one or more `--module <mod.blockpy>` arguments for narrower debugging.
+  Pass `--module-root <root-dir>` to scan a different input root, or one or
+  more `--module <mod.blockpy>` arguments for narrower debugging.
   Use `cargo run -p soac-inspector --bin print_optimization_plan -- --plan <mod.opt>`
   to pretty-print a plan for inspection. `just benchmark` runs this after the
   profile pass so verify/apply exercise the decision artifacts. In

@@ -1343,7 +1343,6 @@ benchmark benchmark_loops="1000000" verify_loops="100000" results_root="bench" r
     echo "decide optimization plans"
     cargo run --release -p soac-inspector --bin decide_optimizations -- \
       --counters "$counters_dir/profile.bin" \
-      --module-root "$SOAC_MODULE_CACHE_DIR" \
       --out "$SOAC_MODULE_CACHE_DIR"
 
     echo

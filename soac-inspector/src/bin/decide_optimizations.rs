@@ -3,6 +3,7 @@ use soac_blockpy::codegen_cache::{
     CachedCodegenModule, load_codegen_module_cache, module_optimization_plan_path,
 };
 use soac_jit::optimization_plan::{OptimizationPlan, ProfileEvidenceStore};
+use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, File};
@@ -32,34 +33,21 @@ fn run_with_args(args: impl IntoIterator<Item = OsString>) -> Result<()> {
     let args = parse_args(args)?;
     let counters_path = args
         .counters
+        .as_deref()
         .ok_or_else(|| anyhow!("missing required --counters <profile.bin>"))?;
     let out_root = args
         .out
+        .as_deref()
         .ok_or_else(|| anyhow!("missing required --out <root-dir>"))?;
 
-    let evidence_store = ProfileEvidenceStore::from_counter_dump(counters_path.as_path())?;
-    let mut modules = args.modules;
-    let root_mode = args.module_root.is_some();
-    let mut root_modules = match args.module_root {
-        Some(root) => cached_module_paths_under_root(root.as_path())?,
-        None => Vec::new(),
-    };
-    modules.append(&mut root_modules);
-    modules.sort();
-    modules.dedup();
-    if modules.is_empty() {
-        bail!("missing required --module <mod.blockpy> or --module-root <root-dir>");
-    }
+    let evidence_store = ProfileEvidenceStore::from_counter_dump(counters_path)?;
+    let module_inputs = module_inputs_for_args(&args, out_root)?;
 
     let mut written = 0usize;
     let mut skipped = 0usize;
-    for module_path in modules {
-        match decide_module_optimizations(
-            &evidence_store,
-            module_path.as_path(),
-            out_root.as_path(),
-            !root_mode,
-        )? {
+    for (module_path, strict) in module_inputs {
+        match decide_module_optimizations(&evidence_store, module_path.as_path(), out_root, strict)?
+        {
             Some(report) => {
                 written += 1;
                 println!(
@@ -77,6 +65,32 @@ fn run_with_args(args: impl IntoIterator<Item = OsString>) -> Result<()> {
     }
     println!("optimization decisions: wrote {written} module plan(s), skipped {skipped} module(s)");
     Ok(())
+}
+
+fn module_inputs_for_args(args: &Args, out_root: &Path) -> Result<Vec<(PathBuf, bool)>> {
+    let mut module_inputs = BTreeMap::<PathBuf, bool>::new();
+    for module_path in &args.modules {
+        module_inputs.insert(module_path.clone(), true);
+    }
+
+    let should_scan_root = args.module_root.is_some() || args.modules.is_empty();
+    if should_scan_root {
+        let root = args.module_root.as_deref().unwrap_or(out_root);
+        let root_modules = cached_module_paths_under_root(root)?;
+        if root_modules.is_empty() && args.modules.is_empty() {
+            bail!("no cached BlockPy modules found under {}", root.display());
+        }
+        for module_path in root_modules {
+            module_inputs.entry(module_path).or_insert(false);
+        }
+    }
+
+    if module_inputs.is_empty() {
+        bail!(
+            "missing module input: pass --module <mod.blockpy> or use an output root containing cached modules"
+        );
+    }
+    Ok(module_inputs.into_iter().collect())
 }
 
 #[derive(Debug)]
@@ -226,7 +240,7 @@ fn next_path(args: &mut impl Iterator<Item = OsString>, flag: &str) -> Result<Pa
 
 fn print_usage() {
     println!(
-        "usage: decide_optimizations --counters <profile.bin> [--module <mod.blockpy> ... | --module-root <root-dir>] --out <root-dir>"
+        "usage: decide_optimizations --counters <profile.bin> [--module <mod.blockpy> ...] [--module-root <root-dir>] --out <root-dir>\n\nBy default, scans <root-dir> for cached mod.blockpy files and writes sibling mod.opt files. Use --module-root to scan a different input root, or --module for narrow debugging."
     );
 }
 
@@ -365,10 +379,10 @@ mod test {
     }
 
     #[test]
-    fn module_root_writes_all_counter_referenced_cached_modules() {
+    fn default_scan_writes_all_counter_referenced_cached_modules() {
         let root = unique_temp_dir();
-        let module_cache_root = root.join("modules-in");
-        let out_root = root.join("modules-out");
+        let module_cache_root = root.join("modules");
+        let out_root = module_cache_root.clone();
 
         let first = store_test_module(
             module_cache_root.as_path(),
@@ -410,8 +424,6 @@ mod test {
         run_with_args([
             OsString::from("--counters"),
             counters_path.into_os_string(),
-            OsString::from("--module-root"),
-            module_cache_root.clone().into_os_string(),
             OsString::from("--out"),
             out_root.clone().into_os_string(),
         ])
@@ -439,6 +451,54 @@ mod test {
         assert!(
             !unused_path.exists(),
             "module-root mode should skip cached modules absent from the counter dump"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn module_root_can_scan_different_input_root() {
+        let root = unique_temp_dir();
+        let module_cache_root = root.join("modules-in");
+        let out_root = root.join("modules-out");
+
+        let module = store_test_module(
+            module_cache_root.as_path(),
+            "pkg.scanned",
+            "def f(obj):\n    return obj.x\n",
+            13,
+        );
+        let instr_id = InstrId::new(BlockLabel::from_index(0), 0);
+        let counters = counter_record(
+            "pkg.scanned",
+            module.source_hash,
+            module.function_id,
+            instr_id,
+        )
+        .encode()
+        .unwrap();
+        let counters_path = root.join("profile.bin");
+        fs::write(counters_path.as_path(), counters).unwrap();
+
+        run_with_args([
+            OsString::from("--counters"),
+            counters_path.into_os_string(),
+            OsString::from("--module-root"),
+            module_cache_root.clone().into_os_string(),
+            OsString::from("--out"),
+            out_root.clone().into_os_string(),
+        ])
+        .unwrap();
+
+        let output_path = module_optimization_plan_path(
+            out_root.as_path(),
+            PythonModuleCacheSource::Project,
+            "pkg.scanned",
+        )
+        .unwrap();
+        assert!(
+            output_path.exists(),
+            "expected optimization plan for pkg.scanned at {}",
+            output_path.display()
         );
         let _ = fs::remove_dir_all(root);
     }
