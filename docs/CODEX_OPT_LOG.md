@@ -994,11 +994,13 @@ benchmarked throughput delta, and the headline pre/post numbers.
   bool and calling generic truthiness. Guard-miss deopt is used only when the
   reachable continuation locals are materialized; otherwise the local generic
   fallback remains in place.
-- throughput: `-1.41%` specialized pystone median; no-refcount diagnostic
-  `+3.30%`; code size `-5.64%`
+- throughput: `+1.10%` specialized pystone median; no-refcount diagnostic
+  `+3.02%`; code size `-5.64%`
 - pre-change benchmark:
-  - specialized pass, 1M loops x3: `255615`, `260022`, `256151 loops/s`
-  - no-refcount diagnostic, 1M loops x3: `336643`, `339285`, `349507 loops/s`
+  - specialized pass, 1M loops x5: `255528`, `241373`, `239204`, `249795`,
+    `257029 loops/s`
+  - no-refcount diagnostic, 1M loops x5: `345733`, `340184`, `264129`,
+    `342075`, `337931 loops/s`
   - pystone JIT code bytes: `392208`
 - post-change benchmark:
   - specialized pass, 1M loops x5: `252544`, `243623`, `249279`, `260897`,
