@@ -5,13 +5,14 @@ use self::precompiled_object::{
 use crate::SOAC_RUNTIME_CLIF;
 #[cfg(test)]
 use crate::config::SOAC_JIT_EMIT_REFCOUNTS_ENV;
+#[cfg(test)]
+use crate::config::specialization_mode_is_profile;
 use crate::config::{
     CraneliftTargetConfig, PythonModuleCacheSource, SpecializationMode,
     behavior_change_indexed_stores_enabled, counter_dump_input_path_from_env, jit_compile_workers,
     jit_refcount_emission_enabled, module_cache_root_from_env_or_repo,
     module_optimization_plan_path, pre_optimization_module_cache_identity,
     profiled_cold_blocks_enabled, soac_work_dir_from_env, specialization_mode_from_env,
-    specialization_mode_is_profile,
 };
 use crate::counter::TopValueCounter;
 use crate::counter_dump::{
@@ -13258,23 +13259,6 @@ fn existing_counter_dump_path(path: Option<&Path>) -> Option<&Path> {
     path.filter(|path| path.exists())
 }
 
-fn load_call_target_specializations(
-    module_name: &str,
-    function_id: RuntimeFunctionId,
-) -> Result<HashMap<InstrId, Vec<RuntimeFunctionId>>, String> {
-    if specialization_mode_is_profile()? {
-        return Ok(HashMap::new());
-    }
-    let Some(path) = counter_dump_input_path_from_env()? else {
-        return Ok(HashMap::new());
-    };
-    let path = path.as_path();
-    if !path.exists() {
-        return Ok(HashMap::new());
-    }
-    read_call_target_specializations_from_file(path, module_name, function_id)
-}
-
 fn resolve_type_key_to_type(
     type_key: &CounterDumpTypeKey,
 ) -> Result<Option<*mut ffi::PyTypeObject>, String> {
@@ -21831,6 +21815,8 @@ fn collect_process_jit_batch_functions<'a>(
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     let mut queue = VecDeque::new();
+    let mut planned_evidence_by_module =
+        HashMap::<usize, HashMap<RuntimeFunctionId, FunctionProfileEvidence>>::new();
     let root_module_id = root.function_id.runtime_module_id();
     seen.insert(root.function_id);
     queue.push_back(ProcessJitBatchFunction {
@@ -21844,15 +21830,14 @@ fn collect_process_jit_batch_functions<'a>(
             continue;
         }
         let mut direct_targets = collect_call_direct_targets(&batch_function.function);
-        if let Some(shared_state) = batch_function.source.shared_state() {
-            for targets in load_call_target_specializations(
-                shared_state.module_name.as_str(),
-                batch_function.function.function_id,
-            )?
-            .values()
-            {
-                direct_targets.extend(targets.iter().copied());
-            }
+        for targets in planned_call_target_specializations_for_batch_function(
+            session,
+            &mut planned_evidence_by_module,
+            &batch_function,
+        )?
+        .values()
+        {
+            direct_targets.extend(targets.iter().copied());
         }
         for function_id in direct_targets {
             if !seen.insert(function_id) {
@@ -21892,6 +21877,33 @@ fn collect_process_jit_batch_functions<'a>(
         out.push(batch_function);
     }
     Ok(out)
+}
+
+fn planned_call_target_specializations_for_batch_function(
+    session: &Arc<crate::session::CompileSession>,
+    planned_evidence_by_module: &mut HashMap<
+        usize,
+        HashMap<RuntimeFunctionId, FunctionProfileEvidence>,
+    >,
+    batch_function: &ProcessJitBatchFunction<'_>,
+) -> Result<HashMap<InstrId, Vec<RuntimeFunctionId>>, String> {
+    let Some(shared_state) = batch_function.source.shared_state() else {
+        return Ok(HashMap::new());
+    };
+    let module_key = shared_state.storage_instance_key();
+    if !planned_evidence_by_module.contains_key(&module_key) {
+        let planned_evidence = load_planned_evidence_for_runtime_state(
+            Some(shared_state),
+            Some(session.as_ref()),
+            specialization_mode_from_env()?,
+        )?;
+        planned_evidence_by_module.insert(module_key, planned_evidence);
+    }
+    Ok(planned_evidence_by_module
+        .get(&module_key)
+        .and_then(|planned_evidence| planned_evidence.get(&batch_function.function.function_id))
+        .map(|evidence| evidence.call_target_specializations.clone())
+        .unwrap_or_default())
 }
 
 fn resolve_process_jit_batch_function<'a>(
@@ -22019,12 +22031,11 @@ impl ProcessJitEngine {
             let batch_function = &plan.batch_functions[*batch_function_index];
             let function_id = batch_function.function.function_id;
             let mut direct_targets = collect_call_direct_targets(&batch_function.function);
-            if let Some(shared_state) = batch_function.source.shared_state() {
-                for targets in load_call_target_specializations(
-                    shared_state.module_name.as_str(),
-                    function_id,
-                )?
-                .values()
+            if let Some(reserved_inputs) = plan.function_compile_inputs.get(batch_function_index) {
+                for targets in reserved_inputs
+                    .specialization_inputs
+                    .call_target_specializations
+                    .values()
                 {
                     direct_targets.extend(targets.iter().copied());
                 }

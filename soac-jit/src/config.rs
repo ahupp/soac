@@ -189,6 +189,7 @@ pub(crate) fn jit_perf_helper_frames_enabled() -> Result<bool, String> {
     jit_perf_helper_frames_enabled_from_env()
 }
 
+#[cfg(test)]
 pub(crate) fn specialization_mode_is_profile() -> Result<bool, String> {
     Ok(specialization_mode_from_env()? == Some(SpecializationMode::Profile))
 }

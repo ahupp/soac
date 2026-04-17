@@ -5498,6 +5498,109 @@ def build(values):
     }
 
     #[test]
+    fn process_jit_batch_collection_uses_optimization_plan_targets() {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "process_jit_batch_collection_uses_optimization_plan_targets",
+        ) {
+            return;
+        }
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| {
+            let module_cache_root = fresh_test_work_dir("planned-process-jit-batch");
+            let _cache_dir =
+                EnvVarGuard::set_os("SOAC_MODULE_CACHE_DIR", module_cache_root.as_os_str());
+            let _work_dir = EnvVarGuard::remove("SOAC_WORK_DIR");
+            let _opt_mode = EnvVarGuard::set("SOAC_OPT_MODE", "verify");
+            let session = std::sync::Arc::new(crate::session::CompileSession::new());
+            let module_name = "planned_process_jit_batch_test";
+            let module_name_gen = ModuleNameGen::new(105);
+            let callee = with_single_test_block(
+                test_function_in_module(&module_name_gen, "callee"),
+                vec![],
+                ret_term(none_expr()),
+            );
+            let caller = with_single_test_block(
+                test_function_in_module(&module_name_gen, "caller"),
+                vec![],
+                ret_term(none_expr()),
+            );
+            let callee_function_id = callee.function_id;
+            let caller_function_id = caller.function_id;
+            let call_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
+            let shared_state = crate::module_type::build_shared_state_for_testing(
+                py,
+                test_module(module_name_gen, vec![callee, caller.clone()]),
+                module_name,
+                "",
+            )
+            .expect("shared state should build");
+            session
+                .retain_shared_module_state(std::sync::Arc::clone(&shared_state))
+                .expect("shared state should be retained");
+
+            let planned_callee_target = test_planned_function_target(0, callee_function_id);
+            let planned_caller_function = test_serialized_function_id(0, caller_function_id);
+            let cache_identity = pre_optimization_module_cache_identity(
+                env!("SOAC_BUILD_IDENTITY"),
+                shared_state.module_name == "soac.runtime",
+            );
+            let plan = OptimizationPlan {
+                source: PythonModuleCacheSource::Project,
+                module_name: module_name.to_string(),
+                source_hash: shared_state.source_hash,
+                cache_identity: cache_identity.clone(),
+                identity_tables: test_plan_identities(
+                    module_name,
+                    shared_state.source_hash,
+                    cache_identity.as_str(),
+                    planned_caller_function,
+                    "caller",
+                    &[],
+                ),
+                functions: vec![FunctionOptimizationPlan {
+                    function: planned_caller_function,
+                    decisions: vec![OptimizationDecision {
+                        instr_id: call_instr_id,
+                        replacement: PlannedReplacement::Guarded {
+                            alternatives: vec![PlannedAlternative {
+                                guards: vec![PlannedGuard::FunctionTarget {
+                                    target: planned_callee_target.clone(),
+                                }],
+                                action: PlannedAction::DirectCall {
+                                    target: planned_callee_target,
+                                },
+                            }],
+                            fallback: PlannedFallback::OriginalInstruction,
+                        },
+                    }],
+                }],
+            };
+            let plan_path = module_optimization_plan_path(
+                module_cache_root.as_path(),
+                PythonModuleCacheSource::Project,
+                module_name,
+            )
+            .expect("test optimization plan path should build");
+            write_test_optimization_plan(plan_path.as_path(), &plan);
+
+            let batch =
+                collect_process_jit_batch_functions(&session, &caller, Some(shared_state.as_ref()))
+                    .expect("process JIT batch should collect planned direct-call targets");
+            let function_ids = batch
+                .iter()
+                .map(|batch_function| batch_function.function.function_id)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                function_ids,
+                vec![caller_function_id, callee_function_id],
+                "same-module planned call targets should enter the process-JIT batch without profile.bin fallback"
+            );
+        });
+    }
+
+    #[test]
     fn process_jit_compile_direct_function_handles_mutual_recursion() {
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         crate::initialize_test_python();
