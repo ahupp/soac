@@ -1,5 +1,5 @@
 use libc::{c_int, c_void};
-use soac_blockpy::block_py::RuntimeFunctionId;
+use soac_core::block_py::RuntimeFunctionId;
 use std::ptr;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};

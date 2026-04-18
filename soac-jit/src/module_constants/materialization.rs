@@ -2,7 +2,7 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
-use soac_blockpy::block_py::RuntimeName;
+use soac_core::block_py::RuntimeName;
 use std::ffi::{CStr, CString, c_char, c_int};
 use std::mem::{self, offset_of};
 use std::ptr;

@@ -1,10 +1,10 @@
-use soac_blockpy::block_py::{BlockPyModule, ModuleNameGen, RuntimeFunctionId};
 use soac_blockpy::codegen_cache::{
     CachedCodegenModuleMetadata, PythonModuleCacheSource, codegen_module_cache_path,
     load_codegen_module_cache, module_optimization_plan_path,
     remap_cached_codegen_module_function_ids, validate_codegen_module_cache_metadata,
 };
 use soac_blockpy::passes::CodegenModuleShape;
+use soac_core::block_py::{BlockPyModule, ModuleNameGen, RuntimeFunctionId};
 use soac_jit::counter_dump::{CounterDumpFile, CounterDumpRecordView, CounterDumpRowView};
 use soac_jit::module_type::hash_module_source;
 use soac_jit::{

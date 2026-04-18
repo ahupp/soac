@@ -1,5 +1,5 @@
 use serde_json::json;
-use soac_blockpy::block_py::RuntimeFunctionId;
+use soac_core::block_py::RuntimeFunctionId;
 use soac_inspector::CounterDumpFile;
 use soac_inspector::CounterDumpKeyLayoutView;
 use soac_inspector::CounterDumpRowView;
@@ -219,7 +219,7 @@ fn main() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::format_counter_row;
-    use soac_blockpy::block_py::{BlockLabel, InstrId, RuntimeFunctionId};
+    use soac_core::block_py::{BlockLabel, InstrId, RuntimeFunctionId};
     use soac_inspector::CounterDumpRowView;
     use soac_inspector::parse_counter_dump_records;
     use soac_jit::counter_dump::{

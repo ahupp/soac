@@ -8,10 +8,10 @@ use pyo3::exceptions::{
 use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyFunction, PyModule, PyString, PyTuple};
-use soac_blockpy::block_py::{
+use soac_blockpy::passes::CodegenModuleShape;
+use soac_core::block_py::{
     BlockPyFunction, FunctionExecutionMode, FunctionKind, ParamKind, RuntimeFunctionId,
 };
-use soac_blockpy::passes::CodegenModuleShape;
 use std::ffi::{CString, c_void};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;

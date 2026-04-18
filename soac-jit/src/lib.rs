@@ -33,8 +33,8 @@ pub(crate) fn python_runtime_test_lock() -> &'static Mutex<()> {
 
 use pyo3::ffi;
 use pyo3::prelude::*;
-use soac_blockpy::block_py::{FunctionExecutionMode, FunctionKind, ParamKind, RuntimeFunctionId};
 use soac_blockpy::passes::CodegenModuleShape;
+use soac_core::block_py::{FunctionExecutionMode, FunctionKind, ParamKind, RuntimeFunctionId};
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
 use std::any::Any;
 use std::ffi::{CString, c_char, c_void};
@@ -339,9 +339,7 @@ struct DirectArgBindingPlan {
 }
 
 impl DirectArgBindingPlan {
-    fn from_function(
-        function: &soac_blockpy::block_py::BlockPyFunction<CodegenModuleShape>,
-    ) -> Self {
+    fn from_function(function: &soac_core::block_py::BlockPyFunction<CodegenModuleShape>) -> Self {
         let runtime_data_layout = jit::FunctionRuntimeDataLayout::from_function(function);
         let positional_param_indices = function
             .params
@@ -564,7 +562,7 @@ impl Drop for FunctionEnv {
 }
 
 impl PyFunctionJitExtra {
-    fn function(&self) -> Result<&soac_blockpy::block_py::BlockPyFunction<CodegenModuleShape>, ()> {
+    fn function(&self) -> Result<&soac_core::block_py::BlockPyFunction<CodegenModuleShape>, ()> {
         self.module_state
             .lookup_function(self.function_id)
             .ok_or_else(|| unsafe {
@@ -1469,7 +1467,7 @@ unsafe fn ensure_clif_direct_entries_compiled(
     if data.function_env.compiled_function.is_none() {
         let function = data
             .function()
-            .map(soac_blockpy::block_py::BlockPyFunction::clone)?;
+            .map(soac_core::block_py::BlockPyFunction::clone)?;
         let ensure_start = Instant::now();
         let function_block_count = function.blocks.len();
         let function_qualname = function.names.qualname.clone();
@@ -2236,7 +2234,7 @@ fn entry_interpreter_vectorcall_for_tests_enabled() -> bool {
 }
 
 fn entry_interpreter_vectorcall_requested(
-    function: &soac_blockpy::block_py::BlockPyFunction<CodegenModuleShape>,
+    function: &soac_core::block_py::BlockPyFunction<CodegenModuleShape>,
 ) -> bool {
     function.execution_mode() == FunctionExecutionMode::Interpreted
         || (entry_interpreter_vectorcall_for_tests_enabled()

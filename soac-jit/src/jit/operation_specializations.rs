@@ -3,7 +3,8 @@ use super::{CpythonTypeSymbol, RelocTypeRef};
 use cranelift_codegen::ir;
 use cranelift_codegen::ir::InstBuilder;
 use pyo3::ffi;
-use soac_blockpy::block_py::{CounterId, GetItem, HasSemanticInstrId, InstrCodegen, SetItem};
+use soac_blockpy::passes::InstrCodegen;
+use soac_core::block_py::{CounterId, GetItem, HasSemanticInstrId, SetItem};
 use std::mem::offset_of;
 
 const ITEM_SHAPE_EXACT_LIST_EXACT_INT: u64 = 1;

@@ -11,16 +11,16 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyAnyMethods, PyList, PyTuple};
-use soac_blockpy::block_py::{
-    BlockPyFunction, BlockPyModule, CounterDef, CounterId, CounterScope, CounterSite,
-    DeoptEntrySource, FunctionExecutionMode, RuntimeFunctionId, RuntimeName,
-};
 use soac_blockpy::codegen_cache::PythonModuleCacheSource;
 use soac_blockpy::passes::{
     CodegenModuleShape, InlinePlanModule, plan_module_inlining,
     specialization_runtime_logging_enabled, summarize_module_escapes,
 };
 use soac_config::SoacEnvConfig;
+use soac_core::block_py::{
+    BlockPyFunction, BlockPyModule, CounterDef, CounterId, CounterScope, CounterSite,
+    DeoptEntrySource, FunctionExecutionMode, RuntimeFunctionId, RuntimeName,
+};
 use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, c_int, c_void};
 use std::fs::{OpenOptions, create_dir_all};
@@ -622,9 +622,7 @@ fn counter_scope_name(scope: CounterScope) -> &'static str {
     }
 }
 
-fn deopt_entry_source_instr_id(
-    source: DeoptEntrySource,
-) -> Option<soac_blockpy::block_py::InstrId> {
+fn deopt_entry_source_instr_id(source: DeoptEntrySource) -> Option<soac_core::block_py::InstrId> {
     match source {
         DeoptEntrySource::BeforeInstr { instr_id } => Some(instr_id),
         DeoptEntrySource::BlockEntry { .. } | DeoptEntrySource::BeforeTerm { .. } => None,
@@ -1853,7 +1851,7 @@ def f(x):
                 kind: "block_entry".to_string(),
                 site: CounterSite::BlockEntry {
                     function_id: RuntimeFunctionId::from_raw_parts(0, 7),
-                    block_label: soac_blockpy::block_py::BlockLabel::from_index(0),
+                    block_label: soac_core::block_py::BlockLabel::from_index(0),
                 },
             },
         ];

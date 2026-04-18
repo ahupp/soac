@@ -1,4 +1,4 @@
-use soac_blockpy::block_py::RuntimeFunctionId;
+use soac_core::block_py::RuntimeFunctionId;
 use soac_inspector::{
     JitClifRenderOptions, lower_source_to_codegen_module,
     lower_source_to_codegen_module_with_module_id, profile_module_identity_from_env,

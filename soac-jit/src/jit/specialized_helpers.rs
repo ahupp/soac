@@ -1178,7 +1178,7 @@ pub unsafe extern "C" fn dp_jit_load_runtime_obj_by_id(runtime_name_id: i64) -> 
         ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c"invalid runtime name id".as_ptr());
         return ptr::null_mut();
     };
-    let Some(runtime_name) = soac_blockpy::block_py::RuntimeName::from_id(runtime_name_id) else {
+    let Some(runtime_name) = soac_core::block_py::RuntimeName::from_id(runtime_name_id) else {
         ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c"unknown runtime name id".as_ptr());
         return ptr::null_mut();
     };

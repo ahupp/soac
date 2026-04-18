@@ -50,29 +50,21 @@ use cranelift_jit::{ArenaMemoryProvider, JITBuilder, JITModule};
 use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module, ModuleReloc};
 use cranelift_reader::parse_functions;
 use pyo3::{Py, PyAny, Python, ffi};
-use soac_blockpy::block_py::{
-    AbruptKind, Block, BlockArg, BlockEdge, BlockLabel, BlockParamRole, BlockPyFunction,
-    BlockPyModule, BlockTerm, Call, CallArgKeyword, CallArgPositional, CallDirect,
-    CallableScopeKind, CellLocation, ChildVisitable, CodegenBlock, CounterDef, CounterId,
-    CounterScope, CounterSite, Del, DeoptEntrySource, FunctionExecutionMode, FunctionKind, GetAttr,
-    HasMeta, HasSemanticInstrId, InstrCodegen, InstrId, InstrKey, Literal, Load, LocalFunctionId,
-    LocalLocation, Meta, ModuleContentId, NameLocation, ParamKind, PersistentFunctionId,
-    ResolvedName, RuntimeFunctionId, RuntimeModuleId, RuntimeName, StorageLayout, Store, Visit,
-    VisitMut, WithMeta, operation as blockpy_intrinsics,
-};
+use soac_blockpy::block_py::{CodegenBlock, Literal};
 use soac_blockpy::passes::{
     CodegenModuleShape, ConstructorFieldValue, DirectFunctionIdGuardTest,
     DirectReceiverTypeVersionGuardTest, FactStore, FunctionRefcountPlan, InlineCallee,
-    InlinePlanModule, InstrResolved, InstrTyped, LocalEnvResumeBinding, LocalEnvResumeBindingState,
-    LocalEnvResumeEntry, LocalEnvResumePoint, LocalEnvResumeStatePrecision,
-    LocalEnvResumeValueSource, LocalRefState, PyExactType, PyObjFacts, RefcountActionKind,
-    RefcountReleaseReason, RefcountSite, RuntimeHelperId, TypedAttrAccessPlan, TypedAttrOwnerRef,
-    TypedCall, TypedCallAccessPlan, TypedCodegenModuleShape, TypedDirectCallArgPlan,
-    TypedDirectCallArgSource, TypedDirectCallGuardTest, TypedDirectCallGuardTestKind,
-    TypedDirectCallableCall, TypedDirectCallableCallGuard, TypedDirectConstructorCallGuard,
-    TypedDirectFunctionCallGuard, TypedDirectMethodCall, TypedDirectMethodCallGuard, TypedGetAttr,
-    TypedGuardedCallableCall, TypedGuardedMethodCall, TypedIndexedFieldGuard, TypedPlannedResult,
-    TypedPyObjectOwnershipPlan, TypedSetAttr, ValueFacts, annotate_typed_function_planned_results,
+    InlinePlanModule, InstrCodegen, InstrResolved, InstrTyped, LocalEnvResumeBinding,
+    LocalEnvResumeBindingState, LocalEnvResumeEntry, LocalEnvResumePoint,
+    LocalEnvResumeStatePrecision, LocalEnvResumeValueSource, LocalRefState, PyExactType,
+    PyObjFacts, RefcountActionKind, RefcountReleaseReason, RefcountSite, RuntimeHelperId,
+    TypedAttrAccessPlan, TypedAttrOwnerRef, TypedCall, TypedCallAccessPlan,
+    TypedCodegenModuleShape, TypedDirectCallArgPlan, TypedDirectCallArgSource,
+    TypedDirectCallGuardTest, TypedDirectCallGuardTestKind, TypedDirectCallableCall,
+    TypedDirectCallableCallGuard, TypedDirectConstructorCallGuard, TypedDirectFunctionCallGuard,
+    TypedDirectMethodCall, TypedDirectMethodCallGuard, TypedGetAttr, TypedGuardedCallableCall,
+    TypedGuardedMethodCall, TypedIndexedFieldGuard, TypedPlannedResult, TypedPyObjectOwnershipPlan,
+    TypedSetAttr, ValueFacts, annotate_typed_function_planned_results,
     annotate_typed_function_result_demands, annotate_typed_function_value_facts,
     assign_missing_codegen_function_instr_ids,
     build_cross_module_direct_method_inline_fragment_to_target,
@@ -88,6 +80,16 @@ use soac_blockpy::passes::{
     try_lower_typed_instr_to_codegen_legacy, try_lower_typed_term_to_codegen_legacy,
     validate_codegen_instr_ids, validate_typed_function_call_access_plans,
     validate_typed_function_value_facts,
+};
+use soac_core::block_py::{
+    AbruptKind, Block, BlockArg, BlockEdge, BlockLabel, BlockParamRole, BlockPyFunction,
+    BlockPyModule, BlockTerm, Call, CallArgKeyword, CallArgPositional, CallDirect,
+    CallableScopeKind, CellLocation, ChildVisitable, CounterDef, CounterId, CounterScope,
+    CounterSite, Del, DeoptEntrySource, FunctionExecutionMode, FunctionKind, GetAttr, HasMeta,
+    HasSemanticInstrId, InstrId, InstrKey, Load, LocalFunctionId, LocalLocation, Meta,
+    ModuleContentId, NameLocation, ParamKind, PersistentFunctionId, ResolvedName,
+    RuntimeFunctionId, RuntimeModuleId, RuntimeName, StorageLayout, Store, Visit, VisitMut,
+    WithMeta, operation as blockpy_intrinsics,
 };
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
@@ -3107,7 +3109,7 @@ fn callable_function_id_guard_term(
     then_label: BlockLabel,
     else_label: BlockLabel,
 ) -> BlockTerm<InstrCodegen> {
-    BlockTerm::IfTerm(soac_blockpy::block_py::TermIf {
+    BlockTerm::IfTerm(soac_core::block_py::TermIf {
         test: InstrCodegen::DirectFunctionIdGuardTest(
             DirectFunctionIdGuardTest::new(load_codegen_temp(callable_temp_name), function_id)
                 .with_meta(Meta::synthetic()),
@@ -3417,7 +3419,7 @@ fn receiver_type_version_guard_term(
     fragment: &ProfiledMethodInlineFragment,
     else_label: BlockLabel,
 ) -> BlockTerm<InstrCodegen> {
-    BlockTerm::IfTerm(soac_blockpy::block_py::TermIf {
+    BlockTerm::IfTerm(soac_core::block_py::TermIf {
         test: InstrCodegen::DirectReceiverTypeVersionGuardTest(
             DirectReceiverTypeVersionGuardTest::new(
                 load_codegen_temp(receiver_temp_name),
@@ -8951,7 +8953,7 @@ fn function_has_default_resolving_direct_entry(
 
 fn param_runtime_default_slot(
     layout: &FunctionRuntimeDataLayout,
-    param: &soac_blockpy::block_py::Param,
+    param: &soac_core::block_py::Param,
     param_index: usize,
 ) -> Option<usize> {
     match param.kind {
@@ -15579,7 +15581,7 @@ fn emit_typed_direct_method_resolved_with_args_from_local_env(
 
 fn emit_call_direct_expr_with_local_env(
     fb: &mut FunctionBuilder<'_>,
-    call: &soac_blockpy::block_py::CallDirect<InstrCodegen>,
+    call: &soac_core::block_py::CallDirect<InstrCodegen>,
     local_env: &mut LocalEnv,
     ctx: &JitEmitCtx<'_>,
     codegen_env: &mut impl JitCodegenEnv,
@@ -15587,7 +15589,7 @@ fn emit_call_direct_expr_with_local_env(
 ) -> ir::Value {
     let fallback_call = || {
         InstrCodegen::Call(
-            soac_blockpy::block_py::Call::new(
+            soac_core::block_py::Call::new(
                 (*call.callable).clone(),
                 call.args.clone(),
                 call.keywords.clone(),
@@ -15707,7 +15709,7 @@ fn emit_call_direct_expr_with_local_env(
 }
 
 fn call_direct_callable_is_explicit_init_attr(
-    call: &soac_blockpy::block_py::CallDirect<InstrCodegen>,
+    call: &soac_core::block_py::CallDirect<InstrCodegen>,
     ctx: &JitEmitCtx<'_>,
 ) -> bool {
     let InstrCodegen::GetAttr(getattr) = call.callable.as_ref() else {
@@ -17238,7 +17240,7 @@ struct SimpleCallParts<'a> {
     has_unpack: bool,
 }
 
-fn simple_call_parts(call: &soac_blockpy::block_py::Call<InstrCodegen>) -> SimpleCallParts<'_> {
+fn simple_call_parts(call: &soac_core::block_py::Call<InstrCodegen>) -> SimpleCallParts<'_> {
     let mut simple_args: Vec<&InstrCodegen> = Vec::new();
     let mut simple_keywords: Vec<(&str, &InstrCodegen)> = Vec::new();
     let mut has_unpack = false;
@@ -17263,7 +17265,7 @@ fn simple_call_parts(call: &soac_blockpy::block_py::Call<InstrCodegen>) -> Simpl
 
 fn typed_call_can_emit_simple_positional_with_typed_inputs(
     call: &TypedCall<InstrTyped>,
-    legacy_call: &soac_blockpy::block_py::Call<InstrCodegen>,
+    legacy_call: &soac_core::block_py::Call<InstrCodegen>,
     emit_ctx: &JitEmitCtx<'_>,
 ) -> bool {
     if !matches!(call.access, TypedCallAccessPlan::Generic) {
@@ -17384,7 +17386,7 @@ fn emit_typed_positional_call_result_with_arg_refs(
 #[allow(clippy::too_many_arguments)]
 fn emit_codegen_simple_call_effect_only_with_local_env(
     fb: &mut FunctionBuilder<'_>,
-    call: &soac_blockpy::block_py::Call<InstrCodegen>,
+    call: &soac_core::block_py::Call<InstrCodegen>,
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     codegen_env: &mut impl JitCodegenEnv,
@@ -17526,7 +17528,7 @@ fn emit_codegen_simple_call_effect_only_with_local_env(
 
 fn emit_codegen_simple_call_with_local_env(
     fb: &mut FunctionBuilder<'_>,
-    call: &soac_blockpy::block_py::Call<InstrCodegen>,
+    call: &soac_core::block_py::Call<InstrCodegen>,
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     profiled_targets: Option<&[RuntimeFunctionId]>,
@@ -18435,7 +18437,7 @@ fn emit_codegen_simple_call_with_local_env(
 
 fn emit_codegen_make_function_with_closure_with_local_env(
     fb: &mut FunctionBuilder<'_>,
-    make_function: &soac_blockpy::block_py::MakeFunctionWithClosure<InstrCodegen>,
+    make_function: &soac_core::block_py::MakeFunctionWithClosure<InstrCodegen>,
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     codegen_env: &mut impl JitCodegenEnv,
@@ -18848,7 +18850,7 @@ fn emit_owned_pyobject_result_for_demand(
 }
 
 fn direct_positional_call_args(
-    call: &soac_blockpy::block_py::Call<InstrCodegen>,
+    call: &soac_core::block_py::Call<InstrCodegen>,
     param_count: usize,
 ) -> Option<Vec<&InstrCodegen>> {
     if !call.keywords.is_empty() || call.args.len() != param_count {
@@ -18865,7 +18867,7 @@ fn direct_positional_call_args(
 
 #[cfg(test)]
 fn static_runtime_primitive_for_call(
-    call: &soac_blockpy::block_py::Call<InstrCodegen>,
+    call: &soac_core::block_py::Call<InstrCodegen>,
     module_constants: &ModuleCodegenConstants,
 ) -> Option<direct_abi::RuntimePrimitiveId> {
     let desc = static_runtime_primitive_desc_for_call(call, module_constants)?;
@@ -18876,7 +18878,7 @@ fn static_runtime_primitive_for_call(
 }
 
 fn static_runtime_primitive_desc_for_call(
-    call: &soac_blockpy::block_py::Call<InstrCodegen>,
+    call: &soac_core::block_py::Call<InstrCodegen>,
     module_constants: &ModuleCodegenConstants,
 ) -> Option<&'static DirectCallableDesc> {
     let name = codegen_expr_static_runtime_name(call.func.as_ref(), module_constants)?;
@@ -19061,7 +19063,7 @@ fn codegen_expr_can_satisfy_param_abi(
 }
 
 fn runtime_primitive_call_params_can_satisfy_abi(
-    call: &soac_blockpy::block_py::Call<InstrCodegen>,
+    call: &soac_core::block_py::Call<InstrCodegen>,
     desc: &DirectCallableDesc,
     local_env: &LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
@@ -19122,7 +19124,7 @@ fn codegen_expr_static_i64_demand_facts(
 
 #[cfg(test)]
 fn runtime_primitive_call_static_params_can_satisfy_abi(
-    call: &soac_blockpy::block_py::Call<InstrCodegen>,
+    call: &soac_core::block_py::Call<InstrCodegen>,
     desc: &DirectCallableDesc,
     module_constants: &ModuleCodegenConstants,
 ) -> bool {
@@ -19499,7 +19501,7 @@ fn emit_runtime_primitive_result_for_demand(
 
 fn emit_runtime_builtin_primitive_desc_call_result_with_local_env(
     fb: &mut FunctionBuilder<'_>,
-    call: &soac_blockpy::block_py::Call<InstrCodegen>,
+    call: &soac_core::block_py::Call<InstrCodegen>,
     desc: &DirectCallableDesc,
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
@@ -19545,7 +19547,7 @@ fn emit_runtime_builtin_primitive_desc_call_result_with_local_env(
 
 fn emit_runtime_builtin_primitive_call_result_with_local_env(
     fb: &mut FunctionBuilder<'_>,
-    call: &soac_blockpy::block_py::Call<InstrCodegen>,
+    call: &soac_core::block_py::Call<InstrCodegen>,
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     demand: ResultDemand,
@@ -19575,7 +19577,7 @@ fn emit_runtime_builtin_primitive_call_result_with_local_env(
 
 fn emit_codegen_call_result_with_local_env(
     fb: &mut FunctionBuilder<'_>,
-    call: &soac_blockpy::block_py::Call<InstrCodegen>,
+    call: &soac_core::block_py::Call<InstrCodegen>,
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     demand: ResultDemand,
@@ -19785,7 +19787,7 @@ fn emit_typed_codegen_simple_positional_call_result_with_local_env(
 fn emit_typed_codegen_direct_callable_specialization_result_with_local_env(
     fb: &mut FunctionBuilder<'_>,
     call: &TypedCall<InstrTyped>,
-    legacy_call: &soac_blockpy::block_py::Call<InstrCodegen>,
+    legacy_call: &soac_core::block_py::Call<InstrCodegen>,
     profiled_targets: Option<&[RuntimeFunctionId]>,
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
@@ -20330,7 +20332,7 @@ fn emit_typed_codegen_direct_method_call_result_with_local_env(
 
 fn emit_codegen_call_direct_result_with_local_env(
     fb: &mut FunctionBuilder<'_>,
-    call: &soac_blockpy::block_py::CallDirect<InstrCodegen>,
+    call: &soac_core::block_py::CallDirect<InstrCodegen>,
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     demand: ResultDemand,
@@ -25516,7 +25518,7 @@ fn block_edge_shape(edge: Option<&BlockEdge>) -> Option<(BlockLabel, usize)> {
     edge.map(|edge| (edge.target.clone(), edge.args.len()))
 }
 
-fn block_term_shape<I: soac_blockpy::block_py::Instr>(
+fn block_term_shape<I: soac_core::block_py::Instr>(
     term: &BlockTerm<I>,
 ) -> (&'static str, Vec<(BlockLabel, usize)>) {
     match term {
@@ -26932,7 +26934,7 @@ fn build_cranelift_run_bb_specialized_function(
 pub unsafe fn render_cranelift_run_bb_specialized_with_cfg(
     blocks: &[ObjPtr],
     module: &BlockPyModule<CodegenModuleShape>,
-    function: &soac_blockpy::block_py::BlockPyFunction<CodegenModuleShape>,
+    function: &soac_core::block_py::BlockPyFunction<CodegenModuleShape>,
     module_constants: &ModuleCodegenConstants,
 ) -> Result<RenderedSpecializedClif, String> {
     unsafe {
@@ -26952,7 +26954,7 @@ pub unsafe fn render_cranelift_run_bb_specialized_with_cfg(
 pub unsafe fn render_instr_typed_for_codegen_with_runtime_state(
     compile_session: &crate::session::CompileSession,
     module: &BlockPyModule<CodegenModuleShape>,
-    function: &soac_blockpy::block_py::BlockPyFunction<CodegenModuleShape>,
+    function: &soac_core::block_py::BlockPyFunction<CodegenModuleShape>,
     runtime_state: Option<&SharedModuleState>,
 ) -> Result<String, String> {
     let builder = new_jit_builder()?;
@@ -27089,7 +27091,7 @@ pub unsafe fn render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
     compile_session: &crate::session::CompileSession,
     blocks: &[ObjPtr],
     module: &BlockPyModule<CodegenModuleShape>,
-    function: &soac_blockpy::block_py::BlockPyFunction<CodegenModuleShape>,
+    function: &soac_core::block_py::BlockPyFunction<CodegenModuleShape>,
     module_constants: &ModuleCodegenConstants,
     runtime_state: Option<&SharedModuleState>,
 ) -> Result<RenderedSpecializedClif, String> {
@@ -27336,7 +27338,7 @@ pub(crate) unsafe fn compile_cranelift_run_bb_specialized_cached(
     compile_session: &Arc<crate::session::CompileSession>,
     blocks: &[ObjPtr],
     module: &BlockPyModule<CodegenModuleShape>,
-    function: &soac_blockpy::block_py::BlockPyFunction<CodegenModuleShape>,
+    function: &soac_core::block_py::BlockPyFunction<CodegenModuleShape>,
     module_constants: &ModuleCodegenConstants,
     counter_defs: &[CounterDef],
     module_constant_ptrs: &[*mut ffi::PyObject],

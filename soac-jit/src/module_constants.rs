@@ -1,11 +1,11 @@
 use pyo3::ffi;
 use pyo3::prelude::*;
-use soac_blockpy::block_py::{
+use soac_blockpy::block_py::{Literal, NumberLiteralValue};
+use soac_blockpy::passes::{CodegenModuleShape, InstrCodegen, InstrResolved};
+use soac_core::block_py::{
     AbruptKind, BlockArg, BlockPyFunction, BlockPyModule, BlockTerm, CallArgKeyword,
-    ChildVisitable, InstrCodegen, InstrResolved, Literal, NameLike, NumberLiteralValue,
-    ParamDefaultSource, RuntimeName, operation as blockpy_intrinsics,
+    ChildVisitable, NameLike, ParamDefaultSource, RuntimeName, operation as blockpy_intrinsics,
 };
-use soac_blockpy::passes::CodegenModuleShape;
 use std::collections::HashMap;
 
 mod materialization;
@@ -568,7 +568,7 @@ impl ModuleConstantCollector {
     }
 }
 
-impl soac_blockpy::block_py::Visit<InstrCodegen> for ModuleConstantCollector {
+impl soac_core::block_py::Visit<InstrCodegen> for ModuleConstantCollector {
     fn visit_instr(&mut self, expr: &InstrCodegen) {
         self.collect_expr(expr);
     }

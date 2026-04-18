@@ -1,13 +1,13 @@
 use std::collections::{HashMap, HashSet};
 
-use soac_blockpy::block_py::{
-    BlockPyFunction, CallArgKeyword, CallArgPositional, ChildVisitable, HasSemanticInstrId, Instr,
-    InstrId, NameLocation, ParamKind, RuntimeFunctionId, RuntimeName, Visit, VisitMut,
-};
 use soac_blockpy::passes::{
-    CodegenModuleShape, InstrCodegen, InstrTyped, TypedCall, TypedCallAccessPlan,
+    CodegenModuleShape, InstrCodegen, InstrResolved, InstrTyped, TypedCall, TypedCallAccessPlan,
     TypedCodegenModuleShape, TypedDirectCallArgPlan, TypedDirectCallArgSource,
     TypedDirectConstructorCallGuard, TypedDirectFunctionCallGuard, TypedDirectMethodCallGuard,
+};
+use soac_core::block_py::{
+    BlockPyFunction, CallArgKeyword, CallArgPositional, ChildVisitable, HasSemanticInstrId, Instr,
+    InstrId, NameLocation, ParamKind, RuntimeFunctionId, RuntimeName, Visit, VisitMut,
 };
 
 use super::{
@@ -19,7 +19,7 @@ use super::{
 use crate::module_constants::{ModuleCodegenConstants, ModuleConstantId};
 
 pub(super) struct CallSpecializationCtx<'a> {
-    pub module: &'a soac_blockpy::block_py::BlockPyModule<CodegenModuleShape>,
+    pub module: &'a soac_core::block_py::BlockPyModule<CodegenModuleShape>,
     pub direct_call_resolver: Option<&'a crate::module_type::SharedModuleState>,
     pub direct_call_target_functions:
         &'a HashMap<RuntimeFunctionId, BlockPyFunction<CodegenModuleShape>>,
@@ -117,7 +117,7 @@ pub(super) fn collect_runtime_protocol_method_targets(
     }
 
     impl Collector<'_> {
-        fn collect_call(&mut self, call: &soac_blockpy::block_py::Call<InstrCodegen>) {
+        fn collect_call(&mut self, call: &soac_core::block_py::Call<InstrCodegen>) {
             if codegen_static_runtime_name(call.func.as_ref(), self.module_constants)
                 != Some(RuntimeName::Iter)
             {
@@ -327,13 +327,9 @@ fn typed_static_runtime_name(
     }
 }
 
-fn resolved_static_runtime_name(
-    expr: &soac_blockpy::block_py::InstrResolved,
-) -> Option<RuntimeName> {
+fn resolved_static_runtime_name(expr: &InstrResolved) -> Option<RuntimeName> {
     match expr {
-        soac_blockpy::block_py::InstrResolved::Load(load)
-            if matches!(load.name.location, NameLocation::RuntimeName(_)) =>
-        {
+        InstrResolved::Load(load) if matches!(load.name.location, NameLocation::RuntimeName(_)) => {
             load.name.location.runtime_name_id()
         }
         _ => None,
@@ -362,7 +358,7 @@ fn codegen_static_runtime_name(
 
 fn codegen_receiver_constructor_call(
     receiver: &InstrCodegen,
-) -> Option<&soac_blockpy::block_py::Call<InstrCodegen>> {
+) -> Option<&soac_core::block_py::Call<InstrCodegen>> {
     match receiver {
         InstrCodegen::Call(call) => Some(call),
         _ => None,
@@ -730,17 +726,17 @@ fn typed_direct_call_arg_plan(plan: &DirectCallArgPlan) -> TypedDirectCallArgPla
 mod tests {
     use super::*;
     use crate::counter_dump::CounterDumpTypeKey;
-    use soac_blockpy::block_py::Visit;
     use soac_blockpy::passes::{TypedDirectCallArgSource, lower_codegen_module_to_typed};
+    use soac_core::block_py::Visit;
 
-    fn lowered_module(source: &str) -> soac_blockpy::block_py::BlockPyModule<CodegenModuleShape> {
+    fn lowered_module(source: &str) -> soac_core::block_py::BlockPyModule<CodegenModuleShape> {
         soac_blockpy::lower_python_to_blockpy_for_testing(source)
             .expect("test source should lower")
             .codegen_module
     }
 
     fn function_by_qualname<'a>(
-        module: &'a soac_blockpy::block_py::BlockPyModule<CodegenModuleShape>,
+        module: &'a soac_core::block_py::BlockPyModule<CodegenModuleShape>,
         qualname: &str,
     ) -> &'a BlockPyFunction<CodegenModuleShape> {
         module
@@ -751,7 +747,7 @@ mod tests {
     }
 
     fn typed_function_by_qualname<'a>(
-        module: &'a soac_blockpy::block_py::BlockPyModule<TypedCodegenModuleShape>,
+        module: &'a soac_core::block_py::BlockPyModule<TypedCodegenModuleShape>,
         qualname: &str,
     ) -> &'a BlockPyFunction<TypedCodegenModuleShape> {
         module

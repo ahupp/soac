@@ -1,19 +1,23 @@
 use super::*;
 use soac_blockpy::block_py::{
-    AbruptKind, BinOp, BinOpKind, BlockArg, BlockEdge, BlockLabel, BlockParam, BlockParamRole,
-    BlockPyFunction, BlockPyModule, BlockTerm, Call, CallArgKeyword, CallArgPositional, CallDirect,
-    CalleeFunctionId, CellLocation, CellRef, ChildVisitable, ClosureInit, ClosureSlot,
-    CodegenBlock, CounterDef, CounterSite, Del, DelItem, FunctionKind, FunctionName, GetAttr,
-    GetItem, HasMeta, HasSemanticInstrId, IncrementCounter, InstrCodegen, InstrResolved, Literal,
-    LiteralValue, Load, LocalFunctionId, LocalLocation, MakeCell, Meta, ModuleNameGen, NameLike,
-    NameLocation, NumberLiteral, NumberLiteralValue, Param, ParamKind, ParamSpec, ResolvedName,
-    RuntimeFunctionId, RuntimeName, SerializedFunctionDebugName, SerializedFunctionId,
-    SerializedIdentityTables, SerializedModuleId, SerializedModuleIdentity, SetAttr, SetItem,
-    StorageLayout, Store, StringLiteral, Tuple, UnaryOp, UnaryOpKind, Visit, VisitMut, WithMeta,
+    CodegenBlock, IncrementCounter, Literal, LiteralValue, NumberLiteral, NumberLiteralValue,
+    StringLiteral,
 };
 use soac_blockpy::passes::{
-    CodegenModuleShape, instrument_bb_module_with_block_entry_counters,
-    instrument_bb_module_with_call_target_counters, validate_codegen_instr_ids,
+    CodegenModuleShape, InstrCodegen, InstrResolved,
+    instrument_bb_module_with_block_entry_counters, instrument_bb_module_with_call_target_counters,
+    validate_codegen_instr_ids,
+};
+use soac_core::block_py::{
+    AbruptKind, BinOp, BinOpKind, BlockArg, BlockEdge, BlockLabel, BlockParam, BlockParamRole,
+    BlockPyFunction, BlockPyModule, BlockTerm, Call, CallArgKeyword, CallArgPositional, CallDirect,
+    CalleeFunctionId, CellLocation, CellRef, ChildVisitable, ClosureInit, ClosureSlot, CounterDef,
+    CounterSite, Del, DelItem, FunctionKind, FunctionName, GetAttr, GetItem, HasMeta,
+    HasSemanticInstrId, Load, LocalFunctionId, LocalLocation, MakeCell, Meta, ModuleNameGen,
+    NameLike, NameLocation, Param, ParamKind, ParamSpec, ResolvedName, RuntimeFunctionId,
+    RuntimeName, SerializedFunctionDebugName, SerializedFunctionId, SerializedIdentityTables,
+    SerializedModuleId, SerializedModuleIdentity, SetAttr, SetItem, StorageLayout, Store, Tuple,
+    UnaryOp, UnaryOpKind, Visit, VisitMut, WithMeta,
 };
 mod tests {
     use super::*;
@@ -3192,7 +3196,7 @@ def build(values):
     }
 
     fn raise_term() -> BlockTerm<InstrCodegen> {
-        BlockTerm::Raise(soac_blockpy::block_py::TermRaise { exc: None })
+        BlockTerm::Raise(soac_core::block_py::TermRaise { exc: None })
     }
 
     fn test_source_block(
@@ -3223,7 +3227,7 @@ def build(values):
             function_id: name_gen.function_id(),
             name_gen,
             names: FunctionName::new(name, name, name, name),
-            kind: soac_blockpy::block_py::FunctionKind::Function,
+            kind: soac_core::block_py::FunctionKind::Function,
             execution_mode: Default::default(),
             params: ParamSpec::default(),
             blocks: vec![],
@@ -3381,7 +3385,7 @@ def build(values):
         let entry = CodegenBlock {
             label: entry_label,
             body: vec![],
-            term: BlockTerm::IfTerm(soac_blockpy::block_py::TermIf {
+            term: BlockTerm::IfTerm(soac_core::block_py::TermIf {
                 test: name_expr(test_runtime_name("TRUE")),
                 then_label,
                 else_label,
@@ -3431,7 +3435,7 @@ def build(values):
         let entry = CodegenBlock {
             label: entry_label,
             body: vec![],
-            term: BlockTerm::IfTerm(soac_blockpy::block_py::TermIf {
+            term: BlockTerm::IfTerm(soac_core::block_py::TermIf {
                 test: InstrCodegen::DirectReceiverTypeVersionGuardTest(
                     DirectReceiverTypeVersionGuardTest::new(
                         constants.int_expr(1),
@@ -3492,7 +3496,7 @@ def build(values):
         let function = with_single_test_block(
             function,
             vec![],
-            BlockTerm::Raise(soac_blockpy::block_py::TermRaise {
+            BlockTerm::Raise(soac_core::block_py::TermRaise {
                 exc: Some(constants.int_expr(1)),
             }),
         );
@@ -3517,7 +3521,7 @@ def build(values):
         let entry = CodegenBlock {
             label: entry_label,
             body: vec![],
-            term: BlockTerm::BranchTable(soac_blockpy::block_py::TermBranchTable {
+            term: BlockTerm::BranchTable(soac_core::block_py::TermBranchTable {
                 index: constants.int_expr(0),
                 targets: vec![case_label],
                 default_label,
@@ -4331,7 +4335,7 @@ def build(values):
         let entry = CodegenBlock {
             label: entry_label,
             body: vec![],
-            term: BlockTerm::IfTerm(soac_blockpy::block_py::TermIf {
+            term: BlockTerm::IfTerm(soac_core::block_py::TermIf {
                 test: with_instr_id(constants.int_expr(0), test_instr_id),
                 then_label,
                 else_label,
@@ -4375,7 +4379,7 @@ def build(values):
         let entry = CodegenBlock {
             label: entry_label,
             body: vec![],
-            term: BlockTerm::BranchTable(soac_blockpy::block_py::TermBranchTable {
+            term: BlockTerm::BranchTable(soac_core::block_py::TermBranchTable {
                 index: with_instr_id(constants.int_expr(0), index_instr_id),
                 targets: vec![case_label],
                 default_label,
@@ -4432,7 +4436,7 @@ def build(values):
         let function = with_single_test_block(
             test_function(),
             vec![],
-            BlockTerm::Raise(soac_blockpy::block_py::TermRaise {
+            BlockTerm::Raise(soac_core::block_py::TermRaise {
                 exc: Some(with_instr_id(constants.int_expr(2), raise_instr_id)),
             }),
         );
@@ -8852,7 +8856,7 @@ def f(x):
         let function = with_single_test_block(
             test_function(),
             vec![],
-            BlockTerm::Raise(soac_blockpy::block_py::TermRaise {
+            BlockTerm::Raise(soac_core::block_py::TermRaise {
                 exc: Some(name_expr(test_constant_name(0))),
             }),
         );
@@ -9007,9 +9011,9 @@ def f(x):
         let function = with_single_test_block(
             test_function,
             vec![expr_stmt(op_expr(
-                soac_blockpy::block_py::MakeFunctionWithClosure::new(
+                soac_core::block_py::MakeFunctionWithClosure::new(
                     function_id,
-                    soac_blockpy::block_py::FunctionKind::Function,
+                    soac_core::block_py::FunctionKind::Function,
                     empty_tuple_expr(),
                     empty_tuple_expr(),
                     none_expr(),
@@ -9304,7 +9308,7 @@ def f(x):
         let mut function = with_single_test_block(
             test_function(),
             vec![],
-            ret_term(op_expr(soac_blockpy::block_py::CellRef::new(
+            ret_term(op_expr(soac_core::block_py::CellRef::new(
                 CellLocation::Owned(0),
             ))),
         );
@@ -9349,7 +9353,7 @@ def f(x):
         let function = with_single_test_block(
             test_function(),
             vec![],
-            ret_term(op_expr(soac_blockpy::block_py::CellRef::new(
+            ret_term(op_expr(soac_core::block_py::CellRef::new(
                 CellLocation::Closure(0),
             ))),
         );
@@ -9384,7 +9388,7 @@ def f(x):
         let function = with_single_test_block(
             test_function(),
             vec![],
-            ret_term(op_expr(soac_blockpy::block_py::CellRef::new(
+            ret_term(op_expr(soac_core::block_py::CellRef::new(
                 CellLocation::CapturedSource(0),
             ))),
         );
@@ -9809,7 +9813,7 @@ def f(x):
         let entry = test_source_block(
             &function,
             vec![],
-            BlockTerm::IfTerm(soac_blockpy::block_py::TermIf {
+            BlockTerm::IfTerm(soac_core::block_py::TermIf {
                 test: name_expr(test_constant_name(0)),
                 then_label: then_block.label,
                 else_label: else_block.label,
@@ -9855,7 +9859,7 @@ def f(x):
         let entry = test_source_block(
             &function,
             vec![],
-            BlockTerm::BranchTable(soac_blockpy::block_py::TermBranchTable {
+            BlockTerm::BranchTable(soac_core::block_py::TermBranchTable {
                 index: name_expr(test_constant_name(0)),
                 targets: vec![first_block.label, second_block.label],
                 default_label: default_block.label,
@@ -9901,7 +9905,7 @@ def f(x):
         let entry = test_source_block(
             &function,
             vec![],
-            BlockTerm::BranchTable(soac_blockpy::block_py::TermBranchTable {
+            BlockTerm::BranchTable(soac_core::block_py::TermBranchTable {
                 index: InstrCodegen::CalleeFunctionId(CalleeFunctionId::new(name_expr(
                     test_constant_name(0),
                 ))),
@@ -11012,7 +11016,7 @@ def f(x):
             let entry = test_source_block(
                 &function,
                 vec![],
-                BlockTerm::IfTerm(soac_blockpy::block_py::TermIf {
+                BlockTerm::IfTerm(soac_core::block_py::TermIf {
                     test: name_expr(test_constant_name(0)),
                     then_label: then_block.label,
                     else_label: else_block.label,
@@ -11118,7 +11122,7 @@ def f(x):
             let entry = test_source_block(
                 &function,
                 vec![],
-                BlockTerm::BranchTable(soac_blockpy::block_py::TermBranchTable {
+                BlockTerm::BranchTable(soac_core::block_py::TermBranchTable {
                     index: name_expr(test_constant_name(0)),
                     targets: vec![first_block.label, second_block.label],
                     default_label: default_block.label,
@@ -11229,7 +11233,7 @@ def f(x):
             let entry = test_source_block(
                 &function,
                 vec![],
-                BlockTerm::BranchTable(soac_blockpy::block_py::TermBranchTable {
+                BlockTerm::BranchTable(soac_core::block_py::TermBranchTable {
                     index: InstrCodegen::CalleeFunctionId(CalleeFunctionId::new(name_expr(
                         test_constant_name(0),
                     ))),
@@ -12736,7 +12740,7 @@ def g():
             let mut function = with_single_test_block(
                 test_function(),
                 vec![],
-                ret_term(op_expr(soac_blockpy::block_py::CellRef::new(
+                ret_term(op_expr(soac_core::block_py::CellRef::new(
                     CellLocation::Owned(0),
                 ))),
             );
@@ -12832,7 +12836,7 @@ def g():
             let function = with_single_test_block(
                 test_function(),
                 vec![],
-                ret_term(op_expr(soac_blockpy::block_py::CellRef::new(
+                ret_term(op_expr(soac_core::block_py::CellRef::new(
                     CellLocation::Closure(0),
                 ))),
             );
@@ -13226,7 +13230,7 @@ def g():
             let function = with_single_test_block(
                 test_function(),
                 vec![],
-                BlockTerm::Raise(soac_blockpy::block_py::TermRaise {
+                BlockTerm::Raise(soac_core::block_py::TermRaise {
                     exc: Some(name_expr(test_constant_name(0))),
                 }),
             );
@@ -13308,7 +13312,7 @@ def g():
             let function = with_single_test_block(
                 test_function(),
                 vec![],
-                BlockTerm::Raise(soac_blockpy::block_py::TermRaise {
+                BlockTerm::Raise(soac_core::block_py::TermRaise {
                     exc: Some(name_expr(test_constant_name(0))),
                 }),
             );
@@ -15646,7 +15650,7 @@ def f(x):
         let entry = CodegenBlock {
             label: entry_label,
             body: vec![],
-            term: BlockTerm::IfTerm(soac_blockpy::block_py::TermIf {
+            term: BlockTerm::IfTerm(soac_core::block_py::TermIf {
                 test: with_instr_id(
                     op_expr(BinOp::new(
                         BinOpKind::Lt,
@@ -15766,7 +15770,7 @@ def f(x):
         let test_block = CodegenBlock {
             label: test_label,
             body: vec![],
-            term: BlockTerm::IfTerm(soac_blockpy::block_py::TermIf {
+            term: BlockTerm::IfTerm(soac_core::block_py::TermIf {
                 test: with_instr_id(
                     op_expr(BinOp::new(
                         BinOpKind::Gt,
@@ -16133,7 +16137,7 @@ def f(x):
                 CodegenBlock {
                     label: entry_label,
                     body: vec![],
-                    term: BlockTerm::IfTerm(soac_blockpy::block_py::TermIf {
+                    term: BlockTerm::IfTerm(soac_core::block_py::TermIf {
                         test: with_instr_id(
                             op_expr(BinOp::new(
                                 BinOpKind::Eq,
@@ -16332,8 +16336,8 @@ def f(x):
             label: block_label,
             body: vec![],
             term: ret_term(with_instr_id(
-                op_expr(soac_blockpy::block_py::UnaryOp::new(
-                    soac_blockpy::block_py::UnaryOpKind::Neg,
+                op_expr(soac_core::block_py::UnaryOp::new(
+                    soac_core::block_py::UnaryOpKind::Neg,
                     name_expr(test_name("value")),
                 )),
                 instr_id,
@@ -17297,7 +17301,7 @@ def f(x, y):
             function_id: caller_function_id,
             name_gen: caller_name_gen,
             names: FunctionName::new("caller", "caller", "caller", "caller"),
-            kind: soac_blockpy::block_py::FunctionKind::Function,
+            kind: soac_core::block_py::FunctionKind::Function,
             execution_mode: Default::default(),
             params: ParamSpec {
                 params: vec![Param {
@@ -17788,7 +17792,7 @@ def f(x, y):
                 function_id: caller_function_id,
                 name_gen: caller_name_gen,
                 names: FunctionName::new("caller", "caller", "caller", "caller"),
-                kind: soac_blockpy::block_py::FunctionKind::Function,
+                kind: soac_core::block_py::FunctionKind::Function,
                 execution_mode: Default::default(),
                 params: ParamSpec {
                     params: vec![Param {
@@ -18363,7 +18367,7 @@ def f(x, y):
             function_id: caller_function_id,
             name_gen: caller_name_gen,
             names: FunctionName::new("caller", "caller", "caller", "caller"),
-            kind: soac_blockpy::block_py::FunctionKind::Function,
+            kind: soac_core::block_py::FunctionKind::Function,
             execution_mode: Default::default(),
             params: caller_params,
             blocks: vec![CodegenBlock {
@@ -18557,7 +18561,7 @@ def f(x, y):
             function_id: method_function_id,
             name_gen: method_name_gen,
             names: FunctionName::new("Thing.f", "Thing.f", "Thing.f", "Thing.f"),
-            kind: soac_blockpy::block_py::FunctionKind::Function,
+            kind: soac_core::block_py::FunctionKind::Function,
             execution_mode: Default::default(),
             params: ParamSpec {
                 params: vec![Param {
@@ -18608,7 +18612,7 @@ def f(x, y):
             function_id: caller_function_id,
             name_gen: caller_name_gen,
             names: FunctionName::new("caller", "caller", "caller", "caller"),
-            kind: soac_blockpy::block_py::FunctionKind::Function,
+            kind: soac_core::block_py::FunctionKind::Function,
             execution_mode: Default::default(),
             params: caller_params,
             blocks: vec![CodegenBlock {
@@ -18869,7 +18873,7 @@ def f(x, y):
                 function_id: method_function_id,
                 name_gen: method_name_gen,
                 names: FunctionName::new("Thing.f", "Thing.f", "Thing.f", "Thing.f"),
-                kind: soac_blockpy::block_py::FunctionKind::Function,
+                kind: soac_core::block_py::FunctionKind::Function,
                 execution_mode: Default::default(),
                 params: ParamSpec {
                     params: vec![Param {
@@ -18899,7 +18903,7 @@ def f(x, y):
                 function_id: caller_function_id,
                 name_gen: caller_name_gen,
                 names: FunctionName::new("caller", "caller", "caller", "caller"),
-                kind: soac_blockpy::block_py::FunctionKind::Function,
+                kind: soac_core::block_py::FunctionKind::Function,
                 execution_mode: Default::default(),
                 params: ParamSpec {
                     params: vec![Param {
@@ -19192,7 +19196,7 @@ def f(x, y):
                 function_id: caller_function_id,
                 name_gen: caller_name_gen,
                 names: FunctionName::new("caller", "caller", "caller", "caller"),
-                kind: soac_blockpy::block_py::FunctionKind::Function,
+                kind: soac_core::block_py::FunctionKind::Function,
                 execution_mode: Default::default(),
                 params: ParamSpec {
                     params: vec![Param {
@@ -20475,7 +20479,7 @@ def f(x, y):
         let mut function = with_single_test_block(
             test_function(),
             vec![],
-            ret_term(op_expr(soac_blockpy::block_py::CellRef::new(
+            ret_term(op_expr(soac_core::block_py::CellRef::new(
                 CellLocation::Closure(2),
             ))),
         );
@@ -20498,7 +20502,7 @@ def f(x, y):
         let mut function = with_single_test_block(
             test_function(),
             vec![],
-            ret_term(op_expr(soac_blockpy::block_py::CellRef::new(
+            ret_term(op_expr(soac_core::block_py::CellRef::new(
                 CellLocation::CapturedSource(2),
             ))),
         );
@@ -20704,7 +20708,7 @@ def f(x, y):
             CodegenBlock {
                 label: entry_label,
                 body: vec![],
-                term: BlockTerm::IfTerm(soac_blockpy::block_py::TermIf {
+                term: BlockTerm::IfTerm(soac_core::block_py::TermIf {
                     test: none_expr(),
                     then_label: hot_label,
                     else_label: cold_label,
@@ -20758,7 +20762,7 @@ def f(x, y):
             CodegenBlock {
                 label: entry_label,
                 body: vec![],
-                term: BlockTerm::IfTerm(soac_blockpy::block_py::TermIf {
+                term: BlockTerm::IfTerm(soac_core::block_py::TermIf {
                     test: none_expr(),
                     then_label: hot_label,
                     else_label: cold_label,
@@ -20963,7 +20967,7 @@ def f(x, y):
                         "Record.__init__",
                         "Record.__init__",
                     ),
-                    kind: soac_blockpy::block_py::FunctionKind::Function,
+                    kind: soac_core::block_py::FunctionKind::Function,
                     execution_mode: Default::default(),
                     params: ParamSpec {
                         params: vec![
@@ -21006,7 +21010,7 @@ def f(x, y):
                         "make_record",
                         "make_record",
                     ),
-                    kind: soac_blockpy::block_py::FunctionKind::Function,
+                    kind: soac_core::block_py::FunctionKind::Function,
                     execution_mode: Default::default(),
                     params: ParamSpec::default(),
                     blocks: vec![CodegenBlock {

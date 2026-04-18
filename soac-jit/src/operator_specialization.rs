@@ -1,4 +1,4 @@
-use soac_blockpy::block_py::{BinOpKind, UnaryOpKind};
+use soac_core::block_py::{BinOpKind, UnaryOpKind};
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

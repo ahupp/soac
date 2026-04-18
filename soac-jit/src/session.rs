@@ -1,7 +1,7 @@
 use crate::jit::ProcessJitEngine;
 use crate::module_type::SharedModuleState;
-use soac_blockpy::block_py::{BlockPyFunction, ModuleNameGen, RuntimeFunctionId};
 use soac_blockpy::passes::CodegenModuleShape;
+use soac_core::block_py::{BlockPyFunction, ModuleNameGen, RuntimeFunctionId};
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -225,7 +225,7 @@ mod test {
         assert!(
             session
                 .shared_module_state_for_function_id(
-                    soac_blockpy::block_py::RuntimeFunctionId::from_raw_parts(7, 1)
+                    soac_core::block_py::RuntimeFunctionId::from_raw_parts(7, 1)
                 )
                 .unwrap()
                 .is_none()

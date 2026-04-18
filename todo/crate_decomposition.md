@@ -222,8 +222,10 @@ keeps web dependencies out of non-web rendering and offline analysis tools.
 3. Done, partial: add `soac-core` and move the first stable BlockPy model slice.
 4. Done, partial: keep `soac-blockpy` as a facade re-exporting `soac-core` so the first extraction
    does not require a whole-workspace import rewrite.
-5. Change `soac-jit`, `soac-pyo3`, `soac-inspector`, and offline tools to import shared IR from
-   `soac-ir` where possible.
+5. Done, partial: changed `soac-jit`, `soac-pyo3`, `soac-inspector`, and offline tools to import
+   shared stable IR from `soac-core` where possible. They still depend on `soac-blockpy` for
+   concrete codegen/resolved instruction enums, pass module shapes, BlockPy-specific literal
+   payloads, and lowering/cache APIs.
 6. Add `soac-lowering` and move passes, driver, transformer, and template code there.
 7. Done: move env parsing and logging setup into `soac-config`.
 8. Move counter/profile schemas and serialization into `soac-profile`.

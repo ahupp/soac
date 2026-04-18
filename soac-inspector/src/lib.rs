@@ -7,12 +7,12 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyModule};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use soac_blockpy::block_py::{BlockPyFunction, BlockPyModule, ModuleNameGen, RuntimeFunctionId};
 use soac_blockpy::passes::{
     CodegenModuleShape, infer_module_value_facts, plan_local_env_module,
     plan_local_env_resume_module, render_local_env_function_plan, render_local_env_module_plan,
     render_local_env_resume_function_plan, render_local_env_resume_module_plan,
 };
+use soac_core::block_py::{BlockPyFunction, BlockPyModule, ModuleNameGen, RuntimeFunctionId};
 use soac_jit::module_constants::ModuleCodegenConstants;
 use soac_jit::module_type::{
     build_shared_state_for_inspection_with_placeholder_constants_and_source_hash,

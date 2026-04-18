@@ -4,8 +4,8 @@
 //! function entries so the later direct-call migration uses the same model.
 
 use super::typed_value::ValueOwnership;
-use soac_blockpy::block_py::RuntimeFunctionId;
 use soac_blockpy::passes::PyExactType;
+use soac_core::block_py::RuntimeFunctionId;
 
 pub(super) const SOAC_RUNTIME_BUILTIN_ORD_I64_SYMBOL: &str = "soac_runtime_builtin_ord_i64";
 pub(super) const SOAC_RUNTIME_BUILTIN_CHR_I64_SYMBOL: &str = "soac_runtime_builtin_chr_i64";

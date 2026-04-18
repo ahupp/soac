@@ -1,7 +1,4 @@
-use soac_blockpy::block_py::{
-    BlockArg, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, CodegenBlock, LocalLocation,
-    RuntimeFunctionId,
-};
+use soac_blockpy::block_py::CodegenBlock;
 pub use soac_blockpy::passes::{
     BlockParamFacts, FunctionLocalPlan, LocalRefKind, ParamBindingFacts, ParamProvenance,
     PlannedLocalBinding, PlannedLocalStorage, plan_function_locals, render_planned_local_binding,
@@ -13,6 +10,10 @@ use soac_blockpy::passes::{
     compute_function_local_live_ins, compute_function_local_must_bound_ins, plan_local_env_module,
     plan_local_env_resume_module, plan_ownership_effects, validate_local_env_module_plan,
     validate_local_env_resume_module_plan, validate_ownership_effects,
+};
+use soac_core::block_py::{
+    BlockArg, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, LocalLocation,
+    RuntimeFunctionId,
 };
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
@@ -1634,19 +1635,19 @@ pub fn plan_jit_function_locals_from_plans(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soac_blockpy::block_py::BlockTerm;
     use soac_blockpy::lower_python_to_blockpy_for_testing;
     use soac_blockpy::passes::BlockLocalPlan;
     use soac_blockpy::passes::{
         LocalEnvResumeBindingState, LocalEnvResumeValueSource, RefcountActionKind,
         RefcountReleaseReason, infer_module_value_facts,
     };
+    use soac_core::block_py::BlockTerm;
 
     fn lowered_function(
         source: &str,
         qualname: &str,
     ) -> (
-        soac_blockpy::block_py::BlockPyModule<CodegenModuleShape>,
+        soac_core::block_py::BlockPyModule<CodegenModuleShape>,
         usize,
     ) {
         let lowered = lower_python_to_blockpy_for_testing(source)

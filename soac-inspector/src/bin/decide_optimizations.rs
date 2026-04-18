@@ -129,12 +129,12 @@ fn print_usage() {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soac_blockpy::block_py::{BlockLabel, InstrId, ModuleNameGen, RuntimeFunctionId};
     use soac_blockpy::codegen_cache::{
         CachedCodegenModuleMetadata, PythonModuleCacheSource, codegen_module_cache_path,
         module_optimization_plan_path,
     };
     use soac_blockpy::{LoweringOptions, lower_python_to_blockpy_recorded_with_options};
+    use soac_core::block_py::{BlockLabel, InstrId, ModuleNameGen, RuntimeFunctionId};
     use soac_jit::counter_dump::{
         CounterDumpRecord, CounterDumpRow, CounterDumpTypeKey, CounterDumpTypeKeyLayout,
         CounterDumpTypeTableEntry,

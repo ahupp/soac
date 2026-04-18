@@ -14,10 +14,10 @@ use cranelift_codegen::ir;
 use cranelift_codegen::ir::InstBuilder;
 use cranelift_frontend::FunctionBuilder;
 use pyo3::ffi;
-use soac_blockpy::block_py::{
-    CounterId, HasSemanticInstrId, Instr, InstrCodegen, NameLike, NameLocation, ResolvedName,
+use soac_blockpy::passes::{InstrCodegen, InstrTyped, PyExactType, PyObjFacts};
+use soac_core::block_py::{
+    CounterId, HasSemanticInstrId, Instr, NameLike, NameLocation, ResolvedName,
 };
-use soac_blockpy::passes::{InstrTyped, PyExactType, PyObjFacts};
 use std::mem::offset_of;
 
 const PY_LONG_SIGN_MASK: i64 = 3;
@@ -94,7 +94,7 @@ pub(super) trait OperationEmitState<'fb, E> {
     fn py_facts_for_arg(&self, arg: &E) -> PyObjFacts;
     fn prepare_guard_miss_dispatch_for_instr(
         &mut self,
-        _instr_id: soac_blockpy::block_py::InstrId,
+        _instr_id: soac_core::block_py::InstrId,
         _pre_guard_operands: &[&E],
         fallback_block: ir::Block,
     ) -> JitGuardMissDispatch {
@@ -574,7 +574,7 @@ fn emit_identity_compare_from_values<'fb, E>(
 
 fn emit_counted_getattr_fallback<'fb, E: Instr>(
     state: &mut impl OperationEmitState<'fb, E>,
-    instr_id: Option<soac_blockpy::block_py::InstrId>,
+    instr_id: Option<soac_core::block_py::InstrId>,
     arg_values: &[(ir::Value, bool)],
 ) -> ir::Value {
     if let Some(instr_id) = instr_id {
@@ -727,7 +727,7 @@ fn emit_specialized_getattr<'fb>(
 
 fn emit_setattr_fallback<'fb>(
     state: &mut impl OperationEmitState<'fb, InstrCodegen>,
-    instr_id: Option<soac_blockpy::block_py::InstrId>,
+    instr_id: Option<soac_core::block_py::InstrId>,
     arg_values: &[(ir::Value, bool)],
 ) -> ir::Value {
     if let Some(instr_id) = instr_id {
@@ -1177,7 +1177,7 @@ fn emit_compact_long_binary_op_or_deopt<'fb, E>(
     op_kind: blockpy_intrinsics::BinOpKind,
     kind: ExactIntBinaryOpKind,
     state: &mut impl OperationEmitState<'fb, E>,
-    instr_id: soac_blockpy::block_py::InstrId,
+    instr_id: soac_core::block_py::InstrId,
     pre_guard_operands: &[&E],
     arg_values: &[(ir::Value, bool)],
     fallback_counter_id: Option<CounterId>,
@@ -1262,7 +1262,7 @@ fn emit_compact_long_compare_i32_bool01_or_deopt<'fb, E>(
     op_kind: blockpy_intrinsics::BinOpKind,
     exact_int_kind: ExactIntBinaryOpKind,
     state: &mut impl OperationEmitState<'fb, E>,
-    instr_id: soac_blockpy::block_py::InstrId,
+    instr_id: soac_core::block_py::InstrId,
     pre_guard_operands: &[&E],
     arg_values: &[(ir::Value, bool)],
     hit_counter_id: Option<CounterId>,
@@ -2010,7 +2010,7 @@ fn emit_indexed_global_load_with_state<'fb>(
     globals_obj: ir::Value,
     name_obj: ir::Value,
     slot_index: ir::Value,
-    instr_id: soac_blockpy::block_py::InstrId,
+    instr_id: soac_core::block_py::InstrId,
 ) -> ir::Value {
     let ptr_ty = state.ctx().consts.ptr_ty;
     let null_ptr = state.fb().ins().iconst(ptr_ty, 0);

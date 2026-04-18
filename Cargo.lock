@@ -1782,6 +1782,7 @@ dependencies = [
  "serde_json",
  "soac-blockpy",
  "soac-config",
+ "soac-core",
  "soac-cpython",
  "soac-jit",
  "tokio",
@@ -1811,6 +1812,7 @@ dependencies = [
  "serde_json",
  "soac-blockpy",
  "soac-config",
+ "soac-core",
  "soac-cpython",
  "tracing",
 ]
@@ -1833,6 +1835,7 @@ dependencies = [
  "serde_json",
  "soac-blockpy",
  "soac-config",
+ "soac-core",
  "soac-cpython",
  "soac-jit",
  "tracing",

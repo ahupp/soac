@@ -1,7 +1,7 @@
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
-use soac_blockpy::block_py::FunctionKind;
 use soac_blockpy::passes::infer_module_value_facts;
+use soac_core::block_py::FunctionKind;
 use soac_jit::{
     module_type::{hash_module_source, indexed_module_info},
     plan_jit_module_locals,
@@ -37,7 +37,7 @@ fn parse_and_lower_runtime_style(source: &str) -> Result<soac_blockpy::LoweringR
 }
 
 fn validate_bb_module_for_jit(
-    bb_module: &soac_blockpy::block_py::BlockPyModule<soac_blockpy::passes::CodegenModuleShape>,
+    bb_module: &soac_core::block_py::BlockPyModule<soac_blockpy::passes::CodegenModuleShape>,
 ) -> Result<(), String> {
     for function in &bb_module.callable_defs {
         match function.lowered_kind() {
@@ -365,7 +365,7 @@ def exercise():
                         .iter()
                         .any(|param| param.arg_name.starts_with("_dp_try_exc_"))
                         || dispatch.slot_writes.iter().any(|(_, source)| {
-                            matches!(source, soac_blockpy::block_py::BlockArg::CurrentException)
+                            matches!(source, soac_core::block_py::BlockArg::CurrentException)
                         }))
             }),
         "expected a dispatch into an except handler target to pass the active exception: {:?}",
