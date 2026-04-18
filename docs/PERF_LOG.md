@@ -12,8 +12,8 @@ transform-only
 2026-03-05: Full JIT
 
 - Warmed in-process comparison:
-  - JIT: logs/benchmark_jit_warm.log -> 5238 loops/s
-  - Stock: logs/benchmark_stock_warm.log -> 824962 loops/s
+  - JIT: work/logs/benchmark_jit_warm.log -> 5238 loops/s
+  - Stock: work/logs/benchmark_stock_warm.log -> 824962 loops/s
 = 157x slower
 
 Vectorcall entry:
@@ -42,7 +42,7 @@ Use C API for operators:
 
 2026-03-25:  whole lot of cleanup, no perf work
 
-• Current cold comparison from logs/benchmark-pystone-compare-20260325.log:
+• Current cold comparison from work/logs/benchmark-pystone-compare-20260325.log:
 
   - jit transformed: 30,536 loops/s
   - stock cpython: 906,698 loops/s
@@ -66,13 +66,13 @@ changes:
       - stock CPython: 754,886 loops/s
       - transformed is 0.121x stock, so stock is about 8.27x faster
       - timing: real 10.75, user 14.99, sys 0.83
-      - log: logs/benchmark_opt_native_20260403.log
+      - log: work/logs/benchmark_opt_native_20260403.log
   - 404cbee4 Inline runtime CLIF support helpers into JIT callers
       - transformed/JIT: 119,398 loops/s
       - stock CPython: 739,834 loops/s
       - transformed is 0.161x stock, so stock is about 6.20x faster
       - timing: real 9.54, user 14.81, sys 0.76
-      - log: logs/benchmark_opt_native_inlining_20260403.log
+      - log: work/logs/benchmark_opt_native_inlining_20260403.log
   - lift runtime functions to constants, immortal constants
       - transformed/JIT: 175,380 loops/s
       - stock CPython: 759,045 loops/s

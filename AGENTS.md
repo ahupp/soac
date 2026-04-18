@@ -198,9 +198,9 @@ report both headline throughput and relative delta.
 
 When a performance change is complete enough that you intend to keep it,
 rebase the finished change onto `main`, run `$soac-profile-benchmark`, write the
-finalized benchmark result to `bench/{change_id}`, and
+finalized benchmark result to `work/bench/{change_id}`, and
 append an entry to `docs/CODEX_OPT_LOG.md` in the same logical change.
-Use `bench/{change_id}_{commit_id}` only for one-off test benchmarks while
+Use `work/bench/{change_id}_{commit_id}` only for one-off test benchmarks while
 iterating. Keep log entries succinct: include the jj change id, a short summary
 of the optimization, the benchmarked throughput delta, and the before/after
 headline numbers. Do not paste validation checklists, full command lines, or
@@ -220,7 +220,7 @@ For fast feedback on Rust changes that may affect crate test targets,
 run `cargo check -p soac-jit --tests` before the full gate; it
 type-checks the `soac-jit` crate including tests without running the
 entire transformed-runtime suite.
-Put test output in `logs/`. Summarize the failures, separate expected
+Put test output in `work/logs/`. Summarize the failures, separate expected
 failures from unexpected failures, investigate the root cause, report
 it, then fix it.
 
@@ -348,7 +348,7 @@ so a later turn can resume without rediscovering context.
   Hang diagnostic for test runs. Pass the PID printed by `just test-all` for
   `cargo-test`/`pytest`, or the PID of a stuck `just`, `pytest`, or
   `cargo test` process. The recipe walks the process tree and writes native
-  gdb stacks plus Python `py-bt` stacks, when available, to `logs/` by default.
+  gdb stacks plus Python `py-bt` stacks, when available, to `work/logs/` by default.
   It may need ptrace permission/CAP_SYS_PTRACE depending on host
   `/proc/sys/kernel/yama/ptrace_scope`.
 - `just py ...`
@@ -361,9 +361,11 @@ so a later turn can resume without rediscovering context.
 - `$soac-profile-benchmark`
   Default skill for performance benchmark requests. This uses the
   default pystone workflow: profile, verify, and specialized apply benchmark.
-  One-off test benchmarks write `bench/{change_id}_{commit_id}`. Finalized
+  Tracked benchmark sources live under `bench/`; generated benchmark result
+  artifacts live under ignored `work/bench/`.
+  One-off test benchmarks write `work/bench/{change_id}_{commit_id}`. Finalized
   benchmarks for changes that are being merged to `main` must run after rebasing
-  onto `main` and write `bench/{change_id}`. Use `just benchmark-deep-profile`
+  onto `main` and write `work/bench/{change_id}`. Use `just benchmark-deep-profile`
   when the user explicitly wants inspector/CLIF artifacts or perf capture, and
   use `just benchmark-deep-profile-from-profile <result-dir>` to extend an
   existing `counters/profile.bin` result without rerunning the profile pass.
@@ -406,8 +408,8 @@ so a later turn can resume without rediscovering context.
 - `SOAC_PARENT_REPO`
   Optional override for `just setup-dev-env` in a jj worktree. The setup recipe
   normally infers the parent checkout from a file-backed `.jj/repo`; the parent
-  owns shared offline state and `bench/` as a regular directory. The setup
-  recipe symlinks `vendor/cpython`, `bench/`, `.uv-cache`, `.uv/`, `.xdg/`,
+  owns shared offline state and `work/` as a regular artifact directory. The setup
+  recipe symlinks `vendor/cpython`, `work/`, `.uv-cache`, `.uv/`, `.xdg/`,
   `soac-module-cache`, and `tmp/cargo-home` from that parent into the worktree,
   and errors instead of creating isolated empty offline caches when neither
   inference nor the override can identify the parent.
@@ -473,7 +475,7 @@ so a later turn can resume without rediscovering context.
   `just pytest ...` and `just test-all` do not write the verbose JSON module
   load/JIT-codegen trace by default. Set `SOAC_PYTEST_TRACE=1` to enable it
   when `SOAC_LOG` is unset. `SOAC_PYTEST_EVENTS_LOG` overrides the output path,
-  which defaults to `logs/pytest_events.jsonl`.
+  which defaults to `work/logs/pytest_events.jsonl`.
 - `SOAC_PYTEST_BATCH_TIMEOUT` / `SOAC_PYTEST_PROGRESS_INTERVAL`
   The parallel pytest runner used by `just pytest ...`, `just pytest-fast ...`,
   and `just test-all` reports currently running batches every

@@ -2,6 +2,11 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 set positional-arguments
 
 repo_root := justfile_directory()
+work_dir := repo_root + "/work"
+logs_dir := work_dir + "/logs"
+benchmark_results_dir := work_dir + "/bench"
+benchmark_source_dir := repo_root + "/bench"
+pystone_source := benchmark_source_dir + "/pystone.py"
 cpython_bin := repo_root + "/vendor/cpython/python"
 cpython_lib_dir := repo_root + "/vendor/cpython"
 venv_dir := repo_root + "/.venv"
@@ -20,10 +25,15 @@ inspector_bin := repo_root + "/target/debug/soac-inspector"
 port := env_var_or_default("PORT", "8000")
 host := env_var_or_default("HOST", "127.0.0.1")
 url := "http://" + host + ":" + port
-last_benchmark_counters_dir := repo_root + "/logs/last_benchmark_counters"
+last_benchmark_counters_dir := logs_dir + "/last_benchmark_counters"
 last_benchmark_counters := last_benchmark_counters_dir + "/profile.bin"
 
 export REPO_ROOT := repo_root
+export WORK_DIR := work_dir
+export LOGS_DIR := logs_dir
+export BENCHMARK_RESULTS_DIR := benchmark_results_dir
+export BENCHMARK_SOURCE_DIR := benchmark_source_dir
+export PYSTONE_SOURCE := pystone_source
 export CPYTHON_BIN := cpython_bin
 export CPYTHON_LIB_DIR := cpython_lib_dir
 export VENV_DIR := venv_dir
@@ -207,7 +217,7 @@ setup-dev-env:
       jj_repo_path="$(head -n 1 "$REPO_ROOT/.jj/repo")"
       if [[ -z "$jj_repo_path" ]]; then
         echo "setup-dev-env: cannot infer parent checkout from empty $REPO_ROOT/.jj/repo" >&2
-        echo "set SOAC_PARENT_REPO to the parent checkout that owns vendor/cpython, bench, and shared offline caches" >&2
+        echo "set SOAC_PARENT_REPO to the parent checkout that owns vendor/cpython, work, and shared offline caches" >&2
         exit 1
       fi
 
@@ -222,7 +232,7 @@ setup-dev-env:
         *)
           echo "setup-dev-env: cannot infer parent checkout from $REPO_ROOT/.jj/repo" >&2
           echo ".jj/repo points to $jj_repo_real, not a checkout-local .jj/repo directory" >&2
-          echo "set SOAC_PARENT_REPO to the parent checkout that owns vendor/cpython, bench, and shared offline caches" >&2
+          echo "set SOAC_PARENT_REPO to the parent checkout that owns vendor/cpython, work, and shared offline caches" >&2
           exit 1
           ;;
       esac
@@ -246,7 +256,7 @@ setup-dev-env:
     fi
 
     mkdir -p \
-      "$parent_repo/bench" \
+      "$parent_repo/work" \
       "$parent_repo/.uv-cache" \
       "$parent_repo/.uv/tools" \
       "$parent_repo/.uv/bin" \
@@ -256,18 +266,18 @@ setup-dev-env:
       "$parent_repo/tmp/cargo-home"
 
     link_shared_dir "$REPO_ROOT/vendor/cpython" "$parent_repo/vendor/cpython" "vendor/cpython"
-    link_shared_dir "$REPO_ROOT/bench" "$parent_repo/bench" "bench" 1
+    link_shared_dir "$REPO_ROOT/work" "$parent_repo/work" "work" 1
     link_shared_dir "$REPO_ROOT/.uv-cache" "$parent_repo/.uv-cache" ".uv-cache" 1
     link_shared_dir "$REPO_ROOT/.uv" "$parent_repo/.uv" ".uv" 1
     link_shared_dir "$REPO_ROOT/.xdg" "$parent_repo/.xdg" ".xdg" 1
     link_shared_dir "$REPO_ROOT/soac-module-cache" "$parent_repo/soac-module-cache" "soac-module-cache" 1
     link_shared_dir "$REPO_ROOT/tmp/cargo-home" "$parent_repo/tmp/cargo-home" "tmp/cargo-home" 1
   else
-    if [[ -L "$REPO_ROOT/bench" ]]; then
-      echo "bench is a symlink in the parent checkout; replace it with a regular directory before running setup-dev-env" >&2
+    if [[ -L "$REPO_ROOT/work" ]]; then
+      echo "work is a symlink in the parent checkout; replace it with a regular directory before running setup-dev-env" >&2
       exit 1
     fi
-    mkdir -p "$REPO_ROOT/bench"
+    mkdir -p "$REPO_ROOT/work"
   fi
 
   mkdir -p \
@@ -381,7 +391,7 @@ build-test-runtime-fast: ensure-cpython ensure-shared-python
       -path "$REPO_ROOT/target" -prune -o \
       -path "$REPO_ROOT/vendor" -prune -o \
       -path "$REPO_ROOT/bench" -prune -o \
-      -path "$REPO_ROOT/logs" -prune -o \
+      -path "$REPO_ROOT/work" -prune -o \
       \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' -o -name 'build.rs' \) \
       -newer "$SOURCE_EXT" -print -quit | grep -q .; then
     needs_build=1
@@ -468,7 +478,7 @@ build-web-inspector-server: ensure-cpython ensure-shared-python
 
 build-web-inspector: build-web-inspector-server
 
-history-metrics-report history_jsonl="logs/warloc_history.jsonl" daily_jsonl="logs/warloc_history_daily.jsonl" html_output="web/history_metrics.html" revset="..@": ensure-cpython
+history-metrics-report history_jsonl="work/logs/warloc_history.jsonl" daily_jsonl="work/logs/warloc_history_daily.jsonl" html_output="web/history_metrics.html" revset="..@": ensure-cpython
   #!/usr/bin/env bash
   export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
   cd "$REPO_ROOT"
@@ -489,16 +499,16 @@ view-speedscope profile="": build-web-inspector
 
   if [[ -z "$PROFILE" ]]; then
     PROFILE="$(
-      find "$REPO_ROOT/logs" -maxdepth 1 -type f -name '*speedscope.json' -printf '%T@ %P\n' \
+      find "$LOGS_DIR" -maxdepth 1 -type f -name '*speedscope.json' -printf '%T@ %P\n' \
         | sort -nr \
         | head -n 1 \
         | cut -d' ' -f2-
     )"
     if [[ -z "$PROFILE" ]]; then
-      echo "no speedscope profile found under $REPO_ROOT/logs" >&2
+      echo "no speedscope profile found under $LOGS_DIR" >&2
       exit 1
     fi
-    PROFILE="logs/$PROFILE"
+    PROFILE="$LOGS_DIR/$PROFILE"
   fi
 
   PROFILE_URL="$("$CPYTHON_BIN" -c 'import pathlib, sys, urllib.parse; base_url = sys.argv[1]; profile_arg = sys.argv[2]; repo_root = pathlib.Path.cwd().resolve(); profile_path = pathlib.Path(profile_arg); rel_path = profile_path.resolve().relative_to(repo_root) if profile_path.is_absolute() else pathlib.Path(profile_arg); print(f"{base_url}/api/speedscope_profile?path={urllib.parse.quote(str(rel_path))}")' "$URL" "$PROFILE")"
@@ -507,7 +517,7 @@ view-speedscope profile="": build-web-inspector
 
   "$REPO_ROOT/scripts/open_web_url.sh" "$OPEN_URL"
 
-run-and-view-speedscope loops="10000000" counters_dir="" output_prefix="logs/pystone_jit_perf_warm_specialized_from_benchmark": ensure-cpython
+run-and-view-speedscope loops="10000000" counters_dir="" output_prefix="work/logs/pystone_jit_perf_warm_specialized_from_benchmark": ensure-cpython
   #!/usr/bin/env bash
   set -euo pipefail
   export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -534,14 +544,14 @@ run-and-view-speedscope loops="10000000" counters_dir="" output_prefix="logs/pys
 
   just view-speedscope "{{output_prefix}}_speedscope.json"
 
-perf-pystone-jit-warm loops="10000000" output_prefix="logs/pystone_jit_perf_warm": ensure-cpython
+perf-pystone-jit-warm loops="10000000" output_prefix="work/logs/pystone_jit_perf_warm": ensure-cpython
   #!/usr/bin/env bash
   export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-  mkdir -p logs
   mkdir -p "$REPO_ROOT/tmp"
 
   LOOPS="{{loops}}"
   OUTPUT_PREFIX="{{output_prefix}}"
+  mkdir -p "$(dirname "$OUTPUT_PREFIX")"
   WARMUP_LOOPS="${WARMUP_LOOPS:-1000}"
   PERF_FREQUENCY="${PERF_FREQUENCY:-999}"
   PERF_CALL_GRAPH="${PERF_CALL_GRAPH:-dwarf,65528}"
@@ -562,7 +572,7 @@ perf-pystone-jit-warm loops="10000000" output_prefix="logs/pystone_jit_perf_warm
   PYO3_RELEASE_LIB="$REPO_ROOT/target/release/lib_soac_ext.so"
   PYO3_STAGING_DIR="$(mktemp -d)"
   READY_FILE="$(mktemp "$REPO_ROOT/tmp/pystone_jit_perf_ready.XXXXXX")"
-  PYTHONPATH_PREFIX="${REPO_ROOT}:${REPO_ROOT}/soac_py/src:${REPO_ROOT}/scripts:${PYO3_STAGING_DIR}"
+  PYTHONPATH_PREFIX="${REPO_ROOT}:${REPO_ROOT}/soac_py/src:${BENCHMARK_SOURCE_DIR}:${PYO3_STAGING_DIR}"
   PY_PID=""
   PERF_PID=""
 
@@ -743,7 +753,7 @@ perf-pystone-jit-warm loops="10000000" output_prefix="logs/pystone_jit_perf_warm
   echo "finished"
   echo "view speedscope: just view-speedscope ${VIEW_SPEEDSCOPE_PROFILE@Q}"
 
-perf-pystone-jit-specialized loops="10000000" output_prefix="logs/pystone_jit_perf_warm_specialized": ensure-cpython (update-venv-offline) (build-extension "release")
+perf-pystone-jit-specialized loops="10000000" output_prefix="work/logs/pystone_jit_perf_warm_specialized": ensure-cpython (update-venv-offline) (build-extension "release")
   #!/usr/bin/env bash
   set -euo pipefail
   export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -761,7 +771,7 @@ perf-pystone-jit-specialized loops="10000000" output_prefix="logs/pystone_jit_pe
   WARMUP_LOOPS="${WARMUP_LOOPS}" \
   SOAC_WORK_DIR="$counters_dir" \
   SOAC_OPT_MODE=profile \
-    "$REPO_ROOT/.venv/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)' >/tmp/soac_perf_specialization_profile.out 2>&1
+    "$REPO_ROOT/.venv/bin/python" -c 'import os, sys; sys.path.insert(0, os.environ["BENCHMARK_SOURCE_DIR"]); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)' >/tmp/soac_perf_specialization_profile.out 2>&1
 
   SOAC_MODULE_CACHE_DIR="${SOAC_MODULE_CACHE_DIR:-}" just _decide-optimizations-for-counters-dir "$counters_dir"
 
@@ -787,7 +797,7 @@ _pytest-run *args='': ensure-venv
 
   export SOAC_CRANELIFT_OPT_LEVEL="${SOAC_CRANELIFT_OPT_LEVEL:-none}"
   export SOAC_BACKGROUND_JIT="${SOAC_BACKGROUND_JIT:-0}"
-  SOAC_PYTEST_EVENTS_LOG="${SOAC_PYTEST_EVENTS_LOG:-$REPO_ROOT/logs/pytest_events.jsonl}"
+  SOAC_PYTEST_EVENTS_LOG="${SOAC_PYTEST_EVENTS_LOG:-$REPO_ROOT/work/logs/pytest_events.jsonl}"
   if [[ -z "${SOAC_LOG:-}" && "${SOAC_PYTEST_TRACE:-0}" =~ ^(1|true|yes|on)$ ]]; then
     rm -f "$SOAC_PYTEST_EVENTS_LOG"
     export SOAC_LOG="soac_jit=info,soac_module_load=info,soac_jit_codegen=info;json=$SOAC_PYTEST_EVENTS_LOG"
@@ -858,8 +868,8 @@ capture-test-stacks root_pid out="":
 
   OUT="{{out}}"
   if [[ -z "$OUT" ]]; then
-    mkdir -p "$REPO_ROOT/logs"
-    OUT="$REPO_ROOT/logs/test-stacks-$(date -u +%Y%m%dT%H%M%SZ)-pid${ROOT_PID}.log"
+    mkdir -p "$LOGS_DIR"
+    OUT="$REPO_ROOT/work/logs/test-stacks-$(date -u +%Y%m%dT%H%M%SZ)-pid${ROOT_PID}.log"
   fi
   mkdir -p "$(dirname "$OUT")"
 
@@ -1163,7 +1173,7 @@ benchmark-verify loops="100000" counters_dir="": (update-venv-offline) (build-ex
   BENCHMARK_CONSTANT_CLOCKS="${BENCHMARK_CONSTANT_CLOCKS}" \
   SOAC_WORK_DIR="$COUNTERS_DIR" \
   SOAC_OPT_MODE=verify \
-    "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
+    "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, os.environ["BENCHMARK_SOURCE_DIR"]); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
   echo "verification counters: $COUNTERS_DIR/verify.bin"
   echo "SOAC events log: $COUNTERS_DIR/events.jsonl"
 
@@ -1183,7 +1193,7 @@ benchmark-warm loops="8000000": (update-venv-offline) (build-extension "release"
   cd "$REPO_ROOT"
 
   echo "jit transformed warm"
-  SOAC_WARM_EVENTS_LOG="$REPO_ROOT/logs/benchmark_warm_events.jsonl"
+  SOAC_WARM_EVENTS_LOG="$REPO_ROOT/work/logs/benchmark_warm_events.jsonl"
   if [[ -z "${SOAC_LOG:-}" ]]; then
     rm -f "$SOAC_WARM_EVENTS_LOG"
     export SOAC_LOG="soac_jit=info,soac_module_load=info,soac_jit_codegen=info;json=$SOAC_WARM_EVENTS_LOG"
@@ -1192,16 +1202,16 @@ benchmark-warm loops="8000000": (update-venv-offline) (build-extension "release"
   WARMUP_LOOPS="${WARMUP_LOOPS}" \
   BENCHMARK_CPU="${BENCHMARK_CPU}" \
   BENCHMARK_CONSTANT_CLOCKS="${BENCHMARK_CONSTANT_CLOCKS}" \
-    "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
+    "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, os.environ["BENCHMARK_SOURCE_DIR"]); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
 
   echo "stock cpython"
   LOOPS="{{loops}}" \
   WARMUP_LOOPS="${WARMUP_LOOPS}" \
   BENCHMARK_CPU="${BENCHMARK_CPU}" \
   BENCHMARK_CONSTANT_CLOCKS="${BENCHMARK_CONSTANT_CLOCKS}" \
-    "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
+    "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, os.environ["BENCHMARK_SOURCE_DIR"]); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
 
-benchmark benchmark_loops="1000000" verify_loops="100000" results_root="bench" result_mode="one-off": (update-venv-offline) (build-extension "release")
+benchmark benchmark_loops="1000000" verify_loops="100000" results_root="work/bench" result_mode="one-off": (update-venv-offline) (build-extension "release")
   #!/usr/bin/env bash
   set -euo pipefail
   export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -1278,7 +1288,7 @@ benchmark benchmark_loops="1000000" verify_loops="100000" results_root="bench" r
     SOAC_WORK_DIR="$counters_dir" \
     SOAC_CRANELIFT_OPT_LEVEL="$CRANELIFT_OPT_LEVEL" \
     SOAC_OPT_MODE=profile \
-      "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
+      "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, os.environ["BENCHMARK_SOURCE_DIR"]); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
 
     echo
     SOAC_MODULE_CACHE_DIR="$SOAC_MODULE_CACHE_DIR" just _decide-optimizations-for-counters-dir "$counters_dir"
@@ -1292,7 +1302,7 @@ benchmark benchmark_loops="1000000" verify_loops="100000" results_root="bench" r
     SOAC_WORK_DIR="$counters_dir" \
     SOAC_CRANELIFT_OPT_LEVEL="$CRANELIFT_OPT_LEVEL" \
     SOAC_OPT_MODE=verify \
-      "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
+      "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, os.environ["BENCHMARK_SOURCE_DIR"]); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
 
     site_count="$(just _call-target-specializations-from-dump "$counters_dir/profile.bin" | awk -F';' 'NF { print NF }')"
     run_apply_pass() {
@@ -1310,7 +1320,7 @@ benchmark benchmark_loops="1000000" verify_loops="100000" results_root="bench" r
           SOAC_CRANELIFT_OPT_LEVEL="$CRANELIFT_OPT_LEVEL" \
           SOAC_OPT_MODE=apply \
           SOAC_JIT_EMIT_REFCOUNTS="$refcount_env" \
-            "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, "scripts"); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
+            "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, os.environ["BENCHMARK_SOURCE_DIR"]); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
         then
           :
         else
@@ -1340,7 +1350,7 @@ benchmark benchmark_loops="1000000" verify_loops="100000" results_root="bench" r
 
   echo "benchmark result: $result_dir"
 
-precompile-shared-library counters="" out="logs/libsoac_precompiled.so" object_dir="":
+precompile-shared-library counters="" out="work/logs/libsoac_precompiled.so" object_dir="":
   #!/usr/bin/env bash
   set -euo pipefail
   cd "$REPO_ROOT"
@@ -1419,7 +1429,7 @@ _benchmark-export-specialized-artifacts result_dir:
   cargo run -p soac-inspector --bin inspect_counters -- \
     --specializations "$COUNTERS_DIR/verify.bin" > "$RESULT_DIR/verify_specializations.txt"
 
-  cargo run -q -p soac-inspector --bin list_jit_functions -- scripts/pystone.py \
+  cargo run -q -p soac-inspector --bin list_jit_functions -- "$PYSTONE_SOURCE" \
     > "$CLIF_DIR/functions.tsv"
   while IFS=$'\t' read -r function_id qualname; do
     safe_qualname="$(printf '%s' "$qualname" | tr -cs '[:alnum:]_.' '_')"
@@ -1430,7 +1440,7 @@ _benchmark-export-specialized-artifacts result_dir:
         --specialized --module-name pystone \
         --cfg-dot-out "$output_base.cfg.dot" \
         --vcode-out "$output_base.vcode" \
-        scripts/pystone.py "$function_id" \
+        "$PYSTONE_SOURCE" "$function_id" \
         > "$output_base.clif"
   done < "$CLIF_DIR/functions.tsv"
 
@@ -1535,7 +1545,7 @@ benchmark-deep-profile-from-profile result_dir verify_loops="100000" perf_loops=
     echo "deep profile result: $RESULT_DIR"
   } 2>&1 | tee "$REPORT"
 
-benchmark-deep-profile benchmark_loops="1000000" verify_loops="100000" perf_loops="10000000" results_root="bench" result_mode="one-off": (update-venv-offline) (build-extension "release")
+benchmark-deep-profile benchmark_loops="1000000" verify_loops="100000" perf_loops="10000000" results_root="work/bench" result_mode="one-off": (update-venv-offline) (build-extension "release")
   #!/usr/bin/env bash
   set -euo pipefail
   cd "$REPO_ROOT"

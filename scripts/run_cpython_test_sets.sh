@@ -4,7 +4,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SET_GLOB="${CPYTHON_TEST_SETS_GLOB:-$REPO_ROOT/test_sets/*.txt}"
 TEMPDIR_PATH="${CPYTHON_TEST_TEMPDIR:-/tmp/diet-python-cpython-tests}"
-LOG_DIR="${CPYTHON_TEST_LOG_DIR:-$REPO_ROOT/logs}"
+LOG_DIR="${CPYTHON_TEST_LOG_DIR:-$REPO_ROOT/work/logs}"
 TEST_TIMEOUT_SECONDS=60
 
 usage() {

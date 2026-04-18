@@ -12,8 +12,8 @@ produced them.
 ## Workflow
 
 Run steps from the repo root. One-off benchmark, counter, perf, and rendered
-CLIF artifacts are created under `bench/{change_id}_{commit_id}/`; finalized
-benchmarks for changes being merged to `main` use `bench/{change_id}/`. The
+CLIF artifacts are created under `work/bench/{change_id}_{commit_id}/`; finalized
+benchmarks for changes being merged to `main` use `work/bench/{change_id}/`. The
 benchmark recipe always records the current `@` revision, so switch the
 workspace to the revision you want before running it.
 

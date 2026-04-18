@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_LOG = Path("logs/last_benchmark_counters/module_loads.jsonl")
+DEFAULT_LOG = Path("work/logs/last_benchmark_counters/module_loads.jsonl")
 MODULE_LOAD_EVENT = "soac.module_load"
 MODULE_LOAD_PHASE_EVENT = "soac.module_load.phase"
 JIT_CODEGEN_EVENT = "soac.jit_codegen"

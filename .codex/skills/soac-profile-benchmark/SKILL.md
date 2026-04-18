@@ -6,7 +6,7 @@ description: Run SOAC's pystone benchmark and summarize its result directory. Us
 # SOAC Profile Benchmark
 
 Use the repo `Justfile` benchmark recipes from the repo root. They write one
-result directory under the ignored shared `bench/` tree.
+result directory under the ignored shared `work/bench/` tree.
 
 ## Run
 
@@ -16,7 +16,7 @@ For one-off test benchmarks while iterating, run:
 just benchmark
 ```
 
-This writes `bench/{change_id}_{commit_id}` so rebased or amended jj changes do
+This writes `work/bench/{change_id}_{commit_id}` so rebased or amended jj changes do
 not accidentally reuse stale results. The recipe records and prints the actual
 current `@` revision that it executed.
 
@@ -26,10 +26,10 @@ then run the benchmark in finalized mode:
 
 ```bash
 jj edit <jj-rev>
-just benchmark 1000000 100000 bench finalized
+just benchmark 1000000 100000 work/bench finalized
 ```
 
-This writes `bench/{change_id}`. If you intentionally want a fresh child
+This writes `work/bench/{change_id}`. If you intentionally want a fresh child
 revision instead of the existing change id, you may switch with `jj new <jj-rev>`
 before running `just benchmark`, but the artifact name will then reflect that
 new child revision because the recipe always uses the current `@`.
@@ -114,4 +114,4 @@ benchmark.
 ## Notes
 
 - Build output may appear before the benchmark numbers when the release extension is stale.
-- Benchmark result directories are intentionally untracked under `bench/`.
+- Benchmark result directories are intentionally untracked under `work/bench/`.

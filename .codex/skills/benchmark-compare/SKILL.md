@@ -1,6 +1,6 @@
 ---
 name: benchmark-compare
-description: Compare two SOAC pystone benchmark directories. Use when Codex needs to create missing one-off bench/{change_id}_{commit_id} results for jj revisions, compare specialized benchmark throughput, verify specialization counters, and inspect rendered CLIF for changed fast paths.
+description: Compare two SOAC pystone benchmark directories. Use when Codex needs to create missing one-off work/bench/{change_id}_{commit_id} results for jj revisions, compare specialized benchmark throughput, verify specialization counters, and inspect rendered CLIF for changed fast paths.
 ---
 
 # Benchmark Compare
@@ -10,15 +10,15 @@ revision, then compare two such directories.
 
 ## Result Layout
 
-Results live under the ignored repo-root `bench/` directory. Each result
+Results live under the ignored repo-root `work/bench/` directory. Each result
 directory used for comparison is named:
 
 ```text
-bench/{change_id}_{commit_id}/
+work/bench/{change_id}_{commit_id}/
 ```
 
 This commit-qualified layout is for one-off comparison runs. Finalized
-benchmarks for changes being merged to `main` use `bench/{change_id}` instead.
+benchmarks for changes being merged to `main` use `work/bench/{change_id}` instead.
 
 Important files:
 
@@ -57,12 +57,12 @@ The recipe does not run the stock CPython benchmark.
 
 When asked to compare jj revs, first resolve each requested rev to its short
 change id and short commit id. Reuse only an exact
-`bench/{change_id}_{commit_id}` directory for that resolved revision:
+`work/bench/{change_id}_{commit_id}` directory for that resolved revision:
 
 ```bash
 change_id="$(jj --ignore-working-copy log -r "<jj-rev>" --no-graph -T 'change_id.short()')"
 commit_id="$(jj --ignore-working-copy log -r "<jj-rev>" --no-graph -T 'commit_id.short()')"
-result_dir="bench/${change_id}_${commit_id}"
+result_dir="work/bench/${change_id}_${commit_id}"
 test -d "$result_dir" && printf '%s\n' "$result_dir"
 ```
 
@@ -83,9 +83,9 @@ re-run `just benchmark` for that side only if the missing detail is needed.
 
 ## Create A Missing Result For Another Rev
 
-If no complete exact `bench/{change_id}_{commit_id}` result exists for a
+If no complete exact `work/bench/{change_id}_{commit_id}` result exists for a
 requested jj rev, create a temporary side workspace and run the result producer
-there. Always write results back into the original repo's `bench/` directory:
+there. Always write results back into the original repo's `work/bench/` directory:
 
 ```bash
 original_repo="$PWD"
@@ -103,7 +103,7 @@ fi
 (
   cd "$ws"
   jj edit "$rev"
-  just benchmark 1000000 100000 "$original_repo/bench"
+  just benchmark 1000000 100000 "$original_repo/work/bench"
 )
 
 jj workspace forget "$workspace_name"

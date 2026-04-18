@@ -45,7 +45,7 @@ For each optimization attempt:
 
 3. Collect perf for the specialized/apply pass, not the profiling pass.
    Keep benchmark, verify, perf, counter-summary, and rendered-CLIF
-   artifacts in logs/.
+   artifacts in work/logs/.
 
 4. Render specialized CLIF for the hot JIT functions. Before coding,
    connect the proposed optimization all the way through: perf hotspot,

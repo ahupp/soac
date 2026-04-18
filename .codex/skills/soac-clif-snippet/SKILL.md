@@ -54,7 +54,7 @@ workload, counters, or requested function changed.
 
 ## Useful Artifacts
 
-The script writes one directory under `logs/soac-clif-snippets/`:
+The script writes one directory under `work/logs/soac-clif-snippets/`:
 
 - `source.py`
 - `workload.txt`

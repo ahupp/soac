@@ -115,7 +115,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--artifact-dir",
         type=Path,
-        help="Directory for generated artifacts. Defaults to logs/soac-clif-snippets/<name>-<id>.",
+        help="Directory for generated artifacts. Defaults to work/logs/soac-clif-snippets/<name>-<id>.",
     )
     return parser.parse_args()
 
@@ -136,6 +136,7 @@ def choose_artifact_dir(args: argparse.Namespace, target_name: str) -> Path:
     unique = uuid.uuid4().hex[:12]
     return (
         Path(import_hook.REPO_ROOT)
+        / "work"
         / "logs"
         / "soac-clif-snippets"
         / f"{sanitize_name(target_name)}-{unique}"

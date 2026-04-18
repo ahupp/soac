@@ -14,15 +14,15 @@ description: Run the CPython regression test suite and generate structured summa
 ./scripts/run_cpython_test_sets.sh --tempdir /tmp/soac-cpython-fast-tests
 ```
 
-This writes a summary to `logs/cpython_jit_test_sets_summary.log` and one
-`logs/cpython_jit_cpython_fast_tests_part_*.log` file per partition.
+This writes a summary to `work/logs/cpython_jit_test_sets_summary.log` and one
+`work/logs/cpython_jit_cpython_fast_tests_part_*.log` file per partition.
 
 ## Run one CPython test file
 
 ```bash
-mkdir -p logs
+mkdir -p work/logs
 set -o pipefail
-just run-cpython-tests 0 -x slow --tempdir /tmp/soac-cpython-single -f /abs/path/to/test_file.py 2>&1 | tee logs/cpython_single_test_file.log
+just run-cpython-tests 0 -x slow --tempdir /tmp/soac-cpython-single -f /abs/path/to/test_file.py 2>&1 | tee work/logs/cpython_single_test_file.log
 ```
 
 `just run-cpython-tests` builds the extension, installs the local package in the
@@ -32,9 +32,9 @@ test.__main__`. Pass an absolute `-f` file path.
 ## Run arbitrary regrtest arguments
 
 ```bash
-mkdir -p logs
+mkdir -p work/logs
 set -o pipefail
-just run-cpython-tests 0 --tempdir /tmp/soac-cpython-tests -x slow 2>&1 | tee logs/cpython_full_test_run.log
+just run-cpython-tests 0 --tempdir /tmp/soac-cpython-tests -x slow 2>&1 | tee work/logs/cpython_full_test_run.log
 ```
 
 Override SOAC environment variables only when explicitly comparing modes.
@@ -44,7 +44,7 @@ Override SOAC environment variables only when explicitly comparing modes.
 - Locate failure anchors:
 
 ```bash
-rg -n "^(FAIL|ERROR|TIMEOUT|CRASHED|INTERRUPTED|LEAKED|ENV_CHANGED):" logs/cpython_full_test_run.log
+rg -n "^(FAIL|ERROR|TIMEOUT|CRASHED|INTERRUPTED|LEAKED|ENV_CHANGED):" work/logs/cpython_full_test_run.log
 ```
 
 - Extract each failure block (look for the separator lines of ===) and classify the failure based on the contents of the error.

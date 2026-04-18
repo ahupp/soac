@@ -18,8 +18,8 @@ through the sandbox.
 For jj worktrees, `just setup-dev-env` infers the parent checkout from a
 file-backed `.jj/repo` when possible. Set
 `SOAC_PARENT_REPO=/path/to/parent/checkout` to override that inference or when
-the parent cannot be inferred. The parent checkout owns `bench/` as a regular
-directory, and the setup recipe symlinks `vendor/cpython`, `bench/`,
+the parent cannot be inferred. The parent checkout owns `work/` as a regular
+artifact directory, and the setup recipe symlinks `vendor/cpython`, `work/`,
 `.uv-cache`, `.uv/`, `.xdg/`, `soac-module-cache`, and `tmp/cargo-home` from
 the parent checkout so temporary worktrees can reuse the already-fetched
 offline state, BlockPy module cache, and shared benchmark artifacts.
@@ -108,7 +108,7 @@ exports are intentionally omitted here.
 - `SOAC_PARENT_REPO=/path/to/parent/checkout`
   Optional override for `just setup-dev-env` inside a jj worktree. The recipe
   normally infers the parent checkout from a file-backed `.jj/repo`; the parent
-  checkout owns `bench/` as a regular directory, `vendor/cpython`, and the
+  checkout owns `work/` as a regular artifact directory, `vendor/cpython`, and the
   shared offline state symlinked into the worktree: `.uv-cache`, `.uv/`,
   `.xdg/`, `soac-module-cache`, and `tmp/cargo-home`.
 
@@ -186,7 +186,7 @@ typed variables must use recognized values. Boolean knobs accept `1`, `true`,
   Enables the verbose pytest module-load and JIT-codegen JSON trace for
   `just pytest ...` and `just test-all` when `SOAC_LOG` is unset. The trace is
   disabled by default for green correctness runs. It writes to
-  `SOAC_PYTEST_EVENTS_LOG` when set, otherwise `logs/pytest_events.jsonl`.
+  `SOAC_PYTEST_EVENTS_LOG` when set, otherwise `work/logs/pytest_events.jsonl`.
 
 - `SOAC_PYTEST_EVENTS_LOG=/path/to/events.jsonl`
   Overrides the pytest trace output path used when `SOAC_PYTEST_TRACE=1`.
@@ -327,10 +327,14 @@ globals are out of scope for now.
 
 ## Perf And Benchmarking
 
+Benchmark sources live under the tracked `bench/` directory. Generated
+benchmark results and other local artifacts live under the ignored `work/`
+tree, with pystone benchmark runs writing to `work/bench/`.
+
 - `just benchmark`
   The default benchmark recipe runs the transformed profile, verify,
   and specialized apply passes and writes the raw result directory under
-  `bench/{change_id}_{commit_id}` for one-off runs or `bench/{change_id}`
+  `work/bench/{change_id}_{commit_id}` for one-off runs or `work/bench/{change_id}`
   for finalized runs. It always records and prints the actual current `@`
   revision that it executed, so switch revisions first with `jj edit <rev>` if
   you want to benchmark some revision other than the current checkout. By
