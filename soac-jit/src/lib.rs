@@ -33,8 +33,8 @@ pub(crate) fn python_runtime_test_lock() -> &'static Mutex<()> {
 
 use pyo3::ffi;
 use pyo3::prelude::*;
-use soac_blockpy::passes::CodegenModuleShape;
 use soac_core::block_py::{FunctionExecutionMode, FunctionKind, ParamKind, RuntimeFunctionId};
+use soac_lowering::passes::CodegenModuleShape;
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
 use std::any::Any;
 use std::ffi::{CString, c_char, c_void};

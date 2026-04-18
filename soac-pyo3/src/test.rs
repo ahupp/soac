@@ -1,11 +1,11 @@
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
-use soac_blockpy::passes::infer_module_value_facts;
 use soac_core::block_py::FunctionKind;
 use soac_jit::{
     module_type::{hash_module_source, indexed_module_info},
     plan_jit_module_locals,
 };
+use soac_lowering::passes::infer_module_value_facts;
 use std::any::Any;
 use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
@@ -20,16 +20,16 @@ fn panic_payload_to_string(payload: Box<dyn Any + Send>) -> String {
     }
 }
 
-fn parse_and_lower(source: &str) -> Result<soac_blockpy::LoweringResult, String> {
-    match std::panic::catch_unwind(|| soac_blockpy::lower_python_to_blockpy_for_testing(source)) {
+fn parse_and_lower(source: &str) -> Result<soac_lowering::LoweringResult, String> {
+    match std::panic::catch_unwind(|| soac_lowering::lower_python_to_blockpy_for_testing(source)) {
         Ok(Ok(result)) => Ok(result),
         Ok(Err(err)) => Err(err.to_string()),
         Err(payload) => Err(panic_payload_to_string(payload)),
     }
 }
 
-fn parse_and_lower_runtime_style(source: &str) -> Result<soac_blockpy::LoweringResult, String> {
-    match std::panic::catch_unwind(|| soac_blockpy::lower_python_to_blockpy_for_testing(source)) {
+fn parse_and_lower_runtime_style(source: &str) -> Result<soac_lowering::LoweringResult, String> {
+    match std::panic::catch_unwind(|| soac_lowering::lower_python_to_blockpy_for_testing(source)) {
         Ok(Ok(result)) => Ok(result),
         Ok(Err(err)) => Err(err.to_string()),
         Err(payload) => Err(panic_payload_to_string(payload)),
@@ -37,7 +37,7 @@ fn parse_and_lower_runtime_style(source: &str) -> Result<soac_blockpy::LoweringR
 }
 
 fn validate_bb_module_for_jit(
-    bb_module: &soac_core::block_py::BlockPyModule<soac_blockpy::passes::CodegenModuleShape>,
+    bb_module: &soac_core::block_py::BlockPyModule<soac_lowering::passes::CodegenModuleShape>,
 ) -> Result<(), String> {
     for function in &bb_module.callable_defs {
         match function.lowered_kind() {
@@ -50,7 +50,7 @@ fn validate_bb_module_for_jit(
     Ok(())
 }
 
-fn run_cranelift_jit_preflight(result: &soac_blockpy::LoweringResult) -> Result<(), String> {
+fn run_cranelift_jit_preflight(result: &soac_lowering::LoweringResult) -> Result<(), String> {
     soac_jit::run_cranelift_smoke(&result.codegen_module)
 }
 

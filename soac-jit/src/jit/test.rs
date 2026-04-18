@@ -1,13 +1,4 @@
 use super::*;
-use soac_blockpy::block_py::{
-    CodegenBlock, IncrementCounter, Literal, LiteralValue, NumberLiteral, NumberLiteralValue,
-    StringLiteral,
-};
-use soac_blockpy::passes::{
-    CodegenModuleShape, InstrCodegen, InstrResolved,
-    instrument_bb_module_with_block_entry_counters, instrument_bb_module_with_call_target_counters,
-    validate_codegen_instr_ids,
-};
 use soac_core::block_py::{
     AbruptKind, BinOp, BinOpKind, BlockArg, BlockEdge, BlockLabel, BlockParam, BlockParamRole,
     BlockPyFunction, BlockPyModule, BlockTerm, Call, CallArgKeyword, CallArgPositional, CallDirect,
@@ -18,6 +9,15 @@ use soac_core::block_py::{
     RuntimeName, SerializedFunctionDebugName, SerializedFunctionId, SerializedIdentityTables,
     SerializedModuleId, SerializedModuleIdentity, SetAttr, SetItem, StorageLayout, Store, Tuple,
     UnaryOp, UnaryOpKind, Visit, VisitMut, WithMeta,
+};
+use soac_lowering::block_py::{
+    CodegenBlock, IncrementCounter, Literal, LiteralValue, NumberLiteral, NumberLiteralValue,
+    StringLiteral,
+};
+use soac_lowering::passes::{
+    CodegenModuleShape, InstrCodegen, InstrResolved,
+    instrument_bb_module_with_block_entry_counters, instrument_bb_module_with_call_target_counters,
+    validate_codegen_instr_ids,
 };
 mod tests {
     use super::*;
@@ -35,8 +35,8 @@ mod tests {
     use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyModule, PyModuleMethods, PyTuple};
     use pyo3::{Bound, Py, PyAny, PyErr, PyResult, Python, ffi};
     use ruff_python_ast as ast;
-    use soac_blockpy::codegen_cache::{PythonModuleCacheSource, module_optimization_plan_path};
-    use soac_blockpy::passes::{TypedInstrExtra, TypedPlannedResult as PlannedResult};
+    use soac_lowering::codegen_cache::{PythonModuleCacheSource, module_optimization_plan_path};
+    use soac_lowering::passes::{TypedInstrExtra, TypedPlannedResult as PlannedResult};
     use std::collections::{HashMap, VecDeque};
     use std::ffi::c_void;
     use std::mem::size_of;
@@ -618,7 +618,7 @@ mod tests {
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         crate::initialize_test_python();
         Python::attach(|py| {
-            let lowered = soac_blockpy::lower_python_to_blockpy_for_testing(
+            let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
                 r#"
 def f():
     return None
@@ -741,7 +741,7 @@ def f():
 
     #[test]
     fn precompile_codegen_module_emits_relocatable_object() {
-        let lowered = soac_blockpy::lower_python_to_blockpy_for_testing(
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
             r#"
 def add(a, b):
     return a + b
@@ -811,7 +811,7 @@ def add(a, b):
         crate::initialize_test_python();
         let module_name = "precompile_static_int";
         let source_hash = 0x5678;
-        let lowered = soac_blockpy::lower_python_to_blockpy_for_testing(
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
             r#"
 def get_value():
     return 12345
@@ -857,7 +857,7 @@ def get_value():
         crate::initialize_test_python();
         let module_name = "precompile_static_big_int";
         let source_hash = 0x6677;
-        let lowered = soac_blockpy::lower_python_to_blockpy_for_testing(
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
             r#"
 def get_value():
     return 123456789012345678901234567890
@@ -903,7 +903,7 @@ def get_value():
     fn precompile_codegen_module_emits_static_compact_ascii_unicode_in_data() {
         let module_name = "precompile_static_ascii";
         let source_hash = 0x6789;
-        let lowered = soac_blockpy::lower_python_to_blockpy_for_testing(
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
             r#"
 def get_value():
     return "ascii-value"
@@ -949,7 +949,7 @@ def get_value():
         crate::initialize_test_python();
         let module_name = "precompile_static_non_ascii";
         let source_hash = 0x7788;
-        let lowered = soac_blockpy::lower_python_to_blockpy_for_testing(
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
             r#"
 def get_value():
     return "caf\u00e9 \U0001f40d"
@@ -995,7 +995,7 @@ def get_value():
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         crate::initialize_test_python();
         Python::attach(|py| unsafe {
-            let lowered = soac_blockpy::lower_python_to_blockpy_for_testing(
+            let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
                 r#"
 def add(left, right):
     return left + right
@@ -1061,7 +1061,7 @@ def add(left, right):
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         crate::initialize_test_python();
         Python::attach(|py| {
-            let lowered = soac_blockpy::lower_python_to_blockpy_for_testing(
+            let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
                 r#"
 def needs_arg(value):
     return value
@@ -1108,7 +1108,7 @@ def needs_arg(value):
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         crate::initialize_test_python();
         Python::attach(|py| unsafe {
-            let lowered = soac_blockpy::lower_python_to_blockpy_for_testing(
+            let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
                 r#"
 def add_default(left, right=9):
     return left + right
@@ -1172,7 +1172,7 @@ def add_default(left, right=9):
         globals_obj: ObjPtr,
         positional_args: &[ObjPtr],
     ) -> Result<ObjPtr, String> {
-        let lowered = soac_blockpy::lower_python_to_blockpy_for_testing(source)
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(source)
             .map_err(|err| format!("lowering entry interpreter source failed: {err}"))?
             .codegen_module;
         let module_code = compile_original_module_code_for_test(py, source)
@@ -1374,7 +1374,7 @@ def add_default(left, right=9):
         py: Python<'py>,
         source: &str,
     ) -> Bound<'py, PyDict> {
-        let lowered = soac_blockpy::lower_python_to_blockpy_for_testing(source)
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(source)
             .expect("lowering module init source should succeed")
             .codegen_module;
         let module_code = compile_original_module_code_for_test(py, source)
@@ -1446,7 +1446,7 @@ def add_default(left, right=9):
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         crate::initialize_test_python();
         Python::attach(|py| unsafe {
-            let lowered = soac_blockpy::lower_python_to_blockpy_for_testing(
+            let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
                 r#"
 def add_default(left, right=9):
     return left + right
@@ -2029,7 +2029,7 @@ def call_helper(value):
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         crate::initialize_test_python();
         Python::attach(|py| unsafe {
-            let lowered = soac_blockpy::lower_python_to_blockpy_for_testing(
+            let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
                 r#"
 def shaped(a, /, b, *args, c, **kwargs):
     return (a, b, args, c, kwargs["extra"])
@@ -2115,7 +2115,7 @@ def shaped(a, /, b, *args, c, **kwargs):
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         crate::initialize_test_python();
         Python::attach(|py| unsafe {
-            let lowered = soac_blockpy::lower_python_to_blockpy_for_testing(
+            let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
                 r#"
 def add_kw_default(value, *, scale=9):
     return value + scale
@@ -2183,7 +2183,7 @@ def add_kw_default(value, *, scale=9):
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         crate::initialize_test_python();
         Python::attach(|py| unsafe {
-            let lowered = soac_blockpy::lower_python_to_blockpy_for_testing(
+            let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
                 r#"
 def takes_one(value):
     return value
@@ -3928,14 +3928,14 @@ def build(values):
             .body
             .first_mut()
             .expect("test block should contain call");
-        let soac_blockpy::passes::InstrTyped::CallTyped(call) = first_instr else {
+        let soac_lowering::passes::InstrTyped::CallTyped(call) = first_instr else {
             panic!("test call should lower to typed call");
         };
-        call.access = soac_blockpy::passes::TypedCallAccessPlan::GuardedCallable {
-            function_guards: vec![soac_blockpy::passes::TypedDirectFunctionCallGuard {
+        call.access = soac_lowering::passes::TypedCallAccessPlan::GuardedCallable {
+            function_guards: vec![soac_lowering::passes::TypedDirectFunctionCallGuard {
                 function_id: RuntimeFunctionId::from_raw_parts(0, 1),
-                arg_plan: soac_blockpy::passes::TypedDirectCallArgPlan {
-                    sources: vec![soac_blockpy::passes::TypedDirectCallArgSource::Provided(0)],
+                arg_plan: soac_lowering::passes::TypedDirectCallArgPlan {
+                    sources: vec![soac_lowering::passes::TypedDirectCallArgSource::Provided(0)],
                 },
             }],
             constructor_guards: Vec::new(),
@@ -3948,7 +3948,7 @@ def build(values):
         assert!(
             matches!(
                 typed_function.blocks[0].body.first(),
-                Some(soac_blockpy::passes::InstrTyped::GuardedCallableCallTyped(
+                Some(soac_lowering::passes::InstrTyped::GuardedCallableCallTyped(
                     _
                 ))
             ),
@@ -6443,7 +6443,7 @@ class Point:
                     }],
                 },
             );
-            let mut lowered = soac_blockpy::lower_python_to_blockpy_for_testing(
+            let mut lowered = soac_lowering::lower_python_to_blockpy_for_testing(
                 r#"
 def write_point(point, value):
     point.x = value
@@ -6744,7 +6744,7 @@ class Record:
                 "SOAC priming should establish the profile-order split-key layout"
             );
 
-            let mut lowered = soac_blockpy::lower_python_to_blockpy_for_testing(
+            let mut lowered = soac_lowering::lower_python_to_blockpy_for_testing(
                 r#"
 class Record:
     def __init__(self, PtrComp=None, Discr=0, EnumComp=0, IntComp=0, StringComp=0):
@@ -7012,7 +7012,7 @@ class Point:
                 },
             );
 
-            let mut lowered = soac_blockpy::lower_python_to_blockpy_for_testing(
+            let mut lowered = soac_lowering::lower_python_to_blockpy_for_testing(
                 r#"
 def read_point(point):
     return point.x
@@ -7252,7 +7252,7 @@ class Point:
             },
         );
 
-        let mut lowered = soac_blockpy::lower_python_to_blockpy_for_testing(source)
+        let mut lowered = soac_lowering::lower_python_to_blockpy_for_testing(source)
             .expect("lowering should succeed")
             .codegen_module;
         instrument_bb_module_with_call_target_counters(&mut lowered);
@@ -7531,7 +7531,7 @@ class Other:
                 },
             );
 
-            let mut lowered = soac_blockpy::lower_python_to_blockpy_for_testing(
+            let mut lowered = soac_lowering::lower_python_to_blockpy_for_testing(
                 r#"
 def read_point(point):
     return point.x
@@ -7719,7 +7719,7 @@ class Other:
                 },
             );
 
-            let mut lowered = soac_blockpy::lower_python_to_blockpy_for_testing(
+            let mut lowered = soac_lowering::lower_python_to_blockpy_for_testing(
                 r#"
 def write_point(point, value):
     point.x = value
@@ -8613,7 +8613,7 @@ def write_point(point, value):
 
     #[test]
     fn runtime_deopt_table_marks_return_local_before_term_continuation() {
-        let lowered = soac_blockpy::lower_python_to_blockpy_for_testing(
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
             r#"
 def f(x):
     return x
@@ -14635,7 +14635,7 @@ def g():
         unsafe {
             crate::initialize_test_python();
             Python::attach(|py| {
-                let mut lowered = soac_blockpy::lower_python_to_blockpy_for_testing(
+                let mut lowered = soac_lowering::lower_python_to_blockpy_for_testing(
                     r#"
 def f():
     return None
@@ -14825,7 +14825,7 @@ def f():
 
     #[test]
     fn render_specialized_jit_exception_dispatch_takes_raised_exception_directly() {
-        let lowered = soac_blockpy::lower_python_to_blockpy_for_testing(
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
             r#"
 def f():
     try:
@@ -14862,7 +14862,7 @@ def f():
 
     #[test]
     fn specialized_jit_try_finally_return_payload_builds_with_refcount_cleanup() {
-        let lowered = soac_blockpy::lower_python_to_blockpy_for_testing(
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
             r#"
 events = []
 
@@ -14899,7 +14899,7 @@ def f(mode):
 
     #[test]
     fn specialized_jit_with_return_payload_failure_cleanup_forwards_stack_slot() {
-        let lowered = soac_blockpy::lower_python_to_blockpy_for_testing(
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
             r#"
 from pathlib import Path
 
@@ -14936,7 +14936,7 @@ def write_and_read(path: Path) -> str:
 
     #[test]
     fn specialized_jit_except_star_failure_cleanup_forwards_unbound_locals() {
-        let lowered = soac_blockpy::lower_python_to_blockpy_for_testing(
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
             r#"
 def run():
     global caught
@@ -14968,7 +14968,7 @@ def run():
         source: &str,
         source_block_matches: impl Fn(&CodegenBlock) -> bool,
     ) {
-        let lowered = soac_blockpy::lower_python_to_blockpy_for_testing(source)
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(source)
             .expect("lowering try/except local-forwarding test source should succeed")
             .codegen_module;
 
@@ -16741,7 +16741,7 @@ def f(x):
 def f():
     return None
 "#;
-                let mut baseline = soac_blockpy::lower_python_to_blockpy_for_testing(source)
+                let mut baseline = soac_lowering::lower_python_to_blockpy_for_testing(source)
                     .expect("lowering should succeed")
                     .codegen_module;
                 let baseline_function = baseline
@@ -16851,7 +16851,7 @@ def f():
 def f(x, y):
     return x + y
 "#;
-                let baseline = soac_blockpy::lower_python_to_blockpy_for_testing(source)
+                let baseline = soac_lowering::lower_python_to_blockpy_for_testing(source)
                     .expect("lowering should succeed")
                     .codegen_module;
                 let baseline_function = baseline
@@ -16873,7 +16873,7 @@ def f(x, y):
                 let baseline_symbolic_globals =
                     count_symbolic_global_values(&baseline_built.ctx.func);
 
-                let mut instrumented = soac_blockpy::lower_python_to_blockpy_for_testing(source)
+                let mut instrumented = soac_lowering::lower_python_to_blockpy_for_testing(source)
                     .expect("lowering should succeed")
                     .codegen_module;
                 instrument_bb_module_with_call_target_counters(&mut instrumented);

@@ -241,12 +241,12 @@ keeps web dependencies out of non-web rendering and offline analysis tools.
 4. Done, partial: keep `soac-blockpy` as a facade re-exporting `soac-core` so the first extraction
    does not require a whole-workspace import rewrite.
 5. Done, partial: changed `soac-jit`, `soac-pyo3`, `soac-inspector`, and offline tools to import
-   shared stable IR from `soac-core` where possible. They still depend on `soac-blockpy` for
+   shared stable IR from `soac-core` where possible. They still depend on `soac-lowering` for
    concrete codegen/resolved instruction enums, pass module shapes, BlockPy-specific literal
    payloads, and lowering/cache APIs.
 6. Done, partial: added `soac-lowering` and moved the remaining BlockPy lowering implementation
-   there. `soac-blockpy` is now a compatibility facade at the library layer, but downstream crates
-   still import lowering/codegen-cache APIs through that facade.
+   there. `soac-blockpy` is now a compatibility facade at the library layer; internal downstream
+   crates import lowering/codegen-cache APIs from `soac-lowering` directly.
 7. Done: move env parsing and logging setup into `soac-config`.
 8. Move counter/profile schemas and serialization into `soac-profile`.
 9. Split `soac-jit/src/jit/mod.rs` into internal modules along backend responsibility boundaries.

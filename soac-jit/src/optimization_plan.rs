@@ -1,17 +1,17 @@
 use crate::counter_dump::{CounterDumpFile, collect_type_key_layouts, collect_type_table};
 use anyhow::{Context, Result, bail};
-use soac_blockpy::block_py::Literal;
-use soac_blockpy::codegen_cache::{
-    CachedCodegenModule, CachedCodegenModuleMetadata, PythonModuleCacheSource,
-    load_codegen_module_cache, module_optimization_plan_path,
-};
-use soac_blockpy::passes::{CodegenModuleShape, InstrCodegen, InstrResolved};
 use soac_core::block_py::{
     BlockPyFunction, BlockPyModule, ChildVisitable, HasSemanticInstrId, InstrId, LocalFunctionId,
     ModuleContentId, NameLocation, PersistentFunctionId, RuntimeFunctionId, RuntimeModuleId,
     SerializedFunctionDebugName, SerializedFunctionId, SerializedIdentityTables,
     SerializedModuleId, SerializedModuleIdentity, Visit,
 };
+use soac_lowering::block_py::Literal;
+use soac_lowering::codegen_cache::{
+    CachedCodegenModule, CachedCodegenModuleMetadata, PythonModuleCacheSource,
+    load_codegen_module_cache, module_optimization_plan_path,
+};
+use soac_lowering::passes::{CodegenModuleShape, InstrCodegen, InstrResolved};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Write;

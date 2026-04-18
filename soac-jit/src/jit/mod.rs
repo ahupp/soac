@@ -50,8 +50,18 @@ use cranelift_jit::{ArenaMemoryProvider, JITBuilder, JITModule};
 use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module, ModuleReloc};
 use cranelift_reader::parse_functions;
 use pyo3::{Py, PyAny, Python, ffi};
-use soac_blockpy::block_py::{CodegenBlock, Literal};
-use soac_blockpy::passes::{
+use soac_core::block_py::{
+    AbruptKind, Block, BlockArg, BlockEdge, BlockLabel, BlockParamRole, BlockPyFunction,
+    BlockPyModule, BlockTerm, Call, CallArgKeyword, CallArgPositional, CallDirect,
+    CallableScopeKind, CellLocation, ChildVisitable, CounterDef, CounterId, CounterScope,
+    CounterSite, Del, DeoptEntrySource, FunctionExecutionMode, FunctionKind, GetAttr, HasMeta,
+    HasSemanticInstrId, InstrId, InstrKey, Load, LocalFunctionId, LocalLocation, Meta,
+    ModuleContentId, NameLocation, ParamKind, PersistentFunctionId, ResolvedName,
+    RuntimeFunctionId, RuntimeModuleId, RuntimeName, StorageLayout, Store, Visit, VisitMut,
+    WithMeta, operation as blockpy_intrinsics,
+};
+use soac_lowering::block_py::{CodegenBlock, Literal};
+use soac_lowering::passes::{
     CodegenModuleShape, ConstructorFieldValue, DirectFunctionIdGuardTest,
     DirectReceiverTypeVersionGuardTest, FactStore, FunctionRefcountPlan, InlineCallee,
     InlinePlanModule, InstrCodegen, InstrResolved, InstrTyped, LocalEnvResumeBinding,
@@ -80,16 +90,6 @@ use soac_blockpy::passes::{
     try_lower_typed_instr_to_codegen_legacy, try_lower_typed_term_to_codegen_legacy,
     validate_codegen_instr_ids, validate_typed_function_call_access_plans,
     validate_typed_function_value_facts,
-};
-use soac_core::block_py::{
-    AbruptKind, Block, BlockArg, BlockEdge, BlockLabel, BlockParamRole, BlockPyFunction,
-    BlockPyModule, BlockTerm, Call, CallArgKeyword, CallArgPositional, CallDirect,
-    CallableScopeKind, CellLocation, ChildVisitable, CounterDef, CounterId, CounterScope,
-    CounterSite, Del, DeoptEntrySource, FunctionExecutionMode, FunctionKind, GetAttr, HasMeta,
-    HasSemanticInstrId, InstrId, InstrKey, Load, LocalFunctionId, LocalLocation, Meta,
-    ModuleContentId, NameLocation, ParamKind, PersistentFunctionId, ResolvedName,
-    RuntimeFunctionId, RuntimeModuleId, RuntimeName, StorageLayout, Store, Visit, VisitMut,
-    WithMeta, operation as blockpy_intrinsics,
 };
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
@@ -2455,7 +2455,7 @@ fn rewrite_profiled_no_arg_method_call_store_block(
     let targets = targets_by_instr_id.get(&candidate.instr_id)?;
     let continuation_label = function.name_gen.next_block_name();
     let receiver_temp =
-        soac_blockpy::passes::allocate_codegen_stack_temp(function, "direct_method_receiver");
+        soac_lowering::passes::allocate_codegen_stack_temp(function, "direct_method_receiver");
     let receiver_temp_name = receiver_temp.resolved_name();
     let exc_edge = block.exc_edge.clone();
 
@@ -2665,7 +2665,7 @@ fn rewrite_profiled_runtime_iter_call_store_block(
     let targets = targets_by_instr_id.get(&candidate.constructor_instr_id)?;
     let continuation_label = function.name_gen.next_block_name();
     let receiver_temp =
-        soac_blockpy::passes::allocate_codegen_stack_temp(function, "runtime_iter_receiver");
+        soac_lowering::passes::allocate_codegen_stack_temp(function, "runtime_iter_receiver");
     let receiver_temp_name = receiver_temp.resolved_name();
     let exc_edge = block.exc_edge.clone();
 
@@ -2917,10 +2917,10 @@ fn rewrite_profiled_no_arg_method_call_store_block_with_callable_guard(
 ) -> Option<Vec<Block<InstrCodegen>>> {
     let continuation_label = function.name_gen.next_block_name();
     let receiver_temp =
-        soac_blockpy::passes::allocate_codegen_stack_temp(function, "direct_method_receiver");
+        soac_lowering::passes::allocate_codegen_stack_temp(function, "direct_method_receiver");
     let receiver_temp_name = receiver_temp.resolved_name();
     let method_temp =
-        soac_blockpy::passes::allocate_codegen_stack_temp(function, "direct_method_callable");
+        soac_lowering::passes::allocate_codegen_stack_temp(function, "direct_method_callable");
     let method_temp_name = method_temp.resolved_name();
     let exc_edge = block.exc_edge.clone();
     let stop_iteration_target = stop_iteration_handler_target(
@@ -13206,7 +13206,7 @@ fn synthesize_test_planned_evidence_for_runtime_state(
         env!("SOAC_BUILD_IDENTITY"),
         shared_state.module_name == "soac.runtime",
     );
-    let metadata = soac_blockpy::codegen_cache::CachedCodegenModuleMetadata {
+    let metadata = soac_lowering::codegen_cache::CachedCodegenModuleMetadata {
         source: shared_state
             .module_cache_source
             .unwrap_or(PythonModuleCacheSource::Project),

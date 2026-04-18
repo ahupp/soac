@@ -1,7 +1,7 @@
 use crate::jit::ProcessJitEngine;
 use crate::module_type::SharedModuleState;
-use soac_blockpy::passes::CodegenModuleShape;
 use soac_core::block_py::{BlockPyFunction, ModuleNameGen, RuntimeFunctionId};
+use soac_lowering::passes::CodegenModuleShape;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicU32, Ordering};

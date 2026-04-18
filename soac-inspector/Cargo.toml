@@ -7,7 +7,7 @@ build = "build.rs"
 [dependencies]
 anyhow = { version = "1.0.100", features = ["backtrace"] }
 axum = "0.8"
-soac-blockpy = { path = "../soac-blockpy" }
+soac-lowering = { path = "../soac-lowering" }
 soac-config = { path = "../soac-config" }
 soac-core = { path = "../soac-core" }
 soac-cpython = { path = "../soac-cpython" }

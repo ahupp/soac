@@ -46,7 +46,7 @@ fn main() -> Result<(), String> {
         )
     })?;
     let source = split_source(&source_path)?;
-    let output = soac_blockpy::lower_python_to_blockpy_for_testing(&source)
+    let output = soac_lowering::lower_python_to_blockpy_for_testing(&source)
         .map_err(|err| err.to_string())?;
     for function in &output.codegen_module.callable_defs {
         println!(

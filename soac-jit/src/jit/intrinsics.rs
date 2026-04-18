@@ -14,10 +14,10 @@ use cranelift_codegen::ir;
 use cranelift_codegen::ir::InstBuilder;
 use cranelift_frontend::FunctionBuilder;
 use pyo3::ffi;
-use soac_blockpy::passes::{InstrCodegen, InstrTyped, PyExactType, PyObjFacts};
 use soac_core::block_py::{
     CounterId, HasSemanticInstrId, Instr, NameLike, NameLocation, ResolvedName,
 };
+use soac_lowering::passes::{InstrCodegen, InstrTyped, PyExactType, PyObjFacts};
 use std::mem::offset_of;
 
 const PY_LONG_SIGN_MASK: i64 = 3;

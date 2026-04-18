@@ -7,11 +7,6 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyModule};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use soac_blockpy::passes::{
-    CodegenModuleShape, infer_module_value_facts, plan_local_env_module,
-    plan_local_env_resume_module, render_local_env_function_plan, render_local_env_module_plan,
-    render_local_env_resume_function_plan, render_local_env_resume_module_plan,
-};
 use soac_core::block_py::{BlockPyFunction, BlockPyModule, ModuleNameGen, RuntimeFunctionId};
 use soac_jit::module_constants::ModuleCodegenConstants;
 use soac_jit::module_type::{
@@ -23,6 +18,11 @@ use soac_jit::{
     render_cranelift_run_bb_specialized_with_runtime_state_and_cfg,
     render_instr_typed_for_codegen_with_runtime_state, render_jit_deopt_resume_module,
     render_jit_function_locals, render_jit_module_locals,
+};
+use soac_lowering::passes::{
+    CodegenModuleShape, infer_module_value_facts, plan_local_env_module,
+    plan_local_env_resume_module, render_local_env_function_plan, render_local_env_module_plan,
+    render_local_env_resume_function_plan, render_local_env_resume_module_plan,
 };
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
@@ -197,8 +197,8 @@ fn ensure_python_support_paths(py: Python<'_>, repo_root: &Path) -> Result<(), A
     Ok(())
 }
 
-fn lower_source_recorded(source: &str) -> Result<soac_blockpy::LoweringResult, ApiError> {
-    soac_blockpy::lower_python_to_blockpy_for_testing(source)
+fn lower_source_recorded(source: &str) -> Result<soac_lowering::LoweringResult, ApiError> {
+    soac_lowering::lower_python_to_blockpy_for_testing(source)
         .map_err(|err| ApiError::internal(err.to_string()))
 }
 
@@ -213,7 +213,7 @@ fn inspector_function_payload(function: &BlockPyFunction<CodegenModuleShape>) ->
     })
 }
 
-fn render_inspector_payload(source: &str, output: &soac_blockpy::LoweringResult) -> Value {
+fn render_inspector_payload(source: &str, output: &soac_lowering::LoweringResult) -> Value {
     let mut steps = vec![json!({
         "key": "input_source",
         "label": "input source",
@@ -299,7 +299,7 @@ pub fn lower_source_to_codegen_module_with_module_id(
     module_id: u32,
 ) -> Result<BlockPyModule<CodegenModuleShape>, String> {
     let output =
-        soac_blockpy::lower_python_to_blockpy_recorded(source, ModuleNameGen::new(module_id))
+        soac_lowering::lower_python_to_blockpy_recorded(source, ModuleNameGen::new(module_id))
             .map_err(|err| err.to_string())?;
     Ok(output.codegen_module)
 }

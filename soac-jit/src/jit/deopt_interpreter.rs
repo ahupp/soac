@@ -12,15 +12,15 @@ use crate::session::CompileSession;
 use pyo3::ffi;
 use pyo3::types::PyAny;
 use pyo3::{Bound, Python};
-use soac_blockpy::passes::{
-    CodegenModuleShape, DirectFunctionIdGuardTest, DirectReceiverTypeVersionGuardTest, InstrCodegen,
-};
 use soac_core::block_py::{
     AbruptKind, BinOp, BinOpKind, Block, BlockArg, BlockEdge, BlockLabel, BlockTerm,
     CallArgKeyword, CallArgPositional, CalleeFunctionId, CellLocation, LocalLocation, NameLocation,
     ParamKind, RuntimeName, UnaryOp, UnaryOpKind,
 };
 use soac_core::block_py::{BlockPyFunction, FunctionKind};
+use soac_lowering::passes::{
+    CodegenModuleShape, DirectFunctionIdGuardTest, DirectReceiverTypeVersionGuardTest, InstrCodegen,
+};
 use std::ffi::{c_int, c_void};
 use std::ptr;
 use std::sync::Arc;

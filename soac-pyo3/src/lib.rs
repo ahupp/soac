@@ -6,31 +6,31 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
 use serde_json::json;
-use soac_blockpy::{lower_python_to_blockpy_for_testing, ruff_ast_to_string};
 use soac_jit::counter_dump::CounterDumpFile;
 use soac_jit::optimization_plan::generate_optimization_plans_for_counter_dump;
+use soac_lowering::{lower_python_to_blockpy_for_testing, ruff_ast_to_string};
 use std::path::{Path, PathBuf};
 use tracing::trace;
 
 #[cfg(test)]
 mod test;
 
-pub(crate) fn lowering_error_to_pyerr(err: soac_blockpy::LoweringError) -> PyErr {
+pub(crate) fn lowering_error_to_pyerr(err: soac_lowering::LoweringError) -> PyErr {
     match err {
-        soac_blockpy::LoweringError::Parse(parse_error) => {
+        soac_lowering::LoweringError::Parse(parse_error) => {
             pyo3::exceptions::PySyntaxError::new_err(parse_error.to_string())
         }
-        soac_blockpy::LoweringError::Other(err) => {
+        soac_lowering::LoweringError::Other(err) => {
             pyo3::exceptions::PyRuntimeError::new_err(err.to_string())
         }
     }
 }
 
-fn lower_source(source: &str) -> PyResult<soac_blockpy::LoweringResult> {
+fn lower_source(source: &str) -> PyResult<soac_lowering::LoweringResult> {
     lower_python_to_blockpy_for_testing(source).map_err(lowering_error_to_pyerr)
 }
 
-fn rendered_ast_to_ast_source(source: &str, output: &soac_blockpy::LoweringResult) -> String {
+fn rendered_ast_to_ast_source(source: &str, output: &soac_lowering::LoweringResult) -> String {
     output
         .pass_tracker
         .pass_ast_to_ast()

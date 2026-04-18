@@ -11,15 +11,15 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyAnyMethods, PyList, PyTuple};
-use soac_blockpy::codegen_cache::PythonModuleCacheSource;
-use soac_blockpy::passes::{
-    CodegenModuleShape, InlinePlanModule, plan_module_inlining,
-    specialization_runtime_logging_enabled, summarize_module_escapes,
-};
 use soac_config::SoacEnvConfig;
 use soac_core::block_py::{
     BlockPyFunction, BlockPyModule, CounterDef, CounterId, CounterScope, CounterSite,
     DeoptEntrySource, FunctionExecutionMode, RuntimeFunctionId, RuntimeName,
+};
+use soac_lowering::codegen_cache::PythonModuleCacheSource;
+use soac_lowering::passes::{
+    CodegenModuleShape, InlinePlanModule, plan_module_inlining,
+    specialization_runtime_logging_enabled, summarize_module_escapes,
 };
 use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, c_int, c_void};
@@ -1665,8 +1665,8 @@ mod test {
     use super::*;
     use crate::counter_dump::COUNTER_DUMP_MAGIC;
     use pyo3::types::PyModule;
-    use soac_blockpy::lower_python_to_blockpy_for_testing;
-    use soac_blockpy::passes::instrument_bb_module_with_block_entry_counters;
+    use soac_lowering::lower_python_to_blockpy_for_testing;
+    use soac_lowering::passes::instrument_bb_module_with_block_entry_counters;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 

@@ -1768,11 +1768,11 @@ dependencies = [
  "rkyv",
  "serde",
  "serde_json",
- "soac-blockpy",
  "soac-config",
  "soac-core",
  "soac-cpython",
  "soac-jit",
+ "soac-lowering",
  "tokio",
  "tower",
  "tower-http",
@@ -1798,10 +1798,10 @@ dependencies = [
  "rkyv",
  "ruff_python_ast",
  "serde_json",
- "soac-blockpy",
  "soac-config",
  "soac-core",
  "soac-cpython",
+ "soac-lowering",
  "tracing",
 ]
 
@@ -1843,11 +1843,11 @@ dependencies = [
  "pyo3",
  "rkyv",
  "serde_json",
- "soac-blockpy",
  "soac-config",
  "soac-core",
  "soac-cpython",
  "soac-jit",
+ "soac-lowering",
  "tracing",
 ]
 

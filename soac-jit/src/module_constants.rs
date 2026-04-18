@@ -1,11 +1,11 @@
 use pyo3::ffi;
 use pyo3::prelude::*;
-use soac_blockpy::block_py::{Literal, NumberLiteralValue};
-use soac_blockpy::passes::{CodegenModuleShape, InstrCodegen, InstrResolved};
 use soac_core::block_py::{
     AbruptKind, BlockArg, BlockPyFunction, BlockPyModule, BlockTerm, CallArgKeyword,
     ChildVisitable, NameLike, ParamDefaultSource, RuntimeName, operation as blockpy_intrinsics,
 };
+use soac_lowering::block_py::{Literal, NumberLiteralValue};
+use soac_lowering::passes::{CodegenModuleShape, InstrCodegen, InstrResolved};
 use std::collections::HashMap;
 
 mod materialization;

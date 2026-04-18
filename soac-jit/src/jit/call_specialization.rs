@@ -1,13 +1,13 @@
 use std::collections::{HashMap, HashSet};
 
-use soac_blockpy::passes::{
-    CodegenModuleShape, InstrCodegen, InstrResolved, InstrTyped, TypedCall, TypedCallAccessPlan,
-    TypedCodegenModuleShape, TypedDirectCallArgPlan, TypedDirectCallArgSource,
-    TypedDirectConstructorCallGuard, TypedDirectFunctionCallGuard, TypedDirectMethodCallGuard,
-};
 use soac_core::block_py::{
     BlockPyFunction, CallArgKeyword, CallArgPositional, ChildVisitable, HasSemanticInstrId, Instr,
     InstrId, NameLocation, ParamKind, RuntimeFunctionId, RuntimeName, Visit, VisitMut,
+};
+use soac_lowering::passes::{
+    CodegenModuleShape, InstrCodegen, InstrResolved, InstrTyped, TypedCall, TypedCallAccessPlan,
+    TypedCodegenModuleShape, TypedDirectCallArgPlan, TypedDirectCallArgSource,
+    TypedDirectConstructorCallGuard, TypedDirectFunctionCallGuard, TypedDirectMethodCallGuard,
 };
 
 use super::{
@@ -726,11 +726,11 @@ fn typed_direct_call_arg_plan(plan: &DirectCallArgPlan) -> TypedDirectCallArgPla
 mod tests {
     use super::*;
     use crate::counter_dump::CounterDumpTypeKey;
-    use soac_blockpy::passes::{TypedDirectCallArgSource, lower_codegen_module_to_typed};
     use soac_core::block_py::Visit;
+    use soac_lowering::passes::{TypedDirectCallArgSource, lower_codegen_module_to_typed};
 
     fn lowered_module(source: &str) -> soac_core::block_py::BlockPyModule<CodegenModuleShape> {
-        soac_blockpy::lower_python_to_blockpy_for_testing(source)
+        soac_lowering::lower_python_to_blockpy_for_testing(source)
             .expect("test source should lower")
             .codegen_module
     }
