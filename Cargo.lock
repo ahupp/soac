@@ -1726,21 +1726,9 @@ dependencies = [
 name = "soac-blockpy"
 version = "0.1.0"
 dependencies = [
- "anyhow",
- "derive_more",
- "regex",
- "rkyv",
- "ruff_python_ast",
- "ruff_python_codegen",
- "ruff_python_parser",
- "ruff_python_semantic",
- "ruff_source_file",
- "ruff_text_size",
  "serde_json",
- "similar",
  "soac-config",
- "soac-core",
- "soac-macros",
+ "soac-lowering",
  "tracing",
 ]
 
@@ -1814,6 +1802,28 @@ dependencies = [
  "soac-config",
  "soac-core",
  "soac-cpython",
+ "tracing",
+]
+
+[[package]]
+name = "soac-lowering"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "derive_more",
+ "regex",
+ "rkyv",
+ "ruff_python_ast",
+ "ruff_python_codegen",
+ "ruff_python_parser",
+ "ruff_python_semantic",
+ "ruff_source_file",
+ "ruff_text_size",
+ "serde_json",
+ "similar",
+ "soac-config",
+ "soac-core",
+ "soac-macros",
  "tracing",
 ]
 

@@ -92,6 +92,24 @@ Contents:
 - Rust test `_soac_ext` staging
 - shared `sys.path` insertion helpers
 
+### `soac-lowering`
+
+Own the remaining BlockPy lowering implementation behind the temporary `soac-blockpy` facade.
+
+Completed: added the `soac-lowering` workspace crate and moved the remaining BlockPy lowering
+implementation there. `soac-blockpy` now has a thin library facade that re-exports
+`soac-lowering`, while its existing developer binaries remain in the package and call the facade.
+
+Contents:
+
+- remaining BlockPy facade payloads and pretty/validation helpers
+- codegen cache format and helpers
+- lowering driver and parse-to-BlockPy entrypoints
+- pass tracker
+- transformation passes
+- template and transformer support
+- lowering fixtures and tests
+
 ## Proposed Crates
 
 ### `soac-ir`
@@ -217,8 +235,8 @@ keeps web dependencies out of non-web rendering and offline analysis tools.
    - edit-only JIT backend rebuild
    - `soac-jit` test build
    - extension build path
-2. Remove accidental crate outputs if safe. In particular, verify whether `soac-blockpy` still needs
-   to build a `cdylib`; if not, make it an `rlib` only.
+2. Done: removed the accidental `cdylib` output from `soac-blockpy`; it now builds as the default
+   Rust library only. The Python extension `cdylib` remains owned by `soac-pyo3`.
 3. Done, partial: add `soac-core` and move the first stable BlockPy model slice.
 4. Done, partial: keep `soac-blockpy` as a facade re-exporting `soac-core` so the first extraction
    does not require a whole-workspace import rewrite.
@@ -226,7 +244,9 @@ keeps web dependencies out of non-web rendering and offline analysis tools.
    shared stable IR from `soac-core` where possible. They still depend on `soac-blockpy` for
    concrete codegen/resolved instruction enums, pass module shapes, BlockPy-specific literal
    payloads, and lowering/cache APIs.
-6. Add `soac-lowering` and move passes, driver, transformer, and template code there.
+6. Done, partial: added `soac-lowering` and moved the remaining BlockPy lowering implementation
+   there. `soac-blockpy` is now a compatibility facade at the library layer, but downstream crates
+   still import lowering/codegen-cache APIs through that facade.
 7. Done: move env parsing and logging setup into `soac-config`.
 8. Move counter/profile schemas and serialization into `soac-profile`.
 9. Split `soac-jit/src/jit/mod.rs` into internal modules along backend responsibility boundaries.

@@ -21,6 +21,7 @@ pub fn compute_soac_build_identity(repo_root: &std::path::Path) -> std::io::Resu
         "Cargo.toml",
         "Cargo.lock",
         "soac-blockpy",
+        "soac-lowering",
         "soac-jit",
         "soac-macros",
         "soac-pyo3",

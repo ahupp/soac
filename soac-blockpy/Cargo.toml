@@ -12,19 +12,7 @@ name = "regen_snapshots"
 path = "src/bin/regen_snapshots/mod.rs"
 
 [dependencies]
-ruff_python_parser = { workspace = true }
-ruff_python_ast = { workspace = true }
-ruff_python_codegen = { workspace = true }
-ruff_python_semantic = { workspace = true }
-ruff_text_size = { workspace = true }
-ruff_source_file = { workspace = true }
-regex = "1"
-serde_json = "1"
-rkyv = { version = "0.8", default-features = false, features = ["std", "bytecheck"] }
-similar = "2"
-tracing = "0.1"
-anyhow = { version = "1.0.100", features = ["backtrace"] }
-derive_more = { version = "2", features = ["from"] }
-soac-macros = { path = "../soac-macros" }
-soac-core = { path = "../soac-core" }
+soac-lowering = { path = "../soac-lowering" }
 soac-config = { path = "../soac-config" }
+serde_json = "1"
+tracing = "0.1"
