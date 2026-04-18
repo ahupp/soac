@@ -5,7 +5,6 @@ import json
 import os
 import subprocess
 import sys
-import textwrap
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +13,7 @@ import pytest
 from tests._integration import decide_optimizations_for_work_dir
 
 OPT_TESTS_DIR = Path(__file__).resolve().parent / "opt_tests"
+VERIFY_DELIMITER = "# soac: verify"
 COUNTER_DELIMITER = "# soac: verify-counters"
 
 
@@ -21,7 +21,8 @@ def _case_paths() -> list[Path]:
     cases: list[Path] = []
     for path in sorted(OPT_TESTS_DIR.glob("*.py")):
         try:
-            if COUNTER_DELIMITER in path.read_text(encoding="utf-8"):
+            source = path.read_text(encoding="utf-8")
+            if VERIFY_DELIMITER in source and COUNTER_DELIMITER in source:
                 cases.append(path)
         except OSError:
             continue
@@ -30,15 +31,25 @@ def _case_paths() -> list[Path]:
 
 def _split_opt_case(case_path: Path) -> tuple[str, list[dict[str, Any]]]:
     source = case_path.read_text(encoding="utf-8")
+    if VERIFY_DELIMITER not in source:
+        raise ValueError(f"missing opt-test verify delimiter in {case_path}")
     if COUNTER_DELIMITER not in source:
         raise ValueError(f"missing opt-test counter delimiter in {case_path}")
-    raw_source, raw_expectations = source.split(COUNTER_DELIMITER, 1)
+    raw_source, rest = source.split(VERIFY_DELIMITER, 1)
+    raw_verify, raw_expectations = rest.split(COUNTER_DELIMITER, 1)
     expectations = ast.literal_eval(raw_expectations.strip())
     if not isinstance(expectations, list) or not all(
         isinstance(expectation, dict) for expectation in expectations
     ):
         raise TypeError(f"{case_path} expectations must be a list of dictionaries")
-    return raw_source.rstrip() + "\n", expectations
+    for expectation in expectations:
+        if "module" in expectation:
+            raise ValueError(
+                f"{case_path} counter expectations must not include module; "
+                "the module is implied by the opt-test filename"
+            )
+    module_source = raw_source.rstrip() + "\n\n" + raw_verify.lstrip()
+    return module_source.rstrip() + "\n", expectations
 
 
 def _soac_subprocess_env(module_root: Path, *, work_dir: Path) -> dict[str, str]:
@@ -65,16 +76,14 @@ def _assert_subprocess_ok(result: subprocess.CompletedProcess[str]) -> None:
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def _run_script(module_root: Path, module_name: str, iterations: int = 80) -> str:
+def _run_script(module_root: Path, module_name: str) -> str:
     return "\n".join(
         [
             "import sys",
             f"sys.path.insert(0, {str(module_root)!r})",
             "from soac.import_hook import install",
             "install()",
-            f"import {module_name} as module",
-            f"for _ in range({iterations}):",
-            "    module.run()",
+            f"import {module_name}",
             "",
         ]
     )
@@ -86,8 +95,9 @@ def _inspect_counter_dump_json(path: Path) -> dict[str, Any]:
     return json.loads(_soac_ext.inspect_counter_dump_json(str(path)))
 
 
-def _counter_value(verify: dict[str, Any], expectation: dict[str, Any]) -> int:
-    module_name = expectation.get("module")
+def _counter_value(
+    verify: dict[str, Any], expectation: dict[str, Any], *, module_name: str
+) -> int:
     function = expectation.get("function")
     kind = expectation.get("kind")
     instr_id = expectation.get("instr_id")
@@ -96,7 +106,7 @@ def _counter_value(verify: dict[str, Any], expectation: dict[str, Any]) -> int:
 
     total = 0
     for record in verify["records"]:
-        if module_name is not None and record["module_name"] != module_name:
+        if record["module_name"] != module_name:
             continue
         for row in record["rows"]:
             if row["kind"] != kind:
@@ -110,12 +120,16 @@ def _counter_value(verify: dict[str, Any], expectation: dict[str, Any]) -> int:
 
 
 def _assert_counter_expectation(
-    verify: dict[str, Any], expectation: dict[str, Any], case_path: Path
+    verify: dict[str, Any],
+    expectation: dict[str, Any],
+    case_path: Path,
+    *,
+    module_name: str,
 ) -> None:
-    value = _counter_value(verify, expectation)
+    value = _counter_value(verify, expectation, module_name=module_name)
     label = {
         key: expectation[key]
-        for key in ("module", "function", "kind", "instr_id")
+        for key in ("function", "kind", "instr_id")
         if key in expectation
     }
     if "equals" in expectation:
@@ -165,4 +179,6 @@ def test_opt_case_verify_counters(tmp_path: Path, case_path: Path) -> None:
     verify = _inspect_counter_dump_json(verify_path)
 
     for expectation in expectations:
-        _assert_counter_expectation(verify, expectation, case_path)
+        _assert_counter_expectation(
+            verify, expectation, case_path, module_name=module_name
+        )

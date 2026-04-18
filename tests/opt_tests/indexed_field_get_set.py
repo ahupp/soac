@@ -16,27 +16,29 @@ def write_fields():
     return record.left + record.right
 
 
-def run():
+def exercise_indexed_fields():
     assert read_fields() == 30
     assert write_fields() == 72
+
+
+# soac: verify
+for _ in range(80):
+    exercise_indexed_fields()
 
 
 # soac: verify-counters
 [
     {
-        "module": "indexed_field_get_set",
         "function": "read_fields",
         "kind": "field_indexed_hit",
         "min": 2,
     },
     {
-        "module": "indexed_field_get_set",
         "function": "write_fields",
         "kind": "field_indexed_hit",
         "min": 3,
     },
     {
-        "module": "indexed_field_get_set",
         "function": "write_fields",
         "kind": "field_indexed_fallback",
         "max": 0,
