@@ -6,7 +6,6 @@ edition = "2021"
 [lib]
 name = "soac_blockpy"
 path = "src/lib.rs"
-crate-type = ["cdylib", "rlib"]
 
 [[bin]]
 name = "regen_snapshots"
