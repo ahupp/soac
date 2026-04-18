@@ -7,13 +7,14 @@ use crate::block_py::{
     BlockPyFunction, Call, ChildVisitable, CounterScope, CounterSite, InstrCodegen, NameLike,
     NameLocation, Visit,
 };
-use crate::lower_python_to_blockpy_for_testing;
 use crate::passes::{
     assign_module_instr_ids, lower_try_jump_exception_flow, normalize_bb_module_strings,
     CodegenModuleShape,
 };
-use std::ffi::OsString;
-use std::sync::{Mutex, OnceLock};
+use crate::{lower_python_to_blockpy_for_testing, lower_python_to_blockpy_for_testing_with_config};
+use soac_config::{SoacEnvConfig, SoacLogConfig, SpecializationMode};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn tracked_name_binding_module(
     source: &str,
@@ -64,35 +65,17 @@ fn expr_tree_contains_local_load(expr: &InstrCodegen) -> bool {
     probe.found
 }
 
-fn profile_env_test_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
+fn config_for_mode(mode: SpecializationMode) -> SoacEnvConfig {
+    SoacEnvConfig::default().with_specialization_mode(Some(mode))
 }
 
-struct EnvVarGuard {
-    key: &'static str,
-    old_value: Option<OsString>,
-}
-
-impl EnvVarGuard {
-    fn set(key: &'static str, value: &str) -> Self {
-        let old_value = std::env::var_os(key);
-        unsafe {
-            std::env::set_var(key, value);
-        }
-        Self { key, old_value }
-    }
-}
-
-impl Drop for EnvVarGuard {
-    fn drop(&mut self) {
-        unsafe {
-            match self.old_value.as_ref() {
-                Some(value) => std::env::set_var(self.key, value),
-                None => std::env::remove_var(self.key),
-            }
-        }
-    }
+fn fresh_test_work_dir(label: &str) -> PathBuf {
+    static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+    std::env::temp_dir().join(format!(
+        "soac-blockpy-{label}-{}-{}",
+        std::process::id(),
+        NEXT_ID.fetch_add(1, Ordering::Relaxed)
+    ))
 }
 
 #[test]
@@ -230,10 +213,9 @@ fn adds_branch_outcome_counters_for_conditional_terms() {
 
 #[test]
 fn lowering_profile_mode_adds_block_entry_counters() {
-    let _guard = profile_env_test_lock().lock().unwrap();
-    let _opt_mode = EnvVarGuard::set("SOAC_OPT_MODE", "profile");
+    let config = config_for_mode(SpecializationMode::Profile);
     let source = "def f(x):\n    if x:\n        return 1\n    return 0\n";
-    let lowered = lower_python_to_blockpy_for_testing(source)
+    let lowered = lower_python_to_blockpy_for_testing_with_config(source, &config)
         .expect("transform should succeed")
         .codegen_module;
 
@@ -269,14 +251,12 @@ fn lowering_profile_mode_adds_block_entry_counters() {
 
 #[test]
 fn lowering_verify_mode_adds_refcount_counters_only_in_verify() {
-    let _guard = profile_env_test_lock().lock().unwrap();
     let source = "def f(x):\n    y = x\n    return y\n";
 
     {
-        let _opt_mode = EnvVarGuard::set("SOAC_OPT_MODE", "verify");
-        let config = soac_config::SoacEnvConfig::from_env().unwrap();
+        let config = config_for_mode(SpecializationMode::Verify);
         assert!(refcount_counter_instrumentation_enabled(&config));
-        let lowered = lower_python_to_blockpy_for_testing(source)
+        let lowered = lower_python_to_blockpy_for_testing_with_config(source, &config)
             .expect("transform should succeed")
             .codegen_module;
         let refcount_counters = lowered
@@ -297,29 +277,33 @@ fn lowering_verify_mode_adds_refcount_counters_only_in_verify() {
         }));
     }
 
-    for mode in ["profile", "apply"] {
-        let _opt_mode = EnvVarGuard::set("SOAC_OPT_MODE", mode);
-        let config = soac_config::SoacEnvConfig::from_env().unwrap();
+    for mode in [SpecializationMode::Profile, SpecializationMode::Apply] {
+        let config = config_for_mode(mode);
         assert!(!refcount_counter_instrumentation_enabled(&config));
-        let lowered = lower_python_to_blockpy_for_testing(source)
+        let lowered = lower_python_to_blockpy_for_testing_with_config(source, &config)
             .expect("transform should succeed")
             .codegen_module;
         assert!(
             lowered.counter_defs.iter().all(|counter| counter.kind != "runtime_incref"
                 && counter.kind != "runtime_decref"),
-            "{mode} lowering should not add refcount counters"
+            "{mode:?} lowering should not add refcount counters"
         );
     }
 }
 
 #[test]
 fn lowering_apply_mode_keeps_only_deopt_entry_counters_even_with_runtime_logging() {
-    let _guard = profile_env_test_lock().lock().unwrap();
-    let _opt_mode = EnvVarGuard::set("SOAC_OPT_MODE", "apply");
-    let _work_dir = EnvVarGuard::set("SOAC_WORK_DIR", "/tmp/soac-apply-counter-test");
-    let _log = EnvVarGuard::set("SOAC_LOG", "soac_specialization_runtime=info");
+    let config = config_for_mode(SpecializationMode::Apply)
+        .with_soac_work_dir(Some(fresh_test_work_dir("apply-counter")))
+        .with_soac_log(
+            SoacLogConfig {
+                filter: "soac_specialization_runtime=info".to_string(),
+                json_path: None,
+            },
+            true,
+        );
     let source = "VALUE = 7\n\ndef read(x):\n    return x + VALUE\n";
-    let lowered = lower_python_to_blockpy_for_testing(source)
+    let lowered = lower_python_to_blockpy_for_testing_with_config(source, &config)
         .expect("transform should succeed")
         .codegen_module;
 

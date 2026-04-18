@@ -204,6 +204,25 @@ impl SoacEnvConfig {
         })
     }
 
+    pub fn with_specialization_mode(
+        mut self,
+        specialization_mode: Option<SpecializationMode>,
+    ) -> Self {
+        self.specialization_mode = specialization_mode;
+        self
+    }
+
+    pub fn with_soac_work_dir(mut self, soac_work_dir: Option<PathBuf>) -> Self {
+        self.soac_work_dir = soac_work_dir;
+        self
+    }
+
+    pub fn with_soac_log(mut self, soac_log: SoacLogConfig, explicit: bool) -> Self {
+        self.soac_log = soac_log;
+        self.soac_log_explicit = explicit;
+        self
+    }
+
     pub fn cranelift_opt_level(&self) -> &str {
         self.cranelift_opt_level.as_str()
     }
@@ -278,6 +297,29 @@ impl SoacEnvConfig {
 
     fn soac_log_has_explicit_value(&self) -> bool {
         self.soac_log_explicit
+    }
+}
+
+impl Default for SoacEnvConfig {
+    fn default() -> Self {
+        Self {
+            cranelift_opt_level: "speed".to_string(),
+            specialization_mode: None,
+            soac_work_dir: None,
+            profiled_cold_blocks_enabled: false,
+            jit_refcount_emission_enabled: true,
+            module_cache_dir: None,
+            compile_mode: CompileMode::Lazy,
+            jit_compile_workers: None,
+            background_jit_enabled: true,
+            jit_perf_helper_frames_enabled: false,
+            soac_exec_trace: None,
+            soac_log: SoacLogConfig {
+                filter: String::new(),
+                json_path: None,
+            },
+            soac_log_explicit: false,
+        }
     }
 }
 

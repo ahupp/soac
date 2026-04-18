@@ -89,26 +89,45 @@ where
 fn lower_python_to_blockpy_with_tracker_and_options<P>(
     source: &str,
     module_name_gen: ModuleNameGen,
-    mut pass_tracker: P,
+    pass_tracker: P,
     options: LoweringOptions,
 ) -> Result<LoweringResult<P>>
 where
     P: PassTracker,
 {
     let env_config = SoacEnvConfig::from_env().map_err(anyhow::Error::msg)?;
-    init_logging_with_config(&env_config).map_err(anyhow::Error::msg)?;
+    lower_python_to_blockpy_with_tracker_options_and_config(
+        source,
+        module_name_gen,
+        pass_tracker,
+        options,
+        &env_config,
+    )
+}
+
+fn lower_python_to_blockpy_with_tracker_options_and_config<P>(
+    source: &str,
+    module_name_gen: ModuleNameGen,
+    mut pass_tracker: P,
+    options: LoweringOptions,
+    env_config: &SoacEnvConfig,
+) -> Result<LoweringResult<P>>
+where
+    P: PassTracker,
+{
+    init_logging_with_config(env_config).map_err(anyhow::Error::msg)?;
     namegen::reset_namegen_state();
     let total_start = Instant::now();
 
     let codegen_module = if options == LoweringOptions::default() {
-        rewrite_module_with_tracker(source, module_name_gen, &mut pass_tracker, &env_config)?
+        rewrite_module_with_tracker(source, module_name_gen, &mut pass_tracker, env_config)?
     } else {
         rewrite_module_with_tracker_with_options(
             source,
             module_name_gen,
             &mut pass_tracker,
             options,
-            &env_config,
+            env_config,
         )?
     };
 
@@ -121,6 +140,19 @@ where
 
 pub fn lower_python_to_blockpy_for_testing(source: &str) -> Result<LoweringResult> {
     lower_python_to_blockpy_with_tracker(source, ModuleNameGen::new(0), RecordingPassTracker::new())
+}
+
+pub fn lower_python_to_blockpy_for_testing_with_config(
+    source: &str,
+    env_config: &SoacEnvConfig,
+) -> Result<LoweringResult> {
+    lower_python_to_blockpy_with_tracker_options_and_config(
+        source,
+        ModuleNameGen::new(0),
+        RecordingPassTracker::new(),
+        LoweringOptions::default(),
+        env_config,
+    )
 }
 
 pub fn lower_python_to_blockpy(
