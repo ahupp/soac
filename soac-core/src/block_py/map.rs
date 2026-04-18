@@ -69,7 +69,7 @@ where
     }
 }
 
-pub(crate) trait MapTerm<In, Out>: MapInstr<In, Out>
+pub trait MapTerm<In, Out>: MapInstr<In, Out>
 where
     In: Instr,
     Out: Instr,
@@ -106,7 +106,7 @@ where
 {
 }
 
-pub(crate) trait MapBlock<In, Out>: MapTerm<In, Out>
+pub trait MapBlock<In, Out>: MapTerm<In, Out>
 where
     In: Instr,
     Out: Instr,
@@ -134,7 +134,7 @@ where
 {
 }
 
-pub(crate) trait MapFunction<PIn, POut>: MapBlock<PIn::Instr, POut::Instr>
+pub trait MapFunction<PIn, POut>: MapBlock<PIn::Instr, POut::Instr>
 where
     PIn: ModuleShape,
     POut: ModuleShape,
@@ -167,7 +167,7 @@ where
 {
 }
 
-pub(crate) trait MapModule<PIn, POut>: MapFunction<PIn, POut>
+pub trait MapModule<PIn, POut>: MapFunction<PIn, POut>
 where
     PIn: ModuleShape,
     POut: ModuleShape<ModuleConstant = PIn::ModuleConstant>,
@@ -195,7 +195,7 @@ where
 {
 }
 
-pub(crate) fn map_function_blocks<PIn, POut>(
+pub fn map_function_blocks<PIn, POut>(
     func: BlockPyFunction<PIn>,
     mut map_block: impl FnMut(Block<PIn::Instr>) -> Block<POut::Instr>,
 ) -> BlockPyFunction<POut>
@@ -217,7 +217,7 @@ where
     }
 }
 
-pub(crate) fn map_module_functions<PIn, POut>(
+pub fn map_module_functions<PIn, POut>(
     module: BlockPyModule<PIn>,
     mut map_fn: impl FnMut(BlockPyFunction<PIn>) -> BlockPyFunction<POut>,
 ) -> BlockPyModule<POut>
@@ -234,7 +234,7 @@ where
     }
 }
 
-pub(crate) trait TryMapTerm<In, Out, Error>: TryMapInstr<In, Out, Error>
+pub trait TryMapTerm<In, Out, Error>: TryMapInstr<In, Out, Error>
 where
     In: Instr,
     Out: Instr,
@@ -274,7 +274,7 @@ where
 {
 }
 
-pub(crate) trait TryMapBlock<In, Out, Error>: TryMapTerm<In, Out, Error>
+pub trait TryMapBlock<In, Out, Error>: TryMapTerm<In, Out, Error>
 where
     In: Instr,
     Out: Instr,
@@ -302,8 +302,7 @@ where
 {
 }
 
-pub(crate) trait TryMapFunction<PIn, POut, Error>:
-    TryMapBlock<PIn::Instr, POut::Instr, Error>
+pub trait TryMapFunction<PIn, POut, Error>: TryMapBlock<PIn::Instr, POut::Instr, Error>
 where
     PIn: ModuleShape,
     POut: ModuleShape,
@@ -337,7 +336,7 @@ where
 }
 
 #[allow(dead_code)]
-pub(crate) trait TryMapModule<PIn, POut, Error>: TryMapFunction<PIn, POut, Error>
+pub trait TryMapModule<PIn, POut, Error>: TryMapFunction<PIn, POut, Error>
 where
     PIn: ModuleShape,
     POut: ModuleShape<ModuleConstant = PIn::ModuleConstant>,

@@ -1,3 +1,4 @@
+#[macro_export]
 macro_rules! define_operation {
     (
         $(#[$attrs:meta])*
@@ -90,7 +91,7 @@ macro_rules! define_operation {
         {
             fn visit_children<V>(&self, visitor: &mut V)
             where
-                V: crate::block_py::Visit<$expr_ty> + ?Sized,
+                V: $crate::block_py::Visit<$expr_ty> + ?Sized,
             {
                 #[allow(unused_variables)]
                 let _ = &visitor;
@@ -99,7 +100,7 @@ macro_rules! define_operation {
 
             fn visit_children_mut<V>(&mut self, visitor: &mut V)
             where
-                V: crate::block_py::VisitMut<$expr_ty> + ?Sized,
+                V: $crate::block_py::VisitMut<$expr_ty> + ?Sized,
             {
                 #[allow(unused_variables)]
                 let _ = &visitor;
@@ -226,14 +227,14 @@ macro_rules! define_operation {
         impl<E: Instr> ChildVisitable<E> for $name {
             fn visit_children<V>(&self, visitor: &mut V)
             where
-                V: crate::block_py::Visit<E> + ?Sized,
+                V: $crate::block_py::Visit<E> + ?Sized,
             {
                 let _ = &visitor;
             }
 
             fn visit_children_mut<V>(&mut self, visitor: &mut V)
             where
-                V: crate::block_py::VisitMut<E> + ?Sized,
+                V: $crate::block_py::VisitMut<E> + ?Sized,
             {
                 let _ = &visitor;
             }
@@ -954,6 +955,7 @@ macro_rules! define_operation {
     };
 }
 
+#[macro_export]
 macro_rules! define_ruff_operation {
     (
         $(#[$attrs:meta])*
@@ -994,5 +996,5 @@ macro_rules! define_ruff_operation {
     };
 }
 
-pub(crate) use define_operation;
-pub(crate) use define_ruff_operation;
+pub use crate::define_operation;
+pub use crate::define_ruff_operation;

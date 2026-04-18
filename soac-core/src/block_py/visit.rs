@@ -12,7 +12,7 @@ pub trait ChildVisitable<E: Instr>: Clone + std::fmt::Debug + Sized {
         V: crate::block_py::VisitMut<E> + ?Sized;
 }
 
-pub(crate) fn instr_any<I, F>(instr: &I, mut predicate: F) -> bool
+pub fn instr_any<I, F>(instr: &I, mut predicate: F) -> bool
 where
     I: Instr + ChildVisitable<I>,
     F: FnMut(&I) -> bool,
@@ -244,7 +244,7 @@ pub trait VisitMut<I: Instr> {
     }
 }
 
-pub(crate) fn walk_module<V, P>(visitor: &mut V, module: &BlockPyModule<P>)
+pub fn walk_module<V, P>(visitor: &mut V, module: &BlockPyModule<P>)
 where
     V: Visit<P::Instr> + ?Sized,
     P: ModuleShape,
@@ -255,7 +255,7 @@ where
     }
 }
 
-pub(crate) fn walk_module_mut<V, P>(visitor: &mut V, module: &mut BlockPyModule<P>)
+pub fn walk_module_mut<V, P>(visitor: &mut V, module: &mut BlockPyModule<P>)
 where
     V: VisitMut<P::Instr> + ?Sized,
     P: ModuleShape,
@@ -266,7 +266,7 @@ where
     }
 }
 
-pub(crate) fn walk_fn<V, P>(visitor: &mut V, func: &BlockPyFunction<P>)
+pub fn walk_fn<V, P>(visitor: &mut V, func: &BlockPyFunction<P>)
 where
     V: Visit<P::Instr> + ?Sized,
     P: ModuleShape,
@@ -277,7 +277,7 @@ where
     }
 }
 
-pub(crate) fn walk_fn_mut<V, P>(visitor: &mut V, func: &mut BlockPyFunction<P>)
+pub fn walk_fn_mut<V, P>(visitor: &mut V, func: &mut BlockPyFunction<P>)
 where
     V: VisitMut<P::Instr> + ?Sized,
     P: ModuleShape,
@@ -288,7 +288,7 @@ where
     }
 }
 
-pub(crate) fn walk_block<V, I>(visitor: &mut V, block: &Block<I>)
+pub fn walk_block<V, I>(visitor: &mut V, block: &Block<I>)
 where
     V: Visit<I> + ?Sized,
     I: Instr + ChildVisitable<I>,
@@ -305,7 +305,7 @@ where
     visitor.visit_term(&block.term);
 }
 
-pub(crate) fn walk_block_mut<V, I>(visitor: &mut V, block: &mut Block<I>)
+pub fn walk_block_mut<V, I>(visitor: &mut V, block: &mut Block<I>)
 where
     V: VisitMut<I> + ?Sized,
     I: Instr + ChildVisitable<I>,
@@ -322,7 +322,7 @@ where
     visitor.visit_term_mut(&mut block.term);
 }
 
-pub(crate) fn walk_stmt<V, I>(visitor: &mut V, stmt: &I)
+pub fn walk_stmt<V, I>(visitor: &mut V, stmt: &I)
 where
     V: Visit<I> + ?Sized,
     I: Instr + ChildVisitable<I>,
@@ -330,7 +330,7 @@ where
     visitor.visit_instr(stmt);
 }
 
-pub(crate) fn walk_stmt_mut<V, I>(visitor: &mut V, stmt: &mut I)
+pub fn walk_stmt_mut<V, I>(visitor: &mut V, stmt: &mut I)
 where
     V: VisitMut<I> + ?Sized,
     I: Instr + ChildVisitable<I>,
@@ -338,7 +338,7 @@ where
     visitor.visit_instr_mut(stmt);
 }
 
-pub(crate) fn walk_edge<V, I>(visitor: &mut V, edge: &BlockEdge)
+pub fn walk_edge<V, I>(visitor: &mut V, edge: &BlockEdge)
 where
     V: Visit<I> + ?Sized,
     I: Instr,
@@ -349,7 +349,7 @@ where
     }
 }
 
-pub(crate) fn walk_edge_mut<V, I>(visitor: &mut V, edge: &mut BlockEdge)
+pub fn walk_edge_mut<V, I>(visitor: &mut V, edge: &mut BlockEdge)
 where
     V: VisitMut<I> + ?Sized,
     I: Instr,
@@ -360,7 +360,7 @@ where
     }
 }
 
-pub(crate) fn walk_term<V, I>(visitor: &mut V, term: &BlockTerm<I>)
+pub fn walk_term<V, I>(visitor: &mut V, term: &BlockTerm<I>)
 where
     V: Visit<I> + ?Sized,
     I: Instr + ChildVisitable<I>,
@@ -374,7 +374,7 @@ where
     }
 }
 
-pub(crate) fn walk_term_mut<V, I>(visitor: &mut V, term: &mut BlockTerm<I>)
+pub fn walk_term_mut<V, I>(visitor: &mut V, term: &mut BlockTerm<I>)
 where
     V: VisitMut<I> + ?Sized,
     I: Instr + ChildVisitable<I>,
@@ -388,7 +388,7 @@ where
     }
 }
 
-pub(crate) fn walk_if_term<V, I>(visitor: &mut V, if_term: &TermIf<I>)
+pub fn walk_if_term<V, I>(visitor: &mut V, if_term: &TermIf<I>)
 where
     V: Visit<I> + ?Sized,
     I: Instr + ChildVisitable<I>,
@@ -398,7 +398,7 @@ where
     visitor.visit_label(&if_term.else_label);
 }
 
-pub(crate) fn walk_if_term_mut<V, I>(visitor: &mut V, if_term: &mut TermIf<I>)
+pub fn walk_if_term_mut<V, I>(visitor: &mut V, if_term: &mut TermIf<I>)
 where
     V: VisitMut<I> + ?Sized,
     I: Instr + ChildVisitable<I>,
@@ -408,7 +408,7 @@ where
     visitor.visit_label_mut(&mut if_term.else_label);
 }
 
-pub(crate) fn walk_branch_table_term<V, I>(visitor: &mut V, branch: &TermBranchTable<I>)
+pub fn walk_branch_table_term<V, I>(visitor: &mut V, branch: &TermBranchTable<I>)
 where
     V: Visit<I> + ?Sized,
     I: Instr + ChildVisitable<I>,
@@ -420,7 +420,7 @@ where
     visitor.visit_label(&branch.default_label);
 }
 
-pub(crate) fn walk_branch_table_term_mut<V, I>(visitor: &mut V, branch: &mut TermBranchTable<I>)
+pub fn walk_branch_table_term_mut<V, I>(visitor: &mut V, branch: &mut TermBranchTable<I>)
 where
     V: VisitMut<I> + ?Sized,
     I: Instr + ChildVisitable<I>,
@@ -432,7 +432,7 @@ where
     visitor.visit_label_mut(&mut branch.default_label);
 }
 
-pub(crate) fn walk_raise_term<V, I>(visitor: &mut V, raise_term: &TermRaise<I>)
+pub fn walk_raise_term<V, I>(visitor: &mut V, raise_term: &TermRaise<I>)
 where
     V: Visit<I> + ?Sized,
     I: Instr + ChildVisitable<I>,
@@ -442,7 +442,7 @@ where
     }
 }
 
-pub(crate) fn walk_raise_term_mut<V, I>(visitor: &mut V, raise_term: &mut TermRaise<I>)
+pub fn walk_raise_term_mut<V, I>(visitor: &mut V, raise_term: &mut TermRaise<I>)
 where
     V: VisitMut<I> + ?Sized,
     I: Instr + ChildVisitable<I>,
@@ -452,7 +452,7 @@ where
     }
 }
 
-pub(crate) fn walk_expr<V, I>(visitor: &mut V, expr: &I)
+pub fn walk_expr<V, I>(visitor: &mut V, expr: &I)
 where
     V: Visit<I> + ?Sized,
     I: Instr + ChildVisitable<I>,
@@ -460,7 +460,7 @@ where
     expr.visit_children(visitor);
 }
 
-pub(crate) fn walk_expr_mut<V, I>(visitor: &mut V, expr: &mut I)
+pub fn walk_expr_mut<V, I>(visitor: &mut V, expr: &mut I)
 where
     V: VisitMut<I> + ?Sized,
     I: Instr + ChildVisitable<I>,

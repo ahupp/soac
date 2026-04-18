@@ -1,5 +1,23 @@
+#[allow(unused_imports)]
+pub use self::map::{
+    MapBlock, MapFunction, MapInstr, MapModule, MapTerm, Mappable, TryMapBlock, TryMapFunction,
+    TryMapInstr, TryMapModule, TryMapTerm, map_function_blocks, map_module_functions,
+};
 pub use self::meta::{
     HasMeta, HasSemanticInstrId, IdentifiedInstr, InstrId, InstrKey, Meta, WithMeta,
+};
+pub use self::operation::{
+    Await, BinOp, BinOpKind, Call, CallDirect, CalleeFunctionId, CellRef, CellRefForName, Del,
+    DelItem, ExprAttribute, ExprBoolOp, ExprBooleanLiteral, ExprBytesLiteral, ExprCompare,
+    ExprDict, ExprDictComp, ExprEllipsisLiteral, ExprFString, ExprGenerator, ExprIf,
+    ExprIpyEscapeCommand, ExprLambda, ExprList, ExprListComp, ExprName, ExprNamed, ExprNoneLiteral,
+    ExprNumberLiteral, ExprSet, ExprSetComp, ExprSlice, ExprStarred, ExprStringLiteral,
+    ExprSubscript, ExprTString, ExprTuple, GetAttr, GetItem, Load, MakeCell, MakeFunction,
+    MakeFunctionWithClosure, SetAttr, SetItem, StmtAnnAssign, StmtAssert, StmtAssign,
+    StmtAugAssign, StmtBreak, StmtClassDef, StmtContinue, StmtDelete, StmtExpr, StmtFor,
+    StmtFunctionDef, StmtGlobal, StmtIf, StmtImport, StmtImportFrom, StmtIpyEscapeCommand,
+    StmtMatch, StmtNonlocal, StmtPass, StmtRaise, StmtReturn, StmtTry, StmtTypeAlias, StmtWhile,
+    StmtWith, Store, Tuple, UnaryOp, UnaryOpKind, Yield, YieldFrom,
 };
 pub use self::param_specs::{Param, ParamDefaultSource, ParamKind, ParamSpec};
 pub use self::scope::{
@@ -7,15 +25,25 @@ pub use self::scope::{
     CellBindingKind, CellCaptureBinding, ClassBodyFallback, ClosureInit, ClosureSlot,
     EffectiveBinding, StorageLayout, derive_effective_binding_for_name,
 };
+#[allow(unused_imports)]
+pub use self::visit::{
+    ChildVisitable, Visit, VisitMut, instr_any, walk_block, walk_block_mut, walk_expr,
+    walk_expr_mut, walk_fn, walk_fn_mut, walk_module, walk_module_mut, walk_stmt, walk_stmt_mut,
+    walk_term, walk_term_mut,
+};
 pub use ruff_python_ast::Expr;
 use ruff_python_ast::{self as ast};
 use std::fmt;
 
 mod counters;
+pub mod map;
 mod meta;
 mod name_gen;
+pub mod operation;
+pub mod operation_macro;
 pub mod param_specs;
 pub mod scope;
+pub mod visit;
 pub use counters::{CounterDef, CounterId, CounterScope, CounterSite, DeoptEntrySource};
 pub use name_gen::{
     BlockLabel, FunctionNameGen, LocalFunctionId, ModuleContentId, ModuleNameGen,

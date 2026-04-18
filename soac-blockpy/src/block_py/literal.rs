@@ -1,5 +1,5 @@
-use super::operation_macro::define_operation;
 use super::*;
+use soac_core::block_py::operation_macro::define_operation;
 use std::fmt;
 
 #[derive(Clone, derive_more::From, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]

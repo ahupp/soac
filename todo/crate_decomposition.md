@@ -40,16 +40,18 @@ high-churn implementation code so common edits rebuild less of the workspace.
 
 Own the first stable BlockPy model slice from the `soac-ir` proposal.
 
-Completed: added the `soac-core` workspace crate and moved context-free BlockPy model
-infrastructure there. `soac-blockpy` remains the lowering facade and re-exports these model types
-while keeping concrete instruction payloads, visitor/mapping helpers, CFG rewrites, validation,
-pretty-printing, and pass-specific lowering code local to `soac-blockpy`.
+Completed: added the `soac-core` workspace crate and moved context-free BlockPy model,
+instruction-operation, visitor, and mapping infrastructure there. `soac-blockpy` remains the
+lowering facade and re-exports these core types while keeping concrete pass instruction enums, CFG
+rewrites, validation, pretty-printing, and pass-specific lowering code local to `soac-blockpy`.
 
 Contents:
 
 - `BlockPyModule`, `BlockPyFunction`, blocks, terms, edges, and block params
 - module/function/runtime ids and name generators
 - source metadata and semantic instruction ids
+- core instruction trait plus generic operation payloads and operation macros
+- generic instruction visitor and mapping traits/helpers
 - parameter specs
 - scope/storage-layout data
 - counter site definitions
@@ -64,7 +66,7 @@ not happened yet.
 
 Likely contents:
 
-- BlockPy module/function/instruction/term types
+- remaining pass-specific instruction payloads
 - `FunctionId` and other stable ids
 - storage/location payloads
 - typed instruction payloads

@@ -4,13 +4,9 @@ pub use soac_core::block_py::{param_specs, scope};
 pub(crate) mod cfg;
 mod counters;
 mod literal;
-mod map;
-pub mod operation;
-mod operation_macro;
 pub mod pretty;
 mod scope_impls;
 pub(crate) mod validate;
-mod visit;
 
 pub use crate::passes::{
     InstrCodegen, InstrCodegenOp, InstrLow, InstrResolved, InstrRuff, InstrUnresolved,
@@ -22,36 +18,12 @@ pub use literal::{
     BytesLiteral, IntLiteral, Literal, LiteralValue, NumberLiteral, NumberLiteralValue,
     StringLiteral,
 };
-#[allow(unused_imports)]
-pub(crate) use map::{
-    map_function_blocks, map_module_functions, MapBlock, MapFunction, MapModule, MapTerm,
-    TryMapBlock, TryMapFunction, TryMapModule, TryMapTerm,
-};
-pub use map::{MapInstr, Mappable, TryMapInstr};
-pub use operation::{
-    Await, BinOp, BinOpKind, Call, CallDirect, CalleeFunctionId, CellRef, CellRefForName, Del,
-    DelItem, ExprAttribute, ExprBoolOp, ExprBooleanLiteral, ExprBytesLiteral, ExprCompare,
-    ExprDict, ExprDictComp, ExprEllipsisLiteral, ExprFString, ExprGenerator, ExprIf,
-    ExprIpyEscapeCommand, ExprLambda, ExprList, ExprListComp, ExprName, ExprNamed, ExprNoneLiteral,
-    ExprNumberLiteral, ExprSet, ExprSetComp, ExprSlice, ExprStarred, ExprStringLiteral,
-    ExprSubscript, ExprTString, ExprTuple, GetAttr, GetItem, Load, MakeCell, MakeFunction,
-    MakeFunctionWithClosure, SetAttr, SetItem, StmtAnnAssign, StmtAssert, StmtAssign,
-    StmtAugAssign, StmtBreak, StmtClassDef, StmtContinue, StmtDelete, StmtExpr, StmtFor,
-    StmtFunctionDef, StmtGlobal, StmtIf, StmtImport, StmtImportFrom, StmtIpyEscapeCommand,
-    StmtMatch, StmtNonlocal, StmtPass, StmtRaise, StmtReturn, StmtTry, StmtTypeAlias, StmtWhile,
-    StmtWith, Store, Tuple, UnaryOp, UnaryOpKind, Yield, YieldFrom,
-};
 pub(crate) use scope_impls::{
     build_storage_layout_from_capture_names, compute_make_function_capture_bindings_from_scope,
     compute_storage_layout_from_scope, is_runtime_closure_name, ScopeExprNode,
 };
+pub use soac_core::block_py::operation;
 pub(crate) use validate::validate_module;
-#[allow(unused_imports)]
-pub(crate) use visit::{
-    instr_any, walk_block, walk_block_mut, walk_expr, walk_expr_mut, walk_fn, walk_fn_mut,
-    walk_module, walk_module_mut, walk_stmt, walk_stmt_mut, walk_term, walk_term_mut,
-};
-pub use visit::{ChildVisitable, Visit, VisitMut};
 
 pub type ResolvedStorageBlock = Block<InstrResolved>;
 pub type CodegenBlock = Block<InstrCodegen>;
