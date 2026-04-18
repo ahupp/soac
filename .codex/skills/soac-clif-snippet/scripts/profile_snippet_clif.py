@@ -48,11 +48,19 @@ def main() -> int:
 
     function_id = lookup_function_id(source_path, target_name)
     specializations = inspect_specializations(profile_dump)
+    pre_inline_clif = render_specialized_clif(
+        module_name=module_name,
+        source_path=source_path,
+        function_id=function_id,
+        counters_dir=counters_dir,
+        pre_inline=True,
+    )
     clif = render_specialized_clif(
         module_name=module_name,
         source_path=source_path,
         function_id=function_id,
         counters_dir=counters_dir,
+        pre_inline=False,
     )
     instr_typed = render_specialized_instr_typed(
         module_name=module_name,
@@ -62,12 +70,14 @@ def main() -> int:
     )
 
     specializations_path = artifact_dir / "specializations.txt"
+    pre_inline_clif_path = artifact_dir / "pre_inline.clif"
     clif_path = artifact_dir / "specialized.clif"
     instr_typed_path = artifact_dir / "instr_typed.txt"
     context_path = artifact_dir / "annotation_context.md"
     metadata_path = artifact_dir / "metadata.json"
 
     specializations_path.write_text(specializations, encoding="utf-8")
+    pre_inline_clif_path.write_text(pre_inline_clif, encoding="utf-8")
     clif_path.write_text(clif, encoding="utf-8")
     instr_typed_path.write_text(instr_typed, encoding="utf-8")
     metadata = {
@@ -80,6 +90,7 @@ def main() -> int:
         "result_repr": result_repr,
         "profile_dump": str(profile_dump),
         "specializations_path": str(specializations_path),
+        "pre_inline_clif_path": str(pre_inline_clif_path),
         "clif_path": str(clif_path),
         "instr_typed_path": str(instr_typed_path),
         "annotation_context_path": str(context_path),
@@ -91,6 +102,7 @@ def main() -> int:
             source=source_path.read_text(encoding="utf-8"),
             specializations=specializations,
             instr_typed=instr_typed,
+            pre_inline_clif=pre_inline_clif,
             clif=clif,
         ),
         encoding="utf-8",
@@ -98,6 +110,7 @@ def main() -> int:
 
     print(f"artifact_dir: {artifact_dir}")
     print(f"annotation_context: {context_path}")
+    print(f"pre_inline_clif: {pre_inline_clif_path}")
     print(f"specialized_clif: {clif_path}")
     print(f"instr_typed: {instr_typed_path}")
     print(f"specializations: {specializations_path}")
@@ -255,21 +268,24 @@ def render_specialized_clif(
     source_path: Path,
     function_id: str,
     counters_dir: Path,
+    pre_inline: bool,
 ) -> str:
     env = {
         **os.environ,
         "SOAC_WORK_DIR": str(counters_dir),
         "SOAC_OPT_MODE": "apply",
     }
-    return run_inspector(
+    args = [
         "render_jit_clif",
         "--specialized",
         "--module-name",
         module_name,
         str(source_path),
         function_id,
-        env=env,
-    ).stdout
+    ]
+    if pre_inline:
+        args.insert(2, "--pre-inline")
+    return run_inspector(*args, env=env).stdout
 
 
 def render_specialized_instr_typed(
@@ -326,17 +342,19 @@ def annotation_context(
     source: str,
     specializations: str,
     instr_typed: str,
+    pre_inline_clif: str,
     clif: str,
 ) -> str:
     return f"""# SOAC CLIF Annotation Context
 
 ## Instructions
 
-Annotate the specialized CLIF below. Preserve CLIF order and add `;` comments
-before each block and beside important instructions. Explain guards, fast paths,
-slow paths, exception edges, helper calls, refcount cleanup, and direct indexed
-access. Use the source and counter context as evidence; mark uncertain block
-purposes as inferred.
+Annotate the specialized CLIF below. Prefer the pre-inlining CLIF when explaining
+semantically meaningful helper calls, because runtime support calls are still
+visible there. Preserve CLIF order and add `;` comments before each block and
+beside important instructions. Explain guards, fast paths, slow paths, exception
+edges, helper calls, refcount cleanup, and direct indexed access. Use the source
+and counter context as evidence; mark uncertain block purposes as inferred.
 
 ## Metadata
 
@@ -360,6 +378,12 @@ purposes as inferred.
 
 ```text
 {instr_typed.rstrip()}
+```
+
+## Pre-Inlining Specialized CLIF
+
+```clif
+{pre_inline_clif.rstrip()}
 ```
 
 ## Specialized CLIF

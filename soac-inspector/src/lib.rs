@@ -65,6 +65,8 @@ struct SpeedscopeProfileRequest {
 
 #[derive(Serialize)]
 pub struct JitClifResponse {
+    #[serde(rename = "preInlineClif")]
+    pub pre_inline_clif: String,
     pub clif: String,
     #[serde(rename = "cfgDot")]
     pub cfg_dot: String,
@@ -668,6 +670,7 @@ pub fn render_jit_clif_for_module_with_options(
         ))
     })?;
     Ok(JitClifResponse {
+        pre_inline_clif: rendered.pre_inline_clif,
         clif: rendered.clif,
         cfg_dot: rendered.cfg_dot,
         vcode_disasm: rendered.vcode_disasm,

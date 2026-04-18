@@ -1538,6 +1538,7 @@ impl<'a> FuncBuildImports<'a> {
 
 #[derive(Debug, Clone)]
 pub struct RenderedSpecializedClif {
+    pub pre_inline_clif: String,
     pub clif: String,
     pub cfg_dot: String,
     pub vcode_disasm: String,
@@ -27269,6 +27270,11 @@ pub unsafe fn render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
         out.push('\n');
     }
     out.push('\n');
+    let pre_inline_clif = render_pre_inline_clif_for_inspection(
+        &built.ctx.func,
+        &built.import_id_to_symbol,
+        &built.block_annotations,
+    );
     let (compiled_clif, cfg_dot, vcode_disasm) = render_compiled_clif_and_vcode_disasm(
         &mut jit_module,
         built.ctx,
@@ -27277,10 +27283,30 @@ pub unsafe fn render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
     )?;
     out.push_str(&compiled_clif);
     Ok(RenderedSpecializedClif {
+        pre_inline_clif,
         clif: out,
         cfg_dot,
         vcode_disasm,
     })
+}
+
+fn render_pre_inline_clif_for_inspection(
+    func: &ir::Function,
+    import_id_to_symbol: &HashMap<u32, &'static str>,
+    block_annotations: &ClifBlockDisplayAnnotations,
+) -> String {
+    let mut clif = String::new();
+    clif.push_str("; ---- pre-inlining CLIF for inspection ----\n");
+    clif.push_str(
+        "; emitted after SOAC typed codegen and before runtime support CLIF inlining and Cranelift optimization\n",
+    );
+    let clif_display =
+        rewrite_import_fn_aliases(func.display().to_string().as_str(), import_id_to_symbol);
+    clif.push_str(&rewrite_block_header_annotations(
+        &clif_display,
+        block_annotations,
+    ));
+    clif
 }
 
 fn render_compiled_clif_and_vcode_disasm(

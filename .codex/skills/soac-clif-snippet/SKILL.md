@@ -1,6 +1,6 @@
 ---
 name: soac-clif-snippet
-description: Profile a small Python code snippet with an example workload, render specialized SOAC CLIF, annotate the CLIF inline, and answer follow-up questions about the generated blocks, guards, counters, and optimization decisions.
+description: Profile a small Python code snippet with an example workload, render pre-inlining and final specialized SOAC CLIF, annotate the CLIF inline, and answer follow-up questions about the generated blocks, guards, counters, helper calls, and optimization decisions.
 ---
 
 # SOAC CLIF Snippet
@@ -37,11 +37,16 @@ If the workload call does not directly identify the function to inspect, pass
 - module/function metadata
 - decoded specialization counters
 - InstrTyped input to specialized codegen
+- pre-inlining specialized CLIF, before runtime support CLIF inlining and
+  Cranelift optimization
 - specialized CLIF
 
 3. Produce annotated CLIF in the answer:
 
 - Return CLIF with comments, not a prose-only summary.
+- Use `pre_inline.clif` to explain semantically meaningful helper calls, because
+  runtime support calls are still visible before inlining. Use
+  `specialized.clif` for the final optimized block/control-flow shape.
 - Preserve CLIF order and original instructions as much as practical.
 - Add a short comment before each block explaining what the block does.
 - Add inline comments for guards, fast paths, slow paths, exception edges,
@@ -64,6 +69,7 @@ The script writes one directory under `work/logs/soac-clif-snippets/`:
 - `counters/profile.bin`
 - `specializations.txt`
 - `instr_typed.txt`
+- `pre_inline.clif`
 - `specialized.clif`
 - `annotation_context.md`
 - `metadata.json`

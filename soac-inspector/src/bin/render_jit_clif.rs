@@ -17,6 +17,7 @@ struct Args {
     vcode_out: Option<PathBuf>,
     debug_plan: bool,
     specialized: bool,
+    pre_inline: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -26,6 +27,7 @@ fn parse_args() -> Result<Args, String> {
     let mut vcode_out = None;
     let mut debug_plan = false;
     let mut specialized = false;
+    let mut pre_inline = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -53,6 +55,9 @@ fn parse_args() -> Result<Args, String> {
             "--specialized" => {
                 specialized = true;
             }
+            "--pre-inline" => {
+                pre_inline = true;
+            }
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);
@@ -78,15 +83,19 @@ fn parse_args() -> Result<Args, String> {
         vcode_out,
         debug_plan,
         specialized,
+        pre_inline,
     })
 }
 
 fn print_usage() {
     eprintln!(
-        "usage: render_jit_clif <source> <function_id> [--module-name NAME] [--cfg-dot-out PATH] [--vcode-out PATH] [--debug-plan] [--specialized]"
+        "usage: render_jit_clif <source> <function_id> [--module-name NAME] [--cfg-dot-out PATH] [--vcode-out PATH] [--debug-plan] [--specialized] [--pre-inline]"
     );
     eprintln!(
         "       --specialized renders the second-pass shape using SOAC_WORK_DIR + SOAC_OPT_MODE=apply"
+    );
+    eprintln!(
+        "       --pre-inline prints the CLIF before runtime support inlining and Cranelift optimization"
     );
 }
 
@@ -161,8 +170,13 @@ fn main() -> Result<(), String> {
         fs::write(&path, rendered.vcode_disasm.as_bytes())
             .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
     }
-    print!("{}", rendered.clif);
-    if !rendered.clif.ends_with('\n') {
+    let clif = if args.pre_inline {
+        &rendered.pre_inline_clif
+    } else {
+        &rendered.clif
+    };
+    print!("{clif}");
+    if !clif.ends_with('\n') {
         println!();
     }
     Ok(())
