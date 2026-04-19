@@ -1,4 +1,3 @@
-#[macro_export]
 macro_rules! py_stmt_internal {
     ($template:literal $(, $name:ident = $value:expr)* $(,)?) => {{
         use std::collections::HashMap;
@@ -27,7 +26,6 @@ macro_rules! py_stmt_internal {
     }};
 }
 
-#[macro_export]
 macro_rules! py_stmts_internal {
     ($template:literal $(, $name:ident = $value:expr)* $(,)?) => {{
         use std::collections::HashMap;
@@ -55,7 +53,6 @@ macro_rules! py_stmts_internal {
     }};
 }
 
-#[macro_export]
 macro_rules! py_expr {
     ($template:literal $(, $name:ident = $value:expr)* $(,)?) => {{
         use ruff_python_ast::{self as ast, Stmt};
@@ -76,27 +73,31 @@ macro_rules! py_expr {
     }};
 }
 
-#[macro_export]
 macro_rules! py_stmt {
     ($template:literal $(, $name:ident = $value:expr)* $(,)?) => {{
             $crate::py_stmt_internal!($template $(, $name = $value)*)
     }};
 }
 
-#[macro_export]
 macro_rules! py_stmts {
     ($template:literal $(, $name:ident = $value:expr)* $(,)?) => {{
             $crate::py_stmts_internal!($template $(, $name = $value)*)
     }};
 }
 
-#[macro_export]
 macro_rules! py_stmt_typed {
     ($template:literal $(, $name:ident = $value:expr)* $(,)?) => {{
         let stmt = $crate::py_stmt_internal!($template $(, $name = $value)*);
         $crate::template::expect_stmt::<_>(stmt, $template)
     }};
 }
+
+pub(crate) use py_expr;
+pub(crate) use py_stmt;
+pub(crate) use py_stmt_internal;
+pub(crate) use py_stmt_typed;
+pub(crate) use py_stmts;
+pub(crate) use py_stmts_internal;
 
 use crate::passes::ast_to_ast::body::Suite;
 use crate::transformer::{walk_expr, walk_keyword, walk_parameter, walk_stmt, Transformer};

@@ -102,7 +102,7 @@ pub(crate) fn run_transform_fixture_tests(fixture: &str) {
 fn blockpy_output_for_snapshot(actual: &str) -> String {
     let mut output = lower_python_to_blockpy_for_testing(actual)
         .map(|result| {
-            crate::block_py::pretty::blockpy_module_to_string(
+            crate::block_py::blockpy_module_to_string(
                 result
                     .pass_tracker
                     .pass_core_blockpy_with_await_and_yield()

@@ -31,19 +31,20 @@ pub use self::visit::{
     walk_expr_mut, walk_fn, walk_fn_mut, walk_module, walk_module_mut, walk_stmt, walk_stmt_mut,
     walk_term, walk_term_mut,
 };
+pub use crate::{define_operation, define_ruff_operation};
 pub use ruff_python_ast::Expr;
 use ruff_python_ast::{self as ast};
 use std::fmt;
 
 mod counters;
-pub mod map;
+mod map;
 mod meta;
 mod name_gen;
-pub mod operation;
-pub mod operation_macro;
-pub mod param_specs;
-pub mod scope;
-pub mod visit;
+mod operation;
+mod operation_macro;
+mod param_specs;
+mod scope;
+mod visit;
 pub use counters::{CounterDef, CounterId, CounterScope, CounterSite, DeoptEntrySource};
 pub use name_gen::{
     BlockLabel, FunctionNameGen, LocalFunctionId, ModuleContentId, ModuleNameGen,

@@ -1,4 +1,4 @@
-use crate::block_py::pretty::BlockPyPrettyPrint;
+use crate::block_py::BlockPyPrettyPrint;
 use crate::block_py::{
     instr_any, Block, BlockPyFunction, BlockPyModule, BlockTerm, HasMeta, InstrCodegen,
     InstrCodegenOp, InstrId, InstrResolved, Literal, LocalLocation, NameLike, NameLocation,

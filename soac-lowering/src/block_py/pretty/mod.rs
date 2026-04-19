@@ -2,7 +2,7 @@ use super::{
     Block, BlockArg, BlockEdge, BlockLabel, BlockParamRole, BlockPyFunction, BlockPyModule,
     BlockTerm, FunctionKind, Instr, ModuleShape, TermIf, TermRaise,
 };
-use crate::block_py::param_specs::{ParamKind, ParamSpec};
+use crate::block_py::{ParamKind, ParamSpec};
 use crate::passes::{
     CodegenModuleShape, CoreModuleShape, CoreModuleShapeWithAwaitAndYield,
     CoreModuleShapeWithYield, ResolvedStorageModuleShape,

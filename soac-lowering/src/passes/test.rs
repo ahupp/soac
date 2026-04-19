@@ -1,4 +1,4 @@
-use crate::block_py::pretty::BlockPyPrettyPrint;
+use crate::block_py::BlockPyPrettyPrint;
 use crate::block_py::{
     instr_any, BlockPyFunction, BlockPyModule, BlockTerm, Call, CallArgKeyword, CallArgPositional,
     CallableScopeKind, CellBindingKind, CellLocation, ChildVisitable, FunctionExecutionMode,
@@ -99,7 +99,7 @@ fn tracked_core_blockpy_with_yield_only(source: &str) -> BlockPyModule<CoreModul
 
 fn assert_all_targets_present<P, S>(module: &BlockPyModule<P>)
 where
-    P: crate::block_py::ModuleShape<Instr = S> + crate::block_py::pretty::BlockPyPrettyPrinter,
+    P: crate::block_py::ModuleShape<Instr = S> + crate::block_py::BlockPyPrettyPrinter,
     S: crate::block_py::Instr + std::fmt::Debug,
     P::Instr: std::fmt::Debug,
 {
@@ -234,7 +234,7 @@ fn slot_by_name<'a>(slots: &'a [ClosureSlot], logical_name: &str) -> &'a Closure
 }
 
 fn expr_text(expr: &impl std::fmt::Debug) -> String {
-    crate::block_py::pretty::bb_expr_text(expr)
+    crate::block_py::bb_expr_text(expr)
 }
 
 fn callable_def_by_name<'a>(
@@ -3377,7 +3377,7 @@ class Field:
             .pass_core_blockpy_with_await_and_yield()
             .cloned()
             .expect("expected lowered core BlockPy module");
-        let blockpy_rendered = crate::block_py::pretty::blockpy_module_to_string(&blockpy);
+        let blockpy_rendered = crate::block_py::blockpy_module_to_string(&blockpy);
         eprintln!("==== {name} BLOCKPY ====\n{blockpy_rendered}");
 
         let bb_module = tracked_name_binding_module(source)

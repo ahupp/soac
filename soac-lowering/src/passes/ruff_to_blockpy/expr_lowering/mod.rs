@@ -1,7 +1,7 @@
 use crate::block_py::{
-    core_runtime_positional_call_expr_with_meta, literal_expr, operation, Del, FunctionKind,
-    HasMeta, InstrWithAwaitAndYield, InstrWithConstantNone, Meta, RuntimeFunctionId, Store,
-    StringLiteral, UnresolvedName, WithMeta,
+    core_runtime_positional_call_expr_with_meta, literal_expr, Del, FunctionKind, HasMeta,
+    InstrWithAwaitAndYield, InstrWithConstantNone, Meta, RuntimeFunctionId, Store, StringLiteral,
+    UnresolvedName, WithMeta,
 };
 use crate::namegen::fresh_name;
 use crate::passes::ast_to_ast::string_templates::lower_string_templates_in_instr_ruff;
@@ -87,8 +87,8 @@ pub(crate) trait RuffToBlockPyExpr:
     ) -> Self;
 }
 
-fn inplace_kind(op: ast::Operator) -> Option<operation::BinOpKind> {
-    Some(operation::BinOpKind::from_ast_inplace_operator(op))
+fn inplace_kind(op: ast::Operator) -> Option<crate::block_py::BinOpKind> {
+    Some(crate::block_py::BinOpKind::from_ast_inplace_operator(op))
 }
 
 impl RuffToBlockPyExpr for InstrWithAwaitAndYield {
@@ -116,7 +116,7 @@ impl RuffToBlockPyExpr for InstrWithAwaitAndYield {
         let meta = Meta::new(node_index.clone(), range);
         let kind = inplace_kind(op)
             .expect("direct augassign lowering should support every Python inplace operator");
-        operation::BinOp::new(kind, Box::new(left), Box::new(right))
+        crate::block_py::BinOp::new(kind, Box::new(left), Box::new(right))
             .with_meta(meta)
             .into()
     }
@@ -128,7 +128,7 @@ impl RuffToBlockPyExpr for InstrWithAwaitAndYield {
         attr: String,
     ) -> Self {
         let attr_expr = string_literal_expr(node_index.clone(), range, attr);
-        operation::GetAttr::new(Box::new(value), Box::new(attr_expr))
+        crate::block_py::GetAttr::new(Box::new(value), Box::new(attr_expr))
             .with_meta(Meta::new(node_index, range))
             .into()
     }
@@ -141,7 +141,7 @@ impl RuffToBlockPyExpr for InstrWithAwaitAndYield {
         replacement: Self,
     ) -> Self {
         let attr_expr = string_literal_expr(node_index.clone(), range, attr);
-        operation::SetAttr::new(Box::new(value), Box::new(attr_expr), Box::new(replacement))
+        crate::block_py::SetAttr::new(Box::new(value), Box::new(attr_expr), Box::new(replacement))
             .with_meta(Meta::new(node_index, range))
             .into()
     }
@@ -152,7 +152,7 @@ impl RuffToBlockPyExpr for InstrWithAwaitAndYield {
         value: Self,
         index: Self,
     ) -> Self {
-        operation::GetItem::new(Box::new(value), Box::new(index))
+        crate::block_py::GetItem::new(Box::new(value), Box::new(index))
             .with_meta(Meta::new(node_index, range))
             .into()
     }
@@ -164,7 +164,7 @@ impl RuffToBlockPyExpr for InstrWithAwaitAndYield {
         index: Self,
         replacement: Self,
     ) -> Self {
-        operation::SetItem::new(Box::new(value), Box::new(index), Box::new(replacement))
+        crate::block_py::SetItem::new(Box::new(value), Box::new(index), Box::new(replacement))
             .with_meta(Meta::new(node_index, range))
             .into()
     }
@@ -175,7 +175,7 @@ impl RuffToBlockPyExpr for InstrWithAwaitAndYield {
         value: Self,
         index: Self,
     ) -> Self {
-        operation::DelItem::new(Box::new(value), Box::new(index))
+        crate::block_py::DelItem::new(Box::new(value), Box::new(index))
             .with_meta(Meta::new(node_index, range))
             .into()
     }
@@ -270,7 +270,7 @@ fn lowered_helper_call<'a>(
     expr: &'a InstrRuff,
     expected_name: &str,
     arity: usize,
-) -> Option<&'a operation::Call<InstrRuff>> {
+) -> Option<&'a crate::block_py::Call<InstrRuff>> {
     let InstrRuff::Call(call) = expr else {
         return None;
     };
@@ -310,7 +310,7 @@ fn lower_direct_core_helper_expr(expr: &InstrRuff) -> Option<InstrWithAwaitAndYi
         let function_id = make_function_id_from_literal(function_id_expr)?;
         let kind = make_function_kind_from_literal(kind_expr)?;
         return Some(
-            operation::MakeFunction::new(
+            crate::block_py::MakeFunction::new(
                 function_id,
                 kind,
                 Box::new(lowered(param_defaults_expr.clone())),
@@ -329,7 +329,7 @@ fn lower_direct_core_helper_expr(expr: &InstrRuff) -> Option<InstrWithAwaitAndYi
             return None;
         };
         return Some(
-            operation::Store::new(
+            crate::block_py::Store::new(
                 ast::name::Name::new(string_literal_value(name_expr)?),
                 Box::new(lowered(value_expr.clone())),
             )
@@ -343,7 +343,7 @@ fn lower_direct_core_helper_expr(expr: &InstrRuff) -> Option<InstrWithAwaitAndYi
             return None;
         };
         return Some(
-            operation::CellRefForName::new(string_literal_value(name_expr)?)
+            crate::block_py::CellRefForName::new(string_literal_value(name_expr)?)
                 .with_meta(call.meta())
                 .into(),
         );

@@ -1,4 +1,4 @@
-use crate::block_py::pretty::BlockPyPrettyPrint;
+use crate::block_py::BlockPyPrettyPrint;
 use crate::block_py::{BlockPyModule, CounterScope, ModuleNameGen};
 use crate::codegen_cache::{
     load_codegen_module_cache, remap_cached_codegen_module_function_ids,

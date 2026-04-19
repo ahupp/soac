@@ -1,8 +1,9 @@
 use pyo3::ffi;
 use pyo3::prelude::*;
+use soac_core::block_py as blockpy_intrinsics;
 use soac_core::block_py::{
     AbruptKind, BlockArg, BlockPyFunction, BlockPyModule, BlockTerm, CallArgKeyword,
-    ChildVisitable, NameLike, ParamDefaultSource, RuntimeName, operation as blockpy_intrinsics,
+    ChildVisitable, NameLike, ParamDefaultSource, RuntimeName,
 };
 use soac_lowering::block_py::{Literal, NumberLiteralValue};
 use soac_lowering::passes::{CodegenModuleShape, InstrCodegen, InstrResolved};

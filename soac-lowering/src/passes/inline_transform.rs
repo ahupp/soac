@@ -1681,7 +1681,7 @@ fn scalar_initializer_for_field(
             };
             let arg = arg_locals.get(call_arg_index)?;
             Some(clear_codegen_instr_id(
-                crate::block_py::operation::Load::new(arg.local.resolved_name()).into(),
+                crate::block_py::Load::new(arg.local.resolved_name()).into(),
             ))
         }
         ConstructorFieldValue::Local { .. }
@@ -1734,7 +1734,7 @@ fn rewrite_scalarized_instr_root(
             let field_name = constant_string_from_constants(constants, &getattr.attr)?;
             let field = allocation.fields.get(field_name.as_str())?;
             Some(clear_codegen_instr_id(
-                crate::block_py::operation::Load::new(field.resolved_name()).into(),
+                crate::block_py::Load::new(field.resolved_name()).into(),
             ))
         }
         InstrCodegenOp::SetAttr(setattr)
@@ -1758,8 +1758,7 @@ fn rewrite_scalarized_instr_root(
             }
             let field_name = constant_string_from_constants(constants, &getattr.attr)?;
             let field = allocation.fields.get(field_name.as_str())?;
-            let field_load: InstrCodegen =
-                crate::block_py::operation::Load::new(field.resolved_name()).into();
+            let field_load: InstrCodegen = crate::block_py::Load::new(field.resolved_name()).into();
             let meta = store.meta();
             Some(clear_codegen_instr_id(
                 Store::new(store.name, field_load).with_meta(meta).into(),
@@ -1815,7 +1814,7 @@ fn rewrite_scalarized_term(
             let field_name = constant_string_from_constants(constants, &getattr.attr)?;
             let field = allocation.fields.get(field_name.as_str())?;
             Some(BlockTerm::Return(clear_codegen_instr_id(
-                crate::block_py::operation::Load::new(field.resolved_name()).into(),
+                crate::block_py::Load::new(field.resolved_name()).into(),
             )))
         }
         BlockTerm::IfTerm(term) => {

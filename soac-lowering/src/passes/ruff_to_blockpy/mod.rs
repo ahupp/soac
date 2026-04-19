@@ -1,7 +1,7 @@
 use crate::block_py::cfg::{
     fold_jumps_to_trivial_return_blockpy, prune_unreachable_blockpy_blocks,
 };
-use crate::block_py::param_specs::ParamSpec;
+use crate::block_py::ParamSpec;
 use crate::block_py::{
     Block, BlockBuilder, BlockEdge, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm,
     CallableScopeInfo, FunctionExecutionMode, FunctionKind, FunctionName, FunctionNameGen, Instr,

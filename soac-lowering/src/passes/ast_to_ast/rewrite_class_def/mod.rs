@@ -1,6 +1,6 @@
-pub mod class_body;
-pub mod method;
-pub mod private;
+pub(crate) mod class_body;
+mod method;
+pub(crate) mod private;
 
 use crate::passes::ast_to_ast::body::{empty_suite, split_docstring};
 use crate::passes::ast_to_ast::context::Context;

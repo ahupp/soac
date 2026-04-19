@@ -2,7 +2,6 @@ mod suspend_order;
 
 use self::suspend_order::make_suspend_order_explicit_in_core_callable_def;
 use crate::block_py::cfg::RelabelBlockTargets;
-use crate::block_py::param_specs::{Param, ParamKind, ParamSpec};
 use crate::block_py::{
     compute_storage_layout_from_scope, core_call_expr_with_meta, core_runtime_name_expr_with_meta,
     core_runtime_positional_call_expr_with_meta, literal_expr, map_module_functions, BindingKind,
@@ -15,6 +14,7 @@ use crate::block_py::{
     StringLiteral, TermBranchTable, TermIf, TermRaise, TryMapFunction, TryMapInstr, TryMapTerm,
     Tuple, UnaryOp, UnaryOpKind, UnresolvedName, WithMeta,
 };
+use crate::block_py::{Param, ParamKind, ParamSpec};
 use crate::passes::ast_to_ast::scope_helpers::is_internal_symbol;
 use crate::passes::ruff_to_blockpy::{attach_exception_edges_to_blocks, lowered_exception_edges};
 use crate::passes::{CoreModuleShape, CoreModuleShapeWithYield};
@@ -838,11 +838,11 @@ fn explicit_jump_args_for_params(params: &[BlockParam]) -> Vec<BlockArg> {
 }
 
 fn is_resume_exc_test() -> InstrUnresolved {
-    crate::block_py::operation::UnaryOp::new(
-        crate::block_py::operation::UnaryOpKind::Not,
+    crate::block_py::UnaryOp::new(
+        crate::block_py::UnaryOpKind::Not,
         Box::new(
-            crate::block_py::operation::BinOp::new(
-                crate::block_py::operation::BinOpKind::Is,
+            crate::block_py::BinOp::new(
+                crate::block_py::BinOpKind::Is,
                 Box::new(core_name("_dp_resume_exc")),
                 Box::new(core_runtime_name_expr_with_meta(
                     "NO_DEFAULT",
@@ -857,8 +857,8 @@ fn is_resume_exc_test() -> InstrUnresolved {
 }
 
 fn is_send_none_test() -> InstrUnresolved {
-    crate::block_py::operation::BinOp::new(
-        crate::block_py::operation::BinOpKind::Is,
+    crate::block_py::BinOp::new(
+        crate::block_py::BinOpKind::Is,
         Box::new(core_name("_dp_send_value")),
         Box::new(core_none()),
     )
@@ -866,8 +866,8 @@ fn is_send_none_test() -> InstrUnresolved {
 }
 
 fn is_name_none_test(name: &str) -> InstrUnresolved {
-    crate::block_py::operation::BinOp::new(
-        crate::block_py::operation::BinOpKind::Is,
+    crate::block_py::BinOp::new(
+        crate::block_py::BinOpKind::Is,
         Box::new(core_name(name)),
         Box::new(core_none()),
     )

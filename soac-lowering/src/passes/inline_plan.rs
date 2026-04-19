@@ -1,4 +1,4 @@
-use crate::block_py::pretty::BlockPyPrettyPrint;
+use crate::block_py::BlockPyPrettyPrint;
 use crate::block_py::{LocalLocation, RuntimeFunctionId};
 use crate::passes::{
     ConstructorFieldStore, ConstructorFieldValue, EscapeSummaryModule,

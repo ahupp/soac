@@ -1704,14 +1704,14 @@ async def outer(inner):
         return ("StopIteration", True)
 "#,
     );
-    let rendered = crate::block_py::pretty::blockpy_module_to_string(&blockpy);
+    let rendered = crate::block_py::blockpy_module_to_string(&blockpy);
     let resume = function_by_name(&blockpy, "outer_resume");
     let stop_iteration_raise_labels = resume
         .blocks
         .iter()
         .filter_map(|block| match &block.term {
             BlockTerm::Raise(TermRaise { exc: Some(exc) })
-                if crate::block_py::pretty::bb_expr_text(exc).contains("StopIteration") =>
+                if crate::block_py::bb_expr_text(exc).contains("StopIteration") =>
             {
                 Some(block.label.clone())
             }

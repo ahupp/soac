@@ -1,6 +1,5 @@
 use crate::pass_tracker::{PassTracker, RecordingPassTracker};
 use crate::passes::ast_to_ast::body::Suite;
-use crate::py_stmt;
 
 #[test]
 #[should_panic(expected = "PassTracker already contains a pass named one")]

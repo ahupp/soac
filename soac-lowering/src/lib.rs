@@ -21,10 +21,15 @@ pub mod fixture;
 mod namegen;
 pub mod pass_tracker;
 pub mod passes;
+#[macro_use]
 mod template;
 #[cfg(test)]
 mod test_util;
 pub(crate) mod transformer;
+
+pub(crate) use template::{
+    py_expr, py_stmt, py_stmt_internal, py_stmt_typed, py_stmts, py_stmts_internal,
+};
 
 #[derive(Debug)]
 pub enum LoweringError {

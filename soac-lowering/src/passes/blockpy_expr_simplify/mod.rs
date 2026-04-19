@@ -1,9 +1,9 @@
 use super::ast_to_ast::string_templates::lower_string_templates_in_expr;
 use crate::block_py::{
     core_call_expr_with_meta, core_runtime_name_expr_with_meta,
-    core_runtime_positional_call_expr_with_meta, literal_expr, operation, Await, BytesLiteral,
-    CallArgKeyword, CallArgPositional, HasMeta, InstrWithAwaitAndYield, InstrWithConstantNone,
-    Meta, NumberLiteral, NumberLiteralValue, StringLiteral, WithMeta, Yield, YieldFrom,
+    core_runtime_positional_call_expr_with_meta, literal_expr, Await, BytesLiteral, CallArgKeyword,
+    CallArgPositional, HasMeta, InstrWithAwaitAndYield, InstrWithConstantNone, Meta, NumberLiteral,
+    NumberLiteralValue, StringLiteral, WithMeta, Yield, YieldFrom,
 };
 use crate::passes::InstrRuff;
 use crate::py_expr;
@@ -26,7 +26,7 @@ fn tuple_from_ast_exprs_with_meta(
     node_index: ast::AtomicNodeIndex,
     range: ruff_text_size::TextRange,
 ) -> InstrWithAwaitAndYield {
-    operation::Tuple::new(
+    crate::block_py::Tuple::new(
         values
             .into_iter()
             .map(InstrWithAwaitAndYield::from_ast_expr)
@@ -119,8 +119,8 @@ fn reduce_core_blockpy_dict(items: Box<[ast::DictItem]>) -> InstrWithAwaitAndYie
         _ => segments
             .into_iter()
             .reduce(|left, right| {
-                core_operation_expr(operation::BinOp::new(
-                    operation::BinOpKind::Or,
+                core_operation_expr(crate::block_py::BinOp::new(
+                    crate::block_py::BinOpKind::Or,
                     Box::new(left),
                     Box::new(right),
                 ))
@@ -145,11 +145,11 @@ fn core_operation_expr_with_meta(
 fn unary_op_expr_with_meta(
     node_index: ast::AtomicNodeIndex,
     range: ruff_text_size::TextRange,
-    kind: operation::UnaryOpKind,
+    kind: crate::block_py::UnaryOpKind,
     operand: InstrWithAwaitAndYield,
 ) -> InstrWithAwaitAndYield {
     core_operation_expr_with_meta(
-        operation::UnaryOp::new(kind, Box::new(operand)),
+        crate::block_py::UnaryOp::new(kind, Box::new(operand)),
         node_index,
         range,
     )
@@ -158,12 +158,12 @@ fn unary_op_expr_with_meta(
 fn binop_expr_with_meta(
     node_index: ast::AtomicNodeIndex,
     range: ruff_text_size::TextRange,
-    kind: operation::BinOpKind,
+    kind: crate::block_py::BinOpKind,
     left: InstrWithAwaitAndYield,
     right: InstrWithAwaitAndYield,
 ) -> InstrWithAwaitAndYield {
     core_operation_expr_with_meta(
-        operation::BinOp::new(kind, Box::new(left), Box::new(right)),
+        crate::block_py::BinOp::new(kind, Box::new(left), Box::new(right)),
         node_index,
         range,
     )
@@ -180,7 +180,7 @@ fn getattr_expr_with_meta(
         Meta::new(node_index.clone(), range),
     );
     core_operation_expr_with_meta(
-        operation::GetAttr::new(Box::new(value), Box::new(attr_expr)),
+        crate::block_py::GetAttr::new(Box::new(value), Box::new(attr_expr)),
         node_index,
         range,
     )
@@ -193,7 +193,7 @@ fn getitem_expr_with_meta(
     index: InstrWithAwaitAndYield,
 ) -> InstrWithAwaitAndYield {
     core_operation_expr_with_meta(
-        operation::GetItem::new(Box::new(value), Box::new(index)),
+        crate::block_py::GetItem::new(Box::new(value), Box::new(index)),
         node_index,
         range,
     )
@@ -208,7 +208,7 @@ fn unary_op_expr_from_ast_with_meta(
     unary_op_expr_with_meta(
         node_index,
         range,
-        operation::UnaryOpKind::from_ast_unary_op(op),
+        crate::block_py::UnaryOpKind::from_ast_unary_op(op),
         operand,
     )
 }
@@ -225,7 +225,7 @@ fn binop_expr_from_ast_with_meta(
         _ => binop_expr_with_meta(
             node_index,
             range,
-            operation::BinOpKind::from_ast_operator(op),
+            crate::block_py::BinOpKind::from_ast_operator(op),
             left,
             right,
         ),
@@ -240,48 +240,82 @@ fn compare_expr_from_ast_with_meta(
     right: InstrWithAwaitAndYield,
 ) -> InstrWithAwaitAndYield {
     match op {
-        ast::CmpOp::Eq => {
-            binop_expr_with_meta(node_index, range, operation::BinOpKind::Eq, left, right)
-        }
-        ast::CmpOp::NotEq => {
-            binop_expr_with_meta(node_index, range, operation::BinOpKind::Ne, left, right)
-        }
-        ast::CmpOp::Lt => {
-            binop_expr_with_meta(node_index, range, operation::BinOpKind::Lt, left, right)
-        }
-        ast::CmpOp::LtE => {
-            binop_expr_with_meta(node_index, range, operation::BinOpKind::Le, left, right)
-        }
-        ast::CmpOp::Gt => {
-            binop_expr_with_meta(node_index, range, operation::BinOpKind::Gt, left, right)
-        }
-        ast::CmpOp::GtE => {
-            binop_expr_with_meta(node_index, range, operation::BinOpKind::Ge, left, right)
-        }
-        ast::CmpOp::Is => {
-            binop_expr_with_meta(node_index, range, operation::BinOpKind::Is, left, right)
-        }
+        ast::CmpOp::Eq => binop_expr_with_meta(
+            node_index,
+            range,
+            crate::block_py::BinOpKind::Eq,
+            left,
+            right,
+        ),
+        ast::CmpOp::NotEq => binop_expr_with_meta(
+            node_index,
+            range,
+            crate::block_py::BinOpKind::Ne,
+            left,
+            right,
+        ),
+        ast::CmpOp::Lt => binop_expr_with_meta(
+            node_index,
+            range,
+            crate::block_py::BinOpKind::Lt,
+            left,
+            right,
+        ),
+        ast::CmpOp::LtE => binop_expr_with_meta(
+            node_index,
+            range,
+            crate::block_py::BinOpKind::Le,
+            left,
+            right,
+        ),
+        ast::CmpOp::Gt => binop_expr_with_meta(
+            node_index,
+            range,
+            crate::block_py::BinOpKind::Gt,
+            left,
+            right,
+        ),
+        ast::CmpOp::GtE => binop_expr_with_meta(
+            node_index,
+            range,
+            crate::block_py::BinOpKind::Ge,
+            left,
+            right,
+        ),
+        ast::CmpOp::Is => binop_expr_with_meta(
+            node_index,
+            range,
+            crate::block_py::BinOpKind::Is,
+            left,
+            right,
+        ),
         ast::CmpOp::IsNot => unary_op_expr_with_meta(
             node_index.clone(),
             range,
-            operation::UnaryOpKind::Not,
-            binop_expr_with_meta(node_index, range, operation::BinOpKind::Is, left, right),
+            crate::block_py::UnaryOpKind::Not,
+            binop_expr_with_meta(
+                node_index,
+                range,
+                crate::block_py::BinOpKind::Is,
+                left,
+                right,
+            ),
         ),
         ast::CmpOp::In => binop_expr_with_meta(
             node_index,
             range,
-            operation::BinOpKind::Contains,
+            crate::block_py::BinOpKind::Contains,
             right,
             left,
         ),
         ast::CmpOp::NotIn => unary_op_expr_with_meta(
             node_index.clone(),
             range,
-            operation::UnaryOpKind::Not,
+            crate::block_py::UnaryOpKind::Not,
             binop_expr_with_meta(
                 node_index,
                 range,
-                operation::BinOpKind::Contains,
+                crate::block_py::BinOpKind::Contains,
                 right,
                 left,
             ),
@@ -295,7 +329,13 @@ fn add_op_expr_with_meta(
     left: InstrWithAwaitAndYield,
     right: InstrWithAwaitAndYield,
 ) -> InstrWithAwaitAndYield {
-    binop_expr_with_meta(node_index, range, operation::BinOpKind::Add, left, right)
+    binop_expr_with_meta(
+        node_index,
+        range,
+        crate::block_py::BinOpKind::Add,
+        left,
+        right,
+    )
 }
 
 fn add_op_expr(
@@ -375,7 +415,7 @@ fn non_operator_operation_from_helper_call(
     let mut args = args.into_iter();
     let meta = Meta::new(node_index, range);
     let operation = match name {
-        "store_global" => operation::Store::new(
+        "store_global" => crate::block_py::Store::new(
             ast::name::Name::new({
                 let _globals = args.next()?;
                 string_arg_from_core_expr(args.next()?)?
@@ -384,9 +424,11 @@ fn non_operator_operation_from_helper_call(
         )
         .with_meta(meta)
         .into(),
-        "cell_ref" => operation::CellRefForName::new(string_arg_from_core_expr(args.next()?)?)
-            .with_meta(meta)
-            .into(),
+        "cell_ref" => {
+            crate::block_py::CellRefForName::new(string_arg_from_core_expr(args.next()?)?)
+                .with_meta(meta)
+                .into()
+        }
         _ => return None,
     };
     if args.next().is_some() {
@@ -413,7 +455,7 @@ fn lower_core_call_expr_with_meta(
                     make_function_kind_from_literal(&args[1]),
                 ) {
                     return core_operation_expr(
-                        operation::MakeFunction::new(
+                        crate::block_py::MakeFunction::new(
                             function_id,
                             kind,
                             Box::new(InstrWithAwaitAndYield::from_ast_expr(args[3].clone())),
@@ -465,7 +507,7 @@ fn reduce_core_tuple_splat(elts: Vec<Expr>) -> InstrWithAwaitAndYield {
     let mut values: Vec<InstrWithAwaitAndYield> = Vec::new();
 
     fn tuple_pack(values: Vec<InstrWithAwaitAndYield>) -> InstrWithAwaitAndYield {
-        operation::Tuple::new(values)
+        crate::block_py::Tuple::new(values)
             .with_meta(Meta::new(
                 ast::AtomicNodeIndex::default(),
                 Default::default(),
@@ -623,7 +665,7 @@ impl InstrWithAwaitAndYield {
             InstrRuff::ExprDict(node) => reduce_core_blockpy_dict(node.items.into()),
             InstrRuff::ExprName(node) => {
                 let meta = node.meta();
-                InstrWithAwaitAndYield::Load(operation::Load::new(node.id).with_meta(meta))
+                InstrWithAwaitAndYield::Load(crate::block_py::Load::new(node.id).with_meta(meta))
             }
             InstrRuff::ExprIpyEscapeCommand(_) => {
                 panic!("IpyEscapeCommand should not reach late core BlockPy boundary")
@@ -806,7 +848,7 @@ impl InstrWithAwaitAndYield {
             Expr::Dict(node) => reduce_core_blockpy_dict(node.items.into()),
             Expr::Name(node) => {
                 let meta = node.meta();
-                InstrWithAwaitAndYield::Load(operation::Load::new(node.id).with_meta(meta))
+                InstrWithAwaitAndYield::Load(crate::block_py::Load::new(node.id).with_meta(meta))
             }
             Expr::IpyEscapeCommand(_) => {
                 panic!("IpyEscapeCommand should not reach late core BlockPy boundary")

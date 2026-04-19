@@ -41,6 +41,7 @@ use cranelift_jit::{ArenaMemoryProvider, JITBuilder, JITModule};
 use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module, ModuleReloc};
 use cranelift_reader::parse_functions;
 use pyo3::{Py, PyAny, Python, ffi};
+use soac_core::block_py as blockpy_intrinsics;
 use soac_core::block_py::{
     AbruptKind, Block, BlockArg, BlockEdge, BlockLabel, BlockParamRole, BlockPyFunction,
     BlockPyModule, BlockTerm, Call, CallArgKeyword, CallArgPositional, CallDirect,
@@ -49,7 +50,7 @@ use soac_core::block_py::{
     HasSemanticInstrId, InstrId, InstrKey, Load, LocalFunctionId, LocalLocation, Meta,
     ModuleContentId, NameLocation, ParamKind, PersistentFunctionId, ResolvedName,
     RuntimeFunctionId, RuntimeModuleId, RuntimeName, StorageLayout, Store, Visit, VisitMut,
-    WithMeta, operation as blockpy_intrinsics,
+    WithMeta,
 };
 use soac_lowering::block_py::{CodegenBlock, Literal};
 use soac_lowering::passes::{

@@ -1,5 +1,5 @@
-use crate::block_py::pretty::BlockPyPrettyPrint;
 use crate::block_py::BlockPyModule;
+use crate::block_py::BlockPyPrettyPrint;
 use crate::passes::ast_to_ast::body::Suite;
 use crate::passes::{
     CoreModuleShape, CoreModuleShapeWithAwaitAndYield, ResolvedStorageModuleShape,

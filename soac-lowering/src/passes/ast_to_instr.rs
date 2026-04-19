@@ -399,7 +399,7 @@ impl InstrRuffAstExt for InstrRuff {
                 Self::wrap_ast_expr(
                     meta,
                     BinOp::new(
-                        crate::block_py::operation::BinOpKind::from_ast_operator(node.op),
+                        crate::block_py::BinOpKind::from_ast_operator(node.op),
                         Self::from_ast_expr(*node.left),
                         Self::from_ast_expr(*node.right),
                     ),
@@ -410,7 +410,7 @@ impl InstrRuffAstExt for InstrRuff {
                 Self::wrap_ast_expr(
                     meta,
                     UnaryOp::new(
-                        crate::block_py::operation::UnaryOpKind::from_ast_unary_op(node.op),
+                        crate::block_py::UnaryOpKind::from_ast_unary_op(node.op),
                         Self::from_ast_expr(*node.operand),
                     ),
                 )

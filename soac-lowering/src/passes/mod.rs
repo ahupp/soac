@@ -3,7 +3,7 @@ pub(crate) mod ast_to_ast;
 pub(crate) mod ast_to_instr;
 pub(crate) mod blockpy_expr_simplify;
 mod blockpy_generators;
-pub mod blockpy_to_bb;
+mod blockpy_to_bb;
 pub(crate) mod core_await_lower;
 mod direct_call_transform;
 mod escape_analysis;
@@ -16,7 +16,7 @@ mod instrument;
 mod local_env_plan;
 mod name_binding;
 mod ownership_effects;
-pub mod ruff_to_blockpy;
+pub(crate) mod ruff_to_blockpy;
 mod trace;
 mod value_facts;
 
