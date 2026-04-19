@@ -21,10 +21,6 @@ use soac_lowering::passes::{
 };
 mod tests {
     use super::*;
-    use crate::counter_dump::{
-        CounterDumpRecord, CounterDumpRow, CounterDumpTypeKey, CounterDumpTypeKeyLayout,
-        CounterDumpTypeTableEntry, write_counter_dump_records,
-    };
     use crate::jit::direct_abi::RuntimePrimitiveId;
     use crate::optimization_plan::{
         FunctionOptimizationPlan, OptimizationDecision, OptimizationPlan, PlannedAction,
@@ -37,6 +33,10 @@ mod tests {
     use ruff_python_ast as ast;
     use soac_lowering::codegen_cache::{PythonModuleCacheSource, module_optimization_plan_path};
     use soac_lowering::passes::{TypedInstrExtra, TypedPlannedResult as PlannedResult};
+    use soac_profile::{
+        CounterDumpRecord, CounterDumpRow, CounterDumpTypeKey, CounterDumpTypeKeyLayout,
+        CounterDumpTypeTableEntry, write_counter_dump_records,
+    };
     use std::collections::{HashMap, VecDeque};
     use std::ffi::c_void;
     use std::mem::size_of;

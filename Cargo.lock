@@ -1773,6 +1773,7 @@ dependencies = [
  "soac-cpython",
  "soac-jit",
  "soac-lowering",
+ "soac-profile",
  "tokio",
  "tower",
  "tower-http",
@@ -1792,7 +1793,6 @@ dependencies = [
  "cranelift-reader",
  "gimli 0.33.1",
  "libc",
- "memmap2",
  "pyo3",
  "pyo3-build-config",
  "rkyv",
@@ -1802,6 +1802,7 @@ dependencies = [
  "soac-core",
  "soac-cpython",
  "soac-lowering",
+ "soac-profile",
  "tracing",
 ]
 
@@ -1837,6 +1838,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "soac-profile"
+version = "0.1.0"
+dependencies = [
+ "memmap2",
+ "rkyv",
+ "soac-core",
+]
+
+[[package]]
 name = "soac-pyo3"
 version = "0.1.0"
 dependencies = [
@@ -1848,6 +1858,7 @@ dependencies = [
  "soac-cpython",
  "soac-jit",
  "soac-lowering",
+ "soac-profile",
  "tracing",
 ]
 

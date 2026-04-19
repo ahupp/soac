@@ -29,11 +29,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tower_http::services::ServeDir;
 
-pub use soac_jit::counter_dump::{
-    CollectedKeyLayout, CounterDumpFile, CounterDumpKeyLayoutView, CounterDumpRecordView,
-    CounterDumpRowView, CounterDumpTypeKeyLayoutView, collect_module_key_layouts,
-    collect_type_key_layouts, parse_counter_dump_records,
-};
+use soac_profile::CounterDumpFile;
 
 static NEXT_WEB_MODULE_ID: AtomicU64 = AtomicU64::new(1);
 

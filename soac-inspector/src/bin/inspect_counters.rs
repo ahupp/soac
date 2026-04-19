@@ -1,10 +1,9 @@
 use serde_json::json;
 use soac_core::block_py::RuntimeFunctionId;
-use soac_inspector::CounterDumpFile;
-use soac_inspector::CounterDumpKeyLayoutView;
-use soac_inspector::CounterDumpRowView;
-use soac_inspector::CounterDumpTypeKeyLayoutView;
-use soac_jit::counter_dump::render_call_target_specializations;
+use soac_profile::{
+    CounterDumpFile, CounterDumpKeyLayoutView, CounterDumpRowView, CounterDumpTypeKeyLayoutView,
+    render_call_target_specializations,
+};
 use std::path::PathBuf;
 
 struct Args {
@@ -220,10 +219,9 @@ fn main() -> Result<(), String> {
 mod tests {
     use super::format_counter_row;
     use soac_core::block_py::{BlockLabel, InstrId, RuntimeFunctionId};
-    use soac_inspector::CounterDumpRowView;
-    use soac_inspector::parse_counter_dump_records;
-    use soac_jit::counter_dump::{
-        CounterDumpRecord, CounterDumpRow, render_call_target_specializations,
+    use soac_profile::{
+        CounterDumpRecord, CounterDumpRow, CounterDumpRowView, parse_counter_dump_records,
+        render_call_target_specializations,
     };
 
     #[test]

@@ -725,9 +725,9 @@ fn typed_direct_call_arg_plan(plan: &DirectCallArgPlan) -> TypedDirectCallArgPla
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::counter_dump::CounterDumpTypeKey;
     use soac_core::block_py::Visit;
     use soac_lowering::passes::{TypedDirectCallArgSource, lower_codegen_module_to_typed};
+    use soac_profile::CounterDumpTypeKey;
 
     fn lowered_module(source: &str) -> soac_core::block_py::BlockPyModule<CodegenModuleShape> {
         soac_lowering::lower_python_to_blockpy_for_testing(source)

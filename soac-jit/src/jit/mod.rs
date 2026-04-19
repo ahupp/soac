@@ -15,15 +15,6 @@ use crate::config::{
     profiled_cold_blocks_enabled, soac_work_dir_from_env, specialization_mode_from_env,
 };
 use crate::counter::TopValueCounter;
-use crate::counter_dump::{
-    CollectedTypeKeyLayout, CounterDumpTypeKey, read_block_entry_counts_from_file,
-};
-#[cfg(test)]
-use crate::counter_dump::{
-    CounterDumpFile, CounterDumpKeyLayout, CounterDumpRecord, CounterDumpRow,
-    CounterDumpTypeKeyLayout, CounterDumpTypeTableEntry, collect_type_key_layouts,
-    collect_type_table, write_counter_dump_records,
-};
 use crate::function_instantiation::{
     SOAC_JIT_MAKE_FUNCTION_WITH_CLOSURE_SYMBOL, make_function_kind_abi_tag,
     soac_jit_make_function_with_closure,
@@ -90,6 +81,13 @@ use soac_lowering::passes::{
     try_lower_typed_instr_to_codegen_legacy, try_lower_typed_term_to_codegen_legacy,
     validate_codegen_instr_ids, validate_typed_function_call_access_plans,
     validate_typed_function_value_facts,
+};
+use soac_profile::{CollectedTypeKeyLayout, CounterDumpTypeKey, read_block_entry_counts_from_file};
+#[cfg(test)]
+use soac_profile::{
+    CounterDumpFile, CounterDumpKeyLayout, CounterDumpRecord, CounterDumpRow,
+    CounterDumpTypeKeyLayout, CounterDumpTypeTableEntry, collect_type_key_layouts,
+    collect_type_table, write_counter_dump_records,
 };
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};

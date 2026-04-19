@@ -17,7 +17,6 @@ pub use function_instantiation::{
 pub use jit::*;
 
 pub mod counter;
-pub mod counter_dump;
 pub mod module_constants;
 pub mod module_type;
 pub mod optimization_plan;

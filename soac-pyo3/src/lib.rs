@@ -6,9 +6,9 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
 use serde_json::json;
-use soac_jit::counter_dump::CounterDumpFile;
 use soac_jit::optimization_plan::generate_optimization_plans_for_counter_dump;
 use soac_lowering::{lower_python_to_blockpy_for_testing, ruff_ast_to_string};
+use soac_profile::CounterDumpFile;
 use std::path::{Path, PathBuf};
 use tracing::trace;
 

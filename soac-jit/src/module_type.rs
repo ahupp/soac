@@ -1,9 +1,5 @@
 use crate::config::{SpecializationMode, counter_dump_output_path_from_env};
 use crate::counter::{CounterEntry, GilTopValueCounter, TopValueCounter};
-use crate::counter_dump::{
-    CounterDumpKeyLayout, CounterDumpRecord, CounterDumpRow, CounterDumpTypeKey,
-    CounterDumpTypeKeyLayout, CounterDumpTypeTableEntry,
-};
 use crate::jit::JitCodegenStats;
 use crate::module_constants::{ModuleCodegenConstants, load_runtime_name_owned_by_id};
 use pyo3::exceptions::{PyRuntimeError, PyTypeError};
@@ -20,6 +16,10 @@ use soac_lowering::codegen_cache::PythonModuleCacheSource;
 use soac_lowering::passes::{
     CodegenModuleShape, InlinePlanModule, plan_module_inlining,
     specialization_runtime_logging_enabled, summarize_module_escapes,
+};
+use soac_profile::{
+    CounterDumpKeyLayout, CounterDumpRecord, CounterDumpRow, CounterDumpTypeKey,
+    CounterDumpTypeKeyLayout, CounterDumpTypeTableEntry,
 };
 use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, c_int, c_void};
@@ -1663,10 +1663,10 @@ impl SoacExtModule {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::counter_dump::COUNTER_DUMP_MAGIC;
     use pyo3::types::PyModule;
     use soac_lowering::lower_python_to_blockpy_for_testing;
     use soac_lowering::passes::instrument_bb_module_with_block_entry_counters;
+    use soac_profile::COUNTER_DUMP_MAGIC;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 

@@ -110,6 +110,25 @@ Contents:
 - template and transformer support
 - lowering fixtures and tests
 
+### `soac-profile`
+
+Own counter dump/profile serialization formats that are shared by runtime, inspector, extension,
+and offline tools.
+
+Completed: added the `soac-profile` workspace crate and moved the binary counter dump format,
+reader/writer, mmap views, type-key layout collection, block-entry count reader, and specialization
+summary rendering out of `soac-jit`. `soac-jit` still owns live runtime counter collection and
+optimization-plan construction, but consumers no longer need to depend on the JIT backend just to
+read counter dump files.
+
+Contents:
+
+- counter dump row/record/type-key schemas
+- profile/verify dump readers and writers
+- module hash references carried by counter dump records
+- summary helpers used by inspector and offline tools
+- serialization compatibility checks
+
 ## Proposed Crates
 
 ### `soac-ir`
@@ -154,22 +173,6 @@ pass-only edits do not force recompilation of the JIT backend or extension crate
 
 The existing `soac-blockpy` crate can temporarily become a compatibility facade that re-exports
 `soac-ir` and `soac-lowering` APIs while callsites are migrated.
-
-### `soac-profile`
-
-Own counter and profile formats.
-
-Likely contents:
-
-- counter schemas and ids
-- profile/verify dump readers and writers
-- module hash references used by counters
-- summary helpers used by benchmarks and inspector
-- serialization compatibility checks
-
-This crate should depend on `soac-ir` where it needs shared ids, but should not depend on PyO3 or
-Cranelift. Inspector and offline precompile tooling should be able to inspect counters without
-rebuilding the JIT backend.
 
 ### `soac-codegen-model`
 
@@ -248,7 +251,9 @@ keeps web dependencies out of non-web rendering and offline analysis tools.
    there. `soac-blockpy` is now a compatibility facade at the library layer; internal downstream
    crates import lowering/codegen-cache APIs from `soac-lowering` directly.
 7. Done: move env parsing and logging setup into `soac-config`.
-8. Move counter/profile schemas and serialization into `soac-profile`.
+8. Done, partial: moved counter dump schemas, serialization, readers, and summary helpers into
+   `soac-profile`. Live runtime counter collection remains in `soac-jit`, and optimization-plan
+   evidence construction remains there until that boundary is split from backend emission.
 9. Split `soac-jit/src/jit/mod.rs` into internal modules along backend responsibility boundaries.
 10. Extract `soac-codegen-model` after the shared descriptors are visible and no longer buried in
     backend emission code.

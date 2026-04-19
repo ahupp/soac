@@ -1,4 +1,3 @@
-use crate::counter_dump::{CounterDumpFile, collect_type_key_layouts, collect_type_table};
 use anyhow::{Context, Result, bail};
 use soac_core::block_py::{
     BlockPyFunction, BlockPyModule, ChildVisitable, HasSemanticInstrId, InstrId, LocalFunctionId,
@@ -12,6 +11,7 @@ use soac_lowering::codegen_cache::{
     load_codegen_module_cache, module_optimization_plan_path,
 };
 use soac_lowering::passes::{CodegenModuleShape, InstrCodegen, InstrResolved};
+use soac_profile::{CounterDumpFile, collect_type_key_layouts, collect_type_table};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Write;
@@ -1401,11 +1401,11 @@ fn push_unique<T: Eq>(values: &mut Vec<T>, value: T) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::counter_dump::{
+    use soac_core::block_py::{BlockLabel, InstrId};
+    use soac_profile::{
         CounterDumpRecord, CounterDumpRow, CounterDumpTypeKey, CounterDumpTypeKeyLayout,
         CounterDumpTypeTableEntry,
     };
-    use soac_core::block_py::{BlockLabel, InstrId};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 

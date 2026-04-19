@@ -2,6 +2,7 @@
 members = [
     "soac-blockpy",
     "soac-core",
+    "soac-profile",
     "soac-config",
     "soac-cpython",
     "soac-lowering",
@@ -13,6 +14,7 @@ members = [
 default-members = [
     "soac-blockpy",
     "soac-core",
+    "soac-profile",
     "soac-config",
     "soac-cpython",
     "soac-lowering",
