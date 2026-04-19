@@ -35,6 +35,8 @@ If the workload call does not directly identify the function to inspect, pass
 - original Python source
 - workload and result repr
 - module/function metadata
+- optimization decision CLI output
+- printed optimization plan
 - decoded specialization counters
 - InstrTyped input to specialized codegen
 - pre-inlining specialized CLIF, before runtime support CLIF inlining and
@@ -68,6 +70,8 @@ The script writes one directory under `work/logs/soac-clif-snippets/`:
 - `result_repr.txt`
 - `counters/profile.bin`
 - `specializations.txt`
+- `optimization_decisions.txt`
+- `optimization_plan.txt`
 - `instr_typed.txt`
 - `pre_inline.clif`
 - `specialized.clif`
