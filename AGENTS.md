@@ -147,7 +147,7 @@ current `@`. Do not treat another workspace's live `@` as a dependency.
 7. Keep specialization docs in sync.
 
    If you add or materially change a specialization, update
-   `docs/SPECIALIZATION.md` in the same logical change. The doc should
+   `doc/SPECIALIZATION.md` in the same logical change. The doc should
    describe what profiling input is recorded, what codegen shape is
    emitted, and the current limitations, soundness boundaries, or likely
    extensions.
@@ -186,7 +186,7 @@ current `@`. Do not treat another workspace's live `@` as a dependency.
 
    If you add, remove, rename, or move runtime helper functions in
    `soac-runtime`, `soac-jit/src/jit/specialized_helpers.rs`, or
-   `soac_py/src/soac/runtime.py`, update `docs/RUNTIME_FUNCTIONS.md`
+   `soac_py/src/soac/runtime.py`, update `doc/RUNTIME_FUNCTIONS.md`
    in the same logical change.
 
 11. Record finalized performance changes.
@@ -199,7 +199,7 @@ report both headline throughput and relative delta.
 When a performance change is complete enough that you intend to keep it,
 rebase the finished change onto `main`, run `$soac-profile-benchmark`, write the
 finalized benchmark result to `work/bench/{change_id}`, and
-append an entry to `docs/CODEX_OPT_LOG.md` in the same logical change.
+append an entry to `doc/CODEX_OPT_LOG.md` in the same logical change.
 Use `work/bench/{change_id}_{commit_id}` only for one-off test benchmarks while
 iterating. Keep log entries succinct: include the jj change id, a short summary
 of the optimization, the benchmarked throughput delta, and the before/after
@@ -215,7 +215,7 @@ benchmark artifacts named for that child rather than the existing revision.
 12. Run the full gate before submitting code changes.
 
 Run `just test-all` before submitting unless the change is docs-only,
-such as `todo/TODO.md`, `AGENTS.md`, or similar documentation-only files.
+such as `doc/todo/TODO.md`, `AGENTS.md`, or similar documentation-only files.
 For fast feedback on Rust changes that may affect crate test targets,
 run `cargo check -p soac-jit --tests` before the full gate; it
 type-checks the `soac-jit` crate including tests without running the

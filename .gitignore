@@ -11,6 +11,7 @@ cpython_full_test_run_summary.txt
 /snapshot
 /work/tmp
 /work/
+/tmp/
 /logs/
 /.uv
 /.uv-cache
