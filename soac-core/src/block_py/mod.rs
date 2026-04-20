@@ -44,6 +44,7 @@ mod map;
 mod meta;
 mod name_gen;
 mod param_specs;
+mod pretty;
 mod scope;
 mod visit;
 pub use counters::{CounterDef, CounterId, CounterScope, CounterSite, DeoptEntrySource};
@@ -52,6 +53,7 @@ pub use name_gen::{
     PersistentFunctionId, RuntimeFunctionId, RuntimeModuleId, SerializedFunctionDebugName,
     SerializedFunctionId, SerializedIdentityTables, SerializedModuleId, SerializedModuleIdentity,
 };
+pub use pretty::{BlockPyPrettyPrinter, PrettyPrint, bb_expr_text, blockpy_module_to_string};
 
 fn is_internal_symbol(name: &str) -> bool {
     name.starts_with("_dp_") || name == "__soac__"

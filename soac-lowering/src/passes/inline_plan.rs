@@ -1,4 +1,4 @@
-use crate::block_py::BlockPyPrettyPrint;
+use crate::block_py::PrettyPrint;
 use crate::block_py::{LocalLocation, RuntimeFunctionId};
 use crate::passes::{
     ConstructorFieldStore, ConstructorFieldValue, EscapeSummaryModule,
@@ -48,7 +48,7 @@ impl InlinePlanModule {
     }
 }
 
-impl BlockPyPrettyPrint for InlinePlanModule {
+impl PrettyPrint for InlinePlanModule {
     fn pretty_print(&self) -> String {
         let mut function_ids = self.functions.keys().copied().collect::<Vec<_>>();
         function_ids.sort_by_key(|function_id| function_id.to_packed_runtime_u64());

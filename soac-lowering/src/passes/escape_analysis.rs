@@ -1,4 +1,4 @@
-use crate::block_py::BlockPyPrettyPrint;
+use crate::block_py::PrettyPrint;
 use crate::block_py::{
     instr_any, Block, BlockPyFunction, BlockPyModule, BlockTerm, HasMeta, InstrCodegen,
     InstrCodegenOp, InstrId, InstrResolved, Literal, LocalLocation, NameLike, NameLocation,
@@ -52,7 +52,7 @@ impl EscapeSummaryModule {
     }
 }
 
-impl BlockPyPrettyPrint for EscapeSummaryModule {
+impl PrettyPrint for EscapeSummaryModule {
     fn pretty_print(&self) -> String {
         let mut function_ids = self.functions.keys().copied().collect::<Vec<_>>();
         function_ids.sort_by_key(|function_id| function_id.to_packed_runtime_u64());

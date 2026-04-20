@@ -1,4 +1,4 @@
-use crate::block_py::BlockPyPrettyPrint;
+use crate::block_py::PrettyPrint;
 use crate::block_py::{
     instr_any, BlockPyFunction, BlockPyModule, BlockTerm, Call, CallArgKeyword, CallArgPositional,
     CallableScopeKind, CellBindingKind, CellLocation, ChildVisitable, FunctionExecutionMode,

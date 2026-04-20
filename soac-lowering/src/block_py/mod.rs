@@ -17,10 +17,6 @@ pub use literal::{
     BytesLiteral, IntLiteral, Literal, LiteralValue, NumberLiteral, NumberLiteralValue,
     StringLiteral,
 };
-#[allow(unused_imports)]
-pub(crate) use pretty::{
-    bb_expr_text, blockpy_module_to_string, BlockPyPrettyPrint, BlockPyPrettyPrinter,
-};
 pub(crate) use scope_impls::{
     build_storage_layout_from_capture_names, compute_make_function_capture_bindings_from_scope,
     compute_storage_layout_from_scope, is_runtime_closure_name, ScopeExprNode,

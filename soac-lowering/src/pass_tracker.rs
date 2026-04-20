@@ -1,6 +1,5 @@
 use crate::block_py::BlockPyModule;
-use crate::block_py::BlockPyPrettyPrint;
-use crate::passes::ast_to_ast::body::Suite;
+use crate::block_py::PrettyPrint;
 use crate::passes::{
     CoreModuleShape, CoreModuleShapeWithAwaitAndYield, ResolvedStorageModuleShape,
 };
@@ -33,7 +32,7 @@ pub struct RecordingPassTracker {
 pub(crate) trait PassTracker {
     fn run_pass<T, F>(&mut self, name: &str, build: F) -> T
     where
-        T: Clone + Any + BlockPyPrettyPrint,
+        T: Clone + Any + PrettyPrint,
         F: FnOnce() -> T;
 
     fn record_timing<T, F>(&mut self, name: &str, build: F) -> T
@@ -41,21 +40,9 @@ pub(crate) trait PassTracker {
         F: FnOnce() -> T;
 }
 
-impl BlockPyPrettyPrint for Suite {
-    fn pretty_print(&self) -> String {
-        crate::ruff_ast_to_string(self)
-    }
-}
-
-impl BlockPyPrettyPrint for ModModule {
-    fn pretty_print(&self) -> String {
-        crate::ruff_ast_to_string(&self.body)
-    }
-}
-
 fn render_tracked_pass_value<T>(value: &dyn Any) -> String
 where
-    T: Any + BlockPyPrettyPrint,
+    T: Any + PrettyPrint,
 {
     value
         .downcast_ref::<T>()
@@ -65,7 +52,7 @@ where
 
 fn render_tracked_pass_debug_value<T>(value: &dyn Any) -> String
 where
-    T: Any + BlockPyPrettyPrint,
+    T: Any + PrettyPrint,
 {
     value
         .downcast_ref::<T>()
@@ -82,7 +69,7 @@ impl NoopPassTracker {
 impl PassTracker for NoopPassTracker {
     fn run_pass<T, F>(&mut self, _name: &str, build: F) -> T
     where
-        T: Clone + Any + BlockPyPrettyPrint,
+        T: Clone + Any + PrettyPrint,
         F: FnOnce() -> T,
     {
         build()
@@ -170,7 +157,7 @@ impl RecordingPassTracker {
 impl PassTracker for RecordingPassTracker {
     fn run_pass<T, F>(&mut self, name: &str, build: F) -> T
     where
-        T: Clone + Any + BlockPyPrettyPrint,
+        T: Clone + Any + PrettyPrint,
         F: FnOnce() -> T,
     {
         let value = self.record_timing(name, build);
