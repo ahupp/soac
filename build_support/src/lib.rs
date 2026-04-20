@@ -1,6 +1,8 @@
 pub fn compute_soac_build_identity(repo_root: &std::path::Path) -> std::io::Result<String> {
     let mut hasher = StableHasher::new();
-    hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
+    let package_version =
+        std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| env!("CARGO_PKG_VERSION").into());
+    hasher.update(package_version.as_bytes());
     hasher.update(b"\0");
     for key in [
         "PROFILE",

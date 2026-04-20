@@ -1,4 +1,4 @@
-include!("../build_support/soac_build_identity.rs");
+use build_support::{compute_soac_build_identity, emit_vendored_python_link};
 
 fn main() {
     let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

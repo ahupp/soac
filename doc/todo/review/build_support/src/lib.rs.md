@@ -1,4 +1,4 @@
-# build_support/soac_build_identity.rs
+# build_support/src/lib.rs
 
 ## File Responsibilities
 

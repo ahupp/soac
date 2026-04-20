@@ -36,4 +36,4 @@ Offline precompile CLI. It reads specialization counters, resolves pre-optimizat
 
 - `soac-jit` offline compile/module cache APIs
 - `soac-pyo3/src/jit_runtime.rs`
-- `build_support/soac_build_identity.rs`
+- `build_support/src/lib.rs`

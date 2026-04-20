@@ -15,6 +15,6 @@ Build script for the `_soac_ext` Python extension. It links against the vendored
 
 ## Context Read
 
-- `build_support/soac_build_identity.rs`
+- `build_support/src/lib.rs`
 - `soac-inspector/build.rs`
 

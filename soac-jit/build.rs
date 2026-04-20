@@ -1,5 +1,3 @@
-include!("../build_support/soac_build_identity.rs");
-
 use std::env;
 use std::error::Error;
 use std::ffi::OsStr;
@@ -7,6 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use build_support::{compute_soac_build_identity, emit_vendored_python_link};
 use pyo3_build_config::{BuildFlag, PythonImplementation};
 
 const RUNTIME_CRATE_NAME: &str = "soac_runtime";

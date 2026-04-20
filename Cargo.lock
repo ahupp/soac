@@ -183,6 +183,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "build_support"
+version = "0.1.0"
+
+[[package]]
 name = "bumpalo"
 version = "3.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1753,6 +1757,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "build_support",
  "http-body-util",
  "pyo3",
  "rkyv",
@@ -1775,6 +1780,7 @@ name = "soac-jit"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "build_support",
  "cranelift-codegen",
  "cranelift-control",
  "cranelift-frontend",
@@ -1841,6 +1847,7 @@ dependencies = [
 name = "soac-pyo3"
 version = "0.1.0"
 dependencies = [
+ "build_support",
  "pyo3",
  "rkyv",
  "serde_json",

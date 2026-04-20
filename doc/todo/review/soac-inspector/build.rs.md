@@ -15,6 +15,6 @@ Build script for `soac-inspector`. It discovers the vendored CPython shared-libr
 
 ## Context Read
 
-- `build_support/soac_build_identity.rs`
+- `build_support/src/lib.rs`
 - `soac-pyo3/build.rs`
 
