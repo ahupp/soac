@@ -1245,10 +1245,7 @@ macro_rules! define_suspend_instr {
                 }
             }
 
-            fn try_map_children<T, Error, M>(
-                self,
-                map: &mut M,
-            ) -> Result<Self::Mapped<T>, Error>
+            fn try_map_children<T, Error, M>(self, map: &mut M) -> Result<Self::Mapped<T>, Error>
             where
                 T: Instr,
                 M: TryMapInstr<E, T, Error>,
@@ -1271,10 +1268,7 @@ macro_rules! define_suspend_instr {
                 }
             }
 
-            fn try_map_same_children<Error, M>(
-                self,
-                map: &mut M,
-            ) -> Result<Self::Mapped<E>, Error>
+            fn try_map_same_children<Error, M>(self, map: &mut M) -> Result<Self::Mapped<E>, Error>
             where
                 M: TryMapInstr<E, E, Error>,
             {
@@ -1285,7 +1279,7 @@ macro_rules! define_suspend_instr {
                 })
             }
         }
-    }
+    };
 }
 
 define_suspend_instr!(Await, "await ");
@@ -1692,6 +1686,12 @@ mod tests {
         type Extra = &'static str;
     }
 
+    impl PrettyPrint for ChildInstr {
+        fn fmt_pretty(&self, printer: &mut PrettyPrinter<'_>) -> fmt::Result {
+            write!(printer, "<{}>", self.0)
+        }
+    }
+
     impl ChildVisitable<ChildInstr> for ChildInstr {
         fn visit_children<V>(&self, _visitor: &mut V)
         where
@@ -1853,5 +1853,33 @@ mod tests {
         op.visit_children(&mut counter);
 
         assert_eq!(counter.0, 6);
+    }
+
+    #[test]
+    fn macro_operation_pretty_prints_child_fields_without_child_debug() {
+        let op = FieldRichOperation::<ChildInstr>::new(
+            "source",
+            vec![
+                CallArgPositional::Positional(ChildInstr("arg0")),
+                CallArgPositional::Starred(ChildInstr("starred")),
+            ],
+            vec![
+                CallArgKeyword::Named {
+                    arg: "kw".into(),
+                    value: ChildInstr("kwarg"),
+                },
+                CallArgKeyword::Starred(ChildInstr("kwargs")),
+            ],
+            Some(Box::new(ChildInstr("fallback"))),
+            vec![ChildInstr("value")],
+        );
+
+        let rendered = op.pretty_print();
+
+        assert_eq!(
+            rendered,
+            "FieldRichOperation(source, [Positional(<arg0>), Starred(<starred>)], [Named { arg: KeywordName { id: \"kw\" }, value: <kwarg> }, Starred(<kwargs>)], Some(<fallback>), [<value>])"
+        );
+        assert!(!rendered.contains("ChildInstr"));
     }
 }

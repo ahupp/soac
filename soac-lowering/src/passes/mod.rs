@@ -31,9 +31,9 @@ use crate::block_py::{
     ExprTuple, GetAttr, GetItem, HasMeta, IncrementCounter, Instr, InstrKey, InstrWithConstantNone,
     LiteralValue, Load, LocalLocation, MakeCell, MakeFunction, MakeFunctionWithClosure,
     MapFunction, MapInstr, MapModule, Mappable, Meta, ModuleShape, NameLike, NameLocation,
-    PrettyPrint, ResolvedName, RuntimeFunctionId, RuntimeName, SetAttr, SetItem, StmtAnnAssign,
-    StmtAssert, StmtAssign, StmtAugAssign, StmtBreak, StmtClassDef, StmtContinue, StmtDelete,
-    StmtExpr, StmtFor, StmtFunctionDef, StmtGlobal, StmtIf, StmtImport, StmtImportFrom,
+    PrettyPrint, PrettyPrinter, ResolvedName, RuntimeFunctionId, RuntimeName, SetAttr, SetItem,
+    StmtAnnAssign, StmtAssert, StmtAssign, StmtAugAssign, StmtBreak, StmtClassDef, StmtContinue,
+    StmtDelete, StmtExpr, StmtFor, StmtFunctionDef, StmtGlobal, StmtIf, StmtImport, StmtImportFrom,
     StmtIpyEscapeCommand, StmtMatch, StmtNonlocal, StmtPass, StmtRaise, StmtReturn, StmtTry,
     StmtTypeAlias, StmtWhile, StmtWith, Store, TryMapInstr, TryMapModule, TryMapTerm, Tuple,
     UnaryOp, UnresolvedName, Visit, VisitMut, WithMeta, Yield, YieldFrom,
@@ -942,24 +942,174 @@ impl<E: Instr> Mappable<E> for TypedDirectMethodCall<E> {
     }
 }
 
-macro_rules! impl_debug_pretty_print {
-    ($name:ident) => {
-        impl<E: Instr> PrettyPrint for $name<E> {
-            fn fmt_pretty(
-                &self,
-                printer: &mut crate::block_py::PrettyPrinter<'_>,
-            ) -> std::fmt::Result {
-                std::fmt::Write::write_fmt(printer, format_args!("{self:?}"))
-            }
+fn fmt_pretty_positional_arg<E>(
+    printer: &mut PrettyPrinter<'_>,
+    arg: &CallArgPositional<E>,
+) -> std::fmt::Result
+where
+    E: Instr + PrettyPrint,
+{
+    match arg {
+        CallArgPositional::Positional(expr) => {
+            std::fmt::Write::write_str(printer, "Positional(")?;
+            expr.fmt_pretty(printer)?;
+            std::fmt::Write::write_str(printer, ")")
         }
-    };
+        CallArgPositional::Starred(expr) => {
+            std::fmt::Write::write_str(printer, "Starred(")?;
+            expr.fmt_pretty(printer)?;
+            std::fmt::Write::write_str(printer, ")")
+        }
+    }
 }
 
-impl_debug_pretty_print!(TypedCall);
-impl_debug_pretty_print!(TypedDirectCallableCall);
-impl_debug_pretty_print!(TypedGuardedCallableCall);
-impl_debug_pretty_print!(TypedGuardedMethodCall);
-impl_debug_pretty_print!(TypedDirectMethodCall);
+fn fmt_pretty_positional_args<E>(
+    printer: &mut PrettyPrinter<'_>,
+    args: &[CallArgPositional<E>],
+) -> std::fmt::Result
+where
+    E: Instr + PrettyPrint,
+{
+    std::fmt::Write::write_str(printer, "[")?;
+    let mut first = true;
+    for arg in args {
+        if !first {
+            std::fmt::Write::write_str(printer, ", ")?;
+        }
+        first = false;
+        fmt_pretty_positional_arg(printer, arg)?;
+    }
+    std::fmt::Write::write_str(printer, "]")
+}
+
+fn fmt_pretty_keyword_arg<E>(
+    printer: &mut PrettyPrinter<'_>,
+    keyword: &CallArgKeyword<E>,
+) -> std::fmt::Result
+where
+    E: Instr + PrettyPrint,
+{
+    match keyword {
+        CallArgKeyword::Named { arg, value } => {
+            std::fmt::Write::write_fmt(printer, format_args!("Named {{ arg: {:?}, value: ", arg))?;
+            value.fmt_pretty(printer)?;
+            std::fmt::Write::write_str(printer, " }")
+        }
+        CallArgKeyword::Starred(value) => {
+            std::fmt::Write::write_str(printer, "Starred(")?;
+            value.fmt_pretty(printer)?;
+            std::fmt::Write::write_str(printer, ")")
+        }
+    }
+}
+
+fn fmt_pretty_keyword_args<E>(
+    printer: &mut PrettyPrinter<'_>,
+    keywords: &[CallArgKeyword<E>],
+) -> std::fmt::Result
+where
+    E: Instr + PrettyPrint,
+{
+    std::fmt::Write::write_str(printer, "[")?;
+    let mut first = true;
+    for keyword in keywords {
+        if !first {
+            std::fmt::Write::write_str(printer, ", ")?;
+        }
+        first = false;
+        fmt_pretty_keyword_arg(printer, keyword)?;
+    }
+    std::fmt::Write::write_str(printer, "]")
+}
+
+impl<E> PrettyPrint for TypedCall<E>
+where
+    E: Instr + PrettyPrint,
+{
+    fn fmt_pretty(&self, printer: &mut PrettyPrinter<'_>) -> std::fmt::Result {
+        std::fmt::Write::write_str(printer, "TypedCall { func: ")?;
+        self.func.fmt_pretty(printer)?;
+        std::fmt::Write::write_str(printer, ", args: ")?;
+        fmt_pretty_positional_args(printer, &self.args)?;
+        std::fmt::Write::write_str(printer, ", keywords: ")?;
+        fmt_pretty_keyword_args(printer, &self.keywords)?;
+        std::fmt::Write::write_fmt(printer, format_args!(", access: {:?} }}", self.access))
+    }
+}
+
+impl<E> PrettyPrint for TypedDirectCallableCall<E>
+where
+    E: Instr + PrettyPrint,
+{
+    fn fmt_pretty(&self, printer: &mut PrettyPrinter<'_>) -> std::fmt::Result {
+        std::fmt::Write::write_str(printer, "TypedDirectCallableCall { func: ")?;
+        self.func.fmt_pretty(printer)?;
+        std::fmt::Write::write_str(printer, ", args: ")?;
+        fmt_pretty_positional_args(printer, &self.args)?;
+        std::fmt::Write::write_fmt(printer, format_args!(", guard: {:?} }}", self.guard))
+    }
+}
+
+impl<E> PrettyPrint for TypedGuardedCallableCall<E>
+where
+    E: Instr + PrettyPrint,
+{
+    fn fmt_pretty(&self, printer: &mut PrettyPrinter<'_>) -> std::fmt::Result {
+        std::fmt::Write::write_str(printer, "TypedGuardedCallableCall { func: ")?;
+        self.func.fmt_pretty(printer)?;
+        std::fmt::Write::write_str(printer, ", args: ")?;
+        fmt_pretty_positional_args(printer, &self.args)?;
+        std::fmt::Write::write_str(printer, ", keywords: ")?;
+        fmt_pretty_keyword_args(printer, &self.keywords)?;
+        std::fmt::Write::write_fmt(
+            printer,
+            format_args!(
+                ", function_guards: {:?}, constructor_guards: {:?} }}",
+                self.function_guards, self.constructor_guards
+            ),
+        )
+    }
+}
+
+impl<E> PrettyPrint for TypedGuardedMethodCall<E>
+where
+    E: Instr + PrettyPrint,
+{
+    fn fmt_pretty(&self, printer: &mut PrettyPrinter<'_>) -> std::fmt::Result {
+        std::fmt::Write::write_str(printer, "TypedGuardedMethodCall { func: ")?;
+        self.func.fmt_pretty(printer)?;
+        std::fmt::Write::write_str(printer, ", args: ")?;
+        fmt_pretty_positional_args(printer, &self.args)?;
+        std::fmt::Write::write_str(printer, ", keywords: ")?;
+        fmt_pretty_keyword_args(printer, &self.keywords)?;
+        std::fmt::Write::write_fmt(
+            printer,
+            format_args!(
+                ", method_name: {:?}, method_guards: {:?} }}",
+                self.method_name, self.method_guards
+            ),
+        )
+    }
+}
+
+impl<E> PrettyPrint for TypedDirectMethodCall<E>
+where
+    E: Instr + PrettyPrint,
+{
+    fn fmt_pretty(&self, printer: &mut PrettyPrinter<'_>) -> std::fmt::Result {
+        std::fmt::Write::write_str(printer, "TypedDirectMethodCall { receiver: ")?;
+        self.receiver.fmt_pretty(printer)?;
+        std::fmt::Write::write_str(printer, ", args: ")?;
+        fmt_pretty_positional_args(printer, &self.args)?;
+        std::fmt::Write::write_fmt(
+            printer,
+            format_args!(
+                ", method_name: {:?}, guard: {:?} }}",
+                self.method_name, self.guard
+            ),
+        )
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TypedDirectCallGuardTestKind {

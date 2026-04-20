@@ -49,12 +49,15 @@ macro_rules! define_instr {
             }
         }
 
-        impl<$expr_ty: Instr> $crate::block_py::PrettyPrint for $name<$expr_ty> {
+        impl<$expr_ty> $crate::block_py::PrettyPrint for $name<$expr_ty>
+        where
+            $expr_ty: Instr + $crate::block_py::PrettyPrint,
+        {
             fn fmt_pretty(
                 &self,
                 printer: &mut $crate::block_py::PrettyPrinter<'_>,
             ) -> std::fmt::Result {
-                std::fmt::Write::write_fmt(printer, format_args!("{self:?}"))
+                define_instr!(@pretty_tuple printer, self, $name, $($raw_fields)*)
             }
         }
 
@@ -216,7 +219,7 @@ macro_rules! define_instr {
                 &self,
                 printer: &mut $crate::block_py::PrettyPrinter<'_>,
             ) -> std::fmt::Result {
-                std::fmt::Write::write_fmt(printer, format_args!("{self:?}"))
+                define_instr!(@pretty_tuple printer, self, $name, $($raw_fields)*)
             }
         }
 
@@ -668,6 +671,152 @@ macro_rules! define_instr {
     (@debug_tuple_fields $builder:ident, $self:ident, $field:ident : Option<Box<$expr_ty:ident>>) => {
         $builder.field(&$self.$field);
     };
+    (@pretty_tuple $printer:ident, $self:ident, $name:ident,) => {
+        std::fmt::Write::write_str($printer, stringify!($name))
+    };
+    (@pretty_tuple $printer:ident, $self:ident, $name:ident, $($fields:tt)+) => {{
+        std::fmt::Write::write_str($printer, stringify!($name))?;
+        std::fmt::Write::write_str($printer, "(")?;
+        define_instr!(@pretty_tuple_fields $printer, $self, "", $($fields)+)?;
+        std::fmt::Write::write_str($printer, ")")
+    }};
+    (@pretty_tuple_fields $printer:ident, $self:ident, $sep:expr,) => {
+        Ok(())
+    };
+    (@pretty_tuple_fields $printer:ident, $self:ident, $sep:expr, $field:ident : Box<$expr_ty:ident>, $($rest:tt)*) => {{
+        std::fmt::Write::write_str($printer, $sep)?;
+        define_instr!(@pretty_field $printer, & $self.$field, [Box<$expr_ty>])?;
+        define_instr!(@pretty_tuple_fields $printer, $self, ", ", $($rest)*)
+    }};
+    (@pretty_tuple_fields $printer:ident, $self:ident, $sep:expr, $field:ident : Box<$expr_ty:ident>) => {{
+        std::fmt::Write::write_str($printer, $sep)?;
+        define_instr!(@pretty_field $printer, & $self.$field, [Box<$expr_ty>])
+    }};
+    (@pretty_tuple_fields $printer:ident, $self:ident, $sep:expr, $field:ident : Vec<CallArgPositional<$expr_ty:ident>>, $($rest:tt)*) => {{
+        std::fmt::Write::write_str($printer, $sep)?;
+        define_instr!(@pretty_field $printer, & $self.$field, [Vec<CallArgPositional<$expr_ty>>])?;
+        define_instr!(@pretty_tuple_fields $printer, $self, ", ", $($rest)*)
+    }};
+    (@pretty_tuple_fields $printer:ident, $self:ident, $sep:expr, $field:ident : Vec<CallArgPositional<$expr_ty:ident>>) => {{
+        std::fmt::Write::write_str($printer, $sep)?;
+        define_instr!(@pretty_field $printer, & $self.$field, [Vec<CallArgPositional<$expr_ty>>])
+    }};
+    (@pretty_tuple_fields $printer:ident, $self:ident, $sep:expr, $field:ident : Vec<CallArgKeyword<$expr_ty:ident>>, $($rest:tt)*) => {{
+        std::fmt::Write::write_str($printer, $sep)?;
+        define_instr!(@pretty_field $printer, & $self.$field, [Vec<CallArgKeyword<$expr_ty>>])?;
+        define_instr!(@pretty_tuple_fields $printer, $self, ", ", $($rest)*)
+    }};
+    (@pretty_tuple_fields $printer:ident, $self:ident, $sep:expr, $field:ident : Vec<CallArgKeyword<$expr_ty:ident>>) => {{
+        std::fmt::Write::write_str($printer, $sep)?;
+        define_instr!(@pretty_field $printer, & $self.$field, [Vec<CallArgKeyword<$expr_ty>>])
+    }};
+    (@pretty_tuple_fields $printer:ident, $self:ident, $sep:expr, $field:ident : Vec<$expr_ty:ident>, $($rest:tt)*) => {{
+        std::fmt::Write::write_str($printer, $sep)?;
+        define_instr!(@pretty_field $printer, & $self.$field, [Vec<$expr_ty>])?;
+        define_instr!(@pretty_tuple_fields $printer, $self, ", ", $($rest)*)
+    }};
+    (@pretty_tuple_fields $printer:ident, $self:ident, $sep:expr, $field:ident : Vec<$expr_ty:ident>) => {{
+        std::fmt::Write::write_str($printer, $sep)?;
+        define_instr!(@pretty_field $printer, & $self.$field, [Vec<$expr_ty>])
+    }};
+    (@pretty_tuple_fields $printer:ident, $self:ident, $sep:expr, $field:ident : Option<Box<$expr_ty:ident>>, $($rest:tt)*) => {{
+        std::fmt::Write::write_str($printer, $sep)?;
+        define_instr!(@pretty_field $printer, & $self.$field, [Option<Box<$expr_ty>>])?;
+        define_instr!(@pretty_tuple_fields $printer, $self, ", ", $($rest)*)
+    }};
+    (@pretty_tuple_fields $printer:ident, $self:ident, $sep:expr, $field:ident : Option<Box<$expr_ty:ident>>) => {{
+        std::fmt::Write::write_str($printer, $sep)?;
+        define_instr!(@pretty_field $printer, & $self.$field, [Option<Box<$expr_ty>>])
+    }};
+    (@pretty_tuple_fields $printer:ident, $self:ident, $sep:expr, $field:ident : $ty:ty, $($rest:tt)*) => {{
+        std::fmt::Write::write_str($printer, $sep)?;
+        define_instr!(@pretty_field $printer, & $self.$field, [$ty])?;
+        define_instr!(@pretty_tuple_fields $printer, $self, ", ", $($rest)*)
+    }};
+    (@pretty_tuple_fields $printer:ident, $self:ident, $sep:expr, $field:ident : $ty:ty) => {{
+        std::fmt::Write::write_str($printer, $sep)?;
+        define_instr!(@pretty_field $printer, & $self.$field, [$ty])
+    }};
+    (@pretty_field $printer:ident, $value:expr, [Box<$expr_ty:ident>]) => {
+        $crate::block_py::PrettyPrint::fmt_pretty(($value).as_ref(), $printer)
+    };
+    (@pretty_field $printer:ident, $value:expr, [Vec<$expr_ty:ident>]) => {{
+        std::fmt::Write::write_str($printer, "[")?;
+        let mut first = true;
+        for item in ($value).iter() {
+            if !first {
+                std::fmt::Write::write_str($printer, ", ")?;
+            }
+            first = false;
+            $crate::block_py::PrettyPrint::fmt_pretty(item, $printer)?;
+        }
+        std::fmt::Write::write_str($printer, "]")
+    }};
+    (@pretty_field $printer:ident, $value:expr, [Option<Box<$expr_ty:ident>>]) => {{
+        match ($value).as_deref() {
+            Some(value) => {
+                std::fmt::Write::write_str($printer, "Some(")?;
+                $crate::block_py::PrettyPrint::fmt_pretty(value, $printer)?;
+                std::fmt::Write::write_str($printer, ")")
+            }
+            None => std::fmt::Write::write_str($printer, "None"),
+        }
+    }};
+    (@pretty_field $printer:ident, $value:expr, [Vec<CallArgPositional<$expr_ty:ident>>]) => {{
+        std::fmt::Write::write_str($printer, "[")?;
+        let mut first = true;
+        for item in ($value).iter() {
+            if !first {
+                std::fmt::Write::write_str($printer, ", ")?;
+            }
+            first = false;
+            define_instr!(@pretty_positional_arg $printer, item)?;
+        }
+        std::fmt::Write::write_str($printer, "]")
+    }};
+    (@pretty_field $printer:ident, $value:expr, [Vec<CallArgKeyword<$expr_ty:ident>>]) => {{
+        std::fmt::Write::write_str($printer, "[")?;
+        let mut first = true;
+        for item in ($value).iter() {
+            if !first {
+                std::fmt::Write::write_str($printer, ", ")?;
+            }
+            first = false;
+            define_instr!(@pretty_keyword_arg $printer, item)?;
+        }
+        std::fmt::Write::write_str($printer, "]")
+    }};
+    (@pretty_field $printer:ident, $value:expr, [$ty:ty]) => {
+        std::fmt::Write::write_fmt($printer, format_args!("{:?}", $value))
+    };
+    (@pretty_positional_arg $printer:ident, $arg:expr) => {{
+        match $arg {
+            $crate::block_py::CallArgPositional::Positional(expr) => {
+                std::fmt::Write::write_str($printer, "Positional(")?;
+                $crate::block_py::PrettyPrint::fmt_pretty(expr, $printer)?;
+                std::fmt::Write::write_str($printer, ")")
+            }
+            $crate::block_py::CallArgPositional::Starred(expr) => {
+                std::fmt::Write::write_str($printer, "Starred(")?;
+                $crate::block_py::PrettyPrint::fmt_pretty(expr, $printer)?;
+                std::fmt::Write::write_str($printer, ")")
+            }
+        }
+    }};
+    (@pretty_keyword_arg $printer:ident, $arg:expr) => {{
+        match $arg {
+            $crate::block_py::CallArgKeyword::Named { arg, value } => {
+                std::fmt::Write::write_fmt($printer, format_args!("Named {{ arg: {:?}, value: ", arg))?;
+                $crate::block_py::PrettyPrint::fmt_pretty(value, $printer)?;
+                std::fmt::Write::write_str($printer, " }")
+            }
+            $crate::block_py::CallArgKeyword::Starred(value) => {
+                std::fmt::Write::write_str($printer, "Starred(")?;
+                $crate::block_py::PrettyPrint::fmt_pretty(value, $printer)?;
+                std::fmt::Write::write_str($printer, ")")
+            }
+        }
+    }};
     (@build_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $f:ident,) => {
         $($mapped_ctor)+ { _meta: $self._meta, extra: Default::default(), $($out)* }
     };
