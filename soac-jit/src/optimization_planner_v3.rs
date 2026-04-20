@@ -1,6 +1,5 @@
 use crate::optimization_alternatives_v3::{
-    ALTERNATIVE_CATALOG_V3_VERSION, AlternativeCatalog, AlternativeId, FailureTargets,
-    LoweringAlternative,
+    AlternativeCatalog, AlternativeId, FailureTargets, LoweringAlternative,
 };
 use crate::optimization_plan_v3::{
     ConversionKind, ConversionOwnership, ConversionPrecondition, ConvertNode, FailureMode,
@@ -8,7 +7,7 @@ use crate::optimization_plan_v3::{
     FunctionPlanIdentity, MaterializeKind, MaterializeNode, ModuleOptimizationPlanV3,
     ModulePlanIdentity, OperationNode, PlanDiagnostic, PlanNode, PlanNodeId, PlanNodeKind,
     PlanValue, PlannedConstant, RegionExitKind, RegionExitPlan, RegionExitTarget, RegionId,
-    RegionInput, RegionInputSource, RegionPlan, RegionSource, Rep, RichCompareOp,
+    RegionInput, RegionInputSource, RegionPlan, RegionSource, Rep,
 };
 use crate::optimization_region_v3::{
     ExtractedExit, ExtractedRegion, ExtractedValue, ExtractedValueId, ExtractedValueKind,
@@ -417,6 +416,8 @@ fn operation_node(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::optimization_alternatives_v3::ALTERNATIVE_CATALOG_V3_VERSION;
+    use crate::optimization_plan_v3::RichCompareOp;
     use crate::optimization_plan_v3::validate_module_plan_v3;
     use crate::optimization_region_v3::extract_block_region_v3;
     use soac_core::block_py::{

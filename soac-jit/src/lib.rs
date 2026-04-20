@@ -27,6 +27,7 @@ pub mod optimization_plan;
 pub mod optimization_plan_v3;
 pub mod optimization_planner_v3;
 pub mod optimization_region_v3;
+pub mod optimization_v3_status;
 pub mod session;
 
 pub use session::{CompileSession, CompileSessionId, allocate_compile_session_id};

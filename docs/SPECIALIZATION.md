@@ -10,6 +10,35 @@ For each specialization, this covers:
 - current limitations, soundness boundaries, and likely extensions
 
 
+## Optimizer v3 Status
+
+Optimizer v3 is the forward path for new semantic optimization work. Its
+current implementation is a comparison path, not the live JIT lowering path:
+it extracts small branch/return regions, derives explicit facts from profile
+evidence, selects alternatives into `ModuleOptimizationPlanV3`, validates the
+full plan, and emits a mechanical neutral stream for later codegen integration.
+
+The first represented slice is exact-compact-`int` `a + b > 0` branch planning:
+`operator_hot_shapes` exact-int evidence proves the operands, an explicit
+constant hint proves `0`, the v3 planner emits a hot checked-`i64` add/compare
+region plus a local generic Python fallback region, and
+`emit_mechanical_plan_v3` refuses invalid plans before emitting steps.
+
+Legacy optimization families remain available for comparison while they are
+migrated. Do not expand a legacy family as the primary implementation path
+unless there is a specific reason; add the v3 catalog alternative, fact bridge,
+planner rule, validation, and mechanical-emitter coverage first.
+
+Current migration surface:
+
+- Represented for v3 comparison: exact-int add/compare branch slice.
+- Legacy only: other exact-int binary/unary operators, profiled direct calls,
+  exact-list getitem/setitem, indexed globals, and indexed fields.
+- Not currently a v3 semantic-plan target: branch locality and cold block
+  layout hints. These remain layout metadata unless a future CFG-placement plan
+  needs to represent them.
+
+
 ## Profiling Input
 
 The counter dump contains hot specialization input, cold key-layout

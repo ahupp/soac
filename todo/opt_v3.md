@@ -35,6 +35,40 @@ Non-goals:
 - Do not treat annotations or profile observations as unconditional facts.
 
 
+## Implementation Status
+
+The first implementation stack establishes v3 as an off-by-default comparison
+path rather than replacing live JIT lowering immediately.
+
+Implemented:
+
+- `optimization_plan_v3`: full plan schema, conversion signatures, operation
+  signatures, replay-safety validation, and structural validation.
+- `optimization_alternatives_v3`: default catalog entries for generic Python
+  add/compare, exact compact-int add/compare, truthiness, and materialization.
+- `optimization_region_v3`: conservative branch/return region extraction that
+  preserves evaluation order and declines unsupported blocks explicitly.
+- `optimization_planner_v3`: bounded planner for exact-compact-`int`
+  `a + b > 0` branches, producing hot and local-fallback `RegionPlan`s.
+- `optimization_emit_v3`: validation-gated mechanical emitter over selected v3
+  plan nodes and exits.
+- `optimization_evidence_v3`: bridge from existing `FunctionProfileEvidence`
+  exact-int operator shapes into v3 planner facts.
+- `optimization_pipeline_v3`: off-by-default exact-int branch comparison path
+  that composes extraction, evidence, planning, validation, and mechanical
+  emission.
+
+Remaining legacy-only families are intentionally visible:
+
+- other exact-int binary/unary operators;
+- profiled direct calls;
+- exact-list getitem/setitem;
+- indexed globals and indexed fields.
+
+Branch locality and cold block hints remain layout metadata for now, not v3
+semantic plan targets.
+
+
 ## Isolated Model
 
 ### Semantic Program
