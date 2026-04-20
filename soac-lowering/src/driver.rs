@@ -52,8 +52,11 @@ struct PreOptimizationModule {
 }
 
 impl PrettyPrint for AstToAstPassResult {
-    fn pretty_print(&self) -> String {
-        crate::ruff_ast_to_string(&self.module)
+    fn fmt_pretty(
+        &self,
+        printer: &mut crate::block_py::PrettyPrinter<'_>,
+    ) -> std::fmt::Result {
+        std::fmt::Write::write_str(printer, &crate::ruff_ast_to_string(&self.module))
     }
 }
 

@@ -6,8 +6,11 @@ use soac_core::block_py::PrettyPrint;
 struct TestPrettySuite(Suite);
 
 impl PrettyPrint for TestPrettySuite {
-    fn pretty_print(&self) -> String {
-        crate::ruff_ast_to_string(&self.0)
+    fn fmt_pretty(
+        &self,
+        printer: &mut soac_core::block_py::PrettyPrinter<'_>,
+    ) -> std::fmt::Result {
+        std::fmt::Write::write_str(printer, &crate::ruff_ast_to_string(&self.0))
     }
 }
 

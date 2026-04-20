@@ -1,10 +1,12 @@
 use super::instr_macro::{define_instr, define_ruff_instr};
 use super::{
     CallArgKeyword, CallArgPositional, CellLocation, ChildVisitable, FunctionKind, HasMeta, Instr,
-    MapInstr, Mappable, Meta, NameLike, RuntimeFunctionId, TryMapInstr, WithMeta,
+    InstrField, MapInstr, Mappable, Meta, NameLike, PrettyPrint, PrettyPrinter, RuntimeFunctionId,
+    TryMapInstr, Visit, VisitMut, WithMeta,
 };
 use ruff_python_ast::{self as ast};
 use std::fmt;
+use std::fmt::Write;
 
 #[derive(
     Debug, Clone, Copy, Eq, PartialEq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
@@ -189,6 +191,47 @@ impl<E: Instr + fmt::Debug> fmt::Debug for Call<E> {
             }
         }
         write!(f, ")")
+    }
+}
+
+impl<E> PrettyPrint for Call<E>
+where
+    E: Instr + PrettyPrint,
+{
+    fn fmt_pretty(&self, printer: &mut PrettyPrinter<'_>) -> fmt::Result {
+        self.func.as_ref().fmt_pretty(printer)?;
+        printer.write_char('(')?;
+        let mut first = true;
+        for arg in &self.args {
+            if !first {
+                printer.write_str(", ")?;
+            }
+            first = false;
+            match arg {
+                CallArgPositional::Positional(expr) => expr.fmt_pretty(printer)?,
+                CallArgPositional::Starred(expr) => {
+                    printer.write_char('*')?;
+                    expr.fmt_pretty(printer)?;
+                }
+            }
+        }
+        for keyword in &self.keywords {
+            if !first {
+                printer.write_str(", ")?;
+            }
+            first = false;
+            match keyword {
+                CallArgKeyword::Named { arg, value } => {
+                    write!(printer, "{arg}=")?;
+                    value.fmt_pretty(printer)?;
+                }
+                CallArgKeyword::Starred(value) => {
+                    printer.write_str("**")?;
+                    value.fmt_pretty(printer)?;
+                }
+            }
+        }
+        printer.write_char(')')
     }
 }
 
@@ -389,6 +432,40 @@ impl<E: Instr + fmt::Debug> fmt::Debug for CallDirect<E> {
             }
         }
         write!(f, ")")
+    }
+}
+
+impl<E> PrettyPrint for CallDirect<E>
+where
+    E: Instr + PrettyPrint,
+{
+    fn fmt_pretty(&self, printer: &mut PrettyPrinter<'_>) -> fmt::Result {
+        write!(printer, "CallDirect({}, ", self.function_id)?;
+        self.callable.as_ref().fmt_pretty(printer)?;
+        for arg in &self.args {
+            printer.write_str(", ")?;
+            match arg {
+                CallArgPositional::Positional(expr) => expr.fmt_pretty(printer)?,
+                CallArgPositional::Starred(expr) => {
+                    printer.write_char('*')?;
+                    expr.fmt_pretty(printer)?;
+                }
+            }
+        }
+        for keyword in &self.keywords {
+            printer.write_str(", ")?;
+            match keyword {
+                CallArgKeyword::Named { arg, value } => {
+                    write!(printer, "{arg}=")?;
+                    value.fmt_pretty(printer)?;
+                }
+                CallArgKeyword::Starred(value) => {
+                    printer.write_str("**")?;
+                    value.fmt_pretty(printer)?;
+                }
+            }
+        }
+        printer.write_char(')')
     }
 }
 
@@ -611,6 +688,12 @@ impl<I: Instr> fmt::Debug for Load<I> {
     }
 }
 
+impl<I: Instr> PrettyPrint for Load<I> {
+    fn fmt_pretty(&self, printer: &mut PrettyPrinter<'_>) -> fmt::Result {
+        printer.write_str(&self.name.pretty_id())
+    }
+}
+
 impl<I: Instr> Load<I> {
     pub fn new(name: impl Into<I::Name>) -> Self {
         Self {
@@ -734,6 +817,21 @@ impl<I: Instr> fmt::Debug for Store<I> {
                 self.value
             )
         }
+    }
+}
+
+impl<I> PrettyPrint for Store<I>
+where
+    I: Instr + PrettyPrint,
+{
+    fn fmt_pretty(&self, printer: &mut PrettyPrinter<'_>) -> fmt::Result {
+        if self.name.pretty_id() == self.name.id_str() {
+            write!(printer, "StoreName({:?}, ", self.name.id_str())?;
+        } else {
+            write!(printer, "StoreLocation({}, ", self.name.pretty_id())?;
+        }
+        self.value.as_ref().fmt_pretty(printer)?;
+        printer.write_char(')')
     }
 }
 
@@ -861,6 +959,17 @@ impl<I: Instr> fmt::Debug for Del<I> {
             .field("name", &self.name.pretty_id())
             .field("quietly", &self.quietly)
             .finish()
+    }
+}
+
+impl<I: Instr> PrettyPrint for Del<I> {
+    fn fmt_pretty(&self, printer: &mut PrettyPrinter<'_>) -> fmt::Result {
+        write!(
+            printer,
+            "Del {{ name: {:?}, quietly: {} }}",
+            self.name.pretty_id(),
+            self.quietly
+        )
     }
 }
 
@@ -1039,23 +1148,149 @@ impl<E: Instr> MakeFunctionWithClosure<E> {
     }
 }
 
-define_instr! {
-    pub struct Await<E> {
-        value: Box<E>,
+macro_rules! define_suspend_instr {
+    ($name:ident, $prefix:literal) => {
+        #[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+        pub struct $name<E: Instr> {
+            _meta: Meta,
+            pub extra: E::Extra,
+            pub value: Box<E>,
+        }
+
+        impl<E: Instr> fmt::Debug for $name<E> {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                let mut debug = f.debug_tuple(stringify!($name));
+                debug.field(&self.value);
+                debug.finish()
+            }
+        }
+
+        impl<E> PrettyPrint for $name<E>
+        where
+            E: Instr + PrettyPrint,
+        {
+            fn fmt_pretty(&self, printer: &mut PrettyPrinter<'_>) -> fmt::Result {
+                printer.write_str($prefix)?;
+                self.value.fmt_pretty(printer)
+            }
+        }
+
+        impl<E: Instr> $name<E> {
+            pub fn new(value: impl Into<Box<E>>) -> Self {
+                Self {
+                    _meta: Meta::default(),
+                    extra: Default::default(),
+                    value: value.into(),
+                }
+            }
+
+            pub fn with_extra(mut self, extra: E::Extra) -> Self {
+                self.extra = extra;
+                self
+            }
+
+            pub fn extra(&self) -> &E::Extra {
+                &self.extra
+            }
+
+            pub fn extra_mut(&mut self) -> &mut E::Extra {
+                &mut self.extra
+            }
+        }
+
+        impl<E: Instr> HasMeta for $name<E> {
+            fn meta(&self) -> Meta {
+                self._meta.clone()
+            }
+        }
+
+        impl<E: Instr> WithMeta for $name<E> {
+            fn with_meta(mut self, meta: Meta) -> Self {
+                self._meta = meta;
+                self
+            }
+        }
+
+        impl<E> ChildVisitable<E> for $name<E>
+        where
+            E: Instr + ChildVisitable<E>,
+        {
+            fn visit_children<V>(&self, visitor: &mut V)
+            where
+                V: Visit<E> + ?Sized,
+            {
+                InstrField::<E>::visit_field(&self.value, visitor);
+            }
+
+            fn visit_children_mut<V>(&mut self, visitor: &mut V)
+            where
+                V: VisitMut<E> + ?Sized,
+            {
+                InstrField::<E>::visit_field_mut(&mut self.value, visitor);
+            }
+        }
+
+        impl<E: Instr> Mappable<E> for $name<E> {
+            type Mapped<T: Instr> = $name<T>;
+
+            fn map_children<T, M>(self, map: &mut M) -> Self::Mapped<T>
+            where
+                T: Instr,
+                M: MapInstr<E, T>,
+            {
+                $name::<T> {
+                    _meta: self._meta,
+                    extra: Default::default(),
+                    value: InstrField::<E>::map_field::<T, M>(self.value, map),
+                }
+            }
+
+            fn try_map_children<T, Error, M>(
+                self,
+                map: &mut M,
+            ) -> Result<Self::Mapped<T>, Error>
+            where
+                T: Instr,
+                M: TryMapInstr<E, T, Error>,
+            {
+                Ok($name::<T> {
+                    _meta: self._meta,
+                    extra: Default::default(),
+                    value: InstrField::<E>::try_map_field::<T, Error, M>(self.value, map)?,
+                })
+            }
+
+            fn map_same_children<M>(self, map: &mut M) -> Self::Mapped<E>
+            where
+                M: MapInstr<E, E>,
+            {
+                $name::<E> {
+                    _meta: self._meta,
+                    extra: self.extra,
+                    value: InstrField::<E>::map_field::<E, M>(self.value, map),
+                }
+            }
+
+            fn try_map_same_children<Error, M>(
+                self,
+                map: &mut M,
+            ) -> Result<Self::Mapped<E>, Error>
+            where
+                M: TryMapInstr<E, E, Error>,
+            {
+                Ok($name::<E> {
+                    _meta: self._meta,
+                    extra: self.extra,
+                    value: InstrField::<E>::try_map_field::<E, Error, M>(self.value, map)?,
+                })
+            }
+        }
     }
 }
 
-define_instr! {
-    pub struct Yield<E> {
-        value: Box<E>,
-    }
-}
-
-define_instr! {
-    pub struct YieldFrom<E> {
-        value: Box<E>,
-    }
-}
+define_suspend_instr!(Await, "await ");
+define_suspend_instr!(Yield, "yield ");
+define_suspend_instr!(YieldFrom, "yield from ");
 
 define_ruff_instr! {
     pub struct ExprBoolOp<E> {

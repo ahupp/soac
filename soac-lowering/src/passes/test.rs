@@ -100,8 +100,8 @@ fn tracked_core_blockpy_with_yield_only(source: &str) -> BlockPyModule<CoreModul
 fn assert_all_targets_present<P, S>(module: &BlockPyModule<P>)
 where
     P: crate::block_py::ModuleShape<Instr = S> + crate::block_py::BlockPyFormat,
-    S: crate::block_py::Instr + std::fmt::Debug,
-    P::Instr: std::fmt::Debug,
+    S: crate::block_py::Instr + crate::block_py::PrettyPrint,
+    P::Instr: crate::block_py::PrettyPrint,
 {
     let rendered = module.pretty_print();
     for callable in &module.callable_defs {
@@ -233,7 +233,7 @@ fn slot_by_name<'a>(slots: &'a [ClosureSlot], logical_name: &str) -> &'a Closure
         .unwrap_or_else(|| panic!("missing closure slot {logical_name}; got {slots:?}"))
 }
 
-fn expr_text(expr: &impl std::fmt::Debug) -> String {
+fn expr_text(expr: &impl crate::block_py::PrettyPrint) -> String {
     crate::block_py::bb_expr_text(expr)
 }
 

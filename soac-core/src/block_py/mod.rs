@@ -53,7 +53,10 @@ pub use name_gen::{
     PersistentFunctionId, RuntimeFunctionId, RuntimeModuleId, SerializedFunctionDebugName,
     SerializedFunctionId, SerializedIdentityTables, SerializedModuleId, SerializedModuleIdentity,
 };
-pub use pretty::{BlockPyFormat, PrettyPrint, bb_expr_text, blockpy_module_to_string};
+pub use pretty::{
+    BlockPyFormat, PrettyConfig, PrettyMode, PrettyPrint, PrettyPrinter, bb_expr_text,
+    blockpy_module_to_string,
+};
 
 fn is_internal_symbol(name: &str) -> bool {
     name.starts_with("_dp_") || name == "__soac__"

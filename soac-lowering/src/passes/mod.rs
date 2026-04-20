@@ -31,18 +31,18 @@ use crate::block_py::{
     ExprTuple, GetAttr, GetItem, HasMeta, IncrementCounter, Instr, InstrKey, InstrWithConstantNone,
     LiteralValue, Load, LocalLocation, MakeCell, MakeFunction, MakeFunctionWithClosure,
     MapFunction, MapInstr, MapModule, Mappable, Meta, ModuleShape, NameLike, NameLocation,
-    ResolvedName, RuntimeFunctionId, RuntimeName, SetAttr, SetItem, StmtAnnAssign, StmtAssert,
-    StmtAssign, StmtAugAssign, StmtBreak, StmtClassDef, StmtContinue, StmtDelete, StmtExpr,
-    StmtFor, StmtFunctionDef, StmtGlobal, StmtIf, StmtImport, StmtImportFrom, StmtIpyEscapeCommand,
-    StmtMatch, StmtNonlocal, StmtPass, StmtRaise, StmtReturn, StmtTry, StmtTypeAlias, StmtWhile,
-    StmtWith, Store, TryMapInstr, TryMapModule, TryMapTerm, Tuple, UnaryOp, UnresolvedName, Visit,
-    VisitMut, WithMeta, Yield, YieldFrom,
+    PrettyPrint, ResolvedName, RuntimeFunctionId, RuntimeName, SetAttr, SetItem, StmtAnnAssign,
+    StmtAssert, StmtAssign, StmtAugAssign, StmtBreak, StmtClassDef, StmtContinue, StmtDelete,
+    StmtExpr, StmtFor, StmtFunctionDef, StmtGlobal, StmtIf, StmtImport, StmtImportFrom,
+    StmtIpyEscapeCommand, StmtMatch, StmtNonlocal, StmtPass, StmtRaise, StmtReturn, StmtTry,
+    StmtTypeAlias, StmtWhile, StmtWith, Store, TryMapInstr, TryMapModule, TryMapTerm, Tuple,
+    UnaryOp, UnresolvedName, Visit, VisitMut, WithMeta, Yield, YieldFrom,
 };
 use ruff_python_ast::{self as ast};
 use soac_macros::{enum_broadcast, DelegateMatchDefault};
 
 #[derive(Clone, derive_more::From, DelegateMatchDefault)]
-#[enum_broadcast(HasMeta, WithMeta, ChildVisitable, Mappable, Debug)]
+#[enum_broadcast(HasMeta, WithMeta, ChildVisitable, Mappable, PrettyPrint, Debug)]
 pub enum InstrRuff {
     ExprBoolOp(ExprBoolOp<Self>),
     ExprNamed(ExprNamed<Self>),
@@ -132,7 +132,7 @@ impl InstrWithConstantNone for InstrRuff {
 #[rkyv(bytecheck(bounds(
     __C: rkyv::validation::ArchiveContext,
 )))]
-#[enum_broadcast(HasMeta, WithMeta, ChildVisitable, Mappable, Debug)]
+#[enum_broadcast(HasMeta, WithMeta, ChildVisitable, Mappable, PrettyPrint, Debug)]
 pub enum InstrCodegenOp {
     BinOp(#[rkyv(omit_bounds)] BinOp<Self>),
     UnaryOp(#[rkyv(omit_bounds)] UnaryOp<Self>),
@@ -942,6 +942,25 @@ impl<E: Instr> Mappable<E> for TypedDirectMethodCall<E> {
     }
 }
 
+macro_rules! impl_debug_pretty_print {
+    ($name:ident) => {
+        impl<E: Instr> PrettyPrint for $name<E> {
+            fn fmt_pretty(
+                &self,
+                printer: &mut crate::block_py::PrettyPrinter<'_>,
+            ) -> std::fmt::Result {
+                std::fmt::Write::write_fmt(printer, format_args!("{self:?}"))
+            }
+        }
+    };
+}
+
+impl_debug_pretty_print!(TypedCall);
+impl_debug_pretty_print!(TypedDirectCallableCall);
+impl_debug_pretty_print!(TypedGuardedCallableCall);
+impl_debug_pretty_print!(TypedGuardedMethodCall);
+impl_debug_pretty_print!(TypedDirectMethodCall);
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TypedDirectCallGuardTestKind {
     RuntimeFunctionId {
@@ -1066,7 +1085,7 @@ impl<E: Instr> TypedSetAttr<E> {
 }
 
 #[derive(Clone, derive_more::From, DelegateMatchDefault)]
-#[enum_broadcast(HasMeta, WithMeta, ChildVisitable, Mappable, Debug)]
+#[enum_broadcast(HasMeta, WithMeta, ChildVisitable, Mappable, PrettyPrint, Debug)]
 pub enum InstrTyped {
     Truthy(TypedTruthy<Self>),
     Load(Load<Self>),
@@ -2308,7 +2327,7 @@ impl InstrWithConstantNone for InstrCodegenOp {
 }
 
 #[derive(Clone, derive_more::From, DelegateMatchDefault)]
-#[enum_broadcast(HasMeta, WithMeta, ChildVisitable, Mappable, Debug)]
+#[enum_broadcast(HasMeta, WithMeta, ChildVisitable, Mappable, PrettyPrint, Debug)]
 pub enum InstrWithAwaitAndYield {
     Literal(LiteralValue),
     BinOp(BinOp<Self>),
@@ -2344,7 +2363,7 @@ impl InstrWithConstantNone for InstrWithAwaitAndYield {
 }
 
 #[derive(Clone, derive_more::From, DelegateMatchDefault)]
-#[enum_broadcast(HasMeta, WithMeta, ChildVisitable, Mappable, Debug)]
+#[enum_broadcast(HasMeta, WithMeta, ChildVisitable, Mappable, PrettyPrint, Debug)]
 pub enum InstrWithYield {
     Literal(LiteralValue),
     BinOp(BinOp<Self>),
@@ -2400,7 +2419,7 @@ impl InstrWithConstantNone for InstrWithYield {
     __C: rkyv::validation::ArchiveContext,
     rkyv::Archived<N>: rkyv::bytecheck::CheckBytes<__C>,
 )))]
-#[enum_broadcast(HasMeta, WithMeta, ChildVisitable, Mappable, Debug)]
+#[enum_broadcast(HasMeta, WithMeta, ChildVisitable, Mappable, PrettyPrint, Debug)]
 pub enum InstrLow<N: NameLike> {
     Literal(LiteralValue),
     BinOp(#[rkyv(omit_bounds)] BinOp<Self>),
@@ -2451,7 +2470,7 @@ pub type InstrUnresolved = InstrLow<UnresolvedName>;
 #[rkyv(bytecheck(bounds(
     __C: rkyv::validation::ArchiveContext,
 )))]
-#[enum_broadcast(HasMeta, WithMeta, ChildVisitable, Mappable, Debug)]
+#[enum_broadcast(HasMeta, WithMeta, ChildVisitable, Mappable, PrettyPrint, Debug)]
 pub enum InstrResolved {
     Literal(LiteralValue),
     BinOp(#[rkyv(omit_bounds)] BinOp<Self>),

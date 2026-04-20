@@ -53,7 +53,10 @@ impl EscapeSummaryModule {
 }
 
 impl PrettyPrint for EscapeSummaryModule {
-    fn pretty_print(&self) -> String {
+    fn fmt_pretty(
+        &self,
+        printer: &mut crate::block_py::PrettyPrinter<'_>,
+    ) -> std::fmt::Result {
         let mut function_ids = self.functions.keys().copied().collect::<Vec<_>>();
         function_ids.sort_by_key(|function_id| function_id.to_packed_runtime_u64());
         let mut out = String::new();
@@ -94,9 +97,9 @@ impl PrettyPrint for EscapeSummaryModule {
             }
         }
         if out.is_empty() {
-            "; no constructor escape summaries\n".to_string()
+            std::fmt::Write::write_str(printer, "; no constructor escape summaries\n")
         } else {
-            out
+            std::fmt::Write::write_str(printer, &out)
         }
     }
 }

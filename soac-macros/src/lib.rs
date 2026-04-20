@@ -47,6 +47,7 @@ enum EnumBroadcastTarget {
     WithMeta,
     ChildVisitable,
     Mappable,
+    PrettyPrint,
     Debug,
 }
 
@@ -61,10 +62,11 @@ impl EnumBroadcastTarget {
             "WithMeta" => Ok(Self::WithMeta),
             "ChildVisitable" => Ok(Self::ChildVisitable),
             "Mappable" => Ok(Self::Mappable),
+            "PrettyPrint" => Ok(Self::PrettyPrint),
             "Debug" => Ok(Self::Debug),
             _ => Err(syn::Error::new_spanned(
                 segment,
-                "unsupported enum_broadcast target; supported targets are HasMeta, WithMeta, ChildVisitable, Mappable, and Debug",
+                "unsupported enum_broadcast target; supported targets are HasMeta, WithMeta, ChildVisitable, Mappable, PrettyPrint, and Debug",
             )),
         }
     }
@@ -142,6 +144,12 @@ impl EnumBroadcastTarget {
                 _ => quote! {
                     Self::#variant_name(node) => node.fmt(f),
                 },
+            }
+        });
+        let pretty_print_arms = variants.iter().map(|variant| {
+            let variant_name = &variant.ident;
+            quote! {
+                Self::#variant_name(node) => crate::block_py::PrettyPrint::fmt_pretty(node, printer),
             }
         });
 
@@ -224,6 +232,18 @@ impl EnumBroadcastTarget {
                     {
                         match self {
                             #( #try_map_same_children_arms )*
+                        }
+                    }
+                }
+            },
+            Self::PrettyPrint => quote! {
+                impl #impl_generics crate::block_py::PrettyPrint for #enum_name #ty_generics #where_clause {
+                    fn fmt_pretty(
+                        &self,
+                        printer: &mut crate::block_py::PrettyPrinter<'_>,
+                    ) -> std::fmt::Result {
+                        match self {
+                            #( #pretty_print_arms )*
                         }
                     }
                 }

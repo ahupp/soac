@@ -1,5 +1,4 @@
 use super::*;
-use soac_core::block_py::define_instr;
 use std::fmt;
 
 #[derive(Clone, derive_more::From, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -19,9 +18,83 @@ impl fmt::Debug for Literal {
     }
 }
 
-define_instr! {
-    pub struct LiteralValue {
-        literal: Literal,
+#[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct LiteralValue {
+    _meta: Meta,
+    pub literal: Literal,
+}
+
+impl fmt::Debug for LiteralValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug = f.debug_tuple("LiteralValue");
+        debug.field(&self.literal);
+        debug.finish()
+    }
+}
+
+impl PrettyPrint for LiteralValue {
+    fn fmt_pretty(&self, printer: &mut PrettyPrinter<'_>) -> fmt::Result {
+        std::fmt::Write::write_fmt(printer, format_args!("{:?}", self.literal))
+    }
+}
+
+impl LiteralValue {
+    pub fn new(literal: impl Into<Literal>) -> Self {
+        Self {
+            _meta: Meta::default(),
+            literal: literal.into(),
+        }
+    }
+}
+
+impl HasMeta for LiteralValue {
+    fn meta(&self) -> Meta {
+        self._meta.clone()
+    }
+}
+
+impl WithMeta for LiteralValue {
+    fn with_meta(mut self, meta: Meta) -> Self {
+        self._meta = meta;
+        self
+    }
+}
+
+impl<E: Instr> ChildVisitable<E> for LiteralValue {
+    fn visit_children<V>(&self, visitor: &mut V)
+    where
+        V: Visit<E> + ?Sized,
+    {
+        let _ = visitor;
+    }
+
+    fn visit_children_mut<V>(&mut self, visitor: &mut V)
+    where
+        V: VisitMut<E> + ?Sized,
+    {
+        let _ = visitor;
+    }
+}
+
+impl<E: Instr> Mappable<E> for LiteralValue {
+    type Mapped<T: Instr> = LiteralValue;
+
+    fn map_children<T, M>(self, map: &mut M) -> Self::Mapped<T>
+    where
+        T: Instr,
+        M: MapInstr<E, T>,
+    {
+        let _ = map;
+        self
+    }
+
+    fn try_map_children<T, Error, M>(self, map: &mut M) -> Result<Self::Mapped<T>, Error>
+    where
+        T: Instr,
+        M: TryMapInstr<E, T, Error>,
+    {
+        let _ = map;
+        Ok(self)
     }
 }
 

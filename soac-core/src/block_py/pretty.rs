@@ -5,7 +5,7 @@ use super::{
 use crate::block_py::{ParamKind, ParamSpec};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::marker::PhantomData;
+use std::fmt::Write;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum IfBranchKind {
@@ -23,69 +23,119 @@ pub trait BlockPyFormat: ModuleShape {
 }
 
 pub trait PrettyPrint {
-    fn pretty_print(&self) -> String;
+    fn fmt_pretty(&self, printer: &mut PrettyPrinter<'_>) -> fmt::Result;
+
+    fn pretty_print_with_config(&self, config: PrettyConfig) -> String {
+        let mut out = String::new();
+        let mut printer = PrettyPrinter::new(&mut out, config);
+        self.fmt_pretty(&mut printer)
+            .expect("writing pretty-printed text to a String should not fail");
+        out
+    }
+
+    fn pretty_print(&self) -> String {
+        self.pretty_print_with_config(PrettyConfig::default())
+    }
 
     fn debug_pretty_print(&self) -> String {
-        self.pretty_print()
+        self.pretty_print_with_config(PrettyConfig::debug())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct PrettyConfig {
+    pub mode: PrettyMode,
+}
+
+impl PrettyConfig {
+    pub fn debug() -> Self {
+        Self {
+            mode: PrettyMode::Debug,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum PrettyMode {
+    #[default]
+    Normal,
+    Debug,
+}
+
+pub struct PrettyPrinter<'a> {
+    out: &'a mut dyn fmt::Write,
+    config: PrettyConfig,
+}
+
+impl<'a> PrettyPrinter<'a> {
+    pub fn new(out: &'a mut dyn fmt::Write, config: PrettyConfig) -> Self {
+        Self { out, config }
+    }
+
+    pub fn config(&self) -> PrettyConfig {
+        self.config
+    }
+
+    pub fn mode(&self) -> PrettyMode {
+        self.config.mode
+    }
+}
+
+impl fmt::Write for PrettyPrinter<'_> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        self.out.write_str(s)
     }
 }
 
 impl<P> PrettyPrint for BlockPyModule<P>
 where
     P: BlockPyFormat,
-    P::Instr: fmt::Debug,
+    P::Instr: PrettyPrint,
 {
-    fn pretty_print(&self) -> String {
-        blockpy_module_to_string(self)
-    }
-
-    fn debug_pretty_print(&self) -> String {
-        blockpy_module_to_string(self)
+    fn fmt_pretty(&self, printer: &mut PrettyPrinter<'_>) -> fmt::Result {
+        printer.write_str(&blockpy_module_to_string_with_config(
+            self,
+            printer.config(),
+        ))
     }
 }
 
 pub fn blockpy_module_to_string<P>(module: &BlockPyModule<P>) -> String
 where
     P: BlockPyFormat,
-    P::Instr: fmt::Debug,
+    P::Instr: PrettyPrint,
 {
-    let mut formatter = BlockPyFormatter::<DebugInlineExprRenderer>::default();
+    blockpy_module_to_string_with_config(module, PrettyConfig::default())
+}
+
+pub fn blockpy_module_to_string_with_config<P>(
+    module: &BlockPyModule<P>,
+    config: PrettyConfig,
+) -> String
+where
+    P: BlockPyFormat,
+    P::Instr: PrettyPrint,
+{
+    let mut formatter = BlockPyFormatter::new(config);
     formatter.write_module(module);
     formatter.finish()
 }
 
-trait InlineExprRenderer<E> {
-    fn render(expr: &E) -> String;
-}
-
-struct DebugInlineExprRenderer;
-
-impl<E> InlineExprRenderer<E> for DebugInlineExprRenderer
-where
-    E: fmt::Debug,
-{
-    fn render(expr: &E) -> String {
-        format!("{expr:?}")
-    }
-}
-
-struct BlockPyFormatter<R> {
+struct BlockPyFormatter {
     out: String,
     indent: usize,
-    _renderer: PhantomData<R>,
+    config: PrettyConfig,
 }
 
-impl<R> Default for BlockPyFormatter<R> {
-    fn default() -> Self {
+impl BlockPyFormatter {
+    fn new(config: PrettyConfig) -> Self {
         Self {
             out: String::new(),
             indent: 0,
-            _renderer: PhantomData,
+            config,
         }
     }
-}
 
-impl<R> BlockPyFormatter<R> {
     fn finish(mut self) -> String {
         if self.out.is_empty() {
             self.line("; empty BlockPy module");
@@ -96,7 +146,7 @@ impl<R> BlockPyFormatter<R> {
     fn write_module<P>(&mut self, module: &BlockPyModule<P>)
     where
         P: BlockPyFormat,
-        R: InlineExprRenderer<P::Instr>,
+        P::Instr: PrettyPrint,
     {
         for function in &module.callable_defs {
             if !self.out.is_empty() {
@@ -109,7 +159,7 @@ impl<R> BlockPyFormatter<R> {
     fn write_function<P>(&mut self, function: &BlockPyFunction<P>)
     where
         P: BlockPyFormat,
-        R: InlineExprRenderer<P::Instr>,
+        P::Instr: PrettyPrint,
     {
         let params = format_parameters(&function.params);
         let referenced_labels = collect_referenced_labels_from_blocks::<P>(&function.blocks);
@@ -167,7 +217,7 @@ impl<R> BlockPyFormatter<R> {
         referenced_labels: &HashSet<BlockLabel>,
     ) where
         P: BlockPyFormat,
-        R: InlineExprRenderer<P::Instr>,
+        P::Instr: PrettyPrint,
     {
         let block = &function.blocks[block_index];
         self.line(render_block_header(block));
@@ -200,7 +250,7 @@ impl<R> BlockPyFormatter<R> {
         referenced_labels: &HashSet<BlockLabel>,
     ) where
         P: BlockPyFormat,
-        R: InlineExprRenderer<P::Instr>,
+        P::Instr: PrettyPrint,
     {
         if block.body.is_empty() {
             self.write_term(
@@ -224,7 +274,7 @@ impl<R> BlockPyFormatter<R> {
 
     fn write_linear_stmt_list<S>(&mut self, stmts: &[S], referenced_labels: &HashSet<BlockLabel>)
     where
-        S: std::fmt::Debug,
+        S: PrettyPrint,
     {
         for stmt in stmts {
             self.write_linear_stmt(stmt, referenced_labels);
@@ -233,9 +283,9 @@ impl<R> BlockPyFormatter<R> {
 
     fn write_linear_stmt<S>(&mut self, stmt: &S, _referenced_labels: &HashSet<BlockLabel>)
     where
-        S: std::fmt::Debug,
+        S: PrettyPrint,
     {
-        self.line(format!("{stmt:?}"));
+        self.line(stmt.pretty_print_with_config(self.config));
     }
 
     fn write_term<P>(
@@ -247,7 +297,7 @@ impl<R> BlockPyFormatter<R> {
         referenced_labels: &HashSet<BlockLabel>,
     ) where
         P: BlockPyFormat,
-        R: InlineExprRenderer<P::Instr>,
+        P::Instr: PrettyPrint,
     {
         match term {
             BlockTerm::Jump(edge) => self.line(format!("jump {}", render_edge(edge))),
@@ -256,7 +306,7 @@ impl<R> BlockPyFormatter<R> {
                 then_label,
                 else_label,
             }) => {
-                self.line(format!("if_term {}:", R::render(test)));
+                self.line(format!("if_term {}:", render_inline_expr(test, self.config)));
                 self.with_indent(|this| {
                     this.line("then:");
                     this.with_indent(|this| {
@@ -298,22 +348,25 @@ impl<R> BlockPyFormatter<R> {
             }
             BlockTerm::BranchTable(branch) => self.line(format!(
                 "branch_table {} -> [{}] default {}",
-                R::render(&branch.index),
+                render_inline_expr(&branch.index, self.config),
                 join_labels(&branch.targets),
                 branch.default_label,
             )),
             BlockTerm::Raise(raise_stmt) => self.write_raise(raise_stmt),
-            BlockTerm::Return(value) => self.line(format!("return {}", R::render(value))),
+            BlockTerm::Return(value) => self.line(format!(
+                "return {}",
+                render_inline_expr(value, self.config)
+            )),
         }
     }
 
     fn write_raise<E>(&mut self, raise_stmt: &TermRaise<E>)
     where
         E: Instr,
-        R: InlineExprRenderer<E>,
+        E: PrettyPrint,
     {
         match &raise_stmt.exc {
-            Some(exc) => self.line(format!("raise {}", R::render(exc))),
+            Some(exc) => self.line(format!("raise {}", render_inline_expr(exc, self.config))),
             None => self.line("raise"),
         }
     }
@@ -369,8 +422,12 @@ fn function_kind_name(kind: FunctionKind) -> &'static str {
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-pub fn bb_expr_text<N: fmt::Debug>(expr: &N) -> String {
-    format!("{expr:?}")
+pub fn bb_expr_text<N: PrettyPrint>(expr: &N) -> String {
+    expr.pretty_print()
+}
+
+fn render_inline_expr<N: PrettyPrint>(expr: &N, config: PrettyConfig) -> String {
+    expr.pretty_print_with_config(config)
 }
 
 fn format_parameters(parameters: &ParamSpec) -> String {

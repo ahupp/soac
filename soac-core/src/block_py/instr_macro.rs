@@ -49,6 +49,15 @@ macro_rules! define_instr {
             }
         }
 
+        impl<$expr_ty: Instr> $crate::block_py::PrettyPrint for $name<$expr_ty> {
+            fn fmt_pretty(
+                &self,
+                printer: &mut $crate::block_py::PrettyPrinter<'_>,
+            ) -> std::fmt::Result {
+                std::fmt::Write::write_fmt(printer, format_args!("{self:?}"))
+            }
+        }
+
         impl<$expr_ty: Instr> $name<$expr_ty> {
             pub fn new($($ctor_args)*) -> Self {
                 Self {
@@ -199,6 +208,15 @@ macro_rules! define_instr {
                 let mut debug = f.debug_tuple(stringify!($name));
                 define_instr!(@debug_tuple_fields debug, self, $($raw_fields)*);
                 debug.finish()
+            }
+        }
+
+        impl $crate::block_py::PrettyPrint for $name {
+            fn fmt_pretty(
+                &self,
+                printer: &mut $crate::block_py::PrettyPrinter<'_>,
+            ) -> std::fmt::Result {
+                std::fmt::Write::write_fmt(printer, format_args!("{self:?}"))
             }
         }
 
