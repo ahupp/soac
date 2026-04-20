@@ -15830,11 +15830,6 @@ def f(x):
                     kind: ParamKind::Any,
                     has_default: false,
                 },
-                Param {
-                    name: "zero".into(),
-                    kind: ParamKind::Any,
-                    has_default: false,
-                },
             ],
         };
         let entry_label = function.name_gen.next_block_name();
@@ -15863,10 +15858,7 @@ def f(x):
                             )),
                             add_instr_id,
                         ),
-                        with_instr_id(
-                            name_expr(test_local_name("zero", 2)),
-                            InstrId::new(entry_label, 3),
-                        ),
+                        with_instr_id(constants.int_expr(0), InstrId::new(entry_label, 3)),
                     )),
                     compare_instr_id,
                 ),
@@ -15891,7 +15883,7 @@ def f(x):
             exc_edge: None,
         };
         function.blocks = vec![entry, then_block, else_block];
-        set_stack_slots(&mut function, &["a", "b", "zero"]);
+        set_stack_slots(&mut function, &["a", "b"]);
 
         let mut module = test_module(ModuleNameGen::new(0), vec![function]);
         module.module_constants = constants.module_constants;
@@ -15906,9 +15898,7 @@ def f(x):
         evidence
             .operator_specializations
             .insert(add_instr_id, vec![exact_int_shape]);
-        let mut hints = crate::optimization_evidence_v3::PlannerFactHints::default();
-        hints.set_i64_constant(crate::optimization_region_v3::ExtractedValueId(3), 0);
-        let artifacts = plan_and_emit_function_exact_int_branches_v3(
+        let artifacts = plan_and_emit_function_exact_int_branches_v3_with_module_constants(
             &AlternativeCatalog::default_v3(),
             ModulePlanIdentity {
                 module_name: "test".to_string(),
@@ -15924,7 +15914,7 @@ def f(x):
             },
             &function,
             &evidence,
-            &HashMap::from([(crate::optimization_plan_v3::RegionId(0), hints)]),
+            module.module_constants.as_slice(),
         )
         .unwrap();
         assert_eq!(artifacts.emission.functions[0].regions.len(), 2);

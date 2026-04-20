@@ -2,6 +2,9 @@ use crate::operator_specialization::{ExactTypeTag, unpack_binary_shape};
 use crate::optimization_plan::FunctionProfileEvidence;
 use crate::optimization_planner_v3::PlannerFacts;
 use crate::optimization_region_v3::{ExtractedRegion, ExtractedValueId, ExtractedValueKind};
+use soac_core::block_py::NameLocation;
+use soac_lowering::block_py::{Literal, NumberLiteralValue};
+use soac_lowering::passes::InstrResolved;
 use std::collections::HashMap;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -44,6 +47,39 @@ pub fn planner_facts_from_profile_evidence_v3(
     facts
 }
 
+pub fn planner_fact_hints_from_module_constants_v3(
+    region: &ExtractedRegion,
+    module_constants: &[InstrResolved],
+) -> PlannerFactHints {
+    let mut hints = PlannerFactHints::default();
+    for value in &region.values {
+        let ExtractedValueKind::LoadName { name } = &value.kind else {
+            continue;
+        };
+        let NameLocation::Constant(index) = name.location else {
+            continue;
+        };
+        let Some(constant) = module_i64_constant(module_constants, index) else {
+            continue;
+        };
+        hints.set_i64_constant(value.id, constant);
+    }
+    hints
+}
+
+fn module_i64_constant(module_constants: &[InstrResolved], index: u32) -> Option<i64> {
+    let InstrResolved::Literal(literal) = module_constants.get(index as usize)? else {
+        return None;
+    };
+    let Literal::NumberLiteral(number) = literal.as_literal() else {
+        return None;
+    };
+    let NumberLiteralValue::Int(value) = &number.value else {
+        return None;
+    };
+    value.as_i64()
+}
+
 fn has_exact_int_binary_shape(shapes: &[u64]) -> bool {
     shapes
         .iter()
@@ -69,6 +105,7 @@ mod tests {
         LocalFunctionId, LocalLocation, Meta, NameLocation, ResolvedName, SerializedFunctionId,
         SerializedModuleId, TermIf, WithMeta,
     };
+    use soac_lowering::block_py::{IntLiteral, LiteralValue, NumberLiteral};
 
     fn label(index: usize) -> BlockLabel {
         BlockLabel::from_index(index)
@@ -92,6 +129,13 @@ mod tests {
         soac_lowering::passes::InstrCodegen::Load(Load::new(ResolvedName {
             id: BlockPyName::new(name),
             location: NameLocation::Local(LocalLocation(slot)),
+        }))
+    }
+
+    fn constant(index: u32) -> soac_lowering::passes::InstrCodegen {
+        soac_lowering::passes::InstrCodegen::Load(Load::new(ResolvedName {
+            id: BlockPyName::new("__dp_constant"),
+            location: NameLocation::Constant(index),
         }))
     }
 
@@ -127,6 +171,34 @@ mod tests {
             None,
         );
         extract_block_region_v3(&block, RegionId(0)).unwrap()
+    }
+
+    fn compact_region_with_constant_zero() -> ExtractedRegion {
+        let add = binary(
+            BinOpKind::Add,
+            with_instr_id(local("a", 0), 0),
+            with_instr_id(local("b", 1), 1),
+            2,
+        );
+        let test = binary(BinOpKind::Gt, add, with_instr_id(constant(0), 3), 4);
+        let block = Block::new(
+            label(0),
+            Vec::new(),
+            BlockTerm::IfTerm(TermIf {
+                test,
+                then_label: label(1),
+                else_label: label(2),
+            }),
+            Vec::<BlockParam>::new(),
+            None,
+        );
+        extract_block_region_v3(&block, RegionId(0)).unwrap()
+    }
+
+    fn int_constant(value: i64) -> InstrResolved {
+        InstrResolved::Literal(LiteralValue::new(Literal::NumberLiteral(NumberLiteral {
+            value: NumberLiteralValue::Int(IntLiteral::from_i64(value)),
+        })))
     }
 
     fn evidence_with_add_shape(shape: u64) -> FunctionProfileEvidence {
@@ -175,6 +247,20 @@ mod tests {
         let evidence =
             evidence_with_add_shape(pack_binary_shape(ExactTypeTag::Int, ExactTypeTag::Int));
         let facts = planner_facts_from_profile_evidence_v3(&region, &evidence, &hints());
+        let plan = plan_with(region, facts);
+
+        validate_module_plan_v3(&plan).unwrap();
+        assert_eq!(plan.functions[0].regions.len(), 2);
+        assert!(plan.functions[0].diagnostics.is_empty());
+    }
+
+    #[test]
+    fn module_constant_hint_enables_compact_int_branch_plan() {
+        let region = compact_region_with_constant_zero();
+        let evidence =
+            evidence_with_add_shape(pack_binary_shape(ExactTypeTag::Int, ExactTypeTag::Int));
+        let hints = planner_fact_hints_from_module_constants_v3(&region, &[int_constant(0)]);
+        let facts = planner_facts_from_profile_evidence_v3(&region, &evidence, &hints);
         let plan = plan_with(region, facts);
 
         validate_module_plan_v3(&plan).unwrap();

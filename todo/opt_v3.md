@@ -38,7 +38,7 @@ Non-goals:
 ## Implementation Status
 
 The first implementation stack establishes v3 as an off-by-default live
-validation path rather than replacing live JIT lowering immediately.
+validation path with one narrow live JIT lowering consumer.
 
 Implemented:
 
@@ -53,7 +53,8 @@ Implemented:
 - `optimization_emit_v3`: validation-gated mechanical emitter over selected v3
   plan nodes and exits.
 - `optimization_evidence_v3`: bridge from existing `FunctionProfileEvidence`
-  exact-int operator shapes into v3 planner facts.
+  exact-int operator shapes and lowered integer module constants into v3
+  planner facts.
 - `optimization_pipeline_v3`: off-by-default exact-int branch pipeline that
   composes extraction, evidence, planning, validation, and mechanical emission.
 - `SOAC_VALIDATE_OPT_V3`: opt-in live validation while loading `mod.opt` plans

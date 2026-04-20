@@ -24,8 +24,8 @@ contains the represented exact-int branch shape, JIT term lowering consumes the
 mechanical v3 region directly; otherwise lowering stays on the existing path.
 
 The first represented slice is exact-compact-`int` `a + b > 0` branch planning:
-`operator_hot_shapes` exact-int evidence proves the operands, an explicit
-constant hint proves `0`, the v3 planner emits a hot checked-`i64` add/compare
+`operator_hot_shapes` exact-int evidence proves the operands, a lowered module
+constant load proves `0`, the v3 planner emits a hot checked-`i64` add/compare
 region plus a local generic Python fallback region, and
 `emit_mechanical_plan_v3` refuses invalid plans before emitting steps.
 

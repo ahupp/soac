@@ -26,7 +26,7 @@ use crate::optimization_emit_v3::{
     MechanicalExitKind, MechanicalOperation, MechanicalRegionEmission, MechanicalStepOp,
 };
 use crate::optimization_pipeline_v3::{
-    ExactIntBranchV3Artifacts, plan_and_emit_function_exact_int_branches_v3,
+    ExactIntBranchV3Artifacts, plan_and_emit_function_exact_int_branches_v3_with_module_constants,
 };
 #[cfg(test)]
 use crate::optimization_plan::ProfileEvidenceStore;
@@ -13312,6 +13312,7 @@ fn planned_optimization_inputs_for_shared_state(
             planned_function,
             current_function,
             &evidence,
+            shared_state.lowered_module.module_constants.as_slice(),
         )? {
             inputs
                 .opt_v3_exact_int_branch_artifacts
@@ -13386,6 +13387,7 @@ fn planned_optimization_inputs_for_precompile(
             planned_function,
             current_function,
             &evidence,
+            module.module_constants.as_slice(),
         )? {
             inputs
                 .opt_v3_exact_int_branch_artifacts
@@ -13414,13 +13416,14 @@ fn opt_v3_exact_int_branch_artifacts_for_function(
     planned_function: &FunctionOptimizationPlan,
     function: &BlockPyFunction<CodegenModuleShape>,
     evidence: &FunctionProfileEvidence,
+    module_constants: &[InstrResolved],
 ) -> Result<Option<ExactIntBranchV3Artifacts>, String> {
     if !opt_v3_validation_enabled()? {
         return Ok(None);
     }
 
     let catalog = AlternativeCatalog::default_v3();
-    let artifacts = plan_and_emit_function_exact_int_branches_v3(
+    let artifacts = plan_and_emit_function_exact_int_branches_v3_with_module_constants(
         &catalog,
         ModulePlanIdentity {
             module_name: plan.module_name.clone(),
@@ -13436,7 +13439,7 @@ fn opt_v3_exact_int_branch_artifacts_for_function(
         },
         function,
         evidence,
-        &HashMap::new(),
+        module_constants,
     )
     .map_err(|err| {
         format!(

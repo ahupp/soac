@@ -2,7 +2,10 @@ use crate::optimization_alternatives_v3::AlternativeCatalog;
 use crate::optimization_emit_v3::{
     MechanicalEmitError, MechanicalModuleEmission, emit_mechanical_plan_v3,
 };
-use crate::optimization_evidence_v3::{PlannerFactHints, planner_facts_from_profile_evidence_v3};
+use crate::optimization_evidence_v3::{
+    PlannerFactHints, planner_fact_hints_from_module_constants_v3,
+    planner_facts_from_profile_evidence_v3,
+};
 use crate::optimization_plan::FunctionProfileEvidence;
 use crate::optimization_plan_v3::{
     FunctionPlanIdentity, ModuleOptimizationPlanV3, ModulePlanIdentity, PlanDiagnostic, RegionId,
@@ -15,6 +18,7 @@ use crate::optimization_region_v3::{
 };
 use soac_core::block_py::{BlockLabel, BlockPyFunction};
 use soac_lowering::passes::CodegenModuleShape;
+use soac_lowering::passes::InstrResolved;
 use std::collections::HashMap;
 use std::fmt;
 
@@ -55,6 +59,35 @@ pub fn plan_and_emit_function_exact_int_branches_v3(
         attempts,
         evidence,
         hints_by_region,
+    )
+}
+
+pub fn plan_and_emit_function_exact_int_branches_v3_with_module_constants(
+    catalog: &AlternativeCatalog,
+    module: ModulePlanIdentity,
+    function: FunctionPlanIdentity,
+    lowered_function: &BlockPyFunction<CodegenModuleShape>,
+    evidence: &FunctionProfileEvidence,
+    module_constants: &[InstrResolved],
+) -> Result<ExactIntBranchV3Artifacts, ExactIntBranchV3Error> {
+    let attempts = extract_function_regions_v3(lowered_function);
+    let hints_by_region = attempts
+        .iter()
+        .filter_map(|attempt| {
+            let region = attempt.result.as_ref().ok()?;
+            Some((
+                region.id,
+                planner_fact_hints_from_module_constants_v3(region, module_constants),
+            ))
+        })
+        .collect::<HashMap<_, _>>();
+    plan_and_emit_extracted_exact_int_branches_v3(
+        catalog,
+        module,
+        function,
+        attempts,
+        evidence,
+        &hints_by_region,
     )
 }
 
