@@ -1,4 +1,4 @@
-# soac-blockpy/src/block_py/operation_macro.rs
+# soac-blockpy/src/block_py/instr_macro.rs
 
 ## File Responsibilities
 
@@ -8,13 +8,13 @@ both generic lowered operations and Ruff-shaped operations.
 
 ## Datatypes
 
-- `define_operation!`: macro for operations that either have child instruction fields or are
+- `define_instr!`: macro for operations that either have child instruction fields or are
   value-only payloads.
-- `define_ruff_operation!`: thin wrapper macro for Ruff-shaped operation payloads.
+- `define_ruff_instr!`: thin wrapper macro for Ruff-shaped operation payloads.
 
 ## Functions
 
-- `define_operation!` top-level arms: distinguish generic `struct Name<E>` operations from
+- `define_instr!` top-level arms: distinguish generic `struct Name<E>` operations from
   value-only `struct Name` operations.
 - `@collect_fields` and `@collect_value_fields`: parse field lists and generate struct fields,
   constructor arguments, and constructor initialization.
@@ -28,11 +28,11 @@ both generic lowered operations and Ruff-shaped operations.
   traversal.
 - `@debug_tuple_fields`: recursive macro arms for debug rendering.
 - `@build_mapped`, `@build_try_mapped`: recursive macro arms for infallible/fallible child mapping.
-- `define_ruff_operation!`: forwards to `define_operation!` while preserving attrs/visibility.
+- `define_ruff_instr!`: forwards to `define_instr!` while preserving attrs/visibility.
 
 ## Context Read
 
-- `soac-blockpy/src/block_py/operation.rs`
+- `soac-blockpy/src/block_py/instr.rs`
 - `soac-blockpy/src/block_py/meta.rs`
 - `soac-blockpy/src/block_py/map.rs`
 - `soac-blockpy/src/block_py/visit.rs`

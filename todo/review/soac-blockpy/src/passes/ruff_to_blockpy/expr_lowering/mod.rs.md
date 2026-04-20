@@ -46,5 +46,5 @@ value construction, and special recognition of core `__soac__` helper calls.
 
 - `soac-blockpy/src/passes/ruff_to_blockpy/expr_lowering/recursive/mod.rs`
 - `soac-blockpy/src/passes/ruff_to_blockpy/expr_lowering/boolop_compare/mod.rs`
-- `soac-blockpy/src/block_py/operation.rs`
+- `soac-blockpy/src/block_py/instr.rs`
 - `soac-blockpy/src/block_py/mod.rs`

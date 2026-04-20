@@ -33,4 +33,4 @@ to the ownership-consuming mapping traits.
 ## Context Read
 
 - `soac-blockpy/src/block_py/mod.rs`
-- `soac-blockpy/src/block_py/operation_macro.rs`
+- `soac-blockpy/src/block_py/instr_macro.rs`

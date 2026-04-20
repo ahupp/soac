@@ -1,4 +1,4 @@
-# soac-blockpy/src/block_py/operation.rs
+# soac-blockpy/src/block_py/instr.rs
 
 ## File Responsibilities
 
@@ -38,12 +38,12 @@ kept during early lowering stages.
 - `Load::new`, `Store::new`, `Del::new`: construct name operations; custom impls handle metadata,
   debug rendering, child traversal, and name/instruction mapping.
 - `MakeFunction::function_id`, `set_function_id`: inspect and update the target function id.
-- Macro-generated operation methods: all `define_operation!` / `define_ruff_operation!` payloads
+- Macro-generated instruction methods: all `define_instr!` / `define_ruff_instr!` payloads
   receive `new`, `meta`, `with_meta`, child traversal, and child mapping behavior.
 
 ## Context Read
 
-- `soac-blockpy/src/block_py/operation_macro.rs`
+- `soac-blockpy/src/block_py/instr_macro.rs`
 - `soac-blockpy/src/block_py/mod.rs`
 - `soac-blockpy/src/block_py/map.rs`
 - `soac-blockpy/src/block_py/visit.rs`

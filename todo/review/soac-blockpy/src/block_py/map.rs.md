@@ -36,4 +36,4 @@ contents without hand-copying structural fields.
 ## Context Read
 
 - `soac-blockpy/src/block_py/mod.rs`
-- `soac-blockpy/src/block_py/operation.rs`
+- `soac-blockpy/src/block_py/instr.rs`

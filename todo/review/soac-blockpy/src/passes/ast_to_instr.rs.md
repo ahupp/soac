@@ -16,4 +16,4 @@ Converts between Ruff AST nodes and SOAC's `InstrRuff` IR. It wraps AST expressi
 
 ## Context Read
 - `soac-blockpy/src/passes/mod.rs` for all `InstrRuff` variants.
-- `soac-blockpy/src/block_py/operation.rs` and related IR payload modules for constructed operation types.
+- `soac-blockpy/src/block_py/instr.rs` and related IR payload modules for constructed instruction types.

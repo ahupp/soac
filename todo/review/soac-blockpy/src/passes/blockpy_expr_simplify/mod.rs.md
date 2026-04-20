@@ -17,5 +17,5 @@ Simplifies Ruff-shaped `InstrRuff` expressions into core BlockPy expressions wit
 
 ## Context Read
 - `soac-blockpy/src/passes/mod.rs` for `InstrRuff` and `InstrWithAwaitAndYield` variants.
-- `soac-blockpy/src/block_py/operation.rs` for core operation payloads.
+- `soac-blockpy/src/block_py/instr.rs` for core instruction payloads.
 - `soac-blockpy/src/passes/ast_to_ast/string_templates.rs` for string-template lowering interaction.

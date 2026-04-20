@@ -1,12 +1,12 @@
 #[macro_export]
-macro_rules! define_operation {
+macro_rules! define_instr {
     (
         $(#[$attrs:meta])*
         $vis:vis struct $name:ident<$expr_ty:ident> {
             $($fields:tt)*
         }
     ) => {
-        define_operation!(
+        define_instr!(
             @collect_fields
             [
                 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -44,7 +44,7 @@ macro_rules! define_operation {
         impl<$expr_ty: Instr> std::fmt::Debug for $name<$expr_ty> {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 let mut debug = f.debug_tuple(stringify!($name));
-                define_operation!(@debug_tuple_fields debug, self, $($raw_fields)*);
+                define_instr!(@debug_tuple_fields debug, self, $($raw_fields)*);
                 debug.finish()
             }
         }
@@ -95,7 +95,7 @@ macro_rules! define_operation {
             {
                 #[allow(unused_variables)]
                 let _ = &visitor;
-                define_operation!(@visit_expr_fields self, visitor, $($raw_fields)*);
+                define_instr!(@visit_expr_fields self, visitor, $($raw_fields)*);
             }
 
             fn visit_children_mut<V>(&mut self, visitor: &mut V)
@@ -104,7 +104,7 @@ macro_rules! define_operation {
             {
                 #[allow(unused_variables)]
                 let _ = &visitor;
-                define_operation!(@visit_expr_fields_mut self, visitor, $($raw_fields)*);
+                define_instr!(@visit_expr_fields_mut self, visitor, $($raw_fields)*);
             }
         }
 
@@ -118,7 +118,7 @@ macro_rules! define_operation {
             {
                 #[allow(unused_variables)]
                 let _ = &map;
-                define_operation!(@build_mapped [$name::<T>] [] self, map, $($raw_fields)*)
+                define_instr!(@build_mapped [$name::<T>] [] self, map, $($raw_fields)*)
             }
 
             fn try_map_children<T, Error, M>(
@@ -131,7 +131,7 @@ macro_rules! define_operation {
             {
                 #[allow(unused_variables)]
                 let _ = &map;
-                define_operation!(@build_try_mapped [$name::<T>] [] self, map, $($raw_fields)*)
+                define_instr!(@build_try_mapped [$name::<T>] [] self, map, $($raw_fields)*)
             }
 
             fn map_same_children<M>(self, map: &mut M) -> Self::Mapped<$expr_ty>
@@ -140,7 +140,7 @@ macro_rules! define_operation {
             {
                 #[allow(unused_variables)]
                 let _ = &map;
-                define_operation!(@build_same_mapped [$name::<$expr_ty>] [] self, map, $($raw_fields)*)
+                define_instr!(@build_same_mapped [$name::<$expr_ty>] [] self, map, $($raw_fields)*)
             }
 
             fn try_map_same_children<Error, M>(
@@ -152,7 +152,7 @@ macro_rules! define_operation {
             {
                 #[allow(unused_variables)]
                 let _ = &map;
-                define_operation!(@build_try_same_mapped [$name::<$expr_ty>] [] self, map, $($raw_fields)*)
+                define_instr!(@build_try_same_mapped [$name::<$expr_ty>] [] self, map, $($raw_fields)*)
             }
         }
     };
@@ -162,7 +162,7 @@ macro_rules! define_operation {
             $($fields:tt)*
         }
     ) => {
-        define_operation!(
+        define_instr!(
             @collect_value_fields
             [
                 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -197,7 +197,7 @@ macro_rules! define_operation {
         impl std::fmt::Debug for $name {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 let mut debug = f.debug_tuple(stringify!($name));
-                define_operation!(@debug_tuple_fields debug, self, $($raw_fields)*);
+                define_instr!(@debug_tuple_fields debug, self, $($raw_fields)*);
                 debug.finish()
             }
         }
@@ -277,7 +277,7 @@ macro_rules! define_operation {
         $field:ident : $ty:ty,
         $($rest:tt)*
     ) => {
-        define_operation!(
+        define_instr!(
             @collect_value_fields
             [$($attrs)*]
             [$vis]
@@ -300,7 +300,7 @@ macro_rules! define_operation {
         [$($ctor_init:tt)*]
         $field:ident : $ty:ty
     ) => {
-        define_operation!(
+        define_instr!(
             @collect_value_fields
             [$($attrs)*]
             [$vis]
@@ -324,7 +324,7 @@ macro_rules! define_operation {
         $field:ident : Box<$inner_expr_ty:ident>,
         $($rest:tt)*
     ) => {
-        define_operation!(
+        define_instr!(
             @collect_fields
             [$($attrs)*]
             [$vis]
@@ -350,7 +350,7 @@ macro_rules! define_operation {
         $field:ident : Vec<$inner_expr_ty:ident>,
         $($rest:tt)*
     ) => {
-        define_operation!(
+        define_instr!(
             @collect_fields
             [$($attrs)*]
             [$vis]
@@ -375,7 +375,7 @@ macro_rules! define_operation {
         [$($ctor_init:tt)*]
         $field:ident : Vec<$inner_expr_ty:ident>
     ) => {
-        define_operation!(
+        define_instr!(
             @collect_fields
             [$($attrs)*]
             [$vis]
@@ -400,7 +400,7 @@ macro_rules! define_operation {
         $field:ident : Option<Box<$inner_expr_ty:ident>>,
         $($rest:tt)*
     ) => {
-        define_operation!(
+        define_instr!(
             @collect_fields
             [$($attrs)*]
             [$vis]
@@ -425,7 +425,7 @@ macro_rules! define_operation {
         [$($ctor_init:tt)*]
         $field:ident : Option<Box<$inner_expr_ty:ident>>
     ) => {
-        define_operation!(
+        define_instr!(
             @collect_fields
             [$($attrs)*]
             [$vis]
@@ -449,7 +449,7 @@ macro_rules! define_operation {
         [$($ctor_init:tt)*]
         $field:ident : Box<$inner_expr_ty:ident>
     ) => {
-        define_operation!(
+        define_instr!(
             @collect_fields
             [$($attrs)*]
             [$vis]
@@ -474,7 +474,7 @@ macro_rules! define_operation {
         $field:ident : $ty:ty,
         $($rest:tt)*
     ) => {
-        define_operation!(
+        define_instr!(
             @collect_fields
             [$($attrs)*]
             [$vis]
@@ -499,7 +499,7 @@ macro_rules! define_operation {
         [$($ctor_init:tt)*]
         $field:ident : $ty:ty
     ) => {
-        define_operation!(
+        define_instr!(
             @collect_fields
             [$($attrs)*]
             [$vis]
@@ -513,42 +513,42 @@ macro_rules! define_operation {
     };
     (@visit_expr_fields $self:ident, $visitor:ident,) => {};
     (@visit_expr_fields $self:ident, $visitor:ident, $field:ident : Box<$expr_ty:ident>, $($rest:tt)*) => {
-        $crate::block_py::OperationField::<$expr_ty>::visit_field(&$self.$field, $visitor);
-        define_operation!(@visit_expr_fields $self, $visitor, $($rest)*);
+        $crate::block_py::InstrField::<$expr_ty>::visit_field(&$self.$field, $visitor);
+        define_instr!(@visit_expr_fields $self, $visitor, $($rest)*);
     };
     (@visit_expr_fields $self:ident, $visitor:ident, $field:ident : Box<$expr_ty:ident>) => {
-        $crate::block_py::OperationField::<$expr_ty>::visit_field(&$self.$field, $visitor);
+        $crate::block_py::InstrField::<$expr_ty>::visit_field(&$self.$field, $visitor);
     };
     (@visit_expr_fields $self:ident, $visitor:ident, $field:ident : Vec<$expr_ty:ident>, $($rest:tt)*) => {
-        $crate::block_py::OperationField::<$expr_ty>::visit_field(&$self.$field, $visitor);
-        define_operation!(@visit_expr_fields $self, $visitor, $($rest)*);
+        $crate::block_py::InstrField::<$expr_ty>::visit_field(&$self.$field, $visitor);
+        define_instr!(@visit_expr_fields $self, $visitor, $($rest)*);
     };
     (@visit_expr_fields $self:ident, $visitor:ident, $field:ident : Vec<$expr_ty:ident>) => {
-        $crate::block_py::OperationField::<$expr_ty>::visit_field(&$self.$field, $visitor);
+        $crate::block_py::InstrField::<$expr_ty>::visit_field(&$self.$field, $visitor);
     };
     (@visit_expr_fields $self:ident, $visitor:ident, $field:ident : Option<Box<$expr_ty:ident>>, $($rest:tt)*) => {
-        $crate::block_py::OperationField::<$expr_ty>::visit_field(&$self.$field, $visitor);
-        define_operation!(@visit_expr_fields $self, $visitor, $($rest)*);
+        $crate::block_py::InstrField::<$expr_ty>::visit_field(&$self.$field, $visitor);
+        define_instr!(@visit_expr_fields $self, $visitor, $($rest)*);
     };
     (@visit_expr_fields $self:ident, $visitor:ident, $field:ident : Option<Box<$expr_ty:ident>>) => {
-        $crate::block_py::OperationField::<$expr_ty>::visit_field(&$self.$field, $visitor);
+        $crate::block_py::InstrField::<$expr_ty>::visit_field(&$self.$field, $visitor);
     };
     (@visit_expr_fields $self:ident, $visitor:ident, $field:ident : Vec<$wrapper:ident<$expr_ty:ident>>, $($rest:tt)*) => {
-        $crate::block_py::OperationField::<$expr_ty>::visit_field(&$self.$field, $visitor);
-        define_operation!(@visit_expr_fields $self, $visitor, $($rest)*);
+        $crate::block_py::InstrField::<$expr_ty>::visit_field(&$self.$field, $visitor);
+        define_instr!(@visit_expr_fields $self, $visitor, $($rest)*);
     };
     (@visit_expr_fields $self:ident, $visitor:ident, $field:ident : Vec<$wrapper:ident<$expr_ty:ident>>) => {
-        $crate::block_py::OperationField::<$expr_ty>::visit_field(&$self.$field, $visitor);
+        $crate::block_py::InstrField::<$expr_ty>::visit_field(&$self.$field, $visitor);
     };
     (@visit_expr_fields $self:ident, $visitor:ident, $field:ident : $ty:ty, $($rest:tt)*) => {
-        define_operation!(@visit_expr_fields $self, $visitor, $($rest)*);
+        define_instr!(@visit_expr_fields $self, $visitor, $($rest)*);
     };
     (@visit_expr_fields $self:ident, $visitor:ident, $field:ident : $ty:ty) => {};
     (@visit_expr_fields $self:ident, $visitor:ident, $field:ident : Vec<$expr_ty:ident>, $($rest:tt)*) => {
         for item in &$self.$field {
             $visitor.visit_instr(item);
         }
-        define_operation!(@visit_expr_fields $self, $visitor, $($rest)*);
+        define_instr!(@visit_expr_fields $self, $visitor, $($rest)*);
     };
     (@visit_expr_fields $self:ident, $visitor:ident, $field:ident : Vec<$expr_ty:ident>) => {
         for item in &$self.$field {
@@ -559,7 +559,7 @@ macro_rules! define_operation {
         if let Some(item) = &$self.$field {
             $visitor.visit_instr(item);
         }
-        define_operation!(@visit_expr_fields $self, $visitor, $($rest)*);
+        define_instr!(@visit_expr_fields $self, $visitor, $($rest)*);
     };
     (@visit_expr_fields $self:ident, $visitor:ident, $field:ident : Option<Box<$expr_ty:ident>>) => {
         if let Some(item) = &$self.$field {
@@ -568,42 +568,42 @@ macro_rules! define_operation {
     };
     (@visit_expr_fields_mut $self:ident, $visitor:ident,) => {};
     (@visit_expr_fields_mut $self:ident, $visitor:ident, $field:ident : Box<$expr_ty:ident>, $($rest:tt)*) => {
-        $crate::block_py::OperationField::<$expr_ty>::visit_field_mut(&mut $self.$field, $visitor);
-        define_operation!(@visit_expr_fields_mut $self, $visitor, $($rest)*);
+        $crate::block_py::InstrField::<$expr_ty>::visit_field_mut(&mut $self.$field, $visitor);
+        define_instr!(@visit_expr_fields_mut $self, $visitor, $($rest)*);
     };
     (@visit_expr_fields_mut $self:ident, $visitor:ident, $field:ident : Box<$expr_ty:ident>) => {
-        $crate::block_py::OperationField::<$expr_ty>::visit_field_mut(&mut $self.$field, $visitor);
+        $crate::block_py::InstrField::<$expr_ty>::visit_field_mut(&mut $self.$field, $visitor);
     };
     (@visit_expr_fields_mut $self:ident, $visitor:ident, $field:ident : Vec<$expr_ty:ident>, $($rest:tt)*) => {
-        $crate::block_py::OperationField::<$expr_ty>::visit_field_mut(&mut $self.$field, $visitor);
-        define_operation!(@visit_expr_fields_mut $self, $visitor, $($rest)*);
+        $crate::block_py::InstrField::<$expr_ty>::visit_field_mut(&mut $self.$field, $visitor);
+        define_instr!(@visit_expr_fields_mut $self, $visitor, $($rest)*);
     };
     (@visit_expr_fields_mut $self:ident, $visitor:ident, $field:ident : Vec<$expr_ty:ident>) => {
-        $crate::block_py::OperationField::<$expr_ty>::visit_field_mut(&mut $self.$field, $visitor);
+        $crate::block_py::InstrField::<$expr_ty>::visit_field_mut(&mut $self.$field, $visitor);
     };
     (@visit_expr_fields_mut $self:ident, $visitor:ident, $field:ident : Option<Box<$expr_ty:ident>>, $($rest:tt)*) => {
-        $crate::block_py::OperationField::<$expr_ty>::visit_field_mut(&mut $self.$field, $visitor);
-        define_operation!(@visit_expr_fields_mut $self, $visitor, $($rest)*);
+        $crate::block_py::InstrField::<$expr_ty>::visit_field_mut(&mut $self.$field, $visitor);
+        define_instr!(@visit_expr_fields_mut $self, $visitor, $($rest)*);
     };
     (@visit_expr_fields_mut $self:ident, $visitor:ident, $field:ident : Option<Box<$expr_ty:ident>>) => {
-        $crate::block_py::OperationField::<$expr_ty>::visit_field_mut(&mut $self.$field, $visitor);
+        $crate::block_py::InstrField::<$expr_ty>::visit_field_mut(&mut $self.$field, $visitor);
     };
     (@visit_expr_fields_mut $self:ident, $visitor:ident, $field:ident : Vec<$wrapper:ident<$expr_ty:ident>>, $($rest:tt)*) => {
-        $crate::block_py::OperationField::<$expr_ty>::visit_field_mut(&mut $self.$field, $visitor);
-        define_operation!(@visit_expr_fields_mut $self, $visitor, $($rest)*);
+        $crate::block_py::InstrField::<$expr_ty>::visit_field_mut(&mut $self.$field, $visitor);
+        define_instr!(@visit_expr_fields_mut $self, $visitor, $($rest)*);
     };
     (@visit_expr_fields_mut $self:ident, $visitor:ident, $field:ident : Vec<$wrapper:ident<$expr_ty:ident>>) => {
-        $crate::block_py::OperationField::<$expr_ty>::visit_field_mut(&mut $self.$field, $visitor);
+        $crate::block_py::InstrField::<$expr_ty>::visit_field_mut(&mut $self.$field, $visitor);
     };
     (@visit_expr_fields_mut $self:ident, $visitor:ident, $field:ident : $ty:ty, $($rest:tt)*) => {
-        define_operation!(@visit_expr_fields_mut $self, $visitor, $($rest)*);
+        define_instr!(@visit_expr_fields_mut $self, $visitor, $($rest)*);
     };
     (@visit_expr_fields_mut $self:ident, $visitor:ident, $field:ident : $ty:ty) => {};
     (@visit_expr_fields_mut $self:ident, $visitor:ident, $field:ident : Vec<$expr_ty:ident>, $($rest:tt)*) => {
         for item in &mut $self.$field {
             $visitor.visit_instr_mut(item);
         }
-        define_operation!(@visit_expr_fields_mut $self, $visitor, $($rest)*);
+        define_instr!(@visit_expr_fields_mut $self, $visitor, $($rest)*);
     };
     (@visit_expr_fields_mut $self:ident, $visitor:ident, $field:ident : Vec<$expr_ty:ident>) => {
         for item in &mut $self.$field {
@@ -614,7 +614,7 @@ macro_rules! define_operation {
         if let Some(item) = &mut $self.$field {
             $visitor.visit_instr_mut(item);
         }
-        define_operation!(@visit_expr_fields_mut $self, $visitor, $($rest)*);
+        define_instr!(@visit_expr_fields_mut $self, $visitor, $($rest)*);
     };
     (@visit_expr_fields_mut $self:ident, $visitor:ident, $field:ident : Option<Box<$expr_ty:ident>>) => {
         if let Some(item) = &mut $self.$field {
@@ -624,28 +624,28 @@ macro_rules! define_operation {
     (@debug_tuple_fields $builder:ident, $self:ident,) => {};
     (@debug_tuple_fields $builder:ident, $self:ident, $field:ident : Box<$expr_ty:ident>, $($rest:tt)*) => {
         $builder.field(&$self.$field);
-        define_operation!(@debug_tuple_fields $builder, $self, $($rest)*);
+        define_instr!(@debug_tuple_fields $builder, $self, $($rest)*);
     };
     (@debug_tuple_fields $builder:ident, $self:ident, $field:ident : Box<$expr_ty:ident>) => {
         $builder.field(&$self.$field);
     };
     (@debug_tuple_fields $builder:ident, $self:ident, $field:ident : $ty:ty, $($rest:tt)*) => {
         $builder.field(&$self.$field);
-        define_operation!(@debug_tuple_fields $builder, $self, $($rest)*);
+        define_instr!(@debug_tuple_fields $builder, $self, $($rest)*);
     };
     (@debug_tuple_fields $builder:ident, $self:ident, $field:ident : $ty:ty) => {
         $builder.field(&$self.$field);
     };
     (@debug_tuple_fields $builder:ident, $self:ident, $field:ident : Vec<$expr_ty:ident>, $($rest:tt)*) => {
         $builder.field(&$self.$field);
-        define_operation!(@debug_tuple_fields $builder, $self, $($rest)*);
+        define_instr!(@debug_tuple_fields $builder, $self, $($rest)*);
     };
     (@debug_tuple_fields $builder:ident, $self:ident, $field:ident : Vec<$expr_ty:ident>) => {
         $builder.field(&$self.$field);
     };
     (@debug_tuple_fields $builder:ident, $self:ident, $field:ident : Option<Box<$expr_ty:ident>>, $($rest:tt)*) => {
         $builder.field(&$self.$field);
-        define_operation!(@debug_tuple_fields $builder, $self, $($rest)*);
+        define_instr!(@debug_tuple_fields $builder, $self, $($rest)*);
     };
     (@debug_tuple_fields $builder:ident, $self:ident, $field:ident : Option<Box<$expr_ty:ident>>) => {
         $builder.field(&$self.$field);
@@ -657,7 +657,7 @@ macro_rules! define_operation {
         $($mapped_ctor)+ { _meta: $self._meta, $($out)* }
     };
     (@build_walked [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $f:ident, $field:ident : Box<$expr_ty:ident>, $($rest:tt)*) => {
-        define_operation!(
+        define_instr!(
             @build_walked
             [$($mapped_ctor)+]
             [$($out)* $field: Box::new($f(*$self.$field)),]
@@ -670,7 +670,7 @@ macro_rules! define_operation {
         $($mapped_ctor)+ { _meta: $self._meta, $($out)* $field: Box::new($f(*$self.$field)), }
     };
     (@build_walked [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $f:ident, $field:ident : $ty:ty, $($rest:tt)*) => {
-        define_operation!(
+        define_instr!(
             @build_walked
             [$($mapped_ctor)+]
             [$($out)* $field: $self.$field,]
@@ -683,59 +683,59 @@ macro_rules! define_operation {
         $($mapped_ctor)+ { _meta: $self._meta, $($out)* $field: $self.$field, }
     };
     (@build_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Box<$expr_ty:ident>, $($rest:tt)*) => {
-        define_operation!(
+        define_instr!(
             @build_mapped
             [$($mapped_ctor)+]
-            [$($out)* $field: $crate::block_py::OperationField::<$expr_ty>::map_field::<T, M>($self.$field, $map),]
+            [$($out)* $field: $crate::block_py::InstrField::<$expr_ty>::map_field::<T, M>($self.$field, $map),]
             $self,
             $map,
             $($rest)*
         )
     };
     (@build_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Box<$expr_ty:ident>) => {
-        $($mapped_ctor)+ { _meta: $self._meta, extra: Default::default(), $($out)* $field: $crate::block_py::OperationField::<$expr_ty>::map_field::<T, M>($self.$field, $map), }
+        $($mapped_ctor)+ { _meta: $self._meta, extra: Default::default(), $($out)* $field: $crate::block_py::InstrField::<$expr_ty>::map_field::<T, M>($self.$field, $map), }
     };
     (@build_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Vec<$expr_ty:ident>, $($rest:tt)*) => {
-        define_operation!(
+        define_instr!(
             @build_mapped
             [$($mapped_ctor)+]
-            [$($out)* $field: $crate::block_py::OperationField::<$expr_ty>::map_field::<T, M>($self.$field, $map),]
+            [$($out)* $field: $crate::block_py::InstrField::<$expr_ty>::map_field::<T, M>($self.$field, $map),]
             $self,
             $map,
             $($rest)*
         )
     };
     (@build_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Vec<$expr_ty:ident>) => {
-        $($mapped_ctor)+ { _meta: $self._meta, extra: Default::default(), $($out)* $field: $crate::block_py::OperationField::<$expr_ty>::map_field::<T, M>($self.$field, $map), }
+        $($mapped_ctor)+ { _meta: $self._meta, extra: Default::default(), $($out)* $field: $crate::block_py::InstrField::<$expr_ty>::map_field::<T, M>($self.$field, $map), }
     };
     (@build_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Option<Box<$expr_ty:ident>>, $($rest:tt)*) => {
-        define_operation!(
+        define_instr!(
             @build_mapped
             [$($mapped_ctor)+]
-            [$($out)* $field: $crate::block_py::OperationField::<$expr_ty>::map_field::<T, M>($self.$field, $map),]
+            [$($out)* $field: $crate::block_py::InstrField::<$expr_ty>::map_field::<T, M>($self.$field, $map),]
             $self,
             $map,
             $($rest)*
         )
     };
     (@build_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Option<Box<$expr_ty:ident>>) => {
-        $($mapped_ctor)+ { _meta: $self._meta, extra: Default::default(), $($out)* $field: $crate::block_py::OperationField::<$expr_ty>::map_field::<T, M>($self.$field, $map), }
+        $($mapped_ctor)+ { _meta: $self._meta, extra: Default::default(), $($out)* $field: $crate::block_py::InstrField::<$expr_ty>::map_field::<T, M>($self.$field, $map), }
     };
     (@build_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Vec<$wrapper:ident<$expr_ty:ident>>, $($rest:tt)*) => {
-        define_operation!(
+        define_instr!(
             @build_mapped
             [$($mapped_ctor)+]
-            [$($out)* $field: $crate::block_py::OperationField::<$expr_ty>::map_field::<T, M>($self.$field, $map),]
+            [$($out)* $field: $crate::block_py::InstrField::<$expr_ty>::map_field::<T, M>($self.$field, $map),]
             $self,
             $map,
             $($rest)*
         )
     };
     (@build_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Vec<$wrapper:ident<$expr_ty:ident>>) => {
-        $($mapped_ctor)+ { _meta: $self._meta, extra: Default::default(), $($out)* $field: $crate::block_py::OperationField::<$expr_ty>::map_field::<T, M>($self.$field, $map), }
+        $($mapped_ctor)+ { _meta: $self._meta, extra: Default::default(), $($out)* $field: $crate::block_py::InstrField::<$expr_ty>::map_field::<T, M>($self.$field, $map), }
     };
     (@build_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : $expr_ty:ident::Name, $($rest:tt)*) => {
-        define_operation!(
+        define_instr!(
             @build_mapped
             [$($mapped_ctor)+]
             [$($out)* $field: $map.map_name($self.$field),]
@@ -748,7 +748,7 @@ macro_rules! define_operation {
         $($mapped_ctor)+ { _meta: $self._meta, extra: Default::default(), $($out)* $field: $map.map_name($self.$field), }
     };
     (@build_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $f:ident, $field:ident : $ty:ty, $($rest:tt)*) => {
-        define_operation!(
+        define_instr!(
             @build_mapped
             [$($mapped_ctor)+]
             [$($out)* $field: $self.$field,]
@@ -761,7 +761,7 @@ macro_rules! define_operation {
         $($mapped_ctor)+ { _meta: $self._meta, extra: Default::default(), $($out)* $field: $self.$field, }
     };
     (@build_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Vec<$expr_ty:ident>, $($rest:tt)*) => {
-        define_operation!(
+        define_instr!(
             @build_mapped
             [$($mapped_ctor)+]
             [$($out)* $field: self.$field.into_iter().map(|value| $map.map_instr(value)).collect(),]
@@ -774,7 +774,7 @@ macro_rules! define_operation {
         $($mapped_ctor)+ { _meta: $self._meta, extra: Default::default(), $($out)* $field: self.$field.into_iter().map(|value| $map.map_instr(value)).collect(), }
     };
     (@build_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Option<Box<$expr_ty:ident>>, $($rest:tt)*) => {
-        define_operation!(
+        define_instr!(
             @build_mapped
             [$($mapped_ctor)+]
             [$($out)* $field: self.$field.map(|value| Box::new($map.map_instr(*value))),]
@@ -790,59 +790,59 @@ macro_rules! define_operation {
         Ok($($mapped_ctor)+ { _meta: $self._meta, extra: Default::default(), $($out)* })
     };
     (@build_try_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Box<$expr_ty:ident>, $($rest:tt)*) => {
-        define_operation!(
+        define_instr!(
             @build_try_mapped
             [$($mapped_ctor)+]
-            [$($out)* $field: $crate::block_py::OperationField::<$expr_ty>::try_map_field::<T, Error, M>($self.$field, $map)?,]
+            [$($out)* $field: $crate::block_py::InstrField::<$expr_ty>::try_map_field::<T, Error, M>($self.$field, $map)?,]
             $self,
             $map,
             $($rest)*
         )
     };
     (@build_try_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Box<$expr_ty:ident>) => {
-        Ok($($mapped_ctor)+ { _meta: $self._meta, extra: Default::default(), $($out)* $field: $crate::block_py::OperationField::<$expr_ty>::try_map_field::<T, Error, M>($self.$field, $map)?, })
+        Ok($($mapped_ctor)+ { _meta: $self._meta, extra: Default::default(), $($out)* $field: $crate::block_py::InstrField::<$expr_ty>::try_map_field::<T, Error, M>($self.$field, $map)?, })
     };
     (@build_try_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Vec<$expr_ty:ident>, $($rest:tt)*) => {
-        define_operation!(
+        define_instr!(
             @build_try_mapped
             [$($mapped_ctor)+]
-            [$($out)* $field: $crate::block_py::OperationField::<$expr_ty>::try_map_field::<T, Error, M>($self.$field, $map)?,]
+            [$($out)* $field: $crate::block_py::InstrField::<$expr_ty>::try_map_field::<T, Error, M>($self.$field, $map)?,]
             $self,
             $map,
             $($rest)*
         )
     };
     (@build_try_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Vec<$expr_ty:ident>) => {
-        Ok($($mapped_ctor)+ { _meta: $self._meta, extra: Default::default(), $($out)* $field: $crate::block_py::OperationField::<$expr_ty>::try_map_field::<T, Error, M>($self.$field, $map)?, })
+        Ok($($mapped_ctor)+ { _meta: $self._meta, extra: Default::default(), $($out)* $field: $crate::block_py::InstrField::<$expr_ty>::try_map_field::<T, Error, M>($self.$field, $map)?, })
     };
     (@build_try_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Option<Box<$expr_ty:ident>>, $($rest:tt)*) => {
-        define_operation!(
+        define_instr!(
             @build_try_mapped
             [$($mapped_ctor)+]
-            [$($out)* $field: $crate::block_py::OperationField::<$expr_ty>::try_map_field::<T, Error, M>($self.$field, $map)?,]
+            [$($out)* $field: $crate::block_py::InstrField::<$expr_ty>::try_map_field::<T, Error, M>($self.$field, $map)?,]
             $self,
             $map,
             $($rest)*
         )
     };
     (@build_try_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Option<Box<$expr_ty:ident>>) => {
-        Ok($($mapped_ctor)+ { _meta: $self._meta, extra: Default::default(), $($out)* $field: $crate::block_py::OperationField::<$expr_ty>::try_map_field::<T, Error, M>($self.$field, $map)?, })
+        Ok($($mapped_ctor)+ { _meta: $self._meta, extra: Default::default(), $($out)* $field: $crate::block_py::InstrField::<$expr_ty>::try_map_field::<T, Error, M>($self.$field, $map)?, })
     };
     (@build_try_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Vec<$wrapper:ident<$expr_ty:ident>>, $($rest:tt)*) => {
-        define_operation!(
+        define_instr!(
             @build_try_mapped
             [$($mapped_ctor)+]
-            [$($out)* $field: $crate::block_py::OperationField::<$expr_ty>::try_map_field::<T, Error, M>($self.$field, $map)?,]
+            [$($out)* $field: $crate::block_py::InstrField::<$expr_ty>::try_map_field::<T, Error, M>($self.$field, $map)?,]
             $self,
             $map,
             $($rest)*
         )
     };
     (@build_try_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Vec<$wrapper:ident<$expr_ty:ident>>) => {
-        Ok($($mapped_ctor)+ { _meta: $self._meta, extra: Default::default(), $($out)* $field: $crate::block_py::OperationField::<$expr_ty>::try_map_field::<T, Error, M>($self.$field, $map)?, })
+        Ok($($mapped_ctor)+ { _meta: $self._meta, extra: Default::default(), $($out)* $field: $crate::block_py::InstrField::<$expr_ty>::try_map_field::<T, Error, M>($self.$field, $map)?, })
     };
     (@build_try_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : $expr_ty:ident::Name, $($rest:tt)*) => {
-        define_operation!(
+        define_instr!(
             @build_try_mapped
             [$($mapped_ctor)+]
             [$($out)* $field: $map.try_map_name($self.$field)?,]
@@ -855,7 +855,7 @@ macro_rules! define_operation {
         Ok($($mapped_ctor)+ { _meta: $self._meta, extra: Default::default(), $($out)* $field: $map.try_map_name($self.$field)?, })
     };
     (@build_try_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $f:ident, $field:ident : $ty:ty, $($rest:tt)*) => {
-        define_operation!(
+        define_instr!(
             @build_try_mapped
             [$($mapped_ctor)+]
             [$($out)* $field: $self.$field,]
@@ -868,7 +868,7 @@ macro_rules! define_operation {
         Ok($($mapped_ctor)+ { _meta: $self._meta, extra: Default::default(), $($out)* $field: $self.$field, })
     };
     (@build_try_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Vec<$expr_ty:ident>, $($rest:tt)*) => {
-        define_operation!(
+        define_instr!(
             @build_try_mapped
             [$($mapped_ctor)+]
             [$($out)* $field: $self.$field.into_iter().map(|value| $map.try_map_instr(value)).collect::<Result<Vec<_>, _>>()?,]
@@ -881,7 +881,7 @@ macro_rules! define_operation {
         Ok($($mapped_ctor)+ { _meta: $self._meta, extra: Default::default(), $($out)* $field: $self.$field.into_iter().map(|value| $map.try_map_instr(value)).collect::<Result<Vec<_>, _>>()?, })
     };
     (@build_try_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Option<Box<$expr_ty:ident>>, $($rest:tt)*) => {
-        define_operation!(
+        define_instr!(
             @build_try_mapped
             [$($mapped_ctor)+]
             [$($out)* $field: $self.$field.map(|value| $map.try_map_instr(*value).map(Box::new)).transpose()?,]
@@ -897,59 +897,59 @@ macro_rules! define_operation {
         $($mapped_ctor)+ { _meta: $self._meta, extra: $self.extra, $($out)* }
     };
     (@build_same_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Box<$expr_ty:ident>, $($rest:tt)*) => {
-        define_operation!(
+        define_instr!(
             @build_same_mapped
             [$($mapped_ctor)+]
-            [$($out)* $field: $crate::block_py::OperationField::<$expr_ty>::map_field::<$expr_ty, M>($self.$field, $map),]
+            [$($out)* $field: $crate::block_py::InstrField::<$expr_ty>::map_field::<$expr_ty, M>($self.$field, $map),]
             $self,
             $map,
             $($rest)*
         )
     };
     (@build_same_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Box<$expr_ty:ident>) => {
-        $($mapped_ctor)+ { _meta: $self._meta, extra: $self.extra, $($out)* $field: $crate::block_py::OperationField::<$expr_ty>::map_field::<$expr_ty, M>($self.$field, $map), }
+        $($mapped_ctor)+ { _meta: $self._meta, extra: $self.extra, $($out)* $field: $crate::block_py::InstrField::<$expr_ty>::map_field::<$expr_ty, M>($self.$field, $map), }
     };
     (@build_same_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Vec<$expr_ty:ident>, $($rest:tt)*) => {
-        define_operation!(
+        define_instr!(
             @build_same_mapped
             [$($mapped_ctor)+]
-            [$($out)* $field: $crate::block_py::OperationField::<$expr_ty>::map_field::<$expr_ty, M>($self.$field, $map),]
+            [$($out)* $field: $crate::block_py::InstrField::<$expr_ty>::map_field::<$expr_ty, M>($self.$field, $map),]
             $self,
             $map,
             $($rest)*
         )
     };
     (@build_same_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Vec<$expr_ty:ident>) => {
-        $($mapped_ctor)+ { _meta: $self._meta, extra: $self.extra, $($out)* $field: $crate::block_py::OperationField::<$expr_ty>::map_field::<$expr_ty, M>($self.$field, $map), }
+        $($mapped_ctor)+ { _meta: $self._meta, extra: $self.extra, $($out)* $field: $crate::block_py::InstrField::<$expr_ty>::map_field::<$expr_ty, M>($self.$field, $map), }
     };
     (@build_same_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Option<Box<$expr_ty:ident>>, $($rest:tt)*) => {
-        define_operation!(
+        define_instr!(
             @build_same_mapped
             [$($mapped_ctor)+]
-            [$($out)* $field: $crate::block_py::OperationField::<$expr_ty>::map_field::<$expr_ty, M>($self.$field, $map),]
+            [$($out)* $field: $crate::block_py::InstrField::<$expr_ty>::map_field::<$expr_ty, M>($self.$field, $map),]
             $self,
             $map,
             $($rest)*
         )
     };
     (@build_same_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Option<Box<$expr_ty:ident>>) => {
-        $($mapped_ctor)+ { _meta: $self._meta, extra: $self.extra, $($out)* $field: $crate::block_py::OperationField::<$expr_ty>::map_field::<$expr_ty, M>($self.$field, $map), }
+        $($mapped_ctor)+ { _meta: $self._meta, extra: $self.extra, $($out)* $field: $crate::block_py::InstrField::<$expr_ty>::map_field::<$expr_ty, M>($self.$field, $map), }
     };
     (@build_same_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Vec<$wrapper:ident<$expr_ty:ident>>, $($rest:tt)*) => {
-        define_operation!(
+        define_instr!(
             @build_same_mapped
             [$($mapped_ctor)+]
-            [$($out)* $field: $crate::block_py::OperationField::<$expr_ty>::map_field::<$expr_ty, M>($self.$field, $map),]
+            [$($out)* $field: $crate::block_py::InstrField::<$expr_ty>::map_field::<$expr_ty, M>($self.$field, $map),]
             $self,
             $map,
             $($rest)*
         )
     };
     (@build_same_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Vec<$wrapper:ident<$expr_ty:ident>>) => {
-        $($mapped_ctor)+ { _meta: $self._meta, extra: $self.extra, $($out)* $field: $crate::block_py::OperationField::<$expr_ty>::map_field::<$expr_ty, M>($self.$field, $map), }
+        $($mapped_ctor)+ { _meta: $self._meta, extra: $self.extra, $($out)* $field: $crate::block_py::InstrField::<$expr_ty>::map_field::<$expr_ty, M>($self.$field, $map), }
     };
     (@build_same_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : $expr_ty:ident::Name, $($rest:tt)*) => {
-        define_operation!(
+        define_instr!(
             @build_same_mapped
             [$($mapped_ctor)+]
             [$($out)* $field: $map.map_name($self.$field),]
@@ -962,7 +962,7 @@ macro_rules! define_operation {
         $($mapped_ctor)+ { _meta: $self._meta, extra: $self.extra, $($out)* $field: $map.map_name($self.$field), }
     };
     (@build_same_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $f:ident, $field:ident : $ty:ty, $($rest:tt)*) => {
-        define_operation!(
+        define_instr!(
             @build_same_mapped
             [$($mapped_ctor)+]
             [$($out)* $field: $self.$field,]
@@ -978,59 +978,59 @@ macro_rules! define_operation {
         Ok($($mapped_ctor)+ { _meta: $self._meta, extra: $self.extra, $($out)* })
     };
     (@build_try_same_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Box<$expr_ty:ident>, $($rest:tt)*) => {
-        define_operation!(
+        define_instr!(
             @build_try_same_mapped
             [$($mapped_ctor)+]
-            [$($out)* $field: $crate::block_py::OperationField::<$expr_ty>::try_map_field::<$expr_ty, Error, M>($self.$field, $map)?,]
+            [$($out)* $field: $crate::block_py::InstrField::<$expr_ty>::try_map_field::<$expr_ty, Error, M>($self.$field, $map)?,]
             $self,
             $map,
             $($rest)*
         )
     };
     (@build_try_same_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Box<$expr_ty:ident>) => {
-        Ok($($mapped_ctor)+ { _meta: $self._meta, extra: $self.extra, $($out)* $field: $crate::block_py::OperationField::<$expr_ty>::try_map_field::<$expr_ty, Error, M>($self.$field, $map)?, })
+        Ok($($mapped_ctor)+ { _meta: $self._meta, extra: $self.extra, $($out)* $field: $crate::block_py::InstrField::<$expr_ty>::try_map_field::<$expr_ty, Error, M>($self.$field, $map)?, })
     };
     (@build_try_same_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Vec<$expr_ty:ident>, $($rest:tt)*) => {
-        define_operation!(
+        define_instr!(
             @build_try_same_mapped
             [$($mapped_ctor)+]
-            [$($out)* $field: $crate::block_py::OperationField::<$expr_ty>::try_map_field::<$expr_ty, Error, M>($self.$field, $map)?,]
+            [$($out)* $field: $crate::block_py::InstrField::<$expr_ty>::try_map_field::<$expr_ty, Error, M>($self.$field, $map)?,]
             $self,
             $map,
             $($rest)*
         )
     };
     (@build_try_same_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Vec<$expr_ty:ident>) => {
-        Ok($($mapped_ctor)+ { _meta: $self._meta, extra: $self.extra, $($out)* $field: $crate::block_py::OperationField::<$expr_ty>::try_map_field::<$expr_ty, Error, M>($self.$field, $map)?, })
+        Ok($($mapped_ctor)+ { _meta: $self._meta, extra: $self.extra, $($out)* $field: $crate::block_py::InstrField::<$expr_ty>::try_map_field::<$expr_ty, Error, M>($self.$field, $map)?, })
     };
     (@build_try_same_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Option<Box<$expr_ty:ident>>, $($rest:tt)*) => {
-        define_operation!(
+        define_instr!(
             @build_try_same_mapped
             [$($mapped_ctor)+]
-            [$($out)* $field: $crate::block_py::OperationField::<$expr_ty>::try_map_field::<$expr_ty, Error, M>($self.$field, $map)?,]
+            [$($out)* $field: $crate::block_py::InstrField::<$expr_ty>::try_map_field::<$expr_ty, Error, M>($self.$field, $map)?,]
             $self,
             $map,
             $($rest)*
         )
     };
     (@build_try_same_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Option<Box<$expr_ty:ident>>) => {
-        Ok($($mapped_ctor)+ { _meta: $self._meta, extra: $self.extra, $($out)* $field: $crate::block_py::OperationField::<$expr_ty>::try_map_field::<$expr_ty, Error, M>($self.$field, $map)?, })
+        Ok($($mapped_ctor)+ { _meta: $self._meta, extra: $self.extra, $($out)* $field: $crate::block_py::InstrField::<$expr_ty>::try_map_field::<$expr_ty, Error, M>($self.$field, $map)?, })
     };
     (@build_try_same_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Vec<$wrapper:ident<$expr_ty:ident>>, $($rest:tt)*) => {
-        define_operation!(
+        define_instr!(
             @build_try_same_mapped
             [$($mapped_ctor)+]
-            [$($out)* $field: $crate::block_py::OperationField::<$expr_ty>::try_map_field::<$expr_ty, Error, M>($self.$field, $map)?,]
+            [$($out)* $field: $crate::block_py::InstrField::<$expr_ty>::try_map_field::<$expr_ty, Error, M>($self.$field, $map)?,]
             $self,
             $map,
             $($rest)*
         )
     };
     (@build_try_same_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : Vec<$wrapper:ident<$expr_ty:ident>>) => {
-        Ok($($mapped_ctor)+ { _meta: $self._meta, extra: $self.extra, $($out)* $field: $crate::block_py::OperationField::<$expr_ty>::try_map_field::<$expr_ty, Error, M>($self.$field, $map)?, })
+        Ok($($mapped_ctor)+ { _meta: $self._meta, extra: $self.extra, $($out)* $field: $crate::block_py::InstrField::<$expr_ty>::try_map_field::<$expr_ty, Error, M>($self.$field, $map)?, })
     };
     (@build_try_same_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $map:ident, $field:ident : $expr_ty:ident::Name, $($rest:tt)*) => {
-        define_operation!(
+        define_instr!(
             @build_try_same_mapped
             [$($mapped_ctor)+]
             [$($out)* $field: $map.try_map_name($self.$field)?,]
@@ -1043,7 +1043,7 @@ macro_rules! define_operation {
         Ok($($mapped_ctor)+ { _meta: $self._meta, extra: $self.extra, $($out)* $field: $map.try_map_name($self.$field)?, })
     };
     (@build_try_same_mapped [$($mapped_ctor:tt)+] [$($out:tt)*] $self:ident, $f:ident, $field:ident : $ty:ty, $($rest:tt)*) => {
-        define_operation!(
+        define_instr!(
             @build_try_same_mapped
             [$($mapped_ctor)+]
             [$($out)* $field: $self.$field,]
@@ -1058,14 +1058,14 @@ macro_rules! define_operation {
 }
 
 #[macro_export]
-macro_rules! define_ruff_operation {
+macro_rules! define_ruff_instr {
     (
         $(#[$attrs:meta])*
         $vis:vis struct $name:ident<$expr_ty:ident> {
             $($fields:tt)*
         }
     ) => {
-        define_operation!(
+        define_instr!(
             @collect_fields
             [$(#[$attrs])*]
             [$vis]
@@ -1084,7 +1084,7 @@ macro_rules! define_ruff_operation {
             $($fields:tt)*
         }
     ) => {
-        define_operation!(
+        define_instr!(
             @collect_value_fields
             [$(#[$attrs])*]
             [$vis]
@@ -1098,5 +1098,5 @@ macro_rules! define_ruff_operation {
     };
 }
 
-pub use crate::define_operation;
-pub use crate::define_ruff_operation;
+pub use crate::define_instr;
+pub use crate::define_ruff_instr;

@@ -23,6 +23,6 @@ passes and later codegen.
 
 ## Context Read
 
-- `soac-blockpy/src/block_py/operation_macro.rs`
+- `soac-blockpy/src/block_py/instr_macro.rs`
 - `soac-blockpy/src/block_py/meta.rs`
 - `soac-blockpy/src/block_py/name_gen.rs`

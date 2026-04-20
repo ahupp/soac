@@ -1,13 +1,4 @@
-#[allow(unused_imports)]
-pub use self::map::{
-    MapBlock, MapFunction, MapInstr, MapModule, MapTerm, Mappable, OperationField, TryMapBlock,
-    TryMapFunction, TryMapInstr, TryMapModule, TryMapTerm, map_function_blocks,
-    map_module_functions,
-};
-pub use self::meta::{
-    HasMeta, HasSemanticInstrId, IdentifiedInstr, InstrId, InstrKey, Meta, WithMeta,
-};
-pub use self::operation::{
+pub use self::instr::{
     Await, BinOp, BinOpKind, Call, CallDirect, CalleeFunctionId, CellRef, CellRefForName, Del,
     DelItem, ExprAttribute, ExprBoolOp, ExprBooleanLiteral, ExprBytesLiteral, ExprCompare,
     ExprDict, ExprDictComp, ExprEllipsisLiteral, ExprFString, ExprGenerator, ExprIf,
@@ -19,6 +10,15 @@ pub use self::operation::{
     StmtFunctionDef, StmtGlobal, StmtIf, StmtImport, StmtImportFrom, StmtIpyEscapeCommand,
     StmtMatch, StmtNonlocal, StmtPass, StmtRaise, StmtReturn, StmtTry, StmtTypeAlias, StmtWhile,
     StmtWith, Store, Tuple, UnaryOp, UnaryOpKind, Yield, YieldFrom,
+};
+#[allow(unused_imports)]
+pub use self::map::{
+    InstrField, MapBlock, MapFunction, MapInstr, MapModule, MapTerm, Mappable, TryMapBlock,
+    TryMapFunction, TryMapInstr, TryMapModule, TryMapTerm, map_function_blocks,
+    map_module_functions,
+};
+pub use self::meta::{
+    HasMeta, HasSemanticInstrId, IdentifiedInstr, InstrId, InstrKey, Meta, WithMeta,
 };
 pub use self::param_specs::{Param, ParamDefaultSource, ParamKind, ParamSpec};
 pub use self::scope::{
@@ -32,17 +32,17 @@ pub use self::visit::{
     walk_expr_mut, walk_fn, walk_fn_mut, walk_module, walk_module_mut, walk_stmt, walk_stmt_mut,
     walk_term, walk_term_mut,
 };
-pub use crate::{define_operation, define_ruff_operation};
+pub use crate::{define_instr, define_ruff_instr};
 pub use ruff_python_ast::Expr;
 use ruff_python_ast::{self as ast};
 use std::fmt;
 
 mod counters;
+mod instr;
+mod instr_macro;
 mod map;
 mod meta;
 mod name_gen;
-mod operation;
-mod operation_macro;
 mod param_specs;
 mod scope;
 mod visit;

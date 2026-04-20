@@ -1,5 +1,5 @@
 use super::*;
-use soac_core::block_py::define_operation;
+use soac_core::block_py::define_instr;
 use std::fmt;
 
 #[derive(Clone, derive_more::From, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -19,7 +19,7 @@ impl fmt::Debug for Literal {
     }
 }
 
-define_operation! {
+define_instr! {
     pub struct LiteralValue {
         literal: Literal,
     }

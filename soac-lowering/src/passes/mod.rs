@@ -21,22 +21,22 @@ mod trace;
 mod value_facts;
 
 use crate::block_py::{
-    cfg::relabel_blockpy_blocks_dense, define_operation, define_ruff_operation, runtime_name_load,
-    Await, BinOp, BlockPyFunction, BlockPyModule, BlockTerm, Call, CallArgKeyword,
-    CallArgPositional, CallDirect, CalleeFunctionId, CellRef, CellRefForName, ChildVisitable, Del,
-    DelItem, ExprAttribute, ExprBoolOp, ExprBooleanLiteral, ExprBytesLiteral, ExprCompare,
-    ExprDict, ExprDictComp, ExprEllipsisLiteral, ExprFString, ExprGenerator, ExprIf,
-    ExprIpyEscapeCommand, ExprLambda, ExprList, ExprListComp, ExprName, ExprNamed, ExprNoneLiteral,
-    ExprNumberLiteral, ExprSet, ExprSetComp, ExprSlice, ExprStarred, ExprStringLiteral,
-    ExprSubscript, ExprTString, ExprTuple, GetAttr, GetItem, HasMeta, IncrementCounter, Instr,
-    InstrKey, InstrWithConstantNone, LiteralValue, Load, LocalLocation, MakeCell, MakeFunction,
-    MakeFunctionWithClosure, MapFunction, MapInstr, MapModule, Mappable, Meta, ModuleShape,
-    NameLike, NameLocation, ResolvedName, RuntimeFunctionId, RuntimeName, SetAttr, SetItem,
-    StmtAnnAssign, StmtAssert, StmtAssign, StmtAugAssign, StmtBreak, StmtClassDef, StmtContinue,
-    StmtDelete, StmtExpr, StmtFor, StmtFunctionDef, StmtGlobal, StmtIf, StmtImport, StmtImportFrom,
-    StmtIpyEscapeCommand, StmtMatch, StmtNonlocal, StmtPass, StmtRaise, StmtReturn, StmtTry,
-    StmtTypeAlias, StmtWhile, StmtWith, Store, TryMapInstr, TryMapModule, TryMapTerm, Tuple,
-    UnaryOp, UnresolvedName, Visit, VisitMut, WithMeta, Yield, YieldFrom,
+    cfg::relabel_blockpy_blocks_dense, define_instr, define_ruff_instr, runtime_name_load, Await,
+    BinOp, BlockPyFunction, BlockPyModule, BlockTerm, Call, CallArgKeyword, CallArgPositional,
+    CallDirect, CalleeFunctionId, CellRef, CellRefForName, ChildVisitable, Del, DelItem,
+    ExprAttribute, ExprBoolOp, ExprBooleanLiteral, ExprBytesLiteral, ExprCompare, ExprDict,
+    ExprDictComp, ExprEllipsisLiteral, ExprFString, ExprGenerator, ExprIf, ExprIpyEscapeCommand,
+    ExprLambda, ExprList, ExprListComp, ExprName, ExprNamed, ExprNoneLiteral, ExprNumberLiteral,
+    ExprSet, ExprSetComp, ExprSlice, ExprStarred, ExprStringLiteral, ExprSubscript, ExprTString,
+    ExprTuple, GetAttr, GetItem, HasMeta, IncrementCounter, Instr, InstrKey, InstrWithConstantNone,
+    LiteralValue, Load, LocalLocation, MakeCell, MakeFunction, MakeFunctionWithClosure,
+    MapFunction, MapInstr, MapModule, Mappable, Meta, ModuleShape, NameLike, NameLocation,
+    ResolvedName, RuntimeFunctionId, RuntimeName, SetAttr, SetItem, StmtAnnAssign, StmtAssert,
+    StmtAssign, StmtAugAssign, StmtBreak, StmtClassDef, StmtContinue, StmtDelete, StmtExpr,
+    StmtFor, StmtFunctionDef, StmtGlobal, StmtIf, StmtImport, StmtImportFrom, StmtIpyEscapeCommand,
+    StmtMatch, StmtNonlocal, StmtPass, StmtRaise, StmtReturn, StmtTry, StmtTypeAlias, StmtWhile,
+    StmtWith, Store, TryMapInstr, TryMapModule, TryMapTerm, Tuple, UnaryOp, UnresolvedName, Visit,
+    VisitMut, WithMeta, Yield, YieldFrom,
 };
 use ruff_python_ast::{self as ast};
 use soac_macros::{enum_broadcast, DelegateMatchDefault};
@@ -165,14 +165,14 @@ impl Instr for InstrCodegenOp {
     type Extra = ();
 }
 
-define_operation! {
+define_instr! {
     pub struct DirectFunctionIdGuardTest<E> {
         value: Box<E>,
         function_id: RuntimeFunctionId,
     }
 }
 
-define_operation! {
+define_instr! {
     pub struct DirectReceiverTypeVersionGuardTest<E> {
         value: Box<E>,
         owner_type_ref: TypedAttrOwnerRef,
@@ -180,7 +180,7 @@ define_operation! {
     }
 }
 
-define_ruff_operation! {
+define_ruff_instr! {
     pub struct TypedTruthy<E> {
         value: Box<E>,
     }
@@ -957,7 +957,7 @@ pub enum TypedDirectCallGuardTestKind {
     },
 }
 
-define_ruff_operation! {
+define_ruff_instr! {
     pub struct TypedDirectCallGuardTest<E> {
         value: Box<E>,
         kind: TypedDirectCallGuardTestKind,
@@ -986,7 +986,7 @@ pub enum TypedAttrAccessPlan {
     ProfiledIndexedField { guards: Vec<TypedIndexedFieldGuard> },
 }
 
-define_ruff_operation! {
+define_ruff_instr! {
     pub struct TypedGetAttr<E> {
         value: Box<E>,
         attr: Box<E>,
@@ -1022,7 +1022,7 @@ impl<E: Instr> TypedGetAttr<E> {
     }
 }
 
-define_ruff_operation! {
+define_ruff_instr! {
     pub struct TypedSetAttr<E> {
         value: Box<E>,
         attr: Box<E>,

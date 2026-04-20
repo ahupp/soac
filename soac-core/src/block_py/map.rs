@@ -32,7 +32,7 @@ where
     }
 }
 
-pub trait OperationField<In>: Sized
+pub trait InstrField<In>: Sized
 where
     In: Instr,
 {
@@ -59,7 +59,7 @@ where
         M: TryMapInstr<In, Out, Error>;
 }
 
-impl<In> OperationField<In> for Box<In>
+impl<In> InstrField<In> for Box<In>
 where
     In: Instr,
 {
@@ -98,7 +98,7 @@ where
     }
 }
 
-impl<In> OperationField<In> for In
+impl<In> InstrField<In> for In
 where
     In: Instr,
 {
@@ -137,7 +137,7 @@ where
     }
 }
 
-impl<In> OperationField<In> for Option<Box<In>>
+impl<In> InstrField<In> for Option<Box<In>>
 where
     In: Instr,
 {
@@ -181,7 +181,7 @@ where
     }
 }
 
-impl<In> OperationField<In> for CallArgPositional<In>
+impl<In> InstrField<In> for CallArgPositional<In>
 where
     In: Instr,
 {
@@ -220,10 +220,10 @@ where
     }
 }
 
-impl<In, Field> OperationField<In> for Vec<Field>
+impl<In, Field> InstrField<In> for Vec<Field>
 where
     In: Instr,
-    Field: OperationField<In>,
+    Field: InstrField<In>,
 {
     type Mapped<Out: Instr> = Vec<Field::Mapped<Out>>;
 
@@ -266,7 +266,7 @@ where
     }
 }
 
-impl<In> OperationField<In> for CallArgKeyword<In>
+impl<In> InstrField<In> for CallArgKeyword<In>
 where
     In: Instr,
 {

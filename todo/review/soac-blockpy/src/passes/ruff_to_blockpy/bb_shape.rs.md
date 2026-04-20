@@ -34,6 +34,6 @@ regions into direct loads from the block's exception parameter.
 ## Context Read
 
 - `soac-blockpy/src/block_py/mod.rs`
-- `soac-blockpy/src/block_py/operation.rs`
+- `soac-blockpy/src/block_py/instr.rs`
 - `soac-blockpy/src/passes/ruff_to_blockpy/mod.rs`
 

@@ -33,5 +33,5 @@ stores and conditional blocks so evaluation order and short-circuit behavior are
 - `soac-blockpy/src/passes/ruff_to_blockpy/expr_lowering/mod.rs`
 - `soac-blockpy/src/passes/ruff_to_blockpy/stmt_lowering/mod.rs`
 - `soac-blockpy/src/passes/ruff_to_blockpy/mod.rs`
-- `soac-blockpy/src/block_py/operation.rs`
+- `soac-blockpy/src/block_py/instr.rs`
 

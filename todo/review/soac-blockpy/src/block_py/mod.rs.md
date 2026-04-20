@@ -70,7 +70,7 @@ across lowering stages.
 
 ## Context Read
 
-- `soac-blockpy/src/block_py/operation.rs`
+- `soac-blockpy/src/block_py/instr.rs`
 - `soac-blockpy/src/block_py/name_gen.rs`
 - `soac-blockpy/src/block_py/scope.rs`
 - `soac-blockpy/src/block_py/map.rs`
