@@ -23,8 +23,42 @@ impl AlternativeCatalog {
             alternatives: vec![
                 generic_binary_add(),
                 exact_compact_int_add(),
-                generic_rich_compare(BinOpKind::Gt, RichCompareOp::Gt),
-                exact_compact_int_compare(BinOpKind::Gt, RichCompareOp::Gt),
+                generic_rich_compare("binary.eq.py_richcompare", BinOpKind::Eq, RichCompareOp::Eq),
+                exact_compact_int_compare(
+                    "binary.eq.exact_compact_int.i32bool",
+                    BinOpKind::Eq,
+                    RichCompareOp::Eq,
+                ),
+                generic_rich_compare("binary.ne.py_richcompare", BinOpKind::Ne, RichCompareOp::Ne),
+                exact_compact_int_compare(
+                    "binary.ne.exact_compact_int.i32bool",
+                    BinOpKind::Ne,
+                    RichCompareOp::Ne,
+                ),
+                generic_rich_compare("binary.lt.py_richcompare", BinOpKind::Lt, RichCompareOp::Lt),
+                exact_compact_int_compare(
+                    "binary.lt.exact_compact_int.i32bool",
+                    BinOpKind::Lt,
+                    RichCompareOp::Lt,
+                ),
+                generic_rich_compare("binary.le.py_richcompare", BinOpKind::Le, RichCompareOp::Le),
+                exact_compact_int_compare(
+                    "binary.le.exact_compact_int.i32bool",
+                    BinOpKind::Le,
+                    RichCompareOp::Le,
+                ),
+                generic_rich_compare("binary.gt.py_richcompare", BinOpKind::Gt, RichCompareOp::Gt),
+                exact_compact_int_compare(
+                    "binary.gt.exact_compact_int.i32bool",
+                    BinOpKind::Gt,
+                    RichCompareOp::Gt,
+                ),
+                generic_rich_compare("binary.ge.py_richcompare", BinOpKind::Ge, RichCompareOp::Ge),
+                exact_compact_int_compare(
+                    "binary.ge.exact_compact_int.i32bool",
+                    BinOpKind::Ge,
+                    RichCompareOp::Ge,
+                ),
                 python_truthiness(),
                 normalized_truthiness(),
                 materialize_python_long(),
@@ -686,9 +720,13 @@ fn exact_compact_int_add() -> LoweringAlternative {
     }
 }
 
-fn generic_rich_compare(binop: BinOpKind, op: RichCompareOp) -> LoweringAlternative {
+fn generic_rich_compare(
+    id: &'static str,
+    binop: BinOpKind,
+    op: RichCompareOp,
+) -> LoweringAlternative {
     LoweringAlternative {
-        id: AlternativeId::new("binary.gt.py_richcompare"),
+        id: AlternativeId::new(id),
         op: SemanticOpKind::Binary { op: binop },
         input_reps: vec![pyobject_input(0), pyobject_input(1)],
         output_rep: Some(Rep::PyObjectOwned),
@@ -725,9 +763,13 @@ fn generic_rich_compare(binop: BinOpKind, op: RichCompareOp) -> LoweringAlternat
     }
 }
 
-fn exact_compact_int_compare(binop: BinOpKind, op: RichCompareOp) -> LoweringAlternative {
+fn exact_compact_int_compare(
+    id: &'static str,
+    binop: BinOpKind,
+    op: RichCompareOp,
+) -> LoweringAlternative {
     LoweringAlternative {
-        id: AlternativeId::new("binary.gt.exact_compact_int.i32bool"),
+        id: AlternativeId::new(id),
         op: SemanticOpKind::Binary { op: binop },
         input_reps: vec![
             i64_from_compact_long_input(0),
@@ -1005,6 +1047,58 @@ mod tests {
                 AlternativeId::new("binary.add.exact_compact_int.i64")
             ]
         );
+    }
+
+    #[test]
+    fn catalog_exposes_all_rich_compare_alternatives() {
+        let catalog = AlternativeCatalog::default_v3();
+        for (kind, generic_id, exact_id) in [
+            (
+                BinOpKind::Eq,
+                "binary.eq.py_richcompare",
+                "binary.eq.exact_compact_int.i32bool",
+            ),
+            (
+                BinOpKind::Ne,
+                "binary.ne.py_richcompare",
+                "binary.ne.exact_compact_int.i32bool",
+            ),
+            (
+                BinOpKind::Lt,
+                "binary.lt.py_richcompare",
+                "binary.lt.exact_compact_int.i32bool",
+            ),
+            (
+                BinOpKind::Le,
+                "binary.le.py_richcompare",
+                "binary.le.exact_compact_int.i32bool",
+            ),
+            (
+                BinOpKind::Gt,
+                "binary.gt.py_richcompare",
+                "binary.gt.exact_compact_int.i32bool",
+            ),
+            (
+                BinOpKind::Ge,
+                "binary.ge.py_richcompare",
+                "binary.ge.exact_compact_int.i32bool",
+            ),
+        ] {
+            assert_eq!(
+                catalog
+                    .by_id(AlternativeId::new(generic_id))
+                    .map(|alt| alt.op),
+                Some(SemanticOpKind::Binary { op: kind }),
+                "missing generic rich-compare alternative {generic_id}",
+            );
+            assert_eq!(
+                catalog
+                    .by_id(AlternativeId::new(exact_id))
+                    .map(|alt| alt.op),
+                Some(SemanticOpKind::Binary { op: kind }),
+                "missing exact compact-int rich-compare alternative {exact_id}",
+            );
+        }
     }
 
     #[test]

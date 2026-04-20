@@ -15588,10 +15588,10 @@ def f(x):
     }
 
     #[test]
-    fn specialized_jit_exact_int_if_compare_uses_i32_bool_fast_path() {
+    fn specialized_jit_opt_v3_exact_int_if_compare_uses_local_fallback() {
         if crate::run_test_in_isolated_process_if_needed(
             module_path!(),
-            "specialized_jit_exact_int_if_compare_uses_i32_bool_fast_path",
+            "specialized_jit_opt_v3_exact_int_if_compare_uses_local_fallback",
         ) {
             return;
         }
@@ -15663,19 +15663,24 @@ def f(x):
                 ),
             )],
         );
-        let bool_helper_names = import_user_names_for_symbols(
+        let generic_fallback_helpers =
+            import_user_names_for_symbols(&built, &["PyObject_RichCompare", "dp_jit_is_true"]);
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&built.ctx.func, &generic_fallback_helpers),
+            2,
+            "v3 exact-int compare branch should keep generic rich-compare and truthiness in the local fallback"
+        );
+        let legacy_exact_helpers = import_user_names_for_symbols(
             &built,
             &[
                 "dp_jit_exact_long_richcompare_bool_slot",
                 "dp_jit_exact_long_richcompare_slot",
-                "PyObject_RichCompare",
-                "dp_jit_is_true",
             ],
         );
         assert_eq!(
-            count_direct_calls_to_runtime_helpers(&built.ctx.func, &bool_helper_names),
+            count_direct_calls_to_runtime_helpers(&built.ctx.func, &legacy_exact_helpers),
             0,
-            "if-condition exact-int compare should lower to compact-long guards and a raw integer compare"
+            "v3 exact-int compare branch should not rely on legacy exact-long compare helpers"
         );
     }
 

@@ -87,7 +87,7 @@ pub fn plan_function_optimization_v3(
 
     for region_request in &request.regions {
         let region = &region_request.region;
-        match plan_compact_int_add_gt_zero_branch(catalog, region, &region_request.facts) {
+        match plan_compact_int_branch(catalog, region, &region_request.facts) {
             Ok(Some(planned_regions)) => function.regions.extend(planned_regions),
             Ok(None) => function.diagnostics.push(PlanDiagnostic {
                 source: region.exit_source(),
@@ -101,6 +101,17 @@ pub fn plan_function_optimization_v3(
     }
 
     function
+}
+
+fn plan_compact_int_branch(
+    catalog: &AlternativeCatalog,
+    region: &ExtractedRegion,
+    facts: &PlannerFacts,
+) -> Result<Option<Vec<RegionPlan>>, String> {
+    if let Some(planned) = plan_compact_int_add_gt_zero_branch(catalog, region, facts)? {
+        return Ok(Some(planned));
+    }
+    plan_compact_int_compare_branch(catalog, region, facts)
 }
 
 fn plan_compact_int_add_gt_zero_branch(
@@ -242,6 +253,108 @@ fn plan_compact_int_add_gt_zero_branch(
     Ok(Some(vec![hot_region, fallback_region]))
 }
 
+fn plan_compact_int_compare_branch(
+    catalog: &AlternativeCatalog,
+    region: &ExtractedRegion,
+    facts: &PlannerFacts,
+) -> Result<Option<Vec<RegionPlan>>, String> {
+    let Some(shape) = match_compact_int_compare_branch(region, facts) else {
+        return Ok(None);
+    };
+    let compare = required_alternative(catalog, shape.compare.exact_id)?;
+    let generic_compare = required_alternative(catalog, shape.compare.generic_id)?;
+    let truthiness = required_alternative(catalog, "truthiness.pyobject")?;
+
+    let fallback_region_id = RegionId(region.id.0 + 1);
+    let failure_targets =
+        FailureTargets::local_fallback(FallbackTarget::Region(fallback_region_id));
+
+    let a_obj = PlanValue::new(0, Rep::PyObjectBorrowed);
+    let b_obj = PlanValue::new(1, Rep::PyObjectBorrowed);
+    let a_i64 = PlanValue::new(2, Rep::I64);
+    let b_i64 = PlanValue::new(3, Rep::I64);
+    let condition = PlanValue::new(4, Rep::I32Bool01);
+
+    let hot_region = RegionPlan {
+        id: region.id,
+        source: RegionSource::Instr {
+            instr_id: shape
+                .source
+                .unwrap_or_else(|| InstrId::new(region.block, 0)),
+        },
+        inputs: vec![
+            region_input(a_obj, 0, shape.left_name.clone()),
+            region_input(b_obj, 1, shape.right_name.clone()),
+        ],
+        nodes: vec![
+            guard_node(compare, 0, 0, a_obj, &failure_targets),
+            guard_node(compare, 1, 1, b_obj, &failure_targets),
+            unbox_node(2, a_obj, a_i64, 0, fallback_region_id),
+            unbox_node(3, b_obj, b_i64, 1, fallback_region_id),
+            operation_node(
+                4,
+                compare,
+                vec![a_i64, b_i64],
+                Some(condition),
+                &failure_targets,
+            )?,
+        ],
+        exits: vec![RegionExitPlan {
+            source: shape.source,
+            kind: RegionExitKind::Branch {
+                condition,
+                then_target: RegionExitTarget::OriginalCfg,
+                else_target: RegionExitTarget::OriginalCfg,
+            },
+        }],
+    };
+
+    let fallback_compare = PlanValue::new(20, Rep::PyObjectOwned);
+    let fallback_condition = PlanValue::new(21, Rep::I32Bool01);
+    let fallback_region = RegionPlan {
+        id: fallback_region_id,
+        source: RegionSource::Synthetic {
+            reason: "generic fallback for compact-int comparison branch".to_string(),
+        },
+        inputs: vec![
+            region_input(a_obj, 0, shape.left_name),
+            region_input(b_obj, 1, shape.right_name),
+        ],
+        nodes: vec![
+            operation_node(
+                20,
+                generic_compare,
+                vec![a_obj, b_obj],
+                Some(fallback_compare),
+                &failure_targets,
+            )?,
+            node(
+                21,
+                PlanNodeKind::Convert(ConvertNode {
+                    input: fallback_compare,
+                    output: fallback_condition,
+                    kind: ConversionKind::TruthinessToI32Bool01,
+                    precondition: ConversionPrecondition::Infallible,
+                    failure: truthiness
+                        .instantiate_failure(&failure_targets)
+                        .map_err(|err| err.0)?,
+                    ownership: ConversionOwnership::ConsumeOwned,
+                }),
+            ),
+        ],
+        exits: vec![RegionExitPlan {
+            source: shape.source,
+            kind: RegionExitKind::Branch {
+                condition: fallback_condition,
+                then_target: RegionExitTarget::OriginalCfg,
+                else_target: RegionExitTarget::OriginalCfg,
+            },
+        }],
+    };
+
+    Ok(Some(vec![hot_region, fallback_region]))
+}
+
 fn required_alternative<'a>(
     catalog: &'a AlternativeCatalog,
     id: &'static str,
@@ -256,6 +369,20 @@ struct CompactIntBranchShape {
     source: Option<InstrId>,
     left_name: String,
     right_name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CompactIntCompareBranchShape {
+    source: Option<InstrId>,
+    left_name: String,
+    right_name: String,
+    compare: CompareAlternativeSpec,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CompareAlternativeSpec {
+    generic_id: &'static str,
+    exact_id: &'static str,
 }
 
 fn match_compact_int_add_gt_zero_branch(
@@ -303,6 +430,69 @@ fn match_compact_int_add_gt_zero_branch(
         source,
         left_name: region.load_name(left)?.id_str().to_string(),
         right_name: region.load_name(right)?.id_str().to_string(),
+    })
+}
+
+fn match_compact_int_compare_branch(
+    region: &ExtractedRegion,
+    facts: &PlannerFacts,
+) -> Option<CompactIntCompareBranchShape> {
+    let ExtractedExit::Branch {
+        condition, source, ..
+    } = region.exit
+    else {
+        return None;
+    };
+    let truth = region.value(condition)?;
+    let ExtractedValueKind::Truthiness {
+        value: compare_value,
+    } = truth.kind
+    else {
+        return None;
+    };
+    let compare = region.value(compare_value)?;
+    let ExtractedValueKind::Binary { op, left, right } = compare.kind else {
+        return None;
+    };
+    let compare = compare_alternative_spec(op)?;
+    if !facts.is_exact_compact_int(left) || !facts.is_exact_compact_int(right) {
+        return None;
+    }
+    Some(CompactIntCompareBranchShape {
+        source,
+        left_name: region.load_name(left)?.id_str().to_string(),
+        right_name: region.load_name(right)?.id_str().to_string(),
+        compare,
+    })
+}
+
+fn compare_alternative_spec(op: BinOpKind) -> Option<CompareAlternativeSpec> {
+    Some(match op {
+        BinOpKind::Eq => CompareAlternativeSpec {
+            generic_id: "binary.eq.py_richcompare",
+            exact_id: "binary.eq.exact_compact_int.i32bool",
+        },
+        BinOpKind::Ne => CompareAlternativeSpec {
+            generic_id: "binary.ne.py_richcompare",
+            exact_id: "binary.ne.exact_compact_int.i32bool",
+        },
+        BinOpKind::Lt => CompareAlternativeSpec {
+            generic_id: "binary.lt.py_richcompare",
+            exact_id: "binary.lt.exact_compact_int.i32bool",
+        },
+        BinOpKind::Le => CompareAlternativeSpec {
+            generic_id: "binary.le.py_richcompare",
+            exact_id: "binary.le.exact_compact_int.i32bool",
+        },
+        BinOpKind::Gt => CompareAlternativeSpec {
+            generic_id: "binary.gt.py_richcompare",
+            exact_id: "binary.gt.exact_compact_int.i32bool",
+        },
+        BinOpKind::Ge => CompareAlternativeSpec {
+            generic_id: "binary.ge.py_richcompare",
+            exact_id: "binary.ge.exact_compact_int.i32bool",
+        },
+        _ => return None,
     })
 }
 
@@ -475,6 +665,27 @@ mod tests {
         extract_block_region_v3(&block, RegionId(0)).unwrap()
     }
 
+    fn compact_int_compare_branch_region(kind: BinOpKind) -> ExtractedRegion {
+        let test = binary(
+            kind,
+            with_instr_id(local("a", 0), 0),
+            with_instr_id(local("b", 1), 1),
+            2,
+        );
+        let block = Block::new(
+            label(0),
+            Vec::new(),
+            BlockTerm::IfTerm(TermIf {
+                test,
+                then_label: label(1),
+                else_label: label(2),
+            }),
+            Vec::<BlockParam>::new(),
+            None,
+        );
+        extract_block_region_v3(&block, RegionId(0)).unwrap()
+    }
+
     fn facts_for_compact_region() -> PlannerFacts {
         let mut facts = PlannerFacts::default();
         facts.mark_exact_compact_int(ExtractedValueId(0));
@@ -527,6 +738,41 @@ mod tests {
             PlanNodeKind::Operation(OperationNode {
                 op: crate::optimization_plan_v3::PlannedOp::I64CompareToBool01 {
                     op: RichCompareOp::Gt
+                },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn plans_direct_compact_int_compare_branch() {
+        let catalog = AlternativeCatalog::default_v3();
+        let request = module_request(
+            compact_int_compare_branch_region(BinOpKind::Lt),
+            facts_for_compact_region(),
+        );
+        let plan = plan_module_optimization_v3(&catalog, request);
+
+        validate_module_plan_v3(&plan).unwrap();
+        let function = &plan.functions[0];
+        assert!(function.diagnostics.is_empty());
+        assert_eq!(function.regions.len(), 2);
+        assert_eq!(function.regions[0].nodes.len(), 5);
+        assert!(matches!(
+            function.regions[0].nodes[4].kind,
+            PlanNodeKind::Operation(OperationNode {
+                op: crate::optimization_plan_v3::PlannedOp::I64CompareToBool01 {
+                    op: RichCompareOp::Lt
+                },
+                ..
+            })
+        ));
+        assert_eq!(function.regions[1].nodes.len(), 2);
+        assert!(matches!(
+            function.regions[1].nodes[0].kind,
+            PlanNodeKind::Operation(OperationNode {
+                op: crate::optimization_plan_v3::PlannedOp::PyObjectRichCompare {
+                    op: RichCompareOp::Lt
                 },
                 ..
             })
