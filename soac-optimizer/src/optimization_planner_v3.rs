@@ -6,12 +6,14 @@ use crate::optimization_region_v3::{
 };
 use soac_core::block_py::{BinOpKind, InstrId, NameLike, NameLocation, ResolvedName};
 use soac_optimization::optimization_plan_v3::{
-    ConversionKind, ConversionOwnership, ConversionPrecondition, ConvertNode, FailureMode,
+    ConversionKind, ConversionOwnership, ConversionPrecondition, ConvertNode, Cost, FailureMode,
     FallbackReason, FallbackTarget, FunctionOptimizationPlanV3, FunctionOwnershipPlan,
     FunctionPlanIdentity, MaterializeKind, MaterializeNode, ModuleOptimizationPlanV3,
     ModulePlanIdentity, OperationNode, PlanDiagnostic, PlanNode, PlanNodeId, PlanNodeKind,
     PlanValue, PlannedConstant, RegionExitKind, RegionExitPlan, RegionExitTarget, RegionId,
-    RegionInput, RegionInputSource, RegionPlan, RegionSource, Rep,
+    RegionInput, RegionInputSource, RegionPlan, RegionSource, RegionValueRef, Rep,
+    ScalarLocalThreadPlan, ScalarThreadFallback, ScalarThreadLocal, ScalarThreadLocalLocation,
+    ScalarThreadMaterialization,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -77,15 +79,17 @@ pub fn plan_function_optimization_v3(
     catalog: &AlternativeCatalog,
     request: FunctionPlanRequest,
 ) -> FunctionOptimizationPlanV3 {
+    let region_requests = request.regions;
     let mut function = FunctionOptimizationPlanV3 {
         function: request.function,
         regions: Vec::new(),
+        scalar_threads: Vec::new(),
         deopt_points: Vec::new(),
         ownership: FunctionOwnershipPlan::default(),
         diagnostics: Vec::new(),
     };
 
-    for region_request in &request.regions {
+    for region_request in &region_requests {
         let region = &region_request.region;
         match plan_compact_int_branch(catalog, region, &region_request.facts) {
             Ok(Some(planned_regions)) => function.regions.extend(planned_regions),
@@ -100,6 +104,7 @@ pub fn plan_function_optimization_v3(
         }
     }
 
+    function.scalar_threads = plan_scalar_local_threads_v3(&region_requests, &function.regions);
     function
 }
 
@@ -121,6 +126,202 @@ fn plan_compact_int_branch(
         return Ok(Some(planned));
     }
     plan_compact_int_binary_return(catalog, region, facts)
+}
+
+fn plan_scalar_local_threads_v3(
+    region_requests: &[ExtractedRegionPlanRequest],
+    planned_regions: &[RegionPlan],
+) -> Vec<ScalarLocalThreadPlan> {
+    let mut threads = Vec::new();
+    for producer_request in region_requests {
+        let producer_region = &producer_request.region;
+        if producer_region.block_body_len != 1 {
+            continue;
+        }
+        let Some(store) = &producer_region.store else {
+            continue;
+        };
+        let Some(continuation) = store.continuation else {
+            continue;
+        };
+        let Some(local) = scalar_thread_local_from_name(&store.target) else {
+            continue;
+        };
+        if !planned_regions
+            .iter()
+            .any(|region| region.id == producer_region.id)
+        {
+            continue;
+        }
+        let Some(producer_shape) =
+            match_compact_int_binary_return(producer_region, &producer_request.facts)
+        else {
+            continue;
+        };
+        let Some(producer_value) = planned_i64_output(planned_regions, producer_region.id) else {
+            continue;
+        };
+        let producer_fallback_region = RegionId(producer_region.id.0 + 1);
+        if !planned_regions
+            .iter()
+            .any(|region| region.id == producer_fallback_region)
+        {
+            continue;
+        }
+
+        for consumer_request in region_requests {
+            let consumer_region = &consumer_request.region;
+            if consumer_region.block != continuation {
+                continue;
+            }
+            if consumer_region.block_body_len != 0 {
+                continue;
+            }
+            if !planned_regions
+                .iter()
+                .any(|region| region.id == consumer_region.id)
+            {
+                continue;
+            }
+            let Some(consumer_shape) = match_compact_int_compare_constant_local_branch(
+                consumer_region,
+                &consumer_request.facts,
+            ) else {
+                continue;
+            };
+            if !same_scalar_thread_local(&store.target, &consumer_shape.value_name) {
+                continue;
+            }
+            let Some(consumer_value) = planned_unbox_output(planned_regions, consumer_region.id)
+            else {
+                continue;
+            };
+            threads.push(ScalarLocalThreadPlan {
+                local: local.clone(),
+                producer: RegionValueRef {
+                    region: producer_region.id,
+                    value: producer_value,
+                },
+                consumer: RegionValueRef {
+                    region: consumer_region.id,
+                    value: consumer_value,
+                },
+                fallback: ScalarThreadFallback::LocalFallbackRegion {
+                    region: producer_fallback_region,
+                    reason: format!(
+                        "guard miss or overflow in {:?} must execute the original store before branching",
+                        producer_shape.source
+                    ),
+                },
+                materialization: ScalarThreadMaterialization::DeferredUntilPythonObjectUse {
+                    reason: "the stored scalar may replace the later local unbox until Python object semantics are required"
+                        .to_string(),
+                },
+                estimated_savings: Cost {
+                    hot_path: 2,
+                    materialization: 1,
+                    ownership: 1,
+                    ..Cost::default()
+                },
+                reason: format!(
+                    "thread exact compact-int store into following comparison at {:?}",
+                    consumer_shape.source
+                ),
+            });
+        }
+    }
+    threads
+}
+
+fn planned_i64_output(planned_regions: &[RegionPlan], region_id: RegionId) -> Option<PlanValue> {
+    planned_regions
+        .iter()
+        .find(|region| region.id == region_id)?
+        .nodes
+        .iter()
+        .find_map(|node| match &node.kind {
+            PlanNodeKind::Operation(operation) => {
+                operation.output.filter(|value| value.rep == Rep::I64)
+            }
+            _ => None,
+        })
+}
+
+fn planned_unbox_output(planned_regions: &[RegionPlan], region_id: RegionId) -> Option<PlanValue> {
+    planned_regions
+        .iter()
+        .find(|region| region.id == region_id)?
+        .nodes
+        .iter()
+        .find_map(|node| match &node.kind {
+            PlanNodeKind::Convert(convert)
+                if convert.kind == ConversionKind::FromPythonLongCompactToI64 =>
+            {
+                Some(convert.output)
+            }
+            _ => None,
+        })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CompactIntCompareConstantLocalBranchShape {
+    source: Option<InstrId>,
+    value_name: ResolvedName,
+}
+
+fn match_compact_int_compare_constant_local_branch(
+    region: &ExtractedRegion,
+    facts: &PlannerFacts,
+) -> Option<CompactIntCompareConstantLocalBranchShape> {
+    let ExtractedExit::Branch {
+        condition, source, ..
+    } = region.exit
+    else {
+        return None;
+    };
+    let truth = region.value(condition)?;
+    let ExtractedValueKind::Truthiness {
+        value: compare_value,
+    } = truth.kind
+    else {
+        return None;
+    };
+    let compare = region.value(compare_value)?;
+    let ExtractedValueKind::Binary { op, left, right } = compare.kind else {
+        return None;
+    };
+    compare_alternative_spec(op)?;
+    if facts.is_exact_compact_int(left) && facts.i64_constant(right).is_some() {
+        return Some(CompactIntCompareConstantLocalBranchShape {
+            source,
+            value_name: region.load_name(left)?.clone(),
+        });
+    }
+    if facts.is_exact_compact_int(right) && facts.i64_constant(left).is_some() {
+        return Some(CompactIntCompareConstantLocalBranchShape {
+            source,
+            value_name: region.load_name(right)?.clone(),
+        });
+    }
+    None
+}
+
+fn scalar_thread_local_from_name(name: &ResolvedName) -> Option<ScalarThreadLocal> {
+    let NameLocation::Local(location) = name.location else {
+        return None;
+    };
+    Some(ScalarThreadLocal {
+        name: name.id_str().to_string(),
+        location: ScalarThreadLocalLocation::Local {
+            slot: location.slot(),
+        },
+    })
+}
+
+fn same_scalar_thread_local(left: &ResolvedName, right: &ResolvedName) -> bool {
+    left.id == right.id
+        && left.location == right.location
+        && scalar_thread_local_from_name(left).is_some()
 }
 
 fn plan_compact_int_add_gt_zero_branch(
@@ -1080,13 +1281,13 @@ fn operation_node(
 mod tests {
     use super::*;
     use crate::optimization_alternatives_v3::ALTERNATIVE_CATALOG_V3_VERSION;
-    use crate::optimization_region_v3::extract_block_region_v3;
+    use crate::optimization_region_v3::{extract_block_region_v3, extract_function_regions_v3};
     use soac_core::block_py::{
-        BinOp, Block, BlockLabel, BlockParam, BlockPyName, BlockTerm, Load, LocalFunctionId,
-        LocalLocation, Meta, NameLocation, SerializedFunctionId, SerializedModuleId, TermIf,
-        WithMeta,
+        BinOp, Block, BlockEdge, BlockLabel, BlockParam, BlockPyFunction, BlockPyName, BlockTerm,
+        FunctionName, Load, LocalFunctionId, LocalLocation, Meta, ModuleNameGen, NameLocation,
+        ParamSpec, SerializedFunctionId, SerializedModuleId, Store, TermIf, WithMeta,
     };
-    use soac_lowering::passes::InstrCodegen;
+    use soac_lowering::passes::{CodegenModuleShape, InstrCodegen};
     use soac_optimization::optimization_plan_v3::RichCompareOp;
     use soac_optimization::optimization_plan_v3::validate_module_plan_v3;
 
@@ -1094,13 +1295,17 @@ mod tests {
         BlockLabel::from_index(index)
     }
 
-    fn instr_id(index: u32) -> InstrId {
-        InstrId::new(label(0), index)
+    fn instr_id_in_label(block: BlockLabel, index: u32) -> InstrId {
+        InstrId::new(block, index)
     }
 
     fn with_instr_id(instr: InstrCodegen, index: u32) -> InstrCodegen {
+        with_instr_id_in_label(instr, label(0), index)
+    }
+
+    fn with_instr_id_in_label(instr: InstrCodegen, block: BlockLabel, index: u32) -> InstrCodegen {
         instr.with_meta(Meta {
-            instr_id: Some(instr_id(index)),
+            instr_id: Some(instr_id_in_label(block, index)),
             ..Meta::synthetic()
         })
     }
@@ -1121,6 +1326,32 @@ mod tests {
 
     fn binary(op: BinOpKind, left: InstrCodegen, right: InstrCodegen, id: u32) -> InstrCodegen {
         with_instr_id(InstrCodegen::BinOp(BinOp::new(op, left, right)), id)
+    }
+
+    fn binary_in_label(
+        op: BinOpKind,
+        left: InstrCodegen,
+        right: InstrCodegen,
+        block: BlockLabel,
+        id: u32,
+    ) -> InstrCodegen {
+        with_instr_id_in_label(InstrCodegen::BinOp(BinOp::new(op, left, right)), block, id)
+    }
+
+    fn test_function(blocks: Vec<Block<InstrCodegen>>) -> BlockPyFunction<CodegenModuleShape> {
+        let name_gen = ModuleNameGen::new(0).next_function_name_gen();
+        BlockPyFunction {
+            function_id: name_gen.function_id(),
+            name_gen,
+            names: FunctionName::new("f", "f", "f", "f"),
+            kind: soac_core::block_py::FunctionKind::Function,
+            execution_mode: Default::default(),
+            params: ParamSpec::default(),
+            blocks,
+            doc: None,
+            storage_layout: None,
+            scope: Default::default(),
+        }
     }
 
     fn compact_int_branch_region() -> ExtractedRegion {
@@ -1238,6 +1469,10 @@ mod tests {
     }
 
     fn module_request(region: ExtractedRegion, facts: PlannerFacts) -> ModulePlanRequest {
+        module_request_regions(vec![ExtractedRegionPlanRequest { region, facts }])
+    }
+
+    fn module_request_regions(regions: Vec<ExtractedRegionPlanRequest>) -> ModulePlanRequest {
         ModulePlanRequest {
             module: ModulePlanIdentity {
                 module_name: "pkg.mod".to_string(),
@@ -1252,7 +1487,7 @@ mod tests {
                     ),
                     debug_name: Some("f".to_string()),
                 },
-                regions: vec![ExtractedRegionPlanRequest { region, facts }],
+                regions,
             }],
         }
     }
@@ -1554,6 +1789,216 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn plans_scalar_thread_for_store_rhs_followed_by_compare() {
+        let catalog = AlternativeCatalog::default_v3();
+        let c = ResolvedName {
+            id: BlockPyName::new("c"),
+            location: NameLocation::Local(LocalLocation(2)),
+        };
+        let add = binary(
+            BinOpKind::Add,
+            with_instr_id(local("a", 0), 0),
+            with_instr_id(local("b", 1), 1),
+            2,
+        );
+        let entry = Block::new(
+            label(0),
+            vec![with_instr_id(
+                InstrCodegen::Store(Store::new(c.clone(), add)),
+                3,
+            )],
+            BlockTerm::Jump(BlockEdge::new(label(1))),
+            Vec::<BlockParam>::new(),
+            None,
+        );
+        let test_label = label(1);
+        let compare = binary_in_label(
+            BinOpKind::Gt,
+            with_instr_id_in_label(InstrCodegen::Load(Load::new(c)), test_label, 4),
+            with_instr_id_in_label(constant(0), test_label, 5),
+            test_label,
+            6,
+        );
+        let test = Block::new(
+            test_label,
+            Vec::new(),
+            BlockTerm::IfTerm(TermIf {
+                test: compare,
+                then_label: label(2),
+                else_label: label(3),
+            }),
+            Vec::<BlockParam>::new(),
+            None,
+        );
+        let region_requests = extract_function_regions_v3(&test_function(vec![entry, test]))
+            .into_iter()
+            .filter_map(|attempt| {
+                let region = attempt.result.ok()?;
+                let mut facts = PlannerFacts::default();
+                match region.id {
+                    RegionId(0) => {
+                        facts.mark_exact_compact_int(ExtractedValueId(0));
+                        facts.mark_exact_compact_int(ExtractedValueId(1));
+                    }
+                    RegionId(4) => {
+                        facts.mark_exact_compact_int(ExtractedValueId(0));
+                        facts.set_i64_constant(ExtractedValueId(1), 0);
+                    }
+                    _ => {}
+                }
+                Some(ExtractedRegionPlanRequest { region, facts })
+            })
+            .collect::<Vec<_>>();
+
+        let plan = plan_module_optimization_v3(&catalog, module_request_regions(region_requests));
+
+        validate_module_plan_v3(&plan).unwrap();
+        let function = &plan.functions[0];
+        assert!(function.diagnostics.is_empty());
+        assert_eq!(function.regions.len(), 4);
+        assert_eq!(function.scalar_threads.len(), 1);
+        let thread = &function.scalar_threads[0];
+        assert_eq!(thread.local.name, "c");
+        assert_eq!(
+            thread.local.location,
+            ScalarThreadLocalLocation::Local { slot: 2 }
+        );
+        assert_eq!(thread.producer.region, RegionId(0));
+        assert_eq!(thread.producer.value.rep, Rep::I64);
+        assert_eq!(thread.consumer.region, RegionId(4));
+        assert_eq!(thread.consumer.value.rep, Rep::I64);
+        assert!(matches!(
+            thread.fallback,
+            ScalarThreadFallback::LocalFallbackRegion {
+                region: RegionId(1),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn scalar_thread_declines_intervening_consumer_body() {
+        let catalog = AlternativeCatalog::default_v3();
+        let c = ResolvedName {
+            id: BlockPyName::new("c"),
+            location: NameLocation::Local(LocalLocation(2)),
+        };
+        let producer = ExtractedRegion {
+            id: RegionId(0),
+            block: label(0),
+            block_body_len: 1,
+            store: Some(crate::optimization_region_v3::ExtractedStoreContext {
+                target: c.clone(),
+                continuation: Some(label(1)),
+            }),
+            values: vec![
+                ExtractedValue {
+                    id: ExtractedValueId(0),
+                    source: None,
+                    kind: ExtractedValueKind::LoadName {
+                        name: ResolvedName {
+                            id: BlockPyName::new("a"),
+                            location: NameLocation::Local(LocalLocation(0)),
+                        },
+                    },
+                },
+                ExtractedValue {
+                    id: ExtractedValueId(1),
+                    source: None,
+                    kind: ExtractedValueKind::LoadName {
+                        name: ResolvedName {
+                            id: BlockPyName::new("b"),
+                            location: NameLocation::Local(LocalLocation(1)),
+                        },
+                    },
+                },
+                ExtractedValue {
+                    id: ExtractedValueId(2),
+                    source: None,
+                    kind: ExtractedValueKind::Binary {
+                        op: BinOpKind::Add,
+                        left: ExtractedValueId(0),
+                        right: ExtractedValueId(1),
+                    },
+                },
+            ],
+            exit: ExtractedExit::Return {
+                source: None,
+                value: ExtractedValueId(2),
+            },
+        };
+        let consumer = ExtractedRegion {
+            id: RegionId(4),
+            block: label(1),
+            block_body_len: 1,
+            store: None,
+            values: vec![
+                ExtractedValue {
+                    id: ExtractedValueId(0),
+                    source: None,
+                    kind: ExtractedValueKind::LoadName { name: c },
+                },
+                ExtractedValue {
+                    id: ExtractedValueId(1),
+                    source: None,
+                    kind: ExtractedValueKind::LoadName {
+                        name: ResolvedName {
+                            id: BlockPyName::new("__dp_constant"),
+                            location: NameLocation::Constant(0),
+                        },
+                    },
+                },
+                ExtractedValue {
+                    id: ExtractedValueId(2),
+                    source: None,
+                    kind: ExtractedValueKind::Binary {
+                        op: BinOpKind::Gt,
+                        left: ExtractedValueId(0),
+                        right: ExtractedValueId(1),
+                    },
+                },
+                ExtractedValue {
+                    id: ExtractedValueId(3),
+                    source: None,
+                    kind: ExtractedValueKind::Truthiness {
+                        value: ExtractedValueId(2),
+                    },
+                },
+            ],
+            exit: ExtractedExit::Branch {
+                source: None,
+                condition: ExtractedValueId(3),
+                then_label: label(2),
+                else_label: label(3),
+            },
+        };
+        let mut producer_facts = PlannerFacts::default();
+        producer_facts.mark_exact_compact_int(ExtractedValueId(0));
+        producer_facts.mark_exact_compact_int(ExtractedValueId(1));
+        let mut consumer_facts = PlannerFacts::default();
+        consumer_facts.mark_exact_compact_int(ExtractedValueId(0));
+        consumer_facts.set_i64_constant(ExtractedValueId(1), 0);
+
+        let plan = plan_module_optimization_v3(
+            &catalog,
+            module_request_regions(vec![
+                ExtractedRegionPlanRequest {
+                    region: producer,
+                    facts: producer_facts,
+                },
+                ExtractedRegionPlanRequest {
+                    region: consumer,
+                    facts: consumer_facts,
+                },
+            ]),
+        );
+
+        validate_module_plan_v3(&plan).unwrap();
+        assert_eq!(plan.functions[0].regions.len(), 4);
+        assert!(plan.functions[0].scalar_threads.is_empty());
     }
 
     #[test]

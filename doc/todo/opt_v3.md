@@ -67,19 +67,23 @@ Implemented:
 
 - `soac-optimization::optimization_plan_v3`: full plan schema, conversion
   signatures, operation signatures, replay-safety validation, and structural
-  validation.
+  validation. Function plans also carry validated `scalar_threads` sidecars
+  that name cross-region scalar-local rewrites without asking codegen to
+  rediscover them.
 - `soac-optimizer::optimization_alternatives_v3`: default catalog entries for
   generic Python add/sub/mul/bitwise/all-rich-compare, exact compact-int
   add/sub/mul/bitwise/all-rich-compare, truthiness, and materialization.
 - `soac-optimizer::optimization_region_v3`: conservative branch/return region
-  extraction that preserves evaluation order and declines unsupported blocks
+  extraction that preserves evaluation order, records store targets and simple
+  jump continuations for store-RHS regions, and declines unsupported blocks
   explicitly.
 - `soac-optimizer::optimization_planner_v3`: bounded planner for
   exact-compact-`int` direct comparison branches, `a + b > 0` branches,
   `return a + b`/`return a - b`/`return a * b` arithmetic returns,
   `return a & b`/`return a | b`/`return a ^ b` bitwise returns, and
   `return a < b` comparison returns, producing hot and local-fallback
-  `RegionPlan`s.
+  `RegionPlan`s. It also records a scalar-thread candidate when a compact-int
+  store RHS feeds the immediately following local comparison.
 - `soac-optimization::optimization_emit_v3`: validation-gated mechanical
   emitter over selected v3 plan nodes and exits.
 - `soac-optimizer::optimization_evidence_v3`: bridge from existing
@@ -106,6 +110,9 @@ Implemented:
 
 Remaining legacy-only families are intentionally visible:
 
+- live JIT consumption of scalar-thread candidates; the plan sidecar exists,
+  but codegen still needs path-aware local state before it can omit
+  materializing a stored local such as `c`;
 - remaining division/modulo/shift and unary exact-int value-producing operators;
 - profiled direct calls;
 - exact-list getitem/setitem;
@@ -388,6 +395,37 @@ Do not attempt an unbounded whole-function search at first. Handle joins by
 materializing to the required boundary representation or by carrying explicit
 phi-compatible reps only when both predecessors have the same proven state.
 
+### Scalar Local Threading
+
+Scalar local threading is a cross-region rewrite, not a late codegen peephole.
+The plan may state that a scalar result produced by one region can replace a
+later scalar consumer of the same local:
+
+```text
+producer:  c = exact_i64_add(a, b)
+consumer:  exact_i64_compare(c, 0)
+rewrite:   use producer.i64 instead of materialize(c) + load(c) + unbox(c)
+```
+
+The selected plan must make the safety boundary explicit:
+
+- the producer and consumer region values have the same scalar representation;
+- the local identity is the same resolved storage location, not only the same
+  spelling;
+- fallback is local and explicit, because a guard miss or overflow must execute
+  the original store before any later comparison or exception path observes the
+  local;
+- materialization is deferred only until a Python object use requires it;
+- validation rejects missing producer/consumer values, mismatched reps,
+  duplicate consumers, unknown fallback regions, and missing reasons.
+
+Live lowering needs one more piece before it may skip the current
+`PyLong_FromLongLong` in `c = a + b`: the JIT local environment must be able to
+represent path-aware scalar locals, or split the hot and local-fallback paths so
+cleanup and later Python-object uses see the right ownership state. Until then,
+the scalar thread is useful planner data and diagnostics, not a license for
+codegen to silently elide local materialization.
+
 
 ## Optimization Plan Data Structure
 
@@ -404,6 +442,7 @@ struct ModuleOptimizationPlanV3 {
 struct FunctionOptimizationPlanV3 {
     function: FunctionIdentity,
     regions: Vec<RegionPlan>,
+    scalar_threads: Vec<ScalarLocalThreadPlan>,
     deopt_points: Vec<PlannedDeoptPoint>,
     ownership: FunctionOwnershipPlan,
     diagnostics: Vec<PlanDiagnostic>,

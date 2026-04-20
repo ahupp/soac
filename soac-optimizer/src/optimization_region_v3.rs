@@ -10,8 +10,16 @@ use std::fmt;
 pub struct ExtractedRegion {
     pub id: RegionId,
     pub block: BlockLabel,
+    pub block_body_len: usize,
+    pub store: Option<ExtractedStoreContext>,
     pub values: Vec<ExtractedValue>,
     pub exit: ExtractedExit,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExtractedStoreContext {
+    pub target: ResolvedName,
+    pub continuation: Option<BlockLabel>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -170,9 +178,21 @@ fn extract_block_body_instr_region_v3(
     Ok(ExtractedRegion {
         id,
         block: block.label,
+        block_body_len: block.body.len(),
+        store: Some(ExtractedStoreContext {
+            target: store.name.clone(),
+            continuation: block_jump_continuation(block),
+        }),
         values: builder.values,
         exit,
     })
+}
+
+fn block_jump_continuation(block: &Block<InstrCodegen>) -> Option<BlockLabel> {
+    match &block.term {
+        BlockTerm::Jump(edge) if edge.args.is_empty() => Some(edge.target),
+        _ => None,
+    }
 }
 
 fn unsupported_instr_error(instr: &InstrCodegen) -> RegionExtractionError {
@@ -249,6 +269,8 @@ fn extract_block_term_region_v3(
     Ok(ExtractedRegion {
         id,
         block: block.label,
+        block_body_len: block.body.len(),
+        store: None,
         values: builder.values,
         exit,
     })
@@ -607,7 +629,7 @@ mod tests {
         let compare = with_instr_id_in_label(
             InstrCodegen::BinOp(BinOp::new(
                 BinOpKind::Gt,
-                with_instr_id_in_label(InstrCodegen::Load(Load::new(c)), test_label, 4),
+                with_instr_id_in_label(InstrCodegen::Load(Load::new(c.clone())), test_label, 4),
                 with_instr_id_in_label(local("zero", 3), test_label, 5),
             )),
             test_label,
@@ -630,6 +652,13 @@ mod tests {
         assert_eq!(attempts.len(), 3);
         let store_rhs = attempts[0].result.as_ref().unwrap();
         assert_eq!(store_rhs.id, RegionId(0));
+        assert_eq!(
+            store_rhs.store,
+            Some(ExtractedStoreContext {
+                target: c.clone(),
+                continuation: Some(label(1)),
+            })
+        );
         assert_eq!(
             store_rhs.exit,
             ExtractedExit::Return {

@@ -96,9 +96,10 @@ fn format_optimization_artifacts_v3(artifacts: &ExactIntBranchV3Artifacts) -> St
         ));
         out.push_str(&format!(" id={}\n", function.function.function));
         out.push_str(&format!(
-            "  regions={} emitted_regions={} deopt_points={} ownership_actions={} diagnostics={}\n",
+            "  regions={} emitted_regions={} scalar_threads={} deopt_points={} ownership_actions={} diagnostics={}\n",
             function.regions.len(),
             emitted_regions,
+            function.scalar_threads.len(),
             function.deopt_points.len(),
             function.ownership.actions.len(),
             function.diagnostics.len()
@@ -110,6 +111,12 @@ fn format_optimization_artifacts_v3(artifacts: &ExactIntBranchV3Artifacts) -> St
                 region.inputs.len(),
                 region.nodes.len(),
                 region.exits.len()
+            ));
+        }
+        for thread in &function.scalar_threads {
+            out.push_str(&format!(
+                "  scalar_thread local={} producer={:?} consumer={:?} fallback={:?}\n",
+                thread.local.name, thread.producer, thread.consumer, thread.fallback
             ));
         }
         for diagnostic in &function.diagnostics {
@@ -153,6 +160,7 @@ mod test {
                         debug_name: Some("f".to_string()),
                     },
                     regions: Vec::new(),
+                    scalar_threads: Vec::new(),
                     deopt_points: Vec::new(),
                     ownership: FunctionOwnershipPlan::default(),
                     diagnostics: Vec::new(),
@@ -171,6 +179,6 @@ mod test {
         let formatted = format_optimization_artifacts_v3(&artifacts);
         assert!(formatted.contains("module pkg.mod source_hash=0x0000000000001234"));
         assert!(formatted.contains("function f"));
-        assert!(formatted.contains("regions=0 emitted_regions=0"));
+        assert!(formatted.contains("regions=0 emitted_regions=0 scalar_threads=0"));
     }
 }

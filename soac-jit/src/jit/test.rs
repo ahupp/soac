@@ -3086,6 +3086,7 @@ def build(values):
                             debug_name: Some(function.names.qualname.clone()),
                         },
                         regions: Vec::new(),
+                        scalar_threads: Vec::new(),
                         deopt_points: Vec::new(),
                         ownership:
                             soac_optimization::optimization_plan_v3::FunctionOwnershipPlan::default(
@@ -16568,6 +16569,7 @@ def f(x):
                             debug_name: Some(function.names.qualname.clone()),
                         },
                         regions: Vec::new(),
+                        scalar_threads: Vec::new(),
                         deopt_points: Vec::new(),
                         ownership:
                             soac_optimization::optimization_plan_v3::FunctionOwnershipPlan::default(
