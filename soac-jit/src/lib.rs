@@ -21,6 +21,7 @@ pub mod module_constants;
 pub mod module_type;
 pub mod optimization_alternatives_v3;
 pub mod optimization_emit_v3;
+pub mod optimization_evidence_v3;
 pub mod optimization_plan;
 pub mod optimization_plan_v3;
 pub mod optimization_planner_v3;
