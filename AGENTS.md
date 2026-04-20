@@ -449,7 +449,9 @@ the mode between passes. `none` is the explicit ordinary
   pipeline while loading `mod.opt` plans in `verify`/`apply`. This runs v3
   extraction, planning, plan validation, and mechanical emission against the
   live lowered function/evidence and passes the resulting artifact to JIT
-  codegen inputs, but leaves branch lowering on the existing legacy path.
+  codegen inputs. When the artifact contains the represented exact-int
+  add/compare branch, JIT term lowering consumes the mechanical v3 region and
+  its local generic fallback; other shapes remain on the existing lowering path.
 - `BENCHMARK_CPU` / `BENCHMARK_CONSTANT_CLOCKS`
   The benchmark recipes use
   [scripts/run_benchmark_with_cpu_mode.sh](/home/adam/project/soac-profile/scripts/run_benchmark_with_cpu_mode.sh)

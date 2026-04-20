@@ -22,6 +22,9 @@ use crate::function_instantiation::{
 use crate::module_constants::{ModuleCodegenConstants, ModuleConstantId};
 use crate::module_type::{CounterRuntimeSlot, SharedModuleState, build_counter_storage_layout};
 use crate::optimization_alternatives_v3::AlternativeCatalog;
+use crate::optimization_emit_v3::{
+    MechanicalExitKind, MechanicalOperation, MechanicalRegionEmission, MechanicalStepOp,
+};
 use crate::optimization_pipeline_v3::{
     ExactIntBranchV3Artifacts, plan_and_emit_function_exact_int_branches_v3,
 };
@@ -31,7 +34,11 @@ use crate::optimization_plan::{
     FunctionOptimizationPlan, FunctionProfileEvidence, OptimizationPlan,
     PlannedIndexedFieldSpecialization, load_optimization_plan,
 };
-use crate::optimization_plan_v3::{FunctionPlanIdentity, ModulePlanIdentity};
+use crate::optimization_plan_v3::{
+    ConversionKind, FailureMode, FallbackTarget, FunctionPlanIdentity, GuardFailure, GuardKind,
+    MaterializeKind, ModulePlanIdentity, PlanValue, PlannedConstant, RegionExitTarget, RegionId,
+    RegionInputSource, RegionPlan, Rep, RichCompareOp,
+};
 use cranelift_codegen::cfg_printer::CFGPrinter;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::inline::{Inline, InlineCommand};
@@ -1028,6 +1035,16 @@ static DP_JIT_PYOBJECT_TO_I64_IMPORT: ImportSpec = ImportSpec::new(
     &[SigType::Pointer],
     &[SigType::I64],
 );
+static PYNUMBER_ADD_IMPORT: ImportSpec = ImportSpec::new(
+    "PyNumber_Add",
+    &[SigType::Pointer, SigType::Pointer],
+    &[SigType::Pointer],
+);
+static PYOBJECT_RICHCOMPARE_IMPORT: ImportSpec = ImportSpec::new(
+    "PyObject_RichCompare",
+    &[SigType::Pointer, SigType::Pointer, SigType::I32],
+    &[SigType::Pointer],
+);
 static PYLONG_FROM_LONGLONG_IMPORT: ImportSpec =
     ImportSpec::new("PyLong_FromLongLong", &[SigType::I64], &[SigType::Pointer]);
 static DP_JIT_RECORD_TOP_VALUE_SAMPLE_IMPORT: ImportSpec = ImportSpec::new(
@@ -1156,6 +1173,8 @@ static JIT_RUNTIME_IMPORT_SPECS: &[&ImportSpec] = &[
     &DP_JIT_PYOBJECT_GETITEM_IMPORT,
     &DP_JIT_PYOBJECT_SETITEM_IMPORT,
     &DP_JIT_PYOBJECT_TO_I64_IMPORT,
+    &PYNUMBER_ADD_IMPORT,
+    &PYOBJECT_RICHCOMPARE_IMPORT,
     &PYLONG_FROM_LONGLONG_IMPORT,
     &DP_JIT_RECORD_TOP_VALUE_SAMPLE_IMPORT,
     &DP_JIT_RAISE_DELETED_NAME_ERROR_IMPORT,
@@ -8156,6 +8175,7 @@ struct JitEmitCtx<'mc> {
     operator_specializations: &'mc HashMap<InstrId, Vec<u64>>,
     operator_specialized_hit_counter_ids: &'mc HashMap<InstrId, CounterId>,
     operator_specialized_fallback_counter_ids: &'mc HashMap<InstrId, CounterId>,
+    opt_v3_exact_int_branch_artifacts: Option<Arc<ExactIntBranchV3Artifacts>>,
     getitem_shape_counter_ids: &'mc HashMap<InstrId, CounterId>,
     getitem_specializations: &'mc HashMap<InstrId, Vec<u64>>,
     getitem_specialized_hit_counter_ids: &'mc HashMap<InstrId, CounterId>,
@@ -21184,6 +21204,835 @@ fn emit_typed_local_load_result_with_local_env(
     })
 }
 
+#[derive(Clone, Copy)]
+struct OptV3ExactIntBranchSelection<'a> {
+    hot_plan: &'a RegionPlan,
+    hot_region: &'a MechanicalRegionEmission,
+    fallback_plan: &'a RegionPlan,
+    fallback_region: &'a MechanicalRegionEmission,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum OptV3MechanicalValue {
+    PyObject { value: ir::Value, owned: bool },
+    I64(ir::Value),
+    I32Bool01(ir::Value),
+}
+
+impl OptV3MechanicalValue {
+    fn matches_rep(self, rep: Rep) -> bool {
+        matches!(
+            (self, rep),
+            (
+                Self::PyObject { owned: true, .. },
+                Rep::PyObjectOwned | Rep::PyObjectImmortal
+            ) | (
+                Self::PyObject { owned: false, .. },
+                Rep::PyObjectBorrowed | Rep::PyObjectImmortal
+            ) | (Self::I64(_), Rep::I64)
+                | (Self::I32Bool01(_), Rep::I32Bool01)
+        )
+    }
+}
+
+fn opt_v3_exact_int_branch_selection_for_source<'a>(
+    artifacts: &'a ExactIntBranchV3Artifacts,
+    source: InstrId,
+) -> Result<Option<OptV3ExactIntBranchSelection<'a>>, String> {
+    let Some(planned_function) = artifacts.plan.functions.first() else {
+        return Ok(None);
+    };
+    let Some(emitted_function) = artifacts.emission.functions.first() else {
+        return Ok(None);
+    };
+    let Some(hot_region) = emitted_function
+        .regions
+        .iter()
+        .find(|region| opt_v3_region_has_branch_source(region, source))
+    else {
+        return Ok(None);
+    };
+    opt_v3_require_original_cfg_branch_exit(hot_region, source)?;
+    let hot_plan = planned_function
+        .regions
+        .iter()
+        .find(|region| region.id == hot_region.region)
+        .ok_or_else(|| {
+            format!(
+                "optimizer v3 emission region {:?} for source {source} has no matching plan region",
+                hot_region.region
+            )
+        })?;
+    let fallback_region_id = opt_v3_required_local_fallback_region(hot_region)?;
+    let fallback_region = emitted_function
+        .regions
+        .iter()
+        .find(|region| region.region == fallback_region_id)
+        .ok_or_else(|| {
+            format!(
+                "optimizer v3 branch region {:?} for source {source} references missing fallback region {:?}",
+                hot_region.region, fallback_region_id
+            )
+        })?;
+    opt_v3_require_original_cfg_branch_exit(fallback_region, source)?;
+    let fallback_plan = planned_function
+        .regions
+        .iter()
+        .find(|region| region.id == fallback_region_id)
+        .ok_or_else(|| {
+            format!(
+                "optimizer v3 fallback emission region {:?} for source {source} has no matching plan region",
+                fallback_region_id
+            )
+        })?;
+    Ok(Some(OptV3ExactIntBranchSelection {
+        hot_plan,
+        hot_region,
+        fallback_plan,
+        fallback_region,
+    }))
+}
+
+fn opt_v3_region_has_branch_source(region: &MechanicalRegionEmission, source: InstrId) -> bool {
+    region.exits.iter().any(|exit| {
+        exit.source == Some(source) && matches!(exit.kind, MechanicalExitKind::Branch { .. })
+    })
+}
+
+fn opt_v3_require_original_cfg_branch_exit(
+    region: &MechanicalRegionEmission,
+    source: InstrId,
+) -> Result<(), String> {
+    if region.exits.len() != 1 {
+        return Err(format!(
+            "optimizer v3 region {:?} for source {source} has {} exits; exact-int branch codegen expects one",
+            region.region,
+            region.exits.len()
+        ));
+    }
+    let exit = &region.exits[0];
+    if exit.source != Some(source) {
+        return Err(format!(
+            "optimizer v3 region {:?} exit source {:?} does not match branch source {source}",
+            region.region, exit.source
+        ));
+    }
+    match &exit.kind {
+        MechanicalExitKind::Branch {
+            then_target,
+            else_target,
+            ..
+        } if *then_target == RegionExitTarget::OriginalCfg
+            && *else_target == RegionExitTarget::OriginalCfg =>
+        {
+            Ok(())
+        }
+        other => Err(format!(
+            "optimizer v3 region {:?} for source {source} has unsupported exit {other:?}; exact-int branch codegen only supports OriginalCfg branch exits",
+            region.region
+        )),
+    }
+}
+
+fn opt_v3_required_local_fallback_region(
+    region: &MechanicalRegionEmission,
+) -> Result<RegionId, String> {
+    let mut targets = HashSet::new();
+    for step in &region.steps {
+        match &step.op {
+            MechanicalStepOp::Guard { failure, .. } => match failure {
+                GuardFailure::FallbackToPlan {
+                    target: FallbackTarget::Region(region),
+                    ..
+                } => {
+                    targets.insert(*region);
+                }
+                GuardFailure::FallbackToPlan { target, .. } => {
+                    return Err(format!(
+                        "optimizer v3 guard node {:?} uses unsupported fallback target {target:?}",
+                        step.node
+                    ));
+                }
+                GuardFailure::DeoptTo { .. } => {
+                    return Err(format!(
+                        "optimizer v3 guard node {:?} uses deopt; exact-int branch codegen requires a visible local fallback",
+                        step.node
+                    ));
+                }
+            },
+            MechanicalStepOp::Convert { failure, .. }
+            | MechanicalStepOp::Operation { failure, .. } => {
+                match opt_v3_failure_fallback_region(failure)? {
+                    Some(region) => {
+                        targets.insert(region);
+                    }
+                    None => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    if targets.len() != 1 {
+        return Err(format!(
+            "optimizer v3 region {:?} has {} local fallback targets; exact-int branch codegen expects exactly one",
+            region.region,
+            targets.len()
+        ));
+    }
+    Ok(*targets.iter().next().expect("checked one target"))
+}
+
+fn opt_v3_failure_fallback_region(failure: &FailureMode) -> Result<Option<RegionId>, String> {
+    match failure {
+        FailureMode::CannotFail => Ok(None),
+        FailureMode::FallbackToPlan {
+            target: FallbackTarget::Region(region),
+            ..
+        } => Ok(Some(*region)),
+        FailureMode::FallbackToPlan { target, .. } => Err(format!(
+            "optimizer v3 exact-int branch codegen only supports region fallback targets, got {target:?}"
+        )),
+        FailureMode::Raise(exception) => Err(format!(
+            "optimizer v3 exact-int branch hot path cannot raise before the local fallback, got {exception:?}"
+        )),
+        FailureMode::DeoptTo { .. } => Err(
+            "optimizer v3 exact-int branch codegen requires a local fallback, not deopt"
+                .to_string(),
+        ),
+    }
+}
+
+fn emit_opt_v3_exact_int_branch_truth_i32(
+    fb: &mut FunctionBuilder<'_>,
+    test_instr_id: Option<InstrId>,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<Option<ir::Value>, String> {
+    let Some(test_instr_id) = test_instr_id else {
+        return Ok(None);
+    };
+    let Some(artifacts) = emit_ctx.opt_v3_exact_int_branch_artifacts.as_deref() else {
+        return Ok(None);
+    };
+    let Some(selection) = opt_v3_exact_int_branch_selection_for_source(artifacts, test_instr_id)?
+    else {
+        return Ok(None);
+    };
+    emit_opt_v3_exact_int_branch_selection(
+        fb,
+        test_instr_id,
+        selection,
+        local_env,
+        emit_ctx,
+        codegen_env,
+        func_imports,
+    )
+    .map(Some)
+}
+
+fn emit_opt_v3_exact_int_branch_selection(
+    fb: &mut FunctionBuilder<'_>,
+    test_instr_id: InstrId,
+    selection: OptV3ExactIntBranchSelection<'_>,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<ir::Value, String> {
+    let result_block = fb.create_block();
+    fb.append_block_param(result_block, emit_ctx.consts.i32_ty);
+    let fallback_block = fb.create_block();
+    fb.set_cold_block(fallback_block);
+
+    let mut hot_values = opt_v3_region_input_values(
+        fb,
+        selection.hot_plan,
+        local_env,
+        emit_ctx,
+        "exact-int branch hot region",
+    )?;
+    emit_opt_v3_mechanical_region_steps(
+        fb,
+        selection.hot_region,
+        &mut hot_values,
+        Some(fallback_block),
+        local_env,
+        emit_ctx,
+        codegen_env,
+        func_imports,
+    )?;
+    let hot_condition =
+        opt_v3_region_branch_condition(selection.hot_region, &hot_values, test_instr_id)?;
+    fb.ins()
+        .jump(result_block, &[ir::BlockArg::Value(hot_condition)]);
+
+    fb.switch_to_block(fallback_block);
+    let mut fallback_values = opt_v3_region_input_values(
+        fb,
+        selection.fallback_plan,
+        local_env,
+        emit_ctx,
+        "exact-int branch fallback region",
+    )?;
+    emit_opt_v3_mechanical_region_steps(
+        fb,
+        selection.fallback_region,
+        &mut fallback_values,
+        None,
+        local_env,
+        emit_ctx,
+        codegen_env,
+        func_imports,
+    )?;
+    let fallback_condition =
+        opt_v3_region_branch_condition(selection.fallback_region, &fallback_values, test_instr_id)?;
+    fb.ins()
+        .jump(result_block, &[ir::BlockArg::Value(fallback_condition)]);
+
+    fb.switch_to_block(result_block);
+    Ok(fb.block_params(result_block)[0])
+}
+
+fn opt_v3_region_input_values(
+    fb: &mut FunctionBuilder<'_>,
+    region: &RegionPlan,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    context: &str,
+) -> Result<HashMap<PlanValue, OptV3MechanicalValue>, String> {
+    let mut values = HashMap::new();
+    for input in &region.inputs {
+        let RegionInputSource::FunctionParam {
+            name: Some(name), ..
+        } = &input.source
+        else {
+            return Err(format!(
+                "optimizer v3 {context} input {:?} has unsupported source {:?}",
+                input.value, input.source
+            ));
+        };
+        let value = local_env
+            .load_name(fb, name, emit_ctx, true)
+            .ok_or_else(|| {
+                format!(
+                    "optimizer v3 {context} input {:?} references unavailable local {name:?}",
+                    input.value
+                )
+            })?;
+        opt_v3_store_mechanical_value(
+            &mut values,
+            input.value,
+            OptV3MechanicalValue::PyObject {
+                value,
+                owned: false,
+            },
+        )?;
+    }
+    Ok(values)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_opt_v3_mechanical_region_steps(
+    fb: &mut FunctionBuilder<'_>,
+    region: &MechanicalRegionEmission,
+    values: &mut HashMap<PlanValue, OptV3MechanicalValue>,
+    local_fallback_block: Option<ir::Block>,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<(), String> {
+    for step in &region.steps {
+        match &step.op {
+            MechanicalStepOp::Input { output } => {
+                if !values.contains_key(output) {
+                    return Err(format!(
+                        "optimizer v3 region {:?} input node {:?} references missing value {:?}",
+                        region.region, step.node, output
+                    ));
+                }
+            }
+            MechanicalStepOp::Constant { output, constant } => {
+                let value = match constant {
+                    PlannedConstant::I64(value) => {
+                        OptV3MechanicalValue::I64(fb.ins().iconst(emit_ctx.consts.i64_ty, *value))
+                    }
+                    other => {
+                        return Err(format!(
+                            "optimizer v3 region {:?} constant node {:?} has unsupported constant {other:?}",
+                            region.region, step.node
+                        ));
+                    }
+                };
+                opt_v3_store_mechanical_value(values, *output, value)?;
+            }
+            MechanicalStepOp::Guard { kind, failure, .. } => {
+                if *kind != GuardKind::SpecializationCheck {
+                    return Err(format!(
+                        "optimizer v3 region {:?} guard node {:?} has unsupported kind {kind:?}",
+                        region.region, step.node
+                    ));
+                }
+                if local_fallback_block.is_none() {
+                    return Err(format!(
+                        "optimizer v3 region {:?} guard node {:?} appears outside a local-fallback hot region",
+                        region.region, step.node
+                    ));
+                }
+                if !matches!(
+                    failure,
+                    GuardFailure::FallbackToPlan {
+                        target: FallbackTarget::Region(_),
+                        ..
+                    }
+                ) {
+                    return Err(format!(
+                        "optimizer v3 region {:?} guard node {:?} requires unsupported failure {failure:?}",
+                        region.region, step.node
+                    ));
+                }
+            }
+            MechanicalStepOp::Convert {
+                kind,
+                input,
+                output,
+                ..
+            } => {
+                emit_opt_v3_mechanical_convert(
+                    fb,
+                    region.region,
+                    step.node,
+                    *kind,
+                    *input,
+                    *output,
+                    values,
+                    local_fallback_block,
+                    local_env,
+                    emit_ctx,
+                    codegen_env,
+                    func_imports,
+                )?;
+            }
+            MechanicalStepOp::Operation {
+                op, inputs, output, ..
+            } => {
+                emit_opt_v3_mechanical_operation(
+                    fb,
+                    region.region,
+                    step.node,
+                    op,
+                    inputs,
+                    *output,
+                    values,
+                    local_fallback_block,
+                    emit_ctx,
+                    codegen_env,
+                    func_imports,
+                )?;
+            }
+            MechanicalStepOp::Materialize {
+                kind,
+                input,
+                output,
+            } => {
+                emit_opt_v3_mechanical_materialize(
+                    fb,
+                    region.region,
+                    step.node,
+                    *kind,
+                    *input,
+                    *output,
+                    values,
+                    emit_ctx,
+                )?;
+            }
+            MechanicalStepOp::Fallback { .. }
+            | MechanicalStepOp::Deopt { .. }
+            | MechanicalStepOp::Ownership { .. } => {
+                return Err(format!(
+                    "optimizer v3 region {:?} node {:?} has unsupported codegen step {:?}",
+                    region.region, step.node, step.op
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_opt_v3_mechanical_convert(
+    fb: &mut FunctionBuilder<'_>,
+    region: RegionId,
+    node: crate::optimization_plan_v3::PlanNodeId,
+    kind: ConversionKind,
+    input: PlanValue,
+    output: PlanValue,
+    values: &mut HashMap<PlanValue, OptV3MechanicalValue>,
+    local_fallback_block: Option<ir::Block>,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<(), String> {
+    match kind {
+        ConversionKind::FromPythonLongCompactToI64 => {
+            let fallback_block = local_fallback_block.ok_or_else(|| {
+                format!(
+                    "optimizer v3 region {region:?} conversion node {node:?} needs a local fallback block"
+                )
+            })?;
+            let (value, owned) = opt_v3_pyobject_value(values, input)?;
+            if owned {
+                return Err(format!(
+                    "optimizer v3 region {region:?} conversion node {node:?} expected borrowed PyObject input"
+                ));
+            }
+            let converted = {
+                let mut intrinsic_state = LocalEnvCodegenIntrinsicEmitState {
+                    fb,
+                    local_env,
+                    ctx: emit_ctx,
+                    codegen_env,
+                    func_imports,
+                };
+                intrinsics::emit_v3_guarded_compact_long_i64(
+                    &mut intrinsic_state,
+                    value,
+                    fallback_block,
+                )
+            };
+            opt_v3_store_mechanical_value(values, output, OptV3MechanicalValue::I64(converted))
+        }
+        ConversionKind::TruthinessToI32Bool01 => {
+            let (value, owned) = opt_v3_take_pyobject_value(values, input)?;
+            let is_true_ref =
+                func_imports.get(codegen_env, &mut fb.func, &DP_JIT_IS_TRUE_IMPORT)?;
+            let truth = emit_truthy_from_pyobject_value(
+                fb,
+                value,
+                PyObjFacts::unknown(),
+                is_true_ref,
+                emit_ctx,
+                owned,
+            );
+            let truth_i32 = truth.expect_i32_bool01("optimizer v3 truthiness conversion");
+            opt_v3_store_mechanical_value(
+                values,
+                output,
+                OptV3MechanicalValue::I32Bool01(truth_i32),
+            )
+        }
+        other => Err(format!(
+            "optimizer v3 region {region:?} conversion node {node:?} has unsupported conversion {other:?}"
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_opt_v3_mechanical_operation(
+    fb: &mut FunctionBuilder<'_>,
+    region: RegionId,
+    node: crate::optimization_plan_v3::PlanNodeId,
+    op: &MechanicalOperation,
+    inputs: &[PlanValue],
+    output: Option<PlanValue>,
+    values: &mut HashMap<PlanValue, OptV3MechanicalValue>,
+    local_fallback_block: Option<ir::Block>,
+    emit_ctx: &JitEmitCtx<'_>,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<(), String> {
+    match op {
+        MechanicalOperation::PyNumberAdd => {
+            let output = output.ok_or_else(|| {
+                format!("optimizer v3 region {region:?} node {node:?} PyNumberAdd has no output")
+            })?;
+            if inputs.len() != 2 {
+                return Err(format!(
+                    "optimizer v3 region {region:?} node {node:?} PyNumberAdd expects two inputs, got {}",
+                    inputs.len()
+                ));
+            }
+            let args = opt_v3_take_pyobject_call_args(values, inputs)?;
+            let arg_values = args.iter().map(|(value, _)| *value).collect::<Vec<_>>();
+            let owned_inputs = args
+                .iter()
+                .filter_map(|(value, owned)| (*owned).then_some(*value))
+                .collect::<Vec<_>>();
+            let add_ref = func_imports.get(codegen_env, &mut fb.func, &PYNUMBER_ADD_IMPORT)?;
+            let result = emit_checked_owned_pyobject_call_with_cleanup(
+                fb,
+                emit_ctx,
+                add_ref,
+                arg_values.as_slice(),
+                owned_inputs.as_slice(),
+            );
+            opt_v3_store_mechanical_value(
+                values,
+                output,
+                OptV3MechanicalValue::PyObject {
+                    value: result,
+                    owned: true,
+                },
+            )
+        }
+        MechanicalOperation::PyObjectRichCompare { op } => {
+            let output = output.ok_or_else(|| {
+                format!(
+                    "optimizer v3 region {region:?} node {node:?} PyObjectRichCompare has no output"
+                )
+            })?;
+            if inputs.len() != 2 {
+                return Err(format!(
+                    "optimizer v3 region {region:?} node {node:?} PyObjectRichCompare expects two inputs, got {}",
+                    inputs.len()
+                ));
+            }
+            let args = opt_v3_take_pyobject_call_args(values, inputs)?;
+            let mut arg_values = args.iter().map(|(value, _)| *value).collect::<Vec<_>>();
+            let owned_inputs = args
+                .iter()
+                .filter_map(|(value, owned)| (*owned).then_some(*value))
+                .collect::<Vec<_>>();
+            let compare_op = fb.ins().iconst(
+                emit_ctx.consts.i32_ty,
+                i64::from(opt_v3_rich_compare_op_code(*op)),
+            );
+            arg_values.push(compare_op);
+            let compare_ref =
+                func_imports.get(codegen_env, &mut fb.func, &PYOBJECT_RICHCOMPARE_IMPORT)?;
+            let result = emit_checked_owned_pyobject_call_with_cleanup(
+                fb,
+                emit_ctx,
+                compare_ref,
+                arg_values.as_slice(),
+                owned_inputs.as_slice(),
+            );
+            opt_v3_store_mechanical_value(
+                values,
+                output,
+                OptV3MechanicalValue::PyObject {
+                    value: result,
+                    owned: true,
+                },
+            )
+        }
+        MechanicalOperation::CheckedI64Add => {
+            let output = output.ok_or_else(|| {
+                format!("optimizer v3 region {region:?} node {node:?} CheckedI64Add has no output")
+            })?;
+            let fallback_block = local_fallback_block.ok_or_else(|| {
+                format!(
+                    "optimizer v3 region {region:?} node {node:?} CheckedI64Add needs a local fallback block"
+                )
+            })?;
+            if inputs.len() != 2 {
+                return Err(format!(
+                    "optimizer v3 region {region:?} node {node:?} CheckedI64Add expects two inputs, got {}",
+                    inputs.len()
+                ));
+            }
+            let lhs = opt_v3_i64_value(values, inputs[0])?;
+            let rhs = opt_v3_i64_value(values, inputs[1])?;
+            let (sum, overflow) = fb.ins().sadd_overflow(lhs, rhs);
+            let ok_block = fb.create_block();
+            fb.append_block_param(ok_block, emit_ctx.consts.i64_ty);
+            fb.ins().brif(
+                overflow,
+                fallback_block,
+                &[],
+                ok_block,
+                &[ir::BlockArg::Value(sum)],
+            );
+            fb.switch_to_block(ok_block);
+            let sum = fb.block_params(ok_block)[0];
+            opt_v3_store_mechanical_value(values, output, OptV3MechanicalValue::I64(sum))
+        }
+        MechanicalOperation::I64CompareToBool01 { op } => {
+            let output = output.ok_or_else(|| {
+                format!(
+                    "optimizer v3 region {region:?} node {node:?} I64CompareToBool01 has no output"
+                )
+            })?;
+            if inputs.len() != 2 {
+                return Err(format!(
+                    "optimizer v3 region {region:?} node {node:?} I64CompareToBool01 expects two inputs, got {}",
+                    inputs.len()
+                ));
+            }
+            let lhs = opt_v3_i64_value(values, inputs[0])?;
+            let rhs = opt_v3_i64_value(values, inputs[1])?;
+            let cond = fb.ins().icmp(opt_v3_rich_compare_intcc(*op), lhs, rhs);
+            let zero = fb.ins().iconst(emit_ctx.consts.i32_ty, 0);
+            let one = fb.ins().iconst(emit_ctx.consts.i32_ty, 1);
+            let value = fb.ins().select(cond, one, zero);
+            opt_v3_store_mechanical_value(values, output, OptV3MechanicalValue::I32Bool01(value))
+        }
+        other => Err(format!(
+            "optimizer v3 region {region:?} node {node:?} has unsupported operation {other:?}"
+        )),
+    }
+}
+
+fn emit_opt_v3_mechanical_materialize(
+    fb: &mut FunctionBuilder<'_>,
+    region: RegionId,
+    node: crate::optimization_plan_v3::PlanNodeId,
+    kind: MaterializeKind,
+    input: PlanValue,
+    output: PlanValue,
+    values: &mut HashMap<PlanValue, OptV3MechanicalValue>,
+    emit_ctx: &JitEmitCtx<'_>,
+) -> Result<(), String> {
+    match kind {
+        MaterializeKind::PythonLong => {
+            let value = opt_v3_i64_value(values, input)?;
+            let result = emit_checked_owned_pyobject_call_with_cleanup(
+                fb,
+                emit_ctx,
+                emit_ctx.py_long_from_i64_ref,
+                &[value],
+                &[],
+            );
+            opt_v3_store_mechanical_value(
+                values,
+                output,
+                OptV3MechanicalValue::PyObject {
+                    value: result,
+                    owned: true,
+                },
+            )
+        }
+        other => Err(format!(
+            "optimizer v3 region {region:?} materialize node {node:?} has unsupported materialization {other:?}"
+        )),
+    }
+}
+
+fn opt_v3_store_mechanical_value(
+    values: &mut HashMap<PlanValue, OptV3MechanicalValue>,
+    key: PlanValue,
+    value: OptV3MechanicalValue,
+) -> Result<(), String> {
+    if !value.matches_rep(key.rep) {
+        return Err(format!(
+            "optimizer v3 mechanical value for {:?} does not match expected rep {:?}",
+            key.id, key.rep
+        ));
+    }
+    if values.insert(key, value).is_some() {
+        return Err(format!(
+            "optimizer v3 mechanical value {:?} was produced more than once",
+            key.id
+        ));
+    }
+    Ok(())
+}
+
+fn opt_v3_pyobject_value(
+    values: &HashMap<PlanValue, OptV3MechanicalValue>,
+    key: PlanValue,
+) -> Result<(ir::Value, bool), String> {
+    match values.get(&key).copied() {
+        Some(OptV3MechanicalValue::PyObject { value, owned }) => Ok((value, owned)),
+        other => Err(format!(
+            "optimizer v3 expected PyObject value {:?}, got {other:?}",
+            key.id
+        )),
+    }
+}
+
+fn opt_v3_take_pyobject_value(
+    values: &mut HashMap<PlanValue, OptV3MechanicalValue>,
+    key: PlanValue,
+) -> Result<(ir::Value, bool), String> {
+    let (value, owned) = opt_v3_pyobject_value(values, key)?;
+    if owned {
+        values.remove(&key);
+    }
+    Ok((value, owned))
+}
+
+fn opt_v3_take_pyobject_call_args(
+    values: &mut HashMap<PlanValue, OptV3MechanicalValue>,
+    inputs: &[PlanValue],
+) -> Result<Vec<(ir::Value, bool)>, String> {
+    inputs
+        .iter()
+        .map(|input| opt_v3_take_pyobject_value(values, *input))
+        .collect()
+}
+
+fn opt_v3_i64_value(
+    values: &HashMap<PlanValue, OptV3MechanicalValue>,
+    key: PlanValue,
+) -> Result<ir::Value, String> {
+    match values.get(&key).copied() {
+        Some(OptV3MechanicalValue::I64(value)) => Ok(value),
+        other => Err(format!(
+            "optimizer v3 expected i64 value {:?}, got {other:?}",
+            key.id
+        )),
+    }
+}
+
+fn opt_v3_i32_bool01_value(
+    values: &HashMap<PlanValue, OptV3MechanicalValue>,
+    key: PlanValue,
+) -> Result<ir::Value, String> {
+    match values.get(&key).copied() {
+        Some(OptV3MechanicalValue::I32Bool01(value)) => Ok(value),
+        other => Err(format!(
+            "optimizer v3 expected i32 bool01 value {:?}, got {other:?}",
+            key.id
+        )),
+    }
+}
+
+fn opt_v3_region_branch_condition(
+    region: &MechanicalRegionEmission,
+    values: &HashMap<PlanValue, OptV3MechanicalValue>,
+    source: InstrId,
+) -> Result<ir::Value, String> {
+    let exit = region.exits.first().ok_or_else(|| {
+        format!(
+            "optimizer v3 region {:?} for source {source} has no exit",
+            region.region
+        )
+    })?;
+    let MechanicalExitKind::Branch { condition, .. } = &exit.kind else {
+        return Err(format!(
+            "optimizer v3 region {:?} for source {source} does not end in a branch",
+            region.region
+        ));
+    };
+    opt_v3_i32_bool01_value(values, *condition)
+}
+
+fn opt_v3_rich_compare_intcc(op: RichCompareOp) -> ir::condcodes::IntCC {
+    match op {
+        RichCompareOp::Eq => ir::condcodes::IntCC::Equal,
+        RichCompareOp::Ne => ir::condcodes::IntCC::NotEqual,
+        RichCompareOp::Lt => ir::condcodes::IntCC::SignedLessThan,
+        RichCompareOp::Le => ir::condcodes::IntCC::SignedLessThanOrEqual,
+        RichCompareOp::Gt => ir::condcodes::IntCC::SignedGreaterThan,
+        RichCompareOp::Ge => ir::condcodes::IntCC::SignedGreaterThanOrEqual,
+    }
+}
+
+fn opt_v3_rich_compare_op_code(op: RichCompareOp) -> i32 {
+    match op {
+        RichCompareOp::Eq => ffi::Py_EQ,
+        RichCompareOp::Ne => ffi::Py_NE,
+        RichCompareOp::Lt => ffi::Py_LT,
+        RichCompareOp::Le => ffi::Py_LE,
+        RichCompareOp::Gt => ffi::Py_GT,
+        RichCompareOp::Ge => ffi::Py_GE,
+    }
+}
+
 fn emit_typed_codegen_i32_bool01_result_with_local_env(
     fb: &mut FunctionBuilder<'_>,
     expr: &InstrTyped,
@@ -22102,14 +22951,27 @@ fn emit_typed_codegen_term(
             .result_demand()
             .unwrap_or(ResultDemand::I32_BOOL01);
         let truth = match demand {
-            ResultDemand::I32Bool01 => emit_typed_codegen_i32_bool01_result_with_local_env(
-                fb,
-                &if_term.test,
-                local_env,
-                emit_ctx,
-                codegen_env,
-                func_imports,
-            )?,
+            ResultDemand::I32Bool01 => {
+                if let Some(truth_i32) = emit_opt_v3_exact_int_branch_truth_i32(
+                    fb,
+                    test_instr_id,
+                    local_env,
+                    emit_ctx,
+                    codegen_env,
+                    func_imports,
+                )? {
+                    EmitResult::i32(truth_i32, IntFacts::i32_bool01())
+                } else {
+                    emit_typed_codegen_i32_bool01_result_with_local_env(
+                        fb,
+                        &if_term.test,
+                        local_env,
+                        emit_ctx,
+                        codegen_env,
+                        func_imports,
+                    )?
+                }
+            }
             other => {
                 return Err(format!(
                     "typed if condition requires I32Bool01 demand, got {other:?}"
@@ -26739,6 +27601,7 @@ fn build_cranelift_run_bb_specialized_function(
                 operator_specialized_hit_counter_ids: &operator_specialized_hit_counter_ids,
                 operator_specialized_fallback_counter_ids:
                     &operator_specialized_fallback_counter_ids,
+                opt_v3_exact_int_branch_artifacts: opt_v3_exact_int_branch_artifacts.clone(),
                 getitem_shape_counter_ids: &getitem_shape_counter_ids,
                 getitem_specializations: &getitem_specializations,
                 getitem_specialized_hit_counter_ids: &getitem_specialized_hit_counter_ids,

@@ -15808,6 +15808,185 @@ def f(x):
     }
 
     #[test]
+    fn specialized_jit_opt_v3_exact_int_branch_artifact_emits_machine_path() {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "specialized_jit_opt_v3_exact_int_branch_artifact_emits_machine_path",
+        ) {
+            return;
+        }
+        let blocks = [1usize as ObjPtr, 2usize as ObjPtr, 3usize as ObjPtr];
+        let mut constants = TestConstantPool::default();
+        let mut function = test_function();
+        function.params = ParamSpec {
+            params: vec![
+                Param {
+                    name: "a".into(),
+                    kind: ParamKind::Any,
+                    has_default: false,
+                },
+                Param {
+                    name: "b".into(),
+                    kind: ParamKind::Any,
+                    has_default: false,
+                },
+                Param {
+                    name: "zero".into(),
+                    kind: ParamKind::Any,
+                    has_default: false,
+                },
+            ],
+        };
+        let entry_label = function.name_gen.next_block_name();
+        let then_label = function.name_gen.next_block_name();
+        let else_label = function.name_gen.next_block_name();
+        let add_instr_id = InstrId::new(entry_label, 2);
+        let compare_instr_id = InstrId::new(entry_label, 4);
+        let entry = CodegenBlock {
+            label: entry_label,
+            body: vec![],
+            term: BlockTerm::IfTerm(soac_core::block_py::TermIf {
+                test: with_instr_id(
+                    op_expr(BinOp::new(
+                        BinOpKind::Gt,
+                        with_instr_id(
+                            op_expr(BinOp::new(
+                                BinOpKind::Add,
+                                with_instr_id(
+                                    name_expr(test_name("a")),
+                                    InstrId::new(entry_label, 0),
+                                ),
+                                with_instr_id(
+                                    name_expr(test_local_name("b", 1)),
+                                    InstrId::new(entry_label, 1),
+                                ),
+                            )),
+                            add_instr_id,
+                        ),
+                        with_instr_id(
+                            name_expr(test_local_name("zero", 2)),
+                            InstrId::new(entry_label, 3),
+                        ),
+                    )),
+                    compare_instr_id,
+                ),
+                then_label,
+                else_label,
+            }),
+            params: vec![],
+            exc_edge: None,
+        };
+        let then_block = CodegenBlock {
+            label: then_label,
+            body: vec![],
+            term: ret_term(constants.int_expr(1)),
+            params: vec![],
+            exc_edge: None,
+        };
+        let else_block = CodegenBlock {
+            label: else_label,
+            body: vec![],
+            term: ret_term(constants.int_expr(0)),
+            params: vec![],
+            exc_edge: None,
+        };
+        function.blocks = vec![entry, then_block, else_block];
+        set_stack_slots(&mut function, &["a", "b", "zero"]);
+
+        let mut module = test_module(ModuleNameGen::new(0), vec![function]);
+        module.module_constants = constants.module_constants;
+        let function = module.callable_defs[0].clone();
+        let module_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+        let exact_int_shape = crate::operator_specialization::pack_binary_shape(
+            crate::operator_specialization::ExactTypeTag::Int,
+            crate::operator_specialization::ExactTypeTag::Int,
+        );
+        let mut evidence = FunctionProfileEvidence::default();
+        evidence
+            .operator_specializations
+            .insert(add_instr_id, vec![exact_int_shape]);
+        let mut hints = crate::optimization_evidence_v3::PlannerFactHints::default();
+        hints.set_i64_constant(crate::optimization_region_v3::ExtractedValueId(3), 0);
+        let artifacts = plan_and_emit_function_exact_int_branches_v3(
+            &AlternativeCatalog::default_v3(),
+            ModulePlanIdentity {
+                module_name: "test".to_string(),
+                source_hash: 0,
+                cache_identity: "test-cache".to_string(),
+            },
+            FunctionPlanIdentity {
+                function: SerializedFunctionId::new(
+                    SerializedModuleId::new(0),
+                    function.function_id.local_function_id(),
+                ),
+                debug_name: Some(function.names.qualname.clone()),
+            },
+            &function,
+            &evidence,
+            &HashMap::from([(crate::optimization_plan_v3::RegionId(0), hints)]),
+        )
+        .unwrap();
+        assert_eq!(artifacts.emission.functions[0].regions.len(), 2);
+
+        let built = build_test_jit_function_with_constants_and_options(
+            &module,
+            &function,
+            &blocks,
+            &module_constants,
+            BuildSpecializedFunctionOptions {
+                specialization_inputs: Some(FunctionSpecializationInputs {
+                    call_target_specializations: HashMap::new(),
+                    operator_specializations: HashMap::new(),
+                    getitem_specializations: HashMap::new(),
+                    setitem_specializations: HashMap::new(),
+                    field_index_specializations: HashMap::new(),
+                    field_index_specializations_by_instr: HashMap::new(),
+                    branch_prefer_true: HashMap::new(),
+                    cold_block_labels: HashSet::new(),
+                    opt_v3_exact_int_branch_artifacts: Some(std::sync::Arc::new(artifacts)),
+                    behavior_change_indexed_stores: false,
+                    guard_miss_deopt_stub: false,
+                }),
+                ..BuildSpecializedFunctionOptions::default()
+            },
+        );
+
+        assert_eq!(
+            count_opcode(&built.ctx.func, ir::Opcode::SaddOverflow),
+            1,
+            "v3 exact-int branch artifact should emit the selected checked machine add"
+        );
+        let generic_helpers = import_user_names_for_symbols(
+            &built,
+            &[
+                "PyNumber_Add",
+                "PyObject_RichCompare",
+                "dp_jit_is_true",
+                "PyLong_FromLongLong",
+            ],
+        );
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&built.ctx.func, &generic_helpers),
+            4,
+            "v3 exact-int branch should keep a local generic fallback region"
+        );
+        let legacy_exact_helpers = import_user_names_for_symbols(
+            &built,
+            &[
+                "dp_jit_exact_long_add_slot",
+                "dp_jit_exact_long_richcompare_slot",
+                "dp_jit_exact_long_richcompare_bool_slot",
+            ],
+        );
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&built.ctx.func, &legacy_exact_helpers),
+            0,
+            "v3 exact-int branch should not rely on legacy exact-long helper calls"
+        );
+    }
+
+    #[test]
     fn specialized_jit_exact_int_compare_guard_miss_deopts_for_replay_safe_operands() {
         if crate::run_test_in_isolated_process_if_needed(
             module_path!(),

@@ -1129,6 +1129,14 @@ fn emit_i64_overflow_guard<'fb, E>(
     state.fb().block_params(value_ok_block)[0]
 }
 
+pub(super) fn emit_v3_guarded_compact_long_i64<'fb>(
+    state: &mut impl OperationEmitState<'fb, InstrTyped>,
+    value: ir::Value,
+    guard_miss_block: ir::Block,
+) -> ir::Value {
+    emit_guarded_compact_long_i64(state, value, guard_miss_block)
+}
+
 fn emit_compact_long_compare<'fb, E>(
     kind: ExactIntBinaryOpKind,
     state: &mut impl OperationEmitState<'fb, E>,

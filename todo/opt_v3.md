@@ -58,12 +58,14 @@ Implemented:
   composes extraction, evidence, planning, validation, and mechanical emission.
 - `SOAC_VALIDATE_OPT_V3`: opt-in live validation while loading `mod.opt` plans
   in `verify`/`apply`; this runs the current v3 exact-int branch pipeline over
-  the lowered function/evidence that legacy JIT specialization will use, but
-  still leaves lowering on the legacy path.
+  the lowered function/evidence that legacy JIT specialization will use.
 - `FunctionSpecializationInputs`: carries validated exact-int branch v3
   artifacts into the JIT build path, where codegen validates that the artifact
-  function identity matches the function being compiled before legacy lowering
-  continues.
+  function identity matches the function being compiled.
+- JIT term lowering now consumes a matching exact-int add/compare branch
+  artifact by interpreting the mechanical hot region and its local generic
+  fallback. Unsupported or absent v3 regions continue through the existing
+  lowering path.
 
 Remaining legacy-only families are intentionally visible:
 

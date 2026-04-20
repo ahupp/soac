@@ -274,7 +274,9 @@ Notes:
   branch pipeline while loading `mod.opt` plans in `verify`/`apply`. This
   runs extraction, planning, plan validation, and mechanical emission against
   the live lowered function/evidence and passes the resulting artifact to JIT
-  codegen inputs, but it does not switch branch lowering to v3 codegen.
+  codegen inputs. When the artifact contains the represented exact-int
+  add/compare branch, JIT term lowering consumes the mechanical v3 region and
+  its local generic fallback; other shapes remain on the existing lowering path.
 - The `apply` phase may emit explicitly marked `BEHAVIOR_CHANGE`
   fast paths. Today that includes raw indexed module-global / instance
   field stores outside module-init code, and undeclared known-builtin
