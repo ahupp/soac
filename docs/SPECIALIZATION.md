@@ -13,10 +13,11 @@ For each specialization, this covers:
 ## Optimizer v3 Status
 
 Optimizer v3 is the forward path for new semantic optimization work. Its
-current implementation is a comparison path, not the live JIT lowering path:
-it extracts small branch/return regions, derives explicit facts from profile
-evidence, selects alternatives into `ModuleOptimizationPlanV3`, validates the
-full plan, and emits a mechanical neutral stream for later codegen integration.
+current implementation can be validated from the live `mod.opt` load path, but
+it is not yet the live JIT lowering path. With `SOAC_VALIDATE_OPT_V3=1`,
+`verify`/`apply` runs v3 extraction, fact derivation, alternative selection,
+full-plan validation, and mechanical neutral emission against the lowered
+function/evidence that legacy JIT specialization is about to use.
 
 The first represented slice is exact-compact-`int` `a + b > 0` branch planning:
 `operator_hot_shapes` exact-int evidence proves the operands, an explicit
@@ -31,7 +32,7 @@ planner rule, validation, and mechanical-emitter coverage first.
 
 Current migration surface:
 
-- Represented for v3 comparison: exact-int add/compare branch slice.
+- Live v3 validation only: exact-int add/compare branch slice.
 - Legacy only: other exact-int binary/unary operators, profiled direct calls,
   exact-list getitem/setitem, indexed globals, and indexed fields.
 - Not currently a v3 semantic-plan target: branch locality and cold block

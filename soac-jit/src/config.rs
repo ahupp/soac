@@ -1,9 +1,9 @@
 use cranelift_codegen::isa::TargetIsa;
 use cranelift_codegen::settings;
 use cranelift_codegen::settings::Configurable;
-#[cfg(test)]
-pub(crate) use soac_config::SOAC_JIT_EMIT_REFCOUNTS_ENV;
 pub(crate) use soac_config::SpecializationMode;
+#[cfg(test)]
+pub(crate) use soac_config::{SOAC_JIT_EMIT_REFCOUNTS_ENV, SOAC_VALIDATE_OPT_V3_ENV};
 use soac_config::{
     background_jit_enabled_from_env,
     counter_dump_input_path_from_env as config_counter_dump_input_path_from_env,
@@ -12,6 +12,7 @@ use soac_config::{
     jit_compile_workers_from_env, jit_perf_helper_frames_enabled_from_env,
     jit_refcount_emission_enabled_from_env,
     module_cache_root_from_env_or_repo as config_module_cache_root_from_env_or_repo,
+    opt_v3_validation_enabled_from_env,
     precompiled_library_path_from_env as config_precompiled_library_path_from_env,
     profiled_cold_blocks_enabled_from_env, soac_work_dir_from_env as config_soac_work_dir_from_env,
     specialization_mode_from_env as config_specialization_mode_from_env,
@@ -108,6 +109,10 @@ pub(crate) fn counter_dump_output_path_from_env() -> Result<Option<PathBuf>, Str
 
 pub(crate) fn profiled_cold_blocks_enabled() -> Result<bool, String> {
     profiled_cold_blocks_enabled_from_env()
+}
+
+pub(crate) fn opt_v3_validation_enabled() -> Result<bool, String> {
+    opt_v3_validation_enabled_from_env()
 }
 
 pub(crate) fn jit_refcount_emission_enabled() -> Result<bool, String> {

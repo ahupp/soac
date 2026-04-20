@@ -15626,6 +15626,7 @@ def f(x):
         ) {
             return;
         }
+        let _opt_v3_guard = EnvVarGuard::set(SOAC_VALIDATE_OPT_V3_ENV, "1");
         let blocks = [1usize as ObjPtr, 2usize as ObjPtr, 3usize as ObjPtr];
         let mut constants = TestConstantPool::default();
         let mut function = test_function();

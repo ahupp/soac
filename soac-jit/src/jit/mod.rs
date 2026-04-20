@@ -4,16 +4,17 @@ use self::precompiled_object::{
 };
 use crate::SOAC_RUNTIME_CLIF;
 #[cfg(test)]
-use crate::config::SOAC_JIT_EMIT_REFCOUNTS_ENV;
-#[cfg(test)]
 use crate::config::specialization_mode_is_profile;
 use crate::config::{
     CraneliftTargetConfig, PythonModuleCacheSource, SpecializationMode,
     behavior_change_indexed_stores_enabled, counter_dump_input_path_from_env, jit_compile_workers,
     jit_refcount_emission_enabled, module_cache_root_from_env_or_repo,
-    module_optimization_plan_path, pre_optimization_module_cache_identity,
-    profiled_cold_blocks_enabled, soac_work_dir_from_env, specialization_mode_from_env,
+    module_optimization_plan_path, opt_v3_validation_enabled,
+    pre_optimization_module_cache_identity, profiled_cold_blocks_enabled, soac_work_dir_from_env,
+    specialization_mode_from_env,
 };
+#[cfg(test)]
+use crate::config::{SOAC_JIT_EMIT_REFCOUNTS_ENV, SOAC_VALIDATE_OPT_V3_ENV};
 use crate::counter::TopValueCounter;
 use crate::function_instantiation::{
     SOAC_JIT_MAKE_FUNCTION_WITH_CLOSURE_SYMBOL, make_function_kind_abi_tag,
@@ -21,12 +22,15 @@ use crate::function_instantiation::{
 };
 use crate::module_constants::{ModuleCodegenConstants, ModuleConstantId};
 use crate::module_type::{CounterRuntimeSlot, SharedModuleState, build_counter_storage_layout};
+use crate::optimization_alternatives_v3::AlternativeCatalog;
+use crate::optimization_pipeline_v3::plan_and_emit_function_exact_int_branches_v3;
 #[cfg(test)]
 use crate::optimization_plan::ProfileEvidenceStore;
 use crate::optimization_plan::{
-    FunctionProfileEvidence, OptimizationPlan, PlannedIndexedFieldSpecialization,
-    load_optimization_plan,
+    FunctionOptimizationPlan, FunctionProfileEvidence, OptimizationPlan,
+    PlannedIndexedFieldSpecialization, load_optimization_plan,
 };
+use crate::optimization_plan_v3::{FunctionPlanIdentity, ModulePlanIdentity};
 use cranelift_codegen::cfg_printer::CFGPrinter;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::inline::{Inline, InlineCommand};
@@ -13269,6 +13273,12 @@ fn planned_evidence_for_shared_state(
                     .map_err(anyhow::Error::msg)
             })
             .map_err(|err| err.to_string())?;
+        validate_opt_v3_exact_int_branch_artifacts_for_function(
+            plan,
+            planned_function,
+            current_function,
+            &evidence,
+        )?;
         evidence_by_function.insert(current_function.function_id, evidence);
     }
     Ok(evidence_by_function)
@@ -13306,7 +13316,11 @@ fn planned_evidence_for_precompile(
     let mut evidence_by_function = HashMap::new();
     for planned_function in &plan.functions {
         let current_function_id = planned_function.runtime_function_id(module_id);
-        if !has_function(current_function_id) {
+        let current_function = module
+            .callable_defs
+            .iter()
+            .find(|function| function.function_id == current_function_id);
+        let Some(current_function) = current_function else {
             return Err(format!(
                 "optimization plan for module {} references missing function id {} ({})",
                 plan.module_name,
@@ -13314,7 +13328,7 @@ fn planned_evidence_for_precompile(
                 plan.debug_name_for_function(planned_function.function)
                     .unwrap_or("<unknown>")
             ));
-        }
+        };
         let evidence = plan
             .evidence_for_local_function(planned_function.local_function_id(), |target| {
                 if target.module.module_name != module_name
@@ -13327,6 +13341,12 @@ fn planned_evidence_for_precompile(
                 Ok(has_function(target_function_id).then_some(target_function_id))
             })
             .map_err(|err| err.to_string())?;
+        validate_opt_v3_exact_int_branch_artifacts_for_function(
+            &plan,
+            planned_function,
+            current_function,
+            &evidence,
+        )?;
         if !function_profile_evidence_is_empty(&evidence) {
             evidence_by_function.insert(current_function_id, evidence);
         }
@@ -13341,6 +13361,74 @@ fn function_profile_evidence_is_empty(evidence: &FunctionProfileEvidence) -> boo
         && evidence.setitem_specializations.is_empty()
         && evidence.field_index_specializations.is_empty()
         && evidence.branch_prefer_true.is_empty()
+}
+
+fn validate_opt_v3_exact_int_branch_artifacts_for_function(
+    plan: &OptimizationPlan,
+    planned_function: &FunctionOptimizationPlan,
+    function: &BlockPyFunction<CodegenModuleShape>,
+    evidence: &FunctionProfileEvidence,
+) -> Result<(), String> {
+    if !opt_v3_validation_enabled()? {
+        return Ok(());
+    }
+
+    let catalog = AlternativeCatalog::default_v3();
+    let artifacts = plan_and_emit_function_exact_int_branches_v3(
+        &catalog,
+        ModulePlanIdentity {
+            module_name: plan.module_name.clone(),
+            source_hash: plan.source_hash,
+            cache_identity: plan.cache_identity.clone(),
+        },
+        FunctionPlanIdentity {
+            function: planned_function.function,
+            debug_name: plan
+                .debug_name_for_function(planned_function.function)
+                .map(ToString::to_string)
+                .or_else(|| Some(function.names.qualname.clone())),
+        },
+        function,
+        evidence,
+        &HashMap::new(),
+    )
+    .map_err(|err| {
+        format!(
+            "optimizer v3 exact-int branch validation failed for module {} function {} ({}): {err}",
+            plan.module_name, function.function_id, function.names.qualname
+        )
+    })?;
+    let region_count = artifacts
+        .emission
+        .functions
+        .iter()
+        .map(|function| function.regions.len())
+        .sum::<usize>();
+    let step_count = artifacts
+        .emission
+        .functions
+        .iter()
+        .flat_map(|function| function.regions.iter())
+        .map(|region| region.steps.len())
+        .sum::<usize>();
+    let diagnostic_count = artifacts
+        .plan
+        .functions
+        .iter()
+        .map(|function| function.diagnostics.len())
+        .sum::<usize>();
+    info!(
+        target: "soac_opt_v3",
+        module = plan.module_name.as_str(),
+        source_hash = plan.source_hash,
+        function = %function.function_id,
+        qualname = function.names.qualname.as_str(),
+        region_count,
+        step_count,
+        diagnostic_count,
+        "validated optimizer v3 exact-int branch artifacts"
+    );
+    Ok(())
 }
 
 fn resolve_planned_function_target(

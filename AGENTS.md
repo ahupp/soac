@@ -444,6 +444,12 @@ so a later turn can resume without rediscovering context.
   `$SOAC_WORK_DIR/profile.bin` as Cranelift `cold` block hints during
   `verify`/`apply`. This is disabled by default; the counters remain
   recorded in `profile`/`verify` either way.
+- `SOAC_VALIDATE_OPT_V3`
+  Optional opt-in for validating the current optimizer-v3 exact-int branch
+  pipeline while loading `mod.opt` plans in `verify`/`apply`. This runs v3
+  extraction, planning, plan validation, and mechanical emission against the
+  live lowered function/evidence, but leaves JIT lowering on the existing
+  legacy path.
 - `BENCHMARK_CPU` / `BENCHMARK_CONSTANT_CLOCKS`
   The benchmark recipes use
   [scripts/run_benchmark_with_cpu_mode.sh](/home/adam/project/soac-profile/scripts/run_benchmark_with_cpu_mode.sh)
