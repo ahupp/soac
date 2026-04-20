@@ -18,6 +18,9 @@ it is not yet the live JIT lowering path. With `SOAC_VALIDATE_OPT_V3=1`,
 `verify`/`apply` runs v3 extraction, fact derivation, alternative selection,
 full-plan validation, and mechanical neutral emission against the lowered
 function/evidence that legacy JIT specialization is about to use.
+The resulting `ExactIntBranchV3Artifacts` are also threaded through
+`FunctionSpecializationInputs` and checked at codegen entry, so the JIT receives
+the structured v3 data without consuming it for lowering yet.
 
 The first represented slice is exact-compact-`int` `a + b > 0` branch planning:
 `operator_hot_shapes` exact-int evidence proves the operands, an explicit
@@ -32,7 +35,7 @@ planner rule, validation, and mechanical-emitter coverage first.
 
 Current migration surface:
 
-- Live v3 validation only: exact-int add/compare branch slice.
+- Live v3 codegen input only: exact-int add/compare branch slice.
 - Legacy only: other exact-int binary/unary operators, profiled direct calls,
   exact-list getitem/setitem, indexed globals, and indexed fields.
 - Not currently a v3 semantic-plan target: branch locality and cold block

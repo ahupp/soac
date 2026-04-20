@@ -17155,7 +17155,7 @@ def f(x, y):
         .expect("test optimization plan path should build");
         write_test_optimization_plan(plan_path.as_path(), &plan);
 
-        let evidence = planned_evidence_for_precompile(
+        let inputs = planned_optimization_inputs_for_precompile(
             Some(PrecompileOptimizationPlanInput {
                 path: plan_path.as_path(),
                 source: PythonModuleCacheSource::Project,
@@ -17168,7 +17168,8 @@ def f(x, y):
         )
         .expect("precompile should load planned same-module evidence");
         assert_eq!(
-            evidence
+            inputs
+                .evidence_by_function
                 .get(&caller_function_id)
                 .and_then(|evidence| evidence.call_target_specializations.get(&instr_id)),
             Some(&vec![callee_function_id]),
@@ -17258,7 +17259,7 @@ def f(x, y):
         .expect("test optimization plan path should build");
         write_test_optimization_plan(plan_path.as_path(), &plan);
 
-        let evidence = planned_evidence_for_precompile(
+        let inputs = planned_optimization_inputs_for_precompile(
             Some(PrecompileOptimizationPlanInput {
                 path: plan_path.as_path(),
                 source: PythonModuleCacheSource::Project,
@@ -17271,7 +17272,8 @@ def f(x, y):
         )
         .expect("precompile should resolve indexed cross-module planned targets");
         assert_eq!(
-            evidence
+            inputs
+                .evidence_by_function
                 .get(&caller_function_id)
                 .and_then(|evidence| evidence.call_target_specializations.get(&instr_id)),
             Some(&vec![callee_function_id]),
@@ -17483,7 +17485,7 @@ def f(x, y):
         .expect("test optimization plan path should build");
         write_test_optimization_plan(plan_path.as_path(), &plan);
 
-        let evidence = planned_evidence_for_precompile(
+        let inputs = planned_optimization_inputs_for_precompile(
             Some(PrecompileOptimizationPlanInput {
                 path: plan_path.as_path(),
                 source: PythonModuleCacheSource::Project,
@@ -17496,7 +17498,9 @@ def f(x, y):
         )
         .expect("precompile should ignore unresolved cross-module planned targets");
         assert!(
-            !evidence.contains_key(&caller_function_id),
+            !inputs
+                .evidence_by_function
+                .contains_key(&caller_function_id),
             "an unresolved precompile-only plan should not shadow counter fallback for the function"
         );
     }
@@ -19486,7 +19490,10 @@ def f(x, y):
         let profile = SpecializationProfile::from_precompile(
             module_name,
             None,
-            HashMap::from([(caller_function.function_id, caller_evidence)]),
+            PlannedOptimizationInputs::from_evidence_by_function(HashMap::from([(
+                caller_function.function_id,
+                caller_evidence,
+            )])),
         )
         .expect("test specialization profile should construct");
         let plan = build_profiled_jit_module_plan(&module, &profile, None, None, &HashMap::new())
@@ -19582,7 +19589,10 @@ def f(x, y):
         let profile = SpecializationProfile::from_precompile(
             module_name,
             None,
-            HashMap::from([(caller_function.function_id, caller_evidence)]),
+            PlannedOptimizationInputs::from_evidence_by_function(HashMap::from([(
+                caller_function.function_id,
+                caller_evidence,
+            )])),
         )
         .expect("test specialization profile should construct");
         let direct_owner_attr_specializations = HashMap::from([(

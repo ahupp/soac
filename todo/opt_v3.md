@@ -60,6 +60,10 @@ Implemented:
   in `verify`/`apply`; this runs the current v3 exact-int branch pipeline over
   the lowered function/evidence that legacy JIT specialization will use, but
   still leaves lowering on the legacy path.
+- `FunctionSpecializationInputs`: carries validated exact-int branch v3
+  artifacts into the JIT build path, where codegen validates that the artifact
+  function identity matches the function being compiled before legacy lowering
+  continues.
 
 Remaining legacy-only families are intentionally visible:
 

@@ -448,8 +448,8 @@ so a later turn can resume without rediscovering context.
   Optional opt-in for validating the current optimizer-v3 exact-int branch
   pipeline while loading `mod.opt` plans in `verify`/`apply`. This runs v3
   extraction, planning, plan validation, and mechanical emission against the
-  live lowered function/evidence, but leaves JIT lowering on the existing
-  legacy path.
+  live lowered function/evidence and passes the resulting artifact to JIT
+  codegen inputs, but leaves branch lowering on the existing legacy path.
 - `BENCHMARK_CPU` / `BENCHMARK_CONSTANT_CLOCKS`
   The benchmark recipes use
   [scripts/run_benchmark_with_cpu_mode.sh](/home/adam/project/soac-profile/scripts/run_benchmark_with_cpu_mode.sh)

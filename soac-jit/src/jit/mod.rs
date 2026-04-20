@@ -23,7 +23,9 @@ use crate::function_instantiation::{
 use crate::module_constants::{ModuleCodegenConstants, ModuleConstantId};
 use crate::module_type::{CounterRuntimeSlot, SharedModuleState, build_counter_storage_layout};
 use crate::optimization_alternatives_v3::AlternativeCatalog;
-use crate::optimization_pipeline_v3::plan_and_emit_function_exact_int_branches_v3;
+use crate::optimization_pipeline_v3::{
+    ExactIntBranchV3Artifacts, plan_and_emit_function_exact_int_branches_v3,
+};
 #[cfg(test)]
 use crate::optimization_plan::ProfileEvidenceStore;
 use crate::optimization_plan::{
@@ -13010,9 +13012,28 @@ struct SpecializationProfile<'a> {
     module_name: Option<&'a str>,
     counter_dump_path: Option<Cow<'a, Path>>,
     planned_evidence: HashMap<RuntimeFunctionId, FunctionProfileEvidence>,
+    opt_v3_exact_int_branch_artifacts: HashMap<RuntimeFunctionId, Arc<ExactIntBranchV3Artifacts>>,
     behavior_change_indexed_stores: bool,
     profiled_cold_blocks: bool,
     guard_miss_deopt: bool,
+}
+
+#[derive(Clone, Default)]
+struct PlannedOptimizationInputs {
+    evidence_by_function: HashMap<RuntimeFunctionId, FunctionProfileEvidence>,
+    opt_v3_exact_int_branch_artifacts: HashMap<RuntimeFunctionId, Arc<ExactIntBranchV3Artifacts>>,
+}
+
+impl PlannedOptimizationInputs {
+    #[cfg(test)]
+    fn from_evidence_by_function(
+        evidence_by_function: HashMap<RuntimeFunctionId, FunctionProfileEvidence>,
+    ) -> Self {
+        Self {
+            evidence_by_function,
+            opt_v3_exact_int_branch_artifacts: HashMap::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -13025,6 +13046,7 @@ struct FunctionSpecializationInputs {
     field_index_specializations_by_instr: HashMap<InstrId, Vec<FieldIndexSpecialization>>,
     branch_prefer_true: HashMap<InstrId, bool>,
     cold_block_labels: HashSet<BlockLabel>,
+    opt_v3_exact_int_branch_artifacts: Option<Arc<ExactIntBranchV3Artifacts>>,
     behavior_change_indexed_stores: bool,
     guard_miss_deopt_stub: bool,
 }
@@ -13035,23 +13057,23 @@ fn soac_repo_root_for_module_cache() -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-fn load_planned_evidence_for_runtime_state(
+fn load_planned_optimization_inputs_for_runtime_state(
     shared_state: Option<&SharedModuleState>,
     compile_session: Option<&crate::session::CompileSession>,
     specialization_mode: Option<SpecializationMode>,
-) -> Result<HashMap<RuntimeFunctionId, FunctionProfileEvidence>, String> {
+) -> Result<PlannedOptimizationInputs, String> {
     if !matches!(
         specialization_mode,
         Some(SpecializationMode::Verify | SpecializationMode::Apply)
     ) {
-        return Ok(HashMap::new());
+        return Ok(PlannedOptimizationInputs::default());
     }
     let Some(shared_state) = shared_state else {
-        return Ok(HashMap::new());
+        return Ok(PlannedOptimizationInputs::default());
     };
     let repo_root = soac_repo_root_for_module_cache();
     let Some(cache_root) = module_cache_root_from_env_or_repo(repo_root.as_deref())? else {
-        return Ok(HashMap::new());
+        return Ok(PlannedOptimizationInputs::default());
     };
     let cache_identity = pre_optimization_module_cache_identity(
         env!("SOAC_BUILD_IDENTITY"),
@@ -13081,25 +13103,25 @@ fn load_planned_evidence_for_runtime_state(
             cache_identity.as_str(),
         )
         .map_err(|err| err.to_string())?;
-        return planned_evidence_for_shared_state(&plan, shared_state, compile_session);
+        return planned_optimization_inputs_for_shared_state(&plan, shared_state, compile_session);
     }
     #[cfg(test)]
-    if let Some(evidence) = synthesize_test_planned_evidence_for_runtime_state(
+    if let Some(inputs) = synthesize_test_planned_optimization_inputs_for_runtime_state(
         cache_root.as_path(),
         shared_state,
         compile_session,
     )? {
-        return Ok(evidence);
+        return Ok(inputs);
     }
-    Ok(HashMap::new())
+    Ok(PlannedOptimizationInputs::default())
 }
 
 #[cfg(test)]
-fn synthesize_test_planned_evidence_for_runtime_state(
+fn synthesize_test_planned_optimization_inputs_for_runtime_state(
     cache_root: &Path,
     shared_state: &SharedModuleState,
     compile_session: Option<&crate::session::CompileSession>,
-) -> Result<Option<HashMap<RuntimeFunctionId, FunctionProfileEvidence>>, String> {
+) -> Result<Option<PlannedOptimizationInputs>, String> {
     let Some(path) = counter_dump_input_path_from_env()? else {
         return Ok(None);
     };
@@ -13244,15 +13266,15 @@ fn synthesize_test_planned_evidence_for_runtime_state(
             path.display()
         )
     })?;
-    planned_evidence_for_shared_state(&plan, shared_state, compile_session).map(Some)
+    planned_optimization_inputs_for_shared_state(&plan, shared_state, compile_session).map(Some)
 }
 
-fn planned_evidence_for_shared_state(
+fn planned_optimization_inputs_for_shared_state(
     plan: &OptimizationPlan,
     shared_state: &SharedModuleState,
     compile_session: Option<&crate::session::CompileSession>,
-) -> Result<HashMap<RuntimeFunctionId, FunctionProfileEvidence>, String> {
-    let mut evidence_by_function = HashMap::new();
+) -> Result<PlannedOptimizationInputs, String> {
+    let mut inputs = PlannedOptimizationInputs::default();
     for planned_function in &plan.functions {
         let current_function_id =
             planned_function.runtime_function_id(RuntimeModuleId::new(shared_state.module_id()));
@@ -13273,29 +13295,35 @@ fn planned_evidence_for_shared_state(
                     .map_err(anyhow::Error::msg)
             })
             .map_err(|err| err.to_string())?;
-        validate_opt_v3_exact_int_branch_artifacts_for_function(
+        if let Some(artifacts) = opt_v3_exact_int_branch_artifacts_for_function(
             plan,
             planned_function,
             current_function,
             &evidence,
-        )?;
-        evidence_by_function.insert(current_function.function_id, evidence);
+        )? {
+            inputs
+                .opt_v3_exact_int_branch_artifacts
+                .insert(current_function.function_id, Arc::new(artifacts));
+        }
+        inputs
+            .evidence_by_function
+            .insert(current_function.function_id, evidence);
     }
-    Ok(evidence_by_function)
+    Ok(inputs)
 }
 
-fn planned_evidence_for_precompile(
+fn planned_optimization_inputs_for_precompile(
     plan_input: Option<PrecompileOptimizationPlanInput<'_>>,
     module_index: Option<&PrecompileModuleIndex>,
     module_name: &str,
     source_hash: u64,
     module: &BlockPyModule<CodegenModuleShape>,
-) -> Result<HashMap<RuntimeFunctionId, FunctionProfileEvidence>, String> {
+) -> Result<PlannedOptimizationInputs, String> {
     let Some(plan_input) = plan_input else {
-        return Ok(HashMap::new());
+        return Ok(PlannedOptimizationInputs::default());
     };
     if !plan_input.path.exists() {
-        return Ok(HashMap::new());
+        return Ok(PlannedOptimizationInputs::default());
     }
     let plan = load_optimization_plan(plan_input.path).map_err(|err| err.to_string())?;
     plan.validate_for_module(
@@ -13313,7 +13341,7 @@ fn planned_evidence_for_precompile(
             .iter()
             .any(|function| function.function_id == function_id)
     };
-    let mut evidence_by_function = HashMap::new();
+    let mut inputs = PlannedOptimizationInputs::default();
     for planned_function in &plan.functions {
         let current_function_id = planned_function.runtime_function_id(module_id);
         let current_function = module
@@ -13341,17 +13369,23 @@ fn planned_evidence_for_precompile(
                 Ok(has_function(target_function_id).then_some(target_function_id))
             })
             .map_err(|err| err.to_string())?;
-        validate_opt_v3_exact_int_branch_artifacts_for_function(
+        if let Some(artifacts) = opt_v3_exact_int_branch_artifacts_for_function(
             &plan,
             planned_function,
             current_function,
             &evidence,
-        )?;
+        )? {
+            inputs
+                .opt_v3_exact_int_branch_artifacts
+                .insert(current_function_id, Arc::new(artifacts));
+        }
         if !function_profile_evidence_is_empty(&evidence) {
-            evidence_by_function.insert(current_function_id, evidence);
+            inputs
+                .evidence_by_function
+                .insert(current_function_id, evidence);
         }
     }
-    Ok(evidence_by_function)
+    Ok(inputs)
 }
 
 fn function_profile_evidence_is_empty(evidence: &FunctionProfileEvidence) -> bool {
@@ -13363,14 +13397,14 @@ fn function_profile_evidence_is_empty(evidence: &FunctionProfileEvidence) -> boo
         && evidence.branch_prefer_true.is_empty()
 }
 
-fn validate_opt_v3_exact_int_branch_artifacts_for_function(
+fn opt_v3_exact_int_branch_artifacts_for_function(
     plan: &OptimizationPlan,
     planned_function: &FunctionOptimizationPlan,
     function: &BlockPyFunction<CodegenModuleShape>,
     evidence: &FunctionProfileEvidence,
-) -> Result<(), String> {
+) -> Result<Option<ExactIntBranchV3Artifacts>, String> {
     if !opt_v3_validation_enabled()? {
-        return Ok(());
+        return Ok(None);
     }
 
     let catalog = AlternativeCatalog::default_v3();
@@ -13428,6 +13462,49 @@ fn validate_opt_v3_exact_int_branch_artifacts_for_function(
         diagnostic_count,
         "validated optimizer v3 exact-int branch artifacts"
     );
+    Ok(Some(artifacts))
+}
+
+fn validate_opt_v3_codegen_artifacts_for_function(
+    function: &BlockPyFunction<CodegenModuleShape>,
+    artifacts: Option<&ExactIntBranchV3Artifacts>,
+) -> Result<(), String> {
+    let Some(artifacts) = artifacts else {
+        return Ok(());
+    };
+    if artifacts.plan.functions.len() != 1 {
+        return Err(format!(
+            "optimizer v3 artifacts for function {} ({}) contain {} planned functions",
+            function.function_id,
+            function.names.qualname,
+            artifacts.plan.functions.len()
+        ));
+    }
+    if artifacts.emission.functions.len() != 1 {
+        return Err(format!(
+            "optimizer v3 emission for function {} ({}) contains {} emitted functions",
+            function.function_id,
+            function.names.qualname,
+            artifacts.emission.functions.len()
+        ));
+    }
+    let planned_function = artifacts.plan.functions[0].function.function;
+    let emitted_function = artifacts.emission.functions[0].function;
+    if planned_function != emitted_function {
+        return Err(format!(
+            "optimizer v3 artifacts for function {} ({}) mismatch planned function {} and emitted function {}",
+            function.function_id, function.names.qualname, planned_function, emitted_function
+        ));
+    }
+    if planned_function.local_function_id() != function.function_id.local_function_id() {
+        return Err(format!(
+            "optimizer v3 artifacts for function {} ({}) target local function {}, expected {}",
+            function.function_id,
+            function.names.qualname,
+            planned_function.local_function_id(),
+            function.function_id.local_function_id()
+        ));
+    }
     Ok(())
 }
 
@@ -13481,6 +13558,10 @@ impl FunctionSpecializationInputs {
             field_index_specializations_by_instr,
             branch_prefer_true: profile.branch_preferences(function.function_id)?,
             cold_block_labels: profile.cold_block_labels(function)?,
+            opt_v3_exact_int_branch_artifacts: profile
+                .opt_v3_exact_int_branch_artifacts
+                .get(&function.function_id)
+                .cloned(),
             behavior_change_indexed_stores: profile.behavior_change_indexed_stores
                 && function.scope.scope_kind != CallableScopeKind::Module,
             guard_miss_deopt_stub: profile.guard_miss_deopt
@@ -13502,7 +13583,7 @@ impl<'a> SpecializationProfile<'a> {
         } else {
             None
         };
-        let planned_evidence = load_planned_evidence_for_runtime_state(
+        let planned_inputs = load_planned_optimization_inputs_for_runtime_state(
             shared_state,
             compile_session,
             specialization_mode,
@@ -13510,7 +13591,8 @@ impl<'a> SpecializationProfile<'a> {
         Ok(Self {
             module_name: shared_state.map(|shared_state| shared_state.module_name.as_str()),
             counter_dump_path: counter_dump_path.map(Cow::Owned),
-            planned_evidence,
+            planned_evidence: planned_inputs.evidence_by_function,
+            opt_v3_exact_int_branch_artifacts: planned_inputs.opt_v3_exact_int_branch_artifacts,
             behavior_change_indexed_stores: behavior_change_indexed_stores_enabled()?,
             profiled_cold_blocks: profiled_cold_blocks_enabled()?,
             guard_miss_deopt: matches!(
@@ -13523,12 +13605,13 @@ impl<'a> SpecializationProfile<'a> {
     fn from_precompile(
         module_name: &'a str,
         counter_dump_path: Option<&'a Path>,
-        planned_evidence: HashMap<RuntimeFunctionId, FunctionProfileEvidence>,
+        planned_inputs: PlannedOptimizationInputs,
     ) -> Result<Self, String> {
         Ok(Self {
             module_name: Some(module_name),
             counter_dump_path: counter_dump_path.map(Cow::Borrowed),
-            planned_evidence,
+            planned_evidence: planned_inputs.evidence_by_function,
+            opt_v3_exact_int_branch_artifacts: planned_inputs.opt_v3_exact_int_branch_artifacts,
             behavior_change_indexed_stores: true,
             profiled_cold_blocks: profiled_cold_blocks_enabled()?,
             guard_miss_deopt: true,
@@ -22373,12 +22456,12 @@ fn planned_call_target_specializations_for_batch_function(
     };
     let module_key = shared_state.storage_instance_key();
     if !planned_evidence_by_module.contains_key(&module_key) {
-        let planned_evidence = load_planned_evidence_for_runtime_state(
+        let planned_inputs = load_planned_optimization_inputs_for_runtime_state(
             Some(shared_state),
             Some(session.as_ref()),
             specialization_mode_from_env()?,
         )?;
-        planned_evidence_by_module.insert(module_key, planned_evidence);
+        planned_evidence_by_module.insert(module_key, planned_inputs.evidence_by_function);
     }
     Ok(planned_evidence_by_module
         .get(&module_key)
@@ -25180,7 +25263,7 @@ fn precompile_codegen_module_to_object_bytes(
         });
     }
 
-    let planned_evidence = planned_evidence_for_precompile(
+    let planned_inputs = planned_optimization_inputs_for_precompile(
         optimization_plan,
         module_index,
         module_name,
@@ -25188,7 +25271,7 @@ fn precompile_codegen_module_to_object_bytes(
         module,
     )?;
     let specialization_profile =
-        SpecializationProfile::from_precompile(module_name, counter_dump_path, planned_evidence)?;
+        SpecializationProfile::from_precompile(module_name, counter_dump_path, planned_inputs)?;
     let jit_module_plan = build_profiled_jit_module_plan(
         module,
         &specialization_profile,
@@ -25983,6 +26066,11 @@ fn build_cranelift_run_bb_specialized_function(
         specialization_inputs.field_index_specializations_by_instr;
     let branch_prefer_true = specialization_inputs.branch_prefer_true;
     let cold_block_labels = specialization_inputs.cold_block_labels;
+    let opt_v3_exact_int_branch_artifacts = specialization_inputs.opt_v3_exact_int_branch_artifacts;
+    validate_opt_v3_codegen_artifacts_for_function(
+        function,
+        opt_v3_exact_int_branch_artifacts.as_deref(),
+    )?;
     let behavior_change_indexed_stores = specialization_inputs.behavior_change_indexed_stores;
     let guard_miss_deopt_stub = specialization_inputs.guard_miss_deopt_stub;
     let function_runtime_data_layout = FunctionRuntimeDataLayout::from_function(function);

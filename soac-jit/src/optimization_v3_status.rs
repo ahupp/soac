@@ -2,6 +2,7 @@
 pub enum V3MigrationStatus {
     RepresentedForComparison,
     LiveValidationOnly,
+    LiveCodegenInputOnly,
     LegacyOnly,
     NotAnOptimizationPlanTarget,
 }
@@ -18,7 +19,7 @@ pub const V3_OPTIMIZATION_FAMILY_STATUS: &[V3OptimizationFamilyStatus] = &[
     V3OptimizationFamilyStatus {
         family: "exact-int add/compare branch slice",
         legacy_input: "operator_hot_shapes",
-        status: V3MigrationStatus::LiveValidationOnly,
+        status: V3MigrationStatus::LiveCodegenInputOnly,
         next_step: "wire the validated v3 emission stream into real JIT codegen for this slice",
     },
     V3OptimizationFamilyStatus {
