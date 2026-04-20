@@ -263,6 +263,12 @@ typed variables must use recognized values. Boolean knobs accept `1`, `true`,
   `SOAC_OPT_MODE` unset, or set it to `none`, for the ordinary
   unspecialized/no-counter path.
 
+- `SOAC_OPT_PLAN_MODE=auto|legacy|v3`
+  Select which serialized optimization-plan artifacts `verify` and `apply`
+  consume. The default `auto` mode prefers `mod.optv3` and falls back to legacy
+  `mod.opt`. `legacy` ignores `mod.optv3`. `v3` requires `mod.optv3` and errors
+  instead of falling back to a legacy plan.
+
 Notes:
 - In normal workflows set one `SOAC_WORK_DIR` for the whole multi-pass
   run and change only `SOAC_OPT_MODE`.
@@ -360,12 +366,13 @@ tree, with pystone benchmark runs writing to `work/bench/`.
   Offline precompile a counter-referenced set of cached BlockPy modules into
   relocatable object files and link them into a shared library. The recipe
   regenerates optimization plans from the counter file before compiling. The
-  precompile JIT path prefers `mod.optv3` when present and otherwise falls back
-  to legacy `mod.opt`. The counter file normally comes from a previous profile
-  pass, and the matching pre-optimization BlockPy cache entries must still exist
-  in the active `$SOAC_WORK_DIR/modules` cache. With the default benchmark cache
-  isolation, that cache is the benchmark result's `counters/modules` directory.
-  When `counters` is omitted, the recipe uses `$LAST_BENCHMARK_COUNTERS`. Set
+  precompile JIT path follows `SOAC_OPT_PLAN_MODE`: `auto` prefers `mod.optv3`
+  and falls back to legacy `mod.opt`, while `v3` requires `mod.optv3`. The
+  counter file normally comes from a previous profile pass, and the matching
+  pre-optimization BlockPy cache entries must still exist in the active
+  `$SOAC_WORK_DIR/modules` cache. With the default benchmark cache isolation,
+  that cache is the benchmark result's `counters/modules` directory. When
+  `counters` is omitted, the recipe uses `$LAST_BENCHMARK_COUNTERS`. Set
   `SOAC_PRECOMPILED_LIBRARY` to the resulting
   `.so` to let runtime direct-function setup use matching precompiled entries.
 
@@ -381,10 +388,10 @@ tree, with pystone benchmark runs writing to `work/bench/`.
   to pretty-print a legacy plan for inspection, or
   `cargo run -p soac-inspector --bin print_optimization_plan_v3 -- --plan <mod.optv3>`
   to inspect a v3 artifact summary. `just benchmark` runs the legacy mode after
-  the profile pass today. In `SOAC_OPT_MODE=verify|apply`, runtime
-  specialization prefers a matching `mod.optv3` in the active module cache and
-  falls back to legacy `mod.opt` for decision-backed call, operator, getitem,
-  setitem, indexed-field, and branch specializations.
+  the profile pass today. In `SOAC_OPT_MODE=verify|apply`,
+  `SOAC_OPT_PLAN_MODE` controls runtime plan selection: `auto` prefers a
+  matching `mod.optv3` in the active module cache and falls back to legacy
+  `mod.opt`, while `v3` requires the serialized v3 artifact.
 
 - `SOAC_JIT_PERF_HELPER_FRAMES=1`
   In `fn should_preserve_perf_helper_frames`, at

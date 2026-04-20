@@ -31,7 +31,9 @@ mod tests {
     use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyModule, PyModuleMethods, PyTuple};
     use pyo3::{Bound, Py, PyAny, PyErr, PyResult, Python, ffi};
     use ruff_python_ast as ast;
-    use soac_lowering::codegen_cache::{PythonModuleCacheSource, module_optimization_plan_path};
+    use soac_lowering::codegen_cache::{
+        PythonModuleCacheSource, module_optimization_plan_path, module_optimization_plan_v3_path,
+    };
     use soac_lowering::passes::{TypedInstrExtra, TypedPlannedResult as PlannedResult};
     use soac_profile::{
         CounterDumpRecord, CounterDumpRow, CounterDumpTypeKey, CounterDumpTypeKeyLayout,
@@ -3046,6 +3048,51 @@ def build(values):
         let archive = rkyv::to_bytes::<rkyv::rancor::Error>(plan)
             .expect("test optimization plan should serialize");
         std::fs::write(path, archive.as_ref()).expect("test optimization plan should be writable");
+    }
+
+    fn write_test_optimization_artifacts_v3(path: &Path, artifacts: &ExactIntBranchV3Artifacts) {
+        crate::optimization_pipeline_v3::write_optimization_artifacts_v3(path, artifacts)
+            .expect("test optimization plan v3 should be writable");
+    }
+
+    fn test_empty_v3_artifacts_for_function(
+        module_name: &str,
+        source_hash: u64,
+        cache_identity: &str,
+        serialized_module_id: u32,
+        function: &BlockPyFunction<CodegenModuleShape>,
+    ) -> ExactIntBranchV3Artifacts {
+        let serialized_function =
+            test_serialized_function_id(serialized_module_id, function.function_id);
+        ExactIntBranchV3Artifacts {
+            plan: ModuleOptimizationPlanV3 {
+                module: ModulePlanIdentity {
+                    module_name: module_name.to_string(),
+                    source_hash,
+                    cache_identity: cache_identity.to_string(),
+                },
+                helper_catalog_version: 1,
+                cost_model_version: 1,
+                functions: vec![crate::optimization_plan_v3::FunctionOptimizationPlanV3 {
+                    function: FunctionPlanIdentity {
+                        function: serialized_function,
+                        debug_name: Some(function.names.qualname.clone()),
+                    },
+                    regions: Vec::new(),
+                    deopt_points: Vec::new(),
+                    ownership: crate::optimization_plan_v3::FunctionOwnershipPlan::default(),
+                    diagnostics: Vec::new(),
+                }],
+            },
+            emission: MechanicalModuleEmission {
+                module_name: module_name.to_string(),
+                functions: vec![crate::optimization_emit_v3::MechanicalFunctionEmission {
+                    function: serialized_function,
+                    debug_name: Some(function.names.qualname.clone()),
+                    regions: Vec::new(),
+                }],
+            },
+        }
     }
 
     fn write_test_operator_optimization_plan(
@@ -16161,6 +16208,73 @@ def f(x):
     }
 
     #[test]
+    fn planned_precompile_inputs_require_v3_artifact_in_strict_plan_mode() {
+        let _plan_mode = EnvVarGuard::set(SOAC_OPT_PLAN_MODE_ENV, "v3");
+        let module_cache_root = fresh_test_work_dir("strict-v3-precompile-plan");
+        let module_name = "strict_v3_precompile_plan_test";
+        let source_hash = 0xabcddcba;
+        let module_name_gen = ModuleNameGen::new(0);
+        let function = with_single_test_block(
+            test_function_in_module(&module_name_gen, "target"),
+            vec![],
+            ret_term(none_expr()),
+        );
+        let function_id = function.function_id;
+        let module = test_module(module_name_gen, vec![function]);
+        let cache_identity =
+            pre_optimization_module_cache_identity(env!("SOAC_BUILD_IDENTITY"), false);
+        let planned_function = test_serialized_function_id(0, function_id);
+        let legacy_plan = OptimizationPlan {
+            source: PythonModuleCacheSource::Project,
+            module_name: module_name.to_string(),
+            source_hash,
+            cache_identity: cache_identity.clone(),
+            identity_tables: test_plan_identities(
+                module_name,
+                source_hash,
+                cache_identity.as_str(),
+                planned_function,
+                "target",
+                &[],
+            ),
+            functions: Vec::new(),
+        };
+        let legacy_path = module_optimization_plan_path(
+            module_cache_root.as_path(),
+            PythonModuleCacheSource::Project,
+            module_name,
+        )
+        .expect("legacy test optimization plan path should build");
+        write_test_optimization_plan(legacy_path.as_path(), &legacy_plan);
+        let missing_v3_path = module_optimization_plan_v3_path(
+            module_cache_root.as_path(),
+            PythonModuleCacheSource::Project,
+            module_name,
+        )
+        .expect("v3 test optimization plan path should build");
+
+        let err = match planned_optimization_inputs_for_precompile(
+            Some(PrecompileOptimizationPlanInput {
+                path: legacy_path.as_path(),
+                v3_path: Some(missing_v3_path.as_path()),
+                source: PythonModuleCacheSource::Project,
+                cache_identity: cache_identity.as_str(),
+            }),
+            None,
+            module_name,
+            source_hash,
+            &module,
+        ) {
+            Ok(_) => panic!("strict v3 plan mode should reject legacy-only precompile inputs"),
+            Err(err) => err,
+        };
+        assert!(
+            err.contains("SOAC_OPT_PLAN_MODE=v3 requires precompile mod.optv3"),
+            "unexpected strict v3 precompile error: {err}"
+        );
+    }
+
+    #[test]
     fn specialized_jit_exact_int_compare_guard_miss_deopts_for_replay_safe_operands() {
         if crate::run_test_in_isolated_process_if_needed(
             module_path!(),
@@ -17969,6 +18083,159 @@ def f(x, y):
                     .unwrap()
                     .get(&instr_id),
                 Some(&false)
+            );
+        });
+    }
+
+    #[test]
+    fn specialization_profile_v3_plan_mode_rejects_legacy_plan_fallback() {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "specialization_profile_v3_plan_mode_rejects_legacy_plan_fallback",
+        ) {
+            return;
+        }
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| {
+            let soac_work_dir = fresh_test_work_dir("strict-v3-runtime-legacy-plan");
+            let module_cache_root = soac_work_dir.join("modules");
+            let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
+            let _opt_mode = EnvVarGuard::set("SOAC_OPT_MODE", "verify");
+            let _plan_mode = EnvVarGuard::set(SOAC_OPT_PLAN_MODE_ENV, "v3");
+            let module_name = "strict_v3_runtime_legacy_plan_test";
+            let module_name_gen = ModuleNameGen::new(0);
+            let function = with_single_test_block(
+                test_function_in_module(&module_name_gen, "target"),
+                vec![],
+                ret_term(none_expr()),
+            );
+            let function_id = function.function_id;
+            let module = test_module(module_name_gen, vec![function]);
+            let shared_state =
+                crate::module_type::build_shared_state_for_testing(py, module, module_name, "")
+                    .expect("shared state should build");
+            let cache_identity = pre_optimization_module_cache_identity(
+                env!("SOAC_BUILD_IDENTITY"),
+                shared_state.module_name == "soac.runtime",
+            );
+            let planned_function = test_serialized_function_id(0, function_id);
+            let legacy_plan = OptimizationPlan {
+                source: PythonModuleCacheSource::Project,
+                module_name: module_name.to_string(),
+                source_hash: shared_state.source_hash,
+                cache_identity: cache_identity.clone(),
+                identity_tables: test_plan_identities(
+                    module_name,
+                    shared_state.source_hash,
+                    cache_identity.as_str(),
+                    planned_function,
+                    "target",
+                    &[],
+                ),
+                functions: Vec::new(),
+            };
+            let legacy_path = module_optimization_plan_path(
+                module_cache_root.as_path(),
+                PythonModuleCacheSource::Project,
+                module_name,
+            )
+            .expect("legacy test optimization plan path should build");
+            write_test_optimization_plan(legacy_path.as_path(), &legacy_plan);
+
+            let err = match SpecializationProfile::from_runtime_state_with_session(
+                Some(shared_state.as_ref()),
+                None,
+            ) {
+                Ok(_) => panic!("strict v3 plan mode should reject a legacy-only runtime plan"),
+                Err(err) => err,
+            };
+            assert!(
+                err.contains("SOAC_OPT_PLAN_MODE=v3 requires mod.optv3"),
+                "unexpected strict v3 runtime error: {err}"
+            );
+        });
+    }
+
+    #[test]
+    fn specialization_profile_loads_serialized_v3_artifact_in_strict_plan_mode() {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "specialization_profile_loads_serialized_v3_artifact_in_strict_plan_mode",
+        ) {
+            return;
+        }
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| {
+            let soac_work_dir = fresh_test_work_dir("strict-v3-runtime-v3-plan");
+            let module_cache_root = soac_work_dir.join("modules");
+            let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
+            let _opt_mode = EnvVarGuard::set("SOAC_OPT_MODE", "verify");
+            let _plan_mode = EnvVarGuard::set(SOAC_OPT_PLAN_MODE_ENV, "v3");
+            let module_name = "strict_v3_runtime_v3_plan_test";
+            let module_name_gen = ModuleNameGen::new(0);
+            let function = with_single_test_block(
+                test_function_in_module(&module_name_gen, "target"),
+                vec![],
+                ret_term(none_expr()),
+            );
+            let function_id = function.function_id;
+            let module = test_module(module_name_gen, vec![function]);
+            let shared_state =
+                crate::module_type::build_shared_state_for_testing(py, module, module_name, "")
+                    .expect("shared state should build");
+            let current_function = shared_state
+                .lookup_function(function_id)
+                .expect("test function should be present in shared state");
+            let cache_identity = pre_optimization_module_cache_identity(
+                env!("SOAC_BUILD_IDENTITY"),
+                shared_state.module_name == "soac.runtime",
+            );
+            let artifacts = test_empty_v3_artifacts_for_function(
+                module_name,
+                shared_state.source_hash,
+                cache_identity.as_str(),
+                0,
+                current_function,
+            );
+            let v3_path = module_optimization_plan_v3_path(
+                module_cache_root.as_path(),
+                PythonModuleCacheSource::Project,
+                module_name,
+            )
+            .expect("v3 test optimization plan path should build");
+            write_test_optimization_artifacts_v3(v3_path.as_path(), &artifacts);
+
+            let profile = SpecializationProfile::from_runtime_state_with_session(
+                Some(shared_state.as_ref()),
+                None,
+            )
+            .expect("strict v3 plan mode should load serialized runtime artifacts");
+            assert!(
+                profile.has_specialization_inputs(),
+                "serialized v3 artifacts should count as specialization input"
+            );
+            assert!(
+                !profile.has_existing_counter_dump(),
+                "test should prove the profile is not relying on a profile.bin fallback"
+            );
+            assert!(
+                profile.planned_evidence.is_empty(),
+                "strict v3 artifact loading should not synthesize legacy planned evidence"
+            );
+            let function_artifacts = profile
+                .opt_v3_exact_int_branch_artifacts
+                .get(&function_id)
+                .expect("v3 profile should include the current function");
+            assert_eq!(function_artifacts.plan.functions.len(), 1);
+            assert_eq!(function_artifacts.emission.functions.len(), 1);
+            assert_eq!(
+                function_artifacts.plan.functions[0]
+                    .function
+                    .function
+                    .local_function_id(),
+                function_id.local_function_id()
             );
         });
     }

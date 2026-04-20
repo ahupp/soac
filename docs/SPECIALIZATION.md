@@ -21,6 +21,9 @@ per-function `ExactIntBranchV3Artifacts`, and threads those artifacts through
 `FunctionSpecializationInputs`. When the artifact contains the represented
 exact-int branch shape, JIT term lowering consumes the mechanical v3 region
 directly; otherwise lowering stays on the existing path.
+Set `SOAC_OPT_PLAN_MODE=v3` to require this serialized artifact and reject
+legacy fallback, or `SOAC_OPT_PLAN_MODE=legacy` to force the old artifact path
+while comparing behavior.
 
 `SOAC_VALIDATE_OPT_V3=1` remains a transitional comparison mode while loading
 legacy `mod.opt`: it rebuilds v3 artifacts in memory from legacy-planned

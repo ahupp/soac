@@ -1,9 +1,11 @@
 use cranelift_codegen::isa::TargetIsa;
 use cranelift_codegen::settings;
 use cranelift_codegen::settings::Configurable;
-pub(crate) use soac_config::SpecializationMode;
+pub(crate) use soac_config::{OptimizationPlanMode, SpecializationMode};
 #[cfg(test)]
-pub(crate) use soac_config::{SOAC_JIT_EMIT_REFCOUNTS_ENV, SOAC_VALIDATE_OPT_V3_ENV};
+pub(crate) use soac_config::{
+    SOAC_JIT_EMIT_REFCOUNTS_ENV, SOAC_OPT_PLAN_MODE_ENV, SOAC_VALIDATE_OPT_V3_ENV,
+};
 use soac_config::{
     background_jit_enabled_from_env,
     counter_dump_input_path_from_env as config_counter_dump_input_path_from_env,
@@ -13,6 +15,7 @@ use soac_config::{
     jit_refcount_emission_enabled_from_env,
     module_cache_root_from_env as config_module_cache_root_from_env,
     opt_v3_validation_enabled_from_env,
+    optimization_plan_mode_from_env as config_optimization_plan_mode_from_env,
     precompiled_library_path_from_env as config_precompiled_library_path_from_env,
     profiled_cold_blocks_enabled_from_env, soac_work_dir_from_env as config_soac_work_dir_from_env,
     specialization_mode_from_env as config_specialization_mode_from_env,
@@ -214,5 +217,9 @@ pub(crate) fn behavior_change_indexed_stores_enabled() -> Result<bool, String> {
 
 pub(crate) fn specialization_mode_from_env() -> Result<Option<SpecializationMode>, String> {
     config_specialization_mode_from_env()
+}
+
+pub(crate) fn optimization_plan_mode_from_env() -> Result<OptimizationPlanMode, String> {
+    config_optimization_plan_mode_from_env()
 }
 pub use soac_lowering::codegen_cache::PythonModuleCacheSource;

@@ -436,12 +436,15 @@ explicit ordinary
   `decide_optimizations` to turn that evidence plus cached BlockPy modules into
   per-module optimization plans before entering `verify` or `apply`. Use
   `--mode v3` to write `mod.optv3` from raw profile evidence and cached
-  unoptimized BlockPy modules; the JIT prefers `mod.optv3` and falls back to
-  legacy `mod.opt`. `verify` exercises indexed store fast paths so hit/fallback
-  counters measure the specialized steady-state path. `apply` still skips
-  counter dump files, but when event logging is enabled it records indexed
-  specialization hit/fallback counts and deopt-entry counts long enough to emit
-  `soac_specialization_runtime` summary events.
+  unoptimized BlockPy modules. `SOAC_OPT_PLAN_MODE=auto|legacy|v3` controls
+  runtime plan selection for `verify`/`apply`: the default `auto` prefers
+  `mod.optv3` and falls back to legacy `mod.opt`, `legacy` ignores `mod.optv3`,
+  and `v3` requires `mod.optv3` instead of falling back. `verify` exercises
+  indexed store fast paths so hit/fallback counters measure the specialized
+  steady-state path. `apply` still skips counter dump files, but when event
+  logging is enabled it records indexed specialization hit/fallback counts and
+  deopt-entry counts long enough to emit `soac_specialization_runtime` summary
+  events.
 - `SOAC_ENABLE_PROFILED_COLD_BLOCKS`
   Optional opt-in for replaying `block_entry` counters from
   `$SOAC_WORK_DIR/profile.bin` as Cranelift `cold` block hints during
@@ -507,11 +510,12 @@ explicit ordinary
 - `just precompile-shared-library counters=<profile.bin> out=<lib.so>`
   Offline precompiles all modules referenced by a counter dump from cached
   pre-optimization BlockPy modules, writes per-module object files, and links a
-  shared library. The precompile JIT path prefers `mod.optv3` when present and
-  otherwise falls back to legacy `mod.opt`. It expects matching module-cache
-  entries in `$SOAC_WORK_DIR/modules`; run a profile/benchmark pass first when
-  the cache is empty. Use `SOAC_PRECOMPILED_LIBRARY` to point runtime execution
-  at the resulting shared library.
+  shared library. The precompile JIT path follows `SOAC_OPT_PLAN_MODE`: `auto`
+  prefers `mod.optv3` and falls back to legacy `mod.opt`, while `v3` requires
+  `mod.optv3`. It expects matching module-cache entries in
+  `$SOAC_WORK_DIR/modules`; run a profile/benchmark pass first when the cache is
+  empty. Use `SOAC_PRECOMPILED_LIBRARY` to point runtime execution at the
+  resulting shared library.
 - `cargo run -p soac-inspector --bin decide_optimizations -- --counters <profile.bin> --out <root-dir>`
   Standalone optimization-decision planner. It loads the counter dump once,
   scans cached BlockPy modules under the output root by default, and writes
@@ -523,10 +527,10 @@ explicit ordinary
   `cargo run -p soac-inspector --bin print_optimization_plan -- --plan <mod.opt>`
   to pretty-print a legacy plan for inspection, or
   `cargo run -p soac-inspector --bin print_optimization_plan_v3 -- --plan <mod.optv3>`
-  to inspect a v3 artifact summary. In `SOAC_OPT_MODE=verify|apply`, runtime
-  specialization prefers a matching `mod.optv3` in the active module cache and
-  falls back to legacy `mod.opt` for decision-backed call, operator, getitem,
-  setitem, indexed-field, and branch specializations.
+  to inspect a v3 artifact summary. In `SOAC_OPT_MODE=verify|apply`,
+  `SOAC_OPT_PLAN_MODE` controls runtime plan selection: `auto` prefers a
+  matching `mod.optv3` in the active module cache and falls back to legacy
+  `mod.opt`, while `v3` requires the serialized v3 artifact.
 - `SOAC_CRANELIFT_OPT_LEVEL`
   Optional Cranelift process-JIT optimization level override:
   `none`, `speed`, or `speed_and_size`. Normal runtime and benchmark

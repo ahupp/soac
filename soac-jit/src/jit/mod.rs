@@ -9,12 +9,14 @@ use crate::config::{
     CraneliftTargetConfig, PythonModuleCacheSource, SpecializationMode,
     behavior_change_indexed_stores_enabled, counter_dump_input_path_from_env, jit_compile_workers,
     jit_refcount_emission_enabled, module_cache_root_from_env, module_optimization_plan_path,
-    module_optimization_plan_v3_path, opt_v3_validation_enabled,
+    module_optimization_plan_v3_path, opt_v3_validation_enabled, optimization_plan_mode_from_env,
     pre_optimization_module_cache_identity, profiled_cold_blocks_enabled, soac_work_dir_from_env,
     specialization_mode_from_env,
 };
 #[cfg(test)]
-use crate::config::{SOAC_JIT_EMIT_REFCOUNTS_ENV, SOAC_VALIDATE_OPT_V3_ENV};
+use crate::config::{
+    SOAC_JIT_EMIT_REFCOUNTS_ENV, SOAC_OPT_PLAN_MODE_ENV, SOAC_VALIDATE_OPT_V3_ENV,
+};
 use crate::counter::TopValueCounter;
 use crate::function_instantiation::{
     SOAC_JIT_MAKE_FUNCTION_WITH_CLOSURE_SYMBOL, make_function_kind_abi_tag,
@@ -13087,7 +13089,14 @@ fn load_planned_optimization_inputs_for_runtime_state(
     let Some(shared_state) = shared_state else {
         return Ok(PlannedOptimizationInputs::default());
     };
+    let plan_mode = optimization_plan_mode_from_env()?;
     let Some(cache_root) = module_cache_root_from_env()? else {
+        if plan_mode.requires_v3() {
+            return Err(format!(
+                "SOAC_OPT_PLAN_MODE=v3 requires SOAC_WORK_DIR/module cache to load mod.optv3 for module {}",
+                shared_state.module_name
+            ));
+        }
         return Ok(PlannedOptimizationInputs::default());
     };
     let cache_identity = pre_optimization_module_cache_identity(
@@ -13102,44 +13111,59 @@ fn load_planned_optimization_inputs_for_runtime_state(
         ],
     };
 
-    for source in candidate_sources.iter().copied() {
-        let path = module_optimization_plan_v3_path(
-            cache_root.as_path(),
-            source,
-            shared_state.module_name.as_str(),
-        )?;
-        if !path.exists() {
-            continue;
+    if plan_mode.allows_v3() {
+        for source in candidate_sources.iter().copied() {
+            let path = module_optimization_plan_v3_path(
+                cache_root.as_path(),
+                source,
+                shared_state.module_name.as_str(),
+            )?;
+            if !path.exists() {
+                continue;
+            }
+            let artifacts =
+                load_optimization_artifacts_v3(path.as_path()).map_err(|err| err.to_string())?;
+            validate_opt_v3_artifacts_for_module(
+                &artifacts,
+                shared_state.module_name.as_str(),
+                shared_state.source_hash,
+                cache_identity.as_str(),
+            )?;
+            return planned_optimization_inputs_from_v3_artifacts(&artifacts, shared_state);
         }
-        let artifacts =
-            load_optimization_artifacts_v3(path.as_path()).map_err(|err| err.to_string())?;
-        validate_opt_v3_artifacts_for_module(
-            &artifacts,
-            shared_state.module_name.as_str(),
-            shared_state.source_hash,
-            cache_identity.as_str(),
-        )?;
-        return planned_optimization_inputs_from_v3_artifacts(&artifacts, shared_state);
+        if plan_mode.requires_v3() {
+            return Err(format!(
+                "SOAC_OPT_PLAN_MODE=v3 requires mod.optv3 for module {} under {}",
+                shared_state.module_name,
+                cache_root.display()
+            ));
+        }
     }
 
-    for source in candidate_sources {
-        let path = module_optimization_plan_path(
-            cache_root.as_path(),
-            source,
-            shared_state.module_name.as_str(),
-        )?;
-        if !path.exists() {
-            continue;
+    if plan_mode.allows_legacy() {
+        for source in candidate_sources {
+            let path = module_optimization_plan_path(
+                cache_root.as_path(),
+                source,
+                shared_state.module_name.as_str(),
+            )?;
+            if !path.exists() {
+                continue;
+            }
+            let plan = load_optimization_plan(path.as_path()).map_err(|err| err.to_string())?;
+            plan.validate_for_module(
+                Some(source),
+                shared_state.module_name.as_str(),
+                shared_state.source_hash,
+                cache_identity.as_str(),
+            )
+            .map_err(|err| err.to_string())?;
+            return planned_optimization_inputs_for_shared_state(
+                &plan,
+                shared_state,
+                compile_session,
+            );
         }
-        let plan = load_optimization_plan(path.as_path()).map_err(|err| err.to_string())?;
-        plan.validate_for_module(
-            Some(source),
-            shared_state.module_name.as_str(),
-            shared_state.source_hash,
-            cache_identity.as_str(),
-        )
-        .map_err(|err| err.to_string())?;
-        return planned_optimization_inputs_for_shared_state(&plan, shared_state, compile_session);
     }
     #[cfg(test)]
     if let Some(inputs) = synthesize_test_planned_optimization_inputs_for_runtime_state(
@@ -13509,21 +13533,32 @@ fn planned_optimization_inputs_for_precompile(
     module: &BlockPyModule<CodegenModuleShape>,
 ) -> Result<PlannedOptimizationInputs, String> {
     let Some(plan_input) = plan_input else {
+        if optimization_plan_mode_from_env()?.requires_v3() {
+            return Err("SOAC_OPT_PLAN_MODE=v3 requires a precompile mod.optv3 input".to_string());
+        }
         return Ok(PlannedOptimizationInputs::default());
     };
-    if let Some(path) = plan_input.v3_path.filter(|path| path.exists()) {
-        let artifacts = load_optimization_artifacts_v3(path).map_err(|err| err.to_string())?;
-        validate_opt_v3_artifacts_for_module(
-            &artifacts,
-            module_name,
-            source_hash,
-            plan_input.cache_identity,
-        )?;
-        return planned_optimization_inputs_from_v3_artifacts_for_codegen_module(
-            &artifacts, module,
-        );
+    let plan_mode = optimization_plan_mode_from_env()?;
+    if plan_mode.allows_v3() {
+        if let Some(path) = plan_input.v3_path.filter(|path| path.exists()) {
+            let artifacts = load_optimization_artifacts_v3(path).map_err(|err| err.to_string())?;
+            validate_opt_v3_artifacts_for_module(
+                &artifacts,
+                module_name,
+                source_hash,
+                plan_input.cache_identity,
+            )?;
+            return planned_optimization_inputs_from_v3_artifacts_for_codegen_module(
+                &artifacts, module,
+            );
+        }
+        if plan_mode.requires_v3() {
+            return Err(format!(
+                "SOAC_OPT_PLAN_MODE=v3 requires precompile mod.optv3 for module {module_name}"
+            ));
+        }
     }
-    if !plan_input.path.exists() {
+    if !plan_mode.allows_legacy() || !plan_input.path.exists() {
         return Ok(PlannedOptimizationInputs::default());
     }
     let plan = load_optimization_plan(plan_input.path).map_err(|err| err.to_string())?;
@@ -13828,6 +13863,7 @@ impl<'a> SpecializationProfile<'a> {
 
     fn has_specialization_inputs(&self) -> bool {
         !self.planned_evidence.is_empty()
+            || !self.opt_v3_exact_int_branch_artifacts.is_empty()
             || (self.profiled_cold_blocks && self.has_existing_counter_dump())
     }
 

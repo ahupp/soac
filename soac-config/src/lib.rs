@@ -5,6 +5,7 @@ use std::sync::Arc;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 pub const SOAC_OPT_MODE_ENV: &str = "SOAC_OPT_MODE";
+pub const SOAC_OPT_PLAN_MODE_ENV: &str = "SOAC_OPT_PLAN_MODE";
 pub const SOAC_WORK_DIR_ENV: &str = "SOAC_WORK_DIR";
 pub const SOAC_CRANELIFT_OPT_LEVEL_ENV: &str = "SOAC_CRANELIFT_OPT_LEVEL";
 pub const SOAC_ENABLE_PROFILED_COLD_BLOCKS_ENV: &str = "SOAC_ENABLE_PROFILED_COLD_BLOCKS";
@@ -26,6 +27,38 @@ pub enum SpecializationMode {
     Profile,
     Verify,
     Apply,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OptimizationPlanMode {
+    Auto,
+    Legacy,
+    V3,
+}
+
+impl OptimizationPlanMode {
+    pub fn from_str(mode: &str) -> Result<Self, String> {
+        match mode.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "legacy" => Ok(Self::Legacy),
+            "v3" => Ok(Self::V3),
+            value => Err(format!(
+                "unrecognized optimization plan mode {value:?}; expected one of: auto, legacy, v3"
+            )),
+        }
+    }
+
+    pub const fn allows_v3(self) -> bool {
+        matches!(self, Self::Auto | Self::V3)
+    }
+
+    pub const fn allows_legacy(self) -> bool {
+        matches!(self, Self::Auto | Self::Legacy)
+    }
+
+    pub const fn requires_v3(self) -> bool {
+        matches!(self, Self::V3)
+    }
 }
 
 impl SpecializationMode {
@@ -93,6 +126,7 @@ pub struct SoacLogConfig {
 pub struct SoacEnvConfig {
     cranelift_opt_level: String,
     specialization_mode: Option<SpecializationMode>,
+    optimization_plan_mode: OptimizationPlanMode,
     soac_work_dir: Option<PathBuf>,
     profiled_cold_blocks_enabled: bool,
     opt_v3_validation_enabled: bool,
@@ -168,6 +202,8 @@ impl SoacEnvConfig {
         )?;
         let specialization_mode =
             parse_optional_specialization_mode(env_string(SOAC_OPT_MODE_ENV)?.as_deref())?;
+        let optimization_plan_mode =
+            parse_optional_optimization_plan_mode(env_string(SOAC_OPT_PLAN_MODE_ENV)?.as_deref())?;
         let soac_work_dir = env_path(SOAC_WORK_DIR_ENV)?;
         let profiled_cold_blocks_enabled = env_bool(SOAC_ENABLE_PROFILED_COLD_BLOCKS_ENV, false)?;
         let opt_v3_validation_enabled = env_bool(SOAC_VALIDATE_OPT_V3_ENV, false)?;
@@ -190,6 +226,7 @@ impl SoacEnvConfig {
         Ok(Self {
             cranelift_opt_level,
             specialization_mode,
+            optimization_plan_mode,
             soac_work_dir,
             profiled_cold_blocks_enabled,
             opt_v3_validation_enabled,
@@ -229,6 +266,10 @@ impl SoacEnvConfig {
 
     pub fn specialization_mode(&self) -> Option<SpecializationMode> {
         self.specialization_mode
+    }
+
+    pub fn optimization_plan_mode(&self) -> OptimizationPlanMode {
+        self.optimization_plan_mode
     }
 
     pub fn soac_work_dir(&self) -> Option<&Path> {
@@ -306,6 +347,7 @@ impl Default for SoacEnvConfig {
         Self {
             cranelift_opt_level: "speed".to_string(),
             specialization_mode: None,
+            optimization_plan_mode: OptimizationPlanMode::Auto,
             soac_work_dir: None,
             profiled_cold_blocks_enabled: false,
             opt_v3_validation_enabled: false,
@@ -396,6 +438,16 @@ fn parse_optional_specialization_mode(
         .map_err(|err| invalid_env_value(SOAC_OPT_MODE_ENV, mode, err))
 }
 
+fn parse_optional_optimization_plan_mode(
+    mode: Option<&str>,
+) -> Result<OptimizationPlanMode, String> {
+    let Some(mode) = mode else {
+        return Ok(OptimizationPlanMode::Auto);
+    };
+    OptimizationPlanMode::from_str(mode)
+        .map_err(|err| invalid_env_value(SOAC_OPT_PLAN_MODE_ENV, mode, err))
+}
+
 fn parse_optional_compile_mode(raw: Option<&str>) -> Result<CompileMode, String> {
     let Some(raw) = raw else {
         return Ok(CompileMode::Lazy);
@@ -422,6 +474,10 @@ fn parse_optional_positive_usize(name: &str, raw: Option<&str>) -> Result<Option
 
 pub fn specialization_mode_from_env() -> Result<Option<SpecializationMode>, String> {
     Ok(SoacEnvConfig::from_env()?.specialization_mode())
+}
+
+pub fn optimization_plan_mode_from_env() -> Result<OptimizationPlanMode, String> {
+    Ok(SoacEnvConfig::from_env()?.optimization_plan_mode())
 }
 
 pub fn soac_work_dir_from_env() -> Result<Option<PathBuf>, String> {
@@ -571,6 +627,7 @@ mod tests {
     fn clear_soac_config_env() -> Vec<EnvVarGuard> {
         vec![
             EnvVarGuard::remove(SOAC_OPT_MODE_ENV),
+            EnvVarGuard::remove(SOAC_OPT_PLAN_MODE_ENV),
             EnvVarGuard::remove(SOAC_WORK_DIR_ENV),
             EnvVarGuard::remove(SOAC_CRANELIFT_OPT_LEVEL_ENV),
             EnvVarGuard::remove(SOAC_ENABLE_PROFILED_COLD_BLOCKS_ENV),
@@ -598,6 +655,24 @@ mod tests {
     }
 
     #[test]
+    fn optimization_plan_mode_from_str_rejects_unknown_values() {
+        assert_eq!(
+            OptimizationPlanMode::from_str("auto").unwrap(),
+            OptimizationPlanMode::Auto
+        );
+        assert_eq!(
+            OptimizationPlanMode::from_str("legacy").unwrap(),
+            OptimizationPlanMode::Legacy
+        );
+        assert_eq!(
+            OptimizationPlanMode::from_str("v3").unwrap(),
+            OptimizationPlanMode::V3
+        );
+        assert!(OptimizationPlanMode::from_str("").is_err());
+        assert!(OptimizationPlanMode::from_str("bogus").is_err());
+    }
+
+    #[test]
     fn env_config_defaults_only_when_vars_are_absent() {
         let _lock = env_lock().lock().unwrap();
         let _guards = clear_soac_config_env();
@@ -605,6 +680,7 @@ mod tests {
         let config = SoacEnvConfig::from_env().unwrap();
 
         assert_eq!(config.specialization_mode(), None);
+        assert_eq!(config.optimization_plan_mode(), OptimizationPlanMode::Auto);
         assert_eq!(config.cranelift_opt_level(), "speed");
         assert_eq!(config.compile_mode(), CompileMode::Lazy);
         assert_eq!(config.jit_compile_workers(), None);
@@ -631,6 +707,7 @@ mod tests {
 
         for (name, value) in [
             (SOAC_OPT_MODE_ENV, "bogus"),
+            (SOAC_OPT_PLAN_MODE_ENV, "bogus"),
             (SOAC_CRANELIFT_OPT_LEVEL_ENV, "fastest"),
             (SOAC_ENABLE_PROFILED_COLD_BLOCKS_ENV, "maybe"),
             (SOAC_VALIDATE_OPT_V3_ENV, "maybe"),
