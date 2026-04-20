@@ -269,6 +269,13 @@ typed variables must use recognized values. Boolean knobs accept `1`, `true`,
   `mod.opt`. `legacy` ignores `mod.optv3`. `v3` requires `mod.optv3` and errors
   instead of falling back to a legacy plan.
 
+- `SOAC_DECIDE_OPT_MODE=legacy|v3`
+  Select which artifact family the Justfile profile-to-plan recipes generate.
+  The default is `v3`, so `just benchmark`, `just benchmark-verify`, and
+  `just precompile-shared-library` write `mod.optv3` from cached unoptimized
+  BlockPy modules and raw profile evidence. Set `legacy` only when comparing the
+  old planner path.
+
 Notes:
 - In normal workflows set one `SOAC_WORK_DIR` for the whole multi-pass
   run and change only `SOAC_OPT_MODE`.
@@ -345,10 +352,11 @@ tree, with pystone benchmark runs writing to `work/bench/`.
   `verify.bin`, `events.jsonl`), generated optimization plans, and the
   revision-scoped BlockPy module cache under `counters/modules`; it does not
   run `perf` and it does not build inspector-based counter/CLIF artifacts. The
-  profile pass is immediately followed by `decide_optimizations`, so verify and
-  apply consume planned decisions rather than raw counters. The specialized
-  apply phase reports both the default refcounts-enabled throughput and an
-  additional unsound
+  profile pass is immediately followed by `decide_optimizations --mode v3` by
+  default, so verify and apply consume serialized v3 plan artifacts rather than
+  raw counters or legacy decisions. Set `SOAC_DECIDE_OPT_MODE=legacy` to compare
+  the old planner path. The specialized apply phase reports both the default
+  refcounts-enabled throughput and an additional unsound
   `SOAC_JIT_EMIT_REFCOUNTS=0` diagnostic throughput.
 
 - `just benchmark-deep-profile`
@@ -387,8 +395,8 @@ tree, with pystone benchmark runs writing to `work/bench/`.
   Use `cargo run -p soac-inspector --bin print_optimization_plan -- --plan <mod.opt>`
   to pretty-print a legacy plan for inspection, or
   `cargo run -p soac-inspector --bin print_optimization_plan_v3 -- --plan <mod.optv3>`
-  to inspect a v3 artifact summary. `just benchmark` runs the legacy mode after
-  the profile pass today. In `SOAC_OPT_MODE=verify|apply`,
+  to inspect a v3 artifact summary. `just benchmark` runs v3 mode after the
+  profile pass by default. In `SOAC_OPT_MODE=verify|apply`,
   `SOAC_OPT_PLAN_MODE` controls runtime plan selection: `auto` prefers a
   matching `mod.optv3` in the active module cache and falls back to legacy
   `mod.opt`, while `v3` requires the serialized v3 artifact.

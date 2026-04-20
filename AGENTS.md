@@ -436,15 +436,16 @@ explicit ordinary
   `decide_optimizations` to turn that evidence plus cached BlockPy modules into
   per-module optimization plans before entering `verify` or `apply`. Use
   `--mode v3` to write `mod.optv3` from raw profile evidence and cached
-  unoptimized BlockPy modules. `SOAC_OPT_PLAN_MODE=auto|legacy|v3` controls
-  runtime plan selection for `verify`/`apply`: the default `auto` prefers
-  `mod.optv3` and falls back to legacy `mod.opt`, `legacy` ignores `mod.optv3`,
-  and `v3` requires `mod.optv3` instead of falling back. `verify` exercises
-  indexed store fast paths so hit/fallback counters measure the specialized
-  steady-state path. `apply` still skips counter dump files, but when event
-  logging is enabled it records indexed specialization hit/fallback counts and
-  deopt-entry counts long enough to emit `soac_specialization_runtime` summary
-  events.
+  unoptimized BlockPy modules. Justfile profile-to-plan recipes default to this
+  v3 mode; set `SOAC_DECIDE_OPT_MODE=legacy` only when comparing the old
+  planner path. `SOAC_OPT_PLAN_MODE=auto|legacy|v3` controls runtime plan
+  selection for `verify`/`apply`: the default `auto` prefers `mod.optv3` and
+  falls back to legacy `mod.opt`, `legacy` ignores `mod.optv3`, and `v3`
+  requires `mod.optv3` instead of falling back. `verify` exercises indexed store
+  fast paths so hit/fallback counters measure the specialized steady-state path.
+  `apply` still skips counter dump files, but when event logging is enabled it
+  records indexed specialization hit/fallback counts and deopt-entry counts long
+  enough to emit `soac_specialization_runtime` summary events.
 - `SOAC_ENABLE_PROFILED_COLD_BLOCKS`
   Optional opt-in for replaying `block_entry` counters from
   `$SOAC_WORK_DIR/profile.bin` as Cranelift `cold` block hints during
