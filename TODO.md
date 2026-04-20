@@ -17,6 +17,7 @@
 ## Perf-to-investigate
 
  * Statically linking against libpython.a
+ * Try bpftime for userspace counters.
  * Decide how much codegen should depend on known imports versus relying only on specialization feedback for cross-module assumptions.
 
  * Value tracing (types, escape analysis)
