@@ -99,7 +99,7 @@ fn tracked_core_blockpy_with_yield_only(source: &str) -> BlockPyModule<CoreModul
 
 fn assert_all_targets_present<P, S>(module: &BlockPyModule<P>)
 where
-    P: crate::block_py::ModuleShape<Instr = S> + crate::block_py::BlockPyPrettyPrinter,
+    P: crate::block_py::ModuleShape<Instr = S> + crate::block_py::BlockPyFormat,
     S: crate::block_py::Instr + std::fmt::Debug,
     P::Instr: std::fmt::Debug,
 {

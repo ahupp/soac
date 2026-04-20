@@ -1,24 +1,24 @@
-use super::{Block, BlockPyPrettyPrinter, Instr, ModuleShape, ResolvedName};
+use super::{Block, BlockPyFormat, Instr, ModuleShape, ResolvedName};
 use crate::passes::{
     CodegenModuleShape, CoreModuleShape, CoreModuleShapeWithAwaitAndYield,
     CoreModuleShapeWithYield, ResolvedStorageModuleShape,
 };
 
-macro_rules! impl_default_blockpy_pretty_printer {
+macro_rules! impl_default_blockpy_format {
     ($($pass:ty),* $(,)?) => {
         $(
-            impl BlockPyPrettyPrinter for $pass {}
+            impl BlockPyFormat for $pass {}
         )*
     };
 }
 
-impl_default_blockpy_pretty_printer!(
+impl_default_blockpy_format!(
     CoreModuleShapeWithAwaitAndYield,
     CoreModuleShapeWithYield,
     CoreModuleShape,
 );
 
-impl BlockPyPrettyPrinter for ResolvedStorageModuleShape {
+impl BlockPyFormat for ResolvedStorageModuleShape {
     fn block_metadata_lines(block: &Block<Self::Instr>) -> Vec<String> {
         let mut lines = Vec::new();
         if let Some(exc_edge) = &block.exc_edge {
@@ -31,7 +31,7 @@ impl BlockPyPrettyPrinter for ResolvedStorageModuleShape {
     }
 }
 
-impl BlockPyPrettyPrinter for CodegenModuleShape {
+impl BlockPyFormat for CodegenModuleShape {
     fn block_metadata_lines(block: &Block<Self::Instr>) -> Vec<String> {
         render_resolved_storage_block_metadata::<Self>(block)
     }

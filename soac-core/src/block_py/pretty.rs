@@ -13,7 +13,7 @@ enum IfBranchKind {
     Else,
 }
 
-pub trait BlockPyPrettyPrinter: ModuleShape {
+pub trait BlockPyFormat: ModuleShape {
     fn block_metadata_lines(block: &Block<Self::Instr>) -> Vec<String>
     where
         Self: Sized,
@@ -32,7 +32,7 @@ pub trait PrettyPrint {
 
 impl<P> PrettyPrint for BlockPyModule<P>
 where
-    P: BlockPyPrettyPrinter,
+    P: BlockPyFormat,
     P::Instr: fmt::Debug,
 {
     fn pretty_print(&self) -> String {
@@ -46,7 +46,7 @@ where
 
 pub fn blockpy_module_to_string<P>(module: &BlockPyModule<P>) -> String
 where
-    P: BlockPyPrettyPrinter,
+    P: BlockPyFormat,
     P::Instr: fmt::Debug,
 {
     let mut formatter = BlockPyFormatter::<DebugInlineExprRenderer>::default();
@@ -95,7 +95,7 @@ impl<R> BlockPyFormatter<R> {
 
     fn write_module<P>(&mut self, module: &BlockPyModule<P>)
     where
-        P: BlockPyPrettyPrinter,
+        P: BlockPyFormat,
         R: InlineExprRenderer<P::Instr>,
     {
         for function in &module.callable_defs {
@@ -108,7 +108,7 @@ impl<R> BlockPyFormatter<R> {
 
     fn write_function<P>(&mut self, function: &BlockPyFunction<P>)
     where
-        P: BlockPyPrettyPrinter,
+        P: BlockPyFormat,
         R: InlineExprRenderer<P::Instr>,
     {
         let params = format_parameters(&function.params);
@@ -166,7 +166,7 @@ impl<R> BlockPyFormatter<R> {
         block_index: usize,
         referenced_labels: &HashSet<BlockLabel>,
     ) where
-        P: BlockPyPrettyPrinter,
+        P: BlockPyFormat,
         R: InlineExprRenderer<P::Instr>,
     {
         let block = &function.blocks[block_index];
@@ -199,7 +199,7 @@ impl<R> BlockPyFormatter<R> {
         block: &Block<P::Instr>,
         referenced_labels: &HashSet<BlockLabel>,
     ) where
-        P: BlockPyPrettyPrinter,
+        P: BlockPyFormat,
         R: InlineExprRenderer<P::Instr>,
     {
         if block.body.is_empty() {
@@ -246,7 +246,7 @@ impl<R> BlockPyFormatter<R> {
         term: &BlockTerm<P::Instr>,
         referenced_labels: &HashSet<BlockLabel>,
     ) where
-        P: BlockPyPrettyPrinter,
+        P: BlockPyFormat,
         R: InlineExprRenderer<P::Instr>,
     {
         match term {
@@ -467,7 +467,7 @@ struct BlockRenderLayout {
 impl BlockRenderLayout {
     fn new<P>(function: &BlockPyFunction<P>) -> Self
     where
-        P: BlockPyPrettyPrinter,
+        P: BlockPyFormat,
     {
         let block_count = function.blocks.len();
         if block_count == 0 {
@@ -538,7 +538,7 @@ impl BlockRenderLayout {
 
 fn sort_block_indices_by_label<P>(indices: &mut [usize], function: &BlockPyFunction<P>)
 where
-    P: BlockPyPrettyPrinter,
+    P: BlockPyFormat,
 {
     indices.sort_by_key(|index| function.blocks[*index].label);
 }
@@ -550,7 +550,7 @@ fn compute_inline_if_term_targets<P>(
     immediate_dominators: &[Option<usize>],
 ) -> (HashMap<(usize, IfBranchKind), usize>, HashSet<usize>)
 where
-    P: BlockPyPrettyPrinter,
+    P: BlockPyFormat,
 {
     let mut targets = HashMap::new();
     let mut inlined_blocks = HashSet::new();
