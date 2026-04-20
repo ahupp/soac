@@ -19,6 +19,7 @@ serde_json = "1"
 soac-jit = { path = "../soac-jit" }
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
 tower-http = { version = "0.6", features = ["fs"] }
+tracing = "0.1"
 
 [dev-dependencies]
 http-body-util = "0.1"

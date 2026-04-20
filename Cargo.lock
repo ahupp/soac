@@ -1723,16 +1723,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "soac-blockpy"
-version = "0.1.0"
-dependencies = [
- "serde_json",
- "soac-config",
- "soac-lowering",
- "tracing",
-]
-
-[[package]]
 name = "soac-config"
 version = "0.1.0"
 dependencies = [
@@ -1777,6 +1767,7 @@ dependencies = [
  "tokio",
  "tower",
  "tower-http",
+ "tracing",
 ]
 
 [[package]]

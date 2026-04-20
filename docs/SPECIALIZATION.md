@@ -57,7 +57,7 @@ The hot streams consumed by the current replay path are:
   - Instrumented for `Call` expressions with no keywords and only
     positional arguments in
     `instrument_bb_module_with_call_target_counters`, at
-    `soac-blockpy/src/passes/trace/mod.rs:186`.
+    `soac-lowering/src/passes/trace/mod.rs:235`.
   - Records observed packed `FunctionId` values via the runtime
     heavy-hitter counter path.
   - Consumed from the binary counter dump in
@@ -67,7 +67,7 @@ The hot streams consumed by the current replay path are:
 - `operator_hot_shapes`
   - Instrumented for candidate `BinOp` and `UnaryOp` expressions in
     `instrument_bb_module_with_call_target_counters`, at
-    `soac-blockpy/src/passes/trace/mod.rs:190`.
+    `soac-lowering/src/passes/trace/mod.rs:235`.
   - Records packed operand shape tags, currently exact-type tags only.
   - Consumed from the binary counter dump in
     `collect_operator_specializations_for_function`, at
@@ -86,7 +86,7 @@ The hot streams consumed by the current replay path are:
 - `block_entry`
   - Instrumented for every lowered basic block in
     `instrument_bb_module_with_block_entry_counters`, at
-    `soac-blockpy/src/passes/trace/mod.rs:107`.
+    `soac-lowering/src/passes/trace/mod.rs:112`.
   - Records scalar visit counts keyed by `(function_id, block_label)`.
   - Consumed from the binary counter dump in
     `collect_block_entry_counts_for_function`, then replayed as
@@ -126,7 +126,7 @@ Verify-mode refcount counters are scalar per-function counters:
 - `runtime_incref` / `runtime_decref`
   - Instrumented only in `SOAC_OPT_MODE=verify` by
     `instrument_bb_module_with_refcount_counters`, at
-    `soac-blockpy/src/passes/trace/mod.rs`.
+    `soac-lowering/src/passes/trace/mod.rs:136`.
   - Count applied SOAC runtime refcount operations emitted through the
     JIT refcount helper path. Immortal or null values skipped by the
     runtime helper do not increment these counters.
@@ -410,7 +410,7 @@ full guarded call blocks today.
   `FunctionId` metadata against a profiled target, and produces a boolean value
   for an ordinary `IfTerm`.
 - `rewrite_profiled_function_call_store_sites`, at
-  `soac-blockpy/src/passes/direct_call_transform.rs`, rewrites simple
+  `soac-lowering/src/passes/direct_call_transform.rs`, rewrites simple
   `Store(name, Call(...))` sites into explicit BlockPy CFG:
   - evaluate the callable into one generated compiler temp
   - evaluate each positional argument once, left-to-right, into generated
@@ -844,7 +844,7 @@ exact-list/exact-int arms and share generic fallback paths.
   - `InplaceMatMul`
 - Candidate detection is in
   `instrument_bb_module_with_call_target_counters`, at
-  `soac-blockpy/src/passes/trace/mod.rs:190`.
+  `soac-lowering/src/passes/trace/mod.rs:235`.
 - Shapes are packed exact-type tags defined in
   `soac-jit/src/operator_specialization.rs:4`.
 - Today the only exact type tag is `ExactTypeTag::Int`.
@@ -902,7 +902,7 @@ exact-list/exact-int arms and share generic fallback paths.
 - Source input is `operator_hot_shapes`.
 - Candidate operators are all `UnaryOp` nodes, via
   `instrument_bb_module_with_call_target_counters`, at
-  `soac-blockpy/src/passes/trace/mod.rs:190`.
+  `soac-lowering/src/passes/trace/mod.rs:235`.
 - Shapes are packed exact-type tags from
   `soac-jit/src/operator_specialization.rs:4`.
 

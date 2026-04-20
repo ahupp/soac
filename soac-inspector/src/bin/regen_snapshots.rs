@@ -5,11 +5,11 @@ use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use soac_blockpy::block_py::BlockPyModule;
-use soac_blockpy::fixture::{parse_fixture, render_fixture, FixtureBlock};
-use soac_blockpy::lower_python_to_blockpy_for_testing;
-use soac_blockpy::passes::CodegenModuleShape;
-use tracing::{enabled, trace, Level};
+use soac_core::block_py::BlockPyModule;
+use soac_lowering::fixture::{FixtureBlock, parse_fixture, render_fixture};
+use soac_lowering::passes::CodegenModuleShape;
+use soac_lowering::{LoweringResult, lower_python_to_blockpy_for_testing};
+use tracing::{Level, enabled, trace};
 
 struct SnapshotSummaryRow {
     case_name: String,
@@ -73,10 +73,7 @@ fn qualified_case_name(path: &Path, block: &FixtureBlock) -> Result<String, Stri
     Ok(format!("{fixture_name}::{}", block.name))
 }
 
-fn render_blockpy_snapshot(
-    _source: &str,
-    result: &soac_blockpy::LoweringResult,
-) -> (String, usize, usize) {
+fn render_blockpy_snapshot(_source: &str, result: &LoweringResult) -> (String, usize, usize) {
     let core_blockpy = result.pass_tracker.pass_core_blockpy_with_await_and_yield();
     let blockpy_rendered = result
         .pass_tracker
@@ -424,4 +421,5 @@ fn main() -> Result<(), String> {
 }
 
 #[cfg(test)]
+#[path = "regen_snapshots/test.rs"]
 mod test;

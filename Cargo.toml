@@ -1,6 +1,5 @@
 [workspace]
 members = [
-    "soac-blockpy",
     "soac-core",
     "soac-profile",
     "soac-config",
@@ -12,7 +11,6 @@ members = [
     "soac-macros",
 ]
 default-members = [
-    "soac-blockpy",
     "soac-core",
     "soac-profile",
     "soac-config",

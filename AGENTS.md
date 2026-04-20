@@ -573,7 +573,7 @@ the mode between passes. `none` is the explicit ordinary
 
 ### Debugging aids
 
-- To inspect transformed output quickly, run `cargo run --bin diet-python <file.py>`.
+- To inspect transformed output quickly, run `cargo run -p soac-inspector --bin diet-python <file.py>`.
 - For BB/JIT inspection, `cargo run -p soac-inspector --bin render_jit_clif -- <source> <function_id>`.
 - To trace BB execution, set `SOAC_EXEC_TRACE` to `all`, `all:params`, `<exact-qualname>`, or `<exact-qualname>:params`.
 

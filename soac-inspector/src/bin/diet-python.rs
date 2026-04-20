@@ -1,7 +1,7 @@
 use std::{env, fs, process};
 
 use serde_json::json;
-use soac_blockpy::{lower_python_to_blockpy_for_testing, ruff_ast_to_string};
+use soac_lowering::{lower_python_to_blockpy_for_testing, ruff_ast_to_string};
 
 const USAGE: &str = "usage: diet-python [--timing] <python-file>";
 

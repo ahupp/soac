@@ -148,7 +148,7 @@ typed variables must use recognized values. Boolean knobs accept `1`, `true`,
 
 - `SOAC_EXEC_TRACE=<selector>`
   In `fn parse_trace_env`, at
-  [soac-blockpy/src/passes/trace/mod.rs:15](/home/adam/project/soac-profile/soac-blockpy/src/passes/trace/mod.rs#L15),
+  [soac-lowering/src/passes/trace/mod.rs:20](/home/adam/project/soac-profile/soac-lowering/src/passes/trace/mod.rs#L20),
   enable basic-block tracing. Accepted forms are:
   - `all`, `1`, `*`, or empty selector: trace all functions
   - `<exact-qualname>`: trace one function
