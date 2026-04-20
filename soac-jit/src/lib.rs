@@ -20,6 +20,7 @@ pub mod counter;
 pub mod module_constants;
 pub mod module_type;
 pub mod optimization_plan;
+pub mod optimization_plan_v3;
 pub mod session;
 
 pub use session::{CompileSession, CompileSessionId, allocate_compile_session_id};
