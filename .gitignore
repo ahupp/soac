@@ -9,6 +9,7 @@ cpython_test_run.log
 cpython_full_test_run.log
 cpython_full_test_run_summary.txt
 /snapshot
+/soac-module-cache/
 /work/tmp
 /work/
 /tmp/
