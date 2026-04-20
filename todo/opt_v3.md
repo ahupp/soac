@@ -65,14 +65,14 @@ Implemented:
 - `optimization_plan_v3`: full plan schema, conversion signatures, operation
   signatures, replay-safety validation, and structural validation.
 - `optimization_alternatives_v3`: default catalog entries for generic Python
-  add/all-rich-compare, exact compact-int add/all-rich-compare, truthiness, and
-  materialization.
+  add/sub/mul/all-rich-compare, exact compact-int add/sub/mul/all-rich-compare,
+  truthiness, and materialization.
 - `optimization_region_v3`: conservative branch/return region extraction that
   preserves evaluation order and declines unsupported blocks explicitly.
 - `optimization_planner_v3`: bounded planner for exact-compact-`int` direct
-  comparison branches, `a + b > 0` branches, `return a + b` add returns, and
-  `return a < b` comparison returns, producing hot and local-fallback
-  `RegionPlan`s.
+  comparison branches, `a + b > 0` branches, `return a + b`/`return a - b`/
+  `return a * b` arithmetic returns, and `return a < b` comparison returns,
+  producing hot and local-fallback `RegionPlan`s.
 - `optimization_emit_v3`: validation-gated mechanical emitter over selected v3
   plan nodes and exits.
 - `optimization_evidence_v3`: bridge from existing `FunctionProfileEvidence`
@@ -96,13 +96,14 @@ Implemented:
   artifacts into the JIT build path, where codegen validates that the artifact
   function identity matches the function being compiled.
 - JIT term lowering now consumes matching exact-int direct-compare branch,
-  add/compare branch, add-return, and comparison-return artifacts by
+  add/compare branch, add/sub/mul-return, and comparison-return artifacts by
   interpreting the mechanical hot region and its local generic fallback.
   Unsupported or absent v3 regions continue through the existing lowering path.
 
 Remaining legacy-only families are intentionally visible:
 
-- remaining arithmetic, bitwise, and unary exact-int value-producing operators;
+- remaining division/modulo/shift, bitwise, and unary exact-int value-producing
+  operators;
 - profiled direct calls;
 - exact-list getitem/setitem;
 - indexed globals and indexed fields.

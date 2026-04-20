@@ -302,9 +302,13 @@ pub struct OperationNode {
 #[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum PlannedOp {
     PyNumberAdd,
+    PyNumberSubtract,
+    PyNumberMultiply,
     PyObjectRichCompare { op: RichCompareOp },
     PyObjectIsTrue,
     CheckedI64Add,
+    CheckedI64Sub,
+    CheckedI64Mul,
     I64CompareToBool01 { op: RichCompareOp },
     DirectHelper { name: String },
 }
@@ -837,13 +841,13 @@ fn validate_materialize(region: RegionId, materialize: &MaterializeNode, errors:
 
 fn validate_operation(region: RegionId, operation: &OperationNode, errors: &mut Vec<String>) {
     match &operation.op {
-        PlannedOp::PyNumberAdd => {
-            validate_python_operation_inputs(region, operation, 2, "PyNumberAdd", errors);
+        PlannedOp::PyNumberAdd | PlannedOp::PyNumberSubtract | PlannedOp::PyNumberMultiply => {
+            validate_python_operation_inputs(region, operation, 2, "PyNumberBinary", errors);
             validate_operation_output(
                 region,
                 operation,
                 Some(Rep::PyObjectOwned),
-                "PyNumberAdd",
+                "PyNumberBinary",
                 errors,
             );
         }
@@ -876,6 +880,26 @@ fn validate_operation(region: RegionId, operation: &OperationNode, errors: &mut 
                 errors,
             );
             validate_operation_output(region, operation, Some(Rep::I64), "CheckedI64Add", errors);
+        }
+        PlannedOp::CheckedI64Sub => {
+            validate_exact_inputs(
+                region,
+                operation,
+                &[Rep::I64, Rep::I64],
+                "CheckedI64Sub",
+                errors,
+            );
+            validate_operation_output(region, operation, Some(Rep::I64), "CheckedI64Sub", errors);
+        }
+        PlannedOp::CheckedI64Mul => {
+            validate_exact_inputs(
+                region,
+                operation,
+                &[Rep::I64, Rep::I64],
+                "CheckedI64Mul",
+                errors,
+            );
+            validate_operation_output(region, operation, Some(Rep::I64), "CheckedI64Mul", errors);
         }
         PlannedOp::I64CompareToBool01 { .. } => {
             validate_exact_inputs(

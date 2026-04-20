@@ -79,9 +79,13 @@ pub enum MechanicalStepOp {
 #[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum MechanicalOperation {
     PyNumberAdd,
+    PyNumberSubtract,
+    PyNumberMultiply,
     PyObjectRichCompare { op: RichCompareOp },
     PyObjectIsTrue,
     CheckedI64Add,
+    CheckedI64Sub,
+    CheckedI64Mul,
     I64CompareToBool01 { op: RichCompareOp },
     DirectHelper { name: String },
 }
@@ -90,9 +94,13 @@ impl From<&PlannedOp> for MechanicalOperation {
     fn from(value: &PlannedOp) -> Self {
         match value {
             PlannedOp::PyNumberAdd => Self::PyNumberAdd,
+            PlannedOp::PyNumberSubtract => Self::PyNumberSubtract,
+            PlannedOp::PyNumberMultiply => Self::PyNumberMultiply,
             PlannedOp::PyObjectRichCompare { op } => Self::PyObjectRichCompare { op: *op },
             PlannedOp::PyObjectIsTrue => Self::PyObjectIsTrue,
             PlannedOp::CheckedI64Add => Self::CheckedI64Add,
+            PlannedOp::CheckedI64Sub => Self::CheckedI64Sub,
+            PlannedOp::CheckedI64Mul => Self::CheckedI64Mul,
             PlannedOp::I64CompareToBool01 { op } => Self::I64CompareToBool01 { op: *op },
             PlannedOp::DirectHelper { name } => Self::DirectHelper { name: name.clone() },
         }

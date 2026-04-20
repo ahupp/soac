@@ -23,6 +23,10 @@ impl AlternativeCatalog {
             alternatives: vec![
                 generic_binary_add(),
                 exact_compact_int_add(),
+                generic_binary_subtract(),
+                exact_compact_int_subtract(),
+                generic_binary_multiply(),
+                exact_compact_int_multiply(),
                 generic_rich_compare("binary.eq.py_richcompare", BinOpKind::Eq, RichCompareOp::Eq),
                 exact_compact_int_compare(
                     "binary.eq.exact_compact_int.i32bool",
@@ -529,7 +533,7 @@ fn validate_operation_emission(
     errors: &mut Vec<String>,
 ) {
     match op {
-        PlannedOp::PyNumberAdd => {
+        PlannedOp::PyNumberAdd | PlannedOp::PyNumberSubtract | PlannedOp::PyNumberMultiply => {
             validate_catalog_operation_signature(
                 id,
                 alternative,
@@ -556,7 +560,7 @@ fn validate_operation_emission(
                 errors,
             );
         }
-        PlannedOp::CheckedI64Add => {
+        PlannedOp::CheckedI64Add | PlannedOp::CheckedI64Sub | PlannedOp::CheckedI64Mul => {
             validate_catalog_operation_signature(
                 id,
                 alternative,
@@ -717,6 +721,130 @@ fn exact_compact_int_add() -> LoweringAlternative {
             compile: 2,
         },
         rationale: "exact compact PyLong operands can use checked i64 addition before materialization",
+    }
+}
+
+fn generic_binary_subtract() -> LoweringAlternative {
+    LoweringAlternative {
+        id: AlternativeId::new("binary.sub.py_generic"),
+        op: SemanticOpKind::Binary { op: BinOpKind::Sub },
+        input_reps: vec![pyobject_input(0), pyobject_input(1)],
+        output_rep: Some(Rep::PyObjectOwned),
+        required_facts: python_object_inputs(),
+        output_facts: vec![ValueFact::PythonObject],
+        emission: AlternativeEmission::Operation(PlannedOp::PyNumberSubtract),
+        guards: Vec::new(),
+        failure_replay: FailureReplayPolicy::local_fallback(
+            "PyNumber_Subtract raises or returns locally without replay",
+        ),
+        failure: AlternativeFailure::Raise {
+            kind: "Exception",
+            reason: "PyNumber_Subtract may raise while implementing Python subtraction",
+        },
+        cost: Cost {
+            hot_path: 80,
+            miss_path: 0,
+            deopt: 0,
+            materialization: 0,
+            ownership: 4,
+            code_size: 2,
+            compile: 1,
+        },
+        rationale: "generic Python subtraction preserves Python dispatch and exception behavior",
+    }
+}
+
+fn exact_compact_int_subtract() -> LoweringAlternative {
+    LoweringAlternative {
+        id: AlternativeId::new("binary.sub.exact_compact_int.i64"),
+        op: SemanticOpKind::Binary { op: BinOpKind::Sub },
+        input_reps: vec![
+            i64_from_compact_long_input(0),
+            i64_from_compact_long_input(1),
+        ],
+        output_rep: Some(Rep::I64),
+        required_facts: exact_compact_int_inputs(),
+        output_facts: vec![ValueFact::I64, ValueFact::ExactCompactPyLong],
+        emission: AlternativeEmission::Operation(PlannedOp::CheckedI64Sub),
+        guards: exact_compact_int_guards(),
+        failure_replay: FailureReplayPolicy::local_fallback(
+            "overflow must use local fallback because the subtraction has consumed unboxed operands",
+        ),
+        failure: AlternativeFailure::LocalFallback {
+            reason: "checked i64 subtraction overflow falls back to generic Python subtraction",
+        },
+        cost: Cost {
+            hot_path: 2,
+            miss_path: 85,
+            deopt: 0,
+            materialization: 0,
+            ownership: 0,
+            code_size: 6,
+            compile: 2,
+        },
+        rationale: "exact compact PyLong operands can use checked i64 subtraction before materialization",
+    }
+}
+
+fn generic_binary_multiply() -> LoweringAlternative {
+    LoweringAlternative {
+        id: AlternativeId::new("binary.mul.py_generic"),
+        op: SemanticOpKind::Binary { op: BinOpKind::Mul },
+        input_reps: vec![pyobject_input(0), pyobject_input(1)],
+        output_rep: Some(Rep::PyObjectOwned),
+        required_facts: python_object_inputs(),
+        output_facts: vec![ValueFact::PythonObject],
+        emission: AlternativeEmission::Operation(PlannedOp::PyNumberMultiply),
+        guards: Vec::new(),
+        failure_replay: FailureReplayPolicy::local_fallback(
+            "PyNumber_Multiply raises or returns locally without replay",
+        ),
+        failure: AlternativeFailure::Raise {
+            kind: "Exception",
+            reason: "PyNumber_Multiply may raise while implementing Python multiplication",
+        },
+        cost: Cost {
+            hot_path: 80,
+            miss_path: 0,
+            deopt: 0,
+            materialization: 0,
+            ownership: 4,
+            code_size: 2,
+            compile: 1,
+        },
+        rationale: "generic Python multiplication preserves Python dispatch and exception behavior",
+    }
+}
+
+fn exact_compact_int_multiply() -> LoweringAlternative {
+    LoweringAlternative {
+        id: AlternativeId::new("binary.mul.exact_compact_int.i64"),
+        op: SemanticOpKind::Binary { op: BinOpKind::Mul },
+        input_reps: vec![
+            i64_from_compact_long_input(0),
+            i64_from_compact_long_input(1),
+        ],
+        output_rep: Some(Rep::I64),
+        required_facts: exact_compact_int_inputs(),
+        output_facts: vec![ValueFact::I64, ValueFact::ExactCompactPyLong],
+        emission: AlternativeEmission::Operation(PlannedOp::CheckedI64Mul),
+        guards: exact_compact_int_guards(),
+        failure_replay: FailureReplayPolicy::local_fallback(
+            "overflow must use local fallback because the multiplication has consumed unboxed operands",
+        ),
+        failure: AlternativeFailure::LocalFallback {
+            reason: "checked i64 multiplication overflow falls back to generic Python multiplication",
+        },
+        cost: Cost {
+            hot_path: 3,
+            miss_path: 85,
+            deopt: 0,
+            materialization: 0,
+            ownership: 0,
+            code_size: 6,
+            compile: 2,
+        },
+        rationale: "exact compact PyLong operands can use checked i64 multiplication before materialization",
     }
 }
 
@@ -947,6 +1075,19 @@ fn pyobject_input(input: u32) -> RepRequirement {
     }
 }
 
+fn python_object_inputs() -> Vec<FactPredicate> {
+    vec![
+        FactPredicate::Input {
+            input: 0,
+            fact: ValueFact::PythonObject,
+        },
+        FactPredicate::Input {
+            input: 1,
+            fact: ValueFact::PythonObject,
+        },
+    ]
+}
+
 fn i64_from_compact_long_input(input: u32) -> RepRequirement {
     RepRequirement {
         input,
@@ -1034,19 +1175,35 @@ mod tests {
     }
 
     #[test]
-    fn catalog_exposes_generic_and_exact_add_alternatives() {
+    fn catalog_exposes_generic_and_exact_arithmetic_alternatives() {
         let catalog = AlternativeCatalog::default_v3();
-        let alternatives = catalog
-            .alternatives_for(SemanticOpKind::Binary { op: BinOpKind::Add })
-            .map(|alternative| alternative.id)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            alternatives,
-            vec![
-                AlternativeId::new("binary.add.py_generic"),
-                AlternativeId::new("binary.add.exact_compact_int.i64")
-            ]
-        );
+        for (kind, generic_id, exact_id) in [
+            (
+                BinOpKind::Add,
+                "binary.add.py_generic",
+                "binary.add.exact_compact_int.i64",
+            ),
+            (
+                BinOpKind::Sub,
+                "binary.sub.py_generic",
+                "binary.sub.exact_compact_int.i64",
+            ),
+            (
+                BinOpKind::Mul,
+                "binary.mul.py_generic",
+                "binary.mul.exact_compact_int.i64",
+            ),
+        ] {
+            let alternatives = catalog
+                .alternatives_for(SemanticOpKind::Binary { op: kind })
+                .map(|alternative| alternative.id)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                alternatives,
+                vec![AlternativeId::new(generic_id), AlternativeId::new(exact_id)],
+                "{kind:?}",
+            );
+        }
     }
 
     #[test]

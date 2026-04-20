@@ -1045,6 +1045,16 @@ static PYNUMBER_ADD_IMPORT: ImportSpec = ImportSpec::new(
     &[SigType::Pointer, SigType::Pointer],
     &[SigType::Pointer],
 );
+static PYNUMBER_SUBTRACT_IMPORT: ImportSpec = ImportSpec::new(
+    "PyNumber_Subtract",
+    &[SigType::Pointer, SigType::Pointer],
+    &[SigType::Pointer],
+);
+static PYNUMBER_MULTIPLY_IMPORT: ImportSpec = ImportSpec::new(
+    "PyNumber_Multiply",
+    &[SigType::Pointer, SigType::Pointer],
+    &[SigType::Pointer],
+);
 static PYOBJECT_RICHCOMPARE_IMPORT: ImportSpec = ImportSpec::new(
     "PyObject_RichCompare",
     &[SigType::Pointer, SigType::Pointer, SigType::I32],
@@ -1179,6 +1189,8 @@ static JIT_RUNTIME_IMPORT_SPECS: &[&ImportSpec] = &[
     &DP_JIT_PYOBJECT_SETITEM_IMPORT,
     &DP_JIT_PYOBJECT_TO_I64_IMPORT,
     &PYNUMBER_ADD_IMPORT,
+    &PYNUMBER_SUBTRACT_IMPORT,
+    &PYNUMBER_MULTIPLY_IMPORT,
     &PYOBJECT_RICHCOMPARE_IMPORT,
     &PYLONG_FROM_LONGLONG_IMPORT,
     &DP_JIT_RECORD_TOP_VALUE_SAMPLE_IMPORT,
@@ -22165,13 +22177,25 @@ fn emit_opt_v3_mechanical_operation(
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<(), String> {
     match op {
-        MechanicalOperation::PyNumberAdd => {
+        MechanicalOperation::PyNumberAdd
+        | MechanicalOperation::PyNumberSubtract
+        | MechanicalOperation::PyNumberMultiply => {
+            let (op_name, import) = match op {
+                MechanicalOperation::PyNumberAdd => ("PyNumberAdd", &PYNUMBER_ADD_IMPORT),
+                MechanicalOperation::PyNumberSubtract => {
+                    ("PyNumberSubtract", &PYNUMBER_SUBTRACT_IMPORT)
+                }
+                MechanicalOperation::PyNumberMultiply => {
+                    ("PyNumberMultiply", &PYNUMBER_MULTIPLY_IMPORT)
+                }
+                _ => unreachable!("matched PyNumber binary operation"),
+            };
             let output = output.ok_or_else(|| {
-                format!("optimizer v3 region {region:?} node {node:?} PyNumberAdd has no output")
+                format!("optimizer v3 region {region:?} node {node:?} {op_name} has no output")
             })?;
             if inputs.len() != 2 {
                 return Err(format!(
-                    "optimizer v3 region {region:?} node {node:?} PyNumberAdd expects two inputs, got {}",
+                    "optimizer v3 region {region:?} node {node:?} {op_name} expects two inputs, got {}",
                     inputs.len()
                 ));
             }
@@ -22181,11 +22205,11 @@ fn emit_opt_v3_mechanical_operation(
                 .iter()
                 .filter_map(|(value, owned)| (*owned).then_some(*value))
                 .collect::<Vec<_>>();
-            let add_ref = func_imports.get(codegen_env, &mut fb.func, &PYNUMBER_ADD_IMPORT)?;
+            let operation_ref = func_imports.get(codegen_env, &mut fb.func, import)?;
             let result = emit_checked_owned_pyobject_call_with_cleanup(
                 fb,
                 emit_ctx,
-                add_ref,
+                operation_ref,
                 arg_values.as_slice(),
                 owned_inputs.as_slice(),
             );
@@ -22239,24 +22263,37 @@ fn emit_opt_v3_mechanical_operation(
                 },
             )
         }
-        MechanicalOperation::CheckedI64Add => {
+        MechanicalOperation::CheckedI64Add
+        | MechanicalOperation::CheckedI64Sub
+        | MechanicalOperation::CheckedI64Mul => {
+            let op_name = match op {
+                MechanicalOperation::CheckedI64Add => "CheckedI64Add",
+                MechanicalOperation::CheckedI64Sub => "CheckedI64Sub",
+                MechanicalOperation::CheckedI64Mul => "CheckedI64Mul",
+                _ => unreachable!("matched checked i64 arithmetic operation"),
+            };
             let output = output.ok_or_else(|| {
-                format!("optimizer v3 region {region:?} node {node:?} CheckedI64Add has no output")
+                format!("optimizer v3 region {region:?} node {node:?} {op_name} has no output")
             })?;
             let fallback_block = local_fallback_block.ok_or_else(|| {
                 format!(
-                    "optimizer v3 region {region:?} node {node:?} CheckedI64Add needs a local fallback block"
+                    "optimizer v3 region {region:?} node {node:?} {op_name} needs a local fallback block"
                 )
             })?;
             if inputs.len() != 2 {
                 return Err(format!(
-                    "optimizer v3 region {region:?} node {node:?} CheckedI64Add expects two inputs, got {}",
+                    "optimizer v3 region {region:?} node {node:?} {op_name} expects two inputs, got {}",
                     inputs.len()
                 ));
             }
             let lhs = opt_v3_i64_value(values, inputs[0])?;
             let rhs = opt_v3_i64_value(values, inputs[1])?;
-            let (sum, overflow) = fb.ins().sadd_overflow(lhs, rhs);
+            let (result, overflow) = match op {
+                MechanicalOperation::CheckedI64Add => fb.ins().sadd_overflow(lhs, rhs),
+                MechanicalOperation::CheckedI64Sub => fb.ins().ssub_overflow(lhs, rhs),
+                MechanicalOperation::CheckedI64Mul => fb.ins().smul_overflow(lhs, rhs),
+                _ => unreachable!("matched checked i64 arithmetic operation"),
+            };
             let ok_block = fb.create_block();
             fb.append_block_param(ok_block, emit_ctx.consts.i64_ty);
             fb.ins().brif(
@@ -22264,11 +22301,11 @@ fn emit_opt_v3_mechanical_operation(
                 fallback_block,
                 &[],
                 ok_block,
-                &[ir::BlockArg::Value(sum)],
+                &[ir::BlockArg::Value(result)],
             );
             fb.switch_to_block(ok_block);
-            let sum = fb.block_params(ok_block)[0];
-            opt_v3_store_mechanical_value(values, output, OptV3MechanicalValue::I64(sum))
+            let result = fb.block_params(ok_block)[0];
+            opt_v3_store_mechanical_value(values, output, OptV3MechanicalValue::I64(result))
         }
         MechanicalOperation::I64CompareToBool01 { op } => {
             let output = output.ok_or_else(|| {
