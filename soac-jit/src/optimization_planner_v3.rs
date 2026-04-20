@@ -114,6 +114,9 @@ fn plan_compact_int_branch(
     if let Some(planned) = plan_compact_int_compare_branch(catalog, region, facts)? {
         return Ok(Some(planned));
     }
+    if let Some(planned) = plan_compact_int_compare_return(catalog, region, facts)? {
+        return Ok(Some(planned));
+    }
     plan_compact_int_add_return(catalog, region, facts)
 }
 
@@ -440,6 +443,94 @@ fn plan_compact_int_compare_branch(
     Ok(Some(vec![hot_region, fallback_region]))
 }
 
+fn plan_compact_int_compare_return(
+    catalog: &AlternativeCatalog,
+    region: &ExtractedRegion,
+    facts: &PlannerFacts,
+) -> Result<Option<Vec<RegionPlan>>, String> {
+    let Some(shape) = match_compact_int_compare_return(region, facts) else {
+        return Ok(None);
+    };
+    let compare = required_alternative(catalog, shape.compare.exact_id)?;
+    let generic_compare = required_alternative(catalog, shape.compare.generic_id)?;
+
+    let fallback_region_id = RegionId(region.id.0 + 1);
+    let failure_targets =
+        FailureTargets::local_fallback(FallbackTarget::Region(fallback_region_id));
+
+    let a_obj = PlanValue::new(0, Rep::PyObjectBorrowed);
+    let b_obj = PlanValue::new(1, Rep::PyObjectBorrowed);
+    let a_i64 = PlanValue::new(2, Rep::I64);
+    let b_i64 = PlanValue::new(3, Rep::I64);
+    let condition = PlanValue::new(4, Rep::I32Bool01);
+    let result_obj = PlanValue::new(5, Rep::PyObjectImmortal);
+
+    let hot_region = RegionPlan {
+        id: region.id,
+        source: RegionSource::Instr {
+            instr_id: shape
+                .source
+                .unwrap_or_else(|| InstrId::new(region.block, 0)),
+        },
+        inputs: vec![
+            region_input(a_obj, 0, shape.left_name.clone()),
+            region_input(b_obj, 1, shape.right_name.clone()),
+        ],
+        nodes: vec![
+            guard_node(compare, 0, 0, a_obj, &failure_targets),
+            guard_node(compare, 1, 1, b_obj, &failure_targets),
+            unbox_node(2, a_obj, a_i64, 0, fallback_region_id),
+            unbox_node(3, b_obj, b_i64, 1, fallback_region_id),
+            operation_node(
+                4,
+                compare,
+                vec![a_i64, b_i64],
+                Some(condition),
+                &failure_targets,
+            )?,
+            node(
+                5,
+                PlanNodeKind::Materialize(MaterializeNode {
+                    input: condition,
+                    output: result_obj,
+                    kind: MaterializeKind::PythonBool,
+                }),
+            ),
+        ],
+        exits: vec![RegionExitPlan {
+            source: shape.source,
+            kind: RegionExitKind::Return { value: result_obj },
+        }],
+    };
+
+    let fallback_compare = PlanValue::new(20, Rep::PyObjectOwned);
+    let fallback_region = RegionPlan {
+        id: fallback_region_id,
+        source: RegionSource::Synthetic {
+            reason: "generic fallback for compact-int comparison return".to_string(),
+        },
+        inputs: vec![
+            region_input(a_obj, 0, shape.left_name),
+            region_input(b_obj, 1, shape.right_name),
+        ],
+        nodes: vec![operation_node(
+            20,
+            generic_compare,
+            vec![a_obj, b_obj],
+            Some(fallback_compare),
+            &failure_targets,
+        )?],
+        exits: vec![RegionExitPlan {
+            source: shape.source,
+            kind: RegionExitKind::Return {
+                value: fallback_compare,
+            },
+        }],
+    };
+
+    Ok(Some(vec![hot_region, fallback_region]))
+}
+
 fn required_alternative<'a>(
     catalog: &'a AlternativeCatalog,
     id: &'static str,
@@ -469,6 +560,14 @@ struct CompactIntReturnShape {
     source: Option<InstrId>,
     left_name: String,
     right_name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CompactIntCompareReturnShape {
+    source: Option<InstrId>,
+    left_name: String,
+    right_name: String,
+    compare: CompareAlternativeSpec,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -577,6 +676,29 @@ fn match_compact_int_compare_branch(
         return None;
     }
     Some(CompactIntCompareBranchShape {
+        source,
+        left_name: region.load_name(left)?.id_str().to_string(),
+        right_name: region.load_name(right)?.id_str().to_string(),
+        compare,
+    })
+}
+
+fn match_compact_int_compare_return(
+    region: &ExtractedRegion,
+    facts: &PlannerFacts,
+) -> Option<CompactIntCompareReturnShape> {
+    let ExtractedExit::Return { value, source } = region.exit else {
+        return None;
+    };
+    let compare = region.value(value)?;
+    let ExtractedValueKind::Binary { op, left, right } = compare.kind else {
+        return None;
+    };
+    let compare = compare_alternative_spec(op)?;
+    if !facts.is_exact_compact_int(left) || !facts.is_exact_compact_int(right) {
+        return None;
+    }
+    Some(CompactIntCompareReturnShape {
         source,
         left_name: region.load_name(left)?.id_str().to_string(),
         right_name: region.load_name(right)?.id_str().to_string(),
@@ -804,6 +926,23 @@ mod tests {
         extract_block_region_v3(&block, RegionId(0)).unwrap()
     }
 
+    fn compact_int_compare_return_region(kind: BinOpKind) -> ExtractedRegion {
+        let value = binary(
+            kind,
+            with_instr_id(local("a", 0), 0),
+            with_instr_id(local("b", 1), 1),
+            2,
+        );
+        let block = Block::new(
+            label(0),
+            Vec::new(),
+            BlockTerm::Return(value),
+            Vec::<BlockParam>::new(),
+            None,
+        );
+        extract_block_region_v3(&block, RegionId(0)).unwrap()
+    }
+
     fn compact_int_add_return_region() -> ExtractedRegion {
         let value = binary(
             BinOpKind::Add,
@@ -908,6 +1047,51 @@ mod tests {
             PlanNodeKind::Operation(OperationNode {
                 op: crate::optimization_plan_v3::PlannedOp::PyObjectRichCompare {
                     op: RichCompareOp::Lt
+                },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn plans_compact_int_compare_return() {
+        let catalog = AlternativeCatalog::default_v3();
+        let request = module_request(
+            compact_int_compare_return_region(BinOpKind::Ge),
+            facts_for_compact_region(),
+        );
+        let plan = plan_module_optimization_v3(&catalog, request);
+
+        validate_module_plan_v3(&plan).unwrap();
+        let function = &plan.functions[0];
+        assert!(function.diagnostics.is_empty());
+        assert_eq!(function.regions.len(), 2);
+        assert_eq!(function.regions[0].nodes.len(), 6);
+        assert!(matches!(
+            function.regions[0].nodes[4].kind,
+            PlanNodeKind::Operation(OperationNode {
+                op: crate::optimization_plan_v3::PlannedOp::I64CompareToBool01 {
+                    op: RichCompareOp::Ge
+                },
+                ..
+            })
+        ));
+        assert!(matches!(
+            function.regions[0].nodes[5].kind,
+            PlanNodeKind::Materialize(MaterializeNode {
+                kind: MaterializeKind::PythonBool,
+                ..
+            })
+        ));
+        assert!(matches!(
+            function.regions[0].exits[0].kind,
+            RegionExitKind::Return { .. }
+        ));
+        assert!(matches!(
+            function.regions[1].nodes[0].kind,
+            PlanNodeKind::Operation(OperationNode {
+                op: crate::optimization_plan_v3::PlannedOp::PyObjectRichCompare {
+                    op: RichCompareOp::Ge
                 },
                 ..
             })

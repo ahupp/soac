@@ -372,7 +372,7 @@ mod tests {
         let err = emit_mechanical_plan_v3(&test_plan(false)).unwrap_err();
         match err {
             MechanicalEmitError::InvalidPlan(validation) => {
-                assert!(validation.contains("return exits require PyObjectOwned"));
+                assert!(validation.contains("return exits require a returnable PyObject"));
             }
         }
     }

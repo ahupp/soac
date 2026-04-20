@@ -693,9 +693,9 @@ fn validate_region_plan(
             }
             RegionExitKind::Return { value } => {
                 check_input(region.id, *value, &available_values, errors);
-                if value.rep != Rep::PyObjectOwned {
+                if !matches!(value.rep, Rep::PyObjectOwned | Rep::PyObjectImmortal) {
                     errors.push(format!(
-                        "region {:?} return exits require PyObjectOwned, got {:?}",
+                        "region {:?} return exits require a returnable PyObject, got {:?}",
                         region.id, value.rep
                     ));
                 }
@@ -1551,6 +1551,9 @@ mod tests {
             }],
         };
         let err = validate_module_plan_v3(&module_with_regions(vec![region])).unwrap_err();
-        assert!(err.contains("return exits require PyObjectOwned"), "{err}");
+        assert!(
+            err.contains("return exits require a returnable PyObject"),
+            "{err}"
+        );
     }
 }

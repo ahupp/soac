@@ -22325,9 +22325,25 @@ fn emit_opt_v3_mechanical_materialize(
                 },
             )
         }
-        other => Err(format!(
-            "optimizer v3 region {region:?} materialize node {node:?} has unsupported materialization {other:?}"
-        )),
+        MaterializeKind::PythonBool => {
+            let value = opt_v3_i32_bool01_value(values, input)?;
+            let (result, ownership, facts) =
+                emit_to_python_bool(fb, SoacValue::i32(value, IntFacts::i32_bool01()), emit_ctx)
+                    .expect_pyobject("optimizer v3 bool materialize");
+            if !matches!(ownership, ValueOwnership::Immortal) || !facts.is_immortal() {
+                return Err(format!(
+                    "optimizer v3 region {region:?} materialize node {node:?} expected immortal bool materialization"
+                ));
+            }
+            opt_v3_store_mechanical_value(
+                values,
+                output,
+                OptV3MechanicalValue::PyObject {
+                    value: result,
+                    owned: false,
+                },
+            )
+        }
     }
 }
 
@@ -22448,14 +22464,14 @@ fn opt_v3_region_return_value(
             region.region
         ));
     };
-    let (value, owned) = opt_v3_pyobject_value(values, *value)?;
-    if !owned {
+    let (raw_value, owned) = opt_v3_pyobject_value(values, *value)?;
+    if !owned && value.rep != Rep::PyObjectImmortal {
         return Err(format!(
             "optimizer v3 region {:?} for source {source} produced borrowed PyObject for return",
             region.region
         ));
     }
-    Ok(value)
+    Ok(raw_value)
 }
 
 fn opt_v3_rich_compare_intcc(op: RichCompareOp) -> ir::condcodes::IntCC {

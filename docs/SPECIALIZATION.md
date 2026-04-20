@@ -30,12 +30,14 @@ legacy `mod.opt`: it rebuilds v3 artifacts in memory from legacy-planned
 evidence. Do not extend that bridge as the primary path.
 
 The represented slices are exact-compact-`int` direct comparison branches such
-as `a < b`, add-then-compare-to-zero branches such as `a + b > 0`, and
-value-producing add returns such as `return a + b`:
+as `a < b`, add-then-compare-to-zero branches such as `a + b > 0`,
+value-producing add returns such as `return a + b`, and value-producing
+comparison returns such as `return a < b`:
 `operator_hot_shapes` exact-int evidence proves the operands, a lowered module
 constant load proves `0` where needed, the v3 planner emits hot checked-`i64`
-operation regions plus local generic Python fallback regions, and
-`emit_mechanical_plan_v3` refuses invalid plans before emitting steps.
+operation regions plus local generic Python fallback regions, materializes
+Python object results explicitly, and `emit_mechanical_plan_v3` refuses invalid
+plans before emitting steps.
 
 Legacy optimization families remain available for comparison while they are
 migrated. Do not expand a legacy family as the primary implementation path
@@ -45,10 +47,12 @@ planner rule, validation, and mechanical-emitter coverage first.
 Current migration surface:
 
 - Live v3 codegen: exact-int direct-compare and add/compare branch slices with
-  local generic fallback, plus exact-int add returns with explicit PythonLong
-  materialization and generic add fallback.
-- Legacy only: other exact-int value-producing binary/unary operators, profiled
-  direct calls, exact-list getitem/setitem, indexed globals, and indexed fields.
+  local generic fallback, exact-int add returns with explicit PythonLong
+  materialization, and exact-int comparison returns with explicit Python bool
+  materialization.
+- Legacy only: arithmetic, bitwise, and unary exact-int value-producing
+  operators, profiled direct calls, exact-list getitem/setitem, indexed globals,
+  and indexed fields.
 - Not currently a v3 semantic-plan target: branch locality and cold block
   layout hints. These remain layout metadata unless a future CFG-placement plan
   needs to represent them.
