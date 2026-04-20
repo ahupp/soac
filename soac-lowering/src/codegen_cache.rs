@@ -25,6 +25,7 @@ pub enum ModuleCacheArtifact {
     CodegenModule,
     Profile,
     OptimizationPlan,
+    OptimizationPlanV3,
 }
 
 #[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -117,6 +118,7 @@ impl ModuleCacheArtifact {
             Self::CodegenModule => "mod.blockpy",
             Self::Profile => "mod.profile",
             Self::OptimizationPlan => "mod.opt",
+            Self::OptimizationPlanV3 => "mod.optv3",
         }
     }
 }
@@ -171,6 +173,19 @@ pub fn module_optimization_plan_path(
         source,
         module_name,
         ModuleCacheArtifact::OptimizationPlan,
+    )
+}
+
+pub fn module_optimization_plan_v3_path(
+    cache_root: impl AsRef<Path>,
+    source: PythonModuleCacheSource,
+    module_name: &str,
+) -> Result<PathBuf> {
+    module_cache_artifact_path(
+        cache_root,
+        source,
+        module_name,
+        ModuleCacheArtifact::OptimizationPlanV3,
     )
 }
 
@@ -487,7 +502,8 @@ fn temp_cache_path(path: &Path) -> PathBuf {
 mod test {
     use super::{
         codegen_module_cache_key, codegen_module_cache_path, load_codegen_module_cache,
-        module_cache_artifact_path, module_optimization_plan_path, module_profile_path,
+        module_cache_artifact_path, module_optimization_plan_path,
+        module_optimization_plan_v3_path, module_profile_path,
         remap_cached_codegen_module_function_ids, remap_codegen_module_function_ids,
         store_codegen_module_cache, validate_codegen_module_cache_metadata,
         CachedCodegenModuleMetadata, CachedPreparedCodegen, ModuleCacheArtifact,
@@ -650,6 +666,15 @@ def g(y):
             module_optimization_plan_path(&root, PythonModuleCacheSource::PythonStdlib, "typing")
                 .expect("stdlib optimization path"),
             PathBuf::from("/cache/root/python-stdlib/typing/mod.opt")
+        );
+        assert_eq!(
+            module_optimization_plan_v3_path(
+                &root,
+                PythonModuleCacheSource::PythonStdlib,
+                "typing"
+            )
+            .expect("stdlib optimization v3 path"),
+            PathBuf::from("/cache/root/python-stdlib/typing/mod.optv3")
         );
         assert_eq!(
             module_cache_artifact_path(

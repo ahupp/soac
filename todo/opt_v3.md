@@ -13,6 +13,24 @@ The plan is written in two layers:
 1. The model in isolation, ignoring the current implementation.
 2. A follow-up migration path that incorporates existing SOAC work.
 
+Updated direction:
+
+- Optimizer v3 must not consume the legacy optimization plan as input. The
+  legacy plan can remain as a transition fallback, but it should not shape v3
+  evidence, alternatives, or codegen artifacts.
+- The intended v3 pipeline is:
+
+  ```text
+  cached unoptimized BlockPy module + raw profile evidence
+    -> decide_optimizations --mode v3
+    -> serialized v3 optimization artifact
+    -> JIT codegen consumes the selected mechanical shape
+  ```
+
+- This may temporarily reduce optimization coverage. That regression is
+  acceptable because it prevents v3 from inheriting site-local legacy decisions
+  and makes entanglement visible.
+
 
 ## Goals
 
@@ -37,8 +55,10 @@ Non-goals:
 
 ## Implementation Status
 
-The first implementation stack establishes v3 as an off-by-default live
-validation path with one narrow live JIT lowering consumer.
+The first implementation stack established v3 as an off-by-default live
+validation path with one narrow live JIT lowering consumer. That bridge is
+useful for validation, but it is not the target architecture because it derives
+v3 inputs from legacy `mod.opt`.
 
 Implemented:
 
@@ -57,11 +77,20 @@ Implemented:
 - `optimization_evidence_v3`: bridge from existing `FunctionProfileEvidence`
   exact-int operator shapes and lowered integer module constants into v3
   planner facts.
-- `optimization_pipeline_v3`: off-by-default exact-int branch pipeline that
-  composes extraction, evidence, planning, validation, and mechanical emission.
-- `SOAC_VALIDATE_OPT_V3`: opt-in live validation while loading `mod.opt` plans
-  in `verify`/`apply`; this runs the current v3 exact-int branch pipeline over
-  the lowered function/evidence that legacy JIT specialization will use.
+- `optimization_pipeline_v3`: exact-int pipeline that composes extraction,
+  evidence, planning, validation, and mechanical emission.
+- `decide_optimizations --mode v3`: offline planner mode that reads cached
+  unoptimized `mod.blockpy` plus `profile.bin`, derives v3 facts directly from
+  raw profile evidence, and writes a serialized `mod.optv3` artifact.
+- `print_optimization_plan_v3`: inspection summary for serialized v3 artifacts.
+- JIT `verify`/`apply` loading prefers `mod.optv3`, validates module identity,
+  splits module-level artifacts into per-function mechanical artifacts, and only
+  falls back to legacy `mod.opt` when no v3 artifact is present.
+- Offline precompile also prefers `mod.optv3` artifacts when available.
+- `SOAC_VALIDATE_OPT_V3`: transitional opt-in live validation while loading
+  legacy `mod.opt` plans in `verify`/`apply`; this currently reconstructs v3
+  input from the legacy plan and should be deleted once `mod.optv3` is the
+  normal v3 path.
 - `FunctionSpecializationInputs`: carries validated exact-int branch v3
   artifacts into the JIT build path, where codegen validates that the artifact
   function identity matches the function being compiled.
@@ -79,6 +108,14 @@ Remaining legacy-only families are intentionally visible:
 
 Branch locality and cold block hints remain layout metadata for now, not v3
 semantic plan targets.
+
+Current integration target:
+
+- Expand v3 coverage while keeping `mod.optv3` as the source of truth for v3.
+- Keep the live `SOAC_VALIDATE_OPT_V3` bridge only as a debugging comparison
+  mode until the offline v3 path has equivalent coverage, then delete it.
+- Stop generating or consuming legacy `mod.opt` once v3 covers the required
+  optimization families.
 
 
 ## Isolated Model
@@ -487,29 +524,37 @@ the branch exit demands `I32Bool01`. If a later Python-observable boundary needs
    - Select a cheapest plan satisfying the region exit demand.
    - Emit structured diagnostics for selected and declined alternatives.
 
-5. Make codegen consume the plan mechanically.
+5. Persist and inspect v3 artifacts offline.
+   - Add a `mod.optv3` cache artifact beside `mod.blockpy`. Done.
+   - Add `decide_optimizations --mode v3` to write it from raw counters and the
+     cached unoptimized module. Done.
+   - Add a printer/inspector for `mod.optv3`. Done for summary inspection.
+
+6. Make codegen consume the plan mechanically.
    - Add an emitter for v3 plan nodes.
    - Keep generic legacy emission available only as an explicit fallback node.
    - Add assertions that codegen received a complete plan for every v3 region.
 
-6. Integrate profile evidence.
-   - First consume existing per-site evidence.
+7. Integrate profile evidence.
+   - First consume raw per-site evidence directly from profile counters.
+   - Do not route v3 evidence through legacy `OptimizationDecision` or
+     `OptimizationPlan`.
    - Then add correlated region evidence where local evidence cannot choose a
      sequence reliably.
    - Feed verify/apply hit, fallback, and deopt counts back into diagnostics.
 
-7. Extend across CFG joins and direct calls.
+8. Extend across CFG joins and direct calls.
    - Add conservative representation merging at joins.
    - Add direct-call variants only after single-function regions are stable.
    - Key compiled variants by function identity, rep signature, and assumptions.
 
-8. Replace old site-local specializations incrementally.
+9. Replace old site-local specializations incrementally.
    - Migrate exact-int operators first.
    - Then truthiness and materialization.
    - Then getitem/setitem, indexed fields, and direct calls.
    - Keep old paths until each replacement has structured tests and diagnostics.
 
-9. Benchmark and document kept performance changes.
+10. Benchmark and document kept performance changes.
    - Use focused specialization tests before full benchmarks.
    - For accepted performance changes, run the repo benchmark workflow and log
      the result in the optimization log.

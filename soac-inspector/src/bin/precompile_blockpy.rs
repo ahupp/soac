@@ -6,7 +6,7 @@ use soac_jit::{
 };
 use soac_lowering::codegen_cache::{
     CachedCodegenModuleMetadata, PythonModuleCacheSource, codegen_module_cache_path,
-    load_codegen_module_cache, module_optimization_plan_path,
+    load_codegen_module_cache, module_optimization_plan_path, module_optimization_plan_v3_path,
     remap_cached_codegen_module_function_ids, validate_codegen_module_cache_metadata,
 };
 use soac_lowering::passes::CodegenModuleShape;
@@ -159,8 +159,15 @@ fn run_with_args(args: impl IntoIterator<Item = OsString>) -> Result<(), String>
             module_ref.module_name.as_str(),
         )
         .map_err(|err| err.to_string())?;
+        let optimization_plan_v3_path = module_optimization_plan_v3_path(
+            module_cache_dir.as_path(),
+            metadata.source,
+            module_ref.module_name.as_str(),
+        )
+        .map_err(|err| err.to_string())?;
         let optimization_plan = PrecompileOptimizationPlanInput {
             path: optimization_plan_path.as_path(),
+            v3_path: Some(optimization_plan_v3_path.as_path()),
             source: metadata.source,
             cache_identity: metadata.cache_identity.as_str(),
         };

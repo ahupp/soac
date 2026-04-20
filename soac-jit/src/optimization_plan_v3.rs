@@ -2,7 +2,7 @@ use soac_core::block_py::{InstrId, SerializedFunctionId};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct ModuleOptimizationPlanV3 {
     pub module: ModulePlanIdentity,
     pub helper_catalog_version: u32,
@@ -10,14 +10,14 @@ pub struct ModuleOptimizationPlanV3 {
     pub functions: Vec<FunctionOptimizationPlanV3>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct ModulePlanIdentity {
     pub module_name: String,
     pub source_hash: u64,
     pub cache_identity: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct FunctionOptimizationPlanV3 {
     pub function: FunctionPlanIdentity,
     pub regions: Vec<RegionPlan>,
@@ -26,18 +26,20 @@ pub struct FunctionOptimizationPlanV3 {
     pub diagnostics: Vec<PlanDiagnostic>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct FunctionPlanIdentity {
     pub function: SerializedFunctionId,
     pub debug_name: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(
+    Clone, Debug, Default, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub struct FunctionOwnershipPlan {
     pub actions: Vec<OwnershipAction>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct RegionPlan {
     pub id: RegionId,
     pub source: RegionSource,
@@ -46,23 +48,35 @@ pub struct RegionPlan {
     pub exits: Vec<RegionExitPlan>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub struct RegionId(pub u32);
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum RegionSource {
     FunctionEntry,
     Instr { instr_id: InstrId },
     Synthetic { reason: String },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct RegionInput {
     pub value: PlanValue,
     pub source: RegionInputSource,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum RegionInputSource {
     FunctionParam {
         index: u32,
@@ -77,13 +91,13 @@ pub enum RegionInputSource {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct RegionExitPlan {
     pub source: Option<InstrId>,
     pub kind: RegionExitKind,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum RegionExitKind {
     Branch {
         condition: PlanValue,
@@ -98,23 +112,35 @@ pub enum RegionExitKind {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum RegionExitTarget {
     Region(RegionId),
     OriginalCfg,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct PlanNode {
     pub id: PlanNodeId,
     pub source: Option<InstrId>,
     pub kind: PlanNodeKind,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub struct PlanNodeId(pub u32);
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum PlanNodeKind {
     Input {
         output: PlanValue,
@@ -138,10 +164,24 @@ pub enum PlanNodeKind {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub struct PlanValueId(pub u32);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub struct PlanValue {
     pub id: PlanValueId,
     pub rep: Rep,
@@ -156,7 +196,9 @@ impl PlanValue {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub enum Rep {
     PyObjectOwned,
     PyObjectBorrowed,
@@ -174,14 +216,14 @@ impl Rep {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum PlannedConstant {
     I64(i64),
     Bool(bool),
     RuntimeName(String),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct ConvertNode {
     pub input: PlanValue,
     pub output: PlanValue,
@@ -191,7 +233,9 @@ pub struct ConvertNode {
     pub ownership: ConversionOwnership,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub enum ConversionKind {
     FromPythonLongCompactToI64,
     ToPythonLongOwned,
@@ -199,14 +243,14 @@ pub enum ConversionKind {
     TruthinessToI32Bool01,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum ConversionPrecondition {
     Infallible,
     DominatingFacts { reason: String },
     SpecializationGuard { guard: PlanNodeId, reason: String },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum ConversionOwnership {
     Preserve,
     MaterializeOwned,
@@ -214,26 +258,26 @@ pub enum ConversionOwnership {
     ConsumeOwned,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct GuardNode {
     pub inputs: Vec<PlanValue>,
     pub guard: GuardSpec,
     pub failure: GuardFailure,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct GuardSpec {
     pub kind: GuardKind,
     pub replay: FailureReplayPolicy,
     pub description: String,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum GuardKind {
     SpecializationCheck,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum GuardFailure {
     FallbackToPlan {
         target: FallbackTarget,
@@ -245,7 +289,7 @@ pub enum GuardFailure {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct OperationNode {
     pub op: PlannedOp,
     pub inputs: Vec<PlanValue>,
@@ -255,7 +299,7 @@ pub struct OperationNode {
     pub cost: Cost,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum PlannedOp {
     PyNumberAdd,
     PyObjectRichCompare { op: RichCompareOp },
@@ -265,7 +309,7 @@ pub enum PlannedOp {
     DirectHelper { name: String },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum RichCompareOp {
     Eq,
     Ne,
@@ -275,20 +319,20 @@ pub enum RichCompareOp {
     Ge,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct MaterializeNode {
     pub input: PlanValue,
     pub output: PlanValue,
     pub kind: MaterializeKind,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum MaterializeKind {
     PythonLong,
     PythonBool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum FailureMode {
     CannotFail,
     Raise(PythonExceptionSpec),
@@ -302,26 +346,26 @@ pub enum FailureMode {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum FallbackTarget {
     Region(RegionId),
     Node(PlanNodeId),
     OriginalInstruction { instr_id: InstrId },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct PythonExceptionSpec {
     pub kind: String,
     pub reason: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct FallbackReason(pub String);
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct DeoptReason(pub String);
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct FailureReplayPolicy {
     pub replay: FailureReplayKind,
     pub reason: ReplayReason,
@@ -343,40 +387,52 @@ impl FailureReplayPolicy {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum FailureReplayKind {
     SafeToReplay,
     MustUseLocalFallback,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct ReplayReason(pub String);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub struct DeoptPointId(pub u32);
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct PlannedDeoptPoint {
     pub id: DeoptPointId,
     pub source: DeoptPointSource,
     pub reason: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum DeoptPointSource {
     BeforeInstr { instr_id: InstrId },
     BeforeRegion { region: RegionId },
     Synthetic { reason: String },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct OwnershipAction {
     pub value: PlanValue,
     pub kind: OwnershipActionKind,
     pub reason: String,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum OwnershipActionKind {
     Incref,
     Decref,
@@ -385,7 +441,9 @@ pub enum OwnershipActionKind {
     MaterializeOwned,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub struct Cost {
     pub hot_path: u32,
     pub miss_path: u32,
@@ -396,7 +454,7 @@ pub struct Cost {
     pub compile: u32,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct PlanDiagnostic {
     pub source: Option<InstrId>,
     pub message: String,

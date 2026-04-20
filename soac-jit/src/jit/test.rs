@@ -16104,6 +16104,63 @@ def f(x):
     }
 
     #[test]
+    fn planned_precompile_inputs_accept_serialized_v3_module_artifact() {
+        let function = test_function();
+        let module = test_module(ModuleNameGen::new(0), vec![function]);
+        let function = &module.callable_defs[0];
+        let serialized_function = SerializedFunctionId::new(
+            SerializedModuleId::new(0),
+            function.function_id.local_function_id(),
+        );
+        let artifacts = ExactIntBranchV3Artifacts {
+            plan: ModuleOptimizationPlanV3 {
+                module: ModulePlanIdentity {
+                    module_name: "test".to_string(),
+                    source_hash: 0,
+                    cache_identity: "test-cache".to_string(),
+                },
+                helper_catalog_version: 1,
+                cost_model_version: 1,
+                functions: vec![crate::optimization_plan_v3::FunctionOptimizationPlanV3 {
+                    function: FunctionPlanIdentity {
+                        function: serialized_function,
+                        debug_name: Some(function.names.qualname.clone()),
+                    },
+                    regions: Vec::new(),
+                    deopt_points: Vec::new(),
+                    ownership: crate::optimization_plan_v3::FunctionOwnershipPlan::default(),
+                    diagnostics: Vec::new(),
+                }],
+            },
+            emission: MechanicalModuleEmission {
+                module_name: "test".to_string(),
+                functions: vec![crate::optimization_emit_v3::MechanicalFunctionEmission {
+                    function: serialized_function,
+                    debug_name: Some(function.names.qualname.clone()),
+                    regions: Vec::new(),
+                }],
+            },
+        };
+
+        let inputs =
+            planned_optimization_inputs_from_v3_artifacts_for_codegen_module(&artifacts, &module)
+                .expect("v3 module artifact should map onto the current codegen module");
+        let function_artifacts = inputs
+            .opt_v3_exact_int_branch_artifacts
+            .get(&function.function_id)
+            .expect("v3 inputs should include the current function");
+        assert_eq!(function_artifacts.plan.functions.len(), 1);
+        assert_eq!(function_artifacts.emission.functions.len(), 1);
+        assert_eq!(
+            function_artifacts.plan.functions[0]
+                .function
+                .function
+                .local_function_id(),
+            function.function_id.local_function_id()
+        );
+    }
+
+    #[test]
     fn specialized_jit_exact_int_compare_guard_miss_deopts_for_replay_safe_operands() {
         if crate::run_test_in_isolated_process_if_needed(
             module_path!(),
@@ -17423,6 +17480,7 @@ def f(x, y):
         let inputs = planned_optimization_inputs_for_precompile(
             Some(PrecompileOptimizationPlanInput {
                 path: plan_path.as_path(),
+                v3_path: None,
                 source: PythonModuleCacheSource::Project,
                 cache_identity: cache_identity.as_str(),
             }),
@@ -17527,6 +17585,7 @@ def f(x, y):
         let inputs = planned_optimization_inputs_for_precompile(
             Some(PrecompileOptimizationPlanInput {
                 path: plan_path.as_path(),
+                v3_path: None,
                 source: PythonModuleCacheSource::Project,
                 cache_identity: cache_identity.as_str(),
             }),
@@ -17665,6 +17724,7 @@ def f(x, y):
             None,
             Some(PrecompileOptimizationPlanInput {
                 path: plan_path.as_path(),
+                v3_path: None,
                 source: PythonModuleCacheSource::Project,
                 cache_identity: cache_identity.as_str(),
             }),
@@ -17753,6 +17813,7 @@ def f(x, y):
         let inputs = planned_optimization_inputs_for_precompile(
             Some(PrecompileOptimizationPlanInput {
                 path: plan_path.as_path(),
+                v3_path: None,
                 source: PythonModuleCacheSource::Project,
                 cache_identity: cache_identity.as_str(),
             }),

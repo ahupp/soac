@@ -426,18 +426,21 @@ another revision's cache.
   Normal specialization runs use one work directory with conventional
 files: `profile.bin` for specialization input, `verify.bin` for the
 countered verification pass, and `events.jsonl` for default JSON
-tracing output. Cached pre-optimization BlockPy modules and sibling `mod.opt`
-plans live under `$SOAC_WORK_DIR/modules`. Set `SOAC_OPT_MODE=none`, `profile`,
-`verify`, or `apply`; recipes should pass the same `SOAC_WORK_DIR` and change only
-the mode between passes. `none` is the explicit ordinary
+tracing output. Cached pre-optimization BlockPy modules and sibling `mod.opt` /
+`mod.optv3` plans live under `$SOAC_WORK_DIR/modules`. Set
+`SOAC_OPT_MODE=none`, `profile`, `verify`, or `apply`; recipes should pass the
+same `SOAC_WORK_DIR` and change only the mode between passes. `none` is the
+explicit ordinary
   unspecialized/no-counter mode and should not read or write counter
   dumps. `profile` writes raw evidence to `profile.bin`; run
   `decide_optimizations` to turn that evidence plus cached BlockPy modules into
-  per-module `mod.opt` plans before entering `verify` or `apply`. `verify`
-  exercises indexed store fast paths so hit/fallback counters measure the
-  specialized steady-state path. `apply` still skips counter dump files, but
-  when event logging is enabled it records indexed specialization hit/fallback
-  counts and deopt-entry counts long enough to emit
+  per-module optimization plans before entering `verify` or `apply`. Use
+  `--mode v3` to write `mod.optv3` from raw profile evidence and cached
+  unoptimized BlockPy modules; the JIT prefers `mod.optv3` and falls back to
+  legacy `mod.opt`. `verify` exercises indexed store fast paths so hit/fallback
+  counters measure the specialized steady-state path. `apply` still skips
+  counter dump files, but when event logging is enabled it records indexed
+  specialization hit/fallback counts and deopt-entry counts long enough to emit
   `soac_specialization_runtime` summary events.
 - `SOAC_ENABLE_PROFILED_COLD_BLOCKS`
   Optional opt-in for replaying `block_entry` counters from
@@ -445,13 +448,12 @@ the mode between passes. `none` is the explicit ordinary
   `verify`/`apply`. This is disabled by default; the counters remain
   recorded in `profile`/`verify` either way.
 - `SOAC_VALIDATE_OPT_V3`
-  Optional opt-in for validating the current optimizer-v3 exact-int branch
-  pipeline while loading `mod.opt` plans in `verify`/`apply`. This runs v3
-  extraction, planning, plan validation, and mechanical emission against the
-  live lowered function/evidence and passes the resulting artifact to JIT
-  codegen inputs. When the artifact contains the represented exact-int
-  add/compare branch, JIT term lowering consumes the mechanical v3 region and
-  its local generic fallback; other shapes remain on the existing lowering path.
+  Transitional opt-in for validating the current optimizer-v3 exact-int branch
+  pipeline while loading legacy `mod.opt` plans in `verify`/`apply`. Normal v3
+  integration should use `decide_optimizations --mode v3` to write `mod.optv3`
+  from raw profile evidence and cached unoptimized BlockPy modules, then let JIT
+  codegen consume the serialized mechanical artifact directly. Keep this env var
+  for comparison while coverage migrates.
 - `BENCHMARK_CPU` / `BENCHMARK_CONSTANT_CLOCKS`
   The benchmark recipes use
   [scripts/run_benchmark_with_cpu_mode.sh](/home/adam/project/soac-profile/scripts/run_benchmark_with_cpu_mode.sh)
@@ -505,22 +507,26 @@ the mode between passes. `none` is the explicit ordinary
 - `just precompile-shared-library counters=<profile.bin> out=<lib.so>`
   Offline precompiles all modules referenced by a counter dump from cached
   pre-optimization BlockPy modules, writes per-module object files, and links a
-  shared library. The recipe regenerates `mod.opt` plans before compiling. It
-  expects matching module-cache entries in `$SOAC_WORK_DIR/modules`; run a
-  profile/benchmark pass first when the cache is empty. Use
-  `SOAC_PRECOMPILED_LIBRARY` to point runtime execution at the resulting shared
-  library.
+  shared library. The precompile JIT path prefers `mod.optv3` when present and
+  otherwise falls back to legacy `mod.opt`. It expects matching module-cache
+  entries in `$SOAC_WORK_DIR/modules`; run a profile/benchmark pass first when
+  the cache is empty. Use `SOAC_PRECOMPILED_LIBRARY` to point runtime execution
+  at the resulting shared library.
 - `cargo run -p soac-inspector --bin decide_optimizations -- --counters <profile.bin> --out <root-dir>`
   Standalone optimization-decision planner. It loads the counter dump once,
   scans cached BlockPy modules under the output root by default, and writes
   binary `mod.opt` artifacts beside those modules, such as
-  `$SOAC_WORK_DIR/modules/python-stdlib/typing/mod.opt`. Use `--module` for a
-  narrow debugging input or `--module-root` to scan a different cache root. Use
+  `$SOAC_WORK_DIR/modules/python-stdlib/typing/mod.opt`. Use `--mode v3` to
+  write `mod.optv3` artifacts from raw profile evidence and cached unoptimized
+  BlockPy modules instead of legacy `mod.opt`. Use `--module` for a narrow
+  debugging input or `--module-root` to scan a different cache root. Use
   `cargo run -p soac-inspector --bin print_optimization_plan -- --plan <mod.opt>`
-  to pretty-print it for inspection. In `SOAC_OPT_MODE=verify|apply`, runtime
-  specialization looks for a matching `mod.opt` in the active module cache and
-  uses it for decision-backed call, operator, getitem, setitem, indexed-field,
-  and branch specializations.
+  to pretty-print a legacy plan for inspection, or
+  `cargo run -p soac-inspector --bin print_optimization_plan_v3 -- --plan <mod.optv3>`
+  to inspect a v3 artifact summary. In `SOAC_OPT_MODE=verify|apply`, runtime
+  specialization prefers a matching `mod.optv3` in the active module cache and
+  falls back to legacy `mod.opt` for decision-backed call, operator, getitem,
+  setitem, indexed-field, and branch specializations.
 - `SOAC_CRANELIFT_OPT_LEVEL`
   Optional Cranelift process-JIT optimization level override:
   `none`, `speed`, or `speed_and_size`. Normal runtime and benchmark

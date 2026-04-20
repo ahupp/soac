@@ -401,6 +401,23 @@ impl ProfileEvidenceStore {
             .get(attr_name)
             .map(Vec::as_slice)
     }
+
+    pub fn evidence_for_runtime_function_v3(
+        &self,
+        module_name: &str,
+        source_hash: u64,
+        function_id: RuntimeFunctionId,
+    ) -> FunctionProfileEvidence {
+        let persistent = self.for_function(module_name, source_hash, function_id);
+        FunctionProfileEvidence {
+            call_target_specializations: HashMap::new(),
+            operator_specializations: persistent.operator_specializations,
+            getitem_specializations: persistent.getitem_specializations,
+            setitem_specializations: persistent.setitem_specializations,
+            field_index_specializations: persistent.field_index_specializations,
+            branch_prefer_true: persistent.branch_prefer_true,
+        }
+    }
 }
 
 fn persistent_function_id_for_counter_row(

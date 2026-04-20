@@ -9,8 +9,9 @@ use crate::config::{
     CraneliftTargetConfig, PythonModuleCacheSource, SpecializationMode,
     behavior_change_indexed_stores_enabled, counter_dump_input_path_from_env, jit_compile_workers,
     jit_refcount_emission_enabled, module_cache_root_from_env, module_optimization_plan_path,
-    opt_v3_validation_enabled, pre_optimization_module_cache_identity,
-    profiled_cold_blocks_enabled, soac_work_dir_from_env, specialization_mode_from_env,
+    module_optimization_plan_v3_path, opt_v3_validation_enabled,
+    pre_optimization_module_cache_identity, profiled_cold_blocks_enabled, soac_work_dir_from_env,
+    specialization_mode_from_env,
 };
 #[cfg(test)]
 use crate::config::{SOAC_JIT_EMIT_REFCOUNTS_ENV, SOAC_VALIDATE_OPT_V3_ENV};
@@ -23,10 +24,12 @@ use crate::module_constants::{ModuleCodegenConstants, ModuleConstantId};
 use crate::module_type::{CounterRuntimeSlot, SharedModuleState, build_counter_storage_layout};
 use crate::optimization_alternatives_v3::AlternativeCatalog;
 use crate::optimization_emit_v3::{
-    MechanicalExitKind, MechanicalOperation, MechanicalRegionEmission, MechanicalStepOp,
+    MechanicalExitKind, MechanicalModuleEmission, MechanicalOperation, MechanicalRegionEmission,
+    MechanicalStepOp,
 };
 use crate::optimization_pipeline_v3::{
-    ExactIntBranchV3Artifacts, plan_and_emit_function_exact_int_branches_v3_with_module_constants,
+    ExactIntBranchV3Artifacts, load_optimization_artifacts_v3,
+    plan_and_emit_function_exact_int_branches_v3_with_module_constants,
 };
 #[cfg(test)]
 use crate::optimization_plan::ProfileEvidenceStore;
@@ -36,8 +39,8 @@ use crate::optimization_plan::{
 };
 use crate::optimization_plan_v3::{
     ConversionKind, FailureMode, FallbackTarget, FunctionPlanIdentity, GuardFailure, GuardKind,
-    MaterializeKind, ModulePlanIdentity, PlanValue, PlannedConstant, RegionExitTarget, RegionId,
-    RegionInputSource, RegionPlan, Rep, RichCompareOp,
+    MaterializeKind, ModuleOptimizationPlanV3, ModulePlanIdentity, PlanValue, PlannedConstant,
+    RegionExitTarget, RegionId, RegionInputSource, RegionPlan, Rep, RichCompareOp,
 };
 use cranelift_codegen::cfg_printer::CFGPrinter;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
@@ -61,8 +64,8 @@ use soac_core::block_py::{
     CounterSite, Del, DeoptEntrySource, FunctionExecutionMode, FunctionKind, GetAttr, HasMeta,
     HasSemanticInstrId, InstrId, InstrKey, Load, LocalFunctionId, LocalLocation, Meta,
     ModuleContentId, NameLocation, ParamKind, PersistentFunctionId, ResolvedName,
-    RuntimeFunctionId, RuntimeModuleId, RuntimeName, StorageLayout, Store, Visit, VisitMut,
-    WithMeta,
+    RuntimeFunctionId, RuntimeModuleId, RuntimeName, SerializedFunctionId, StorageLayout, Store,
+    Visit, VisitMut, WithMeta,
 };
 use soac_lowering::block_py::{CodegenBlock, Literal};
 use soac_lowering::passes::{
@@ -13098,6 +13101,27 @@ fn load_planned_optimization_inputs_for_runtime_state(
             PythonModuleCacheSource::PythonStdlib,
         ],
     };
+
+    for source in candidate_sources.iter().copied() {
+        let path = module_optimization_plan_v3_path(
+            cache_root.as_path(),
+            source,
+            shared_state.module_name.as_str(),
+        )?;
+        if !path.exists() {
+            continue;
+        }
+        let artifacts =
+            load_optimization_artifacts_v3(path.as_path()).map_err(|err| err.to_string())?;
+        validate_opt_v3_artifacts_for_module(
+            &artifacts,
+            shared_state.module_name.as_str(),
+            shared_state.source_hash,
+            cache_identity.as_str(),
+        )?;
+        return planned_optimization_inputs_from_v3_artifacts(&artifacts, shared_state);
+    }
+
     for source in candidate_sources {
         let path = module_optimization_plan_path(
             cache_root.as_path(),
@@ -13126,6 +13150,158 @@ fn load_planned_optimization_inputs_for_runtime_state(
         return Ok(inputs);
     }
     Ok(PlannedOptimizationInputs::default())
+}
+
+fn validate_opt_v3_artifacts_for_module(
+    artifacts: &ExactIntBranchV3Artifacts,
+    module_name: &str,
+    source_hash: u64,
+    cache_identity: &str,
+) -> Result<(), String> {
+    if artifacts.plan.module.module_name != module_name {
+        return Err(format!(
+            "optimization plan v3 module name is {}, expected {module_name}",
+            artifacts.plan.module.module_name
+        ));
+    }
+    if artifacts.plan.module.source_hash != source_hash {
+        return Err(format!(
+            "optimization plan v3 source hash for module {module_name} is 0x{:016x}, expected 0x{source_hash:016x}",
+            artifacts.plan.module.source_hash
+        ));
+    }
+    if artifacts.plan.module.cache_identity != cache_identity {
+        return Err(format!(
+            "optimization plan v3 cache identity for module {module_name} is {}, expected {cache_identity}",
+            artifacts.plan.module.cache_identity
+        ));
+    }
+    if artifacts.emission.module_name != module_name {
+        return Err(format!(
+            "optimization plan v3 emission module name is {}, expected {module_name}",
+            artifacts.emission.module_name
+        ));
+    }
+    Ok(())
+}
+
+fn planned_optimization_inputs_from_v3_artifacts(
+    artifacts: &ExactIntBranchV3Artifacts,
+    shared_state: &SharedModuleState,
+) -> Result<PlannedOptimizationInputs, String> {
+    let mut inputs = PlannedOptimizationInputs::default();
+    for planned_function in &artifacts.plan.functions {
+        let local_function_id = planned_function.function.function.local_function_id();
+        let current_function_id = RuntimeFunctionId::new(
+            RuntimeModuleId::new(shared_state.module_id()),
+            local_function_id,
+        );
+        let current_function = shared_state
+            .lookup_function(current_function_id)
+            .ok_or_else(|| {
+                format!(
+                    "optimization plan v3 for module {} references missing function id {} ({})",
+                    artifacts.plan.module.module_name,
+                    local_function_id,
+                    planned_function
+                        .function
+                        .debug_name
+                        .as_deref()
+                        .unwrap_or("<unknown>")
+                )
+            })?;
+        let Some(function_artifacts) =
+            opt_v3_single_function_artifacts(artifacts, planned_function.function.function)?
+        else {
+            continue;
+        };
+        validate_opt_v3_codegen_artifacts_for_function(
+            current_function,
+            Some(&function_artifacts),
+        )?;
+        inputs
+            .opt_v3_exact_int_branch_artifacts
+            .insert(current_function_id, Arc::new(function_artifacts));
+    }
+    Ok(inputs)
+}
+
+fn planned_optimization_inputs_from_v3_artifacts_for_codegen_module(
+    artifacts: &ExactIntBranchV3Artifacts,
+    module: &BlockPyModule<CodegenModuleShape>,
+) -> Result<PlannedOptimizationInputs, String> {
+    let mut inputs = PlannedOptimizationInputs::default();
+    let module_id = RuntimeModuleId::new(module.module_name_gen.module_id());
+    for planned_function in &artifacts.plan.functions {
+        let local_function_id = planned_function.function.function.local_function_id();
+        let current_function_id = RuntimeFunctionId::new(module_id, local_function_id);
+        let current_function = module
+            .callable_defs
+            .iter()
+            .find(|function| function.function_id == current_function_id)
+            .ok_or_else(|| {
+                format!(
+                    "optimization plan v3 for module {} references missing function id {} ({})",
+                    artifacts.plan.module.module_name,
+                    local_function_id,
+                    planned_function
+                        .function
+                        .debug_name
+                        .as_deref()
+                        .unwrap_or("<unknown>")
+                )
+            })?;
+        let Some(function_artifacts) =
+            opt_v3_single_function_artifacts(artifacts, planned_function.function.function)?
+        else {
+            continue;
+        };
+        validate_opt_v3_codegen_artifacts_for_function(
+            current_function,
+            Some(&function_artifacts),
+        )?;
+        inputs
+            .opt_v3_exact_int_branch_artifacts
+            .insert(current_function_id, Arc::new(function_artifacts));
+    }
+    Ok(inputs)
+}
+
+fn opt_v3_single_function_artifacts(
+    artifacts: &ExactIntBranchV3Artifacts,
+    function: SerializedFunctionId,
+) -> Result<Option<ExactIntBranchV3Artifacts>, String> {
+    let Some(planned_function) = artifacts
+        .plan
+        .functions
+        .iter()
+        .find(|planned| planned.function.function == function)
+    else {
+        return Ok(None);
+    };
+    let emitted_function = artifacts
+        .emission
+        .functions
+        .iter()
+        .find(|emitted| emitted.function == function)
+        .ok_or_else(|| {
+            format!(
+                "optimization plan v3 has planned function {} without matching mechanical emission",
+                function
+            )
+        })?;
+    Ok(Some(ExactIntBranchV3Artifacts {
+        plan: ModuleOptimizationPlanV3 {
+            module: artifacts.plan.module.clone(),
+            helper_catalog_version: artifacts.plan.helper_catalog_version,
+            cost_model_version: artifacts.plan.cost_model_version,
+            functions: vec![planned_function.clone()],
+        },
+        emission: MechanicalModuleEmission {
+            module_name: artifacts.emission.module_name.clone(),
+            functions: vec![emitted_function.clone()],
+        },
+    }))
 }
 
 #[cfg(test)]
@@ -13335,6 +13511,18 @@ fn planned_optimization_inputs_for_precompile(
     let Some(plan_input) = plan_input else {
         return Ok(PlannedOptimizationInputs::default());
     };
+    if let Some(path) = plan_input.v3_path.filter(|path| path.exists()) {
+        let artifacts = load_optimization_artifacts_v3(path).map_err(|err| err.to_string())?;
+        validate_opt_v3_artifacts_for_module(
+            &artifacts,
+            module_name,
+            source_hash,
+            plan_input.cache_identity,
+        )?;
+        return planned_optimization_inputs_from_v3_artifacts_for_codegen_module(
+            &artifacts, module,
+        );
+    }
     if !plan_input.path.exists() {
         return Ok(PlannedOptimizationInputs::default());
     }
@@ -26113,6 +26301,7 @@ fn precompile_external_direct_call_target_functions(
 #[derive(Debug, Clone, Copy)]
 pub struct PrecompileOptimizationPlanInput<'a> {
     pub path: &'a Path,
+    pub v3_path: Option<&'a Path>,
     pub source: PythonModuleCacheSource,
     pub cache_identity: &'a str,
 }

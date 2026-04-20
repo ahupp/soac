@@ -7,34 +7,34 @@ use crate::optimization_plan_v3::{
 use soac_core::block_py::{InstrId, SerializedFunctionId};
 use std::fmt;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct MechanicalModuleEmission {
     pub module_name: String,
     pub functions: Vec<MechanicalFunctionEmission>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct MechanicalFunctionEmission {
     pub function: SerializedFunctionId,
     pub debug_name: Option<String>,
     pub regions: Vec<MechanicalRegionEmission>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct MechanicalRegionEmission {
     pub region: RegionId,
     pub steps: Vec<MechanicalStep>,
     pub exits: Vec<MechanicalExit>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct MechanicalStep {
     pub node: PlanNodeId,
     pub source: Option<InstrId>,
     pub op: MechanicalStepOp,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum MechanicalStepOp {
     Input {
         output: PlanValue,
@@ -76,7 +76,7 @@ pub enum MechanicalStepOp {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum MechanicalOperation {
     PyNumberAdd,
     PyObjectRichCompare { op: RichCompareOp },
@@ -99,13 +99,13 @@ impl From<&PlannedOp> for MechanicalOperation {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct MechanicalExit {
     pub source: Option<InstrId>,
     pub kind: MechanicalExitKind,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum MechanicalExitKind {
     Branch {
         condition: PlanValue,

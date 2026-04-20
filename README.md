@@ -233,9 +233,9 @@ typed variables must use recognized values. Boolean knobs accept `1`, `true`,
   - `events.jsonl`: default tracing JSONL when `SOAC_LOG` is not
     set.
   - `modules/`: root for cached pre-optimization BlockPy modules and sibling
-    `mod.opt` optimization plans. Cached modules use stable per-module artifact
-    paths such as `project/pkg/submod/mod.blockpy`, with source hash and build
-    identity stored as cache metadata.
+    `mod.opt` / `mod.optv3` optimization plans. Cached modules use stable
+    per-module artifact paths such as `project/pkg/submod/mod.blockpy`, with
+    source hash and build identity stored as cache metadata.
 
 - `SOAC_OPT_MODE=none|profile|verify|apply`
   Select the runtime specialization phase:
@@ -246,15 +246,15 @@ typed variables must use recognized values. Boolean knobs accept `1`, `true`,
     already set it.
   - `profile`: run unspecialized, instrument specialization input
     counters, and write `$SOAC_WORK_DIR/profile.bin`.
-  - `verify`: read per-module `mod.opt` optimization plans from the
-    active module cache, apply their specializations, instrument
-    specialization input counters again, and write
+  - `verify`: read per-module optimization plans from the active module cache,
+    preferring `mod.optv3` over legacy `mod.opt`, apply their specializations,
+    instrument specialization input counters again, and write
     `$SOAC_WORK_DIR/verify.bin`. Verify mode exercises indexed store
     fast paths so their hit/fallback counters measure the specialized
     steady-state path.
-  - `apply`: read per-module `mod.opt` optimization plans from the
-    active module cache, apply their specializations, and emit no
-    specialization counter dump files.
+  - `apply`: read per-module optimization plans from the active module cache,
+    preferring `mod.optv3` over legacy `mod.opt`, apply their specializations,
+    and emit no specialization counter dump files.
     When event logging is enabled through `SOAC_LOG` or the default
     `$SOAC_WORK_DIR/events.jsonl`, apply mode still records in-process
     indexed specialization hit/fallback and deopt-entry counts long enough to
@@ -270,13 +270,12 @@ Notes:
   from `$SOAC_WORK_DIR/profile.bin` as Cranelift `cold` block hints in
   `verify`/`apply`. This stays disabled by default; profiling still
   records the underlying `block_entry` counters either way.
-- `SOAC_VALIDATE_OPT_V3=1` validates the current optimizer-v3 exact-int
-  branch pipeline while loading `mod.opt` plans in `verify`/`apply`. This
-  runs extraction, planning, plan validation, and mechanical emission against
-  the live lowered function/evidence and passes the resulting artifact to JIT
-  codegen inputs. When the artifact contains the represented exact-int
-  add/compare branch, JIT term lowering consumes the mechanical v3 region and
-  its local generic fallback; other shapes remain on the existing lowering path.
+- `SOAC_VALIDATE_OPT_V3=1` is a transitional comparison mode for the current
+  optimizer-v3 exact-int branch pipeline while loading legacy `mod.opt` plans in
+  `verify`/`apply`. Normal v3 integration should use `decide_optimizations
+  --mode v3` to write `mod.optv3` from raw profile evidence and cached
+  unoptimized BlockPy modules, then let JIT codegen consume the serialized
+  mechanical artifact directly.
 - The `apply` phase may emit explicitly marked `BEHAVIOR_CHANGE`
   fast paths. Today that includes raw indexed module-global / instance
   field stores outside module-init code, and undeclared known-builtin
@@ -337,11 +336,11 @@ tree, with pystone benchmark runs writing to `work/bench/`.
   revision that it executed, so switch revisions first with `jj edit <rev>` if
   you want to benchmark some revision other than the current checkout. By
   default it keeps the benchmark log, raw counter files (`profile.bin`,
-  `verify.bin`, `events.jsonl`), generated `mod.opt` optimization plans, and
-  the revision-scoped BlockPy module cache under `counters/modules`; it does
-  not run `perf` and it does not build inspector-based counter/CLIF artifacts.
-  The profile pass is immediately followed by `decide_optimizations`, so verify
-  and apply consume planned decisions rather than raw counters. The specialized
+  `verify.bin`, `events.jsonl`), generated optimization plans, and the
+  revision-scoped BlockPy module cache under `counters/modules`; it does not
+  run `perf` and it does not build inspector-based counter/CLIF artifacts. The
+  profile pass is immediately followed by `decide_optimizations`, so verify and
+  apply consume planned decisions rather than raw counters. The specialized
   apply phase reports both the default refcounts-enabled throughput and an
   additional unsound
   `SOAC_JIT_EMIT_REFCOUNTS=0` diagnostic throughput.
@@ -353,19 +352,20 @@ tree, with pystone benchmark runs writing to `work/bench/`.
 
 - `just benchmark-deep-profile-from-profile <result-dir>`
   Start from an existing result directory with `counters/profile.bin`,
-  regenerate `mod.opt` plans, rerun only the verify pass to produce
+  regenerate optimization plans, rerun only the verify pass to produce
   `verify.bin`, then add the same deep-profile artifacts without rerunning the
   profile pass.
 
 - `just precompile-shared-library counters=<profile.bin> out=<lib.so>`
   Offline precompile a counter-referenced set of cached BlockPy modules into
   relocatable object files and link them into a shared library. The recipe
-  regenerates `mod.opt` plans from the counter file before compiling. The
-  counter file normally comes from a previous profile pass, and the matching
-  pre-optimization BlockPy cache entries must still exist in the active
-  `$SOAC_WORK_DIR/modules` cache. With the default benchmark cache isolation,
-  that cache is the benchmark result's `counters/modules` directory. When
-  `counters` is omitted, the recipe uses `$LAST_BENCHMARK_COUNTERS`. Set
+  regenerates optimization plans from the counter file before compiling. The
+  precompile JIT path prefers `mod.optv3` when present and otherwise falls back
+  to legacy `mod.opt`. The counter file normally comes from a previous profile
+  pass, and the matching pre-optimization BlockPy cache entries must still exist
+  in the active `$SOAC_WORK_DIR/modules` cache. With the default benchmark cache
+  isolation, that cache is the benchmark result's `counters/modules` directory.
+  When `counters` is omitted, the recipe uses `$LAST_BENCHMARK_COUNTERS`. Set
   `SOAC_PRECOMPILED_LIBRARY` to the resulting
   `.so` to let runtime direct-function setup use matching precompiled entries.
 
@@ -373,14 +373,18 @@ tree, with pystone benchmark runs writing to `work/bench/`.
   Load a counter dump once, scan the cached BlockPy module root for
   `mod.blockpy` files, and write sibling binary optimization-decision artifacts
   using stable module artifact paths such as `python-stdlib/typing/mod.opt`.
-  Pass `--module-root <root-dir>` to scan a different input root, or one or
-  more `--module <mod.blockpy>` arguments for narrower debugging.
+  Pass `--mode v3` to write `mod.optv3` artifacts from raw profile evidence and
+  cached unoptimized BlockPy modules instead of writing legacy `mod.opt` plans.
+  Pass `--module-root <root-dir>` to scan a different input root, or one or more
+  `--module <mod.blockpy>` arguments for narrower debugging.
   Use `cargo run -p soac-inspector --bin print_optimization_plan -- --plan <mod.opt>`
-  to pretty-print a plan for inspection. `just benchmark` runs this after the
-  profile pass so verify/apply exercise the decision artifacts. In
-  `SOAC_OPT_MODE=verify|apply`, runtime specialization looks for a matching
-  `mod.opt` in the active module cache for decision-backed call, operator,
-  getitem, setitem, indexed-field, and branch specializations.
+  to pretty-print a legacy plan for inspection, or
+  `cargo run -p soac-inspector --bin print_optimization_plan_v3 -- --plan <mod.optv3>`
+  to inspect a v3 artifact summary. `just benchmark` runs the legacy mode after
+  the profile pass today. In `SOAC_OPT_MODE=verify|apply`, runtime
+  specialization prefers a matching `mod.optv3` in the active module cache and
+  falls back to legacy `mod.opt` for decision-backed call, operator, getitem,
+  setitem, indexed-field, and branch specializations.
 
 - `SOAC_JIT_PERF_HELPER_FRAMES=1`
   In `fn should_preserve_perf_helper_frames`, at

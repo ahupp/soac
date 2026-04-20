@@ -1,4 +1,5 @@
 use anyhow::{Result, anyhow, bail};
+use soac_jit::optimization_pipeline_v3::generate_optimization_plans_v3_for_cached_modules;
 use soac_jit::optimization_plan::{
     CachedModuleOptimizationInput, ProfileEvidenceStore, cached_module_paths_under_root,
     generate_optimization_plans_for_cached_modules,
@@ -14,6 +15,14 @@ struct Args {
     modules: Vec<PathBuf>,
     module_root: Option<PathBuf>,
     out: Option<PathBuf>,
+    mode: OptimizationMode,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum OptimizationMode {
+    #[default]
+    Legacy,
+    V3,
 }
 
 fn main() {
@@ -41,8 +50,18 @@ fn run_with_args(args: impl IntoIterator<Item = OsString>) -> Result<()> {
     let evidence_store = ProfileEvidenceStore::from_counter_dump(counters_path)?;
     let module_inputs = module_inputs_for_args(&args, out_root)?;
 
-    let summary =
-        generate_optimization_plans_for_cached_modules(&evidence_store, module_inputs, out_root)?;
+    let summary = match args.mode {
+        OptimizationMode::Legacy => generate_optimization_plans_for_cached_modules(
+            &evidence_store,
+            module_inputs,
+            out_root,
+        )?,
+        OptimizationMode::V3 => generate_optimization_plans_v3_for_cached_modules(
+            &evidence_store,
+            module_inputs,
+            out_root,
+        )?,
+    };
     for report in &summary.reports {
         println!(
             "wrote {} for module={} source_hash=0x{:016x} ({} functions)",
@@ -103,6 +122,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Args> {
             "--counters" => parsed.counters = Some(next_path(&mut args, flag)?),
             "--module" => parsed.modules.push(next_path(&mut args, flag)?),
             "--module-root" => parsed.module_root = Some(next_path(&mut args, flag)?),
+            "--mode" => parsed.mode = next_mode(&mut args, flag)?,
             "--out" => parsed.out = Some(next_path(&mut args, flag)?),
             "--help" | "-h" => {
                 print_usage();
@@ -120,9 +140,23 @@ fn next_path(args: &mut impl Iterator<Item = OsString>, flag: &str) -> Result<Pa
         .ok_or_else(|| anyhow!("{flag} requires a value"))
 }
 
+fn next_mode(args: &mut impl Iterator<Item = OsString>, flag: &str) -> Result<OptimizationMode> {
+    let mode = args
+        .next()
+        .ok_or_else(|| anyhow!("{flag} requires a value"))?;
+    let mode = mode
+        .to_str()
+        .ok_or_else(|| anyhow!("non-UTF-8 {flag} value is unsupported: {mode:?}"))?;
+    match mode {
+        "legacy" => Ok(OptimizationMode::Legacy),
+        "v3" => Ok(OptimizationMode::V3),
+        _ => bail!("{flag} must be 'legacy' or 'v3', got {mode:?}"),
+    }
+}
+
 fn print_usage() {
     println!(
-        "usage: decide_optimizations --counters <profile.bin> [--module <mod.blockpy> ...] [--module-root <root-dir>] --out <root-dir>\n\nBy default, scans <root-dir> for cached mod.blockpy files and writes sibling mod.opt files. Use --module-root to scan a different input root, or --module for narrow debugging."
+        "usage: decide_optimizations --counters <profile.bin> [--mode legacy|v3] [--module <mod.blockpy> ...] [--module-root <root-dir>] --out <root-dir>\n\nBy default, scans <root-dir> for cached mod.blockpy files and writes sibling mod.opt files. Use --mode v3 to write sibling mod.optv3 files from raw profile evidence and cached unoptimized BlockPy modules. Use --module-root to scan a different input root, or --module for narrow debugging."
     );
 }
 
@@ -131,10 +165,11 @@ mod test {
     use super::*;
     use soac_core::block_py::{BlockLabel, InstrId, ModuleNameGen, RuntimeFunctionId};
     use soac_jit::module_type::hash_module_source;
+    use soac_jit::optimization_pipeline_v3::load_optimization_artifacts_v3;
     use soac_jit::optimization_plan::{OptimizationPlan, PlannedAction, PlannedReplacement};
     use soac_lowering::codegen_cache::{
         CachedCodegenModuleMetadata, PythonModuleCacheSource, codegen_module_cache_path,
-        module_optimization_plan_path,
+        module_optimization_plan_path, module_optimization_plan_v3_path,
     };
     use soac_lowering::{LoweringOptions, lower_python_to_blockpy_recorded_with_options};
     use soac_profile::{
@@ -346,6 +381,78 @@ mod test {
         assert!(
             !unused_path.exists(),
             "module-root mode should skip cached modules absent from the counter dump"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mode_v3_emits_mod_optv3_under_requested_root() {
+        let root = unique_temp_dir();
+        let module_name = "pkg.modv3";
+        let module = store_test_module(
+            root.join("modules-in").as_path(),
+            module_name,
+            "def f(a, b):\n    return a + b\n",
+            17,
+        );
+        let instr_id = InstrId::new(BlockLabel::from_index(0), 0);
+        let counters = counter_record(
+            module_name,
+            module.source_hash,
+            module.function_id,
+            instr_id,
+        )
+        .encode()
+        .unwrap();
+        let counters_path = root.join("profile.bin");
+        fs::write(counters_path.as_path(), counters).unwrap();
+        let out_root = root.join("modules-out");
+        let module_cache_path = codegen_module_cache_path(
+            root.join("modules-in").as_path(),
+            PythonModuleCacheSource::Project,
+            module_name,
+        )
+        .unwrap();
+
+        run_with_args([
+            OsString::from("--counters"),
+            counters_path.into_os_string(),
+            OsString::from("--mode"),
+            OsString::from("v3"),
+            OsString::from("--module"),
+            module_cache_path.into_os_string(),
+            OsString::from("--out"),
+            out_root.clone().into_os_string(),
+        ])
+        .unwrap();
+
+        let output_path = module_optimization_plan_v3_path(
+            out_root.as_path(),
+            PythonModuleCacheSource::Project,
+            module_name,
+        )
+        .unwrap();
+        let artifacts = load_optimization_artifacts_v3(output_path.as_path()).unwrap();
+        assert_eq!(artifacts.plan.module.module_name, module_name);
+        assert_eq!(artifacts.plan.module.source_hash, module.source_hash);
+        assert_eq!(artifacts.emission.module_name, module_name);
+        assert!(
+            artifacts.plan.functions.iter().any(|function| {
+                function.function.function.local_function_id()
+                    == module.function_id.local_function_id()
+            }),
+            "v3 plan should include the profiled function"
+        );
+
+        let legacy_path = module_optimization_plan_path(
+            out_root.as_path(),
+            PythonModuleCacheSource::Project,
+            module_name,
+        )
+        .unwrap();
+        assert!(
+            !legacy_path.exists(),
+            "v3 mode should not write the legacy optimization plan"
         );
         let _ = fs::remove_dir_all(root);
     }
