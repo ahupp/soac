@@ -55,32 +55,38 @@ Non-goals:
 
 ## Implementation Status
 
-The first implementation stack established v3 as an off-by-default live
-validation path with one narrow live JIT lowering consumer. That bridge is
-useful for validation, but it is not the target architecture because it derives
-v3 inputs from legacy `mod.opt`.
+The current implementation uses an offline v3 planner path. Shared
+serializable plan and mechanical artifact types live in `soac-optimization`,
+the offline extraction/planning pipeline lives in `soac-optimizer`, and
+`soac-jit` consumes validated `mod.optv3` artifacts mechanically during
+`verify`/`apply` or precompile. The old live bridge that reconstructed v3
+artifacts from legacy `mod.opt` has been removed, so v3 no longer consumes
+legacy optimization decisions.
 
 Implemented:
 
-- `optimization_plan_v3`: full plan schema, conversion signatures, operation
-  signatures, replay-safety validation, and structural validation.
-- `optimization_alternatives_v3`: default catalog entries for generic Python
-  add/sub/mul/bitwise/all-rich-compare, exact compact-int
+- `soac-optimization::optimization_plan_v3`: full plan schema, conversion
+  signatures, operation signatures, replay-safety validation, and structural
+  validation.
+- `soac-optimizer::optimization_alternatives_v3`: default catalog entries for
+  generic Python add/sub/mul/bitwise/all-rich-compare, exact compact-int
   add/sub/mul/bitwise/all-rich-compare, truthiness, and materialization.
-- `optimization_region_v3`: conservative branch/return region extraction that
-  preserves evaluation order and declines unsupported blocks explicitly.
-- `optimization_planner_v3`: bounded planner for exact-compact-`int` direct
-  comparison branches, `a + b > 0` branches, `return a + b`/`return a - b`/
-  `return a * b` arithmetic returns, `return a & b`/`return a | b`/
-  `return a ^ b` bitwise returns, and `return a < b` comparison returns,
-  producing hot and local-fallback `RegionPlan`s.
-- `optimization_emit_v3`: validation-gated mechanical emitter over selected v3
-  plan nodes and exits.
-- `optimization_evidence_v3`: bridge from existing `FunctionProfileEvidence`
-  exact-int operator shapes and lowered integer module constants into v3
-  planner facts.
-- `optimization_pipeline_v3`: exact-int pipeline that composes extraction,
-  evidence, planning, validation, and mechanical emission.
+- `soac-optimizer::optimization_region_v3`: conservative branch/return region
+  extraction that preserves evaluation order and declines unsupported blocks
+  explicitly.
+- `soac-optimizer::optimization_planner_v3`: bounded planner for
+  exact-compact-`int` direct comparison branches, `a + b > 0` branches,
+  `return a + b`/`return a - b`/`return a * b` arithmetic returns,
+  `return a & b`/`return a | b`/`return a ^ b` bitwise returns, and
+  `return a < b` comparison returns, producing hot and local-fallback
+  `RegionPlan`s.
+- `soac-optimization::optimization_emit_v3`: validation-gated mechanical
+  emitter over selected v3 plan nodes and exits.
+- `soac-optimizer::optimization_evidence_v3`: bridge from existing
+  `FunctionProfileEvidence` exact-int operator shapes and lowered integer
+  module constants into v3 planner facts.
+- `soac-optimizer::optimization_pipeline_v3`: exact-int pipeline that composes
+  extraction, evidence, planning, validation, and mechanical emission.
 - `decide_optimizations --mode v3`: offline planner mode that reads cached
   unoptimized `mod.blockpy` plus `profile.bin`, derives v3 facts directly from
   raw profile evidence, and writes a serialized `mod.optv3` artifact.
@@ -89,10 +95,6 @@ Implemented:
   splits module-level artifacts into per-function mechanical artifacts, and only
   falls back to legacy `mod.opt` when no v3 artifact is present.
 - Offline precompile also prefers `mod.optv3` artifacts when available.
-- `SOAC_VALIDATE_OPT_V3`: transitional opt-in live validation while loading
-  legacy `mod.opt` plans in `verify`/`apply`; this currently reconstructs v3
-  input from the legacy plan and should be deleted once `mod.optv3` is the
-  normal v3 path.
 - `FunctionSpecializationInputs`: carries validated exact-int branch v3
   artifacts into the JIT build path, where codegen validates that the artifact
   function identity matches the function being compiled.
@@ -115,8 +117,6 @@ semantic plan targets.
 Current integration target:
 
 - Expand v3 coverage while keeping `mod.optv3` as the source of truth for v3.
-- Keep the live `SOAC_VALIDATE_OPT_V3` bridge only as a debugging comparison
-  mode until the offline v3 path has equivalent coverage, then delete it.
 - Stop generating or consuming legacy `mod.opt` once v3 covers the required
   optimization families.
 

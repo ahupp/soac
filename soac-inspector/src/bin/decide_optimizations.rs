@@ -1,9 +1,9 @@
 use anyhow::{Result, anyhow, bail};
-use soac_jit::optimization_pipeline_v3::generate_optimization_plans_v3_for_cached_modules;
-use soac_jit::optimization_plan::{
+use soac_optimization::optimization_plan::{
     CachedModuleOptimizationInput, ProfileEvidenceStore, cached_module_paths_under_root,
     generate_optimization_plans_for_cached_modules,
 };
+use soac_optimizer::optimization_pipeline_v3::generate_optimization_plans_v3_for_cached_modules;
 use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsString;
@@ -165,13 +165,15 @@ mod test {
     use super::*;
     use soac_core::block_py::{BlockLabel, InstrId, ModuleNameGen, RuntimeFunctionId};
     use soac_jit::module_type::hash_module_source;
-    use soac_jit::optimization_pipeline_v3::load_optimization_artifacts_v3;
-    use soac_jit::optimization_plan::{OptimizationPlan, PlannedAction, PlannedReplacement};
     use soac_lowering::codegen_cache::{
         CachedCodegenModuleMetadata, PythonModuleCacheSource, codegen_module_cache_path,
         module_optimization_plan_path, module_optimization_plan_v3_path,
     };
     use soac_lowering::{LoweringOptions, lower_python_to_blockpy_recorded_with_options};
+    use soac_optimization::optimization_artifacts_v3::load_optimization_artifacts_v3;
+    use soac_optimization::optimization_plan::{
+        OptimizationPlan, PlannedAction, PlannedReplacement,
+    };
     use soac_profile::{
         CounterDumpRecord, CounterDumpRow, CounterDumpTypeKey, CounterDumpTypeKeyLayout,
         CounterDumpTypeTableEntry,

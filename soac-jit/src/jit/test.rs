@@ -22,11 +22,6 @@ use soac_lowering::passes::{
 mod tests {
     use super::*;
     use crate::jit::direct_abi::RuntimePrimitiveId;
-    use crate::optimization_plan::{
-        FunctionOptimizationPlan, OptimizationDecision, OptimizationPlan, PlannedAction,
-        PlannedAlternative, PlannedFallback, PlannedFunctionTarget, PlannedGuard,
-        PlannedIndexedFieldSpecialization, PlannedReplacement, PlannedTypeKey, ShapeFamily,
-    };
     use cranelift_codegen::cursor::Cursor;
     use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyModule, PyModuleMethods, PyTuple};
     use pyo3::{Bound, Py, PyAny, PyErr, PyResult, Python, ffi};
@@ -35,6 +30,17 @@ mod tests {
         PythonModuleCacheSource, module_optimization_plan_path, module_optimization_plan_v3_path,
     };
     use soac_lowering::passes::{TypedInstrExtra, TypedPlannedResult as PlannedResult};
+    use soac_optimization::optimization_artifacts_v3::{
+        ExactIntBranchV3Artifacts, write_optimization_artifacts_v3,
+    };
+    use soac_optimization::optimization_plan::{
+        FunctionOptimizationPlan, FunctionProfileEvidence, OptimizationDecision, OptimizationPlan,
+        PlannedAction, PlannedAlternative, PlannedFallback, PlannedFunctionTarget, PlannedGuard,
+        PlannedIndexedFieldSpecialization, PlannedReplacement, PlannedTypeKey, ShapeFamily,
+    };
+    use soac_optimization::optimization_plan_v3::{FunctionPlanIdentity, ModulePlanIdentity};
+    use soac_optimizer::optimization_alternatives_v3::AlternativeCatalog;
+    use soac_optimizer::optimization_pipeline_v3::plan_and_emit_function_exact_int_branches_v3_with_module_constants;
     use soac_profile::{
         CounterDumpRecord, CounterDumpRow, CounterDumpTypeKey, CounterDumpTypeKeyLayout,
         CounterDumpTypeTableEntry, write_counter_dump_records,
@@ -3051,7 +3057,7 @@ def build(values):
     }
 
     fn write_test_optimization_artifacts_v3(path: &Path, artifacts: &ExactIntBranchV3Artifacts) {
-        crate::optimization_pipeline_v3::write_optimization_artifacts_v3(path, artifacts)
+        write_optimization_artifacts_v3(path, artifacts)
             .expect("test optimization plan v3 should be writable");
     }
 
@@ -3073,24 +3079,30 @@ def build(values):
                 },
                 helper_catalog_version: 1,
                 cost_model_version: 1,
-                functions: vec![crate::optimization_plan_v3::FunctionOptimizationPlanV3 {
-                    function: FunctionPlanIdentity {
-                        function: serialized_function,
-                        debug_name: Some(function.names.qualname.clone()),
+                functions: vec![
+                    soac_optimization::optimization_plan_v3::FunctionOptimizationPlanV3 {
+                        function: FunctionPlanIdentity {
+                            function: serialized_function,
+                            debug_name: Some(function.names.qualname.clone()),
+                        },
+                        regions: Vec::new(),
+                        deopt_points: Vec::new(),
+                        ownership:
+                            soac_optimization::optimization_plan_v3::FunctionOwnershipPlan::default(
+                            ),
+                        diagnostics: Vec::new(),
                     },
-                    regions: Vec::new(),
-                    deopt_points: Vec::new(),
-                    ownership: crate::optimization_plan_v3::FunctionOwnershipPlan::default(),
-                    diagnostics: Vec::new(),
-                }],
+                ],
             },
             emission: MechanicalModuleEmission {
                 module_name: module_name.to_string(),
-                functions: vec![crate::optimization_emit_v3::MechanicalFunctionEmission {
-                    function: serialized_function,
-                    debug_name: Some(function.names.qualname.clone()),
-                    regions: Vec::new(),
-                }],
+                functions: vec![
+                    soac_optimization::optimization_emit_v3::MechanicalFunctionEmission {
+                        function: serialized_function,
+                        debug_name: Some(function.names.qualname.clone()),
+                        regions: Vec::new(),
+                    },
+                ],
             },
         }
     }
@@ -15198,9 +15210,9 @@ def f(x):
             Vec::new(),
             &[(
                 instr_id,
-                crate::operator_specialization::pack_binary_shape(
-                    crate::operator_specialization::ExactTypeTag::Int,
-                    crate::operator_specialization::ExactTypeTag::Int,
+                soac_optimization::operator_specialization::pack_binary_shape(
+                    soac_optimization::operator_specialization::ExactTypeTag::Int,
+                    soac_optimization::operator_specialization::ExactTypeTag::Int,
                 ),
             )],
         );
@@ -15362,9 +15374,9 @@ def f(x):
             Vec::new(),
             &[(
                 instr_id,
-                crate::operator_specialization::pack_binary_shape(
-                    crate::operator_specialization::ExactTypeTag::Int,
-                    crate::operator_specialization::ExactTypeTag::Int,
+                soac_optimization::operator_specialization::pack_binary_shape(
+                    soac_optimization::operator_specialization::ExactTypeTag::Int,
+                    soac_optimization::operator_specialization::ExactTypeTag::Int,
                 ),
             )],
         );
@@ -15449,10 +15461,12 @@ def f(x):
                         function_qualname: Some(function.names.qualname.clone()),
                         block_label: None,
                         value: 1,
-                        observed_value: Some(crate::operator_specialization::pack_binary_shape(
-                            crate::operator_specialization::ExactTypeTag::Int,
-                            crate::operator_specialization::ExactTypeTag::Int,
-                        )),
+                        observed_value: Some(
+                            soac_optimization::operator_specialization::pack_binary_shape(
+                                soac_optimization::operator_specialization::ExactTypeTag::Int,
+                                soac_optimization::operator_specialization::ExactTypeTag::Int,
+                            ),
+                        ),
                         max_overcount: Some(0),
                     }],
                     module_keys: Vec::new(),
@@ -15632,9 +15646,9 @@ def f(x):
             Vec::new(),
             &[(
                 instr_id,
-                crate::operator_specialization::pack_binary_shape(
-                    crate::operator_specialization::ExactTypeTag::Int,
-                    crate::operator_specialization::ExactTypeTag::Int,
+                soac_optimization::operator_specialization::pack_binary_shape(
+                    soac_optimization::operator_specialization::ExactTypeTag::Int,
+                    soac_optimization::operator_specialization::ExactTypeTag::Int,
                 ),
             )],
         );
@@ -15657,103 +15671,6 @@ def f(x):
         assert!(
             count_symbolic_global_values(&built.ctx.func) > baseline_symbolic_globals,
             "exact-int compare specialization should add a symbolic global for the PyLong guard",
-        );
-    }
-
-    #[test]
-    fn specialized_jit_opt_v3_exact_int_if_compare_uses_local_fallback() {
-        if crate::run_test_in_isolated_process_if_needed(
-            module_path!(),
-            "specialized_jit_opt_v3_exact_int_if_compare_uses_local_fallback",
-        ) {
-            return;
-        }
-        let _opt_v3_guard = EnvVarGuard::set(SOAC_VALIDATE_OPT_V3_ENV, "1");
-        let blocks = [1usize as ObjPtr, 2usize as ObjPtr, 3usize as ObjPtr];
-        let mut constants = TestConstantPool::default();
-        let mut function = test_function();
-        function.params = ParamSpec {
-            params: vec![
-                Param {
-                    name: "a".into(),
-                    kind: ParamKind::Any,
-                    has_default: false,
-                },
-                Param {
-                    name: "b".into(),
-                    kind: ParamKind::Any,
-                    has_default: false,
-                },
-            ],
-        };
-        let entry_label = function.name_gen.next_block_name();
-        let then_label = function.name_gen.next_block_name();
-        let else_label = function.name_gen.next_block_name();
-        let instr_id = InstrId::new(entry_label, 0);
-        let entry = CodegenBlock {
-            label: entry_label,
-            body: vec![],
-            term: BlockTerm::IfTerm(soac_core::block_py::TermIf {
-                test: with_instr_id(
-                    op_expr(BinOp::new(
-                        BinOpKind::Lt,
-                        name_expr(test_name("a")),
-                        name_expr(test_local_name("b", 1)),
-                    )),
-                    instr_id,
-                ),
-                then_label,
-                else_label,
-            }),
-            params: vec![],
-            exc_edge: None,
-        };
-        let then_block = CodegenBlock {
-            label: then_label,
-            body: vec![],
-            term: ret_term(constants.int_expr(1)),
-            params: vec![],
-            exc_edge: None,
-        };
-        let else_block = CodegenBlock {
-            label: else_label,
-            body: vec![],
-            term: ret_term(constants.int_expr(0)),
-            params: vec![],
-            exc_edge: None,
-        };
-        function.blocks = vec![entry, then_block, else_block];
-        set_stack_slots(&mut function, &["a", "b"]);
-        let (_jit_module, built) = build_test_jit_function_with_operator_specializations(
-            &function,
-            &blocks,
-            constants.module_constants,
-            &[(
-                instr_id,
-                crate::operator_specialization::pack_binary_shape(
-                    crate::operator_specialization::ExactTypeTag::Int,
-                    crate::operator_specialization::ExactTypeTag::Int,
-                ),
-            )],
-        );
-        let generic_fallback_helpers =
-            import_user_names_for_symbols(&built, &["PyObject_RichCompare", "dp_jit_is_true"]);
-        assert_eq!(
-            count_direct_calls_to_runtime_helpers(&built.ctx.func, &generic_fallback_helpers),
-            2,
-            "v3 exact-int compare branch should keep generic rich-compare and truthiness in the local fallback"
-        );
-        let legacy_exact_helpers = import_user_names_for_symbols(
-            &built,
-            &[
-                "dp_jit_exact_long_richcompare_bool_slot",
-                "dp_jit_exact_long_richcompare_slot",
-            ],
-        );
-        assert_eq!(
-            count_direct_calls_to_runtime_helpers(&built.ctx.func, &legacy_exact_helpers),
-            0,
-            "v3 exact-int compare branch should not rely on legacy exact-long compare helpers"
         );
     }
 
@@ -15849,9 +15766,9 @@ def f(x):
         };
         function.blocks = vec![entry, test_block, then_block, else_block];
         set_stack_slots(&mut function, &["a", "b", "c"]);
-        let exact_int_shape = crate::operator_specialization::pack_binary_shape(
-            crate::operator_specialization::ExactTypeTag::Int,
-            crate::operator_specialization::ExactTypeTag::Int,
+        let exact_int_shape = soac_optimization::operator_specialization::pack_binary_shape(
+            soac_optimization::operator_specialization::ExactTypeTag::Int,
+            soac_optimization::operator_specialization::ExactTypeTag::Int,
         );
         let (_jit_module, built) = build_test_jit_function_with_operator_specializations(
             &function,
@@ -15968,9 +15885,9 @@ def f(x):
         let function = module.callable_defs[0].clone();
         let module_constants =
             crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
-        let exact_int_shape = crate::operator_specialization::pack_binary_shape(
-            crate::operator_specialization::ExactTypeTag::Int,
-            crate::operator_specialization::ExactTypeTag::Int,
+        let exact_int_shape = soac_optimization::operator_specialization::pack_binary_shape(
+            soac_optimization::operator_specialization::ExactTypeTag::Int,
+            soac_optimization::operator_specialization::ExactTypeTag::Int,
         );
         let mut evidence = FunctionProfileEvidence::default();
         evidence
@@ -16152,9 +16069,9 @@ def f(x):
         let function = module.callable_defs[0].clone();
         let module_constants =
             crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
-        let exact_int_shape = crate::operator_specialization::pack_binary_shape(
-            crate::operator_specialization::ExactTypeTag::Int,
-            crate::operator_specialization::ExactTypeTag::Int,
+        let exact_int_shape = soac_optimization::operator_specialization::pack_binary_shape(
+            soac_optimization::operator_specialization::ExactTypeTag::Int,
+            soac_optimization::operator_specialization::ExactTypeTag::Int,
         );
         let mut evidence = FunctionProfileEvidence::default();
         evidence
@@ -16305,9 +16222,9 @@ def f(x):
             let function = module.callable_defs[0].clone();
             let module_constants =
                 crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
-            let exact_int_shape = crate::operator_specialization::pack_binary_shape(
-                crate::operator_specialization::ExactTypeTag::Int,
-                crate::operator_specialization::ExactTypeTag::Int,
+            let exact_int_shape = soac_optimization::operator_specialization::pack_binary_shape(
+                soac_optimization::operator_specialization::ExactTypeTag::Int,
+                soac_optimization::operator_specialization::ExactTypeTag::Int,
             );
             let mut evidence = FunctionProfileEvidence::default();
             evidence
@@ -16432,9 +16349,9 @@ def f(x):
             let function = module.callable_defs[0].clone();
             let module_constants =
                 crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
-            let exact_int_shape = crate::operator_specialization::pack_binary_shape(
-                crate::operator_specialization::ExactTypeTag::Int,
-                crate::operator_specialization::ExactTypeTag::Int,
+            let exact_int_shape = soac_optimization::operator_specialization::pack_binary_shape(
+                soac_optimization::operator_specialization::ExactTypeTag::Int,
+                soac_optimization::operator_specialization::ExactTypeTag::Int,
             );
             let mut evidence = FunctionProfileEvidence::default();
             evidence
@@ -16554,9 +16471,9 @@ def f(x):
         let function = module.callable_defs[0].clone();
         let module_constants =
             crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
-        let exact_int_shape = crate::operator_specialization::pack_binary_shape(
-            crate::operator_specialization::ExactTypeTag::Int,
-            crate::operator_specialization::ExactTypeTag::Int,
+        let exact_int_shape = soac_optimization::operator_specialization::pack_binary_shape(
+            soac_optimization::operator_specialization::ExactTypeTag::Int,
+            soac_optimization::operator_specialization::ExactTypeTag::Int,
         );
         let mut evidence = FunctionProfileEvidence::default();
         evidence
@@ -16644,24 +16561,30 @@ def f(x):
                 },
                 helper_catalog_version: 1,
                 cost_model_version: 1,
-                functions: vec![crate::optimization_plan_v3::FunctionOptimizationPlanV3 {
-                    function: FunctionPlanIdentity {
-                        function: serialized_function,
-                        debug_name: Some(function.names.qualname.clone()),
+                functions: vec![
+                    soac_optimization::optimization_plan_v3::FunctionOptimizationPlanV3 {
+                        function: FunctionPlanIdentity {
+                            function: serialized_function,
+                            debug_name: Some(function.names.qualname.clone()),
+                        },
+                        regions: Vec::new(),
+                        deopt_points: Vec::new(),
+                        ownership:
+                            soac_optimization::optimization_plan_v3::FunctionOwnershipPlan::default(
+                            ),
+                        diagnostics: Vec::new(),
                     },
-                    regions: Vec::new(),
-                    deopt_points: Vec::new(),
-                    ownership: crate::optimization_plan_v3::FunctionOwnershipPlan::default(),
-                    diagnostics: Vec::new(),
-                }],
+                ],
             },
             emission: MechanicalModuleEmission {
                 module_name: "test".to_string(),
-                functions: vec![crate::optimization_emit_v3::MechanicalFunctionEmission {
-                    function: serialized_function,
-                    debug_name: Some(function.names.qualname.clone()),
-                    regions: Vec::new(),
-                }],
+                functions: vec![
+                    soac_optimization::optimization_emit_v3::MechanicalFunctionEmission {
+                        function: serialized_function,
+                        debug_name: Some(function.names.qualname.clone()),
+                        regions: Vec::new(),
+                    },
+                ],
             },
         };
 
@@ -16798,9 +16721,9 @@ def f(x):
             Vec::new(),
             &[(
                 instr_id,
-                crate::operator_specialization::pack_binary_shape(
-                    crate::operator_specialization::ExactTypeTag::Int,
-                    crate::operator_specialization::ExactTypeTag::Int,
+                soac_optimization::operator_specialization::pack_binary_shape(
+                    soac_optimization::operator_specialization::ExactTypeTag::Int,
+                    soac_optimization::operator_specialization::ExactTypeTag::Int,
                 ),
             )],
         );
@@ -16885,10 +16808,12 @@ def f(x):
                         function_qualname: Some(function.names.qualname.clone()),
                         block_label: None,
                         value: 1,
-                        observed_value: Some(crate::operator_specialization::pack_binary_shape(
-                            crate::operator_specialization::ExactTypeTag::Int,
-                            crate::operator_specialization::ExactTypeTag::Int,
-                        )),
+                        observed_value: Some(
+                            soac_optimization::operator_specialization::pack_binary_shape(
+                                soac_optimization::operator_specialization::ExactTypeTag::Int,
+                                soac_optimization::operator_specialization::ExactTypeTag::Int,
+                            ),
+                        ),
                         max_overcount: Some(0),
                     }],
                     module_keys: Vec::new(),
@@ -17108,10 +17033,12 @@ def f(x):
                         function_qualname: Some(function.names.qualname.clone()),
                         block_label: None,
                         value: 1,
-                        observed_value: Some(crate::operator_specialization::pack_binary_shape(
-                            crate::operator_specialization::ExactTypeTag::Int,
-                            crate::operator_specialization::ExactTypeTag::Int,
-                        )),
+                        observed_value: Some(
+                            soac_optimization::operator_specialization::pack_binary_shape(
+                                soac_optimization::operator_specialization::ExactTypeTag::Int,
+                                soac_optimization::operator_specialization::ExactTypeTag::Int,
+                            ),
+                        ),
                         max_overcount: Some(0),
                     }],
                     module_keys: Vec::new(),
@@ -17280,8 +17207,8 @@ def f(x):
             Vec::new(),
             &[(
                 instr_id,
-                crate::operator_specialization::pack_unary_shape(
-                    crate::operator_specialization::ExactTypeTag::Int,
+                soac_optimization::operator_specialization::pack_unary_shape(
+                    soac_optimization::operator_specialization::ExactTypeTag::Int,
                 ),
             )],
         );
@@ -17294,8 +17221,8 @@ def f(x):
         assert!(
             function_contains_iconst_imm(
                 &built.ctx.func,
-                crate::operator_specialization::pack_unary_shape(
-                    crate::operator_specialization::ExactTypeTag::Int,
+                soac_optimization::operator_specialization::pack_unary_shape(
+                    soac_optimization::operator_specialization::ExactTypeTag::Int,
                 ) as i64,
             ),
             "exact-int unary specialization should guard on the profiled exact-int shape",
@@ -17352,8 +17279,8 @@ def f(x):
             Vec::new(),
             &[(
                 instr_id,
-                crate::operator_specialization::pack_unary_shape(
-                    crate::operator_specialization::ExactTypeTag::Int,
+                soac_optimization::operator_specialization::pack_unary_shape(
+                    soac_optimization::operator_specialization::ExactTypeTag::Int,
                 ),
             )],
         );
@@ -17430,9 +17357,11 @@ def f(x):
                         function_qualname: Some(function.names.qualname.clone()),
                         block_label: None,
                         value: 1,
-                        observed_value: Some(crate::operator_specialization::pack_unary_shape(
-                            crate::operator_specialization::ExactTypeTag::Int,
-                        )),
+                        observed_value: Some(
+                            soac_optimization::operator_specialization::pack_unary_shape(
+                                soac_optimization::operator_specialization::ExactTypeTag::Int,
+                            ),
+                        ),
                         max_overcount: Some(0),
                     }],
                     module_keys: Vec::new(),
@@ -17574,9 +17503,9 @@ def f(x):
             constants.module_constants,
             &[(
                 instr_id,
-                crate::operator_specialization::pack_binary_shape(
-                    crate::operator_specialization::ExactTypeTag::Int,
-                    crate::operator_specialization::ExactTypeTag::Int,
+                soac_optimization::operator_specialization::pack_binary_shape(
+                    soac_optimization::operator_specialization::ExactTypeTag::Int,
+                    soac_optimization::operator_specialization::ExactTypeTag::Int,
                 ),
             )],
         );

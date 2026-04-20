@@ -1,10 +1,10 @@
-use crate::operator_specialization::{ExactTypeTag, unpack_binary_shape};
-use crate::optimization_plan::FunctionProfileEvidence;
 use crate::optimization_planner_v3::PlannerFacts;
 use crate::optimization_region_v3::{ExtractedRegion, ExtractedValueId, ExtractedValueKind};
 use soac_core::block_py::NameLocation;
 use soac_lowering::block_py::{Literal, NumberLiteralValue};
 use soac_lowering::passes::InstrResolved;
+use soac_optimization::operator_specialization::{ExactTypeTag, unpack_binary_shape};
+use soac_optimization::optimization_plan::FunctionProfileEvidence;
 use std::collections::HashMap;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -89,12 +89,7 @@ fn has_exact_int_binary_shape(shapes: &[u64]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::operator_specialization::{ExactTypeTag, pack_binary_shape};
     use crate::optimization_alternatives_v3::AlternativeCatalog;
-    use crate::optimization_plan::FunctionProfileEvidence;
-    use crate::optimization_plan_v3::{
-        FunctionPlanIdentity, ModulePlanIdentity, RegionId, validate_module_plan_v3,
-    };
     use crate::optimization_planner_v3::{
         ExtractedRegionPlanRequest, FunctionPlanRequest, ModulePlanRequest,
         plan_module_optimization_v3,
@@ -106,6 +101,11 @@ mod tests {
         SerializedModuleId, TermIf, WithMeta,
     };
     use soac_lowering::block_py::{IntLiteral, LiteralValue, NumberLiteral};
+    use soac_optimization::operator_specialization::{ExactTypeTag, pack_binary_shape};
+    use soac_optimization::optimization_plan::FunctionProfileEvidence;
+    use soac_optimization::optimization_plan_v3::{
+        FunctionPlanIdentity, ModulePlanIdentity, RegionId, validate_module_plan_v3,
+    };
 
     fn label(index: usize) -> BlockLabel {
         BlockLabel::from_index(index)
@@ -218,7 +218,7 @@ mod tests {
     fn plan_with(
         region: ExtractedRegion,
         facts: PlannerFacts,
-    ) -> crate::optimization_plan_v3::ModuleOptimizationPlanV3 {
+    ) -> soac_optimization::optimization_plan_v3::ModuleOptimizationPlanV3 {
         plan_module_optimization_v3(
             &AlternativeCatalog::default_v3(),
             ModulePlanRequest {

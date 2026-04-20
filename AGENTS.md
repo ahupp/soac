@@ -451,13 +451,6 @@ explicit ordinary
   `$SOAC_WORK_DIR/profile.bin` as Cranelift `cold` block hints during
   `verify`/`apply`. This is disabled by default; the counters remain
   recorded in `profile`/`verify` either way.
-- `SOAC_VALIDATE_OPT_V3`
-  Transitional opt-in for validating the current optimizer-v3 exact-int branch
-  pipeline while loading legacy `mod.opt` plans in `verify`/`apply`. Normal v3
-  integration should use `decide_optimizations --mode v3` to write `mod.optv3`
-  from raw profile evidence and cached unoptimized BlockPy modules, then let JIT
-  codegen consume the serialized mechanical artifact directly. Keep this env var
-  for comparison while coverage migrates.
 - `BENCHMARK_CPU` / `BENCHMARK_CONSTANT_CLOCKS`
   The benchmark recipes use
   [scripts/run_benchmark_with_cpu_mode.sh](/home/adam/project/soac-profile/scripts/run_benchmark_with_cpu_mode.sh)

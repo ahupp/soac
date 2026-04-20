@@ -3,6 +3,8 @@ members = [
     "build_support",
     "soac-core",
     "soac-profile",
+    "soac-optimization",
+    "soac-optimizer",
     "soac-config",
     "soac-cpython",
     "soac-lowering",
@@ -14,6 +16,8 @@ members = [
 default-members = [
     "soac-core",
     "soac-profile",
+    "soac-optimization",
+    "soac-optimizer",
     "soac-config",
     "soac-cpython",
     "soac-lowering",

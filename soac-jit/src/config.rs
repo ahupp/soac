@@ -3,9 +3,7 @@ use cranelift_codegen::settings;
 use cranelift_codegen::settings::Configurable;
 pub(crate) use soac_config::SpecializationMode;
 #[cfg(test)]
-pub(crate) use soac_config::{
-    SOAC_JIT_EMIT_REFCOUNTS_ENV, SOAC_OPT_PLAN_MODE_ENV, SOAC_VALIDATE_OPT_V3_ENV,
-};
+pub(crate) use soac_config::{SOAC_JIT_EMIT_REFCOUNTS_ENV, SOAC_OPT_PLAN_MODE_ENV};
 use soac_config::{
     SoacEnvConfig, precompiled_library_path_from_env as config_precompiled_library_path_from_env,
 };

@@ -9,7 +9,6 @@ pub const SOAC_OPT_PLAN_MODE_ENV: &str = "SOAC_OPT_PLAN_MODE";
 pub const SOAC_WORK_DIR_ENV: &str = "SOAC_WORK_DIR";
 pub const SOAC_CRANELIFT_OPT_LEVEL_ENV: &str = "SOAC_CRANELIFT_OPT_LEVEL";
 pub const SOAC_ENABLE_PROFILED_COLD_BLOCKS_ENV: &str = "SOAC_ENABLE_PROFILED_COLD_BLOCKS";
-pub const SOAC_VALIDATE_OPT_V3_ENV: &str = "SOAC_VALIDATE_OPT_V3";
 pub const SOAC_JIT_EMIT_REFCOUNTS_ENV: &str = "SOAC_JIT_EMIT_REFCOUNTS";
 pub const SOAC_JIT_COMPILE_WORKERS_ENV: &str = "SOAC_JIT_COMPILE_WORKERS";
 pub const SOAC_BACKGROUND_JIT_ENV: &str = "SOAC_BACKGROUND_JIT";
@@ -129,7 +128,6 @@ pub struct SoacEnvConfig {
     optimization_plan_mode: OptimizationPlanMode,
     soac_work_dir: Option<PathBuf>,
     profiled_cold_blocks_enabled: bool,
-    opt_v3_validation_enabled: bool,
     jit_refcount_emission_enabled: bool,
     compile_mode: CompileMode,
     jit_compile_workers: Option<usize>,
@@ -206,7 +204,6 @@ impl SoacEnvConfig {
             parse_optional_optimization_plan_mode(env_string(SOAC_OPT_PLAN_MODE_ENV)?.as_deref())?;
         let soac_work_dir = env_path(SOAC_WORK_DIR_ENV)?;
         let profiled_cold_blocks_enabled = env_bool(SOAC_ENABLE_PROFILED_COLD_BLOCKS_ENV, false)?;
-        let opt_v3_validation_enabled = env_bool(SOAC_VALIDATE_OPT_V3_ENV, false)?;
         let jit_refcount_emission_enabled = env_bool(SOAC_JIT_EMIT_REFCOUNTS_ENV, true)?;
         let compile_mode =
             parse_optional_compile_mode(env_string(SOAC_COMPILE_MODE_ENV)?.as_deref())?;
@@ -229,7 +226,6 @@ impl SoacEnvConfig {
             optimization_plan_mode,
             soac_work_dir,
             profiled_cold_blocks_enabled,
-            opt_v3_validation_enabled,
             jit_refcount_emission_enabled,
             compile_mode,
             jit_compile_workers,
@@ -292,10 +288,6 @@ impl SoacEnvConfig {
         self.profiled_cold_blocks_enabled
     }
 
-    pub fn opt_v3_validation_enabled(&self) -> bool {
-        self.opt_v3_validation_enabled
-    }
-
     pub fn jit_refcount_emission_enabled(&self) -> bool {
         self.jit_refcount_emission_enabled
     }
@@ -350,7 +342,6 @@ impl Default for SoacEnvConfig {
             optimization_plan_mode: OptimizationPlanMode::Auto,
             soac_work_dir: None,
             profiled_cold_blocks_enabled: false,
-            opt_v3_validation_enabled: false,
             jit_refcount_emission_enabled: true,
             compile_mode: CompileMode::Lazy,
             jit_compile_workers: None,
@@ -555,7 +546,6 @@ mod tests {
             EnvVarGuard::remove(SOAC_WORK_DIR_ENV),
             EnvVarGuard::remove(SOAC_CRANELIFT_OPT_LEVEL_ENV),
             EnvVarGuard::remove(SOAC_ENABLE_PROFILED_COLD_BLOCKS_ENV),
-            EnvVarGuard::remove(SOAC_VALIDATE_OPT_V3_ENV),
             EnvVarGuard::remove(SOAC_JIT_EMIT_REFCOUNTS_ENV),
             EnvVarGuard::remove(SOAC_PRECOMPILED_LIBRARY_ENV),
             EnvVarGuard::remove(SOAC_COMPILE_MODE_ENV),
@@ -609,7 +599,6 @@ mod tests {
         assert_eq!(config.compile_mode(), CompileMode::Lazy);
         assert_eq!(config.jit_compile_workers(), None);
         assert!(config.background_jit_enabled());
-        assert!(!config.opt_v3_validation_enabled());
         assert!(config.jit_refcount_emission_enabled());
         assert!(!config.jit_perf_helper_frames_enabled());
     }
@@ -634,7 +623,6 @@ mod tests {
             (SOAC_OPT_PLAN_MODE_ENV, "bogus"),
             (SOAC_CRANELIFT_OPT_LEVEL_ENV, "fastest"),
             (SOAC_ENABLE_PROFILED_COLD_BLOCKS_ENV, "maybe"),
-            (SOAC_VALIDATE_OPT_V3_ENV, "maybe"),
             (SOAC_JIT_EMIT_REFCOUNTS_ENV, ""),
             (SOAC_COMPILE_MODE_ENV, "always"),
             (SOAC_JIT_COMPILE_WORKERS_ENV, "0"),

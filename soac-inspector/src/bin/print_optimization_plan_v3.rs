@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow, bail};
-use soac_jit::optimization_pipeline_v3::{
+use soac_optimization::optimization_artifacts_v3::{
     ExactIntBranchV3Artifacts, load_optimization_artifacts_v3,
 };
 use std::env;
@@ -126,8 +126,10 @@ fn format_optimization_artifacts_v3(artifacts: &ExactIntBranchV3Artifacts) -> St
 mod test {
     use super::*;
     use soac_core::block_py::{LocalFunctionId, SerializedFunctionId, SerializedModuleId};
-    use soac_jit::optimization_emit_v3::{MechanicalFunctionEmission, MechanicalModuleEmission};
-    use soac_jit::optimization_plan_v3::{
+    use soac_optimization::optimization_emit_v3::{
+        MechanicalFunctionEmission, MechanicalModuleEmission,
+    };
+    use soac_optimization::optimization_plan_v3::{
         FunctionOptimizationPlanV3, FunctionOwnershipPlan, FunctionPlanIdentity,
         ModuleOptimizationPlanV3, ModulePlanIdentity,
     };

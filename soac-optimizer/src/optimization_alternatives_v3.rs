@@ -1,10 +1,10 @@
-use crate::optimization_plan_v3::{
+use soac_core::block_py::BinOpKind;
+use soac_optimization::optimization_plan_v3::{
     ConversionKind, Cost, DeoptPointId, DeoptReason, FailureMode, FailureReplayKind,
     FailureReplayPolicy, FallbackReason, FallbackTarget, GuardFailure, GuardKind, GuardNode,
     GuardSpec, MaterializeKind, PlannedOp, PythonExceptionSpec, Rep, RichCompareOp,
     conversion_signature,
 };
-use soac_core::block_py::BinOpKind;
 use std::collections::HashSet;
 use std::fmt;
 
@@ -1266,14 +1266,14 @@ fn exact_compact_int_guard(input: u32) -> GuardRequirement {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::optimization_plan_v3::{
+    use soac_core::block_py::{
+        BlockLabel, InstrId, LocalFunctionId, SerializedFunctionId, SerializedModuleId,
+    };
+    use soac_optimization::optimization_plan_v3::{
         ConversionOwnership, ConversionPrecondition, ConvertNode, MaterializeNode,
         ModuleOptimizationPlanV3, ModulePlanIdentity, PlanNode, PlanNodeId, PlanNodeKind,
         PlanValue, PlannedConstant, RegionExitKind, RegionExitPlan, RegionExitTarget, RegionId,
         RegionInput, RegionInputSource, RegionPlan, RegionSource, validate_module_plan_v3,
-    };
-    use soac_core::block_py::{
-        BlockLabel, InstrId, LocalFunctionId, SerializedFunctionId, SerializedModuleId,
     };
 
     fn test_function_id() -> SerializedFunctionId {
@@ -1484,14 +1484,16 @@ mod tests {
                 unbox_node(3, b_obj, b_i64, 1),
                 node(
                     4,
-                    PlanNodeKind::Operation(crate::optimization_plan_v3::OperationNode {
-                        op: add.planned_operation().unwrap(),
-                        inputs: vec![a_i64, b_i64],
-                        output: Some(sum_i64),
-                        failure_replay: add.failure_replay.clone(),
-                        failure: add.instantiate_failure(&fallback_target).unwrap(),
-                        cost: add.cost,
-                    }),
+                    PlanNodeKind::Operation(
+                        soac_optimization::optimization_plan_v3::OperationNode {
+                            op: add.planned_operation().unwrap(),
+                            inputs: vec![a_i64, b_i64],
+                            output: Some(sum_i64),
+                            failure_replay: add.failure_replay.clone(),
+                            failure: add.instantiate_failure(&fallback_target).unwrap(),
+                            cost: add.cost,
+                        },
+                    ),
                 ),
                 node(
                     5,
@@ -1502,14 +1504,16 @@ mod tests {
                 ),
                 node(
                     6,
-                    PlanNodeKind::Operation(crate::optimization_plan_v3::OperationNode {
-                        op: compare.planned_operation().unwrap(),
-                        inputs: vec![sum_i64, zero_i64],
-                        output: Some(condition),
-                        failure_replay: compare.failure_replay.clone(),
-                        failure: compare.instantiate_failure(&fallback_target).unwrap(),
-                        cost: compare.cost,
-                    }),
+                    PlanNodeKind::Operation(
+                        soac_optimization::optimization_plan_v3::OperationNode {
+                            op: compare.planned_operation().unwrap(),
+                            inputs: vec![sum_i64, zero_i64],
+                            output: Some(condition),
+                            failure_replay: compare.failure_replay.clone(),
+                            failure: compare.instantiate_failure(&fallback_target).unwrap(),
+                            cost: compare.cost,
+                        },
+                    ),
                 ),
             ],
             exits: vec![RegionExitPlan {
@@ -1536,14 +1540,16 @@ mod tests {
             nodes: vec![
                 node(
                     10,
-                    PlanNodeKind::Operation(crate::optimization_plan_v3::OperationNode {
-                        op: generic_add.planned_operation().unwrap(),
-                        inputs: vec![a_obj, b_obj],
-                        output: Some(fallback_sum),
-                        failure_replay: generic_add.failure_replay.clone(),
-                        failure: generic_add.instantiate_failure(&fallback_target).unwrap(),
-                        cost: generic_add.cost,
-                    }),
+                    PlanNodeKind::Operation(
+                        soac_optimization::optimization_plan_v3::OperationNode {
+                            op: generic_add.planned_operation().unwrap(),
+                            inputs: vec![a_obj, b_obj],
+                            output: Some(fallback_sum),
+                            failure_replay: generic_add.failure_replay.clone(),
+                            failure: generic_add.instantiate_failure(&fallback_target).unwrap(),
+                            cost: generic_add.cost,
+                        },
+                    ),
                 ),
                 node(
                     11,
@@ -1562,16 +1568,18 @@ mod tests {
                 ),
                 node(
                     13,
-                    PlanNodeKind::Operation(crate::optimization_plan_v3::OperationNode {
-                        op: generic_compare.planned_operation().unwrap(),
-                        inputs: vec![fallback_sum, fallback_zero_obj],
-                        output: Some(fallback_compare),
-                        failure_replay: generic_compare.failure_replay.clone(),
-                        failure: generic_compare
-                            .instantiate_failure(&fallback_target)
-                            .unwrap(),
-                        cost: generic_compare.cost,
-                    }),
+                    PlanNodeKind::Operation(
+                        soac_optimization::optimization_plan_v3::OperationNode {
+                            op: generic_compare.planned_operation().unwrap(),
+                            inputs: vec![fallback_sum, fallback_zero_obj],
+                            output: Some(fallback_compare),
+                            failure_replay: generic_compare.failure_replay.clone(),
+                            failure: generic_compare
+                                .instantiate_failure(&fallback_target)
+                                .unwrap(),
+                            cost: generic_compare.cost,
+                        },
+                    ),
                 ),
                 node(
                     14,
@@ -1608,16 +1616,19 @@ mod tests {
             },
             helper_catalog_version: ALTERNATIVE_CATALOG_V3_VERSION,
             cost_model_version: 1,
-            functions: vec![crate::optimization_plan_v3::FunctionOptimizationPlanV3 {
-                function: crate::optimization_plan_v3::FunctionPlanIdentity {
-                    function: test_function_id(),
-                    debug_name: Some("f".to_string()),
+            functions: vec![
+                soac_optimization::optimization_plan_v3::FunctionOptimizationPlanV3 {
+                    function: soac_optimization::optimization_plan_v3::FunctionPlanIdentity {
+                        function: test_function_id(),
+                        debug_name: Some("f".to_string()),
+                    },
+                    regions: vec![hot_region, fallback_region],
+                    deopt_points: Vec::new(),
+                    ownership:
+                        soac_optimization::optimization_plan_v3::FunctionOwnershipPlan::default(),
+                    diagnostics: Vec::new(),
                 },
-                regions: vec![hot_region, fallback_region],
-                deopt_points: Vec::new(),
-                ownership: crate::optimization_plan_v3::FunctionOwnershipPlan::default(),
-                diagnostics: Vec::new(),
-            }],
+            ],
         }
     }
 

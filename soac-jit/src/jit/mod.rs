@@ -9,9 +9,7 @@ use crate::config::{
     pre_optimization_module_cache_identity,
 };
 #[cfg(test)]
-use crate::config::{
-    SOAC_JIT_EMIT_REFCOUNTS_ENV, SOAC_OPT_PLAN_MODE_ENV, SOAC_VALIDATE_OPT_V3_ENV,
-};
+use crate::config::{SOAC_JIT_EMIT_REFCOUNTS_ENV, SOAC_OPT_PLAN_MODE_ENV};
 use crate::counter::TopValueCounter;
 use crate::function_instantiation::{
     SOAC_JIT_MAKE_FUNCTION_WITH_CLOSURE_SYMBOL, make_function_kind_abi_tag,
@@ -19,26 +17,6 @@ use crate::function_instantiation::{
 };
 use crate::module_constants::{ModuleCodegenConstants, ModuleConstantId};
 use crate::module_type::{CounterRuntimeSlot, SharedModuleState, build_counter_storage_layout};
-use crate::optimization_alternatives_v3::AlternativeCatalog;
-use crate::optimization_emit_v3::{
-    MechanicalExitKind, MechanicalModuleEmission, MechanicalOperation, MechanicalRegionEmission,
-    MechanicalStepOp,
-};
-use crate::optimization_pipeline_v3::{
-    ExactIntBranchV3Artifacts, load_optimization_artifacts_v3,
-    plan_and_emit_function_exact_int_branches_v3_with_module_constants,
-};
-#[cfg(test)]
-use crate::optimization_plan::ProfileEvidenceStore;
-use crate::optimization_plan::{
-    FunctionOptimizationPlan, FunctionProfileEvidence, OptimizationPlan,
-    PlannedIndexedFieldSpecialization, load_optimization_plan,
-};
-use crate::optimization_plan_v3::{
-    ConversionKind, FailureMode, FallbackTarget, FunctionPlanIdentity, GuardFailure, GuardKind,
-    MaterializeKind, ModuleOptimizationPlanV3, ModulePlanIdentity, PlanValue, PlannedConstant,
-    RegionExitTarget, RegionId, RegionInputSource, RegionPlan, Rep, RichCompareOp,
-};
 use cranelift_codegen::cfg_printer::CFGPrinter;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::inline::{Inline, InlineCommand};
@@ -95,6 +73,24 @@ use soac_lowering::passes::{
     try_lower_typed_instr_to_codegen_legacy, try_lower_typed_term_to_codegen_legacy,
     validate_codegen_instr_ids, validate_typed_function_call_access_plans,
     validate_typed_function_value_facts,
+};
+use soac_optimization::optimization_artifacts_v3::{
+    ExactIntBranchV3Artifacts, load_optimization_artifacts_v3,
+};
+use soac_optimization::optimization_emit_v3::{
+    MechanicalExitKind, MechanicalModuleEmission, MechanicalOperation, MechanicalRegionEmission,
+    MechanicalStepOp,
+};
+#[cfg(test)]
+use soac_optimization::optimization_plan::ProfileEvidenceStore;
+use soac_optimization::optimization_plan::{
+    FunctionProfileEvidence, OptimizationPlan, PlannedIndexedFieldSpecialization,
+    load_optimization_plan,
+};
+use soac_optimization::optimization_plan_v3::{
+    ConversionKind, FailureMode, FallbackTarget, GuardFailure, GuardKind, MaterializeKind,
+    ModuleOptimizationPlanV3, PlanNodeId, PlanValue, PlannedConstant, RegionExitTarget, RegionId,
+    RegionInputSource, RegionPlan, Rep, RichCompareOp,
 };
 use soac_profile::{CollectedTypeKeyLayout, CounterDumpTypeKey, read_block_entry_counts_from_file};
 #[cfg(test)]
@@ -13214,7 +13210,6 @@ fn load_planned_optimization_inputs_for_runtime_state(
                 &plan,
                 shared_state,
                 compile_session,
-                env_config,
             );
         }
     }
@@ -13533,15 +13528,13 @@ fn synthesize_test_planned_optimization_inputs_for_runtime_state(
             path.display()
         )
     })?;
-    planned_optimization_inputs_for_shared_state(&plan, shared_state, compile_session, env_config)
-        .map(Some)
+    planned_optimization_inputs_for_shared_state(&plan, shared_state, compile_session).map(Some)
 }
 
 fn planned_optimization_inputs_for_shared_state(
     plan: &OptimizationPlan,
     shared_state: &SharedModuleState,
     compile_session: Option<&crate::session::CompileSession>,
-    env_config: &SoacEnvConfig,
 ) -> Result<PlannedOptimizationInputs, String> {
     let mut inputs = PlannedOptimizationInputs::default();
     for planned_function in &plan.functions {
@@ -13564,18 +13557,6 @@ fn planned_optimization_inputs_for_shared_state(
                     .map_err(anyhow::Error::msg)
             })
             .map_err(|err| err.to_string())?;
-        if let Some(artifacts) = opt_v3_exact_int_branch_artifacts_for_function(
-            env_config,
-            plan,
-            planned_function,
-            current_function,
-            &evidence,
-            shared_state.lowered_module.module_constants.as_slice(),
-        )? {
-            inputs
-                .opt_v3_exact_int_branch_artifacts
-                .insert(current_function.function_id, Arc::new(artifacts));
-        }
         inputs
             .evidence_by_function
             .insert(current_function.function_id, evidence);
@@ -13639,11 +13620,7 @@ fn planned_optimization_inputs_for_precompile(
     let mut inputs = PlannedOptimizationInputs::default();
     for planned_function in &plan.functions {
         let current_function_id = planned_function.runtime_function_id(module_id);
-        let current_function = module
-            .callable_defs
-            .iter()
-            .find(|function| function.function_id == current_function_id);
-        let Some(current_function) = current_function else {
+        if !has_function(current_function_id) {
             return Err(format!(
                 "optimization plan for module {} references missing function id {} ({})",
                 plan.module_name,
@@ -13651,7 +13628,7 @@ fn planned_optimization_inputs_for_precompile(
                 plan.debug_name_for_function(planned_function.function)
                     .unwrap_or("<unknown>")
             ));
-        };
+        }
         let evidence = plan
             .evidence_for_local_function(planned_function.local_function_id(), |target| {
                 if target.module.module_name != module_name
@@ -13664,18 +13641,6 @@ fn planned_optimization_inputs_for_precompile(
                 Ok(has_function(target_function_id).then_some(target_function_id))
             })
             .map_err(|err| err.to_string())?;
-        if let Some(artifacts) = opt_v3_exact_int_branch_artifacts_for_function(
-            env_config,
-            &plan,
-            planned_function,
-            current_function,
-            &evidence,
-            module.module_constants.as_slice(),
-        )? {
-            inputs
-                .opt_v3_exact_int_branch_artifacts
-                .insert(current_function_id, Arc::new(artifacts));
-        }
         if !function_profile_evidence_is_empty(&evidence) {
             inputs
                 .evidence_by_function
@@ -13692,76 +13657,6 @@ fn function_profile_evidence_is_empty(evidence: &FunctionProfileEvidence) -> boo
         && evidence.setitem_specializations.is_empty()
         && evidence.field_index_specializations.is_empty()
         && evidence.branch_prefer_true.is_empty()
-}
-
-fn opt_v3_exact_int_branch_artifacts_for_function(
-    env_config: &SoacEnvConfig,
-    plan: &OptimizationPlan,
-    planned_function: &FunctionOptimizationPlan,
-    function: &BlockPyFunction<CodegenModuleShape>,
-    evidence: &FunctionProfileEvidence,
-    module_constants: &[InstrResolved],
-) -> Result<Option<ExactIntBranchV3Artifacts>, String> {
-    if !env_config.opt_v3_validation_enabled() {
-        return Ok(None);
-    }
-
-    let catalog = AlternativeCatalog::default_v3();
-    let artifacts = plan_and_emit_function_exact_int_branches_v3_with_module_constants(
-        &catalog,
-        ModulePlanIdentity {
-            module_name: plan.module_name.clone(),
-            source_hash: plan.source_hash,
-            cache_identity: plan.cache_identity.clone(),
-        },
-        FunctionPlanIdentity {
-            function: planned_function.function,
-            debug_name: plan
-                .debug_name_for_function(planned_function.function)
-                .map(ToString::to_string)
-                .or_else(|| Some(function.names.qualname.clone())),
-        },
-        function,
-        evidence,
-        module_constants,
-    )
-    .map_err(|err| {
-        format!(
-            "optimizer v3 exact-int branch validation failed for module {} function {} ({}): {err}",
-            plan.module_name, function.function_id, function.names.qualname
-        )
-    })?;
-    let region_count = artifacts
-        .emission
-        .functions
-        .iter()
-        .map(|function| function.regions.len())
-        .sum::<usize>();
-    let step_count = artifacts
-        .emission
-        .functions
-        .iter()
-        .flat_map(|function| function.regions.iter())
-        .map(|region| region.steps.len())
-        .sum::<usize>();
-    let diagnostic_count = artifacts
-        .plan
-        .functions
-        .iter()
-        .map(|function| function.diagnostics.len())
-        .sum::<usize>();
-    info!(
-        target: "soac_opt_v3",
-        module = plan.module_name.as_str(),
-        source_hash = plan.source_hash,
-        function = %function.function_id,
-        qualname = function.names.qualname.as_str(),
-        region_count,
-        step_count,
-        diagnostic_count,
-        "validated optimizer v3 exact-int branch artifacts"
-    );
-    Ok(Some(artifacts))
 }
 
 fn validate_opt_v3_codegen_artifacts_for_function(
@@ -22223,7 +22118,7 @@ fn emit_opt_v3_mechanical_region_steps(
 fn emit_opt_v3_mechanical_convert(
     fb: &mut FunctionBuilder<'_>,
     region: RegionId,
-    node: crate::optimization_plan_v3::PlanNodeId,
+    node: PlanNodeId,
     kind: ConversionKind,
     input: PlanValue,
     output: PlanValue,
@@ -22292,7 +22187,7 @@ fn emit_opt_v3_mechanical_convert(
 fn emit_opt_v3_mechanical_operation(
     fb: &mut FunctionBuilder<'_>,
     region: RegionId,
-    node: crate::optimization_plan_v3::PlanNodeId,
+    node: PlanNodeId,
     op: &MechanicalOperation,
     inputs: &[PlanValue],
     output: Option<PlanValue>,
@@ -22490,7 +22385,7 @@ fn emit_opt_v3_mechanical_operation(
 fn emit_opt_v3_mechanical_materialize(
     fb: &mut FunctionBuilder<'_>,
     region: RegionId,
-    node: crate::optimization_plan_v3::PlanNodeId,
+    node: PlanNodeId,
     kind: MaterializeKind,
     input: PlanValue,
     output: PlanValue,

@@ -6,10 +6,6 @@ use super::{
     emit_owned_module_constant_from_parts, step_null_block_args,
 };
 use crate::jit::blockpy_intrinsics;
-use crate::operator_specialization::{
-    BINARY_RHS_TAG_SHIFT, ExactIntBinaryOpKind, ExactIntUnaryOpKind, ExactTypeTag, UNARY_TAG_SHIFT,
-    pack_binary_shape, pack_unary_shape, unpack_binary_shape, unpack_unary_shape,
-};
 use cranelift_codegen::ir;
 use cranelift_codegen::ir::InstBuilder;
 use cranelift_frontend::FunctionBuilder;
@@ -18,6 +14,10 @@ use soac_core::block_py::{
     CounterId, HasSemanticInstrId, Instr, NameLike, NameLocation, ResolvedName,
 };
 use soac_lowering::passes::{InstrCodegen, InstrTyped, PyExactType, PyObjFacts};
+use soac_optimization::operator_specialization::{
+    BINARY_RHS_TAG_SHIFT, ExactIntBinaryOpKind, ExactIntUnaryOpKind, ExactTypeTag, UNARY_TAG_SHIFT,
+    pack_binary_shape, pack_unary_shape, unpack_binary_shape, unpack_unary_shape,
+};
 use std::mem::offset_of;
 
 const PY_LONG_SIGN_MASK: i64 = 3;

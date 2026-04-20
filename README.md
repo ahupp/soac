@@ -283,12 +283,6 @@ Notes:
   from `$SOAC_WORK_DIR/profile.bin` as Cranelift `cold` block hints in
   `verify`/`apply`. This stays disabled by default; profiling still
   records the underlying `block_entry` counters either way.
-- `SOAC_VALIDATE_OPT_V3=1` is a transitional comparison mode for the current
-  optimizer-v3 exact-int branch pipeline while loading legacy `mod.opt` plans in
-  `verify`/`apply`. Normal v3 integration should use `decide_optimizations
-  --mode v3` to write `mod.optv3` from raw profile evidence and cached
-  unoptimized BlockPy modules, then let JIT codegen consume the serialized
-  mechanical artifact directly.
 - The `apply` phase may emit explicitly marked `BEHAVIOR_CHANGE`
   fast paths. Today that includes raw indexed module-global / instance
   field stores outside module-init code, and undeclared known-builtin

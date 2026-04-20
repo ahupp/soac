@@ -3,10 +3,10 @@
 use super::RuntimeJitDeoptInvocation;
 use crate::module_constants::raise_name_error_for_missing_name;
 use crate::module_constants::{load_runtime_name_owned, load_runtime_name_owned_by_id};
-use crate::operator_specialization::{ExactIntBinaryOpKind, ExactIntUnaryOpKind};
 use cranelift_jit::JITBuilder;
 use libc;
 use pyo3::ffi;
+use soac_optimization::operator_specialization::{ExactIntBinaryOpKind, ExactIntUnaryOpKind};
 use std::ffi::{c_char, c_void};
 use std::ptr;
 use std::sync::OnceLock;
