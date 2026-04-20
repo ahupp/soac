@@ -111,6 +111,9 @@ fn plan_compact_int_branch(
     if let Some(planned) = plan_compact_int_add_gt_zero_branch(catalog, region, facts)? {
         return Ok(Some(planned));
     }
+    if let Some(planned) = plan_compact_int_compare_constant_branch(catalog, region, facts)? {
+        return Ok(Some(planned));
+    }
     if let Some(planned) = plan_compact_int_compare_branch(catalog, region, facts)? {
         return Ok(Some(planned));
     }
@@ -234,6 +237,128 @@ fn plan_compact_int_add_gt_zero_branch(
             )?,
             node(
                 24,
+                PlanNodeKind::Convert(ConvertNode {
+                    input: fallback_compare,
+                    output: fallback_condition,
+                    kind: ConversionKind::TruthinessToI32Bool01,
+                    precondition: ConversionPrecondition::Infallible,
+                    failure: truthiness
+                        .instantiate_failure(&failure_targets)
+                        .map_err(|err| err.0)?,
+                    ownership: ConversionOwnership::ConsumeOwned,
+                }),
+            ),
+        ],
+        exits: vec![RegionExitPlan {
+            source: shape.source,
+            kind: RegionExitKind::Branch {
+                condition: fallback_condition,
+                then_target: RegionExitTarget::OriginalCfg,
+                else_target: RegionExitTarget::OriginalCfg,
+            },
+        }],
+    };
+
+    Ok(Some(vec![hot_region, fallback_region]))
+}
+
+fn plan_compact_int_compare_constant_branch(
+    catalog: &AlternativeCatalog,
+    region: &ExtractedRegion,
+    facts: &PlannerFacts,
+) -> Result<Option<Vec<RegionPlan>>, String> {
+    let Some(shape) = match_compact_int_compare_constant_branch(region, facts) else {
+        return Ok(None);
+    };
+    let compare = required_alternative(catalog, shape.compare.exact_id)?;
+    let generic_compare = required_alternative(catalog, shape.compare.generic_id)?;
+    let truthiness = required_alternative(catalog, "truthiness.pyobject")?;
+
+    let fallback_region_id = RegionId(region.id.0 + 1);
+    let failure_targets =
+        FailureTargets::local_fallback(FallbackTarget::Region(fallback_region_id));
+
+    let value_obj = PlanValue::new(0, Rep::PyObjectBorrowed);
+    let value_i64 = PlanValue::new(1, Rep::I64);
+    let constant_i64 = PlanValue::new(2, Rep::I64);
+    let condition = PlanValue::new(3, Rep::I32Bool01);
+    let guard_index = if shape.constant_on_left { 1 } else { 0 };
+    let hot_operands = if shape.constant_on_left {
+        vec![constant_i64, value_i64]
+    } else {
+        vec![value_i64, constant_i64]
+    };
+
+    let hot_region = RegionPlan {
+        id: region.id,
+        source: RegionSource::Instr {
+            instr_id: shape
+                .source
+                .unwrap_or_else(|| InstrId::new(region.block, 0)),
+        },
+        inputs: vec![region_input(value_obj, 0, shape.value_name.clone())],
+        nodes: vec![
+            guard_node(compare, guard_index, 0, value_obj, &failure_targets),
+            unbox_node(1, value_obj, value_i64, 0, fallback_region_id),
+            node(
+                2,
+                PlanNodeKind::Constant {
+                    output: constant_i64,
+                    constant: PlannedConstant::I64(shape.constant),
+                },
+            ),
+            operation_node(3, compare, hot_operands, Some(condition), &failure_targets)?,
+        ],
+        exits: vec![RegionExitPlan {
+            source: shape.source,
+            kind: RegionExitKind::Branch {
+                condition,
+                then_target: RegionExitTarget::OriginalCfg,
+                else_target: RegionExitTarget::OriginalCfg,
+            },
+        }],
+    };
+
+    let fallback_constant_i64 = PlanValue::new(20, Rep::I64);
+    let fallback_constant_obj = PlanValue::new(21, Rep::PyObjectOwned);
+    let fallback_compare = PlanValue::new(22, Rep::PyObjectOwned);
+    let fallback_condition = PlanValue::new(23, Rep::I32Bool01);
+    let fallback_operands = if shape.constant_on_left {
+        vec![fallback_constant_obj, value_obj]
+    } else {
+        vec![value_obj, fallback_constant_obj]
+    };
+    let fallback_region = RegionPlan {
+        id: fallback_region_id,
+        source: RegionSource::Synthetic {
+            reason: "generic fallback for compact-int comparison with constant branch".to_string(),
+        },
+        inputs: vec![region_input(value_obj, 0, shape.value_name)],
+        nodes: vec![
+            node(
+                20,
+                PlanNodeKind::Constant {
+                    output: fallback_constant_i64,
+                    constant: PlannedConstant::I64(shape.constant),
+                },
+            ),
+            node(
+                21,
+                PlanNodeKind::Materialize(MaterializeNode {
+                    input: fallback_constant_i64,
+                    output: fallback_constant_obj,
+                    kind: MaterializeKind::PythonLong,
+                }),
+            ),
+            operation_node(
+                22,
+                generic_compare,
+                fallback_operands,
+                Some(fallback_compare),
+                &failure_targets,
+            )?,
+            node(
+                23,
                 PlanNodeKind::Convert(ConvertNode {
                     input: fallback_compare,
                     output: fallback_condition,
@@ -562,6 +687,15 @@ struct CompactIntCompareBranchShape {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+struct CompactIntCompareConstantBranchShape {
+    source: Option<InstrId>,
+    value_name: String,
+    constant: i64,
+    constant_on_left: bool,
+    compare: CompareAlternativeSpec,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct CompactIntReturnShape {
     source: Option<InstrId>,
     left_name: String,
@@ -658,6 +792,53 @@ fn match_compact_int_binary_return(
         right_name: region.loadable_name(right)?,
         operation,
     })
+}
+
+fn match_compact_int_compare_constant_branch(
+    region: &ExtractedRegion,
+    facts: &PlannerFacts,
+) -> Option<CompactIntCompareConstantBranchShape> {
+    let ExtractedExit::Branch {
+        condition, source, ..
+    } = region.exit
+    else {
+        return None;
+    };
+    let truth = region.value(condition)?;
+    let ExtractedValueKind::Truthiness {
+        value: compare_value,
+    } = truth.kind
+    else {
+        return None;
+    };
+    let compare = region.value(compare_value)?;
+    let ExtractedValueKind::Binary { op, left, right } = compare.kind else {
+        return None;
+    };
+    let compare = compare_alternative_spec(op)?;
+    if facts.is_exact_compact_int(left) {
+        if let Some(constant) = facts.i64_constant(right) {
+            return Some(CompactIntCompareConstantBranchShape {
+                source,
+                value_name: region.loadable_name(left)?,
+                constant,
+                constant_on_left: false,
+                compare,
+            });
+        }
+    }
+    if facts.is_exact_compact_int(right) {
+        if let Some(constant) = facts.i64_constant(left) {
+            return Some(CompactIntCompareConstantBranchShape {
+                source,
+                value_name: region.loadable_name(right)?,
+                constant,
+                constant_on_left: true,
+                compare,
+            });
+        }
+    }
+    None
 }
 
 fn match_compact_int_compare_branch(
@@ -1048,6 +1229,14 @@ mod tests {
         facts
     }
 
+    fn facts_for_compare_constant_region() -> PlannerFacts {
+        let mut facts = PlannerFacts::default();
+        facts.mark_exact_compact_int(ExtractedValueId(0));
+        facts.mark_exact_compact_int(ExtractedValueId(1));
+        facts.set_i64_constant(ExtractedValueId(1), 0);
+        facts
+    }
+
     fn module_request(region: ExtractedRegion, facts: PlannerFacts) -> ModulePlanRequest {
         ModulePlanRequest {
             module: ModulePlanIdentity {
@@ -1329,24 +1518,42 @@ mod tests {
     }
 
     #[test]
-    fn constant_operands_are_not_region_inputs() {
+    fn plans_compact_int_compare_branch_with_constant_operand() {
         let catalog = AlternativeCatalog::default_v3();
         let request = module_request(
             compact_int_compare_branch_with_constant_region(BinOpKind::Gt),
-            facts_for_compact_region(),
+            facts_for_compare_constant_region(),
         );
         let plan = plan_module_optimization_v3(&catalog, request);
 
+        validate_module_plan_v3(&plan).unwrap();
         let function = &plan.functions[0];
-        assert!(function.regions.is_empty());
-        assert_eq!(function.diagnostics.len(), 1);
-        assert!(
-            function.diagnostics[0]
-                .message
-                .contains("unsupported shape"),
-            "{:?}",
-            function.diagnostics[0]
+        assert!(function.diagnostics.is_empty());
+        assert_eq!(function.regions.len(), 2);
+        assert_eq!(function.regions[0].inputs.len(), 1);
+        assert_eq!(
+            function.regions[0].inputs[0].source,
+            RegionInputSource::FunctionParam {
+                index: 0,
+                name: Some("c".to_string())
+            }
         );
+        assert!(matches!(
+            function.regions[0].nodes[2].kind,
+            PlanNodeKind::Constant {
+                constant: PlannedConstant::I64(0),
+                ..
+            }
+        ));
+        assert!(matches!(
+            function.regions[0].nodes[3].kind,
+            PlanNodeKind::Operation(OperationNode {
+                op: crate::optimization_plan_v3::PlannedOp::I64CompareToBool01 {
+                    op: RichCompareOp::Gt
+                },
+                ..
+            })
+        ));
     }
 
     #[test]

@@ -21391,6 +21391,18 @@ fn emit_typed_codegen_stmt_result_with_local_env(
         }
     }
 
+    if let Some(result) = emit_opt_v3_exact_int_expr_pyobject_result(
+        fb,
+        expr,
+        local_env,
+        emit_ctx,
+        demand,
+        codegen_env,
+        func_imports,
+    )? {
+        return Ok(result);
+    }
+
     if matches!(
         expr,
         InstrTyped::Truthy(_)
@@ -21518,6 +21530,12 @@ enum OptV3MechanicalValue {
     PyObject { value: ir::Value, owned: bool },
     I64(ir::Value),
     I32Bool01(ir::Value),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct OptV3PyObjectResult {
+    value: ir::Value,
+    ownership: ValueOwnership,
 }
 
 impl OptV3MechanicalValue {
@@ -21852,7 +21870,57 @@ fn emit_opt_v3_exact_int_return_pyobject(
         codegen_env,
         func_imports,
     )
-    .map(Some)
+    .map(|result| Some(result.value))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_opt_v3_exact_int_expr_pyobject_result(
+    fb: &mut FunctionBuilder<'_>,
+    expr: &InstrTyped,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    demand: ResultDemand,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<Option<EmitResult>, String> {
+    if !matches!(expr, InstrTyped::BinOp(_)) {
+        return Ok(None);
+    }
+    let ResultDemand::PyObject { borrowed_ok: false } = demand else {
+        return Ok(None);
+    };
+    let Some(value_instr_id) = expr.try_semantic_instr_id() else {
+        return Ok(None);
+    };
+    let Some(artifacts) = emit_ctx.opt_v3_exact_int_branch_artifacts.as_deref() else {
+        return Ok(None);
+    };
+    let Some(selection) = opt_v3_exact_int_return_selection_for_source(artifacts, value_instr_id)?
+    else {
+        return Ok(None);
+    };
+    let result = emit_opt_v3_exact_int_return_selection(
+        fb,
+        value_instr_id,
+        selection,
+        local_env,
+        emit_ctx,
+        codegen_env,
+        func_imports,
+    )?;
+    if !result.ownership.can_satisfy_pyobject_demand(demand) {
+        return Err(format!(
+            "optimizer v3 expression result for {value_instr_id} produced {:?}, but demand is {demand:?}",
+            result.ownership
+        ));
+    }
+    let facts =
+        py_facts_for_typed_expr_with_local_env(expr, local_env).unwrap_or_else(PyObjFacts::unknown);
+    Ok(Some(EmitResult::PyObject {
+        value: result.value,
+        ownership: result.ownership,
+        facts,
+    }))
 }
 
 fn emit_opt_v3_exact_int_branch_selection(
@@ -21927,7 +21995,7 @@ fn emit_opt_v3_exact_int_return_selection(
     emit_ctx: &JitEmitCtx<'_>,
     codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
-) -> Result<ir::Value, String> {
+) -> Result<OptV3PyObjectResult, String> {
     let result_block = fb.create_block();
     fb.append_block_param(result_block, emit_ctx.consts.ptr_ty);
     let fallback_block = fb.create_block();
@@ -21950,9 +22018,10 @@ fn emit_opt_v3_exact_int_return_selection(
         codegen_env,
         func_imports,
     )?;
-    let hot_value = opt_v3_region_return_value(selection.hot_region, &hot_values, value_instr_id)?;
+    let hot_result =
+        opt_v3_region_return_pyobject(selection.hot_region, &hot_values, value_instr_id)?;
     fb.ins()
-        .jump(result_block, &[ir::BlockArg::Value(hot_value)]);
+        .jump(result_block, &[ir::BlockArg::Value(hot_result.value)]);
 
     fb.switch_to_block(fallback_block);
     let mut fallback_values = opt_v3_region_input_values(
@@ -21972,13 +22041,16 @@ fn emit_opt_v3_exact_int_return_selection(
         codegen_env,
         func_imports,
     )?;
-    let fallback_value =
-        opt_v3_region_return_value(selection.fallback_region, &fallback_values, value_instr_id)?;
+    let fallback_result =
+        opt_v3_region_return_pyobject(selection.fallback_region, &fallback_values, value_instr_id)?;
     fb.ins()
-        .jump(result_block, &[ir::BlockArg::Value(fallback_value)]);
+        .jump(result_block, &[ir::BlockArg::Value(fallback_result.value)]);
 
     fb.switch_to_block(result_block);
-    Ok(fb.block_params(result_block)[0])
+    Ok(OptV3PyObjectResult {
+        value: fb.block_params(result_block)[0],
+        ownership: merge_opt_v3_pyobject_ownership(hot_result.ownership, fallback_result.ownership),
+    })
 }
 
 fn opt_v3_region_input_values(
@@ -22566,11 +22638,11 @@ fn opt_v3_region_branch_condition(
     opt_v3_i32_bool01_value(values, *condition)
 }
 
-fn opt_v3_region_return_value(
+fn opt_v3_region_return_pyobject(
     region: &MechanicalRegionEmission,
     values: &HashMap<PlanValue, OptV3MechanicalValue>,
     source: InstrId,
-) -> Result<ir::Value, String> {
+) -> Result<OptV3PyObjectResult, String> {
     let exit = region.exits.first().ok_or_else(|| {
         format!(
             "optimizer v3 region {:?} for source {source} has no exit",
@@ -22590,7 +22662,39 @@ fn opt_v3_region_return_value(
             region.region
         ));
     }
-    Ok(raw_value)
+    Ok(OptV3PyObjectResult {
+        value: raw_value,
+        ownership: opt_v3_pyobject_ownership(value.rep, owned)?,
+    })
+}
+
+fn opt_v3_pyobject_ownership(rep: Rep, owned: bool) -> Result<ValueOwnership, String> {
+    match (rep, owned) {
+        (Rep::PyObjectOwned, true) => Ok(ValueOwnership::Owned),
+        (Rep::PyObjectImmortal, false) => Ok(ValueOwnership::Immortal),
+        (Rep::PyObjectImmortal, true) => Ok(ValueOwnership::Owned),
+        (Rep::PyObjectBorrowed, false) => Ok(ValueOwnership::Borrowed),
+        (Rep::PyObjectBorrowed, true) => {
+            Err("optimizer v3 produced an owned value for a borrowed PyObject rep".to_string())
+        }
+        (Rep::PyObjectOwned, false) => {
+            Err("optimizer v3 produced a borrowed value for an owned PyObject rep".to_string())
+        }
+        (other, _) => Err(format!(
+            "optimizer v3 return value has non-PyObject representation {other:?}"
+        )),
+    }
+}
+
+fn merge_opt_v3_pyobject_ownership(
+    hot: ValueOwnership,
+    fallback: ValueOwnership,
+) -> ValueOwnership {
+    match (hot, fallback) {
+        (ValueOwnership::Immortal, ValueOwnership::Immortal) => ValueOwnership::Immortal,
+        (ValueOwnership::Borrowed, ValueOwnership::Borrowed) => ValueOwnership::Borrowed,
+        _ => ValueOwnership::Owned,
+    }
 }
 
 fn opt_v3_rich_compare_intcc(op: RichCompareOp) -> ir::condcodes::IntCC {

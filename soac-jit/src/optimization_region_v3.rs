@@ -102,15 +102,28 @@ impl std::error::Error for RegionExtractionError {}
 pub fn extract_function_regions_v3(
     function: &BlockPyFunction<CodegenModuleShape>,
 ) -> Vec<RegionExtractionAttempt> {
-    function
-        .blocks
-        .iter()
-        .enumerate()
-        .map(|(index, block)| RegionExtractionAttempt {
+    let mut attempts = Vec::new();
+    let mut next_region_id = 0;
+    for block in &function.blocks {
+        for instr in &block.body {
+            attempts.push(RegionExtractionAttempt {
+                block: block.label,
+                result: extract_block_body_instr_region_v3(
+                    block,
+                    instr,
+                    next_primary_region_id(&mut next_region_id),
+                ),
+            });
+        }
+        attempts.push(RegionExtractionAttempt {
             block: block.label,
-            result: extract_block_region_v3(block, RegionId(index as u32)),
-        })
-        .collect()
+            result: extract_block_term_region_v3(
+                block,
+                next_primary_region_id(&mut next_region_id),
+            ),
+        });
+    }
+    attempts
 }
 
 pub fn extract_block_region_v3(
@@ -123,6 +136,83 @@ pub fn extract_block_region_v3(
             len: block.body.len(),
         });
     }
+    if block.exc_edge.is_some() {
+        return Err(RegionExtractionError::BlockHasExceptionEdge { block: block.label });
+    }
+
+    extract_block_term_region_v3(block, id)
+}
+
+fn next_primary_region_id(next: &mut u32) -> RegionId {
+    let id = RegionId(*next);
+    *next += 2;
+    id
+}
+
+fn extract_block_body_instr_region_v3(
+    block: &Block<InstrCodegen>,
+    instr: &InstrCodegen,
+    id: RegionId,
+) -> Result<ExtractedRegion, RegionExtractionError> {
+    if block.exc_edge.is_some() {
+        return Err(RegionExtractionError::BlockHasExceptionEdge { block: block.label });
+    }
+
+    let InstrCodegenOp::Store(store) = instr else {
+        return Err(unsupported_instr_error(instr));
+    };
+    let mut builder = RegionBuilder::new(id, block.label);
+    let value = builder.linearize_instr(&store.value)?;
+    let exit = ExtractedExit::Return {
+        source: value_source(&builder.values, value),
+        value,
+    };
+    Ok(ExtractedRegion {
+        id,
+        block: block.label,
+        values: builder.values,
+        exit,
+    })
+}
+
+fn unsupported_instr_error(instr: &InstrCodegen) -> RegionExtractionError {
+    RegionExtractionError::UnsupportedInstr {
+        source: instr.try_semantic_instr_id(),
+        kind: instr_codegen_kind(instr),
+    }
+}
+
+fn instr_codegen_kind(instr: &InstrCodegen) -> &'static str {
+    match instr {
+        InstrCodegenOp::BinOp(_) => "BinOp",
+        InstrCodegenOp::UnaryOp(_) => "UnaryOp",
+        InstrCodegenOp::CalleeFunctionId(_) => "CalleeFunctionId",
+        InstrCodegenOp::DirectFunctionIdGuardTest(_) => "DirectFunctionIdGuardTest",
+        InstrCodegenOp::DirectReceiverTypeVersionGuardTest(_) => {
+            "DirectReceiverTypeVersionGuardTest"
+        }
+        InstrCodegenOp::Tuple(_) => "Tuple",
+        InstrCodegenOp::Call(_) => "Call",
+        InstrCodegenOp::CallDirect(_) => "CallDirect",
+        InstrCodegenOp::GetAttr(_) => "GetAttr",
+        InstrCodegenOp::SetAttr(_) => "SetAttr",
+        InstrCodegenOp::GetItem(_) => "GetItem",
+        InstrCodegenOp::SetItem(_) => "SetItem",
+        InstrCodegenOp::DelItem(_) => "DelItem",
+        InstrCodegenOp::Load(_) => "Load",
+        InstrCodegenOp::Store(_) => "Store",
+        InstrCodegenOp::Del(_) => "Del",
+        InstrCodegenOp::MakeCell(_) => "MakeCell",
+        InstrCodegenOp::IncrementCounter(_) => "IncrementCounter",
+        InstrCodegenOp::CellRef(_) => "CellRef",
+        InstrCodegenOp::MakeFunctionWithClosure(_) => "MakeFunctionWithClosure",
+    }
+}
+
+fn extract_block_term_region_v3(
+    block: &Block<InstrCodegen>,
+    id: RegionId,
+) -> Result<ExtractedRegion, RegionExtractionError> {
     if block.exc_edge.is_some() {
         return Err(RegionExtractionError::BlockHasExceptionEdge { block: block.label });
     }
@@ -338,8 +428,8 @@ fn value_source(values: &[ExtractedValue], value: ExtractedValueId) -> Option<In
 mod tests {
     use super::*;
     use soac_core::block_py::{
-        BinOp, BlockEdge, BlockParam, BlockPyName, LocalLocation, Meta, NameLocation, TermIf,
-        Tuple, UnaryOp, WithMeta,
+        BinOp, BlockEdge, BlockParam, BlockPyName, FunctionName, LocalLocation, Meta,
+        ModuleNameGen, NameLocation, ParamSpec, Store, TermIf, Tuple, UnaryOp, WithMeta,
     };
 
     fn label(index: usize) -> BlockLabel {
@@ -350,9 +440,17 @@ mod tests {
         InstrId::new(label(0), index)
     }
 
+    fn instr_id_in_label(block: BlockLabel, index: u32) -> InstrId {
+        InstrId::new(block, index)
+    }
+
     fn with_instr_id(instr: InstrCodegen, index: u32) -> InstrCodegen {
+        with_instr_id_in_label(instr, label(0), index)
+    }
+
+    fn with_instr_id_in_label(instr: InstrCodegen, block: BlockLabel, index: u32) -> InstrCodegen {
         instr.with_meta(Meta {
-            instr_id: Some(instr_id(index)),
+            instr_id: Some(instr_id_in_label(block, index)),
             ..Meta::synthetic()
         })
     }
@@ -380,6 +478,22 @@ mod tests {
             Vec::<BlockParam>::new(),
             None,
         )
+    }
+
+    fn test_function(blocks: Vec<Block<InstrCodegen>>) -> BlockPyFunction<CodegenModuleShape> {
+        let name_gen = ModuleNameGen::new(0).next_function_name_gen();
+        BlockPyFunction {
+            function_id: name_gen.function_id(),
+            name_gen,
+            names: FunctionName::new("f", "f", "f", "f"),
+            kind: soac_core::block_py::FunctionKind::Function,
+            execution_mode: Default::default(),
+            params: ParamSpec::default(),
+            blocks,
+            doc: None,
+            storage_layout: None,
+            scope: Default::default(),
+        }
     }
 
     #[test]
@@ -465,6 +579,71 @@ mod tests {
                 value: ExtractedValueId(2),
             }
         );
+    }
+
+    #[test]
+    fn function_extraction_includes_store_rhs_and_later_terminator() {
+        let c = ResolvedName {
+            id: BlockPyName::new("c"),
+            location: NameLocation::Local(LocalLocation(2)),
+        };
+        let add = binary(
+            BinOpKind::Add,
+            with_instr_id(local("a", 0), 0),
+            with_instr_id(local("b", 1), 1),
+            2,
+        );
+        let entry = Block::new(
+            label(0),
+            vec![with_instr_id(
+                InstrCodegen::Store(Store::new(c.clone(), add)),
+                3,
+            )],
+            BlockTerm::Jump(BlockEdge::new(label(1))),
+            Vec::<BlockParam>::new(),
+            None,
+        );
+        let test_label = label(1);
+        let compare = with_instr_id_in_label(
+            InstrCodegen::BinOp(BinOp::new(
+                BinOpKind::Gt,
+                with_instr_id_in_label(InstrCodegen::Load(Load::new(c)), test_label, 4),
+                with_instr_id_in_label(local("zero", 3), test_label, 5),
+            )),
+            test_label,
+            6,
+        );
+        let test = Block::new(
+            test_label,
+            Vec::new(),
+            BlockTerm::IfTerm(TermIf {
+                test: compare,
+                then_label: label(2),
+                else_label: label(3),
+            }),
+            Vec::<BlockParam>::new(),
+            None,
+        );
+
+        let attempts = extract_function_regions_v3(&test_function(vec![entry, test]));
+
+        assert_eq!(attempts.len(), 3);
+        let store_rhs = attempts[0].result.as_ref().unwrap();
+        assert_eq!(store_rhs.id, RegionId(0));
+        assert_eq!(
+            store_rhs.exit,
+            ExtractedExit::Return {
+                source: Some(instr_id(2)),
+                value: ExtractedValueId(2),
+            }
+        );
+        assert_eq!(
+            attempts[1].result.as_ref().unwrap_err().to_string(),
+            "block bb0 has unsupported terminator Jump"
+        );
+        let branch = attempts[2].result.as_ref().unwrap();
+        assert_eq!(branch.id, RegionId(4));
+        assert!(matches!(branch.exit, ExtractedExit::Branch { .. }));
     }
 
     #[test]

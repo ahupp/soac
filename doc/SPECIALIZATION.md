@@ -32,9 +32,11 @@ evidence. Do not extend that bridge as the primary path.
 The represented slices are exact-compact-`int` direct comparison branches such
 as `a < b`, add-then-compare-to-zero branches such as `a + b > 0`,
 value-producing add/sub/mul/bitwise returns such as `return a + b` or
-`return a & b`, and value-producing comparison returns such as `return a < b`:
-`operator_hot_shapes` exact-int evidence proves the operands, a lowered module
-constant load proves `0` where needed, the v3 planner emits hot checked-`i64`
+`return a & b`, store RHS expressions such as `c = a + b`, comparison
+branches against lowered integer module constants such as `c > 0`, and
+value-producing comparison returns such as `return a < b`: `operator_hot_shapes`
+exact-int evidence proves the operands, a lowered module constant load proves
+the integer constant where needed, the v3 planner emits hot checked-`i64`
 operation regions plus local generic Python fallback regions, materializes
 Python object results explicitly, and `emit_mechanical_plan_v3` refuses invalid
 plans before emitting steps.
@@ -46,10 +48,13 @@ planner rule, validation, and mechanical-emitter coverage first.
 
 Current migration surface:
 
-- Live v3 codegen: exact-int direct-compare and add/compare branch slices with
-  local generic fallback, exact-int add/sub/mul/bitwise returns with explicit
-  PythonLong materialization, and exact-int comparison returns with explicit
-  Python bool materialization.
+- Live v3 codegen: exact-int direct-compare, compare-with-integer-constant,
+  and add/compare branch slices with local generic fallback, exact-int
+  add/sub/mul/bitwise return-shaped expression regions with explicit PythonLong
+  materialization, and exact-int comparison returns with explicit Python bool
+  materialization. Store RHS lowering can consume return-shaped expression
+  regions, so simple lowered code like `c = a + b; if c > 0: ...` can optimize
+  the add store and the later branch as separate v3 regions.
 - Legacy only: division/modulo/shift and unary exact-int value-producing
   operators, profiled direct calls, exact-list getitem/setitem, indexed globals,
   and indexed fields.
