@@ -25,7 +25,12 @@ pub struct ModulePlanRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FunctionPlanRequest {
     pub function: FunctionPlanIdentity,
-    pub regions: Vec<ExtractedRegion>,
+    pub regions: Vec<ExtractedRegionPlanRequest>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExtractedRegionPlanRequest {
+    pub region: ExtractedRegion,
     pub facts: PlannerFacts,
 }
 
@@ -81,8 +86,9 @@ pub fn plan_function_optimization_v3(
         diagnostics: Vec::new(),
     };
 
-    for region in &request.regions {
-        match plan_compact_int_add_gt_zero_branch(catalog, region, &request.facts) {
+    for region_request in &request.regions {
+        let region = &region_request.region;
+        match plan_compact_int_add_gt_zero_branch(catalog, region, &region_request.facts) {
             Ok(Some(planned_regions)) => function.regions.extend(planned_regions),
             Ok(None) => function.diagnostics.push(PlanDiagnostic {
                 source: region.exit_source(),
@@ -491,8 +497,7 @@ mod tests {
                     ),
                     debug_name: Some("f".to_string()),
                 },
-                regions: vec![region],
-                facts,
+                regions: vec![ExtractedRegionPlanRequest { region, facts }],
             }],
         }
     }

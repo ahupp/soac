@@ -60,7 +60,8 @@ mod tests {
         FunctionPlanIdentity, ModulePlanIdentity, RegionId, validate_module_plan_v3,
     };
     use crate::optimization_planner_v3::{
-        FunctionPlanRequest, ModulePlanRequest, plan_module_optimization_v3,
+        ExtractedRegionPlanRequest, FunctionPlanRequest, ModulePlanRequest,
+        plan_module_optimization_v3,
     };
     use crate::optimization_region_v3::extract_block_region_v3;
     use soac_core::block_py::{
@@ -162,8 +163,7 @@ mod tests {
                         ),
                         debug_name: Some("f".to_string()),
                     },
-                    regions: vec![region],
-                    facts,
+                    regions: vec![ExtractedRegionPlanRequest { region, facts }],
                 }],
             },
         )
