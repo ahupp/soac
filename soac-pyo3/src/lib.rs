@@ -6,6 +6,7 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
 use serde_json::json;
+use soac_jit::optimization_pipeline_v3::generate_optimization_plans_v3_for_counter_dump;
 use soac_jit::optimization_plan::generate_optimization_plans_for_counter_dump;
 use soac_lowering::{lower_python_to_blockpy_for_testing, ruff_ast_to_string};
 use soac_profile::CounterDumpFile;
@@ -122,18 +123,36 @@ fn inspect_counter_dump_json(path: &str) -> PyResult<String> {
     })
 }
 
-#[pyfunction]
+#[pyfunction(signature = (counters_path, module_root, out_root=None, mode="legacy"))]
 fn decide_optimizations_for_counter_dump(
     counters_path: &str,
     module_root: &str,
     out_root: Option<&str>,
+    mode: &str,
 ) -> PyResult<usize> {
     let counters_path = Path::new(counters_path);
     let module_root = Path::new(module_root);
     let out_root = out_root
         .map(PathBuf::from)
         .unwrap_or_else(|| module_root.to_path_buf());
-    generate_optimization_plans_for_counter_dump(counters_path, module_root, out_root.as_path())
+    let summary = match mode {
+        "legacy" => generate_optimization_plans_for_counter_dump(
+            counters_path,
+            module_root,
+            out_root.as_path(),
+        ),
+        "v3" => generate_optimization_plans_v3_for_counter_dump(
+            counters_path,
+            module_root,
+            out_root.as_path(),
+        ),
+        other => {
+            return Err(PyRuntimeError::new_err(format!(
+                "optimization mode must be 'legacy' or 'v3', got {other:?}"
+            )));
+        }
+    };
+    summary
         .map(|summary| summary.written())
         .map_err(|err| PyRuntimeError::new_err(err.to_string()))
 }

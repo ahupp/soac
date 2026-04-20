@@ -8,7 +8,7 @@ use crate::optimization_evidence_v3::{
 };
 use crate::optimization_plan::{
     CachedModuleOptimizationInput, FunctionProfileEvidence, ModuleOptimizationPlanReport,
-    OptimizationPlanGenerationSummary, ProfileEvidenceStore,
+    OptimizationPlanGenerationSummary, ProfileEvidenceStore, cached_module_paths_under_root,
 };
 use crate::optimization_plan_v3::{
     FunctionPlanIdentity, ModuleOptimizationPlanV3, ModulePlanIdentity, PlanDiagnostic, RegionId,
@@ -248,6 +248,18 @@ pub fn generate_optimization_plans_v3_for_cached_modules(
         }
     }
     Ok(summary)
+}
+
+pub fn generate_optimization_plans_v3_for_counter_dump(
+    counters_path: &Path,
+    module_root: &Path,
+    out_root: &Path,
+) -> Result<OptimizationPlanGenerationSummary> {
+    let evidence_store = ProfileEvidenceStore::from_counter_dump(counters_path)?;
+    let module_inputs = cached_module_paths_under_root(module_root)?
+        .into_iter()
+        .map(|module_path| CachedModuleOptimizationInput::new(module_path, false));
+    generate_optimization_plans_v3_for_cached_modules(&evidence_store, module_inputs, out_root)
 }
 
 pub fn generate_module_optimization_plan_v3(

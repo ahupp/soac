@@ -148,6 +148,36 @@ def read():
     assert int(dump["records"][0]["source_hash"], 16) > 0
 
 
+def test_decide_optimizations_helper_can_write_v3_plan(tmp_path):
+    module_name = "counter_dump_v3_plan_case"
+    (tmp_path / f"{module_name}.py").write_text(
+        """
+def compare(a, b):
+    return a < b
+
+def run():
+    return compare(1, 2)
+""",
+        encoding="utf-8",
+    )
+    work_dir = tmp_path / "soac-work"
+    script = _import_and_run_script(
+        tmp_path,
+        f"import {module_name} as module",
+        "assert module.run() is True",
+    )
+    base_env = _soac_subprocess_env(tmp_path, work_dir=work_dir)
+    profile_result = _run_soac_subprocess(
+        script,
+        env={**base_env, "SOAC_OPT_MODE": "profile"},
+    )
+    _assert_subprocess_ok(profile_result)
+
+    assert decide_optimizations_for_work_dir(work_dir, mode="v3") >= 1
+    assert list((work_dir / "modules").rglob("mod.optv3"))
+    assert not list((work_dir / "modules").rglob("mod.opt"))
+
+
 def test_counter_dump_file_is_not_written_in_none_mode(tmp_path, monkeypatch):
     work_dir = tmp_path / "soac-work"
     monkeypatch.setenv("SOAC_WORK_DIR", str(work_dir))
