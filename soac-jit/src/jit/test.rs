@@ -16101,6 +16101,11 @@ def f(x):
         )
         .unwrap();
         assert_eq!(artifacts.emission.functions[0].regions.len(), 4);
+        assert_eq!(
+            artifacts.plan.functions[0].scalar_threads.len(),
+            1,
+            "v3 add-store/compare should plan one scalar thread for c"
+        );
 
         let built = build_test_jit_function_with_constants_and_options(
             &module,

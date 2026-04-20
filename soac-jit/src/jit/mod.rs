@@ -43,7 +43,7 @@ use soac_core::block_py::{
     RuntimeFunctionId, RuntimeModuleId, RuntimeName, SerializedFunctionId, StorageLayout, Store,
     Visit, VisitMut, WithMeta,
 };
-use soac_lowering::block_py::{CodegenBlock, Literal};
+use soac_lowering::block_py::{CodegenBlock, Literal, NameLike};
 use soac_lowering::passes::{
     CodegenModuleShape, ConstructorFieldValue, DirectFunctionIdGuardTest,
     DirectReceiverTypeVersionGuardTest, FactStore, FunctionRefcountPlan, InlineCallee,
@@ -90,7 +90,8 @@ use soac_optimization::optimization_plan::{
 use soac_optimization::optimization_plan_v3::{
     ConversionKind, FailureMode, FallbackTarget, GuardFailure, GuardKind, MaterializeKind,
     ModuleOptimizationPlanV3, PlanNodeId, PlanValue, PlannedConstant, RegionExitTarget, RegionId,
-    RegionInputSource, RegionPlan, Rep, RichCompareOp,
+    RegionInputSource, RegionPlan, Rep, RichCompareOp, ScalarLocalThreadPlan, ScalarThreadFallback,
+    ScalarThreadLocalLocation, ScalarThreadMaterialization,
 };
 use soac_profile::{CollectedTypeKeyLayout, CounterDumpTypeKey, read_block_entry_counts_from_file};
 #[cfg(test)]
@@ -196,6 +197,7 @@ static TYPE_KEY_RUNTIME_REGISTRY: OnceLock<Mutex<HashMap<CounterDumpTypeKey, usi
     OnceLock::new();
 const JIT_ARENA_BYTES: usize = 256 * 1024 * 1024;
 const MISSING_PYTHON_EXCEPTION_TRAP: ir::TrapCode = ir::TrapCode::unwrap_user(1);
+const OPT_V3_FUSED_CONSUMER_TRAP: ir::TrapCode = ir::TrapCode::unwrap_user(2);
 const COLD_BLOCK_ENTRY_RATE_DENOMINATOR: u64 = 100;
 thread_local! {
     static PROCESS_JIT_COMPILE_DEPTH: Cell<usize> = const { Cell::new(0) };
@@ -21420,6 +21422,13 @@ struct OptV3ExactIntReturnSelection<'a> {
     fallback_region: &'a MechanicalRegionEmission,
 }
 
+#[derive(Clone, Copy)]
+struct OptV3ScalarThreadSelection<'a> {
+    thread: &'a ScalarLocalThreadPlan,
+    producer: OptV3ExactIntReturnSelection<'a>,
+    consumer: OptV3ExactIntBranchSelection<'a>,
+}
+
 #[derive(Clone, Copy, Debug)]
 enum OptV3MechanicalValue {
     PyObject { value: ir::Value, owned: bool },
@@ -21569,6 +21578,61 @@ fn opt_v3_exact_int_return_selection_for_source<'a>(
         fallback_plan,
         fallback_region,
     }))
+}
+
+fn opt_v3_scalar_thread_selection_for_store_branch<'a>(
+    artifacts: &'a ExactIntBranchV3Artifacts,
+    producer_source: InstrId,
+    consumer_source: InstrId,
+    local_name: &ResolvedName,
+) -> Result<Option<OptV3ScalarThreadSelection<'a>>, String> {
+    let Some(planned_function) = artifacts.plan.functions.first() else {
+        return Ok(None);
+    };
+    let Some(producer) = opt_v3_exact_int_return_selection_for_source(artifacts, producer_source)?
+    else {
+        return Ok(None);
+    };
+    let Some(consumer) = opt_v3_exact_int_branch_selection_for_source(artifacts, consumer_source)?
+    else {
+        return Ok(None);
+    };
+    let Some(thread) = planned_function.scalar_threads.iter().find(|thread| {
+        thread.producer.region == producer.hot_plan.id
+            && thread.consumer.region == consumer.hot_plan.id
+            && opt_v3_scalar_thread_matches_local(thread, local_name)
+    }) else {
+        return Ok(None);
+    };
+    match &thread.fallback {
+        ScalarThreadFallback::LocalFallbackRegion { region, .. }
+            if *region == producer.fallback_plan.id => {}
+        other => {
+            return Err(format!(
+                "optimizer v3 scalar thread for local {} has fallback {other:?}, expected producer fallback {:?}",
+                thread.local.name, producer.fallback_plan.id
+            ));
+        }
+    }
+    Ok(Some(OptV3ScalarThreadSelection {
+        thread,
+        producer,
+        consumer,
+    }))
+}
+
+fn opt_v3_scalar_thread_matches_local(
+    thread: &ScalarLocalThreadPlan,
+    local_name: &ResolvedName,
+) -> bool {
+    let Some(location) = local_name.local_location() else {
+        return false;
+    };
+    match thread.local.location {
+        ScalarThreadLocalLocation::Local { slot } => {
+            slot == location.slot() && thread.local.name == local_name.id_str()
+        }
+    }
 }
 
 fn opt_v3_region_has_return_source(region: &MechanicalRegionEmission, source: InstrId) -> bool {
@@ -21997,9 +22061,101 @@ fn emit_opt_v3_mechanical_region_steps(
     codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<(), String> {
+    emit_opt_v3_mechanical_region_steps_controlled(
+        fb,
+        region,
+        values,
+        local_fallback_block,
+        local_env,
+        emit_ctx,
+        codegen_env,
+        func_imports,
+        None,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_opt_v3_mechanical_region_steps_until_value(
+    fb: &mut FunctionBuilder<'_>,
+    region: &MechanicalRegionEmission,
+    values: &mut HashMap<PlanValue, OptV3MechanicalValue>,
+    local_fallback_block: Option<ir::Block>,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+    stop_after_value: PlanValue,
+) -> Result<(), String> {
+    emit_opt_v3_mechanical_region_steps_controlled(
+        fb,
+        region,
+        values,
+        local_fallback_block,
+        local_env,
+        emit_ctx,
+        codegen_env,
+        func_imports,
+        Some(stop_after_value),
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_opt_v3_mechanical_region_steps_with_preseeded_scalar(
+    fb: &mut FunctionBuilder<'_>,
+    region: &MechanicalRegionEmission,
+    values: &mut HashMap<PlanValue, OptV3MechanicalValue>,
+    local_fallback_block: Option<ir::Block>,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+    preseeded_scalar: PlanValue,
+) -> Result<(), String> {
+    emit_opt_v3_mechanical_region_steps_controlled(
+        fb,
+        region,
+        values,
+        local_fallback_block,
+        local_env,
+        emit_ctx,
+        codegen_env,
+        func_imports,
+        None,
+        Some(preseeded_scalar),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_opt_v3_mechanical_region_steps_controlled(
+    fb: &mut FunctionBuilder<'_>,
+    region: &MechanicalRegionEmission,
+    values: &mut HashMap<PlanValue, OptV3MechanicalValue>,
+    local_fallback_block: Option<ir::Block>,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+    stop_after_value: Option<PlanValue>,
+    preseeded_scalar: Option<PlanValue>,
+) -> Result<(), String> {
+    if let Some(value) = stop_after_value
+        && values.contains_key(&value)
+    {
+        return Ok(());
+    }
+    let preseeded_convert_inputs = if let Some(preseeded_scalar) = preseeded_scalar {
+        opt_v3_convert_inputs_for_output(region, preseeded_scalar)
+    } else {
+        HashSet::new()
+    };
     for step in &region.steps {
         match &step.op {
             MechanicalStepOp::Input { output } => {
+                if preseeded_convert_inputs.contains(output) {
+                    continue;
+                }
                 if !values.contains_key(output) {
                     return Err(format!(
                         "optimizer v3 region {:?} input node {:?} references missing value {:?}",
@@ -22021,6 +22177,12 @@ fn emit_opt_v3_mechanical_region_steps(
                 };
                 opt_v3_store_mechanical_value(values, *output, value)?;
             }
+            MechanicalStepOp::Guard { inputs, .. }
+                if !preseeded_convert_inputs.is_empty()
+                    && !inputs.is_empty()
+                    && inputs
+                        .iter()
+                        .all(|input| preseeded_convert_inputs.contains(input)) => {}
             MechanicalStepOp::Guard { kind, failure, .. } => {
                 if *kind != GuardKind::SpecializationCheck {
                     return Err(format!(
@@ -22053,6 +22215,9 @@ fn emit_opt_v3_mechanical_region_steps(
                 output,
                 ..
             } => {
+                if preseeded_scalar == Some(*output) && values.contains_key(output) {
+                    continue;
+                }
                 emit_opt_v3_mechanical_convert(
                     fb,
                     region.region,
@@ -22110,8 +22275,37 @@ fn emit_opt_v3_mechanical_region_steps(
                 ));
             }
         }
+        if let Some(value) = stop_after_value
+            && values.contains_key(&value)
+        {
+            return Ok(());
+        }
+    }
+    if let Some(value) = stop_after_value {
+        return Err(format!(
+            "optimizer v3 region {:?} did not produce requested stop value {:?}",
+            region.region, value.id
+        ));
     }
     Ok(())
+}
+
+fn opt_v3_convert_inputs_for_output(
+    region: &MechanicalRegionEmission,
+    output: PlanValue,
+) -> HashSet<PlanValue> {
+    region
+        .steps
+        .iter()
+        .filter_map(|step| match &step.op {
+            MechanicalStepOp::Convert {
+                input,
+                output: step_output,
+                ..
+            } if *step_output == output => Some(*input),
+            _ => None,
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -22817,6 +23011,390 @@ fn emit_typed_codegen_ops(
         discard_emit_result(fb, result, emit_ctx)?;
     }
     Ok(())
+}
+
+fn codegen_block_has_predecessor(
+    function: &BlockPyFunction<CodegenModuleShape>,
+    target: BlockLabel,
+) -> usize {
+    function
+        .blocks
+        .iter()
+        .filter(|block| match &block.term {
+            BlockTerm::Jump(edge) => edge.target == target,
+            BlockTerm::IfTerm(if_term) => {
+                if_term.then_label == target || if_term.else_label == target
+            }
+            BlockTerm::BranchTable(branch) => {
+                branch.default_label == target || branch.targets.contains(&target)
+            }
+            BlockTerm::Raise(_) | BlockTerm::Return(_) => false,
+        })
+        .count()
+}
+
+fn cranelift_value_args(args: &[ir::BlockArg]) -> Result<Vec<ir::Value>, String> {
+    args.iter()
+        .map(|arg| match arg {
+            ir::BlockArg::Value(value) => Ok(*value),
+            other => Err(format!(
+                "optimizer v3 scalar-thread jump expected value block arg, got {other:?}"
+            )),
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_opt_v3_scalar_threaded_store_branch(
+    fb: &mut FunctionBuilder<'_>,
+    source_label: BlockLabel,
+    typed_block: &Block<InstrTyped>,
+    typed_function: &BlockPyFunction<TypedCodegenModuleShape>,
+    function: &BlockPyFunction<CodegenModuleShape>,
+    jit_local_plan: &PlannedJitFunctionLocals,
+    exec_blocks: &[ir::Block],
+    block_indices_by_label: &HashMap<BlockLabel, usize>,
+    jump_edge_transports: &[Option<EdgeTransportPlan>],
+    implicit_target_transports: &[EdgeTransportPlan],
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    cleanup_null_block: ir::Block,
+    pending_local_failure_cleanups: &mut Vec<PendingLocalFailureCleanup>,
+    local_failure_cleanup_blocks: &mut HashMap<LocalFailureCleanupKey, ir::Block>,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+    current_exception_name: Option<&str>,
+) -> Result<Option<BlockLabel>, String> {
+    let [store_expr] = typed_block.body.as_slice() else {
+        return Ok(None);
+    };
+    let InstrTyped::LegacyStore(store) = store_expr else {
+        return Ok(None);
+    };
+    let Some(location) = store.name.local_location() else {
+        return Ok(None);
+    };
+    let BlockTerm::Jump(edge) = &typed_block.term else {
+        return Ok(None);
+    };
+    if !edge.args.is_empty() {
+        return Ok(None);
+    }
+    if codegen_block_has_predecessor(function, edge.target) != 1 {
+        return Ok(None);
+    }
+    if current_exception_name.is_some() || block_exception_name(function, edge.target).is_some() {
+        return Ok(None);
+    }
+
+    let consumer_index =
+        codegen_block_index_for_label(function, block_indices_by_label, edge.target)?;
+    let consumer_block = &typed_function.blocks[consumer_index];
+    if !consumer_block.body.is_empty() {
+        return Ok(None);
+    }
+    let BlockTerm::IfTerm(if_term) = &consumer_block.term else {
+        return Ok(None);
+    };
+    let Some(producer_source) = store.value.try_semantic_instr_id() else {
+        return Ok(None);
+    };
+    let Some(consumer_source) = if_term.test.try_semantic_instr_id() else {
+        return Ok(None);
+    };
+    let Some(artifacts) = emit_ctx.opt_v3_exact_int_branch_artifacts.as_deref() else {
+        return Ok(None);
+    };
+    let Some(selection) = opt_v3_scalar_thread_selection_for_store_branch(
+        artifacts,
+        producer_source,
+        consumer_source,
+        &store.name,
+    )?
+    else {
+        return Ok(None);
+    };
+    if !matches!(
+        selection.thread.materialization,
+        ScalarThreadMaterialization::DeferredUntilPythonObjectUse { .. }
+    ) {
+        return Err(format!(
+            "optimizer v3 scalar thread for local {} has unsupported materialization {:?}",
+            selection.thread.local.name, selection.thread.materialization
+        ));
+    }
+
+    if let Some(store_instr_id) = store_expr.try_semantic_instr_id() {
+        emit_ctx.require_deopt_point_before_instr_id(store_instr_id)?;
+    }
+    emit_ctx.require_deopt_point_before_term(source_label)?;
+    emit_ctx.require_deopt_point_at_block_entry(edge.target)?;
+    emit_ctx.require_deopt_point_before_term(edge.target)?;
+
+    let source_index =
+        codegen_block_index_for_label(function, block_indices_by_label, source_label)?;
+    let source_jump_transport = jump_edge_transports[source_index]
+        .as_ref()
+        .expect("jump term should have a planned edge transport");
+    let layout = emit_ctx
+        .storage_layout
+        .as_ref()
+        .expect("Store local slot should have storage layout during typed codegen");
+    let local_name = local_name_for_location(layout, location);
+    let result_block = fb.create_block();
+    fb.append_block_param(result_block, emit_ctx.consts.i32_ty);
+    fb.append_block_param(result_block, emit_ctx.consts.ptr_ty);
+    let producer_fallback_block = fb.create_block();
+    fb.set_cold_block(producer_fallback_block);
+
+    let stmt_emit_ctx = local_failure_cleanup_emit_ctx(
+        fb,
+        emit_ctx,
+        local_env,
+        cleanup_null_block,
+        pending_local_failure_cleanups,
+        local_failure_cleanup_blocks,
+    )?;
+    let stmt_emit_ctx = stmt_emit_ctx.as_ref().unwrap_or(emit_ctx);
+
+    let mut hot_values = opt_v3_region_input_values(
+        fb,
+        selection.producer.hot_plan,
+        local_env,
+        stmt_emit_ctx,
+        "scalar-thread producer hot region",
+    )?;
+    emit_opt_v3_mechanical_region_steps_until_value(
+        fb,
+        selection.producer.hot_region,
+        &mut hot_values,
+        Some(producer_fallback_block),
+        local_env,
+        stmt_emit_ctx,
+        codegen_env,
+        func_imports,
+        selection.thread.producer.value,
+    )?;
+    let threaded_i64 = opt_v3_i64_value(&hot_values, selection.thread.producer.value)?;
+    let mut consumer_hot_values = HashMap::new();
+    opt_v3_store_mechanical_value(
+        &mut consumer_hot_values,
+        selection.thread.consumer.value,
+        OptV3MechanicalValue::I64(threaded_i64),
+    )?;
+    emit_opt_v3_mechanical_region_steps_with_preseeded_scalar(
+        fb,
+        selection.consumer.hot_region,
+        &mut consumer_hot_values,
+        None,
+        local_env,
+        stmt_emit_ctx,
+        codegen_env,
+        func_imports,
+        selection.thread.consumer.value,
+    )?;
+    let hot_condition = opt_v3_region_branch_condition(
+        selection.consumer.hot_region,
+        &consumer_hot_values,
+        consumer_source,
+    )?;
+    let hot_c = emit_checked_owned_pyobject_call_with_cleanup(
+        fb,
+        stmt_emit_ctx,
+        stmt_emit_ctx.py_long_from_i64_ref,
+        &[threaded_i64],
+        &[],
+    );
+    fb.ins().jump(
+        result_block,
+        &[
+            ir::BlockArg::Value(hot_condition),
+            ir::BlockArg::Value(hot_c),
+        ],
+    );
+
+    fb.switch_to_block(producer_fallback_block);
+    let mut fallback_env = local_env.clone();
+    let producer_fallback_emit_ctx = local_failure_cleanup_emit_ctx(
+        fb,
+        emit_ctx,
+        &fallback_env,
+        cleanup_null_block,
+        pending_local_failure_cleanups,
+        local_failure_cleanup_blocks,
+    )?;
+    let producer_fallback_emit_ctx = producer_fallback_emit_ctx.as_ref().unwrap_or(emit_ctx);
+    let mut producer_fallback_values = opt_v3_region_input_values(
+        fb,
+        selection.producer.fallback_plan,
+        &mut fallback_env,
+        producer_fallback_emit_ctx,
+        "scalar-thread producer fallback region",
+    )?;
+    emit_opt_v3_mechanical_region_steps(
+        fb,
+        selection.producer.fallback_region,
+        &mut producer_fallback_values,
+        None,
+        &mut fallback_env,
+        producer_fallback_emit_ctx,
+        codegen_env,
+        func_imports,
+    )?;
+    let fallback_c_result = opt_v3_region_return_pyobject(
+        selection.producer.fallback_region,
+        &producer_fallback_values,
+        producer_source,
+    )?;
+    if !fallback_c_result
+        .ownership
+        .can_satisfy_pyobject_demand(ResultDemand::PYOBJECT_OWNED)
+    {
+        return Err(format!(
+            "optimizer v3 scalar-thread fallback producer for {producer_source} produced {:?}, expected owned PyObject",
+            fallback_c_result.ownership
+        ));
+    }
+    fallback_env.store_location(
+        fb,
+        location,
+        local_name,
+        fallback_c_result.value,
+        LocalRefKind::Owned,
+        Some(PyObjFacts::unknown()),
+        emit_ctx.allow_local_only_slot_backed_stores,
+        &emit_ctx.stack_slots,
+        emit_ctx.consts.ptr_ty,
+        emit_ctx.consts.thread_state_value,
+        emit_ctx.incref_ref,
+        emit_ctx.decref_ref,
+    );
+    let consumer_fallback_emit_ctx = local_failure_cleanup_emit_ctx(
+        fb,
+        emit_ctx,
+        &fallback_env,
+        cleanup_null_block,
+        pending_local_failure_cleanups,
+        local_failure_cleanup_blocks,
+    )?;
+    let consumer_fallback_emit_ctx = consumer_fallback_emit_ctx.as_ref().unwrap_or(emit_ctx);
+    let mut consumer_fallback_values = opt_v3_region_input_values(
+        fb,
+        selection.consumer.fallback_plan,
+        &mut fallback_env,
+        consumer_fallback_emit_ctx,
+        "scalar-thread consumer fallback region",
+    )?;
+    emit_opt_v3_mechanical_region_steps(
+        fb,
+        selection.consumer.fallback_region,
+        &mut consumer_fallback_values,
+        None,
+        &mut fallback_env,
+        consumer_fallback_emit_ctx,
+        codegen_env,
+        func_imports,
+    )?;
+    let fallback_condition = opt_v3_region_branch_condition(
+        selection.consumer.fallback_region,
+        &consumer_fallback_values,
+        consumer_source,
+    )?;
+    let fallback_c = fallback_env
+        .load_location(fb, location, local_name, consumer_fallback_emit_ctx, true)
+        .ok_or_else(|| {
+            format!("optimizer v3 scalar-thread fallback lost materialized local {local_name}")
+        })?;
+    fb.ins().jump(
+        result_block,
+        &[
+            ir::BlockArg::Value(fallback_condition),
+            ir::BlockArg::Value(fallback_c),
+        ],
+    );
+
+    fb.switch_to_block(result_block);
+    let result_params = fb.block_params(result_block).to_vec();
+    let condition = result_params[0];
+    let c_value = result_params[1];
+    local_env.store_location(
+        fb,
+        location,
+        local_name,
+        c_value,
+        LocalRefKind::Owned,
+        Some(PyObjFacts::unknown()),
+        emit_ctx.allow_local_only_slot_backed_stores,
+        &emit_ctx.stack_slots,
+        emit_ctx.consts.ptr_ty,
+        emit_ctx.consts.thread_state_value,
+        emit_ctx.incref_ref,
+        emit_ctx.decref_ref,
+    );
+    let (prepared_args, forwarded_locations) = emit_planned_target_args_codegen_from_local_env(
+        fb,
+        &source_jump_transport.target_args,
+        local_env,
+        emit_ctx,
+        codegen_env,
+        func_imports,
+    )
+    .map_err(|err| {
+        format!(
+            "missing local mapping for fused optimizer v3 scalar-thread jump from block {source_label}: {err}"
+        )
+    })?;
+    emit_planned_local_releases_for_reason_with_local_env(
+        fb,
+        source_label,
+        &RefcountReleaseReason::Jump {
+            target: edge.target,
+        },
+        local_env,
+        &forwarded_locations,
+        emit_ctx,
+    )?;
+    emit_decref_unforwarded_local_env(
+        fb,
+        local_env,
+        &forwarded_locations,
+        &[],
+        emit_ctx.consts.thread_state_value,
+        emit_ctx.decref_ref,
+    );
+    let consumer_arg_values = cranelift_value_args(&prepared_args)?;
+    let mut consumer_env = LocalEnv::default();
+    bind_planned_local_env_at_block_entry(
+        fb,
+        jit_local_plan,
+        consumer_index,
+        &consumer_arg_values,
+        &mut consumer_env,
+        &emit_ctx.stack_slots,
+        emit_ctx.consts.ptr_ty,
+        emit_ctx.consts.thread_state_value,
+        emit_ctx.incref_ref,
+        emit_ctx.decref_ref,
+        matches!(function.kind, FunctionKind::Function),
+    )?;
+    emit_codegen_if_truth_i32(
+        fb,
+        edge.target,
+        Some(consumer_source),
+        condition,
+        if_term.then_label,
+        if_term.else_label,
+        None,
+        function,
+        exec_blocks,
+        block_indices_by_label,
+        implicit_target_transports,
+        &mut consumer_env,
+        emit_ctx,
+        codegen_env,
+        func_imports,
+    )?;
+    Ok(Some(edge.target))
 }
 
 fn emit_codegen_if_target_arm(
@@ -28133,9 +28711,14 @@ fn build_cranelift_run_bb_specialized_function(
             }
         }
 
+        let mut opt_v3_fused_scalar_thread_consumers = HashSet::new();
         for (index, block) in exec_blocks.iter().enumerate() {
             fb.switch_to_block(*block);
             let codegen_block = &function.blocks[index];
+            if opt_v3_fused_scalar_thread_consumers.contains(&codegen_block.label) {
+                fb.ins().trap(OPT_V3_FUSED_CONSUMER_TRAP);
+                continue;
+            }
             let mut local_env = LocalEnv::default();
             let block_param_values = fb.block_params(*block).to_vec();
             bind_planned_local_env_at_block_entry(
@@ -28275,6 +28858,30 @@ fn build_cranelift_run_bb_specialized_function(
             }));
             emit_ctx.require_deopt_point_at_block_entry(codegen_block.label)?;
             let _block_refcount_plan = emit_ctx.refcount_plan.block(codegen_block.label);
+
+            if let Some(consumer_label) = emit_opt_v3_scalar_threaded_store_branch(
+                &mut fb,
+                codegen_block.label,
+                &typed_function.blocks[index],
+                &typed_function,
+                function,
+                jit_local_plan,
+                &exec_blocks,
+                &block_indices_by_label,
+                jump_edge_transports,
+                implicit_target_transports,
+                &mut local_env,
+                &emit_ctx,
+                cleanup_null_blocks[index],
+                &mut pending_local_failure_cleanups,
+                &mut local_failure_cleanup_blocks,
+                codegen_env,
+                &mut func_imports,
+                codegen_block.exception_param(),
+            )? {
+                opt_v3_fused_scalar_thread_consumers.insert(consumer_label);
+                continue;
+            }
 
             emit_typed_codegen_ops(
                 &mut fb,
