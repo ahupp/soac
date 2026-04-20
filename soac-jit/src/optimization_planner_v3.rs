@@ -111,7 +111,10 @@ fn plan_compact_int_branch(
     if let Some(planned) = plan_compact_int_add_gt_zero_branch(catalog, region, facts)? {
         return Ok(Some(planned));
     }
-    plan_compact_int_compare_branch(catalog, region, facts)
+    if let Some(planned) = plan_compact_int_compare_branch(catalog, region, facts)? {
+        return Ok(Some(planned));
+    }
+    plan_compact_int_add_return(catalog, region, facts)
 }
 
 fn plan_compact_int_add_gt_zero_branch(
@@ -253,6 +256,88 @@ fn plan_compact_int_add_gt_zero_branch(
     Ok(Some(vec![hot_region, fallback_region]))
 }
 
+fn plan_compact_int_add_return(
+    catalog: &AlternativeCatalog,
+    region: &ExtractedRegion,
+    facts: &PlannerFacts,
+) -> Result<Option<Vec<RegionPlan>>, String> {
+    let Some(shape) = match_compact_int_add_return(region, facts) else {
+        return Ok(None);
+    };
+    let add = required_alternative(catalog, "binary.add.exact_compact_int.i64")?;
+    let generic_add = required_alternative(catalog, "binary.add.py_generic")?;
+
+    let fallback_region_id = RegionId(region.id.0 + 1);
+    let failure_targets =
+        FailureTargets::local_fallback(FallbackTarget::Region(fallback_region_id));
+
+    let a_obj = PlanValue::new(0, Rep::PyObjectBorrowed);
+    let b_obj = PlanValue::new(1, Rep::PyObjectBorrowed);
+    let a_i64 = PlanValue::new(2, Rep::I64);
+    let b_i64 = PlanValue::new(3, Rep::I64);
+    let sum_i64 = PlanValue::new(4, Rep::I64);
+    let result_obj = PlanValue::new(5, Rep::PyObjectOwned);
+
+    let hot_region = RegionPlan {
+        id: region.id,
+        source: RegionSource::Instr {
+            instr_id: shape
+                .source
+                .unwrap_or_else(|| InstrId::new(region.block, 0)),
+        },
+        inputs: vec![
+            region_input(a_obj, 0, shape.left_name.clone()),
+            region_input(b_obj, 1, shape.right_name.clone()),
+        ],
+        nodes: vec![
+            guard_node(add, 0, 0, a_obj, &failure_targets),
+            guard_node(add, 1, 1, b_obj, &failure_targets),
+            unbox_node(2, a_obj, a_i64, 0, fallback_region_id),
+            unbox_node(3, b_obj, b_i64, 1, fallback_region_id),
+            operation_node(4, add, vec![a_i64, b_i64], Some(sum_i64), &failure_targets)?,
+            node(
+                5,
+                PlanNodeKind::Materialize(MaterializeNode {
+                    input: sum_i64,
+                    output: result_obj,
+                    kind: MaterializeKind::PythonLong,
+                }),
+            ),
+        ],
+        exits: vec![RegionExitPlan {
+            source: shape.source,
+            kind: RegionExitKind::Return { value: result_obj },
+        }],
+    };
+
+    let fallback_sum = PlanValue::new(20, Rep::PyObjectOwned);
+    let fallback_region = RegionPlan {
+        id: fallback_region_id,
+        source: RegionSource::Synthetic {
+            reason: "generic fallback for compact-int add return".to_string(),
+        },
+        inputs: vec![
+            region_input(a_obj, 0, shape.left_name),
+            region_input(b_obj, 1, shape.right_name),
+        ],
+        nodes: vec![operation_node(
+            20,
+            generic_add,
+            vec![a_obj, b_obj],
+            Some(fallback_sum),
+            &failure_targets,
+        )?],
+        exits: vec![RegionExitPlan {
+            source: shape.source,
+            kind: RegionExitKind::Return {
+                value: fallback_sum,
+            },
+        }],
+    };
+
+    Ok(Some(vec![hot_region, fallback_region]))
+}
+
 fn plan_compact_int_compare_branch(
     catalog: &AlternativeCatalog,
     region: &ExtractedRegion,
@@ -379,6 +464,13 @@ struct CompactIntCompareBranchShape {
     compare: CompareAlternativeSpec,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CompactIntReturnShape {
+    source: Option<InstrId>,
+    left_name: String,
+    right_name: String,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CompareAlternativeSpec {
     generic_id: &'static str,
@@ -427,6 +519,32 @@ fn match_compact_int_add_gt_zero_branch(
         return None;
     }
     Some(CompactIntBranchShape {
+        source,
+        left_name: region.load_name(left)?.id_str().to_string(),
+        right_name: region.load_name(right)?.id_str().to_string(),
+    })
+}
+
+fn match_compact_int_add_return(
+    region: &ExtractedRegion,
+    facts: &PlannerFacts,
+) -> Option<CompactIntReturnShape> {
+    let ExtractedExit::Return { value, source } = region.exit else {
+        return None;
+    };
+    let add = region.value(value)?;
+    let ExtractedValueKind::Binary {
+        op: BinOpKind::Add,
+        left,
+        right,
+    } = add.kind
+    else {
+        return None;
+    };
+    if !facts.is_exact_compact_int(left) || !facts.is_exact_compact_int(right) {
+        return None;
+    }
+    Some(CompactIntReturnShape {
         source,
         left_name: region.load_name(left)?.id_str().to_string(),
         right_name: region.load_name(right)?.id_str().to_string(),
@@ -686,6 +804,23 @@ mod tests {
         extract_block_region_v3(&block, RegionId(0)).unwrap()
     }
 
+    fn compact_int_add_return_region() -> ExtractedRegion {
+        let value = binary(
+            BinOpKind::Add,
+            with_instr_id(local("a", 0), 0),
+            with_instr_id(local("b", 1), 1),
+            2,
+        );
+        let block = Block::new(
+            label(0),
+            Vec::new(),
+            BlockTerm::Return(value),
+            Vec::<BlockParam>::new(),
+            None,
+        );
+        extract_block_region_v3(&block, RegionId(0)).unwrap()
+    }
+
     fn facts_for_compact_region() -> PlannerFacts {
         let mut facts = PlannerFacts::default();
         facts.mark_exact_compact_int(ExtractedValueId(0));
@@ -774,6 +909,44 @@ mod tests {
                 op: crate::optimization_plan_v3::PlannedOp::PyObjectRichCompare {
                     op: RichCompareOp::Lt
                 },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn plans_compact_int_add_return() {
+        let catalog = AlternativeCatalog::default_v3();
+        let request = module_request(compact_int_add_return_region(), facts_for_compact_region());
+        let plan = plan_module_optimization_v3(&catalog, request);
+
+        validate_module_plan_v3(&plan).unwrap();
+        let function = &plan.functions[0];
+        assert!(function.diagnostics.is_empty());
+        assert_eq!(function.regions.len(), 2);
+        assert_eq!(function.regions[0].nodes.len(), 6);
+        assert!(matches!(
+            function.regions[0].nodes[4].kind,
+            PlanNodeKind::Operation(OperationNode {
+                op: crate::optimization_plan_v3::PlannedOp::CheckedI64Add,
+                ..
+            })
+        ));
+        assert!(matches!(
+            function.regions[0].nodes[5].kind,
+            PlanNodeKind::Materialize(MaterializeNode {
+                kind: MaterializeKind::PythonLong,
+                ..
+            })
+        ));
+        assert!(matches!(
+            function.regions[0].exits[0].kind,
+            RegionExitKind::Return { .. }
+        ));
+        assert!(matches!(
+            function.regions[1].nodes[0].kind,
+            PlanNodeKind::Operation(OperationNode {
+                op: crate::optimization_plan_v3::PlannedOp::PyNumberAdd,
                 ..
             })
         ));

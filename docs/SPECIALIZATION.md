@@ -23,8 +23,9 @@ The resulting `ExactIntBranchV3Artifacts` are also threaded through
 contains the represented exact-int branch shape, JIT term lowering consumes the
 mechanical v3 region directly; otherwise lowering stays on the existing path.
 
-The represented branch slices are exact-compact-`int` direct comparisons such as
-`a < b` and add-then-compare-to-zero shapes such as `a + b > 0`:
+The represented slices are exact-compact-`int` direct comparison branches such
+as `a < b`, add-then-compare-to-zero branches such as `a + b > 0`, and
+value-producing add returns such as `return a + b`:
 `operator_hot_shapes` exact-int evidence proves the operands, a lowered module
 constant load proves `0` where needed, the v3 planner emits hot checked-`i64`
 operation regions plus local generic Python fallback regions, and
@@ -38,9 +39,10 @@ planner rule, validation, and mechanical-emitter coverage first.
 Current migration surface:
 
 - Live v3 codegen: exact-int direct-compare and add/compare branch slices with
-  local generic fallback.
-- Legacy only: exact-int value-producing binary/unary operators, profiled direct
-  calls, exact-list getitem/setitem, indexed globals, and indexed fields.
+  local generic fallback, plus exact-int add returns with explicit PythonLong
+  materialization and generic add fallback.
+- Legacy only: other exact-int value-producing binary/unary operators, profiled
+  direct calls, exact-list getitem/setitem, indexed globals, and indexed fields.
 - Not currently a v3 semantic-plan target: branch locality and cold block
   layout hints. These remain layout metadata unless a future CFG-placement plan
   needs to represent them.

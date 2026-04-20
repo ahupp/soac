@@ -21215,6 +21215,14 @@ struct OptV3ExactIntBranchSelection<'a> {
     fallback_region: &'a MechanicalRegionEmission,
 }
 
+#[derive(Clone, Copy)]
+struct OptV3ExactIntReturnSelection<'a> {
+    hot_plan: &'a RegionPlan,
+    hot_region: &'a MechanicalRegionEmission,
+    fallback_plan: &'a RegionPlan,
+    fallback_region: &'a MechanicalRegionEmission,
+}
+
 #[derive(Clone, Copy, Debug)]
 enum OptV3MechanicalValue {
     PyObject { value: ir::Value, owned: bool },
@@ -21302,6 +21310,70 @@ fn opt_v3_region_has_branch_source(region: &MechanicalRegionEmission, source: In
     })
 }
 
+fn opt_v3_exact_int_return_selection_for_source<'a>(
+    artifacts: &'a ExactIntBranchV3Artifacts,
+    source: InstrId,
+) -> Result<Option<OptV3ExactIntReturnSelection<'a>>, String> {
+    let Some(planned_function) = artifacts.plan.functions.first() else {
+        return Ok(None);
+    };
+    let Some(emitted_function) = artifacts.emission.functions.first() else {
+        return Ok(None);
+    };
+    let Some(hot_region) = emitted_function
+        .regions
+        .iter()
+        .find(|region| opt_v3_region_has_return_source(region, source))
+    else {
+        return Ok(None);
+    };
+    opt_v3_require_return_exit(hot_region, source)?;
+    let hot_plan = planned_function
+        .regions
+        .iter()
+        .find(|region| region.id == hot_region.region)
+        .ok_or_else(|| {
+            format!(
+                "optimizer v3 emission region {:?} for source {source} has no matching plan region",
+                hot_region.region
+            )
+        })?;
+    let fallback_region_id = opt_v3_required_local_fallback_region(hot_region)?;
+    let fallback_region = emitted_function
+        .regions
+        .iter()
+        .find(|region| region.region == fallback_region_id)
+        .ok_or_else(|| {
+            format!(
+                "optimizer v3 return region {:?} for source {source} references missing fallback region {:?}",
+                hot_region.region, fallback_region_id
+            )
+        })?;
+    opt_v3_require_return_exit(fallback_region, source)?;
+    let fallback_plan = planned_function
+        .regions
+        .iter()
+        .find(|region| region.id == fallback_region_id)
+        .ok_or_else(|| {
+            format!(
+                "optimizer v3 fallback emission region {:?} for source {source} has no matching plan region",
+                fallback_region_id
+            )
+        })?;
+    Ok(Some(OptV3ExactIntReturnSelection {
+        hot_plan,
+        hot_region,
+        fallback_plan,
+        fallback_region,
+    }))
+}
+
+fn opt_v3_region_has_return_source(region: &MechanicalRegionEmission, source: InstrId) -> bool {
+    region.exits.iter().any(|exit| {
+        exit.source == Some(source) && matches!(exit.kind, MechanicalExitKind::Return { .. })
+    })
+}
+
 fn opt_v3_require_original_cfg_branch_exit(
     region: &MechanicalRegionEmission,
     source: InstrId,
@@ -21332,6 +21404,33 @@ fn opt_v3_require_original_cfg_branch_exit(
         }
         other => Err(format!(
             "optimizer v3 region {:?} for source {source} has unsupported exit {other:?}; exact-int branch codegen only supports OriginalCfg branch exits",
+            region.region
+        )),
+    }
+}
+
+fn opt_v3_require_return_exit(
+    region: &MechanicalRegionEmission,
+    source: InstrId,
+) -> Result<(), String> {
+    if region.exits.len() != 1 {
+        return Err(format!(
+            "optimizer v3 region {:?} for source {source} has {} exits; exact-int return codegen expects one",
+            region.region,
+            region.exits.len()
+        ));
+    }
+    let exit = &region.exits[0];
+    if exit.source != Some(source) {
+        return Err(format!(
+            "optimizer v3 region {:?} return exit source {:?} does not match source {source}",
+            region.region, exit.source
+        ));
+    }
+    match &exit.kind {
+        MechanicalExitKind::Return { .. } => Ok(()),
+        other => Err(format!(
+            "optimizer v3 region {:?} for source {source} has unsupported exit {other:?}; exact-int return codegen only supports Return exits",
             region.region
         )),
     }
@@ -21435,6 +21534,37 @@ fn emit_opt_v3_exact_int_branch_truth_i32(
     .map(Some)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn emit_opt_v3_exact_int_return_pyobject(
+    fb: &mut FunctionBuilder<'_>,
+    value_instr_id: Option<InstrId>,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<Option<ir::Value>, String> {
+    let Some(value_instr_id) = value_instr_id else {
+        return Ok(None);
+    };
+    let Some(artifacts) = emit_ctx.opt_v3_exact_int_branch_artifacts.as_deref() else {
+        return Ok(None);
+    };
+    let Some(selection) = opt_v3_exact_int_return_selection_for_source(artifacts, value_instr_id)?
+    else {
+        return Ok(None);
+    };
+    emit_opt_v3_exact_int_return_selection(
+        fb,
+        value_instr_id,
+        selection,
+        local_env,
+        emit_ctx,
+        codegen_env,
+        func_imports,
+    )
+    .map(Some)
+}
+
 fn emit_opt_v3_exact_int_branch_selection(
     fb: &mut FunctionBuilder<'_>,
     test_instr_id: InstrId,
@@ -21493,6 +21623,69 @@ fn emit_opt_v3_exact_int_branch_selection(
         opt_v3_region_branch_condition(selection.fallback_region, &fallback_values, test_instr_id)?;
     fb.ins()
         .jump(result_block, &[ir::BlockArg::Value(fallback_condition)]);
+
+    fb.switch_to_block(result_block);
+    Ok(fb.block_params(result_block)[0])
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_opt_v3_exact_int_return_selection(
+    fb: &mut FunctionBuilder<'_>,
+    value_instr_id: InstrId,
+    selection: OptV3ExactIntReturnSelection<'_>,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<ir::Value, String> {
+    let result_block = fb.create_block();
+    fb.append_block_param(result_block, emit_ctx.consts.ptr_ty);
+    let fallback_block = fb.create_block();
+    fb.set_cold_block(fallback_block);
+
+    let mut hot_values = opt_v3_region_input_values(
+        fb,
+        selection.hot_plan,
+        local_env,
+        emit_ctx,
+        "exact-int return hot region",
+    )?;
+    emit_opt_v3_mechanical_region_steps(
+        fb,
+        selection.hot_region,
+        &mut hot_values,
+        Some(fallback_block),
+        local_env,
+        emit_ctx,
+        codegen_env,
+        func_imports,
+    )?;
+    let hot_value = opt_v3_region_return_value(selection.hot_region, &hot_values, value_instr_id)?;
+    fb.ins()
+        .jump(result_block, &[ir::BlockArg::Value(hot_value)]);
+
+    fb.switch_to_block(fallback_block);
+    let mut fallback_values = opt_v3_region_input_values(
+        fb,
+        selection.fallback_plan,
+        local_env,
+        emit_ctx,
+        "exact-int return fallback region",
+    )?;
+    emit_opt_v3_mechanical_region_steps(
+        fb,
+        selection.fallback_region,
+        &mut fallback_values,
+        None,
+        local_env,
+        emit_ctx,
+        codegen_env,
+        func_imports,
+    )?;
+    let fallback_value =
+        opt_v3_region_return_value(selection.fallback_region, &fallback_values, value_instr_id)?;
+    fb.ins()
+        .jump(result_block, &[ir::BlockArg::Value(fallback_value)]);
 
     fb.switch_to_block(result_block);
     Ok(fb.block_params(result_block)[0])
@@ -22012,6 +22205,33 @@ fn opt_v3_region_branch_condition(
         ));
     };
     opt_v3_i32_bool01_value(values, *condition)
+}
+
+fn opt_v3_region_return_value(
+    region: &MechanicalRegionEmission,
+    values: &HashMap<PlanValue, OptV3MechanicalValue>,
+    source: InstrId,
+) -> Result<ir::Value, String> {
+    let exit = region.exits.first().ok_or_else(|| {
+        format!(
+            "optimizer v3 region {:?} for source {source} has no exit",
+            region.region
+        )
+    })?;
+    let MechanicalExitKind::Return { value } = &exit.kind else {
+        return Err(format!(
+            "optimizer v3 region {:?} for source {source} does not end in a return",
+            region.region
+        ));
+    };
+    let (value, owned) = opt_v3_pyobject_value(values, *value)?;
+    if !owned {
+        return Err(format!(
+            "optimizer v3 region {:?} for source {source} produced borrowed PyObject for return",
+            region.region
+        ));
+    }
+    Ok(value)
 }
 
 fn opt_v3_rich_compare_intcc(op: RichCompareOp) -> ir::condcodes::IntCC {
@@ -23010,6 +23230,23 @@ fn emit_typed_codegen_term(
             .unwrap_or(ResultDemand::PYOBJECT_OWNED);
         let result = match demand {
             ResultDemand::PyObject { borrowed_ok: false } => {
+                if let Some(ret_value) = emit_opt_v3_exact_int_return_pyobject(
+                    fb,
+                    value.try_semantic_instr_id(),
+                    local_env,
+                    emit_ctx,
+                    codegen_env,
+                    func_imports,
+                )? {
+                    return emit_codegen_return_pyobject(
+                        fb,
+                        source_label,
+                        ret_value,
+                        local_env,
+                        emit_ctx,
+                        current_exception_name,
+                    );
+                }
                 emit_typed_codegen_stmt_result_with_local_env(
                     fb,
                     value,

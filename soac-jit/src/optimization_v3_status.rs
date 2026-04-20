@@ -17,16 +17,16 @@ pub struct V3OptimizationFamilyStatus {
 
 pub const V3_OPTIMIZATION_FAMILY_STATUS: &[V3OptimizationFamilyStatus] = &[
     V3OptimizationFamilyStatus {
-        family: "exact-int direct-compare and add/compare branch slices",
+        family: "exact-int direct-compare/add-compare branches and add returns",
         legacy_input: "operator_hot_shapes",
         status: V3MigrationStatus::LiveCodegenInputOnly,
-        next_step: "migrate value-producing exact-int binary and unary operators to v3 plans",
+        next_step: "migrate the remaining value-producing exact-int binary and unary operators to v3 plans",
     },
     V3OptimizationFamilyStatus {
-        family: "exact-int value-producing binary and unary operators",
+        family: "remaining exact-int value-producing binary and unary operators",
         legacy_input: "operator_hot_shapes",
         status: V3MigrationStatus::LegacyOnly,
-        next_step: "model return/value materialization and fallback ownership for non-branch results",
+        next_step: "model non-add operations, bool materialization for comparisons, and fallback ownership",
     },
     V3OptimizationFamilyStatus {
         family: "profiled direct calls",

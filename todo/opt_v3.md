@@ -50,8 +50,8 @@ Implemented:
 - `optimization_region_v3`: conservative branch/return region extraction that
   preserves evaluation order and declines unsupported blocks explicitly.
 - `optimization_planner_v3`: bounded planner for exact-compact-`int` direct
-  comparison branches and `a + b > 0` branches, producing hot and
-  local-fallback `RegionPlan`s.
+  comparison branches, `a + b > 0` branches, and `return a + b` value-producing
+  returns, producing hot and local-fallback `RegionPlan`s.
 - `optimization_emit_v3`: validation-gated mechanical emitter over selected v3
   plan nodes and exits.
 - `optimization_evidence_v3`: bridge from existing `FunctionProfileEvidence`
@@ -65,14 +65,14 @@ Implemented:
 - `FunctionSpecializationInputs`: carries validated exact-int branch v3
   artifacts into the JIT build path, where codegen validates that the artifact
   function identity matches the function being compiled.
-- JIT term lowering now consumes matching exact-int direct-compare and
-  add/compare branch artifacts by interpreting the mechanical hot region and
-  its local generic fallback. Unsupported or absent v3 regions continue through
-  the existing lowering path.
+- JIT term lowering now consumes matching exact-int direct-compare branch,
+  add/compare branch, and add-return artifacts by interpreting the mechanical
+  hot region and its local generic fallback. Unsupported or absent v3 regions
+  continue through the existing lowering path.
 
 Remaining legacy-only families are intentionally visible:
 
-- value-producing exact-int binary/unary operators;
+- remaining value-producing exact-int binary/unary operators;
 - profiled direct calls;
 - exact-list getitem/setitem;
 - indexed globals and indexed fields.
