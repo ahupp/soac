@@ -98,20 +98,18 @@ where
     }
 }
 
-impl<In> OperationField<In> for Vec<In>
+impl<In> OperationField<In> for In
 where
     In: Instr,
 {
-    type Mapped<Out: Instr> = Vec<Out>;
+    type Mapped<Out: Instr> = Out;
 
     fn visit_field<V>(&self, visitor: &mut V)
     where
         In: ChildVisitable<In>,
         V: Visit<In> + ?Sized,
     {
-        for item in self {
-            visitor.visit_instr(item);
-        }
+        visitor.visit_instr(self);
     }
 
     fn visit_field_mut<V>(&mut self, visitor: &mut V)
@@ -119,9 +117,7 @@ where
         In: ChildVisitable<In>,
         V: VisitMut<In> + ?Sized,
     {
-        for item in self {
-            visitor.visit_instr_mut(item);
-        }
+        visitor.visit_instr_mut(self);
     }
 
     fn map_field<Out, M>(self, map: &mut M) -> Self::Mapped<Out>
@@ -129,7 +125,7 @@ where
         Out: Instr,
         M: MapInstr<In, Out>,
     {
-        self.into_iter().map(|value| map.map_instr(value)).collect()
+        map.map_instr(self)
     }
 
     fn try_map_field<Out, Error, M>(self, map: &mut M) -> Result<Self::Mapped<Out>, Error>
@@ -137,9 +133,7 @@ where
         Out: Instr,
         M: TryMapInstr<In, Out, Error>,
     {
-        self.into_iter()
-            .map(|value| map.try_map_instr(value))
-            .collect()
+        map.try_map_instr(self)
     }
 }
 
@@ -226,11 +220,12 @@ where
     }
 }
 
-impl<In> OperationField<In> for Vec<CallArgPositional<In>>
+impl<In, Field> OperationField<In> for Vec<Field>
 where
     In: Instr,
+    Field: OperationField<In>,
 {
-    type Mapped<Out: Instr> = Vec<CallArgPositional<Out>>;
+    type Mapped<Out: Instr> = Vec<Field::Mapped<Out>>;
 
     fn visit_field<V>(&self, visitor: &mut V)
     where
@@ -307,51 +302,6 @@ where
         M: TryMapInstr<In, Out, Error>,
     {
         self.try_map_instr(|expr| map.try_map_instr(expr))
-    }
-}
-
-impl<In> OperationField<In> for Vec<CallArgKeyword<In>>
-where
-    In: Instr,
-{
-    type Mapped<Out: Instr> = Vec<CallArgKeyword<Out>>;
-
-    fn visit_field<V>(&self, visitor: &mut V)
-    where
-        In: ChildVisitable<In>,
-        V: Visit<In> + ?Sized,
-    {
-        for item in self {
-            item.visit_field(visitor);
-        }
-    }
-
-    fn visit_field_mut<V>(&mut self, visitor: &mut V)
-    where
-        In: ChildVisitable<In>,
-        V: VisitMut<In> + ?Sized,
-    {
-        for item in self {
-            item.visit_field_mut(visitor);
-        }
-    }
-
-    fn map_field<Out, M>(self, map: &mut M) -> Self::Mapped<Out>
-    where
-        Out: Instr,
-        M: MapInstr<In, Out>,
-    {
-        self.into_iter().map(|item| item.map_field(map)).collect()
-    }
-
-    fn try_map_field<Out, Error, M>(self, map: &mut M) -> Result<Self::Mapped<Out>, Error>
-    where
-        Out: Instr,
-        M: TryMapInstr<In, Out, Error>,
-    {
-        self.into_iter()
-            .map(|item| item.try_map_field(map))
-            .collect()
     }
 }
 
