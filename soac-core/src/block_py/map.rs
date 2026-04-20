@@ -1,3 +1,4 @@
+use super::visit::{Visit, VisitMut};
 use super::*;
 
 pub trait Mappable<E>: Sized
@@ -28,6 +29,329 @@ where
         M: TryMapInstr<E, E, Error>,
     {
         self.try_map_children(map)
+    }
+}
+
+pub trait OperationField<In>: Sized
+where
+    In: Instr,
+{
+    type Mapped<Out: Instr>;
+
+    fn visit_field<V>(&self, visitor: &mut V)
+    where
+        In: ChildVisitable<In>,
+        V: Visit<In> + ?Sized;
+
+    fn visit_field_mut<V>(&mut self, visitor: &mut V)
+    where
+        In: ChildVisitable<In>,
+        V: VisitMut<In> + ?Sized;
+
+    fn map_field<Out, M>(self, map: &mut M) -> Self::Mapped<Out>
+    where
+        Out: Instr,
+        M: MapInstr<In, Out>;
+
+    fn try_map_field<Out, Error, M>(self, map: &mut M) -> Result<Self::Mapped<Out>, Error>
+    where
+        Out: Instr,
+        M: TryMapInstr<In, Out, Error>;
+}
+
+impl<In> OperationField<In> for Box<In>
+where
+    In: Instr,
+{
+    type Mapped<Out: Instr> = Box<Out>;
+
+    fn visit_field<V>(&self, visitor: &mut V)
+    where
+        In: ChildVisitable<In>,
+        V: Visit<In> + ?Sized,
+    {
+        visitor.visit_instr(self);
+    }
+
+    fn visit_field_mut<V>(&mut self, visitor: &mut V)
+    where
+        In: ChildVisitable<In>,
+        V: VisitMut<In> + ?Sized,
+    {
+        visitor.visit_instr_mut(self);
+    }
+
+    fn map_field<Out, M>(self, map: &mut M) -> Self::Mapped<Out>
+    where
+        Out: Instr,
+        M: MapInstr<In, Out>,
+    {
+        Box::new(map.map_instr(*self))
+    }
+
+    fn try_map_field<Out, Error, M>(self, map: &mut M) -> Result<Self::Mapped<Out>, Error>
+    where
+        Out: Instr,
+        M: TryMapInstr<In, Out, Error>,
+    {
+        map.try_map_instr(*self).map(Box::new)
+    }
+}
+
+impl<In> OperationField<In> for Vec<In>
+where
+    In: Instr,
+{
+    type Mapped<Out: Instr> = Vec<Out>;
+
+    fn visit_field<V>(&self, visitor: &mut V)
+    where
+        In: ChildVisitable<In>,
+        V: Visit<In> + ?Sized,
+    {
+        for item in self {
+            visitor.visit_instr(item);
+        }
+    }
+
+    fn visit_field_mut<V>(&mut self, visitor: &mut V)
+    where
+        In: ChildVisitable<In>,
+        V: VisitMut<In> + ?Sized,
+    {
+        for item in self {
+            visitor.visit_instr_mut(item);
+        }
+    }
+
+    fn map_field<Out, M>(self, map: &mut M) -> Self::Mapped<Out>
+    where
+        Out: Instr,
+        M: MapInstr<In, Out>,
+    {
+        self.into_iter().map(|value| map.map_instr(value)).collect()
+    }
+
+    fn try_map_field<Out, Error, M>(self, map: &mut M) -> Result<Self::Mapped<Out>, Error>
+    where
+        Out: Instr,
+        M: TryMapInstr<In, Out, Error>,
+    {
+        self.into_iter()
+            .map(|value| map.try_map_instr(value))
+            .collect()
+    }
+}
+
+impl<In> OperationField<In> for Option<Box<In>>
+where
+    In: Instr,
+{
+    type Mapped<Out: Instr> = Option<Box<Out>>;
+
+    fn visit_field<V>(&self, visitor: &mut V)
+    where
+        In: ChildVisitable<In>,
+        V: Visit<In> + ?Sized,
+    {
+        if let Some(item) = self {
+            visitor.visit_instr(item);
+        }
+    }
+
+    fn visit_field_mut<V>(&mut self, visitor: &mut V)
+    where
+        In: ChildVisitable<In>,
+        V: VisitMut<In> + ?Sized,
+    {
+        if let Some(item) = self {
+            visitor.visit_instr_mut(item);
+        }
+    }
+
+    fn map_field<Out, M>(self, map: &mut M) -> Self::Mapped<Out>
+    where
+        Out: Instr,
+        M: MapInstr<In, Out>,
+    {
+        self.map(|value| Box::new(map.map_instr(*value)))
+    }
+
+    fn try_map_field<Out, Error, M>(self, map: &mut M) -> Result<Self::Mapped<Out>, Error>
+    where
+        Out: Instr,
+        M: TryMapInstr<In, Out, Error>,
+    {
+        self.map(|value| map.try_map_instr(*value).map(Box::new))
+            .transpose()
+    }
+}
+
+impl<In> OperationField<In> for CallArgPositional<In>
+where
+    In: Instr,
+{
+    type Mapped<Out: Instr> = CallArgPositional<Out>;
+
+    fn visit_field<V>(&self, visitor: &mut V)
+    where
+        In: ChildVisitable<In>,
+        V: Visit<In> + ?Sized,
+    {
+        visitor.visit_instr(self.expr());
+    }
+
+    fn visit_field_mut<V>(&mut self, visitor: &mut V)
+    where
+        In: ChildVisitable<In>,
+        V: VisitMut<In> + ?Sized,
+    {
+        visitor.visit_instr_mut(self.expr_mut());
+    }
+
+    fn map_field<Out, M>(self, map: &mut M) -> Self::Mapped<Out>
+    where
+        Out: Instr,
+        M: MapInstr<In, Out>,
+    {
+        self.map_instr(|expr| map.map_instr(expr))
+    }
+
+    fn try_map_field<Out, Error, M>(self, map: &mut M) -> Result<Self::Mapped<Out>, Error>
+    where
+        Out: Instr,
+        M: TryMapInstr<In, Out, Error>,
+    {
+        self.try_map_instr(|expr| map.try_map_instr(expr))
+    }
+}
+
+impl<In> OperationField<In> for Vec<CallArgPositional<In>>
+where
+    In: Instr,
+{
+    type Mapped<Out: Instr> = Vec<CallArgPositional<Out>>;
+
+    fn visit_field<V>(&self, visitor: &mut V)
+    where
+        In: ChildVisitable<In>,
+        V: Visit<In> + ?Sized,
+    {
+        for item in self {
+            item.visit_field(visitor);
+        }
+    }
+
+    fn visit_field_mut<V>(&mut self, visitor: &mut V)
+    where
+        In: ChildVisitable<In>,
+        V: VisitMut<In> + ?Sized,
+    {
+        for item in self {
+            item.visit_field_mut(visitor);
+        }
+    }
+
+    fn map_field<Out, M>(self, map: &mut M) -> Self::Mapped<Out>
+    where
+        Out: Instr,
+        M: MapInstr<In, Out>,
+    {
+        self.into_iter().map(|item| item.map_field(map)).collect()
+    }
+
+    fn try_map_field<Out, Error, M>(self, map: &mut M) -> Result<Self::Mapped<Out>, Error>
+    where
+        Out: Instr,
+        M: TryMapInstr<In, Out, Error>,
+    {
+        self.into_iter()
+            .map(|item| item.try_map_field(map))
+            .collect()
+    }
+}
+
+impl<In> OperationField<In> for CallArgKeyword<In>
+where
+    In: Instr,
+{
+    type Mapped<Out: Instr> = CallArgKeyword<Out>;
+
+    fn visit_field<V>(&self, visitor: &mut V)
+    where
+        In: ChildVisitable<In>,
+        V: Visit<In> + ?Sized,
+    {
+        visitor.visit_instr(self.expr());
+    }
+
+    fn visit_field_mut<V>(&mut self, visitor: &mut V)
+    where
+        In: ChildVisitable<In>,
+        V: VisitMut<In> + ?Sized,
+    {
+        visitor.visit_instr_mut(self.expr_mut());
+    }
+
+    fn map_field<Out, M>(self, map: &mut M) -> Self::Mapped<Out>
+    where
+        Out: Instr,
+        M: MapInstr<In, Out>,
+    {
+        self.map_instr(|expr| map.map_instr(expr))
+    }
+
+    fn try_map_field<Out, Error, M>(self, map: &mut M) -> Result<Self::Mapped<Out>, Error>
+    where
+        Out: Instr,
+        M: TryMapInstr<In, Out, Error>,
+    {
+        self.try_map_instr(|expr| map.try_map_instr(expr))
+    }
+}
+
+impl<In> OperationField<In> for Vec<CallArgKeyword<In>>
+where
+    In: Instr,
+{
+    type Mapped<Out: Instr> = Vec<CallArgKeyword<Out>>;
+
+    fn visit_field<V>(&self, visitor: &mut V)
+    where
+        In: ChildVisitable<In>,
+        V: Visit<In> + ?Sized,
+    {
+        for item in self {
+            item.visit_field(visitor);
+        }
+    }
+
+    fn visit_field_mut<V>(&mut self, visitor: &mut V)
+    where
+        In: ChildVisitable<In>,
+        V: VisitMut<In> + ?Sized,
+    {
+        for item in self {
+            item.visit_field_mut(visitor);
+        }
+    }
+
+    fn map_field<Out, M>(self, map: &mut M) -> Self::Mapped<Out>
+    where
+        Out: Instr,
+        M: MapInstr<In, Out>,
+    {
+        self.into_iter().map(|item| item.map_field(map)).collect()
+    }
+
+    fn try_map_field<Out, Error, M>(self, map: &mut M) -> Result<Self::Mapped<Out>, Error>
+    where
+        Out: Instr,
+        M: TryMapInstr<In, Out, Error>,
+    {
+        self.into_iter()
+            .map(|item| item.try_map_field(map))
+            .collect()
     }
 }
 

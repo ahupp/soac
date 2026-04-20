@@ -21,22 +21,22 @@ mod trace;
 mod value_facts;
 
 use crate::block_py::{
-    cfg::relabel_blockpy_blocks_dense, runtime_name_load, Await, BinOp, BlockPyFunction,
-    BlockPyModule, BlockTerm, Call, CallArgKeyword, CallArgPositional, CallDirect,
-    CalleeFunctionId, CellRef, CellRefForName, ChildVisitable, Del, DelItem, ExprAttribute,
-    ExprBoolOp, ExprBooleanLiteral, ExprBytesLiteral, ExprCompare, ExprDict, ExprDictComp,
-    ExprEllipsisLiteral, ExprFString, ExprGenerator, ExprIf, ExprIpyEscapeCommand, ExprLambda,
-    ExprList, ExprListComp, ExprName, ExprNamed, ExprNoneLiteral, ExprNumberLiteral, ExprSet,
-    ExprSetComp, ExprSlice, ExprStarred, ExprStringLiteral, ExprSubscript, ExprTString, ExprTuple,
-    GetAttr, GetItem, HasMeta, IncrementCounter, Instr, InstrKey, InstrWithConstantNone,
-    LiteralValue, Load, LocalLocation, MakeCell, MakeFunction, MakeFunctionWithClosure,
-    MapFunction, MapInstr, MapModule, Mappable, Meta, ModuleShape, NameLike, NameLocation,
-    ResolvedName, RuntimeFunctionId, RuntimeName, SetAttr, SetItem, StmtAnnAssign, StmtAssert,
-    StmtAssign, StmtAugAssign, StmtBreak, StmtClassDef, StmtContinue, StmtDelete, StmtExpr,
-    StmtFor, StmtFunctionDef, StmtGlobal, StmtIf, StmtImport, StmtImportFrom, StmtIpyEscapeCommand,
-    StmtMatch, StmtNonlocal, StmtPass, StmtRaise, StmtReturn, StmtTry, StmtTypeAlias, StmtWhile,
-    StmtWith, Store, TryMapInstr, TryMapModule, TryMapTerm, Tuple, UnaryOp, UnresolvedName, Visit,
-    VisitMut, WithMeta, Yield, YieldFrom,
+    cfg::relabel_blockpy_blocks_dense, define_operation, define_ruff_operation, runtime_name_load,
+    Await, BinOp, BlockPyFunction, BlockPyModule, BlockTerm, Call, CallArgKeyword,
+    CallArgPositional, CallDirect, CalleeFunctionId, CellRef, CellRefForName, ChildVisitable, Del,
+    DelItem, ExprAttribute, ExprBoolOp, ExprBooleanLiteral, ExprBytesLiteral, ExprCompare,
+    ExprDict, ExprDictComp, ExprEllipsisLiteral, ExprFString, ExprGenerator, ExprIf,
+    ExprIpyEscapeCommand, ExprLambda, ExprList, ExprListComp, ExprName, ExprNamed, ExprNoneLiteral,
+    ExprNumberLiteral, ExprSet, ExprSetComp, ExprSlice, ExprStarred, ExprStringLiteral,
+    ExprSubscript, ExprTString, ExprTuple, GetAttr, GetItem, HasMeta, IncrementCounter, Instr,
+    InstrKey, InstrWithConstantNone, LiteralValue, Load, LocalLocation, MakeCell, MakeFunction,
+    MakeFunctionWithClosure, MapFunction, MapInstr, MapModule, Mappable, Meta, ModuleShape,
+    NameLike, NameLocation, ResolvedName, RuntimeFunctionId, RuntimeName, SetAttr, SetItem,
+    StmtAnnAssign, StmtAssert, StmtAssign, StmtAugAssign, StmtBreak, StmtClassDef, StmtContinue,
+    StmtDelete, StmtExpr, StmtFor, StmtFunctionDef, StmtGlobal, StmtIf, StmtImport, StmtImportFrom,
+    StmtIpyEscapeCommand, StmtMatch, StmtNonlocal, StmtPass, StmtRaise, StmtReturn, StmtTry,
+    StmtTypeAlias, StmtWhile, StmtWith, Store, TryMapInstr, TryMapModule, TryMapTerm, Tuple,
+    UnaryOp, UnresolvedName, Visit, VisitMut, WithMeta, Yield, YieldFrom,
 };
 use ruff_python_ast::{self as ast};
 use soac_macros::{enum_broadcast, DelegateMatchDefault};
@@ -165,283 +165,34 @@ impl Instr for InstrCodegenOp {
     type Extra = ();
 }
 
-#[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-pub struct DirectFunctionIdGuardTest<E: Instr> {
-    _meta: Meta,
-    pub extra: E::Extra,
-    pub value: Box<E>,
-    pub function_id: RuntimeFunctionId,
-}
-
-impl<E: Instr> DirectFunctionIdGuardTest<E> {
-    pub fn new(value: impl Into<Box<E>>, function_id: RuntimeFunctionId) -> Self {
-        Self {
-            _meta: Meta::default(),
-            extra: Default::default(),
-            value: value.into(),
-            function_id,
-        }
+define_operation! {
+    pub struct DirectFunctionIdGuardTest<E> {
+        value: Box<E>,
+        function_id: RuntimeFunctionId,
     }
 }
 
-impl<E: Instr + std::fmt::Debug> std::fmt::Debug for DirectFunctionIdGuardTest<E> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DirectFunctionIdGuardTest")
-            .field("value", &self.value)
-            .field("function_id", &self.function_id)
-            .finish()
-    }
-}
-
-impl<E: Instr> HasMeta for DirectFunctionIdGuardTest<E> {
-    fn meta(&self) -> Meta {
-        self._meta.clone()
-    }
-}
-
-impl<E: Instr> WithMeta for DirectFunctionIdGuardTest<E> {
-    fn with_meta(mut self, meta: Meta) -> Self {
-        self._meta = meta;
-        self
-    }
-}
-
-impl<E> ChildVisitable<E> for DirectFunctionIdGuardTest<E>
-where
-    E: Instr + ChildVisitable<E>,
-{
-    fn visit_children<V>(&self, visitor: &mut V)
-    where
-        V: crate::block_py::Visit<E> + ?Sized,
-    {
-        visitor.visit_instr(&self.value);
-    }
-
-    fn visit_children_mut<V>(&mut self, visitor: &mut V)
-    where
-        V: crate::block_py::VisitMut<E> + ?Sized,
-    {
-        visitor.visit_instr_mut(&mut self.value);
-    }
-}
-
-impl<E: Instr> Mappable<E> for DirectFunctionIdGuardTest<E> {
-    type Mapped<T: Instr> = DirectFunctionIdGuardTest<T>;
-
-    fn map_children<T, M>(self, map: &mut M) -> Self::Mapped<T>
-    where
-        T: Instr,
-        M: MapInstr<E, T>,
-    {
-        DirectFunctionIdGuardTest {
-            _meta: self._meta,
-            extra: Default::default(),
-            value: Box::new(map.map_instr(*self.value)),
-            function_id: self.function_id,
-        }
-    }
-
-    fn try_map_children<T, Error, M>(self, map: &mut M) -> Result<Self::Mapped<T>, Error>
-    where
-        T: Instr,
-        M: TryMapInstr<E, T, Error>,
-    {
-        Ok(DirectFunctionIdGuardTest {
-            _meta: self._meta,
-            extra: Default::default(),
-            value: Box::new(map.try_map_instr(*self.value)?),
-            function_id: self.function_id,
-        })
-    }
-}
-
-#[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-pub struct DirectReceiverTypeVersionGuardTest<E: Instr> {
-    _meta: Meta,
-    pub extra: E::Extra,
-    pub value: Box<E>,
-    pub owner_type_ref: TypedAttrOwnerRef,
-    pub type_version: u32,
-}
-
-impl<E: Instr> DirectReceiverTypeVersionGuardTest<E> {
-    pub fn new(
-        value: impl Into<Box<E>>,
+define_operation! {
+    pub struct DirectReceiverTypeVersionGuardTest<E> {
+        value: Box<E>,
         owner_type_ref: TypedAttrOwnerRef,
         type_version: u32,
-    ) -> Self {
-        Self {
-            _meta: Meta::default(),
-            extra: Default::default(),
-            value: value.into(),
-            owner_type_ref,
-            type_version,
-        }
     }
 }
 
-impl<E: Instr + std::fmt::Debug> std::fmt::Debug for DirectReceiverTypeVersionGuardTest<E> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DirectReceiverTypeVersionGuardTest")
-            .field("value", &self.value)
-            .field("owner_type_ref", &self.owner_type_ref)
-            .field("type_version", &self.type_version)
-            .finish()
+define_ruff_operation! {
+    pub struct TypedTruthy<E> {
+        value: Box<E>,
     }
-}
-
-impl<E: Instr> HasMeta for DirectReceiverTypeVersionGuardTest<E> {
-    fn meta(&self) -> Meta {
-        self._meta.clone()
-    }
-}
-
-impl<E: Instr> WithMeta for DirectReceiverTypeVersionGuardTest<E> {
-    fn with_meta(mut self, meta: Meta) -> Self {
-        self._meta = meta;
-        self
-    }
-}
-
-impl<E> ChildVisitable<E> for DirectReceiverTypeVersionGuardTest<E>
-where
-    E: Instr + ChildVisitable<E>,
-{
-    fn visit_children<V>(&self, visitor: &mut V)
-    where
-        V: crate::block_py::Visit<E> + ?Sized,
-    {
-        visitor.visit_instr(&self.value);
-    }
-
-    fn visit_children_mut<V>(&mut self, visitor: &mut V)
-    where
-        V: crate::block_py::VisitMut<E> + ?Sized,
-    {
-        visitor.visit_instr_mut(&mut self.value);
-    }
-}
-
-impl<E: Instr> Mappable<E> for DirectReceiverTypeVersionGuardTest<E> {
-    type Mapped<T: Instr> = DirectReceiverTypeVersionGuardTest<T>;
-
-    fn map_children<T, M>(self, map: &mut M) -> Self::Mapped<T>
-    where
-        T: Instr,
-        M: MapInstr<E, T>,
-    {
-        DirectReceiverTypeVersionGuardTest {
-            _meta: self._meta,
-            extra: Default::default(),
-            value: Box::new(map.map_instr(*self.value)),
-            owner_type_ref: self.owner_type_ref,
-            type_version: self.type_version,
-        }
-    }
-
-    fn try_map_children<T, Error, M>(self, map: &mut M) -> Result<Self::Mapped<T>, Error>
-    where
-        T: Instr,
-        M: TryMapInstr<E, T, Error>,
-    {
-        Ok(DirectReceiverTypeVersionGuardTest {
-            _meta: self._meta,
-            extra: Default::default(),
-            value: Box::new(map.try_map_instr(*self.value)?),
-            owner_type_ref: self.owner_type_ref,
-            type_version: self.type_version,
-        })
-    }
-}
-
-#[derive(Clone)]
-pub struct TypedTruthy<E: Instr> {
-    _meta: Meta,
-    pub extra: E::Extra,
-    value: Box<E>,
 }
 
 impl<E: Instr> TypedTruthy<E> {
-    pub fn new(value: impl Into<Box<E>>) -> Self {
-        Self {
-            _meta: Meta::default(),
-            extra: Default::default(),
-            value: value.into(),
-        }
-    }
-
     pub fn value(&self) -> &E {
         &self.value
     }
 
     pub fn into_value(self) -> E {
         *self.value
-    }
-}
-
-impl<E: Instr + std::fmt::Debug> std::fmt::Debug for TypedTruthy<E> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("TypedTruthy").field(&self.value).finish()
-    }
-}
-
-impl<E: Instr> HasMeta for TypedTruthy<E> {
-    fn meta(&self) -> Meta {
-        self._meta.clone()
-    }
-}
-
-impl<E: Instr> WithMeta for TypedTruthy<E> {
-    fn with_meta(mut self, meta: Meta) -> Self {
-        self._meta = meta;
-        self
-    }
-}
-
-impl<E> ChildVisitable<E> for TypedTruthy<E>
-where
-    E: Instr + ChildVisitable<E>,
-{
-    fn visit_children<V>(&self, visitor: &mut V)
-    where
-        V: crate::block_py::Visit<E> + ?Sized,
-    {
-        visitor.visit_instr(&self.value);
-    }
-
-    fn visit_children_mut<V>(&mut self, visitor: &mut V)
-    where
-        V: crate::block_py::VisitMut<E> + ?Sized,
-    {
-        visitor.visit_instr_mut(&mut self.value);
-    }
-}
-
-impl<E: Instr> Mappable<E> for TypedTruthy<E> {
-    type Mapped<T: Instr> = TypedTruthy<T>;
-
-    fn map_children<T, M>(self, map: &mut M) -> Self::Mapped<T>
-    where
-        T: Instr,
-        M: MapInstr<E, T>,
-    {
-        TypedTruthy {
-            _meta: self._meta,
-            extra: Default::default(),
-            value: Box::new(map.map_instr(*self.value)),
-        }
-    }
-
-    fn try_map_children<T, Error, M>(self, map: &mut M) -> Result<Self::Mapped<T>, Error>
-    where
-        T: Instr,
-        M: TryMapInstr<E, T, Error>,
-    {
-        Ok(TypedTruthy {
-            _meta: self._meta,
-            extra: Default::default(),
-            value: Box::new(map.try_map_instr(*self.value)?),
-        })
     }
 }
 
@@ -1206,93 +957,10 @@ pub enum TypedDirectCallGuardTestKind {
     },
 }
 
-#[derive(Clone)]
-pub struct TypedDirectCallGuardTest<E: Instr> {
-    _meta: Meta,
-    pub extra: E::Extra,
-    pub value: Box<E>,
-    pub kind: TypedDirectCallGuardTestKind,
-}
-
-impl<E: Instr> TypedDirectCallGuardTest<E> {
-    pub fn new(value: impl Into<Box<E>>, kind: TypedDirectCallGuardTestKind) -> Self {
-        Self {
-            _meta: Meta::default(),
-            extra: Default::default(),
-            value: value.into(),
-            kind,
-        }
-    }
-}
-
-impl<E: Instr + std::fmt::Debug> std::fmt::Debug for TypedDirectCallGuardTest<E> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TypedDirectCallGuardTest")
-            .field("value", &self.value)
-            .field("kind", &self.kind)
-            .finish()
-    }
-}
-
-impl<E: Instr> HasMeta for TypedDirectCallGuardTest<E> {
-    fn meta(&self) -> Meta {
-        self._meta.clone()
-    }
-}
-
-impl<E: Instr> WithMeta for TypedDirectCallGuardTest<E> {
-    fn with_meta(mut self, meta: Meta) -> Self {
-        self._meta = meta;
-        self
-    }
-}
-
-impl<E> ChildVisitable<E> for TypedDirectCallGuardTest<E>
-where
-    E: Instr + ChildVisitable<E>,
-{
-    fn visit_children<V>(&self, visitor: &mut V)
-    where
-        V: crate::block_py::Visit<E> + ?Sized,
-    {
-        visitor.visit_instr(&self.value);
-    }
-
-    fn visit_children_mut<V>(&mut self, visitor: &mut V)
-    where
-        V: crate::block_py::VisitMut<E> + ?Sized,
-    {
-        visitor.visit_instr_mut(&mut self.value);
-    }
-}
-
-impl<E: Instr> Mappable<E> for TypedDirectCallGuardTest<E> {
-    type Mapped<T: Instr> = TypedDirectCallGuardTest<T>;
-
-    fn map_children<T, M>(self, map: &mut M) -> Self::Mapped<T>
-    where
-        T: Instr,
-        M: MapInstr<E, T>,
-    {
-        TypedDirectCallGuardTest {
-            _meta: self._meta,
-            extra: Default::default(),
-            value: Box::new(map.map_instr(*self.value)),
-            kind: self.kind,
-        }
-    }
-
-    fn try_map_children<T, Error, M>(self, map: &mut M) -> Result<Self::Mapped<T>, Error>
-    where
-        T: Instr,
-        M: TryMapInstr<E, T, Error>,
-    {
-        Ok(TypedDirectCallGuardTest {
-            _meta: self._meta,
-            extra: Default::default(),
-            value: Box::new(map.try_map_instr(*self.value)?),
-            kind: self.kind,
-        })
+define_ruff_operation! {
+    pub struct TypedDirectCallGuardTest<E> {
+        value: Box<E>,
+        kind: TypedDirectCallGuardTestKind,
     }
 }
 
@@ -1318,13 +986,12 @@ pub enum TypedAttrAccessPlan {
     ProfiledIndexedField { guards: Vec<TypedIndexedFieldGuard> },
 }
 
-#[derive(Clone)]
-pub struct TypedGetAttr<E: Instr> {
-    _meta: Meta,
-    pub extra: E::Extra,
-    pub value: Box<E>,
-    pub attr: Box<E>,
-    pub access: TypedAttrAccessPlan,
+define_ruff_operation! {
+    pub struct TypedGetAttr<E> {
+        value: Box<E>,
+        attr: Box<E>,
+        access: TypedAttrAccessPlan,
+    }
 }
 
 impl<E: Instr> TypedGetAttr<E> {
@@ -1355,90 +1022,13 @@ impl<E: Instr> TypedGetAttr<E> {
     }
 }
 
-impl<E: Instr + std::fmt::Debug> std::fmt::Debug for TypedGetAttr<E> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TypedGetAttr")
-            .field("value", &self.value)
-            .field("attr", &self.attr)
-            .field("access", &self.access)
-            .finish()
+define_ruff_operation! {
+    pub struct TypedSetAttr<E> {
+        value: Box<E>,
+        attr: Box<E>,
+        replacement: Box<E>,
+        access: TypedAttrAccessPlan,
     }
-}
-
-impl<E: Instr> HasMeta for TypedGetAttr<E> {
-    fn meta(&self) -> Meta {
-        self._meta.clone()
-    }
-}
-
-impl<E: Instr> WithMeta for TypedGetAttr<E> {
-    fn with_meta(mut self, meta: Meta) -> Self {
-        self._meta = meta;
-        self
-    }
-}
-
-impl<E> ChildVisitable<E> for TypedGetAttr<E>
-where
-    E: Instr + ChildVisitable<E>,
-{
-    fn visit_children<V>(&self, visitor: &mut V)
-    where
-        V: crate::block_py::Visit<E> + ?Sized,
-    {
-        visitor.visit_instr(&self.value);
-        visitor.visit_instr(&self.attr);
-    }
-
-    fn visit_children_mut<V>(&mut self, visitor: &mut V)
-    where
-        V: crate::block_py::VisitMut<E> + ?Sized,
-    {
-        visitor.visit_instr_mut(&mut self.value);
-        visitor.visit_instr_mut(&mut self.attr);
-    }
-}
-
-impl<E: Instr> Mappable<E> for TypedGetAttr<E> {
-    type Mapped<T: Instr> = TypedGetAttr<T>;
-
-    fn map_children<T, M>(self, map: &mut M) -> Self::Mapped<T>
-    where
-        T: Instr,
-        M: MapInstr<E, T>,
-    {
-        TypedGetAttr {
-            _meta: self._meta,
-            extra: Default::default(),
-            value: Box::new(map.map_instr(*self.value)),
-            attr: Box::new(map.map_instr(*self.attr)),
-            access: self.access,
-        }
-    }
-
-    fn try_map_children<T, Error, M>(self, map: &mut M) -> Result<Self::Mapped<T>, Error>
-    where
-        T: Instr,
-        M: TryMapInstr<E, T, Error>,
-    {
-        Ok(TypedGetAttr {
-            _meta: self._meta,
-            extra: Default::default(),
-            value: Box::new(map.try_map_instr(*self.value)?),
-            attr: Box::new(map.try_map_instr(*self.attr)?),
-            access: self.access,
-        })
-    }
-}
-
-#[derive(Clone)]
-pub struct TypedSetAttr<E: Instr> {
-    _meta: Meta,
-    pub extra: E::Extra,
-    pub value: Box<E>,
-    pub attr: Box<E>,
-    pub replacement: Box<E>,
-    pub access: TypedAttrAccessPlan,
 }
 
 impl<E: Instr> TypedSetAttr<E> {
@@ -1472,87 +1062,6 @@ impl<E: Instr> TypedSetAttr<E> {
         SetAttr::new(self.value, self.attr, self.replacement)
             .with_extra(self.extra)
             .with_meta(self._meta)
-    }
-}
-
-impl<E: Instr + std::fmt::Debug> std::fmt::Debug for TypedSetAttr<E> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TypedSetAttr")
-            .field("value", &self.value)
-            .field("attr", &self.attr)
-            .field("replacement", &self.replacement)
-            .field("access", &self.access)
-            .finish()
-    }
-}
-
-impl<E: Instr> HasMeta for TypedSetAttr<E> {
-    fn meta(&self) -> Meta {
-        self._meta.clone()
-    }
-}
-
-impl<E: Instr> WithMeta for TypedSetAttr<E> {
-    fn with_meta(mut self, meta: Meta) -> Self {
-        self._meta = meta;
-        self
-    }
-}
-
-impl<E> ChildVisitable<E> for TypedSetAttr<E>
-where
-    E: Instr + ChildVisitable<E>,
-{
-    fn visit_children<V>(&self, visitor: &mut V)
-    where
-        V: crate::block_py::Visit<E> + ?Sized,
-    {
-        visitor.visit_instr(&self.value);
-        visitor.visit_instr(&self.attr);
-        visitor.visit_instr(&self.replacement);
-    }
-
-    fn visit_children_mut<V>(&mut self, visitor: &mut V)
-    where
-        V: crate::block_py::VisitMut<E> + ?Sized,
-    {
-        visitor.visit_instr_mut(&mut self.value);
-        visitor.visit_instr_mut(&mut self.attr);
-        visitor.visit_instr_mut(&mut self.replacement);
-    }
-}
-
-impl<E: Instr> Mappable<E> for TypedSetAttr<E> {
-    type Mapped<T: Instr> = TypedSetAttr<T>;
-
-    fn map_children<T, M>(self, map: &mut M) -> Self::Mapped<T>
-    where
-        T: Instr,
-        M: MapInstr<E, T>,
-    {
-        TypedSetAttr {
-            _meta: self._meta,
-            extra: Default::default(),
-            value: Box::new(map.map_instr(*self.value)),
-            attr: Box::new(map.map_instr(*self.attr)),
-            replacement: Box::new(map.map_instr(*self.replacement)),
-            access: self.access,
-        }
-    }
-
-    fn try_map_children<T, Error, M>(self, map: &mut M) -> Result<Self::Mapped<T>, Error>
-    where
-        T: Instr,
-        M: TryMapInstr<E, T, Error>,
-    {
-        Ok(TypedSetAttr {
-            _meta: self._meta,
-            extra: Default::default(),
-            value: Box::new(map.try_map_instr(*self.value)?),
-            attr: Box::new(map.try_map_instr(*self.attr)?),
-            replacement: Box::new(map.try_map_instr(*self.replacement)?),
-            access: self.access,
-        })
     }
 }
 

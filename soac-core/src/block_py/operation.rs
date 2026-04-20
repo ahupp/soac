@@ -1430,6 +1430,7 @@ define_ruff_operation! {
 #[cfg(test)]
 mod tests {
     use super::super::UnresolvedName;
+    use super::super::{Visit, VisitMut};
     use super::*;
 
     #[derive(Clone, Debug)]
@@ -1446,6 +1447,47 @@ mod tests {
     impl Instr for OtherInstr {
         type Name = UnresolvedName;
         type Extra = &'static str;
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct ChildInstr(&'static str);
+
+    impl Instr for ChildInstr {
+        type Name = UnresolvedName;
+        type Extra = &'static str;
+    }
+
+    impl ChildVisitable<ChildInstr> for ChildInstr {
+        fn visit_children<V>(&self, _visitor: &mut V)
+        where
+            V: Visit<ChildInstr> + ?Sized,
+        {
+        }
+
+        fn visit_children_mut<V>(&mut self, _visitor: &mut V)
+        where
+            V: VisitMut<ChildInstr> + ?Sized,
+        {
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct MappedChildInstr(&'static str);
+
+    impl Instr for MappedChildInstr {
+        type Name = UnresolvedName;
+        type Extra = &'static str;
+    }
+
+    define_operation! {
+        #[allow(dead_code)]
+        struct FieldRichOperation<E> {
+            name: E::Name,
+            args: Vec<CallArgPositional<E>>,
+            keywords: Vec<CallArgKeyword<E>>,
+            fallback: Option<Box<E>>,
+            values: Vec<E>,
+        }
     }
 
     struct TestToOther;
@@ -1482,5 +1524,99 @@ mod tests {
         let mapped: Load<OtherInstr> = op.map_children(&mut TestToOther);
 
         assert_eq!(*mapped.extra(), "");
+    }
+
+    #[test]
+    fn macro_operation_maps_name_and_call_arg_fields() {
+        struct ChildToMapped;
+
+        impl MapInstr<ChildInstr, MappedChildInstr> for ChildToMapped {
+            fn map_instr(&mut self, instr: ChildInstr) -> MappedChildInstr {
+                MappedChildInstr(instr.0)
+            }
+
+            fn map_name(&mut self, name: UnresolvedName) -> UnresolvedName {
+                format!("mapped_{}", name.id_str()).into()
+            }
+        }
+
+        let mut op = FieldRichOperation::<ChildInstr>::new(
+            "source",
+            vec![
+                CallArgPositional::Positional(ChildInstr("arg0")),
+                CallArgPositional::Starred(ChildInstr("starred")),
+            ],
+            vec![
+                CallArgKeyword::Named {
+                    arg: "kw".into(),
+                    value: ChildInstr("kwarg"),
+                },
+                CallArgKeyword::Starred(ChildInstr("kwargs")),
+            ],
+            Some(Box::new(ChildInstr("fallback"))),
+            vec![ChildInstr("value")],
+        )
+        .with_extra("source-extra");
+
+        assert_eq!(*op.extra(), "source-extra");
+        *op.extra_mut() = "updated-extra";
+        assert_eq!(*op.extra(), "updated-extra");
+
+        let mapped: FieldRichOperation<MappedChildInstr> = op.map_children(&mut ChildToMapped);
+
+        assert_eq!(mapped.name.id_str(), "mapped_source");
+        assert_eq!(*mapped.extra(), "");
+        assert!(matches!(
+            mapped.args.as_slice(),
+            [
+                CallArgPositional::Positional(MappedChildInstr("arg0")),
+                CallArgPositional::Starred(MappedChildInstr("starred")),
+            ]
+        ));
+        assert!(matches!(
+            mapped.keywords.as_slice(),
+            [
+                CallArgKeyword::Named { arg, value: MappedChildInstr("kwarg") },
+                CallArgKeyword::Starred(MappedChildInstr("kwargs")),
+            ] if arg.as_str() == "kw"
+        ));
+        assert_eq!(
+            mapped.fallback.as_deref(),
+            Some(&MappedChildInstr("fallback"))
+        );
+        assert_eq!(mapped.values, vec![MappedChildInstr("value")]);
+    }
+
+    #[test]
+    fn macro_operation_visits_call_arg_fields() {
+        struct Counter(usize);
+
+        impl Visit<ChildInstr> for Counter {
+            fn visit_instr(&mut self, _expr: &ChildInstr) {
+                self.0 += 1;
+            }
+        }
+
+        let op = FieldRichOperation::<ChildInstr>::new(
+            "source",
+            vec![
+                CallArgPositional::Positional(ChildInstr("arg0")),
+                CallArgPositional::Starred(ChildInstr("starred")),
+            ],
+            vec![
+                CallArgKeyword::Named {
+                    arg: "kw".into(),
+                    value: ChildInstr("kwarg"),
+                },
+                CallArgKeyword::Starred(ChildInstr("kwargs")),
+            ],
+            Some(Box::new(ChildInstr("fallback"))),
+            vec![ChildInstr("value")],
+        );
+
+        let mut counter = Counter(0);
+        op.visit_children(&mut counter);
+
+        assert_eq!(counter.0, 6);
     }
 }

@@ -1,0 +1,14 @@
+[v1]
+"inferno 0.12.6 (registry+https://github.com/rust-lang/crates.io-index)" = [
+    "inferno-collapse-dtrace",
+    "inferno-collapse-ghcprof",
+    "inferno-collapse-guess",
+    "inferno-collapse-perf",
+    "inferno-collapse-recursive",
+    "inferno-collapse-sample",
+    "inferno-collapse-vsprof",
+    "inferno-collapse-vtune",
+    "inferno-collapse-xctrace",
+    "inferno-diff-folded",
+    "inferno-flamegraph",
+]

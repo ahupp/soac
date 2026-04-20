@@ -1,7 +1,8 @@
 #[allow(unused_imports)]
 pub use self::map::{
-    MapBlock, MapFunction, MapInstr, MapModule, MapTerm, Mappable, TryMapBlock, TryMapFunction,
-    TryMapInstr, TryMapModule, TryMapTerm, map_function_blocks, map_module_functions,
+    MapBlock, MapFunction, MapInstr, MapModule, MapTerm, Mappable, OperationField, TryMapBlock,
+    TryMapFunction, TryMapInstr, TryMapModule, TryMapTerm, map_function_blocks,
+    map_module_functions,
 };
 pub use self::meta::{
     HasMeta, HasSemanticInstrId, IdentifiedInstr, InstrId, InstrKey, Meta, WithMeta,

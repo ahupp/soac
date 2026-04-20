@@ -3442,7 +3442,7 @@ def build(values):
                         TypedAttrOwnerRef::CpythonTypeSymbol(
                             cpython_type_symbol_name(CpythonTypeSymbol::Long).to_string(),
                         ),
-                        0,
+                        0_u32,
                     ),
                 ),
                 then_label,
