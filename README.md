@@ -10,16 +10,17 @@ just setup-dev-env
 `setup-dev-env` reuses an already-installed nightly Rust toolchain and Cranelift
 codegen component rather than upgrading them on every run, because a nightly
 refresh forces rebuilds. It also installs the `ruff` command with uv. The repo
-keeps uv state under the working tree (`.uv-cache`, `.uv/`, and `.xdg/`) and
-puts the repo-local uv tool bin directory on `PATH`, so later test and benchmark
-recipes can run uv in offline mode instead of fetching through the sandbox.
+keeps uv, XDG, and cargo state under the working tree (`.uv-cache`, `.uv/`,
+`.xdg/`, and `work/tmp/`) and puts the repo-local uv tool bin directory on
+`PATH`, so later test and benchmark recipes can run uv in offline mode instead
+of fetching through the sandbox.
 
 For jj worktrees, `just setup-dev-env` infers the parent checkout from a
 file-backed `.jj/repo` when possible. Set
 `SOAC_PARENT_REPO=/path/to/parent/checkout` to override that inference or when
 the parent cannot be inferred. The parent checkout owns `work/` as a regular
 artifact directory, and the setup recipe symlinks `vendor/cpython`, `work/`,
-`.uv-cache`, `.uv/`, `.xdg/`, and `tmp/cargo-home` from the parent checkout so
+`.uv-cache`, `.uv/`, `.xdg/`, and `work/tmp/cargo-home` from the parent checkout so
 temporary worktrees can reuse the already-fetched offline state and shared
 benchmark artifacts.
 
@@ -96,11 +97,12 @@ exports are intentionally omitted here.
 ## Local Tooling
 
 - `UV_CACHE_DIR`, `UV_TOOL_DIR`, `UV_TOOL_BIN_DIR`, `XDG_CACHE_HOME`,
-  `XDG_DATA_HOME`, and `XDG_RUNTIME_DIR`
+  `XDG_DATA_HOME`, `XDG_RUNTIME_DIR`, and `CARGO_HOME`
   The `.envrc` and `Justfile` point these at repo-local directories by default
   so uv package cache, installed tools, and XDG state stay under the working
-  tree. The `Justfile` also respects pre-set values for these variables, which
-  allows temporary worktrees to use explicit writable shared cache roots.
+  tree. `XDG_RUNTIME_DIR` and `CARGO_HOME` default under `work/tmp/`. The
+  `Justfile` also respects pre-set values for these variables, which allows
+  temporary worktrees to use explicit writable shared cache roots.
   `just setup-dev-env` installs `ruff` into the repo-local uv tool bin
   directory.
 
@@ -109,7 +111,7 @@ exports are intentionally omitted here.
   normally infers the parent checkout from a file-backed `.jj/repo`; the parent
   checkout owns `work/` as a regular artifact directory, `vendor/cpython`, and
   the shared offline state symlinked into the worktree: `.uv-cache`, `.uv/`,
-  `.xdg/`, and `tmp/cargo-home`.
+  `.xdg/`, and `work/tmp/cargo-home`.
 
 - `SOAC_PRECOMPILED_LIBRARY=/path/to/libsoac_precompiled.so`
   Optional runtime source for offline-precompiled direct function bodies. When

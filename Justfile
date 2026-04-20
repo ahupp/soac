@@ -15,8 +15,8 @@ uv_tool_dir := env_var_or_default("UV_TOOL_DIR", repo_root + "/.uv/tools")
 uv_tool_bin_dir := env_var_or_default("UV_TOOL_BIN_DIR", repo_root + "/.uv/bin")
 xdg_cache_home := env_var_or_default("XDG_CACHE_HOME", repo_root + "/.xdg/cache")
 xdg_data_home := env_var_or_default("XDG_DATA_HOME", repo_root + "/.xdg/data")
-xdg_runtime_dir := env_var_or_default("XDG_RUNTIME_DIR", repo_root + "/tmp")
-cargo_home := env_var_or_default("CARGO_HOME", repo_root + "/tmp/cargo-home")
+xdg_runtime_dir := env_var_or_default("XDG_RUNTIME_DIR", repo_root + "/work/tmp")
+cargo_home := env_var_or_default("CARGO_HOME", repo_root + "/work/tmp/cargo-home")
 pyo3_python := cpython_bin
 web_dir := repo_root + "/web"
 inspector_bin := repo_root + "/target/debug/soac-inspector"
@@ -259,14 +259,14 @@ setup-dev-env:
       "$parent_repo/.uv/bin" \
       "$parent_repo/.xdg/cache" \
       "$parent_repo/.xdg/data" \
-      "$parent_repo/tmp/cargo-home"
+      "$parent_repo/work/tmp/cargo-home"
 
     link_shared_dir "$REPO_ROOT/vendor/cpython" "$parent_repo/vendor/cpython" "vendor/cpython"
     link_shared_dir "$REPO_ROOT/work" "$parent_repo/work" "work" 1
     link_shared_dir "$REPO_ROOT/.uv-cache" "$parent_repo/.uv-cache" ".uv-cache" 1
     link_shared_dir "$REPO_ROOT/.uv" "$parent_repo/.uv" ".uv" 1
     link_shared_dir "$REPO_ROOT/.xdg" "$parent_repo/.xdg" ".xdg" 1
-    link_shared_dir "$REPO_ROOT/tmp/cargo-home" "$parent_repo/tmp/cargo-home" "tmp/cargo-home" 1
+    link_shared_dir "$REPO_ROOT/work/tmp/cargo-home" "$parent_repo/work/tmp/cargo-home" "work/tmp/cargo-home" 1
   else
     if [[ -L "$REPO_ROOT/work" ]]; then
       echo "work is a symlink in the parent checkout; replace it with a regular directory before running setup-dev-env" >&2
@@ -537,7 +537,7 @@ run-and-view-speedscope loops="10000000" counters_dir="" output_prefix="work/log
 perf-pystone-jit-warm loops="10000000" output_prefix="work/logs/pystone_jit_perf_warm": ensure-cpython
   #!/usr/bin/env bash
   export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-  mkdir -p "$REPO_ROOT/tmp"
+  mkdir -p "$REPO_ROOT/work/tmp"
 
   LOOPS="{{loops}}"
   OUTPUT_PREFIX="{{output_prefix}}"
@@ -547,10 +547,10 @@ perf-pystone-jit-warm loops="10000000" output_prefix="work/logs/pystone_jit_perf
   PERF_CALL_GRAPH="${PERF_CALL_GRAPH:-dwarf,65528}"
   PERF_PERCENT_LIMIT="${PERF_PERCENT_LIMIT:-0.5}"
   PERF_HELPER_FRAMES="${SOAC_JIT_PERF_HELPER_FRAMES:-1}"
-  PERF_BUILDID_DIR="${PERF_BUILDID_DIR:-$REPO_ROOT/tmp/perf-buildid}"
+  PERF_BUILDID_DIR="${PERF_BUILDID_DIR:-$REPO_ROOT/work/tmp/perf-buildid}"
 
   PERF_DATA_BASENAME="$(basename "${OUTPUT_PREFIX}").data"
-  PERF_DATA="$REPO_ROOT/tmp/${PERF_DATA_BASENAME}"
+  PERF_DATA="$REPO_ROOT/work/tmp/${PERF_DATA_BASENAME}"
   RUN_LOG="${OUTPUT_PREFIX}.log"
   PERF_RECORD_LOG="${OUTPUT_PREFIX}_record.txt"
   REPORT_SYMBOLS="${OUTPUT_PREFIX}_report.txt"
@@ -558,10 +558,10 @@ perf-pystone-jit-warm loops="10000000" output_prefix="work/logs/pystone_jit_perf
   REPORT_DSO_SYMBOLS="${OUTPUT_PREFIX}_by_dso_symbol.txt"
   REPORT_CALLGRAPH="${OUTPUT_PREFIX}_callgraph.txt"
   REPORT_SPEEDSCOPE="${OUTPUT_PREFIX}_speedscope.json"
-  INJECTED_PERF_DATA="$REPO_ROOT/tmp/$(basename "${OUTPUT_PREFIX}").injected.data"
+  INJECTED_PERF_DATA="$REPO_ROOT/work/tmp/$(basename "${OUTPUT_PREFIX}").injected.data"
   PYO3_RELEASE_LIB="$REPO_ROOT/target/release/lib_soac_ext.so"
   PYO3_STAGING_DIR="$(mktemp -d)"
-  READY_FILE="$(mktemp "$REPO_ROOT/tmp/pystone_jit_perf_ready.XXXXXX")"
+  READY_FILE="$(mktemp "$REPO_ROOT/work/tmp/pystone_jit_perf_ready.XXXXXX")"
   PYTHONPATH_PREFIX="${REPO_ROOT}:${REPO_ROOT}/soac_py/src:${BENCHMARK_SOURCE_DIR}:${PYO3_STAGING_DIR}"
   PY_PID=""
   PERF_PID=""
@@ -1433,8 +1433,8 @@ _benchmark-run-specialized-perf result_dir perf_loops="10000000": ensure-cpython
   SOAC_OPT_MODE=apply \
     just perf-pystone-jit-warm "{{perf_loops}}" "$OUTPUT_PREFIX"
 
-  PERF_DATA_SOURCE="$REPO_ROOT/tmp/$(basename "$OUTPUT_PREFIX").data"
-  PERF_INJECTED_SOURCE="$REPO_ROOT/tmp/$(basename "$OUTPUT_PREFIX").injected.data"
+  PERF_DATA_SOURCE="$REPO_ROOT/work/tmp/$(basename "$OUTPUT_PREFIX").data"
+  PERF_INJECTED_SOURCE="$REPO_ROOT/work/tmp/$(basename "$OUTPUT_PREFIX").injected.data"
   if [[ ! -f "$PERF_DATA_SOURCE" ]]; then
     echo "perf data not found at $PERF_DATA_SOURCE" >&2
     exit 1
