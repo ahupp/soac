@@ -269,7 +269,7 @@ pub fn instrument_bb_module_with_call_target_counters(
         matches!(expr, InstrCodegen::SetItem(_))
     }
 
-    fn define_operation_shape_counters(
+    fn define_instr_shape_counters(
         counters: &mut CounterBuilder<'_>,
         function_id: crate::block_py::RuntimeFunctionId,
         instr_id: crate::block_py::InstrId,
@@ -384,7 +384,7 @@ pub fn instrument_bb_module_with_call_target_counters(
             }
             if is_getitem_specialization_candidate(expr) {
                 let instr_id = expr.semantic_instr_id();
-                define_operation_shape_counters(
+                define_instr_shape_counters(
                     self.counters,
                     self.function_id,
                     instr_id,
@@ -395,7 +395,7 @@ pub fn instrument_bb_module_with_call_target_counters(
             }
             if is_setitem_specialization_candidate(expr) {
                 let instr_id = expr.semantic_instr_id();
-                define_operation_shape_counters(
+                define_instr_shape_counters(
                     self.counters,
                     self.function_id,
                     instr_id,
