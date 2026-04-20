@@ -8,10 +8,9 @@ use crate::config::specialization_mode_is_profile;
 use crate::config::{
     CraneliftTargetConfig, PythonModuleCacheSource, SpecializationMode,
     behavior_change_indexed_stores_enabled, counter_dump_input_path_from_env, jit_compile_workers,
-    jit_refcount_emission_enabled, module_cache_root_from_env_or_repo,
-    module_optimization_plan_path, opt_v3_validation_enabled,
-    pre_optimization_module_cache_identity, profiled_cold_blocks_enabled, soac_work_dir_from_env,
-    specialization_mode_from_env,
+    jit_refcount_emission_enabled, module_cache_root_from_env, module_optimization_plan_path,
+    opt_v3_validation_enabled, pre_optimization_module_cache_identity,
+    profiled_cold_blocks_enabled, soac_work_dir_from_env, specialization_mode_from_env,
 };
 #[cfg(test)]
 use crate::config::{SOAC_JIT_EMIT_REFCOUNTS_ENV, SOAC_VALIDATE_OPT_V3_ENV};
@@ -13051,12 +13050,6 @@ struct FunctionSpecializationInputs {
     guard_miss_deopt_stub: bool,
 }
 
-fn soac_repo_root_for_module_cache() -> Option<PathBuf> {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .map(Path::to_path_buf)
-}
-
 fn load_planned_optimization_inputs_for_runtime_state(
     shared_state: Option<&SharedModuleState>,
     compile_session: Option<&crate::session::CompileSession>,
@@ -13071,8 +13064,7 @@ fn load_planned_optimization_inputs_for_runtime_state(
     let Some(shared_state) = shared_state else {
         return Ok(PlannedOptimizationInputs::default());
     };
-    let repo_root = soac_repo_root_for_module_cache();
-    let Some(cache_root) = module_cache_root_from_env_or_repo(repo_root.as_deref())? else {
+    let Some(cache_root) = module_cache_root_from_env()? else {
         return Ok(PlannedOptimizationInputs::default());
     };
     let cache_identity = pre_optimization_module_cache_identity(

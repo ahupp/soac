@@ -23,7 +23,7 @@ Offline precompile CLI. It reads specialization counters, resolves pre-optimizat
 - `module_cache_path_for_identity`: constructs the exact cache path for a known source hash/build identity/runtime-name mode.
 - `matching_cache_paths_for_source_hash`: finds candidate cache files when exact identity matching is ambiguous or absent.
 - `link_shared_library`: invokes the linker to create the final shared library.
-- `default_module_cache_dir`: returns the repository-local `soac-module-cache` path.
+- `default_module_cache_dir`: returns the cache path derived from `SOAC_WORK_DIR/modules`.
 - `repo_root`: finds the repository root from the Cargo manifest directory.
 - `default_object_dir`: derives the object-output directory from the shared-library output path.
 - `object_file_name`: creates a stable object filename for a module reference.
@@ -37,4 +37,3 @@ Offline precompile CLI. It reads specialization counters, resolves pre-optimizat
 - `soac-jit` offline compile/module cache APIs
 - `soac-pyo3/src/jit_runtime.rs`
 - `build_support/soac_build_identity.rs`
-

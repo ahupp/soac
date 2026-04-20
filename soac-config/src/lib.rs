@@ -12,7 +12,6 @@ pub const SOAC_VALIDATE_OPT_V3_ENV: &str = "SOAC_VALIDATE_OPT_V3";
 pub const SOAC_JIT_EMIT_REFCOUNTS_ENV: &str = "SOAC_JIT_EMIT_REFCOUNTS";
 pub const SOAC_JIT_COMPILE_WORKERS_ENV: &str = "SOAC_JIT_COMPILE_WORKERS";
 pub const SOAC_BACKGROUND_JIT_ENV: &str = "SOAC_BACKGROUND_JIT";
-pub const SOAC_MODULE_CACHE_DIR_ENV: &str = "SOAC_MODULE_CACHE_DIR";
 pub const SOAC_PRECOMPILED_LIBRARY_ENV: &str = "SOAC_PRECOMPILED_LIBRARY";
 pub const SOAC_COMPILE_MODE_ENV: &str = "SOAC_COMPILE_MODE";
 pub const SOAC_JIT_PERF_HELPER_FRAMES_ENV: &str = "SOAC_JIT_PERF_HELPER_FRAMES";
@@ -98,7 +97,6 @@ pub struct SoacEnvConfig {
     profiled_cold_blocks_enabled: bool,
     opt_v3_validation_enabled: bool,
     jit_refcount_emission_enabled: bool,
-    module_cache_dir: Option<PathBuf>,
     compile_mode: CompileMode,
     jit_compile_workers: Option<usize>,
     background_jit_enabled: bool,
@@ -174,7 +172,6 @@ impl SoacEnvConfig {
         let profiled_cold_blocks_enabled = env_bool(SOAC_ENABLE_PROFILED_COLD_BLOCKS_ENV, false)?;
         let opt_v3_validation_enabled = env_bool(SOAC_VALIDATE_OPT_V3_ENV, false)?;
         let jit_refcount_emission_enabled = env_bool(SOAC_JIT_EMIT_REFCOUNTS_ENV, true)?;
-        let module_cache_dir = env_path(SOAC_MODULE_CACHE_DIR_ENV)?;
         let compile_mode =
             parse_optional_compile_mode(env_string(SOAC_COMPILE_MODE_ENV)?.as_deref())?;
         let jit_compile_workers = parse_optional_positive_usize(
@@ -197,7 +194,6 @@ impl SoacEnvConfig {
             profiled_cold_blocks_enabled,
             opt_v3_validation_enabled,
             jit_refcount_emission_enabled,
-            module_cache_dir,
             compile_mode,
             jit_compile_workers,
             background_jit_enabled,
@@ -263,11 +259,8 @@ impl SoacEnvConfig {
         self.jit_refcount_emission_enabled
     }
 
-    pub fn module_cache_root_or_repo(&self, repo_root: Option<&Path>) -> Option<PathBuf> {
-        self.module_cache_dir
-            .clone()
-            .or_else(|| self.soac_work_dir.as_ref().map(|root| root.join("modules")))
-            .or_else(|| repo_root.map(|root| root.join("soac-module-cache")))
+    pub fn module_cache_root(&self) -> Option<PathBuf> {
+        self.soac_work_dir.as_ref().map(|root| root.join("modules"))
     }
 
     pub fn compile_mode(&self) -> CompileMode {
@@ -317,7 +310,6 @@ impl Default for SoacEnvConfig {
             profiled_cold_blocks_enabled: false,
             opt_v3_validation_enabled: false,
             jit_refcount_emission_enabled: true,
-            module_cache_dir: None,
             compile_mode: CompileMode::Lazy,
             jit_compile_workers: None,
             background_jit_enabled: true,
@@ -458,10 +450,8 @@ pub fn jit_refcount_emission_enabled_from_env() -> Result<bool, String> {
     Ok(SoacEnvConfig::from_env()?.jit_refcount_emission_enabled())
 }
 
-pub fn module_cache_root_from_env_or_repo(
-    repo_root: Option<&Path>,
-) -> Result<Option<PathBuf>, String> {
-    Ok(SoacEnvConfig::from_env()?.module_cache_root_or_repo(repo_root))
+pub fn module_cache_root_from_env() -> Result<Option<PathBuf>, String> {
+    Ok(SoacEnvConfig::from_env()?.module_cache_root())
 }
 
 pub fn precompiled_library_path_from_env() -> Result<Option<PathBuf>, String> {
@@ -586,7 +576,6 @@ mod tests {
             EnvVarGuard::remove(SOAC_ENABLE_PROFILED_COLD_BLOCKS_ENV),
             EnvVarGuard::remove(SOAC_VALIDATE_OPT_V3_ENV),
             EnvVarGuard::remove(SOAC_JIT_EMIT_REFCOUNTS_ENV),
-            EnvVarGuard::remove(SOAC_MODULE_CACHE_DIR_ENV),
             EnvVarGuard::remove(SOAC_PRECOMPILED_LIBRARY_ENV),
             EnvVarGuard::remove(SOAC_COMPILE_MODE_ENV),
             EnvVarGuard::remove(SOAC_JIT_COMPILE_WORKERS_ENV),

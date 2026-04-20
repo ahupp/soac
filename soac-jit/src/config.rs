@@ -11,7 +11,7 @@ use soac_config::{
     cranelift_opt_level_from_env, eager_clif_compile_requested_from_env,
     jit_compile_workers_from_env, jit_perf_helper_frames_enabled_from_env,
     jit_refcount_emission_enabled_from_env,
-    module_cache_root_from_env_or_repo as config_module_cache_root_from_env_or_repo,
+    module_cache_root_from_env as config_module_cache_root_from_env,
     opt_v3_validation_enabled_from_env,
     precompiled_library_path_from_env as config_precompiled_library_path_from_env,
     profiled_cold_blocks_enabled_from_env, soac_work_dir_from_env as config_soac_work_dir_from_env,
@@ -24,8 +24,7 @@ use soac_lowering::codegen_cache::{
     pre_optimization_module_cache_metadata as blockpy_pre_optimization_module_cache_metadata,
     pre_optimization_module_cache_path as blockpy_pre_optimization_module_cache_path,
 };
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -119,10 +118,8 @@ pub(crate) fn jit_refcount_emission_enabled() -> Result<bool, String> {
     jit_refcount_emission_enabled_from_env()
 }
 
-pub fn module_cache_root_from_env_or_repo(
-    repo_root: Option<&Path>,
-) -> Result<Option<PathBuf>, String> {
-    config_module_cache_root_from_env_or_repo(repo_root)
+pub fn module_cache_root_from_env() -> Result<Option<PathBuf>, String> {
+    config_module_cache_root_from_env()
 }
 
 pub fn pre_optimization_module_cache_identity(

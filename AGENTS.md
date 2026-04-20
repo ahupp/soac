@@ -369,12 +369,12 @@ so a later turn can resume without rediscovering context.
   when the user explicitly wants inspector/CLIF artifacts or perf capture, and
   use `just benchmark-deep-profile-from-profile <result-dir>` to extend an
   existing `counters/profile.bin` result without rerunning the profile pass.
-  `just benchmark` records the actual current `@` revision in the result header
-  and does not accept a revision argument; switch revisions first with `jj edit`
-  or, if you intentionally want a fresh child revision, `jj new`. Unless the
-  caller explicitly sets `SOAC_MODULE_CACHE_DIR`, benchmark recipes keep the
-  BlockPy module cache under the current result's `counters/modules` directory
-  so in-place before/after revision runs cannot reuse another revision's cache.
+`just benchmark` records the actual current `@` revision in the result header
+and does not accept a revision argument; switch revisions first with `jj edit`
+or, if you intentionally want a fresh child revision, `jj new`. Benchmark
+recipes keep the BlockPy module cache under the current result's
+`counters/modules` directory so in-place before/after revision runs cannot reuse
+another revision's cache.
   Report the specialized apply-pass median from the result directory's
   `benchmark.txt` unless I explicitly ask for the warm unspecialized baseline.
   The benchmark also attempts an unsound `SOAC_JIT_EMIT_REFCOUNTS=0` diagnostic
@@ -394,11 +394,9 @@ so a later turn can resume without rediscovering context.
 - Repo-local uv state
   `.envrc` and `Justfile` keep uv and XDG state under the repo with
   `UV_CACHE_DIR`, `UV_TOOL_DIR`, `UV_TOOL_BIN_DIR`, `XDG_CACHE_HOME`,
-  `XDG_DATA_HOME`, and `XDG_RUNTIME_DIR`. `just setup-dev-env` also creates or
-  symlinks repo-local `soac-module-cache`, but the `Justfile` does not export
-  `SOAC_MODULE_CACHE_DIR` by default so specialization runs can use
-  `$SOAC_WORK_DIR/modules` as their module-artifact root. The `Justfile`
-  respects pre-set values for those variables. `just setup-dev-env` reuses an
+  `XDG_DATA_HOME`, and `XDG_RUNTIME_DIR`. Module artifacts are rooted under the
+  active `$SOAC_WORK_DIR/modules` directory. The `Justfile` respects pre-set
+  values for those repo-local state variables. `just setup-dev-env` reuses an
   already-installed nightly Rust toolchain and Cranelift codegen component
   rather than upgrading them on every run, because nightly refreshes force
   rebuilds. It also installs the repo-local `ruff` command. Test and benchmark
@@ -409,9 +407,9 @@ so a later turn can resume without rediscovering context.
   Optional override for `just setup-dev-env` in a jj worktree. The setup recipe
   normally infers the parent checkout from a file-backed `.jj/repo`; the parent
   owns shared offline state and `work/` as a regular artifact directory. The setup
-  recipe symlinks `vendor/cpython`, `work/`, `.uv-cache`, `.uv/`, `.xdg/`,
-  `soac-module-cache`, and `tmp/cargo-home` from that parent into the worktree,
-  and errors instead of creating isolated empty offline caches when neither
+  recipe symlinks `vendor/cpython`, `work/`, `.uv-cache`, `.uv/`, `.xdg/`, and
+  `tmp/cargo-home` from that parent into the worktree, and errors instead of
+  creating isolated empty offline caches when neither
   inference nor the override can identify the parent.
   When sandboxing would otherwise block shared benchmark writes or jj metadata
   updates, run Codex with the worktree and parent checkout as writable roots.
@@ -425,11 +423,12 @@ so a later turn can resume without rediscovering context.
   `true`, `yes`, or `on` for true and `0`, `false`, `no`, or `off` for false.
 - `SOAC_WORK_DIR` / `SOAC_OPT_MODE`
   Normal specialization runs use one work directory with conventional
-  files: `profile.bin` for specialization input, `verify.bin` for the
-  countered verification pass, and `events.jsonl` for default JSON
-  tracing output. Set `SOAC_OPT_MODE=none`, `profile`, `verify`, or
-  `apply`; recipes should pass the same `SOAC_WORK_DIR` and change only
-  the mode between passes. `none` is the explicit ordinary
+files: `profile.bin` for specialization input, `verify.bin` for the
+countered verification pass, and `events.jsonl` for default JSON
+tracing output. Cached pre-optimization BlockPy modules and sibling `mod.opt`
+plans live under `$SOAC_WORK_DIR/modules`. Set `SOAC_OPT_MODE=none`, `profile`,
+`verify`, or `apply`; recipes should pass the same `SOAC_WORK_DIR` and change only
+the mode between passes. `none` is the explicit ordinary
   unspecialized/no-counter mode and should not read or write counter
   dumps. `profile` writes raw evidence to `profile.bin`; run
   `decide_optimizations` to turn that evidence plus cached BlockPy modules into
@@ -495,17 +494,6 @@ so a later turn can resume without rediscovering context.
   default. Set `SOAC_RUN_SLOW_TESTS=1` to include intentionally expensive tests
   such as broad import-hook coverage. Direct pytest invocations can also pass
   `--run-slow`.
-- `SOAC_MODULE_CACHE_DIR`
-  Optional directory for the shared pre-optimization BlockPy module cache. When
-  unset and `SOAC_WORK_DIR` is set, module artifacts default under
-  `$SOAC_WORK_DIR/modules`; otherwise they default to repo-local
-  `soac-module-cache`. Cached modules use per-module paths such as
-  `project/pkg/submod/mod.blockpy`; source hash and SOAC build identity are
-  cache metadata, not filename components. `mod.profile` and `mod.opt` are the
-  corresponding per-module profile-evidence and optimization-decision artifact
-  names. Benchmark recipes override the Justfile's repo-local default when the
-  caller did not set this variable explicitly, using the benchmark result's
-  `counters/modules` directory instead.
 - `SOAC_PRECOMPILED_LIBRARY`
   Optional path to an offline-precompiled SOAC shared library. When set, runtime
   direct-function compilation first tries to load matching code by module name,
@@ -515,12 +503,10 @@ so a later turn can resume without rediscovering context.
   Offline precompiles all modules referenced by a counter dump from cached
   pre-optimization BlockPy modules, writes per-module object files, and links a
   shared library. The recipe regenerates `mod.opt` plans before compiling. It
-  expects matching module-cache entries in
-  `SOAC_MODULE_CACHE_DIR`, in `$SOAC_WORK_DIR/modules` when the cache
-  directory is unset, or in `<counters-dir>/modules` when precompiling from an
-  explicit counter dump; run a profile/benchmark pass first when the cache is
-  empty. Use `SOAC_PRECOMPILED_LIBRARY` to point runtime execution at the
-  resulting shared library.
+  expects matching module-cache entries in `$SOAC_WORK_DIR/modules`; run a
+  profile/benchmark pass first when the cache is empty. Use
+  `SOAC_PRECOMPILED_LIBRARY` to point runtime execution at the resulting shared
+  library.
 - `cargo run -p soac-inspector --bin decide_optimizations -- --counters <profile.bin> --out <root-dir>`
   Standalone optimization-decision planner. It loads the counter dump once,
   scans cached BlockPy modules under the output root by default, and writes

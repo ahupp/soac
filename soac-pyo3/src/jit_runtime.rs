@@ -4,7 +4,7 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyModule, PyTuple};
 use soac_core::block_py::{BlockPyFunction, BlockPyModule, RuntimeFunctionId};
-use soac_jit::config::module_cache_root_from_env_or_repo;
+use soac_jit::config::module_cache_root_from_env;
 use soac_jit::module_type::{ModuleInfo, SoacExtModule, hash_module_source};
 use soac_lowering::codegen_cache::{CachedCodegenModuleMetadata, PythonModuleCacheSource};
 use soac_lowering::passes::CodegenModuleShape;
@@ -180,10 +180,7 @@ fn pre_optimization_module_cache(
     source_hash: u64,
     runtime_names_as_globals: bool,
 ) -> PyResult<Option<(PathBuf, CachedCodegenModuleMetadata)>> {
-    let repo_root = soac_repo_root();
-    let Some(cache_root) = module_cache_root_from_env_or_repo(repo_root.as_deref())
-        .map_err(PyRuntimeError::new_err)?
-    else {
+    let Some(cache_root) = module_cache_root_from_env().map_err(PyRuntimeError::new_err)? else {
         return Ok(None);
     };
     let path = soac_jit::config::pre_optimization_module_cache_path(

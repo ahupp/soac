@@ -55,7 +55,6 @@ def _split_opt_case(case_path: Path) -> tuple[str, list[dict[str, Any]]]:
 def _soac_subprocess_env(module_root: Path, *, work_dir: Path) -> dict[str, str]:
     env = dict(os.environ)
     env["SOAC_MODULE_ENABLED"] = f"path:{module_root}"
-    env["SOAC_MODULE_CACHE_DIR"] = str(work_dir / "modules")
     env["SOAC_WORK_DIR"] = str(work_dir)
     env.pop("SOAC_LOG", None)
     env.pop("SOAC_COMPILE_MODE", None)
@@ -161,13 +160,7 @@ def test_opt_case_verify_counters(tmp_path: Path, case_path: Path) -> None:
     )
     _assert_subprocess_ok(profile_result)
     assert (work_dir / "profile.bin").exists()
-    assert (
-        decide_optimizations_for_work_dir(
-            work_dir,
-            module_cache_dir=Path(base_env["SOAC_MODULE_CACHE_DIR"]),
-        )
-        >= 1
-    )
+    assert decide_optimizations_for_work_dir(work_dir) >= 1
 
     verify_result = _run_soac_subprocess(
         script,

@@ -10,19 +10,18 @@ just setup-dev-env
 `setup-dev-env` reuses an already-installed nightly Rust toolchain and Cranelift
 codegen component rather than upgrading them on every run, because a nightly
 refresh forces rebuilds. It also installs the `ruff` command with uv. The repo
-keeps uv state under the working tree (`.uv-cache`, `.uv/`, `.xdg/`, and
-`soac-module-cache`) and puts the repo-local uv tool bin directory on `PATH`, so
-later test and benchmark recipes can run uv in offline mode instead of fetching
-through the sandbox.
+keeps uv state under the working tree (`.uv-cache`, `.uv/`, and `.xdg/`) and
+puts the repo-local uv tool bin directory on `PATH`, so later test and benchmark
+recipes can run uv in offline mode instead of fetching through the sandbox.
 
 For jj worktrees, `just setup-dev-env` infers the parent checkout from a
 file-backed `.jj/repo` when possible. Set
 `SOAC_PARENT_REPO=/path/to/parent/checkout` to override that inference or when
 the parent cannot be inferred. The parent checkout owns `work/` as a regular
 artifact directory, and the setup recipe symlinks `vendor/cpython`, `work/`,
-`.uv-cache`, `.uv/`, `.xdg/`, `soac-module-cache`, and `tmp/cargo-home` from
-the parent checkout so temporary worktrees can reuse the already-fetched
-offline state, BlockPy module cache, and shared benchmark artifacts.
+`.uv-cache`, `.uv/`, `.xdg/`, and `tmp/cargo-home` from the parent checkout so
+temporary worktrees can reuse the already-fetched offline state and shared
+benchmark artifacts.
 
 # CLIF
 
@@ -108,21 +107,9 @@ exports are intentionally omitted here.
 - `SOAC_PARENT_REPO=/path/to/parent/checkout`
   Optional override for `just setup-dev-env` inside a jj worktree. The recipe
   normally infers the parent checkout from a file-backed `.jj/repo`; the parent
-  checkout owns `work/` as a regular artifact directory, `vendor/cpython`, and the
-  shared offline state symlinked into the worktree: `.uv-cache`, `.uv/`,
-  `.xdg/`, `soac-module-cache`, and `tmp/cargo-home`.
-
-- `SOAC_MODULE_CACHE_DIR=/path/to/cache`
-  Optional directory for the pre-optimization BlockPy module cache. When this is
-  unset and `SOAC_WORK_DIR` is set, module artifacts default under
-  `$SOAC_WORK_DIR/modules`; otherwise they default to `soac-module-cache` under
-  the repo root. Cached modules use stable per-module artifact paths such as
-  `project/pkg/submod/mod.blockpy`, with source hash and build identity stored
-  as cache metadata. `mod.profile` and `mod.opt` are reserved as the matching
-  per-module profile-evidence and optimization-decision artifacts. Benchmark
-  recipes override the Justfile's repo-local default when the caller did not set
-  this variable explicitly, so benchmark runs keep their module cache under the
-  current result's `counters/modules` directory.
+  checkout owns `work/` as a regular artifact directory, `vendor/cpython`, and
+  the shared offline state symlinked into the worktree: `.uv-cache`, `.uv/`,
+  `.xdg/`, and `tmp/cargo-home`.
 
 - `SOAC_PRECOMPILED_LIBRARY=/path/to/libsoac_precompiled.so`
   Optional runtime source for offline-precompiled direct function bodies. When
@@ -243,8 +230,10 @@ typed variables must use recognized values. Boolean knobs accept `1`, `true`,
   - `verify.bin`: countered output recorded by the verify pass.
   - `events.jsonl`: default tracing JSONL when `SOAC_LOG` is not
     set.
-  - `modules/`: default root for per-module artifacts when
-    `SOAC_MODULE_CACHE_DIR` is unset.
+  - `modules/`: root for cached pre-optimization BlockPy modules and sibling
+    `mod.opt` optimization plans. Cached modules use stable per-module artifact
+    paths such as `project/pkg/submod/mod.blockpy`, with source hash and build
+    identity stored as cache metadata.
 
 - `SOAC_OPT_MODE=none|profile|verify|apply`
   Select the runtime specialization phase:
@@ -369,13 +358,10 @@ tree, with pystone benchmark runs writing to `work/bench/`.
   relocatable object files and link them into a shared library. The recipe
   regenerates `mod.opt` plans from the counter file before compiling. The
   counter file normally comes from a previous profile pass, and the matching
-  pre-optimization BlockPy cache entries must still exist in the active module
-  cache. With the
-  default benchmark cache isolation, that cache is the benchmark result's
-  `counters/modules` directory; when `counters` points at
-  `.../counters/profile.bin` and `SOAC_MODULE_CACHE_DIR` was not set explicitly,
-  the precompile recipe derives that cache path automatically. When `counters`
-  is omitted, the recipe uses `$LAST_BENCHMARK_COUNTERS`. Set
+  pre-optimization BlockPy cache entries must still exist in the active
+  `$SOAC_WORK_DIR/modules` cache. With the default benchmark cache isolation,
+  that cache is the benchmark result's `counters/modules` directory. When
+  `counters` is omitted, the recipe uses `$LAST_BENCHMARK_COUNTERS`. Set
   `SOAC_PRECOMPILED_LIBRARY` to the resulting
   `.so` to let runtime direct-function setup use matching precompiled entries.
 

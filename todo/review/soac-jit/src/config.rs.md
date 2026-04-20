@@ -27,7 +27,7 @@ while preserving crate-local visibility choices. BlockPy module-cache path and m
 - `counter_dump_output_path_from_env`: returns profile/verify counter output path.
 - `profiled_cold_blocks_enabled`: returns whether profiled cold blocks should affect codegen.
 - `jit_refcount_emission_enabled`: returns whether JIT refcount emission is enabled.
-- `module_cache_root_from_env_or_repo`: resolves the pre-optimization module cache root.
+- `module_cache_root_from_env`: resolves the pre-optimization module cache root from `SOAC_WORK_DIR`.
 - `pre_optimization_module_cache_identity`: builds the build-identity string used in module-cache keys.
 - `pre_optimization_module_cache_path`: resolves a module-cache path for a source hash and identity.
 - `precompiled_library_path_from_env`: returns an optional precompiled shared-library path.

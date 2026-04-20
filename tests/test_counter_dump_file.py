@@ -26,14 +26,10 @@ def _read_jsonl(path):
     ]
 
 
-def _soac_subprocess_env(module_root, *, work_dir=None, extra_env=None, module_cache_dir=True):
+def _soac_subprocess_env(module_root, *, work_dir=None, extra_env=None):
     env = dict(os.environ)
     env["SOAC_MODULE_ENABLED"] = f"path:{module_root}"
     env.pop("SOAC_COMPILE_MODE", None)
-    if module_cache_dir:
-        env["SOAC_MODULE_CACHE_DIR"] = str(module_root / "soac-module-cache")
-    else:
-        env.pop("SOAC_MODULE_CACHE_DIR", None)
     if work_dir is not None:
         env["SOAC_WORK_DIR"] = str(work_dir)
     else:
@@ -58,12 +54,8 @@ def _assert_subprocess_ok(result):
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def _decide_optimizations_for_env(work_dir, base_env):
-    module_cache_dir = base_env.get("SOAC_MODULE_CACHE_DIR")
-    return decide_optimizations_for_work_dir(
-        work_dir,
-        module_cache_dir=None if module_cache_dir is None else Path(module_cache_dir),
-    )
+def _decide_optimizations_for_env(work_dir):
+    return decide_optimizations_for_work_dir(work_dir)
 
 
 def _import_and_run_script(module_root, import_stmt, body):
@@ -112,7 +104,7 @@ def run():
     )
     _assert_subprocess_ok(profile_result)
     assert (work_dir / "profile.bin").exists()
-    assert _decide_optimizations_for_env(work_dir, base_env) >= 1
+    assert _decide_optimizations_for_env(work_dir) >= 1
     return {
         "base_dir": base_dir,
         "module_name": module_name,
@@ -276,7 +268,8 @@ def read():
 
 
 def test_pre_optimization_blockpy_module_cache_is_reused(tmp_path):
-    cache_dir = tmp_path / "module-cache"
+    work_dir = tmp_path / "soac-work"
+    cache_dir = work_dir / "modules"
     log_path = tmp_path / "cache-events.jsonl"
     module_path = tmp_path / "module_cache_case.py"
     module_path.write_text(
@@ -288,8 +281,8 @@ def value():
     )
     env = _soac_subprocess_env(
         tmp_path,
+        work_dir=work_dir,
         extra_env={
-            "SOAC_MODULE_CACHE_DIR": str(cache_dir),
             "SOAC_LOG": f"soac_blockpy_module_cache=info;json={log_path}",
         },
     )
@@ -327,7 +320,6 @@ def test_soac_work_dir_is_default_module_artifact_root(tmp_path):
         env=_soac_subprocess_env(
             tmp_path,
             work_dir=work_dir,
-            module_cache_dir=False,
         ),
     )
     _assert_subprocess_ok(result)
@@ -454,7 +446,7 @@ def run_case():
         and row["value"] > 0
     ]
     assert profiled_shapes, profile
-    assert _decide_optimizations_for_env(work_dir, base_env) >= 1
+    assert _decide_optimizations_for_env(work_dir) >= 1
 
     verify_result = _run_soac_subprocess(
         script,
@@ -531,7 +523,7 @@ def run_case():
         and row["value"] > 0
     ]
     assert profiled_shapes, profile
-    assert _decide_optimizations_for_env(work_dir, base_env) >= 1
+    assert _decide_optimizations_for_env(work_dir) >= 1
 
     verify_result = _run_soac_subprocess(
         script,
@@ -626,7 +618,7 @@ def write_field():
     _assert_subprocess_ok(profile_result)
     profile_dump_path = work_dir / "profile.bin"
     assert profile_dump_path.exists()
-    assert _decide_optimizations_for_env(work_dir, base_env) >= 1
+    assert _decide_optimizations_for_env(work_dir) >= 1
 
     profile = _inspect_counter_dump_json(profile_dump_path)
     owner_entries = [
@@ -741,7 +733,7 @@ def run():
         if key["owner_type_id"] == record_type_id
     }
     assert profiled_keys == {"x", "y"}, profile
-    assert _decide_optimizations_for_env(work_dir, base_env) >= 1
+    assert _decide_optimizations_for_env(work_dir) >= 1
 
     verify_result = _run_soac_subprocess(
         script,

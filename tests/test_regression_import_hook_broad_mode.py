@@ -908,7 +908,6 @@ assert runtime.typing_Generic is not None
     base_env = {
         **env,
         "SOAC_WORK_DIR": str(tmp_path / "runtime-profile-counters"),
-        "SOAC_MODULE_CACHE_DIR": str(tmp_path / "module-cache"),
     }
     profile_result = subprocess.run(
         [sys.executable, "-c", script],
@@ -918,13 +917,7 @@ assert runtime.typing_Generic is not None
         text=True,
     )
     assert profile_result.returncode == 0, profile_result.stdout + profile_result.stderr
-    assert (
-        decide_optimizations_for_work_dir(
-            tmp_path / "runtime-profile-counters",
-            module_cache_dir=tmp_path / "module-cache",
-        )
-        >= 1
-    )
+    assert decide_optimizations_for_work_dir(tmp_path / "runtime-profile-counters") >= 1
 
     verify_result = subprocess.run(
         [sys.executable, "-c", script],

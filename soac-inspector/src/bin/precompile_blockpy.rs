@@ -80,7 +80,7 @@ fn run_with_args(args: impl IntoIterator<Item = OsString>) -> Result<(), String>
         .ok_or_else(|| "missing required --out <shared-library>".to_string())?;
     let module_cache_dir = match args.module_cache_dir {
         Some(path) => path,
-        None => default_module_cache_dir(counters_path.as_path())?,
+        None => default_module_cache_dir()?,
     };
     let object_dir = args
         .object_dir
@@ -449,19 +449,12 @@ fn link_shared_library(
     }
 }
 
-fn default_module_cache_dir(counters_path: &Path) -> Result<PathBuf, String> {
-    if let Some(path) = soac_jit::config::module_cache_root_from_env_or_repo(None)? {
-        return Ok(path);
-    }
-    if let Some(parent) = counters_path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        return Ok(parent.join("modules"));
-    }
-    let repo_root = repo_root();
-    soac_jit::config::module_cache_root_from_env_or_repo(Some(repo_root.as_path()))?
-        .ok_or_else(|| "repo root fallback should always produce a module cache dir".to_string())
+fn default_module_cache_dir() -> Result<PathBuf, String> {
+    soac_jit::config::module_cache_root_from_env()?.ok_or_else(|| {
+        "SOAC_WORK_DIR must be set when --module-cache-dir is omitted; \
+         using SOAC_WORK_DIR/modules for cached BlockPy modules"
+            .to_string()
+    })
 }
 
 fn repo_root() -> PathBuf {
@@ -555,7 +548,7 @@ fn next_os_string(
 
 fn print_usage() {
     println!(
-        "usage: precompile_blockpy --counters <profile.bin> --out <libsoac_precompiled.so> [--module-cache-dir <dir>] [--build-identity <identity>] [--object-dir <dir>] [--linker <cc>]"
+        "usage: precompile_blockpy --counters <profile.bin> --out <libsoac_precompiled.so> [--module-cache-dir <dir>] [--build-identity <identity>] [--object-dir <dir>] [--linker <cc>]\n\nBy default, reads cached BlockPy modules from SOAC_WORK_DIR/modules."
     );
 }
 
@@ -731,7 +724,7 @@ mod test {
     #[test]
     fn include_soac_runtime_module_adds_runtime_cache_entry() {
         let root = unique_temp_dir();
-        let cache_root = root.join("soac-module-cache");
+        let cache_root = root.join("modules");
         let runtime_source = fs::read_to_string(soac_runtime_source_path()).unwrap();
         let runtime_ref = CounterModuleRef {
             module_name: SOAC_RUNTIME_MODULE_NAME.to_string(),
@@ -798,7 +791,7 @@ mod test {
             source_hash,
             module_id: Some(module_id),
         };
-        let cache_root = root.join("soac-module-cache");
+        let cache_root = root.join("modules");
         let cache_path =
             module_cache_path_for_identity(cache_root.as_path(), &module_ref, SOAC_BUILD_IDENTITY)
                 .unwrap();
