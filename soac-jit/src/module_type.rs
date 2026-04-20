@@ -1,4 +1,4 @@
-use crate::config::{SpecializationMode, counter_dump_output_path_from_env};
+use crate::config::SpecializationMode;
 use crate::counter::{CounterEntry, GilTopValueCounter, TopValueCounter};
 use crate::jit::JitCodegenStats;
 use crate::module_constants::{ModuleCodegenConstants, load_runtime_name_owned_by_id};
@@ -1223,7 +1223,7 @@ fn snapshot_type_key_layout_events_bound(
 }
 
 fn counter_dump_file_from_env() -> Option<std::path::PathBuf> {
-    let path = match counter_dump_output_path_from_env() {
+    let path = match SoacEnvConfig::from_env().map(|config| config.counter_dump_output_path()) {
         Ok(Some(path)) => path,
         Ok(None) => return None,
         Err(err) => {

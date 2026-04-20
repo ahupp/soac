@@ -1,7 +1,6 @@
 #![cfg_attr(test, allow(dead_code, unused_imports))]
 
 use super::RuntimeJitDeoptInvocation;
-use crate::config::jit_perf_helper_frames_enabled;
 use crate::module_constants::raise_name_error_for_missing_name;
 use crate::module_constants::{load_runtime_name_owned, load_runtime_name_owned_by_id};
 use crate::operator_specialization::{ExactIntBinaryOpKind, ExactIntUnaryOpKind};
@@ -1793,7 +1792,8 @@ fn chosen_helper_symbol(fast: *const u8, with_frame: *const u8) -> *const u8 {
     if cfg!(test) {
         return fast;
     }
-    if jit_perf_helper_frames_enabled()
+    if soac_config::SoacEnvConfig::from_env()
+        .map(|config| config.jit_perf_helper_frames_enabled())
         .unwrap_or_else(|err| panic!("invalid SOAC_JIT_PERF_HELPER_FRAMES config: {err}"))
     {
         with_frame
@@ -2228,16 +2228,28 @@ mod tests {
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         let prior = std::env::var_os(soac_config::SOAC_JIT_PERF_HELPER_FRAMES_ENV);
         unsafe { std::env::remove_var(soac_config::SOAC_JIT_PERF_HELPER_FRAMES_ENV) };
-        assert!(!crate::config::jit_perf_helper_frames_enabled().unwrap());
+        assert!(
+            !soac_config::SoacEnvConfig::from_env()
+                .unwrap()
+                .jit_perf_helper_frames_enabled()
+        );
 
         unsafe { std::env::set_var(soac_config::SOAC_JIT_PERF_HELPER_FRAMES_ENV, "1") };
-        assert!(crate::config::jit_perf_helper_frames_enabled().unwrap());
+        assert!(
+            soac_config::SoacEnvConfig::from_env()
+                .unwrap()
+                .jit_perf_helper_frames_enabled()
+        );
 
         unsafe { std::env::set_var(soac_config::SOAC_JIT_PERF_HELPER_FRAMES_ENV, "0") };
-        assert!(!crate::config::jit_perf_helper_frames_enabled().unwrap());
+        assert!(
+            !soac_config::SoacEnvConfig::from_env()
+                .unwrap()
+                .jit_perf_helper_frames_enabled()
+        );
 
         unsafe { std::env::set_var(soac_config::SOAC_JIT_PERF_HELPER_FRAMES_ENV, "") };
-        assert!(crate::config::jit_perf_helper_frames_enabled().is_err());
+        assert!(soac_config::SoacEnvConfig::from_env().is_err());
 
         match prior {
             Some(value) => unsafe {

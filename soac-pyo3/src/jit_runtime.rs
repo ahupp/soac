@@ -4,7 +4,6 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyModule, PyTuple};
 use soac_core::block_py::{BlockPyFunction, BlockPyModule, RuntimeFunctionId};
-use soac_jit::config::module_cache_root_from_env;
 use soac_jit::module_type::{ModuleInfo, SoacExtModule, hash_module_source};
 use soac_lowering::codegen_cache::{CachedCodegenModuleMetadata, PythonModuleCacheSource};
 use soac_lowering::passes::CodegenModuleShape;
@@ -175,12 +174,17 @@ fn module_cache_source_for_import_path(path: &str) -> PythonModuleCacheSource {
 }
 
 fn pre_optimization_module_cache(
+    session: &soac_jit::CompileSession,
     module_name: &str,
     source: PythonModuleCacheSource,
     source_hash: u64,
     runtime_names_as_globals: bool,
 ) -> PyResult<Option<(PathBuf, CachedCodegenModuleMetadata)>> {
-    let Some(cache_root) = module_cache_root_from_env().map_err(PyRuntimeError::new_err)? else {
+    let Some(cache_root) = session
+        .env_config()
+        .map_err(PyRuntimeError::new_err)?
+        .module_cache_root()
+    else {
         return Ok(None);
     };
     let path = soac_jit::config::pre_optimization_module_cache_path(
@@ -464,6 +468,7 @@ fn create_module(py: Python<'_>, path: &str, spec: Py<PyAny>) -> PyResult<Py<PyA
     let session = soac_jit::CompileSession::process();
     let runtime_names_as_globals = module_name == "soac.runtime";
     let pre_optimization_cache = pre_optimization_module_cache(
+        session.as_ref(),
         module_name.as_str(),
         module_cache_source,
         source_hash,

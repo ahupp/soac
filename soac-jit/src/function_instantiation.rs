@@ -1,4 +1,3 @@
-use crate::config::eager_clif_compile_requested;
 use crate::jit::{ModuleJitContext, ModuleRuntimeContext};
 use crate::module_type::SharedModuleState;
 use crate::{CompileSession, clone_module_runtime_context, compile_clif_vectorcall};
@@ -111,7 +110,12 @@ fn maybe_eager_compile_clif_entry(
     module_runtime: &ModuleRuntimeContext,
     function_id: RuntimeFunctionId,
 ) -> PyResult<()> {
-    if !eager_clif_compile_requested().map_err(PyRuntimeError::new_err)? {
+    if !module_runtime
+        .compile_session
+        .env_config()
+        .map_err(PyRuntimeError::new_err)?
+        .eager_clif_compile_requested()
+    {
         return Ok(());
     }
     if module_runtime

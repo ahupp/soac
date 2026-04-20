@@ -95,8 +95,10 @@ mod imp {
 
     impl JitDumpSession {
         fn new() -> Result<Self, String> {
-            let dump_dir =
-                crate::config::soac_work_dir_from_env()?.unwrap_or_else(|| PathBuf::from("/tmp"));
+            let dump_dir = soac_config::SoacEnvConfig::from_env()?
+                .soac_work_dir()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("/tmp"));
             Self::new_in_dir(&dump_dir)
         }
 

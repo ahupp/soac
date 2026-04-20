@@ -7,6 +7,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyModule};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use soac_config::SoacEnvConfig;
 use soac_core::block_py::{BlockPyFunction, BlockPyModule, ModuleNameGen, RuntimeFunctionId};
 use soac_jit::module_constants::ModuleCodegenConstants;
 use soac_jit::module_type::{
@@ -311,7 +312,8 @@ pub struct ProfileModuleIdentity {
 pub fn profile_module_identity_from_env(
     module_name: &str,
 ) -> Result<Option<ProfileModuleIdentity>, String> {
-    let Some(path) = soac_jit::config::counter_dump_input_path_from_env()? else {
+    let env_config = SoacEnvConfig::from_env()?;
+    let Some(path) = env_config.counter_dump_input_path() else {
         return Ok(None);
     };
     if !path.exists() {

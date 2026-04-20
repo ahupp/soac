@@ -1,3 +1,4 @@
+use soac_config::SoacEnvConfig;
 use soac_core::block_py::{BlockPyModule, ModuleNameGen, RuntimeFunctionId};
 use soac_jit::module_type::hash_module_source;
 use soac_jit::{
@@ -457,11 +458,13 @@ fn link_shared_library(
 }
 
 fn default_module_cache_dir() -> Result<PathBuf, String> {
-    soac_jit::config::module_cache_root_from_env()?.ok_or_else(|| {
-        "SOAC_WORK_DIR must be set when --module-cache-dir is omitted; \
+    SoacEnvConfig::from_env()?
+        .module_cache_root()
+        .ok_or_else(|| {
+            "SOAC_WORK_DIR must be set when --module-cache-dir is omitted; \
          using SOAC_WORK_DIR/modules for cached BlockPy modules"
-            .to_string()
-    })
+                .to_string()
+        })
 }
 
 fn repo_root() -> PathBuf {

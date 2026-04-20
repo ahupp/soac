@@ -6118,6 +6118,7 @@ def build(values):
             .expect("specialized JIT build should succeed");
             let (clif, _cfg_dot, _vcode_disasm) = render_compiled_clif_and_vcode_disasm(
                 &mut jit_module,
+                &SoacEnvConfig::default(),
                 built.ctx,
                 &built.import_id_to_symbol,
                 &built.block_annotations,
@@ -7614,6 +7615,7 @@ def read_point(point):
             let mut ctx = built.ctx;
             define_prepared_function(
                 &mut jit_module,
+                &SoacEnvConfig::default(),
                 built.main_id,
                 &mut ctx,
                 "test-field-getattr-deopt-runtime-read-point",
@@ -7803,6 +7805,7 @@ def write_point(point, value):
             let mut ctx = built.ctx;
             define_prepared_function(
                 &mut jit_module,
+                &SoacEnvConfig::default(),
                 built.main_id,
                 &mut ctx,
                 "test-field-setattr-deopt-runtime-write-point",
@@ -7905,6 +7908,7 @@ def write_point(point, value):
             .expect("specialized JIT build should succeed");
             let (clif, _cfg_dot, _vcode_disasm) = render_compiled_clif_and_vcode_disasm(
                 &mut jit_module,
+                &SoacEnvConfig::default(),
                 built.ctx,
                 &built.import_id_to_symbol,
                 &built.block_annotations,
@@ -8062,10 +8066,16 @@ def write_point(point, value):
                 BuildSpecializedFunctionOptions::default(),
             )
             .expect("specialized JIT build should succeed");
-            inline_runtime_support_calls(&mut jit_module, &mut built.ctx, "test")
-                .expect("runtime support helpers should inline");
+            inline_runtime_support_calls(
+                &mut jit_module,
+                &SoacEnvConfig::default(),
+                &mut built.ctx,
+                "test",
+            )
+            .expect("runtime support helpers should inline");
             let (clif, _cfg_dot, _vcode_disasm) = render_compiled_clif_and_vcode_disasm(
                 &mut jit_module,
+                &SoacEnvConfig::default(),
                 built.ctx,
                 &built.import_id_to_symbol,
                 &built.block_annotations,
@@ -14010,6 +14020,7 @@ def g():
 
         define_prepared_function(
             &mut jit_module,
+            &SoacEnvConfig::default(),
             wrapper_id,
             &mut ctx,
             "test-runtime-refcount-smoke-wrapper",
@@ -14078,6 +14089,7 @@ def g():
 
         define_prepared_function(
             &mut jit_module,
+            &SoacEnvConfig::default(),
             wrapper_id,
             &mut ctx,
             "test-runtime-refcount-decref-wrapper",
@@ -14113,6 +14125,7 @@ def g():
         .expect("scalar counter storage should define");
         let counted_incref_id = build_counted_runtime_refcount_helper(
             &mut jit_module,
+            &SoacEnvConfig::default(),
             "test_counted_runtime_incref",
             "test-counted-runtime-incref",
             &DP_JIT_INCREF_IMPORT,
@@ -14155,6 +14168,7 @@ def g():
 
         define_prepared_function(
             &mut jit_module,
+            &SoacEnvConfig::default(),
             wrapper_id,
             &mut ctx,
             "test-counted-runtime-incref-wrapper",
@@ -14198,6 +14212,7 @@ def g():
         .expect("scalar counter storage should define");
         let counted_decref_id = build_counted_runtime_refcount_helper(
             &mut jit_module,
+            &SoacEnvConfig::default(),
             "test_counted_runtime_decref",
             "test-counted-runtime-decref",
             &DP_JIT_DECREF_IMPORT,
@@ -14241,6 +14256,7 @@ def g():
 
         define_prepared_function(
             &mut jit_module,
+            &SoacEnvConfig::default(),
             wrapper_id,
             &mut ctx,
             "test-counted-runtime-decref-wrapper",
@@ -14291,6 +14307,7 @@ def g():
 
         let inlined = inline_runtime_support_calls(
             &mut jit_module,
+            &SoacEnvConfig::default(),
             &mut ctx,
             "test runtime support inliner should run",
         )
@@ -14319,27 +14336,33 @@ def g():
         {
             let _env = EnvVarGuard::remove(SOAC_JIT_EMIT_REFCOUNTS_ENV);
             assert!(
-                jit_refcount_emission_enabled().unwrap(),
+                soac_config::SoacEnvConfig::from_env()
+                    .unwrap()
+                    .jit_refcount_emission_enabled(),
                 "refcount emission should be enabled by default"
             );
         }
         for value in ["0", "false", "False", "no", "off"] {
             let _env = EnvVarGuard::set(SOAC_JIT_EMIT_REFCOUNTS_ENV, value);
             assert!(
-                !jit_refcount_emission_enabled().unwrap(),
+                !soac_config::SoacEnvConfig::from_env()
+                    .unwrap()
+                    .jit_refcount_emission_enabled(),
                 "{SOAC_JIT_EMIT_REFCOUNTS_ENV}={value:?} should disable refcount emission"
             );
         }
         for value in ["1", "true", "yes", "on"] {
             let _env = EnvVarGuard::set(SOAC_JIT_EMIT_REFCOUNTS_ENV, value);
             assert!(
-                jit_refcount_emission_enabled().unwrap(),
+                soac_config::SoacEnvConfig::from_env()
+                    .unwrap()
+                    .jit_refcount_emission_enabled(),
                 "{SOAC_JIT_EMIT_REFCOUNTS_ENV}={value:?} should keep refcount emission enabled"
             );
         }
         let _env = EnvVarGuard::set(SOAC_JIT_EMIT_REFCOUNTS_ENV, "");
         assert!(
-            jit_refcount_emission_enabled().is_err(),
+            soac_config::SoacEnvConfig::from_env().is_err(),
             "{SOAC_JIT_EMIT_REFCOUNTS_ENV}=empty should be rejected"
         );
     }
@@ -14365,6 +14388,7 @@ def g():
 
             let inlined = inline_runtime_support_calls(
                 &mut jit_module,
+                &SoacEnvConfig::from_env().expect("disabled refcount test env should parse"),
                 &mut ctx,
                 "test runtime support inliner should run with refcounts disabled",
             )
@@ -14387,6 +14411,7 @@ def g():
                 unsafe { build_runtime_refcount_smoke_context() };
             inline_runtime_support_calls(
                 &mut jit_module,
+                &SoacEnvConfig::from_env().expect("enabled refcount test env should parse"),
                 &mut ctx,
                 "test runtime support inliner should run with refcounts enabled",
             )
@@ -15492,6 +15517,7 @@ def f(x):
             let mut ctx = built.ctx;
             define_prepared_function(
                 &mut jit_module,
+                &SoacEnvConfig::default(),
                 built.main_id,
                 &mut ctx,
                 "test-exact-int-binop-deopt-resume",
@@ -16522,6 +16548,7 @@ def f(x):
         .expect("v3 test optimization plan path should build");
 
         let err = match planned_optimization_inputs_for_precompile(
+            &SoacEnvConfig::from_env().expect("strict v3 test env should parse"),
             Some(PrecompileOptimizationPlanInput {
                 path: legacy_path.as_path(),
                 v3_path: Some(missing_v3_path.as_path()),
@@ -16744,6 +16771,7 @@ def f(x):
             let mut ctx = built.ctx;
             define_prepared_function(
                 &mut jit_module,
+                &SoacEnvConfig::default(),
                 built.main_id,
                 &mut ctx,
                 "test-exact-int-compare-deopt-resume",
@@ -16966,6 +16994,7 @@ def f(x):
             let mut ctx = built.ctx;
             define_prepared_function(
                 &mut jit_module,
+                &SoacEnvConfig::default(),
                 built.main_id,
                 &mut ctx,
                 "test-exact-int-if-compare-deopt-resume",
@@ -17286,6 +17315,7 @@ def f(x):
             let mut ctx = built.ctx;
             define_prepared_function(
                 &mut jit_module,
+                &SoacEnvConfig::default(),
                 built.main_id,
                 &mut ctx,
                 "test-exact-int-unary-deopt-resume",
@@ -17860,6 +17890,7 @@ def f(x, y):
         write_test_optimization_plan(plan_path.as_path(), &plan);
 
         let inputs = planned_optimization_inputs_for_precompile(
+            &SoacEnvConfig::default(),
             Some(PrecompileOptimizationPlanInput {
                 path: plan_path.as_path(),
                 v3_path: None,
@@ -17965,6 +17996,7 @@ def f(x, y):
         write_test_optimization_plan(plan_path.as_path(), &plan);
 
         let inputs = planned_optimization_inputs_for_precompile(
+            &SoacEnvConfig::default(),
             Some(PrecompileOptimizationPlanInput {
                 path: plan_path.as_path(),
                 v3_path: None,
@@ -18193,6 +18225,7 @@ def f(x, y):
         write_test_optimization_plan(plan_path.as_path(), &plan);
 
         let inputs = planned_optimization_inputs_for_precompile(
+            &SoacEnvConfig::default(),
             Some(PrecompileOptimizationPlanInput {
                 path: plan_path.as_path(),
                 v3_path: None,
@@ -19969,6 +20002,7 @@ def f(x, y):
             let mut method_ctx = built_method.ctx;
             define_prepared_function(
                 &mut jit_module,
+                &SoacEnvConfig::default(),
                 built_method.main_id,
                 &mut method_ctx,
                 "test-direct-method-deopt-profiled-method",
@@ -19979,6 +20013,7 @@ def f(x, y):
             let mut caller_ctx = built.ctx;
             define_prepared_function(
                 &mut jit_module,
+                &SoacEnvConfig::default(),
                 built.main_id,
                 &mut caller_ctx,
                 "test-direct-method-deopt-runtime-caller",
@@ -20203,6 +20238,7 @@ def f(x, y):
             let mut callee_ctx = built_callee.ctx;
             define_prepared_function(
                 &mut jit_module,
+                &SoacEnvConfig::default(),
                 built_callee.main_id,
                 &mut callee_ctx,
                 "test-direct-call-deopt-profiled-callee",
@@ -20213,6 +20249,7 @@ def f(x, y):
             let mut caller_ctx = built.ctx;
             define_prepared_function(
                 &mut jit_module,
+                &SoacEnvConfig::default(),
                 built.main_id,
                 &mut caller_ctx,
                 "test-direct-call-deopt-runtime-caller",
@@ -20346,6 +20383,7 @@ def f(x, y):
             .call_target_specializations
             .insert(call_instr_id, vec![callee_function.function_id]);
         let profile = SpecializationProfile::from_precompile(
+            &SoacEnvConfig::default(),
             module_name,
             None,
             PlannedOptimizationInputs::from_evidence_by_function(HashMap::from([(
@@ -20445,6 +20483,7 @@ def f(x, y):
             .call_target_specializations
             .insert(call_instr_id, vec![next_function.function_id]);
         let profile = SpecializationProfile::from_precompile(
+            &SoacEnvConfig::default(),
             module_name,
             None,
             PlannedOptimizationInputs::from_evidence_by_function(HashMap::from([(
@@ -20712,6 +20751,7 @@ def f(x, y):
             let mut ctx = built.ctx;
             define_prepared_function(
                 &mut jit_module,
+                &SoacEnvConfig::default(),
                 built.main_id,
                 &mut ctx,
                 "test-nested-body-global-deopt-resume",
@@ -20841,6 +20881,7 @@ def f(x, y):
             let mut ctx = built.ctx;
             define_prepared_function(
                 &mut jit_module,
+                &SoacEnvConfig::default(),
                 built.main_id,
                 &mut ctx,
                 "test-body-global-deopt-resume",
@@ -21079,6 +21120,7 @@ def f(x, y):
             let mut ctx = built.ctx;
             define_prepared_function(
                 &mut jit_module,
+                &SoacEnvConfig::default(),
                 built.main_id,
                 &mut ctx,
                 "test-return-global-deopt-resume",
@@ -21223,6 +21265,7 @@ def f(x, y):
             let mut ctx = built.ctx;
             define_prepared_function(
                 &mut jit_module,
+                &SoacEnvConfig::default(),
                 built.main_id,
                 &mut ctx,
                 "test-global-store-deopt-resume",

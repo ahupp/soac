@@ -1,24 +1,13 @@
 use cranelift_codegen::isa::TargetIsa;
 use cranelift_codegen::settings;
 use cranelift_codegen::settings::Configurable;
-pub(crate) use soac_config::{OptimizationPlanMode, SpecializationMode};
+pub(crate) use soac_config::SpecializationMode;
 #[cfg(test)]
 pub(crate) use soac_config::{
     SOAC_JIT_EMIT_REFCOUNTS_ENV, SOAC_OPT_PLAN_MODE_ENV, SOAC_VALIDATE_OPT_V3_ENV,
 };
 use soac_config::{
-    background_jit_enabled_from_env,
-    counter_dump_input_path_from_env as config_counter_dump_input_path_from_env,
-    counter_dump_output_path_from_env as config_counter_dump_output_path_from_env,
-    cranelift_opt_level_from_env, eager_clif_compile_requested_from_env,
-    jit_compile_workers_from_env, jit_perf_helper_frames_enabled_from_env,
-    jit_refcount_emission_enabled_from_env,
-    module_cache_root_from_env as config_module_cache_root_from_env,
-    opt_v3_validation_enabled_from_env,
-    optimization_plan_mode_from_env as config_optimization_plan_mode_from_env,
-    precompiled_library_path_from_env as config_precompiled_library_path_from_env,
-    profiled_cold_blocks_enabled_from_env, soac_work_dir_from_env as config_soac_work_dir_from_env,
-    specialization_mode_from_env as config_specialization_mode_from_env,
+    SoacEnvConfig, precompiled_library_path_from_env as config_precompiled_library_path_from_env,
 };
 pub use soac_lowering::codegen_cache::CachedCodegenModuleMetadata;
 use soac_lowering::codegen_cache::{
@@ -40,21 +29,21 @@ pub(crate) struct CraneliftTargetConfig {
 }
 
 impl CraneliftTargetConfig {
-    pub(crate) fn runtime_from_env() -> Result<Self, String> {
-        Self::from_env_with_pic(false)
+    pub(crate) fn runtime(config: &SoacEnvConfig) -> Self {
+        Self::from_config_with_pic(config, false)
     }
 
-    pub(crate) fn object_from_env() -> Result<Self, String> {
-        Self::from_env_with_pic(true)
+    pub(crate) fn object(config: &SoacEnvConfig) -> Self {
+        Self::from_config_with_pic(config, true)
     }
 
-    fn from_env_with_pic(is_pic: bool) -> Result<Self, String> {
-        Ok(Self {
-            opt_level: cranelift_opt_level_from_env()?,
+    fn from_config_with_pic(config: &SoacEnvConfig, is_pic: bool) -> Self {
+        Self {
+            opt_level: config.cranelift_opt_level().to_string(),
             is_pic,
             preserve_frame_pointers: true,
             machine_code_cfg_info: true,
-        })
+        }
     }
 
     pub(crate) fn build_isa(&self) -> Result<Arc<dyn TargetIsa>, String> {
@@ -96,34 +85,6 @@ impl CraneliftTargetConfig {
             .set(name, value)
             .map_err(|err| format!("failed to configure Cranelift flags: {err}"))
     }
-}
-
-pub fn soac_work_dir_from_env() -> Result<Option<PathBuf>, String> {
-    config_soac_work_dir_from_env()
-}
-
-pub fn counter_dump_input_path_from_env() -> Result<Option<PathBuf>, String> {
-    config_counter_dump_input_path_from_env()
-}
-
-pub(crate) fn counter_dump_output_path_from_env() -> Result<Option<PathBuf>, String> {
-    config_counter_dump_output_path_from_env()
-}
-
-pub(crate) fn profiled_cold_blocks_enabled() -> Result<bool, String> {
-    profiled_cold_blocks_enabled_from_env()
-}
-
-pub(crate) fn opt_v3_validation_enabled() -> Result<bool, String> {
-    opt_v3_validation_enabled_from_env()
-}
-
-pub(crate) fn jit_refcount_emission_enabled() -> Result<bool, String> {
-    jit_refcount_emission_enabled_from_env()
-}
-
-pub fn module_cache_root_from_env() -> Result<Option<PathBuf>, String> {
-    config_module_cache_root_from_env()
 }
 
 pub fn pre_optimization_module_cache_identity(
@@ -187,39 +148,5 @@ pub fn module_optimization_plan_v3_path(
 
 pub(crate) fn precompiled_library_path_from_env() -> Result<Option<PathBuf>, String> {
     config_precompiled_library_path_from_env()
-}
-
-pub fn eager_clif_compile_requested() -> Result<bool, String> {
-    eager_clif_compile_requested_from_env()
-}
-
-pub(crate) fn jit_compile_workers() -> Result<Option<usize>, String> {
-    jit_compile_workers_from_env()
-}
-
-pub(crate) fn background_jit_enabled() -> Result<bool, String> {
-    background_jit_enabled_from_env()
-}
-
-pub(crate) fn jit_perf_helper_frames_enabled() -> Result<bool, String> {
-    jit_perf_helper_frames_enabled_from_env()
-}
-
-#[cfg(test)]
-pub(crate) fn specialization_mode_is_profile() -> Result<bool, String> {
-    Ok(specialization_mode_from_env()? == Some(SpecializationMode::Profile))
-}
-
-pub(crate) fn behavior_change_indexed_stores_enabled() -> Result<bool, String> {
-    Ok(specialization_mode_from_env()?
-        .is_some_and(SpecializationMode::behavior_change_indexed_stores_enabled))
-}
-
-pub(crate) fn specialization_mode_from_env() -> Result<Option<SpecializationMode>, String> {
-    config_specialization_mode_from_env()
-}
-
-pub(crate) fn optimization_plan_mode_from_env() -> Result<OptimizationPlanMode, String> {
-    config_optimization_plan_mode_from_env()
 }
 pub use soac_lowering::codegen_cache::PythonModuleCacheSource;

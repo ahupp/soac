@@ -3,15 +3,10 @@ use self::precompiled_object::{
     ObjectFunctionDefinition, R_X86_64_64, write_precompiled_object,
 };
 use crate::SOAC_RUNTIME_CLIF;
-#[cfg(test)]
-use crate::config::specialization_mode_is_profile;
 use crate::config::{
     CraneliftTargetConfig, PythonModuleCacheSource, SpecializationMode,
-    behavior_change_indexed_stores_enabled, counter_dump_input_path_from_env, jit_compile_workers,
-    jit_refcount_emission_enabled, module_cache_root_from_env, module_optimization_plan_path,
-    module_optimization_plan_v3_path, opt_v3_validation_enabled, optimization_plan_mode_from_env,
-    pre_optimization_module_cache_identity, profiled_cold_blocks_enabled, soac_work_dir_from_env,
-    specialization_mode_from_env,
+    module_optimization_plan_path, module_optimization_plan_v3_path,
+    pre_optimization_module_cache_identity,
 };
 #[cfg(test)]
 use crate::config::{
@@ -58,6 +53,7 @@ use cranelift_jit::{ArenaMemoryProvider, JITBuilder, JITModule};
 use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module, ModuleReloc};
 use cranelift_reader::parse_functions;
 use pyo3::{Py, PyAny, Python, ffi};
+use soac_config::SoacEnvConfig;
 use soac_core::block_py as blockpy_intrinsics;
 use soac_core::block_py::{
     AbruptKind, Block, BlockArg, BlockEdge, BlockLabel, BlockParamRole, BlockPyFunction,
@@ -1706,6 +1702,7 @@ struct JitDataDeclarationSnapshot {
 
 struct JitBatchPlan<'a> {
     root_function_id: RuntimeFunctionId,
+    env_config: &'a SoacEnvConfig,
     batch_functions: Vec<ProcessJitBatchFunction<'a>>,
     function_indices_to_define: Vec<usize>,
     function_compile_inputs: HashMap<usize, ReservedJitFunctionCompileInputs>,
@@ -1734,6 +1731,15 @@ struct JitBatchStreamingCommitOutput {
 }
 
 const DEFAULT_JIT_COMPILE_WORKER_LIMIT: usize = 4;
+
+fn env_config_for_session(
+    compile_session: Option<&crate::session::CompileSession>,
+) -> Result<Cow<'_, SoacEnvConfig>, String> {
+    match compile_session {
+        Some(session) => Ok(Cow::Borrowed(session.env_config()?)),
+        None => Ok(Cow::Owned(SoacEnvConfig::from_env()?)),
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 struct JitBatchWorkerMetrics {
@@ -1796,13 +1802,15 @@ impl JitBatchWorkerMetrics {
     }
 }
 
-fn jit_batch_worker_count(function_count: usize) -> Result<usize, String> {
+fn jit_batch_worker_count(function_count: usize, env_config: &SoacEnvConfig) -> usize {
     if function_count == 0 {
-        return Ok(0);
+        return 0;
     }
     let available = std::thread::available_parallelism().map_or(1, usize::from);
-    let configured_limit = jit_compile_workers()?.unwrap_or(DEFAULT_JIT_COMPILE_WORKER_LIMIT);
-    Ok(function_count.min(available).min(configured_limit).max(1))
+    let configured_limit = env_config
+        .jit_compile_workers()
+        .unwrap_or(DEFAULT_JIT_COMPILE_WORKER_LIMIT);
+    function_count.min(available).min(configured_limit).max(1)
 }
 
 impl JitBatchPlan<'_> {
@@ -3868,6 +3876,7 @@ fn emit_jit_batch_codegen_log(
 }
 
 pub(crate) struct ProcessJitEngine {
+    env_config: SoacEnvConfig,
     module: ProcessJitModule,
     state: Mutex<ProcessJitState>,
     vectorcall_trampolines: Mutex<HashMap<usize, VectorcallEntryFn>>,
@@ -4321,6 +4330,7 @@ impl ProcessJitState {
             );
             let counted_refcount_helpers = build_counted_runtime_refcount_helpers(
                 jit_module,
+                inputs.session.env_config()?,
                 &batch_function.function,
                 shared_state.lowered_module.counter_defs.as_slice(),
                 shared_state.counter_slots_by_id(),
@@ -4381,6 +4391,7 @@ impl ProcessJitState {
         )?;
         let counted_refcount_helpers = build_counted_runtime_refcount_helpers(
             jit_module,
+            inputs.session.env_config()?,
             &batch_function.function,
             inputs.counter_defs,
             counter_slots_by_id.as_ref(),
@@ -4466,12 +4477,13 @@ impl ProcessJitState {
 
         Ok(ReservedDirectFunctionBatch::Reserved(JitBatchPlan {
             root_function_id: root_function.function_id,
+            env_config: inputs.session.env_config()?,
             batch_functions,
             function_indices_to_define,
             function_compile_inputs,
             compile_waiters,
             module_declarations: JitModuleDeclarationSnapshot::from_module(jit_module),
-            isa: CraneliftTargetConfig::runtime_from_env()?.build_isa()?,
+            isa: CraneliftTargetConfig::runtime(inputs.session.env_config()?).build_isa()?,
             module_plans: HashMap::new(),
             predeclared,
         }))
@@ -4540,7 +4552,7 @@ impl ProcessJitState {
                 worker_metrics: JitBatchWorkerMetrics::default(),
             });
         }
-        let worker_count = jit_batch_worker_count(function_count)?;
+        let worker_count = jit_batch_worker_count(function_count, plan.env_config);
         if worker_count <= 1 {
             let worker_output = Self::compile_reserved_direct_function_batch_worker(
                 inputs,
@@ -4710,6 +4722,7 @@ impl ProcessJitState {
             direct_function_backend_name(function, batch_function.source.shared_state());
         let compiled = compile_prepared_function_bytes(
             codegen_env,
+            plan.env_config,
             main_id,
             &mut ctx,
             function_name.as_str(),
@@ -4738,6 +4751,7 @@ impl ProcessJitState {
                 })?;
                 let compiled = compile_prepared_function_bytes(
                     codegen_env,
+                    plan.env_config,
                     default_adapter_id,
                     &mut default_ctx,
                     default_adapter_symbol.as_str(),
@@ -4886,6 +4900,7 @@ impl ProcessJitState {
                 defined.compiled.artifact.systemv_unwind_info.as_ref(),
             )?;
             record_jit_bb_map(
+                session.env_config()?,
                 &defined.main_symbol,
                 code_id,
                 &defined.compiled.artifact,
@@ -4922,6 +4937,7 @@ impl ProcessJitState {
                         .as_ref(),
                 )?;
                 record_jit_bb_map(
+                    session.env_config()?,
                     default_adapter_symbol,
                     code_id,
                     &default_adapter_compiled.artifact,
@@ -11306,6 +11322,7 @@ fn lookup_runtime_counter_id(
 
 fn build_counted_runtime_refcount_helper(
     jit_module: &mut JITModule,
+    env_config: &SoacEnvConfig,
     symbol_name: &str,
     function_name: &str,
     wrapper_import: &'static ImportSpec,
@@ -11357,6 +11374,7 @@ fn build_counted_runtime_refcount_helper(
 
     let _ = define_prepared_function(
         jit_module,
+        env_config,
         helper_id,
         &mut ctx,
         function_name,
@@ -11368,13 +11386,14 @@ fn build_counted_runtime_refcount_helper(
 
 fn build_counted_runtime_refcount_helpers(
     jit_module: &mut JITModule,
+    env_config: &SoacEnvConfig,
     function: &BlockPyFunction<CodegenModuleShape>,
     counter_defs: &[CounterDef],
     counter_slots_by_id: &[CounterRuntimeSlot],
     scalar_counter_data_id: Option<DataId>,
     symbol_scope: Option<&str>,
 ) -> Result<CountedRefcountHelpers, String> {
-    if !jit_refcount_emission_enabled()? {
+    if !env_config.jit_refcount_emission_enabled() {
         return Ok(CountedRefcountHelpers::default());
     }
 
@@ -11394,6 +11413,7 @@ fn build_counted_runtime_refcount_helpers(
                 );
                 build_counted_runtime_refcount_helper(
                     jit_module,
+                    env_config,
                     &helper_name,
                     &helper_name,
                     &DP_JIT_INCREF_IMPORT,
@@ -11420,6 +11440,7 @@ fn build_counted_runtime_refcount_helpers(
                 );
                 build_counted_runtime_refcount_helper(
                     jit_module,
+                    env_config,
                     &helper_name,
                     &helper_name,
                     &DP_JIT_DECREF_IMPORT,
@@ -13108,6 +13129,7 @@ struct FunctionSpecializationInputs {
 fn load_planned_optimization_inputs_for_runtime_state(
     shared_state: Option<&SharedModuleState>,
     compile_session: Option<&crate::session::CompileSession>,
+    env_config: &SoacEnvConfig,
     specialization_mode: Option<SpecializationMode>,
 ) -> Result<PlannedOptimizationInputs, String> {
     if !matches!(
@@ -13119,8 +13141,8 @@ fn load_planned_optimization_inputs_for_runtime_state(
     let Some(shared_state) = shared_state else {
         return Ok(PlannedOptimizationInputs::default());
     };
-    let plan_mode = optimization_plan_mode_from_env()?;
-    let Some(cache_root) = module_cache_root_from_env()? else {
+    let plan_mode = env_config.optimization_plan_mode();
+    let Some(cache_root) = env_config.module_cache_root() else {
         if plan_mode.requires_v3() {
             return Err(format!(
                 "SOAC_OPT_PLAN_MODE=v3 requires SOAC_WORK_DIR/module cache to load mod.optv3 for module {}",
@@ -13192,6 +13214,7 @@ fn load_planned_optimization_inputs_for_runtime_state(
                 &plan,
                 shared_state,
                 compile_session,
+                env_config,
             );
         }
     }
@@ -13200,6 +13223,7 @@ fn load_planned_optimization_inputs_for_runtime_state(
         cache_root.as_path(),
         shared_state,
         compile_session,
+        env_config,
     )? {
         return Ok(inputs);
     }
@@ -13363,8 +13387,9 @@ fn synthesize_test_planned_optimization_inputs_for_runtime_state(
     cache_root: &Path,
     shared_state: &SharedModuleState,
     compile_session: Option<&crate::session::CompileSession>,
+    env_config: &SoacEnvConfig,
 ) -> Result<Option<PlannedOptimizationInputs>, String> {
-    let Some(path) = counter_dump_input_path_from_env()? else {
+    let Some(path) = env_config.counter_dump_input_path() else {
         return Ok(None);
     };
     let path = path.as_path();
@@ -13508,13 +13533,15 @@ fn synthesize_test_planned_optimization_inputs_for_runtime_state(
             path.display()
         )
     })?;
-    planned_optimization_inputs_for_shared_state(&plan, shared_state, compile_session).map(Some)
+    planned_optimization_inputs_for_shared_state(&plan, shared_state, compile_session, env_config)
+        .map(Some)
 }
 
 fn planned_optimization_inputs_for_shared_state(
     plan: &OptimizationPlan,
     shared_state: &SharedModuleState,
     compile_session: Option<&crate::session::CompileSession>,
+    env_config: &SoacEnvConfig,
 ) -> Result<PlannedOptimizationInputs, String> {
     let mut inputs = PlannedOptimizationInputs::default();
     for planned_function in &plan.functions {
@@ -13538,6 +13565,7 @@ fn planned_optimization_inputs_for_shared_state(
             })
             .map_err(|err| err.to_string())?;
         if let Some(artifacts) = opt_v3_exact_int_branch_artifacts_for_function(
+            env_config,
             plan,
             planned_function,
             current_function,
@@ -13556,6 +13584,7 @@ fn planned_optimization_inputs_for_shared_state(
 }
 
 fn planned_optimization_inputs_for_precompile(
+    env_config: &SoacEnvConfig,
     plan_input: Option<PrecompileOptimizationPlanInput<'_>>,
     module_index: Option<&PrecompileModuleIndex>,
     module_name: &str,
@@ -13563,12 +13592,12 @@ fn planned_optimization_inputs_for_precompile(
     module: &BlockPyModule<CodegenModuleShape>,
 ) -> Result<PlannedOptimizationInputs, String> {
     let Some(plan_input) = plan_input else {
-        if optimization_plan_mode_from_env()?.requires_v3() {
+        if env_config.optimization_plan_mode().requires_v3() {
             return Err("SOAC_OPT_PLAN_MODE=v3 requires a precompile mod.optv3 input".to_string());
         }
         return Ok(PlannedOptimizationInputs::default());
     };
-    let plan_mode = optimization_plan_mode_from_env()?;
+    let plan_mode = env_config.optimization_plan_mode();
     if plan_mode.allows_v3() {
         if let Some(path) = plan_input.v3_path.filter(|path| path.exists()) {
             let artifacts = load_optimization_artifacts_v3(path).map_err(|err| err.to_string())?;
@@ -13636,6 +13665,7 @@ fn planned_optimization_inputs_for_precompile(
             })
             .map_err(|err| err.to_string())?;
         if let Some(artifacts) = opt_v3_exact_int_branch_artifacts_for_function(
+            env_config,
             &plan,
             planned_function,
             current_function,
@@ -13665,13 +13695,14 @@ fn function_profile_evidence_is_empty(evidence: &FunctionProfileEvidence) -> boo
 }
 
 fn opt_v3_exact_int_branch_artifacts_for_function(
+    env_config: &SoacEnvConfig,
     plan: &OptimizationPlan,
     planned_function: &FunctionOptimizationPlan,
     function: &BlockPyFunction<CodegenModuleShape>,
     evidence: &FunctionProfileEvidence,
     module_constants: &[InstrResolved],
 ) -> Result<Option<ExactIntBranchV3Artifacts>, String> {
-    if !opt_v3_validation_enabled()? {
+    if !env_config.opt_v3_validation_enabled() {
         return Ok(None);
     }
 
@@ -13843,17 +13874,19 @@ impl<'a> SpecializationProfile<'a> {
         shared_state: Option<&'a SharedModuleState>,
         compile_session: Option<&crate::session::CompileSession>,
     ) -> Result<Self, String> {
-        let specialization_mode = specialization_mode_from_env()?;
+        let env_config = env_config_for_session(compile_session)?;
+        let specialization_mode = env_config.specialization_mode();
         let counter_dump_path = if shared_state.is_some()
             && specialization_mode != Some(crate::config::SpecializationMode::Profile)
         {
-            counter_dump_input_path_from_env()?
+            env_config.counter_dump_input_path()
         } else {
             None
         };
         let planned_inputs = load_planned_optimization_inputs_for_runtime_state(
             shared_state,
             compile_session,
+            &env_config,
             specialization_mode,
         )?;
         Ok(Self {
@@ -13861,8 +13894,9 @@ impl<'a> SpecializationProfile<'a> {
             counter_dump_path: counter_dump_path.map(Cow::Owned),
             planned_evidence: planned_inputs.evidence_by_function,
             opt_v3_exact_int_branch_artifacts: planned_inputs.opt_v3_exact_int_branch_artifacts,
-            behavior_change_indexed_stores: behavior_change_indexed_stores_enabled()?,
-            profiled_cold_blocks: profiled_cold_blocks_enabled()?,
+            behavior_change_indexed_stores: specialization_mode
+                .is_some_and(SpecializationMode::behavior_change_indexed_stores_enabled),
+            profiled_cold_blocks: env_config.profiled_cold_blocks_enabled(),
             guard_miss_deopt: matches!(
                 specialization_mode,
                 Some(SpecializationMode::Verify | SpecializationMode::Apply)
@@ -13871,6 +13905,7 @@ impl<'a> SpecializationProfile<'a> {
     }
 
     fn from_precompile(
+        env_config: &SoacEnvConfig,
         module_name: &'a str,
         counter_dump_path: Option<&'a Path>,
         planned_inputs: PlannedOptimizationInputs,
@@ -13881,7 +13916,7 @@ impl<'a> SpecializationProfile<'a> {
             planned_evidence: planned_inputs.evidence_by_function,
             opt_v3_exact_int_branch_artifacts: planned_inputs.opt_v3_exact_int_branch_artifacts,
             behavior_change_indexed_stores: true,
-            profiled_cold_blocks: profiled_cold_blocks_enabled()?,
+            profiled_cold_blocks: env_config.profiled_cold_blocks_enabled(),
             guard_miss_deopt: true,
         })
     }
@@ -14623,10 +14658,11 @@ fn load_field_index_specializations_from_path(
 #[cfg(test)]
 fn load_field_index_specializations()
 -> Result<HashMap<String, Vec<FieldIndexSpecialization>>, String> {
-    if specialization_mode_is_profile()? {
+    let env_config = SoacEnvConfig::from_env()?;
+    if env_config.specialization_mode() == Some(SpecializationMode::Profile) {
         return Ok(HashMap::new());
     }
-    let Some(path) = counter_dump_input_path_from_env()? else {
+    let Some(path) = env_config.counter_dump_input_path() else {
         return Ok(HashMap::new());
     };
     let path = path.as_path();
@@ -23717,8 +23753,8 @@ fn emit_typed_codegen_term(
     )
 }
 
-fn new_jit_builder() -> Result<JITBuilder, String> {
-    let isa = CraneliftTargetConfig::runtime_from_env()?.build_isa()?;
+fn new_jit_builder(env_config: &SoacEnvConfig) -> Result<JITBuilder, String> {
+    let isa = CraneliftTargetConfig::runtime(env_config).build_isa()?;
     let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
     if let Ok(provider) = ArenaMemoryProvider::new_with_size(JIT_ARENA_BYTES) {
         builder.memory_provider(Box::new(provider));
@@ -23761,9 +23797,10 @@ fn register_jit_builder_symbols(builder: &mut JITBuilder) {
     register_specialized_jit_symbols(builder);
 }
 
-fn new_jit_module(_compile_session: &crate::session::CompileSession) -> Result<JITModule, String> {
-    let mut jit_module = JITModule::new(new_jit_builder()?);
-    load_runtime_support_clif(&mut jit_module)?;
+fn new_jit_module(compile_session: &crate::session::CompileSession) -> Result<JITModule, String> {
+    let env_config = compile_session.env_config()?;
+    let mut jit_module = JITModule::new(new_jit_builder(env_config)?);
+    load_runtime_support_clif(&mut jit_module, env_config)?;
     Ok(jit_module)
 }
 
@@ -23876,7 +23913,8 @@ fn planned_call_target_specializations_for_batch_function(
         let planned_inputs = load_planned_optimization_inputs_for_runtime_state(
             Some(shared_state),
             Some(session.as_ref()),
-            specialization_mode_from_env()?,
+            session.env_config()?,
+            session.env_config()?.specialization_mode(),
         )?;
         planned_evidence_by_module.insert(module_key, planned_inputs.evidence_by_function);
     }
@@ -23914,6 +23952,7 @@ fn resolve_process_jit_batch_function<'a>(
 impl ProcessJitEngine {
     pub(crate) fn new(compile_session: &crate::session::CompileSession) -> Result<Self, String> {
         Ok(Self {
+            env_config: compile_session.env_config()?.clone(),
             module: ProcessJitModule::new(compile_session)?,
             state: Mutex::new(ProcessJitState::new()),
             vectorcall_trampolines: Mutex::new(HashMap::new()),
@@ -23935,7 +23974,12 @@ impl ProcessJitEngine {
 
         let mut jit_module = self.module.lock_for_serial_phase()?;
         let symbol = format!("__soac_vectorcall_arity_{param_count}");
-        let entry = define_shared_vectorcall_trampoline(&mut jit_module, param_count, &symbol)?;
+        let entry = define_shared_vectorcall_trampoline(
+            &mut jit_module,
+            &self.env_config,
+            param_count,
+            &symbol,
+        )?;
         trampolines.insert(param_count, entry);
         Ok(entry)
     }
@@ -24068,7 +24112,7 @@ impl ProcessJitEngine {
                 worker_metrics: JitBatchWorkerMetrics::default(),
             });
         }
-        let worker_count = jit_batch_worker_count(function_count)?;
+        let worker_count = jit_batch_worker_count(function_count, plan.env_config);
         let dependencies = Self::streaming_batch_direct_dependencies(plan)?;
         let mut remaining_function_ids: HashSet<_> = plan
             .function_indices_to_define
@@ -24232,10 +24276,11 @@ impl ProcessJitEngine {
         session: Arc<crate::session::CompileSession>,
         shared_state: Arc<crate::module_type::SharedModuleState>,
     ) -> Result<(), String> {
-        if !crate::config::background_jit_enabled()? {
+        let env_config = session.env_config()?;
+        if !env_config.background_jit_enabled() {
             return Ok(());
         }
-        if specialization_mode_from_env()?.is_some() {
+        if env_config.specialization_mode().is_some() {
             return Ok(());
         }
         if shared_state.lowered_module.callable_defs.is_empty() {
@@ -24903,13 +24948,20 @@ struct TrivialJumpNormalizationStats {
 
 fn define_prepared_function(
     jit_module: &mut JITModule,
+    env_config: &SoacEnvConfig,
     func_id: FuncId,
     ctx: &mut cranelift_codegen::Context,
     function_name: &str,
     err_prefix: &str,
 ) -> Result<DefinedFunctionArtifact, String> {
-    let compiled =
-        compile_prepared_function_bytes(jit_module, func_id, ctx, function_name, err_prefix)?;
+    let compiled = compile_prepared_function_bytes(
+        jit_module,
+        env_config,
+        func_id,
+        ctx,
+        function_name,
+        err_prefix,
+    )?;
     define_compiled_function_bytes(jit_module, func_id, &compiled, err_prefix)?;
     Ok(compiled.artifact)
 }
@@ -24933,36 +24985,38 @@ fn define_compiled_function_bytes(
 
 fn compile_prepared_function_bytes(
     codegen_env: &mut impl JitCodegenEnv,
+    env_config: &SoacEnvConfig,
     func_id: FuncId,
     ctx: &mut cranelift_codegen::Context,
     function_name: &str,
     err_prefix: &str,
 ) -> Result<CompiledFunctionArtifact, String> {
-    let function_name = if jit_refcount_emission_enabled()? {
+    let function_name = if env_config.jit_refcount_emission_enabled() {
         Cow::Borrowed(function_name)
     } else {
         Cow::Owned(format!("{function_name}:refcounts=off"))
     };
     ctx.func.name = stable_cranelift_function_name(function_name.as_ref());
-    prepare_cranelift_function_for_backend(codegen_env, None, ctx, err_prefix)?;
+    prepare_cranelift_function_for_backend(codegen_env, env_config, None, ctx, err_prefix)?;
     compile_backend_prepared_function_bytes(codegen_env.codegen_isa(), func_id, ctx, err_prefix)
 }
 
 fn compile_prepared_function_bytes_with_isa(
     codegen_env: &mut impl JitCodegenEnv,
+    env_config: &SoacEnvConfig,
     isa: &dyn TargetIsa,
     func_id: FuncId,
     ctx: &mut cranelift_codegen::Context,
     function_name: &str,
     err_prefix: &str,
 ) -> Result<CompiledFunctionArtifact, String> {
-    let function_name = if jit_refcount_emission_enabled()? {
+    let function_name = if env_config.jit_refcount_emission_enabled() {
         Cow::Borrowed(function_name)
     } else {
         Cow::Owned(format!("{function_name}:refcounts=off"))
     };
     ctx.func.name = stable_cranelift_function_name(function_name.as_ref());
-    prepare_cranelift_function_for_backend(codegen_env, Some(isa), ctx, err_prefix)?;
+    prepare_cranelift_function_for_backend(codegen_env, env_config, Some(isa), ctx, err_prefix)?;
     compile_backend_prepared_function_bytes(isa, func_id, ctx, err_prefix)
 }
 
@@ -25011,11 +25065,12 @@ fn compile_backend_prepared_function_bytes(
 
 fn prepare_cranelift_function_for_backend(
     codegen_env: &mut impl JitCodegenEnv,
+    env_config: &SoacEnvConfig,
     isa: Option<&dyn TargetIsa>,
     ctx: &mut cranelift_codegen::Context,
     err_prefix: &str,
 ) -> Result<(), String> {
-    inline_runtime_support_calls(codegen_env, ctx, err_prefix)?;
+    inline_runtime_support_calls(codegen_env, env_config, ctx, err_prefix)?;
     let isa = isa.unwrap_or_else(|| codegen_env.codegen_isa());
     let mut ctrl_plane = ControlPlane::default();
     ctx.optimize(isa, &mut ctrl_plane)
@@ -25398,6 +25453,7 @@ fn stable_cranelift_function_hash(bytes: &[u8]) -> u64 {
 }
 
 fn record_jit_bb_map(
+    env_config: &SoacEnvConfig,
     symbol: &str,
     code_id: u64,
     artifact: &DefinedFunctionArtifact,
@@ -25405,13 +25461,8 @@ fn record_jit_bb_map(
     function_qualname: &str,
     entry_kind: &str,
 ) {
-    let dir = match soac_work_dir_from_env() {
-        Ok(Some(dir)) => dir,
-        Ok(None) => return,
-        Err(err) => {
-            eprintln!("[soac jitdump] invalid SOAC_WORK_DIR: {err}");
-            return;
-        }
+    let Some(dir) = env_config.soac_work_dir() else {
+        return;
     };
     let path = dir.join("jit-bb-map.jsonl");
     let record = serde_json::json!({
@@ -25473,7 +25524,10 @@ struct RuntimeSupportInliner {
 }
 
 impl RuntimeSupportInliner {
-    fn for_module(codegen_env: &mut impl JitCodegenEnv) -> Result<Self, String> {
+    fn for_module(
+        codegen_env: &mut impl JitCodegenEnv,
+        env_config: &SoacEnvConfig,
+    ) -> Result<Self, String> {
         let library = runtime_support_library()?;
         let local_runtime_symbols = runtime_support_local_symbols(&library);
         let mut import_func_ids = HashMap::new();
@@ -25503,7 +25557,8 @@ impl RuntimeSupportInliner {
                 &parsed.function.signature,
                 "inlineable runtime CLIF function",
             )?;
-            let mut function = if should_inline_refcount_as_noop(parsed.symbol.as_str())? {
+            let mut function = if should_inline_refcount_as_noop(env_config, parsed.symbol.as_str())
+            {
                 build_noop_runtime_support_function(func_id, &parsed.function.signature)
             } else {
                 parsed.function.clone()
@@ -25528,12 +25583,12 @@ impl RuntimeSupportInliner {
     }
 }
 
-fn should_inline_refcount_as_noop(symbol: &str) -> Result<bool, String> {
-    Ok(!jit_refcount_emission_enabled()?
+fn should_inline_refcount_as_noop(env_config: &SoacEnvConfig, symbol: &str) -> bool {
+    !env_config.jit_refcount_emission_enabled()
         && matches!(
             symbol,
             SOAC_RUNTIME_INCREF_SYMBOL | SOAC_RUNTIME_DECREF_SYMBOL
-        ))
+        )
 }
 
 fn build_noop_runtime_support_function(func_id: FuncId, signature: &ir::Signature) -> ir::Function {
@@ -25581,10 +25636,11 @@ impl Inline for RuntimeSupportInliner {
 
 fn inline_runtime_support_calls(
     codegen_env: &mut impl JitCodegenEnv,
+    env_config: &SoacEnvConfig,
     ctx: &mut cranelift_codegen::Context,
     err_prefix: &str,
 ) -> Result<bool, String> {
-    let mut inliner = RuntimeSupportInliner::for_module(codegen_env)?;
+    let mut inliner = RuntimeSupportInliner::for_module(codegen_env, env_config)?;
     ctx.inline(&mut inliner)
         .map_err(|err| format!("{err_prefix}: failed to inline runtime support calls: {err:?}"))
 }
@@ -26231,7 +26287,10 @@ fn remap_runtime_clif_extern_user_names(
     Ok(())
 }
 
-fn load_runtime_support_clif(jit_module: &mut JITModule) -> Result<(), String> {
+fn load_runtime_support_clif(
+    jit_module: &mut JITModule,
+    env_config: &SoacEnvConfig,
+) -> Result<(), String> {
     let library = runtime_support_library()?;
     let local_runtime_symbols = runtime_support_local_symbols(&library);
     let mut import_func_ids = HashMap::new();
@@ -26267,6 +26326,7 @@ fn load_runtime_support_clif(jit_module: &mut JITModule) -> Result<(), String> {
         ctx.func = function;
         let _ = define_prepared_function(
             jit_module,
+            env_config,
             func_id,
             &mut ctx,
             &parsed.symbol,
@@ -26443,6 +26503,7 @@ pub struct PrecompileOptimizationPlanInput<'a> {
 
 fn compile_runtime_support_clif_for_object(
     jit_module: &mut JITModule,
+    env_config: &SoacEnvConfig,
     object_isa: &dyn TargetIsa,
 ) -> Result<Vec<ObjectFunctionDefinition>, String> {
     let library = runtime_support_library()?;
@@ -26481,6 +26542,7 @@ fn compile_runtime_support_clif_for_object(
         ctx.func = function;
         let compiled = compile_prepared_function_bytes_with_isa(
             jit_module,
+            env_config,
             object_isa,
             func_id,
             &mut ctx,
@@ -26565,11 +26627,12 @@ fn precompile_codegen_module_to_object_bytes(
     module_index: Option<&PrecompileModuleIndex>,
 ) -> Result<PrecompiledObjectBytes, String> {
     let compile_session = crate::session::CompileSession::new();
-    let object_isa = CraneliftTargetConfig::object_from_env()?.build_isa()?;
-    let builder = new_jit_builder()?;
+    let env_config = compile_session.env_config()?;
+    let object_isa = CraneliftTargetConfig::object(env_config).build_isa()?;
+    let builder = new_jit_builder(env_config)?;
     let mut jit_module = JITModule::new(builder);
     let mut function_definitions =
-        compile_runtime_support_clif_for_object(&mut jit_module, object_isa.as_ref())?;
+        compile_runtime_support_clif_for_object(&mut jit_module, env_config, object_isa.as_ref())?;
 
     let module_constants = ModuleCodegenConstants::collect_from_module(module);
     let module_constant_ptrs = placeholder_module_constant_ptrs(module_constants.len());
@@ -26682,14 +26745,19 @@ fn precompile_codegen_module_to_object_bytes(
     }
 
     let planned_inputs = planned_optimization_inputs_for_precompile(
+        env_config,
         optimization_plan,
         module_index,
         module_name,
         source_hash,
         module,
     )?;
-    let specialization_profile =
-        SpecializationProfile::from_precompile(module_name, counter_dump_path, planned_inputs)?;
+    let specialization_profile = SpecializationProfile::from_precompile(
+        env_config,
+        module_name,
+        counter_dump_path,
+        planned_inputs,
+    )?;
     let jit_module_plan = build_profiled_jit_module_plan(
         module,
         &specialization_profile,
@@ -26788,6 +26856,7 @@ fn precompile_codegen_module_to_object_bytes(
         let mut ctx = built.ctx;
         let compiled = compile_prepared_function_bytes_with_isa(
             &mut jit_module,
+            env_config,
             object_isa.as_ref(),
             built.main_id,
             &mut ctx,
@@ -26827,6 +26896,7 @@ fn precompile_codegen_module_to_object_bytes(
                 })?;
                 let compiled = compile_prepared_function_bytes_with_isa(
                     &mut jit_module,
+                    env_config,
                     object_isa.as_ref(),
                     default_adapter_id,
                     &mut default_ctx,
@@ -27047,6 +27117,7 @@ pub fn run_cranelift_smoke(module: &BlockPyModule<CodegenModuleShape>) -> Result
 
     let compile_session = crate::session::CompileSession::new();
     let mut jit_module = new_jit_module(&compile_session)?;
+    let env_config = compile_session.env_config()?;
     let mut ctx = jit_module.codegen_make_context();
     ctx.func
         .signature
@@ -27066,6 +27137,7 @@ pub fn run_cranelift_smoke(module: &BlockPyModule<CodegenModuleShape>) -> Result
     let function_id = declare_local_fn(&mut jit_module, "dp_jit_smoke", &ctx.func.signature)?;
     let _ = define_prepared_function(
         &mut jit_module,
+        env_config,
         function_id,
         &mut ctx,
         "jit-smoke",
@@ -27329,6 +27401,7 @@ fn build_cranelift_run_bb_specialized_function(
     predeclared_direct_functions: Option<&HashMap<RuntimeFunctionId, DeclaredJitFunction>>,
     options: BuildSpecializedFunctionOptions,
 ) -> Result<BuiltSpecializedFunction, String> {
+    let env_config = compile_session.env_config()?;
     let block_count = function.blocks.len();
     if block_count == 0 {
         return Err(format!("specialized JIT run_bb plan has no blocks"));
@@ -27584,6 +27657,7 @@ fn build_cranelift_run_bb_specialized_function(
         })?;
         build_counted_runtime_refcount_helpers(
             jit_module,
+            compile_session.env_config()?,
             function,
             counter_defs,
             counter_slots_by_id,
@@ -27809,7 +27883,7 @@ fn build_cranelift_run_bb_specialized_function(
             &mut fb.func,
             &SOAC_RUNTIME_LOAD_GLOBAL_SLOW_IMPORT,
         );
-        let guard_miss_deopt_stub_ref = (jit_refcount_emission_enabled()?
+        let guard_miss_deopt_stub_ref = (env_config.jit_refcount_emission_enabled()
             && (options.guard_miss_deopt_stub || guard_miss_deopt_stub))
             .then(|| {
                 func_imports.get_or_panic(codegen_env, &mut fb.func, &DP_JIT_DEOPT_RESUME_IMPORT)
@@ -28552,7 +28626,7 @@ pub unsafe fn render_instr_typed_for_codegen_with_runtime_state(
     function: &soac_core::block_py::BlockPyFunction<CodegenModuleShape>,
     runtime_state: Option<&SharedModuleState>,
 ) -> Result<String, String> {
-    let builder = new_jit_builder()?;
+    let builder = new_jit_builder(compile_session.env_config()?)?;
     let mut jit_module = JITModule::new(builder);
     let specialization_profile = SpecializationProfile::from_runtime_state_with_session(
         runtime_state,
@@ -28694,7 +28768,7 @@ pub unsafe fn render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
         return Err("specialized JIT run_bb requires at least one block".to_string());
     }
 
-    let builder = new_jit_builder()?;
+    let builder = new_jit_builder(compile_session.env_config()?)?;
     let mut jit_module = JITModule::new(builder);
     let specialization_profile = SpecializationProfile::from_runtime_state_with_session(
         runtime_state,
@@ -28871,6 +28945,7 @@ pub unsafe fn render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
     );
     let (compiled_clif, cfg_dot, vcode_disasm) = render_compiled_clif_and_vcode_disasm(
         &mut jit_module,
+        compile_session.env_config()?,
         built.ctx,
         &built.import_id_to_symbol,
         &built.block_annotations,
@@ -28905,12 +28980,14 @@ fn render_pre_inline_clif_for_inspection(
 
 fn render_compiled_clif_and_vcode_disasm(
     jit_module: &mut JITModule,
+    env_config: &SoacEnvConfig,
     mut ctx: cranelift_codegen::Context,
     import_id_to_symbol: &HashMap<u32, &'static str>,
     block_annotations: &ClifBlockDisplayAnnotations,
 ) -> Result<(String, String, String), String> {
     prepare_cranelift_function_for_backend(
         jit_module,
+        env_config,
         None,
         &mut ctx,
         "failed to render specialized jit run_bb function",
@@ -29037,6 +29114,7 @@ fn compiled_direct_deopt_table(
 
 fn define_shared_vectorcall_trampoline(
     jit_module: &mut JITModule,
+    env_config: &SoacEnvConfig,
     param_count: usize,
     symbol_name: &str,
 ) -> Result<VectorcallEntryFn, String> {
@@ -29332,6 +29410,7 @@ fn define_shared_vectorcall_trampoline(
 
     let main_artifact = define_prepared_function(
         jit_module,
+        env_config,
         main_id,
         &mut ctx,
         &format!("direct-vectorcall-trampoline:{param_count}"),

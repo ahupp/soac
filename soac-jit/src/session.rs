@@ -1,5 +1,6 @@
 use crate::jit::ProcessJitEngine;
 use crate::module_type::SharedModuleState;
+use soac_config::SoacEnvConfig;
 use soac_core::block_py::{BlockPyFunction, ModuleNameGen, RuntimeFunctionId};
 use soac_lowering::passes::CodegenModuleShape;
 use std::collections::HashMap;
@@ -28,6 +29,7 @@ pub struct CompileSession {
     next_module_id: AtomicU32,
     shared_module_states: Mutex<SharedModuleStateRegistry>,
     process_jit: OnceLock<Result<ProcessJitEngine, String>>,
+    env_config: OnceLock<Result<SoacEnvConfig, String>>,
 }
 
 #[derive(Default)]
@@ -80,6 +82,7 @@ impl CompileSession {
             next_module_id: AtomicU32::new(1),
             shared_module_states: Mutex::new(SharedModuleStateRegistry::default()),
             process_jit: OnceLock::new(),
+            env_config: OnceLock::new(),
         }
     }
 
@@ -93,6 +96,13 @@ impl CompileSession {
 
     pub fn module_name_gen(&self) -> ModuleNameGen {
         ModuleNameGen::new(self.next_module_id.fetch_add(1, Ordering::Relaxed))
+    }
+
+    pub fn env_config(&self) -> Result<&SoacEnvConfig, String> {
+        match self.env_config.get_or_init(SoacEnvConfig::from_env) {
+            Ok(config) => Ok(config),
+            Err(err) => Err(err.clone()),
+        }
     }
 
     pub(crate) fn process_jit(&self) -> Result<&ProcessJitEngine, String> {

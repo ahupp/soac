@@ -416,10 +416,6 @@ fn parse_cranelift_opt_level(raw: &str) -> Result<String, String> {
     }
 }
 
-pub fn cranelift_opt_level_from_env() -> Result<String, String> {
-    Ok(SoacEnvConfig::from_env()?.cranelift_opt_level().to_string())
-}
-
 fn parse_optional_cranelift_opt_level(raw: Option<&str>) -> Result<String, String> {
     let Some(raw) = raw else {
         return Ok("speed".to_string());
@@ -472,76 +468,8 @@ fn parse_optional_positive_usize(name: &str, raw: Option<&str>) -> Result<Option
     Ok(Some(value))
 }
 
-pub fn specialization_mode_from_env() -> Result<Option<SpecializationMode>, String> {
-    Ok(SoacEnvConfig::from_env()?.specialization_mode())
-}
-
-pub fn optimization_plan_mode_from_env() -> Result<OptimizationPlanMode, String> {
-    Ok(SoacEnvConfig::from_env()?.optimization_plan_mode())
-}
-
-pub fn soac_work_dir_from_env() -> Result<Option<PathBuf>, String> {
-    Ok(SoacEnvConfig::from_env()?
-        .soac_work_dir()
-        .map(Path::to_path_buf))
-}
-
-pub fn counter_dump_input_path_from_env() -> Result<Option<PathBuf>, String> {
-    Ok(SoacEnvConfig::from_env()?.counter_dump_input_path())
-}
-
-pub fn counter_dump_output_path_from_env() -> Result<Option<PathBuf>, String> {
-    Ok(SoacEnvConfig::from_env()?.counter_dump_output_path())
-}
-
-pub fn profiled_cold_blocks_enabled_from_env() -> Result<bool, String> {
-    Ok(SoacEnvConfig::from_env()?.profiled_cold_blocks_enabled())
-}
-
-pub fn opt_v3_validation_enabled_from_env() -> Result<bool, String> {
-    Ok(SoacEnvConfig::from_env()?.opt_v3_validation_enabled())
-}
-
-pub fn jit_refcount_emission_enabled_from_env() -> Result<bool, String> {
-    Ok(SoacEnvConfig::from_env()?.jit_refcount_emission_enabled())
-}
-
-pub fn module_cache_root_from_env() -> Result<Option<PathBuf>, String> {
-    Ok(SoacEnvConfig::from_env()?.module_cache_root())
-}
-
 pub fn precompiled_library_path_from_env() -> Result<Option<PathBuf>, String> {
     env_path(SOAC_PRECOMPILED_LIBRARY_ENV)
-}
-
-pub fn compile_mode_from_env() -> Result<CompileMode, String> {
-    Ok(SoacEnvConfig::from_env()?.compile_mode())
-}
-
-pub fn eager_clif_compile_requested_from_env() -> Result<bool, String> {
-    Ok(SoacEnvConfig::from_env()?.eager_clif_compile_requested())
-}
-
-pub fn background_jit_enabled_from_env() -> Result<bool, String> {
-    Ok(SoacEnvConfig::from_env()?.background_jit_enabled())
-}
-
-pub fn jit_compile_workers_from_env() -> Result<Option<usize>, String> {
-    Ok(SoacEnvConfig::from_env()?.jit_compile_workers())
-}
-
-pub fn jit_perf_helper_frames_enabled_from_env() -> Result<bool, String> {
-    Ok(SoacEnvConfig::from_env()?.jit_perf_helper_frames_enabled())
-}
-
-pub fn soac_exec_trace_from_env() -> Result<Option<String>, String> {
-    Ok(SoacEnvConfig::from_env()?
-        .soac_exec_trace()
-        .map(ToString::to_string))
-}
-
-pub fn soac_log_config_from_env() -> Result<SoacLogConfig, String> {
-    Ok(SoacEnvConfig::from_env()?.soac_log().clone())
 }
 
 fn parse_soac_log_config(
@@ -580,10 +508,6 @@ fn parse_soac_log_config(
         filter: filter_segments.join(","),
         json_path,
     })
-}
-
-pub fn specialization_runtime_logging_enabled_from_env() -> Result<bool, String> {
-    Ok(SoacEnvConfig::from_env()?.specialization_runtime_logging_enabled())
 }
 
 #[cfg(test)]
