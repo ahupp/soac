@@ -165,6 +165,15 @@ pub enum Rep {
     I64,
 }
 
+impl Rep {
+    pub const fn is_python_object(self) -> bool {
+        matches!(
+            self,
+            Self::PyObjectOwned | Self::PyObjectBorrowed | Self::PyObjectImmortal
+        )
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PlannedConstant {
     I64(i64),
@@ -551,6 +560,7 @@ fn validate_region_plan(
                 for input in &operation.inputs {
                     check_input(region.id, *input, &available_values, errors);
                 }
+                validate_operation(region.id, operation, errors);
                 validate_failure_mode(
                     region.id,
                     &operation.failure,
@@ -682,13 +692,7 @@ fn validate_conversion(
     seen_node_ids: &HashSet<PlanNodeId>,
     errors: &mut Vec<String>,
 ) {
-    let Some(rule) = conversion_rule(convert.kind) else {
-        errors.push(format!(
-            "region {region:?} has no conversion rule for {:?}",
-            convert.kind
-        ));
-        return;
-    };
+    let rule = conversion_signature(convert.kind);
     if convert.input.rep != rule.input {
         errors.push(format!(
             "region {region:?} conversion {:?} expects input {:?}, got {:?}",
@@ -742,7 +746,7 @@ fn validate_conversion(
 fn validate_conversion_failure(
     region: RegionId,
     convert: &ConvertNode,
-    rule: ConversionRule,
+    rule: ConversionSignature,
     errors: &mut Vec<String>,
 ) {
     match rule.failure {
@@ -770,6 +774,142 @@ fn validate_materialize(region: RegionId, materialize: &MaterializeNode, errors:
             "region {region:?} materialization {:?} expects {:?}->{:?}, got {:?}->{:?}",
             materialize.kind, expected.0, expected.1, materialize.input.rep, materialize.output.rep
         ));
+    }
+}
+
+fn validate_operation(region: RegionId, operation: &OperationNode, errors: &mut Vec<String>) {
+    match &operation.op {
+        PlannedOp::PyNumberAdd => {
+            validate_python_operation_inputs(region, operation, 2, "PyNumberAdd", errors);
+            validate_operation_output(
+                region,
+                operation,
+                Some(Rep::PyObjectOwned),
+                "PyNumberAdd",
+                errors,
+            );
+        }
+        PlannedOp::PyObjectRichCompare { .. } => {
+            validate_python_operation_inputs(region, operation, 2, "PyObjectRichCompare", errors);
+            validate_operation_output(
+                region,
+                operation,
+                Some(Rep::PyObjectOwned),
+                "PyObjectRichCompare",
+                errors,
+            );
+        }
+        PlannedOp::PyObjectIsTrue => {
+            validate_python_operation_inputs(region, operation, 1, "PyObjectIsTrue", errors);
+            validate_operation_output(
+                region,
+                operation,
+                Some(Rep::I32Bool01),
+                "PyObjectIsTrue",
+                errors,
+            );
+        }
+        PlannedOp::CheckedI64Add => {
+            validate_exact_inputs(
+                region,
+                operation,
+                &[Rep::I64, Rep::I64],
+                "CheckedI64Add",
+                errors,
+            );
+            validate_operation_output(region, operation, Some(Rep::I64), "CheckedI64Add", errors);
+        }
+        PlannedOp::I64CompareToBool01 { .. } => {
+            validate_exact_inputs(
+                region,
+                operation,
+                &[Rep::I64, Rep::I64],
+                "I64CompareToBool01",
+                errors,
+            );
+            validate_operation_output(
+                region,
+                operation,
+                Some(Rep::I32Bool01),
+                "I64CompareToBool01",
+                errors,
+            );
+        }
+        PlannedOp::DirectHelper { .. } => {}
+    }
+}
+
+fn validate_python_operation_inputs(
+    region: RegionId,
+    operation: &OperationNode,
+    arity: usize,
+    name: &str,
+    errors: &mut Vec<String>,
+) {
+    if operation.inputs.len() != arity {
+        errors.push(format!(
+            "region {region:?} operation {name} expects {arity} inputs, got {}",
+            operation.inputs.len()
+        ));
+        return;
+    }
+    for (index, input) in operation.inputs.iter().enumerate() {
+        if !input.rep.is_python_object() {
+            errors.push(format!(
+                "region {region:?} operation {name} input {index} expects a Python object rep, got {:?}",
+                input.rep
+            ));
+        }
+    }
+}
+
+fn validate_exact_inputs(
+    region: RegionId,
+    operation: &OperationNode,
+    expected: &[Rep],
+    name: &str,
+    errors: &mut Vec<String>,
+) {
+    if operation.inputs.len() != expected.len() {
+        errors.push(format!(
+            "region {region:?} operation {name} expects {} inputs, got {}",
+            expected.len(),
+            operation.inputs.len()
+        ));
+        return;
+    }
+    for (index, (input, expected_rep)) in operation.inputs.iter().zip(expected.iter()).enumerate() {
+        if input.rep != *expected_rep {
+            errors.push(format!(
+                "region {region:?} operation {name} input {index} expects {:?}, got {:?}",
+                expected_rep, input.rep
+            ));
+        }
+    }
+}
+
+fn validate_operation_output(
+    region: RegionId,
+    operation: &OperationNode,
+    expected: Option<Rep>,
+    name: &str,
+    errors: &mut Vec<String>,
+) {
+    match (operation.output, expected) {
+        (Some(output), Some(expected_rep)) if output.rep == expected_rep => {}
+        (Some(output), Some(expected_rep)) => errors.push(format!(
+            "region {region:?} operation {name} output expects {:?}, got {:?}",
+            expected_rep, output.rep
+        )),
+        (None, Some(expected_rep)) => errors.push(format!(
+            "region {region:?} operation {name} expects output {:?}, got no output",
+            expected_rep
+        )),
+        (Some(output), None) => errors.push(format!(
+            "region {region:?} operation {name} expects no output, got {:?}",
+            output.rep
+        )),
+        (None, None) => {}
     }
 }
 
@@ -902,59 +1042,59 @@ fn validate_exit_target(
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-struct ConversionRule {
-    input: Rep,
-    output: Rep,
-    precondition: ConversionPreconditionRule,
-    failure: ConversionFailureRule,
-    ownership: ConversionOwnership,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConversionSignature {
+    pub input: Rep,
+    pub output: Rep,
+    pub precondition: ConversionPreconditionRule,
+    pub failure: ConversionFailureRule,
+    pub ownership: ConversionOwnership,
 }
 
-#[derive(Clone, Copy, Debug)]
-enum ConversionPreconditionRule {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConversionPreconditionRule {
     Infallible,
     FactsOrGuard,
 }
 
-#[derive(Clone, Copy, Debug)]
-enum ConversionFailureRule {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConversionFailureRule {
     CannotFail,
     MayRaise,
     SpecializationMiss,
 }
 
-fn conversion_rule(kind: ConversionKind) -> Option<ConversionRule> {
-    Some(match kind {
-        ConversionKind::FromPythonLongCompactToI64 => ConversionRule {
+pub fn conversion_signature(kind: ConversionKind) -> ConversionSignature {
+    match kind {
+        ConversionKind::FromPythonLongCompactToI64 => ConversionSignature {
             input: Rep::PyObjectBorrowed,
             output: Rep::I64,
             precondition: ConversionPreconditionRule::FactsOrGuard,
             failure: ConversionFailureRule::SpecializationMiss,
             ownership: ConversionOwnership::BorrowInput,
         },
-        ConversionKind::ToPythonLongOwned => ConversionRule {
+        ConversionKind::ToPythonLongOwned => ConversionSignature {
             input: Rep::I64,
             output: Rep::PyObjectOwned,
             precondition: ConversionPreconditionRule::Infallible,
             failure: ConversionFailureRule::MayRaise,
             ownership: ConversionOwnership::MaterializeOwned,
         },
-        ConversionKind::ToPythonBoolImmortal => ConversionRule {
+        ConversionKind::ToPythonBoolImmortal => ConversionSignature {
             input: Rep::I32Bool01,
             output: Rep::PyObjectImmortal,
             precondition: ConversionPreconditionRule::Infallible,
             failure: ConversionFailureRule::CannotFail,
             ownership: ConversionOwnership::Preserve,
         },
-        ConversionKind::TruthinessToI32Bool01 => ConversionRule {
+        ConversionKind::TruthinessToI32Bool01 => ConversionSignature {
             input: Rep::PyObjectOwned,
             output: Rep::I32Bool01,
             precondition: ConversionPreconditionRule::Infallible,
             failure: ConversionFailureRule::MayRaise,
             ownership: ConversionOwnership::ConsumeOwned,
         },
-    })
+    }
 }
 
 fn finish_validation(errors: Vec<String>) -> Result<(), PlanValidationError> {
