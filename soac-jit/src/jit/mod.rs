@@ -1055,6 +1055,21 @@ static PYNUMBER_MULTIPLY_IMPORT: ImportSpec = ImportSpec::new(
     &[SigType::Pointer, SigType::Pointer],
     &[SigType::Pointer],
 );
+static PYNUMBER_AND_IMPORT: ImportSpec = ImportSpec::new(
+    "PyNumber_And",
+    &[SigType::Pointer, SigType::Pointer],
+    &[SigType::Pointer],
+);
+static PYNUMBER_OR_IMPORT: ImportSpec = ImportSpec::new(
+    "PyNumber_Or",
+    &[SigType::Pointer, SigType::Pointer],
+    &[SigType::Pointer],
+);
+static PYNUMBER_XOR_IMPORT: ImportSpec = ImportSpec::new(
+    "PyNumber_Xor",
+    &[SigType::Pointer, SigType::Pointer],
+    &[SigType::Pointer],
+);
 static PYOBJECT_RICHCOMPARE_IMPORT: ImportSpec = ImportSpec::new(
     "PyObject_RichCompare",
     &[SigType::Pointer, SigType::Pointer, SigType::I32],
@@ -1191,6 +1206,9 @@ static JIT_RUNTIME_IMPORT_SPECS: &[&ImportSpec] = &[
     &PYNUMBER_ADD_IMPORT,
     &PYNUMBER_SUBTRACT_IMPORT,
     &PYNUMBER_MULTIPLY_IMPORT,
+    &PYNUMBER_AND_IMPORT,
+    &PYNUMBER_OR_IMPORT,
+    &PYNUMBER_XOR_IMPORT,
     &PYOBJECT_RICHCOMPARE_IMPORT,
     &PYLONG_FROM_LONGLONG_IMPORT,
     &DP_JIT_RECORD_TOP_VALUE_SAMPLE_IMPORT,
@@ -22179,7 +22197,10 @@ fn emit_opt_v3_mechanical_operation(
     match op {
         MechanicalOperation::PyNumberAdd
         | MechanicalOperation::PyNumberSubtract
-        | MechanicalOperation::PyNumberMultiply => {
+        | MechanicalOperation::PyNumberMultiply
+        | MechanicalOperation::PyNumberBitAnd
+        | MechanicalOperation::PyNumberBitOr
+        | MechanicalOperation::PyNumberBitXor => {
             let (op_name, import) = match op {
                 MechanicalOperation::PyNumberAdd => ("PyNumberAdd", &PYNUMBER_ADD_IMPORT),
                 MechanicalOperation::PyNumberSubtract => {
@@ -22188,6 +22209,9 @@ fn emit_opt_v3_mechanical_operation(
                 MechanicalOperation::PyNumberMultiply => {
                     ("PyNumberMultiply", &PYNUMBER_MULTIPLY_IMPORT)
                 }
+                MechanicalOperation::PyNumberBitAnd => ("PyNumberBitAnd", &PYNUMBER_AND_IMPORT),
+                MechanicalOperation::PyNumberBitOr => ("PyNumberBitOr", &PYNUMBER_OR_IMPORT),
+                MechanicalOperation::PyNumberBitXor => ("PyNumberBitXor", &PYNUMBER_XOR_IMPORT),
                 _ => unreachable!("matched PyNumber binary operation"),
             };
             let output = output.ok_or_else(|| {
@@ -22305,6 +22329,28 @@ fn emit_opt_v3_mechanical_operation(
             );
             fb.switch_to_block(ok_block);
             let result = fb.block_params(ok_block)[0];
+            opt_v3_store_mechanical_value(values, output, OptV3MechanicalValue::I64(result))
+        }
+        MechanicalOperation::I64BitAnd
+        | MechanicalOperation::I64BitOr
+        | MechanicalOperation::I64BitXor => {
+            let output = output.ok_or_else(|| {
+                format!("optimizer v3 region {region:?} node {node:?} {op:?} has no output")
+            })?;
+            if inputs.len() != 2 {
+                return Err(format!(
+                    "optimizer v3 region {region:?} node {node:?} {op:?} expects two inputs, got {}",
+                    inputs.len()
+                ));
+            }
+            let lhs = opt_v3_i64_value(values, inputs[0])?;
+            let rhs = opt_v3_i64_value(values, inputs[1])?;
+            let result = match op {
+                MechanicalOperation::I64BitAnd => fb.ins().band(lhs, rhs),
+                MechanicalOperation::I64BitOr => fb.ins().bor(lhs, rhs),
+                MechanicalOperation::I64BitXor => fb.ins().bxor(lhs, rhs),
+                _ => unreachable!("matched i64 bitwise operation"),
+            };
             opt_v3_store_mechanical_value(values, output, OptV3MechanicalValue::I64(result))
         }
         MechanicalOperation::I64CompareToBool01 { op } => {

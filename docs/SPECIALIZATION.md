@@ -31,8 +31,8 @@ evidence. Do not extend that bridge as the primary path.
 
 The represented slices are exact-compact-`int` direct comparison branches such
 as `a < b`, add-then-compare-to-zero branches such as `a + b > 0`,
-value-producing add/sub/mul returns such as `return a + b`, and
-value-producing comparison returns such as `return a < b`:
+value-producing add/sub/mul/bitwise returns such as `return a + b` or
+`return a & b`, and value-producing comparison returns such as `return a < b`:
 `operator_hot_shapes` exact-int evidence proves the operands, a lowered module
 constant load proves `0` where needed, the v3 planner emits hot checked-`i64`
 operation regions plus local generic Python fallback regions, materializes
@@ -47,12 +47,12 @@ planner rule, validation, and mechanical-emitter coverage first.
 Current migration surface:
 
 - Live v3 codegen: exact-int direct-compare and add/compare branch slices with
-  local generic fallback, exact-int add/sub/mul returns with explicit PythonLong
-  materialization, and exact-int comparison returns with explicit Python bool
-  materialization.
-- Legacy only: division/modulo/shift, bitwise, and unary exact-int
-  value-producing operators, profiled direct calls, exact-list getitem/setitem,
-  indexed globals, and indexed fields.
+  local generic fallback, exact-int add/sub/mul/bitwise returns with explicit
+  PythonLong materialization, and exact-int comparison returns with explicit
+  Python bool materialization.
+- Legacy only: division/modulo/shift and unary exact-int value-producing
+  operators, profiled direct calls, exact-list getitem/setitem, indexed globals,
+  and indexed fields.
 - Not currently a v3 semantic-plan target: branch locality and cold block
   layout hints. These remain layout metadata unless a future CFG-placement plan
   needs to represent them.

@@ -304,11 +304,17 @@ pub enum PlannedOp {
     PyNumberAdd,
     PyNumberSubtract,
     PyNumberMultiply,
+    PyNumberBitAnd,
+    PyNumberBitOr,
+    PyNumberBitXor,
     PyObjectRichCompare { op: RichCompareOp },
     PyObjectIsTrue,
     CheckedI64Add,
     CheckedI64Sub,
     CheckedI64Mul,
+    I64BitAnd,
+    I64BitOr,
+    I64BitXor,
     I64CompareToBool01 { op: RichCompareOp },
     DirectHelper { name: String },
 }
@@ -841,7 +847,12 @@ fn validate_materialize(region: RegionId, materialize: &MaterializeNode, errors:
 
 fn validate_operation(region: RegionId, operation: &OperationNode, errors: &mut Vec<String>) {
     match &operation.op {
-        PlannedOp::PyNumberAdd | PlannedOp::PyNumberSubtract | PlannedOp::PyNumberMultiply => {
+        PlannedOp::PyNumberAdd
+        | PlannedOp::PyNumberSubtract
+        | PlannedOp::PyNumberMultiply
+        | PlannedOp::PyNumberBitAnd
+        | PlannedOp::PyNumberBitOr
+        | PlannedOp::PyNumberBitXor => {
             validate_python_operation_inputs(region, operation, 2, "PyNumberBinary", errors);
             validate_operation_output(
                 region,
@@ -871,35 +882,20 @@ fn validate_operation(region: RegionId, operation: &OperationNode, errors: &mut 
                 errors,
             );
         }
-        PlannedOp::CheckedI64Add => {
+        PlannedOp::CheckedI64Add
+        | PlannedOp::CheckedI64Sub
+        | PlannedOp::CheckedI64Mul
+        | PlannedOp::I64BitAnd
+        | PlannedOp::I64BitOr
+        | PlannedOp::I64BitXor => {
             validate_exact_inputs(
                 region,
                 operation,
                 &[Rep::I64, Rep::I64],
-                "CheckedI64Add",
+                "I64Binary",
                 errors,
             );
-            validate_operation_output(region, operation, Some(Rep::I64), "CheckedI64Add", errors);
-        }
-        PlannedOp::CheckedI64Sub => {
-            validate_exact_inputs(
-                region,
-                operation,
-                &[Rep::I64, Rep::I64],
-                "CheckedI64Sub",
-                errors,
-            );
-            validate_operation_output(region, operation, Some(Rep::I64), "CheckedI64Sub", errors);
-        }
-        PlannedOp::CheckedI64Mul => {
-            validate_exact_inputs(
-                region,
-                operation,
-                &[Rep::I64, Rep::I64],
-                "CheckedI64Mul",
-                errors,
-            );
-            validate_operation_output(region, operation, Some(Rep::I64), "CheckedI64Mul", errors);
+            validate_operation_output(region, operation, Some(Rep::I64), "I64Binary", errors);
         }
         PlannedOp::I64CompareToBool01 { .. } => {
             validate_exact_inputs(

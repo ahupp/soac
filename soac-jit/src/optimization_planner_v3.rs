@@ -117,7 +117,7 @@ fn plan_compact_int_branch(
     if let Some(planned) = plan_compact_int_compare_return(catalog, region, facts)? {
         return Ok(Some(planned));
     }
-    plan_compact_int_arithmetic_return(catalog, region, facts)
+    plan_compact_int_binary_return(catalog, region, facts)
 }
 
 fn plan_compact_int_add_gt_zero_branch(
@@ -259,16 +259,16 @@ fn plan_compact_int_add_gt_zero_branch(
     Ok(Some(vec![hot_region, fallback_region]))
 }
 
-fn plan_compact_int_arithmetic_return(
+fn plan_compact_int_binary_return(
     catalog: &AlternativeCatalog,
     region: &ExtractedRegion,
     facts: &PlannerFacts,
 ) -> Result<Option<Vec<RegionPlan>>, String> {
-    let Some(shape) = match_compact_int_arithmetic_return(region, facts) else {
+    let Some(shape) = match_compact_int_binary_return(region, facts) else {
         return Ok(None);
     };
-    let arithmetic = required_alternative(catalog, shape.arithmetic.exact_id)?;
-    let generic_arithmetic = required_alternative(catalog, shape.arithmetic.generic_id)?;
+    let operation = required_alternative(catalog, shape.operation.exact_id)?;
+    let generic_operation = required_alternative(catalog, shape.operation.generic_id)?;
 
     let fallback_region_id = RegionId(region.id.0 + 1);
     let failure_targets =
@@ -293,13 +293,13 @@ fn plan_compact_int_arithmetic_return(
             region_input(b_obj, 1, shape.right_name.clone()),
         ],
         nodes: vec![
-            guard_node(arithmetic, 0, 0, a_obj, &failure_targets),
-            guard_node(arithmetic, 1, 1, b_obj, &failure_targets),
+            guard_node(operation, 0, 0, a_obj, &failure_targets),
+            guard_node(operation, 1, 1, b_obj, &failure_targets),
             unbox_node(2, a_obj, a_i64, 0, fallback_region_id),
             unbox_node(3, b_obj, b_i64, 1, fallback_region_id),
             operation_node(
                 4,
-                arithmetic,
+                operation,
                 vec![a_i64, b_i64],
                 Some(result_i64),
                 &failure_targets,
@@ -323,7 +323,7 @@ fn plan_compact_int_arithmetic_return(
     let fallback_region = RegionPlan {
         id: fallback_region_id,
         source: RegionSource::Synthetic {
-            reason: "generic fallback for compact-int arithmetic return".to_string(),
+            reason: "generic fallback for compact-int binary return".to_string(),
         },
         inputs: vec![
             region_input(a_obj, 0, shape.left_name),
@@ -331,7 +331,7 @@ fn plan_compact_int_arithmetic_return(
         ],
         nodes: vec![operation_node(
             20,
-            generic_arithmetic,
+            generic_operation,
             vec![a_obj, b_obj],
             Some(fallback_sum),
             &failure_targets,
@@ -566,7 +566,7 @@ struct CompactIntReturnShape {
     source: Option<InstrId>,
     left_name: String,
     right_name: String,
-    arithmetic: ArithmeticAlternativeSpec,
+    operation: BinaryReturnAlternativeSpec,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -584,7 +584,7 @@ struct CompareAlternativeSpec {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ArithmeticAlternativeSpec {
+struct BinaryReturnAlternativeSpec {
     generic_id: &'static str,
     exact_id: &'static str,
 }
@@ -637,7 +637,7 @@ fn match_compact_int_add_gt_zero_branch(
     })
 }
 
-fn match_compact_int_arithmetic_return(
+fn match_compact_int_binary_return(
     region: &ExtractedRegion,
     facts: &PlannerFacts,
 ) -> Option<CompactIntReturnShape> {
@@ -648,7 +648,7 @@ fn match_compact_int_arithmetic_return(
     let ExtractedValueKind::Binary { op, left, right } = add.kind else {
         return None;
     };
-    let arithmetic = arithmetic_alternative_spec(op)?;
+    let operation = binary_return_alternative_spec(op)?;
     if !facts.is_exact_compact_int(left) || !facts.is_exact_compact_int(right) {
         return None;
     }
@@ -656,7 +656,7 @@ fn match_compact_int_arithmetic_return(
         source,
         left_name: region.load_name(left)?.id_str().to_string(),
         right_name: region.load_name(right)?.id_str().to_string(),
-        arithmetic,
+        operation,
     })
 }
 
@@ -746,19 +746,31 @@ fn compare_alternative_spec(op: BinOpKind) -> Option<CompareAlternativeSpec> {
     })
 }
 
-fn arithmetic_alternative_spec(op: BinOpKind) -> Option<ArithmeticAlternativeSpec> {
+fn binary_return_alternative_spec(op: BinOpKind) -> Option<BinaryReturnAlternativeSpec> {
     Some(match op {
-        BinOpKind::Add => ArithmeticAlternativeSpec {
+        BinOpKind::Add => BinaryReturnAlternativeSpec {
             generic_id: "binary.add.py_generic",
             exact_id: "binary.add.exact_compact_int.i64",
         },
-        BinOpKind::Sub => ArithmeticAlternativeSpec {
+        BinOpKind::Sub => BinaryReturnAlternativeSpec {
             generic_id: "binary.sub.py_generic",
             exact_id: "binary.sub.exact_compact_int.i64",
         },
-        BinOpKind::Mul => ArithmeticAlternativeSpec {
+        BinOpKind::Mul => BinaryReturnAlternativeSpec {
             generic_id: "binary.mul.py_generic",
             exact_id: "binary.mul.exact_compact_int.i64",
+        },
+        BinOpKind::And => BinaryReturnAlternativeSpec {
+            generic_id: "binary.and.py_generic",
+            exact_id: "binary.and.exact_compact_int.i64",
+        },
+        BinOpKind::Or => BinaryReturnAlternativeSpec {
+            generic_id: "binary.or.py_generic",
+            exact_id: "binary.or.exact_compact_int.i64",
+        },
+        BinOpKind::Xor => BinaryReturnAlternativeSpec {
+            generic_id: "binary.xor.py_generic",
+            exact_id: "binary.xor.exact_compact_int.i64",
         },
         _ => return None,
     })
@@ -971,7 +983,7 @@ mod tests {
         extract_block_region_v3(&block, RegionId(0)).unwrap()
     }
 
-    fn compact_int_arithmetic_return_region(kind: BinOpKind) -> ExtractedRegion {
+    fn compact_int_binary_return_region(kind: BinOpKind) -> ExtractedRegion {
         let value = binary(
             kind,
             with_instr_id(local("a", 0), 0),
@@ -1130,7 +1142,7 @@ mod tests {
     fn plans_compact_int_add_return() {
         let catalog = AlternativeCatalog::default_v3();
         let request = module_request(
-            compact_int_arithmetic_return_region(BinOpKind::Add),
+            compact_int_binary_return_region(BinOpKind::Add),
             facts_for_compact_region(),
         );
         let plan = plan_module_optimization_v3(&catalog, request);
@@ -1183,7 +1195,55 @@ mod tests {
             ),
         ] {
             let request = module_request(
-                compact_int_arithmetic_return_region(kind),
+                compact_int_binary_return_region(kind),
+                facts_for_compact_region(),
+            );
+            let plan = plan_module_optimization_v3(&catalog, request);
+
+            validate_module_plan_v3(&plan).unwrap();
+            let function = &plan.functions[0];
+            assert!(function.diagnostics.is_empty(), "{kind:?}");
+            assert_eq!(function.regions.len(), 2, "{kind:?}");
+            assert_eq!(function.regions[0].nodes.len(), 6, "{kind:?}");
+            assert!(
+                matches!(
+                    &function.regions[0].nodes[4].kind,
+                    PlanNodeKind::Operation(OperationNode { op, .. }) if op == &exact_op
+                ),
+                "{kind:?}"
+            );
+            assert!(
+                matches!(
+                    &function.regions[1].nodes[0].kind,
+                    PlanNodeKind::Operation(OperationNode { op, .. }) if op == &generic_op
+                ),
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn plans_compact_int_bitwise_returns() {
+        let catalog = AlternativeCatalog::default_v3();
+        for (kind, exact_op, generic_op) in [
+            (
+                BinOpKind::And,
+                crate::optimization_plan_v3::PlannedOp::I64BitAnd,
+                crate::optimization_plan_v3::PlannedOp::PyNumberBitAnd,
+            ),
+            (
+                BinOpKind::Or,
+                crate::optimization_plan_v3::PlannedOp::I64BitOr,
+                crate::optimization_plan_v3::PlannedOp::PyNumberBitOr,
+            ),
+            (
+                BinOpKind::Xor,
+                crate::optimization_plan_v3::PlannedOp::I64BitXor,
+                crate::optimization_plan_v3::PlannedOp::PyNumberBitXor,
+            ),
+        ] {
+            let request = module_request(
+                compact_int_binary_return_region(kind),
                 facts_for_compact_region(),
             );
             let plan = plan_module_optimization_v3(&catalog, request);

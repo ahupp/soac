@@ -17,13 +17,13 @@ pub struct V3OptimizationFamilyStatus {
 
 pub const V3_OPTIMIZATION_FAMILY_STATUS: &[V3OptimizationFamilyStatus] = &[
     V3OptimizationFamilyStatus {
-        family: "exact-int direct-compare/add-compare branches, add/sub/mul returns, and comparison returns",
+        family: "exact-int direct-compare/add-compare branches, add/sub/mul/bitwise returns, and comparison returns",
         legacy_input: "operator_hot_shapes",
         status: V3MigrationStatus::LiveCodegenInputOnly,
-        next_step: "migrate the remaining division/modulo/shift, bitwise, and unary value-producing exact-int operators to v3 plans",
+        next_step: "migrate the remaining division/modulo/shift and unary value-producing exact-int operators to v3 plans",
     },
     V3OptimizationFamilyStatus {
-        family: "remaining division/modulo/shift, bitwise, and unary value-producing exact-int operators",
+        family: "remaining division/modulo/shift and unary value-producing exact-int operators",
         legacy_input: "operator_hot_shapes",
         status: V3MigrationStatus::LegacyOnly,
         next_step: "model remaining operator semantics, fallback ownership, and unsupported-overflow boundaries",

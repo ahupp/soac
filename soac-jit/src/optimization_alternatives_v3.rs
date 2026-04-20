@@ -27,6 +27,39 @@ impl AlternativeCatalog {
                 exact_compact_int_subtract(),
                 generic_binary_multiply(),
                 exact_compact_int_multiply(),
+                generic_bitwise(
+                    "binary.and.py_generic",
+                    BinOpKind::And,
+                    PlannedOp::PyNumberBitAnd,
+                    "PyNumber_And",
+                ),
+                exact_compact_int_bitwise(
+                    "binary.and.exact_compact_int.i64",
+                    BinOpKind::And,
+                    PlannedOp::I64BitAnd,
+                ),
+                generic_bitwise(
+                    "binary.or.py_generic",
+                    BinOpKind::Or,
+                    PlannedOp::PyNumberBitOr,
+                    "PyNumber_Or",
+                ),
+                exact_compact_int_bitwise(
+                    "binary.or.exact_compact_int.i64",
+                    BinOpKind::Or,
+                    PlannedOp::I64BitOr,
+                ),
+                generic_bitwise(
+                    "binary.xor.py_generic",
+                    BinOpKind::Xor,
+                    PlannedOp::PyNumberBitXor,
+                    "PyNumber_Xor",
+                ),
+                exact_compact_int_bitwise(
+                    "binary.xor.exact_compact_int.i64",
+                    BinOpKind::Xor,
+                    PlannedOp::I64BitXor,
+                ),
                 generic_rich_compare("binary.eq.py_richcompare", BinOpKind::Eq, RichCompareOp::Eq),
                 exact_compact_int_compare(
                     "binary.eq.exact_compact_int.i32bool",
@@ -533,7 +566,12 @@ fn validate_operation_emission(
     errors: &mut Vec<String>,
 ) {
     match op {
-        PlannedOp::PyNumberAdd | PlannedOp::PyNumberSubtract | PlannedOp::PyNumberMultiply => {
+        PlannedOp::PyNumberAdd
+        | PlannedOp::PyNumberSubtract
+        | PlannedOp::PyNumberMultiply
+        | PlannedOp::PyNumberBitAnd
+        | PlannedOp::PyNumberBitOr
+        | PlannedOp::PyNumberBitXor => {
             validate_catalog_operation_signature(
                 id,
                 alternative,
@@ -560,7 +598,12 @@ fn validate_operation_emission(
                 errors,
             );
         }
-        PlannedOp::CheckedI64Add | PlannedOp::CheckedI64Sub | PlannedOp::CheckedI64Mul => {
+        PlannedOp::CheckedI64Add
+        | PlannedOp::CheckedI64Sub
+        | PlannedOp::CheckedI64Mul
+        | PlannedOp::I64BitAnd
+        | PlannedOp::I64BitOr
+        | PlannedOp::I64BitXor => {
             validate_catalog_operation_signature(
                 id,
                 alternative,
@@ -845,6 +888,97 @@ fn exact_compact_int_multiply() -> LoweringAlternative {
             compile: 2,
         },
         rationale: "exact compact PyLong operands can use checked i64 multiplication before materialization",
+    }
+}
+
+fn generic_bitwise(
+    id: &'static str,
+    binop: BinOpKind,
+    emission: PlannedOp,
+    py_number_name: &'static str,
+) -> LoweringAlternative {
+    LoweringAlternative {
+        id: AlternativeId::new(id),
+        op: SemanticOpKind::Binary { op: binop },
+        input_reps: vec![pyobject_input(0), pyobject_input(1)],
+        output_rep: Some(Rep::PyObjectOwned),
+        required_facts: python_object_inputs(),
+        output_facts: vec![ValueFact::PythonObject],
+        emission: AlternativeEmission::Operation(emission),
+        guards: Vec::new(),
+        failure_replay: FailureReplayPolicy::local_fallback(format!(
+            "{py_number_name} raises or returns locally without replay"
+        )),
+        failure: AlternativeFailure::Raise {
+            kind: "Exception",
+            reason: "generic Python bitwise operation may raise while preserving Python dispatch",
+        },
+        cost: Cost {
+            hot_path: 80,
+            miss_path: 0,
+            deopt: 0,
+            materialization: 0,
+            ownership: 4,
+            code_size: 2,
+            compile: 1,
+        },
+        rationale: match binop {
+            BinOpKind::And => {
+                "generic Python bitwise and preserves Python dispatch and exception behavior"
+            }
+            BinOpKind::Or => {
+                "generic Python bitwise or preserves Python dispatch and exception behavior"
+            }
+            BinOpKind::Xor => {
+                "generic Python bitwise xor preserves Python dispatch and exception behavior"
+            }
+            _ => unreachable!("generic bitwise alternative only covers and/or/xor"),
+        },
+    }
+}
+
+fn exact_compact_int_bitwise(
+    id: &'static str,
+    binop: BinOpKind,
+    emission: PlannedOp,
+) -> LoweringAlternative {
+    LoweringAlternative {
+        id: AlternativeId::new(id),
+        op: SemanticOpKind::Binary { op: binop },
+        input_reps: vec![
+            i64_from_compact_long_input(0),
+            i64_from_compact_long_input(1),
+        ],
+        output_rep: Some(Rep::I64),
+        required_facts: exact_compact_int_inputs(),
+        output_facts: vec![ValueFact::I64, ValueFact::ExactCompactPyLong],
+        emission: AlternativeEmission::Operation(emission),
+        guards: exact_compact_int_guards(),
+        failure_replay: FailureReplayPolicy::safe(
+            "i64 bitwise operations cannot fail after exact compact-int guards",
+        ),
+        failure: AlternativeFailure::CannotFail,
+        cost: Cost {
+            hot_path: 1,
+            miss_path: 70,
+            deopt: 0,
+            materialization: 0,
+            ownership: 0,
+            code_size: 2,
+            compile: 1,
+        },
+        rationale: match binop {
+            BinOpKind::And => {
+                "exact compact PyLong operands can use machine i64 bitwise and before materialization"
+            }
+            BinOpKind::Or => {
+                "exact compact PyLong operands can use machine i64 bitwise or before materialization"
+            }
+            BinOpKind::Xor => {
+                "exact compact PyLong operands can use machine i64 bitwise xor before materialization"
+            }
+            _ => unreachable!("exact bitwise alternative only covers and/or/xor"),
+        },
     }
 }
 
@@ -1175,7 +1309,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_exposes_generic_and_exact_arithmetic_alternatives() {
+    fn catalog_exposes_generic_and_exact_binary_return_alternatives() {
         let catalog = AlternativeCatalog::default_v3();
         for (kind, generic_id, exact_id) in [
             (
@@ -1192,6 +1326,21 @@ mod tests {
                 BinOpKind::Mul,
                 "binary.mul.py_generic",
                 "binary.mul.exact_compact_int.i64",
+            ),
+            (
+                BinOpKind::And,
+                "binary.and.py_generic",
+                "binary.and.exact_compact_int.i64",
+            ),
+            (
+                BinOpKind::Or,
+                "binary.or.py_generic",
+                "binary.or.exact_compact_int.i64",
+            ),
+            (
+                BinOpKind::Xor,
+                "binary.xor.py_generic",
+                "binary.xor.exact_compact_int.i64",
             ),
         ] {
             let alternatives = catalog
