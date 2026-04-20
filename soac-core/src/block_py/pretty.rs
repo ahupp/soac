@@ -42,6 +42,49 @@ pub trait PrettyPrint {
     }
 }
 
+impl<T> PrettyPrint for Box<T>
+where
+    T: PrettyPrint + ?Sized,
+{
+    fn fmt_pretty(&self, printer: &mut PrettyPrinter<'_>) -> fmt::Result {
+        self.as_ref().fmt_pretty(printer)
+    }
+}
+
+impl<T> PrettyPrint for Vec<T>
+where
+    T: PrettyPrint,
+{
+    fn fmt_pretty(&self, printer: &mut PrettyPrinter<'_>) -> fmt::Result {
+        printer.write_char('[')?;
+        let mut first = true;
+        for item in self {
+            if !first {
+                printer.write_str(", ")?;
+            }
+            first = false;
+            item.fmt_pretty(printer)?;
+        }
+        printer.write_char(']')
+    }
+}
+
+impl<T> PrettyPrint for Option<T>
+where
+    T: PrettyPrint,
+{
+    fn fmt_pretty(&self, printer: &mut PrettyPrinter<'_>) -> fmt::Result {
+        match self {
+            Some(value) => {
+                printer.write_str("Some(")?;
+                value.fmt_pretty(printer)?;
+                printer.write_char(')')
+            }
+            None => printer.write_str("None"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct PrettyConfig {
     pub mode: PrettyMode,

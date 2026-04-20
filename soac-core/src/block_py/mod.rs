@@ -36,6 +36,7 @@ pub use crate::{define_instr, define_ruff_instr};
 pub use ruff_python_ast::Expr;
 use ruff_python_ast::{self as ast};
 use std::fmt;
+use std::fmt::Write;
 
 mod counters;
 mod instr;
@@ -874,6 +875,26 @@ pub enum CallArgPositional<E> {
     Starred(E),
 }
 
+impl<E> PrettyPrint for CallArgPositional<E>
+where
+    E: PrettyPrint,
+{
+    fn fmt_pretty(&self, printer: &mut PrettyPrinter<'_>) -> fmt::Result {
+        match self {
+            Self::Positional(expr) => {
+                printer.write_str("Positional(")?;
+                expr.fmt_pretty(printer)?;
+                printer.write_char(')')
+            }
+            Self::Starred(expr) => {
+                printer.write_str("Starred(")?;
+                expr.fmt_pretty(printer)?;
+                printer.write_char(')')
+            }
+        }
+    }
+}
+
 impl<E> CallArgPositional<E> {
     pub fn from_ast_expr_with(expr: ast::Expr, lower: impl FnOnce(ast::Expr) -> E) -> Self {
         match expr {
@@ -959,6 +980,26 @@ impl From<ast::Identifier> for KeywordName {
 pub enum CallArgKeyword<E> {
     Named { arg: KeywordName, value: E },
     Starred(E),
+}
+
+impl<E> PrettyPrint for CallArgKeyword<E>
+where
+    E: PrettyPrint,
+{
+    fn fmt_pretty(&self, printer: &mut PrettyPrinter<'_>) -> fmt::Result {
+        match self {
+            Self::Named { arg, value } => {
+                write!(printer, "Named {{ arg: {arg:?}, value: ")?;
+                value.fmt_pretty(printer)?;
+                printer.write_str(" }")
+            }
+            Self::Starred(value) => {
+                printer.write_str("Starred(")?;
+                value.fmt_pretty(printer)?;
+                printer.write_char(')')
+            }
+        }
+    }
 }
 
 impl<E> CallArgKeyword<E> {
