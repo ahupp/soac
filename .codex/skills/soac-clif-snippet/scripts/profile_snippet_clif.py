@@ -47,8 +47,10 @@ def main() -> int:
         raise RuntimeError(f"SOAC did not write profile counters at {profile_dump}")
 
     function_id = lookup_function_id(source_path, target_name)
-    optimization_decisions = decide_optimizations(profile_dump, counters_dir)
+    optimization_decisions = decide_optimizations(profile_dump, counters_dir, mode="legacy")
+    optimization_decisions_v3 = decide_optimizations(profile_dump, counters_dir, mode="v3")
     optimization_plan = print_optimization_plans(counters_dir)
+    optimization_plan_v3 = print_optimization_plans_v3(counters_dir)
     specializations = inspect_specializations(profile_dump)
     pre_inline_clif = render_specialized_clif(
         module_name=module_name,
@@ -73,7 +75,9 @@ def main() -> int:
 
     specializations_path = artifact_dir / "specializations.txt"
     optimization_decisions_path = artifact_dir / "optimization_decisions.txt"
+    optimization_decisions_v3_path = artifact_dir / "optimization_decisions_v3.txt"
     optimization_plan_path = artifact_dir / "optimization_plan.txt"
+    optimization_plan_v3_path = artifact_dir / "optimization_plan_v3.txt"
     pre_inline_clif_path = artifact_dir / "pre_inline.clif"
     clif_path = artifact_dir / "specialized.clif"
     instr_typed_path = artifact_dir / "instr_typed.txt"
@@ -82,7 +86,11 @@ def main() -> int:
 
     specializations_path.write_text(specializations, encoding="utf-8")
     optimization_decisions_path.write_text(optimization_decisions, encoding="utf-8")
+    optimization_decisions_v3_path.write_text(
+        optimization_decisions_v3, encoding="utf-8"
+    )
     optimization_plan_path.write_text(optimization_plan, encoding="utf-8")
+    optimization_plan_v3_path.write_text(optimization_plan_v3, encoding="utf-8")
     pre_inline_clif_path.write_text(pre_inline_clif, encoding="utf-8")
     clif_path.write_text(clif, encoding="utf-8")
     instr_typed_path.write_text(instr_typed, encoding="utf-8")
@@ -97,7 +105,9 @@ def main() -> int:
         "profile_dump": str(profile_dump),
         "specializations_path": str(specializations_path),
         "optimization_decisions_path": str(optimization_decisions_path),
+        "optimization_decisions_v3_path": str(optimization_decisions_v3_path),
         "optimization_plan_path": str(optimization_plan_path),
+        "optimization_plan_v3_path": str(optimization_plan_v3_path),
         "pre_inline_clif_path": str(pre_inline_clif_path),
         "clif_path": str(clif_path),
         "instr_typed_path": str(instr_typed_path),
@@ -109,7 +119,9 @@ def main() -> int:
             metadata=metadata,
             source=source_path.read_text(encoding="utf-8"),
             optimization_decisions=optimization_decisions,
+            optimization_decisions_v3=optimization_decisions_v3,
             optimization_plan=optimization_plan,
+            optimization_plan_v3=optimization_plan_v3,
             specializations=specializations,
             instr_typed=instr_typed,
             pre_inline_clif=pre_inline_clif,
@@ -121,7 +133,9 @@ def main() -> int:
     print(f"artifact_dir: {artifact_dir}")
     print(f"annotation_context: {context_path}")
     print(f"optimization_decisions: {optimization_decisions_path}")
+    print(f"optimization_decisions_v3: {optimization_decisions_v3_path}")
     print(f"optimization_plan: {optimization_plan_path}")
+    print(f"optimization_plan_v3: {optimization_plan_v3_path}")
     print(f"pre_inline_clif: {pre_inline_clif_path}")
     print(f"specialized_clif: {clif_path}")
     print(f"instr_typed: {instr_typed_path}")
@@ -274,12 +288,14 @@ def inspect_specializations(profile_dump: Path) -> str:
         )
 
 
-def decide_optimizations(profile_dump: Path, counters_dir: Path) -> str:
+def decide_optimizations(profile_dump: Path, counters_dir: Path, *, mode: str) -> str:
     module_root = counters_dir / "modules"
     return run_inspector(
         "decide_optimizations",
         "--counters",
         str(profile_dump),
+        "--mode",
+        mode,
         "--module-root",
         str(module_root),
         "--out",
@@ -297,6 +313,23 @@ def print_optimization_plans(counters_dir: Path) -> str:
     for plan_path in plan_paths:
         plan_text = run_inspector(
             "print_optimization_plan",
+            "--plan",
+            str(plan_path),
+        ).stdout
+        rendered.append(f"# {plan_path}\n{plan_text.rstrip()}\n")
+    return "\n".join(rendered)
+
+
+def print_optimization_plans_v3(counters_dir: Path) -> str:
+    module_root = counters_dir / "modules"
+    plan_paths = sorted(module_root.glob("**/mod.optv3"))
+    if not plan_paths:
+        return f"no optimizer v3 plans found under {module_root}\n"
+
+    rendered = []
+    for plan_path in plan_paths:
+        plan_text = run_inspector(
+            "print_optimization_plan_v3",
             "--plan",
             str(plan_path),
         ).stdout
@@ -383,7 +416,9 @@ def annotation_context(
     metadata: dict[str, Any],
     source: str,
     optimization_decisions: str,
+    optimization_decisions_v3: str,
     optimization_plan: str,
+    optimization_plan_v3: str,
     specializations: str,
     instr_typed: str,
     pre_inline_clif: str,
@@ -424,10 +459,22 @@ and counter context as evidence; mark uncertain block purposes as inferred.
 {optimization_decisions.rstrip()}
 ```
 
+## Optimizer v3 Decision CLI Output
+
+```text
+{optimization_decisions_v3.rstrip()}
+```
+
 ## Optimization Plan
 
 ```text
 {optimization_plan.rstrip()}
+```
+
+## Optimizer v3 Plan
+
+```text
+{optimization_plan_v3.rstrip()}
 ```
 
 ## InstrTyped Input To Codegen

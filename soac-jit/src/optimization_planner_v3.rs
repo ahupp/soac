@@ -12,7 +12,7 @@ use crate::optimization_plan_v3::{
 use crate::optimization_region_v3::{
     ExtractedExit, ExtractedRegion, ExtractedValue, ExtractedValueId, ExtractedValueKind,
 };
-use soac_core::block_py::{BinOpKind, InstrId, NameLike, ResolvedName};
+use soac_core::block_py::{BinOpKind, InstrId, NameLike, NameLocation, ResolvedName};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -632,8 +632,8 @@ fn match_compact_int_add_gt_zero_branch(
     }
     Some(CompactIntBranchShape {
         source,
-        left_name: region.load_name(left)?.id_str().to_string(),
-        right_name: region.load_name(right)?.id_str().to_string(),
+        left_name: region.loadable_name(left)?,
+        right_name: region.loadable_name(right)?,
     })
 }
 
@@ -654,8 +654,8 @@ fn match_compact_int_binary_return(
     }
     Some(CompactIntReturnShape {
         source,
-        left_name: region.load_name(left)?.id_str().to_string(),
-        right_name: region.load_name(right)?.id_str().to_string(),
+        left_name: region.loadable_name(left)?,
+        right_name: region.loadable_name(right)?,
         operation,
     })
 }
@@ -687,8 +687,8 @@ fn match_compact_int_compare_branch(
     }
     Some(CompactIntCompareBranchShape {
         source,
-        left_name: region.load_name(left)?.id_str().to_string(),
-        right_name: region.load_name(right)?.id_str().to_string(),
+        left_name: region.loadable_name(left)?,
+        right_name: region.loadable_name(right)?,
         compare,
     })
 }
@@ -710,8 +710,8 @@ fn match_compact_int_compare_return(
     }
     Some(CompactIntCompareReturnShape {
         source,
-        left_name: region.load_name(left)?.id_str().to_string(),
-        right_name: region.load_name(right)?.id_str().to_string(),
+        left_name: region.loadable_name(left)?,
+        right_name: region.loadable_name(right)?,
         compare,
     })
 }
@@ -779,6 +779,7 @@ fn binary_return_alternative_spec(op: BinOpKind) -> Option<BinaryReturnAlternati
 trait ExtractedRegionExt {
     fn value(&self, value: ExtractedValueId) -> Option<&ExtractedValue>;
     fn load_name(&self, value: ExtractedValueId) -> Option<&ResolvedName>;
+    fn loadable_name(&self, value: ExtractedValueId) -> Option<String>;
     fn exit_source(&self) -> Option<InstrId>;
 }
 
@@ -791,6 +792,17 @@ impl ExtractedRegionExt for ExtractedRegion {
         match &self.value(value)?.kind {
             ExtractedValueKind::LoadName { name } => Some(name),
             ExtractedValueKind::Binary { .. } | ExtractedValueKind::Truthiness { .. } => None,
+        }
+    }
+
+    fn loadable_name(&self, value: ExtractedValueId) -> Option<String> {
+        let name = self.load_name(value)?;
+        match name.location {
+            NameLocation::Local(_) | NameLocation::Cell(_) => Some(name.id_str().to_string()),
+            NameLocation::GlobalName
+            | NameLocation::Global(_)
+            | NameLocation::RuntimeName(_)
+            | NameLocation::Constant(_) => None,
         }
     }
 
@@ -919,6 +931,13 @@ mod tests {
         }))
     }
 
+    fn constant(slot: u32) -> InstrCodegen {
+        InstrCodegen::Load(Load::new(ResolvedName {
+            id: BlockPyName::new("__dp_constant"),
+            location: NameLocation::Constant(slot),
+        }))
+    }
+
     fn binary(op: BinOpKind, left: InstrCodegen, right: InstrCodegen, id: u32) -> InstrCodegen {
         with_instr_id(InstrCodegen::BinOp(BinOp::new(op, left, right)), id)
     }
@@ -950,6 +969,27 @@ mod tests {
             kind,
             with_instr_id(local("a", 0), 0),
             with_instr_id(local("b", 1), 1),
+            2,
+        );
+        let block = Block::new(
+            label(0),
+            Vec::new(),
+            BlockTerm::IfTerm(TermIf {
+                test,
+                then_label: label(1),
+                else_label: label(2),
+            }),
+            Vec::<BlockParam>::new(),
+            None,
+        );
+        extract_block_region_v3(&block, RegionId(0)).unwrap()
+    }
+
+    fn compact_int_compare_branch_with_constant_region(kind: BinOpKind) -> ExtractedRegion {
+        let test = binary(
+            kind,
+            with_instr_id(local("c", 0), 0),
+            with_instr_id(constant(0), 1),
             2,
         );
         let block = Block::new(
@@ -1274,6 +1314,27 @@ mod tests {
     fn missing_exact_int_facts_declines_region() {
         let catalog = AlternativeCatalog::default_v3();
         let request = module_request(compact_int_branch_region(), PlannerFacts::default());
+        let plan = plan_module_optimization_v3(&catalog, request);
+
+        let function = &plan.functions[0];
+        assert!(function.regions.is_empty());
+        assert_eq!(function.diagnostics.len(), 1);
+        assert!(
+            function.diagnostics[0]
+                .message
+                .contains("unsupported shape"),
+            "{:?}",
+            function.diagnostics[0]
+        );
+    }
+
+    #[test]
+    fn constant_operands_are_not_region_inputs() {
+        let catalog = AlternativeCatalog::default_v3();
+        let request = module_request(
+            compact_int_compare_branch_with_constant_region(BinOpKind::Gt),
+            facts_for_compact_region(),
+        );
         let plan = plan_module_optimization_v3(&catalog, request);
 
         let function = &plan.functions[0];

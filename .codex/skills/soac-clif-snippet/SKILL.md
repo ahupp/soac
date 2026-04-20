@@ -37,6 +37,8 @@ If the workload call does not directly identify the function to inspect, pass
 - module/function metadata
 - optimization decision CLI output
 - printed optimization plan
+- optimizer v3 decision CLI output
+- printed optimizer v3 plan
 - decoded specialization counters
 - InstrTyped input to specialized codegen
 - pre-inlining specialized CLIF, before runtime support CLIF inlining and
@@ -72,6 +74,8 @@ The script writes one directory under `work/logs/soac-clif-snippets/`:
 - `specializations.txt`
 - `optimization_decisions.txt`
 - `optimization_plan.txt`
+- `optimization_decisions_v3.txt`
+- `optimization_plan_v3.txt`
 - `instr_typed.txt`
 - `pre_inline.clif`
 - `specialized.clif`
