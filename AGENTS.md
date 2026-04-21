@@ -407,8 +407,9 @@ another revision's cache.
 - Repo-local uv state
   `.envrc` and `Justfile` keep uv, XDG, and cargo state under the repo with
   `UV_CACHE_DIR`, `UV_TOOL_DIR`, `UV_TOOL_BIN_DIR`, `XDG_CACHE_HOME`,
-  `XDG_DATA_HOME`, `XDG_RUNTIME_DIR`, and `CARGO_HOME`. `XDG_RUNTIME_DIR` and
-  `CARGO_HOME` default under `work/tmp/`. Module artifacts are rooted under the
+  `XDG_DATA_HOME`, `XDG_RUNTIME_DIR`, and `CARGO_HOME`. `XDG_RUNTIME_DIR`
+  defaults under `work/tmp/`, and `CARGO_HOME` defaults to `work/cargo-home`.
+  Module artifacts are rooted under the
   active `$SOAC_WORK_DIR/modules` directory. The `Justfile` respects pre-set
   values for those repo-local state variables. `just setup-dev-env` reuses an
   already-installed nightly Rust toolchain and Cranelift codegen component
@@ -422,7 +423,7 @@ another revision's cache.
   normally infers the parent checkout from a file-backed `.jj/repo`; the parent
   owns shared offline state and `work/` as a regular artifact directory. The setup
   recipe symlinks `vendor/cpython`, `work/`, `.uv-cache`, `.uv/`, `.xdg/`, and
-  `work/tmp/cargo-home` from that parent into the worktree, and errors instead of
+  `work/cargo-home` from that parent into the worktree, and errors instead of
   creating isolated empty offline caches when neither
   inference nor the override can identify the parent.
   When sandboxing would otherwise block shared benchmark writes or jj metadata

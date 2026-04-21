@@ -16,7 +16,7 @@ uv_tool_bin_dir := env_var_or_default("UV_TOOL_BIN_DIR", repo_root + "/.uv/bin")
 xdg_cache_home := env_var_or_default("XDG_CACHE_HOME", repo_root + "/.xdg/cache")
 xdg_data_home := env_var_or_default("XDG_DATA_HOME", repo_root + "/.xdg/data")
 xdg_runtime_dir := env_var_or_default("XDG_RUNTIME_DIR", repo_root + "/work/tmp")
-cargo_home := env_var_or_default("CARGO_HOME", repo_root + "/work/tmp/cargo-home")
+cargo_home := env_var_or_default("CARGO_HOME", repo_root + "/work/cargo-home")
 pyo3_python := cpython_bin
 web_dir := repo_root + "/web"
 inspector_bin := repo_root + "/target/debug/soac-inspector"
@@ -259,14 +259,14 @@ setup-dev-env:
       "$parent_repo/.uv/bin" \
       "$parent_repo/.xdg/cache" \
       "$parent_repo/.xdg/data" \
-      "$parent_repo/work/tmp/cargo-home"
+      "$parent_repo/work/cargo-home"
 
     link_shared_dir "$REPO_ROOT/vendor/cpython" "$parent_repo/vendor/cpython" "vendor/cpython"
     link_shared_dir "$REPO_ROOT/work" "$parent_repo/work" "work" 1
     link_shared_dir "$REPO_ROOT/.uv-cache" "$parent_repo/.uv-cache" ".uv-cache" 1
     link_shared_dir "$REPO_ROOT/.uv" "$parent_repo/.uv" ".uv" 1
     link_shared_dir "$REPO_ROOT/.xdg" "$parent_repo/.xdg" ".xdg" 1
-    link_shared_dir "$REPO_ROOT/work/tmp/cargo-home" "$parent_repo/work/tmp/cargo-home" "work/tmp/cargo-home" 1
+    link_shared_dir "$REPO_ROOT/work/cargo-home" "$parent_repo/work/cargo-home" "work/cargo-home" 1
   else
     if [[ -L "$REPO_ROOT/work" ]]; then
       echo "work is a symlink in the parent checkout; replace it with a regular directory before running setup-dev-env" >&2

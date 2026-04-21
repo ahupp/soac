@@ -11,7 +11,7 @@ just setup-dev-env
 codegen component rather than upgrading them on every run, because a nightly
 refresh forces rebuilds. It also installs the `ruff` command with uv. The repo
 keeps uv, XDG, and cargo state under the working tree (`.uv-cache`, `.uv/`,
-`.xdg/`, and `work/tmp/`) and puts the repo-local uv tool bin directory on
+`.xdg/`, `work/tmp/`, and `work/cargo-home`) and puts the repo-local uv tool bin directory on
 `PATH`, so later test and benchmark recipes can run uv in offline mode instead
 of fetching through the sandbox.
 
@@ -20,7 +20,7 @@ file-backed `.jj/repo` when possible. Set
 `SOAC_PARENT_REPO=/path/to/parent/checkout` to override that inference or when
 the parent cannot be inferred. The parent checkout owns `work/` as a regular
 artifact directory, and the setup recipe symlinks `vendor/cpython`, `work/`,
-`.uv-cache`, `.uv/`, `.xdg/`, and `work/tmp/cargo-home` from the parent checkout so
+`.uv-cache`, `.uv/`, `.xdg/`, and `work/cargo-home` from the parent checkout so
 temporary worktrees can reuse the already-fetched offline state and shared
 benchmark artifacts.
 
@@ -100,7 +100,8 @@ exports are intentionally omitted here.
   `XDG_DATA_HOME`, `XDG_RUNTIME_DIR`, and `CARGO_HOME`
   The `.envrc` and `Justfile` point these at repo-local directories by default
   so uv package cache, installed tools, and XDG state stay under the working
-  tree. `XDG_RUNTIME_DIR` and `CARGO_HOME` default under `work/tmp/`. The
+  tree. `XDG_RUNTIME_DIR` defaults under `work/tmp/`, and `CARGO_HOME` defaults
+  to `work/cargo-home`. The
   `Justfile` also respects pre-set values for these variables, which allows
   temporary worktrees to use explicit writable shared cache roots.
   `just setup-dev-env` installs `ruff` into the repo-local uv tool bin
@@ -111,7 +112,7 @@ exports are intentionally omitted here.
   normally infers the parent checkout from a file-backed `.jj/repo`; the parent
   checkout owns `work/` as a regular artifact directory, `vendor/cpython`, and
   the shared offline state symlinked into the worktree: `.uv-cache`, `.uv/`,
-  `.xdg/`, and `work/tmp/cargo-home`.
+  `.xdg/`, and `work/cargo-home`.
 
 - `SOAC_PRECOMPILED_LIBRARY=/path/to/libsoac_precompiled.so`
   Optional runtime source for offline-precompiled direct function bodies. When
