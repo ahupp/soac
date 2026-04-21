@@ -1,4 +1,4 @@
-# soac-pyo3/src/jit_runtime.rs
+# crates/soac_pyo3/src/jit_runtime.rs
 
 ## File Responsibilities
 
@@ -54,7 +54,7 @@ Python extension runtime bridge for transformed modules. It implements `_soac_ex
 
 ## Context Read
 
-- `soac-pyo3/src/lib.rs`
+- `crates/soac_pyo3/src/lib.rs`
 - `soac_py/src/soac/import_hook.py`
 - `soac_py/src/soac/runtime.py`
 - `soac_jit::module_type`

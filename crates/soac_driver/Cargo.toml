@@ -1,0 +1,16 @@
+[package]
+name = "soac_driver"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "soac_driver"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = { version = "1.0.100", features = ["backtrace"] }
+rkyv = { version = "0.8", default-features = false, features = ["std", "bytecheck"] }
+soac_config = { path = "../soac_config" }
+soac_core = { path = "../soac_core" }
+soac_lowering = { path = "../soac_lowering" }
+tracing = "0.1"

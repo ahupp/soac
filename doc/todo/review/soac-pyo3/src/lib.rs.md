@@ -1,4 +1,4 @@
-# soac-pyo3/src/lib.rs
+# crates/soac_pyo3/src/lib.rs
 
 ## File Responsibilities
 
@@ -19,7 +19,7 @@ Defines the `_soac_ext` Python extension module. It exposes source transformatio
 
 ## Context Read
 
-- `soac-pyo3/src/jit_runtime.rs`
+- `crates/soac_pyo3/src/jit_runtime.rs`
 - `soac_py/src/soac/import_hook.py`
-- `soac-jit/src/counter_dump.rs`
+- `crates/soac_jit/src/counter_dump.rs`
 

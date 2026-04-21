@@ -12,10 +12,10 @@ general direct-call ABI description that can say:
 - this callable accepts borrowed Python object arguments
 - this callable returns an `i64`, `i32`, owned `PyObject`, or no value
 - this callable reports errors by setting `PyThreadState.current_exception`
-- this callable is implemented by a `soac-jit-runtime` symbol that can be imported
+- this callable is implemented by a `soac_jit_runtime` symbol that can be imported
   into Cranelift and inlined when small enough
 
-`soac-jit-runtime` should hold the actual checked builtin implementations. The JIT
+`soac_jit_runtime` should hold the actual checked builtin implementations. The JIT
 should hold selection policy, typed demands, coercions, and fallback wiring.
 
 ## Design
@@ -60,7 +60,7 @@ optimization needs them.
 
 ## Runtime Primitive Shape
 
-`ord` should be implemented in `soac-jit-runtime` as a checked primitive:
+`ord` should be implemented in `soac_jit_runtime` as a checked primitive:
 
 ```rust
 unsafe extern "C" fn soac_runtime_builtin_ord_i64(
@@ -128,9 +128,9 @@ This requires generic coercion edges:
 ## Implementation Order
 
 Status: steps 1 through 5 have started. The direct ABI descriptor scaffold
-exists in `soac-jit`, checked `soac_runtime_builtin_ord_i64` /
+exists in `soac_jit`, checked `soac_runtime_builtin_ord_i64` /
 `soac_runtime_builtin_chr_i64` / `soac_runtime_builtin_len_i64` entry points
-exist in `soac-jit-runtime`, and static runtime-name `ord` / `len` calls can emit
+exist in `soac_jit_runtime`, and static runtime-name `ord` / `len` calls can emit
 an `i64`. Static `chr(ord(x))` can consume that `i64` without materializing an
 intermediate `PyLong`. Static `chr(<i64 module constant>)` can also use the
 scalar `chr_i64` path. Exact `PyLong` facts can satisfy `chr`'s `i64` demand
@@ -138,7 +138,7 @@ through the general `soac_runtime_pylong_as_i64_saturating` coercion, so
 `chr(x)` can use the scalar path when `x` is known/proven to be an exact local
 int while preserving CPython's `chr(huge_int)` `ValueError` behavior.
 
-1. Add compiler-visible direct ABI descriptor scaffolding in `soac-jit`.
+1. Add compiler-visible direct ABI descriptor scaffolding in `soac_jit`.
 
    This should define `DirectTargetId`, `RuntimePrimitiveId`,
    `DirectCallableDesc`, `DirectCallAbi`, `ParamAbi`, `ResultAbi`, `ErrorAbi`,
@@ -147,7 +147,7 @@ int while preserving CPython's `chr(huge_int)` `ValueError` behavior.
    generated code yet.
 
 2. Add checked `ord_i64`, `chr_i64`, and `len_i64` implementations to
-   `soac-jit-runtime`.
+   `soac_jit_runtime`.
 
    Keep the implementation raw and ABI-shaped. Prefer direct Unicode layout
    reads where practical, but keep all validation inside the checked primitive.
@@ -155,7 +155,7 @@ int while preserving CPython's `chr(huge_int)` `ValueError` behavior.
    If the full checked function is too large to inline, split slow error
    formatting into non-inline helpers.
 
-3. Add primitive call emission in `soac-jit`.
+3. Add primitive call emission in `soac_jit`.
 
    Given a `DirectCallableDesc`, emit child arguments according to `ParamAbi`,
    call the runtime symbol, check `PyThreadState.current_exception` when

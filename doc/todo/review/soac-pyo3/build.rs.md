@@ -1,4 +1,4 @@
-# soac-pyo3/build.rs
+# crates/soac_pyo3/build.rs
 
 ## File Responsibilities
 
@@ -16,5 +16,5 @@ Build script for the `_soac_ext` Python extension. It links against the vendored
 ## Context Read
 
 - `build_support/src/lib.rs`
-- `soac-inspector/build.rs`
+- `crates/soac_inspector/build.rs`
 

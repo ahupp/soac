@@ -1,4 +1,4 @@
-# soac-jit/src/jit/intrinsics.rs
+# crates/soac_jit/src/jit/intrinsics.rs
 
 ## File Responsibilities
 
@@ -41,8 +41,8 @@ emission logic can be used from the larger JIT codegen state.
 
 ## Context Read
 
-- `soac-jit/src/jit/mod.rs`: supplies `JitEmitCtx`, `ImportSpec`, counter helpers, type guards, module constants, and the
+- `crates/soac_jit/src/jit/mod.rs`: supplies `JitEmitCtx`, `ImportSpec`, counter helpers, type guards, module constants, and the
   implementation of `OperationEmitState`.
-- `soac-jit/src/jit/specialized_helpers.rs`: implements many imported `dp_jit_*` helper symbols.
+- `crates/soac_jit/src/jit/specialized_helpers.rs`: implements many imported `dp_jit_*` helper symbols.
 - `crate::operator_specialization`: defines operator shape packing and exact-int operator kinds.
 - `crate::jit::blockpy_intrinsics` and `soac_blockpy::block_py`: define intrinsic operation nodes and semantic ids.

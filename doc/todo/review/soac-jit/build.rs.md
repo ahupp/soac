@@ -1,15 +1,15 @@
-# soac-jit/build.rs
+# crates/soac_jit/build.rs
 
 ## File Responsibilities
 
-Build script for `soac-jit`. It configures PyO3 cfg flags, verifies the vendored CPython runtime layout is compatible with raw
-runtime CLIF assumptions, links against the vendored shared `libpython`, compiles `soac-jit-runtime/src/lib.rs` with
+Build script for `soac_jit`. It configures PyO3 cfg flags, verifies the vendored CPython runtime layout is compatible with raw
+runtime CLIF assumptions, links against the vendored shared `libpython`, compiles `crates/soac_jit_runtime/src/lib.rs` with
 rustc-codegen-cranelift, extracts optimized `soac_runtime_*` CLIF files, and writes them into a generated
 `SOAC_JIT_RUNTIME_CLIF` constant.
 
 ## Datatypes
 
-- `RUNTIME_CRATE_NAME`: build-time crate name used when compiling `soac-jit-runtime` to CLIF.
+- `RUNTIME_CRATE_NAME`: build-time crate name used when compiling `soac_jit_runtime` to CLIF.
 - `BuildOutput`: captured stdout/stderr from the rustc-codegen-cranelift invocation so missing CLIF output can report useful
   diagnostics.
 
@@ -21,8 +21,8 @@ rustc-codegen-cranelift, extracts optimized `soac_runtime_*` CLIF files, and wri
 - `find_python_shared_lib_name`: scans a directory for a `libpython*.so` and returns the link name without `lib`/`.so`.
 - `ensure_supported_python_runtime_layout`: rejects non-CPython and CPython builds with free-threading, `Py_REF_DEBUG`, or
   `Py_TRACE_REFS`, because the inlined runtime helpers assume normal CPython object layout.
-- `emit_rerun_if_changed`: emits Cargo dependency tracking for `soac-jit-runtime` and all files beneath it.
-- `build_runtime_clif`: invokes nightly rustc with the Cranelift backend to emit optimized CLIF for `soac-jit-runtime`.
+- `emit_rerun_if_changed`: emits Cargo dependency tracking for `soac_jit_runtime` and all files beneath it.
+- `build_runtime_clif`: invokes nightly rustc with the Cranelift backend to emit optimized CLIF for `soac_jit_runtime`.
 - `clif_output_dir`: computes rustc-codegen-cranelift's emitted `.clif` directory.
 - `find_runtime_clif_files`: reads sorted `.opt.clif` files whose names start with `soac_runtime_`.
 - `write_runtime_clif_constant`: writes `soac_jit_runtime_clif.rs` containing the embedded `(symbol, clif)` table.
@@ -31,7 +31,7 @@ rustc-codegen-cranelift, extracts optimized `soac_runtime_*` CLIF files, and wri
 
 ## Context Read
 
-- `soac-jit-runtime/src/lib.rs`
-- `soac-jit/src/lib.rs`
-- `soac-jit/src/jit/mod.rs`
+- `crates/soac_jit_runtime/src/lib.rs`
+- `crates/soac_jit/src/lib.rs`
+- `crates/soac_jit/src/jit/mod.rs`
 

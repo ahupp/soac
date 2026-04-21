@@ -1,4 +1,4 @@
-# soac-jit/src/jit/deopt_interpreter.rs
+# crates/soac_jit/src/jit/deopt_interpreter.rs
 
 ## File Responsibilities
 
@@ -42,8 +42,8 @@ and returns an owned Python result or a null pointer with a Python exception set
 
 ## Context Read
 
-- `soac-jit/src/jit/mod.rs`: defines `RuntimeJitDeoptInvocation`, deopt records/cursors/locals, data layout, and
+- `crates/soac_jit/src/jit/mod.rs`: defines `RuntimeJitDeoptInvocation`, deopt records/cursors/locals, data layout, and
   `abrupt_kind_tag`.
-- `soac-jit/src/jit/specialized_helpers.rs`: provides cell/global helper exports reused by the interpreter.
+- `crates/soac_jit/src/jit/specialized_helpers.rs`: provides cell/global helper exports reused by the interpreter.
 - `crate::module_constants`: loads runtime-name constants for deopt.
 - `soac_blockpy::block_py`: instruction, term, call-argument, name-location, and operator datatypes interpreted here.

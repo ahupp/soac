@@ -35,6 +35,6 @@ Python-level runtime support module for lowered SOAC programs. It exposes runtim
 
 ## Context Read
 
-- `soac-pyo3/src/jit_runtime.rs`
+- `crates/soac_pyo3/src/jit_runtime.rs`
 - `soac_py/src/soac/sim.py`
 - `doc/RUNTIME_FUNCTIONS.md`

@@ -1,4 +1,4 @@
-# soac-jit/src/jit/direct_abi.rs
+# crates/soac_jit/src/jit/direct_abi.rs
 
 ## File Responsibilities
 
@@ -41,6 +41,6 @@ and that builtin-name lookup recognizes the supported builtin names.
 
 ## Context Read
 
-- `soac-jit/src/jit/mod.rs`: consumes descriptors when selecting and emitting runtime primitive calls.
-- `soac-jit/src/jit/typed_value.rs`: supplies `ValueOwnership`.
+- `crates/soac_jit/src/jit/mod.rs`: consumes descriptors when selecting and emitting runtime primitive calls.
+- `crates/soac_jit/src/jit/typed_value.rs`: supplies `ValueOwnership`.
 - `soac_blockpy::passes::PyExactType`: supplies exact-result type facts.

@@ -32,6 +32,6 @@ Reads SOAC tracing JSONL module-load/codegen events and reports aggregate timing
 
 ## Context Read
 
-- `soac-pyo3/src/jit_runtime.rs`
-- `soac-jit` tracing targets for module-load and codegen events
+- `crates/soac_pyo3/src/jit_runtime.rs`
+- `soac_jit` tracing targets for module-load and codegen events
 

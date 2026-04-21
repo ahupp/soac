@@ -1,4 +1,4 @@
-# soac-jit/src/jit/runtime_context.rs
+# crates/soac_jit/src/jit/runtime_context.rs
 
 ## File Responsibilities
 
@@ -28,7 +28,7 @@ module/function state to raw pointer layouts that codegen can address directly, 
 
 ## Context Read
 
-- `soac-jit/src/jit/mod.rs`: uses these offsets and context types while generating direct calls, exception checks, and
+- `crates/soac_jit/src/jit/mod.rs`: uses these offsets and context types while generating direct calls, exception checks, and
   runtime state.
 - `crate::module_type::SharedModuleState`: module-level state referenced by `ModuleJitContext`.
 - `crate::session::CompileSession`: process/session state owned by `ModuleRuntimeContext`.

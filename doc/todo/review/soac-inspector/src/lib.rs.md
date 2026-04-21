@@ -1,4 +1,4 @@
-# soac-inspector/src/lib.rs
+# crates/soac_inspector/src/lib.rs
 
 ## File Responsibilities
 
@@ -54,5 +54,5 @@ Shared inspector library and web API. It prepares embedded Python, lowers source
 - `soac_blockpy` lowering APIs
 - `soac_jit` render/debug/profile APIs
 - `soac_py/src/soac/import_hook.py`
-- `soac-inspector/src/bin/render_jit_clif.rs`
+- `crates/soac_inspector/src/bin/render_jit_clif.rs`
 

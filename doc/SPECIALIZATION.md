@@ -81,21 +81,21 @@ The hot streams consumed by the current replay path are:
   - Instrumented for `Call` expressions with no keywords and only
     positional arguments in
     `instrument_bb_module_with_call_target_counters`, at
-    `soac-lowering/src/passes/trace/mod.rs:235`.
+    `crates/soac_lowering/src/passes/trace/mod.rs:235`.
   - Records observed packed `FunctionId` values via the runtime
     heavy-hitter counter path.
   - Consumed from the binary counter dump in
     `collect_call_target_specializations_for_function`, at
-    `soac-jit/src/counter_dump.rs:759`.
+    `crates/soac_jit/src/counter_dump.rs:759`.
 
 - `operator_hot_shapes`
   - Instrumented for candidate `BinOp` and `UnaryOp` expressions in
     `instrument_bb_module_with_call_target_counters`, at
-    `soac-lowering/src/passes/trace/mod.rs:235`.
+    `crates/soac_lowering/src/passes/trace/mod.rs:235`.
   - Records packed operand shape tags, currently exact-type tags only.
   - Consumed from the binary counter dump in
     `collect_operator_specializations_for_function`, at
-    `soac-jit/src/counter_dump.rs:789`.
+    `crates/soac_jit/src/counter_dump.rs:789`.
 
 - `branch_outcomes`
   - Instrumented for `IfTerm` terminators, keyed by the conditional
@@ -110,7 +110,7 @@ The hot streams consumed by the current replay path are:
 - `block_entry`
   - Instrumented for every lowered basic block in
     `instrument_bb_module_with_block_entry_counters`, at
-    `soac-lowering/src/passes/trace/mod.rs:112`.
+    `crates/soac_lowering/src/passes/trace/mod.rs:112`.
   - Records scalar visit counts keyed by `(function_id, block_label)`.
   - Consumed from the binary counter dump in
     `collect_block_entry_counts_for_function`, then replayed as
@@ -124,14 +124,14 @@ The cold metadata stream records dictionary-key layouts for replay:
   - Contains the lowered module global-name table as
     `(module_name, key, index)` entries.
   - Consumed from the binary counter dump with
-    `collect_module_key_layouts`, at `soac-jit/src/counter_dump.rs`.
+    `collect_module_key_layouts`, at `crates/soac_jit/src/counter_dump.rs`.
 
 - `type_keys`
   - Recorded from the vendored CPython split-key insertion watcher for
     transformed classes created while key-layout profiling is enabled.
   - Contains `(module.qualname, key, split_keys_index)` entries.
   - Consumed from the binary counter dump with
-    `collect_type_key_layouts`, at `soac-jit/src/counter_dump.rs`.
+    `collect_type_key_layouts`, at `crates/soac_jit/src/counter_dump.rs`.
 
 Verify-mode indexed-storage counters are scalar per-site counters:
 
@@ -150,7 +150,7 @@ Verify-mode refcount counters are scalar per-function counters:
 - `runtime_incref` / `runtime_decref`
   - Instrumented only in `SOAC_OPT_MODE=verify` by
     `instrument_bb_module_with_refcount_counters`, at
-    `soac-lowering/src/passes/trace/mod.rs:136`.
+    `crates/soac_lowering/src/passes/trace/mod.rs:136`.
   - Count applied SOAC runtime refcount operations emitted through the
     JIT refcount helper path. Immortal or null values skipped by the
     runtime helper do not increment these counters.
@@ -181,10 +181,10 @@ The JIT loads hot profile input from `$SOAC_WORK_DIR/profile.bin` in
 apply/verify mode:
 
 - `load_call_target_specializations`, at
-  `soac-jit/src/jit/mod.rs:1966`
+  `crates/soac_jit/src/jit/mod.rs:1966`
 - `load_operator_specializations`, at
-  `soac-jit/src/jit/mod.rs:2057`
-- `load_branch_preferences`, at `soac-jit/src/jit/mod.rs`
+  `crates/soac_jit/src/jit/mod.rs:2057`
+- `load_branch_preferences`, at `crates/soac_jit/src/jit/mod.rs`
 
 
 ## Profiled Branch Locality
@@ -324,7 +324,7 @@ apply/verify mode:
   optimization plan. Legacy `mod.opt` can still supply the same typed input
   while the migration is incomplete.
 - V3 indexed-field emissions remain separate from legacy per-instruction field
-  evidence inside `soac-jit`: the emitted access kind and attribute name must
+  evidence inside `soac_jit`: the emitted access kind and attribute name must
   match the lowered `GetAttr`/`SetAttr` instruction, or codegen rejects the plan
   instead of silently treating it as another profiled field candidate.
   By-attribute layout availability is still shared with the existing constructor
@@ -420,7 +420,7 @@ full guarded call blocks today.
 - Source input is `call_hot_targets`.
 - The observed value is the callee `FunctionId` recovered by
   `emit_callee_function_id_checked`, at
-  `soac-jit/src/jit/mod.rs:3032`.
+  `crates/soac_jit/src/jit/mod.rs:3032`.
 - This only applies to `Call` sites with:
   - no keywords
   - no starred / unpacked arguments
@@ -431,7 +431,7 @@ full guarded call blocks today.
 
 - The generic direct-call specialization path lives in the `Call`
   lowering branch in `emit_codegen_expr`, at
-  `soac-jit/src/jit/mod.rs:4777`.
+  `crates/soac_jit/src/jit/mod.rs:4777`.
 - On the hot path it:
   - computes the callee `FunctionId`
   - compares it against profiled targets
@@ -442,7 +442,7 @@ full guarded call blocks today.
   - emits a direct Cranelift `call` to the already-compiled specialized
     runner for that function via
     `emit_direct_call_resolved_with_arg_plan`, at
-    `soac-jit/src/jit/mod.rs:3515`
+    `crates/soac_jit/src/jit/mod.rs:3515`
 - No `Py_LeaveRecursiveCall` call is emitted on the direct-call return
   path. In the vendored CPython this leave operation is a no-op; the
   paired stateful recursion accounting is not part of the current direct-call
@@ -456,7 +456,7 @@ full guarded call blocks today.
   `FunctionId` metadata against a profiled target, and produces a boolean value
   for an ordinary `IfTerm`.
 - `rewrite_profiled_function_call_store_sites`, at
-  `soac-lowering/src/passes/direct_call_transform.rs`, rewrites simple
+  `crates/soac_lowering/src/passes/direct_call_transform.rs`, rewrites simple
   `Store(name, Call(...))` sites into explicit BlockPy CFG:
   - evaluate the callable into one generated compiler temp
   - evaluate each positional argument once, left-to-right, into generated
@@ -520,7 +520,7 @@ full guarded call blocks today.
 - Source input is also `call_hot_targets`.
 - This specialization is only considered when the call target is a
   `GetAttr`, in `direct_method_specializations_for_call_site`, at
-  `soac-jit/src/jit/call_specialization.rs`.
+  `crates/soac_jit/src/jit/call_specialization.rs`.
 - The profiled hot target is still the method function's `FunctionId`.
 - The specialization then refines that with owner-type metadata from
   either predeclared owner-attribute specializations or
@@ -569,7 +569,7 @@ full guarded call blocks today.
   a selected owner-method specialization, and produces a boolean value for an
   ordinary `IfTerm`.
 - `rewrite_profiled_no_arg_method_call_store_sites`, at
-  `soac-jit/src/jit/mod.rs`, rewrites simple `Store(name,
+  `crates/soac_jit/src/jit/mod.rs`, rewrites simple `Store(name,
   Call(GetAttr(receiver, "method"), []))` sites when profile replay identifies
   a transformed method target. It prefers owner/type-version metadata when
   present, and can fall back to guarding the bound method's transformed
@@ -615,7 +615,7 @@ full guarded call blocks today.
 ### Codegen
 
 - Method specialization is emitted in `emit_codegen_expr`, at
-  `soac-jit/src/jit/mod.rs:4584`.
+  `crates/soac_jit/src/jit/mod.rs:4584`.
 - The fast path:
   - evaluates the receiver once
   - guards exact owner type and owner type version with direct JIT
@@ -667,17 +667,17 @@ full guarded call blocks today.
   observed `FunctionId` for the hot transformed `__init__` target.
 - The constructor-specific refinement happens in
   `direct_constructor_specializations_for_call_site`, at
-  `soac-jit/src/jit/mod.rs:2785`, which uses
+  `crates/soac_jit/src/jit/mod.rs:2785`, which uses
   `lookup_exact_owner_types_for_constructor`, at
-  `soac-jit/src/lib.rs:1008`.
+  `crates/soac_jit/src/lib.rs:1008`.
 
 ### Codegen
 
 - Constructor specialization is emitted from the `Call` lowering path
-  in `emit_codegen_expr`, at `soac-jit/src/jit/mod.rs:4775`.
+  in `emit_codegen_expr`, at `crates/soac_jit/src/jit/mod.rs:4775`.
 - The actual constructor fast path is
   `emit_direct_constructor_resolved_with_arg_values`, at
-  `soac-jit/src/jit/mod.rs:3394`.
+  `crates/soac_jit/src/jit/mod.rs:3394`.
 - The fast path:
   - guards exact callee object identity against the profiled owner type
   - guards the owner type version
@@ -732,9 +732,9 @@ full guarded call blocks today.
   loop-exit jumps.
 - Helper entrypoints are:
   - `pytype_generic_alloc_hook`, at
-    `soac-jit/src/jit/specialized_helpers.rs:107`
+    `crates/soac_jit/src/jit/specialized_helpers.rs:107`
   - `finish_constructor_init_hook`, at
-    `soac-jit/src/jit/specialized_helpers.rs:118`
+    `crates/soac_jit/src/jit/specialized_helpers.rs:118`
 
 ### Limitations / Soundness / Extensions
 
@@ -774,7 +774,7 @@ full guarded call blocks today.
 ## Operation Specializations
 
 SOAC keeps operation-level specializations in
-`soac-jit/src/jit/operation_specializations.rs` instead of spreading guarded
+`crates/soac_jit/src/jit/operation_specializations.rs` instead of spreading guarded
 fast paths through generic opcode lowering. The first implementations are
 concrete rather than framework-driven: `GetItem` and `SetItem` emit
 exact-list/exact-int arms and share generic fallback paths.
@@ -890,16 +890,16 @@ exact-list/exact-int arms and share generic fallback paths.
   - `InplaceMatMul`
 - Candidate detection is in
   `instrument_bb_module_with_call_target_counters`, at
-  `soac-lowering/src/passes/trace/mod.rs:235`.
+  `crates/soac_lowering/src/passes/trace/mod.rs:235`.
 - Shapes are packed exact-type tags defined in
-  `soac-jit/src/operator_specialization.rs:4`.
+  `crates/soac_jit/src/operator_specialization.rs:4`.
 - Today the only exact type tag is `ExactTypeTag::Int`.
 
 ### Codegen
 
 - Binary specialization is emitted in
   `emit_specialized_binop`, at
-  `soac-jit/src/jit/intrinsics.rs:714`.
+  `crates/soac_jit/src/jit/intrinsics.rs:714`.
 - The fast path:
   - records the current observed operand shape
   - compares it against the profiled exact-int shape for operations that still
@@ -948,15 +948,15 @@ exact-list/exact-int arms and share generic fallback paths.
 - Source input is `operator_hot_shapes`.
 - Candidate operators are all `UnaryOp` nodes, via
   `instrument_bb_module_with_call_target_counters`, at
-  `soac-lowering/src/passes/trace/mod.rs:235`.
+  `crates/soac_lowering/src/passes/trace/mod.rs:235`.
 - Shapes are packed exact-type tags from
-  `soac-jit/src/operator_specialization.rs:4`.
+  `crates/soac_jit/src/operator_specialization.rs:4`.
 
 ### Codegen
 
 - Unary specialization is emitted in
   `emit_specialized_unary_op`, at
-  `soac-jit/src/jit/intrinsics.rs`.
+  `crates/soac_jit/src/jit/intrinsics.rs`.
 - The fast path:
   - records the observed unary operand shape
   - checks for exact `int`
@@ -993,7 +993,7 @@ exact-list/exact-int arms and share generic fallback paths.
 
 - Comparison specialization also goes through
   `emit_specialized_binop`, at
-  `soac-jit/src/jit/intrinsics.rs`.
+  `crates/soac_jit/src/jit/intrinsics.rs`.
 - If the profiled shape is exact `int`/`int`, comparisons such as
   `Eq`, `Ne`, `Lt`, `Le`, `Gt`, and `Ge` guard compact exact `PyLong` layout
   and emit a direct integer comparison instead of generic
@@ -1043,7 +1043,7 @@ exact-list/exact-int arms and share generic fallback paths.
 
 ### Codegen
 
-- `ord(x)` can emit a direct call to the `soac-jit-runtime`
+- `ord(x)` can emit a direct call to the `soac_jit_runtime`
   `soac_runtime_builtin_ord_i64` primitive. The primitive accepts the argument
   as a borrowed `PyObject*`, performs CPython-compatible validation internally,
   sets `PyThreadState.current_exception` on failure, and returns an `i64`.

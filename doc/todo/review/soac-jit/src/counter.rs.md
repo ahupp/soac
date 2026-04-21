@@ -1,4 +1,4 @@
-# soac-jit/src/counter.rs
+# crates/soac_jit/src/counter.rs
 
 ## File Responsibilities
 
@@ -37,7 +37,7 @@ pointers while the GIL serializes access.
 
 ## Context Read
 
-- `soac-jit/src/module_type.rs`
-- `soac-jit/src/counter_dump.rs`
-- `soac-jit/src/jit/specialized_helpers.rs`
+- `crates/soac_jit/src/module_type.rs`
+- `crates/soac_jit/src/counter_dump.rs`
+- `crates/soac_jit/src/jit/specialized_helpers.rs`
 

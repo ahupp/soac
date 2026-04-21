@@ -1,0 +1,28 @@
+[package]
+name = "soac_pyo3"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+
+[lib]
+name = "_soac_ext"
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+soac_lowering = { path = "../soac_lowering" }
+soac_driver = { path = "../soac_driver" }
+soac_config = { path = "../soac_config" }
+soac_core = { path = "../soac_core" }
+soac_opt = { path = "../soac_opt" }
+soac_jit = { path = "../soac_jit" }
+pyo3 = { workspace = true, features = ["extension-module"] }
+tracing = "0.1"
+serde_json = "1"
+rkyv = { version = "0.8", features = ["alloc"] }
+
+[build-dependencies]
+build_support = { workspace = true }
+
+[dev-dependencies]
+soac_cpython = { path = "../soac_cpython" }

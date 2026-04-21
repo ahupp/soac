@@ -1,0 +1,14 @@
+[package]
+name = "soac_opt"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+doctest = false
+
+[dependencies]
+anyhow = { version = "1.0.100", features = ["backtrace"] }
+rkyv = { version = "0.8", features = ["alloc"] }
+soac_core = { path = "../soac_core" }
+soac_driver = { path = "../soac_driver" }
+soac_lowering = { path = "../soac_lowering" }

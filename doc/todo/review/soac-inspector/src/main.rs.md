@@ -1,4 +1,4 @@
-# soac-inspector/src/main.rs
+# crates/soac_inspector/src/main.rs
 
 ## File Responsibilities
 
@@ -14,5 +14,5 @@ HTTP server entrypoint for the inspector web app. It binds a local address, prin
 
 ## Context Read
 
-- `soac-inspector/src/lib.rs`
+- `crates/soac_inspector/src/lib.rs`
 

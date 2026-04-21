@@ -1,4 +1,4 @@
-# soac-jit/src/module_type.rs
+# crates/soac_jit/src/module_type.rs
 
 ## File Responsibilities
 
@@ -66,9 +66,9 @@ emission, JIT-codegen logging, and type/key layout profiling hooks.
 
 ## Context Read
 
-- `soac-jit/src/session.rs`
-- `soac-jit/src/counter.rs`
-- `soac-jit/src/counter_dump.rs`
-- `soac-jit/src/module_constants.rs`
-- `soac-jit/src/jit/mod.rs`
+- `crates/soac_jit/src/session.rs`
+- `crates/soac_jit/src/counter.rs`
+- `crates/soac_jit/src/counter_dump.rs`
+- `crates/soac_jit/src/module_constants.rs`
+- `crates/soac_jit/src/jit/mod.rs`
 

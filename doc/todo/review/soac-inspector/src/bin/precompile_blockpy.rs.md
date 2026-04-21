@@ -1,4 +1,4 @@
-# soac-inspector/src/bin/precompile_blockpy.rs
+# crates/soac_inspector/src/bin/precompile_blockpy.rs
 
 ## File Responsibilities
 
@@ -34,6 +34,6 @@ Offline precompile CLI. It reads specialization counters, resolves pre-optimizat
 
 ## Context Read
 
-- `soac-jit` offline compile/module cache APIs
-- `soac-pyo3/src/jit_runtime.rs`
+- `soac_jit` offline compile/module cache APIs
+- `crates/soac_pyo3/src/jit_runtime.rs`
 - `build_support/src/lib.rs`

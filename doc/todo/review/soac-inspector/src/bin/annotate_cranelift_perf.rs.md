@@ -1,4 +1,4 @@
-# soac-inspector/src/bin/annotate_cranelift_perf.rs
+# crates/soac_inspector/src/bin/annotate_cranelift_perf.rs
 
 ## File Responsibilities
 
@@ -36,6 +36,6 @@ Annotates rendered Cranelift VCode with perf sample counts for SOAC JIT code. It
 ## Context Read
 
 - `scripts/summarize_benchmark_result.py`
-- `soac-inspector/src/bin/render_jit_clif.rs`
-- `soac-jit` JIT BB map artifact shape
+- `crates/soac_inspector/src/bin/render_jit_clif.rs`
+- `soac_jit` JIT BB map artifact shape
 

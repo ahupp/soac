@@ -1,7 +1,7 @@
 # Development Environment
 
 Install the Python-side venv and the nightly Rust codegen backend used by
-`soac-jit`:
+`soac_jit`:
 
 ```
 just setup-dev-env
@@ -143,13 +143,13 @@ typed variables must use recognized values. Boolean knobs accept `1`, `true`,
 
 - `SOAC_COMPILE_MODE=eager`
   In `fn eager_clif_compile_requested`, at
-  [soac-pyo3/src/jit_runtime.rs:96](/home/adam/project/soac-profile/soac-pyo3/src/jit_runtime.rs#L96),
+  [crates/soac_pyo3/src/jit_runtime.rs:96](/home/adam/project/soac-profile/crates/soac_pyo3/src/jit_runtime.rs#L96),
   eagerly compile lazy CLIF/JIT entries as they are registered instead
   of waiting for first execution.
 
 - `SOAC_EXEC_TRACE=<selector>`
   In `fn parse_trace_env`, at
-  [soac-lowering/src/passes/trace/mod.rs:20](/home/adam/project/soac-profile/soac-lowering/src/passes/trace/mod.rs#L20),
+  [crates/soac_lowering/src/passes/trace/mod.rs:20](/home/adam/project/soac-profile/crates/soac_lowering/src/passes/trace/mod.rs#L20),
   enable basic-block tracing. Accepted forms are:
   - `all`, `1`, `*`, or empty selector: trace all functions
   - `<exact-qualname>`: trace one function
@@ -319,7 +319,7 @@ def add(a, b):
 `%soac-profile` materializes the recovered function source into a temporary
 module, runs that module through SOAC with `SOAC_OPT_MODE=profile`, calls the
 function with the provided arguments, and records the profile counters for the
-session. `%soac-clif` uses `soac-inspector` with those counters to print
+session. `%soac-clif` uses `soac_inspector` with those counters to print
 specialized Cranelift IR, which is the more readable structured view for most
 optimization decisions. `%soac-clif-annotate` sends the recovered Python source,
 specialized CLIF, and decoded specialization-counter context to `codex exec` and
@@ -380,7 +380,7 @@ tree, with pystone benchmark runs writing to `work/bench/`.
   `SOAC_PRECOMPILED_LIBRARY` to the resulting
   `.so` to let runtime direct-function setup use matching precompiled entries.
 
-- `cargo run -p soac-inspector --bin decide_optimizations -- --counters <profile.bin> --out <modules-root>`
+- `cargo run -p soac_inspector --bin decide_optimizations -- --counters <profile.bin> --out <modules-root>`
   Load a counter dump once, scan the cached BlockPy module root for
   `mod.blockpy` files, and write sibling binary optimization-decision artifacts
   using stable module artifact paths such as `python-stdlib/typing/mod.opt`.
@@ -388,9 +388,9 @@ tree, with pystone benchmark runs writing to `work/bench/`.
   cached unoptimized BlockPy modules instead of writing legacy `mod.opt` plans.
   Pass `--module-root <root-dir>` to scan a different input root, or one or more
   `--module <mod.blockpy>` arguments for narrower debugging.
-  Use `cargo run -p soac-inspector --bin print_optimization_plan -- --plan <mod.opt>`
+  Use `cargo run -p soac_inspector --bin print_optimization_plan -- --plan <mod.opt>`
   to pretty-print a legacy plan for inspection, or
-  `cargo run -p soac-inspector --bin print_optimization_plan_v3 -- --plan <mod.optv3>`
+  `cargo run -p soac_inspector --bin print_optimization_plan_v3 -- --plan <mod.optv3>`
   to inspect a v3 artifact summary. `just benchmark` runs v3 mode after the
   profile pass by default. In `SOAC_OPT_MODE=verify|apply`,
   `SOAC_OPT_PLAN_MODE` controls runtime plan selection: the default `v3`
@@ -399,7 +399,7 @@ tree, with pystone benchmark runs writing to `work/bench/`.
 
 - `SOAC_JIT_PERF_HELPER_FRAMES=1`
   In `fn should_preserve_perf_helper_frames`, at
-  [soac-jit/src/jit/specialized_helpers.rs:1700](/home/adam/project/soac-profile/soac-jit/src/jit/specialized_helpers.rs#L1700),
+  [crates/soac_jit/src/jit/specialized_helpers.rs:1700](/home/adam/project/soac-profile/crates/soac_jit/src/jit/specialized_helpers.rs#L1700),
   select profiling-oriented helper wrappers that preserve explicit stack
   frames. This improves perf call stacks but is slower than the default
   fast helper path. The perf recipes default it on.
@@ -489,11 +489,11 @@ tree, with pystone benchmark runs writing to `work/bench/`.
 ## Local Web Inspector
 
 - `HOST=<bind-address>`
-  In [`fn main`, at [soac-inspector/src/main.rs:8](/home/adam/project/soac-profile/soac-inspector/src/main.rs#L8)],
+  In [`fn main`, at [crates/soac_inspector/src/main.rs:8](/home/adam/project/soac-profile/crates/soac_inspector/src/main.rs#L8)],
   control the bind address for the local inspector server. The `Justfile`
   default is `127.0.0.1`.
 
 - `PORT=<port>`
-  In [`fn main`, at [soac-inspector/src/main.rs:9](/home/adam/project/soac-profile/soac-inspector/src/main.rs#L9)],
+  In [`fn main`, at [crates/soac_inspector/src/main.rs:9](/home/adam/project/soac-profile/crates/soac_inspector/src/main.rs#L9)],
   control the bind port for the local inspector server. The `Justfile`
   default is `8000`.

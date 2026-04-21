@@ -1,4 +1,4 @@
-# soac-jit/src/counter_dump.rs
+# crates/soac_jit/src/counter_dump.rs
 
 ## File Responsibilities
 
@@ -57,7 +57,7 @@ branch, block-entry, module-key, and type-key specialization consumers.
 
 ## Context Read
 
-- `soac-jit/src/module_type.rs`
-- `soac-jit/src/jit/mod.rs`
+- `crates/soac_jit/src/module_type.rs`
+- `crates/soac_jit/src/jit/mod.rs`
 - `soac-blockpy/src/block_py.rs`
 

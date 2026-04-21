@@ -19,8 +19,8 @@ Computes a stable SOAC build-identity hash from source files that affect runtime
 
 ## Context Read
 
-- `soac-pyo3/build.rs`
-- `soac-inspector/build.rs`
-- `soac-pyo3/src/jit_runtime.rs`
-- `soac-inspector/src/bin/precompile_blockpy.rs`
+- `crates/soac_pyo3/build.rs`
+- `crates/soac_inspector/build.rs`
+- `crates/soac_pyo3/src/jit_runtime.rs`
+- `crates/soac_inspector/src/bin/precompile_blockpy.rs`
 

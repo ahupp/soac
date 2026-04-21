@@ -56,28 +56,28 @@ Non-goals:
 ## Implementation Status
 
 The current implementation uses an offline v3 planner path. Shared
-serializable plan and mechanical artifact types live in `soac-opt`,
-the offline extraction/planning pipeline lives in `soac-opt`, and
-`soac-jit` consumes validated `mod.optv3` artifacts mechanically during
+serializable plan and mechanical artifact types live in `soac_opt`,
+the offline extraction/planning pipeline lives in `soac_opt`, and
+`soac_jit` consumes validated `mod.optv3` artifacts mechanically during
 `verify`/`apply` or precompile. The old live bridge that reconstructed v3
 artifacts from legacy `mod.opt` has been removed, so v3 no longer consumes
 legacy optimization decisions.
 
 Implemented:
 
-- `soac-opt::plan_v3`: full plan schema, conversion
+- `soac_opt::plan_v3`: full plan schema, conversion
   signatures, operation signatures, replay-safety validation, and structural
   validation. Function plans also carry validated `scalar_threads` sidecars
   that name cross-region scalar-local rewrites without asking codegen to
   rediscover them.
-- `soac-opt::alternatives_v3`: default catalog entries for
+- `soac_opt::alternatives_v3`: default catalog entries for
   generic Python add/sub/mul/bitwise/all-rich-compare, exact compact-int
   add/sub/mul/bitwise/all-rich-compare, truthiness, and materialization.
-- `soac-opt::region_v3`: conservative branch/return region
+- `soac_opt::region_v3`: conservative branch/return region
   extraction that preserves evaluation order, records store targets and simple
   jump continuations for store-RHS regions, and declines unsupported blocks
   explicitly.
-- `soac-opt::planner_v3`: bounded planner for
+- `soac_opt::planner_v3`: bounded planner for
   exact-compact-`int` direct comparison branches, `a + b > 0` branches,
   `return a + b`/`return a - b`/`return a * b` arithmetic returns,
   `return a & b`/`return a | b`/`return a ^ b` bitwise returns, and
@@ -87,14 +87,14 @@ Implemented:
   profiled direct-call selections from `call_hot_targets`. Constant-attribute
   indexed-field selections are planned from raw `type_keys` layout evidence and
   lowered `GetAttr`/`SetAttr` sites.
-- `soac-opt::emit_v3`: validation-gated mechanical
+- `soac_opt::emit_v3`: validation-gated mechanical
   emitter over selected v3 plan nodes and exits. Function-level direct-call
   selections and indexed-field selections are also emitted as mechanical
   decisions.
-- `soac-opt::evidence_v3`: bridge from existing
+- `soac_opt::evidence_v3`: bridge from existing
   `FunctionProfileEvidence` exact-int operator shapes and lowered integer
   module constants into v3 planner facts.
-- `soac-opt::pipeline_v3`: exact-int pipeline that composes
+- `soac_opt::pipeline_v3`: exact-int pipeline that composes
   extraction, evidence, planning, validation, and mechanical emission.
 - `decide_optimizations --mode v3`: offline planner mode that reads cached
   unoptimized `mod.blockpy` plus `profile.bin`, derives v3 facts directly from
@@ -145,7 +145,7 @@ Partially migrated families are also intentionally visible:
   lowering itself is still the existing typed lowering rather than a mechanical
   v3 call node.
 - indexed fields are represented as v3 plan selections plus mechanical
-  indexed-field emissions. `soac-jit` now keeps the emitted access kind and
+  indexed-field emissions. `soac_jit` now keeps the emitted access kind and
   attribute name separate from legacy per-instruction field evidence and
   validates that they match the lowered `GetAttr`/`SetAttr` site before
   annotating typed attribute lowering. By-attribute layout availability is
@@ -156,7 +156,7 @@ Partially migrated families are also intentionally visible:
 Remaining scalar cleanup:
 
 - The compact-int region-step emitter is mechanical once a v3 region is
-  selected, but scalar threading still has a `soac-jit` recognizer for the
+  selected, but scalar threading still has a `soac_jit` recognizer for the
   adjacent store-RHS -> empty compare block -> simple return shape. A cleaner
   follow-up is to make the scalar-thread emission plan name the fused block
   shape, consumed labels, unmaterialized-local cleanup, and inline-return
@@ -682,7 +682,7 @@ not change generated code.
 
 Deliverable:
 
-- A new optimizer-plan module, for example `soac-opt/src/plan_v3.rs`
+- A new optimizer-plan module, for example `crates/soac_opt/src/plan_v3.rs`
   or a new shared crate module if the existing crate boundaries make that
   cleaner.
 - Data types for:
@@ -815,7 +815,7 @@ merge-conflict risk. Each workstream should own a narrow file set.
 
 Ownership:
 
-- `soac-opt/src/plan_v3.rs`
+- `crates/soac_opt/src/plan_v3.rs`
 - module export wiring
 - unit tests colocated with the new module
 
@@ -833,7 +833,7 @@ Conflict risk:
 
 Ownership:
 
-- a new file such as `soac-opt/src/alternatives_v3.rs`
+- a new file such as `crates/soac_opt/src/alternatives_v3.rs`
 - catalog-only tests
 
 Output:
@@ -852,8 +852,8 @@ Conflict risk:
 
 Ownership:
 
-- a new file such as `soac-lowering/src/passes/optimization_regions.rs`
-- focused tests in `soac-lowering`
+- a new file such as `crates/soac_lowering/src/passes/optimization_regions.rs`
+- focused tests in `soac_lowering`
 
 Output:
 
@@ -870,7 +870,7 @@ Conflict risk:
 
 Ownership:
 
-- a new file such as `soac-opt/src/planner_v3.rs`
+- a new file such as `crates/soac_opt/src/planner_v3.rs`
 - tests that use hand-built regions and the alternative catalog
 
 Output:
@@ -887,8 +887,8 @@ Conflict risk:
 
 Ownership:
 
-- a new file such as `soac-jit/src/jit/plan_v3_emitter.rs`
-- minimal wiring in `soac-jit/src/jit/mod.rs`
+- a new file such as `crates/soac_jit/src/jit/plan_v3_emitter.rs`
+- minimal wiring in `crates/soac_jit/src/jit/mod.rs`
 
 Output:
 

@@ -1,4 +1,4 @@
-# soac-jit/src/jit/mod.rs
+# crates/soac_jit/src/jit/mod.rs
 
 ## File Responsibilities
 
@@ -110,11 +110,11 @@ lifetime management.
 
 ## Context Read
 
-- `soac-jit/src/jit/planning.rs`: supplies local/refcount/deopt plans consumed by codegen.
-- `soac-jit/src/jit/intrinsics.rs`: emits intrinsic operations through `OperationEmitState`.
-- `soac-jit/src/jit/specialized_helpers.rs`: registers and implements imported helper symbols.
-- `soac-jit/src/jit/runtime_context.rs`: supplies ABI offsets and runtime context structs.
-- `soac-jit/src/jit/direct_abi.rs` and `soac-jit/src/jit/typed_value.rs`: supply direct-call descriptors and typed-demand
+- `crates/soac_jit/src/jit/planning.rs`: supplies local/refcount/deopt plans consumed by codegen.
+- `crates/soac_jit/src/jit/intrinsics.rs`: emits intrinsic operations through `OperationEmitState`.
+- `crates/soac_jit/src/jit/specialized_helpers.rs`: registers and implements imported helper symbols.
+- `crates/soac_jit/src/jit/runtime_context.rs`: supplies ABI offsets and runtime context structs.
+- `crates/soac_jit/src/jit/direct_abi.rs` and `crates/soac_jit/src/jit/typed_value.rs`: supply direct-call descriptors and typed-demand
   value/result models.
 - `crate::module_constants`, `crate::module_type`, `crate::session`, `crate::config`, and `crate::operator_specialization`:
   provide constants, shared module state, process session/config, and specialization metadata.

@@ -25,7 +25,7 @@ CPython names to preserve:
 - Function signature annotations are not collected into a helper.
 - `soac-blockpy/src/passes/ruff_to_blockpy/module_plan/mod.rs` always passes `None` as the
   `annotate_fn` argument when it materializes `__soac__.make_function(...)`.
-- `soac-pyo3/src/jit_runtime.rs` already has the runtime hook: `update_function_metadata(...)`
+- `crates/soac_pyo3/src/jit_runtime.rs` already has the runtime hook: `update_function_metadata(...)`
   sets `func.__annotate__` when the `annotate_fn` argument is not `None`.
 - The generated module/class helper handles VALUE and STRING, but raises `NotImplementedError`
   for FORWARDREF. That sends CPython's `annotationlib.call_annotate_function(...)` down its
@@ -155,6 +155,6 @@ Run at least:
 ```sh
 just pytest tests/test_regression_annotationlib_nonlocal.py
 just pytest tests/test_integration_cases.py
-cargo check -p soac-blockpy -p soac-pyo3 -p soac-jit
+cargo check -p soac-blockpy -p soac_pyo3 -p soac_jit
 ```
 

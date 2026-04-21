@@ -12,7 +12,7 @@ line, and insertion into the current raised exception's `__traceback__`.
 
 ## Existing facts
 
-- `soac-jit/src/jit/jitdump.rs` serializes Cranelift `SystemVUnwindInfo` into
+- `crates/soac_jit/src/jit/jitdump.rs` serializes Cranelift `SystemVUnwindInfo` into
   `.eh_frame` bytes and writes a `PERF_JIT_CODE_UNWINDING_INFO` record before
   the matching `PERF_JIT_CODE_LOAD` record.
 - That jitdump copy is for perf.  Runtime traceback recovery should not parse

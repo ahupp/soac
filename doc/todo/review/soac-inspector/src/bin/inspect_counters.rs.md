@@ -1,4 +1,4 @@
-# soac-inspector/src/bin/inspect_counters.rs
+# crates/soac_inspector/src/bin/inspect_counters.rs
 
 ## File Responsibilities
 
@@ -19,6 +19,6 @@ CLI for inspecting SOAC counter dump files. It can print module/type key layouts
 
 ## Context Read
 
-- `soac-jit/src/counter_dump.rs`
+- `crates/soac_jit/src/counter_dump.rs`
 - `.codex/skills/soac-clif-snippet/scripts/profile_snippet_clif.py`
 

@@ -14,5 +14,5 @@ Package initializer for `soac`. It eagerly imports the native `_soac_ext` extens
 
 ## Context Read
 
-- `soac-pyo3/src/lib.rs`
+- `crates/soac_pyo3/src/lib.rs`
 

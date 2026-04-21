@@ -1,4 +1,4 @@
-# soac-jit-runtime/src/lib.rs
+# crates/soac_jit_runtime/src/lib.rs
 
 ## File Responsibilities
 
@@ -32,7 +32,7 @@ Very-hot raw ABI runtime helper library for generated SOAC code. It mirrors sele
 ## Context Read
 
 - `doc/RUNTIME_FUNCTIONS.md`
-- `soac-jit/src/jit/mod.rs`
-- `soac-jit/src/jit/specialized_helpers.rs`
+- `crates/soac_jit/src/jit/mod.rs`
+- `crates/soac_jit/src/jit/specialized_helpers.rs`
 - CPython raw object layout assumptions in `vendor/cpython` headers were treated as the ABI source, but not edited.
 

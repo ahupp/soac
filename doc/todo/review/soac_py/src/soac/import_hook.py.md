@@ -29,6 +29,6 @@ Import hook that replaces eligible source-module loading with SOAC module creati
 
 ## Context Read
 
-- `soac-pyo3/src/jit_runtime.rs`
+- `crates/soac_pyo3/src/jit_runtime.rs`
 - `soac_py/src/soac/runtime.py`
 

@@ -1,8 +1,8 @@
-# soac-jit/src/config.rs
+# crates/soac_jit/src/config.rs
 
 ## File Responsibilities
 
-Thin `soac-jit` facade over centralized environment parsing in `soac_config`, plus construction of Cranelift target ISA
+Thin `soac_jit` facade over centralized environment parsing in `soac_config`, plus construction of Cranelift target ISA
 settings for runtime JIT and offline object generation. This keeps call sites from reading environment variables directly
 while preserving crate-local visibility choices. BlockPy module-cache path and metadata helpers are forwarded from
 `soac_blockpy::codegen_cache`.
@@ -39,7 +39,7 @@ while preserving crate-local visibility choices. BlockPy module-cache path and m
 
 ## Context Read
 
-- `soac-config/src/lib.rs`
+- `crates/soac_config/src/lib.rs`
 - `soac-blockpy/src/codegen_cache.rs`
-- `soac-jit/src/jit/mod.rs`
-- `soac-jit/src/module_type.rs`
+- `crates/soac_jit/src/jit/mod.rs`
+- `crates/soac_jit/src/module_type.rs`

@@ -19,7 +19,7 @@ xdg_runtime_dir := env_var_or_default("XDG_RUNTIME_DIR", repo_root + "/work/tmp"
 cargo_home := env_var_or_default("CARGO_HOME", repo_root + "/work/cargo-home")
 pyo3_python := cpython_bin
 web_dir := repo_root + "/web"
-inspector_bin := repo_root + "/target/debug/soac-inspector"
+inspector_bin := repo_root + "/target/debug/soac_inspector"
 port := env_var_or_default("PORT", "8000")
 host := env_var_or_default("HOST", "127.0.0.1")
 url := "http://" + host + ":" + port
@@ -340,7 +340,7 @@ build-extension build="debug": ensure-cpython
 
   (
     cd "$REPO_ROOT"
-    cargo build "${BUILD_ARGS[@]}" -p soac-pyo3
+    cargo build "${BUILD_ARGS[@]}" -p soac_pyo3
   )
   just install-extension "$BUILD"
 
@@ -467,7 +467,7 @@ build-web-inspector-server: ensure-cpython ensure-shared-python
   TIMEFORMAT='[diet-python timing] build_web_inspector_server_s=%3R'
   time {
     cd "$REPO_ROOT"
-    cargo build -p soac-inspector --bin soac-inspector
+    cargo build -p soac_inspector --bin soac_inspector
   }
 
 build-web-inspector: build-web-inspector-server
@@ -1074,7 +1074,7 @@ _test-all-test-phase:
   cargo_test_status_file="$test_log_dir/cargo-test.status"
   pytest_status_file="$test_log_dir/pytest.status"
 
-  # Some soac-jit tests share CPython process state and JIT finalization state.
+  # Some soac_jit tests share CPython process state and JIT finalization state.
   # Keep the Rust harness serial here so the full gate is deterministic. Pytest
   # imports a symlink to target/debug/lib_soac_ext.so, so running it while cargo
   # relinks test artifacts can load a mismatched extension.
@@ -1129,7 +1129,7 @@ _call-target-specializations-from-dump dump_path:
   #!/usr/bin/env bash
   set -euo pipefail
   cd "$REPO_ROOT"
-  cargo run --release -p soac-inspector --bin inspect_counters -- --specializations "{{dump_path}}"
+  cargo run --release -p soac_inspector --bin inspect_counters -- --specializations "{{dump_path}}"
 
 [private]
 _decide-optimizations-for-counters-dir counters_dir:
@@ -1164,7 +1164,7 @@ _decide-optimizations-for-counters-dir counters_dir:
       find "$MODULE_CACHE_DIR" -name mod.optv3 -delete
     fi
   fi
-  cargo run --release -p soac-inspector --bin decide_optimizations -- \
+  cargo run --release -p soac_inspector --bin decide_optimizations -- \
     --mode "$OPTIMIZATION_PLAN_MODE" \
     --counters "$COUNTERS_DIR/profile.bin" \
     --out "$MODULE_CACHE_DIR"
@@ -1416,7 +1416,7 @@ precompile-shared-library counters="" out="work/logs/libsoac_precompiled.so" obj
 
   SOAC_WORK_DIR="$COUNTERS_DIR" \
   SOAC_OPT_PLAN_MODE="${SOAC_OPT_PLAN_MODE:-v3}" \
-    cargo run -p soac-inspector --bin precompile_blockpy -- "${args[@]}"
+    cargo run -p soac_inspector --bin precompile_blockpy -- "${args[@]}"
 
 [private]
 _benchmark-export-specialized-artifacts result_dir:
@@ -1443,23 +1443,23 @@ _benchmark-export-specialized-artifacts result_dir:
   rm -rf "$CLIF_DIR"
   mkdir -p "$CLIF_DIR"
 
-  cargo run --release -p soac-inspector --bin inspect_counters -- \
+  cargo run --release -p soac_inspector --bin inspect_counters -- \
     "$COUNTERS_DIR/profile.bin" > "$RESULT_DIR/profile_counters.txt"
-  cargo run --release -p soac-inspector --bin inspect_counters -- \
+  cargo run --release -p soac_inspector --bin inspect_counters -- \
     "$COUNTERS_DIR/verify.bin" > "$RESULT_DIR/verify_counters.txt"
-  cargo run --release -p soac-inspector --bin inspect_counters -- \
+  cargo run --release -p soac_inspector --bin inspect_counters -- \
     --specializations "$COUNTERS_DIR/profile.bin" > "$RESULT_DIR/profile_specializations.txt"
-  cargo run --release -p soac-inspector --bin inspect_counters -- \
+  cargo run --release -p soac_inspector --bin inspect_counters -- \
     --specializations "$COUNTERS_DIR/verify.bin" > "$RESULT_DIR/verify_specializations.txt"
 
-  cargo run -q --release -p soac-inspector --bin list_jit_functions -- "$PYSTONE_SOURCE" \
+  cargo run -q --release -p soac_inspector --bin list_jit_functions -- "$PYSTONE_SOURCE" \
     > "$CLIF_DIR/functions.tsv"
   while IFS=$'\t' read -r function_id qualname; do
     safe_qualname="$(printf '%s' "$qualname" | tr -cs '[:alnum:]_.' '_')"
     output_base="$CLIF_DIR/fn_${function_id}_${safe_qualname}"
     SOAC_WORK_DIR="$COUNTERS_DIR" \
     SOAC_OPT_MODE=apply \
-      cargo run -q --release -p soac-inspector --bin render_jit_clif -- \
+      cargo run -q --release -p soac_inspector --bin render_jit_clif -- \
         --specialized --module-name pystone \
         --cfg-dot-out "$output_base.cfg.dot" \
         --vcode-out "$output_base.vcode" \
@@ -1527,7 +1527,7 @@ _benchmark-add-deep-profile-artifacts result_dir perf_loops="10000000": ensure-c
 
   just _benchmark-export-specialized-artifacts "$RESULT_DIR"
   just _benchmark-run-specialized-perf "$RESULT_DIR" "{{perf_loops}}"
-  cargo run -q -p soac-inspector --bin annotate_cranelift_perf -- "$RESULT_DIR"
+  cargo run -q -p soac_inspector --bin annotate_cranelift_perf -- "$RESULT_DIR"
 
 benchmark-deep-profile-from-profile result_dir verify_loops="100000" perf_loops="10000000": (update-venv-offline) (build-extension "release")
   #!/usr/bin/env bash

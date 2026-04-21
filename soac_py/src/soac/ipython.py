@@ -309,7 +309,7 @@ class SoacOptimizationExplorer:
             "run",
             "-q",
             "-p",
-            "soac-inspector",
+            "soac_inspector",
             "--bin",
             bin_name,
             "--",

@@ -1,4 +1,4 @@
-# soac-inspector/src/bin/render_jit_clif.rs
+# crates/soac_inspector/src/bin/render_jit_clif.rs
 
 ## File Responsibilities
 
@@ -18,6 +18,6 @@ CLI for rendering JIT CLIF/VCode for a lowered Python function. It supports prof
 
 ## Context Read
 
-- `soac-inspector/src/lib.rs`
-- `soac-jit` debug rendering APIs
+- `crates/soac_inspector/src/lib.rs`
+- `soac_jit` debug rendering APIs
 

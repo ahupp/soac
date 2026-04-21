@@ -1,8 +1,8 @@
-# soac-inspector/build.rs
+# crates/soac_inspector/build.rs
 
 ## File Responsibilities
 
-Build script for `soac-inspector`. It discovers the vendored CPython shared-library build directory, emits linker search/library directives, and embeds the SOAC build identity.
+Build script for `soac_inspector`. It discovers the vendored CPython shared-library build directory, emits linker search/library directives, and embeds the SOAC build identity.
 
 ## Datatypes
 
@@ -16,5 +16,5 @@ Build script for `soac-inspector`. It discovers the vendored CPython shared-libr
 ## Context Read
 
 - `build_support/src/lib.rs`
-- `soac-pyo3/build.rs`
+- `crates/soac_pyo3/build.rs`
 

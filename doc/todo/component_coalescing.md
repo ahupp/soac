@@ -11,17 +11,17 @@ to understand and safer to change.
 The same runtime-helper concept is currently described in several places:
 
 - runtime helper facts in `soac-blockpy/src/passes/value_facts.rs`
-- direct-call ABI descriptors in `soac-jit/src/jit/direct_abi.rs`
-- JIT import specs and symbol registration in `soac-jit/src/jit/mod.rs`
-- helper implementations and registration in `soac-jit/src/jit/specialized_helpers.rs`
-- inlinable runtime implementations in `soac-jit-runtime/src/lib.rs`
+- direct-call ABI descriptors in `crates/soac_jit/src/jit/direct_abi.rs`
+- JIT import specs and symbol registration in `crates/soac_jit/src/jit/mod.rs`
+- helper implementations and registration in `crates/soac_jit/src/jit/specialized_helpers.rs`
+- inlinable runtime implementations in `crates/soac_jit_runtime/src/lib.rs`
 
 Coalesce this into one shared runtime ABI registry that records symbol name, signature, ownership,
 result facts, error convention, implementation origin, inlinability, and optional direct-call
 descriptor. Codegen, value facts, import declaration, symbol registration, and docs should consume
 that table instead of independently encoding the same helper properties.
 
-Do not merge `soac-jit-runtime` and `specialized_helpers.rs` directly. `soac-jit-runtime` is the inlinable
+Do not merge `soac_jit_runtime` and `specialized_helpers.rs` directly. `soac_jit_runtime` is the inlinable
 raw ABI layer; `specialized_helpers.rs` is the CPython/JIT bridge and panic boundary. The shared
 piece should be descriptors and generated registration, not one physical helper implementation file.
 
@@ -33,9 +33,9 @@ conceptual model but are split across:
 - `soac-blockpy/src/passes/value_facts.rs`
 - `soac-blockpy/src/passes/ownership_effects.rs`
 - `soac-blockpy/src/passes/local_env_plan.rs`
-- `soac-jit/src/jit/typed_value.rs`
-- `soac-jit/src/jit/planning.rs`
-- demand-aware emission in `soac-jit/src/jit/mod.rs`
+- `crates/soac_jit/src/jit/typed_value.rs`
+- `crates/soac_jit/src/jit/planning.rs`
+- demand-aware emission in `crates/soac_jit/src/jit/mod.rs`
 
 The intended direction is a BlockPy-owned typed lowering plan that records representation, demand,
 ownership, cleanup obligations, and local environment requirements. JIT codegen should consume that
@@ -90,7 +90,7 @@ fields of one model. This keeps staged lowering while reducing translation-only 
 
 ### Build Support For Vendored CPython (done)
 
-The build scripts for `soac-jit`, `soac-inspector`, and `soac-pyo3` duplicate vendored `libpython`
+The build scripts for `soac_jit`, `soac_inspector`, and `soac_pyo3` duplicate vendored `libpython`
 discovery and Cargo link directive emission. `build_support/src/lib.rs` already provides
 shared build identity support; extend build support with vendored-CPython library discovery and link
 emission helpers.

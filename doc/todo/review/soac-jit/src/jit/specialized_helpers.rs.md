@@ -1,4 +1,4 @@
-# soac-jit/src/jit/specialized_helpers.rs
+# crates/soac_jit/src/jit/specialized_helpers.rs
 
 ## File Responsibilities
 
@@ -61,8 +61,8 @@ helpers, exception helpers, and perf-attribution wrapper variants. The file is i
 
 ## Context Read
 
-- `soac-jit/src/jit/mod.rs`: declares import specs for these helpers and calls `register_specialized_jit_symbols`.
-- `soac-jit/src/jit/deopt_interpreter.rs`: invoked by `dp_jit_deopt_resume`.
+- `crates/soac_jit/src/jit/mod.rs`: declares import specs for these helpers and calls `register_specialized_jit_symbols`.
+- `crates/soac_jit/src/jit/deopt_interpreter.rs`: invoked by `dp_jit_deopt_resume`.
 - `crate::module_constants`: runtime-name load and missing-name error helpers.
 - `crate::operator_specialization`: exact-int operator enums used by numeric specialization helpers.
 - `crate::config::jit_perf_helper_frames_enabled`: selects fast versus perf-frame helper symbols.

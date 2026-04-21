@@ -1,4 +1,4 @@
-# soac-jit/src/module_constants.rs
+# crates/soac_jit/src/module_constants.rs
 
 ## File Responsibilities
 
@@ -56,7 +56,7 @@ runtime module itself is being loaded, plus support for experimental static comp
 
 ## Context Read
 
-- `soac-jit/src/jit/mod.rs`
-- `soac-jit/src/module_type.rs`
+- `crates/soac_jit/src/jit/mod.rs`
+- `crates/soac_jit/src/module_type.rs`
 - `soac_py/src/soac/runtime.py`
 - `soac-blockpy/src/block_py.rs`

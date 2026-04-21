@@ -1727,14 +1727,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "soac-config"
+name = "soac_config"
 version = "0.1.0"
 dependencies = [
  "tracing-subscriber",
 ]
 
 [[package]]
-name = "soac-core"
+name = "soac_core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1745,7 +1745,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "soac-cpython"
+name = "soac_cpython"
 version = "0.1.0"
 dependencies = [
  "libc",
@@ -1753,19 +1753,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "soac-driver"
+name = "soac_driver"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "rkyv",
- "soac-config",
- "soac-core",
- "soac-lowering",
+ "soac_config",
+ "soac_core",
+ "soac_lowering",
  "tracing",
 ]
 
 [[package]]
-name = "soac-inspector"
+name = "soac_inspector"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1776,13 +1776,13 @@ dependencies = [
  "rkyv",
  "serde",
  "serde_json",
- "soac-config",
- "soac-core",
- "soac-cpython",
- "soac-driver",
- "soac-jit",
- "soac-lowering",
- "soac-opt",
+ "soac_config",
+ "soac_core",
+ "soac_cpython",
+ "soac_driver",
+ "soac_jit",
+ "soac_lowering",
+ "soac_opt",
  "tokio",
  "tower",
  "tower-http",
@@ -1790,7 +1790,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "soac-jit"
+name = "soac_jit"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1809,17 +1809,17 @@ dependencies = [
  "rkyv",
  "ruff_python_ast",
  "serde_json",
- "soac-config",
- "soac-core",
- "soac-cpython",
- "soac-driver",
- "soac-lowering",
- "soac-opt",
+ "soac_config",
+ "soac_core",
+ "soac_cpython",
+ "soac_driver",
+ "soac_lowering",
+ "soac_opt",
  "tracing",
 ]
 
 [[package]]
-name = "soac-lowering"
+name = "soac_lowering"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1834,14 +1834,14 @@ dependencies = [
  "ruff_text_size",
  "serde_json",
  "similar",
- "soac-config",
- "soac-core",
- "soac-macros",
+ "soac_config",
+ "soac_core",
+ "soac_macros",
  "tracing",
 ]
 
 [[package]]
-name = "soac-macros"
+name = "soac_macros"
 version = "0.1.0"
 dependencies = [
  "proc-macro2",
@@ -1850,31 +1850,31 @@ dependencies = [
 ]
 
 [[package]]
-name = "soac-opt"
+name = "soac_opt"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "rkyv",
- "soac-core",
- "soac-driver",
- "soac-lowering",
+ "soac_core",
+ "soac_driver",
+ "soac_lowering",
 ]
 
 [[package]]
-name = "soac-pyo3"
+name = "soac_pyo3"
 version = "0.1.0"
 dependencies = [
  "build_support",
  "pyo3",
  "rkyv",
  "serde_json",
- "soac-config",
- "soac-core",
- "soac-cpython",
- "soac-driver",
- "soac-jit",
- "soac-lowering",
- "soac-opt",
+ "soac_config",
+ "soac_core",
+ "soac_cpython",
+ "soac_driver",
+ "soac_jit",
+ "soac_lowering",
+ "soac_opt",
  "tracing",
 ]
 

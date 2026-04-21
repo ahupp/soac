@@ -1,4 +1,4 @@
-# soac-macros/src/lib.rs
+# crates/soac_macros/src/lib.rs
 
 ## File Responsibilities
 
@@ -30,5 +30,5 @@ Procedural macro crate for SOAC IR enums. It generates delegation and mapping bo
 ## Context Read
 
 - SOAC IR enum usage in `soac-blockpy`
-- Generated trait names referenced by `soac-macros`
+- Generated trait names referenced by `soac_macros`
 

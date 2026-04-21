@@ -1,4 +1,4 @@
-# soac-jit/src/lib.rs
+# crates/soac_jit/src/lib.rs
 
 ## File Responsibilities
 
@@ -80,9 +80,9 @@ direct method and constructor specialization.
 
 ## Context Read
 
-- `soac-jit/src/jit/mod.rs`
-- `soac-jit/src/jit/runtime_context.rs`
-- `soac-jit/src/jit/direct_abi.rs`
-- `soac-jit/src/module_type.rs`
+- `crates/soac_jit/src/jit/mod.rs`
+- `crates/soac_jit/src/jit/runtime_context.rs`
+- `crates/soac_jit/src/jit/direct_abi.rs`
+- `crates/soac_jit/src/module_type.rs`
 - `soac-blockpy/src/block_py.rs`
 

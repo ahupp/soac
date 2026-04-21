@@ -1,4 +1,4 @@
-# soac-jit/src/jit/planning.rs
+# crates/soac_jit/src/jit/planning.rs
 
 ## File Responsibilities
 
@@ -55,4 +55,4 @@ Tests cover local/refcount/deopt planning shapes for representative control-flow
 
 - `soac_blockpy::passes`: source local-env, refcount, fact, and deopt-resume planning APIs.
 - `soac_blockpy::block_py`: BlockPy function, block, edge, term, and argument datatypes consumed by the planner.
-- `soac-jit/src/jit/mod.rs`: consumes the planned locals, transports, cleanup, and deopt-resume metadata during codegen.
+- `crates/soac_jit/src/jit/mod.rs`: consumes the planned locals, transports, cleanup, and deopt-resume metadata during codegen.

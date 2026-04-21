@@ -1,4 +1,4 @@
-# soac-jit/src/operator_specialization.rs
+# crates/soac_jit/src/operator_specialization.rs
 
 ## File Responsibilities
 
@@ -26,7 +26,7 @@ recorded in counters and later decoded by specialized codegen to choose exact-in
 
 ## Context Read
 
-- `soac-jit/src/jit/mod.rs`
-- `soac-jit/src/jit/specialized_helpers.rs`
+- `crates/soac_jit/src/jit/mod.rs`
+- `crates/soac_jit/src/jit/specialized_helpers.rs`
 - `soac-blockpy/src/block_py.rs`
 

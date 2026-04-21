@@ -1,4 +1,4 @@
-# soac-jit/src/session.rs
+# crates/soac_jit/src/session.rs
 
 ## File Responsibilities
 
@@ -35,7 +35,7 @@ passed through runtime/JIT code instead of using scattered globals.
 
 ## Context Read
 
-- `soac-jit/src/module_type.rs`
-- `soac-jit/src/jit/mod.rs`
-- `soac-jit/src/jit/runtime_context.rs`
+- `crates/soac_jit/src/module_type.rs`
+- `crates/soac_jit/src/jit/mod.rs`
+- `crates/soac_jit/src/jit/runtime_context.rs`
 

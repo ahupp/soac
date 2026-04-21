@@ -1,4 +1,4 @@
-# soac-inspector/src/bin/list_jit_functions.rs
+# crates/soac_inspector/src/bin/list_jit_functions.rs
 
 ## File Responsibilities
 
@@ -18,6 +18,6 @@ Small CLI that lowers a source file and prints JSONL records for each lowered ca
 
 ## Context Read
 
-- `soac-inspector/src/lib.rs`
-- `soac-inspector/src/bin/render_jit_clif.rs`
+- `crates/soac_inspector/src/lib.rs`
+- `crates/soac_inspector/src/bin/render_jit_clif.rs`
 

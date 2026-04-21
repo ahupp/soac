@@ -1,0 +1,8 @@
+[package]
+name = "soac_cpython"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+libc = "0.2"
+pyo3 = { workspace = true }

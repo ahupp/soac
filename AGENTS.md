@@ -70,7 +70,7 @@ because it should affect engineering decisions:
    CPython hook; prefer an explicit post-create/post-callback init step
    or a clearly-owned Rust state object.
 
-9. Keep `soac-jit-runtime` visibly raw and ABI-shaped. It is the very-hot
+9. Keep `soac_jit_runtime` visibly raw and ABI-shaped. It is the very-hot
    local runtime layer that gets inlined into generated code: avoid PyO3
    wrapper types there, name hand-written CPython layout mirrors with a
    `RawPy*` prefix, and keep casts clustered at ABI boundaries so direct
@@ -185,7 +185,7 @@ current `@`. Do not treat another workspace's live `@` as a dependency.
 10. Keep runtime helper inventory in sync.
 
    If you add, remove, rename, or move runtime helper functions in
-   `soac-jit-runtime`, `soac-jit/src/jit/specialized_helpers.rs`, or
+   `soac_jit_runtime`, `crates/soac_jit/src/jit/specialized_helpers.rs`, or
    `soac_py/src/soac/runtime.py`, update `doc/RUNTIME_FUNCTIONS.md`
    in the same logical change.
 
@@ -217,8 +217,8 @@ benchmark artifacts named for that child rather than the existing revision.
 Run `just test-all` before submitting unless the change is docs-only,
 such as `doc/todo/TODO.md`, `AGENTS.md`, or similar documentation-only files.
 For fast feedback on Rust changes that may affect crate test targets,
-run `cargo check -p soac-jit --tests` before the full gate; it
-type-checks the `soac-jit` crate including tests without running the
+run `cargo check -p soac_jit --tests` before the full gate; it
+type-checks the `soac_jit` crate including tests without running the
 entire transformed-runtime suite.
 For Rust formatting, use `just fmt-rust <package> ...` and
 `just fmt-rust-check <package> ...`, which call package-scoped
@@ -401,7 +401,7 @@ another revision's cache.
   specialized CLIF with `%soac-clif func`, Codex-annotated CLIF with
   `%soac-clif-annotate func`, or lowered assembly-like VCode with
   `%soac-vcode func`. It materializes the function source into a temporary
-  transformed module, uses `soac-inspector` for rendering, and uses
+  transformed module, uses `soac_inspector` for rendering, and uses
   `codex exec` for annotation, so it is for local exploration rather than
   benchmark-quality measurement.
 - Repo-local uv state
@@ -524,7 +524,7 @@ explicit ordinary
   `$SOAC_WORK_DIR/modules`; run a profile/benchmark pass first when the cache is
   empty. Use `SOAC_PRECOMPILED_LIBRARY` to point runtime execution at the
   resulting shared library.
-- `cargo run -p soac-inspector --bin decide_optimizations -- --counters <profile.bin> --out <root-dir>`
+- `cargo run -p soac_inspector --bin decide_optimizations -- --counters <profile.bin> --out <root-dir>`
   Standalone optimization-decision planner. It loads the counter dump once,
   scans cached BlockPy modules under the output root by default, and writes
   binary `mod.opt` artifacts beside those modules, such as
@@ -532,9 +532,9 @@ explicit ordinary
   write `mod.optv3` artifacts from raw profile evidence and cached unoptimized
   BlockPy modules instead of legacy `mod.opt`. Use `--module` for a narrow
   debugging input or `--module-root` to scan a different cache root. Use
-  `cargo run -p soac-inspector --bin print_optimization_plan -- --plan <mod.opt>`
+  `cargo run -p soac_inspector --bin print_optimization_plan -- --plan <mod.opt>`
   to pretty-print a legacy plan for inspection, or
-  `cargo run -p soac-inspector --bin print_optimization_plan_v3 -- --plan <mod.optv3>`
+  `cargo run -p soac_inspector --bin print_optimization_plan_v3 -- --plan <mod.optv3>`
   to inspect a v3 artifact summary. In `SOAC_OPT_MODE=verify|apply`,
   `SOAC_OPT_PLAN_MODE` controls runtime plan selection: the default `v3`
   requires a matching serialized v3 artifact, while `auto` prefers a matching
@@ -591,8 +591,8 @@ explicit ordinary
 
 ### Debugging aids
 
-- To inspect transformed output quickly, run `cargo run -p soac-inspector --bin diet-python <file.py>`.
-- For BB/JIT inspection, `cargo run -p soac-inspector --bin render_jit_clif -- <source> <function_id>`.
+- To inspect transformed output quickly, run `cargo run -p soac_inspector --bin diet-python <file.py>`.
+- For BB/JIT inspection, `cargo run -p soac_inspector --bin render_jit_clif -- <source> <function_id>`.
 - To trace BB execution, set `SOAC_EXEC_TRACE` to `all`, `all:params`, `<exact-qualname>`, or `<exact-qualname>:params`.
 
 

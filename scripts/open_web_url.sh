@@ -34,7 +34,7 @@ if ss -ltnH "( sport = :$PORT )" | grep -q .; then
     exit 0
   fi
 
-  echo "Port $PORT is already in use, but the existing listener is not a healthy soac-inspector server." >&2
+  echo "Port $PORT is already in use, but the existing listener is not a healthy soac_inspector server." >&2
   ss -ltnp "( sport = :$PORT )" >&2 || true
   exit 1
 fi

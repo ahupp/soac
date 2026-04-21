@@ -1,4 +1,4 @@
-# soac-jit/src/jit/jitdump.rs
+# crates/soac_jit/src/jit/jitdump.rs
 
 ## File Responsibilities
 
@@ -34,6 +34,6 @@ Tests validate header/code-load serialization and unwind-info ordering in a temp
 
 ## Context Read
 
-- `soac-jit/src/jit/mod.rs`: calls `record_code_load` after generated code is compiled/finalized.
+- `crates/soac_jit/src/jit/mod.rs`: calls `record_code_load` after generated code is compiled/finalized.
 - `crate::config::soac_work_dir_from_env`: chooses the jitdump output directory.
 - Cranelift `TargetIsa` and System V unwind info APIs: source of codegen unwind metadata.

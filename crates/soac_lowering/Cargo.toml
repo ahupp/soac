@@ -1,0 +1,26 @@
+[package]
+name = "soac_lowering"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "soac_lowering"
+path = "src/lib.rs"
+
+[dependencies]
+ruff_python_parser = { workspace = true }
+ruff_python_ast = { workspace = true }
+ruff_python_codegen = { workspace = true }
+ruff_python_semantic = { workspace = true }
+ruff_text_size = { workspace = true }
+ruff_source_file = { workspace = true }
+regex = "1"
+serde_json = "1"
+rkyv = { version = "0.8", default-features = false, features = ["std", "bytecheck"] }
+similar = "2"
+tracing = "0.1"
+anyhow = { version = "1.0.100", features = ["backtrace"] }
+derive_more = { version = "2", features = ["from"] }
+soac_macros = { path = "../soac_macros" }
+soac_core = { path = "../soac_core" }
+soac_config = { path = "../soac_config" }

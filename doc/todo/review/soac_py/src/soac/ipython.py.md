@@ -29,7 +29,7 @@ IPython extension for interactive SOAC optimization exploration. It provides mag
 - `SoacOptimizationExplorer._render_clif`: invokes inspector rendering for CLIF with optional profile/specialization inputs.
 - `SoacOptimizationExplorer._counter_summary`: invokes `inspect_counters` for the profile dump.
 - `SoacOptimizationExplorer._run_codex_annotator`: runs `codex exec` with the annotation prompt.
-- `SoacOptimizationExplorer._run_inspector`: subprocess wrapper for `cargo run -p soac-inspector --bin ...`.
+- `SoacOptimizationExplorer._run_inspector`: subprocess wrapper for `cargo run -p soac_inspector --bin ...`.
 - `_parse_render_target`: parses optional magic target names.
 - `_build_clif_annotation_prompt`: builds Codex prompt text from source, counters, CLIF, and VCode.
 - `_bounded_context`: truncates long context blocks.
@@ -42,5 +42,5 @@ IPython extension for interactive SOAC optimization exploration. It provides mag
 
 - `.codex/skills/soac-clif-snippet/scripts/profile_snippet_clif.py`
 - `soac_py/src/soac/import_hook.py`
-- `soac-inspector/src/bin/render_jit_clif.rs`
+- `crates/soac_inspector/src/bin/render_jit_clif.rs`
 

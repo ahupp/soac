@@ -1,4 +1,4 @@
-# soac-jit/src/jit/typed_value.rs
+# crates/soac_jit/src/jit/typed_value.rs
 
 ## File Responsibilities
 
@@ -38,6 +38,6 @@ conversion, or refcount work.
 
 ## Context Read
 
-- `soac-jit/src/jit/mod.rs`: main consumer for typed expression and demand-aware lowering.
-- `soac-jit/src/jit/direct_abi.rs`: uses `ValueOwnership` in direct-call result ABI.
+- `crates/soac_jit/src/jit/mod.rs`: main consumer for typed expression and demand-aware lowering.
+- `crates/soac_jit/src/jit/direct_abi.rs`: uses `ValueOwnership` in direct-call result ABI.
 - `soac_blockpy::passes::PyObjFacts`: Python object facts stored alongside PyObject typed values.
