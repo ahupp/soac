@@ -89,8 +89,8 @@ use soac_opt::plan_v3::{
     ConversionKind, FailureMode, FallbackTarget, FunctionOptimizationPlanV3, GuardFailure,
     GuardKind, MaterializeKind, ModuleOptimizationPlanV3, PlanNodeId, PlanValue, PlannedConstant,
     RegionExitTarget, RegionId, RegionInputSource, RegionPlan, Rep, RichCompareOp,
-    ScalarLocalThreadPlan, ScalarThreadFallback, ScalarThreadLocalLocation,
-    ScalarThreadMaterialization,
+    ScalarLocalThreadPlan, ScalarThreadFallback, ScalarThreadLocalCleanup,
+    ScalarThreadLocalLocation, ScalarThreadLocalState, ScalarThreadMaterialization,
 };
 use soac_profile::{CollectedTypeKeyLayout, CounterDumpTypeKey, read_block_entry_counts_from_file};
 #[cfg(test)]
@@ -16573,6 +16573,26 @@ fn emit_planned_local_releases_for_reason_with_local_env(
     forwarded_locations: &HashSet<LocalLocation>,
     emit_ctx: &JitEmitCtx<'_>,
 ) -> Result<(), String> {
+    emit_planned_local_releases_for_reason_with_local_env_excluding(
+        fb,
+        source_label,
+        reason,
+        local_env,
+        forwarded_locations,
+        &HashSet::new(),
+        emit_ctx,
+    )
+}
+
+fn emit_planned_local_releases_for_reason_with_local_env_excluding(
+    fb: &mut FunctionBuilder<'_>,
+    source_label: BlockLabel,
+    reason: &RefcountReleaseReason,
+    local_env: &mut LocalEnv,
+    forwarded_locations: &HashSet<LocalLocation>,
+    unmaterialized_locations: &HashSet<LocalLocation>,
+    emit_ctx: &JitEmitCtx<'_>,
+) -> Result<(), String> {
     let Some(block_plan) = emit_ctx.refcount_plan.block(source_label) else {
         return Ok(());
     };
@@ -16620,6 +16640,9 @@ fn emit_planned_local_releases_for_reason_with_local_env(
             // Cleanup-only locals may be forwarded as block params even when the semantic
             // ownership plan releases them on this edge. In that representation the target
             // block owns the cleanup obligation instead of a source-side stack slot.
+            continue;
+        }
+        if unmaterialized_locations.contains(&local.location) {
             continue;
         }
         let removed = local_env.remove_location_or_name(local.location, &local.name);
@@ -21701,6 +21724,19 @@ fn opt_v3_scalar_thread_matches_local(
     }
 }
 
+fn opt_v3_scalar_thread_unmaterialized_local_location(
+    thread: &ScalarLocalThreadPlan,
+) -> Result<Option<LocalLocation>, String> {
+    match &thread.local_state {
+        ScalarThreadLocalState::ScalarOnlyHotPath {
+            cleanup: ScalarThreadLocalCleanup::NoPyObjectSlotOwnership,
+            ..
+        } => match thread.local.location {
+            ScalarThreadLocalLocation::Local { slot } => Ok(Some(LocalLocation(slot))),
+        },
+    }
+}
+
 fn opt_v3_term_references_local(term: &BlockTerm<InstrCodegen>, local_name: &ResolvedName) -> bool {
     struct LocalRefFinder<'a> {
         local_name: &'a ResolvedName,
@@ -23215,6 +23251,7 @@ fn emit_opt_v3_scalar_thread_inline_return_branch(
     source_label: BlockLabel,
     test_instr_id: Option<InstrId>,
     truth_i32: ir::Value,
+    unmaterialized_location: Option<LocalLocation>,
     targets: OptV3ScalarThreadInlineReturnTargets<'_>,
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
@@ -23265,6 +23302,7 @@ fn emit_opt_v3_scalar_thread_inline_return_branch(
         hot_branch,
         hot_label,
         hot_term,
+        unmaterialized_location,
         &mut hot_local_env,
         emit_ctx,
         codegen_env,
@@ -23280,6 +23318,7 @@ fn emit_opt_v3_scalar_thread_inline_return_branch(
         cold_branch,
         cold_label,
         cold_term,
+        unmaterialized_location,
         &mut cold_local_env,
         emit_ctx,
         codegen_env,
@@ -23296,6 +23335,7 @@ fn emit_opt_v3_scalar_thread_inline_return_arm(
     branch_block: ir::Block,
     target_label: BlockLabel,
     target_term: &BlockTerm<InstrCodegen>,
+    unmaterialized_location: Option<LocalLocation>,
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     codegen_env: &mut impl JitCodegenEnv,
@@ -23316,7 +23356,16 @@ fn emit_opt_v3_scalar_thread_inline_return_arm(
         codegen_env,
         func_imports,
     );
-    emit_codegen_return_pyobject(fb, target_label, ret_value, local_env, emit_ctx, None)
+    let unmaterialized_locations = unmaterialized_location.into_iter().collect::<HashSet<_>>();
+    emit_codegen_return_pyobject_with_unmaterialized_locals(
+        fb,
+        target_label,
+        ret_value,
+        local_env,
+        emit_ctx,
+        None,
+        &unmaterialized_locations,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -23500,6 +23549,7 @@ fn emit_opt_v3_scalar_threaded_store_branch(
             edge.target,
             Some(consumer_source),
             hot_condition,
+            opt_v3_scalar_thread_unmaterialized_local_location(selection.thread)?,
             inline_return_targets,
             &mut hot_return_env,
             stmt_emit_ctx,
@@ -23618,6 +23668,7 @@ fn emit_opt_v3_scalar_threaded_store_branch(
             edge.target,
             Some(consumer_source),
             fallback_condition,
+            None,
             inline_return_targets,
             &mut fallback_env,
             consumer_fallback_emit_ctx,
@@ -23894,14 +23945,35 @@ fn emit_codegen_return_pyobject(
     emit_ctx: &JitEmitCtx<'_>,
     current_exception_name: Option<&str>,
 ) -> Result<(), String> {
+    emit_codegen_return_pyobject_with_unmaterialized_locals(
+        fb,
+        source_label,
+        ret_value,
+        local_env,
+        emit_ctx,
+        current_exception_name,
+        &HashSet::new(),
+    )
+}
+
+fn emit_codegen_return_pyobject_with_unmaterialized_locals(
+    fb: &mut FunctionBuilder<'_>,
+    source_label: BlockLabel,
+    ret_value: ir::Value,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    current_exception_name: Option<&str>,
+    unmaterialized_locations: &HashSet<LocalLocation>,
+) -> Result<(), String> {
     let forwarded_locations = HashSet::new();
     let release_reason = RefcountReleaseReason::Return;
-    emit_planned_local_releases_for_reason_with_local_env(
+    emit_planned_local_releases_for_reason_with_local_env_excluding(
         fb,
         source_label,
         &release_reason,
         local_env,
         &forwarded_locations,
+        unmaterialized_locations,
         emit_ctx,
     )?;
     emit_decref_unforwarded_local_env(

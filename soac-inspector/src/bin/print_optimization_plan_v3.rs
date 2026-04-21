@@ -143,8 +143,13 @@ fn format_optimization_artifacts_v3_with_options(
         }
         for thread in &function.scalar_threads {
             out.push_str(&format!(
-                "  scalar_thread local={} producer={:?} consumer={:?} fallback={:?}\n",
-                thread.local.name, thread.producer, thread.consumer, thread.fallback
+                "  scalar_thread local={} producer={:?} consumer={:?} fallback={:?} local_state={:?} materialization={:?}\n",
+                thread.local.name,
+                thread.producer,
+                thread.consumer,
+                thread.fallback,
+                thread.local_state,
+                thread.materialization
             ));
         }
         for direct_call in &function.direct_calls {

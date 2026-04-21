@@ -54,6 +54,7 @@ pub struct ScalarLocalThreadPlan {
     pub producer: RegionValueRef,
     pub consumer: RegionValueRef,
     pub fallback: ScalarThreadFallback,
+    pub local_state: ScalarThreadLocalState,
     pub materialization: ScalarThreadMaterialization,
     pub estimated_savings: Cost,
     pub reason: String,
@@ -81,6 +82,19 @@ pub struct RegionValueRef {
 #[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum ScalarThreadFallback {
     LocalFallbackRegion { region: RegionId, reason: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub enum ScalarThreadLocalState {
+    ScalarOnlyHotPath {
+        cleanup: ScalarThreadLocalCleanup,
+        reason: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub enum ScalarThreadLocalCleanup {
+    NoPyObjectSlotOwnership,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -565,6 +579,12 @@ fn validate_function_plan(function: &FunctionOptimizationPlanV3, errors: &mut Ve
             ));
         }
     }
+    let region_positions = function
+        .regions
+        .iter()
+        .enumerate()
+        .map(|(index, region)| (region.id, index))
+        .collect::<HashMap<_, _>>();
     let deopt_points = function
         .deopt_points
         .iter()
@@ -586,6 +606,7 @@ fn validate_function_plan(function: &FunctionOptimizationPlanV3, errors: &mut Ve
             function,
             thread,
             &region_ids,
+            &region_positions,
             &region_values,
             &mut threaded_consumers,
             errors,
@@ -708,6 +729,7 @@ fn validate_scalar_thread_plan(
     function: &FunctionOptimizationPlanV3,
     thread: &ScalarLocalThreadPlan,
     region_ids: &HashSet<RegionId>,
+    region_positions: &HashMap<RegionId, usize>,
     region_values: &HashMap<(RegionId, PlanValueId), Rep>,
     threaded_consumers: &mut HashSet<RegionValueRef>,
     errors: &mut Vec<String>,
@@ -729,6 +751,20 @@ fn validate_scalar_thread_plan(
             "function {} scalar thread for local {} must cross regions",
             function.function.function, thread.local.name
         ));
+    }
+    match (
+        region_positions.get(&thread.producer.region),
+        region_positions.get(&thread.consumer.region),
+    ) {
+        (Some(producer_index), Some(consumer_index)) if producer_index < consumer_index => {}
+        (Some(_), Some(_)) => errors.push(format!(
+            "function {} scalar thread for local {} requires producer region {:?} before consumer region {:?}",
+            function.function.function,
+            thread.local.name,
+            thread.producer.region,
+            thread.consumer.region
+        )),
+        _ => {}
     }
     if !threaded_consumers.insert(thread.consumer) {
         errors.push(format!(
@@ -774,9 +810,42 @@ fn validate_scalar_thread_plan(
                     function.function.function, thread.local.name, region
                 ));
             }
+            if *region == thread.producer.region || *region == thread.consumer.region {
+                errors.push(format!(
+                    "function {} scalar thread for local {} fallback region {:?} must be distinct from producer {:?} and consumer {:?}",
+                    function.function.function,
+                    thread.local.name,
+                    region,
+                    thread.producer.region,
+                    thread.consumer.region
+                ));
+            }
             if reason.is_empty() {
                 errors.push(format!(
                     "function {} scalar thread for local {} has fallback without reason",
+                    function.function.function, thread.local.name
+                ));
+            }
+            validate_scalar_thread_producer_fallbacks(function, thread, *region, errors);
+        }
+    }
+    match &thread.local_state {
+        ScalarThreadLocalState::ScalarOnlyHotPath { reason, .. } if reason.is_empty() => {
+            errors.push(format!(
+                "function {} scalar thread for local {} has scalar-only local state without reason",
+                function.function.function, thread.local.name
+            ));
+        }
+        ScalarThreadLocalState::ScalarOnlyHotPath {
+            cleanup: ScalarThreadLocalCleanup::NoPyObjectSlotOwnership,
+            ..
+        } => {
+            if !matches!(
+                thread.materialization,
+                ScalarThreadMaterialization::DeferredUntilPythonObjectUse { .. }
+            ) {
+                errors.push(format!(
+                    "function {} scalar thread for local {} cannot use no-PyObject cleanup without deferred materialization",
                     function.function.function, thread.local.name
                 ));
             }
@@ -792,6 +861,66 @@ fn validate_scalar_thread_plan(
             ));
         }
         ScalarThreadMaterialization::DeferredUntilPythonObjectUse { .. } => {}
+    }
+}
+
+fn validate_scalar_thread_producer_fallbacks(
+    function: &FunctionOptimizationPlanV3,
+    thread: &ScalarLocalThreadPlan,
+    fallback_region: RegionId,
+    errors: &mut Vec<String>,
+) {
+    let Some(producer_region) = function
+        .regions
+        .iter()
+        .find(|region| region.id == thread.producer.region)
+    else {
+        return;
+    };
+    for node in &producer_region.nodes {
+        let target = match &node.kind {
+            PlanNodeKind::Guard(guard) => match &guard.failure {
+                GuardFailure::FallbackToPlan {
+                    target: FallbackTarget::Region(region),
+                    ..
+                } => Some(*region),
+                GuardFailure::FallbackToPlan { .. } | GuardFailure::DeoptTo { .. } => None,
+            },
+            PlanNodeKind::Convert(convert) => match &convert.failure {
+                FailureMode::FallbackToPlan {
+                    target: FallbackTarget::Region(region),
+                    ..
+                } => Some(*region),
+                FailureMode::CannotFail | FailureMode::Raise(_) | FailureMode::DeoptTo { .. } => {
+                    None
+                }
+                FailureMode::FallbackToPlan { .. } => None,
+            },
+            PlanNodeKind::Operation(operation) => match &operation.failure {
+                FailureMode::FallbackToPlan {
+                    target: FallbackTarget::Region(region),
+                    ..
+                } => Some(*region),
+                FailureMode::CannotFail | FailureMode::Raise(_) | FailureMode::DeoptTo { .. } => {
+                    None
+                }
+                FailureMode::FallbackToPlan { .. } => None,
+            },
+            PlanNodeKind::Input { .. }
+            | PlanNodeKind::Constant { .. }
+            | PlanNodeKind::Materialize(_)
+            | PlanNodeKind::Fallback { .. }
+            | PlanNodeKind::Deopt { .. }
+            | PlanNodeKind::Ownership { .. } => None,
+        };
+        if let Some(target) = target
+            && target != fallback_region
+        {
+            errors.push(format!(
+                "function {} scalar thread for local {} producer node {:?} falls back to {:?}, expected scalar-thread fallback {:?}",
+                function.function.function, thread.local.name, node.id, target, fallback_region
+            ));
+        }
     }
 }
 
@@ -849,6 +978,7 @@ fn validate_region_plan(
         .map(|node| node.id)
         .collect::<HashSet<_>>();
     let mut seen_node_ids = HashSet::<PlanNodeId>::new();
+    let mut seen_guard_ids = HashSet::<PlanNodeId>::new();
 
     for node in &region.nodes {
         if !seen_node_ids.insert(node.id) {
@@ -880,7 +1010,7 @@ fn validate_region_plan(
             }
             PlanNodeKind::Convert(convert) => {
                 check_input(region.id, convert.input, &available_values, errors);
-                validate_conversion(region.id, convert, &seen_node_ids, errors);
+                validate_conversion(region.id, convert, &seen_guard_ids, errors);
                 validate_failure_mode(
                     region.id,
                     &convert.failure,
@@ -900,6 +1030,7 @@ fn validate_region_plan(
                 );
             }
             PlanNodeKind::Guard(guard) => {
+                seen_guard_ids.insert(node.id);
                 for input in &guard.inputs {
                     check_input(region.id, *input, &available_values, errors);
                 }
@@ -918,6 +1049,7 @@ fn validate_region_plan(
                     check_input(region.id, *input, &available_values, errors);
                 }
                 validate_operation(region.id, operation, errors);
+                validate_operation_failure_semantics(region.id, operation, errors);
                 validate_failure_mode(
                     region.id,
                     &operation.failure,
@@ -1046,7 +1178,7 @@ fn check_input(
 fn validate_conversion(
     region: RegionId,
     convert: &ConvertNode,
-    seen_node_ids: &HashSet<PlanNodeId>,
+    seen_guard_ids: &HashSet<PlanNodeId>,
     errors: &mut Vec<String>,
 ) {
     let rule = conversion_signature(convert.kind);
@@ -1077,7 +1209,7 @@ fn validate_conversion(
         (
             ConversionPreconditionRule::FactsOrGuard,
             ConversionPrecondition::SpecializationGuard { guard, reason },
-        ) if !reason.is_empty() && seen_node_ids.contains(guard) => {}
+        ) if !reason.is_empty() && seen_guard_ids.contains(guard) => {}
         (
             ConversionPreconditionRule::FactsOrGuard,
             ConversionPrecondition::SpecializationGuard { guard, reason },
@@ -1089,7 +1221,7 @@ fn validate_conversion(
             ConversionPreconditionRule::FactsOrGuard,
             ConversionPrecondition::SpecializationGuard { guard, .. },
         ) => errors.push(format!(
-            "region {region:?} conversion {:?} references guard {:?} before it is available",
+            "region {region:?} conversion {:?} references non-dominating guard {:?}",
             convert.kind, guard
         )),
         _ => errors.push(format!(
@@ -1098,6 +1230,50 @@ fn validate_conversion(
         )),
     }
     validate_conversion_failure(region, convert, rule, errors);
+}
+
+fn validate_operation_failure_semantics(
+    region: RegionId,
+    operation: &OperationNode,
+    errors: &mut Vec<String>,
+) {
+    match &operation.op {
+        PlannedOp::CheckedI64Add | PlannedOp::CheckedI64Sub | PlannedOp::CheckedI64Mul => {
+            if !matches!(operation.failure, FailureMode::FallbackToPlan { .. }) {
+                errors.push(format!(
+                    "region {region:?} operation {:?} must use an explicit local fallback for overflow, got {:?}",
+                    operation.op, operation.failure
+                ));
+            }
+        }
+        PlannedOp::I64BitAnd
+        | PlannedOp::I64BitOr
+        | PlannedOp::I64BitXor
+        | PlannedOp::I64CompareToBool01 { .. } => {
+            if operation.failure != FailureMode::CannotFail {
+                errors.push(format!(
+                    "region {region:?} operation {:?} should be CannotFail after selected scalar inputs, got {:?}",
+                    operation.op, operation.failure
+                ));
+            }
+        }
+        PlannedOp::PyNumberAdd
+        | PlannedOp::PyNumberSubtract
+        | PlannedOp::PyNumberMultiply
+        | PlannedOp::PyNumberBitAnd
+        | PlannedOp::PyNumberBitOr
+        | PlannedOp::PyNumberBitXor
+        | PlannedOp::PyObjectRichCompare { .. }
+        | PlannedOp::PyObjectIsTrue => {
+            if !matches!(operation.failure, FailureMode::Raise(_)) {
+                errors.push(format!(
+                    "region {region:?} operation {:?} must raise locally through Python semantics, got {:?}",
+                    operation.op, operation.failure
+                ));
+            }
+        }
+        PlannedOp::DirectHelper { .. } => {}
+    }
 }
 
 fn validate_conversion_failure(
@@ -1806,6 +1982,10 @@ mod tests {
                 region: RegionId(1),
                 reason: "fallback preserves local store semantics".to_string(),
             },
+            local_state: ScalarThreadLocalState::ScalarOnlyHotPath {
+                cleanup: ScalarThreadLocalCleanup::NoPyObjectSlotOwnership,
+                reason: "hot path keeps c as a scalar and never stores a PyObject".to_string(),
+            },
             materialization: ScalarThreadMaterialization::DeferredUntilPythonObjectUse {
                 reason: "only scalar consumers use the value".to_string(),
             },
@@ -1871,6 +2051,10 @@ mod tests {
                 region: RegionId(9),
                 reason: "fallback preserves local store semantics".to_string(),
             },
+            local_state: ScalarThreadLocalState::ScalarOnlyHotPath {
+                cleanup: ScalarThreadLocalCleanup::NoPyObjectSlotOwnership,
+                reason: "hot path keeps c as a scalar and never stores a PyObject".to_string(),
+            },
             materialization: ScalarThreadMaterialization::DeferredUntilPythonObjectUse {
                 reason: "only scalar consumers use the value".to_string(),
             },
@@ -1884,6 +2068,85 @@ mod tests {
         ))
         .unwrap_err();
         assert!(err.contains("unknown fallback region"), "{err}");
+    }
+
+    #[test]
+    fn scalar_thread_producer_after_consumer_fails() {
+        let scalar = PlanValue::new(0, Rep::I64);
+        let consumer_region = RegionPlan {
+            id: RegionId(2),
+            source: RegionSource::Synthetic {
+                reason: "consumer".to_string(),
+            },
+            inputs: vec![RegionInput {
+                value: scalar,
+                source: RegionInputSource::CapturedValue {
+                    from_region: RegionId(0),
+                    value: scalar.id,
+                },
+            }],
+            nodes: Vec::new(),
+            exits: Vec::new(),
+        };
+        let fallback_region = RegionPlan {
+            id: RegionId(1),
+            source: RegionSource::Synthetic {
+                reason: "generic fallback".to_string(),
+            },
+            inputs: Vec::new(),
+            nodes: Vec::new(),
+            exits: Vec::new(),
+        };
+        let producer_region = RegionPlan {
+            id: RegionId(0),
+            source: RegionSource::FunctionEntry,
+            inputs: Vec::new(),
+            nodes: vec![node(
+                0,
+                PlanNodeKind::Constant {
+                    output: scalar,
+                    constant: PlannedConstant::I64(3),
+                },
+            )],
+            exits: Vec::new(),
+        };
+        let thread = ScalarLocalThreadPlan {
+            local: ScalarThreadLocal {
+                name: "c".to_string(),
+                location: ScalarThreadLocalLocation::Local { slot: 2 },
+            },
+            producer: RegionValueRef {
+                region: RegionId(0),
+                value: scalar,
+            },
+            consumer: RegionValueRef {
+                region: RegionId(2),
+                value: scalar,
+            },
+            fallback: ScalarThreadFallback::LocalFallbackRegion {
+                region: RegionId(1),
+                reason: "fallback preserves local store semantics".to_string(),
+            },
+            local_state: ScalarThreadLocalState::ScalarOnlyHotPath {
+                cleanup: ScalarThreadLocalCleanup::NoPyObjectSlotOwnership,
+                reason: "hot path keeps c as a scalar and never stores a PyObject".to_string(),
+            },
+            materialization: ScalarThreadMaterialization::DeferredUntilPythonObjectUse {
+                reason: "only scalar consumers use the value".to_string(),
+            },
+            estimated_savings: Cost::default(),
+            reason: "thread local c as i64".to_string(),
+        };
+
+        let err = validate_module_plan_v3(&module_with_regions_and_scalar_threads(
+            vec![consumer_region, fallback_region, producer_region],
+            vec![thread],
+        ))
+        .unwrap_err();
+        assert!(
+            err.contains("requires producer region"),
+            "expected scalar-thread ordering error, got {err}"
+        );
     }
 
     #[test]
@@ -1955,6 +2218,72 @@ mod tests {
         };
         let err = validate_module_plan_v3(&module_with_regions(vec![region])).unwrap_err();
         assert!(err.contains("expects input PyObjectBorrowed"), "{err}");
+    }
+
+    #[test]
+    fn conversion_precondition_must_reference_dominating_guard() {
+        let input_value = PlanValue::new(0, Rep::PyObjectBorrowed);
+        let output = PlanValue::new(1, Rep::I64);
+        let region = RegionPlan {
+            id: RegionId(0),
+            source: RegionSource::FunctionEntry,
+            inputs: vec![input(input_value, 0, "value")],
+            nodes: vec![
+                node(
+                    0,
+                    PlanNodeKind::Constant {
+                        output: PlanValue::new(2, Rep::I64),
+                        constant: PlannedConstant::I64(1),
+                    },
+                ),
+                node(
+                    1,
+                    PlanNodeKind::Convert(ConvertNode {
+                        input: input_value,
+                        output,
+                        kind: ConversionKind::FromPythonLongCompactToI64,
+                        precondition: ConversionPrecondition::SpecializationGuard {
+                            guard: PlanNodeId(0),
+                            reason: "not actually a guard".to_string(),
+                        },
+                        failure: FailureMode::FallbackToPlan {
+                            target: FallbackTarget::Region(RegionId(0)),
+                            reason: FallbackReason("test".to_string()),
+                        },
+                        ownership: ConversionOwnership::BorrowInput,
+                    }),
+                ),
+            ],
+            exits: Vec::new(),
+        };
+        let err = validate_module_plan_v3(&module_with_regions(vec![region])).unwrap_err();
+        assert!(err.contains("non-dominating guard"), "{err}");
+    }
+
+    #[test]
+    fn checked_i64_operation_requires_explicit_fallback() {
+        let left = PlanValue::new(0, Rep::I64);
+        let right = PlanValue::new(1, Rep::I64);
+        let output = PlanValue::new(2, Rep::I64);
+        let region = RegionPlan {
+            id: RegionId(0),
+            source: RegionSource::FunctionEntry,
+            inputs: vec![input(left, 0, "left"), input(right, 1, "right")],
+            nodes: vec![node(
+                0,
+                PlanNodeKind::Operation(OperationNode {
+                    op: PlannedOp::CheckedI64Add,
+                    inputs: vec![left, right],
+                    output: Some(output),
+                    failure_replay: FailureReplayPolicy::safe("invalid test replay policy"),
+                    failure: FailureMode::CannotFail,
+                    cost: Cost::default(),
+                }),
+            )],
+            exits: Vec::new(),
+        };
+        let err = validate_module_plan_v3(&module_with_regions(vec![region])).unwrap_err();
+        assert!(err.contains("explicit local fallback"), "{err}");
     }
 
     #[test]

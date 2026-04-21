@@ -9,7 +9,8 @@ use crate::plan_v3::{
     PlanNode, PlanNodeId, PlanNodeKind, PlanValue, PlannedConstant, RegionExitKind, RegionExitPlan,
     RegionExitTarget, RegionId, RegionInput, RegionInputSource, RegionPlan, RegionSource,
     RegionValueRef, Rep, ScalarLocalThreadPlan, ScalarThreadFallback, ScalarThreadLocal,
-    ScalarThreadLocalLocation, ScalarThreadMaterialization,
+    ScalarThreadLocalCleanup, ScalarThreadLocalLocation, ScalarThreadLocalState,
+    ScalarThreadMaterialization,
 };
 use crate::region_v3::{
     ExtractedExit, ExtractedRegion, ExtractedValue, ExtractedValueId, ExtractedValueKind,
@@ -238,6 +239,11 @@ fn plan_scalar_local_threads_v3(
                         "guard miss or overflow in {:?} must execute the original store before branching",
                         producer_shape.source
                     ),
+                },
+                local_state: ScalarThreadLocalState::ScalarOnlyHotPath {
+                    cleanup: ScalarThreadLocalCleanup::NoPyObjectSlotOwnership,
+                    reason: "the hot path keeps the store target as a scalar and never writes a PyObject local slot"
+                        .to_string(),
                 },
                 materialization: ScalarThreadMaterialization::DeferredUntilPythonObjectUse {
                     reason: "the stored scalar may replace the later local unbox until Python object semantics are required"
@@ -1920,6 +1926,13 @@ mod tests {
             thread.fallback,
             ScalarThreadFallback::LocalFallbackRegion {
                 region: RegionId(1),
+                ..
+            }
+        ));
+        assert!(matches!(
+            thread.local_state,
+            ScalarThreadLocalState::ScalarOnlyHotPath {
+                cleanup: ScalarThreadLocalCleanup::NoPyObjectSlotOwnership,
                 ..
             }
         ));
