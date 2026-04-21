@@ -159,9 +159,10 @@ Partially migrated families are also intentionally visible:
   indexed-global emissions with explicit module-dict guard and original global
   fallback effects. The JIT validates emitted global name/access/index against
   lowered `NameLocation::Global(slot)` and consumes the v3 entry as the
-  indexed global load/store input. The final helper-call lowering still lives in
-  the existing global load/store emitters rather than a v3-specific operation
-  node.
+  indexed global load/store input. Legacy indexed-global profile maps remain
+  serialized evidence for planning, but are no longer consumed by JIT lowering.
+  The final helper-call builder remains in the existing global load/store
+  emitters as a mechanical lowering helper for the validated v3 global node.
 - exact-list getitem/setitem are represented as v3 plan selections plus
   mechanical exact-list item emissions with explicit exact-list/exact-compact-int
   in-bounds guard and original item-access fallback effects. The JIT validates

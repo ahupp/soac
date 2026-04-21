@@ -7241,35 +7241,12 @@ fn emit_codegen_non_local_name_load(
                     ctx,
                 );
                 let slot_index = fb.ins().iconst(ir::types::I64, i64::from(slot.slot()));
-                if let Some(load_instr_id) = load_instr_id.filter(|load_instr_id| {
-                    ctx.allow_legacy_indexed_globals
-                        && ctx
-                            .global_indexed_hit_counter_ids
-                            .contains_key(load_instr_id)
-                }) {
-                    let guard_miss_resume_point =
-                        ctx.guard_miss_resume_point
-                            .unwrap_or(LocalEnvResumePoint::BeforeInstr {
-                                key: InstrKey::new(ctx.function_id, load_instr_id),
-                            });
-                    emit_codegen_indexed_global_load(
-                        fb,
-                        globals_obj,
-                        name_obj,
-                        slot_index,
-                        load_instr_id,
-                        guard_miss_resume_point,
-                        local_env,
-                        ctx,
-                    )
-                } else {
-                    let value_inst = fb.ins().call(
-                        ctx.load_global_fast_ref,
-                        &[globals_obj, name_obj, slot_index],
-                    );
-                    let value = fb.inst_results(value_inst)[0];
-                    emit_decref_owned_input_after_nullable_result(fb, ctx, value, name_obj)
-                }
+                let value_inst = fb.ins().call(
+                    ctx.load_global_fast_ref,
+                    &[globals_obj, name_obj, slot_index],
+                );
+                let value = fb.inst_results(value_inst)[0];
+                emit_decref_owned_input_after_nullable_result(fb, ctx, value, name_obj)
             };
             let value_ok_block = fb.create_block();
             fb.append_block_param(value_ok_block, ptr_ty);
@@ -8303,7 +8280,6 @@ struct JitEmitCtx<'mc> {
     global_indexed_hit_counter_ids: &'mc HashMap<InstrId, CounterId>,
     global_indexed_fallback_counter_ids: &'mc HashMap<InstrId, CounterId>,
     opt_v3_indexed_globals_by_instr: &'mc HashMap<InstrId, OptV3IndexedGlobalAccessPlan>,
-    allow_legacy_indexed_globals: bool,
     field_indexed_hit_counter_ids: &'mc HashMap<InstrId, CounterId>,
     field_indexed_fallback_counter_ids: &'mc HashMap<InstrId, CounterId>,
     field_generic_getattr_counter_ids: &'mc HashMap<InstrId, CounterId>,
@@ -13344,7 +13320,6 @@ struct SpecializationProfile<'a> {
     opt_v3_emitted_indexed_globals:
         HashMap<RuntimeFunctionId, HashMap<InstrId, OptV3IndexedGlobalAccessPlan>>,
     opt_v3_exact_int_branch_artifacts: HashMap<RuntimeFunctionId, Arc<ExactIntBranchV3Artifacts>>,
-    loaded_opt_v3_plan: bool,
     behavior_change_indexed_stores: bool,
     profiled_cold_blocks: bool,
     guard_miss_deopt: bool,
@@ -13362,7 +13337,6 @@ struct PlannedOptimizationInputs {
     opt_v3_emitted_indexed_globals:
         HashMap<RuntimeFunctionId, HashMap<InstrId, OptV3IndexedGlobalAccessPlan>>,
     opt_v3_exact_int_branch_artifacts: HashMap<RuntimeFunctionId, Arc<ExactIntBranchV3Artifacts>>,
-    loaded_opt_v3_plan: bool,
 }
 
 impl PlannedOptimizationInputs {
@@ -13377,7 +13351,6 @@ impl PlannedOptimizationInputs {
             opt_v3_emitted_indexed_fields: HashMap::new(),
             opt_v3_emitted_indexed_globals: HashMap::new(),
             opt_v3_exact_int_branch_artifacts: HashMap::new(),
-            loaded_opt_v3_plan: false,
         }
     }
 }
@@ -13443,7 +13416,6 @@ struct FunctionSpecializationInputs {
     branch_prefer_true: HashMap<InstrId, bool>,
     cold_block_labels: HashSet<BlockLabel>,
     opt_v3_exact_int_branch_artifacts: Option<Arc<ExactIntBranchV3Artifacts>>,
-    allow_legacy_indexed_globals: bool,
     behavior_change_indexed_stores: bool,
     guard_miss_deopt_stub: bool,
 }
@@ -13589,7 +13561,6 @@ fn planned_optimization_inputs_from_v3_artifacts(
     shared_state: &SharedModuleState,
 ) -> Result<PlannedOptimizationInputs, String> {
     let mut inputs = PlannedOptimizationInputs::default();
-    inputs.loaded_opt_v3_plan = true;
     for planned_function in &artifacts.plan.functions {
         let local_function_id = planned_function.function.function.local_function_id();
         let current_function_id = RuntimeFunctionId::new(
@@ -13661,7 +13632,6 @@ fn planned_optimization_inputs_from_v3_artifacts_for_codegen_module(
     module: &BlockPyModule<CodegenModuleShape>,
 ) -> Result<PlannedOptimizationInputs, String> {
     let mut inputs = PlannedOptimizationInputs::default();
-    inputs.loaded_opt_v3_plan = true;
     let module_id = RuntimeModuleId::new(module.module_name_gen.module_id());
     for planned_function in &artifacts.plan.functions {
         let local_function_id = planned_function.function.function.local_function_id();
@@ -14709,7 +14679,6 @@ impl FunctionSpecializationInputs {
                 .opt_v3_exact_int_branch_artifacts
                 .get(&function.function_id)
                 .cloned(),
-            allow_legacy_indexed_globals: !profile.loaded_opt_v3_plan,
             behavior_change_indexed_stores: profile.behavior_change_indexed_stores
                 && function.scope.scope_kind != CallableScopeKind::Module,
             guard_miss_deopt_stub: profile.guard_miss_deopt
@@ -14748,7 +14717,6 @@ impl<'a> SpecializationProfile<'a> {
             opt_v3_emitted_indexed_fields: planned_inputs.opt_v3_emitted_indexed_fields,
             opt_v3_emitted_indexed_globals: planned_inputs.opt_v3_emitted_indexed_globals,
             opt_v3_exact_int_branch_artifacts: planned_inputs.opt_v3_exact_int_branch_artifacts,
-            loaded_opt_v3_plan: planned_inputs.loaded_opt_v3_plan,
             behavior_change_indexed_stores: specialization_mode
                 .is_some_and(SpecializationMode::behavior_change_indexed_stores_enabled),
             profiled_cold_blocks: env_config.profiled_cold_blocks_enabled(),
@@ -14775,7 +14743,6 @@ impl<'a> SpecializationProfile<'a> {
             opt_v3_emitted_indexed_fields: planned_inputs.opt_v3_emitted_indexed_fields,
             opt_v3_emitted_indexed_globals: planned_inputs.opt_v3_emitted_indexed_globals,
             opt_v3_exact_int_branch_artifacts: planned_inputs.opt_v3_exact_int_branch_artifacts,
-            loaded_opt_v3_plan: planned_inputs.loaded_opt_v3_plan,
             behavior_change_indexed_stores: true,
             profiled_cold_blocks: env_config.profiled_cold_blocks_enabled(),
             guard_miss_deopt: true,
@@ -29645,7 +29612,6 @@ fn build_cranelift_run_bb_specialized_function(
         opt_v3_exact_int_branch_artifacts.as_deref(),
     )?;
     let behavior_change_indexed_stores = specialization_inputs.behavior_change_indexed_stores;
-    let allow_legacy_indexed_globals = specialization_inputs.allow_legacy_indexed_globals;
     let guard_miss_deopt_stub = specialization_inputs.guard_miss_deopt_stub;
     let function_runtime_data_layout = FunctionRuntimeDataLayout::from_function(function);
     let true_constant_id = module_constants.require_runtime_name_constant_id("TRUE");
@@ -30340,7 +30306,6 @@ fn build_cranelift_run_bb_specialized_function(
                 global_indexed_hit_counter_ids: &global_indexed_hit_counter_ids,
                 global_indexed_fallback_counter_ids: &global_indexed_fallback_counter_ids,
                 opt_v3_indexed_globals_by_instr: &opt_v3_indexed_globals_by_instr,
-                allow_legacy_indexed_globals,
                 field_indexed_hit_counter_ids: &field_indexed_hit_counter_ids,
                 field_indexed_fallback_counter_ids: &field_indexed_fallback_counter_ids,
                 field_generic_getattr_counter_ids: &field_generic_getattr_counter_ids,

@@ -275,6 +275,9 @@ apply/verify mode:
   plan. JIT validation rejects any indexed-global emission whose name, access
   kind, or expected index does not match the lowered `NameLocation::Global`
   instruction.
+- Without a v3 indexed-global emission, global loads/stores use the generic
+  global helper path even when legacy `mod.opt` or counter evidence contains
+  module-key/indexed-global data.
 - The emitted fast path calls a local-runtime helper with the globals
   dict, constant key object, and expected index.
 - The helper guards that the globals dict still has an indexed-unicode

@@ -16212,7 +16212,6 @@ def f(x):
                     branch_prefer_true: HashMap::new(),
                     cold_block_labels: HashSet::new(),
                     opt_v3_exact_int_branch_artifacts: Some(std::sync::Arc::new(artifacts)),
-                    allow_legacy_indexed_globals: false,
                     behavior_change_indexed_stores: false,
                     guard_miss_deopt_stub: false,
                 }),
@@ -16407,7 +16406,6 @@ def f(x):
                     branch_prefer_true: HashMap::new(),
                     cold_block_labels: HashSet::new(),
                     opt_v3_exact_int_branch_artifacts: Some(std::sync::Arc::new(artifacts)),
-                    allow_legacy_indexed_globals: false,
                     behavior_change_indexed_stores: false,
                     guard_miss_deopt_stub: false,
                 }),
@@ -16566,7 +16564,6 @@ def f(x):
                         branch_prefer_true: HashMap::new(),
                         cold_block_labels: HashSet::new(),
                         opt_v3_exact_int_branch_artifacts: Some(std::sync::Arc::new(artifacts)),
-                        allow_legacy_indexed_globals: false,
                         behavior_change_indexed_stores: false,
                         guard_miss_deopt_stub: false,
                     }),
@@ -16696,7 +16693,6 @@ def f(x):
                         branch_prefer_true: HashMap::new(),
                         cold_block_labels: HashSet::new(),
                         opt_v3_exact_int_branch_artifacts: Some(std::sync::Arc::new(artifacts)),
-                        allow_legacy_indexed_globals: false,
                         behavior_change_indexed_stores: false,
                         guard_miss_deopt_stub: false,
                     }),
@@ -16821,7 +16817,6 @@ def f(x):
                     branch_prefer_true: HashMap::new(),
                     cold_block_labels: HashSet::new(),
                     opt_v3_exact_int_branch_artifacts: Some(std::sync::Arc::new(artifacts)),
-                    allow_legacy_indexed_globals: false,
                     behavior_change_indexed_stores: false,
                     guard_miss_deopt_stub: false,
                 }),
@@ -17313,18 +17308,107 @@ def f(x):
         )
     }
 
-    fn opt_v3_indexed_global_plan(
+    fn opt_v3_indexed_global_plan_for_name(
         source: InstrId,
         access: IndexedGlobalAccessKind,
+        name: &str,
     ) -> OptV3IndexedGlobalAccessPlan {
         OptV3IndexedGlobalAccessPlan {
             source,
             access,
             module_name: "test".to_string(),
-            name: "counter".to_string(),
+            name: name.to_string(),
             expected_index: 0,
             guard: IndexedGlobalGuardKind::ModuleDictKeyAtIndex,
             fallback: IndexedGlobalFallbackKind::OriginalGlobalAccess,
+        }
+    }
+
+    fn opt_v3_indexed_global_plan(
+        source: InstrId,
+        access: IndexedGlobalAccessKind,
+    ) -> OptV3IndexedGlobalAccessPlan {
+        opt_v3_indexed_global_plan_for_name(source, access, "counter")
+    }
+
+    fn first_indexed_global_access_source(
+        function: &BlockPyFunction<CodegenModuleShape>,
+        access: IndexedGlobalAccessKind,
+        name: &str,
+    ) -> InstrId {
+        struct Finder<'a> {
+            access: IndexedGlobalAccessKind,
+            name: &'a str,
+            source: Option<InstrId>,
+        }
+
+        impl Visit<InstrCodegen> for Finder<'_> {
+            fn visit_instr(&mut self, expr: &InstrCodegen)
+            where
+                InstrCodegen: ChildVisitable<InstrCodegen>,
+            {
+                if self.source.is_none() {
+                    match expr {
+                        InstrCodegen::Load(op)
+                            if self.access == IndexedGlobalAccessKind::Load
+                                && op.name.id_str() == self.name
+                                && matches!(op.name.location, NameLocation::Global(_)) =>
+                        {
+                            self.source = Some(op.semantic_instr_id());
+                        }
+                        InstrCodegen::Store(op)
+                            if self.access == IndexedGlobalAccessKind::Store
+                                && op.name.id_str() == self.name
+                                && matches!(op.name.location, NameLocation::Global(_)) =>
+                        {
+                            self.source = Some(op.semantic_instr_id());
+                        }
+                        _ => {}
+                    }
+                }
+                expr.visit_children(self);
+            }
+        }
+
+        let mut finder = Finder {
+            access,
+            name,
+            source: None,
+        };
+        finder.visit_fn(function);
+        finder.source.unwrap_or_else(|| {
+            panic!(
+                "function {} should contain indexed-global {access:?} for {name}",
+                function.names.qualname
+            )
+        })
+    }
+
+    fn indexed_global_specialization_inputs_for_function(
+        function: &BlockPyFunction<CodegenModuleShape>,
+        access: IndexedGlobalAccessKind,
+        name: &str,
+        behavior_change_indexed_stores: bool,
+        guard_miss_deopt_stub: bool,
+    ) -> FunctionSpecializationInputs {
+        let source = first_indexed_global_access_source(function, access, name);
+        FunctionSpecializationInputs {
+            call_target_specializations: HashMap::new(),
+            direct_function_call_guards: HashMap::new(),
+            operator_specializations: HashMap::new(),
+            opt_v3_exact_list_items_by_instr: HashMap::new(),
+            field_index_specializations: HashMap::new(),
+            field_index_specializations_by_instr: HashMap::new(),
+            opt_v3_indexed_fields_by_instr: HashMap::new(),
+            opt_v3_indexed_globals_by_instr: HashMap::from([(
+                source,
+                opt_v3_indexed_global_plan_for_name(source, access, name),
+            )]),
+            branch_prefer_true: HashMap::new(),
+            cold_block_labels: HashSet::new(),
+            opt_v3_exact_int_branch_artifacts: None,
+            behavior_change_indexed_stores,
+            guard_miss_deopt_stub,
         }
     }
 
@@ -17369,7 +17453,6 @@ def f(x):
                     branch_prefer_true: HashMap::new(),
                     cold_block_labels: HashSet::new(),
                     opt_v3_exact_int_branch_artifacts: None,
-                    allow_legacy_indexed_globals: false,
                     behavior_change_indexed_stores: true,
                     guard_miss_deopt_stub: false,
                 }),
@@ -17396,13 +17479,51 @@ def f(x):
     }
 
     #[test]
-    fn codegen_does_not_rediscover_indexed_globals_when_v3_plan_has_no_entry() {
+    fn codegen_does_not_rediscover_indexed_globals_from_profile_counters() {
         let module_name_gen = ModuleNameGen::new(7);
         let load_source = InstrId::new(BlockLabel::from_index(0), 11);
         let store_source = InstrId::new(BlockLabel::from_index(0), 13);
         let function = indexed_global_test_function(&module_name_gen, load_source, store_source);
         let mut module = test_module(module_name_gen, vec![function.clone()]);
         module.global_names = vec!["counter".to_string()];
+        module.counter_defs.extend([
+            CounterDef {
+                id: CounterId(0),
+                scope: CounterScope::This,
+                kind: "global_indexed_hit".to_string(),
+                site: CounterSite::Runtime {
+                    function_id: Some(function.function_id),
+                    instr_id: Some(load_source),
+                },
+            },
+            CounterDef {
+                id: CounterId(1),
+                scope: CounterScope::This,
+                kind: "global_indexed_hit".to_string(),
+                site: CounterSite::Runtime {
+                    function_id: Some(function.function_id),
+                    instr_id: Some(store_source),
+                },
+            },
+            CounterDef {
+                id: CounterId(2),
+                scope: CounterScope::This,
+                kind: "global_indexed_fallback".to_string(),
+                site: CounterSite::Runtime {
+                    function_id: Some(function.function_id),
+                    instr_id: Some(load_source),
+                },
+            },
+            CounterDef {
+                id: CounterId(3),
+                scope: CounterScope::This,
+                kind: "global_indexed_fallback".to_string(),
+                site: CounterSite::Runtime {
+                    function_id: Some(function.function_id),
+                    instr_id: Some(store_source),
+                },
+            },
+        ]);
         let module_constants =
             crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
         let blocks = [1usize as ObjPtr];
@@ -17424,7 +17545,6 @@ def f(x):
                     branch_prefer_true: HashMap::new(),
                     cold_block_labels: HashSet::new(),
                     opt_v3_exact_int_branch_artifacts: None,
-                    allow_legacy_indexed_globals: false,
                     behavior_change_indexed_stores: true,
                     guard_miss_deopt_stub: false,
                 }),
@@ -18200,7 +18320,6 @@ def write_point(point, value):
             opt_v3_emitted_indexed_fields: HashMap::new(),
             opt_v3_emitted_indexed_globals: HashMap::new(),
             opt_v3_exact_int_branch_artifacts: HashMap::new(),
-            loaded_opt_v3_plan: true,
             behavior_change_indexed_stores: false,
             profiled_cold_blocks: false,
             guard_miss_deopt: false,
@@ -20640,6 +20759,13 @@ def f(x, y):
         let function = module.callable_defs[0].clone();
         let module_constants =
             crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+        let specialization_inputs = indexed_global_specialization_inputs_for_function(
+            &function,
+            IndexedGlobalAccessKind::Load,
+            "x",
+            true,
+            false,
+        );
         let built = build_test_jit_function_with_constants_and_options(
             &module,
             &function,
@@ -20647,6 +20773,7 @@ def f(x, y):
             &module_constants,
             BuildSpecializedFunctionOptions {
                 guard_miss_deopt_stub: true,
+                specialization_inputs: Some(specialization_inputs),
                 ..BuildSpecializedFunctionOptions::default()
             },
         );
@@ -20698,6 +20825,15 @@ def f(x, y):
         )
         .expect("shared state should build");
         let function = shared_state.lowered_module.callable_defs[0].clone();
+        let specialization_inputs = (mode != "profile").then(|| {
+            indexed_global_specialization_inputs_for_function(
+                &function,
+                IndexedGlobalAccessKind::Load,
+                "x",
+                true,
+                matches!(mode, "verify" | "apply"),
+            )
+        });
         let compile_session = crate::session::CompileSession::new();
         let mut jit_module =
             new_jit_module(&compile_session).expect("test jit module should construct");
@@ -20729,7 +20865,10 @@ def f(x, y):
             Some(shared_state.as_ref()),
             None,
             None,
-            BuildSpecializedFunctionOptions::default(),
+            BuildSpecializedFunctionOptions {
+                specialization_inputs,
+                ..BuildSpecializedFunctionOptions::default()
+            },
         )
         .expect("specialized JIT build should succeed")
     }
@@ -20762,6 +20901,15 @@ def f(x, y):
         )
         .expect("shared state should build");
         let function = shared_state.lowered_module.callable_defs[0].clone();
+        let specialization_inputs = (mode != "profile").then(|| {
+            indexed_global_specialization_inputs_for_function(
+                &function,
+                IndexedGlobalAccessKind::Store,
+                "x",
+                matches!(mode, "verify" | "apply"),
+                matches!(mode, "verify" | "apply"),
+            )
+        });
         let compile_session = crate::session::CompileSession::new();
         let mut jit_module =
             new_jit_module(&compile_session).expect("test jit module should construct");
@@ -20793,7 +20941,10 @@ def f(x, y):
             Some(shared_state.as_ref()),
             None,
             None,
-            BuildSpecializedFunctionOptions::default(),
+            BuildSpecializedFunctionOptions {
+                specialization_inputs,
+                ..BuildSpecializedFunctionOptions::default()
+            },
         )
         .expect("specialized JIT build should succeed")
     }
@@ -20882,8 +21033,8 @@ def f(x, y):
             );
             assert_eq!(
                 count_direct_calls_to_runtime_helpers(&built.ctx.func, &slow_global_helpers),
-                1,
-                "profile mode should preserve the local slow global-load fallback"
+                0,
+                "profile mode without a v3 indexed-global plan should not emit the planned slow fallback"
             );
         });
     }
@@ -22333,6 +22484,13 @@ def f(x, y):
         let function = module.callable_defs[0].clone();
         let module_constants =
             crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+        let specialization_inputs = indexed_global_specialization_inputs_for_function(
+            &function,
+            IndexedGlobalAccessKind::Load,
+            "x",
+            true,
+            false,
+        );
         let built = build_test_jit_function_with_constants_and_options(
             &module,
             &function,
@@ -22340,6 +22498,7 @@ def f(x, y):
             &module_constants,
             BuildSpecializedFunctionOptions {
                 guard_miss_deopt_stub: true,
+                specialization_inputs: Some(specialization_inputs),
                 ..BuildSpecializedFunctionOptions::default()
             },
         );
@@ -22370,6 +22529,13 @@ def f(x, y):
         let function = module.callable_defs[0].clone();
         let module_constants =
             crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+        let specialization_inputs = indexed_global_specialization_inputs_for_function(
+            &function,
+            IndexedGlobalAccessKind::Load,
+            "x",
+            true,
+            false,
+        );
         let built = build_test_jit_function_with_constants_and_options(
             &module,
             &function,
@@ -22377,6 +22543,7 @@ def f(x, y):
             &module_constants,
             BuildSpecializedFunctionOptions {
                 guard_miss_deopt_stub: true,
+                specialization_inputs: Some(specialization_inputs),
                 ..BuildSpecializedFunctionOptions::default()
             },
         );
@@ -22452,6 +22619,13 @@ def f(x, y):
                     shared_state.lowered_module.counter_defs.as_slice(),
                 );
             let blocks = vec![std::ptr::null_mut::<c_void>(); function.blocks.len()];
+            let specialization_inputs = indexed_global_specialization_inputs_for_function(
+                &function,
+                IndexedGlobalAccessKind::Load,
+                "x",
+                true,
+                false,
+            );
             let built = build_test_cranelift_run_bb_specialized_function(
                 &mut jit_module,
                 blocks.as_slice(),
@@ -22469,6 +22643,7 @@ def f(x, y):
                 None,
                 BuildSpecializedFunctionOptions {
                     guard_miss_deopt_stub: true,
+                    specialization_inputs: Some(specialization_inputs),
                     ..BuildSpecializedFunctionOptions::default()
                 },
             )
@@ -22582,6 +22757,13 @@ def f(x, y):
                     shared_state.lowered_module.counter_defs.as_slice(),
                 );
             let blocks = vec![std::ptr::null_mut::<c_void>(); function.blocks.len()];
+            let specialization_inputs = indexed_global_specialization_inputs_for_function(
+                &function,
+                IndexedGlobalAccessKind::Load,
+                "x",
+                true,
+                false,
+            );
             let built = build_test_cranelift_run_bb_specialized_function(
                 &mut jit_module,
                 blocks.as_slice(),
@@ -22599,6 +22781,7 @@ def f(x, y):
                 None,
                 BuildSpecializedFunctionOptions {
                     guard_miss_deopt_stub: true,
+                    specialization_inputs: Some(specialization_inputs),
                     ..BuildSpecializedFunctionOptions::default()
                 },
             )
@@ -22686,6 +22869,13 @@ def f(x, y):
         let function = module.callable_defs[0].clone();
         let module_constants =
             crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+        let specialization_inputs = indexed_global_specialization_inputs_for_function(
+            &function,
+            IndexedGlobalAccessKind::Load,
+            "y",
+            true,
+            false,
+        );
         let built = build_test_jit_function_with_constants_and_options(
             &module,
             &function,
@@ -22693,6 +22883,7 @@ def f(x, y):
             &module_constants,
             BuildSpecializedFunctionOptions {
                 guard_miss_deopt_stub: true,
+                specialization_inputs: Some(specialization_inputs),
                 ..BuildSpecializedFunctionOptions::default()
             },
         );
@@ -22745,6 +22936,13 @@ def f(x, y):
         let function = module.callable_defs[0].clone();
         let module_constants =
             crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+        let specialization_inputs = indexed_global_specialization_inputs_for_function(
+            &function,
+            IndexedGlobalAccessKind::Load,
+            "x",
+            true,
+            false,
+        );
         let built = build_test_jit_function_with_constants_and_options(
             &module,
             &function,
@@ -22752,6 +22950,7 @@ def f(x, y):
             &module_constants,
             BuildSpecializedFunctionOptions {
                 guard_miss_deopt_stub: true,
+                specialization_inputs: Some(specialization_inputs),
                 ..BuildSpecializedFunctionOptions::default()
             },
         );
@@ -22821,6 +23020,13 @@ def f(x, y):
                     shared_state.lowered_module.counter_defs.as_slice(),
                 );
             let blocks = vec![std::ptr::null_mut::<c_void>(); function.blocks.len()];
+            let specialization_inputs = indexed_global_specialization_inputs_for_function(
+                &function,
+                IndexedGlobalAccessKind::Load,
+                "x",
+                true,
+                false,
+            );
             let built = build_test_cranelift_run_bb_specialized_function(
                 &mut jit_module,
                 blocks.as_slice(),
@@ -22838,6 +23044,7 @@ def f(x, y):
                 None,
                 BuildSpecializedFunctionOptions {
                     guard_miss_deopt_stub: true,
+                    specialization_inputs: Some(specialization_inputs),
                     ..BuildSpecializedFunctionOptions::default()
                 },
             )
@@ -22969,6 +23176,13 @@ def f(x, y):
                     shared_state.lowered_module.counter_defs.as_slice(),
                 );
             let blocks = vec![std::ptr::null_mut::<c_void>(); function.blocks.len()];
+            let specialization_inputs = indexed_global_specialization_inputs_for_function(
+                &function,
+                IndexedGlobalAccessKind::Store,
+                "x",
+                true,
+                true,
+            );
             let built = build_test_cranelift_run_bb_specialized_function(
                 &mut jit_module,
                 blocks.as_slice(),
@@ -22984,7 +23198,10 @@ def f(x, y):
                 Some(shared_state.as_ref()),
                 None,
                 None,
-                BuildSpecializedFunctionOptions::default(),
+                BuildSpecializedFunctionOptions {
+                    specialization_inputs: Some(specialization_inputs),
+                    ..BuildSpecializedFunctionOptions::default()
+                },
             )
             .expect("specialized JIT build should succeed");
             let facts = infer_jit_value_facts(&shared_state.lowered_module);

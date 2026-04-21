@@ -2143,30 +2143,15 @@ fn emit_load<'fb>(
                     .fb()
                     .ins()
                     .iconst(ir::types::I64, i64::from(slot.slot()));
-                if state.ctx().allow_legacy_indexed_globals
-                    && state
-                        .ctx()
-                        .global_indexed_hit_counter_ids
-                        .contains_key(&instr_id)
-                {
-                    emit_indexed_global_load_with_state(
-                        state,
-                        globals_obj,
-                        name_obj,
-                        slot_index,
-                        instr_id,
-                    )
-                } else {
-                    let call_inst = state
-                        .fb()
-                        .ins()
-                        .call(func_ref, &[globals_obj, name_obj, slot_index]);
-                    state
-                        .fb()
-                        .ins()
-                        .call(decref_ref, &[thread_state_value, name_obj]);
-                    state.fb().inst_results(call_inst)[0]
-                }
+                let call_inst = state
+                    .fb()
+                    .ins()
+                    .call(func_ref, &[globals_obj, name_obj, slot_index]);
+                state
+                    .fb()
+                    .ins()
+                    .call(decref_ref, &[thread_state_value, name_obj]);
+                state.fb().inst_results(call_inst)[0]
             };
             let slow_value_is_null =
                 state
@@ -2387,30 +2372,17 @@ fn emit_store<'fb, E: Instr<Name = ResolvedName>>(
             .fb()
             .ins()
             .iconst(ir::types::I64, i64::from(expected_index));
-        if state.ctx().behavior_change_indexed_stores && state.ctx().allow_legacy_indexed_globals {
-            emit_indexed_global_store_with_state(
-                state,
-                func_ref,
-                globals_obj,
-                name_obj,
-                slot_index,
-                instr_id,
-                op.value.as_ref(),
-                &arg_values,
-            )
-        } else {
-            let call_inst = state.fb().ins().call(
-                func_ref,
-                &[globals_obj, name_obj, slot_index, arg_values[0].0],
-            );
-            let result = state.fb().inst_results(call_inst)[0];
-            state.release_arg_values(&arg_values);
-            state
-                .fb()
-                .ins()
-                .call(decref_ref, &[thread_state_value, name_obj]);
-            result
-        }
+        let call_inst = state.fb().ins().call(
+            func_ref,
+            &[globals_obj, name_obj, slot_index, arg_values[0].0],
+        );
+        let result = state.fb().inst_results(call_inst)[0];
+        state.release_arg_values(&arg_values);
+        state
+            .fb()
+            .ins()
+            .call(decref_ref, &[thread_state_value, name_obj]);
+        result
     };
     state.finish_owned_result(result)
 }
