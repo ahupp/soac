@@ -16662,13 +16662,64 @@ def f(x):
 
         assert_eq!(
             planned_inputs
-                .evidence_by_function
+                .opt_v3_direct_call_targets
                 .get(&caller_id)
                 .unwrap()
-                .call_target_specializations
                 .get(&source)
                 .unwrap(),
             &vec![callee_id]
+        );
+        assert!(
+            planned_inputs.evidence_by_function.is_empty(),
+            "v3 direct-call sidecars should not be converted into legacy profile evidence"
+        );
+    }
+
+    #[test]
+    fn specialization_profile_uses_v3_direct_calls_only_for_codegen_inputs() {
+        let caller_id = RuntimeFunctionId::from_raw_parts(0, 1);
+        let legacy_target = RuntimeFunctionId::from_raw_parts(0, 2);
+        let v3_target = RuntimeFunctionId::from_raw_parts(0, 3);
+        let source = InstrId::new(BlockLabel::from_index(0), 4);
+
+        let mut legacy_evidence = FunctionProfileEvidence::default();
+        legacy_evidence
+            .call_target_specializations
+            .insert(source, vec![legacy_target]);
+        let mut planned_evidence = HashMap::new();
+        planned_evidence.insert(caller_id, legacy_evidence);
+
+        let mut opt_v3_direct_call_targets = HashMap::new();
+        opt_v3_direct_call_targets.insert(caller_id, HashMap::from([(source, vec![v3_target])]));
+
+        let profile = SpecializationProfile {
+            module_name: None,
+            counter_dump_path: None,
+            planned_evidence,
+            opt_v3_direct_call_targets,
+            opt_v3_exact_int_branch_artifacts: HashMap::new(),
+            behavior_change_indexed_stores: false,
+            profiled_cold_blocks: false,
+            guard_miss_deopt: false,
+        };
+
+        assert_eq!(
+            profile
+                .call_target_specializations(caller_id)
+                .unwrap()
+                .get(&source)
+                .unwrap(),
+            &vec![legacy_target],
+            "legacy planning queries should not see v3 direct-call sidecars"
+        );
+        assert_eq!(
+            profile
+                .codegen_call_target_specializations(caller_id)
+                .unwrap()
+                .get(&source)
+                .unwrap(),
+            &vec![legacy_target, v3_target],
+            "codegen inputs should consume the v3-selected direct-call target"
         );
     }
 

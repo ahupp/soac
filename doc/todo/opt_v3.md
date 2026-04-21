@@ -105,8 +105,10 @@ Implemented:
 - `FunctionSpecializationInputs`: carries validated exact-int branch v3
   artifacts into the JIT build path, where codegen validates that the artifact
   function identity matches the function being compiled. Same-module profiled
-  direct-call sidecars are also converted from `mod.optv3` into the existing
-  direct-call specialization input map.
+  direct-call sidecars are carried from `mod.optv3` as v3-owned codegen inputs;
+  they are merged into the direct-call specialization input map only at
+  `FunctionSpecializationInputs` construction, not rewritten into legacy profile
+  evidence.
 - JIT term lowering now consumes matching exact-int direct-compare branch,
   add/compare branch, add/sub/mul/bitwise-return, and comparison-return
   artifacts by interpreting the mechanical hot region and its local generic
