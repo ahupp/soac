@@ -157,41 +157,13 @@ define_instr! {
     }
 }
 
-#[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct Call<E: Instr> {
     _meta: Meta,
     pub extra: E::Extra,
     pub func: Box<E>,
     pub args: Vec<CallArgPositional<E>>,
     pub keywords: Vec<CallArgKeyword<E>>,
-}
-
-impl<E: Instr + fmt::Debug> fmt::Debug for Call<E> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?}(", self.func)?;
-        let mut first = true;
-        for arg in &self.args {
-            if !first {
-                write!(f, ", ")?;
-            }
-            first = false;
-            match arg {
-                CallArgPositional::Positional(expr) => write!(f, "{expr:?}")?,
-                CallArgPositional::Starred(expr) => write!(f, "*{expr:?}")?,
-            }
-        }
-        for keyword in &self.keywords {
-            if !first {
-                write!(f, ", ")?;
-            }
-            first = false;
-            match keyword {
-                CallArgKeyword::Named { arg, value } => write!(f, "{arg}={value:?}")?,
-                CallArgKeyword::Starred(value) => write!(f, "**{value:?}")?,
-            }
-        }
-        write!(f, ")")
-    }
 }
 
 impl<E> PrettyPrint for Call<E>
@@ -404,7 +376,7 @@ define_instr! {
     }
 }
 
-#[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct CallDirect<E: Instr> {
     _meta: Meta,
     pub extra: E::Extra,
@@ -412,27 +384,6 @@ pub struct CallDirect<E: Instr> {
     pub function_id: RuntimeFunctionId,
     pub args: Vec<CallArgPositional<E>>,
     pub keywords: Vec<CallArgKeyword<E>>,
-}
-
-impl<E: Instr + fmt::Debug> fmt::Debug for CallDirect<E> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "CallDirect({}, {:?}", self.function_id, self.callable)?;
-        for arg in &self.args {
-            write!(f, ", ")?;
-            match arg {
-                CallArgPositional::Positional(expr) => write!(f, "{expr:?}")?,
-                CallArgPositional::Starred(expr) => write!(f, "*{expr:?}")?,
-            }
-        }
-        for keyword in &self.keywords {
-            write!(f, ", ")?;
-            match keyword {
-                CallArgKeyword::Named { arg, value } => write!(f, "{arg}={value:?}")?,
-                CallArgKeyword::Starred(value) => write!(f, "**{value:?}")?,
-            }
-        }
-        write!(f, ")")
-    }
 }
 
 impl<E> PrettyPrint for CallDirect<E>
@@ -675,17 +626,11 @@ define_instr! {
     }
 }
 
-#[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct Load<I: Instr> {
     _meta: Meta,
     pub extra: I::Extra,
     pub name: I::Name,
-}
-
-impl<I: Instr> fmt::Debug for Load<I> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.name.pretty_id())
-    }
 }
 
 impl<I: Instr> PrettyPrint for Load<I> {
@@ -797,27 +742,12 @@ impl<I: Instr> Mappable<I> for Load<I> {
     }
 }
 
-#[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct Store<I: Instr> {
     _meta: Meta,
     pub extra: I::Extra,
     pub name: I::Name,
     pub value: Box<I>,
-}
-
-impl<I: Instr> fmt::Debug for Store<I> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.name.pretty_id() == self.name.id_str() {
-            write!(f, "StoreName({:?}, {:?})", self.name.id_str(), self.value)
-        } else {
-            write!(
-                f,
-                "StoreLocation({}, {:?})",
-                self.name.pretty_id(),
-                self.value
-            )
-        }
-    }
 }
 
 impl<I> PrettyPrint for Store<I>
@@ -945,21 +875,12 @@ impl<I: Instr> Mappable<I> for Store<I> {
     }
 }
 
-#[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct Del<I: Instr> {
     _meta: Meta,
     pub extra: I::Extra,
     pub name: I::Name,
     pub quietly: bool,
-}
-
-impl<I: Instr> fmt::Debug for Del<I> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Del")
-            .field("name", &self.name.pretty_id())
-            .field("quietly", &self.quietly)
-            .finish()
-    }
 }
 
 impl<I: Instr> PrettyPrint for Del<I> {
@@ -1150,19 +1071,11 @@ impl<E: Instr> MakeFunctionWithClosure<E> {
 
 macro_rules! define_suspend_instr {
     ($name:ident, $prefix:literal) => {
-        #[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+        #[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
         pub struct $name<E: Instr> {
             _meta: Meta,
             pub extra: E::Extra,
             pub value: Box<E>,
-        }
-
-        impl<E: Instr> fmt::Debug for $name<E> {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                let mut debug = f.debug_tuple(stringify!($name));
-                debug.field(&self.value);
-                debug.finish()
-            }
         }
 
         impl<E> PrettyPrint for $name<E>

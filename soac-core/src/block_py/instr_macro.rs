@@ -33,20 +33,12 @@ macro_rules! define_instr {
         [$($ctor_args:tt)*]
         [$($ctor_init:tt)*]
     ) => {
-        #[derive(Clone)]
+        #[derive(Clone, Debug)]
         $($attrs)*
         $vis struct $name<$expr_ty: Instr> {
             _meta: Meta,
             pub extra: $expr_ty::Extra,
             $($struct_fields)*
-        }
-
-        impl<$expr_ty: Instr> std::fmt::Debug for $name<$expr_ty> {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                let mut debug = f.debug_tuple(stringify!($name));
-                define_instr!(@debug_tuple_fields debug, self, $($raw_fields)*);
-                debug.finish()
-            }
         }
 
         impl<$expr_ty> $crate::block_py::PrettyPrint for $name<$expr_ty>
@@ -199,19 +191,11 @@ macro_rules! define_instr {
         [$($ctor_args:tt)*]
         [$($ctor_init:tt)*]
     ) => {
-        #[derive(Clone)]
+        #[derive(Clone, Debug)]
         $($attrs)*
         $vis struct $name {
             _meta: Meta,
             $($struct_fields)*
-        }
-
-        impl std::fmt::Debug for $name {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                let mut debug = f.debug_tuple(stringify!($name));
-                define_instr!(@debug_tuple_fields debug, self, $($raw_fields)*);
-                debug.finish()
-            }
         }
 
         impl $crate::block_py::PrettyPrint for $name {
@@ -641,35 +625,6 @@ macro_rules! define_instr {
         if let Some(item) = &mut $self.$field {
             $visitor.visit_instr_mut(item);
         }
-    };
-    (@debug_tuple_fields $builder:ident, $self:ident,) => {};
-    (@debug_tuple_fields $builder:ident, $self:ident, $field:ident : Box<$expr_ty:ident>, $($rest:tt)*) => {
-        $builder.field(&$self.$field);
-        define_instr!(@debug_tuple_fields $builder, $self, $($rest)*);
-    };
-    (@debug_tuple_fields $builder:ident, $self:ident, $field:ident : Box<$expr_ty:ident>) => {
-        $builder.field(&$self.$field);
-    };
-    (@debug_tuple_fields $builder:ident, $self:ident, $field:ident : $ty:ty, $($rest:tt)*) => {
-        $builder.field(&$self.$field);
-        define_instr!(@debug_tuple_fields $builder, $self, $($rest)*);
-    };
-    (@debug_tuple_fields $builder:ident, $self:ident, $field:ident : $ty:ty) => {
-        $builder.field(&$self.$field);
-    };
-    (@debug_tuple_fields $builder:ident, $self:ident, $field:ident : Vec<$expr_ty:ident>, $($rest:tt)*) => {
-        $builder.field(&$self.$field);
-        define_instr!(@debug_tuple_fields $builder, $self, $($rest)*);
-    };
-    (@debug_tuple_fields $builder:ident, $self:ident, $field:ident : Vec<$expr_ty:ident>) => {
-        $builder.field(&$self.$field);
-    };
-    (@debug_tuple_fields $builder:ident, $self:ident, $field:ident : Option<Box<$expr_ty:ident>>, $($rest:tt)*) => {
-        $builder.field(&$self.$field);
-        define_instr!(@debug_tuple_fields $builder, $self, $($rest)*);
-    };
-    (@debug_tuple_fields $builder:ident, $self:ident, $field:ident : Option<Box<$expr_ty:ident>>) => {
-        $builder.field(&$self.$field);
     };
     (@pretty_tuple $printer:ident, $self:ident, $name:ident,) => {
         std::fmt::Write::write_str($printer, stringify!($name))
