@@ -26,6 +26,10 @@ mod tests {
     use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyModule, PyModuleMethods, PyTuple};
     use pyo3::{Bound, Py, PyAny, PyErr, PyResult, Python, ffi};
     use ruff_python_ast as ast;
+    use soac_core::profile::{
+        CounterDumpRecord, CounterDumpRow, CounterDumpTypeKey, CounterDumpTypeKeyLayout,
+        CounterDumpTypeTableEntry, write_counter_dump_records,
+    };
     use soac_driver::codegen_cache::{
         PythonModuleCacheSource, module_optimization_plan_path, module_optimization_plan_v3_path,
     };
@@ -42,10 +46,6 @@ mod tests {
         DirectCallArgPlan as PlanV3DirectCallArgPlan,
         DirectCallArgSource as PlanV3DirectCallArgSource, DirectCallSpecializationPlan,
         FunctionPlanIdentity, ModulePlanIdentity,
-    };
-    use soac_profile::{
-        CounterDumpRecord, CounterDumpRow, CounterDumpTypeKey, CounterDumpTypeKeyLayout,
-        CounterDumpTypeTableEntry, write_counter_dump_records,
     };
     use std::collections::{HashMap, VecDeque};
     use std::ffi::c_void;

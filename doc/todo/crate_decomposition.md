@@ -128,16 +128,16 @@ Contents:
 - profile, verify, apply, and trace counter insertion policy
 - runtime/import-hook lowering entrypoints
 
-### `soac-profile`
+### `soac-core::profile`
 
 Own counter dump/profile serialization formats that are shared by runtime, inspector, extension,
 and offline tools.
 
-Completed: added the `soac-profile` workspace crate and moved the binary counter dump format,
-reader/writer, mmap views, type-key layout collection, block-entry count reader, and specialization
-summary rendering out of `soac-jit`. `soac-jit` still owns live runtime counter collection and
-optimization-plan construction, but consumers no longer need to depend on the JIT backend just to
-read counter dump files.
+Completed: moved the binary counter dump format, reader/writer, mmap views, type-key layout
+collection, block-entry count reader, and specialization summary rendering out of `soac-jit`.
+These APIs now live in `soac-core::profile`, so consumers can share profile data structures without
+depending on the JIT backend or a separate profile crate. `soac-jit` still owns live runtime counter
+collection and optimization-plan construction.
 
 Contents:
 
@@ -270,7 +270,7 @@ keeps web dependencies out of non-web rendering and offline analysis tools.
    crates import lowering/codegen-cache APIs from `soac-lowering` directly.
 7. Done: move env parsing and logging setup into `soac-config`.
 8. Done, partial: moved counter dump schemas, serialization, readers, and summary helpers into
-   `soac-profile`. Live runtime counter collection remains in `soac-jit`, and optimization-plan
+   `soac-core::profile`. Live runtime counter collection remains in `soac-jit`, and optimization-plan
    evidence construction remains there until that boundary is split from backend emission.
 9. Split `soac-jit/src/jit/mod.rs` into internal modules along backend responsibility boundaries.
 10. Extract `soac-codegen-model` after the shared descriptors are visible and no longer buried in

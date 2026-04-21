@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tower_http::services::ServeDir;
 
-use soac_profile::CounterDumpFile;
+use soac_core::profile::CounterDumpFile;
 
 static NEXT_WEB_MODULE_ID: AtomicU64 = AtomicU64::new(1);
 

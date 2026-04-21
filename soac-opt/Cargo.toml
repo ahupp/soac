@@ -12,4 +12,3 @@ rkyv = { version = "0.8", features = ["alloc"] }
 soac-core = { path = "../soac-core" }
 soac-driver = { path = "../soac-driver" }
 soac-lowering = { path = "../soac-lowering" }
-soac-profile = { path = "../soac-profile" }

@@ -1,10 +1,10 @@
 #[cfg(not(target_endian = "little"))]
 compile_error!("counter dump format currently requires little-endian hosts");
 
+use crate::block_py::{BlockLabel, InstrId, RuntimeFunctionId};
 use memmap2::Mmap;
 use rkyv::rancor::Error as RkyvError;
 use rkyv::{Archive, Deserialize, Serialize};
-use soac_core::block_py::{BlockLabel, InstrId, RuntimeFunctionId};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Write;
@@ -979,7 +979,7 @@ pub fn write_counter_dump_records<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soac_core::block_py::BlockLabel;
+    use crate::block_py::BlockLabel;
     use std::collections::HashMap;
     use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};

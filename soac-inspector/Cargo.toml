@@ -11,7 +11,6 @@ soac-lowering = { path = "../soac-lowering" }
 soac-driver = { path = "../soac-driver" }
 soac-config = { path = "../soac-config" }
 soac-core = { path = "../soac-core" }
-soac-profile = { path = "../soac-profile" }
 soac-opt = { path = "../soac-opt" }
 soac-cpython = { path = "../soac-cpython" }
 pyo3 = { workspace = true }

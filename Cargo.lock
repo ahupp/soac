@@ -1738,6 +1738,7 @@ name = "soac-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "memmap2",
  "rkyv",
  "ruff_python_ast",
  "ruff_text_size",
@@ -1782,7 +1783,6 @@ dependencies = [
  "soac-jit",
  "soac-lowering",
  "soac-opt",
- "soac-profile",
  "tokio",
  "tower",
  "tower-http",
@@ -1815,7 +1815,6 @@ dependencies = [
  "soac-driver",
  "soac-lowering",
  "soac-opt",
- "soac-profile",
  "tracing",
 ]
 
@@ -1859,16 +1858,6 @@ dependencies = [
  "soac-core",
  "soac-driver",
  "soac-lowering",
- "soac-profile",
-]
-
-[[package]]
-name = "soac-profile"
-version = "0.1.0"
-dependencies = [
- "memmap2",
- "rkyv",
- "soac-core",
 ]
 
 [[package]]
@@ -1886,7 +1875,6 @@ dependencies = [
  "soac-jit",
  "soac-lowering",
  "soac-opt",
- "soac-profile",
  "tracing",
 ]
 

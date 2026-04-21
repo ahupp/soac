@@ -164,6 +164,10 @@ fn print_usage() {
 mod test {
     use super::*;
     use soac_core::block_py::{BlockLabel, InstrId, ModuleNameGen, RuntimeFunctionId};
+    use soac_core::profile::{
+        CounterDumpRecord, CounterDumpRow, CounterDumpTypeKey, CounterDumpTypeKeyLayout,
+        CounterDumpTypeTableEntry,
+    };
     use soac_driver::codegen_cache::{
         CachedCodegenModuleMetadata, PythonModuleCacheSource, codegen_module_cache_path,
         module_optimization_plan_path, module_optimization_plan_v3_path,
@@ -172,10 +176,6 @@ mod test {
     use soac_jit::module_type::hash_module_source;
     use soac_opt::artifacts_v3::load_optimization_artifacts_v3;
     use soac_opt::plan::{OptimizationPlan, PlannedAction, PlannedReplacement};
-    use soac_profile::{
-        CounterDumpRecord, CounterDumpRow, CounterDumpTypeKey, CounterDumpTypeKeyLayout,
-        CounterDumpTypeTableEntry,
-    };
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 

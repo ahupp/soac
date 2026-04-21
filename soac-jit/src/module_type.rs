@@ -12,14 +12,14 @@ use soac_core::block_py::{
     BlockPyFunction, BlockPyModule, CounterDef, CounterId, CounterScope, CounterSite,
     DeoptEntrySource, FunctionExecutionMode, RuntimeFunctionId, RuntimeName,
 };
+use soac_core::profile::{
+    CounterDumpKeyLayout, CounterDumpRecord, CounterDumpRow, CounterDumpTypeKey,
+    CounterDumpTypeKeyLayout, CounterDumpTypeTableEntry,
+};
 use soac_driver::codegen_cache::PythonModuleCacheSource;
 use soac_lowering::passes::{
     CodegenModuleShape, InlinePlanModule, plan_module_inlining,
     specialization_runtime_logging_enabled, summarize_module_escapes,
-};
-use soac_profile::{
-    CounterDumpKeyLayout, CounterDumpRecord, CounterDumpRow, CounterDumpTypeKey,
-    CounterDumpTypeKeyLayout, CounterDumpTypeTableEntry,
 };
 use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, c_int, c_void};
@@ -1664,9 +1664,9 @@ impl SoacExtModule {
 mod test {
     use super::*;
     use pyo3::types::PyModule;
+    use soac_core::profile::COUNTER_DUMP_MAGIC;
     use soac_lowering::lower_python_to_blockpy_for_testing;
     use soac_lowering::passes::instrument_bb_module_with_block_entry_counters;
-    use soac_profile::COUNTER_DUMP_MAGIC;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 

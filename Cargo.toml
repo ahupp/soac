@@ -2,7 +2,6 @@
 members = [
     "build_support",
     "soac-core",
-    "soac-profile",
     "soac-opt",
     "soac-driver",
     "soac-config",
@@ -15,7 +14,6 @@ members = [
 ]
 default-members = [
     "soac-core",
-    "soac-profile",
     "soac-opt",
     "soac-driver",
     "soac-config",

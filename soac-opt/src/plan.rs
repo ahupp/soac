@@ -5,13 +5,13 @@ use soac_core::block_py::{
     SerializedFunctionDebugName, SerializedFunctionId, SerializedIdentityTables,
     SerializedModuleId, SerializedModuleIdentity, Visit,
 };
+use soac_core::profile::{CounterDumpFile, collect_type_key_layouts, collect_type_table};
 use soac_driver::codegen_cache::{
     CachedCodegenModule, CachedCodegenModuleMetadata, PythonModuleCacheSource,
     load_codegen_module_cache, module_optimization_plan_path,
 };
 use soac_lowering::block_py::Literal;
 use soac_lowering::passes::{CodegenModuleShape, InstrCodegen, InstrResolved};
-use soac_profile::{CounterDumpFile, collect_type_key_layouts, collect_type_table};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Write;
@@ -1433,7 +1433,7 @@ fn push_unique<T: Eq>(values: &mut Vec<T>, value: T) {
 mod tests {
     use super::*;
     use soac_core::block_py::{BlockLabel, InstrId};
-    use soac_profile::{
+    use soac_core::profile::{
         CounterDumpRecord, CounterDumpRow, CounterDumpTypeKey, CounterDumpTypeKeyLayout,
         CounterDumpTypeTableEntry,
     };
@@ -1772,7 +1772,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!(
-            "soac-profile-evidence-store-test-{}-{unique}.bin",
+            "soac-core-profile-evidence-store-test-{}-{unique}.bin",
             std::process::id()
         ))
     }

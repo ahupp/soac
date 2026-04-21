@@ -43,6 +43,15 @@ use soac_core::block_py::{
     RuntimeFunctionId, RuntimeModuleId, RuntimeName, SerializedFunctionId, StorageLayout, Store,
     Visit, VisitMut, WithMeta,
 };
+use soac_core::profile::{
+    CollectedTypeKeyLayout, CounterDumpTypeKey, read_block_entry_counts_from_file,
+};
+#[cfg(test)]
+use soac_core::profile::{
+    CounterDumpFile, CounterDumpKeyLayout, CounterDumpRecord, CounterDumpRow,
+    CounterDumpTypeKeyLayout, CounterDumpTypeTableEntry, collect_type_key_layouts,
+    collect_type_table, write_counter_dump_records,
+};
 use soac_lowering::block_py::{CodegenBlock, Literal, NameLike};
 use soac_lowering::passes::{
     CodegenModuleShape, ConstructorFieldValue, DirectFunctionIdGuardTest,
@@ -93,13 +102,6 @@ use soac_opt::plan_v3::{
     RegionPlan, Rep, RichCompareOp, ScalarLocalThreadPlan, ScalarThreadFallback,
     ScalarThreadLocalCleanup, ScalarThreadLocalLocation, ScalarThreadLocalState,
     ScalarThreadMaterialization,
-};
-use soac_profile::{CollectedTypeKeyLayout, CounterDumpTypeKey, read_block_entry_counts_from_file};
-#[cfg(test)]
-use soac_profile::{
-    CounterDumpFile, CounterDumpKeyLayout, CounterDumpRecord, CounterDumpRow,
-    CounterDumpTypeKeyLayout, CounterDumpTypeTableEntry, collect_type_key_layouts,
-    collect_type_table, write_counter_dump_records,
 };
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};

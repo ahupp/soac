@@ -12,7 +12,6 @@ soac-lowering = { path = "../soac-lowering" }
 soac-driver = { path = "../soac-driver" }
 soac-config = { path = "../soac-config" }
 soac-core = { path = "../soac-core" }
-soac-profile = { path = "../soac-profile" }
 soac-opt = { path = "../soac-opt" }
 anyhow = { version = "1.0.100", features = ["backtrace"] }
 ruff_python_ast = { workspace = true }

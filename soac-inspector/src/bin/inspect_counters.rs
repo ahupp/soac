@@ -1,6 +1,6 @@
 use serde_json::json;
 use soac_core::block_py::RuntimeFunctionId;
-use soac_profile::{
+use soac_core::profile::{
     CounterDumpFile, CounterDumpKeyLayoutView, CounterDumpRowView, CounterDumpTypeKeyLayoutView,
     render_call_target_specializations,
 };
@@ -219,7 +219,7 @@ fn main() -> Result<(), String> {
 mod tests {
     use super::format_counter_row;
     use soac_core::block_py::{BlockLabel, InstrId, RuntimeFunctionId};
-    use soac_profile::{
+    use soac_core::profile::{
         CounterDumpRecord, CounterDumpRow, CounterDumpRowView, parse_counter_dump_records,
         render_call_target_specializations,
     };

@@ -1,5 +1,6 @@
 use soac_config::SoacEnvConfig;
 use soac_core::block_py::{BlockPyModule, ModuleNameGen, RuntimeFunctionId};
+use soac_core::profile::{CounterDumpFile, CounterDumpRecordView, CounterDumpRowView};
 use soac_driver::codegen_cache::{
     CachedCodegenModuleMetadata, PythonModuleCacheSource, codegen_module_cache_path,
     load_codegen_module_cache, module_optimization_plan_path, module_optimization_plan_v3_path,
@@ -11,7 +12,6 @@ use soac_jit::{
     precompile_codegen_module_to_object_file,
 };
 use soac_lowering::passes::CodegenModuleShape;
-use soac_profile::{CounterDumpFile, CounterDumpRecordView, CounterDumpRowView};
 use std::collections::HashSet;
 use std::env;
 use std::ffi::{OsStr, OsString};
@@ -565,10 +565,10 @@ fn print_usage() {
 #[cfg(test)]
 mod test {
     use super::*;
+    use soac_core::profile::{CounterDumpRecord, CounterDumpRow, parse_counter_dump_records};
     use soac_driver::codegen_cache::store_codegen_module_cache;
     use soac_driver::{LoweringOptions, lower_python_to_blockpy_recorded_with_options};
     use soac_jit::module_type::hash_module_source;
-    use soac_profile::{CounterDumpRecord, CounterDumpRow, parse_counter_dump_records};
     use std::process::Stdio;
     use std::time::{SystemTime, UNIX_EPOCH};
 
