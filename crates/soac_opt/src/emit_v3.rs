@@ -4,9 +4,10 @@ use crate::plan_v3::{
     ExactListItemSpecializationPlan, FailureMode, GuardFailure, GuardKind, IndexedFieldAccessKind,
     IndexedFieldOwnerType, IndexedFieldSpecializationPlan, IndexedGlobalAccessKind,
     IndexedGlobalFallbackPlan, IndexedGlobalGuardPlan, IndexedGlobalSpecializationPlan,
-    MaterializeKind, ModuleOptimizationPlanV3, OperationNode, PlanNodeId, PlanNodeKind,
-    PlanValidationError, PlanValue, PlannedConstant, PlannedOp, RegionExitKind, RegionExitTarget,
-    RegionId, RichCompareOp, validate_module_plan_v3,
+    MaterializeKind, MethodCallFallbackPlan, MethodCallGuardPlan, MethodCallOwnerType,
+    MethodCallSpecializationPlan, ModuleOptimizationPlanV3, OperationNode, PlanNodeId,
+    PlanNodeKind, PlanValidationError, PlanValue, PlannedConstant, PlannedOp, RegionExitKind,
+    RegionExitTarget, RegionId, RichCompareOp, validate_module_plan_v3,
 };
 use soac_core::block_py::{InstrId, SerializedFunctionId};
 use std::fmt;
@@ -22,6 +23,7 @@ pub struct MechanicalFunctionEmission {
     pub function: SerializedFunctionId,
     pub debug_name: Option<String>,
     pub direct_calls: Vec<MechanicalDirectCallEmission>,
+    pub method_calls: Vec<MechanicalMethodCallEmission>,
     pub exact_list_items: Vec<MechanicalExactListItemEmission>,
     pub indexed_fields: Vec<MechanicalIndexedFieldEmission>,
     pub indexed_globals: Vec<MechanicalIndexedGlobalEmission>,
@@ -33,6 +35,18 @@ pub struct MechanicalDirectCallEmission {
     pub source: InstrId,
     pub target: SerializedFunctionId,
     pub arg_plan: DirectCallArgPlan,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct MechanicalMethodCallEmission {
+    pub source: InstrId,
+    pub target: SerializedFunctionId,
+    pub method_name: String,
+    pub owner_type: MethodCallOwnerType,
+    pub arg_plan: DirectCallArgPlan,
+    pub guard: MethodCallGuardPlan,
+    pub fallback: MethodCallFallbackPlan,
     pub reason: String,
 }
 
@@ -216,6 +230,7 @@ pub fn emit_mechanical_plan_v3(
                 function: function.function.function,
                 debug_name: function.function.debug_name.clone(),
                 direct_calls: function.direct_calls.iter().map(emit_direct_call).collect(),
+                method_calls: function.method_calls.iter().map(emit_method_call).collect(),
                 exact_list_items: function
                     .exact_list_items
                     .iter()
@@ -266,6 +281,19 @@ fn emit_direct_call(direct_call: &DirectCallSpecializationPlan) -> MechanicalDir
         target: direct_call.target,
         arg_plan: direct_call.arg_plan.clone(),
         reason: direct_call.reason.clone(),
+    }
+}
+
+fn emit_method_call(method_call: &MethodCallSpecializationPlan) -> MechanicalMethodCallEmission {
+    MechanicalMethodCallEmission {
+        source: method_call.source,
+        target: method_call.target,
+        method_name: method_call.method_name.clone(),
+        owner_type: method_call.owner_type.clone(),
+        arg_plan: method_call.arg_plan.clone(),
+        guard: method_call.guard.clone(),
+        fallback: method_call.fallback.clone(),
+        reason: method_call.reason.clone(),
     }
 }
 
@@ -379,8 +407,9 @@ mod tests {
         ExactListItemSpecializationPlan, FallbackReason, FallbackTarget,
         FunctionOptimizationPlanV3, FunctionOwnershipPlan, FunctionPlanIdentity,
         IndexedFieldAccessKind, IndexedFieldOwnerType, IndexedFieldSpecializationPlan,
-        MaterializeNode, ModulePlanIdentity, RegionExitPlan, RegionInput, RegionPlan, RegionSource,
-        Rep,
+        MaterializeNode, MethodCallFallbackKind, MethodCallFallbackPlan, MethodCallGuardKind,
+        MethodCallGuardPlan, MethodCallOwnerType, MethodCallSpecializationPlan, ModulePlanIdentity,
+        RegionExitPlan, RegionInput, RegionPlan, RegionSource, Rep,
     };
     use soac_core::block_py::{
         BlockLabel, LocalFunctionId, SerializedIdentityTables, SerializedModuleId,
@@ -516,6 +545,7 @@ mod tests {
                 ],
                 scalar_threads: Vec::new(),
                 direct_calls: Vec::new(),
+                method_calls: Vec::new(),
                 exact_list_items: Vec::new(),
                 indexed_fields: Vec::new(),
                 indexed_globals: Vec::new(),
@@ -586,6 +616,55 @@ mod tests {
                     sources: vec![DirectCallArgSource::Provided(0)],
                 },
                 reason: "profiled call_hot_targets selected this same-module function".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn emits_method_call_decisions_mechanically() {
+        let mut plan = test_plan(true);
+        let source = InstrId::new(BlockLabel::from_index(0), 7);
+        let target = SerializedFunctionId::new(SerializedModuleId::new(0), LocalFunctionId::new(2));
+        let owner_type = MethodCallOwnerType {
+            module_name: "pkg.mod".to_string(),
+            qualname: "Box".to_string(),
+        };
+        let guard = MethodCallGuardPlan {
+            kind: MethodCallGuardKind::ExactReceiverTypeVersion,
+        };
+        let fallback = MethodCallFallbackPlan {
+            kind: MethodCallFallbackKind::OriginalMethodCall,
+        };
+        plan.functions[0]
+            .method_calls
+            .push(MethodCallSpecializationPlan {
+                source,
+                target,
+                method_name: "get".to_string(),
+                owner_type: owner_type.clone(),
+                arg_plan: DirectCallArgPlan {
+                    sources: vec![DirectCallArgSource::Provided(0)],
+                },
+                guard: guard.clone(),
+                fallback: fallback.clone(),
+                reason: "profiled call_hot_targets selected this owner method".to_string(),
+            });
+
+        let emission = emit_mechanical_plan_v3(&plan).unwrap();
+
+        assert_eq!(
+            emission.functions[0].method_calls,
+            vec![MechanicalMethodCallEmission {
+                source,
+                target,
+                method_name: "get".to_string(),
+                owner_type,
+                arg_plan: DirectCallArgPlan {
+                    sources: vec![DirectCallArgSource::Provided(0)],
+                },
+                guard,
+                fallback,
+                reason: "profiled call_hot_targets selected this owner method".to_string(),
             }]
         );
     }

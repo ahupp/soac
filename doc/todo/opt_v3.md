@@ -83,17 +83,18 @@ Implemented:
   `return a & b`/`return a | b`/`return a ^ b` bitwise returns, and
   `return a < b` comparison returns, producing hot and local-fallback
   `RegionPlan`s. It also records a scalar-thread sidecar when a compact-int
-  store RHS feeds the immediately following local comparison, and ordinary
-  profiled direct-call selections from `call_hot_targets`, including
-  cross-module targets present in the cached module set. Constant-attribute
+  store RHS feeds the immediately following local comparison, ordinary profiled
+  direct-call selections from `call_hot_targets`, including cross-module targets
+  present in the cached module set, and guarded receiver-method selections from
+  `Call(GetAttr(receiver, method), ...)` profile evidence. Constant-attribute
   indexed-field selections are planned from raw `type_keys` layout evidence and
   lowered `GetAttr`/`SetAttr` sites. Exact-list item selections are planned from
   raw `getitem_hot_shapes`/`setitem_hot_shapes` evidence and lowered
   `GetItem`/`SetItem` sites.
 - `soac_opt::emit_v3`: validation-gated mechanical
   emitter over selected v3 plan nodes and exits. Function-level direct-call
-  selections, exact-list item selections, and indexed-field selections are also
-  emitted as mechanical decisions.
+  selections, method-call selections, exact-list item selections, and
+  indexed-field selections are also emitted as mechanical decisions.
 - `soac_opt::evidence_v3`: bridge from existing
   `FunctionProfileEvidence` exact-int operator shapes and lowered integer
   module constants into v3 planner facts.
@@ -104,8 +105,8 @@ Implemented:
   raw profile evidence, and writes a serialized `mod.optv3` artifact.
 - `print_optimization_plan_v3`: inspection summary for serialized v3 artifacts,
   with `--details` showing region inputs, plan nodes, exits, mechanical
-  emission steps, scalar threads, direct-call decisions, and indexed-field
-  decisions.
+  emission steps, scalar threads, direct-call and method-call decisions, and
+  indexed-field decisions.
 - JIT `verify`/`apply` loading prefers `mod.optv3`, validates module identity,
   splits module-level artifacts into per-function mechanical artifacts, and only
   falls back to legacy `mod.opt` when no v3 artifact is present.
@@ -119,6 +120,12 @@ Implemented:
   targets only for direct-call function predeclaration, module-plan direct-call
   rewrites, precompile target lookup, and process-JIT batch scheduling, not as
   legacy profile evidence.
+  Method-call decisions are also derived from mechanical `mod.optv3` emission
+  as v3-owned codegen inputs. They carry owner type, method name, receiver
+  type-version guard kind, original-call fallback kind, and an argument plan
+  with the implicit receiver represented explicitly. The JIT validates the
+  emitted method plan, resolves the current owner type/attribute, and lowers it
+  to a typed guarded method call without converting it to legacy evidence.
   Indexed-field
   decisions are also derived from mechanical `mod.optv3` emission as v3-owned
   typed-attribute inputs, with exact plan/emission validation before use.
@@ -147,11 +154,12 @@ Partially migrated families are also intentionally visible:
 - scalar-threading is only implemented for the adjacent, no-exception,
   store-RHS-to-empty-compare shape;
 - profiled direct calls are represented as v3 plan selections plus mechanical
-  direct-call emissions with validated ordinary-call argument plans and consumed
-  through mechanical typed-call lowering for ordinary-function targets.
+  direct-call/method-call emissions with validated argument plans and consumed
+  through mechanical typed-call lowering for ordinary-function and receiver
+  method targets.
   Cross-module targets are represented through serialized module identities and
-  resolved from the loaded module set; methods and constructors are still
-  outside the v3 direct-call family.
+  resolved from the loaded module set; constructors are still outside the v3
+  direct-call family.
 - indexed fields are represented as v3 plan selections plus mechanical
   indexed-field emissions. `soac_jit` now keeps the emitted access kind and
   attribute name separate from legacy per-instruction field evidence and
@@ -539,6 +547,8 @@ struct FunctionOptimizationPlanV3 {
     function: FunctionIdentity,
     regions: Vec<RegionPlan>,
     scalar_threads: Vec<ScalarLocalThreadPlan>,
+    direct_calls: Vec<DirectCallSpecializationPlan>,
+    method_calls: Vec<MethodCallSpecializationPlan>,
     deopt_points: Vec<PlannedDeoptPoint>,
     ownership: FunctionOwnershipPlan,
     diagnostics: Vec<PlanDiagnostic>,
@@ -690,9 +700,10 @@ the branch exit demands `I32Bool01`. If a later Python-observable boundary needs
    - Migrate exact-int operators first.
    - Then truthiness and materialization.
    - Direct calls are partially migrated through mechanical v3 typed lowering,
-     including cross-module ordinary-function targets; indexed fields and
-     indexed globals are partially migrated as v3-owned codegen inputs; lift
-     their actual lowering into mechanical nodes next.
+     including cross-module ordinary-function targets and guarded receiver
+     methods; indexed fields and indexed globals are partially migrated as
+     v3-owned codegen inputs; lift their actual lowering into mechanical nodes
+     next.
    - Then getitem/setitem.
    - Keep old paths until each replacement has structured tests and diagnostics.
 

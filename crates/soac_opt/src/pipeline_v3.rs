@@ -12,12 +12,13 @@ use crate::plan::{
 use crate::plan_v3::{
     DirectCallArgPlan, DirectCallArgSource, EXACT_LIST_EXACT_INT_ITEM_SHAPE_TAG,
     ExactListItemAccessKind, ExactListItemShape, FunctionPlanIdentity, IndexedFieldAccessKind,
-    IndexedFieldOwnerType, IndexedGlobalAccessKind, ModulePlanIdentity, PlanDiagnostic, RegionId,
+    IndexedFieldOwnerType, IndexedGlobalAccessKind, MethodCallOwnerType, ModulePlanIdentity,
+    PlanDiagnostic, RegionId,
 };
 use crate::planner_v3::{
     DirectCallPlanRequest, ExactListItemPlanRequest, ExtractedRegionPlanRequest,
-    FunctionPlanRequest, IndexedFieldPlanRequest, IndexedGlobalPlanRequest, ModulePlanRequest,
-    plan_module_optimization_v3,
+    FunctionPlanRequest, IndexedFieldPlanRequest, IndexedGlobalPlanRequest, MethodCallPlanRequest,
+    ModulePlanRequest, plan_module_optimization_v3,
 };
 use crate::region_v3::{
     RegionExtractionAttempt, RegionExtractionError, extract_function_regions_v3,
@@ -297,6 +298,7 @@ fn plan_and_emit_module_v3_from_raw_evidence_with_target_index(
             }
         }
         let (direct_calls, direct_call_diagnostics) = direct_call_requests_from_evidence_v3(
+            lowered_module,
             metadata,
             function,
             evidence_store,
@@ -304,6 +306,15 @@ fn plan_and_emit_module_v3_from_raw_evidence_with_target_index(
             &mut identity_builder,
         );
         diagnostics.extend(direct_call_diagnostics);
+        let (method_calls, method_call_diagnostics) = method_call_requests_from_evidence_v3(
+            lowered_module,
+            metadata,
+            function,
+            evidence_store,
+            target_index,
+            &mut identity_builder,
+        );
+        diagnostics.extend(method_call_diagnostics);
         let (exact_list_items, exact_list_item_diagnostics) =
             exact_list_item_requests_from_profile_evidence_v3(function, &evidence);
         diagnostics.extend(exact_list_item_diagnostics);
@@ -321,6 +332,7 @@ fn plan_and_emit_module_v3_from_raw_evidence_with_target_index(
             function: function_plan_identity_v3(function),
             regions: region_requests,
             direct_calls,
+            method_calls,
             exact_list_items,
             indexed_fields,
             indexed_globals,
@@ -372,6 +384,7 @@ pub fn plan_and_emit_extracted_exact_int_branches_v3(
             module,
             functions: vec![FunctionPlanRequest {
                 direct_calls: Vec::new(),
+                method_calls: Vec::new(),
                 exact_list_items: Vec::new(),
                 indexed_fields: Vec::new(),
                 indexed_globals: Vec::new(),
@@ -666,6 +679,7 @@ fn module_constant_string_value_v3(
 }
 
 fn direct_call_requests_from_evidence_v3(
+    lowered_module: &BlockPyModule<CodegenModuleShape>,
     metadata: &CachedCodegenModuleMetadata,
     function: &BlockPyFunction<CodegenModuleShape>,
     evidence_store: &ProfileEvidenceStore,
@@ -684,6 +698,9 @@ fn direct_call_requests_from_evidence_v3(
         .collect::<Vec<_>>();
     entries.sort_by_key(|(source, _)| *source);
     for (source, targets) in entries {
+        if is_method_call_source_v3(lowered_module, function, source) {
+            continue;
+        }
         let mut targets = targets;
         targets.sort();
         targets.dedup();
@@ -720,6 +737,7 @@ fn direct_call_requests_from_evidence_v3(
                 function,
                 source,
                 target_function,
+                0,
             ) {
                 Some(Ok(arg_plan)) => arg_plan,
                 Some(Err(reason)) => {
@@ -754,14 +772,204 @@ fn direct_call_requests_from_evidence_v3(
     (requests, diagnostics)
 }
 
+fn method_call_requests_from_evidence_v3(
+    lowered_module: &BlockPyModule<CodegenModuleShape>,
+    metadata: &CachedCodegenModuleMetadata,
+    function: &BlockPyFunction<CodegenModuleShape>,
+    evidence_store: &ProfileEvidenceStore,
+    target_index: &DirectCallTargetIndex,
+    identity_builder: &mut OptimizationPlanV3IdentityBuilder,
+) -> (Vec<MethodCallPlanRequest>, Vec<PlanDiagnostic>) {
+    let mut requests = Vec::new();
+    let mut diagnostics = Vec::new();
+    let mut entries = evidence_store
+        .persistent_call_target_specializations_for_runtime_function_v3(
+            metadata.module_name.as_str(),
+            metadata.source_hash,
+            function.function_id,
+        )
+        .into_iter()
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|(source, _)| *source);
+    for (source, targets) in entries {
+        let method_name = match method_call_name_for_instr_id_v3(lowered_module, function, source) {
+            Some(Some(method_name)) => method_name,
+            Some(None) => {
+                diagnostics.push(PlanDiagnostic {
+                    source: Some(source),
+                    message: "v3 method-call declined source: method attribute name is not a constant string".to_string(),
+                });
+                continue;
+            }
+            None => continue,
+        };
+        let mut targets = targets;
+        targets.sort();
+        targets.dedup();
+        for target in targets {
+            let serialized_target = identity_builder.function_id_for_persistent(target.clone());
+            let Some(target_function) = target_index.function(&target) else {
+                diagnostics.push(PlanDiagnostic {
+                    source: Some(source),
+                    message: format!(
+                        "v3 method-call declined target {serialized_target}: target function is missing from cached modules"
+                    ),
+                });
+                continue;
+            };
+            if target_function.execution_mode() != FunctionExecutionMode::Jit {
+                diagnostics.push(PlanDiagnostic {
+                    source: Some(source),
+                    message: format!(
+                        "v3 method-call declined target {serialized_target}: target function is not JIT lowered"
+                    ),
+                });
+                continue;
+            }
+            if target_function.names.fn_name == "__init__" {
+                diagnostics.push(PlanDiagnostic {
+                    source: Some(source),
+                    message: format!(
+                        "v3 method-call declined target {serialized_target}: constructor targets require constructor allocation semantics"
+                    ),
+                });
+                continue;
+            }
+            let Some(owner_type) =
+                method_call_owner_type_from_target_v3(&target, target_function, &method_name)
+            else {
+                diagnostics.push(PlanDiagnostic {
+                    source: Some(source),
+                    message: format!(
+                        "v3 method-call declined target {serialized_target}: could not derive owner type for method {method_name}"
+                    ),
+                });
+                continue;
+            };
+            let arg_plan = match direct_call_arg_plan_for_instr_id_v3(
+                function,
+                source,
+                target_function,
+                1,
+            ) {
+                Some(Ok(arg_plan)) => arg_plan,
+                Some(Err(reason)) => {
+                    diagnostics.push(PlanDiagnostic {
+                        source: Some(source),
+                        message: format!(
+                            "v3 method-call declined target {serialized_target}: {reason}"
+                        ),
+                    });
+                    continue;
+                }
+                None => {
+                    diagnostics.push(PlanDiagnostic {
+                        source: Some(source),
+                        message: format!(
+                            "v3 method-call declined target {serialized_target}: source instruction is not a lowered call"
+                        ),
+                    });
+                    continue;
+                }
+            };
+            requests.push(MethodCallPlanRequest {
+                source,
+                target: serialized_target,
+                method_name: method_name.clone(),
+                owner_type,
+                arg_plan,
+                reason: "profiled call_hot_targets selected this owner-method target with validated receiver-call arguments".to_string(),
+            });
+            identity_builder
+                .add_debug_name(serialized_target, target_function.names.qualname.clone());
+        }
+    }
+    (requests, diagnostics)
+}
+
+fn method_call_owner_type_from_target_v3(
+    target: &PersistentFunctionId,
+    target_function: &BlockPyFunction<CodegenModuleShape>,
+    method_name: &str,
+) -> Option<MethodCallOwnerType> {
+    let suffix = format!(".{method_name}");
+    let owner_qualname = target_function
+        .names
+        .qualname
+        .strip_suffix(suffix.as_str())?;
+    if owner_qualname.is_empty()
+        || owner_qualname
+            .split('.')
+            .any(|part| part.is_empty() || part == "<locals>")
+    {
+        return None;
+    }
+    Some(MethodCallOwnerType {
+        module_name: target.module.module_name.clone(),
+        qualname: owner_qualname.to_string(),
+    })
+}
+
+fn is_method_call_source_v3(
+    module: &BlockPyModule<CodegenModuleShape>,
+    function: &BlockPyFunction<CodegenModuleShape>,
+    source: InstrId,
+) -> bool {
+    method_call_name_for_instr_id_v3(module, function, source).is_some()
+}
+
+fn method_call_name_for_instr_id_v3(
+    module: &BlockPyModule<CodegenModuleShape>,
+    function: &BlockPyFunction<CodegenModuleShape>,
+    source: InstrId,
+) -> Option<Option<String>> {
+    struct Finder<'a> {
+        module: &'a BlockPyModule<CodegenModuleShape>,
+        source: InstrId,
+        result: Option<Option<String>>,
+    }
+
+    impl Visit<InstrCodegen> for Finder<'_> {
+        fn visit_instr(&mut self, expr: &InstrCodegen)
+        where
+            InstrCodegen: ChildVisitable<InstrCodegen>,
+        {
+            if self.result.is_some() {
+                return;
+            }
+            if let InstrCodegen::Call(call) = expr
+                && call.try_semantic_instr_id() == Some(self.source)
+                && let InstrCodegen::GetAttr(getattr) = call.func.as_ref()
+            {
+                self.result = Some(
+                    codegen_constant_string_value_v3(self.module, getattr.attr.as_ref())
+                        .map(str::to_string),
+                );
+                return;
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    let mut finder = Finder {
+        module,
+        source,
+        result: None,
+    };
+    finder.visit_fn(function);
+    finder.result
+}
+
 fn direct_call_arg_plan_for_instr_id_v3(
     function: &BlockPyFunction<CodegenModuleShape>,
     source: InstrId,
     target_function: &BlockPyFunction<CodegenModuleShape>,
+    implicit_positional_arg_count: usize,
 ) -> Option<std::result::Result<DirectCallArgPlan, String>> {
     struct Finder<'a> {
         source: InstrId,
         target_function: &'a BlockPyFunction<CodegenModuleShape>,
+        implicit_positional_arg_count: usize,
         result: Option<std::result::Result<DirectCallArgPlan, String>>,
     }
 
@@ -779,6 +987,7 @@ fn direct_call_arg_plan_for_instr_id_v3(
                 self.result = Some(direct_call_arg_plan_from_call_v3(
                     call,
                     self.target_function,
+                    self.implicit_positional_arg_count,
                 ));
                 return;
             }
@@ -789,6 +998,7 @@ fn direct_call_arg_plan_for_instr_id_v3(
     let mut finder = Finder {
         source,
         target_function,
+        implicit_positional_arg_count,
         result: None,
     };
     finder.visit_fn(function);
@@ -798,6 +1008,7 @@ fn direct_call_arg_plan_for_instr_id_v3(
 fn direct_call_arg_plan_from_call_v3(
     call: &Call<InstrCodegen>,
     target_function: &BlockPyFunction<CodegenModuleShape>,
+    implicit_positional_arg_count: usize,
 ) -> std::result::Result<DirectCallArgPlan, String> {
     if call
         .args
@@ -819,11 +1030,13 @@ fn direct_call_arg_plan_from_call_v3(
         }
     }
 
-    let provided_positional_arg_count = call
+    let explicit_positional_arg_count = call
         .args
         .iter()
         .filter(|arg| matches!(arg, CallArgPositional::Positional(_)))
         .count();
+    let provided_positional_arg_count =
+        implicit_positional_arg_count + explicit_positional_arg_count;
     let accepted_positional_arg_count = target_function
         .params
         .iter()

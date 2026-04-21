@@ -49,7 +49,9 @@ mod tests {
         FunctionPlanIdentity, IndexedFieldAccessKind, IndexedFieldOwnerType,
         IndexedFieldSpecializationPlan, IndexedGlobalAccessKind, IndexedGlobalFallbackKind,
         IndexedGlobalFallbackPlan, IndexedGlobalGuardKind, IndexedGlobalGuardPlan,
-        IndexedGlobalSpecializationPlan, ModulePlanIdentity,
+        IndexedGlobalSpecializationPlan, MethodCallFallbackKind, MethodCallFallbackPlan,
+        MethodCallGuardKind, MethodCallGuardPlan, MethodCallOwnerType,
+        MethodCallSpecializationPlan, ModulePlanIdentity,
     };
     use std::collections::{HashMap, VecDeque};
     use std::ffi::c_void;
@@ -3106,6 +3108,7 @@ def build(values):
                     regions: Vec::new(),
                     scalar_threads: Vec::new(),
                     direct_calls: Vec::new(),
+                    method_calls: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
                     indexed_globals: Vec::new(),
@@ -3120,6 +3123,7 @@ def build(values):
                     function: serialized_function,
                     debug_name: Some(function.names.qualname.clone()),
                     direct_calls: Vec::new(),
+                    method_calls: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
                     indexed_globals: Vec::new(),
@@ -16258,6 +16262,7 @@ def f(x):
                 specialization_inputs: Some(FunctionSpecializationInputs {
                     call_target_specializations: HashMap::new(),
                     opt_v3_direct_calls_by_instr: HashMap::new(),
+                    opt_v3_method_calls_by_instr: HashMap::new(),
                     operator_specializations: HashMap::new(),
                     opt_v3_exact_list_items_by_instr: HashMap::new(),
                     field_index_specializations: HashMap::new(),
@@ -16452,6 +16457,7 @@ def f(x):
                 specialization_inputs: Some(FunctionSpecializationInputs {
                     call_target_specializations: HashMap::new(),
                     opt_v3_direct_calls_by_instr: HashMap::new(),
+                    opt_v3_method_calls_by_instr: HashMap::new(),
                     operator_specializations: HashMap::new(),
                     opt_v3_exact_list_items_by_instr: HashMap::new(),
                     field_index_specializations: HashMap::new(),
@@ -16610,6 +16616,7 @@ def f(x):
                     specialization_inputs: Some(FunctionSpecializationInputs {
                         call_target_specializations: HashMap::new(),
                         opt_v3_direct_calls_by_instr: HashMap::new(),
+                        opt_v3_method_calls_by_instr: HashMap::new(),
                         operator_specializations: HashMap::new(),
                         opt_v3_exact_list_items_by_instr: HashMap::new(),
                         field_index_specializations: HashMap::new(),
@@ -16739,6 +16746,7 @@ def f(x):
                     specialization_inputs: Some(FunctionSpecializationInputs {
                         call_target_specializations: HashMap::new(),
                         opt_v3_direct_calls_by_instr: HashMap::new(),
+                        opt_v3_method_calls_by_instr: HashMap::new(),
                         operator_specializations: HashMap::new(),
                         opt_v3_exact_list_items_by_instr: HashMap::new(),
                         field_index_specializations: HashMap::new(),
@@ -16863,6 +16871,7 @@ def f(x):
                 specialization_inputs: Some(FunctionSpecializationInputs {
                     call_target_specializations: HashMap::new(),
                     opt_v3_direct_calls_by_instr: HashMap::new(),
+                    opt_v3_method_calls_by_instr: HashMap::new(),
                     operator_specializations: HashMap::new(),
                     opt_v3_exact_list_items_by_instr: HashMap::new(),
                     field_index_specializations: HashMap::new(),
@@ -16933,6 +16942,7 @@ def f(x):
                     regions: Vec::new(),
                     scalar_threads: Vec::new(),
                     direct_calls: Vec::new(),
+                    method_calls: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
                     indexed_globals: Vec::new(),
@@ -16947,6 +16957,7 @@ def f(x):
                     function: serialized_function,
                     debug_name: Some(function.names.qualname.clone()),
                     direct_calls: Vec::new(),
+                    method_calls: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
                     indexed_globals: Vec::new(),
@@ -17023,6 +17034,7 @@ def f(x):
                         },
                         reason: "profiled direct call".to_string(),
                     }],
+                    method_calls: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
                     indexed_globals: Vec::new(),
@@ -17044,6 +17056,7 @@ def f(x):
                         },
                         reason: "profiled direct call".to_string(),
                     }],
+                    method_calls: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
                     indexed_globals: Vec::new(),
@@ -17082,6 +17095,124 @@ def f(x):
         assert!(
             planned_inputs.evidence_by_function.is_empty(),
             "v3 emitted direct calls should not be converted into legacy profile evidence"
+        );
+    }
+
+    #[test]
+    fn planned_precompile_inputs_consume_v3_emitted_method_calls() {
+        let module_name_gen = ModuleNameGen::new(7);
+        let caller = test_function_in_module(&module_name_gen, "caller");
+        let callee = test_function_in_module(&module_name_gen, "Box.get");
+        let caller_id = caller.function_id;
+        let callee_id = callee.function_id;
+        let module = test_module(module_name_gen, vec![caller, callee]);
+        let source = InstrId::new(BlockLabel::from_index(0), 11);
+        let serialized_caller =
+            SerializedFunctionId::new(SerializedModuleId::new(0), caller_id.local_function_id());
+        let serialized_callee =
+            SerializedFunctionId::new(SerializedModuleId::new(0), callee_id.local_function_id());
+        let owner_type = MethodCallOwnerType {
+            module_name: "test".to_string(),
+            qualname: "Box".to_string(),
+        };
+        let guard = MethodCallGuardPlan {
+            kind: MethodCallGuardKind::ExactReceiverTypeVersion,
+        };
+        let fallback = MethodCallFallbackPlan {
+            kind: MethodCallFallbackKind::OriginalMethodCall,
+        };
+        let artifacts = ExactIntBranchV3Artifacts {
+            plan: ModuleOptimizationPlanV3 {
+                module: ModulePlanIdentity {
+                    module_name: "test".to_string(),
+                    source_hash: 0,
+                    cache_identity: "test-cache".to_string(),
+                },
+                identity_tables: test_plan_identities(
+                    "test",
+                    0,
+                    "test-cache",
+                    serialized_caller,
+                    "caller",
+                    &[],
+                ),
+                helper_catalog_version: 1,
+                cost_model_version: 1,
+                functions: vec![soac_opt::plan_v3::FunctionOptimizationPlanV3 {
+                    function: FunctionPlanIdentity {
+                        function: serialized_caller,
+                        debug_name: Some("caller".to_string()),
+                    },
+                    regions: Vec::new(),
+                    scalar_threads: Vec::new(),
+                    direct_calls: Vec::new(),
+                    method_calls: vec![MethodCallSpecializationPlan {
+                        source,
+                        target: serialized_callee,
+                        method_name: "get".to_string(),
+                        owner_type: owner_type.clone(),
+                        arg_plan: PlanV3DirectCallArgPlan {
+                            sources: vec![PlanV3DirectCallArgSource::Provided(0)],
+                        },
+                        guard: guard.clone(),
+                        fallback: fallback.clone(),
+                        reason: "profiled method call".to_string(),
+                    }],
+                    exact_list_items: Vec::new(),
+                    indexed_fields: Vec::new(),
+                    indexed_globals: Vec::new(),
+                    deopt_points: Vec::new(),
+                    ownership: soac_opt::plan_v3::FunctionOwnershipPlan::default(),
+                    diagnostics: Vec::new(),
+                }],
+            },
+            emission: MechanicalModuleEmission {
+                module_name: "test".to_string(),
+                functions: vec![soac_opt::emit_v3::MechanicalFunctionEmission {
+                    function: serialized_caller,
+                    debug_name: Some("caller".to_string()),
+                    direct_calls: Vec::new(),
+                    method_calls: vec![soac_opt::emit_v3::MechanicalMethodCallEmission {
+                        source,
+                        target: serialized_callee,
+                        method_name: "get".to_string(),
+                        owner_type,
+                        arg_plan: PlanV3DirectCallArgPlan {
+                            sources: vec![PlanV3DirectCallArgSource::Provided(0)],
+                        },
+                        guard,
+                        fallback,
+                        reason: "profiled method call".to_string(),
+                    }],
+                    exact_list_items: Vec::new(),
+                    indexed_fields: Vec::new(),
+                    indexed_globals: Vec::new(),
+                    regions: Vec::new(),
+                }],
+            },
+        };
+
+        let planned_inputs = planned_optimization_inputs_from_v3_artifacts_for_codegen_module(
+            &artifacts,
+            &module,
+            artifacts.plan.module.module_name.as_str(),
+            artifacts.plan.module.source_hash,
+            None,
+        )
+        .expect("v3 module artifact should map method calls onto the current codegen module");
+        let method_calls = planned_inputs
+            .opt_v3_emitted_method_calls
+            .get(&caller_id)
+            .and_then(|calls| calls.get(&source))
+            .expect("v3 method-call emission should be available for codegen");
+        assert_eq!(method_calls.len(), 1);
+        assert_eq!(method_calls[0].target, callee_id);
+        assert_eq!(method_calls[0].method_name, "get");
+        assert_eq!(method_calls[0].owner_type.module_name, "test");
+        assert_eq!(method_calls[0].owner_type.qualname, "Box");
+        assert!(
+            planned_inputs.evidence_by_function.is_empty(),
+            "v3 emitted method calls should not be converted into legacy profile evidence"
         );
     }
 
@@ -17149,6 +17280,7 @@ def f(x):
                         },
                         reason: "profiled cross-module direct call".to_string(),
                     }],
+                    method_calls: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
                     indexed_globals: Vec::new(),
@@ -17170,6 +17302,7 @@ def f(x):
                         },
                         reason: "profiled cross-module direct call".to_string(),
                     }],
+                    method_calls: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
                     indexed_globals: Vec::new(),
@@ -17251,6 +17384,7 @@ def f(x):
                     regions: Vec::new(),
                     scalar_threads: Vec::new(),
                     direct_calls: Vec::new(),
+                    method_calls: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: vec![
                         IndexedFieldSpecializationPlan {
@@ -17284,6 +17418,7 @@ def f(x):
                     function: serialized_caller,
                     debug_name: Some("caller".to_string()),
                     direct_calls: Vec::new(),
+                    method_calls: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: vec![
                         soac_opt::emit_v3::MechanicalIndexedFieldEmission {
@@ -17406,6 +17541,7 @@ def f(x):
                     regions: Vec::new(),
                     scalar_threads: Vec::new(),
                     direct_calls: Vec::new(),
+                    method_calls: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
                     indexed_globals: vec![
@@ -17443,6 +17579,7 @@ def f(x):
                     function: serialized_caller,
                     debug_name: Some("caller".to_string()),
                     direct_calls: Vec::new(),
+                    method_calls: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
                     indexed_globals: vec![
@@ -17631,6 +17768,7 @@ def f(x):
         FunctionSpecializationInputs {
             call_target_specializations: HashMap::new(),
             opt_v3_direct_calls_by_instr: HashMap::new(),
+            opt_v3_method_calls_by_instr: HashMap::new(),
             operator_specializations: HashMap::new(),
             opt_v3_exact_list_items_by_instr: HashMap::new(),
             field_index_specializations: HashMap::new(),
@@ -17668,6 +17806,7 @@ def f(x):
                 specialization_inputs: Some(FunctionSpecializationInputs {
                     call_target_specializations: HashMap::new(),
                     opt_v3_direct_calls_by_instr: HashMap::new(),
+                    opt_v3_method_calls_by_instr: HashMap::new(),
                     operator_specializations: HashMap::new(),
                     opt_v3_exact_list_items_by_instr: HashMap::new(),
                     field_index_specializations: HashMap::new(),
@@ -17772,6 +17911,7 @@ def f(x):
                 specialization_inputs: Some(FunctionSpecializationInputs {
                     call_target_specializations: HashMap::new(),
                     opt_v3_direct_calls_by_instr: HashMap::new(),
+                    opt_v3_method_calls_by_instr: HashMap::new(),
                     operator_specializations: HashMap::new(),
                     opt_v3_exact_list_items_by_instr: HashMap::new(),
                     field_index_specializations: HashMap::new(),
@@ -18424,6 +18564,7 @@ def write_point(point, value):
                         },
                         reason: "profiled direct call".to_string(),
                     }],
+                    method_calls: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
                     indexed_globals: Vec::new(),
@@ -18438,6 +18579,7 @@ def write_point(point, value):
                     function: serialized_caller,
                     debug_name: Some("caller".to_string()),
                     direct_calls: Vec::new(),
+                    method_calls: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
                     indexed_globals: Vec::new(),
@@ -18501,6 +18643,7 @@ def write_point(point, value):
                     regions: Vec::new(),
                     scalar_threads: Vec::new(),
                     direct_calls: Vec::new(),
+                    method_calls: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: vec![IndexedFieldSpecializationPlan {
                         source,
@@ -18522,6 +18665,7 @@ def write_point(point, value):
                     function: serialized_caller,
                     debug_name: Some("caller".to_string()),
                     direct_calls: Vec::new(),
+                    method_calls: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
                     indexed_globals: Vec::new(),
@@ -18578,6 +18722,7 @@ def write_point(point, value):
             counter_dump_path: None,
             planned_evidence,
             opt_v3_emitted_direct_calls,
+            opt_v3_emitted_method_calls: HashMap::new(),
             opt_v3_emitted_exact_list_items: HashMap::new(),
             opt_v3_emitted_indexed_fields: HashMap::new(),
             opt_v3_emitted_indexed_globals: HashMap::new(),
@@ -22643,6 +22788,7 @@ def f(x, y):
                 caller_function.function_id,
                 HashMap::from([(call_instr_id, vec![v3_plan])]),
             )]),
+            opt_v3_emitted_method_calls: HashMap::new(),
             opt_v3_emitted_exact_list_items: HashMap::new(),
             opt_v3_emitted_indexed_fields: HashMap::new(),
             opt_v3_emitted_indexed_globals: HashMap::new(),
@@ -22771,6 +22917,7 @@ def f(x, y):
                 caller_function.function_id,
                 HashMap::from([(call_instr_id, vec![v3_plan])]),
             )]),
+            opt_v3_emitted_method_calls: HashMap::new(),
             opt_v3_emitted_exact_list_items: HashMap::new(),
             opt_v3_emitted_indexed_fields: HashMap::from([(
                 caller_function.function_id,
