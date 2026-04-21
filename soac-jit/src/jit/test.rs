@@ -15928,6 +15928,7 @@ def f(x):
                     setitem_specializations: HashMap::new(),
                     field_index_specializations: HashMap::new(),
                     field_index_specializations_by_instr: HashMap::new(),
+                    opt_v3_indexed_fields_by_instr: HashMap::new(),
                     branch_prefer_true: HashMap::new(),
                     cold_block_labels: HashSet::new(),
                     opt_v3_exact_int_branch_artifacts: Some(std::sync::Arc::new(artifacts)),
@@ -16121,6 +16122,7 @@ def f(x):
                     setitem_specializations: HashMap::new(),
                     field_index_specializations: HashMap::new(),
                     field_index_specializations_by_instr: HashMap::new(),
+                    opt_v3_indexed_fields_by_instr: HashMap::new(),
                     branch_prefer_true: HashMap::new(),
                     cold_block_labels: HashSet::new(),
                     opt_v3_exact_int_branch_artifacts: Some(std::sync::Arc::new(artifacts)),
@@ -16278,6 +16280,7 @@ def f(x):
                         setitem_specializations: HashMap::new(),
                         field_index_specializations: HashMap::new(),
                         field_index_specializations_by_instr: HashMap::new(),
+                        opt_v3_indexed_fields_by_instr: HashMap::new(),
                         branch_prefer_true: HashMap::new(),
                         cold_block_labels: HashSet::new(),
                         opt_v3_exact_int_branch_artifacts: Some(std::sync::Arc::new(artifacts)),
@@ -16406,6 +16409,7 @@ def f(x):
                         setitem_specializations: HashMap::new(),
                         field_index_specializations: HashMap::new(),
                         field_index_specializations_by_instr: HashMap::new(),
+                        opt_v3_indexed_fields_by_instr: HashMap::new(),
                         branch_prefer_true: HashMap::new(),
                         cold_block_labels: HashSet::new(),
                         opt_v3_exact_int_branch_artifacts: Some(std::sync::Arc::new(artifacts)),
@@ -16529,6 +16533,7 @@ def f(x):
                     setitem_specializations: HashMap::new(),
                     field_index_specializations: HashMap::new(),
                     field_index_specializations_by_instr: HashMap::new(),
+                    opt_v3_indexed_fields_by_instr: HashMap::new(),
                     branch_prefer_true: HashMap::new(),
                     cold_block_labels: HashSet::new(),
                     opt_v3_exact_int_branch_artifacts: Some(std::sync::Arc::new(artifacts)),
@@ -16777,18 +16782,22 @@ def f(x):
 
         assert_eq!(
             planned_inputs
-                .opt_v3_emitted_field_index_specializations
+                .opt_v3_emitted_indexed_fields
                 .get(&caller_id)
                 .unwrap()
                 .get(&source)
                 .unwrap(),
-            &vec![PlannedIndexedFieldSpecialization {
-                owner_type: PlannedTypeKey {
-                    module_name: owner_type.module_name,
-                    qualname: owner_type.qualname,
-                },
+            &vec![OptV3IndexedFieldAccessPlan {
+                access: IndexedFieldAccessKind::Load,
                 attr_name: "value".to_string(),
-                expected_index: 2,
+                specialization: PlannedIndexedFieldSpecialization {
+                    owner_type: PlannedTypeKey {
+                        module_name: owner_type.module_name,
+                        qualname: owner_type.qualname,
+                    },
+                    attr_name: "value".to_string(),
+                    expected_index: 2,
+                },
             }]
         );
         assert!(
@@ -16937,15 +16946,87 @@ def read_point(point):
                 .expect("v3 indexed-field input should resolve to codegen guards");
             assert!(
                 inputs
+                    .opt_v3_indexed_fields_by_instr
+                    .contains_key(&getattr_instr_id),
+                "v3 emitted indexed-field decision should become explicit v3 codegen input"
+            );
+            assert!(
+                !inputs
                     .field_index_specializations_by_instr
                     .contains_key(&getattr_instr_id),
-                "v3 emitted indexed-field decision should become per-instruction codegen input"
+                "v3 indexed fields should not be converted into legacy per-instruction field evidence"
             );
 
             modules
                 .del_item("field_type_test")
                 .expect("owner module should be removed");
         });
+    }
+
+    #[test]
+    fn v3_indexed_field_annotation_rejects_attr_name_mismatch() {
+        let module_name_gen = ModuleNameGen::new(0);
+        let mut constants = TestConstantPool::default();
+        let mut function = test_function_in_module(&module_name_gen, "read");
+        function.params = ParamSpec {
+            params: vec![Param {
+                name: "obj".into(),
+                kind: ParamKind::Any,
+                has_default: false,
+            }],
+        };
+        let block_label = function.name_gen.next_block_name();
+        let getattr_instr_id = InstrId::new(block_label, 1);
+        function.blocks = vec![CodegenBlock {
+            label: block_label,
+            body: vec![],
+            term: ret_term(with_instr_id(
+                op_expr(GetAttr::new(
+                    name_expr(test_name("obj")),
+                    constants.string_expr("actual"),
+                )),
+                getattr_instr_id,
+            )),
+            params: vec![],
+            exc_edge: None,
+        }];
+        set_stack_slots(&mut function, &["obj"]);
+
+        let mut module = test_module(module_name_gen, vec![function.clone()]);
+        module.module_constants = constants.module_constants;
+        let mut typed_function =
+            lower_typed_function_if_tests_to_truthy(lower_codegen_function_to_typed(function));
+        let opt_v3_indexed_fields_by_instr = HashMap::from([(
+            getattr_instr_id,
+            vec![OptV3ResolvedIndexedFieldAccess {
+                access: IndexedFieldAccessKind::Load,
+                attr_name: "planned".to_string(),
+                specialization: FieldIndexSpecialization {
+                    expected_index: 0,
+                    owner_type_ref: RelocTypeRef::TypeKey(CounterDumpTypeKey {
+                        module_name: "field_type_test".to_string(),
+                        qualname: "Point".to_string(),
+                    }),
+                    type_version: 1,
+                },
+            }],
+        )]);
+
+        let err = annotate_typed_attr_accesses(
+            &module,
+            &mut typed_function,
+            &HashMap::new(),
+            &HashMap::new(),
+            &opt_v3_indexed_fields_by_instr,
+            true,
+        )
+        .expect_err("v3 indexed-field attr mismatch should fail validation");
+
+        assert!(
+            err.contains("selected attr \"planned\"")
+                && err.contains("lowered instruction uses attr \"actual\""),
+            "{err}"
+        );
     }
 
     #[test]
@@ -17113,7 +17194,7 @@ def read_point(point):
             counter_dump_path: None,
             planned_evidence,
             opt_v3_emitted_direct_function_guards,
-            opt_v3_emitted_field_index_specializations: HashMap::new(),
+            opt_v3_emitted_indexed_fields: HashMap::new(),
             opt_v3_exact_int_branch_artifacts: HashMap::new(),
             behavior_change_indexed_stores: false,
             profiled_cold_blocks: false,

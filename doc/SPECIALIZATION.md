@@ -323,6 +323,12 @@ apply/verify mode:
   mechanical indexed-field emissions rather than from the legacy per-function
   optimization plan. Legacy `mod.opt` can still supply the same typed input
   while the migration is incomplete.
+- V3 indexed-field emissions remain separate from legacy per-instruction field
+  evidence inside `soac-jit`: the emitted access kind and attribute name must
+  match the lowered `GetAttr`/`SetAttr` instruction, or codegen rejects the plan
+  instead of silently treating it as another profiled field candidate.
+  By-attribute layout availability is still shared with the existing constructor
+  initializer fast path until that family has its own v3 plan node.
 - After codegen-to-typed lowering, these sites are represented as
   `GetAttrTyped` / `SetAttrTyped` operations annotated with a profiled
   indexed-field access plan. The typed plan carries the selected

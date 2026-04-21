@@ -98,6 +98,7 @@ use soac_opt::plan_v3::{
     ConversionKind, DirectCallArgPlan as PlanV3DirectCallArgPlan,
     DirectCallArgSource as PlanV3DirectCallArgSource, FailureMode, FallbackTarget,
     FunctionOptimizationPlanV3, GuardFailure, GuardKind,
+    IndexedFieldAccessKind as PlanV3IndexedFieldAccessKind,
     IndexedFieldSpecializationPlan as PlanV3IndexedFieldSpecializationPlan, MaterializeKind,
     ModuleOptimizationPlanV3, PlanNodeId, PlanValue, PlannedConstant, RegionExitTarget, RegionId,
     RegionInputSource, RegionPlan, Rep, RichCompareOp, ScalarLocalThreadPlan, ScalarThreadFallback,
@@ -9094,6 +9095,20 @@ impl FieldIndexSpecialization {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OptV3IndexedFieldAccessPlan {
+    access: PlanV3IndexedFieldAccessKind,
+    attr_name: String,
+    specialization: PlannedIndexedFieldSpecialization,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OptV3ResolvedIndexedFieldAccess {
+    access: PlanV3IndexedFieldAccessKind,
+    attr_name: String,
+    specialization: FieldIndexSpecialization,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum CpythonTypeSymbol {
     Function,
@@ -12708,20 +12723,25 @@ pub(super) fn typed_constant_string_value<'a>(
 }
 
 fn annotate_typed_attr_accesses(
-    _module: &BlockPyModule<CodegenModuleShape>,
+    module: &BlockPyModule<CodegenModuleShape>,
     function: &mut BlockPyFunction<TypedCodegenModuleShape>,
     _field_index_specializations: &HashMap<String, Vec<FieldIndexSpecialization>>,
     field_index_specializations_by_instr: &HashMap<InstrId, Vec<FieldIndexSpecialization>>,
+    opt_v3_indexed_fields_by_instr: &HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>,
     specialize_stores: bool,
-) -> usize {
+) -> Result<usize, String> {
     struct Annotator<'a> {
+        module: &'a BlockPyModule<CodegenModuleShape>,
         field_index_specializations_by_instr: &'a HashMap<InstrId, Vec<FieldIndexSpecialization>>,
+        opt_v3_indexed_fields_by_instr: &'a HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>,
         specialize_stores: bool,
         count: usize,
+        consumed_opt_v3_sources: HashSet<InstrId>,
+        error: Option<String>,
     }
 
     impl Annotator<'_> {
-        fn guards_for_attr(
+        fn legacy_guards_for_attr(
             &self,
             instr_id: InstrId,
             _attr: &InstrTyped,
@@ -12736,26 +12756,91 @@ fn annotate_typed_attr_accesses(
                         .collect::<Vec<_>>()
                 })
         }
+
+        fn opt_v3_guards_for_attr(
+            &mut self,
+            instr_id: InstrId,
+            attr: &InstrTyped,
+            expected_access: PlanV3IndexedFieldAccessKind,
+        ) -> Option<Vec<TypedIndexedFieldGuard>> {
+            let accesses = self.opt_v3_indexed_fields_by_instr.get(&instr_id)?;
+            let Some(attr_name) = typed_constant_string_value(self.module, attr) else {
+                self.error = Some(format!(
+                    "optimizer v3 indexed-field emission for {instr_id} expected constant attribute {:?}, but typed attr is not a module string constant",
+                    accesses[0].attr_name
+                ));
+                return None;
+            };
+            let mut guards = Vec::with_capacity(accesses.len());
+            for access in accesses {
+                if access.access != expected_access {
+                    self.error = Some(format!(
+                        "optimizer v3 indexed-field emission for {instr_id} selected {:?}, but lowered instruction is {:?}",
+                        access.access, expected_access
+                    ));
+                    return None;
+                }
+                if access.attr_name != attr_name {
+                    self.error = Some(format!(
+                        "optimizer v3 indexed-field emission for {instr_id} selected attr {:?}, but lowered instruction uses attr {:?}",
+                        access.attr_name, attr_name
+                    ));
+                    return None;
+                }
+                guards.push(access.specialization.to_typed_guard());
+            }
+            self.consumed_opt_v3_sources.insert(instr_id);
+            Some(guards)
+        }
+
+        fn annotate_attr(
+            &mut self,
+            instr_id: InstrId,
+            attr: &InstrTyped,
+            expected_access: PlanV3IndexedFieldAccessKind,
+        ) -> Option<Vec<TypedIndexedFieldGuard>> {
+            if self.opt_v3_indexed_fields_by_instr.contains_key(&instr_id) {
+                return self.opt_v3_guards_for_attr(instr_id, attr, expected_access);
+            }
+            self.legacy_guards_for_attr(instr_id, attr)
+        }
     }
 
     impl VisitMut<InstrTyped> for Annotator<'_> {
         fn visit_instr_mut(&mut self, expr: &mut InstrTyped) {
+            if self.error.is_some() {
+                return;
+            }
             match expr {
                 InstrTyped::GetAttrTyped(op) => {
-                    if let Some(guards) =
-                        self.guards_for_attr(op.semantic_instr_id(), op.attr.as_ref())
-                    {
+                    if let Some(guards) = self.annotate_attr(
+                        op.semantic_instr_id(),
+                        op.attr.as_ref(),
+                        PlanV3IndexedFieldAccessKind::Load,
+                    ) {
                         op.access = TypedAttrAccessPlan::ProfiledIndexedField { guards };
                         self.count += 1;
                     }
                 }
                 InstrTyped::SetAttrTyped(op) if self.specialize_stores => {
-                    if let Some(guards) =
-                        self.guards_for_attr(op.semantic_instr_id(), op.attr.as_ref())
-                    {
+                    if let Some(guards) = self.annotate_attr(
+                        op.semantic_instr_id(),
+                        op.attr.as_ref(),
+                        PlanV3IndexedFieldAccessKind::Store,
+                    ) {
                         op.access = TypedAttrAccessPlan::ProfiledIndexedField { guards };
                         self.count += 1;
                     }
+                }
+                InstrTyped::SetAttrTyped(op)
+                    if self
+                        .opt_v3_indexed_fields_by_instr
+                        .contains_key(&op.semantic_instr_id()) =>
+                {
+                    self.error = Some(format!(
+                        "optimizer v3 indexed-field store emission for {} cannot be consumed because indexed stores are disabled",
+                        op.semantic_instr_id()
+                    ));
                 }
                 _ => {}
             }
@@ -12764,17 +12849,31 @@ fn annotate_typed_attr_accesses(
     }
 
     let mut annotator = Annotator {
+        module,
         field_index_specializations_by_instr,
+        opt_v3_indexed_fields_by_instr,
         specialize_stores,
         count: 0,
+        consumed_opt_v3_sources: HashSet::new(),
+        error: None,
     };
     for block in &mut function.blocks {
         for instr in &mut block.body {
             annotator.visit_instr_mut(instr);
         }
         annotator.visit_term_mut(&mut block.term);
+        if let Some(error) = annotator.error.take() {
+            return Err(error);
+        }
     }
-    annotator.count
+    for instr_id in opt_v3_indexed_fields_by_instr.keys() {
+        if !annotator.consumed_opt_v3_sources.contains(instr_id) {
+            return Err(format!(
+                "optimizer v3 indexed-field emission for {instr_id} was not consumed by typed attr lowering"
+            ));
+        }
+    }
+    Ok(annotator.count)
 }
 
 fn direct_method_owner_attr_specializations(
@@ -13091,8 +13190,8 @@ struct SpecializationProfile<'a> {
     planned_evidence: HashMap<RuntimeFunctionId, FunctionProfileEvidence>,
     opt_v3_emitted_direct_function_guards:
         HashMap<RuntimeFunctionId, HashMap<InstrId, Vec<TypedDirectFunctionCallGuard>>>,
-    opt_v3_emitted_field_index_specializations:
-        HashMap<RuntimeFunctionId, HashMap<InstrId, Vec<PlannedIndexedFieldSpecialization>>>,
+    opt_v3_emitted_indexed_fields:
+        HashMap<RuntimeFunctionId, HashMap<InstrId, Vec<OptV3IndexedFieldAccessPlan>>>,
     opt_v3_exact_int_branch_artifacts: HashMap<RuntimeFunctionId, Arc<ExactIntBranchV3Artifacts>>,
     behavior_change_indexed_stores: bool,
     profiled_cold_blocks: bool,
@@ -13104,8 +13203,8 @@ struct PlannedOptimizationInputs {
     evidence_by_function: HashMap<RuntimeFunctionId, FunctionProfileEvidence>,
     opt_v3_emitted_direct_function_guards:
         HashMap<RuntimeFunctionId, HashMap<InstrId, Vec<TypedDirectFunctionCallGuard>>>,
-    opt_v3_emitted_field_index_specializations:
-        HashMap<RuntimeFunctionId, HashMap<InstrId, Vec<PlannedIndexedFieldSpecialization>>>,
+    opt_v3_emitted_indexed_fields:
+        HashMap<RuntimeFunctionId, HashMap<InstrId, Vec<OptV3IndexedFieldAccessPlan>>>,
     opt_v3_exact_int_branch_artifacts: HashMap<RuntimeFunctionId, Arc<ExactIntBranchV3Artifacts>>,
 }
 
@@ -13117,7 +13216,7 @@ impl PlannedOptimizationInputs {
         Self {
             evidence_by_function,
             opt_v3_emitted_direct_function_guards: HashMap::new(),
-            opt_v3_emitted_field_index_specializations: HashMap::new(),
+            opt_v3_emitted_indexed_fields: HashMap::new(),
             opt_v3_exact_int_branch_artifacts: HashMap::new(),
         }
     }
@@ -13180,6 +13279,7 @@ struct FunctionSpecializationInputs {
     setitem_specializations: HashMap<InstrId, Vec<u64>>,
     field_index_specializations: HashMap<String, Vec<FieldIndexSpecialization>>,
     field_index_specializations_by_instr: HashMap<InstrId, Vec<FieldIndexSpecialization>>,
+    opt_v3_indexed_fields_by_instr: HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>,
     branch_prefer_true: HashMap<InstrId, bool>,
     cold_block_labels: HashSet<BlockLabel>,
     opt_v3_exact_int_branch_artifacts: Option<Arc<ExactIntBranchV3Artifacts>>,
@@ -13367,10 +13467,10 @@ fn planned_optimization_inputs_from_v3_artifacts(
                 .insert(current_function_id, guards);
         }
         if let Some(indexed_fields) =
-            opt_v3_emitted_field_index_specializations_for_function(&function_artifacts)
+            opt_v3_emitted_indexed_fields_for_function(&function_artifacts)
         {
             inputs
-                .opt_v3_emitted_field_index_specializations
+                .opt_v3_emitted_indexed_fields
                 .insert(current_function_id, indexed_fields);
         }
         inputs
@@ -13429,10 +13529,10 @@ fn planned_optimization_inputs_from_v3_artifacts_for_codegen_module(
                 .insert(current_function_id, guards);
         }
         if let Some(indexed_fields) =
-            opt_v3_emitted_field_index_specializations_for_function(&function_artifacts)
+            opt_v3_emitted_indexed_fields_for_function(&function_artifacts)
         {
             inputs
-                .opt_v3_emitted_field_index_specializations
+                .opt_v3_emitted_indexed_fields
                 .insert(current_function_id, indexed_fields);
         }
         inputs
@@ -13442,35 +13542,39 @@ fn planned_optimization_inputs_from_v3_artifacts_for_codegen_module(
     Ok(inputs)
 }
 
-fn opt_v3_emitted_field_index_specializations_for_function(
+fn opt_v3_emitted_indexed_fields_for_function(
     artifacts: &ExactIntBranchV3Artifacts,
-) -> Option<HashMap<InstrId, Vec<PlannedIndexedFieldSpecialization>>> {
+) -> Option<HashMap<InstrId, Vec<OptV3IndexedFieldAccessPlan>>> {
     let emitted_function = &artifacts.emission.functions[0];
     if emitted_function.indexed_fields.is_empty() {
         return None;
     }
 
-    let mut by_source = HashMap::<InstrId, Vec<PlannedIndexedFieldSpecialization>>::new();
+    let mut by_source = HashMap::<InstrId, Vec<OptV3IndexedFieldAccessPlan>>::new();
     for indexed_field in &emitted_function.indexed_fields {
-        let specialization = planned_indexed_field_specialization_from_v3(indexed_field);
+        let access = opt_v3_indexed_field_access_plan_from_emission(indexed_field);
         let entry = by_source.entry(indexed_field.source).or_default();
-        if !entry.contains(&specialization) {
-            entry.push(specialization);
+        if !entry.contains(&access) {
+            entry.push(access);
         }
     }
     Some(by_source)
 }
 
-fn planned_indexed_field_specialization_from_v3(
+fn opt_v3_indexed_field_access_plan_from_emission(
     indexed_field: &MechanicalIndexedFieldEmission,
-) -> PlannedIndexedFieldSpecialization {
-    PlannedIndexedFieldSpecialization {
-        owner_type: PlannedTypeKey {
-            module_name: indexed_field.owner_type.module_name.clone(),
-            qualname: indexed_field.owner_type.qualname.clone(),
-        },
+) -> OptV3IndexedFieldAccessPlan {
+    OptV3IndexedFieldAccessPlan {
+        access: indexed_field.access,
         attr_name: indexed_field.attr_name.clone(),
-        expected_index: indexed_field.expected_index,
+        specialization: PlannedIndexedFieldSpecialization {
+            owner_type: PlannedTypeKey {
+                module_name: indexed_field.owner_type.module_name.clone(),
+                qualname: indexed_field.owner_type.qualname.clone(),
+            },
+            attr_name: indexed_field.attr_name.clone(),
+            expected_index: indexed_field.expected_index,
+        },
     }
 }
 
@@ -14011,8 +14115,11 @@ impl FunctionSpecializationInputs {
         profile: &SpecializationProfile<'_>,
         function: &BlockPyFunction<CodegenModuleShape>,
     ) -> Result<Self, String> {
-        let (field_index_specializations, field_index_specializations_by_instr) =
-            profile.field_index_specialization_maps(function.function_id)?;
+        let (
+            field_index_specializations,
+            field_index_specializations_by_instr,
+            opt_v3_indexed_fields_by_instr,
+        ) = profile.field_index_specialization_maps(function.function_id)?;
         Ok(Self {
             call_target_specializations: profile
                 .codegen_call_target_specializations(function.function_id)?,
@@ -14023,6 +14130,7 @@ impl FunctionSpecializationInputs {
             setitem_specializations: profile.setitem_specializations(function.function_id)?,
             field_index_specializations,
             field_index_specializations_by_instr,
+            opt_v3_indexed_fields_by_instr,
             branch_prefer_true: profile.branch_preferences(function.function_id)?,
             cold_block_labels: profile.cold_block_labels(function)?,
             opt_v3_exact_int_branch_artifacts: profile
@@ -14063,8 +14171,7 @@ impl<'a> SpecializationProfile<'a> {
             planned_evidence: planned_inputs.evidence_by_function,
             opt_v3_emitted_direct_function_guards: planned_inputs
                 .opt_v3_emitted_direct_function_guards,
-            opt_v3_emitted_field_index_specializations: planned_inputs
-                .opt_v3_emitted_field_index_specializations,
+            opt_v3_emitted_indexed_fields: planned_inputs.opt_v3_emitted_indexed_fields,
             opt_v3_exact_int_branch_artifacts: planned_inputs.opt_v3_exact_int_branch_artifacts,
             behavior_change_indexed_stores: specialization_mode
                 .is_some_and(SpecializationMode::behavior_change_indexed_stores_enabled),
@@ -14088,8 +14195,7 @@ impl<'a> SpecializationProfile<'a> {
             planned_evidence: planned_inputs.evidence_by_function,
             opt_v3_emitted_direct_function_guards: planned_inputs
                 .opt_v3_emitted_direct_function_guards,
-            opt_v3_emitted_field_index_specializations: planned_inputs
-                .opt_v3_emitted_field_index_specializations,
+            opt_v3_emitted_indexed_fields: planned_inputs.opt_v3_emitted_indexed_fields,
             opt_v3_exact_int_branch_artifacts: planned_inputs.opt_v3_exact_int_branch_artifacts,
             behavior_change_indexed_stores: true,
             profiled_cold_blocks: env_config.profiled_cold_blocks_enabled(),
@@ -14105,7 +14211,7 @@ impl<'a> SpecializationProfile<'a> {
     fn has_specialization_inputs(&self) -> bool {
         !self.planned_evidence.is_empty()
             || !self.opt_v3_emitted_direct_function_guards.is_empty()
-            || !self.opt_v3_emitted_field_index_specializations.is_empty()
+            || !self.opt_v3_emitted_indexed_fields.is_empty()
             || !self.opt_v3_exact_int_branch_artifacts.is_empty()
             || (self.profiled_cold_blocks && self.has_existing_counter_dump())
     }
@@ -14118,10 +14224,10 @@ impl<'a> SpecializationProfile<'a> {
             .flat_map(|specializations| specializations.iter())
             .collect::<Vec<_>>();
         planned_fields.extend(
-            self.opt_v3_emitted_field_index_specializations
+            self.opt_v3_emitted_indexed_fields
                 .values()
-                .flat_map(|specializations_by_instr| specializations_by_instr.values())
-                .flat_map(|specializations| specializations.iter()),
+                .flat_map(|accesses_by_instr| accesses_by_instr.values())
+                .flat_map(|accesses| accesses.iter().map(|access| &access.specialization)),
         );
         planned_fields
     }
@@ -14214,6 +14320,7 @@ impl<'a> SpecializationProfile<'a> {
         (
             HashMap<String, Vec<FieldIndexSpecialization>>,
             HashMap<InstrId, Vec<FieldIndexSpecialization>>,
+            HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>,
         ),
         String,
     > {
@@ -14229,30 +14336,15 @@ impl<'a> SpecializationProfile<'a> {
             }
         }
 
-        let Some(evidence) = self.planned_evidence.get(&function_id) else {
-            let by_instr = self.field_index_specializations_by_instr_from_planned(
-                self.opt_v3_emitted_field_index_specializations
-                    .get(&function_id),
-            )?;
-            return Ok((by_attr, by_instr));
-        };
-        let mut by_instr = self.field_index_specializations_by_instr_from_planned(Some(
-            &evidence.field_index_specializations,
-        ))?;
-        if let Some(v3_specializations) = self
-            .opt_v3_emitted_field_index_specializations
-            .get(&function_id)
-        {
-            let v3_by_instr =
-                self.field_index_specializations_by_instr_from_planned(Some(v3_specializations))?;
-            for (instr_id, mut specializations) in v3_by_instr {
-                let entry = by_instr.entry(instr_id).or_default();
-                for specialization in specializations.drain(..) {
-                    push_unique_specialization(entry, specialization);
-                }
-            }
-        }
-        Ok((by_attr, by_instr))
+        let by_instr = self.field_index_specializations_by_instr_from_planned(
+            self.planned_evidence
+                .get(&function_id)
+                .map(|evidence| &evidence.field_index_specializations),
+        )?;
+        let opt_v3_by_instr = self.opt_v3_indexed_fields_by_instr_from_emitted(
+            self.opt_v3_emitted_indexed_fields.get(&function_id),
+        )?;
+        Ok((by_attr, by_instr, opt_v3_by_instr))
     }
 
     fn field_index_specializations_by_instr_from_planned(
@@ -14274,6 +14366,37 @@ impl<'a> SpecializationProfile<'a> {
             }
             if !specializations.is_empty() {
                 by_instr.insert(*instr_id, specializations);
+            }
+        }
+        Ok(by_instr)
+    }
+
+    fn opt_v3_indexed_fields_by_instr_from_emitted(
+        &self,
+        planned_by_instr: Option<&HashMap<InstrId, Vec<OptV3IndexedFieldAccessPlan>>>,
+    ) -> Result<HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>, String> {
+        let Some(planned_by_instr) = planned_by_instr else {
+            return Ok(HashMap::new());
+        };
+        let mut by_instr = HashMap::new();
+        for (instr_id, planned_accesses) in planned_by_instr {
+            let mut resolved_accesses = Vec::new();
+            for planned in planned_accesses {
+                if let Some(specialization) =
+                    field_index_specialization_from_primed_planned(&planned.specialization)?
+                {
+                    let resolved = OptV3ResolvedIndexedFieldAccess {
+                        access: planned.access,
+                        attr_name: planned.attr_name.clone(),
+                        specialization,
+                    };
+                    if !resolved_accesses.contains(&resolved) {
+                        resolved_accesses.push(resolved);
+                    }
+                }
+            }
+            if !resolved_accesses.is_empty() {
+                by_instr.insert(*instr_id, resolved_accesses);
             }
         }
         Ok(by_instr)
@@ -28524,6 +28647,7 @@ fn prepare_specialized_typed_function(
     value_facts: &FactStore,
     field_index_specializations: &HashMap<String, Vec<FieldIndexSpecialization>>,
     field_index_specializations_by_instr: &HashMap<InstrId, Vec<FieldIndexSpecialization>>,
+    opt_v3_indexed_fields_by_instr: &HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>,
     specialize_field_stores: bool,
     call_specialization_ctx: &CallSpecializationCtx<'_>,
     call_target_specializations: &HashMap<InstrId, Vec<RuntimeFunctionId>>,
@@ -28539,8 +28663,9 @@ fn prepare_specialized_typed_function(
         &mut typed_function,
         field_index_specializations,
         field_index_specializations_by_instr,
+        opt_v3_indexed_fields_by_instr,
         specialize_field_stores,
-    );
+    )?;
     annotate_typed_call_accesses(
         &mut typed_function,
         call_specialization_ctx,
@@ -28823,6 +28948,7 @@ fn build_cranelift_run_bb_specialized_function(
     let field_index_specializations = specialization_inputs.field_index_specializations;
     let field_index_specializations_by_instr =
         specialization_inputs.field_index_specializations_by_instr;
+    let opt_v3_indexed_fields_by_instr = specialization_inputs.opt_v3_indexed_fields_by_instr;
     let branch_prefer_true = specialization_inputs.branch_prefer_true;
     let cold_block_labels = specialization_inputs.cold_block_labels;
     let opt_v3_exact_int_branch_artifacts = specialization_inputs.opt_v3_exact_int_branch_artifacts;
@@ -28885,6 +29011,7 @@ fn build_cranelift_run_bb_specialized_function(
         value_facts,
         &field_index_specializations,
         &field_index_specializations_by_instr,
+        &opt_v3_indexed_fields_by_instr,
         behavior_change_indexed_stores,
         &call_specialization_ctx,
         &call_target_specializations,
@@ -30025,6 +30152,7 @@ pub unsafe fn render_instr_typed_for_codegen_with_runtime_state(
         &jit_module_plan.value_facts,
         &specialization_inputs.field_index_specializations,
         &specialization_inputs.field_index_specializations_by_instr,
+        &specialization_inputs.opt_v3_indexed_fields_by_instr,
         specialization_inputs.behavior_change_indexed_stores,
         &call_specialization_ctx,
         &specialization_inputs.call_target_specializations,

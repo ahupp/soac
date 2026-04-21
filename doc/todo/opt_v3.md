@@ -145,9 +145,23 @@ Partially migrated families are also intentionally visible:
   lowering itself is still the existing typed lowering rather than a mechanical
   v3 call node.
 - indexed fields are represented as v3 plan selections plus mechanical
-  indexed-field emissions and consumed as JIT typed-attribute guard input, but
-  the attribute load/store lowering itself is still the existing typed lowering
-  rather than a mechanical v3 node.
+  indexed-field emissions. `soac-jit` now keeps the emitted access kind and
+  attribute name separate from legacy per-instruction field evidence and
+  validates that they match the lowered `GetAttr`/`SetAttr` site before
+  annotating typed attribute lowering. By-attribute layout availability is
+  still shared with the existing constructor initializer fast path. The final
+  inline load/store emission still uses the existing typed attribute emitter
+  rather than a v3-specific operation node.
+
+Remaining scalar cleanup:
+
+- The compact-int region-step emitter is mechanical once a v3 region is
+  selected, but scalar threading still has a `soac-jit` recognizer for the
+  adjacent store-RHS -> empty compare block -> simple return shape. A cleaner
+  follow-up is to make the scalar-thread emission plan name the fused block
+  shape, consumed labels, unmaterialized-local cleanup, and inline-return
+  targets explicitly, so JIT block lowering executes a selected fusion template
+  instead of rediscovering that control-flow shape.
 
 Branch locality and cold block hints remain layout metadata for now, not v3
 semantic plan targets.
