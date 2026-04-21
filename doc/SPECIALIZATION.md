@@ -396,21 +396,23 @@ apply/verify mode:
 
 ## Direct Function Calls
 
-Before typed JIT emission, legacy `Call` nodes lower to `TypedCall` nodes. In
-apply/verify mode, call-target profile replay annotates each eligible
-`TypedCall` with a `TypedCallAccessPlan`. In the v3 path,
-`decide_optimizations --mode v3` reads the raw `call_hot_targets` evidence and
-records same-module ordinary-function targets in `mod.optv3` as direct-call
-plan selections plus matching mechanical direct-call emissions. The offline v3
-planner validates the lowered call site and target signature, then stores the
-direct-entry argument plan in the artifact. The JIT validates that the
-mechanical emission matches the selected plan and that each target exists in
-the loaded module, then derives codegen guard and target input when constructing
-`FunctionSpecializationInputs`; planner queries over legacy
-`FunctionProfileEvidence` do not see v3 direct-call targets.
-Compatible profiled targets become guarded ordinary-call, constructor-call, or
-method-call plans with the selected `FunctionId`, owner/type-version guard when
-needed, and direct-entry argument plan. A typed lowering pass turns guarded
+Before typed JIT emission, legacy `Call` nodes lower to `TypedCall` nodes. The
+legacy plan path can still annotate eligible `TypedCall`s from replayed
+`call_hot_targets`, but the v3 path does not feed v3 selections back into that
+legacy map. In v3, `decide_optimizations --mode v3` reads the raw
+`call_hot_targets` evidence and records same-module ordinary-function targets
+in `mod.optv3` as direct-call plan selections plus matching mechanical
+direct-call emissions. The offline v3 planner validates the lowered call site
+and target signature, then stores the direct-entry argument plan in the
+artifact. The JIT validates that the mechanical emission matches the selected
+plan and that each target exists in the loaded module, then consumes the
+emitted guard plan directly when constructing `FunctionSpecializationInputs`.
+V3 guard targets are used for direct-function predeclaration and process-JIT
+batch scheduling, but planner queries over legacy `FunctionProfileEvidence` do
+not see v3 direct-call targets. On the legacy path, compatible profiled targets
+become guarded ordinary-call, constructor-call, or method-call plans with the
+selected `FunctionId`, owner/type-version guard when needed, and direct-entry
+argument plan. A typed lowering pass turns guarded
 ordinary/constructor calls into `InstrTyped::GuardedCallableCallTyped` and
 guarded methods into `InstrTyped::GuardedMethodCallTyped`. The typed IR also has
 `InstrTyped::DirectCallGuardTest` for exact callee-function-id checks and

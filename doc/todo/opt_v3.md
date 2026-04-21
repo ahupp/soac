@@ -114,8 +114,9 @@ Implemented:
   function identity matches the function being compiled. Same-module profiled
   direct-call decisions and ordinary-call argument plans are derived from the
   mechanical `mod.optv3` emission as v3-owned codegen inputs; the JIT consumes
-  the emitted guard shape and derives a target map from it only for direct-call
-  function predeclaration, not as legacy profile evidence. Indexed-field
+  the emitted guard shape directly and uses its targets only for direct-call
+  function predeclaration and process-JIT batch scheduling, not as legacy
+  profile evidence. Indexed-field
   decisions are also derived from mechanical `mod.optv3` emission as v3-owned
   typed-attribute inputs, with exact plan/emission validation before use.
   Exact-list item decisions are derived from mechanical `mod.optv3` emission as

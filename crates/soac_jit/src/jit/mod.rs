@@ -13356,7 +13356,17 @@ impl PlannedOptimizationInputs {
 }
 
 impl PlannedOptimizationInputs {
-    fn codegen_call_target_specializations(
+    fn v3_direct_function_call_targets(
+        &self,
+        function_id: RuntimeFunctionId,
+    ) -> HashMap<InstrId, Vec<RuntimeFunctionId>> {
+        self.opt_v3_emitted_direct_function_guards
+            .get(&function_id)
+            .map(direct_function_guard_targets)
+            .unwrap_or_default()
+    }
+
+    fn direct_call_targets_for_batch(
         &self,
         function_id: RuntimeFunctionId,
     ) -> HashMap<InstrId, Vec<RuntimeFunctionId>> {
@@ -13365,11 +13375,7 @@ impl PlannedOptimizationInputs {
             .get(&function_id)
             .map(|evidence| evidence.call_target_specializations.clone())
             .unwrap_or_default();
-        let v3_targets = self
-            .opt_v3_emitted_direct_function_guards
-            .get(&function_id)
-            .map(direct_function_guard_targets)
-            .unwrap_or_default();
+        let v3_targets = self.v3_direct_function_call_targets(function_id);
         merge_call_target_specializations(legacy_targets, v3_targets)
     }
 }
@@ -13386,6 +13392,15 @@ fn direct_function_guard_targets(
             )
         })
         .collect()
+}
+
+fn extend_direct_call_targets_from_guards(
+    out: &mut HashSet<RuntimeFunctionId>,
+    guards_by_source: &HashMap<InstrId, Vec<TypedDirectFunctionCallGuard>>,
+) {
+    for guards in guards_by_source.values() {
+        out.extend(guards.iter().map(|guard| guard.function_id));
+    }
 }
 
 fn merge_call_target_specializations(
@@ -14656,7 +14671,7 @@ impl FunctionSpecializationInputs {
         ) = profile.field_index_specialization_maps(function.function_id)?;
         Ok(Self {
             call_target_specializations: profile
-                .codegen_call_target_specializations(function.function_id)?,
+                .call_target_specializations(function.function_id)?,
             direct_function_call_guards: profile
                 .codegen_direct_function_call_guards(function.function_id),
             operator_specializations: profile.operator_specializations(function.function_id)?,
@@ -14793,20 +14808,14 @@ impl<'a> SpecializationProfile<'a> {
             .unwrap_or_default())
     }
 
-    fn codegen_call_target_specializations(
+    fn v3_direct_function_call_targets(
         &self,
         function_id: RuntimeFunctionId,
-    ) -> Result<HashMap<InstrId, Vec<RuntimeFunctionId>>, String> {
-        let legacy_targets = self.call_target_specializations(function_id)?;
-        let v3_targets = self
-            .opt_v3_emitted_direct_function_guards
+    ) -> HashMap<InstrId, Vec<RuntimeFunctionId>> {
+        self.opt_v3_emitted_direct_function_guards
             .get(&function_id)
             .map(direct_function_guard_targets)
-            .unwrap_or_default();
-        Ok(merge_call_target_specializations(
-            legacy_targets,
-            v3_targets,
-        ))
+            .unwrap_or_default()
     }
 
     fn codegen_direct_function_call_guards(
@@ -25883,7 +25892,7 @@ fn collect_process_jit_batch_functions<'a>(
             continue;
         }
         let mut direct_targets = collect_call_direct_targets(&batch_function.function);
-        for targets in planned_call_target_specializations_for_batch_function(
+        for targets in planned_direct_call_targets_for_batch_function(
             session,
             &mut planned_inputs_by_module,
             &batch_function,
@@ -25932,7 +25941,7 @@ fn collect_process_jit_batch_functions<'a>(
     Ok(out)
 }
 
-fn planned_call_target_specializations_for_batch_function(
+fn planned_direct_call_targets_for_batch_function(
     session: &Arc<crate::session::CompileSession>,
     planned_inputs_by_module: &mut HashMap<usize, PlannedOptimizationInputs>,
     batch_function: &ProcessJitBatchFunction<'_>,
@@ -25953,7 +25962,7 @@ fn planned_call_target_specializations_for_batch_function(
     Ok(planned_inputs_by_module
         .get(&module_key)
         .map(|planned_inputs| {
-            planned_inputs.codegen_call_target_specializations(batch_function.function.function_id)
+            planned_inputs.direct_call_targets_for_batch(batch_function.function.function_id)
         })
         .unwrap_or_default())
 }
@@ -28514,6 +28523,12 @@ fn precompile_external_direct_call_target_functions(
         {
             target_ids.extend(targets.iter().copied());
         }
+        for targets in profile
+            .v3_direct_function_call_targets(function.function_id)
+            .values()
+        {
+            target_ids.extend(targets.iter().copied());
+        }
     }
     Ok(target_ids
         .into_iter()
@@ -29623,6 +29638,7 @@ fn build_cranelift_run_bb_specialized_function(
     for targets in call_target_specializations.values() {
         direct_call_targets.extend(targets.iter().copied());
     }
+    extend_direct_call_targets_from_guards(&mut direct_call_targets, &direct_function_call_guards);
     direct_call_targets.extend(collect_runtime_protocol_method_targets(
         function,
         module_constants,
@@ -30768,6 +30784,10 @@ pub unsafe fn render_instr_typed_for_codegen_with_runtime_state(
     for targets in specialization_inputs.call_target_specializations.values() {
         direct_call_targets.extend(targets.iter().copied());
     }
+    extend_direct_call_targets_from_guards(
+        &mut direct_call_targets,
+        &specialization_inputs.direct_function_call_guards,
+    );
     direct_call_targets.extend(collect_runtime_protocol_method_targets(
         render_function,
         &render_module_constants,

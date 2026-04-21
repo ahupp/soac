@@ -18344,12 +18344,11 @@ def write_point(point, value):
         );
         assert_eq!(
             profile
-                .codegen_call_target_specializations(caller_id)
-                .unwrap()
+                .v3_direct_function_call_targets(caller_id)
                 .get(&source)
                 .unwrap(),
-            &vec![legacy_target, v3_target],
-            "codegen inputs should consume the v3-selected direct-call target"
+            &vec![v3_target],
+            "v3 direct-call targets should stay separate from legacy call-target evidence"
         );
     }
 
