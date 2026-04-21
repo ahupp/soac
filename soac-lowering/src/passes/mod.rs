@@ -1069,10 +1069,19 @@ pub struct TypedIndexedFieldGuard {
     pub type_version: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TypedIndexedFieldPlanSource {
+    LegacyProfile,
+    OptimizationPlanV3,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TypedAttrAccessPlan {
     Generic,
-    ProfiledIndexedField { guards: Vec<TypedIndexedFieldGuard> },
+    IndexedField {
+        source: TypedIndexedFieldPlanSource,
+        guards: Vec<TypedIndexedFieldGuard>,
+    },
 }
 
 define_ruff_instr! {

@@ -65,10 +65,10 @@ use soac_lowering::passes::{
     TypedDirectCallGuardTest, TypedDirectCallGuardTestKind, TypedDirectCallableCall,
     TypedDirectCallableCallGuard, TypedDirectConstructorCallGuard, TypedDirectFunctionCallGuard,
     TypedDirectMethodCall, TypedDirectMethodCallGuard, TypedGetAttr, TypedGuardedCallableCall,
-    TypedGuardedMethodCall, TypedIndexedFieldGuard, TypedPlannedResult, TypedPyObjectOwnershipPlan,
-    TypedSetAttr, ValueFacts, annotate_typed_function_planned_results,
-    annotate_typed_function_result_demands, annotate_typed_function_value_facts,
-    assign_missing_codegen_function_instr_ids,
+    TypedGuardedMethodCall, TypedIndexedFieldGuard, TypedIndexedFieldPlanSource,
+    TypedPlannedResult, TypedPyObjectOwnershipPlan, TypedSetAttr, ValueFacts,
+    annotate_typed_function_planned_results, annotate_typed_function_result_demands,
+    annotate_typed_function_value_facts, assign_missing_codegen_function_instr_ids,
     build_cross_module_direct_method_inline_fragment_to_target,
     build_direct_method_inline_fragment_to_target, infer_module_value_facts,
     inline_direct_call_stores_with_callees, lower_codegen_function_to_typed,
@@ -91,7 +91,7 @@ use soac_opt::emit_v3::{
 #[cfg(test)]
 use soac_opt::plan::ProfileEvidenceStore;
 use soac_opt::plan::{
-    FunctionProfileEvidence, OptimizationPlan, PlannedIndexedFieldSpecialization, PlannedTypeKey,
+    FunctionProfileEvidence, OptimizationPlan, PlannedIndexedFieldSpecialization,
     load_optimization_plan,
 };
 use soac_opt::plan_v3::{
@@ -99,6 +99,7 @@ use soac_opt::plan_v3::{
     DirectCallArgSource as PlanV3DirectCallArgSource, FailureMode, FallbackTarget,
     FunctionOptimizationPlanV3, GuardFailure, GuardKind,
     IndexedFieldAccessKind as PlanV3IndexedFieldAccessKind,
+    IndexedFieldOwnerType as PlanV3IndexedFieldOwnerType,
     IndexedFieldSpecializationPlan as PlanV3IndexedFieldSpecializationPlan, MaterializeKind,
     ModuleOptimizationPlanV3, PlanNodeId, PlanValue, PlannedConstant, RegionExitTarget, RegionId,
     RegionInputSource, RegionPlan, Rep, RichCompareOp, ScalarLocalThreadPlan, ScalarThreadFallback,
@@ -1356,11 +1357,18 @@ fn predeclare_specialization_type_imports(
     jit_module: &mut JITModule,
     profile: &SpecializationProfile<'_>,
 ) -> Result<(), String> {
-    let planned_fields = profile.planned_field_index_specializations();
+    let planned_fields = profile.planned_legacy_field_index_specializations();
     prime_planned_field_index_layouts(planned_fields.iter().copied())?;
+    let opt_v3_planned_fields = profile.opt_v3_indexed_field_access_plans();
+    prime_opt_v3_field_index_layouts(opt_v3_planned_fields.iter().copied())?;
     let mut type_refs = HashSet::new();
     for planned in planned_fields {
         if let Some(specialization) = field_index_specialization_from_primed_planned(planned)? {
+            type_refs.insert(specialization.owner_type_ref);
+        }
+    }
+    for planned in opt_v3_planned_fields {
+        if let Some(specialization) = field_index_specialization_from_primed_opt_v3(planned)? {
             type_refs.insert(specialization.owner_type_ref);
         }
     }
@@ -9100,8 +9108,9 @@ impl FieldIndexSpecialization {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct OptV3IndexedFieldAccessPlan {
     access: PlanV3IndexedFieldAccessKind,
+    owner_type: PlanV3IndexedFieldOwnerType,
     attr_name: String,
-    specialization: PlannedIndexedFieldSpecialization,
+    expected_index: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -12747,15 +12756,19 @@ fn annotate_typed_attr_accesses(
             &self,
             instr_id: InstrId,
             _attr: &InstrTyped,
-        ) -> Option<Vec<TypedIndexedFieldGuard>> {
+        ) -> Option<TypedAttrAccessPlan> {
             self.field_index_specializations_by_instr
                 .get(&instr_id)
                 .filter(|specializations| !specializations.is_empty())
                 .map(|specializations| {
-                    specializations
+                    let guards = specializations
                         .iter()
                         .map(FieldIndexSpecialization::to_typed_guard)
-                        .collect::<Vec<_>>()
+                        .collect::<Vec<_>>();
+                    TypedAttrAccessPlan::IndexedField {
+                        source: TypedIndexedFieldPlanSource::LegacyProfile,
+                        guards,
+                    }
                 })
         }
 
@@ -12764,7 +12777,7 @@ fn annotate_typed_attr_accesses(
             instr_id: InstrId,
             attr: &InstrTyped,
             expected_access: PlanV3IndexedFieldAccessKind,
-        ) -> Option<Vec<TypedIndexedFieldGuard>> {
+        ) -> Option<TypedAttrAccessPlan> {
             let accesses = self.opt_v3_indexed_fields_by_instr.get(&instr_id)?;
             let Some(attr_name) = typed_constant_string_value(self.module, attr) else {
                 self.error = Some(format!(
@@ -12792,7 +12805,10 @@ fn annotate_typed_attr_accesses(
                 guards.push(access.specialization.to_typed_guard());
             }
             self.consumed_opt_v3_sources.insert(instr_id);
-            Some(guards)
+            Some(TypedAttrAccessPlan::IndexedField {
+                source: TypedIndexedFieldPlanSource::OptimizationPlanV3,
+                guards,
+            })
         }
 
         fn annotate_attr(
@@ -12800,7 +12816,7 @@ fn annotate_typed_attr_accesses(
             instr_id: InstrId,
             attr: &InstrTyped,
             expected_access: PlanV3IndexedFieldAccessKind,
-        ) -> Option<Vec<TypedIndexedFieldGuard>> {
+        ) -> Option<TypedAttrAccessPlan> {
             if self.opt_v3_indexed_fields_by_instr.contains_key(&instr_id) {
                 return self.opt_v3_guards_for_attr(instr_id, attr, expected_access);
             }
@@ -12815,22 +12831,22 @@ fn annotate_typed_attr_accesses(
             }
             match expr {
                 InstrTyped::GetAttrTyped(op) => {
-                    if let Some(guards) = self.annotate_attr(
+                    if let Some(access) = self.annotate_attr(
                         op.semantic_instr_id(),
                         op.attr.as_ref(),
                         PlanV3IndexedFieldAccessKind::Load,
                     ) {
-                        op.access = TypedAttrAccessPlan::ProfiledIndexedField { guards };
+                        op.access = access;
                         self.count += 1;
                     }
                 }
                 InstrTyped::SetAttrTyped(op) if self.specialize_stores => {
-                    if let Some(guards) = self.annotate_attr(
+                    if let Some(access) = self.annotate_attr(
                         op.semantic_instr_id(),
                         op.attr.as_ref(),
                         PlanV3IndexedFieldAccessKind::Store,
                     ) {
-                        op.access = TypedAttrAccessPlan::ProfiledIndexedField { guards };
+                        op.access = access;
                         self.count += 1;
                     }
                 }
@@ -13568,15 +13584,9 @@ fn opt_v3_indexed_field_access_plan_from_emission(
 ) -> OptV3IndexedFieldAccessPlan {
     OptV3IndexedFieldAccessPlan {
         access: indexed_field.access,
+        owner_type: indexed_field.owner_type.clone(),
         attr_name: indexed_field.attr_name.clone(),
-        specialization: PlannedIndexedFieldSpecialization {
-            owner_type: PlannedTypeKey {
-                module_name: indexed_field.owner_type.module_name.clone(),
-                qualname: indexed_field.owner_type.qualname.clone(),
-            },
-            attr_name: indexed_field.attr_name.clone(),
-            expected_index: indexed_field.expected_index,
-        },
+        expected_index: indexed_field.expected_index,
     }
 }
 
@@ -14218,20 +14228,22 @@ impl<'a> SpecializationProfile<'a> {
             || (self.profiled_cold_blocks && self.has_existing_counter_dump())
     }
 
-    fn planned_field_index_specializations(&self) -> Vec<&PlannedIndexedFieldSpecialization> {
-        let mut planned_fields = self
-            .planned_evidence
+    fn planned_legacy_field_index_specializations(
+        &self,
+    ) -> Vec<&PlannedIndexedFieldSpecialization> {
+        self.planned_evidence
             .values()
             .flat_map(|evidence| evidence.field_index_specializations.values())
             .flat_map(|specializations| specializations.iter())
-            .collect::<Vec<_>>();
-        planned_fields.extend(
-            self.opt_v3_emitted_indexed_fields
-                .values()
-                .flat_map(|accesses_by_instr| accesses_by_instr.values())
-                .flat_map(|accesses| accesses.iter().map(|access| &access.specialization)),
-        );
-        planned_fields
+            .collect()
+    }
+
+    fn opt_v3_indexed_field_access_plans(&self) -> Vec<&OptV3IndexedFieldAccessPlan> {
+        self.opt_v3_emitted_indexed_fields
+            .values()
+            .flat_map(|accesses_by_instr| accesses_by_instr.values())
+            .flat_map(|accesses| accesses.iter())
+            .collect()
     }
 
     fn call_target_specializations(
@@ -14326,8 +14338,10 @@ impl<'a> SpecializationProfile<'a> {
         ),
         String,
     > {
-        let planned_fields = self.planned_field_index_specializations();
+        let planned_fields = self.planned_legacy_field_index_specializations();
         prime_planned_field_index_layouts(planned_fields.iter().copied())?;
+        let opt_v3_planned_fields = self.opt_v3_indexed_field_access_plans();
+        prime_opt_v3_field_index_layouts(opt_v3_planned_fields.iter().copied())?;
         let mut by_attr = HashMap::<String, Vec<FieldIndexSpecialization>>::new();
         for planned in planned_fields {
             if let Some(specialization) = field_index_specialization_from_primed_planned(planned)? {
@@ -14385,7 +14399,7 @@ impl<'a> SpecializationProfile<'a> {
             let mut resolved_accesses = Vec::new();
             for planned in planned_accesses {
                 if let Some(specialization) =
-                    field_index_specialization_from_primed_planned(&planned.specialization)?
+                    field_index_specialization_from_primed_opt_v3(planned)?
                 {
                     let resolved = OptV3ResolvedIndexedFieldAccess {
                         access: planned.access,
@@ -14934,6 +14948,13 @@ fn planned_field_index_type_key(planned: &PlannedIndexedFieldSpecialization) -> 
     }
 }
 
+fn opt_v3_field_index_type_key(planned: &OptV3IndexedFieldAccessPlan) -> CounterDumpTypeKey {
+    CounterDumpTypeKey {
+        module_name: planned.owner_type.module_name.clone(),
+        qualname: planned.owner_type.qualname.clone(),
+    }
+}
+
 fn prime_planned_field_index_layouts<'a>(
     planned_fields: impl IntoIterator<Item = &'a PlannedIndexedFieldSpecialization>,
 ) -> Result<(), String> {
@@ -14971,10 +14992,61 @@ fn prime_planned_field_index_layouts<'a>(
     Ok(())
 }
 
+fn prime_opt_v3_field_index_layouts<'a>(
+    planned_fields: impl IntoIterator<Item = &'a OptV3IndexedFieldAccessPlan>,
+) -> Result<(), String> {
+    let mut layouts_by_type = HashMap::<CounterDumpTypeKey, Vec<CollectedTypeKeyLayout>>::new();
+    let mut seen_layouts = HashSet::<(CounterDumpTypeKey, String, u32)>::new();
+    for planned in planned_fields {
+        let type_key = opt_v3_field_index_type_key(planned);
+        if !seen_layouts.insert((
+            type_key.clone(),
+            planned.attr_name.clone(),
+            planned.expected_index,
+        )) {
+            continue;
+        }
+        layouts_by_type
+            .entry(type_key)
+            .or_default()
+            .push(CollectedTypeKeyLayout {
+                owner_type_id: 0,
+                key: planned.attr_name.clone(),
+                index: planned.expected_index,
+            });
+    }
+    for (type_key, mut layouts) in layouts_by_type {
+        layouts.sort_by(|lhs, rhs| {
+            lhs.index
+                .cmp(&rhs.index)
+                .then_with(|| lhs.key.cmp(&rhs.key))
+        });
+        let Some(owner_type) = resolve_type_key_to_type(&type_key)? else {
+            continue;
+        };
+        prime_field_index_layout(owner_type, layouts.as_slice())?;
+    }
+    Ok(())
+}
+
 fn field_index_specialization_from_primed_planned(
     planned: &PlannedIndexedFieldSpecialization,
 ) -> Result<Option<FieldIndexSpecialization>, String> {
     let type_key = planned_field_index_type_key(planned);
+    let Some(owner_type) = resolve_type_key_to_type(&type_key)? else {
+        return Ok(None);
+    };
+    field_index_specialization_for_type(
+        owner_type,
+        planned.attr_name.as_str(),
+        planned.expected_index,
+    )
+}
+
+fn field_index_specialization_from_primed_opt_v3(
+    planned: &OptV3IndexedFieldAccessPlan,
+) -> Result<Option<FieldIndexSpecialization>, String> {
+    let type_key = opt_v3_field_index_type_key(planned);
     let Some(owner_type) = resolve_type_key_to_type(&type_key)? else {
         return Ok(None);
     };
@@ -17435,7 +17507,7 @@ fn emit_typed_setattr_fallback(
     ))
 }
 
-fn emit_typed_profiled_indexed_getattr(
+fn emit_typed_indexed_getattr(
     fb: &mut FunctionBuilder<'_>,
     op: &TypedGetAttr<InstrTyped>,
     guards: &[TypedIndexedFieldGuard],
@@ -17597,9 +17669,10 @@ fn emit_typed_profiled_indexed_getattr(
     Ok(Some(SoacValue::pyobject(result, PyObjFacts::unknown())))
 }
 
-fn emit_typed_profiled_indexed_setattr(
+fn emit_typed_indexed_setattr(
     fb: &mut FunctionBuilder<'_>,
     op: &TypedSetAttr<InstrTyped>,
+    source: TypedIndexedFieldPlanSource,
     guards: &[TypedIndexedFieldGuard],
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
@@ -17608,6 +17681,12 @@ fn emit_typed_profiled_indexed_setattr(
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<Option<EmitResult>, String> {
     if !emit_ctx.behavior_change_indexed_stores {
+        if source == TypedIndexedFieldPlanSource::OptimizationPlanV3 {
+            return Err(format!(
+                "optimizer v3 indexed-field store emission for {} reached codegen with indexed stores disabled",
+                op.semantic_instr_id()
+            ));
+        }
         return Ok(None);
     }
     let result_needs_pyobject = match demand {
@@ -18026,9 +18105,9 @@ fn emit_typed_codegen_expr_value_with_local_env(
     }
 
     if let InstrTyped::GetAttrTyped(op) = expr
-        && let TypedAttrAccessPlan::ProfiledIndexedField { guards } = &op.access
+        && let TypedAttrAccessPlan::IndexedField { guards, .. } = &op.access
     {
-        let maybe_value = emit_typed_profiled_indexed_getattr(
+        let maybe_value = emit_typed_indexed_getattr(
             fb,
             op,
             guards,
@@ -18043,11 +18122,12 @@ fn emit_typed_codegen_expr_value_with_local_env(
     }
 
     if let InstrTyped::SetAttrTyped(op) = expr
-        && let TypedAttrAccessPlan::ProfiledIndexedField { guards } = &op.access
+        && let TypedAttrAccessPlan::IndexedField { source, guards } = &op.access
     {
-        let maybe_value = emit_typed_profiled_indexed_setattr(
+        let maybe_value = emit_typed_indexed_setattr(
             fb,
             op,
+            *source,
             guards,
             local_env,
             emit_ctx,
@@ -21723,8 +21803,8 @@ fn emit_typed_codegen_stmt_result_with_local_env(
         );
     }
     if let InstrTyped::GetAttrTyped(op) = expr {
-        let result = if let TypedAttrAccessPlan::ProfiledIndexedField { guards } = &op.access {
-            emit_typed_profiled_indexed_getattr(
+        let result = if let TypedAttrAccessPlan::IndexedField { guards, .. } = &op.access {
+            emit_typed_indexed_getattr(
                 fb,
                 op,
                 guards,
@@ -21771,10 +21851,11 @@ fn emit_typed_codegen_stmt_result_with_local_env(
         });
     }
     if let InstrTyped::SetAttrTyped(op) = expr {
-        if let TypedAttrAccessPlan::ProfiledIndexedField { guards } = &op.access {
-            if let Some(result) = emit_typed_profiled_indexed_setattr(
+        if let TypedAttrAccessPlan::IndexedField { source, guards } = &op.access {
+            if let Some(result) = emit_typed_indexed_setattr(
                 fb,
                 op,
+                *source,
                 guards,
                 local_env,
                 emit_ctx,

@@ -17088,15 +17088,9 @@ def f(x):
                 .unwrap(),
             &vec![OptV3IndexedFieldAccessPlan {
                 access: IndexedFieldAccessKind::Load,
+                owner_type: owner_type.clone(),
                 attr_name: "value".to_string(),
-                specialization: PlannedIndexedFieldSpecialization {
-                    owner_type: PlannedTypeKey {
-                        module_name: owner_type.module_name.clone(),
-                        qualname: owner_type.qualname.clone(),
-                    },
-                    attr_name: "value".to_string(),
-                    expected_index: 2,
-                },
+                expected_index: 2,
             }]
         );
         assert_eq!(
@@ -17108,15 +17102,9 @@ def f(x):
                 .unwrap(),
             &vec![OptV3IndexedFieldAccessPlan {
                 access: IndexedFieldAccessKind::Store,
+                owner_type: owner_type.clone(),
                 attr_name: "value".to_string(),
-                specialization: PlannedIndexedFieldSpecialization {
-                    owner_type: PlannedTypeKey {
-                        module_name: owner_type.module_name.clone(),
-                        qualname: owner_type.qualname.clone(),
-                    },
-                    attr_name: "value".to_string(),
-                    expected_index: 2,
-                },
+                expected_index: 2,
             }]
         );
         assert!(
@@ -17556,6 +17544,85 @@ def write_point(point, value):
                 .del_item("field_type_test")
                 .expect("owner module should be removed");
         });
+    }
+
+    #[test]
+    fn v3_indexed_field_annotation_preserves_mechanical_plan_source() {
+        let module_name_gen = ModuleNameGen::new(0);
+        let mut constants = TestConstantPool::default();
+        let mut function = test_function_in_module(&module_name_gen, "write");
+        function.params = ParamSpec {
+            params: vec![
+                Param {
+                    name: "obj".into(),
+                    kind: ParamKind::Any,
+                    has_default: false,
+                },
+                Param {
+                    name: "value".into(),
+                    kind: ParamKind::Any,
+                    has_default: false,
+                },
+            ],
+        };
+        let block_label = function.name_gen.next_block_name();
+        let setattr_instr_id = InstrId::new(block_label, 1);
+        function.blocks = vec![CodegenBlock {
+            label: block_label,
+            body: vec![with_instr_id(
+                op_expr(SetAttr::new(
+                    name_expr(test_name("obj")),
+                    constants.string_expr("x"),
+                    name_expr(test_name("value")),
+                )),
+                setattr_instr_id,
+            )],
+            term: ret_term(none_expr()),
+            params: vec![],
+            exc_edge: None,
+        }];
+        set_stack_slots(&mut function, &["obj", "value"]);
+
+        let mut module = test_module(module_name_gen, vec![function.clone()]);
+        module.module_constants = constants.module_constants;
+        let mut typed_function =
+            lower_typed_function_if_tests_to_truthy(lower_codegen_function_to_typed(function));
+        let opt_v3_indexed_fields_by_instr = HashMap::from([(
+            setattr_instr_id,
+            vec![OptV3ResolvedIndexedFieldAccess {
+                access: IndexedFieldAccessKind::Store,
+                attr_name: "x".to_string(),
+                specialization: FieldIndexSpecialization {
+                    expected_index: 0,
+                    owner_type_ref: RelocTypeRef::TypeKey(CounterDumpTypeKey {
+                        module_name: "field_type_test".to_string(),
+                        qualname: "Point".to_string(),
+                    }),
+                    type_version: 1,
+                },
+            }],
+        )]);
+
+        let annotated = annotate_typed_attr_accesses(
+            &module,
+            &mut typed_function,
+            &HashMap::new(),
+            &HashMap::new(),
+            &opt_v3_indexed_fields_by_instr,
+            true,
+        )
+        .expect("v3 indexed-field SetAttr annotation should succeed");
+        assert_eq!(annotated, 1);
+
+        let InstrTyped::SetAttrTyped(op) = &typed_function.blocks[0].body[0] else {
+            panic!("test function body should contain typed SetAttr");
+        };
+        let TypedAttrAccessPlan::IndexedField { source, guards } = &op.access else {
+            panic!("v3 SetAttr should be annotated as an indexed-field access");
+        };
+        assert_eq!(*source, TypedIndexedFieldPlanSource::OptimizationPlanV3);
+        assert_eq!(guards.len(), 1);
+        assert_eq!(guards[0].expected_index, 0);
     }
 
     #[test]
