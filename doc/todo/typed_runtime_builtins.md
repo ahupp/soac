@@ -12,10 +12,10 @@ general direct-call ABI description that can say:
 - this callable accepts borrowed Python object arguments
 - this callable returns an `i64`, `i32`, owned `PyObject`, or no value
 - this callable reports errors by setting `PyThreadState.current_exception`
-- this callable is implemented by a `soac-runtime` symbol that can be imported
+- this callable is implemented by a `soac-jit-runtime` symbol that can be imported
   into Cranelift and inlined when small enough
 
-`soac-runtime` should hold the actual checked builtin implementations. The JIT
+`soac-jit-runtime` should hold the actual checked builtin implementations. The JIT
 should hold selection policy, typed demands, coercions, and fallback wiring.
 
 ## Design
@@ -60,7 +60,7 @@ optimization needs them.
 
 ## Runtime Primitive Shape
 
-`ord` should be implemented in `soac-runtime` as a checked primitive:
+`ord` should be implemented in `soac-jit-runtime` as a checked primitive:
 
 ```rust
 unsafe extern "C" fn soac_runtime_builtin_ord_i64(
@@ -130,7 +130,7 @@ This requires generic coercion edges:
 Status: steps 1 through 5 have started. The direct ABI descriptor scaffold
 exists in `soac-jit`, checked `soac_runtime_builtin_ord_i64` /
 `soac_runtime_builtin_chr_i64` / `soac_runtime_builtin_len_i64` entry points
-exist in `soac-runtime`, and static runtime-name `ord` / `len` calls can emit
+exist in `soac-jit-runtime`, and static runtime-name `ord` / `len` calls can emit
 an `i64`. Static `chr(ord(x))` can consume that `i64` without materializing an
 intermediate `PyLong`. Static `chr(<i64 module constant>)` can also use the
 scalar `chr_i64` path. Exact `PyLong` facts can satisfy `chr`'s `i64` demand
@@ -147,7 +147,7 @@ int while preserving CPython's `chr(huge_int)` `ValueError` behavior.
    generated code yet.
 
 2. Add checked `ord_i64`, `chr_i64`, and `len_i64` implementations to
-   `soac-runtime`.
+   `soac-jit-runtime`.
 
    Keep the implementation raw and ABI-shaped. Prefer direct Unicode layout
    reads where practical, but keep all validation inside the checked primitive.

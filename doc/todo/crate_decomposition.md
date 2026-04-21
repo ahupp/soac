@@ -287,7 +287,7 @@ keeps web dependencies out of non-web rendering and offline analysis tools.
 - Do not split every pass into its own crate. Adjacent passes share context and tend to change
   together; a pass-per-crate layout would add API friction without reducing the rebuilds that matter.
 - Cross-crate inlining can matter for very hot helpers. Keep very-hot ABI-shaped runtime code in
-  `soac-runtime` or the backend/runtime boundary, and use explicit benchmarks before moving hot code
+  `soac-jit-runtime` or the backend/runtime boundary, and use explicit benchmarks before moving hot code
   behind a less optimizable crate boundary.
 
 ## First Concrete Step

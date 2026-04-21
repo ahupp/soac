@@ -1010,7 +1010,7 @@ exact-list/exact-int arms and share generic fallback paths.
 
 ### Codegen
 
-- `ord(x)` can emit a direct call to the `soac-runtime`
+- `ord(x)` can emit a direct call to the `soac-jit-runtime`
   `soac_runtime_builtin_ord_i64` primitive. The primitive accepts the argument
   as a borrowed `PyObject*`, performs CPython-compatible validation internally,
   sets `PyThreadState.current_exception` on failure, and returns an `i64`.

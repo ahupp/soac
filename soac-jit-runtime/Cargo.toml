@@ -1,4 +1,4 @@
 [package]
-name = "soac-runtime"
+name = "soac-jit-runtime"
 version = "0.1.0"
 edition = "2024"

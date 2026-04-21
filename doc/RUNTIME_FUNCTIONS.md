@@ -7,8 +7,8 @@ module.
 
 Scope:
 
-- `soac-runtime`: exported `#[unsafe(no_mangle)]` functions in
-  `soac-runtime/src/lib.rs`.
+- `soac-jit-runtime`: exported `#[unsafe(no_mangle)]` functions in
+  `soac-jit-runtime/src/lib.rs`.
 - `specialized_helpers.rs`: exported helpers and symbols registered by
   `register_specialized_jit_symbols`.
 - `soac.runtime`: top-level Python callables, runtime classes, methods, and
@@ -22,7 +22,7 @@ Scope:
 This list does not include plain runtime constants such as `TRUE`, `FALSE`,
 `NONE`, `EMPTY_TUPLE`, or type/data symbols such as `PyFunction_Type`.
 
-## soac-runtime
+## soac-jit-runtime
 
 Exported C ABI helpers:
 

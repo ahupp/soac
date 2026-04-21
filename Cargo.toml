@@ -23,8 +23,8 @@ default-members = [
     "soac-jit",
     "soac-inspector",
 ]
-# soac-runtime is standalone since its built to CLIF 
-exclude = ["soac-runtime"]
+# soac-jit-runtime is standalone since it is built to CLIF.
+exclude = ["soac-jit-runtime"]
 resolver = "2"
 
 [profile.release-ext]

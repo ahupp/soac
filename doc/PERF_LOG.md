@@ -131,7 +131,7 @@ Current behavior:
   binding into `RuntimeName` loads; module-constant extraction then
   snapshots the runtime/builtin object in a constant slot
 
-In `apply` mode, specialized JIT code may call `soac-runtime` helpers
+In `apply` mode, specialized JIT code may call `soac-jit-runtime` helpers
 that overwrite an existing guarded storage slot directly:
 
 - indexed module-global store: replace `PyDictIndexedValues.values[index]`,

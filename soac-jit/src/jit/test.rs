@@ -14437,7 +14437,7 @@ def g():
         let source = parsed_runtime_clif_function("soac_runtime_example_known_value_source");
         assert!(
             source.function.dfg.num_insts() > 0,
-            "example source helper should load from soac-runtime CLIF as an ir::Function"
+            "example source helper should load from soac-jit-runtime CLIF as an ir::Function"
         );
         let parsed = parsed_runtime_clif_function("soac_runtime_example_offset_known_value");
         let callee_name = single_direct_call_callee_name(&parsed.function);

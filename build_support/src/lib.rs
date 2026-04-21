@@ -26,7 +26,7 @@ pub fn compute_soac_build_identity(repo_root: &std::path::Path) -> std::io::Resu
         "soac-jit",
         "soac-macros",
         "soac-pyo3",
-        "soac-runtime",
+        "soac-jit-runtime",
     ] {
         collect_identity_paths(&repo_root.join(relative), &mut paths)?;
     }

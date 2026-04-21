@@ -1,7 +1,7 @@
 #![no_std]
 
 #[cfg(not(target_pointer_width = "64"))]
-compile_error!("soac-runtime raw CPython layout support requires a 64-bit target");
+compile_error!("soac-jit-runtime raw CPython layout support requires a 64-bit target");
 
 use core::ffi::{c_int, c_void};
 

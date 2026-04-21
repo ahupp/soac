@@ -2,7 +2,7 @@ use self::precompiled_object::{
     ElfSymbolBinding, ElfSymbolKind, ObjectDataDefinition, ObjectDataRelocation,
     ObjectFunctionDefinition, R_X86_64_64, write_precompiled_object,
 };
-use crate::SOAC_RUNTIME_CLIF;
+use crate::SOAC_JIT_RUNTIME_CLIF;
 use crate::config::{
     CraneliftTargetConfig, PythonModuleCacheSource, SpecializationMode,
     module_optimization_plan_path, module_optimization_plan_v3_path,
@@ -26919,7 +26919,7 @@ struct ParsedRuntimeClifFunction {
 
 fn parse_runtime_clif_functions() -> Result<Vec<ParsedRuntimeClifFunction>, String> {
     let mut parsed_functions = Vec::new();
-    for (symbol, clif_text) in SOAC_RUNTIME_CLIF {
+    for (symbol, clif_text) in SOAC_JIT_RUNTIME_CLIF {
         let mut functions = parse_functions(clif_text)
             .map_err(|err| format!("failed to parse runtime CLIF for {symbol}: {err}"))?;
         if functions.len() != 1 {

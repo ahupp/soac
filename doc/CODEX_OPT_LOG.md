@@ -475,7 +475,7 @@ benchmarked throughput delta, and the headline pre/post numbers.
 ## 2026-04-08 - Inline runtime guard and indexed-field helpers
 
 - jj change id: `kkoolpkp`
-- summary: Type/version guards now inline through soac-runtime, indexed
+- summary: Type/version guards now inline through soac-jit-runtime, indexed
   field helpers use direct dict/inline-values access instead of
   `_PyObject_GetDictPtr`, and the opt-in unsound indexed field-store path
   reports hit/miss status instead of returning an owned temporary.

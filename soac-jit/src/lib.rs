@@ -1,7 +1,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 #![allow(unused_unsafe)]
 
-include!(concat!(env!("OUT_DIR"), "/soac_runtime_clif.rs"));
+include!(concat!(env!("OUT_DIR"), "/soac_jit_runtime_clif.rs"));
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};

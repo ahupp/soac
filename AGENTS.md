@@ -70,7 +70,7 @@ because it should affect engineering decisions:
    CPython hook; prefer an explicit post-create/post-callback init step
    or a clearly-owned Rust state object.
 
-9. Keep `soac-runtime` visibly raw and ABI-shaped. It is the very-hot
+9. Keep `soac-jit-runtime` visibly raw and ABI-shaped. It is the very-hot
    local runtime layer that gets inlined into generated code: avoid PyO3
    wrapper types there, name hand-written CPython layout mirrors with a
    `RawPy*` prefix, and keep casts clustered at ABI boundaries so direct
@@ -185,7 +185,7 @@ current `@`. Do not treat another workspace's live `@` as a dependency.
 10. Keep runtime helper inventory in sync.
 
    If you add, remove, rename, or move runtime helper functions in
-   `soac-runtime`, `soac-jit/src/jit/specialized_helpers.rs`, or
+   `soac-jit-runtime`, `soac-jit/src/jit/specialized_helpers.rs`, or
    `soac_py/src/soac/runtime.py`, update `doc/RUNTIME_FUNCTIONS.md`
    in the same logical change.
 

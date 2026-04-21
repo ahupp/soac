@@ -8,7 +8,7 @@ use std::process::Command;
 use build_support::{compute_soac_build_identity, emit_vendored_python_link};
 use pyo3_build_config::{BuildFlag, PythonImplementation};
 
-const RUNTIME_CRATE_NAME: &str = "soac_runtime";
+const RUNTIME_CRATE_NAME: &str = "soac_jit_runtime";
 
 fn main() -> Result<(), Box<dyn Error>> {
     pyo3_build_config::use_pyo3_cfgs();
@@ -20,11 +20,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         .ok_or("soac-jit should live under the repo root")?;
     let build_identity = compute_soac_build_identity(repo_root)?;
     println!("cargo:rustc-env=SOAC_BUILD_IDENTITY={build_identity}");
-    let runtime_dir = repo_root.join("soac-runtime");
+    let runtime_dir = repo_root.join("soac-jit-runtime");
     let runtime_src = runtime_dir.join("src").join("lib.rs");
     emit_vendored_python_link(repo_root)?;
     let out_dir = PathBuf::from(env::var("OUT_DIR")?);
-    let clif_out_dir = out_dir.join("soac-runtime-clif");
+    let clif_out_dir = out_dir.join("soac-jit-runtime-clif");
 
     emit_rerun_if_changed(&runtime_dir)?;
     fs::create_dir_all(&clif_out_dir)?;
@@ -123,7 +123,7 @@ fn build_runtime_clif(
     }
 
     Err(format!(
-        "failed to build soac-runtime to CLIF with rustc-codegen-cranelift\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        "failed to build soac-jit-runtime to CLIF with rustc-codegen-cranelift\nstdout:\n{stdout}\nstderr:\n{stderr}"
     )
     .into())
 }
@@ -157,8 +157,8 @@ fn find_runtime_clif_files(clif_out_dir: &Path) -> Result<Vec<(String, String)>,
 
 fn write_runtime_clif_constant(runtime_clif: &[(String, String)]) -> Result<(), Box<dyn Error>> {
     let out_dir = PathBuf::from(env::var("OUT_DIR")?);
-    let out_path = out_dir.join("soac_runtime_clif.rs");
-    let mut contents = String::from("pub const SOAC_RUNTIME_CLIF: &[(&str, &str)] = &[\n");
+    let out_path = out_dir.join("soac_jit_runtime_clif.rs");
+    let mut contents = String::from("pub const SOAC_JIT_RUNTIME_CLIF: &[(&str, &str)] = &[\n");
     for (symbol, clif) in runtime_clif {
         contents.push_str("    (");
         contents.push_str(&format!("{symbol:?}, "));

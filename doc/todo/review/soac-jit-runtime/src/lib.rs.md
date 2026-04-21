@@ -1,4 +1,4 @@
-# soac-runtime/src/lib.rs
+# soac-jit-runtime/src/lib.rs
 
 ## File Responsibilities
 

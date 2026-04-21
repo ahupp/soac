@@ -14,14 +14,14 @@ The same runtime-helper concept is currently described in several places:
 - direct-call ABI descriptors in `soac-jit/src/jit/direct_abi.rs`
 - JIT import specs and symbol registration in `soac-jit/src/jit/mod.rs`
 - helper implementations and registration in `soac-jit/src/jit/specialized_helpers.rs`
-- inlinable runtime implementations in `soac-runtime/src/lib.rs`
+- inlinable runtime implementations in `soac-jit-runtime/src/lib.rs`
 
 Coalesce this into one shared runtime ABI registry that records symbol name, signature, ownership,
 result facts, error convention, implementation origin, inlinability, and optional direct-call
 descriptor. Codegen, value facts, import declaration, symbol registration, and docs should consume
 that table instead of independently encoding the same helper properties.
 
-Do not merge `soac-runtime` and `specialized_helpers.rs` directly. `soac-runtime` is the inlinable
+Do not merge `soac-jit-runtime` and `specialized_helpers.rs` directly. `soac-jit-runtime` is the inlinable
 raw ABI layer; `specialized_helpers.rs` is the CPython/JIT bridge and panic boundary. The shared
 piece should be descriptors and generated registration, not one physical helper implementation file.
 
