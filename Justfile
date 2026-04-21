@@ -972,6 +972,38 @@ cpython *args='':
   set -- {{args}}
   "$REPO_ROOT/vendor/cpython/python" "$@"
 
+fmt-rust *packages='':
+  #!/usr/bin/env bash
+  cd "$REPO_ROOT"
+  set -- {{packages}}
+  if [[ "$#" -eq 0 ]]; then
+    echo "usage: just fmt-rust <cargo-package> [<cargo-package> ...]" >&2
+    echo "Use package-scoped cargo fmt; avoid bare rustfmt and full-workspace cargo fmt." >&2
+    exit 2
+  fi
+
+  cargo_args=()
+  for package in "$@"; do
+    cargo_args+=(--package "$package")
+  done
+  cargo fmt "${cargo_args[@]}"
+
+fmt-rust-check *packages='':
+  #!/usr/bin/env bash
+  cd "$REPO_ROOT"
+  set -- {{packages}}
+  if [[ "$#" -eq 0 ]]; then
+    echo "usage: just fmt-rust-check <cargo-package> [<cargo-package> ...]" >&2
+    echo "Use package-scoped cargo fmt --check; avoid bare rustfmt and full-workspace cargo fmt." >&2
+    exit 2
+  fi
+
+  cargo_args=()
+  for package in "$@"; do
+    cargo_args+=(--package "$package")
+  done
+  cargo fmt --check "${cargo_args[@]}"
+
 fmt-markdown:
   #!/usr/bin/env bash
   cd "$REPO_ROOT"

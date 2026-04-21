@@ -220,6 +220,12 @@ For fast feedback on Rust changes that may affect crate test targets,
 run `cargo check -p soac-jit --tests` before the full gate; it
 type-checks the `soac-jit` crate including tests without running the
 entire transformed-runtime suite.
+For Rust formatting, use `just fmt-rust <package> ...` and
+`just fmt-rust-check <package> ...`, which call package-scoped
+`cargo fmt`. Do not run bare `rustfmt <path>` for repo files: it can
+miss the crate edition/config context and fail on valid Rust 2024
+syntax. Avoid full-workspace `cargo fmt` unless broad formatting churn
+is intentional, because it can touch unrelated preexisting formatting.
 Put test output in `work/logs/`. Summarize the failures, separate expected
 failures from unexpected failures, investigate the root cause, report
 it, then fix it.
@@ -335,6 +341,13 @@ so a later turn can resume without rediscovering context.
 
 - `just test-all`
   Full gate for non-doc changes.
+- `just fmt-rust <cargo-package> ...`
+  Formats Rust through package-scoped `cargo fmt`. Prefer this over bare
+  `rustfmt <path>` so rustfmt receives Cargo's edition/config context, and over
+  full-workspace `cargo fmt` unless unrelated formatting churn is intentional.
+- `just fmt-rust-check <cargo-package> ...`
+  Package-scoped Rust formatting check. Use this for validation after scoped
+  Rust edits.
 - `just pytest ...`
   Authoritative transformed-runtime pytest entrypoint.
 - `just pytest-fast ...`
