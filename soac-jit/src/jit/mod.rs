@@ -8244,6 +8244,8 @@ struct JitEmitCtx<'mc> {
     global_indexed_fallback_counter_ids: &'mc HashMap<InstrId, CounterId>,
     field_indexed_hit_counter_ids: &'mc HashMap<InstrId, CounterId>,
     field_indexed_fallback_counter_ids: &'mc HashMap<InstrId, CounterId>,
+    field_generic_getattr_counter_ids: &'mc HashMap<InstrId, CounterId>,
+    field_generic_setattr_counter_ids: &'mc HashMap<InstrId, CounterId>,
     deopt_entry_guard_miss_counter_ids: &'mc HashMap<usize, CounterId>,
     field_index_specializations: &'mc HashMap<String, Vec<FieldIndexSpecialization>>,
     field_index_specializations_by_instr: &'mc HashMap<InstrId, Vec<FieldIndexSpecialization>>,
@@ -17351,7 +17353,7 @@ fn emit_typed_getattr_fallback(
     push_owned_typed_input_cleanup(&mut owned_inputs, value, value_is_borrowed);
     push_owned_typed_input_cleanup(&mut owned_inputs, attr, attr_is_borrowed);
     if let Some(counter_id) = emit_ctx
-        .field_indexed_fallback_counter_ids
+        .field_generic_getattr_counter_ids
         .get(&op.semantic_instr_id())
         .copied()
     {
@@ -17409,7 +17411,7 @@ fn emit_typed_setattr_fallback(
     push_owned_typed_input_cleanup(&mut owned_inputs, attr, attr_is_borrowed);
     push_owned_typed_input_cleanup(&mut owned_inputs, replacement, replacement_is_borrowed);
     if let Some(counter_id) = emit_ctx
-        .field_indexed_fallback_counter_ids
+        .field_generic_setattr_counter_ids
         .get(&op.semantic_instr_id())
         .copied()
     {
@@ -28943,6 +28945,16 @@ fn build_cranelift_run_bb_specialized_function(
         function.function_id,
         "field_indexed_fallback",
     );
+    let field_generic_getattr_counter_ids = collect_runtime_counter_ids_by_kind(
+        counter_defs,
+        function.function_id,
+        "field_generic_getattr",
+    );
+    let field_generic_setattr_counter_ids = collect_runtime_counter_ids_by_kind(
+        counter_defs,
+        function.function_id,
+        "field_generic_setattr",
+    );
     let deopt_entry_guard_miss_counter_ids = collect_deopt_entry_counter_ids_by_kind(
         counter_defs,
         function.function_id,
@@ -29701,6 +29713,8 @@ fn build_cranelift_run_bb_specialized_function(
                 global_indexed_fallback_counter_ids: &global_indexed_fallback_counter_ids,
                 field_indexed_hit_counter_ids: &field_indexed_hit_counter_ids,
                 field_indexed_fallback_counter_ids: &field_indexed_fallback_counter_ids,
+                field_generic_getattr_counter_ids: &field_generic_getattr_counter_ids,
+                field_generic_setattr_counter_ids: &field_generic_setattr_counter_ids,
                 deopt_entry_guard_miss_counter_ids: &deopt_entry_guard_miss_counter_ids,
                 branch_outcome_counter_ids: &branch_outcome_counter_ids,
                 branch_prefer_true: &branch_prefer_true,

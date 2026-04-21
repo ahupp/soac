@@ -369,6 +369,8 @@ impl SharedModuleState {
                     | "global_indexed_fallback"
                     | "field_indexed_hit"
                     | "field_indexed_fallback"
+                    | "field_generic_getattr"
+                    | "field_generic_setattr"
                     | "operator_specialized_hit"
                     | "operator_specialized_fallback"
                     | "getitem_specialized_hit"

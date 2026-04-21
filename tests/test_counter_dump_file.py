@@ -213,6 +213,57 @@ def read():
     assert not (work_dir / "verify.bin").exists()
 
 
+def test_unplanned_field_access_records_generic_counters_not_indexed_fallback(tmp_path):
+    module_name = "field_generic_counter_case"
+    (tmp_path / f"{module_name}.py").write_text(
+        """
+class Box:
+    pass
+
+def write_and_read(value):
+    box = Box()
+    box.x = value
+    return box.x
+""",
+        encoding="utf-8",
+    )
+    work_dir = tmp_path / "soac-work"
+    script = _import_and_run_script(
+        tmp_path,
+        f"import {module_name} as module",
+        """
+        for index in range(5):
+            assert module.write_and_read(index) == index
+        """,
+    )
+    base_env = _soac_subprocess_env(
+        tmp_path,
+        work_dir=work_dir,
+        extra_env={"SOAC_COMPILE_MODE": "eager"},
+    )
+
+    result = _run_soac_subprocess(
+        script,
+        env={**base_env, "SOAC_OPT_MODE": "profile"},
+    )
+    _assert_subprocess_ok(result)
+    profile = _inspect_counter_dump_json(work_dir / "profile.bin")
+
+    by_kind = {}
+    for record in profile["records"]:
+        if record["module_name"] != module_name:
+            continue
+        for row in record["rows"]:
+            if row["function_qualname"] != "write_and_read":
+                continue
+            by_kind[row["kind"]] = by_kind.get(row["kind"], 0) + row["value"]
+
+    assert by_kind["field_generic_getattr"] >= 5, profile
+    assert by_kind["field_generic_setattr"] >= 5, profile
+    assert by_kind.get("field_indexed_hit", 0) == 0, profile
+    assert by_kind.get("field_indexed_fallback", 0) == 0, profile
+
+
 def test_module_load_event_is_written_to_soac_log_json(tmp_path):
     log_path = tmp_path / "soac-events.jsonl"
     module_path = tmp_path / "module_load_log_case.py"

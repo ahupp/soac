@@ -580,7 +580,7 @@ fn emit_counted_getattr_fallback<'fb, E: Instr>(
     if let Some(instr_id) = instr_id {
         let counter_id = state
             .ctx()
-            .field_indexed_fallback_counter_ids
+            .field_generic_getattr_counter_ids
             .get(&instr_id)
             .copied();
         increment_counter_with_state(state, counter_id);
@@ -733,7 +733,7 @@ fn emit_setattr_fallback<'fb>(
     if let Some(instr_id) = instr_id {
         let counter_id = state
             .ctx()
-            .field_indexed_fallback_counter_ids
+            .field_generic_setattr_counter_ids
             .get(&instr_id)
             .copied();
         increment_counter_with_state(state, counter_id);

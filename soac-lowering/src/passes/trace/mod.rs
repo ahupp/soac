@@ -257,10 +257,6 @@ pub fn instrument_bb_module_with_call_target_counters(
         }
     }
 
-    fn is_field_index_candidate(expr: &InstrCodegen) -> bool {
-        matches!(expr, InstrCodegen::GetAttr(_) | InstrCodegen::SetAttr(_))
-    }
-
     fn is_getitem_specialization_candidate(expr: &InstrCodegen) -> bool {
         matches!(expr, InstrCodegen::GetItem(_))
     }
@@ -345,15 +341,44 @@ pub fn instrument_bb_module_with_call_target_counters(
                     "global_indexed_fallback",
                 );
             }
-            if is_field_index_candidate(expr) {
-                let instr_id = expr.semantic_instr_id();
-                define_indexed_hit_fallback_counters(
-                    self.counters,
-                    self.function_id,
-                    instr_id,
-                    "field_indexed_hit",
-                    "field_indexed_fallback",
-                );
+            match expr {
+                InstrCodegen::GetAttr(_) => {
+                    let instr_id = expr.semantic_instr_id();
+                    define_indexed_hit_fallback_counters(
+                        self.counters,
+                        self.function_id,
+                        instr_id,
+                        "field_indexed_hit",
+                        "field_indexed_fallback",
+                    );
+                    self.counters.define_if_missing(
+                        CounterScope::This,
+                        "field_generic_getattr",
+                        CounterSite::Runtime {
+                            function_id: Some(self.function_id),
+                            instr_id: Some(instr_id),
+                        },
+                    );
+                }
+                InstrCodegen::SetAttr(_) => {
+                    let instr_id = expr.semantic_instr_id();
+                    define_indexed_hit_fallback_counters(
+                        self.counters,
+                        self.function_id,
+                        instr_id,
+                        "field_indexed_hit",
+                        "field_indexed_fallback",
+                    );
+                    self.counters.define_if_missing(
+                        CounterScope::This,
+                        "field_generic_setattr",
+                        CounterSite::Runtime {
+                            function_id: Some(self.function_id),
+                            instr_id: Some(instr_id),
+                        },
+                    );
+                }
+                _ => {}
             }
             if is_operator_specialization_candidate(expr) {
                 let instr_id = expr.semantic_instr_id();
