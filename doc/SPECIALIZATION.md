@@ -21,7 +21,8 @@ per-function `ExactIntBranchV3Artifacts`, and threads those artifacts through
 `FunctionSpecializationInputs`. Same-module profiled direct calls from
 `mod.optv3` are emitted as mechanical v3 direct-call decisions with validated
 ordinary-call argument plans; JIT validation checks those emitted decisions
-against the selected plan before deriving the codegen guard and target inputs.
+against the selected plan before deriving mechanical typed-call lowering input
+and direct-call target inputs.
 Constant-attribute indexed-field load/store selections from `type_keys` are
 also emitted as mechanical v3 indexed-field decisions; JIT validation checks
 those emitted decisions against the selected plan before deriving typed
@@ -60,8 +61,8 @@ Current migration surface:
   regions, so simple lowered code like `c = a + b; if c > 0: ...` can optimize
   the add store and the later branch as separate v3 regions. Same-module
   profiled direct calls are selected by v3, emitted as mechanical direct-call
-  decisions, and consumed as v3-owned codegen inputs. Constant-string indexed
-  fields are selected by v3 from raw `type_keys`, emitted as mechanical
+  decisions, and consumed through v3-owned typed-call lowering. Constant-string
+  indexed fields are selected by v3 from raw `type_keys`, emitted as mechanical
   indexed-field decisions, and consumed as v3-owned typed attribute inputs.
   Indexed globals are selected by v3 from raw `module_keys` plus lowered
   `NameLocation::Global(slot)` load/store sites, emitted with explicit
@@ -406,30 +407,25 @@ direct-call emissions. The offline v3 planner validates the lowered call site
 and target signature, then stores the direct-entry argument plan in the
 artifact. The JIT validates that the mechanical emission matches the selected
 plan and that each target exists in the loaded module, then consumes the
-emitted guard plan directly when constructing `FunctionSpecializationInputs`.
-V3 guard targets are used for direct-function predeclaration and process-JIT
-batch scheduling, but planner queries over legacy `FunctionProfileEvidence` do
-not see v3 direct-call targets. On the legacy path, compatible profiled targets
-become guarded ordinary-call, constructor-call, or method-call plans with the
-selected `FunctionId`, owner/type-version guard when needed, and direct-entry
-argument plan. A typed lowering pass turns guarded
-ordinary/constructor calls into `InstrTyped::GuardedCallableCallTyped` and
-guarded methods into `InstrTyped::GuardedMethodCallTyped`. The typed IR also has
-`InstrTyped::DirectCallGuardTest` for exact callee-function-id checks and
-owner/type-version checks, `InstrTyped::DirectCallableCallTyped` for direct
-ordinary-function and constructor-call arms, and
-`InstrTyped::DirectMethodCallTyped` for the direct arm of a method
-specialization where the receiver has already passed the owner/type-version
-guard. These are the explicit primitives that the next CFG rewrite will use
-when expanding guarded calls into guard/deopt plus direct-call arms.
-Incompatible call shapes keep the raw profiled target list instead. This
-keeps the guard selection visible in the typed value space rather than requiring
-codegen-only map lookups to rediscover it. The call-access annotator derives
-method names and simple call shapes from `InstrTyped` directly; legacy lowering
-is reserved for the later mechanical emission path. Result-demand planning runs
-after this typed call-access lowering so it sees the guarded-call/direct-call
-typed nodes, not only generic calls. The JIT emitter still materializes the
-full guarded call blocks today.
+emitted call plan directly when constructing `FunctionSpecializationInputs`.
+When preparing the typed function, v3 emitted calls are lowered mechanically to
+`InstrTyped::GuardedCallableCallTyped` before the legacy call-access annotator
+runs. V3 targets are also used for direct-function predeclaration,
+process-JIT batch scheduling, and the earlier BlockPy store-call rewrite, but
+planner queries over legacy `FunctionProfileEvidence` do not see v3 direct-call
+targets. On the legacy path, compatible profiled targets still become guarded
+ordinary-call, constructor-call, or method-call plans with the selected
+`FunctionId`, owner/type-version guard when needed, and direct-entry argument
+plan; the existing typed lowering pass then turns those access plans into
+guarded typed-call nodes. The typed IR also has `InstrTyped::DirectCallGuardTest`
+for exact callee-function-id checks and owner/type-version checks,
+`InstrTyped::DirectCallableCallTyped` for direct ordinary-function and
+constructor-call arms, and `InstrTyped::DirectMethodCallTyped` for the direct
+arm of a method specialization where the receiver has already passed the
+owner/type-version guard. Incompatible legacy call shapes keep the raw profiled
+target list instead. Result-demand planning runs after this typed call lowering
+so it sees the guarded-call/direct-call typed nodes, not only generic calls. The
+JIT emitter still materializes the full guarded call blocks today.
 
 ### Counted Input
 

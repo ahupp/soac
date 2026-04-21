@@ -114,9 +114,10 @@ Implemented:
   function identity matches the function being compiled. Same-module profiled
   direct-call decisions and ordinary-call argument plans are derived from the
   mechanical `mod.optv3` emission as v3-owned codegen inputs; the JIT consumes
-  the emitted guard shape directly and uses its targets only for direct-call
-  function predeclaration, module-plan direct-call rewrites, precompile target
-  lookup, and process-JIT batch scheduling, not as legacy profile evidence.
+  the emitted call plan through mechanical typed-call lowering and uses its
+  targets only for direct-call function predeclaration, module-plan direct-call
+  rewrites, precompile target lookup, and process-JIT batch scheduling, not as
+  legacy profile evidence.
   Indexed-field
   decisions are also derived from mechanical `mod.optv3` emission as v3-owned
   typed-attribute inputs, with exact plan/emission validation before use.
@@ -146,9 +147,9 @@ Partially migrated families are also intentionally visible:
   store-RHS-to-empty-compare shape;
 - profiled direct calls are represented as v3 plan selections plus mechanical
   direct-call emissions with validated ordinary-call argument plans and consumed
-  as JIT direct-call guard input for same-module targets, but the direct-call
-  lowering itself is still the existing typed lowering rather than a mechanical
-  v3 call node.
+  through mechanical typed-call lowering for same-module ordinary-function
+  targets. Cross-module targets, methods, and constructors are still outside
+  the v3 direct-call family.
 - indexed fields are represented as v3 plan selections plus mechanical
   indexed-field emissions. `soac_jit` now keeps the emitted access kind and
   attribute name separate from legacy per-instruction field evidence and
@@ -686,9 +687,9 @@ the branch exit demands `I32Bool01`. If a later Python-observable boundary needs
 9. Replace old site-local specializations incrementally.
    - Migrate exact-int operators first.
    - Then truthiness and materialization.
-   - Direct calls, indexed fields, and indexed globals are partially migrated as
-     v3-owned codegen inputs; lift their actual lowering into mechanical nodes
-     next.
+   - Direct calls are partially migrated through mechanical v3 typed lowering;
+     indexed fields and indexed globals are partially migrated as v3-owned
+     codegen inputs; lift their actual lowering into mechanical nodes next.
    - Then getitem/setitem.
    - Keep old paths until each replacement has structured tests and diagnostics.
 

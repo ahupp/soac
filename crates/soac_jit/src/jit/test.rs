@@ -4044,6 +4044,53 @@ def build(values):
     }
 
     #[test]
+    fn opt_v3_direct_call_emission_lowers_call_to_guarded_callable_mechanically() {
+        let mut constants = TestConstantPool::default();
+        let call_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
+        let target = RuntimeFunctionId::from_raw_parts(0, 7);
+        let call = with_instr_id(
+            op_expr(Call::new(
+                name_expr(test_runtime_name("callable")),
+                vec![CallArgPositional::Positional(constants.int_expr(1))],
+                Vec::<CallArgKeyword<InstrCodegen>>::new(),
+            )),
+            call_instr_id,
+        );
+        let function =
+            with_single_test_block(test_function(), vec![call], ret_term(constants.int_expr(2)));
+        let mut typed_function = lower_codegen_function_to_typed(function);
+        let direct_call_plan = OptV3DirectCallPlan {
+            source: call_instr_id,
+            target,
+            arg_plan: TypedDirectCallArgPlan {
+                sources: vec![TypedDirectCallArgSource::Provided(0)],
+            },
+            reason: "profiled direct call".to_string(),
+        };
+
+        assert_eq!(
+            lower_opt_v3_direct_call_emissions(
+                &mut typed_function,
+                &HashMap::from([(call_instr_id, vec![direct_call_plan])]),
+            ),
+            1
+        );
+
+        let Some(soac_lowering::passes::InstrTyped::GuardedCallableCallTyped(call)) =
+            typed_function.blocks[0].body.first()
+        else {
+            panic!("v3 direct-call emission should lower directly to guarded callable call");
+        };
+        assert!(call.constructor_guards.is_empty());
+        assert_eq!(call.function_guards.len(), 1);
+        assert_eq!(call.function_guards[0].function_id, target);
+        assert_eq!(
+            call.function_guards[0].arg_plan.sources,
+            vec![TypedDirectCallArgSource::Provided(0)]
+        );
+    }
+
+    #[test]
     fn typed_result_demand_extra_marks_direct_call_inputs_pyobject_borrowed_ok() {
         let mut constants = TestConstantPool::default();
         let call_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
@@ -16202,7 +16249,7 @@ def f(x):
             BuildSpecializedFunctionOptions {
                 specialization_inputs: Some(FunctionSpecializationInputs {
                     call_target_specializations: HashMap::new(),
-                    direct_function_call_guards: HashMap::new(),
+                    opt_v3_direct_calls_by_instr: HashMap::new(),
                     operator_specializations: HashMap::new(),
                     opt_v3_exact_list_items_by_instr: HashMap::new(),
                     field_index_specializations: HashMap::new(),
@@ -16396,7 +16443,7 @@ def f(x):
             BuildSpecializedFunctionOptions {
                 specialization_inputs: Some(FunctionSpecializationInputs {
                     call_target_specializations: HashMap::new(),
-                    direct_function_call_guards: HashMap::new(),
+                    opt_v3_direct_calls_by_instr: HashMap::new(),
                     operator_specializations: HashMap::new(),
                     opt_v3_exact_list_items_by_instr: HashMap::new(),
                     field_index_specializations: HashMap::new(),
@@ -16554,7 +16601,7 @@ def f(x):
                 BuildSpecializedFunctionOptions {
                     specialization_inputs: Some(FunctionSpecializationInputs {
                         call_target_specializations: HashMap::new(),
-                        direct_function_call_guards: HashMap::new(),
+                        opt_v3_direct_calls_by_instr: HashMap::new(),
                         operator_specializations: HashMap::new(),
                         opt_v3_exact_list_items_by_instr: HashMap::new(),
                         field_index_specializations: HashMap::new(),
@@ -16683,7 +16730,7 @@ def f(x):
                 BuildSpecializedFunctionOptions {
                     specialization_inputs: Some(FunctionSpecializationInputs {
                         call_target_specializations: HashMap::new(),
-                        direct_function_call_guards: HashMap::new(),
+                        opt_v3_direct_calls_by_instr: HashMap::new(),
                         operator_specializations: HashMap::new(),
                         opt_v3_exact_list_items_by_instr: HashMap::new(),
                         field_index_specializations: HashMap::new(),
@@ -16807,7 +16854,7 @@ def f(x):
             BuildSpecializedFunctionOptions {
                 specialization_inputs: Some(FunctionSpecializationInputs {
                     call_target_specializations: HashMap::new(),
-                    direct_function_call_guards: HashMap::new(),
+                    opt_v3_direct_calls_by_instr: HashMap::new(),
                     operator_specializations: HashMap::new(),
                     opt_v3_exact_list_items_by_instr: HashMap::new(),
                     field_index_specializations: HashMap::new(),
@@ -16982,18 +17029,20 @@ def f(x):
 
         assert_eq!(
             planned_inputs
-                .opt_v3_emitted_direct_function_guards
+                .opt_v3_emitted_direct_calls
                 .get(&caller_id)
                 .unwrap()
                 .get(&source)
                 .unwrap()
                 .first()
                 .unwrap(),
-            &soac_lowering::passes::TypedDirectFunctionCallGuard {
-                function_id: callee_id,
+            &OptV3DirectCallPlan {
+                source,
+                target: callee_id,
                 arg_plan: soac_lowering::passes::TypedDirectCallArgPlan {
                     sources: vec![soac_lowering::passes::TypedDirectCallArgSource::Provided(0)],
                 },
+                reason: "profiled direct call".to_string(),
             }
         );
         assert!(
@@ -17394,7 +17443,7 @@ def f(x):
         let source = first_indexed_global_access_source(function, access, name);
         FunctionSpecializationInputs {
             call_target_specializations: HashMap::new(),
-            direct_function_call_guards: HashMap::new(),
+            opt_v3_direct_calls_by_instr: HashMap::new(),
             operator_specializations: HashMap::new(),
             opt_v3_exact_list_items_by_instr: HashMap::new(),
             field_index_specializations: HashMap::new(),
@@ -17431,7 +17480,7 @@ def f(x):
             BuildSpecializedFunctionOptions {
                 specialization_inputs: Some(FunctionSpecializationInputs {
                     call_target_specializations: HashMap::new(),
-                    direct_function_call_guards: HashMap::new(),
+                    opt_v3_direct_calls_by_instr: HashMap::new(),
                     operator_specializations: HashMap::new(),
                     opt_v3_exact_list_items_by_instr: HashMap::new(),
                     field_index_specializations: HashMap::new(),
@@ -17535,7 +17584,7 @@ def f(x):
             BuildSpecializedFunctionOptions {
                 specialization_inputs: Some(FunctionSpecializationInputs {
                     call_target_specializations: HashMap::new(),
-                    direct_function_call_guards: HashMap::new(),
+                    opt_v3_direct_calls_by_instr: HashMap::new(),
                     operator_specializations: HashMap::new(),
                     opt_v3_exact_list_items_by_instr: HashMap::new(),
                     field_index_specializations: HashMap::new(),
@@ -18301,21 +18350,23 @@ def write_point(point, value):
         let mut planned_evidence = HashMap::new();
         planned_evidence.insert(caller_id, legacy_evidence);
 
-        let v3_guard = soac_lowering::passes::TypedDirectFunctionCallGuard {
-            function_id: v3_target,
+        let v3_plan = OptV3DirectCallPlan {
+            source,
+            target: v3_target,
             arg_plan: soac_lowering::passes::TypedDirectCallArgPlan {
                 sources: vec![soac_lowering::passes::TypedDirectCallArgSource::Provided(0)],
             },
+            reason: "profiled direct call".to_string(),
         };
-        let mut opt_v3_emitted_direct_function_guards = HashMap::new();
-        opt_v3_emitted_direct_function_guards
-            .insert(caller_id, HashMap::from([(source, vec![v3_guard.clone()])]));
+        let mut opt_v3_emitted_direct_calls = HashMap::new();
+        opt_v3_emitted_direct_calls
+            .insert(caller_id, HashMap::from([(source, vec![v3_plan.clone()])]));
 
         let profile = SpecializationProfile {
             module_name: None,
             counter_dump_path: None,
             planned_evidence,
-            opt_v3_emitted_direct_function_guards,
+            opt_v3_emitted_direct_calls,
             opt_v3_emitted_exact_list_items: HashMap::new(),
             opt_v3_emitted_indexed_fields: HashMap::new(),
             opt_v3_emitted_indexed_globals: HashMap::new(),
@@ -18336,11 +18387,11 @@ def write_point(point, value):
         );
         assert_eq!(
             profile
-                .codegen_direct_function_call_guards(caller_id)
+                .codegen_opt_v3_direct_calls(caller_id)
                 .get(&source)
                 .unwrap(),
-            &vec![v3_guard],
-            "codegen guard inputs should consume the emitted v3 argument plan"
+            &vec![v3_plan],
+            "codegen direct-call inputs should consume the emitted v3 argument plan"
         );
         assert_eq!(
             profile
@@ -22365,19 +22416,21 @@ def f(x, y):
             module_name_gen,
             vec![callee_function.clone(), caller_function.clone()],
         );
-        let v3_guard = TypedDirectFunctionCallGuard {
-            function_id: callee_function.function_id,
+        let v3_plan = OptV3DirectCallPlan {
+            source: call_instr_id,
+            target: callee_function.function_id,
             arg_plan: TypedDirectCallArgPlan {
                 sources: vec![TypedDirectCallArgSource::Provided(0)],
             },
+            reason: "profiled direct call".to_string(),
         };
         let profile = SpecializationProfile {
             module_name: Some(module_name),
             counter_dump_path: None,
             planned_evidence: HashMap::new(),
-            opt_v3_emitted_direct_function_guards: HashMap::from([(
+            opt_v3_emitted_direct_calls: HashMap::from([(
                 caller_function.function_id,
-                HashMap::from([(call_instr_id, vec![v3_guard])]),
+                HashMap::from([(call_instr_id, vec![v3_plan])]),
             )]),
             opt_v3_emitted_exact_list_items: HashMap::new(),
             opt_v3_emitted_indexed_fields: HashMap::new(),
