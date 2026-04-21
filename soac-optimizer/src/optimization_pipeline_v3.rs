@@ -11,8 +11,8 @@ use crate::optimization_region_v3::{
 };
 use anyhow::{Context, Result, anyhow, bail};
 use soac_core::block_py::{
-    BlockLabel, BlockPyFunction, BlockPyModule, LocalFunctionId, SerializedFunctionId,
-    SerializedModuleId,
+    BlockLabel, BlockPyFunction, BlockPyModule, InstrId, LocalFunctionId, RuntimeModuleId,
+    SerializedFunctionId, SerializedModuleId,
 };
 use soac_lowering::codegen_cache::{
     CachedCodegenModule, CachedCodegenModuleMetadata, load_codegen_module_cache,
@@ -146,6 +146,11 @@ pub fn plan_and_emit_module_v3_from_raw_evidence(
         functions.push(FunctionPlanRequest {
             function: function_plan_identity_v3(function),
             regions: region_requests,
+            direct_call_targets: direct_call_targets_from_same_module_evidence_v3(
+                SerializedModuleId::new(0),
+                function.function_id.runtime_module_id(),
+                &evidence,
+            ),
         });
         diagnostics_by_function.push(diagnostics);
     }
@@ -184,6 +189,11 @@ pub fn plan_and_emit_extracted_exact_int_branches_v3(
         ModulePlanRequest {
             module,
             functions: vec![FunctionPlanRequest {
+                direct_call_targets: direct_call_targets_from_same_module_evidence_v3(
+                    function.function.module_id(),
+                    RuntimeModuleId::new(function.function.module_id().as_u32()),
+                    evidence,
+                ),
                 function,
                 regions: region_requests,
             }],
@@ -205,6 +215,32 @@ fn function_plan_identity_v3(
             LocalFunctionId::new(function.function_id.local_function_id().as_u32()),
         ),
         debug_name: Some(function.names.qualname.clone()),
+    }
+}
+
+fn direct_call_targets_from_same_module_evidence_v3(
+    serialized_module_id: SerializedModuleId,
+    runtime_module_id: RuntimeModuleId,
+    evidence: &FunctionProfileEvidence,
+) -> HashMap<InstrId, Vec<SerializedFunctionId>> {
+    let mut targets_by_source = HashMap::new();
+    for (source, targets) in &evidence.call_target_specializations {
+        for target in targets {
+            if target.runtime_module_id() != runtime_module_id {
+                continue;
+            }
+            push_unique(
+                targets_by_source.entry(*source).or_insert_with(Vec::new),
+                SerializedFunctionId::new(serialized_module_id, target.local_function_id()),
+            );
+        }
+    }
+    targets_by_source
+}
+
+fn push_unique<T: PartialEq>(values: &mut Vec<T>, value: T) {
+    if !values.contains(&value) {
+        values.push(value);
     }
 }
 
@@ -312,8 +348,8 @@ mod tests {
     use crate::optimization_region_v3::{ExtractedValueId, extract_block_region_v3};
     use soac_core::block_py::{
         BinOp, BinOpKind, Block, BlockLabel, BlockParam, BlockPyName, BlockTerm, InstrId, Load,
-        LocalFunctionId, LocalLocation, Meta, NameLocation, ResolvedName, SerializedFunctionId,
-        SerializedModuleId, TermIf, WithMeta,
+        LocalFunctionId, LocalLocation, Meta, NameLocation, ResolvedName, RuntimeFunctionId,
+        SerializedFunctionId, SerializedModuleId, TermIf, WithMeta,
     };
     use soac_lowering::passes::InstrCodegen;
     use soac_optimization::operator_specialization::{ExactTypeTag, pack_binary_shape};
@@ -419,6 +455,37 @@ mod tests {
         assert_eq!(artifacts.plan.functions[0].regions.len(), 2);
         assert_eq!(artifacts.emission.functions[0].regions.len(), 2);
         assert!(artifacts.plan.functions[0].diagnostics.is_empty());
+    }
+
+    #[test]
+    fn direct_call_evidence_is_carried_into_v3_plan() {
+        let source = instr_id(9);
+        let mut evidence = FunctionProfileEvidence::default();
+        evidence.call_target_specializations.insert(
+            source,
+            vec![
+                RuntimeFunctionId::from_raw_parts(0, 2),
+                RuntimeFunctionId::from_raw_parts(99, 3),
+            ],
+        );
+
+        let artifacts = plan_and_emit_extracted_exact_int_branches_v3(
+            &AlternativeCatalog::default_v3(),
+            module_identity(),
+            function_identity(),
+            Vec::new(),
+            &evidence,
+            &HashMap::new(),
+        )
+        .unwrap();
+
+        let direct_calls = &artifacts.plan.functions[0].direct_calls;
+        assert_eq!(direct_calls.len(), 1);
+        assert_eq!(direct_calls[0].source, source);
+        assert_eq!(
+            direct_calls[0].target,
+            SerializedFunctionId::new(SerializedModuleId::new(0), LocalFunctionId::new(2))
+        );
     }
 
     #[test]

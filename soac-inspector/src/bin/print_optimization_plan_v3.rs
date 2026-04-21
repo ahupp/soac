@@ -2,6 +2,10 @@ use anyhow::{Result, anyhow, bail};
 use soac_optimization::optimization_artifacts_v3::{
     ExactIntBranchV3Artifacts, load_optimization_artifacts_v3,
 };
+use soac_optimization::optimization_emit_v3::{
+    MechanicalFunctionEmission, MechanicalRegionEmission,
+};
+use soac_optimization::optimization_plan_v3::{RegionId, RegionPlan};
 use std::env;
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -9,6 +13,12 @@ use std::path::PathBuf;
 #[derive(Debug, Default)]
 struct Args {
     plan: Option<PathBuf>,
+    details: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct FormatOptions {
+    details: bool,
 }
 
 fn main() {
@@ -29,7 +39,15 @@ fn run_with_args(args: impl IntoIterator<Item = OsString>) -> Result<()> {
         .as_deref()
         .ok_or_else(|| anyhow!("missing required --plan <mod.optv3>"))?;
     let artifacts = load_optimization_artifacts_v3(path)?;
-    print!("{}", format_optimization_artifacts_v3(&artifacts));
+    print!(
+        "{}",
+        format_optimization_artifacts_v3_with_options(
+            &artifacts,
+            FormatOptions {
+                details: args.details,
+            },
+        )
+    );
     Ok(())
 }
 
@@ -42,6 +60,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Args> {
             .ok_or_else(|| anyhow!("non-UTF-8 argument is unsupported: {arg:?}"))?;
         match flag {
             "--plan" => parsed.plan = Some(next_path(&mut args, flag)?),
+            "--details" => parsed.details = true,
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);
@@ -59,10 +78,17 @@ fn next_path(args: &mut impl Iterator<Item = OsString>, flag: &str) -> Result<Pa
 }
 
 fn print_usage() {
-    println!("usage: print_optimization_plan_v3 --plan <mod.optv3>");
+    println!("usage: print_optimization_plan_v3 --plan <mod.optv3> [--details]");
 }
 
 fn format_optimization_artifacts_v3(artifacts: &ExactIntBranchV3Artifacts) -> String {
+    format_optimization_artifacts_v3_with_options(artifacts, FormatOptions::default())
+}
+
+fn format_optimization_artifacts_v3_with_options(
+    artifacts: &ExactIntBranchV3Artifacts,
+    options: FormatOptions,
+) -> String {
     let mut out = String::new();
     let plan = &artifacts.plan;
     out.push_str(&format!(
@@ -79,11 +105,12 @@ fn format_optimization_artifacts_v3(artifacts: &ExactIntBranchV3Artifacts) -> St
         artifacts.emission.functions.len()
     ));
     for function in &plan.functions {
-        let emitted_regions = artifacts
+        let emitted_function = artifacts
             .emission
             .functions
             .iter()
-            .find(|emitted| emitted.function == function.function.function)
+            .find(|emitted| emitted.function == function.function.function);
+        let emitted_regions = emitted_function
             .map(|emitted| emitted.regions.len())
             .unwrap_or(0);
         out.push_str(&format!(
@@ -96,10 +123,11 @@ fn format_optimization_artifacts_v3(artifacts: &ExactIntBranchV3Artifacts) -> St
         ));
         out.push_str(&format!(" id={}\n", function.function.function));
         out.push_str(&format!(
-            "  regions={} emitted_regions={} scalar_threads={} deopt_points={} ownership_actions={} diagnostics={}\n",
+            "  regions={} emitted_regions={} scalar_threads={} direct_calls={} deopt_points={} ownership_actions={} diagnostics={}\n",
             function.regions.len(),
             emitted_regions,
             function.scalar_threads.len(),
+            function.direct_calls.len(),
             function.deopt_points.len(),
             function.ownership.actions.len(),
             function.diagnostics.len()
@@ -112,11 +140,20 @@ fn format_optimization_artifacts_v3(artifacts: &ExactIntBranchV3Artifacts) -> St
                 region.nodes.len(),
                 region.exits.len()
             ));
+            if options.details {
+                format_region_details(&mut out, region, emitted_function);
+            }
         }
         for thread in &function.scalar_threads {
             out.push_str(&format!(
                 "  scalar_thread local={} producer={:?} consumer={:?} fallback={:?}\n",
                 thread.local.name, thread.producer, thread.consumer, thread.fallback
+            ));
+        }
+        for direct_call in &function.direct_calls {
+            out.push_str(&format!(
+                "  direct_call source={} target={} reason={}\n",
+                direct_call.source, direct_call.target, direct_call.reason
             ));
         }
         for diagnostic in &function.diagnostics {
@@ -127,6 +164,57 @@ fn format_optimization_artifacts_v3(artifacts: &ExactIntBranchV3Artifacts) -> St
         }
     }
     out
+}
+
+fn format_region_details(
+    out: &mut String,
+    region: &RegionPlan,
+    emitted_function: Option<&MechanicalFunctionEmission>,
+) {
+    out.push_str(&format!("    source={:?}\n", region.source));
+    for input in &region.inputs {
+        out.push_str(&format!(
+            "    input {:?}: {:?} <- {:?}\n",
+            input.value.id, input.value.rep, input.source
+        ));
+    }
+    for node in &region.nodes {
+        out.push_str(&format!(
+            "    node {:?} source={:?}: {:?}\n",
+            node.id, node.source, node.kind
+        ));
+    }
+    for exit in &region.exits {
+        out.push_str(&format!(
+            "    exit source={:?}: {:?}\n",
+            exit.source, exit.kind
+        ));
+    }
+    if let Some(emitted_region) = emitted_region_for_plan_region(emitted_function, region.id) {
+        out.push_str("    emitted:\n");
+        for step in &emitted_region.steps {
+            out.push_str(&format!(
+                "      step {:?} source={:?}: {:?}\n",
+                step.node, step.source, step.op
+            ));
+        }
+        for exit in &emitted_region.exits {
+            out.push_str(&format!(
+                "      exit source={:?}: {:?}\n",
+                exit.source, exit.kind
+            ));
+        }
+    }
+}
+
+fn emitted_region_for_plan_region(
+    emitted_function: Option<&MechanicalFunctionEmission>,
+    region: RegionId,
+) -> Option<&MechanicalRegionEmission> {
+    emitted_function?
+        .regions
+        .iter()
+        .find(|emitted| emitted.region == region)
 }
 
 #[cfg(test)]
@@ -161,6 +249,7 @@ mod test {
                     },
                     regions: Vec::new(),
                     scalar_threads: Vec::new(),
+                    direct_calls: Vec::new(),
                     deopt_points: Vec::new(),
                     ownership: FunctionOwnershipPlan::default(),
                     diagnostics: Vec::new(),
@@ -179,6 +268,6 @@ mod test {
         let formatted = format_optimization_artifacts_v3(&artifacts);
         assert!(formatted.contains("module pkg.mod source_hash=0x0000000000001234"));
         assert!(formatted.contains("function f"));
-        assert!(formatted.contains("regions=0 emitted_regions=0 scalar_threads=0"));
+        assert!(formatted.contains("regions=0 emitted_regions=0 scalar_threads=0 direct_calls=0"));
     }
 }

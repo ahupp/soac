@@ -38,7 +38,9 @@ mod tests {
         PlannedAction, PlannedAlternative, PlannedFallback, PlannedFunctionTarget, PlannedGuard,
         PlannedIndexedFieldSpecialization, PlannedReplacement, PlannedTypeKey, ShapeFamily,
     };
-    use soac_optimization::optimization_plan_v3::{FunctionPlanIdentity, ModulePlanIdentity};
+    use soac_optimization::optimization_plan_v3::{
+        DirectCallSpecializationPlan, FunctionPlanIdentity, ModulePlanIdentity,
+    };
     use soac_optimizer::optimization_alternatives_v3::AlternativeCatalog;
     use soac_optimizer::optimization_pipeline_v3::plan_and_emit_function_exact_int_branches_v3_with_module_constants;
     use soac_profile::{
@@ -3087,6 +3089,7 @@ def build(values):
                         },
                         regions: Vec::new(),
                         scalar_threads: Vec::new(),
+                        direct_calls: Vec::new(),
                         deopt_points: Vec::new(),
                         ownership:
                             soac_optimization::optimization_plan_v3::FunctionOwnershipPlan::default(
@@ -16575,6 +16578,7 @@ def f(x):
                         },
                         regions: Vec::new(),
                         scalar_threads: Vec::new(),
+                        direct_calls: Vec::new(),
                         deopt_points: Vec::new(),
                         ownership:
                             soac_optimization::optimization_plan_v3::FunctionOwnershipPlan::default(
@@ -16610,6 +16614,77 @@ def f(x):
                 .function
                 .local_function_id(),
             function.function_id.local_function_id()
+        );
+    }
+
+    #[test]
+    fn planned_precompile_inputs_convert_v3_direct_call_sidecars() {
+        let module_name_gen = ModuleNameGen::new(7);
+        let caller = test_function_in_module(&module_name_gen, "caller");
+        let callee = test_function_in_module(&module_name_gen, "callee");
+        let caller_id = caller.function_id;
+        let callee_id = callee.function_id;
+        let module = test_module(module_name_gen, vec![caller, callee]);
+        let source = InstrId::new(BlockLabel::from_index(0), 11);
+        let serialized_caller =
+            SerializedFunctionId::new(SerializedModuleId::new(0), caller_id.local_function_id());
+        let serialized_callee =
+            SerializedFunctionId::new(SerializedModuleId::new(0), callee_id.local_function_id());
+        let artifacts = ExactIntBranchV3Artifacts {
+            plan: ModuleOptimizationPlanV3 {
+                module: ModulePlanIdentity {
+                    module_name: "test".to_string(),
+                    source_hash: 0,
+                    cache_identity: "test-cache".to_string(),
+                },
+                helper_catalog_version: 1,
+                cost_model_version: 1,
+                functions: vec![
+                    soac_optimization::optimization_plan_v3::FunctionOptimizationPlanV3 {
+                        function: FunctionPlanIdentity {
+                            function: serialized_caller,
+                            debug_name: Some("caller".to_string()),
+                        },
+                        regions: Vec::new(),
+                        scalar_threads: Vec::new(),
+                        direct_calls: vec![DirectCallSpecializationPlan {
+                            source,
+                            target: serialized_callee,
+                            reason: "profiled direct call".to_string(),
+                        }],
+                        deopt_points: Vec::new(),
+                        ownership:
+                            soac_optimization::optimization_plan_v3::FunctionOwnershipPlan::default(
+                            ),
+                        diagnostics: Vec::new(),
+                    },
+                ],
+            },
+            emission: MechanicalModuleEmission {
+                module_name: "test".to_string(),
+                functions: vec![
+                    soac_optimization::optimization_emit_v3::MechanicalFunctionEmission {
+                        function: serialized_caller,
+                        debug_name: Some("caller".to_string()),
+                        regions: Vec::new(),
+                    },
+                ],
+            },
+        };
+
+        let planned_inputs =
+            planned_optimization_inputs_from_v3_artifacts_for_codegen_module(&artifacts, &module)
+                .unwrap();
+
+        assert_eq!(
+            planned_inputs
+                .evidence_by_function
+                .get(&caller_id)
+                .unwrap()
+                .call_target_specializations
+                .get(&source)
+                .unwrap(),
+            &vec![callee_id]
         );
     }
 

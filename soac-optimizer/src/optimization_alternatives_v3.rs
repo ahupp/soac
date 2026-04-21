@@ -1624,6 +1624,7 @@ mod tests {
                     },
                     regions: vec![hot_region, fallback_region],
                     scalar_threads: Vec::new(),
+                    direct_calls: Vec::new(),
                     deopt_points: Vec::new(),
                     ownership:
                         soac_optimization::optimization_plan_v3::FunctionOwnershipPlan::default(),

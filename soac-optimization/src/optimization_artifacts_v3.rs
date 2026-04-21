@@ -5,7 +5,7 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
 
-const OPTIMIZATION_ARTIFACTS_V3_FORMAT_VERSION: u32 = 1;
+const OPTIMIZATION_ARTIFACTS_V3_FORMAT_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct ExactIntBranchV3Artifacts {

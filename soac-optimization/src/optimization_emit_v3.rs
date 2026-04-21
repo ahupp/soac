@@ -349,6 +349,7 @@ mod tests {
                     }],
                 }],
                 scalar_threads: Vec::new(),
+                direct_calls: Vec::new(),
                 deopt_points: Vec::new(),
                 ownership: FunctionOwnershipPlan::default(),
                 diagnostics: Vec::new(),

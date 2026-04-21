@@ -82,8 +82,9 @@ Implemented:
   `return a + b`/`return a - b`/`return a * b` arithmetic returns,
   `return a & b`/`return a | b`/`return a ^ b` bitwise returns, and
   `return a < b` comparison returns, producing hot and local-fallback
-  `RegionPlan`s. It also records a scalar-thread candidate when a compact-int
-  store RHS feeds the immediately following local comparison.
+  `RegionPlan`s. It also records a scalar-thread sidecar when a compact-int
+  store RHS feeds the immediately following local comparison, and same-module
+  profiled direct-call sidecars from `call_hot_targets`.
 - `soac-optimization::optimization_emit_v3`: validation-gated mechanical
   emitter over selected v3 plan nodes and exits.
 - `soac-optimizer::optimization_evidence_v3`: bridge from existing
@@ -94,29 +95,45 @@ Implemented:
 - `decide_optimizations --mode v3`: offline planner mode that reads cached
   unoptimized `mod.blockpy` plus `profile.bin`, derives v3 facts directly from
   raw profile evidence, and writes a serialized `mod.optv3` artifact.
-- `print_optimization_plan_v3`: inspection summary for serialized v3 artifacts.
+- `print_optimization_plan_v3`: inspection summary for serialized v3 artifacts,
+  with `--details` showing region inputs, plan nodes, exits, mechanical
+  emission steps, scalar threads, and direct-call sidecars.
 - JIT `verify`/`apply` loading prefers `mod.optv3`, validates module identity,
   splits module-level artifacts into per-function mechanical artifacts, and only
   falls back to legacy `mod.opt` when no v3 artifact is present.
 - Offline precompile also prefers `mod.optv3` artifacts when available.
 - `FunctionSpecializationInputs`: carries validated exact-int branch v3
   artifacts into the JIT build path, where codegen validates that the artifact
-  function identity matches the function being compiled.
+  function identity matches the function being compiled. Same-module profiled
+  direct-call sidecars are also converted from `mod.optv3` into the existing
+  direct-call specialization input map.
 - JIT term lowering now consumes matching exact-int direct-compare branch,
   add/compare branch, add/sub/mul/bitwise-return, and comparison-return
   artifacts by interpreting the mechanical hot region and its local generic
   fallback. Unsupported or absent v3 regions continue through the existing
   lowering path.
+- JIT term lowering consumes the initial scalar-thread sidecar for the
+  conservative adjacent shape: a planned store-RHS region with no visible
+  side effects before the store, followed immediately by an empty comparison
+  block that reloads the same local. On the fast path this lets the stored
+  value remain as an unboxed scalar until a Python object is required; guard
+  misses or overflow still enter the local fallback region that performs the
+  original store before branching.
 
 Remaining legacy-only families are intentionally visible:
 
-- live JIT consumption of scalar-thread candidates; the plan sidecar exists,
-  but codegen still needs path-aware local state before it can omit
-  materializing a stored local such as `c`;
 - remaining division/modulo/shift and unary exact-int value-producing operators;
-- profiled direct calls;
 - exact-list getitem/setitem;
 - indexed globals and indexed fields.
+
+Partially migrated families are also intentionally visible:
+
+- scalar-threading is only implemented for the adjacent, no-exception,
+  store-RHS-to-empty-compare shape;
+- profiled direct calls are represented as v3 sidecars and consumed as JIT
+  direct-call specialization input for same-module targets, but the direct-call
+  lowering itself is still the existing typed lowering rather than a mechanical
+  v3 call node.
 
 Branch locality and cold block hints remain layout metadata for now, not v3
 semantic plan targets.
@@ -126,6 +143,32 @@ Current integration target:
 - Expand v3 coverage while keeping `mod.optv3` as the source of truth for v3.
 - Stop generating or consuming legacy `mod.opt` once v3 covers the required
   optimization families.
+
+Scalar-thread generalization notes:
+
+- Treat scalar value threading as a generic rewrite over planned values and
+  local state, not as a special case in codegen. A producer region exposes a
+  value in a cheaper representation, a later consumer requests that semantic
+  value, and validation proves that every intervening path either keeps the
+  scalar available or materializes the Python object before it can be observed.
+- The next generalization is beyond the current adjacent-block shape: allow a
+  single-predecessor continuation path with intervening non-consuming nodes,
+  then allow exception-bearing or cleanup-bearing paths only after the plan
+  records where the local must be materialized before visible side effects,
+  destructor-observable refcount changes, or deopt replay.
+- The scalar-thread plan should name the producer value, consumer use, local
+  slot, dominance/path condition, materialization point, and fallback region.
+  Validation should reject duplicate consumers, ambiguous local writes, missing
+  materialization before Python-object use, or a fallback path that would skip
+  the original store.
+- Costing should remain ordinary v3 costing: the rewrite saves unbox/box/load
+  work on the hot path, but adds validation and materialization obligations.
+  If those obligations are not explicit and cheap enough, the alternative
+  should decline rather than relying on codegen cleanup.
+- Regression tests for further scalar-threading should assert structured plan
+  and JIT input facts, not rendered CLIF text: producer and consumer refs,
+  fallback region, materialization reason, and that direct lowering can still
+  execute the original Python store on any miss path.
 
 
 ## Isolated Model

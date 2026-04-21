@@ -332,6 +332,7 @@ def print_optimization_plans_v3(counters_dir: Path) -> str:
             "print_optimization_plan_v3",
             "--plan",
             str(plan_path),
+            "--details",
         ).stdout
         rendered.append(f"# {plan_path}\n{plan_text.rstrip()}\n")
     return "\n".join(rendered)

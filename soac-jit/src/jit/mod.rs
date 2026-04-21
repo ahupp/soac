@@ -88,10 +88,11 @@ use soac_optimization::optimization_plan::{
     load_optimization_plan,
 };
 use soac_optimization::optimization_plan_v3::{
-    ConversionKind, FailureMode, FallbackTarget, GuardFailure, GuardKind, MaterializeKind,
-    ModuleOptimizationPlanV3, PlanNodeId, PlanValue, PlannedConstant, RegionExitTarget, RegionId,
-    RegionInputSource, RegionPlan, Rep, RichCompareOp, ScalarLocalThreadPlan, ScalarThreadFallback,
-    ScalarThreadLocalLocation, ScalarThreadMaterialization,
+    ConversionKind, FailureMode, FallbackTarget, FunctionOptimizationPlanV3, GuardFailure,
+    GuardKind, MaterializeKind, ModuleOptimizationPlanV3, PlanNodeId, PlanValue, PlannedConstant,
+    RegionExitTarget, RegionId, RegionInputSource, RegionPlan, Rep, RichCompareOp,
+    ScalarLocalThreadPlan, ScalarThreadFallback, ScalarThreadLocalLocation,
+    ScalarThreadMaterialization,
 };
 use soac_profile::{CollectedTypeKeyLayout, CounterDumpTypeKey, read_block_entry_counts_from_file};
 #[cfg(test)]
@@ -13294,6 +13295,15 @@ fn planned_optimization_inputs_from_v3_artifacts(
             current_function,
             Some(&function_artifacts),
         )?;
+        if let Some(evidence) = opt_v3_direct_call_evidence_for_function(
+            planned_function,
+            RuntimeModuleId::new(shared_state.module_id()),
+            |target| shared_state.lookup_function(target).is_some(),
+        )? {
+            inputs
+                .evidence_by_function
+                .insert(current_function_id, evidence);
+        }
         inputs
             .opt_v3_exact_int_branch_artifacts
             .insert(current_function_id, Arc::new(function_artifacts));
@@ -13335,11 +13345,61 @@ fn planned_optimization_inputs_from_v3_artifacts_for_codegen_module(
             current_function,
             Some(&function_artifacts),
         )?;
+        if let Some(evidence) =
+            opt_v3_direct_call_evidence_for_function(planned_function, module_id, |target| {
+                module
+                    .callable_defs
+                    .iter()
+                    .any(|function| function.function_id == target)
+            })?
+        {
+            inputs
+                .evidence_by_function
+                .insert(current_function_id, evidence);
+        }
         inputs
             .opt_v3_exact_int_branch_artifacts
             .insert(current_function_id, Arc::new(function_artifacts));
     }
     Ok(inputs)
+}
+
+fn opt_v3_direct_call_evidence_for_function(
+    planned_function: &FunctionOptimizationPlanV3,
+    runtime_module_id: RuntimeModuleId,
+    target_exists: impl Fn(RuntimeFunctionId) -> bool,
+) -> Result<Option<FunctionProfileEvidence>, String> {
+    if planned_function.direct_calls.is_empty() {
+        return Ok(None);
+    }
+
+    let mut evidence = FunctionProfileEvidence::default();
+    for direct_call in &planned_function.direct_calls {
+        if direct_call.target.module_id() != planned_function.function.function.module_id() {
+            return Err(format!(
+                "optimization plan v3 direct-call target {} at {} is outside function module {}",
+                direct_call.target,
+                direct_call.source,
+                planned_function.function.function.module_id()
+            ));
+        }
+        let target =
+            RuntimeFunctionId::new(runtime_module_id, direct_call.target.local_function_id());
+        if !target_exists(target) {
+            return Err(format!(
+                "optimization plan v3 direct-call target {} at {} does not exist in runtime module {}",
+                direct_call.target, direct_call.source, runtime_module_id
+            ));
+        }
+        let targets = evidence
+            .call_target_specializations
+            .entry(direct_call.source)
+            .or_default();
+        if !targets.contains(&target) {
+            targets.push(target);
+        }
+    }
+    Ok(Some(evidence))
 }
 
 fn opt_v3_single_function_artifacts(

@@ -4,16 +4,18 @@ use crate::optimization_alternatives_v3::{
 use crate::optimization_region_v3::{
     ExtractedExit, ExtractedRegion, ExtractedValue, ExtractedValueId, ExtractedValueKind,
 };
-use soac_core::block_py::{BinOpKind, InstrId, NameLike, NameLocation, ResolvedName};
+use soac_core::block_py::{
+    BinOpKind, InstrId, NameLike, NameLocation, ResolvedName, SerializedFunctionId,
+};
 use soac_optimization::optimization_plan_v3::{
-    ConversionKind, ConversionOwnership, ConversionPrecondition, ConvertNode, Cost, FailureMode,
-    FallbackReason, FallbackTarget, FunctionOptimizationPlanV3, FunctionOwnershipPlan,
-    FunctionPlanIdentity, MaterializeKind, MaterializeNode, ModuleOptimizationPlanV3,
-    ModulePlanIdentity, OperationNode, PlanDiagnostic, PlanNode, PlanNodeId, PlanNodeKind,
-    PlanValue, PlannedConstant, RegionExitKind, RegionExitPlan, RegionExitTarget, RegionId,
-    RegionInput, RegionInputSource, RegionPlan, RegionSource, RegionValueRef, Rep,
-    ScalarLocalThreadPlan, ScalarThreadFallback, ScalarThreadLocal, ScalarThreadLocalLocation,
-    ScalarThreadMaterialization,
+    ConversionKind, ConversionOwnership, ConversionPrecondition, ConvertNode, Cost,
+    DirectCallSpecializationPlan, FailureMode, FallbackReason, FallbackTarget,
+    FunctionOptimizationPlanV3, FunctionOwnershipPlan, FunctionPlanIdentity, MaterializeKind,
+    MaterializeNode, ModuleOptimizationPlanV3, ModulePlanIdentity, OperationNode, PlanDiagnostic,
+    PlanNode, PlanNodeId, PlanNodeKind, PlanValue, PlannedConstant, RegionExitKind, RegionExitPlan,
+    RegionExitTarget, RegionId, RegionInput, RegionInputSource, RegionPlan, RegionSource,
+    RegionValueRef, Rep, ScalarLocalThreadPlan, ScalarThreadFallback, ScalarThreadLocal,
+    ScalarThreadLocalLocation, ScalarThreadMaterialization,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -27,6 +29,7 @@ pub struct ModulePlanRequest {
 pub struct FunctionPlanRequest {
     pub function: FunctionPlanIdentity,
     pub regions: Vec<ExtractedRegionPlanRequest>,
+    pub direct_call_targets: HashMap<InstrId, Vec<SerializedFunctionId>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -80,10 +83,12 @@ pub fn plan_function_optimization_v3(
     request: FunctionPlanRequest,
 ) -> FunctionOptimizationPlanV3 {
     let region_requests = request.regions;
+    let direct_calls = plan_direct_call_specializations_v3(&request.direct_call_targets);
     let mut function = FunctionOptimizationPlanV3 {
         function: request.function,
         regions: Vec::new(),
         scalar_threads: Vec::new(),
+        direct_calls,
         deopt_points: Vec::new(),
         ownership: FunctionOwnershipPlan::default(),
         diagnostics: Vec::new(),
@@ -106,6 +111,27 @@ pub fn plan_function_optimization_v3(
 
     function.scalar_threads = plan_scalar_local_threads_v3(&region_requests, &function.regions);
     function
+}
+
+fn plan_direct_call_specializations_v3(
+    targets_by_source: &HashMap<InstrId, Vec<SerializedFunctionId>>,
+) -> Vec<DirectCallSpecializationPlan> {
+    let mut entries = targets_by_source.iter().collect::<Vec<_>>();
+    entries.sort_by_key(|(source, _)| **source);
+    let mut plans = Vec::new();
+    for (source, targets) in entries {
+        let mut targets = targets.clone();
+        targets.sort();
+        targets.dedup();
+        for target in targets {
+            plans.push(DirectCallSpecializationPlan {
+                source: *source,
+                target,
+                reason: "profiled call_hot_targets selected this same-module function".to_string(),
+            });
+        }
+    }
+    plans
 }
 
 fn plan_compact_int_branch(
@@ -1488,8 +1514,28 @@ mod tests {
                     debug_name: Some("f".to_string()),
                 },
                 regions,
+                direct_call_targets: HashMap::new(),
             }],
         }
+    }
+
+    #[test]
+    fn plans_same_module_direct_call_sidecar_from_profiled_targets() {
+        let mut request = module_request_regions(Vec::new());
+        let source = InstrId::new(label(0), 9);
+        let target = SerializedFunctionId::new(SerializedModuleId::new(0), LocalFunctionId::new(2));
+        request.functions[0]
+            .direct_call_targets
+            .insert(source, vec![target, target]);
+
+        let plan = plan_module_optimization_v3(&AlternativeCatalog::default_v3(), request);
+
+        validate_module_plan_v3(&plan).unwrap();
+        let direct_calls = &plan.functions[0].direct_calls;
+        assert_eq!(direct_calls.len(), 1);
+        assert_eq!(direct_calls[0].source, source);
+        assert_eq!(direct_calls[0].target, target);
+        assert!(direct_calls[0].reason.contains("call_hot_targets"));
     }
 
     #[test]

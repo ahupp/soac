@@ -31,8 +31,8 @@ pub const V3_OPTIMIZATION_FAMILY_STATUS: &[V3OptimizationFamilyStatus] = &[
     V3OptimizationFamilyStatus {
         family: "profiled direct calls",
         legacy_input: "call_hot_targets",
-        status: V3MigrationStatus::LegacyOnly,
-        next_step: "model call alternatives, argument ownership, and callable guard failure policy",
+        status: V3MigrationStatus::LiveCodegenInputOnly,
+        next_step: "lift direct-call lowering itself into mechanical v3 nodes and add cross-module target support",
     },
     V3OptimizationFamilyStatus {
         family: "exact-list getitem and setitem",

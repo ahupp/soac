@@ -409,8 +409,22 @@ impl ProfileEvidenceStore {
         function_id: RuntimeFunctionId,
     ) -> FunctionProfileEvidence {
         let persistent = self.for_function(module_name, source_hash, function_id);
+        let mut call_target_specializations = HashMap::new();
+        for (instr_id, targets) in persistent.call_target_specializations {
+            for target in targets {
+                if target.module.module_name != module_name
+                    || target.module.source_hash != source_hash
+                {
+                    continue;
+                }
+                push_unique(
+                    call_target_specializations.entry(instr_id).or_default(),
+                    RuntimeFunctionId::new(function_id.runtime_module_id(), target.local),
+                );
+            }
+        }
         FunctionProfileEvidence {
-            call_target_specializations: HashMap::new(),
+            call_target_specializations,
             operator_specializations: persistent.operator_specializations,
             getitem_specializations: persistent.getitem_specializations,
             setitem_specializations: persistent.setitem_specializations,
@@ -1524,6 +1538,14 @@ mod tests {
         assert_eq!(
             store.field_index_specializations_for_attr("x").unwrap(),
             &[field_specialization.clone()]
+        );
+        let v3_evidence = store.evidence_for_runtime_function_v3("pkg.mod", 0x1234, function_id);
+        assert_eq!(
+            v3_evidence
+                .call_target_specializations
+                .get(&instr_id)
+                .unwrap(),
+            &vec![target_id]
         );
 
         let mut evidence = evidence;

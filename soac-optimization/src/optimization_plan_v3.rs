@@ -22,6 +22,7 @@ pub struct FunctionOptimizationPlanV3 {
     pub function: FunctionPlanIdentity,
     pub regions: Vec<RegionPlan>,
     pub scalar_threads: Vec<ScalarLocalThreadPlan>,
+    pub direct_calls: Vec<DirectCallSpecializationPlan>,
     pub deopt_points: Vec<PlannedDeoptPoint>,
     pub ownership: FunctionOwnershipPlan,
     pub diagnostics: Vec<PlanDiagnostic>,
@@ -31,6 +32,13 @@ pub struct FunctionOptimizationPlanV3 {
 pub struct FunctionPlanIdentity {
     pub function: SerializedFunctionId,
     pub debug_name: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct DirectCallSpecializationPlan {
+    pub source: InstrId,
+    pub target: SerializedFunctionId,
+    pub reason: String,
 }
 
 #[derive(
@@ -583,11 +591,36 @@ fn validate_function_plan(function: &FunctionOptimizationPlanV3, errors: &mut Ve
             errors,
         );
     }
+    validate_direct_call_plans(function, errors);
     for action in &function.ownership.actions {
         if action.reason.is_empty() {
             errors.push(format!(
                 "function {} has ownership action for {:?} without reason",
                 function.function.function, action.value
+            ));
+        }
+    }
+}
+
+fn validate_direct_call_plans(function: &FunctionOptimizationPlanV3, errors: &mut Vec<String>) {
+    let mut seen = HashSet::new();
+    for direct_call in &function.direct_calls {
+        if !seen.insert((direct_call.source, direct_call.target)) {
+            errors.push(format!(
+                "function {} has duplicate direct-call target {} at {}",
+                function.function.function, direct_call.target, direct_call.source
+            ));
+        }
+        if direct_call.reason.is_empty() {
+            errors.push(format!(
+                "function {} direct-call target {} at {} has empty reason",
+                function.function.function, direct_call.target, direct_call.source
+            ));
+        }
+        if direct_call.target.module_id() != function.function.function.module_id() {
+            errors.push(format!(
+                "function {} direct-call target {} is cross-module; v3 direct-call sidecars currently require same-module targets",
+                function.function.function, direct_call.target
             ));
         }
     }
@@ -1452,6 +1485,14 @@ mod tests {
         module_with_regions_and_scalar_threads(regions, Vec::new())
     }
 
+    fn module_with_direct_calls(
+        direct_calls: Vec<DirectCallSpecializationPlan>,
+    ) -> ModuleOptimizationPlanV3 {
+        let mut module = module_with_regions(Vec::new());
+        module.functions[0].direct_calls = direct_calls;
+        module
+    }
+
     fn module_with_regions_and_scalar_threads(
         regions: Vec<RegionPlan>,
         scalar_threads: Vec<ScalarLocalThreadPlan>,
@@ -1471,6 +1512,7 @@ mod tests {
                 },
                 regions,
                 scalar_threads,
+                direct_calls: Vec::new(),
                 deopt_points: vec![PlannedDeoptPoint {
                     id: DeoptPointId(0),
                     source: DeoptPointSource::Synthetic {
@@ -1486,6 +1528,31 @@ mod tests {
 
     fn instr_id(index: u32) -> InstrId {
         InstrId::new(BlockLabel::from_index(0), index)
+    }
+
+    #[test]
+    fn validates_direct_call_sidecars() {
+        let target = SerializedFunctionId::new(SerializedModuleId::new(0), LocalFunctionId::new(2));
+        let plan = module_with_direct_calls(vec![DirectCallSpecializationPlan {
+            source: instr_id(7),
+            target,
+            reason: "profiled call target".to_string(),
+        }]);
+
+        validate_module_plan_v3(&plan).unwrap();
+    }
+
+    #[test]
+    fn rejects_cross_module_direct_call_sidecars() {
+        let target = SerializedFunctionId::new(SerializedModuleId::new(1), LocalFunctionId::new(2));
+        let plan = module_with_direct_calls(vec![DirectCallSpecializationPlan {
+            source: instr_id(7),
+            target,
+            reason: "profiled call target".to_string(),
+        }]);
+
+        let err = validate_module_plan_v3(&plan).unwrap_err();
+        assert!(err.to_string().contains("cross-module"));
     }
 
     fn input(value: PlanValue, index: u32, name: &str) -> RegionInput {

@@ -236,6 +236,7 @@ mod tests {
                         debug_name: Some("f".to_string()),
                     },
                     regions: vec![ExtractedRegionPlanRequest { region, facts }],
+                    direct_call_targets: HashMap::new(),
                 }],
             },
         )
