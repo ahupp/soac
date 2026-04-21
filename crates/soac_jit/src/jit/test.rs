@@ -22688,6 +22688,130 @@ def f(x, y):
     }
 
     #[test]
+    fn source_keyed_v3_emissions_keep_profiled_module_shape_unrewritten() {
+        let module_name = "v3_source_keyed_shape_test";
+        let module_name_gen = ModuleNameGen::new(0);
+        let mut callee_function = test_function_in_module(&module_name_gen, "callee");
+        callee_function.params.params.push(Param {
+            name: "x".into(),
+            kind: ParamKind::Any,
+            has_default: false,
+        });
+        callee_function = with_single_test_block(
+            callee_function,
+            vec![],
+            ret_term(name_expr(test_local_name("x", 0))),
+        );
+        set_stack_slots(&mut callee_function, &["x"]);
+
+        let mut caller_function = test_function_in_module(&module_name_gen, "caller");
+        caller_function.params.params.extend([
+            Param {
+                name: "fn".into(),
+                kind: ParamKind::Any,
+                has_default: false,
+            },
+            Param {
+                name: "x".into(),
+                kind: ParamKind::Any,
+                has_default: false,
+            },
+        ]);
+        let caller_block_label = caller_function.name_gen.next_block_name();
+        let call_instr_id = InstrId::new(caller_block_label, 1);
+        caller_function = with_test_blocks(
+            caller_function,
+            vec![CodegenBlock {
+                label: caller_block_label,
+                body: vec![assign_stmt(
+                    test_local_name("y", 2),
+                    with_instr_id(
+                        op_expr(Call::new(
+                            name_expr(test_local_name("fn", 0)),
+                            vec![CallArgPositional::Positional(name_expr(test_local_name(
+                                "x", 1,
+                            )))],
+                            Vec::<CallArgKeyword<InstrCodegen>>::new(),
+                        )),
+                        call_instr_id,
+                    ),
+                )],
+                term: ret_term(name_expr(test_local_name("y", 2))),
+                params: vec![],
+                exc_edge: None,
+            }],
+        );
+        set_stack_slots(&mut caller_function, &["fn", "x", "y"]);
+        let module = test_module(
+            module_name_gen,
+            vec![callee_function.clone(), caller_function.clone()],
+        );
+        let v3_plan = OptV3DirectCallPlan {
+            source: call_instr_id,
+            target: callee_function.function_id,
+            arg_plan: TypedDirectCallArgPlan {
+                sources: vec![TypedDirectCallArgSource::Provided(0)],
+            },
+            reason: "profiled direct call".to_string(),
+        };
+        let indexed_field = OptV3IndexedFieldAccessPlan {
+            access: IndexedFieldAccessKind::Load,
+            owner_type: IndexedFieldOwnerType {
+                module_name: module_name.to_string(),
+                qualname: "Owner".to_string(),
+            },
+            attr_name: "x".to_string(),
+            expected_index: 0,
+        };
+        let profile = SpecializationProfile {
+            module_name: Some(module_name),
+            counter_dump_path: None,
+            planned_evidence: HashMap::new(),
+            opt_v3_emitted_direct_calls: HashMap::from([(
+                caller_function.function_id,
+                HashMap::from([(call_instr_id, vec![v3_plan])]),
+            )]),
+            opt_v3_emitted_exact_list_items: HashMap::new(),
+            opt_v3_emitted_indexed_fields: HashMap::from([(
+                caller_function.function_id,
+                HashMap::from([(InstrId::new(caller_block_label, 99), vec![indexed_field])]),
+            )]),
+            opt_v3_emitted_indexed_globals: HashMap::new(),
+            opt_v3_exact_int_branch_artifacts: HashMap::new(),
+            behavior_change_indexed_stores: false,
+            profiled_cold_blocks: false,
+            guard_miss_deopt: false,
+        };
+        let plan = build_profiled_jit_module_plan(&module, &profile, None, None, &HashMap::new())
+            .expect("v3-profiled JIT module plan should build");
+        let planned_caller = plan
+            .module
+            .callable_defs
+            .iter()
+            .find(|function| function.function_id == caller_function.function_id)
+            .expect("planned module should keep caller");
+
+        assert!(
+            !planned_caller.blocks.iter().any(|block| {
+                matches!(
+                    &block.term,
+                    BlockTerm::IfTerm(term)
+                        if matches!(term.test, InstrCodegen::DirectFunctionIdGuardTest(_))
+                )
+            }),
+            "source-keyed v3 emissions must be consumed against the original BlockPy shape"
+        );
+        assert!(
+            planned_caller
+                .blocks
+                .iter()
+                .flat_map(|block| &block.body)
+                .any(|instr| matches!(instr, InstrCodegen::Store(store) if matches!(store.value.as_ref(), InstrCodegen::Call(_)))),
+            "source-keyed v3 emissions should keep the original call store for typed lowering"
+        );
+    }
+
+    #[test]
     fn profiled_no_arg_method_store_rewrite_uses_receiver_guard_and_inlines_target() {
         let module_name = "profiled_method_call_inline_plan_test";
         let module_name_gen = ModuleNameGen::new(0);

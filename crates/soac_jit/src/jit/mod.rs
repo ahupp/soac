@@ -2021,10 +2021,18 @@ fn build_profiled_jit_module_plan(
     let empty_direct_owner_attr_specializations = HashMap::new();
     let planned_module_id = planned_module.module_name_gen.module_id();
     for function in &mut planned_module.callable_defs {
-        let call_target_specializations =
-            profile.call_target_specializations(function.function_id)?;
-        let direct_call_rewrite_targets =
-            profile.direct_call_rewrite_targets(function.function_id)?;
+        let has_source_keyed_v3_emissions =
+            profile.has_source_keyed_opt_v3_emissions(function.function_id);
+        let call_target_specializations = if has_source_keyed_v3_emissions {
+            HashMap::new()
+        } else {
+            profile.call_target_specializations(function.function_id)?
+        };
+        let direct_call_rewrite_targets = if has_source_keyed_v3_emissions {
+            HashMap::new()
+        } else {
+            profile.direct_call_rewrite_targets(function.function_id)?
+        };
         if call_target_specializations.is_empty() && direct_call_rewrite_targets.is_empty() {
             continue;
         }
@@ -14858,6 +14866,23 @@ impl<'a> SpecializationProfile<'a> {
             || !self.opt_v3_emitted_indexed_globals.is_empty()
             || !self.opt_v3_exact_int_branch_artifacts.is_empty()
             || (self.profiled_cold_blocks && self.has_existing_counter_dump())
+    }
+
+    fn has_source_keyed_opt_v3_emissions(&self, function_id: RuntimeFunctionId) -> bool {
+        self.opt_v3_emitted_exact_list_items
+            .get(&function_id)
+            .is_some_and(|items| !items.is_empty())
+            || self
+                .opt_v3_emitted_indexed_fields
+                .get(&function_id)
+                .is_some_and(|fields| !fields.is_empty())
+            || self
+                .opt_v3_emitted_indexed_globals
+                .get(&function_id)
+                .is_some_and(|globals| !globals.is_empty())
+            || self
+                .opt_v3_exact_int_branch_artifacts
+                .contains_key(&function_id)
     }
 
     fn planned_legacy_field_index_specializations(
