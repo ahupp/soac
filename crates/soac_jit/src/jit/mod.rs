@@ -41,7 +41,7 @@ use soac_core::block_py::{
     HasSemanticInstrId, InstrId, InstrKey, InstrWithConstantNone, Load, LocalFunctionId,
     LocalLocation, Meta, ModuleContentId, NameLike, NameLocation, ParamKind, PersistentFunctionId,
     ResolvedName, RuntimeFunctionId, RuntimeModuleId, RuntimeName, SerializedFunctionId,
-    StorageLayout, Store, Visit, VisitMut, WithMeta,
+    SerializedModuleId, StorageLayout, Store, Visit, VisitMut, WithMeta,
 };
 use soac_core::profile::{
     CollectedTypeKeyLayout, CounterDumpTypeKey, read_block_entry_counts_from_file,
@@ -13507,7 +13507,11 @@ fn load_planned_optimization_inputs_for_runtime_state(
                 shared_state.source_hash,
                 cache_identity.as_str(),
             )?;
-            return planned_optimization_inputs_from_v3_artifacts(&artifacts, shared_state);
+            return planned_optimization_inputs_from_v3_artifacts(
+                &artifacts,
+                shared_state,
+                compile_session,
+            );
         }
         if plan_mode.requires_v3() {
             return Err(format!(
@@ -13579,6 +13583,29 @@ fn validate_opt_v3_artifacts_for_module(
             artifacts.plan.module.cache_identity
         ));
     }
+    let current_identity = artifacts
+        .plan
+        .identity_tables
+        .module(SerializedModuleId::new(0))
+        .map_err(|err| format!("optimization plan v3 identity table: {err}"))?;
+    if current_identity.module_name != module_name {
+        return Err(format!(
+            "optimization plan v3 identity table module 0 is {}, expected {module_name}",
+            current_identity.module_name
+        ));
+    }
+    if current_identity.source_hash != source_hash {
+        return Err(format!(
+            "optimization plan v3 identity table source hash for module 0 is 0x{:016x}, expected 0x{source_hash:016x}",
+            current_identity.source_hash
+        ));
+    }
+    if current_identity.cache_identity.as_deref() != Some(cache_identity) {
+        return Err(format!(
+            "optimization plan v3 identity table cache identity for module 0 is {:?}, expected {cache_identity}",
+            current_identity.cache_identity
+        ));
+    }
     if artifacts.emission.module_name != module_name {
         return Err(format!(
             "optimization plan v3 emission module name is {}, expected {module_name}",
@@ -13591,6 +13618,7 @@ fn validate_opt_v3_artifacts_for_module(
 fn planned_optimization_inputs_from_v3_artifacts(
     artifacts: &ExactIntBranchV3Artifacts,
     shared_state: &SharedModuleState,
+    compile_session: Option<&crate::session::CompileSession>,
 ) -> Result<PlannedOptimizationInputs, String> {
     let mut inputs = PlannedOptimizationInputs::default();
     for planned_function in &artifacts.plan.functions {
@@ -13622,11 +13650,11 @@ fn planned_optimization_inputs_from_v3_artifacts(
             current_function,
             Some(&function_artifacts),
         )?;
-        if let Some(direct_calls) = opt_v3_emitted_direct_calls_for_function(
-            &function_artifacts,
-            RuntimeModuleId::new(shared_state.module_id()),
-            |target| shared_state.lookup_function(target).is_some(),
-        )? {
+        if let Some(direct_calls) =
+            opt_v3_emitted_direct_calls_for_function(&function_artifacts, |target| {
+                resolve_opt_v3_runtime_function_target(shared_state, compile_session, target)
+            })?
+        {
             inputs
                 .opt_v3_emitted_direct_calls
                 .insert(current_function_id, direct_calls);
@@ -13662,6 +13690,9 @@ fn planned_optimization_inputs_from_v3_artifacts(
 fn planned_optimization_inputs_from_v3_artifacts_for_codegen_module(
     artifacts: &ExactIntBranchV3Artifacts,
     module: &BlockPyModule<CodegenModuleShape>,
+    module_name: &str,
+    source_hash: u64,
+    module_index: Option<&PrecompileModuleIndex>,
 ) -> Result<PlannedOptimizationInputs, String> {
     let mut inputs = PlannedOptimizationInputs::default();
     let module_id = RuntimeModuleId::new(module.module_name_gen.module_id());
@@ -13694,11 +13725,15 @@ fn planned_optimization_inputs_from_v3_artifacts_for_codegen_module(
             Some(&function_artifacts),
         )?;
         if let Some(direct_calls) =
-            opt_v3_emitted_direct_calls_for_function(&function_artifacts, module_id, |target| {
-                module
-                    .callable_defs
-                    .iter()
-                    .any(|function| function.function_id == target)
+            opt_v3_emitted_direct_calls_for_function(&function_artifacts, |target| {
+                resolve_opt_v3_codegen_module_function_target(
+                    module_name,
+                    source_hash,
+                    module_id,
+                    module,
+                    module_index,
+                    target,
+                )
             })?
         {
             inputs
@@ -14060,12 +14095,39 @@ fn opt_v3_indexed_global_access_plan_from_emission(
     }
 }
 
+fn resolve_opt_v3_runtime_function_target(
+    shared_state: &SharedModuleState,
+    compile_session: Option<&crate::session::CompileSession>,
+    target: PersistentFunctionId,
+) -> Result<Option<RuntimeFunctionId>, String> {
+    resolve_planned_function_target(shared_state, compile_session, &target)
+}
+
+fn resolve_opt_v3_codegen_module_function_target(
+    module_name: &str,
+    source_hash: u64,
+    module_id: RuntimeModuleId,
+    module: &BlockPyModule<CodegenModuleShape>,
+    module_index: Option<&PrecompileModuleIndex>,
+    target: PersistentFunctionId,
+) -> Result<Option<RuntimeFunctionId>, String> {
+    if target.module.module_name != module_name || target.module.source_hash != source_hash {
+        return Ok(
+            module_index.and_then(|module_index| module_index.function_id_for_target(&target))
+        );
+    }
+    let target_function_id = RuntimeFunctionId::new(module_id, target.local);
+    Ok(module
+        .callable_defs
+        .iter()
+        .any(|function| function.function_id == target_function_id)
+        .then_some(target_function_id))
+}
+
 fn opt_v3_emitted_direct_calls_for_function(
     artifacts: &ExactIntBranchV3Artifacts,
-    runtime_module_id: RuntimeModuleId,
-    target_exists: impl Fn(RuntimeFunctionId) -> bool,
+    mut resolve_target: impl FnMut(PersistentFunctionId) -> Result<Option<RuntimeFunctionId>, String>,
 ) -> Result<Option<HashMap<InstrId, Vec<OptV3DirectCallPlan>>>, String> {
-    let planned_function = &artifacts.plan.functions[0];
     let emitted_function = &artifacts.emission.functions[0];
     if emitted_function.direct_calls.is_empty() {
         return Ok(None);
@@ -14073,22 +14135,22 @@ fn opt_v3_emitted_direct_calls_for_function(
 
     let mut direct_calls = HashMap::<InstrId, Vec<OptV3DirectCallPlan>>::new();
     for direct_call in &emitted_function.direct_calls {
-        if direct_call.target.module_id() != planned_function.function.function.module_id() {
+        let persistent_target = artifacts
+            .plan
+            .identity_tables
+            .persistent_function_id(direct_call.target)
+            .map_err(|err| {
+                format!(
+                    "optimization plan v3 emitted direct-call target {} at {} cannot resolve identity: {err}",
+                    direct_call.target, direct_call.source
+                )
+            })?;
+        let Some(target) = resolve_target(persistent_target.clone())? else {
             return Err(format!(
-                "optimization plan v3 emitted direct-call target {} at {} is outside function module {}",
-                direct_call.target,
-                direct_call.source,
-                planned_function.function.function.module_id()
+                "optimization plan v3 emitted direct-call target {} ({:?}) at {} does not exist in loaded module set",
+                direct_call.target, persistent_target, direct_call.source
             ));
-        }
-        let target =
-            RuntimeFunctionId::new(runtime_module_id, direct_call.target.local_function_id());
-        if !target_exists(target) {
-            return Err(format!(
-                "optimization plan v3 emitted direct-call target {} at {} does not exist in runtime module {}",
-                direct_call.target, direct_call.source, runtime_module_id
-            ));
-        }
+        };
         let plans = direct_calls.entry(direct_call.source).or_default();
         if !plans.iter().any(|plan| plan.target == target) {
             plans.push(OptV3DirectCallPlan {
@@ -14145,6 +14207,7 @@ fn opt_v3_single_function_artifacts(
     Ok(Some(ExactIntBranchV3Artifacts {
         plan: ModuleOptimizationPlanV3 {
             module: artifacts.plan.module.clone(),
+            identity_tables: artifacts.plan.identity_tables.clone(),
             helper_catalog_version: artifacts.plan.helper_catalog_version,
             cost_model_version: artifacts.plan.cost_model_version,
             functions: vec![planned_function.clone()],
@@ -14368,7 +14431,11 @@ fn planned_optimization_inputs_for_precompile(
                 plan_input.cache_identity,
             )?;
             return planned_optimization_inputs_from_v3_artifacts_for_codegen_module(
-                &artifacts, module,
+                &artifacts,
+                module,
+                module_name,
+                source_hash,
+                module_index,
             );
         }
         if plan_mode.requires_v3() {

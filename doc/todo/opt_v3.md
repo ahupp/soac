@@ -83,8 +83,9 @@ Implemented:
   `return a & b`/`return a | b`/`return a ^ b` bitwise returns, and
   `return a < b` comparison returns, producing hot and local-fallback
   `RegionPlan`s. It also records a scalar-thread sidecar when a compact-int
-  store RHS feeds the immediately following local comparison, and same-module
-  profiled direct-call selections from `call_hot_targets`. Constant-attribute
+  store RHS feeds the immediately following local comparison, and ordinary
+  profiled direct-call selections from `call_hot_targets`, including
+  cross-module targets present in the cached module set. Constant-attribute
   indexed-field selections are planned from raw `type_keys` layout evidence and
   lowered `GetAttr`/`SetAttr` sites. Exact-list item selections are planned from
   raw `getitem_hot_shapes`/`setitem_hot_shapes` evidence and lowered
@@ -147,9 +148,10 @@ Partially migrated families are also intentionally visible:
   store-RHS-to-empty-compare shape;
 - profiled direct calls are represented as v3 plan selections plus mechanical
   direct-call emissions with validated ordinary-call argument plans and consumed
-  through mechanical typed-call lowering for same-module ordinary-function
-  targets. Cross-module targets, methods, and constructors are still outside
-  the v3 direct-call family.
+  through mechanical typed-call lowering for ordinary-function targets.
+  Cross-module targets are represented through serialized module identities and
+  resolved from the loaded module set; methods and constructors are still
+  outside the v3 direct-call family.
 - indexed fields are represented as v3 plan selections plus mechanical
   indexed-field emissions. `soac_jit` now keeps the emitted access kind and
   attribute name separate from legacy per-instruction field evidence and
@@ -687,9 +689,10 @@ the branch exit demands `I32Bool01`. If a later Python-observable boundary needs
 9. Replace old site-local specializations incrementally.
    - Migrate exact-int operators first.
    - Then truthiness and materialization.
-   - Direct calls are partially migrated through mechanical v3 typed lowering;
-     indexed fields and indexed globals are partially migrated as v3-owned
-     codegen inputs; lift their actual lowering into mechanical nodes next.
+   - Direct calls are partially migrated through mechanical v3 typed lowering,
+     including cross-module ordinary-function targets; indexed fields and
+     indexed globals are partially migrated as v3-owned codegen inputs; lift
+     their actual lowering into mechanical nodes next.
    - Then getitem/setitem.
    - Keep old paths until each replacement has structured tests and diagnostics.
 

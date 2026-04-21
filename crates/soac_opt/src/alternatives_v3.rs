@@ -1273,7 +1273,8 @@ mod tests {
         RegionInput, RegionInputSource, RegionPlan, RegionSource, validate_module_plan_v3,
     };
     use soac_core::block_py::{
-        BlockLabel, InstrId, LocalFunctionId, SerializedFunctionId, SerializedModuleId,
+        BlockLabel, InstrId, LocalFunctionId, SerializedFunctionId, SerializedIdentityTables,
+        SerializedModuleId, SerializedModuleIdentity,
     };
 
     fn test_function_id() -> SerializedFunctionId {
@@ -1605,6 +1606,14 @@ mod tests {
                 module_name: "pkg.mod".to_string(),
                 source_hash: 0x4321,
                 cache_identity: "test-cache".to_string(),
+            },
+            identity_tables: SerializedIdentityTables {
+                modules: vec![SerializedModuleIdentity {
+                    module_name: "pkg.mod".to_string(),
+                    source_hash: 0x4321,
+                    cache_identity: Some("test-cache".to_string()),
+                }],
+                debug_names: Vec::new(),
             },
             helper_catalog_version: ALTERNATIVE_CATALOG_V3_VERSION,
             cost_model_version: 1,

@@ -3088,6 +3088,14 @@ def build(values):
                     source_hash,
                     cache_identity: cache_identity.to_string(),
                 },
+                identity_tables: test_plan_identities(
+                    module_name,
+                    source_hash,
+                    cache_identity,
+                    serialized_function,
+                    function.names.qualname.as_str(),
+                    &[],
+                ),
                 helper_catalog_version: 1,
                 cost_model_version: 1,
                 functions: vec![soac_opt::plan_v3::FunctionOptimizationPlanV3 {
@@ -16907,6 +16915,14 @@ def f(x):
                     source_hash: 0,
                     cache_identity: "test-cache".to_string(),
                 },
+                identity_tables: test_plan_identities(
+                    "test",
+                    0,
+                    "test-cache",
+                    serialized_function,
+                    function.names.qualname.as_str(),
+                    &[],
+                ),
                 helper_catalog_version: 1,
                 cost_model_version: 1,
                 functions: vec![soac_opt::plan_v3::FunctionOptimizationPlanV3 {
@@ -16939,9 +16955,14 @@ def f(x):
             },
         };
 
-        let inputs =
-            planned_optimization_inputs_from_v3_artifacts_for_codegen_module(&artifacts, &module)
-                .expect("v3 module artifact should map onto the current codegen module");
+        let inputs = planned_optimization_inputs_from_v3_artifacts_for_codegen_module(
+            &artifacts,
+            &module,
+            artifacts.plan.module.module_name.as_str(),
+            artifacts.plan.module.source_hash,
+            None,
+        )
+        .expect("v3 module artifact should map onto the current codegen module");
         let function_artifacts = inputs
             .opt_v3_exact_int_branch_artifacts
             .get(&function.function_id)
@@ -16977,6 +16998,14 @@ def f(x):
                     source_hash: 0,
                     cache_identity: "test-cache".to_string(),
                 },
+                identity_tables: test_plan_identities(
+                    "test",
+                    0,
+                    "test-cache",
+                    serialized_caller,
+                    "caller",
+                    &[],
+                ),
                 helper_catalog_version: 1,
                 cost_model_version: 1,
                 functions: vec![soac_opt::plan_v3::FunctionOptimizationPlanV3 {
@@ -17023,9 +17052,14 @@ def f(x):
             },
         };
 
-        let planned_inputs =
-            planned_optimization_inputs_from_v3_artifacts_for_codegen_module(&artifacts, &module)
-                .unwrap();
+        let planned_inputs = planned_optimization_inputs_from_v3_artifacts_for_codegen_module(
+            &artifacts,
+            &module,
+            artifacts.plan.module.module_name.as_str(),
+            artifacts.plan.module.source_hash,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(
             planned_inputs
@@ -17052,6 +17086,133 @@ def f(x):
     }
 
     #[test]
+    fn planned_precompile_inputs_consume_cross_module_v3_emitted_direct_calls() {
+        let caller_module_name = "test_v3_cross_module_direct_call_caller";
+        let callee_module_name = "test_v3_cross_module_direct_call_callee";
+        let caller_source_hash = 0xabcdef21;
+        let callee_source_hash = 0xabcdef22;
+        let caller_module_name_gen = ModuleNameGen::new(37);
+        let callee_module_name_gen = ModuleNameGen::new(38);
+        let caller = test_function_in_module(&caller_module_name_gen, "caller");
+        let callee = test_function_in_module(&callee_module_name_gen, "callee");
+        let caller_id = caller.function_id;
+        let callee_id = callee.function_id;
+        let caller_module = test_module(caller_module_name_gen, vec![caller]);
+        let callee_module = test_module(callee_module_name_gen, vec![callee]);
+        let module_index = PrecompileModuleIndex::from_entries([
+            PrecompileModuleIndexEntry {
+                module_name: caller_module_name,
+                source_hash: caller_source_hash,
+                module: &caller_module,
+            },
+            PrecompileModuleIndexEntry {
+                module_name: callee_module_name,
+                source_hash: callee_source_hash,
+                module: &callee_module,
+            },
+        ])
+        .expect("precompile module index should build");
+        let source = InstrId::new(BlockLabel::from_index(0), 11);
+        let serialized_caller =
+            SerializedFunctionId::new(SerializedModuleId::new(0), caller_id.local_function_id());
+        let serialized_callee =
+            SerializedFunctionId::new(SerializedModuleId::new(1), callee_id.local_function_id());
+        let artifacts = ExactIntBranchV3Artifacts {
+            plan: ModuleOptimizationPlanV3 {
+                module: ModulePlanIdentity {
+                    module_name: caller_module_name.to_string(),
+                    source_hash: caller_source_hash,
+                    cache_identity: "test-cache".to_string(),
+                },
+                identity_tables: test_plan_identities(
+                    caller_module_name,
+                    caller_source_hash,
+                    "test-cache",
+                    serialized_caller,
+                    "caller",
+                    &[(callee_module_name, callee_source_hash)],
+                ),
+                helper_catalog_version: 1,
+                cost_model_version: 1,
+                functions: vec![soac_opt::plan_v3::FunctionOptimizationPlanV3 {
+                    function: FunctionPlanIdentity {
+                        function: serialized_caller,
+                        debug_name: Some("caller".to_string()),
+                    },
+                    regions: Vec::new(),
+                    scalar_threads: Vec::new(),
+                    direct_calls: vec![DirectCallSpecializationPlan {
+                        source,
+                        target: serialized_callee,
+                        arg_plan: PlanV3DirectCallArgPlan {
+                            sources: vec![PlanV3DirectCallArgSource::Provided(0)],
+                        },
+                        reason: "profiled cross-module direct call".to_string(),
+                    }],
+                    exact_list_items: Vec::new(),
+                    indexed_fields: Vec::new(),
+                    indexed_globals: Vec::new(),
+                    deopt_points: Vec::new(),
+                    ownership: soac_opt::plan_v3::FunctionOwnershipPlan::default(),
+                    diagnostics: Vec::new(),
+                }],
+            },
+            emission: MechanicalModuleEmission {
+                module_name: caller_module_name.to_string(),
+                functions: vec![soac_opt::emit_v3::MechanicalFunctionEmission {
+                    function: serialized_caller,
+                    debug_name: Some("caller".to_string()),
+                    direct_calls: vec![soac_opt::emit_v3::MechanicalDirectCallEmission {
+                        source,
+                        target: serialized_callee,
+                        arg_plan: PlanV3DirectCallArgPlan {
+                            sources: vec![PlanV3DirectCallArgSource::Provided(0)],
+                        },
+                        reason: "profiled cross-module direct call".to_string(),
+                    }],
+                    exact_list_items: Vec::new(),
+                    indexed_fields: Vec::new(),
+                    indexed_globals: Vec::new(),
+                    regions: Vec::new(),
+                }],
+            },
+        };
+
+        let planned_inputs = planned_optimization_inputs_from_v3_artifacts_for_codegen_module(
+            &artifacts,
+            &caller_module,
+            caller_module_name,
+            caller_source_hash,
+            Some(&module_index),
+        )
+        .unwrap();
+
+        assert_eq!(
+            planned_inputs
+                .opt_v3_emitted_direct_calls
+                .get(&caller_id)
+                .unwrap()
+                .get(&source)
+                .unwrap()
+                .first()
+                .unwrap(),
+            &OptV3DirectCallPlan {
+                source,
+                target: callee_id,
+                arg_plan: soac_lowering::passes::TypedDirectCallArgPlan {
+                    sources: vec![soac_lowering::passes::TypedDirectCallArgSource::Provided(0)],
+                },
+                reason: "profiled cross-module direct call".to_string(),
+            },
+            "JIT precompile loading should resolve v3 cross-module direct-call targets through the identity table and module index"
+        );
+        assert!(
+            planned_inputs.evidence_by_function.is_empty(),
+            "cross-module v3 emitted direct calls should not synthesize legacy evidence"
+        );
+    }
+
+    #[test]
     fn planned_precompile_inputs_consume_v3_emitted_indexed_fields() {
         let module_name_gen = ModuleNameGen::new(7);
         let caller = test_function_in_module(&module_name_gen, "caller");
@@ -17072,6 +17233,14 @@ def f(x):
                     source_hash: 0,
                     cache_identity: "test-cache".to_string(),
                 },
+                identity_tables: test_plan_identities(
+                    "test",
+                    0,
+                    "test-cache",
+                    serialized_caller,
+                    "caller",
+                    &[],
+                ),
                 helper_catalog_version: 1,
                 cost_model_version: 1,
                 functions: vec![soac_opt::plan_v3::FunctionOptimizationPlanV3 {
@@ -17142,9 +17311,14 @@ def f(x):
             },
         };
 
-        let planned_inputs =
-            planned_optimization_inputs_from_v3_artifacts_for_codegen_module(&artifacts, &module)
-                .unwrap();
+        let planned_inputs = planned_optimization_inputs_from_v3_artifacts_for_codegen_module(
+            &artifacts,
+            &module,
+            artifacts.plan.module.module_name.as_str(),
+            artifacts.plan.module.source_hash,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(
             planned_inputs
@@ -17214,6 +17388,14 @@ def f(x):
                     source_hash: 0,
                     cache_identity: "test-cache".to_string(),
                 },
+                identity_tables: test_plan_identities(
+                    "test",
+                    0,
+                    "test-cache",
+                    serialized_caller,
+                    "caller",
+                    &[],
+                ),
                 helper_catalog_version: 1,
                 cost_model_version: 1,
                 functions: vec![soac_opt::plan_v3::FunctionOptimizationPlanV3 {
@@ -17292,9 +17474,14 @@ def f(x):
             },
         };
 
-        let planned_inputs =
-            planned_optimization_inputs_from_v3_artifacts_for_codegen_module(&artifacts, &module)
-                .unwrap();
+        let planned_inputs = planned_optimization_inputs_from_v3_artifacts_for_codegen_module(
+            &artifacts,
+            &module,
+            artifacts.plan.module.module_name.as_str(),
+            artifacts.plan.module.source_hash,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(
             planned_inputs
@@ -18212,6 +18399,14 @@ def write_point(point, value):
                     source_hash: 0,
                     cache_identity: "test-cache".to_string(),
                 },
+                identity_tables: test_plan_identities(
+                    "test",
+                    0,
+                    "test-cache",
+                    serialized_caller,
+                    "caller",
+                    &[],
+                ),
                 helper_catalog_version: 1,
                 cost_model_version: 1,
                 functions: vec![soac_opt::plan_v3::FunctionOptimizationPlanV3 {
@@ -18252,7 +18447,11 @@ def write_point(point, value):
         };
 
         let err = match planned_optimization_inputs_from_v3_artifacts_for_codegen_module(
-            &artifacts, &module,
+            &artifacts,
+            &module,
+            artifacts.plan.module.module_name.as_str(),
+            artifacts.plan.module.source_hash,
+            None,
         ) {
             Ok(_) => panic!("mismatched v3 direct-call emission should be rejected"),
             Err(err) => err,
@@ -18284,6 +18483,14 @@ def write_point(point, value):
                     source_hash: 0,
                     cache_identity: "test-cache".to_string(),
                 },
+                identity_tables: test_plan_identities(
+                    "test",
+                    0,
+                    "test-cache",
+                    serialized_caller,
+                    "caller",
+                    &[],
+                ),
                 helper_catalog_version: 1,
                 cost_model_version: 1,
                 functions: vec![soac_opt::plan_v3::FunctionOptimizationPlanV3 {
@@ -18324,7 +18531,11 @@ def write_point(point, value):
         };
 
         let err = match planned_optimization_inputs_from_v3_artifacts_for_codegen_module(
-            &artifacts, &module,
+            &artifacts,
+            &module,
+            artifacts.plan.module.module_name.as_str(),
+            artifacts.plan.module.source_hash,
+            None,
         ) {
             Ok(_) => panic!("mismatched v3 indexed-field emission should be rejected"),
             Err(err) => err,

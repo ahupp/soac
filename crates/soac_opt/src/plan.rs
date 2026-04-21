@@ -476,6 +476,16 @@ impl ProfileEvidenceStore {
             branch_prefer_true: persistent.branch_prefer_true,
         }
     }
+
+    pub fn persistent_call_target_specializations_for_runtime_function_v3(
+        &self,
+        module_name: &str,
+        source_hash: u64,
+        function_id: RuntimeFunctionId,
+    ) -> HashMap<InstrId, Vec<PersistentFunctionId>> {
+        self.for_function(module_name, source_hash, function_id)
+            .call_target_specializations
+    }
 }
 
 fn persistent_function_id_for_counter_row(

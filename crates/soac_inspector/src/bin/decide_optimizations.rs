@@ -163,7 +163,10 @@ fn print_usage() {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soac_core::block_py::{BlockLabel, InstrId, ModuleNameGen, RuntimeFunctionId};
+    use soac_core::block_py::{
+        BlockLabel, BlockPyFunction, ChildVisitable, HasSemanticInstrId, InstrId, ModuleNameGen,
+        RuntimeFunctionId, Visit,
+    };
     use soac_core::profile::{
         CounterDumpRecord, CounterDumpRow, CounterDumpTypeKey, CounterDumpTypeKeyLayout,
         CounterDumpTypeTableEntry,
@@ -174,6 +177,7 @@ mod test {
     };
     use soac_driver::{LoweringOptions, lower_python_to_blockpy_recorded_with_options};
     use soac_jit::module_type::hash_module_source;
+    use soac_lowering::passes::{CodegenModuleShape, InstrCodegen};
     use soac_opt::artifacts_v3::load_optimization_artifacts_v3;
     use soac_opt::plan::{OptimizationPlan, PlannedAction, PlannedReplacement};
     use std::fs;
@@ -458,6 +462,125 @@ mod test {
     }
 
     #[test]
+    fn mode_v3_emits_cross_module_direct_call_identity() {
+        let root = unique_temp_dir();
+        let module_cache_root = root.join("modules-in");
+        let out_root = root.join("modules-out");
+        let caller_module_name = "pkg.cross_caller";
+        let callee_module_name = "pkg.cross_callee";
+        let caller = store_test_module(
+            module_cache_root.as_path(),
+            caller_module_name,
+            "def caller(fn, x):\n    return fn(x)\n",
+            27,
+        );
+        let callee = store_test_module(
+            module_cache_root.as_path(),
+            callee_module_name,
+            "def callee(x):\n    return x\n",
+            28,
+        );
+        let call_instr_id = caller
+            .first_call_instr_id
+            .expect("caller fixture should contain one lowered call");
+        let mut counters = counter_record_with_call_target(
+            caller_module_name,
+            caller.source_hash,
+            caller.function_id,
+            call_instr_id,
+            callee.function_id,
+        )
+        .encode()
+        .unwrap();
+        counters.extend_from_slice(
+            counter_record_for_module_identity(
+                callee_module_name,
+                callee.source_hash,
+                callee.function_id,
+            )
+            .encode()
+            .unwrap()
+            .as_slice(),
+        );
+        let counters_path = root.join("profile.bin");
+        fs::write(counters_path.as_path(), counters).unwrap();
+        let caller_cache_path = codegen_module_cache_path(
+            module_cache_root.as_path(),
+            PythonModuleCacheSource::Project,
+            caller_module_name,
+        )
+        .unwrap();
+        let callee_cache_path = codegen_module_cache_path(
+            module_cache_root.as_path(),
+            PythonModuleCacheSource::Project,
+            callee_module_name,
+        )
+        .unwrap();
+
+        run_with_args([
+            OsString::from("--counters"),
+            counters_path.into_os_string(),
+            OsString::from("--mode"),
+            OsString::from("v3"),
+            OsString::from("--module"),
+            caller_cache_path.into_os_string(),
+            OsString::from("--module"),
+            callee_cache_path.into_os_string(),
+            OsString::from("--out"),
+            out_root.clone().into_os_string(),
+        ])
+        .unwrap();
+
+        let output_path = module_optimization_plan_v3_path(
+            out_root.as_path(),
+            PythonModuleCacheSource::Project,
+            caller_module_name,
+        )
+        .unwrap();
+        let artifacts = load_optimization_artifacts_v3(output_path.as_path()).unwrap();
+        assert_eq!(artifacts.plan.module.module_name, caller_module_name);
+        let planned_function = artifacts
+            .plan
+            .functions
+            .iter()
+            .find(|function| {
+                function.function.function.local_function_id()
+                    == caller.function_id.local_function_id()
+            })
+            .expect("caller plan should include the profiled function");
+        let direct_call = planned_function
+            .direct_calls
+            .iter()
+            .find(|direct_call| direct_call.source == call_instr_id)
+            .expect("caller plan should include the profiled direct call");
+        let target = artifacts
+            .plan
+            .identity_tables
+            .persistent_function_id(direct_call.target)
+            .expect("v3 direct-call target should resolve through the serialized identity table");
+        assert_eq!(target.module.module_name, callee_module_name);
+        assert_eq!(target.module.source_hash, callee.source_hash);
+        assert_eq!(target.local, callee.function_id.local_function_id());
+        assert!(
+            artifacts
+                .emission
+                .functions
+                .iter()
+                .flat_map(|function| &function.direct_calls)
+                .any(|emitted| emitted.source == call_instr_id
+                    && emitted.target == direct_call.target),
+            "mechanical v3 emission should preserve the cross-module direct-call target"
+        );
+        assert!(
+            artifacts.plan.identity_tables.modules.iter().any(|module| {
+                module.module_name == callee_module_name && module.source_hash == callee.source_hash
+            }),
+            "caller v3 plan should serialize callee module identity"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn module_root_can_scan_different_input_root() {
         let root = unique_temp_dir();
         let module_cache_root = root.join("modules-in");
@@ -508,6 +631,7 @@ mod test {
     struct StoredTestModule {
         source_hash: u64,
         function_id: RuntimeFunctionId,
+        first_call_instr_id: Option<InstrId>,
     }
 
     fn store_test_module(
@@ -539,16 +663,46 @@ mod test {
             },
         )
         .unwrap();
-        let function_id = lowered
+        let function = lowered
             .codegen_module
             .callable_defs
             .first()
-            .map(|function| function.function_id)
             .expect("test module should contain one function");
+        let function_id = function.function_id;
+        let first_call_instr_id = first_call_instr_id(function);
         StoredTestModule {
             source_hash,
             function_id,
+            first_call_instr_id,
         }
+    }
+
+    fn first_call_instr_id(function: &BlockPyFunction<CodegenModuleShape>) -> Option<InstrId> {
+        struct Finder {
+            result: Option<InstrId>,
+        }
+
+        impl Visit<InstrCodegen> for Finder {
+            fn visit_instr(&mut self, expr: &InstrCodegen)
+            where
+                InstrCodegen: ChildVisitable<InstrCodegen>,
+            {
+                if self.result.is_some() {
+                    return;
+                }
+                if let InstrCodegen::Call(call) = expr {
+                    self.result = call.try_semantic_instr_id();
+                    if self.result.is_some() {
+                        return;
+                    }
+                }
+                expr.visit_children(self);
+            }
+        }
+
+        let mut finder = Finder { result: None };
+        finder.visit_fn(function);
+        finder.result
     }
 
     fn counter_record(
@@ -556,6 +710,22 @@ mod test {
         source_hash: u64,
         function_id: RuntimeFunctionId,
         instr_id: InstrId,
+    ) -> CounterDumpRecord {
+        counter_record_with_call_target(
+            module_name,
+            source_hash,
+            function_id,
+            instr_id,
+            RuntimeFunctionId::from_raw_parts(8, 2),
+        )
+    }
+
+    fn counter_record_with_call_target(
+        module_name: &str,
+        source_hash: u64,
+        function_id: RuntimeFunctionId,
+        instr_id: InstrId,
+        call_target: RuntimeFunctionId,
     ) -> CounterDumpRecord {
         CounterDumpRecord {
             source_hash,
@@ -573,9 +743,7 @@ mod test {
                     function_qualname: Some("f".to_string()),
                     block_label: Some("bb0".to_string()),
                     value: 1,
-                    observed_value: Some(
-                        RuntimeFunctionId::from_raw_parts(8, 2).to_packed_runtime_u64(),
-                    ),
+                    observed_value: Some(call_target.to_packed_runtime_u64()),
                     max_overcount: None,
                 },
                 CounterDumpRow {

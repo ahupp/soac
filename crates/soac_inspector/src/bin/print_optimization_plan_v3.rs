@@ -330,7 +330,10 @@ fn emitted_region_for_plan_region(
 #[cfg(test)]
 mod test {
     use super::*;
-    use soac_core::block_py::{LocalFunctionId, SerializedFunctionId, SerializedModuleId};
+    use soac_core::block_py::{
+        LocalFunctionId, SerializedFunctionId, SerializedIdentityTables, SerializedModuleId,
+        SerializedModuleIdentity,
+    };
     use soac_opt::emit_v3::{MechanicalFunctionEmission, MechanicalModuleEmission};
     use soac_opt::plan_v3::{
         FunctionOptimizationPlanV3, FunctionOwnershipPlan, FunctionPlanIdentity,
@@ -347,6 +350,14 @@ mod test {
                     module_name: "pkg.mod".to_string(),
                     source_hash: 0x1234,
                     cache_identity: "test-cache".to_string(),
+                },
+                identity_tables: SerializedIdentityTables {
+                    modules: vec![SerializedModuleIdentity {
+                        module_name: "pkg.mod".to_string(),
+                        source_hash: 0x1234,
+                        cache_identity: Some("test-cache".to_string()),
+                    }],
+                    debug_names: Vec::new(),
                 },
                 helper_catalog_version: 1,
                 cost_model_version: 1,

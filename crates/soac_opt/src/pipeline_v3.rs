@@ -25,8 +25,10 @@ use crate::region_v3::{
 use anyhow::{Context, Result, anyhow, bail};
 use soac_core::block_py::{
     BlockLabel, BlockPyFunction, BlockPyModule, Call, CallArgPositional, ChildVisitable,
-    FunctionExecutionMode, HasSemanticInstrId, InstrId, LocalFunctionId, NameLike, NameLocation,
-    ParamKind, RuntimeModuleId, SerializedFunctionId, SerializedModuleId, Visit,
+    FunctionExecutionMode, HasSemanticInstrId, InstrId, LocalFunctionId, ModuleContentId, NameLike,
+    NameLocation, ParamKind, PersistentFunctionId, SerializedFunctionDebugName,
+    SerializedFunctionId, SerializedIdentityTables, SerializedModuleId, SerializedModuleIdentity,
+    Visit,
 };
 use soac_driver::codegen_cache::{
     CachedCodegenModule, CachedCodegenModuleMetadata, load_codegen_module_cache,
@@ -52,6 +54,136 @@ impl fmt::Display for ExactIntBranchV3Error {
 }
 
 impl std::error::Error for ExactIntBranchV3Error {}
+
+#[derive(Clone, Debug, Default)]
+pub struct DirectCallTargetIndex {
+    functions: HashMap<PersistentFunctionId, BlockPyFunction<CodegenModuleShape>>,
+}
+
+impl DirectCallTargetIndex {
+    fn from_current_module(
+        metadata: &CachedCodegenModuleMetadata,
+        module: &BlockPyModule<CodegenModuleShape>,
+    ) -> Self {
+        let mut index = Self::default();
+        index.insert_module(metadata, module);
+        index
+    }
+
+    fn from_cached_modules(
+        module_inputs: &[CachedModuleOptimizationInput],
+    ) -> Result<DirectCallTargetIndex> {
+        let mut index = DirectCallTargetIndex::default();
+        for module_input in module_inputs {
+            let cache = load_codegen_module_cache(module_input.module_path.as_path())
+                .with_context(|| {
+                    format!(
+                        "load BlockPy module cache {} for optimizer v3 direct-call target index",
+                        module_input.module_path.display()
+                    )
+                })?;
+            index.insert_module(&cache.metadata, &cache.module);
+        }
+        Ok(index)
+    }
+
+    fn insert_module(
+        &mut self,
+        metadata: &CachedCodegenModuleMetadata,
+        module: &BlockPyModule<CodegenModuleShape>,
+    ) {
+        let content_id = ModuleContentId::new(metadata.module_name.clone(), metadata.source_hash);
+        for function in &module.callable_defs {
+            self.functions.insert(
+                PersistentFunctionId::new(
+                    content_id.clone(),
+                    function.function_id.local_function_id(),
+                ),
+                function.clone(),
+            );
+        }
+    }
+
+    fn function(
+        &self,
+        function_id: &PersistentFunctionId,
+    ) -> Option<&BlockPyFunction<CodegenModuleShape>> {
+        self.functions.get(function_id)
+    }
+}
+
+struct OptimizationPlanV3IdentityBuilder {
+    tables: SerializedIdentityTables,
+    modules_by_content: HashMap<ModuleContentId, SerializedModuleId>,
+}
+
+impl OptimizationPlanV3IdentityBuilder {
+    fn new(metadata: &CachedCodegenModuleMetadata) -> Self {
+        let mut builder = Self {
+            tables: SerializedIdentityTables::default(),
+            modules_by_content: HashMap::new(),
+        };
+        builder.intern_module(
+            ModuleContentId::new(metadata.module_name.clone(), metadata.source_hash),
+            Some(metadata.cache_identity.clone()),
+        );
+        builder
+    }
+
+    fn function_id_for_persistent(
+        &mut self,
+        function: PersistentFunctionId,
+    ) -> SerializedFunctionId {
+        let module_id = self.intern_module(function.module, None);
+        SerializedFunctionId::new(module_id, function.local)
+    }
+
+    fn add_debug_name(&mut self, function: SerializedFunctionId, qualname: impl Into<String>) {
+        self.tables.debug_names.push(SerializedFunctionDebugName {
+            function,
+            qualname: qualname.into(),
+        });
+    }
+
+    fn finish(self) -> SerializedIdentityTables {
+        self.tables
+    }
+
+    fn intern_module(
+        &mut self,
+        module: ModuleContentId,
+        cache_identity: Option<String>,
+    ) -> SerializedModuleId {
+        if let Some(module_id) = self.modules_by_content.get(&module) {
+            if let Some(cache_identity) = cache_identity
+                && let Some(identity) = self.tables.modules.get_mut(module_id.as_u32() as usize)
+                && identity.cache_identity.is_none()
+            {
+                identity.cache_identity = Some(cache_identity);
+            }
+            return *module_id;
+        }
+        let module_id = SerializedModuleId::new(self.tables.modules.len() as u32);
+        self.tables.modules.push(SerializedModuleIdentity {
+            module_name: module.module_name.clone(),
+            source_hash: module.source_hash,
+            cache_identity,
+        });
+        self.modules_by_content.insert(module, module_id);
+        module_id
+    }
+}
+
+fn identity_tables_for_single_module(module: &ModulePlanIdentity) -> SerializedIdentityTables {
+    SerializedIdentityTables {
+        modules: vec![SerializedModuleIdentity {
+            module_name: module.module_name.clone(),
+            source_hash: module.source_hash,
+            cache_identity: Some(module.cache_identity.clone()),
+        }],
+        debug_names: Vec::new(),
+    }
+}
 
 pub fn plan_and_emit_function_exact_int_branches_v3(
     catalog: &AlternativeCatalog,
@@ -107,11 +239,29 @@ pub fn plan_and_emit_module_v3_from_raw_evidence(
     lowered_module: &BlockPyModule<CodegenModuleShape>,
     evidence_store: &ProfileEvidenceStore,
 ) -> Result<ExactIntBranchV3Artifacts, ExactIntBranchV3Error> {
+    let target_index = DirectCallTargetIndex::from_current_module(metadata, lowered_module);
+    plan_and_emit_module_v3_from_raw_evidence_with_target_index(
+        catalog,
+        metadata,
+        lowered_module,
+        evidence_store,
+        &target_index,
+    )
+}
+
+fn plan_and_emit_module_v3_from_raw_evidence_with_target_index(
+    catalog: &AlternativeCatalog,
+    metadata: &CachedCodegenModuleMetadata,
+    lowered_module: &BlockPyModule<CodegenModuleShape>,
+    evidence_store: &ProfileEvidenceStore,
+    target_index: &DirectCallTargetIndex,
+) -> Result<ExactIntBranchV3Artifacts, ExactIntBranchV3Error> {
     let module = ModulePlanIdentity {
         module_name: metadata.module_name.clone(),
         source_hash: metadata.source_hash,
         cache_identity: metadata.cache_identity.clone(),
     };
+    let mut identity_builder = OptimizationPlanV3IdentityBuilder::new(metadata);
     let mut functions = Vec::new();
     let mut diagnostics_by_function = Vec::new();
     for function in &lowered_module.callable_defs {
@@ -146,14 +296,13 @@ pub fn plan_and_emit_module_v3_from_raw_evidence(
                 Err(error) => diagnostics.push(extraction_diagnostic(attempt.block, error)),
             }
         }
-        let (direct_calls, direct_call_diagnostics) =
-            direct_call_requests_from_same_module_evidence_v3(
-                SerializedModuleId::new(0),
-                function.function_id.runtime_module_id(),
-                function,
-                lowered_module,
-                &evidence,
-            );
+        let (direct_calls, direct_call_diagnostics) = direct_call_requests_from_evidence_v3(
+            metadata,
+            function,
+            evidence_store,
+            target_index,
+            &mut identity_builder,
+        );
         diagnostics.extend(direct_call_diagnostics);
         let (exact_list_items, exact_list_item_diagnostics) =
             exact_list_item_requests_from_profile_evidence_v3(function, &evidence);
@@ -179,7 +328,15 @@ pub fn plan_and_emit_module_v3_from_raw_evidence(
         diagnostics_by_function.push(diagnostics);
     }
 
-    let mut plan = plan_module_optimization_v3(catalog, ModulePlanRequest { module, functions });
+    let identity_tables = identity_builder.finish();
+    let mut plan = plan_module_optimization_v3(
+        catalog,
+        ModulePlanRequest {
+            module,
+            identity_tables,
+            functions,
+        },
+    );
     for (function, diagnostics) in plan.functions.iter_mut().zip(diagnostics_by_function) {
         function.diagnostics.extend(diagnostics);
     }
@@ -211,6 +368,7 @@ pub fn plan_and_emit_extracted_exact_int_branches_v3(
     let mut plan = plan_module_optimization_v3(
         catalog,
         ModulePlanRequest {
+            identity_tables: identity_tables_for_single_module(&module),
             module,
             functions: vec![FunctionPlanRequest {
                 direct_calls: Vec::new(),
@@ -507,46 +665,42 @@ fn module_constant_string_value_v3(
     Some(literal.value.as_str())
 }
 
-fn direct_call_requests_from_same_module_evidence_v3(
-    serialized_module_id: SerializedModuleId,
-    runtime_module_id: RuntimeModuleId,
+fn direct_call_requests_from_evidence_v3(
+    metadata: &CachedCodegenModuleMetadata,
     function: &BlockPyFunction<CodegenModuleShape>,
-    lowered_module: &BlockPyModule<CodegenModuleShape>,
-    evidence: &FunctionProfileEvidence,
+    evidence_store: &ProfileEvidenceStore,
+    target_index: &DirectCallTargetIndex,
+    identity_builder: &mut OptimizationPlanV3IdentityBuilder,
 ) -> (Vec<DirectCallPlanRequest>, Vec<PlanDiagnostic>) {
     let mut requests = Vec::new();
     let mut diagnostics = Vec::new();
-    let mut entries = evidence
-        .call_target_specializations
-        .iter()
+    let mut entries = evidence_store
+        .persistent_call_target_specializations_for_runtime_function_v3(
+            metadata.module_name.as_str(),
+            metadata.source_hash,
+            function.function_id,
+        )
+        .into_iter()
         .collect::<Vec<_>>();
-    entries.sort_by_key(|(source, _)| **source);
+    entries.sort_by_key(|(source, _)| *source);
     for (source, targets) in entries {
-        let mut targets = targets.clone();
+        let mut targets = targets;
         targets.sort();
         targets.dedup();
         for target in targets {
-            if target.runtime_module_id() != runtime_module_id {
-                continue;
-            }
-            let serialized_target =
-                SerializedFunctionId::new(serialized_module_id, target.local_function_id());
-            let Some(target_function) = lowered_module
-                .callable_defs
-                .iter()
-                .find(|candidate| candidate.function_id == target)
-            else {
+            let serialized_target = identity_builder.function_id_for_persistent(target.clone());
+            let Some(target_function) = target_index.function(&target) else {
                 diagnostics.push(PlanDiagnostic {
-                    source: Some(*source),
+                    source: Some(source),
                     message: format!(
-                        "v3 direct-call declined target {serialized_target}: target function is missing from lowered module"
+                        "v3 direct-call declined target {serialized_target}: target function is missing from cached modules"
                     ),
                 });
                 continue;
             };
             if target_function.execution_mode() != FunctionExecutionMode::Jit {
                 diagnostics.push(PlanDiagnostic {
-                    source: Some(*source),
+                    source: Some(source),
                     message: format!(
                         "v3 direct-call declined target {serialized_target}: target function is not JIT lowered"
                     ),
@@ -555,7 +709,7 @@ fn direct_call_requests_from_same_module_evidence_v3(
             }
             if target_function.names.fn_name == "__init__" {
                 diagnostics.push(PlanDiagnostic {
-                    source: Some(*source),
+                    source: Some(source),
                     message: format!(
                         "v3 direct-call declined target {serialized_target}: constructor targets require owner/type guards"
                     ),
@@ -564,13 +718,13 @@ fn direct_call_requests_from_same_module_evidence_v3(
             }
             let arg_plan = match direct_call_arg_plan_for_instr_id_v3(
                 function,
-                *source,
+                source,
                 target_function,
             ) {
                 Some(Ok(arg_plan)) => arg_plan,
                 Some(Err(reason)) => {
                     diagnostics.push(PlanDiagnostic {
-                        source: Some(*source),
+                        source: Some(source),
                         message: format!(
                             "v3 direct-call declined target {serialized_target}: {reason}"
                         ),
@@ -579,7 +733,7 @@ fn direct_call_requests_from_same_module_evidence_v3(
                 }
                 None => {
                     diagnostics.push(PlanDiagnostic {
-                        source: Some(*source),
+                        source: Some(source),
                         message: format!(
                             "v3 direct-call declined target {serialized_target}: source instruction is not a lowered call"
                         ),
@@ -588,11 +742,13 @@ fn direct_call_requests_from_same_module_evidence_v3(
                 }
             };
             requests.push(DirectCallPlanRequest {
-                source: *source,
+                source,
                 target: serialized_target,
                 arg_plan,
-                reason: "profiled call_hot_targets selected this same-module function with validated ordinary-call arguments".to_string(),
+                reason: "profiled call_hot_targets selected this function with validated ordinary-call arguments".to_string(),
             });
+            identity_builder
+                .add_debug_name(serialized_target, target_function.names.qualname.clone());
         }
     }
     (requests, diagnostics)
@@ -728,13 +884,16 @@ pub fn generate_optimization_plans_v3_for_cached_modules(
     module_inputs: impl IntoIterator<Item = CachedModuleOptimizationInput>,
     out_root: &Path,
 ) -> Result<OptimizationPlanGenerationSummary> {
+    let module_inputs = module_inputs.into_iter().collect::<Vec<_>>();
+    let target_index = DirectCallTargetIndex::from_cached_modules(module_inputs.as_slice())?;
     let mut summary = OptimizationPlanGenerationSummary::default();
     for module_input in module_inputs {
-        match generate_module_optimization_plan_v3(
+        match generate_module_optimization_plan_v3_with_target_index(
             evidence_store,
             module_input.module_path.as_path(),
             out_root,
             module_input.strict,
+            &target_index,
         )? {
             Some(report) => summary.reports.push(report),
             None => summary.skipped += 1,
@@ -763,15 +922,51 @@ pub fn generate_module_optimization_plan_v3(
 ) -> Result<Option<ModuleOptimizationPlanReport>> {
     let cache = load_codegen_module_cache(module_path)
         .with_context(|| format!("load BlockPy module cache {}", module_path.display()))?;
+    let target_index = DirectCallTargetIndex::from_current_module(&cache.metadata, &cache.module);
+    generate_loaded_module_optimization_plan_v3(
+        evidence_store,
+        cache,
+        out_root,
+        strict,
+        &target_index,
+    )
+}
+
+fn generate_module_optimization_plan_v3_with_target_index(
+    evidence_store: &ProfileEvidenceStore,
+    module_path: &Path,
+    out_root: &Path,
+    strict: bool,
+    target_index: &DirectCallTargetIndex,
+) -> Result<Option<ModuleOptimizationPlanReport>> {
+    let cache = load_codegen_module_cache(module_path)
+        .with_context(|| format!("load BlockPy module cache {}", module_path.display()))?;
+    generate_loaded_module_optimization_plan_v3(
+        evidence_store,
+        cache,
+        out_root,
+        strict,
+        target_index,
+    )
+}
+
+fn generate_loaded_module_optimization_plan_v3(
+    evidence_store: &ProfileEvidenceStore,
+    cache: CachedCodegenModule,
+    out_root: &Path,
+    strict: bool,
+    target_index: &DirectCallTargetIndex,
+) -> Result<Option<ModuleOptimizationPlanReport>> {
     if !counter_evidence_matches_cached_module_v3(evidence_store, &cache, strict)? {
         return Ok(None);
     }
     let catalog = AlternativeCatalog::default_v3();
-    let artifacts = plan_and_emit_module_v3_from_raw_evidence(
+    let artifacts = plan_and_emit_module_v3_from_raw_evidence_with_target_index(
         &catalog,
         &cache.metadata,
         &cache.module,
         evidence_store,
+        target_index,
     )
     .map_err(|err| anyhow!("generate optimizer v3 plan: {err}"))?;
     let output_path = module_optimization_plan_v3_path(

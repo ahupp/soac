@@ -22,12 +22,14 @@ use crate::region_v3::{
 };
 use soac_core::block_py::{
     BinOpKind, InstrId, NameLike, NameLocation, ResolvedName, SerializedFunctionId,
+    SerializedIdentityTables,
 };
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModulePlanRequest {
     pub module: ModulePlanIdentity,
+    pub identity_tables: SerializedIdentityTables,
     pub functions: Vec<FunctionPlanRequest>,
 }
 
@@ -113,6 +115,7 @@ pub fn plan_module_optimization_v3(
 ) -> ModuleOptimizationPlanV3 {
     ModuleOptimizationPlanV3 {
         module: request.module,
+        identity_tables: request.identity_tables,
         helper_catalog_version: catalog.version,
         cost_model_version: 1,
         functions: request
@@ -1488,7 +1491,8 @@ mod tests {
     use soac_core::block_py::{
         BinOp, Block, BlockEdge, BlockLabel, BlockParam, BlockPyFunction, BlockPyName, BlockTerm,
         FunctionName, Load, LocalFunctionId, LocalLocation, Meta, ModuleNameGen, NameLocation,
-        ParamSpec, SerializedFunctionId, SerializedModuleId, Store, TermIf, WithMeta,
+        ParamSpec, SerializedFunctionId, SerializedIdentityTables, SerializedModuleId,
+        SerializedModuleIdentity, Store, TermIf, WithMeta,
     };
     use soac_lowering::passes::{CodegenModuleShape, InstrCodegen};
 
@@ -1679,6 +1683,14 @@ mod tests {
                 module_name: "pkg.mod".to_string(),
                 source_hash: 0x55,
                 cache_identity: "test-cache".to_string(),
+            },
+            identity_tables: SerializedIdentityTables {
+                modules: vec![SerializedModuleIdentity {
+                    module_name: "pkg.mod".to_string(),
+                    source_hash: 0x55,
+                    cache_identity: Some("test-cache".to_string()),
+                }],
+                debug_names: Vec::new(),
             },
             functions: vec![FunctionPlanRequest {
                 function: FunctionPlanIdentity {

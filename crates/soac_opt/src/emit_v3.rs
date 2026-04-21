@@ -382,7 +382,10 @@ mod tests {
         MaterializeNode, ModulePlanIdentity, RegionExitPlan, RegionInput, RegionPlan, RegionSource,
         Rep,
     };
-    use soac_core::block_py::{BlockLabel, LocalFunctionId, SerializedModuleId};
+    use soac_core::block_py::{
+        BlockLabel, LocalFunctionId, SerializedIdentityTables, SerializedModuleId,
+        SerializedModuleIdentity,
+    };
 
     fn test_plan(include_materialization: bool) -> ModuleOptimizationPlanV3 {
         let lhs = PlanValue::new(0, Rep::I64);
@@ -446,6 +449,14 @@ mod tests {
                 module_name: "pkg.mod".to_string(),
                 source_hash: 0x77,
                 cache_identity: "test-cache".to_string(),
+            },
+            identity_tables: SerializedIdentityTables {
+                modules: vec![SerializedModuleIdentity {
+                    module_name: "pkg.mod".to_string(),
+                    source_hash: 0x77,
+                    cache_identity: Some("test-cache".to_string()),
+                }],
+                debug_names: Vec::new(),
             },
             helper_catalog_version: 1,
             cost_model_version: 1,

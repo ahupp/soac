@@ -1,4 +1,6 @@
-use soac_core::block_py::{InstrId, SerializedFunctionId};
+use soac_core::block_py::{
+    InstrId, SerializedFunctionId, SerializedIdentityTables, SerializedModuleId,
+};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
@@ -7,6 +9,7 @@ pub const EXACT_LIST_EXACT_INT_ITEM_SHAPE_TAG: u64 = 1;
 #[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct ModuleOptimizationPlanV3 {
     pub module: ModulePlanIdentity,
+    pub identity_tables: SerializedIdentityTables,
     pub helper_catalog_version: u32,
     pub cost_model_version: u32,
     pub functions: Vec<FunctionOptimizationPlanV3>,
@@ -737,13 +740,34 @@ pub fn validate_module_plan_v3(plan: &ModuleOptimizationPlanV3) -> Result<(), Pl
     if plan.module.module_name.is_empty() {
         errors.push("module identity has empty module name".to_string());
     }
+    if plan
+        .identity_tables
+        .module(SerializedModuleId::new(0))
+        .is_err()
+    {
+        errors.push("module identity table is missing current module id 0".to_string());
+    }
     for function in &plan.functions {
-        validate_function_plan(function, &mut errors);
+        validate_function_plan(function, &plan.identity_tables, &mut errors);
     }
     finish_validation(errors)
 }
 
-fn validate_function_plan(function: &FunctionOptimizationPlanV3, errors: &mut Vec<String>) {
+fn validate_function_plan(
+    function: &FunctionOptimizationPlanV3,
+    identity_tables: &SerializedIdentityTables,
+    errors: &mut Vec<String>,
+) {
+    if identity_tables
+        .module(function.function.function.module_id())
+        .is_err()
+    {
+        errors.push(format!(
+            "function {} references missing module id {}",
+            function.function.function,
+            function.function.function.module_id()
+        ));
+    }
     let mut region_ids = HashSet::new();
     for region in &function.regions {
         if !region_ids.insert(region.id) {
@@ -786,7 +810,7 @@ fn validate_function_plan(function: &FunctionOptimizationPlanV3, errors: &mut Ve
             errors,
         );
     }
-    validate_direct_call_plans(function, errors);
+    validate_direct_call_plans(function, identity_tables, errors);
     validate_exact_list_item_plans(function, errors);
     validate_indexed_field_plans(function, errors);
     validate_indexed_global_plans(function, errors);
@@ -800,7 +824,11 @@ fn validate_function_plan(function: &FunctionOptimizationPlanV3, errors: &mut Ve
     }
 }
 
-fn validate_direct_call_plans(function: &FunctionOptimizationPlanV3, errors: &mut Vec<String>) {
+fn validate_direct_call_plans(
+    function: &FunctionOptimizationPlanV3,
+    identity_tables: &SerializedIdentityTables,
+    errors: &mut Vec<String>,
+) {
     let mut seen = HashSet::new();
     for direct_call in &function.direct_calls {
         if !seen.insert((direct_call.source, direct_call.target)) {
@@ -815,10 +843,15 @@ fn validate_direct_call_plans(function: &FunctionOptimizationPlanV3, errors: &mu
                 function.function.function, direct_call.target, direct_call.source
             ));
         }
-        if direct_call.target.module_id() != function.function.function.module_id() {
+        if identity_tables
+            .module(direct_call.target.module_id())
+            .is_err()
+        {
             errors.push(format!(
-                "function {} direct-call target {} is cross-module; v3 direct-call selections currently require same-module targets",
-                function.function.function, direct_call.target
+                "function {} direct-call target {} references missing module id {}",
+                function.function.function,
+                direct_call.target,
+                direct_call.target.module_id()
             ));
         }
         validate_direct_call_arg_plan(function, direct_call, errors);
@@ -1991,7 +2024,9 @@ fn finish_validation(errors: Vec<String>) -> Result<(), PlanValidationError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soac_core::block_py::{BlockLabel, LocalFunctionId, SerializedModuleId};
+    use soac_core::block_py::{
+        BlockLabel, LocalFunctionId, SerializedModuleId, SerializedModuleIdentity,
+    };
 
     fn function_id() -> SerializedFunctionId {
         SerializedFunctionId::new(SerializedModuleId::new(0), LocalFunctionId::new(1))
@@ -2043,6 +2078,14 @@ mod tests {
                 source_hash: 0x1234,
                 cache_identity: "test-cache".to_string(),
             },
+            identity_tables: SerializedIdentityTables {
+                modules: vec![SerializedModuleIdentity {
+                    module_name: "pkg.mod".to_string(),
+                    source_hash: 0x1234,
+                    cache_identity: Some("test-cache".to_string()),
+                }],
+                debug_names: Vec::new(),
+            },
             helper_catalog_version: 1,
             cost_model_version: 1,
             functions: vec![FunctionOptimizationPlanV3 {
@@ -2089,7 +2132,27 @@ mod tests {
     }
 
     #[test]
-    fn rejects_cross_module_direct_call_selections() {
+    fn validates_cross_module_direct_call_selections_with_identity() {
+        let target = SerializedFunctionId::new(SerializedModuleId::new(1), LocalFunctionId::new(2));
+        let mut plan = module_with_direct_calls(vec![DirectCallSpecializationPlan {
+            source: instr_id(7),
+            target,
+            arg_plan: DirectCallArgPlan {
+                sources: vec![DirectCallArgSource::Provided(0)],
+            },
+            reason: "profiled call target".to_string(),
+        }]);
+        plan.identity_tables.modules.push(SerializedModuleIdentity {
+            module_name: "pkg.callee".to_string(),
+            source_hash: 0x5678,
+            cache_identity: None,
+        });
+
+        validate_module_plan_v3(&plan).unwrap();
+    }
+
+    #[test]
+    fn rejects_direct_call_selections_with_missing_target_module_identity() {
         let target = SerializedFunctionId::new(SerializedModuleId::new(1), LocalFunctionId::new(2));
         let plan = module_with_direct_calls(vec![DirectCallSpecializationPlan {
             source: instr_id(7),
@@ -2099,9 +2162,8 @@ mod tests {
             },
             reason: "profiled call target".to_string(),
         }]);
-
         let err = validate_module_plan_v3(&plan).unwrap_err();
-        assert!(err.to_string().contains("cross-module"));
+        assert!(err.to_string().contains("missing module id 1"));
     }
 
     #[test]

@@ -103,7 +103,7 @@ mod tests {
     use soac_core::block_py::{
         BinOp, BinOpKind, Block, BlockLabel, BlockParam, BlockPyName, BlockTerm, InstrId, Load,
         LocalFunctionId, LocalLocation, Meta, NameLocation, ResolvedName, SerializedFunctionId,
-        SerializedModuleId, TermIf, WithMeta,
+        SerializedIdentityTables, SerializedModuleId, SerializedModuleIdentity, TermIf, WithMeta,
     };
     use soac_lowering::block_py::literal::{IntLiteral, LiteralValue, NumberLiteral};
 
@@ -226,6 +226,14 @@ mod tests {
                     module_name: "pkg.mod".to_string(),
                     source_hash: 0x88,
                     cache_identity: "test-cache".to_string(),
+                },
+                identity_tables: SerializedIdentityTables {
+                    modules: vec![SerializedModuleIdentity {
+                        module_name: "pkg.mod".to_string(),
+                        source_hash: 0x88,
+                        cache_identity: Some("test-cache".to_string()),
+                    }],
+                    debug_names: Vec::new(),
                 },
                 functions: vec![FunctionPlanRequest {
                     function: FunctionPlanIdentity {

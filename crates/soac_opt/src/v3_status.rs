@@ -32,7 +32,7 @@ pub const V3_OPTIMIZATION_FAMILY_STATUS: &[V3OptimizationFamilyStatus] = &[
         family: "profiled direct calls",
         legacy_input: "call_hot_targets",
         status: V3MigrationStatus::LiveCodegenInputOnly,
-        next_step: "add cross-module target support and method/constructor variants",
+        next_step: "add method/constructor variants",
     },
     V3OptimizationFamilyStatus {
         family: "exact-list getitem and setitem",
