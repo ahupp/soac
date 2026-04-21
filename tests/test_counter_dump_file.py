@@ -55,8 +55,8 @@ def _assert_subprocess_ok(result):
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def _decide_optimizations_for_env(work_dir):
-    return decide_optimizations_for_work_dir(work_dir)
+def _decide_optimizations_for_env(work_dir, *, mode="legacy"):
+    return decide_optimizations_for_work_dir(work_dir, mode=mode)
 
 
 def _import_and_run_script(module_root, import_stmt, body):
@@ -489,7 +489,7 @@ def test_apply_mode_default_event_log_omits_specialization_runtime_counters(
     assert not runtime_rows, runtime_rows
 
 
-def test_getitem_profile_replay_records_hit_and_fallback_counters(tmp_path):
+def test_getitem_v3_profile_replay_records_hit_and_fallback_counters(tmp_path):
     module_path = tmp_path / "getitem_specialization_case.py"
     module_path.write_text(
         """
@@ -517,7 +517,9 @@ def run_case():
         "import getitem_specialization_case",
         "assert getitem_specialization_case.run_case() == 182",
     )
-    base_env = _soac_subprocess_env(tmp_path, work_dir=work_dir)
+    base_env = _soac_subprocess_env(
+        tmp_path, work_dir=work_dir, extra_env={"SOAC_OPT_PLAN_MODE": "v3"}
+    )
 
     profile_result = _run_soac_subprocess(
         script,
@@ -536,7 +538,7 @@ def run_case():
         and row["value"] > 0
     ]
     assert profiled_shapes, profile
-    assert _decide_optimizations_for_env(work_dir) >= 1
+    assert _decide_optimizations_for_env(work_dir, mode="v3") >= 1
 
     verify_result = _run_soac_subprocess(
         script,
@@ -563,7 +565,7 @@ def run_case():
     assert fallback_count >= 1, verify
 
 
-def test_setitem_profile_replay_records_hit_and_fallback_counters(tmp_path):
+def test_setitem_v3_profile_replay_records_hit_and_fallback_counters(tmp_path):
     module_path = tmp_path / "setitem_specialization_case.py"
     module_path.write_text(
         """
@@ -594,7 +596,9 @@ def run_case():
         "import setitem_specialization_case",
         "assert setitem_specialization_case.run_case() == 281",
     )
-    base_env = _soac_subprocess_env(tmp_path, work_dir=work_dir)
+    base_env = _soac_subprocess_env(
+        tmp_path, work_dir=work_dir, extra_env={"SOAC_OPT_PLAN_MODE": "v3"}
+    )
 
     profile_result = _run_soac_subprocess(
         script,
@@ -613,7 +617,7 @@ def run_case():
         and row["value"] > 0
     ]
     assert profiled_shapes, profile
-    assert _decide_optimizations_for_env(work_dir) >= 1
+    assert _decide_optimizations_for_env(work_dir, mode="v3") >= 1
 
     verify_result = _run_soac_subprocess(
         script,

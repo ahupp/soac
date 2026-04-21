@@ -795,9 +795,9 @@ than by legacy `mod.opt` shape decisions. The v3 plan records the lowered
 `GetItem`/`SetItem` source, access kind, exact-list/exact-int shape, explicit
 exact-list/exact-compact-int in-bounds guard, and original item-access fallback.
 The current JIT still uses the existing inline list load/store emitter for the
-selected shape. In v3 mode the emitted exact-list item node is consumed
-directly; legacy replayed item-shape maps are only used when no v3 artifact is
-loaded. The generic `dp_jit_pyobject_getitem` and `dp_jit_pyobject_setitem`
+selected shape. The emitted exact-list item node is consumed directly; legacy
+replayed item-shape maps are no longer consumed by JIT lowering for this
+family. The generic `dp_jit_pyobject_getitem` and `dp_jit_pyobject_setitem`
 helpers intentionally do not contain an exact-list fast path; unplanned item
 access goes through the CPython item APIs.
 
@@ -815,13 +815,12 @@ access goes through the CPython item APIs.
 ### Codegen
 
 - `GetItem` lowering routes through the operation-specialization module.
-- Without counters or replayed hot shapes, `GetItem` stays on the generic
+- Without counters or v3 exact-list item emissions, `GetItem` stays on the generic
   `PyObject_GetItem` path.
 - With `getitem_hot_shapes` counters, profile/verify mode records the dispatch
-  shape after evaluating operands, then uses the generic path unless a replayed
-  hot shape selected the specialized arm. In v3 mode, the validated
-  exact-list item emission in `mod.optv3` selects the specialized arm directly
-  rather than being converted back into a replayed hot shape.
+  shape after evaluating operands. The validated exact-list item emission in
+  `mod.optv3` selects the specialized arm directly; legacy `mod.opt` item-shape
+  selections are not consumed by JIT lowering.
 - The first specialized arm guards:
   - the object is exactly `PyList_Type`
   - the index object is exactly `PyLong_Type`
@@ -870,13 +869,12 @@ access goes through the CPython item APIs.
 ### Codegen
 
 - `SetItem` lowering routes through the operation-specialization module.
-- Without counters or replayed hot shapes, `SetItem` stays on the generic
+- Without counters or v3 exact-list item emissions, `SetItem` stays on the generic
   `PyObject_SetItem` helper path.
 - With `setitem_hot_shapes` counters, profile/verify mode records the dispatch
-  shape after evaluating operands, then uses the generic path unless a replayed
-  hot shape selected the specialized arm. In v3 mode, the validated
-  exact-list item emission in `mod.optv3` selects the specialized arm directly
-  rather than being converted back into a replayed hot shape.
+  shape after evaluating operands. The validated exact-list item emission in
+  `mod.optv3` selects the specialized arm directly; legacy `mod.opt` item-shape
+  selections are not consumed by JIT lowering.
 - The specialized arm guards:
   - the object is exactly `PyList_Type`
   - the index object is exactly `PyLong_Type`

@@ -8292,15 +8292,12 @@ struct JitEmitCtx<'mc> {
     operator_specialized_fallback_counter_ids: &'mc HashMap<InstrId, CounterId>,
     opt_v3_exact_int_branch_artifacts: Option<Arc<ExactIntBranchV3Artifacts>>,
     getitem_shape_counter_ids: &'mc HashMap<InstrId, CounterId>,
-    getitem_specializations: &'mc HashMap<InstrId, Vec<u64>>,
     getitem_specialized_hit_counter_ids: &'mc HashMap<InstrId, CounterId>,
     getitem_specialized_fallback_counter_ids: &'mc HashMap<InstrId, CounterId>,
     setitem_shape_counter_ids: &'mc HashMap<InstrId, CounterId>,
-    setitem_specializations: &'mc HashMap<InstrId, Vec<u64>>,
     setitem_specialized_hit_counter_ids: &'mc HashMap<InstrId, CounterId>,
     setitem_specialized_fallback_counter_ids: &'mc HashMap<InstrId, CounterId>,
     opt_v3_exact_list_items_by_instr: &'mc HashMap<InstrId, OptV3ExactListItemAccessPlan>,
-    allow_legacy_item_specializations: bool,
     branch_outcome_counter_ids: &'mc HashMap<InstrId, CounterId>,
     branch_prefer_true: &'mc HashMap<InstrId, bool>,
     global_indexed_hit_counter_ids: &'mc HashMap<InstrId, CounterId>,
@@ -13438,8 +13435,6 @@ struct FunctionSpecializationInputs {
     call_target_specializations: HashMap<InstrId, Vec<RuntimeFunctionId>>,
     direct_function_call_guards: HashMap<InstrId, Vec<TypedDirectFunctionCallGuard>>,
     operator_specializations: HashMap<InstrId, Vec<u64>>,
-    getitem_specializations: HashMap<InstrId, Vec<u64>>,
-    setitem_specializations: HashMap<InstrId, Vec<u64>>,
     opt_v3_exact_list_items_by_instr: HashMap<InstrId, OptV3ExactListItemAccessPlan>,
     field_index_specializations: HashMap<String, Vec<FieldIndexSpecialization>>,
     field_index_specializations_by_instr: HashMap<InstrId, Vec<FieldIndexSpecialization>>,
@@ -13449,7 +13444,6 @@ struct FunctionSpecializationInputs {
     cold_block_labels: HashSet<BlockLabel>,
     opt_v3_exact_int_branch_artifacts: Option<Arc<ExactIntBranchV3Artifacts>>,
     allow_legacy_indexed_globals: bool,
-    allow_legacy_item_specializations: bool,
     behavior_change_indexed_stores: bool,
     guard_miss_deopt_stub: bool,
 }
@@ -14436,8 +14430,6 @@ fn planned_optimization_inputs_for_precompile(
 fn function_profile_evidence_is_empty(evidence: &FunctionProfileEvidence) -> bool {
     evidence.call_target_specializations.is_empty()
         && evidence.operator_specializations.is_empty()
-        && evidence.getitem_specializations.is_empty()
-        && evidence.setitem_specializations.is_empty()
         && evidence.field_index_specializations.is_empty()
         && evidence.branch_prefer_true.is_empty()
 }
@@ -14698,8 +14690,6 @@ impl FunctionSpecializationInputs {
             direct_function_call_guards: profile
                 .codegen_direct_function_call_guards(function.function_id),
             operator_specializations: profile.operator_specializations(function.function_id)?,
-            getitem_specializations: profile.getitem_specializations(function.function_id)?,
-            setitem_specializations: profile.setitem_specializations(function.function_id)?,
             opt_v3_exact_list_items_by_instr: profile
                 .opt_v3_emitted_exact_list_items
                 .get(&function.function_id)
@@ -14720,7 +14710,6 @@ impl FunctionSpecializationInputs {
                 .get(&function.function_id)
                 .cloned(),
             allow_legacy_indexed_globals: !profile.loaded_opt_v3_plan,
-            allow_legacy_item_specializations: !profile.loaded_opt_v3_plan,
             behavior_change_indexed_stores: profile.behavior_change_indexed_stores
                 && function.scope.scope_kind != CallableScopeKind::Module,
             guard_miss_deopt_stub: profile.guard_miss_deopt
@@ -14871,28 +14860,6 @@ impl<'a> SpecializationProfile<'a> {
             .planned_evidence
             .get(&function_id)
             .map(|evidence| evidence.operator_specializations.clone())
-            .unwrap_or_default())
-    }
-
-    fn getitem_specializations(
-        &self,
-        function_id: RuntimeFunctionId,
-    ) -> Result<HashMap<InstrId, Vec<u64>>, String> {
-        Ok(self
-            .planned_evidence
-            .get(&function_id)
-            .map(|evidence| evidence.getitem_specializations.clone())
-            .unwrap_or_default())
-    }
-
-    fn setitem_specializations(
-        &self,
-        function_id: RuntimeFunctionId,
-    ) -> Result<HashMap<InstrId, Vec<u64>>, String> {
-        Ok(self
-            .planned_evidence
-            .get(&function_id)
-            .map(|evidence| evidence.setitem_specializations.clone())
             .unwrap_or_default())
     }
 
@@ -29664,8 +29631,6 @@ fn build_cranelift_run_bb_specialized_function(
     let call_target_specializations = specialization_inputs.call_target_specializations;
     let direct_function_call_guards = specialization_inputs.direct_function_call_guards;
     let operator_specializations = specialization_inputs.operator_specializations;
-    let getitem_specializations = specialization_inputs.getitem_specializations;
-    let setitem_specializations = specialization_inputs.setitem_specializations;
     let opt_v3_exact_list_items_by_instr = specialization_inputs.opt_v3_exact_list_items_by_instr;
     let field_index_specializations = specialization_inputs.field_index_specializations;
     let field_index_specializations_by_instr =
@@ -29681,7 +29646,6 @@ fn build_cranelift_run_bb_specialized_function(
     )?;
     let behavior_change_indexed_stores = specialization_inputs.behavior_change_indexed_stores;
     let allow_legacy_indexed_globals = specialization_inputs.allow_legacy_indexed_globals;
-    let allow_legacy_item_specializations = specialization_inputs.allow_legacy_item_specializations;
     let guard_miss_deopt_stub = specialization_inputs.guard_miss_deopt_stub;
     let function_runtime_data_layout = FunctionRuntimeDataLayout::from_function(function);
     let true_constant_id = module_constants.require_runtime_name_constant_id("TRUE");
@@ -30367,15 +30331,12 @@ fn build_cranelift_run_bb_specialized_function(
                     &operator_specialized_fallback_counter_ids,
                 opt_v3_exact_int_branch_artifacts: opt_v3_exact_int_branch_artifacts.clone(),
                 getitem_shape_counter_ids: &getitem_shape_counter_ids,
-                getitem_specializations: &getitem_specializations,
                 getitem_specialized_hit_counter_ids: &getitem_specialized_hit_counter_ids,
                 getitem_specialized_fallback_counter_ids: &getitem_specialized_fallback_counter_ids,
                 setitem_shape_counter_ids: &setitem_shape_counter_ids,
-                setitem_specializations: &setitem_specializations,
                 setitem_specialized_hit_counter_ids: &setitem_specialized_hit_counter_ids,
                 setitem_specialized_fallback_counter_ids: &setitem_specialized_fallback_counter_ids,
                 opt_v3_exact_list_items_by_instr: &opt_v3_exact_list_items_by_instr,
-                allow_legacy_item_specializations,
                 global_indexed_hit_counter_ids: &global_indexed_hit_counter_ids,
                 global_indexed_fallback_counter_ids: &global_indexed_fallback_counter_ids,
                 opt_v3_indexed_globals_by_instr: &opt_v3_indexed_globals_by_instr,

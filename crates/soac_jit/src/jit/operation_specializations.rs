@@ -26,12 +26,6 @@ struct RawPyLongObject {
     long_value: RawPyLongValue,
 }
 
-fn legacy_exact_list_exact_int_selected(hot_shapes: &[u64]) -> bool {
-    hot_shapes
-        .iter()
-        .any(|shape| *shape == EXACT_LIST_EXACT_INT_ITEM_SHAPE_TAG)
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ExactListItemLoweringPlan {
     access: ExactListItemAccessKind,
@@ -51,15 +45,6 @@ impl ExactListItemLoweringPlan {
             shape: plan.shape,
             guard: plan.guard,
             fallback: plan.fallback,
-        }
-    }
-
-    fn legacy_exact_list_exact_int(access: ExactListItemAccessKind) -> Self {
-        Self {
-            access,
-            shape: ExactListItemShape::ExactListExactInt,
-            guard: ExactListItemGuardKind::ExactListExactCompactIntInBounds,
-            fallback: ExactListItemFallbackKind::OriginalItemAccess,
         }
     }
 
@@ -90,54 +75,28 @@ impl ExactListItemLoweringPlan {
     }
 }
 
-fn selected_getitem_lowering_plan<'fb>(
+fn selected_v3_getitem_lowering_plan<'fb>(
     state: &impl OperationEmitState<'fb, InstrCodegen>,
     instr_id: InstrId,
 ) -> Option<ExactListItemLoweringPlan> {
-    if let Some(plan) = state
+    state
         .ctx()
         .opt_v3_exact_list_items_by_instr
         .get(&instr_id)
         .filter(|plan| plan.access == ExactListItemAccessKind::Get)
-    {
-        return Some(ExactListItemLoweringPlan::from_v3(
-            plan,
-            ExactListItemAccessKind::Get,
-        ));
-    }
-
-    if !state.ctx().allow_legacy_item_specializations {
-        return None;
-    }
-    let hot_shapes = state.ctx().getitem_specializations.get(&instr_id)?;
-    legacy_exact_list_exact_int_selected(hot_shapes).then(|| {
-        ExactListItemLoweringPlan::legacy_exact_list_exact_int(ExactListItemAccessKind::Get)
-    })
+        .map(|plan| ExactListItemLoweringPlan::from_v3(plan, ExactListItemAccessKind::Get))
 }
 
-fn selected_setitem_lowering_plan<'fb>(
+fn selected_v3_setitem_lowering_plan<'fb>(
     state: &impl OperationEmitState<'fb, InstrCodegen>,
     instr_id: InstrId,
 ) -> Option<ExactListItemLoweringPlan> {
-    if let Some(plan) = state
+    state
         .ctx()
         .opt_v3_exact_list_items_by_instr
         .get(&instr_id)
         .filter(|plan| plan.access == ExactListItemAccessKind::Set)
-    {
-        return Some(ExactListItemLoweringPlan::from_v3(
-            plan,
-            ExactListItemAccessKind::Set,
-        ));
-    }
-
-    if !state.ctx().allow_legacy_item_specializations {
-        return None;
-    }
-    let hot_shapes = state.ctx().setitem_specializations.get(&instr_id)?;
-    legacy_exact_list_exact_int_selected(hot_shapes).then(|| {
-        ExactListItemLoweringPlan::legacy_exact_list_exact_int(ExactListItemAccessKind::Set)
-    })
+        .map(|plan| ExactListItemLoweringPlan::from_v3(plan, ExactListItemAccessKind::Set))
 }
 
 pub(super) fn emit_getitem<'fb>(
@@ -160,7 +119,7 @@ pub(super) fn emit_getitem<'fb>(
         .getitem_specialized_fallback_counter_ids
         .get(&instr_id)
         .copied();
-    let lowering_plan = selected_getitem_lowering_plan(state, instr_id);
+    let lowering_plan = selected_v3_getitem_lowering_plan(state, instr_id);
     if shape_counter_id.is_none() && lowering_plan.is_none() {
         return emit_generic_getitem_from_exprs(op, state);
     }
@@ -206,7 +165,7 @@ pub(super) fn emit_setitem<'fb>(
         .setitem_specialized_fallback_counter_ids
         .get(&instr_id)
         .copied();
-    let lowering_plan = selected_setitem_lowering_plan(state, instr_id);
+    let lowering_plan = selected_v3_setitem_lowering_plan(state, instr_id);
     if shape_counter_id.is_none() && lowering_plan.is_none() {
         return emit_generic_setitem_from_exprs(op, state);
     }

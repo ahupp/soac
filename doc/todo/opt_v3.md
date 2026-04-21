@@ -167,9 +167,10 @@ Partially migrated families are also intentionally visible:
   in-bounds guard and original item-access fallback effects. The JIT validates
   emitted access kind against lowered `GetItem`/`SetItem` sites and consumes the
   v3 entry directly as the item-specialization input, without translating it
-  through legacy hot-shape maps. The final inline list load/store lowering still
-  lives in the existing operation-specialization emitter rather than a
-  v3-specific operation node.
+  through legacy hot-shape maps. Legacy item hot-shape maps remain serialized
+  profiling evidence for planning, but are no longer consumed by JIT lowering.
+  The final inline list load/store builder remains in the operation-specialization
+  module as a mechanical lowering helper for the validated v3 item node.
 
 Remaining scalar cleanup:
 
