@@ -91,7 +91,7 @@ fields of one model. This keeps staged lowering while reducing translation-only 
 ### Build Support For Vendored CPython (done)
 
 The build scripts for `soac_jit`, `soac_inspector`, and `soac_pyo3` duplicate vendored `libpython`
-discovery and Cargo link directive emission. `build_support/src/lib.rs` already provides
+discovery and Cargo link directive emission. `crates/build_support/src/lib.rs` already provides
 shared build identity support; extend build support with vendored-CPython library discovery and link
 emission helpers.
 

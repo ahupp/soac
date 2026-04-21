@@ -15,6 +15,6 @@ Build script for the `_soac_ext` Python extension. It links against the vendored
 
 ## Context Read
 
-- `build_support/src/lib.rs`
+- `crates/build_support/src/lib.rs`
 - `crates/soac_inspector/build.rs`
 

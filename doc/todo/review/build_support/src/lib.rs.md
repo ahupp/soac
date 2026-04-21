@@ -1,4 +1,4 @@
-# build_support/src/lib.rs
+# crates/build_support/src/lib.rs
 
 ## File Responsibilities
 
