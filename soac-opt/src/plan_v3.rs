@@ -38,7 +38,19 @@ pub struct FunctionPlanIdentity {
 pub struct DirectCallSpecializationPlan {
     pub source: InstrId,
     pub target: SerializedFunctionId,
+    pub arg_plan: DirectCallArgPlan,
     pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct DirectCallArgPlan {
+    pub sources: Vec<DirectCallArgSource>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub enum DirectCallArgSource {
+    Provided(u32),
+    DefaultSentinel,
 }
 
 #[derive(
@@ -643,6 +655,38 @@ fn validate_direct_call_plans(function: &FunctionOptimizationPlanV3, errors: &mu
                 "function {} direct-call target {} is cross-module; v3 direct-call selections currently require same-module targets",
                 function.function.function, direct_call.target
             ));
+        }
+        validate_direct_call_arg_plan(function, direct_call, errors);
+    }
+}
+
+fn validate_direct_call_arg_plan(
+    function: &FunctionOptimizationPlanV3,
+    direct_call: &DirectCallSpecializationPlan,
+    errors: &mut Vec<String>,
+) {
+    let mut next_provided = 0u32;
+    let mut saw_default = false;
+    for source in &direct_call.arg_plan.sources {
+        match source {
+            DirectCallArgSource::Provided(index) => {
+                if saw_default {
+                    errors.push(format!(
+                        "function {} direct-call target {} at {} has provided argument after a default sentinel",
+                        function.function.function, direct_call.target, direct_call.source
+                    ));
+                }
+                if *index != next_provided {
+                    errors.push(format!(
+                        "function {} direct-call target {} at {} has non-contiguous provided argument index {}, expected {}",
+                        function.function.function, direct_call.target, direct_call.source, index, next_provided
+                    ));
+                }
+                next_provided = next_provided.saturating_add(1);
+            }
+            DirectCallArgSource::DefaultSentinel => {
+                saw_default = true;
+            }
         }
     }
 }
@@ -1712,6 +1756,9 @@ mod tests {
         let plan = module_with_direct_calls(vec![DirectCallSpecializationPlan {
             source: instr_id(7),
             target,
+            arg_plan: DirectCallArgPlan {
+                sources: vec![DirectCallArgSource::Provided(0)],
+            },
             reason: "profiled call target".to_string(),
         }]);
 
@@ -1724,6 +1771,9 @@ mod tests {
         let plan = module_with_direct_calls(vec![DirectCallSpecializationPlan {
             source: instr_id(7),
             target,
+            arg_plan: DirectCallArgPlan {
+                sources: vec![DirectCallArgSource::Provided(0)],
+            },
             reason: "profiled call target".to_string(),
         }]);
 

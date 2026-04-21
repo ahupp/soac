@@ -32,10 +32,12 @@ pub(super) fn annotate_typed_call_accesses(
     function: &mut BlockPyFunction<TypedCodegenModuleShape>,
     ctx: &CallSpecializationCtx<'_>,
     call_target_specializations: &HashMap<InstrId, Vec<RuntimeFunctionId>>,
+    direct_function_call_guards: &HashMap<InstrId, Vec<TypedDirectFunctionCallGuard>>,
 ) -> usize {
     struct Annotator<'a> {
         ctx: &'a CallSpecializationCtx<'a>,
         call_target_specializations: &'a HashMap<InstrId, Vec<RuntimeFunctionId>>,
+        direct_function_call_guards: &'a HashMap<InstrId, Vec<TypedDirectFunctionCallGuard>>,
         count: usize,
     }
 
@@ -43,6 +45,16 @@ pub(super) fn annotate_typed_call_accesses(
         fn visit_instr_mut(&mut self, expr: &mut InstrTyped) {
             expr.visit_children_mut(self);
             if let InstrTyped::CallTyped(op) = expr
+                && let Some(instr_id) = op.try_semantic_instr_id()
+                && let Some(function_guards) = self.direct_function_call_guards.get(&instr_id)
+                && !function_guards.is_empty()
+            {
+                op.access = TypedCallAccessPlan::GuardedCallable {
+                    function_guards: function_guards.clone(),
+                    constructor_guards: Vec::new(),
+                };
+                self.count += 1;
+            } else if let InstrTyped::CallTyped(op) = expr
                 && let Some(instr_id) = op.try_semantic_instr_id()
                 && let Some(targets) = self.call_target_specializations.get(&instr_id)
                 && !targets.is_empty()
@@ -80,6 +92,7 @@ pub(super) fn annotate_typed_call_accesses(
     let mut annotator = Annotator {
         ctx,
         call_target_specializations,
+        direct_function_call_guards,
         count: 0,
     };
     for block in &mut function.blocks {
@@ -726,7 +739,9 @@ fn typed_direct_call_arg_plan(plan: &DirectCallArgPlan) -> TypedDirectCallArgPla
 mod tests {
     use super::*;
     use soac_core::block_py::Visit;
-    use soac_lowering::passes::{TypedDirectCallArgSource, lower_codegen_module_to_typed};
+    use soac_lowering::passes::{
+        TypedDirectCallArgPlan, TypedDirectCallArgSource, lower_codegen_module_to_typed,
+    };
     use soac_profile::CounterDumpTypeKey;
 
     fn lowered_module(source: &str) -> soac_core::block_py::BlockPyModule<CodegenModuleShape> {
@@ -818,9 +833,68 @@ mod tests {
             &mut typed_module.callable_defs[caller_index],
             &ctx,
             &call_target_specializations,
+            &HashMap::new(),
         );
         let caller = typed_function_by_qualname(&typed_module, "caller");
         (annotated, typed_call_accesses(caller), callee_id)
+    }
+
+    #[test]
+    fn annotates_preplanned_direct_function_guard_without_target_replanning() {
+        let source = r#"
+def callee(x):
+    return x
+
+def caller(y):
+    return callee(y)
+"#;
+        let module = lowered_module(source);
+        let callee_id = function_by_qualname(&module, "callee").function_id;
+        let mut typed_module = lower_codegen_module_to_typed(module.clone());
+        let caller_index = typed_module
+            .callable_defs
+            .iter()
+            .position(|function| function.names.qualname == "caller")
+            .expect("caller should lower");
+        let call_instr_id = typed_call_accesses(&typed_module.callable_defs[caller_index])
+            .into_iter()
+            .next()
+            .expect("caller should contain a call")
+            .0;
+
+        let direct_call_target_functions = HashMap::new();
+        let direct_edge_stats = DirectEdgeStats::default();
+        let ctx = CallSpecializationCtx {
+            module: &module,
+            direct_call_resolver: None,
+            direct_call_target_functions: &direct_call_target_functions,
+            direct_owner_attr_specializations: None,
+            direct_edge_stats: &direct_edge_stats,
+        };
+        let guard = TypedDirectFunctionCallGuard {
+            function_id: callee_id,
+            arg_plan: TypedDirectCallArgPlan {
+                sources: vec![TypedDirectCallArgSource::Provided(0)],
+            },
+        };
+        let annotated = annotate_typed_call_accesses(
+            &mut typed_module.callable_defs[caller_index],
+            &ctx,
+            &HashMap::new(),
+            &HashMap::from([(call_instr_id, vec![guard.clone()])]),
+        );
+        let caller = typed_function_by_qualname(&typed_module, "caller");
+        let calls = typed_call_accesses(caller);
+
+        assert_eq!(annotated, 1);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].1,
+            TypedCallAccessPlan::GuardedCallable {
+                function_guards: vec![guard],
+                constructor_guards: Vec::new(),
+            }
+        );
     }
 
     #[test]
@@ -908,6 +982,7 @@ def caller(it):\n    return it.__next__()\n",
             &mut typed_module.callable_defs[caller_index],
             &ctx,
             &call_target_specializations,
+            &HashMap::new(),
         );
         let caller = typed_function_by_qualname(&typed_module, "caller");
         let calls = typed_call_accesses(caller);
@@ -975,6 +1050,7 @@ def caller(cls, value):\n    return cls(value)\n",
             &mut typed_module.callable_defs[caller_index],
             &ctx,
             &call_target_specializations,
+            &HashMap::new(),
         );
         let caller = typed_function_by_qualname(&typed_module, "caller");
         let calls = typed_call_accesses(caller);
@@ -1034,6 +1110,7 @@ def caller(cls, value):\n    return cls(value)\n",
             &mut typed_module.callable_defs[caller_index],
             &ctx,
             &HashMap::from([(call_instr_id, vec![init_id])]),
+            &HashMap::new(),
         );
 
         assert_eq!(annotated, 1);

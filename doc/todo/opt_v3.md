@@ -106,10 +106,10 @@ Implemented:
 - `FunctionSpecializationInputs`: carries validated exact-int branch v3
   artifacts into the JIT build path, where codegen validates that the artifact
   function identity matches the function being compiled. Same-module profiled
-  direct-call decisions are derived from the mechanical `mod.optv3` emission as
-  v3-owned codegen inputs; they are merged into the direct-call specialization
-  input map only at `FunctionSpecializationInputs` construction, not rewritten
-  into legacy profile evidence.
+  direct-call decisions and ordinary-call argument plans are derived from the
+  mechanical `mod.optv3` emission as v3-owned codegen inputs; the JIT consumes
+  the emitted guard shape and derives a target map from it only for direct-call
+  function predeclaration, not as legacy profile evidence.
 - JIT term lowering now consumes matching exact-int direct-compare branch,
   add/compare branch, add/sub/mul/bitwise-return, and comparison-return
   artifacts by interpreting the mechanical hot region and its local generic
@@ -134,9 +134,10 @@ Partially migrated families are also intentionally visible:
 - scalar-threading is only implemented for the adjacent, no-exception,
   store-RHS-to-empty-compare shape;
 - profiled direct calls are represented as v3 plan selections plus mechanical
-  direct-call emissions and consumed as JIT direct-call specialization input for
-  same-module targets, but the direct-call lowering itself is still the
-  existing typed lowering rather than a mechanical v3 call node.
+  direct-call emissions with validated ordinary-call argument plans and consumed
+  as JIT direct-call guard input for same-module targets, but the direct-call
+  lowering itself is still the existing typed lowering rather than a mechanical
+  v3 call node.
 
 Branch locality and cold block hints remain layout metadata for now, not v3
 semantic plan targets.

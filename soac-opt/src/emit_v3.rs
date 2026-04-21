@@ -1,8 +1,8 @@
 use crate::plan_v3::{
-    ConversionKind, DeoptPointId, DirectCallSpecializationPlan, FailureMode, GuardFailure,
-    GuardKind, MaterializeKind, ModuleOptimizationPlanV3, OperationNode, PlanNodeId, PlanNodeKind,
-    PlanValidationError, PlanValue, PlannedConstant, PlannedOp, RegionExitKind, RegionExitTarget,
-    RegionId, RichCompareOp, validate_module_plan_v3,
+    ConversionKind, DeoptPointId, DirectCallArgPlan, DirectCallSpecializationPlan, FailureMode,
+    GuardFailure, GuardKind, MaterializeKind, ModuleOptimizationPlanV3, OperationNode, PlanNodeId,
+    PlanNodeKind, PlanValidationError, PlanValue, PlannedConstant, PlannedOp, RegionExitKind,
+    RegionExitTarget, RegionId, RichCompareOp, validate_module_plan_v3,
 };
 use soac_core::block_py::{InstrId, SerializedFunctionId};
 use std::fmt;
@@ -25,6 +25,7 @@ pub struct MechanicalFunctionEmission {
 pub struct MechanicalDirectCallEmission {
     pub source: InstrId,
     pub target: SerializedFunctionId,
+    pub arg_plan: DirectCallArgPlan,
     pub reason: String,
 }
 
@@ -209,6 +210,7 @@ fn emit_direct_call(direct_call: &DirectCallSpecializationPlan) -> MechanicalDir
     MechanicalDirectCallEmission {
         source: direct_call.source,
         target: direct_call.target,
+        arg_plan: direct_call.arg_plan.clone(),
         reason: direct_call.reason.clone(),
     }
 }
@@ -278,9 +280,10 @@ fn emit_exit_kind(kind: &RegionExitKind) -> MechanicalExitKind {
 mod tests {
     use super::*;
     use crate::plan_v3::{
-        Cost, DirectCallSpecializationPlan, FallbackReason, FallbackTarget,
-        FunctionOptimizationPlanV3, FunctionOwnershipPlan, FunctionPlanIdentity, MaterializeNode,
-        ModulePlanIdentity, RegionExitPlan, RegionInput, RegionPlan, RegionSource, Rep,
+        Cost, DirectCallArgPlan, DirectCallArgSource, DirectCallSpecializationPlan, FallbackReason,
+        FallbackTarget, FunctionOptimizationPlanV3, FunctionOwnershipPlan, FunctionPlanIdentity,
+        MaterializeNode, ModulePlanIdentity, RegionExitPlan, RegionInput, RegionPlan, RegionSource,
+        Rep,
     };
     use soac_core::block_py::{BlockLabel, LocalFunctionId, SerializedModuleId};
 
@@ -455,6 +458,9 @@ mod tests {
             .push(DirectCallSpecializationPlan {
                 source,
                 target,
+                arg_plan: DirectCallArgPlan {
+                    sources: vec![DirectCallArgSource::Provided(0)],
+                },
                 reason: "profiled call_hot_targets selected this same-module function".to_string(),
             });
 
@@ -465,6 +471,9 @@ mod tests {
             vec![MechanicalDirectCallEmission {
                 source,
                 target,
+                arg_plan: DirectCallArgPlan {
+                    sources: vec![DirectCallArgSource::Provided(0)],
+                },
                 reason: "profiled call_hot_targets selected this same-module function".to_string(),
             }]
         );

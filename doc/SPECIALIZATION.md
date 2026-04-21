@@ -19,12 +19,12 @@ raw profile evidence. `verify`/`apply` prefers `mod.optv3` over legacy
 `mod.opt`, validates the artifact against the module identity, splits it into
 per-function `ExactIntBranchV3Artifacts`, and threads those artifacts through
 `FunctionSpecializationInputs`. Same-module profiled direct calls from
-`mod.optv3` are emitted as mechanical v3 direct-call decisions; JIT validation
-checks those emitted decisions against the selected plan before deriving the
-codegen call-target input. They are not rewritten into legacy
-`FunctionProfileEvidence`. When the artifact contains the represented exact-int
-branch shape, JIT term lowering consumes the mechanical v3 region directly;
-otherwise lowering stays on the existing path.
+`mod.optv3` are emitted as mechanical v3 direct-call decisions with validated
+ordinary-call argument plans; JIT validation checks those emitted decisions
+against the selected plan before deriving the codegen guard and target inputs.
+They are not rewritten into legacy `FunctionProfileEvidence`. When the artifact
+contains the represented exact-int branch shape, JIT term lowering consumes the
+mechanical v3 region directly; otherwise lowering stays on the existing path.
 Set `SOAC_OPT_PLAN_MODE=v3` to require this serialized artifact and reject
 legacy fallback, or `SOAC_OPT_PLAN_MODE=legacy` to force the old artifact path
 while comparing behavior.
@@ -368,10 +368,11 @@ apply/verify mode, call-target profile replay annotates each eligible
 `TypedCall` with a `TypedCallAccessPlan`. In the v3 path,
 `decide_optimizations --mode v3` reads the raw `call_hot_targets` evidence and
 records same-module ordinary-function targets in `mod.optv3` as direct-call
-plan selections plus matching mechanical direct-call emissions. The JIT
-validates that the mechanical emission matches the selected plan and that each
-target exists in the loaded module, then derives codegen call-target input when
-constructing
+plan selections plus matching mechanical direct-call emissions. The offline v3
+planner validates the lowered call site and target signature, then stores the
+direct-entry argument plan in the artifact. The JIT validates that the
+mechanical emission matches the selected plan and that each target exists in
+the loaded module, then derives codegen guard and target input when constructing
 `FunctionSpecializationInputs`; planner queries over legacy
 `FunctionProfileEvidence` do not see v3 direct-call targets.
 Compatible profiled targets become guarded ordinary-call, constructor-call, or

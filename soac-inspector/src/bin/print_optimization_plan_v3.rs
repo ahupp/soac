@@ -158,15 +158,18 @@ fn format_optimization_artifacts_v3_with_options(
         }
         for direct_call in &function.direct_calls {
             out.push_str(&format!(
-                "  direct_call source={} target={} reason={}\n",
-                direct_call.source, direct_call.target, direct_call.reason
+                "  direct_call source={} target={} arg_plan={:?} reason={}\n",
+                direct_call.source, direct_call.target, direct_call.arg_plan, direct_call.reason
             ));
         }
         if let Some(emitted_function) = emitted_function {
             for direct_call in &emitted_function.direct_calls {
                 out.push_str(&format!(
-                    "  emitted_direct_call source={} target={} reason={}\n",
-                    direct_call.source, direct_call.target, direct_call.reason
+                    "  emitted_direct_call source={} target={} arg_plan={:?} reason={}\n",
+                    direct_call.source,
+                    direct_call.target,
+                    direct_call.arg_plan,
+                    direct_call.reason
                 ));
             }
         }

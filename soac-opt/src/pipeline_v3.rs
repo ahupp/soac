@@ -9,24 +9,28 @@ use crate::plan::{
     CachedModuleOptimizationInput, FunctionProfileEvidence, ModuleOptimizationPlanReport,
     OptimizationPlanGenerationSummary, ProfileEvidenceStore, cached_module_paths_under_root,
 };
-use crate::plan_v3::{FunctionPlanIdentity, ModulePlanIdentity, PlanDiagnostic, RegionId};
+use crate::plan_v3::{
+    DirectCallArgPlan, DirectCallArgSource, FunctionPlanIdentity, ModulePlanIdentity,
+    PlanDiagnostic, RegionId,
+};
 use crate::planner_v3::{
-    ExtractedRegionPlanRequest, FunctionPlanRequest, ModulePlanRequest, plan_module_optimization_v3,
+    DirectCallPlanRequest, ExtractedRegionPlanRequest, FunctionPlanRequest, ModulePlanRequest,
+    plan_module_optimization_v3,
 };
 use crate::region_v3::{
     RegionExtractionAttempt, RegionExtractionError, extract_function_regions_v3,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use soac_core::block_py::{
-    BlockLabel, BlockPyFunction, BlockPyModule, InstrId, LocalFunctionId, RuntimeModuleId,
-    SerializedFunctionId, SerializedModuleId,
+    BlockLabel, BlockPyFunction, BlockPyModule, Call, CallArgPositional, ChildVisitable,
+    FunctionExecutionMode, HasSemanticInstrId, InstrId, LocalFunctionId, ParamKind,
+    RuntimeModuleId, SerializedFunctionId, SerializedModuleId, Visit,
 };
 use soac_lowering::codegen_cache::{
     CachedCodegenModule, CachedCodegenModuleMetadata, load_codegen_module_cache,
     module_optimization_plan_v3_path,
 };
-use soac_lowering::passes::CodegenModuleShape;
-use soac_lowering::passes::InstrResolved;
+use soac_lowering::passes::{CodegenModuleShape, InstrCodegen, InstrResolved};
 use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
@@ -139,14 +143,19 @@ pub fn plan_and_emit_module_v3_from_raw_evidence(
                 Err(error) => diagnostics.push(extraction_diagnostic(attempt.block, error)),
             }
         }
+        let (direct_calls, direct_call_diagnostics) =
+            direct_call_requests_from_same_module_evidence_v3(
+                SerializedModuleId::new(0),
+                function.function_id.runtime_module_id(),
+                function,
+                lowered_module,
+                &evidence,
+            );
+        diagnostics.extend(direct_call_diagnostics);
         functions.push(FunctionPlanRequest {
             function: function_plan_identity_v3(function),
             regions: region_requests,
-            direct_call_targets: direct_call_targets_from_same_module_evidence_v3(
-                SerializedModuleId::new(0),
-                function.function_id.runtime_module_id(),
-                &evidence,
-            ),
+            direct_calls,
         });
         diagnostics_by_function.push(diagnostics);
     }
@@ -185,11 +194,7 @@ pub fn plan_and_emit_extracted_exact_int_branches_v3(
         ModulePlanRequest {
             module,
             functions: vec![FunctionPlanRequest {
-                direct_call_targets: direct_call_targets_from_same_module_evidence_v3(
-                    function.function.module_id(),
-                    RuntimeModuleId::new(function.function.module_id().as_u32()),
-                    evidence,
-                ),
+                direct_calls: Vec::new(),
                 function,
                 regions: region_requests,
             }],
@@ -214,30 +219,213 @@ fn function_plan_identity_v3(
     }
 }
 
-fn direct_call_targets_from_same_module_evidence_v3(
+fn direct_call_requests_from_same_module_evidence_v3(
     serialized_module_id: SerializedModuleId,
     runtime_module_id: RuntimeModuleId,
+    function: &BlockPyFunction<CodegenModuleShape>,
+    lowered_module: &BlockPyModule<CodegenModuleShape>,
     evidence: &FunctionProfileEvidence,
-) -> HashMap<InstrId, Vec<SerializedFunctionId>> {
-    let mut targets_by_source = HashMap::new();
-    for (source, targets) in &evidence.call_target_specializations {
+) -> (Vec<DirectCallPlanRequest>, Vec<PlanDiagnostic>) {
+    let mut requests = Vec::new();
+    let mut diagnostics = Vec::new();
+    let mut entries = evidence
+        .call_target_specializations
+        .iter()
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|(source, _)| **source);
+    for (source, targets) in entries {
+        let mut targets = targets.clone();
+        targets.sort();
+        targets.dedup();
         for target in targets {
             if target.runtime_module_id() != runtime_module_id {
                 continue;
             }
-            push_unique(
-                targets_by_source.entry(*source).or_insert_with(Vec::new),
-                SerializedFunctionId::new(serialized_module_id, target.local_function_id()),
-            );
+            let serialized_target =
+                SerializedFunctionId::new(serialized_module_id, target.local_function_id());
+            let Some(target_function) = lowered_module
+                .callable_defs
+                .iter()
+                .find(|candidate| candidate.function_id == target)
+            else {
+                diagnostics.push(PlanDiagnostic {
+                    source: Some(*source),
+                    message: format!(
+                        "v3 direct-call declined target {serialized_target}: target function is missing from lowered module"
+                    ),
+                });
+                continue;
+            };
+            if target_function.execution_mode() != FunctionExecutionMode::Jit {
+                diagnostics.push(PlanDiagnostic {
+                    source: Some(*source),
+                    message: format!(
+                        "v3 direct-call declined target {serialized_target}: target function is not JIT lowered"
+                    ),
+                });
+                continue;
+            }
+            if target_function.names.fn_name == "__init__" {
+                diagnostics.push(PlanDiagnostic {
+                    source: Some(*source),
+                    message: format!(
+                        "v3 direct-call declined target {serialized_target}: constructor targets require owner/type guards"
+                    ),
+                });
+                continue;
+            }
+            let arg_plan = match direct_call_arg_plan_for_instr_id_v3(
+                function,
+                *source,
+                target_function,
+            ) {
+                Some(Ok(arg_plan)) => arg_plan,
+                Some(Err(reason)) => {
+                    diagnostics.push(PlanDiagnostic {
+                        source: Some(*source),
+                        message: format!(
+                            "v3 direct-call declined target {serialized_target}: {reason}"
+                        ),
+                    });
+                    continue;
+                }
+                None => {
+                    diagnostics.push(PlanDiagnostic {
+                        source: Some(*source),
+                        message: format!(
+                            "v3 direct-call declined target {serialized_target}: source instruction is not a lowered call"
+                        ),
+                    });
+                    continue;
+                }
+            };
+            requests.push(DirectCallPlanRequest {
+                source: *source,
+                target: serialized_target,
+                arg_plan,
+                reason: "profiled call_hot_targets selected this same-module function with validated ordinary-call arguments".to_string(),
+            });
         }
     }
-    targets_by_source
+    (requests, diagnostics)
 }
 
-fn push_unique<T: PartialEq>(values: &mut Vec<T>, value: T) {
-    if !values.contains(&value) {
-        values.push(value);
+fn direct_call_arg_plan_for_instr_id_v3(
+    function: &BlockPyFunction<CodegenModuleShape>,
+    source: InstrId,
+    target_function: &BlockPyFunction<CodegenModuleShape>,
+) -> Option<std::result::Result<DirectCallArgPlan, String>> {
+    struct Finder<'a> {
+        source: InstrId,
+        target_function: &'a BlockPyFunction<CodegenModuleShape>,
+        result: Option<std::result::Result<DirectCallArgPlan, String>>,
     }
+
+    impl Visit<InstrCodegen> for Finder<'_> {
+        fn visit_instr(&mut self, expr: &InstrCodegen)
+        where
+            InstrCodegen: ChildVisitable<InstrCodegen>,
+        {
+            if self.result.is_some() {
+                return;
+            }
+            if let InstrCodegen::Call(call) = expr
+                && call.try_semantic_instr_id() == Some(self.source)
+            {
+                self.result = Some(direct_call_arg_plan_from_call_v3(
+                    call,
+                    self.target_function,
+                ));
+                return;
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    let mut finder = Finder {
+        source,
+        target_function,
+        result: None,
+    };
+    finder.visit_fn(function);
+    finder.result
+}
+
+fn direct_call_arg_plan_from_call_v3(
+    call: &Call<InstrCodegen>,
+    target_function: &BlockPyFunction<CodegenModuleShape>,
+) -> std::result::Result<DirectCallArgPlan, String> {
+    if call
+        .args
+        .iter()
+        .any(|arg| matches!(arg, CallArgPositional::Starred(_)))
+    {
+        return Err("starred arguments are not supported".to_string());
+    }
+    if !call.keywords.is_empty() {
+        return Err("keyword arguments are not supported".to_string());
+    }
+
+    for param in target_function.params.iter() {
+        if matches!(param.kind, ParamKind::VarArg | ParamKind::KwArg) {
+            return Err(format!(
+                "target parameter kind {:?} is not supported",
+                param.kind
+            ));
+        }
+    }
+
+    let provided_positional_arg_count = call
+        .args
+        .iter()
+        .filter(|arg| matches!(arg, CallArgPositional::Positional(_)))
+        .count();
+    let accepted_positional_arg_count = target_function
+        .params
+        .iter()
+        .filter(|param| matches!(param.kind, ParamKind::PosOnly | ParamKind::Any))
+        .count();
+    if provided_positional_arg_count > accepted_positional_arg_count {
+        return Err(format!(
+            "too many positional arguments: provided {provided_positional_arg_count}, accepted {accepted_positional_arg_count}"
+        ));
+    }
+
+    let mut sources = Vec::with_capacity(target_function.params.len());
+    let mut next_provided_arg = 0usize;
+    for param in target_function.params.iter() {
+        match param.kind {
+            ParamKind::PosOnly | ParamKind::Any => {
+                if next_provided_arg < provided_positional_arg_count {
+                    sources.push(DirectCallArgSource::Provided(
+                        next_provided_arg
+                            .try_into()
+                            .map_err(|_| "too many positional arguments for v3 arg plan")?,
+                    ));
+                    next_provided_arg += 1;
+                } else if param.has_default {
+                    sources.push(DirectCallArgSource::DefaultSentinel);
+                } else {
+                    return Err(format!("missing required argument {}", param.name));
+                }
+            }
+            ParamKind::KwOnly => {
+                if param.has_default {
+                    sources.push(DirectCallArgSource::DefaultSentinel);
+                } else {
+                    return Err(format!(
+                        "missing required keyword-only argument {}",
+                        param.name
+                    ));
+                }
+            }
+            ParamKind::VarArg | ParamKind::KwArg => unreachable!(
+                "unsupported variadic params should be rejected before planning direct-call args"
+            ),
+        }
+    }
+    debug_assert_eq!(next_provided_arg, provided_positional_arg_count);
+    Ok(DirectCallArgPlan { sources })
 }
 
 fn extraction_diagnostic(block: BlockLabel, error: RegionExtractionError) -> PlanDiagnostic {
@@ -454,7 +642,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_call_evidence_is_carried_into_v3_plan() {
+    fn direct_call_evidence_without_module_context_is_not_planned() {
         let source = instr_id(9);
         let mut evidence = FunctionProfileEvidence::default();
         evidence.call_target_specializations.insert(
@@ -476,11 +664,9 @@ mod tests {
         .unwrap();
 
         let direct_calls = &artifacts.plan.functions[0].direct_calls;
-        assert_eq!(direct_calls.len(), 1);
-        assert_eq!(direct_calls[0].source, source);
-        assert_eq!(
-            direct_calls[0].target,
-            SerializedFunctionId::new(SerializedModuleId::new(0), LocalFunctionId::new(2))
+        assert!(
+            direct_calls.is_empty(),
+            "v3 direct-call planning requires the lowered call site and target signature"
         );
     }
 

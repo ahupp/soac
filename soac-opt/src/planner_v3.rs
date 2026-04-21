@@ -3,7 +3,7 @@ use crate::alternatives_v3::{
 };
 use crate::plan_v3::{
     ConversionKind, ConversionOwnership, ConversionPrecondition, ConvertNode, Cost,
-    DirectCallSpecializationPlan, FailureMode, FallbackReason, FallbackTarget,
+    DirectCallArgPlan, DirectCallSpecializationPlan, FailureMode, FallbackReason, FallbackTarget,
     FunctionOptimizationPlanV3, FunctionOwnershipPlan, FunctionPlanIdentity, MaterializeKind,
     MaterializeNode, ModuleOptimizationPlanV3, ModulePlanIdentity, OperationNode, PlanDiagnostic,
     PlanNode, PlanNodeId, PlanNodeKind, PlanValue, PlannedConstant, RegionExitKind, RegionExitPlan,
@@ -30,7 +30,15 @@ pub struct ModulePlanRequest {
 pub struct FunctionPlanRequest {
     pub function: FunctionPlanIdentity,
     pub regions: Vec<ExtractedRegionPlanRequest>,
-    pub direct_call_targets: HashMap<InstrId, Vec<SerializedFunctionId>>,
+    pub direct_calls: Vec<DirectCallPlanRequest>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectCallPlanRequest {
+    pub source: InstrId,
+    pub target: SerializedFunctionId,
+    pub arg_plan: DirectCallArgPlan,
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -84,7 +92,7 @@ pub fn plan_function_optimization_v3(
     request: FunctionPlanRequest,
 ) -> FunctionOptimizationPlanV3 {
     let region_requests = request.regions;
-    let direct_calls = plan_direct_call_specializations_v3(&request.direct_call_targets);
+    let direct_calls = plan_direct_call_specializations_v3(&request.direct_calls);
     let mut function = FunctionOptimizationPlanV3 {
         function: request.function,
         regions: Vec::new(),
@@ -115,20 +123,19 @@ pub fn plan_function_optimization_v3(
 }
 
 fn plan_direct_call_specializations_v3(
-    targets_by_source: &HashMap<InstrId, Vec<SerializedFunctionId>>,
+    direct_call_requests: &[DirectCallPlanRequest],
 ) -> Vec<DirectCallSpecializationPlan> {
-    let mut entries = targets_by_source.iter().collect::<Vec<_>>();
-    entries.sort_by_key(|(source, _)| **source);
+    let mut entries = direct_call_requests.iter().collect::<Vec<_>>();
+    entries.sort_by_key(|request| (request.source, request.target));
+    let mut seen = HashSet::new();
     let mut plans = Vec::new();
-    for (source, targets) in entries {
-        let mut targets = targets.clone();
-        targets.sort();
-        targets.dedup();
-        for target in targets {
+    for request in entries {
+        if seen.insert((request.source, request.target)) {
             plans.push(DirectCallSpecializationPlan {
-                source: *source,
-                target,
-                reason: "profiled call_hot_targets selected this same-module function".to_string(),
+                source: request.source,
+                target: request.target,
+                arg_plan: request.arg_plan.clone(),
+                reason: request.reason.clone(),
             });
         }
     }
@@ -1520,7 +1527,7 @@ mod tests {
                     debug_name: Some("f".to_string()),
                 },
                 regions,
-                direct_call_targets: HashMap::new(),
+                direct_calls: Vec::new(),
             }],
         }
     }
@@ -1530,9 +1537,24 @@ mod tests {
         let mut request = module_request_regions(Vec::new());
         let source = InstrId::new(label(0), 9);
         let target = SerializedFunctionId::new(SerializedModuleId::new(0), LocalFunctionId::new(2));
-        request.functions[0]
-            .direct_call_targets
-            .insert(source, vec![target, target]);
+        request.functions[0].direct_calls = vec![
+            DirectCallPlanRequest {
+                source,
+                target,
+                arg_plan: DirectCallArgPlan {
+                    sources: vec![crate::plan_v3::DirectCallArgSource::Provided(0)],
+                },
+                reason: "profiled call_hot_targets selected this same-module function".to_string(),
+            },
+            DirectCallPlanRequest {
+                source,
+                target,
+                arg_plan: DirectCallArgPlan {
+                    sources: vec![crate::plan_v3::DirectCallArgSource::Provided(0)],
+                },
+                reason: "profiled call_hot_targets selected this same-module function".to_string(),
+            },
+        ];
 
         let plan = plan_module_optimization_v3(&AlternativeCatalog::default_v3(), request);
 
@@ -1541,6 +1563,12 @@ mod tests {
         assert_eq!(direct_calls.len(), 1);
         assert_eq!(direct_calls[0].source, source);
         assert_eq!(direct_calls[0].target, target);
+        assert_eq!(
+            direct_calls[0].arg_plan,
+            DirectCallArgPlan {
+                sources: vec![crate::plan_v3::DirectCallArgSource::Provided(0)]
+            }
+        );
         assert!(direct_calls[0].reason.contains("call_hot_targets"));
     }
 

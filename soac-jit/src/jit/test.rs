@@ -39,7 +39,9 @@ mod tests {
         PlannedIndexedFieldSpecialization, PlannedReplacement, PlannedTypeKey, ShapeFamily,
     };
     use soac_opt::plan_v3::{
-        DirectCallSpecializationPlan, FunctionPlanIdentity, ModulePlanIdentity,
+        DirectCallArgPlan as PlanV3DirectCallArgPlan,
+        DirectCallArgSource as PlanV3DirectCallArgSource, DirectCallSpecializationPlan,
+        FunctionPlanIdentity, ModulePlanIdentity,
     };
     use soac_profile::{
         CounterDumpRecord, CounterDumpRow, CounterDumpTypeKey, CounterDumpTypeKeyLayout,
@@ -15917,6 +15919,7 @@ def f(x):
             BuildSpecializedFunctionOptions {
                 specialization_inputs: Some(FunctionSpecializationInputs {
                     call_target_specializations: HashMap::new(),
+                    direct_function_call_guards: HashMap::new(),
                     operator_specializations: HashMap::new(),
                     getitem_specializations: HashMap::new(),
                     setitem_specializations: HashMap::new(),
@@ -16109,6 +16112,7 @@ def f(x):
             BuildSpecializedFunctionOptions {
                 specialization_inputs: Some(FunctionSpecializationInputs {
                     call_target_specializations: HashMap::new(),
+                    direct_function_call_guards: HashMap::new(),
                     operator_specializations: HashMap::new(),
                     getitem_specializations: HashMap::new(),
                     setitem_specializations: HashMap::new(),
@@ -16265,6 +16269,7 @@ def f(x):
                 BuildSpecializedFunctionOptions {
                     specialization_inputs: Some(FunctionSpecializationInputs {
                         call_target_specializations: HashMap::new(),
+                        direct_function_call_guards: HashMap::new(),
                         operator_specializations: HashMap::new(),
                         getitem_specializations: HashMap::new(),
                         setitem_specializations: HashMap::new(),
@@ -16392,6 +16397,7 @@ def f(x):
                 BuildSpecializedFunctionOptions {
                     specialization_inputs: Some(FunctionSpecializationInputs {
                         call_target_specializations: HashMap::new(),
+                        direct_function_call_guards: HashMap::new(),
                         operator_specializations: HashMap::new(),
                         getitem_specializations: HashMap::new(),
                         setitem_specializations: HashMap::new(),
@@ -16514,6 +16520,7 @@ def f(x):
             BuildSpecializedFunctionOptions {
                 specialization_inputs: Some(FunctionSpecializationInputs {
                     call_target_specializations: HashMap::new(),
+                    direct_function_call_guards: HashMap::new(),
                     operator_specializations: HashMap::new(),
                     getitem_specializations: HashMap::new(),
                     setitem_specializations: HashMap::new(),
@@ -16641,6 +16648,9 @@ def f(x):
                     direct_calls: vec![DirectCallSpecializationPlan {
                         source,
                         target: serialized_callee,
+                        arg_plan: PlanV3DirectCallArgPlan {
+                            sources: vec![PlanV3DirectCallArgSource::Provided(0)],
+                        },
                         reason: "profiled direct call".to_string(),
                     }],
                     deopt_points: Vec::new(),
@@ -16656,6 +16666,9 @@ def f(x):
                     direct_calls: vec![soac_opt::emit_v3::MechanicalDirectCallEmission {
                         source,
                         target: serialized_callee,
+                        arg_plan: PlanV3DirectCallArgPlan {
+                            sources: vec![PlanV3DirectCallArgSource::Provided(0)],
+                        },
                         reason: "profiled direct call".to_string(),
                     }],
                     regions: Vec::new(),
@@ -16669,12 +16682,19 @@ def f(x):
 
         assert_eq!(
             planned_inputs
-                .opt_v3_emitted_direct_call_targets
+                .opt_v3_emitted_direct_function_guards
                 .get(&caller_id)
                 .unwrap()
                 .get(&source)
+                .unwrap()
+                .first()
                 .unwrap(),
-            &vec![callee_id]
+            &soac_lowering::passes::TypedDirectFunctionCallGuard {
+                function_id: callee_id,
+                arg_plan: soac_lowering::passes::TypedDirectCallArgPlan {
+                    sources: vec![soac_lowering::passes::TypedDirectCallArgSource::Provided(0)],
+                },
+            }
         );
         assert!(
             planned_inputs.evidence_by_function.is_empty(),
@@ -16714,6 +16734,9 @@ def f(x):
                     direct_calls: vec![DirectCallSpecializationPlan {
                         source,
                         target: serialized_callee,
+                        arg_plan: PlanV3DirectCallArgPlan {
+                            sources: vec![PlanV3DirectCallArgSource::Provided(0)],
+                        },
                         reason: "profiled direct call".to_string(),
                     }],
                     deopt_points: Vec::new(),
@@ -16759,15 +16782,21 @@ def f(x):
         let mut planned_evidence = HashMap::new();
         planned_evidence.insert(caller_id, legacy_evidence);
 
-        let mut opt_v3_emitted_direct_call_targets = HashMap::new();
-        opt_v3_emitted_direct_call_targets
-            .insert(caller_id, HashMap::from([(source, vec![v3_target])]));
+        let v3_guard = soac_lowering::passes::TypedDirectFunctionCallGuard {
+            function_id: v3_target,
+            arg_plan: soac_lowering::passes::TypedDirectCallArgPlan {
+                sources: vec![soac_lowering::passes::TypedDirectCallArgSource::Provided(0)],
+            },
+        };
+        let mut opt_v3_emitted_direct_function_guards = HashMap::new();
+        opt_v3_emitted_direct_function_guards
+            .insert(caller_id, HashMap::from([(source, vec![v3_guard.clone()])]));
 
         let profile = SpecializationProfile {
             module_name: None,
             counter_dump_path: None,
             planned_evidence,
-            opt_v3_emitted_direct_call_targets,
+            opt_v3_emitted_direct_function_guards,
             opt_v3_exact_int_branch_artifacts: HashMap::new(),
             behavior_change_indexed_stores: false,
             profiled_cold_blocks: false,
@@ -16782,6 +16811,14 @@ def f(x):
                 .unwrap(),
             &vec![legacy_target],
             "legacy planning queries should not see v3 emitted direct-call targets"
+        );
+        assert_eq!(
+            profile
+                .codegen_direct_function_call_guards(caller_id)
+                .get(&source)
+                .unwrap(),
+            &vec![v3_guard],
+            "codegen guard inputs should consume the emitted v3 argument plan"
         );
         assert_eq!(
             profile
