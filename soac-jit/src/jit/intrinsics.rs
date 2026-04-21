@@ -14,7 +14,7 @@ use soac_core::block_py::{
     CounterId, HasSemanticInstrId, Instr, NameLike, NameLocation, ResolvedName,
 };
 use soac_lowering::passes::{InstrCodegen, InstrTyped, PyExactType, PyObjFacts};
-use soac_optimization::operator_specialization::{
+use soac_opt::operator_specialization::{
     BINARY_RHS_TAG_SHIFT, ExactIntBinaryOpKind, ExactIntUnaryOpKind, ExactTypeTag, UNARY_TAG_SHIFT,
     pack_binary_shape, pack_unary_shape, unpack_binary_shape, unpack_unary_shape,
 };

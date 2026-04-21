@@ -1,7 +1,18 @@
 use crate::optimization_alternatives_v3::AlternativeCatalog;
+use crate::optimization_artifacts_v3::{
+    ExactIntBranchV3Artifacts, write_optimization_artifacts_v3,
+};
+use crate::optimization_emit_v3::{MechanicalEmitError, emit_mechanical_plan_v3};
 use crate::optimization_evidence_v3::{
     PlannerFactHints, planner_fact_hints_from_module_constants_v3,
     planner_facts_from_profile_evidence_v3,
+};
+use crate::optimization_plan::{
+    CachedModuleOptimizationInput, FunctionProfileEvidence, ModuleOptimizationPlanReport,
+    OptimizationPlanGenerationSummary, ProfileEvidenceStore, cached_module_paths_under_root,
+};
+use crate::optimization_plan_v3::{
+    FunctionPlanIdentity, ModulePlanIdentity, PlanDiagnostic, RegionId,
 };
 use crate::optimization_planner_v3::{
     ExtractedRegionPlanRequest, FunctionPlanRequest, ModulePlanRequest, plan_module_optimization_v3,
@@ -20,17 +31,6 @@ use soac_lowering::codegen_cache::{
 };
 use soac_lowering::passes::CodegenModuleShape;
 use soac_lowering::passes::InstrResolved;
-use soac_optimization::optimization_artifacts_v3::{
-    ExactIntBranchV3Artifacts, write_optimization_artifacts_v3,
-};
-use soac_optimization::optimization_emit_v3::{MechanicalEmitError, emit_mechanical_plan_v3};
-use soac_optimization::optimization_plan::{
-    CachedModuleOptimizationInput, FunctionProfileEvidence, ModuleOptimizationPlanReport,
-    OptimizationPlanGenerationSummary, ProfileEvidenceStore, cached_module_paths_under_root,
-};
-use soac_optimization::optimization_plan_v3::{
-    FunctionPlanIdentity, ModulePlanIdentity, PlanDiagnostic, RegionId,
-};
 use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
@@ -345,6 +345,8 @@ fn counter_evidence_matches_cached_module_v3(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::operator_specialization::{ExactTypeTag, pack_binary_shape};
+    use crate::optimization_plan_v3::{RegionId, validate_module_plan_v3};
     use crate::optimization_region_v3::{ExtractedValueId, extract_block_region_v3};
     use soac_core::block_py::{
         BinOp, BinOpKind, Block, BlockLabel, BlockParam, BlockPyName, BlockTerm, InstrId, Load,
@@ -352,8 +354,6 @@ mod tests {
         SerializedFunctionId, SerializedModuleId, TermIf, WithMeta,
     };
     use soac_lowering::passes::InstrCodegen;
-    use soac_optimization::operator_specialization::{ExactTypeTag, pack_binary_shape};
-    use soac_optimization::optimization_plan_v3::{RegionId, validate_module_plan_v3};
 
     fn label(index: usize) -> BlockLabel {
         BlockLabel::from_index(index)

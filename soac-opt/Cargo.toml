@@ -1,5 +1,5 @@
 [package]
-name = "soac-optimization"
+name = "soac-opt"
 version = "0.1.0"
 edition = "2024"
 

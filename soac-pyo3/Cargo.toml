@@ -14,8 +14,7 @@ soac-lowering = { path = "../soac-lowering" }
 soac-config = { path = "../soac-config" }
 soac-core = { path = "../soac-core" }
 soac-profile = { path = "../soac-profile" }
-soac-optimization = { path = "../soac-optimization" }
-soac-optimizer = { path = "../soac-optimizer" }
+soac-opt = { path = "../soac-opt" }
 soac-jit = { path = "../soac-jit" }
 pyo3 = { workspace = true, features = ["extension-module"] }
 tracing = "0.1"

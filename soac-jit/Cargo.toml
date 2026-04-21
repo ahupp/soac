@@ -12,7 +12,7 @@ soac-lowering = { path = "../soac-lowering" }
 soac-config = { path = "../soac-config" }
 soac-core = { path = "../soac-core" }
 soac-profile = { path = "../soac-profile" }
-soac-optimization = { path = "../soac-optimization" }
+soac-opt = { path = "../soac-opt" }
 anyhow = { version = "1.0.100", features = ["backtrace"] }
 ruff_python_ast = { workspace = true }
 pyo3 = { workspace = true, features = ["extension-module"] }
@@ -35,4 +35,3 @@ pyo3-build-config = { git = "https://github.com/PyO3/pyo3", branch = "main", fea
 
 [dev-dependencies]
 soac-cpython = { path = "../soac-cpython" }
-soac-optimizer = { path = "../soac-optimizer" }

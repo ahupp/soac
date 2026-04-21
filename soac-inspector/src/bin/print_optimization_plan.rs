@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, anyhow, bail};
-use soac_optimization::optimization_plan::{OptimizationPlan, format_optimization_plan};
+use soac_opt::optimization_plan::{OptimizationPlan, format_optimization_plan};
 use std::env;
 use std::ffi::OsString;
 use std::fs;

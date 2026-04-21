@@ -6,7 +6,7 @@ use crate::module_constants::{load_runtime_name_owned, load_runtime_name_owned_b
 use cranelift_jit::JITBuilder;
 use libc;
 use pyo3::ffi;
-use soac_optimization::operator_specialization::{ExactIntBinaryOpKind, ExactIntUnaryOpKind};
+use soac_opt::operator_specialization::{ExactIntBinaryOpKind, ExactIntUnaryOpKind};
 use std::ffi::{c_char, c_void};
 use std::ptr;
 use std::sync::OnceLock;

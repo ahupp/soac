@@ -1768,8 +1768,7 @@ dependencies = [
  "soac-cpython",
  "soac-jit",
  "soac-lowering",
- "soac-optimization",
- "soac-optimizer",
+ "soac-opt",
  "soac-profile",
  "tokio",
  "tower",
@@ -1801,8 +1800,7 @@ dependencies = [
  "soac-core",
  "soac-cpython",
  "soac-lowering",
- "soac-optimization",
- "soac-optimizer",
+ "soac-opt",
  "soac-profile",
  "tracing",
 ]
@@ -1839,7 +1837,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "soac-optimization"
+name = "soac-opt"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1847,17 +1845,6 @@ dependencies = [
  "soac-core",
  "soac-lowering",
  "soac-profile",
-]
-
-[[package]]
-name = "soac-optimizer"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "rkyv",
- "soac-core",
- "soac-lowering",
- "soac-optimization",
 ]
 
 [[package]]
@@ -1882,8 +1869,7 @@ dependencies = [
  "soac-cpython",
  "soac-jit",
  "soac-lowering",
- "soac-optimization",
- "soac-optimizer",
+ "soac-opt",
  "soac-profile",
  "tracing",
 ]

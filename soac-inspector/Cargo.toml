@@ -11,8 +11,7 @@ soac-lowering = { path = "../soac-lowering" }
 soac-config = { path = "../soac-config" }
 soac-core = { path = "../soac-core" }
 soac-profile = { path = "../soac-profile" }
-soac-optimization = { path = "../soac-optimization" }
-soac-optimizer = { path = "../soac-optimizer" }
+soac-opt = { path = "../soac-opt" }
 soac-cpython = { path = "../soac-cpython" }
 pyo3 = { workspace = true }
 rkyv = { version = "0.8", features = ["alloc"] }

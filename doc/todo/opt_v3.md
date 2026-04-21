@@ -56,8 +56,8 @@ Non-goals:
 ## Implementation Status
 
 The current implementation uses an offline v3 planner path. Shared
-serializable plan and mechanical artifact types live in `soac-optimization`,
-the offline extraction/planning pipeline lives in `soac-optimizer`, and
+serializable plan and mechanical artifact types live in `soac-opt`,
+the offline extraction/planning pipeline lives in `soac-opt`, and
 `soac-jit` consumes validated `mod.optv3` artifacts mechanically during
 `verify`/`apply` or precompile. The old live bridge that reconstructed v3
 artifacts from legacy `mod.opt` has been removed, so v3 no longer consumes
@@ -65,19 +65,19 @@ legacy optimization decisions.
 
 Implemented:
 
-- `soac-optimization::optimization_plan_v3`: full plan schema, conversion
+- `soac-opt::optimization_plan_v3`: full plan schema, conversion
   signatures, operation signatures, replay-safety validation, and structural
   validation. Function plans also carry validated `scalar_threads` sidecars
   that name cross-region scalar-local rewrites without asking codegen to
   rediscover them.
-- `soac-optimizer::optimization_alternatives_v3`: default catalog entries for
+- `soac-opt::optimization_alternatives_v3`: default catalog entries for
   generic Python add/sub/mul/bitwise/all-rich-compare, exact compact-int
   add/sub/mul/bitwise/all-rich-compare, truthiness, and materialization.
-- `soac-optimizer::optimization_region_v3`: conservative branch/return region
+- `soac-opt::optimization_region_v3`: conservative branch/return region
   extraction that preserves evaluation order, records store targets and simple
   jump continuations for store-RHS regions, and declines unsupported blocks
   explicitly.
-- `soac-optimizer::optimization_planner_v3`: bounded planner for
+- `soac-opt::optimization_planner_v3`: bounded planner for
   exact-compact-`int` direct comparison branches, `a + b > 0` branches,
   `return a + b`/`return a - b`/`return a * b` arithmetic returns,
   `return a & b`/`return a | b`/`return a ^ b` bitwise returns, and
@@ -85,12 +85,12 @@ Implemented:
   `RegionPlan`s. It also records a scalar-thread sidecar when a compact-int
   store RHS feeds the immediately following local comparison, and same-module
   profiled direct-call sidecars from `call_hot_targets`.
-- `soac-optimization::optimization_emit_v3`: validation-gated mechanical
+- `soac-opt::optimization_emit_v3`: validation-gated mechanical
   emitter over selected v3 plan nodes and exits.
-- `soac-optimizer::optimization_evidence_v3`: bridge from existing
+- `soac-opt::optimization_evidence_v3`: bridge from existing
   `FunctionProfileEvidence` exact-int operator shapes and lowered integer
   module constants into v3 planner facts.
-- `soac-optimizer::optimization_pipeline_v3`: exact-int pipeline that composes
+- `soac-opt::optimization_pipeline_v3`: exact-int pipeline that composes
   extraction, evidence, planning, validation, and mechanical emission.
 - `decide_optimizations --mode v3`: offline planner mode that reads cached
   unoptimized `mod.blockpy` plus `profile.bin`, derives v3 facts directly from
