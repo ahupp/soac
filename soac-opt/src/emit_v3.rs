@@ -261,9 +261,9 @@ fn emit_exit_kind(kind: &RegionExitKind) -> MechanicalExitKind {
 mod tests {
     use super::*;
     use crate::plan_v3::{
-        Cost, FunctionOptimizationPlanV3, FunctionOwnershipPlan, FunctionPlanIdentity,
-        MaterializeNode, ModulePlanIdentity, RegionExitPlan, RegionInput, RegionPlan, RegionSource,
-        Rep,
+        Cost, FallbackReason, FallbackTarget, FunctionOptimizationPlanV3, FunctionOwnershipPlan,
+        FunctionPlanIdentity, MaterializeNode, ModulePlanIdentity, RegionExitPlan, RegionInput,
+        RegionPlan, RegionSource, Rep,
     };
     use soac_core::block_py::{LocalFunctionId, SerializedModuleId};
 
@@ -299,7 +299,10 @@ mod tests {
                     failure_replay: crate::plan_v3::FailureReplayPolicy::local_fallback(
                         "overflow would use a local fallback in a real plan",
                     ),
-                    failure: FailureMode::CannotFail,
+                    failure: FailureMode::FallbackToPlan {
+                        target: FallbackTarget::Region(RegionId(1)),
+                        reason: FallbackReason("overflow uses synthetic fallback".to_string()),
+                    },
                     cost: Cost::default(),
                 }),
             },
@@ -318,6 +321,8 @@ mod tests {
         } else {
             sum
         };
+        let fallback_i64 = PlanValue::new(10, Rep::I64);
+        let fallback_result = PlanValue::new(11, Rep::PyObjectOwned);
 
         ModuleOptimizationPlanV3 {
             module: ModulePlanIdentity {
@@ -335,18 +340,52 @@ mod tests {
                     ),
                     debug_name: Some("f".to_string()),
                 },
-                regions: vec![RegionPlan {
-                    id: RegionId(0),
-                    source: RegionSource::FunctionEntry,
-                    inputs: Vec::<RegionInput>::new(),
-                    nodes,
-                    exits: vec![RegionExitPlan {
-                        source: None,
-                        kind: RegionExitKind::Return {
-                            value: return_value,
+                regions: vec![
+                    RegionPlan {
+                        id: RegionId(0),
+                        source: RegionSource::FunctionEntry,
+                        inputs: Vec::<RegionInput>::new(),
+                        nodes,
+                        exits: vec![RegionExitPlan {
+                            source: None,
+                            kind: RegionExitKind::Return {
+                                value: return_value,
+                            },
+                        }],
+                    },
+                    RegionPlan {
+                        id: RegionId(1),
+                        source: RegionSource::Synthetic {
+                            reason: "test overflow fallback".to_string(),
                         },
-                    }],
-                }],
+                        inputs: Vec::<RegionInput>::new(),
+                        nodes: vec![
+                            crate::plan_v3::PlanNode {
+                                id: PlanNodeId(10),
+                                source: None,
+                                kind: PlanNodeKind::Constant {
+                                    output: fallback_i64,
+                                    constant: PlannedConstant::I64(0),
+                                },
+                            },
+                            crate::plan_v3::PlanNode {
+                                id: PlanNodeId(11),
+                                source: None,
+                                kind: PlanNodeKind::Materialize(MaterializeNode {
+                                    input: fallback_i64,
+                                    output: fallback_result,
+                                    kind: MaterializeKind::PythonLong,
+                                }),
+                            },
+                        ],
+                        exits: vec![RegionExitPlan {
+                            source: None,
+                            kind: RegionExitKind::Return {
+                                value: fallback_result,
+                            },
+                        }],
+                    },
+                ],
                 scalar_threads: Vec::new(),
                 direct_calls: Vec::new(),
                 deopt_points: Vec::new(),
