@@ -47,6 +47,7 @@ def _run_apply_module(tmp_path: Path, module_name: str, source: str) -> tuple[ob
         {
             "SOAC_MODULE_ENABLED": f"path:{tmp_path}",
             "SOAC_WORK_DIR": str(work_dir),
+            "SOAC_OPT_PLAN_MODE": "legacy",
         }
     )
 

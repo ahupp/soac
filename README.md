@@ -247,13 +247,13 @@ typed variables must use recognized values. Boolean knobs accept `1`, `true`,
   - `profile`: run unspecialized, instrument specialization input
     counters, and write `$SOAC_WORK_DIR/profile.bin`.
   - `verify`: read per-module optimization plans from the active module cache,
-    preferring `mod.optv3` over legacy `mod.opt`, apply their specializations,
+    selected by `SOAC_OPT_PLAN_MODE`, apply their specializations,
     instrument specialization input counters again, and write
     `$SOAC_WORK_DIR/verify.bin`. Verify mode exercises indexed store
     fast paths so their hit/fallback counters measure the specialized
     steady-state path.
   - `apply`: read per-module optimization plans from the active module cache,
-    preferring `mod.optv3` over legacy `mod.opt`, apply their specializations,
+    selected by `SOAC_OPT_PLAN_MODE`, apply their specializations,
     and emit no specialization counter dump files.
     When event logging is enabled through `SOAC_LOG` or the default
     `$SOAC_WORK_DIR/events.jsonl`, apply mode still records in-process
@@ -265,9 +265,9 @@ typed variables must use recognized values. Boolean knobs accept `1`, `true`,
 
 - `SOAC_OPT_PLAN_MODE=auto|legacy|v3`
   Select which serialized optimization-plan artifacts `verify` and `apply`
-  consume. The default `auto` mode prefers `mod.optv3` and falls back to legacy
-  `mod.opt`. `legacy` ignores `mod.optv3`. `v3` requires `mod.optv3` and errors
-  instead of falling back to a legacy plan.
+  consume. The default `v3` mode requires `mod.optv3` and errors instead of
+  falling back to a legacy plan. `auto` prefers `mod.optv3` and falls back to
+  legacy `mod.opt`. `legacy` ignores `mod.optv3`.
 
 - `SOAC_DECIDE_OPT_MODE=legacy|v3`
   Select which artifact family the Justfile profile-to-plan recipes generate.
@@ -368,8 +368,9 @@ tree, with pystone benchmark runs writing to `work/bench/`.
   Offline precompile a counter-referenced set of cached BlockPy modules into
   relocatable object files and link them into a shared library. The recipe
   regenerates optimization plans from the counter file before compiling. The
-  precompile JIT path follows `SOAC_OPT_PLAN_MODE`: `auto` prefers `mod.optv3`
-  and falls back to legacy `mod.opt`, while `v3` requires `mod.optv3`. The
+  precompile JIT path follows `SOAC_OPT_PLAN_MODE`: the default `v3` mode
+  requires `mod.optv3`, while `auto` prefers `mod.optv3` and falls back to
+  legacy `mod.opt`. The
   counter file normally comes from a previous profile pass, and the matching
   pre-optimization BlockPy cache entries must still exist in the active
   `$SOAC_WORK_DIR/modules` cache. With the default benchmark cache isolation,
@@ -391,9 +392,9 @@ tree, with pystone benchmark runs writing to `work/bench/`.
   `cargo run -p soac-inspector --bin print_optimization_plan_v3 -- --plan <mod.optv3>`
   to inspect a v3 artifact summary. `just benchmark` runs v3 mode after the
   profile pass by default. In `SOAC_OPT_MODE=verify|apply`,
-  `SOAC_OPT_PLAN_MODE` controls runtime plan selection: `auto` prefers a
-  matching `mod.optv3` in the active module cache and falls back to legacy
-  `mod.opt`, while `v3` requires the serialized v3 artifact.
+  `SOAC_OPT_PLAN_MODE` controls runtime plan selection: the default `v3`
+  requires a matching serialized v3 artifact, while `auto` prefers a matching
+  `mod.optv3` in the active module cache and falls back to legacy `mod.opt`.
 
 - `SOAC_JIT_PERF_HELPER_FRAMES=1`
   In `fn should_preserve_perf_helper_frames`, at

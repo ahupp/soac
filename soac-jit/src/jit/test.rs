@@ -26,6 +26,7 @@ mod tests {
     use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyModule, PyModuleMethods, PyTuple};
     use pyo3::{Bound, Py, PyAny, PyErr, PyResult, Python, ffi};
     use ruff_python_ast as ast;
+    use soac_config::OptimizationPlanMode;
     use soac_core::profile::{
         CounterDumpRecord, CounterDumpRow, CounterDumpTypeKey, CounterDumpTypeKeyLayout,
         CounterDumpTypeTableEntry, write_counter_dump_records,
@@ -761,6 +762,7 @@ def add(a, b):
         .expect("lowering precompile smoke source should succeed")
         .codegen_module;
 
+        let _plan_mode = set_legacy_optimization_plan_mode();
         let object = precompile_codegen_module_to_object_bytes(
             "precompile_smoke",
             0x1234,
@@ -837,6 +839,7 @@ def get_value():
             module_constant_symbol_prefix_for_module_identity(module_name, source_hash);
         let constant_symbol = module_constant_object_symbol(symbol_prefix.as_str(), constant_id);
 
+        let _plan_mode = set_legacy_optimization_plan_mode();
         let object = precompile_codegen_module_to_object_bytes(
             module_name,
             source_hash,
@@ -884,6 +887,7 @@ def get_value():
             module_constant_symbol_prefix_for_module_identity(module_name, source_hash);
         let constant_symbol = module_constant_object_symbol(symbol_prefix.as_str(), constant_id);
 
+        let _plan_mode = set_legacy_optimization_plan_mode();
         let object = precompile_codegen_module_to_object_bytes(
             module_name,
             source_hash,
@@ -929,6 +933,7 @@ def get_value():
             module_constant_symbol_prefix_for_module_identity(module_name, source_hash);
         let constant_symbol = module_constant_object_symbol(symbol_prefix.as_str(), constant_id);
 
+        let _plan_mode = set_legacy_optimization_plan_mode();
         let object = precompile_codegen_module_to_object_bytes(
             module_name,
             source_hash,
@@ -975,6 +980,7 @@ def get_value():
             module_constant_symbol_prefix_for_module_identity(module_name, source_hash);
         let constant_symbol = module_constant_object_symbol(symbol_prefix.as_str(), constant_id);
 
+        let _plan_mode = set_legacy_optimization_plan_mode();
         let object = precompile_codegen_module_to_object_bytes(
             module_name,
             source_hash,
@@ -5633,7 +5639,7 @@ def build(values):
             let soac_work_dir = fresh_test_work_dir("planned-process-jit-batch");
             let module_cache_root = soac_work_dir.join("modules");
             let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
-            let _opt_mode = EnvVarGuard::set("SOAC_OPT_MODE", "verify");
+            let (_opt_mode, _plan_mode) = set_legacy_opt_mode("verify");
             let session = std::sync::Arc::new(crate::session::CompileSession::new());
             let module_name = "planned_process_jit_batch_test";
             let module_name_gen = ModuleNameGen::new(105);
@@ -5957,6 +5963,7 @@ def build(values):
             std::env::set_var("SOAC_WORK_DIR", &soac_work_dir);
             std::env::set_var("SOAC_OPT_MODE", "apply");
         }
+        let _plan_mode = set_legacy_optimization_plan_mode();
         crate::initialize_test_python();
 
         let (jit_module, built) = Python::attach(|py| {
@@ -6086,6 +6093,7 @@ def build(values):
                 std::env::remove_var("SOAC_ENABLE_PROFILED_COLD_BLOCKS");
             }
         }
+        let _plan_mode = set_legacy_optimization_plan_mode();
         crate::initialize_test_python();
 
         let rendered = Python::attach(|py| {
@@ -6171,6 +6179,7 @@ def build(values):
         let old_soac_work_dir = std::env::var_os("SOAC_WORK_DIR");
         let old_soac_opt_mode = std::env::var_os("SOAC_OPT_MODE");
         let soac_work_dir = fresh_test_work_dir("test-work");
+        let _plan_mode = set_legacy_optimization_plan_mode();
         unsafe {
             std::env::set_var("SOAC_WORK_DIR", &soac_work_dir);
             std::env::set_var("SOAC_OPT_MODE", "verify");
@@ -6439,6 +6448,7 @@ class Record:
         let old_soac_work_dir = std::env::var_os("SOAC_WORK_DIR");
         let old_soac_opt_mode = std::env::var_os("SOAC_OPT_MODE");
         let soac_work_dir = fresh_test_work_dir("test-work");
+        let _plan_mode = set_legacy_optimization_plan_mode();
         unsafe {
             std::env::set_var("SOAC_WORK_DIR", &soac_work_dir);
             std::env::set_var("SOAC_OPT_MODE", "apply");
@@ -6684,6 +6694,7 @@ def write_point(point, value):
         let old_soac_work_dir = std::env::var_os("SOAC_WORK_DIR");
         let old_soac_opt_mode = std::env::var_os("SOAC_OPT_MODE");
         let soac_work_dir = fresh_test_work_dir("test-work");
+        let _plan_mode = set_legacy_optimization_plan_mode();
         unsafe {
             std::env::set_var("SOAC_WORK_DIR", &soac_work_dir);
             std::env::set_var("SOAC_OPT_MODE", "verify");
@@ -7029,6 +7040,7 @@ class Record:
         let old_soac_work_dir = std::env::var_os("SOAC_WORK_DIR");
         let old_soac_opt_mode = std::env::var_os("SOAC_OPT_MODE");
         let soac_work_dir = fresh_test_work_dir("test-work");
+        let _plan_mode = set_legacy_optimization_plan_mode();
         unsafe {
             std::env::set_var("SOAC_WORK_DIR", &soac_work_dir);
             std::env::set_var("SOAC_OPT_MODE", "apply");
@@ -7256,7 +7268,7 @@ def read_point(point):
             let soac_work_dir = fresh_test_work_dir("v3-field-getattr-store-rhs");
             let module_cache_root = soac_work_dir.join("modules");
             let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
-            let _opt_mode = EnvVarGuard::set("SOAC_OPT_MODE", "apply");
+            let (_opt_mode, _plan_mode) = set_legacy_opt_mode("apply");
             let _plan_mode = EnvVarGuard::set(SOAC_OPT_PLAN_MODE_ENV, "v3");
             let owner_module = PyModule::from_code(
                 py,
@@ -7484,7 +7496,7 @@ def read_point(point):
         source: &str,
         function_bind_name: &str,
     ) -> BuiltSpecializedFunction {
-        let _opt_mode = EnvVarGuard::set("SOAC_OPT_MODE", mode);
+        let (_opt_mode, _plan_mode) = set_legacy_opt_mode(mode);
         let soac_work_dir = fresh_test_work_dir("field-getattr-deopt");
         let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
         let owner_module = PyModule::from_code(
@@ -7760,7 +7772,7 @@ def write_point(factory, value):
                 globals_obj: ObjPtr,
             }
 
-            let _opt_mode = EnvVarGuard::set("SOAC_OPT_MODE", "verify");
+            let (_opt_mode, _plan_mode) = set_legacy_opt_mode("verify");
             let soac_work_dir = fresh_test_work_dir("field-getattr-deopt-runtime");
             let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
             let owner_module = PyModule::from_code(
@@ -7949,7 +7961,7 @@ def read_point(point):
                 globals_obj: ObjPtr,
             }
 
-            let _opt_mode = EnvVarGuard::set("SOAC_OPT_MODE", "verify");
+            let (_opt_mode, _plan_mode) = set_legacy_opt_mode("verify");
             let soac_work_dir = fresh_test_work_dir("field-setattr-deopt-runtime");
             let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
             let owner_module = PyModule::from_code(
@@ -14199,6 +14211,21 @@ def g():
         }
     }
 
+    fn set_legacy_optimization_plan_mode() -> EnvVarGuard {
+        EnvVarGuard::set(SOAC_OPT_PLAN_MODE_ENV, "legacy")
+    }
+
+    fn set_legacy_opt_mode(mode: &str) -> (EnvVarGuard, EnvVarGuard) {
+        (
+            EnvVarGuard::set("SOAC_OPT_MODE", mode),
+            set_legacy_optimization_plan_mode(),
+        )
+    }
+
+    fn legacy_plan_env_config() -> SoacEnvConfig {
+        SoacEnvConfig::default().with_optimization_plan_mode(OptimizationPlanMode::Legacy)
+    }
+
     unsafe fn build_runtime_refcount_smoke_context() -> (
         crate::session::CompileSession,
         JITModule,
@@ -15655,7 +15682,7 @@ def f(x):
                 globals_obj: ObjPtr,
             }
 
-            let _opt_mode = EnvVarGuard::set("SOAC_OPT_MODE", "apply");
+            let (_opt_mode, _plan_mode) = set_legacy_opt_mode("apply");
             let soac_work_dir = fresh_test_work_dir("exact-int-binop-deopt-runtime");
             let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
             let mut function = test_function();
@@ -17112,7 +17139,7 @@ def f(x):
             let soac_work_dir = fresh_test_work_dir("strict-v3-indexed-field-input");
             let module_cache_root = soac_work_dir.join("modules");
             let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
-            let _opt_mode = EnvVarGuard::set("SOAC_OPT_MODE", "apply");
+            let (_opt_mode, _plan_mode) = set_legacy_opt_mode("apply");
             let _plan_mode = EnvVarGuard::set(SOAC_OPT_PLAN_MODE_ENV, "v3");
             let owner_module = PyModule::from_code(
                 py,
@@ -17270,7 +17297,7 @@ def read_point(point):
             let soac_work_dir = fresh_test_work_dir("strict-v3-indexed-field-setattr");
             let module_cache_root = soac_work_dir.join("modules");
             let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
-            let _opt_mode = EnvVarGuard::set("SOAC_OPT_MODE", "apply");
+            let (_opt_mode, _plan_mode) = set_legacy_opt_mode("apply");
             let _plan_mode = EnvVarGuard::set(SOAC_OPT_PLAN_MODE_ENV, "v3");
             let owner_module = PyModule::from_code(
                 py,
@@ -17944,7 +17971,7 @@ def write_point(point, value):
                 globals_obj: ObjPtr,
             }
 
-            let _opt_mode = EnvVarGuard::set("SOAC_OPT_MODE", "apply");
+            let (_opt_mode, _plan_mode) = set_legacy_opt_mode("apply");
             let soac_work_dir = fresh_test_work_dir("exact-int-compare-deopt-runtime");
             let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
             let mut function = test_function();
@@ -18139,7 +18166,7 @@ def write_point(point, value):
                 globals_obj: ObjPtr,
             }
 
-            let _opt_mode = EnvVarGuard::set("SOAC_OPT_MODE", "apply");
+            let (_opt_mode, _plan_mode) = set_legacy_opt_mode("apply");
             let soac_work_dir = fresh_test_work_dir("exact-int-if-compare-deopt-runtime");
             let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
             let mut constants = TestConstantPool::default();
@@ -18497,7 +18524,7 @@ def write_point(point, value):
                 globals_obj: ObjPtr,
             }
 
-            let _opt_mode = EnvVarGuard::set("SOAC_OPT_MODE", "apply");
+            let (_opt_mode, _plan_mode) = set_legacy_opt_mode("apply");
             let soac_work_dir = fresh_test_work_dir("exact-int-unary-deopt-runtime");
             let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
             let mut function = test_function();
@@ -19068,6 +19095,7 @@ def f(x, y):
         let old_soac_work_dir = std::env::var_os("SOAC_WORK_DIR");
         let old_soac_opt_mode = std::env::var_os("SOAC_OPT_MODE");
         let soac_work_dir = fresh_test_work_dir("test-work");
+        let _plan_mode = set_legacy_optimization_plan_mode();
         unsafe {
             std::env::set_var("SOAC_WORK_DIR", &soac_work_dir);
             std::env::set_var("SOAC_OPT_MODE", "verify");
@@ -19186,7 +19214,7 @@ def f(x, y):
         write_test_optimization_plan(plan_path.as_path(), &plan);
 
         let inputs = planned_optimization_inputs_for_precompile(
-            &SoacEnvConfig::default(),
+            &legacy_plan_env_config(),
             Some(PrecompileOptimizationPlanInput {
                 path: plan_path.as_path(),
                 v3_path: None,
@@ -19292,7 +19320,7 @@ def f(x, y):
         write_test_optimization_plan(plan_path.as_path(), &plan);
 
         let inputs = planned_optimization_inputs_for_precompile(
-            &SoacEnvConfig::default(),
+            &legacy_plan_env_config(),
             Some(PrecompileOptimizationPlanInput {
                 path: plan_path.as_path(),
                 v3_path: None,
@@ -19427,6 +19455,7 @@ def f(x, y):
         .expect("test optimization plan path should build");
         write_test_optimization_plan(plan_path.as_path(), &plan);
 
+        let _plan_mode = set_legacy_optimization_plan_mode();
         let object = precompile_codegen_module_to_object_bytes(
             caller_module_name,
             caller_source_hash,
@@ -19521,7 +19550,7 @@ def f(x, y):
         write_test_optimization_plan(plan_path.as_path(), &plan);
 
         let inputs = planned_optimization_inputs_for_precompile(
-            &SoacEnvConfig::default(),
+            &legacy_plan_env_config(),
             Some(PrecompileOptimizationPlanInput {
                 path: plan_path.as_path(),
                 v3_path: None,
@@ -19556,7 +19585,7 @@ def f(x, y):
             let soac_work_dir = fresh_test_work_dir("planned-specialization-modules");
             let module_cache_root = soac_work_dir.join("modules");
             let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
-            let _opt_mode = EnvVarGuard::set("SOAC_OPT_MODE", "verify");
+            let (_opt_mode, _plan_mode) = set_legacy_opt_mode("verify");
             let module_name = "planned_specialization_profile_test";
             let module_name_gen = ModuleNameGen::new(0);
             let callee = with_single_test_block(
@@ -19698,7 +19727,7 @@ def f(x, y):
             let soac_work_dir = fresh_test_work_dir("strict-v3-runtime-legacy-plan");
             let module_cache_root = soac_work_dir.join("modules");
             let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
-            let _opt_mode = EnvVarGuard::set("SOAC_OPT_MODE", "verify");
+            let (_opt_mode, _plan_mode) = set_legacy_opt_mode("verify");
             let _plan_mode = EnvVarGuard::set(SOAC_OPT_PLAN_MODE_ENV, "v3");
             let module_name = "strict_v3_runtime_legacy_plan_test";
             let module_name_gen = ModuleNameGen::new(0);
@@ -19768,7 +19797,7 @@ def f(x, y):
             let soac_work_dir = fresh_test_work_dir("strict-v3-runtime-v3-plan");
             let module_cache_root = soac_work_dir.join("modules");
             let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
-            let _opt_mode = EnvVarGuard::set("SOAC_OPT_MODE", "verify");
+            let (_opt_mode, _plan_mode) = set_legacy_opt_mode("verify");
             let _plan_mode = EnvVarGuard::set(SOAC_OPT_PLAN_MODE_ENV, "v3");
             let module_name = "strict_v3_runtime_v3_plan_test";
             let module_name_gen = ModuleNameGen::new(0);
@@ -19851,7 +19880,7 @@ def f(x, y):
             let soac_work_dir = fresh_test_work_dir("planned-cross-module-specializations");
             let module_cache_root = soac_work_dir.join("modules");
             let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
-            let _opt_mode = EnvVarGuard::set("SOAC_OPT_MODE", "verify");
+            let (_opt_mode, _plan_mode) = set_legacy_opt_mode("verify");
             let session = std::sync::Arc::new(crate::session::CompileSession::new());
             let caller_module_name = "planned_cross_module_caller_test";
             let callee_module_name = "planned_cross_module_callee_test";
@@ -19964,7 +19993,7 @@ def f(x, y):
             let soac_work_dir = fresh_test_work_dir("planned-cross-module-direct-codegen");
             let module_cache_root = soac_work_dir.join("modules");
             let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
-            let _opt_mode = EnvVarGuard::set("SOAC_OPT_MODE", "verify");
+            let (_opt_mode, _plan_mode) = set_legacy_opt_mode("verify");
             let session = std::sync::Arc::new(crate::session::CompileSession::new());
             let caller_module_name = "planned_cross_module_direct_codegen_caller_test";
             let callee_module_name = "planned_cross_module_direct_codegen_callee_test";
@@ -20240,7 +20269,7 @@ def f(x, y):
         py: Python<'_>,
         mode: &str,
     ) -> BuiltSpecializedFunction {
-        let _opt_mode = EnvVarGuard::set("SOAC_OPT_MODE", mode);
+        let (_opt_mode, _plan_mode) = set_legacy_opt_mode(mode);
         let soac_work_dir = fresh_test_work_dir("indexed-global-deopt-profile");
         let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
         let blocks = [1usize as ObjPtr];
@@ -20299,7 +20328,7 @@ def f(x, y):
         py: Python<'_>,
         mode: &str,
     ) -> BuiltSpecializedFunction {
-        let _opt_mode = EnvVarGuard::set("SOAC_OPT_MODE", mode);
+        let (_opt_mode, _plan_mode) = set_legacy_opt_mode(mode);
         let soac_work_dir = fresh_test_work_dir("indexed-global-store-deopt-profile");
         let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
         let blocks = [1usize as ObjPtr];
@@ -20521,7 +20550,7 @@ def f(x, y):
         py: Python<'_>,
         callable_replay_safe: bool,
     ) -> BuiltSpecializedFunction {
-        let _opt_mode = EnvVarGuard::set("SOAC_OPT_MODE", "verify");
+        let (_opt_mode, _plan_mode) = set_legacy_opt_mode("verify");
         let soac_work_dir = fresh_test_work_dir("direct-call-deopt-profile");
         let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
         let blocks = [1usize as ObjPtr];
@@ -20742,7 +20771,7 @@ def f(x, y):
         py: Python<'_>,
         receiver_replay_safe: bool,
     ) -> BuiltSpecializedFunction {
-        let _opt_mode = EnvVarGuard::set("SOAC_OPT_MODE", "verify");
+        let (_opt_mode, _plan_mode) = set_legacy_opt_mode("verify");
         let soac_work_dir = fresh_test_work_dir("direct-method-deopt-profile");
         let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
         let blocks = [1usize as ObjPtr];
@@ -21054,7 +21083,7 @@ def f(x, y):
                 globals_obj: ObjPtr,
             }
 
-            let _opt_mode = EnvVarGuard::set("SOAC_OPT_MODE", "verify");
+            let (_opt_mode, _plan_mode) = set_legacy_opt_mode("verify");
             let soac_work_dir = fresh_test_work_dir("direct-method-deopt-runtime");
             let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
             let module_name = "direct_method_deopt_runtime_test";
@@ -21373,7 +21402,7 @@ def f(x, y):
                 globals_obj: ObjPtr,
             }
 
-            let _opt_mode = EnvVarGuard::set("SOAC_OPT_MODE", "verify");
+            let (_opt_mode, _plan_mode) = set_legacy_opt_mode("verify");
             let soac_work_dir = fresh_test_work_dir("direct-call-deopt-runtime");
             let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
             let module_name_gen = ModuleNameGen::new(0);
@@ -22481,7 +22510,7 @@ def f(x, y):
                 globals_obj: ObjPtr,
             }
 
-            let _opt_mode = EnvVarGuard::set("SOAC_OPT_MODE", "verify");
+            let (_opt_mode, _plan_mode) = set_legacy_opt_mode("verify");
             let soac_work_dir = fresh_test_work_dir("indexed-global-store-deopt-runtime");
             let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
             let mut function = test_function();
@@ -23147,6 +23176,7 @@ def f(x, y):
         let old_soac_work_dir = std::env::var_os("SOAC_WORK_DIR");
         let old_soac_opt_mode = std::env::var_os("SOAC_OPT_MODE");
         let soac_work_dir = fresh_test_work_dir("test-work");
+        let _plan_mode = set_legacy_optimization_plan_mode();
         unsafe {
             std::env::set_var("SOAC_WORK_DIR", &soac_work_dir);
             std::env::set_var("SOAC_OPT_MODE", "apply");

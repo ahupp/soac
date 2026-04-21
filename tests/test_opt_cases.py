@@ -56,6 +56,7 @@ def _soac_subprocess_env(module_root: Path, *, work_dir: Path) -> dict[str, str]
     env = dict(os.environ)
     env["SOAC_MODULE_ENABLED"] = f"path:{module_root}"
     env["SOAC_WORK_DIR"] = str(work_dir)
+    env["SOAC_OPT_PLAN_MODE"] = "legacy"
     env.pop("SOAC_LOG", None)
     env.pop("SOAC_COMPILE_MODE", None)
     return env

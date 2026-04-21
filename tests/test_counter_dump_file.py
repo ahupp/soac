@@ -29,6 +29,7 @@ def _read_jsonl(path):
 def _soac_subprocess_env(module_root, *, work_dir=None, extra_env=None):
     env = dict(os.environ)
     env["SOAC_MODULE_ENABLED"] = f"path:{module_root}"
+    env["SOAC_OPT_PLAN_MODE"] = "legacy"
     env.pop("SOAC_COMPILE_MODE", None)
     if work_dir is not None:
         env["SOAC_WORK_DIR"] = str(work_dir)
@@ -148,7 +149,7 @@ def read():
     assert int(dump["records"][0]["source_hash"], 16) > 0
 
 
-def test_strict_v3_plan_mode_consumes_helper_written_v3_plan(tmp_path):
+def test_default_v3_plan_mode_consumes_helper_written_v3_plan(tmp_path):
     module_name = "counter_dump_strict_v3_plan_case"
     (tmp_path / f"{module_name}.py").write_text(
         """
@@ -167,6 +168,7 @@ def run():
         "assert module.run() is True",
     )
     base_env = _soac_subprocess_env(tmp_path, work_dir=work_dir)
+    base_env.pop("SOAC_OPT_PLAN_MODE", None)
     profile_result = _run_soac_subprocess(
         script,
         env={**base_env, "SOAC_OPT_MODE": "profile"},
@@ -180,11 +182,7 @@ def run():
     for opt_mode in ("verify", "apply"):
         result = _run_soac_subprocess(
             script,
-            env={
-                **base_env,
-                "SOAC_OPT_MODE": opt_mode,
-                "SOAC_OPT_PLAN_MODE": "v3",
-            },
+            env={**base_env, "SOAC_OPT_MODE": opt_mode},
         )
         _assert_subprocess_ok(result)
 

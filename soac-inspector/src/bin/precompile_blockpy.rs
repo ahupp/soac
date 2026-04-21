@@ -569,6 +569,8 @@ mod test {
     use soac_driver::codegen_cache::store_codegen_module_cache;
     use soac_driver::{LoweringOptions, lower_python_to_blockpy_recorded_with_options};
     use soac_jit::module_type::hash_module_source;
+    use soac_opt::pipeline_v3::generate_optimization_plans_v3_for_cached_modules;
+    use soac_opt::plan::{CachedModuleOptimizationInput, ProfileEvidenceStore};
     use std::process::Stdio;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -749,7 +751,7 @@ mod test {
             ModuleNameGen::new(11),
             LoweringOptions {
                 runtime_names_as_globals: true,
-                pre_optimization_cache_path: Some(runtime_cache_path),
+                pre_optimization_cache_path: Some(runtime_cache_path.clone()),
                 pre_optimization_cache_metadata: Some(module_cache_metadata_for_source(
                     PythonModuleCacheSource::Project,
                     &runtime_ref,
@@ -837,7 +839,7 @@ mod test {
             ModuleNameGen::new(11),
             LoweringOptions {
                 runtime_names_as_globals: true,
-                pre_optimization_cache_path: Some(runtime_cache_path),
+                pre_optimization_cache_path: Some(runtime_cache_path.clone()),
                 pre_optimization_cache_metadata: Some(module_cache_metadata_for_source(
                     PythonModuleCacheSource::Project,
                     &runtime_ref,
@@ -855,7 +857,24 @@ mod test {
             .expect("test module should contain f");
         let counters_path = root.join("profile.bin");
         let record = counter_record(module_name, source_hash, Some(function_id));
-        fs::write(counters_path.as_path(), record.encode().unwrap()).unwrap();
+        let runtime_record =
+            counter_record(SOAC_RUNTIME_MODULE_NAME, runtime_ref.source_hash, None);
+        fs::write(
+            counters_path.as_path(),
+            [record.encode().unwrap(), runtime_record.encode().unwrap()].concat(),
+        )
+        .unwrap();
+        let evidence_store = ProfileEvidenceStore::from_counter_dump(counters_path.as_path())
+            .expect("test counter dump should load");
+        generate_optimization_plans_v3_for_cached_modules(
+            &evidence_store,
+            [
+                CachedModuleOptimizationInput::new(cache_path.clone(), true),
+                CachedModuleOptimizationInput::new(runtime_cache_path, true),
+            ],
+            cache_root.as_path(),
+        )
+        .expect("test should generate v3 precompile plans");
 
         let out_path = root.join("libsoac_precompiled_test.so");
         let object_dir = root.join("objects");

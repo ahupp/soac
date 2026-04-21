@@ -256,6 +256,11 @@ impl SoacEnvConfig {
         self
     }
 
+    pub fn with_optimization_plan_mode(mut self, mode: OptimizationPlanMode) -> Self {
+        self.optimization_plan_mode = mode;
+        self
+    }
+
     pub fn cranelift_opt_level(&self) -> &str {
         self.cranelift_opt_level.as_str()
     }
@@ -339,7 +344,7 @@ impl Default for SoacEnvConfig {
         Self {
             cranelift_opt_level: "speed".to_string(),
             specialization_mode: None,
-            optimization_plan_mode: OptimizationPlanMode::Auto,
+            optimization_plan_mode: OptimizationPlanMode::V3,
             soac_work_dir: None,
             profiled_cold_blocks_enabled: false,
             jit_refcount_emission_enabled: true,
@@ -429,7 +434,7 @@ fn parse_optional_optimization_plan_mode(
     mode: Option<&str>,
 ) -> Result<OptimizationPlanMode, String> {
     let Some(mode) = mode else {
-        return Ok(OptimizationPlanMode::Auto);
+        return Ok(OptimizationPlanMode::V3);
     };
     OptimizationPlanMode::from_str(mode)
         .map_err(|err| invalid_env_value(SOAC_OPT_PLAN_MODE_ENV, mode, err))
@@ -594,7 +599,7 @@ mod tests {
         let config = SoacEnvConfig::from_env().unwrap();
 
         assert_eq!(config.specialization_mode(), None);
-        assert_eq!(config.optimization_plan_mode(), OptimizationPlanMode::Auto);
+        assert_eq!(config.optimization_plan_mode(), OptimizationPlanMode::V3);
         assert_eq!(config.cranelift_opt_level(), "speed");
         assert_eq!(config.compile_mode(), CompileMode::Lazy);
         assert_eq!(config.jit_compile_workers(), None);

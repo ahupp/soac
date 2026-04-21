@@ -1176,7 +1176,7 @@ benchmark-verify loops="100000" counters_dir="": (update-venv-offline) (build-ex
   WARMUP_LOOPS="${WARMUP_LOOPS:-1000}"
   BENCHMARK_CPU="${BENCHMARK_CPU:-}"
   BENCHMARK_CONSTANT_CLOCKS="${BENCHMARK_CONSTANT_CLOCKS:-0}"
-  RUNTIME_OPT_PLAN_MODE="${SOAC_OPT_PLAN_MODE:-auto}"
+  RUNTIME_OPT_PLAN_MODE="${SOAC_OPT_PLAN_MODE:-v3}"
   COUNTERS_DIR="{{counters_dir}}"
   if [[ -z "$COUNTERS_DIR" ]]; then
     COUNTERS_DIR="$LAST_BENCHMARK_COUNTERS_DIR"
@@ -1252,7 +1252,7 @@ benchmark benchmark_loops="1000000" verify_loops="100000" results_root="work/ben
   RESULTS_ROOT="{{results_root}}"
   RESULT_MODE="{{result_mode}}"
   CRANELIFT_OPT_LEVEL="${SOAC_CRANELIFT_OPT_LEVEL:-speed}"
-  RUNTIME_OPT_PLAN_MODE="${SOAC_OPT_PLAN_MODE:-auto}"
+  RUNTIME_OPT_PLAN_MODE="${SOAC_OPT_PLAN_MODE:-v3}"
   if [[ "$RESULTS_ROOT" != /* ]]; then
     RESULTS_ROOT="$REPO_ROOT/$RESULTS_ROOT"
   fi
@@ -1415,7 +1415,7 @@ precompile-shared-library counters="" out="work/logs/libsoac_precompiled.so" obj
   fi
 
   SOAC_WORK_DIR="$COUNTERS_DIR" \
-  SOAC_OPT_PLAN_MODE="${SOAC_OPT_PLAN_MODE:-auto}" \
+  SOAC_OPT_PLAN_MODE="${SOAC_OPT_PLAN_MODE:-v3}" \
     cargo run -p soac-inspector --bin precompile_blockpy -- "${args[@]}"
 
 [private]

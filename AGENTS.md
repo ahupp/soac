@@ -452,9 +452,9 @@ explicit ordinary
   unoptimized BlockPy modules. Justfile profile-to-plan recipes default to this
   v3 mode; set `SOAC_DECIDE_OPT_MODE=legacy` only when comparing the old
   planner path. `SOAC_OPT_PLAN_MODE=auto|legacy|v3` controls runtime plan
-  selection for `verify`/`apply`: the default `auto` prefers `mod.optv3` and
-  falls back to legacy `mod.opt`, `legacy` ignores `mod.optv3`, and `v3`
-  requires `mod.optv3` instead of falling back. `verify` exercises indexed store
+  selection for `verify`/`apply`: the default `v3` requires `mod.optv3` instead
+  of falling back, `auto` prefers `mod.optv3` and falls back to legacy
+  `mod.opt`, and `legacy` ignores `mod.optv3`. `verify` exercises indexed store
   fast paths so hit/fallback counters measure the specialized steady-state path.
   `apply` still skips counter dump files, but when event logging is enabled it
   records indexed specialization hit/fallback counts and deopt-entry counts long
@@ -517,9 +517,9 @@ explicit ordinary
 - `just precompile-shared-library counters=<profile.bin> out=<lib.so>`
   Offline precompiles all modules referenced by a counter dump from cached
   pre-optimization BlockPy modules, writes per-module object files, and links a
-  shared library. The precompile JIT path follows `SOAC_OPT_PLAN_MODE`: `auto`
-  prefers `mod.optv3` and falls back to legacy `mod.opt`, while `v3` requires
-  `mod.optv3`. It expects matching module-cache entries in
+  shared library. The precompile JIT path follows `SOAC_OPT_PLAN_MODE`: the
+  default `v3` requires `mod.optv3`, while `auto` prefers `mod.optv3` and falls
+  back to legacy `mod.opt`. It expects matching module-cache entries in
   `$SOAC_WORK_DIR/modules`; run a profile/benchmark pass first when the cache is
   empty. Use `SOAC_PRECOMPILED_LIBRARY` to point runtime execution at the
   resulting shared library.
@@ -535,9 +535,9 @@ explicit ordinary
   to pretty-print a legacy plan for inspection, or
   `cargo run -p soac-inspector --bin print_optimization_plan_v3 -- --plan <mod.optv3>`
   to inspect a v3 artifact summary. In `SOAC_OPT_MODE=verify|apply`,
-  `SOAC_OPT_PLAN_MODE` controls runtime plan selection: `auto` prefers a
-  matching `mod.optv3` in the active module cache and falls back to legacy
-  `mod.opt`, while `v3` requires the serialized v3 artifact.
+  `SOAC_OPT_PLAN_MODE` controls runtime plan selection: the default `v3`
+  requires a matching serialized v3 artifact, while `auto` prefers a matching
+  `mod.optv3` in the active module cache and falls back to legacy `mod.opt`.
 - `SOAC_CRANELIFT_OPT_LEVEL`
   Optional Cranelift process-JIT optimization level override:
   `none`, `speed`, or `speed_and_size`. Normal runtime and benchmark
