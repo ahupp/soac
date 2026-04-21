@@ -130,6 +130,10 @@ Treat one or two type-check instructions inside an already-small helper
 as below the landing threshold unless repeated benchmarks show a clear
 win.
 
+This hidden helper fast path was later removed as part of the optimizer-v3
+migration. Exact-list item optimization now belongs behind an explicit selected
+plan; the generic item helpers are direct wrappers around the CPython item APIs.
+
 ### Truth tests after rich comparisons
 
 The profile showed `dp_jit_is_true` at about `1.43%` self, but

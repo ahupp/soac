@@ -54,18 +54,6 @@ unsafe extern "C" {
 
 pub type ObjPtr = *mut c_void;
 
-#[repr(C)]
-struct SoacPyLongValue {
-    lv_tag: usize,
-    ob_digit: [u32; 1],
-}
-#[repr(C)]
-struct SoacPyLongObject {
-    ob_base: ffi::PyObject,
-    long_value: SoacPyLongValue,
-}
-const PY_LONG_SIGN_MASK: usize = 3;
-const PY_LONG_NON_SIZE_BITS: usize = 3;
 unsafe fn is_cell_object(obj: *mut ffi::PyObject) -> bool {
     !obj.is_null() && ffi::Py_TYPE(obj) == std::ptr::addr_of_mut!(PyCell_Type)
 }
@@ -472,44 +460,6 @@ unsafe extern "C" fn pyobject_setattr_hook(obj: ObjPtr, attr: ObjPtr, value: Obj
         ptr::null_mut()
     }
 }
-unsafe fn exact_compact_long_value(obj: *mut ffi::PyObject) -> Option<ffi::Py_ssize_t> {
-    if ffi::PyLong_CheckExact(obj) == 0 {
-        return None;
-    }
-    let long = obj as *const SoacPyLongObject;
-    let long_value = &(*long).long_value;
-    if long_value.lv_tag >= (2 << PY_LONG_NON_SIZE_BITS) {
-        return None;
-    }
-
-    let sign = 1isize - (long_value.lv_tag & PY_LONG_SIGN_MASK) as isize;
-    Some(sign * long_value.ob_digit[0] as ffi::Py_ssize_t)
-}
-unsafe fn exact_list_index(
-    obj: *mut ffi::PyObject,
-    key: *mut ffi::PyObject,
-) -> Option<ffi::Py_ssize_t> {
-    if ffi::PyList_CheckExact(obj) == 0 {
-        return None;
-    }
-
-    let mut index = if let Some(index) = exact_compact_long_value(key) {
-        index
-    } else {
-        let index = ffi::PyLong_AsSsize_t(key);
-        if index == -1 && !ffi::PyErr_Occurred().is_null() {
-            ffi::PyErr_Clear();
-            return None;
-        }
-        index
-    };
-
-    let len = ffi::PyList_GET_SIZE(obj);
-    if index < 0 {
-        index += len;
-    }
-    (0 <= index && index < len).then_some(index)
-}
 unsafe fn new_none() -> ObjPtr {
     let none = ffi::Py_None();
     ffi::Py_INCREF(none);
@@ -523,12 +473,8 @@ unsafe extern "C" fn pyobject_getitem_hook(obj: ObjPtr, key: ObjPtr) -> ObjPtr {
         );
         return ptr::null_mut();
     }
-    let obj = obj as *mut ffi::PyObject;
-    let key = key as *mut ffi::PyObject;
-    if let Some(index) = exact_list_index(obj, key) {
-        return ffi::Py_NewRef(ffi::PyList_GET_ITEM(obj, index)) as ObjPtr;
-    }
-    let result = ffi::PyObject_GetItem(obj, key) as ObjPtr;
+    let result =
+        ffi::PyObject_GetItem(obj as *mut ffi::PyObject, key as *mut ffi::PyObject) as ObjPtr;
     result
 }
 unsafe extern "C" fn pyobject_setitem_hook(obj: ObjPtr, key: ObjPtr, value: ObjPtr) -> ObjPtr {
@@ -539,17 +485,11 @@ unsafe extern "C" fn pyobject_setitem_hook(obj: ObjPtr, key: ObjPtr, value: ObjP
         );
         return ptr::null_mut();
     }
-    let obj = obj as *mut ffi::PyObject;
-    let key = key as *mut ffi::PyObject;
-    let value = value as *mut ffi::PyObject;
-    if let Some(index) = exact_list_index(obj, key) {
-        let old_value = ffi::PyList_GET_ITEM(obj, index);
-        ffi::PyList_SET_ITEM(obj, index, ffi::Py_NewRef(value));
-        ffi::Py_DECREF(old_value);
-        return new_none();
-    }
-
-    let rc = ffi::PyObject_SetItem(obj, key, value);
+    let rc = ffi::PyObject_SetItem(
+        obj as *mut ffi::PyObject,
+        key as *mut ffi::PyObject,
+        value as *mut ffi::PyObject,
+    );
     if rc == 0 { new_none() } else { ptr::null_mut() }
 }
 unsafe extern "C" fn pyobject_delitem_hook(obj: ObjPtr, key: ObjPtr) -> ObjPtr {

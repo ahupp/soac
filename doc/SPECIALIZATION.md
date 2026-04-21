@@ -797,7 +797,9 @@ exact-list/exact-compact-int in-bounds guard, and original item-access fallback.
 The current JIT still uses the existing inline list load/store emitter for the
 selected shape. In v3 mode the emitted exact-list item node is consumed
 directly; legacy replayed item-shape maps are only used when no v3 artifact is
-loaded.
+loaded. The generic `dp_jit_pyobject_getitem` and `dp_jit_pyobject_setitem`
+helpers intentionally do not contain an exact-list fast path; unplanned item
+access goes through the CPython item APIs.
 
 ### Exact-List `GetItem`
 
@@ -828,7 +830,8 @@ loaded.
   borrowed list element, and returns the owned result expected by the current
   legacy `GetItem` lowering path.
 - On miss, codegen falls back to `PyObject_GetItem` through the generic helper
-  path and records `getitem_specialized_fallback` in verify mode.
+  path, which performs no exact-list rediscovery, and records
+  `getitem_specialized_fallback` in verify mode.
 
 ### Limitations / Soundness / Extensions
 
@@ -883,7 +886,8 @@ loaded.
   `PyListObject.ob_item[index]`, DECREFs the old slot value, and returns owned
   `None`.
 - On miss, codegen falls back to `PyObject_SetItem` through the generic helper
-  path and records `setitem_specialized_fallback` in verify mode.
+  path, which performs no exact-list rediscovery, and records
+  `setitem_specialized_fallback` in verify mode.
 
 ### Limitations / Soundness / Extensions
 
