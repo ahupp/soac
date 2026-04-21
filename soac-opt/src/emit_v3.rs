@@ -1,8 +1,8 @@
 use crate::plan_v3::{
-    ConversionKind, DeoptPointId, FailureMode, GuardFailure, GuardKind, MaterializeKind,
-    ModuleOptimizationPlanV3, OperationNode, PlanNodeId, PlanNodeKind, PlanValidationError,
-    PlanValue, PlannedConstant, PlannedOp, RegionExitKind, RegionExitTarget, RegionId,
-    RichCompareOp, validate_module_plan_v3,
+    ConversionKind, DeoptPointId, DirectCallSpecializationPlan, FailureMode, GuardFailure,
+    GuardKind, MaterializeKind, ModuleOptimizationPlanV3, OperationNode, PlanNodeId, PlanNodeKind,
+    PlanValidationError, PlanValue, PlannedConstant, PlannedOp, RegionExitKind, RegionExitTarget,
+    RegionId, RichCompareOp, validate_module_plan_v3,
 };
 use soac_core::block_py::{InstrId, SerializedFunctionId};
 use std::fmt;
@@ -17,7 +17,15 @@ pub struct MechanicalModuleEmission {
 pub struct MechanicalFunctionEmission {
     pub function: SerializedFunctionId,
     pub debug_name: Option<String>,
+    pub direct_calls: Vec<MechanicalDirectCallEmission>,
     pub regions: Vec<MechanicalRegionEmission>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct MechanicalDirectCallEmission {
+    pub source: InstrId,
+    pub target: SerializedFunctionId,
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -167,6 +175,7 @@ pub fn emit_mechanical_plan_v3(
             .map(|function| MechanicalFunctionEmission {
                 function: function.function.function,
                 debug_name: function.function.debug_name.clone(),
+                direct_calls: function.direct_calls.iter().map(emit_direct_call).collect(),
                 regions: function
                     .regions
                     .iter()
@@ -194,6 +203,14 @@ pub fn emit_mechanical_plan_v3(
             })
             .collect(),
     })
+}
+
+fn emit_direct_call(direct_call: &DirectCallSpecializationPlan) -> MechanicalDirectCallEmission {
+    MechanicalDirectCallEmission {
+        source: direct_call.source,
+        target: direct_call.target,
+        reason: direct_call.reason.clone(),
+    }
 }
 
 fn emit_node_op(kind: &PlanNodeKind) -> MechanicalStepOp {
@@ -261,11 +278,11 @@ fn emit_exit_kind(kind: &RegionExitKind) -> MechanicalExitKind {
 mod tests {
     use super::*;
     use crate::plan_v3::{
-        Cost, FallbackReason, FallbackTarget, FunctionOptimizationPlanV3, FunctionOwnershipPlan,
-        FunctionPlanIdentity, MaterializeNode, ModulePlanIdentity, RegionExitPlan, RegionInput,
-        RegionPlan, RegionSource, Rep,
+        Cost, DirectCallSpecializationPlan, FallbackReason, FallbackTarget,
+        FunctionOptimizationPlanV3, FunctionOwnershipPlan, FunctionPlanIdentity, MaterializeNode,
+        ModulePlanIdentity, RegionExitPlan, RegionInput, RegionPlan, RegionSource, Rep,
     };
-    use soac_core::block_py::{LocalFunctionId, SerializedModuleId};
+    use soac_core::block_py::{BlockLabel, LocalFunctionId, SerializedModuleId};
 
     fn test_plan(include_materialization: bool) -> ModuleOptimizationPlanV3 {
         let lhs = PlanValue::new(0, Rep::I64);
@@ -400,6 +417,7 @@ mod tests {
         let emission = emit_mechanical_plan_v3(&test_plan(true)).unwrap();
 
         assert_eq!(emission.module_name, "pkg.mod");
+        assert!(emission.functions[0].direct_calls.is_empty());
         let region = &emission.functions[0].regions[0];
         assert_eq!(region.steps.len(), 4);
         assert!(matches!(
@@ -425,6 +443,31 @@ mod tests {
                 }
             }
         ));
+    }
+
+    #[test]
+    fn emits_direct_call_decisions_mechanically() {
+        let mut plan = test_plan(true);
+        let source = InstrId::new(BlockLabel::from_index(0), 7);
+        let target = SerializedFunctionId::new(SerializedModuleId::new(0), LocalFunctionId::new(2));
+        plan.functions[0]
+            .direct_calls
+            .push(DirectCallSpecializationPlan {
+                source,
+                target,
+                reason: "profiled call_hot_targets selected this same-module function".to_string(),
+            });
+
+        let emission = emit_mechanical_plan_v3(&plan).unwrap();
+
+        assert_eq!(
+            emission.functions[0].direct_calls,
+            vec![MechanicalDirectCallEmission {
+                source,
+                target,
+                reason: "profiled call_hot_targets selected this same-module function".to_string(),
+            }]
+        );
     }
 
     #[test]

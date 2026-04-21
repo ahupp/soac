@@ -76,8 +76,8 @@ use soac_lowering::passes::{
 };
 use soac_opt::artifacts_v3::{ExactIntBranchV3Artifacts, load_optimization_artifacts_v3};
 use soac_opt::emit_v3::{
-    MechanicalExitKind, MechanicalModuleEmission, MechanicalOperation, MechanicalRegionEmission,
-    MechanicalStepOp,
+    MechanicalExitKind, MechanicalFunctionEmission, MechanicalModuleEmission, MechanicalOperation,
+    MechanicalRegionEmission, MechanicalStepOp,
 };
 #[cfg(test)]
 use soac_opt::plan::ProfileEvidenceStore;
@@ -13084,7 +13084,7 @@ struct SpecializationProfile<'a> {
     module_name: Option<&'a str>,
     counter_dump_path: Option<Cow<'a, Path>>,
     planned_evidence: HashMap<RuntimeFunctionId, FunctionProfileEvidence>,
-    opt_v3_direct_call_targets:
+    opt_v3_emitted_direct_call_targets:
         HashMap<RuntimeFunctionId, HashMap<InstrId, Vec<RuntimeFunctionId>>>,
     opt_v3_exact_int_branch_artifacts: HashMap<RuntimeFunctionId, Arc<ExactIntBranchV3Artifacts>>,
     behavior_change_indexed_stores: bool,
@@ -13095,7 +13095,7 @@ struct SpecializationProfile<'a> {
 #[derive(Clone, Default)]
 struct PlannedOptimizationInputs {
     evidence_by_function: HashMap<RuntimeFunctionId, FunctionProfileEvidence>,
-    opt_v3_direct_call_targets:
+    opt_v3_emitted_direct_call_targets:
         HashMap<RuntimeFunctionId, HashMap<InstrId, Vec<RuntimeFunctionId>>>,
     opt_v3_exact_int_branch_artifacts: HashMap<RuntimeFunctionId, Arc<ExactIntBranchV3Artifacts>>,
 }
@@ -13107,7 +13107,7 @@ impl PlannedOptimizationInputs {
     ) -> Self {
         Self {
             evidence_by_function,
-            opt_v3_direct_call_targets: HashMap::new(),
+            opt_v3_emitted_direct_call_targets: HashMap::new(),
             opt_v3_exact_int_branch_artifacts: HashMap::new(),
         }
     }
@@ -13124,7 +13124,7 @@ impl PlannedOptimizationInputs {
             .map(|evidence| evidence.call_target_specializations.clone())
             .unwrap_or_default();
         let v3_targets = self
-            .opt_v3_direct_call_targets
+            .opt_v3_emitted_direct_call_targets
             .get(&function_id)
             .cloned()
             .unwrap_or_default();
@@ -13332,13 +13332,13 @@ fn planned_optimization_inputs_from_v3_artifacts(
             current_function,
             Some(&function_artifacts),
         )?;
-        if let Some(targets) = opt_v3_direct_call_targets_for_function(
-            planned_function,
+        if let Some(targets) = opt_v3_emitted_direct_call_targets_for_function(
+            &function_artifacts,
             RuntimeModuleId::new(shared_state.module_id()),
             |target| shared_state.lookup_function(target).is_some(),
         )? {
             inputs
-                .opt_v3_direct_call_targets
+                .opt_v3_emitted_direct_call_targets
                 .insert(current_function_id, targets);
         }
         inputs
@@ -13382,16 +13382,18 @@ fn planned_optimization_inputs_from_v3_artifacts_for_codegen_module(
             current_function,
             Some(&function_artifacts),
         )?;
-        if let Some(targets) =
-            opt_v3_direct_call_targets_for_function(planned_function, module_id, |target| {
+        if let Some(targets) = opt_v3_emitted_direct_call_targets_for_function(
+            &function_artifacts,
+            module_id,
+            |target| {
                 module
                     .callable_defs
                     .iter()
                     .any(|function| function.function_id == target)
-            })?
-        {
+            },
+        )? {
             inputs
-                .opt_v3_direct_call_targets
+                .opt_v3_emitted_direct_call_targets
                 .insert(current_function_id, targets);
         }
         inputs
@@ -13401,20 +13403,22 @@ fn planned_optimization_inputs_from_v3_artifacts_for_codegen_module(
     Ok(inputs)
 }
 
-fn opt_v3_direct_call_targets_for_function(
-    planned_function: &FunctionOptimizationPlanV3,
+fn opt_v3_emitted_direct_call_targets_for_function(
+    artifacts: &ExactIntBranchV3Artifacts,
     runtime_module_id: RuntimeModuleId,
     target_exists: impl Fn(RuntimeFunctionId) -> bool,
 ) -> Result<Option<HashMap<InstrId, Vec<RuntimeFunctionId>>>, String> {
-    if planned_function.direct_calls.is_empty() {
+    let planned_function = &artifacts.plan.functions[0];
+    let emitted_function = &artifacts.emission.functions[0];
+    if emitted_function.direct_calls.is_empty() {
         return Ok(None);
     }
 
     let mut direct_call_targets = HashMap::<InstrId, Vec<RuntimeFunctionId>>::new();
-    for direct_call in &planned_function.direct_calls {
+    for direct_call in &emitted_function.direct_calls {
         if direct_call.target.module_id() != planned_function.function.function.module_id() {
             return Err(format!(
-                "optimization plan v3 direct-call target {} at {} is outside function module {}",
+                "optimization plan v3 emitted direct-call target {} at {} is outside function module {}",
                 direct_call.target,
                 direct_call.source,
                 planned_function.function.function.module_id()
@@ -13424,7 +13428,7 @@ fn opt_v3_direct_call_targets_for_function(
             RuntimeFunctionId::new(runtime_module_id, direct_call.target.local_function_id());
         if !target_exists(target) {
             return Err(format!(
-                "optimization plan v3 direct-call target {} at {} does not exist in runtime module {}",
+                "optimization plan v3 emitted direct-call target {} at {} does not exist in runtime module {}",
                 direct_call.target, direct_call.source, runtime_module_id
             ));
         }
@@ -13795,6 +13799,41 @@ fn validate_opt_v3_codegen_artifacts_for_function(
             function.function_id.local_function_id()
         ));
     }
+    validate_opt_v3_direct_call_emission_matches_plan(
+        &artifacts.plan.functions[0],
+        &artifacts.emission.functions[0],
+    )?;
+    Ok(())
+}
+
+fn validate_opt_v3_direct_call_emission_matches_plan(
+    planned_function: &FunctionOptimizationPlanV3,
+    emitted_function: &MechanicalFunctionEmission,
+) -> Result<(), String> {
+    if planned_function.direct_calls.len() != emitted_function.direct_calls.len() {
+        return Err(format!(
+            "optimizer v3 artifacts for function {} contain {} planned direct calls but {} emitted direct calls",
+            planned_function.function.function,
+            planned_function.direct_calls.len(),
+            emitted_function.direct_calls.len()
+        ));
+    }
+    for (index, (planned, emitted)) in planned_function
+        .direct_calls
+        .iter()
+        .zip(emitted_function.direct_calls.iter())
+        .enumerate()
+    {
+        if planned.source != emitted.source
+            || planned.target != emitted.target
+            || planned.reason != emitted.reason
+        {
+            return Err(format!(
+                "optimizer v3 emitted direct-call #{index} for function {} does not match the selected plan",
+                planned_function.function.function
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -13884,7 +13923,7 @@ impl<'a> SpecializationProfile<'a> {
             module_name: shared_state.map(|shared_state| shared_state.module_name.as_str()),
             counter_dump_path: counter_dump_path.map(Cow::Owned),
             planned_evidence: planned_inputs.evidence_by_function,
-            opt_v3_direct_call_targets: planned_inputs.opt_v3_direct_call_targets,
+            opt_v3_emitted_direct_call_targets: planned_inputs.opt_v3_emitted_direct_call_targets,
             opt_v3_exact_int_branch_artifacts: planned_inputs.opt_v3_exact_int_branch_artifacts,
             behavior_change_indexed_stores: specialization_mode
                 .is_some_and(SpecializationMode::behavior_change_indexed_stores_enabled),
@@ -13906,7 +13945,7 @@ impl<'a> SpecializationProfile<'a> {
             module_name: Some(module_name),
             counter_dump_path: counter_dump_path.map(Cow::Borrowed),
             planned_evidence: planned_inputs.evidence_by_function,
-            opt_v3_direct_call_targets: planned_inputs.opt_v3_direct_call_targets,
+            opt_v3_emitted_direct_call_targets: planned_inputs.opt_v3_emitted_direct_call_targets,
             opt_v3_exact_int_branch_artifacts: planned_inputs.opt_v3_exact_int_branch_artifacts,
             behavior_change_indexed_stores: true,
             profiled_cold_blocks: env_config.profiled_cold_blocks_enabled(),
@@ -13921,7 +13960,7 @@ impl<'a> SpecializationProfile<'a> {
 
     fn has_specialization_inputs(&self) -> bool {
         !self.planned_evidence.is_empty()
-            || !self.opt_v3_direct_call_targets.is_empty()
+            || !self.opt_v3_emitted_direct_call_targets.is_empty()
             || !self.opt_v3_exact_int_branch_artifacts.is_empty()
             || (self.profiled_cold_blocks && self.has_existing_counter_dump())
     }
@@ -13951,7 +13990,7 @@ impl<'a> SpecializationProfile<'a> {
     ) -> Result<HashMap<InstrId, Vec<RuntimeFunctionId>>, String> {
         let legacy_targets = self.call_target_specializations(function_id)?;
         let v3_targets = self
-            .opt_v3_direct_call_targets
+            .opt_v3_emitted_direct_call_targets
             .get(&function_id)
             .cloned()
             .unwrap_or_default();

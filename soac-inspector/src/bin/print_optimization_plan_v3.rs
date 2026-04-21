@@ -110,6 +110,9 @@ fn format_optimization_artifacts_v3_with_options(
         let emitted_regions = emitted_function
             .map(|emitted| emitted.regions.len())
             .unwrap_or(0);
+        let emitted_direct_calls = emitted_function
+            .map(|emitted| emitted.direct_calls.len())
+            .unwrap_or(0);
         out.push_str(&format!(
             "\nfunction {}",
             function
@@ -120,11 +123,12 @@ fn format_optimization_artifacts_v3_with_options(
         ));
         out.push_str(&format!(" id={}\n", function.function.function));
         out.push_str(&format!(
-            "  regions={} emitted_regions={} scalar_threads={} direct_calls={} deopt_points={} ownership_actions={} diagnostics={}\n",
+            "  regions={} emitted_regions={} scalar_threads={} direct_calls={} emitted_direct_calls={} deopt_points={} ownership_actions={} diagnostics={}\n",
             function.regions.len(),
             emitted_regions,
             function.scalar_threads.len(),
             function.direct_calls.len(),
+            emitted_direct_calls,
             function.deopt_points.len(),
             function.ownership.actions.len(),
             function.diagnostics.len()
@@ -157,6 +161,14 @@ fn format_optimization_artifacts_v3_with_options(
                 "  direct_call source={} target={} reason={}\n",
                 direct_call.source, direct_call.target, direct_call.reason
             ));
+        }
+        if let Some(emitted_function) = emitted_function {
+            for direct_call in &emitted_function.direct_calls {
+                out.push_str(&format!(
+                    "  emitted_direct_call source={} target={} reason={}\n",
+                    direct_call.source, direct_call.target, direct_call.reason
+                ));
+            }
         }
         for diagnostic in &function.diagnostics {
             out.push_str(&format!(
@@ -260,6 +272,7 @@ mod test {
                 functions: vec![MechanicalFunctionEmission {
                     function,
                     debug_name: Some("f".to_string()),
+                    direct_calls: Vec::new(),
                     regions: Vec::new(),
                 }],
             },
@@ -268,6 +281,8 @@ mod test {
         let formatted = format_optimization_artifacts_v3(&artifacts);
         assert!(formatted.contains("module pkg.mod source_hash=0x0000000000001234"));
         assert!(formatted.contains("function f"));
-        assert!(formatted.contains("regions=0 emitted_regions=0 scalar_threads=0 direct_calls=0"));
+        assert!(formatted.contains(
+            "regions=0 emitted_regions=0 scalar_threads=0 direct_calls=0 emitted_direct_calls=0"
+        ));
     }
 }

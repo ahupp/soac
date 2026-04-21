@@ -84,9 +84,10 @@ Implemented:
   `return a < b` comparison returns, producing hot and local-fallback
   `RegionPlan`s. It also records a scalar-thread sidecar when a compact-int
   store RHS feeds the immediately following local comparison, and same-module
-  profiled direct-call sidecars from `call_hot_targets`.
+  profiled direct-call selections from `call_hot_targets`.
 - `soac-opt::emit_v3`: validation-gated mechanical
-  emitter over selected v3 plan nodes and exits.
+  emitter over selected v3 plan nodes and exits. Function-level direct-call
+  selections are also emitted as mechanical direct-call decisions.
 - `soac-opt::evidence_v3`: bridge from existing
   `FunctionProfileEvidence` exact-int operator shapes and lowered integer
   module constants into v3 planner facts.
@@ -97,7 +98,7 @@ Implemented:
   raw profile evidence, and writes a serialized `mod.optv3` artifact.
 - `print_optimization_plan_v3`: inspection summary for serialized v3 artifacts,
   with `--details` showing region inputs, plan nodes, exits, mechanical
-  emission steps, scalar threads, and direct-call sidecars.
+  emission steps, scalar threads, and direct-call decisions.
 - JIT `verify`/`apply` loading prefers `mod.optv3`, validates module identity,
   splits module-level artifacts into per-function mechanical artifacts, and only
   falls back to legacy `mod.opt` when no v3 artifact is present.
@@ -105,10 +106,10 @@ Implemented:
 - `FunctionSpecializationInputs`: carries validated exact-int branch v3
   artifacts into the JIT build path, where codegen validates that the artifact
   function identity matches the function being compiled. Same-module profiled
-  direct-call sidecars are carried from `mod.optv3` as v3-owned codegen inputs;
-  they are merged into the direct-call specialization input map only at
-  `FunctionSpecializationInputs` construction, not rewritten into legacy profile
-  evidence.
+  direct-call decisions are derived from the mechanical `mod.optv3` emission as
+  v3-owned codegen inputs; they are merged into the direct-call specialization
+  input map only at `FunctionSpecializationInputs` construction, not rewritten
+  into legacy profile evidence.
 - JIT term lowering now consumes matching exact-int direct-compare branch,
   add/compare branch, add/sub/mul/bitwise-return, and comparison-return
   artifacts by interpreting the mechanical hot region and its local generic
@@ -132,10 +133,10 @@ Partially migrated families are also intentionally visible:
 
 - scalar-threading is only implemented for the adjacent, no-exception,
   store-RHS-to-empty-compare shape;
-- profiled direct calls are represented as v3 sidecars and consumed as JIT
-  direct-call specialization input for same-module targets, but the direct-call
-  lowering itself is still the existing typed lowering rather than a mechanical
-  v3 call node.
+- profiled direct calls are represented as v3 plan selections plus mechanical
+  direct-call emissions and consumed as JIT direct-call specialization input for
+  same-module targets, but the direct-call lowering itself is still the
+  existing typed lowering rather than a mechanical v3 call node.
 
 Branch locality and cold block hints remain layout metadata for now, not v3
 semantic plan targets.

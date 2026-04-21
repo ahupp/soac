@@ -1526,7 +1526,7 @@ mod tests {
     }
 
     #[test]
-    fn plans_same_module_direct_call_sidecar_from_profiled_targets() {
+    fn plans_same_module_direct_call_selection_from_profiled_targets() {
         let mut request = module_request_regions(Vec::new());
         let source = InstrId::new(label(0), 9);
         let target = SerializedFunctionId::new(SerializedModuleId::new(0), LocalFunctionId::new(2));

@@ -640,7 +640,7 @@ fn validate_direct_call_plans(function: &FunctionOptimizationPlanV3, errors: &mu
         }
         if direct_call.target.module_id() != function.function.function.module_id() {
             errors.push(format!(
-                "function {} direct-call target {} is cross-module; v3 direct-call sidecars currently require same-module targets",
+                "function {} direct-call target {} is cross-module; v3 direct-call selections currently require same-module targets",
                 function.function.function, direct_call.target
             ));
         }
@@ -1707,7 +1707,7 @@ mod tests {
     }
 
     #[test]
-    fn validates_direct_call_sidecars() {
+    fn validates_direct_call_selections() {
         let target = SerializedFunctionId::new(SerializedModuleId::new(0), LocalFunctionId::new(2));
         let plan = module_with_direct_calls(vec![DirectCallSpecializationPlan {
             source: instr_id(7),
@@ -1719,7 +1719,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_cross_module_direct_call_sidecars() {
+    fn rejects_cross_module_direct_call_selections() {
         let target = SerializedFunctionId::new(SerializedModuleId::new(1), LocalFunctionId::new(2));
         let plan = module_with_direct_calls(vec![DirectCallSpecializationPlan {
             source: instr_id(7),

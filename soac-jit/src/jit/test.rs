@@ -3097,6 +3097,7 @@ def build(values):
                 functions: vec![soac_opt::emit_v3::MechanicalFunctionEmission {
                     function: serialized_function,
                     debug_name: Some(function.names.qualname.clone()),
+                    direct_calls: Vec::new(),
                     regions: Vec::new(),
                 }],
             },
@@ -16584,6 +16585,7 @@ def f(x):
                 functions: vec![soac_opt::emit_v3::MechanicalFunctionEmission {
                     function: serialized_function,
                     debug_name: Some(function.names.qualname.clone()),
+                    direct_calls: Vec::new(),
                     regions: Vec::new(),
                 }],
             },
@@ -16608,7 +16610,7 @@ def f(x):
     }
 
     #[test]
-    fn planned_precompile_inputs_convert_v3_direct_call_sidecars() {
+    fn planned_precompile_inputs_consume_v3_emitted_direct_calls() {
         let module_name_gen = ModuleNameGen::new(7);
         let caller = test_function_in_module(&module_name_gen, "caller");
         let callee = test_function_in_module(&module_name_gen, "callee");
@@ -16651,6 +16653,11 @@ def f(x):
                 functions: vec![soac_opt::emit_v3::MechanicalFunctionEmission {
                     function: serialized_caller,
                     debug_name: Some("caller".to_string()),
+                    direct_calls: vec![soac_opt::emit_v3::MechanicalDirectCallEmission {
+                        source,
+                        target: serialized_callee,
+                        reason: "profiled direct call".to_string(),
+                    }],
                     regions: Vec::new(),
                 }],
             },
@@ -16662,7 +16669,7 @@ def f(x):
 
         assert_eq!(
             planned_inputs
-                .opt_v3_direct_call_targets
+                .opt_v3_emitted_direct_call_targets
                 .get(&caller_id)
                 .unwrap()
                 .get(&source)
@@ -16671,12 +16678,75 @@ def f(x):
         );
         assert!(
             planned_inputs.evidence_by_function.is_empty(),
-            "v3 direct-call sidecars should not be converted into legacy profile evidence"
+            "v3 emitted direct calls should not be converted into legacy profile evidence"
         );
     }
 
     #[test]
-    fn specialization_profile_uses_v3_direct_calls_only_for_codegen_inputs() {
+    fn planned_precompile_inputs_reject_mismatched_v3_direct_call_emission() {
+        let module_name_gen = ModuleNameGen::new(7);
+        let caller = test_function_in_module(&module_name_gen, "caller");
+        let callee = test_function_in_module(&module_name_gen, "callee");
+        let caller_id = caller.function_id;
+        let callee_id = callee.function_id;
+        let module = test_module(module_name_gen, vec![caller, callee]);
+        let source = InstrId::new(BlockLabel::from_index(0), 11);
+        let serialized_caller =
+            SerializedFunctionId::new(SerializedModuleId::new(0), caller_id.local_function_id());
+        let serialized_callee =
+            SerializedFunctionId::new(SerializedModuleId::new(0), callee_id.local_function_id());
+        let artifacts = ExactIntBranchV3Artifacts {
+            plan: ModuleOptimizationPlanV3 {
+                module: ModulePlanIdentity {
+                    module_name: "test".to_string(),
+                    source_hash: 0,
+                    cache_identity: "test-cache".to_string(),
+                },
+                helper_catalog_version: 1,
+                cost_model_version: 1,
+                functions: vec![soac_opt::plan_v3::FunctionOptimizationPlanV3 {
+                    function: FunctionPlanIdentity {
+                        function: serialized_caller,
+                        debug_name: Some("caller".to_string()),
+                    },
+                    regions: Vec::new(),
+                    scalar_threads: Vec::new(),
+                    direct_calls: vec![DirectCallSpecializationPlan {
+                        source,
+                        target: serialized_callee,
+                        reason: "profiled direct call".to_string(),
+                    }],
+                    deopt_points: Vec::new(),
+                    ownership: soac_opt::plan_v3::FunctionOwnershipPlan::default(),
+                    diagnostics: Vec::new(),
+                }],
+            },
+            emission: MechanicalModuleEmission {
+                module_name: "test".to_string(),
+                functions: vec![soac_opt::emit_v3::MechanicalFunctionEmission {
+                    function: serialized_caller,
+                    debug_name: Some("caller".to_string()),
+                    direct_calls: Vec::new(),
+                    regions: Vec::new(),
+                }],
+            },
+        };
+
+        let err = match planned_optimization_inputs_from_v3_artifacts_for_codegen_module(
+            &artifacts, &module,
+        ) {
+            Ok(_) => panic!("mismatched v3 direct-call emission should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.contains("contain 1 planned direct calls but 0 emitted direct calls"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn specialization_profile_uses_v3_emitted_direct_calls_only_for_codegen_inputs() {
         let caller_id = RuntimeFunctionId::from_raw_parts(0, 1);
         let legacy_target = RuntimeFunctionId::from_raw_parts(0, 2);
         let v3_target = RuntimeFunctionId::from_raw_parts(0, 3);
@@ -16689,14 +16759,15 @@ def f(x):
         let mut planned_evidence = HashMap::new();
         planned_evidence.insert(caller_id, legacy_evidence);
 
-        let mut opt_v3_direct_call_targets = HashMap::new();
-        opt_v3_direct_call_targets.insert(caller_id, HashMap::from([(source, vec![v3_target])]));
+        let mut opt_v3_emitted_direct_call_targets = HashMap::new();
+        opt_v3_emitted_direct_call_targets
+            .insert(caller_id, HashMap::from([(source, vec![v3_target])]));
 
         let profile = SpecializationProfile {
             module_name: None,
             counter_dump_path: None,
             planned_evidence,
-            opt_v3_direct_call_targets,
+            opt_v3_emitted_direct_call_targets,
             opt_v3_exact_int_branch_artifacts: HashMap::new(),
             behavior_change_indexed_stores: false,
             profiled_cold_blocks: false,
@@ -16710,7 +16781,7 @@ def f(x):
                 .get(&source)
                 .unwrap(),
             &vec![legacy_target],
-            "legacy planning queries should not see v3 direct-call sidecars"
+            "legacy planning queries should not see v3 emitted direct-call targets"
         );
         assert_eq!(
             profile
