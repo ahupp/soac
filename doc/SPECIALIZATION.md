@@ -22,9 +22,13 @@ per-function `ExactIntBranchV3Artifacts`, and threads those artifacts through
 `mod.optv3` are emitted as mechanical v3 direct-call decisions with validated
 ordinary-call argument plans; JIT validation checks those emitted decisions
 against the selected plan before deriving the codegen guard and target inputs.
-They are not rewritten into legacy `FunctionProfileEvidence`. When the artifact
-contains the represented exact-int branch shape, JIT term lowering consumes the
-mechanical v3 region directly; otherwise lowering stays on the existing path.
+Constant-attribute indexed-field load/store selections from `type_keys` are
+also emitted as mechanical v3 indexed-field decisions; JIT validation checks
+those emitted decisions against the selected plan before deriving typed
+indexed-field guard input. They are not rewritten into legacy
+`FunctionProfileEvidence`. When the artifact contains the represented exact-int
+branch shape, JIT term lowering consumes the mechanical v3 region directly;
+otherwise lowering stays on the existing path.
 Set `SOAC_OPT_PLAN_MODE=v3` to require this serialized artifact and reject
 legacy fallback, or `SOAC_OPT_PLAN_MODE=legacy` to force the old artifact path
 while comparing behavior.
@@ -56,9 +60,11 @@ Current migration surface:
   regions, so simple lowered code like `c = a + b; if c > 0: ...` can optimize
   the add store and the later branch as separate v3 regions. Same-module
   profiled direct calls are selected by v3, emitted as mechanical direct-call
-  decisions, and consumed as v3-owned codegen inputs.
+  decisions, and consumed as v3-owned codegen inputs. Constant-string indexed
+  fields are selected by v3 from raw `type_keys`, emitted as mechanical
+  indexed-field decisions, and consumed as v3-owned typed attribute inputs.
 - Legacy only: division/modulo/shift and unary exact-int value-producing
-  operators, exact-list getitem/setitem, indexed globals, and indexed fields.
+  operators, exact-list getitem/setitem, and indexed globals.
 - Not currently a v3 semantic-plan target: branch locality and cold block
   layout hints. These remain layout metadata unless a future CFG-placement plan
   needs to represent them.
@@ -300,6 +306,9 @@ apply/verify mode:
 
 - Source layout input is `type_keys`, recorded from CPython split-key
   insertion events.
+- In `decide_optimizations --mode v3`, the offline planner consumes raw
+  `type_keys` plus lowered constant-attribute `GetAttr`/`SetAttr` sites and
+  serializes matching indexed-field selections into `mod.optv3`.
 - Codegen resolves a recorded owner name to the currently imported type,
   then rejects the specialization if a class binding/descriptor for that
   attribute is present.
@@ -310,6 +319,10 @@ apply/verify mode:
 
 - Constant-string `GetAttr` sites with a recorded key index get a
   guard on exact owner type and owner type version.
+- With a `mod.optv3` artifact, those recorded key indexes come from validated
+  mechanical indexed-field emissions rather than from the legacy per-function
+  optimization plan. Legacy `mod.opt` can still supply the same typed input
+  while the migration is incomplete.
 - After codegen-to-typed lowering, these sites are represented as
   `GetAttrTyped` / `SetAttrTyped` operations annotated with a profiled
   indexed-field access plan. The typed plan carries the selected

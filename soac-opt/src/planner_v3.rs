@@ -4,7 +4,8 @@ use crate::alternatives_v3::{
 use crate::plan_v3::{
     ConversionKind, ConversionOwnership, ConversionPrecondition, ConvertNode, Cost,
     DirectCallArgPlan, DirectCallSpecializationPlan, FailureMode, FallbackReason, FallbackTarget,
-    FunctionOptimizationPlanV3, FunctionOwnershipPlan, FunctionPlanIdentity, MaterializeKind,
+    FunctionOptimizationPlanV3, FunctionOwnershipPlan, FunctionPlanIdentity,
+    IndexedFieldAccessKind, IndexedFieldOwnerType, IndexedFieldSpecializationPlan, MaterializeKind,
     MaterializeNode, ModuleOptimizationPlanV3, ModulePlanIdentity, OperationNode, PlanDiagnostic,
     PlanNode, PlanNodeId, PlanNodeKind, PlanValue, PlannedConstant, RegionExitKind, RegionExitPlan,
     RegionExitTarget, RegionId, RegionInput, RegionInputSource, RegionPlan, RegionSource,
@@ -31,6 +32,7 @@ pub struct FunctionPlanRequest {
     pub function: FunctionPlanIdentity,
     pub regions: Vec<ExtractedRegionPlanRequest>,
     pub direct_calls: Vec<DirectCallPlanRequest>,
+    pub indexed_fields: Vec<IndexedFieldPlanRequest>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -38,6 +40,16 @@ pub struct DirectCallPlanRequest {
     pub source: InstrId,
     pub target: SerializedFunctionId,
     pub arg_plan: DirectCallArgPlan,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexedFieldPlanRequest {
+    pub source: InstrId,
+    pub access: IndexedFieldAccessKind,
+    pub owner_type: IndexedFieldOwnerType,
+    pub attr_name: String,
+    pub expected_index: u32,
     pub reason: String,
 }
 
@@ -93,11 +105,13 @@ pub fn plan_function_optimization_v3(
 ) -> FunctionOptimizationPlanV3 {
     let region_requests = request.regions;
     let direct_calls = plan_direct_call_specializations_v3(&request.direct_calls);
+    let indexed_fields = plan_indexed_field_specializations_v3(&request.indexed_fields);
     let mut function = FunctionOptimizationPlanV3 {
         function: request.function,
         regions: Vec::new(),
         scalar_threads: Vec::new(),
         direct_calls,
+        indexed_fields,
         deopt_points: Vec::new(),
         ownership: FunctionOwnershipPlan::default(),
         diagnostics: Vec::new(),
@@ -135,6 +149,51 @@ fn plan_direct_call_specializations_v3(
                 source: request.source,
                 target: request.target,
                 arg_plan: request.arg_plan.clone(),
+                reason: request.reason.clone(),
+            });
+        }
+    }
+    plans
+}
+
+fn plan_indexed_field_specializations_v3(
+    indexed_field_requests: &[IndexedFieldPlanRequest],
+) -> Vec<IndexedFieldSpecializationPlan> {
+    let mut entries = indexed_field_requests.iter().collect::<Vec<_>>();
+    entries.sort_by(|lhs, rhs| {
+        (
+            lhs.source,
+            lhs.access,
+            lhs.owner_type.module_name.as_str(),
+            lhs.owner_type.qualname.as_str(),
+            lhs.attr_name.as_str(),
+            lhs.expected_index,
+        )
+            .cmp(&(
+                rhs.source,
+                rhs.access,
+                rhs.owner_type.module_name.as_str(),
+                rhs.owner_type.qualname.as_str(),
+                rhs.attr_name.as_str(),
+                rhs.expected_index,
+            ))
+    });
+    let mut seen = HashSet::new();
+    let mut plans = Vec::new();
+    for request in entries {
+        if seen.insert((
+            request.source,
+            request.access,
+            request.owner_type.clone(),
+            request.attr_name.clone(),
+            request.expected_index,
+        )) {
+            plans.push(IndexedFieldSpecializationPlan {
+                source: request.source,
+                access: request.access,
+                owner_type: request.owner_type.clone(),
+                attr_name: request.attr_name.clone(),
+                expected_index: request.expected_index,
                 reason: request.reason.clone(),
             });
         }
@@ -1528,6 +1587,7 @@ mod tests {
                 },
                 regions,
                 direct_calls: Vec::new(),
+                indexed_fields: Vec::new(),
             }],
         }
     }
@@ -1570,6 +1630,53 @@ mod tests {
             }
         );
         assert!(direct_calls[0].reason.contains("call_hot_targets"));
+    }
+
+    #[test]
+    fn plans_indexed_field_selections_from_profiled_type_keys() {
+        let mut request = module_request_regions(Vec::new());
+        let load_source = InstrId::new(label(0), 9);
+        let store_source = InstrId::new(label(0), 3);
+        let owner_type = IndexedFieldOwnerType {
+            module_name: "pkg.model".to_string(),
+            qualname: "Record".to_string(),
+        };
+        request.functions[0].indexed_fields = vec![
+            IndexedFieldPlanRequest {
+                source: load_source,
+                access: IndexedFieldAccessKind::Load,
+                owner_type: owner_type.clone(),
+                attr_name: "value".to_string(),
+                expected_index: 2,
+                reason: "profiled type_keys selected this indexed-field layout".to_string(),
+            },
+            IndexedFieldPlanRequest {
+                source: load_source,
+                access: IndexedFieldAccessKind::Load,
+                owner_type: owner_type.clone(),
+                attr_name: "value".to_string(),
+                expected_index: 2,
+                reason: "profiled type_keys selected this indexed-field layout".to_string(),
+            },
+            IndexedFieldPlanRequest {
+                source: store_source,
+                access: IndexedFieldAccessKind::Store,
+                owner_type,
+                attr_name: "value".to_string(),
+                expected_index: 2,
+                reason: "profiled type_keys selected this indexed-field layout".to_string(),
+            },
+        ];
+
+        let plan = plan_module_optimization_v3(&AlternativeCatalog::default_v3(), request);
+
+        validate_module_plan_v3(&plan).unwrap();
+        let indexed_fields = &plan.functions[0].indexed_fields;
+        assert_eq!(indexed_fields.len(), 2);
+        assert_eq!(indexed_fields[0].source, store_source);
+        assert_eq!(indexed_fields[0].access, IndexedFieldAccessKind::Store);
+        assert_eq!(indexed_fields[1].source, load_source);
+        assert_eq!(indexed_fields[1].access, IndexedFieldAccessKind::Load);
     }
 
     #[test]

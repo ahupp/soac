@@ -1616,6 +1616,7 @@ mod tests {
                 regions: vec![hot_region, fallback_region],
                 scalar_threads: Vec::new(),
                 direct_calls: Vec::new(),
+                indexed_fields: Vec::new(),
                 deopt_points: Vec::new(),
                 ownership: crate::plan_v3::FunctionOwnershipPlan::default(),
                 diagnostics: Vec::new(),

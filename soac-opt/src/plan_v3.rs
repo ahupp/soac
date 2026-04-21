@@ -23,6 +23,7 @@ pub struct FunctionOptimizationPlanV3 {
     pub regions: Vec<RegionPlan>,
     pub scalar_threads: Vec<ScalarLocalThreadPlan>,
     pub direct_calls: Vec<DirectCallSpecializationPlan>,
+    pub indexed_fields: Vec<IndexedFieldSpecializationPlan>,
     pub deopt_points: Vec<PlannedDeoptPoint>,
     pub ownership: FunctionOwnershipPlan,
     pub diagnostics: Vec<PlanDiagnostic>,
@@ -51,6 +52,40 @@ pub struct DirectCallArgPlan {
 pub enum DirectCallArgSource {
     Provided(u32),
     DefaultSentinel,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct IndexedFieldSpecializationPlan {
+    pub source: InstrId,
+    pub access: IndexedFieldAccessKind,
+    pub owner_type: IndexedFieldOwnerType,
+    pub attr_name: String,
+    pub expected_index: u32,
+    pub reason: String,
+}
+
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
+pub enum IndexedFieldAccessKind {
+    Load,
+    Store,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct IndexedFieldOwnerType {
+    pub module_name: String,
+    pub qualname: String,
 }
 
 #[derive(
@@ -625,6 +660,7 @@ fn validate_function_plan(function: &FunctionOptimizationPlanV3, errors: &mut Ve
         );
     }
     validate_direct_call_plans(function, errors);
+    validate_indexed_field_plans(function, errors);
     for action in &function.ownership.actions {
         if action.reason.is_empty() {
             errors.push(format!(
@@ -657,6 +693,54 @@ fn validate_direct_call_plans(function: &FunctionOptimizationPlanV3, errors: &mu
             ));
         }
         validate_direct_call_arg_plan(function, direct_call, errors);
+    }
+}
+
+fn validate_indexed_field_plans(function: &FunctionOptimizationPlanV3, errors: &mut Vec<String>) {
+    let mut seen = HashSet::new();
+    for indexed_field in &function.indexed_fields {
+        if !seen.insert((
+            indexed_field.source,
+            indexed_field.access,
+            indexed_field.owner_type.clone(),
+            indexed_field.attr_name.clone(),
+            indexed_field.expected_index,
+        )) {
+            errors.push(format!(
+                "function {} has duplicate indexed-field {:?} {}.{} attr={} index={} at {}",
+                function.function.function,
+                indexed_field.access,
+                indexed_field.owner_type.module_name,
+                indexed_field.owner_type.qualname,
+                indexed_field.attr_name,
+                indexed_field.expected_index,
+                indexed_field.source
+            ));
+        }
+        if indexed_field.owner_type.module_name.is_empty() {
+            errors.push(format!(
+                "function {} indexed-field at {} has empty owner module",
+                function.function.function, indexed_field.source
+            ));
+        }
+        if indexed_field.owner_type.qualname.is_empty() {
+            errors.push(format!(
+                "function {} indexed-field at {} has empty owner qualname",
+                function.function.function, indexed_field.source
+            ));
+        }
+        if indexed_field.attr_name.is_empty() {
+            errors.push(format!(
+                "function {} indexed-field at {} has empty attr name",
+                function.function.function, indexed_field.source
+            ));
+        }
+        if indexed_field.reason.is_empty() {
+            errors.push(format!(
+                "function {} indexed-field at {} has empty reason",
+                function.function.function, indexed_field.source
+            ));
+        }
     }
 }
 
@@ -1713,6 +1797,14 @@ mod tests {
         module
     }
 
+    fn module_with_indexed_fields(
+        indexed_fields: Vec<IndexedFieldSpecializationPlan>,
+    ) -> ModuleOptimizationPlanV3 {
+        let mut module = module_with_regions(Vec::new());
+        module.functions[0].indexed_fields = indexed_fields;
+        module
+    }
+
     fn module_with_regions_and_scalar_threads(
         regions: Vec<RegionPlan>,
         scalar_threads: Vec<ScalarLocalThreadPlan>,
@@ -1733,6 +1825,7 @@ mod tests {
                 regions,
                 scalar_threads,
                 direct_calls: Vec::new(),
+                indexed_fields: Vec::new(),
                 deopt_points: vec![PlannedDeoptPoint {
                     id: DeoptPointId(0),
                     source: DeoptPointSource::Synthetic {
@@ -1779,6 +1872,42 @@ mod tests {
 
         let err = validate_module_plan_v3(&plan).unwrap_err();
         assert!(err.to_string().contains("cross-module"));
+    }
+
+    #[test]
+    fn validates_indexed_field_selections() {
+        let plan = module_with_indexed_fields(vec![IndexedFieldSpecializationPlan {
+            source: instr_id(7),
+            access: IndexedFieldAccessKind::Load,
+            owner_type: IndexedFieldOwnerType {
+                module_name: "pkg.model".to_string(),
+                qualname: "Record".to_string(),
+            },
+            attr_name: "value".to_string(),
+            expected_index: 2,
+            reason: "profiled type_keys selected this indexed-field layout".to_string(),
+        }]);
+
+        validate_module_plan_v3(&plan).unwrap();
+    }
+
+    #[test]
+    fn rejects_duplicate_indexed_field_selections() {
+        let indexed_field = IndexedFieldSpecializationPlan {
+            source: instr_id(7),
+            access: IndexedFieldAccessKind::Load,
+            owner_type: IndexedFieldOwnerType {
+                module_name: "pkg.model".to_string(),
+                qualname: "Record".to_string(),
+            },
+            attr_name: "value".to_string(),
+            expected_index: 2,
+            reason: "profiled type_keys selected this indexed-field layout".to_string(),
+        };
+        let plan = module_with_indexed_fields(vec![indexed_field.clone(), indexed_field]);
+
+        let err = validate_module_plan_v3(&plan).unwrap_err();
+        assert!(err.to_string().contains("duplicate indexed-field"));
     }
 
     fn input(value: PlanValue, index: u32, name: &str) -> RegionInput {

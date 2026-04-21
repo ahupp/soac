@@ -84,10 +84,13 @@ Implemented:
   `return a < b` comparison returns, producing hot and local-fallback
   `RegionPlan`s. It also records a scalar-thread sidecar when a compact-int
   store RHS feeds the immediately following local comparison, and same-module
-  profiled direct-call selections from `call_hot_targets`.
+  profiled direct-call selections from `call_hot_targets`. Constant-attribute
+  indexed-field selections are planned from raw `type_keys` layout evidence and
+  lowered `GetAttr`/`SetAttr` sites.
 - `soac-opt::emit_v3`: validation-gated mechanical
   emitter over selected v3 plan nodes and exits. Function-level direct-call
-  selections are also emitted as mechanical direct-call decisions.
+  selections and indexed-field selections are also emitted as mechanical
+  decisions.
 - `soac-opt::evidence_v3`: bridge from existing
   `FunctionProfileEvidence` exact-int operator shapes and lowered integer
   module constants into v3 planner facts.
@@ -98,7 +101,8 @@ Implemented:
   raw profile evidence, and writes a serialized `mod.optv3` artifact.
 - `print_optimization_plan_v3`: inspection summary for serialized v3 artifacts,
   with `--details` showing region inputs, plan nodes, exits, mechanical
-  emission steps, scalar threads, and direct-call decisions.
+  emission steps, scalar threads, direct-call decisions, and indexed-field
+  decisions.
 - JIT `verify`/`apply` loading prefers `mod.optv3`, validates module identity,
   splits module-level artifacts into per-function mechanical artifacts, and only
   falls back to legacy `mod.opt` when no v3 artifact is present.
@@ -109,7 +113,9 @@ Implemented:
   direct-call decisions and ordinary-call argument plans are derived from the
   mechanical `mod.optv3` emission as v3-owned codegen inputs; the JIT consumes
   the emitted guard shape and derives a target map from it only for direct-call
-  function predeclaration, not as legacy profile evidence.
+  function predeclaration, not as legacy profile evidence. Indexed-field
+  decisions are also derived from mechanical `mod.optv3` emission as v3-owned
+  typed-attribute inputs, with exact plan/emission validation before use.
 - JIT term lowering now consumes matching exact-int direct-compare branch,
   add/compare branch, add/sub/mul/bitwise-return, and comparison-return
   artifacts by interpreting the mechanical hot region and its local generic
@@ -127,7 +133,7 @@ Remaining legacy-only families are intentionally visible:
 
 - remaining division/modulo/shift and unary exact-int value-producing operators;
 - exact-list getitem/setitem;
-- indexed globals and indexed fields.
+- indexed globals.
 
 Partially migrated families are also intentionally visible:
 
@@ -138,6 +144,10 @@ Partially migrated families are also intentionally visible:
   as JIT direct-call guard input for same-module targets, but the direct-call
   lowering itself is still the existing typed lowering rather than a mechanical
   v3 call node.
+- indexed fields are represented as v3 plan selections plus mechanical
+  indexed-field emissions and consumed as JIT typed-attribute guard input, but
+  the attribute load/store lowering itself is still the existing typed lowering
+  rather than a mechanical v3 node.
 
 Branch locality and cold block hints remain layout metadata for now, not v3
 semantic plan targets.
@@ -640,7 +650,9 @@ the branch exit demands `I32Bool01`. If a later Python-observable boundary needs
 9. Replace old site-local specializations incrementally.
    - Migrate exact-int operators first.
    - Then truthiness and materialization.
-   - Then getitem/setitem, indexed fields, and direct calls.
+   - Direct calls and indexed fields are partially migrated as v3-owned codegen
+     inputs; lift their actual lowering into mechanical nodes next.
+   - Then getitem/setitem and indexed globals.
    - Keep old paths until each replacement has structured tests and diagnostics.
 
 10. Benchmark and document kept performance changes.

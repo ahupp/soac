@@ -85,21 +85,22 @@ use soac_lowering::passes::{
 };
 use soac_opt::artifacts_v3::{ExactIntBranchV3Artifacts, load_optimization_artifacts_v3};
 use soac_opt::emit_v3::{
-    MechanicalExitKind, MechanicalFunctionEmission, MechanicalModuleEmission, MechanicalOperation,
-    MechanicalRegionEmission, MechanicalStepOp,
+    MechanicalExitKind, MechanicalFunctionEmission, MechanicalIndexedFieldEmission,
+    MechanicalModuleEmission, MechanicalOperation, MechanicalRegionEmission, MechanicalStepOp,
 };
 #[cfg(test)]
 use soac_opt::plan::ProfileEvidenceStore;
 use soac_opt::plan::{
-    FunctionProfileEvidence, OptimizationPlan, PlannedIndexedFieldSpecialization,
+    FunctionProfileEvidence, OptimizationPlan, PlannedIndexedFieldSpecialization, PlannedTypeKey,
     load_optimization_plan,
 };
 use soac_opt::plan_v3::{
     ConversionKind, DirectCallArgPlan as PlanV3DirectCallArgPlan,
     DirectCallArgSource as PlanV3DirectCallArgSource, FailureMode, FallbackTarget,
-    FunctionOptimizationPlanV3, GuardFailure, GuardKind, MaterializeKind, ModuleOptimizationPlanV3,
-    PlanNodeId, PlanValue, PlannedConstant, RegionExitTarget, RegionId, RegionInputSource,
-    RegionPlan, Rep, RichCompareOp, ScalarLocalThreadPlan, ScalarThreadFallback,
+    FunctionOptimizationPlanV3, GuardFailure, GuardKind,
+    IndexedFieldSpecializationPlan as PlanV3IndexedFieldSpecializationPlan, MaterializeKind,
+    ModuleOptimizationPlanV3, PlanNodeId, PlanValue, PlannedConstant, RegionExitTarget, RegionId,
+    RegionInputSource, RegionPlan, Rep, RichCompareOp, ScalarLocalThreadPlan, ScalarThreadFallback,
     ScalarThreadLocalCleanup, ScalarThreadLocalLocation, ScalarThreadLocalState,
     ScalarThreadMaterialization,
 };
@@ -13090,6 +13091,8 @@ struct SpecializationProfile<'a> {
     planned_evidence: HashMap<RuntimeFunctionId, FunctionProfileEvidence>,
     opt_v3_emitted_direct_function_guards:
         HashMap<RuntimeFunctionId, HashMap<InstrId, Vec<TypedDirectFunctionCallGuard>>>,
+    opt_v3_emitted_field_index_specializations:
+        HashMap<RuntimeFunctionId, HashMap<InstrId, Vec<PlannedIndexedFieldSpecialization>>>,
     opt_v3_exact_int_branch_artifacts: HashMap<RuntimeFunctionId, Arc<ExactIntBranchV3Artifacts>>,
     behavior_change_indexed_stores: bool,
     profiled_cold_blocks: bool,
@@ -13101,6 +13104,8 @@ struct PlannedOptimizationInputs {
     evidence_by_function: HashMap<RuntimeFunctionId, FunctionProfileEvidence>,
     opt_v3_emitted_direct_function_guards:
         HashMap<RuntimeFunctionId, HashMap<InstrId, Vec<TypedDirectFunctionCallGuard>>>,
+    opt_v3_emitted_field_index_specializations:
+        HashMap<RuntimeFunctionId, HashMap<InstrId, Vec<PlannedIndexedFieldSpecialization>>>,
     opt_v3_exact_int_branch_artifacts: HashMap<RuntimeFunctionId, Arc<ExactIntBranchV3Artifacts>>,
 }
 
@@ -13112,6 +13117,7 @@ impl PlannedOptimizationInputs {
         Self {
             evidence_by_function,
             opt_v3_emitted_direct_function_guards: HashMap::new(),
+            opt_v3_emitted_field_index_specializations: HashMap::new(),
             opt_v3_exact_int_branch_artifacts: HashMap::new(),
         }
     }
@@ -13360,6 +13366,13 @@ fn planned_optimization_inputs_from_v3_artifacts(
                 .opt_v3_emitted_direct_function_guards
                 .insert(current_function_id, guards);
         }
+        if let Some(indexed_fields) =
+            opt_v3_emitted_field_index_specializations_for_function(&function_artifacts)
+        {
+            inputs
+                .opt_v3_emitted_field_index_specializations
+                .insert(current_function_id, indexed_fields);
+        }
         inputs
             .opt_v3_exact_int_branch_artifacts
             .insert(current_function_id, Arc::new(function_artifacts));
@@ -13415,11 +13428,50 @@ fn planned_optimization_inputs_from_v3_artifacts_for_codegen_module(
                 .opt_v3_emitted_direct_function_guards
                 .insert(current_function_id, guards);
         }
+        if let Some(indexed_fields) =
+            opt_v3_emitted_field_index_specializations_for_function(&function_artifacts)
+        {
+            inputs
+                .opt_v3_emitted_field_index_specializations
+                .insert(current_function_id, indexed_fields);
+        }
         inputs
             .opt_v3_exact_int_branch_artifacts
             .insert(current_function_id, Arc::new(function_artifacts));
     }
     Ok(inputs)
+}
+
+fn opt_v3_emitted_field_index_specializations_for_function(
+    artifacts: &ExactIntBranchV3Artifacts,
+) -> Option<HashMap<InstrId, Vec<PlannedIndexedFieldSpecialization>>> {
+    let emitted_function = &artifacts.emission.functions[0];
+    if emitted_function.indexed_fields.is_empty() {
+        return None;
+    }
+
+    let mut by_source = HashMap::<InstrId, Vec<PlannedIndexedFieldSpecialization>>::new();
+    for indexed_field in &emitted_function.indexed_fields {
+        let specialization = planned_indexed_field_specialization_from_v3(indexed_field);
+        let entry = by_source.entry(indexed_field.source).or_default();
+        if !entry.contains(&specialization) {
+            entry.push(specialization);
+        }
+    }
+    Some(by_source)
+}
+
+fn planned_indexed_field_specialization_from_v3(
+    indexed_field: &MechanicalIndexedFieldEmission,
+) -> PlannedIndexedFieldSpecialization {
+    PlannedIndexedFieldSpecialization {
+        owner_type: PlannedTypeKey {
+            module_name: indexed_field.owner_type.module_name.clone(),
+            qualname: indexed_field.owner_type.qualname.clone(),
+        },
+        attr_name: indexed_field.attr_name.clone(),
+        expected_index: indexed_field.expected_index,
+    }
 }
 
 fn opt_v3_emitted_direct_function_guards_for_function(
@@ -13842,6 +13894,10 @@ fn validate_opt_v3_codegen_artifacts_for_function(
         &artifacts.plan.functions[0],
         &artifacts.emission.functions[0],
     )?;
+    validate_opt_v3_indexed_field_emission_matches_plan(
+        &artifacts.plan.functions[0],
+        &artifacts.emission.functions[0],
+    )?;
     Ok(())
 }
 
@@ -13865,6 +13921,7 @@ fn validate_opt_v3_direct_call_emission_matches_plan(
     {
         if planned.source != emitted.source
             || planned.target != emitted.target
+            || planned.arg_plan != emitted.arg_plan
             || planned.reason != emitted.reason
         {
             return Err(format!(
@@ -13874,6 +13931,46 @@ fn validate_opt_v3_direct_call_emission_matches_plan(
         }
     }
     Ok(())
+}
+
+fn validate_opt_v3_indexed_field_emission_matches_plan(
+    planned_function: &FunctionOptimizationPlanV3,
+    emitted_function: &MechanicalFunctionEmission,
+) -> Result<(), String> {
+    if planned_function.indexed_fields.len() != emitted_function.indexed_fields.len() {
+        return Err(format!(
+            "optimizer v3 artifacts for function {} contain {} planned indexed fields but {} emitted indexed fields",
+            planned_function.function.function,
+            planned_function.indexed_fields.len(),
+            emitted_function.indexed_fields.len()
+        ));
+    }
+    for (index, (planned, emitted)) in planned_function
+        .indexed_fields
+        .iter()
+        .zip(emitted_function.indexed_fields.iter())
+        .enumerate()
+    {
+        if !opt_v3_indexed_field_emission_matches_plan(planned, emitted) {
+            return Err(format!(
+                "optimizer v3 emitted indexed-field #{index} for function {} does not match the selected plan",
+                planned_function.function.function
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn opt_v3_indexed_field_emission_matches_plan(
+    planned: &PlanV3IndexedFieldSpecializationPlan,
+    emitted: &MechanicalIndexedFieldEmission,
+) -> bool {
+    planned.source == emitted.source
+        && planned.access == emitted.access
+        && planned.owner_type == emitted.owner_type
+        && planned.attr_name == emitted.attr_name
+        && planned.expected_index == emitted.expected_index
+        && planned.reason == emitted.reason
 }
 
 fn resolve_planned_function_target(
@@ -13966,6 +14063,8 @@ impl<'a> SpecializationProfile<'a> {
             planned_evidence: planned_inputs.evidence_by_function,
             opt_v3_emitted_direct_function_guards: planned_inputs
                 .opt_v3_emitted_direct_function_guards,
+            opt_v3_emitted_field_index_specializations: planned_inputs
+                .opt_v3_emitted_field_index_specializations,
             opt_v3_exact_int_branch_artifacts: planned_inputs.opt_v3_exact_int_branch_artifacts,
             behavior_change_indexed_stores: specialization_mode
                 .is_some_and(SpecializationMode::behavior_change_indexed_stores_enabled),
@@ -13989,6 +14088,8 @@ impl<'a> SpecializationProfile<'a> {
             planned_evidence: planned_inputs.evidence_by_function,
             opt_v3_emitted_direct_function_guards: planned_inputs
                 .opt_v3_emitted_direct_function_guards,
+            opt_v3_emitted_field_index_specializations: planned_inputs
+                .opt_v3_emitted_field_index_specializations,
             opt_v3_exact_int_branch_artifacts: planned_inputs.opt_v3_exact_int_branch_artifacts,
             behavior_change_indexed_stores: true,
             profiled_cold_blocks: env_config.profiled_cold_blocks_enabled(),
@@ -14004,16 +14105,25 @@ impl<'a> SpecializationProfile<'a> {
     fn has_specialization_inputs(&self) -> bool {
         !self.planned_evidence.is_empty()
             || !self.opt_v3_emitted_direct_function_guards.is_empty()
+            || !self.opt_v3_emitted_field_index_specializations.is_empty()
             || !self.opt_v3_exact_int_branch_artifacts.is_empty()
             || (self.profiled_cold_blocks && self.has_existing_counter_dump())
     }
 
     fn planned_field_index_specializations(&self) -> Vec<&PlannedIndexedFieldSpecialization> {
-        self.planned_evidence
+        let mut planned_fields = self
+            .planned_evidence
             .values()
             .flat_map(|evidence| evidence.field_index_specializations.values())
             .flat_map(|specializations| specializations.iter())
-            .collect()
+            .collect::<Vec<_>>();
+        planned_fields.extend(
+            self.opt_v3_emitted_field_index_specializations
+                .values()
+                .flat_map(|specializations_by_instr| specializations_by_instr.values())
+                .flat_map(|specializations| specializations.iter()),
+        );
+        planned_fields
     }
 
     fn call_target_specializations(
@@ -14120,10 +14230,40 @@ impl<'a> SpecializationProfile<'a> {
         }
 
         let Some(evidence) = self.planned_evidence.get(&function_id) else {
-            return Ok((by_attr, HashMap::new()));
+            let by_instr = self.field_index_specializations_by_instr_from_planned(
+                self.opt_v3_emitted_field_index_specializations
+                    .get(&function_id),
+            )?;
+            return Ok((by_attr, by_instr));
+        };
+        let mut by_instr = self.field_index_specializations_by_instr_from_planned(Some(
+            &evidence.field_index_specializations,
+        ))?;
+        if let Some(v3_specializations) = self
+            .opt_v3_emitted_field_index_specializations
+            .get(&function_id)
+        {
+            let v3_by_instr =
+                self.field_index_specializations_by_instr_from_planned(Some(v3_specializations))?;
+            for (instr_id, mut specializations) in v3_by_instr {
+                let entry = by_instr.entry(instr_id).or_default();
+                for specialization in specializations.drain(..) {
+                    push_unique_specialization(entry, specialization);
+                }
+            }
+        }
+        Ok((by_attr, by_instr))
+    }
+
+    fn field_index_specializations_by_instr_from_planned(
+        &self,
+        planned_by_instr: Option<&HashMap<InstrId, Vec<PlannedIndexedFieldSpecialization>>>,
+    ) -> Result<HashMap<InstrId, Vec<FieldIndexSpecialization>>, String> {
+        let Some(planned_by_instr) = planned_by_instr else {
+            return Ok(HashMap::new());
         };
         let mut by_instr = HashMap::new();
-        for (instr_id, planned_specializations) in &evidence.field_index_specializations {
+        for (instr_id, planned_specializations) in planned_by_instr {
             let mut specializations = Vec::new();
             for planned in planned_specializations {
                 if let Some(specialization) =
@@ -14136,7 +14276,7 @@ impl<'a> SpecializationProfile<'a> {
                 by_instr.insert(*instr_id, specializations);
             }
         }
-        Ok((by_attr, by_instr))
+        Ok(by_instr)
     }
 
     fn cold_block_labels(

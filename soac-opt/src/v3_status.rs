@@ -41,10 +41,16 @@ pub const V3_OPTIMIZATION_FAMILY_STATUS: &[V3OptimizationFamilyStatus] = &[
         next_step: "model item-operation alternatives with local fallback and mutation effects",
     },
     V3OptimizationFamilyStatus {
-        family: "indexed globals and fields",
-        legacy_input: "module_keys, type_keys, and indexed hit/fallback counters",
+        family: "indexed fields",
+        legacy_input: "type_keys and field_indexed hit/fallback counters",
+        status: V3MigrationStatus::LiveCodegenInputOnly,
+        next_step: "lift typed attribute load/store lowering itself into mechanical v3 nodes",
+    },
+    V3OptimizationFamilyStatus {
+        family: "indexed globals",
+        legacy_input: "module_keys and global_indexed hit/fallback counters",
         status: V3MigrationStatus::LegacyOnly,
-        next_step: "model indexed load/store alternatives with explicit deopt replay reasons",
+        next_step: "model indexed global load/store alternatives with explicit module-dict guard effects",
     },
     V3OptimizationFamilyStatus {
         family: "branch locality and cold block layout",

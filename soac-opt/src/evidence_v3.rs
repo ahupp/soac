@@ -237,6 +237,7 @@ mod tests {
                     },
                     regions: vec![ExtractedRegionPlanRequest { region, facts }],
                     direct_calls: Vec::new(),
+                    indexed_fields: Vec::new(),
                 }],
             },
         )

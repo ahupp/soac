@@ -45,7 +45,8 @@ mod tests {
     use soac_opt::plan_v3::{
         DirectCallArgPlan as PlanV3DirectCallArgPlan,
         DirectCallArgSource as PlanV3DirectCallArgSource, DirectCallSpecializationPlan,
-        FunctionPlanIdentity, ModulePlanIdentity,
+        FunctionPlanIdentity, IndexedFieldAccessKind, IndexedFieldOwnerType,
+        IndexedFieldSpecializationPlan, ModulePlanIdentity,
     };
     use std::collections::{HashMap, VecDeque};
     use std::ffi::c_void;
@@ -3089,6 +3090,7 @@ def build(values):
                     regions: Vec::new(),
                     scalar_threads: Vec::new(),
                     direct_calls: Vec::new(),
+                    indexed_fields: Vec::new(),
                     deopt_points: Vec::new(),
                     ownership: soac_opt::plan_v3::FunctionOwnershipPlan::default(),
                     diagnostics: Vec::new(),
@@ -3100,6 +3102,7 @@ def build(values):
                     function: serialized_function,
                     debug_name: Some(function.names.qualname.clone()),
                     direct_calls: Vec::new(),
+                    indexed_fields: Vec::new(),
                     regions: Vec::new(),
                 }],
             },
@@ -16582,6 +16585,7 @@ def f(x):
                     regions: Vec::new(),
                     scalar_threads: Vec::new(),
                     direct_calls: Vec::new(),
+                    indexed_fields: Vec::new(),
                     deopt_points: Vec::new(),
                     ownership: soac_opt::plan_v3::FunctionOwnershipPlan::default(),
                     diagnostics: Vec::new(),
@@ -16593,6 +16597,7 @@ def f(x):
                     function: serialized_function,
                     debug_name: Some(function.names.qualname.clone()),
                     direct_calls: Vec::new(),
+                    indexed_fields: Vec::new(),
                     regions: Vec::new(),
                 }],
             },
@@ -16653,6 +16658,7 @@ def f(x):
                         },
                         reason: "profiled direct call".to_string(),
                     }],
+                    indexed_fields: Vec::new(),
                     deopt_points: Vec::new(),
                     ownership: soac_opt::plan_v3::FunctionOwnershipPlan::default(),
                     diagnostics: Vec::new(),
@@ -16671,6 +16677,7 @@ def f(x):
                         },
                         reason: "profiled direct call".to_string(),
                     }],
+                    indexed_fields: Vec::new(),
                     regions: Vec::new(),
                 }],
             },
@@ -16700,6 +16707,245 @@ def f(x):
             planned_inputs.evidence_by_function.is_empty(),
             "v3 emitted direct calls should not be converted into legacy profile evidence"
         );
+    }
+
+    #[test]
+    fn planned_precompile_inputs_consume_v3_emitted_indexed_fields() {
+        let module_name_gen = ModuleNameGen::new(7);
+        let caller = test_function_in_module(&module_name_gen, "caller");
+        let caller_id = caller.function_id;
+        let module = test_module(module_name_gen, vec![caller]);
+        let source = InstrId::new(BlockLabel::from_index(0), 11);
+        let serialized_caller =
+            SerializedFunctionId::new(SerializedModuleId::new(0), caller_id.local_function_id());
+        let owner_type = IndexedFieldOwnerType {
+            module_name: "pkg.model".to_string(),
+            qualname: "Record".to_string(),
+        };
+        let artifacts = ExactIntBranchV3Artifacts {
+            plan: ModuleOptimizationPlanV3 {
+                module: ModulePlanIdentity {
+                    module_name: "test".to_string(),
+                    source_hash: 0,
+                    cache_identity: "test-cache".to_string(),
+                },
+                helper_catalog_version: 1,
+                cost_model_version: 1,
+                functions: vec![soac_opt::plan_v3::FunctionOptimizationPlanV3 {
+                    function: FunctionPlanIdentity {
+                        function: serialized_caller,
+                        debug_name: Some("caller".to_string()),
+                    },
+                    regions: Vec::new(),
+                    scalar_threads: Vec::new(),
+                    direct_calls: Vec::new(),
+                    indexed_fields: vec![IndexedFieldSpecializationPlan {
+                        source,
+                        access: IndexedFieldAccessKind::Load,
+                        owner_type: owner_type.clone(),
+                        attr_name: "value".to_string(),
+                        expected_index: 2,
+                        reason: "profiled type_keys selected this indexed-field layout".to_string(),
+                    }],
+                    deopt_points: Vec::new(),
+                    ownership: soac_opt::plan_v3::FunctionOwnershipPlan::default(),
+                    diagnostics: Vec::new(),
+                }],
+            },
+            emission: MechanicalModuleEmission {
+                module_name: "test".to_string(),
+                functions: vec![soac_opt::emit_v3::MechanicalFunctionEmission {
+                    function: serialized_caller,
+                    debug_name: Some("caller".to_string()),
+                    direct_calls: Vec::new(),
+                    indexed_fields: vec![soac_opt::emit_v3::MechanicalIndexedFieldEmission {
+                        source,
+                        access: IndexedFieldAccessKind::Load,
+                        owner_type: owner_type.clone(),
+                        attr_name: "value".to_string(),
+                        expected_index: 2,
+                        reason: "profiled type_keys selected this indexed-field layout".to_string(),
+                    }],
+                    regions: Vec::new(),
+                }],
+            },
+        };
+
+        let planned_inputs =
+            planned_optimization_inputs_from_v3_artifacts_for_codegen_module(&artifacts, &module)
+                .unwrap();
+
+        assert_eq!(
+            planned_inputs
+                .opt_v3_emitted_field_index_specializations
+                .get(&caller_id)
+                .unwrap()
+                .get(&source)
+                .unwrap(),
+            &vec![PlannedIndexedFieldSpecialization {
+                owner_type: PlannedTypeKey {
+                    module_name: owner_type.module_name,
+                    qualname: owner_type.qualname,
+                },
+                attr_name: "value".to_string(),
+                expected_index: 2,
+            }]
+        );
+        assert!(
+            planned_inputs.evidence_by_function.is_empty(),
+            "v3 emitted indexed fields should not be converted into legacy profile evidence"
+        );
+    }
+
+    #[test]
+    fn specialization_profile_consumes_v3_indexed_fields_as_codegen_inputs() {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "specialization_profile_consumes_v3_indexed_fields_as_codegen_inputs",
+        ) {
+            return;
+        }
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| {
+            let soac_work_dir = fresh_test_work_dir("strict-v3-indexed-field-input");
+            let module_cache_root = soac_work_dir.join("modules");
+            let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
+            let _opt_mode = EnvVarGuard::set("SOAC_OPT_MODE", "apply");
+            let _plan_mode = EnvVarGuard::set(SOAC_OPT_PLAN_MODE_ENV, "v3");
+            let owner_module = PyModule::from_code(
+                py,
+                c"
+class Point:
+    pass
+",
+                c"field_type_test.py",
+                c"field_type_test",
+            )
+            .expect("owner module should execute");
+            let sys = PyModule::import(py, "sys").expect("sys should import");
+            let modules = sys
+                .getattr("modules")
+                .expect("sys.modules should exist")
+                .cast_into::<pyo3::types::PyDict>()
+                .expect("sys.modules should be a dict");
+            modules
+                .set_item("field_type_test", owner_module.as_any())
+                .expect("owner module should be registered");
+
+            let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+                r#"
+def read_point(point):
+    return point.x
+"#,
+            )
+            .expect("lowering should succeed")
+            .codegen_module;
+            let module_name = "counter_test";
+            let shared_state =
+                crate::module_type::build_shared_state_for_testing(py, lowered, module_name, "")
+                    .expect("shared state should build");
+            let function = shared_state
+                .lowered_module
+                .callable_defs
+                .iter()
+                .find(|function| function.names.bind_name == "read_point")
+                .expect("missing read_point")
+                .clone();
+            struct GetAttrFinder {
+                instr_id: Option<InstrId>,
+            }
+            impl Visit<InstrCodegen> for GetAttrFinder {
+                fn visit_instr(&mut self, expr: &InstrCodegen)
+                where
+                    InstrCodegen: ChildVisitable<InstrCodegen>,
+                {
+                    if self.instr_id.is_none()
+                        && let InstrCodegen::GetAttr(_) = expr
+                    {
+                        self.instr_id = Some(expr.semantic_instr_id());
+                    }
+                    expr.visit_children(self);
+                }
+            }
+            let mut finder = GetAttrFinder { instr_id: None };
+            for block in &function.blocks {
+                for expr in &block.body {
+                    finder.visit_instr(expr);
+                }
+                finder.visit_term(&block.term);
+            }
+            let getattr_instr_id = finder
+                .instr_id
+                .expect("read_point should contain a GetAttr");
+            let current_function = shared_state
+                .lookup_function(function.function_id)
+                .expect("read_point should be present in shared state");
+            let cache_identity = pre_optimization_module_cache_identity(
+                env!("SOAC_BUILD_IDENTITY"),
+                shared_state.module_name == "soac.runtime",
+            );
+            let mut artifacts = test_empty_v3_artifacts_for_function(
+                module_name,
+                shared_state.source_hash,
+                cache_identity.as_str(),
+                0,
+                current_function,
+            );
+            let owner_type = IndexedFieldOwnerType {
+                module_name: "field_type_test".to_string(),
+                qualname: "Point".to_string(),
+            };
+            artifacts.plan.functions[0]
+                .indexed_fields
+                .push(IndexedFieldSpecializationPlan {
+                    source: getattr_instr_id,
+                    access: IndexedFieldAccessKind::Load,
+                    owner_type: owner_type.clone(),
+                    attr_name: "x".to_string(),
+                    expected_index: 0,
+                    reason: "profiled type_keys selected this indexed-field layout".to_string(),
+                });
+            artifacts.emission.functions[0].indexed_fields.push(
+                soac_opt::emit_v3::MechanicalIndexedFieldEmission {
+                    source: getattr_instr_id,
+                    access: IndexedFieldAccessKind::Load,
+                    owner_type,
+                    attr_name: "x".to_string(),
+                    expected_index: 0,
+                    reason: "profiled type_keys selected this indexed-field layout".to_string(),
+                },
+            );
+            let v3_path = module_optimization_plan_v3_path(
+                module_cache_root.as_path(),
+                PythonModuleCacheSource::Project,
+                module_name,
+            )
+            .expect("v3 test optimization plan path should build");
+            write_test_optimization_artifacts_v3(v3_path.as_path(), &artifacts);
+
+            let profile = SpecializationProfile::from_runtime_state_with_session(
+                Some(shared_state.as_ref()),
+                None,
+            )
+            .expect("strict v3 indexed-field artifact should load");
+            assert!(
+                profile.planned_evidence.is_empty(),
+                "v3 indexed fields should not synthesize legacy evidence"
+            );
+            let inputs = FunctionSpecializationInputs::from_profile(&profile, &function)
+                .expect("v3 indexed-field input should resolve to codegen guards");
+            assert!(
+                inputs
+                    .field_index_specializations_by_instr
+                    .contains_key(&getattr_instr_id),
+                "v3 emitted indexed-field decision should become per-instruction codegen input"
+            );
+
+            modules
+                .del_item("field_type_test")
+                .expect("owner module should be removed");
+        });
     }
 
     #[test]
@@ -16739,6 +16985,7 @@ def f(x):
                         },
                         reason: "profiled direct call".to_string(),
                     }],
+                    indexed_fields: Vec::new(),
                     deopt_points: Vec::new(),
                     ownership: soac_opt::plan_v3::FunctionOwnershipPlan::default(),
                     diagnostics: Vec::new(),
@@ -16750,6 +16997,7 @@ def f(x):
                     function: serialized_caller,
                     debug_name: Some("caller".to_string()),
                     direct_calls: Vec::new(),
+                    indexed_fields: Vec::new(),
                     regions: Vec::new(),
                 }],
             },
@@ -16764,6 +17012,74 @@ def f(x):
 
         assert!(
             err.contains("contain 1 planned direct calls but 0 emitted direct calls"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn planned_precompile_inputs_reject_mismatched_v3_indexed_field_emission() {
+        let module_name_gen = ModuleNameGen::new(7);
+        let caller = test_function_in_module(&module_name_gen, "caller");
+        let caller_id = caller.function_id;
+        let module = test_module(module_name_gen, vec![caller]);
+        let source = InstrId::new(BlockLabel::from_index(0), 11);
+        let serialized_caller =
+            SerializedFunctionId::new(SerializedModuleId::new(0), caller_id.local_function_id());
+        let owner_type = IndexedFieldOwnerType {
+            module_name: "pkg.model".to_string(),
+            qualname: "Record".to_string(),
+        };
+        let artifacts = ExactIntBranchV3Artifacts {
+            plan: ModuleOptimizationPlanV3 {
+                module: ModulePlanIdentity {
+                    module_name: "test".to_string(),
+                    source_hash: 0,
+                    cache_identity: "test-cache".to_string(),
+                },
+                helper_catalog_version: 1,
+                cost_model_version: 1,
+                functions: vec![soac_opt::plan_v3::FunctionOptimizationPlanV3 {
+                    function: FunctionPlanIdentity {
+                        function: serialized_caller,
+                        debug_name: Some("caller".to_string()),
+                    },
+                    regions: Vec::new(),
+                    scalar_threads: Vec::new(),
+                    direct_calls: Vec::new(),
+                    indexed_fields: vec![IndexedFieldSpecializationPlan {
+                        source,
+                        access: IndexedFieldAccessKind::Load,
+                        owner_type,
+                        attr_name: "value".to_string(),
+                        expected_index: 2,
+                        reason: "profiled type_keys selected this indexed-field layout".to_string(),
+                    }],
+                    deopt_points: Vec::new(),
+                    ownership: soac_opt::plan_v3::FunctionOwnershipPlan::default(),
+                    diagnostics: Vec::new(),
+                }],
+            },
+            emission: MechanicalModuleEmission {
+                module_name: "test".to_string(),
+                functions: vec![soac_opt::emit_v3::MechanicalFunctionEmission {
+                    function: serialized_caller,
+                    debug_name: Some("caller".to_string()),
+                    direct_calls: Vec::new(),
+                    indexed_fields: Vec::new(),
+                    regions: Vec::new(),
+                }],
+            },
+        };
+
+        let err = match planned_optimization_inputs_from_v3_artifacts_for_codegen_module(
+            &artifacts, &module,
+        ) {
+            Ok(_) => panic!("mismatched v3 indexed-field emission should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.contains("contain 1 planned indexed fields but 0 emitted indexed fields"),
             "{err}"
         );
     }
@@ -16797,6 +17113,7 @@ def f(x):
             counter_dump_path: None,
             planned_evidence,
             opt_v3_emitted_direct_function_guards,
+            opt_v3_emitted_field_index_specializations: HashMap::new(),
             opt_v3_exact_int_branch_artifacts: HashMap::new(),
             behavior_change_indexed_stores: false,
             profiled_cold_blocks: false,

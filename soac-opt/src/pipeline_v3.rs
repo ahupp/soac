@@ -10,12 +10,12 @@ use crate::plan::{
     OptimizationPlanGenerationSummary, ProfileEvidenceStore, cached_module_paths_under_root,
 };
 use crate::plan_v3::{
-    DirectCallArgPlan, DirectCallArgSource, FunctionPlanIdentity, ModulePlanIdentity,
-    PlanDiagnostic, RegionId,
+    DirectCallArgPlan, DirectCallArgSource, FunctionPlanIdentity, IndexedFieldAccessKind,
+    IndexedFieldOwnerType, ModulePlanIdentity, PlanDiagnostic, RegionId,
 };
 use crate::planner_v3::{
-    DirectCallPlanRequest, ExtractedRegionPlanRequest, FunctionPlanRequest, ModulePlanRequest,
-    plan_module_optimization_v3,
+    DirectCallPlanRequest, ExtractedRegionPlanRequest, FunctionPlanRequest,
+    IndexedFieldPlanRequest, ModulePlanRequest, plan_module_optimization_v3,
 };
 use crate::region_v3::{
     RegionExtractionAttempt, RegionExtractionError, extract_function_regions_v3,
@@ -23,13 +23,14 @@ use crate::region_v3::{
 use anyhow::{Context, Result, anyhow, bail};
 use soac_core::block_py::{
     BlockLabel, BlockPyFunction, BlockPyModule, Call, CallArgPositional, ChildVisitable,
-    FunctionExecutionMode, HasSemanticInstrId, InstrId, LocalFunctionId, ParamKind,
+    FunctionExecutionMode, HasSemanticInstrId, InstrId, LocalFunctionId, NameLocation, ParamKind,
     RuntimeModuleId, SerializedFunctionId, SerializedModuleId, Visit,
 };
 use soac_driver::codegen_cache::{
     CachedCodegenModule, CachedCodegenModuleMetadata, load_codegen_module_cache,
     module_optimization_plan_v3_path,
 };
+use soac_lowering::block_py::Literal;
 use soac_lowering::passes::{CodegenModuleShape, InstrCodegen, InstrResolved};
 use std::collections::HashMap;
 use std::fmt;
@@ -152,10 +153,16 @@ pub fn plan_and_emit_module_v3_from_raw_evidence(
                 &evidence,
             );
         diagnostics.extend(direct_call_diagnostics);
+        let indexed_fields = indexed_field_requests_from_type_key_evidence_v3(
+            function,
+            lowered_module,
+            evidence_store,
+        );
         functions.push(FunctionPlanRequest {
             function: function_plan_identity_v3(function),
             regions: region_requests,
             direct_calls,
+            indexed_fields,
         });
         diagnostics_by_function.push(diagnostics);
     }
@@ -195,6 +202,7 @@ pub fn plan_and_emit_extracted_exact_int_branches_v3(
             module,
             functions: vec![FunctionPlanRequest {
                 direct_calls: Vec::new(),
+                indexed_fields: Vec::new(),
                 function,
                 regions: region_requests,
             }],
@@ -217,6 +225,112 @@ fn function_plan_identity_v3(
         ),
         debug_name: Some(function.names.qualname.clone()),
     }
+}
+
+fn indexed_field_requests_from_type_key_evidence_v3(
+    function: &BlockPyFunction<CodegenModuleShape>,
+    lowered_module: &BlockPyModule<CodegenModuleShape>,
+    evidence_store: &ProfileEvidenceStore,
+) -> Vec<IndexedFieldPlanRequest> {
+    struct Collector<'a> {
+        lowered_module: &'a BlockPyModule<CodegenModuleShape>,
+        evidence_store: &'a ProfileEvidenceStore,
+        requests: Vec<IndexedFieldPlanRequest>,
+    }
+
+    impl Collector<'_> {
+        fn collect_attr(
+            &mut self,
+            source: InstrId,
+            access: IndexedFieldAccessKind,
+            attr_expr: &InstrCodegen,
+        ) {
+            let Some(attr_name) = codegen_constant_string_value_v3(self.lowered_module, attr_expr)
+            else {
+                return;
+            };
+            let Some(specializations) = self
+                .evidence_store
+                .field_index_specializations_for_attr(attr_name)
+            else {
+                return;
+            };
+            for specialization in specializations {
+                self.requests.push(IndexedFieldPlanRequest {
+                    source,
+                    access,
+                    owner_type: IndexedFieldOwnerType {
+                        module_name: specialization.owner_type.module_name.clone(),
+                        qualname: specialization.owner_type.qualname.clone(),
+                    },
+                    attr_name: specialization.attr_name.clone(),
+                    expected_index: specialization.expected_index,
+                    reason: "profiled type_keys selected this indexed-field layout for a constant attribute access".to_string(),
+                });
+            }
+        }
+    }
+
+    impl Visit<InstrCodegen> for Collector<'_> {
+        fn visit_instr(&mut self, expr: &InstrCodegen)
+        where
+            InstrCodegen: ChildVisitable<InstrCodegen>,
+        {
+            match expr {
+                InstrCodegen::GetAttr(op) => {
+                    self.collect_attr(
+                        op.semantic_instr_id(),
+                        IndexedFieldAccessKind::Load,
+                        op.attr.as_ref(),
+                    );
+                }
+                InstrCodegen::SetAttr(op) => {
+                    self.collect_attr(
+                        op.semantic_instr_id(),
+                        IndexedFieldAccessKind::Store,
+                        op.attr.as_ref(),
+                    );
+                }
+                _ => {}
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    let mut collector = Collector {
+        lowered_module,
+        evidence_store,
+        requests: Vec::new(),
+    };
+    collector.visit_fn(function);
+    collector.requests
+}
+
+fn codegen_constant_string_value_v3<'a>(
+    module: &'a BlockPyModule<CodegenModuleShape>,
+    expr: &InstrCodegen,
+) -> Option<&'a str> {
+    let InstrCodegen::Load(load) = expr else {
+        return None;
+    };
+    let NameLocation::Constant(constant_index) = load.name.location else {
+        return None;
+    };
+    module_constant_string_value_v3(module, constant_index)
+}
+
+fn module_constant_string_value_v3(
+    module: &BlockPyModule<CodegenModuleShape>,
+    constant_index: u32,
+) -> Option<&str> {
+    let InstrResolved::Literal(literal) = module.module_constants.get(constant_index as usize)?
+    else {
+        return None;
+    };
+    let Literal::StringLiteral(literal) = literal.as_literal() else {
+        return None;
+    };
+    Some(literal.value.as_str())
 }
 
 fn direct_call_requests_from_same_module_evidence_v3(
@@ -533,11 +647,18 @@ mod tests {
     use crate::plan_v3::{RegionId, validate_module_plan_v3};
     use crate::region_v3::{ExtractedValueId, extract_block_region_v3};
     use soac_core::block_py::{
-        BinOp, BinOpKind, Block, BlockLabel, BlockParam, BlockPyName, BlockTerm, InstrId, Load,
-        LocalFunctionId, LocalLocation, Meta, NameLocation, ResolvedName, RuntimeFunctionId,
-        SerializedFunctionId, SerializedModuleId, TermIf, WithMeta,
+        BinOp, BinOpKind, Block, BlockLabel, BlockParam, BlockPyName, BlockTerm, FunctionName,
+        GetAttr, InstrId, Load, LocalFunctionId, LocalLocation, Meta, ModuleNameGen, NameLocation,
+        ParamSpec, ResolvedName, RuntimeFunctionId, SerializedFunctionId, SerializedModuleId,
+        SetAttr, TermIf, WithMeta,
     };
-    use soac_lowering::passes::InstrCodegen;
+    use soac_core::profile::{
+        CounterDumpRecord, CounterDumpTypeKey, CounterDumpTypeKeyLayout, CounterDumpTypeTableEntry,
+    };
+    use soac_lowering::block_py::{LiteralValue, StringLiteral};
+    use soac_lowering::passes::{InstrCodegen, InstrResolved};
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn label(index: usize) -> BlockLabel {
         BlockLabel::from_index(index)
@@ -558,6 +679,13 @@ mod tests {
         InstrCodegen::Load(Load::new(ResolvedName {
             id: BlockPyName::new(name),
             location: NameLocation::Local(LocalLocation(slot)),
+        }))
+    }
+
+    fn constant_name(index: u32) -> InstrCodegen {
+        InstrCodegen::Load(Load::new(ResolvedName {
+            id: BlockPyName::new(format!("<const {index}>")),
+            location: NameLocation::Constant(index),
         }))
     }
 
@@ -602,6 +730,35 @@ mod tests {
             ),
             debug_name: Some("f".to_string()),
         }
+    }
+
+    fn function_with_blocks(
+        blocks: Vec<Block<InstrCodegen>>,
+    ) -> BlockPyFunction<CodegenModuleShape> {
+        let name_gen = ModuleNameGen::new(0).next_function_name_gen();
+        BlockPyFunction {
+            function_id: name_gen.function_id(),
+            name_gen,
+            names: FunctionName::new("f", "f", "f", "f"),
+            kind: soac_core::block_py::FunctionKind::Function,
+            execution_mode: Default::default(),
+            params: ParamSpec::default(),
+            blocks,
+            doc: None,
+            storage_layout: None,
+            scope: Default::default(),
+        }
+    }
+
+    fn unique_counter_path_v3() -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "soac-opt-v3-pipeline-test-{}-{nanos}.bin",
+            std::process::id()
+        ))
     }
 
     fn evidence() -> FunctionProfileEvidence {
@@ -668,6 +825,84 @@ mod tests {
             direct_calls.is_empty(),
             "v3 direct-call planning requires the lowered call site and target signature"
         );
+    }
+
+    #[test]
+    fn indexed_field_requests_are_derived_from_raw_type_key_evidence() {
+        let attr_name = constant_name(0);
+        let get_source = InstrId::new(label(0), 5);
+        let set_source = InstrId::new(label(0), 8);
+        let block = Block::new(
+            label(0),
+            vec![
+                InstrCodegen::GetAttr(GetAttr::new(local("record", 0), attr_name.clone()))
+                    .with_meta(Meta {
+                        instr_id: Some(get_source),
+                        ..Meta::synthetic()
+                    }),
+                InstrCodegen::SetAttr(SetAttr::new(
+                    local("record", 0),
+                    attr_name,
+                    local("value", 1),
+                ))
+                .with_meta(Meta {
+                    instr_id: Some(set_source),
+                    ..Meta::synthetic()
+                }),
+            ],
+            BlockTerm::jump_term(label(1)),
+            Vec::<BlockParam>::new(),
+            None,
+        );
+        let function = function_with_blocks(vec![block]);
+        let module = BlockPyModule {
+            module_name_gen: ModuleNameGen::new(0),
+            global_names: Vec::new(),
+            callable_defs: vec![function],
+            module_constants: vec![InstrResolved::Literal(LiteralValue::new(StringLiteral {
+                value: "value".to_string(),
+            }))],
+            counter_defs: Vec::new(),
+        };
+        let record = CounterDumpRecord {
+            source_hash: 0x1234,
+            module_name: "pkg.mod".to_string(),
+            package_name: None,
+            rows: Vec::new(),
+            module_keys: Vec::new(),
+            type_keys: vec![CounterDumpTypeKeyLayout {
+                owner_type_id: 44,
+                key: "value".to_string(),
+                index: 2,
+            }],
+            type_table: vec![CounterDumpTypeTableEntry {
+                type_id: 44,
+                key: CounterDumpTypeKey {
+                    module_name: "pkg.model".to_string(),
+                    qualname: "Record".to_string(),
+                },
+            }],
+        };
+        let path = unique_counter_path_v3();
+        fs::write(path.as_path(), record.encode().unwrap()).unwrap();
+        let evidence_store = ProfileEvidenceStore::from_counter_dump(path.as_path()).unwrap();
+        let _ = fs::remove_file(path);
+
+        let requests = indexed_field_requests_from_type_key_evidence_v3(
+            &module.callable_defs[0],
+            &module,
+            &evidence_store,
+        );
+
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].source, get_source);
+        assert_eq!(requests[0].access, IndexedFieldAccessKind::Load);
+        assert_eq!(requests[0].owner_type.module_name, "pkg.model");
+        assert_eq!(requests[0].owner_type.qualname, "Record");
+        assert_eq!(requests[0].attr_name, "value");
+        assert_eq!(requests[0].expected_index, 2);
+        assert_eq!(requests[1].source, set_source);
+        assert_eq!(requests[1].access, IndexedFieldAccessKind::Store);
     }
 
     #[test]

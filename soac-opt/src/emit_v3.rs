@@ -1,8 +1,9 @@
 use crate::plan_v3::{
     ConversionKind, DeoptPointId, DirectCallArgPlan, DirectCallSpecializationPlan, FailureMode,
-    GuardFailure, GuardKind, MaterializeKind, ModuleOptimizationPlanV3, OperationNode, PlanNodeId,
-    PlanNodeKind, PlanValidationError, PlanValue, PlannedConstant, PlannedOp, RegionExitKind,
-    RegionExitTarget, RegionId, RichCompareOp, validate_module_plan_v3,
+    GuardFailure, GuardKind, IndexedFieldAccessKind, IndexedFieldOwnerType,
+    IndexedFieldSpecializationPlan, MaterializeKind, ModuleOptimizationPlanV3, OperationNode,
+    PlanNodeId, PlanNodeKind, PlanValidationError, PlanValue, PlannedConstant, PlannedOp,
+    RegionExitKind, RegionExitTarget, RegionId, RichCompareOp, validate_module_plan_v3,
 };
 use soac_core::block_py::{InstrId, SerializedFunctionId};
 use std::fmt;
@@ -18,6 +19,7 @@ pub struct MechanicalFunctionEmission {
     pub function: SerializedFunctionId,
     pub debug_name: Option<String>,
     pub direct_calls: Vec<MechanicalDirectCallEmission>,
+    pub indexed_fields: Vec<MechanicalIndexedFieldEmission>,
     pub regions: Vec<MechanicalRegionEmission>,
 }
 
@@ -26,6 +28,16 @@ pub struct MechanicalDirectCallEmission {
     pub source: InstrId,
     pub target: SerializedFunctionId,
     pub arg_plan: DirectCallArgPlan,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct MechanicalIndexedFieldEmission {
+    pub source: InstrId,
+    pub access: IndexedFieldAccessKind,
+    pub owner_type: IndexedFieldOwnerType,
+    pub attr_name: String,
+    pub expected_index: u32,
     pub reason: String,
 }
 
@@ -177,6 +189,11 @@ pub fn emit_mechanical_plan_v3(
                 function: function.function.function,
                 debug_name: function.function.debug_name.clone(),
                 direct_calls: function.direct_calls.iter().map(emit_direct_call).collect(),
+                indexed_fields: function
+                    .indexed_fields
+                    .iter()
+                    .map(emit_indexed_field)
+                    .collect(),
                 regions: function
                     .regions
                     .iter()
@@ -212,6 +229,19 @@ fn emit_direct_call(direct_call: &DirectCallSpecializationPlan) -> MechanicalDir
         target: direct_call.target,
         arg_plan: direct_call.arg_plan.clone(),
         reason: direct_call.reason.clone(),
+    }
+}
+
+fn emit_indexed_field(
+    indexed_field: &IndexedFieldSpecializationPlan,
+) -> MechanicalIndexedFieldEmission {
+    MechanicalIndexedFieldEmission {
+        source: indexed_field.source,
+        access: indexed_field.access,
+        owner_type: indexed_field.owner_type.clone(),
+        attr_name: indexed_field.attr_name.clone(),
+        expected_index: indexed_field.expected_index,
+        reason: indexed_field.reason.clone(),
     }
 }
 
@@ -282,6 +312,7 @@ mod tests {
     use crate::plan_v3::{
         Cost, DirectCallArgPlan, DirectCallArgSource, DirectCallSpecializationPlan, FallbackReason,
         FallbackTarget, FunctionOptimizationPlanV3, FunctionOwnershipPlan, FunctionPlanIdentity,
+        IndexedFieldAccessKind, IndexedFieldOwnerType, IndexedFieldSpecializationPlan,
         MaterializeNode, ModulePlanIdentity, RegionExitPlan, RegionInput, RegionPlan, RegionSource,
         Rep,
     };
@@ -408,6 +439,7 @@ mod tests {
                 ],
                 scalar_threads: Vec::new(),
                 direct_calls: Vec::new(),
+                indexed_fields: Vec::new(),
                 deopt_points: Vec::new(),
                 ownership: FunctionOwnershipPlan::default(),
                 diagnostics: Vec::new(),
@@ -475,6 +507,40 @@ mod tests {
                     sources: vec![DirectCallArgSource::Provided(0)],
                 },
                 reason: "profiled call_hot_targets selected this same-module function".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn emits_indexed_field_decisions_mechanically() {
+        let mut plan = test_plan(true);
+        let source = InstrId::new(BlockLabel::from_index(0), 7);
+        let owner_type = IndexedFieldOwnerType {
+            module_name: "pkg.model".to_string(),
+            qualname: "Record".to_string(),
+        };
+        plan.functions[0]
+            .indexed_fields
+            .push(IndexedFieldSpecializationPlan {
+                source,
+                access: IndexedFieldAccessKind::Load,
+                owner_type: owner_type.clone(),
+                attr_name: "value".to_string(),
+                expected_index: 2,
+                reason: "profiled type_keys selected this indexed-field layout".to_string(),
+            });
+
+        let emission = emit_mechanical_plan_v3(&plan).unwrap();
+
+        assert_eq!(
+            emission.functions[0].indexed_fields,
+            vec![MechanicalIndexedFieldEmission {
+                source,
+                access: IndexedFieldAccessKind::Load,
+                owner_type,
+                attr_name: "value".to_string(),
+                expected_index: 2,
+                reason: "profiled type_keys selected this indexed-field layout".to_string(),
             }]
         );
     }
