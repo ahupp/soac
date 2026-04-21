@@ -514,7 +514,8 @@ mod tests {
     #[test]
     fn emits_indexed_field_decisions_mechanically() {
         let mut plan = test_plan(true);
-        let source = InstrId::new(BlockLabel::from_index(0), 7);
+        let load_source = InstrId::new(BlockLabel::from_index(0), 7);
+        let store_source = InstrId::new(BlockLabel::from_index(0), 9);
         let owner_type = IndexedFieldOwnerType {
             module_name: "pkg.model".to_string(),
             qualname: "Record".to_string(),
@@ -522,8 +523,18 @@ mod tests {
         plan.functions[0]
             .indexed_fields
             .push(IndexedFieldSpecializationPlan {
-                source,
+                source: load_source,
                 access: IndexedFieldAccessKind::Load,
+                owner_type: owner_type.clone(),
+                attr_name: "value".to_string(),
+                expected_index: 2,
+                reason: "profiled type_keys selected this indexed-field layout".to_string(),
+            });
+        plan.functions[0]
+            .indexed_fields
+            .push(IndexedFieldSpecializationPlan {
+                source: store_source,
+                access: IndexedFieldAccessKind::Store,
                 owner_type: owner_type.clone(),
                 attr_name: "value".to_string(),
                 expected_index: 2,
@@ -534,14 +545,24 @@ mod tests {
 
         assert_eq!(
             emission.functions[0].indexed_fields,
-            vec![MechanicalIndexedFieldEmission {
-                source,
-                access: IndexedFieldAccessKind::Load,
-                owner_type,
-                attr_name: "value".to_string(),
-                expected_index: 2,
-                reason: "profiled type_keys selected this indexed-field layout".to_string(),
-            }]
+            vec![
+                MechanicalIndexedFieldEmission {
+                    source: load_source,
+                    access: IndexedFieldAccessKind::Load,
+                    owner_type: owner_type.clone(),
+                    attr_name: "value".to_string(),
+                    expected_index: 2,
+                    reason: "profiled type_keys selected this indexed-field layout".to_string(),
+                },
+                MechanicalIndexedFieldEmission {
+                    source: store_source,
+                    access: IndexedFieldAccessKind::Store,
+                    owner_type,
+                    attr_name: "value".to_string(),
+                    expected_index: 2,
+                    reason: "profiled type_keys selected this indexed-field layout".to_string(),
+                },
+            ]
         );
     }
 
