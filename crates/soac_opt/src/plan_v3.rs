@@ -103,14 +103,6 @@ pub enum ExactListItemShape {
     ExactListExactInt,
 }
 
-impl ExactListItemShape {
-    pub const fn legacy_shape_tag(self) -> u64 {
-        match self {
-            Self::ExactListExactInt => EXACT_LIST_EXACT_INT_ITEM_SHAPE_TAG,
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct ExactListItemGuardPlan {
     pub kind: ExactListItemGuardKind,

@@ -25,14 +25,10 @@ struct RawPyLongObject {
     long_value: RawPyLongValue,
 }
 
-fn opt_v3_exact_list_item_hot_shapes(
-    plan: &OptV3ExactListItemAccessPlan,
-    expected_access: ExactListItemAccessKind,
-) -> Vec<u64> {
-    plan.expect_lowering_shape(expected_access);
-    match plan.shape {
-        ExactListItemShape::ExactListExactInt => vec![plan.shape.legacy_shape_tag()],
-    }
+fn legacy_exact_list_exact_int_selected(hot_shapes: &[u64]) -> bool {
+    hot_shapes
+        .iter()
+        .any(|shape| *shape == EXACT_LIST_EXACT_INT_ITEM_SHAPE_TAG)
 }
 
 pub(super) fn emit_getitem<'fb>(
@@ -55,38 +51,44 @@ pub(super) fn emit_getitem<'fb>(
         .getitem_specialized_fallback_counter_ids
         .get(&instr_id)
         .copied();
-    let hot_shapes = state
+    let opt_v3_plan = state
         .ctx()
         .opt_v3_exact_list_items_by_instr
         .get(&instr_id)
         .filter(|plan| plan.access == ExactListItemAccessKind::Get)
-        .map(|plan| opt_v3_exact_list_item_hot_shapes(plan, ExactListItemAccessKind::Get))
-        .unwrap_or_else(|| {
-            if state.ctx().allow_legacy_item_specializations {
-                state
-                    .ctx()
-                    .getitem_specializations
-                    .get(&instr_id)
-                    .cloned()
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            }
-        });
-    if shape_counter_id.is_none() && hot_shapes.is_empty() {
+        .cloned();
+    let legacy_hot_shapes =
+        if opt_v3_plan.is_none() && state.ctx().allow_legacy_item_specializations {
+            state
+                .ctx()
+                .getitem_specializations
+                .get(&instr_id)
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+    if shape_counter_id.is_none() && opt_v3_plan.is_none() && legacy_hot_shapes.is_empty() {
         return emit_generic_getitem_from_exprs(op, state);
     }
 
     let arg_values = state.emit_arg_values(&[op.value.as_ref(), op.index.as_ref()]);
-    let shape = emit_item_dispatch_shape_from_arg_values(state, &arg_values);
     if let Some(counter_id) = shape_counter_id {
+        let shape = emit_item_dispatch_shape_from_arg_values(state, &arg_values);
         emit_record_item_shape_counter(state, counter_id, shape);
     }
 
-    let supports_exact_list_exact_int = hot_shapes
-        .iter()
-        .any(|shape| *shape == EXACT_LIST_EXACT_INT_ITEM_SHAPE_TAG);
-    if !supports_exact_list_exact_int {
+    if let Some(plan) = opt_v3_plan {
+        return emit_exact_list_item_getitem_from_v3_plan(
+            state,
+            &arg_values,
+            &plan,
+            specialized_hit_counter_id,
+            specialized_fallback_counter_id,
+        );
+    }
+
+    if !legacy_exact_list_exact_int_selected(&legacy_hot_shapes) {
         let result = emit_generic_getitem_from_arg_values(state, &arg_values);
         state.release_arg_values(&arg_values);
         return state.finish_owned_result(result);
@@ -120,25 +122,24 @@ pub(super) fn emit_setitem<'fb>(
         .setitem_specialized_fallback_counter_ids
         .get(&instr_id)
         .copied();
-    let hot_shapes = state
+    let opt_v3_plan = state
         .ctx()
         .opt_v3_exact_list_items_by_instr
         .get(&instr_id)
         .filter(|plan| plan.access == ExactListItemAccessKind::Set)
-        .map(|plan| opt_v3_exact_list_item_hot_shapes(plan, ExactListItemAccessKind::Set))
-        .unwrap_or_else(|| {
-            if state.ctx().allow_legacy_item_specializations {
-                state
-                    .ctx()
-                    .setitem_specializations
-                    .get(&instr_id)
-                    .cloned()
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            }
-        });
-    if shape_counter_id.is_none() && hot_shapes.is_empty() {
+        .cloned();
+    let legacy_hot_shapes =
+        if opt_v3_plan.is_none() && state.ctx().allow_legacy_item_specializations {
+            state
+                .ctx()
+                .setitem_specializations
+                .get(&instr_id)
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+    if shape_counter_id.is_none() && opt_v3_plan.is_none() && legacy_hot_shapes.is_empty() {
         return emit_generic_setitem_from_exprs(op, state);
     }
 
@@ -147,15 +148,22 @@ pub(super) fn emit_setitem<'fb>(
         op.index.as_ref(),
         op.replacement.as_ref(),
     ]);
-    let shape = emit_item_dispatch_shape_from_arg_values(state, &arg_values[..2]);
     if let Some(counter_id) = shape_counter_id {
+        let shape = emit_item_dispatch_shape_from_arg_values(state, &arg_values[..2]);
         emit_record_item_shape_counter(state, counter_id, shape);
     }
 
-    let supports_exact_list_exact_int = hot_shapes
-        .iter()
-        .any(|shape| *shape == EXACT_LIST_EXACT_INT_ITEM_SHAPE_TAG);
-    if !supports_exact_list_exact_int {
+    if let Some(plan) = opt_v3_plan {
+        return emit_exact_list_item_setitem_from_v3_plan(
+            state,
+            &arg_values,
+            &plan,
+            specialized_hit_counter_id,
+            specialized_fallback_counter_id,
+        );
+    }
+
+    if !legacy_exact_list_exact_int_selected(&legacy_hot_shapes) {
         let result = emit_generic_setitem_from_arg_values(state, &arg_values);
         state.release_arg_values(&arg_values);
         return state.finish_owned_result(result);
@@ -349,6 +357,42 @@ fn emit_generic_setitem_from_arg_values<'fb>(
         &[arg_values[0].0, arg_values[1].0, arg_values[2].0],
     );
     state.fb().inst_results(call_inst)[0]
+}
+
+fn emit_exact_list_item_getitem_from_v3_plan<'fb>(
+    state: &mut impl OperationEmitState<'fb, InstrCodegen>,
+    arg_values: &[(ir::Value, bool)],
+    plan: &OptV3ExactListItemAccessPlan,
+    specialized_hit_counter_id: Option<CounterId>,
+    specialized_fallback_counter_id: Option<CounterId>,
+) -> ir::Value {
+    plan.expect_lowering_shape(ExactListItemAccessKind::Get);
+    match plan.shape {
+        ExactListItemShape::ExactListExactInt => emit_exact_list_exact_int_getitem(
+            state,
+            arg_values,
+            specialized_hit_counter_id,
+            specialized_fallback_counter_id,
+        ),
+    }
+}
+
+fn emit_exact_list_item_setitem_from_v3_plan<'fb>(
+    state: &mut impl OperationEmitState<'fb, InstrCodegen>,
+    arg_values: &[(ir::Value, bool)],
+    plan: &OptV3ExactListItemAccessPlan,
+    specialized_hit_counter_id: Option<CounterId>,
+    specialized_fallback_counter_id: Option<CounterId>,
+) -> ir::Value {
+    plan.expect_lowering_shape(ExactListItemAccessKind::Set);
+    match plan.shape {
+        ExactListItemShape::ExactListExactInt => emit_exact_list_exact_int_setitem(
+            state,
+            arg_values,
+            specialized_hit_counter_id,
+            specialized_fallback_counter_id,
+        ),
+    }
 }
 
 fn emit_exact_list_exact_int_getitem<'fb>(

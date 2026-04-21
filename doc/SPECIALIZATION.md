@@ -795,8 +795,9 @@ than by legacy `mod.opt` shape decisions. The v3 plan records the lowered
 `GetItem`/`SetItem` source, access kind, exact-list/exact-int shape, explicit
 exact-list/exact-compact-int in-bounds guard, and original item-access fallback.
 The current JIT still uses the existing inline list load/store emitter for the
-selected shape; the v3 artifact is the source of truth for whether that emitter
-is enabled.
+selected shape. In v3 mode the emitted exact-list item node is consumed
+directly; legacy replayed item-shape maps are only used when no v3 artifact is
+loaded.
 
 ### Exact-List `GetItem`
 
@@ -816,8 +817,9 @@ is enabled.
   `PyObject_GetItem` path.
 - With `getitem_hot_shapes` counters, profile/verify mode records the dispatch
   shape after evaluating operands, then uses the generic path unless a replayed
-  hot shape selected the specialized arm. In v3 mode that replayed shape comes
-  from the validated exact-list item emission in `mod.optv3`.
+  hot shape selected the specialized arm. In v3 mode, the validated
+  exact-list item emission in `mod.optv3` selects the specialized arm directly
+  rather than being converted back into a replayed hot shape.
 - The first specialized arm guards:
   - the object is exactly `PyList_Type`
   - the index object is exactly `PyLong_Type`
@@ -869,8 +871,9 @@ is enabled.
   `PyObject_SetItem` helper path.
 - With `setitem_hot_shapes` counters, profile/verify mode records the dispatch
   shape after evaluating operands, then uses the generic path unless a replayed
-  hot shape selected the specialized arm. In v3 mode that replayed shape comes
-  from the validated exact-list item emission in `mod.optv3`.
+  hot shape selected the specialized arm. In v3 mode, the validated
+  exact-list item emission in `mod.optv3` selects the specialized arm directly
+  rather than being converted back into a replayed hot shape.
 - The specialized arm guards:
   - the object is exactly `PyList_Type`
   - the index object is exactly `PyLong_Type`

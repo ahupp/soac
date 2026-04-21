@@ -166,9 +166,10 @@ Partially migrated families are also intentionally visible:
   mechanical exact-list item emissions with explicit exact-list/exact-compact-int
   in-bounds guard and original item-access fallback effects. The JIT validates
   emitted access kind against lowered `GetItem`/`SetItem` sites and consumes the
-  v3 entry as the item-specialization input. The final inline list load/store
-  lowering still lives in the existing operation-specialization emitter rather
-  than a v3-specific operation node.
+  v3 entry directly as the item-specialization input, without translating it
+  through legacy hot-shape maps. The final inline list load/store lowering still
+  lives in the existing operation-specialization emitter rather than a
+  v3-specific operation node.
 
 Remaining scalar cleanup:
 
