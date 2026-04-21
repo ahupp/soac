@@ -65,19 +65,19 @@ legacy optimization decisions.
 
 Implemented:
 
-- `soac-opt::optimization_plan_v3`: full plan schema, conversion
+- `soac-opt::plan_v3`: full plan schema, conversion
   signatures, operation signatures, replay-safety validation, and structural
   validation. Function plans also carry validated `scalar_threads` sidecars
   that name cross-region scalar-local rewrites without asking codegen to
   rediscover them.
-- `soac-opt::optimization_alternatives_v3`: default catalog entries for
+- `soac-opt::alternatives_v3`: default catalog entries for
   generic Python add/sub/mul/bitwise/all-rich-compare, exact compact-int
   add/sub/mul/bitwise/all-rich-compare, truthiness, and materialization.
-- `soac-opt::optimization_region_v3`: conservative branch/return region
+- `soac-opt::region_v3`: conservative branch/return region
   extraction that preserves evaluation order, records store targets and simple
   jump continuations for store-RHS regions, and declines unsupported blocks
   explicitly.
-- `soac-opt::optimization_planner_v3`: bounded planner for
+- `soac-opt::planner_v3`: bounded planner for
   exact-compact-`int` direct comparison branches, `a + b > 0` branches,
   `return a + b`/`return a - b`/`return a * b` arithmetic returns,
   `return a & b`/`return a | b`/`return a ^ b` bitwise returns, and
@@ -85,12 +85,12 @@ Implemented:
   `RegionPlan`s. It also records a scalar-thread sidecar when a compact-int
   store RHS feeds the immediately following local comparison, and same-module
   profiled direct-call sidecars from `call_hot_targets`.
-- `soac-opt::optimization_emit_v3`: validation-gated mechanical
+- `soac-opt::emit_v3`: validation-gated mechanical
   emitter over selected v3 plan nodes and exits.
-- `soac-opt::optimization_evidence_v3`: bridge from existing
+- `soac-opt::evidence_v3`: bridge from existing
   `FunctionProfileEvidence` exact-int operator shapes and lowered integer
   module constants into v3 planner facts.
-- `soac-opt::optimization_pipeline_v3`: exact-int pipeline that composes
+- `soac-opt::pipeline_v3`: exact-int pipeline that composes
   extraction, evidence, planning, validation, and mechanical emission.
 - `decide_optimizations --mode v3`: offline planner mode that reads cached
   unoptimized `mod.blockpy` plus `profile.bin`, derives v3 facts directly from
@@ -652,7 +652,7 @@ not change generated code.
 
 Deliverable:
 
-- A new optimizer-plan module, for example `soac-jit/src/optimization_plan_v3.rs`
+- A new optimizer-plan module, for example `soac-opt/src/plan_v3.rs`
   or a new shared crate module if the existing crate boundaries make that
   cleaner.
 - Data types for:
@@ -785,7 +785,7 @@ merge-conflict risk. Each workstream should own a narrow file set.
 
 Ownership:
 
-- `soac-jit/src/optimization_plan_v3.rs`
+- `soac-opt/src/plan_v3.rs`
 - module export wiring
 - unit tests colocated with the new module
 
@@ -803,7 +803,7 @@ Conflict risk:
 
 Ownership:
 
-- a new file such as `soac-jit/src/optimization_alternatives.rs`
+- a new file such as `soac-opt/src/alternatives_v3.rs`
 - catalog-only tests
 
 Output:
@@ -840,7 +840,7 @@ Conflict risk:
 
 Ownership:
 
-- a new file such as `soac-jit/src/optimization_planner_v3.rs`
+- a new file such as `soac-opt/src/planner_v3.rs`
 - tests that use hand-built regions and the alternative catalog
 
 Output:

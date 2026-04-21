@@ -1,5 +1,5 @@
-use crate::optimization_emit_v3::MechanicalModuleEmission;
-use crate::optimization_plan_v3::ModuleOptimizationPlanV3;
+use crate::emit_v3::MechanicalModuleEmission;
+use crate::plan_v3::ModuleOptimizationPlanV3;
 use anyhow::{Context, Result, anyhow, bail};
 use std::fs::{self, File};
 use std::io::Write;

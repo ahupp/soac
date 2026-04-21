@@ -1,7 +1,7 @@
 use crate::operator_specialization::{ExactTypeTag, unpack_binary_shape};
-use crate::optimization_plan::FunctionProfileEvidence;
-use crate::optimization_planner_v3::PlannerFacts;
-use crate::optimization_region_v3::{ExtractedRegion, ExtractedValueId, ExtractedValueKind};
+use crate::plan::FunctionProfileEvidence;
+use crate::planner_v3::PlannerFacts;
+use crate::region_v3::{ExtractedRegion, ExtractedValueId, ExtractedValueKind};
 use soac_core::block_py::NameLocation;
 use soac_lowering::block_py::{Literal, NumberLiteralValue};
 use soac_lowering::passes::InstrResolved;
@@ -89,17 +89,17 @@ fn has_exact_int_binary_shape(shapes: &[u64]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::alternatives_v3::AlternativeCatalog;
     use crate::operator_specialization::{ExactTypeTag, pack_binary_shape};
-    use crate::optimization_alternatives_v3::AlternativeCatalog;
-    use crate::optimization_plan::FunctionProfileEvidence;
-    use crate::optimization_plan_v3::{
+    use crate::plan::FunctionProfileEvidence;
+    use crate::plan_v3::{
         FunctionPlanIdentity, ModulePlanIdentity, RegionId, validate_module_plan_v3,
     };
-    use crate::optimization_planner_v3::{
+    use crate::planner_v3::{
         ExtractedRegionPlanRequest, FunctionPlanRequest, ModulePlanRequest,
         plan_module_optimization_v3,
     };
-    use crate::optimization_region_v3::extract_block_region_v3;
+    use crate::region_v3::extract_block_region_v3;
     use soac_core::block_py::{
         BinOp, BinOpKind, Block, BlockLabel, BlockParam, BlockPyName, BlockTerm, InstrId, Load,
         LocalFunctionId, LocalLocation, Meta, NameLocation, ResolvedName, SerializedFunctionId,
@@ -218,7 +218,7 @@ mod tests {
     fn plan_with(
         region: ExtractedRegion,
         facts: PlannerFacts,
-    ) -> crate::optimization_plan_v3::ModuleOptimizationPlanV3 {
+    ) -> crate::plan_v3::ModuleOptimizationPlanV3 {
         plan_module_optimization_v3(
             &AlternativeCatalog::default_v3(),
             ModulePlanRequest {

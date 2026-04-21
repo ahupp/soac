@@ -30,17 +30,15 @@ mod tests {
         PythonModuleCacheSource, module_optimization_plan_path, module_optimization_plan_v3_path,
     };
     use soac_lowering::passes::{TypedInstrExtra, TypedPlannedResult as PlannedResult};
-    use soac_opt::optimization_alternatives_v3::AlternativeCatalog;
-    use soac_opt::optimization_artifacts_v3::{
-        ExactIntBranchV3Artifacts, write_optimization_artifacts_v3,
-    };
-    use soac_opt::optimization_pipeline_v3::plan_and_emit_function_exact_int_branches_v3_with_module_constants;
-    use soac_opt::optimization_plan::{
+    use soac_opt::alternatives_v3::AlternativeCatalog;
+    use soac_opt::artifacts_v3::{ExactIntBranchV3Artifacts, write_optimization_artifacts_v3};
+    use soac_opt::pipeline_v3::plan_and_emit_function_exact_int_branches_v3_with_module_constants;
+    use soac_opt::plan::{
         FunctionOptimizationPlan, FunctionProfileEvidence, OptimizationDecision, OptimizationPlan,
         PlannedAction, PlannedAlternative, PlannedFallback, PlannedFunctionTarget, PlannedGuard,
         PlannedIndexedFieldSpecialization, PlannedReplacement, PlannedTypeKey, ShapeFamily,
     };
-    use soac_opt::optimization_plan_v3::{
+    use soac_opt::plan_v3::{
         DirectCallSpecializationPlan, FunctionPlanIdentity, ModulePlanIdentity,
     };
     use soac_profile::{
@@ -3081,7 +3079,7 @@ def build(values):
                 },
                 helper_catalog_version: 1,
                 cost_model_version: 1,
-                functions: vec![soac_opt::optimization_plan_v3::FunctionOptimizationPlanV3 {
+                functions: vec![soac_opt::plan_v3::FunctionOptimizationPlanV3 {
                     function: FunctionPlanIdentity {
                         function: serialized_function,
                         debug_name: Some(function.names.qualname.clone()),
@@ -3090,13 +3088,13 @@ def build(values):
                     scalar_threads: Vec::new(),
                     direct_calls: Vec::new(),
                     deopt_points: Vec::new(),
-                    ownership: soac_opt::optimization_plan_v3::FunctionOwnershipPlan::default(),
+                    ownership: soac_opt::plan_v3::FunctionOwnershipPlan::default(),
                     diagnostics: Vec::new(),
                 }],
             },
             emission: MechanicalModuleEmission {
                 module_name: module_name.to_string(),
-                functions: vec![soac_opt::optimization_emit_v3::MechanicalFunctionEmission {
+                functions: vec![soac_opt::emit_v3::MechanicalFunctionEmission {
                     function: serialized_function,
                     debug_name: Some(function.names.qualname.clone()),
                     regions: Vec::new(),
@@ -16562,7 +16560,7 @@ def f(x):
                 },
                 helper_catalog_version: 1,
                 cost_model_version: 1,
-                functions: vec![soac_opt::optimization_plan_v3::FunctionOptimizationPlanV3 {
+                functions: vec![soac_opt::plan_v3::FunctionOptimizationPlanV3 {
                     function: FunctionPlanIdentity {
                         function: serialized_function,
                         debug_name: Some(function.names.qualname.clone()),
@@ -16571,13 +16569,13 @@ def f(x):
                     scalar_threads: Vec::new(),
                     direct_calls: Vec::new(),
                     deopt_points: Vec::new(),
-                    ownership: soac_opt::optimization_plan_v3::FunctionOwnershipPlan::default(),
+                    ownership: soac_opt::plan_v3::FunctionOwnershipPlan::default(),
                     diagnostics: Vec::new(),
                 }],
             },
             emission: MechanicalModuleEmission {
                 module_name: "test".to_string(),
-                functions: vec![soac_opt::optimization_emit_v3::MechanicalFunctionEmission {
+                functions: vec![soac_opt::emit_v3::MechanicalFunctionEmission {
                     function: serialized_function,
                     debug_name: Some(function.names.qualname.clone()),
                     regions: Vec::new(),
@@ -16625,7 +16623,7 @@ def f(x):
                 },
                 helper_catalog_version: 1,
                 cost_model_version: 1,
-                functions: vec![soac_opt::optimization_plan_v3::FunctionOptimizationPlanV3 {
+                functions: vec![soac_opt::plan_v3::FunctionOptimizationPlanV3 {
                     function: FunctionPlanIdentity {
                         function: serialized_caller,
                         debug_name: Some("caller".to_string()),
@@ -16638,13 +16636,13 @@ def f(x):
                         reason: "profiled direct call".to_string(),
                     }],
                     deopt_points: Vec::new(),
-                    ownership: soac_opt::optimization_plan_v3::FunctionOwnershipPlan::default(),
+                    ownership: soac_opt::plan_v3::FunctionOwnershipPlan::default(),
                     diagnostics: Vec::new(),
                 }],
             },
             emission: MechanicalModuleEmission {
                 module_name: "test".to_string(),
-                functions: vec![soac_opt::optimization_emit_v3::MechanicalFunctionEmission {
+                functions: vec![soac_opt::emit_v3::MechanicalFunctionEmission {
                     function: serialized_caller,
                     debug_name: Some("caller".to_string()),
                     regions: Vec::new(),

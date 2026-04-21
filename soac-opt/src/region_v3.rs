@@ -1,4 +1,4 @@
-use crate::optimization_plan_v3::RegionId;
+use crate::plan_v3::RegionId;
 use soac_core::block_py::{
     BinOpKind, Block, BlockLabel, BlockPyFunction, BlockTerm, HasSemanticInstrId, InstrId, Load,
     ResolvedName, TermIf, UnaryOpKind,

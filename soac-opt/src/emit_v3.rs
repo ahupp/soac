@@ -1,4 +1,4 @@
-use crate::optimization_plan_v3::{
+use crate::plan_v3::{
     ConversionKind, DeoptPointId, FailureMode, GuardFailure, GuardKind, MaterializeKind,
     ModuleOptimizationPlanV3, OperationNode, PlanNodeId, PlanNodeKind, PlanValidationError,
     PlanValue, PlannedConstant, PlannedOp, RegionExitKind, RegionExitTarget, RegionId,
@@ -66,13 +66,13 @@ pub enum MechanicalStepOp {
         output: PlanValue,
     },
     Fallback {
-        target: crate::optimization_plan_v3::FallbackTarget,
+        target: crate::plan_v3::FallbackTarget,
     },
     Deopt {
         target: DeoptPointId,
     },
     Ownership {
-        action: crate::optimization_plan_v3::OwnershipAction,
+        action: crate::plan_v3::OwnershipAction,
     },
 }
 
@@ -260,7 +260,7 @@ fn emit_exit_kind(kind: &RegionExitKind) -> MechanicalExitKind {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::optimization_plan_v3::{
+    use crate::plan_v3::{
         Cost, FunctionOptimizationPlanV3, FunctionOwnershipPlan, FunctionPlanIdentity,
         MaterializeNode, ModulePlanIdentity, RegionExitPlan, RegionInput, RegionPlan, RegionSource,
         Rep,
@@ -273,7 +273,7 @@ mod tests {
         let sum = PlanValue::new(2, Rep::I64);
         let result = PlanValue::new(3, Rep::PyObjectOwned);
         let mut nodes = vec![
-            crate::optimization_plan_v3::PlanNode {
+            crate::plan_v3::PlanNode {
                 id: PlanNodeId(0),
                 source: None,
                 kind: PlanNodeKind::Constant {
@@ -281,7 +281,7 @@ mod tests {
                     constant: PlannedConstant::I64(1),
                 },
             },
-            crate::optimization_plan_v3::PlanNode {
+            crate::plan_v3::PlanNode {
                 id: PlanNodeId(1),
                 source: None,
                 kind: PlanNodeKind::Constant {
@@ -289,24 +289,23 @@ mod tests {
                     constant: PlannedConstant::I64(2),
                 },
             },
-            crate::optimization_plan_v3::PlanNode {
+            crate::plan_v3::PlanNode {
                 id: PlanNodeId(2),
                 source: None,
                 kind: PlanNodeKind::Operation(OperationNode {
                     op: PlannedOp::CheckedI64Add,
                     inputs: vec![lhs, rhs],
                     output: Some(sum),
-                    failure_replay:
-                        crate::optimization_plan_v3::FailureReplayPolicy::local_fallback(
-                            "overflow would use a local fallback in a real plan",
-                        ),
+                    failure_replay: crate::plan_v3::FailureReplayPolicy::local_fallback(
+                        "overflow would use a local fallback in a real plan",
+                    ),
                     failure: FailureMode::CannotFail,
                     cost: Cost::default(),
                 }),
             },
         ];
         let return_value = if include_materialization {
-            nodes.push(crate::optimization_plan_v3::PlanNode {
+            nodes.push(crate::plan_v3::PlanNode {
                 id: PlanNodeId(3),
                 source: None,
                 kind: PlanNodeKind::Materialize(MaterializeNode {

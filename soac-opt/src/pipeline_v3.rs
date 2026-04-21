@@ -1,23 +1,19 @@
-use crate::optimization_alternatives_v3::AlternativeCatalog;
-use crate::optimization_artifacts_v3::{
-    ExactIntBranchV3Artifacts, write_optimization_artifacts_v3,
-};
-use crate::optimization_emit_v3::{MechanicalEmitError, emit_mechanical_plan_v3};
-use crate::optimization_evidence_v3::{
+use crate::alternatives_v3::AlternativeCatalog;
+use crate::artifacts_v3::{ExactIntBranchV3Artifacts, write_optimization_artifacts_v3};
+use crate::emit_v3::{MechanicalEmitError, emit_mechanical_plan_v3};
+use crate::evidence_v3::{
     PlannerFactHints, planner_fact_hints_from_module_constants_v3,
     planner_facts_from_profile_evidence_v3,
 };
-use crate::optimization_plan::{
+use crate::plan::{
     CachedModuleOptimizationInput, FunctionProfileEvidence, ModuleOptimizationPlanReport,
     OptimizationPlanGenerationSummary, ProfileEvidenceStore, cached_module_paths_under_root,
 };
-use crate::optimization_plan_v3::{
-    FunctionPlanIdentity, ModulePlanIdentity, PlanDiagnostic, RegionId,
-};
-use crate::optimization_planner_v3::{
+use crate::plan_v3::{FunctionPlanIdentity, ModulePlanIdentity, PlanDiagnostic, RegionId};
+use crate::planner_v3::{
     ExtractedRegionPlanRequest, FunctionPlanRequest, ModulePlanRequest, plan_module_optimization_v3,
 };
-use crate::optimization_region_v3::{
+use crate::region_v3::{
     RegionExtractionAttempt, RegionExtractionError, extract_function_regions_v3,
 };
 use anyhow::{Context, Result, anyhow, bail};
@@ -346,8 +342,8 @@ fn counter_evidence_matches_cached_module_v3(
 mod tests {
     use super::*;
     use crate::operator_specialization::{ExactTypeTag, pack_binary_shape};
-    use crate::optimization_plan_v3::{RegionId, validate_module_plan_v3};
-    use crate::optimization_region_v3::{ExtractedValueId, extract_block_region_v3};
+    use crate::plan_v3::{RegionId, validate_module_plan_v3};
+    use crate::region_v3::{ExtractedValueId, extract_block_region_v3};
     use soac_core::block_py::{
         BinOp, BinOpKind, Block, BlockLabel, BlockParam, BlockPyName, BlockTerm, InstrId, Load,
         LocalFunctionId, LocalLocation, Meta, NameLocation, ResolvedName, RuntimeFunctionId,

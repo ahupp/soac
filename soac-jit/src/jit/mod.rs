@@ -74,20 +74,18 @@ use soac_lowering::passes::{
     validate_codegen_instr_ids, validate_typed_function_call_access_plans,
     validate_typed_function_value_facts,
 };
-use soac_opt::optimization_artifacts_v3::{
-    ExactIntBranchV3Artifacts, load_optimization_artifacts_v3,
-};
-use soac_opt::optimization_emit_v3::{
+use soac_opt::artifacts_v3::{ExactIntBranchV3Artifacts, load_optimization_artifacts_v3};
+use soac_opt::emit_v3::{
     MechanicalExitKind, MechanicalModuleEmission, MechanicalOperation, MechanicalRegionEmission,
     MechanicalStepOp,
 };
 #[cfg(test)]
-use soac_opt::optimization_plan::ProfileEvidenceStore;
-use soac_opt::optimization_plan::{
+use soac_opt::plan::ProfileEvidenceStore;
+use soac_opt::plan::{
     FunctionProfileEvidence, OptimizationPlan, PlannedIndexedFieldSpecialization,
     load_optimization_plan,
 };
-use soac_opt::optimization_plan_v3::{
+use soac_opt::plan_v3::{
     ConversionKind, FailureMode, FallbackTarget, FunctionOptimizationPlanV3, GuardFailure,
     GuardKind, MaterializeKind, ModuleOptimizationPlanV3, PlanNodeId, PlanValue, PlannedConstant,
     RegionExitTarget, RegionId, RegionInputSource, RegionPlan, Rep, RichCompareOp,
