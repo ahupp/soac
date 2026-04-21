@@ -349,7 +349,10 @@ impl BlockPyFormatter {
                 then_label,
                 else_label,
             }) => {
-                self.line(format!("if_term {}:", render_inline_expr(test, self.config)));
+                self.line(format!(
+                    "if_term {}:",
+                    render_inline_expr(test, self.config)
+                ));
                 self.with_indent(|this| {
                     this.line("then:");
                     this.with_indent(|this| {
@@ -396,10 +399,9 @@ impl BlockPyFormatter {
                 branch.default_label,
             )),
             BlockTerm::Raise(raise_stmt) => self.write_raise(raise_stmt),
-            BlockTerm::Return(value) => self.line(format!(
-                "return {}",
-                render_inline_expr(value, self.config)
-            )),
+            BlockTerm::Return(value) => {
+                self.line(format!("return {}", render_inline_expr(value, self.config)))
+            }
         }
     }
 
