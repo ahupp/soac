@@ -22307,6 +22307,123 @@ def f(x, y):
     }
 
     #[test]
+    fn v3_direct_call_store_rewrite_feeds_blockpy_inliner_without_legacy_evidence() {
+        let module_name = "v3_store_call_inline_plan_test";
+        let module_name_gen = ModuleNameGen::new(0);
+        let mut callee_function = test_function_in_module(&module_name_gen, "callee");
+        callee_function.params.params.push(Param {
+            name: "x".into(),
+            kind: ParamKind::Any,
+            has_default: false,
+        });
+        callee_function = with_single_test_block(
+            callee_function,
+            vec![],
+            ret_term(name_expr(test_local_name("x", 0))),
+        );
+        set_stack_slots(&mut callee_function, &["x"]);
+
+        let mut caller_function = test_function_in_module(&module_name_gen, "caller");
+        caller_function.params.params.extend([
+            Param {
+                name: "fn".into(),
+                kind: ParamKind::Any,
+                has_default: false,
+            },
+            Param {
+                name: "x".into(),
+                kind: ParamKind::Any,
+                has_default: false,
+            },
+        ]);
+        let caller_block_label = caller_function.name_gen.next_block_name();
+        let call_instr_id = InstrId::new(caller_block_label, 1);
+        caller_function = with_test_blocks(
+            caller_function,
+            vec![CodegenBlock {
+                label: caller_block_label,
+                body: vec![assign_stmt(
+                    test_local_name("y", 2),
+                    with_instr_id(
+                        op_expr(Call::new(
+                            name_expr(test_local_name("fn", 0)),
+                            vec![CallArgPositional::Positional(name_expr(test_local_name(
+                                "x", 1,
+                            )))],
+                            Vec::<CallArgKeyword<InstrCodegen>>::new(),
+                        )),
+                        call_instr_id,
+                    ),
+                )],
+                term: ret_term(name_expr(test_local_name("y", 2))),
+                params: vec![],
+                exc_edge: None,
+            }],
+        );
+        set_stack_slots(&mut caller_function, &["fn", "x", "y"]);
+        let module = test_module(
+            module_name_gen,
+            vec![callee_function.clone(), caller_function.clone()],
+        );
+        let v3_guard = TypedDirectFunctionCallGuard {
+            function_id: callee_function.function_id,
+            arg_plan: TypedDirectCallArgPlan {
+                sources: vec![TypedDirectCallArgSource::Provided(0)],
+            },
+        };
+        let profile = SpecializationProfile {
+            module_name: Some(module_name),
+            counter_dump_path: None,
+            planned_evidence: HashMap::new(),
+            opt_v3_emitted_direct_function_guards: HashMap::from([(
+                caller_function.function_id,
+                HashMap::from([(call_instr_id, vec![v3_guard])]),
+            )]),
+            opt_v3_emitted_exact_list_items: HashMap::new(),
+            opt_v3_emitted_indexed_fields: HashMap::new(),
+            opt_v3_emitted_indexed_globals: HashMap::new(),
+            opt_v3_exact_int_branch_artifacts: HashMap::new(),
+            behavior_change_indexed_stores: false,
+            profiled_cold_blocks: false,
+            guard_miss_deopt: false,
+        };
+        assert!(
+            profile
+                .call_target_specializations(caller_function.function_id)
+                .unwrap()
+                .is_empty(),
+            "v3 direct-call module rewrite should not depend on legacy profile evidence"
+        );
+        let plan = build_profiled_jit_module_plan(&module, &profile, None, None, &HashMap::new())
+            .expect("v3-profiled JIT module plan should build");
+        let planned_caller = plan
+            .module
+            .callable_defs
+            .iter()
+            .find(|function| function.function_id == caller_function.function_id)
+            .expect("planned module should keep caller");
+
+        assert!(
+            planned_caller.blocks.iter().any(|block| {
+                matches!(
+                    &block.term,
+                    BlockTerm::IfTerm(term)
+                        if matches!(term.test, InstrCodegen::DirectFunctionIdGuardTest(_))
+                )
+            }),
+            "v3 direct-call rewrite should keep the function-id guard explicit"
+        );
+        assert!(
+            !planned_caller
+                .blocks
+                .iter()
+                .flat_map(|block| &block.body)
+                .any(|instr| matches!(instr, InstrCodegen::Store(store) if matches!(store.value.as_ref(), InstrCodegen::CallDirect(_)))),
+            "v3 hot CallDirect store should be consumed by the BlockPy inliner"
+        );
+    }
+
+    #[test]
     fn profiled_no_arg_method_store_rewrite_uses_receiver_guard_and_inlines_target() {
         let module_name = "profiled_method_call_inline_plan_test";
         let module_name_gen = ModuleNameGen::new(0);

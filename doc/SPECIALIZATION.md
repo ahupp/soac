@@ -491,12 +491,14 @@ full guarded call blocks today.
   Method and constructor-shaped targets, including `__init__`, are left as
   generic calls here so the typed method/constructor specialization path can
   still handle them.
-- In apply/verify mode with an existing profile dump, JIT module planning clones
-  the lowered codegen module, applies this rewrite, runs the normal BlockPy
-  direct-call inliner / scalar-replacement cleanup on the rewritten CFG, then
-  recomputes value facts, LocalEnv planning, refcount ownership, and deopt
-  resume planning from the rewritten module. Codegen and runtime deopt tables
-  therefore see the same CFG.
+- In apply/verify mode, JIT module planning clones the lowered codegen module,
+  applies this rewrite from either explicit legacy call-target evidence or v3
+  mechanical direct-call emissions, runs the normal BlockPy direct-call inliner
+  / scalar-replacement cleanup on the rewritten CFG, then recomputes value
+  facts, LocalEnv planning, refcount ownership, and deopt resume planning from
+  the rewritten module. Codegen and runtime deopt tables therefore see the same
+  CFG. V3 direct-call emissions are consumed directly as rewrite inputs rather
+  than being converted back into legacy `FunctionProfileEvidence`.
 - JIT codegen has a direct boolean lowering for `IfTerm` tests that are
   `DirectFunctionIdGuardTest`, so the guard does not round-trip through Python
   truthiness. The deopt interpreter also supports the guard expression for

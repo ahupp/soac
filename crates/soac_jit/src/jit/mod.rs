@@ -2023,49 +2023,53 @@ fn build_profiled_jit_module_plan(
     for function in &mut planned_module.callable_defs {
         let call_target_specializations =
             profile.call_target_specializations(function.function_id)?;
-        if call_target_specializations.is_empty() {
+        let direct_call_rewrite_targets =
+            profile.direct_call_rewrite_targets(function.function_id)?;
+        if call_target_specializations.is_empty() && direct_call_rewrite_targets.is_empty() {
             continue;
         }
         let direct_owner_attr_specializations = direct_owner_attr_specializations_by_function
             .get(&function.function_id)
             .unwrap_or(&empty_direct_owner_attr_specializations);
-        let stats = rewrite_profiled_no_arg_method_call_store_sites(
-            function,
-            module_constants,
-            &call_target_specializations,
-            direct_owner_attr_specializations,
-            &inline_callees,
-            &straightline_constructor_ids,
-            &mut runtime_constructor_function_ids,
-        );
-        if stats.total_attempts() != 0 {
-            info!(
-                target: "soac_jit_profiled_method_inline",
-                module_id = planned_module_id,
-                function_id = %function.function_id,
-                qualname = %function.names.qualname,
-                candidate_stores = stats.candidate_stores,
-                missing_callee_targets = stats.missing_callee_targets,
-                missing_owner_guard_targets = stats.missing_owner_guard_targets,
-                owner_fragment_unsupported_targets = stats.owner_fragment_unsupported_targets,
-                callable_fragment_unsupported_targets = stats.callable_fragment_unsupported_targets,
-                stop_iteration_candidate_exc_edges = stats.stop_iteration_candidate_exc_edges,
-                stop_iteration_current_exception_edges = stats.stop_iteration_current_exception_edges,
-                stop_iteration_handler_blocks = stats.stop_iteration_handler_blocks,
-                stop_iteration_handler_if_terms = stats.stop_iteration_handler_if_terms,
-                stop_iteration_handler_test_matches = stats.stop_iteration_handler_test_matches,
-                stop_iteration_handler_targets = stats.stop_iteration_handler_targets,
-                stop_iteration_raises_rewritten = stats.stop_iteration_raises_rewritten,
-                static_runtime_constructor_calls_rewritten =
-                    stats.static_runtime_constructor_calls_rewritten,
-                rewritten_stores = stats.rewritten_stores,
-                "soac_jit_profiled_method_inline"
+        if !call_target_specializations.is_empty() {
+            let stats = rewrite_profiled_no_arg_method_call_store_sites(
+                function,
+                module_constants,
+                &call_target_specializations,
+                direct_owner_attr_specializations,
+                &inline_callees,
+                &straightline_constructor_ids,
+                &mut runtime_constructor_function_ids,
             );
+            if stats.total_attempts() != 0 {
+                info!(
+                    target: "soac_jit_profiled_method_inline",
+                    module_id = planned_module_id,
+                    function_id = %function.function_id,
+                    qualname = %function.names.qualname,
+                    candidate_stores = stats.candidate_stores,
+                    missing_callee_targets = stats.missing_callee_targets,
+                    missing_owner_guard_targets = stats.missing_owner_guard_targets,
+                    owner_fragment_unsupported_targets = stats.owner_fragment_unsupported_targets,
+                    callable_fragment_unsupported_targets = stats.callable_fragment_unsupported_targets,
+                    stop_iteration_candidate_exc_edges = stats.stop_iteration_candidate_exc_edges,
+                    stop_iteration_current_exception_edges = stats.stop_iteration_current_exception_edges,
+                    stop_iteration_handler_blocks = stats.stop_iteration_handler_blocks,
+                    stop_iteration_handler_if_terms = stats.stop_iteration_handler_if_terms,
+                    stop_iteration_handler_test_matches = stats.stop_iteration_handler_test_matches,
+                    stop_iteration_handler_targets = stats.stop_iteration_handler_targets,
+                    stop_iteration_raises_rewritten = stats.stop_iteration_raises_rewritten,
+                    static_runtime_constructor_calls_rewritten =
+                        stats.static_runtime_constructor_calls_rewritten,
+                    rewritten_stores = stats.rewritten_stores,
+                    "soac_jit_profiled_method_inline"
+                );
+            }
+            rewritten_store_count += stats.rewritten_stores;
         }
-        rewritten_store_count += stats.rewritten_stores;
         let stats = rewrite_profiled_function_call_store_sites(
             function,
-            &call_target_specializations,
+            &direct_call_rewrite_targets,
             &callees,
         );
         if stats.rewritten_stores != 0
@@ -2193,14 +2197,16 @@ fn build_profiled_inline_callee_maps(
     let mut target_ids = HashSet::new();
     let mut external_inline_plan = InlinePlanModule::default();
     for function in &module.callable_defs {
-        let call_target_specializations =
-            profile.call_target_specializations(function.function_id)?;
-        for targets in call_target_specializations.values() {
+        let direct_call_rewrite_targets =
+            profile.direct_call_rewrite_targets(function.function_id)?;
+        for targets in direct_call_rewrite_targets.values() {
             target_ids.extend(targets.iter().copied());
         }
         if let Some(direct_owner_attr_specializations) =
             direct_owner_attr_specializations_by_function.get(&function.function_id)
         {
+            let call_target_specializations =
+                profile.call_target_specializations(function.function_id)?;
             target_ids.extend(collect_runtime_iter_method_target_ids(
                 function,
                 module.module_constants.as_slice(),
@@ -2253,8 +2259,8 @@ fn build_profiled_inline_callee_maps(
                 shared_state.lowered_module.module_constants.clone(),
             ),
         );
-        let call_target_specializations = profile.call_target_specializations(function_id)?;
-        for targets in call_target_specializations.values() {
+        let direct_call_rewrite_targets = profile.direct_call_rewrite_targets(function_id)?;
+        for targets in direct_call_rewrite_targets.values() {
             for target_id in targets {
                 if target_ids.insert(*target_id) {
                     pending_target_ids.push_back(*target_id);
@@ -2273,8 +2279,8 @@ fn specialize_profiled_inline_callees(
 ) -> Result<(), String> {
     let function_ids = inline_callees.keys().copied().collect::<Vec<_>>();
     for function_id in function_ids {
-        let call_target_specializations = profile.call_target_specializations(function_id)?;
-        if call_target_specializations.is_empty() {
+        let direct_call_rewrite_targets = profile.direct_call_rewrite_targets(function_id)?;
+        if direct_call_rewrite_targets.is_empty() {
             continue;
         }
         let Some(inline_callee) = inline_callees.get(&function_id).cloned() else {
@@ -2283,7 +2289,7 @@ fn specialize_profiled_inline_callees(
         let mut function = inline_callee.function().clone();
         let stats = rewrite_profiled_function_call_store_sites_with_constructor_targets(
             &mut function,
-            &call_target_specializations,
+            &direct_call_rewrite_targets,
             callee_functions,
             true,
         );
@@ -14816,6 +14822,18 @@ impl<'a> SpecializationProfile<'a> {
             .get(&function_id)
             .map(direct_function_guard_targets)
             .unwrap_or_default()
+    }
+
+    fn direct_call_rewrite_targets(
+        &self,
+        function_id: RuntimeFunctionId,
+    ) -> Result<HashMap<InstrId, Vec<RuntimeFunctionId>>, String> {
+        let legacy_targets = self.call_target_specializations(function_id)?;
+        let v3_targets = self.v3_direct_function_call_targets(function_id);
+        Ok(merge_call_target_specializations(
+            legacy_targets,
+            v3_targets,
+        ))
     }
 
     fn codegen_direct_function_call_guards(
