@@ -85,9 +85,9 @@ use soac_lowering::passes::{
 };
 use soac_opt::artifacts_v3::{ExactIntBranchV3Artifacts, load_optimization_artifacts_v3};
 use soac_opt::emit_v3::{
-    MechanicalExitKind, MechanicalFunctionEmission, MechanicalIndexedFieldEmission,
-    MechanicalIndexedGlobalEmission, MechanicalModuleEmission, MechanicalOperation,
-    MechanicalRegionEmission, MechanicalStepOp,
+    MechanicalExactListItemEmission, MechanicalExitKind, MechanicalFunctionEmission,
+    MechanicalIndexedFieldEmission, MechanicalIndexedGlobalEmission, MechanicalModuleEmission,
+    MechanicalOperation, MechanicalRegionEmission, MechanicalStepOp,
 };
 #[cfg(test)]
 use soac_opt::plan::ProfileEvidenceStore;
@@ -97,7 +97,11 @@ use soac_opt::plan::{
 };
 use soac_opt::plan_v3::{
     ConversionKind, DirectCallArgPlan as PlanV3DirectCallArgPlan,
-    DirectCallArgSource as PlanV3DirectCallArgSource, FailureMode, FallbackTarget,
+    DirectCallArgSource as PlanV3DirectCallArgSource,
+    ExactListItemAccessKind as PlanV3ExactListItemAccessKind,
+    ExactListItemFallbackKind as PlanV3ExactListItemFallbackKind,
+    ExactListItemGuardKind as PlanV3ExactListItemGuardKind,
+    ExactListItemShape as PlanV3ExactListItemShape, FailureMode, FallbackTarget,
     FunctionOptimizationPlanV3, GuardFailure, GuardKind,
     IndexedFieldAccessKind as PlanV3IndexedFieldAccessKind,
     IndexedFieldOwnerType as PlanV3IndexedFieldOwnerType,
@@ -8295,6 +8299,8 @@ struct JitEmitCtx<'mc> {
     setitem_specializations: &'mc HashMap<InstrId, Vec<u64>>,
     setitem_specialized_hit_counter_ids: &'mc HashMap<InstrId, CounterId>,
     setitem_specialized_fallback_counter_ids: &'mc HashMap<InstrId, CounterId>,
+    opt_v3_exact_list_items_by_instr: &'mc HashMap<InstrId, OptV3ExactListItemAccessPlan>,
+    allow_legacy_item_specializations: bool,
     branch_outcome_counter_ids: &'mc HashMap<InstrId, CounterId>,
     branch_prefer_true: &'mc HashMap<InstrId, bool>,
     global_indexed_hit_counter_ids: &'mc HashMap<InstrId, CounterId>,
@@ -9153,6 +9159,46 @@ impl FieldIndexSpecialization {
             owner_type_ref: typed_attr_owner_ref_from_reloc_type_ref(&self.owner_type_ref),
             type_version: self.type_version,
         }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OptV3ExactListItemAccessPlan {
+    source: InstrId,
+    access: PlanV3ExactListItemAccessKind,
+    shape: PlanV3ExactListItemShape,
+    guard: PlanV3ExactListItemGuardKind,
+    fallback: PlanV3ExactListItemFallbackKind,
+}
+
+impl OptV3ExactListItemAccessPlan {
+    fn expect_lowering_shape(&self, expected_access: PlanV3ExactListItemAccessKind) {
+        assert_eq!(
+            self.access, expected_access,
+            "optimizer v3 exact-list item {:?} reached {:?} lowering for {}",
+            self.access, expected_access, self.source
+        );
+        assert_eq!(
+            self.shape,
+            PlanV3ExactListItemShape::ExactListExactInt,
+            "optimizer v3 exact-list item {} has unsupported shape {:?}",
+            self.source,
+            self.shape
+        );
+        assert_eq!(
+            self.guard,
+            PlanV3ExactListItemGuardKind::ExactListExactCompactIntInBounds,
+            "optimizer v3 exact-list item {} has unsupported guard {:?}",
+            self.source,
+            self.guard
+        );
+        assert_eq!(
+            self.fallback,
+            PlanV3ExactListItemFallbackKind::OriginalItemAccess,
+            "optimizer v3 exact-list item {} has unsupported fallback {:?}",
+            self.source,
+            self.fallback
+        );
     }
 }
 
@@ -13294,6 +13340,8 @@ struct SpecializationProfile<'a> {
     planned_evidence: HashMap<RuntimeFunctionId, FunctionProfileEvidence>,
     opt_v3_emitted_direct_function_guards:
         HashMap<RuntimeFunctionId, HashMap<InstrId, Vec<TypedDirectFunctionCallGuard>>>,
+    opt_v3_emitted_exact_list_items:
+        HashMap<RuntimeFunctionId, HashMap<InstrId, OptV3ExactListItemAccessPlan>>,
     opt_v3_emitted_indexed_fields:
         HashMap<RuntimeFunctionId, HashMap<InstrId, Vec<OptV3IndexedFieldAccessPlan>>>,
     opt_v3_emitted_indexed_globals:
@@ -13310,6 +13358,8 @@ struct PlannedOptimizationInputs {
     evidence_by_function: HashMap<RuntimeFunctionId, FunctionProfileEvidence>,
     opt_v3_emitted_direct_function_guards:
         HashMap<RuntimeFunctionId, HashMap<InstrId, Vec<TypedDirectFunctionCallGuard>>>,
+    opt_v3_emitted_exact_list_items:
+        HashMap<RuntimeFunctionId, HashMap<InstrId, OptV3ExactListItemAccessPlan>>,
     opt_v3_emitted_indexed_fields:
         HashMap<RuntimeFunctionId, HashMap<InstrId, Vec<OptV3IndexedFieldAccessPlan>>>,
     opt_v3_emitted_indexed_globals:
@@ -13326,6 +13376,7 @@ impl PlannedOptimizationInputs {
         Self {
             evidence_by_function,
             opt_v3_emitted_direct_function_guards: HashMap::new(),
+            opt_v3_emitted_exact_list_items: HashMap::new(),
             opt_v3_emitted_indexed_fields: HashMap::new(),
             opt_v3_emitted_indexed_globals: HashMap::new(),
             opt_v3_exact_int_branch_artifacts: HashMap::new(),
@@ -13389,6 +13440,7 @@ struct FunctionSpecializationInputs {
     operator_specializations: HashMap<InstrId, Vec<u64>>,
     getitem_specializations: HashMap<InstrId, Vec<u64>>,
     setitem_specializations: HashMap<InstrId, Vec<u64>>,
+    opt_v3_exact_list_items_by_instr: HashMap<InstrId, OptV3ExactListItemAccessPlan>,
     field_index_specializations: HashMap<String, Vec<FieldIndexSpecialization>>,
     field_index_specializations_by_instr: HashMap<InstrId, Vec<FieldIndexSpecialization>>,
     opt_v3_indexed_fields_by_instr: HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>,
@@ -13397,6 +13449,7 @@ struct FunctionSpecializationInputs {
     cold_block_labels: HashSet<BlockLabel>,
     opt_v3_exact_int_branch_artifacts: Option<Arc<ExactIntBranchV3Artifacts>>,
     allow_legacy_indexed_globals: bool,
+    allow_legacy_item_specializations: bool,
     behavior_change_indexed_stores: bool,
     guard_miss_deopt_stub: bool,
 }
@@ -13581,6 +13634,13 @@ fn planned_optimization_inputs_from_v3_artifacts(
                 .opt_v3_emitted_direct_function_guards
                 .insert(current_function_id, guards);
         }
+        if let Some(items) =
+            opt_v3_emitted_exact_list_items_for_function(&function_artifacts, current_function)?
+        {
+            inputs
+                .opt_v3_emitted_exact_list_items
+                .insert(current_function_id, items);
+        }
         if let Some(indexed_fields) =
             opt_v3_emitted_indexed_fields_for_function(&function_artifacts)
         {
@@ -13651,6 +13711,13 @@ fn planned_optimization_inputs_from_v3_artifacts_for_codegen_module(
                 .opt_v3_emitted_direct_function_guards
                 .insert(current_function_id, guards);
         }
+        if let Some(items) =
+            opt_v3_emitted_exact_list_items_for_function(&function_artifacts, current_function)?
+        {
+            inputs
+                .opt_v3_emitted_exact_list_items
+                .insert(current_function_id, items);
+        }
         if let Some(indexed_fields) =
             opt_v3_emitted_indexed_fields_for_function(&function_artifacts)
         {
@@ -13699,6 +13766,137 @@ fn opt_v3_indexed_field_access_plan_from_emission(
         owner_type: indexed_field.owner_type.clone(),
         attr_name: indexed_field.attr_name.clone(),
         expected_index: indexed_field.expected_index,
+    }
+}
+
+fn opt_v3_emitted_exact_list_items_for_function(
+    artifacts: &ExactIntBranchV3Artifacts,
+    function: &BlockPyFunction<CodegenModuleShape>,
+) -> Result<Option<HashMap<InstrId, OptV3ExactListItemAccessPlan>>, String> {
+    let emitted_function = &artifacts.emission.functions[0];
+    if emitted_function.exact_list_items.is_empty() {
+        return Ok(None);
+    }
+
+    let lowered_accesses = lowered_item_accesses_by_instr(function);
+    let mut by_source = HashMap::<InstrId, OptV3ExactListItemAccessPlan>::new();
+    for item in &emitted_function.exact_list_items {
+        validate_opt_v3_exact_list_item_emission_for_lowered_function(
+            item,
+            function,
+            &lowered_accesses,
+        )?;
+        let access = opt_v3_exact_list_item_access_plan_from_emission(item);
+        if let Some(previous) = by_source.insert(item.source, access.clone())
+            && previous != access
+        {
+            return Err(format!(
+                "optimizer v3 emitted multiple exact-list item plans for {}",
+                item.source
+            ));
+        }
+    }
+    Ok(Some(by_source))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LoweredItemAccess {
+    access: PlanV3ExactListItemAccessKind,
+}
+
+fn lowered_item_accesses_by_instr(
+    function: &BlockPyFunction<CodegenModuleShape>,
+) -> HashMap<InstrId, LoweredItemAccess> {
+    struct Collector {
+        accesses: HashMap<InstrId, LoweredItemAccess>,
+    }
+
+    impl Visit<InstrCodegen> for Collector {
+        fn visit_instr(&mut self, expr: &InstrCodegen)
+        where
+            InstrCodegen: ChildVisitable<InstrCodegen>,
+        {
+            match expr {
+                InstrCodegen::GetItem(op) => {
+                    self.accesses.insert(
+                        op.semantic_instr_id(),
+                        LoweredItemAccess {
+                            access: PlanV3ExactListItemAccessKind::Get,
+                        },
+                    );
+                }
+                InstrCodegen::SetItem(op) => {
+                    self.accesses.insert(
+                        op.semantic_instr_id(),
+                        LoweredItemAccess {
+                            access: PlanV3ExactListItemAccessKind::Set,
+                        },
+                    );
+                }
+                _ => {}
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    let mut collector = Collector {
+        accesses: HashMap::new(),
+    };
+    collector.visit_fn(function);
+    collector.accesses
+}
+
+fn validate_opt_v3_exact_list_item_emission_for_lowered_function(
+    emitted: &MechanicalExactListItemEmission,
+    function: &BlockPyFunction<CodegenModuleShape>,
+    lowered_accesses: &HashMap<InstrId, LoweredItemAccess>,
+) -> Result<(), String> {
+    let Some(lowered) = lowered_accesses.get(&emitted.source) else {
+        return Err(format!(
+            "optimizer v3 emitted exact-list item {:?} {:?} at {}, but function {} ({}) has no lowered getitem/setitem with that source",
+            emitted.access,
+            emitted.shape,
+            emitted.source,
+            function.function_id,
+            function.names.qualname
+        ));
+    };
+    if lowered.access != emitted.access {
+        return Err(format!(
+            "optimizer v3 emitted exact-list item {:?} for {}, but lowered instruction is {:?}",
+            emitted.access, emitted.source, lowered.access
+        ));
+    }
+    if emitted.shape != PlanV3ExactListItemShape::ExactListExactInt {
+        return Err(format!(
+            "optimizer v3 emitted exact-list item shape {:?} for {}, but codegen only supports ExactListExactInt",
+            emitted.shape, emitted.source
+        ));
+    }
+    if emitted.guard.kind != PlanV3ExactListItemGuardKind::ExactListExactCompactIntInBounds {
+        return Err(format!(
+            "optimizer v3 emitted exact-list item guard {:?} for {}, but codegen only supports ExactListExactCompactIntInBounds",
+            emitted.guard.kind, emitted.source
+        ));
+    }
+    if emitted.fallback.kind != PlanV3ExactListItemFallbackKind::OriginalItemAccess {
+        return Err(format!(
+            "optimizer v3 emitted exact-list item fallback {:?} for {}, but codegen only supports OriginalItemAccess",
+            emitted.fallback.kind, emitted.source
+        ));
+    }
+    Ok(())
+}
+
+fn opt_v3_exact_list_item_access_plan_from_emission(
+    item: &MechanicalExactListItemEmission,
+) -> OptV3ExactListItemAccessPlan {
+    OptV3ExactListItemAccessPlan {
+        source: item.source,
+        access: item.access,
+        shape: item.shape,
+        guard: item.guard.kind,
+        fallback: item.fallback.kind,
     }
 }
 
@@ -14288,6 +14486,10 @@ fn validate_opt_v3_codegen_artifacts_for_function(
         &artifacts.plan.functions[0],
         &artifacts.emission.functions[0],
     )?;
+    validate_opt_v3_exact_list_item_emission_matches_plan(
+        &artifacts.plan.functions[0],
+        &artifacts.emission.functions[0],
+    )?;
     validate_opt_v3_indexed_field_emission_matches_plan(
         &artifacts.plan.functions[0],
         &artifacts.emission.functions[0],
@@ -14324,6 +14526,40 @@ fn validate_opt_v3_direct_call_emission_matches_plan(
         {
             return Err(format!(
                 "optimizer v3 emitted direct-call #{index} for function {} does not match the selected plan",
+                planned_function.function.function
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_opt_v3_exact_list_item_emission_matches_plan(
+    planned_function: &FunctionOptimizationPlanV3,
+    emitted_function: &MechanicalFunctionEmission,
+) -> Result<(), String> {
+    if planned_function.exact_list_items.len() != emitted_function.exact_list_items.len() {
+        return Err(format!(
+            "optimizer v3 artifacts for function {} contain {} planned exact-list items but {} emitted exact-list items",
+            planned_function.function.function,
+            planned_function.exact_list_items.len(),
+            emitted_function.exact_list_items.len()
+        ));
+    }
+    for (index, (planned, emitted)) in planned_function
+        .exact_list_items
+        .iter()
+        .zip(emitted_function.exact_list_items.iter())
+        .enumerate()
+    {
+        if planned.source != emitted.source
+            || planned.access != emitted.access
+            || planned.shape != emitted.shape
+            || planned.guard != emitted.guard
+            || planned.fallback != emitted.fallback
+            || planned.reason != emitted.reason
+        {
+            return Err(format!(
+                "optimizer v3 emitted exact-list item #{index} for function {} does not match the selected plan",
                 planned_function.function.function
             ));
         }
@@ -14464,6 +14700,11 @@ impl FunctionSpecializationInputs {
             operator_specializations: profile.operator_specializations(function.function_id)?,
             getitem_specializations: profile.getitem_specializations(function.function_id)?,
             setitem_specializations: profile.setitem_specializations(function.function_id)?,
+            opt_v3_exact_list_items_by_instr: profile
+                .opt_v3_emitted_exact_list_items
+                .get(&function.function_id)
+                .cloned()
+                .unwrap_or_default(),
             field_index_specializations,
             field_index_specializations_by_instr,
             opt_v3_indexed_fields_by_instr,
@@ -14479,6 +14720,7 @@ impl FunctionSpecializationInputs {
                 .get(&function.function_id)
                 .cloned(),
             allow_legacy_indexed_globals: !profile.loaded_opt_v3_plan,
+            allow_legacy_item_specializations: !profile.loaded_opt_v3_plan,
             behavior_change_indexed_stores: profile.behavior_change_indexed_stores
                 && function.scope.scope_kind != CallableScopeKind::Module,
             guard_miss_deopt_stub: profile.guard_miss_deopt
@@ -14513,6 +14755,7 @@ impl<'a> SpecializationProfile<'a> {
             planned_evidence: planned_inputs.evidence_by_function,
             opt_v3_emitted_direct_function_guards: planned_inputs
                 .opt_v3_emitted_direct_function_guards,
+            opt_v3_emitted_exact_list_items: planned_inputs.opt_v3_emitted_exact_list_items,
             opt_v3_emitted_indexed_fields: planned_inputs.opt_v3_emitted_indexed_fields,
             opt_v3_emitted_indexed_globals: planned_inputs.opt_v3_emitted_indexed_globals,
             opt_v3_exact_int_branch_artifacts: planned_inputs.opt_v3_exact_int_branch_artifacts,
@@ -14539,6 +14782,7 @@ impl<'a> SpecializationProfile<'a> {
             planned_evidence: planned_inputs.evidence_by_function,
             opt_v3_emitted_direct_function_guards: planned_inputs
                 .opt_v3_emitted_direct_function_guards,
+            opt_v3_emitted_exact_list_items: planned_inputs.opt_v3_emitted_exact_list_items,
             opt_v3_emitted_indexed_fields: planned_inputs.opt_v3_emitted_indexed_fields,
             opt_v3_emitted_indexed_globals: planned_inputs.opt_v3_emitted_indexed_globals,
             opt_v3_exact_int_branch_artifacts: planned_inputs.opt_v3_exact_int_branch_artifacts,
@@ -14557,6 +14801,7 @@ impl<'a> SpecializationProfile<'a> {
     fn has_specialization_inputs(&self) -> bool {
         !self.planned_evidence.is_empty()
             || !self.opt_v3_emitted_direct_function_guards.is_empty()
+            || !self.opt_v3_emitted_exact_list_items.is_empty()
             || !self.opt_v3_emitted_indexed_fields.is_empty()
             || !self.opt_v3_emitted_indexed_globals.is_empty()
             || !self.opt_v3_exact_int_branch_artifacts.is_empty()
@@ -29421,6 +29666,7 @@ fn build_cranelift_run_bb_specialized_function(
     let operator_specializations = specialization_inputs.operator_specializations;
     let getitem_specializations = specialization_inputs.getitem_specializations;
     let setitem_specializations = specialization_inputs.setitem_specializations;
+    let opt_v3_exact_list_items_by_instr = specialization_inputs.opt_v3_exact_list_items_by_instr;
     let field_index_specializations = specialization_inputs.field_index_specializations;
     let field_index_specializations_by_instr =
         specialization_inputs.field_index_specializations_by_instr;
@@ -29435,6 +29681,7 @@ fn build_cranelift_run_bb_specialized_function(
     )?;
     let behavior_change_indexed_stores = specialization_inputs.behavior_change_indexed_stores;
     let allow_legacy_indexed_globals = specialization_inputs.allow_legacy_indexed_globals;
+    let allow_legacy_item_specializations = specialization_inputs.allow_legacy_item_specializations;
     let guard_miss_deopt_stub = specialization_inputs.guard_miss_deopt_stub;
     let function_runtime_data_layout = FunctionRuntimeDataLayout::from_function(function);
     let true_constant_id = module_constants.require_runtime_name_constant_id("TRUE");
@@ -30127,6 +30374,8 @@ fn build_cranelift_run_bb_specialized_function(
                 setitem_specializations: &setitem_specializations,
                 setitem_specialized_hit_counter_ids: &setitem_specialized_hit_counter_ids,
                 setitem_specialized_fallback_counter_ids: &setitem_specialized_fallback_counter_ids,
+                opt_v3_exact_list_items_by_instr: &opt_v3_exact_list_items_by_instr,
+                allow_legacy_item_specializations,
                 global_indexed_hit_counter_ids: &global_indexed_hit_counter_ids,
                 global_indexed_fallback_counter_ids: &global_indexed_fallback_counter_ids,
                 opt_v3_indexed_globals_by_instr: &opt_v3_indexed_globals_by_instr,

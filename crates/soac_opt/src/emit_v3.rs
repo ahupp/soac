@@ -1,11 +1,12 @@
 use crate::plan_v3::{
-    ConversionKind, DeoptPointId, DirectCallArgPlan, DirectCallSpecializationPlan, FailureMode,
-    GuardFailure, GuardKind, IndexedFieldAccessKind, IndexedFieldOwnerType,
-    IndexedFieldSpecializationPlan, IndexedGlobalAccessKind, IndexedGlobalFallbackPlan,
-    IndexedGlobalGuardPlan, IndexedGlobalSpecializationPlan, MaterializeKind,
-    ModuleOptimizationPlanV3, OperationNode, PlanNodeId, PlanNodeKind, PlanValidationError,
-    PlanValue, PlannedConstant, PlannedOp, RegionExitKind, RegionExitTarget, RegionId,
-    RichCompareOp, validate_module_plan_v3,
+    ConversionKind, DeoptPointId, DirectCallArgPlan, DirectCallSpecializationPlan,
+    ExactListItemAccessKind, ExactListItemFallbackPlan, ExactListItemGuardPlan, ExactListItemShape,
+    ExactListItemSpecializationPlan, FailureMode, GuardFailure, GuardKind, IndexedFieldAccessKind,
+    IndexedFieldOwnerType, IndexedFieldSpecializationPlan, IndexedGlobalAccessKind,
+    IndexedGlobalFallbackPlan, IndexedGlobalGuardPlan, IndexedGlobalSpecializationPlan,
+    MaterializeKind, ModuleOptimizationPlanV3, OperationNode, PlanNodeId, PlanNodeKind,
+    PlanValidationError, PlanValue, PlannedConstant, PlannedOp, RegionExitKind, RegionExitTarget,
+    RegionId, RichCompareOp, validate_module_plan_v3,
 };
 use soac_core::block_py::{InstrId, SerializedFunctionId};
 use std::fmt;
@@ -21,6 +22,7 @@ pub struct MechanicalFunctionEmission {
     pub function: SerializedFunctionId,
     pub debug_name: Option<String>,
     pub direct_calls: Vec<MechanicalDirectCallEmission>,
+    pub exact_list_items: Vec<MechanicalExactListItemEmission>,
     pub indexed_fields: Vec<MechanicalIndexedFieldEmission>,
     pub indexed_globals: Vec<MechanicalIndexedGlobalEmission>,
     pub regions: Vec<MechanicalRegionEmission>,
@@ -31,6 +33,16 @@ pub struct MechanicalDirectCallEmission {
     pub source: InstrId,
     pub target: SerializedFunctionId,
     pub arg_plan: DirectCallArgPlan,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct MechanicalExactListItemEmission {
+    pub source: InstrId,
+    pub access: ExactListItemAccessKind,
+    pub shape: ExactListItemShape,
+    pub guard: ExactListItemGuardPlan,
+    pub fallback: ExactListItemFallbackPlan,
     pub reason: String,
 }
 
@@ -204,6 +216,11 @@ pub fn emit_mechanical_plan_v3(
                 function: function.function.function,
                 debug_name: function.function.debug_name.clone(),
                 direct_calls: function.direct_calls.iter().map(emit_direct_call).collect(),
+                exact_list_items: function
+                    .exact_list_items
+                    .iter()
+                    .map(emit_exact_list_item)
+                    .collect(),
                 indexed_fields: function
                     .indexed_fields
                     .iter()
@@ -249,6 +266,17 @@ fn emit_direct_call(direct_call: &DirectCallSpecializationPlan) -> MechanicalDir
         target: direct_call.target,
         arg_plan: direct_call.arg_plan.clone(),
         reason: direct_call.reason.clone(),
+    }
+}
+
+fn emit_exact_list_item(item: &ExactListItemSpecializationPlan) -> MechanicalExactListItemEmission {
+    MechanicalExactListItemEmission {
+        source: item.source,
+        access: item.access,
+        shape: item.shape,
+        guard: item.guard.clone(),
+        fallback: item.fallback.clone(),
+        reason: item.reason.clone(),
     }
 }
 
@@ -345,8 +373,11 @@ fn emit_exit_kind(kind: &RegionExitKind) -> MechanicalExitKind {
 mod tests {
     use super::*;
     use crate::plan_v3::{
-        Cost, DirectCallArgPlan, DirectCallArgSource, DirectCallSpecializationPlan, FallbackReason,
-        FallbackTarget, FunctionOptimizationPlanV3, FunctionOwnershipPlan, FunctionPlanIdentity,
+        Cost, DirectCallArgPlan, DirectCallArgSource, DirectCallSpecializationPlan,
+        ExactListItemAccessKind, ExactListItemFallbackKind, ExactListItemFallbackPlan,
+        ExactListItemGuardKind, ExactListItemGuardPlan, ExactListItemShape,
+        ExactListItemSpecializationPlan, FallbackReason, FallbackTarget,
+        FunctionOptimizationPlanV3, FunctionOwnershipPlan, FunctionPlanIdentity,
         IndexedFieldAccessKind, IndexedFieldOwnerType, IndexedFieldSpecializationPlan,
         MaterializeNode, ModulePlanIdentity, RegionExitPlan, RegionInput, RegionPlan, RegionSource,
         Rep,
@@ -474,6 +505,7 @@ mod tests {
                 ],
                 scalar_threads: Vec::new(),
                 direct_calls: Vec::new(),
+                exact_list_items: Vec::new(),
                 indexed_fields: Vec::new(),
                 indexed_globals: Vec::new(),
                 deopt_points: Vec::new(),
@@ -544,6 +576,63 @@ mod tests {
                 },
                 reason: "profiled call_hot_targets selected this same-module function".to_string(),
             }]
+        );
+    }
+
+    #[test]
+    fn emits_exact_list_item_decisions_mechanically() {
+        let mut plan = test_plan(true);
+        let get_source = InstrId::new(BlockLabel::from_index(0), 7);
+        let set_source = InstrId::new(BlockLabel::from_index(0), 9);
+        let guard = ExactListItemGuardPlan {
+            kind: ExactListItemGuardKind::ExactListExactCompactIntInBounds,
+        };
+        let fallback = ExactListItemFallbackPlan {
+            kind: ExactListItemFallbackKind::OriginalItemAccess,
+        };
+        plan.functions[0]
+            .exact_list_items
+            .push(ExactListItemSpecializationPlan {
+                source: get_source,
+                access: ExactListItemAccessKind::Get,
+                shape: ExactListItemShape::ExactListExactInt,
+                guard: guard.clone(),
+                fallback: fallback.clone(),
+                reason: "profiled getitem_hot_shapes selected exact-list/exact-int".to_string(),
+            });
+        plan.functions[0]
+            .exact_list_items
+            .push(ExactListItemSpecializationPlan {
+                source: set_source,
+                access: ExactListItemAccessKind::Set,
+                shape: ExactListItemShape::ExactListExactInt,
+                guard: guard.clone(),
+                fallback: fallback.clone(),
+                reason: "profiled setitem_hot_shapes selected exact-list/exact-int".to_string(),
+            });
+
+        let emission = emit_mechanical_plan_v3(&plan).unwrap();
+
+        assert_eq!(
+            emission.functions[0].exact_list_items,
+            vec![
+                MechanicalExactListItemEmission {
+                    source: get_source,
+                    access: ExactListItemAccessKind::Get,
+                    shape: ExactListItemShape::ExactListExactInt,
+                    guard: guard.clone(),
+                    fallback: fallback.clone(),
+                    reason: "profiled getitem_hot_shapes selected exact-list/exact-int".to_string(),
+                },
+                MechanicalExactListItemEmission {
+                    source: set_source,
+                    access: ExactListItemAccessKind::Set,
+                    shape: ExactListItemShape::ExactListExactInt,
+                    guard,
+                    fallback,
+                    reason: "profiled setitem_hot_shapes selected exact-list/exact-int".to_string(),
+                },
+            ]
         );
     }
 

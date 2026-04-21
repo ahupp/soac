@@ -3,17 +3,19 @@ use crate::alternatives_v3::{
 };
 use crate::plan_v3::{
     ConversionKind, ConversionOwnership, ConversionPrecondition, ConvertNode, Cost,
-    DirectCallArgPlan, DirectCallSpecializationPlan, FailureMode, FallbackReason, FallbackTarget,
-    FunctionOptimizationPlanV3, FunctionOwnershipPlan, FunctionPlanIdentity,
-    IndexedFieldAccessKind, IndexedFieldOwnerType, IndexedFieldSpecializationPlan,
-    IndexedGlobalAccessKind, IndexedGlobalFallbackKind, IndexedGlobalFallbackPlan,
-    IndexedGlobalGuardKind, IndexedGlobalGuardPlan, IndexedGlobalSpecializationPlan,
-    MaterializeKind, MaterializeNode, ModuleOptimizationPlanV3, ModulePlanIdentity, OperationNode,
-    PlanDiagnostic, PlanNode, PlanNodeId, PlanNodeKind, PlanValue, PlannedConstant, RegionExitKind,
-    RegionExitPlan, RegionExitTarget, RegionId, RegionInput, RegionInputSource, RegionPlan,
-    RegionSource, RegionValueRef, Rep, ScalarLocalThreadPlan, ScalarThreadFallback,
-    ScalarThreadLocal, ScalarThreadLocalCleanup, ScalarThreadLocalLocation, ScalarThreadLocalState,
-    ScalarThreadMaterialization,
+    DirectCallArgPlan, DirectCallSpecializationPlan, ExactListItemAccessKind,
+    ExactListItemFallbackKind, ExactListItemFallbackPlan, ExactListItemGuardKind,
+    ExactListItemGuardPlan, ExactListItemShape, ExactListItemSpecializationPlan, FailureMode,
+    FallbackReason, FallbackTarget, FunctionOptimizationPlanV3, FunctionOwnershipPlan,
+    FunctionPlanIdentity, IndexedFieldAccessKind, IndexedFieldOwnerType,
+    IndexedFieldSpecializationPlan, IndexedGlobalAccessKind, IndexedGlobalFallbackKind,
+    IndexedGlobalFallbackPlan, IndexedGlobalGuardKind, IndexedGlobalGuardPlan,
+    IndexedGlobalSpecializationPlan, MaterializeKind, MaterializeNode, ModuleOptimizationPlanV3,
+    ModulePlanIdentity, OperationNode, PlanDiagnostic, PlanNode, PlanNodeId, PlanNodeKind,
+    PlanValue, PlannedConstant, RegionExitKind, RegionExitPlan, RegionExitTarget, RegionId,
+    RegionInput, RegionInputSource, RegionPlan, RegionSource, RegionValueRef, Rep,
+    ScalarLocalThreadPlan, ScalarThreadFallback, ScalarThreadLocal, ScalarThreadLocalCleanup,
+    ScalarThreadLocalLocation, ScalarThreadLocalState, ScalarThreadMaterialization,
 };
 use crate::region_v3::{
     ExtractedExit, ExtractedRegion, ExtractedValue, ExtractedValueId, ExtractedValueKind,
@@ -34,6 +36,7 @@ pub struct FunctionPlanRequest {
     pub function: FunctionPlanIdentity,
     pub regions: Vec<ExtractedRegionPlanRequest>,
     pub direct_calls: Vec<DirectCallPlanRequest>,
+    pub exact_list_items: Vec<ExactListItemPlanRequest>,
     pub indexed_fields: Vec<IndexedFieldPlanRequest>,
     pub indexed_globals: Vec<IndexedGlobalPlanRequest>,
 }
@@ -43,6 +46,14 @@ pub struct DirectCallPlanRequest {
     pub source: InstrId,
     pub target: SerializedFunctionId,
     pub arg_plan: DirectCallArgPlan,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExactListItemPlanRequest {
+    pub source: InstrId,
+    pub access: ExactListItemAccessKind,
+    pub shape: ExactListItemShape,
     pub reason: String,
 }
 
@@ -118,6 +129,7 @@ pub fn plan_function_optimization_v3(
 ) -> FunctionOptimizationPlanV3 {
     let region_requests = request.regions;
     let direct_calls = plan_direct_call_specializations_v3(&request.direct_calls);
+    let exact_list_items = plan_exact_list_item_specializations_v3(&request.exact_list_items);
     let indexed_fields = plan_indexed_field_specializations_v3(&request.indexed_fields);
     let indexed_globals = plan_indexed_global_specializations_v3(&request.indexed_globals);
     let mut function = FunctionOptimizationPlanV3 {
@@ -125,6 +137,7 @@ pub fn plan_function_optimization_v3(
         regions: Vec::new(),
         scalar_threads: Vec::new(),
         direct_calls,
+        exact_list_items,
         indexed_fields,
         indexed_globals,
         deopt_points: Vec::new(),
@@ -164,6 +177,32 @@ fn plan_direct_call_specializations_v3(
                 source: request.source,
                 target: request.target,
                 arg_plan: request.arg_plan.clone(),
+                reason: request.reason.clone(),
+            });
+        }
+    }
+    plans
+}
+
+fn plan_exact_list_item_specializations_v3(
+    item_requests: &[ExactListItemPlanRequest],
+) -> Vec<ExactListItemSpecializationPlan> {
+    let mut entries = item_requests.iter().collect::<Vec<_>>();
+    entries.sort_by_key(|request| (request.source, request.access, request.shape));
+    let mut seen = HashSet::new();
+    let mut plans = Vec::new();
+    for request in entries {
+        if seen.insert((request.source, request.access, request.shape)) {
+            plans.push(ExactListItemSpecializationPlan {
+                source: request.source,
+                access: request.access,
+                shape: request.shape,
+                guard: ExactListItemGuardPlan {
+                    kind: ExactListItemGuardKind::ExactListExactCompactIntInBounds,
+                },
+                fallback: ExactListItemFallbackPlan {
+                    kind: ExactListItemFallbackKind::OriginalItemAccess,
+                },
                 reason: request.reason.clone(),
             });
         }
@@ -1651,6 +1690,7 @@ mod tests {
                 },
                 regions,
                 direct_calls: Vec::new(),
+                exact_list_items: Vec::new(),
                 indexed_fields: Vec::new(),
                 indexed_globals: Vec::new(),
             }],
@@ -1695,6 +1735,49 @@ mod tests {
             }
         );
         assert!(direct_calls[0].reason.contains("call_hot_targets"));
+    }
+
+    #[test]
+    fn plans_exact_list_item_selection_from_profiled_shapes() {
+        let mut request = module_request_regions(Vec::new());
+        let get_source = InstrId::new(label(0), 9);
+        let set_source = InstrId::new(label(0), 11);
+        request.functions[0].exact_list_items = vec![
+            ExactListItemPlanRequest {
+                source: get_source,
+                access: ExactListItemAccessKind::Get,
+                shape: ExactListItemShape::ExactListExactInt,
+                reason: "profiled getitem".to_string(),
+            },
+            ExactListItemPlanRequest {
+                source: get_source,
+                access: ExactListItemAccessKind::Get,
+                shape: ExactListItemShape::ExactListExactInt,
+                reason: "profiled getitem".to_string(),
+            },
+            ExactListItemPlanRequest {
+                source: set_source,
+                access: ExactListItemAccessKind::Set,
+                shape: ExactListItemShape::ExactListExactInt,
+                reason: "profiled setitem".to_string(),
+            },
+        ];
+
+        let plan = plan_module_optimization_v3(&AlternativeCatalog::default_v3(), request);
+
+        validate_module_plan_v3(&plan).unwrap();
+        let items = &plan.functions[0].exact_list_items;
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].access, ExactListItemAccessKind::Get);
+        assert_eq!(
+            items[0].guard.kind,
+            ExactListItemGuardKind::ExactListExactCompactIntInBounds
+        );
+        assert_eq!(
+            items[0].fallback.kind,
+            ExactListItemFallbackKind::OriginalItemAccess
+        );
+        assert_eq!(items[1].access, ExactListItemAccessKind::Set);
     }
 
     #[test]

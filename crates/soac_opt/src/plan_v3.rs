@@ -2,6 +2,8 @@ use soac_core::block_py::{InstrId, SerializedFunctionId};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
+pub const EXACT_LIST_EXACT_INT_ITEM_SHAPE_TAG: u64 = 1;
+
 #[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct ModuleOptimizationPlanV3 {
     pub module: ModulePlanIdentity,
@@ -23,6 +25,7 @@ pub struct FunctionOptimizationPlanV3 {
     pub regions: Vec<RegionPlan>,
     pub scalar_threads: Vec<ScalarLocalThreadPlan>,
     pub direct_calls: Vec<DirectCallSpecializationPlan>,
+    pub exact_list_items: Vec<ExactListItemSpecializationPlan>,
     pub indexed_fields: Vec<IndexedFieldSpecializationPlan>,
     pub indexed_globals: Vec<IndexedGlobalSpecializationPlan>,
     pub deopt_points: Vec<PlannedDeoptPoint>,
@@ -53,6 +56,83 @@ pub struct DirectCallArgPlan {
 pub enum DirectCallArgSource {
     Provided(u32),
     DefaultSentinel,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct ExactListItemSpecializationPlan {
+    pub source: InstrId,
+    pub access: ExactListItemAccessKind,
+    pub shape: ExactListItemShape,
+    pub guard: ExactListItemGuardPlan,
+    pub fallback: ExactListItemFallbackPlan,
+    pub reason: String,
+}
+
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
+pub enum ExactListItemAccessKind {
+    Get,
+    Set,
+}
+
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
+pub enum ExactListItemShape {
+    ExactListExactInt,
+}
+
+impl ExactListItemShape {
+    pub const fn legacy_shape_tag(self) -> u64 {
+        match self {
+            Self::ExactListExactInt => EXACT_LIST_EXACT_INT_ITEM_SHAPE_TAG,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct ExactListItemGuardPlan {
+    pub kind: ExactListItemGuardKind,
+}
+
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
+pub enum ExactListItemGuardKind {
+    ExactListExactCompactIntInBounds,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct ExactListItemFallbackPlan {
+    pub kind: ExactListItemFallbackKind,
+}
+
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
+pub enum ExactListItemFallbackKind {
+    OriginalItemAccess,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -715,6 +795,7 @@ fn validate_function_plan(function: &FunctionOptimizationPlanV3, errors: &mut Ve
         );
     }
     validate_direct_call_plans(function, errors);
+    validate_exact_list_item_plans(function, errors);
     validate_indexed_field_plans(function, errors);
     validate_indexed_global_plans(function, errors);
     for action in &function.ownership.actions {
@@ -749,6 +830,36 @@ fn validate_direct_call_plans(function: &FunctionOptimizationPlanV3, errors: &mu
             ));
         }
         validate_direct_call_arg_plan(function, direct_call, errors);
+    }
+}
+
+fn validate_exact_list_item_plans(function: &FunctionOptimizationPlanV3, errors: &mut Vec<String>) {
+    let mut seen = HashSet::new();
+    for item in &function.exact_list_items {
+        if !seen.insert((item.source, item.access, item.shape)) {
+            errors.push(format!(
+                "function {} has duplicate exact-list item {:?} {:?} at {}",
+                function.function.function, item.access, item.shape, item.source
+            ));
+        }
+        if item.guard.kind != ExactListItemGuardKind::ExactListExactCompactIntInBounds {
+            errors.push(format!(
+                "function {} exact-list item at {} has unsupported guard {:?}",
+                function.function.function, item.source, item.guard.kind
+            ));
+        }
+        if item.fallback.kind != ExactListItemFallbackKind::OriginalItemAccess {
+            errors.push(format!(
+                "function {} exact-list item at {} has unsupported fallback {:?}",
+                function.function.function, item.source, item.fallback.kind
+            ));
+        }
+        if item.reason.is_empty() {
+            errors.push(format!(
+                "function {} exact-list item at {} has empty reason",
+                function.function.function, item.source
+            ));
+        }
     }
 }
 
@@ -1914,6 +2025,14 @@ mod tests {
         module
     }
 
+    fn module_with_exact_list_items(
+        exact_list_items: Vec<ExactListItemSpecializationPlan>,
+    ) -> ModuleOptimizationPlanV3 {
+        let mut module = module_with_regions(Vec::new());
+        module.functions[0].exact_list_items = exact_list_items;
+        module
+    }
+
     fn module_with_indexed_globals(
         indexed_globals: Vec<IndexedGlobalSpecializationPlan>,
     ) -> ModuleOptimizationPlanV3 {
@@ -1942,6 +2061,7 @@ mod tests {
                 regions,
                 scalar_threads,
                 direct_calls: Vec::new(),
+                exact_list_items: Vec::new(),
                 indexed_fields: Vec::new(),
                 indexed_globals: Vec::new(),
                 deopt_points: vec![PlannedDeoptPoint {
@@ -1990,6 +2110,44 @@ mod tests {
 
         let err = validate_module_plan_v3(&plan).unwrap_err();
         assert!(err.to_string().contains("cross-module"));
+    }
+
+    #[test]
+    fn validates_exact_list_item_selections() {
+        let plan = module_with_exact_list_items(vec![ExactListItemSpecializationPlan {
+            source: instr_id(7),
+            access: ExactListItemAccessKind::Get,
+            shape: ExactListItemShape::ExactListExactInt,
+            guard: ExactListItemGuardPlan {
+                kind: ExactListItemGuardKind::ExactListExactCompactIntInBounds,
+            },
+            fallback: ExactListItemFallbackPlan {
+                kind: ExactListItemFallbackKind::OriginalItemAccess,
+            },
+            reason: "profiled getitem_hot_shapes selected exact-list/exact-int".to_string(),
+        }]);
+
+        validate_module_plan_v3(&plan).unwrap();
+    }
+
+    #[test]
+    fn rejects_duplicate_exact_list_item_selections() {
+        let exact_list_item = ExactListItemSpecializationPlan {
+            source: instr_id(7),
+            access: ExactListItemAccessKind::Get,
+            shape: ExactListItemShape::ExactListExactInt,
+            guard: ExactListItemGuardPlan {
+                kind: ExactListItemGuardKind::ExactListExactCompactIntInBounds,
+            },
+            fallback: ExactListItemFallbackPlan {
+                kind: ExactListItemFallbackKind::OriginalItemAccess,
+            },
+            reason: "profiled getitem_hot_shapes selected exact-list/exact-int".to_string(),
+        };
+        let plan = module_with_exact_list_items(vec![exact_list_item.clone(), exact_list_item]);
+
+        let err = validate_module_plan_v3(&plan).unwrap_err();
+        assert!(err.to_string().contains("duplicate exact-list item"));
     }
 
     #[test]

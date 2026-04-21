@@ -1,13 +1,15 @@
 use super::intrinsics::{OperationEmitState, increment_counter_with_state};
-use super::{CpythonTypeSymbol, RelocTypeRef};
+use super::{CpythonTypeSymbol, OptV3ExactListItemAccessPlan, RelocTypeRef};
 use cranelift_codegen::ir;
 use cranelift_codegen::ir::InstBuilder;
 use pyo3::ffi;
 use soac_core::block_py::{CounterId, GetItem, HasSemanticInstrId, SetItem};
 use soac_lowering::passes::InstrCodegen;
+use soac_opt::plan_v3::{
+    EXACT_LIST_EXACT_INT_ITEM_SHAPE_TAG, ExactListItemAccessKind, ExactListItemShape,
+};
 use std::mem::offset_of;
 
-const ITEM_SHAPE_EXACT_LIST_EXACT_INT: u64 = 1;
 const PYLONG_COMPACT_TAG_LIMIT: i64 = 2 << 3;
 const PYLONG_SIGN_MASK: i64 = 3;
 
@@ -21,6 +23,16 @@ struct RawPyLongValue {
 struct RawPyLongObject {
     ob_base: ffi::PyObject,
     long_value: RawPyLongValue,
+}
+
+fn opt_v3_exact_list_item_hot_shapes(
+    plan: &OptV3ExactListItemAccessPlan,
+    expected_access: ExactListItemAccessKind,
+) -> Vec<u64> {
+    plan.expect_lowering_shape(expected_access);
+    match plan.shape {
+        ExactListItemShape::ExactListExactInt => vec![plan.shape.legacy_shape_tag()],
+    }
 }
 
 pub(super) fn emit_getitem<'fb>(
@@ -45,10 +57,22 @@ pub(super) fn emit_getitem<'fb>(
         .copied();
     let hot_shapes = state
         .ctx()
-        .getitem_specializations
+        .opt_v3_exact_list_items_by_instr
         .get(&instr_id)
-        .cloned()
-        .unwrap_or_default();
+        .filter(|plan| plan.access == ExactListItemAccessKind::Get)
+        .map(|plan| opt_v3_exact_list_item_hot_shapes(plan, ExactListItemAccessKind::Get))
+        .unwrap_or_else(|| {
+            if state.ctx().allow_legacy_item_specializations {
+                state
+                    .ctx()
+                    .getitem_specializations
+                    .get(&instr_id)
+                    .cloned()
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            }
+        });
     if shape_counter_id.is_none() && hot_shapes.is_empty() {
         return emit_generic_getitem_from_exprs(op, state);
     }
@@ -61,7 +85,7 @@ pub(super) fn emit_getitem<'fb>(
 
     let supports_exact_list_exact_int = hot_shapes
         .iter()
-        .any(|shape| *shape == ITEM_SHAPE_EXACT_LIST_EXACT_INT);
+        .any(|shape| *shape == EXACT_LIST_EXACT_INT_ITEM_SHAPE_TAG);
     if !supports_exact_list_exact_int {
         let result = emit_generic_getitem_from_arg_values(state, &arg_values);
         state.release_arg_values(&arg_values);
@@ -98,10 +122,22 @@ pub(super) fn emit_setitem<'fb>(
         .copied();
     let hot_shapes = state
         .ctx()
-        .setitem_specializations
+        .opt_v3_exact_list_items_by_instr
         .get(&instr_id)
-        .cloned()
-        .unwrap_or_default();
+        .filter(|plan| plan.access == ExactListItemAccessKind::Set)
+        .map(|plan| opt_v3_exact_list_item_hot_shapes(plan, ExactListItemAccessKind::Set))
+        .unwrap_or_else(|| {
+            if state.ctx().allow_legacy_item_specializations {
+                state
+                    .ctx()
+                    .setitem_specializations
+                    .get(&instr_id)
+                    .cloned()
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            }
+        });
     if shape_counter_id.is_none() && hot_shapes.is_empty() {
         return emit_generic_setitem_from_exprs(op, state);
     }
@@ -118,7 +154,7 @@ pub(super) fn emit_setitem<'fb>(
 
     let supports_exact_list_exact_int = hot_shapes
         .iter()
-        .any(|shape| *shape == ITEM_SHAPE_EXACT_LIST_EXACT_INT);
+        .any(|shape| *shape == EXACT_LIST_EXACT_INT_ITEM_SHAPE_TAG);
     if !supports_exact_list_exact_int {
         let result = emit_generic_setitem_from_arg_values(state, &arg_values);
         state.release_arg_values(&arg_values);
@@ -213,7 +249,7 @@ fn emit_item_dispatch_shape_from_arg_values<'fb>(
     let exact_list_exact_int_shape = state
         .fb()
         .ins()
-        .iconst(i64_ty, ITEM_SHAPE_EXACT_LIST_EXACT_INT as i64);
+        .iconst(i64_ty, EXACT_LIST_EXACT_INT_ITEM_SHAPE_TAG as i64);
     let result_block = state.fb().create_block();
     state.fb().append_block_param(result_block, i64_ty);
     let obj = arg_values[0].0;

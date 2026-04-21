@@ -10,12 +10,13 @@ use crate::plan::{
     OptimizationPlanGenerationSummary, ProfileEvidenceStore, cached_module_paths_under_root,
 };
 use crate::plan_v3::{
-    DirectCallArgPlan, DirectCallArgSource, FunctionPlanIdentity, IndexedFieldAccessKind,
+    DirectCallArgPlan, DirectCallArgSource, EXACT_LIST_EXACT_INT_ITEM_SHAPE_TAG,
+    ExactListItemAccessKind, ExactListItemShape, FunctionPlanIdentity, IndexedFieldAccessKind,
     IndexedFieldOwnerType, IndexedGlobalAccessKind, ModulePlanIdentity, PlanDiagnostic, RegionId,
 };
 use crate::planner_v3::{
-    DirectCallPlanRequest, ExtractedRegionPlanRequest, FunctionPlanRequest,
-    IndexedFieldPlanRequest, IndexedGlobalPlanRequest, ModulePlanRequest,
+    DirectCallPlanRequest, ExactListItemPlanRequest, ExtractedRegionPlanRequest,
+    FunctionPlanRequest, IndexedFieldPlanRequest, IndexedGlobalPlanRequest, ModulePlanRequest,
     plan_module_optimization_v3,
 };
 use crate::region_v3::{
@@ -154,6 +155,9 @@ pub fn plan_and_emit_module_v3_from_raw_evidence(
                 &evidence,
             );
         diagnostics.extend(direct_call_diagnostics);
+        let (exact_list_items, exact_list_item_diagnostics) =
+            exact_list_item_requests_from_profile_evidence_v3(function, &evidence);
+        diagnostics.extend(exact_list_item_diagnostics);
         let indexed_fields = indexed_field_requests_from_type_key_evidence_v3(
             function,
             lowered_module,
@@ -168,6 +172,7 @@ pub fn plan_and_emit_module_v3_from_raw_evidence(
             function: function_plan_identity_v3(function),
             regions: region_requests,
             direct_calls,
+            exact_list_items,
             indexed_fields,
             indexed_globals,
         });
@@ -209,6 +214,7 @@ pub fn plan_and_emit_extracted_exact_int_branches_v3(
             module,
             functions: vec![FunctionPlanRequest {
                 direct_calls: Vec::new(),
+                exact_list_items: Vec::new(),
                 indexed_fields: Vec::new(),
                 indexed_globals: Vec::new(),
                 function,
@@ -233,6 +239,88 @@ fn function_plan_identity_v3(
         ),
         debug_name: Some(function.names.qualname.clone()),
     }
+}
+
+fn exact_list_item_requests_from_profile_evidence_v3(
+    function: &BlockPyFunction<CodegenModuleShape>,
+    evidence: &FunctionProfileEvidence,
+) -> (Vec<ExactListItemPlanRequest>, Vec<PlanDiagnostic>) {
+    struct Collector<'a> {
+        evidence: &'a FunctionProfileEvidence,
+        requests: Vec<ExactListItemPlanRequest>,
+        diagnostics: Vec<PlanDiagnostic>,
+    }
+
+    impl Collector<'_> {
+        fn collect_item(
+            &mut self,
+            source: InstrId,
+            access: ExactListItemAccessKind,
+            shapes_by_instr: &HashMap<InstrId, Vec<u64>>,
+            counter_kind: &str,
+        ) {
+            let Some(shapes) = shapes_by_instr.get(&source) else {
+                return;
+            };
+            for shape in shapes {
+                match *shape {
+                    EXACT_LIST_EXACT_INT_ITEM_SHAPE_TAG => {
+                        self.requests.push(ExactListItemPlanRequest {
+                            source,
+                            access,
+                            shape: ExactListItemShape::ExactListExactInt,
+                            reason: format!(
+                                "profiled {counter_kind} selected exact-list/exact-int item specialization"
+                            ),
+                        });
+                    }
+                    0 => {}
+                    other => self.diagnostics.push(PlanDiagnostic {
+                        source: Some(source),
+                        message: format!(
+                            "v3 exact-list item declined unsupported {counter_kind} shape {other}"
+                        ),
+                    }),
+                }
+            }
+        }
+    }
+
+    impl Visit<InstrCodegen> for Collector<'_> {
+        fn visit_instr(&mut self, expr: &InstrCodegen)
+        where
+            InstrCodegen: ChildVisitable<InstrCodegen>,
+        {
+            match expr {
+                InstrCodegen::GetItem(op) => {
+                    self.collect_item(
+                        op.semantic_instr_id(),
+                        ExactListItemAccessKind::Get,
+                        &self.evidence.getitem_specializations,
+                        "getitem_hot_shapes",
+                    );
+                }
+                InstrCodegen::SetItem(op) => {
+                    self.collect_item(
+                        op.semantic_instr_id(),
+                        ExactListItemAccessKind::Set,
+                        &self.evidence.setitem_specializations,
+                        "setitem_hot_shapes",
+                    );
+                }
+                _ => {}
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    let mut collector = Collector {
+        evidence,
+        requests: Vec::new(),
+        diagnostics: Vec::new(),
+    };
+    collector.visit_fn(function);
+    (collector.requests, collector.diagnostics)
 }
 
 fn indexed_global_requests_from_module_key_evidence_v3(
@@ -734,9 +822,9 @@ mod tests {
     use crate::region_v3::{ExtractedValueId, extract_block_region_v3};
     use soac_core::block_py::{
         BinOp, BinOpKind, Block, BlockLabel, BlockParam, BlockPyName, BlockTerm, FunctionName,
-        GetAttr, InstrId, Load, LocalFunctionId, LocalLocation, Meta, ModuleNameGen, NameLocation,
-        ParamSpec, ResolvedName, RuntimeFunctionId, SerializedFunctionId, SerializedModuleId,
-        SetAttr, Store, TermIf, WithMeta,
+        GetAttr, GetItem, InstrId, Load, LocalFunctionId, LocalLocation, Meta, ModuleNameGen,
+        NameLocation, ParamSpec, ResolvedName, RuntimeFunctionId, SerializedFunctionId,
+        SerializedModuleId, SetAttr, SetItem, Store, TermIf, WithMeta,
     };
     use soac_core::profile::{
         CounterDumpKeyLayout, CounterDumpRecord, CounterDumpTypeKey, CounterDumpTypeKeyLayout,
@@ -919,6 +1007,54 @@ mod tests {
             direct_calls.is_empty(),
             "v3 direct-call planning requires the lowered call site and target signature"
         );
+    }
+
+    #[test]
+    fn exact_list_item_requests_are_derived_from_raw_shape_evidence() {
+        let get_source = InstrId::new(label(0), 5);
+        let set_source = InstrId::new(label(0), 8);
+        let block = Block::new(
+            label(0),
+            vec![
+                InstrCodegen::GetItem(GetItem::new(local("items", 0), local("index", 1)))
+                    .with_meta(Meta {
+                        instr_id: Some(get_source),
+                        ..Meta::synthetic()
+                    }),
+                InstrCodegen::SetItem(SetItem::new(
+                    local("items", 0),
+                    local("index", 1),
+                    local("value", 2),
+                ))
+                .with_meta(Meta {
+                    instr_id: Some(set_source),
+                    ..Meta::synthetic()
+                }),
+            ],
+            BlockTerm::jump_term(label(1)),
+            Vec::<BlockParam>::new(),
+            None,
+        );
+        let function = function_with_blocks(vec![block]);
+        let mut evidence = FunctionProfileEvidence::default();
+        evidence
+            .getitem_specializations
+            .insert(get_source, vec![EXACT_LIST_EXACT_INT_ITEM_SHAPE_TAG]);
+        evidence
+            .setitem_specializations
+            .insert(set_source, vec![EXACT_LIST_EXACT_INT_ITEM_SHAPE_TAG]);
+
+        let (requests, diagnostics) =
+            exact_list_item_requests_from_profile_evidence_v3(&function, &evidence);
+
+        assert!(diagnostics.is_empty());
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].source, get_source);
+        assert_eq!(requests[0].access, ExactListItemAccessKind::Get);
+        assert_eq!(requests[0].shape, ExactListItemShape::ExactListExactInt);
+        assert_eq!(requests[1].source, set_source);
+        assert_eq!(requests[1].access, ExactListItemAccessKind::Set);
+        assert_eq!(requests[1].shape, ExactListItemShape::ExactListExactInt);
     }
 
     #[test]

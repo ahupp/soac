@@ -113,6 +113,9 @@ fn format_optimization_artifacts_v3_with_options(
         let emitted_direct_calls = emitted_function
             .map(|emitted| emitted.direct_calls.len())
             .unwrap_or(0);
+        let emitted_exact_list_items = emitted_function
+            .map(|emitted| emitted.exact_list_items.len())
+            .unwrap_or(0);
         let emitted_indexed_fields = emitted_function
             .map(|emitted| emitted.indexed_fields.len())
             .unwrap_or(0);
@@ -129,12 +132,14 @@ fn format_optimization_artifacts_v3_with_options(
         ));
         out.push_str(&format!(" id={}\n", function.function.function));
         out.push_str(&format!(
-            "  regions={} emitted_regions={} scalar_threads={} direct_calls={} emitted_direct_calls={} indexed_fields={} emitted_indexed_fields={} indexed_globals={} emitted_indexed_globals={} deopt_points={} ownership_actions={} diagnostics={}\n",
+            "  regions={} emitted_regions={} scalar_threads={} direct_calls={} emitted_direct_calls={} exact_list_items={} emitted_exact_list_items={} indexed_fields={} emitted_indexed_fields={} indexed_globals={} emitted_indexed_globals={} deopt_points={} ownership_actions={} diagnostics={}\n",
             function.regions.len(),
             emitted_regions,
             function.scalar_threads.len(),
             function.direct_calls.len(),
             emitted_direct_calls,
+            function.exact_list_items.len(),
+            emitted_exact_list_items,
             function.indexed_fields.len(),
             emitted_indexed_fields,
             function.indexed_globals.len(),
@@ -180,6 +185,30 @@ fn format_optimization_artifacts_v3_with_options(
                     direct_call.target,
                     direct_call.arg_plan,
                     direct_call.reason
+                ));
+            }
+        }
+        for item in &function.exact_list_items {
+            out.push_str(&format!(
+                "  exact_list_item source={} access={:?} shape={:?} guard={:?} fallback={:?} reason={}\n",
+                item.source,
+                item.access,
+                item.shape,
+                item.guard.kind,
+                item.fallback.kind,
+                item.reason
+            ));
+        }
+        if let Some(emitted_function) = emitted_function {
+            for item in &emitted_function.exact_list_items {
+                out.push_str(&format!(
+                    "  emitted_exact_list_item source={} access={:?} shape={:?} guard={:?} fallback={:?} reason={}\n",
+                    item.source,
+                    item.access,
+                    item.shape,
+                    item.guard.kind,
+                    item.fallback.kind,
+                    item.reason
                 ));
             }
         }
@@ -329,6 +358,7 @@ mod test {
                     regions: Vec::new(),
                     scalar_threads: Vec::new(),
                     direct_calls: Vec::new(),
+                    exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
                     indexed_globals: Vec::new(),
                     deopt_points: Vec::new(),
@@ -342,6 +372,7 @@ mod test {
                     function,
                     debug_name: Some("f".to_string()),
                     direct_calls: Vec::new(),
+                    exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
                     indexed_globals: Vec::new(),
                     regions: Vec::new(),
@@ -353,7 +384,7 @@ mod test {
         assert!(formatted.contains("module pkg.mod source_hash=0x0000000000001234"));
         assert!(formatted.contains("function f"));
         assert!(formatted.contains(
-            "regions=0 emitted_regions=0 scalar_threads=0 direct_calls=0 emitted_direct_calls=0 indexed_fields=0 emitted_indexed_fields=0 indexed_globals=0 emitted_indexed_globals=0"
+            "regions=0 emitted_regions=0 scalar_threads=0 direct_calls=0 emitted_direct_calls=0 exact_list_items=0 emitted_exact_list_items=0 indexed_fields=0 emitted_indexed_fields=0 indexed_globals=0 emitted_indexed_globals=0"
         ));
     }
 }

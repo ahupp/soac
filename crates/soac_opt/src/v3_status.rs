@@ -37,8 +37,8 @@ pub const V3_OPTIMIZATION_FAMILY_STATUS: &[V3OptimizationFamilyStatus] = &[
     V3OptimizationFamilyStatus {
         family: "exact-list getitem and setitem",
         legacy_input: "getitem_hot_shapes and setitem_hot_shapes",
-        status: V3MigrationStatus::LegacyOnly,
-        next_step: "model item-operation alternatives with local fallback and mutation effects",
+        status: V3MigrationStatus::LiveCodegenInputOnly,
+        next_step: "lift exact-list getitem/setitem lowering itself into mechanical v3 nodes with explicit list effects",
     },
     V3OptimizationFamilyStatus {
         family: "indexed fields",

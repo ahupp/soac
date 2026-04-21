@@ -204,6 +204,8 @@ def _assert_v3_plan_expectation(
         "scalar_threads",
         "direct_calls",
         "emitted_direct_calls",
+        "exact_list_items",
+        "emitted_exact_list_items",
         "indexed_fields",
         "emitted_indexed_fields",
         "indexed_globals",

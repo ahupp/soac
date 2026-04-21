@@ -86,11 +86,13 @@ Implemented:
   store RHS feeds the immediately following local comparison, and same-module
   profiled direct-call selections from `call_hot_targets`. Constant-attribute
   indexed-field selections are planned from raw `type_keys` layout evidence and
-  lowered `GetAttr`/`SetAttr` sites.
+  lowered `GetAttr`/`SetAttr` sites. Exact-list item selections are planned from
+  raw `getitem_hot_shapes`/`setitem_hot_shapes` evidence and lowered
+  `GetItem`/`SetItem` sites.
 - `soac_opt::emit_v3`: validation-gated mechanical
   emitter over selected v3 plan nodes and exits. Function-level direct-call
-  selections and indexed-field selections are also emitted as mechanical
-  decisions.
+  selections, exact-list item selections, and indexed-field selections are also
+  emitted as mechanical decisions.
 - `soac_opt::evidence_v3`: bridge from existing
   `FunctionProfileEvidence` exact-int operator shapes and lowered integer
   module constants into v3 planner facts.
@@ -116,6 +118,9 @@ Implemented:
   function predeclaration, not as legacy profile evidence. Indexed-field
   decisions are also derived from mechanical `mod.optv3` emission as v3-owned
   typed-attribute inputs, with exact plan/emission validation before use.
+  Exact-list item decisions are derived from mechanical `mod.optv3` emission as
+  v3-owned item-operation inputs, with lowered `GetItem`/`SetItem` validation
+  before the existing list fast-path emitter uses them.
 - JIT term lowering now consumes matching exact-int direct-compare branch,
   add/compare branch, add/sub/mul/bitwise-return, and comparison-return
   artifacts by interpreting the mechanical hot region and its local generic
@@ -132,7 +137,6 @@ Implemented:
 Remaining legacy-only families are intentionally visible:
 
 - remaining division/modulo/shift and unary exact-int value-producing operators;
-- exact-list getitem/setitem.
 
 Partially migrated families are also intentionally visible:
 
@@ -158,6 +162,13 @@ Partially migrated families are also intentionally visible:
   indexed global load/store input. The final helper-call lowering still lives in
   the existing global load/store emitters rather than a v3-specific operation
   node.
+- exact-list getitem/setitem are represented as v3 plan selections plus
+  mechanical exact-list item emissions with explicit exact-list/exact-compact-int
+  in-bounds guard and original item-access fallback effects. The JIT validates
+  emitted access kind against lowered `GetItem`/`SetItem` sites and consumes the
+  v3 entry as the item-specialization input. The final inline list load/store
+  lowering still lives in the existing operation-specialization emitter rather
+  than a v3-specific operation node.
 
 Remaining scalar cleanup:
 
