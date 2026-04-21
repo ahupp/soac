@@ -1617,6 +1617,7 @@ mod tests {
                 scalar_threads: Vec::new(),
                 direct_calls: Vec::new(),
                 indexed_fields: Vec::new(),
+                indexed_globals: Vec::new(),
                 deopt_points: Vec::new(),
                 ownership: crate::plan_v3::FunctionOwnershipPlan::default(),
                 diagnostics: Vec::new(),

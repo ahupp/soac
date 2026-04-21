@@ -47,7 +47,9 @@ mod tests {
         DirectCallArgPlan as PlanV3DirectCallArgPlan,
         DirectCallArgSource as PlanV3DirectCallArgSource, DirectCallSpecializationPlan,
         FunctionPlanIdentity, IndexedFieldAccessKind, IndexedFieldOwnerType,
-        IndexedFieldSpecializationPlan, ModulePlanIdentity,
+        IndexedFieldSpecializationPlan, IndexedGlobalAccessKind, IndexedGlobalFallbackKind,
+        IndexedGlobalFallbackPlan, IndexedGlobalGuardKind, IndexedGlobalGuardPlan,
+        IndexedGlobalSpecializationPlan, ModulePlanIdentity,
     };
     use std::collections::{HashMap, VecDeque};
     use std::ffi::c_void;
@@ -3097,6 +3099,7 @@ def build(values):
                     scalar_threads: Vec::new(),
                     direct_calls: Vec::new(),
                     indexed_fields: Vec::new(),
+                    indexed_globals: Vec::new(),
                     deopt_points: Vec::new(),
                     ownership: soac_opt::plan_v3::FunctionOwnershipPlan::default(),
                     diagnostics: Vec::new(),
@@ -3109,6 +3112,7 @@ def build(values):
                     debug_name: Some(function.names.qualname.clone()),
                     direct_calls: Vec::new(),
                     indexed_fields: Vec::new(),
+                    indexed_globals: Vec::new(),
                     regions: Vec::new(),
                 }],
             },
@@ -16203,9 +16207,11 @@ def f(x):
                     field_index_specializations: HashMap::new(),
                     field_index_specializations_by_instr: HashMap::new(),
                     opt_v3_indexed_fields_by_instr: HashMap::new(),
+                    opt_v3_indexed_globals_by_instr: HashMap::new(),
                     branch_prefer_true: HashMap::new(),
                     cold_block_labels: HashSet::new(),
                     opt_v3_exact_int_branch_artifacts: Some(std::sync::Arc::new(artifacts)),
+                    allow_legacy_indexed_globals: false,
                     behavior_change_indexed_stores: false,
                     guard_miss_deopt_stub: false,
                 }),
@@ -16397,9 +16403,11 @@ def f(x):
                     field_index_specializations: HashMap::new(),
                     field_index_specializations_by_instr: HashMap::new(),
                     opt_v3_indexed_fields_by_instr: HashMap::new(),
+                    opt_v3_indexed_globals_by_instr: HashMap::new(),
                     branch_prefer_true: HashMap::new(),
                     cold_block_labels: HashSet::new(),
                     opt_v3_exact_int_branch_artifacts: Some(std::sync::Arc::new(artifacts)),
+                    allow_legacy_indexed_globals: false,
                     behavior_change_indexed_stores: false,
                     guard_miss_deopt_stub: false,
                 }),
@@ -16555,9 +16563,11 @@ def f(x):
                         field_index_specializations: HashMap::new(),
                         field_index_specializations_by_instr: HashMap::new(),
                         opt_v3_indexed_fields_by_instr: HashMap::new(),
+                        opt_v3_indexed_globals_by_instr: HashMap::new(),
                         branch_prefer_true: HashMap::new(),
                         cold_block_labels: HashSet::new(),
                         opt_v3_exact_int_branch_artifacts: Some(std::sync::Arc::new(artifacts)),
+                        allow_legacy_indexed_globals: false,
                         behavior_change_indexed_stores: false,
                         guard_miss_deopt_stub: false,
                     }),
@@ -16684,9 +16694,11 @@ def f(x):
                         field_index_specializations: HashMap::new(),
                         field_index_specializations_by_instr: HashMap::new(),
                         opt_v3_indexed_fields_by_instr: HashMap::new(),
+                        opt_v3_indexed_globals_by_instr: HashMap::new(),
                         branch_prefer_true: HashMap::new(),
                         cold_block_labels: HashSet::new(),
                         opt_v3_exact_int_branch_artifacts: Some(std::sync::Arc::new(artifacts)),
+                        allow_legacy_indexed_globals: false,
                         behavior_change_indexed_stores: false,
                         guard_miss_deopt_stub: false,
                     }),
@@ -16808,9 +16820,11 @@ def f(x):
                     field_index_specializations: HashMap::new(),
                     field_index_specializations_by_instr: HashMap::new(),
                     opt_v3_indexed_fields_by_instr: HashMap::new(),
+                    opt_v3_indexed_globals_by_instr: HashMap::new(),
                     branch_prefer_true: HashMap::new(),
                     cold_block_labels: HashSet::new(),
                     opt_v3_exact_int_branch_artifacts: Some(std::sync::Arc::new(artifacts)),
+                    allow_legacy_indexed_globals: false,
                     behavior_change_indexed_stores: false,
                     guard_miss_deopt_stub: false,
                 }),
@@ -16865,6 +16879,7 @@ def f(x):
                     scalar_threads: Vec::new(),
                     direct_calls: Vec::new(),
                     indexed_fields: Vec::new(),
+                    indexed_globals: Vec::new(),
                     deopt_points: Vec::new(),
                     ownership: soac_opt::plan_v3::FunctionOwnershipPlan::default(),
                     diagnostics: Vec::new(),
@@ -16877,6 +16892,7 @@ def f(x):
                     debug_name: Some(function.names.qualname.clone()),
                     direct_calls: Vec::new(),
                     indexed_fields: Vec::new(),
+                    indexed_globals: Vec::new(),
                     regions: Vec::new(),
                 }],
             },
@@ -16938,6 +16954,7 @@ def f(x):
                         reason: "profiled direct call".to_string(),
                     }],
                     indexed_fields: Vec::new(),
+                    indexed_globals: Vec::new(),
                     deopt_points: Vec::new(),
                     ownership: soac_opt::plan_v3::FunctionOwnershipPlan::default(),
                     diagnostics: Vec::new(),
@@ -16957,6 +16974,7 @@ def f(x):
                         reason: "profiled direct call".to_string(),
                     }],
                     indexed_fields: Vec::new(),
+                    indexed_globals: Vec::new(),
                     regions: Vec::new(),
                 }],
             },
@@ -17039,6 +17057,7 @@ def f(x):
                                 .to_string(),
                         },
                     ],
+                    indexed_globals: Vec::new(),
                     deopt_points: Vec::new(),
                     ownership: soac_opt::plan_v3::FunctionOwnershipPlan::default(),
                     diagnostics: Vec::new(),
@@ -17070,6 +17089,7 @@ def f(x):
                                 .to_string(),
                         },
                     ],
+                    indexed_globals: Vec::new(),
                     regions: Vec::new(),
                 }],
             },
@@ -17110,6 +17130,315 @@ def f(x):
         assert!(
             planned_inputs.evidence_by_function.is_empty(),
             "v3 emitted indexed fields should not be converted into legacy profile evidence"
+        );
+    }
+
+    #[test]
+    fn planned_precompile_inputs_consume_v3_emitted_indexed_globals() {
+        let module_name_gen = ModuleNameGen::new(7);
+        let load_source = InstrId::new(BlockLabel::from_index(0), 11);
+        let store_source = InstrId::new(BlockLabel::from_index(0), 13);
+        let caller = with_single_test_block(
+            test_function_in_module(&module_name_gen, "caller"),
+            vec![with_instr_id(
+                assign_stmt(test_global_name("counter"), name_expr(test_name("value"))),
+                store_source,
+            )],
+            ret_term(with_instr_id(
+                name_expr(test_global_name("counter")),
+                load_source,
+            )),
+        );
+        let caller_id = caller.function_id;
+        let mut module = test_module(module_name_gen, vec![caller]);
+        module.global_names = vec!["counter".to_string()];
+        let serialized_caller =
+            SerializedFunctionId::new(SerializedModuleId::new(0), caller_id.local_function_id());
+        let guard = IndexedGlobalGuardPlan {
+            kind: IndexedGlobalGuardKind::ModuleDictKeyAtIndex,
+        };
+        let fallback = IndexedGlobalFallbackPlan {
+            kind: IndexedGlobalFallbackKind::OriginalGlobalAccess,
+        };
+        let artifacts = ExactIntBranchV3Artifacts {
+            plan: ModuleOptimizationPlanV3 {
+                module: ModulePlanIdentity {
+                    module_name: "test".to_string(),
+                    source_hash: 0,
+                    cache_identity: "test-cache".to_string(),
+                },
+                helper_catalog_version: 1,
+                cost_model_version: 1,
+                functions: vec![soac_opt::plan_v3::FunctionOptimizationPlanV3 {
+                    function: FunctionPlanIdentity {
+                        function: serialized_caller,
+                        debug_name: Some("caller".to_string()),
+                    },
+                    regions: Vec::new(),
+                    scalar_threads: Vec::new(),
+                    direct_calls: Vec::new(),
+                    indexed_fields: Vec::new(),
+                    indexed_globals: vec![
+                        IndexedGlobalSpecializationPlan {
+                            source: load_source,
+                            access: IndexedGlobalAccessKind::Load,
+                            module_name: "test".to_string(),
+                            name: "counter".to_string(),
+                            expected_index: 0,
+                            guard: guard.clone(),
+                            fallback: fallback.clone(),
+                            reason: "profiled module_keys selected this indexed-global slot"
+                                .to_string(),
+                        },
+                        IndexedGlobalSpecializationPlan {
+                            source: store_source,
+                            access: IndexedGlobalAccessKind::Store,
+                            module_name: "test".to_string(),
+                            name: "counter".to_string(),
+                            expected_index: 0,
+                            guard: guard.clone(),
+                            fallback: fallback.clone(),
+                            reason: "profiled module_keys selected this indexed-global slot"
+                                .to_string(),
+                        },
+                    ],
+                    deopt_points: Vec::new(),
+                    ownership: soac_opt::plan_v3::FunctionOwnershipPlan::default(),
+                    diagnostics: Vec::new(),
+                }],
+            },
+            emission: MechanicalModuleEmission {
+                module_name: "test".to_string(),
+                functions: vec![soac_opt::emit_v3::MechanicalFunctionEmission {
+                    function: serialized_caller,
+                    debug_name: Some("caller".to_string()),
+                    direct_calls: Vec::new(),
+                    indexed_fields: Vec::new(),
+                    indexed_globals: vec![
+                        soac_opt::emit_v3::MechanicalIndexedGlobalEmission {
+                            source: load_source,
+                            access: IndexedGlobalAccessKind::Load,
+                            module_name: "test".to_string(),
+                            name: "counter".to_string(),
+                            expected_index: 0,
+                            guard: guard.clone(),
+                            fallback: fallback.clone(),
+                            reason: "profiled module_keys selected this indexed-global slot"
+                                .to_string(),
+                        },
+                        soac_opt::emit_v3::MechanicalIndexedGlobalEmission {
+                            source: store_source,
+                            access: IndexedGlobalAccessKind::Store,
+                            module_name: "test".to_string(),
+                            name: "counter".to_string(),
+                            expected_index: 0,
+                            guard,
+                            fallback,
+                            reason: "profiled module_keys selected this indexed-global slot"
+                                .to_string(),
+                        },
+                    ],
+                    regions: Vec::new(),
+                }],
+            },
+        };
+
+        let planned_inputs =
+            planned_optimization_inputs_from_v3_artifacts_for_codegen_module(&artifacts, &module)
+                .unwrap();
+
+        assert_eq!(
+            planned_inputs
+                .opt_v3_emitted_indexed_globals
+                .get(&caller_id)
+                .unwrap()
+                .get(&load_source)
+                .unwrap(),
+            &OptV3IndexedGlobalAccessPlan {
+                source: load_source,
+                access: IndexedGlobalAccessKind::Load,
+                module_name: "test".to_string(),
+                name: "counter".to_string(),
+                expected_index: 0,
+                guard: IndexedGlobalGuardKind::ModuleDictKeyAtIndex,
+                fallback: IndexedGlobalFallbackKind::OriginalGlobalAccess,
+            }
+        );
+        assert_eq!(
+            planned_inputs
+                .opt_v3_emitted_indexed_globals
+                .get(&caller_id)
+                .unwrap()
+                .get(&store_source)
+                .unwrap(),
+            &OptV3IndexedGlobalAccessPlan {
+                source: store_source,
+                access: IndexedGlobalAccessKind::Store,
+                module_name: "test".to_string(),
+                name: "counter".to_string(),
+                expected_index: 0,
+                guard: IndexedGlobalGuardKind::ModuleDictKeyAtIndex,
+                fallback: IndexedGlobalFallbackKind::OriginalGlobalAccess,
+            }
+        );
+        assert!(
+            planned_inputs.evidence_by_function.is_empty(),
+            "v3 emitted indexed globals should not be converted into legacy profile evidence"
+        );
+    }
+
+    fn indexed_global_test_function(
+        module_name_gen: &ModuleNameGen,
+        load_source: InstrId,
+        store_source: InstrId,
+    ) -> BlockPyFunction<CodegenModuleShape> {
+        with_single_test_block(
+            test_function_in_module(module_name_gen, "global_user"),
+            vec![
+                with_instr_id(
+                    assign_stmt(test_global_name("counter"), none_expr()),
+                    store_source,
+                ),
+                with_instr_id(
+                    expr_stmt(name_expr(test_global_name("counter"))),
+                    load_source,
+                ),
+            ],
+            ret_term(none_expr()),
+        )
+    }
+
+    fn opt_v3_indexed_global_plan(
+        source: InstrId,
+        access: IndexedGlobalAccessKind,
+    ) -> OptV3IndexedGlobalAccessPlan {
+        OptV3IndexedGlobalAccessPlan {
+            source,
+            access,
+            module_name: "test".to_string(),
+            name: "counter".to_string(),
+            expected_index: 0,
+            guard: IndexedGlobalGuardKind::ModuleDictKeyAtIndex,
+            fallback: IndexedGlobalFallbackKind::OriginalGlobalAccess,
+        }
+    }
+
+    #[test]
+    fn codegen_consumes_v3_indexed_global_inputs_without_legacy_counters() {
+        let module_name_gen = ModuleNameGen::new(7);
+        let load_source = InstrId::new(BlockLabel::from_index(0), 11);
+        let store_source = InstrId::new(BlockLabel::from_index(0), 13);
+        let function = indexed_global_test_function(&module_name_gen, load_source, store_source);
+        let mut module = test_module(module_name_gen, vec![function.clone()]);
+        module.global_names = vec!["counter".to_string()];
+        let module_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+        let blocks = [1usize as ObjPtr];
+        let built = build_test_jit_function_with_constants_and_options(
+            &module,
+            &function,
+            &blocks,
+            &module_constants,
+            BuildSpecializedFunctionOptions {
+                specialization_inputs: Some(FunctionSpecializationInputs {
+                    call_target_specializations: HashMap::new(),
+                    direct_function_call_guards: HashMap::new(),
+                    operator_specializations: HashMap::new(),
+                    getitem_specializations: HashMap::new(),
+                    setitem_specializations: HashMap::new(),
+                    field_index_specializations: HashMap::new(),
+                    field_index_specializations_by_instr: HashMap::new(),
+                    opt_v3_indexed_fields_by_instr: HashMap::new(),
+                    opt_v3_indexed_globals_by_instr: HashMap::from([
+                        (
+                            load_source,
+                            opt_v3_indexed_global_plan(load_source, IndexedGlobalAccessKind::Load),
+                        ),
+                        (
+                            store_source,
+                            opt_v3_indexed_global_plan(
+                                store_source,
+                                IndexedGlobalAccessKind::Store,
+                            ),
+                        ),
+                    ]),
+                    branch_prefer_true: HashMap::new(),
+                    cold_block_labels: HashSet::new(),
+                    opt_v3_exact_int_branch_artifacts: None,
+                    allow_legacy_indexed_globals: false,
+                    behavior_change_indexed_stores: true,
+                    guard_miss_deopt_stub: false,
+                }),
+                ..BuildSpecializedFunctionOptions::default()
+            },
+        );
+
+        let probe_helper = declared_user_names_for_symbols(
+            &built,
+            &[super::SOAC_RUNTIME_PROBE_GLOBAL_INDEXED_SYMBOL],
+        );
+        let store_helper = declared_user_names_for_symbols(
+            &built,
+            &[super::SOAC_RUNTIME_STORE_GLOBAL_INDEXED_SYMBOL],
+        );
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&built.ctx.func, &probe_helper),
+            1
+        );
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&built.ctx.func, &store_helper),
+            1
+        );
+    }
+
+    #[test]
+    fn codegen_does_not_rediscover_indexed_globals_when_v3_plan_has_no_entry() {
+        let module_name_gen = ModuleNameGen::new(7);
+        let load_source = InstrId::new(BlockLabel::from_index(0), 11);
+        let store_source = InstrId::new(BlockLabel::from_index(0), 13);
+        let function = indexed_global_test_function(&module_name_gen, load_source, store_source);
+        let mut module = test_module(module_name_gen, vec![function.clone()]);
+        module.global_names = vec!["counter".to_string()];
+        let module_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+        let blocks = [1usize as ObjPtr];
+        let built = build_test_jit_function_with_constants_and_options(
+            &module,
+            &function,
+            &blocks,
+            &module_constants,
+            BuildSpecializedFunctionOptions {
+                specialization_inputs: Some(FunctionSpecializationInputs {
+                    call_target_specializations: HashMap::new(),
+                    direct_function_call_guards: HashMap::new(),
+                    operator_specializations: HashMap::new(),
+                    getitem_specializations: HashMap::new(),
+                    setitem_specializations: HashMap::new(),
+                    field_index_specializations: HashMap::new(),
+                    field_index_specializations_by_instr: HashMap::new(),
+                    opt_v3_indexed_fields_by_instr: HashMap::new(),
+                    opt_v3_indexed_globals_by_instr: HashMap::new(),
+                    branch_prefer_true: HashMap::new(),
+                    cold_block_labels: HashSet::new(),
+                    opt_v3_exact_int_branch_artifacts: None,
+                    allow_legacy_indexed_globals: false,
+                    behavior_change_indexed_stores: true,
+                    guard_miss_deopt_stub: false,
+                }),
+                ..BuildSpecializedFunctionOptions::default()
+            },
+        );
+
+        let indexed_helpers = declared_user_names_for_symbols(
+            &built,
+            &[
+                super::SOAC_RUNTIME_PROBE_GLOBAL_INDEXED_SYMBOL,
+                super::SOAC_RUNTIME_STORE_GLOBAL_INDEXED_SYMBOL,
+            ],
+        );
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&built.ctx.func, &indexed_helpers),
+            0
         );
     }
 
@@ -17729,6 +18058,7 @@ def write_point(point, value):
                         reason: "profiled direct call".to_string(),
                     }],
                     indexed_fields: Vec::new(),
+                    indexed_globals: Vec::new(),
                     deopt_points: Vec::new(),
                     ownership: soac_opt::plan_v3::FunctionOwnershipPlan::default(),
                     diagnostics: Vec::new(),
@@ -17741,6 +18071,7 @@ def write_point(point, value):
                     debug_name: Some("caller".to_string()),
                     direct_calls: Vec::new(),
                     indexed_fields: Vec::new(),
+                    indexed_globals: Vec::new(),
                     regions: Vec::new(),
                 }],
             },
@@ -17797,6 +18128,7 @@ def write_point(point, value):
                         expected_index: 2,
                         reason: "profiled type_keys selected this indexed-field layout".to_string(),
                     }],
+                    indexed_globals: Vec::new(),
                     deopt_points: Vec::new(),
                     ownership: soac_opt::plan_v3::FunctionOwnershipPlan::default(),
                     diagnostics: Vec::new(),
@@ -17809,6 +18141,7 @@ def write_point(point, value):
                     debug_name: Some("caller".to_string()),
                     direct_calls: Vec::new(),
                     indexed_fields: Vec::new(),
+                    indexed_globals: Vec::new(),
                     regions: Vec::new(),
                 }],
             },
@@ -17857,7 +18190,9 @@ def write_point(point, value):
             planned_evidence,
             opt_v3_emitted_direct_function_guards,
             opt_v3_emitted_indexed_fields: HashMap::new(),
+            opt_v3_emitted_indexed_globals: HashMap::new(),
             opt_v3_exact_int_branch_artifacts: HashMap::new(),
+            loaded_opt_v3_plan: true,
             behavior_change_indexed_stores: false,
             profiled_cold_blocks: false,
             guard_miss_deopt: false,

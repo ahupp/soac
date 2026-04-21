@@ -49,8 +49,8 @@ pub const V3_OPTIMIZATION_FAMILY_STATUS: &[V3OptimizationFamilyStatus] = &[
     V3OptimizationFamilyStatus {
         family: "indexed globals",
         legacy_input: "module_keys and global_indexed hit/fallback counters",
-        status: V3MigrationStatus::LegacyOnly,
-        next_step: "model indexed global load/store alternatives with explicit module-dict guard effects",
+        status: V3MigrationStatus::LiveCodegenInputOnly,
+        next_step: "lift indexed global load/store lowering itself into mechanical v3 nodes",
     },
     V3OptimizationFamilyStatus {
         family: "branch locality and cold block layout",

@@ -24,6 +24,7 @@ pub struct FunctionOptimizationPlanV3 {
     pub scalar_threads: Vec<ScalarLocalThreadPlan>,
     pub direct_calls: Vec<DirectCallSpecializationPlan>,
     pub indexed_fields: Vec<IndexedFieldSpecializationPlan>,
+    pub indexed_globals: Vec<IndexedGlobalSpecializationPlan>,
     pub deopt_points: Vec<PlannedDeoptPoint>,
     pub ownership: FunctionOwnershipPlan,
     pub diagnostics: Vec<PlanDiagnostic>,
@@ -86,6 +87,60 @@ pub enum IndexedFieldAccessKind {
 pub struct IndexedFieldOwnerType {
     pub module_name: String,
     pub qualname: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct IndexedGlobalSpecializationPlan {
+    pub source: InstrId,
+    pub access: IndexedGlobalAccessKind,
+    pub module_name: String,
+    pub name: String,
+    pub expected_index: u32,
+    pub guard: IndexedGlobalGuardPlan,
+    pub fallback: IndexedGlobalFallbackPlan,
+    pub reason: String,
+}
+
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
+pub enum IndexedGlobalAccessKind {
+    Load,
+    Store,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct IndexedGlobalGuardPlan {
+    pub kind: IndexedGlobalGuardKind,
+}
+
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
+pub enum IndexedGlobalGuardKind {
+    ModuleDictKeyAtIndex,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct IndexedGlobalFallbackPlan {
+    pub kind: IndexedGlobalFallbackKind,
+}
+
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
+pub enum IndexedGlobalFallbackKind {
+    OriginalGlobalAccess,
 }
 
 #[derive(
@@ -661,6 +716,7 @@ fn validate_function_plan(function: &FunctionOptimizationPlanV3, errors: &mut Ve
     }
     validate_direct_call_plans(function, errors);
     validate_indexed_field_plans(function, errors);
+    validate_indexed_global_plans(function, errors);
     for action in &function.ownership.actions {
         if action.reason.is_empty() {
             errors.push(format!(
@@ -739,6 +795,59 @@ fn validate_indexed_field_plans(function: &FunctionOptimizationPlanV3, errors: &
             errors.push(format!(
                 "function {} indexed-field at {} has empty reason",
                 function.function.function, indexed_field.source
+            ));
+        }
+    }
+}
+
+fn validate_indexed_global_plans(function: &FunctionOptimizationPlanV3, errors: &mut Vec<String>) {
+    let mut seen = HashSet::new();
+    for indexed_global in &function.indexed_globals {
+        if !seen.insert((
+            indexed_global.source,
+            indexed_global.access,
+            indexed_global.module_name.clone(),
+            indexed_global.name.clone(),
+            indexed_global.expected_index,
+        )) {
+            errors.push(format!(
+                "function {} has duplicate indexed-global {:?} {}.{} index={} at {}",
+                function.function.function,
+                indexed_global.access,
+                indexed_global.module_name,
+                indexed_global.name,
+                indexed_global.expected_index,
+                indexed_global.source
+            ));
+        }
+        if indexed_global.module_name.is_empty() {
+            errors.push(format!(
+                "function {} indexed-global at {} has empty module name",
+                function.function.function, indexed_global.source
+            ));
+        }
+        if indexed_global.name.is_empty() {
+            errors.push(format!(
+                "function {} indexed-global at {} has empty name",
+                function.function.function, indexed_global.source
+            ));
+        }
+        if indexed_global.guard.kind != IndexedGlobalGuardKind::ModuleDictKeyAtIndex {
+            errors.push(format!(
+                "function {} indexed-global at {} has unsupported guard {:?}",
+                function.function.function, indexed_global.source, indexed_global.guard.kind
+            ));
+        }
+        if indexed_global.fallback.kind != IndexedGlobalFallbackKind::OriginalGlobalAccess {
+            errors.push(format!(
+                "function {} indexed-global at {} has unsupported fallback {:?}",
+                function.function.function, indexed_global.source, indexed_global.fallback.kind
+            ));
+        }
+        if indexed_global.reason.is_empty() {
+            errors.push(format!(
+                "function {} indexed-global at {} has empty reason",
+                function.function.function, indexed_global.source
             ));
         }
     }
@@ -1805,6 +1914,14 @@ mod tests {
         module
     }
 
+    fn module_with_indexed_globals(
+        indexed_globals: Vec<IndexedGlobalSpecializationPlan>,
+    ) -> ModuleOptimizationPlanV3 {
+        let mut module = module_with_regions(Vec::new());
+        module.functions[0].indexed_globals = indexed_globals;
+        module
+    }
+
     fn module_with_regions_and_scalar_threads(
         regions: Vec<RegionPlan>,
         scalar_threads: Vec<ScalarLocalThreadPlan>,
@@ -1826,6 +1943,7 @@ mod tests {
                 scalar_threads,
                 direct_calls: Vec::new(),
                 indexed_fields: Vec::new(),
+                indexed_globals: Vec::new(),
                 deopt_points: vec![PlannedDeoptPoint {
                     id: DeoptPointId(0),
                     source: DeoptPointSource::Synthetic {
@@ -1908,6 +2026,48 @@ mod tests {
 
         let err = validate_module_plan_v3(&plan).unwrap_err();
         assert!(err.to_string().contains("duplicate indexed-field"));
+    }
+
+    #[test]
+    fn validates_indexed_global_selections() {
+        let plan = module_with_indexed_globals(vec![IndexedGlobalSpecializationPlan {
+            source: instr_id(7),
+            access: IndexedGlobalAccessKind::Load,
+            module_name: "pkg.mod".to_string(),
+            name: "value".to_string(),
+            expected_index: 2,
+            guard: IndexedGlobalGuardPlan {
+                kind: IndexedGlobalGuardKind::ModuleDictKeyAtIndex,
+            },
+            fallback: IndexedGlobalFallbackPlan {
+                kind: IndexedGlobalFallbackKind::OriginalGlobalAccess,
+            },
+            reason: "profiled module_keys selected this indexed-global slot".to_string(),
+        }]);
+
+        validate_module_plan_v3(&plan).unwrap();
+    }
+
+    #[test]
+    fn rejects_duplicate_indexed_global_selections() {
+        let indexed_global = IndexedGlobalSpecializationPlan {
+            source: instr_id(7),
+            access: IndexedGlobalAccessKind::Load,
+            module_name: "pkg.mod".to_string(),
+            name: "value".to_string(),
+            expected_index: 2,
+            guard: IndexedGlobalGuardPlan {
+                kind: IndexedGlobalGuardKind::ModuleDictKeyAtIndex,
+            },
+            fallback: IndexedGlobalFallbackPlan {
+                kind: IndexedGlobalFallbackKind::OriginalGlobalAccess,
+            },
+            reason: "profiled module_keys selected this indexed-global slot".to_string(),
+        };
+        let plan = module_with_indexed_globals(vec![indexed_global.clone(), indexed_global]);
+
+        let err = validate_module_plan_v3(&plan).unwrap_err();
+        assert!(err.to_string().contains("duplicate indexed-global"));
     }
 
     fn input(value: PlanValue, index: u32, name: &str) -> RegionInput {

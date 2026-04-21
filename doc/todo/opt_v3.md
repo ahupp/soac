@@ -132,8 +132,7 @@ Implemented:
 Remaining legacy-only families are intentionally visible:
 
 - remaining division/modulo/shift and unary exact-int value-producing operators;
-- exact-list getitem/setitem;
-- indexed globals.
+- exact-list getitem/setitem.
 
 Partially migrated families are also intentionally visible:
 
@@ -152,6 +151,13 @@ Partially migrated families are also intentionally visible:
   still shared with the existing constructor initializer fast path. The final
   inline load/store emission still uses the existing typed attribute emitter
   rather than a v3-specific operation node.
+- indexed globals are represented as v3 plan selections plus mechanical
+  indexed-global emissions with explicit module-dict guard and original global
+  fallback effects. The JIT validates emitted global name/access/index against
+  lowered `NameLocation::Global(slot)` and consumes the v3 entry as the
+  indexed global load/store input. The final helper-call lowering still lives in
+  the existing global load/store emitters rather than a v3-specific operation
+  node.
 
 Remaining scalar cleanup:
 
@@ -664,9 +670,10 @@ the branch exit demands `I32Bool01`. If a later Python-observable boundary needs
 9. Replace old site-local specializations incrementally.
    - Migrate exact-int operators first.
    - Then truthiness and materialization.
-   - Direct calls and indexed fields are partially migrated as v3-owned codegen
-     inputs; lift their actual lowering into mechanical nodes next.
-   - Then getitem/setitem and indexed globals.
+   - Direct calls, indexed fields, and indexed globals are partially migrated as
+     v3-owned codegen inputs; lift their actual lowering into mechanical nodes
+     next.
+   - Then getitem/setitem.
    - Keep old paths until each replacement has structured tests and diagnostics.
 
 10. Benchmark and document kept performance changes.

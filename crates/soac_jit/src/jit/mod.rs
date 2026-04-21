@@ -86,7 +86,8 @@ use soac_lowering::passes::{
 use soac_opt::artifacts_v3::{ExactIntBranchV3Artifacts, load_optimization_artifacts_v3};
 use soac_opt::emit_v3::{
     MechanicalExitKind, MechanicalFunctionEmission, MechanicalIndexedFieldEmission,
-    MechanicalModuleEmission, MechanicalOperation, MechanicalRegionEmission, MechanicalStepOp,
+    MechanicalIndexedGlobalEmission, MechanicalModuleEmission, MechanicalOperation,
+    MechanicalRegionEmission, MechanicalStepOp,
 };
 #[cfg(test)]
 use soac_opt::plan::ProfileEvidenceStore;
@@ -100,7 +101,11 @@ use soac_opt::plan_v3::{
     FunctionOptimizationPlanV3, GuardFailure, GuardKind,
     IndexedFieldAccessKind as PlanV3IndexedFieldAccessKind,
     IndexedFieldOwnerType as PlanV3IndexedFieldOwnerType,
-    IndexedFieldSpecializationPlan as PlanV3IndexedFieldSpecializationPlan, MaterializeKind,
+    IndexedFieldSpecializationPlan as PlanV3IndexedFieldSpecializationPlan,
+    IndexedGlobalAccessKind as PlanV3IndexedGlobalAccessKind,
+    IndexedGlobalFallbackKind as PlanV3IndexedGlobalFallbackKind,
+    IndexedGlobalGuardKind as PlanV3IndexedGlobalGuardKind,
+    IndexedGlobalSpecializationPlan as PlanV3IndexedGlobalSpecializationPlan, MaterializeKind,
     ModuleOptimizationPlanV3, PlanNodeId, PlanValue, PlannedConstant, RegionExitTarget, RegionId,
     RegionInputSource, RegionPlan, Rep, RichCompareOp, ScalarLocalThreadPlan, ScalarThreadFallback,
     ScalarThreadLocalCleanup, ScalarThreadLocalLocation, ScalarThreadLocalState,
@@ -7219,39 +7224,48 @@ fn emit_codegen_non_local_name_load(
         }
         NameLocation::Global(slot) => {
             let globals_obj = ctx.consts.block_const;
-            let name_obj = emit_owned_module_constant(
-                fb,
-                ctx.module_constants
-                    .require_unicode_constant_id(name.id.as_str()),
-                ctx,
-            );
-            let slot_index = fb.ins().iconst(ir::types::I64, i64::from(slot.slot()));
-            let value = if let Some(load_instr_id) = load_instr_id.filter(|load_instr_id| {
-                ctx.global_indexed_hit_counter_ids
-                    .contains_key(load_instr_id)
-            }) {
-                let guard_miss_resume_point =
-                    ctx.guard_miss_resume_point
-                        .unwrap_or(LocalEnvResumePoint::BeforeInstr {
-                            key: InstrKey::new(ctx.function_id, load_instr_id),
-                        });
-                emit_codegen_indexed_global_load(
-                    fb,
-                    globals_obj,
-                    name_obj,
-                    slot_index,
-                    load_instr_id,
-                    guard_miss_resume_point,
-                    local_env,
-                    ctx,
-                )
+            let opt_v3_plan = load_instr_id
+                .and_then(|load_instr_id| ctx.opt_v3_indexed_globals_by_instr.get(&load_instr_id))
+                .filter(|plan| plan.access == PlanV3IndexedGlobalAccessKind::Load);
+            let value = if let Some(plan) = opt_v3_plan {
+                emit_codegen_opt_v3_indexed_global_load(fb, globals_obj, plan, local_env, ctx)
             } else {
-                let value_inst = fb.ins().call(
-                    ctx.load_global_fast_ref,
-                    &[globals_obj, name_obj, slot_index],
+                let name_obj = emit_owned_module_constant(
+                    fb,
+                    ctx.module_constants
+                        .require_unicode_constant_id(name.id.as_str()),
+                    ctx,
                 );
-                let value = fb.inst_results(value_inst)[0];
-                emit_decref_owned_input_after_nullable_result(fb, ctx, value, name_obj)
+                let slot_index = fb.ins().iconst(ir::types::I64, i64::from(slot.slot()));
+                if let Some(load_instr_id) = load_instr_id.filter(|load_instr_id| {
+                    ctx.allow_legacy_indexed_globals
+                        && ctx
+                            .global_indexed_hit_counter_ids
+                            .contains_key(load_instr_id)
+                }) {
+                    let guard_miss_resume_point =
+                        ctx.guard_miss_resume_point
+                            .unwrap_or(LocalEnvResumePoint::BeforeInstr {
+                                key: InstrKey::new(ctx.function_id, load_instr_id),
+                            });
+                    emit_codegen_indexed_global_load(
+                        fb,
+                        globals_obj,
+                        name_obj,
+                        slot_index,
+                        load_instr_id,
+                        guard_miss_resume_point,
+                        local_env,
+                        ctx,
+                    )
+                } else {
+                    let value_inst = fb.ins().call(
+                        ctx.load_global_fast_ref,
+                        &[globals_obj, name_obj, slot_index],
+                    );
+                    let value = fb.inst_results(value_inst)[0];
+                    emit_decref_owned_input_after_nullable_result(fb, ctx, value, name_obj)
+                }
             };
             let value_ok_block = fb.create_block();
             fb.append_block_param(value_ok_block, ptr_ty);
@@ -7439,6 +7453,39 @@ fn emit_codegen_indexed_global_load(
 
     fb.switch_to_block(result_block);
     fb.block_params(result_block)[0]
+}
+
+fn emit_codegen_opt_v3_indexed_global_load(
+    fb: &mut FunctionBuilder<'_>,
+    globals_obj: ir::Value,
+    plan: &OptV3IndexedGlobalAccessPlan,
+    local_env: &LocalEnv,
+    ctx: &JitEmitCtx<'_>,
+) -> ir::Value {
+    plan.expect_lowering_shape(PlanV3IndexedGlobalAccessKind::Load);
+    let name_obj = emit_owned_module_constant(
+        fb,
+        ctx.module_constants.require_unicode_constant_id(&plan.name),
+        ctx,
+    );
+    let slot_index = fb
+        .ins()
+        .iconst(ir::types::I64, i64::from(plan.expected_index));
+    let guard_miss_resume_point =
+        ctx.guard_miss_resume_point
+            .unwrap_or(LocalEnvResumePoint::BeforeInstr {
+                key: InstrKey::new(ctx.function_id, plan.source),
+            });
+    emit_codegen_indexed_global_load(
+        fb,
+        globals_obj,
+        name_obj,
+        slot_index,
+        plan.source,
+        guard_miss_resume_point,
+        local_env,
+        ctx,
+    )
 }
 
 fn codegen_expr_const_string(
@@ -8252,6 +8299,8 @@ struct JitEmitCtx<'mc> {
     branch_prefer_true: &'mc HashMap<InstrId, bool>,
     global_indexed_hit_counter_ids: &'mc HashMap<InstrId, CounterId>,
     global_indexed_fallback_counter_ids: &'mc HashMap<InstrId, CounterId>,
+    opt_v3_indexed_globals_by_instr: &'mc HashMap<InstrId, OptV3IndexedGlobalAccessPlan>,
+    allow_legacy_indexed_globals: bool,
     field_indexed_hit_counter_ids: &'mc HashMap<InstrId, CounterId>,
     field_indexed_fallback_counter_ids: &'mc HashMap<InstrId, CounterId>,
     field_generic_getattr_counter_ids: &'mc HashMap<InstrId, CounterId>,
@@ -9120,6 +9169,41 @@ struct OptV3ResolvedIndexedFieldAccess {
     access: PlanV3IndexedFieldAccessKind,
     attr_name: String,
     specialization: FieldIndexSpecialization,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OptV3IndexedGlobalAccessPlan {
+    source: InstrId,
+    access: PlanV3IndexedGlobalAccessKind,
+    module_name: String,
+    name: String,
+    expected_index: u32,
+    guard: PlanV3IndexedGlobalGuardKind,
+    fallback: PlanV3IndexedGlobalFallbackKind,
+}
+
+impl OptV3IndexedGlobalAccessPlan {
+    fn expect_lowering_shape(&self, expected_access: PlanV3IndexedGlobalAccessKind) {
+        assert_eq!(
+            self.access, expected_access,
+            "optimizer v3 indexed-global {:?} reached {:?} lowering for {}",
+            self.access, expected_access, self.source
+        );
+        assert_eq!(
+            self.guard,
+            PlanV3IndexedGlobalGuardKind::ModuleDictKeyAtIndex,
+            "optimizer v3 indexed-global {} has unsupported guard {:?}",
+            self.source,
+            self.guard
+        );
+        assert_eq!(
+            self.fallback,
+            PlanV3IndexedGlobalFallbackKind::OriginalGlobalAccess,
+            "optimizer v3 indexed-global {} has unsupported fallback {:?}",
+            self.source,
+            self.fallback
+        );
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -13212,7 +13296,10 @@ struct SpecializationProfile<'a> {
         HashMap<RuntimeFunctionId, HashMap<InstrId, Vec<TypedDirectFunctionCallGuard>>>,
     opt_v3_emitted_indexed_fields:
         HashMap<RuntimeFunctionId, HashMap<InstrId, Vec<OptV3IndexedFieldAccessPlan>>>,
+    opt_v3_emitted_indexed_globals:
+        HashMap<RuntimeFunctionId, HashMap<InstrId, OptV3IndexedGlobalAccessPlan>>,
     opt_v3_exact_int_branch_artifacts: HashMap<RuntimeFunctionId, Arc<ExactIntBranchV3Artifacts>>,
+    loaded_opt_v3_plan: bool,
     behavior_change_indexed_stores: bool,
     profiled_cold_blocks: bool,
     guard_miss_deopt: bool,
@@ -13225,7 +13312,10 @@ struct PlannedOptimizationInputs {
         HashMap<RuntimeFunctionId, HashMap<InstrId, Vec<TypedDirectFunctionCallGuard>>>,
     opt_v3_emitted_indexed_fields:
         HashMap<RuntimeFunctionId, HashMap<InstrId, Vec<OptV3IndexedFieldAccessPlan>>>,
+    opt_v3_emitted_indexed_globals:
+        HashMap<RuntimeFunctionId, HashMap<InstrId, OptV3IndexedGlobalAccessPlan>>,
     opt_v3_exact_int_branch_artifacts: HashMap<RuntimeFunctionId, Arc<ExactIntBranchV3Artifacts>>,
+    loaded_opt_v3_plan: bool,
 }
 
 impl PlannedOptimizationInputs {
@@ -13237,7 +13327,9 @@ impl PlannedOptimizationInputs {
             evidence_by_function,
             opt_v3_emitted_direct_function_guards: HashMap::new(),
             opt_v3_emitted_indexed_fields: HashMap::new(),
+            opt_v3_emitted_indexed_globals: HashMap::new(),
             opt_v3_exact_int_branch_artifacts: HashMap::new(),
+            loaded_opt_v3_plan: false,
         }
     }
 }
@@ -13300,9 +13392,11 @@ struct FunctionSpecializationInputs {
     field_index_specializations: HashMap<String, Vec<FieldIndexSpecialization>>,
     field_index_specializations_by_instr: HashMap<InstrId, Vec<FieldIndexSpecialization>>,
     opt_v3_indexed_fields_by_instr: HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>,
+    opt_v3_indexed_globals_by_instr: HashMap<InstrId, OptV3IndexedGlobalAccessPlan>,
     branch_prefer_true: HashMap<InstrId, bool>,
     cold_block_labels: HashSet<BlockLabel>,
     opt_v3_exact_int_branch_artifacts: Option<Arc<ExactIntBranchV3Artifacts>>,
+    allow_legacy_indexed_globals: bool,
     behavior_change_indexed_stores: bool,
     guard_miss_deopt_stub: bool,
 }
@@ -13448,6 +13542,7 @@ fn planned_optimization_inputs_from_v3_artifacts(
     shared_state: &SharedModuleState,
 ) -> Result<PlannedOptimizationInputs, String> {
     let mut inputs = PlannedOptimizationInputs::default();
+    inputs.loaded_opt_v3_plan = true;
     for planned_function in &artifacts.plan.functions {
         let local_function_id = planned_function.function.function.local_function_id();
         let current_function_id = RuntimeFunctionId::new(
@@ -13493,6 +13588,13 @@ fn planned_optimization_inputs_from_v3_artifacts(
                 .opt_v3_emitted_indexed_fields
                 .insert(current_function_id, indexed_fields);
         }
+        if let Some(indexed_globals) =
+            opt_v3_emitted_indexed_globals_for_function(&function_artifacts, current_function)?
+        {
+            inputs
+                .opt_v3_emitted_indexed_globals
+                .insert(current_function_id, indexed_globals);
+        }
         inputs
             .opt_v3_exact_int_branch_artifacts
             .insert(current_function_id, Arc::new(function_artifacts));
@@ -13505,6 +13607,7 @@ fn planned_optimization_inputs_from_v3_artifacts_for_codegen_module(
     module: &BlockPyModule<CodegenModuleShape>,
 ) -> Result<PlannedOptimizationInputs, String> {
     let mut inputs = PlannedOptimizationInputs::default();
+    inputs.loaded_opt_v3_plan = true;
     let module_id = RuntimeModuleId::new(module.module_name_gen.module_id());
     for planned_function in &artifacts.plan.functions {
         let local_function_id = planned_function.function.function.local_function_id();
@@ -13555,6 +13658,13 @@ fn planned_optimization_inputs_from_v3_artifacts_for_codegen_module(
                 .opt_v3_emitted_indexed_fields
                 .insert(current_function_id, indexed_fields);
         }
+        if let Some(indexed_globals) =
+            opt_v3_emitted_indexed_globals_for_function(&function_artifacts, current_function)?
+        {
+            inputs
+                .opt_v3_emitted_indexed_globals
+                .insert(current_function_id, indexed_globals);
+        }
         inputs
             .opt_v3_exact_int_branch_artifacts
             .insert(current_function_id, Arc::new(function_artifacts));
@@ -13589,6 +13699,172 @@ fn opt_v3_indexed_field_access_plan_from_emission(
         owner_type: indexed_field.owner_type.clone(),
         attr_name: indexed_field.attr_name.clone(),
         expected_index: indexed_field.expected_index,
+    }
+}
+
+fn opt_v3_emitted_indexed_globals_for_function(
+    artifacts: &ExactIntBranchV3Artifacts,
+    function: &BlockPyFunction<CodegenModuleShape>,
+) -> Result<Option<HashMap<InstrId, OptV3IndexedGlobalAccessPlan>>, String> {
+    let emitted_function = &artifacts.emission.functions[0];
+    if emitted_function.indexed_globals.is_empty() {
+        return Ok(None);
+    }
+
+    let lowered_accesses = lowered_global_accesses_by_instr(function);
+    let mut by_source = HashMap::<InstrId, OptV3IndexedGlobalAccessPlan>::new();
+    for indexed_global in &emitted_function.indexed_globals {
+        if indexed_global.module_name != artifacts.plan.module.module_name {
+            return Err(format!(
+                "optimizer v3 emitted indexed-global module {} for {}, expected {}",
+                indexed_global.module_name,
+                indexed_global.source,
+                artifacts.plan.module.module_name
+            ));
+        }
+        validate_opt_v3_indexed_global_emission_for_lowered_function(
+            indexed_global,
+            function,
+            &lowered_accesses,
+        )?;
+        let access = opt_v3_indexed_global_access_plan_from_emission(indexed_global);
+        if let Some(previous) = by_source.insert(indexed_global.source, access.clone())
+            && previous != access
+        {
+            return Err(format!(
+                "optimizer v3 emitted multiple indexed-global plans for {}",
+                indexed_global.source
+            ));
+        }
+    }
+    Ok(Some(by_source))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LoweredGlobalAccess {
+    access: PlanV3IndexedGlobalAccessKind,
+    name: String,
+    slot: u32,
+}
+
+fn lowered_global_accesses_by_instr(
+    function: &BlockPyFunction<CodegenModuleShape>,
+) -> HashMap<InstrId, LoweredGlobalAccess> {
+    struct Collector {
+        accesses: HashMap<InstrId, LoweredGlobalAccess>,
+    }
+
+    impl Visit<InstrCodegen> for Collector {
+        fn visit_instr(&mut self, expr: &InstrCodegen)
+        where
+            InstrCodegen: ChildVisitable<InstrCodegen>,
+        {
+            match expr {
+                InstrCodegen::Load(op) => {
+                    if let NameLocation::Global(slot) = op.name.location {
+                        let Some(source) = op.try_semantic_instr_id() else {
+                            expr.visit_children(self);
+                            return;
+                        };
+                        self.accesses.insert(
+                            source,
+                            LoweredGlobalAccess {
+                                access: PlanV3IndexedGlobalAccessKind::Load,
+                                name: op.name.id_str().to_string(),
+                                slot: slot.slot(),
+                            },
+                        );
+                    }
+                }
+                InstrCodegen::Store(op) => {
+                    if let NameLocation::Global(slot) = op.name.location {
+                        let Some(source) = op.try_semantic_instr_id() else {
+                            expr.visit_children(self);
+                            return;
+                        };
+                        self.accesses.insert(
+                            source,
+                            LoweredGlobalAccess {
+                                access: PlanV3IndexedGlobalAccessKind::Store,
+                                name: op.name.id_str().to_string(),
+                                slot: slot.slot(),
+                            },
+                        );
+                    }
+                }
+                _ => {}
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    let mut collector = Collector {
+        accesses: HashMap::new(),
+    };
+    collector.visit_fn(function);
+    collector.accesses
+}
+
+fn validate_opt_v3_indexed_global_emission_for_lowered_function(
+    emitted: &MechanicalIndexedGlobalEmission,
+    function: &BlockPyFunction<CodegenModuleShape>,
+    lowered_accesses: &HashMap<InstrId, LoweredGlobalAccess>,
+) -> Result<(), String> {
+    let Some(lowered) = lowered_accesses.get(&emitted.source) else {
+        return Err(format!(
+            "optimizer v3 emitted indexed-global {:?} {}.{} at {}, but function {} ({}) has no lowered global load/store with that source",
+            emitted.access,
+            emitted.module_name,
+            emitted.name,
+            emitted.source,
+            function.function_id,
+            function.names.qualname
+        ));
+    };
+    if lowered.access != emitted.access {
+        return Err(format!(
+            "optimizer v3 emitted indexed-global {:?} for {}, but lowered instruction is {:?}",
+            emitted.access, emitted.source, lowered.access
+        ));
+    }
+    if lowered.name != emitted.name {
+        return Err(format!(
+            "optimizer v3 emitted indexed-global name {:?} for {}, but lowered instruction uses {:?}",
+            emitted.name, emitted.source, lowered.name
+        ));
+    }
+    if lowered.slot != emitted.expected_index {
+        return Err(format!(
+            "optimizer v3 emitted indexed-global slot {} for {}, but lowered instruction uses global slot {}",
+            emitted.expected_index, emitted.source, lowered.slot
+        ));
+    }
+    if emitted.guard.kind != PlanV3IndexedGlobalGuardKind::ModuleDictKeyAtIndex {
+        return Err(format!(
+            "optimizer v3 emitted indexed-global guard {:?} for {}, but codegen only supports ModuleDictKeyAtIndex",
+            emitted.guard.kind, emitted.source
+        ));
+    }
+    if emitted.fallback.kind != PlanV3IndexedGlobalFallbackKind::OriginalGlobalAccess {
+        return Err(format!(
+            "optimizer v3 emitted indexed-global fallback {:?} for {}, but codegen only supports OriginalGlobalAccess",
+            emitted.fallback.kind, emitted.source
+        ));
+    }
+    Ok(())
+}
+
+fn opt_v3_indexed_global_access_plan_from_emission(
+    indexed_global: &MechanicalIndexedGlobalEmission,
+) -> OptV3IndexedGlobalAccessPlan {
+    OptV3IndexedGlobalAccessPlan {
+        source: indexed_global.source,
+        access: indexed_global.access,
+        module_name: indexed_global.module_name.clone(),
+        name: indexed_global.name.clone(),
+        expected_index: indexed_global.expected_index,
+        guard: indexed_global.guard.kind,
+        fallback: indexed_global.fallback.kind,
     }
 }
 
@@ -14016,6 +14292,10 @@ fn validate_opt_v3_codegen_artifacts_for_function(
         &artifacts.plan.functions[0],
         &artifacts.emission.functions[0],
     )?;
+    validate_opt_v3_indexed_global_emission_matches_plan(
+        &artifacts.plan.functions[0],
+        &artifacts.emission.functions[0],
+    )?;
     Ok(())
 }
 
@@ -14091,6 +14371,48 @@ fn opt_v3_indexed_field_emission_matches_plan(
         && planned.reason == emitted.reason
 }
 
+fn validate_opt_v3_indexed_global_emission_matches_plan(
+    planned_function: &FunctionOptimizationPlanV3,
+    emitted_function: &MechanicalFunctionEmission,
+) -> Result<(), String> {
+    if planned_function.indexed_globals.len() != emitted_function.indexed_globals.len() {
+        return Err(format!(
+            "optimizer v3 artifacts for function {} contain {} planned indexed globals but {} emitted indexed globals",
+            planned_function.function.function,
+            planned_function.indexed_globals.len(),
+            emitted_function.indexed_globals.len()
+        ));
+    }
+    for (index, (planned, emitted)) in planned_function
+        .indexed_globals
+        .iter()
+        .zip(emitted_function.indexed_globals.iter())
+        .enumerate()
+    {
+        if !opt_v3_indexed_global_emission_matches_plan(planned, emitted) {
+            return Err(format!(
+                "optimizer v3 emitted indexed-global #{index} for function {} does not match the selected plan",
+                planned_function.function.function
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn opt_v3_indexed_global_emission_matches_plan(
+    planned: &PlanV3IndexedGlobalSpecializationPlan,
+    emitted: &MechanicalIndexedGlobalEmission,
+) -> bool {
+    planned.source == emitted.source
+        && planned.access == emitted.access
+        && planned.module_name == emitted.module_name
+        && planned.name == emitted.name
+        && planned.expected_index == emitted.expected_index
+        && planned.guard == emitted.guard
+        && planned.fallback == emitted.fallback
+        && planned.reason == emitted.reason
+}
+
 fn resolve_planned_function_target(
     shared_state: &SharedModuleState,
     compile_session: Option<&crate::session::CompileSession>,
@@ -14145,12 +14467,18 @@ impl FunctionSpecializationInputs {
             field_index_specializations,
             field_index_specializations_by_instr,
             opt_v3_indexed_fields_by_instr,
+            opt_v3_indexed_globals_by_instr: profile
+                .opt_v3_emitted_indexed_globals
+                .get(&function.function_id)
+                .cloned()
+                .unwrap_or_default(),
             branch_prefer_true: profile.branch_preferences(function.function_id)?,
             cold_block_labels: profile.cold_block_labels(function)?,
             opt_v3_exact_int_branch_artifacts: profile
                 .opt_v3_exact_int_branch_artifacts
                 .get(&function.function_id)
                 .cloned(),
+            allow_legacy_indexed_globals: !profile.loaded_opt_v3_plan,
             behavior_change_indexed_stores: profile.behavior_change_indexed_stores
                 && function.scope.scope_kind != CallableScopeKind::Module,
             guard_miss_deopt_stub: profile.guard_miss_deopt
@@ -14186,7 +14514,9 @@ impl<'a> SpecializationProfile<'a> {
             opt_v3_emitted_direct_function_guards: planned_inputs
                 .opt_v3_emitted_direct_function_guards,
             opt_v3_emitted_indexed_fields: planned_inputs.opt_v3_emitted_indexed_fields,
+            opt_v3_emitted_indexed_globals: planned_inputs.opt_v3_emitted_indexed_globals,
             opt_v3_exact_int_branch_artifacts: planned_inputs.opt_v3_exact_int_branch_artifacts,
+            loaded_opt_v3_plan: planned_inputs.loaded_opt_v3_plan,
             behavior_change_indexed_stores: specialization_mode
                 .is_some_and(SpecializationMode::behavior_change_indexed_stores_enabled),
             profiled_cold_blocks: env_config.profiled_cold_blocks_enabled(),
@@ -14210,7 +14540,9 @@ impl<'a> SpecializationProfile<'a> {
             opt_v3_emitted_direct_function_guards: planned_inputs
                 .opt_v3_emitted_direct_function_guards,
             opt_v3_emitted_indexed_fields: planned_inputs.opt_v3_emitted_indexed_fields,
+            opt_v3_emitted_indexed_globals: planned_inputs.opt_v3_emitted_indexed_globals,
             opt_v3_exact_int_branch_artifacts: planned_inputs.opt_v3_exact_int_branch_artifacts,
+            loaded_opt_v3_plan: planned_inputs.loaded_opt_v3_plan,
             behavior_change_indexed_stores: true,
             profiled_cold_blocks: env_config.profiled_cold_blocks_enabled(),
             guard_miss_deopt: true,
@@ -14226,6 +14558,7 @@ impl<'a> SpecializationProfile<'a> {
         !self.planned_evidence.is_empty()
             || !self.opt_v3_emitted_direct_function_guards.is_empty()
             || !self.opt_v3_emitted_indexed_fields.is_empty()
+            || !self.opt_v3_emitted_indexed_globals.is_empty()
             || !self.opt_v3_exact_int_branch_artifacts.is_empty()
             || (self.profiled_cold_blocks && self.has_existing_counter_dump())
     }
@@ -29092,6 +29425,7 @@ fn build_cranelift_run_bb_specialized_function(
     let field_index_specializations_by_instr =
         specialization_inputs.field_index_specializations_by_instr;
     let opt_v3_indexed_fields_by_instr = specialization_inputs.opt_v3_indexed_fields_by_instr;
+    let opt_v3_indexed_globals_by_instr = specialization_inputs.opt_v3_indexed_globals_by_instr;
     let branch_prefer_true = specialization_inputs.branch_prefer_true;
     let cold_block_labels = specialization_inputs.cold_block_labels;
     let opt_v3_exact_int_branch_artifacts = specialization_inputs.opt_v3_exact_int_branch_artifacts;
@@ -29100,6 +29434,7 @@ fn build_cranelift_run_bb_specialized_function(
         opt_v3_exact_int_branch_artifacts.as_deref(),
     )?;
     let behavior_change_indexed_stores = specialization_inputs.behavior_change_indexed_stores;
+    let allow_legacy_indexed_globals = specialization_inputs.allow_legacy_indexed_globals;
     let guard_miss_deopt_stub = specialization_inputs.guard_miss_deopt_stub;
     let function_runtime_data_layout = FunctionRuntimeDataLayout::from_function(function);
     let true_constant_id = module_constants.require_runtime_name_constant_id("TRUE");
@@ -29794,6 +30129,8 @@ fn build_cranelift_run_bb_specialized_function(
                 setitem_specialized_fallback_counter_ids: &setitem_specialized_fallback_counter_ids,
                 global_indexed_hit_counter_ids: &global_indexed_hit_counter_ids,
                 global_indexed_fallback_counter_ids: &global_indexed_fallback_counter_ids,
+                opt_v3_indexed_globals_by_instr: &opt_v3_indexed_globals_by_instr,
+                allow_legacy_indexed_globals,
                 field_indexed_hit_counter_ids: &field_indexed_hit_counter_ids,
                 field_indexed_fallback_counter_ids: &field_indexed_fallback_counter_ids,
                 field_generic_getattr_counter_ids: &field_generic_getattr_counter_ids,

@@ -11,11 +11,12 @@ use crate::plan::{
 };
 use crate::plan_v3::{
     DirectCallArgPlan, DirectCallArgSource, FunctionPlanIdentity, IndexedFieldAccessKind,
-    IndexedFieldOwnerType, ModulePlanIdentity, PlanDiagnostic, RegionId,
+    IndexedFieldOwnerType, IndexedGlobalAccessKind, ModulePlanIdentity, PlanDiagnostic, RegionId,
 };
 use crate::planner_v3::{
     DirectCallPlanRequest, ExtractedRegionPlanRequest, FunctionPlanRequest,
-    IndexedFieldPlanRequest, ModulePlanRequest, plan_module_optimization_v3,
+    IndexedFieldPlanRequest, IndexedGlobalPlanRequest, ModulePlanRequest,
+    plan_module_optimization_v3,
 };
 use crate::region_v3::{
     RegionExtractionAttempt, RegionExtractionError, extract_function_regions_v3,
@@ -23,8 +24,8 @@ use crate::region_v3::{
 use anyhow::{Context, Result, anyhow, bail};
 use soac_core::block_py::{
     BlockLabel, BlockPyFunction, BlockPyModule, Call, CallArgPositional, ChildVisitable,
-    FunctionExecutionMode, HasSemanticInstrId, InstrId, LocalFunctionId, NameLocation, ParamKind,
-    RuntimeModuleId, SerializedFunctionId, SerializedModuleId, Visit,
+    FunctionExecutionMode, HasSemanticInstrId, InstrId, LocalFunctionId, NameLike, NameLocation,
+    ParamKind, RuntimeModuleId, SerializedFunctionId, SerializedModuleId, Visit,
 };
 use soac_driver::codegen_cache::{
     CachedCodegenModule, CachedCodegenModuleMetadata, load_codegen_module_cache,
@@ -158,11 +159,17 @@ pub fn plan_and_emit_module_v3_from_raw_evidence(
             lowered_module,
             evidence_store,
         );
+        let indexed_globals = indexed_global_requests_from_module_key_evidence_v3(
+            metadata.module_name.as_str(),
+            function,
+            evidence_store,
+        );
         functions.push(FunctionPlanRequest {
             function: function_plan_identity_v3(function),
             regions: region_requests,
             direct_calls,
             indexed_fields,
+            indexed_globals,
         });
         diagnostics_by_function.push(diagnostics);
     }
@@ -203,6 +210,7 @@ pub fn plan_and_emit_extracted_exact_int_branches_v3(
             functions: vec![FunctionPlanRequest {
                 direct_calls: Vec::new(),
                 indexed_fields: Vec::new(),
+                indexed_globals: Vec::new(),
                 function,
                 regions: region_requests,
             }],
@@ -225,6 +233,84 @@ fn function_plan_identity_v3(
         ),
         debug_name: Some(function.names.qualname.clone()),
     }
+}
+
+fn indexed_global_requests_from_module_key_evidence_v3(
+    module_name: &str,
+    function: &BlockPyFunction<CodegenModuleShape>,
+    evidence_store: &ProfileEvidenceStore,
+) -> Vec<IndexedGlobalPlanRequest> {
+    struct Collector<'a> {
+        module_name: &'a str,
+        evidence_store: &'a ProfileEvidenceStore,
+        requests: Vec<IndexedGlobalPlanRequest>,
+    }
+
+    impl Collector<'_> {
+        fn collect_name(
+            &mut self,
+            source: InstrId,
+            access: IndexedGlobalAccessKind,
+            name: &soac_core::block_py::ResolvedName,
+        ) {
+            let NameLocation::Global(slot) = name.location else {
+                return;
+            };
+            let Some(specializations) = self
+                .evidence_store
+                .global_index_specializations_for_name(self.module_name, name.id_str())
+            else {
+                return;
+            };
+            for specialization in specializations {
+                if specialization.expected_index != slot.slot() {
+                    continue;
+                }
+                self.requests.push(IndexedGlobalPlanRequest {
+                    source,
+                    access,
+                    module_name: specialization.module_name.clone(),
+                    name: specialization.name.clone(),
+                    expected_index: specialization.expected_index,
+                    reason: "profiled module_keys selected this indexed-global slot for a lowered global access".to_string(),
+                });
+            }
+        }
+    }
+
+    impl Visit<InstrCodegen> for Collector<'_> {
+        fn visit_instr(&mut self, expr: &InstrCodegen)
+        where
+            InstrCodegen: ChildVisitable<InstrCodegen>,
+        {
+            match expr {
+                InstrCodegen::Load(op) => {
+                    let Some(source) = op.try_semantic_instr_id() else {
+                        expr.visit_children(self);
+                        return;
+                    };
+                    self.collect_name(source, IndexedGlobalAccessKind::Load, &op.name);
+                }
+                InstrCodegen::Store(op) => {
+                    let Some(source) = op.try_semantic_instr_id() else {
+                        expr.visit_children(self);
+                        return;
+                    };
+                    self.collect_name(source, IndexedGlobalAccessKind::Store, &op.name);
+                }
+                _ => {}
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    let mut collector = Collector {
+        module_name,
+        evidence_store,
+        requests: Vec::new(),
+    };
+    collector.visit_fn(function);
+    collector.requests
 }
 
 fn indexed_field_requests_from_type_key_evidence_v3(
@@ -650,10 +736,11 @@ mod tests {
         BinOp, BinOpKind, Block, BlockLabel, BlockParam, BlockPyName, BlockTerm, FunctionName,
         GetAttr, InstrId, Load, LocalFunctionId, LocalLocation, Meta, ModuleNameGen, NameLocation,
         ParamSpec, ResolvedName, RuntimeFunctionId, SerializedFunctionId, SerializedModuleId,
-        SetAttr, TermIf, WithMeta,
+        SetAttr, Store, TermIf, WithMeta,
     };
     use soac_core::profile::{
-        CounterDumpRecord, CounterDumpTypeKey, CounterDumpTypeKeyLayout, CounterDumpTypeTableEntry,
+        CounterDumpKeyLayout, CounterDumpRecord, CounterDumpTypeKey, CounterDumpTypeKeyLayout,
+        CounterDumpTypeTableEntry,
     };
     use soac_lowering::block_py::literal::{LiteralValue, StringLiteral};
     use soac_lowering::passes::{InstrCodegen, InstrResolved};
@@ -687,6 +774,13 @@ mod tests {
             id: BlockPyName::new(format!("<const {index}>")),
             location: NameLocation::Constant(index),
         }))
+    }
+
+    fn global_name(name: &str, slot: u32) -> ResolvedName {
+        ResolvedName {
+            id: BlockPyName::new(name),
+            location: NameLocation::Global(soac_core::block_py::GlobalSlot(slot)),
+        }
     }
 
     fn binary(op: BinOpKind, left: InstrCodegen, right: InstrCodegen, id: u32) -> InstrCodegen {
@@ -903,6 +997,73 @@ mod tests {
         assert_eq!(requests[0].expected_index, 2);
         assert_eq!(requests[1].source, set_source);
         assert_eq!(requests[1].access, IndexedFieldAccessKind::Store);
+    }
+
+    #[test]
+    fn indexed_global_requests_are_derived_from_raw_module_key_evidence() {
+        let load_source = InstrId::new(label(0), 5);
+        let store_source = InstrId::new(label(0), 8);
+        let block = Block::new(
+            label(0),
+            vec![
+                InstrCodegen::Load(Load::new(global_name("counter", 1))).with_meta(Meta {
+                    instr_id: Some(load_source),
+                    ..Meta::synthetic()
+                }),
+                InstrCodegen::Store(Store::new(global_name("counter", 1), local("value", 0)))
+                    .with_meta(Meta {
+                        instr_id: Some(store_source),
+                        ..Meta::synthetic()
+                    }),
+                InstrCodegen::Load(Load::new(global_name("other", 2))).with_meta(Meta {
+                    instr_id: Some(InstrId::new(label(0), 11)),
+                    ..Meta::synthetic()
+                }),
+            ],
+            BlockTerm::jump_term(label(1)),
+            Vec::<BlockParam>::new(),
+            None,
+        );
+        let function = function_with_blocks(vec![block]);
+        let record = CounterDumpRecord {
+            source_hash: 0x1234,
+            module_name: "pkg.mod".to_string(),
+            package_name: None,
+            rows: Vec::new(),
+            module_keys: vec![
+                CounterDumpKeyLayout {
+                    owner: "pkg.mod".to_string(),
+                    key: "counter".to_string(),
+                    index: 1,
+                },
+                CounterDumpKeyLayout {
+                    owner: "pkg.mod".to_string(),
+                    key: "other".to_string(),
+                    index: 99,
+                },
+            ],
+            type_keys: Vec::new(),
+            type_table: Vec::new(),
+        };
+        let path = unique_counter_path_v3();
+        fs::write(path.as_path(), record.encode().unwrap()).unwrap();
+        let evidence_store = ProfileEvidenceStore::from_counter_dump(path.as_path()).unwrap();
+        let _ = fs::remove_file(path);
+
+        let requests = indexed_global_requests_from_module_key_evidence_v3(
+            "pkg.mod",
+            &function,
+            &evidence_store,
+        );
+
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].source, load_source);
+        assert_eq!(requests[0].access, IndexedGlobalAccessKind::Load);
+        assert_eq!(requests[0].module_name, "pkg.mod");
+        assert_eq!(requests[0].name, "counter");
+        assert_eq!(requests[0].expected_index, 1);
+        assert_eq!(requests[1].source, store_source);
+        assert_eq!(requests[1].access, IndexedGlobalAccessKind::Store);
     }
 
     #[test]

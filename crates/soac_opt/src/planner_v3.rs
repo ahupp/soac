@@ -5,12 +5,14 @@ use crate::plan_v3::{
     ConversionKind, ConversionOwnership, ConversionPrecondition, ConvertNode, Cost,
     DirectCallArgPlan, DirectCallSpecializationPlan, FailureMode, FallbackReason, FallbackTarget,
     FunctionOptimizationPlanV3, FunctionOwnershipPlan, FunctionPlanIdentity,
-    IndexedFieldAccessKind, IndexedFieldOwnerType, IndexedFieldSpecializationPlan, MaterializeKind,
-    MaterializeNode, ModuleOptimizationPlanV3, ModulePlanIdentity, OperationNode, PlanDiagnostic,
-    PlanNode, PlanNodeId, PlanNodeKind, PlanValue, PlannedConstant, RegionExitKind, RegionExitPlan,
-    RegionExitTarget, RegionId, RegionInput, RegionInputSource, RegionPlan, RegionSource,
-    RegionValueRef, Rep, ScalarLocalThreadPlan, ScalarThreadFallback, ScalarThreadLocal,
-    ScalarThreadLocalCleanup, ScalarThreadLocalLocation, ScalarThreadLocalState,
+    IndexedFieldAccessKind, IndexedFieldOwnerType, IndexedFieldSpecializationPlan,
+    IndexedGlobalAccessKind, IndexedGlobalFallbackKind, IndexedGlobalFallbackPlan,
+    IndexedGlobalGuardKind, IndexedGlobalGuardPlan, IndexedGlobalSpecializationPlan,
+    MaterializeKind, MaterializeNode, ModuleOptimizationPlanV3, ModulePlanIdentity, OperationNode,
+    PlanDiagnostic, PlanNode, PlanNodeId, PlanNodeKind, PlanValue, PlannedConstant, RegionExitKind,
+    RegionExitPlan, RegionExitTarget, RegionId, RegionInput, RegionInputSource, RegionPlan,
+    RegionSource, RegionValueRef, Rep, ScalarLocalThreadPlan, ScalarThreadFallback,
+    ScalarThreadLocal, ScalarThreadLocalCleanup, ScalarThreadLocalLocation, ScalarThreadLocalState,
     ScalarThreadMaterialization,
 };
 use crate::region_v3::{
@@ -33,6 +35,7 @@ pub struct FunctionPlanRequest {
     pub regions: Vec<ExtractedRegionPlanRequest>,
     pub direct_calls: Vec<DirectCallPlanRequest>,
     pub indexed_fields: Vec<IndexedFieldPlanRequest>,
+    pub indexed_globals: Vec<IndexedGlobalPlanRequest>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -49,6 +52,16 @@ pub struct IndexedFieldPlanRequest {
     pub access: IndexedFieldAccessKind,
     pub owner_type: IndexedFieldOwnerType,
     pub attr_name: String,
+    pub expected_index: u32,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexedGlobalPlanRequest {
+    pub source: InstrId,
+    pub access: IndexedGlobalAccessKind,
+    pub module_name: String,
+    pub name: String,
     pub expected_index: u32,
     pub reason: String,
 }
@@ -106,12 +119,14 @@ pub fn plan_function_optimization_v3(
     let region_requests = request.regions;
     let direct_calls = plan_direct_call_specializations_v3(&request.direct_calls);
     let indexed_fields = plan_indexed_field_specializations_v3(&request.indexed_fields);
+    let indexed_globals = plan_indexed_global_specializations_v3(&request.indexed_globals);
     let mut function = FunctionOptimizationPlanV3 {
         function: request.function,
         regions: Vec::new(),
         scalar_threads: Vec::new(),
         direct_calls,
         indexed_fields,
+        indexed_globals,
         deopt_points: Vec::new(),
         ownership: FunctionOwnershipPlan::default(),
         diagnostics: Vec::new(),
@@ -194,6 +209,55 @@ fn plan_indexed_field_specializations_v3(
                 owner_type: request.owner_type.clone(),
                 attr_name: request.attr_name.clone(),
                 expected_index: request.expected_index,
+                reason: request.reason.clone(),
+            });
+        }
+    }
+    plans
+}
+
+fn plan_indexed_global_specializations_v3(
+    indexed_global_requests: &[IndexedGlobalPlanRequest],
+) -> Vec<IndexedGlobalSpecializationPlan> {
+    let mut entries = indexed_global_requests.iter().collect::<Vec<_>>();
+    entries.sort_by(|lhs, rhs| {
+        (
+            lhs.source,
+            lhs.access,
+            lhs.module_name.as_str(),
+            lhs.name.as_str(),
+            lhs.expected_index,
+        )
+            .cmp(&(
+                rhs.source,
+                rhs.access,
+                rhs.module_name.as_str(),
+                rhs.name.as_str(),
+                rhs.expected_index,
+            ))
+    });
+    let mut seen = HashSet::new();
+    let mut plans = Vec::new();
+    for request in entries {
+        if seen.insert((
+            request.source,
+            request.access,
+            request.module_name.clone(),
+            request.name.clone(),
+            request.expected_index,
+        )) {
+            plans.push(IndexedGlobalSpecializationPlan {
+                source: request.source,
+                access: request.access,
+                module_name: request.module_name.clone(),
+                name: request.name.clone(),
+                expected_index: request.expected_index,
+                guard: IndexedGlobalGuardPlan {
+                    kind: IndexedGlobalGuardKind::ModuleDictKeyAtIndex,
+                },
+                fallback: IndexedGlobalFallbackPlan {
+                    kind: IndexedGlobalFallbackKind::OriginalGlobalAccess,
+                },
                 reason: request.reason.clone(),
             });
         }
@@ -1588,6 +1652,7 @@ mod tests {
                 regions,
                 direct_calls: Vec::new(),
                 indexed_fields: Vec::new(),
+                indexed_globals: Vec::new(),
             }],
         }
     }

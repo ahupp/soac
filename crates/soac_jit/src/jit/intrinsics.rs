@@ -1,9 +1,9 @@
 use super::operation_specializations;
 use super::{
-    CpythonTypeSymbol, ImportSpec, JitDeoptExitRef, JitEmitCtx, JitGuardMissDispatch, RelocTypeRef,
-    SOAC_RUNTIME_LOAD_GLOBAL_IMPORT, SOAC_RUNTIME_STORE_GLOBAL_IMPORT, SigType,
-    emit_exact_type_version_match, emit_increment_counter_slot,
-    emit_owned_module_constant_from_parts, step_null_block_args,
+    CpythonTypeSymbol, ImportSpec, JitDeoptExitRef, JitEmitCtx, JitGuardMissDispatch,
+    OptV3IndexedGlobalAccessPlan, RelocTypeRef, SOAC_RUNTIME_LOAD_GLOBAL_IMPORT,
+    SOAC_RUNTIME_STORE_GLOBAL_IMPORT, SigType, emit_exact_type_version_match,
+    emit_increment_counter_slot, emit_owned_module_constant_from_parts, step_null_block_args,
 };
 use crate::jit::blockpy_intrinsics;
 use cranelift_codegen::ir;
@@ -11,7 +11,7 @@ use cranelift_codegen::ir::InstBuilder;
 use cranelift_frontend::FunctionBuilder;
 use pyo3::ffi;
 use soac_core::block_py::{
-    CounterId, HasSemanticInstrId, Instr, NameLike, NameLocation, ResolvedName,
+    CounterId, HasSemanticInstrId, Instr, InstrId, NameLike, NameLocation, ResolvedName,
 };
 use soac_lowering::passes::{InstrCodegen, InstrTyped, PyExactType, PyObjFacts};
 use soac_opt::operator_specialization::{
@@ -2018,7 +2018,7 @@ fn emit_indexed_global_load_with_state<'fb>(
     globals_obj: ir::Value,
     name_obj: ir::Value,
     slot_index: ir::Value,
-    instr_id: soac_core::block_py::InstrId,
+    instr_id: InstrId,
 ) -> ir::Value {
     let ptr_ty = state.ctx().consts.ptr_ty;
     let null_ptr = state.fb().ins().iconst(ptr_ty, 0);
@@ -2094,6 +2094,20 @@ fn emit_indexed_global_load_with_state<'fb>(
     state.fb().block_params(result_block)[0]
 }
 
+fn emit_opt_v3_indexed_global_load_with_state<'fb>(
+    state: &mut impl OperationEmitState<'fb, InstrCodegen>,
+    globals_obj: ir::Value,
+    plan: &OptV3IndexedGlobalAccessPlan,
+) -> ir::Value {
+    plan.expect_lowering_shape(soac_opt::plan_v3::IndexedGlobalAccessKind::Load);
+    let name_obj = state.emit_owned_string_constant(plan.name.as_str());
+    let slot_index = state
+        .fb()
+        .ins()
+        .iconst(ir::types::I64, i64::from(plan.expected_index));
+    emit_indexed_global_load_with_state(state, globals_obj, name_obj, slot_index, plan.source)
+}
+
 fn emit_load<'fb>(
     op: &blockpy_intrinsics::Load<InstrCodegen>,
     state: &mut impl OperationEmitState<'fb, InstrCodegen>,
@@ -2114,34 +2128,45 @@ fn emit_load<'fb>(
             let null_ptr = state.fb().ins().iconst(ptr_ty, 0);
             let value_ok_block = state.fb().create_block();
             state.fb().append_block_param(value_ok_block, ptr_ty);
-            let name_obj = state.emit_owned_string_constant(op.name.id_str());
-            let slot_index = state
-                .fb()
-                .ins()
-                .iconst(ir::types::I64, i64::from(slot.slot()));
             let instr_id = op.semantic_instr_id();
-            let slow_value = if state
+            let opt_v3_plan = state
                 .ctx()
-                .global_indexed_hit_counter_ids
-                .contains_key(&instr_id)
-            {
-                emit_indexed_global_load_with_state(
-                    state,
-                    globals_obj,
-                    name_obj,
-                    slot_index,
-                    instr_id,
-                )
+                .opt_v3_indexed_globals_by_instr
+                .get(&instr_id)
+                .filter(|plan| plan.access == soac_opt::plan_v3::IndexedGlobalAccessKind::Load)
+                .cloned();
+            let slow_value = if let Some(plan) = opt_v3_plan {
+                emit_opt_v3_indexed_global_load_with_state(state, globals_obj, &plan)
             } else {
-                let call_inst = state
+                let name_obj = state.emit_owned_string_constant(op.name.id_str());
+                let slot_index = state
                     .fb()
                     .ins()
-                    .call(func_ref, &[globals_obj, name_obj, slot_index]);
-                state
-                    .fb()
-                    .ins()
-                    .call(decref_ref, &[thread_state_value, name_obj]);
-                state.fb().inst_results(call_inst)[0]
+                    .iconst(ir::types::I64, i64::from(slot.slot()));
+                if state.ctx().allow_legacy_indexed_globals
+                    && state
+                        .ctx()
+                        .global_indexed_hit_counter_ids
+                        .contains_key(&instr_id)
+                {
+                    emit_indexed_global_load_with_state(
+                        state,
+                        globals_obj,
+                        name_obj,
+                        slot_index,
+                        instr_id,
+                    )
+                } else {
+                    let call_inst = state
+                        .fb()
+                        .ins()
+                        .call(func_ref, &[globals_obj, name_obj, slot_index]);
+                    state
+                        .fb()
+                        .ins()
+                        .call(decref_ref, &[thread_state_value, name_obj]);
+                    state.fb().inst_results(call_inst)[0]
+                }
             };
             let slow_value_is_null =
                 state
@@ -2184,138 +2209,208 @@ fn emit_load<'fb>(
     state.finish_owned_result(result)
 }
 
+fn emit_indexed_global_store_with_state<'fb, E: Instr<Name = ResolvedName>>(
+    state: &mut impl OperationEmitState<'fb, E>,
+    func_ref: ir::FuncRef,
+    globals_obj: ir::Value,
+    name_obj: ir::Value,
+    slot_index: ir::Value,
+    instr_id: InstrId,
+    value_operand: &E,
+    arg_values: &[(ir::Value, bool)],
+) -> ir::Value {
+    let ptr_ty = state.ctx().consts.ptr_ty;
+    let null_ptr = state.fb().ins().iconst(ptr_ty, 0);
+    let store_global_indexed_ref = state.ctx().store_global_indexed_ref;
+    let decref_ref = state.ctx().decref_ref;
+    let thread_state_value = state.ctx().consts.thread_state_value;
+    let hit_counter_id = state
+        .ctx()
+        .global_indexed_hit_counter_ids
+        .get(&instr_id)
+        .copied();
+    let fallback_counter_id = state
+        .ctx()
+        .global_indexed_fallback_counter_ids
+        .get(&instr_id)
+        .copied();
+    let result_block = state.fb().create_block();
+    state.fb().append_block_param(result_block, ptr_ty);
+    let fallback_block = state.fb().create_block();
+    state.fb().set_cold_block(fallback_block);
+    let pre_guard_operands = [value_operand];
+    let guard_miss_dispatch =
+        state.prepare_guard_miss_dispatch_for_instr(instr_id, &pre_guard_operands, fallback_block);
+    let direct_block = state.fb().create_block();
+    state.fb().append_block_param(direct_block, ptr_ty);
+    let direct_inst = state.fb().ins().call(
+        store_global_indexed_ref,
+        &[
+            thread_state_value,
+            globals_obj,
+            name_obj,
+            slot_index,
+            arg_values[0].0,
+        ],
+    );
+    let direct_value = state.fb().inst_results(direct_inst)[0];
+    let direct_is_null = state
+        .fb()
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, direct_value, null_ptr);
+    state.fb().ins().brif(
+        direct_is_null,
+        guard_miss_dispatch.branch_block(),
+        &[],
+        direct_block,
+        &[ir::BlockArg::Value(direct_value)],
+    );
+
+    state.fb().switch_to_block(direct_block);
+    let direct_value = state.fb().block_params(direct_block)[0];
+    increment_counter_with_state(state, hit_counter_id);
+    state.release_arg_values(arg_values);
+    state
+        .fb()
+        .ins()
+        .call(decref_ref, &[thread_state_value, name_obj]);
+    state
+        .fb()
+        .ins()
+        .jump(result_block, &[ir::BlockArg::Value(direct_value)]);
+
+    match guard_miss_dispatch {
+        JitGuardMissDispatch::FallbackBlock(fallback_block) => {
+            state.fb().switch_to_block(fallback_block);
+            increment_counter_with_state(state, fallback_counter_id);
+            let fallback_inst = state.fb().ins().call(
+                func_ref,
+                &[globals_obj, name_obj, slot_index, arg_values[0].0],
+            );
+            let fallback_value = state.fb().inst_results(fallback_inst)[0];
+            state.release_arg_values(arg_values);
+            state
+                .fb()
+                .ins()
+                .call(decref_ref, &[thread_state_value, name_obj]);
+            state
+                .fb()
+                .ins()
+                .jump(result_block, &[ir::BlockArg::Value(fallback_value)]);
+        }
+        JitGuardMissDispatch::DeoptResume {
+            block,
+            target,
+            deopt_resume_ref,
+        } => {
+            state.fb().switch_to_block(block);
+            state.fb().set_cold_block(block);
+            increment_counter_with_state(state, fallback_counter_id);
+            let deopt_result = state.emit_deopt_resume_result(target, deopt_resume_ref);
+            state.release_arg_values(arg_values);
+            state
+                .fb()
+                .ins()
+                .call(decref_ref, &[thread_state_value, name_obj]);
+            state.emit_deopt_result_return_or_step_null(deopt_result);
+        }
+    }
+
+    state.fb().switch_to_block(result_block);
+    state.fb().block_params(result_block)[0]
+}
+
+fn emit_opt_v3_indexed_global_store_with_state<'fb, E: Instr<Name = ResolvedName>>(
+    op: &blockpy_intrinsics::Store<E>,
+    state: &mut impl OperationEmitState<'fb, E>,
+    func_ref: ir::FuncRef,
+    globals_obj: ir::Value,
+    arg_values: &[(ir::Value, bool)],
+    plan: &OptV3IndexedGlobalAccessPlan,
+) -> ir::Value {
+    plan.expect_lowering_shape(soac_opt::plan_v3::IndexedGlobalAccessKind::Store);
+    if !state.ctx().behavior_change_indexed_stores {
+        panic!(
+            "optimizer v3 indexed-global store emission for {} reached codegen with indexed stores disabled",
+            plan.source
+        );
+    }
+    let name_obj = state.emit_owned_string_constant(plan.name.as_str());
+    let slot_index = state
+        .fb()
+        .ins()
+        .iconst(ir::types::I64, i64::from(plan.expected_index));
+    emit_indexed_global_store_with_state(
+        state,
+        func_ref,
+        globals_obj,
+        name_obj,
+        slot_index,
+        plan.source,
+        op.value.as_ref(),
+        arg_values,
+    )
+}
+
 fn emit_store<'fb, E: Instr<Name = ResolvedName>>(
     op: &blockpy_intrinsics::Store<E>,
     state: &mut impl OperationEmitState<'fb, E>,
 ) -> ir::Value {
     let arg_values = state.emit_arg_values(&[&op.value]);
-    let name_obj = state.emit_owned_string_constant(op.name.id_str());
     let func_ref = state.import_func(&SOAC_RUNTIME_STORE_GLOBAL_IMPORT);
     let decref_ref = state.ctx().decref_ref;
     let thread_state_value = state.ctx().consts.thread_state_value;
     let globals_obj = state.ctx().consts.block_const;
-    let slot_index = match op.name.location {
-        NameLocation::Global(slot) => state
+    let instr_id = op.semantic_instr_id();
+    let opt_v3_plan = state
+        .ctx()
+        .opt_v3_indexed_globals_by_instr
+        .get(&instr_id)
+        .filter(|plan| plan.access == soac_opt::plan_v3::IndexedGlobalAccessKind::Store)
+        .cloned();
+    let result = if let Some(plan) = opt_v3_plan {
+        emit_opt_v3_indexed_global_store_with_state(
+            op,
+            state,
+            func_ref,
+            globals_obj,
+            &arg_values,
+            &plan,
+        )
+    } else {
+        let expected_index = match op.name.location {
+            NameLocation::Global(slot) => slot.slot(),
+            _ => unreachable!("emit_store only applies to global names"),
+        };
+        let name_obj = state.emit_owned_string_constant(op.name.id_str());
+        let slot_index = state
             .fb()
             .ins()
-            .iconst(ir::types::I64, i64::from(slot.slot())),
-        _ => unreachable!("emit_store only applies to global names"),
-    };
-    let result = if state.ctx().behavior_change_indexed_stores {
-        let instr_id = op.semantic_instr_id();
-        let ptr_ty = state.ctx().consts.ptr_ty;
-        let null_ptr = state.fb().ins().iconst(ptr_ty, 0);
-        let store_global_indexed_ref = state.ctx().store_global_indexed_ref;
-        let hit_counter_id = state
-            .ctx()
-            .global_indexed_hit_counter_ids
-            .get(&instr_id)
-            .copied();
-        let fallback_counter_id = state
-            .ctx()
-            .global_indexed_fallback_counter_ids
-            .get(&instr_id)
-            .copied();
-        let result_block = state.fb().create_block();
-        state.fb().append_block_param(result_block, ptr_ty);
-        let fallback_block = state.fb().create_block();
-        state.fb().set_cold_block(fallback_block);
-        let pre_guard_operands = [op.value.as_ref()];
-        let guard_miss_dispatch = state.prepare_guard_miss_dispatch_for_instr(
-            instr_id,
-            &pre_guard_operands,
-            fallback_block,
-        );
-        let direct_block = state.fb().create_block();
-        state.fb().append_block_param(direct_block, ptr_ty);
-        let direct_inst = state.fb().ins().call(
-            store_global_indexed_ref,
-            &[
-                thread_state_value,
+            .iconst(ir::types::I64, i64::from(expected_index));
+        if state.ctx().behavior_change_indexed_stores && state.ctx().allow_legacy_indexed_globals {
+            emit_indexed_global_store_with_state(
+                state,
+                func_ref,
                 globals_obj,
                 name_obj,
                 slot_index,
-                arg_values[0].0,
-            ],
-        );
-        let direct_value = state.fb().inst_results(direct_inst)[0];
-        let direct_is_null =
+                instr_id,
+                op.value.as_ref(),
+                &arg_values,
+            )
+        } else {
+            let call_inst = state.fb().ins().call(
+                func_ref,
+                &[globals_obj, name_obj, slot_index, arg_values[0].0],
+            );
+            let result = state.fb().inst_results(call_inst)[0];
+            state.release_arg_values(&arg_values);
             state
                 .fb()
                 .ins()
-                .icmp(ir::condcodes::IntCC::Equal, direct_value, null_ptr);
-        state.fb().ins().brif(
-            direct_is_null,
-            guard_miss_dispatch.branch_block(),
-            &[],
-            direct_block,
-            &[ir::BlockArg::Value(direct_value)],
-        );
-
-        state.fb().switch_to_block(direct_block);
-        let direct_value = state.fb().block_params(direct_block)[0];
-        increment_counter_with_state(state, hit_counter_id);
-        state.release_arg_values(&arg_values);
-        state
-            .fb()
-            .ins()
-            .call(decref_ref, &[thread_state_value, name_obj]);
-        state
-            .fb()
-            .ins()
-            .jump(result_block, &[ir::BlockArg::Value(direct_value)]);
-
-        match guard_miss_dispatch {
-            JitGuardMissDispatch::FallbackBlock(fallback_block) => {
-                state.fb().switch_to_block(fallback_block);
-                increment_counter_with_state(state, fallback_counter_id);
-                let fallback_inst = state.fb().ins().call(
-                    func_ref,
-                    &[globals_obj, name_obj, slot_index, arg_values[0].0],
-                );
-                let fallback_value = state.fb().inst_results(fallback_inst)[0];
-                state.release_arg_values(&arg_values);
-                state
-                    .fb()
-                    .ins()
-                    .call(decref_ref, &[thread_state_value, name_obj]);
-                state
-                    .fb()
-                    .ins()
-                    .jump(result_block, &[ir::BlockArg::Value(fallback_value)]);
-            }
-            JitGuardMissDispatch::DeoptResume {
-                block,
-                target,
-                deopt_resume_ref,
-            } => {
-                state.fb().switch_to_block(block);
-                state.fb().set_cold_block(block);
-                increment_counter_with_state(state, fallback_counter_id);
-                let deopt_result = state.emit_deopt_resume_result(target, deopt_resume_ref);
-                state.release_arg_values(&arg_values);
-                state
-                    .fb()
-                    .ins()
-                    .call(decref_ref, &[thread_state_value, name_obj]);
-                state.emit_deopt_result_return_or_step_null(deopt_result);
-            }
+                .call(decref_ref, &[thread_state_value, name_obj]);
+            result
         }
-
-        state.fb().switch_to_block(result_block);
-        state.fb().block_params(result_block)[0]
-    } else {
-        let call_inst = state.fb().ins().call(
-            func_ref,
-            &[globals_obj, name_obj, slot_index, arg_values[0].0],
-        );
-        let result = state.fb().inst_results(call_inst)[0];
-        state.release_arg_values(&arg_values);
-        state
-            .fb()
-            .ins()
-            .call(decref_ref, &[thread_state_value, name_obj]);
-        result
     };
     state.finish_owned_result(result)
 }

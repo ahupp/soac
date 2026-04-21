@@ -1,9 +1,11 @@
 use crate::plan_v3::{
     ConversionKind, DeoptPointId, DirectCallArgPlan, DirectCallSpecializationPlan, FailureMode,
     GuardFailure, GuardKind, IndexedFieldAccessKind, IndexedFieldOwnerType,
-    IndexedFieldSpecializationPlan, MaterializeKind, ModuleOptimizationPlanV3, OperationNode,
-    PlanNodeId, PlanNodeKind, PlanValidationError, PlanValue, PlannedConstant, PlannedOp,
-    RegionExitKind, RegionExitTarget, RegionId, RichCompareOp, validate_module_plan_v3,
+    IndexedFieldSpecializationPlan, IndexedGlobalAccessKind, IndexedGlobalFallbackPlan,
+    IndexedGlobalGuardPlan, IndexedGlobalSpecializationPlan, MaterializeKind,
+    ModuleOptimizationPlanV3, OperationNode, PlanNodeId, PlanNodeKind, PlanValidationError,
+    PlanValue, PlannedConstant, PlannedOp, RegionExitKind, RegionExitTarget, RegionId,
+    RichCompareOp, validate_module_plan_v3,
 };
 use soac_core::block_py::{InstrId, SerializedFunctionId};
 use std::fmt;
@@ -20,6 +22,7 @@ pub struct MechanicalFunctionEmission {
     pub debug_name: Option<String>,
     pub direct_calls: Vec<MechanicalDirectCallEmission>,
     pub indexed_fields: Vec<MechanicalIndexedFieldEmission>,
+    pub indexed_globals: Vec<MechanicalIndexedGlobalEmission>,
     pub regions: Vec<MechanicalRegionEmission>,
 }
 
@@ -38,6 +41,18 @@ pub struct MechanicalIndexedFieldEmission {
     pub owner_type: IndexedFieldOwnerType,
     pub attr_name: String,
     pub expected_index: u32,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct MechanicalIndexedGlobalEmission {
+    pub source: InstrId,
+    pub access: IndexedGlobalAccessKind,
+    pub module_name: String,
+    pub name: String,
+    pub expected_index: u32,
+    pub guard: IndexedGlobalGuardPlan,
+    pub fallback: IndexedGlobalFallbackPlan,
     pub reason: String,
 }
 
@@ -194,6 +209,11 @@ pub fn emit_mechanical_plan_v3(
                     .iter()
                     .map(emit_indexed_field)
                     .collect(),
+                indexed_globals: function
+                    .indexed_globals
+                    .iter()
+                    .map(emit_indexed_global)
+                    .collect(),
                 regions: function
                     .regions
                     .iter()
@@ -242,6 +262,21 @@ fn emit_indexed_field(
         attr_name: indexed_field.attr_name.clone(),
         expected_index: indexed_field.expected_index,
         reason: indexed_field.reason.clone(),
+    }
+}
+
+fn emit_indexed_global(
+    indexed_global: &IndexedGlobalSpecializationPlan,
+) -> MechanicalIndexedGlobalEmission {
+    MechanicalIndexedGlobalEmission {
+        source: indexed_global.source,
+        access: indexed_global.access,
+        module_name: indexed_global.module_name.clone(),
+        name: indexed_global.name.clone(),
+        expected_index: indexed_global.expected_index,
+        guard: indexed_global.guard.clone(),
+        fallback: indexed_global.fallback.clone(),
+        reason: indexed_global.reason.clone(),
     }
 }
 
@@ -440,6 +475,7 @@ mod tests {
                 scalar_threads: Vec::new(),
                 direct_calls: Vec::new(),
                 indexed_fields: Vec::new(),
+                indexed_globals: Vec::new(),
                 deopt_points: Vec::new(),
                 ownership: FunctionOwnershipPlan::default(),
                 diagnostics: Vec::new(),
@@ -561,6 +597,81 @@ mod tests {
                     attr_name: "value".to_string(),
                     expected_index: 2,
                     reason: "profiled type_keys selected this indexed-field layout".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn emits_indexed_global_decisions_mechanically() {
+        let mut plan = test_plan(true);
+        let load_source = InstrId::new(BlockLabel::from_index(0), 7);
+        let store_source = InstrId::new(BlockLabel::from_index(0), 9);
+        plan.functions[0]
+            .indexed_globals
+            .push(IndexedGlobalSpecializationPlan {
+                source: load_source,
+                access: IndexedGlobalAccessKind::Load,
+                module_name: "pkg.mod".to_string(),
+                name: "value".to_string(),
+                expected_index: 2,
+                guard: IndexedGlobalGuardPlan {
+                    kind: crate::plan_v3::IndexedGlobalGuardKind::ModuleDictKeyAtIndex,
+                },
+                fallback: IndexedGlobalFallbackPlan {
+                    kind: crate::plan_v3::IndexedGlobalFallbackKind::OriginalGlobalAccess,
+                },
+                reason: "profiled module_keys selected this indexed-global slot".to_string(),
+            });
+        plan.functions[0]
+            .indexed_globals
+            .push(IndexedGlobalSpecializationPlan {
+                source: store_source,
+                access: IndexedGlobalAccessKind::Store,
+                module_name: "pkg.mod".to_string(),
+                name: "value".to_string(),
+                expected_index: 2,
+                guard: IndexedGlobalGuardPlan {
+                    kind: crate::plan_v3::IndexedGlobalGuardKind::ModuleDictKeyAtIndex,
+                },
+                fallback: IndexedGlobalFallbackPlan {
+                    kind: crate::plan_v3::IndexedGlobalFallbackKind::OriginalGlobalAccess,
+                },
+                reason: "profiled module_keys selected this indexed-global slot".to_string(),
+            });
+
+        let emission = emit_mechanical_plan_v3(&plan).unwrap();
+
+        assert_eq!(
+            emission.functions[0].indexed_globals,
+            vec![
+                MechanicalIndexedGlobalEmission {
+                    source: load_source,
+                    access: IndexedGlobalAccessKind::Load,
+                    module_name: "pkg.mod".to_string(),
+                    name: "value".to_string(),
+                    expected_index: 2,
+                    guard: IndexedGlobalGuardPlan {
+                        kind: crate::plan_v3::IndexedGlobalGuardKind::ModuleDictKeyAtIndex,
+                    },
+                    fallback: IndexedGlobalFallbackPlan {
+                        kind: crate::plan_v3::IndexedGlobalFallbackKind::OriginalGlobalAccess,
+                    },
+                    reason: "profiled module_keys selected this indexed-global slot".to_string(),
+                },
+                MechanicalIndexedGlobalEmission {
+                    source: store_source,
+                    access: IndexedGlobalAccessKind::Store,
+                    module_name: "pkg.mod".to_string(),
+                    name: "value".to_string(),
+                    expected_index: 2,
+                    guard: IndexedGlobalGuardPlan {
+                        kind: crate::plan_v3::IndexedGlobalGuardKind::ModuleDictKeyAtIndex,
+                    },
+                    fallback: IndexedGlobalFallbackPlan {
+                        kind: crate::plan_v3::IndexedGlobalFallbackKind::OriginalGlobalAccess,
+                    },
+                    reason: "profiled module_keys selected this indexed-global slot".to_string(),
                 },
             ]
         );

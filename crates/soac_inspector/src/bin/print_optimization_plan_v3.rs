@@ -116,6 +116,9 @@ fn format_optimization_artifacts_v3_with_options(
         let emitted_indexed_fields = emitted_function
             .map(|emitted| emitted.indexed_fields.len())
             .unwrap_or(0);
+        let emitted_indexed_globals = emitted_function
+            .map(|emitted| emitted.indexed_globals.len())
+            .unwrap_or(0);
         out.push_str(&format!(
             "\nfunction {}",
             function
@@ -126,7 +129,7 @@ fn format_optimization_artifacts_v3_with_options(
         ));
         out.push_str(&format!(" id={}\n", function.function.function));
         out.push_str(&format!(
-            "  regions={} emitted_regions={} scalar_threads={} direct_calls={} emitted_direct_calls={} indexed_fields={} emitted_indexed_fields={} deopt_points={} ownership_actions={} diagnostics={}\n",
+            "  regions={} emitted_regions={} scalar_threads={} direct_calls={} emitted_direct_calls={} indexed_fields={} emitted_indexed_fields={} indexed_globals={} emitted_indexed_globals={} deopt_points={} ownership_actions={} diagnostics={}\n",
             function.regions.len(),
             emitted_regions,
             function.scalar_threads.len(),
@@ -134,6 +137,8 @@ fn format_optimization_artifacts_v3_with_options(
             emitted_direct_calls,
             function.indexed_fields.len(),
             emitted_indexed_fields,
+            function.indexed_globals.len(),
+            emitted_indexed_globals,
             function.deopt_points.len(),
             function.ownership.actions.len(),
             function.diagnostics.len()
@@ -201,6 +206,34 @@ fn format_optimization_artifacts_v3_with_options(
                     indexed_field.attr_name,
                     indexed_field.expected_index,
                     indexed_field.reason
+                ));
+            }
+        }
+        for indexed_global in &function.indexed_globals {
+            out.push_str(&format!(
+                "  indexed_global source={} access={:?} module={} name={} index={} guard={:?} fallback={:?} reason={}\n",
+                indexed_global.source,
+                indexed_global.access,
+                indexed_global.module_name,
+                indexed_global.name,
+                indexed_global.expected_index,
+                indexed_global.guard.kind,
+                indexed_global.fallback.kind,
+                indexed_global.reason
+            ));
+        }
+        if let Some(emitted_function) = emitted_function {
+            for indexed_global in &emitted_function.indexed_globals {
+                out.push_str(&format!(
+                    "  emitted_indexed_global source={} access={:?} module={} name={} index={} guard={:?} fallback={:?} reason={}\n",
+                    indexed_global.source,
+                    indexed_global.access,
+                    indexed_global.module_name,
+                    indexed_global.name,
+                    indexed_global.expected_index,
+                    indexed_global.guard.kind,
+                    indexed_global.fallback.kind,
+                    indexed_global.reason
                 ));
             }
         }
@@ -297,6 +330,7 @@ mod test {
                     scalar_threads: Vec::new(),
                     direct_calls: Vec::new(),
                     indexed_fields: Vec::new(),
+                    indexed_globals: Vec::new(),
                     deopt_points: Vec::new(),
                     ownership: FunctionOwnershipPlan::default(),
                     diagnostics: Vec::new(),
@@ -309,6 +343,7 @@ mod test {
                     debug_name: Some("f".to_string()),
                     direct_calls: Vec::new(),
                     indexed_fields: Vec::new(),
+                    indexed_globals: Vec::new(),
                     regions: Vec::new(),
                 }],
             },
@@ -318,7 +353,7 @@ mod test {
         assert!(formatted.contains("module pkg.mod source_hash=0x0000000000001234"));
         assert!(formatted.contains("function f"));
         assert!(formatted.contains(
-            "regions=0 emitted_regions=0 scalar_threads=0 direct_calls=0 emitted_direct_calls=0 indexed_fields=0 emitted_indexed_fields=0"
+            "regions=0 emitted_regions=0 scalar_threads=0 direct_calls=0 emitted_direct_calls=0 indexed_fields=0 emitted_indexed_fields=0 indexed_globals=0 emitted_indexed_globals=0"
         ));
     }
 }

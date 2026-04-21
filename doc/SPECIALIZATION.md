@@ -63,8 +63,12 @@ Current migration surface:
   decisions, and consumed as v3-owned codegen inputs. Constant-string indexed
   fields are selected by v3 from raw `type_keys`, emitted as mechanical
   indexed-field decisions, and consumed as v3-owned typed attribute inputs.
+  Indexed globals are selected by v3 from raw `module_keys` plus lowered
+  `NameLocation::Global(slot)` load/store sites, emitted with explicit
+  module-dict guard and original-global-access fallback effects, and consumed
+  as v3-owned global load/store inputs.
 - Legacy only: division/modulo/shift and unary exact-int value-producing
-  operators, exact-list getitem/setitem, and indexed globals.
+  operators and exact-list getitem/setitem.
 - Not currently a v3 semantic-plan target: branch locality and cold block
   layout hints. These remain layout metadata unless a future CFG-placement plan
   needs to represent them.
@@ -255,6 +259,9 @@ apply/verify mode:
 ### Counted Input
 
 - Source layout input is `module_keys`.
+- In `decide_optimizations --mode v3`, the offline planner consumes raw
+  `module_keys` plus lowered `NameLocation::Global(slot)` load/store sites and
+  serializes matching indexed-global selections into `mod.optv3`.
 - In profile/apply modes, the transformed module object creates an
   indexed unicode dict whose key table matches the lowered module
   global-name table.
@@ -264,6 +271,10 @@ apply/verify mode:
 ### Codegen
 
 - Direct-name global loads/stores use the expected lowered global index.
+- In v3 mode, the selected global load/store must come from the serialized
+  plan. JIT validation rejects any indexed-global emission whose name, access
+  kind, or expected index does not match the lowered `NameLocation::Global`
+  instruction.
 - The emitted fast path calls a local-runtime helper with the globals
   dict, constant key object, and expected index.
 - The helper guards that the globals dict still has an indexed-unicode

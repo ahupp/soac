@@ -5,7 +5,9 @@ use soac_core::block_py::{
     SerializedFunctionDebugName, SerializedFunctionId, SerializedIdentityTables,
     SerializedModuleId, SerializedModuleIdentity, Visit,
 };
-use soac_core::profile::{CounterDumpFile, collect_type_key_layouts, collect_type_table};
+use soac_core::profile::{
+    CounterDumpFile, collect_module_key_layouts, collect_type_key_layouts, collect_type_table,
+};
 use soac_driver::codegen_cache::{
     CachedCodegenModule, CachedCodegenModuleMetadata, PythonModuleCacheSource,
     load_codegen_module_cache, module_optimization_plan_path,
@@ -45,6 +47,8 @@ pub struct ProfileEvidenceStore {
     module_targets_by_runtime_id: HashMap<RuntimeModuleId, PlannedModuleTarget>,
     ambiguous_module_runtime_ids: HashSet<RuntimeModuleId>,
     field_index_specializations_by_attr: HashMap<String, Vec<PlannedIndexedFieldSpecialization>>,
+    global_index_specializations_by_module_name:
+        HashMap<(String, String), Vec<PlannedIndexedGlobalSpecialization>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -153,6 +157,15 @@ struct PlannedModuleTarget {
 pub struct PlannedIndexedFieldSpecialization {
     pub owner_type: PlannedTypeKey,
     pub attr_name: String,
+    pub expected_index: u32,
+}
+
+#[derive(
+    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
+pub struct PlannedIndexedGlobalSpecialization {
+    pub module_name: String,
+    pub name: String,
     pub expected_index: u32,
 }
 
@@ -333,6 +346,27 @@ impl ProfileEvidenceStore {
                 );
             }
         }
+        let module_key_layouts =
+            collect_module_key_layouts(records.as_slice()).map_err(anyhow::Error::msg)?;
+        for (module_name, layouts) in module_key_layouts {
+            for layout in layouts {
+                let specialization = PlannedIndexedGlobalSpecialization {
+                    module_name: module_name.clone(),
+                    name: layout.key,
+                    expected_index: layout.index,
+                };
+                push_unique(
+                    store
+                        .global_index_specializations_by_module_name
+                        .entry((
+                            specialization.module_name.clone(),
+                            specialization.name.clone(),
+                        ))
+                        .or_default(),
+                    specialization,
+                );
+            }
+        }
 
         for ((function_id, instr_id), [false_count, true_count]) in branch_counts {
             if false_count == 0 && true_count == 0 {
@@ -399,6 +433,16 @@ impl ProfileEvidenceStore {
     ) -> Option<&[PlannedIndexedFieldSpecialization]> {
         self.field_index_specializations_by_attr
             .get(attr_name)
+            .map(Vec::as_slice)
+    }
+
+    pub fn global_index_specializations_for_name(
+        &self,
+        module_name: &str,
+        name: &str,
+    ) -> Option<&[PlannedIndexedGlobalSpecialization]> {
+        self.global_index_specializations_by_module_name
+            .get(&(module_name.to_string(), name.to_string()))
             .map(Vec::as_slice)
     }
 
@@ -1434,8 +1478,8 @@ mod tests {
     use super::*;
     use soac_core::block_py::{BlockLabel, InstrId};
     use soac_core::profile::{
-        CounterDumpRecord, CounterDumpRow, CounterDumpTypeKey, CounterDumpTypeKeyLayout,
-        CounterDumpTypeTableEntry,
+        CounterDumpKeyLayout, CounterDumpRecord, CounterDumpRow, CounterDumpTypeKey,
+        CounterDumpTypeKeyLayout, CounterDumpTypeTableEntry,
     };
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1480,6 +1524,11 @@ mod tests {
             attr_name: "x".to_string(),
             expected_index: 2,
         };
+        let global_specialization = PlannedIndexedGlobalSpecialization {
+            module_name: "pkg.mod".to_string(),
+            name: "G".to_string(),
+            expected_index: 1,
+        };
         let rows = vec![
             row(
                 "call_hot_targets",
@@ -1504,7 +1553,11 @@ mod tests {
             module_name: "pkg.mod".to_string(),
             package_name: None,
             rows,
-            module_keys: Vec::new(),
+            module_keys: vec![CounterDumpKeyLayout {
+                owner: "pkg.mod".to_string(),
+                key: "G".to_string(),
+                index: 1,
+            }],
             type_keys: vec![CounterDumpTypeKeyLayout {
                 owner_type_id: 44,
                 key: "x".to_string(),
@@ -1538,6 +1591,12 @@ mod tests {
         assert_eq!(
             store.field_index_specializations_for_attr("x").unwrap(),
             &[field_specialization.clone()]
+        );
+        assert_eq!(
+            store
+                .global_index_specializations_for_name("pkg.mod", "G")
+                .unwrap(),
+            &[global_specialization]
         );
         let v3_evidence = store.evidence_for_runtime_function_v3("pkg.mod", 0x1234, function_id);
         assert_eq!(

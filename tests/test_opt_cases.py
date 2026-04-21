@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -13,6 +14,7 @@ import pytest
 from tests._integration import decide_optimizations_for_work_dir
 
 OPT_TESTS_DIR = Path(__file__).resolve().parent / "opt_tests"
+PLAN_MODE_RE = re.compile(r"^# soac: opt-plan-mode=(legacy|v3)\s*$", re.MULTILINE)
 VERIFY_DELIMITER = "# soac: verify"
 COUNTER_DELIMITER = "# soac: verify-counters"
 
@@ -29,7 +31,7 @@ def _case_paths() -> list[Path]:
     return cases
 
 
-def _split_opt_case(case_path: Path) -> tuple[str, list[dict[str, Any]]]:
+def _split_opt_case(case_path: Path) -> tuple[str, str, list[dict[str, Any]]]:
     source = case_path.read_text(encoding="utf-8")
     if VERIFY_DELIMITER not in source:
         raise ValueError(f"missing opt-test verify delimiter in {case_path}")
@@ -48,15 +50,21 @@ def _split_opt_case(case_path: Path) -> tuple[str, list[dict[str, Any]]]:
                 f"{case_path} counter expectations must not include module; "
                 "the module is implied by the opt-test filename"
             )
+    plan_mode_matches = PLAN_MODE_RE.findall(raw_source)
+    if len(plan_mode_matches) > 1:
+        raise ValueError(f"{case_path} declares multiple opt-test plan modes")
+    plan_mode = plan_mode_matches[0] if plan_mode_matches else "legacy"
     module_source = raw_source.rstrip() + "\n\n" + raw_verify.lstrip()
-    return module_source.rstrip() + "\n", expectations
+    return module_source.rstrip() + "\n", plan_mode, expectations
 
 
-def _soac_subprocess_env(module_root: Path, *, work_dir: Path) -> dict[str, str]:
+def _soac_subprocess_env(
+    module_root: Path, *, work_dir: Path, plan_mode: str
+) -> dict[str, str]:
     env = dict(os.environ)
     env["SOAC_MODULE_ENABLED"] = f"path:{module_root}"
     env["SOAC_WORK_DIR"] = str(work_dir)
-    env["SOAC_OPT_PLAN_MODE"] = "legacy"
+    env["SOAC_OPT_PLAN_MODE"] = plan_mode
     env.pop("SOAC_LOG", None)
     env.pop("SOAC_COMPILE_MODE", None)
     return env
@@ -93,6 +101,12 @@ def _inspect_counter_dump_json(path: Path) -> dict[str, Any]:
     import _soac_ext
 
     return json.loads(_soac_ext.inspect_counter_dump_json(str(path)))
+
+
+def _inspect_v3_plan_json(path: Path) -> dict[str, Any]:
+    import _soac_ext
+
+    return json.loads(_soac_ext.inspect_optimization_artifacts_v3_json(str(path)))
 
 
 def _counter_value(
@@ -142,17 +156,82 @@ def _assert_counter_expectation(
         raise ValueError(f"counter expectation has no comparator: {expectation!r}")
 
 
+def _assert_metric_expectation(
+    actual: int, expected: Any, case_path: Path, label: dict[str, Any]
+) -> None:
+    if isinstance(expected, int):
+        assert actual == expected, (case_path, label, actual)
+        return
+    if not isinstance(expected, dict):
+        raise TypeError(f"metric expectation must be an int or dictionary: {expected!r}")
+    if "equals" in expected:
+        assert actual == expected["equals"], (case_path, label, actual)
+    if "min" in expected:
+        assert actual >= expected["min"], (case_path, label, actual)
+    if "max" in expected:
+        assert actual <= expected["max"], (case_path, label, actual)
+    if not {"equals", "min", "max"} & expected.keys():
+        raise ValueError(f"metric expectation has no comparator: {expected!r}")
+
+
+def _v3_plan_for_module(work_dir: Path, module_name: str) -> dict[str, Any]:
+    plans = [_inspect_v3_plan_json(path) for path in (work_dir / "modules").rglob("mod.optv3")]
+    matches = [
+        plan for plan in plans if plan["module"]["module_name"] == module_name
+    ]
+    assert len(matches) == 1, (module_name, plans)
+    return matches[0]
+
+
+def _assert_v3_plan_expectation(
+    plan: dict[str, Any],
+    expectation: dict[str, Any],
+    case_path: Path,
+) -> None:
+    function_name = expectation.get("function")
+    if function_name is None:
+        raise ValueError(f"v3 plan expectation is missing function: {expectation!r}")
+    functions = [
+        function
+        for function in plan["functions"]
+        if function["debug_name"] == function_name
+    ]
+    assert len(functions) == 1, (case_path, function_name, plan)
+    function = functions[0]
+    for metric in (
+        "regions",
+        "emitted_regions",
+        "scalar_threads",
+        "direct_calls",
+        "emitted_direct_calls",
+        "indexed_fields",
+        "emitted_indexed_fields",
+        "indexed_globals",
+        "emitted_indexed_globals",
+        "diagnostics",
+    ):
+        if metric in expectation:
+            _assert_metric_expectation(
+                function[metric],
+                expectation[metric],
+                case_path,
+                {"function": function_name, "metric": metric},
+            )
+
+
 @pytest.mark.integration
 @pytest.mark.parametrize("case_path", _case_paths(), ids=lambda path: path.stem)
 def test_opt_case_verify_counters(tmp_path: Path, case_path: Path) -> None:
-    source, expectations = _split_opt_case(case_path)
+    source, plan_mode, expectations = _split_opt_case(case_path)
     module_name = case_path.stem
     module_root = tmp_path / "modules"
     module_root.mkdir()
     (module_root / f"{module_name}.py").write_text(source, encoding="utf-8")
 
     work_dir = tmp_path / "soac-work"
-    base_env = _soac_subprocess_env(module_root, work_dir=work_dir)
+    base_env = _soac_subprocess_env(
+        module_root, work_dir=work_dir, plan_mode=plan_mode
+    )
     script = _run_script(module_root, module_name)
 
     profile_result = _run_soac_subprocess(
@@ -161,7 +240,10 @@ def test_opt_case_verify_counters(tmp_path: Path, case_path: Path) -> None:
     )
     _assert_subprocess_ok(profile_result)
     assert (work_dir / "profile.bin").exists()
-    assert decide_optimizations_for_work_dir(work_dir) >= 1
+    assert decide_optimizations_for_work_dir(work_dir, mode=plan_mode) >= 1
+    plan_suffix = ".optv3" if plan_mode == "v3" else ".opt"
+    assert list((work_dir / "modules").rglob(f"*{plan_suffix}"))
+    v3_plan = _v3_plan_for_module(work_dir, module_name) if plan_mode == "v3" else None
 
     verify_result = _run_soac_subprocess(
         script,
@@ -173,6 +255,11 @@ def test_opt_case_verify_counters(tmp_path: Path, case_path: Path) -> None:
     verify = _inspect_counter_dump_json(verify_path)
 
     for expectation in expectations:
-        _assert_counter_expectation(
-            verify, expectation, case_path, module_name=module_name
-        )
+        if expectation.get("type") == "v3_plan":
+            if v3_plan is None:
+                raise ValueError(f"{case_path} has v3 plan expectation in {plan_mode} mode")
+            _assert_v3_plan_expectation(v3_plan, expectation, case_path)
+        else:
+            _assert_counter_expectation(
+                verify, expectation, case_path, module_name=module_name
+            )
