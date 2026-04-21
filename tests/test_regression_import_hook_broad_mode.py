@@ -1095,14 +1095,13 @@ def check_exit():
         assert module.check_exit() is False
 
 
-def test_soac_lone_surrogate_string_literal_raises(tmp_path):
+def test_soac_lone_surrogate_string_literal_uses_replacement_character(tmp_path):
     source = r"""
 VALUE = "\uD82A"
 """
 
-    with pytest.raises(SyntaxError, match="lone surrogate"):
-        with soac_module(tmp_path, "lone_surrogate_string_literal", source):
-            pass
+    with soac_module(tmp_path, "lone_surrogate_string_literal", source) as module:
+        assert module.VALUE == "\ufffd"
 
 
 def test_soac_attribute_assignment_temps_do_not_keep_cycle_alive(tmp_path):

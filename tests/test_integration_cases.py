@@ -15,11 +15,6 @@ MODULES_DIR = Path(__file__).resolve().parent / "integration_modules"
 FRAME_SENSITIVE_BUILTINS_XFAIL = (
     "frame-sensitive locals()/vars()/dir()/eval()/exec() behavior is not supported"
 )
-LONE_SURROGATE_LITERAL_CASES = {
-    "concat_surrogates",
-    "fstring_surrogates",
-    "surrogate_unicode_escape_repr",
-}
 
 
 def _case_paths() -> list[Path]:
@@ -66,12 +61,6 @@ def test_integration_case(tmp_path: Path, case_path: Path, mode: str) -> None:
 
     source, validate_source = split_integration_case(case_path)
     module_name = case_path.stem
-
-    if mode in {"soac", "entry"} and case_path.stem in LONE_SURROGATE_LITERAL_CASES:
-        with pytest.raises(SyntaxError, match="lone surrogate"):
-            with integration_module(tmp_path, module_name, source, mode=mode):
-                pass
-        return
 
     sys.path.insert(0, str(MODULES_DIR))
     try:

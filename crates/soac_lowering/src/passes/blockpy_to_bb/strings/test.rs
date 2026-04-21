@@ -1,6 +1,6 @@
 use super::normalize_bb_module_strings;
 use crate::{
-    block_py::{ChildVisitable, InstrCodegen, InstrResolved, Literal, NameLike},
+    block_py::{ChildVisitable, InstrCodegen, InstrResolved, Literal, NameLike, Visit},
     lower_python_to_blockpy_for_testing,
     passes::lower_try_jump_exception_flow,
 };
@@ -24,6 +24,32 @@ fn module_constants_contain_string(exprs: &[InstrResolved]) -> bool {
                 if matches!(literal.as_literal(), Literal::StringLiteral(_))
         )
     })
+}
+
+fn lowered_string_values(source: &str) -> Vec<String> {
+    struct StringLiteralCollector {
+        values: Vec<String>,
+    }
+
+    impl Visit<InstrResolved> for StringLiteralCollector {
+        fn visit_instr(&mut self, expr: &InstrResolved) {
+            if let InstrResolved::Literal(literal) = expr {
+                if let Literal::StringLiteral(value) = literal.as_literal() {
+                    self.values.push(value.value.clone());
+                }
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    let module = lower_python_to_blockpy_for_testing(source)
+        .expect("transform should succeed")
+        .codegen_module;
+    let mut collector = StringLiteralCollector { values: Vec::new() };
+    for constant in &module.module_constants {
+        collector.visit_instr(constant);
+    }
+    collector.values
 }
 
 fn collect_helper_like_names_in_expr(out: &mut Vec<String>, expr: &InstrCodegen) {
@@ -183,26 +209,27 @@ def f(obj, mapping, key, value):
 }
 
 #[test]
-fn rejects_lone_surrogate_escaped_string_literals() {
-    for source in [
-        "def f():\n    return \"\\udca7\" \"b\"\n",
-        "def f():\n    return f\"\\udca7{x}\"\n",
+fn replaces_lone_surrogate_escaped_string_literals() {
+    for (source, expected) in [
+        ("def f():\n    return \"\\udca7\" \"b\"\n", "\u{FFFD}b"),
+        ("def f(x):\n    return f\"\\udca7{x}\"\n", "\u{FFFD}"),
+        ("def f(x):\n    return f\"{x:\\udca7}\"\n", "\u{FFFD}"),
     ] {
-        let err = match lower_python_to_blockpy_for_testing(source) {
-            Ok(_) => panic!("lone surrogate string literals should fail explicitly"),
-            Err(err) => err,
-        };
+        let values = lowered_string_values(source);
         assert!(
-            err.to_string().contains("lone surrogate"),
-            "unexpected error: {err}"
+            values.iter().any(|value| value == expected),
+            "expected {expected:?} in {values:?}"
         );
     }
 
-    for source in [
-        "def f():\n    return r\"\\udca7\" \"b\"\n",
-        "def f(x):\n    return rf\"\\udca7{x}\"\n",
+    for (source, expected) in [
+        ("def f():\n    return r\"\\udca7\" \"b\"\n", "\\udca7b"),
+        ("def f(x):\n    return rf\"\\udca7{x}\"\n", "\\udca7"),
     ] {
-        lower_python_to_blockpy_for_testing(source)
-            .expect("raw string literals should preserve backslash-u text");
+        let values = lowered_string_values(source);
+        assert!(
+            values.iter().any(|value| value == expected),
+            "expected {expected:?} in {values:?}"
+        );
     }
 }

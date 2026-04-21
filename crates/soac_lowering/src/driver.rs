@@ -5,7 +5,6 @@ use crate::passes::ast_to_ast::rewrite_class_def;
 use crate::passes::ast_to_ast::rewrite_expr::ScopedHelperExprPass;
 use crate::passes::ast_to_ast::{
     body::Suite, rewrite_future_annotations, rewrite_stmt, semantic::SemanticAstState,
-    string_templates,
 };
 use crate::passes::core_await_lower::lower_awaits_in_core_blockpy_module;
 use crate::passes::ruff_to_blockpy::rewrite_ast_to_core_blockpy_module_with_module;
@@ -84,8 +83,6 @@ pub fn lower_source_to_codegen_module_with_tracker(
         pass_tracker.record_timing("parse", || -> std::result::Result<_, ParseError> {
             let mut module = parse_module(source).map(|module| module.into_syntax())?;
             rewrite_future_annotations::rewrite(&mut module.body)?;
-            let context = Context::new(source);
-            string_templates::reject_lone_surrogate_string_literals(&context, &mut module.body)?;
             Ok(module)
         })?;
 
