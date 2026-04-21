@@ -21720,6 +21720,54 @@ fn emit_typed_codegen_stmt_result_with_local_env(
             func_imports,
         );
     }
+    if let InstrTyped::GetAttrTyped(op) = expr {
+        let result = if let TypedAttrAccessPlan::ProfiledIndexedField { guards } = &op.access {
+            emit_typed_profiled_indexed_getattr(
+                fb,
+                op,
+                guards,
+                local_env,
+                emit_ctx,
+                codegen_env,
+                func_imports,
+            )?
+        } else {
+            None
+        };
+        let result = match result {
+            Some(result) => result,
+            None => {
+                emit_typed_getattr_fallback(fb, op, local_env, emit_ctx, codegen_env, func_imports)?
+            }
+        };
+        let (value, ownership, facts) = result.expect_pyobject("typed getattr statement result");
+        return Ok(match demand {
+            ResultDemand::EffectOnly => {
+                if ownership.is_owned() && !facts.is_immortal() {
+                    fb.ins().call(
+                        emit_ctx.decref_ref,
+                        &[emit_ctx.consts.thread_state_value, value],
+                    );
+                }
+                EmitResult::no_value()
+            }
+            ResultDemand::PyObject { .. } => {
+                if !ownership.can_satisfy_pyobject_demand(demand) {
+                    return Err(format!(
+                        "typed getattr statement result produced {ownership:?}, but demand is {demand:?}"
+                    ));
+                }
+                EmitResult::PyObject {
+                    value,
+                    ownership,
+                    facts,
+                }
+            }
+            ResultDemand::I32Bool01 | ResultDemand::I64 | ResultDemand::I64Index => {
+                panic!("typed getattr cannot satisfy non-PyObject demand {demand:?}")
+            }
+        });
+    }
     if let InstrTyped::SetAttrTyped(op) = expr {
         if let TypedAttrAccessPlan::ProfiledIndexedField { guards } = &op.access {
             if let Some(result) = emit_typed_profiled_indexed_setattr(

@@ -5,6 +5,22 @@ optimization attempts made by Codex agents. Keep entries succinct: what
 changed or was tried, which jj change id carried it when landed, the
 benchmarked throughput delta, and the headline pre/post numbers.
 
+## 2026-04-21 - Fix v3 indexed-field receiver lowering
+
+- jj change id: `ltxokuuw`
+- summary: `GetAttrTyped` statement results now consume v3 emitted indexed-field
+  load decisions directly, so loads used as local-store RHS values take the
+  same profiled indexed fast path as expression-position loads.
+- throughput: `+1.61%` median versus the previous mechanical v3 indexed-field
+  change
+- pre-change benchmark: apply, refcounts enabled, 1M loops x3 median
+  `239058 loops/s`; core pystone code size `50323 bytes`
+- post-change benchmark: apply, refcounts enabled, 1M loops x3 median
+  `242905 loops/s`; core pystone code size `50667 bytes`
+- indexed-field counters: `2525030` to `2929030` hits and `1010107` to
+  `606107` fallbacks in a 100k-loop verify run
+- result directory: `work/bench/ltxokuuwvptz`
+
 ## 2026-04-21 - Route indexed fields through optimizer v3
 
 - jj change ids: `mnltztnt`, `ntmvkovm`

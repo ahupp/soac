@@ -6988,6 +6988,35 @@ class Record:
         }
     }
 
+    fn first_getattr_instr_id(function: &BlockPyFunction<CodegenModuleShape>) -> InstrId {
+        struct GetAttrFinder {
+            instr_id: Option<InstrId>,
+        }
+
+        impl Visit<InstrCodegen> for GetAttrFinder {
+            fn visit_instr(&mut self, expr: &InstrCodegen)
+            where
+                InstrCodegen: ChildVisitable<InstrCodegen>,
+            {
+                if self.instr_id.is_none()
+                    && let InstrCodegen::GetAttr(_) = expr
+                {
+                    self.instr_id = Some(expr.semantic_instr_id());
+                }
+                expr.visit_children(self);
+            }
+        }
+
+        let mut finder = GetAttrFinder { instr_id: None };
+        for block in &function.blocks {
+            for expr in &block.body {
+                finder.visit_instr(expr);
+            }
+            finder.visit_term(&block.term);
+        }
+        finder.instr_id.expect("function should contain a GetAttr")
+    }
+
     #[test]
     fn field_index_specialized_getattr_hits_apply_mode_fast_path() {
         if crate::run_test_in_isolated_process_if_needed(
@@ -7065,25 +7094,7 @@ def read_point(point):
                 .find(|function| function.names.bind_name == "read_point")
                 .expect("missing lowered function read_point")
                 .clone();
-            let getattr_instr_id = function
-                .blocks
-                .iter()
-                .find_map(|block| {
-                    block
-                        .body
-                        .iter()
-                        .find_map(|expr| match expr {
-                            InstrCodegen::GetAttr(_) => Some(expr.semantic_instr_id()),
-                            _ => None,
-                        })
-                        .or_else(|| match &block.term {
-                            BlockTerm::Return(InstrCodegen::GetAttr(expr)) => {
-                                Some(expr.semantic_instr_id())
-                            }
-                            _ => None,
-                        })
-                })
-                .expect("read_point should contain a GetAttr");
+            let getattr_instr_id = first_getattr_instr_id(&function);
             let field_counter_sites = lowered
                 .counter_defs
                 .iter()
@@ -7229,6 +7240,242 @@ def read_point(point):
                 None => std::env::remove_var("SOAC_OPT_MODE"),
             }
         }
+    }
+
+    #[test]
+    fn v3_field_indexed_getattr_store_rhs_hits_apply_mode_fast_path() {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "v3_field_indexed_getattr_store_rhs_hits_apply_mode_fast_path",
+        ) {
+            return;
+        }
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| {
+            let soac_work_dir = fresh_test_work_dir("v3-field-getattr-store-rhs");
+            let module_cache_root = soac_work_dir.join("modules");
+            let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
+            let _opt_mode = EnvVarGuard::set("SOAC_OPT_MODE", "apply");
+            let _plan_mode = EnvVarGuard::set(SOAC_OPT_PLAN_MODE_ENV, "v3");
+            let owner_module = PyModule::from_code(
+                py,
+                c"
+class Point:
+    pass
+",
+                c"field_type_test.py",
+                c"field_type_test",
+            )
+            .expect("owner module should execute");
+            let sys = PyModule::import(py, "sys").expect("sys should import");
+            let modules = sys
+                .getattr("modules")
+                .expect("sys.modules should exist")
+                .cast_into::<pyo3::types::PyDict>()
+                .expect("sys.modules should be a dict");
+            modules
+                .set_item("field_type_test", owner_module.as_any())
+                .expect("owner module should be registered");
+
+            let module_name = "counter_test";
+            let mut lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+                r#"
+def read_point(point):
+    value = point.x
+    return value
+"#,
+            )
+            .expect("lowering should succeed")
+            .codegen_module;
+            instrument_bb_module_with_call_target_counters(&mut lowered);
+            let function = lowered
+                .callable_defs
+                .iter()
+                .find(|function| function.names.bind_name == "read_point")
+                .expect("missing lowered function read_point")
+                .clone();
+            let getattr_instr_id = first_getattr_instr_id(&function);
+            let field_counter_sites = lowered
+                .counter_defs
+                .iter()
+                .filter_map(|counter| match &counter.site {
+                    CounterSite::Runtime {
+                        function_id: Some(counter_function_id),
+                        instr_id: Some(counter_instr_id),
+                    } if *counter_function_id == function.function_id
+                        && counter.kind.starts_with("field_indexed") =>
+                    {
+                        Some(format!("{}@{:?}", counter.kind, counter_instr_id))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let hit_counter_id = lowered
+                .counter_defs
+                .iter()
+                .find_map(|counter| match &counter.site {
+                    CounterSite::Runtime {
+                        function_id: Some(counter_function_id),
+                        instr_id: Some(counter_instr_id),
+                    } if counter.kind == "field_indexed_hit"
+                        && *counter_function_id == function.function_id
+                        && *counter_instr_id == getattr_instr_id =>
+                    {
+                        Some(counter.id)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "missing field_indexed_hit counter for GetAttr {:?} in {:?}",
+                        getattr_instr_id, field_counter_sites
+                    )
+                });
+            let fallback_counter_id = lowered
+                .counter_defs
+                .iter()
+                .find_map(|counter| match &counter.site {
+                    CounterSite::Runtime {
+                        function_id: Some(counter_function_id),
+                        instr_id: Some(counter_instr_id),
+                    } if counter.kind == "field_indexed_fallback"
+                        && *counter_function_id == function.function_id
+                        && *counter_instr_id == getattr_instr_id =>
+                    {
+                        Some(counter.id)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "missing field_indexed_fallback counter for GetAttr {:?} in {:?}",
+                        getattr_instr_id, field_counter_sites
+                    )
+                });
+
+            let shared_state =
+                crate::module_type::build_shared_state_for_testing(py, lowered, module_name, "")
+                    .expect("shared state should build");
+            let current_function = shared_state
+                .lookup_function(function.function_id)
+                .expect("read_point should be present in shared state");
+            let cache_identity = pre_optimization_module_cache_identity(
+                env!("SOAC_BUILD_IDENTITY"),
+                shared_state.module_name == "soac.runtime",
+            );
+            let mut artifacts = test_empty_v3_artifacts_for_function(
+                module_name,
+                shared_state.source_hash,
+                cache_identity.as_str(),
+                0,
+                current_function,
+            );
+            let owner_type = IndexedFieldOwnerType {
+                module_name: "field_type_test".to_string(),
+                qualname: "Point".to_string(),
+            };
+            artifacts.plan.functions[0]
+                .indexed_fields
+                .push(IndexedFieldSpecializationPlan {
+                    source: getattr_instr_id,
+                    access: IndexedFieldAccessKind::Load,
+                    owner_type: owner_type.clone(),
+                    attr_name: "x".to_string(),
+                    expected_index: 0,
+                    reason: "profiled type_keys selected this indexed-field layout".to_string(),
+                });
+            artifacts.emission.functions[0].indexed_fields.push(
+                soac_opt::emit_v3::MechanicalIndexedFieldEmission {
+                    source: getattr_instr_id,
+                    access: IndexedFieldAccessKind::Load,
+                    owner_type,
+                    attr_name: "x".to_string(),
+                    expected_index: 0,
+                    reason: "profiled type_keys selected this indexed-field layout".to_string(),
+                },
+            );
+            let v3_path = module_optimization_plan_v3_path(
+                module_cache_root.as_path(),
+                PythonModuleCacheSource::Project,
+                module_name,
+            )
+            .expect("v3 test optimization plan path should build");
+            write_test_optimization_artifacts_v3(v3_path.as_path(), &artifacts);
+
+            let runtime = unsafe { build_test_module_runtime(py, shared_state.clone()) };
+            let module_constant_ptrs = shared_state.module_constant_ptrs();
+            let blocks = vec![std::ptr::null_mut::<c_void>(); function.blocks.len()];
+            let compile_session = crate::session::CompileSession::process();
+            let compiled_handle = unsafe {
+                compile_cranelift_run_bb_specialized_cached(
+                    &compile_session,
+                    &blocks,
+                    &shared_state.lowered_module,
+                    &function,
+                    &shared_state.codegen_constants,
+                    &shared_state.lowered_module.counter_defs,
+                    &module_constant_ptrs,
+                    Some(shared_state.as_ref()),
+                )
+            }
+            .expect("specialized read_point should compile");
+            let (code_ptr, _default_code_ptr, param_count) = compiled_handle
+                .handle
+                .direct_runner_info()
+                .expect("compiled direct runner should expose entrypoint");
+            assert_eq!(param_count, 1, "read_point should take one direct arg");
+            let entry: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> *mut c_void =
+                unsafe { std::mem::transmute(code_ptr) };
+
+            let point_type = owner_module
+                .getattr("Point")
+                .expect("Point should exist on owner module");
+            let point = unsafe { ffi::PyObject_CallNoArgs(point_type.as_ptr()) };
+            assert!(!point.is_null(), "Point() should create a test instance");
+            let point_obj = unsafe { pyo3::Bound::from_borrowed_ptr(py, point) };
+            point_obj
+                .setattr("x", 123_456_i64)
+                .expect("Point instance should accept x");
+
+            let mut function_context = test_function_jit_context(&runtime, std::ptr::null_mut());
+            let thread_state = unsafe { ffi::PyThreadState_Get() }.cast::<c_void>();
+            let result = unsafe {
+                entry(
+                    std::ptr::addr_of_mut!(function_context).cast(),
+                    thread_state,
+                    point.cast(),
+                )
+            };
+            assert!(
+                !result.is_null(),
+                "read_point should return the stored value"
+            );
+
+            assert_eq!(
+                shared_state.counter_value(hit_counter_id),
+                1,
+                "v3 indexed GetAttr used as a store RHS should take the fast path"
+            );
+            assert_eq!(
+                shared_state.counter_value(fallback_counter_id),
+                0,
+                "v3 indexed GetAttr used as a store RHS should avoid generic getattr"
+            );
+
+            let result_obj = unsafe { pyo3::Bound::from_owned_ptr(py, result.cast()) };
+            assert_eq!(
+                result_obj
+                    .extract::<i64>()
+                    .expect("read_point result should be an int"),
+                123_456
+            );
+
+            unsafe { ffi::Py_DECREF(point) };
+            modules
+                .del_item("field_type_test")
+                .expect("owner module should be removed");
+        });
     }
 
     fn build_field_indexed_specialization_for_source(
