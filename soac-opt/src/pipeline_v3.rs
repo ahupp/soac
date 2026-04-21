@@ -26,7 +26,7 @@ use soac_core::block_py::{
     FunctionExecutionMode, HasSemanticInstrId, InstrId, LocalFunctionId, ParamKind,
     RuntimeModuleId, SerializedFunctionId, SerializedModuleId, Visit,
 };
-use soac_lowering::codegen_cache::{
+use soac_driver::codegen_cache::{
     CachedCodegenModule, CachedCodegenModuleMetadata, load_codegen_module_cache,
     module_optimization_plan_v3_path,
 };

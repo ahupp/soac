@@ -29,7 +29,7 @@ pub struct RecordingPassTracker {
     timings: Vec<PassTiming>,
 }
 
-pub(crate) trait PassTracker {
+pub trait PassTracker {
     fn run_pass<T, F>(&mut self, name: &str, build: F) -> T
     where
         T: Clone + Any + PrettyPrint,

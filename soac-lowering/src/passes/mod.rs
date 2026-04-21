@@ -2730,10 +2730,13 @@ pub use ownership_effects::{
     RefcountSite,
 };
 pub use trace::{
-    define_bb_module_deopt_entry_counters, deopt_entry_counter_instrumentation_enabled,
+    call_target_counter_instrumentation_enabled, define_bb_module_deopt_entry_counters,
+    deopt_entry_counter_instrumentation_enabled, instrument_bb_module_for_trace,
     instrument_bb_module_with_block_entry_counters, instrument_bb_module_with_call_target_counters,
     instrument_bb_module_with_global_load_counters, instrument_bb_module_with_locality_counters,
-    instrument_bb_module_with_refcount_counters, specialization_runtime_logging_enabled,
+    instrument_bb_module_with_refcount_counters, locality_counter_instrumentation_enabled,
+    parse_trace_env, refcount_counter_instrumentation_enabled,
+    specialization_runtime_logging_enabled,
 };
 pub use value_facts::{
     infer_module_value_facts, BoolFacts, BoolSingletonFact, CallableFact, EnvFacts, FactStore,
@@ -2744,12 +2747,6 @@ pub use value_facts::{
 
 pub(crate) use global_index::lower_global_index_in_resolved_module_default;
 pub(crate) use name_binding::lower_name_binding_in_core_blockpy_module_with_options;
-pub(crate) use trace::{
-    call_target_counter_instrumentation_enabled, instrument_bb_module_for_trace,
-    locality_counter_instrumentation_enabled, parse_trace_env,
-    refcount_counter_instrumentation_enabled,
-};
-
 pub fn relabel_dense_bb_module<P: ModuleShape>(module: &mut BlockPyModule<P>) {
     for callable in &mut module.callable_defs {
         relabel_blockpy_blocks_dense(&mut callable.blocks);

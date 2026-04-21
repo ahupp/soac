@@ -1,8 +1,7 @@
 #![recursion_limit = "256"]
 
 use crate::block_py::{BlockPyModule, ModuleNameGen};
-pub use crate::driver::LoweringOptions;
-use crate::driver::{rewrite_module_with_tracker, rewrite_module_with_tracker_with_options};
+pub use crate::driver::{lower_source_to_codegen_module_with_tracker, LoweringOptions};
 use crate::pass_tracker::{NoopPassTracker, PassTracker, RecordingPassTracker};
 use crate::passes::CodegenModuleShape;
 use anyhow::Error as AnyhowError;
@@ -11,11 +10,9 @@ use ruff_python_codegen::{Generator, Indentation};
 pub use ruff_python_parser::ParseError;
 use ruff_source_file::LineEnding;
 use ruff_text_size::TextRange;
-use soac_config::{init_logging_with_config, SoacEnvConfig};
 use std::time::{Duration, Instant};
 
 pub mod block_py;
-pub mod codegen_cache;
 mod driver;
 pub mod fixture;
 mod namegen;
@@ -94,47 +91,21 @@ where
 fn lower_python_to_blockpy_with_tracker_and_options<P>(
     source: &str,
     module_name_gen: ModuleNameGen,
-    pass_tracker: P,
-    options: LoweringOptions,
-) -> Result<LoweringResult<P>>
-where
-    P: PassTracker,
-{
-    let env_config = SoacEnvConfig::from_env().map_err(anyhow::Error::msg)?;
-    lower_python_to_blockpy_with_tracker_options_and_config(
-        source,
-        module_name_gen,
-        pass_tracker,
-        options,
-        &env_config,
-    )
-}
-
-fn lower_python_to_blockpy_with_tracker_options_and_config<P>(
-    source: &str,
-    module_name_gen: ModuleNameGen,
     mut pass_tracker: P,
     options: LoweringOptions,
-    env_config: &SoacEnvConfig,
 ) -> Result<LoweringResult<P>>
 where
     P: PassTracker,
 {
-    init_logging_with_config(env_config).map_err(anyhow::Error::msg)?;
-    namegen::reset_namegen_state();
+    reset_lowering_state();
     let total_start = Instant::now();
 
-    let codegen_module = if options == LoweringOptions::default() {
-        rewrite_module_with_tracker(source, module_name_gen, &mut pass_tracker, env_config)?
-    } else {
-        rewrite_module_with_tracker_with_options(
-            source,
-            module_name_gen,
-            &mut pass_tracker,
-            options,
-            env_config,
-        )?
-    };
+    let codegen_module = lower_source_to_codegen_module_with_tracker(
+        source,
+        module_name_gen,
+        &mut pass_tracker,
+        options,
+    )?;
 
     Ok(LoweringResult {
         total_time: total_start.elapsed(),
@@ -143,21 +114,12 @@ where
     })
 }
 
-pub fn lower_python_to_blockpy_for_testing(source: &str) -> Result<LoweringResult> {
-    lower_python_to_blockpy_with_tracker(source, ModuleNameGen::new(0), RecordingPassTracker::new())
+pub fn reset_lowering_state() {
+    namegen::reset_namegen_state();
 }
 
-pub fn lower_python_to_blockpy_for_testing_with_config(
-    source: &str,
-    env_config: &SoacEnvConfig,
-) -> Result<LoweringResult> {
-    lower_python_to_blockpy_with_tracker_options_and_config(
-        source,
-        ModuleNameGen::new(0),
-        RecordingPassTracker::new(),
-        LoweringOptions::default(),
-        env_config,
-    )
+pub fn lower_python_to_blockpy_for_testing(source: &str) -> Result<LoweringResult> {
+    lower_python_to_blockpy_with_tracker(source, ModuleNameGen::new(0), RecordingPassTracker::new())
 }
 
 pub fn lower_python_to_blockpy(

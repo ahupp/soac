@@ -1,12 +1,12 @@
-use crate::block_py::{
-    walk_expr_mut, walk_module_mut, BlockPyFunction, BlockPyModule, CounterSite, FunctionNameGen,
-    ModuleNameGen, RuntimeFunctionId, RuntimeModuleId, VisitMut,
+use anyhow::{Context, Result, anyhow, bail};
+use soac_lowering::block_py::{
+    BlockPyFunction, BlockPyModule, CounterSite, FunctionNameGen, ModuleNameGen, RuntimeFunctionId,
+    RuntimeModuleId, VisitMut, walk_expr_mut, walk_module_mut,
 };
-use crate::passes::{
+use soac_lowering::passes::{
     CodegenModuleShape, EscapeSummaryModule, FactStore, InlinePlanModule, InstrCodegen,
     LocalEnvModulePlan, LocalEnvResumeModulePlan, RefcountPlan,
 };
-use anyhow::{anyhow, bail, Context, Result};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -350,7 +350,7 @@ impl FunctionIdRemapper {
 impl VisitMut<InstrCodegen> for FunctionIdRemapper {
     fn visit_instr_mut(&mut self, expr: &mut InstrCodegen)
     where
-        InstrCodegen: crate::block_py::ChildVisitable<InstrCodegen>,
+        InstrCodegen: soac_lowering::block_py::ChildVisitable<InstrCodegen>,
     {
         match expr {
             InstrCodegen::CallDirect(op) => {
@@ -501,20 +501,19 @@ fn temp_cache_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod test {
     use super::{
-        codegen_module_cache_key, codegen_module_cache_path, load_codegen_module_cache,
-        module_cache_artifact_path, module_optimization_plan_path,
+        CachedCodegenModuleMetadata, CachedPreparedCodegen, ModuleCacheArtifact,
+        PythonModuleCacheSource, codegen_module_cache_key, codegen_module_cache_path,
+        load_codegen_module_cache, module_cache_artifact_path, module_optimization_plan_path,
         module_optimization_plan_v3_path, module_profile_path,
         remap_cached_codegen_module_function_ids, remap_codegen_module_function_ids,
         store_codegen_module_cache, validate_codegen_module_cache_metadata,
-        CachedCodegenModuleMetadata, CachedPreparedCodegen, ModuleCacheArtifact,
-        PythonModuleCacheSource,
     };
-    use crate::block_py::{
-        walk_block, walk_expr, BlockPyModule, ChildVisitable, HasSemanticInstrId, InstrCodegen,
-        ModuleNameGen, RuntimeFunctionId, Visit,
+    use soac_lowering::block_py::{
+        BlockPyModule, ChildVisitable, HasSemanticInstrId, InstrCodegen, ModuleNameGen,
+        RuntimeFunctionId, Visit, walk_block, walk_expr,
     };
-    use crate::lower_python_to_blockpy_for_testing;
-    use crate::passes::{self, CodegenModuleShape};
+    use soac_lowering::lower_python_to_blockpy_for_testing;
+    use soac_lowering::passes::{self, CodegenModuleShape};
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -687,12 +686,10 @@ def g(y):
             PathBuf::from("/cache/root/project/pkg/submod/mod.blockpy")
         );
 
-        assert!(codegen_module_cache_path(
-            &root,
-            PythonModuleCacheSource::PythonStdlib,
-            "../escape"
-        )
-        .is_err());
+        assert!(
+            codegen_module_cache_path(&root, PythonModuleCacheSource::PythonStdlib, "../escape")
+                .is_err()
+        );
     }
 
     #[test]
@@ -892,7 +889,7 @@ def outer(value):
     }
 
     fn summarize_function(
-        function: &crate::block_py::BlockPyFunction<CodegenModuleShape>,
+        function: &soac_lowering::block_py::BlockPyFunction<CodegenModuleShape>,
     ) -> FunctionSummary {
         FunctionSummary {
             function_id: function.function_id,
@@ -913,7 +910,7 @@ def outer(value):
     }
 
     fn instr_ids(
-        function: &crate::block_py::BlockPyFunction<CodegenModuleShape>,
+        function: &soac_lowering::block_py::BlockPyFunction<CodegenModuleShape>,
     ) -> Vec<(u32, u32)> {
         let mut collector = InstrIdCollector {
             instr_ids: Vec::new(),

@@ -26,7 +26,7 @@ mod tests {
     use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyModule, PyModuleMethods, PyTuple};
     use pyo3::{Bound, Py, PyAny, PyErr, PyResult, Python, ffi};
     use ruff_python_ast as ast;
-    use soac_lowering::codegen_cache::{
+    use soac_driver::codegen_cache::{
         PythonModuleCacheSource, module_optimization_plan_path, module_optimization_plan_v3_path,
     };
     use soac_lowering::passes::{TypedInstrExtra, TypedPlannedResult as PlannedResult};

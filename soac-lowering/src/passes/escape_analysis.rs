@@ -53,10 +53,7 @@ impl EscapeSummaryModule {
 }
 
 impl PrettyPrint for EscapeSummaryModule {
-    fn fmt_pretty(
-        &self,
-        printer: &mut crate::block_py::PrettyPrinter<'_>,
-    ) -> std::fmt::Result {
+    fn fmt_pretty(&self, printer: &mut crate::block_py::PrettyPrinter<'_>) -> std::fmt::Result {
         let mut function_ids = self.functions.keys().copied().collect::<Vec<_>>();
         function_ids.sort_by_key(|function_id| function_id.to_packed_runtime_u64());
         let mut out = String::new();
@@ -954,8 +951,6 @@ mod tests {
             ModuleNameGen::new(0),
             LoweringOptions {
                 runtime_names_as_globals: true,
-                pre_optimization_cache_path: None,
-                pre_optimization_cache_metadata: None,
             },
         )
         .expect("transform should succeed")

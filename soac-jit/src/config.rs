@@ -7,8 +7,8 @@ pub(crate) use soac_config::{SOAC_JIT_EMIT_REFCOUNTS_ENV, SOAC_OPT_PLAN_MODE_ENV
 use soac_config::{
     SoacEnvConfig, precompiled_library_path_from_env as config_precompiled_library_path_from_env,
 };
-pub use soac_lowering::codegen_cache::CachedCodegenModuleMetadata;
-use soac_lowering::codegen_cache::{
+pub use soac_driver::codegen_cache::CachedCodegenModuleMetadata;
+use soac_driver::codegen_cache::{
     module_optimization_plan_path as blockpy_module_optimization_plan_path,
     module_optimization_plan_v3_path as blockpy_module_optimization_plan_v3_path,
     pre_optimization_module_cache_identity as blockpy_pre_optimization_module_cache_identity,
@@ -147,4 +147,4 @@ pub fn module_optimization_plan_v3_path(
 pub(crate) fn precompiled_library_path_from_env() -> Result<Option<PathBuf>, String> {
     config_precompiled_library_path_from_env()
 }
-pub use soac_lowering::codegen_cache::PythonModuleCacheSource;
+pub use soac_driver::codegen_cache::PythonModuleCacheSource;

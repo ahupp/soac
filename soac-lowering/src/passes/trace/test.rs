@@ -1,20 +1,16 @@
 use super::{
     instrument_bb_module_for_trace, instrument_bb_module_with_global_load_counters,
-    instrument_bb_module_with_locality_counters, parse_trace_config,
-    refcount_counter_instrumentation_enabled, TraceConfig,
+    instrument_bb_module_with_locality_counters, parse_trace_config, TraceConfig,
 };
 use crate::block_py::{
     BlockPyFunction, Call, ChildVisitable, CounterScope, CounterSite, InstrCodegen, NameLike,
     NameLocation, Visit,
 };
+use crate::lower_python_to_blockpy_for_testing;
 use crate::passes::{
     assign_module_instr_ids, lower_try_jump_exception_flow, normalize_bb_module_strings,
     CodegenModuleShape,
 };
-use crate::{lower_python_to_blockpy_for_testing, lower_python_to_blockpy_for_testing_with_config};
-use soac_config::{SoacEnvConfig, SoacLogConfig, SpecializationMode};
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn tracked_name_binding_module(
     source: &str,
@@ -63,19 +59,6 @@ fn expr_tree_contains_local_load(expr: &InstrCodegen) -> bool {
     let mut probe = LocalLoadProbe { found: false };
     probe.visit_instr(expr);
     probe.found
-}
-
-fn config_for_mode(mode: SpecializationMode) -> SoacEnvConfig {
-    SoacEnvConfig::default().with_specialization_mode(Some(mode))
-}
-
-fn fresh_test_work_dir(label: &str) -> PathBuf {
-    static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
-    std::env::temp_dir().join(format!(
-        "soac-blockpy-{label}-{}-{}",
-        std::process::id(),
-        NEXT_ID.fetch_add(1, Ordering::Relaxed)
-    ))
 }
 
 #[test]
@@ -208,123 +191,5 @@ fn adds_branch_outcome_counters_for_conditional_terms() {
             }
         ),
         "branch outcome counter should point at the conditional test instruction"
-    );
-}
-
-#[test]
-fn lowering_profile_mode_adds_block_entry_counters() {
-    let config = config_for_mode(SpecializationMode::Profile);
-    let source = "def f(x):\n    if x:\n        return 1\n    return 0\n";
-    let lowered = lower_python_to_blockpy_for_testing_with_config(source, &config)
-        .expect("transform should succeed")
-        .codegen_module;
-
-    let block_entry_counters = lowered
-        .counter_defs
-        .iter()
-        .filter(|counter| counter.kind == "block_entry")
-        .collect::<Vec<_>>();
-    let total_blocks = lowered
-        .callable_defs
-        .iter()
-        .map(|function| function.blocks.len())
-        .sum::<usize>();
-    assert_eq!(
-        block_entry_counters.len(),
-        total_blocks,
-        "profile lowering should attach one block_entry counter per lowered block"
-    );
-    assert!(block_entry_counters.iter().all(|counter| {
-        counter.scope == CounterScope::This
-            && matches!(counter.site, CounterSite::BlockEntry { .. })
-    }));
-    assert_eq!(
-        lowered
-            .counter_defs
-            .iter()
-            .filter(|counter| counter.kind == "branch_outcomes")
-            .count(),
-        1,
-        "profile lowering should still add branch_outcomes counters"
-    );
-}
-
-#[test]
-fn lowering_verify_mode_adds_refcount_counters_only_in_verify() {
-    let source = "def f(x):\n    y = x\n    return y\n";
-
-    {
-        let config = config_for_mode(SpecializationMode::Verify);
-        assert!(refcount_counter_instrumentation_enabled(&config));
-        let lowered = lower_python_to_blockpy_for_testing_with_config(source, &config)
-            .expect("transform should succeed")
-            .codegen_module;
-        let refcount_counters = lowered
-            .counter_defs
-            .iter()
-            .filter(|counter| counter.kind == "runtime_incref" || counter.kind == "runtime_decref")
-            .collect::<Vec<_>>();
-        assert_eq!(refcount_counters.len(), lowered.callable_defs.len() * 2);
-        assert!(refcount_counters.iter().all(|counter| {
-            counter.scope == CounterScope::Function
-                && matches!(
-                    counter.site,
-                    CounterSite::Runtime {
-                        function_id: Some(_),
-                        instr_id: None,
-                    }
-                )
-        }));
-    }
-
-    for mode in [SpecializationMode::Profile, SpecializationMode::Apply] {
-        let config = config_for_mode(mode);
-        assert!(!refcount_counter_instrumentation_enabled(&config));
-        let lowered = lower_python_to_blockpy_for_testing_with_config(source, &config)
-            .expect("transform should succeed")
-            .codegen_module;
-        assert!(
-            lowered.counter_defs.iter().all(|counter| counter.kind != "runtime_incref"
-                && counter.kind != "runtime_decref"),
-            "{mode:?} lowering should not add refcount counters"
-        );
-    }
-}
-
-#[test]
-fn lowering_apply_mode_keeps_only_deopt_entry_counters_even_with_runtime_logging() {
-    let config = config_for_mode(SpecializationMode::Apply)
-        .with_soac_work_dir(Some(fresh_test_work_dir("apply-counter")))
-        .with_soac_log(
-            SoacLogConfig {
-                filter: "soac_specialization_runtime=info".to_string(),
-                json_path: None,
-            },
-            true,
-        );
-    let source = "VALUE = 7\n\ndef read(x):\n    return x + VALUE\n";
-    let lowered = lower_python_to_blockpy_for_testing_with_config(source, &config)
-        .expect("transform should succeed")
-        .codegen_module;
-
-    assert!(
-        lowered
-            .counter_defs
-            .iter()
-            .all(|counter| counter.kind == "deopt_entry_guard_miss"),
-        "apply lowering should keep only deopt-entry counters just because runtime logging is enabled: {:?}",
-        lowered
-            .counter_defs
-            .iter()
-            .map(|counter| counter.kind.as_str())
-            .collect::<Vec<_>>()
-    );
-    assert!(
-        lowered
-            .counter_defs
-            .iter()
-            .all(|counter| matches!(counter.site, CounterSite::DeoptEntry { .. })),
-        "apply deopt-entry counters should carry source metadata: {:?}",
-        lowered.counter_defs
     );
 }

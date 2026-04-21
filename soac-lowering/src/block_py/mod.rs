@@ -21,6 +21,8 @@ pub(crate) use scope_impls::{
     build_storage_layout_from_capture_names, compute_make_function_capture_bindings_from_scope,
     compute_storage_layout_from_scope, is_runtime_closure_name, ScopeExprNode,
 };
+pub use validate::validate_codegen_module;
+#[cfg(test)]
 pub(crate) use validate::validate_module;
 
 pub type ResolvedStorageBlock = Block<InstrResolved>;

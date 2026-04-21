@@ -62,8 +62,8 @@ Own typed environment parsing and process logging setup.
 
 Completed: extracted into the `soac-config` workspace crate. Direct runtime and entrypoint
 consumers now import config and logging from `soac-config`; no `soac-blockpy` compatibility
-re-export remains. The remaining BlockPy cache metadata/path helpers live with the cache format in
-`soac-blockpy::codegen_cache` until the cache/profile formats are split further.
+re-export remains. BlockPy cache metadata/path helpers now live with the cache format in
+`soac-driver::codegen_cache`.
 
 Contents:
 
@@ -103,12 +103,30 @@ implementation there. `soac-blockpy` now has a thin library facade that re-expor
 Contents:
 
 - remaining BlockPy facade payloads and pretty/validation helpers
-- codegen cache format and helpers
-- lowering driver and parse-to-BlockPy entrypoints
+- pure parse-to-`BlockPyModule<CodegenModuleShape>` entrypoints
 - pass tracker
 - transformation passes
 - template and transformer support
 - lowering fixtures and tests
+
+### `soac-driver`
+
+Own high-level coordination across the frontend, cache artifacts, prepared codegen plans, and
+profile/counter instrumentation.
+
+Completed: added the `soac-driver` workspace crate and moved pre-optimization module-cache
+handling, prepared-codegen cache serialization, env/logging/timing orchestration, and profile/trace
+counter insertion out of `soac-lowering`. The lowering crate now exposes the pure source-to-codegen
+module pipeline; production/runtime entrypoints that need cache or counter policy call through
+`soac-driver`.
+
+Contents:
+
+- cache artifact path helpers and pre-optimization module cache format
+- high-level lowering result orchestration
+- prepared codegen plan calculation and cache store/load
+- profile, verify, apply, and trace counter insertion policy
+- runtime/import-hook lowering entrypoints
 
 ### `soac-profile`
 
@@ -162,7 +180,7 @@ Own parsing, transformation, name binding, and pass execution.
 Likely contents:
 
 - current `soac-blockpy/src/passes`
-- current lowering driver
+- pure parse-to-BlockPy lowering pipeline
 - AST transformer
 - template support
 - parse-to-BlockPy entrypoints

@@ -1,10 +1,5 @@
 use crate::block_py::PrettyPrint;
-use crate::block_py::{BlockPyModule, CounterScope, ModuleNameGen};
-use crate::codegen_cache::{
-    load_codegen_module_cache, remap_cached_codegen_module_function_ids,
-    store_codegen_module_cache, validate_codegen_module_cache_metadata, CachedCodegenModule,
-    CachedCodegenModuleMetadata, CachedPreparedCodegen,
-};
+use crate::block_py::{BlockPyModule, ModuleNameGen};
 use crate::pass_tracker::PassTracker;
 use crate::passes::ast_to_ast::ast_rewrite::rewrite_with_pass;
 use crate::passes::ast_to_ast::context::Context;
@@ -23,9 +18,6 @@ use crate::passes::{
 use crate::{ParseError, Result};
 use ruff_python_ast::{self as ast, Stmt};
 use ruff_python_parser::parse_module;
-use soac_config::SoacEnvConfig;
-use std::path::{Path, PathBuf};
-use tracing::{info, warn};
 
 #[derive(Clone)]
 pub(crate) struct AstToAstPassResult {
@@ -40,22 +32,10 @@ pub struct LoweringOptions {
     /// from `soac.runtime`, so using them while compiling `soac.runtime` itself
     /// would make module initialization circular.
     pub runtime_names_as_globals: bool,
-    pub pre_optimization_cache_path: Option<PathBuf>,
-    pub pre_optimization_cache_metadata: Option<CachedCodegenModuleMetadata>,
-}
-
-struct PreOptimizationModule {
-    module: BlockPyModule<CodegenModuleShape>,
-    prepared: Option<CachedPreparedCodegen>,
-    cache_path_for_store: Option<PathBuf>,
-    cache_metadata_for_store: Option<CachedCodegenModuleMetadata>,
 }
 
 impl PrettyPrint for AstToAstPassResult {
-    fn fmt_pretty(
-        &self,
-        printer: &mut crate::block_py::PrettyPrinter<'_>,
-    ) -> std::fmt::Result {
+    fn fmt_pretty(&self, printer: &mut crate::block_py::PrettyPrinter<'_>) -> std::fmt::Result {
         std::fmt::Write::write_str(printer, &crate::ruff_ast_to_string(&self.module))
     }
 }
@@ -95,130 +75,11 @@ fn rewrite_ast_to_ast_module(context: &Context, mut module: Suite) -> AstToAstPa
     }
 }
 
-pub(crate) fn rewrite_module_with_tracker_with_options(
+pub fn lower_source_to_codegen_module_with_tracker(
     source: &str,
     module_name_gen: ModuleNameGen,
     pass_tracker: &mut impl PassTracker,
     options: LoweringOptions,
-    env_config: &SoacEnvConfig,
-) -> Result<BlockPyModule<CodegenModuleShape>> {
-    let pre_optimization =
-        rewrite_pre_optimization_module_with_cache(source, module_name_gen, pass_tracker, options)?;
-    finish_codegen_module_with_tracker(pre_optimization, pass_tracker, env_config)
-}
-
-fn rewrite_pre_optimization_module_with_cache(
-    source: &str,
-    module_name_gen: ModuleNameGen,
-    pass_tracker: &mut impl PassTracker,
-    options: LoweringOptions,
-) -> Result<PreOptimizationModule> {
-    if let Some(cache_path) = &options.pre_optimization_cache_path {
-        let cache_exists =
-            pass_tracker.record_timing("bb_codegen_cache_lookup", || cache_path.is_file());
-        if cache_exists {
-            let loaded = pass_tracker.record_timing("bb_codegen_cache_load", || {
-                load_codegen_module_cache(cache_path)
-            });
-            match loaded {
-                Ok(mut cache) => {
-                    let metadata_mismatch = if let Some(expected) =
-                        &options.pre_optimization_cache_metadata
-                    {
-                        match validate_codegen_module_cache_metadata(&cache.metadata, expected) {
-                            Ok(()) => None,
-                            Err(err) => Some(err),
-                        }
-                    } else {
-                        None
-                    };
-                    if let Some(err) = metadata_mismatch {
-                        warn!(
-                            target: "soac_blockpy_module_cache",
-                            event = "soac.blockpy_module_cache",
-                            cache_hit = false,
-                            path = %cache_path.display(),
-                            error = %err,
-                            "blockpy_module_cache_metadata_mismatch",
-                        );
-                    } else {
-                        remap_cached_codegen_module_function_ids(&mut cache, module_name_gen);
-                        let has_prepared = cache.prepared.is_some();
-                        info!(
-                            target: "soac_blockpy_module_cache",
-                            event = "soac.blockpy_module_cache",
-                            cache_hit = true,
-                            prepared = has_prepared,
-                            path = %cache_path.display(),
-                            "blockpy_module_cache_hit",
-                        );
-                        let CachedCodegenModule {
-                            metadata: _,
-                            module,
-                            prepared,
-                        } = cache;
-                        return Ok(PreOptimizationModule {
-                            module: pass_tracker.run_pass("bb_codegen", || module),
-                            prepared,
-                            cache_path_for_store: None,
-                            cache_metadata_for_store: None,
-                        });
-                    }
-                }
-                Err(err) => {
-                    warn!(
-                        target: "soac_blockpy_module_cache",
-                        event = "soac.blockpy_module_cache",
-                        cache_hit = false,
-                        path = %cache_path.display(),
-                        error = %err,
-                        "blockpy_module_cache_load_failed",
-                    );
-                }
-            }
-        } else {
-            info!(
-                target: "soac_blockpy_module_cache",
-                event = "soac.blockpy_module_cache",
-                cache_hit = false,
-                path = %cache_path.display(),
-                "blockpy_module_cache_miss",
-            );
-        }
-
-        let module = rewrite_pre_optimization_module_from_source(
-            source,
-            module_name_gen,
-            pass_tracker,
-            options.runtime_names_as_globals,
-        )?;
-        Ok(PreOptimizationModule {
-            module,
-            prepared: None,
-            cache_path_for_store: Some(cache_path.clone()),
-            cache_metadata_for_store: options.pre_optimization_cache_metadata.clone(),
-        })
-    } else {
-        let module = rewrite_pre_optimization_module_from_source(
-            source,
-            module_name_gen,
-            pass_tracker,
-            options.runtime_names_as_globals,
-        )?;
-        Ok(PreOptimizationModule {
-            module,
-            prepared: None,
-            cache_path_for_store: None,
-            cache_metadata_for_store: None,
-        })
-    }
-}
-
-fn rewrite_pre_optimization_module_from_source(
-    source: &str,
-    module_name_gen: ModuleNameGen,
-    pass_tracker: &mut impl PassTracker,
-    runtime_names_as_globals: bool,
 ) -> Result<BlockPyModule<CodegenModuleShape>> {
     let module =
         pass_tracker.record_timing("parse", || -> std::result::Result<_, ParseError> {
@@ -323,7 +184,7 @@ fn rewrite_pre_optimization_module_from_source(
         pass_tracker.run_pass("name_binding", || {
             passes::lower_name_binding_in_core_blockpy_module_with_options(
                 core_blockpy_without_await_or_yield,
-                runtime_names_as_globals,
+                options.runtime_names_as_globals,
             )
         });
 
@@ -346,222 +207,6 @@ fn rewrite_pre_optimization_module_from_source(
     Ok(bb_codegen)
 }
 
-fn store_pre_optimization_cache(
-    cache_path: &Path,
-    metadata: &CachedCodegenModuleMetadata,
-    module: &BlockPyModule<CodegenModuleShape>,
-    prepared: &CachedPreparedCodegen,
-    pass_tracker: &mut impl PassTracker,
-) {
-    let stored = pass_tracker.record_timing("bb_codegen_cache_store", || {
-        store_codegen_module_cache(cache_path, metadata, module, Some(prepared))
-    });
-    match stored {
-        Ok(()) => {
-            info!(
-                target: "soac_blockpy_module_cache",
-                event = "soac.blockpy_module_cache_store",
-                path = %cache_path.display(),
-                "blockpy_module_cache_store",
-            );
-        }
-        Err(err) => {
-            warn!(
-                target: "soac_blockpy_module_cache",
-                event = "soac.blockpy_module_cache_store",
-                path = %cache_path.display(),
-                error = %err,
-                "blockpy_module_cache_store_failed",
-            );
-        }
-    }
-}
-
-fn finish_codegen_module_with_tracker(
-    pre_optimization: PreOptimizationModule,
-    pass_tracker: &mut impl PassTracker,
-    env_config: &SoacEnvConfig,
-) -> Result<BlockPyModule<CodegenModuleShape>> {
-    let PreOptimizationModule {
-        module: mut bb_codegen,
-        prepared,
-        cache_path_for_store,
-        cache_metadata_for_store,
-    } = pre_optimization;
-    pass_tracker.record_timing("validate_codegen_instr_ids", || {
-        passes::validate_codegen_instr_ids(&bb_codegen).map_err(anyhow::Error::msg)
-    })?;
-    let prepared = if let Some(prepared) = prepared {
-        pass_tracker.record_timing("prepared_codegen_cache_use", || prepared)
-    } else {
-        let initial_inline_plan = pass_tracker.record_timing("inline_candidate_plan", || {
-            let escape_summary = passes::summarize_module_escapes(&bb_codegen);
-            passes::plan_module_inlining(&escape_summary)
-        });
-        let scalar_replacement_stats =
-            pass_tracker.record_timing("scalar_replace_constructor_allocations", || {
-                passes::scalar_replace_non_escaping_constructor_allocations(
-                    &mut bb_codegen,
-                    &initial_inline_plan,
-                )
-            });
-        let inline_rewrite_stats = pass_tracker.record_timing("inline_direct_call_stores", || {
-            passes::inline_simple_direct_call_stores(&mut bb_codegen, &initial_inline_plan)
-        });
-        if scalar_replacement_stats.replaced_allocations != 0
-            || inline_rewrite_stats.rewritten_stores != 0
-        {
-            pass_tracker.record_timing("validate_codegen_instr_ids_after_inline", || {
-                passes::validate_codegen_instr_ids(&bb_codegen).map_err(anyhow::Error::msg)
-            })?;
-        }
-        let escape_summary = pass_tracker.run_pass("escape_summary", || {
-            passes::summarize_module_escapes(&bb_codegen)
-        });
-        let inline_plan = pass_tracker.run_pass("inline_plan", || {
-            passes::plan_module_inlining(&escape_summary)
-        });
-        let value_facts: passes::FactStore = pass_tracker.record_timing("value_facts", || {
-            passes::infer_module_value_facts(&bb_codegen)
-        });
-        let ownership_plan: passes::RefcountPlan = pass_tracker
-            .record_timing("ownership_effects", || {
-                passes::plan_ownership_effects(&bb_codegen, &value_facts)
-            });
-        pass_tracker.record_timing("validate_ownership_effects", || {
-            passes::validate_ownership_effects(&bb_codegen, &value_facts, &ownership_plan)
-                .map_err(anyhow::Error::msg)
-        })?;
-        let local_env_plan: passes::LocalEnvModulePlan = pass_tracker
-            .record_timing("local_env_plan", || {
-                passes::plan_local_env_module(&bb_codegen, &value_facts)
-            });
-        pass_tracker.record_timing("validate_local_env_plan", || {
-            passes::validate_local_env_module_plan(&bb_codegen, &value_facts, &local_env_plan)
-                .map_err(anyhow::Error::msg)
-        })?;
-        let local_env_resume_plan: passes::LocalEnvResumeModulePlan = pass_tracker
-            .record_timing("local_env_resume_plan", || {
-                passes::plan_local_env_resume_module(&bb_codegen, &local_env_plan, &value_facts)
-            });
-        pass_tracker.record_timing("validate_local_env_resume_plan", || {
-            passes::validate_local_env_resume_module_plan(
-                &bb_codegen,
-                &local_env_plan,
-                &value_facts,
-                &local_env_resume_plan,
-            )
-            .map_err(anyhow::Error::msg)
-        })?;
-        CachedPreparedCodegen {
-            escape_summary,
-            inline_plan,
-            value_facts,
-            ownership_plan,
-            local_env_plan,
-            local_env_resume_plan,
-        }
-    };
-
-    if let Some(cache_path) = &cache_path_for_store {
-        if let Some(metadata) = &cache_metadata_for_store {
-            store_pre_optimization_cache(
-                cache_path,
-                metadata,
-                &bb_codegen,
-                &prepared,
-                pass_tracker,
-            );
-        }
-    }
-
-    let CachedPreparedCodegen {
-        local_env_resume_plan,
-        ..
-    } = prepared;
-
-    let bb_traced: BlockPyModule<CodegenModuleShape> =
-        if let Some(config) = passes::parse_trace_env(env_config) {
-            pass_tracker.run_pass("bb_trace", || {
-                let mut traced = bb_codegen;
-                passes::instrument_bb_module_for_trace(&mut traced, &config);
-                traced
-            })
-        } else {
-            bb_codegen
-        };
-
-    let bb_call_target_counted: BlockPyModule<CodegenModuleShape> =
-        if passes::call_target_counter_instrumentation_enabled(env_config) {
-            pass_tracker.run_pass("bb_call_target_counters", || {
-                let mut counted = bb_traced;
-                passes::instrument_bb_module_with_call_target_counters(&mut counted);
-                counted
-            })
-        } else {
-            bb_traced
-        };
-
-    let bb_locality_counted: BlockPyModule<CodegenModuleShape> =
-        if passes::locality_counter_instrumentation_enabled(env_config) {
-            pass_tracker.run_pass("bb_locality_counters", || {
-                let mut counted = bb_call_target_counted;
-                passes::instrument_bb_module_with_block_entry_counters(&mut counted);
-                passes::instrument_bb_module_with_locality_counters(&mut counted);
-                counted
-            })
-        } else {
-            bb_call_target_counted
-        };
-
-    let bb_refcount_counted: BlockPyModule<CodegenModuleShape> =
-        if passes::refcount_counter_instrumentation_enabled(env_config) {
-            pass_tracker.record_timing("bb_refcount_counters", || {
-                let mut counted = bb_locality_counted;
-                passes::instrument_bb_module_with_refcount_counters(
-                    &mut counted,
-                    CounterScope::Function,
-                )
-                .map_err(anyhow::Error::msg)?;
-                Ok::<BlockPyModule<CodegenModuleShape>, anyhow::Error>(counted)
-            })?
-        } else {
-            bb_locality_counted
-        };
-
-    let bb_deopt_entry_counted: BlockPyModule<CodegenModuleShape> =
-        if passes::deopt_entry_counter_instrumentation_enabled(env_config) {
-            pass_tracker.record_timing("bb_deopt_entry_counters", || {
-                let mut counted = bb_refcount_counted;
-                passes::define_bb_module_deopt_entry_counters(&mut counted, &local_env_resume_plan);
-                counted
-            })
-        } else {
-            bb_refcount_counted
-        };
-
-    pass_tracker.record_timing("validate", || {
-        crate::block_py::validate_module(&bb_deopt_entry_counted).map_err(anyhow::Error::msg)
-    })?;
-
-    Ok(bb_deopt_entry_counted)
-}
-
-pub(crate) fn rewrite_module_with_tracker(
-    source: &str,
-    module_name_gen: ModuleNameGen,
-    pass_tracker: &mut impl PassTracker,
-    env_config: &SoacEnvConfig,
-) -> Result<BlockPyModule<CodegenModuleShape>> {
-    rewrite_module_with_tracker_with_options(
-        source,
-        module_name_gen,
-        pass_tracker,
-        LoweringOptions::default(),
-        env_config,
-    )
-}
-
 pub(crate) fn wrap_module_init(semantic_state: &mut SemanticAstState, module: &mut Suite) {
     let mut init_body = std::mem::take(module);
     if init_body.is_empty() {
@@ -578,71 +223,4 @@ def _dp_module_init():
     semantic_state.synthesize_module_init_scope(&module_init);
 
     *module = vec![Stmt::FunctionDef(module_init)];
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::block_py::ModuleNameGen;
-    use crate::codegen_cache::{
-        load_codegen_module_cache, store_codegen_module_cache, CachedCodegenModuleMetadata,
-        PythonModuleCacheSource,
-    };
-    use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    #[test]
-    fn pre_optimization_cache_metadata_mismatch_rebuilds_and_replaces_cache() {
-        let source = "def f():\n    return 1\n";
-        let module_name = "cache_metadata_mismatch_test";
-        let cache_path = unique_temp_dir()
-            .join("project")
-            .join(module_name)
-            .join("mod.blockpy");
-        let stale_metadata = metadata(module_name, "old-build");
-        let expected_metadata = metadata(module_name, "new-build");
-        let stale_module = crate::lower_python_to_blockpy_recorded(source, ModuleNameGen::new(1))
-            .expect("initial lowering should succeed")
-            .codegen_module;
-        store_codegen_module_cache(cache_path.as_path(), &stale_metadata, &stale_module, None)
-            .expect("stale cache should be writable");
-
-        if let Err(err) = crate::lower_python_to_blockpy_recorded_with_options(
-            source,
-            ModuleNameGen::new(2),
-            LoweringOptions {
-                runtime_names_as_globals: false,
-                pre_optimization_cache_path: Some(cache_path.clone()),
-                pre_optimization_cache_metadata: Some(expected_metadata.clone()),
-            },
-        ) {
-            panic!(
-                "stale cache metadata should be treated as a miss, not as a lowering error: {err}"
-            );
-        }
-
-        let replaced = load_codegen_module_cache(cache_path.as_path())
-            .expect("rebuilt cache should be readable");
-        assert_eq!(replaced.metadata, expected_metadata);
-    }
-
-    fn metadata(module_name: &str, cache_identity: &str) -> CachedCodegenModuleMetadata {
-        CachedCodegenModuleMetadata {
-            source: PythonModuleCacheSource::Project,
-            module_name: module_name.to_string(),
-            source_hash: 0x1234,
-            cache_identity: cache_identity.to_string(),
-        }
-    }
-
-    fn unique_temp_dir() -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock should be after epoch")
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "soac-blockpy-cache-test-{}-{nanos}",
-            std::process::id()
-        ))
-    }
 }

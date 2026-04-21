@@ -1,15 +1,13 @@
 use crate::pass_tracker::{PassTracker, RecordingPassTracker};
 use crate::passes::ast_to_ast::body::Suite;
-use soac_core::block_py::PrettyPrint;
+use crate::passes::InstrCodegen;
+use soac_core::block_py::{ChildVisitable, PrettyPrint, Visit};
 
 #[derive(Clone)]
 struct TestPrettySuite(Suite);
 
 impl PrettyPrint for TestPrettySuite {
-    fn fmt_pretty(
-        &self,
-        printer: &mut soac_core::block_py::PrettyPrinter<'_>,
-    ) -> std::fmt::Result {
+    fn fmt_pretty(&self, printer: &mut soac_core::block_py::PrettyPrinter<'_>) -> std::fmt::Result {
         std::fmt::Write::write_str(printer, &crate::ruff_ast_to_string(&self.0))
     }
 }
@@ -59,4 +57,40 @@ fn pass_tracker_renders_tracked_pass_text_for_renderable_passes() {
             .collect::<Vec<_>>(),
         vec!["one".to_string()]
     );
+}
+
+#[test]
+fn pure_lowering_does_not_insert_counters() {
+    let lowered = crate::lower_python_to_blockpy_for_testing(
+        "def f(x):\n    if x:\n        return 1\n    return 0\n",
+    )
+    .expect("lowering should succeed")
+    .codegen_module;
+
+    assert!(lowered.counter_defs.is_empty());
+
+    let mut probe = IncrementCounterProbe::default();
+    for function in &lowered.callable_defs {
+        for block in &function.blocks {
+            for instr in &block.body {
+                probe.visit_instr(instr);
+            }
+            probe.visit_term(&block.term);
+        }
+    }
+    assert_eq!(probe.increment_counters, 0);
+}
+
+#[derive(Default)]
+struct IncrementCounterProbe {
+    increment_counters: usize,
+}
+
+impl Visit<InstrCodegen> for IncrementCounterProbe {
+    fn visit_instr(&mut self, expr: &InstrCodegen) {
+        if matches!(expr, InstrCodegen::IncrementCounter(_)) {
+            self.increment_counters += 1;
+        }
+        expr.visit_children(self);
+    }
 }

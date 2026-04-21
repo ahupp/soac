@@ -1752,6 +1752,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "soac-driver"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rkyv",
+ "soac-config",
+ "soac-core",
+ "soac-lowering",
+ "tracing",
+]
+
+[[package]]
 name = "soac-inspector"
 version = "0.1.0"
 dependencies = [
@@ -1766,6 +1778,7 @@ dependencies = [
  "soac-config",
  "soac-core",
  "soac-cpython",
+ "soac-driver",
  "soac-jit",
  "soac-lowering",
  "soac-opt",
@@ -1799,6 +1812,7 @@ dependencies = [
  "soac-config",
  "soac-core",
  "soac-cpython",
+ "soac-driver",
  "soac-lowering",
  "soac-opt",
  "soac-profile",
@@ -1843,6 +1857,7 @@ dependencies = [
  "anyhow",
  "rkyv",
  "soac-core",
+ "soac-driver",
  "soac-lowering",
  "soac-profile",
 ]
@@ -1867,6 +1882,7 @@ dependencies = [
  "soac-config",
  "soac-core",
  "soac-cpython",
+ "soac-driver",
  "soac-jit",
  "soac-lowering",
  "soac-opt",

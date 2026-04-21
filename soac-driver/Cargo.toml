@@ -1,15 +1,16 @@
 [package]
-name = "soac-opt"
+name = "soac-driver"
 version = "0.1.0"
 edition = "2024"
 
 [lib]
-doctest = false
+name = "soac_driver"
+path = "src/lib.rs"
 
 [dependencies]
 anyhow = { version = "1.0.100", features = ["backtrace"] }
-rkyv = { version = "0.8", features = ["alloc"] }
+rkyv = { version = "0.8", default-features = false, features = ["std", "bytecheck"] }
+soac-config = { path = "../soac-config" }
 soac-core = { path = "../soac-core" }
-soac-driver = { path = "../soac-driver" }
 soac-lowering = { path = "../soac-lowering" }
-soac-profile = { path = "../soac-profile" }
+tracing = "0.1"

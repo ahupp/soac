@@ -5,11 +5,11 @@ use soac_core::block_py::{
     SerializedFunctionDebugName, SerializedFunctionId, SerializedIdentityTables,
     SerializedModuleId, SerializedModuleIdentity, Visit,
 };
-use soac_lowering::block_py::Literal;
-use soac_lowering::codegen_cache::{
+use soac_driver::codegen_cache::{
     CachedCodegenModule, CachedCodegenModuleMetadata, PythonModuleCacheSource,
     load_codegen_module_cache, module_optimization_plan_path,
 };
+use soac_lowering::block_py::Literal;
 use soac_lowering::passes::{CodegenModuleShape, InstrCodegen, InstrResolved};
 use soac_profile::{CounterDumpFile, collect_type_key_layouts, collect_type_table};
 use std::collections::{HashMap, HashSet};

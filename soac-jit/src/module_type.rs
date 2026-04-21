@@ -12,7 +12,7 @@ use soac_core::block_py::{
     BlockPyFunction, BlockPyModule, CounterDef, CounterId, CounterScope, CounterSite,
     DeoptEntrySource, FunctionExecutionMode, RuntimeFunctionId, RuntimeName,
 };
-use soac_lowering::codegen_cache::PythonModuleCacheSource;
+use soac_driver::codegen_cache::PythonModuleCacheSource;
 use soac_lowering::passes::{
     CodegenModuleShape, InlinePlanModule, plan_module_inlining,
     specialization_runtime_logging_enabled, summarize_module_escapes,

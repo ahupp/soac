@@ -12,24 +12,24 @@ use soac_config::{SoacEnvConfig, SpecializationMode};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TraceConfig {
-    pub(crate) qualname_filter: Option<String>,
-    pub(crate) include_params: bool,
+pub struct TraceConfig {
+    pub qualname_filter: Option<String>,
+    pub include_params: bool,
 }
 
-pub(crate) fn parse_trace_env(config: &SoacEnvConfig) -> Option<TraceConfig> {
+pub fn parse_trace_env(config: &SoacEnvConfig) -> Option<TraceConfig> {
     parse_trace_config(config.soac_exec_trace()?)
 }
 
-pub(crate) fn call_target_counter_instrumentation_enabled(config: &SoacEnvConfig) -> bool {
+pub fn call_target_counter_instrumentation_enabled(config: &SoacEnvConfig) -> bool {
     specialization_mode_instruments_top_values(config)
 }
 
-pub(crate) fn locality_counter_instrumentation_enabled(config: &SoacEnvConfig) -> bool {
+pub fn locality_counter_instrumentation_enabled(config: &SoacEnvConfig) -> bool {
     specialization_mode_instruments_top_values(config)
 }
 
-pub(crate) fn refcount_counter_instrumentation_enabled(config: &SoacEnvConfig) -> bool {
+pub fn refcount_counter_instrumentation_enabled(config: &SoacEnvConfig) -> bool {
     config.specialization_mode() == Some(SpecializationMode::Verify)
 }
 
@@ -70,7 +70,7 @@ pub(crate) fn parse_trace_config(raw: &str) -> Option<TraceConfig> {
     })
 }
 
-pub(crate) fn instrument_bb_module_for_trace(
+pub fn instrument_bb_module_for_trace(
     module: &mut BlockPyModule<CodegenModuleShape>,
     config: &TraceConfig,
 ) {

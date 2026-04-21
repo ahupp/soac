@@ -11,6 +11,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 soac-lowering = { path = "../soac-lowering" }
+soac-driver = { path = "../soac-driver" }
 soac-config = { path = "../soac-config" }
 soac-core = { path = "../soac-core" }
 soac-profile = { path = "../soac-profile" }

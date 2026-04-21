@@ -13631,7 +13631,7 @@ fn synthesize_test_planned_optimization_inputs_for_runtime_state(
         env!("SOAC_BUILD_IDENTITY"),
         shared_state.module_name == "soac.runtime",
     );
-    let metadata = soac_lowering::codegen_cache::CachedCodegenModuleMetadata {
+    let metadata = soac_driver::codegen_cache::CachedCodegenModuleMetadata {
         source: shared_state
             .module_cache_source
             .unwrap_or(PythonModuleCacheSource::Project),
