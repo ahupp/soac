@@ -1,10 +1,9 @@
-use crate::block_py::BlockPyModule;
-use crate::block_py::PrettyPrint;
 use crate::passes::{
     CoreModuleShape, CoreModuleShapeWithAwaitAndYield, ResolvedStorageModuleShape,
 };
 use ruff_python_ast::{self as ast, ModModule};
 use ruff_text_size::TextRange;
+use soac_core::block_py::{BlockPyModule, PrettyPrint};
 use std::any::Any;
 use std::time::{Duration, Instant};
 

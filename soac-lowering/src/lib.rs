@@ -1,6 +1,5 @@
 #![recursion_limit = "256"]
 
-use crate::block_py::{BlockPyModule, ModuleNameGen};
 pub use crate::driver::{lower_source_to_codegen_module_with_tracker, LoweringOptions};
 use crate::pass_tracker::{NoopPassTracker, PassTracker, RecordingPassTracker};
 use crate::passes::CodegenModuleShape;
@@ -10,6 +9,7 @@ use ruff_python_codegen::{Generator, Indentation};
 pub use ruff_python_parser::ParseError;
 use ruff_source_file::LineEnding;
 use ruff_text_size::TextRange;
+use soac_core::block_py::{BlockPyModule, ModuleNameGen};
 use std::time::{Duration, Instant};
 
 pub mod block_py;

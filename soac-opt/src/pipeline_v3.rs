@@ -30,7 +30,7 @@ use soac_driver::codegen_cache::{
     CachedCodegenModule, CachedCodegenModuleMetadata, load_codegen_module_cache,
     module_optimization_plan_v3_path,
 };
-use soac_lowering::block_py::Literal;
+use soac_lowering::block_py::literal::Literal;
 use soac_lowering::passes::{CodegenModuleShape, InstrCodegen, InstrResolved};
 use std::collections::HashMap;
 use std::fmt;
@@ -655,7 +655,7 @@ mod tests {
     use soac_core::profile::{
         CounterDumpRecord, CounterDumpTypeKey, CounterDumpTypeKeyLayout, CounterDumpTypeTableEntry,
     };
-    use soac_lowering::block_py::{LiteralValue, StringLiteral};
+    use soac_lowering::block_py::literal::{LiteralValue, StringLiteral};
     use soac_lowering::passes::{InstrCodegen, InstrResolved};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};

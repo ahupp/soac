@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, anyhow, bail};
-use soac_lowering::block_py::{
+use soac_core::block_py::{
     BlockPyFunction, BlockPyModule, CounterSite, FunctionNameGen, ModuleNameGen, RuntimeFunctionId,
     RuntimeModuleId, VisitMut, walk_expr_mut, walk_module_mut,
 };
@@ -350,7 +350,7 @@ impl FunctionIdRemapper {
 impl VisitMut<InstrCodegen> for FunctionIdRemapper {
     fn visit_instr_mut(&mut self, expr: &mut InstrCodegen)
     where
-        InstrCodegen: soac_lowering::block_py::ChildVisitable<InstrCodegen>,
+        InstrCodegen: soac_core::block_py::ChildVisitable<InstrCodegen>,
     {
         match expr {
             InstrCodegen::CallDirect(op) => {
@@ -508,12 +508,12 @@ mod test {
         remap_cached_codegen_module_function_ids, remap_codegen_module_function_ids,
         store_codegen_module_cache, validate_codegen_module_cache_metadata,
     };
-    use soac_lowering::block_py::{
-        BlockPyModule, ChildVisitable, HasSemanticInstrId, InstrCodegen, ModuleNameGen,
-        RuntimeFunctionId, Visit, walk_block, walk_expr,
+    use soac_core::block_py::{
+        BlockPyModule, ChildVisitable, HasSemanticInstrId, ModuleNameGen, RuntimeFunctionId, Visit,
+        walk_block, walk_expr,
     };
     use soac_lowering::lower_python_to_blockpy_for_testing;
-    use soac_lowering::passes::{self, CodegenModuleShape};
+    use soac_lowering::passes::{self, CodegenModuleShape, InstrCodegen};
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -889,7 +889,7 @@ def outer(value):
     }
 
     fn summarize_function(
-        function: &soac_lowering::block_py::BlockPyFunction<CodegenModuleShape>,
+        function: &soac_core::block_py::BlockPyFunction<CodegenModuleShape>,
     ) -> FunctionSummary {
         FunctionSummary {
             function_id: function.function_id,
@@ -910,7 +910,7 @@ def outer(value):
     }
 
     fn instr_ids(
-        function: &soac_lowering::block_py::BlockPyFunction<CodegenModuleShape>,
+        function: &soac_core::block_py::BlockPyFunction<CodegenModuleShape>,
     ) -> Vec<(u32, u32)> {
         let mut collector = InstrIdCollector {
             instr_ids: Vec::new(),

@@ -462,7 +462,7 @@ fn finish_codegen_module_with_tracker(
         };
 
     pass_tracker.record_timing("validate", || {
-        soac_lowering::block_py::validate_codegen_module(&bb_deopt_entry_counted)
+        soac_lowering::block_py::validate::validate_codegen_module(&bb_deopt_entry_counted)
             .map_err(anyhow::Error::msg)
     })?;
 

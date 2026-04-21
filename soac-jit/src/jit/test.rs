@@ -10,9 +10,9 @@ use soac_core::block_py::{
     SerializedModuleId, SerializedModuleIdentity, SetAttr, SetItem, StorageLayout, Store, Tuple,
     UnaryOp, UnaryOpKind, Visit, VisitMut, WithMeta,
 };
-use soac_lowering::block_py::{
-    CodegenBlock, IncrementCounter, Literal, LiteralValue, NumberLiteral, NumberLiteralValue,
-    StringLiteral,
+use soac_lowering::block_py::counters::IncrementCounter;
+use soac_lowering::block_py::literal::{
+    Literal, LiteralValue, NumberLiteral, NumberLiteralValue, StringLiteral,
 };
 use soac_lowering::passes::{
     CodegenModuleShape, InstrCodegen, InstrResolved,

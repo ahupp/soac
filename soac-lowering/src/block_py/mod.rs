@@ -1,19 +1,19 @@
-pub use soac_core::block_py::*;
+pub(crate) use soac_core::block_py::*;
 
 pub(crate) mod cfg;
-mod counters;
-mod literal;
+pub mod counters;
+pub mod literal;
 mod pretty;
 mod scope_impls;
-pub(crate) mod validate;
+pub mod validate;
 
-pub use crate::passes::{
+pub(crate) use crate::passes::{
     InstrCodegen, InstrCodegenOp, InstrLow, InstrResolved, InstrRuff, InstrUnresolved,
     InstrWithAwaitAndYield, InstrWithYield,
 };
-pub use counters::IncrementCounter;
+pub(crate) use counters::IncrementCounter;
 pub(crate) use literal::literal_expr;
-pub use literal::{
+pub(crate) use literal::{
     BytesLiteral, IntLiteral, Literal, LiteralValue, NumberLiteral, NumberLiteralValue,
     StringLiteral,
 };
@@ -21,12 +21,12 @@ pub(crate) use scope_impls::{
     build_storage_layout_from_capture_names, compute_make_function_capture_bindings_from_scope,
     compute_storage_layout_from_scope, is_runtime_closure_name, ScopeExprNode,
 };
-pub use validate::validate_codegen_module;
 #[cfg(test)]
 pub(crate) use validate::validate_module;
 
-pub type ResolvedStorageBlock = Block<InstrResolved>;
-pub type CodegenBlock = Block<InstrCodegen>;
+pub(crate) type ResolvedStorageBlock = Block<InstrResolved>;
+#[cfg(test)]
+pub(crate) type CodegenBlock = Block<InstrCodegen>;
 
 pub(crate) fn core_call_expr_with_meta<E>(
     func: E,

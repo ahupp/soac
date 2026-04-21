@@ -10,7 +10,7 @@ use soac_driver::codegen_cache::{
     CachedCodegenModule, CachedCodegenModuleMetadata, PythonModuleCacheSource,
     load_codegen_module_cache, module_optimization_plan_path,
 };
-use soac_lowering::block_py::Literal;
+use soac_lowering::block_py::literal::Literal;
 use soac_lowering::passes::{CodegenModuleShape, InstrCodegen, InstrResolved};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};

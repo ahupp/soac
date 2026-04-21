@@ -5,7 +5,7 @@ use soac_core::block_py::{
     AbruptKind, BlockArg, BlockPyFunction, BlockPyModule, BlockTerm, CallArgKeyword,
     ChildVisitable, NameLike, ParamDefaultSource, RuntimeName,
 };
-use soac_lowering::block_py::{Literal, NumberLiteralValue};
+use soac_lowering::block_py::literal::{Literal, NumberLiteralValue};
 use soac_lowering::passes::{CodegenModuleShape, InstrCodegen, InstrResolved};
 use std::collections::HashMap;
 

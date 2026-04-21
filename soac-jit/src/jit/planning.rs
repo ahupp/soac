@@ -1,14 +1,13 @@
 use soac_core::block_py::{
-    BlockArg, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, LocalLocation,
+    Block, BlockArg, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, LocalLocation,
     RuntimeFunctionId,
 };
-use soac_lowering::block_py::CodegenBlock;
 pub use soac_lowering::passes::{
     BlockParamFacts, FunctionLocalPlan, LocalRefKind, ParamBindingFacts, ParamProvenance,
     PlannedLocalBinding, PlannedLocalStorage, plan_function_locals, render_planned_local_binding,
 };
 use soac_lowering::passes::{
-    CodegenModuleShape, FactStore, FunctionLocalEnvResumePlan, FunctionRefcountPlan,
+    CodegenModuleShape, FactStore, FunctionLocalEnvResumePlan, FunctionRefcountPlan, InstrCodegen,
     LocalEnvModulePlan, LocalEnvResumeEntry, LocalEnvResumeModulePlan, LocalEnvResumePoint,
     LocalEnvResumeStatePrecision, RefcountActionKind, RefcountPlan, RefcountReleaseReason,
     compute_function_local_live_ins, compute_function_local_must_bound_ins, plan_local_env_module,
@@ -17,6 +16,8 @@ use soac_lowering::passes::{
 };
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
+
+type CodegenBlock = Block<InstrCodegen>;
 
 fn can_release_via_stack_slot_fallback(name: &str) -> bool {
     name.starts_with("_dp_try_exc_")

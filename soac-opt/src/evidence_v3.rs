@@ -3,7 +3,7 @@ use crate::plan::FunctionProfileEvidence;
 use crate::planner_v3::PlannerFacts;
 use crate::region_v3::{ExtractedRegion, ExtractedValueId, ExtractedValueKind};
 use soac_core::block_py::NameLocation;
-use soac_lowering::block_py::{Literal, NumberLiteralValue};
+use soac_lowering::block_py::literal::{Literal, NumberLiteralValue};
 use soac_lowering::passes::InstrResolved;
 use std::collections::HashMap;
 
@@ -105,7 +105,7 @@ mod tests {
         LocalFunctionId, LocalLocation, Meta, NameLocation, ResolvedName, SerializedFunctionId,
         SerializedModuleId, TermIf, WithMeta,
     };
-    use soac_lowering::block_py::{IntLiteral, LiteralValue, NumberLiteral};
+    use soac_lowering::block_py::literal::{IntLiteral, LiteralValue, NumberLiteral};
 
     fn label(index: usize) -> BlockLabel {
         BlockLabel::from_index(index)

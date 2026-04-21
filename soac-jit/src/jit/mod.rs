@@ -39,7 +39,7 @@ use soac_core::block_py::{
     CallableScopeKind, CellLocation, ChildVisitable, CounterDef, CounterId, CounterScope,
     CounterSite, Del, DeoptEntrySource, FunctionExecutionMode, FunctionKind, GetAttr, HasMeta,
     HasSemanticInstrId, InstrId, InstrKey, Load, LocalFunctionId, LocalLocation, Meta,
-    ModuleContentId, NameLocation, ParamKind, PersistentFunctionId, ResolvedName,
+    ModuleContentId, NameLike, NameLocation, ParamKind, PersistentFunctionId, ResolvedName,
     RuntimeFunctionId, RuntimeModuleId, RuntimeName, SerializedFunctionId, StorageLayout, Store,
     Visit, VisitMut, WithMeta,
 };
@@ -52,7 +52,7 @@ use soac_core::profile::{
     CounterDumpTypeKeyLayout, CounterDumpTypeTableEntry, collect_type_key_layouts,
     collect_type_table, write_counter_dump_records,
 };
-use soac_lowering::block_py::{CodegenBlock, Literal, NameLike};
+use soac_lowering::block_py::literal::Literal;
 use soac_lowering::passes::{
     CodegenModuleShape, ConstructorFieldValue, DirectFunctionIdGuardTest,
     DirectReceiverTypeVersionGuardTest, FactStore, FunctionRefcountPlan, InlineCallee,
@@ -119,6 +119,8 @@ use std::sync::mpsc;
 use std::sync::{Arc, Condvar};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
+
+type CodegenBlock = Block<InstrCodegen>;
 use tracing::{info, warn};
 
 unsafe extern "C" {
