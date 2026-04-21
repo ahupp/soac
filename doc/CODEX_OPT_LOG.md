@@ -5,6 +5,26 @@ optimization attempts made by Codex agents. Keep entries succinct: what
 changed or was tried, which jj change id carried it when landed, the
 benchmarked throughput delta, and the headline pre/post numbers.
 
+## 2026-04-21 - Route indexed fields through optimizer v3
+
+- jj change ids: `mnltztnt`, `ntmvkovm`
+- summary: Indexed-field selections are now planned from v3 profile evidence
+  and consumed as explicit v3 codegen inputs. The JIT preserves the emitted
+  access kind and attribute name instead of converting v3 decisions into legacy
+  per-instruction field evidence, making typed attribute annotation validate the
+  selected plan shape mechanically.
+- throughput: `+7.45%` median
+- pre-change benchmark: apply, refcounts enabled, 1M loops x3 median
+  `222490 loops/s`; core pystone code size `47394 bytes`
+- post-change benchmark: apply, refcounts enabled, 1M loops x3 median
+  `239058 loops/s`; core pystone code size `50323 bytes`
+- indexed-field counters: `0` to `2525030` hits and `3535137` to `1010107`
+  fallbacks in a 100k-loop verify run
+- note: the final mechanical-consumption cleanup intentionally rejects four
+  legacy-permissive indexed-field hits that were present in the immediate
+  predecessor; compared with the true pre-indexed-field baseline, indexed-field
+  hits still increase substantially.
+
 ## 2026-04-17 - Emit effect-only typed setattr without None materialization
 
 - jj change id: `nlzrurom`
