@@ -16137,6 +16137,12 @@ def f(x):
             3,
             "v3 add-store/compare should keep one generic local fallback for add and one for compare truthiness"
         );
+        let materialize_helpers = import_user_names_for_symbols(&built, &["PyLong_FromLongLong"]);
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&built.ctx.func, &materialize_helpers),
+            1,
+            "v3 scalar-thread hot path should not materialize c when both branch targets return without reading it"
+        );
         let legacy_exact_helpers = import_user_names_for_symbols(
             &built,
             &[

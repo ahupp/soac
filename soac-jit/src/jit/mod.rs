@@ -21487,6 +21487,14 @@ struct OptV3ScalarThreadSelection<'a> {
     consumer: OptV3ExactIntBranchSelection<'a>,
 }
 
+#[derive(Clone, Copy)]
+struct OptV3ScalarThreadInlineReturnTargets<'a> {
+    then_label: BlockLabel,
+    then_term: &'a BlockTerm<InstrCodegen>,
+    else_label: BlockLabel,
+    else_term: &'a BlockTerm<InstrCodegen>,
+}
+
 #[derive(Clone, Copy, Debug)]
 enum OptV3MechanicalValue {
     PyObject { value: ir::Value, owned: bool },
@@ -21691,6 +21699,105 @@ fn opt_v3_scalar_thread_matches_local(
             slot == location.slot() && thread.local.name == local_name.id_str()
         }
     }
+}
+
+fn opt_v3_term_references_local(term: &BlockTerm<InstrCodegen>, local_name: &ResolvedName) -> bool {
+    struct LocalRefFinder<'a> {
+        local_name: &'a ResolvedName,
+        found: bool,
+    }
+
+    impl Visit<InstrCodegen> for LocalRefFinder<'_> {
+        fn visit_instr(&mut self, expr: &InstrCodegen)
+        where
+            InstrCodegen: ChildVisitable<InstrCodegen>,
+        {
+            if let InstrCodegen::Load(load) = expr
+                && same_resolved_local_name(&load.name, self.local_name)
+            {
+                self.found = true;
+                return;
+            }
+            expr.visit_children(self);
+        }
+
+        fn visit_block_arg(&mut self, arg: &BlockArg) {
+            if let BlockArg::Name(name) = arg
+                && name == self.local_name.id_str()
+            {
+                self.found = true;
+            }
+        }
+    }
+
+    let mut finder = LocalRefFinder {
+        local_name,
+        found: false,
+    };
+    finder.visit_term(term);
+    finder.found
+}
+
+fn same_resolved_local_name(left: &ResolvedName, right: &ResolvedName) -> bool {
+    left.local_location() == right.local_location() && left.id_str() == right.id_str()
+}
+
+fn opt_v3_scalar_thread_inline_return_targets<'a>(
+    function: &'a BlockPyFunction<CodegenModuleShape>,
+    block_indices_by_label: &HashMap<BlockLabel, usize>,
+    if_term: &soac_core::block_py::TermIf<InstrTyped>,
+    local_name: &ResolvedName,
+) -> Result<Option<OptV3ScalarThreadInlineReturnTargets<'a>>, String> {
+    if if_term.then_label == if_term.else_label {
+        return Ok(None);
+    }
+    let Some(then_term) = opt_v3_scalar_thread_inline_return_target(
+        function,
+        block_indices_by_label,
+        if_term.then_label,
+        local_name,
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some(else_term) = opt_v3_scalar_thread_inline_return_target(
+        function,
+        block_indices_by_label,
+        if_term.else_label,
+        local_name,
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(OptV3ScalarThreadInlineReturnTargets {
+        then_label: if_term.then_label,
+        then_term,
+        else_label: if_term.else_label,
+        else_term,
+    }))
+}
+
+fn opt_v3_scalar_thread_inline_return_target<'a>(
+    function: &'a BlockPyFunction<CodegenModuleShape>,
+    block_indices_by_label: &HashMap<BlockLabel, usize>,
+    target: BlockLabel,
+    local_name: &ResolvedName,
+) -> Result<Option<&'a BlockTerm<InstrCodegen>>, String> {
+    if codegen_block_has_predecessor(function, target) != 1 {
+        return Ok(None);
+    }
+    let target_index = codegen_block_index_for_label(function, block_indices_by_label, target)?;
+    let target_block = &function.blocks[target_index];
+    if !target_block.body.is_empty() || target_block.exception_param().is_some() {
+        return Ok(None);
+    }
+    let BlockTerm::Return(_) = &target_block.term else {
+        return Ok(None);
+    };
+    if opt_v3_term_references_local(&target_block.term, local_name) {
+        return Ok(None);
+    }
+    Ok(Some(&target_block.term))
 }
 
 fn opt_v3_region_has_return_source(region: &MechanicalRegionEmission, source: InstrId) -> bool {
@@ -23103,6 +23210,116 @@ fn cranelift_value_args(args: &[ir::BlockArg]) -> Result<Vec<ir::Value>, String>
 }
 
 #[allow(clippy::too_many_arguments)]
+fn emit_opt_v3_scalar_thread_inline_return_branch(
+    fb: &mut FunctionBuilder<'_>,
+    source_label: BlockLabel,
+    test_instr_id: Option<InstrId>,
+    truth_i32: ir::Value,
+    targets: OptV3ScalarThreadInlineReturnTargets<'_>,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<(), String> {
+    if let Some(test_instr_id) = test_instr_id
+        && let Some(counter_id) = emit_ctx
+            .branch_outcome_counter_ids
+            .get(&test_instr_id)
+            .copied()
+    {
+        emit_record_branch_outcome_sample(fb, counter_id, truth_i32, emit_ctx);
+    }
+
+    let prefer_true = test_instr_id
+        .and_then(|test_instr_id| emit_ctx.branch_prefer_true.get(&test_instr_id).copied())
+        .unwrap_or(true);
+    let hot_cond = if prefer_true {
+        fb.ins()
+            .icmp_imm(ir::condcodes::IntCC::NotEqual, truth_i32, 0)
+    } else {
+        fb.ins().icmp_imm(ir::condcodes::IntCC::Equal, truth_i32, 0)
+    };
+    let hot_branch = fb.create_block();
+    let cold_branch = fb.create_block();
+    fb.ins().brif(hot_cond, hot_branch, &[], cold_branch, &[]);
+
+    let (hot_label, hot_term, cold_label, cold_term) = if prefer_true {
+        (
+            targets.then_label,
+            targets.then_term,
+            targets.else_label,
+            targets.else_term,
+        )
+    } else {
+        (
+            targets.else_label,
+            targets.else_term,
+            targets.then_label,
+            targets.then_term,
+        )
+    };
+
+    let mut hot_local_env = local_env.clone();
+    emit_opt_v3_scalar_thread_inline_return_arm(
+        fb,
+        hot_branch,
+        hot_label,
+        hot_term,
+        &mut hot_local_env,
+        emit_ctx,
+        codegen_env,
+        func_imports,
+    )
+    .map_err(|err| {
+        format!("optimizer v3 scalar-thread inline return from block {source_label}: {err}")
+    })?;
+
+    let mut cold_local_env = local_env.clone();
+    emit_opt_v3_scalar_thread_inline_return_arm(
+        fb,
+        cold_branch,
+        cold_label,
+        cold_term,
+        &mut cold_local_env,
+        emit_ctx,
+        codegen_env,
+        func_imports,
+    )
+    .map_err(|err| {
+        format!("optimizer v3 scalar-thread inline return from block {source_label}: {err}")
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_opt_v3_scalar_thread_inline_return_arm(
+    fb: &mut FunctionBuilder<'_>,
+    branch_block: ir::Block,
+    target_label: BlockLabel,
+    target_term: &BlockTerm<InstrCodegen>,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<(), String> {
+    fb.switch_to_block(branch_block);
+    let BlockTerm::Return(value) = target_term else {
+        return Err(format!(
+            "target block {target_label} is no longer a return block"
+        ));
+    };
+    let ret_value = emit_codegen_expr_with_local_env(
+        fb,
+        value,
+        local_env,
+        emit_ctx,
+        false,
+        codegen_env,
+        func_imports,
+    );
+    emit_codegen_return_pyobject(fb, target_label, ret_value, local_env, emit_ctx, None)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn emit_opt_v3_scalar_threaded_store_branch(
     fb: &mut FunctionBuilder<'_>,
     source_label: BlockLabel,
@@ -23122,7 +23339,7 @@ fn emit_opt_v3_scalar_threaded_store_branch(
     codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
     current_exception_name: Option<&str>,
-) -> Result<Option<BlockLabel>, String> {
+) -> Result<Option<Vec<BlockLabel>>, String> {
     let [store_expr] = typed_block.body.as_slice() else {
         return Ok(None);
     };
@@ -23199,9 +23416,29 @@ fn emit_opt_v3_scalar_threaded_store_branch(
         .as_ref()
         .expect("Store local slot should have storage layout during typed codegen");
     let local_name = local_name_for_location(layout, location);
-    let result_block = fb.create_block();
-    fb.append_block_param(result_block, emit_ctx.consts.i32_ty);
-    fb.append_block_param(result_block, emit_ctx.consts.ptr_ty);
+    let local_already_bound = local_env
+        .entry_index_for_location(location)
+        .or_else(|| local_env.entry_index_for_name(local_name))
+        .is_some();
+    let inline_return_targets = if !local_already_bound && emit_ctx.stack_slots.has_name(local_name)
+    {
+        opt_v3_scalar_thread_inline_return_targets(
+            function,
+            block_indices_by_label,
+            if_term,
+            &store.name,
+        )?
+    } else {
+        None
+    };
+    let result_block = if inline_return_targets.is_none() {
+        let block = fb.create_block();
+        fb.append_block_param(block, emit_ctx.consts.i32_ty);
+        fb.append_block_param(block, emit_ctx.consts.ptr_ty);
+        Some(block)
+    } else {
+        None
+    };
     let producer_fallback_block = fb.create_block();
     fb.set_cold_block(producer_fallback_block);
 
@@ -23256,20 +23493,37 @@ fn emit_opt_v3_scalar_threaded_store_branch(
         &consumer_hot_values,
         consumer_source,
     )?;
-    let hot_c = emit_checked_owned_pyobject_call_with_cleanup(
-        fb,
-        stmt_emit_ctx,
-        stmt_emit_ctx.py_long_from_i64_ref,
-        &[threaded_i64],
-        &[],
-    );
-    fb.ins().jump(
-        result_block,
-        &[
-            ir::BlockArg::Value(hot_condition),
-            ir::BlockArg::Value(hot_c),
-        ],
-    );
+    if let Some(inline_return_targets) = inline_return_targets {
+        let mut hot_return_env = local_env.clone();
+        emit_opt_v3_scalar_thread_inline_return_branch(
+            fb,
+            edge.target,
+            Some(consumer_source),
+            hot_condition,
+            inline_return_targets,
+            &mut hot_return_env,
+            stmt_emit_ctx,
+            codegen_env,
+            func_imports,
+        )?;
+    } else {
+        let result_block =
+            result_block.expect("non-inline scalar thread path should have a result block");
+        let hot_c = emit_checked_owned_pyobject_call_with_cleanup(
+            fb,
+            stmt_emit_ctx,
+            stmt_emit_ctx.py_long_from_i64_ref,
+            &[threaded_i64],
+            &[],
+        );
+        fb.ins().jump(
+            result_block,
+            &[
+                ir::BlockArg::Value(hot_condition),
+                ir::BlockArg::Value(hot_c),
+            ],
+        );
+    }
 
     fb.switch_to_block(producer_fallback_block);
     let mut fallback_env = local_env.clone();
@@ -23358,11 +23612,31 @@ fn emit_opt_v3_scalar_threaded_store_branch(
         &consumer_fallback_values,
         consumer_source,
     )?;
+    if let Some(inline_return_targets) = inline_return_targets {
+        emit_opt_v3_scalar_thread_inline_return_branch(
+            fb,
+            edge.target,
+            Some(consumer_source),
+            fallback_condition,
+            inline_return_targets,
+            &mut fallback_env,
+            consumer_fallback_emit_ctx,
+            codegen_env,
+            func_imports,
+        )?;
+        return Ok(Some(vec![
+            edge.target,
+            if_term.then_label,
+            if_term.else_label,
+        ]));
+    }
     let fallback_c = fallback_env
         .load_location(fb, location, local_name, consumer_fallback_emit_ctx, true)
         .ok_or_else(|| {
             format!("optimizer v3 scalar-thread fallback lost materialized local {local_name}")
         })?;
+    let result_block =
+        result_block.expect("non-inline scalar thread path should have result block");
     fb.ins().jump(
         result_block,
         &[
@@ -23452,7 +23726,7 @@ fn emit_opt_v3_scalar_threaded_store_branch(
         codegen_env,
         func_imports,
     )?;
-    Ok(Some(edge.target))
+    Ok(Some(vec![edge.target]))
 }
 
 fn emit_codegen_if_target_arm(
@@ -28917,7 +29191,7 @@ fn build_cranelift_run_bb_specialized_function(
             emit_ctx.require_deopt_point_at_block_entry(codegen_block.label)?;
             let _block_refcount_plan = emit_ctx.refcount_plan.block(codegen_block.label);
 
-            if let Some(consumer_label) = emit_opt_v3_scalar_threaded_store_branch(
+            if let Some(fused_labels) = emit_opt_v3_scalar_threaded_store_branch(
                 &mut fb,
                 codegen_block.label,
                 &typed_function.blocks[index],
@@ -28937,7 +29211,7 @@ fn build_cranelift_run_bb_specialized_function(
                 &mut func_imports,
                 codegen_block.exception_param(),
             )? {
-                opt_v3_fused_scalar_thread_consumers.insert(consumer_label);
+                opt_v3_fused_scalar_thread_consumers.extend(fused_labels);
                 continue;
             }
 
