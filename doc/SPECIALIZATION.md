@@ -422,14 +422,17 @@ consumes the emitted call plan directly when constructing
 ordinary calls are lowered mechanically to
 `InstrTyped::GuardedCallableCallTyped`; v3 emitted method calls resolve the
 current owner type and owner attribute, then lower mechanically to
-`InstrTyped::GuardedMethodCallTyped` before the legacy call-access annotator
-runs. V3 targets are also used for direct-function predeclaration,
+`InstrTyped::GuardedMethodCallTyped`; v3 emitted constructor calls resolve the
+current owner type and `__init__` attribute, then lower mechanically to
+`InstrTyped::GuardedCallableCallTyped` with constructor guards before the
+legacy call-access annotator runs. V3 targets are also used for direct-function predeclaration,
 process-JIT batch scheduling, and the earlier BlockPy store-call rewrite for
 ordinary direct calls, but planner queries over legacy
 `FunctionProfileEvidence` do not see v3 call targets. Current v3 direct-call
 support covers ordinary function targets and receiver-method targets with
-validated positional/default argument plans; constructor variants remain on the
-legacy path. On the legacy path, compatible profiled targets still become
+validated positional/default argument plans, plus class-constructor targets
+whose hot target is a transformed `__init__`. On the legacy path, compatible
+profiled targets still become
 guarded ordinary-call, constructor-call, or method-call plans with the selected
 `FunctionId`, owner/type-version guard when needed, and direct-entry argument
 plan; the existing typed lowering pass then turns those access plans into
@@ -502,8 +505,8 @@ JIT emitter still materializes the full guarded call blocks today.
   sentinels and resolved by the callee's default-resolving direct entry.
   Method and constructor-shaped targets, including `__init__`, are left as
   generic calls here so the typed method/constructor specialization path can
-  still handle them. V3 method-call emissions are handled later in typed-call
-  lowering, not by this store-call rewrite.
+  still handle them. V3 method-call and constructor-call emissions are handled
+  later in typed-call lowering, not by this store-call rewrite.
 - In apply/verify mode, JIT module planning clones the lowered codegen module,
   applies this rewrite from either explicit legacy call-target evidence or v3
   mechanical ordinary direct-call emissions, runs the normal BlockPy direct-call inliner
@@ -525,9 +528,9 @@ JIT emitter still materializes the full guarded call blocks today.
 - Current limitations:
   - keywords are excluded
   - starred / unpacked args are excluded
-  - constructor targets are excluded here and remain handled by typed call
-    specialization; method targets are represented by v3 method-call emissions
-    and lowered as guarded typed method calls
+  - constructor targets are excluded here and represented by v3
+    constructor-call emissions; method targets are represented by v3
+    method-call emissions and lowered as guarded typed method calls
   - variadic target params are excluded
   - required keyword-only target params are excluded unless they have a
     default value
@@ -703,11 +706,19 @@ JIT emitter still materializes the full guarded call blocks today.
 - Source input is again `call_hot_targets`.
 - Constructor calls do not get their own counter kind; they reuse the
   observed `FunctionId` for the hot transformed `__init__` target.
-- The constructor-specific refinement happens in
-  `direct_constructor_specializations_for_call_site`, at
-  `crates/soac_jit/src/jit/mod.rs:2785`, which uses
-  `lookup_exact_owner_types_for_constructor`, at
-  `crates/soac_jit/src/lib.rs:1008`.
+- In optimizer-v3 mode, `decide_optimizations --mode v3` consumes the raw
+  target evidence directly and writes constructor-call selections into
+  `mod.optv3`. The serialized plan owns the constructor owner type key, the
+  `__init__` direct-entry argument plan with implicit `self`, the callable
+  type-version guard kind, and the original-constructor-call fallback kind.
+- JIT typed-call lowering validates the mechanical emission, resolves the
+  current owner type and `__init__` attribute, and constructs a typed
+  constructor guard. The existing constructor emitter then owns allocation,
+  straight-line initializer inlining, direct `__init__` calls, and
+  `dp_jit_finish_constructor_init`.
+- Legacy constructor refinement remains the fallback for non-v3 plans and
+  happens in `direct_constructor_specializations_for_call_site`, which uses
+  `lookup_exact_owner_types_for_constructor`.
 
 ### Codegen
 

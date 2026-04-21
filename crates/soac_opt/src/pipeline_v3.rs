@@ -10,15 +10,16 @@ use crate::plan::{
     OptimizationPlanGenerationSummary, ProfileEvidenceStore, cached_module_paths_under_root,
 };
 use crate::plan_v3::{
-    DirectCallArgPlan, DirectCallArgSource, EXACT_LIST_EXACT_INT_ITEM_SHAPE_TAG,
-    ExactListItemAccessKind, ExactListItemShape, FunctionPlanIdentity, IndexedFieldAccessKind,
-    IndexedFieldOwnerType, IndexedGlobalAccessKind, MethodCallOwnerType, ModulePlanIdentity,
-    PlanDiagnostic, RegionId,
+    ConstructorCallOwnerType, DirectCallArgPlan, DirectCallArgSource,
+    EXACT_LIST_EXACT_INT_ITEM_SHAPE_TAG, ExactListItemAccessKind, ExactListItemShape,
+    FunctionPlanIdentity, IndexedFieldAccessKind, IndexedFieldOwnerType, IndexedGlobalAccessKind,
+    MethodCallOwnerType, ModulePlanIdentity, PlanDiagnostic, RegionId,
 };
 use crate::planner_v3::{
-    DirectCallPlanRequest, ExactListItemPlanRequest, ExtractedRegionPlanRequest,
-    FunctionPlanRequest, IndexedFieldPlanRequest, IndexedGlobalPlanRequest, MethodCallPlanRequest,
-    ModulePlanRequest, plan_module_optimization_v3,
+    ConstructorCallPlanRequest, DirectCallPlanRequest, ExactListItemPlanRequest,
+    ExtractedRegionPlanRequest, FunctionPlanRequest, IndexedFieldPlanRequest,
+    IndexedGlobalPlanRequest, MethodCallPlanRequest, ModulePlanRequest,
+    plan_module_optimization_v3,
 };
 use crate::region_v3::{
     RegionExtractionAttempt, RegionExtractionError, extract_function_regions_v3,
@@ -306,6 +307,16 @@ fn plan_and_emit_module_v3_from_raw_evidence_with_target_index(
             &mut identity_builder,
         );
         diagnostics.extend(direct_call_diagnostics);
+        let (constructor_calls, constructor_call_diagnostics) =
+            constructor_call_requests_from_evidence_v3(
+                lowered_module,
+                metadata,
+                function,
+                evidence_store,
+                target_index,
+                &mut identity_builder,
+            );
+        diagnostics.extend(constructor_call_diagnostics);
         let (method_calls, method_call_diagnostics) = method_call_requests_from_evidence_v3(
             lowered_module,
             metadata,
@@ -332,6 +343,7 @@ fn plan_and_emit_module_v3_from_raw_evidence_with_target_index(
             function: function_plan_identity_v3(function),
             regions: region_requests,
             direct_calls,
+            constructor_calls,
             method_calls,
             exact_list_items,
             indexed_fields,
@@ -384,6 +396,7 @@ pub fn plan_and_emit_extracted_exact_int_branches_v3(
             module,
             functions: vec![FunctionPlanRequest {
                 direct_calls: Vec::new(),
+                constructor_calls: Vec::new(),
                 method_calls: Vec::new(),
                 exact_list_items: Vec::new(),
                 indexed_fields: Vec::new(),
@@ -725,12 +738,6 @@ fn direct_call_requests_from_evidence_v3(
                 continue;
             }
             if target_function.names.fn_name == "__init__" {
-                diagnostics.push(PlanDiagnostic {
-                    source: Some(source),
-                    message: format!(
-                        "v3 direct-call declined target {serialized_target}: constructor targets require owner/type guards"
-                    ),
-                });
                 continue;
             }
             let arg_plan = match direct_call_arg_plan_for_instr_id_v3(
@@ -764,6 +771,107 @@ fn direct_call_requests_from_evidence_v3(
                 target: serialized_target,
                 arg_plan,
                 reason: "profiled call_hot_targets selected this function with validated ordinary-call arguments".to_string(),
+            });
+            identity_builder
+                .add_debug_name(serialized_target, target_function.names.qualname.clone());
+        }
+    }
+    (requests, diagnostics)
+}
+
+fn constructor_call_requests_from_evidence_v3(
+    lowered_module: &BlockPyModule<CodegenModuleShape>,
+    metadata: &CachedCodegenModuleMetadata,
+    function: &BlockPyFunction<CodegenModuleShape>,
+    evidence_store: &ProfileEvidenceStore,
+    target_index: &DirectCallTargetIndex,
+    identity_builder: &mut OptimizationPlanV3IdentityBuilder,
+) -> (Vec<ConstructorCallPlanRequest>, Vec<PlanDiagnostic>) {
+    let mut requests = Vec::new();
+    let mut diagnostics = Vec::new();
+    let mut entries = evidence_store
+        .persistent_call_target_specializations_for_runtime_function_v3(
+            metadata.module_name.as_str(),
+            metadata.source_hash,
+            function.function_id,
+        )
+        .into_iter()
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|(source, _)| *source);
+    for (source, targets) in entries {
+        if is_method_call_source_v3(lowered_module, function, source) {
+            continue;
+        }
+        let mut targets = targets;
+        targets.sort();
+        targets.dedup();
+        for target in targets {
+            let serialized_target = identity_builder.function_id_for_persistent(target.clone());
+            let Some(target_function) = target_index.function(&target) else {
+                diagnostics.push(PlanDiagnostic {
+                    source: Some(source),
+                    message: format!(
+                        "v3 constructor-call declined target {serialized_target}: target function is missing from cached modules"
+                    ),
+                });
+                continue;
+            };
+            if target_function.names.fn_name != "__init__" {
+                continue;
+            }
+            if target_function.execution_mode() != FunctionExecutionMode::Jit {
+                diagnostics.push(PlanDiagnostic {
+                    source: Some(source),
+                    message: format!(
+                        "v3 constructor-call declined target {serialized_target}: target function is not JIT lowered"
+                    ),
+                });
+                continue;
+            }
+            let Some(owner_type) = constructor_call_owner_type_from_target_v3(
+                &target_function.names.qualname,
+                &target,
+            ) else {
+                diagnostics.push(PlanDiagnostic {
+                    source: Some(source),
+                    message: format!(
+                        "v3 constructor-call declined target {serialized_target}: could not derive owner type from __init__ qualname"
+                    ),
+                });
+                continue;
+            };
+            let arg_plan = match direct_call_arg_plan_for_instr_id_v3(
+                function,
+                source,
+                target_function,
+                1,
+            ) {
+                Some(Ok(arg_plan)) => arg_plan,
+                Some(Err(reason)) => {
+                    diagnostics.push(PlanDiagnostic {
+                        source: Some(source),
+                        message: format!(
+                            "v3 constructor-call declined target {serialized_target}: {reason}"
+                        ),
+                    });
+                    continue;
+                }
+                None => {
+                    diagnostics.push(PlanDiagnostic {
+                        source: Some(source),
+                        message: format!(
+                            "v3 constructor-call declined target {serialized_target}: source instruction is not a lowered call"
+                        ),
+                    });
+                    continue;
+                }
+            };
+            requests.push(ConstructorCallPlanRequest {
+                source,
+                target: serialized_target,
+                owner_type,
+                arg_plan,
+                reason: "profiled call_hot_targets selected this constructor __init__ target with validated constructor arguments".to_string(),
             });
             identity_builder
                 .add_debug_name(serialized_target, target_function.names.qualname.clone());
@@ -885,6 +993,24 @@ fn method_call_requests_from_evidence_v3(
         }
     }
     (requests, diagnostics)
+}
+
+fn constructor_call_owner_type_from_target_v3(
+    target_qualname: &str,
+    target: &PersistentFunctionId,
+) -> Option<ConstructorCallOwnerType> {
+    let owner_qualname = target_qualname.strip_suffix(".__init__")?;
+    if owner_qualname.is_empty()
+        || owner_qualname
+            .split('.')
+            .any(|part| part.is_empty() || part == "<locals>")
+    {
+        return None;
+    }
+    Some(ConstructorCallOwnerType {
+        module_name: target.module.module_name.clone(),
+        qualname: owner_qualname.to_string(),
+    })
 }
 
 fn method_call_owner_type_from_target_v3(

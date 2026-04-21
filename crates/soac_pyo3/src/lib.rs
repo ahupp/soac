@@ -146,6 +146,8 @@ fn inspect_optimization_artifacts_v3_json(path: &str) -> PyResult<String> {
                 "scalar_threads": function.scalar_threads.len(),
                 "direct_calls": function.direct_calls.len(),
                 "emitted_direct_calls": emitted_function.map(|emitted| emitted.direct_calls.len()).unwrap_or(0),
+                "constructor_calls": function.constructor_calls.len(),
+                "emitted_constructor_calls": emitted_function.map(|emitted| emitted.constructor_calls.len()).unwrap_or(0),
                 "method_calls": function.method_calls.len(),
                 "emitted_method_calls": emitted_function.map(|emitted| emitted.method_calls.len()).unwrap_or(0),
                 "exact_list_items": function.exact_list_items.len(),

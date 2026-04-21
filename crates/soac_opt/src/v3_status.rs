@@ -29,10 +29,10 @@ pub const V3_OPTIMIZATION_FAMILY_STATUS: &[V3OptimizationFamilyStatus] = &[
         next_step: "model remaining operator semantics, fallback ownership, and unsupported-overflow boundaries",
     },
     V3OptimizationFamilyStatus {
-        family: "profiled direct calls and guarded receiver-method calls",
+        family: "profiled direct calls, guarded receiver-method calls, and guarded constructor calls",
         legacy_input: "call_hot_targets",
         status: V3MigrationStatus::LiveCodegenInputOnly,
-        next_step: "add constructor variants and lift call lowering further into mechanical v3 nodes",
+        next_step: "lift call lowering further into mechanical v3 nodes and remove more legacy typed-call rediscovery",
     },
     V3OptimizationFamilyStatus {
         family: "exact-list getitem and setitem",

@@ -1098,3 +1098,21 @@ benchmarked throughput delta, and the headline pre/post numbers.
 - post-change benchmark:
   - specialized pass, 1M loops x3: `260255`, `262657`, `260516 loops/s`
   - no-refcount diagnostic, 1M loops x3: `342902`, `345126`, `342299 loops/s`
+
+## 2026-04-22 - Plan v3 guarded constructor calls
+
+- jj change id: `otplqsxp`
+- summary: optimizer v3 now writes guarded constructor-call selections into
+  `mod.optv3`, and the JIT consumes those emitted constructor-call nodes as
+  typed-call inputs while preserving the existing constructor allocation/init
+  lowering shape.
+- throughput: `-0.18%` specialized pystone median; no-refcount diagnostic
+  `+2.49%`; code size unchanged
+- pre-change benchmark:
+  - specialized pass, 1M loops x3: `169294`, `166294`, `170687 loops/s`
+  - no-refcount diagnostic, 1M loops x3: `180244`, `175495`, `171471 loops/s`
+  - pystone JIT code bytes: `56776`
+- post-change benchmark:
+  - specialized pass, 1M loops x3: `171222`, `168987`, `159633 loops/s`
+  - no-refcount diagnostic, 1M loops x3: `178648`, `179869`, `181974 loops/s`
+  - pystone JIT code bytes: `56776`

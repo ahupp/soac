@@ -88,10 +88,14 @@ def _run_script(module_root: Path, module_name: str) -> str:
     return "\n".join(
         [
             "import sys",
+            "import importlib",
             f"sys.path.insert(0, {str(module_root)!r})",
             "from soac.import_hook import install",
             "install()",
-            f"import {module_name}",
+            f"module = importlib.import_module({module_name!r})",
+            "verify = getattr(module, '_soac_opt_verify', None)",
+            "if callable(verify):",
+            "    verify()",
             "",
         ]
     )
@@ -204,6 +208,8 @@ def _assert_v3_plan_expectation(
         "scalar_threads",
         "direct_calls",
         "emitted_direct_calls",
+        "constructor_calls",
+        "emitted_constructor_calls",
         "method_calls",
         "emitted_method_calls",
         "exact_list_items",

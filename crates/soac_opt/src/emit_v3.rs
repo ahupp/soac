@@ -1,13 +1,15 @@
 use crate::plan_v3::{
-    ConversionKind, DeoptPointId, DirectCallArgPlan, DirectCallSpecializationPlan,
-    ExactListItemAccessKind, ExactListItemFallbackPlan, ExactListItemGuardPlan, ExactListItemShape,
-    ExactListItemSpecializationPlan, FailureMode, GuardFailure, GuardKind, IndexedFieldAccessKind,
-    IndexedFieldOwnerType, IndexedFieldSpecializationPlan, IndexedGlobalAccessKind,
-    IndexedGlobalFallbackPlan, IndexedGlobalGuardPlan, IndexedGlobalSpecializationPlan,
-    MaterializeKind, MethodCallFallbackPlan, MethodCallGuardPlan, MethodCallOwnerType,
-    MethodCallSpecializationPlan, ModuleOptimizationPlanV3, OperationNode, PlanNodeId,
-    PlanNodeKind, PlanValidationError, PlanValue, PlannedConstant, PlannedOp, RegionExitKind,
-    RegionExitTarget, RegionId, RichCompareOp, validate_module_plan_v3,
+    ConstructorCallFallbackPlan, ConstructorCallGuardPlan, ConstructorCallOwnerType,
+    ConstructorCallSpecializationPlan, ConversionKind, DeoptPointId, DirectCallArgPlan,
+    DirectCallSpecializationPlan, ExactListItemAccessKind, ExactListItemFallbackPlan,
+    ExactListItemGuardPlan, ExactListItemShape, ExactListItemSpecializationPlan, FailureMode,
+    GuardFailure, GuardKind, IndexedFieldAccessKind, IndexedFieldOwnerType,
+    IndexedFieldSpecializationPlan, IndexedGlobalAccessKind, IndexedGlobalFallbackPlan,
+    IndexedGlobalGuardPlan, IndexedGlobalSpecializationPlan, MaterializeKind,
+    MethodCallFallbackPlan, MethodCallGuardPlan, MethodCallOwnerType, MethodCallSpecializationPlan,
+    ModuleOptimizationPlanV3, OperationNode, PlanNodeId, PlanNodeKind, PlanValidationError,
+    PlanValue, PlannedConstant, PlannedOp, RegionExitKind, RegionExitTarget, RegionId,
+    RichCompareOp, validate_module_plan_v3,
 };
 use soac_core::block_py::{InstrId, SerializedFunctionId};
 use std::fmt;
@@ -23,6 +25,7 @@ pub struct MechanicalFunctionEmission {
     pub function: SerializedFunctionId,
     pub debug_name: Option<String>,
     pub direct_calls: Vec<MechanicalDirectCallEmission>,
+    pub constructor_calls: Vec<MechanicalConstructorCallEmission>,
     pub method_calls: Vec<MechanicalMethodCallEmission>,
     pub exact_list_items: Vec<MechanicalExactListItemEmission>,
     pub indexed_fields: Vec<MechanicalIndexedFieldEmission>,
@@ -35,6 +38,17 @@ pub struct MechanicalDirectCallEmission {
     pub source: InstrId,
     pub target: SerializedFunctionId,
     pub arg_plan: DirectCallArgPlan,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct MechanicalConstructorCallEmission {
+    pub source: InstrId,
+    pub target: SerializedFunctionId,
+    pub owner_type: ConstructorCallOwnerType,
+    pub arg_plan: DirectCallArgPlan,
+    pub guard: ConstructorCallGuardPlan,
+    pub fallback: ConstructorCallFallbackPlan,
     pub reason: String,
 }
 
@@ -230,6 +244,11 @@ pub fn emit_mechanical_plan_v3(
                 function: function.function.function,
                 debug_name: function.function.debug_name.clone(),
                 direct_calls: function.direct_calls.iter().map(emit_direct_call).collect(),
+                constructor_calls: function
+                    .constructor_calls
+                    .iter()
+                    .map(emit_constructor_call)
+                    .collect(),
                 method_calls: function.method_calls.iter().map(emit_method_call).collect(),
                 exact_list_items: function
                     .exact_list_items
@@ -281,6 +300,20 @@ fn emit_direct_call(direct_call: &DirectCallSpecializationPlan) -> MechanicalDir
         target: direct_call.target,
         arg_plan: direct_call.arg_plan.clone(),
         reason: direct_call.reason.clone(),
+    }
+}
+
+fn emit_constructor_call(
+    constructor_call: &ConstructorCallSpecializationPlan,
+) -> MechanicalConstructorCallEmission {
+    MechanicalConstructorCallEmission {
+        source: constructor_call.source,
+        target: constructor_call.target,
+        owner_type: constructor_call.owner_type.clone(),
+        arg_plan: constructor_call.arg_plan.clone(),
+        guard: constructor_call.guard.clone(),
+        fallback: constructor_call.fallback.clone(),
+        reason: constructor_call.reason.clone(),
     }
 }
 
@@ -401,6 +434,8 @@ fn emit_exit_kind(kind: &RegionExitKind) -> MechanicalExitKind {
 mod tests {
     use super::*;
     use crate::plan_v3::{
+        ConstructorCallFallbackKind, ConstructorCallFallbackPlan, ConstructorCallGuardKind,
+        ConstructorCallGuardPlan, ConstructorCallOwnerType, ConstructorCallSpecializationPlan,
         Cost, DirectCallArgPlan, DirectCallArgSource, DirectCallSpecializationPlan,
         ExactListItemAccessKind, ExactListItemFallbackKind, ExactListItemFallbackPlan,
         ExactListItemGuardKind, ExactListItemGuardPlan, ExactListItemShape,
@@ -545,6 +580,7 @@ mod tests {
                 ],
                 scalar_threads: Vec::new(),
                 direct_calls: Vec::new(),
+                constructor_calls: Vec::new(),
                 method_calls: Vec::new(),
                 exact_list_items: Vec::new(),
                 indexed_fields: Vec::new(),
@@ -616,6 +652,59 @@ mod tests {
                     sources: vec![DirectCallArgSource::Provided(0)],
                 },
                 reason: "profiled call_hot_targets selected this same-module function".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn emits_constructor_call_decisions_mechanically() {
+        let mut plan = test_plan(true);
+        let source = InstrId::new(BlockLabel::from_index(0), 7);
+        let target = SerializedFunctionId::new(SerializedModuleId::new(0), LocalFunctionId::new(2));
+        let owner_type = ConstructorCallOwnerType {
+            module_name: "pkg.mod".to_string(),
+            qualname: "Box".to_string(),
+        };
+        let guard = ConstructorCallGuardPlan {
+            kind: ConstructorCallGuardKind::ExactCallableTypeVersion,
+        };
+        let fallback = ConstructorCallFallbackPlan {
+            kind: ConstructorCallFallbackKind::OriginalConstructorCall,
+        };
+        plan.functions[0]
+            .constructor_calls
+            .push(ConstructorCallSpecializationPlan {
+                source,
+                target,
+                owner_type: owner_type.clone(),
+                arg_plan: DirectCallArgPlan {
+                    sources: vec![
+                        DirectCallArgSource::Provided(0),
+                        DirectCallArgSource::Provided(1),
+                    ],
+                },
+                guard: guard.clone(),
+                fallback: fallback.clone(),
+                reason: "profiled constructor target".to_string(),
+            });
+
+        let emission = emit_mechanical_plan_v3(&plan).unwrap();
+
+        assert_eq!(
+            emission.functions[0].constructor_calls,
+            vec![MechanicalConstructorCallEmission {
+                source,
+                target,
+                owner_type,
+                arg_plan: DirectCallArgPlan {
+                    sources: vec![
+                        DirectCallArgSource::Provided(0),
+                        DirectCallArgSource::Provided(1),
+                    ],
+                },
+                guard,
+                fallback,
+                reason: "profiled constructor target".to_string(),
             }]
         );
     }

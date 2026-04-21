@@ -113,6 +113,9 @@ fn format_optimization_artifacts_v3_with_options(
         let emitted_direct_calls = emitted_function
             .map(|emitted| emitted.direct_calls.len())
             .unwrap_or(0);
+        let emitted_constructor_calls = emitted_function
+            .map(|emitted| emitted.constructor_calls.len())
+            .unwrap_or(0);
         let emitted_method_calls = emitted_function
             .map(|emitted| emitted.method_calls.len())
             .unwrap_or(0);
@@ -135,12 +138,14 @@ fn format_optimization_artifacts_v3_with_options(
         ));
         out.push_str(&format!(" id={}\n", function.function.function));
         out.push_str(&format!(
-            "  regions={} emitted_regions={} scalar_threads={} direct_calls={} emitted_direct_calls={} method_calls={} emitted_method_calls={} exact_list_items={} emitted_exact_list_items={} indexed_fields={} emitted_indexed_fields={} indexed_globals={} emitted_indexed_globals={} deopt_points={} ownership_actions={} diagnostics={}\n",
+            "  regions={} emitted_regions={} scalar_threads={} direct_calls={} emitted_direct_calls={} constructor_calls={} emitted_constructor_calls={} method_calls={} emitted_method_calls={} exact_list_items={} emitted_exact_list_items={} indexed_fields={} emitted_indexed_fields={} indexed_globals={} emitted_indexed_globals={} deopt_points={} ownership_actions={} diagnostics={}\n",
             function.regions.len(),
             emitted_regions,
             function.scalar_threads.len(),
             function.direct_calls.len(),
             emitted_direct_calls,
+            function.constructor_calls.len(),
+            emitted_constructor_calls,
             function.method_calls.len(),
             emitted_method_calls,
             function.exact_list_items.len(),
@@ -190,6 +195,34 @@ fn format_optimization_artifacts_v3_with_options(
                     direct_call.target,
                     direct_call.arg_plan,
                     direct_call.reason
+                ));
+            }
+        }
+        for constructor_call in &function.constructor_calls {
+            out.push_str(&format!(
+                "  constructor_call source={} target={} owner={}.{} arg_plan={:?} guard={:?} fallback={:?} reason={}\n",
+                constructor_call.source,
+                constructor_call.target,
+                constructor_call.owner_type.module_name,
+                constructor_call.owner_type.qualname,
+                constructor_call.arg_plan,
+                constructor_call.guard,
+                constructor_call.fallback,
+                constructor_call.reason
+            ));
+        }
+        if let Some(emitted_function) = emitted_function {
+            for constructor_call in &emitted_function.constructor_calls {
+                out.push_str(&format!(
+                    "  emitted_constructor_call source={} target={} owner={}.{} arg_plan={:?} guard={:?} fallback={:?} reason={}\n",
+                    constructor_call.source,
+                    constructor_call.target,
+                    constructor_call.owner_type.module_name,
+                    constructor_call.owner_type.qualname,
+                    constructor_call.arg_plan,
+                    constructor_call.guard,
+                    constructor_call.fallback,
+                    constructor_call.reason
                 ));
             }
         }
@@ -404,6 +437,7 @@ mod test {
                     regions: Vec::new(),
                     scalar_threads: Vec::new(),
                     direct_calls: Vec::new(),
+                    constructor_calls: Vec::new(),
                     method_calls: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
@@ -419,6 +453,7 @@ mod test {
                     function,
                     debug_name: Some("f".to_string()),
                     direct_calls: Vec::new(),
+                    constructor_calls: Vec::new(),
                     method_calls: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
@@ -432,7 +467,7 @@ mod test {
         assert!(formatted.contains("module pkg.mod source_hash=0x0000000000001234"));
         assert!(formatted.contains("function f"));
         assert!(formatted.contains(
-            "regions=0 emitted_regions=0 scalar_threads=0 direct_calls=0 emitted_direct_calls=0 method_calls=0 emitted_method_calls=0 exact_list_items=0 emitted_exact_list_items=0 indexed_fields=0 emitted_indexed_fields=0 indexed_globals=0 emitted_indexed_globals=0"
+            "regions=0 emitted_regions=0 scalar_threads=0 direct_calls=0 emitted_direct_calls=0 constructor_calls=0 emitted_constructor_calls=0 method_calls=0 emitted_method_calls=0 exact_list_items=0 emitted_exact_list_items=0 indexed_fields=0 emitted_indexed_fields=0 indexed_globals=0 emitted_indexed_globals=0"
         ));
     }
 }

@@ -2,6 +2,8 @@ use crate::alternatives_v3::{
     AlternativeCatalog, AlternativeId, FailureTargets, LoweringAlternative,
 };
 use crate::plan_v3::{
+    ConstructorCallFallbackKind, ConstructorCallFallbackPlan, ConstructorCallGuardKind,
+    ConstructorCallGuardPlan, ConstructorCallOwnerType, ConstructorCallSpecializationPlan,
     ConversionKind, ConversionOwnership, ConversionPrecondition, ConvertNode, Cost,
     DirectCallArgPlan, DirectCallSpecializationPlan, ExactListItemAccessKind,
     ExactListItemFallbackKind, ExactListItemFallbackPlan, ExactListItemGuardKind,
@@ -40,6 +42,7 @@ pub struct FunctionPlanRequest {
     pub function: FunctionPlanIdentity,
     pub regions: Vec<ExtractedRegionPlanRequest>,
     pub direct_calls: Vec<DirectCallPlanRequest>,
+    pub constructor_calls: Vec<ConstructorCallPlanRequest>,
     pub method_calls: Vec<MethodCallPlanRequest>,
     pub exact_list_items: Vec<ExactListItemPlanRequest>,
     pub indexed_fields: Vec<IndexedFieldPlanRequest>,
@@ -50,6 +53,15 @@ pub struct FunctionPlanRequest {
 pub struct DirectCallPlanRequest {
     pub source: InstrId,
     pub target: SerializedFunctionId,
+    pub arg_plan: DirectCallArgPlan,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConstructorCallPlanRequest {
+    pub source: InstrId,
+    pub target: SerializedFunctionId,
+    pub owner_type: ConstructorCallOwnerType,
     pub arg_plan: DirectCallArgPlan,
     pub reason: String,
 }
@@ -145,6 +157,7 @@ pub fn plan_function_optimization_v3(
 ) -> FunctionOptimizationPlanV3 {
     let region_requests = request.regions;
     let direct_calls = plan_direct_call_specializations_v3(&request.direct_calls);
+    let constructor_calls = plan_constructor_call_specializations_v3(&request.constructor_calls);
     let method_calls = plan_method_call_specializations_v3(&request.method_calls);
     let exact_list_items = plan_exact_list_item_specializations_v3(&request.exact_list_items);
     let indexed_fields = plan_indexed_field_specializations_v3(&request.indexed_fields);
@@ -154,6 +167,7 @@ pub fn plan_function_optimization_v3(
         regions: Vec::new(),
         scalar_threads: Vec::new(),
         direct_calls,
+        constructor_calls,
         method_calls,
         exact_list_items,
         indexed_fields,
@@ -180,6 +194,46 @@ pub fn plan_function_optimization_v3(
 
     function.scalar_threads = plan_scalar_local_threads_v3(&region_requests, &function.regions);
     function
+}
+
+fn plan_constructor_call_specializations_v3(
+    constructor_call_requests: &[ConstructorCallPlanRequest],
+) -> Vec<ConstructorCallSpecializationPlan> {
+    let mut entries = constructor_call_requests.iter().collect::<Vec<_>>();
+    entries.sort_by(|lhs, rhs| {
+        (
+            lhs.source,
+            lhs.target,
+            lhs.owner_type.module_name.as_str(),
+            lhs.owner_type.qualname.as_str(),
+        )
+            .cmp(&(
+                rhs.source,
+                rhs.target,
+                rhs.owner_type.module_name.as_str(),
+                rhs.owner_type.qualname.as_str(),
+            ))
+    });
+    let mut seen = HashSet::new();
+    let mut plans = Vec::new();
+    for request in entries {
+        if seen.insert((request.source, request.target, request.owner_type.clone())) {
+            plans.push(ConstructorCallSpecializationPlan {
+                source: request.source,
+                target: request.target,
+                owner_type: request.owner_type.clone(),
+                arg_plan: request.arg_plan.clone(),
+                guard: ConstructorCallGuardPlan {
+                    kind: ConstructorCallGuardKind::ExactCallableTypeVersion,
+                },
+                fallback: ConstructorCallFallbackPlan {
+                    kind: ConstructorCallFallbackKind::OriginalConstructorCall,
+                },
+                reason: request.reason.clone(),
+            });
+        }
+    }
+    plans
 }
 
 fn plan_method_call_specializations_v3(
@@ -1765,6 +1819,7 @@ mod tests {
                 },
                 regions,
                 direct_calls: Vec::new(),
+                constructor_calls: Vec::new(),
                 method_calls: Vec::new(),
                 exact_list_items: Vec::new(),
                 indexed_fields: Vec::new(),

@@ -154,12 +154,14 @@ Partially migrated families are also intentionally visible:
 - scalar-threading is only implemented for the adjacent, no-exception,
   store-RHS-to-empty-compare shape;
 - profiled direct calls are represented as v3 plan selections plus mechanical
-  direct-call/method-call emissions with validated argument plans and consumed
-  through mechanical typed-call lowering for ordinary-function and receiver
-  method targets.
+  direct-call/method-call/constructor-call emissions with validated argument
+  plans and consumed through mechanical typed-call lowering for ordinary-function,
+  receiver method, and class-constructor targets.
   Cross-module targets are represented through serialized module identities and
-  resolved from the loaded module set; constructors are still outside the v3
-  direct-call family.
+  resolved from the loaded module set. Constructor-call plans own the selected
+  `__init__` target, owner type, type-version guard kind, original-call
+  fallback, and implicit-`self` argument plan; the existing constructor emitter
+  still owns allocation, initializer inlining, and `__init__` result validation.
 - indexed fields are represented as v3 plan selections plus mechanical
   indexed-field emissions. `soac_jit` now keeps the emitted access kind and
   attribute name separate from legacy per-instruction field evidence and
