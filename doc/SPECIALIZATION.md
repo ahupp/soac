@@ -448,11 +448,14 @@ runs. The shared typed call-access lowering pass then creates the guarded typed
 call nodes. Guardless v3-owned sources remain generic calls instead of being
 replanned from legacy call-target evidence. V3 targets are also used for
 direct-function predeclaration and process-JIT batch scheduling. The
-earlier BlockPy store-call rewrite now consumes only v3 call plans whose
-serialized body policy is `Inline`; v3 plans whose body policy is `DirectCall`
-stay in the original lowered call shape for later mechanical typed-call
-lowering. Planner queries over legacy `FunctionProfileEvidence` do not see v3
-call targets. Current v3 direct-call support covers ordinary function targets
+earlier BlockPy store-call rewrite consumes v3 call plans whose serialized body
+policy is `Inline` before inlining/scalar cleanup. For simple store-call sites
+whose body policy is `DirectCall`, a later post-inline BlockPy rewrite creates
+explicit function-id guard, direct-call hot arm, and generic fallback blocks
+without handing that hot arm back to the inliner. Other `DirectCall` shapes stay
+in the original lowered call shape for mechanical typed-call lowering. Planner
+queries over legacy `FunctionProfileEvidence` do not see v3 call targets.
+Current v3 direct-call support covers ordinary function targets
 and receiver-method targets with validated positional/default argument plans,
 plus class-constructor targets whose hot target is a transformed `__init__`.
 On the legacy path, compatible
@@ -633,9 +636,11 @@ JIT emitter still materializes the full guarded call blocks today.
   directly. V3 `DirectCall` body plans first annotate typed call access plans,
   and the shared typed access lowering pass creates guarded callable/method
   payloads before result-demand planning. Ordinary v3 direct-call store sites
-  and eligible receiver-method sites are expanded in the profiled BlockPy
-  module plan only when the v3 plan selected `Inline` as the call-body policy
-  after validating inline-fragment buildability. Runtime-iter constructor
+  whose body selected `DirectCall` can be expanded after inline cleanup into
+  explicit function-id guard CFG with a `CallDirect` hot arm and generic
+  fallback. Ordinary direct-call store sites and eligible receiver-method sites
+  whose body selected `Inline` are expanded earlier in the profiled BlockPy
+  module plan after validating inline-fragment buildability. Runtime-iter constructor
   `Inline` body plans carry the selected `__iter__` function id in the
   serialized v3 plan; the JIT resolves that plan target and uses it as the body
   callee instead of rediscovering the method target from the owner type. The

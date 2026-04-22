@@ -23521,7 +23521,7 @@ def f(x, y):
     }
 
     #[test]
-    fn v3_direct_call_store_rewrite_requires_inline_body_plan() {
+    fn v3_direct_call_body_store_rewrite_runs_after_inline_cleanup() {
         let module_name = "v3_store_call_direct_body_plan_test";
         let module_name_gen = ModuleNameGen::new(0);
         let mut callee_function = test_function_in_module(&module_name_gen, "callee");
@@ -23616,28 +23616,30 @@ def f(x, y):
             .expect("planned module should keep caller");
 
         assert!(
-            !planned_caller.blocks.iter().any(|block| {
+            planned_caller.blocks.iter().any(|block| {
                 matches!(
                     &block.term,
                     BlockTerm::IfTerm(term)
                         if matches!(term.test, InstrCodegen::DirectFunctionIdGuardTest(_))
                 )
             }),
-            "v3 direct-call body plan should not trigger the early inline rewrite"
+            "v3 direct-call body plan should still make the function-id guard explicit"
         );
         assert!(
             planned_caller
                 .blocks
                 .iter()
                 .flat_map(|block| &block.body)
-                .any(|instr| {
-                    matches!(
-                        instr,
-                        InstrCodegen::Store(store)
-                            if matches!(store.value.as_ref(), InstrCodegen::Call(_))
-                    )
-                }),
-            "the generic call should remain available for later mechanical v3 direct-call lowering"
+                .any(|instr| matches!(instr, InstrCodegen::Store(store) if matches!(store.value.as_ref(), InstrCodegen::CallDirect(_)))),
+            "v3 DirectCall body stores should be rewritten after inline cleanup, so the direct call remains explicit"
+        );
+        assert!(
+            planned_caller
+                .blocks
+                .iter()
+                .flat_map(|block| &block.body)
+                .any(|instr| matches!(instr, InstrCodegen::Store(store) if matches!(store.value.as_ref(), InstrCodegen::Call(_)))),
+            "the generic fallback call should remain available in the fallback arm"
         );
     }
 

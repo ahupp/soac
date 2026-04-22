@@ -2310,6 +2310,52 @@ fn build_profiled_jit_module_plan(
             })?;
         }
     }
+    let mut direct_body_rewritten_store_count = 0usize;
+    for function in &mut planned_module.callable_defs {
+        if profile
+            .opt_v3_exact_int_branch_artifacts
+            .contains_key(&function.function_id)
+        {
+            continue;
+        }
+        let direct_body_rewrite_targets =
+            profile.v3_direct_function_call_body_targets(function.function_id);
+        if direct_body_rewrite_targets.is_empty() {
+            continue;
+        }
+        let stats = rewrite_profiled_function_call_store_sites(
+            function,
+            &direct_body_rewrite_targets,
+            &callees,
+        );
+        if stats.rewritten_stores != 0
+            || stats.skipped_empty_targets != 0
+            || stats.skipped_incompatible_targets != 0
+        {
+            info!(
+                target: "soac_jit_v3_direct_call_body_rewrite",
+                module_id = planned_module_id,
+                function_id = %function.function_id,
+                qualname = %function.names.qualname,
+                rewritten_stores = stats.rewritten_stores,
+                skipped_empty_targets = stats.skipped_empty_targets,
+                skipped_incompatible_targets = stats.skipped_incompatible_targets,
+                skipped_missing_callee_targets = stats.skipped_missing_callee_targets,
+                skipped_arity_mismatch_targets = stats.skipped_arity_mismatch_targets,
+                skipped_unsupported_init_targets = stats.skipped_unsupported_init_targets,
+                skipped_missing_storage_layout_targets = stats.skipped_missing_storage_layout_targets,
+                skipped_unsupported_param_kind_targets =
+                    stats.skipped_unsupported_param_kind_targets,
+                skipped_missing_param_storage_targets = stats.skipped_missing_param_storage_targets,
+                "soac_jit_v3_direct_call_body_rewrite"
+            );
+        }
+        direct_body_rewritten_store_count += stats.rewritten_stores;
+    }
+    if direct_body_rewritten_store_count != 0 {
+        validate_codegen_instr_ids(&planned_module)
+            .map_err(|err| format!("v3 direct-call body CFG rewrite validation failed: {err}"))?;
+    }
     build_jit_module_plan_from_owned_module(planned_module)
 }
 
@@ -2351,6 +2397,12 @@ fn build_profiled_inline_callee_maps(
         let direct_call_rewrite_targets =
             profile.module_plan_direct_call_rewrite_targets(function.function_id)?;
         for targets in direct_call_rewrite_targets.values() {
+            target_ids.extend(targets.iter().copied());
+        }
+        for targets in profile
+            .v3_direct_function_call_body_targets(function.function_id)
+            .values()
+        {
             target_ids.extend(targets.iter().copied());
         }
         for plans in profile
@@ -2430,6 +2482,16 @@ fn build_profiled_inline_callee_maps(
         let direct_call_rewrite_targets =
             profile.module_plan_direct_call_rewrite_targets(function_id)?;
         for targets in direct_call_rewrite_targets.values() {
+            for target_id in targets {
+                if target_ids.insert(*target_id) {
+                    pending_target_ids.push_back(*target_id);
+                }
+            }
+        }
+        for targets in profile
+            .v3_direct_function_call_body_targets(function_id)
+            .values()
+        {
             for target_id in targets {
                 if target_ids.insert(*target_id) {
                     pending_target_ids.push_back(*target_id);
@@ -13668,6 +13730,22 @@ fn opt_v3_inline_direct_call_targets(
         .collect()
 }
 
+fn opt_v3_direct_call_body_targets(
+    direct_calls_by_source: &HashMap<InstrId, Vec<OptV3DirectCallPlan>>,
+) -> HashMap<InstrId, Vec<RuntimeFunctionId>> {
+    direct_calls_by_source
+        .iter()
+        .filter_map(|(source, direct_calls)| {
+            let targets = direct_calls
+                .iter()
+                .filter(|direct_call| direct_call.body.kind == PlanV3CallBodyKind::DirectCall)
+                .map(|direct_call| direct_call.target)
+                .collect::<Vec<_>>();
+            (!targets.is_empty()).then_some((*source, targets))
+        })
+        .collect()
+}
+
 fn opt_v3_direct_call_body_plans(
     direct_calls_by_source: &HashMap<InstrId, Vec<OptV3DirectCallPlan>>,
 ) -> HashMap<InstrId, Vec<OptV3DirectCallPlan>> {
@@ -15649,6 +15727,16 @@ impl<'a> SpecializationProfile<'a> {
         self.opt_v3_emitted_direct_calls
             .get(&function_id)
             .map(opt_v3_inline_direct_call_targets)
+            .unwrap_or_default()
+    }
+
+    fn v3_direct_function_call_body_targets(
+        &self,
+        function_id: RuntimeFunctionId,
+    ) -> HashMap<InstrId, Vec<RuntimeFunctionId>> {
+        self.opt_v3_emitted_direct_calls
+            .get(&function_id)
+            .map(opt_v3_direct_call_body_targets)
             .unwrap_or_default()
     }
 
