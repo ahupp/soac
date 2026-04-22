@@ -1362,11 +1362,19 @@ fn predeclare_owner_attr_import(
     let Some(owner_type_ref) = reloc_type_ref_for_type(owner_type)? else {
         return Ok(());
     };
-    predeclare_reloc_type_ref_import(jit_module, &owner_type_ref)?;
+    predeclare_owner_attr_import_for_ref(jit_module, &owner_type_ref, attr_name)
+}
+
+fn predeclare_owner_attr_import_for_ref(
+    jit_module: &mut JITModule,
+    owner_type_ref: &RelocTypeRef,
+    attr_name: &str,
+) -> Result<(), String> {
+    predeclare_reloc_type_ref_import(jit_module, owner_type_ref)?;
     predeclare_reloc_callable_ref_import(
         jit_module,
         &RelocCallableRef::OwnerAttr {
-            owner_type_ref,
+            owner_type_ref: owner_type_ref.clone(),
             attr_name: attr_name.to_string(),
         },
     )
@@ -1549,56 +1557,100 @@ fn predeclare_direct_call_owner_type_imports(
 ) -> Result<HashMap<DirectOwnerAttrKey, Vec<DirectOwnerAttrSpecialization>>, String> {
     let mut out: HashMap<DirectOwnerAttrKey, Vec<DirectOwnerAttrSpecialization>> = HashMap::new();
     let call_target_specializations = profile.call_target_specializations(function.function_id)?;
-    if call_target_specializations.is_empty() {
-        return Ok(out);
-    }
-
-    let call_sites = collect_profiled_direct_call_sites_for_inline_tree(module, function, profile)?;
     let mut constructor_owner_lookups = 0usize;
     let mut constructor_owner_matches = 0usize;
     let mut method_owner_lookups = 0usize;
     let mut method_owner_matches = 0usize;
-    for call_site in call_sites {
-        for function_id in call_site.targets.iter().copied() {
-            constructor_owner_lookups += 1;
-            if let Ok(owner_types) =
-                unsafe { crate::lookup_exact_owner_types_for_constructor(function_id) }
-            {
-                constructor_owner_matches += owner_types.len();
-                for owner in owner_types {
-                    let Some(owner_type_ref) = reloc_type_ref_for_type(owner.owner_type)? else {
+    if !call_target_specializations.is_empty() {
+        let call_sites =
+            collect_profiled_direct_call_sites_for_inline_tree(module, function, profile)?;
+        for call_site in call_sites {
+            for function_id in call_site.targets.iter().copied() {
+                constructor_owner_lookups += 1;
+                if let Ok(owner_types) =
+                    unsafe { crate::lookup_exact_owner_types_for_constructor(function_id) }
+                {
+                    constructor_owner_matches += owner_types.len();
+                    for owner in owner_types {
+                        let Some(owner_type_ref) = reloc_type_ref_for_type(owner.owner_type)?
+                        else {
+                            continue;
+                        };
+                        predeclare_owner_attr_import(jit_module, owner.owner_type, "__init__")?;
+                        push_direct_owner_attr_specialization(
+                            &mut out,
+                            function_id,
+                            "__init__",
+                            owner_type_ref,
+                            owner.type_version,
+                        );
+                    }
+                }
+                if let Some(method_name) = call_site.method_name.as_deref() {
+                    method_owner_lookups += 1;
+                    let Ok(owner_types) = (unsafe {
+                        crate::lookup_exact_owner_types_for_method(function_id, method_name)
+                    }) else {
                         continue;
                     };
-                    predeclare_owner_attr_import(jit_module, owner.owner_type, "__init__")?;
-                    out.entry(DirectOwnerAttrKey::new(function_id, "__init__"))
-                        .or_default()
-                        .push(DirectOwnerAttrSpecialization {
+                    method_owner_matches += owner_types.len();
+                    for owner in owner_types {
+                        let Some(owner_type_ref) = reloc_type_ref_for_type(owner.owner_type)?
+                        else {
+                            continue;
+                        };
+                        predeclare_owner_attr_import(jit_module, owner.owner_type, method_name)?;
+                        push_direct_owner_attr_specialization(
+                            &mut out,
+                            function_id,
+                            method_name,
                             owner_type_ref,
-                            type_version: owner.type_version,
-                        });
+                            owner.type_version,
+                        );
+                    }
                 }
             }
-            if let Some(method_name) = call_site.method_name.as_deref() {
-                method_owner_lookups += 1;
-                let Ok(owner_types) = (unsafe {
-                    crate::lookup_exact_owner_types_for_method(function_id, method_name)
-                }) else {
-                    continue;
-                };
-                method_owner_matches += owner_types.len();
-                for owner in owner_types {
-                    let Some(owner_type_ref) = reloc_type_ref_for_type(owner.owner_type)? else {
-                        continue;
-                    };
-                    predeclare_owner_attr_import(jit_module, owner.owner_type, method_name)?;
-                    out.entry(DirectOwnerAttrKey::new(function_id, method_name))
-                        .or_default()
-                        .push(DirectOwnerAttrSpecialization {
-                            owner_type_ref,
-                            type_version: owner.type_version,
-                        });
-                }
-            }
+        }
+    }
+    let opt_v3_constructor_calls =
+        profile.codegen_opt_v3_constructor_calls(function.function_id)?;
+    for constructor_call in opt_v3_constructor_calls.values() {
+        for guard in &constructor_call.guards {
+            let Some(owner_type_ref) =
+                reloc_type_ref_from_typed_attr_owner_ref(&guard.owner_type_ref)
+            else {
+                continue;
+            };
+            predeclare_owner_attr_import_for_ref(jit_module, &owner_type_ref, "__init__")?;
+            push_direct_owner_attr_specialization(
+                &mut out,
+                guard.function_id,
+                "__init__",
+                owner_type_ref,
+                guard.type_version,
+            );
+        }
+    }
+    let opt_v3_method_calls = profile.codegen_opt_v3_method_calls(function.function_id)?;
+    for method_call in opt_v3_method_calls.values() {
+        for guard in &method_call.guards {
+            let Some(owner_type_ref) =
+                reloc_type_ref_from_typed_attr_owner_ref(&guard.owner_type_ref)
+            else {
+                continue;
+            };
+            predeclare_owner_attr_import_for_ref(
+                jit_module,
+                &owner_type_ref,
+                method_call.method_name.as_str(),
+            )?;
+            push_direct_owner_attr_specialization(
+                &mut out,
+                guard.function_id,
+                method_call.method_name.as_str(),
+                owner_type_ref,
+                guard.type_version,
+            );
         }
     }
     if constructor_owner_lookups != 0 || method_owner_lookups != 0 {
@@ -1615,6 +1667,25 @@ fn predeclare_direct_call_owner_type_imports(
         );
     }
     Ok(out)
+}
+
+fn push_direct_owner_attr_specialization(
+    out: &mut HashMap<DirectOwnerAttrKey, Vec<DirectOwnerAttrSpecialization>>,
+    function_id: RuntimeFunctionId,
+    attr_name: &str,
+    owner_type_ref: RelocTypeRef,
+    type_version: u32,
+) {
+    let specialization = DirectOwnerAttrSpecialization {
+        owner_type_ref,
+        type_version,
+    };
+    let specializations = out
+        .entry(DirectOwnerAttrKey::new(function_id, attr_name))
+        .or_default();
+    if !specializations.contains(&specialization) {
+        specializations.push(specialization);
+    }
 }
 
 struct FuncBuildImports<'a> {
@@ -2073,6 +2144,9 @@ fn build_profiled_jit_module_plan(
     let empty_direct_owner_attr_specializations = HashMap::new();
     let planned_module_id = planned_module.module_name_gen.module_id();
     for function in &mut planned_module.callable_defs {
+        let has_exact_int_branch_artifacts = profile
+            .opt_v3_exact_int_branch_artifacts
+            .contains_key(&function.function_id);
         let has_source_keyed_v3_emissions =
             profile.has_source_keyed_opt_v3_emissions(function.function_id);
         let call_target_specializations = if has_source_keyed_v3_emissions {
@@ -2080,27 +2154,34 @@ fn build_profiled_jit_module_plan(
         } else {
             profile.call_target_specializations(function.function_id)?
         };
-        let direct_call_rewrite_targets = if profile
-            .opt_v3_exact_int_branch_artifacts
-            .contains_key(&function.function_id)
-        {
+        let method_call_rewrite_targets = if has_exact_int_branch_artifacts {
+            HashMap::new()
+        } else if has_source_keyed_v3_emissions {
+            merge_call_target_specializations(
+                profile.v3_method_call_targets(function.function_id),
+                profile.v3_constructor_call_targets(function.function_id),
+            )
+        } else {
+            call_target_specializations.clone()
+        };
+        let direct_call_rewrite_targets = if has_exact_int_branch_artifacts {
             HashMap::new()
         } else if has_source_keyed_v3_emissions {
             profile.v3_direct_function_call_targets(function.function_id)
         } else {
             profile.direct_call_rewrite_targets(function.function_id)?
         };
-        if call_target_specializations.is_empty() && direct_call_rewrite_targets.is_empty() {
+        if method_call_rewrite_targets.is_empty() && direct_call_rewrite_targets.is_empty() {
             continue;
         }
         let direct_owner_attr_specializations = direct_owner_attr_specializations_by_function
             .get(&function.function_id)
             .unwrap_or(&empty_direct_owner_attr_specializations);
-        if !call_target_specializations.is_empty() {
+        if !method_call_rewrite_targets.is_empty() {
             let stats = rewrite_profiled_no_arg_method_call_store_sites(
                 function,
                 module_constants,
-                &call_target_specializations,
+                &method_call_rewrite_targets,
                 direct_owner_attr_specializations,
                 &inline_callees,
                 &straightline_constructor_ids,
@@ -2265,6 +2346,18 @@ fn build_profiled_inline_callee_maps(
         let direct_call_rewrite_targets =
             profile.direct_call_rewrite_targets(function.function_id)?;
         for targets in direct_call_rewrite_targets.values() {
+            target_ids.extend(targets.iter().copied());
+        }
+        for targets in profile
+            .v3_constructor_call_targets(function.function_id)
+            .values()
+        {
+            target_ids.extend(targets.iter().copied());
+        }
+        for targets in profile
+            .v3_method_call_targets(function.function_id)
+            .values()
+        {
             target_ids.extend(targets.iter().copied());
         }
         if let Some(direct_owner_attr_specializations) =
@@ -8799,7 +8892,7 @@ impl DirectOwnerAttrKey {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct DirectOwnerAttrSpecialization {
     owner_type_ref: RelocTypeRef,
     type_version: u32,
@@ -15213,14 +15306,18 @@ impl FunctionSpecializationInputs {
         let mut opt_v3_direct_calls_by_instr =
             profile.codegen_opt_v3_direct_calls(function.function_id);
         opt_v3_direct_calls_by_instr.retain(|source, _| generic_call_sources.contains(source));
+        let mut opt_v3_constructor_calls_by_instr =
+            profile.codegen_opt_v3_constructor_calls(function.function_id)?;
+        opt_v3_constructor_calls_by_instr.retain(|source, _| generic_call_sources.contains(source));
+        let mut opt_v3_method_calls_by_instr =
+            profile.codegen_opt_v3_method_calls(function.function_id)?;
+        opt_v3_method_calls_by_instr.retain(|source, _| generic_call_sources.contains(source));
         Ok(Self {
             call_target_specializations: profile
                 .call_target_specializations(function.function_id)?,
             opt_v3_direct_calls_by_instr,
-            opt_v3_constructor_calls_by_instr: profile
-                .codegen_opt_v3_constructor_calls(function.function_id)?,
-            opt_v3_method_calls_by_instr: profile
-                .codegen_opt_v3_method_calls(function.function_id)?,
+            opt_v3_constructor_calls_by_instr,
+            opt_v3_method_calls_by_instr,
             operator_specializations: profile.operator_specializations(function.function_id)?,
             opt_v3_exact_list_items_by_instr: profile
                 .opt_v3_emitted_exact_list_items

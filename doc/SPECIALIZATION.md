@@ -514,8 +514,10 @@ JIT emitter still materializes the full guarded call blocks today.
   sentinels and resolved by the callee's default-resolving direct entry.
   Method and constructor-shaped targets, including `__init__`, are left as
   generic calls here so the typed method/constructor specialization path can
-  still handle them. V3 method-call and constructor-call emissions are handled
-  later in typed-call lowering, not by this store-call rewrite.
+  still handle them. V3 method-call and constructor-call emissions can feed the
+  early no-argument method/runtime-iter rewrite when that specialized rewrite
+  recognizes the lowered call shape; otherwise they remain v3-owned typed-call
+  inputs for later lowering.
 - In apply/verify mode, JIT module planning clones the lowered codegen module,
   applies this rewrite from either explicit legacy call-target evidence or v3
   mechanical ordinary direct-call emissions, runs the normal BlockPy
@@ -616,9 +618,10 @@ JIT emitter still materializes the full guarded call blocks today.
   directly, and guarded callable-call emission now consumes prepared
   `InstrTyped::GuardedCallableCallTyped` payloads directly instead of converting
   them back into typed call access plans. Ordinary v3 direct-call store sites
-  are expanded in the profiled BlockPy module plan. The next step is to expand
-  remaining guarded method/constructor typed nodes into explicit guard,
-  direct-call, and fallback CFG blocks before final JIT emission.
+  and eligible no-argument v3 method/runtime-iter sites are expanded in the
+  profiled BlockPy module plan. The next step is to expand remaining guarded
+  method/constructor typed nodes into explicit guard, direct-call, and fallback
+  CFG blocks before final JIT emission.
 - Typed call access plans are validated before specialized JIT emission, and
   typed calls use the selected plan as the source of truth. If annotation leaves
   a typed call as generic/profiled-only, codegen does not rediscover a guarded
@@ -705,9 +708,9 @@ JIT emitter still materializes the full guarded call blocks today.
   - only methods backed by transformed Python functions available through the
     current compile session
   - guarded calls, direct callable calls, direct method calls, and guard tests
-    now have explicit typed instructions; the no-arg method-store case also has
-    an explicit CFG rewrite, while broader guarded-call CFG expansion is still
-    pending
+    now have explicit typed instructions; ordinary direct calls, the no-arg
+    method-store case, and recognized runtime protocol calls also have explicit
+    CFG rewrites, while broader guarded-call CFG expansion is still pending
 - Soundness boundary:
   - relies on exact owner type and type-version guards
   - or on the bound method object still resolving to the same transformed

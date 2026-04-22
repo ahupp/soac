@@ -1134,3 +1134,21 @@ benchmarked throughput delta, and the headline pre/post numbers.
   - specialized pass, 1M loops x3: `95367`, `96469`, `96669 loops/s`
   - no-refcount diagnostic, 1M loops x3: `172970`, `170712`, `170764 loops/s`
   - pystone JIT code bytes: `64879`
+
+## 2026-04-22 - Feed v3 method calls into early call rewrites
+
+- jj change id: `mmqxxtum`
+- summary: v3 method and constructor call emissions now participate in the
+  existing profiled BlockPy no-arg method/runtime-iter rewrite path when that
+  rewrite can consume the lowered call site. V3 method/constructor sources
+  consumed by module planning are filtered out of late typed JIT lowering.
+- throughput: `+0.03%` specialized pystone median; no-refcount diagnostic
+  `-3.46%`; code size unchanged
+- pre-change benchmark:
+  - specialized pass, 1M loops x3: `95367`, `96469`, `96669 loops/s`
+  - no-refcount diagnostic, 1M loops x3: `172970`, `170712`, `170764 loops/s`
+  - pystone JIT code bytes: `64879`
+- post-change benchmark:
+  - specialized pass, 1M loops x3: `95203`, `96496`, `96721 loops/s`
+  - no-refcount diagnostic, 1M loops x3: `173418`, `164855`, `155884 loops/s`
+  - pystone JIT code bytes: `64879`
