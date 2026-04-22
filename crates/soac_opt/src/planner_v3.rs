@@ -54,8 +54,40 @@ pub struct DirectCallPlanRequest {
     pub source: InstrId,
     pub target: SerializedFunctionId,
     pub arg_plan: DirectCallArgPlan,
-    pub inline_candidate: bool,
+    pub body: CallBodyPlanRequest,
     pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CallBodyPlanRequest {
+    pub alternatives: Vec<CallBodyAlternativeRequest>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CallBodyAlternativeRequest {
+    pub kind: CallBodyKind,
+    pub cost: Cost,
+    pub reason: String,
+}
+
+impl CallBodyPlanRequest {
+    pub fn with_inline_candidate(inline_candidate: bool) -> Self {
+        let mut alternatives = vec![CallBodyAlternativeRequest {
+            kind: CallBodyKind::DirectCall,
+            cost: direct_call_body_cost_v3(),
+            reason: "guarded direct call is the baseline validated call-body alternative"
+                .to_string(),
+        }];
+        if inline_candidate {
+            alternatives.push(CallBodyAlternativeRequest {
+                kind: CallBodyKind::Inline,
+                cost: inline_call_body_cost_v3(),
+                reason: "lowered call shape is eligible for the early inline body alternative"
+                    .to_string(),
+            });
+        }
+        Self { alternatives }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -64,7 +96,7 @@ pub struct ConstructorCallPlanRequest {
     pub target: SerializedFunctionId,
     pub owner_type: ConstructorCallOwnerType,
     pub arg_plan: DirectCallArgPlan,
-    pub inline_candidate: bool,
+    pub body: CallBodyPlanRequest,
     pub reason: String,
 }
 
@@ -75,7 +107,7 @@ pub struct MethodCallPlanRequest {
     pub method_name: String,
     pub owner_type: MethodCallOwnerType,
     pub arg_plan: DirectCallArgPlan,
-    pub inline_candidate: bool,
+    pub body: CallBodyPlanRequest,
     pub reason: String,
 }
 
@@ -232,7 +264,7 @@ fn plan_constructor_call_specializations_v3(
                 fallback: ConstructorCallFallbackPlan {
                     kind: ConstructorCallFallbackKind::OriginalConstructorCall,
                 },
-                body: choose_call_body_plan_v3(request.inline_candidate),
+                body: choose_call_body_plan_v3(&request.body),
                 reason: request.reason.clone(),
             });
         }
@@ -281,7 +313,7 @@ fn plan_method_call_specializations_v3(
                 fallback: MethodCallFallbackPlan {
                     kind: MethodCallFallbackKind::OriginalMethodCall,
                 },
-                body: choose_call_body_plan_v3(request.inline_candidate),
+                body: choose_call_body_plan_v3(&request.body),
                 reason: request.reason.clone(),
             });
         }
@@ -302,7 +334,7 @@ fn plan_direct_call_specializations_v3(
                 source: request.source,
                 target: request.target,
                 arg_plan: request.arg_plan.clone(),
-                body: choose_call_body_plan_v3(request.inline_candidate),
+                body: choose_call_body_plan_v3(&request.body),
                 reason: request.reason.clone(),
             });
         }
@@ -310,42 +342,21 @@ fn plan_direct_call_specializations_v3(
     plans
 }
 
-fn choose_call_body_plan_v3(inline_candidate: bool) -> CallBodyPlan {
-    let direct = CallBodyPlan {
-        kind: CallBodyKind::DirectCall,
-        cost: Cost {
-            hot_path: 8,
-            miss_path: 2,
-            deopt: 0,
-            materialization: 0,
-            ownership: 1,
-            code_size: 2,
-            compile: 1,
-        },
-        reason: "guarded direct call is the only validated call-body alternative".to_string(),
-    };
-    if !inline_candidate {
-        return direct;
-    }
-    let inline = CallBodyPlan {
-        kind: CallBodyKind::Inline,
-        cost: Cost {
-            hot_path: 2,
-            miss_path: 2,
-            deopt: 0,
-            materialization: 0,
-            ownership: 0,
-            code_size: 6,
-            compile: 4,
-        },
-        reason: "inline body has lower modeled hot-path cost for this validated call site"
-            .to_string(),
-    };
-    if call_body_cost_key(&inline.cost) < call_body_cost_key(&direct.cost) {
-        inline
-    } else {
-        direct
-    }
+fn choose_call_body_plan_v3(request: &CallBodyPlanRequest) -> CallBodyPlan {
+    request
+        .alternatives
+        .iter()
+        .min_by_key(|alternative| call_body_cost_key(&alternative.cost))
+        .map(|alternative| CallBodyPlan {
+            kind: alternative.kind,
+            cost: alternative.cost,
+            reason: alternative.reason.clone(),
+        })
+        .unwrap_or_else(|| CallBodyPlan {
+            kind: CallBodyKind::DirectCall,
+            cost: direct_call_body_cost_v3(),
+            reason: "guarded direct call is the default call-body alternative".to_string(),
+        })
 }
 
 fn call_body_cost_key(cost: &Cost) -> (u32, u32, u32, u32) {
@@ -357,6 +368,30 @@ fn call_body_cost_key(cost: &Cost) -> (u32, u32, u32, u32) {
         cost.code_size,
         cost.compile,
     )
+}
+
+fn direct_call_body_cost_v3() -> Cost {
+    Cost {
+        hot_path: 8,
+        miss_path: 2,
+        deopt: 0,
+        materialization: 0,
+        ownership: 1,
+        code_size: 2,
+        compile: 1,
+    }
+}
+
+fn inline_call_body_cost_v3() -> Cost {
+    Cost {
+        hot_path: 2,
+        miss_path: 2,
+        deopt: 0,
+        materialization: 0,
+        ownership: 0,
+        code_size: 6,
+        compile: 4,
+    }
 }
 
 fn plan_exact_list_item_specializations_v3(
@@ -1895,7 +1930,7 @@ mod tests {
                 arg_plan: DirectCallArgPlan {
                     sources: vec![crate::plan_v3::DirectCallArgSource::Provided(0)],
                 },
-                inline_candidate: true,
+                body: CallBodyPlanRequest::with_inline_candidate(true),
                 reason: "profiled call_hot_targets selected this same-module function".to_string(),
             },
             DirectCallPlanRequest {
@@ -1904,7 +1939,7 @@ mod tests {
                 arg_plan: DirectCallArgPlan {
                     sources: vec![crate::plan_v3::DirectCallArgSource::Provided(0)],
                 },
-                inline_candidate: true,
+                body: CallBodyPlanRequest::with_inline_candidate(true),
                 reason: "profiled call_hot_targets selected this same-module function".to_string(),
             },
         ];
@@ -1937,7 +1972,7 @@ mod tests {
             arg_plan: DirectCallArgPlan {
                 sources: vec![crate::plan_v3::DirectCallArgSource::Provided(0)],
             },
-            inline_candidate: false,
+            body: CallBodyPlanRequest::with_inline_candidate(false),
             reason: "profiled call_hot_targets selected this same-module function".to_string(),
         }];
 

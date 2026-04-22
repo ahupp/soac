@@ -16,9 +16,9 @@ use crate::plan_v3::{
     MethodCallOwnerType, ModulePlanIdentity, PlanDiagnostic, RegionId,
 };
 use crate::planner_v3::{
-    ConstructorCallPlanRequest, DirectCallPlanRequest, ExactListItemPlanRequest,
-    ExtractedRegionPlanRequest, FunctionPlanRequest, IndexedFieldPlanRequest,
-    IndexedGlobalPlanRequest, MethodCallPlanRequest, ModulePlanRequest,
+    CallBodyPlanRequest, ConstructorCallPlanRequest, DirectCallPlanRequest,
+    ExactListItemPlanRequest, ExtractedRegionPlanRequest, FunctionPlanRequest,
+    IndexedFieldPlanRequest, IndexedGlobalPlanRequest, MethodCallPlanRequest, ModulePlanRequest,
     plan_module_optimization_v3,
 };
 use crate::region_v3::{
@@ -770,11 +770,11 @@ fn direct_call_requests_from_evidence_v3(
                 source,
                 target: serialized_target,
                 arg_plan,
-                inline_candidate: direct_call_inline_candidate_v3(
+                body: CallBodyPlanRequest::with_inline_candidate(direct_call_inline_candidate_v3(
                     function,
                     source,
                     target_function,
-                ),
+                )),
                 reason: "profiled call_hot_targets selected this function with validated ordinary-call arguments".to_string(),
             });
             identity_builder
@@ -876,11 +876,11 @@ fn constructor_call_requests_from_evidence_v3(
                 target: serialized_target,
                 owner_type,
                 arg_plan,
-                inline_candidate: constructor_call_inline_candidate_v3(
+                body: CallBodyPlanRequest::with_inline_candidate(constructor_call_inline_candidate_v3(
                     lowered_module,
                     function,
                     source,
-                ),
+                )),
                 reason: "profiled call_hot_targets selected this constructor __init__ target with validated constructor arguments".to_string(),
             });
             identity_builder
@@ -996,12 +996,12 @@ fn method_call_requests_from_evidence_v3(
                 method_name: method_name.clone(),
                 owner_type,
                 arg_plan,
-                inline_candidate: method_call_inline_candidate_v3(
+                body: CallBodyPlanRequest::with_inline_candidate(method_call_inline_candidate_v3(
                     lowered_module,
                     function,
                     source,
                     target_function,
-                ),
+                )),
                 reason: "profiled call_hot_targets selected this owner-method target with validated receiver-call arguments".to_string(),
             });
             identity_builder
