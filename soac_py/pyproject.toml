@@ -16,6 +16,5 @@ packages = ["soac"]
 
 [dependency-groups]
 dev = [
-    "ipython>=9,<10",
     "pytest>=8,<9",
 ]
