@@ -24383,6 +24383,188 @@ def f(x, y):
     }
 
     #[test]
+    fn v3_direct_constructor_body_store_rewrite_runs_before_typed_lowering() {
+        let module_name = "v3_profiled_constructor_call_direct_body_plan_test";
+        let module_name_gen = ModuleNameGen::new(0);
+
+        let mut init_function = test_function_in_module(&module_name_gen, "Box.__init__");
+        init_function.params.params.push(Param {
+            name: "self".into(),
+            kind: ParamKind::Any,
+            has_default: false,
+        });
+        init_function.params.params.push(Param {
+            name: "value".into(),
+            kind: ParamKind::Any,
+            has_default: false,
+        });
+        init_function = with_single_test_block(
+            init_function,
+            vec![],
+            ret_term(name_expr(test_local_name("self", 0))),
+        );
+        set_stack_slots(&mut init_function, &["self", "value"]);
+
+        let mut caller_function = test_function_in_module(&module_name_gen, "caller");
+        caller_function.params.params.push(Param {
+            name: "x".into(),
+            kind: ParamKind::Any,
+            has_default: false,
+        });
+        let caller_block_label = caller_function.name_gen.next_block_name();
+        let call_instr_id = InstrId::new(caller_block_label, 1);
+        caller_function = with_test_blocks(
+            caller_function,
+            vec![CodegenBlock {
+                label: caller_block_label,
+                body: vec![assign_stmt(
+                    test_local_name("y", 1),
+                    with_instr_id(
+                        op_expr(Call::new(
+                            name_expr(test_global_name("Box")),
+                            vec![CallArgPositional::Positional(name_expr(test_local_name(
+                                "x", 0,
+                            )))],
+                            Vec::<CallArgKeyword<InstrCodegen>>::new(),
+                        )),
+                        call_instr_id,
+                    ),
+                )],
+                term: ret_term(name_expr(test_local_name("y", 1))),
+                params: vec![],
+                exc_edge: None,
+            }],
+        );
+        set_stack_slots(&mut caller_function, &["x", "y"]);
+
+        let module = test_module(
+            module_name_gen,
+            vec![init_function.clone(), caller_function.clone()],
+        );
+        let expected_arg_plan = TypedDirectCallArgPlan {
+            sources: vec![
+                TypedDirectCallArgSource::Provided(0),
+                TypedDirectCallArgSource::Provided(1),
+            ],
+        };
+        let inputs = PlannedOptimizationInputs {
+            opt_v3_emitted_constructor_calls: HashMap::from([(
+                caller_function.function_id,
+                HashMap::from([(
+                    call_instr_id,
+                    vec![OptV3ConstructorCallPlan {
+                        source: call_instr_id,
+                        target: init_function.function_id,
+                        owner_type: PlanV3ConstructorCallOwnerType {
+                            module_name: module_name.to_string(),
+                            qualname: "Box".to_string(),
+                        },
+                        arg_plan: expected_arg_plan.clone(),
+                        guard: PlanV3ConstructorCallGuardKind::ExactCallableTypeVersion,
+                        fallback: PlanV3ConstructorCallFallbackKind::OriginalConstructorCall,
+                        body: test_v3_direct_call_body(),
+                        inline_target: None,
+                        reason: "profiled constructor call".to_string(),
+                    }],
+                )]),
+            )]),
+            ..PlannedOptimizationInputs::default()
+        };
+        let profile = SpecializationProfile::from_precompile(
+            &SoacEnvConfig::default(),
+            module_name,
+            None,
+            inputs,
+        )
+        .expect("test specialization profile should construct");
+        let direct_owner_attr_specializations = HashMap::from([(
+            caller_function.function_id,
+            HashMap::from([(
+                DirectOwnerAttrKey::new(init_function.function_id, "__init__"),
+                vec![DirectOwnerAttrSpecialization {
+                    owner_type_ref: RelocTypeRef::TypeKey(CounterDumpTypeKey {
+                        module_name: module_name.to_string(),
+                        qualname: "Box".to_string(),
+                    }),
+                    type_version: 1,
+                }],
+            )]),
+        )]);
+        let plan = build_profiled_jit_module_plan(
+            &module,
+            &profile,
+            None,
+            None,
+            &direct_owner_attr_specializations,
+        )
+        .expect("profiled JIT module plan should build");
+        let planned_caller = plan
+            .module
+            .callable_defs
+            .iter()
+            .find(|function| function.function_id == caller_function.function_id)
+            .expect("planned module should keep caller");
+
+        assert!(
+            planned_caller.blocks.iter().any(|block| {
+                matches!(
+                    &block.term,
+                    BlockTerm::IfTerm(term)
+                        if matches!(
+                            term.test,
+                            InstrCodegen::DirectCallableTypeVersionGuardTest(_)
+                        )
+                )
+            }),
+            "v3 constructor DirectCall body rewrite should guard the callable type/version explicitly"
+        );
+        let direct_callable_call = planned_caller
+            .blocks
+            .iter()
+            .flat_map(|block| &block.body)
+            .find_map(|instr| {
+                let InstrCodegen::Store(store) = instr else {
+                    return None;
+                };
+                let InstrCodegen::DirectCallableCall(call) = store.value.as_ref() else {
+                    return None;
+                };
+                Some(call)
+            })
+            .expect("v3 constructor DirectCall body stores should keep a direct-callable hot arm");
+        assert_eq!(
+            direct_callable_call.args.len(),
+            1,
+            "the explicit constructor argument should be preserved in the hot arm"
+        );
+        assert!(
+            matches!(
+                &direct_callable_call.guard,
+                TypedDirectCallableCallGuard::Constructor(guard)
+                    if guard.arg_plan == expected_arg_plan
+            ),
+            "the hot arm should retain the v3 constructor receiver-plus-argument plan"
+        );
+        assert!(
+            planned_caller
+                .blocks
+                .iter()
+                .flat_map(|block| &block.body)
+                .any(|instr| matches!(instr, InstrCodegen::Store(store) if matches!(store.value.as_ref(), InstrCodegen::Call(call) if call.args.len() == 1))),
+            "v3 constructor DirectCall body fallback should preserve the original explicit argument"
+        );
+        let specialization_inputs =
+            FunctionSpecializationInputs::from_profile(&profile, planned_caller)
+                .expect("planned profile inputs should filter consumed v3 constructor calls");
+        assert!(
+            specialization_inputs
+                .opt_v3_constructor_calls_by_instr
+                .is_empty(),
+            "v3 constructor calls consumed by the profiled module plan should not reach typed JIT lowering"
+        );
+    }
+
+    #[test]
     fn profiled_runtime_iter_receiver_call_direct_requires_straightline_constructor() {
         let constructor_id = RuntimeFunctionId::from_raw_parts(7, 11);
         let receiver = InstrCodegen::Call(Call::new(

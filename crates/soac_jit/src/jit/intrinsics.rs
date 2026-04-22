@@ -2447,10 +2447,12 @@ pub(super) fn emit_operation<'fb>(
     match operation {
         InstrCodegen::CalleeFunctionId(_) => None,
         InstrCodegen::DirectFunctionIdGuardTest(_)
+        | InstrCodegen::DirectCallableTypeVersionGuardTest(_)
         | InstrCodegen::DirectReceiverTypeVersionGuardTest(_) => None,
         InstrCodegen::Tuple(_) => None,
         InstrCodegen::Call(_) => None,
         InstrCodegen::CallDirect(_) => None,
+        InstrCodegen::DirectCallableCall(_) => None,
         InstrCodegen::DirectMethodCall(_) => None,
         InstrCodegen::BinOp(op) => emit_specialized_binop(op, state).or_else(|| {
             Some(emit_binop(

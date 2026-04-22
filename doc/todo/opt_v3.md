@@ -182,6 +182,9 @@ Partially migrated families are also intentionally visible:
   is `DirectCall` can now expand before typed lowering into an explicit
   receiver guard, direct-method hot arm, and generic method fallback while
   preserving explicit positional arguments from the original lowered call.
+  Constructor store sites whose v3 body choice is `DirectCall` can now expand
+  into an explicit callable guard, direct-callable constructor hot arm, and
+  generic constructor fallback before typed lowering.
 - indexed fields are represented as v3 plan selections plus mechanical
   indexed-field emissions. `soac_jit` now keeps the emitted access kind and
   attribute name separate from legacy per-instruction field evidence and

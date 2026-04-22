@@ -19,7 +19,8 @@ use soac_core::block_py::{
 };
 use soac_core::block_py::{BlockPyFunction, FunctionKind};
 use soac_lowering::passes::{
-    CodegenModuleShape, DirectFunctionIdGuardTest, DirectReceiverTypeVersionGuardTest, InstrCodegen,
+    CodegenModuleShape, DirectCallableTypeVersionGuardTest, DirectFunctionIdGuardTest,
+    DirectReceiverTypeVersionGuardTest, InstrCodegen,
 };
 use std::ffi::{c_int, c_void};
 use std::ptr;
@@ -919,12 +920,18 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
             InstrCodegen::DirectFunctionIdGuardTest(guard) => unsafe {
                 self.execute_direct_function_id_guard_test_owned(guard)
             },
+            InstrCodegen::DirectCallableTypeVersionGuardTest(guard) => unsafe {
+                self.execute_direct_callable_type_version_guard_test_owned(guard)
+            },
             InstrCodegen::DirectReceiverTypeVersionGuardTest(guard) => unsafe {
                 self.execute_direct_receiver_type_version_guard_test_owned(guard)
             },
             InstrCodegen::Tuple(tuple) => unsafe { self.execute_tuple_owned(tuple) },
             InstrCodegen::Call(call) => unsafe { self.execute_call_owned(call) },
             InstrCodegen::CallDirect(call) => unsafe { self.execute_call_direct_owned(call) },
+            InstrCodegen::DirectCallableCall(_) => {
+                Err("deopt continuation direct callable call is unsupported".to_string())
+            }
             InstrCodegen::DirectMethodCall(_) => {
                 Err("deopt continuation direct method call is unsupported".to_string())
             }
@@ -1459,6 +1466,28 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
             )
             .cast()
         })
+    }
+
+    #[cold]
+    unsafe fn execute_direct_callable_type_version_guard_test_owned(
+        &mut self,
+        guard: &DirectCallableTypeVersionGuardTest<InstrCodegen>,
+    ) -> Result<ObjPtr, String> {
+        let callable = unsafe { self.execute_expr_owned(&guard.value)? };
+        if callable.is_null() {
+            return Ok(ptr::null_mut());
+        }
+        let expected = reloc_type_ref_from_typed_attr_owner_ref(&guard.owner_type_ref)
+            .and_then(|owner_type_ref| resolve_reloc_type_ref_to_type(&owner_type_ref).ok())
+            .flatten();
+        let matched = expected.is_some_and(|expected| unsafe {
+            callable.cast::<ffi::PyTypeObject>() == expected
+                && (*expected).tp_version_tag == guard.type_version
+        });
+        unsafe {
+            ffi::Py_DECREF(callable.cast::<ffi::PyObject>());
+        }
+        Ok(unsafe { ffi::PyBool_FromLong(matched as libc::c_long).cast() })
     }
 
     #[cold]

@@ -2647,6 +2647,9 @@ impl TryMapInstr<InstrCodegen, InstrCodegen, InlineUnsupportedReason>
             InstrCodegenOp::DirectFunctionIdGuardTest(op) => {
                 InstrCodegenOp::DirectFunctionIdGuardTest(op.try_map_children(self)?)
             }
+            InstrCodegenOp::DirectCallableTypeVersionGuardTest(op) => {
+                InstrCodegenOp::DirectCallableTypeVersionGuardTest(op.try_map_children(self)?)
+            }
             InstrCodegenOp::DirectReceiverTypeVersionGuardTest(op) => {
                 InstrCodegenOp::DirectReceiverTypeVersionGuardTest(op.try_map_children(self)?)
             }
@@ -2654,6 +2657,9 @@ impl TryMapInstr<InstrCodegen, InstrCodegen, InlineUnsupportedReason>
             InstrCodegenOp::Call(op) => InstrCodegenOp::Call(op.try_map_children(self)?),
             InstrCodegenOp::CallDirect(op) => {
                 InstrCodegenOp::CallDirect(op.try_map_children(self)?)
+            }
+            InstrCodegenOp::DirectCallableCall(op) => {
+                InstrCodegenOp::DirectCallableCall(op.try_map_children(self)?)
             }
             InstrCodegenOp::DirectMethodCall(op) => {
                 InstrCodegenOp::DirectMethodCall(op.try_map_children(self)?)
@@ -2750,12 +2756,18 @@ impl MapInstr<InstrCodegen, InstrCodegen> for InstrIdScrubber {
             InstrCodegenOp::DirectFunctionIdGuardTest(op) => {
                 InstrCodegenOp::DirectFunctionIdGuardTest(op.map_children(self))
             }
+            InstrCodegenOp::DirectCallableTypeVersionGuardTest(op) => {
+                InstrCodegenOp::DirectCallableTypeVersionGuardTest(op.map_children(self))
+            }
             InstrCodegenOp::DirectReceiverTypeVersionGuardTest(op) => {
                 InstrCodegenOp::DirectReceiverTypeVersionGuardTest(op.map_children(self))
             }
             InstrCodegenOp::Tuple(op) => InstrCodegenOp::Tuple(op.map_children(self)),
             InstrCodegenOp::Call(op) => InstrCodegenOp::Call(op.map_children(self)),
             InstrCodegenOp::CallDirect(op) => InstrCodegenOp::CallDirect(op.map_children(self)),
+            InstrCodegenOp::DirectCallableCall(op) => {
+                InstrCodegenOp::DirectCallableCall(op.map_children(self))
+            }
             InstrCodegenOp::DirectMethodCall(op) => {
                 InstrCodegenOp::DirectMethodCall(op.map_children(self))
             }

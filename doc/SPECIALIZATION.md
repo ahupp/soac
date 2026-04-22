@@ -457,7 +457,10 @@ whose body policy is `DirectCall` and whose arguments are explicit positional
 arguments can also expand before typed lowering into explicit receiver
 type/version guard blocks, a direct-method hot arm, and an original generic
 method-call fallback. Other `DirectCall` shapes stay in the original lowered
-call shape for mechanical typed-call lowering. Planner
+call shape for mechanical typed-call lowering. Constructor store sites whose
+body policy is `DirectCall` can likewise expand before typed lowering into
+explicit callable type/version guard blocks, a direct-callable constructor hot
+arm, and the original generic constructor-call fallback. Planner
 queries over legacy `FunctionProfileEvidence` do not see v3 call targets.
 Current v3 direct-call support covers ordinary function targets
 and receiver-method targets with validated positional/default argument plans,
@@ -646,10 +649,14 @@ JIT emitter still materializes the full guarded call blocks today.
   `DirectCall` can expand in the same profiled BlockPy module plan into an
   explicit receiver type/version guard CFG with an `InstrCodegen::DirectMethodCall`
   hot arm and generic method-call fallback while preserving the original
-  explicit positional arguments in both arms. Ordinary direct-call store sites
-  and eligible receiver-method sites whose body selected `Inline` are expanded
-  earlier in the profiled BlockPy module plan after validating inline-fragment
-  buildability. Runtime-iter constructor
+  explicit positional arguments in both arms. Constructor store sites whose
+  body selected `DirectCall` can expand in the same profiled BlockPy module
+  plan into an explicit callable type/version guard CFG with an
+  `InstrCodegen::DirectCallableCall` constructor hot arm and generic
+  constructor-call fallback. Ordinary direct-call store sites and eligible
+  receiver-method sites whose body selected `Inline` are expanded earlier in
+  the profiled BlockPy module plan after validating inline-fragment buildability.
+  Runtime-iter constructor
   `Inline` body plans carry the selected `__iter__` function id in the
   serialized v3 plan; the JIT resolves that plan target and uses it as the body
   callee instead of rediscovering the method target from the owner type. The
@@ -658,9 +665,8 @@ JIT emitter still materializes the full guarded call blocks today.
   lookup path. Late typed-call lowering only consumes v3 call plans whose
   selected body is `DirectCall`; `Inline` body plans are owned by the earlier
   BlockPy rewrite path and do not silently fall through to a different guarded
-  typed-call shape. The next step is to expand the remaining guarded
-  constructor typed nodes into explicit guard, direct-call, and fallback CFG
-  blocks before final JIT emission.
+  typed-call shape. Remaining non-store or otherwise unsupported callable
+  shapes still use guarded typed-call lowering.
 - Typed call access plans are validated before specialized JIT emission, and
   typed calls use the selected plan as the source of truth. If annotation leaves
   a typed call as generic/profiled-only, codegen does not rediscover a guarded

@@ -54,9 +54,9 @@ use soac_core::profile::{
 };
 use soac_lowering::block_py::literal::Literal;
 use soac_lowering::passes::{
-    CodegenModuleShape, ConstructorFieldValue, DirectFunctionIdGuardTest,
-    DirectReceiverTypeVersionGuardTest, FactStore, FunctionRefcountPlan, InlineCallee,
-    InlinePlanModule, InstrCodegen, InstrResolved, InstrTyped, LocalEnvResumeBinding,
+    CodegenModuleShape, ConstructorFieldValue, DirectCallableTypeVersionGuardTest,
+    DirectFunctionIdGuardTest, DirectReceiverTypeVersionGuardTest, FactStore, FunctionRefcountPlan,
+    InlineCallee, InlinePlanModule, InstrCodegen, InstrResolved, InstrTyped, LocalEnvResumeBinding,
     LocalEnvResumeBindingState, LocalEnvResumeEntry, LocalEnvResumePoint,
     LocalEnvResumeStatePrecision, LocalEnvResumeValueSource, LocalRefState, PyExactType,
     PyObjFacts, RefcountActionKind, RefcountReleaseReason, RefcountSite, RuntimeHelperId,
@@ -2155,6 +2155,11 @@ fn build_profiled_jit_module_plan(
         } else {
             profile.v3_inline_constructor_calls(function.function_id)
         };
+        let constructor_call_body_plans = if has_exact_int_branch_artifacts {
+            HashMap::new()
+        } else {
+            profile.v3_direct_constructor_call_body_plans(function.function_id)
+        };
         let call_target_specializations = if has_source_keyed_v3_emissions {
             HashMap::new()
         } else {
@@ -2175,12 +2180,35 @@ fn build_profiled_jit_module_plan(
         } else {
             profile.module_plan_direct_call_rewrite_targets(function.function_id)?
         };
-        if method_call_rewrite_targets.is_empty() && direct_call_rewrite_targets.is_empty() {
+        if method_call_rewrite_targets.is_empty()
+            && direct_call_rewrite_targets.is_empty()
+            && constructor_call_body_plans.is_empty()
+        {
             continue;
         }
         let direct_owner_attr_specializations = direct_owner_attr_specializations_by_function
             .get(&function.function_id)
             .unwrap_or(&empty_direct_owner_attr_specializations);
+        if !constructor_call_body_plans.is_empty() {
+            let stats = rewrite_v3_direct_constructor_call_body_store_sites(
+                function,
+                &constructor_call_body_plans,
+                direct_owner_attr_specializations,
+            );
+            if stats.total_attempts() != 0 {
+                info!(
+                    target: "soac_jit_v3_direct_constructor_body_rewrite",
+                    module_id = planned_module_id,
+                    function_id = %function.function_id,
+                    qualname = %function.names.qualname,
+                    candidate_stores = stats.candidate_stores,
+                    missing_owner_guard_targets = stats.missing_owner_guard_targets,
+                    rewritten_stores = stats.rewritten_stores,
+                    "soac_jit_v3_direct_constructor_body_rewrite"
+                );
+            }
+            rewritten_store_count += stats.rewritten_stores;
+        }
         if !method_call_rewrite_targets.is_empty() {
             let stats = rewrite_profiled_no_arg_method_call_store_sites(
                 function,
@@ -2748,6 +2776,19 @@ struct ProfiledRuntimeIterInlineCandidate {
     constructor_instr_id: InstrId,
 }
 
+struct ProfiledConstructorCallBodyCandidate {
+    instr_index: usize,
+    target: ResolvedName,
+    callable: InstrCodegen,
+    args: Vec<CallArgPositional<InstrCodegen>>,
+    instr_id: InstrId,
+}
+
+struct V3DirectConstructorCallBodyFragment {
+    guard: TypedDirectConstructorCallGuard,
+    entry_label: BlockLabel,
+}
+
 fn rewrite_profiled_no_arg_method_call_store_sites(
     function: &mut BlockPyFunction<CodegenModuleShape>,
     caller_constants: &mut Vec<InstrResolved>,
@@ -2834,6 +2875,42 @@ fn rewrite_v3_direct_method_call_body_store_sites(
     stats
 }
 
+fn rewrite_v3_direct_constructor_call_body_store_sites(
+    function: &mut BlockPyFunction<CodegenModuleShape>,
+    constructor_call_body_plans: &HashMap<InstrId, Vec<OptV3ConstructorCallPlan>>,
+    direct_owner_attr_specializations: &HashMap<
+        DirectOwnerAttrKey,
+        Vec<DirectOwnerAttrSpecialization>,
+    >,
+) -> ProfiledMethodInlineRewriteStats {
+    let mut stats = ProfiledMethodInlineRewriteStats::default();
+    let constructor_call_body_targets =
+        opt_v3_direct_constructor_call_body_targets(constructor_call_body_plans);
+    let original_blocks = std::mem::take(&mut function.blocks);
+    let mut rewritten_blocks = Vec::with_capacity(original_blocks.len());
+    for block in original_blocks {
+        match rewrite_v3_direct_constructor_call_body_store_block(
+            function,
+            block.clone(),
+            &constructor_call_body_targets,
+            constructor_call_body_plans,
+            direct_owner_attr_specializations,
+            &mut stats,
+        ) {
+            Some(blocks) => {
+                stats.rewritten_stores += 1;
+                rewritten_blocks.extend(blocks);
+            }
+            None => rewritten_blocks.push(block),
+        }
+    }
+    function.blocks = rewritten_blocks;
+    if stats.rewritten_stores != 0 {
+        assign_missing_codegen_function_instr_ids(function);
+    }
+    stats
+}
+
 fn rewrite_v3_direct_method_call_body_store_block(
     function: &mut BlockPyFunction<CodegenModuleShape>,
     module_constants: &[InstrResolved],
@@ -2863,10 +2940,7 @@ fn rewrite_v3_direct_method_call_body_store_block(
     for plan in plans {
         if plan.body.kind != PlanV3CallBodyKind::DirectCall
             || plan.method_name != candidate.method_name
-            || !v3_direct_method_call_body_arg_plan_matches_args(
-                &plan.arg_plan,
-                candidate.args.len(),
-            )
+            || !v3_direct_call_body_arg_plan_matches_args(&plan.arg_plan, candidate.args.len())
         {
             continue;
         }
@@ -3006,6 +3080,184 @@ fn rewrite_v3_direct_method_call_body_store_block(
             .with_meta(Meta::synthetic())
             .into(),
             Del::new(receiver_temp_name.clone(), false)
+                .with_meta(Meta::synthetic())
+                .into(),
+        ],
+        BlockTerm::Jump(BlockEdge::new(continuation_label)),
+        Vec::new(),
+        exc_edge.clone(),
+    ));
+
+    blocks.push(Block::new(
+        continuation_label,
+        after,
+        block.term,
+        Vec::new(),
+        exc_edge,
+    ));
+
+    Some(blocks)
+}
+
+fn rewrite_v3_direct_constructor_call_body_store_block(
+    function: &mut BlockPyFunction<CodegenModuleShape>,
+    block: Block<InstrCodegen>,
+    constructor_call_body_targets: &HashMap<InstrId, Vec<RuntimeFunctionId>>,
+    constructor_call_body_plans: &HashMap<InstrId, Vec<OptV3ConstructorCallPlan>>,
+    direct_owner_attr_specializations: &HashMap<
+        DirectOwnerAttrKey,
+        Vec<DirectOwnerAttrSpecialization>,
+    >,
+    stats: &mut ProfiledMethodInlineRewriteStats,
+) -> Option<Vec<Block<InstrCodegen>>> {
+    let candidate =
+        find_profiled_constructor_call_body_candidate(&block, constructor_call_body_targets)?;
+    stats.candidate_stores += 1;
+    let plans = constructor_call_body_plans.get(&candidate.instr_id)?;
+    let continuation_label = function.name_gen.next_block_name();
+    let callable_temp =
+        soac_lowering::passes::allocate_codegen_stack_temp(function, "direct_constructor_callable");
+    let callable_temp_name = callable_temp.resolved_name();
+    let exc_edge = block.exc_edge.clone();
+
+    let mut fragments = Vec::new();
+    for plan in plans {
+        if plan.body.kind != PlanV3CallBodyKind::DirectCall
+            || !v3_direct_call_body_arg_plan_matches_args(&plan.arg_plan, candidate.args.len())
+        {
+            continue;
+        }
+        let key = DirectOwnerAttrKey::new(plan.target, "__init__");
+        let Some(guards) = direct_owner_attr_specializations.get(&key) else {
+            stats.missing_owner_guard_targets += 1;
+            continue;
+        };
+        for guard in guards {
+            if !direct_owner_attr_specialization_matches_v3_constructor_plan(guard, plan) {
+                continue;
+            }
+            let typed_guard = TypedDirectConstructorCallGuard {
+                function_id: plan.target,
+                owner_type_ref: typed_attr_owner_ref_from_reloc_type_ref(&guard.owner_type_ref),
+                type_version: guard.type_version,
+                arg_plan: plan.arg_plan.clone(),
+            };
+            if fragments
+                .iter()
+                .any(|fragment: &V3DirectConstructorCallBodyFragment| fragment.guard == typed_guard)
+            {
+                continue;
+            }
+            fragments.push(V3DirectConstructorCallBodyFragment {
+                guard: typed_guard,
+                entry_label: function.name_gen.next_block_name(),
+            });
+        }
+    }
+    if fragments.is_empty() {
+        return None;
+    }
+
+    let mut before = block.body;
+    let after = before.split_off(candidate.instr_index + 1);
+    before.truncate(candidate.instr_index);
+    before.push(
+        Store::new(callable_temp_name.clone(), candidate.callable)
+            .with_meta(Meta::synthetic())
+            .into(),
+    );
+
+    let generic_label = function.name_gen.next_block_name();
+    let guard_labels = (0..fragments.len().saturating_sub(1))
+        .map(|_| function.name_gen.next_block_name())
+        .collect::<Vec<_>>();
+
+    let entry_term = callable_type_version_guard_term_for_typed_constructor_guard(
+        &callable_temp_name,
+        &fragments[0].guard,
+        fragments[0].entry_label,
+        guard_labels.first().copied().unwrap_or(generic_label),
+    );
+    let entry = Block::new(
+        block.label,
+        before,
+        entry_term,
+        block.params,
+        exc_edge.clone(),
+    );
+
+    let mut blocks = Vec::with_capacity(fragments.len() * 2 + 3);
+    blocks.push(entry);
+
+    for (guard_index, guard_label) in guard_labels.iter().copied().enumerate() {
+        let target_index = guard_index + 1;
+        let else_label = guard_labels
+            .get(guard_index + 1)
+            .copied()
+            .unwrap_or(generic_label);
+        blocks.push(Block::new(
+            guard_label,
+            Vec::new(),
+            callable_type_version_guard_term_for_typed_constructor_guard(
+                &callable_temp_name,
+                &fragments[target_index].guard,
+                fragments[target_index].entry_label,
+                else_label,
+            ),
+            Vec::new(),
+            exc_edge.clone(),
+        ));
+    }
+
+    for (fragment_index, fragment) in fragments.into_iter().enumerate() {
+        let direct_args = if fragment_index == 0 {
+            candidate.args.clone()
+        } else {
+            clone_codegen_call_args_with_fresh_instr_ids(&candidate.args)
+        };
+        blocks.push(Block::new(
+            fragment.entry_label,
+            vec![
+                Store::new(
+                    candidate.target.clone(),
+                    InstrCodegen::DirectCallableCall(
+                        TypedDirectCallableCall::new(
+                            load_codegen_temp(&callable_temp_name),
+                            direct_args,
+                            TypedDirectCallableCallGuard::Constructor(fragment.guard),
+                        )
+                        .with_meta(Meta::synthetic()),
+                    ),
+                )
+                .with_meta(Meta::synthetic())
+                .into(),
+                Del::new(callable_temp_name.clone(), false)
+                    .with_meta(Meta::synthetic())
+                    .into(),
+            ],
+            BlockTerm::Jump(BlockEdge::new(continuation_label)),
+            Vec::new(),
+            exc_edge.clone(),
+        ));
+    }
+
+    blocks.push(Block::new(
+        generic_label,
+        vec![
+            Store::new(
+                candidate.target,
+                InstrCodegen::Call(
+                    Call::new(
+                        load_codegen_temp(&callable_temp_name),
+                        clone_codegen_call_args_with_fresh_instr_ids(&candidate.args),
+                        Vec::new(),
+                    )
+                    .with_meta(Meta::synthetic()),
+                ),
+            )
+            .with_meta(Meta::synthetic())
+            .into(),
+            Del::new(callable_temp_name.clone(), false)
                 .with_meta(Meta::synthetic())
                 .into(),
         ],
@@ -4018,6 +4270,44 @@ fn find_profiled_method_call_body_candidate(
         })
 }
 
+fn find_profiled_constructor_call_body_candidate(
+    block: &Block<InstrCodegen>,
+    targets_by_instr_id: &HashMap<InstrId, Vec<RuntimeFunctionId>>,
+) -> Option<ProfiledConstructorCallBodyCandidate> {
+    block
+        .body
+        .iter()
+        .enumerate()
+        .find_map(|(instr_index, instr)| {
+            let InstrCodegen::Store(store) = instr else {
+                return None;
+            };
+            let InstrCodegen::Call(call) = store.value.as_ref() else {
+                return None;
+            };
+            if matches!(call.func.as_ref(), InstrCodegen::GetAttr(_))
+                || !call.keywords.is_empty()
+                || call
+                    .args
+                    .iter()
+                    .any(|arg| matches!(arg, CallArgPositional::Starred(_)))
+            {
+                return None;
+            }
+            let instr_id = call.try_semantic_instr_id()?;
+            if targets_by_instr_id.get(&instr_id).is_none_or(Vec::is_empty) {
+                return None;
+            }
+            Some(ProfiledConstructorCallBodyCandidate {
+                instr_index,
+                target: store.name.clone(),
+                callable: (*call.func).clone(),
+                args: call.args.clone(),
+                instr_id,
+            })
+        })
+}
+
 fn find_profiled_runtime_iter_inline_candidate(
     module_constants: &[InstrResolved],
     block: &Block<InstrCodegen>,
@@ -4111,6 +4401,26 @@ fn receiver_type_version_guard_term_for_typed_guard(
     )
 }
 
+fn callable_type_version_guard_term_for_typed_constructor_guard(
+    callable_temp_name: &ResolvedName,
+    guard: &TypedDirectConstructorCallGuard,
+    then_label: BlockLabel,
+    else_label: BlockLabel,
+) -> BlockTerm<InstrCodegen> {
+    BlockTerm::IfTerm(soac_core::block_py::TermIf {
+        test: InstrCodegen::DirectCallableTypeVersionGuardTest(
+            DirectCallableTypeVersionGuardTest::new(
+                load_codegen_temp(callable_temp_name),
+                guard.owner_type_ref.clone(),
+                guard.type_version,
+            )
+            .with_meta(Meta::synthetic()),
+        ),
+        then_label,
+        else_label,
+    })
+}
+
 fn receiver_type_version_guard_term_for_owner(
     receiver_temp_name: &ResolvedName,
     owner_type_ref: TypedAttrOwnerRef,
@@ -4132,6 +4442,19 @@ fn receiver_type_version_guard_term_for_owner(
     })
 }
 
+fn direct_owner_attr_specialization_matches_v3_constructor_plan(
+    guard: &DirectOwnerAttrSpecialization,
+    plan: &OptV3ConstructorCallPlan,
+) -> bool {
+    match &guard.owner_type_ref {
+        RelocTypeRef::TypeKey(type_key) => {
+            type_key.module_name == plan.owner_type.module_name
+                && type_key.qualname == plan.owner_type.qualname
+        }
+        RelocTypeRef::CpythonTypeSymbol(_) => false,
+    }
+}
+
 fn direct_owner_attr_specialization_matches_v3_method_plan(
     guard: &DirectOwnerAttrSpecialization,
     plan: &OptV3MethodCallPlan,
@@ -4145,7 +4468,7 @@ fn direct_owner_attr_specialization_matches_v3_method_plan(
     }
 }
 
-fn v3_direct_method_call_body_arg_plan_matches_args(
+fn v3_direct_call_body_arg_plan_matches_args(
     plan: &TypedDirectCallArgPlan,
     explicit_arg_count: usize,
 ) -> bool {
@@ -7319,6 +7642,9 @@ fn runtime_jit_deopt_expr_supported(
         InstrCodegen::DirectFunctionIdGuardTest(guard) => {
             runtime_jit_deopt_expr_supported(&guard.value, support)
         }
+        InstrCodegen::DirectCallableTypeVersionGuardTest(guard) => {
+            runtime_jit_deopt_expr_supported(&guard.value, support)
+        }
         InstrCodegen::DirectReceiverTypeVersionGuardTest(guard) => {
             runtime_jit_deopt_expr_supported(&guard.value, support)
         }
@@ -7331,6 +7657,7 @@ fn runtime_jit_deopt_expr_supported(
             &call.keywords,
             support,
         ),
+        InstrCodegen::DirectCallableCall(_) => false,
         InstrCodegen::DirectMethodCall(_) => false,
         InstrCodegen::Store(store) => {
             runtime_jit_deopt_name_location_supported(store.name.location, support)
@@ -13871,6 +14198,16 @@ fn collect_call_direct_targets(
             if let InstrCodegen::CallDirect(call) = expr {
                 self.out.insert(call.function_id);
             }
+            if let InstrCodegen::DirectCallableCall(call) = expr {
+                match &call.guard {
+                    TypedDirectCallableCallGuard::Function(guard) => {
+                        self.out.insert(guard.function_id);
+                    }
+                    TypedDirectCallableCallGuard::Constructor(guard) => {
+                        self.out.insert(guard.function_id);
+                    }
+                }
+            }
             if let InstrCodegen::DirectMethodCall(call) = expr {
                 self.out.insert(call.guard.function_id);
             }
@@ -14204,6 +14541,42 @@ fn opt_v3_constructor_call_targets(
                     .map(|constructor_call| constructor_call.target)
                     .collect(),
             )
+        })
+        .collect()
+}
+
+fn opt_v3_direct_constructor_call_body_targets(
+    constructor_calls_by_source: &HashMap<InstrId, Vec<OptV3ConstructorCallPlan>>,
+) -> HashMap<InstrId, Vec<RuntimeFunctionId>> {
+    constructor_calls_by_source
+        .iter()
+        .filter_map(|(source, constructor_calls)| {
+            let targets = constructor_calls
+                .iter()
+                .filter(|constructor_call| {
+                    constructor_call.body.kind == PlanV3CallBodyKind::DirectCall
+                })
+                .map(|constructor_call| constructor_call.target)
+                .collect::<Vec<_>>();
+            (!targets.is_empty()).then_some((*source, targets))
+        })
+        .collect()
+}
+
+fn opt_v3_direct_constructor_call_body_plans(
+    constructor_calls_by_source: &HashMap<InstrId, Vec<OptV3ConstructorCallPlan>>,
+) -> HashMap<InstrId, Vec<OptV3ConstructorCallPlan>> {
+    constructor_calls_by_source
+        .iter()
+        .filter_map(|(source, constructor_calls)| {
+            let plans = constructor_calls
+                .iter()
+                .filter(|constructor_call| {
+                    constructor_call.body.kind == PlanV3CallBodyKind::DirectCall
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            (!plans.is_empty()).then_some((*source, plans))
         })
         .collect()
 }
@@ -16223,6 +16596,16 @@ impl<'a> SpecializationProfile<'a> {
                     })
                     .collect()
             })
+            .unwrap_or_default()
+    }
+
+    fn v3_direct_constructor_call_body_plans(
+        &self,
+        function_id: RuntimeFunctionId,
+    ) -> HashMap<InstrId, Vec<OptV3ConstructorCallPlan>> {
+        self.opt_v3_emitted_constructor_calls
+            .get(&function_id)
+            .map(opt_v3_direct_constructor_call_body_plans)
             .unwrap_or_default()
     }
 
@@ -23955,6 +24338,48 @@ fn emit_codegen_direct_function_id_guard_test_value_with_local_env(
     Ok(guard)
 }
 
+fn emit_codegen_direct_callable_type_version_guard_test_value_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    op: &DirectCallableTypeVersionGuardTest<InstrCodegen>,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<SoacValue, String> {
+    let value_is_borrowed = codegen_expr_pyobject_input_is_borrowed_from_local_env(
+        op.value.as_ref(),
+        local_env,
+        emit_ctx,
+    );
+    let value = emit_codegen_expr_value_with_local_env(
+        fb,
+        op.value.as_ref(),
+        local_env,
+        emit_ctx,
+        value_is_borrowed,
+        codegen_env,
+        func_imports,
+    );
+    let (raw_value, ownership, facts) =
+        value.expect_pyobject("direct callable type-version guard input");
+    let owner_type_ref = reloc_type_ref_from_typed_attr_owner_ref(&op.owner_type_ref)
+        .ok_or_else(|| "invalid direct callable guard owner type ref".to_string())?;
+    let guard = match emit_type_ptr_value_for_ref(fb, codegen_env, emit_ctx, &owner_type_ref)? {
+        Some(expected_type) => emit_exact_callable_type_version_match_bool01(
+            fb,
+            raw_value,
+            expected_type,
+            op.type_version,
+            emit_ctx,
+        ),
+        None => emit_i32_bool01_const(fb, false, emit_ctx),
+    };
+    if ownership.is_owned() {
+        emit_release_owned_pyobject(fb, raw_value, Some(facts), emit_ctx);
+    }
+    Ok(guard)
+}
+
 fn emit_codegen_direct_receiver_type_version_guard_test_value_with_local_env(
     fb: &mut FunctionBuilder<'_>,
     op: &DirectReceiverTypeVersionGuardTest<InstrCodegen>,
@@ -27329,6 +27754,17 @@ fn emit_codegen_term(
                         func_imports,
                     )?
                     .expect_i32_bool01("direct function-id guard")
+                }
+                InstrCodegen::DirectCallableTypeVersionGuardTest(guard) => {
+                    emit_codegen_direct_callable_type_version_guard_test_value_with_local_env(
+                        fb,
+                        guard,
+                        local_env,
+                        emit_ctx,
+                        codegen_env,
+                        func_imports,
+                    )?
+                    .expect_i32_bool01("direct callable type-version guard")
                 }
                 InstrCodegen::DirectReceiverTypeVersionGuardTest(guard) => {
                     emit_codegen_direct_receiver_type_version_guard_test_value_with_local_env(

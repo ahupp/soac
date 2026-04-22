@@ -70,6 +70,9 @@ fn collect_helper_like_names_in_expr(out: &mut Vec<String>, expr: &InstrCodegen)
         InstrCodegen::DirectFunctionIdGuardTest(operation) => {
             operation.visit_children(&mut HelperNameVisitor { out });
         }
+        InstrCodegen::DirectCallableTypeVersionGuardTest(operation) => {
+            operation.visit_children(&mut HelperNameVisitor { out });
+        }
         InstrCodegen::DirectReceiverTypeVersionGuardTest(operation) => {
             operation.visit_children(&mut HelperNameVisitor { out });
         }
@@ -96,6 +99,9 @@ fn collect_helper_like_names_in_expr(out: &mut Vec<String>, expr: &InstrCodegen)
             operation.visit_children(&mut HelperNameVisitor { out });
         }
         InstrCodegen::CallDirect(operation) => {
+            operation.visit_children(&mut HelperNameVisitor { out });
+        }
+        InstrCodegen::DirectCallableCall(operation) => {
             operation.visit_children(&mut HelperNameVisitor { out });
         }
         InstrCodegen::DirectMethodCall(operation) => {

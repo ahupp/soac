@@ -430,6 +430,9 @@ impl ModuleConstantCollector {
             InstrCodegen::DirectFunctionIdGuardTest(op) => {
                 self.collect_expr(op.value.as_ref());
             }
+            InstrCodegen::DirectCallableTypeVersionGuardTest(op) => {
+                self.collect_expr(op.value.as_ref());
+            }
             InstrCodegen::DirectReceiverTypeVersionGuardTest(op) => {
                 self.collect_expr(op.value.as_ref());
             }
@@ -464,6 +467,9 @@ impl ModuleConstantCollector {
                     }
                     self.collect_expr(keyword.expr());
                 }
+            }
+            InstrCodegen::DirectCallableCall(op) => {
+                op.visit_children(self);
             }
             InstrCodegen::DirectMethodCall(op) => {
                 self.constants
