@@ -16328,9 +16328,15 @@ impl FunctionSpecializationInputs {
         let mut opt_v3_method_calls_by_instr =
             profile.codegen_opt_v3_method_calls(function.function_id)?;
         opt_v3_method_calls_by_instr.retain(|source, _| generic_call_sources.contains(source));
+        let v3_owned_call_sources = profile.v3_call_emission_sources(function.function_id);
+        let call_target_specializations =
+            profile.call_target_specializations(function.function_id)?;
+        let call_target_specializations = legacy_call_targets_excluding_sources(
+            &call_target_specializations,
+            &v3_owned_call_sources,
+        );
         Ok(Self {
-            call_target_specializations: profile
-                .call_target_specializations(function.function_id)?,
+            call_target_specializations,
             opt_v3_direct_calls_by_instr,
             opt_v3_constructor_calls_by_instr,
             opt_v3_method_calls_by_instr,
@@ -16386,6 +16392,13 @@ fn legacy_call_targets_excluding_v3_call_sources(
         constructor_calls_by_instr,
         method_calls_by_instr,
     );
+    legacy_call_targets_excluding_sources(call_target_specializations, &v3_sources)
+}
+
+fn legacy_call_targets_excluding_sources(
+    call_target_specializations: &HashMap<InstrId, Vec<RuntimeFunctionId>>,
+    v3_sources: &HashSet<InstrId>,
+) -> HashMap<InstrId, Vec<RuntimeFunctionId>> {
     if v3_sources.is_empty() {
         return call_target_specializations.clone();
     }
@@ -16504,6 +16517,20 @@ impl<'a> SpecializationProfile<'a> {
             || self
                 .opt_v3_exact_int_branch_artifacts
                 .contains_key(&function_id)
+    }
+
+    fn v3_call_emission_sources(&self, function_id: RuntimeFunctionId) -> HashSet<InstrId> {
+        let mut sources = HashSet::new();
+        if let Some(direct_calls) = self.opt_v3_emitted_direct_calls.get(&function_id) {
+            sources.extend(direct_calls.keys().copied());
+        }
+        if let Some(constructor_calls) = self.opt_v3_emitted_constructor_calls.get(&function_id) {
+            sources.extend(constructor_calls.keys().copied());
+        }
+        if let Some(method_calls) = self.opt_v3_emitted_method_calls.get(&function_id) {
+            sources.extend(method_calls.keys().copied());
+        }
+        sources
     }
 
     fn planned_legacy_field_index_specializations(

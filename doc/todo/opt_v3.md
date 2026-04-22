@@ -177,8 +177,10 @@ Partially migrated families are also intentionally visible:
   happens while preparing `FunctionSpecializationInputs`, not during typed-call
   lowering. Prepared guards must also prove that their exact owner-type and
   owner-attribute callable relocations can be registered and predeclared before
-  worker codegen. The guardless prepared source remains a local fallback, not a
-  legacy call-target replan. Receiver-method store sites whose v3 body choice
+  worker codegen. `FunctionSpecializationInputs` also filters legacy call-target
+  evidence at raw v3 emitted call-source keys, so a guardless or early-consumed
+  v3-owned source remains a local fallback, not a legacy call-target replan.
+  Receiver-method store sites whose v3 body choice
   is `DirectCall` can now expand before typed lowering into an explicit
   receiver guard, direct-method hot arm, and generic method fallback while
   preserving explicit positional arguments from the original lowered call.

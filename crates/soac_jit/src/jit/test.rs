@@ -4312,6 +4312,76 @@ def build(values):
     }
 
     #[test]
+    fn function_specialization_inputs_exclude_legacy_targets_for_raw_v3_call_sources() {
+        let mut constants = TestConstantPool::default();
+        let v3_source = InstrId::new(BlockLabel::from_index(0), 1);
+        let legacy_source = InstrId::new(BlockLabel::from_index(0), 2);
+        let legacy_target = RuntimeFunctionId::from_raw_parts(0, 11);
+        let v3_target = RuntimeFunctionId::from_raw_parts(0, 12);
+        let call = with_instr_id(
+            op_expr(Call::new(
+                name_expr(test_local_name("fn", 0)),
+                Vec::<CallArgPositional<InstrCodegen>>::new(),
+                Vec::<CallArgKeyword<InstrCodegen>>::new(),
+            )),
+            v3_source,
+        );
+        let mut function =
+            with_single_test_block(test_function(), vec![call], ret_term(constants.int_expr(2)));
+        set_stack_slots(&mut function, &["fn"]);
+
+        let mut legacy_evidence = FunctionProfileEvidence::default();
+        legacy_evidence.call_target_specializations = HashMap::from([
+            (v3_source, vec![legacy_target]),
+            (legacy_source, vec![legacy_target]),
+        ]);
+        let v3_plan = OptV3DirectCallPlan {
+            source: v3_source,
+            target: v3_target,
+            arg_plan: TypedDirectCallArgPlan {
+                sources: Vec::new(),
+            },
+            body: test_v3_inline_call_body(),
+            reason: "profiled direct call".to_string(),
+        };
+        let profile = SpecializationProfile {
+            module_name: None,
+            counter_dump_path: None,
+            planned_evidence: HashMap::from([(function.function_id, legacy_evidence)]),
+            opt_v3_emitted_direct_calls: HashMap::from([(
+                function.function_id,
+                HashMap::from([(v3_source, vec![v3_plan])]),
+            )]),
+            opt_v3_emitted_constructor_calls: HashMap::new(),
+            opt_v3_emitted_method_calls: HashMap::new(),
+            opt_v3_emitted_exact_list_items: HashMap::new(),
+            opt_v3_emitted_indexed_fields: HashMap::new(),
+            opt_v3_emitted_indexed_globals: HashMap::new(),
+            opt_v3_exact_int_branch_artifacts: HashMap::new(),
+            behavior_change_indexed_stores: false,
+            profiled_cold_blocks: false,
+            guard_miss_deopt: false,
+        };
+
+        let inputs = FunctionSpecializationInputs::from_profile(&profile, &function)
+            .expect("specialization inputs should prepare");
+
+        assert!(
+            !inputs.call_target_specializations.contains_key(&v3_source),
+            "raw v3-owned call sources should not retain legacy call-target evidence"
+        );
+        assert_eq!(
+            inputs.call_target_specializations.get(&legacy_source),
+            Some(&vec![legacy_target]),
+            "unowned legacy call-target evidence should remain available"
+        );
+        assert!(
+            inputs.opt_v3_direct_calls_by_instr.is_empty(),
+            "inline-body v3 direct calls are consumed before typed lowering"
+        );
+    }
+
+    #[test]
     fn opt_v3_typed_call_preparation_skips_inline_body_plans() {
         let function_id = RuntimeFunctionId::from_raw_parts(0, 1);
         let source = InstrId::new(BlockLabel::from_index(0), 7);

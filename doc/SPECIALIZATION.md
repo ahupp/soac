@@ -445,9 +445,11 @@ v3-owned sources. Prepared method guards annotate
 `TypedCallAccessPlan::GuardedMethod`; prepared constructor guards annotate
 `TypedCallAccessPlan::GuardedCallable` before the legacy call-access annotator
 runs. The shared typed call-access lowering pass then creates the guarded typed
-call nodes. Guardless v3-owned sources remain generic calls instead of being
-replanned from legacy call-target evidence. V3 targets are also used for
-direct-function predeclaration and process-JIT batch scheduling. The
+call nodes. `FunctionSpecializationInputs` filters legacy call-target evidence
+at raw v3 emitted call-source keys, so guardless or early-consumed v3-owned
+sources remain generic calls instead of being replanned from legacy call-target
+evidence. V3 targets are also used for direct-function predeclaration and
+process-JIT batch scheduling. The
 earlier BlockPy store-call rewrite consumes v3 call plans whose serialized body
 policy is `Inline` before inlining/scalar cleanup. For simple store-call sites
 whose body policy is `DirectCall`, a later post-inline BlockPy rewrite creates
