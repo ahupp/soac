@@ -3,15 +3,17 @@ use crate::plan_v3::{
     ConstructorCallSpecializationPlan, ConversionKind, DeoptPointId, DirectCallArgPlan,
     DirectCallSpecializationPlan, ExactListItemAccessKind, ExactListItemFallbackPlan,
     ExactListItemGuardPlan, ExactListItemShape, ExactListItemSpecializationPlan, FailureMode,
-    GuardFailure, GuardKind, IndexedFieldAccessKind, IndexedFieldOwnerType,
-    IndexedFieldSpecializationPlan, IndexedGlobalAccessKind, IndexedGlobalFallbackPlan,
-    IndexedGlobalGuardPlan, IndexedGlobalSpecializationPlan, MaterializeKind,
-    MethodCallFallbackPlan, MethodCallGuardPlan, MethodCallOwnerType, MethodCallSpecializationPlan,
-    ModuleOptimizationPlanV3, OperationNode, PlanNodeId, PlanNodeKind, PlanValidationError,
-    PlanValue, PlannedConstant, PlannedOp, RegionExitKind, RegionExitTarget, RegionId,
-    RichCompareOp, validate_module_plan_v3,
+    GuardFailure, GuardKind, IndexedFieldAccessKind, IndexedFieldFallbackPlan,
+    IndexedFieldGuardKind, IndexedFieldOwnerType, IndexedFieldSpecializationPlan,
+    IndexedGlobalAccessKind, IndexedGlobalFallbackPlan, IndexedGlobalGuardPlan,
+    IndexedGlobalSpecializationPlan, MaterializeKind, MethodCallFallbackPlan, MethodCallGuardPlan,
+    MethodCallOwnerType, MethodCallSpecializationPlan, ModuleOptimizationPlanV3, OperationNode,
+    PlanNodeId, PlanNodeKind, PlanValidationError, PlanValue, PlannedConstant, PlannedOp,
+    RegionExitKind, RegionExitTarget, RegionId, RegionInputSource, RegionPlan, Rep, RichCompareOp,
+    ScalarLocalThreadPlan, validate_module_plan_v3,
 };
 use soac_core::block_py::{InstrId, SerializedFunctionId};
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 #[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -30,6 +32,7 @@ pub struct MechanicalFunctionEmission {
     pub exact_list_items: Vec<MechanicalExactListItemEmission>,
     pub indexed_fields: Vec<MechanicalIndexedFieldEmission>,
     pub indexed_globals: Vec<MechanicalIndexedGlobalEmission>,
+    pub scalar_threads: Vec<ScalarLocalThreadPlan>,
     pub regions: Vec<MechanicalRegionEmission>,
 }
 
@@ -81,10 +84,17 @@ pub struct MechanicalExactListItemEmission {
 pub struct MechanicalIndexedFieldEmission {
     pub source: InstrId,
     pub access: IndexedFieldAccessKind,
+    pub guard: MechanicalIndexedFieldGuard,
+    pub fallback: IndexedFieldFallbackPlan,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct MechanicalIndexedFieldGuard {
+    pub kind: IndexedFieldGuardKind,
     pub owner_type: IndexedFieldOwnerType,
     pub attr_name: String,
     pub expected_index: u32,
-    pub reason: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -222,12 +232,16 @@ pub enum MechanicalExitKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MechanicalEmitError {
     InvalidPlan(PlanValidationError),
+    EmissionMismatch(String),
 }
 
 impl fmt::Display for MechanicalEmitError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidPlan(err) => write!(f, "invalid optimization plan v3: {err}"),
+            Self::EmissionMismatch(message) => {
+                write!(f, "optimization plan v3 emission mismatch: {message}")
+            }
         }
     }
 }
@@ -238,63 +252,821 @@ pub fn emit_mechanical_plan_v3(
     plan: &ModuleOptimizationPlanV3,
 ) -> Result<MechanicalModuleEmission, MechanicalEmitError> {
     validate_module_plan_v3(plan).map_err(MechanicalEmitError::InvalidPlan)?;
-    Ok(MechanicalModuleEmission {
+    let emission = expected_mechanical_emission_for_plan_v3(plan);
+    validate_mechanical_emission_matches_plan_v3(plan, &emission)?;
+    Ok(emission)
+}
+
+pub fn validate_mechanical_emission_matches_plan_v3(
+    plan: &ModuleOptimizationPlanV3,
+    emission: &MechanicalModuleEmission,
+) -> Result<(), MechanicalEmitError> {
+    validate_module_plan_v3(plan).map_err(MechanicalEmitError::InvalidPlan)?;
+    if emission.module_name != plan.module.module_name {
+        return Err(MechanicalEmitError::EmissionMismatch(format!(
+            "emitted module name is {}, expected {}",
+            emission.module_name, plan.module.module_name
+        )));
+    }
+    validate_emitted_list(
+        "functions",
+        "<module>",
+        &expected_mechanical_emission_for_plan_v3(plan).functions,
+        &emission.functions,
+    )?;
+    validate_current_mechanical_lowering_shape_v3(plan, emission)
+        .map_err(MechanicalEmitError::EmissionMismatch)
+}
+
+fn expected_mechanical_emission_for_plan_v3(
+    plan: &ModuleOptimizationPlanV3,
+) -> MechanicalModuleEmission {
+    MechanicalModuleEmission {
         module_name: plan.module.module_name.clone(),
-        functions: plan
-            .functions
+        functions: plan.functions.iter().map(emit_function).collect(),
+    }
+}
+
+fn emit_function(
+    function: &crate::plan_v3::FunctionOptimizationPlanV3,
+) -> MechanicalFunctionEmission {
+    MechanicalFunctionEmission {
+        function: function.function.function,
+        debug_name: function.function.debug_name.clone(),
+        direct_calls: function.direct_calls.iter().map(emit_direct_call).collect(),
+        constructor_calls: function
+            .constructor_calls
             .iter()
-            .map(|function| MechanicalFunctionEmission {
-                function: function.function.function,
-                debug_name: function.function.debug_name.clone(),
-                direct_calls: function.direct_calls.iter().map(emit_direct_call).collect(),
-                constructor_calls: function
-                    .constructor_calls
-                    .iter()
-                    .map(emit_constructor_call)
-                    .collect(),
-                method_calls: function.method_calls.iter().map(emit_method_call).collect(),
-                exact_list_items: function
-                    .exact_list_items
-                    .iter()
-                    .map(emit_exact_list_item)
-                    .collect(),
-                indexed_fields: function
-                    .indexed_fields
-                    .iter()
-                    .map(emit_indexed_field)
-                    .collect(),
-                indexed_globals: function
-                    .indexed_globals
-                    .iter()
-                    .map(emit_indexed_global)
-                    .collect(),
-                regions: function
-                    .regions
-                    .iter()
-                    .map(|region| MechanicalRegionEmission {
-                        region: region.id,
-                        steps: region
-                            .nodes
-                            .iter()
-                            .map(|node| MechanicalStep {
-                                node: node.id,
-                                source: node.source,
-                                op: emit_node_op(&node.kind),
-                            })
-                            .collect(),
-                        exits: region
-                            .exits
-                            .iter()
-                            .map(|exit| MechanicalExit {
-                                source: exit.source,
-                                kind: emit_exit_kind(&exit.kind),
-                            })
-                            .collect(),
-                    })
-                    .collect(),
+            .map(emit_constructor_call)
+            .collect(),
+        method_calls: function.method_calls.iter().map(emit_method_call).collect(),
+        exact_list_items: function
+            .exact_list_items
+            .iter()
+            .map(emit_exact_list_item)
+            .collect(),
+        indexed_fields: function
+            .indexed_fields
+            .iter()
+            .map(emit_indexed_field)
+            .collect(),
+        indexed_globals: function
+            .indexed_globals
+            .iter()
+            .map(emit_indexed_global)
+            .collect(),
+        scalar_threads: function.scalar_threads.clone(),
+        regions: function.regions.iter().map(emit_region).collect(),
+    }
+}
+
+fn emit_region(region: &crate::plan_v3::RegionPlan) -> MechanicalRegionEmission {
+    MechanicalRegionEmission {
+        region: region.id,
+        steps: region
+            .nodes
+            .iter()
+            .map(|node| MechanicalStep {
+                node: node.id,
+                source: node.source,
+                op: emit_node_op(&node.kind),
             })
             .collect(),
-    })
+        exits: region
+            .exits
+            .iter()
+            .map(|exit| MechanicalExit {
+                source: exit.source,
+                kind: emit_exit_kind(&exit.kind),
+            })
+            .collect(),
+    }
+}
+
+fn validate_emitted_list<T: PartialEq>(
+    family: &str,
+    owner: &str,
+    expected: &[T],
+    emitted: &[T],
+) -> Result<(), MechanicalEmitError> {
+    if expected.len() != emitted.len() {
+        return Err(MechanicalEmitError::EmissionMismatch(format!(
+            "{owner} contains {} expected {family} but {} emitted {family}",
+            expected.len(),
+            emitted.len()
+        )));
+    }
+    for (index, (expected, emitted)) in expected.iter().zip(emitted.iter()).enumerate() {
+        if expected != emitted {
+            return Err(MechanicalEmitError::EmissionMismatch(format!(
+                "{owner} emitted {family} #{index} does not match the selected plan"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_current_mechanical_lowering_shape_v3(
+    plan: &ModuleOptimizationPlanV3,
+    emission: &MechanicalModuleEmission,
+) -> Result<(), String> {
+    let planned_functions = plan
+        .functions
+        .iter()
+        .map(|function| (function.function.function, function))
+        .collect::<HashMap<_, _>>();
+    for emitted_function in &emission.functions {
+        let planned_function = planned_functions
+            .get(&emitted_function.function)
+            .ok_or_else(|| {
+                format!(
+                    "emitted function {} has no matching selected plan",
+                    emitted_function.function
+                )
+            })?;
+        validate_function_mechanical_lowering_shape_v3(planned_function, emitted_function)?;
+    }
+    Ok(())
+}
+
+fn validate_function_mechanical_lowering_shape_v3(
+    planned_function: &crate::plan_v3::FunctionOptimizationPlanV3,
+    emitted_function: &MechanicalFunctionEmission,
+) -> Result<(), String> {
+    let planned_regions = planned_function
+        .regions
+        .iter()
+        .map(|region| (region.id, region))
+        .collect::<HashMap<_, _>>();
+    let emitted_regions = emitted_function
+        .regions
+        .iter()
+        .map(|region| (region.region, region))
+        .collect::<HashMap<_, _>>();
+    for emitted_region in &emitted_function.regions {
+        let planned_region = planned_regions.get(&emitted_region.region).ok_or_else(|| {
+            format!(
+                "emitted function {} has region {:?} with no matching selected plan",
+                emitted_function.function, emitted_region.region
+            )
+        })?;
+        validate_region_inputs_supported_by_current_lowering_v3(
+            emitted_function.function,
+            planned_region,
+        )?;
+        validate_region_mechanical_lowering_shape_v3(
+            emitted_function.function,
+            emitted_region,
+            &emitted_regions,
+        )?;
+        validate_region_steps_supported_by_current_lowering_v3(
+            emitted_function.function,
+            emitted_region,
+        )?;
+    }
+    for thread in &planned_function.scalar_threads {
+        validate_scalar_thread_mechanical_lowering_shape_v3(
+            emitted_function.function,
+            thread,
+            &emitted_regions,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_region_inputs_supported_by_current_lowering_v3(
+    function: SerializedFunctionId,
+    region: &RegionPlan,
+) -> Result<(), String> {
+    for input in &region.inputs {
+        match &input.source {
+            RegionInputSource::FunctionParam { name: Some(_), .. }
+                if input.value.rep == Rep::PyObjectBorrowed => {}
+            RegionInputSource::FunctionParam { name: Some(_), .. } => {
+                return Err(format!(
+                    "function {function} region {:?} input {:?} has rep {:?}; current mechanical lowering loads named inputs as borrowed PyObjects",
+                    region.id, input.value.id, input.value.rep
+                ));
+            }
+            source => {
+                return Err(format!(
+                    "function {function} region {:?} input {:?} has unsupported source {source:?}; current mechanical lowering only supports named function-param inputs",
+                    region.id, input.value.id
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_region_mechanical_lowering_shape_v3(
+    function: SerializedFunctionId,
+    region: &MechanicalRegionEmission,
+    emitted_regions: &HashMap<RegionId, &MechanicalRegionEmission>,
+) -> Result<(), String> {
+    let Some(exit) = region.exits.first() else {
+        return Ok(());
+    };
+    match &exit.kind {
+        MechanicalExitKind::Branch { .. } => {
+            require_single_original_cfg_branch_exit_v3(function, region)?;
+            validate_region_local_fallback_shape_v3(function, region, emitted_regions)?;
+        }
+        MechanicalExitKind::Return { .. } => {
+            require_single_return_exit_v3(function, region)?;
+            validate_region_local_fallback_shape_v3(function, region, emitted_regions)?;
+        }
+        MechanicalExitKind::Jump { .. } => {}
+    }
+    Ok(())
+}
+
+fn validate_region_local_fallback_shape_v3(
+    function: SerializedFunctionId,
+    region: &MechanicalRegionEmission,
+    emitted_regions: &HashMap<RegionId, &MechanicalRegionEmission>,
+) -> Result<(), String> {
+    let targets = local_fallback_region_targets_v3(region)?;
+    if targets.is_empty() {
+        return Ok(());
+    }
+    if targets.len() != 1 {
+        return Err(format!(
+            "function {function} region {:?} has {} local fallback targets; current mechanical lowering expects at most one",
+            region.region,
+            targets.len()
+        ));
+    }
+    let fallback_id = *targets.iter().next().expect("checked one fallback target");
+    let fallback_region = emitted_regions.get(&fallback_id).ok_or_else(|| {
+        format!(
+            "function {function} region {:?} references missing local fallback region {:?}",
+            region.region, fallback_id
+        )
+    })?;
+    require_matching_fallback_exit_v3(function, region, fallback_region)
+}
+
+fn validate_region_steps_supported_by_current_lowering_v3(
+    function: SerializedFunctionId,
+    region: &MechanicalRegionEmission,
+) -> Result<(), String> {
+    let local_fallback_targets = local_fallback_region_targets_v3(region)?;
+    for step in &region.steps {
+        match &step.op {
+            MechanicalStepOp::Input { output } => {
+                return Err(format!(
+                    "function {function} region {:?} input node {:?} produces {:?}; current mechanical lowering expects region inputs to be preloaded, not emitted as nodes",
+                    region.region, step.node, output.id
+                ));
+            }
+            MechanicalStepOp::Constant { output, constant } => {
+                if !matches!(constant, PlannedConstant::I64(_)) {
+                    return Err(format!(
+                        "function {function} region {:?} constant node {:?} uses unsupported constant {constant:?}; current mechanical lowering only emits i64 constants",
+                        region.region, step.node
+                    ));
+                }
+                if output.rep != Rep::I64 {
+                    return Err(format!(
+                        "function {function} region {:?} constant node {:?} produces {:?}; current mechanical lowering only emits i64 constants",
+                        region.region, step.node, output.rep
+                    ));
+                }
+            }
+            MechanicalStepOp::Guard {
+                kind,
+                inputs,
+                failure,
+            } => {
+                if *kind != GuardKind::SpecializationCheck {
+                    return Err(format!(
+                        "function {function} region {:?} guard node {:?} has unsupported kind {kind:?}",
+                        region.region, step.node
+                    ));
+                }
+                if inputs.is_empty() {
+                    return Err(format!(
+                        "function {function} region {:?} guard node {:?} has no inputs",
+                        region.region, step.node
+                    ));
+                }
+                if !matches!(
+                    failure,
+                    GuardFailure::FallbackToPlan {
+                        target: crate::plan_v3::FallbackTarget::Region(_),
+                        ..
+                    }
+                ) {
+                    return Err(format!(
+                        "function {function} region {:?} guard node {:?} has unsupported failure {failure:?}; current mechanical lowering requires a region fallback",
+                        region.region, step.node
+                    ));
+                }
+            }
+            MechanicalStepOp::Convert {
+                kind,
+                input,
+                output,
+                failure,
+            } => validate_conversion_supported_by_current_lowering_v3(
+                function,
+                region.region,
+                step.node,
+                *kind,
+                *input,
+                *output,
+                failure,
+                !local_fallback_targets.is_empty(),
+            )?,
+            MechanicalStepOp::Operation {
+                op,
+                inputs,
+                output,
+                failure,
+            } => validate_operation_supported_by_current_lowering_v3(
+                function,
+                region.region,
+                step.node,
+                op,
+                inputs,
+                *output,
+                failure,
+                !local_fallback_targets.is_empty(),
+            )?,
+            MechanicalStepOp::Materialize {
+                kind,
+                input,
+                output,
+            } => validate_materialize_supported_by_current_lowering_v3(
+                function,
+                region.region,
+                step.node,
+                *kind,
+                *input,
+                *output,
+            )?,
+            MechanicalStepOp::Fallback { .. }
+            | MechanicalStepOp::Deopt { .. }
+            | MechanicalStepOp::Ownership { .. } => {
+                return Err(format!(
+                    "function {function} region {:?} node {:?} has unsupported codegen step {:?}",
+                    region.region, step.node, step.op
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_conversion_supported_by_current_lowering_v3(
+    function: SerializedFunctionId,
+    region: RegionId,
+    node: PlanNodeId,
+    kind: ConversionKind,
+    input: PlanValue,
+    output: PlanValue,
+    failure: &FailureMode,
+    has_local_fallback: bool,
+) -> Result<(), String> {
+    match kind {
+        ConversionKind::FromPythonLongCompactToI64 => {
+            if !has_local_fallback
+                || !matches!(
+                    failure,
+                    FailureMode::FallbackToPlan {
+                        target: crate::plan_v3::FallbackTarget::Region(_),
+                        ..
+                    }
+                )
+            {
+                return Err(format!(
+                    "function {function} region {region:?} conversion node {node:?} needs a region local fallback for compact-long guard misses"
+                ));
+            }
+            if input.rep != Rep::PyObjectBorrowed || output.rep != Rep::I64 {
+                return Err(format!(
+                    "function {function} region {region:?} conversion node {node:?} expects PyObjectBorrowed->I64, got {:?}->{:?}",
+                    input.rep, output.rep
+                ));
+            }
+            Ok(())
+        }
+        ConversionKind::TruthinessToI32Bool01 => {
+            if input.rep != Rep::PyObjectOwned || output.rep != Rep::I32Bool01 {
+                return Err(format!(
+                    "function {function} region {region:?} conversion node {node:?} expects PyObjectOwned->I32Bool01, got {:?}->{:?}",
+                    input.rep, output.rep
+                ));
+            }
+            if !matches!(failure, FailureMode::Raise(_)) {
+                return Err(format!(
+                    "function {function} region {region:?} conversion node {node:?} expects Python truthiness failure to raise locally, got {failure:?}"
+                ));
+            }
+            Ok(())
+        }
+        ConversionKind::ToPythonLongOwned | ConversionKind::ToPythonBoolImmortal => Err(format!(
+            "function {function} region {region:?} conversion node {node:?} has unsupported conversion {kind:?}; current mechanical lowering uses materialization nodes for Python object creation"
+        )),
+    }
+}
+
+fn validate_operation_supported_by_current_lowering_v3(
+    function: SerializedFunctionId,
+    region: RegionId,
+    node: PlanNodeId,
+    op: &MechanicalOperation,
+    inputs: &[PlanValue],
+    output: Option<PlanValue>,
+    failure: &FailureMode,
+    has_local_fallback: bool,
+) -> Result<(), String> {
+    match op {
+        MechanicalOperation::PyNumberAdd
+        | MechanicalOperation::PyNumberSubtract
+        | MechanicalOperation::PyNumberMultiply
+        | MechanicalOperation::PyNumberBitAnd
+        | MechanicalOperation::PyNumberBitOr
+        | MechanicalOperation::PyNumberBitXor
+        | MechanicalOperation::PyObjectRichCompare { .. } => {
+            validate_supported_python_operation_signature_v3(
+                function, region, node, op, inputs, output, 2,
+            )?;
+            if !matches!(failure, FailureMode::Raise(_)) {
+                return Err(format!(
+                    "function {function} region {region:?} operation node {node:?} {op:?} expects local Python raise failure, got {failure:?}"
+                ));
+            }
+            Ok(())
+        }
+        MechanicalOperation::CheckedI64Add
+        | MechanicalOperation::CheckedI64Sub
+        | MechanicalOperation::CheckedI64Mul => {
+            validate_supported_operation_signature_v3(
+                function,
+                region,
+                node,
+                op,
+                inputs,
+                output,
+                &[Rep::I64, Rep::I64],
+                Rep::I64,
+            )?;
+            if !has_local_fallback
+                || !matches!(
+                    failure,
+                    FailureMode::FallbackToPlan {
+                        target: crate::plan_v3::FallbackTarget::Region(_),
+                        ..
+                    }
+                )
+            {
+                return Err(format!(
+                    "function {function} region {region:?} operation node {node:?} {op:?} needs a region local fallback for overflow"
+                ));
+            }
+            Ok(())
+        }
+        MechanicalOperation::I64BitAnd
+        | MechanicalOperation::I64BitOr
+        | MechanicalOperation::I64BitXor => {
+            validate_supported_operation_signature_v3(
+                function,
+                region,
+                node,
+                op,
+                inputs,
+                output,
+                &[Rep::I64, Rep::I64],
+                Rep::I64,
+            )?;
+            if failure != &FailureMode::CannotFail {
+                return Err(format!(
+                    "function {function} region {region:?} operation node {node:?} {op:?} must be CannotFail, got {failure:?}"
+                ));
+            }
+            Ok(())
+        }
+        MechanicalOperation::I64CompareToBool01 { .. } => {
+            validate_supported_operation_signature_v3(
+                function,
+                region,
+                node,
+                op,
+                inputs,
+                output,
+                &[Rep::I64, Rep::I64],
+                Rep::I32Bool01,
+            )?;
+            if failure != &FailureMode::CannotFail {
+                return Err(format!(
+                    "function {function} region {region:?} operation node {node:?} {op:?} must be CannotFail, got {failure:?}"
+                ));
+            }
+            Ok(())
+        }
+        MechanicalOperation::PyObjectIsTrue | MechanicalOperation::DirectHelper { .. } => {
+            Err(format!(
+                "function {function} region {region:?} operation node {node:?} has unsupported operation {op:?}"
+            ))
+        }
+    }
+}
+
+fn validate_supported_python_operation_signature_v3(
+    function: SerializedFunctionId,
+    region: RegionId,
+    node: PlanNodeId,
+    op: &MechanicalOperation,
+    inputs: &[PlanValue],
+    output: Option<PlanValue>,
+    expected_input_count: usize,
+) -> Result<(), String> {
+    if inputs.len() != expected_input_count {
+        return Err(format!(
+            "function {function} region {region:?} operation node {node:?} {op:?} expects {expected_input_count} inputs, got {}",
+            inputs.len()
+        ));
+    }
+    for (index, input) in inputs.iter().enumerate() {
+        if !input.rep.is_python_object() {
+            return Err(format!(
+                "function {function} region {region:?} operation node {node:?} {op:?} input {index} expects a Python object rep, got {:?}",
+                input.rep
+            ));
+        }
+    }
+    match output {
+        Some(output) if output.rep == Rep::PyObjectOwned => Ok(()),
+        Some(output) => Err(format!(
+            "function {function} region {region:?} operation node {node:?} {op:?} output expects PyObjectOwned, got {:?}",
+            output.rep
+        )),
+        None => Err(format!(
+            "function {function} region {region:?} operation node {node:?} {op:?} expects output PyObjectOwned, got no output"
+        )),
+    }
+}
+
+fn validate_supported_operation_signature_v3(
+    function: SerializedFunctionId,
+    region: RegionId,
+    node: PlanNodeId,
+    op: &MechanicalOperation,
+    inputs: &[PlanValue],
+    output: Option<PlanValue>,
+    expected_inputs: &[Rep],
+    expected_output: Rep,
+) -> Result<(), String> {
+    if inputs.len() != expected_inputs.len() {
+        return Err(format!(
+            "function {function} region {region:?} operation node {node:?} {op:?} expects {} inputs, got {}",
+            expected_inputs.len(),
+            inputs.len()
+        ));
+    }
+    for (index, (input, expected)) in inputs.iter().zip(expected_inputs.iter()).enumerate() {
+        if input.rep != *expected {
+            return Err(format!(
+                "function {function} region {region:?} operation node {node:?} {op:?} input {index} expects {expected:?}, got {:?}",
+                input.rep
+            ));
+        }
+    }
+    match output {
+        Some(output) if output.rep == expected_output => Ok(()),
+        Some(output) => Err(format!(
+            "function {function} region {region:?} operation node {node:?} {op:?} output expects {expected_output:?}, got {:?}",
+            output.rep
+        )),
+        None => Err(format!(
+            "function {function} region {region:?} operation node {node:?} {op:?} expects output {expected_output:?}, got no output"
+        )),
+    }
+}
+
+fn validate_materialize_supported_by_current_lowering_v3(
+    function: SerializedFunctionId,
+    region: RegionId,
+    node: PlanNodeId,
+    kind: MaterializeKind,
+    input: PlanValue,
+    output: PlanValue,
+) -> Result<(), String> {
+    let expected = match kind {
+        MaterializeKind::PythonLong => (Rep::I64, Rep::PyObjectOwned),
+        MaterializeKind::PythonBool => (Rep::I32Bool01, Rep::PyObjectImmortal),
+    };
+    if input.rep != expected.0 || output.rep != expected.1 {
+        return Err(format!(
+            "function {function} region {region:?} materialize node {node:?} {kind:?} expects {:?}->{:?}, got {:?}->{:?}",
+            expected.0, expected.1, input.rep, output.rep
+        ));
+    }
+    Ok(())
+}
+
+fn validate_scalar_thread_mechanical_lowering_shape_v3(
+    function: SerializedFunctionId,
+    thread: &ScalarLocalThreadPlan,
+    emitted_regions: &HashMap<RegionId, &MechanicalRegionEmission>,
+) -> Result<(), String> {
+    let producer = emitted_regions.get(&thread.producer.region).ok_or_else(|| {
+        format!(
+            "function {function} scalar thread for local {} references missing producer region {:?}",
+            thread.local.name, thread.producer.region
+        )
+    })?;
+    let consumer = emitted_regions.get(&thread.consumer.region).ok_or_else(|| {
+        format!(
+            "function {function} scalar thread for local {} references missing consumer region {:?}",
+            thread.local.name, thread.consumer.region
+        )
+    })?;
+    if !has_single_return_exit_v3(producer) {
+        return Err(format!(
+            "function {function} scalar thread for local {} producer region {:?} is not a single-return region",
+            thread.local.name, thread.producer.region
+        ));
+    }
+    if !has_single_original_cfg_branch_exit_v3(consumer) {
+        return Err(format!(
+            "function {function} scalar thread for local {} consumer region {:?} is not a single OriginalCfg branch region",
+            thread.local.name, thread.consumer.region
+        ));
+    }
+    let producer_fallbacks = local_fallback_region_targets_v3(producer)?;
+    let expected_fallback = match &thread.fallback {
+        crate::plan_v3::ScalarThreadFallback::LocalFallbackRegion { region, .. } => *region,
+    };
+    if producer_fallbacks.len() != 1 || !producer_fallbacks.contains(&expected_fallback) {
+        return Err(format!(
+            "function {function} scalar thread for local {} has fallback {:?}, but producer region {:?} uses {:?}",
+            thread.local.name, expected_fallback, thread.producer.region, producer_fallbacks
+        ));
+    }
+    Ok(())
+}
+
+fn require_matching_fallback_exit_v3(
+    function: SerializedFunctionId,
+    hot_region: &MechanicalRegionEmission,
+    fallback_region: &MechanicalRegionEmission,
+) -> Result<(), String> {
+    let hot_exit = hot_region
+        .exits
+        .first()
+        .expect("caller checked hot region has an exit");
+    match &hot_exit.kind {
+        MechanicalExitKind::Branch { .. } => {
+            require_single_original_cfg_branch_exit_v3(function, fallback_region)?;
+            let fallback_exit = fallback_region
+                .exits
+                .first()
+                .expect("branch fallback has one exit");
+            if fallback_exit.source != hot_exit.source {
+                return Err(format!(
+                    "function {function} branch region {:?} fallback {:?} uses exit source {:?}, expected {:?}",
+                    hot_region.region,
+                    fallback_region.region,
+                    fallback_exit.source,
+                    hot_exit.source
+                ));
+            }
+            Ok(())
+        }
+        MechanicalExitKind::Return { .. } => {
+            require_single_return_exit_v3(function, fallback_region)?;
+            let fallback_exit = fallback_region
+                .exits
+                .first()
+                .expect("return fallback has one exit");
+            if fallback_exit.source != hot_exit.source {
+                return Err(format!(
+                    "function {function} return region {:?} fallback {:?} uses exit source {:?}, expected {:?}",
+                    hot_region.region,
+                    fallback_region.region,
+                    fallback_exit.source,
+                    hot_exit.source
+                ));
+            }
+            Ok(())
+        }
+        MechanicalExitKind::Jump { .. } => Ok(()),
+    }
+}
+
+fn require_single_original_cfg_branch_exit_v3(
+    function: SerializedFunctionId,
+    region: &MechanicalRegionEmission,
+) -> Result<(), String> {
+    if !has_single_original_cfg_branch_exit_v3(region) {
+        return Err(format!(
+            "function {function} region {:?} must have exactly one OriginalCfg branch exit for current mechanical lowering, got {:?}",
+            region.region, region.exits
+        ));
+    }
+    Ok(())
+}
+
+fn has_single_original_cfg_branch_exit_v3(region: &MechanicalRegionEmission) -> bool {
+    let [exit] = region.exits.as_slice() else {
+        return false;
+    };
+    matches!(
+        &exit.kind,
+        MechanicalExitKind::Branch {
+            then_target,
+            else_target,
+            ..
+        } if matches!(then_target, &RegionExitTarget::OriginalCfg)
+            && matches!(else_target, &RegionExitTarget::OriginalCfg)
+    )
+}
+
+fn require_single_return_exit_v3(
+    function: SerializedFunctionId,
+    region: &MechanicalRegionEmission,
+) -> Result<(), String> {
+    if !has_single_return_exit_v3(region) {
+        return Err(format!(
+            "function {function} region {:?} must have exactly one return exit for current mechanical lowering, got {:?}",
+            region.region, region.exits
+        ));
+    }
+    Ok(())
+}
+
+fn has_single_return_exit_v3(region: &MechanicalRegionEmission) -> bool {
+    let [exit] = region.exits.as_slice() else {
+        return false;
+    };
+    matches!(&exit.kind, MechanicalExitKind::Return { .. })
+}
+
+fn local_fallback_region_targets_v3(
+    region: &MechanicalRegionEmission,
+) -> Result<HashSet<RegionId>, String> {
+    let mut targets = HashSet::new();
+    let mut raise_before_fallback = None;
+    for step in &region.steps {
+        match &step.op {
+            MechanicalStepOp::Guard { failure, .. } => match failure {
+                GuardFailure::FallbackToPlan {
+                    target: crate::plan_v3::FallbackTarget::Region(region),
+                    ..
+                } => {
+                    targets.insert(*region);
+                }
+                GuardFailure::FallbackToPlan { target, .. } => {
+                    return Err(format!(
+                        "region {:?} guard node {:?} uses unsupported fallback target {target:?}; current mechanical lowering requires region fallback targets",
+                        region.region, step.node
+                    ));
+                }
+                GuardFailure::DeoptTo { .. } => {
+                    return Err(format!(
+                        "region {:?} guard node {:?} uses deopt; current mechanical lowering requires a visible local fallback",
+                        region.region, step.node
+                    ));
+                }
+            },
+            MechanicalStepOp::Convert { failure, .. }
+            | MechanicalStepOp::Operation { failure, .. } => match failure {
+                FailureMode::CannotFail => {}
+                FailureMode::FallbackToPlan {
+                    target: crate::plan_v3::FallbackTarget::Region(region),
+                    ..
+                } => {
+                    targets.insert(*region);
+                }
+                FailureMode::FallbackToPlan { target, .. } => {
+                    return Err(format!(
+                        "current mechanical lowering only supports region fallback targets, got {target:?}"
+                    ));
+                }
+                FailureMode::Raise(exception) => {
+                    raise_before_fallback = Some(format!("{exception:?}"));
+                }
+                FailureMode::DeoptTo { .. } => {
+                    return Err(
+                        "current mechanical lowering requires a local fallback, not deopt"
+                            .to_string(),
+                    );
+                }
+            },
+            _ => {}
+        }
+    }
+    if !targets.is_empty()
+        && let Some(exception) = raise_before_fallback
+    {
+        return Err(format!(
+            "current mechanical lowering cannot raise before the local fallback, got {exception}"
+        ));
+    }
+    Ok(targets)
 }
 
 fn emit_direct_call(direct_call: &DirectCallSpecializationPlan) -> MechanicalDirectCallEmission {
@@ -353,9 +1125,13 @@ fn emit_indexed_field(
     MechanicalIndexedFieldEmission {
         source: indexed_field.source,
         access: indexed_field.access,
-        owner_type: indexed_field.owner_type.clone(),
-        attr_name: indexed_field.attr_name.clone(),
-        expected_index: indexed_field.expected_index,
+        guard: MechanicalIndexedFieldGuard {
+            kind: indexed_field.guard.kind,
+            owner_type: indexed_field.owner_type.clone(),
+            attr_name: indexed_field.attr_name.clone(),
+            expected_index: indexed_field.expected_index,
+        },
+        fallback: indexed_field.fallback.clone(),
         reason: indexed_field.reason.clone(),
     }
 }
@@ -442,15 +1218,18 @@ mod tests {
     use crate::plan_v3::{
         CallBodyKind, CallBodyPlan, ConstructorCallFallbackKind, ConstructorCallFallbackPlan,
         ConstructorCallGuardKind, ConstructorCallGuardPlan, ConstructorCallOwnerType,
-        ConstructorCallSpecializationPlan, Cost, DirectCallArgPlan, DirectCallArgSource,
-        DirectCallSpecializationPlan, ExactListItemAccessKind, ExactListItemFallbackKind,
-        ExactListItemFallbackPlan, ExactListItemGuardKind, ExactListItemGuardPlan,
-        ExactListItemShape, ExactListItemSpecializationPlan, FallbackReason, FallbackTarget,
+        ConstructorCallSpecializationPlan, ConversionOwnership, ConversionPrecondition,
+        ConvertNode, Cost, DirectCallArgPlan, DirectCallArgSource, DirectCallSpecializationPlan,
+        ExactListItemAccessKind, ExactListItemFallbackKind, ExactListItemFallbackPlan,
+        ExactListItemGuardKind, ExactListItemGuardPlan, ExactListItemShape,
+        ExactListItemSpecializationPlan, FallbackReason, FallbackTarget,
         FunctionOptimizationPlanV3, FunctionOwnershipPlan, FunctionPlanIdentity,
-        IndexedFieldAccessKind, IndexedFieldOwnerType, IndexedFieldSpecializationPlan,
-        MaterializeNode, MethodCallFallbackKind, MethodCallFallbackPlan, MethodCallGuardKind,
-        MethodCallGuardPlan, MethodCallOwnerType, MethodCallSpecializationPlan, ModulePlanIdentity,
-        RegionExitPlan, RegionInput, RegionPlan, RegionSource, Rep,
+        IndexedFieldAccessKind, IndexedFieldFallbackKind, IndexedFieldFallbackPlan,
+        IndexedFieldGuardKind, IndexedFieldGuardPlan, IndexedFieldOwnerType,
+        IndexedFieldSpecializationPlan, MaterializeNode, MethodCallFallbackKind,
+        MethodCallFallbackPlan, MethodCallGuardKind, MethodCallGuardPlan, MethodCallOwnerType,
+        MethodCallSpecializationPlan, ModulePlanIdentity, PythonExceptionSpec, RegionExitPlan,
+        RegionInput, RegionInputSource, RegionPlan, RegionSource, Rep,
     };
     use soac_core::block_py::{
         BlockLabel, LocalFunctionId, SerializedIdentityTables, SerializedModuleId,
@@ -646,6 +1425,153 @@ mod tests {
                 }
             }
         ));
+    }
+
+    #[test]
+    fn validates_emission_matches_plan() {
+        let plan = test_plan(true);
+        let mut emission = emit_mechanical_plan_v3(&plan).unwrap();
+        emission.module_name = "pkg.other".to_string();
+
+        let err = validate_mechanical_emission_matches_plan_v3(&plan, &emission).unwrap_err();
+
+        match err {
+            MechanicalEmitError::EmissionMismatch(message) => {
+                assert!(message.contains("emitted module name"));
+            }
+            MechanicalEmitError::InvalidPlan(err) => panic!("unexpected plan error: {err}"),
+        }
+    }
+
+    #[test]
+    fn validates_current_mechanical_lowering_shape() {
+        let mut plan = test_plan(true);
+        let PlanNodeKind::Operation(operation) = &mut plan.functions[0].regions[0].nodes[2].kind
+        else {
+            panic!("test plan node should be an operation");
+        };
+        operation.failure = FailureMode::FallbackToPlan {
+            target: FallbackTarget::Node(PlanNodeId(3)),
+            reason: FallbackReason("overflow uses node fallback".to_string()),
+        };
+
+        let err = emit_mechanical_plan_v3(&plan).unwrap_err();
+
+        match err {
+            MechanicalEmitError::EmissionMismatch(message) => {
+                assert!(
+                    message.contains("only supports region fallback targets"),
+                    "{message}"
+                );
+            }
+            MechanicalEmitError::InvalidPlan(err) => panic!("unexpected plan error: {err}"),
+        }
+    }
+
+    fn mechanical_emission_mismatch(plan: &ModuleOptimizationPlanV3) -> String {
+        match emit_mechanical_plan_v3(plan).unwrap_err() {
+            MechanicalEmitError::EmissionMismatch(message) => message,
+            MechanicalEmitError::InvalidPlan(err) => panic!("unexpected plan error: {err}"),
+        }
+    }
+
+    #[test]
+    fn validates_current_lowering_rejects_unsupported_region_inputs() {
+        let mut plan = test_plan(true);
+        let input = PlanValue::new(99, Rep::I64);
+        plan.functions[0].regions[0].inputs.push(RegionInput {
+            value: input,
+            source: RegionInputSource::Synthetic {
+                reason: "test synthetic input".to_string(),
+            },
+        });
+
+        let message = mechanical_emission_mismatch(&plan);
+
+        assert!(
+            message.contains("only supports named function-param inputs"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn validates_current_lowering_rejects_unsupported_constants() {
+        let mut plan = test_plan(true);
+        let PlanNodeKind::Constant { constant, .. } =
+            &mut plan.functions[0].regions[0].nodes[0].kind
+        else {
+            panic!("test plan node should be a constant");
+        };
+        *constant = PlannedConstant::Bool(true);
+
+        let message = mechanical_emission_mismatch(&plan);
+
+        assert!(message.contains("unsupported constant"), "{message}");
+    }
+
+    #[test]
+    fn validates_current_lowering_rejects_unsupported_conversions() {
+        let mut plan = test_plan(true);
+        let input = PlanValue::new(10, Rep::I64);
+        let output = PlanValue::new(98, Rep::PyObjectOwned);
+        plan.functions[0].regions[1].nodes.insert(
+            1,
+            crate::plan_v3::PlanNode {
+                id: PlanNodeId(98),
+                source: None,
+                kind: PlanNodeKind::Convert(ConvertNode {
+                    input,
+                    output,
+                    kind: ConversionKind::ToPythonLongOwned,
+                    precondition: ConversionPrecondition::Infallible,
+                    failure: FailureMode::Raise(PythonExceptionSpec {
+                        kind: "MemoryError".to_string(),
+                        reason: "test allocation failure".to_string(),
+                    }),
+                    ownership: ConversionOwnership::MaterializeOwned,
+                }),
+            },
+        );
+
+        let message = mechanical_emission_mismatch(&plan);
+
+        assert!(
+            message.contains("unsupported conversion ToPythonLongOwned"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn validates_current_lowering_rejects_unsupported_operations() {
+        let mut plan = test_plan(true);
+        let input = PlanValue::new(11, Rep::PyObjectOwned);
+        let output = PlanValue::new(98, Rep::I32Bool01);
+        plan.functions[0].regions[1]
+            .nodes
+            .push(crate::plan_v3::PlanNode {
+                id: PlanNodeId(98),
+                source: None,
+                kind: PlanNodeKind::Operation(OperationNode {
+                    op: PlannedOp::PyObjectIsTrue,
+                    inputs: vec![input],
+                    output: Some(output),
+                    failure_replay: crate::plan_v3::FailureReplayPolicy::local_fallback(
+                        "test truthiness failure replay",
+                    ),
+                    failure: FailureMode::Raise(PythonExceptionSpec {
+                        kind: "Exception".to_string(),
+                        reason: "test truthiness can raise".to_string(),
+                    }),
+                    cost: Cost::default(),
+                }),
+            });
+
+        let message = mechanical_emission_mismatch(&plan);
+
+        assert!(
+            message.contains("unsupported operation PyObjectIsTrue"),
+            "{message}"
+        );
     }
 
     #[test]
@@ -861,6 +1787,12 @@ mod tests {
             module_name: "pkg.model".to_string(),
             qualname: "Record".to_string(),
         };
+        let guard = IndexedFieldGuardPlan {
+            kind: IndexedFieldGuardKind::OwnerTypeVersionAndFieldIndex,
+        };
+        let fallback = IndexedFieldFallbackPlan {
+            kind: IndexedFieldFallbackKind::OriginalAttrAccess,
+        };
         plan.functions[0]
             .indexed_fields
             .push(IndexedFieldSpecializationPlan {
@@ -869,6 +1801,8 @@ mod tests {
                 owner_type: owner_type.clone(),
                 attr_name: "value".to_string(),
                 expected_index: 2,
+                guard: guard.clone(),
+                fallback: fallback.clone(),
                 reason: "profiled type_keys selected this indexed-field layout".to_string(),
             });
         plan.functions[0]
@@ -879,6 +1813,8 @@ mod tests {
                 owner_type: owner_type.clone(),
                 attr_name: "value".to_string(),
                 expected_index: 2,
+                guard: guard.clone(),
+                fallback: fallback.clone(),
                 reason: "profiled type_keys selected this indexed-field layout".to_string(),
             });
 
@@ -890,17 +1826,25 @@ mod tests {
                 MechanicalIndexedFieldEmission {
                     source: load_source,
                     access: IndexedFieldAccessKind::Load,
-                    owner_type: owner_type.clone(),
-                    attr_name: "value".to_string(),
-                    expected_index: 2,
+                    guard: MechanicalIndexedFieldGuard {
+                        kind: guard.kind,
+                        owner_type: owner_type.clone(),
+                        attr_name: "value".to_string(),
+                        expected_index: 2,
+                    },
+                    fallback: fallback.clone(),
                     reason: "profiled type_keys selected this indexed-field layout".to_string(),
                 },
                 MechanicalIndexedFieldEmission {
                     source: store_source,
                     access: IndexedFieldAccessKind::Store,
-                    owner_type,
-                    attr_name: "value".to_string(),
-                    expected_index: 2,
+                    guard: MechanicalIndexedFieldGuard {
+                        kind: guard.kind,
+                        owner_type,
+                        attr_name: "value".to_string(),
+                        expected_index: 2,
+                    },
+                    fallback,
                     reason: "profiled type_keys selected this indexed-field layout".to_string(),
                 },
             ]
@@ -988,6 +1932,9 @@ mod tests {
         match err {
             MechanicalEmitError::InvalidPlan(validation) => {
                 assert!(validation.contains("return exits require a returnable PyObject"));
+            }
+            MechanicalEmitError::EmissionMismatch(message) => {
+                panic!("unexpected emission mismatch: {message}");
             }
         }
     }

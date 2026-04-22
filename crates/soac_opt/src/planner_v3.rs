@@ -9,7 +9,8 @@ use crate::plan_v3::{
     ExactListItemFallbackKind, ExactListItemFallbackPlan, ExactListItemGuardKind,
     ExactListItemGuardPlan, ExactListItemShape, ExactListItemSpecializationPlan, FailureMode,
     FallbackReason, FallbackTarget, FunctionOptimizationPlanV3, FunctionOwnershipPlan,
-    FunctionPlanIdentity, IndexedFieldAccessKind, IndexedFieldOwnerType,
+    FunctionPlanIdentity, IndexedFieldAccessKind, IndexedFieldFallbackKind,
+    IndexedFieldFallbackPlan, IndexedFieldGuardKind, IndexedFieldGuardPlan, IndexedFieldOwnerType,
     IndexedFieldSpecializationPlan, IndexedGlobalAccessKind, IndexedGlobalFallbackKind,
     IndexedGlobalFallbackPlan, IndexedGlobalGuardKind, IndexedGlobalGuardPlan,
     IndexedGlobalSpecializationPlan, MaterializeKind, MaterializeNode, MethodCallFallbackKind,
@@ -484,6 +485,12 @@ fn plan_indexed_field_specializations_v3(
                 owner_type: request.owner_type.clone(),
                 attr_name: request.attr_name.clone(),
                 expected_index: request.expected_index,
+                guard: IndexedFieldGuardPlan {
+                    kind: IndexedFieldGuardKind::OwnerTypeVersionAndFieldIndex,
+                },
+                fallback: IndexedFieldFallbackPlan {
+                    kind: IndexedFieldFallbackKind::OriginalAttrAccess,
+                },
                 reason: request.reason.clone(),
             });
         }

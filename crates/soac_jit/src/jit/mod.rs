@@ -40,8 +40,8 @@ use soac_core::block_py::{
     CounterSite, Del, DeoptEntrySource, FunctionExecutionMode, FunctionKind, GetAttr, HasMeta,
     HasSemanticInstrId, InstrId, InstrKey, Load, LocalFunctionId, LocalLocation, Meta,
     ModuleContentId, NameLike, NameLocation, ParamKind, PersistentFunctionId, ResolvedName,
-    RuntimeFunctionId, RuntimeModuleId, RuntimeName, SerializedFunctionId, SerializedModuleId,
-    StorageLayout, Store, Visit, VisitMut, WithMeta,
+    RuntimeFunctionId, RuntimeModuleId, RuntimeName, SerializedFunctionId, StorageLayout, Store,
+    Visit, VisitMut, WithMeta,
 };
 use soac_core::profile::{
     CollectedTypeKeyLayout, CounterDumpTypeKey, read_block_entry_counts_from_file,
@@ -83,11 +83,13 @@ use soac_lowering::passes::{
     validate_codegen_instr_ids, validate_typed_function_call_access_plans,
     validate_typed_function_value_facts,
 };
-use soac_opt::artifacts_v3::{ExactIntBranchV3Artifacts, load_optimization_artifacts_v3};
+use soac_opt::artifacts_v3::{
+    ExactIntBranchV3Artifacts, load_optimization_artifacts_v3,
+    single_function_optimization_artifacts_v3, validate_optimization_artifacts_v3_for_module,
+};
 use soac_opt::emit_v3::{
-    MechanicalConstructorCallEmission, MechanicalExactListItemEmission, MechanicalExitKind,
-    MechanicalFunctionEmission, MechanicalIndexedFieldEmission, MechanicalIndexedGlobalEmission,
-    MechanicalMethodCallEmission, MechanicalModuleEmission, MechanicalOperation,
+    MechanicalExactListItemEmission, MechanicalExitKind, MechanicalIndexedFieldEmission,
+    MechanicalIndexedFieldGuard, MechanicalIndexedGlobalEmission, MechanicalOperation,
     MechanicalRegionEmission, MechanicalStepOp,
 };
 #[cfg(test)]
@@ -100,29 +102,24 @@ use soac_opt::plan_v3::{
     CallBodyKind as PlanV3CallBodyKind, CallBodyPlan as PlanV3CallBodyPlan,
     ConstructorCallFallbackKind as PlanV3ConstructorCallFallbackKind,
     ConstructorCallGuardKind as PlanV3ConstructorCallGuardKind,
-    ConstructorCallOwnerType as PlanV3ConstructorCallOwnerType,
-    ConstructorCallSpecializationPlan as PlanV3ConstructorCallSpecializationPlan, ConversionKind,
+    ConstructorCallOwnerType as PlanV3ConstructorCallOwnerType, ConversionKind,
     DirectCallArgPlan as PlanV3DirectCallArgPlan, DirectCallArgSource as PlanV3DirectCallArgSource,
     ExactListItemAccessKind as PlanV3ExactListItemAccessKind,
     ExactListItemFallbackKind as PlanV3ExactListItemFallbackKind,
     ExactListItemGuardKind as PlanV3ExactListItemGuardKind,
-    ExactListItemShape as PlanV3ExactListItemShape, FailureMode, FallbackTarget,
-    FunctionOptimizationPlanV3, GuardFailure, GuardKind,
-    IndexedFieldAccessKind as PlanV3IndexedFieldAccessKind,
-    IndexedFieldOwnerType as PlanV3IndexedFieldOwnerType,
-    IndexedFieldSpecializationPlan as PlanV3IndexedFieldSpecializationPlan,
+    ExactListItemShape as PlanV3ExactListItemShape, FailureMode, FallbackTarget, GuardFailure,
+    GuardKind, IndexedFieldAccessKind as PlanV3IndexedFieldAccessKind,
+    IndexedFieldFallbackKind as PlanV3IndexedFieldFallbackKind,
+    IndexedFieldGuardKind as PlanV3IndexedFieldGuardKind,
     IndexedGlobalAccessKind as PlanV3IndexedGlobalAccessKind,
     IndexedGlobalFallbackKind as PlanV3IndexedGlobalFallbackKind,
-    IndexedGlobalGuardKind as PlanV3IndexedGlobalGuardKind,
-    IndexedGlobalSpecializationPlan as PlanV3IndexedGlobalSpecializationPlan, MaterializeKind,
+    IndexedGlobalGuardKind as PlanV3IndexedGlobalGuardKind, MaterializeKind,
     MethodCallFallbackKind as PlanV3MethodCallFallbackKind,
     MethodCallGuardKind as PlanV3MethodCallGuardKind,
-    MethodCallOwnerType as PlanV3MethodCallOwnerType,
-    MethodCallSpecializationPlan as PlanV3MethodCallSpecializationPlan, ModuleOptimizationPlanV3,
-    PlanNodeId, PlanValue, PlannedConstant, RegionExitTarget, RegionId, RegionInputSource,
-    RegionPlan, Rep, RichCompareOp, ScalarLocalThreadPlan, ScalarThreadFallback,
-    ScalarThreadLocalCleanup, ScalarThreadLocalLocation, ScalarThreadLocalState,
-    ScalarThreadMaterialization,
+    MethodCallOwnerType as PlanV3MethodCallOwnerType, PlanNodeId, PlanValue, PlannedConstant,
+    RegionId, RegionInputSource, RegionPlan, Rep, RichCompareOp, ScalarLocalThreadPlan,
+    ScalarThreadFallback, ScalarThreadLocalCleanup, ScalarThreadLocalLocation,
+    ScalarThreadLocalState, ScalarThreadMaterialization,
 };
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
@@ -2153,11 +2150,6 @@ fn build_profiled_jit_module_plan(
         } else {
             profile.v3_inline_constructor_calls(function.function_id)
         };
-        let constructor_call_body_plans = if has_exact_int_branch_artifacts {
-            HashMap::new()
-        } else {
-            profile.v3_direct_constructor_call_body_plans(function.function_id)
-        };
         let method_call_rewrite_targets = if has_exact_int_branch_artifacts {
             HashMap::new()
         } else {
@@ -2171,36 +2163,13 @@ fn build_profiled_jit_module_plan(
         } else {
             profile.v3_inline_direct_function_call_targets(function.function_id)
         };
-        if method_call_rewrite_targets.is_empty()
-            && direct_call_rewrite_targets.is_empty()
-            && constructor_call_body_plans.is_empty()
-        {
+        if method_call_rewrite_targets.is_empty() && direct_call_rewrite_targets.is_empty() {
             continue;
         }
-        let direct_owner_attr_specializations = direct_owner_attr_specializations_by_function
-            .get(&function.function_id)
-            .unwrap_or(&empty_direct_owner_attr_specializations);
-        if !constructor_call_body_plans.is_empty() {
-            let stats = rewrite_v3_direct_constructor_call_body_store_sites(
-                function,
-                &constructor_call_body_plans,
-                direct_owner_attr_specializations,
-            );
-            if stats.total_attempts() != 0 {
-                info!(
-                    target: "soac_jit_v3_direct_constructor_body_rewrite",
-                    module_id = planned_module_id,
-                    function_id = %function.function_id,
-                    qualname = %function.names.qualname,
-                    candidate_stores = stats.candidate_stores,
-                    missing_owner_guard_targets = stats.missing_owner_guard_targets,
-                    rewritten_stores = stats.rewritten_stores,
-                    "soac_jit_v3_direct_constructor_body_rewrite"
-                );
-            }
-            rewritten_store_count += stats.rewritten_stores;
-        }
         if !method_call_rewrite_targets.is_empty() {
+            let direct_owner_attr_specializations = direct_owner_attr_specializations_by_function
+                .get(&function.function_id)
+                .unwrap_or(&empty_direct_owner_attr_specializations);
             let stats = rewrite_profiled_no_arg_method_call_store_sites(
                 function,
                 module_constants,
@@ -2329,78 +2298,6 @@ fn build_profiled_jit_module_plan(
             })?;
         }
     }
-    let mut direct_body_rewritten_store_count = 0usize;
-    let module_constants_for_direct_body = planned_module.module_constants.clone();
-    for function in &mut planned_module.callable_defs {
-        if profile
-            .opt_v3_exact_int_branch_artifacts
-            .contains_key(&function.function_id)
-        {
-            continue;
-        }
-        let direct_body_rewrite_targets =
-            profile.v3_direct_function_call_body_targets(function.function_id);
-        if !direct_body_rewrite_targets.is_empty() {
-            let stats = rewrite_profiled_function_call_store_sites(
-                function,
-                &direct_body_rewrite_targets,
-                &callees,
-            );
-            if stats.rewritten_stores != 0
-                || stats.skipped_empty_targets != 0
-                || stats.skipped_incompatible_targets != 0
-            {
-                info!(
-                    target: "soac_jit_v3_direct_call_body_rewrite",
-                    module_id = planned_module_id,
-                    function_id = %function.function_id,
-                    qualname = %function.names.qualname,
-                    rewritten_stores = stats.rewritten_stores,
-                    skipped_empty_targets = stats.skipped_empty_targets,
-                    skipped_incompatible_targets = stats.skipped_incompatible_targets,
-                    skipped_missing_callee_targets = stats.skipped_missing_callee_targets,
-                    skipped_arity_mismatch_targets = stats.skipped_arity_mismatch_targets,
-                    skipped_unsupported_init_targets = stats.skipped_unsupported_init_targets,
-                    skipped_missing_storage_layout_targets = stats.skipped_missing_storage_layout_targets,
-                    skipped_unsupported_param_kind_targets =
-                        stats.skipped_unsupported_param_kind_targets,
-                    skipped_missing_param_storage_targets = stats.skipped_missing_param_storage_targets,
-                    "soac_jit_v3_direct_call_body_rewrite"
-                );
-            }
-            direct_body_rewritten_store_count += stats.rewritten_stores;
-        }
-        let method_body_plans = profile.v3_direct_method_call_body_plans(function.function_id);
-        if method_body_plans.is_empty() {
-            continue;
-        }
-        let direct_owner_attr_specializations = direct_owner_attr_specializations_by_function
-            .get(&function.function_id)
-            .unwrap_or(&empty_direct_owner_attr_specializations);
-        let stats = rewrite_v3_direct_method_call_body_store_sites(
-            function,
-            module_constants_for_direct_body.as_slice(),
-            &method_body_plans,
-            direct_owner_attr_specializations,
-        );
-        if stats.total_attempts() != 0 {
-            info!(
-                target: "soac_jit_v3_direct_method_body_rewrite",
-                module_id = planned_module_id,
-                function_id = %function.function_id,
-                qualname = %function.names.qualname,
-                candidate_stores = stats.candidate_stores,
-                missing_owner_guard_targets = stats.missing_owner_guard_targets,
-                rewritten_stores = stats.rewritten_stores,
-                "soac_jit_v3_direct_method_body_rewrite"
-            );
-        }
-        direct_body_rewritten_store_count += stats.rewritten_stores;
-    }
-    if direct_body_rewritten_store_count != 0 {
-        validate_codegen_instr_ids(&planned_module)
-            .map_err(|err| format!("v3 direct-call body CFG rewrite validation failed: {err}"))?;
-    }
     build_jit_module_plan_from_owned_module(planned_module)
 }
 
@@ -2444,12 +2341,6 @@ fn build_profiled_inline_callee_maps(
         for targets in direct_call_rewrite_targets.values() {
             target_ids.extend(targets.iter().copied());
         }
-        for targets in profile
-            .v3_direct_function_call_body_targets(function.function_id)
-            .values()
-        {
-            target_ids.extend(targets.iter().copied());
-        }
         for plans in profile
             .v3_inline_constructor_calls(function.function_id)
             .values()
@@ -2463,12 +2354,6 @@ fn build_profiled_inline_callee_maps(
         }
         for targets in profile
             .v3_inline_method_call_targets(function.function_id)
-            .values()
-        {
-            target_ids.extend(targets.iter().copied());
-        }
-        for targets in profile
-            .v3_direct_method_call_body_targets(function.function_id)
             .values()
         {
             target_ids.extend(targets.iter().copied());
@@ -2535,26 +2420,6 @@ fn build_profiled_inline_callee_maps(
         let direct_call_rewrite_targets =
             profile.v3_inline_direct_function_call_targets(function_id);
         for targets in direct_call_rewrite_targets.values() {
-            for target_id in targets {
-                if target_ids.insert(*target_id) {
-                    pending_target_ids.push_back(*target_id);
-                }
-            }
-        }
-        for targets in profile
-            .v3_direct_function_call_body_targets(function_id)
-            .values()
-        {
-            for target_id in targets {
-                if target_ids.insert(*target_id) {
-                    pending_target_ids.push_back(*target_id);
-                }
-            }
-        }
-        for targets in profile
-            .v3_direct_method_call_body_targets(function_id)
-            .values()
-        {
             for target_id in targets {
                 if target_ids.insert(*target_id) {
                     pending_target_ids.push_back(*target_id);
@@ -2738,7 +2603,6 @@ struct ProfiledMethodInlineCandidate {
     target: ResolvedName,
     receiver: InstrCodegen,
     attr: InstrCodegen,
-    args: Vec<CallArgPositional<InstrCodegen>>,
     method_name: String,
     instr_id: InstrId,
 }
@@ -2747,12 +2611,6 @@ struct ProfiledMethodInlineFragment {
     guard: DirectOwnerAttrSpecialization,
     entry_label: BlockLabel,
     blocks: Vec<Block<InstrCodegen>>,
-}
-
-struct V3DirectMethodCallBodyFragment {
-    plan: OptV3MethodCallPlan,
-    guard: TypedDirectMethodCallGuard,
-    entry_label: BlockLabel,
 }
 
 struct ProfiledMethodCallableGuardFragment {
@@ -2767,19 +2625,6 @@ struct ProfiledRuntimeIterInlineCandidate {
     func: InstrCodegen,
     receiver: InstrCodegen,
     constructor_instr_id: InstrId,
-}
-
-struct ProfiledConstructorCallBodyCandidate {
-    instr_index: usize,
-    target: ResolvedName,
-    callable: InstrCodegen,
-    args: Vec<CallArgPositional<InstrCodegen>>,
-    instr_id: InstrId,
-}
-
-struct V3DirectConstructorCallBodyFragment {
-    guard: TypedDirectConstructorCallGuard,
-    entry_label: BlockLabel,
 }
 
 fn rewrite_profiled_no_arg_method_call_store_sites(
@@ -2829,445 +2674,6 @@ fn rewrite_profiled_no_arg_method_call_store_sites(
         assign_missing_codegen_function_instr_ids(function);
     }
     stats
-}
-
-fn rewrite_v3_direct_method_call_body_store_sites(
-    function: &mut BlockPyFunction<CodegenModuleShape>,
-    module_constants: &[InstrResolved],
-    method_call_body_plans: &HashMap<InstrId, Vec<OptV3MethodCallPlan>>,
-    direct_owner_attr_specializations: &HashMap<
-        DirectOwnerAttrKey,
-        Vec<DirectOwnerAttrSpecialization>,
-    >,
-) -> ProfiledMethodInlineRewriteStats {
-    let mut stats = ProfiledMethodInlineRewriteStats::default();
-    let method_call_body_targets = opt_v3_direct_method_call_body_targets(method_call_body_plans);
-    let original_blocks = std::mem::take(&mut function.blocks);
-    let mut rewritten_blocks = Vec::with_capacity(original_blocks.len());
-    for block in original_blocks {
-        match rewrite_v3_direct_method_call_body_store_block(
-            function,
-            module_constants,
-            block.clone(),
-            &method_call_body_targets,
-            method_call_body_plans,
-            direct_owner_attr_specializations,
-            &mut stats,
-        ) {
-            Some(blocks) => {
-                stats.rewritten_stores += 1;
-                rewritten_blocks.extend(blocks);
-            }
-            None => rewritten_blocks.push(block),
-        }
-    }
-    function.blocks = rewritten_blocks;
-    if stats.rewritten_stores != 0 {
-        assign_missing_codegen_function_instr_ids(function);
-    }
-    stats
-}
-
-fn rewrite_v3_direct_constructor_call_body_store_sites(
-    function: &mut BlockPyFunction<CodegenModuleShape>,
-    constructor_call_body_plans: &HashMap<InstrId, Vec<OptV3ConstructorCallPlan>>,
-    direct_owner_attr_specializations: &HashMap<
-        DirectOwnerAttrKey,
-        Vec<DirectOwnerAttrSpecialization>,
-    >,
-) -> ProfiledMethodInlineRewriteStats {
-    let mut stats = ProfiledMethodInlineRewriteStats::default();
-    let constructor_call_body_targets =
-        opt_v3_direct_constructor_call_body_targets(constructor_call_body_plans);
-    let original_blocks = std::mem::take(&mut function.blocks);
-    let mut rewritten_blocks = Vec::with_capacity(original_blocks.len());
-    for block in original_blocks {
-        match rewrite_v3_direct_constructor_call_body_store_block(
-            function,
-            block.clone(),
-            &constructor_call_body_targets,
-            constructor_call_body_plans,
-            direct_owner_attr_specializations,
-            &mut stats,
-        ) {
-            Some(blocks) => {
-                stats.rewritten_stores += 1;
-                rewritten_blocks.extend(blocks);
-            }
-            None => rewritten_blocks.push(block),
-        }
-    }
-    function.blocks = rewritten_blocks;
-    if stats.rewritten_stores != 0 {
-        assign_missing_codegen_function_instr_ids(function);
-    }
-    stats
-}
-
-fn rewrite_v3_direct_method_call_body_store_block(
-    function: &mut BlockPyFunction<CodegenModuleShape>,
-    module_constants: &[InstrResolved],
-    block: Block<InstrCodegen>,
-    method_call_body_targets: &HashMap<InstrId, Vec<RuntimeFunctionId>>,
-    method_call_body_plans: &HashMap<InstrId, Vec<OptV3MethodCallPlan>>,
-    direct_owner_attr_specializations: &HashMap<
-        DirectOwnerAttrKey,
-        Vec<DirectOwnerAttrSpecialization>,
-    >,
-    stats: &mut ProfiledMethodInlineRewriteStats,
-) -> Option<Vec<Block<InstrCodegen>>> {
-    let candidate = find_profiled_method_call_body_candidate(
-        module_constants,
-        &block,
-        method_call_body_targets,
-    )?;
-    stats.candidate_stores += 1;
-    let plans = method_call_body_plans.get(&candidate.instr_id)?;
-    let continuation_label = function.name_gen.next_block_name();
-    let receiver_temp =
-        soac_lowering::passes::allocate_codegen_stack_temp(function, "direct_method_receiver");
-    let receiver_temp_name = receiver_temp.resolved_name();
-    let exc_edge = block.exc_edge.clone();
-
-    let mut fragments = Vec::new();
-    for plan in plans {
-        if plan.body.kind != PlanV3CallBodyKind::DirectCall
-            || plan.method_name != candidate.method_name
-            || !v3_direct_call_body_arg_plan_matches_args(&plan.arg_plan, candidate.args.len())
-        {
-            continue;
-        }
-        let key = DirectOwnerAttrKey::new(plan.target, plan.method_name.as_str());
-        let Some(guards) = direct_owner_attr_specializations.get(&key) else {
-            stats.missing_owner_guard_targets += 1;
-            continue;
-        };
-        for guard in guards {
-            if !direct_owner_attr_specialization_matches_v3_method_plan(guard, plan) {
-                continue;
-            }
-            let typed_guard = TypedDirectMethodCallGuard {
-                function_id: plan.target,
-                owner_type_ref: typed_attr_owner_ref_from_reloc_type_ref(&guard.owner_type_ref),
-                type_version: guard.type_version,
-                arg_plan: plan.arg_plan.clone(),
-            };
-            if fragments
-                .iter()
-                .any(|fragment: &V3DirectMethodCallBodyFragment| fragment.guard == typed_guard)
-            {
-                continue;
-            }
-            fragments.push(V3DirectMethodCallBodyFragment {
-                plan: plan.clone(),
-                guard: typed_guard,
-                entry_label: function.name_gen.next_block_name(),
-            });
-        }
-    }
-    if fragments.is_empty() {
-        return None;
-    }
-
-    let mut before = block.body;
-    let after = before.split_off(candidate.instr_index + 1);
-    before.truncate(candidate.instr_index);
-    before.push(
-        Store::new(receiver_temp_name.clone(), candidate.receiver)
-            .with_meta(Meta::synthetic())
-            .into(),
-    );
-
-    let generic_label = function.name_gen.next_block_name();
-    let guard_labels = (0..fragments.len().saturating_sub(1))
-        .map(|_| function.name_gen.next_block_name())
-        .collect::<Vec<_>>();
-
-    let entry_term = receiver_type_version_guard_term_for_typed_guard(
-        &receiver_temp_name,
-        &fragments[0].guard,
-        fragments[0].entry_label,
-        guard_labels.first().copied().unwrap_or(generic_label),
-    );
-    let entry = Block::new(
-        block.label,
-        before,
-        entry_term,
-        block.params,
-        exc_edge.clone(),
-    );
-
-    let mut blocks = Vec::with_capacity(fragments.len() * 2 + 3);
-    blocks.push(entry);
-
-    for (guard_index, guard_label) in guard_labels.iter().copied().enumerate() {
-        let target_index = guard_index + 1;
-        let else_label = guard_labels
-            .get(guard_index + 1)
-            .copied()
-            .unwrap_or(generic_label);
-        blocks.push(Block::new(
-            guard_label,
-            Vec::new(),
-            receiver_type_version_guard_term_for_typed_guard(
-                &receiver_temp_name,
-                &fragments[target_index].guard,
-                fragments[target_index].entry_label,
-                else_label,
-            ),
-            Vec::new(),
-            exc_edge.clone(),
-        ));
-    }
-
-    for (fragment_index, fragment) in fragments.into_iter().enumerate() {
-        let direct_args = if fragment_index == 0 {
-            candidate.args.clone()
-        } else {
-            clone_codegen_call_args_with_fresh_instr_ids(&candidate.args)
-        };
-        blocks.push(Block::new(
-            fragment.entry_label,
-            vec![
-                Store::new(
-                    candidate.target.clone(),
-                    InstrCodegen::DirectMethodCall(
-                        TypedDirectMethodCall::new(
-                            load_codegen_temp(&receiver_temp_name),
-                            direct_args,
-                            fragment.plan.method_name,
-                            fragment.guard,
-                        )
-                        .with_meta(Meta::synthetic()),
-                    ),
-                )
-                .with_meta(Meta::synthetic())
-                .into(),
-                Del::new(receiver_temp_name.clone(), false)
-                    .with_meta(Meta::synthetic())
-                    .into(),
-            ],
-            BlockTerm::Jump(BlockEdge::new(continuation_label)),
-            Vec::new(),
-            exc_edge.clone(),
-        ));
-    }
-
-    blocks.push(Block::new(
-        generic_label,
-        vec![
-            Store::new(
-                candidate.target,
-                InstrCodegen::Call(
-                    Call::new(
-                        InstrCodegen::GetAttr(
-                            GetAttr::new(load_codegen_temp(&receiver_temp_name), candidate.attr)
-                                .with_meta(Meta::synthetic()),
-                        ),
-                        clone_codegen_call_args_with_fresh_instr_ids(&candidate.args),
-                        Vec::new(),
-                    )
-                    .with_meta(Meta::synthetic()),
-                ),
-            )
-            .with_meta(Meta::synthetic())
-            .into(),
-            Del::new(receiver_temp_name.clone(), false)
-                .with_meta(Meta::synthetic())
-                .into(),
-        ],
-        BlockTerm::Jump(BlockEdge::new(continuation_label)),
-        Vec::new(),
-        exc_edge.clone(),
-    ));
-
-    blocks.push(Block::new(
-        continuation_label,
-        after,
-        block.term,
-        Vec::new(),
-        exc_edge,
-    ));
-
-    Some(blocks)
-}
-
-fn rewrite_v3_direct_constructor_call_body_store_block(
-    function: &mut BlockPyFunction<CodegenModuleShape>,
-    block: Block<InstrCodegen>,
-    constructor_call_body_targets: &HashMap<InstrId, Vec<RuntimeFunctionId>>,
-    constructor_call_body_plans: &HashMap<InstrId, Vec<OptV3ConstructorCallPlan>>,
-    direct_owner_attr_specializations: &HashMap<
-        DirectOwnerAttrKey,
-        Vec<DirectOwnerAttrSpecialization>,
-    >,
-    stats: &mut ProfiledMethodInlineRewriteStats,
-) -> Option<Vec<Block<InstrCodegen>>> {
-    let candidate =
-        find_profiled_constructor_call_body_candidate(&block, constructor_call_body_targets)?;
-    stats.candidate_stores += 1;
-    let plans = constructor_call_body_plans.get(&candidate.instr_id)?;
-    let continuation_label = function.name_gen.next_block_name();
-    let callable_temp =
-        soac_lowering::passes::allocate_codegen_stack_temp(function, "direct_constructor_callable");
-    let callable_temp_name = callable_temp.resolved_name();
-    let exc_edge = block.exc_edge.clone();
-
-    let mut fragments = Vec::new();
-    for plan in plans {
-        if plan.body.kind != PlanV3CallBodyKind::DirectCall
-            || !v3_direct_call_body_arg_plan_matches_args(&plan.arg_plan, candidate.args.len())
-        {
-            continue;
-        }
-        let key = DirectOwnerAttrKey::new(plan.target, "__init__");
-        let Some(guards) = direct_owner_attr_specializations.get(&key) else {
-            stats.missing_owner_guard_targets += 1;
-            continue;
-        };
-        for guard in guards {
-            if !direct_owner_attr_specialization_matches_v3_constructor_plan(guard, plan) {
-                continue;
-            }
-            let typed_guard = TypedDirectConstructorCallGuard {
-                function_id: plan.target,
-                owner_type_ref: typed_attr_owner_ref_from_reloc_type_ref(&guard.owner_type_ref),
-                type_version: guard.type_version,
-                arg_plan: plan.arg_plan.clone(),
-            };
-            if fragments
-                .iter()
-                .any(|fragment: &V3DirectConstructorCallBodyFragment| fragment.guard == typed_guard)
-            {
-                continue;
-            }
-            fragments.push(V3DirectConstructorCallBodyFragment {
-                guard: typed_guard,
-                entry_label: function.name_gen.next_block_name(),
-            });
-        }
-    }
-    if fragments.is_empty() {
-        return None;
-    }
-
-    let mut before = block.body;
-    let after = before.split_off(candidate.instr_index + 1);
-    before.truncate(candidate.instr_index);
-    before.push(
-        Store::new(callable_temp_name.clone(), candidate.callable)
-            .with_meta(Meta::synthetic())
-            .into(),
-    );
-
-    let generic_label = function.name_gen.next_block_name();
-    let guard_labels = (0..fragments.len().saturating_sub(1))
-        .map(|_| function.name_gen.next_block_name())
-        .collect::<Vec<_>>();
-
-    let entry_term = callable_type_version_guard_term_for_typed_constructor_guard(
-        &callable_temp_name,
-        &fragments[0].guard,
-        fragments[0].entry_label,
-        guard_labels.first().copied().unwrap_or(generic_label),
-    );
-    let entry = Block::new(
-        block.label,
-        before,
-        entry_term,
-        block.params,
-        exc_edge.clone(),
-    );
-
-    let mut blocks = Vec::with_capacity(fragments.len() * 2 + 3);
-    blocks.push(entry);
-
-    for (guard_index, guard_label) in guard_labels.iter().copied().enumerate() {
-        let target_index = guard_index + 1;
-        let else_label = guard_labels
-            .get(guard_index + 1)
-            .copied()
-            .unwrap_or(generic_label);
-        blocks.push(Block::new(
-            guard_label,
-            Vec::new(),
-            callable_type_version_guard_term_for_typed_constructor_guard(
-                &callable_temp_name,
-                &fragments[target_index].guard,
-                fragments[target_index].entry_label,
-                else_label,
-            ),
-            Vec::new(),
-            exc_edge.clone(),
-        ));
-    }
-
-    for (fragment_index, fragment) in fragments.into_iter().enumerate() {
-        let direct_args = if fragment_index == 0 {
-            candidate.args.clone()
-        } else {
-            clone_codegen_call_args_with_fresh_instr_ids(&candidate.args)
-        };
-        blocks.push(Block::new(
-            fragment.entry_label,
-            vec![
-                Store::new(
-                    candidate.target.clone(),
-                    InstrCodegen::DirectCallableCall(
-                        TypedDirectCallableCall::new(
-                            load_codegen_temp(&callable_temp_name),
-                            direct_args,
-                            TypedDirectCallableCallGuard::Constructor(fragment.guard),
-                        )
-                        .with_meta(Meta::synthetic()),
-                    ),
-                )
-                .with_meta(Meta::synthetic())
-                .into(),
-                Del::new(callable_temp_name.clone(), false)
-                    .with_meta(Meta::synthetic())
-                    .into(),
-            ],
-            BlockTerm::Jump(BlockEdge::new(continuation_label)),
-            Vec::new(),
-            exc_edge.clone(),
-        ));
-    }
-
-    blocks.push(Block::new(
-        generic_label,
-        vec![
-            Store::new(
-                candidate.target,
-                InstrCodegen::Call(
-                    Call::new(
-                        load_codegen_temp(&callable_temp_name),
-                        clone_codegen_call_args_with_fresh_instr_ids(&candidate.args),
-                        Vec::new(),
-                    )
-                    .with_meta(Meta::synthetic()),
-                ),
-            )
-            .with_meta(Meta::synthetic())
-            .into(),
-            Del::new(callable_temp_name.clone(), false)
-                .with_meta(Meta::synthetic())
-                .into(),
-        ],
-        BlockTerm::Jump(BlockEdge::new(continuation_label)),
-        Vec::new(),
-        exc_edge.clone(),
-    ));
-
-    blocks.push(Block::new(
-        continuation_label,
-        after,
-        block.term,
-        Vec::new(),
-        exc_edge,
-    ));
-
-    Some(blocks)
 }
 
 fn rewrite_profiled_no_arg_method_call_store_block(
@@ -4211,91 +3617,7 @@ fn find_profiled_no_arg_method_inline_candidate(
                 target: store.name.clone(),
                 receiver: (*getattr.value).clone(),
                 attr: (*getattr.attr).clone(),
-                args: Vec::new(),
                 method_name: method_name.to_string(),
-                instr_id,
-            })
-        })
-}
-
-fn find_profiled_method_call_body_candidate(
-    module_constants: &[InstrResolved],
-    block: &Block<InstrCodegen>,
-    targets_by_instr_id: &HashMap<InstrId, Vec<RuntimeFunctionId>>,
-) -> Option<ProfiledMethodInlineCandidate> {
-    block
-        .body
-        .iter()
-        .enumerate()
-        .find_map(|(instr_index, instr)| {
-            let InstrCodegen::Store(store) = instr else {
-                return None;
-            };
-            let InstrCodegen::Call(call) = store.value.as_ref() else {
-                return None;
-            };
-            if !call.keywords.is_empty()
-                || call
-                    .args
-                    .iter()
-                    .any(|arg| matches!(arg, CallArgPositional::Starred(_)))
-            {
-                return None;
-            }
-            let instr_id = call.try_semantic_instr_id()?;
-            if targets_by_instr_id.get(&instr_id).is_none_or(Vec::is_empty) {
-                return None;
-            }
-            let InstrCodegen::GetAttr(getattr) = call.func.as_ref() else {
-                return None;
-            };
-            let method_name =
-                codegen_constant_string_value_from_slice(module_constants, getattr.attr.as_ref())?;
-            Some(ProfiledMethodInlineCandidate {
-                instr_index,
-                target: store.name.clone(),
-                receiver: (*getattr.value).clone(),
-                attr: (*getattr.attr).clone(),
-                args: call.args.clone(),
-                method_name: method_name.to_string(),
-                instr_id,
-            })
-        })
-}
-
-fn find_profiled_constructor_call_body_candidate(
-    block: &Block<InstrCodegen>,
-    targets_by_instr_id: &HashMap<InstrId, Vec<RuntimeFunctionId>>,
-) -> Option<ProfiledConstructorCallBodyCandidate> {
-    block
-        .body
-        .iter()
-        .enumerate()
-        .find_map(|(instr_index, instr)| {
-            let InstrCodegen::Store(store) = instr else {
-                return None;
-            };
-            let InstrCodegen::Call(call) = store.value.as_ref() else {
-                return None;
-            };
-            if matches!(call.func.as_ref(), InstrCodegen::GetAttr(_))
-                || !call.keywords.is_empty()
-                || call
-                    .args
-                    .iter()
-                    .any(|arg| matches!(arg, CallArgPositional::Starred(_)))
-            {
-                return None;
-            }
-            let instr_id = call.try_semantic_instr_id()?;
-            if targets_by_instr_id.get(&instr_id).is_none_or(Vec::is_empty) {
-                return None;
-            }
-            Some(ProfiledConstructorCallBodyCandidate {
-                instr_index,
-                target: store.name.clone(),
-                callable: (*call.func).clone(),
-                args: call.args.clone(),
                 instr_id,
             })
         })
@@ -4379,41 +3701,6 @@ fn receiver_type_version_guard_term(
     )
 }
 
-fn receiver_type_version_guard_term_for_typed_guard(
-    receiver_temp_name: &ResolvedName,
-    guard: &TypedDirectMethodCallGuard,
-    then_label: BlockLabel,
-    else_label: BlockLabel,
-) -> BlockTerm<InstrCodegen> {
-    receiver_type_version_guard_term_for_owner(
-        receiver_temp_name,
-        guard.owner_type_ref.clone(),
-        guard.type_version,
-        then_label,
-        else_label,
-    )
-}
-
-fn callable_type_version_guard_term_for_typed_constructor_guard(
-    callable_temp_name: &ResolvedName,
-    guard: &TypedDirectConstructorCallGuard,
-    then_label: BlockLabel,
-    else_label: BlockLabel,
-) -> BlockTerm<InstrCodegen> {
-    BlockTerm::IfTerm(soac_core::block_py::TermIf {
-        test: InstrCodegen::DirectCallableTypeVersionGuardTest(
-            DirectCallableTypeVersionGuardTest::new(
-                load_codegen_temp(callable_temp_name),
-                guard.owner_type_ref.clone(),
-                guard.type_version,
-            )
-            .with_meta(Meta::synthetic()),
-        ),
-        then_label,
-        else_label,
-    })
-}
-
 fn receiver_type_version_guard_term_for_owner(
     receiver_temp_name: &ResolvedName,
     owner_type_ref: TypedAttrOwnerRef,
@@ -4433,81 +3720,6 @@ fn receiver_type_version_guard_term_for_owner(
         then_label,
         else_label,
     })
-}
-
-fn direct_owner_attr_specialization_matches_v3_constructor_plan(
-    guard: &DirectOwnerAttrSpecialization,
-    plan: &OptV3ConstructorCallPlan,
-) -> bool {
-    match &guard.owner_type_ref {
-        RelocTypeRef::TypeKey(type_key) => {
-            type_key.module_name == plan.owner_type.module_name
-                && type_key.qualname == plan.owner_type.qualname
-        }
-        RelocTypeRef::CpythonTypeSymbol(_) => false,
-    }
-}
-
-fn direct_owner_attr_specialization_matches_v3_method_plan(
-    guard: &DirectOwnerAttrSpecialization,
-    plan: &OptV3MethodCallPlan,
-) -> bool {
-    match &guard.owner_type_ref {
-        RelocTypeRef::TypeKey(type_key) => {
-            type_key.module_name == plan.owner_type.module_name
-                && type_key.qualname == plan.owner_type.qualname
-        }
-        RelocTypeRef::CpythonTypeSymbol(_) => false,
-    }
-}
-
-fn v3_direct_call_body_arg_plan_matches_args(
-    plan: &TypedDirectCallArgPlan,
-    explicit_arg_count: usize,
-) -> bool {
-    let provided_arg_count = explicit_arg_count + 1;
-    let mut seen = vec![false; provided_arg_count];
-    for source in &plan.sources {
-        match source {
-            TypedDirectCallArgSource::Provided(index) if *index < provided_arg_count => {
-                if seen[*index] {
-                    return false;
-                }
-                seen[*index] = true;
-            }
-            TypedDirectCallArgSource::DefaultSentinel => {}
-            TypedDirectCallArgSource::Provided(_) => return false,
-        }
-    }
-    seen.into_iter().all(|provided| provided)
-}
-
-fn clone_codegen_call_args_with_fresh_instr_ids(
-    args: &[CallArgPositional<InstrCodegen>],
-) -> Vec<CallArgPositional<InstrCodegen>> {
-    args.iter()
-        .cloned()
-        .map(|arg| arg.map_instr(clear_codegen_instr_ids))
-        .collect()
-}
-
-fn clear_codegen_instr_ids(mut instr: InstrCodegen) -> InstrCodegen {
-    struct Scrubber;
-
-    impl VisitMut<InstrCodegen> for Scrubber {
-        fn visit_instr_mut(&mut self, expr: &mut InstrCodegen)
-        where
-            InstrCodegen: ChildVisitable<InstrCodegen>,
-        {
-            expr.visit_children_mut(self);
-            let mut meta = expr.meta();
-            meta.instr_id = None;
-            *expr = expr.clone().with_meta(meta);
-        }
-    }
-
-    Scrubber.visit_instr_mut(&mut instr);
-    instr
 }
 
 fn append_cleanup_before_method_inline_exit(
@@ -8438,7 +7650,6 @@ fn emit_codegen_opt_v3_indexed_global_load(
     local_env: &LocalEnv,
     ctx: &JitEmitCtx<'_>,
 ) -> ir::Value {
-    plan.expect_lowering_shape(PlanV3IndexedGlobalAccessKind::Load);
     let name_obj = emit_owned_module_constant(
         fb,
         ctx.module_constants.require_unicode_constant_id(&plan.name),
@@ -9275,6 +8486,7 @@ struct JitEmitCtx<'mc> {
     global_indexed_hit_counter_ids: &'mc HashMap<InstrId, CounterId>,
     global_indexed_fallback_counter_ids: &'mc HashMap<InstrId, CounterId>,
     opt_v3_indexed_globals_by_instr: &'mc HashMap<InstrId, OptV3IndexedGlobalAccessPlan>,
+    opt_v3_indexed_fields_by_instr: &'mc HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>,
     field_indexed_hit_counter_ids: &'mc HashMap<InstrId, CounterId>,
     field_indexed_fallback_counter_ids: &'mc HashMap<InstrId, CounterId>,
     field_generic_getattr_counter_ids: &'mc HashMap<InstrId, CounterId>,
@@ -10139,49 +9351,19 @@ struct OptV3ExactListItemAccessPlan {
     fallback: PlanV3ExactListItemFallbackKind,
 }
 
-impl OptV3ExactListItemAccessPlan {
-    fn expect_lowering_shape(&self, expected_access: PlanV3ExactListItemAccessKind) {
-        assert_eq!(
-            self.access, expected_access,
-            "optimizer v3 exact-list item {:?} reached {:?} lowering for {}",
-            self.access, expected_access, self.source
-        );
-        assert_eq!(
-            self.shape,
-            PlanV3ExactListItemShape::ExactListExactInt,
-            "optimizer v3 exact-list item {} has unsupported shape {:?}",
-            self.source,
-            self.shape
-        );
-        assert_eq!(
-            self.guard,
-            PlanV3ExactListItemGuardKind::ExactListExactCompactIntInBounds,
-            "optimizer v3 exact-list item {} has unsupported guard {:?}",
-            self.source,
-            self.guard
-        );
-        assert_eq!(
-            self.fallback,
-            PlanV3ExactListItemFallbackKind::OriginalItemAccess,
-            "optimizer v3 exact-list item {} has unsupported fallback {:?}",
-            self.source,
-            self.fallback
-        );
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct OptV3IndexedFieldAccessPlan {
     access: PlanV3IndexedFieldAccessKind,
-    owner_type: PlanV3IndexedFieldOwnerType,
-    attr_name: String,
-    expected_index: u32,
+    guard: MechanicalIndexedFieldGuard,
+    fallback: PlanV3IndexedFieldFallbackKind,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct OptV3ResolvedIndexedFieldAccess {
     access: PlanV3IndexedFieldAccessKind,
     attr_name: String,
+    guard: PlanV3IndexedFieldGuardKind,
+    fallback: PlanV3IndexedFieldFallbackKind,
     specialization: FieldIndexSpecialization,
 }
 
@@ -10193,48 +9375,81 @@ struct IndexedFieldLoweringPlan {
 }
 
 impl IndexedFieldLoweringPlan {
-    fn from_typed_guards(
+    fn for_access(
         instr_id: InstrId,
         source: TypedIndexedFieldPlanSource,
         guards: &[TypedIndexedFieldGuard],
         expected_access: PlanV3IndexedFieldAccessKind,
+        opt_v3_indexed_fields_by_instr: &HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>,
+    ) -> Result<Option<Self>, String> {
+        match source {
+            TypedIndexedFieldPlanSource::LegacyProfile => {
+                Self::from_legacy_typed_guards(guards, expected_access)
+            }
+            TypedIndexedFieldPlanSource::OptimizationPlanV3 => Self::from_prevalidated_v3_accesses(
+                instr_id,
+                expected_access,
+                opt_v3_indexed_fields_by_instr,
+            ),
+        }
+    }
+
+    fn from_legacy_typed_guards(
+        guards: &[TypedIndexedFieldGuard],
+        expected_access: PlanV3IndexedFieldAccessKind,
     ) -> Result<Option<Self>, String> {
         if guards.is_empty() {
-            if source == TypedIndexedFieldPlanSource::OptimizationPlanV3 {
-                return Err(format!(
-                    "optimizer v3 indexed-field {:?} for {instr_id} reached codegen without guards",
-                    expected_access
-                ));
-            }
             return Ok(None);
         }
 
         let mut specializations = Vec::with_capacity(guards.len());
         for guard in guards {
             let Some(specialization) = field_index_specialization_from_typed_guard(guard) else {
-                if source == TypedIndexedFieldPlanSource::OptimizationPlanV3 {
-                    return Err(format!(
-                        "optimizer v3 indexed-field {:?} for {instr_id} has unsupported owner type reference {:?}",
-                        expected_access, guard.owner_type_ref
-                    ));
-                }
                 continue;
             };
             push_unique_specialization(&mut specializations, specialization);
         }
 
         if specializations.is_empty() {
-            if source == TypedIndexedFieldPlanSource::OptimizationPlanV3 {
-                return Err(format!(
-                    "optimizer v3 indexed-field {:?} for {instr_id} has no codegen-resolvable guards",
-                    expected_access
-                ));
-            }
             return Ok(None);
         }
 
         Ok(Some(Self {
-            source,
+            source: TypedIndexedFieldPlanSource::LegacyProfile,
+            access: expected_access,
+            specializations,
+        }))
+    }
+
+    fn from_prevalidated_v3_accesses(
+        instr_id: InstrId,
+        expected_access: PlanV3IndexedFieldAccessKind,
+        opt_v3_indexed_fields_by_instr: &HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>,
+    ) -> Result<Option<Self>, String> {
+        let accesses = opt_v3_indexed_fields_by_instr.get(&instr_id).ok_or_else(|| {
+            format!(
+                "optimizer v3 indexed-field {:?} for {instr_id} lost its prevalidated codegen guard payload",
+                expected_access
+            )
+        })?;
+        let mut specializations = Vec::with_capacity(accesses.len());
+        for access in accesses {
+            if access.access != expected_access {
+                return Err(format!(
+                    "optimizer v3 indexed-field for {instr_id} was prevalidated as {:?}, but typed lowering requested {:?}",
+                    access.access, expected_access
+                ));
+            }
+            push_unique_specialization(&mut specializations, access.specialization.clone());
+        }
+        if specializations.is_empty() {
+            return Err(format!(
+                "optimizer v3 indexed-field {:?} for {instr_id} lost all prevalidated codegen guards",
+                expected_access
+            ));
+        }
+        Ok(Some(Self {
+            source: TypedIndexedFieldPlanSource::OptimizationPlanV3,
             access: expected_access,
             specializations,
         }))
@@ -10249,7 +9464,7 @@ impl IndexedFieldLoweringPlan {
         match owner_type {
             Some(owner_type) => Ok(Some(owner_type)),
             None if self.source == TypedIndexedFieldPlanSource::OptimizationPlanV3 => Err(format!(
-                "optimizer v3 indexed-field {:?} for {instr_id} could not bind owner type reference {:?}",
+                "prevalidated optimizer v3 indexed-field {:?} for {instr_id} could not bind runtime owner type reference {:?}",
                 self.access, specialization.owner_type_ref
             )),
             None => Ok(None),
@@ -10266,30 +9481,6 @@ struct OptV3IndexedGlobalAccessPlan {
     expected_index: u32,
     guard: PlanV3IndexedGlobalGuardKind,
     fallback: PlanV3IndexedGlobalFallbackKind,
-}
-
-impl OptV3IndexedGlobalAccessPlan {
-    fn expect_lowering_shape(&self, expected_access: PlanV3IndexedGlobalAccessKind) {
-        assert_eq!(
-            self.access, expected_access,
-            "optimizer v3 indexed-global {:?} reached {:?} lowering for {}",
-            self.access, expected_access, self.source
-        );
-        assert_eq!(
-            self.guard,
-            PlanV3IndexedGlobalGuardKind::ModuleDictKeyAtIndex,
-            "optimizer v3 indexed-global {} has unsupported guard {:?}",
-            self.source,
-            self.guard
-        );
-        assert_eq!(
-            self.fallback,
-            PlanV3IndexedGlobalFallbackKind::OriginalGlobalAccess,
-            "optimizer v3 indexed-global {} has unsupported fallback {:?}",
-            self.source,
-            self.fallback
-        );
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -13906,7 +13097,6 @@ pub(super) fn typed_constant_string_value<'a>(
 }
 
 fn annotate_typed_attr_accesses(
-    module: &BlockPyModule<CodegenModuleShape>,
     function: &mut BlockPyFunction<TypedCodegenModuleShape>,
     _field_index_specializations: &HashMap<String, Vec<FieldIndexSpecialization>>,
     field_index_specializations_by_instr: &HashMap<InstrId, Vec<FieldIndexSpecialization>>,
@@ -13914,12 +13104,10 @@ fn annotate_typed_attr_accesses(
     specialize_stores: bool,
 ) -> Result<usize, String> {
     struct Annotator<'a> {
-        module: &'a BlockPyModule<CodegenModuleShape>,
         field_index_specializations_by_instr: &'a HashMap<InstrId, Vec<FieldIndexSpecialization>>,
         opt_v3_indexed_fields_by_instr: &'a HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>,
         specialize_stores: bool,
         count: usize,
-        consumed_opt_v3_sources: HashSet<InstrId>,
         error: Option<String>,
     }
 
@@ -13944,39 +13132,12 @@ fn annotate_typed_attr_accesses(
                 })
         }
 
-        fn opt_v3_guards_for_attr(
-            &mut self,
-            instr_id: InstrId,
-            attr: &InstrTyped,
-            expected_access: PlanV3IndexedFieldAccessKind,
-        ) -> Option<TypedAttrAccessPlan> {
+        fn opt_v3_guards_for_attr(&mut self, instr_id: InstrId) -> Option<TypedAttrAccessPlan> {
             let accesses = self.opt_v3_indexed_fields_by_instr.get(&instr_id)?;
-            let Some(attr_name) = typed_constant_string_value(self.module, attr) else {
-                self.error = Some(format!(
-                    "optimizer v3 indexed-field emission for {instr_id} expected constant attribute {:?}, but typed attr is not a module string constant",
-                    accesses[0].attr_name
-                ));
-                return None;
-            };
             let mut guards = Vec::with_capacity(accesses.len());
             for access in accesses {
-                if access.access != expected_access {
-                    self.error = Some(format!(
-                        "optimizer v3 indexed-field emission for {instr_id} selected {:?}, but lowered instruction is {:?}",
-                        access.access, expected_access
-                    ));
-                    return None;
-                }
-                if access.attr_name != attr_name {
-                    self.error = Some(format!(
-                        "optimizer v3 indexed-field emission for {instr_id} selected attr {:?}, but lowered instruction uses attr {:?}",
-                        access.attr_name, attr_name
-                    ));
-                    return None;
-                }
                 guards.push(access.specialization.to_typed_guard());
             }
-            self.consumed_opt_v3_sources.insert(instr_id);
             Some(TypedAttrAccessPlan::IndexedField {
                 source: TypedIndexedFieldPlanSource::OptimizationPlanV3,
                 guards,
@@ -13987,10 +13148,10 @@ fn annotate_typed_attr_accesses(
             &mut self,
             instr_id: InstrId,
             attr: &InstrTyped,
-            expected_access: PlanV3IndexedFieldAccessKind,
+            _expected_access: PlanV3IndexedFieldAccessKind,
         ) -> Option<TypedAttrAccessPlan> {
             if self.opt_v3_indexed_fields_by_instr.contains_key(&instr_id) {
-                return self.opt_v3_guards_for_attr(instr_id, attr, expected_access);
+                return self.opt_v3_guards_for_attr(instr_id);
             }
             self.legacy_guards_for_attr(instr_id, attr)
         }
@@ -14039,12 +13200,10 @@ fn annotate_typed_attr_accesses(
     }
 
     let mut annotator = Annotator {
-        module,
         field_index_specializations_by_instr,
         opt_v3_indexed_fields_by_instr,
         specialize_stores,
         count: 0,
-        consumed_opt_v3_sources: HashSet::new(),
         error: None,
     };
     for block in &mut function.blocks {
@@ -14054,13 +13213,6 @@ fn annotate_typed_attr_accesses(
         annotator.visit_term_mut(&mut block.term);
         if let Some(error) = annotator.error.take() {
             return Err(error);
-        }
-    }
-    for instr_id in opt_v3_indexed_fields_by_instr.keys() {
-        if !annotator.consumed_opt_v3_sources.contains(instr_id) {
-            return Err(format!(
-                "optimizer v3 indexed-field emission for {instr_id} was not consumed by typed attr lowering"
-            ));
         }
     }
     Ok(annotator.count)
@@ -14282,30 +13434,6 @@ fn collect_call_direct_targets(
 
     let mut out = HashSet::new();
     let mut collector = CallDirectTargetCollector { out: &mut out };
-    collector.visit_fn(function);
-    out
-}
-
-fn collect_generic_call_instr_ids(
-    function: &BlockPyFunction<CodegenModuleShape>,
-) -> HashSet<InstrId> {
-    struct GenericCallInstrIdCollector<'a> {
-        out: &'a mut HashSet<InstrId>,
-    }
-
-    impl Visit<InstrCodegen> for GenericCallInstrIdCollector<'_> {
-        fn visit_instr(&mut self, expr: &InstrCodegen) {
-            if let InstrCodegen::Call(call) = expr
-                && let Some(instr_id) = call.try_semantic_instr_id()
-            {
-                self.out.insert(instr_id);
-            }
-            expr.visit_children(self);
-        }
-    }
-
-    let mut out = HashSet::new();
-    let mut collector = GenericCallInstrIdCollector { out: &mut out };
     collector.visit_fn(function);
     out
 }
@@ -14552,22 +13680,6 @@ fn opt_v3_inline_direct_call_targets(
         .collect()
 }
 
-fn opt_v3_direct_call_body_targets(
-    direct_calls_by_source: &HashMap<InstrId, Vec<OptV3DirectCallPlan>>,
-) -> HashMap<InstrId, Vec<RuntimeFunctionId>> {
-    direct_calls_by_source
-        .iter()
-        .filter_map(|(source, direct_calls)| {
-            let targets = direct_calls
-                .iter()
-                .filter(|direct_call| direct_call.body.kind == PlanV3CallBodyKind::DirectCall)
-                .map(|direct_call| direct_call.target)
-                .collect::<Vec<_>>();
-            (!targets.is_empty()).then_some((*source, targets))
-        })
-        .collect()
-}
-
 fn opt_v3_direct_call_body_plans(
     direct_calls_by_source: &HashMap<InstrId, Vec<OptV3DirectCallPlan>>,
 ) -> HashMap<InstrId, Vec<OptV3DirectCallPlan>> {
@@ -14610,42 +13722,6 @@ fn opt_v3_constructor_call_targets(
         .collect()
 }
 
-fn opt_v3_direct_constructor_call_body_targets(
-    constructor_calls_by_source: &HashMap<InstrId, Vec<OptV3ConstructorCallPlan>>,
-) -> HashMap<InstrId, Vec<RuntimeFunctionId>> {
-    constructor_calls_by_source
-        .iter()
-        .filter_map(|(source, constructor_calls)| {
-            let targets = constructor_calls
-                .iter()
-                .filter(|constructor_call| {
-                    constructor_call.body.kind == PlanV3CallBodyKind::DirectCall
-                })
-                .map(|constructor_call| constructor_call.target)
-                .collect::<Vec<_>>();
-            (!targets.is_empty()).then_some((*source, targets))
-        })
-        .collect()
-}
-
-fn opt_v3_direct_constructor_call_body_plans(
-    constructor_calls_by_source: &HashMap<InstrId, Vec<OptV3ConstructorCallPlan>>,
-) -> HashMap<InstrId, Vec<OptV3ConstructorCallPlan>> {
-    constructor_calls_by_source
-        .iter()
-        .filter_map(|(source, constructor_calls)| {
-            let plans = constructor_calls
-                .iter()
-                .filter(|constructor_call| {
-                    constructor_call.body.kind == PlanV3CallBodyKind::DirectCall
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            (!plans.is_empty()).then_some((*source, plans))
-        })
-        .collect()
-}
-
 fn opt_v3_method_call_targets(
     method_calls_by_source: &HashMap<InstrId, Vec<OptV3MethodCallPlan>>,
 ) -> HashMap<InstrId, Vec<RuntimeFunctionId>> {
@@ -14675,38 +13751,6 @@ fn opt_v3_inline_method_call_targets(
                 .map(|method_call| method_call.target)
                 .collect::<Vec<_>>();
             (!targets.is_empty()).then_some((*source, targets))
-        })
-        .collect()
-}
-
-fn opt_v3_direct_method_call_body_targets(
-    method_calls_by_source: &HashMap<InstrId, Vec<OptV3MethodCallPlan>>,
-) -> HashMap<InstrId, Vec<RuntimeFunctionId>> {
-    method_calls_by_source
-        .iter()
-        .filter_map(|(source, method_calls)| {
-            let targets = method_calls
-                .iter()
-                .filter(|method_call| method_call.body.kind == PlanV3CallBodyKind::DirectCall)
-                .map(|method_call| method_call.target)
-                .collect::<Vec<_>>();
-            (!targets.is_empty()).then_some((*source, targets))
-        })
-        .collect()
-}
-
-fn opt_v3_direct_method_call_body_plans(
-    method_calls_by_source: &HashMap<InstrId, Vec<OptV3MethodCallPlan>>,
-) -> HashMap<InstrId, Vec<OptV3MethodCallPlan>> {
-    method_calls_by_source
-        .iter()
-        .filter_map(|(source, method_calls)| {
-            let plans = method_calls
-                .iter()
-                .filter(|method_call| method_call.body.kind == PlanV3CallBodyKind::DirectCall)
-                .cloned()
-                .collect::<Vec<_>>();
-            (!plans.is_empty()).then_some((*source, plans))
         })
         .collect()
 }
@@ -14863,12 +13907,13 @@ fn load_planned_optimization_inputs_for_runtime_state(
             }
             let artifacts =
                 load_optimization_artifacts_v3(path.as_path()).map_err(|err| err.to_string())?;
-            validate_opt_v3_artifacts_for_module(
+            validate_optimization_artifacts_v3_for_module(
                 &artifacts,
                 shared_state.module_name.as_str(),
                 shared_state.source_hash,
                 cache_identity.as_str(),
-            )?;
+            )
+            .map_err(|err| err.to_string())?;
             return planned_optimization_inputs_from_v3_artifacts(
                 &artifacts,
                 shared_state,
@@ -14921,62 +13966,6 @@ fn load_planned_optimization_inputs_for_runtime_state(
     Ok(PlannedOptimizationInputs::default())
 }
 
-fn validate_opt_v3_artifacts_for_module(
-    artifacts: &ExactIntBranchV3Artifacts,
-    module_name: &str,
-    source_hash: u64,
-    cache_identity: &str,
-) -> Result<(), String> {
-    if artifacts.plan.module.module_name != module_name {
-        return Err(format!(
-            "optimization plan v3 module name is {}, expected {module_name}",
-            artifacts.plan.module.module_name
-        ));
-    }
-    if artifacts.plan.module.source_hash != source_hash {
-        return Err(format!(
-            "optimization plan v3 source hash for module {module_name} is 0x{:016x}, expected 0x{source_hash:016x}",
-            artifacts.plan.module.source_hash
-        ));
-    }
-    if artifacts.plan.module.cache_identity != cache_identity {
-        return Err(format!(
-            "optimization plan v3 cache identity for module {module_name} is {}, expected {cache_identity}",
-            artifacts.plan.module.cache_identity
-        ));
-    }
-    let current_identity = artifacts
-        .plan
-        .identity_tables
-        .module(SerializedModuleId::new(0))
-        .map_err(|err| format!("optimization plan v3 identity table: {err}"))?;
-    if current_identity.module_name != module_name {
-        return Err(format!(
-            "optimization plan v3 identity table module 0 is {}, expected {module_name}",
-            current_identity.module_name
-        ));
-    }
-    if current_identity.source_hash != source_hash {
-        return Err(format!(
-            "optimization plan v3 identity table source hash for module 0 is 0x{:016x}, expected 0x{source_hash:016x}",
-            current_identity.source_hash
-        ));
-    }
-    if current_identity.cache_identity.as_deref() != Some(cache_identity) {
-        return Err(format!(
-            "optimization plan v3 identity table cache identity for module 0 is {:?}, expected {cache_identity}",
-            current_identity.cache_identity
-        ));
-    }
-    if artifacts.emission.module_name != module_name {
-        return Err(format!(
-            "optimization plan v3 emission module name is {}, expected {module_name}",
-            artifacts.emission.module_name
-        ));
-    }
-    Ok(())
-}
-
 fn planned_optimization_inputs_from_v3_artifacts(
     artifacts: &ExactIntBranchV3Artifacts,
     shared_state: &SharedModuleState,
@@ -14989,7 +13978,7 @@ fn planned_optimization_inputs_from_v3_artifacts(
             RuntimeModuleId::new(shared_state.module_id()),
             local_function_id,
         );
-        let current_function = shared_state
+        shared_state
             .lookup_function(current_function_id)
             .ok_or_else(|| {
                 format!(
@@ -15008,10 +13997,6 @@ fn planned_optimization_inputs_from_v3_artifacts(
         else {
             continue;
         };
-        validate_opt_v3_codegen_artifacts_for_function(
-            current_function,
-            Some(&function_artifacts),
-        )?;
         if let Some(direct_calls) =
             opt_v3_emitted_direct_calls_for_function(&function_artifacts, |target| {
                 resolve_opt_v3_runtime_function_target(shared_state, compile_session, target)
@@ -15039,24 +14024,20 @@ fn planned_optimization_inputs_from_v3_artifacts(
                 .opt_v3_emitted_method_calls
                 .insert(current_function_id, method_calls);
         }
-        if let Some(items) =
-            opt_v3_emitted_exact_list_items_for_function(&function_artifacts, current_function)?
-        {
+        if let Some(items) = opt_v3_emitted_exact_list_items_for_function(&function_artifacts)? {
             inputs
                 .opt_v3_emitted_exact_list_items
                 .insert(current_function_id, items);
         }
-        if let Some(indexed_fields) = opt_v3_emitted_indexed_fields_for_function(
-            &function_artifacts,
-            &shared_state.lowered_module,
-            current_function,
-        )? {
+        if let Some(indexed_fields) =
+            opt_v3_emitted_indexed_fields_for_function(&function_artifacts)?
+        {
             inputs
                 .opt_v3_emitted_indexed_fields
                 .insert(current_function_id, indexed_fields);
         }
         if let Some(indexed_globals) =
-            opt_v3_emitted_indexed_globals_for_function(&function_artifacts, current_function)?
+            opt_v3_emitted_indexed_globals_for_function(&function_artifacts)?
         {
             inputs
                 .opt_v3_emitted_indexed_globals
@@ -15081,7 +14062,7 @@ fn planned_optimization_inputs_from_v3_artifacts_for_codegen_module(
     for planned_function in &artifacts.plan.functions {
         let local_function_id = planned_function.function.function.local_function_id();
         let current_function_id = RuntimeFunctionId::new(module_id, local_function_id);
-        let current_function = module
+        module
             .callable_defs
             .iter()
             .find(|function| function.function_id == current_function_id)
@@ -15102,10 +14083,6 @@ fn planned_optimization_inputs_from_v3_artifacts_for_codegen_module(
         else {
             continue;
         };
-        validate_opt_v3_codegen_artifacts_for_function(
-            current_function,
-            Some(&function_artifacts),
-        )?;
         if let Some(direct_calls) =
             opt_v3_emitted_direct_calls_for_function(&function_artifacts, |target| {
                 resolve_opt_v3_codegen_module_function_target(
@@ -15154,24 +14131,20 @@ fn planned_optimization_inputs_from_v3_artifacts_for_codegen_module(
                 .opt_v3_emitted_method_calls
                 .insert(current_function_id, method_calls);
         }
-        if let Some(items) =
-            opt_v3_emitted_exact_list_items_for_function(&function_artifacts, current_function)?
-        {
+        if let Some(items) = opt_v3_emitted_exact_list_items_for_function(&function_artifacts)? {
             inputs
                 .opt_v3_emitted_exact_list_items
                 .insert(current_function_id, items);
         }
-        if let Some(indexed_fields) = opt_v3_emitted_indexed_fields_for_function(
-            &function_artifacts,
-            module,
-            current_function,
-        )? {
+        if let Some(indexed_fields) =
+            opt_v3_emitted_indexed_fields_for_function(&function_artifacts)?
+        {
             inputs
                 .opt_v3_emitted_indexed_fields
                 .insert(current_function_id, indexed_fields);
         }
         if let Some(indexed_globals) =
-            opt_v3_emitted_indexed_globals_for_function(&function_artifacts, current_function)?
+            opt_v3_emitted_indexed_globals_for_function(&function_artifacts)?
         {
             inputs
                 .opt_v3_emitted_indexed_globals
@@ -15186,22 +14159,14 @@ fn planned_optimization_inputs_from_v3_artifacts_for_codegen_module(
 
 fn opt_v3_emitted_indexed_fields_for_function(
     artifacts: &ExactIntBranchV3Artifacts,
-    module: &BlockPyModule<CodegenModuleShape>,
-    function: &BlockPyFunction<CodegenModuleShape>,
 ) -> Result<Option<HashMap<InstrId, Vec<OptV3IndexedFieldAccessPlan>>>, String> {
     let emitted_function = &artifacts.emission.functions[0];
     if emitted_function.indexed_fields.is_empty() {
         return Ok(None);
     }
 
-    let lowered_accesses = lowered_field_accesses_by_instr(module, function)?;
     let mut by_source = HashMap::<InstrId, Vec<OptV3IndexedFieldAccessPlan>>::new();
     for indexed_field in &emitted_function.indexed_fields {
-        validate_opt_v3_indexed_field_emission_for_lowered_function(
-            indexed_field,
-            function,
-            &lowered_accesses,
-        )?;
         let access = opt_v3_indexed_field_access_plan_from_emission(indexed_field);
         let entry = by_source.entry(indexed_field.source).or_default();
         if !entry.contains(&access) {
@@ -15216,240 +14181,25 @@ fn opt_v3_indexed_field_access_plan_from_emission(
 ) -> OptV3IndexedFieldAccessPlan {
     OptV3IndexedFieldAccessPlan {
         access: indexed_field.access,
-        owner_type: indexed_field.owner_type.clone(),
-        attr_name: indexed_field.attr_name.clone(),
-        expected_index: indexed_field.expected_index,
+        guard: indexed_field.guard.clone(),
+        fallback: indexed_field.fallback.kind,
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct LoweredFieldAccess {
-    access: PlanV3IndexedFieldAccessKind,
-    attr_name: String,
-}
-
-fn lowered_field_accesses_by_instr(
-    module: &BlockPyModule<CodegenModuleShape>,
-    function: &BlockPyFunction<CodegenModuleShape>,
-) -> Result<HashMap<InstrId, LoweredFieldAccess>, String> {
-    struct Collector<'a> {
-        module: &'a BlockPyModule<CodegenModuleShape>,
-        accesses: HashMap<InstrId, LoweredFieldAccess>,
-        error: Option<String>,
-    }
-
-    impl Collector<'_> {
-        fn attr_name_for_source(&mut self, source: InstrId, attr: &InstrCodegen) -> Option<String> {
-            match codegen_constant_string_value(self.module, attr) {
-                Some(attr_name) => Some(attr_name.to_string()),
-                None => {
-                    self.error = Some(format!(
-                        "optimizer v3 indexed-field source {source} expected constant attribute, but lowered attr is not a module string constant"
-                    ));
-                    None
-                }
-            }
-        }
-    }
-
-    impl Visit<InstrCodegen> for Collector<'_> {
-        fn visit_instr(&mut self, expr: &InstrCodegen)
-        where
-            InstrCodegen: ChildVisitable<InstrCodegen>,
-        {
-            if self.error.is_some() {
-                return;
-            }
-            match expr {
-                InstrCodegen::GetAttr(op) => {
-                    let source = op.semantic_instr_id();
-                    if let Some(attr_name) = self.attr_name_for_source(source, op.attr.as_ref()) {
-                        self.accesses.insert(
-                            source,
-                            LoweredFieldAccess {
-                                access: PlanV3IndexedFieldAccessKind::Load,
-                                attr_name,
-                            },
-                        );
-                    }
-                }
-                InstrCodegen::SetAttr(op) => {
-                    let source = op.semantic_instr_id();
-                    if let Some(attr_name) = self.attr_name_for_source(source, op.attr.as_ref()) {
-                        self.accesses.insert(
-                            source,
-                            LoweredFieldAccess {
-                                access: PlanV3IndexedFieldAccessKind::Store,
-                                attr_name,
-                            },
-                        );
-                    }
-                }
-                _ => {}
-            }
-            expr.visit_children(self);
-        }
-    }
-
-    let mut collector = Collector {
-        module,
-        accesses: HashMap::new(),
-        error: None,
-    };
-    collector.visit_fn(function);
-    if let Some(error) = collector.error {
-        return Err(error);
-    }
-    Ok(collector.accesses)
-}
-
-fn validate_opt_v3_indexed_field_emission_for_lowered_function(
-    emitted: &MechanicalIndexedFieldEmission,
-    function: &BlockPyFunction<CodegenModuleShape>,
-    lowered_accesses: &HashMap<InstrId, LoweredFieldAccess>,
-) -> Result<(), String> {
-    let Some(lowered) = lowered_accesses.get(&emitted.source) else {
-        return Err(format!(
-            "optimizer v3 emitted indexed-field {:?} {} at {}, but function {} ({}) has no lowered GetAttr/SetAttr with that source",
-            emitted.access,
-            emitted.attr_name,
-            emitted.source,
-            function.function_id,
-            function.names.qualname
-        ));
-    };
-    if lowered.access != emitted.access {
-        return Err(format!(
-            "optimizer v3 emitted indexed-field {:?} for {}, but lowered instruction is {:?}",
-            emitted.access, emitted.source, lowered.access
-        ));
-    }
-    if lowered.attr_name != emitted.attr_name {
-        return Err(format!(
-            "optimizer v3 emitted indexed-field attr {:?} for {}, but lowered instruction uses {:?}",
-            emitted.attr_name, emitted.source, lowered.attr_name
-        ));
-    }
-    Ok(())
 }
 
 fn opt_v3_emitted_exact_list_items_for_function(
     artifacts: &ExactIntBranchV3Artifacts,
-    function: &BlockPyFunction<CodegenModuleShape>,
 ) -> Result<Option<HashMap<InstrId, OptV3ExactListItemAccessPlan>>, String> {
     let emitted_function = &artifacts.emission.functions[0];
     if emitted_function.exact_list_items.is_empty() {
         return Ok(None);
     }
 
-    let lowered_accesses = lowered_item_accesses_by_instr(function);
     let mut by_source = HashMap::<InstrId, OptV3ExactListItemAccessPlan>::new();
     for item in &emitted_function.exact_list_items {
-        validate_opt_v3_exact_list_item_emission_for_lowered_function(
-            item,
-            function,
-            &lowered_accesses,
-        )?;
         let access = opt_v3_exact_list_item_access_plan_from_emission(item);
-        if let Some(previous) = by_source.insert(item.source, access.clone())
-            && previous != access
-        {
-            return Err(format!(
-                "optimizer v3 emitted multiple exact-list item plans for {}",
-                item.source
-            ));
-        }
+        by_source.insert(item.source, access);
     }
     Ok(Some(by_source))
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct LoweredItemAccess {
-    access: PlanV3ExactListItemAccessKind,
-}
-
-fn lowered_item_accesses_by_instr(
-    function: &BlockPyFunction<CodegenModuleShape>,
-) -> HashMap<InstrId, LoweredItemAccess> {
-    struct Collector {
-        accesses: HashMap<InstrId, LoweredItemAccess>,
-    }
-
-    impl Visit<InstrCodegen> for Collector {
-        fn visit_instr(&mut self, expr: &InstrCodegen)
-        where
-            InstrCodegen: ChildVisitable<InstrCodegen>,
-        {
-            match expr {
-                InstrCodegen::GetItem(op) => {
-                    self.accesses.insert(
-                        op.semantic_instr_id(),
-                        LoweredItemAccess {
-                            access: PlanV3ExactListItemAccessKind::Get,
-                        },
-                    );
-                }
-                InstrCodegen::SetItem(op) => {
-                    self.accesses.insert(
-                        op.semantic_instr_id(),
-                        LoweredItemAccess {
-                            access: PlanV3ExactListItemAccessKind::Set,
-                        },
-                    );
-                }
-                _ => {}
-            }
-            expr.visit_children(self);
-        }
-    }
-
-    let mut collector = Collector {
-        accesses: HashMap::new(),
-    };
-    collector.visit_fn(function);
-    collector.accesses
-}
-
-fn validate_opt_v3_exact_list_item_emission_for_lowered_function(
-    emitted: &MechanicalExactListItemEmission,
-    function: &BlockPyFunction<CodegenModuleShape>,
-    lowered_accesses: &HashMap<InstrId, LoweredItemAccess>,
-) -> Result<(), String> {
-    let Some(lowered) = lowered_accesses.get(&emitted.source) else {
-        return Err(format!(
-            "optimizer v3 emitted exact-list item {:?} {:?} at {}, but function {} ({}) has no lowered getitem/setitem with that source",
-            emitted.access,
-            emitted.shape,
-            emitted.source,
-            function.function_id,
-            function.names.qualname
-        ));
-    };
-    if lowered.access != emitted.access {
-        return Err(format!(
-            "optimizer v3 emitted exact-list item {:?} for {}, but lowered instruction is {:?}",
-            emitted.access, emitted.source, lowered.access
-        ));
-    }
-    if emitted.shape != PlanV3ExactListItemShape::ExactListExactInt {
-        return Err(format!(
-            "optimizer v3 emitted exact-list item shape {:?} for {}, but codegen only supports ExactListExactInt",
-            emitted.shape, emitted.source
-        ));
-    }
-    if emitted.guard.kind != PlanV3ExactListItemGuardKind::ExactListExactCompactIntInBounds {
-        return Err(format!(
-            "optimizer v3 emitted exact-list item guard {:?} for {}, but codegen only supports ExactListExactCompactIntInBounds",
-            emitted.guard.kind, emitted.source
-        ));
-    }
-    if emitted.fallback.kind != PlanV3ExactListItemFallbackKind::OriginalItemAccess {
-        return Err(format!(
-            "optimizer v3 emitted exact-list item fallback {:?} for {}, but codegen only supports OriginalItemAccess",
-            emitted.fallback.kind, emitted.source
-        ));
-    }
-    Ok(())
 }
 
 fn opt_v3_exact_list_item_access_plan_from_emission(
@@ -15466,154 +14216,18 @@ fn opt_v3_exact_list_item_access_plan_from_emission(
 
 fn opt_v3_emitted_indexed_globals_for_function(
     artifacts: &ExactIntBranchV3Artifacts,
-    function: &BlockPyFunction<CodegenModuleShape>,
 ) -> Result<Option<HashMap<InstrId, OptV3IndexedGlobalAccessPlan>>, String> {
     let emitted_function = &artifacts.emission.functions[0];
     if emitted_function.indexed_globals.is_empty() {
         return Ok(None);
     }
 
-    let lowered_accesses = lowered_global_accesses_by_instr(function);
     let mut by_source = HashMap::<InstrId, OptV3IndexedGlobalAccessPlan>::new();
     for indexed_global in &emitted_function.indexed_globals {
-        if indexed_global.module_name != artifacts.plan.module.module_name {
-            return Err(format!(
-                "optimizer v3 emitted indexed-global module {} for {}, expected {}",
-                indexed_global.module_name,
-                indexed_global.source,
-                artifacts.plan.module.module_name
-            ));
-        }
-        validate_opt_v3_indexed_global_emission_for_lowered_function(
-            indexed_global,
-            function,
-            &lowered_accesses,
-        )?;
         let access = opt_v3_indexed_global_access_plan_from_emission(indexed_global);
-        if let Some(previous) = by_source.insert(indexed_global.source, access.clone())
-            && previous != access
-        {
-            return Err(format!(
-                "optimizer v3 emitted multiple indexed-global plans for {}",
-                indexed_global.source
-            ));
-        }
+        by_source.insert(indexed_global.source, access);
     }
     Ok(Some(by_source))
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct LoweredGlobalAccess {
-    access: PlanV3IndexedGlobalAccessKind,
-    name: String,
-    slot: u32,
-}
-
-fn lowered_global_accesses_by_instr(
-    function: &BlockPyFunction<CodegenModuleShape>,
-) -> HashMap<InstrId, LoweredGlobalAccess> {
-    struct Collector {
-        accesses: HashMap<InstrId, LoweredGlobalAccess>,
-    }
-
-    impl Visit<InstrCodegen> for Collector {
-        fn visit_instr(&mut self, expr: &InstrCodegen)
-        where
-            InstrCodegen: ChildVisitable<InstrCodegen>,
-        {
-            match expr {
-                InstrCodegen::Load(op) => {
-                    if let NameLocation::Global(slot) = op.name.location {
-                        let Some(source) = op.try_semantic_instr_id() else {
-                            expr.visit_children(self);
-                            return;
-                        };
-                        self.accesses.insert(
-                            source,
-                            LoweredGlobalAccess {
-                                access: PlanV3IndexedGlobalAccessKind::Load,
-                                name: op.name.id_str().to_string(),
-                                slot: slot.slot(),
-                            },
-                        );
-                    }
-                }
-                InstrCodegen::Store(op) => {
-                    if let NameLocation::Global(slot) = op.name.location {
-                        let Some(source) = op.try_semantic_instr_id() else {
-                            expr.visit_children(self);
-                            return;
-                        };
-                        self.accesses.insert(
-                            source,
-                            LoweredGlobalAccess {
-                                access: PlanV3IndexedGlobalAccessKind::Store,
-                                name: op.name.id_str().to_string(),
-                                slot: slot.slot(),
-                            },
-                        );
-                    }
-                }
-                _ => {}
-            }
-            expr.visit_children(self);
-        }
-    }
-
-    let mut collector = Collector {
-        accesses: HashMap::new(),
-    };
-    collector.visit_fn(function);
-    collector.accesses
-}
-
-fn validate_opt_v3_indexed_global_emission_for_lowered_function(
-    emitted: &MechanicalIndexedGlobalEmission,
-    function: &BlockPyFunction<CodegenModuleShape>,
-    lowered_accesses: &HashMap<InstrId, LoweredGlobalAccess>,
-) -> Result<(), String> {
-    let Some(lowered) = lowered_accesses.get(&emitted.source) else {
-        return Err(format!(
-            "optimizer v3 emitted indexed-global {:?} {}.{} at {}, but function {} ({}) has no lowered global load/store with that source",
-            emitted.access,
-            emitted.module_name,
-            emitted.name,
-            emitted.source,
-            function.function_id,
-            function.names.qualname
-        ));
-    };
-    if lowered.access != emitted.access {
-        return Err(format!(
-            "optimizer v3 emitted indexed-global {:?} for {}, but lowered instruction is {:?}",
-            emitted.access, emitted.source, lowered.access
-        ));
-    }
-    if lowered.name != emitted.name {
-        return Err(format!(
-            "optimizer v3 emitted indexed-global name {:?} for {}, but lowered instruction uses {:?}",
-            emitted.name, emitted.source, lowered.name
-        ));
-    }
-    if lowered.slot != emitted.expected_index {
-        return Err(format!(
-            "optimizer v3 emitted indexed-global slot {} for {}, but lowered instruction uses global slot {}",
-            emitted.expected_index, emitted.source, lowered.slot
-        ));
-    }
-    if emitted.guard.kind != PlanV3IndexedGlobalGuardKind::ModuleDictKeyAtIndex {
-        return Err(format!(
-            "optimizer v3 emitted indexed-global guard {:?} for {}, but codegen only supports ModuleDictKeyAtIndex",
-            emitted.guard.kind, emitted.source
-        ));
-    }
-    if emitted.fallback.kind != PlanV3IndexedGlobalFallbackKind::OriginalGlobalAccess {
-        return Err(format!(
-            "optimizer v3 emitted indexed-global fallback {:?} for {}, but codegen only supports OriginalGlobalAccess",
-            emitted.fallback.kind, emitted.source
-        ));
-    }
-    Ok(())
 }
 
 fn opt_v3_indexed_global_access_plan_from_emission(
@@ -15844,38 +14458,7 @@ fn opt_v3_single_function_artifacts(
     artifacts: &ExactIntBranchV3Artifacts,
     function: SerializedFunctionId,
 ) -> Result<Option<ExactIntBranchV3Artifacts>, String> {
-    let Some(planned_function) = artifacts
-        .plan
-        .functions
-        .iter()
-        .find(|planned| planned.function.function == function)
-    else {
-        return Ok(None);
-    };
-    let emitted_function = artifacts
-        .emission
-        .functions
-        .iter()
-        .find(|emitted| emitted.function == function)
-        .ok_or_else(|| {
-            format!(
-                "optimization plan v3 has planned function {} without matching mechanical emission",
-                function
-            )
-        })?;
-    Ok(Some(ExactIntBranchV3Artifacts {
-        plan: ModuleOptimizationPlanV3 {
-            module: artifacts.plan.module.clone(),
-            identity_tables: artifacts.plan.identity_tables.clone(),
-            helper_catalog_version: artifacts.plan.helper_catalog_version,
-            cost_model_version: artifacts.plan.cost_model_version,
-            functions: vec![planned_function.clone()],
-        },
-        emission: MechanicalModuleEmission {
-            module_name: artifacts.emission.module_name.clone(),
-            functions: vec![emitted_function.clone()],
-        },
-    }))
+    single_function_optimization_artifacts_v3(artifacts, function).map_err(|err| err.to_string())
 }
 
 #[cfg(test)]
@@ -16083,12 +14666,13 @@ fn planned_optimization_inputs_for_precompile(
     if plan_mode.allows_v3() {
         if let Some(path) = plan_input.v3_path.filter(|path| path.exists()) {
             let artifacts = load_optimization_artifacts_v3(path).map_err(|err| err.to_string())?;
-            validate_opt_v3_artifacts_for_module(
+            validate_optimization_artifacts_v3_for_module(
                 &artifacts,
                 module_name,
                 source_hash,
                 plan_input.cache_identity,
-            )?;
+            )
+            .map_err(|err| err.to_string())?;
             return planned_optimization_inputs_from_v3_artifacts_for_codegen_module(
                 &artifacts,
                 module,
@@ -16162,307 +14746,6 @@ fn function_profile_evidence_is_empty(evidence: &FunctionProfileEvidence) -> boo
         && evidence.branch_prefer_true.is_empty()
 }
 
-fn validate_opt_v3_codegen_artifacts_for_function(
-    function: &BlockPyFunction<CodegenModuleShape>,
-    artifacts: Option<&ExactIntBranchV3Artifacts>,
-) -> Result<(), String> {
-    let Some(artifacts) = artifacts else {
-        return Ok(());
-    };
-    if artifacts.plan.functions.len() != 1 {
-        return Err(format!(
-            "optimizer v3 artifacts for function {} ({}) contain {} planned functions",
-            function.function_id,
-            function.names.qualname,
-            artifacts.plan.functions.len()
-        ));
-    }
-    if artifacts.emission.functions.len() != 1 {
-        return Err(format!(
-            "optimizer v3 emission for function {} ({}) contains {} emitted functions",
-            function.function_id,
-            function.names.qualname,
-            artifacts.emission.functions.len()
-        ));
-    }
-    let planned_function = artifacts.plan.functions[0].function.function;
-    let emitted_function = artifacts.emission.functions[0].function;
-    if planned_function != emitted_function {
-        return Err(format!(
-            "optimizer v3 artifacts for function {} ({}) mismatch planned function {} and emitted function {}",
-            function.function_id, function.names.qualname, planned_function, emitted_function
-        ));
-    }
-    if planned_function.local_function_id() != function.function_id.local_function_id() {
-        return Err(format!(
-            "optimizer v3 artifacts for function {} ({}) target local function {}, expected {}",
-            function.function_id,
-            function.names.qualname,
-            planned_function.local_function_id(),
-            function.function_id.local_function_id()
-        ));
-    }
-    validate_opt_v3_direct_call_emission_matches_plan(
-        &artifacts.plan.functions[0],
-        &artifacts.emission.functions[0],
-    )?;
-    validate_opt_v3_constructor_call_emission_matches_plan(
-        &artifacts.plan.functions[0],
-        &artifacts.emission.functions[0],
-    )?;
-    validate_opt_v3_method_call_emission_matches_plan(
-        &artifacts.plan.functions[0],
-        &artifacts.emission.functions[0],
-    )?;
-    validate_opt_v3_exact_list_item_emission_matches_plan(
-        &artifacts.plan.functions[0],
-        &artifacts.emission.functions[0],
-    )?;
-    validate_opt_v3_indexed_field_emission_matches_plan(
-        &artifacts.plan.functions[0],
-        &artifacts.emission.functions[0],
-    )?;
-    validate_opt_v3_indexed_global_emission_matches_plan(
-        &artifacts.plan.functions[0],
-        &artifacts.emission.functions[0],
-    )?;
-    Ok(())
-}
-
-fn validate_opt_v3_direct_call_emission_matches_plan(
-    planned_function: &FunctionOptimizationPlanV3,
-    emitted_function: &MechanicalFunctionEmission,
-) -> Result<(), String> {
-    if planned_function.direct_calls.len() != emitted_function.direct_calls.len() {
-        return Err(format!(
-            "optimizer v3 artifacts for function {} contain {} planned direct calls but {} emitted direct calls",
-            planned_function.function.function,
-            planned_function.direct_calls.len(),
-            emitted_function.direct_calls.len()
-        ));
-    }
-    for (index, (planned, emitted)) in planned_function
-        .direct_calls
-        .iter()
-        .zip(emitted_function.direct_calls.iter())
-        .enumerate()
-    {
-        if planned.source != emitted.source
-            || planned.target != emitted.target
-            || planned.arg_plan != emitted.arg_plan
-            || planned.body != emitted.body
-            || planned.reason != emitted.reason
-        {
-            return Err(format!(
-                "optimizer v3 emitted direct-call #{index} for function {} does not match the selected plan",
-                planned_function.function.function
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn validate_opt_v3_constructor_call_emission_matches_plan(
-    planned_function: &FunctionOptimizationPlanV3,
-    emitted_function: &MechanicalFunctionEmission,
-) -> Result<(), String> {
-    if planned_function.constructor_calls.len() != emitted_function.constructor_calls.len() {
-        return Err(format!(
-            "optimizer v3 artifacts for function {} contain {} planned constructor calls but {} emitted constructor calls",
-            planned_function.function.function,
-            planned_function.constructor_calls.len(),
-            emitted_function.constructor_calls.len()
-        ));
-    }
-    for (index, (planned, emitted)) in planned_function
-        .constructor_calls
-        .iter()
-        .zip(emitted_function.constructor_calls.iter())
-        .enumerate()
-    {
-        if !opt_v3_constructor_call_emission_matches_plan(planned, emitted) {
-            return Err(format!(
-                "optimizer v3 emitted constructor-call #{index} for function {} does not match the selected plan",
-                planned_function.function.function
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn opt_v3_constructor_call_emission_matches_plan(
-    planned: &PlanV3ConstructorCallSpecializationPlan,
-    emitted: &MechanicalConstructorCallEmission,
-) -> bool {
-    planned.source == emitted.source
-        && planned.target == emitted.target
-        && planned.owner_type == emitted.owner_type
-        && planned.arg_plan == emitted.arg_plan
-        && planned.guard == emitted.guard
-        && planned.fallback == emitted.fallback
-        && planned.body == emitted.body
-        && planned.reason == emitted.reason
-}
-
-fn validate_opt_v3_method_call_emission_matches_plan(
-    planned_function: &FunctionOptimizationPlanV3,
-    emitted_function: &MechanicalFunctionEmission,
-) -> Result<(), String> {
-    if planned_function.method_calls.len() != emitted_function.method_calls.len() {
-        return Err(format!(
-            "optimizer v3 artifacts for function {} contain {} planned method calls but {} emitted method calls",
-            planned_function.function.function,
-            planned_function.method_calls.len(),
-            emitted_function.method_calls.len()
-        ));
-    }
-    for (index, (planned, emitted)) in planned_function
-        .method_calls
-        .iter()
-        .zip(emitted_function.method_calls.iter())
-        .enumerate()
-    {
-        if !opt_v3_method_call_emission_matches_plan(planned, emitted) {
-            return Err(format!(
-                "optimizer v3 emitted method-call #{index} for function {} does not match the selected plan",
-                planned_function.function.function
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn opt_v3_method_call_emission_matches_plan(
-    planned: &PlanV3MethodCallSpecializationPlan,
-    emitted: &MechanicalMethodCallEmission,
-) -> bool {
-    planned.source == emitted.source
-        && planned.target == emitted.target
-        && planned.method_name == emitted.method_name
-        && planned.owner_type == emitted.owner_type
-        && planned.arg_plan == emitted.arg_plan
-        && planned.guard == emitted.guard
-        && planned.fallback == emitted.fallback
-        && planned.body == emitted.body
-        && planned.reason == emitted.reason
-}
-
-fn validate_opt_v3_exact_list_item_emission_matches_plan(
-    planned_function: &FunctionOptimizationPlanV3,
-    emitted_function: &MechanicalFunctionEmission,
-) -> Result<(), String> {
-    if planned_function.exact_list_items.len() != emitted_function.exact_list_items.len() {
-        return Err(format!(
-            "optimizer v3 artifacts for function {} contain {} planned exact-list items but {} emitted exact-list items",
-            planned_function.function.function,
-            planned_function.exact_list_items.len(),
-            emitted_function.exact_list_items.len()
-        ));
-    }
-    for (index, (planned, emitted)) in planned_function
-        .exact_list_items
-        .iter()
-        .zip(emitted_function.exact_list_items.iter())
-        .enumerate()
-    {
-        if planned.source != emitted.source
-            || planned.access != emitted.access
-            || planned.shape != emitted.shape
-            || planned.guard != emitted.guard
-            || planned.fallback != emitted.fallback
-            || planned.reason != emitted.reason
-        {
-            return Err(format!(
-                "optimizer v3 emitted exact-list item #{index} for function {} does not match the selected plan",
-                planned_function.function.function
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn validate_opt_v3_indexed_field_emission_matches_plan(
-    planned_function: &FunctionOptimizationPlanV3,
-    emitted_function: &MechanicalFunctionEmission,
-) -> Result<(), String> {
-    if planned_function.indexed_fields.len() != emitted_function.indexed_fields.len() {
-        return Err(format!(
-            "optimizer v3 artifacts for function {} contain {} planned indexed fields but {} emitted indexed fields",
-            planned_function.function.function,
-            planned_function.indexed_fields.len(),
-            emitted_function.indexed_fields.len()
-        ));
-    }
-    for (index, (planned, emitted)) in planned_function
-        .indexed_fields
-        .iter()
-        .zip(emitted_function.indexed_fields.iter())
-        .enumerate()
-    {
-        if !opt_v3_indexed_field_emission_matches_plan(planned, emitted) {
-            return Err(format!(
-                "optimizer v3 emitted indexed-field #{index} for function {} does not match the selected plan",
-                planned_function.function.function
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn opt_v3_indexed_field_emission_matches_plan(
-    planned: &PlanV3IndexedFieldSpecializationPlan,
-    emitted: &MechanicalIndexedFieldEmission,
-) -> bool {
-    planned.source == emitted.source
-        && planned.access == emitted.access
-        && planned.owner_type == emitted.owner_type
-        && planned.attr_name == emitted.attr_name
-        && planned.expected_index == emitted.expected_index
-        && planned.reason == emitted.reason
-}
-
-fn validate_opt_v3_indexed_global_emission_matches_plan(
-    planned_function: &FunctionOptimizationPlanV3,
-    emitted_function: &MechanicalFunctionEmission,
-) -> Result<(), String> {
-    if planned_function.indexed_globals.len() != emitted_function.indexed_globals.len() {
-        return Err(format!(
-            "optimizer v3 artifacts for function {} contain {} planned indexed globals but {} emitted indexed globals",
-            planned_function.function.function,
-            planned_function.indexed_globals.len(),
-            emitted_function.indexed_globals.len()
-        ));
-    }
-    for (index, (planned, emitted)) in planned_function
-        .indexed_globals
-        .iter()
-        .zip(emitted_function.indexed_globals.iter())
-        .enumerate()
-    {
-        if !opt_v3_indexed_global_emission_matches_plan(planned, emitted) {
-            return Err(format!(
-                "optimizer v3 emitted indexed-global #{index} for function {} does not match the selected plan",
-                planned_function.function.function
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn opt_v3_indexed_global_emission_matches_plan(
-    planned: &PlanV3IndexedGlobalSpecializationPlan,
-    emitted: &MechanicalIndexedGlobalEmission,
-) -> bool {
-    planned.source == emitted.source
-        && planned.access == emitted.access
-        && planned.module_name == emitted.module_name
-        && planned.name == emitted.name
-        && planned.expected_index == emitted.expected_index
-        && planned.guard == emitted.guard
-        && planned.fallback == emitted.fallback
-        && planned.reason == emitted.reason
-}
-
 fn resolve_planned_function_target(
     shared_state: &SharedModuleState,
     compile_session: Option<&crate::session::CompileSession>,
@@ -16506,16 +14789,12 @@ impl FunctionSpecializationInputs {
             field_index_specializations_by_instr,
             opt_v3_indexed_fields_by_instr,
         ) = profile.field_index_specialization_maps(function.function_id)?;
-        let generic_call_sources = collect_generic_call_instr_ids(function);
-        let mut opt_v3_direct_calls_by_instr =
+        let opt_v3_direct_calls_by_instr =
             profile.codegen_opt_v3_direct_calls(function.function_id);
-        opt_v3_direct_calls_by_instr.retain(|source, _| generic_call_sources.contains(source));
-        let mut opt_v3_constructor_calls_by_instr =
+        let opt_v3_constructor_calls_by_instr =
             profile.codegen_opt_v3_constructor_calls(function.function_id)?;
-        opt_v3_constructor_calls_by_instr.retain(|source, _| generic_call_sources.contains(source));
-        let mut opt_v3_method_calls_by_instr =
+        let opt_v3_method_calls_by_instr =
             profile.codegen_opt_v3_method_calls(function.function_id)?;
-        opt_v3_method_calls_by_instr.retain(|source, _| generic_call_sources.contains(source));
         let v3_owned_call_sources = profile.v3_call_emission_sources(function.function_id);
         let call_target_specializations =
             profile.call_target_specializations(function.function_id)?;
@@ -16741,16 +15020,6 @@ impl<'a> SpecializationProfile<'a> {
             .unwrap_or_default()
     }
 
-    fn v3_direct_function_call_body_targets(
-        &self,
-        function_id: RuntimeFunctionId,
-    ) -> HashMap<InstrId, Vec<RuntimeFunctionId>> {
-        self.opt_v3_emitted_direct_calls
-            .get(&function_id)
-            .map(opt_v3_direct_call_body_targets)
-            .unwrap_or_default()
-    }
-
     fn v3_constructor_call_targets(
         &self,
         function_id: RuntimeFunctionId,
@@ -16785,16 +15054,6 @@ impl<'a> SpecializationProfile<'a> {
             .unwrap_or_default()
     }
 
-    fn v3_direct_constructor_call_body_plans(
-        &self,
-        function_id: RuntimeFunctionId,
-    ) -> HashMap<InstrId, Vec<OptV3ConstructorCallPlan>> {
-        self.opt_v3_emitted_constructor_calls
-            .get(&function_id)
-            .map(opt_v3_direct_constructor_call_body_plans)
-            .unwrap_or_default()
-    }
-
     fn v3_method_call_targets(
         &self,
         function_id: RuntimeFunctionId,
@@ -16812,26 +15071,6 @@ impl<'a> SpecializationProfile<'a> {
         self.opt_v3_emitted_method_calls
             .get(&function_id)
             .map(opt_v3_inline_method_call_targets)
-            .unwrap_or_default()
-    }
-
-    fn v3_direct_method_call_body_targets(
-        &self,
-        function_id: RuntimeFunctionId,
-    ) -> HashMap<InstrId, Vec<RuntimeFunctionId>> {
-        self.opt_v3_emitted_method_calls
-            .get(&function_id)
-            .map(opt_v3_direct_method_call_body_targets)
-            .unwrap_or_default()
-    }
-
-    fn v3_direct_method_call_body_plans(
-        &self,
-        function_id: RuntimeFunctionId,
-    ) -> HashMap<InstrId, Vec<OptV3MethodCallPlan>> {
-        self.opt_v3_emitted_method_calls
-            .get(&function_id)
-            .map(opt_v3_direct_method_call_body_plans)
             .unwrap_or_default()
     }
 
@@ -16963,14 +15202,16 @@ impl<'a> SpecializationProfile<'a> {
                     required_field_index_specialization_from_primed_opt_v3(planned).map_err(
                         |err| {
                             format!(
-                                "optimizer v3 indexed-field plan {:?} for {} attr {:?} could not resolve a codegen guard: {err}",
-                                planned.access, instr_id, planned.attr_name
+                                "optimizer v3 indexed-field plan {:?} for {} attr {:?} could not bind a runtime field guard: {err}",
+                                planned.access, instr_id, planned.guard.attr_name
                             )
                         },
                     )?;
                 let resolved = OptV3ResolvedIndexedFieldAccess {
                     access: planned.access,
-                    attr_name: planned.attr_name.clone(),
+                    attr_name: planned.guard.attr_name.clone(),
+                    guard: planned.guard.kind,
+                    fallback: planned.fallback,
                     specialization,
                 };
                 if !resolved_accesses.contains(&resolved) {
@@ -17015,10 +15256,9 @@ fn prepare_opt_v3_constructor_call_plans_for_codegen(
         }
         let mut guards = Vec::new();
         for constructor_call in constructor_calls {
-            if let Some(guard) = opt_v3_constructor_call_guard_from_plan(constructor_call)?
-                && register_opt_v3_prepared_constructor_guard_symbols(&guard)?
-                && !guards.contains(&guard)
-            {
+            let guard = opt_v3_constructor_call_guard_from_plan(constructor_call)?;
+            register_opt_v3_prepared_constructor_guard_symbols(&guard)?;
+            if !guards.contains(&guard) {
                 guards.push(guard);
             }
         }
@@ -17051,10 +15291,9 @@ fn prepare_opt_v3_method_call_plans_for_codegen(
         }
         let mut guards = Vec::new();
         for method_call in method_calls {
-            if let Some(guard) = opt_v3_method_call_guard_from_plan(method_call)?
-                && register_opt_v3_prepared_method_guard_symbols(&guard, &method_name)?
-                && !guards.contains(&guard)
-            {
+            let guard = opt_v3_method_call_guard_from_plan(method_call)?;
+            register_opt_v3_prepared_method_guard_symbols(&guard, &method_name)?;
+            if !guards.contains(&guard) {
                 guards.push(guard);
             }
         }
@@ -17071,35 +15310,51 @@ fn prepare_opt_v3_method_call_plans_for_codegen(
 
 fn register_opt_v3_prepared_constructor_guard_symbols(
     guard: &TypedDirectConstructorCallGuard,
-) -> Result<bool, String> {
-    let Some(owner_type_ref) = reloc_type_ref_from_typed_attr_owner_ref(&guard.owner_type_ref)
-    else {
-        return Ok(false);
-    };
+) -> Result<(), String> {
+    let owner_type_ref = reloc_type_ref_from_typed_attr_owner_ref(&guard.owner_type_ref)
+        .ok_or_else(|| {
+            "optimizer v3 constructor-call guard has invalid owner type ref".to_string()
+        })?;
     if !ensure_reloc_type_symbol_registered(&owner_type_ref)? {
-        return Ok(false);
+        return Err(format!(
+            "optimizer v3 constructor-call target {} could not register owner type {:?}",
+            guard.function_id, guard.owner_type_ref
+        ));
     }
-    ensure_reloc_callable_symbol_registered(&RelocCallableRef::OwnerAttr {
+    if !ensure_reloc_callable_symbol_registered(&RelocCallableRef::OwnerAttr {
         owner_type_ref,
         attr_name: "__init__".to_string(),
-    })
+    })? {
+        return Err(format!(
+            "optimizer v3 constructor-call target {} could not register owner __init__ callable",
+            guard.function_id
+        ));
+    }
+    Ok(())
 }
 
 fn register_opt_v3_prepared_method_guard_symbols(
     guard: &TypedDirectMethodCallGuard,
     method_name: &str,
-) -> Result<bool, String> {
-    let Some(owner_type_ref) = reloc_type_ref_from_typed_attr_owner_ref(&guard.owner_type_ref)
-    else {
-        return Ok(false);
-    };
+) -> Result<(), String> {
+    let owner_type_ref = reloc_type_ref_from_typed_attr_owner_ref(&guard.owner_type_ref)
+        .ok_or_else(|| "optimizer v3 method-call guard has invalid owner type ref".to_string())?;
     if !ensure_reloc_type_symbol_registered(&owner_type_ref)? {
-        return Ok(false);
+        return Err(format!(
+            "optimizer v3 method-call target {} could not register owner type {:?}",
+            guard.function_id, guard.owner_type_ref
+        ));
     }
-    ensure_reloc_callable_symbol_registered(&RelocCallableRef::OwnerAttr {
+    if !ensure_reloc_callable_symbol_registered(&RelocCallableRef::OwnerAttr {
         owner_type_ref,
         attr_name: method_name.to_string(),
-    })
+    })? {
+        return Err(format!(
+            "optimizer v3 method-call target {} could not register owner method callable {method_name}",
+            guard.function_id
+        ));
+    }
+    Ok(())
 }
 
 fn existing_counter_dump_path(path: Option<&Path>) -> Option<&Path> {
@@ -17621,8 +15876,8 @@ fn planned_field_index_type_key(planned: &PlannedIndexedFieldSpecialization) -> 
 
 fn opt_v3_field_index_type_key(planned: &OptV3IndexedFieldAccessPlan) -> CounterDumpTypeKey {
     CounterDumpTypeKey {
-        module_name: planned.owner_type.module_name.clone(),
-        qualname: planned.owner_type.qualname.clone(),
+        module_name: planned.guard.owner_type.module_name.clone(),
+        qualname: planned.guard.owner_type.qualname.clone(),
     }
 }
 
@@ -17672,8 +15927,8 @@ fn prime_opt_v3_field_index_layouts<'a>(
         let type_key = opt_v3_field_index_type_key(planned);
         if !seen_layouts.insert((
             type_key.clone(),
-            planned.attr_name.clone(),
-            planned.expected_index,
+            planned.guard.attr_name.clone(),
+            planned.guard.expected_index,
         )) {
             continue;
         }
@@ -17682,8 +15937,8 @@ fn prime_opt_v3_field_index_layouts<'a>(
             .or_default()
             .push(CollectedTypeKeyLayout {
                 owner_type_id: 0,
-                key: planned.attr_name.clone(),
-                index: planned.expected_index,
+                key: planned.guard.attr_name.clone(),
+                index: planned.guard.expected_index,
             });
     }
     for (type_key, mut layouts) in layouts_by_type {
@@ -17723,8 +15978,8 @@ fn field_index_specialization_from_primed_opt_v3(
     };
     field_index_specialization_for_type(
         owner_type,
-        planned.attr_name.as_str(),
-        planned.expected_index,
+        planned.guard.attr_name.as_str(),
+        planned.guard.expected_index,
     )
 }
 
@@ -17740,16 +15995,16 @@ fn required_field_index_specialization_from_primed_opt_v3(
     };
     field_index_specialization_for_type(
         owner_type,
-        planned.attr_name.as_str(),
-        planned.expected_index,
+        planned.guard.attr_name.as_str(),
+        planned.guard.expected_index,
     )?
     .ok_or_else(|| {
         format!(
             "owner type {}.{} does not support indexed-field lowering for attr {:?} at expected index {}; this requires a heap type with generic getattro/setattro, no class binding for the attr, and a nonzero type version tag",
             type_key.module_name,
             type_key.qualname,
-            planned.attr_name,
-            planned.expected_index
+            planned.guard.attr_name,
+            planned.guard.expected_index
         )
     })
 }
@@ -20215,11 +18470,12 @@ fn emit_typed_indexed_getattr(
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<Option<SoacValue>, String> {
     let instr_id = op.semantic_instr_id();
-    let Some(plan) = IndexedFieldLoweringPlan::from_typed_guards(
+    let Some(plan) = IndexedFieldLoweringPlan::for_access(
         instr_id,
         source,
         guards,
         PlanV3IndexedFieldAccessKind::Load,
+        emit_ctx.opt_v3_indexed_fields_by_instr,
     )?
     else {
         return Ok(None);
@@ -20400,11 +18656,12 @@ fn emit_typed_indexed_setattr(
         }
     };
     let instr_id = op.semantic_instr_id();
-    let Some(plan) = IndexedFieldLoweringPlan::from_typed_guards(
+    let Some(plan) = IndexedFieldLoweringPlan::for_access(
         instr_id,
         source,
         guards,
         PlanV3IndexedFieldAccessKind::Store,
+        emit_ctx.opt_v3_indexed_fields_by_instr,
     )?
     else {
         return Ok(None);
@@ -25169,7 +23426,6 @@ fn opt_v3_exact_int_branch_selection_for_source<'a>(
     else {
         return Ok(None);
     };
-    opt_v3_require_original_cfg_branch_exit(hot_region, source)?;
     let hot_plan = planned_function
         .regions
         .iter()
@@ -25180,7 +23436,12 @@ fn opt_v3_exact_int_branch_selection_for_source<'a>(
                 hot_region.region
             )
         })?;
-    let fallback_region_id = opt_v3_required_local_fallback_region(hot_region)?;
+    let fallback_region_id = opt_v3_local_fallback_region(hot_region).ok_or_else(|| {
+        format!(
+            "prevalidated optimizer v3 branch region {:?} for source {source} has no local fallback region",
+            hot_region.region
+        )
+    })?;
     let fallback_region = emitted_function
         .regions
         .iter()
@@ -25191,7 +23452,6 @@ fn opt_v3_exact_int_branch_selection_for_source<'a>(
                 hot_region.region, fallback_region_id
             )
         })?;
-    opt_v3_require_original_cfg_branch_exit(fallback_region, source)?;
     let fallback_plan = planned_function
         .regions
         .iter()
@@ -25233,7 +23493,6 @@ fn opt_v3_exact_int_return_selection_for_source<'a>(
     else {
         return Ok(None);
     };
-    opt_v3_require_return_exit(hot_region, source)?;
     let hot_plan = planned_function
         .regions
         .iter()
@@ -25244,7 +23503,12 @@ fn opt_v3_exact_int_return_selection_for_source<'a>(
                 hot_region.region
             )
         })?;
-    let fallback_region_id = opt_v3_required_local_fallback_region(hot_region)?;
+    let fallback_region_id = opt_v3_local_fallback_region(hot_region).ok_or_else(|| {
+        format!(
+            "prevalidated optimizer v3 return region {:?} for source {source} has no local fallback region",
+            hot_region.region
+        )
+    })?;
     let fallback_region = emitted_function
         .regions
         .iter()
@@ -25255,7 +23519,6 @@ fn opt_v3_exact_int_return_selection_for_source<'a>(
                 hot_region.region, fallback_region_id
             )
         })?;
-    opt_v3_require_return_exit(fallback_region, source)?;
     let fallback_plan = planned_function
         .regions
         .iter()
@@ -25280,7 +23543,7 @@ fn opt_v3_scalar_thread_selection_for_store_branch<'a>(
     consumer_source: InstrId,
     local_name: &ResolvedName,
 ) -> Result<Option<OptV3ScalarThreadSelection<'a>>, String> {
-    let Some(planned_function) = artifacts.plan.functions.first() else {
+    let Some(emitted_function) = artifacts.emission.functions.first() else {
         return Ok(None);
     };
     let Some(producer) = opt_v3_exact_int_return_selection_for_source(artifacts, producer_source)?
@@ -25291,23 +23554,15 @@ fn opt_v3_scalar_thread_selection_for_store_branch<'a>(
     else {
         return Ok(None);
     };
-    let Some(thread) = planned_function.scalar_threads.iter().find(|thread| {
+    let Some(thread) = emitted_function.scalar_threads.iter().find(|thread| {
         thread.producer.region == producer.hot_plan.id
             && thread.consumer.region == consumer.hot_plan.id
             && opt_v3_scalar_thread_matches_local(thread, local_name)
     }) else {
         return Ok(None);
     };
-    match &thread.fallback {
-        ScalarThreadFallback::LocalFallbackRegion { region, .. }
-            if *region == producer.fallback_plan.id => {}
-        other => {
-            return Err(format!(
-                "optimizer v3 scalar thread for local {} has fallback {other:?}, expected producer fallback {:?}",
-                thread.local.name, producer.fallback_plan.id
-            ));
-        }
-    }
+    let ScalarThreadFallback::LocalFallbackRegion { region, .. } = &thread.fallback;
+    debug_assert_eq!(*region, producer.fallback_plan.id);
     Ok(Some(OptV3ScalarThreadSelection {
         thread,
         producer,
@@ -25447,133 +23702,38 @@ fn opt_v3_region_has_return_source(region: &MechanicalRegionEmission, source: In
     })
 }
 
-fn opt_v3_require_original_cfg_branch_exit(
-    region: &MechanicalRegionEmission,
-    source: InstrId,
-) -> Result<(), String> {
-    if region.exits.len() != 1 {
-        return Err(format!(
-            "optimizer v3 region {:?} for source {source} has {} exits; exact-int branch codegen expects one",
-            region.region,
-            region.exits.len()
-        ));
-    }
-    let exit = &region.exits[0];
-    if exit.source != Some(source) {
-        return Err(format!(
-            "optimizer v3 region {:?} exit source {:?} does not match branch source {source}",
-            region.region, exit.source
-        ));
-    }
-    match &exit.kind {
-        MechanicalExitKind::Branch {
-            then_target,
-            else_target,
-            ..
-        } if *then_target == RegionExitTarget::OriginalCfg
-            && *else_target == RegionExitTarget::OriginalCfg =>
-        {
-            Ok(())
-        }
-        other => Err(format!(
-            "optimizer v3 region {:?} for source {source} has unsupported exit {other:?}; exact-int branch codegen only supports OriginalCfg branch exits",
-            region.region
-        )),
-    }
-}
-
-fn opt_v3_require_return_exit(
-    region: &MechanicalRegionEmission,
-    source: InstrId,
-) -> Result<(), String> {
-    if region.exits.len() != 1 {
-        return Err(format!(
-            "optimizer v3 region {:?} for source {source} has {} exits; exact-int return codegen expects one",
-            region.region,
-            region.exits.len()
-        ));
-    }
-    let exit = &region.exits[0];
-    if exit.source != Some(source) {
-        return Err(format!(
-            "optimizer v3 region {:?} return exit source {:?} does not match source {source}",
-            region.region, exit.source
-        ));
-    }
-    match &exit.kind {
-        MechanicalExitKind::Return { .. } => Ok(()),
-        other => Err(format!(
-            "optimizer v3 region {:?} for source {source} has unsupported exit {other:?}; exact-int return codegen only supports Return exits",
-            region.region
-        )),
-    }
-}
-
-fn opt_v3_required_local_fallback_region(
-    region: &MechanicalRegionEmission,
-) -> Result<RegionId, String> {
-    let mut targets = HashSet::new();
+fn opt_v3_local_fallback_region(region: &MechanicalRegionEmission) -> Option<RegionId> {
     for step in &region.steps {
         match &step.op {
             MechanicalStepOp::Guard { failure, .. } => match failure {
                 GuardFailure::FallbackToPlan {
                     target: FallbackTarget::Region(region),
                     ..
-                } => {
-                    targets.insert(*region);
-                }
-                GuardFailure::FallbackToPlan { target, .. } => {
-                    return Err(format!(
-                        "optimizer v3 guard node {:?} uses unsupported fallback target {target:?}",
-                        step.node
-                    ));
-                }
-                GuardFailure::DeoptTo { .. } => {
-                    return Err(format!(
-                        "optimizer v3 guard node {:?} uses deopt; exact-int branch codegen requires a visible local fallback",
-                        step.node
-                    ));
-                }
+                } => return Some(*region),
+                GuardFailure::FallbackToPlan { .. } | GuardFailure::DeoptTo { .. } => {}
             },
             MechanicalStepOp::Convert { failure, .. }
             | MechanicalStepOp::Operation { failure, .. } => {
-                match opt_v3_failure_fallback_region(failure)? {
-                    Some(region) => {
-                        targets.insert(region);
-                    }
-                    None => {}
+                if let Some(region) = opt_v3_failure_fallback_region(failure) {
+                    return Some(region);
                 }
             }
             _ => {}
         }
     }
-    if targets.len() != 1 {
-        return Err(format!(
-            "optimizer v3 region {:?} has {} local fallback targets; exact-int branch codegen expects exactly one",
-            region.region,
-            targets.len()
-        ));
-    }
-    Ok(*targets.iter().next().expect("checked one target"))
+    None
 }
 
-fn opt_v3_failure_fallback_region(failure: &FailureMode) -> Result<Option<RegionId>, String> {
+fn opt_v3_failure_fallback_region(failure: &FailureMode) -> Option<RegionId> {
     match failure {
-        FailureMode::CannotFail => Ok(None),
         FailureMode::FallbackToPlan {
             target: FallbackTarget::Region(region),
             ..
-        } => Ok(Some(*region)),
-        FailureMode::FallbackToPlan { target, .. } => Err(format!(
-            "optimizer v3 exact-int branch codegen only supports region fallback targets, got {target:?}"
-        )),
-        FailureMode::Raise(exception) => Err(format!(
-            "optimizer v3 exact-int branch hot path cannot raise before the local fallback, got {exception:?}"
-        )),
-        FailureMode::DeoptTo { .. } => Err(
-            "optimizer v3 exact-int branch codegen requires a local fallback, not deopt"
-                .to_string(),
-        ),
+        } => Some(*region),
+        FailureMode::CannotFail
+        | FailureMode::Raise(_)
+        | FailureMode::FallbackToPlan { .. }
+        | FailureMode::DeoptTo { .. } => None,
     }
 }
 
@@ -25832,7 +23992,7 @@ fn opt_v3_region_input_values(
         } = &input.source
         else {
             return Err(format!(
-                "optimizer v3 {context} input {:?} has unsupported source {:?}",
+                "prevalidated optimizer v3 {context} input {:?} has non-mechanical source {:?}",
                 input.value, input.source
             ));
         };
@@ -25976,7 +24136,7 @@ fn emit_opt_v3_mechanical_region_steps_controlled(
                     }
                     other => {
                         return Err(format!(
-                            "optimizer v3 region {:?} constant node {:?} has unsupported constant {other:?}",
+                            "prevalidated optimizer v3 region {:?} constant node {:?} has non-i64 constant {other:?}",
                             region.region, step.node
                         ));
                     }
@@ -25992,7 +24152,7 @@ fn emit_opt_v3_mechanical_region_steps_controlled(
             MechanicalStepOp::Guard { kind, failure, .. } => {
                 if *kind != GuardKind::SpecializationCheck {
                     return Err(format!(
-                        "optimizer v3 region {:?} guard node {:?} has unsupported kind {kind:?}",
+                        "prevalidated optimizer v3 region {:?} guard node {:?} has non-mechanical kind {kind:?}",
                         region.region, step.node
                     ));
                 }
@@ -26010,7 +24170,7 @@ fn emit_opt_v3_mechanical_region_steps_controlled(
                     }
                 ) {
                     return Err(format!(
-                        "optimizer v3 region {:?} guard node {:?} requires unsupported failure {failure:?}",
+                        "prevalidated optimizer v3 region {:?} guard node {:?} has non-mechanical failure {failure:?}",
                         region.region, step.node
                     ));
                 }
@@ -26076,7 +24236,7 @@ fn emit_opt_v3_mechanical_region_steps_controlled(
             | MechanicalStepOp::Deopt { .. }
             | MechanicalStepOp::Ownership { .. } => {
                 return Err(format!(
-                    "optimizer v3 region {:?} node {:?} has unsupported codegen step {:?}",
+                    "prevalidated optimizer v3 region {:?} node {:?} contains a non-emittable codegen step {:?}",
                     region.region, step.node, step.op
                 ));
             }
@@ -26178,7 +24338,7 @@ fn emit_opt_v3_mechanical_convert(
             )
         }
         other => Err(format!(
-            "optimizer v3 region {region:?} conversion node {node:?} has unsupported conversion {other:?}"
+            "prevalidated optimizer v3 region {region:?} conversion node {node:?} contains conversion outside the validated emitter capability set {other:?}"
         )),
     }
 }
@@ -26377,7 +24537,7 @@ fn emit_opt_v3_mechanical_operation(
             opt_v3_store_mechanical_value(values, output, OptV3MechanicalValue::I32Bool01(value))
         }
         other => Err(format!(
-            "optimizer v3 region {region:?} node {node:?} has unsupported operation {other:?}"
+            "prevalidated optimizer v3 region {region:?} node {node:?} contains operation outside the validated emitter capability set {other:?}"
         )),
     }
 }
@@ -27048,7 +25208,7 @@ fn emit_opt_v3_scalar_threaded_store_branch(
         ScalarThreadMaterialization::DeferredUntilPythonObjectUse { .. }
     ) {
         return Err(format!(
-            "optimizer v3 scalar thread for local {} has unsupported materialization {:?}",
+            "prevalidated optimizer v3 scalar thread for local {} has non-mechanical materialization {:?}",
             selection.thread.local.name, selection.thread.materialization
         ));
     }
@@ -31872,20 +30032,9 @@ fn annotate_opt_v3_direct_call_access_plans(
     if direct_calls_by_instr.is_empty() {
         return Ok(0);
     }
-    for (source, direct_calls) in direct_calls_by_instr {
-        for direct_call in direct_calls {
-            if direct_call.body.kind != PlanV3CallBodyKind::DirectCall {
-                return Err(format!(
-                    "optimizer v3 direct-call at {} selected {:?} body, but typed call-access annotation only consumes DirectCall bodies",
-                    source, direct_call.body.kind
-                ));
-            }
-        }
-    }
 
     struct Rewriter<'a> {
         direct_calls_by_instr: &'a HashMap<InstrId, Vec<OptV3DirectCallPlan>>,
-        seen_sources: HashSet<InstrId>,
         count: usize,
     }
 
@@ -31901,7 +30050,6 @@ fn annotate_opt_v3_direct_call_access_plans(
             let Some(direct_calls) = self.direct_calls_by_instr.get(&instr_id) else {
                 return;
             };
-            self.seen_sources.insert(instr_id);
             if direct_calls.is_empty() {
                 return;
             }
@@ -31923,67 +30071,60 @@ fn annotate_opt_v3_direct_call_access_plans(
 
     let mut rewriter = Rewriter {
         direct_calls_by_instr,
-        seen_sources: HashSet::new(),
         count: 0,
     };
     rewriter.visit_fn_mut(function);
-    if let Some(source) = direct_calls_by_instr
-        .keys()
-        .find(|source| !rewriter.seen_sources.contains(source))
-    {
-        return Err(format!(
-            "optimizer v3 emitted direct-call at {}, but lowered function has no matching call",
-            source
-        ));
-    }
     Ok(rewriter.count)
 }
 
 fn opt_v3_constructor_call_guard_from_plan(
     plan: &OptV3ConstructorCallPlan,
-) -> Result<Option<TypedDirectConstructorCallGuard>, String> {
-    if plan.guard != PlanV3ConstructorCallGuardKind::ExactCallableTypeVersion {
-        return Err(format!(
-            "optimizer v3 constructor-call at {} has unsupported guard {:?}",
-            plan.source, plan.guard
-        ));
-    }
-    if plan.fallback != PlanV3ConstructorCallFallbackKind::OriginalConstructorCall {
-        return Err(format!(
-            "optimizer v3 constructor-call at {} has unsupported fallback {:?}",
-            plan.source, plan.fallback
-        ));
-    }
+) -> Result<TypedDirectConstructorCallGuard, String> {
     let type_key = CounterDumpTypeKey {
         module_name: plan.owner_type.module_name.clone(),
         qualname: plan.owner_type.qualname.clone(),
     };
-    let Some(owner_type) = resolve_type_key_to_type(&type_key)? else {
-        return Ok(None);
-    };
+    let owner_type = resolve_type_key_to_type(&type_key)?.ok_or_else(|| {
+        format!(
+            "optimizer v3 constructor-call at {} could not resolve owner type {}.{}",
+            plan.source, type_key.module_name, type_key.qualname
+        )
+    })?;
     if unsafe { (*owner_type).tp_version_tag } == 0 {
         let _ = unsafe { PyUnstable_Type_AssignVersionTag(owner_type) };
     }
     let type_version = unsafe { (*owner_type).tp_version_tag };
     if type_version == 0 {
-        return Ok(None);
+        return Err(format!(
+            "optimizer v3 constructor-call at {} owner type {}.{} has no type version tag",
+            plan.source, type_key.module_name, type_key.qualname
+        ));
     }
-    let Some(owner_type_ref) = reloc_type_ref_for_type(owner_type)? else {
-        return Ok(None);
-    };
-    let Some(function_id) = owner_attr_function_id_for_type_ref(&owner_type_ref, "__init__")?
-    else {
-        return Ok(None);
-    };
+    let owner_type_ref = reloc_type_ref_for_type(owner_type)?.ok_or_else(|| {
+        format!(
+            "optimizer v3 constructor-call at {} owner type {}.{} has no relocatable type reference",
+            plan.source, type_key.module_name, type_key.qualname
+        )
+    })?;
+    let function_id = owner_attr_function_id_for_type_ref(&owner_type_ref, "__init__")?
+        .ok_or_else(|| {
+            format!(
+                "optimizer v3 constructor-call at {} could not resolve owner __init__ function id",
+                plan.source
+            )
+        })?;
     if function_id != plan.target {
-        return Ok(None);
+        return Err(format!(
+            "optimizer v3 constructor-call at {} selected target {}, but runtime owner __init__ resolves to {}",
+            plan.source, plan.target, function_id
+        ));
     }
-    Ok(Some(TypedDirectConstructorCallGuard {
+    Ok(TypedDirectConstructorCallGuard {
         function_id: plan.target,
         owner_type_ref: typed_attr_owner_ref_from_reloc_type_ref(&owner_type_ref),
         type_version,
         arg_plan: plan.arg_plan.clone(),
-    }))
+    })
 }
 
 fn annotate_opt_v3_constructor_call_access_plans(
@@ -31996,16 +30137,11 @@ fn annotate_opt_v3_constructor_call_access_plans(
 
     struct Rewriter<'a> {
         constructor_calls_by_instr: &'a HashMap<InstrId, OptV3PreparedConstructorCallPlan>,
-        seen_sources: HashSet<InstrId>,
         count: usize,
-        error: Option<String>,
     }
 
     impl VisitMut<InstrTyped> for Rewriter<'_> {
         fn visit_instr_mut(&mut self, expr: &mut InstrTyped) {
-            if self.error.is_some() {
-                return;
-            }
             expr.visit_children_mut(self);
             let InstrTyped::CallTyped(call) = expr else {
                 return;
@@ -32016,14 +30152,6 @@ fn annotate_opt_v3_constructor_call_access_plans(
             let Some(constructor_calls) = self.constructor_calls_by_instr.get(&instr_id) else {
                 return;
             };
-            self.seen_sources.insert(instr_id);
-            if matches!(call.func.as_ref(), InstrTyped::GetAttrTyped(_)) {
-                self.error = Some(format!(
-                    "optimizer v3 emitted constructor-call at {}, but lowered source is a method call",
-                    instr_id
-                ));
-                return;
-            }
             if constructor_calls.guards.is_empty() {
                 // The v3 source still owns this call site, but guard
                 // preparation declined before typed lowering.
@@ -32040,76 +30168,63 @@ fn annotate_opt_v3_constructor_call_access_plans(
 
     let mut rewriter = Rewriter {
         constructor_calls_by_instr,
-        seen_sources: HashSet::new(),
         count: 0,
-        error: None,
     };
     rewriter.visit_fn_mut(function);
-    if let Some(error) = rewriter.error {
-        return Err(error);
-    }
-    if let Some(source) = constructor_calls_by_instr
-        .keys()
-        .find(|source| !rewriter.seen_sources.contains(source))
-    {
-        return Err(format!(
-            "optimizer v3 emitted constructor-call at {}, but lowered function has no matching call",
-            source
-        ));
-    }
     Ok(rewriter.count)
 }
 
 fn opt_v3_method_call_guard_from_plan(
     plan: &OptV3MethodCallPlan,
-) -> Result<Option<TypedDirectMethodCallGuard>, String> {
-    if plan.guard != PlanV3MethodCallGuardKind::ExactReceiverTypeVersion {
-        return Err(format!(
-            "optimizer v3 method-call at {} has unsupported guard {:?}",
-            plan.source, plan.guard
-        ));
-    }
-    if plan.fallback != PlanV3MethodCallFallbackKind::OriginalMethodCall {
-        return Err(format!(
-            "optimizer v3 method-call at {} has unsupported fallback {:?}",
-            plan.source, plan.fallback
-        ));
-    }
+) -> Result<TypedDirectMethodCallGuard, String> {
     let type_key = CounterDumpTypeKey {
         module_name: plan.owner_type.module_name.clone(),
         qualname: plan.owner_type.qualname.clone(),
     };
-    let Some(owner_type) = resolve_type_key_to_type(&type_key)? else {
-        return Ok(None);
-    };
+    let owner_type = resolve_type_key_to_type(&type_key)?.ok_or_else(|| {
+        format!(
+            "optimizer v3 method-call at {} could not resolve owner type {}.{}",
+            plan.source, type_key.module_name, type_key.qualname
+        )
+    })?;
     if unsafe { (*owner_type).tp_version_tag } == 0 {
         let _ = unsafe { PyUnstable_Type_AssignVersionTag(owner_type) };
     }
     let type_version = unsafe { (*owner_type).tp_version_tag };
     if type_version == 0 {
-        return Ok(None);
+        return Err(format!(
+            "optimizer v3 method-call at {} owner type {}.{} has no type version tag",
+            plan.source, type_key.module_name, type_key.qualname
+        ));
     }
-    let Some(owner_type_ref) = reloc_type_ref_for_type(owner_type)? else {
-        return Ok(None);
-    };
-    let Some(function_id) =
-        owner_attr_function_id_for_type_ref(&owner_type_ref, &plan.method_name)?
-    else {
-        return Ok(None);
-    };
+    let owner_type_ref = reloc_type_ref_for_type(owner_type)?.ok_or_else(|| {
+        format!(
+            "optimizer v3 method-call at {} owner type {}.{} has no relocatable type reference",
+            plan.source, type_key.module_name, type_key.qualname
+        )
+    })?;
+    let function_id = owner_attr_function_id_for_type_ref(&owner_type_ref, &plan.method_name)?
+        .ok_or_else(|| {
+            format!(
+                "optimizer v3 method-call at {} could not resolve owner method {:?} function id",
+                plan.source, plan.method_name
+            )
+        })?;
     if function_id != plan.target {
-        return Ok(None);
+        return Err(format!(
+            "optimizer v3 method-call at {} selected target {}, but runtime owner method {:?} resolves to {}",
+            plan.source, plan.target, plan.method_name, function_id
+        ));
     }
-    Ok(Some(TypedDirectMethodCallGuard {
+    Ok(TypedDirectMethodCallGuard {
         function_id: plan.target,
         owner_type_ref: typed_attr_owner_ref_from_reloc_type_ref(&owner_type_ref),
         type_version,
         arg_plan: plan.arg_plan.clone(),
-    }))
+    })
 }
 
 fn annotate_opt_v3_method_call_access_plans(
-    module: &BlockPyModule<CodegenModuleShape>,
     function: &mut BlockPyFunction<TypedCodegenModuleShape>,
     method_calls_by_instr: &HashMap<InstrId, OptV3PreparedMethodCallPlan>,
 ) -> Result<usize, String> {
@@ -32118,18 +30233,12 @@ fn annotate_opt_v3_method_call_access_plans(
     }
 
     struct Rewriter<'a> {
-        module: &'a BlockPyModule<CodegenModuleShape>,
         method_calls_by_instr: &'a HashMap<InstrId, OptV3PreparedMethodCallPlan>,
-        seen_sources: HashSet<InstrId>,
         count: usize,
-        error: Option<String>,
     }
 
     impl VisitMut<InstrTyped> for Rewriter<'_> {
         fn visit_instr_mut(&mut self, expr: &mut InstrTyped) {
-            if self.error.is_some() {
-                return;
-            }
             expr.visit_children_mut(self);
             let InstrTyped::CallTyped(call) = expr else {
                 return;
@@ -32140,29 +30249,6 @@ fn annotate_opt_v3_method_call_access_plans(
             let Some(method_calls) = self.method_calls_by_instr.get(&instr_id) else {
                 return;
             };
-            self.seen_sources.insert(instr_id);
-            let InstrTyped::GetAttrTyped(getattr) = call.func.as_ref() else {
-                self.error = Some(format!(
-                    "optimizer v3 emitted method-call at {}, but lowered source is not a GetAttr call",
-                    instr_id
-                ));
-                return;
-            };
-            let Some(method_name) = typed_constant_string_value(self.module, getattr.attr.as_ref())
-            else {
-                self.error = Some(format!(
-                    "optimizer v3 emitted method-call at {}, but method attribute is not a constant string",
-                    instr_id
-                ));
-                return;
-            };
-            if method_calls.method_name != method_name {
-                self.error = Some(format!(
-                    "optimizer v3 emitted method-call at {} for method {}, but lowered call uses {}",
-                    instr_id, method_calls.method_name, method_name
-                ));
-                return;
-            }
             if method_calls.guards.is_empty() {
                 // The v3 source still owns this call site, but guard
                 // preparation declined before typed lowering.
@@ -32170,7 +30256,7 @@ fn annotate_opt_v3_method_call_access_plans(
             }
 
             call.access = TypedCallAccessPlan::GuardedMethod {
-                method_name: method_name.to_string(),
+                method_name: method_calls.method_name.clone(),
                 method_guards: method_calls.guards.clone(),
             };
             self.count += 1;
@@ -32178,30 +30264,15 @@ fn annotate_opt_v3_method_call_access_plans(
     }
 
     let mut rewriter = Rewriter {
-        module,
         method_calls_by_instr,
-        seen_sources: HashSet::new(),
         count: 0,
-        error: None,
     };
     rewriter.visit_fn_mut(function);
-    if let Some(error) = rewriter.error {
-        return Err(error);
-    }
-    if let Some(source) = method_calls_by_instr
-        .keys()
-        .find(|source| !rewriter.seen_sources.contains(source))
-    {
-        return Err(format!(
-            "optimizer v3 emitted method-call at {}, but lowered function has no matching call",
-            source
-        ));
-    }
     Ok(rewriter.count)
 }
 
 fn prepare_specialized_typed_function(
-    module: &BlockPyModule<CodegenModuleShape>,
+    _module: &BlockPyModule<CodegenModuleShape>,
     function: &BlockPyFunction<CodegenModuleShape>,
     value_facts: &FactStore,
     field_index_specializations: &HashMap<String, Vec<FieldIndexSpecialization>>,
@@ -32220,7 +30291,6 @@ fn prepare_specialized_typed_function(
     let mut typed_function = lower_typed_function_if_tests_to_truthy(typed_function);
 
     annotate_typed_attr_accesses(
-        module,
         &mut typed_function,
         field_index_specializations,
         field_index_specializations_by_instr,
@@ -32232,11 +30302,7 @@ fn prepare_specialized_typed_function(
         &mut typed_function,
         opt_v3_constructor_calls_by_instr,
     )?;
-    annotate_opt_v3_method_call_access_plans(
-        module,
-        &mut typed_function,
-        opt_v3_method_calls_by_instr,
-    )?;
+    annotate_opt_v3_method_call_access_plans(&mut typed_function, opt_v3_method_calls_by_instr)?;
     annotate_typed_call_accesses(
         &mut typed_function,
         call_specialization_ctx,
@@ -32534,10 +30600,6 @@ fn build_cranelift_run_bb_specialized_function(
     let branch_prefer_true = specialization_inputs.branch_prefer_true;
     let cold_block_labels = specialization_inputs.cold_block_labels;
     let opt_v3_exact_int_branch_artifacts = specialization_inputs.opt_v3_exact_int_branch_artifacts;
-    validate_opt_v3_codegen_artifacts_for_function(
-        function,
-        opt_v3_exact_int_branch_artifacts.as_deref(),
-    )?;
     let behavior_change_indexed_stores = specialization_inputs.behavior_change_indexed_stores;
     let guard_miss_deopt_stub = specialization_inputs.guard_miss_deopt_stub;
     let function_runtime_data_layout = FunctionRuntimeDataLayout::from_function(function);
@@ -33253,6 +31315,7 @@ fn build_cranelift_run_bb_specialized_function(
                 global_indexed_hit_counter_ids: &global_indexed_hit_counter_ids,
                 global_indexed_fallback_counter_ids: &global_indexed_fallback_counter_ids,
                 opt_v3_indexed_globals_by_instr: &opt_v3_indexed_globals_by_instr,
+                opt_v3_indexed_fields_by_instr: &opt_v3_indexed_fields_by_instr,
                 field_indexed_hit_counter_ids: &field_indexed_hit_counter_ids,
                 field_indexed_fallback_counter_ids: &field_indexed_fallback_counter_ids,
                 field_generic_getattr_counter_ids: &field_generic_getattr_counter_ids,

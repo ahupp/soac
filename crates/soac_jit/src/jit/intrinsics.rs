@@ -2099,7 +2099,6 @@ fn emit_opt_v3_indexed_global_load_with_state<'fb>(
     globals_obj: ir::Value,
     plan: &OptV3IndexedGlobalAccessPlan,
 ) -> ir::Value {
-    plan.expect_lowering_shape(soac_opt::plan_v3::IndexedGlobalAccessKind::Load);
     let name_obj = state.emit_owned_string_constant(plan.name.as_str());
     let slot_index = state
         .fb()
@@ -2313,7 +2312,6 @@ fn emit_opt_v3_indexed_global_store_with_state<'fb, E: Instr<Name = ResolvedName
     arg_values: &[(ir::Value, bool)],
     plan: &OptV3IndexedGlobalAccessPlan,
 ) -> ir::Value {
-    plan.expect_lowering_shape(soac_opt::plan_v3::IndexedGlobalAccessKind::Store);
     if !state.ctx().behavior_change_indexed_stores {
         panic!(
             "optimizer v3 indexed-global store emission for {} reached codegen with indexed stores disabled",

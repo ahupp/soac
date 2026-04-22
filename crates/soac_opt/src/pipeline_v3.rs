@@ -10,10 +10,13 @@ use crate::plan::{
     OptimizationPlanGenerationSummary, ProfileEvidenceStore, cached_module_paths_under_root,
 };
 use crate::plan_v3::{
-    ConstructorCallOwnerType, DirectCallArgPlan, DirectCallArgSource,
-    EXACT_LIST_EXACT_INT_ITEM_SHAPE_TAG, ExactListItemAccessKind, ExactListItemShape,
-    FunctionPlanIdentity, IndexedFieldAccessKind, IndexedFieldOwnerType, IndexedGlobalAccessKind,
-    MethodCallOwnerType, ModulePlanIdentity, PlanDiagnostic, RegionId,
+    ConstructorCallOwnerType, ConstructorCallSpecializationPlan, DirectCallArgPlan,
+    DirectCallArgSource, DirectCallSpecializationPlan, EXACT_LIST_EXACT_INT_ITEM_SHAPE_TAG,
+    ExactListItemAccessKind, ExactListItemShape, ExactListItemSpecializationPlan,
+    FunctionOptimizationPlanV3, FunctionPlanIdentity, IndexedFieldAccessKind,
+    IndexedFieldOwnerType, IndexedFieldSpecializationPlan, IndexedGlobalAccessKind,
+    IndexedGlobalSpecializationPlan, MethodCallOwnerType, MethodCallSpecializationPlan,
+    ModuleOptimizationPlanV3, ModulePlanIdentity, PlanDiagnostic, RegionId,
 };
 use crate::planner_v3::{
     CallBodyPlanRequest, ConstructorCallPlanRequest, DirectCallPlanRequest,
@@ -396,6 +399,8 @@ fn plan_and_emit_module_v3_from_raw_evidence_with_target_index(
     for (function, diagnostics) in plan.functions.iter_mut().zip(diagnostics_by_function) {
         function.diagnostics.extend(diagnostics);
     }
+    validate_module_plan_v3_against_lowered_module(&plan, lowered_module)
+        .map_err(ExactIntBranchV3Error::Emit)?;
     let emission = emit_mechanical_plan_v3(&plan).map_err(ExactIntBranchV3Error::Emit)?;
     Ok(ExactIntBranchV3Artifacts { plan, emission })
 }
@@ -443,6 +448,529 @@ pub fn plan_and_emit_extracted_exact_int_branches_v3(
     }
     let emission = emit_mechanical_plan_v3(&plan).map_err(ExactIntBranchV3Error::Emit)?;
     Ok(ExactIntBranchV3Artifacts { plan, emission })
+}
+
+fn validate_module_plan_v3_against_lowered_module(
+    plan: &ModuleOptimizationPlanV3,
+    lowered_module: &BlockPyModule<CodegenModuleShape>,
+) -> Result<(), MechanicalEmitError> {
+    for planned_function in &plan.functions {
+        let local_function_id = planned_function.function.function.local_function_id();
+        let lowered_function = lowered_module
+            .callable_defs
+            .iter()
+            .find(|function| {
+                function.function_id.local_function_id().as_u32() == local_function_id.as_u32()
+            })
+            .ok_or_else(|| {
+                MechanicalEmitError::EmissionMismatch(format!(
+                    "function {} has no matching lowered function",
+                    planned_function.function.function
+                ))
+            })?;
+        validate_function_plan_v3_against_lowered_function(
+            plan,
+            planned_function,
+            lowered_module,
+            lowered_function,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_function_plan_v3_against_lowered_function(
+    plan: &ModuleOptimizationPlanV3,
+    planned_function: &FunctionOptimizationPlanV3,
+    lowered_module: &BlockPyModule<CodegenModuleShape>,
+    lowered_function: &BlockPyFunction<CodegenModuleShape>,
+) -> Result<(), MechanicalEmitError> {
+    if !planned_function.direct_calls.is_empty()
+        || !planned_function.constructor_calls.is_empty()
+        || !planned_function.method_calls.is_empty()
+    {
+        let lowered_calls = lowered_calls_by_instr_v3(lowered_module, lowered_function)?;
+        for direct_call in &planned_function.direct_calls {
+            validate_direct_call_plan_against_lowered_function(
+                direct_call,
+                planned_function,
+                lowered_function,
+                &lowered_calls,
+            )?;
+        }
+        for constructor_call in &planned_function.constructor_calls {
+            validate_constructor_call_plan_against_lowered_function(
+                constructor_call,
+                planned_function,
+                lowered_function,
+                &lowered_calls,
+            )?;
+        }
+        for method_call in &planned_function.method_calls {
+            validate_method_call_plan_against_lowered_function(
+                method_call,
+                planned_function,
+                lowered_function,
+                &lowered_calls,
+            )?;
+        }
+    }
+    if !planned_function.exact_list_items.is_empty() {
+        let lowered_accesses = lowered_item_accesses_by_instr_v3(lowered_function);
+        for item in &planned_function.exact_list_items {
+            validate_exact_list_item_plan_against_lowered_function(
+                item,
+                planned_function,
+                lowered_function,
+                &lowered_accesses,
+            )?;
+        }
+    }
+    if !planned_function.indexed_fields.is_empty() {
+        let lowered_accesses =
+            lowered_field_accesses_by_instr_v3(lowered_module, lowered_function)?;
+        for indexed_field in &planned_function.indexed_fields {
+            validate_indexed_field_plan_against_lowered_function(
+                indexed_field,
+                planned_function,
+                lowered_function,
+                &lowered_accesses,
+            )?;
+        }
+    }
+    if !planned_function.indexed_globals.is_empty() {
+        let lowered_accesses = lowered_global_accesses_by_instr_v3(lowered_function);
+        for indexed_global in &planned_function.indexed_globals {
+            if indexed_global.module_name != plan.module.module_name {
+                return Err(MechanicalEmitError::EmissionMismatch(format!(
+                    "function {} indexed-global at {} names module {}, expected {}",
+                    planned_function.function.function,
+                    indexed_global.source,
+                    indexed_global.module_name,
+                    plan.module.module_name
+                )));
+            }
+            validate_indexed_global_plan_against_lowered_function(
+                indexed_global,
+                planned_function,
+                lowered_function,
+                &lowered_accesses,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LoweredCallAccessV3 {
+    method_name: Option<String>,
+}
+
+fn lowered_calls_by_instr_v3(
+    module: &BlockPyModule<CodegenModuleShape>,
+    function: &BlockPyFunction<CodegenModuleShape>,
+) -> Result<HashMap<InstrId, LoweredCallAccessV3>, MechanicalEmitError> {
+    struct Collector<'a> {
+        module: &'a BlockPyModule<CodegenModuleShape>,
+        calls: HashMap<InstrId, LoweredCallAccessV3>,
+        error: Option<MechanicalEmitError>,
+    }
+
+    impl Visit<InstrCodegen> for Collector<'_> {
+        fn visit_instr(&mut self, expr: &InstrCodegen)
+        where
+            InstrCodegen: ChildVisitable<InstrCodegen>,
+        {
+            if self.error.is_some() {
+                return;
+            }
+            if let InstrCodegen::Call(call) = expr
+                && let Some(source) = call.try_semantic_instr_id()
+            {
+                let method_name = match call.func.as_ref() {
+                    InstrCodegen::GetAttr(getattr) => {
+                        let Some(method_name) =
+                            codegen_constant_string_value_v3(self.module, getattr.attr.as_ref())
+                        else {
+                            self.error = Some(MechanicalEmitError::EmissionMismatch(format!(
+                                "method-call source {source} has non-constant lowered attribute"
+                            )));
+                            return;
+                        };
+                        Some(method_name.to_string())
+                    }
+                    _ => None,
+                };
+                self.calls
+                    .insert(source, LoweredCallAccessV3 { method_name });
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    let mut collector = Collector {
+        module,
+        calls: HashMap::new(),
+        error: None,
+    };
+    collector.visit_fn(function);
+    if let Some(error) = collector.error {
+        return Err(error);
+    }
+    Ok(collector.calls)
+}
+
+fn validate_direct_call_plan_against_lowered_function(
+    plan: &DirectCallSpecializationPlan,
+    planned_function: &FunctionOptimizationPlanV3,
+    lowered_function: &BlockPyFunction<CodegenModuleShape>,
+    lowered_calls: &HashMap<InstrId, LoweredCallAccessV3>,
+) -> Result<(), MechanicalEmitError> {
+    if !lowered_calls.contains_key(&plan.source) {
+        return Err(MechanicalEmitError::EmissionMismatch(format!(
+            "function {} direct-call at {}, but lowered function {} has no call with that source",
+            planned_function.function.function, plan.source, lowered_function.function_id
+        )));
+    }
+    Ok(())
+}
+
+fn validate_constructor_call_plan_against_lowered_function(
+    plan: &ConstructorCallSpecializationPlan,
+    planned_function: &FunctionOptimizationPlanV3,
+    lowered_function: &BlockPyFunction<CodegenModuleShape>,
+    lowered_calls: &HashMap<InstrId, LoweredCallAccessV3>,
+) -> Result<(), MechanicalEmitError> {
+    let Some(lowered) = lowered_calls.get(&plan.source) else {
+        return Err(MechanicalEmitError::EmissionMismatch(format!(
+            "function {} constructor-call at {}, but lowered function {} has no call with that source",
+            planned_function.function.function, plan.source, lowered_function.function_id
+        )));
+    };
+    if lowered.method_name.is_some() {
+        return Err(MechanicalEmitError::EmissionMismatch(format!(
+            "function {} constructor-call at {} selects a lowered method call",
+            planned_function.function.function, plan.source
+        )));
+    }
+    Ok(())
+}
+
+fn validate_method_call_plan_against_lowered_function(
+    plan: &MethodCallSpecializationPlan,
+    planned_function: &FunctionOptimizationPlanV3,
+    lowered_function: &BlockPyFunction<CodegenModuleShape>,
+    lowered_calls: &HashMap<InstrId, LoweredCallAccessV3>,
+) -> Result<(), MechanicalEmitError> {
+    let Some(lowered) = lowered_calls.get(&plan.source) else {
+        return Err(MechanicalEmitError::EmissionMismatch(format!(
+            "function {} method-call at {}, but lowered function {} has no call with that source",
+            planned_function.function.function, plan.source, lowered_function.function_id
+        )));
+    };
+    match lowered.method_name.as_deref() {
+        Some(method_name) if method_name == plan.method_name => Ok(()),
+        Some(method_name) => Err(MechanicalEmitError::EmissionMismatch(format!(
+            "function {} method-call at {} selects method {}, but lowered call uses {}",
+            planned_function.function.function, plan.source, plan.method_name, method_name
+        ))),
+        None => Err(MechanicalEmitError::EmissionMismatch(format!(
+            "function {} method-call at {} does not lower from GetAttr",
+            planned_function.function.function, plan.source
+        ))),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LoweredFieldAccessV3 {
+    access: IndexedFieldAccessKind,
+    attr_name: String,
+}
+
+fn lowered_field_accesses_by_instr_v3(
+    module: &BlockPyModule<CodegenModuleShape>,
+    function: &BlockPyFunction<CodegenModuleShape>,
+) -> Result<HashMap<InstrId, LoweredFieldAccessV3>, MechanicalEmitError> {
+    struct Collector<'a> {
+        module: &'a BlockPyModule<CodegenModuleShape>,
+        accesses: HashMap<InstrId, LoweredFieldAccessV3>,
+        error: Option<MechanicalEmitError>,
+    }
+
+    impl Collector<'_> {
+        fn attr_name_for_source(&mut self, source: InstrId, attr: &InstrCodegen) -> Option<String> {
+            match codegen_constant_string_value_v3(self.module, attr) {
+                Some(attr_name) => Some(attr_name.to_string()),
+                None => {
+                    self.error = Some(MechanicalEmitError::EmissionMismatch(format!(
+                        "indexed-field source {source} expected constant attribute, but lowered attr is not a module string constant"
+                    )));
+                    None
+                }
+            }
+        }
+    }
+
+    impl Visit<InstrCodegen> for Collector<'_> {
+        fn visit_instr(&mut self, expr: &InstrCodegen)
+        where
+            InstrCodegen: ChildVisitable<InstrCodegen>,
+        {
+            if self.error.is_some() {
+                return;
+            }
+            match expr {
+                InstrCodegen::GetAttr(op) => {
+                    let source = op.semantic_instr_id();
+                    if let Some(attr_name) = self.attr_name_for_source(source, op.attr.as_ref()) {
+                        self.accesses.insert(
+                            source,
+                            LoweredFieldAccessV3 {
+                                access: IndexedFieldAccessKind::Load,
+                                attr_name,
+                            },
+                        );
+                    }
+                }
+                InstrCodegen::SetAttr(op) => {
+                    let source = op.semantic_instr_id();
+                    if let Some(attr_name) = self.attr_name_for_source(source, op.attr.as_ref()) {
+                        self.accesses.insert(
+                            source,
+                            LoweredFieldAccessV3 {
+                                access: IndexedFieldAccessKind::Store,
+                                attr_name,
+                            },
+                        );
+                    }
+                }
+                _ => {}
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    let mut collector = Collector {
+        module,
+        accesses: HashMap::new(),
+        error: None,
+    };
+    collector.visit_fn(function);
+    if let Some(error) = collector.error {
+        return Err(error);
+    }
+    Ok(collector.accesses)
+}
+
+fn validate_indexed_field_plan_against_lowered_function(
+    plan: &IndexedFieldSpecializationPlan,
+    planned_function: &FunctionOptimizationPlanV3,
+    lowered_function: &BlockPyFunction<CodegenModuleShape>,
+    lowered_accesses: &HashMap<InstrId, LoweredFieldAccessV3>,
+) -> Result<(), MechanicalEmitError> {
+    let Some(lowered) = lowered_accesses.get(&plan.source) else {
+        return Err(MechanicalEmitError::EmissionMismatch(format!(
+            "function {} indexed-field {:?} {} at {}, but lowered function {} has no GetAttr/SetAttr with that source",
+            planned_function.function.function,
+            plan.access,
+            plan.attr_name,
+            plan.source,
+            lowered_function.function_id
+        )));
+    };
+    if lowered.access != plan.access {
+        return Err(MechanicalEmitError::EmissionMismatch(format!(
+            "function {} indexed-field {:?} for {}, but lowered instruction is {:?}",
+            planned_function.function.function, plan.access, plan.source, lowered.access
+        )));
+    }
+    if lowered.attr_name != plan.attr_name {
+        return Err(MechanicalEmitError::EmissionMismatch(format!(
+            "function {} indexed-field attr {:?} for {}, but lowered instruction uses {:?}",
+            planned_function.function.function, plan.attr_name, plan.source, lowered.attr_name
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LoweredItemAccessV3 {
+    access: ExactListItemAccessKind,
+}
+
+fn lowered_item_accesses_by_instr_v3(
+    function: &BlockPyFunction<CodegenModuleShape>,
+) -> HashMap<InstrId, LoweredItemAccessV3> {
+    struct Collector {
+        accesses: HashMap<InstrId, LoweredItemAccessV3>,
+    }
+
+    impl Visit<InstrCodegen> for Collector {
+        fn visit_instr(&mut self, expr: &InstrCodegen)
+        where
+            InstrCodegen: ChildVisitable<InstrCodegen>,
+        {
+            match expr {
+                InstrCodegen::GetItem(op) => {
+                    self.accesses.insert(
+                        op.semantic_instr_id(),
+                        LoweredItemAccessV3 {
+                            access: ExactListItemAccessKind::Get,
+                        },
+                    );
+                }
+                InstrCodegen::SetItem(op) => {
+                    self.accesses.insert(
+                        op.semantic_instr_id(),
+                        LoweredItemAccessV3 {
+                            access: ExactListItemAccessKind::Set,
+                        },
+                    );
+                }
+                _ => {}
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    let mut collector = Collector {
+        accesses: HashMap::new(),
+    };
+    collector.visit_fn(function);
+    collector.accesses
+}
+
+fn validate_exact_list_item_plan_against_lowered_function(
+    plan: &ExactListItemSpecializationPlan,
+    planned_function: &FunctionOptimizationPlanV3,
+    lowered_function: &BlockPyFunction<CodegenModuleShape>,
+    lowered_accesses: &HashMap<InstrId, LoweredItemAccessV3>,
+) -> Result<(), MechanicalEmitError> {
+    let Some(lowered) = lowered_accesses.get(&plan.source) else {
+        return Err(MechanicalEmitError::EmissionMismatch(format!(
+            "function {} exact-list item {:?} {:?} at {}, but lowered function {} has no getitem/setitem with that source",
+            planned_function.function.function,
+            plan.access,
+            plan.shape,
+            plan.source,
+            lowered_function.function_id
+        )));
+    };
+    if lowered.access != plan.access {
+        return Err(MechanicalEmitError::EmissionMismatch(format!(
+            "function {} exact-list item {:?} for {}, but lowered instruction is {:?}",
+            planned_function.function.function, plan.access, plan.source, lowered.access
+        )));
+    }
+    if plan.shape != ExactListItemShape::ExactListExactInt {
+        return Err(MechanicalEmitError::EmissionMismatch(format!(
+            "function {} exact-list item shape {:?} for {}, but codegen only supports ExactListExactInt",
+            planned_function.function.function, plan.shape, plan.source
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LoweredGlobalAccessV3 {
+    access: IndexedGlobalAccessKind,
+    name: String,
+    slot: u32,
+}
+
+fn lowered_global_accesses_by_instr_v3(
+    function: &BlockPyFunction<CodegenModuleShape>,
+) -> HashMap<InstrId, LoweredGlobalAccessV3> {
+    struct Collector {
+        accesses: HashMap<InstrId, LoweredGlobalAccessV3>,
+    }
+
+    impl Visit<InstrCodegen> for Collector {
+        fn visit_instr(&mut self, expr: &InstrCodegen)
+        where
+            InstrCodegen: ChildVisitable<InstrCodegen>,
+        {
+            match expr {
+                InstrCodegen::Load(op) => {
+                    if let NameLocation::Global(slot) = op.name.location {
+                        let Some(source) = op.try_semantic_instr_id() else {
+                            expr.visit_children(self);
+                            return;
+                        };
+                        self.accesses.insert(
+                            source,
+                            LoweredGlobalAccessV3 {
+                                access: IndexedGlobalAccessKind::Load,
+                                name: op.name.id_str().to_string(),
+                                slot: slot.slot(),
+                            },
+                        );
+                    }
+                }
+                InstrCodegen::Store(op) => {
+                    if let NameLocation::Global(slot) = op.name.location {
+                        let Some(source) = op.try_semantic_instr_id() else {
+                            expr.visit_children(self);
+                            return;
+                        };
+                        self.accesses.insert(
+                            source,
+                            LoweredGlobalAccessV3 {
+                                access: IndexedGlobalAccessKind::Store,
+                                name: op.name.id_str().to_string(),
+                                slot: slot.slot(),
+                            },
+                        );
+                    }
+                }
+                _ => {}
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    let mut collector = Collector {
+        accesses: HashMap::new(),
+    };
+    collector.visit_fn(function);
+    collector.accesses
+}
+
+fn validate_indexed_global_plan_against_lowered_function(
+    plan: &IndexedGlobalSpecializationPlan,
+    planned_function: &FunctionOptimizationPlanV3,
+    lowered_function: &BlockPyFunction<CodegenModuleShape>,
+    lowered_accesses: &HashMap<InstrId, LoweredGlobalAccessV3>,
+) -> Result<(), MechanicalEmitError> {
+    let Some(lowered) = lowered_accesses.get(&plan.source) else {
+        return Err(MechanicalEmitError::EmissionMismatch(format!(
+            "function {} indexed-global {:?} {}.{} at {}, but lowered function {} has no global load/store with that source",
+            planned_function.function.function,
+            plan.access,
+            plan.module_name,
+            plan.name,
+            plan.source,
+            lowered_function.function_id
+        )));
+    };
+    if lowered.access != plan.access {
+        return Err(MechanicalEmitError::EmissionMismatch(format!(
+            "function {} indexed-global {:?} for {}, but lowered instruction is {:?}",
+            planned_function.function.function, plan.access, plan.source, lowered.access
+        )));
+    }
+    if lowered.name != plan.name {
+        return Err(MechanicalEmitError::EmissionMismatch(format!(
+            "function {} indexed-global name {:?} for {}, but lowered instruction uses {:?}",
+            planned_function.function.function, plan.name, plan.source, lowered.name
+        )));
+    }
+    if lowered.slot != plan.expected_index {
+        return Err(MechanicalEmitError::EmissionMismatch(format!(
+            "function {} indexed-global slot {} for {}, but lowered instruction uses global slot {}",
+            planned_function.function.function, plan.expected_index, plan.source, lowered.slot
+        )));
+    }
+    Ok(())
 }
 
 fn function_plan_identity_v3(

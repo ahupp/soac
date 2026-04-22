@@ -37,6 +37,7 @@ mod tests {
     use soac_lowering::passes::{TypedInstrExtra, TypedPlannedResult as PlannedResult};
     use soac_opt::alternatives_v3::AlternativeCatalog;
     use soac_opt::artifacts_v3::{ExactIntBranchV3Artifacts, write_optimization_artifacts_v3};
+    use soac_opt::emit_v3::{MechanicalIndexedFieldGuard, MechanicalModuleEmission};
     use soac_opt::pipeline_v3::plan_and_emit_function_exact_int_branches_v3_with_module_constants;
     use soac_opt::plan::{
         FunctionOptimizationPlan, FunctionProfileEvidence, OptimizationDecision, OptimizationPlan,
@@ -48,12 +49,13 @@ mod tests {
         ConstructorCallGuardKind, ConstructorCallGuardPlan, ConstructorCallOwnerType,
         ConstructorCallSpecializationPlan, Cost, DirectCallArgPlan as PlanV3DirectCallArgPlan,
         DirectCallArgSource as PlanV3DirectCallArgSource, DirectCallSpecializationPlan,
-        FunctionPlanIdentity, IndexedFieldAccessKind, IndexedFieldOwnerType,
-        IndexedFieldSpecializationPlan, IndexedGlobalAccessKind, IndexedGlobalFallbackKind,
-        IndexedGlobalFallbackPlan, IndexedGlobalGuardKind, IndexedGlobalGuardPlan,
-        IndexedGlobalSpecializationPlan, MethodCallFallbackKind, MethodCallFallbackPlan,
-        MethodCallGuardKind, MethodCallGuardPlan, MethodCallOwnerType,
-        MethodCallSpecializationPlan, ModulePlanIdentity,
+        FunctionPlanIdentity, IndexedFieldAccessKind, IndexedFieldFallbackKind,
+        IndexedFieldFallbackPlan, IndexedFieldGuardKind, IndexedFieldGuardPlan,
+        IndexedFieldOwnerType, IndexedFieldSpecializationPlan, IndexedGlobalAccessKind,
+        IndexedGlobalFallbackKind, IndexedGlobalFallbackPlan, IndexedGlobalGuardKind,
+        IndexedGlobalGuardPlan, IndexedGlobalSpecializationPlan, MethodCallFallbackKind,
+        MethodCallFallbackPlan, MethodCallGuardKind, MethodCallGuardPlan, MethodCallOwnerType,
+        MethodCallSpecializationPlan, ModuleOptimizationPlanV3, ModulePlanIdentity,
     };
     use std::collections::{HashMap, VecDeque};
     use std::ffi::c_void;
@@ -3167,6 +3169,7 @@ def build(values):
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
                     indexed_globals: Vec::new(),
+                    scalar_threads: Vec::new(),
                     regions: Vec::new(),
                 }],
             },
@@ -4186,84 +4189,6 @@ def build(values):
     }
 
     #[test]
-    fn opt_v3_direct_call_emission_rejects_inline_body_plan() {
-        let mut constants = TestConstantPool::default();
-        let call_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
-        let target = RuntimeFunctionId::from_raw_parts(0, 7);
-        let call = with_instr_id(
-            op_expr(Call::new(
-                name_expr(test_runtime_name("callable")),
-                vec![CallArgPositional::Positional(constants.int_expr(1))],
-                Vec::<CallArgKeyword<InstrCodegen>>::new(),
-            )),
-            call_instr_id,
-        );
-        let function =
-            with_single_test_block(test_function(), vec![call], ret_term(constants.int_expr(2)));
-        let mut typed_function = lower_codegen_function_to_typed(function);
-        let direct_call_plan = OptV3DirectCallPlan {
-            source: call_instr_id,
-            target,
-            arg_plan: TypedDirectCallArgPlan {
-                sources: vec![TypedDirectCallArgSource::Provided(0)],
-            },
-            body: test_v3_inline_call_body(),
-            reason: "profiled direct call".to_string(),
-        };
-
-        let err = annotate_opt_v3_direct_call_access_plans(
-            &mut typed_function,
-            &HashMap::from([(call_instr_id, vec![direct_call_plan])]),
-        )
-        .expect_err("Inline direct-call bodies should not reach typed lowering");
-
-        assert!(
-            err.contains("typed call-access annotation only consumes DirectCall bodies"),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn opt_v3_direct_call_emission_rejects_unmatched_source() {
-        let mut constants = TestConstantPool::default();
-        let call_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
-        let missing_source = InstrId::new(BlockLabel::from_index(7), 11);
-        let target = RuntimeFunctionId::from_raw_parts(0, 7);
-        let call = with_instr_id(
-            op_expr(Call::new(
-                name_expr(test_runtime_name("callable")),
-                vec![CallArgPositional::Positional(constants.int_expr(1))],
-                Vec::<CallArgKeyword<InstrCodegen>>::new(),
-            )),
-            call_instr_id,
-        );
-        let function =
-            with_single_test_block(test_function(), vec![call], ret_term(constants.int_expr(2)));
-        let mut typed_function = lower_codegen_function_to_typed(function);
-        let direct_call_plan = OptV3DirectCallPlan {
-            source: missing_source,
-            target,
-            arg_plan: TypedDirectCallArgPlan {
-                sources: vec![TypedDirectCallArgSource::Provided(0)],
-            },
-            body: test_v3_direct_call_body(),
-            reason: "profiled direct call".to_string(),
-        };
-
-        let err = annotate_opt_v3_direct_call_access_plans(
-            &mut typed_function,
-            &HashMap::from([(missing_source, vec![direct_call_plan])]),
-        )
-        .expect_err("unmatched v3 direct-call source should be rejected");
-
-        assert!(
-            err.contains("optimizer v3 emitted direct-call")
-                && err.contains("lowered function has no matching call"),
-            "{err}"
-        );
-    }
-
-    #[test]
     fn legacy_call_targets_for_codegen_exclude_v3_call_sources() {
         let legacy_source = InstrId::new(BlockLabel::from_index(0), 1);
         let direct_source = InstrId::new(BlockLabel::from_index(0), 2);
@@ -4475,7 +4400,6 @@ def build(values):
     fn opt_v3_constructor_call_emission_declines_selected_source_without_runtime_guard() {
         let mut constants = TestConstantPool::default();
         let call_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
-        let target = RuntimeFunctionId::from_raw_parts(0, 7);
         let call = with_instr_id(
             op_expr(Call::new(
                 name_expr(test_global_name("Box")),
@@ -4487,29 +4411,10 @@ def build(values):
         let function =
             with_single_test_block(test_function(), vec![call], ret_term(constants.int_expr(2)));
         let mut typed_function = lower_codegen_function_to_typed(function);
-        let constructor_call_plan = OptV3ConstructorCallPlan {
-            source: call_instr_id,
-            target,
-            owner_type: PlanV3ConstructorCallOwnerType {
-                module_name: "missing_v3_constructor_type".to_string(),
-                qualname: "Box".to_string(),
-            },
-            arg_plan: TypedDirectCallArgPlan {
-                sources: vec![
-                    TypedDirectCallArgSource::Provided(0),
-                    TypedDirectCallArgSource::Provided(1),
-                ],
-            },
-            guard: PlanV3ConstructorCallGuardKind::ExactCallableTypeVersion,
-            fallback: PlanV3ConstructorCallFallbackKind::OriginalConstructorCall,
-            body: test_v3_direct_call_body(),
-            inline_target: None,
-            reason: "profiled constructor call".to_string(),
-        };
-        let prepared_constructor_calls = prepare_opt_v3_constructor_call_plans_for_codegen(
-            &HashMap::from([(call_instr_id, vec![constructor_call_plan])]),
-        )
-        .expect("constructor guard preparation should succeed");
+        let prepared_constructor_calls = HashMap::from([(
+            call_instr_id,
+            OptV3PreparedConstructorCallPlan { guards: Vec::new() },
+        )]);
         assert!(
             prepared_constructor_calls
                 .get(&call_instr_id)
@@ -4543,7 +4448,6 @@ def build(values):
     fn opt_v3_method_call_emission_declines_selected_source_without_runtime_guard() {
         let mut constants = TestConstantPool::default();
         let call_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
-        let target = RuntimeFunctionId::from_raw_parts(0, 7);
         let call = with_instr_id(
             op_expr(Call::new(
                 op_expr(GetAttr::new(
@@ -4557,34 +4461,14 @@ def build(values):
         );
         let function =
             with_single_test_block(test_function(), vec![call], ret_term(constants.int_expr(2)));
-        let mut module = test_module(ModuleNameGen::new(0), vec![function.clone()]);
-        module.module_constants = constants.module_constants;
         let mut typed_function = lower_codegen_function_to_typed(function);
-        let method_call_plan = OptV3MethodCallPlan {
-            source: call_instr_id,
-            target,
-            method_name: "get".to_string(),
-            owner_type: PlanV3MethodCallOwnerType {
-                module_name: "missing_v3_method_type".to_string(),
-                qualname: "Box".to_string(),
+        let prepared_method_calls = HashMap::from([(
+            call_instr_id,
+            OptV3PreparedMethodCallPlan {
+                method_name: "get".to_string(),
+                guards: Vec::new(),
             },
-            arg_plan: TypedDirectCallArgPlan {
-                sources: vec![
-                    TypedDirectCallArgSource::Provided(0),
-                    TypedDirectCallArgSource::Provided(1),
-                ],
-            },
-            guard: PlanV3MethodCallGuardKind::ExactReceiverTypeVersion,
-            fallback: PlanV3MethodCallFallbackKind::OriginalMethodCall,
-            body: test_v3_direct_call_body(),
-            reason: "profiled method call".to_string(),
-        };
-        let prepared_method_calls =
-            prepare_opt_v3_method_call_plans_for_codegen(&HashMap::from([(
-                call_instr_id,
-                vec![method_call_plan],
-            )]))
-            .expect("method guard preparation should succeed");
+        )]);
         assert!(
             prepared_method_calls
                 .get(&call_instr_id)
@@ -4595,12 +4479,8 @@ def build(values):
         );
 
         assert_eq!(
-            annotate_opt_v3_method_call_access_plans(
-                &module,
-                &mut typed_function,
-                &prepared_method_calls,
-            )
-            .expect("unresolved runtime guard should leave generic method call in place"),
+            annotate_opt_v3_method_call_access_plans(&mut typed_function, &prepared_method_calls)
+                .expect("unresolved runtime guard should leave generic method call in place"),
             0
         );
 
@@ -4616,10 +4496,9 @@ def build(values):
     }
 
     #[test]
-    fn opt_v3_method_call_emission_rejects_selected_source_with_wrong_call_shape() {
+    fn opt_v3_method_call_annotation_trusts_prevalidated_source_shape() {
         let mut constants = TestConstantPool::default();
         let call_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
-        let target = RuntimeFunctionId::from_raw_parts(0, 7);
         let call = with_instr_id(
             op_expr(Call::new(
                 name_expr(test_local_name("get", 0)),
@@ -4630,46 +4509,19 @@ def build(values):
         );
         let function =
             with_single_test_block(test_function(), vec![call], ret_term(constants.int_expr(2)));
-        let mut module = test_module(ModuleNameGen::new(0), vec![function.clone()]);
-        module.module_constants = constants.module_constants;
         let mut typed_function = lower_codegen_function_to_typed(function);
-        let method_call_plan = OptV3MethodCallPlan {
-            source: call_instr_id,
-            target,
-            method_name: "get".to_string(),
-            owner_type: PlanV3MethodCallOwnerType {
-                module_name: "missing_v3_method_type".to_string(),
-                qualname: "Box".to_string(),
+        let prepared_method_calls = HashMap::from([(
+            call_instr_id,
+            OptV3PreparedMethodCallPlan {
+                method_name: "get".to_string(),
+                guards: Vec::new(),
             },
-            arg_plan: TypedDirectCallArgPlan {
-                sources: vec![
-                    TypedDirectCallArgSource::Provided(0),
-                    TypedDirectCallArgSource::Provided(1),
-                ],
-            },
-            guard: PlanV3MethodCallGuardKind::ExactReceiverTypeVersion,
-            fallback: PlanV3MethodCallFallbackKind::OriginalMethodCall,
-            body: test_v3_direct_call_body(),
-            reason: "profiled method call".to_string(),
-        };
-        let prepared_method_calls =
-            prepare_opt_v3_method_call_plans_for_codegen(&HashMap::from([(
-                call_instr_id,
-                vec![method_call_plan],
-            )]))
-            .expect("method guard preparation should succeed");
+        )]);
 
-        let err = annotate_opt_v3_method_call_access_plans(
-            &module,
-            &mut typed_function,
-            &prepared_method_calls,
-        )
-        .expect_err("v3 method-call selection should still reject a non-method source");
-
-        assert!(
-            err.contains("optimizer v3 emitted method-call")
-                && err.contains("lowered source is not a GetAttr call"),
-            "{err}"
+        assert_eq!(
+            annotate_opt_v3_method_call_access_plans(&mut typed_function, &prepared_method_calls)
+                .expect("JIT annotation should trust the prevalidated v3 method-call source"),
+            0
         );
     }
 
@@ -8023,6 +7875,12 @@ def read_point(point):
                 module_name: "field_type_test".to_string(),
                 qualname: "Point".to_string(),
             };
+            let field_guard = IndexedFieldGuardPlan {
+                kind: IndexedFieldGuardKind::OwnerTypeVersionAndFieldIndex,
+            };
+            let field_fallback = IndexedFieldFallbackPlan {
+                kind: IndexedFieldFallbackKind::OriginalAttrAccess,
+            };
             artifacts.plan.functions[0]
                 .indexed_fields
                 .push(IndexedFieldSpecializationPlan {
@@ -8031,15 +7889,21 @@ def read_point(point):
                     owner_type: owner_type.clone(),
                     attr_name: "x".to_string(),
                     expected_index: 0,
+                    guard: field_guard.clone(),
+                    fallback: field_fallback.clone(),
                     reason: "profiled type_keys selected this indexed-field layout".to_string(),
                 });
             artifacts.emission.functions[0].indexed_fields.push(
                 soac_opt::emit_v3::MechanicalIndexedFieldEmission {
                     source: getattr_instr_id,
                     access: IndexedFieldAccessKind::Load,
-                    owner_type,
-                    attr_name: "x".to_string(),
-                    expected_index: 0,
+                    guard: MechanicalIndexedFieldGuard {
+                        kind: field_guard.kind,
+                        owner_type,
+                        attr_name: "x".to_string(),
+                        expected_index: 0,
+                    },
+                    fallback: field_fallback,
                     reason: "profiled type_keys selected this indexed-field layout".to_string(),
                 },
             );
@@ -17539,6 +17403,7 @@ def f(x):
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
                     indexed_globals: Vec::new(),
+                    scalar_threads: Vec::new(),
                     regions: Vec::new(),
                 }],
             },
@@ -17642,6 +17507,7 @@ def f(x):
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
                     indexed_globals: Vec::new(),
+                    scalar_threads: Vec::new(),
                     regions: Vec::new(),
                 }],
             },
@@ -17790,6 +17656,7 @@ def f(x):
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
                     indexed_globals: Vec::new(),
+                    scalar_threads: Vec::new(),
                     regions: Vec::new(),
                 }],
             },
@@ -17912,6 +17779,7 @@ def f(x):
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
                     indexed_globals: Vec::new(),
+                    scalar_threads: Vec::new(),
                     regions: Vec::new(),
                 }],
             },
@@ -18035,6 +17903,7 @@ def f(x):
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
                     indexed_globals: Vec::new(),
+                    scalar_threads: Vec::new(),
                     regions: Vec::new(),
                 }],
             },
@@ -18162,6 +18031,12 @@ def f(x):
                             owner_type: owner_type.clone(),
                             attr_name: "value".to_string(),
                             expected_index: 2,
+                            guard: IndexedFieldGuardPlan {
+                                kind: IndexedFieldGuardKind::OwnerTypeVersionAndFieldIndex,
+                            },
+                            fallback: IndexedFieldFallbackPlan {
+                                kind: IndexedFieldFallbackKind::OriginalAttrAccess,
+                            },
                             reason: "profiled type_keys selected this indexed-field layout"
                                 .to_string(),
                         },
@@ -18171,6 +18046,12 @@ def f(x):
                             owner_type: owner_type.clone(),
                             attr_name: "value".to_string(),
                             expected_index: 2,
+                            guard: IndexedFieldGuardPlan {
+                                kind: IndexedFieldGuardKind::OwnerTypeVersionAndFieldIndex,
+                            },
+                            fallback: IndexedFieldFallbackPlan {
+                                kind: IndexedFieldFallbackKind::OriginalAttrAccess,
+                            },
                             reason: "profiled type_keys selected this indexed-field layout"
                                 .to_string(),
                         },
@@ -18194,23 +18075,36 @@ def f(x):
                         soac_opt::emit_v3::MechanicalIndexedFieldEmission {
                             source: load_source,
                             access: IndexedFieldAccessKind::Load,
-                            owner_type: owner_type.clone(),
-                            attr_name: "value".to_string(),
-                            expected_index: 2,
+                            guard: MechanicalIndexedFieldGuard {
+                                kind: IndexedFieldGuardKind::OwnerTypeVersionAndFieldIndex,
+                                owner_type: owner_type.clone(),
+                                attr_name: "value".to_string(),
+                                expected_index: 2,
+                            },
+                            fallback: IndexedFieldFallbackPlan {
+                                kind: IndexedFieldFallbackKind::OriginalAttrAccess,
+                            },
                             reason: "profiled type_keys selected this indexed-field layout"
                                 .to_string(),
                         },
                         soac_opt::emit_v3::MechanicalIndexedFieldEmission {
                             source: store_source,
                             access: IndexedFieldAccessKind::Store,
-                            owner_type: owner_type.clone(),
-                            attr_name: "value".to_string(),
-                            expected_index: 2,
+                            guard: MechanicalIndexedFieldGuard {
+                                kind: IndexedFieldGuardKind::OwnerTypeVersionAndFieldIndex,
+                                owner_type: owner_type.clone(),
+                                attr_name: "value".to_string(),
+                                expected_index: 2,
+                            },
+                            fallback: IndexedFieldFallbackPlan {
+                                kind: IndexedFieldFallbackKind::OriginalAttrAccess,
+                            },
                             reason: "profiled type_keys selected this indexed-field layout"
                                 .to_string(),
                         },
                     ],
                     indexed_globals: Vec::new(),
+                    scalar_threads: Vec::new(),
                     regions: Vec::new(),
                 }],
             },
@@ -18234,9 +18128,13 @@ def f(x):
                 .unwrap(),
             &vec![OptV3IndexedFieldAccessPlan {
                 access: IndexedFieldAccessKind::Load,
-                owner_type: owner_type.clone(),
-                attr_name: "value".to_string(),
-                expected_index: 2,
+                guard: MechanicalIndexedFieldGuard {
+                    kind: IndexedFieldGuardKind::OwnerTypeVersionAndFieldIndex,
+                    owner_type: owner_type.clone(),
+                    attr_name: "value".to_string(),
+                    expected_index: 2,
+                },
+                fallback: IndexedFieldFallbackKind::OriginalAttrAccess,
             }]
         );
         assert_eq!(
@@ -18248,34 +18146,18 @@ def f(x):
                 .unwrap(),
             &vec![OptV3IndexedFieldAccessPlan {
                 access: IndexedFieldAccessKind::Store,
-                owner_type: owner_type.clone(),
-                attr_name: "value".to_string(),
-                expected_index: 2,
+                guard: MechanicalIndexedFieldGuard {
+                    kind: IndexedFieldGuardKind::OwnerTypeVersionAndFieldIndex,
+                    owner_type: owner_type.clone(),
+                    attr_name: "value".to_string(),
+                    expected_index: 2,
+                },
+                fallback: IndexedFieldFallbackKind::OriginalAttrAccess,
             }]
         );
         assert!(
             planned_inputs.evidence_by_function.is_empty(),
             "v3 emitted indexed fields should not be converted into legacy profile evidence"
-        );
-
-        let mut mismatched_artifacts = artifacts.clone();
-        mismatched_artifacts.plan.functions[0].indexed_fields[0].attr_name = "other".to_string();
-        mismatched_artifacts.emission.functions[0].indexed_fields[0].attr_name =
-            "other".to_string();
-        let err = match planned_optimization_inputs_from_v3_artifacts_for_codegen_module(
-            &mismatched_artifacts,
-            &module,
-            mismatched_artifacts.plan.module.module_name.as_str(),
-            mismatched_artifacts.plan.module.source_hash,
-            None,
-        ) {
-            Ok(_) => panic!("v3 indexed-field attr mismatch should be rejected before codegen"),
-            Err(err) => err,
-        };
-        assert!(
-            err.contains("optimizer v3 emitted indexed-field attr")
-                && err.contains("lowered instruction uses"),
-            "{err}"
         );
     }
 
@@ -18398,6 +18280,7 @@ def f(x):
                                 .to_string(),
                         },
                     ],
+                    scalar_threads: Vec::new(),
                     regions: Vec::new(),
                 }],
             },
@@ -18835,6 +18718,12 @@ def read_point(point):
                 module_name: "field_type_test".to_string(),
                 qualname: "Point".to_string(),
             };
+            let field_guard = IndexedFieldGuardPlan {
+                kind: IndexedFieldGuardKind::OwnerTypeVersionAndFieldIndex,
+            };
+            let field_fallback = IndexedFieldFallbackPlan {
+                kind: IndexedFieldFallbackKind::OriginalAttrAccess,
+            };
             artifacts.plan.functions[0]
                 .indexed_fields
                 .push(IndexedFieldSpecializationPlan {
@@ -18843,15 +18732,21 @@ def read_point(point):
                     owner_type: owner_type.clone(),
                     attr_name: "x".to_string(),
                     expected_index: 0,
+                    guard: field_guard.clone(),
+                    fallback: field_fallback.clone(),
                     reason: "profiled type_keys selected this indexed-field layout".to_string(),
                 });
             artifacts.emission.functions[0].indexed_fields.push(
                 soac_opt::emit_v3::MechanicalIndexedFieldEmission {
                     source: getattr_instr_id,
                     access: IndexedFieldAccessKind::Load,
-                    owner_type,
-                    attr_name: "x".to_string(),
-                    expected_index: 0,
+                    guard: MechanicalIndexedFieldGuard {
+                        kind: field_guard.kind,
+                        owner_type,
+                        attr_name: "x".to_string(),
+                        expected_index: 0,
+                    },
+                    fallback: field_fallback,
                     reason: "profiled type_keys selected this indexed-field layout".to_string(),
                 },
             );
@@ -18943,9 +18838,13 @@ def read_point(point):
                         getattr_instr_id,
                         vec![OptV3IndexedFieldAccessPlan {
                             access: IndexedFieldAccessKind::Load,
-                            owner_type,
-                            attr_name: "x".to_string(),
-                            expected_index: 0,
+                            guard: MechanicalIndexedFieldGuard {
+                                kind: IndexedFieldGuardKind::OwnerTypeVersionAndFieldIndex,
+                                owner_type,
+                                attr_name: "x".to_string(),
+                                expected_index: 0,
+                            },
+                            fallback: IndexedFieldFallbackKind::OriginalAttrAccess,
                         }],
                     )]),
                 )]),
@@ -19055,6 +18954,12 @@ def write_point(point, value):
                 module_name: "field_type_test".to_string(),
                 qualname: "Point".to_string(),
             };
+            let field_guard = IndexedFieldGuardPlan {
+                kind: IndexedFieldGuardKind::OwnerTypeVersionAndFieldIndex,
+            };
+            let field_fallback = IndexedFieldFallbackPlan {
+                kind: IndexedFieldFallbackKind::OriginalAttrAccess,
+            };
             let store_reason =
                 "profiled type_keys selected this indexed-field layout for SetAttr".to_string();
             artifacts.plan.functions[0]
@@ -19065,15 +18970,21 @@ def write_point(point, value):
                     owner_type: owner_type.clone(),
                     attr_name: "x".to_string(),
                     expected_index: 0,
+                    guard: field_guard.clone(),
+                    fallback: field_fallback.clone(),
                     reason: store_reason.clone(),
                 });
             artifacts.emission.functions[0].indexed_fields.push(
                 soac_opt::emit_v3::MechanicalIndexedFieldEmission {
                     source: setattr_instr_id,
                     access: IndexedFieldAccessKind::Store,
-                    owner_type,
-                    attr_name: "x".to_string(),
-                    expected_index: 0,
+                    guard: MechanicalIndexedFieldGuard {
+                        kind: field_guard.kind,
+                        owner_type,
+                        attr_name: "x".to_string(),
+                        expected_index: 0,
+                    },
+                    fallback: field_fallback,
                     reason: store_reason,
                 },
             );
@@ -19282,8 +19193,6 @@ def write_point(point, value):
         }];
         set_stack_slots(&mut function, &["obj", "value"]);
 
-        let mut module = test_module(module_name_gen, vec![function.clone()]);
-        module.module_constants = constants.module_constants;
         let mut typed_function =
             lower_typed_function_if_tests_to_truthy(lower_codegen_function_to_typed(function));
         let opt_v3_indexed_fields_by_instr = HashMap::from([(
@@ -19291,6 +19200,8 @@ def write_point(point, value):
             vec![OptV3ResolvedIndexedFieldAccess {
                 access: IndexedFieldAccessKind::Store,
                 attr_name: "x".to_string(),
+                guard: IndexedFieldGuardKind::OwnerTypeVersionAndFieldIndex,
+                fallback: IndexedFieldFallbackKind::OriginalAttrAccess,
                 specialization: FieldIndexSpecialization {
                     expected_index: 0,
                     owner_type_ref: RelocTypeRef::TypeKey(CounterDumpTypeKey {
@@ -19303,7 +19214,6 @@ def write_point(point, value):
         )]);
 
         let annotated = annotate_typed_attr_accesses(
-            &module,
             &mut typed_function,
             &HashMap::new(),
             &HashMap::new(),
@@ -19325,7 +19235,7 @@ def write_point(point, value):
     }
 
     #[test]
-    fn v3_indexed_field_annotation_rejects_attr_name_mismatch() {
+    fn v3_indexed_field_annotation_trusts_prevalidated_plan() {
         let module_name_gen = ModuleNameGen::new(0);
         let mut constants = TestConstantPool::default();
         let mut function = test_function_in_module(&module_name_gen, "read");
@@ -19353,8 +19263,6 @@ def write_point(point, value):
         }];
         set_stack_slots(&mut function, &["obj"]);
 
-        let mut module = test_module(module_name_gen, vec![function.clone()]);
-        module.module_constants = constants.module_constants;
         let mut typed_function =
             lower_typed_function_if_tests_to_truthy(lower_codegen_function_to_typed(function));
         let opt_v3_indexed_fields_by_instr = HashMap::from([(
@@ -19362,6 +19270,8 @@ def write_point(point, value):
             vec![OptV3ResolvedIndexedFieldAccess {
                 access: IndexedFieldAccessKind::Load,
                 attr_name: "planned".to_string(),
+                guard: IndexedFieldGuardKind::OwnerTypeVersionAndFieldIndex,
+                fallback: IndexedFieldFallbackKind::OriginalAttrAccess,
                 specialization: FieldIndexSpecialization {
                     expected_index: 0,
                     owner_type_ref: RelocTypeRef::TypeKey(CounterDumpTypeKey {
@@ -19373,21 +19283,15 @@ def write_point(point, value):
             }],
         )]);
 
-        let err = annotate_typed_attr_accesses(
-            &module,
+        let annotated = annotate_typed_attr_accesses(
             &mut typed_function,
             &HashMap::new(),
             &HashMap::new(),
             &opt_v3_indexed_fields_by_instr,
             true,
         )
-        .expect_err("v3 indexed-field attr mismatch should fail validation");
-
-        assert!(
-            err.contains("selected attr \"planned\"")
-                && err.contains("lowered instruction uses attr \"actual\""),
-            "{err}"
-        );
+        .expect("JIT annotation should trust the prevalidated v3 indexed-field source");
+        assert_eq!(annotated, 1);
     }
 
     #[test]
@@ -19457,6 +19361,7 @@ def write_point(point, value):
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
                     indexed_globals: Vec::new(),
+                    scalar_threads: Vec::new(),
                     regions: Vec::new(),
                 }],
             },
@@ -19474,7 +19379,8 @@ def write_point(point, value):
         };
 
         assert!(
-            err.contains("contain 1 planned direct calls but 0 emitted direct calls"),
+            err.contains("validate optimization plan v3 artifacts")
+                && err.contains("optimization plan v3 emission mismatch"),
             "{err}"
         );
     }
@@ -19526,6 +19432,12 @@ def write_point(point, value):
                         owner_type,
                         attr_name: "value".to_string(),
                         expected_index: 2,
+                        guard: IndexedFieldGuardPlan {
+                            kind: IndexedFieldGuardKind::OwnerTypeVersionAndFieldIndex,
+                        },
+                        fallback: IndexedFieldFallbackPlan {
+                            kind: IndexedFieldFallbackKind::OriginalAttrAccess,
+                        },
                         reason: "profiled type_keys selected this indexed-field layout".to_string(),
                     }],
                     indexed_globals: Vec::new(),
@@ -19545,6 +19457,7 @@ def write_point(point, value):
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
                     indexed_globals: Vec::new(),
+                    scalar_threads: Vec::new(),
                     regions: Vec::new(),
                 }],
             },
@@ -19562,7 +19475,8 @@ def write_point(point, value):
         };
 
         assert!(
-            err.contains("contain 1 planned indexed fields but 0 emitted indexed fields"),
+            err.contains("validate optimization plan v3 artifacts")
+                && err.contains("optimization plan v3 emission mismatch"),
             "{err}"
         );
     }
@@ -23726,129 +23640,6 @@ def f(x, y):
     }
 
     #[test]
-    fn v3_direct_call_body_store_rewrite_runs_after_inline_cleanup() {
-        let module_name = "v3_store_call_direct_body_plan_test";
-        let module_name_gen = ModuleNameGen::new(0);
-        let mut callee_function = test_function_in_module(&module_name_gen, "callee");
-        callee_function.params.params.push(Param {
-            name: "x".into(),
-            kind: ParamKind::Any,
-            has_default: false,
-        });
-        callee_function = with_single_test_block(
-            callee_function,
-            vec![],
-            ret_term(name_expr(test_local_name("x", 0))),
-        );
-        set_stack_slots(&mut callee_function, &["x"]);
-
-        let mut caller_function = test_function_in_module(&module_name_gen, "caller");
-        caller_function.params.params.extend([
-            Param {
-                name: "fn".into(),
-                kind: ParamKind::Any,
-                has_default: false,
-            },
-            Param {
-                name: "x".into(),
-                kind: ParamKind::Any,
-                has_default: false,
-            },
-        ]);
-        let caller_block_label = caller_function.name_gen.next_block_name();
-        let call_instr_id = InstrId::new(caller_block_label, 1);
-        caller_function = with_test_blocks(
-            caller_function,
-            vec![CodegenBlock {
-                label: caller_block_label,
-                body: vec![assign_stmt(
-                    test_local_name("y", 2),
-                    with_instr_id(
-                        op_expr(Call::new(
-                            name_expr(test_local_name("fn", 0)),
-                            vec![CallArgPositional::Positional(name_expr(test_local_name(
-                                "x", 1,
-                            )))],
-                            Vec::<CallArgKeyword<InstrCodegen>>::new(),
-                        )),
-                        call_instr_id,
-                    ),
-                )],
-                term: ret_term(name_expr(test_local_name("y", 2))),
-                params: vec![],
-                exc_edge: None,
-            }],
-        );
-        set_stack_slots(&mut caller_function, &["fn", "x", "y"]);
-        let module = test_module(
-            module_name_gen,
-            vec![callee_function.clone(), caller_function.clone()],
-        );
-        let v3_plan = OptV3DirectCallPlan {
-            source: call_instr_id,
-            target: callee_function.function_id,
-            arg_plan: TypedDirectCallArgPlan {
-                sources: vec![TypedDirectCallArgSource::Provided(0)],
-            },
-            body: test_v3_direct_call_body(),
-            reason: "profiled direct call".to_string(),
-        };
-        let profile = SpecializationProfile {
-            module_name: Some(module_name),
-            counter_dump_path: None,
-            planned_evidence: HashMap::new(),
-            opt_v3_emitted_direct_calls: HashMap::from([(
-                caller_function.function_id,
-                HashMap::from([(call_instr_id, vec![v3_plan])]),
-            )]),
-            opt_v3_emitted_constructor_calls: HashMap::new(),
-            opt_v3_emitted_method_calls: HashMap::new(),
-            opt_v3_emitted_exact_list_items: HashMap::new(),
-            opt_v3_emitted_indexed_fields: HashMap::new(),
-            opt_v3_emitted_indexed_globals: HashMap::new(),
-            opt_v3_exact_int_branch_artifacts: HashMap::new(),
-            behavior_change_indexed_stores: false,
-            profiled_cold_blocks: false,
-            guard_miss_deopt: false,
-        };
-        let plan = build_profiled_jit_module_plan(&module, &profile, None, None, &HashMap::new())
-            .expect("v3-profiled JIT module plan should build");
-        let planned_caller = plan
-            .module
-            .callable_defs
-            .iter()
-            .find(|function| function.function_id == caller_function.function_id)
-            .expect("planned module should keep caller");
-
-        assert!(
-            planned_caller.blocks.iter().any(|block| {
-                matches!(
-                    &block.term,
-                    BlockTerm::IfTerm(term)
-                        if matches!(term.test, InstrCodegen::DirectFunctionIdGuardTest(_))
-                )
-            }),
-            "v3 direct-call body plan should still make the function-id guard explicit"
-        );
-        assert!(
-            planned_caller
-                .blocks
-                .iter()
-                .flat_map(|block| &block.body)
-                .any(|instr| matches!(instr, InstrCodegen::Store(store) if matches!(store.value.as_ref(), InstrCodegen::CallDirect(_)))),
-            "v3 DirectCall body stores should be rewritten after inline cleanup, so the direct call remains explicit"
-        );
-        assert!(
-            planned_caller
-                .blocks
-                .iter()
-                .flat_map(|block| &block.body)
-                .any(|instr| matches!(instr, InstrCodegen::Store(store) if matches!(store.value.as_ref(), InstrCodegen::Call(_)))),
-            "the generic fallback call should remain available in the fallback arm"
-        );
-    }
-
-    #[test]
     fn source_keyed_v3_emissions_still_allow_plan_level_direct_call_rewrite() {
         let module_name = "v3_source_keyed_shape_test";
         let module_name_gen = ModuleNameGen::new(0);
@@ -24251,520 +24042,6 @@ def f(x, y):
                 .opt_v3_method_calls_by_instr
                 .is_empty(),
             "v3 method calls consumed by the profiled module plan should not reach typed JIT lowering"
-        );
-    }
-
-    #[test]
-    fn v3_direct_method_body_store_rewrite_runs_before_typed_lowering() {
-        let module_name = "v3_profiled_method_call_direct_body_plan_test";
-        let module_name_gen = ModuleNameGen::new(0);
-        let mut constants = TestConstantPool::default();
-
-        let mut next_function = test_function_in_module(&module_name_gen, "IterRange.__next__");
-        next_function.params.params.push(Param {
-            name: "self".into(),
-            kind: ParamKind::Any,
-            has_default: false,
-        });
-        next_function = with_single_test_block(
-            next_function,
-            vec![],
-            ret_term(name_expr(test_local_name("self", 0))),
-        );
-        set_stack_slots(&mut next_function, &["self"]);
-
-        let mut caller_function = test_function_in_module(&module_name_gen, "caller");
-        caller_function.params.params.push(Param {
-            name: "it".into(),
-            kind: ParamKind::Any,
-            has_default: false,
-        });
-        let caller_block_label = caller_function.name_gen.next_block_name();
-        let call_instr_id = InstrId::new(caller_block_label, 1);
-        caller_function = with_test_blocks(
-            caller_function,
-            vec![CodegenBlock {
-                label: caller_block_label,
-                body: vec![assign_stmt(
-                    test_local_name("y", 1),
-                    with_instr_id(
-                        op_expr(Call::new(
-                            op_expr(GetAttr::new(
-                                name_expr(test_local_name("it", 0)),
-                                constants.string_expr("__next__"),
-                            )),
-                            Vec::<CallArgPositional<InstrCodegen>>::new(),
-                            Vec::<CallArgKeyword<InstrCodegen>>::new(),
-                        )),
-                        call_instr_id,
-                    ),
-                )],
-                term: ret_term(name_expr(test_local_name("y", 1))),
-                params: vec![],
-                exc_edge: None,
-            }],
-        );
-        set_stack_slots(&mut caller_function, &["it", "y"]);
-
-        let mut module = test_module(
-            module_name_gen,
-            vec![next_function.clone(), caller_function.clone()],
-        );
-        module.module_constants = constants.module_constants;
-        let inputs = PlannedOptimizationInputs {
-            opt_v3_emitted_method_calls: HashMap::from([(
-                caller_function.function_id,
-                HashMap::from([(
-                    call_instr_id,
-                    vec![OptV3MethodCallPlan {
-                        source: call_instr_id,
-                        target: next_function.function_id,
-                        method_name: "__next__".to_string(),
-                        owner_type: PlanV3MethodCallOwnerType {
-                            module_name: module_name.to_string(),
-                            qualname: "IterRange".to_string(),
-                        },
-                        arg_plan: TypedDirectCallArgPlan {
-                            sources: vec![TypedDirectCallArgSource::Provided(0)],
-                        },
-                        guard: PlanV3MethodCallGuardKind::ExactReceiverTypeVersion,
-                        fallback: PlanV3MethodCallFallbackKind::OriginalMethodCall,
-                        body: test_v3_direct_call_body(),
-                        reason: "profiled method call".to_string(),
-                    }],
-                )]),
-            )]),
-            ..PlannedOptimizationInputs::default()
-        };
-        let profile = SpecializationProfile::from_precompile(
-            &SoacEnvConfig::default(),
-            module_name,
-            None,
-            inputs,
-        )
-        .expect("test specialization profile should construct");
-        let direct_owner_attr_specializations = HashMap::from([(
-            caller_function.function_id,
-            HashMap::from([(
-                DirectOwnerAttrKey::new(next_function.function_id, "__next__"),
-                vec![DirectOwnerAttrSpecialization {
-                    owner_type_ref: RelocTypeRef::TypeKey(CounterDumpTypeKey {
-                        module_name: module_name.to_string(),
-                        qualname: "IterRange".to_string(),
-                    }),
-                    type_version: 1,
-                }],
-            )]),
-        )]);
-        let plan = build_profiled_jit_module_plan(
-            &module,
-            &profile,
-            None,
-            None,
-            &direct_owner_attr_specializations,
-        )
-        .expect("profiled JIT module plan should build");
-        let planned_caller = plan
-            .module
-            .callable_defs
-            .iter()
-            .find(|function| function.function_id == caller_function.function_id)
-            .expect("planned module should keep caller");
-
-        assert!(
-            planned_caller.blocks.iter().any(|block| {
-                matches!(
-                    &block.term,
-                    BlockTerm::IfTerm(term)
-                        if matches!(
-                            term.test,
-                            InstrCodegen::DirectReceiverTypeVersionGuardTest(_)
-                        )
-                )
-            }),
-            "v3 method DirectCall body rewrite should guard the receiver type/version explicitly"
-        );
-        assert!(
-            planned_caller
-                .blocks
-                .iter()
-                .flat_map(|block| &block.body)
-                .any(|instr| matches!(instr, InstrCodegen::Store(store) if matches!(store.value.as_ref(), InstrCodegen::DirectMethodCall(_)))),
-            "v3 method DirectCall body stores should keep a direct-method hot arm"
-        );
-        assert!(
-            planned_caller
-                .blocks
-                .iter()
-                .flat_map(|block| &block.body)
-                .any(|instr| matches!(instr, InstrCodegen::Store(store) if matches!(store.value.as_ref(), InstrCodegen::Call(_)))),
-            "v3 method DirectCall body fallback should retain the original generic method call"
-        );
-        let specialization_inputs =
-            FunctionSpecializationInputs::from_profile(&profile, planned_caller)
-                .expect("planned profile inputs should filter consumed v3 method calls");
-        assert!(
-            specialization_inputs
-                .opt_v3_method_calls_by_instr
-                .is_empty(),
-            "v3 method calls consumed by the profiled module plan should not reach typed JIT lowering"
-        );
-    }
-
-    #[test]
-    fn v3_direct_method_body_store_rewrite_preserves_explicit_args() {
-        let module_name = "v3_profiled_method_call_direct_body_args_plan_test";
-        let module_name_gen = ModuleNameGen::new(0);
-        let mut constants = TestConstantPool::default();
-
-        let mut method_function = test_function_in_module(&module_name_gen, "Accumulator.add");
-        method_function.params.params.push(Param {
-            name: "self".into(),
-            kind: ParamKind::Any,
-            has_default: false,
-        });
-        method_function.params.params.push(Param {
-            name: "value".into(),
-            kind: ParamKind::Any,
-            has_default: false,
-        });
-        method_function = with_single_test_block(
-            method_function,
-            vec![],
-            ret_term(name_expr(test_local_name("value", 1))),
-        );
-        set_stack_slots(&mut method_function, &["self", "value"]);
-
-        let mut caller_function = test_function_in_module(&module_name_gen, "caller");
-        caller_function.params.params.push(Param {
-            name: "obj".into(),
-            kind: ParamKind::Any,
-            has_default: false,
-        });
-        caller_function.params.params.push(Param {
-            name: "x".into(),
-            kind: ParamKind::Any,
-            has_default: false,
-        });
-        let caller_block_label = caller_function.name_gen.next_block_name();
-        let call_instr_id = InstrId::new(caller_block_label, 1);
-        caller_function = with_test_blocks(
-            caller_function,
-            vec![CodegenBlock {
-                label: caller_block_label,
-                body: vec![assign_stmt(
-                    test_local_name("y", 2),
-                    with_instr_id(
-                        op_expr(Call::new(
-                            op_expr(GetAttr::new(
-                                name_expr(test_local_name("obj", 0)),
-                                constants.string_expr("add"),
-                            )),
-                            vec![CallArgPositional::Positional(name_expr(test_local_name(
-                                "x", 1,
-                            )))],
-                            Vec::<CallArgKeyword<InstrCodegen>>::new(),
-                        )),
-                        call_instr_id,
-                    ),
-                )],
-                term: ret_term(name_expr(test_local_name("y", 2))),
-                params: vec![],
-                exc_edge: None,
-            }],
-        );
-        set_stack_slots(&mut caller_function, &["obj", "x", "y"]);
-
-        let mut module = test_module(
-            module_name_gen,
-            vec![method_function.clone(), caller_function.clone()],
-        );
-        module.module_constants = constants.module_constants;
-        let expected_arg_plan = TypedDirectCallArgPlan {
-            sources: vec![
-                TypedDirectCallArgSource::Provided(0),
-                TypedDirectCallArgSource::Provided(1),
-            ],
-        };
-        let inputs = PlannedOptimizationInputs {
-            opt_v3_emitted_method_calls: HashMap::from([(
-                caller_function.function_id,
-                HashMap::from([(
-                    call_instr_id,
-                    vec![OptV3MethodCallPlan {
-                        source: call_instr_id,
-                        target: method_function.function_id,
-                        method_name: "add".to_string(),
-                        owner_type: PlanV3MethodCallOwnerType {
-                            module_name: module_name.to_string(),
-                            qualname: "Accumulator".to_string(),
-                        },
-                        arg_plan: expected_arg_plan.clone(),
-                        guard: PlanV3MethodCallGuardKind::ExactReceiverTypeVersion,
-                        fallback: PlanV3MethodCallFallbackKind::OriginalMethodCall,
-                        body: test_v3_direct_call_body(),
-                        reason: "profiled method call".to_string(),
-                    }],
-                )]),
-            )]),
-            ..PlannedOptimizationInputs::default()
-        };
-        let profile = SpecializationProfile::from_precompile(
-            &SoacEnvConfig::default(),
-            module_name,
-            None,
-            inputs,
-        )
-        .expect("test specialization profile should construct");
-        let direct_owner_attr_specializations = HashMap::from([(
-            caller_function.function_id,
-            HashMap::from([(
-                DirectOwnerAttrKey::new(method_function.function_id, "add"),
-                vec![DirectOwnerAttrSpecialization {
-                    owner_type_ref: RelocTypeRef::TypeKey(CounterDumpTypeKey {
-                        module_name: module_name.to_string(),
-                        qualname: "Accumulator".to_string(),
-                    }),
-                    type_version: 1,
-                }],
-            )]),
-        )]);
-        let plan = build_profiled_jit_module_plan(
-            &module,
-            &profile,
-            None,
-            None,
-            &direct_owner_attr_specializations,
-        )
-        .expect("profiled JIT module plan should build");
-        let planned_caller = plan
-            .module
-            .callable_defs
-            .iter()
-            .find(|function| function.function_id == caller_function.function_id)
-            .expect("planned module should keep caller");
-
-        let direct_method_call = planned_caller
-            .blocks
-            .iter()
-            .flat_map(|block| &block.body)
-            .find_map(|instr| {
-                let InstrCodegen::Store(store) = instr else {
-                    return None;
-                };
-                let InstrCodegen::DirectMethodCall(call) = store.value.as_ref() else {
-                    return None;
-                };
-                Some(call)
-            })
-            .expect("v3 method DirectCall body stores should keep a direct-method hot arm");
-        assert_eq!(
-            direct_method_call.args.len(),
-            1,
-            "the explicit method argument should be preserved in the hot arm"
-        );
-        assert_eq!(
-            direct_method_call.guard.arg_plan, expected_arg_plan,
-            "the hot arm should retain the v3 receiver-plus-argument plan"
-        );
-        assert!(
-            planned_caller
-                .blocks
-                .iter()
-                .flat_map(|block| &block.body)
-                .any(|instr| matches!(instr, InstrCodegen::Store(store) if matches!(store.value.as_ref(), InstrCodegen::Call(call) if call.args.len() == 1))),
-            "v3 method DirectCall body fallback should preserve the original explicit argument"
-        );
-        let specialization_inputs =
-            FunctionSpecializationInputs::from_profile(&profile, planned_caller)
-                .expect("planned profile inputs should filter consumed v3 method calls");
-        assert!(
-            specialization_inputs
-                .opt_v3_method_calls_by_instr
-                .is_empty(),
-            "v3 method calls consumed by the profiled module plan should not reach typed JIT lowering"
-        );
-    }
-
-    #[test]
-    fn v3_direct_constructor_body_store_rewrite_runs_before_typed_lowering() {
-        let module_name = "v3_profiled_constructor_call_direct_body_plan_test";
-        let module_name_gen = ModuleNameGen::new(0);
-
-        let mut init_function = test_function_in_module(&module_name_gen, "Box.__init__");
-        init_function.params.params.push(Param {
-            name: "self".into(),
-            kind: ParamKind::Any,
-            has_default: false,
-        });
-        init_function.params.params.push(Param {
-            name: "value".into(),
-            kind: ParamKind::Any,
-            has_default: false,
-        });
-        init_function = with_single_test_block(
-            init_function,
-            vec![],
-            ret_term(name_expr(test_local_name("self", 0))),
-        );
-        set_stack_slots(&mut init_function, &["self", "value"]);
-
-        let mut caller_function = test_function_in_module(&module_name_gen, "caller");
-        caller_function.params.params.push(Param {
-            name: "x".into(),
-            kind: ParamKind::Any,
-            has_default: false,
-        });
-        let caller_block_label = caller_function.name_gen.next_block_name();
-        let call_instr_id = InstrId::new(caller_block_label, 1);
-        caller_function = with_test_blocks(
-            caller_function,
-            vec![CodegenBlock {
-                label: caller_block_label,
-                body: vec![assign_stmt(
-                    test_local_name("y", 1),
-                    with_instr_id(
-                        op_expr(Call::new(
-                            name_expr(test_global_name("Box")),
-                            vec![CallArgPositional::Positional(name_expr(test_local_name(
-                                "x", 0,
-                            )))],
-                            Vec::<CallArgKeyword<InstrCodegen>>::new(),
-                        )),
-                        call_instr_id,
-                    ),
-                )],
-                term: ret_term(name_expr(test_local_name("y", 1))),
-                params: vec![],
-                exc_edge: None,
-            }],
-        );
-        set_stack_slots(&mut caller_function, &["x", "y"]);
-
-        let module = test_module(
-            module_name_gen,
-            vec![init_function.clone(), caller_function.clone()],
-        );
-        let expected_arg_plan = TypedDirectCallArgPlan {
-            sources: vec![
-                TypedDirectCallArgSource::Provided(0),
-                TypedDirectCallArgSource::Provided(1),
-            ],
-        };
-        let inputs = PlannedOptimizationInputs {
-            opt_v3_emitted_constructor_calls: HashMap::from([(
-                caller_function.function_id,
-                HashMap::from([(
-                    call_instr_id,
-                    vec![OptV3ConstructorCallPlan {
-                        source: call_instr_id,
-                        target: init_function.function_id,
-                        owner_type: PlanV3ConstructorCallOwnerType {
-                            module_name: module_name.to_string(),
-                            qualname: "Box".to_string(),
-                        },
-                        arg_plan: expected_arg_plan.clone(),
-                        guard: PlanV3ConstructorCallGuardKind::ExactCallableTypeVersion,
-                        fallback: PlanV3ConstructorCallFallbackKind::OriginalConstructorCall,
-                        body: test_v3_direct_call_body(),
-                        inline_target: None,
-                        reason: "profiled constructor call".to_string(),
-                    }],
-                )]),
-            )]),
-            ..PlannedOptimizationInputs::default()
-        };
-        let profile = SpecializationProfile::from_precompile(
-            &SoacEnvConfig::default(),
-            module_name,
-            None,
-            inputs,
-        )
-        .expect("test specialization profile should construct");
-        let direct_owner_attr_specializations = HashMap::from([(
-            caller_function.function_id,
-            HashMap::from([(
-                DirectOwnerAttrKey::new(init_function.function_id, "__init__"),
-                vec![DirectOwnerAttrSpecialization {
-                    owner_type_ref: RelocTypeRef::TypeKey(CounterDumpTypeKey {
-                        module_name: module_name.to_string(),
-                        qualname: "Box".to_string(),
-                    }),
-                    type_version: 1,
-                }],
-            )]),
-        )]);
-        let plan = build_profiled_jit_module_plan(
-            &module,
-            &profile,
-            None,
-            None,
-            &direct_owner_attr_specializations,
-        )
-        .expect("profiled JIT module plan should build");
-        let planned_caller = plan
-            .module
-            .callable_defs
-            .iter()
-            .find(|function| function.function_id == caller_function.function_id)
-            .expect("planned module should keep caller");
-
-        assert!(
-            planned_caller.blocks.iter().any(|block| {
-                matches!(
-                    &block.term,
-                    BlockTerm::IfTerm(term)
-                        if matches!(
-                            term.test,
-                            InstrCodegen::DirectCallableTypeVersionGuardTest(_)
-                        )
-                )
-            }),
-            "v3 constructor DirectCall body rewrite should guard the callable type/version explicitly"
-        );
-        let direct_callable_call = planned_caller
-            .blocks
-            .iter()
-            .flat_map(|block| &block.body)
-            .find_map(|instr| {
-                let InstrCodegen::Store(store) = instr else {
-                    return None;
-                };
-                let InstrCodegen::DirectCallableCall(call) = store.value.as_ref() else {
-                    return None;
-                };
-                Some(call)
-            })
-            .expect("v3 constructor DirectCall body stores should keep a direct-callable hot arm");
-        assert_eq!(
-            direct_callable_call.args.len(),
-            1,
-            "the explicit constructor argument should be preserved in the hot arm"
-        );
-        assert!(
-            matches!(
-                &direct_callable_call.guard,
-                TypedDirectCallableCallGuard::Constructor(guard)
-                    if guard.arg_plan == expected_arg_plan
-            ),
-            "the hot arm should retain the v3 constructor receiver-plus-argument plan"
-        );
-        assert!(
-            planned_caller
-                .blocks
-                .iter()
-                .flat_map(|block| &block.body)
-                .any(|instr| matches!(instr, InstrCodegen::Store(store) if matches!(store.value.as_ref(), InstrCodegen::Call(call) if call.args.len() == 1))),
-            "v3 constructor DirectCall body fallback should preserve the original explicit argument"
-        );
-        let specialization_inputs =
-            FunctionSpecializationInputs::from_profile(&profile, planned_caller)
-                .expect("planned profile inputs should filter consumed v3 constructor calls");
-        assert!(
-            specialization_inputs
-                .opt_v3_constructor_calls_by_instr
-                .is_empty(),
-            "v3 constructor calls consumed by the profiled module plan should not reach typed JIT lowering"
         );
     }
 

@@ -241,6 +241,8 @@ pub struct IndexedFieldSpecializationPlan {
     pub owner_type: IndexedFieldOwnerType,
     pub attr_name: String,
     pub expected_index: u32,
+    pub guard: IndexedFieldGuardPlan,
+    pub fallback: IndexedFieldFallbackPlan,
     pub reason: String,
 }
 
@@ -266,6 +268,30 @@ pub enum IndexedFieldAccessKind {
 pub struct IndexedFieldOwnerType {
     pub module_name: String,
     pub qualname: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct IndexedFieldGuardPlan {
+    pub kind: IndexedFieldGuardKind,
+}
+
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
+pub enum IndexedFieldGuardKind {
+    OwnerTypeVersionAndFieldIndex,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct IndexedFieldFallbackPlan {
+    pub kind: IndexedFieldFallbackKind,
+}
+
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
+pub enum IndexedFieldFallbackKind {
+    OriginalAttrAccess,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -1249,6 +1275,18 @@ fn validate_indexed_field_plans(function: &FunctionOptimizationPlanV3, errors: &
             errors.push(format!(
                 "function {} indexed-field at {} has empty attr name",
                 function.function.function, indexed_field.source
+            ));
+        }
+        if indexed_field.guard.kind != IndexedFieldGuardKind::OwnerTypeVersionAndFieldIndex {
+            errors.push(format!(
+                "function {} indexed-field at {} has unsupported guard {:?}",
+                function.function.function, indexed_field.source, indexed_field.guard.kind
+            ));
+        }
+        if indexed_field.fallback.kind != IndexedFieldFallbackKind::OriginalAttrAccess {
+            errors.push(format!(
+                "function {} indexed-field at {} has unsupported fallback {:?}",
+                function.function.function, indexed_field.source, indexed_field.fallback.kind
             ));
         }
         if indexed_field.reason.is_empty() {
@@ -2947,6 +2985,12 @@ mod tests {
             },
             attr_name: "value".to_string(),
             expected_index: 2,
+            guard: IndexedFieldGuardPlan {
+                kind: IndexedFieldGuardKind::OwnerTypeVersionAndFieldIndex,
+            },
+            fallback: IndexedFieldFallbackPlan {
+                kind: IndexedFieldFallbackKind::OriginalAttrAccess,
+            },
             reason: "profiled type_keys selected this indexed-field layout".to_string(),
         }]);
 
@@ -2964,6 +3008,12 @@ mod tests {
             },
             attr_name: "value".to_string(),
             expected_index: 2,
+            guard: IndexedFieldGuardPlan {
+                kind: IndexedFieldGuardKind::OwnerTypeVersionAndFieldIndex,
+            },
+            fallback: IndexedFieldFallbackPlan {
+                kind: IndexedFieldFallbackKind::OriginalAttrAccess,
+            },
             reason: "profiled type_keys selected this indexed-field layout".to_string(),
         };
         let plan = module_with_indexed_fields(vec![indexed_field.clone(), indexed_field]);

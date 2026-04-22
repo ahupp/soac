@@ -295,13 +295,14 @@ fn format_optimization_artifacts_v3_with_options(
         if let Some(emitted_function) = emitted_function {
             for indexed_field in &emitted_function.indexed_fields {
                 out.push_str(&format!(
-                    "  emitted_indexed_field source={} access={:?} owner={}.{} attr={} index={} reason={}\n",
+                    "  emitted_indexed_field source={} access={:?} guard={:?} owner={}.{} attr={} index={} reason={}\n",
                     indexed_field.source,
                     indexed_field.access,
-                    indexed_field.owner_type.module_name,
-                    indexed_field.owner_type.qualname,
-                    indexed_field.attr_name,
-                    indexed_field.expected_index,
+                    indexed_field.guard.kind,
+                    indexed_field.guard.owner_type.module_name,
+                    indexed_field.guard.owner_type.qualname,
+                    indexed_field.guard.attr_name,
+                    indexed_field.guard.expected_index,
                     indexed_field.reason
                 ));
             }
@@ -458,6 +459,7 @@ mod test {
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
                     indexed_globals: Vec::new(),
+                    scalar_threads: Vec::new(),
                     regions: Vec::new(),
                 }],
             },

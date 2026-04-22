@@ -5,10 +5,7 @@ use cranelift_codegen::ir::InstBuilder;
 use pyo3::ffi;
 use soac_core::block_py::{CounterId, GetItem, HasSemanticInstrId, InstrId, SetItem};
 use soac_lowering::passes::InstrCodegen;
-use soac_opt::plan_v3::{
-    EXACT_LIST_EXACT_INT_ITEM_SHAPE_TAG, ExactListItemAccessKind, ExactListItemFallbackKind,
-    ExactListItemGuardKind, ExactListItemShape,
-};
+use soac_opt::plan_v3::{EXACT_LIST_EXACT_INT_ITEM_SHAPE_TAG, ExactListItemAccessKind};
 use std::mem::offset_of;
 
 const PYLONG_COMPACT_TAG_LIMIT: i64 = 2 << 3;
@@ -29,9 +26,6 @@ struct RawPyLongObject {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ExactListItemLoweringPlan {
     access: ExactListItemAccessKind,
-    shape: ExactListItemShape,
-    guard: ExactListItemGuardKind,
-    fallback: ExactListItemFallbackKind,
 }
 
 impl ExactListItemLoweringPlan {
@@ -39,12 +33,9 @@ impl ExactListItemLoweringPlan {
         plan: &OptV3ExactListItemAccessPlan,
         expected_access: ExactListItemAccessKind,
     ) -> Self {
-        plan.expect_lowering_shape(expected_access);
+        debug_assert_eq!(plan.access, expected_access);
         Self {
             access: plan.access,
-            shape: plan.shape,
-            guard: plan.guard,
-            fallback: plan.fallback,
         }
     }
 
@@ -53,24 +44,6 @@ impl ExactListItemLoweringPlan {
             self.access, expected_access,
             "exact-list item plan {:?} reached {:?} lowering",
             self.access, expected_access
-        );
-        assert_eq!(
-            self.shape,
-            ExactListItemShape::ExactListExactInt,
-            "exact-list item plan has unsupported shape {:?}",
-            self.shape
-        );
-        assert_eq!(
-            self.guard,
-            ExactListItemGuardKind::ExactListExactCompactIntInBounds,
-            "exact-list item plan has unsupported guard {:?}",
-            self.guard
-        );
-        assert_eq!(
-            self.fallback,
-            ExactListItemFallbackKind::OriginalItemAccess,
-            "exact-list item plan has unsupported fallback {:?}",
-            self.fallback
         );
     }
 }
@@ -385,15 +358,13 @@ fn emit_exact_list_item_getitem_from_plan<'fb>(
     specialized_fallback_counter_id: Option<CounterId>,
 ) -> ir::Value {
     plan.expect_exact_list_exact_int(ExactListItemAccessKind::Get);
-    match plan.shape {
-        ExactListItemShape::ExactListExactInt => emit_exact_list_exact_int_getitem(
-            state,
-            arg_values,
-            plan,
-            specialized_hit_counter_id,
-            specialized_fallback_counter_id,
-        ),
-    }
+    emit_exact_list_exact_int_getitem(
+        state,
+        arg_values,
+        plan,
+        specialized_hit_counter_id,
+        specialized_fallback_counter_id,
+    )
 }
 
 fn emit_exact_list_item_setitem_from_plan<'fb>(
@@ -404,15 +375,13 @@ fn emit_exact_list_item_setitem_from_plan<'fb>(
     specialized_fallback_counter_id: Option<CounterId>,
 ) -> ir::Value {
     plan.expect_exact_list_exact_int(ExactListItemAccessKind::Set);
-    match plan.shape {
-        ExactListItemShape::ExactListExactInt => emit_exact_list_exact_int_setitem(
-            state,
-            arg_values,
-            plan,
-            specialized_hit_counter_id,
-            specialized_fallback_counter_id,
-        ),
-    }
+    emit_exact_list_exact_int_setitem(
+        state,
+        arg_values,
+        plan,
+        specialized_hit_counter_id,
+        specialized_fallback_counter_id,
+    )
 }
 
 fn emit_exact_list_exact_compact_int_in_bounds_guard<'fb>(
