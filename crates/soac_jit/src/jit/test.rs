@@ -19502,8 +19502,10 @@ def write_point(point, value):
             "v3 direct-call targets should stay separate from legacy call-target evidence"
         );
         assert!(
-            profile.has_source_keyed_opt_v3_emissions(caller_id),
-            "v3 direct-call emissions should mark the function as source-keyed"
+            profile
+                .v3_call_emission_sources(caller_id)
+                .contains(&source),
+            "v3 direct-call emissions should mark the call source as v3-owned"
         );
         assert!(
             profile
@@ -23849,8 +23851,8 @@ def f(x, y):
     }
 
     #[test]
-    fn profiled_no_arg_method_store_rewrite_uses_receiver_guard_and_inlines_target() {
-        let module_name = "profiled_method_call_inline_plan_test";
+    fn legacy_no_arg_method_evidence_does_not_feed_module_method_rewrite() {
+        let module_name = "legacy_method_call_no_inline_plan_test";
         let module_name_gen = ModuleNameGen::new(0);
         let mut constants = TestConstantPool::default();
 
@@ -23948,7 +23950,7 @@ def f(x, y):
             .expect("planned module should keep caller");
 
         assert!(
-            planned_caller.blocks.iter().any(|block| {
+            !planned_caller.blocks.iter().any(|block| {
                 matches!(
                     &block.term,
                     BlockTerm::IfTerm(term)
@@ -23958,15 +23960,15 @@ def f(x, y):
                         )
                 )
             }),
-            "profiled method rewrite should guard the receiver type/version explicitly"
+            "legacy method evidence should not feed the v3 module method rewrite"
         );
         assert!(
             planned_caller
                 .blocks
                 .iter()
                 .flat_map(|block| &block.body)
-                .any(|instr| matches!(instr, InstrCodegen::Store(store) if store.name.id_str() == "y" && matches!(store.value.as_ref(), InstrCodegen::Load(_)))),
-            "hot method arm should inline the callee body into a direct local store"
+                .any(|instr| matches!(instr, InstrCodegen::Store(store) if store.name.id_str() == "y" && matches!(store.value.as_ref(), InstrCodegen::Call(_)))),
+            "the original generic method call should remain in the module plan"
         );
     }
 

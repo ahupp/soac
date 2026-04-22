@@ -2148,8 +2148,6 @@ fn build_profiled_jit_module_plan(
         let has_exact_int_branch_artifacts = profile
             .opt_v3_exact_int_branch_artifacts
             .contains_key(&function.function_id);
-        let has_source_keyed_v3_emissions =
-            profile.has_source_keyed_opt_v3_emissions(function.function_id);
         let inline_constructor_calls = if has_exact_int_branch_artifacts {
             HashMap::new()
         } else {
@@ -2160,20 +2158,13 @@ fn build_profiled_jit_module_plan(
         } else {
             profile.v3_direct_constructor_call_body_plans(function.function_id)
         };
-        let call_target_specializations = if has_source_keyed_v3_emissions {
-            HashMap::new()
-        } else {
-            profile.call_target_specializations(function.function_id)?
-        };
         let method_call_rewrite_targets = if has_exact_int_branch_artifacts {
             HashMap::new()
-        } else if has_source_keyed_v3_emissions {
+        } else {
             merge_call_target_specializations(
                 profile.v3_inline_method_call_targets(function.function_id),
                 opt_v3_constructor_call_targets(&inline_constructor_calls),
             )
-        } else {
-            call_target_specializations.clone()
         };
         let direct_call_rewrite_targets = if has_exact_int_branch_artifacts {
             HashMap::new()
@@ -2485,13 +2476,15 @@ fn build_profiled_inline_callee_maps(
         if let Some(direct_owner_attr_specializations) =
             direct_owner_attr_specializations_by_function.get(&function.function_id)
         {
-            let call_target_specializations =
-                profile.call_target_specializations(function.function_id)?;
+            let inline_constructor_calls =
+                profile.v3_inline_constructor_calls(function.function_id);
+            let constructor_call_targets =
+                opt_v3_constructor_call_targets(&inline_constructor_calls);
             target_ids.extend(collect_runtime_iter_method_target_ids(
                 function,
                 module.module_constants.as_slice(),
                 direct_owner_attr_specializations,
-                &call_target_specializations,
+                &constructor_call_targets,
             ));
         }
     }
@@ -16488,35 +16481,6 @@ impl<'a> SpecializationProfile<'a> {
             || !self.opt_v3_emitted_indexed_globals.is_empty()
             || !self.opt_v3_exact_int_branch_artifacts.is_empty()
             || (self.profiled_cold_blocks && self.has_existing_counter_dump())
-    }
-
-    fn has_source_keyed_opt_v3_emissions(&self, function_id: RuntimeFunctionId) -> bool {
-        self.opt_v3_emitted_direct_calls
-            .get(&function_id)
-            .is_some_and(|direct_calls| !direct_calls.is_empty())
-            || self
-                .opt_v3_emitted_constructor_calls
-                .get(&function_id)
-                .is_some_and(|constructor_calls| !constructor_calls.is_empty())
-            || self
-                .opt_v3_emitted_method_calls
-                .get(&function_id)
-                .is_some_and(|method_calls| !method_calls.is_empty())
-            || self
-                .opt_v3_emitted_exact_list_items
-                .get(&function_id)
-                .is_some_and(|items| !items.is_empty())
-            || self
-                .opt_v3_emitted_indexed_fields
-                .get(&function_id)
-                .is_some_and(|fields| !fields.is_empty())
-            || self
-                .opt_v3_emitted_indexed_globals
-                .get(&function_id)
-                .is_some_and(|globals| !globals.is_empty())
-            || self
-                .opt_v3_exact_int_branch_artifacts
-                .contains_key(&function_id)
     }
 
     fn v3_call_emission_sources(&self, function_id: RuntimeFunctionId) -> HashSet<InstrId> {

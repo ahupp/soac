@@ -648,6 +648,7 @@ time.sleep(0.25)
     env.pop("SOAC_OPT_MODE", None)
     env["SOAC_BACKGROUND_JIT"] = "1"
     env["SOAC_MODULE_ENABLED"] = f"path:{tmp_path}"
+    env["SOAC_WORK_DIR"] = str(tmp_path / "background-jit-work")
     env["SOAC_LOG"] = f"soac_jit_codegen=info;json={log_path}"
     result = subprocess.run(
         [sys.executable, "-c", script],
@@ -699,6 +700,7 @@ assert mod.identity(4) == 4
     env.pop("SOAC_OPT_MODE", None)
     env["SOAC_BACKGROUND_JIT"] = "1"
     env["SOAC_MODULE_ENABLED"] = f"path:{package_dir}"
+    env["SOAC_WORK_DIR"] = str(tmp_path / "immediate-call-work")
     result = subprocess.run(
         [sys.executable, "-c", script],
         check=False,

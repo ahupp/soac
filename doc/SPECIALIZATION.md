@@ -550,8 +550,7 @@ JIT emitter still materializes the full guarded call blocks today.
   recognizes the lowered call shape; otherwise they remain v3-owned typed-call
   inputs for later lowering.
 - In apply/verify mode, JIT module planning clones the lowered codegen module,
-  applies this rewrite from either explicit legacy call-target evidence or v3
-  mechanical ordinary direct-call emissions, runs the normal BlockPy
+  applies this rewrite from v3 mechanical ordinary direct-call emissions, runs the normal BlockPy
   direct-call inliner / scalar-replacement cleanup on the rewritten CFG, then
   recomputes value facts, LocalEnv planning, refcount ownership, and deopt
   resume planning from the rewritten module. Codegen and runtime deopt tables
@@ -662,13 +661,12 @@ JIT emitter still materializes the full guarded call blocks today.
   constructor-call fallback. Ordinary direct-call store sites and eligible
   receiver-method sites whose body selected `Inline` are expanded earlier in
   the profiled BlockPy module plan after validating inline-fragment buildability.
-  Runtime-iter constructor
-  `Inline` body plans carry the selected `__iter__` function id in the
+  Runtime-iter constructor `Inline` body plans carry the selected `__iter__` function id in the
   serialized v3 plan; the JIT resolves that plan target and uses it as the body
   callee instead of rediscovering the method target from the owner type. The
-  JIT still prepares the constructor owner/type-version guard at runtime, and
-  legacy non-v3 constructor/runtime-iter rewrites still use the runtime owner
-  lookup path. Late typed-call lowering only consumes v3 call plans whose
+  JIT still prepares the constructor owner/type-version guard at runtime. Legacy
+  call-target evidence no longer feeds the module-level method or runtime-iter
+  rewrite. Late typed-call lowering only consumes v3 call plans whose
   selected body is `DirectCall`; `Inline` body plans are owned by the earlier
   BlockPy rewrite path and do not silently fall through to a different guarded
   typed-call shape. Remaining non-store or otherwise unsupported callable
@@ -687,8 +685,8 @@ JIT emitter still materializes the full guarded call blocks today.
   ordinary `IfTerm`.
 - `rewrite_profiled_no_arg_method_call_store_sites`, at
   `crates/soac_jit/src/jit/mod.rs`, rewrites simple `Store(name,
-  Call(GetAttr(receiver, "method"), []))` sites when profile replay identifies
-  a transformed method target. It prefers owner/type-version metadata when
+  Call(GetAttr(receiver, "method"), []))` sites when a v3 inline method plan
+  selects a transformed method target. It prefers owner/type-version metadata when
   present, and can fall back to guarding the bound method's transformed
   function id when owner metadata is not available:
   - evaluate the receiver once into a generated compiler temp
