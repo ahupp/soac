@@ -4117,7 +4117,7 @@ def build(values):
     }
 
     #[test]
-    fn opt_v3_direct_call_emission_lowers_call_to_guarded_callable_mechanically() {
+    fn opt_v3_direct_call_emission_annotates_call_access_mechanically() {
         let mut constants = TestConstantPool::default();
         let call_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
         let target = RuntimeFunctionId::from_raw_parts(0, 7);
@@ -4143,25 +4143,45 @@ def build(values):
         };
 
         assert_eq!(
-            lower_opt_v3_direct_call_emissions(
+            annotate_opt_v3_direct_call_access_plans(
                 &mut typed_function,
                 &HashMap::from([(call_instr_id, vec![direct_call_plan])]),
             )
-            .expect("v3 direct-call emission should lower"),
+            .expect("v3 direct-call emission should annotate access"),
             1
         );
 
-        let Some(soac_lowering::passes::InstrTyped::GuardedCallableCallTyped(call)) =
+        let Some(soac_lowering::passes::InstrTyped::CallTyped(call)) =
             typed_function.blocks[0].body.first()
         else {
-            panic!("v3 direct-call emission should lower directly to guarded callable call");
+            panic!("v3 direct-call emission should preserve the call until typed access lowering");
         };
-        assert!(call.constructor_guards.is_empty());
-        assert_eq!(call.function_guards.len(), 1);
-        assert_eq!(call.function_guards[0].function_id, target);
+        let soac_lowering::passes::TypedCallAccessPlan::GuardedCallable {
+            function_guards,
+            constructor_guards,
+        } = &call.access
+        else {
+            panic!("v3 direct-call emission should produce a guarded callable access plan");
+        };
+        assert!(constructor_guards.is_empty());
+        assert_eq!(function_guards.len(), 1);
+        assert_eq!(function_guards[0].function_id, target);
         assert_eq!(
-            call.function_guards[0].arg_plan.sources,
+            function_guards[0].arg_plan.sources,
             vec![TypedDirectCallArgSource::Provided(0)]
+        );
+        assert_eq!(
+            lower_typed_function_call_access_plan_instrs(&mut typed_function),
+            1
+        );
+        assert!(
+            matches!(
+                typed_function.blocks[0].body.first(),
+                Some(soac_lowering::passes::InstrTyped::GuardedCallableCallTyped(
+                    _
+                ))
+            ),
+            "the shared typed access lowering pass should create the guarded-call instruction"
         );
     }
 
@@ -4191,14 +4211,14 @@ def build(values):
             reason: "profiled direct call".to_string(),
         };
 
-        let err = lower_opt_v3_direct_call_emissions(
+        let err = annotate_opt_v3_direct_call_access_plans(
             &mut typed_function,
             &HashMap::from([(call_instr_id, vec![direct_call_plan])]),
         )
         .expect_err("Inline direct-call bodies should not reach typed lowering");
 
         assert!(
-            err.contains("typed lowering only consumes DirectCall bodies"),
+            err.contains("typed call-access annotation only consumes DirectCall bodies"),
             "{err}"
         );
     }
@@ -4230,7 +4250,7 @@ def build(values):
             reason: "profiled direct call".to_string(),
         };
 
-        let err = lower_opt_v3_direct_call_emissions(
+        let err = annotate_opt_v3_direct_call_access_plans(
             &mut typed_function,
             &HashMap::from([(missing_source, vec![direct_call_plan])]),
         )
@@ -4430,7 +4450,7 @@ def build(values):
         );
 
         assert_eq!(
-            lower_opt_v3_constructor_call_emissions(
+            annotate_opt_v3_constructor_call_access_plans(
                 &mut typed_function,
                 &prepared_constructor_calls,
             )
@@ -4505,7 +4525,7 @@ def build(values):
         );
 
         assert_eq!(
-            lower_opt_v3_method_call_emissions(
+            annotate_opt_v3_method_call_access_plans(
                 &module,
                 &mut typed_function,
                 &prepared_method_calls,
@@ -4569,7 +4589,7 @@ def build(values):
             )]))
             .expect("method guard preparation should succeed");
 
-        let err = lower_opt_v3_method_call_emissions(
+        let err = annotate_opt_v3_method_call_access_plans(
             &module,
             &mut typed_function,
             &prepared_method_calls,

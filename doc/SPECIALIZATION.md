@@ -438,15 +438,16 @@ plan in the artifact. The JIT validates that the mechanical emission matches
 the selected plan and that each target exists in the loaded module set, then
 consumes the emitted call plan directly when constructing
 `FunctionSpecializationInputs`. When preparing the typed function, v3 emitted
-ordinary calls are lowered mechanically to
-`InstrTyped::GuardedCallableCallTyped`; v3 emitted method and constructor calls
-arrive at typed lowering as prepared guards from `FunctionSpecializationInputs`
-or as guardless v3-owned sources. Prepared method guards lower mechanically to
-`InstrTyped::GuardedMethodCallTyped`; prepared constructor guards lower
-mechanically to `InstrTyped::GuardedCallableCallTyped` before the legacy
-call-access annotator runs. Guardless v3-owned sources remain generic calls
-instead of being replanned from legacy call-target evidence. V3 targets are also
-used for direct-function predeclaration and process-JIT batch scheduling. The
+ordinary calls annotate the matching `TypedCall` with
+`TypedCallAccessPlan::GuardedCallable`; v3 emitted method and constructor calls
+arrive as prepared guards from `FunctionSpecializationInputs` or as guardless
+v3-owned sources. Prepared method guards annotate
+`TypedCallAccessPlan::GuardedMethod`; prepared constructor guards annotate
+`TypedCallAccessPlan::GuardedCallable` before the legacy call-access annotator
+runs. The shared typed call-access lowering pass then creates the guarded typed
+call nodes. Guardless v3-owned sources remain generic calls instead of being
+replanned from legacy call-target evidence. V3 targets are also used for
+direct-function predeclaration and process-JIT batch scheduling. The
 earlier BlockPy store-call rewrite now consumes only v3 call plans whose
 serialized body policy is `Inline`; v3 plans whose body policy is `DirectCall`
 stay in the original lowered call shape for later mechanical typed-call
@@ -629,9 +630,9 @@ JIT emitter still materializes the full guarded call blocks today.
   `InstrTyped::DirectCallableCallTyped`. They carry the callable expression,
   explicit positional args, and either a selected function guard or a selected
   constructor owner/type-version guard. The current JIT can emit this node
-  directly, and guarded callable-call emission now consumes prepared
-  `InstrTyped::GuardedCallableCallTyped` payloads directly instead of converting
-  them back into typed call access plans. Ordinary v3 direct-call store sites
+  directly. V3 `DirectCall` body plans first annotate typed call access plans,
+  and the shared typed access lowering pass creates guarded callable/method
+  payloads before result-demand planning. Ordinary v3 direct-call store sites
   and eligible receiver-method sites are expanded in the profiled BlockPy
   module plan only when the v3 plan selected `Inline` as the call-body policy
   after validating inline-fragment buildability. Runtime-iter constructor

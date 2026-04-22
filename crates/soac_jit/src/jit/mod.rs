@@ -38,10 +38,10 @@ use soac_core::block_py::{
     BlockPyModule, BlockTerm, Call, CallArgKeyword, CallArgPositional, CallDirect,
     CallableScopeKind, CellLocation, ChildVisitable, CounterDef, CounterId, CounterScope,
     CounterSite, Del, DeoptEntrySource, FunctionExecutionMode, FunctionKind, GetAttr, HasMeta,
-    HasSemanticInstrId, InstrId, InstrKey, InstrWithConstantNone, Load, LocalFunctionId,
-    LocalLocation, Meta, ModuleContentId, NameLike, NameLocation, ParamKind, PersistentFunctionId,
-    ResolvedName, RuntimeFunctionId, RuntimeModuleId, RuntimeName, SerializedFunctionId,
-    SerializedModuleId, StorageLayout, Store, Visit, VisitMut, WithMeta,
+    HasSemanticInstrId, InstrId, InstrKey, Load, LocalFunctionId, LocalLocation, Meta,
+    ModuleContentId, NameLike, NameLocation, ParamKind, PersistentFunctionId, ResolvedName,
+    RuntimeFunctionId, RuntimeModuleId, RuntimeName, SerializedFunctionId, SerializedModuleId,
+    StorageLayout, Store, Visit, VisitMut, WithMeta,
 };
 use soac_core::profile::{
     CollectedTypeKeyLayout, CounterDumpTypeKey, read_block_entry_counts_from_file,
@@ -30662,7 +30662,7 @@ fn validate_typed_function_preserves_codegen_cfg(
     Ok(())
 }
 
-fn lower_opt_v3_direct_call_emissions(
+fn annotate_opt_v3_direct_call_access_plans(
     function: &mut BlockPyFunction<TypedCodegenModuleShape>,
     direct_calls_by_instr: &HashMap<InstrId, Vec<OptV3DirectCallPlan>>,
 ) -> Result<usize, String> {
@@ -30673,7 +30673,7 @@ fn lower_opt_v3_direct_call_emissions(
         for direct_call in direct_calls {
             if direct_call.body.kind != PlanV3CallBodyKind::DirectCall {
                 return Err(format!(
-                    "optimizer v3 direct-call at {} selected {:?} body, but typed lowering only consumes DirectCall bodies",
+                    "optimizer v3 direct-call at {} selected {:?} body, but typed call-access annotation only consumes DirectCall bodies",
                     source, direct_call.body.kind
                 ));
             }
@@ -30703,11 +30703,6 @@ fn lower_opt_v3_direct_call_emissions(
                 return;
             }
 
-            let old_expr = std::mem::replace(expr, InstrTyped::constant_none());
-            let InstrTyped::CallTyped(mut call) = old_expr else {
-                unreachable!("checked call shape before replacing typed instruction")
-            };
-            call.access = TypedCallAccessPlan::Generic;
             let function_guards = direct_calls
                 .iter()
                 .map(|direct_call| TypedDirectFunctionCallGuard {
@@ -30715,9 +30710,10 @@ fn lower_opt_v3_direct_call_emissions(
                     arg_plan: direct_call.arg_plan.clone(),
                 })
                 .collect();
-            *expr = InstrTyped::GuardedCallableCallTyped(
-                TypedGuardedCallableCall::from_typed_call(call, function_guards, Vec::new()),
-            );
+            call.access = TypedCallAccessPlan::GuardedCallable {
+                function_guards,
+                constructor_guards: Vec::new(),
+            };
             self.count += 1;
         }
     }
@@ -30787,7 +30783,7 @@ fn opt_v3_constructor_call_guard_from_plan(
     }))
 }
 
-fn lower_opt_v3_constructor_call_emissions(
+fn annotate_opt_v3_constructor_call_access_plans(
     function: &mut BlockPyFunction<TypedCodegenModuleShape>,
     constructor_calls_by_instr: &HashMap<InstrId, OptV3PreparedConstructorCallPlan>,
 ) -> Result<usize, String> {
@@ -30831,17 +30827,10 @@ fn lower_opt_v3_constructor_call_emissions(
                 return;
             }
 
-            let old_expr = std::mem::replace(expr, InstrTyped::constant_none());
-            let InstrTyped::CallTyped(mut call) = old_expr else {
-                unreachable!("checked call shape before replacing typed instruction")
+            call.access = TypedCallAccessPlan::GuardedCallable {
+                function_guards: Vec::new(),
+                constructor_guards: constructor_calls.guards.clone(),
             };
-            call.access = TypedCallAccessPlan::Generic;
-            *expr =
-                InstrTyped::GuardedCallableCallTyped(TypedGuardedCallableCall::from_typed_call(
-                    call,
-                    Vec::new(),
-                    constructor_calls.guards.clone(),
-                ));
             self.count += 1;
         }
     }
@@ -30916,7 +30905,7 @@ fn opt_v3_method_call_guard_from_plan(
     }))
 }
 
-fn lower_opt_v3_method_call_emissions(
+fn annotate_opt_v3_method_call_access_plans(
     module: &BlockPyModule<CodegenModuleShape>,
     function: &mut BlockPyFunction<TypedCodegenModuleShape>,
     method_calls_by_instr: &HashMap<InstrId, OptV3PreparedMethodCallPlan>,
@@ -30977,16 +30966,10 @@ fn lower_opt_v3_method_call_emissions(
                 return;
             }
 
-            let old_expr = std::mem::replace(expr, InstrTyped::constant_none());
-            let InstrTyped::CallTyped(mut call) = old_expr else {
-                unreachable!("checked call shape before replacing typed instruction")
+            call.access = TypedCallAccessPlan::GuardedMethod {
+                method_name: method_name.to_string(),
+                method_guards: method_calls.guards.clone(),
             };
-            call.access = TypedCallAccessPlan::Generic;
-            *expr = InstrTyped::GuardedMethodCallTyped(TypedGuardedMethodCall::from_typed_call(
-                call,
-                method_name.to_string(),
-                method_calls.guards.clone(),
-            ));
             self.count += 1;
         }
     }
@@ -31041,12 +31024,16 @@ fn prepare_specialized_typed_function(
         opt_v3_indexed_fields_by_instr,
         specialize_field_stores,
     )?;
-    lower_opt_v3_direct_call_emissions(&mut typed_function, opt_v3_direct_calls_by_instr)?;
-    lower_opt_v3_constructor_call_emissions(
+    annotate_opt_v3_direct_call_access_plans(&mut typed_function, opt_v3_direct_calls_by_instr)?;
+    annotate_opt_v3_constructor_call_access_plans(
         &mut typed_function,
         opt_v3_constructor_calls_by_instr,
     )?;
-    lower_opt_v3_method_call_emissions(module, &mut typed_function, opt_v3_method_calls_by_instr)?;
+    annotate_opt_v3_method_call_access_plans(
+        module,
+        &mut typed_function,
+        opt_v3_method_calls_by_instr,
+    )?;
     annotate_typed_call_accesses(
         &mut typed_function,
         call_specialization_ctx,
