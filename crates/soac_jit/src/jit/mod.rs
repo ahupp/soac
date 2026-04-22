@@ -30051,6 +30051,9 @@ fn lower_opt_v3_constructor_call_emissions(
                 }
             }
             if guards.is_empty() {
+                // The v3 source still owns this call site. If the runtime
+                // owner type/attribute cannot be resolved in this compile
+                // context, leave the original generic call in place.
                 return;
             }
 
@@ -30209,6 +30212,9 @@ fn lower_opt_v3_method_call_emissions(
                 }
             }
             if guards.is_empty() {
+                // The v3 source still owns this call site. If the runtime
+                // owner type/attribute cannot be resolved in this compile
+                // context, leave the original generic call in place.
                 return;
             }
 

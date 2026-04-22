@@ -4216,6 +4216,172 @@ def build(values):
     }
 
     #[test]
+    fn opt_v3_constructor_call_emission_declines_selected_source_without_runtime_guard() {
+        let mut constants = TestConstantPool::default();
+        let call_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
+        let target = RuntimeFunctionId::from_raw_parts(0, 7);
+        let call = with_instr_id(
+            op_expr(Call::new(
+                name_expr(test_global_name("Box")),
+                vec![CallArgPositional::Positional(constants.int_expr(1))],
+                Vec::<CallArgKeyword<InstrCodegen>>::new(),
+            )),
+            call_instr_id,
+        );
+        let function =
+            with_single_test_block(test_function(), vec![call], ret_term(constants.int_expr(2)));
+        let mut typed_function = lower_codegen_function_to_typed(function);
+        let constructor_call_plan = OptV3ConstructorCallPlan {
+            source: call_instr_id,
+            target,
+            owner_type: PlanV3ConstructorCallOwnerType {
+                module_name: "missing_v3_constructor_type".to_string(),
+                qualname: "Box".to_string(),
+            },
+            arg_plan: TypedDirectCallArgPlan {
+                sources: vec![
+                    TypedDirectCallArgSource::Provided(0),
+                    TypedDirectCallArgSource::Provided(1),
+                ],
+            },
+            guard: PlanV3ConstructorCallGuardKind::ExactCallableTypeVersion,
+            fallback: PlanV3ConstructorCallFallbackKind::OriginalConstructorCall,
+            reason: "profiled constructor call".to_string(),
+        };
+
+        assert_eq!(
+            lower_opt_v3_constructor_call_emissions(
+                &mut typed_function,
+                &HashMap::from([(call_instr_id, vec![constructor_call_plan])]),
+            )
+            .expect("unresolved runtime guard should leave generic constructor call in place"),
+            0
+        );
+
+        let Some(soac_lowering::passes::InstrTyped::CallTyped(call)) =
+            typed_function.blocks[0].body.first()
+        else {
+            panic!("unresolved runtime guard should preserve original constructor call");
+        };
+        assert!(matches!(
+            call.access,
+            soac_lowering::passes::TypedCallAccessPlan::Generic
+        ));
+    }
+
+    #[test]
+    fn opt_v3_method_call_emission_declines_selected_source_without_runtime_guard() {
+        let mut constants = TestConstantPool::default();
+        let call_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
+        let target = RuntimeFunctionId::from_raw_parts(0, 7);
+        let call = with_instr_id(
+            op_expr(Call::new(
+                op_expr(GetAttr::new(
+                    name_expr(test_local_name("box", 0)),
+                    constants.string_expr("get"),
+                )),
+                vec![CallArgPositional::Positional(constants.int_expr(1))],
+                Vec::<CallArgKeyword<InstrCodegen>>::new(),
+            )),
+            call_instr_id,
+        );
+        let function =
+            with_single_test_block(test_function(), vec![call], ret_term(constants.int_expr(2)));
+        let mut module = test_module(ModuleNameGen::new(0), vec![function.clone()]);
+        module.module_constants = constants.module_constants;
+        let mut typed_function = lower_codegen_function_to_typed(function);
+        let method_call_plan = OptV3MethodCallPlan {
+            source: call_instr_id,
+            target,
+            method_name: "get".to_string(),
+            owner_type: PlanV3MethodCallOwnerType {
+                module_name: "missing_v3_method_type".to_string(),
+                qualname: "Box".to_string(),
+            },
+            arg_plan: TypedDirectCallArgPlan {
+                sources: vec![
+                    TypedDirectCallArgSource::Provided(0),
+                    TypedDirectCallArgSource::Provided(1),
+                ],
+            },
+            guard: PlanV3MethodCallGuardKind::ExactReceiverTypeVersion,
+            fallback: PlanV3MethodCallFallbackKind::OriginalMethodCall,
+            reason: "profiled method call".to_string(),
+        };
+
+        assert_eq!(
+            lower_opt_v3_method_call_emissions(
+                &module,
+                &mut typed_function,
+                &HashMap::from([(call_instr_id, vec![method_call_plan])]),
+            )
+            .expect("unresolved runtime guard should leave generic method call in place"),
+            0
+        );
+
+        let Some(soac_lowering::passes::InstrTyped::CallTyped(call)) =
+            typed_function.blocks[0].body.first()
+        else {
+            panic!("unresolved runtime guard should preserve original method call");
+        };
+        assert!(matches!(
+            call.access,
+            soac_lowering::passes::TypedCallAccessPlan::Generic
+        ));
+    }
+
+    #[test]
+    fn opt_v3_method_call_emission_rejects_selected_source_with_wrong_call_shape() {
+        let mut constants = TestConstantPool::default();
+        let call_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
+        let target = RuntimeFunctionId::from_raw_parts(0, 7);
+        let call = with_instr_id(
+            op_expr(Call::new(
+                name_expr(test_local_name("get", 0)),
+                vec![CallArgPositional::Positional(constants.int_expr(1))],
+                Vec::<CallArgKeyword<InstrCodegen>>::new(),
+            )),
+            call_instr_id,
+        );
+        let function =
+            with_single_test_block(test_function(), vec![call], ret_term(constants.int_expr(2)));
+        let mut module = test_module(ModuleNameGen::new(0), vec![function.clone()]);
+        module.module_constants = constants.module_constants;
+        let mut typed_function = lower_codegen_function_to_typed(function);
+        let method_call_plan = OptV3MethodCallPlan {
+            source: call_instr_id,
+            target,
+            method_name: "get".to_string(),
+            owner_type: PlanV3MethodCallOwnerType {
+                module_name: "missing_v3_method_type".to_string(),
+                qualname: "Box".to_string(),
+            },
+            arg_plan: TypedDirectCallArgPlan {
+                sources: vec![
+                    TypedDirectCallArgSource::Provided(0),
+                    TypedDirectCallArgSource::Provided(1),
+                ],
+            },
+            guard: PlanV3MethodCallGuardKind::ExactReceiverTypeVersion,
+            fallback: PlanV3MethodCallFallbackKind::OriginalMethodCall,
+            reason: "profiled method call".to_string(),
+        };
+
+        let err = lower_opt_v3_method_call_emissions(
+            &module,
+            &mut typed_function,
+            &HashMap::from([(call_instr_id, vec![method_call_plan])]),
+        )
+        .expect_err("v3 method-call selection should still reject a non-method source");
+
+        assert!(
+            err.contains("optimizer v3 emitted method-call")
+                && err.contains("lowered source is not a GetAttr call"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn typed_result_demand_extra_marks_direct_call_inputs_pyobject_borrowed_ok() {
         let mut constants = TestConstantPool::default();
         let call_instr_id = InstrId::new(BlockLabel::from_index(0), 0);

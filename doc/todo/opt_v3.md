@@ -129,8 +129,11 @@ Implemented:
   as v3-owned codegen inputs. They carry owner type, method name, receiver
   type-version guard kind, original-call fallback kind, and an argument plan
   with the implicit receiver represented explicitly. The JIT validates the
-  emitted method plan, resolves the current owner type/attribute, and lowers it
-  to a typed guarded method call without converting it to legacy evidence.
+  emitted method plan, attempts to resolve the current owner type/attribute,
+  and lowers it to a typed guarded method call when that runtime guard is
+  available. If the guard cannot be resolved in the current compile context,
+  the v3-owned source stays out of legacy evidence and the original generic
+  call remains as the local fallback.
   Indexed-field
   decisions are also derived from mechanical `mod.optv3` emission as v3-owned
   typed-attribute inputs, with exact plan/emission validation before use.
@@ -167,6 +170,11 @@ Partially migrated families are also intentionally visible:
   `__init__` target, owner type, type-version guard kind, original-call
   fallback, and implicit-`self` argument plan; the existing constructor emitter
   still owns allocation, initializer inlining, and `__init__` result validation.
+  Runtime owner type or attribute resolution can still decline a selected
+  method/constructor source to the original generic call; that is a local
+  fallback, not a legacy call-target replan. A future cleanup should make those
+  runtime preconditions explicit enough that selected call nodes either always
+  lower mechanically or are declined before JIT typed-call emission.
 - indexed fields are represented as v3 plan selections plus mechanical
   indexed-field emissions. `soac_jit` now keeps the emitted access kind and
   attribute name separate from legacy per-instruction field evidence and

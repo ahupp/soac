@@ -26,6 +26,10 @@ receiver type-version guard kind, and original-call fallback kind. JIT
 validation checks those emitted decisions against the selected plan before
 deriving mechanical typed-call lowering input and resolving current-module or
 cross-module direct-call targets from the loaded module set.
+If a method or constructor owner type/attribute guard cannot be resolved in the
+current compile context, the v3-owned call source stays out of legacy
+call-target evidence and the original generic call remains as the local
+fallback.
 Constant-attribute indexed-field load/store selections from `type_keys` are
 also emitted as mechanical v3 indexed-field decisions; JIT validation checks
 those emitted decisions against the selected plan before deriving typed
@@ -425,9 +429,11 @@ current owner type and owner attribute, then lower mechanically to
 `InstrTyped::GuardedMethodCallTyped`; v3 emitted constructor calls resolve the
 current owner type and `__init__` attribute, then lower mechanically to
 `InstrTyped::GuardedCallableCallTyped` with constructor guards before the
-legacy call-access annotator runs. V3 targets are also used for direct-function predeclaration,
-process-JIT batch scheduling, and the earlier BlockPy store-call rewrite for
-ordinary direct calls, but planner queries over legacy
+legacy call-access annotator runs. If runtime owner type or attribute
+resolution cannot produce a guard, the v3-owned call source remains a generic
+call instead of being replanned from legacy call-target evidence. V3 targets are
+also used for direct-function predeclaration, process-JIT batch scheduling, and
+the earlier BlockPy store-call rewrite for ordinary direct calls, but planner queries over legacy
 `FunctionProfileEvidence` do not see v3 call targets. Current v3 direct-call
 support covers ordinary function targets and receiver-method targets with
 validated positional/default argument plans, plus class-constructor targets
@@ -557,8 +563,10 @@ JIT emitter still materializes the full guarded call blocks today.
   target evidence directly and writes method-call selections into `mod.optv3`.
   The serialized plan owns the method name, owner type key, direct-entry
   argument plan, receiver type-version guard kind, and original-call fallback
-  kind. JIT lowering validates the mechanical emission and resolves the current
-  owner type/attribute before constructing the typed method guard.
+  kind. JIT lowering validates the mechanical emission and tries to resolve the
+  current owner type/attribute before constructing the typed method guard; if
+  no guard can be resolved in that compile context, the original generic method
+  call remains as the local fallback.
 - This specialization is only considered when the call target is a
   `GetAttr`, in `direct_method_specializations_for_call_site`, at
   `crates/soac_jit/src/jit/call_specialization.rs`.
@@ -713,9 +721,10 @@ JIT emitter still materializes the full guarded call blocks today.
   type-version guard kind, and the original-constructor-call fallback kind.
 - JIT typed-call lowering validates the mechanical emission, resolves the
   current owner type and `__init__` attribute, and constructs a typed
-  constructor guard. The existing constructor emitter then owns allocation,
-  straight-line initializer inlining, direct `__init__` calls, and
-  `dp_jit_finish_constructor_init`.
+  constructor guard when possible. If no runtime guard can be resolved in that
+  compile context, the original generic constructor call remains as the local
+  fallback. The existing constructor emitter then owns allocation, straight-line
+  initializer inlining, direct `__init__` calls, and `dp_jit_finish_constructor_init`.
 - Legacy constructor refinement remains the fallback for non-v3 plans and
   happens in `direct_constructor_specializations_for_call_site`, which uses
   `lookup_exact_owner_types_for_constructor`.
