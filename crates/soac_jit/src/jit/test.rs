@@ -4138,7 +4138,7 @@ def build(values):
             arg_plan: TypedDirectCallArgPlan {
                 sources: vec![TypedDirectCallArgSource::Provided(0)],
             },
-            body: test_v3_inline_call_body(),
+            body: test_v3_direct_call_body(),
             reason: "profiled direct call".to_string(),
         };
 
@@ -4166,6 +4166,44 @@ def build(values):
     }
 
     #[test]
+    fn opt_v3_direct_call_emission_rejects_inline_body_plan() {
+        let mut constants = TestConstantPool::default();
+        let call_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
+        let target = RuntimeFunctionId::from_raw_parts(0, 7);
+        let call = with_instr_id(
+            op_expr(Call::new(
+                name_expr(test_runtime_name("callable")),
+                vec![CallArgPositional::Positional(constants.int_expr(1))],
+                Vec::<CallArgKeyword<InstrCodegen>>::new(),
+            )),
+            call_instr_id,
+        );
+        let function =
+            with_single_test_block(test_function(), vec![call], ret_term(constants.int_expr(2)));
+        let mut typed_function = lower_codegen_function_to_typed(function);
+        let direct_call_plan = OptV3DirectCallPlan {
+            source: call_instr_id,
+            target,
+            arg_plan: TypedDirectCallArgPlan {
+                sources: vec![TypedDirectCallArgSource::Provided(0)],
+            },
+            body: test_v3_inline_call_body(),
+            reason: "profiled direct call".to_string(),
+        };
+
+        let err = lower_opt_v3_direct_call_emissions(
+            &mut typed_function,
+            &HashMap::from([(call_instr_id, vec![direct_call_plan])]),
+        )
+        .expect_err("Inline direct-call bodies should not reach typed lowering");
+
+        assert!(
+            err.contains("typed lowering only consumes DirectCall bodies"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn opt_v3_direct_call_emission_rejects_unmatched_source() {
         let mut constants = TestConstantPool::default();
         let call_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
@@ -4188,7 +4226,7 @@ def build(values):
             arg_plan: TypedDirectCallArgPlan {
                 sources: vec![TypedDirectCallArgSource::Provided(0)],
             },
-            body: test_v3_inline_call_body(),
+            body: test_v3_direct_call_body(),
             reason: "profiled direct call".to_string(),
         };
 

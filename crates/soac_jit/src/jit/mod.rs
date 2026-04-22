@@ -30669,6 +30669,16 @@ fn lower_opt_v3_direct_call_emissions(
     if direct_calls_by_instr.is_empty() {
         return Ok(0);
     }
+    for (source, direct_calls) in direct_calls_by_instr {
+        for direct_call in direct_calls {
+            if direct_call.body.kind != PlanV3CallBodyKind::DirectCall {
+                return Err(format!(
+                    "optimizer v3 direct-call at {} selected {:?} body, but typed lowering only consumes DirectCall bodies",
+                    source, direct_call.body.kind
+                ));
+            }
+        }
+    }
 
     struct Rewriter<'a> {
         direct_calls_by_instr: &'a HashMap<InstrId, Vec<OptV3DirectCallPlan>>,
