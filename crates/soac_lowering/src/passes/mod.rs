@@ -28,18 +28,19 @@ use crate::block_py::{
     ExprDictComp, ExprEllipsisLiteral, ExprFString, ExprGenerator, ExprIf, ExprIpyEscapeCommand,
     ExprLambda, ExprList, ExprListComp, ExprName, ExprNamed, ExprNoneLiteral, ExprNumberLiteral,
     ExprSet, ExprSetComp, ExprSlice, ExprStarred, ExprStringLiteral, ExprSubscript, ExprTString,
-    ExprTuple, GetAttr, GetItem, HasMeta, IncrementCounter, Instr, InstrKey, InstrWithConstantNone,
-    LiteralValue, Load, LocalLocation, MakeCell, MakeFunction, MakeFunctionWithClosure,
-    MapFunction, MapInstr, MapModule, Mappable, Meta, ModuleShape, NameLike, NameLocation,
-    PrettyPrint, PrettyPrinter, ResolvedName, RuntimeFunctionId, RuntimeName, SetAttr, SetItem,
-    StmtAnnAssign, StmtAssert, StmtAssign, StmtAugAssign, StmtBreak, StmtClassDef, StmtContinue,
-    StmtDelete, StmtExpr, StmtFor, StmtFunctionDef, StmtGlobal, StmtIf, StmtImport, StmtImportFrom,
-    StmtIpyEscapeCommand, StmtMatch, StmtNonlocal, StmtPass, StmtRaise, StmtReturn, StmtTry,
-    StmtTypeAlias, StmtWhile, StmtWith, Store, TryMapInstr, TryMapModule, TryMapTerm, Tuple,
-    UnaryOp, UnresolvedName, Visit, VisitMut, WithMeta, Yield, YieldFrom,
+    ExprTuple, GetAttr, GetItem, HasMeta, HasSemanticInstrId, IncrementCounter, Instr, InstrId,
+    InstrKey, InstrWithConstantNone, LiteralValue, Load, LocalLocation, MakeCell, MakeFunction,
+    MakeFunctionWithClosure, MapFunction, MapInstr, MapModule, Mappable, Meta, ModuleShape,
+    NameLike, NameLocation, PrettyPrint, PrettyPrinter, ResolvedName, RuntimeFunctionId,
+    RuntimeName, SetAttr, SetItem, StmtAnnAssign, StmtAssert, StmtAssign, StmtAugAssign, StmtBreak,
+    StmtClassDef, StmtContinue, StmtDelete, StmtExpr, StmtFor, StmtFunctionDef, StmtGlobal, StmtIf,
+    StmtImport, StmtImportFrom, StmtIpyEscapeCommand, StmtMatch, StmtNonlocal, StmtPass, StmtRaise,
+    StmtReturn, StmtTry, StmtTypeAlias, StmtWhile, StmtWith, Store, TryMapInstr, TryMapModule,
+    TryMapTerm, Tuple, UnaryOp, UnresolvedName, Visit, VisitMut, WithMeta, Yield, YieldFrom,
 };
 use ruff_python_ast::{self as ast};
 use soac_macros::{enum_broadcast, DelegateMatchDefault};
+use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, derive_more::From, DelegateMatchDefault)]
 #[enum_broadcast(HasMeta, WithMeta, ChildVisitable, Mappable, PrettyPrint, Debug)]
@@ -270,6 +271,69 @@ pub enum TypedCallAccessPlan {
         method_name: String,
         method_guards: Vec<TypedDirectMethodCallGuard>,
     },
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TypedCallEmissionPlans {
+    pub by_source: HashMap<InstrId, TypedCallEmissionPlan>,
+}
+
+impl TypedCallEmissionPlans {
+    pub fn is_empty(&self) -> bool {
+        self.by_source.is_empty()
+    }
+
+    pub fn sources(&self) -> HashSet<InstrId> {
+        self.by_source.keys().copied().collect()
+    }
+
+    pub fn target_function_ids(&self) -> Vec<RuntimeFunctionId> {
+        self.by_source
+            .values()
+            .flat_map(TypedCallEmissionPlan::target_function_ids)
+            .collect()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TypedCallEmissionPlan {
+    Callable {
+        function_guards: Vec<TypedDirectFunctionCallGuard>,
+        constructor_guards: Vec<TypedDirectConstructorCallGuard>,
+    },
+    Method {
+        method_name: String,
+        method_guards: Vec<TypedDirectMethodCallGuard>,
+    },
+}
+
+impl TypedCallEmissionPlan {
+    pub fn target_function_ids(&self) -> Vec<RuntimeFunctionId> {
+        match self {
+            Self::Callable {
+                function_guards,
+                constructor_guards,
+            } => function_guards
+                .iter()
+                .map(|guard| guard.function_id)
+                .chain(constructor_guards.iter().map(|guard| guard.function_id))
+                .collect(),
+            Self::Method { method_guards, .. } => method_guards
+                .iter()
+                .map(|guard| guard.function_id)
+                .collect(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Callable {
+                function_guards,
+                constructor_guards,
+            } => function_guards.is_empty() && constructor_guards.is_empty(),
+            Self::Method { method_guards, .. } => method_guards.is_empty(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -2002,6 +2066,86 @@ pub fn lower_typed_if_tests_to_truthy(
     module
 }
 
+pub fn lower_typed_function_call_emission_plans(
+    function: &mut BlockPyFunction<TypedCodegenModuleShape>,
+    plans: &TypedCallEmissionPlans,
+) -> Result<usize, String> {
+    if plans.is_empty() {
+        return Ok(0);
+    }
+
+    struct Rewriter<'a> {
+        plans: &'a TypedCallEmissionPlans,
+        count: usize,
+        error: Option<String>,
+    }
+
+    impl VisitMut<InstrTyped> for Rewriter<'_> {
+        fn visit_instr_mut(&mut self, expr: &mut InstrTyped) {
+            if self.error.is_some() {
+                return;
+            }
+            expr.visit_children_mut(self);
+            let InstrTyped::CallTyped(call) = expr else {
+                return;
+            };
+            let Some(instr_id) = call.try_semantic_instr_id() else {
+                return;
+            };
+            let Some(plan) = self.plans.by_source.get(&instr_id) else {
+                return;
+            };
+            if plan.is_empty() {
+                return;
+            }
+
+            let old_expr = std::mem::replace(expr, InstrTyped::constant_none());
+            let InstrTyped::CallTyped(call) = old_expr else {
+                unreachable!("checked call shape before replacing typed instruction")
+            };
+            match plan {
+                TypedCallEmissionPlan::Callable {
+                    function_guards,
+                    constructor_guards,
+                } => {
+                    *expr = InstrTyped::GuardedCallableCallTyped(
+                        TypedGuardedCallableCall::from_typed_call(
+                            call,
+                            function_guards.clone(),
+                            constructor_guards.clone(),
+                        ),
+                    );
+                    self.count += 1;
+                }
+                TypedCallEmissionPlan::Method {
+                    method_name,
+                    method_guards,
+                } => {
+                    *expr = InstrTyped::GuardedMethodCallTyped(
+                        TypedGuardedMethodCall::from_typed_call(
+                            call,
+                            method_name.clone(),
+                            method_guards.clone(),
+                        ),
+                    );
+                    self.count += 1;
+                }
+            }
+        }
+    }
+
+    let mut rewriter = Rewriter {
+        plans,
+        count: 0,
+        error: None,
+    };
+    rewriter.visit_fn_mut(function);
+    if let Some(err) = rewriter.error {
+        return Err(err);
+    }
+    Ok(rewriter.count)
+}
+
 pub fn lower_typed_function_call_access_plan_instrs(
     function: &mut BlockPyFunction<TypedCodegenModuleShape>,
 ) -> usize {
@@ -2985,6 +3129,30 @@ mod typed_codegen_tests {
         );
     }
 
+    fn first_typed_call_instr_id(function: &BlockPyFunction<TypedCodegenModuleShape>) -> InstrId {
+        struct Finder {
+            instr_id: Option<InstrId>,
+        }
+
+        impl Visit<InstrTyped> for Finder {
+            fn visit_instr(&mut self, expr: &InstrTyped) {
+                if self.instr_id.is_none() {
+                    if let InstrTyped::CallTyped(call) = expr {
+                        self.instr_id = call.try_semantic_instr_id();
+                        return;
+                    }
+                }
+                expr.visit_children(self);
+            }
+        }
+
+        let mut finder = Finder { instr_id: None };
+        finder.visit_fn(function);
+        finder
+            .instr_id
+            .expect("test function should contain a typed call with an instruction id")
+    }
+
     #[test]
     fn lower_codegen_module_to_typed_keeps_loads_first_class() {
         let lowered =
@@ -3339,6 +3507,168 @@ def caller(it):\n    return it.__next__()\n",
         }
         assert_eq!(counter.typed_calls, 0);
         assert_eq!(counter.guarded_method_calls, 1);
+    }
+
+    #[test]
+    fn lowers_typed_call_emission_plan_to_guarded_callable_instr() {
+        let lowered = crate::lower_python_to_blockpy_for_testing(
+            "def add(a):\n    return a\n\n\
+def caller(a):\n    return add(a)\n",
+        )
+        .expect("source should lower");
+        let add_id = codegen_function_id_by_qualname(&lowered.codegen_module, "add");
+        let mut typed = lower_codegen_module_to_typed(lowered.codegen_module);
+        let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+        let call_id = first_typed_call_instr_id(caller);
+        let plans = TypedCallEmissionPlans {
+            by_source: HashMap::from([(
+                call_id,
+                TypedCallEmissionPlan::Callable {
+                    function_guards: vec![TypedDirectFunctionCallGuard {
+                        function_id: add_id,
+                        arg_plan: TypedDirectCallArgPlan {
+                            sources: vec![TypedDirectCallArgSource::Provided(0)],
+                        },
+                    }],
+                    constructor_guards: Vec::new(),
+                },
+            )]),
+        };
+
+        assert_eq!(
+            lower_typed_function_call_emission_plans(caller, &plans)
+                .expect("typed call emission plan should lower"),
+            1
+        );
+        assert_eq!(
+            lower_typed_function_call_access_plan_instrs(caller),
+            0,
+            "mechanical call emission lowering should not round-trip through access plans"
+        );
+
+        let mut counter = LegacyInstrCounter::default();
+        counter.visit_fn(caller);
+        assert_eq!(counter.typed_calls, 0);
+        assert_eq!(counter.guarded_callable_calls, 1);
+    }
+
+    #[test]
+    fn lowers_typed_call_emission_plan_with_function_and_constructor_guards() {
+        let lowered =
+            crate::lower_python_to_blockpy_for_testing("def caller(a):\n    return callable(a)\n")
+                .expect("source should lower");
+        let mut typed = lower_codegen_module_to_typed(lowered.codegen_module);
+        let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+        let call_id = first_typed_call_instr_id(caller);
+        let direct_target = RuntimeFunctionId::from_raw_parts(0, 7);
+        let constructor_target = RuntimeFunctionId::from_raw_parts(0, 8);
+        let arg_plan = TypedDirectCallArgPlan {
+            sources: vec![TypedDirectCallArgSource::Provided(0)],
+        };
+        let plans = TypedCallEmissionPlans {
+            by_source: HashMap::from([(
+                call_id,
+                TypedCallEmissionPlan::Callable {
+                    function_guards: vec![TypedDirectFunctionCallGuard {
+                        function_id: direct_target,
+                        arg_plan: arg_plan.clone(),
+                    }],
+                    constructor_guards: vec![TypedDirectConstructorCallGuard {
+                        function_id: constructor_target,
+                        owner_type_ref: TypedAttrOwnerRef::TypeKey {
+                            module_name: "test".to_string(),
+                            qualname: "Box".to_string(),
+                        },
+                        type_version: 11,
+                        arg_plan,
+                    }],
+                },
+            )]),
+        };
+
+        assert_eq!(
+            lower_typed_function_call_emission_plans(caller, &plans)
+                .expect("typed callable emission plan should lower"),
+            1
+        );
+        let mut counter = LegacyInstrCounter::default();
+        counter.visit_fn(caller);
+        assert_eq!(counter.guarded_callable_calls, 1);
+    }
+
+    #[test]
+    fn lowers_typed_call_emission_plan_to_guarded_method_instr() {
+        let lowered =
+            crate::lower_python_to_blockpy_for_testing("def caller(box):\n    return box.get(1)\n")
+                .expect("source should lower");
+        let mut typed = lower_codegen_module_to_typed(lowered.codegen_module);
+        let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+        let call_id = first_typed_call_instr_id(caller);
+        let target = RuntimeFunctionId::from_raw_parts(0, 9);
+        let plans = TypedCallEmissionPlans {
+            by_source: HashMap::from([(
+                call_id,
+                TypedCallEmissionPlan::Method {
+                    method_name: "get".to_string(),
+                    method_guards: vec![TypedDirectMethodCallGuard {
+                        function_id: target,
+                        owner_type_ref: TypedAttrOwnerRef::TypeKey {
+                            module_name: "test".to_string(),
+                            qualname: "Box".to_string(),
+                        },
+                        type_version: 11,
+                        arg_plan: TypedDirectCallArgPlan {
+                            sources: vec![TypedDirectCallArgSource::Provided(0)],
+                        },
+                    }],
+                },
+            )]),
+        };
+
+        assert_eq!(
+            lower_typed_function_call_emission_plans(caller, &plans)
+                .expect("typed method emission plan should lower"),
+            1
+        );
+        assert_eq!(
+            lower_typed_function_call_access_plan_instrs(caller),
+            0,
+            "mechanical method emission lowering should not round-trip through access plans"
+        );
+
+        let mut counter = LegacyInstrCounter::default();
+        counter.visit_fn(caller);
+        assert_eq!(counter.typed_calls, 0);
+        assert_eq!(counter.guarded_method_calls, 1);
+    }
+
+    #[test]
+    fn empty_typed_call_emission_plan_leaves_generic_call_in_place() {
+        let lowered =
+            crate::lower_python_to_blockpy_for_testing("def caller(box):\n    return box.get(1)\n")
+                .expect("source should lower");
+        let mut typed = lower_codegen_module_to_typed(lowered.codegen_module);
+        let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+        let call_id = first_typed_call_instr_id(caller);
+        let plans = TypedCallEmissionPlans {
+            by_source: HashMap::from([(
+                call_id,
+                TypedCallEmissionPlan::Method {
+                    method_name: "get".to_string(),
+                    method_guards: Vec::new(),
+                },
+            )]),
+        };
+
+        assert_eq!(
+            lower_typed_function_call_emission_plans(caller, &plans)
+                .expect("empty typed emission plan should be a local fallback"),
+            0
+        );
+        let mut counter = LegacyInstrCounter::default();
+        counter.visit_fn(caller);
+        assert_eq!(counter.typed_calls, 1);
+        assert_eq!(counter.guarded_method_calls, 0);
     }
 
     #[test]

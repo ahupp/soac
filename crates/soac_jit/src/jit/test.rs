@@ -4121,194 +4121,6 @@ def build(values):
     }
 
     #[test]
-    fn opt_v3_direct_call_emission_lowers_to_guarded_call_mechanically() {
-        let mut constants = TestConstantPool::default();
-        let call_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
-        let target = RuntimeFunctionId::from_raw_parts(0, 7);
-        let call = with_instr_id(
-            op_expr(Call::new(
-                name_expr(test_runtime_name("callable")),
-                vec![CallArgPositional::Positional(constants.int_expr(1))],
-                Vec::<CallArgKeyword<InstrCodegen>>::new(),
-            )),
-            call_instr_id,
-        );
-        let function =
-            with_single_test_block(test_function(), vec![call], ret_term(constants.int_expr(2)));
-        let mut typed_function = lower_codegen_function_to_typed(function);
-        let direct_call_plan = OptV3DirectCallPlan {
-            source: call_instr_id,
-            target,
-            arg_plan: TypedDirectCallArgPlan {
-                sources: vec![TypedDirectCallArgSource::Provided(0)],
-            },
-            body: test_v3_direct_call_body(),
-            reason: "profiled direct call".to_string(),
-        };
-
-        assert_eq!(
-            lower_opt_v3_call_emissions_to_typed_instrs(
-                &mut typed_function,
-                &HashMap::from([(call_instr_id, vec![direct_call_plan])]),
-                &HashMap::new(),
-                &HashMap::new(),
-            )
-            .expect("v3 direct-call emission should lower the typed call"),
-            1
-        );
-
-        let Some(soac_lowering::passes::InstrTyped::GuardedCallableCallTyped(call)) =
-            typed_function.blocks[0].body.first()
-        else {
-            panic!("v3 direct-call emission should directly create a guarded callable call");
-        };
-        assert!(call.constructor_guards.is_empty());
-        assert_eq!(call.function_guards.len(), 1);
-        assert_eq!(call.function_guards[0].function_id, target);
-        assert_eq!(
-            call.function_guards[0].arg_plan.sources,
-            vec![TypedDirectCallArgSource::Provided(0)]
-        );
-        assert_eq!(
-            lower_typed_function_call_access_plan_instrs(&mut typed_function),
-            0,
-            "v3 call lowering should not round-trip through typed access-plan lowering"
-        );
-    }
-
-    #[test]
-    fn opt_v3_callable_call_lowering_merges_function_and_constructor_guards() {
-        let mut constants = TestConstantPool::default();
-        let call_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
-        let direct_target = RuntimeFunctionId::from_raw_parts(0, 7);
-        let constructor_target = RuntimeFunctionId::from_raw_parts(0, 8);
-        let arg_plan = TypedDirectCallArgPlan {
-            sources: vec![TypedDirectCallArgSource::Provided(0)],
-        };
-        let call = with_instr_id(
-            op_expr(Call::new(
-                name_expr(test_runtime_name("callable")),
-                vec![CallArgPositional::Positional(constants.int_expr(1))],
-                Vec::<CallArgKeyword<InstrCodegen>>::new(),
-            )),
-            call_instr_id,
-        );
-        let function =
-            with_single_test_block(test_function(), vec![call], ret_term(constants.int_expr(2)));
-        let mut typed_function = lower_codegen_function_to_typed(function);
-
-        assert_eq!(
-            lower_opt_v3_call_emissions_to_typed_instrs(
-                &mut typed_function,
-                &HashMap::from([(
-                    call_instr_id,
-                    vec![OptV3DirectCallPlan {
-                        source: call_instr_id,
-                        target: direct_target,
-                        arg_plan: arg_plan.clone(),
-                        body: test_v3_direct_call_body(),
-                        reason: "profiled direct call".to_string(),
-                    }],
-                )]),
-                &HashMap::from([(
-                    call_instr_id,
-                    OptV3PreparedConstructorCallPlan {
-                        guards: vec![TypedDirectConstructorCallGuard {
-                            function_id: constructor_target,
-                            owner_type_ref: TypedAttrOwnerRef::TypeKey {
-                                module_name: "test".to_string(),
-                                qualname: "Box".to_string(),
-                            },
-                            type_version: 11,
-                            arg_plan: arg_plan.clone(),
-                        }],
-                    },
-                )]),
-                &HashMap::new(),
-            )
-            .expect("v3 callable emissions should lower mechanically"),
-            1
-        );
-
-        let Some(soac_lowering::passes::InstrTyped::GuardedCallableCallTyped(call)) =
-            typed_function.blocks[0].body.first()
-        else {
-            panic!("v3 callable emissions should directly create a guarded callable call");
-        };
-        assert_eq!(call.function_guards.len(), 1);
-        assert_eq!(call.function_guards[0].function_id, direct_target);
-        assert_eq!(call.constructor_guards.len(), 1);
-        assert_eq!(call.constructor_guards[0].function_id, constructor_target);
-        assert_eq!(
-            lower_typed_function_call_access_plan_instrs(&mut typed_function),
-            0,
-            "v3 callable lowering should not round-trip through typed access-plan lowering"
-        );
-    }
-
-    #[test]
-    fn opt_v3_method_call_emission_lowers_to_guarded_method_mechanically() {
-        let mut constants = TestConstantPool::default();
-        let call_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
-        let target = RuntimeFunctionId::from_raw_parts(0, 9);
-        let call = with_instr_id(
-            op_expr(Call::new(
-                op_expr(GetAttr::new(
-                    name_expr(test_local_name("box", 0)),
-                    constants.string_expr("get"),
-                )),
-                vec![CallArgPositional::Positional(constants.int_expr(1))],
-                Vec::<CallArgKeyword<InstrCodegen>>::new(),
-            )),
-            call_instr_id,
-        );
-        let function =
-            with_single_test_block(test_function(), vec![call], ret_term(constants.int_expr(2)));
-        let mut typed_function = lower_codegen_function_to_typed(function);
-
-        assert_eq!(
-            lower_opt_v3_call_emissions_to_typed_instrs(
-                &mut typed_function,
-                &HashMap::new(),
-                &HashMap::new(),
-                &HashMap::from([(
-                    call_instr_id,
-                    OptV3PreparedMethodCallPlan {
-                        method_name: "get".to_string(),
-                        guards: vec![TypedDirectMethodCallGuard {
-                            function_id: target,
-                            owner_type_ref: TypedAttrOwnerRef::TypeKey {
-                                module_name: "test".to_string(),
-                                qualname: "Box".to_string(),
-                            },
-                            type_version: 11,
-                            arg_plan: TypedDirectCallArgPlan {
-                                sources: vec![TypedDirectCallArgSource::Provided(0)],
-                            },
-                        }],
-                    },
-                )]),
-            )
-            .expect("v3 method-call emission should lower mechanically"),
-            1
-        );
-
-        let Some(soac_lowering::passes::InstrTyped::GuardedMethodCallTyped(call)) =
-            typed_function.blocks[0].body.first()
-        else {
-            panic!("v3 method-call emission should directly create a guarded method call");
-        };
-        assert_eq!(call.method_name, "get");
-        assert_eq!(call.method_guards.len(), 1);
-        assert_eq!(call.method_guards[0].function_id, target);
-        assert_eq!(
-            lower_typed_function_call_access_plan_instrs(&mut typed_function),
-            0,
-            "v3 method-call lowering should not round-trip through typed access-plan lowering"
-        );
-    }
-
-    #[test]
     fn legacy_call_targets_for_codegen_exclude_v3_call_sources() {
         let legacy_source = InstrId::new(BlockLabel::from_index(0), 1);
         let direct_source = InstrId::new(BlockLabel::from_index(0), 2);
@@ -4320,13 +4132,7 @@ def build(values):
             sources: vec![TypedDirectCallArgSource::Provided(0)],
         };
 
-        let filtered = legacy_call_targets_excluding_v3_call_sources(
-            &HashMap::from([
-                (legacy_source, vec![legacy_target]),
-                (direct_source, vec![legacy_target]),
-                (constructor_source, vec![legacy_target]),
-                (method_source, vec![legacy_target]),
-            ]),
+        let opt_v3_call_emissions = typed_call_emission_plans_from_v3(
             &HashMap::from([(
                 direct_source,
                 vec![OptV3DirectCallPlan {
@@ -4348,6 +4154,16 @@ def build(values):
                     guards: Vec::new(),
                 },
             )]),
+        )
+        .expect("v3 call emissions should merge into typed emission plan");
+        let filtered = legacy_call_targets_excluding_sources(
+            &HashMap::from([
+                (legacy_source, vec![legacy_target]),
+                (direct_source, vec![legacy_target]),
+                (constructor_source, vec![legacy_target]),
+                (method_source, vec![legacy_target]),
+            ]),
+            &opt_v3_call_emissions.sources(),
         );
 
         assert_eq!(
@@ -4421,7 +4237,7 @@ def build(values):
             "unowned legacy call-target evidence should remain available"
         );
         assert!(
-            inputs.opt_v3_direct_calls_by_instr.is_empty(),
+            inputs.opt_v3_call_emissions.is_empty(),
             "inline-body v3 direct calls are consumed before typed lowering"
         );
     }
@@ -4513,147 +4329,6 @@ def build(values):
             .unwrap()
             .is_empty(),
             "Inline method body plans are owned by the early BlockPy rewrite path"
-        );
-    }
-
-    #[test]
-    fn opt_v3_constructor_call_emission_declines_selected_source_without_runtime_guard() {
-        let mut constants = TestConstantPool::default();
-        let call_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
-        let call = with_instr_id(
-            op_expr(Call::new(
-                name_expr(test_global_name("Box")),
-                vec![CallArgPositional::Positional(constants.int_expr(1))],
-                Vec::<CallArgKeyword<InstrCodegen>>::new(),
-            )),
-            call_instr_id,
-        );
-        let function =
-            with_single_test_block(test_function(), vec![call], ret_term(constants.int_expr(2)));
-        let mut typed_function = lower_codegen_function_to_typed(function);
-        let prepared_constructor_calls = HashMap::from([(
-            call_instr_id,
-            OptV3PreparedConstructorCallPlan { guards: Vec::new() },
-        )]);
-        assert!(
-            prepared_constructor_calls
-                .get(&call_instr_id)
-                .expect("source should stay owned")
-                .guards
-                .is_empty(),
-            "unresolved constructor guard should decline before typed lowering"
-        );
-
-        assert_eq!(
-            lower_opt_v3_call_emissions_to_typed_instrs(
-                &mut typed_function,
-                &HashMap::new(),
-                &prepared_constructor_calls,
-                &HashMap::new(),
-            )
-            .expect("unresolved runtime guard should leave generic constructor call in place"),
-            0
-        );
-
-        let Some(soac_lowering::passes::InstrTyped::CallTyped(call)) =
-            typed_function.blocks[0].body.first()
-        else {
-            panic!("unresolved runtime guard should preserve original constructor call");
-        };
-        assert!(matches!(
-            call.access,
-            soac_lowering::passes::TypedCallAccessPlan::Generic
-        ));
-    }
-
-    #[test]
-    fn opt_v3_method_call_emission_declines_selected_source_without_runtime_guard() {
-        let mut constants = TestConstantPool::default();
-        let call_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
-        let call = with_instr_id(
-            op_expr(Call::new(
-                op_expr(GetAttr::new(
-                    name_expr(test_local_name("box", 0)),
-                    constants.string_expr("get"),
-                )),
-                vec![CallArgPositional::Positional(constants.int_expr(1))],
-                Vec::<CallArgKeyword<InstrCodegen>>::new(),
-            )),
-            call_instr_id,
-        );
-        let function =
-            with_single_test_block(test_function(), vec![call], ret_term(constants.int_expr(2)));
-        let mut typed_function = lower_codegen_function_to_typed(function);
-        let prepared_method_calls = HashMap::from([(
-            call_instr_id,
-            OptV3PreparedMethodCallPlan {
-                method_name: "get".to_string(),
-                guards: Vec::new(),
-            },
-        )]);
-        assert!(
-            prepared_method_calls
-                .get(&call_instr_id)
-                .expect("source should stay owned")
-                .guards
-                .is_empty(),
-            "unresolved method guard should decline before typed lowering"
-        );
-
-        assert_eq!(
-            lower_opt_v3_call_emissions_to_typed_instrs(
-                &mut typed_function,
-                &HashMap::new(),
-                &HashMap::new(),
-                &prepared_method_calls,
-            )
-            .expect("unresolved runtime guard should leave generic method call in place"),
-            0
-        );
-
-        let Some(soac_lowering::passes::InstrTyped::CallTyped(call)) =
-            typed_function.blocks[0].body.first()
-        else {
-            panic!("unresolved runtime guard should preserve original method call");
-        };
-        assert!(matches!(
-            call.access,
-            soac_lowering::passes::TypedCallAccessPlan::Generic
-        ));
-    }
-
-    #[test]
-    fn opt_v3_method_call_lowering_trusts_prevalidated_source_shape() {
-        let mut constants = TestConstantPool::default();
-        let call_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
-        let call = with_instr_id(
-            op_expr(Call::new(
-                name_expr(test_local_name("get", 0)),
-                vec![CallArgPositional::Positional(constants.int_expr(1))],
-                Vec::<CallArgKeyword<InstrCodegen>>::new(),
-            )),
-            call_instr_id,
-        );
-        let function =
-            with_single_test_block(test_function(), vec![call], ret_term(constants.int_expr(2)));
-        let mut typed_function = lower_codegen_function_to_typed(function);
-        let prepared_method_calls = HashMap::from([(
-            call_instr_id,
-            OptV3PreparedMethodCallPlan {
-                method_name: "get".to_string(),
-                guards: Vec::new(),
-            },
-        )]);
-
-        assert_eq!(
-            lower_opt_v3_call_emissions_to_typed_instrs(
-                &mut typed_function,
-                &HashMap::new(),
-                &HashMap::new(),
-                &prepared_method_calls,
-            )
-            .expect("JIT lowering should trust the prevalidated v3 method-call source"),
-            0
         );
     }
 
@@ -16828,9 +16503,7 @@ def f(x):
             BuildSpecializedFunctionOptions {
                 specialization_inputs: Some(FunctionSpecializationInputs {
                     call_target_specializations: HashMap::new(),
-                    opt_v3_direct_calls_by_instr: HashMap::new(),
-                    opt_v3_constructor_calls_by_instr: HashMap::new(),
-                    opt_v3_method_calls_by_instr: HashMap::new(),
+                    opt_v3_call_emissions: TypedCallEmissionPlans::default(),
                     operator_specializations: HashMap::new(),
                     opt_v3_exact_list_items_by_instr: HashMap::new(),
                     field_index_specializations: HashMap::new(),
@@ -17024,9 +16697,7 @@ def f(x):
             BuildSpecializedFunctionOptions {
                 specialization_inputs: Some(FunctionSpecializationInputs {
                     call_target_specializations: HashMap::new(),
-                    opt_v3_direct_calls_by_instr: HashMap::new(),
-                    opt_v3_constructor_calls_by_instr: HashMap::new(),
-                    opt_v3_method_calls_by_instr: HashMap::new(),
+                    opt_v3_call_emissions: TypedCallEmissionPlans::default(),
                     operator_specializations: HashMap::new(),
                     opt_v3_exact_list_items_by_instr: HashMap::new(),
                     field_index_specializations: HashMap::new(),
@@ -17184,9 +16855,7 @@ def f(x):
                 BuildSpecializedFunctionOptions {
                     specialization_inputs: Some(FunctionSpecializationInputs {
                         call_target_specializations: HashMap::new(),
-                        opt_v3_direct_calls_by_instr: HashMap::new(),
-                        opt_v3_constructor_calls_by_instr: HashMap::new(),
-                        opt_v3_method_calls_by_instr: HashMap::new(),
+                        opt_v3_call_emissions: TypedCallEmissionPlans::default(),
                         operator_specializations: HashMap::new(),
                         opt_v3_exact_list_items_by_instr: HashMap::new(),
                         field_index_specializations: HashMap::new(),
@@ -17315,9 +16984,7 @@ def f(x):
                 BuildSpecializedFunctionOptions {
                     specialization_inputs: Some(FunctionSpecializationInputs {
                         call_target_specializations: HashMap::new(),
-                        opt_v3_direct_calls_by_instr: HashMap::new(),
-                        opt_v3_constructor_calls_by_instr: HashMap::new(),
-                        opt_v3_method_calls_by_instr: HashMap::new(),
+                        opt_v3_call_emissions: TypedCallEmissionPlans::default(),
                         operator_specializations: HashMap::new(),
                         opt_v3_exact_list_items_by_instr: HashMap::new(),
                         field_index_specializations: HashMap::new(),
@@ -17441,9 +17108,7 @@ def f(x):
             BuildSpecializedFunctionOptions {
                 specialization_inputs: Some(FunctionSpecializationInputs {
                     call_target_specializations: HashMap::new(),
-                    opt_v3_direct_calls_by_instr: HashMap::new(),
-                    opt_v3_constructor_calls_by_instr: HashMap::new(),
-                    opt_v3_method_calls_by_instr: HashMap::new(),
+                    opt_v3_call_emissions: TypedCallEmissionPlans::default(),
                     operator_specializations: HashMap::new(),
                     opt_v3_exact_list_items_by_instr: HashMap::new(),
                     field_index_specializations: HashMap::new(),
@@ -18574,9 +18239,7 @@ def f(x):
         let source = first_indexed_global_access_source(function, access, name);
         FunctionSpecializationInputs {
             call_target_specializations: HashMap::new(),
-            opt_v3_direct_calls_by_instr: HashMap::new(),
-            opt_v3_constructor_calls_by_instr: HashMap::new(),
-            opt_v3_method_calls_by_instr: HashMap::new(),
+            opt_v3_call_emissions: TypedCallEmissionPlans::default(),
             operator_specializations: HashMap::new(),
             opt_v3_exact_list_items_by_instr: HashMap::new(),
             field_index_specializations: HashMap::new(),
@@ -18613,9 +18276,7 @@ def f(x):
             BuildSpecializedFunctionOptions {
                 specialization_inputs: Some(FunctionSpecializationInputs {
                     call_target_specializations: HashMap::new(),
-                    opt_v3_direct_calls_by_instr: HashMap::new(),
-                    opt_v3_constructor_calls_by_instr: HashMap::new(),
-                    opt_v3_method_calls_by_instr: HashMap::new(),
+                    opt_v3_call_emissions: TypedCallEmissionPlans::default(),
                     operator_specializations: HashMap::new(),
                     opt_v3_exact_list_items_by_instr: HashMap::new(),
                     field_index_specializations: HashMap::new(),
@@ -18719,9 +18380,7 @@ def f(x):
             BuildSpecializedFunctionOptions {
                 specialization_inputs: Some(FunctionSpecializationInputs {
                     call_target_specializations: HashMap::new(),
-                    opt_v3_direct_calls_by_instr: HashMap::new(),
-                    opt_v3_constructor_calls_by_instr: HashMap::new(),
-                    opt_v3_method_calls_by_instr: HashMap::new(),
+                    opt_v3_call_emissions: TypedCallEmissionPlans::default(),
                     operator_specializations: HashMap::new(),
                     opt_v3_exact_list_items_by_instr: HashMap::new(),
                     field_index_specializations: HashMap::new(),
@@ -23899,9 +23558,7 @@ def f(x, y):
             FunctionSpecializationInputs::from_profile(&profile, planned_caller)
                 .expect("planned profile inputs should filter consumed v3 direct calls");
         assert!(
-            specialization_inputs
-                .opt_v3_direct_calls_by_instr
-                .is_empty(),
+            specialization_inputs.opt_v3_call_emissions.is_empty(),
             "v3 direct calls consumed by the profiled module plan should not reach typed JIT lowering"
         );
     }
@@ -24170,9 +23827,7 @@ def f(x, y):
             FunctionSpecializationInputs::from_profile(&profile, planned_caller)
                 .expect("planned profile inputs should filter consumed v3 method calls");
         assert!(
-            specialization_inputs
-                .opt_v3_method_calls_by_instr
-                .is_empty(),
+            specialization_inputs.opt_v3_call_emissions.is_empty(),
             "v3 method calls consumed by the profiled module plan should not reach typed JIT lowering"
         );
     }
