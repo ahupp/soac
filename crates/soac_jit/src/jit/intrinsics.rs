@@ -2451,6 +2451,7 @@ pub(super) fn emit_operation<'fb>(
         InstrCodegen::Tuple(_) => None,
         InstrCodegen::Call(_) => None,
         InstrCodegen::CallDirect(_) => None,
+        InstrCodegen::DirectMethodCall(_) => None,
         InstrCodegen::BinOp(op) => emit_specialized_binop(op, state).or_else(|| {
             Some(emit_binop(
                 op.kind,

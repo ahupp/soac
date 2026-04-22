@@ -925,6 +925,9 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
             InstrCodegen::Tuple(tuple) => unsafe { self.execute_tuple_owned(tuple) },
             InstrCodegen::Call(call) => unsafe { self.execute_call_owned(call) },
             InstrCodegen::CallDirect(call) => unsafe { self.execute_call_direct_owned(call) },
+            InstrCodegen::DirectMethodCall(_) => {
+                Err("deopt continuation direct method call is unsupported".to_string())
+            }
             InstrCodegen::Store(store) => unsafe { self.execute_store_owned(store) },
             InstrCodegen::Del(del) => unsafe { self.execute_del_owned(del) },
             InstrCodegen::IncrementCounter(_) => Ok(owned_none()),

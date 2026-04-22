@@ -178,7 +178,11 @@ Partially migrated families are also intentionally visible:
   lowering. Prepared guards must also prove that their exact owner-type and
   owner-attribute callable relocations can be registered and predeclared before
   worker codegen. The guardless prepared source remains a local fallback, not a
-  legacy call-target replan.
+  legacy call-target replan. No-argument receiver-method store sites whose v3
+  body choice is `DirectCall` can now expand before typed lowering into an
+  explicit receiver guard, direct-method hot arm, and generic method fallback;
+  method calls with explicit arguments still use the guarded typed-call lowering
+  path.
 - indexed fields are represented as v3 plan selections plus mechanical
   indexed-field emissions. `soac_jit` now keeps the emitted access kind and
   attribute name separate from legacy per-instruction field evidence and
@@ -720,9 +724,11 @@ the branch exit demands `I32Bool01`. If a later Python-observable boundary needs
    - Then truthiness and materialization.
    - Direct calls are partially migrated through mechanical v3 typed lowering,
      including cross-module ordinary-function targets and guarded receiver
-     methods; indexed fields and indexed globals are partially migrated as
-     v3-owned codegen inputs; lift their actual lowering into mechanical nodes
-     next.
+     methods. Simple ordinary-function `DirectCall` bodies and no-argument
+     receiver-method `DirectCall` bodies have explicit CFG rewrites; remaining
+     method/constructor guarded typed nodes still need expansion. Indexed fields
+     and indexed globals are partially migrated as v3-owned codegen inputs; lift
+     their actual lowering into mechanical nodes next.
    - Then getitem/setitem.
    - Keep old paths until each replacement has structured tests and diagnostics.
 

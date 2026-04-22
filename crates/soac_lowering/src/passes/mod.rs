@@ -144,6 +144,7 @@ pub enum InstrCodegenOp {
     Tuple(#[rkyv(omit_bounds)] Tuple<Self>),
     Call(#[rkyv(omit_bounds)] Call<Self>),
     CallDirect(#[rkyv(omit_bounds)] CallDirect<Self>),
+    DirectMethodCall(#[rkyv(omit_bounds)] TypedDirectMethodCall<Self>),
     GetAttr(#[rkyv(omit_bounds)] GetAttr<Self>),
     SetAttr(#[rkyv(omit_bounds)] SetAttr<Self>),
     GetItem(#[rkyv(omit_bounds)] GetItem<Self>),
@@ -196,24 +197,24 @@ impl<E: Instr> TypedTruthy<E> {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum TypedDirectCallArgSource {
     Provided(usize),
     DefaultSentinel,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct TypedDirectCallArgPlan {
     pub sources: Vec<TypedDirectCallArgSource>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct TypedDirectFunctionCallGuard {
     pub function_id: RuntimeFunctionId,
     pub arg_plan: TypedDirectCallArgPlan,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct TypedDirectMethodCallGuard {
     pub function_id: RuntimeFunctionId,
     pub owner_type_ref: TypedAttrOwnerRef,
@@ -221,7 +222,7 @@ pub struct TypedDirectMethodCallGuard {
     pub arg_plan: TypedDirectCallArgPlan,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct TypedDirectConstructorCallGuard {
     pub function_id: RuntimeFunctionId,
     pub owner_type_ref: TypedAttrOwnerRef,
@@ -229,7 +230,7 @@ pub struct TypedDirectConstructorCallGuard {
     pub arg_plan: TypedDirectCallArgPlan,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum TypedDirectCallableCallGuard {
     Function(TypedDirectFunctionCallGuard),
     Constructor(TypedDirectConstructorCallGuard),
@@ -823,7 +824,7 @@ impl<E: Instr> Mappable<E> for TypedGuardedMethodCall<E> {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct TypedDirectMethodCall<E: Instr> {
     _meta: Meta,
     pub extra: E::Extra,
@@ -1465,6 +1466,9 @@ impl MapInstr<InstrCodegen, InstrTyped> for CodegenToTyped {
                 InstrTyped::CallTyped(TypedCall::from_legacy(op.map_children(self)))
             }
             InstrCodegenOp::CallDirect(op) => InstrTyped::LegacyCallDirect(op.map_children(self)),
+            InstrCodegenOp::DirectMethodCall(op) => {
+                InstrTyped::DirectMethodCallTyped(op.map_children(self))
+            }
             InstrCodegenOp::GetAttr(op) => {
                 InstrTyped::GetAttrTyped(TypedGetAttr::from_legacy(op.map_children(self)))
             }

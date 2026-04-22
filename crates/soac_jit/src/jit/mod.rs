@@ -2311,6 +2311,7 @@ fn build_profiled_jit_module_plan(
         }
     }
     let mut direct_body_rewritten_store_count = 0usize;
+    let module_constants_for_direct_body = planned_module.module_constants.clone();
     for function in &mut planned_module.callable_defs {
         if profile
             .opt_v3_exact_int_branch_artifacts
@@ -2320,34 +2321,59 @@ fn build_profiled_jit_module_plan(
         }
         let direct_body_rewrite_targets =
             profile.v3_direct_function_call_body_targets(function.function_id);
-        if direct_body_rewrite_targets.is_empty() {
+        if !direct_body_rewrite_targets.is_empty() {
+            let stats = rewrite_profiled_function_call_store_sites(
+                function,
+                &direct_body_rewrite_targets,
+                &callees,
+            );
+            if stats.rewritten_stores != 0
+                || stats.skipped_empty_targets != 0
+                || stats.skipped_incompatible_targets != 0
+            {
+                info!(
+                    target: "soac_jit_v3_direct_call_body_rewrite",
+                    module_id = planned_module_id,
+                    function_id = %function.function_id,
+                    qualname = %function.names.qualname,
+                    rewritten_stores = stats.rewritten_stores,
+                    skipped_empty_targets = stats.skipped_empty_targets,
+                    skipped_incompatible_targets = stats.skipped_incompatible_targets,
+                    skipped_missing_callee_targets = stats.skipped_missing_callee_targets,
+                    skipped_arity_mismatch_targets = stats.skipped_arity_mismatch_targets,
+                    skipped_unsupported_init_targets = stats.skipped_unsupported_init_targets,
+                    skipped_missing_storage_layout_targets = stats.skipped_missing_storage_layout_targets,
+                    skipped_unsupported_param_kind_targets =
+                        stats.skipped_unsupported_param_kind_targets,
+                    skipped_missing_param_storage_targets = stats.skipped_missing_param_storage_targets,
+                    "soac_jit_v3_direct_call_body_rewrite"
+                );
+            }
+            direct_body_rewritten_store_count += stats.rewritten_stores;
+        }
+        let method_body_plans = profile.v3_direct_method_call_body_plans(function.function_id);
+        if method_body_plans.is_empty() {
             continue;
         }
-        let stats = rewrite_profiled_function_call_store_sites(
+        let direct_owner_attr_specializations = direct_owner_attr_specializations_by_function
+            .get(&function.function_id)
+            .unwrap_or(&empty_direct_owner_attr_specializations);
+        let stats = rewrite_v3_direct_method_call_body_store_sites(
             function,
-            &direct_body_rewrite_targets,
-            &callees,
+            module_constants_for_direct_body.as_slice(),
+            &method_body_plans,
+            direct_owner_attr_specializations,
         );
-        if stats.rewritten_stores != 0
-            || stats.skipped_empty_targets != 0
-            || stats.skipped_incompatible_targets != 0
-        {
+        if stats.total_attempts() != 0 {
             info!(
-                target: "soac_jit_v3_direct_call_body_rewrite",
+                target: "soac_jit_v3_direct_method_body_rewrite",
                 module_id = planned_module_id,
                 function_id = %function.function_id,
                 qualname = %function.names.qualname,
+                candidate_stores = stats.candidate_stores,
+                missing_owner_guard_targets = stats.missing_owner_guard_targets,
                 rewritten_stores = stats.rewritten_stores,
-                skipped_empty_targets = stats.skipped_empty_targets,
-                skipped_incompatible_targets = stats.skipped_incompatible_targets,
-                skipped_missing_callee_targets = stats.skipped_missing_callee_targets,
-                skipped_arity_mismatch_targets = stats.skipped_arity_mismatch_targets,
-                skipped_unsupported_init_targets = stats.skipped_unsupported_init_targets,
-                skipped_missing_storage_layout_targets = stats.skipped_missing_storage_layout_targets,
-                skipped_unsupported_param_kind_targets =
-                    stats.skipped_unsupported_param_kind_targets,
-                skipped_missing_param_storage_targets = stats.skipped_missing_param_storage_targets,
-                "soac_jit_v3_direct_call_body_rewrite"
+                "soac_jit_v3_direct_method_body_rewrite"
             );
         }
         direct_body_rewritten_store_count += stats.rewritten_stores;
@@ -2422,6 +2448,12 @@ fn build_profiled_inline_callee_maps(
         {
             target_ids.extend(targets.iter().copied());
         }
+        for targets in profile
+            .v3_direct_method_call_body_targets(function.function_id)
+            .values()
+        {
+            target_ids.extend(targets.iter().copied());
+        }
         if let Some(direct_owner_attr_specializations) =
             direct_owner_attr_specializations_by_function.get(&function.function_id)
         {
@@ -2490,6 +2522,16 @@ fn build_profiled_inline_callee_maps(
         }
         for targets in profile
             .v3_direct_function_call_body_targets(function_id)
+            .values()
+        {
+            for target_id in targets {
+                if target_ids.insert(*target_id) {
+                    pending_target_ids.push_back(*target_id);
+                }
+            }
+        }
+        for targets in profile
+            .v3_direct_method_call_body_targets(function_id)
             .values()
         {
             for target_id in targets {
@@ -2685,6 +2727,12 @@ struct ProfiledMethodInlineFragment {
     blocks: Vec<Block<InstrCodegen>>,
 }
 
+struct V3DirectMethodCallBodyFragment {
+    plan: OptV3MethodCallPlan,
+    guard: TypedDirectMethodCallGuard,
+    entry_label: BlockLabel,
+}
+
 struct ProfiledMethodCallableGuardFragment {
     function_id: RuntimeFunctionId,
     entry_label: BlockLabel,
@@ -2746,6 +2794,226 @@ fn rewrite_profiled_no_arg_method_call_store_sites(
         assign_missing_codegen_function_instr_ids(function);
     }
     stats
+}
+
+fn rewrite_v3_direct_method_call_body_store_sites(
+    function: &mut BlockPyFunction<CodegenModuleShape>,
+    module_constants: &[InstrResolved],
+    method_call_body_plans: &HashMap<InstrId, Vec<OptV3MethodCallPlan>>,
+    direct_owner_attr_specializations: &HashMap<
+        DirectOwnerAttrKey,
+        Vec<DirectOwnerAttrSpecialization>,
+    >,
+) -> ProfiledMethodInlineRewriteStats {
+    let mut stats = ProfiledMethodInlineRewriteStats::default();
+    let method_call_body_targets = opt_v3_direct_method_call_body_targets(method_call_body_plans);
+    let original_blocks = std::mem::take(&mut function.blocks);
+    let mut rewritten_blocks = Vec::with_capacity(original_blocks.len());
+    for block in original_blocks {
+        match rewrite_v3_direct_method_call_body_store_block(
+            function,
+            module_constants,
+            block.clone(),
+            &method_call_body_targets,
+            method_call_body_plans,
+            direct_owner_attr_specializations,
+            &mut stats,
+        ) {
+            Some(blocks) => {
+                stats.rewritten_stores += 1;
+                rewritten_blocks.extend(blocks);
+            }
+            None => rewritten_blocks.push(block),
+        }
+    }
+    function.blocks = rewritten_blocks;
+    if stats.rewritten_stores != 0 {
+        assign_missing_codegen_function_instr_ids(function);
+    }
+    stats
+}
+
+fn rewrite_v3_direct_method_call_body_store_block(
+    function: &mut BlockPyFunction<CodegenModuleShape>,
+    module_constants: &[InstrResolved],
+    block: Block<InstrCodegen>,
+    method_call_body_targets: &HashMap<InstrId, Vec<RuntimeFunctionId>>,
+    method_call_body_plans: &HashMap<InstrId, Vec<OptV3MethodCallPlan>>,
+    direct_owner_attr_specializations: &HashMap<
+        DirectOwnerAttrKey,
+        Vec<DirectOwnerAttrSpecialization>,
+    >,
+    stats: &mut ProfiledMethodInlineRewriteStats,
+) -> Option<Vec<Block<InstrCodegen>>> {
+    let candidate = find_profiled_no_arg_method_inline_candidate(
+        module_constants,
+        &block,
+        method_call_body_targets,
+    )?;
+    stats.candidate_stores += 1;
+    let plans = method_call_body_plans.get(&candidate.instr_id)?;
+    let continuation_label = function.name_gen.next_block_name();
+    let receiver_temp =
+        soac_lowering::passes::allocate_codegen_stack_temp(function, "direct_method_receiver");
+    let receiver_temp_name = receiver_temp.resolved_name();
+    let exc_edge = block.exc_edge.clone();
+
+    let mut fragments = Vec::new();
+    for plan in plans {
+        if plan.body.kind != PlanV3CallBodyKind::DirectCall
+            || plan.method_name != candidate.method_name
+            || !v3_direct_method_call_body_arg_plan_is_no_arg(&plan.arg_plan)
+        {
+            continue;
+        }
+        let key = DirectOwnerAttrKey::new(plan.target, plan.method_name.as_str());
+        let Some(guards) = direct_owner_attr_specializations.get(&key) else {
+            stats.missing_owner_guard_targets += 1;
+            continue;
+        };
+        for guard in guards {
+            if !direct_owner_attr_specialization_matches_v3_method_plan(guard, plan) {
+                continue;
+            }
+            let typed_guard = TypedDirectMethodCallGuard {
+                function_id: plan.target,
+                owner_type_ref: typed_attr_owner_ref_from_reloc_type_ref(&guard.owner_type_ref),
+                type_version: guard.type_version,
+                arg_plan: plan.arg_plan.clone(),
+            };
+            if fragments
+                .iter()
+                .any(|fragment: &V3DirectMethodCallBodyFragment| fragment.guard == typed_guard)
+            {
+                continue;
+            }
+            fragments.push(V3DirectMethodCallBodyFragment {
+                plan: plan.clone(),
+                guard: typed_guard,
+                entry_label: function.name_gen.next_block_name(),
+            });
+        }
+    }
+    if fragments.is_empty() {
+        return None;
+    }
+
+    let mut before = block.body;
+    let after = before.split_off(candidate.instr_index + 1);
+    before.truncate(candidate.instr_index);
+    before.push(
+        Store::new(receiver_temp_name.clone(), candidate.receiver)
+            .with_meta(Meta::synthetic())
+            .into(),
+    );
+
+    let generic_label = function.name_gen.next_block_name();
+    let guard_labels = (0..fragments.len().saturating_sub(1))
+        .map(|_| function.name_gen.next_block_name())
+        .collect::<Vec<_>>();
+
+    let entry_term = receiver_type_version_guard_term_for_typed_guard(
+        &receiver_temp_name,
+        &fragments[0].guard,
+        fragments[0].entry_label,
+        guard_labels.first().copied().unwrap_or(generic_label),
+    );
+    let entry = Block::new(
+        block.label,
+        before,
+        entry_term,
+        block.params,
+        exc_edge.clone(),
+    );
+
+    let mut blocks = Vec::with_capacity(fragments.len() * 2 + 3);
+    blocks.push(entry);
+
+    for (guard_index, guard_label) in guard_labels.iter().copied().enumerate() {
+        let target_index = guard_index + 1;
+        let else_label = guard_labels
+            .get(guard_index + 1)
+            .copied()
+            .unwrap_or(generic_label);
+        blocks.push(Block::new(
+            guard_label,
+            Vec::new(),
+            receiver_type_version_guard_term_for_typed_guard(
+                &receiver_temp_name,
+                &fragments[target_index].guard,
+                fragments[target_index].entry_label,
+                else_label,
+            ),
+            Vec::new(),
+            exc_edge.clone(),
+        ));
+    }
+
+    for fragment in fragments {
+        blocks.push(Block::new(
+            fragment.entry_label,
+            vec![
+                Store::new(
+                    candidate.target.clone(),
+                    InstrCodegen::DirectMethodCall(
+                        TypedDirectMethodCall::new(
+                            load_codegen_temp(&receiver_temp_name),
+                            Vec::<CallArgPositional<InstrCodegen>>::new(),
+                            fragment.plan.method_name,
+                            fragment.guard,
+                        )
+                        .with_meta(Meta::synthetic()),
+                    ),
+                )
+                .with_meta(Meta::synthetic())
+                .into(),
+                Del::new(receiver_temp_name.clone(), false)
+                    .with_meta(Meta::synthetic())
+                    .into(),
+            ],
+            BlockTerm::Jump(BlockEdge::new(continuation_label)),
+            Vec::new(),
+            exc_edge.clone(),
+        ));
+    }
+
+    blocks.push(Block::new(
+        generic_label,
+        vec![
+            Store::new(
+                candidate.target,
+                InstrCodegen::Call(
+                    Call::new(
+                        InstrCodegen::GetAttr(
+                            GetAttr::new(load_codegen_temp(&receiver_temp_name), candidate.attr)
+                                .with_meta(Meta::synthetic()),
+                        ),
+                        Vec::new(),
+                        Vec::new(),
+                    )
+                    .with_meta(Meta::synthetic()),
+                ),
+            )
+            .with_meta(Meta::synthetic())
+            .into(),
+            Del::new(receiver_temp_name.clone(), false)
+                .with_meta(Meta::synthetic())
+                .into(),
+        ],
+        BlockTerm::Jump(BlockEdge::new(continuation_label)),
+        Vec::new(),
+        exc_edge.clone(),
+    ));
+
+    blocks.push(Block::new(
+        continuation_label,
+        after,
+        block.term,
+        Vec::new(),
+        exc_edge,
+    ));
+
+    Some(blocks)
 }
 
 fn rewrite_profiled_no_arg_method_call_store_block(
@@ -3764,18 +4032,74 @@ fn receiver_type_version_guard_term(
     fragment: &ProfiledMethodInlineFragment,
     else_label: BlockLabel,
 ) -> BlockTerm<InstrCodegen> {
+    receiver_type_version_guard_term_for_owner(
+        receiver_temp_name,
+        typed_attr_owner_ref_from_reloc_type_ref(&fragment.guard.owner_type_ref),
+        fragment.guard.type_version,
+        fragment.entry_label,
+        else_label,
+    )
+}
+
+fn receiver_type_version_guard_term_for_typed_guard(
+    receiver_temp_name: &ResolvedName,
+    guard: &TypedDirectMethodCallGuard,
+    then_label: BlockLabel,
+    else_label: BlockLabel,
+) -> BlockTerm<InstrCodegen> {
+    receiver_type_version_guard_term_for_owner(
+        receiver_temp_name,
+        guard.owner_type_ref.clone(),
+        guard.type_version,
+        then_label,
+        else_label,
+    )
+}
+
+fn receiver_type_version_guard_term_for_owner(
+    receiver_temp_name: &ResolvedName,
+    owner_type_ref: TypedAttrOwnerRef,
+    type_version: u32,
+    then_label: BlockLabel,
+    else_label: BlockLabel,
+) -> BlockTerm<InstrCodegen> {
     BlockTerm::IfTerm(soac_core::block_py::TermIf {
         test: InstrCodegen::DirectReceiverTypeVersionGuardTest(
             DirectReceiverTypeVersionGuardTest::new(
                 load_codegen_temp(receiver_temp_name),
-                typed_attr_owner_ref_from_reloc_type_ref(&fragment.guard.owner_type_ref),
-                fragment.guard.type_version,
+                owner_type_ref,
+                type_version,
             )
             .with_meta(Meta::synthetic()),
         ),
-        then_label: fragment.entry_label,
+        then_label,
         else_label,
     })
+}
+
+fn direct_owner_attr_specialization_matches_v3_method_plan(
+    guard: &DirectOwnerAttrSpecialization,
+    plan: &OptV3MethodCallPlan,
+) -> bool {
+    match &guard.owner_type_ref {
+        RelocTypeRef::TypeKey(type_key) => {
+            type_key.module_name == plan.owner_type.module_name
+                && type_key.qualname == plan.owner_type.qualname
+        }
+        RelocTypeRef::CpythonTypeSymbol(_) => false,
+    }
+}
+
+fn v3_direct_method_call_body_arg_plan_is_no_arg(plan: &TypedDirectCallArgPlan) -> bool {
+    let mut receiver_sources = 0usize;
+    for source in &plan.sources {
+        match source {
+            TypedDirectCallArgSource::Provided(0) => receiver_sources += 1,
+            TypedDirectCallArgSource::DefaultSentinel => {}
+            TypedDirectCallArgSource::Provided(_) => return false,
+        }
+    }
+    receiver_sources == 1
 }
 
 fn append_cleanup_before_method_inline_exit(
@@ -6915,6 +7239,7 @@ fn runtime_jit_deopt_expr_supported(
             &call.keywords,
             support,
         ),
+        InstrCodegen::DirectMethodCall(_) => false,
         InstrCodegen::Store(store) => {
             runtime_jit_deopt_name_location_supported(store.name.location, support)
                 && runtime_jit_deopt_expr_supported(&store.value, support)
@@ -13454,6 +13779,9 @@ fn collect_call_direct_targets(
             if let InstrCodegen::CallDirect(call) = expr {
                 self.out.insert(call.function_id);
             }
+            if let InstrCodegen::DirectMethodCall(call) = expr {
+                self.out.insert(call.guard.function_id);
+            }
             expr.visit_children(self);
         }
     }
@@ -13817,6 +14145,38 @@ fn opt_v3_inline_method_call_targets(
                 .map(|method_call| method_call.target)
                 .collect::<Vec<_>>();
             (!targets.is_empty()).then_some((*source, targets))
+        })
+        .collect()
+}
+
+fn opt_v3_direct_method_call_body_targets(
+    method_calls_by_source: &HashMap<InstrId, Vec<OptV3MethodCallPlan>>,
+) -> HashMap<InstrId, Vec<RuntimeFunctionId>> {
+    method_calls_by_source
+        .iter()
+        .filter_map(|(source, method_calls)| {
+            let targets = method_calls
+                .iter()
+                .filter(|method_call| method_call.body.kind == PlanV3CallBodyKind::DirectCall)
+                .map(|method_call| method_call.target)
+                .collect::<Vec<_>>();
+            (!targets.is_empty()).then_some((*source, targets))
+        })
+        .collect()
+}
+
+fn opt_v3_direct_method_call_body_plans(
+    method_calls_by_source: &HashMap<InstrId, Vec<OptV3MethodCallPlan>>,
+) -> HashMap<InstrId, Vec<OptV3MethodCallPlan>> {
+    method_calls_by_source
+        .iter()
+        .filter_map(|(source, method_calls)| {
+            let plans = method_calls
+                .iter()
+                .filter(|method_call| method_call.body.kind == PlanV3CallBodyKind::DirectCall)
+                .cloned()
+                .collect::<Vec<_>>();
+            (!plans.is_empty()).then_some((*source, plans))
         })
         .collect()
 }
@@ -15791,6 +16151,26 @@ impl<'a> SpecializationProfile<'a> {
         self.opt_v3_emitted_method_calls
             .get(&function_id)
             .map(opt_v3_inline_method_call_targets)
+            .unwrap_or_default()
+    }
+
+    fn v3_direct_method_call_body_targets(
+        &self,
+        function_id: RuntimeFunctionId,
+    ) -> HashMap<InstrId, Vec<RuntimeFunctionId>> {
+        self.opt_v3_emitted_method_calls
+            .get(&function_id)
+            .map(opt_v3_direct_method_call_body_targets)
+            .unwrap_or_default()
+    }
+
+    fn v3_direct_method_call_body_plans(
+        &self,
+        function_id: RuntimeFunctionId,
+    ) -> HashMap<InstrId, Vec<OptV3MethodCallPlan>> {
+        self.opt_v3_emitted_method_calls
+            .get(&function_id)
+            .map(opt_v3_direct_method_call_body_plans)
             .unwrap_or_default()
     }
 
