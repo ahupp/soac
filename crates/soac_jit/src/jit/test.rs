@@ -4121,7 +4121,7 @@ def build(values):
     }
 
     #[test]
-    fn opt_v3_direct_call_emission_annotates_call_access_mechanically() {
+    fn opt_v3_direct_call_emission_lowers_to_guarded_call_mechanically() {
         let mut constants = TestConstantPool::default();
         let call_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
         let target = RuntimeFunctionId::from_raw_parts(0, 7);
@@ -4147,45 +4147,164 @@ def build(values):
         };
 
         assert_eq!(
-            annotate_opt_v3_direct_call_access_plans(
+            lower_opt_v3_call_emissions_to_typed_instrs(
                 &mut typed_function,
                 &HashMap::from([(call_instr_id, vec![direct_call_plan])]),
+                &HashMap::new(),
+                &HashMap::new(),
             )
-            .expect("v3 direct-call emission should annotate access"),
+            .expect("v3 direct-call emission should lower the typed call"),
             1
         );
 
-        let Some(soac_lowering::passes::InstrTyped::CallTyped(call)) =
+        let Some(soac_lowering::passes::InstrTyped::GuardedCallableCallTyped(call)) =
             typed_function.blocks[0].body.first()
         else {
-            panic!("v3 direct-call emission should preserve the call until typed access lowering");
+            panic!("v3 direct-call emission should directly create a guarded callable call");
         };
-        let soac_lowering::passes::TypedCallAccessPlan::GuardedCallable {
-            function_guards,
-            constructor_guards,
-        } = &call.access
-        else {
-            panic!("v3 direct-call emission should produce a guarded callable access plan");
-        };
-        assert!(constructor_guards.is_empty());
-        assert_eq!(function_guards.len(), 1);
-        assert_eq!(function_guards[0].function_id, target);
+        assert!(call.constructor_guards.is_empty());
+        assert_eq!(call.function_guards.len(), 1);
+        assert_eq!(call.function_guards[0].function_id, target);
         assert_eq!(
-            function_guards[0].arg_plan.sources,
+            call.function_guards[0].arg_plan.sources,
             vec![TypedDirectCallArgSource::Provided(0)]
         );
         assert_eq!(
             lower_typed_function_call_access_plan_instrs(&mut typed_function),
+            0,
+            "v3 call lowering should not round-trip through typed access-plan lowering"
+        );
+    }
+
+    #[test]
+    fn opt_v3_callable_call_lowering_merges_function_and_constructor_guards() {
+        let mut constants = TestConstantPool::default();
+        let call_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
+        let direct_target = RuntimeFunctionId::from_raw_parts(0, 7);
+        let constructor_target = RuntimeFunctionId::from_raw_parts(0, 8);
+        let arg_plan = TypedDirectCallArgPlan {
+            sources: vec![TypedDirectCallArgSource::Provided(0)],
+        };
+        let call = with_instr_id(
+            op_expr(Call::new(
+                name_expr(test_runtime_name("callable")),
+                vec![CallArgPositional::Positional(constants.int_expr(1))],
+                Vec::<CallArgKeyword<InstrCodegen>>::new(),
+            )),
+            call_instr_id,
+        );
+        let function =
+            with_single_test_block(test_function(), vec![call], ret_term(constants.int_expr(2)));
+        let mut typed_function = lower_codegen_function_to_typed(function);
+
+        assert_eq!(
+            lower_opt_v3_call_emissions_to_typed_instrs(
+                &mut typed_function,
+                &HashMap::from([(
+                    call_instr_id,
+                    vec![OptV3DirectCallPlan {
+                        source: call_instr_id,
+                        target: direct_target,
+                        arg_plan: arg_plan.clone(),
+                        body: test_v3_direct_call_body(),
+                        reason: "profiled direct call".to_string(),
+                    }],
+                )]),
+                &HashMap::from([(
+                    call_instr_id,
+                    OptV3PreparedConstructorCallPlan {
+                        guards: vec![TypedDirectConstructorCallGuard {
+                            function_id: constructor_target,
+                            owner_type_ref: TypedAttrOwnerRef::TypeKey {
+                                module_name: "test".to_string(),
+                                qualname: "Box".to_string(),
+                            },
+                            type_version: 11,
+                            arg_plan: arg_plan.clone(),
+                        }],
+                    },
+                )]),
+                &HashMap::new(),
+            )
+            .expect("v3 callable emissions should lower mechanically"),
             1
         );
-        assert!(
-            matches!(
-                typed_function.blocks[0].body.first(),
-                Some(soac_lowering::passes::InstrTyped::GuardedCallableCallTyped(
-                    _
-                ))
-            ),
-            "the shared typed access lowering pass should create the guarded-call instruction"
+
+        let Some(soac_lowering::passes::InstrTyped::GuardedCallableCallTyped(call)) =
+            typed_function.blocks[0].body.first()
+        else {
+            panic!("v3 callable emissions should directly create a guarded callable call");
+        };
+        assert_eq!(call.function_guards.len(), 1);
+        assert_eq!(call.function_guards[0].function_id, direct_target);
+        assert_eq!(call.constructor_guards.len(), 1);
+        assert_eq!(call.constructor_guards[0].function_id, constructor_target);
+        assert_eq!(
+            lower_typed_function_call_access_plan_instrs(&mut typed_function),
+            0,
+            "v3 callable lowering should not round-trip through typed access-plan lowering"
+        );
+    }
+
+    #[test]
+    fn opt_v3_method_call_emission_lowers_to_guarded_method_mechanically() {
+        let mut constants = TestConstantPool::default();
+        let call_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
+        let target = RuntimeFunctionId::from_raw_parts(0, 9);
+        let call = with_instr_id(
+            op_expr(Call::new(
+                op_expr(GetAttr::new(
+                    name_expr(test_local_name("box", 0)),
+                    constants.string_expr("get"),
+                )),
+                vec![CallArgPositional::Positional(constants.int_expr(1))],
+                Vec::<CallArgKeyword<InstrCodegen>>::new(),
+            )),
+            call_instr_id,
+        );
+        let function =
+            with_single_test_block(test_function(), vec![call], ret_term(constants.int_expr(2)));
+        let mut typed_function = lower_codegen_function_to_typed(function);
+
+        assert_eq!(
+            lower_opt_v3_call_emissions_to_typed_instrs(
+                &mut typed_function,
+                &HashMap::new(),
+                &HashMap::new(),
+                &HashMap::from([(
+                    call_instr_id,
+                    OptV3PreparedMethodCallPlan {
+                        method_name: "get".to_string(),
+                        guards: vec![TypedDirectMethodCallGuard {
+                            function_id: target,
+                            owner_type_ref: TypedAttrOwnerRef::TypeKey {
+                                module_name: "test".to_string(),
+                                qualname: "Box".to_string(),
+                            },
+                            type_version: 11,
+                            arg_plan: TypedDirectCallArgPlan {
+                                sources: vec![TypedDirectCallArgSource::Provided(0)],
+                            },
+                        }],
+                    },
+                )]),
+            )
+            .expect("v3 method-call emission should lower mechanically"),
+            1
+        );
+
+        let Some(soac_lowering::passes::InstrTyped::GuardedMethodCallTyped(call)) =
+            typed_function.blocks[0].body.first()
+        else {
+            panic!("v3 method-call emission should directly create a guarded method call");
+        };
+        assert_eq!(call.method_name, "get");
+        assert_eq!(call.method_guards.len(), 1);
+        assert_eq!(call.method_guards[0].function_id, target);
+        assert_eq!(
+            lower_typed_function_call_access_plan_instrs(&mut typed_function),
+            0,
+            "v3 method-call lowering should not round-trip through typed access-plan lowering"
         );
     }
 
@@ -4426,9 +4545,11 @@ def build(values):
         );
 
         assert_eq!(
-            annotate_opt_v3_constructor_call_access_plans(
+            lower_opt_v3_call_emissions_to_typed_instrs(
                 &mut typed_function,
+                &HashMap::new(),
                 &prepared_constructor_calls,
+                &HashMap::new(),
             )
             .expect("unresolved runtime guard should leave generic constructor call in place"),
             0
@@ -4480,8 +4601,13 @@ def build(values):
         );
 
         assert_eq!(
-            annotate_opt_v3_method_call_access_plans(&mut typed_function, &prepared_method_calls)
-                .expect("unresolved runtime guard should leave generic method call in place"),
+            lower_opt_v3_call_emissions_to_typed_instrs(
+                &mut typed_function,
+                &HashMap::new(),
+                &HashMap::new(),
+                &prepared_method_calls,
+            )
+            .expect("unresolved runtime guard should leave generic method call in place"),
             0
         );
 
@@ -4497,7 +4623,7 @@ def build(values):
     }
 
     #[test]
-    fn opt_v3_method_call_annotation_trusts_prevalidated_source_shape() {
+    fn opt_v3_method_call_lowering_trusts_prevalidated_source_shape() {
         let mut constants = TestConstantPool::default();
         let call_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
         let call = with_instr_id(
@@ -4520,8 +4646,13 @@ def build(values):
         )]);
 
         assert_eq!(
-            annotate_opt_v3_method_call_access_plans(&mut typed_function, &prepared_method_calls)
-                .expect("JIT annotation should trust the prevalidated v3 method-call source"),
+            lower_opt_v3_call_emissions_to_typed_instrs(
+                &mut typed_function,
+                &HashMap::new(),
+                &HashMap::new(),
+                &prepared_method_calls,
+            )
+            .expect("JIT lowering should trust the prevalidated v3 method-call source"),
             0
         );
     }

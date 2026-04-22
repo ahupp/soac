@@ -174,6 +174,7 @@ mod typed_value;
 use call_specialization::{
     CallSpecializationCtx, annotate_typed_call_accesses, collect_runtime_protocol_method_targets,
     direct_constructor_owner_attr_specializations_from_source,
+    lower_opt_v3_call_emissions_to_typed_instrs,
 };
 use direct_abi::{
     ArgOwnership, DirectCallableDesc, DirectEntry, DirectTargetId, ErrorAbi, HiddenArgAbi,
@@ -30025,58 +30026,6 @@ fn validate_typed_function_preserves_codegen_cfg(
     Ok(())
 }
 
-fn annotate_opt_v3_direct_call_access_plans(
-    function: &mut BlockPyFunction<TypedCodegenModuleShape>,
-    direct_calls_by_instr: &HashMap<InstrId, Vec<OptV3DirectCallPlan>>,
-) -> Result<usize, String> {
-    if direct_calls_by_instr.is_empty() {
-        return Ok(0);
-    }
-
-    struct Rewriter<'a> {
-        direct_calls_by_instr: &'a HashMap<InstrId, Vec<OptV3DirectCallPlan>>,
-        count: usize,
-    }
-
-    impl VisitMut<InstrTyped> for Rewriter<'_> {
-        fn visit_instr_mut(&mut self, expr: &mut InstrTyped) {
-            expr.visit_children_mut(self);
-            let InstrTyped::CallTyped(call) = expr else {
-                return;
-            };
-            let Some(instr_id) = call.try_semantic_instr_id() else {
-                return;
-            };
-            let Some(direct_calls) = self.direct_calls_by_instr.get(&instr_id) else {
-                return;
-            };
-            if direct_calls.is_empty() {
-                return;
-            }
-
-            let function_guards = direct_calls
-                .iter()
-                .map(|direct_call| TypedDirectFunctionCallGuard {
-                    function_id: direct_call.target,
-                    arg_plan: direct_call.arg_plan.clone(),
-                })
-                .collect();
-            call.access = TypedCallAccessPlan::GuardedCallable {
-                function_guards,
-                constructor_guards: Vec::new(),
-            };
-            self.count += 1;
-        }
-    }
-
-    let mut rewriter = Rewriter {
-        direct_calls_by_instr,
-        count: 0,
-    };
-    rewriter.visit_fn_mut(function);
-    Ok(rewriter.count)
-}
-
 fn opt_v3_constructor_call_guard_from_plan(
     plan: &OptV3ConstructorCallPlan,
 ) -> Result<TypedDirectConstructorCallGuard, String> {
@@ -30125,53 +30074,6 @@ fn opt_v3_constructor_call_guard_from_plan(
         type_version,
         arg_plan: plan.arg_plan.clone(),
     })
-}
-
-fn annotate_opt_v3_constructor_call_access_plans(
-    function: &mut BlockPyFunction<TypedCodegenModuleShape>,
-    constructor_calls_by_instr: &HashMap<InstrId, OptV3PreparedConstructorCallPlan>,
-) -> Result<usize, String> {
-    if constructor_calls_by_instr.is_empty() {
-        return Ok(0);
-    }
-
-    struct Rewriter<'a> {
-        constructor_calls_by_instr: &'a HashMap<InstrId, OptV3PreparedConstructorCallPlan>,
-        count: usize,
-    }
-
-    impl VisitMut<InstrTyped> for Rewriter<'_> {
-        fn visit_instr_mut(&mut self, expr: &mut InstrTyped) {
-            expr.visit_children_mut(self);
-            let InstrTyped::CallTyped(call) = expr else {
-                return;
-            };
-            let Some(instr_id) = call.try_semantic_instr_id() else {
-                return;
-            };
-            let Some(constructor_calls) = self.constructor_calls_by_instr.get(&instr_id) else {
-                return;
-            };
-            if constructor_calls.guards.is_empty() {
-                // The v3 source still owns this call site, but guard
-                // preparation declined before typed lowering.
-                return;
-            }
-
-            call.access = TypedCallAccessPlan::GuardedCallable {
-                function_guards: Vec::new(),
-                constructor_guards: constructor_calls.guards.clone(),
-            };
-            self.count += 1;
-        }
-    }
-
-    let mut rewriter = Rewriter {
-        constructor_calls_by_instr,
-        count: 0,
-    };
-    rewriter.visit_fn_mut(function);
-    Ok(rewriter.count)
 }
 
 fn opt_v3_method_call_guard_from_plan(
@@ -30224,53 +30126,6 @@ fn opt_v3_method_call_guard_from_plan(
     })
 }
 
-fn annotate_opt_v3_method_call_access_plans(
-    function: &mut BlockPyFunction<TypedCodegenModuleShape>,
-    method_calls_by_instr: &HashMap<InstrId, OptV3PreparedMethodCallPlan>,
-) -> Result<usize, String> {
-    if method_calls_by_instr.is_empty() {
-        return Ok(0);
-    }
-
-    struct Rewriter<'a> {
-        method_calls_by_instr: &'a HashMap<InstrId, OptV3PreparedMethodCallPlan>,
-        count: usize,
-    }
-
-    impl VisitMut<InstrTyped> for Rewriter<'_> {
-        fn visit_instr_mut(&mut self, expr: &mut InstrTyped) {
-            expr.visit_children_mut(self);
-            let InstrTyped::CallTyped(call) = expr else {
-                return;
-            };
-            let Some(instr_id) = call.try_semantic_instr_id() else {
-                return;
-            };
-            let Some(method_calls) = self.method_calls_by_instr.get(&instr_id) else {
-                return;
-            };
-            if method_calls.guards.is_empty() {
-                // The v3 source still owns this call site, but guard
-                // preparation declined before typed lowering.
-                return;
-            }
-
-            call.access = TypedCallAccessPlan::GuardedMethod {
-                method_name: method_calls.method_name.clone(),
-                method_guards: method_calls.guards.clone(),
-            };
-            self.count += 1;
-        }
-    }
-
-    let mut rewriter = Rewriter {
-        method_calls_by_instr,
-        count: 0,
-    };
-    rewriter.visit_fn_mut(function);
-    Ok(rewriter.count)
-}
-
 fn prepare_specialized_typed_function(
     _module: &BlockPyModule<CodegenModuleShape>,
     function: &BlockPyFunction<CodegenModuleShape>,
@@ -30297,12 +30152,12 @@ fn prepare_specialized_typed_function(
         opt_v3_indexed_fields_by_instr,
         specialize_field_stores,
     )?;
-    annotate_opt_v3_direct_call_access_plans(&mut typed_function, opt_v3_direct_calls_by_instr)?;
-    annotate_opt_v3_constructor_call_access_plans(
+    lower_opt_v3_call_emissions_to_typed_instrs(
         &mut typed_function,
+        opt_v3_direct_calls_by_instr,
         opt_v3_constructor_calls_by_instr,
+        opt_v3_method_calls_by_instr,
     )?;
-    annotate_opt_v3_method_call_access_plans(&mut typed_function, opt_v3_method_calls_by_instr)?;
     annotate_typed_call_accesses(
         &mut typed_function,
         call_specialization_ctx,

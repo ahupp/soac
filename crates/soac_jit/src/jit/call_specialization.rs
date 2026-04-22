@@ -2,17 +2,20 @@ use std::collections::{HashMap, HashSet};
 
 use soac_core::block_py::{
     BlockPyFunction, CallArgKeyword, CallArgPositional, ChildVisitable, HasSemanticInstrId, Instr,
-    InstrId, NameLocation, ParamKind, RuntimeFunctionId, RuntimeName, Visit, VisitMut,
+    InstrId, InstrWithConstantNone, NameLocation, ParamKind, RuntimeFunctionId, RuntimeName, Visit,
+    VisitMut,
 };
 use soac_lowering::passes::{
     CodegenModuleShape, InstrCodegen, InstrResolved, InstrTyped, TypedCall, TypedCallAccessPlan,
     TypedCodegenModuleShape, TypedDirectCallArgPlan, TypedDirectCallArgSource,
     TypedDirectConstructorCallGuard, TypedDirectFunctionCallGuard, TypedDirectMethodCallGuard,
+    TypedGuardedCallableCall, TypedGuardedMethodCall,
 };
 
 use super::{
     DirectCallArgPlan, DirectCallArgSource, DirectCallIncompatibility, DirectEdgeStats,
     DirectFunctionSpecialization, DirectOwnerAttrKey, DirectOwnerAttrSpecialization,
+    OptV3DirectCallPlan, OptV3PreparedConstructorCallPlan, OptV3PreparedMethodCallPlan,
     owner_attr_function_id_for_type_ref, reloc_type_ref_for_type,
     typed_attr_owner_ref_from_reloc_type_ref,
 };
@@ -89,6 +92,111 @@ pub(super) fn annotate_typed_call_accesses(
         annotator.visit_term_mut(&mut block.term);
     }
     annotator.count
+}
+
+pub(super) fn lower_opt_v3_call_emissions_to_typed_instrs(
+    function: &mut BlockPyFunction<TypedCodegenModuleShape>,
+    direct_calls_by_instr: &HashMap<InstrId, Vec<OptV3DirectCallPlan>>,
+    constructor_calls_by_instr: &HashMap<InstrId, OptV3PreparedConstructorCallPlan>,
+    method_calls_by_instr: &HashMap<InstrId, OptV3PreparedMethodCallPlan>,
+) -> Result<usize, String> {
+    if direct_calls_by_instr.is_empty()
+        && constructor_calls_by_instr.is_empty()
+        && method_calls_by_instr.is_empty()
+    {
+        return Ok(0);
+    }
+
+    struct Rewriter<'a> {
+        direct_calls_by_instr: &'a HashMap<InstrId, Vec<OptV3DirectCallPlan>>,
+        constructor_calls_by_instr: &'a HashMap<InstrId, OptV3PreparedConstructorCallPlan>,
+        method_calls_by_instr: &'a HashMap<InstrId, OptV3PreparedMethodCallPlan>,
+        count: usize,
+        error: Option<String>,
+    }
+
+    impl VisitMut<InstrTyped> for Rewriter<'_> {
+        fn visit_instr_mut(&mut self, expr: &mut InstrTyped) {
+            if self.error.is_some() {
+                return;
+            }
+            expr.visit_children_mut(self);
+            let InstrTyped::CallTyped(call) = expr else {
+                return;
+            };
+            let Some(instr_id) = call.try_semantic_instr_id() else {
+                return;
+            };
+            let direct_calls = self.direct_calls_by_instr.get(&instr_id);
+            let constructor_calls = self.constructor_calls_by_instr.get(&instr_id);
+            let method_calls = self.method_calls_by_instr.get(&instr_id);
+            if direct_calls.is_none() && constructor_calls.is_none() && method_calls.is_none() {
+                return;
+            }
+            if method_calls.is_some() && (direct_calls.is_some() || constructor_calls.is_some()) {
+                self.error = Some(format!(
+                    "optimizer v3 call source {instr_id} has both method and callable emissions"
+                ));
+                return;
+            }
+
+            let old_expr = std::mem::replace(expr, InstrTyped::constant_none());
+            let InstrTyped::CallTyped(call) = old_expr else {
+                unreachable!("checked call shape before replacing typed instruction")
+            };
+
+            if let Some(method_calls) = method_calls {
+                if method_calls.guards.is_empty() {
+                    *expr = InstrTyped::CallTyped(call);
+                    return;
+                }
+                *expr =
+                    InstrTyped::GuardedMethodCallTyped(TypedGuardedMethodCall::from_typed_call(
+                        call,
+                        method_calls.method_name.clone(),
+                        method_calls.guards.clone(),
+                    ));
+                self.count += 1;
+                return;
+            }
+
+            let function_guards = direct_calls
+                .into_iter()
+                .flat_map(|direct_calls| direct_calls.iter())
+                .map(|direct_call| TypedDirectFunctionCallGuard {
+                    function_id: direct_call.target,
+                    arg_plan: direct_call.arg_plan.clone(),
+                })
+                .collect::<Vec<_>>();
+            let constructor_guards = constructor_calls
+                .map(|constructor_calls| constructor_calls.guards.clone())
+                .unwrap_or_default();
+            if function_guards.is_empty() && constructor_guards.is_empty() {
+                *expr = InstrTyped::CallTyped(call);
+                return;
+            }
+            *expr =
+                InstrTyped::GuardedCallableCallTyped(TypedGuardedCallableCall::from_typed_call(
+                    call,
+                    function_guards,
+                    constructor_guards,
+                ));
+            self.count += 1;
+        }
+    }
+
+    let mut rewriter = Rewriter {
+        direct_calls_by_instr,
+        constructor_calls_by_instr,
+        method_calls_by_instr,
+        count: 0,
+        error: None,
+    };
+    rewriter.visit_fn_mut(function);
+    if let Some(err) = rewriter.error {
+        return Err(err);
+    }
+    Ok(rewriter.count)
 }
 
 pub(super) fn collect_runtime_protocol_method_targets(
