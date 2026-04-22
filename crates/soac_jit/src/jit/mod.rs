@@ -2167,10 +2167,8 @@ fn build_profiled_jit_module_plan(
         };
         let direct_call_rewrite_targets = if has_exact_int_branch_artifacts {
             HashMap::new()
-        } else if has_source_keyed_v3_emissions {
-            profile.v3_inline_direct_function_call_targets(function.function_id)
         } else {
-            profile.direct_call_rewrite_targets(function.function_id)?
+            profile.module_plan_direct_call_rewrite_targets(function.function_id)?
         };
         if method_call_rewrite_targets.is_empty() && direct_call_rewrite_targets.is_empty() {
             continue;
@@ -2345,7 +2343,7 @@ fn build_profiled_inline_callee_maps(
     let mut external_inline_plan = InlinePlanModule::default();
     for function in &module.callable_defs {
         let direct_call_rewrite_targets =
-            profile.direct_call_rewrite_targets(function.function_id)?;
+            profile.module_plan_direct_call_rewrite_targets(function.function_id)?;
         for targets in direct_call_rewrite_targets.values() {
             target_ids.extend(targets.iter().copied());
         }
@@ -2418,7 +2416,8 @@ fn build_profiled_inline_callee_maps(
                 shared_state.lowered_module.module_constants.clone(),
             ),
         );
-        let direct_call_rewrite_targets = profile.direct_call_rewrite_targets(function_id)?;
+        let direct_call_rewrite_targets =
+            profile.module_plan_direct_call_rewrite_targets(function_id)?;
         for targets in direct_call_rewrite_targets.values() {
             for target_id in targets {
                 if target_ids.insert(*target_id) {
@@ -2438,7 +2437,8 @@ fn specialize_profiled_inline_callees(
 ) -> Result<(), String> {
     let function_ids = inline_callees.keys().copied().collect::<Vec<_>>();
     for function_id in function_ids {
-        let direct_call_rewrite_targets = profile.direct_call_rewrite_targets(function_id)?;
+        let direct_call_rewrite_targets =
+            profile.module_plan_direct_call_rewrite_targets(function_id)?;
         if direct_call_rewrite_targets.is_empty() {
             continue;
         }
@@ -15520,9 +15520,13 @@ impl<'a> SpecializationProfile<'a> {
     }
 
     fn has_source_keyed_opt_v3_emissions(&self, function_id: RuntimeFunctionId) -> bool {
-        self.opt_v3_emitted_constructor_calls
+        self.opt_v3_emitted_direct_calls
             .get(&function_id)
-            .is_some_and(|constructor_calls| !constructor_calls.is_empty())
+            .is_some_and(|direct_calls| !direct_calls.is_empty())
+            || self
+                .opt_v3_emitted_constructor_calls
+                .get(&function_id)
+                .is_some_and(|constructor_calls| !constructor_calls.is_empty())
             || self
                 .opt_v3_emitted_method_calls
                 .get(&function_id)
@@ -15643,6 +15647,17 @@ impl<'a> SpecializationProfile<'a> {
             legacy_targets,
             v3_targets,
         ))
+    }
+
+    fn module_plan_direct_call_rewrite_targets(
+        &self,
+        function_id: RuntimeFunctionId,
+    ) -> Result<HashMap<InstrId, Vec<RuntimeFunctionId>>, String> {
+        if self.has_source_keyed_opt_v3_emissions(function_id) {
+            Ok(self.v3_inline_direct_function_call_targets(function_id))
+        } else {
+            self.direct_call_rewrite_targets(function_id)
+        }
     }
 
     fn codegen_opt_v3_direct_calls(

@@ -19268,6 +19268,19 @@ def write_point(point, value):
             &vec![v3_target],
             "v3 direct-call targets should stay separate from legacy call-target evidence"
         );
+        assert!(
+            profile.has_source_keyed_opt_v3_emissions(caller_id),
+            "v3 direct-call emissions should mark the function as source-keyed"
+        );
+        assert_eq!(
+            profile
+                .module_plan_direct_call_rewrite_targets(caller_id)
+                .unwrap()
+                .get(&source)
+                .unwrap(),
+            &vec![v3_target],
+            "source-keyed module planning should consume only the v3 direct-call decision"
+        );
     }
 
     #[test]
