@@ -2717,6 +2717,7 @@ struct ProfiledMethodInlineCandidate {
     target: ResolvedName,
     receiver: InstrCodegen,
     attr: InstrCodegen,
+    args: Vec<CallArgPositional<InstrCodegen>>,
     method_name: String,
     instr_id: InstrId,
 }
@@ -2845,7 +2846,7 @@ fn rewrite_v3_direct_method_call_body_store_block(
     >,
     stats: &mut ProfiledMethodInlineRewriteStats,
 ) -> Option<Vec<Block<InstrCodegen>>> {
-    let candidate = find_profiled_no_arg_method_inline_candidate(
+    let candidate = find_profiled_method_call_body_candidate(
         module_constants,
         &block,
         method_call_body_targets,
@@ -2862,7 +2863,10 @@ fn rewrite_v3_direct_method_call_body_store_block(
     for plan in plans {
         if plan.body.kind != PlanV3CallBodyKind::DirectCall
             || plan.method_name != candidate.method_name
-            || !v3_direct_method_call_body_arg_plan_is_no_arg(&plan.arg_plan)
+            || !v3_direct_method_call_body_arg_plan_matches_args(
+                &plan.arg_plan,
+                candidate.args.len(),
+            )
         {
             continue;
         }
@@ -2949,7 +2953,12 @@ fn rewrite_v3_direct_method_call_body_store_block(
         ));
     }
 
-    for fragment in fragments {
+    for (fragment_index, fragment) in fragments.into_iter().enumerate() {
+        let direct_args = if fragment_index == 0 {
+            candidate.args.clone()
+        } else {
+            clone_codegen_call_args_with_fresh_instr_ids(&candidate.args)
+        };
         blocks.push(Block::new(
             fragment.entry_label,
             vec![
@@ -2958,7 +2967,7 @@ fn rewrite_v3_direct_method_call_body_store_block(
                     InstrCodegen::DirectMethodCall(
                         TypedDirectMethodCall::new(
                             load_codegen_temp(&receiver_temp_name),
-                            Vec::<CallArgPositional<InstrCodegen>>::new(),
+                            direct_args,
                             fragment.plan.method_name,
                             fragment.guard,
                         )
@@ -2988,7 +2997,7 @@ fn rewrite_v3_direct_method_call_body_store_block(
                             GetAttr::new(load_codegen_temp(&receiver_temp_name), candidate.attr)
                                 .with_meta(Meta::synthetic()),
                         ),
-                        Vec::new(),
+                        clone_codegen_call_args_with_fresh_instr_ids(&candidate.args),
                         Vec::new(),
                     )
                     .with_meta(Meta::synthetic()),
@@ -3957,6 +3966,52 @@ fn find_profiled_no_arg_method_inline_candidate(
                 target: store.name.clone(),
                 receiver: (*getattr.value).clone(),
                 attr: (*getattr.attr).clone(),
+                args: Vec::new(),
+                method_name: method_name.to_string(),
+                instr_id,
+            })
+        })
+}
+
+fn find_profiled_method_call_body_candidate(
+    module_constants: &[InstrResolved],
+    block: &Block<InstrCodegen>,
+    targets_by_instr_id: &HashMap<InstrId, Vec<RuntimeFunctionId>>,
+) -> Option<ProfiledMethodInlineCandidate> {
+    block
+        .body
+        .iter()
+        .enumerate()
+        .find_map(|(instr_index, instr)| {
+            let InstrCodegen::Store(store) = instr else {
+                return None;
+            };
+            let InstrCodegen::Call(call) = store.value.as_ref() else {
+                return None;
+            };
+            if !call.keywords.is_empty()
+                || call
+                    .args
+                    .iter()
+                    .any(|arg| matches!(arg, CallArgPositional::Starred(_)))
+            {
+                return None;
+            }
+            let instr_id = call.try_semantic_instr_id()?;
+            if targets_by_instr_id.get(&instr_id).is_none_or(Vec::is_empty) {
+                return None;
+            }
+            let InstrCodegen::GetAttr(getattr) = call.func.as_ref() else {
+                return None;
+            };
+            let method_name =
+                codegen_constant_string_value_from_slice(module_constants, getattr.attr.as_ref())?;
+            Some(ProfiledMethodInlineCandidate {
+                instr_index,
+                target: store.name.clone(),
+                receiver: (*getattr.value).clone(),
+                attr: (*getattr.attr).clone(),
+                args: call.args.clone(),
                 method_name: method_name.to_string(),
                 instr_id,
             })
@@ -4090,16 +4145,53 @@ fn direct_owner_attr_specialization_matches_v3_method_plan(
     }
 }
 
-fn v3_direct_method_call_body_arg_plan_is_no_arg(plan: &TypedDirectCallArgPlan) -> bool {
-    let mut receiver_sources = 0usize;
+fn v3_direct_method_call_body_arg_plan_matches_args(
+    plan: &TypedDirectCallArgPlan,
+    explicit_arg_count: usize,
+) -> bool {
+    let provided_arg_count = explicit_arg_count + 1;
+    let mut seen = vec![false; provided_arg_count];
     for source in &plan.sources {
         match source {
-            TypedDirectCallArgSource::Provided(0) => receiver_sources += 1,
+            TypedDirectCallArgSource::Provided(index) if *index < provided_arg_count => {
+                if seen[*index] {
+                    return false;
+                }
+                seen[*index] = true;
+            }
             TypedDirectCallArgSource::DefaultSentinel => {}
             TypedDirectCallArgSource::Provided(_) => return false,
         }
     }
-    receiver_sources == 1
+    seen.into_iter().all(|provided| provided)
+}
+
+fn clone_codegen_call_args_with_fresh_instr_ids(
+    args: &[CallArgPositional<InstrCodegen>],
+) -> Vec<CallArgPositional<InstrCodegen>> {
+    args.iter()
+        .cloned()
+        .map(|arg| arg.map_instr(clear_codegen_instr_ids))
+        .collect()
+}
+
+fn clear_codegen_instr_ids(mut instr: InstrCodegen) -> InstrCodegen {
+    struct Scrubber;
+
+    impl VisitMut<InstrCodegen> for Scrubber {
+        fn visit_instr_mut(&mut self, expr: &mut InstrCodegen)
+        where
+            InstrCodegen: ChildVisitable<InstrCodegen>,
+        {
+            expr.visit_children_mut(self);
+            let mut meta = expr.meta();
+            meta.instr_id = None;
+            *expr = expr.clone().with_meta(meta);
+        }
+    }
+
+    Scrubber.visit_instr_mut(&mut instr);
+    instr
 }
 
 fn append_cleanup_before_method_inline_exit(
