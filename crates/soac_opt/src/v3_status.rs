@@ -32,7 +32,7 @@ pub const V3_OPTIMIZATION_FAMILY_STATUS: &[V3OptimizationFamilyStatus] = &[
         family: "profiled direct calls, guarded receiver-method calls, and guarded constructor calls",
         legacy_input: "call_hot_targets",
         status: V3MigrationStatus::LiveCodegenInputOnly,
-        next_step: "lift call lowering further into mechanical v3 nodes and remove more legacy typed-call rediscovery",
+        next_step: "split guarded-call typed lowering so prepared v3 guards expand without shared legacy access-plan code",
     },
     V3OptimizationFamilyStatus {
         family: "exact-list getitem and setitem",

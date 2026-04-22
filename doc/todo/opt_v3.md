@@ -128,12 +128,14 @@ Implemented:
   Method-call decisions are also derived from mechanical `mod.optv3` emission
   as v3-owned codegen inputs. They carry owner type, method name, receiver
   type-version guard kind, original-call fallback kind, and an argument plan
-  with the implicit receiver represented explicitly. The JIT validates the
-  emitted method plan, attempts to resolve the current owner type/attribute,
-  and lowers it to a typed guarded method call when that runtime guard is
-  available. If the guard cannot be resolved in the current compile context,
-  the v3-owned source stays out of legacy evidence and the original generic
-  call remains as the local fallback.
+  with the implicit receiver represented explicitly. Specialization-input
+  preparation validates the emitted method plan, resolves the current owner
+  type/attribute when possible, and records either prepared typed guards or an
+  owned source with no guards. Preparation also validates the exact type and
+  callable relocations that typed lowering will import, and process-JIT
+  reservation predeclares those imports before worker codegen receives the
+  function. Typed-call lowering then mechanically lowers prepared guards and
+  leaves guardless v3-owned sources as their original generic call.
   Indexed-field
   decisions are also derived from mechanical `mod.optv3` emission as v3-owned
   typed-attribute inputs, with exact plan/emission validation before use.
@@ -171,10 +173,12 @@ Partially migrated families are also intentionally visible:
   fallback, and implicit-`self` argument plan; the existing constructor emitter
   still owns allocation, initializer inlining, and `__init__` result validation.
   Runtime owner type or attribute resolution can still decline a selected
-  method/constructor source to the original generic call; that is a local
-  fallback, not a legacy call-target replan. A future cleanup should make those
-  runtime preconditions explicit enough that selected call nodes either always
-  lower mechanically or are declined before JIT typed-call emission.
+  method/constructor source to the original generic call; that decline now
+  happens while preparing `FunctionSpecializationInputs`, not during typed-call
+  lowering. Prepared guards must also prove that their exact owner-type and
+  owner-attribute callable relocations can be registered and predeclared before
+  worker codegen. The guardless prepared source remains a local fallback, not a
+  legacy call-target replan.
 - indexed fields are represented as v3 plan selections plus mechanical
   indexed-field emissions. `soac_jit` now keeps the emitted access kind and
   attribute name separate from legacy per-instruction field evidence and

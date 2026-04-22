@@ -3406,6 +3406,27 @@ def build(values):
             direct_call_resolver,
             Some(compile_session),
         )?;
+        predeclare_specialization_type_imports(jit_module, &specialization_profile)?;
+        let direct_owner_attr_specializations = if direct_call_resolver.is_some() {
+            predeclare_direct_call_owner_type_imports(
+                jit_module,
+                module,
+                function,
+                &specialization_profile,
+            )?
+        } else {
+            HashMap::new()
+        };
+        let specialization_inputs =
+            FunctionSpecializationInputs::from_profile(&specialization_profile, function)?;
+        predeclare_prepared_opt_v3_call_imports(jit_module, &specialization_inputs)?;
+        let mut options = options;
+        if options.direct_owner_attr_specializations.is_none() {
+            options.direct_owner_attr_specializations = Some(direct_owner_attr_specializations);
+        }
+        if options.specialization_inputs.is_none() {
+            options.specialization_inputs = Some(specialization_inputs);
+        }
         build_cranelift_run_bb_specialized_function(
             jit_module,
             blocks,
@@ -4154,8 +4175,6 @@ def build(values):
         let method_source = InstrId::new(BlockLabel::from_index(0), 4);
         let legacy_target = RuntimeFunctionId::from_raw_parts(0, 11);
         let direct_target = RuntimeFunctionId::from_raw_parts(0, 12);
-        let constructor_target = RuntimeFunctionId::from_raw_parts(0, 13);
-        let method_target = RuntimeFunctionId::from_raw_parts(0, 14);
         let arg_plan = TypedDirectCallArgPlan {
             sources: vec![TypedDirectCallArgSource::Provided(0)],
         };
@@ -4178,34 +4197,14 @@ def build(values):
             )]),
             &HashMap::from([(
                 constructor_source,
-                vec![OptV3ConstructorCallPlan {
-                    source: constructor_source,
-                    target: constructor_target,
-                    owner_type: PlanV3ConstructorCallOwnerType {
-                        module_name: "test".to_string(),
-                        qualname: "Box".to_string(),
-                    },
-                    arg_plan: arg_plan.clone(),
-                    guard: PlanV3ConstructorCallGuardKind::ExactCallableTypeVersion,
-                    fallback: PlanV3ConstructorCallFallbackKind::OriginalConstructorCall,
-                    reason: "profiled constructor call".to_string(),
-                }],
+                OptV3PreparedConstructorCallPlan { guards: Vec::new() },
             )]),
             &HashMap::from([(
                 method_source,
-                vec![OptV3MethodCallPlan {
-                    source: method_source,
-                    target: method_target,
+                OptV3PreparedMethodCallPlan {
                     method_name: "get".to_string(),
-                    owner_type: PlanV3MethodCallOwnerType {
-                        module_name: "test".to_string(),
-                        qualname: "Box".to_string(),
-                    },
-                    arg_plan,
-                    guard: PlanV3MethodCallGuardKind::ExactReceiverTypeVersion,
-                    fallback: PlanV3MethodCallFallbackKind::OriginalMethodCall,
-                    reason: "profiled method call".to_string(),
-                }],
+                    guards: Vec::new(),
+                },
             )]),
         );
 
@@ -4248,11 +4247,23 @@ def build(values):
             fallback: PlanV3ConstructorCallFallbackKind::OriginalConstructorCall,
             reason: "profiled constructor call".to_string(),
         };
+        let prepared_constructor_calls = prepare_opt_v3_constructor_call_plans_for_codegen(
+            &HashMap::from([(call_instr_id, vec![constructor_call_plan])]),
+        )
+        .expect("constructor guard preparation should succeed");
+        assert!(
+            prepared_constructor_calls
+                .get(&call_instr_id)
+                .expect("source should stay owned")
+                .guards
+                .is_empty(),
+            "unresolved constructor guard should decline before typed lowering"
+        );
 
         assert_eq!(
             lower_opt_v3_constructor_call_emissions(
                 &mut typed_function,
-                &HashMap::from([(call_instr_id, vec![constructor_call_plan])]),
+                &prepared_constructor_calls,
             )
             .expect("unresolved runtime guard should leave generic constructor call in place"),
             0
@@ -4308,12 +4319,26 @@ def build(values):
             fallback: PlanV3MethodCallFallbackKind::OriginalMethodCall,
             reason: "profiled method call".to_string(),
         };
+        let prepared_method_calls =
+            prepare_opt_v3_method_call_plans_for_codegen(&HashMap::from([(
+                call_instr_id,
+                vec![method_call_plan],
+            )]))
+            .expect("method guard preparation should succeed");
+        assert!(
+            prepared_method_calls
+                .get(&call_instr_id)
+                .expect("source should stay owned")
+                .guards
+                .is_empty(),
+            "unresolved method guard should decline before typed lowering"
+        );
 
         assert_eq!(
             lower_opt_v3_method_call_emissions(
                 &module,
                 &mut typed_function,
-                &HashMap::from([(call_instr_id, vec![method_call_plan])]),
+                &prepared_method_calls,
             )
             .expect("unresolved runtime guard should leave generic method call in place"),
             0
@@ -4366,11 +4391,17 @@ def build(values):
             fallback: PlanV3MethodCallFallbackKind::OriginalMethodCall,
             reason: "profiled method call".to_string(),
         };
+        let prepared_method_calls =
+            prepare_opt_v3_method_call_plans_for_codegen(&HashMap::from([(
+                call_instr_id,
+                vec![method_call_plan],
+            )]))
+            .expect("method guard preparation should succeed");
 
         let err = lower_opt_v3_method_call_emissions(
             &module,
             &mut typed_function,
-            &HashMap::from([(call_instr_id, vec![method_call_plan])]),
+            &prepared_method_calls,
         )
         .expect_err("v3 method-call selection should still reject a non-method source");
 
