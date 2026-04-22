@@ -19507,10 +19507,9 @@ def write_point(point, value):
         );
         assert!(
             profile
-                .module_plan_direct_call_rewrite_targets(caller_id)
-                .unwrap()
+                .v3_inline_direct_function_call_targets(caller_id)
                 .is_empty(),
-            "source-keyed module planning should leave DirectCall body plans for typed lowering"
+            "DirectCall body plans should stay out of the module-level inline rewrite"
         );
     }
 
@@ -23367,8 +23366,8 @@ def f(x, y):
     }
 
     #[test]
-    fn profiled_store_call_rewrite_feeds_blockpy_inliner() {
-        let module_name = "profiled_store_call_inline_plan_test";
+    fn legacy_store_call_evidence_does_not_feed_module_direct_call_rewrite() {
+        let module_name = "legacy_store_call_no_inline_plan_test";
         let module_name_gen = ModuleNameGen::new(0);
         let mut callee_function = test_function_in_module(&module_name_gen, "callee");
         callee_function.params.params.push(Param {
@@ -23449,22 +23448,22 @@ def f(x, y):
             .expect("planned module should keep caller");
 
         assert!(
-            planned_caller.blocks.iter().any(|block| {
+            !planned_caller.blocks.iter().any(|block| {
                 matches!(
                     &block.term,
                     BlockTerm::IfTerm(term)
                         if matches!(term.test, InstrCodegen::DirectFunctionIdGuardTest(_))
                 )
             }),
-            "profiled rewrite should keep the function-id guard explicit"
+            "legacy call-target evidence should not feed the v3 module direct-call rewrite"
         );
         assert!(
-            !planned_caller
+            planned_caller
                 .blocks
                 .iter()
                 .flat_map(|block| &block.body)
-                .any(|instr| matches!(instr, InstrCodegen::Store(store) if matches!(store.value.as_ref(), InstrCodegen::CallDirect(_)))),
-            "profiled hot CallDirect store should be consumed by the BlockPy inliner"
+                .any(|instr| matches!(instr, InstrCodegen::Store(store) if matches!(store.value.as_ref(), InstrCodegen::Call(_)))),
+            "the original generic call should remain in the module plan"
         );
     }
 

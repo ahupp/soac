@@ -533,6 +533,10 @@ JIT emitter still materializes the full guarded call blocks today.
     original destination
   - emit a fallback arm that stores the original generic `Call(temp, temp_args)`
     result into the original destination
+- The module-level rewrite is fed by v3 emitted inline direct-call plans. Legacy
+  call-target specialization evidence no longer drives this BlockPy rewrite;
+  when no v3 inline plan owns the site, the original generic call remains for
+  later generic or legacy typed-call lowering.
   - delete the compiler temps before joining the continuation block
 - The rewrite only consumes profiled targets that match the ordinary direct-call
   / BlockPy inliner shape: positional-only-or-normal parameters, no keywords,

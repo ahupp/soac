@@ -168,7 +168,9 @@ Partially migrated families are also intentionally visible:
   plans and consumed through mechanical typed-call lowering for ordinary-function,
   receiver method, and class-constructor targets.
   Cross-module targets are represented through serialized module identities and
-  resolved from the loaded module set. Constructor-call plans own the selected
+  resolved from the loaded module set. Module-level ordinary direct-call CFG
+  rewrites are now fed only by v3 emitted inline direct-call plans, not by
+  legacy call-target specialization evidence. Constructor-call plans own the selected
   `__init__` target, owner type, type-version guard kind, original-call
   fallback, and implicit-`self` argument plan; the existing constructor emitter
   still owns allocation, initializer inlining, and `__init__` result validation.
