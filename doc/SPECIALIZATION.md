@@ -65,6 +65,10 @@ Legacy optimization families remain available for comparison while they are
 migrated. Do not expand a legacy family as the primary implementation path
 unless there is a specific reason; add the v3 catalog alternative, fact bridge,
 planner rule, validation, and mechanical-emitter coverage first.
+The cached pre-optimization BlockPy module is intentionally not rewritten by
+generic direct-call inlining or constructor scalar replacement before
+`decide_optimizations` reads it; those transformations must be selected by a
+plan or by a later explicitly profiled JIT path.
 
 Current migration surface:
 
@@ -797,24 +801,23 @@ JIT emitter still materializes the full guarded call blocks today.
   when the allocation path shares successor blocks with non-allocation paths.
   It still rejects objects whose aliases cannot be proven to dominate all
   active uses.
-- Direct-call inlining and constructor scalar replacement run as a bounded
-  fixed point before value-fact inference. This lets a direct-call inline expose
-  another direct call or constructor allocation, then lets the next iteration
-  inline or scalarize the newly visible shape. The current bound is deliberately
-  small; hitting it leaves the remaining BlockPy unchanged rather than
-  broadening the rewrite unsafely.
-- Before JIT codegen, `inline_direct_call_stores_with_callees` can also inline
-  small `CallDirect` store sites, not just constructor initializers. The
-  conservative subset requires positional-only/ordinary parameters, exact arity,
-  no keywords or starred arguments, no callee block params, no callee exception
-  edges, and at most sixteen callee blocks. Cross-module callees are allowed
-  when the caller can carry a planned-module constant table: callee constants
-  are copied into the caller module, runtime globals are rewritten to
-  `RuntimeName`, and the process JIT installs a separate constant-object
-  binding for the planned module so generated code and deopt continuations see
-  the remapped slots. Return blocks store into the original caller target and
-  jump to the continuation; explicit raise blocks inherit the caller exception
-  edge. This is the BlockPy-level building block for later converting inlined
+- The generic driver does not run direct-call inlining or constructor scalar
+  replacement on the pre-optimization module cache. Optimizer-v3 planning should
+  see the lowered module shape and select any inline or scalar replacement
+  explicitly.
+- When a profiled or v3-selected path has already rewritten a call site to a
+  direct-call shape, `inline_direct_call_stores_with_callees` can inline small
+  `CallDirect` store sites, not just constructor initializers. The conservative
+  subset requires positional-only/ordinary parameters, exact arity, no keywords
+  or starred arguments, no callee block params, no callee exception edges, and
+  at most sixteen callee blocks. Cross-module callees are allowed when the
+  caller can carry a planned-module constant table: callee constants are copied
+  into the caller module, runtime globals are rewritten to `RuntimeName`, and
+  the process JIT installs a separate constant-object binding for the planned
+  module so generated code and deopt continuations see the remapped slots.
+  Return blocks store into the original caller target and jump to the
+  continuation; explicit raise blocks inherit the caller exception edge. This is
+  the BlockPy-level building block for later converting inlined
   `raise StopIteration` inside synthetic loop fetch regions into direct
   loop-exit jumps.
 - Helper entrypoints are:

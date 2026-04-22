@@ -304,7 +304,7 @@ fn finish_codegen_module_with_tracker(
     env_config: &SoacEnvConfig,
 ) -> Result<BlockPyModule<CodegenModuleShape>> {
     let PreOptimizationModule {
-        module: mut bb_codegen,
+        module: bb_codegen,
         prepared,
         cache_path_for_store,
         cache_metadata_for_store,
@@ -315,27 +315,6 @@ fn finish_codegen_module_with_tracker(
     let prepared = if let Some(prepared) = prepared {
         pass_tracker.record_timing("prepared_codegen_cache_use", || prepared)
     } else {
-        let initial_inline_plan = pass_tracker.record_timing("inline_candidate_plan", || {
-            let escape_summary = passes::summarize_module_escapes(&bb_codegen);
-            passes::plan_module_inlining(&escape_summary)
-        });
-        let scalar_replacement_stats =
-            pass_tracker.record_timing("scalar_replace_constructor_allocations", || {
-                passes::scalar_replace_non_escaping_constructor_allocations(
-                    &mut bb_codegen,
-                    &initial_inline_plan,
-                )
-            });
-        let inline_rewrite_stats = pass_tracker.record_timing("inline_direct_call_stores", || {
-            passes::inline_simple_direct_call_stores(&mut bb_codegen, &initial_inline_plan)
-        });
-        if scalar_replacement_stats.replaced_allocations != 0
-            || inline_rewrite_stats.rewritten_stores != 0
-        {
-            pass_tracker.record_timing("validate_codegen_instr_ids_after_inline", || {
-                passes::validate_codegen_instr_ids(&bb_codegen).map_err(anyhow::Error::msg)
-            })?;
-        }
         let escape_summary = pass_tracker.run_pass("escape_summary", || {
             passes::summarize_module_escapes(&bb_codegen)
         });
@@ -514,6 +493,34 @@ mod tests {
         let replaced = load_codegen_module_cache(cache_path.as_path())
             .expect("rebuilt cache should be readable");
         assert_eq!(replaced.metadata, expected_metadata);
+    }
+
+    #[test]
+    fn pre_optimization_lowering_does_not_run_inline_rewrite_cleanup() {
+        let source = "def callee(x):\n    return x\n\ndef caller(x):\n    return callee(x)\n";
+        let lowered = lower_python_to_blockpy_recorded(source, ModuleNameGen::new(0))
+            .expect("transform should succeed");
+        let pass_names = lowered.pass_tracker.pass_names().collect::<Vec<_>>();
+        let timing_names = lowered
+            .pass_tracker
+            .pass_timings()
+            .map(|timing| timing.name)
+            .collect::<Vec<_>>();
+
+        assert!(
+            pass_names.contains(&"inline_plan"),
+            "driver should still compute inline analysis facts for cached prepared codegen"
+        );
+        assert!(
+            !timing_names.iter().any(|name| matches!(
+                name.as_str(),
+                "inline_candidate_plan"
+                    | "scalar_replace_constructor_allocations"
+                    | "inline_direct_call_stores"
+                    | "validate_codegen_instr_ids_after_inline"
+            )),
+            "pre-optimization lowering should not mutate the lowered module with inline cleanup"
+        );
     }
 
     #[test]
