@@ -4230,7 +4230,7 @@ def build(values):
                     source: direct_source,
                     target: direct_target,
                     arg_plan: arg_plan.clone(),
-                    body: test_v3_inline_call_body(),
+                    body: test_v3_direct_call_body(),
                     reason: "profiled direct call".to_string(),
                 }],
             )]),
@@ -4250,6 +4250,96 @@ def build(values):
         assert_eq!(
             filtered,
             HashMap::from([(legacy_source, vec![legacy_target])])
+        );
+    }
+
+    #[test]
+    fn opt_v3_typed_call_preparation_skips_inline_body_plans() {
+        let function_id = RuntimeFunctionId::from_raw_parts(0, 1);
+        let source = InstrId::new(BlockLabel::from_index(0), 7);
+        let target = RuntimeFunctionId::from_raw_parts(0, 9);
+        let direct_call = OptV3DirectCallPlan {
+            source,
+            target,
+            arg_plan: TypedDirectCallArgPlan {
+                sources: vec![TypedDirectCallArgSource::Provided(0)],
+            },
+            body: test_v3_inline_call_body(),
+            reason: "profiled direct call".to_string(),
+        };
+        let profile = SpecializationProfile {
+            module_name: None,
+            counter_dump_path: None,
+            planned_evidence: HashMap::new(),
+            opt_v3_emitted_direct_calls: HashMap::from([(
+                function_id,
+                HashMap::from([(source, vec![direct_call])]),
+            )]),
+            opt_v3_emitted_constructor_calls: HashMap::new(),
+            opt_v3_emitted_method_calls: HashMap::new(),
+            opt_v3_emitted_exact_list_items: HashMap::new(),
+            opt_v3_emitted_indexed_fields: HashMap::new(),
+            opt_v3_emitted_indexed_globals: HashMap::new(),
+            opt_v3_exact_int_branch_artifacts: HashMap::new(),
+            behavior_change_indexed_stores: false,
+            profiled_cold_blocks: false,
+            guard_miss_deopt: false,
+        };
+        assert!(
+            profile.codegen_opt_v3_direct_calls(function_id).is_empty(),
+            "Inline direct-call body plans are owned by the early BlockPy rewrite path"
+        );
+
+        let constructor_call = OptV3ConstructorCallPlan {
+            source,
+            target,
+            owner_type: PlanV3ConstructorCallOwnerType {
+                module_name: "missing_v3_constructor_type".to_string(),
+                qualname: "Box".to_string(),
+            },
+            arg_plan: TypedDirectCallArgPlan {
+                sources: vec![TypedDirectCallArgSource::Provided(0)],
+            },
+            guard: PlanV3ConstructorCallGuardKind::ExactCallableTypeVersion,
+            fallback: PlanV3ConstructorCallFallbackKind::OriginalConstructorCall,
+            body: test_v3_inline_call_body(),
+            inline_target: None,
+            reason: "profiled constructor call".to_string(),
+        };
+        assert!(
+            prepare_opt_v3_constructor_call_plans_for_codegen(&HashMap::from([(
+                source,
+                vec![constructor_call],
+            )]))
+            .unwrap()
+            .is_empty(),
+            "Inline constructor body plans are owned by the early BlockPy rewrite path"
+        );
+
+        let method_call = OptV3MethodCallPlan {
+            source,
+            target,
+            method_name: "get".to_string(),
+            owner_type: PlanV3MethodCallOwnerType {
+                module_name: "missing_v3_method_type".to_string(),
+                qualname: "Box".to_string(),
+            },
+            arg_plan: TypedDirectCallArgPlan {
+                sources: vec![TypedDirectCallArgSource::Provided(0)],
+            },
+            guard: PlanV3MethodCallGuardKind::ExactReceiverTypeVersion,
+            fallback: PlanV3MethodCallFallbackKind::OriginalMethodCall,
+            body: test_v3_inline_call_body(),
+            reason: "profiled method call".to_string(),
+        };
+        assert!(
+            prepare_opt_v3_method_call_plans_for_codegen(&HashMap::from([(
+                source,
+                vec![method_call],
+            )]))
+            .unwrap()
+            .is_empty(),
+            "Inline method body plans are owned by the early BlockPy rewrite path"
         );
     }
 
@@ -4284,7 +4374,7 @@ def build(values):
             },
             guard: PlanV3ConstructorCallGuardKind::ExactCallableTypeVersion,
             fallback: PlanV3ConstructorCallFallbackKind::OriginalConstructorCall,
-            body: test_v3_inline_call_body(),
+            body: test_v3_direct_call_body(),
             inline_target: None,
             reason: "profiled constructor call".to_string(),
         };
@@ -4358,7 +4448,7 @@ def build(values):
             },
             guard: PlanV3MethodCallGuardKind::ExactReceiverTypeVersion,
             fallback: PlanV3MethodCallFallbackKind::OriginalMethodCall,
-            body: test_v3_inline_call_body(),
+            body: test_v3_direct_call_body(),
             reason: "profiled method call".to_string(),
         };
         let prepared_method_calls =
@@ -4431,7 +4521,7 @@ def build(values):
             },
             guard: PlanV3MethodCallGuardKind::ExactReceiverTypeVersion,
             fallback: PlanV3MethodCallFallbackKind::OriginalMethodCall,
-            body: test_v3_inline_call_body(),
+            body: test_v3_direct_call_body(),
             reason: "profiled method call".to_string(),
         };
         let prepared_method_calls =
@@ -19235,7 +19325,7 @@ def write_point(point, value):
             arg_plan: soac_lowering::passes::TypedDirectCallArgPlan {
                 sources: vec![soac_lowering::passes::TypedDirectCallArgSource::Provided(0)],
             },
-            body: test_v3_inline_call_body(),
+            body: test_v3_direct_call_body(),
             reason: "profiled direct call".to_string(),
         };
         let mut opt_v3_emitted_direct_calls = HashMap::new();
@@ -19287,14 +19377,12 @@ def write_point(point, value):
             profile.has_source_keyed_opt_v3_emissions(caller_id),
             "v3 direct-call emissions should mark the function as source-keyed"
         );
-        assert_eq!(
+        assert!(
             profile
                 .module_plan_direct_call_rewrite_targets(caller_id)
                 .unwrap()
-                .get(&source)
-                .unwrap(),
-            &vec![v3_target],
-            "source-keyed module planning should consume only the v3 direct-call decision"
+                .is_empty(),
+            "source-keyed module planning should leave DirectCall body plans for typed lowering"
         );
     }
 

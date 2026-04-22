@@ -13668,6 +13668,22 @@ fn opt_v3_inline_direct_call_targets(
         .collect()
 }
 
+fn opt_v3_direct_call_body_plans(
+    direct_calls_by_source: &HashMap<InstrId, Vec<OptV3DirectCallPlan>>,
+) -> HashMap<InstrId, Vec<OptV3DirectCallPlan>> {
+    direct_calls_by_source
+        .iter()
+        .filter_map(|(source, direct_calls)| {
+            let plans = direct_calls
+                .iter()
+                .filter(|direct_call| direct_call.body.kind == PlanV3CallBodyKind::DirectCall)
+                .cloned()
+                .collect::<Vec<_>>();
+            (!plans.is_empty()).then_some((*source, plans))
+        })
+        .collect()
+}
+
 fn extend_direct_call_targets_from_v3_direct_calls(
     out: &mut HashSet<RuntimeFunctionId>,
     direct_calls_by_source: &HashMap<InstrId, Vec<OptV3DirectCallPlan>>,
@@ -15719,7 +15735,7 @@ impl<'a> SpecializationProfile<'a> {
     ) -> HashMap<InstrId, Vec<OptV3DirectCallPlan>> {
         self.opt_v3_emitted_direct_calls
             .get(&function_id)
-            .cloned()
+            .map(opt_v3_direct_call_body_plans)
             .unwrap_or_default()
     }
 
@@ -15879,6 +15895,13 @@ fn prepare_opt_v3_constructor_call_plans_for_codegen(
 ) -> Result<HashMap<InstrId, OptV3PreparedConstructorCallPlan>, String> {
     let mut prepared = HashMap::new();
     for (source, constructor_calls) in constructor_calls_by_instr {
+        let constructor_calls = constructor_calls
+            .iter()
+            .filter(|constructor_call| constructor_call.body.kind == PlanV3CallBodyKind::DirectCall)
+            .collect::<Vec<_>>();
+        if constructor_calls.is_empty() {
+            continue;
+        }
         let mut guards = Vec::new();
         for constructor_call in constructor_calls {
             if let Some(guard) = opt_v3_constructor_call_guard_from_plan(constructor_call)?
@@ -15898,14 +15921,11 @@ fn prepare_opt_v3_method_call_plans_for_codegen(
 ) -> Result<HashMap<InstrId, OptV3PreparedMethodCallPlan>, String> {
     let mut prepared = HashMap::new();
     for (source, method_calls) in method_calls_by_instr {
+        let method_calls = method_calls
+            .iter()
+            .filter(|method_call| method_call.body.kind == PlanV3CallBodyKind::DirectCall)
+            .collect::<Vec<_>>();
         let Some(first_method_call) = method_calls.first() else {
-            prepared.insert(
-                *source,
-                OptV3PreparedMethodCallPlan {
-                    method_name: String::new(),
-                    guards: Vec::new(),
-                },
-            );
             continue;
         };
         let method_name = first_method_call.method_name.clone();

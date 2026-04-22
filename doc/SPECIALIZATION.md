@@ -640,7 +640,10 @@ JIT emitter still materializes the full guarded call blocks today.
   callee instead of rediscovering the method target from the owner type. The
   JIT still prepares the constructor owner/type-version guard at runtime, and
   legacy non-v3 constructor/runtime-iter rewrites still use the runtime owner
-  lookup path. The next step is to expand remaining guarded
+  lookup path. Late typed-call lowering only consumes v3 call plans whose
+  selected body is `DirectCall`; `Inline` body plans are owned by the earlier
+  BlockPy rewrite path and do not silently fall through to a different guarded
+  typed-call shape. The next step is to expand remaining guarded
   method/constructor typed nodes into explicit guard, direct-call, and fallback
   CFG blocks before final JIT emission.
 - Typed call access plans are validated before specialized JIT emission, and
