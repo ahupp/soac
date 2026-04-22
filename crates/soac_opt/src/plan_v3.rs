@@ -975,6 +975,15 @@ fn validate_direct_call_plans(
             &direct_call.arg_plan,
             errors,
         );
+        validate_inline_call_body_arg_plan(
+            function,
+            "direct-call",
+            direct_call.target,
+            direct_call.source,
+            &direct_call.body,
+            &direct_call.arg_plan,
+            errors,
+        );
     }
 }
 
@@ -1157,6 +1166,15 @@ fn validate_method_call_plans(
             &method_call.arg_plan,
             errors,
         );
+        validate_inline_call_body_arg_plan(
+            function,
+            "method-call",
+            method_call.target,
+            method_call.source,
+            &method_call.body,
+            &method_call.arg_plan,
+            errors,
+        );
     }
 }
 
@@ -1308,6 +1326,28 @@ fn validate_call_body_plan(
     if matches!(body.kind, CallBodyKind::Inline) && body.cost.hot_path == 0 {
         errors.push(format!(
             "function {} {kind} target {} at {} has inline call-body plan without modeled hot-path cost",
+            function.function.function, target, source
+        ));
+    }
+}
+
+fn validate_inline_call_body_arg_plan(
+    function: &FunctionOptimizationPlanV3,
+    kind: &str,
+    target: SerializedFunctionId,
+    source: InstrId,
+    body: &CallBodyPlan,
+    arg_plan: &DirectCallArgPlan,
+    errors: &mut Vec<String>,
+) {
+    if matches!(body.kind, CallBodyKind::Inline)
+        && arg_plan
+            .sources
+            .iter()
+            .any(|source| matches!(source, DirectCallArgSource::DefaultSentinel))
+    {
+        errors.push(format!(
+            "function {} {kind} target {} at {} has inline call-body plan with default-sentinel arguments",
             function.function.function, target, source
         ));
     }
@@ -2477,6 +2517,22 @@ mod tests {
         }
     }
 
+    fn inline_call_body() -> CallBodyPlan {
+        CallBodyPlan {
+            kind: CallBodyKind::Inline,
+            cost: Cost {
+                hot_path: 2,
+                miss_path: 1,
+                deopt: 0,
+                materialization: 0,
+                ownership: 1,
+                code_size: 3,
+                compile: 2,
+            },
+            reason: "test inline body".to_string(),
+        }
+    }
+
     #[test]
     fn validates_direct_call_selections() {
         let target = SerializedFunctionId::new(SerializedModuleId::new(0), LocalFunctionId::new(2));
@@ -2528,6 +2584,30 @@ mod tests {
         }]);
         let err = validate_module_plan_v3(&plan).unwrap_err();
         assert!(err.to_string().contains("missing module id 1"));
+    }
+
+    #[test]
+    fn rejects_direct_call_inline_body_with_default_arg_sentinel() {
+        let target = SerializedFunctionId::new(SerializedModuleId::new(0), LocalFunctionId::new(2));
+        let plan = module_with_direct_calls(vec![DirectCallSpecializationPlan {
+            source: instr_id(7),
+            target,
+            arg_plan: DirectCallArgPlan {
+                sources: vec![
+                    DirectCallArgSource::Provided(0),
+                    DirectCallArgSource::DefaultSentinel,
+                ],
+            },
+            body: inline_call_body(),
+            reason: "profiled call target".to_string(),
+        }]);
+
+        let err = validate_module_plan_v3(&plan).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("inline call-body plan with default-sentinel arguments"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -2645,6 +2725,41 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("method-call target 1:2 references missing module id 1"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rejects_method_call_inline_body_with_default_arg_sentinel() {
+        let target = SerializedFunctionId::new(SerializedModuleId::new(0), LocalFunctionId::new(2));
+        let plan = module_with_method_calls(vec![MethodCallSpecializationPlan {
+            source: instr_id(7),
+            target,
+            method_name: "get".to_string(),
+            owner_type: MethodCallOwnerType {
+                module_name: "pkg.mod".to_string(),
+                qualname: "Box".to_string(),
+            },
+            arg_plan: DirectCallArgPlan {
+                sources: vec![
+                    DirectCallArgSource::Provided(0),
+                    DirectCallArgSource::DefaultSentinel,
+                ],
+            },
+            guard: MethodCallGuardPlan {
+                kind: MethodCallGuardKind::ExactReceiverTypeVersion,
+            },
+            fallback: MethodCallFallbackPlan {
+                kind: MethodCallFallbackKind::OriginalMethodCall,
+            },
+            body: inline_call_body(),
+            reason: "profiled owner-method target".to_string(),
+        }]);
+
+        let err = validate_module_plan_v3(&plan).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("inline call-body plan with default-sentinel arguments"),
             "{err}"
         );
     }
