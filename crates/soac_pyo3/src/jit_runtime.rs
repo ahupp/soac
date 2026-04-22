@@ -4,9 +4,11 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyModule, PyTuple};
 use soac_core::block_py::{BlockPyFunction, BlockPyModule, RuntimeFunctionId};
-use soac_driver::codegen_cache::{CachedCodegenModuleMetadata, PythonModuleCacheSource};
+use soac_driver::codegen_cache::{
+    CachedCodegenModuleMetadata, PythonModuleCacheSource, hash_module_source,
+};
 use soac_driver::{LoweringOptions, lower_python_to_blockpy_recorded_with_options};
-use soac_jit::module_type::{ModuleInfo, SoacExtModule, hash_module_source};
+use soac_jit::module_type::{ModuleInfo, SoacExtModule};
 use soac_lowering::passes::CodegenModuleShape;
 use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};

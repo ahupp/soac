@@ -60,6 +60,18 @@ pub struct CachedCodegenModuleMetadata {
     pub cache_identity: String,
 }
 
+pub fn hash_module_source(source: &str) -> u64 {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x00000100000001b3;
+
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in source.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
 pub fn pre_optimization_module_cache_identity(
     build_identity: &str,
     runtime_names_as_globals: bool,

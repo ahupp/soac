@@ -173,10 +173,9 @@ mod test {
     };
     use soac_driver::codegen_cache::{
         CachedCodegenModuleMetadata, PythonModuleCacheSource, codegen_module_cache_path,
-        module_optimization_plan_path, module_optimization_plan_v3_path,
+        hash_module_source, module_optimization_plan_path, module_optimization_plan_v3_path,
     };
     use soac_driver::{LoweringOptions, lower_python_to_blockpy_recorded_with_options};
-    use soac_jit::module_type::hash_module_source;
     use soac_lowering::passes::{CodegenModuleShape, InstrCodegen};
     use soac_opt::artifacts_v3::load_optimization_artifacts_v3;
     use soac_opt::plan::{OptimizationPlan, PlannedAction, PlannedReplacement};

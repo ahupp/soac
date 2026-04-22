@@ -3,10 +3,10 @@ use soac_core::block_py::{BlockPyModule, ModuleNameGen, RuntimeFunctionId};
 use soac_core::profile::{CounterDumpFile, CounterDumpRecordView, CounterDumpRowView};
 use soac_driver::codegen_cache::{
     CachedCodegenModuleMetadata, PythonModuleCacheSource, codegen_module_cache_path,
-    load_codegen_module_cache, module_optimization_plan_path, module_optimization_plan_v3_path,
-    remap_cached_codegen_module_function_ids, validate_codegen_module_cache_metadata,
+    hash_module_source, load_codegen_module_cache, module_optimization_plan_path,
+    module_optimization_plan_v3_path, remap_cached_codegen_module_function_ids,
+    validate_codegen_module_cache_metadata,
 };
-use soac_jit::module_type::hash_module_source;
 use soac_jit::{
     PrecompileModuleIndex, PrecompileModuleIndexEntry, PrecompileOptimizationPlanInput,
     precompile_codegen_module_to_object_file,
@@ -569,7 +569,6 @@ mod test {
     use soac_core::profile::{CounterDumpRecord, CounterDumpRow, parse_counter_dump_records};
     use soac_driver::codegen_cache::store_codegen_module_cache;
     use soac_driver::{LoweringOptions, lower_python_to_blockpy_recorded_with_options};
-    use soac_jit::module_type::hash_module_source;
     use soac_opt::pipeline_v3::generate_optimization_plans_v3_for_cached_modules;
     use soac_opt::plan::{CachedModuleOptimizationInput, ProfileEvidenceStore};
     use std::process::Stdio;
