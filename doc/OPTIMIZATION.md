@@ -61,7 +61,7 @@ For each optimization attempt:
    change, and whether the relevant verify counters / CLIF shape changed
    as expected.
 
-7. Update `doc/CODEX_OPT_LOG.md` before moving on. Log landed changes,
+7. Update `doc/PERF_LOG.md` before moving on. Log landed changes,
    benchmark-negative attempts, and inconclusive attempts that consumed
    meaningful investigation time. Keep entries concise: candidate
    summary, landed jj change id if any, specialized-throughput

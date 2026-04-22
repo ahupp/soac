@@ -532,7 +532,7 @@ These diagnostics should feed benchmark artifacts and targeted tests.
 10. Benchmark and log kept performance changes.
 
    Measure before/after on the standard benchmark workflow. If a specialization
-   is kept, add a succinct entry to `doc/CODEX_OPT_LOG.md`.
+   is kept, add a succinct entry to `doc/PERF_LOG.md`.
 
 ## Suggested First Step
 

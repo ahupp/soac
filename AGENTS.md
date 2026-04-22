@@ -199,7 +199,7 @@ report both headline throughput and relative delta.
 When a performance change is complete enough that you intend to keep it,
 rebase the finished change onto `main`, run `$soac-profile-benchmark`, write the
 finalized benchmark result to `work/bench/{change_id}`, and
-append an entry to `doc/CODEX_OPT_LOG.md` in the same logical change.
+append an entry to `doc/PERF_LOG.md` in the same logical change.
 Use `work/bench/{change_id}_{commit_id}` only for one-off test benchmarks while
 iterating. Keep log entries succinct: include the jj change id, a short summary
 of the optimization, the benchmarked throughput delta, and the before/after

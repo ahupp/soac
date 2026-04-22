@@ -172,14 +172,15 @@ Most command-line inspection tools live in `soac-inspector` and can be run as
   snapshot source cases. This is mainly a maintenance tool for inspector and
   lowering snapshot workflows.
 
-# Development Environment
-
-Install the Python-side venv and the nightly Rust codegen backend used by
-`soac_jit`:
+# Setup
 
 ```
-just setup-dev-env
+$ cargo install --locked just
+$ just setup-dev-env
 ```
+
+The workflows in `AGENTS.md` depend on using `jj-vcs` for version control and may not work well with codex 
+with a regular git repo.
 
 `setup-dev-env` reuses an already-installed nightly Rust toolchain and Cranelift
 codegen component rather than upgrading them on every run, because a nightly
@@ -198,67 +199,7 @@ artifact directory, and the setup recipe symlinks `vendor/cpython`, `work/`,
 temporary worktrees can reuse the already-fetched offline state and shared
 benchmark artifacts.
 
-# CLIF
 
-```
-$ ./rust-clif-dist/rustc-clif --out-dir=clif-out/ --crate-type=rlib fastadd.rs -Cdebuginfo=0 --emit link,llvm-ir
-```
-
-# Log
-
-2026-01-15:
-  - Totals: duration 18m 3s; tests run 37,414; failures 747; skipped 1,706; test files run 483/492; failed 103; env_changed 1;
-    skipped 31; resource_denied 9
-2026-01-16:
-  - Test files: 401 passed / 492 total (483 run; 81 failed; 1 env_changed; 31 skipped; 9 resource_denied).
-  - Test cases: 39,237 passed / 39,820 total (583 failed; 1,835 skipped).
-
-Then
-• Test File Counts
-
-  - Passing: 388/492
-  - Run: 483/492
-  - Failed: 95
-  - Skipped files: 44
-
-  Individual Test Cases
-
-  - Run: 39,320
-  - Passed: 38,685
-  - Failed: 635
-  - Skipped: 1,754
-
-2026-01-17:
-Total duration: 33 min 49 sec
-Total tests: run=28,491 failures=612 skipped=1,426
-Total test files: run=488/492 failed=160 skipped=24 resource_denied=4
-Result: FAILURE
-
-
-2026-02-02:
-
-Total duration: 48 min 11 sec
-Total tests: run=32,863 failures=705 skipped=1,778
-Total test files: run=483/491 failed=132 skipped=27 resource_denied=8
-Result: FAILURE
-
-
-# Principles
-
-  * Locality: for any specific concept, it's better to handle it in one place.
-    e.g, prefer to handle different kinds of load/store (global, nonlocal,
-    local, class-body) in one place, rather than spreading them across many
-    different transforms.  For example, things we prefer not to do:
-      - have many different layers of the system aware of annotations and annotationlib
-      - special cases that match on specific internal variable names
-      - many different sites aware of scoping rules
-
-# Unsupported Source Forms
-
-- SOAC does not support string literals containing lone surrogate escapes such
-  as `"\uD800"`. These are uncommon, cannot be represented as ordinary Rust
-  `str` data after parsing, and should fail explicitly instead of being routed
-  through a runtime `eval()` workaround.
 
 # Environment Variables
 
@@ -269,17 +210,6 @@ plumbing such as `REPO_ROOT`, `VENV_DIR`, `WEB_DIR`, and similar helper
 exports are intentionally omitted here.
 
 ## Local Tooling
-
-- `UV_CACHE_DIR`, `UV_TOOL_DIR`, `UV_TOOL_BIN_DIR`, `XDG_CACHE_HOME`,
-  `XDG_DATA_HOME`, `XDG_RUNTIME_DIR`, and `CARGO_HOME`
-  The `.envrc` and `Justfile` point these at repo-local directories by default
-  so uv package cache, installed tools, and XDG state stay under the working
-  tree. `XDG_RUNTIME_DIR` defaults under `work/tmp/`, and `CARGO_HOME` defaults
-  to `work/cargo-home`. The
-  `Justfile` also respects pre-set values for these variables, which allows
-  temporary worktrees to use explicit writable shared cache roots.
-  `just setup-dev-env` installs `ruff` into the repo-local uv tool bin
-  directory.
 
 - `SOAC_PARENT_REPO=/path/to/parent/checkout`
   Optional override for `just setup-dev-env` inside a jj worktree. The recipe
@@ -618,15 +548,3 @@ tree, with pystone benchmark runs writing to `work/bench/`.
 - `PYTHON_BIN=/path/to/python`
   In [scripts/collect_cpython_skip_ids.sh](/home/adam/project/soac-profile/scripts/collect_cpython_skip_ids.sh),
   choose which Python binary is used when collecting skip IDs.
-
-## Local Web Inspector
-
-- `HOST=<bind-address>`
-  In [`fn main`, at [crates/soac_inspector/src/main.rs:8](/home/adam/project/soac-profile/crates/soac_inspector/src/main.rs#L8)],
-  control the bind address for the local inspector server. The `Justfile`
-  default is `127.0.0.1`.
-
-- `PORT=<port>`
-  In [`fn main`, at [crates/soac_inspector/src/main.rs:9](/home/adam/project/soac-profile/crates/soac_inspector/src/main.rs#L9)],
-  control the bind port for the local inspector server. The `Justfile`
-  default is `8000`.
