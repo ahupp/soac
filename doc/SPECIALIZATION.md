@@ -368,7 +368,10 @@ apply/verify mode:
   access kind and attribute name match the lowered `GetAttr`/`SetAttr`
   instruction, so typed annotation and codegen receive an already shape-checked
   v3 field input instead of silently treating it as another profiled field
-  candidate.
+  candidate. Once selected, a v3 indexed-field input is required to resolve to
+  a usable owner-type/version guard; unresolved owner types or unsupported
+  field layouts reject the v3 plan instead of silently falling back to generic
+  attribute lowering.
   By-attribute layout availability is still shared with the existing constructor
   initializer fast path until that family has its own v3 plan node.
 - After codegen-to-typed lowering, these sites are represented as

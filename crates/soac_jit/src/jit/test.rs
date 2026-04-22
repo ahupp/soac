@@ -18894,6 +18894,82 @@ def read_point(point):
     }
 
     #[test]
+    fn v3_indexed_field_input_rejects_unresolvable_owner_type() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|_| {
+            let module_name_gen = ModuleNameGen::new(7);
+            let mut constants = TestConstantPool::default();
+            let mut function = test_function_in_module(&module_name_gen, "read_missing_owner");
+            function.params = ParamSpec {
+                params: vec![Param {
+                    name: "obj".into(),
+                    kind: ParamKind::Any,
+                    has_default: false,
+                }],
+            };
+            let block_label = function.name_gen.next_block_name();
+            let getattr_instr_id = InstrId::new(block_label, 1);
+            function.blocks = vec![CodegenBlock {
+                label: block_label,
+                body: vec![],
+                term: ret_term(with_instr_id(
+                    op_expr(GetAttr::new(
+                        name_expr(test_name("obj")),
+                        constants.string_expr("x"),
+                    )),
+                    getattr_instr_id,
+                )),
+                params: vec![],
+                exc_edge: None,
+            }];
+            set_stack_slots(&mut function, &["obj"]);
+
+            let owner_type = IndexedFieldOwnerType {
+                module_name: "missing_field_owner_module".to_string(),
+                qualname: "Point".to_string(),
+            };
+            let profile = SpecializationProfile {
+                module_name: None,
+                counter_dump_path: None,
+                planned_evidence: HashMap::new(),
+                opt_v3_emitted_direct_calls: HashMap::new(),
+                opt_v3_emitted_constructor_calls: HashMap::new(),
+                opt_v3_emitted_method_calls: HashMap::new(),
+                opt_v3_emitted_exact_list_items: HashMap::new(),
+                opt_v3_emitted_indexed_fields: HashMap::from([(
+                    function.function_id,
+                    HashMap::from([(
+                        getattr_instr_id,
+                        vec![OptV3IndexedFieldAccessPlan {
+                            access: IndexedFieldAccessKind::Load,
+                            owner_type,
+                            attr_name: "x".to_string(),
+                            expected_index: 0,
+                        }],
+                    )]),
+                )]),
+                opt_v3_emitted_indexed_globals: HashMap::new(),
+                opt_v3_exact_int_branch_artifacts: HashMap::new(),
+                behavior_change_indexed_stores: false,
+                profiled_cold_blocks: false,
+                guard_miss_deopt: false,
+            };
+
+            let err = match FunctionSpecializationInputs::from_profile(&profile, &function) {
+                Ok(_) => panic!("v3 indexed-field input should reject an unresolved owner type"),
+                Err(err) => err,
+            };
+            assert!(
+                err.contains("optimizer v3 indexed-field plan")
+                    && err.contains("missing_field_owner_module.Point")
+                    && err.contains("not loaded or cannot be resolved"),
+                "{err}"
+            );
+        });
+    }
+
+    #[test]
     fn strict_v3_indexed_field_setattr_hits_apply_mode_first_insert() {
         if crate::run_test_in_isolated_process_if_needed(
             module_path!(),
@@ -23840,14 +23916,13 @@ def f(x, y):
             body: test_v3_inline_call_body(),
             reason: "profiled direct call".to_string(),
         };
-        let indexed_field = OptV3IndexedFieldAccessPlan {
-            access: IndexedFieldAccessKind::Load,
-            owner_type: IndexedFieldOwnerType {
-                module_name: module_name.to_string(),
-                qualname: "Owner".to_string(),
-            },
-            attr_name: "x".to_string(),
-            expected_index: 0,
+        let non_call_v3_source = InstrId::new(caller_block_label, 99);
+        let exact_list_item = OptV3ExactListItemAccessPlan {
+            source: non_call_v3_source,
+            access: PlanV3ExactListItemAccessKind::Get,
+            shape: PlanV3ExactListItemShape::ExactListExactInt,
+            guard: PlanV3ExactListItemGuardKind::ExactListExactCompactIntInBounds,
+            fallback: PlanV3ExactListItemFallbackKind::OriginalItemAccess,
         };
         let profile = SpecializationProfile {
             module_name: Some(module_name),
@@ -23859,11 +23934,11 @@ def f(x, y):
             )]),
             opt_v3_emitted_constructor_calls: HashMap::new(),
             opt_v3_emitted_method_calls: HashMap::new(),
-            opt_v3_emitted_exact_list_items: HashMap::new(),
-            opt_v3_emitted_indexed_fields: HashMap::from([(
+            opt_v3_emitted_exact_list_items: HashMap::from([(
                 caller_function.function_id,
-                HashMap::from([(InstrId::new(caller_block_label, 99), vec![indexed_field])]),
+                HashMap::from([(non_call_v3_source, exact_list_item)]),
             )]),
+            opt_v3_emitted_indexed_fields: HashMap::new(),
             opt_v3_emitted_indexed_globals: HashMap::new(),
             opt_v3_exact_int_branch_artifacts: HashMap::new(),
             behavior_change_indexed_stores: false,

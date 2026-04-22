@@ -197,8 +197,10 @@ Partially migrated families are also intentionally visible:
   validates that they match the lowered `GetAttr`/`SetAttr` site while loading
   v3 artifacts, before constructing typed/codegen inputs. By-attribute layout
   availability is still shared with the existing constructor initializer fast
-  path. The final inline load/store emission still uses the existing typed
-  attribute emitter rather than a v3-specific operation node.
+  path, but selected v3 indexed-field inputs must now resolve to usable
+  owner-type/version guards before codegen. The final inline load/store
+  emission still uses the existing typed attribute emitter rather than a
+  v3-specific operation node.
 - indexed globals are represented as v3 plan selections plus mechanical
   indexed-global emissions with explicit module-dict guard and original global
   fallback effects. The JIT validates emitted global name/access/index against

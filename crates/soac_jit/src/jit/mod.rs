@@ -10186,6 +10186,78 @@ struct OptV3ResolvedIndexedFieldAccess {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+struct IndexedFieldLoweringPlan {
+    source: TypedIndexedFieldPlanSource,
+    access: PlanV3IndexedFieldAccessKind,
+    specializations: Vec<FieldIndexSpecialization>,
+}
+
+impl IndexedFieldLoweringPlan {
+    fn from_typed_guards(
+        instr_id: InstrId,
+        source: TypedIndexedFieldPlanSource,
+        guards: &[TypedIndexedFieldGuard],
+        expected_access: PlanV3IndexedFieldAccessKind,
+    ) -> Result<Option<Self>, String> {
+        if guards.is_empty() {
+            if source == TypedIndexedFieldPlanSource::OptimizationPlanV3 {
+                return Err(format!(
+                    "optimizer v3 indexed-field {:?} for {instr_id} reached codegen without guards",
+                    expected_access
+                ));
+            }
+            return Ok(None);
+        }
+
+        let mut specializations = Vec::with_capacity(guards.len());
+        for guard in guards {
+            let Some(specialization) = field_index_specialization_from_typed_guard(guard) else {
+                if source == TypedIndexedFieldPlanSource::OptimizationPlanV3 {
+                    return Err(format!(
+                        "optimizer v3 indexed-field {:?} for {instr_id} has unsupported owner type reference {:?}",
+                        expected_access, guard.owner_type_ref
+                    ));
+                }
+                continue;
+            };
+            push_unique_specialization(&mut specializations, specialization);
+        }
+
+        if specializations.is_empty() {
+            if source == TypedIndexedFieldPlanSource::OptimizationPlanV3 {
+                return Err(format!(
+                    "optimizer v3 indexed-field {:?} for {instr_id} has no codegen-resolvable guards",
+                    expected_access
+                ));
+            }
+            return Ok(None);
+        }
+
+        Ok(Some(Self {
+            source,
+            access: expected_access,
+            specializations,
+        }))
+    }
+
+    fn require_type_ptr(
+        &self,
+        instr_id: InstrId,
+        specialization: &FieldIndexSpecialization,
+        owner_type: Option<ir::Value>,
+    ) -> Result<Option<ir::Value>, String> {
+        match owner_type {
+            Some(owner_type) => Ok(Some(owner_type)),
+            None if self.source == TypedIndexedFieldPlanSource::OptimizationPlanV3 => Err(format!(
+                "optimizer v3 indexed-field {:?} for {instr_id} could not bind owner type reference {:?}",
+                self.access, specialization.owner_type_ref
+            )),
+            None => Ok(None),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct OptV3IndexedGlobalAccessPlan {
     source: InstrId,
     access: PlanV3IndexedGlobalAccessKind,
@@ -16887,17 +16959,22 @@ impl<'a> SpecializationProfile<'a> {
         for (instr_id, planned_accesses) in planned_by_instr {
             let mut resolved_accesses = Vec::new();
             for planned in planned_accesses {
-                if let Some(specialization) =
-                    field_index_specialization_from_primed_opt_v3(planned)?
-                {
-                    let resolved = OptV3ResolvedIndexedFieldAccess {
-                        access: planned.access,
-                        attr_name: planned.attr_name.clone(),
-                        specialization,
-                    };
-                    if !resolved_accesses.contains(&resolved) {
-                        resolved_accesses.push(resolved);
-                    }
+                let specialization =
+                    required_field_index_specialization_from_primed_opt_v3(planned).map_err(
+                        |err| {
+                            format!(
+                                "optimizer v3 indexed-field plan {:?} for {} attr {:?} could not resolve a codegen guard: {err}",
+                                planned.access, instr_id, planned.attr_name
+                            )
+                        },
+                    )?;
+                let resolved = OptV3ResolvedIndexedFieldAccess {
+                    access: planned.access,
+                    attr_name: planned.attr_name.clone(),
+                    specialization,
+                };
+                if !resolved_accesses.contains(&resolved) {
+                    resolved_accesses.push(resolved);
                 }
             }
             if !resolved_accesses.is_empty() {
@@ -17649,6 +17726,32 @@ fn field_index_specialization_from_primed_opt_v3(
         planned.attr_name.as_str(),
         planned.expected_index,
     )
+}
+
+fn required_field_index_specialization_from_primed_opt_v3(
+    planned: &OptV3IndexedFieldAccessPlan,
+) -> Result<FieldIndexSpecialization, String> {
+    let type_key = opt_v3_field_index_type_key(planned);
+    let Some(owner_type) = resolve_type_key_to_type(&type_key)? else {
+        return Err(format!(
+            "owner type {}.{} is not loaded or cannot be resolved",
+            type_key.module_name, type_key.qualname
+        ));
+    };
+    field_index_specialization_for_type(
+        owner_type,
+        planned.attr_name.as_str(),
+        planned.expected_index,
+    )?
+    .ok_or_else(|| {
+        format!(
+            "owner type {}.{} does not support indexed-field lowering for attr {:?} at expected index {}; this requires a heap type with generic getattro/setattro, no class binding for the attr, and a nonzero type version tag",
+            type_key.module_name,
+            type_key.qualname,
+            planned.attr_name,
+            planned.expected_index
+        )
+    })
 }
 
 fn push_unique_specialization(
@@ -20104,6 +20207,7 @@ fn emit_typed_setattr_fallback(
 fn emit_typed_indexed_getattr(
     fb: &mut FunctionBuilder<'_>,
     op: &TypedGetAttr<InstrTyped>,
+    source: TypedIndexedFieldPlanSource,
     guards: &[TypedIndexedFieldGuard],
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
@@ -20111,16 +20215,15 @@ fn emit_typed_indexed_getattr(
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<Option<SoacValue>, String> {
     let instr_id = op.semantic_instr_id();
-    if guards.is_empty() {
+    let Some(plan) = IndexedFieldLoweringPlan::from_typed_guards(
+        instr_id,
+        source,
+        guards,
+        PlanV3IndexedFieldAccessKind::Load,
+    )?
+    else {
         return Ok(None);
-    }
-    let specializations = guards
-        .iter()
-        .filter_map(field_index_specialization_from_typed_guard)
-        .collect::<Vec<_>>();
-    if specializations.is_empty() {
-        return Ok(None);
-    }
+    };
     let (value, value_is_borrowed) = emit_typed_pyobject_input_with_local_env(
         fb,
         op.value.as_ref(),
@@ -20166,19 +20269,25 @@ fn emit_typed_indexed_getattr(
         fallback_block,
     );
 
-    for (index, specialization) in specializations.iter().enumerate() {
-        let Some(owner_type) =
+    for (index, specialization) in plan.specializations.iter().enumerate() {
+        let Some(owner_type) = plan.require_type_ptr(
+            instr_id,
+            specialization,
             emit_type_ptr_value_for_ref(fb, codegen_env, emit_ctx, &specialization.owner_type_ref)
-                .unwrap_or_else(|err| {
-                    panic!("failed to bind field-indexed get type symbol: {err}");
-                })
+                .map_err(|err| {
+                    format!(
+                        "failed to bind field-indexed get owner type for {}: {err}",
+                        instr_id
+                    )
+                })?,
+        )?
         else {
             continue;
         };
         let maybe_direct_block = fb.create_block();
         let direct_block = fb.create_block();
         fb.append_block_param(direct_block, ptr_ty);
-        let next_guard_block = if index + 1 == specializations.len() {
+        let next_guard_block = if index + 1 == plan.specializations.len() {
             fallback_block
         } else {
             fb.create_block()
@@ -20218,7 +20327,7 @@ fn emit_typed_indexed_getattr(
         fb.ins()
             .jump(result_block, &[ir::BlockArg::Value(direct_value)]);
 
-        if index + 1 != specializations.len() {
+        if index + 1 != plan.specializations.len() {
             fb.switch_to_block(next_guard_block);
         }
     }
@@ -20291,16 +20400,15 @@ fn emit_typed_indexed_setattr(
         }
     };
     let instr_id = op.semantic_instr_id();
-    if guards.is_empty() {
+    let Some(plan) = IndexedFieldLoweringPlan::from_typed_guards(
+        instr_id,
+        source,
+        guards,
+        PlanV3IndexedFieldAccessKind::Store,
+    )?
+    else {
         return Ok(None);
-    }
-    let specializations = guards
-        .iter()
-        .filter_map(field_index_specialization_from_typed_guard)
-        .collect::<Vec<_>>();
-    if specializations.is_empty() {
-        return Ok(None);
-    }
+    };
     let (value, value_is_borrowed) = emit_typed_pyobject_input_with_local_env(
         fb,
         op.value.as_ref(),
@@ -20358,18 +20466,24 @@ fn emit_typed_indexed_setattr(
         fallback_block,
     );
 
-    for (index, specialization) in specializations.iter().enumerate() {
-        let Some(owner_type) =
+    for (index, specialization) in plan.specializations.iter().enumerate() {
+        let Some(owner_type) = plan.require_type_ptr(
+            instr_id,
+            specialization,
             emit_type_ptr_value_for_ref(fb, codegen_env, emit_ctx, &specialization.owner_type_ref)
-                .unwrap_or_else(|err| {
-                    panic!("failed to bind field-indexed set type symbol: {err}");
-                })
+                .map_err(|err| {
+                    format!(
+                        "failed to bind field-indexed set owner type for {}: {err}",
+                        instr_id
+                    )
+                })?,
+        )?
         else {
             continue;
         };
         let maybe_direct_block = fb.create_block();
         let direct_block = fb.create_block();
-        let next_guard_block = if index + 1 == specializations.len() {
+        let next_guard_block = if index + 1 == plan.specializations.len() {
             fallback_block
         } else {
             fb.create_block()
@@ -20420,7 +20534,7 @@ fn emit_typed_indexed_setattr(
             fb.ins().jump(result_block, &[]);
         }
 
-        if index + 1 != specializations.len() {
+        if index + 1 != plan.specializations.len() {
             fb.switch_to_block(next_guard_block);
         }
     }
@@ -20699,11 +20813,12 @@ fn emit_typed_codegen_expr_value_with_local_env(
     }
 
     if let InstrTyped::GetAttrTyped(op) = expr
-        && let TypedAttrAccessPlan::IndexedField { guards, .. } = &op.access
+        && let TypedAttrAccessPlan::IndexedField { source, guards } = &op.access
     {
         let maybe_value = emit_typed_indexed_getattr(
             fb,
             op,
+            *source,
             guards,
             local_env,
             emit_ctx,
@@ -24751,10 +24866,11 @@ fn emit_typed_codegen_stmt_result_with_local_env(
         );
     }
     if let InstrTyped::GetAttrTyped(op) = expr {
-        let result = if let TypedAttrAccessPlan::IndexedField { guards, .. } = &op.access {
+        let result = if let TypedAttrAccessPlan::IndexedField { source, guards } = &op.access {
             emit_typed_indexed_getattr(
                 fb,
                 op,
+                *source,
                 guards,
                 local_env,
                 emit_ctx,
