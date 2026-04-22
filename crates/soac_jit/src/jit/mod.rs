@@ -19499,22 +19499,30 @@ fn typed_call_can_emit_simple_positional_with_typed_inputs(
             .is_none_or(Vec::is_empty)
 }
 
-fn typed_simple_positional_args(call: &TypedCall<InstrTyped>) -> Result<Vec<&InstrTyped>, String> {
-    if !call.keywords.is_empty() {
-        return Err(
-            "typed call with typed-only children and keyword args is not supported".to_string(),
-        );
+fn typed_simple_positional_arg_refs<'a>(
+    args: &'a [CallArgPositional<InstrTyped>],
+    keywords: &[CallArgKeyword<InstrTyped>],
+    context: &str,
+) -> Result<Vec<&'a InstrTyped>, String> {
+    if !keywords.is_empty() {
+        return Err(format!("{context} with keyword args is not supported"));
     }
-    let mut args = Vec::with_capacity(call.args.len());
-    for arg in &call.args {
+    let mut positional = Vec::with_capacity(args.len());
+    for arg in args {
         let CallArgPositional::Positional(arg) = arg else {
-            return Err(
-                "typed call with typed-only children and starred args is not supported".to_string(),
-            );
+            return Err(format!("{context} with starred args is not supported"));
         };
-        args.push(arg);
+        positional.push(arg);
     }
-    Ok(args)
+    Ok(positional)
+}
+
+fn typed_simple_positional_args(call: &TypedCall<InstrTyped>) -> Result<Vec<&InstrTyped>, String> {
+    typed_simple_positional_arg_refs(
+        call.args.as_slice(),
+        call.keywords.as_slice(),
+        "typed call with typed-only children",
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -22019,20 +22027,6 @@ fn emit_typed_codegen_direct_callable_specialization_result_with_local_env(
     debug_assert_eq!(simple_args.len(), arg_refs.len());
 
     let site_instr_id = legacy_call.try_semantic_instr_id();
-    let call_target_counter = site_instr_id
-        .and_then(|site_instr_id| emit_ctx.call_target_counter_ids.get(&site_instr_id))
-        .copied();
-    let direct_hit_counter_id = site_instr_id
-        .and_then(|site_instr_id| emit_ctx.call_direct_hit_counter_ids.get(&site_instr_id))
-        .copied();
-    let direct_fallback_counter_id = site_instr_id
-        .and_then(|site_instr_id| {
-            emit_ctx
-                .call_direct_fallback_counter_ids
-                .get(&site_instr_id)
-        })
-        .copied();
-
     let (constructor_specializations, direct_specializations) = match &call.access {
         TypedCallAccessPlan::GuardedCallable {
             function_guards,
@@ -22100,9 +22094,56 @@ fn emit_typed_codegen_direct_callable_specialization_result_with_local_env(
         return Ok(None);
     }
 
-    let (callable, callable_is_borrowed) = emit_typed_pyobject_input_with_local_env(
+    emit_typed_prepared_direct_callable_specialization_result_with_local_env(
         fb,
         call.func.as_ref(),
+        arg_refs.as_slice(),
+        site_instr_id,
+        constructor_specializations.as_slice(),
+        direct_specializations.as_slice(),
+        local_env,
+        emit_ctx,
+        demand,
+        codegen_env,
+        func_imports,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_typed_prepared_direct_callable_specialization_result_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    func: &InstrTyped,
+    arg_refs: &[&InstrTyped],
+    site_instr_id: Option<InstrId>,
+    constructor_specializations: &[DirectConstructorSpecialization],
+    direct_specializations: &[DirectFunctionSpecialization],
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    demand: ResultDemand,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<Option<EmitResult>, String> {
+    if constructor_specializations.is_empty() && direct_specializations.is_empty() {
+        return Ok(None);
+    }
+
+    let call_target_counter = site_instr_id
+        .and_then(|site_instr_id| emit_ctx.call_target_counter_ids.get(&site_instr_id))
+        .copied();
+    let direct_hit_counter_id = site_instr_id
+        .and_then(|site_instr_id| emit_ctx.call_direct_hit_counter_ids.get(&site_instr_id))
+        .copied();
+    let direct_fallback_counter_id = site_instr_id
+        .and_then(|site_instr_id| {
+            emit_ctx
+                .call_direct_fallback_counter_ids
+                .get(&site_instr_id)
+        })
+        .copied();
+
+    let (callable, callable_is_borrowed) = emit_typed_pyobject_input_with_local_env(
+        fb,
+        func,
         local_env,
         emit_ctx,
         codegen_env,
@@ -22127,21 +22168,7 @@ fn emit_typed_codegen_direct_callable_specialization_result_with_local_env(
     let direct_guard_miss_dispatch = if !constructor_specializations.is_empty() {
         JitGuardMissDispatch::FallbackBlock(generic_block)
     } else if let Some(site_instr_id) = site_instr_id {
-        let guard_miss_resume_point =
-            emit_ctx
-                .guard_miss_resume_point
-                .unwrap_or(LocalEnvResumePoint::BeforeInstr {
-                    key: InstrKey::new(emit_ctx.function_id, site_instr_id),
-                });
-        prepare_optional_guard_miss_dispatch(
-            emit_ctx.guard_miss_target_for_resume_point(
-                guard_miss_resume_point,
-                &[legacy_call.func.as_ref()],
-                generic_block,
-            ),
-            generic_block,
-            emit_ctx.guard_miss_deopt_stub_ref,
-        )
+        prepare_typed_guard_miss_dispatch_for_instr(emit_ctx, site_instr_id, &[func], generic_block)
     } else {
         JitGuardMissDispatch::FallbackBlock(generic_block)
     };
@@ -22203,7 +22230,7 @@ fn emit_typed_codegen_direct_callable_specialization_result_with_local_env(
                 fb,
                 callable,
                 callable_is_borrowed,
-                arg_refs.as_slice(),
+                arg_refs,
                 specialization,
                 target_function,
                 local_env,
@@ -22269,7 +22296,7 @@ fn emit_typed_codegen_direct_callable_specialization_result_with_local_env(
                 fb,
                 callable,
                 callable_is_borrowed,
-                arg_refs.as_slice(),
+                arg_refs,
                 &specialization.arg_plan,
                 target_function,
                 local_env,
@@ -22298,7 +22325,7 @@ fn emit_typed_codegen_direct_callable_specialization_result_with_local_env(
                 fb,
                 callable,
                 callable_is_borrowed,
-                arg_refs.as_slice(),
+                arg_refs,
                 local_env,
                 emit_ctx,
                 ResultDemand::PYOBJECT_OWNED,
@@ -22350,6 +22377,55 @@ fn emit_typed_codegen_direct_callable_specialization_result_with_local_env(
     )))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn emit_typed_generic_positional_call_result_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    func: &InstrTyped,
+    arg_refs: &[&InstrTyped],
+    site_instr_id: Option<InstrId>,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    demand: ResultDemand,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<EmitResult, String> {
+    let (callable, callable_is_borrowed) = emit_typed_pyobject_input_with_local_env(
+        fb,
+        func,
+        local_env,
+        emit_ctx,
+        codegen_env,
+        func_imports,
+        "typed guarded-call callable fallback",
+    )?;
+    if let Some(counter_id) = site_instr_id
+        .and_then(|site_instr_id| emit_ctx.call_target_counter_ids.get(&site_instr_id))
+        .copied()
+    {
+        let callee_id = emit_callee_function_id_checked(fb, callable, emit_ctx, codegen_env);
+        emit_record_call_target_sample(fb, counter_id, callee_id, emit_ctx);
+    }
+    emit_typed_positional_call_result_with_arg_refs(
+        fb,
+        callable,
+        callable_is_borrowed,
+        arg_refs,
+        local_env,
+        emit_ctx,
+        demand,
+        codegen_env,
+        func_imports,
+    )
+}
+
+fn typed_getattr_parts(expr: &InstrTyped) -> Option<(&InstrTyped, &InstrTyped)> {
+    match expr {
+        InstrTyped::GetAttrTyped(getattr) => Some((getattr.value.as_ref(), getattr.attr.as_ref())),
+        InstrTyped::LegacyGetAttr(getattr) => Some((getattr.value.as_ref(), getattr.attr.as_ref())),
+        _ => None,
+    }
+}
+
 fn emit_typed_codegen_guarded_callable_call_result_with_local_env(
     fb: &mut FunctionBuilder<'_>,
     call: &TypedGuardedCallableCall<InstrTyped>,
@@ -22359,10 +22435,37 @@ fn emit_typed_codegen_guarded_callable_call_result_with_local_env(
     codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<Option<EmitResult>, String> {
-    let typed_call = call.clone().into_typed_call();
-    emit_typed_codegen_call_result_with_local_env(
+    let arg_refs = typed_simple_positional_arg_refs(
+        call.args.as_slice(),
+        call.keywords.as_slice(),
+        "typed guarded callable call",
+    )?;
+    let constructor_specializations =
+        direct_constructor_specializations_from_typed_guards(call.constructor_guards.as_slice());
+    let direct_specializations =
+        direct_function_specializations_from_typed_guards(call.function_guards.as_slice());
+    if constructor_specializations.is_empty() && direct_specializations.is_empty() {
+        let result = emit_typed_generic_positional_call_result_with_local_env(
+            fb,
+            call.func.as_ref(),
+            arg_refs.as_slice(),
+            call.try_semantic_instr_id(),
+            local_env,
+            emit_ctx,
+            demand,
+            codegen_env,
+            func_imports,
+        )?;
+        return Ok(Some(result));
+    }
+
+    emit_typed_prepared_direct_callable_specialization_result_with_local_env(
         fb,
-        &typed_call,
+        call.func.as_ref(),
+        arg_refs.as_slice(),
+        call.try_semantic_instr_id(),
+        constructor_specializations.as_slice(),
+        direct_specializations.as_slice(),
         local_env,
         emit_ctx,
         demand,
@@ -22380,16 +22483,225 @@ fn emit_typed_codegen_guarded_method_call_result_with_local_env(
     codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<Option<EmitResult>, String> {
-    let typed_call = call.clone().into_typed_call();
-    emit_typed_codegen_call_result_with_local_env(
+    let arg_refs = typed_simple_positional_arg_refs(
+        call.args.as_slice(),
+        call.keywords.as_slice(),
+        "typed guarded method call",
+    )?;
+    let direct_method_specializations = direct_method_specializations_from_typed_guards(
+        call.method_guards.as_slice(),
+        call.method_name.as_str(),
+    );
+    if direct_method_specializations.is_empty() {
+        let result = emit_typed_generic_positional_call_result_with_local_env(
+            fb,
+            call.func.as_ref(),
+            arg_refs.as_slice(),
+            call.try_semantic_instr_id(),
+            local_env,
+            emit_ctx,
+            demand,
+            codegen_env,
+            func_imports,
+        )?;
+        return Ok(Some(result));
+    }
+
+    let Some((receiver_expr, attr_expr)) = typed_getattr_parts(call.func.as_ref()) else {
+        return Err("typed guarded method call requires a GetAttr call target".to_string());
+    };
+    let site_instr_id = call.try_semantic_instr_id();
+    let call_target_counter = site_instr_id
+        .and_then(|site_instr_id| emit_ctx.call_target_counter_ids.get(&site_instr_id))
+        .copied();
+    let direct_hit_counter_id = site_instr_id
+        .and_then(|site_instr_id| emit_ctx.call_direct_hit_counter_ids.get(&site_instr_id))
+        .copied();
+    let direct_fallback_counter_id = site_instr_id
+        .and_then(|site_instr_id| {
+            emit_ctx
+                .call_direct_fallback_counter_ids
+                .get(&site_instr_id)
+        })
+        .copied();
+    let (receiver, receiver_is_borrowed) = emit_typed_pyobject_input_with_local_env(
         fb,
-        &typed_call,
+        receiver_expr,
         local_env,
         emit_ctx,
-        demand,
         codegen_env,
         func_imports,
-    )
+        "typed guarded-method receiver",
+    )?;
+
+    let ptr_ty = emit_ctx.consts.ptr_ty;
+    let null_ptr = fb.ins().iconst(ptr_ty, 0);
+    let result_block = fb.create_block();
+    fb.append_block_param(result_block, ptr_ty);
+    let generic_block = fb.create_block();
+    fb.set_cold_block(generic_block);
+    let method_guard_miss_dispatch = site_instr_id
+        .map(|site_instr_id| {
+            prepare_typed_guard_miss_dispatch_for_instr(
+                emit_ctx,
+                site_instr_id,
+                &[receiver_expr],
+                generic_block,
+            )
+        })
+        .unwrap_or(JitGuardMissDispatch::FallbackBlock(generic_block));
+    for (index, specialization) in direct_method_specializations.iter().enumerate() {
+        let Some(expected_type) =
+            emit_type_ptr_value_for_ref(fb, codegen_env, emit_ctx, &specialization.owner_type_ref)
+                .unwrap_or_else(|err| {
+                    panic!("failed to bind direct method type symbol: {err}");
+                })
+        else {
+            continue;
+        };
+        let direct_block = fb.create_block();
+        let miss_block = if index + 1 == direct_method_specializations.len() {
+            method_guard_miss_dispatch.branch_block()
+        } else {
+            fb.create_block()
+        };
+        let is_match =
+            emit_exact_type_version_match(fb, receiver, expected_type, specialization.type_version);
+        fb.ins().brif(is_match, direct_block, &[], miss_block, &[]);
+
+        fb.switch_to_block(direct_block);
+        let target_function = direct_call_target_function(emit_ctx, specialization.function_id)
+            .expect("direct method specialization target should exist");
+        if let Some(counter_id) = call_target_counter {
+            let callee_id = fb.ins().iconst(
+                emit_ctx.consts.i64_ty,
+                specialization.function_id.to_packed_runtime_u64() as i64,
+            );
+            emit_record_call_target_sample(fb, counter_id, callee_id, emit_ctx);
+        }
+        if let Some(counter_id) = direct_hit_counter_id {
+            let _ = emit_increment_counter(fb, counter_id, emit_ctx);
+        }
+        let direct_result = emit_typed_direct_method_resolved_with_args_from_local_env(
+            fb,
+            receiver,
+            receiver_is_borrowed,
+            arg_refs.as_slice(),
+            specialization,
+            target_function,
+            local_env,
+            emit_ctx,
+            codegen_env,
+            func_imports,
+        )?;
+        fb.ins()
+            .jump(result_block, &[ir::BlockArg::Value(direct_result)]);
+        if index + 1 != direct_method_specializations.len() {
+            fb.switch_to_block(miss_block);
+        }
+    }
+
+    match method_guard_miss_dispatch {
+        JitGuardMissDispatch::FallbackBlock(generic_block) => {
+            fb.switch_to_block(generic_block);
+            let (attr, attr_is_borrowed) = emit_typed_pyobject_input_with_local_env(
+                fb,
+                attr_expr,
+                local_env,
+                emit_ctx,
+                codegen_env,
+                func_imports,
+                "typed guarded-method attr fallback",
+            )?;
+            let getattr_inst = fb
+                .ins()
+                .call(emit_ctx.pyobject_getattr_ref, &[receiver, attr]);
+            let mut owned_inputs = Vec::with_capacity(2);
+            if !attr_is_borrowed {
+                owned_inputs.push(attr);
+            }
+            if !receiver_is_borrowed {
+                owned_inputs.push(receiver);
+            }
+            let callable = emit_decref_owned_inputs_after_nullable_result(
+                fb,
+                emit_ctx,
+                fb.inst_results(getattr_inst)[0],
+                &owned_inputs,
+            );
+            let callable_is_null = fb
+                .ins()
+                .icmp(ir::condcodes::IntCC::Equal, callable, null_ptr);
+            let callable_ok_block = fb.create_block();
+            fb.append_block_param(callable_ok_block, ptr_ty);
+            fb.ins().brif(
+                callable_is_null,
+                emit_ctx.consts.step_null_block,
+                &step_null_block_args(emit_ctx),
+                callable_ok_block,
+                &[ir::BlockArg::Value(callable)],
+            );
+            fb.switch_to_block(callable_ok_block);
+            let callable = fb.block_params(callable_ok_block)[0];
+            if let Some(counter_id) = call_target_counter {
+                let callee_id =
+                    emit_callee_function_id_checked(fb, callable, emit_ctx, codegen_env);
+                emit_record_call_target_sample(fb, counter_id, callee_id, emit_ctx);
+            }
+            if let Some(counter_id) = direct_fallback_counter_id {
+                let _ = emit_increment_counter(fb, counter_id, emit_ctx);
+            }
+            let generic_result = emit_typed_positional_call_result_with_arg_refs(
+                fb,
+                callable,
+                false,
+                arg_refs.as_slice(),
+                local_env,
+                emit_ctx,
+                ResultDemand::PYOBJECT_OWNED,
+                codegen_env,
+                func_imports,
+            )?;
+            let (generic_result, ownership, _) =
+                generic_result.expect_pyobject("typed guarded-method fallback result");
+            debug_assert!(ownership.is_owned());
+            fb.ins()
+                .jump(result_block, &[ir::BlockArg::Value(generic_result)]);
+        }
+        JitGuardMissDispatch::DeoptResume {
+            block,
+            target,
+            deopt_resume_ref,
+        } => {
+            fb.switch_to_block(block);
+            fb.set_cold_block(block);
+            if let Some(counter_id) = direct_fallback_counter_id {
+                let _ = emit_increment_counter(fb, counter_id, emit_ctx);
+            }
+            if !receiver_is_borrowed {
+                emit_release_owned_inputs(fb, emit_ctx, &[receiver]);
+            }
+            let deopt_result = emit_deopt_resume_call_with_local_env(
+                fb,
+                target,
+                deopt_resume_ref,
+                emit_ctx.consts.block_const,
+                emit_ctx,
+                local_env,
+            );
+            emit_deopt_result_return_or_step_null(fb, emit_ctx, deopt_result);
+        }
+    }
+
+    fb.switch_to_block(result_block);
+    let result = fb.block_params(result_block)[0];
+    Ok(Some(emit_owned_pyobject_result_for_demand(
+        fb,
+        result,
+        PyObjFacts::unknown(),
+        emit_ctx,
+        demand,
+    )))
 }
 
 fn emit_typed_codegen_direct_callable_call_result_with_local_env(

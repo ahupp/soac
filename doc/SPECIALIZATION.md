@@ -585,9 +585,11 @@ JIT emitter still materializes the full guarded call blocks today.
   method name, owner/type-version guard, and direct-entry argument plan. A
   follow-up typed lowering pass then turns that call into
   `InstrTyped::GuardedMethodCallTyped`, so later BlockPy/JIT stages can see an
-  explicit guarded-method operation rather than rediscovering it in codegen.
-  This is intentionally available without a live Python resolver when profile
-  replay supplies predeclared owner-attribute metadata.
+  explicit guarded-method operation rather than rediscovering it in codegen. The
+  JIT emitter consumes this prepared guarded-method payload directly; it does not
+  rebuild a guarded method access plan from legacy profile evidence. This is
+  intentionally available without a live Python resolver when profile replay
+  supplies predeclared owner-attribute metadata.
 - Runtime protocol calls can also select a guarded method fast path when the
   protocol call's receiver is itself a profiled constructor result. The first
   supported case is `iter(receiver)`: profile replay uses the constructor
@@ -608,8 +610,11 @@ JIT emitter still materializes the full guarded call blocks today.
   `InstrTyped::DirectCallableCallTyped`. They carry the callable expression,
   explicit positional args, and either a selected function guard or a selected
   constructor owner/type-version guard. The current JIT can emit this node
-  directly; the next step is to have guarded-call expansion create it in the
-  guarded success arm.
+  directly, and guarded callable-call emission now consumes prepared
+  `InstrTyped::GuardedCallableCallTyped` payloads directly instead of converting
+  them back into typed call access plans. The next step is to expand guarded-call
+  typed nodes into explicit guard, direct-call, and fallback CFG blocks before
+  final JIT emission.
 - Typed call access plans are validated before specialized JIT emission, and
   typed calls use the selected plan as the source of truth. If annotation leaves
   a typed call as generic/profiled-only, codegen does not rediscover a guarded
