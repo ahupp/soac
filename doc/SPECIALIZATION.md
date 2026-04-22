@@ -518,12 +518,15 @@ JIT emitter still materializes the full guarded call blocks today.
   later in typed-call lowering, not by this store-call rewrite.
 - In apply/verify mode, JIT module planning clones the lowered codegen module,
   applies this rewrite from either explicit legacy call-target evidence or v3
-  mechanical ordinary direct-call emissions, runs the normal BlockPy direct-call inliner
-  / scalar-replacement cleanup on the rewritten CFG, then recomputes value
-  facts, LocalEnv planning, refcount ownership, and deopt resume planning from
-  the rewritten module. Codegen and runtime deopt tables therefore see the same
-  CFG. V3 ordinary direct-call emissions are consumed directly as rewrite inputs
-  rather than being converted back into legacy `FunctionProfileEvidence`.
+  mechanical ordinary direct-call emissions, runs the normal BlockPy
+  direct-call inliner / scalar-replacement cleanup on the rewritten CFG, then
+  recomputes value facts, LocalEnv planning, refcount ownership, and deopt
+  resume planning from the rewritten module. Codegen and runtime deopt tables
+  therefore see the same CFG. V3 ordinary direct-call emissions are consumed
+  directly as rewrite inputs rather than being converted back into legacy
+  `FunctionProfileEvidence`, including functions that also have unrelated
+  source-keyed v3 decisions. V3 exact-int branch artifacts remain excluded from
+  this early rewrite until those CFG rewrites are composed in one planner stage.
 - JIT codegen has a direct boolean lowering for `IfTerm` tests that are
   `DirectFunctionIdGuardTest`, so the guard does not round-trip through Python
   truthiness. The deopt interpreter also supports the guard expression for
@@ -612,9 +615,10 @@ JIT emitter still materializes the full guarded call blocks today.
   constructor owner/type-version guard. The current JIT can emit this node
   directly, and guarded callable-call emission now consumes prepared
   `InstrTyped::GuardedCallableCallTyped` payloads directly instead of converting
-  them back into typed call access plans. The next step is to expand guarded-call
-  typed nodes into explicit guard, direct-call, and fallback CFG blocks before
-  final JIT emission.
+  them back into typed call access plans. Ordinary v3 direct-call store sites
+  are expanded in the profiled BlockPy module plan. The next step is to expand
+  remaining guarded method/constructor typed nodes into explicit guard,
+  direct-call, and fallback CFG blocks before final JIT emission.
 - Typed call access plans are validated before specialized JIT emission, and
   typed calls use the selected plan as the source of truth. If annotation leaves
   a typed call as generic/profiled-only, codegen does not rediscover a guarded

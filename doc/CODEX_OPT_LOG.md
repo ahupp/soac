@@ -1116,3 +1116,21 @@ benchmarked throughput delta, and the headline pre/post numbers.
   - specialized pass, 1M loops x3: `171222`, `168987`, `159633 loops/s`
   - no-refcount diagnostic, 1M loops x3: `178648`, `179869`, `181974 loops/s`
   - pystone JIT code bytes: `56776`
+
+## 2026-04-22 - Move v3 direct-call rewrites before typed lowering
+
+- jj change id: `xqnzznpu`
+- summary: v3 ordinary direct-call store rewrites now run in the profiled
+  BlockPy module plan even when the function also has unrelated source-keyed v3
+  decisions. Direct-call emissions consumed by that rewrite are filtered out of
+  late typed JIT lowering so the selected static plan is not replayed twice.
+- throughput: `+1.38%` specialized pystone median; no-refcount diagnostic
+  `-0.60%`; code size unchanged
+- pre-change benchmark:
+  - specialized pass, 1M loops x3: `95238`, `93548`, `95157 loops/s`
+  - no-refcount diagnostic, 1M loops x3: `171801`, `168587`, `172543 loops/s`
+  - pystone JIT code bytes: `64879`
+- post-change benchmark:
+  - specialized pass, 1M loops x3: `95367`, `96469`, `96669 loops/s`
+  - no-refcount diagnostic, 1M loops x3: `172970`, `170712`, `170764 loops/s`
+  - pystone JIT code bytes: `64879`

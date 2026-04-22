@@ -23293,7 +23293,7 @@ def f(x, y):
     }
 
     #[test]
-    fn source_keyed_v3_emissions_keep_profiled_module_shape_unrewritten() {
+    fn source_keyed_v3_emissions_still_allow_plan_level_direct_call_rewrite() {
         let module_name = "v3_source_keyed_shape_test";
         let module_name_gen = ModuleNameGen::new(0);
         let mut callee_function = test_function_in_module(&module_name_gen, "callee");
@@ -23399,14 +23399,14 @@ def f(x, y):
             .expect("planned module should keep caller");
 
         assert!(
-            !planned_caller.blocks.iter().any(|block| {
+            planned_caller.blocks.iter().any(|block| {
                 matches!(
                     &block.term,
                     BlockTerm::IfTerm(term)
                         if matches!(term.test, InstrCodegen::DirectFunctionIdGuardTest(_))
                 )
             }),
-            "source-keyed v3 emissions must be consumed against the original BlockPy shape"
+            "source-keyed v3 emissions should not block plan-level v3 direct-call CFG expansion"
         );
         assert!(
             planned_caller
@@ -23414,7 +23414,16 @@ def f(x, y):
                 .iter()
                 .flat_map(|block| &block.body)
                 .any(|instr| matches!(instr, InstrCodegen::Store(store) if matches!(store.value.as_ref(), InstrCodegen::Call(_)))),
-            "source-keyed v3 emissions should keep the original call store for typed lowering"
+            "fallback arm should retain a generic call for the original Python semantics"
+        );
+        let specialization_inputs =
+            FunctionSpecializationInputs::from_profile(&profile, planned_caller)
+                .expect("planned profile inputs should filter consumed v3 direct calls");
+        assert!(
+            specialization_inputs
+                .opt_v3_direct_calls_by_instr
+                .is_empty(),
+            "v3 direct calls consumed by the profiled module plan should not reach typed JIT lowering"
         );
     }
 

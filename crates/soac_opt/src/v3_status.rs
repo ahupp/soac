@@ -32,7 +32,7 @@ pub const V3_OPTIMIZATION_FAMILY_STATUS: &[V3OptimizationFamilyStatus] = &[
         family: "profiled direct calls, guarded receiver-method calls, and guarded constructor calls",
         legacy_input: "call_hot_targets",
         status: V3MigrationStatus::LiveCodegenInputOnly,
-        next_step: "expand guarded-call typed nodes into explicit guard, direct-call, and fallback CFG blocks before JIT emission",
+        next_step: "move remaining method/constructor guarded-call CFG expansion before final JIT emission",
     },
     V3OptimizationFamilyStatus {
         family: "exact-list getitem and setitem",

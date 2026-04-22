@@ -2080,8 +2080,13 @@ fn build_profiled_jit_module_plan(
         } else {
             profile.call_target_specializations(function.function_id)?
         };
-        let direct_call_rewrite_targets = if has_source_keyed_v3_emissions {
+        let direct_call_rewrite_targets = if profile
+            .opt_v3_exact_int_branch_artifacts
+            .contains_key(&function.function_id)
+        {
             HashMap::new()
+        } else if has_source_keyed_v3_emissions {
+            profile.v3_direct_function_call_targets(function.function_id)
         } else {
             profile.direct_call_rewrite_targets(function.function_id)?
         };
@@ -13274,6 +13279,30 @@ fn collect_call_direct_targets(
     out
 }
 
+fn collect_generic_call_instr_ids(
+    function: &BlockPyFunction<CodegenModuleShape>,
+) -> HashSet<InstrId> {
+    struct GenericCallInstrIdCollector<'a> {
+        out: &'a mut HashSet<InstrId>,
+    }
+
+    impl Visit<InstrCodegen> for GenericCallInstrIdCollector<'_> {
+        fn visit_instr(&mut self, expr: &InstrCodegen) {
+            if let InstrCodegen::Call(call) = expr
+                && let Some(instr_id) = call.try_semantic_instr_id()
+            {
+                self.out.insert(instr_id);
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    let mut out = HashSet::new();
+    let mut collector = GenericCallInstrIdCollector { out: &mut out };
+    collector.visit_fn(function);
+    out
+}
+
 fn codegen_expr_const_i64(
     expr: &InstrCodegen,
     module_constants: &ModuleCodegenConstants,
@@ -15180,10 +15209,14 @@ impl FunctionSpecializationInputs {
             field_index_specializations_by_instr,
             opt_v3_indexed_fields_by_instr,
         ) = profile.field_index_specialization_maps(function.function_id)?;
+        let generic_call_sources = collect_generic_call_instr_ids(function);
+        let mut opt_v3_direct_calls_by_instr =
+            profile.codegen_opt_v3_direct_calls(function.function_id);
+        opt_v3_direct_calls_by_instr.retain(|source, _| generic_call_sources.contains(source));
         Ok(Self {
             call_target_specializations: profile
                 .call_target_specializations(function.function_id)?,
-            opt_v3_direct_calls_by_instr: profile.codegen_opt_v3_direct_calls(function.function_id),
+            opt_v3_direct_calls_by_instr,
             opt_v3_constructor_calls_by_instr: profile
                 .codegen_opt_v3_constructor_calls(function.function_id)?,
             opt_v3_method_calls_by_instr: profile
