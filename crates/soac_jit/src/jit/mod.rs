@@ -15157,6 +15157,40 @@ impl FunctionSpecializationInputs {
     }
 }
 
+fn v3_call_emission_sources(
+    direct_calls_by_instr: &HashMap<InstrId, Vec<OptV3DirectCallPlan>>,
+    constructor_calls_by_instr: &HashMap<InstrId, Vec<OptV3ConstructorCallPlan>>,
+    method_calls_by_instr: &HashMap<InstrId, Vec<OptV3MethodCallPlan>>,
+) -> HashSet<InstrId> {
+    direct_calls_by_instr
+        .keys()
+        .chain(constructor_calls_by_instr.keys())
+        .chain(method_calls_by_instr.keys())
+        .copied()
+        .collect()
+}
+
+fn legacy_call_targets_excluding_v3_call_sources(
+    call_target_specializations: &HashMap<InstrId, Vec<RuntimeFunctionId>>,
+    direct_calls_by_instr: &HashMap<InstrId, Vec<OptV3DirectCallPlan>>,
+    constructor_calls_by_instr: &HashMap<InstrId, Vec<OptV3ConstructorCallPlan>>,
+    method_calls_by_instr: &HashMap<InstrId, Vec<OptV3MethodCallPlan>>,
+) -> HashMap<InstrId, Vec<RuntimeFunctionId>> {
+    let v3_sources = v3_call_emission_sources(
+        direct_calls_by_instr,
+        constructor_calls_by_instr,
+        method_calls_by_instr,
+    );
+    if v3_sources.is_empty() {
+        return call_target_specializations.clone();
+    }
+    call_target_specializations
+        .iter()
+        .filter(|(source, _targets)| !v3_sources.contains(source))
+        .map(|(source, targets)| (*source, targets.clone()))
+        .collect()
+}
+
 impl<'a> SpecializationProfile<'a> {
     fn from_runtime_state_with_session(
         shared_state: Option<&'a SharedModuleState>,
@@ -29852,13 +29886,14 @@ fn validate_typed_function_preserves_codegen_cfg(
 fn lower_opt_v3_direct_call_emissions(
     function: &mut BlockPyFunction<TypedCodegenModuleShape>,
     direct_calls_by_instr: &HashMap<InstrId, Vec<OptV3DirectCallPlan>>,
-) -> usize {
+) -> Result<usize, String> {
     if direct_calls_by_instr.is_empty() {
-        return 0;
+        return Ok(0);
     }
 
     struct Rewriter<'a> {
         direct_calls_by_instr: &'a HashMap<InstrId, Vec<OptV3DirectCallPlan>>,
+        seen_sources: HashSet<InstrId>,
         count: usize,
     }
 
@@ -29874,6 +29909,7 @@ fn lower_opt_v3_direct_call_emissions(
             let Some(direct_calls) = self.direct_calls_by_instr.get(&instr_id) else {
                 return;
             };
+            self.seen_sources.insert(instr_id);
             if direct_calls.is_empty() {
                 return;
             }
@@ -29899,10 +29935,20 @@ fn lower_opt_v3_direct_call_emissions(
 
     let mut rewriter = Rewriter {
         direct_calls_by_instr,
+        seen_sources: HashSet::new(),
         count: 0,
     };
     rewriter.visit_fn_mut(function);
-    rewriter.count
+    if let Some(source) = direct_calls_by_instr
+        .keys()
+        .find(|source| !rewriter.seen_sources.contains(source))
+    {
+        return Err(format!(
+            "optimizer v3 emitted direct-call at {}, but lowered function has no matching call",
+            source
+        ));
+    }
+    Ok(rewriter.count)
 }
 
 fn opt_v3_constructor_call_guard_from_plan(
@@ -30230,7 +30276,7 @@ fn prepare_specialized_typed_function(
         opt_v3_indexed_fields_by_instr,
         specialize_field_stores,
     )?;
-    lower_opt_v3_direct_call_emissions(&mut typed_function, opt_v3_direct_calls_by_instr);
+    lower_opt_v3_direct_call_emissions(&mut typed_function, opt_v3_direct_calls_by_instr)?;
     lower_opt_v3_constructor_call_emissions(
         &mut typed_function,
         opt_v3_constructor_calls_by_instr,
@@ -30545,8 +30591,14 @@ fn build_cranelift_run_bb_specialized_function(
     let none_constant_id = module_constants.require_runtime_name_constant_id("NONE");
     let empty_tuple_constant_id = module_constants.require_runtime_name_constant_id("EMPTY_TUPLE");
 
+    let legacy_call_targets_for_codegen = legacy_call_targets_excluding_v3_call_sources(
+        &call_target_specializations,
+        &opt_v3_direct_calls_by_instr,
+        &opt_v3_constructor_calls_by_instr,
+        &opt_v3_method_calls_by_instr,
+    );
     let mut direct_call_targets = collect_call_direct_targets(function);
-    for targets in call_target_specializations.values() {
+    for targets in legacy_call_targets_for_codegen.values() {
         direct_call_targets.extend(targets.iter().copied());
     }
     extend_direct_call_targets_from_v3_direct_calls(
@@ -30565,7 +30617,7 @@ fn build_cranelift_run_bb_specialized_function(
         function,
         module_constants,
         options.direct_owner_attr_specializations.as_ref(),
-        &call_target_specializations,
+        &legacy_call_targets_for_codegen,
     ));
     let empty_direct_functions = HashMap::new();
     let direct_call_functions = predeclared_direct_functions.unwrap_or(&empty_direct_functions);
@@ -30607,7 +30659,7 @@ fn build_cranelift_run_bb_specialized_function(
         &opt_v3_indexed_fields_by_instr,
         behavior_change_indexed_stores,
         &call_specialization_ctx,
-        &call_target_specializations,
+        &legacy_call_targets_for_codegen,
         &opt_v3_direct_calls_by_instr,
         &opt_v3_constructor_calls_by_instr,
         &opt_v3_method_calls_by_instr,
@@ -31704,8 +31756,14 @@ pub unsafe fn render_instr_typed_for_codegen_with_runtime_state(
     } else {
         ModuleCodegenConstants::collect_from_module(render_module)
     };
+    let legacy_call_targets_for_codegen = legacy_call_targets_excluding_v3_call_sources(
+        &specialization_inputs.call_target_specializations,
+        &specialization_inputs.opt_v3_direct_calls_by_instr,
+        &specialization_inputs.opt_v3_constructor_calls_by_instr,
+        &specialization_inputs.opt_v3_method_calls_by_instr,
+    );
     let mut direct_call_targets = collect_call_direct_targets(render_function);
-    for targets in specialization_inputs.call_target_specializations.values() {
+    for targets in legacy_call_targets_for_codegen.values() {
         direct_call_targets.extend(targets.iter().copied());
     }
     extend_direct_call_targets_from_v3_direct_calls(
@@ -31724,7 +31782,7 @@ pub unsafe fn render_instr_typed_for_codegen_with_runtime_state(
         render_function,
         &render_module_constants,
         Some(&direct_owner_attr_specializations),
-        &specialization_inputs.call_target_specializations,
+        &legacy_call_targets_for_codegen,
     ));
     let mut direct_call_target_functions = HashMap::new();
     for function_id in direct_call_targets {
@@ -31764,7 +31822,7 @@ pub unsafe fn render_instr_typed_for_codegen_with_runtime_state(
         &specialization_inputs.opt_v3_indexed_fields_by_instr,
         specialization_inputs.behavior_change_indexed_stores,
         &call_specialization_ctx,
-        &specialization_inputs.call_target_specializations,
+        &legacy_call_targets_for_codegen,
         &specialization_inputs.opt_v3_direct_calls_by_instr,
         &specialization_inputs.opt_v3_constructor_calls_by_instr,
         &specialization_inputs.opt_v3_method_calls_by_instr,

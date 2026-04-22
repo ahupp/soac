@@ -4088,7 +4088,8 @@ def build(values):
             lower_opt_v3_direct_call_emissions(
                 &mut typed_function,
                 &HashMap::from([(call_instr_id, vec![direct_call_plan])]),
-            ),
+            )
+            .expect("v3 direct-call emission should lower"),
             1
         );
 
@@ -4103,6 +4104,114 @@ def build(values):
         assert_eq!(
             call.function_guards[0].arg_plan.sources,
             vec![TypedDirectCallArgSource::Provided(0)]
+        );
+    }
+
+    #[test]
+    fn opt_v3_direct_call_emission_rejects_unmatched_source() {
+        let mut constants = TestConstantPool::default();
+        let call_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
+        let missing_source = InstrId::new(BlockLabel::from_index(7), 11);
+        let target = RuntimeFunctionId::from_raw_parts(0, 7);
+        let call = with_instr_id(
+            op_expr(Call::new(
+                name_expr(test_runtime_name("callable")),
+                vec![CallArgPositional::Positional(constants.int_expr(1))],
+                Vec::<CallArgKeyword<InstrCodegen>>::new(),
+            )),
+            call_instr_id,
+        );
+        let function =
+            with_single_test_block(test_function(), vec![call], ret_term(constants.int_expr(2)));
+        let mut typed_function = lower_codegen_function_to_typed(function);
+        let direct_call_plan = OptV3DirectCallPlan {
+            source: missing_source,
+            target,
+            arg_plan: TypedDirectCallArgPlan {
+                sources: vec![TypedDirectCallArgSource::Provided(0)],
+            },
+            reason: "profiled direct call".to_string(),
+        };
+
+        let err = lower_opt_v3_direct_call_emissions(
+            &mut typed_function,
+            &HashMap::from([(missing_source, vec![direct_call_plan])]),
+        )
+        .expect_err("unmatched v3 direct-call source should be rejected");
+
+        assert!(
+            err.contains("optimizer v3 emitted direct-call")
+                && err.contains("lowered function has no matching call"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn legacy_call_targets_for_codegen_exclude_v3_call_sources() {
+        let legacy_source = InstrId::new(BlockLabel::from_index(0), 1);
+        let direct_source = InstrId::new(BlockLabel::from_index(0), 2);
+        let constructor_source = InstrId::new(BlockLabel::from_index(0), 3);
+        let method_source = InstrId::new(BlockLabel::from_index(0), 4);
+        let legacy_target = RuntimeFunctionId::from_raw_parts(0, 11);
+        let direct_target = RuntimeFunctionId::from_raw_parts(0, 12);
+        let constructor_target = RuntimeFunctionId::from_raw_parts(0, 13);
+        let method_target = RuntimeFunctionId::from_raw_parts(0, 14);
+        let arg_plan = TypedDirectCallArgPlan {
+            sources: vec![TypedDirectCallArgSource::Provided(0)],
+        };
+
+        let filtered = legacy_call_targets_excluding_v3_call_sources(
+            &HashMap::from([
+                (legacy_source, vec![legacy_target]),
+                (direct_source, vec![legacy_target]),
+                (constructor_source, vec![legacy_target]),
+                (method_source, vec![legacy_target]),
+            ]),
+            &HashMap::from([(
+                direct_source,
+                vec![OptV3DirectCallPlan {
+                    source: direct_source,
+                    target: direct_target,
+                    arg_plan: arg_plan.clone(),
+                    reason: "profiled direct call".to_string(),
+                }],
+            )]),
+            &HashMap::from([(
+                constructor_source,
+                vec![OptV3ConstructorCallPlan {
+                    source: constructor_source,
+                    target: constructor_target,
+                    owner_type: PlanV3ConstructorCallOwnerType {
+                        module_name: "test".to_string(),
+                        qualname: "Box".to_string(),
+                    },
+                    arg_plan: arg_plan.clone(),
+                    guard: PlanV3ConstructorCallGuardKind::ExactCallableTypeVersion,
+                    fallback: PlanV3ConstructorCallFallbackKind::OriginalConstructorCall,
+                    reason: "profiled constructor call".to_string(),
+                }],
+            )]),
+            &HashMap::from([(
+                method_source,
+                vec![OptV3MethodCallPlan {
+                    source: method_source,
+                    target: method_target,
+                    method_name: "get".to_string(),
+                    owner_type: PlanV3MethodCallOwnerType {
+                        module_name: "test".to_string(),
+                        qualname: "Box".to_string(),
+                    },
+                    arg_plan,
+                    guard: PlanV3MethodCallGuardKind::ExactReceiverTypeVersion,
+                    fallback: PlanV3MethodCallFallbackKind::OriginalMethodCall,
+                    reason: "profiled method call".to_string(),
+                }],
+            )]),
+        );
+
+        assert_eq!(
+            filtered,
+            HashMap::from([(legacy_source, vec![legacy_target])])
         );
     }
 

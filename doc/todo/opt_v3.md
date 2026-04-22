@@ -119,7 +119,12 @@ Implemented:
   the emitted call plan through mechanical typed-call lowering and uses its
   targets only for direct-call function predeclaration, module-plan direct-call
   rewrites, precompile target lookup, and process-JIT batch scheduling, not as
-  legacy profile evidence.
+  legacy profile evidence. When a call source has an emitted v3 direct,
+  constructor, or method call node, JIT preparation also filters that source
+  out of the legacy call-target map before typed-call annotation and
+  runtime-protocol collection, so overlapping legacy evidence cannot reselect
+  a different call shape. Direct-call emission rejects a selected source that
+  is absent from the lowered typed function.
   Method-call decisions are also derived from mechanical `mod.optv3` emission
   as v3-owned codegen inputs. They carry owner type, method name, receiver
   type-version guard kind, original-call fallback kind, and an argument plan
