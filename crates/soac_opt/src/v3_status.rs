@@ -33,8 +33,8 @@ pub const V3_OPTIMIZATION_FAMILY_STATUS: &[V3OptimizationFamilyStatus] = &[
         legacy_input: "call_hot_targets",
         status: V3MigrationStatus::LiveCodegenInputOnly,
         next_step: concat!(
-            "move remaining inline eligibility facts and argument-bearing method/constructor ",
-            "guarded-call CFG expansion before final JIT emission"
+            "move constructor/runtime-iter inline eligibility facts and argument-bearing ",
+            "method/constructor guarded-call CFG expansion before final JIT emission"
         ),
     },
     V3OptimizationFamilyStatus {

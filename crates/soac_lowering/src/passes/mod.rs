@@ -2702,10 +2702,11 @@ pub use inline_sites::{
 };
 pub use inline_transform::{
     bind_simple_direct_call_inline_args, bind_simple_direct_method_inline_args,
+    build_cross_module_direct_call_inline_fragment_to_target,
     build_cross_module_direct_method_inline_fragment_to_target,
-    build_direct_method_inline_fragment_to_target, build_single_block_inline_fragment,
-    build_single_block_inline_fragment_to_target, build_single_block_inline_fragment_with_bindings,
-    inline_and_scalar_replace_until_fixed_point,
+    build_direct_call_inline_fragment_to_target, build_direct_method_inline_fragment_to_target,
+    build_single_block_inline_fragment, build_single_block_inline_fragment_to_target,
+    build_single_block_inline_fragment_with_bindings, inline_and_scalar_replace_until_fixed_point,
     inline_and_scalar_replace_with_callees_until_fixed_point,
     inline_direct_call_stores_with_callees, inline_simple_direct_call_stores,
     rewrite_static_runtime_constructor_call_stores,

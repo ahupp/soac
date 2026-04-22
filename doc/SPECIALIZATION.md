@@ -24,12 +24,14 @@ call decisions with validated argument plans and serialized target module
 identities. Call plans also carry the selected call-body policy:
 `DirectCall` for guarded direct-call lowering, or `Inline` when the offline
 planner selected the early BlockPy inline path as the lower-cost body
-alternative. Method-call plans additionally carry the method name, owner type,
-receiver type-version guard kind, and original-call fallback kind. JIT
-validation checks those emitted decisions against the selected plan before
-deriving mechanical typed-call lowering input, filtering early inline rewrite
-inputs by the selected body policy, and resolving current-module or
-cross-module direct-call targets from the loaded module set.
+alternative. For ordinary direct-call and receiver-method plans, `Inline`
+selection also validates that the BlockPy inline-fragment builder can construct
+the selected body from the cached target module. Method-call plans additionally
+carry the method name, owner type, receiver type-version guard kind, and
+original-call fallback kind. JIT validation checks those emitted decisions
+against the selected plan before deriving mechanical typed-call lowering input,
+filtering early inline rewrite inputs by the selected body policy, and resolving
+current-module or cross-module direct-call targets from the loaded module set.
 If a method or constructor owner type/attribute guard cannot be resolved in the
 current compile context, specialization-input preparation keeps a guardless
 v3-owned source. That source stays out of legacy call-target evidence and the
@@ -630,12 +632,14 @@ JIT emitter still materializes the full guarded call blocks today.
   directly, and guarded callable-call emission now consumes prepared
   `InstrTyped::GuardedCallableCallTyped` payloads directly instead of converting
   them back into typed call access plans. Ordinary v3 direct-call store sites
-  and eligible no-argument v3 method/runtime-iter sites are expanded in the
-  profiled BlockPy module plan only when the v3 plan selected `Inline` as the
-  call-body policy. The next step is to make inline eligibility itself richer in
-  the offline request facts and to expand remaining guarded method/constructor
-  typed nodes into explicit guard, direct-call, and fallback CFG blocks before
-  final JIT emission.
+  and eligible receiver-method sites are expanded in the profiled BlockPy
+  module plan only when the v3 plan selected `Inline` as the call-body policy
+  after validating inline-fragment buildability. Runtime-iter constructor sites
+  still use the existing constructor inline-summary filter. The next step is to
+  make constructor/runtime-iter inline eligibility explicit in offline request
+  facts and to expand remaining guarded method/constructor typed nodes into
+  explicit guard, direct-call, and fallback CFG blocks before final JIT
+  emission.
 - Typed call access plans are validated before specialized JIT emission, and
   typed calls use the selected plan as the source of truth. If annotation leaves
   a typed call as generic/profiled-only, codegen does not rediscover a guarded
