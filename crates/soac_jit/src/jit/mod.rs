@@ -14974,9 +14974,11 @@ fn planned_optimization_inputs_from_v3_artifacts(
                 .opt_v3_emitted_exact_list_items
                 .insert(current_function_id, items);
         }
-        if let Some(indexed_fields) =
-            opt_v3_emitted_indexed_fields_for_function(&function_artifacts)
-        {
+        if let Some(indexed_fields) = opt_v3_emitted_indexed_fields_for_function(
+            &function_artifacts,
+            &shared_state.lowered_module,
+            current_function,
+        )? {
             inputs
                 .opt_v3_emitted_indexed_fields
                 .insert(current_function_id, indexed_fields);
@@ -15087,9 +15089,11 @@ fn planned_optimization_inputs_from_v3_artifacts_for_codegen_module(
                 .opt_v3_emitted_exact_list_items
                 .insert(current_function_id, items);
         }
-        if let Some(indexed_fields) =
-            opt_v3_emitted_indexed_fields_for_function(&function_artifacts)
-        {
+        if let Some(indexed_fields) = opt_v3_emitted_indexed_fields_for_function(
+            &function_artifacts,
+            module,
+            current_function,
+        )? {
             inputs
                 .opt_v3_emitted_indexed_fields
                 .insert(current_function_id, indexed_fields);
@@ -15110,21 +15114,29 @@ fn planned_optimization_inputs_from_v3_artifacts_for_codegen_module(
 
 fn opt_v3_emitted_indexed_fields_for_function(
     artifacts: &ExactIntBranchV3Artifacts,
-) -> Option<HashMap<InstrId, Vec<OptV3IndexedFieldAccessPlan>>> {
+    module: &BlockPyModule<CodegenModuleShape>,
+    function: &BlockPyFunction<CodegenModuleShape>,
+) -> Result<Option<HashMap<InstrId, Vec<OptV3IndexedFieldAccessPlan>>>, String> {
     let emitted_function = &artifacts.emission.functions[0];
     if emitted_function.indexed_fields.is_empty() {
-        return None;
+        return Ok(None);
     }
 
+    let lowered_accesses = lowered_field_accesses_by_instr(module, function)?;
     let mut by_source = HashMap::<InstrId, Vec<OptV3IndexedFieldAccessPlan>>::new();
     for indexed_field in &emitted_function.indexed_fields {
+        validate_opt_v3_indexed_field_emission_for_lowered_function(
+            indexed_field,
+            function,
+            &lowered_accesses,
+        )?;
         let access = opt_v3_indexed_field_access_plan_from_emission(indexed_field);
         let entry = by_source.entry(indexed_field.source).or_default();
         if !entry.contains(&access) {
             entry.push(access);
         }
     }
-    Some(by_source)
+    Ok(Some(by_source))
 }
 
 fn opt_v3_indexed_field_access_plan_from_emission(
@@ -15136,6 +15148,117 @@ fn opt_v3_indexed_field_access_plan_from_emission(
         attr_name: indexed_field.attr_name.clone(),
         expected_index: indexed_field.expected_index,
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LoweredFieldAccess {
+    access: PlanV3IndexedFieldAccessKind,
+    attr_name: String,
+}
+
+fn lowered_field_accesses_by_instr(
+    module: &BlockPyModule<CodegenModuleShape>,
+    function: &BlockPyFunction<CodegenModuleShape>,
+) -> Result<HashMap<InstrId, LoweredFieldAccess>, String> {
+    struct Collector<'a> {
+        module: &'a BlockPyModule<CodegenModuleShape>,
+        accesses: HashMap<InstrId, LoweredFieldAccess>,
+        error: Option<String>,
+    }
+
+    impl Collector<'_> {
+        fn attr_name_for_source(&mut self, source: InstrId, attr: &InstrCodegen) -> Option<String> {
+            match codegen_constant_string_value(self.module, attr) {
+                Some(attr_name) => Some(attr_name.to_string()),
+                None => {
+                    self.error = Some(format!(
+                        "optimizer v3 indexed-field source {source} expected constant attribute, but lowered attr is not a module string constant"
+                    ));
+                    None
+                }
+            }
+        }
+    }
+
+    impl Visit<InstrCodegen> for Collector<'_> {
+        fn visit_instr(&mut self, expr: &InstrCodegen)
+        where
+            InstrCodegen: ChildVisitable<InstrCodegen>,
+        {
+            if self.error.is_some() {
+                return;
+            }
+            match expr {
+                InstrCodegen::GetAttr(op) => {
+                    let source = op.semantic_instr_id();
+                    if let Some(attr_name) = self.attr_name_for_source(source, op.attr.as_ref()) {
+                        self.accesses.insert(
+                            source,
+                            LoweredFieldAccess {
+                                access: PlanV3IndexedFieldAccessKind::Load,
+                                attr_name,
+                            },
+                        );
+                    }
+                }
+                InstrCodegen::SetAttr(op) => {
+                    let source = op.semantic_instr_id();
+                    if let Some(attr_name) = self.attr_name_for_source(source, op.attr.as_ref()) {
+                        self.accesses.insert(
+                            source,
+                            LoweredFieldAccess {
+                                access: PlanV3IndexedFieldAccessKind::Store,
+                                attr_name,
+                            },
+                        );
+                    }
+                }
+                _ => {}
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    let mut collector = Collector {
+        module,
+        accesses: HashMap::new(),
+        error: None,
+    };
+    collector.visit_fn(function);
+    if let Some(error) = collector.error {
+        return Err(error);
+    }
+    Ok(collector.accesses)
+}
+
+fn validate_opt_v3_indexed_field_emission_for_lowered_function(
+    emitted: &MechanicalIndexedFieldEmission,
+    function: &BlockPyFunction<CodegenModuleShape>,
+    lowered_accesses: &HashMap<InstrId, LoweredFieldAccess>,
+) -> Result<(), String> {
+    let Some(lowered) = lowered_accesses.get(&emitted.source) else {
+        return Err(format!(
+            "optimizer v3 emitted indexed-field {:?} {} at {}, but function {} ({}) has no lowered GetAttr/SetAttr with that source",
+            emitted.access,
+            emitted.attr_name,
+            emitted.source,
+            function.function_id,
+            function.names.qualname
+        ));
+    };
+    if lowered.access != emitted.access {
+        return Err(format!(
+            "optimizer v3 emitted indexed-field {:?} for {}, but lowered instruction is {:?}",
+            emitted.access, emitted.source, lowered.access
+        ));
+    }
+    if lowered.attr_name != emitted.attr_name {
+        return Err(format!(
+            "optimizer v3 emitted indexed-field attr {:?} for {}, but lowered instruction uses {:?}",
+            emitted.attr_name, emitted.source, lowered.attr_name
+        ));
+    }
+    Ok(())
 }
 
 fn opt_v3_emitted_exact_list_items_for_function(

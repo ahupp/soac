@@ -194,11 +194,11 @@ Partially migrated families are also intentionally visible:
 - indexed fields are represented as v3 plan selections plus mechanical
   indexed-field emissions. `soac_jit` now keeps the emitted access kind and
   attribute name separate from legacy per-instruction field evidence and
-  validates that they match the lowered `GetAttr`/`SetAttr` site before
-  annotating typed attribute lowering. By-attribute layout availability is
-  still shared with the existing constructor initializer fast path. The final
-  inline load/store emission still uses the existing typed attribute emitter
-  rather than a v3-specific operation node.
+  validates that they match the lowered `GetAttr`/`SetAttr` site while loading
+  v3 artifacts, before constructing typed/codegen inputs. By-attribute layout
+  availability is still shared with the existing constructor initializer fast
+  path. The final inline load/store emission still uses the existing typed
+  attribute emitter rather than a v3-specific operation node.
 - indexed globals are represented as v3 plan selections plus mechanical
   indexed-global emissions with explicit module-dict guard and original global
   fallback effects. The JIT validates emitted global name/access/index against

@@ -18078,11 +18078,49 @@ def f(x):
     #[test]
     fn planned_precompile_inputs_consume_v3_emitted_indexed_fields() {
         let module_name_gen = ModuleNameGen::new(7);
-        let caller = test_function_in_module(&module_name_gen, "caller");
+        let mut constants = TestConstantPool::default();
+        let mut caller = test_function_in_module(&module_name_gen, "caller");
+        caller.params = ParamSpec {
+            params: vec![
+                Param {
+                    name: "obj".into(),
+                    kind: ParamKind::Any,
+                    has_default: false,
+                },
+                Param {
+                    name: "replacement".into(),
+                    kind: ParamKind::Any,
+                    has_default: false,
+                },
+            ],
+        };
+        let block_label = caller.name_gen.next_block_name();
+        let load_source = InstrId::new(block_label, 11);
+        let store_source = InstrId::new(block_label, 13);
+        caller.blocks = vec![CodegenBlock {
+            label: block_label,
+            body: vec![with_instr_id(
+                op_expr(SetAttr::new(
+                    name_expr(test_name("obj")),
+                    constants.string_expr("value"),
+                    name_expr(test_name("replacement")),
+                )),
+                store_source,
+            )],
+            term: ret_term(with_instr_id(
+                op_expr(GetAttr::new(
+                    name_expr(test_name("obj")),
+                    constants.string_expr("value"),
+                )),
+                load_source,
+            )),
+            params: vec![],
+            exc_edge: None,
+        }];
+        set_stack_slots(&mut caller, &["obj", "replacement"]);
         let caller_id = caller.function_id;
-        let module = test_module(module_name_gen, vec![caller]);
-        let load_source = InstrId::new(BlockLabel::from_index(0), 11);
-        let store_source = InstrId::new(BlockLabel::from_index(0), 13);
+        let mut module = test_module(module_name_gen, vec![caller]);
+        module.module_constants = constants.module_constants;
         let serialized_caller =
             SerializedFunctionId::new(SerializedModuleId::new(0), caller_id.local_function_id());
         let owner_type = IndexedFieldOwnerType {
@@ -18218,6 +18256,26 @@ def f(x):
         assert!(
             planned_inputs.evidence_by_function.is_empty(),
             "v3 emitted indexed fields should not be converted into legacy profile evidence"
+        );
+
+        let mut mismatched_artifacts = artifacts.clone();
+        mismatched_artifacts.plan.functions[0].indexed_fields[0].attr_name = "other".to_string();
+        mismatched_artifacts.emission.functions[0].indexed_fields[0].attr_name =
+            "other".to_string();
+        let err = match planned_optimization_inputs_from_v3_artifacts_for_codegen_module(
+            &mismatched_artifacts,
+            &module,
+            mismatched_artifacts.plan.module.module_name.as_str(),
+            mismatched_artifacts.plan.module.source_hash,
+            None,
+        ) {
+            Ok(_) => panic!("v3 indexed-field attr mismatch should be rejected before codegen"),
+            Err(err) => err,
+        };
+        assert!(
+            err.contains("optimizer v3 emitted indexed-field attr")
+                && err.contains("lowered instruction uses"),
+            "{err}"
         );
     }
 

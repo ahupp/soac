@@ -42,8 +42,9 @@ predeclares those imports before worker codegen. Codegen imports those prepared
 symbols; it does not resolve Python attributes to recover missing callables.
 Constant-attribute indexed-field load/store selections from `type_keys` are
 also emitted as mechanical v3 indexed-field decisions; JIT validation checks
-those emitted decisions against the selected plan before deriving typed
-indexed-field guard input. They are not rewritten into legacy
+those emitted decisions against the selected plan and lowered
+`GetAttr`/`SetAttr` shape before deriving typed indexed-field guard input.
+They are not rewritten into legacy
 `FunctionProfileEvidence`. When the artifact contains the represented exact-int
 branch shape, JIT term lowering consumes the mechanical v3 region directly;
 otherwise lowering stays on the existing path.
@@ -363,9 +364,11 @@ apply/verify mode:
   optimization plan. Legacy `mod.opt` can still supply the same typed input
   while the migration is incomplete.
 - V3 indexed-field emissions remain separate from legacy per-instruction field
-  evidence inside `soac_jit`: the emitted access kind and attribute name must
-  match the lowered `GetAttr`/`SetAttr` instruction, or codegen rejects the plan
-  instead of silently treating it as another profiled field candidate.
+  evidence inside `soac_jit`: artifact loading validates that the emitted
+  access kind and attribute name match the lowered `GetAttr`/`SetAttr`
+  instruction, so typed annotation and codegen receive an already shape-checked
+  v3 field input instead of silently treating it as another profiled field
+  candidate.
   By-attribute layout availability is still shared with the existing constructor
   initializer fast path until that family has its own v3 plan node.
 - After codegen-to-typed lowering, these sites are represented as
