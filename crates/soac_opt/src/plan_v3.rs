@@ -57,6 +57,7 @@ pub struct DirectCallSpecializationPlan {
 pub struct CallBodyPlan {
     pub kind: CallBodyKind,
     pub cost: Cost,
+    pub inline_target: Option<SerializedFunctionId>,
     pub reason: String,
 }
 
@@ -950,6 +951,7 @@ fn validate_direct_call_plans(
         }
         validate_call_body_plan(
             function,
+            identity_tables,
             "direct-call",
             direct_call.target,
             direct_call.source,
@@ -1057,6 +1059,7 @@ fn validate_constructor_call_plans(
         }
         validate_call_body_plan(
             function,
+            identity_tables,
             "constructor-call",
             constructor_call.target,
             constructor_call.source,
@@ -1152,6 +1155,7 @@ fn validate_method_call_plans(
         }
         validate_call_body_plan(
             function,
+            identity_tables,
             "method-call",
             method_call.target,
             method_call.source,
@@ -1311,6 +1315,7 @@ fn validate_indexed_global_plans(function: &FunctionOptimizationPlanV3, errors: 
 
 fn validate_call_body_plan(
     function: &FunctionOptimizationPlanV3,
+    identity_tables: &SerializedIdentityTables,
     kind: &str,
     target: SerializedFunctionId,
     source: InstrId,
@@ -1328,6 +1333,41 @@ fn validate_call_body_plan(
             "function {} {kind} target {} at {} has inline call-body plan without modeled hot-path cost",
             function.function.function, target, source
         ));
+    }
+    match (body.kind, body.inline_target) {
+        (CallBodyKind::DirectCall, Some(inline_target)) => {
+            errors.push(format!(
+                "function {} {kind} target {} at {} has direct call-body plan with inline target {}",
+                function.function.function, target, source, inline_target
+            ));
+        }
+        (CallBodyKind::Inline, Some(inline_target)) => {
+            if kind != "constructor-call" {
+                errors.push(format!(
+                    "function {} {kind} target {} at {} has unexpected explicit inline target {}",
+                    function.function.function, target, source, inline_target
+                ));
+            }
+            if identity_tables.module(inline_target.module_id()).is_err() {
+                errors.push(format!(
+                    "function {} {kind} target {} at {} has inline target {} referencing missing module id {}",
+                    function.function.function,
+                    target,
+                    source,
+                    inline_target,
+                    inline_target.module_id()
+                ));
+            }
+        }
+        (CallBodyKind::Inline, None) => {
+            if kind == "constructor-call" {
+                errors.push(format!(
+                    "function {} constructor-call target {} at {} has inline call-body plan without runtime-iter inline target",
+                    function.function.function, target, source
+                ));
+            }
+        }
+        (CallBodyKind::DirectCall, None) => {}
     }
 }
 
@@ -2513,6 +2553,7 @@ mod tests {
                 code_size: 2,
                 compile: 1,
             },
+            inline_target: None,
             reason: "test direct-call body".to_string(),
         }
     }
@@ -2529,7 +2570,15 @@ mod tests {
                 code_size: 3,
                 compile: 2,
             },
+            inline_target: None,
             reason: "test inline body".to_string(),
+        }
+    }
+
+    fn constructor_inline_call_body(inline_target: SerializedFunctionId) -> CallBodyPlan {
+        CallBodyPlan {
+            inline_target: Some(inline_target),
+            ..inline_call_body()
         }
     }
 
@@ -2637,6 +2686,91 @@ mod tests {
         }]);
 
         validate_module_plan_v3(&plan).unwrap();
+    }
+
+    #[test]
+    fn validates_constructor_call_inline_body_with_runtime_iter_target() {
+        let target = SerializedFunctionId::new(SerializedModuleId::new(0), LocalFunctionId::new(2));
+        let iter_target =
+            SerializedFunctionId::new(SerializedModuleId::new(0), LocalFunctionId::new(3));
+        let plan = module_with_constructor_calls(vec![ConstructorCallSpecializationPlan {
+            source: instr_id(7),
+            target,
+            owner_type: ConstructorCallOwnerType {
+                module_name: "pkg.mod".to_string(),
+                qualname: "Box".to_string(),
+            },
+            arg_plan: DirectCallArgPlan {
+                sources: vec![DirectCallArgSource::Provided(0)],
+            },
+            guard: ConstructorCallGuardPlan {
+                kind: ConstructorCallGuardKind::ExactCallableTypeVersion,
+            },
+            fallback: ConstructorCallFallbackPlan {
+                kind: ConstructorCallFallbackKind::OriginalConstructorCall,
+            },
+            body: constructor_inline_call_body(iter_target),
+            reason: "profiled constructor target".to_string(),
+        }]);
+
+        validate_module_plan_v3(&plan).unwrap();
+    }
+
+    #[test]
+    fn rejects_constructor_call_inline_body_without_runtime_iter_target() {
+        let target = SerializedFunctionId::new(SerializedModuleId::new(0), LocalFunctionId::new(2));
+        let plan = module_with_constructor_calls(vec![ConstructorCallSpecializationPlan {
+            source: instr_id(7),
+            target,
+            owner_type: ConstructorCallOwnerType {
+                module_name: "pkg.mod".to_string(),
+                qualname: "Box".to_string(),
+            },
+            arg_plan: DirectCallArgPlan {
+                sources: vec![DirectCallArgSource::Provided(0)],
+            },
+            guard: ConstructorCallGuardPlan {
+                kind: ConstructorCallGuardKind::ExactCallableTypeVersion,
+            },
+            fallback: ConstructorCallFallbackPlan {
+                kind: ConstructorCallFallbackKind::OriginalConstructorCall,
+            },
+            body: inline_call_body(),
+            reason: "profiled constructor target".to_string(),
+        }]);
+
+        let err = validate_module_plan_v3(&plan).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("inline call-body plan without runtime-iter inline target"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rejects_direct_call_inline_body_with_explicit_inline_target() {
+        let target = SerializedFunctionId::new(SerializedModuleId::new(0), LocalFunctionId::new(2));
+        let inline_target =
+            SerializedFunctionId::new(SerializedModuleId::new(0), LocalFunctionId::new(3));
+        let plan = module_with_direct_calls(vec![DirectCallSpecializationPlan {
+            source: instr_id(7),
+            target,
+            arg_plan: DirectCallArgPlan {
+                sources: vec![DirectCallArgSource::Provided(0)],
+            },
+            body: CallBodyPlan {
+                inline_target: Some(inline_target),
+                ..inline_call_body()
+            },
+            reason: "profiled call target".to_string(),
+        }]);
+
+        let err = validate_module_plan_v3(&plan).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unexpected explicit inline target"),
+            "{err}"
+        );
     }
 
     #[test]

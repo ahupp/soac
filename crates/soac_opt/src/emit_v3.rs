@@ -469,6 +469,7 @@ mod tests {
                 code_size: 6,
                 compile: 4,
             },
+            inline_target: None,
             reason: "test inline body".to_string(),
         }
     }
@@ -696,7 +697,12 @@ mod tests {
         let fallback = ConstructorCallFallbackPlan {
             kind: ConstructorCallFallbackKind::OriginalConstructorCall,
         };
-        let body = inline_call_body();
+        let inline_target =
+            SerializedFunctionId::new(SerializedModuleId::new(0), LocalFunctionId::new(3));
+        let body = CallBodyPlan {
+            inline_target: Some(inline_target),
+            ..inline_call_body()
+        };
         plan.functions[0]
             .constructor_calls
             .push(ConstructorCallSpecializationPlan {

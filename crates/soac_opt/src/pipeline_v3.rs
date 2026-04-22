@@ -66,6 +66,7 @@ impl std::error::Error for ExactIntBranchV3Error {}
 #[derive(Clone, Debug, Default)]
 pub struct DirectCallTargetIndex {
     functions: HashMap<PersistentFunctionId, DirectCallTargetEntry>,
+    functions_by_qualname: HashMap<(ModuleContentId, String), PersistentFunctionId>,
 }
 
 #[derive(Clone, Debug)]
@@ -110,11 +111,16 @@ impl DirectCallTargetIndex {
         let content_id = ModuleContentId::new(metadata.module_name.clone(), metadata.source_hash);
         let module_constants = Arc::new(module.module_constants.clone());
         for function in &module.callable_defs {
+            let persistent_id = PersistentFunctionId::new(
+                content_id.clone(),
+                function.function_id.local_function_id(),
+            );
+            self.functions_by_qualname.insert(
+                (content_id.clone(), function.names.qualname.clone()),
+                persistent_id.clone(),
+            );
             self.functions.insert(
-                PersistentFunctionId::new(
-                    content_id.clone(),
-                    function.function_id.local_function_id(),
-                ),
+                persistent_id,
                 DirectCallTargetEntry {
                     module: content_id.clone(),
                     module_constants: module_constants.clone(),
@@ -128,11 +134,15 @@ impl DirectCallTargetIndex {
         self.functions.get(function_id)
     }
 
-    fn function(
+    fn entry_by_module_qualname(
         &self,
-        function_id: &PersistentFunctionId,
-    ) -> Option<&BlockPyFunction<CodegenModuleShape>> {
-        self.entry(function_id).map(|entry| &entry.function)
+        module: &ModuleContentId,
+        qualname: &str,
+    ) -> Option<(PersistentFunctionId, &DirectCallTargetEntry)> {
+        let function_id = self
+            .functions_by_qualname
+            .get(&(module.clone(), qualname.to_string()))?;
+        Some((function_id.clone(), self.entry(function_id)?))
     }
 }
 
@@ -820,6 +830,7 @@ fn constructor_call_requests_from_evidence_v3(
 ) -> (Vec<ConstructorCallPlanRequest>, Vec<PlanDiagnostic>) {
     let mut requests = Vec::new();
     let mut diagnostics = Vec::new();
+    let current_module = ModuleContentId::new(metadata.module_name.clone(), metadata.source_hash);
     let mut entries = evidence_store
         .persistent_call_target_specializations_for_runtime_function_v3(
             metadata.module_name.as_str(),
@@ -838,7 +849,7 @@ fn constructor_call_requests_from_evidence_v3(
         targets.dedup();
         for target in targets {
             let serialized_target = identity_builder.function_id_for_persistent(target.clone());
-            let Some(target_function) = target_index.function(&target) else {
+            let Some(target_entry) = target_index.entry(&target) else {
                 diagnostics.push(PlanDiagnostic {
                     source: Some(source),
                     message: format!(
@@ -847,6 +858,7 @@ fn constructor_call_requests_from_evidence_v3(
                 });
                 continue;
             };
+            let target_function = &target_entry.function;
             if target_function.names.fn_name != "__init__" {
                 continue;
             }
@@ -897,16 +909,27 @@ fn constructor_call_requests_from_evidence_v3(
                     continue;
                 }
             };
+            let inline_target = constructor_call_runtime_iter_inline_target_v3(
+                lowered_module,
+                &current_module,
+                function,
+                source,
+                target_index,
+                target_entry,
+                &owner_type,
+            )
+            .map(|(function_id, qualname)| {
+                let serialized_function_id =
+                    identity_builder.function_id_for_persistent(function_id);
+                identity_builder.add_debug_name(serialized_function_id, qualname);
+                serialized_function_id
+            });
             requests.push(ConstructorCallPlanRequest {
                 source,
                 target: serialized_target,
                 owner_type,
                 arg_plan,
-                body: CallBodyPlanRequest::with_inline_candidate(constructor_call_inline_candidate_v3(
-                    lowered_module,
-                    function,
-                    source,
-                )),
+                body: CallBodyPlanRequest::with_inline_target_candidate(inline_target),
                 reason: "profiled call_hot_targets selected this constructor __init__ target with validated constructor arguments".to_string(),
             });
             identity_builder
@@ -1229,49 +1252,82 @@ fn method_call_inline_candidate_v3(
     if !call_inline_signature_candidate_v3(call, target_function, 1) {
         return false;
     }
-    method_call_inline_body_buildable_v3(
+    direct_method_inline_body_buildable_v3(
         module,
         current_module,
         function,
         return_target,
-        call,
         getattr.value.as_ref().clone(),
+        call.args.as_slice(),
         target,
     )
     .is_ok()
 }
 
-fn constructor_call_inline_candidate_v3(
+fn constructor_call_runtime_iter_inline_target_v3(
+    module: &BlockPyModule<CodegenModuleShape>,
+    current_module: &ModuleContentId,
+    function: &BlockPyFunction<CodegenModuleShape>,
+    source: InstrId,
+    target_index: &DirectCallTargetIndex,
+    constructor_target: &DirectCallTargetEntry,
+    owner_type: &ConstructorCallOwnerType,
+) -> Option<(PersistentFunctionId, String)> {
+    let (return_target, receiver) =
+        runtime_iter_call_for_constructor_instr_id_v3(module, function, source)?;
+    let iter_qualname = format!("{}.__iter__", owner_type.qualname);
+    let (iter_function_id, iter_target) = target_index
+        .entry_by_module_qualname(&constructor_target.module, iter_qualname.as_str())?;
+    if iter_target.function.execution_mode() != FunctionExecutionMode::Jit {
+        return None;
+    }
+    direct_method_inline_body_buildable_v3(
+        module,
+        current_module,
+        function,
+        return_target,
+        receiver,
+        &[],
+        iter_target,
+    )
+    .ok()?;
+    Some((
+        iter_function_id,
+        iter_target.function.names.qualname.clone(),
+    ))
+}
+
+fn runtime_iter_call_for_constructor_instr_id_v3(
     module: &BlockPyModule<CodegenModuleShape>,
     function: &BlockPyFunction<CodegenModuleShape>,
     source: InstrId,
-) -> bool {
-    function.blocks.iter().any(|block| {
-        block.body.iter().any(|instr| {
+) -> Option<(ResolvedName, InstrCodegen)> {
+    for block in &function.blocks {
+        for instr in &block.body {
             let InstrCodegen::Store(store) = instr else {
-                return false;
+                continue;
             };
             let InstrCodegen::Call(iter_call) = store.value.as_ref() else {
-                return false;
+                continue;
             };
             if !is_runtime_name_expr_v3(module, iter_call.func.as_ref(), RuntimeName::Iter)
                 || !iter_call.keywords.is_empty()
                 || iter_call.args.len() != 1
             {
-                return false;
+                continue;
             }
-            let Some(receiver) = iter_call.args.first() else {
-                return false;
-            };
-            let CallArgPositional::Positional(receiver) = receiver else {
-                return false;
+            let Some(CallArgPositional::Positional(receiver)) = iter_call.args.first() else {
+                continue;
             };
             let InstrCodegen::Call(constructor_call) = receiver else {
-                return false;
+                continue;
             };
-            constructor_call.try_semantic_instr_id() == Some(source)
-        })
-    })
+            if constructor_call.try_semantic_instr_id() == Some(source) {
+                return Some((store.name.clone(), receiver.clone()));
+            }
+        }
+    }
+    None
 }
 
 fn is_runtime_name_expr_v3(
@@ -1355,18 +1411,15 @@ fn direct_call_inline_body_buildable_v3(
     Ok(())
 }
 
-fn method_call_inline_body_buildable_v3(
+fn direct_method_inline_body_buildable_v3(
     module: &BlockPyModule<CodegenModuleShape>,
     current_module: &ModuleContentId,
     function: &BlockPyFunction<CodegenModuleShape>,
     return_target: ResolvedName,
-    call: &Call<InstrCodegen>,
     receiver: InstrCodegen,
+    args: &[CallArgPositional<InstrCodegen>],
     target: &DirectCallTargetEntry,
 ) -> Result<(), InlineUnsupportedReason> {
-    if !call.keywords.is_empty() {
-        return Err(InlineUnsupportedReason::KeywordArguments);
-    }
     let mut caller = function.clone();
     let mut caller_constants = module.module_constants.clone();
     let continuation = caller.name_gen.next_block_name();
@@ -1376,7 +1429,7 @@ fn method_call_inline_body_buildable_v3(
             &target.function,
             continuation,
             receiver,
-            &call.args,
+            args,
             return_target,
         )?;
     } else {
@@ -1387,7 +1440,7 @@ fn method_call_inline_body_buildable_v3(
             target.module_constants.as_slice(),
             continuation,
             receiver,
-            &call.args,
+            args,
             return_target,
         )?;
     }
@@ -1847,6 +1900,16 @@ mod tests {
         }
     }
 
+    fn simple_arg_return_callee_named(
+        fn_name: &str,
+        qualname: &str,
+        params: &[(&str, bool)],
+    ) -> BlockPyFunction<CodegenModuleShape> {
+        let mut function = simple_arg_return_callee(params);
+        function.names = FunctionName::new(fn_name, fn_name, fn_name, qualname);
+        function
+    }
+
     fn unique_counter_path_v3() -> std::path::PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1983,6 +2046,85 @@ mod tests {
             source,
             &default_target
         ));
+    }
+
+    #[test]
+    fn constructor_runtime_iter_inline_candidate_names_iter_body_target() {
+        let source = instr_id(9);
+        let current_module = ModuleContentId::new("pkg.mod", 0x99);
+        let constructor_call = with_instr_id(
+            InstrCodegen::Call(Call::new(
+                local("Box", 0),
+                vec![CallArgPositional::Positional(local("x", 1))],
+                Vec::new(),
+            )),
+            9,
+        );
+        let iter_call = InstrCodegen::Call(Call::new(
+            InstrCodegen::Load(Load::new(ResolvedName {
+                id: BlockPyName::new("iter"),
+                location: NameLocation::RuntimeName(RuntimeName::Iter),
+            })),
+            vec![CallArgPositional::Positional(constructor_call)],
+            Vec::new(),
+        ));
+        let mut caller = function_with_blocks(vec![Block::new(
+            label(0),
+            vec![InstrCodegen::Store(Store::new(
+                local_name("result", 2),
+                iter_call,
+            ))],
+            BlockTerm::Return(local("result", 2)),
+            Vec::<BlockParam>::new(),
+            None,
+        )]);
+        set_stack_slots(&mut caller, &["Box", "x", "result"]);
+        let module = module_with_constants(Vec::new());
+
+        let init_function = simple_arg_return_callee_named(
+            "__init__",
+            "Box.__init__",
+            &[("self", false), ("x", false)],
+        );
+        let iter_function =
+            simple_arg_return_callee_named("__iter__", "Box.__iter__", &[("self", false)]);
+        let init_function_id =
+            PersistentFunctionId::new(current_module.clone(), LocalFunctionId::new(2));
+        let iter_function_id =
+            PersistentFunctionId::new(current_module.clone(), LocalFunctionId::new(3));
+        let mut target_index = DirectCallTargetIndex::default();
+        target_index.functions.insert(
+            init_function_id.clone(),
+            direct_call_target_entry(current_module.clone(), init_function),
+        );
+        target_index.functions.insert(
+            iter_function_id.clone(),
+            direct_call_target_entry(current_module.clone(), iter_function),
+        );
+        target_index.functions_by_qualname.insert(
+            (current_module.clone(), "Box.__iter__".to_string()),
+            iter_function_id.clone(),
+        );
+        let constructor_target = target_index.entry(&init_function_id).unwrap();
+        let owner_type = ConstructorCallOwnerType {
+            module_name: "pkg.mod".to_string(),
+            qualname: "Box".to_string(),
+        };
+
+        let selected = constructor_call_runtime_iter_inline_target_v3(
+            &module,
+            &current_module,
+            &caller,
+            source,
+            &target_index,
+            constructor_target,
+            &owner_type,
+        );
+
+        assert_eq!(
+            selected,
+            Some((iter_function_id, "Box.__iter__".to_string()))
+        );
     }
 
     #[test]

@@ -88,6 +88,7 @@ mod tests {
                     compile: 4,
                 },
             },
+            inline_target: None,
             reason: format!("test {kind:?} call body"),
         }
     }
@@ -4284,6 +4285,7 @@ def build(values):
             guard: PlanV3ConstructorCallGuardKind::ExactCallableTypeVersion,
             fallback: PlanV3ConstructorCallFallbackKind::OriginalConstructorCall,
             body: test_v3_inline_call_body(),
+            inline_target: None,
             reason: "profiled constructor call".to_string(),
         };
         let prepared_constructor_calls = prepare_opt_v3_constructor_call_plans_for_codegen(
@@ -17466,14 +17468,20 @@ def f(x):
         let module_name_gen = ModuleNameGen::new(7);
         let caller = test_function_in_module(&module_name_gen, "caller");
         let callee = test_function_in_module(&module_name_gen, "Box.__init__");
+        let iter_callee = test_function_in_module(&module_name_gen, "Box.__iter__");
         let caller_id = caller.function_id;
         let callee_id = callee.function_id;
-        let module = test_module(module_name_gen, vec![caller, callee]);
+        let iter_callee_id = iter_callee.function_id;
+        let module = test_module(module_name_gen, vec![caller, callee, iter_callee]);
         let source = InstrId::new(BlockLabel::from_index(0), 11);
         let serialized_caller =
             SerializedFunctionId::new(SerializedModuleId::new(0), caller_id.local_function_id());
         let serialized_callee =
             SerializedFunctionId::new(SerializedModuleId::new(0), callee_id.local_function_id());
+        let serialized_iter_callee = SerializedFunctionId::new(
+            SerializedModuleId::new(0),
+            iter_callee_id.local_function_id(),
+        );
         let owner_type = ConstructorCallOwnerType {
             module_name: "test".to_string(),
             qualname: "Box".to_string(),
@@ -17521,7 +17529,10 @@ def f(x):
                         },
                         guard: guard.clone(),
                         fallback: fallback.clone(),
-                        body: test_v3_inline_call_body(),
+                        body: CallBodyPlan {
+                            inline_target: Some(serialized_iter_callee),
+                            ..test_v3_inline_call_body()
+                        },
                         reason: "profiled constructor call".to_string(),
                     }],
                     method_calls: Vec::new(),
@@ -17551,7 +17562,10 @@ def f(x):
                         },
                         guard,
                         fallback,
-                        body: test_v3_inline_call_body(),
+                        body: CallBodyPlan {
+                            inline_target: Some(serialized_iter_callee),
+                            ..test_v3_inline_call_body()
+                        },
                         reason: "profiled constructor call".to_string(),
                     }],
                     method_calls: Vec::new(),
@@ -17578,6 +17592,7 @@ def f(x):
             .expect("v3 constructor-call emission should be available for codegen");
         assert_eq!(constructor_calls.len(), 1);
         assert_eq!(constructor_calls[0].target, callee_id);
+        assert_eq!(constructor_calls[0].inline_target, Some(iter_callee_id));
         assert_eq!(constructor_calls[0].owner_type.module_name, "test");
         assert_eq!(constructor_calls[0].owner_type.qualname, "Box");
         assert!(

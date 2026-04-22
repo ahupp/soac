@@ -2150,6 +2150,11 @@ fn build_profiled_jit_module_plan(
             .contains_key(&function.function_id);
         let has_source_keyed_v3_emissions =
             profile.has_source_keyed_opt_v3_emissions(function.function_id);
+        let inline_constructor_calls = if has_exact_int_branch_artifacts {
+            HashMap::new()
+        } else {
+            profile.v3_inline_constructor_calls(function.function_id)
+        };
         let call_target_specializations = if has_source_keyed_v3_emissions {
             HashMap::new()
         } else {
@@ -2160,7 +2165,7 @@ fn build_profiled_jit_module_plan(
         } else if has_source_keyed_v3_emissions {
             merge_call_target_specializations(
                 profile.v3_inline_method_call_targets(function.function_id),
-                profile.v3_inline_constructor_call_targets(function.function_id),
+                opt_v3_constructor_call_targets(&inline_constructor_calls),
             )
         } else {
             call_target_specializations.clone()
@@ -2184,6 +2189,7 @@ fn build_profiled_jit_module_plan(
                 direct_owner_attr_specializations,
                 &inline_callees,
                 &straightline_constructor_ids,
+                &inline_constructor_calls,
                 &mut runtime_constructor_function_ids,
             );
             if stats.total_attempts() != 0 {
@@ -2347,11 +2353,16 @@ fn build_profiled_inline_callee_maps(
         for targets in direct_call_rewrite_targets.values() {
             target_ids.extend(targets.iter().copied());
         }
-        for targets in profile
-            .v3_inline_constructor_call_targets(function.function_id)
+        for plans in profile
+            .v3_inline_constructor_calls(function.function_id)
             .values()
         {
-            target_ids.extend(targets.iter().copied());
+            for plan in plans {
+                target_ids.insert(plan.target);
+                if let Some(inline_target) = plan.inline_target {
+                    target_ids.insert(inline_target);
+                }
+            }
         }
         for targets in profile
             .v3_inline_method_call_targets(function.function_id)
@@ -2636,6 +2647,7 @@ fn rewrite_profiled_no_arg_method_call_store_sites(
     >,
     callees: &HashMap<RuntimeFunctionId, InlineCallee>,
     straightline_constructor_ids: &HashSet<RuntimeFunctionId>,
+    inline_constructor_calls_by_source: &HashMap<InstrId, Vec<OptV3ConstructorCallPlan>>,
     runtime_constructor_function_ids: &mut HashSet<RuntimeFunctionId>,
 ) -> ProfiledMethodInlineRewriteStats {
     let mut stats = ProfiledMethodInlineRewriteStats::default();
@@ -2655,6 +2667,7 @@ fn rewrite_profiled_no_arg_method_call_store_sites(
             direct_owner_attr_specializations,
             callees,
             straightline_constructor_ids,
+            inline_constructor_calls_by_source,
             &original_block_by_label,
             &mut stats,
             runtime_constructor_function_ids,
@@ -2684,6 +2697,7 @@ fn rewrite_profiled_no_arg_method_call_store_block(
     >,
     callees: &HashMap<RuntimeFunctionId, InlineCallee>,
     straightline_constructor_ids: &HashSet<RuntimeFunctionId>,
+    inline_constructor_calls_by_source: &HashMap<InstrId, Vec<OptV3ConstructorCallPlan>>,
     original_block_by_label: &HashMap<BlockLabel, Block<InstrCodegen>>,
     stats: &mut ProfiledMethodInlineRewriteStats,
     runtime_constructor_function_ids: &mut HashSet<RuntimeFunctionId>,
@@ -2701,6 +2715,7 @@ fn rewrite_profiled_no_arg_method_call_store_block(
             direct_owner_attr_specializations,
             callees,
             straightline_constructor_ids,
+            inline_constructor_calls_by_source,
             stats,
             runtime_constructor_function_ids,
         );
@@ -2907,6 +2922,7 @@ fn rewrite_profiled_runtime_iter_call_store_block(
     >,
     callees: &HashMap<RuntimeFunctionId, InlineCallee>,
     straightline_constructor_ids: &HashSet<RuntimeFunctionId>,
+    inline_constructor_calls_by_source: &HashMap<InstrId, Vec<OptV3ConstructorCallPlan>>,
     stats: &mut ProfiledMethodInlineRewriteStats,
     runtime_constructor_function_ids: &mut HashSet<RuntimeFunctionId>,
 ) -> Option<Vec<Block<InstrCodegen>>> {
@@ -2926,18 +2942,31 @@ fn rewrite_profiled_runtime_iter_call_store_block(
     let mut fragments = Vec::new();
     let mut fragment_constructor_function_ids = Vec::new();
     for function_id in dedup_function_ids(targets) {
+        let planned_inline_target = inline_constructor_calls_by_source
+            .get(&candidate.constructor_instr_id)
+            .and_then(|plans| {
+                plans
+                    .iter()
+                    .find(|plan| {
+                        plan.target == function_id && plan.body.kind == PlanV3CallBodyKind::Inline
+                    })
+                    .and_then(|plan| plan.inline_target)
+            });
         for guard in direct_constructor_owner_attr_specializations_from_source(
             Some(direct_owner_attr_specializations),
             function_id,
         ) {
-            let iter_function_id =
+            let iter_function_id = if let Some(iter_function_id) = planned_inline_target {
+                iter_function_id
+            } else {
                 match owner_attr_function_id_for_type_ref(&guard.owner_type_ref, "__iter__") {
                     Ok(Some(function_id)) => function_id,
                     Ok(None) | Err(_) => {
                         stats.missing_owner_guard_targets += 1;
                         continue;
                     }
-                };
+                }
+            };
             let Some(callee) = callees.get(&iter_function_id) else {
                 stats.missing_callee_targets += 1;
                 continue;
@@ -13665,22 +13694,6 @@ fn opt_v3_constructor_call_targets(
         .collect()
 }
 
-fn opt_v3_inline_constructor_call_targets(
-    constructor_calls_by_source: &HashMap<InstrId, Vec<OptV3ConstructorCallPlan>>,
-) -> HashMap<InstrId, Vec<RuntimeFunctionId>> {
-    constructor_calls_by_source
-        .iter()
-        .filter_map(|(source, constructor_calls)| {
-            let targets = constructor_calls
-                .iter()
-                .filter(|constructor_call| constructor_call.body.kind == PlanV3CallBodyKind::Inline)
-                .map(|constructor_call| constructor_call.target)
-                .collect::<Vec<_>>();
-            (!targets.is_empty()).then_some((*source, targets))
-        })
-        .collect()
-}
-
 fn opt_v3_method_call_targets(
     method_calls_by_source: &HashMap<InstrId, Vec<OptV3MethodCallPlan>>,
 ) -> HashMap<InstrId, Vec<RuntimeFunctionId>> {
@@ -13770,6 +13783,7 @@ struct OptV3ConstructorCallPlan {
     guard: PlanV3ConstructorCallGuardKind,
     fallback: PlanV3ConstructorCallFallbackKind,
     body: PlanV3CallBodyPlan,
+    inline_target: Option<RuntimeFunctionId>,
     reason: String,
 }
 
@@ -14606,13 +14620,37 @@ fn opt_v3_emitted_constructor_calls_for_function(
                 constructor_call.target, persistent_target, constructor_call.source
             ));
         };
+        let inline_target = if let Some(serialized_inline_target) =
+            constructor_call.body.inline_target
+        {
+            let persistent_inline_target = artifacts
+                    .plan
+                    .identity_tables
+                    .persistent_function_id(serialized_inline_target)
+                    .map_err(|err| {
+                        format!(
+                            "optimization plan v3 emitted constructor-call inline target {} at {} cannot resolve identity: {err}",
+                            serialized_inline_target, constructor_call.source
+                        )
+                    })?;
+            let Some(inline_target) = resolve_target(persistent_inline_target.clone())? else {
+                return Err(format!(
+                    "optimization plan v3 emitted constructor-call inline target {} ({:?}) at {} does not exist in loaded module set",
+                    serialized_inline_target, persistent_inline_target, constructor_call.source
+                ));
+            };
+            Some(inline_target)
+        } else {
+            None
+        };
         let plans = constructor_calls
             .entry(constructor_call.source)
             .or_default();
-        if !plans
-            .iter()
-            .any(|plan| plan.target == target && plan.owner_type == constructor_call.owner_type)
-        {
+        if !plans.iter().any(|plan| {
+            plan.target == target
+                && plan.owner_type == constructor_call.owner_type
+                && plan.inline_target == inline_target
+        }) {
             plans.push(OptV3ConstructorCallPlan {
                 source: constructor_call.source,
                 target,
@@ -14621,6 +14659,7 @@ fn opt_v3_emitted_constructor_calls_for_function(
                 guard: constructor_call.guard.kind,
                 fallback: constructor_call.fallback.kind,
                 body: constructor_call.body.clone(),
+                inline_target,
                 reason: constructor_call.reason.clone(),
             });
         }
@@ -15607,13 +15646,27 @@ impl<'a> SpecializationProfile<'a> {
             .unwrap_or_default()
     }
 
-    fn v3_inline_constructor_call_targets(
+    fn v3_inline_constructor_calls(
         &self,
         function_id: RuntimeFunctionId,
-    ) -> HashMap<InstrId, Vec<RuntimeFunctionId>> {
+    ) -> HashMap<InstrId, Vec<OptV3ConstructorCallPlan>> {
         self.opt_v3_emitted_constructor_calls
             .get(&function_id)
-            .map(opt_v3_inline_constructor_call_targets)
+            .map(|constructor_calls_by_source| {
+                constructor_calls_by_source
+                    .iter()
+                    .filter_map(|(source, constructor_calls)| {
+                        let plans = constructor_calls
+                            .iter()
+                            .filter(|constructor_call| {
+                                constructor_call.body.kind == PlanV3CallBodyKind::Inline
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        (!plans.is_empty()).then_some((*source, plans))
+                    })
+                    .collect()
+            })
             .unwrap_or_default()
     }
 

@@ -67,6 +67,7 @@ pub struct CallBodyPlanRequest {
 pub struct CallBodyAlternativeRequest {
     pub kind: CallBodyKind,
     pub cost: Cost,
+    pub inline_target: Option<SerializedFunctionId>,
     pub reason: String,
 }
 
@@ -75,6 +76,7 @@ impl CallBodyPlanRequest {
         let mut alternatives = vec![CallBodyAlternativeRequest {
             kind: CallBodyKind::DirectCall,
             cost: direct_call_body_cost_v3(),
+            inline_target: None,
             reason: "guarded direct call is the baseline validated call-body alternative"
                 .to_string(),
         }];
@@ -82,8 +84,30 @@ impl CallBodyPlanRequest {
             alternatives.push(CallBodyAlternativeRequest {
                 kind: CallBodyKind::Inline,
                 cost: inline_call_body_cost_v3(),
+                inline_target: None,
                 reason: "lowered call shape is eligible for the early inline body alternative"
                     .to_string(),
+            });
+        }
+        Self { alternatives }
+    }
+
+    pub fn with_inline_target_candidate(inline_target: Option<SerializedFunctionId>) -> Self {
+        let mut alternatives = vec![CallBodyAlternativeRequest {
+            kind: CallBodyKind::DirectCall,
+            cost: direct_call_body_cost_v3(),
+            inline_target: None,
+            reason: "guarded direct call is the baseline validated call-body alternative"
+                .to_string(),
+        }];
+        if let Some(inline_target) = inline_target {
+            alternatives.push(CallBodyAlternativeRequest {
+                kind: CallBodyKind::Inline,
+                cost: inline_call_body_cost_v3(),
+                inline_target: Some(inline_target),
+                reason:
+                    "runtime-iter body target is eligible for the early inline body alternative"
+                        .to_string(),
             });
         }
         Self { alternatives }
@@ -350,11 +374,13 @@ fn choose_call_body_plan_v3(request: &CallBodyPlanRequest) -> CallBodyPlan {
         .map(|alternative| CallBodyPlan {
             kind: alternative.kind,
             cost: alternative.cost,
+            inline_target: alternative.inline_target,
             reason: alternative.reason.clone(),
         })
         .unwrap_or_else(|| CallBodyPlan {
             kind: CallBodyKind::DirectCall,
             cost: direct_call_body_cost_v3(),
+            inline_target: None,
             reason: "guarded direct call is the default call-body alternative".to_string(),
         })
 }

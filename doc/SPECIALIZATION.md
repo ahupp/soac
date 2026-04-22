@@ -634,12 +634,15 @@ JIT emitter still materializes the full guarded call blocks today.
   them back into typed call access plans. Ordinary v3 direct-call store sites
   and eligible receiver-method sites are expanded in the profiled BlockPy
   module plan only when the v3 plan selected `Inline` as the call-body policy
-  after validating inline-fragment buildability. Runtime-iter constructor sites
-  still use the existing constructor inline-summary filter. The next step is to
-  make constructor/runtime-iter inline eligibility explicit in offline request
-  facts and to expand remaining guarded method/constructor typed nodes into
-  explicit guard, direct-call, and fallback CFG blocks before final JIT
-  emission.
+  after validating inline-fragment buildability. Runtime-iter constructor
+  `Inline` body plans carry the selected `__iter__` function id in the
+  serialized v3 plan; the JIT resolves that plan target and uses it as the body
+  callee instead of rediscovering the method target from the owner type. The
+  JIT still prepares the constructor owner/type-version guard at runtime, and
+  legacy non-v3 constructor/runtime-iter rewrites still use the runtime owner
+  lookup path. The next step is to expand remaining guarded
+  method/constructor typed nodes into explicit guard, direct-call, and fallback
+  CFG blocks before final JIT emission.
 - Typed call access plans are validated before specialized JIT emission, and
   typed calls use the selected plan as the source of truth. If annotation leaves
   a typed call as generic/profiled-only, codegen does not rediscover a guarded
