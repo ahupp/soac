@@ -28,7 +28,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use soac_core::block_py::{
     BlockLabel, BlockPyFunction, BlockPyModule, Call, CallArgPositional, ChildVisitable,
     FunctionExecutionMode, HasSemanticInstrId, InstrId, LocalFunctionId, ModuleContentId, NameLike,
-    NameLocation, ParamKind, PersistentFunctionId, SerializedFunctionDebugName,
+    NameLocation, ParamKind, PersistentFunctionId, RuntimeName, SerializedFunctionDebugName,
     SerializedFunctionId, SerializedIdentityTables, SerializedModuleId, SerializedModuleIdentity,
     Visit,
 };
@@ -770,6 +770,11 @@ fn direct_call_requests_from_evidence_v3(
                 source,
                 target: serialized_target,
                 arg_plan,
+                inline_candidate: direct_call_inline_candidate_v3(
+                    function,
+                    source,
+                    target_function,
+                ),
                 reason: "profiled call_hot_targets selected this function with validated ordinary-call arguments".to_string(),
             });
             identity_builder
@@ -871,6 +876,11 @@ fn constructor_call_requests_from_evidence_v3(
                 target: serialized_target,
                 owner_type,
                 arg_plan,
+                inline_candidate: constructor_call_inline_candidate_v3(
+                    lowered_module,
+                    function,
+                    source,
+                ),
                 reason: "profiled call_hot_targets selected this constructor __init__ target with validated constructor arguments".to_string(),
             });
             identity_builder
@@ -986,6 +996,12 @@ fn method_call_requests_from_evidence_v3(
                 method_name: method_name.clone(),
                 owner_type,
                 arg_plan,
+                inline_candidate: method_call_inline_candidate_v3(
+                    lowered_module,
+                    function,
+                    source,
+                    target_function,
+                ),
                 reason: "profiled call_hot_targets selected this owner-method target with validated receiver-call arguments".to_string(),
             });
             identity_builder
@@ -1129,6 +1145,174 @@ fn direct_call_arg_plan_for_instr_id_v3(
     };
     finder.visit_fn(function);
     finder.result
+}
+
+fn direct_call_inline_candidate_v3(
+    function: &BlockPyFunction<CodegenModuleShape>,
+    source: InstrId,
+    target_function: &BlockPyFunction<CodegenModuleShape>,
+) -> bool {
+    let Some(call) = store_call_for_instr_id_v3(function, source) else {
+        return false;
+    };
+    if target_function.names.fn_name == "__init__" {
+        return false;
+    }
+    call_inline_signature_candidate_v3(call, target_function, 0)
+}
+
+fn method_call_inline_candidate_v3(
+    module: &BlockPyModule<CodegenModuleShape>,
+    function: &BlockPyFunction<CodegenModuleShape>,
+    source: InstrId,
+    target_function: &BlockPyFunction<CodegenModuleShape>,
+) -> bool {
+    let Some(call) = store_call_for_instr_id_v3(function, source) else {
+        return false;
+    };
+    if !call.args.is_empty() || !call.keywords.is_empty() {
+        return false;
+    }
+    let InstrCodegen::GetAttr(getattr) = call.func.as_ref() else {
+        return false;
+    };
+    if codegen_constant_string_value_v3(module, getattr.attr.as_ref()).is_none() {
+        return false;
+    }
+    call_inline_signature_candidate_v3(call, target_function, 1)
+}
+
+fn constructor_call_inline_candidate_v3(
+    module: &BlockPyModule<CodegenModuleShape>,
+    function: &BlockPyFunction<CodegenModuleShape>,
+    source: InstrId,
+) -> bool {
+    function.blocks.iter().any(|block| {
+        block.body.iter().any(|instr| {
+            let InstrCodegen::Store(store) = instr else {
+                return false;
+            };
+            let InstrCodegen::Call(iter_call) = store.value.as_ref() else {
+                return false;
+            };
+            if !is_runtime_name_expr_v3(module, iter_call.func.as_ref(), RuntimeName::Iter)
+                || !iter_call.keywords.is_empty()
+                || iter_call.args.len() != 1
+            {
+                return false;
+            }
+            let Some(receiver) = iter_call.args.first() else {
+                return false;
+            };
+            let CallArgPositional::Positional(receiver) = receiver else {
+                return false;
+            };
+            let InstrCodegen::Call(constructor_call) = receiver else {
+                return false;
+            };
+            constructor_call.try_semantic_instr_id() == Some(source)
+        })
+    })
+}
+
+fn is_runtime_name_expr_v3(
+    module: &BlockPyModule<CodegenModuleShape>,
+    expr: &InstrCodegen,
+    runtime_name: RuntimeName,
+) -> bool {
+    let InstrCodegen::Load(load) = expr else {
+        return false;
+    };
+    if load.name.location == NameLocation::RuntimeName(runtime_name) {
+        return true;
+    }
+    let Some(constant_index) = load.name.location.as_constant() else {
+        return false;
+    };
+    let Some(InstrResolved::Load(load)) = module.module_constants.get(constant_index as usize)
+    else {
+        return false;
+    };
+    load.name.location == NameLocation::RuntimeName(runtime_name)
+}
+
+fn store_call_for_instr_id_v3(
+    function: &BlockPyFunction<CodegenModuleShape>,
+    source: InstrId,
+) -> Option<&Call<InstrCodegen>> {
+    for block in &function.blocks {
+        for instr in &block.body {
+            let InstrCodegen::Store(store) = instr else {
+                continue;
+            };
+            let InstrCodegen::Call(call) = store.value.as_ref() else {
+                continue;
+            };
+            if call.try_semantic_instr_id() == Some(source) {
+                return Some(call);
+            }
+        }
+    }
+    None
+}
+
+fn call_inline_signature_candidate_v3(
+    call: &Call<InstrCodegen>,
+    target_function: &BlockPyFunction<CodegenModuleShape>,
+    implicit_positional_arg_count: usize,
+) -> bool {
+    if !call.keywords.is_empty()
+        || call
+            .args
+            .iter()
+            .any(|arg| matches!(arg, CallArgPositional::Starred(_)))
+    {
+        return false;
+    }
+    let Some(storage_layout) = &target_function.storage_layout else {
+        return false;
+    };
+    let explicit_positional_arg_count = call
+        .args
+        .iter()
+        .filter(|arg| matches!(arg, CallArgPositional::Positional(_)))
+        .count();
+    let provided_positional_arg_count =
+        implicit_positional_arg_count + explicit_positional_arg_count;
+    let accepted_positional_arg_count = target_function
+        .params
+        .iter()
+        .filter(|param| matches!(param.kind, ParamKind::PosOnly | ParamKind::Any))
+        .count();
+    if provided_positional_arg_count > accepted_positional_arg_count {
+        return false;
+    }
+    let mut consumed_positional_args = 0usize;
+    for param in target_function.params.iter() {
+        match param.kind {
+            ParamKind::PosOnly | ParamKind::Any => {
+                if consumed_positional_args < provided_positional_arg_count {
+                    consumed_positional_args += 1;
+                } else if !param.has_default {
+                    return false;
+                }
+            }
+            ParamKind::KwOnly => {
+                if !param.has_default {
+                    return false;
+                }
+            }
+            ParamKind::VarArg | ParamKind::KwArg => return false,
+        }
+        if !storage_layout
+            .stack_slots()
+            .iter()
+            .any(|name| name == &param.name)
+        {
+            return false;
+        }
+    }
+    true
 }
 
 fn direct_call_arg_plan_from_call_v3(

@@ -44,9 +44,9 @@ mod tests {
         PlannedIndexedFieldSpecialization, PlannedReplacement, PlannedTypeKey, ShapeFamily,
     };
     use soac_opt::plan_v3::{
-        ConstructorCallFallbackKind, ConstructorCallFallbackPlan, ConstructorCallGuardKind,
-        ConstructorCallGuardPlan, ConstructorCallOwnerType, ConstructorCallSpecializationPlan,
-        DirectCallArgPlan as PlanV3DirectCallArgPlan,
+        CallBodyKind, CallBodyPlan, ConstructorCallFallbackKind, ConstructorCallFallbackPlan,
+        ConstructorCallGuardKind, ConstructorCallGuardPlan, ConstructorCallOwnerType,
+        ConstructorCallSpecializationPlan, Cost, DirectCallArgPlan as PlanV3DirectCallArgPlan,
         DirectCallArgSource as PlanV3DirectCallArgSource, DirectCallSpecializationPlan,
         FunctionPlanIdentity, IndexedFieldAccessKind, IndexedFieldOwnerType,
         IndexedFieldSpecializationPlan, IndexedGlobalAccessKind, IndexedGlobalFallbackKind,
@@ -63,6 +63,41 @@ mod tests {
 
     unsafe extern "C" {
         fn PyCell_New(obj: *mut ffi::PyObject) -> *mut ffi::PyObject;
+    }
+
+    fn test_v3_call_body(kind: CallBodyKind) -> CallBodyPlan {
+        CallBodyPlan {
+            kind,
+            cost: match kind {
+                CallBodyKind::DirectCall => Cost {
+                    hot_path: 8,
+                    miss_path: 2,
+                    deopt: 0,
+                    materialization: 0,
+                    ownership: 1,
+                    code_size: 2,
+                    compile: 1,
+                },
+                CallBodyKind::Inline => Cost {
+                    hot_path: 2,
+                    miss_path: 2,
+                    deopt: 0,
+                    materialization: 0,
+                    ownership: 0,
+                    code_size: 6,
+                    compile: 4,
+                },
+            },
+            reason: format!("test {kind:?} call body"),
+        }
+    }
+
+    fn test_v3_inline_call_body() -> CallBodyPlan {
+        test_v3_call_body(CallBodyKind::Inline)
+    }
+
+    fn test_v3_direct_call_body() -> CallBodyPlan {
+        test_v3_call_body(CallBodyKind::DirectCall)
     }
 
     unsafe fn test_dp_jit_deopt_resume(
@@ -4102,6 +4137,7 @@ def build(values):
             arg_plan: TypedDirectCallArgPlan {
                 sources: vec![TypedDirectCallArgSource::Provided(0)],
             },
+            body: test_v3_inline_call_body(),
             reason: "profiled direct call".to_string(),
         };
 
@@ -4151,6 +4187,7 @@ def build(values):
             arg_plan: TypedDirectCallArgPlan {
                 sources: vec![TypedDirectCallArgSource::Provided(0)],
             },
+            body: test_v3_inline_call_body(),
             reason: "profiled direct call".to_string(),
         };
 
@@ -4192,6 +4229,7 @@ def build(values):
                     source: direct_source,
                     target: direct_target,
                     arg_plan: arg_plan.clone(),
+                    body: test_v3_inline_call_body(),
                     reason: "profiled direct call".to_string(),
                 }],
             )]),
@@ -4245,6 +4283,7 @@ def build(values):
             },
             guard: PlanV3ConstructorCallGuardKind::ExactCallableTypeVersion,
             fallback: PlanV3ConstructorCallFallbackKind::OriginalConstructorCall,
+            body: test_v3_inline_call_body(),
             reason: "profiled constructor call".to_string(),
         };
         let prepared_constructor_calls = prepare_opt_v3_constructor_call_plans_for_codegen(
@@ -4317,6 +4356,7 @@ def build(values):
             },
             guard: PlanV3MethodCallGuardKind::ExactReceiverTypeVersion,
             fallback: PlanV3MethodCallFallbackKind::OriginalMethodCall,
+            body: test_v3_inline_call_body(),
             reason: "profiled method call".to_string(),
         };
         let prepared_method_calls =
@@ -4389,6 +4429,7 @@ def build(values):
             },
             guard: PlanV3MethodCallGuardKind::ExactReceiverTypeVersion,
             fallback: PlanV3MethodCallFallbackKind::OriginalMethodCall,
+            body: test_v3_inline_call_body(),
             reason: "profiled method call".to_string(),
         };
         let prepared_method_calls =
@@ -17349,6 +17390,7 @@ def f(x):
                         arg_plan: PlanV3DirectCallArgPlan {
                             sources: vec![PlanV3DirectCallArgSource::Provided(0)],
                         },
+                        body: test_v3_inline_call_body(),
                         reason: "profiled direct call".to_string(),
                     }],
                     constructor_calls: Vec::new(),
@@ -17372,6 +17414,7 @@ def f(x):
                         arg_plan: PlanV3DirectCallArgPlan {
                             sources: vec![PlanV3DirectCallArgSource::Provided(0)],
                         },
+                        body: test_v3_inline_call_body(),
                         reason: "profiled direct call".to_string(),
                     }],
                     constructor_calls: Vec::new(),
@@ -17408,6 +17451,7 @@ def f(x):
                 arg_plan: soac_lowering::passes::TypedDirectCallArgPlan {
                     sources: vec![soac_lowering::passes::TypedDirectCallArgSource::Provided(0)],
                 },
+                body: test_v3_inline_call_body(),
                 reason: "profiled direct call".to_string(),
             }
         );
@@ -17477,6 +17521,7 @@ def f(x):
                         },
                         guard: guard.clone(),
                         fallback: fallback.clone(),
+                        body: test_v3_inline_call_body(),
                         reason: "profiled constructor call".to_string(),
                     }],
                     method_calls: Vec::new(),
@@ -17506,6 +17551,7 @@ def f(x):
                         },
                         guard,
                         fallback,
+                        body: test_v3_inline_call_body(),
                         reason: "profiled constructor call".to_string(),
                     }],
                     method_calls: Vec::new(),
@@ -17599,6 +17645,7 @@ def f(x):
                         },
                         guard: guard.clone(),
                         fallback: fallback.clone(),
+                        body: test_v3_inline_call_body(),
                         reason: "profiled method call".to_string(),
                     }],
                     exact_list_items: Vec::new(),
@@ -17626,6 +17673,7 @@ def f(x):
                         },
                         guard,
                         fallback,
+                        body: test_v3_inline_call_body(),
                         reason: "profiled method call".to_string(),
                     }],
                     exact_list_items: Vec::new(),
@@ -17722,6 +17770,7 @@ def f(x):
                         arg_plan: PlanV3DirectCallArgPlan {
                             sources: vec![PlanV3DirectCallArgSource::Provided(0)],
                         },
+                        body: test_v3_inline_call_body(),
                         reason: "profiled cross-module direct call".to_string(),
                     }],
                     constructor_calls: Vec::new(),
@@ -17745,6 +17794,7 @@ def f(x):
                         arg_plan: PlanV3DirectCallArgPlan {
                             sources: vec![PlanV3DirectCallArgSource::Provided(0)],
                         },
+                        body: test_v3_inline_call_body(),
                         reason: "profiled cross-module direct call".to_string(),
                     }],
                     constructor_calls: Vec::new(),
@@ -17781,6 +17831,7 @@ def f(x):
                 arg_plan: soac_lowering::passes::TypedDirectCallArgPlan {
                     sources: vec![soac_lowering::passes::TypedDirectCallArgSource::Provided(0)],
                 },
+                body: test_v3_inline_call_body(),
                 reason: "profiled cross-module direct call".to_string(),
             },
             "JIT precompile loading should resolve v3 cross-module direct-call targets through the identity table and module index"
@@ -19015,6 +19066,7 @@ def write_point(point, value):
                         arg_plan: PlanV3DirectCallArgPlan {
                             sources: vec![PlanV3DirectCallArgSource::Provided(0)],
                         },
+                        body: test_v3_inline_call_body(),
                         reason: "profiled direct call".to_string(),
                     }],
                     constructor_calls: Vec::new(),
@@ -19168,6 +19220,7 @@ def write_point(point, value):
             arg_plan: soac_lowering::passes::TypedDirectCallArgPlan {
                 sources: vec![soac_lowering::passes::TypedDirectCallArgSource::Provided(0)],
             },
+            body: test_v3_inline_call_body(),
             reason: "profiled direct call".to_string(),
         };
         let mut opt_v3_emitted_direct_calls = HashMap::new();
@@ -23236,6 +23289,7 @@ def f(x, y):
             arg_plan: TypedDirectCallArgPlan {
                 sources: vec![TypedDirectCallArgSource::Provided(0)],
             },
+            body: test_v3_inline_call_body(),
             reason: "profiled direct call".to_string(),
         };
         let profile = SpecializationProfile {
@@ -23289,6 +23343,127 @@ def f(x, y):
                 .flat_map(|block| &block.body)
                 .any(|instr| matches!(instr, InstrCodegen::Store(store) if matches!(store.value.as_ref(), InstrCodegen::CallDirect(_)))),
             "v3 hot CallDirect store should be consumed by the BlockPy inliner"
+        );
+    }
+
+    #[test]
+    fn v3_direct_call_store_rewrite_requires_inline_body_plan() {
+        let module_name = "v3_store_call_direct_body_plan_test";
+        let module_name_gen = ModuleNameGen::new(0);
+        let mut callee_function = test_function_in_module(&module_name_gen, "callee");
+        callee_function.params.params.push(Param {
+            name: "x".into(),
+            kind: ParamKind::Any,
+            has_default: false,
+        });
+        callee_function = with_single_test_block(
+            callee_function,
+            vec![],
+            ret_term(name_expr(test_local_name("x", 0))),
+        );
+        set_stack_slots(&mut callee_function, &["x"]);
+
+        let mut caller_function = test_function_in_module(&module_name_gen, "caller");
+        caller_function.params.params.extend([
+            Param {
+                name: "fn".into(),
+                kind: ParamKind::Any,
+                has_default: false,
+            },
+            Param {
+                name: "x".into(),
+                kind: ParamKind::Any,
+                has_default: false,
+            },
+        ]);
+        let caller_block_label = caller_function.name_gen.next_block_name();
+        let call_instr_id = InstrId::new(caller_block_label, 1);
+        caller_function = with_test_blocks(
+            caller_function,
+            vec![CodegenBlock {
+                label: caller_block_label,
+                body: vec![assign_stmt(
+                    test_local_name("y", 2),
+                    with_instr_id(
+                        op_expr(Call::new(
+                            name_expr(test_local_name("fn", 0)),
+                            vec![CallArgPositional::Positional(name_expr(test_local_name(
+                                "x", 1,
+                            )))],
+                            Vec::<CallArgKeyword<InstrCodegen>>::new(),
+                        )),
+                        call_instr_id,
+                    ),
+                )],
+                term: ret_term(name_expr(test_local_name("y", 2))),
+                params: vec![],
+                exc_edge: None,
+            }],
+        );
+        set_stack_slots(&mut caller_function, &["fn", "x", "y"]);
+        let module = test_module(
+            module_name_gen,
+            vec![callee_function.clone(), caller_function.clone()],
+        );
+        let v3_plan = OptV3DirectCallPlan {
+            source: call_instr_id,
+            target: callee_function.function_id,
+            arg_plan: TypedDirectCallArgPlan {
+                sources: vec![TypedDirectCallArgSource::Provided(0)],
+            },
+            body: test_v3_direct_call_body(),
+            reason: "profiled direct call".to_string(),
+        };
+        let profile = SpecializationProfile {
+            module_name: Some(module_name),
+            counter_dump_path: None,
+            planned_evidence: HashMap::new(),
+            opt_v3_emitted_direct_calls: HashMap::from([(
+                caller_function.function_id,
+                HashMap::from([(call_instr_id, vec![v3_plan])]),
+            )]),
+            opt_v3_emitted_constructor_calls: HashMap::new(),
+            opt_v3_emitted_method_calls: HashMap::new(),
+            opt_v3_emitted_exact_list_items: HashMap::new(),
+            opt_v3_emitted_indexed_fields: HashMap::new(),
+            opt_v3_emitted_indexed_globals: HashMap::new(),
+            opt_v3_exact_int_branch_artifacts: HashMap::new(),
+            behavior_change_indexed_stores: false,
+            profiled_cold_blocks: false,
+            guard_miss_deopt: false,
+        };
+        let plan = build_profiled_jit_module_plan(&module, &profile, None, None, &HashMap::new())
+            .expect("v3-profiled JIT module plan should build");
+        let planned_caller = plan
+            .module
+            .callable_defs
+            .iter()
+            .find(|function| function.function_id == caller_function.function_id)
+            .expect("planned module should keep caller");
+
+        assert!(
+            !planned_caller.blocks.iter().any(|block| {
+                matches!(
+                    &block.term,
+                    BlockTerm::IfTerm(term)
+                        if matches!(term.test, InstrCodegen::DirectFunctionIdGuardTest(_))
+                )
+            }),
+            "v3 direct-call body plan should not trigger the early inline rewrite"
+        );
+        assert!(
+            planned_caller
+                .blocks
+                .iter()
+                .flat_map(|block| &block.body)
+                .any(|instr| {
+                    matches!(
+                        instr,
+                        InstrCodegen::Store(store)
+                            if matches!(store.value.as_ref(), InstrCodegen::Call(_))
+                    )
+                }),
+            "the generic call should remain available for later mechanical v3 direct-call lowering"
         );
     }
 
@@ -23357,6 +23532,7 @@ def f(x, y):
             arg_plan: TypedDirectCallArgPlan {
                 sources: vec![TypedDirectCallArgSource::Provided(0)],
             },
+            body: test_v3_inline_call_body(),
             reason: "profiled direct call".to_string(),
         };
         let indexed_field = OptV3IndexedFieldAccessPlan {
@@ -23624,6 +23800,7 @@ def f(x, y):
                         },
                         guard: PlanV3MethodCallGuardKind::ExactReceiverTypeVersion,
                         fallback: PlanV3MethodCallFallbackKind::OriginalMethodCall,
+                        body: test_v3_inline_call_body(),
                         reason: "profiled method call".to_string(),
                     }],
                 )]),

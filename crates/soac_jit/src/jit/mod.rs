@@ -97,6 +97,7 @@ use soac_opt::plan::{
     load_optimization_plan,
 };
 use soac_opt::plan_v3::{
+    CallBodyKind as PlanV3CallBodyKind, CallBodyPlan as PlanV3CallBodyPlan,
     ConstructorCallFallbackKind as PlanV3ConstructorCallFallbackKind,
     ConstructorCallGuardKind as PlanV3ConstructorCallGuardKind,
     ConstructorCallOwnerType as PlanV3ConstructorCallOwnerType,
@@ -2158,8 +2159,8 @@ fn build_profiled_jit_module_plan(
             HashMap::new()
         } else if has_source_keyed_v3_emissions {
             merge_call_target_specializations(
-                profile.v3_method_call_targets(function.function_id),
-                profile.v3_constructor_call_targets(function.function_id),
+                profile.v3_inline_method_call_targets(function.function_id),
+                profile.v3_inline_constructor_call_targets(function.function_id),
             )
         } else {
             call_target_specializations.clone()
@@ -2167,7 +2168,7 @@ fn build_profiled_jit_module_plan(
         let direct_call_rewrite_targets = if has_exact_int_branch_artifacts {
             HashMap::new()
         } else if has_source_keyed_v3_emissions {
-            profile.v3_direct_function_call_targets(function.function_id)
+            profile.v3_inline_direct_function_call_targets(function.function_id)
         } else {
             profile.direct_call_rewrite_targets(function.function_id)?
         };
@@ -2349,13 +2350,13 @@ fn build_profiled_inline_callee_maps(
             target_ids.extend(targets.iter().copied());
         }
         for targets in profile
-            .v3_constructor_call_targets(function.function_id)
+            .v3_inline_constructor_call_targets(function.function_id)
             .values()
         {
             target_ids.extend(targets.iter().copied());
         }
         for targets in profile
-            .v3_method_call_targets(function.function_id)
+            .v3_inline_method_call_targets(function.function_id)
             .values()
         {
             target_ids.extend(targets.iter().copied());
@@ -13622,6 +13623,22 @@ fn opt_v3_direct_call_targets(
         .collect()
 }
 
+fn opt_v3_inline_direct_call_targets(
+    direct_calls_by_source: &HashMap<InstrId, Vec<OptV3DirectCallPlan>>,
+) -> HashMap<InstrId, Vec<RuntimeFunctionId>> {
+    direct_calls_by_source
+        .iter()
+        .filter_map(|(source, direct_calls)| {
+            let targets = direct_calls
+                .iter()
+                .filter(|direct_call| direct_call.body.kind == PlanV3CallBodyKind::Inline)
+                .map(|direct_call| direct_call.target)
+                .collect::<Vec<_>>();
+            (!targets.is_empty()).then_some((*source, targets))
+        })
+        .collect()
+}
+
 fn extend_direct_call_targets_from_v3_direct_calls(
     out: &mut HashSet<RuntimeFunctionId>,
     direct_calls_by_source: &HashMap<InstrId, Vec<OptV3DirectCallPlan>>,
@@ -13648,6 +13665,22 @@ fn opt_v3_constructor_call_targets(
         .collect()
 }
 
+fn opt_v3_inline_constructor_call_targets(
+    constructor_calls_by_source: &HashMap<InstrId, Vec<OptV3ConstructorCallPlan>>,
+) -> HashMap<InstrId, Vec<RuntimeFunctionId>> {
+    constructor_calls_by_source
+        .iter()
+        .filter_map(|(source, constructor_calls)| {
+            let targets = constructor_calls
+                .iter()
+                .filter(|constructor_call| constructor_call.body.kind == PlanV3CallBodyKind::Inline)
+                .map(|constructor_call| constructor_call.target)
+                .collect::<Vec<_>>();
+            (!targets.is_empty()).then_some((*source, targets))
+        })
+        .collect()
+}
+
 fn opt_v3_method_call_targets(
     method_calls_by_source: &HashMap<InstrId, Vec<OptV3MethodCallPlan>>,
 ) -> HashMap<InstrId, Vec<RuntimeFunctionId>> {
@@ -13661,6 +13694,22 @@ fn opt_v3_method_call_targets(
                     .map(|method_call| method_call.target)
                     .collect(),
             )
+        })
+        .collect()
+}
+
+fn opt_v3_inline_method_call_targets(
+    method_calls_by_source: &HashMap<InstrId, Vec<OptV3MethodCallPlan>>,
+) -> HashMap<InstrId, Vec<RuntimeFunctionId>> {
+    method_calls_by_source
+        .iter()
+        .filter_map(|(source, method_calls)| {
+            let targets = method_calls
+                .iter()
+                .filter(|method_call| method_call.body.kind == PlanV3CallBodyKind::Inline)
+                .map(|method_call| method_call.target)
+                .collect::<Vec<_>>();
+            (!targets.is_empty()).then_some((*source, targets))
         })
         .collect()
 }
@@ -13708,6 +13757,7 @@ struct OptV3DirectCallPlan {
     source: InstrId,
     target: RuntimeFunctionId,
     arg_plan: TypedDirectCallArgPlan,
+    body: PlanV3CallBodyPlan,
     reason: String,
 }
 
@@ -13719,6 +13769,7 @@ struct OptV3ConstructorCallPlan {
     arg_plan: TypedDirectCallArgPlan,
     guard: PlanV3ConstructorCallGuardKind,
     fallback: PlanV3ConstructorCallFallbackKind,
+    body: PlanV3CallBodyPlan,
     reason: String,
 }
 
@@ -13731,6 +13782,7 @@ struct OptV3MethodCallPlan {
     arg_plan: TypedDirectCallArgPlan,
     guard: PlanV3MethodCallGuardKind,
     fallback: PlanV3MethodCallFallbackKind,
+    body: PlanV3CallBodyPlan,
     reason: String,
 }
 
@@ -14519,6 +14571,7 @@ fn opt_v3_emitted_direct_calls_for_function(
                 source: direct_call.source,
                 target,
                 arg_plan: typed_direct_call_arg_plan_from_v3(&direct_call.arg_plan),
+                body: direct_call.body.clone(),
                 reason: direct_call.reason.clone(),
             });
         }
@@ -14567,6 +14620,7 @@ fn opt_v3_emitted_constructor_calls_for_function(
                 arg_plan: typed_direct_call_arg_plan_from_v3(&constructor_call.arg_plan),
                 guard: constructor_call.guard.kind,
                 fallback: constructor_call.fallback.kind,
+                body: constructor_call.body.clone(),
                 reason: constructor_call.reason.clone(),
             });
         }
@@ -14615,6 +14669,7 @@ fn opt_v3_emitted_method_calls_for_function(
                 arg_plan: typed_direct_call_arg_plan_from_v3(&method_call.arg_plan),
                 guard: method_call.guard.kind,
                 fallback: method_call.fallback.kind,
+                body: method_call.body.clone(),
                 reason: method_call.reason.clone(),
             });
         }
@@ -15049,6 +15104,7 @@ fn validate_opt_v3_direct_call_emission_matches_plan(
         if planned.source != emitted.source
             || planned.target != emitted.target
             || planned.arg_plan != emitted.arg_plan
+            || planned.body != emitted.body
             || planned.reason != emitted.reason
         {
             return Err(format!(
@@ -15098,6 +15154,7 @@ fn opt_v3_constructor_call_emission_matches_plan(
         && planned.arg_plan == emitted.arg_plan
         && planned.guard == emitted.guard
         && planned.fallback == emitted.fallback
+        && planned.body == emitted.body
         && planned.reason == emitted.reason
 }
 
@@ -15140,6 +15197,7 @@ fn opt_v3_method_call_emission_matches_plan(
         && planned.arg_plan == emitted.arg_plan
         && planned.guard == emitted.guard
         && planned.fallback == emitted.fallback
+        && planned.body == emitted.body
         && planned.reason == emitted.reason
 }
 
@@ -15525,6 +15583,16 @@ impl<'a> SpecializationProfile<'a> {
             .unwrap_or_default()
     }
 
+    fn v3_inline_direct_function_call_targets(
+        &self,
+        function_id: RuntimeFunctionId,
+    ) -> HashMap<InstrId, Vec<RuntimeFunctionId>> {
+        self.opt_v3_emitted_direct_calls
+            .get(&function_id)
+            .map(opt_v3_inline_direct_call_targets)
+            .unwrap_or_default()
+    }
+
     fn v3_constructor_call_targets(
         &self,
         function_id: RuntimeFunctionId,
@@ -15532,6 +15600,16 @@ impl<'a> SpecializationProfile<'a> {
         self.opt_v3_emitted_constructor_calls
             .get(&function_id)
             .map(opt_v3_constructor_call_targets)
+            .unwrap_or_default()
+    }
+
+    fn v3_inline_constructor_call_targets(
+        &self,
+        function_id: RuntimeFunctionId,
+    ) -> HashMap<InstrId, Vec<RuntimeFunctionId>> {
+        self.opt_v3_emitted_constructor_calls
+            .get(&function_id)
+            .map(opt_v3_inline_constructor_call_targets)
             .unwrap_or_default()
     }
 
@@ -15545,12 +15623,22 @@ impl<'a> SpecializationProfile<'a> {
             .unwrap_or_default()
     }
 
+    fn v3_inline_method_call_targets(
+        &self,
+        function_id: RuntimeFunctionId,
+    ) -> HashMap<InstrId, Vec<RuntimeFunctionId>> {
+        self.opt_v3_emitted_method_calls
+            .get(&function_id)
+            .map(opt_v3_inline_method_call_targets)
+            .unwrap_or_default()
+    }
+
     fn direct_call_rewrite_targets(
         &self,
         function_id: RuntimeFunctionId,
     ) -> Result<HashMap<InstrId, Vec<RuntimeFunctionId>>, String> {
         let legacy_targets = self.call_target_specializations(function_id)?;
-        let v3_targets = self.v3_direct_function_call_targets(function_id);
+        let v3_targets = self.v3_inline_direct_function_call_targets(function_id);
         Ok(merge_call_target_specializations(
             legacy_targets,
             v3_targets,

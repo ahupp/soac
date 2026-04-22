@@ -49,7 +49,23 @@ pub struct DirectCallSpecializationPlan {
     pub source: InstrId,
     pub target: SerializedFunctionId,
     pub arg_plan: DirectCallArgPlan,
+    pub body: CallBodyPlan,
     pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct CallBodyPlan {
+    pub kind: CallBodyKind,
+    pub cost: Cost,
+    pub reason: String,
+}
+
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
+pub enum CallBodyKind {
+    DirectCall,
+    Inline,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -71,6 +87,7 @@ pub struct ConstructorCallSpecializationPlan {
     pub arg_plan: DirectCallArgPlan,
     pub guard: ConstructorCallGuardPlan,
     pub fallback: ConstructorCallFallbackPlan,
+    pub body: CallBodyPlan,
     pub reason: String,
 }
 
@@ -113,6 +130,7 @@ pub struct MethodCallSpecializationPlan {
     pub arg_plan: DirectCallArgPlan,
     pub guard: MethodCallGuardPlan,
     pub fallback: MethodCallFallbackPlan,
+    pub body: CallBodyPlan,
     pub reason: String,
 }
 
@@ -930,6 +948,14 @@ fn validate_direct_call_plans(
                 function.function.function, direct_call.target, direct_call.source
             ));
         }
+        validate_call_body_plan(
+            function,
+            "direct-call",
+            direct_call.target,
+            direct_call.source,
+            &direct_call.body,
+            errors,
+        );
         if identity_tables
             .module(direct_call.target.module_id())
             .is_err()
@@ -1020,6 +1046,14 @@ fn validate_constructor_call_plans(
                 constructor_call.fallback.kind
             ));
         }
+        validate_call_body_plan(
+            function,
+            "constructor-call",
+            constructor_call.target,
+            constructor_call.source,
+            &constructor_call.body,
+            errors,
+        );
         validate_direct_call_arg_plan(
             function,
             "constructor-call",
@@ -1107,6 +1141,14 @@ fn validate_method_call_plans(
                 method_call.fallback.kind
             ));
         }
+        validate_call_body_plan(
+            function,
+            "method-call",
+            method_call.target,
+            method_call.source,
+            &method_call.body,
+            errors,
+        );
         validate_direct_call_arg_plan(
             function,
             "method-call",
@@ -1246,6 +1288,28 @@ fn validate_indexed_global_plans(function: &FunctionOptimizationPlanV3, errors: 
                 function.function.function, indexed_global.source
             ));
         }
+    }
+}
+
+fn validate_call_body_plan(
+    function: &FunctionOptimizationPlanV3,
+    kind: &str,
+    target: SerializedFunctionId,
+    source: InstrId,
+    body: &CallBodyPlan,
+    errors: &mut Vec<String>,
+) {
+    if body.reason.is_empty() {
+        errors.push(format!(
+            "function {} {kind} target {} at {} has call-body plan without reason",
+            function.function.function, target, source
+        ));
+    }
+    if matches!(body.kind, CallBodyKind::Inline) && body.cost.hot_path == 0 {
+        errors.push(format!(
+            "function {} {kind} target {} at {} has inline call-body plan without modeled hot-path cost",
+            function.function.function, target, source
+        ));
     }
 }
 
@@ -2397,6 +2461,22 @@ mod tests {
         InstrId::new(BlockLabel::from_index(0), index)
     }
 
+    fn direct_call_body() -> CallBodyPlan {
+        CallBodyPlan {
+            kind: CallBodyKind::DirectCall,
+            cost: Cost {
+                hot_path: 8,
+                miss_path: 2,
+                deopt: 0,
+                materialization: 0,
+                ownership: 1,
+                code_size: 2,
+                compile: 1,
+            },
+            reason: "test direct-call body".to_string(),
+        }
+    }
+
     #[test]
     fn validates_direct_call_selections() {
         let target = SerializedFunctionId::new(SerializedModuleId::new(0), LocalFunctionId::new(2));
@@ -2406,6 +2486,7 @@ mod tests {
             arg_plan: DirectCallArgPlan {
                 sources: vec![DirectCallArgSource::Provided(0)],
             },
+            body: direct_call_body(),
             reason: "profiled call target".to_string(),
         }]);
 
@@ -2421,6 +2502,7 @@ mod tests {
             arg_plan: DirectCallArgPlan {
                 sources: vec![DirectCallArgSource::Provided(0)],
             },
+            body: direct_call_body(),
             reason: "profiled call target".to_string(),
         }]);
         plan.identity_tables.modules.push(SerializedModuleIdentity {
@@ -2441,6 +2523,7 @@ mod tests {
             arg_plan: DirectCallArgPlan {
                 sources: vec![DirectCallArgSource::Provided(0)],
             },
+            body: direct_call_body(),
             reason: "profiled call target".to_string(),
         }]);
         let err = validate_module_plan_v3(&plan).unwrap_err();
@@ -2469,6 +2552,7 @@ mod tests {
             fallback: ConstructorCallFallbackPlan {
                 kind: ConstructorCallFallbackKind::OriginalConstructorCall,
             },
+            body: direct_call_body(),
             reason: "profiled constructor target".to_string(),
         }]);
 
@@ -2494,6 +2578,7 @@ mod tests {
             fallback: ConstructorCallFallbackPlan {
                 kind: ConstructorCallFallbackKind::OriginalConstructorCall,
             },
+            body: direct_call_body(),
             reason: "profiled constructor target".to_string(),
         }]);
 
@@ -2525,6 +2610,7 @@ mod tests {
             fallback: MethodCallFallbackPlan {
                 kind: MethodCallFallbackKind::OriginalMethodCall,
             },
+            body: direct_call_body(),
             reason: "profiled owner-method target".to_string(),
         }]);
 
@@ -2551,6 +2637,7 @@ mod tests {
             fallback: MethodCallFallbackPlan {
                 kind: MethodCallFallbackKind::OriginalMethodCall,
             },
+            body: direct_call_body(),
             reason: "profiled owner-method target".to_string(),
         }]);
 

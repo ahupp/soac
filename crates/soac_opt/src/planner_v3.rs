@@ -2,10 +2,10 @@ use crate::alternatives_v3::{
     AlternativeCatalog, AlternativeId, FailureTargets, LoweringAlternative,
 };
 use crate::plan_v3::{
-    ConstructorCallFallbackKind, ConstructorCallFallbackPlan, ConstructorCallGuardKind,
-    ConstructorCallGuardPlan, ConstructorCallOwnerType, ConstructorCallSpecializationPlan,
-    ConversionKind, ConversionOwnership, ConversionPrecondition, ConvertNode, Cost,
-    DirectCallArgPlan, DirectCallSpecializationPlan, ExactListItemAccessKind,
+    CallBodyKind, CallBodyPlan, ConstructorCallFallbackKind, ConstructorCallFallbackPlan,
+    ConstructorCallGuardKind, ConstructorCallGuardPlan, ConstructorCallOwnerType,
+    ConstructorCallSpecializationPlan, ConversionKind, ConversionOwnership, ConversionPrecondition,
+    ConvertNode, Cost, DirectCallArgPlan, DirectCallSpecializationPlan, ExactListItemAccessKind,
     ExactListItemFallbackKind, ExactListItemFallbackPlan, ExactListItemGuardKind,
     ExactListItemGuardPlan, ExactListItemShape, ExactListItemSpecializationPlan, FailureMode,
     FallbackReason, FallbackTarget, FunctionOptimizationPlanV3, FunctionOwnershipPlan,
@@ -54,6 +54,7 @@ pub struct DirectCallPlanRequest {
     pub source: InstrId,
     pub target: SerializedFunctionId,
     pub arg_plan: DirectCallArgPlan,
+    pub inline_candidate: bool,
     pub reason: String,
 }
 
@@ -63,6 +64,7 @@ pub struct ConstructorCallPlanRequest {
     pub target: SerializedFunctionId,
     pub owner_type: ConstructorCallOwnerType,
     pub arg_plan: DirectCallArgPlan,
+    pub inline_candidate: bool,
     pub reason: String,
 }
 
@@ -73,6 +75,7 @@ pub struct MethodCallPlanRequest {
     pub method_name: String,
     pub owner_type: MethodCallOwnerType,
     pub arg_plan: DirectCallArgPlan,
+    pub inline_candidate: bool,
     pub reason: String,
 }
 
@@ -229,6 +232,7 @@ fn plan_constructor_call_specializations_v3(
                 fallback: ConstructorCallFallbackPlan {
                     kind: ConstructorCallFallbackKind::OriginalConstructorCall,
                 },
+                body: choose_call_body_plan_v3(request.inline_candidate),
                 reason: request.reason.clone(),
             });
         }
@@ -277,6 +281,7 @@ fn plan_method_call_specializations_v3(
                 fallback: MethodCallFallbackPlan {
                     kind: MethodCallFallbackKind::OriginalMethodCall,
                 },
+                body: choose_call_body_plan_v3(request.inline_candidate),
                 reason: request.reason.clone(),
             });
         }
@@ -297,11 +302,61 @@ fn plan_direct_call_specializations_v3(
                 source: request.source,
                 target: request.target,
                 arg_plan: request.arg_plan.clone(),
+                body: choose_call_body_plan_v3(request.inline_candidate),
                 reason: request.reason.clone(),
             });
         }
     }
     plans
+}
+
+fn choose_call_body_plan_v3(inline_candidate: bool) -> CallBodyPlan {
+    let direct = CallBodyPlan {
+        kind: CallBodyKind::DirectCall,
+        cost: Cost {
+            hot_path: 8,
+            miss_path: 2,
+            deopt: 0,
+            materialization: 0,
+            ownership: 1,
+            code_size: 2,
+            compile: 1,
+        },
+        reason: "guarded direct call is the only validated call-body alternative".to_string(),
+    };
+    if !inline_candidate {
+        return direct;
+    }
+    let inline = CallBodyPlan {
+        kind: CallBodyKind::Inline,
+        cost: Cost {
+            hot_path: 2,
+            miss_path: 2,
+            deopt: 0,
+            materialization: 0,
+            ownership: 0,
+            code_size: 6,
+            compile: 4,
+        },
+        reason: "inline body has lower modeled hot-path cost for this validated call site"
+            .to_string(),
+    };
+    if call_body_cost_key(&inline.cost) < call_body_cost_key(&direct.cost) {
+        inline
+    } else {
+        direct
+    }
+}
+
+fn call_body_cost_key(cost: &Cost) -> (u32, u32, u32, u32) {
+    (
+        cost.hot_path
+            .saturating_add(cost.materialization)
+            .saturating_add(cost.ownership),
+        cost.miss_path.saturating_add(cost.deopt),
+        cost.code_size,
+        cost.compile,
+    )
 }
 
 fn plan_exact_list_item_specializations_v3(
@@ -1840,6 +1895,7 @@ mod tests {
                 arg_plan: DirectCallArgPlan {
                     sources: vec![crate::plan_v3::DirectCallArgSource::Provided(0)],
                 },
+                inline_candidate: true,
                 reason: "profiled call_hot_targets selected this same-module function".to_string(),
             },
             DirectCallPlanRequest {
@@ -1848,6 +1904,7 @@ mod tests {
                 arg_plan: DirectCallArgPlan {
                     sources: vec![crate::plan_v3::DirectCallArgSource::Provided(0)],
                 },
+                inline_candidate: true,
                 reason: "profiled call_hot_targets selected this same-module function".to_string(),
             },
         ];
@@ -1865,7 +1922,32 @@ mod tests {
                 sources: vec![crate::plan_v3::DirectCallArgSource::Provided(0)]
             }
         );
+        assert_eq!(direct_calls[0].body.kind, CallBodyKind::Inline);
         assert!(direct_calls[0].reason.contains("call_hot_targets"));
+    }
+
+    #[test]
+    fn direct_call_body_cost_model_declines_inline_without_candidate() {
+        let mut request = module_request_regions(Vec::new());
+        let source = InstrId::new(label(0), 9);
+        let target = SerializedFunctionId::new(SerializedModuleId::new(0), LocalFunctionId::new(2));
+        request.functions[0].direct_calls = vec![DirectCallPlanRequest {
+            source,
+            target,
+            arg_plan: DirectCallArgPlan {
+                sources: vec![crate::plan_v3::DirectCallArgSource::Provided(0)],
+            },
+            inline_candidate: false,
+            reason: "profiled call_hot_targets selected this same-module function".to_string(),
+        }];
+
+        let plan = plan_module_optimization_v3(&AlternativeCatalog::default_v3(), request);
+
+        validate_module_plan_v3(&plan).unwrap();
+        assert_eq!(
+            plan.functions[0].direct_calls[0].body.kind,
+            CallBodyKind::DirectCall
+        );
     }
 
     #[test]

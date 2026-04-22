@@ -32,7 +32,10 @@ pub const V3_OPTIMIZATION_FAMILY_STATUS: &[V3OptimizationFamilyStatus] = &[
         family: "profiled direct calls, guarded receiver-method calls, and guarded constructor calls",
         legacy_input: "call_hot_targets",
         status: V3MigrationStatus::LiveCodegenInputOnly,
-        next_step: "move remaining argument-bearing method/constructor guarded-call CFG expansion before final JIT emission",
+        next_step: concat!(
+            "move remaining inline eligibility facts and argument-bearing method/constructor ",
+            "guarded-call CFG expansion before final JIT emission"
+        ),
     },
     V3OptimizationFamilyStatus {
         family: "exact-list getitem and setitem",

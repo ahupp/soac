@@ -1,5 +1,5 @@
 use crate::plan_v3::{
-    ConstructorCallFallbackPlan, ConstructorCallGuardPlan, ConstructorCallOwnerType,
+    CallBodyPlan, ConstructorCallFallbackPlan, ConstructorCallGuardPlan, ConstructorCallOwnerType,
     ConstructorCallSpecializationPlan, ConversionKind, DeoptPointId, DirectCallArgPlan,
     DirectCallSpecializationPlan, ExactListItemAccessKind, ExactListItemFallbackPlan,
     ExactListItemGuardPlan, ExactListItemShape, ExactListItemSpecializationPlan, FailureMode,
@@ -38,6 +38,7 @@ pub struct MechanicalDirectCallEmission {
     pub source: InstrId,
     pub target: SerializedFunctionId,
     pub arg_plan: DirectCallArgPlan,
+    pub body: CallBodyPlan,
     pub reason: String,
 }
 
@@ -49,6 +50,7 @@ pub struct MechanicalConstructorCallEmission {
     pub arg_plan: DirectCallArgPlan,
     pub guard: ConstructorCallGuardPlan,
     pub fallback: ConstructorCallFallbackPlan,
+    pub body: CallBodyPlan,
     pub reason: String,
 }
 
@@ -61,6 +63,7 @@ pub struct MechanicalMethodCallEmission {
     pub arg_plan: DirectCallArgPlan,
     pub guard: MethodCallGuardPlan,
     pub fallback: MethodCallFallbackPlan,
+    pub body: CallBodyPlan,
     pub reason: String,
 }
 
@@ -299,6 +302,7 @@ fn emit_direct_call(direct_call: &DirectCallSpecializationPlan) -> MechanicalDir
         source: direct_call.source,
         target: direct_call.target,
         arg_plan: direct_call.arg_plan.clone(),
+        body: direct_call.body.clone(),
         reason: direct_call.reason.clone(),
     }
 }
@@ -313,6 +317,7 @@ fn emit_constructor_call(
         arg_plan: constructor_call.arg_plan.clone(),
         guard: constructor_call.guard.clone(),
         fallback: constructor_call.fallback.clone(),
+        body: constructor_call.body.clone(),
         reason: constructor_call.reason.clone(),
     }
 }
@@ -326,6 +331,7 @@ fn emit_method_call(method_call: &MethodCallSpecializationPlan) -> MechanicalMet
         arg_plan: method_call.arg_plan.clone(),
         guard: method_call.guard.clone(),
         fallback: method_call.fallback.clone(),
+        body: method_call.body.clone(),
         reason: method_call.reason.clone(),
     }
 }
@@ -434,12 +440,12 @@ fn emit_exit_kind(kind: &RegionExitKind) -> MechanicalExitKind {
 mod tests {
     use super::*;
     use crate::plan_v3::{
-        ConstructorCallFallbackKind, ConstructorCallFallbackPlan, ConstructorCallGuardKind,
-        ConstructorCallGuardPlan, ConstructorCallOwnerType, ConstructorCallSpecializationPlan,
-        Cost, DirectCallArgPlan, DirectCallArgSource, DirectCallSpecializationPlan,
-        ExactListItemAccessKind, ExactListItemFallbackKind, ExactListItemFallbackPlan,
-        ExactListItemGuardKind, ExactListItemGuardPlan, ExactListItemShape,
-        ExactListItemSpecializationPlan, FallbackReason, FallbackTarget,
+        CallBodyKind, CallBodyPlan, ConstructorCallFallbackKind, ConstructorCallFallbackPlan,
+        ConstructorCallGuardKind, ConstructorCallGuardPlan, ConstructorCallOwnerType,
+        ConstructorCallSpecializationPlan, Cost, DirectCallArgPlan, DirectCallArgSource,
+        DirectCallSpecializationPlan, ExactListItemAccessKind, ExactListItemFallbackKind,
+        ExactListItemFallbackPlan, ExactListItemGuardKind, ExactListItemGuardPlan,
+        ExactListItemShape, ExactListItemSpecializationPlan, FallbackReason, FallbackTarget,
         FunctionOptimizationPlanV3, FunctionOwnershipPlan, FunctionPlanIdentity,
         IndexedFieldAccessKind, IndexedFieldOwnerType, IndexedFieldSpecializationPlan,
         MaterializeNode, MethodCallFallbackKind, MethodCallFallbackPlan, MethodCallGuardKind,
@@ -450,6 +456,22 @@ mod tests {
         BlockLabel, LocalFunctionId, SerializedIdentityTables, SerializedModuleId,
         SerializedModuleIdentity,
     };
+
+    fn inline_call_body() -> CallBodyPlan {
+        CallBodyPlan {
+            kind: CallBodyKind::Inline,
+            cost: Cost {
+                hot_path: 2,
+                miss_path: 2,
+                deopt: 0,
+                materialization: 0,
+                ownership: 0,
+                code_size: 6,
+                compile: 4,
+            },
+            reason: "test inline body".to_string(),
+        }
+    }
 
     fn test_plan(include_materialization: bool) -> ModuleOptimizationPlanV3 {
         let lhs = PlanValue::new(0, Rep::I64);
@@ -630,6 +652,7 @@ mod tests {
         let mut plan = test_plan(true);
         let source = InstrId::new(BlockLabel::from_index(0), 7);
         let target = SerializedFunctionId::new(SerializedModuleId::new(0), LocalFunctionId::new(2));
+        let body = inline_call_body();
         plan.functions[0]
             .direct_calls
             .push(DirectCallSpecializationPlan {
@@ -638,6 +661,7 @@ mod tests {
                 arg_plan: DirectCallArgPlan {
                     sources: vec![DirectCallArgSource::Provided(0)],
                 },
+                body: body.clone(),
                 reason: "profiled call_hot_targets selected this same-module function".to_string(),
             });
 
@@ -651,6 +675,7 @@ mod tests {
                 arg_plan: DirectCallArgPlan {
                     sources: vec![DirectCallArgSource::Provided(0)],
                 },
+                body,
                 reason: "profiled call_hot_targets selected this same-module function".to_string(),
             }]
         );
@@ -671,6 +696,7 @@ mod tests {
         let fallback = ConstructorCallFallbackPlan {
             kind: ConstructorCallFallbackKind::OriginalConstructorCall,
         };
+        let body = inline_call_body();
         plan.functions[0]
             .constructor_calls
             .push(ConstructorCallSpecializationPlan {
@@ -685,6 +711,7 @@ mod tests {
                 },
                 guard: guard.clone(),
                 fallback: fallback.clone(),
+                body: body.clone(),
                 reason: "profiled constructor target".to_string(),
             });
 
@@ -704,6 +731,7 @@ mod tests {
                 },
                 guard,
                 fallback,
+                body,
                 reason: "profiled constructor target".to_string(),
             }]
         );
@@ -724,6 +752,7 @@ mod tests {
         let fallback = MethodCallFallbackPlan {
             kind: MethodCallFallbackKind::OriginalMethodCall,
         };
+        let body = inline_call_body();
         plan.functions[0]
             .method_calls
             .push(MethodCallSpecializationPlan {
@@ -736,6 +765,7 @@ mod tests {
                 },
                 guard: guard.clone(),
                 fallback: fallback.clone(),
+                body: body.clone(),
                 reason: "profiled call_hot_targets selected this owner method".to_string(),
             });
 
@@ -753,6 +783,7 @@ mod tests {
                 },
                 guard,
                 fallback,
+                body,
                 reason: "profiled call_hot_targets selected this owner method".to_string(),
             }]
         );

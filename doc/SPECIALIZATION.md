@@ -21,10 +21,14 @@ per-function `ExactIntBranchV3Artifacts`, and threads those artifacts through
 `FunctionSpecializationInputs`. Profiled ordinary-function direct calls and
 guarded receiver-method calls from `mod.optv3` are emitted as mechanical v3
 call decisions with validated argument plans and serialized target module
-identities. Method-call plans additionally carry the method name, owner type,
+identities. Call plans also carry the selected call-body policy:
+`DirectCall` for guarded direct-call lowering, or `Inline` when the offline
+planner selected the early BlockPy inline path as the lower-cost body
+alternative. Method-call plans additionally carry the method name, owner type,
 receiver type-version guard kind, and original-call fallback kind. JIT
 validation checks those emitted decisions against the selected plan before
-deriving mechanical typed-call lowering input and resolving current-module or
+deriving mechanical typed-call lowering input, filtering early inline rewrite
+inputs by the selected body policy, and resolving current-module or
 cross-module direct-call targets from the loaded module set.
 If a method or constructor owner type/attribute guard cannot be resolved in the
 current compile context, specialization-input preparation keeps a guardless
@@ -72,9 +76,10 @@ Current migration surface:
   regions, so simple lowered code like `c = a + b; if c > 0: ...` can optimize
   the add store and the later branch as separate v3 regions. Profiled ordinary
   direct calls and receiver-method calls are selected by v3, emitted as
-  mechanical call decisions with serialized target and owner identities, and
-  consumed through v3-owned typed-call lowering. Constant-string indexed fields
-  are selected by v3 from raw
+  mechanical call decisions with serialized target and owner identities plus an
+  explicit call-body policy, and consumed through v3-owned typed-call lowering
+  or the v3-gated early inline rewrite. Constant-string indexed fields are
+  selected by v3 from raw
   `type_keys`, emitted as mechanical
   indexed-field decisions, and consumed as v3-owned typed attribute inputs.
   Indexed globals are selected by v3 from raw `module_keys` plus lowered
@@ -435,12 +440,15 @@ or as guardless v3-owned sources. Prepared method guards lower mechanically to
 mechanically to `InstrTyped::GuardedCallableCallTyped` before the legacy
 call-access annotator runs. Guardless v3-owned sources remain generic calls
 instead of being replanned from legacy call-target evidence. V3 targets are also
-used for direct-function predeclaration, process-JIT batch scheduling, and the
-earlier BlockPy store-call rewrite for ordinary direct calls, but planner queries over legacy
-`FunctionProfileEvidence` do not see v3 call targets. Current v3 direct-call
-support covers ordinary function targets and receiver-method targets with
-validated positional/default argument plans, plus class-constructor targets
-whose hot target is a transformed `__init__`. On the legacy path, compatible
+used for direct-function predeclaration and process-JIT batch scheduling. The
+earlier BlockPy store-call rewrite now consumes only v3 call plans whose
+serialized body policy is `Inline`; v3 plans whose body policy is `DirectCall`
+stay in the original lowered call shape for later mechanical typed-call
+lowering. Planner queries over legacy `FunctionProfileEvidence` do not see v3
+call targets. Current v3 direct-call support covers ordinary function targets
+and receiver-method targets with validated positional/default argument plans,
+plus class-constructor targets whose hot target is a transformed `__init__`.
+On the legacy path, compatible
 profiled targets still become
 guarded ordinary-call, constructor-call, or method-call plans with the selected
 `FunctionId`, owner/type-version guard when needed, and direct-entry argument
@@ -619,9 +627,11 @@ JIT emitter still materializes the full guarded call blocks today.
   `InstrTyped::GuardedCallableCallTyped` payloads directly instead of converting
   them back into typed call access plans. Ordinary v3 direct-call store sites
   and eligible no-argument v3 method/runtime-iter sites are expanded in the
-  profiled BlockPy module plan. The next step is to expand remaining guarded
-  method/constructor typed nodes into explicit guard, direct-call, and fallback
-  CFG blocks before final JIT emission.
+  profiled BlockPy module plan only when the v3 plan selected `Inline` as the
+  call-body policy. The next step is to make inline eligibility itself richer in
+  the offline request facts and to expand remaining guarded method/constructor
+  typed nodes into explicit guard, direct-call, and fallback CFG blocks before
+  final JIT emission.
 - Typed call access plans are validated before specialized JIT emission, and
   typed calls use the selected plan as the source of truth. If annotation leaves
   a typed call as generic/profiled-only, codegen does not rediscover a guarded
