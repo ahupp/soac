@@ -1,9 +1,9 @@
 pub mod codegen_cache;
 
 use crate::codegen_cache::{
-    CachedCodegenModule, CachedCodegenModuleMetadata, CachedPreparedCodegen,
-    load_codegen_module_cache, remap_cached_codegen_module_function_ids,
-    store_codegen_module_cache, validate_codegen_module_cache_metadata,
+    CachedCodegenModule, CachedCodegenModuleMetadata, load_codegen_module_cache,
+    remap_cached_codegen_module_function_ids, store_codegen_module_cache,
+    validate_codegen_module_cache_metadata,
 };
 use soac_config::{SoacEnvConfig, init_logging_with_config};
 use soac_core::block_py::{BlockPyModule, CounterDef, CounterId, CounterScope, ModuleNameGen};
@@ -36,7 +36,6 @@ impl LoweringOptions {
 
 struct PreOptimizationModule {
     module: BlockPyModule<CodegenModuleShape>,
-    prepared: Option<CachedPreparedCodegen>,
     cache_path_for_store: Option<PathBuf>,
     cache_metadata_for_store: Option<CachedCodegenModuleMetadata>,
 }
@@ -197,23 +196,19 @@ fn rewrite_pre_optimization_module_with_cache(
                         );
                     } else {
                         remap_cached_codegen_module_function_ids(&mut cache, module_name_gen);
-                        let has_prepared = cache.prepared.is_some();
                         info!(
                             target: "soac_blockpy_module_cache",
                             event = "soac.blockpy_module_cache",
                             cache_hit = true,
-                            prepared = has_prepared,
                             path = %cache_path.display(),
                             "blockpy_module_cache_hit",
                         );
                         let CachedCodegenModule {
                             metadata: _,
                             module,
-                            prepared,
                         } = cache;
                         return Ok(PreOptimizationModule {
                             module: pass_tracker.run_pass("bb_codegen", || module),
-                            prepared,
                             cache_path_for_store: None,
                             cache_metadata_for_store: None,
                         });
@@ -248,7 +243,6 @@ fn rewrite_pre_optimization_module_with_cache(
         )?;
         Ok(PreOptimizationModule {
             module,
-            prepared: None,
             cache_path_for_store: Some(cache_path.clone()),
             cache_metadata_for_store: options.pre_optimization_cache_metadata.clone(),
         })
@@ -261,7 +255,6 @@ fn rewrite_pre_optimization_module_with_cache(
         )?;
         Ok(PreOptimizationModule {
             module,
-            prepared: None,
             cache_path_for_store: None,
             cache_metadata_for_store: None,
         })
@@ -272,11 +265,10 @@ fn store_pre_optimization_cache(
     cache_path: &Path,
     metadata: &CachedCodegenModuleMetadata,
     module: &BlockPyModule<CodegenModuleShape>,
-    prepared: &CachedPreparedCodegen,
     pass_tracker: &mut impl PassTracker,
 ) {
     let stored = pass_tracker.record_timing("bb_codegen_cache_store", || {
-        store_codegen_module_cache(cache_path, metadata, module, Some(prepared))
+        store_codegen_module_cache(cache_path, metadata, module)
     });
     match stored {
         Ok(()) => {
@@ -306,80 +298,18 @@ fn finish_codegen_module_with_tracker(
 ) -> Result<BlockPyModule<CodegenModuleShape>> {
     let PreOptimizationModule {
         module: bb_codegen,
-        prepared,
         cache_path_for_store,
         cache_metadata_for_store,
     } = pre_optimization;
     pass_tracker.record_timing("validate_codegen_instr_ids", || {
         passes::validate_codegen_instr_ids(&bb_codegen).map_err(anyhow::Error::msg)
     })?;
-    let prepared = if let Some(prepared) = prepared {
-        pass_tracker.record_timing("prepared_codegen_cache_use", || prepared)
-    } else {
-        let escape_summary = pass_tracker.run_pass("escape_summary", || {
-            passes::summarize_module_escapes(&bb_codegen)
-        });
-        let inline_plan = pass_tracker.run_pass("inline_plan", || {
-            passes::plan_module_inlining(&escape_summary)
-        });
-        let value_facts: passes::FactStore = pass_tracker.record_timing("value_facts", || {
-            passes::infer_module_value_facts(&bb_codegen)
-        });
-        let ownership_plan: passes::RefcountPlan = pass_tracker
-            .record_timing("ownership_effects", || {
-                passes::plan_ownership_effects(&bb_codegen, &value_facts)
-            });
-        pass_tracker.record_timing("validate_ownership_effects", || {
-            passes::validate_ownership_effects(&bb_codegen, &value_facts, &ownership_plan)
-                .map_err(anyhow::Error::msg)
-        })?;
-        let local_env_plan: passes::LocalEnvModulePlan = pass_tracker
-            .record_timing("local_env_plan", || {
-                passes::plan_local_env_module(&bb_codegen, &value_facts)
-            });
-        pass_tracker.record_timing("validate_local_env_plan", || {
-            passes::validate_local_env_module_plan(&bb_codegen, &value_facts, &local_env_plan)
-                .map_err(anyhow::Error::msg)
-        })?;
-        let local_env_resume_plan: passes::LocalEnvResumeModulePlan = pass_tracker
-            .record_timing("local_env_resume_plan", || {
-                passes::plan_local_env_resume_module(&bb_codegen, &local_env_plan, &value_facts)
-            });
-        pass_tracker.record_timing("validate_local_env_resume_plan", || {
-            passes::validate_local_env_resume_module_plan(
-                &bb_codegen,
-                &local_env_plan,
-                &value_facts,
-                &local_env_resume_plan,
-            )
-            .map_err(anyhow::Error::msg)
-        })?;
-        CachedPreparedCodegen {
-            escape_summary,
-            inline_plan,
-            value_facts,
-            ownership_plan,
-            local_env_plan,
-            local_env_resume_plan,
-        }
-    };
 
     if let Some(cache_path) = &cache_path_for_store {
         if let Some(metadata) = &cache_metadata_for_store {
-            store_pre_optimization_cache(
-                cache_path,
-                metadata,
-                &bb_codegen,
-                &prepared,
-                pass_tracker,
-            );
+            store_pre_optimization_cache(cache_path, metadata, &bb_codegen, pass_tracker);
         }
     }
-
-    let CachedPreparedCodegen {
-        local_env_resume_plan,
-        ..
-    } = prepared;
 
     let bb_traced: BlockPyModule<CodegenModuleShape> =
         if let Some(config) = passes::parse_trace_env(env_config) {
@@ -432,23 +362,43 @@ fn finish_codegen_module_with_tracker(
             bb_locality_counted
         };
 
-    let bb_deopt_entry_counted: BlockPyModule<CodegenModuleShape> =
-        if passes::deopt_entry_counter_instrumentation_enabled(env_config) {
-            pass_tracker.record_timing("bb_deopt_entry_counters", || {
-                let mut counted = bb_refcount_counted;
-                passes::define_bb_module_deopt_entry_counters(&mut counted, &local_env_resume_plan);
-                counted
-            })
-        } else {
-            bb_refcount_counted
-        };
-
     pass_tracker.record_timing("validate", || {
-        soac_lowering::block_py::validate::validate_codegen_module(&bb_deopt_entry_counted)
+        soac_lowering::block_py::validate::validate_codegen_module(&bb_refcount_counted)
             .map_err(anyhow::Error::msg)
     })?;
 
-    Ok(bb_deopt_entry_counted)
+    Ok(bb_refcount_counted)
+}
+
+fn define_deopt_entry_counters_for_current_module(
+    module: &mut BlockPyModule<CodegenModuleShape>,
+    pass_tracker: &mut impl PassTracker,
+) -> Result<()> {
+    let value_facts = pass_tracker.record_timing("deopt_entry_value_facts", || {
+        passes::infer_module_value_facts(module)
+    });
+    let local_env_plan = pass_tracker.record_timing("deopt_entry_local_env_plan", || {
+        passes::plan_local_env_module(module, &value_facts)
+    });
+    pass_tracker.record_timing("validate_deopt_entry_local_env_plan", || {
+        passes::validate_local_env_module_plan(module, &value_facts, &local_env_plan)
+            .map_err(anyhow::Error::msg)
+    })?;
+    let local_env_resume_plan = pass_tracker
+        .record_timing("deopt_entry_local_env_resume_plan", || {
+            passes::plan_local_env_resume_module(module, &local_env_plan, &value_facts)
+        });
+    pass_tracker.record_timing("validate_deopt_entry_local_env_resume_plan", || {
+        passes::validate_local_env_resume_module_plan(
+            module,
+            &local_env_plan,
+            &value_facts,
+            &local_env_resume_plan,
+        )
+        .map_err(anyhow::Error::msg)
+    })?;
+    passes::define_bb_module_deopt_entry_counters(module, &local_env_resume_plan);
+    Ok(())
 }
 
 pub fn finish_cached_codegen_module_for_runtime(
@@ -458,7 +408,6 @@ pub fn finish_cached_codegen_module_for_runtime(
     finish_codegen_module_with_tracker(
         PreOptimizationModule {
             module,
-            prepared: None,
             cache_path_for_store: None,
             cache_metadata_for_store: None,
         },
@@ -475,6 +424,9 @@ pub fn finish_cached_codegen_module_for_runtime_with_counter_defs(
     let mut module = finish_cached_codegen_module_for_runtime(module, env_config)?;
     retain_defined_explicit_counter_increments(&mut module, counter_defs);
     module.counter_defs = counter_defs.to_vec();
+    if passes::deopt_entry_counter_instrumentation_enabled(env_config) {
+        define_deopt_entry_counters_for_current_module(&mut module, &mut NoopPassTracker::new())?;
+    }
     Ok(module)
 }
 
@@ -521,7 +473,7 @@ mod tests {
             soac_lowering::lower_python_to_blockpy_recorded(source, ModuleNameGen::new(1))
                 .expect("initial lowering should succeed")
                 .codegen_module;
-        store_codegen_module_cache(cache_path.as_path(), &stale_metadata, &stale_module, None)
+        store_codegen_module_cache(cache_path.as_path(), &stale_metadata, &stale_module)
             .expect("stale cache should be writable");
 
         if let Err(err) = lower_python_to_blockpy_recorded_with_options(
@@ -544,7 +496,7 @@ mod tests {
     }
 
     #[test]
-    fn pre_optimization_lowering_does_not_run_inline_rewrite_cleanup() {
+    fn pre_optimization_lowering_does_not_compute_or_store_prepared_codegen_facts() {
         let source = "def callee(x):\n    return x\n\ndef caller(x):\n    return callee(x)\n";
         let lowered = lower_python_to_blockpy_recorded(source, ModuleNameGen::new(0))
             .expect("transform should succeed");
@@ -555,10 +507,27 @@ mod tests {
             .map(|timing| timing.name)
             .collect::<Vec<_>>();
 
-        assert!(
-            pass_names.contains(&"inline_plan"),
-            "driver should still compute inline analysis facts for cached prepared codegen"
-        );
+        for removed_pass in ["escape_summary", "inline_plan"] {
+            assert!(
+                !pass_names.contains(&removed_pass),
+                "pre-optimization lowering should not compute {removed_pass} for cached prepared codegen"
+            );
+        }
+        for removed_timing in [
+            "prepared_codegen_cache_use",
+            "value_facts",
+            "ownership_effects",
+            "validate_ownership_effects",
+            "local_env_plan",
+            "validate_local_env_plan",
+            "local_env_resume_plan",
+            "validate_local_env_resume_plan",
+        ] {
+            assert!(
+                !timing_names.iter().any(|name| name == removed_timing),
+                "pre-optimization lowering should not compute {removed_timing} for cached prepared codegen"
+            );
+        }
         assert!(
             !timing_names.iter().any(|name| matches!(
                 name.as_str(),
@@ -698,7 +667,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_mode_keeps_only_deopt_entry_counters_even_with_runtime_logging() {
+    fn apply_mode_preoptimization_lowering_does_not_define_deopt_entry_counters() {
         let config = SoacEnvConfig::default()
             .with_specialization_mode(Some(SpecializationMode::Apply))
             .with_soac_work_dir(Some(fresh_test_work_dir("apply-counter")))
@@ -715,24 +684,38 @@ mod tests {
             .codegen_module;
 
         assert!(
-            lowered
-                .counter_defs
-                .iter()
-                .all(|counter| counter.kind == "deopt_entry_guard_miss"),
-            "apply lowering should keep only deopt-entry counters just because runtime logging is enabled: {:?}",
+            lowered.counter_defs.is_empty(),
+            "pre-optimization apply lowering should not define counters just because runtime logging is enabled: {:?}",
             lowered
                 .counter_defs
                 .iter()
                 .map(|counter| counter.kind.as_str())
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn cached_runtime_finish_defines_deopt_entry_counters_on_final_module() {
+        let source = "VALUE = 7\n\ndef read(x):\n    return x + VALUE\n";
+        let module = lower_python_to_blockpy_for_testing(source)
+            .expect("transform should succeed")
+            .codegen_module;
+        let config = SoacEnvConfig::default()
+            .with_specialization_mode(Some(SpecializationMode::Apply))
+            .with_soac_work_dir(Some(fresh_test_work_dir("final-apply-counter")));
+
+        let finished =
+            finish_cached_codegen_module_for_runtime_with_counter_defs(module, &config, &[])
+                .expect("finish cached runtime module");
+
         assert!(
-            lowered
+            finished
                 .counter_defs
                 .iter()
-                .all(|counter| matches!(counter.site, CounterSite::DeoptEntry { .. })),
-            "apply deopt-entry counters should carry source metadata: {:?}",
-            lowered.counter_defs
+                .any(|counter| counter.kind == "deopt_entry_guard_miss"
+                    && matches!(counter.site, CounterSite::DeoptEntry { .. })),
+            "final apply module should define deopt-entry counters from the final local-env resume plan: {:?}",
+            finished.counter_defs
         );
     }
 

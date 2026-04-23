@@ -16,10 +16,15 @@ use soac_core::profile::{
     CounterDumpBranchValue, CounterDumpKeyLayout, CounterDumpRecord, CounterDumpRow,
     CounterDumpTypeKey, CounterDumpTypeKeyLayout, CounterDumpTypeTableEntry,
 };
-use soac_driver::codegen_cache::PythonModuleCacheSource;
+use soac_driver::codegen_cache::{
+    PythonModuleCacheSource, load_codegen_module_cache, module_optimized_codegen_v3_path,
+    pre_optimization_module_cache_metadata, remap_cached_codegen_module_function_ids,
+    validate_codegen_module_cache_metadata,
+};
+use soac_driver::finish_cached_codegen_module_for_runtime_with_counter_defs;
 use soac_lowering::passes::{
-    CodegenModuleShape, InlinePlanModule, plan_module_inlining,
-    specialization_runtime_logging_enabled, summarize_module_escapes,
+    CodegenModuleShape, deopt_entry_counter_instrumentation_enabled,
+    specialization_runtime_logging_enabled,
 };
 use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, c_int, c_void};
@@ -55,7 +60,6 @@ pub struct ModuleInfo {
 
 pub struct SharedModuleState {
     pub lowered_module: BlockPyModule<CodegenModuleShape>,
-    pub inline_plan: InlinePlanModule,
     pub module_name: String,
     pub package_name: String,
     pub source_hash: u64,
@@ -874,10 +878,8 @@ pub fn build_shared_state_for_inspection_with_placeholder_constants(
     let module_constant_objs = (0..codegen_constants.len())
         .map(|_| py.None())
         .collect::<Vec<_>>();
-    let inline_plan = plan_inline_candidates(&lowered_module);
     Ok(Arc::new(SharedModuleState {
         lowered_module,
-        inline_plan,
         module_name: module_name.to_string(),
         package_name: package_name.to_string(),
         source_hash: 0,
@@ -914,10 +916,8 @@ pub fn build_shared_state_for_inspection_with_placeholder_constants_and_source_h
     let module_constant_objs = (0..codegen_constants.len())
         .map(|_| py.None())
         .collect::<Vec<_>>();
-    let inline_plan = plan_inline_candidates(&lowered_module);
     Ok(Arc::new(SharedModuleState {
         lowered_module,
-        inline_plan,
         module_name: module_name.to_string(),
         package_name: package_name.to_string(),
         source_hash,
@@ -988,10 +988,8 @@ fn build_shared_state_for_inspection_with_original_code_and_source_hash(
     };
     let module_constant_objs =
         build_module_constant_objects(py, &codegen_constants, module_name, source_hash)?;
-    let inline_plan = plan_inline_candidates(&lowered_module);
     Ok(Arc::new(SharedModuleState {
         lowered_module,
-        inline_plan,
         module_name: module_name.to_string(),
         package_name: package_name.to_string(),
         source_hash,
@@ -1038,9 +1036,63 @@ fn build_function_index_by_id(
     Ok(function_index_by_id)
 }
 
-fn plan_inline_candidates(module: &BlockPyModule<CodegenModuleShape>) -> InlinePlanModule {
-    let escape_summary = summarize_module_escapes(module);
-    plan_module_inlining(&escape_summary)
+fn append_final_deopt_counter_defs_for_runtime(
+    lowered_module: &mut BlockPyModule<CodegenModuleShape>,
+    module_name: &str,
+    source_hash: u64,
+    module_cache_source: Option<PythonModuleCacheSource>,
+) -> PyResult<()> {
+    let env_config = SoacEnvConfig::from_env().map_err(PyRuntimeError::new_err)?;
+    if !deopt_entry_counter_instrumentation_enabled(&env_config) {
+        return Ok(());
+    }
+    let Some(cache_root) = env_config.module_cache_root() else {
+        return Ok(());
+    };
+    let candidate_sources = match module_cache_source {
+        Some(source) => vec![source],
+        None => vec![
+            PythonModuleCacheSource::Project,
+            PythonModuleCacheSource::PythonStdlib,
+        ],
+    };
+    for source in candidate_sources {
+        let path = module_optimized_codegen_v3_path(cache_root.as_path(), source, module_name)
+            .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+        if !path.exists() {
+            continue;
+        }
+        let mut cache = load_codegen_module_cache(path.as_path())
+            .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+        let expected = pre_optimization_module_cache_metadata(
+            source,
+            module_name,
+            source_hash,
+            env!("SOAC_BUILD_IDENTITY"),
+            module_name == "soac.runtime",
+        );
+        validate_codegen_module_cache_metadata(&cache.metadata, &expected)
+            .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+        remap_cached_codegen_module_function_ids(
+            &mut cache,
+            lowered_module.module_name_gen.clone(),
+        );
+        let original_counter_count = lowered_module.counter_defs.len();
+        let finalized = finish_cached_codegen_module_for_runtime_with_counter_defs(
+            cache.module,
+            &env_config,
+            lowered_module.counter_defs.as_slice(),
+        )
+        .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+        lowered_module.counter_defs.extend(
+            finalized
+                .counter_defs
+                .into_iter()
+                .skip(original_counter_count),
+        );
+        return Ok(());
+    }
+    Ok(())
 }
 
 #[repr(C)]
@@ -1054,7 +1106,7 @@ impl SoacExtModuleState {
         &mut self,
         py: Python<'_>,
         compile_session: &Arc<crate::session::CompileSession>,
-        lowered_module: BlockPyModule<CodegenModuleShape>,
+        mut lowered_module: BlockPyModule<CodegenModuleShape>,
         original_code_by_function_id: HashMap<RuntimeFunctionId, Py<PyAny>>,
         module_name: String,
         package_name: String,
@@ -1066,6 +1118,12 @@ impl SoacExtModuleState {
                 "transformed module state was unexpectedly initialized twice",
             ));
         }
+        append_final_deopt_counter_defs_for_runtime(
+            &mut lowered_module,
+            module_name.as_str(),
+            source_hash,
+            module_cache_source,
+        )?;
         let function_index_by_id = build_function_index_by_id(&lowered_module)?;
         let (counter_slots_by_id, counter_values, top_value_counters) =
             build_counter_storage(&lowered_module.counter_defs)?;
@@ -1080,10 +1138,8 @@ impl SoacExtModuleState {
             module_name.as_str(),
             source_hash,
         )?;
-        let inline_plan = plan_inline_candidates(&lowered_module);
         let shared_state = Arc::new(SharedModuleState {
             lowered_module,
-            inline_plan,
             module_name,
             package_name,
             source_hash,
@@ -1775,7 +1831,6 @@ def f():
             function_index_by_id: build_function_index_by_id(&lowered)
                 .expect("function index should build"),
             codegen_constants: ModuleCodegenConstants::collect_from_module(&lowered),
-            inline_plan: plan_inline_candidates(&lowered),
             source_hash: 0,
             module_cache_source: None,
             storage_instance_key: allocate_shared_module_state_storage_key(),
@@ -1852,7 +1907,6 @@ def f(x):
             function_index_by_id: build_function_index_by_id(&lowered)
                 .expect("function index should build"),
             codegen_constants: ModuleCodegenConstants::collect_from_module(&lowered),
-            inline_plan: plan_inline_candidates(&lowered),
             source_hash: 0,
             module_cache_source: None,
             storage_instance_key: allocate_shared_module_state_storage_key(),
@@ -2040,7 +2094,6 @@ def f():
             function_index_by_id: build_function_index_by_id(&lowered)
                 .expect("function index should build"),
             codegen_constants: ModuleCodegenConstants::collect_from_module(&lowered),
-            inline_plan: plan_inline_candidates(&lowered),
             source_hash: 0,
             module_cache_source: None,
             storage_instance_key: allocate_shared_module_state_storage_key(),

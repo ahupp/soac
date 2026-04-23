@@ -6590,14 +6590,12 @@ fn emit_deopt_entry_guard_miss_counter(
     let Some(counter_id) = ctx.deopt_entry_guard_miss_counter_ids.get(&ordinal) else {
         return;
     };
-    let counter_slot = scalar_counter_slot_for_id(ctx.counter_slots_by_id, *counter_id)
-        .unwrap_or_else(|err| panic!("{err}"));
-    let scalar_counter_base_value = ctx.consts.scalar_counter_base_value.unwrap_or_else(|| {
-        panic!(
-            "missing scalar counter base for deopt-entry counter id {}",
-            counter_id.0
-        )
-    });
+    let Ok(counter_slot) = scalar_counter_slot_for_id(ctx.counter_slots_by_id, *counter_id) else {
+        return;
+    };
+    let Some(scalar_counter_base_value) = ctx.consts.scalar_counter_base_value else {
+        return;
+    };
     emit_increment_counter_slot(fb, scalar_counter_base_value, counter_slot);
 }
 

@@ -1712,7 +1712,6 @@ fn generate_loaded_module_optimization_plan_v3(
         optimized_module_path.as_path(),
         &cache.metadata,
         &optimized_module,
-        None,
     )?;
     Ok(Some(ModuleOptimizationPlanReport {
         output_path,

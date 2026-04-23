@@ -3152,8 +3152,7 @@ def build(values):
             metadata.module_name.as_str(),
         )
         .map_err(|err| err.to_string())?;
-        store_codegen_module_cache(path.as_path(), metadata, module, None)
-            .map_err(|err| err.to_string())
+        store_codegen_module_cache(path.as_path(), metadata, module).map_err(|err| err.to_string())
     }
 
     fn write_test_optimization_artifacts_v3_for_shared_state(

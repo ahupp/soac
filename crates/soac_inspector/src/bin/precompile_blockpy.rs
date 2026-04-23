@@ -677,7 +677,6 @@ mod test {
                 path.as_path(),
                 &module_cache_metadata_for_source(source, &module_ref, SOAC_BUILD_IDENTITY),
                 &lowered,
-                None,
             )
             .unwrap();
         }
@@ -722,7 +721,6 @@ mod test {
                 SOAC_BUILD_IDENTITY,
             ),
             &lowered,
-            None,
         )
         .unwrap();
 
