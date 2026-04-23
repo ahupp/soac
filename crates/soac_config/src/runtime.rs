@@ -5,6 +5,7 @@ use std::sync::Arc;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 pub(crate) const SOAC_OPT_MODE_ENV: &str = "SOAC_OPT_MODE";
+pub(crate) const SOAC_OPT_RUNTIME_PIPELINE_ENV: &str = "SOAC_OPT_RUNTIME_PIPELINE";
 pub(crate) const SOAC_WORK_DIR_ENV: &str = "SOAC_WORK_DIR";
 pub(crate) const SOAC_CRANELIFT_OPT_LEVEL_ENV: &str = "SOAC_CRANELIFT_OPT_LEVEL";
 pub(crate) const SOAC_ENABLE_PROFILED_COLD_BLOCKS_ENV: &str = "SOAC_ENABLE_PROFILED_COLD_BLOCKS";
@@ -65,6 +66,28 @@ impl SpecializationMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeOptimizationPipeline {
+    PlanArtifacts,
+    TypedV3Identity,
+}
+
+impl RuntimeOptimizationPipeline {
+    pub fn from_str(mode: &str) -> Result<Self, String> {
+        match mode.trim() {
+            "plan-artifacts" => Ok(Self::PlanArtifacts),
+            "typed-v3" => Ok(Self::TypedV3Identity),
+            value => Err(format!(
+                "unrecognized runtime optimization pipeline {value:?}; expected one of: plan-artifacts, typed-v3"
+            )),
+        }
+    }
+
+    pub fn uses_identity_typed_runtime(self) -> bool {
+        matches!(self, Self::TypedV3Identity)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompileMode {
     Lazy,
     Eager,
@@ -92,6 +115,7 @@ pub struct SoacLogConfig {
 pub struct SoacEnvConfig {
     cranelift_opt_level: String,
     specialization_mode: Option<SpecializationMode>,
+    runtime_optimization_pipeline: RuntimeOptimizationPipeline,
     soac_work_dir: Option<PathBuf>,
     profiled_cold_blocks_enabled: bool,
     jit_refcount_emission_enabled: bool,
@@ -167,6 +191,9 @@ impl SoacEnvConfig {
         )?;
         let specialization_mode =
             parse_optional_specialization_mode(env_string(SOAC_OPT_MODE_ENV)?.as_deref())?;
+        let runtime_optimization_pipeline = parse_optional_runtime_optimization_pipeline(
+            env_string(SOAC_OPT_RUNTIME_PIPELINE_ENV)?.as_deref(),
+        )?;
         let soac_work_dir = env_path(SOAC_WORK_DIR_ENV)?;
         let profiled_cold_blocks_enabled = env_bool(SOAC_ENABLE_PROFILED_COLD_BLOCKS_ENV, false)?;
         let jit_refcount_emission_enabled = env_bool(SOAC_JIT_EMIT_REFCOUNTS_ENV, true)?;
@@ -189,6 +216,7 @@ impl SoacEnvConfig {
         Ok(Self {
             cranelift_opt_level,
             specialization_mode,
+            runtime_optimization_pipeline,
             soac_work_dir,
             profiled_cold_blocks_enabled,
             jit_refcount_emission_enabled,
@@ -208,6 +236,14 @@ impl SoacEnvConfig {
         specialization_mode: Option<SpecializationMode>,
     ) -> Self {
         self.specialization_mode = specialization_mode;
+        self
+    }
+
+    pub fn with_runtime_optimization_pipeline(
+        mut self,
+        pipeline: RuntimeOptimizationPipeline,
+    ) -> Self {
+        self.runtime_optimization_pipeline = pipeline;
         self
     }
 
@@ -238,6 +274,10 @@ impl SoacEnvConfig {
 
     pub fn specialization_mode(&self) -> Option<SpecializationMode> {
         self.specialization_mode
+    }
+
+    pub fn runtime_optimization_pipeline(&self) -> RuntimeOptimizationPipeline {
+        self.runtime_optimization_pipeline
     }
 
     pub fn soac_work_dir(&self) -> Option<&Path> {
@@ -301,6 +341,12 @@ impl SoacEnvConfig {
     }
 
     pub fn specialization_runtime_logging_enabled(&self) -> bool {
+        if self
+            .runtime_optimization_pipeline
+            .uses_identity_typed_runtime()
+        {
+            return false;
+        }
         self.specialization_mode == Some(SpecializationMode::Apply)
             && (self.soac_log_has_explicit_value() || self.soac_work_dir.is_some())
     }
@@ -315,6 +361,7 @@ impl Default for SoacEnvConfig {
         Self {
             cranelift_opt_level: "speed".to_string(),
             specialization_mode: None,
+            runtime_optimization_pipeline: RuntimeOptimizationPipeline::PlanArtifacts,
             soac_work_dir: None,
             profiled_cold_blocks_enabled: false,
             jit_refcount_emission_enabled: true,
@@ -399,6 +446,16 @@ fn parse_optional_specialization_mode(
     };
     SpecializationMode::from_str(mode)
         .map_err(|err| invalid_env_value(SOAC_OPT_MODE_ENV, mode, err))
+}
+
+fn parse_optional_runtime_optimization_pipeline(
+    raw: Option<&str>,
+) -> Result<RuntimeOptimizationPipeline, String> {
+    let Some(raw) = raw else {
+        return Ok(RuntimeOptimizationPipeline::PlanArtifacts);
+    };
+    RuntimeOptimizationPipeline::from_str(raw)
+        .map_err(|err| invalid_env_value(SOAC_OPT_RUNTIME_PIPELINE_ENV, raw, err))
 }
 
 fn parse_optional_compile_mode(raw: Option<&str>) -> Result<CompileMode, String> {
@@ -504,6 +561,7 @@ mod tests {
     fn clear_soac_config_env() -> Vec<EnvVarGuard> {
         vec![
             EnvVarGuard::remove(SOAC_OPT_MODE_ENV),
+            EnvVarGuard::remove(SOAC_OPT_RUNTIME_PIPELINE_ENV),
             EnvVarGuard::remove(SOAC_WORK_DIR_ENV),
             EnvVarGuard::remove(SOAC_CRANELIFT_OPT_LEVEL_ENV),
             EnvVarGuard::remove(SOAC_ENABLE_PROFILED_COLD_BLOCKS_ENV),
@@ -537,6 +595,10 @@ mod tests {
         let config = SoacEnvConfig::from_env().unwrap();
 
         assert_eq!(config.specialization_mode(), None);
+        assert_eq!(
+            config.runtime_optimization_pipeline(),
+            RuntimeOptimizationPipeline::PlanArtifacts
+        );
         assert_eq!(config.cranelift_opt_level(), "speed");
         assert_eq!(config.compile_mode(), CompileMode::Lazy);
         assert_eq!(config.jit_compile_workers(), None);
@@ -554,6 +616,20 @@ mod tests {
         let config = SoacEnvConfig::from_env().unwrap();
 
         assert_eq!(config.jit_compile_workers(), Some(3));
+    }
+
+    #[test]
+    fn env_config_parses_runtime_optimization_pipeline() {
+        let _lock = env_lock().lock().unwrap();
+        let _guards = clear_soac_config_env();
+        let _pipeline = EnvVarGuard::set(SOAC_OPT_RUNTIME_PIPELINE_ENV, "typed-v3");
+
+        let config = SoacEnvConfig::from_env().unwrap();
+
+        assert_eq!(
+            config.runtime_optimization_pipeline(),
+            RuntimeOptimizationPipeline::TypedV3Identity
+        );
     }
 
     #[test]
@@ -635,6 +711,7 @@ mod tests {
 
         for (name, value) in [
             (SOAC_OPT_MODE_ENV, "bogus"),
+            (SOAC_OPT_RUNTIME_PIPELINE_ENV, "legacy"),
             (SOAC_CRANELIFT_OPT_LEVEL_ENV, "fastest"),
             (SOAC_ENABLE_PROFILED_COLD_BLOCKS_ENV, "maybe"),
             (SOAC_JIT_EMIT_REFCOUNTS_ENV, ""),

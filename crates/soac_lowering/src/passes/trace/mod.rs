@@ -32,6 +32,12 @@ pub fn refcount_counter_instrumentation_enabled(config: &SoacEnvConfig) -> bool 
 }
 
 pub fn deopt_entry_counter_instrumentation_enabled(config: &SoacEnvConfig) -> bool {
+    if config
+        .runtime_optimization_pipeline()
+        .uses_identity_typed_runtime()
+    {
+        return false;
+    }
     matches!(
         config.specialization_mode(),
         Some(SpecializationMode::Verify | SpecializationMode::Apply)

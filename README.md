@@ -373,6 +373,13 @@ typed variables must use recognized values. Boolean knobs accept `1`, `true`,
   unoptimized BlockPy modules and raw profile evidence. `verify`, `apply`, and
   precompile consume those artifacts directly.
 
+- `SOAC_OPT_RUNTIME_PIPELINE=typed-v3` enables the experimental runtime typed
+  pipeline for `verify`/`apply`. It bypasses required `mod.optv3` and
+  `mod.optv3.blockpy` loading, builds the JIT module from the cached
+  pre-optimization `mod.blockpy`, lowers `CodegenModuleShape` to
+  `TypedCodegenModuleShape`, and emits the typed JIT without optimization
+  rewrites. Leave it unset for normal serialized-plan execution.
+
 Notes:
 - In normal workflows set one `SOAC_WORK_DIR` for the whole multi-pass
   run and change only `SOAC_OPT_MODE`.

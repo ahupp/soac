@@ -29,7 +29,7 @@ use cranelift_jit::{ArenaMemoryProvider, JITBuilder, JITModule};
 use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module, ModuleReloc};
 use cranelift_reader::parse_functions;
 use pyo3::{Py, PyAny, Python, ffi};
-use soac_config::SoacEnvConfig;
+use soac_config::{RuntimeOptimizationPipeline, SoacEnvConfig};
 use soac_core::block_py as blockpy_intrinsics;
 use soac_core::block_py::literal::Literal;
 use soac_core::block_py::{
@@ -1688,6 +1688,7 @@ impl JitBatchPlan<'_> {
         &mut self,
         inputs: &DirectFunctionCompileInputs<'_>,
     ) -> Result<(), String> {
+        let runtime_pipeline = inputs.session.env_config()?.runtime_optimization_pipeline();
         for batch_function_index in &self.function_indices_to_define {
             let batch_function = &self.batch_functions[*batch_function_index];
             let reserved_inputs = self
@@ -1703,13 +1704,22 @@ impl JitBatchPlan<'_> {
                     Some(shared_state),
                     Some(inputs.session.as_ref()),
                 )?;
-                if profile.optimized_module.is_some() {
+                if runtime_pipeline.uses_identity_typed_runtime() {
+                    build_identity_typed_jit_module_plan(&shared_state.lowered_module)?
+                } else if profile.optimized_module.is_some() {
                     build_profiled_jit_module_plan(&shared_state.lowered_module, &profile)?
                 } else {
                     shared_state.jit_module_plan()?
                 }
             } else {
-                build_jit_module_plan(inputs.module)?
+                match runtime_pipeline {
+                    RuntimeOptimizationPipeline::PlanArtifacts => {
+                        build_jit_module_plan(inputs.module)?
+                    }
+                    RuntimeOptimizationPipeline::TypedV3Identity => {
+                        build_identity_typed_jit_module_plan(inputs.module)?
+                    }
+                }
             };
             self.module_plans.insert(binding_key, module_plan);
         }
@@ -1825,6 +1835,12 @@ fn build_jit_module_plan(
     module: &BlockPyModule<CodegenModuleShape>,
 ) -> Result<Arc<JitModulePlan>, String> {
     build_jit_module_plan_from_owned_module(module.clone())
+}
+
+fn build_identity_typed_jit_module_plan(
+    module: &BlockPyModule<CodegenModuleShape>,
+) -> Result<Arc<JitModulePlan>, String> {
+    build_jit_module_plan(module)
 }
 
 fn build_profiled_jit_module_plan(
@@ -11276,6 +11292,12 @@ fn load_planned_optimization_inputs_for_runtime_state(
     ) {
         return Ok(PlannedOptimizationInputs::default());
     }
+    if env_config
+        .runtime_optimization_pipeline()
+        .uses_identity_typed_runtime()
+    {
+        return Ok(PlannedOptimizationInputs::default());
+    }
     let Some(shared_state) = shared_state else {
         return Ok(PlannedOptimizationInputs::default());
     };
@@ -11674,7 +11696,11 @@ impl<'a> SpecializationProfile<'a> {
     ) -> Result<Self, String> {
         let env_config = env_config_for_session(compile_session)?;
         let specialization_mode = env_config.specialization_mode();
+        let identity_typed_runtime = env_config
+            .runtime_optimization_pipeline()
+            .uses_identity_typed_runtime();
         let counter_dump_path = if shared_state.is_some()
+            && !identity_typed_runtime
             && specialization_mode != Some(crate::config::SpecializationMode::Profile)
         {
             env_config.counter_dump_input_path()
@@ -11696,13 +11722,16 @@ impl<'a> SpecializationProfile<'a> {
             opt_v3_emitted_indexed_fields: planned_inputs.opt_v3_emitted_indexed_fields,
             opt_v3_emitted_indexed_globals: planned_inputs.opt_v3_emitted_indexed_globals,
             opt_v3_exact_int_branch_artifacts: planned_inputs.opt_v3_exact_int_branch_artifacts,
-            behavior_change_indexed_stores: specialization_mode
-                .is_some_and(SpecializationMode::behavior_change_indexed_stores_enabled),
-            profiled_cold_blocks: env_config.profiled_cold_blocks_enabled(),
-            guard_miss_deopt: matches!(
-                specialization_mode,
-                Some(SpecializationMode::Verify | SpecializationMode::Apply)
-            ),
+            behavior_change_indexed_stores: !identity_typed_runtime
+                && specialization_mode
+                    .is_some_and(SpecializationMode::behavior_change_indexed_stores_enabled),
+            profiled_cold_blocks: !identity_typed_runtime
+                && env_config.profiled_cold_blocks_enabled(),
+            guard_miss_deopt: !identity_typed_runtime
+                && matches!(
+                    specialization_mode,
+                    Some(SpecializationMode::Verify | SpecializationMode::Apply)
+                ),
         })
     }
 

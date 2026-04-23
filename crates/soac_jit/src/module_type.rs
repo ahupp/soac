@@ -961,6 +961,12 @@ fn load_runtime_indexed_field_counter_emissions(
     ) {
         return Ok(HashMap::new());
     }
+    if env_config
+        .runtime_optimization_pipeline()
+        .uses_identity_typed_runtime()
+    {
+        return Ok(HashMap::new());
+    }
     let Some(cache_root) = env_config.module_cache_root() else {
         return Err(format!(
             "SOAC_OPT_MODE=verify/apply requires SOAC_WORK_DIR/module cache to load mod.optv3 for module {module_name}"
@@ -1282,9 +1288,9 @@ fn append_final_deopt_counter_defs_for_runtime(
     module_name: &str,
     source_hash: u64,
     module_cache_source: Option<PythonModuleCacheSource>,
+    env_config: &SoacEnvConfig,
 ) -> PyResult<()> {
-    let env_config = SoacEnvConfig::from_env().map_err(PyRuntimeError::new_err)?;
-    if !deopt_entry_counter_instrumentation_enabled(&env_config) {
+    if !deopt_entry_counter_instrumentation_enabled(env_config) {
         return Ok(());
     }
     let Some(cache_root) = env_config.module_cache_root() else {
@@ -1359,15 +1365,16 @@ impl SoacExtModuleState {
                 "transformed module state was unexpectedly initialized twice",
             ));
         }
+        let env_config = compile_session
+            .env_config()
+            .map_err(PyRuntimeError::new_err)?;
         append_final_deopt_counter_defs_for_runtime(
             &mut lowered_module,
             module_name.as_str(),
             source_hash,
             module_cache_source,
+            env_config,
         )?;
-        let env_config = compile_session
-            .env_config()
-            .map_err(PyRuntimeError::new_err)?;
         specialize_runtime_field_access_counter_branches(
             &mut lowered_module,
             module_name.as_str(),

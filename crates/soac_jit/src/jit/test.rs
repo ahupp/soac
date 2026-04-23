@@ -17732,6 +17732,64 @@ def f(x, y):
     }
 
     #[test]
+    fn runtime_typed_v3_pipeline_bypasses_serialized_v3_artifacts_in_verify_mode() {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "runtime_typed_v3_pipeline_bypasses_serialized_v3_artifacts_in_verify_mode",
+        ) {
+            return;
+        }
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| {
+            let soac_work_dir = fresh_test_work_dir("runtime-typed-v3-identity");
+            let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
+            let _opt_mode = set_opt_mode("verify");
+            let _pipeline = EnvVarGuard::set("SOAC_OPT_RUNTIME_PIPELINE", "typed-v3");
+            let module_name = "runtime_typed_v3_identity_test";
+            let module_name_gen = ModuleNameGen::new(0);
+            let function = with_single_test_block(
+                test_function_in_module(&module_name_gen, "target"),
+                vec![],
+                ret_term(none_expr()),
+            );
+            let module = test_module(module_name_gen, vec![function]);
+            let shared_state =
+                crate::module_type::build_shared_state_for_testing(py, module, module_name, "")
+                    .expect("shared state should build");
+
+            let profile = SpecializationProfile::from_runtime_state_with_session(
+                Some(shared_state.as_ref()),
+                None,
+            )
+            .expect("typed-v3 runtime pipeline should not require serialized v3 artifacts");
+            assert!(
+                profile.optimized_module.is_none(),
+                "typed-v3 identity runtime should use the pre-optimization BlockPy module"
+            );
+            assert!(
+                profile.counter_dump_path.is_none(),
+                "typed-v3 identity runtime should not consume profile evidence yet"
+            );
+            assert!(profile.opt_v3_emitted_direct_calls.is_empty());
+            assert!(profile.opt_v3_emitted_exact_list_items.is_empty());
+            assert!(profile.opt_v3_emitted_indexed_fields.is_empty());
+            assert!(profile.opt_v3_emitted_indexed_globals.is_empty());
+            assert!(profile.opt_v3_exact_int_branch_artifacts.is_empty());
+            assert!(!profile.behavior_change_indexed_stores);
+            assert!(!profile.guard_miss_deopt);
+
+            let module_plan = build_identity_typed_jit_module_plan(&shared_state.lowered_module)
+                .expect("typed-v3 identity runtime should lower CodegenModuleShape to typed JIT");
+            assert_eq!(module_plan.module.callable_defs.len(), 1);
+            assert_eq!(
+                module_plan.module.module_name_gen.module_id(),
+                shared_state.lowered_module.module_name_gen.module_id()
+            );
+        });
+    }
+
+    #[test]
     fn specialized_jit_assignment_to_direct_entry_param_avoids_stack_mirror() {
         let blocks = [1usize as ObjPtr];
         let mut constants = TestConstantPool::default();

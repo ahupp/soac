@@ -3,6 +3,6 @@
 mod runtime;
 
 pub use runtime::{
-    init_logging, init_logging_with_config, CompileMode, SoacEnvConfig, SoacLogConfig,
-    SpecializationMode,
+    init_logging, init_logging_with_config, CompileMode, RuntimeOptimizationPipeline,
+    SoacEnvConfig, SoacLogConfig, SpecializationMode,
 };
