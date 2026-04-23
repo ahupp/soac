@@ -6139,111 +6139,6 @@ def build(values):
     }
 
     #[test]
-    fn field_index_specializations_resolve_type_key_without_module_globals() {
-        if crate::run_test_in_isolated_process_if_needed(
-            module_path!(),
-            "field_index_specializations_resolve_type_key_without_module_globals",
-        ) {
-            return;
-        }
-        let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        let old_soac_work_dir = std::env::var_os("SOAC_WORK_DIR");
-        let old_soac_opt_mode = std::env::var_os("SOAC_OPT_MODE");
-        let soac_work_dir = fresh_test_work_dir("test-work");
-
-        unsafe {
-            std::env::set_var("SOAC_WORK_DIR", &soac_work_dir);
-            std::env::set_var("SOAC_OPT_MODE", "verify");
-        }
-        crate::initialize_test_python();
-
-        Python::attach(|py| {
-            let module = PyModule::from_code(
-                py,
-                c"
-class Point:
-    pass
-",
-                c"field_type_test.py",
-                c"field_type_test",
-            )
-            .expect("test module should execute");
-            let sys = PyModule::import(py, "sys").expect("sys should import");
-            let modules = sys
-                .getattr("modules")
-                .expect("sys.modules should exist")
-                .cast_into::<pyo3::types::PyDict>()
-                .expect("sys.modules should be a dict");
-            modules
-                .set_item("field_type_test", module.as_any())
-                .expect("test module should be registered");
-            let owner_type = module
-                .getattr("Point")
-                .expect("Point should exist")
-                .as_ptr() as *mut ffi::PyTypeObject;
-
-            write_test_counter_dump(
-                soac_work_dir.join("profile.bin").as_path(),
-                &CounterDumpRecord {
-                    source_hash: 0,
-                    module_name: "counter_test".to_string(),
-                    package_name: None,
-                    rows: Vec::new(),
-                    module_keys: Vec::new(),
-                    type_keys: vec![CounterDumpTypeKeyLayout {
-                        owner_type_id: 7,
-                        key: "x".to_string(),
-                        index: 0,
-                    }],
-                    type_table: vec![CounterDumpTypeTableEntry {
-                        type_id: 7,
-                        key: CounterDumpTypeKey {
-                            module_name: "field_type_test".to_string(),
-                            qualname: "Point".to_string(),
-                        },
-                    }],
-                },
-            );
-
-            let specializations = load_field_index_specializations()
-                .expect("field specializations should load from type table");
-            let x_specializations = specializations
-                .get("x")
-                .expect("x specialization should be present");
-            assert_eq!(x_specializations.len(), 1);
-            assert_eq!(
-                x_specializations[0].owner_type_ref,
-                RelocTypeRef::TypeKey(CounterDumpTypeKey {
-                    module_name: "field_type_test".to_string(),
-                    qualname: "Point".to_string(),
-                })
-            );
-            assert_eq!(
-                resolve_reloc_type_ref_to_type(&x_specializations[0].owner_type_ref)
-                    .expect("type key should resolve back to a live type"),
-                Some(owner_type)
-            );
-            assert_eq!(x_specializations[0].expected_index, 0);
-            assert_ne!(x_specializations[0].type_version, 0);
-
-            modules
-                .del_item("field_type_test")
-                .expect("test module should be removed");
-        });
-
-        unsafe {
-            match old_soac_work_dir {
-                Some(value) => std::env::set_var("SOAC_WORK_DIR", value),
-                None => std::env::remove_var("SOAC_WORK_DIR"),
-            }
-            match old_soac_opt_mode {
-                Some(value) => std::env::set_var("SOAC_OPT_MODE", value),
-                None => std::env::remove_var("SOAC_OPT_MODE"),
-            }
-        }
-    }
-
-    #[test]
     fn reloc_type_ref_uses_cpython_symbols_for_builtin_types() {
         let long_ref = reloc_type_ref_for_type(std::ptr::addr_of_mut!(PyLong_Type))
             .expect("builtin type relocation should not error");
@@ -6259,7 +6154,7 @@ class Point:
     }
 
     #[test]
-    fn field_index_specializations_prime_owner_type_key_layouts() {
+    fn field_index_layouts_prime_owner_type_key_layouts() {
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         crate::initialize_test_python();
 
@@ -6622,27 +6517,6 @@ class Record:
                     }],
                 },
             );
-            let loaded_specializations =
-                load_field_index_specializations().expect("field specializations should load");
-            assert_eq!(
-                loaded_specializations
-                    .values()
-                    .map(std::vec::Vec::len)
-                    .sum::<usize>(),
-                5,
-                "each profiled Record field should produce one specialization"
-            );
-            assert!(
-                cached_split_key_layout(py, owner_type).starts_with(&[
-                    ("PtrComp".to_string(), 0),
-                    ("Discr".to_string(), 1),
-                    ("EnumComp".to_string(), 2),
-                    ("IntComp".to_string(), 3),
-                    ("StringComp".to_string(), 4),
-                ]),
-                "SOAC priming should establish the profile-order split-key layout"
-            );
-
             let mut lowered = soac_lowering::lower_python_to_blockpy_for_testing(
                 r#"
 class Record:
@@ -15277,8 +15151,6 @@ def f(x):
                 specialization_inputs: Some(FunctionSpecializationInputs {
                     opt_v3_call_emissions: TypedCallEmissionPlans::default(),
                     opt_v3_exact_list_items_by_instr: HashMap::new(),
-                    field_index_specializations: HashMap::new(),
-                    field_index_specializations_by_instr: HashMap::new(),
                     opt_v3_indexed_fields_by_instr: HashMap::new(),
                     opt_v3_indexed_globals_by_instr: HashMap::new(),
                     cold_block_labels: HashSet::new(),
@@ -15455,8 +15327,6 @@ def f(x):
                 specialization_inputs: Some(FunctionSpecializationInputs {
                     opt_v3_call_emissions: TypedCallEmissionPlans::default(),
                     opt_v3_exact_list_items_by_instr: HashMap::new(),
-                    field_index_specializations: HashMap::new(),
-                    field_index_specializations_by_instr: HashMap::new(),
                     opt_v3_indexed_fields_by_instr: HashMap::new(),
                     opt_v3_indexed_globals_by_instr: HashMap::new(),
                     cold_block_labels: HashSet::new(),
@@ -15590,8 +15460,6 @@ def f(x):
                     specialization_inputs: Some(FunctionSpecializationInputs {
                         opt_v3_call_emissions: TypedCallEmissionPlans::default(),
                         opt_v3_exact_list_items_by_instr: HashMap::new(),
-                        field_index_specializations: HashMap::new(),
-                        field_index_specializations_by_instr: HashMap::new(),
                         opt_v3_indexed_fields_by_instr: HashMap::new(),
                         opt_v3_indexed_globals_by_instr: HashMap::new(),
                         cold_block_labels: HashSet::new(),
@@ -15710,8 +15578,6 @@ def f(x):
                     specialization_inputs: Some(FunctionSpecializationInputs {
                         opt_v3_call_emissions: TypedCallEmissionPlans::default(),
                         opt_v3_exact_list_items_by_instr: HashMap::new(),
-                        field_index_specializations: HashMap::new(),
-                        field_index_specializations_by_instr: HashMap::new(),
                         opt_v3_indexed_fields_by_instr: HashMap::new(),
                         opt_v3_indexed_globals_by_instr: HashMap::new(),
                         cold_block_labels: HashSet::new(),
@@ -15824,8 +15690,6 @@ def f(x):
                 specialization_inputs: Some(FunctionSpecializationInputs {
                     opt_v3_call_emissions: TypedCallEmissionPlans::default(),
                     opt_v3_exact_list_items_by_instr: HashMap::new(),
-                    field_index_specializations: HashMap::new(),
-                    field_index_specializations_by_instr: HashMap::new(),
                     opt_v3_indexed_fields_by_instr: HashMap::new(),
                     opt_v3_indexed_globals_by_instr: HashMap::new(),
                     cold_block_labels: HashSet::new(),
@@ -16642,8 +16506,6 @@ def f(x):
         FunctionSpecializationInputs {
             opt_v3_call_emissions: TypedCallEmissionPlans::default(),
             opt_v3_exact_list_items_by_instr: HashMap::new(),
-            field_index_specializations: HashMap::new(),
-            field_index_specializations_by_instr: HashMap::new(),
             opt_v3_indexed_fields_by_instr: HashMap::new(),
             opt_v3_indexed_globals_by_instr: HashMap::from([(
                 source,
@@ -16676,8 +16538,6 @@ def f(x):
                 specialization_inputs: Some(FunctionSpecializationInputs {
                     opt_v3_call_emissions: TypedCallEmissionPlans::default(),
                     opt_v3_exact_list_items_by_instr: HashMap::new(),
-                    field_index_specializations: HashMap::new(),
-                    field_index_specializations_by_instr: HashMap::new(),
                     opt_v3_indexed_fields_by_instr: HashMap::new(),
                     opt_v3_indexed_globals_by_instr: HashMap::from([
                         (
@@ -16767,8 +16627,6 @@ def f(x):
                 specialization_inputs: Some(FunctionSpecializationInputs {
                     opt_v3_call_emissions: TypedCallEmissionPlans::default(),
                     opt_v3_exact_list_items_by_instr: HashMap::new(),
-                    field_index_specializations: HashMap::new(),
-                    field_index_specializations_by_instr: HashMap::new(),
                     opt_v3_indexed_fields_by_instr: HashMap::new(),
                     opt_v3_indexed_globals_by_instr: HashMap::new(),
                     cold_block_labels: HashSet::new(),
@@ -16942,12 +16800,6 @@ def read_point(point):
                     .opt_v3_indexed_fields_by_instr
                     .contains_key(&getattr_instr_id),
                 "v3 emitted indexed-field decision should become explicit v3 codegen input"
-            );
-            assert!(
-                !inputs
-                    .field_index_specializations_by_instr
-                    .contains_key(&getattr_instr_id),
-                "v3 indexed fields should not be converted into legacy per-instruction field evidence"
             );
 
             modules
@@ -17171,12 +17023,6 @@ def write_point(point, value):
                     .contains_key(&setattr_instr_id),
                 "v3 emitted indexed-field Store decision should become explicit v3 codegen input"
             );
-            assert!(
-                !inputs
-                    .field_index_specializations_by_instr
-                    .contains_key(&setattr_instr_id),
-                "v3 indexed SetAttr should not be converted into legacy field evidence"
-            );
 
             let (hit_counter_id, hit_branch_id) = runtime_branch_counter_for(
                 &shared_state.lowered_module.counter_defs,
@@ -17362,10 +17208,9 @@ def write_point(point, value):
         let InstrTyped::SetAttrTyped(op) = &typed_function.blocks[0].body[0] else {
             panic!("test function body should contain typed SetAttr");
         };
-        let TypedAttrAccessPlan::IndexedField { source, guards } = &op.access else {
+        let TypedAttrAccessPlan::IndexedField { guards } = &op.access else {
             panic!("v3 SetAttr should be annotated as an indexed-field access");
         };
-        assert_eq!(*source, TypedIndexedFieldPlanSource::OptimizationPlanV3);
         assert_eq!(guards.len(), 1);
         assert_eq!(guards[0].expected_index, 0);
     }
@@ -17962,70 +17807,6 @@ def f(x, y):
             !rendered.contains("explicit_slot 8"),
             "unused storage-layout locals should not allocate stack slots:\n{rendered}"
         );
-    }
-
-    #[test]
-    fn render_specialized_jit_ignores_field_index_specializations_without_runtime_state() {
-        if crate::run_test_in_isolated_process_if_needed(
-            module_path!(),
-            "render_specialized_jit_ignores_field_index_specializations_without_runtime_state",
-        ) {
-            return;
-        }
-        let old_soac_work_dir = std::env::var_os("SOAC_WORK_DIR");
-        let old_soac_opt_mode = std::env::var_os("SOAC_OPT_MODE");
-        let soac_work_dir = fresh_test_work_dir("test-work");
-
-        unsafe {
-            std::env::set_var("SOAC_WORK_DIR", &soac_work_dir);
-            std::env::set_var("SOAC_OPT_MODE", "verify");
-        }
-
-        write_test_counter_dump(
-            soac_work_dir.join("profile.bin").as_path(),
-            &CounterDumpRecord {
-                source_hash: 0,
-                module_name: "counter_test".to_string(),
-                package_name: None,
-                rows: Vec::new(),
-                module_keys: Vec::new(),
-                type_keys: vec![CounterDumpTypeKeyLayout {
-                    owner_type_id: 7,
-                    key: "x".to_string(),
-                    index: 0,
-                }],
-                type_table: vec![CounterDumpTypeTableEntry {
-                    type_id: 7,
-                    key: CounterDumpTypeKey {
-                        module_name: "field_type_test".to_string(),
-                        qualname: "Point".to_string(),
-                    },
-                }],
-            },
-        );
-
-        let blocks = [1usize as ObjPtr];
-        let mut constants = TestConstantPool::default();
-        let function =
-            with_single_test_block(test_function(), vec![], ret_term(constants.int_expr(7)));
-        let rendered = render_test_jit_function_with_module_constants(
-            &function,
-            &blocks,
-            constants.module_constants,
-        );
-        assert!(
-            rendered.contains("function"),
-            "rendering should succeed without runtime state even when field specializations are configured:\n{rendered}"
-        );
-
-        match old_soac_work_dir {
-            Some(value) => unsafe { std::env::set_var("SOAC_WORK_DIR", value) },
-            None => unsafe { std::env::remove_var("SOAC_WORK_DIR") },
-        }
-        match old_soac_opt_mode {
-            Some(value) => unsafe { std::env::set_var("SOAC_OPT_MODE", value) },
-            None => unsafe { std::env::remove_var("SOAC_OPT_MODE") },
-        }
     }
 
     #[test]

@@ -231,9 +231,6 @@ pub type TypedDirectCallableCallGuard = TypedDirectFunctionCallGuard;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TypedCallAccessPlan {
     Generic,
-    ProfiledCallableTargets {
-        targets: Vec<RuntimeFunctionId>,
-    },
     GuardedCallable {
         function_guards: Vec<TypedDirectFunctionCallGuard>,
     },
@@ -775,19 +772,10 @@ pub struct TypedIndexedFieldGuard {
     pub type_version: u32,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TypedIndexedFieldPlanSource {
-    LegacyProfile,
-    OptimizationPlanV3,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TypedAttrAccessPlan {
     Generic,
-    IndexedField {
-        source: TypedIndexedFieldPlanSource,
-        guards: Vec<TypedIndexedFieldGuard>,
-    },
+    IndexedField { guards: Vec<TypedIndexedFieldGuard> },
 }
 
 define_ruff_instr! {
@@ -1840,9 +1828,7 @@ pub fn validate_typed_module_call_access_plans(
 
 fn validate_typed_call_access_plan(call: &TypedCall<InstrTyped>) -> Result<(), String> {
     match &call.access {
-        TypedCallAccessPlan::Generic | TypedCallAccessPlan::ProfiledCallableTargets { .. } => {
-            Ok(())
-        }
+        TypedCallAccessPlan::Generic => Ok(()),
         TypedCallAccessPlan::GuardedCallable { function_guards } => {
             validate_typed_call_simple_shape(call)?;
             for guard in function_guards {
