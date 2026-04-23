@@ -514,7 +514,7 @@ explicit ordinary
   `$SOAC_WORK_DIR/modules`; run a profile/benchmark pass first when the cache is
   empty. Use `SOAC_PRECOMPILED_LIBRARY` to point runtime execution at the
   resulting shared library.
-- `cargo run -p soac_inspector --bin decide_optimizations -- --counters <profile.bin> --out <root-dir>`
+- `cargo run -p soac_opt --bin decide_optimizations -- --counters <profile.bin> --out <root-dir>`
   Standalone optimization-decision planner. It loads the counter dump once,
   scans cached BlockPy modules under the output root by default, and writes
   binary `mod.opt` artifacts beside those modules, such as

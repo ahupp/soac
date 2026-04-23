@@ -1154,7 +1154,7 @@ _decide-optimizations-for-counters-dir counters_dir:
       find "$MODULE_CACHE_DIR" -name mod.optv3 -delete
     fi
   fi
-  cargo run --release -p soac_inspector --bin decide_optimizations -- \
+  cargo run --release -p soac_opt --bin decide_optimizations -- \
     --mode "$OPTIMIZATION_PLAN_MODE" \
     --counters "$COUNTERS_DIR/profile.bin" \
     --out "$MODULE_CACHE_DIR"

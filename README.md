@@ -443,7 +443,7 @@ tree, with pystone benchmark runs writing to `work/bench/`.
   `SOAC_PRECOMPILED_LIBRARY` to the resulting
   `.so` to let runtime direct-function setup use matching precompiled entries.
 
-- `cargo run -p soac_inspector --bin decide_optimizations -- --counters <profile.bin> --out <modules-root>`
+- `cargo run -p soac_opt --bin decide_optimizations -- --counters <profile.bin> --out <modules-root>`
   Load a counter dump once, scan the cached BlockPy module root for
   `mod.blockpy` files, and write sibling binary optimization-decision artifacts
   using stable module artifact paths such as `python-stdlib/typing/mod.opt`.
