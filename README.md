@@ -1,3 +1,177 @@
+# Repository Components
+
+## Rust Crates
+
+- `build_support`
+  Shared build-script helpers for computing the SOAC build identity and linking
+  against the vendored CPython library. Crates with native Python or inspector
+  build steps use it from `build.rs`.
+
+- `soac-config`
+  Central typed configuration for SOAC environment variables, logging, work
+  directories, optimization modes, and runtime feature flags. Runtime, JIT,
+  inspector, and benchmark entrypoints should parse environment state through
+  this crate instead of re-reading raw variables.
+
+- `soac-core`
+  Core data model crate for BlockPy IR, profile/counter dump formats, runtime
+  function IDs, and structured pretty-printing helpers. It owns the serialized
+  shapes that are shared between lowering, optimization, JIT, and inspection.
+
+- `soac-cpython`
+  Embedding and test-support utilities for the vendored CPython build. It
+  locates the repository, configures Python home/search paths, stages extension
+  modules for tests, and initializes Python for Rust-side integration tests.
+
+- `soac-driver`
+  Pipeline orchestration around lowering and codegen module caching. It exposes
+  production and test lowering entrypoints and owns the cache path/metadata
+  helpers used by the runtime and optimizer.
+
+- `soac-inspector`
+  Local web inspector and command-line tooling for lowering, counter dumps,
+  optimization plans, CLIF/VCode rendering, and benchmark artifact analysis. It
+  is the main crate for interactive and offline inspection workflows.
+
+- `soac-jit`
+  CPython-facing JIT implementation that turns resolved BlockPy functions into
+  Cranelift code, manages module runtime state, counters, constants, guards,
+  deopt paths, and optional precompiled function loading.
+
+- `soac-jit-runtime`
+  Standalone, ABI-shaped runtime helper crate intended to be compiled to CLIF
+  and inlined into generated code. It stays close to raw CPython layouts and
+  keeps hot helper behavior visible to codegen review.
+
+- `soac-lowering`
+  Parser-to-BlockPy lowering pipeline, transformation passes, pass tracking,
+  source fixtures, validation, and structured render helpers. It is where raw
+  Python syntax is turned into progressively more resolved compiler IR.
+
+- `soac-macros`
+  Procedural macros used by the lowering and IR layers to reduce repetitive
+  enum delegation and match boilerplate. It should stay mechanical and avoid
+  owning compiler semantics.
+
+- `soac-opt`
+  Optimization planning and artifact generation from profile evidence and
+  cached BlockPy modules. It owns legacy and v3 plan formats, specialization
+  decisions, emitted plan sidecars, and optimization-family status reporting.
+
+- `soac-pyo3`
+  The `_soac_ext` Python extension module. It bridges CPython import-hook
+  callbacks into SOAC lowering, optimization-plan loading, JIT module creation,
+  and runtime execution.
+
+- `bench/pystone-rust`
+  Rust pystone benchmark package used for baseline or comparison work around
+  the Python pystone benchmark. It is outside the main SOAC workspace members.
+
+## Codex Skills
+
+- `analyze-pystone-perf`
+  End-to-end pystone performance-analysis workflow that combines benchmark
+  counters, perf capture, specialized CLIF rendering, and ranked optimization
+  suggestions.
+
+- `benchmark-compare`
+  Compares two SOAC pystone benchmark result directories, creating missing
+  one-off benchmark artifacts when needed and checking throughput, counters,
+  and specialized CLIF differences.
+
+- `fix-test-case`
+  Focused workflow for one failing test: reproduce it, add a minimal regression
+  under `tests/`, identify the root cause, implement the fix, and rerun the
+  narrow check.
+
+- `inspect-pass`
+  Opens the local web inspector at a named tracked lowering pass for a concrete
+  source example, useful for visually comparing transform stages.
+
+- `python-debug`
+  Uses `pdb` to step through Python scripts, continue to exceptions, and
+  inspect runtime state at specific lines.
+
+- `python-monitoring-trace`
+  Uses `sys.monitoring` to trace selected Python execution events with
+  include/exclude controls and optional log output.
+
+- `run-cpython-tests`
+  Runs vendored CPython regression tests through SOAC's import-hook path and
+  writes structured logs for full, partitioned, or single-file regrtest runs.
+
+- `soac-clif-snippet`
+  Profiles a small Python snippet, renders pre-inlining and final specialized
+  CLIF, and prepares annotation context for explaining generated blocks,
+  guards, counters, and helper calls.
+
+- `soac-profile-benchmark`
+  Runs the SOAC pystone profile/verify/apply benchmark workflow and summarizes
+  the generated `work/bench/` result directory.
+
+- `summarize-cpython-failures`
+  Summarizes CPython regrtest logs, computes file and test-case totals, and
+  groups failures by likely root cause.
+
+## CLI Inspection Tools
+
+Most command-line inspection tools live in `soac-inspector` and can be run as
+`cargo run -p soac-inspector --bin <tool> -- ...`.
+
+- `soac-inspector`
+  Starts the local web inspector server. It serves the interactive pass,
+  BlockPy, CLIF, and typed-instruction views, binding to `HOST`/`PORT` or
+  `127.0.0.1:8000` by default.
+
+- `diet-python`
+  Lowers a Python file through the transform pipeline and prints the final
+  rewritten Python source. Pass `--timing` to emit per-pass timing JSON on
+  stderr.
+
+- `list_jit_functions`
+  Prints the packed runtime function ID and qualified name for each lowered JIT
+  function in a source file. Use this before rendering CLIF or typed
+  instructions for a specific function.
+
+- `render_jit_clif`
+  Renders generated CLIF for one source file and function ID. It can render
+  specialized apply-mode code, pre-inline CLIF, debug plans, CFG dot output,
+  and lowered VCode.
+
+- `render_instr_typed`
+  Renders typed instruction-level JIT output for one source file and function
+  ID, with the same specialized apply-mode module identity handling as
+  `render_jit_clif`.
+
+- `inspect_counters`
+  Reads a `profile.bin` or `verify.bin` counter dump and prints counters,
+  key-layout rows, specialization summaries, or JSON.
+
+- `decide_optimizations`
+  Reads profile counters plus cached BlockPy modules and writes legacy `mod.opt`
+  or v3 `mod.optv3` optimization plans under a module-cache root.
+
+- `print_optimization_plan`
+  Pretty-prints a legacy `mod.opt` optimization plan.
+
+- `print_optimization_plan_v3`
+  Pretty-prints a v3 `mod.optv3` optimization artifact, with `--details` for
+  region and emission detail.
+
+- `precompile_blockpy`
+  Uses profile counters and cached BlockPy modules to compile referenced
+  modules into object files and link an offline shared library for
+  `SOAC_PRECOMPILED_LIBRARY`.
+
+- `annotate_cranelift_perf`
+  Correlates perf samples with SOAC JIT basic-block maps for a benchmark result
+  directory, writes annotated VCode files, and prints block-level sample rows.
+
+- `regen_snapshots`
+  Regenerates ignored `snapshot/` fixtures and summary rows from checked-in
+  snapshot source cases. This is mainly a maintenance tool for inspector and
+  lowering snapshot workflows.
+
 # Development Environment
 
 Install the Python-side venv and the nightly Rust codegen backend used by
