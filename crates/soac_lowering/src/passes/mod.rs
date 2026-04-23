@@ -16,6 +16,7 @@ mod instrument;
 mod local_env_plan;
 mod name_binding;
 mod ownership_effects;
+mod profiled_method_transform;
 pub(crate) mod ruff_to_blockpy;
 mod trace;
 mod value_facts;
@@ -2917,6 +2918,11 @@ pub use ownership_effects::{
     validate_ownership_effects, BlockRefcountPlan, FunctionRefcountPlan, LocalRefState,
     RefcountAction, RefcountActionKind, RefcountLocal, RefcountPlan, RefcountReleaseReason,
     RefcountSite,
+};
+pub use profiled_method_transform::{
+    collect_profiled_runtime_iter_method_target_ids,
+    rewrite_profiled_no_arg_method_call_store_sites, ProfiledMethodInlineRewriteStats,
+    ProfiledOwnerAttrKey, ProfiledOwnerAttrSpecialization, ProfiledRuntimeIterConstructorCall,
 };
 pub use trace::{
     call_target_counter_instrumentation_enabled, define_bb_module_deopt_entry_counters,

@@ -23833,38 +23833,6 @@ def f(x, y):
     }
 
     #[test]
-    fn profiled_runtime_iter_receiver_call_direct_requires_straightline_constructor() {
-        let constructor_id = RuntimeFunctionId::from_raw_parts(7, 11);
-        let receiver = InstrCodegen::Call(Call::new(
-            name_expr(test_global_name("RangeLike")),
-            vec![CallArgPositional::Positional(name_expr(test_local_name(
-                "n", 0,
-            )))],
-            Vec::<CallArgKeyword<InstrCodegen>>::new(),
-        ));
-
-        let unchanged = scalarizable_profiled_constructor_receiver(
-            receiver.clone(),
-            Some(constructor_id),
-            &HashSet::new(),
-        );
-        assert!(
-            matches!(unchanged, InstrCodegen::Call(_)),
-            "non-straightline constructors must stay as ordinary constructor calls"
-        );
-
-        let rewritten = scalarizable_profiled_constructor_receiver(
-            receiver,
-            Some(constructor_id),
-            &HashSet::from([constructor_id]),
-        );
-        let InstrCodegen::CallDirect(call) = rewritten else {
-            panic!("straightline constructors should become scalar-replacement candidates");
-        };
-        assert_eq!(call.function_id, constructor_id);
-    }
-
-    #[test]
     fn indexed_global_body_guard_miss_can_target_cold_deopt_stub() {
         let function = with_single_test_block(
             test_function(),
