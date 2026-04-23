@@ -51,6 +51,12 @@ pub struct ResolvedIndexedFieldAccess<T> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedIndexedFieldAccessPlan<T> {
+    pub access: IndexedFieldAccessKind,
+    pub specializations: Vec<T>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IndexedGlobalAccessPlan {
     pub source: InstrId,
     pub access: IndexedGlobalAccessKind,
@@ -187,6 +193,41 @@ pub fn prepare_indexed_field_accesses_for_codegen<T: PartialEq>(
         }
     }
     Ok(by_instr)
+}
+
+pub fn prepared_indexed_field_access_plan<T: Clone + PartialEq>(
+    instr_id: InstrId,
+    expected_access: IndexedFieldAccessKind,
+    resolved_by_instr: &HashMap<InstrId, Vec<ResolvedIndexedFieldAccess<T>>>,
+) -> Result<PreparedIndexedFieldAccessPlan<T>, String> {
+    let accesses = resolved_by_instr.get(&instr_id).ok_or_else(|| {
+        format!(
+            "optimizer v3 indexed-field {:?} for {instr_id} lost its prevalidated codegen guard payload",
+            expected_access
+        )
+    })?;
+    let mut specializations = Vec::with_capacity(accesses.len());
+    for access in accesses {
+        if access.access != expected_access {
+            return Err(format!(
+                "optimizer v3 indexed-field for {instr_id} was prevalidated as {:?}, but typed lowering requested {:?}",
+                access.access, expected_access
+            ));
+        }
+        if !specializations.contains(&access.specialization) {
+            specializations.push(access.specialization.clone());
+        }
+    }
+    if specializations.is_empty() {
+        return Err(format!(
+            "optimizer v3 indexed-field {:?} for {instr_id} lost all prevalidated codegen guards",
+            expected_access
+        ));
+    }
+    Ok(PreparedIndexedFieldAccessPlan {
+        access: expected_access,
+        specializations,
+    })
 }
 
 pub fn exact_list_items_for_function_from_artifacts(
@@ -341,5 +382,34 @@ mod tests {
         );
         assert_eq!(prepared[&instr_id].len(), 1);
         assert_eq!(prepared[&instr_id][0].specialization, 7);
+    }
+
+    #[test]
+    fn prepared_indexed_field_access_plan_validates_requested_access() {
+        let instr_id = InstrId::new(BlockLabel::from_index(1), 4);
+        let resolved = ResolvedIndexedFieldAccess {
+            access: IndexedFieldAccessKind::Load,
+            attr_name: "field".to_string(),
+            guard: IndexedFieldGuardKind::OwnerTypeVersionAndFieldIndex,
+            fallback: IndexedFieldFallbackKind::OriginalAttrAccess,
+            specialization: 11,
+        };
+        let mut by_instr = HashMap::new();
+        by_instr.insert(instr_id, vec![resolved]);
+
+        let prepared =
+            prepared_indexed_field_access_plan(instr_id, IndexedFieldAccessKind::Load, &by_instr)
+                .expect("matching indexed-field access should prepare");
+
+        assert_eq!(prepared.access, IndexedFieldAccessKind::Load);
+        assert_eq!(prepared.specializations, vec![11]);
+
+        let err =
+            prepared_indexed_field_access_plan(instr_id, IndexedFieldAccessKind::Store, &by_instr)
+                .expect_err("mismatched indexed-field access should be rejected");
+        assert!(
+            err.contains("typed lowering requested Store"),
+            "unexpected error: {err}"
+        );
     }
 }

@@ -95,6 +95,7 @@ use soac_opt::access_emission_v3::{
     indexed_fields_for_function_from_artifacts as opt_v3_emitted_indexed_fields_for_function,
     indexed_globals_for_function_from_artifacts as opt_v3_emitted_indexed_globals_for_function,
     prepare_indexed_field_accesses_for_codegen as opt_v3_prepare_indexed_field_accesses_for_codegen,
+    prepared_indexed_field_access_plan as opt_v3_prepared_indexed_field_access_plan,
 };
 use soac_opt::artifacts_v3::{
     ExactIntBranchV3Artifacts, load_optimization_artifacts_v3,
@@ -8332,32 +8333,15 @@ impl IndexedFieldLoweringPlan {
         expected_access: PlanV3IndexedFieldAccessKind,
         opt_v3_indexed_fields_by_instr: &HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>,
     ) -> Result<Option<Self>, String> {
-        let accesses = opt_v3_indexed_fields_by_instr.get(&instr_id).ok_or_else(|| {
-            format!(
-                "optimizer v3 indexed-field {:?} for {instr_id} lost its prevalidated codegen guard payload",
-                expected_access
-            )
-        })?;
-        let mut specializations = Vec::with_capacity(accesses.len());
-        for access in accesses {
-            if access.access != expected_access {
-                return Err(format!(
-                    "optimizer v3 indexed-field for {instr_id} was prevalidated as {:?}, but typed lowering requested {:?}",
-                    access.access, expected_access
-                ));
-            }
-            push_unique_specialization(&mut specializations, access.specialization.clone());
-        }
-        if specializations.is_empty() {
-            return Err(format!(
-                "optimizer v3 indexed-field {:?} for {instr_id} lost all prevalidated codegen guards",
-                expected_access
-            ));
-        }
+        let prepared = opt_v3_prepared_indexed_field_access_plan(
+            instr_id,
+            expected_access,
+            opt_v3_indexed_fields_by_instr,
+        )?;
         Ok(Some(Self {
             source: TypedIndexedFieldPlanSource::OptimizationPlanV3,
-            access: expected_access,
-            specializations,
+            access: prepared.access,
+            specializations: prepared.specializations,
         }))
     }
 
