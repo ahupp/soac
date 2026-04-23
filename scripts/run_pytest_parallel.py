@@ -7,6 +7,7 @@ import signal
 import subprocess
 import sys
 import time
+from datetime import UTC, datetime
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from math import ceil
@@ -16,6 +17,7 @@ from threading import Lock
 
 REPO_ROOT = Path(os.environ["REPO_ROOT"])
 VENV_PYTHON = Path(os.environ["VENV_DIR"]) / "bin" / "python"
+LOGS_DIR = REPO_ROOT / "work" / "logs"
 MIN_BATCH_NODEIDS = 16
 
 
@@ -247,6 +249,158 @@ def terminate_process_group(proc: subprocess.Popen[str]) -> None:
         proc.kill()
 
 
+def process_exists(pid: int) -> bool:
+    return (Path("/proc") / str(pid)).exists()
+
+
+def proc_children_by_parent() -> dict[int, list[int]]:
+    children: dict[int, list[int]] = {}
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        stat_path = entry / "stat"
+        try:
+            stat = stat_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        # /proc/<pid>/stat uses "pid (comm) state ppid ..."; comm may contain spaces.
+        try:
+            after_comm = stat.rsplit(")", 1)[1].strip()
+            parts = after_comm.split()
+            ppid = int(parts[1])
+            pid = int(entry.name)
+        except (IndexError, ValueError):
+            continue
+        children.setdefault(ppid, []).append(pid)
+    return children
+
+
+def collect_descendant_pids(root_pid: int) -> list[int]:
+    children = proc_children_by_parent()
+    pids: list[int] = []
+    stack = [root_pid]
+    seen: set[int] = set()
+    while stack:
+        pid = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        pids.append(pid)
+        stack.extend(reversed(children.get(pid, [])))
+    return pids
+
+
+def proc_text(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+def proc_cmdline(pid: int) -> str:
+    path = Path("/proc") / str(pid) / "cmdline"
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return "<unavailable>"
+    text = raw.replace(b"\0", b" ").decode("utf-8", errors="replace").strip()
+    return text or "<empty>"
+
+
+def proc_cwd(pid: int) -> str:
+    path = Path("/proc") / str(pid) / "cwd"
+    try:
+        return str(path.resolve(strict=True))
+    except OSError:
+        return "<unavailable>"
+
+
+def run_gdb_stack_capture(pid: int) -> tuple[int, str]:
+    gdb = shutil_which("gdb")
+    if gdb is None:
+        return 127, "gdb not found; install gdb before capturing native stacks\n"
+
+    python_gdb = REPO_ROOT / "vendor" / "cpython" / "python-gdb.py"
+    commands = [
+        "set pagination off",
+        "set confirm off",
+    ]
+    if python_gdb.exists():
+        commands.append(f"source {python_gdb}")
+    commands.extend(
+        [
+            "info threads",
+            "thread apply all bt full",
+        ]
+    )
+    if python_gdb.exists():
+        commands.append("thread apply all py-bt")
+
+    cmd = [gdb, "-q", "-batch", "-p", str(pid)]
+    for command in commands:
+        cmd.extend(["-ex", command])
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except subprocess.TimeoutExpired as exc:
+        output = (exc.stdout or "") + (exc.stderr or "")
+        output += "\ngdb stack capture timed out after 20s\n"
+        return 124, output
+    return proc.returncode, proc.stdout + proc.stderr
+
+
+def shutil_which(command: str) -> str | None:
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        if not directory:
+            continue
+        candidate = Path(directory) / command
+        if os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
+
+
+def capture_timeout_stacks(root_pid: int, label: str, timeout_s: float) -> Path:
+    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    safe_label = "".join(ch if ch.isalnum() else "-" for ch in label)[:80].strip("-")
+    out = LOGS_DIR / f"pytest-timeout-stacks-{timestamp}-pid{root_pid}-{safe_label}.log"
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    pids = collect_descendant_pids(root_pid)
+    with out.open("w", encoding="utf-8") as file:
+        file.write("SOAC pytest timeout stack capture\n")
+        file.write(f"timestamp_utc={datetime.now(UTC).isoformat()}\n")
+        file.write(f"root_pid={root_pid}\n")
+        file.write(f"timeout_s={timeout_s:.1f}\n")
+        file.write(f"batch={label}\n")
+        file.write(f"pids={' '.join(str(pid) for pid in pids)}\n\n")
+
+        for pid in pids:
+            file.write(f"\n===== pid {pid} =====\n")
+            file.write(f"cmdline: {proc_cmdline(pid)}\n")
+            status = proc_text(Path("/proc") / str(pid) / "status")
+            if status is not None:
+                file.write(status.splitlines()[0] + "\n")
+                for line in status.splitlines()[1:12]:
+                    file.write(line + "\n")
+            file.write(f"cwd: {proc_cwd(pid)}\n")
+            file.write("\n--- gdb: native and Python stacks ---\n")
+            if not process_exists(pid):
+                file.write("process exited before capture\n")
+                continue
+            status_code, output = run_gdb_stack_capture(pid)
+            file.write(output)
+            if output and not output.endswith("\n"):
+                file.write("\n")
+            if status_code != 0:
+                file.write(f"\ngdb capture exited with status {status_code} for pid {pid}\n")
+    return out
+
+
 def run_pytest(
     args: list[str],
     batch: PytestBatch,
@@ -278,6 +432,12 @@ def run_pytest(
         stdout, stderr = proc.communicate(timeout=timeout_s if timeout_s > 0 else None)
     except subprocess.TimeoutExpired:
         timed_out = True
+        stack_path: Path | None = None
+        stack_error: str | None = None
+        try:
+            stack_path = capture_timeout_stacks(proc.pid, batch.label, timeout_s)
+        except Exception as exc:  # noqa: BLE001 - timeout diagnostics must be best-effort.
+            stack_error = f"{type(exc).__name__}: {exc}"
         terminate_process_group(proc)
         stdout, stderr = proc.communicate()
     finally:
@@ -285,6 +445,13 @@ def run_pytest(
         monitor.finish(batch_id)
     output = stdout + stderr
     if timed_out:
+        if stack_path is not None:
+            output += f"\n[diet-python pytest] captured timeout stacks: {stack_path}\n"
+        if stack_error is not None:
+            output += (
+                "\n[diet-python pytest] failed to capture timeout stacks: "
+                f"{stack_error}\n"
+            )
         output += (
             "\n[diet-python pytest] batch timed out after "
             f"{timeout_s:.1f}s: {shlex.join(cmd)}\n"
