@@ -101,8 +101,10 @@ use soac_opt::artifacts_v3::{
     single_function_optimization_artifacts_v3, validate_optimization_artifacts_v3_for_module,
 };
 use soac_opt::call_emission_v3::{
-    PreparedV3ConstructorCallPlan, PreparedV3MethodCallPlan, ResolvedV3ConstructorCallPlan,
-    ResolvedV3DirectCallPlan, ResolvedV3MethodCallPlan,
+    ConstructorCallGuardRequest as OptV3ConstructorCallGuardRequest,
+    MethodCallGuardRequest as OptV3MethodCallGuardRequest, PreparedV3ConstructorCallPlan,
+    PreparedV3MethodCallPlan, ResolvedV3ConstructorCallPlan, ResolvedV3DirectCallPlan,
+    ResolvedV3MethodCallPlan, RuntimeCallOwnerGuard as OptV3RuntimeCallOwnerGuard,
     constructor_call_targets as opt_v3_constructor_call_targets,
     constructor_calls_for_function_from_artifacts as opt_v3_emitted_constructor_calls_for_function,
     direct_call_body_plans as opt_v3_direct_call_body_plans,
@@ -13479,7 +13481,7 @@ impl<'a> SpecializationProfile<'a> {
         };
         prepare_constructor_call_plans_for_codegen(
             constructor_calls,
-            opt_v3_constructor_call_guard_from_plan,
+            opt_v3_constructor_call_runtime_guard_from_request,
             register_opt_v3_prepared_constructor_guard_symbols,
         )
     }
@@ -13493,7 +13495,7 @@ impl<'a> SpecializationProfile<'a> {
         };
         prepare_method_call_plans_for_codegen(
             method_calls,
-            opt_v3_method_call_guard_from_plan,
+            opt_v3_method_call_runtime_guard_from_request,
             register_opt_v3_prepared_method_guard_symbols,
         )
     }
@@ -28032,17 +28034,14 @@ fn validate_typed_function_preserves_codegen_cfg(
     Ok(())
 }
 
-fn opt_v3_constructor_call_guard_from_plan(
-    plan: &ResolvedV3ConstructorCallPlan,
-) -> Result<TypedDirectConstructorCallGuard, String> {
-    let type_key = CounterDumpTypeKey {
-        module_name: plan.owner_type.module_name.clone(),
-        qualname: plan.owner_type.qualname.clone(),
-    };
-    let owner_type = resolve_type_key_to_type(&type_key)?.ok_or_else(|| {
+fn opt_v3_constructor_call_runtime_guard_from_request(
+    request: &OptV3ConstructorCallGuardRequest,
+) -> Result<OptV3RuntimeCallOwnerGuard, String> {
+    let type_key = &request.owner_type_key;
+    let owner_type = resolve_type_key_to_type(type_key)?.ok_or_else(|| {
         format!(
             "optimizer v3 constructor-call at {} could not resolve owner type {}.{}",
-            plan.source, type_key.module_name, type_key.qualname
+            request.source, type_key.module_name, type_key.qualname
         )
     })?;
     if unsafe { (*owner_type).tp_version_tag } == 0 {
@@ -28052,47 +28051,42 @@ fn opt_v3_constructor_call_guard_from_plan(
     if type_version == 0 {
         return Err(format!(
             "optimizer v3 constructor-call at {} owner type {}.{} has no type version tag",
-            plan.source, type_key.module_name, type_key.qualname
+            request.source, type_key.module_name, type_key.qualname
         ));
     }
     let owner_type_ref = reloc_type_ref_for_type(owner_type)?.ok_or_else(|| {
         format!(
             "optimizer v3 constructor-call at {} owner type {}.{} has no relocatable type reference",
-            plan.source, type_key.module_name, type_key.qualname
+            request.source, type_key.module_name, type_key.qualname
         )
     })?;
     let function_id = owner_attr_function_id_for_type_ref(&owner_type_ref, "__init__")?
         .ok_or_else(|| {
             format!(
                 "optimizer v3 constructor-call at {} could not resolve owner __init__ function id",
-                plan.source
+                request.source
             )
         })?;
-    if function_id != plan.target {
+    if function_id != request.target {
         return Err(format!(
             "optimizer v3 constructor-call at {} selected target {}, but runtime owner __init__ resolves to {}",
-            plan.source, plan.target, function_id
+            request.source, request.target, function_id
         ));
     }
-    Ok(TypedDirectConstructorCallGuard {
-        function_id: plan.target,
+    Ok(OptV3RuntimeCallOwnerGuard {
         owner_type_ref: typed_attr_owner_ref_from_reloc_type_ref(&owner_type_ref),
         type_version,
-        arg_plan: plan.arg_plan.clone(),
     })
 }
 
-fn opt_v3_method_call_guard_from_plan(
-    plan: &ResolvedV3MethodCallPlan,
-) -> Result<TypedDirectMethodCallGuard, String> {
-    let type_key = CounterDumpTypeKey {
-        module_name: plan.owner_type.module_name.clone(),
-        qualname: plan.owner_type.qualname.clone(),
-    };
-    let owner_type = resolve_type_key_to_type(&type_key)?.ok_or_else(|| {
+fn opt_v3_method_call_runtime_guard_from_request(
+    request: &OptV3MethodCallGuardRequest,
+) -> Result<OptV3RuntimeCallOwnerGuard, String> {
+    let type_key = &request.owner_type_key;
+    let owner_type = resolve_type_key_to_type(type_key)?.ok_or_else(|| {
         format!(
             "optimizer v3 method-call at {} could not resolve owner type {}.{}",
-            plan.source, type_key.module_name, type_key.qualname
+            request.source, type_key.module_name, type_key.qualname
         )
     })?;
     if unsafe { (*owner_type).tp_version_tag } == 0 {
@@ -28102,33 +28096,31 @@ fn opt_v3_method_call_guard_from_plan(
     if type_version == 0 {
         return Err(format!(
             "optimizer v3 method-call at {} owner type {}.{} has no type version tag",
-            plan.source, type_key.module_name, type_key.qualname
+            request.source, type_key.module_name, type_key.qualname
         ));
     }
     let owner_type_ref = reloc_type_ref_for_type(owner_type)?.ok_or_else(|| {
         format!(
             "optimizer v3 method-call at {} owner type {}.{} has no relocatable type reference",
-            plan.source, type_key.module_name, type_key.qualname
+            request.source, type_key.module_name, type_key.qualname
         )
     })?;
-    let function_id = owner_attr_function_id_for_type_ref(&owner_type_ref, &plan.method_name)?
+    let function_id = owner_attr_function_id_for_type_ref(&owner_type_ref, &request.method_name)?
         .ok_or_else(|| {
-            format!(
-                "optimizer v3 method-call at {} could not resolve owner method {:?} function id",
-                plan.source, plan.method_name
-            )
-        })?;
-    if function_id != plan.target {
+        format!(
+            "optimizer v3 method-call at {} could not resolve owner method {:?} function id",
+            request.source, request.method_name
+        )
+    })?;
+    if function_id != request.target {
         return Err(format!(
             "optimizer v3 method-call at {} selected target {}, but runtime owner method {:?} resolves to {}",
-            plan.source, plan.target, plan.method_name, function_id
+            request.source, request.target, request.method_name, function_id
         ));
     }
-    Ok(TypedDirectMethodCallGuard {
-        function_id: plan.target,
+    Ok(OptV3RuntimeCallOwnerGuard {
         owner_type_ref: typed_attr_owner_ref_from_reloc_type_ref(&owner_type_ref),
         type_version,
-        arg_plan: plan.arg_plan.clone(),
     })
 }
 

@@ -5,8 +5,9 @@ use crate::plan_v3::{
     MethodCallGuardKind, MethodCallOwnerType,
 };
 use soac_core::block_py::{InstrId, PersistentFunctionId, RuntimeFunctionId};
+use soac_core::profile::CounterDumpTypeKey;
 use soac_lowering::passes::{
-    TypedCallEmissionPlan, TypedCallEmissionPlans, TypedDirectCallArgPlan,
+    TypedAttrOwnerRef, TypedCallEmissionPlan, TypedCallEmissionPlans, TypedDirectCallArgPlan,
     TypedDirectCallArgSource, TypedDirectConstructorCallGuard, TypedDirectFunctionCallGuard,
     TypedDirectMethodCallGuard,
 };
@@ -56,6 +57,29 @@ pub struct PreparedV3ConstructorCallPlan {
 pub struct PreparedV3MethodCallPlan {
     pub method_name: String,
     pub guards: Vec<TypedDirectMethodCallGuard>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeCallOwnerGuard {
+    pub owner_type_ref: TypedAttrOwnerRef,
+    pub type_version: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConstructorCallGuardRequest {
+    pub source: InstrId,
+    pub target: RuntimeFunctionId,
+    pub owner_type_key: CounterDumpTypeKey,
+    pub arg_plan: TypedDirectCallArgPlan,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MethodCallGuardRequest {
+    pub source: InstrId,
+    pub target: RuntimeFunctionId,
+    pub method_name: String,
+    pub owner_type_key: CounterDumpTypeKey,
+    pub arg_plan: TypedDirectCallArgPlan,
 }
 
 pub fn typed_direct_call_arg_plan_from_v3(plan: &DirectCallArgPlan) -> TypedDirectCallArgPlan {
@@ -365,11 +389,38 @@ pub fn legacy_call_targets_excluding_sources(
         .collect()
 }
 
+pub fn constructor_call_guard_request(
+    plan: &ResolvedV3ConstructorCallPlan,
+) -> ConstructorCallGuardRequest {
+    ConstructorCallGuardRequest {
+        source: plan.source,
+        target: plan.target,
+        owner_type_key: CounterDumpTypeKey {
+            module_name: plan.owner_type.module_name.clone(),
+            qualname: plan.owner_type.qualname.clone(),
+        },
+        arg_plan: plan.arg_plan.clone(),
+    }
+}
+
+pub fn method_call_guard_request(plan: &ResolvedV3MethodCallPlan) -> MethodCallGuardRequest {
+    MethodCallGuardRequest {
+        source: plan.source,
+        target: plan.target,
+        method_name: plan.method_name.clone(),
+        owner_type_key: CounterDumpTypeKey {
+            module_name: plan.owner_type.module_name.clone(),
+            qualname: plan.owner_type.qualname.clone(),
+        },
+        arg_plan: plan.arg_plan.clone(),
+    }
+}
+
 pub fn prepare_constructor_call_plans_for_codegen(
     constructor_calls_by_instr: &HashMap<InstrId, Vec<ResolvedV3ConstructorCallPlan>>,
-    mut guard_from_plan: impl FnMut(
-        &ResolvedV3ConstructorCallPlan,
-    ) -> Result<TypedDirectConstructorCallGuard, String>,
+    mut runtime_guard_from_request: impl FnMut(
+        &ConstructorCallGuardRequest,
+    ) -> Result<RuntimeCallOwnerGuard, String>,
     mut validate_guard: impl FnMut(&TypedDirectConstructorCallGuard) -> Result<(), String>,
 ) -> Result<HashMap<InstrId, PreparedV3ConstructorCallPlan>, String> {
     let mut prepared = HashMap::new();
@@ -383,7 +434,14 @@ pub fn prepare_constructor_call_plans_for_codegen(
         }
         let mut guards = Vec::new();
         for constructor_call in constructor_calls {
-            let guard = guard_from_plan(constructor_call)?;
+            let request = constructor_call_guard_request(constructor_call);
+            let runtime_guard = runtime_guard_from_request(&request)?;
+            let guard = TypedDirectConstructorCallGuard {
+                function_id: request.target,
+                owner_type_ref: runtime_guard.owner_type_ref,
+                type_version: runtime_guard.type_version,
+                arg_plan: request.arg_plan,
+            };
             validate_guard(&guard)?;
             if !guards.contains(&guard) {
                 guards.push(guard);
@@ -396,9 +454,9 @@ pub fn prepare_constructor_call_plans_for_codegen(
 
 pub fn prepare_method_call_plans_for_codegen(
     method_calls_by_instr: &HashMap<InstrId, Vec<ResolvedV3MethodCallPlan>>,
-    mut guard_from_plan: impl FnMut(
-        &ResolvedV3MethodCallPlan,
-    ) -> Result<TypedDirectMethodCallGuard, String>,
+    mut runtime_guard_from_request: impl FnMut(
+        &MethodCallGuardRequest,
+    ) -> Result<RuntimeCallOwnerGuard, String>,
     mut validate_guard: impl FnMut(&TypedDirectMethodCallGuard, &str) -> Result<(), String>,
 ) -> Result<HashMap<InstrId, PreparedV3MethodCallPlan>, String> {
     let mut prepared = HashMap::new();
@@ -422,7 +480,14 @@ pub fn prepare_method_call_plans_for_codegen(
         }
         let mut guards = Vec::new();
         for method_call in method_calls {
-            let guard = guard_from_plan(method_call)?;
+            let request = method_call_guard_request(method_call);
+            let runtime_guard = runtime_guard_from_request(&request)?;
+            let guard = TypedDirectMethodCallGuard {
+                function_id: request.target,
+                owner_type_ref: runtime_guard.owner_type_ref,
+                type_version: runtime_guard.type_version,
+                arg_plan: request.arg_plan,
+            };
             validate_guard(&guard, &method_name)?;
             if !guards.contains(&guard) {
                 guards.push(guard);
@@ -517,4 +582,127 @@ pub fn v3_call_emission_sources(
         sources.extend(method_calls.keys().copied());
     }
     sources
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plan_v3::{Cost, MethodCallFallbackKind};
+    use soac_core::block_py::BlockLabel;
+
+    fn direct_body() -> CallBodyPlan {
+        CallBodyPlan {
+            kind: CallBodyKind::DirectCall,
+            cost: Cost {
+                hot_path: 1,
+                miss_path: 0,
+                deopt: 0,
+                materialization: 0,
+                ownership: 0,
+                code_size: 1,
+                compile: 1,
+            },
+            inline_target: None,
+            reason: "test".to_string(),
+        }
+    }
+
+    #[test]
+    fn prepares_constructor_guards_from_runtime_owner_payload() {
+        let source = InstrId::new(BlockLabel::from_index(0), 1);
+        let target = RuntimeFunctionId::from_raw_parts(0, 2);
+        let owner_type_ref = TypedAttrOwnerRef::TypeKey {
+            module_name: "module".to_string(),
+            qualname: "Box".to_string(),
+        };
+        let plan = ResolvedV3ConstructorCallPlan {
+            source,
+            target,
+            owner_type: ConstructorCallOwnerType {
+                module_name: "module".to_string(),
+                qualname: "Box".to_string(),
+            },
+            arg_plan: TypedDirectCallArgPlan {
+                sources: vec![TypedDirectCallArgSource::Provided(0)],
+            },
+            guard: ConstructorCallGuardKind::ExactCallableTypeVersion,
+            fallback: ConstructorCallFallbackKind::OriginalConstructorCall,
+            body: direct_body(),
+            inline_target: None,
+            reason: "profiled constructor".to_string(),
+        };
+
+        let prepared = prepare_constructor_call_plans_for_codegen(
+            &HashMap::from([(source, vec![plan])]),
+            |request| {
+                assert_eq!(request.source, source);
+                assert_eq!(request.target, target);
+                assert_eq!(request.owner_type_key.module_name, "module");
+                assert_eq!(request.owner_type_key.qualname, "Box");
+                Ok(RuntimeCallOwnerGuard {
+                    owner_type_ref: owner_type_ref.clone(),
+                    type_version: 42,
+                })
+            },
+            |_| Ok(()),
+        )
+        .expect("constructor guard should prepare");
+
+        assert_eq!(prepared[&source].guards.len(), 1);
+        assert_eq!(prepared[&source].guards[0].function_id, target);
+        assert_eq!(prepared[&source].guards[0].owner_type_ref, owner_type_ref);
+        assert_eq!(prepared[&source].guards[0].type_version, 42);
+    }
+
+    #[test]
+    fn prepares_method_guards_from_runtime_owner_payload() {
+        let source = InstrId::new(BlockLabel::from_index(0), 3);
+        let target = RuntimeFunctionId::from_raw_parts(0, 4);
+        let owner_type_ref = TypedAttrOwnerRef::TypeKey {
+            module_name: "module".to_string(),
+            qualname: "Box".to_string(),
+        };
+        let plan = ResolvedV3MethodCallPlan {
+            source,
+            target,
+            method_name: "get".to_string(),
+            owner_type: MethodCallOwnerType {
+                module_name: "module".to_string(),
+                qualname: "Box".to_string(),
+            },
+            arg_plan: TypedDirectCallArgPlan {
+                sources: vec![TypedDirectCallArgSource::Provided(0)],
+            },
+            guard: MethodCallGuardKind::ExactReceiverTypeVersion,
+            fallback: MethodCallFallbackKind::OriginalMethodCall,
+            body: direct_body(),
+            reason: "profiled method".to_string(),
+        };
+
+        let prepared = prepare_method_call_plans_for_codegen(
+            &HashMap::from([(source, vec![plan])]),
+            |request| {
+                assert_eq!(request.source, source);
+                assert_eq!(request.target, target);
+                assert_eq!(request.method_name, "get");
+                assert_eq!(request.owner_type_key.module_name, "module");
+                assert_eq!(request.owner_type_key.qualname, "Box");
+                Ok(RuntimeCallOwnerGuard {
+                    owner_type_ref: owner_type_ref.clone(),
+                    type_version: 77,
+                })
+            },
+            |_, method_name| {
+                assert_eq!(method_name, "get");
+                Ok(())
+            },
+        )
+        .expect("method guard should prepare");
+
+        assert_eq!(prepared[&source].method_name, "get");
+        assert_eq!(prepared[&source].guards.len(), 1);
+        assert_eq!(prepared[&source].guards[0].function_id, target);
+        assert_eq!(prepared[&source].guards[0].owner_type_ref, owner_type_ref);
+        assert_eq!(prepared[&source].guards[0].type_version, 77);
+    }
 }
