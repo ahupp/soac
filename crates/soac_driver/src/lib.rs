@@ -455,7 +455,7 @@ mod tests {
         PythonModuleCacheSource, load_codegen_module_cache, store_codegen_module_cache,
     };
     use soac_config::{SoacEnvConfig, SoacLogConfig, SpecializationMode};
-    use soac_core::block_py::{CounterSite, ModuleNameGen};
+    use soac_core::block_py::{CounterSite, FunctionExecutionMode, ModuleNameGen};
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -537,19 +537,30 @@ mod tests {
             .iter()
             .filter(|counter| counter.kind == "block_entry")
             .collect::<Vec<_>>();
-        let total_blocks = lowered
+        let jit_function_ids = lowered
             .callable_defs
             .iter()
+            .filter(|function| function.execution_mode() == FunctionExecutionMode::Jit)
+            .map(|function| function.function_id)
+            .collect::<Vec<_>>();
+        let total_jit_blocks = lowered
+            .callable_defs
+            .iter()
+            .filter(|function| function.execution_mode() == FunctionExecutionMode::Jit)
             .map(|function| function.blocks.len())
             .sum::<usize>();
         assert_eq!(
             block_entry_counters.len(),
-            total_blocks,
-            "profile lowering should attach one block_entry counter per lowered block"
+            total_jit_blocks,
+            "profile lowering should attach one block_entry counter per lowered JIT block"
         );
         assert!(block_entry_counters.iter().all(|counter| {
             counter.scope == CounterScope::This
-                && matches!(counter.site, CounterSite::BlockEntry { .. })
+                && matches!(
+                    &counter.site,
+                    CounterSite::BlockEntry { function_id, .. }
+                    if jit_function_ids.contains(function_id)
+                )
         }));
         assert_eq!(
             lowered
@@ -580,15 +591,21 @@ mod tests {
                     counter.kind == "runtime_incref" || counter.kind == "runtime_decref"
                 })
                 .collect::<Vec<_>>();
-            assert_eq!(refcount_counters.len(), lowered.callable_defs.len() * 2);
+            let jit_function_ids = lowered
+                .callable_defs
+                .iter()
+                .filter(|function| function.execution_mode() == FunctionExecutionMode::Jit)
+                .map(|function| function.function_id)
+                .collect::<Vec<_>>();
+            assert_eq!(refcount_counters.len(), jit_function_ids.len() * 2);
             assert!(refcount_counters.iter().all(|counter| {
                 counter.scope == CounterScope::Function
                     && matches!(
-                        counter.site,
+                        &counter.site,
                         CounterSite::Runtime {
-                            function_id: Some(_),
+                            function_id: Some(function_id),
                             instr_id: None,
-                        }
+                        } if jit_function_ids.contains(function_id)
                     )
             }));
         }

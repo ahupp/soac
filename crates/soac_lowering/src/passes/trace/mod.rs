@@ -2,8 +2,8 @@ use crate::block_py::HasSemanticInstrId;
 use crate::block_py::{
     core_call_expr_with_meta, literal_expr, BlockPyFunction, BlockPyModule, BlockTerm,
     CallArgPositional, ChildVisitable, CounterScope, CounterSite, DeoptEntrySource,
-    IncrementCounter, InstrCodegen, InstrResolved, Load, Meta, NameLocation, ResolvedName,
-    RuntimeName, StringLiteral, Tuple, Visit, WithMeta,
+    FunctionExecutionMode, IncrementCounter, InstrCodegen, InstrResolved, Load, Meta, NameLocation,
+    ResolvedName, RuntimeName, StringLiteral, Tuple, Visit, WithMeta,
 };
 use crate::passes::{
     CodegenModuleShape, CounterBuilder, LocalEnvResumeModulePlan, LocalEnvResumePoint,
@@ -48,6 +48,22 @@ fn specialization_mode_instruments_top_values(config: &SoacEnvConfig) -> bool {
     config
         .specialization_mode()
         .is_some_and(SpecializationMode::records_counters)
+}
+
+fn functions_with_counter_instrumentation(
+    functions: &[BlockPyFunction<CodegenModuleShape>],
+) -> impl Iterator<Item = &BlockPyFunction<CodegenModuleShape>> {
+    functions
+        .iter()
+        .filter(|function| function.execution_mode() == FunctionExecutionMode::Jit)
+}
+
+fn functions_with_counter_instrumentation_mut(
+    functions: &mut [BlockPyFunction<CodegenModuleShape>],
+) -> impl Iterator<Item = &mut BlockPyFunction<CodegenModuleShape>> {
+    functions
+        .iter_mut()
+        .filter(|function| function.execution_mode() == FunctionExecutionMode::Jit)
 }
 
 pub(crate) fn parse_trace_config(raw: &str) -> Option<TraceConfig> {
@@ -113,7 +129,7 @@ pub fn instrument_bb_module_with_block_entry_counters(
     module: &mut BlockPyModule<CodegenModuleShape>,
 ) {
     let mut counters = CounterBuilder::new(&mut module.counter_defs);
-    for function in &mut module.callable_defs {
+    for function in functions_with_counter_instrumentation_mut(&mut module.callable_defs) {
         for block in &mut function.blocks {
             let counter_id = counters
                 .define(
@@ -146,9 +162,7 @@ pub fn instrument_bb_module_with_refcount_counters(
             );
         }
         CounterScope::Function => {
-            let function_ids = module
-                .callable_defs
-                .iter()
+            let function_ids = functions_with_counter_instrumentation(&module.callable_defs)
                 .map(|function| function.function_id)
                 .collect::<Vec<_>>();
             for function_id in function_ids {
@@ -185,7 +199,7 @@ pub fn define_bb_module_deopt_entry_counters(
     resume_plan: &LocalEnvResumeModulePlan,
 ) {
     let mut counters = CounterBuilder::new(&mut module.counter_defs);
-    for function in &module.callable_defs {
+    for function in functions_with_counter_instrumentation(&module.callable_defs) {
         let Some(function_plan) = resume_plan.function(function.function_id) else {
             continue;
         };
@@ -468,7 +482,7 @@ pub fn instrument_bb_module_with_call_target_counters(
     }
 
     let mut counters = CounterBuilder::new(&mut module.counter_defs);
-    for function in &module.callable_defs {
+    for function in functions_with_counter_instrumentation(&module.callable_defs) {
         let mut collector = SpecializationCandidateCounterCollector {
             function_id: function.function_id,
             counters: &mut counters,
@@ -479,7 +493,7 @@ pub fn instrument_bb_module_with_call_target_counters(
 
 pub fn instrument_bb_module_with_locality_counters(module: &mut BlockPyModule<CodegenModuleShape>) {
     let mut counters = CounterBuilder::new(&mut module.counter_defs);
-    for function in &module.callable_defs {
+    for function in functions_with_counter_instrumentation(&module.callable_defs) {
         for block in &function.blocks {
             let BlockTerm::IfTerm(if_term) = &block.term else {
                 continue;

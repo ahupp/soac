@@ -1,16 +1,19 @@
 use super::{
-    instrument_bb_module_for_trace, instrument_bb_module_with_global_load_counters,
-    instrument_bb_module_with_locality_counters, parse_trace_config, TraceConfig,
+    instrument_bb_module_for_trace, instrument_bb_module_with_block_entry_counters,
+    instrument_bb_module_with_call_target_counters, instrument_bb_module_with_global_load_counters,
+    instrument_bb_module_with_locality_counters, instrument_bb_module_with_refcount_counters,
+    parse_trace_config, TraceConfig,
 };
 use crate::block_py::{
-    BlockPyFunction, Call, ChildVisitable, CounterScope, CounterSite, InstrCodegen, NameLike,
-    NameLocation, Visit,
+    BlockPyFunction, BlockPyModule, Call, ChildVisitable, CounterScope, CounterSite,
+    FunctionExecutionMode, InstrCodegen, NameLike, NameLocation, RuntimeFunctionId, Visit,
 };
 use crate::lower_python_to_blockpy_for_testing;
 use crate::passes::{
     assign_module_instr_ids, lower_try_jump_exception_flow, normalize_bb_module_strings,
     CodegenModuleShape,
 };
+use std::collections::HashSet;
 
 fn tracked_name_binding_module(
     source: &str,
@@ -41,6 +44,16 @@ fn trace_enter_calls(function: &BlockPyFunction<CodegenModuleShape>) -> Vec<&Cal
         .collect()
 }
 
+fn codegen_module_for_trace_test(source: &str) -> BlockPyModule<CodegenModuleShape> {
+    let bb_module = tracked_name_binding_module(source)
+        .expect("transform should succeed")
+        .expect("bb module should be available");
+    let prepared = lower_try_jump_exception_flow(&bb_module);
+    let mut normalized = normalize_bb_module_strings(&prepared);
+    crate::passes::relabel_dense_bb_module(&mut normalized);
+    assign_module_instr_ids(normalized)
+}
+
 struct LocalLoadProbe {
     found: bool,
 }
@@ -59,6 +72,31 @@ fn expr_tree_contains_local_load(expr: &InstrCodegen) -> bool {
     let mut probe = LocalLoadProbe { found: false };
     probe.visit_instr(expr);
     probe.found
+}
+
+fn function_contains_increment_counter(function: &BlockPyFunction<CodegenModuleShape>) -> bool {
+    struct IncrementCounterProbe {
+        found: bool,
+    }
+
+    impl Visit<InstrCodegen> for IncrementCounterProbe {
+        fn visit_instr(&mut self, expr: &InstrCodegen) {
+            self.found |= matches!(expr, InstrCodegen::IncrementCounter(_));
+            expr.visit_children(self);
+        }
+    }
+
+    let mut probe = IncrementCounterProbe { found: false };
+    probe.visit_fn(function);
+    probe.found
+}
+
+fn counter_site_function_id(site: &CounterSite) -> Option<RuntimeFunctionId> {
+    match site {
+        CounterSite::BlockEntry { function_id, .. }
+        | CounterSite::DeoptEntry { function_id, .. } => Some(*function_id),
+        CounterSite::Runtime { function_id, .. } => *function_id,
+    }
 }
 
 #[test]
@@ -90,13 +128,7 @@ fn parses_all_and_params_variants() {
 #[test]
 fn instruments_matching_function_blocks() {
     let source = "def f(x):\n    try:\n        return x + 1\n    except Exception:\n        return 0\n\ndef g(y):\n    return y + 2\n";
-    let bb_module = tracked_name_binding_module(source)
-        .expect("transform should succeed")
-        .expect("bb module should be available");
-    let prepared = lower_try_jump_exception_flow(&bb_module);
-    let mut normalized = normalize_bb_module_strings(&prepared);
-    crate::passes::relabel_dense_bb_module(&mut normalized);
-    let mut codegen = assign_module_instr_ids(normalized);
+    let mut codegen = codegen_module_for_trace_test(source);
     instrument_bb_module_for_trace(
         &mut codegen,
         &TraceConfig {
@@ -130,13 +162,7 @@ fn instruments_matching_function_blocks() {
 #[test]
 fn adds_named_global_load_counters_once() {
     let source = "VALUE = 1\n\ndef f():\n    return VALUE\n";
-    let bb_module = tracked_name_binding_module(source)
-        .expect("transform should succeed")
-        .expect("bb module should be available");
-    let prepared = lower_try_jump_exception_flow(&bb_module);
-    let mut normalized = normalize_bb_module_strings(&prepared);
-    crate::passes::relabel_dense_bb_module(&mut normalized);
-    let mut codegen = assign_module_instr_ids(normalized);
+    let mut codegen = codegen_module_for_trace_test(source);
     instrument_bb_module_with_global_load_counters(&mut codegen);
     instrument_bb_module_with_global_load_counters(&mut codegen);
     let counters = codegen
@@ -166,13 +192,7 @@ fn adds_named_global_load_counters_once() {
 #[test]
 fn adds_branch_outcome_counters_for_conditional_terms() {
     let source = "def f(x):\n    if x:\n        return 1\n    return 0\n";
-    let bb_module = tracked_name_binding_module(source)
-        .expect("transform should succeed")
-        .expect("bb module should be available");
-    let prepared = lower_try_jump_exception_flow(&bb_module);
-    let mut normalized = normalize_bb_module_strings(&prepared);
-    crate::passes::relabel_dense_bb_module(&mut normalized);
-    let mut codegen = assign_module_instr_ids(normalized);
+    let mut codegen = codegen_module_for_trace_test(source);
     instrument_bb_module_with_locality_counters(&mut codegen);
 
     let counters = codegen
@@ -191,5 +211,61 @@ fn adds_branch_outcome_counters_for_conditional_terms() {
             }
         ),
         "branch outcome counter should point at the conditional test instruction"
+    );
+}
+
+#[test]
+fn skips_counter_instrumentation_for_interpreted_functions() {
+    let source = r#"
+VALUE: int = 1
+
+def f(value: int) -> int:
+    if value:
+        return value + VALUE
+    return 0
+
+class C:
+    field: int = 1
+"#;
+    let mut codegen = codegen_module_for_trace_test(source);
+    let interpreted_ids = codegen
+        .callable_defs
+        .iter()
+        .filter(|function| function.execution_mode() == FunctionExecutionMode::Interpreted)
+        .map(|function| function.function_id)
+        .collect::<HashSet<_>>();
+    assert!(!interpreted_ids.is_empty());
+
+    instrument_bb_module_with_block_entry_counters(&mut codegen);
+    instrument_bb_module_with_call_target_counters(&mut codegen);
+    instrument_bb_module_with_locality_counters(&mut codegen);
+    instrument_bb_module_with_refcount_counters(&mut codegen, CounterScope::Function)
+        .expect("function refcount counters should be defined");
+
+    for function in &codegen.callable_defs {
+        if interpreted_ids.contains(&function.function_id) {
+            assert!(
+                !function_contains_increment_counter(function),
+                "interpreted function {} should not contain counter increments",
+                function.names.qualname
+            );
+        }
+    }
+    assert!(
+        codegen
+            .callable_defs
+            .iter()
+            .filter(|function| function.execution_mode() == FunctionExecutionMode::Jit)
+            .any(function_contains_increment_counter),
+        "JIT functions should still receive block-entry counters"
+    );
+    assert!(
+        codegen
+            .counter_defs
+            .iter()
+            .filter_map(|counter| counter_site_function_id(&counter.site))
+            .all(|function_id| !interpreted_ids.contains(&function_id)),
+        "counter definitions should not target interpreted functions: {:?}",
+        codegen.counter_defs
     );
 }
