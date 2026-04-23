@@ -1,8 +1,8 @@
-use crate::block_py::{
-    walk_block, walk_expr, BlockLabel, BlockPyModule, CallArgKeyword, CallArgPositional,
-    ChildVisitable, HasMeta, InstrCodegen, InstrId, RuntimeFunctionId, Visit,
+use crate::passes::{CodegenModuleShape, InlinePlanModule, InstrCodegen, InstrCodegenOp};
+use soac_core::block_py::{
+    BlockLabel, BlockPyModule, CallArgKeyword, CallArgPositional, ChildVisitable, HasMeta, InstrId,
+    RuntimeFunctionId, Visit, walk_block, walk_expr,
 };
-use crate::passes::{CodegenModuleShape, InlinePlanModule, InstrCodegenOp};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct InlineCallSiteModule {
@@ -89,7 +89,7 @@ impl Visit<InstrCodegen> for InlineCallSiteCollector<'_> {
         walk_expr(self, expr);
     }
 
-    fn visit_block(&mut self, block: &crate::block_py::Block<InstrCodegen>)
+    fn visit_block(&mut self, block: &soac_core::block_py::Block<InstrCodegen>)
     where
         InstrCodegen: ChildVisitable<InstrCodegen>,
     {
@@ -101,9 +101,9 @@ impl Visit<InstrCodegen> for InlineCallSiteCollector<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block_py::{CallDirect, Load, NameLocation, ResolvedName};
-    use crate::lower_python_to_blockpy_for_testing;
     use crate::passes::{plan_module_inlining, summarize_module_escapes};
+    use soac_core::block_py::{CallDirect, Load, NameLocation, ResolvedName};
+    use soac_lowering::lower_python_to_blockpy_for_testing;
 
     fn function_index_by_qualname(
         module: &BlockPyModule<CodegenModuleShape>,

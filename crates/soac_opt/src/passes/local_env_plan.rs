@@ -5,14 +5,14 @@
 //! backend-neutral: backends may materialize these entries as SSA block params,
 //! stack-slot loads, or another resume-state representation.
 
-use crate::block_py::{
-    BlockLabel, BlockPyFunction, BlockPyModule, HasSemanticInstrId, InstrCodegen, InstrKey,
-    LocalLocation, RuntimeFunctionId,
-};
 use crate::passes::ownership_effects::{
     compute_function_local_live_ins, compute_function_local_must_bound_ins,
 };
-use crate::passes::{CodegenModuleShape, FactStore, PyObjFacts};
+use crate::passes::{CodegenModuleShape, FactStore, InstrCodegen, PyObjFacts};
+use soac_core::block_py::{
+    BlockLabel, BlockPyFunction, BlockPyModule, HasSemanticInstrId, InstrKey, LocalLocation,
+    RuntimeFunctionId,
+};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
@@ -905,8 +905,8 @@ fn is_try_exception_alias_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lower_python_to_blockpy_for_testing;
     use crate::passes::infer_module_value_facts;
+    use soac_lowering::lower_python_to_blockpy_for_testing;
 
     #[test]
     fn local_env_module_plan_covers_codegen_functions_and_blocks() {
@@ -970,10 +970,12 @@ def f():
             local_plan.blocks.len(),
             function_without_storage.blocks.len()
         );
-        assert!(local_plan
-            .blocks
-            .values()
-            .all(|block_plan| block_plan.entry_locals.is_empty()));
+        assert!(
+            local_plan
+                .blocks
+                .values()
+                .all(|block_plan| block_plan.entry_locals.is_empty())
+        );
 
         let resume_plan =
             plan_function_local_env_resume(&function_without_storage, &local_plan, &facts);
@@ -1035,10 +1037,12 @@ def choose(flag, x):
                     .any(|entry| matches!(entry.point, LocalEnvResumePoint::BeforeInstr { .. })),
                 "non-empty functions should expose instruction-keyed resume points"
             );
-            assert!(function_plan
-                .entries
-                .iter()
-                .all(|entry| entry.point.function_id() == function.function_id));
+            assert!(
+                function_plan
+                    .entries
+                    .iter()
+                    .all(|entry| entry.point.function_id() == function.function_id)
+            );
         }
     }
 

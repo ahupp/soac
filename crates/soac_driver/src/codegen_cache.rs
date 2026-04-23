@@ -173,6 +173,36 @@ pub fn module_optimized_codegen_v3_path(
     )
 }
 
+pub fn cached_module_paths_under_root(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    collect_cached_module_paths(root, &mut out)?;
+    out.sort();
+    Ok(out)
+}
+
+fn collect_cached_module_paths(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("read module cache path metadata {}", path.display()))?;
+    if metadata.is_file() {
+        if path.file_name().and_then(|name| name.to_str())
+            == Some(ModuleCacheArtifact::CodegenModule.file_name())
+        {
+            out.push(path.to_path_buf());
+        }
+        return Ok(());
+    }
+    if !metadata.is_dir() {
+        return Ok(());
+    }
+    let entries = fs::read_dir(path)
+        .with_context(|| format!("read module cache directory {}", path.display()))?;
+    for entry in entries {
+        let entry = entry.with_context(|| format!("read entry in {}", path.display()))?;
+        collect_cached_module_paths(entry.path().as_path(), out)?;
+    }
+    Ok(())
+}
+
 pub fn codegen_module_cache_key(source_hash: u64, build_identity: &str) -> String {
     format!("{source_hash:016x}-{:016x}", stable_hash(build_identity))
 }
@@ -335,7 +365,15 @@ impl VisitMut<InstrCodegen> for FunctionIdRemapper {
             InstrCodegen::CallDirect(op) => {
                 op.function_id = self.remap(op.function_id);
             }
-            InstrCodegen::DirectCallableCall(op) => {
+            InstrCodegen::DirectCallableCall(op) => match &mut op.guard {
+                soac_lowering::passes::TypedDirectCallableCallGuard::Function(guard) => {
+                    guard.function_id = self.remap(guard.function_id);
+                }
+                soac_lowering::passes::TypedDirectCallableCallGuard::Constructor(guard) => {
+                    guard.function_id = self.remap(guard.function_id);
+                }
+            },
+            InstrCodegen::DirectMethodCall(op) => {
                 op.guard.function_id = self.remap(op.guard.function_id);
             }
             InstrCodegen::DirectFunctionIdGuardTest(op) => {

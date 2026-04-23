@@ -1,14 +1,25 @@
 pub mod codegen_cache;
 
 use crate::codegen_cache::{
-    CachedCodegenModule, CachedCodegenModuleMetadata, load_codegen_module_cache,
+    CachedCodegenModule, CachedCodegenModuleMetadata, cached_module_paths_under_root,
+    load_codegen_module_cache, module_optimization_plan_v3_path, module_optimized_codegen_v3_path,
     remap_cached_codegen_module_function_ids, store_codegen_module_cache,
     validate_codegen_module_cache_metadata,
 };
+use anyhow::{Context, Result as AnyhowResult};
 use soac_config::{SoacEnvConfig, init_logging_with_config};
-use soac_core::block_py::{BlockPyModule, CounterDef, CounterId, CounterScope, ModuleNameGen};
+use soac_core::block_py::{
+    BlockPyModule, CounterDef, CounterId, CounterScope, CounterSite, DeoptEntrySource,
+    FunctionExecutionMode, ModuleNameGen,
+};
 use soac_lowering::pass_tracker::{NoopPassTracker, PassTracker, RecordingPassTracker};
 use soac_lowering::passes::{self, CodegenModuleShape, InstrCodegen};
+pub use soac_lowering::{LoweringError, LoweringResult, Result};
+use soac_opt::artifacts_v3::write_optimization_artifacts_v3;
+use soac_opt::passes as opt_passes;
+use soac_opt::pipeline_v3::{ModuleOptimizationInput, optimize_modules_v3_from_raw_evidence};
+use soac_opt::plan::ProfileEvidenceStore;
+use soac_opt::plan_v3::ModulePlanIdentity;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -384,21 +395,21 @@ fn define_deopt_entry_counters_for_current_module(
     pass_tracker: &mut impl PassTracker,
 ) -> soac_lowering::Result<()> {
     let value_facts = pass_tracker.record_timing("deopt_entry_value_facts", || {
-        passes::infer_module_value_facts(module)
+        opt_passes::infer_module_value_facts(module)
     });
     let local_env_plan = pass_tracker.record_timing("deopt_entry_local_env_plan", || {
-        passes::plan_local_env_module(module, &value_facts)
+        opt_passes::plan_local_env_module(module, &value_facts)
     });
     pass_tracker.record_timing("validate_deopt_entry_local_env_plan", || {
-        passes::validate_local_env_module_plan(module, &value_facts, &local_env_plan)
+        opt_passes::validate_local_env_module_plan(module, &value_facts, &local_env_plan)
             .map_err(anyhow::Error::msg)
     })?;
     let local_env_resume_plan = pass_tracker
         .record_timing("deopt_entry_local_env_resume_plan", || {
-            passes::plan_local_env_resume_module(module, &local_env_plan, &value_facts)
+            opt_passes::plan_local_env_resume_module(module, &local_env_plan, &value_facts)
         });
     pass_tracker.record_timing("validate_deopt_entry_local_env_resume_plan", || {
-        passes::validate_local_env_resume_module_plan(
+        opt_passes::validate_local_env_resume_module_plan(
             module,
             &local_env_plan,
             &value_facts,
@@ -406,8 +417,48 @@ fn define_deopt_entry_counters_for_current_module(
         )
         .map_err(anyhow::Error::msg)
     })?;
-    passes::define_bb_module_deopt_entry_counters(module, &local_env_resume_plan);
+    define_bb_module_deopt_entry_counters(module, &local_env_resume_plan);
     Ok(())
+}
+
+fn define_bb_module_deopt_entry_counters(
+    module: &mut BlockPyModule<CodegenModuleShape>,
+    resume_plan: &opt_passes::LocalEnvResumeModulePlan,
+) {
+    let mut counters = passes::CounterBuilder::new(&mut module.counter_defs);
+    for function in module
+        .callable_defs
+        .iter()
+        .filter(|function| function.execution_mode() == FunctionExecutionMode::Jit)
+    {
+        let Some(function_plan) = resume_plan.function(function.function_id) else {
+            continue;
+        };
+        for entry in &function_plan.entries {
+            counters.define_if_missing(
+                CounterScope::This,
+                "deopt_entry_guard_miss",
+                CounterSite::DeoptEntry {
+                    function_id: function.function_id,
+                    source: deopt_entry_source_for_resume_point(entry.point),
+                },
+            );
+        }
+    }
+}
+
+fn deopt_entry_source_for_resume_point(point: opt_passes::LocalEnvResumePoint) -> DeoptEntrySource {
+    match point {
+        opt_passes::LocalEnvResumePoint::BlockEntry { block, .. } => {
+            DeoptEntrySource::BlockEntry { block_label: block }
+        }
+        opt_passes::LocalEnvResumePoint::BeforeInstr { key } => DeoptEntrySource::BeforeInstr {
+            instr_id: key.instr_id,
+        },
+        opt_passes::LocalEnvResumePoint::BeforeTerm { block, .. } => {
+            DeoptEntrySource::BeforeTerm { block_label: block }
+        }
+    }
 }
 
 pub fn finish_cached_codegen_module_for_runtime(
@@ -437,6 +488,146 @@ pub fn finish_cached_codegen_module_for_runtime_with_counter_defs(
         define_deopt_entry_counters_for_current_module(&mut module, &mut NoopPassTracker::new())?;
     }
     Ok(module)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CachedModuleOptimizationInput {
+    pub module_path: PathBuf,
+    pub strict: bool,
+}
+
+impl CachedModuleOptimizationInput {
+    pub fn new(module_path: PathBuf, strict: bool) -> Self {
+        Self {
+            module_path,
+            strict,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModuleOptimizationPlanReport {
+    pub output_path: PathBuf,
+    pub optimized_module_path: PathBuf,
+    pub module_name: String,
+    pub source_hash: u64,
+    pub function_count: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OptimizationPlanGenerationSummary {
+    pub reports: Vec<ModuleOptimizationPlanReport>,
+    pub skipped: usize,
+}
+
+impl OptimizationPlanGenerationSummary {
+    pub fn written(&self) -> usize {
+        self.reports.len()
+    }
+}
+
+struct LoadedCachedModuleOptimizationInput {
+    strict: bool,
+    cache: CachedCodegenModule,
+}
+
+pub fn generate_optimization_plans_v3_for_counter_dump(
+    counters_path: &Path,
+    module_root: &Path,
+    out_root: &Path,
+) -> AnyhowResult<OptimizationPlanGenerationSummary> {
+    let evidence_store = ProfileEvidenceStore::from_counter_dump(counters_path)?;
+    let modules = cached_module_paths_under_root(module_root)?
+        .into_iter()
+        .map(|module_path| CachedModuleOptimizationInput::new(module_path, false));
+    generate_optimization_plans_v3_for_cached_modules(&evidence_store, modules, out_root)
+}
+
+pub fn generate_optimization_plans_v3_for_cached_modules(
+    evidence_store: &ProfileEvidenceStore,
+    module_inputs: impl IntoIterator<Item = CachedModuleOptimizationInput>,
+    out_root: &Path,
+) -> AnyhowResult<OptimizationPlanGenerationSummary> {
+    let loaded = module_inputs
+        .into_iter()
+        .map(|input| {
+            let cache =
+                load_codegen_module_cache(input.module_path.as_path()).with_context(|| {
+                    format!(
+                        "load BlockPy module cache {} for optimizer v3",
+                        input.module_path.display()
+                    )
+                })?;
+            Ok(LoadedCachedModuleOptimizationInput {
+                strict: input.strict,
+                cache,
+            })
+        })
+        .collect::<AnyhowResult<Vec<_>>>()?;
+    let module_inputs = loaded
+        .iter()
+        .map(|input| {
+            ModuleOptimizationInput::new(
+                module_plan_identity_for_cached_metadata(&input.cache.metadata),
+                &input.cache.module,
+                input.strict,
+            )
+        })
+        .collect::<Vec<_>>();
+    let optimized = optimize_modules_v3_from_raw_evidence(evidence_store, module_inputs)?;
+    let mut summary = OptimizationPlanGenerationSummary {
+        reports: Vec::new(),
+        skipped: optimized.skipped,
+    };
+    for optimized_module in optimized.modules {
+        let loaded_input = loaded
+            .iter()
+            .find(|input| {
+                module_plan_identity_for_cached_metadata(&input.cache.metadata)
+                    == optimized_module.identity
+            })
+            .with_context(|| {
+                format!(
+                    "optimized module {} source_hash=0x{:016x} did not match a loaded cache input",
+                    optimized_module.identity.module_name, optimized_module.identity.source_hash
+                )
+            })?;
+        let metadata = &loaded_input.cache.metadata;
+        let output_path = module_optimization_plan_v3_path(
+            out_root,
+            metadata.source,
+            metadata.module_name.as_str(),
+        )?;
+        let optimized_module_path = module_optimized_codegen_v3_path(
+            out_root,
+            metadata.source,
+            metadata.module_name.as_str(),
+        )?;
+        write_optimization_artifacts_v3(output_path.as_path(), &optimized_module.artifacts)?;
+        store_codegen_module_cache(
+            optimized_module_path.as_path(),
+            metadata,
+            &optimized_module.optimized_module,
+        )?;
+        summary.reports.push(ModuleOptimizationPlanReport {
+            output_path,
+            optimized_module_path,
+            module_name: metadata.module_name.clone(),
+            source_hash: metadata.source_hash,
+            function_count: optimized_module.artifacts.plan.functions.len(),
+        });
+    }
+    Ok(summary)
+}
+
+fn module_plan_identity_for_cached_metadata(
+    metadata: &CachedCodegenModuleMetadata,
+) -> ModulePlanIdentity {
+    ModulePlanIdentity {
+        module_name: metadata.module_name.clone(),
+        source_hash: metadata.source_hash,
+        cache_identity: metadata.cache_identity.clone(),
+    }
 }
 
 fn retain_defined_explicit_counter_increments(

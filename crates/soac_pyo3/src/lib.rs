@@ -7,9 +7,9 @@ use pyo3::prelude::*;
 use pyo3::types::PyModule;
 use serde_json::json;
 use soac_core::profile::CounterDumpFile;
+use soac_driver::generate_optimization_plans_v3_for_counter_dump;
 use soac_lowering::{lower_python_to_blockpy_for_testing, ruff_ast_to_string};
 use soac_opt::artifacts_v3::load_optimization_artifacts_v3;
-use soac_opt::pipeline_v3::generate_optimization_plans_v3_for_counter_dump;
 use std::path::{Path, PathBuf};
 use tracing::trace;
 

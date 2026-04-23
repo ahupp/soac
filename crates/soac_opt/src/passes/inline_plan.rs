@@ -1,9 +1,9 @@
-use crate::block_py::PrettyPrint;
-use crate::block_py::{LocalLocation, RuntimeFunctionId};
 use crate::passes::{
     ConstructorFieldStore, ConstructorFieldValue, EscapeSummaryModule,
     FieldInitializerConstructorSummary, NonEscapingConstructorAllocationSummary,
 };
+use soac_core::block_py::PrettyPrint;
+use soac_core::block_py::{LocalLocation, RuntimeFunctionId};
 use std::collections::HashMap;
 
 #[derive(
@@ -49,7 +49,7 @@ impl InlinePlanModule {
 }
 
 impl PrettyPrint for InlinePlanModule {
-    fn fmt_pretty(&self, printer: &mut crate::block_py::PrettyPrinter<'_>) -> std::fmt::Result {
+    fn fmt_pretty(&self, printer: &mut soac_core::block_py::PrettyPrinter<'_>) -> std::fmt::Result {
         let mut function_ids = self.functions.keys().copied().collect::<Vec<_>>();
         function_ids.sort_by_key(|function_id| function_id.to_packed_runtime_u64());
         let mut out = String::new();
@@ -164,7 +164,7 @@ fn render_field_value(value: &ConstructorFieldValue) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lower_python_to_blockpy_for_testing;
+    use soac_lowering::lower_python_to_blockpy_for_testing;
 
     #[test]
     fn plans_straightline_constructor_from_escape_summary() {
@@ -217,9 +217,11 @@ class Box:
             .expect("constructor should be present");
         let escape_summary = crate::passes::summarize_module_escapes(&module);
         let inline_plan = plan_module_inlining(&escape_summary);
-        assert!(inline_plan
-            .straightline_constructor(function.function_id)
-            .is_none());
+        assert!(
+            inline_plan
+                .straightline_constructor(function.function_id)
+                .is_none()
+        );
     }
 
     #[test]

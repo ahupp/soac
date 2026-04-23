@@ -1,14 +1,14 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::block_py::{
+use soac_core::block_py::{
     Block, BlockEdge, BlockLabel, BlockPyFunction, BlockTerm, Call, CallArgPositional, CallDirect,
     Del, HasSemanticInstrId, InstrId, Load, Meta, ParamKind, ResolvedName, RuntimeFunctionId,
     Store, TermIf, WithMeta,
 };
 
 use super::{
-    allocate_codegen_stack_temp, assign_missing_codegen_function_instr_ids, CodegenModuleShape,
-    DirectFunctionIdGuardTest, InstrCodegen, InstrCodegenOp,
+    CodegenModuleShape, DirectFunctionIdGuardTest, InstrCodegen, InstrCodegenOp,
+    allocate_codegen_stack_temp, assign_missing_codegen_function_instr_ids,
 };
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
@@ -477,9 +477,9 @@ fn append_cleanup_del_to_body(body: &mut Vec<InstrCodegen>, temp_name: &Resolved
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block_py::{BlockPyModule, ChildVisitable, Visit};
-    use crate::lower_python_to_blockpy_for_testing;
     use crate::passes::validate_codegen_instr_ids;
+    use soac_core::block_py::{BlockPyModule, ChildVisitable, Visit};
+    use soac_lowering::lower_python_to_blockpy_for_testing;
 
     fn lowered_module(source: &str) -> BlockPyModule<CodegenModuleShape> {
         lower_python_to_blockpy_for_testing(source)

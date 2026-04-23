@@ -35,10 +35,10 @@ mod tests {
         module_optimized_codegen_v3_path, pre_optimization_module_cache_identity,
         store_codegen_module_cache,
     };
-    use soac_lowering::passes::{TypedInstrExtra, TypedPlannedResult as PlannedResult};
     use soac_opt::alternatives_v3::AlternativeCatalog;
     use soac_opt::artifacts_v3::{ExactIntBranchV3Artifacts, write_optimization_artifacts_v3};
     use soac_opt::emit_v3::{MechanicalIndexedFieldGuard, MechanicalModuleEmission};
+    use soac_opt::passes::{TypedInstrExtra, TypedPlannedResult as PlannedResult};
     use soac_opt::pipeline_v3::{
         plan_and_emit_function_exact_int_branches_v3_with_module_constants,
         plan_and_emit_module_v3_from_raw_evidence,
@@ -3232,7 +3232,11 @@ def build(values):
         let catalog = AlternativeCatalog::default_v3();
         let artifacts = plan_and_emit_module_v3_from_raw_evidence(
             &catalog,
-            &metadata,
+            ModulePlanIdentity {
+                module_name: metadata.module_name.clone(),
+                source_hash: metadata.source_hash,
+                cache_identity: metadata.cache_identity.clone(),
+            },
             &shared_state.lowered_module,
             &evidence_store,
         )
@@ -4126,16 +4130,17 @@ def build(values):
             .body
             .first_mut()
             .expect("test block should contain call");
-        let soac_lowering::passes::InstrTyped::CallTyped(call) = first_instr else {
+        let soac_opt::passes::InstrTyped::CallTyped(call) = first_instr else {
             panic!("test call should lower to typed call");
         };
-        call.access = soac_lowering::passes::TypedCallAccessPlan::GuardedCallable {
-            function_guards: vec![soac_lowering::passes::TypedDirectFunctionCallGuard {
+        call.access = soac_opt::passes::TypedCallAccessPlan::GuardedCallable {
+            function_guards: vec![soac_opt::passes::TypedDirectFunctionCallGuard {
                 function_id: RuntimeFunctionId::from_raw_parts(0, 1),
-                arg_plan: soac_lowering::passes::TypedDirectCallArgPlan {
-                    sources: vec![soac_lowering::passes::TypedDirectCallArgSource::Provided(0)],
+                arg_plan: soac_opt::passes::TypedDirectCallArgPlan {
+                    sources: vec![soac_opt::passes::TypedDirectCallArgSource::Provided(0)],
                 },
             }],
+            constructor_guards: Vec::new(),
         };
 
         assert_eq!(
@@ -4145,9 +4150,7 @@ def build(values):
         assert!(
             matches!(
                 typed_function.blocks[0].body.first(),
-                Some(soac_lowering::passes::InstrTyped::GuardedCallableCallTyped(
-                    _
-                ))
+                Some(soac_opt::passes::InstrTyped::GuardedCallableCallTyped(_))
             ),
             "guarded call plan should lower before demand planning"
         );
@@ -15151,6 +15154,8 @@ def f(x):
                 specialization_inputs: Some(FunctionSpecializationInputs {
                     opt_v3_call_emissions: TypedCallEmissionPlans::default(),
                     opt_v3_exact_list_items_by_instr: HashMap::new(),
+                    field_index_specializations: HashMap::new(),
+                    field_index_specializations_by_instr: HashMap::new(),
                     opt_v3_indexed_fields_by_instr: HashMap::new(),
                     opt_v3_indexed_globals_by_instr: HashMap::new(),
                     cold_block_labels: HashSet::new(),
@@ -15327,6 +15332,8 @@ def f(x):
                 specialization_inputs: Some(FunctionSpecializationInputs {
                     opt_v3_call_emissions: TypedCallEmissionPlans::default(),
                     opt_v3_exact_list_items_by_instr: HashMap::new(),
+                    field_index_specializations: HashMap::new(),
+                    field_index_specializations_by_instr: HashMap::new(),
                     opt_v3_indexed_fields_by_instr: HashMap::new(),
                     opt_v3_indexed_globals_by_instr: HashMap::new(),
                     cold_block_labels: HashSet::new(),
@@ -15460,6 +15467,8 @@ def f(x):
                     specialization_inputs: Some(FunctionSpecializationInputs {
                         opt_v3_call_emissions: TypedCallEmissionPlans::default(),
                         opt_v3_exact_list_items_by_instr: HashMap::new(),
+                        field_index_specializations: HashMap::new(),
+                        field_index_specializations_by_instr: HashMap::new(),
                         opt_v3_indexed_fields_by_instr: HashMap::new(),
                         opt_v3_indexed_globals_by_instr: HashMap::new(),
                         cold_block_labels: HashSet::new(),
@@ -15578,6 +15587,8 @@ def f(x):
                     specialization_inputs: Some(FunctionSpecializationInputs {
                         opt_v3_call_emissions: TypedCallEmissionPlans::default(),
                         opt_v3_exact_list_items_by_instr: HashMap::new(),
+                        field_index_specializations: HashMap::new(),
+                        field_index_specializations_by_instr: HashMap::new(),
                         opt_v3_indexed_fields_by_instr: HashMap::new(),
                         opt_v3_indexed_globals_by_instr: HashMap::new(),
                         cold_block_labels: HashSet::new(),
@@ -15690,6 +15701,8 @@ def f(x):
                 specialization_inputs: Some(FunctionSpecializationInputs {
                     opt_v3_call_emissions: TypedCallEmissionPlans::default(),
                     opt_v3_exact_list_items_by_instr: HashMap::new(),
+                    field_index_specializations: HashMap::new(),
+                    field_index_specializations_by_instr: HashMap::new(),
                     opt_v3_indexed_fields_by_instr: HashMap::new(),
                     opt_v3_indexed_globals_by_instr: HashMap::new(),
                     cold_block_labels: HashSet::new(),
@@ -15887,8 +15900,8 @@ def f(x):
             &ResolvedV3DirectCallPlan {
                 source,
                 target: callee_id,
-                arg_plan: soac_lowering::passes::TypedDirectCallArgPlan {
-                    sources: vec![soac_lowering::passes::TypedDirectCallArgSource::Provided(0)],
+                arg_plan: soac_opt::passes::TypedDirectCallArgPlan {
+                    sources: vec![soac_opt::passes::TypedDirectCallArgSource::Provided(0)],
                 },
                 body: test_v3_inline_call_body(),
                 reason: "profiled direct call".to_string(),
@@ -16013,8 +16026,8 @@ def f(x):
             &ResolvedV3DirectCallPlan {
                 source,
                 target: callee_id,
-                arg_plan: soac_lowering::passes::TypedDirectCallArgPlan {
-                    sources: vec![soac_lowering::passes::TypedDirectCallArgSource::Provided(0)],
+                arg_plan: soac_opt::passes::TypedDirectCallArgPlan {
+                    sources: vec![soac_opt::passes::TypedDirectCallArgSource::Provided(0)],
                 },
                 body: test_v3_inline_call_body(),
                 reason: "profiled cross-module direct call".to_string(),
@@ -16506,6 +16519,8 @@ def f(x):
         FunctionSpecializationInputs {
             opt_v3_call_emissions: TypedCallEmissionPlans::default(),
             opt_v3_exact_list_items_by_instr: HashMap::new(),
+            field_index_specializations: HashMap::new(),
+            field_index_specializations_by_instr: HashMap::new(),
             opt_v3_indexed_fields_by_instr: HashMap::new(),
             opt_v3_indexed_globals_by_instr: HashMap::from([(
                 source,
@@ -16538,6 +16553,8 @@ def f(x):
                 specialization_inputs: Some(FunctionSpecializationInputs {
                     opt_v3_call_emissions: TypedCallEmissionPlans::default(),
                     opt_v3_exact_list_items_by_instr: HashMap::new(),
+                    field_index_specializations: HashMap::new(),
+                    field_index_specializations_by_instr: HashMap::new(),
                     opt_v3_indexed_fields_by_instr: HashMap::new(),
                     opt_v3_indexed_globals_by_instr: HashMap::from([
                         (
@@ -16627,6 +16644,8 @@ def f(x):
                 specialization_inputs: Some(FunctionSpecializationInputs {
                     opt_v3_call_emissions: TypedCallEmissionPlans::default(),
                     opt_v3_exact_list_items_by_instr: HashMap::new(),
+                    field_index_specializations: HashMap::new(),
+                    field_index_specializations_by_instr: HashMap::new(),
                     opt_v3_indexed_fields_by_instr: HashMap::new(),
                     opt_v3_indexed_globals_by_instr: HashMap::new(),
                     cold_block_labels: HashSet::new(),
@@ -17197,6 +17216,8 @@ def write_point(point, value):
 
         let annotated = annotate_typed_attr_accesses(
             &mut typed_function,
+            &HashMap::new(),
+            &HashMap::new(),
             &opt_v3_indexed_fields_by_instr,
             true,
         )
@@ -17206,7 +17227,7 @@ def write_point(point, value):
         let InstrTyped::SetAttrTyped(op) = &typed_function.blocks[0].body[0] else {
             panic!("test function body should contain typed SetAttr");
         };
-        let TypedAttrAccessPlan::IndexedField { guards } = &op.access else {
+        let TypedAttrAccessPlan::IndexedField { guards, .. } = &op.access else {
             panic!("v3 SetAttr should be annotated as an indexed-field access");
         };
         assert_eq!(guards.len(), 1);
@@ -17264,6 +17285,8 @@ def write_point(point, value):
 
         let annotated = annotate_typed_attr_accesses(
             &mut typed_function,
+            &HashMap::new(),
+            &HashMap::new(),
             &opt_v3_indexed_fields_by_instr,
             true,
         )

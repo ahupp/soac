@@ -16,10 +16,7 @@ use crate::function_instantiation::{
     soac_jit_make_function_with_closure,
 };
 use crate::module_constants::{ModuleCodegenConstants, ModuleConstantId};
-use crate::module_type::{
-    CounterRuntimeSlot, SharedModuleState, build_counter_storage_layout,
-    specialize_field_access_counter_branches,
-};
+use crate::module_type::{CounterRuntimeSlot, SharedModuleState, build_counter_storage_layout};
 use cranelift_codegen::cfg_printer::CFGPrinter;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::inline::{Inline, InlineCommand};
@@ -41,13 +38,15 @@ use soac_core::block_py::{
     BlockPyModule, BlockTerm, CallArgKeyword, CallArgPositional, CallableScopeKind, CellLocation,
     ChildVisitable, CounterBranchId, CounterDef, CounterId, CounterScope, CounterSite, Del,
     DeoptEntrySource, FunctionExecutionMode, FunctionKind, HasMeta, HasSemanticInstrId, InstrId,
-    InstrKey, LocalFunctionId, LocalLocation, Mappable, ModuleContentId, NameLocation, ParamKind,
+    InstrKey, LocalFunctionId, LocalLocation, ModuleContentId, NameLocation, ParamKind,
     PersistentFunctionId, ResolvedName, RuntimeFunctionId, RuntimeModuleId, RuntimeName,
-    SerializedFunctionId, StorageLayout, Store, TryMapInstr, TryMapTerm, Visit, VisitMut, WithMeta,
+    SerializedFunctionId, StorageLayout, Store, Visit, VisitMut, WithMeta,
 };
 use soac_core::profile::{
     CollectedTypeKeyLayout, CounterDumpTypeKey, read_block_entry_counts_from_file,
 };
+#[cfg(test)]
+use soac_core::profile::{CounterDumpFile, collect_type_key_layouts, collect_type_table};
 use soac_driver::codegen_cache::{
     load_codegen_module_cache, remap_cached_codegen_module_function_ids,
     validate_codegen_module_cache_metadata,
@@ -56,21 +55,7 @@ use soac_driver::finish_cached_codegen_module_for_runtime_with_counter_defs;
 use soac_lowering::block_py::literal::Literal;
 use soac_lowering::passes::{
     CodegenModuleShape, DirectCallableTypeVersionGuardTest, DirectFunctionIdGuardTest,
-    DirectReceiverTypeVersionGuardTest, FactStore, FunctionRefcountPlan, InstrCodegen,
-    InstrResolved, InstrTyped, LocalEnvResumeBinding, LocalEnvResumeBindingState,
-    LocalEnvResumeEntry, LocalEnvResumePoint, LocalEnvResumeStatePrecision,
-    LocalEnvResumeValueSource, LocalRefState, PyExactType, PyObjFacts, RefcountActionKind,
-    RefcountReleaseReason, RefcountSite, RuntimeHelperId, TypedAttrAccessPlan, TypedAttrOwnerRef,
-    TypedCall, TypedCallAccessPlan, TypedCallEmissionPlan, TypedCallEmissionPlans,
-    TypedCodegenModuleShape, TypedDirectCallArgPlan, TypedDirectCallArgSource,
-    TypedDirectCallGuardTest, TypedDirectCallGuardTestKind, TypedDirectCallableCall,
-    TypedDirectFunctionCallGuard, TypedGetAttr, TypedGuardedCallableCall, TypedIndexedFieldGuard,
-    TypedPlannedResult, TypedPyObjectOwnershipPlan, TypedSetAttr, ValueFacts,
-    annotate_typed_function_planned_results, annotate_typed_function_result_demands,
-    annotate_typed_function_value_facts, infer_module_value_facts, lower_codegen_function_to_typed,
-    lower_typed_function_call_access_plan_instrs, lower_typed_function_call_emission_plans,
-    lower_typed_function_if_tests_to_truthy, refresh_typed_function_value_facts,
-    validate_typed_function_call_access_plans, validate_typed_function_value_facts,
+    DirectReceiverTypeVersionGuardTest, InstrCodegen, InstrResolved,
 };
 use soac_opt::access_emission_v3::{
     ExactListItemAccessPlan as OptV3ExactListItemAccessPlan,
@@ -103,6 +88,25 @@ use soac_opt::emit_v3::{
     mechanical_codegen_step as opt_v3_mechanical_codegen_step,
     mechanical_convert_inputs_for_output as opt_v3_mechanical_convert_inputs_for_output,
     mechanical_region_function_param_inputs as opt_v3_mechanical_region_function_param_inputs,
+};
+use soac_opt::passes::{
+    FactStore, FunctionRefcountPlan, InstrTyped, LocalEnvResumeBinding, LocalEnvResumeBindingState,
+    LocalEnvResumeEntry, LocalEnvResumePoint, LocalEnvResumeStatePrecision,
+    LocalEnvResumeValueSource, LocalRefState, PyExactType, PyObjFacts, RefcountActionKind,
+    RefcountReleaseReason, RefcountSite, RuntimeHelperId, TypedAttrAccessPlan, TypedAttrOwnerRef,
+    TypedCall, TypedCallAccessPlan, TypedCallEmissionPlan, TypedCallEmissionPlans,
+    TypedCodegenModuleShape, TypedDirectCallArgPlan, TypedDirectCallArgSource,
+    TypedDirectCallGuardTest, TypedDirectCallGuardTestKind, TypedDirectCallableCall,
+    TypedDirectCallableCallGuard, TypedDirectConstructorCallGuard, TypedDirectFunctionCallGuard,
+    TypedDirectMethodCall, TypedDirectMethodCallGuard, TypedGetAttr, TypedGuardedCallableCall,
+    TypedGuardedMethodCall, TypedIndexedFieldGuard, TypedIndexedFieldPlanSource,
+    TypedPlannedResult, TypedPyObjectOwnershipPlan, TypedSetAttr, ValueFacts,
+    annotate_typed_function_planned_results, annotate_typed_function_result_demands,
+    annotate_typed_function_value_facts, infer_module_value_facts, lower_codegen_function_to_typed,
+    lower_typed_function_call_access_plan_instrs, lower_typed_function_call_emission_plans,
+    lower_typed_function_if_tests_to_truthy, refresh_typed_function_value_facts,
+    try_lower_typed_instr_to_codegen_legacy, try_lower_typed_term_to_codegen_legacy,
+    validate_typed_function_call_access_plans, validate_typed_function_value_facts,
 };
 use soac_opt::plan_v3::{
     IndexedFieldAccessKind as PlanV3IndexedFieldAccessKind,
@@ -288,6 +292,22 @@ fn reloc_type_ref_symbol_name(type_ref: &RelocTypeRef) -> Cow<'static, str> {
             symbol.push('_');
             push_symbol_component_hex(&mut symbol, type_key.qualname.as_str());
             Cow::Owned(symbol)
+        }
+    }
+}
+
+fn reloc_callable_ref_symbol_name(callable_ref: &RelocCallableRef) -> String {
+    match callable_ref {
+        RelocCallableRef::OwnerAttr {
+            owner_type_ref,
+            attr_name,
+        } => {
+            let mut symbol = String::from("__soac_callable_owner_attr_");
+            let owner_symbol = reloc_type_ref_symbol_name(owner_type_ref);
+            push_symbol_component_hex(&mut symbol, owner_symbol.as_ref());
+            symbol.push('_');
+            push_symbol_component_hex(&mut symbol, attr_name.as_str());
+            symbol
         }
     }
 }
@@ -989,6 +1009,16 @@ static DP_JIT_PY_CALL_WITH_KW_IMPORT: ImportSpec = ImportSpec::new(
     &[SigType::Pointer, SigType::Pointer, SigType::Pointer],
     &[SigType::Pointer],
 );
+static DP_JIT_PYTYPE_GENERIC_ALLOC_IMPORT: ImportSpec = ImportSpec::new(
+    "dp_jit_pytype_generic_alloc",
+    &[SigType::Pointer, SigType::I64],
+    &[SigType::Pointer],
+);
+static DP_JIT_FINISH_CONSTRUCTOR_INIT_IMPORT: ImportSpec = ImportSpec::new(
+    "dp_jit_finish_constructor_init",
+    &[SigType::Pointer, SigType::Pointer],
+    &[SigType::Pointer],
+);
 static DP_JIT_LOAD_RUNTIME_OBJ_IMPORT: ImportSpec = ImportSpec::new(
     "dp_jit_load_runtime_obj",
     &[SigType::Pointer],
@@ -1178,6 +1208,8 @@ static JIT_RUNTIME_IMPORT_SPECS: &[&ImportSpec] = &[
     &DP_JIT_ENTER_RECURSIVE_CALL_IMPORT,
     &PY_THREAD_STATE_GET_UNCHECKED_IMPORT,
     &DP_JIT_PY_CALL_WITH_KW_IMPORT,
+    &DP_JIT_PYTYPE_GENERIC_ALLOC_IMPORT,
+    &DP_JIT_FINISH_CONSTRUCTOR_INIT_IMPORT,
     &DP_JIT_LOAD_RUNTIME_OBJ_IMPORT,
     &DP_JIT_LOAD_RUNTIME_OBJ_BY_ID_IMPORT,
     &DP_JIT_PYOBJECT_GETATTR_IMPORT,
@@ -1305,6 +1337,18 @@ fn predeclare_reloc_type_ref_import(
     Ok(())
 }
 
+fn predeclare_reloc_callable_ref_import(
+    jit_module: &mut JITModule,
+    callable_ref: &RelocCallableRef,
+) -> Result<(), String> {
+    if !ensure_reloc_callable_symbol_registered(callable_ref)? {
+        return Ok(());
+    }
+    let symbol = reloc_callable_ref_symbol_name(callable_ref);
+    let _ = declare_type_ptr_import(jit_module, symbol.as_str())?;
+    Ok(())
+}
+
 fn predeclare_specialization_type_imports(
     jit_module: &mut JITModule,
     profile: &SpecializationProfile<'_>,
@@ -1327,7 +1371,7 @@ fn predeclare_specialization_type_imports(
 }
 
 fn predeclare_prepared_opt_v3_call_imports(
-    _jit_module: &mut JITModule,
+    jit_module: &mut JITModule,
     specialization_inputs: &FunctionSpecializationInputs,
 ) -> Result<(), String> {
     for plan in specialization_inputs
@@ -1336,7 +1380,45 @@ fn predeclare_prepared_opt_v3_call_imports(
         .values()
     {
         match plan {
-            TypedCallEmissionPlan::Callable { .. } => {}
+            TypedCallEmissionPlan::Callable {
+                constructor_guards, ..
+            } => {
+                for guard in constructor_guards {
+                    let Some(owner_type_ref) =
+                        reloc_type_ref_from_typed_attr_owner_ref(&guard.owner_type_ref)
+                    else {
+                        continue;
+                    };
+                    predeclare_reloc_type_ref_import(jit_module, &owner_type_ref)?;
+                    predeclare_reloc_callable_ref_import(
+                        jit_module,
+                        &RelocCallableRef::OwnerAttr {
+                            owner_type_ref,
+                            attr_name: "__init__".to_string(),
+                        },
+                    )?;
+                }
+            }
+            TypedCallEmissionPlan::Method {
+                method_name,
+                method_guards,
+            } => {
+                for guard in method_guards {
+                    let Some(owner_type_ref) =
+                        reloc_type_ref_from_typed_attr_owner_ref(&guard.owner_type_ref)
+                    else {
+                        continue;
+                    };
+                    predeclare_reloc_type_ref_import(jit_module, &owner_type_ref)?;
+                    predeclare_reloc_callable_ref_import(
+                        jit_module,
+                        &RelocCallableRef::OwnerAttr {
+                            owner_type_ref,
+                            attr_name: method_name.clone(),
+                        },
+                    )?;
+                }
+            }
         }
     }
     Ok(())
@@ -4525,8 +4607,51 @@ fn typed_nested_guard_scan_expr(expr: &InstrTyped, saw_replay_unsafe_effect: &mu
                 )
                 && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
         }
+        InstrTyped::GuardedMethodCallTyped(op) => {
+            if op.args.is_empty()
+                && op.keywords.is_empty()
+                && let InstrTyped::GetAttrTyped(getattr) = op.func.as_ref()
+            {
+                // Direct-method guard code evaluates only the receiver before the guard.
+                // Keep this no-arg only until argument guard points carry their own
+                // precise resume state.
+                return typed_nested_guard_scan_expr(
+                    getattr.value.as_ref(),
+                    saw_replay_unsafe_effect,
+                ) && nested_guard_candidate_seen_before_replay_unsafe_effect(
+                    true,
+                    *saw_replay_unsafe_effect,
+                ) && mark_replay_unsafe_effect(saw_replay_unsafe_effect);
+            }
+            typed_nested_guard_scan_expr(op.func.as_ref(), saw_replay_unsafe_effect)
+                && typed_nested_guard_scan_positional_args(
+                    op.args.as_slice(),
+                    saw_replay_unsafe_effect,
+                )
+                && typed_nested_guard_scan_keyword_args(
+                    op.keywords.as_slice(),
+                    saw_replay_unsafe_effect,
+                )
+                && nested_guard_candidate_seen_before_replay_unsafe_effect(
+                    true,
+                    *saw_replay_unsafe_effect,
+                )
+                && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
+        }
         InstrTyped::DirectCallableCallTyped(op) => {
             typed_nested_guard_scan_expr(op.func.as_ref(), saw_replay_unsafe_effect)
+                && typed_nested_guard_scan_positional_args(
+                    op.args.as_slice(),
+                    saw_replay_unsafe_effect,
+                )
+                && nested_guard_candidate_seen_before_replay_unsafe_effect(
+                    true,
+                    *saw_replay_unsafe_effect,
+                )
+                && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
+        }
+        InstrTyped::DirectMethodCallTyped(op) => {
+            typed_nested_guard_scan_expr(op.receiver.as_ref(), saw_replay_unsafe_effect)
                 && typed_nested_guard_scan_positional_args(
                     op.args.as_slice(),
                     saw_replay_unsafe_effect,
@@ -4812,6 +4937,7 @@ fn runtime_jit_deopt_expr_supported(
             support,
         ),
         InstrCodegen::DirectCallableCall(_) => false,
+        InstrCodegen::DirectMethodCall(_) => false,
         InstrCodegen::Store(store) => {
             runtime_jit_deopt_name_location_supported(store.name.location, support)
                 && runtime_jit_deopt_expr_supported(&store.value, support)
@@ -6372,6 +6498,8 @@ struct JitEmitCtx<'mc> {
     decref_ref: ir::FuncRef,
     py_call_positional_three_ref: ir::FuncRef,
     py_vectorcall_ref: ir::FuncRef,
+    pytype_generic_alloc_ref: ir::FuncRef,
+    finish_constructor_init_ref: ir::FuncRef,
     consts: JitEmitConsts,
     load_global_fast_ref: ir::FuncRef,
     probe_global_indexed_ref: ir::FuncRef,
@@ -6428,10 +6556,12 @@ struct JitEmitCtx<'mc> {
     field_generic_getattr_counter_ids: &'mc HashMap<InstrId, CounterRef>,
     field_generic_setattr_counter_ids: &'mc HashMap<InstrId, CounterRef>,
     deopt_entry_guard_miss_counter_ids: &'mc HashMap<usize, CounterId>,
+    field_index_specializations_by_instr: &'mc HashMap<InstrId, Vec<FieldIndexSpecialization>>,
     behavior_change_indexed_stores: bool,
     allow_local_only_slot_backed_stores: bool,
     exception_forwarded_local_names: Option<&'mc [String]>,
     type_ptr_data_ids: RefCell<HashMap<RelocTypeRef, DataId>>,
+    callable_ptr_data_ids: RefCell<HashMap<RelocCallableRef, DataId>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -6590,12 +6720,14 @@ fn emit_deopt_entry_guard_miss_counter(
     let Some(counter_id) = ctx.deopt_entry_guard_miss_counter_ids.get(&ordinal) else {
         return;
     };
-    let Ok(counter_slot) = scalar_counter_slot_for_id(ctx.counter_slots_by_id, *counter_id) else {
-        return;
-    };
-    let Some(scalar_counter_base_value) = ctx.consts.scalar_counter_base_value else {
-        return;
-    };
+    let counter_slot = scalar_counter_slot_for_id(ctx.counter_slots_by_id, *counter_id)
+        .unwrap_or_else(|err| panic!("{err}"));
+    let scalar_counter_base_value = ctx.consts.scalar_counter_base_value.unwrap_or_else(|| {
+        panic!(
+            "missing scalar counter base for deopt-entry counter id {}",
+            counter_id.0
+        )
+    });
     emit_increment_counter_slot(fb, scalar_counter_base_value, counter_slot);
 }
 
@@ -6842,6 +6974,24 @@ fn infer_jit_value_facts(module: &BlockPyModule<CodegenModuleShape>) -> FactStor
 }
 
 #[derive(Clone)]
+struct DirectMethodSpecialization {
+    function_id: RuntimeFunctionId,
+    descriptor_function_ref: RelocCallableRef,
+    owner_type_ref: RelocTypeRef,
+    type_version: u32,
+    arg_plan: DirectCallArgPlan,
+}
+
+#[derive(Clone)]
+struct DirectConstructorSpecialization {
+    function_id: RuntimeFunctionId,
+    init_function_ref: RelocCallableRef,
+    owner_type_ref: RelocTypeRef,
+    type_version: u32,
+    arg_plan: DirectCallArgPlan,
+}
+
+#[derive(Clone)]
 struct DirectFunctionSpecialization {
     function_id: RuntimeFunctionId,
     arg_plan: DirectCallArgPlan,
@@ -6870,6 +7020,69 @@ fn direct_function_specializations_from_typed_guards(
             arg_plan: direct_call_arg_plan_from_typed(&guard.arg_plan),
         })
         .collect()
+}
+
+fn direct_constructor_specializations_from_typed_guards(
+    guards: &[TypedDirectConstructorCallGuard],
+) -> Vec<DirectConstructorSpecialization> {
+    guards
+        .iter()
+        .filter_map(direct_constructor_specialization_from_typed_guard)
+        .collect()
+}
+
+fn direct_constructor_specialization_from_typed_guard(
+    guard: &TypedDirectConstructorCallGuard,
+) -> Option<DirectConstructorSpecialization> {
+    let owner_type_ref = reloc_type_ref_from_typed_attr_owner_ref(&guard.owner_type_ref)?;
+    Some(DirectConstructorSpecialization {
+        function_id: guard.function_id,
+        init_function_ref: RelocCallableRef::OwnerAttr {
+            owner_type_ref: owner_type_ref.clone(),
+            attr_name: "__init__".to_string(),
+        },
+        owner_type_ref,
+        type_version: guard.type_version,
+        arg_plan: direct_call_arg_plan_from_typed(&guard.arg_plan),
+    })
+}
+
+fn direct_method_specializations_from_typed_guards(
+    guards: &[TypedDirectMethodCallGuard],
+    method_name: &str,
+) -> Vec<DirectMethodSpecialization> {
+    guards
+        .iter()
+        .filter_map(|guard| {
+            let owner_type_ref = reloc_type_ref_from_typed_attr_owner_ref(&guard.owner_type_ref)?;
+            Some(DirectMethodSpecialization {
+                function_id: guard.function_id,
+                descriptor_function_ref: RelocCallableRef::OwnerAttr {
+                    owner_type_ref: owner_type_ref.clone(),
+                    attr_name: method_name.to_string(),
+                },
+                owner_type_ref,
+                type_version: guard.type_version,
+                arg_plan: direct_call_arg_plan_from_typed(&guard.arg_plan),
+            })
+        })
+        .collect()
+}
+
+fn direct_method_specialization_from_typed_call(
+    call: &TypedDirectMethodCall<InstrTyped>,
+) -> Option<DirectMethodSpecialization> {
+    let owner_type_ref = reloc_type_ref_from_typed_attr_owner_ref(&call.guard.owner_type_ref)?;
+    Some(DirectMethodSpecialization {
+        function_id: call.guard.function_id,
+        descriptor_function_ref: RelocCallableRef::OwnerAttr {
+            owner_type_ref: owner_type_ref.clone(),
+            attr_name: call.method_name.clone(),
+        },
+        owner_type_ref,
+        type_version: call.guard.type_version,
+        arg_plan: direct_call_arg_plan_from_typed(&call.guard.arg_plan),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7186,12 +7399,59 @@ type OptV3ResolvedIndexedFieldAccess =
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct IndexedFieldLoweringPlan {
+    source: TypedIndexedFieldPlanSource,
     access: PlanV3IndexedFieldAccessKind,
     specializations: Vec<FieldIndexSpecialization>,
 }
 
 impl IndexedFieldLoweringPlan {
     fn for_access(
+        instr_id: InstrId,
+        source: TypedIndexedFieldPlanSource,
+        guards: &[TypedIndexedFieldGuard],
+        expected_access: PlanV3IndexedFieldAccessKind,
+        opt_v3_indexed_fields_by_instr: &HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>,
+    ) -> Result<Option<Self>, String> {
+        match source {
+            TypedIndexedFieldPlanSource::LegacyProfile => {
+                Self::from_legacy_typed_guards(guards, expected_access)
+            }
+            TypedIndexedFieldPlanSource::OptimizationPlanV3 => Self::from_prevalidated_v3_accesses(
+                instr_id,
+                expected_access,
+                opt_v3_indexed_fields_by_instr,
+            ),
+        }
+    }
+
+    fn from_legacy_typed_guards(
+        guards: &[TypedIndexedFieldGuard],
+        expected_access: PlanV3IndexedFieldAccessKind,
+    ) -> Result<Option<Self>, String> {
+        if guards.is_empty() {
+            return Ok(None);
+        }
+
+        let mut specializations = Vec::with_capacity(guards.len());
+        for guard in guards {
+            let Some(specialization) = field_index_specialization_from_typed_guard(guard) else {
+                continue;
+            };
+            push_unique_specialization(&mut specializations, specialization);
+        }
+
+        if specializations.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(Self {
+            source: TypedIndexedFieldPlanSource::LegacyProfile,
+            access: expected_access,
+            specializations,
+        }))
+    }
+
+    fn from_prevalidated_v3_accesses(
         instr_id: InstrId,
         expected_access: PlanV3IndexedFieldAccessKind,
         opt_v3_indexed_fields_by_instr: &HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>,
@@ -7202,6 +7462,7 @@ impl IndexedFieldLoweringPlan {
             opt_v3_indexed_fields_by_instr,
         )?;
         Ok(Some(Self {
+            source: TypedIndexedFieldPlanSource::OptimizationPlanV3,
             access: prepared.access,
             specializations: prepared.specializations,
         }))
@@ -7215,10 +7476,11 @@ impl IndexedFieldLoweringPlan {
     ) -> Result<Option<ir::Value>, String> {
         match owner_type {
             Some(owner_type) => Ok(Some(owner_type)),
-            None => Err(format!(
+            None if self.source == TypedIndexedFieldPlanSource::OptimizationPlanV3 => Err(format!(
                 "prevalidated optimizer v3 indexed-field {:?} for {instr_id} could not bind runtime owner type reference {:?}",
                 self.access, specialization.owner_type_ref
             )),
+            None => Ok(None),
         }
     }
 }
@@ -7265,6 +7527,24 @@ fn reloc_type_ref_from_typed_attr_owner_ref(
             qualname: qualname.clone(),
         })),
     }
+}
+
+fn field_index_specialization_from_typed_guard(
+    guard: &TypedIndexedFieldGuard,
+) -> Option<FieldIndexSpecialization> {
+    Some(FieldIndexSpecialization {
+        expected_index: guard.expected_index,
+        owner_type_ref: reloc_type_ref_from_typed_attr_owner_ref(&guard.owner_type_ref)?,
+        type_version: guard.type_version,
+    })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum RelocCallableRef {
+    OwnerAttr {
+        owner_type_ref: RelocTypeRef,
+        attr_name: String,
+    },
 }
 
 struct LocalEnvCodegenIntrinsicEmitState<'a, 'b, 'mc, 'c, 'd, Env: JitCodegenEnv> {
@@ -8802,7 +9082,7 @@ impl<'a, 'b, 'mc, 'c, 'd, Env: JitCodegenEnv> intrinsics::OperationEmitState<'b,
                 });
         let legacy_operands = pre_guard_operands
             .iter()
-            .map(|operand| typed_expr_to_codegen_fallback((*operand).clone()))
+            .map(|operand| try_lower_typed_instr_to_codegen_legacy((*operand).clone()))
             .collect::<Result<Vec<_>, _>>();
         let guard_miss_target = legacy_operands
             .as_ref()
@@ -10868,10 +11148,13 @@ pub(super) fn codegen_constant_string_value<'a>(
 
 fn annotate_typed_attr_accesses(
     function: &mut BlockPyFunction<TypedCodegenModuleShape>,
+    _field_index_specializations: &HashMap<String, Vec<FieldIndexSpecialization>>,
+    field_index_specializations_by_instr: &HashMap<InstrId, Vec<FieldIndexSpecialization>>,
     opt_v3_indexed_fields_by_instr: &HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>,
     specialize_stores: bool,
 ) -> Result<usize, String> {
     struct Annotator<'a> {
+        field_index_specializations_by_instr: &'a HashMap<InstrId, Vec<FieldIndexSpecialization>>,
         opt_v3_indexed_fields_by_instr: &'a HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>,
         specialize_stores: bool,
         count: usize,
@@ -10879,17 +11162,48 @@ fn annotate_typed_attr_accesses(
     }
 
     impl Annotator<'_> {
+        fn legacy_guards_for_attr(
+            &self,
+            instr_id: InstrId,
+            _attr: &InstrTyped,
+        ) -> Option<TypedAttrAccessPlan> {
+            self.field_index_specializations_by_instr
+                .get(&instr_id)
+                .filter(|specializations| !specializations.is_empty())
+                .map(|specializations| {
+                    let guards = specializations
+                        .iter()
+                        .map(FieldIndexSpecialization::to_typed_guard)
+                        .collect::<Vec<_>>();
+                    TypedAttrAccessPlan::IndexedField {
+                        source: TypedIndexedFieldPlanSource::LegacyProfile,
+                        guards,
+                    }
+                })
+        }
+
         fn opt_v3_guards_for_attr(&mut self, instr_id: InstrId) -> Option<TypedAttrAccessPlan> {
             let accesses = self.opt_v3_indexed_fields_by_instr.get(&instr_id)?;
             let mut guards = Vec::with_capacity(accesses.len());
             for access in accesses {
                 guards.push(access.specialization.to_typed_guard());
             }
-            Some(TypedAttrAccessPlan::IndexedField { guards })
+            Some(TypedAttrAccessPlan::IndexedField {
+                source: TypedIndexedFieldPlanSource::OptimizationPlanV3,
+                guards,
+            })
         }
 
-        fn annotate_attr(&mut self, instr_id: InstrId) -> Option<TypedAttrAccessPlan> {
-            self.opt_v3_guards_for_attr(instr_id)
+        fn annotate_attr(
+            &mut self,
+            instr_id: InstrId,
+            attr: &InstrTyped,
+            _expected_access: PlanV3IndexedFieldAccessKind,
+        ) -> Option<TypedAttrAccessPlan> {
+            if self.opt_v3_indexed_fields_by_instr.contains_key(&instr_id) {
+                return self.opt_v3_guards_for_attr(instr_id);
+            }
+            self.legacy_guards_for_attr(instr_id, attr)
         }
     }
 
@@ -10900,13 +11214,21 @@ fn annotate_typed_attr_accesses(
             }
             match expr {
                 InstrTyped::GetAttrTyped(op) => {
-                    if let Some(access) = self.annotate_attr(op.semantic_instr_id()) {
+                    if let Some(access) = self.annotate_attr(
+                        op.semantic_instr_id(),
+                        op.attr.as_ref(),
+                        PlanV3IndexedFieldAccessKind::Load,
+                    ) {
                         op.access = access;
                         self.count += 1;
                     }
                 }
                 InstrTyped::SetAttrTyped(op) if self.specialize_stores => {
-                    if let Some(access) = self.annotate_attr(op.semantic_instr_id()) {
+                    if let Some(access) = self.annotate_attr(
+                        op.semantic_instr_id(),
+                        op.attr.as_ref(),
+                        PlanV3IndexedFieldAccessKind::Store,
+                    ) {
                         op.access = access;
                         self.count += 1;
                     }
@@ -10928,6 +11250,7 @@ fn annotate_typed_attr_accesses(
     }
 
     let mut annotator = Annotator {
+        field_index_specializations_by_instr,
         opt_v3_indexed_fields_by_instr,
         specialize_stores,
         count: 0,
@@ -10966,6 +11289,16 @@ fn collect_call_direct_targets(
                 self.out.insert(call.function_id);
             }
             if let InstrCodegen::DirectCallableCall(call) = expr {
+                match &call.guard {
+                    TypedDirectCallableCallGuard::Function(guard) => {
+                        self.out.insert(guard.function_id);
+                    }
+                    TypedDirectCallableCallGuard::Constructor(guard) => {
+                        self.out.insert(guard.function_id);
+                    }
+                }
+            }
+            if let InstrCodegen::DirectMethodCall(call) = expr {
                 self.out.insert(call.guard.function_id);
             }
             expr.visit_children(self);
@@ -11155,6 +11488,8 @@ impl PlannedOptimizationInputs {
 struct FunctionSpecializationInputs {
     opt_v3_call_emissions: TypedCallEmissionPlans,
     opt_v3_exact_list_items_by_instr: HashMap<InstrId, OptV3ExactListItemAccessPlan>,
+    field_index_specializations: HashMap<String, Vec<FieldIndexSpecialization>>,
+    field_index_specializations_by_instr: HashMap<InstrId, Vec<FieldIndexSpecialization>>,
     opt_v3_indexed_fields_by_instr: HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>,
     opt_v3_indexed_globals_by_instr: HashMap<InstrId, OptV3IndexedGlobalAccessPlan>,
     cold_block_labels: HashSet<BlockLabel>,
@@ -11529,8 +11864,11 @@ impl FunctionSpecializationInputs {
         profile: &SpecializationProfile<'_>,
         function: &BlockPyFunction<CodegenModuleShape>,
     ) -> Result<Self, String> {
-        let opt_v3_indexed_fields_by_instr =
-            profile.opt_v3_indexed_field_accesses(function.function_id)?;
+        let (
+            field_index_specializations,
+            field_index_specializations_by_instr,
+            opt_v3_indexed_fields_by_instr,
+        ) = profile.field_index_specialization_maps(function.function_id)?;
         let opt_v3_direct_calls_by_instr =
             profile.codegen_opt_v3_direct_calls(function.function_id);
         let opt_v3_call_emissions =
@@ -11542,6 +11880,8 @@ impl FunctionSpecializationInputs {
                 .get(&function.function_id)
                 .cloned()
                 .unwrap_or_default(),
+            field_index_specializations,
+            field_index_specializations_by_instr,
             opt_v3_indexed_fields_by_instr,
             opt_v3_indexed_globals_by_instr: profile
                 .opt_v3_emitted_indexed_globals
@@ -11649,18 +11989,26 @@ impl<'a> SpecializationProfile<'a> {
             .unwrap_or_default()
     }
 
-    fn opt_v3_indexed_field_accesses(
+    fn field_index_specialization_maps(
         &self,
         function_id: RuntimeFunctionId,
-    ) -> Result<HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>, String> {
+    ) -> Result<
+        (
+            HashMap<String, Vec<FieldIndexSpecialization>>,
+            HashMap<InstrId, Vec<FieldIndexSpecialization>>,
+            HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>,
+        ),
+        String,
+    > {
         let opt_v3_planned_fields = self.opt_v3_indexed_field_access_plans();
         let opt_v3_layout_groups =
             opt_v3_indexed_field_layout_groups(opt_v3_planned_fields.iter().copied());
         prime_opt_v3_field_index_layouts(opt_v3_layout_groups.iter())?;
-        opt_v3_prepare_indexed_field_accesses_for_codegen(
+        let opt_v3_by_instr = opt_v3_prepare_indexed_field_accesses_for_codegen(
             self.opt_v3_emitted_indexed_fields.get(&function_id),
             |request| field_index_specialization_from_opt_v3_for_function(function_id, request),
-        )
+        )?;
+        Ok((HashMap::new(), HashMap::new(), opt_v3_by_instr))
     }
 
     fn cold_block_labels(
@@ -11916,6 +12264,86 @@ fn emit_type_ptr_value_for_ref(
     Ok(Some(fb.ins().global_value(ctx.consts.ptr_ty, type_data)))
 }
 
+fn resolve_reloc_callable_ref_to_object(
+    callable_ref: &RelocCallableRef,
+) -> Result<Option<ObjPtr>, String> {
+    match callable_ref {
+        RelocCallableRef::OwnerAttr {
+            owner_type_ref,
+            attr_name,
+        } => {
+            let Some(owner_type) = resolve_reloc_type_ref_to_type(owner_type_ref)? else {
+                return Ok(None);
+            };
+            let attr_name = CString::new(attr_name.as_str()).map_err(|_| {
+                format!("callable attr contains NUL and cannot be resolved: {attr_name:?}")
+            })?;
+            let dict = unsafe { (*owner_type).tp_dict };
+            if dict.is_null() {
+                return Ok(None);
+            }
+            let value = unsafe { ffi::PyDict_GetItemString(dict, attr_name.as_ptr()) };
+            if value.is_null() || unsafe { ffi::PyFunction_Check(value) } == 0 {
+                return Ok(None);
+            }
+            Ok(Some(value as ObjPtr))
+        }
+    }
+}
+
+fn ensure_reloc_callable_symbol_registered(
+    callable_ref: &RelocCallableRef,
+) -> Result<bool, String> {
+    let symbol = reloc_callable_ref_symbol_name(callable_ref);
+    if lookup_registered_jit_data_symbol(symbol.as_str()).is_some() {
+        return Ok(true);
+    }
+    let Some(callable) = resolve_reloc_callable_ref_to_object(callable_ref)? else {
+        return Ok(false);
+    };
+    register_jit_data_symbol(symbol.as_str(), callable.cast::<u8>());
+    Ok(true)
+}
+
+fn callable_ptr_data_id_for_ref(
+    codegen_env: &mut impl JitCodegenEnv,
+    ctx: &JitEmitCtx<'_>,
+    callable_ref: &RelocCallableRef,
+) -> Result<Option<DataId>, String> {
+    if let Some(data_id) = ctx
+        .callable_ptr_data_ids
+        .borrow()
+        .get(callable_ref)
+        .copied()
+    {
+        return Ok(Some(data_id));
+    }
+    let symbol = reloc_callable_ref_symbol_name(callable_ref);
+    if lookup_registered_jit_data_symbol(symbol.as_str()).is_none() {
+        return Ok(None);
+    }
+    let data_id = declare_type_ptr_import(codegen_env, symbol.as_str())?;
+    ctx.callable_ptr_data_ids
+        .borrow_mut()
+        .insert(callable_ref.clone(), data_id);
+    Ok(Some(data_id))
+}
+
+fn emit_callable_ptr_value_for_ref(
+    fb: &mut FunctionBuilder<'_>,
+    codegen_env: &mut impl JitCodegenEnv,
+    ctx: &JitEmitCtx<'_>,
+    callable_ref: &RelocCallableRef,
+) -> Result<Option<ir::Value>, String> {
+    let Some(data_id) = callable_ptr_data_id_for_ref(codegen_env, ctx, callable_ref)? else {
+        return Ok(None);
+    };
+    let callable_data = codegen_env.codegen_declare_data_in_func(data_id, &mut fb.func)?;
+    Ok(Some(
+        fb.ins().global_value(ctx.consts.ptr_ty, callable_data),
+    ))
+}
+
 fn owner_type_has_class_binding_for_attr(
     owner_type: *mut ffi::PyTypeObject,
     attr_name: &str,
@@ -12159,6 +12587,60 @@ fn field_index_specialization_from_opt_v3_for_function(
         request.attr_name.as_str(),
         request.expected_index,
     )
+}
+
+fn push_unique_specialization(
+    specializations: &mut Vec<FieldIndexSpecialization>,
+    specialization: FieldIndexSpecialization,
+) {
+    if !specializations.contains(&specialization) {
+        specializations.push(specialization);
+    }
+}
+
+#[cfg(test)]
+fn load_field_index_specializations_from_path(
+    path: &Path,
+) -> Result<HashMap<String, Vec<FieldIndexSpecialization>>, String> {
+    let dump = CounterDumpFile::open(path)?;
+    let records = dump.records()?;
+    let type_table = collect_type_table(records.as_slice())?;
+    let type_key_layouts = collect_type_key_layouts(records.as_slice())?;
+    let mut out = HashMap::<String, Vec<FieldIndexSpecialization>>::new();
+    for (type_id, layouts) in type_key_layouts {
+        let Some(type_key) = type_table.get(&type_id) else {
+            continue;
+        };
+        let Some(owner_type) = resolve_type_key_to_type(type_key)? else {
+            continue;
+        };
+        prime_field_index_layout(owner_type, layouts.as_slice())?;
+        for layout in layouts {
+            if let Some(specialization) =
+                field_index_specialization_for_type(owner_type, layout.key.as_str(), layout.index)?
+            {
+                out.entry(layout.key).or_default().push(specialization);
+            }
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+fn load_field_index_specializations()
+-> Result<HashMap<String, Vec<FieldIndexSpecialization>>, String> {
+    let env_config = SoacEnvConfig::from_env()?;
+    if env_config.specialization_mode() == Some(SpecializationMode::Profile) {
+        return Ok(HashMap::new());
+    }
+    let Some(path) = env_config.counter_dump_input_path() else {
+        return Ok(HashMap::new());
+    };
+    let path = path.as_path();
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+    load_field_index_specializations_from_path(path)
 }
 
 fn collect_cold_block_labels_from_path(
@@ -12764,6 +13246,126 @@ fn emit_direct_call_resolved_with_arg_values(
     fb.block_params(call_ok_block)[0]
 }
 
+fn emit_direct_constructor_resolved_with_arg_values(
+    fb: &mut FunctionBuilder<'_>,
+    callable: ir::Value,
+    callable_is_borrowed: bool,
+    arg_values: Vec<ir::Value>,
+    arg_borrowed: Vec<bool>,
+    specialization: &DirectConstructorSpecialization,
+    target_function: &BlockPyFunction<CodegenModuleShape>,
+    ctx: &JitEmitCtx<'_>,
+    codegen_env: &mut impl JitCodegenEnv,
+) -> ir::Value {
+    let ptr_ty = ctx.consts.ptr_ty;
+    let null_ptr = fb.ins().iconst(ptr_ty, 0);
+    let zero = fb.ins().iconst(ctx.consts.i64_ty, 0);
+    let alloc_inst = fb
+        .ins()
+        .call(ctx.pytype_generic_alloc_ref, &[callable, zero]);
+    let allocated = fb.inst_results(alloc_inst)[0];
+    if !callable_is_borrowed {
+        fb.ins()
+            .call(ctx.decref_ref, &[ctx.consts.thread_state_value, callable]);
+    }
+    let alloc_is_null = fb
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, allocated, null_ptr);
+    let alloc_failed = fb.create_block();
+    let alloc_ok = fb.create_block();
+    fb.append_block_param(alloc_ok, ptr_ty);
+    fb.ins().brif(
+        alloc_is_null,
+        alloc_failed,
+        &[],
+        alloc_ok,
+        &[ir::BlockArg::Value(allocated)],
+    );
+
+    fb.switch_to_block(alloc_failed);
+    let mut owned_inputs = Vec::with_capacity(arg_values.len());
+    for (value, borrowed_arg) in arg_values.iter().copied().zip(arg_borrowed.iter().copied()) {
+        if !borrowed_arg {
+            owned_inputs.push(value);
+        }
+    }
+    emit_release_owned_inputs(fb, ctx, &owned_inputs);
+    fb.ins()
+        .jump(ctx.consts.step_null_block, &step_null_block_args(ctx));
+
+    fb.switch_to_block(alloc_ok);
+    let allocated = fb.block_params(alloc_ok)[0];
+    let mut provided_arg_values = Vec::with_capacity(arg_values.len() + 1);
+    let mut provided_arg_borrowed = Vec::with_capacity(arg_borrowed.len() + 1);
+    provided_arg_values.push(allocated);
+    provided_arg_borrowed.push(true);
+    provided_arg_values.extend(arg_values);
+    provided_arg_borrowed.extend(arg_borrowed);
+    let (init_arg_values, init_arg_borrowed) = emit_direct_call_args_from_plan(
+        fb,
+        &specialization.arg_plan,
+        provided_arg_values,
+        provided_arg_borrowed,
+        ptr_ty,
+    );
+    let init_callable =
+        emit_callable_ptr_value_for_ref(fb, codegen_env, ctx, &specialization.init_function_ref)
+            .unwrap_or_else(|err| panic!("failed to bind constructor callable symbol: {err}"))
+            .expect("constructor callable symbol should be available");
+    let init_result = emit_direct_call_resolved_raw_with_arg_values(
+        fb,
+        init_callable,
+        true,
+        init_arg_values,
+        init_arg_borrowed,
+        if specialization.arg_plan.requires_default_resolving_entry() {
+            DirectCallEntryKind::DefaultResolving
+        } else {
+            DirectCallEntryKind::Core
+        },
+        target_function,
+        ctx,
+        codegen_env,
+    );
+    let init_failed = fb
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, init_result, null_ptr);
+    let init_fail_block = fb.create_block();
+    let init_ok_block = fb.create_block();
+    fb.append_block_param(init_ok_block, ptr_ty);
+    fb.ins().brif(
+        init_failed,
+        init_fail_block,
+        &[],
+        init_ok_block,
+        &[ir::BlockArg::Value(init_result)],
+    );
+
+    fb.switch_to_block(init_fail_block);
+    emit_release_owned_inputs(fb, ctx, &[allocated]);
+    fb.ins()
+        .jump(ctx.consts.step_null_block, &step_null_block_args(ctx));
+
+    fb.switch_to_block(init_ok_block);
+    let init_result = fb.block_params(init_ok_block)[0];
+    let finish_inst = fb
+        .ins()
+        .call(ctx.finish_constructor_init_ref, &[allocated, init_result]);
+    let result = fb.inst_results(finish_inst)[0];
+    let result_is_null = fb.ins().icmp(ir::condcodes::IntCC::Equal, result, null_ptr);
+    let result_ok_block = fb.create_block();
+    fb.append_block_param(result_ok_block, ptr_ty);
+    fb.ins().brif(
+        result_is_null,
+        ctx.consts.step_null_block,
+        &step_null_block_args(ctx),
+        result_ok_block,
+        &[ir::BlockArg::Value(result)],
+    );
+    fb.switch_to_block(result_ok_block);
+    fb.block_params(result_ok_block)[0]
+}
+
 fn emit_direct_call_args_from_plan(
     fb: &mut FunctionBuilder<'_>,
     arg_plan: &DirectCallArgPlan,
@@ -12925,6 +13527,212 @@ fn emit_typed_direct_call_resolved_with_arg_plan_from_local_env(
         arg_values,
         arg_borrowed,
         if arg_plan.requires_default_resolving_entry() {
+            DirectCallEntryKind::DefaultResolving
+        } else {
+            DirectCallEntryKind::Core
+        },
+        target_function,
+        ctx,
+        codegen_env,
+    ))
+}
+
+fn emit_direct_constructor_resolved_with_args_from_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    callable: ir::Value,
+    callable_is_borrowed: bool,
+    args: &[&InstrCodegen],
+    specialization: &DirectConstructorSpecialization,
+    target_function: &BlockPyFunction<CodegenModuleShape>,
+    local_env: &mut LocalEnv,
+    ctx: &JitEmitCtx<'_>,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> ir::Value {
+    let mut arg_values = Vec::with_capacity(args.len());
+    let mut arg_borrowed = Vec::with_capacity(args.len());
+    for arg in args {
+        let borrowed_arg =
+            codegen_expr_pyobject_input_is_borrowed_from_local_env(arg, local_env, ctx);
+        arg_borrowed.push(borrowed_arg);
+        arg_values.push(emit_codegen_expr_with_local_env(
+            fb,
+            arg,
+            local_env,
+            ctx,
+            borrowed_arg,
+            codegen_env,
+            func_imports,
+        ));
+    }
+    emit_direct_constructor_resolved_with_arg_values(
+        fb,
+        callable,
+        callable_is_borrowed,
+        arg_values,
+        arg_borrowed,
+        specialization,
+        target_function,
+        ctx,
+        codegen_env,
+    )
+}
+
+fn emit_typed_direct_constructor_resolved_with_args_from_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    callable: ir::Value,
+    callable_is_borrowed: bool,
+    args: &[&InstrTyped],
+    specialization: &DirectConstructorSpecialization,
+    target_function: &BlockPyFunction<CodegenModuleShape>,
+    local_env: &mut LocalEnv,
+    ctx: &JitEmitCtx<'_>,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<ir::Value, String> {
+    let mut arg_values = Vec::with_capacity(args.len());
+    let mut arg_borrowed = Vec::with_capacity(args.len());
+    for arg in args {
+        let (value, borrowed) = emit_typed_pyobject_input_with_local_env(
+            fb,
+            arg,
+            local_env,
+            ctx,
+            codegen_env,
+            func_imports,
+            "typed direct-constructor arg",
+        )?;
+        arg_values.push(value);
+        arg_borrowed.push(borrowed);
+    }
+    Ok(emit_direct_constructor_resolved_with_arg_values(
+        fb,
+        callable,
+        callable_is_borrowed,
+        arg_values,
+        arg_borrowed,
+        specialization,
+        target_function,
+        ctx,
+        codegen_env,
+    ))
+}
+
+fn emit_direct_method_resolved_with_args_from_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    receiver: ir::Value,
+    receiver_is_borrowed: bool,
+    args: &[&InstrCodegen],
+    specialization: &DirectMethodSpecialization,
+    target_function: &BlockPyFunction<CodegenModuleShape>,
+    local_env: &mut LocalEnv,
+    ctx: &JitEmitCtx<'_>,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> ir::Value {
+    let ptr_ty = ctx.consts.ptr_ty;
+    let mut provided_arg_values = Vec::with_capacity(args.len() + 1);
+    let mut provided_arg_borrowed = Vec::with_capacity(args.len() + 1);
+    provided_arg_values.push(receiver);
+    provided_arg_borrowed.push(receiver_is_borrowed);
+    for arg in args {
+        let borrowed_arg =
+            codegen_expr_pyobject_input_is_borrowed_from_local_env(arg, local_env, ctx);
+        provided_arg_borrowed.push(borrowed_arg);
+        provided_arg_values.push(emit_codegen_expr_with_local_env(
+            fb,
+            arg,
+            local_env,
+            ctx,
+            borrowed_arg,
+            codegen_env,
+            func_imports,
+        ));
+    }
+    let (arg_values, arg_borrowed) = emit_direct_call_args_from_plan(
+        fb,
+        &specialization.arg_plan,
+        provided_arg_values,
+        provided_arg_borrowed,
+        ptr_ty,
+    );
+    let callable = emit_callable_ptr_value_for_ref(
+        fb,
+        codegen_env,
+        ctx,
+        &specialization.descriptor_function_ref,
+    )
+    .unwrap_or_else(|err| panic!("failed to bind direct method callable symbol: {err}"))
+    .expect("direct method callable symbol should be available");
+    emit_direct_call_resolved_with_arg_values(
+        fb,
+        callable,
+        true,
+        arg_values,
+        arg_borrowed,
+        if specialization.arg_plan.requires_default_resolving_entry() {
+            DirectCallEntryKind::DefaultResolving
+        } else {
+            DirectCallEntryKind::Core
+        },
+        target_function,
+        ctx,
+        codegen_env,
+    )
+}
+
+fn emit_typed_direct_method_resolved_with_args_from_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    receiver: ir::Value,
+    receiver_is_borrowed: bool,
+    args: &[&InstrTyped],
+    specialization: &DirectMethodSpecialization,
+    target_function: &BlockPyFunction<CodegenModuleShape>,
+    local_env: &mut LocalEnv,
+    ctx: &JitEmitCtx<'_>,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<ir::Value, String> {
+    let ptr_ty = ctx.consts.ptr_ty;
+    let mut provided_arg_values = Vec::with_capacity(args.len() + 1);
+    let mut provided_arg_borrowed = Vec::with_capacity(args.len() + 1);
+    provided_arg_values.push(receiver);
+    provided_arg_borrowed.push(receiver_is_borrowed);
+    for arg in args {
+        let (value, borrowed) = emit_typed_pyobject_input_with_local_env(
+            fb,
+            arg,
+            local_env,
+            ctx,
+            codegen_env,
+            func_imports,
+            "typed direct-method arg",
+        )?;
+        provided_arg_values.push(value);
+        provided_arg_borrowed.push(borrowed);
+    }
+    let (arg_values, arg_borrowed) = emit_direct_call_args_from_plan(
+        fb,
+        &specialization.arg_plan,
+        provided_arg_values,
+        provided_arg_borrowed,
+        ptr_ty,
+    );
+    let callable = emit_callable_ptr_value_for_ref(
+        fb,
+        codegen_env,
+        ctx,
+        &specialization.descriptor_function_ref,
+    )
+    .unwrap_or_else(|err| panic!("failed to bind direct method callable symbol: {err}"))
+    .expect("direct method callable symbol should be available");
+    Ok(emit_direct_call_resolved_with_arg_values(
+        fb,
+        callable,
+        true,
+        arg_values,
+        arg_borrowed,
+        if specialization.arg_plan.requires_default_resolving_entry() {
             DirectCallEntryKind::DefaultResolving
         } else {
             DirectCallEntryKind::Core
@@ -13778,111 +14586,6 @@ fn emit_codegen_expr_value_with_local_env(
     SoacValue::pyobject_with_ownership(value, ownership, facts)
 }
 
-struct TypedCodegenFallbackLowerer;
-
-impl TryMapInstr<InstrTyped, InstrCodegen, String> for TypedCodegenFallbackLowerer {
-    fn try_map_instr(&mut self, instr: InstrTyped) -> Result<InstrCodegen, String> {
-        Ok(match instr {
-            InstrTyped::Truthy(_) => {
-                return Err(
-                    "typed truthiness instruction requires typed codegen emission".to_string(),
-                );
-            }
-            InstrTyped::Load(op) => InstrCodegen::Load(op.try_map_children(self)?),
-            InstrTyped::BinOp(op) => InstrCodegen::BinOp(op.try_map_children(self)?),
-            InstrTyped::LegacyTuple(op) => InstrCodegen::Tuple(op.try_map_children(self)?),
-            InstrTyped::LegacyUnaryOp(op) => InstrCodegen::UnaryOp(op.try_map_children(self)?),
-            InstrTyped::LegacyCalleeFunctionId(op) => {
-                InstrCodegen::CalleeFunctionId(op.try_map_children(self)?)
-            }
-            InstrTyped::DirectCallGuardTest(op) => {
-                let meta = op.meta();
-                match op.kind {
-                    TypedDirectCallGuardTestKind::RuntimeFunctionId { function_id } => {
-                        InstrCodegen::DirectFunctionIdGuardTest(
-                            DirectFunctionIdGuardTest::new(
-                                self.try_map_instr(*op.value)?,
-                                function_id,
-                            )
-                            .with_meta(meta),
-                        )
-                    }
-                    TypedDirectCallGuardTestKind::ExactReceiverTypeVersion {
-                        owner_type_ref,
-                        type_version,
-                    } => InstrCodegen::DirectReceiverTypeVersionGuardTest(
-                        DirectReceiverTypeVersionGuardTest::new(
-                            self.try_map_instr(*op.value)?,
-                            owner_type_ref,
-                            type_version,
-                        )
-                        .with_meta(meta),
-                    ),
-                    TypedDirectCallGuardTestKind::ExactCallableTypeVersion {
-                        owner_type_ref,
-                        type_version,
-                    } => InstrCodegen::DirectCallableTypeVersionGuardTest(
-                        DirectCallableTypeVersionGuardTest::new(
-                            self.try_map_instr(*op.value)?,
-                            owner_type_ref,
-                            type_version,
-                        )
-                        .with_meta(meta),
-                    ),
-                }
-            }
-            InstrTyped::CallTyped(op) => {
-                InstrCodegen::Call(op.try_map_children(self)?.into_legacy())
-            }
-            InstrTyped::GuardedCallableCallTyped(_) => {
-                return Err(
-                    "typed guarded callable call requires typed codegen emission".to_string(),
-                );
-            }
-            InstrTyped::DirectCallableCallTyped(op) => {
-                InstrCodegen::DirectCallableCall(op.try_map_children(self)?)
-            }
-            InstrTyped::LegacyCall(op) => InstrCodegen::Call(op.try_map_children(self)?),
-            InstrTyped::LegacyCallDirect(op) => {
-                InstrCodegen::CallDirect(op.try_map_children(self)?)
-            }
-            InstrTyped::GetAttrTyped(op) => {
-                InstrCodegen::GetAttr(op.try_map_children(self)?.into_legacy())
-            }
-            InstrTyped::SetAttrTyped(op) => {
-                InstrCodegen::SetAttr(op.try_map_children(self)?.into_legacy())
-            }
-            InstrTyped::LegacyGetAttr(op) => InstrCodegen::GetAttr(op.try_map_children(self)?),
-            InstrTyped::LegacySetAttr(op) => InstrCodegen::SetAttr(op.try_map_children(self)?),
-            InstrTyped::LegacyGetItem(op) => InstrCodegen::GetItem(op.try_map_children(self)?),
-            InstrTyped::LegacySetItem(op) => InstrCodegen::SetItem(op.try_map_children(self)?),
-            InstrTyped::LegacyDelItem(op) => InstrCodegen::DelItem(op.try_map_children(self)?),
-            InstrTyped::LegacyStore(op) => InstrCodegen::Store(op.try_map_children(self)?),
-            InstrTyped::LegacyDel(op) => InstrCodegen::Del(op.try_map_children(self)?),
-            InstrTyped::LegacyMakeCell(op) => InstrCodegen::MakeCell(op.try_map_children(self)?),
-            InstrTyped::LegacyIncrementCounter(op) => InstrCodegen::IncrementCounter(op),
-            InstrTyped::LegacyCellRef(op) => InstrCodegen::CellRef(op),
-            InstrTyped::LegacyMakeFunctionWithClosure(op) => {
-                InstrCodegen::MakeFunctionWithClosure(op.try_map_children(self)?)
-            }
-        })
-    }
-
-    fn try_map_name(&mut self, name: ResolvedName) -> Result<ResolvedName, String> {
-        Ok(name)
-    }
-}
-
-fn typed_expr_to_codegen_fallback(instr: InstrTyped) -> Result<InstrCodegen, String> {
-    TypedCodegenFallbackLowerer.try_map_instr(instr)
-}
-
-fn typed_term_to_codegen_fallback(
-    term: BlockTerm<InstrTyped>,
-) -> Result<BlockTerm<InstrCodegen>, String> {
-    TypedCodegenFallbackLowerer.try_map_term(term)
-}
-
 fn prepare_typed_guard_miss_dispatch_for_instr(
     emit_ctx: &JitEmitCtx<'_>,
     instr_id: InstrId,
@@ -13891,7 +14594,7 @@ fn prepare_typed_guard_miss_dispatch_for_instr(
 ) -> JitGuardMissDispatch {
     let legacy_operands = pre_guard_operands
         .iter()
-        .map(|operand| typed_expr_to_codegen_fallback((*operand).clone()))
+        .map(|operand| try_lower_typed_instr_to_codegen_legacy((*operand).clone()))
         .collect::<Result<Vec<_>, _>>();
     let Ok(legacy_operands) = legacy_operands else {
         return JitGuardMissDispatch::FallbackBlock(fallback_block);
@@ -14056,7 +14759,8 @@ fn emit_typed_setattr_fallback(
 fn emit_typed_indexed_getattr(
     fb: &mut FunctionBuilder<'_>,
     op: &TypedGetAttr<InstrTyped>,
-    _guards: &[TypedIndexedFieldGuard],
+    source: TypedIndexedFieldPlanSource,
+    guards: &[TypedIndexedFieldGuard],
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     codegen_env: &mut impl JitCodegenEnv,
@@ -14065,6 +14769,8 @@ fn emit_typed_indexed_getattr(
     let instr_id = op.semantic_instr_id();
     let Some(plan) = IndexedFieldLoweringPlan::for_access(
         instr_id,
+        source,
+        guards,
         PlanV3IndexedFieldAccessKind::Load,
         emit_ctx.opt_v3_indexed_fields_by_instr,
     )?
@@ -14222,7 +14928,8 @@ fn emit_typed_indexed_getattr(
 fn emit_typed_indexed_setattr(
     fb: &mut FunctionBuilder<'_>,
     op: &TypedSetAttr<InstrTyped>,
-    _guards: &[TypedIndexedFieldGuard],
+    source: TypedIndexedFieldPlanSource,
+    guards: &[TypedIndexedFieldGuard],
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     demand: ResultDemand,
@@ -14230,10 +14937,13 @@ fn emit_typed_indexed_setattr(
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<Option<EmitResult>, String> {
     if !emit_ctx.behavior_change_indexed_stores {
-        return Err(format!(
-            "optimizer v3 indexed-field store emission for {} reached codegen with indexed stores disabled",
-            op.semantic_instr_id()
-        ));
+        if source == TypedIndexedFieldPlanSource::OptimizationPlanV3 {
+            return Err(format!(
+                "optimizer v3 indexed-field store emission for {} reached codegen with indexed stores disabled",
+                op.semantic_instr_id()
+            ));
+        }
+        return Ok(None);
     }
     let result_needs_pyobject = match demand {
         ResultDemand::EffectOnly => false,
@@ -14245,6 +14955,8 @@ fn emit_typed_indexed_setattr(
     let instr_id = op.semantic_instr_id();
     let Some(plan) = IndexedFieldLoweringPlan::for_access(
         instr_id,
+        source,
+        guards,
         PlanV3IndexedFieldAccessKind::Store,
         emit_ctx.opt_v3_indexed_fields_by_instr,
     )?
@@ -14529,7 +15241,7 @@ fn emit_typed_codegen_expr_value_with_local_env(
             );
             return Ok(SoacValue::pyobject_with_ownership(value, ownership, facts));
         }
-        let legacy_expr = typed_expr_to_codegen_fallback(expr.clone())?;
+        let legacy_expr = try_lower_typed_instr_to_codegen_legacy(expr.clone())?;
         return Ok(emit_codegen_expr_value_with_local_env(
             fb,
             &legacy_expr,
@@ -14560,7 +15272,40 @@ fn emit_typed_codegen_expr_value_with_local_env(
             return Ok(SoacValue::pyobject_with_ownership(value, ownership, facts));
         }
         let typed_call = op.clone().into_typed_call();
-        let legacy_expr = typed_expr_to_codegen_fallback(InstrTyped::CallTyped(typed_call))?;
+        let legacy_expr =
+            try_lower_typed_instr_to_codegen_legacy(InstrTyped::CallTyped(typed_call))?;
+        return Ok(emit_codegen_expr_value_with_local_env(
+            fb,
+            &legacy_expr,
+            local_env,
+            emit_ctx,
+            borrowed,
+            codegen_env,
+            func_imports,
+        ));
+    }
+
+    if let InstrTyped::GuardedMethodCallTyped(op) = expr {
+        if let Some(result) = emit_typed_codegen_guarded_method_call_result_with_local_env(
+            fb,
+            op,
+            local_env,
+            emit_ctx,
+            ResultDemand::PYOBJECT_OWNED,
+            codegen_env,
+            func_imports,
+        )? {
+            let (value, ownership, facts) =
+                result.expect_pyobject("typed guarded method call expression result");
+            assert!(
+                ownership.can_satisfy_pyobject_demand(ResultDemand::PYOBJECT_OWNED),
+                "typed guarded method call expression result should satisfy owned PyObject demand"
+            );
+            return Ok(SoacValue::pyobject_with_ownership(value, ownership, facts));
+        }
+        let typed_call = op.clone().into_typed_call();
+        let legacy_expr =
+            try_lower_typed_instr_to_codegen_legacy(InstrTyped::CallTyped(typed_call))?;
         return Ok(emit_codegen_expr_value_with_local_env(
             fb,
             &legacy_expr,
@@ -14591,6 +15336,25 @@ fn emit_typed_codegen_expr_value_with_local_env(
         return Ok(SoacValue::pyobject_with_ownership(value, ownership, facts));
     }
 
+    if let InstrTyped::DirectMethodCallTyped(op) = expr {
+        let result = emit_typed_codegen_direct_method_call_result_with_local_env(
+            fb,
+            op,
+            local_env,
+            emit_ctx,
+            ResultDemand::PYOBJECT_OWNED,
+            codegen_env,
+            func_imports,
+        )?;
+        let (value, ownership, facts) =
+            result.expect_pyobject("typed direct method call expression result");
+        assert!(
+            ownership.can_satisfy_pyobject_demand(ResultDemand::PYOBJECT_OWNED),
+            "typed direct method call expression result should satisfy owned PyObject demand"
+        );
+        return Ok(SoacValue::pyobject_with_ownership(value, ownership, facts));
+    }
+
     if let InstrTyped::DirectCallGuardTest(op) = expr {
         return emit_typed_direct_call_guard_test_value_with_local_env(
             fb,
@@ -14603,11 +15367,12 @@ fn emit_typed_codegen_expr_value_with_local_env(
     }
 
     if let InstrTyped::GetAttrTyped(op) = expr
-        && let TypedAttrAccessPlan::IndexedField { guards } = &op.access
+        && let TypedAttrAccessPlan::IndexedField { source, guards } = &op.access
     {
         let maybe_value = emit_typed_indexed_getattr(
             fb,
             op,
+            *source,
             guards,
             local_env,
             emit_ctx,
@@ -14620,11 +15385,12 @@ fn emit_typed_codegen_expr_value_with_local_env(
     }
 
     if let InstrTyped::SetAttrTyped(op) = expr
-        && let TypedAttrAccessPlan::IndexedField { guards } = &op.access
+        && let TypedAttrAccessPlan::IndexedField { source, guards } = &op.access
     {
         let maybe_value = emit_typed_indexed_setattr(
             fb,
             op,
+            *source,
             guards,
             local_env,
             emit_ctx,
@@ -14665,7 +15431,7 @@ fn emit_typed_codegen_expr_value_with_local_env(
         return Ok(SoacValue::pyobject_with_ownership(value, ownership, facts));
     }
 
-    let legacy_expr = typed_expr_to_codegen_fallback(expr.clone())?;
+    let legacy_expr = try_lower_typed_instr_to_codegen_legacy(expr.clone())?;
     Ok(emit_codegen_expr_value_with_local_env(
         fb,
         &legacy_expr,
@@ -15178,54 +15944,395 @@ fn emit_codegen_simple_call_with_local_env(
                     .get(&site_instr_id)
             })
             .copied();
-        let direct_specializations = match typed_access {
-            Some(TypedCallAccessPlan::GuardedCallable { function_guards }) => {
-                direct_function_specializations_from_typed_guards(function_guards)
+        if let Some(TypedCallAccessPlan::GuardedRuntimeProtocolMethod {
+            runtime_name,
+            method_name,
+            method_guards,
+        }) = typed_access
+            && *runtime_name == RuntimeName::Iter
+            && simple_args.len() == 1
+        {
+            let direct_method_specializations =
+                direct_method_specializations_from_typed_guards(method_guards, method_name);
+            if !direct_method_specializations.is_empty() {
+                let receiver_expr = simple_args[0];
+                let receiver_is_borrowed = codegen_expr_pyobject_input_is_borrowed_from_local_env(
+                    receiver_expr,
+                    local_env,
+                    emit_ctx,
+                );
+                let receiver = emit_codegen_expr_with_local_env(
+                    fb,
+                    receiver_expr,
+                    local_env,
+                    emit_ctx,
+                    receiver_is_borrowed,
+                    codegen_env,
+                    func_imports,
+                );
+                let result_block = fb.create_block();
+                fb.append_block_param(result_block, ptr_ty);
+                let generic_block = fb.create_block();
+                fb.set_cold_block(generic_block);
+
+                for (index, specialization) in direct_method_specializations.iter().enumerate() {
+                    let expected_type = emit_type_ptr_value_for_ref(
+                        fb,
+                        codegen_env,
+                        emit_ctx,
+                        &specialization.owner_type_ref,
+                    )
+                    .unwrap_or_else(|err| {
+                        panic!("failed to bind runtime protocol method type symbol: {err}");
+                    })
+                    .expect("runtime protocol method type symbol should be available");
+                    let direct_block = fb.create_block();
+                    let miss_block = if index + 1 == direct_method_specializations.len() {
+                        generic_block
+                    } else {
+                        fb.create_block()
+                    };
+                    let is_match = emit_exact_type_version_match(
+                        fb,
+                        receiver,
+                        expected_type,
+                        specialization.type_version,
+                    );
+                    fb.ins().brif(is_match, direct_block, &[], miss_block, &[]);
+
+                    fb.switch_to_block(direct_block);
+                    let target_function =
+                        direct_call_target_function(emit_ctx, specialization.function_id)
+                            .expect("runtime protocol method specialization target should exist");
+                    if let Some(counter_id) = call_target_counter {
+                        let callee_id = fb.ins().iconst(
+                            emit_ctx.consts.i64_ty,
+                            specialization.function_id.to_packed_runtime_u64() as i64,
+                        );
+                        emit_record_call_target_sample(fb, counter_id, callee_id, emit_ctx);
+                    }
+                    if let Some(counter_id) = direct_hit_counter_id {
+                        emit_increment_counter_ref(fb, counter_id, emit_ctx);
+                    }
+                    let direct_result = emit_direct_method_resolved_with_args_from_local_env(
+                        fb,
+                        receiver,
+                        receiver_is_borrowed,
+                        &[],
+                        specialization,
+                        target_function,
+                        local_env,
+                        emit_ctx,
+                        codegen_env,
+                        func_imports,
+                    );
+                    fb.ins()
+                        .jump(result_block, &[ir::BlockArg::Value(direct_result)]);
+                    if index + 1 != direct_method_specializations.len() {
+                        fb.switch_to_block(miss_block);
+                    }
+                }
+
+                fb.switch_to_block(generic_block);
+                emit_ctx
+                    .direct_edge_stats
+                    .record_guarded_generic_fallback_block();
+                let callable = emit_checked_runtime_name_object(fb, *runtime_name, emit_ctx);
+                if let Some(counter_id) = call_target_counter {
+                    let callee_id =
+                        emit_callee_function_id_checked(fb, callable, emit_ctx, codegen_env);
+                    emit_record_call_target_sample(fb, counter_id, callee_id, emit_ctx);
+                }
+                if let Some(counter_id) = direct_fallback_counter_id {
+                    emit_increment_counter_ref(fb, counter_id, emit_ctx);
+                }
+                let (generic_result, _, _) = emit_positional_call_three_result_with_arg_values(
+                    fb,
+                    callable,
+                    false,
+                    vec![receiver],
+                    vec![receiver_is_borrowed],
+                    emit_ctx,
+                    ResultDemand::PYOBJECT_OWNED,
+                )
+                .expect_pyobject("guarded runtime protocol method fallback");
+                fb.ins()
+                    .jump(result_block, &[ir::BlockArg::Value(generic_result)]);
+                fb.switch_to_block(result_block);
+                return Some(fb.block_params(result_block)[0]);
             }
-            Some(_) => Vec::new(),
-            _ => call_site_profiled_targets(call, profiled_targets)
-                .map(|targets| {
-                    targets
-                        .iter()
-                        .copied()
-                        .filter_map(|function_id| {
-                            let Some(target_function) =
-                                direct_call_target_function(emit_ctx, function_id)
-                            else {
-                                emit_ctx
-                                    .direct_edge_stats
-                                    .record_profiled_missing_target_candidate();
-                                return None;
-                            };
-                            if target_function.names.fn_name == "__init__" {
-                                return None;
-                            }
-                            let arg_plan = match validate_direct_call_compatibility(
-                                target_function,
-                                emit_ctx.direct_call_functions,
-                                simple_args.len(),
-                                0,
-                                false,
-                                false,
-                            ) {
-                                Ok(arg_plan) => arg_plan,
-                                Err(incompatibility) => {
-                                    record_profiled_direct_call_incompatibility(
-                                        emit_ctx.direct_edge_stats,
-                                        incompatibility,
-                                    );
+        }
+        let (constructor_specializations, direct_specializations) = match typed_access {
+            Some(TypedCallAccessPlan::GuardedCallable {
+                function_guards,
+                constructor_guards,
+            }) => (
+                direct_constructor_specializations_from_typed_guards(constructor_guards),
+                direct_function_specializations_from_typed_guards(function_guards),
+            ),
+            Some(_) => (Vec::new(), Vec::new()),
+            _ => {
+                let constructor_specializations = Vec::new();
+                let direct_specializations = call_site_profiled_targets(call, profiled_targets)
+                    .map(|targets| {
+                        targets
+                            .iter()
+                            .copied()
+                            .filter_map(|function_id| {
+                                let Some(target_function) =
+                                    direct_call_target_function(emit_ctx, function_id)
+                                else {
+                                    emit_ctx
+                                        .direct_edge_stats
+                                        .record_profiled_missing_target_candidate();
+                                    return None;
+                                };
+                                if target_function.names.fn_name == "__init__" {
                                     return None;
                                 }
-                            };
-                            Some(DirectFunctionSpecialization {
-                                function_id,
-                                arg_plan,
+                                let arg_plan = match validate_direct_call_compatibility(
+                                    target_function,
+                                    emit_ctx.direct_call_functions,
+                                    simple_args.len(),
+                                    0,
+                                    false,
+                                    false,
+                                ) {
+                                    Ok(arg_plan) => arg_plan,
+                                    Err(incompatibility) => {
+                                        record_profiled_direct_call_incompatibility(
+                                            emit_ctx.direct_edge_stats,
+                                            incompatibility,
+                                        );
+                                        return None;
+                                    }
+                                };
+                                Some(DirectFunctionSpecialization {
+                                    function_id,
+                                    arg_plan,
+                                })
                             })
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default(),
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                (constructor_specializations, direct_specializations)
+            }
         };
+        let direct_method_specializations = match typed_access {
+            Some(TypedCallAccessPlan::GuardedMethod {
+                method_name,
+                method_guards,
+            }) => direct_method_specializations_from_typed_guards(method_guards, method_name),
+            Some(_) => Vec::new(),
+            _ => Vec::new(),
+        };
+        if !direct_method_specializations.is_empty() {
+            let InstrCodegen::GetAttr(getattr) = call.func.as_ref() else {
+                unreachable!("direct method specializations require GetAttr call target");
+            };
+            let receiver_is_borrowed = codegen_expr_pyobject_input_is_borrowed_from_local_env(
+                getattr.value.as_ref(),
+                local_env,
+                emit_ctx,
+            );
+            let receiver = emit_codegen_expr_with_local_env(
+                fb,
+                getattr.value.as_ref(),
+                local_env,
+                emit_ctx,
+                receiver_is_borrowed,
+                codegen_env,
+                func_imports,
+            );
+            let result_block = fb.create_block();
+            fb.append_block_param(result_block, ptr_ty);
+            let generic_block = fb.create_block();
+            fb.set_cold_block(generic_block);
+            let method_guard_miss_resume_point = emit_ctx.guard_miss_resume_point.or_else(|| {
+                site_instr_id.map(|site_instr_id| LocalEnvResumePoint::BeforeInstr {
+                    key: InstrKey::new(emit_ctx.function_id, site_instr_id),
+                })
+            });
+            let method_guard_miss_dispatch = method_guard_miss_resume_point
+                .map(|guard_miss_resume_point| {
+                    prepare_optional_guard_miss_dispatch(
+                        emit_ctx.guard_miss_target_for_resume_point(
+                            guard_miss_resume_point,
+                            &[getattr.value.as_ref()],
+                            generic_block,
+                        ),
+                        generic_block,
+                        emit_ctx.guard_miss_deopt_stub_ref,
+                    )
+                })
+                .unwrap_or(JitGuardMissDispatch::FallbackBlock(generic_block));
+            for (index, specialization) in direct_method_specializations.iter().enumerate() {
+                let Some(expected_type) = emit_type_ptr_value_for_ref(
+                    fb,
+                    codegen_env,
+                    emit_ctx,
+                    &specialization.owner_type_ref,
+                )
+                .unwrap_or_else(|err| {
+                    panic!("failed to bind direct method type symbol: {err}");
+                }) else {
+                    continue;
+                };
+                let direct_block = fb.create_block();
+                let miss_block = if index + 1 == direct_method_specializations.len() {
+                    method_guard_miss_dispatch.branch_block()
+                } else {
+                    fb.create_block()
+                };
+                let is_match = emit_exact_type_version_match(
+                    fb,
+                    receiver,
+                    expected_type,
+                    specialization.type_version,
+                );
+                fb.ins().brif(is_match, direct_block, &[], miss_block, &[]);
+
+                fb.switch_to_block(direct_block);
+                let target_function =
+                    direct_call_target_function(emit_ctx, specialization.function_id)
+                        .expect("direct method specialization target should exist");
+                if let Some(counter_id) = call_target_counter {
+                    let callee_id = fb.ins().iconst(
+                        emit_ctx.consts.i64_ty,
+                        specialization.function_id.to_packed_runtime_u64() as i64,
+                    );
+                    emit_record_call_target_sample(fb, counter_id, callee_id, emit_ctx);
+                }
+                if let Some(counter_id) = direct_hit_counter_id {
+                    emit_increment_counter_ref(fb, counter_id, emit_ctx);
+                }
+                let direct_result = emit_direct_method_resolved_with_args_from_local_env(
+                    fb,
+                    receiver,
+                    receiver_is_borrowed,
+                    simple_args.as_slice(),
+                    specialization,
+                    target_function,
+                    local_env,
+                    emit_ctx,
+                    codegen_env,
+                    func_imports,
+                );
+                fb.ins()
+                    .jump(result_block, &[ir::BlockArg::Value(direct_result)]);
+                if index + 1 != direct_method_specializations.len() {
+                    fb.switch_to_block(miss_block);
+                }
+            }
+
+            match method_guard_miss_dispatch {
+                JitGuardMissDispatch::FallbackBlock(generic_block) => {
+                    fb.switch_to_block(generic_block);
+                    let attr_is_borrowed = codegen_expr_pyobject_input_is_borrowed_from_local_env(
+                        getattr.attr.as_ref(),
+                        local_env,
+                        emit_ctx,
+                    );
+                    let attr = emit_codegen_expr_with_local_env(
+                        fb,
+                        getattr.attr.as_ref(),
+                        local_env,
+                        emit_ctx,
+                        attr_is_borrowed,
+                        codegen_env,
+                        func_imports,
+                    );
+                    let getattr_inst = fb
+                        .ins()
+                        .call(emit_ctx.pyobject_getattr_ref, &[receiver, attr]);
+                    let mut owned_inputs = Vec::with_capacity(2);
+                    if !attr_is_borrowed {
+                        owned_inputs.push(attr);
+                    }
+                    if !receiver_is_borrowed {
+                        owned_inputs.push(receiver);
+                    }
+                    let callable = emit_decref_owned_inputs_after_nullable_result(
+                        fb,
+                        emit_ctx,
+                        fb.inst_results(getattr_inst)[0],
+                        &owned_inputs,
+                    );
+                    let callable_is_null =
+                        fb.ins()
+                            .icmp(ir::condcodes::IntCC::Equal, callable, null_ptr);
+                    let callable_ok_block = fb.create_block();
+                    fb.append_block_param(callable_ok_block, ptr_ty);
+                    fb.ins().brif(
+                        callable_is_null,
+                        emit_ctx.consts.step_null_block,
+                        &step_null_block_args(emit_ctx),
+                        callable_ok_block,
+                        &[ir::BlockArg::Value(callable)],
+                    );
+                    fb.switch_to_block(callable_ok_block);
+                    let callable = fb.block_params(callable_ok_block)[0];
+                    if let Some(counter_id) = call_target_counter {
+                        let callee_id =
+                            emit_callee_function_id_checked(fb, callable, emit_ctx, codegen_env);
+                        emit_record_call_target_sample(fb, counter_id, callee_id, emit_ctx);
+                    }
+                    if let Some(counter_id) = direct_fallback_counter_id {
+                        emit_increment_counter_ref(fb, counter_id, emit_ctx);
+                    }
+                    let generic_result = if simple_args.len() <= 3 {
+                        emit_positional_call_three_with_local_env(
+                            fb,
+                            callable,
+                            false,
+                            simple_args.as_slice(),
+                            local_env,
+                            emit_ctx,
+                            codegen_env,
+                            func_imports,
+                        )
+                    } else {
+                        emit_positional_vectorcall_with_local_env(
+                            fb,
+                            callable,
+                            false,
+                            simple_args.as_slice(),
+                            local_env,
+                            emit_ctx,
+                            codegen_env,
+                            func_imports,
+                        )
+                    };
+                    fb.ins()
+                        .jump(result_block, &[ir::BlockArg::Value(generic_result)]);
+                }
+                JitGuardMissDispatch::DeoptResume {
+                    block,
+                    target,
+                    deopt_resume_ref,
+                } => {
+                    fb.switch_to_block(block);
+                    fb.set_cold_block(block);
+                    if let Some(counter_id) = direct_fallback_counter_id {
+                        emit_increment_counter_ref(fb, counter_id, emit_ctx);
+                    }
+                    if !receiver_is_borrowed {
+                        emit_release_owned_inputs(fb, emit_ctx, &[receiver]);
+                    }
+                    let deopt_result = emit_deopt_resume_call_with_local_env(
+                        fb,
+                        target,
+                        deopt_resume_ref,
+                        emit_ctx.consts.block_const,
+                        emit_ctx,
+                        local_env,
+                    );
+                    emit_deopt_result_return_or_step_null(fb, emit_ctx, deopt_result);
+                }
+            }
+            fb.switch_to_block(result_block);
+            return Some(fb.block_params(result_block)[0]);
+        }
         let callable_is_borrowed = codegen_expr_pyobject_input_is_borrowed_from_local_env(
             call.func.as_ref(),
             local_env,
@@ -15240,20 +16347,23 @@ fn emit_codegen_simple_call_with_local_env(
             codegen_env,
             func_imports,
         );
-        let should_emit_callee_id =
-            call_target_counter.is_some() || !direct_specializations.is_empty();
+        let should_emit_callee_id = call_target_counter.is_some()
+            || !constructor_specializations.is_empty()
+            || !direct_specializations.is_empty();
         let callee_id = should_emit_callee_id
             .then(|| emit_callee_function_id_checked(fb, callable, emit_ctx, codegen_env));
         if let Some(counter_id) = call_target_counter {
             let callee_id = callee_id.expect("callee id should exist for call target counter");
             emit_record_call_target_sample(fb, counter_id, callee_id, emit_ctx);
         }
-        if !direct_specializations.is_empty() {
+        if !constructor_specializations.is_empty() || !direct_specializations.is_empty() {
             let result_block = fb.create_block();
             fb.append_block_param(result_block, ptr_ty);
             let generic_block = fb.create_block();
             fb.set_cold_block(generic_block);
-            let direct_guard_miss_dispatch = if let Some(site_instr_id) = site_instr_id {
+            let direct_guard_miss_dispatch = if !constructor_specializations.is_empty() {
+                JitGuardMissDispatch::FallbackBlock(generic_block)
+            } else if let Some(site_instr_id) = site_instr_id {
                 let guard_miss_resume_point =
                     emit_ctx
                         .guard_miss_resume_point
@@ -15272,7 +16382,87 @@ fn emit_codegen_simple_call_with_local_env(
             } else {
                 JitGuardMissDispatch::FallbackBlock(generic_block)
             };
-            {
+            let mut direct_chain_start = None;
+            if !constructor_specializations.is_empty() {
+                let mut next_miss_block = fb.create_block();
+                for (index, specialization) in constructor_specializations.iter().enumerate() {
+                    let Some(expected_type) = emit_type_ptr_value_for_ref(
+                        fb,
+                        codegen_env,
+                        emit_ctx,
+                        &specialization.owner_type_ref,
+                    )
+                    .unwrap_or_else(|err| {
+                        panic!("failed to bind constructor type symbol: {err}");
+                    }) else {
+                        continue;
+                    };
+                    let type_match_block = fb.create_block();
+                    let direct_block = fb.create_block();
+                    let miss_block = if index + 1 == constructor_specializations.len() {
+                        if direct_specializations.is_empty() {
+                            generic_block
+                        } else {
+                            fb.create_block()
+                        }
+                    } else {
+                        fb.create_block()
+                    };
+                    let is_exact_type =
+                        fb.ins()
+                            .icmp(ir::condcodes::IntCC::Equal, callable, expected_type);
+                    fb.ins()
+                        .brif(is_exact_type, type_match_block, &[], miss_block, &[]);
+
+                    fb.switch_to_block(type_match_block);
+                    let type_version = fb.ins().load(
+                        ir::types::I32,
+                        ir::MemFlags::trusted(),
+                        callable,
+                        offset_of!(ffi::PyTypeObject, tp_version_tag) as i32,
+                    );
+                    let version_matches = fb.ins().icmp_imm(
+                        ir::condcodes::IntCC::Equal,
+                        type_version,
+                        specialization.type_version as i64,
+                    );
+                    fb.ins()
+                        .brif(version_matches, direct_block, &[], miss_block, &[]);
+
+                    fb.switch_to_block(direct_block);
+                    let target_function =
+                        direct_call_target_function(emit_ctx, specialization.function_id)
+                            .expect("direct constructor specialization target should exist");
+                    if let Some(counter_id) = direct_hit_counter_id {
+                        emit_increment_counter_ref(fb, counter_id, emit_ctx);
+                    }
+                    let direct_result = emit_direct_constructor_resolved_with_args_from_local_env(
+                        fb,
+                        callable,
+                        callable_is_borrowed,
+                        simple_args.as_slice(),
+                        specialization,
+                        target_function,
+                        local_env,
+                        emit_ctx,
+                        codegen_env,
+                        func_imports,
+                    );
+                    fb.ins()
+                        .jump(result_block, &[ir::BlockArg::Value(direct_result)]);
+                    if index + 1 != constructor_specializations.len() {
+                        fb.switch_to_block(miss_block);
+                    } else {
+                        next_miss_block = miss_block;
+                    }
+                }
+                direct_chain_start = Some(next_miss_block);
+            }
+
+            if !direct_specializations.is_empty() {
+                if let Some(start_block) = direct_chain_start {
+                    fb.switch_to_block(start_block);
+                }
                 let callee_id = callee_id.expect("callee id should exist for direct call guards");
                 let callable_type = fb.ins().load(
                     ptr_ty,
@@ -16640,21 +17830,22 @@ fn emit_typed_codegen_call_result_with_local_env(
     codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<Option<EmitResult>, String> {
-    let legacy_call = match typed_expr_to_codegen_fallback(InstrTyped::CallTyped(call.clone())) {
-        Ok(InstrCodegen::Call(legacy_call)) => legacy_call,
-        Ok(_) => unreachable!("typed call should lower to a legacy call"),
-        Err(_) => {
-            return emit_typed_codegen_simple_positional_call_result_with_local_env(
-                fb,
-                call,
-                local_env,
-                emit_ctx,
-                demand,
-                codegen_env,
-                func_imports,
-            );
-        }
-    };
+    let legacy_call =
+        match try_lower_typed_instr_to_codegen_legacy(InstrTyped::CallTyped(call.clone())) {
+            Ok(InstrCodegen::Call(legacy_call)) => legacy_call,
+            Ok(_) => unreachable!("typed call should lower to a legacy call"),
+            Err(_) => {
+                return emit_typed_codegen_simple_positional_call_result_with_local_env(
+                    fb,
+                    call,
+                    local_env,
+                    emit_ctx,
+                    demand,
+                    codegen_env,
+                    func_imports,
+                );
+            }
+        };
     if let Some(result) = emit_runtime_builtin_primitive_call_result_with_local_env(
         fb,
         &legacy_call,
@@ -16692,8 +17883,28 @@ fn emit_typed_codegen_call_result_with_local_env(
     let guarded_targets;
     let profiled_targets = match &call.access {
         TypedCallAccessPlan::Generic => None,
-        TypedCallAccessPlan::GuardedCallable { function_guards } => {
+        TypedCallAccessPlan::ProfiledCallableTargets { targets }
+        | TypedCallAccessPlan::ProfiledMethodTargets { targets } => Some(targets.as_slice()),
+        TypedCallAccessPlan::GuardedCallable {
+            function_guards,
+            constructor_guards,
+        } => {
             guarded_targets = function_guards
+                .iter()
+                .map(|guard| guard.function_id)
+                .chain(constructor_guards.iter().map(|guard| guard.function_id))
+                .collect::<Vec<_>>();
+            Some(guarded_targets.as_slice())
+        }
+        TypedCallAccessPlan::GuardedMethod { method_guards, .. } => {
+            guarded_targets = method_guards
+                .iter()
+                .map(|guard| guard.function_id)
+                .collect::<Vec<_>>();
+            Some(guarded_targets.as_slice())
+        }
+        TypedCallAccessPlan::GuardedRuntimeProtocolMethod { method_guards, .. } => {
+            guarded_targets = method_guards
                 .iter()
                 .map(|guard| guard.function_id)
                 .collect::<Vec<_>>();
@@ -16805,13 +18016,22 @@ fn emit_typed_codegen_direct_callable_specialization_result_with_local_env(
     debug_assert_eq!(simple_args.len(), arg_refs.len());
 
     let site_instr_id = legacy_call.try_semantic_instr_id();
-    let direct_specializations = match &call.access {
-        TypedCallAccessPlan::GuardedCallable { function_guards } => {
-            direct_function_specializations_from_typed_guards(function_guards)
+    let (constructor_specializations, direct_specializations) = match &call.access {
+        TypedCallAccessPlan::GuardedCallable {
+            function_guards,
+            constructor_guards,
+        } => (
+            direct_constructor_specializations_from_typed_guards(constructor_guards),
+            direct_function_specializations_from_typed_guards(function_guards),
+        ),
+        TypedCallAccessPlan::Generic | TypedCallAccessPlan::ProfiledCallableTargets { .. } => {
+            (Vec::new(), Vec::new())
         }
-        TypedCallAccessPlan::Generic => Vec::new(),
+        TypedCallAccessPlan::ProfiledMethodTargets { .. }
+        | TypedCallAccessPlan::GuardedMethod { .. }
+        | TypedCallAccessPlan::GuardedRuntimeProtocolMethod { .. } => return Ok(None),
     };
-    if direct_specializations.is_empty() {
+    if constructor_specializations.is_empty() && direct_specializations.is_empty() {
         return Ok(None);
     }
 
@@ -16820,6 +18040,7 @@ fn emit_typed_codegen_direct_callable_specialization_result_with_local_env(
         call.func.as_ref(),
         arg_refs.as_slice(),
         site_instr_id,
+        constructor_specializations.as_slice(),
         direct_specializations.as_slice(),
         local_env,
         emit_ctx,
@@ -16835,6 +18056,7 @@ fn emit_typed_prepared_direct_callable_specialization_result_with_local_env(
     func: &InstrTyped,
     arg_refs: &[&InstrTyped],
     site_instr_id: Option<InstrId>,
+    constructor_specializations: &[DirectConstructorSpecialization],
     direct_specializations: &[DirectFunctionSpecialization],
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
@@ -16842,7 +18064,7 @@ fn emit_typed_prepared_direct_callable_specialization_result_with_local_env(
     codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<Option<EmitResult>, String> {
-    if direct_specializations.is_empty() {
+    if constructor_specializations.is_empty() && direct_specializations.is_empty() {
         return Ok(None);
     }
 
@@ -16869,7 +18091,9 @@ fn emit_typed_prepared_direct_callable_specialization_result_with_local_env(
         func_imports,
         "typed direct-call callable",
     )?;
-    let should_emit_callee_id = call_target_counter.is_some() || !direct_specializations.is_empty();
+    let should_emit_callee_id = call_target_counter.is_some()
+        || !constructor_specializations.is_empty()
+        || !direct_specializations.is_empty();
     let callee_id = should_emit_callee_id
         .then(|| emit_callee_function_id_checked(fb, callable, emit_ctx, codegen_env));
     if let Some(counter_id) = call_target_counter {
@@ -16882,13 +18106,94 @@ fn emit_typed_prepared_direct_callable_specialization_result_with_local_env(
     fb.append_block_param(result_block, ptr_ty);
     let generic_block = fb.create_block();
     fb.set_cold_block(generic_block);
-    let direct_guard_miss_dispatch = if let Some(site_instr_id) = site_instr_id {
+    let direct_guard_miss_dispatch = if !constructor_specializations.is_empty() {
+        JitGuardMissDispatch::FallbackBlock(generic_block)
+    } else if let Some(site_instr_id) = site_instr_id {
         prepare_typed_guard_miss_dispatch_for_instr(emit_ctx, site_instr_id, &[func], generic_block)
     } else {
         JitGuardMissDispatch::FallbackBlock(generic_block)
     };
 
+    let mut direct_chain_start = None;
+    if !constructor_specializations.is_empty() {
+        let mut next_miss_block = fb.create_block();
+        for (index, specialization) in constructor_specializations.iter().enumerate() {
+            let Some(expected_type) = emit_type_ptr_value_for_ref(
+                fb,
+                codegen_env,
+                emit_ctx,
+                &specialization.owner_type_ref,
+            )
+            .unwrap_or_else(|err| {
+                panic!("failed to bind constructor type symbol: {err}");
+            }) else {
+                continue;
+            };
+            let type_match_block = fb.create_block();
+            let direct_block = fb.create_block();
+            let miss_block = if index + 1 == constructor_specializations.len() {
+                if direct_specializations.is_empty() {
+                    generic_block
+                } else {
+                    fb.create_block()
+                }
+            } else {
+                fb.create_block()
+            };
+            let is_exact_type = fb
+                .ins()
+                .icmp(ir::condcodes::IntCC::Equal, callable, expected_type);
+            fb.ins()
+                .brif(is_exact_type, type_match_block, &[], miss_block, &[]);
+
+            fb.switch_to_block(type_match_block);
+            let type_version = fb.ins().load(
+                ir::types::I32,
+                ir::MemFlags::trusted(),
+                callable,
+                offset_of!(ffi::PyTypeObject, tp_version_tag) as i32,
+            );
+            let version_matches = fb.ins().icmp_imm(
+                ir::condcodes::IntCC::Equal,
+                type_version,
+                specialization.type_version as i64,
+            );
+            fb.ins()
+                .brif(version_matches, direct_block, &[], miss_block, &[]);
+
+            fb.switch_to_block(direct_block);
+            let target_function = direct_call_target_function(emit_ctx, specialization.function_id)
+                .expect("direct constructor specialization target should exist");
+            if let Some(counter_id) = direct_hit_counter_id {
+                emit_increment_counter_ref(fb, counter_id, emit_ctx);
+            }
+            let direct_result = emit_typed_direct_constructor_resolved_with_args_from_local_env(
+                fb,
+                callable,
+                callable_is_borrowed,
+                arg_refs,
+                specialization,
+                target_function,
+                local_env,
+                emit_ctx,
+                codegen_env,
+                func_imports,
+            )?;
+            fb.ins()
+                .jump(result_block, &[ir::BlockArg::Value(direct_result)]);
+            if index + 1 != constructor_specializations.len() {
+                fb.switch_to_block(miss_block);
+            } else {
+                next_miss_block = miss_block;
+            }
+        }
+        direct_chain_start = Some(next_miss_block);
+    }
+
     if !direct_specializations.is_empty() {
+        if let Some(start_block) = direct_chain_start {
+            fb.switch_to_block(start_block);
+        }
         let callee_id = callee_id.expect("callee id should exist for direct call guards");
         let callable_type = fb.ins().load(
             ptr_ty,
@@ -17054,6 +18359,14 @@ fn emit_typed_generic_positional_call_result_with_local_env(
     )
 }
 
+fn typed_getattr_parts(expr: &InstrTyped) -> Option<(&InstrTyped, &InstrTyped)> {
+    match expr {
+        InstrTyped::GetAttrTyped(getattr) => Some((getattr.value.as_ref(), getattr.attr.as_ref())),
+        InstrTyped::LegacyGetAttr(getattr) => Some((getattr.value.as_ref(), getattr.attr.as_ref())),
+        _ => None,
+    }
+}
+
 fn emit_typed_codegen_guarded_callable_call_result_with_local_env(
     fb: &mut FunctionBuilder<'_>,
     call: &TypedGuardedCallableCall<InstrTyped>,
@@ -17068,9 +18381,11 @@ fn emit_typed_codegen_guarded_callable_call_result_with_local_env(
         call.keywords.as_slice(),
         "typed guarded callable call",
     )?;
+    let constructor_specializations =
+        direct_constructor_specializations_from_typed_guards(call.constructor_guards.as_slice());
     let direct_specializations =
         direct_function_specializations_from_typed_guards(call.function_guards.as_slice());
-    if direct_specializations.is_empty() {
+    if constructor_specializations.is_empty() && direct_specializations.is_empty() {
         let result = emit_typed_generic_positional_call_result_with_local_env(
             fb,
             call.func.as_ref(),
@@ -17090,6 +18405,7 @@ fn emit_typed_codegen_guarded_callable_call_result_with_local_env(
         call.func.as_ref(),
         arg_refs.as_slice(),
         call.try_semantic_instr_id(),
+        constructor_specializations.as_slice(),
         direct_specializations.as_slice(),
         local_env,
         emit_ctx,
@@ -17097,6 +18413,236 @@ fn emit_typed_codegen_guarded_callable_call_result_with_local_env(
         codegen_env,
         func_imports,
     )
+}
+
+fn emit_typed_codegen_guarded_method_call_result_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    call: &TypedGuardedMethodCall<InstrTyped>,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    demand: ResultDemand,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<Option<EmitResult>, String> {
+    let arg_refs = typed_simple_positional_arg_refs(
+        call.args.as_slice(),
+        call.keywords.as_slice(),
+        "typed guarded method call",
+    )?;
+    let direct_method_specializations = direct_method_specializations_from_typed_guards(
+        call.method_guards.as_slice(),
+        call.method_name.as_str(),
+    );
+    if direct_method_specializations.is_empty() {
+        let result = emit_typed_generic_positional_call_result_with_local_env(
+            fb,
+            call.func.as_ref(),
+            arg_refs.as_slice(),
+            call.try_semantic_instr_id(),
+            local_env,
+            emit_ctx,
+            demand,
+            codegen_env,
+            func_imports,
+        )?;
+        return Ok(Some(result));
+    }
+
+    let Some((receiver_expr, attr_expr)) = typed_getattr_parts(call.func.as_ref()) else {
+        return Err("typed guarded method call requires a GetAttr call target".to_string());
+    };
+    let site_instr_id = call.try_semantic_instr_id();
+    let call_target_counter = site_instr_id
+        .and_then(|site_instr_id| emit_ctx.call_target_counter_ids.get(&site_instr_id))
+        .copied();
+    let direct_hit_counter_id = site_instr_id
+        .and_then(|site_instr_id| emit_ctx.call_direct_hit_counter_ids.get(&site_instr_id))
+        .copied();
+    let direct_fallback_counter_id = site_instr_id
+        .and_then(|site_instr_id| {
+            emit_ctx
+                .call_direct_fallback_counter_ids
+                .get(&site_instr_id)
+        })
+        .copied();
+    let (receiver, receiver_is_borrowed) = emit_typed_pyobject_input_with_local_env(
+        fb,
+        receiver_expr,
+        local_env,
+        emit_ctx,
+        codegen_env,
+        func_imports,
+        "typed guarded-method receiver",
+    )?;
+
+    let ptr_ty = emit_ctx.consts.ptr_ty;
+    let null_ptr = fb.ins().iconst(ptr_ty, 0);
+    let result_block = fb.create_block();
+    fb.append_block_param(result_block, ptr_ty);
+    let generic_block = fb.create_block();
+    fb.set_cold_block(generic_block);
+    let method_guard_miss_dispatch = site_instr_id
+        .map(|site_instr_id| {
+            prepare_typed_guard_miss_dispatch_for_instr(
+                emit_ctx,
+                site_instr_id,
+                &[receiver_expr],
+                generic_block,
+            )
+        })
+        .unwrap_or(JitGuardMissDispatch::FallbackBlock(generic_block));
+    for (index, specialization) in direct_method_specializations.iter().enumerate() {
+        let Some(expected_type) =
+            emit_type_ptr_value_for_ref(fb, codegen_env, emit_ctx, &specialization.owner_type_ref)
+                .unwrap_or_else(|err| {
+                    panic!("failed to bind direct method type symbol: {err}");
+                })
+        else {
+            continue;
+        };
+        let direct_block = fb.create_block();
+        let miss_block = if index + 1 == direct_method_specializations.len() {
+            method_guard_miss_dispatch.branch_block()
+        } else {
+            fb.create_block()
+        };
+        let is_match =
+            emit_exact_type_version_match(fb, receiver, expected_type, specialization.type_version);
+        fb.ins().brif(is_match, direct_block, &[], miss_block, &[]);
+
+        fb.switch_to_block(direct_block);
+        let target_function = direct_call_target_function(emit_ctx, specialization.function_id)
+            .expect("direct method specialization target should exist");
+        if let Some(counter_id) = call_target_counter {
+            let callee_id = fb.ins().iconst(
+                emit_ctx.consts.i64_ty,
+                specialization.function_id.to_packed_runtime_u64() as i64,
+            );
+            emit_record_call_target_sample(fb, counter_id, callee_id, emit_ctx);
+        }
+        if let Some(counter_id) = direct_hit_counter_id {
+            emit_increment_counter_ref(fb, counter_id, emit_ctx);
+        }
+        let direct_result = emit_typed_direct_method_resolved_with_args_from_local_env(
+            fb,
+            receiver,
+            receiver_is_borrowed,
+            arg_refs.as_slice(),
+            specialization,
+            target_function,
+            local_env,
+            emit_ctx,
+            codegen_env,
+            func_imports,
+        )?;
+        fb.ins()
+            .jump(result_block, &[ir::BlockArg::Value(direct_result)]);
+        if index + 1 != direct_method_specializations.len() {
+            fb.switch_to_block(miss_block);
+        }
+    }
+
+    match method_guard_miss_dispatch {
+        JitGuardMissDispatch::FallbackBlock(generic_block) => {
+            fb.switch_to_block(generic_block);
+            let (attr, attr_is_borrowed) = emit_typed_pyobject_input_with_local_env(
+                fb,
+                attr_expr,
+                local_env,
+                emit_ctx,
+                codegen_env,
+                func_imports,
+                "typed guarded-method attr fallback",
+            )?;
+            let getattr_inst = fb
+                .ins()
+                .call(emit_ctx.pyobject_getattr_ref, &[receiver, attr]);
+            let mut owned_inputs = Vec::with_capacity(2);
+            if !attr_is_borrowed {
+                owned_inputs.push(attr);
+            }
+            if !receiver_is_borrowed {
+                owned_inputs.push(receiver);
+            }
+            let callable = emit_decref_owned_inputs_after_nullable_result(
+                fb,
+                emit_ctx,
+                fb.inst_results(getattr_inst)[0],
+                &owned_inputs,
+            );
+            let callable_is_null = fb
+                .ins()
+                .icmp(ir::condcodes::IntCC::Equal, callable, null_ptr);
+            let callable_ok_block = fb.create_block();
+            fb.append_block_param(callable_ok_block, ptr_ty);
+            fb.ins().brif(
+                callable_is_null,
+                emit_ctx.consts.step_null_block,
+                &step_null_block_args(emit_ctx),
+                callable_ok_block,
+                &[ir::BlockArg::Value(callable)],
+            );
+            fb.switch_to_block(callable_ok_block);
+            let callable = fb.block_params(callable_ok_block)[0];
+            if let Some(counter_id) = call_target_counter {
+                let callee_id =
+                    emit_callee_function_id_checked(fb, callable, emit_ctx, codegen_env);
+                emit_record_call_target_sample(fb, counter_id, callee_id, emit_ctx);
+            }
+            if let Some(counter_id) = direct_fallback_counter_id {
+                emit_increment_counter_ref(fb, counter_id, emit_ctx);
+            }
+            let generic_result = emit_typed_positional_call_result_with_arg_refs(
+                fb,
+                callable,
+                false,
+                arg_refs.as_slice(),
+                local_env,
+                emit_ctx,
+                ResultDemand::PYOBJECT_OWNED,
+                codegen_env,
+                func_imports,
+            )?;
+            let (generic_result, ownership, _) =
+                generic_result.expect_pyobject("typed guarded-method fallback result");
+            debug_assert!(ownership.is_owned());
+            fb.ins()
+                .jump(result_block, &[ir::BlockArg::Value(generic_result)]);
+        }
+        JitGuardMissDispatch::DeoptResume {
+            block,
+            target,
+            deopt_resume_ref,
+        } => {
+            fb.switch_to_block(block);
+            fb.set_cold_block(block);
+            if let Some(counter_id) = direct_fallback_counter_id {
+                emit_increment_counter_ref(fb, counter_id, emit_ctx);
+            }
+            if !receiver_is_borrowed {
+                emit_release_owned_inputs(fb, emit_ctx, &[receiver]);
+            }
+            let deopt_result = emit_deopt_resume_call_with_local_env(
+                fb,
+                target,
+                deopt_resume_ref,
+                emit_ctx.consts.block_const,
+                emit_ctx,
+                local_env,
+            );
+            emit_deopt_result_return_or_step_null(fb, emit_ctx, deopt_result);
+        }
+    }
+
+    fb.switch_to_block(result_block);
+    let result = fb.block_params(result_block)[0];
+    Ok(Some(emit_owned_pyobject_result_for_demand(
+        fb,
+        result,
+        PyObjFacts::unknown(),
+        emit_ctx,
+        demand,
+    )))
 }
 
 fn emit_typed_codegen_direct_callable_call_result_with_local_env(
@@ -17124,20 +18670,104 @@ fn emit_typed_codegen_direct_callable_call_result_with_local_env(
         };
         arg_refs.push(arg);
     }
-    let target_function = direct_call_target_function(emit_ctx, call.guard.function_id)
+    let result = match &call.guard {
+        TypedDirectCallableCallGuard::Function(guard) => {
+            let target_function = direct_call_target_function(emit_ctx, guard.function_id)
+                .ok_or_else(|| {
+                    format!(
+                        "typed direct callable call target {:?} is unavailable",
+                        guard.function_id
+                    )
+                })?;
+            let arg_plan = direct_call_arg_plan_from_typed(&guard.arg_plan);
+            emit_typed_direct_call_resolved_with_arg_plan_from_local_env(
+                fb,
+                callable,
+                callable_is_borrowed,
+                arg_refs.as_slice(),
+                &arg_plan,
+                target_function,
+                local_env,
+                emit_ctx,
+                codegen_env,
+                func_imports,
+            )?
+        }
+        TypedDirectCallableCallGuard::Constructor(guard) => {
+            let specialization = direct_constructor_specialization_from_typed_guard(guard)
+                .ok_or_else(|| {
+                    "typed direct constructor call has invalid owner type ref".to_string()
+                })?;
+            let target_function = direct_call_target_function(emit_ctx, specialization.function_id)
+                .ok_or_else(|| {
+                    format!(
+                        "typed direct constructor call target {:?} is unavailable",
+                        specialization.function_id
+                    )
+                })?;
+            emit_typed_direct_constructor_resolved_with_args_from_local_env(
+                fb,
+                callable,
+                callable_is_borrowed,
+                arg_refs.as_slice(),
+                &specialization,
+                target_function,
+                local_env,
+                emit_ctx,
+                codegen_env,
+                func_imports,
+            )?
+        }
+    };
+    Ok(emit_owned_pyobject_result_for_demand(
+        fb,
+        result,
+        PyObjFacts::unknown(),
+        emit_ctx,
+        demand,
+    ))
+}
+
+fn emit_typed_codegen_direct_method_call_result_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    call: &TypedDirectMethodCall<InstrTyped>,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    demand: ResultDemand,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<EmitResult, String> {
+    let specialization = direct_method_specialization_from_typed_call(call)
+        .ok_or_else(|| "typed direct method call has invalid owner type ref".to_string())?;
+    let target_function = direct_call_target_function(emit_ctx, specialization.function_id)
         .ok_or_else(|| {
             format!(
-                "typed direct callable call target {:?} is unavailable",
-                call.guard.function_id
+                "typed direct method call target {:?} is unavailable",
+                specialization.function_id
             )
         })?;
-    let arg_plan = direct_call_arg_plan_from_typed(&call.guard.arg_plan);
-    let result = emit_typed_direct_call_resolved_with_arg_plan_from_local_env(
+    let (receiver, receiver_is_borrowed) = emit_typed_pyobject_input_with_local_env(
         fb,
-        callable,
-        callable_is_borrowed,
+        call.receiver.as_ref(),
+        local_env,
+        emit_ctx,
+        codegen_env,
+        func_imports,
+        "typed direct-method receiver",
+    )?;
+    let mut arg_refs = Vec::with_capacity(call.args.len());
+    for arg in &call.args {
+        let CallArgPositional::Positional(arg) = arg else {
+            return Err("typed direct method call does not support starred args".to_string());
+        };
+        arg_refs.push(arg);
+    }
+    let result = emit_typed_direct_method_resolved_with_args_from_local_env(
+        fb,
+        receiver,
+        receiver_is_borrowed,
         arg_refs.as_slice(),
-        &arg_plan,
+        &specialization,
         target_function,
         local_env,
         emit_ctx,
@@ -17618,7 +19248,9 @@ fn emit_typed_codegen_stmt_with_local_env(
             | InstrTyped::LegacyUnaryOp(_)
             | InstrTyped::CallTyped(_)
             | InstrTyped::GuardedCallableCallTyped(_)
+            | InstrTyped::GuardedMethodCallTyped(_)
             | InstrTyped::DirectCallableCallTyped(_)
+            | InstrTyped::DirectMethodCallTyped(_)
             | InstrTyped::DirectCallGuardTest(_)
     ) {
         return emit_typed_codegen_expr_with_local_env(
@@ -17632,7 +19264,7 @@ fn emit_typed_codegen_stmt_with_local_env(
         );
     }
 
-    let legacy_expr = typed_expr_to_codegen_fallback(expr.clone())?;
+    let legacy_expr = try_lower_typed_instr_to_codegen_legacy(expr.clone())?;
     Ok(emit_codegen_stmt_with_local_env(
         fb,
         &legacy_expr,
@@ -17684,6 +19316,19 @@ fn emit_typed_codegen_stmt_result_with_local_env(
             return Ok(result);
         }
     }
+    if let InstrTyped::GuardedMethodCallTyped(op) = expr {
+        if let Some(result) = emit_typed_codegen_guarded_method_call_result_with_local_env(
+            fb,
+            op,
+            local_env,
+            emit_ctx,
+            demand,
+            codegen_env,
+            func_imports,
+        )? {
+            return Ok(result);
+        }
+    }
     if let InstrTyped::DirectCallableCallTyped(op) = expr {
         return emit_typed_codegen_direct_callable_call_result_with_local_env(
             fb,
@@ -17695,11 +19340,23 @@ fn emit_typed_codegen_stmt_result_with_local_env(
             func_imports,
         );
     }
+    if let InstrTyped::DirectMethodCallTyped(op) = expr {
+        return emit_typed_codegen_direct_method_call_result_with_local_env(
+            fb,
+            op,
+            local_env,
+            emit_ctx,
+            demand,
+            codegen_env,
+            func_imports,
+        );
+    }
     if let InstrTyped::GetAttrTyped(op) = expr {
-        let result = if let TypedAttrAccessPlan::IndexedField { guards } = &op.access {
+        let result = if let TypedAttrAccessPlan::IndexedField { source, guards } = &op.access {
             emit_typed_indexed_getattr(
                 fb,
                 op,
+                *source,
                 guards,
                 local_env,
                 emit_ctx,
@@ -17744,10 +19401,11 @@ fn emit_typed_codegen_stmt_result_with_local_env(
         });
     }
     if let InstrTyped::SetAttrTyped(op) = expr {
-        if let TypedAttrAccessPlan::IndexedField { guards } = &op.access {
+        if let TypedAttrAccessPlan::IndexedField { source, guards } = &op.access {
             if let Some(result) = emit_typed_indexed_setattr(
                 fb,
                 op,
+                *source,
                 guards,
                 local_env,
                 emit_ctx,
@@ -17821,7 +19479,9 @@ fn emit_typed_codegen_stmt_result_with_local_env(
             | InstrTyped::BinOp(_)
             | InstrTyped::CallTyped(_)
             | InstrTyped::GuardedCallableCallTyped(_)
+            | InstrTyped::GuardedMethodCallTyped(_)
             | InstrTyped::DirectCallableCallTyped(_)
+            | InstrTyped::DirectMethodCallTyped(_)
             | InstrTyped::DirectCallGuardTest(_)
     ) {
         if demand == ResultDemand::I32_BOOL01 {
@@ -17868,7 +19528,7 @@ fn emit_typed_codegen_stmt_result_with_local_env(
         });
     }
 
-    let legacy_expr = typed_expr_to_codegen_fallback(expr.clone())?;
+    let legacy_expr = try_lower_typed_instr_to_codegen_legacy(expr.clone())?;
     emit_codegen_stmt_result_with_local_env(
         fb,
         &legacy_expr,
@@ -18910,7 +20570,7 @@ fn emit_typed_codegen_i64_index_result_with_local_env(
     func_imports: &mut FuncBuildImports<'_>,
     pyobject_to_i64_ref: ir::FuncRef,
 ) -> Result<EmitResult, String> {
-    if let Ok(legacy_expr) = typed_expr_to_codegen_fallback(expr.clone()) {
+    if let Ok(legacy_expr) = try_lower_typed_instr_to_codegen_legacy(expr.clone()) {
         let index_i64 = emit_branch_index_i64(
             fb,
             &legacy_expr,
@@ -20561,7 +22221,7 @@ fn emit_typed_codegen_term(
         );
     }
 
-    let legacy_term = typed_term_to_codegen_fallback(term.clone())?;
+    let legacy_term = try_lower_typed_term_to_codegen_legacy(term.clone())?;
     emit_codegen_term(
         fb,
         source_label,
@@ -23438,20 +25098,7 @@ fn precompile_codegen_module_to_object_bytes(
     let mut function_definitions =
         compile_runtime_support_clif_for_object(&mut jit_module, env_config, object_isa.as_ref())?;
 
-    let planned_inputs = planned_optimization_inputs_for_precompile(
-        optimization_plan,
-        module_index,
-        module_name,
-        source_hash,
-        module,
-    )?;
-    let mut module_for_codegen = module.clone();
-    specialize_field_access_counter_branches(
-        &mut module_for_codegen,
-        &planned_inputs.opt_v3_emitted_indexed_fields,
-    );
-
-    let module_constants = ModuleCodegenConstants::collect_from_module(&module_for_codegen);
+    let module_constants = ModuleCodegenConstants::collect_from_module(module);
     let module_constant_ptrs = placeholder_module_constant_ptrs(module_constants.len());
     let module_constant_symbol_prefix =
         module_constant_symbol_prefix_for_module_identity(module_name, source_hash);
@@ -23462,13 +25109,13 @@ fn precompile_codegen_module_to_object_bytes(
     )?;
 
     let (counter_slots_by_id, scalar_counter_count, top_value_counter_count) =
-        build_counter_storage_layout(module_for_codegen.counter_defs.as_slice())?;
+        build_counter_storage_layout(module.counter_defs.as_slice())?;
     let scalar_counter_data_id = if scalar_counter_count == 0 {
         None
     } else {
         Some(define_scalar_counter_storage_data(
             &mut jit_module,
-            &module_for_codegen,
+            module,
             scalar_counter_count,
         )?)
     };
@@ -23477,7 +25124,7 @@ fn precompile_codegen_module_to_object_bytes(
     } else {
         Some(define_top_value_counter_storage_data(
             &mut jit_module,
-            &module_for_codegen,
+            module,
             top_value_counter_count,
         )?)
     };
@@ -23527,7 +25174,7 @@ fn precompile_codegen_module_to_object_bytes(
     if let Some(data_id) = scalar_counter_data_id {
         data_definitions.push(ObjectDataDefinition {
             data_id,
-            symbol: scalar_counter_storage_symbol(&module_for_codegen),
+            symbol: scalar_counter_storage_symbol(module),
             binding: ElfSymbolBinding::Global,
             bytes: vec![
                 0;
@@ -23545,7 +25192,7 @@ fn precompile_codegen_module_to_object_bytes(
     if let Some(data_id) = top_value_counter_data_id {
         data_definitions.push(ObjectDataDefinition {
             data_id,
-            symbol: top_value_counter_storage_symbol(&module_for_codegen),
+            symbol: top_value_counter_storage_symbol(module),
             binding: ElfSymbolBinding::Global,
             bytes: vec![
                 0;
@@ -23561,16 +25208,23 @@ fn precompile_codegen_module_to_object_bytes(
         });
     }
 
+    let planned_inputs = planned_optimization_inputs_for_precompile(
+        optimization_plan,
+        module_index,
+        module_name,
+        source_hash,
+        module,
+    )?;
     let specialization_profile = SpecializationProfile::from_precompile(
         env_config,
         module_name,
         counter_dump_path,
-        planned_inputs.clone(),
+        planned_inputs,
     )?;
     let jit_module_plan = if specialization_profile.optimized_module.is_some() {
-        build_profiled_jit_module_plan(&module_for_codegen, &specialization_profile)?
+        build_profiled_jit_module_plan(module, &specialization_profile)?
     } else {
-        build_jit_module_plan(&module_for_codegen)?
+        build_jit_module_plan(module)?
     };
     let planned_module = jit_module_plan.module.as_ref();
     let external_direct_call_target_functions = precompile_external_direct_call_target_functions(
@@ -24062,6 +25716,8 @@ fn prepare_specialized_typed_function(
     _module: &BlockPyModule<CodegenModuleShape>,
     function: &BlockPyFunction<CodegenModuleShape>,
     value_facts: &FactStore,
+    field_index_specializations: &HashMap<String, Vec<FieldIndexSpecialization>>,
+    field_index_specializations_by_instr: &HashMap<InstrId, Vec<FieldIndexSpecialization>>,
     opt_v3_indexed_fields_by_instr: &HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>,
     specialize_field_stores: bool,
     opt_v3_call_emissions: &TypedCallEmissionPlans,
@@ -24073,6 +25729,8 @@ fn prepare_specialized_typed_function(
 
     annotate_typed_attr_accesses(
         &mut typed_function,
+        field_index_specializations,
+        field_index_specializations_by_instr,
         opt_v3_indexed_fields_by_instr,
         specialize_field_stores,
     )?;
@@ -24097,7 +25755,9 @@ fn instr_typed_variant_name(expr: &InstrTyped) -> &'static str {
         InstrTyped::LegacyCalleeFunctionId(_) => "LegacyCalleeFunctionId",
         InstrTyped::CallTyped(_) => "CallTyped",
         InstrTyped::GuardedCallableCallTyped(_) => "GuardedCallableCallTyped",
+        InstrTyped::GuardedMethodCallTyped(_) => "GuardedMethodCallTyped",
         InstrTyped::DirectCallableCallTyped(_) => "DirectCallableCallTyped",
+        InstrTyped::DirectMethodCallTyped(_) => "DirectMethodCallTyped",
         InstrTyped::DirectCallGuardTest(_) => "DirectCallGuardTest",
         InstrTyped::LegacyCall(_) => "LegacyCall",
         InstrTyped::LegacyCallDirect(_) => "LegacyCallDirect",
@@ -24378,6 +26038,9 @@ fn build_cranelift_run_bb_specialized_function(
     };
     let opt_v3_call_emissions = specialization_inputs.opt_v3_call_emissions;
     let opt_v3_exact_list_items_by_instr = specialization_inputs.opt_v3_exact_list_items_by_instr;
+    let field_index_specializations = specialization_inputs.field_index_specializations;
+    let field_index_specializations_by_instr =
+        specialization_inputs.field_index_specializations_by_instr;
     let opt_v3_indexed_fields_by_instr = specialization_inputs.opt_v3_indexed_fields_by_instr;
     let opt_v3_indexed_globals_by_instr = specialization_inputs.opt_v3_indexed_globals_by_instr;
     let cold_block_labels = specialization_inputs.cold_block_labels;
@@ -24420,6 +26083,8 @@ fn build_cranelift_run_bb_specialized_function(
         module,
         function,
         value_facts,
+        &field_index_specializations,
+        &field_index_specializations_by_instr,
         &opt_v3_indexed_fields_by_instr,
         behavior_change_indexed_stores,
         &opt_v3_call_emissions,
@@ -24663,6 +26328,16 @@ fn build_cranelift_run_bb_specialized_function(
             codegen_env,
             &mut fb.func,
             &DP_JIT_DIRECT_COMPILE_FUNCTION_ENV_IMPORT,
+        );
+        let pytype_generic_alloc_ref = func_imports.get_or_panic(
+            codegen_env,
+            &mut fb.func,
+            &DP_JIT_PYTYPE_GENERIC_ALLOC_IMPORT,
+        );
+        let finish_constructor_init_ref = func_imports.get_or_panic(
+            codegen_env,
+            &mut fb.func,
+            &DP_JIT_FINISH_CONSTRUCTOR_INIT_IMPORT,
         );
         let load_global_fast_ref =
             func_imports.get_or_panic(codegen_env, &mut fb.func, &SOAC_RUNTIME_LOAD_GLOBAL_IMPORT);
@@ -24964,6 +26639,8 @@ fn build_cranelift_run_bb_specialized_function(
                 decref_ref,
                 py_call_positional_three_ref,
                 py_vectorcall_ref,
+                pytype_generic_alloc_ref,
+                finish_constructor_init_ref,
                 consts: JitEmitConsts {
                     step_null_block: fast_step_null_block,
                     step_null_args: fast_step_null_args,
@@ -25037,12 +26714,14 @@ fn build_cranelift_run_bb_specialized_function(
                 field_generic_setattr_counter_ids: &field_generic_setattr_counter_ids,
                 deopt_entry_guard_miss_counter_ids: &deopt_entry_guard_miss_counter_ids,
                 branch_outcome_counter_ids: &branch_outcome_counter_ids,
+                field_index_specializations_by_instr: &field_index_specializations_by_instr,
                 behavior_change_indexed_stores,
                 allow_local_only_slot_backed_stores: true,
                 exception_forwarded_local_names: exc_dispatches[index]
                     .as_ref()
                     .map(|dispatch| dispatch.forwarded_local_names.as_slice()),
                 type_ptr_data_ids: RefCell::new(HashMap::new()),
+                callable_ptr_data_ids: RefCell::new(HashMap::new()),
             };
             debug_assert!(
                 emit_ctx
@@ -25483,6 +27162,8 @@ pub unsafe fn render_instr_typed_for_codegen_with_runtime_state(
         render_module,
         render_function,
         &jit_module_plan.value_facts,
+        &specialization_inputs.field_index_specializations,
+        &specialization_inputs.field_index_specializations_by_instr,
         &specialization_inputs.opt_v3_indexed_fields_by_instr,
         specialization_inputs.behavior_change_indexed_stores,
         &specialization_inputs.opt_v3_call_emissions,

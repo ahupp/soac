@@ -1,30 +1,30 @@
-use crate::block_py::PrettyPrint;
-use crate::block_py::{
-    instr_any, Block, BlockPyFunction, BlockPyModule, BlockTerm, HasMeta, InstrCodegen,
-    InstrCodegenOp, InstrId, InstrResolved, Literal, LocalLocation, NameLike, NameLocation,
-    RuntimeFunctionId,
+use crate::passes::{CodegenModuleShape, InstrCodegen, InstrCodegenOp, InstrResolved};
+use soac_core::block_py::PrettyPrint;
+use soac_core::block_py::{
+    Block, BlockPyFunction, BlockPyModule, BlockTerm, HasMeta, InstrId, LocalLocation, NameLike,
+    NameLocation, RuntimeFunctionId, instr_any,
 };
-use crate::CodegenModuleShape;
+use soac_lowering::block_py::literal::Literal;
 use std::collections::{HashMap, HashSet};
 
 #[derive(
     Clone, Debug, Default, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
 )]
 pub struct EscapeSummaryModule {
-    pub functions: HashMap<crate::block_py::RuntimeFunctionId, FunctionEscapeSummary>,
+    pub functions: HashMap<soac_core::block_py::RuntimeFunctionId, FunctionEscapeSummary>,
 }
 
 impl EscapeSummaryModule {
     pub fn function(
         &self,
-        function_id: crate::block_py::RuntimeFunctionId,
+        function_id: soac_core::block_py::RuntimeFunctionId,
     ) -> Option<&FunctionEscapeSummary> {
         self.functions.get(&function_id)
     }
 
     pub fn non_escaping_constructor(
         &self,
-        function_id: crate::block_py::RuntimeFunctionId,
+        function_id: soac_core::block_py::RuntimeFunctionId,
     ) -> Option<&NonEscapingConstructorSummary> {
         self.function(function_id)
             .and_then(|summary| summary.non_escaping_constructor.as_ref())
@@ -32,7 +32,7 @@ impl EscapeSummaryModule {
 
     pub fn straightline_field_initializer(
         &self,
-        function_id: crate::block_py::RuntimeFunctionId,
+        function_id: soac_core::block_py::RuntimeFunctionId,
     ) -> Option<&FieldInitializerConstructorSummary> {
         self.function(function_id)
             .and_then(|summary| summary.straightline_field_initializer.as_ref())
@@ -40,7 +40,8 @@ impl EscapeSummaryModule {
 
     pub fn remap_function_ids(
         &mut self,
-        remap: impl Fn(crate::block_py::RuntimeFunctionId) -> crate::block_py::RuntimeFunctionId + Copy,
+        remap: impl Fn(soac_core::block_py::RuntimeFunctionId) -> soac_core::block_py::RuntimeFunctionId
+        + Copy,
     ) {
         self.functions = std::mem::take(&mut self.functions)
             .into_iter()
@@ -53,7 +54,7 @@ impl EscapeSummaryModule {
 }
 
 impl PrettyPrint for EscapeSummaryModule {
-    fn fmt_pretty(&self, printer: &mut crate::block_py::PrettyPrinter<'_>) -> std::fmt::Result {
+    fn fmt_pretty(&self, printer: &mut soac_core::block_py::PrettyPrinter<'_>) -> std::fmt::Result {
         let mut function_ids = self.functions.keys().copied().collect::<Vec<_>>();
         function_ids.sort_by_key(|function_id| function_id.to_packed_runtime_u64());
         let mut out = String::new();
@@ -138,7 +139,8 @@ pub struct FunctionEscapeSummary {
 impl FunctionEscapeSummary {
     fn remap_function_ids(
         &mut self,
-        remap: impl Fn(crate::block_py::RuntimeFunctionId) -> crate::block_py::RuntimeFunctionId + Copy,
+        remap: impl Fn(soac_core::block_py::RuntimeFunctionId) -> soac_core::block_py::RuntimeFunctionId
+        + Copy,
     ) {
         for allocation in &mut self.non_escaping_constructor_allocations {
             allocation.constructor_function_id = remap(allocation.constructor_function_id);
@@ -290,8 +292,8 @@ fn summarize_constructor_allocation_uses_in_block(
     call_instr_id: Option<InstrId>,
     remaining_body: &[InstrCodegen],
     term: &BlockTerm<InstrCodegen>,
-    block_by_label: &HashMap<crate::block_py::BlockLabel, &Block<InstrCodegen>>,
-    normal_predecessor_counts: &HashMap<crate::block_py::BlockLabel, usize>,
+    block_by_label: &HashMap<soac_core::block_py::BlockLabel, &Block<InstrCodegen>>,
+    normal_predecessor_counts: &HashMap<soac_core::block_py::BlockLabel, usize>,
 ) -> Option<NonEscapingConstructorAllocationSummary> {
     let mut summary = NonEscapingConstructorAllocationSummary {
         local_name,
@@ -380,7 +382,7 @@ fn summarize_constructor_allocation_uses_in_block(
 
 fn normal_predecessor_counts(
     function: &BlockPyFunction<CodegenModuleShape>,
-) -> HashMap<crate::block_py::BlockLabel, usize> {
+) -> HashMap<soac_core::block_py::BlockLabel, usize> {
     let mut counts = HashMap::new();
     for block in &function.blocks {
         match &block.term {
@@ -932,11 +934,11 @@ fn instr_uses_self(instr: &InstrCodegen, self_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block_py::ModuleNameGen;
-    use crate::block_py::{CallArgPositional, CallDirect};
-    use crate::{
-        lower_python_to_blockpy_for_testing, lower_python_to_blockpy_recorded_with_options,
-        LoweringOptions,
+    use soac_core::block_py::ModuleNameGen;
+    use soac_core::block_py::{CallArgPositional, CallDirect};
+    use soac_lowering::{
+        LoweringOptions, lower_python_to_blockpy_for_testing,
+        lower_python_to_blockpy_recorded_with_options,
     };
 
     fn lowered(source: &str) -> BlockPyModule<CodegenModuleShape> {
@@ -1112,9 +1114,11 @@ class Box:
 "#,
         );
         let function = function_by_qualname(&module, "Box.__init__");
-        assert!(summarize_module_escapes(&module)
-            .non_escaping_constructor(function.function_id)
-            .is_none());
+        assert!(
+            summarize_module_escapes(&module)
+                .non_escaping_constructor(function.function_id)
+                .is_none()
+        );
     }
 
     #[test]
@@ -1130,12 +1134,16 @@ class Box:
         );
         let function = function_by_qualname(&module, "Box.__init__");
         let escapes = summarize_module_escapes(&module);
-        assert!(escapes
-            .non_escaping_constructor(function.function_id)
-            .is_some());
-        assert!(escapes
-            .straightline_field_initializer(function.function_id)
-            .is_none());
+        assert!(
+            escapes
+                .non_escaping_constructor(function.function_id)
+                .is_some()
+        );
+        assert!(
+            escapes
+                .straightline_field_initializer(function.function_id)
+                .is_none()
+        );
     }
 
     #[test]
@@ -1149,9 +1157,11 @@ class Box:
 "#,
         );
         let function = function_by_qualname(&module, "Box.__init__");
-        assert!(summarize_module_escapes(&module)
-            .non_escaping_constructor(function.function_id)
-            .is_none());
+        assert!(
+            summarize_module_escapes(&module)
+                .non_escaping_constructor(function.function_id)
+                .is_none()
+        );
     }
 
     #[test]
@@ -1205,10 +1215,12 @@ def make(x):
 
         let escapes = summarize_module_escapes(&module);
 
-        assert!(escapes
-            .function(make_id)
-            .expect("make should have an escape summary")
-            .non_escaping_constructor_allocations
-            .is_empty());
+        assert!(
+            escapes
+                .function(make_id)
+                .expect("make should have an escape summary")
+                .non_escaping_constructor_allocations
+                .is_empty()
+        );
     }
 }

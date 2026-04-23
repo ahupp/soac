@@ -3,7 +3,7 @@ use pyo3::types::PyModule;
 use soac_core::block_py::FunctionKind;
 use soac_driver::codegen_cache::hash_module_source;
 use soac_jit::{module_type::indexed_module_info, plan_jit_module_locals};
-use soac_lowering::passes::infer_module_value_facts;
+use soac_opt::passes::infer_module_value_facts;
 use std::any::Any;
 use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};

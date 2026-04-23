@@ -1,8 +1,5 @@
 use crate::call_emission_v3::{ResolvedV3DirectCallPlan, inline_direct_call_targets};
-use soac_core::block_py::{
-    BlockLabel, BlockPyFunction, BlockPyModule, InstrId, RuntimeFunctionId, VisitMut,
-};
-use soac_lowering::passes::{
+use crate::passes::{
     CodegenModuleShape, DirectCallStoreRewriteStats, InlineCallee, InlinePlanModule,
     InlineRewriteStats, InstrCodegen, InstrResolved, ScalarReplacementStats,
     inline_direct_call_stores_with_callees, plan_module_inlining,
@@ -10,6 +7,9 @@ use soac_lowering::passes::{
     rewrite_profiled_function_call_store_sites_with_constructor_targets,
     scalar_replace_non_escaping_constructor_allocations, summarize_module_escapes,
     validate_codegen_instr_ids,
+};
+use soac_core::block_py::{
+    BlockLabel, BlockPyFunction, BlockPyModule, InstrId, RuntimeFunctionId, VisitMut,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -319,12 +319,12 @@ fn normalize_function_block_labels_dense(function: &mut BlockPyFunction<CodegenM
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::passes::{
+        TypedDirectCallArgPlan, TypedDirectCallArgSource, validate_codegen_instr_ids,
+    };
     use crate::plan_v3::{CallBodyKind, CallBodyPlan, Cost};
     use soac_core::block_py::{ChildVisitable, HasSemanticInstrId, Visit};
     use soac_lowering::lower_python_to_blockpy_for_testing;
-    use soac_lowering::passes::{
-        InstrCodegen, TypedDirectCallArgPlan, TypedDirectCallArgSource, validate_codegen_instr_ids,
-    };
 
     fn lowered_module(source: &str) -> BlockPyModule<CodegenModuleShape> {
         lower_python_to_blockpy_for_testing(source)

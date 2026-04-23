@@ -13,8 +13,9 @@ use pyo3::ffi;
 use soac_core::block_py::{
     HasSemanticInstrId, Instr, InstrId, NameLike, NameLocation, ResolvedName,
 };
-use soac_lowering::passes::{InstrCodegen, InstrTyped, PyObjFacts};
+use soac_lowering::passes::InstrCodegen;
 use soac_opt::operator_specialization::{BINARY_RHS_TAG_SHIFT, ExactTypeTag};
+use soac_opt::passes::{InstrTyped, PyObjFacts};
 use std::mem::offset_of;
 
 const PY_LONG_SIGN_MASK: i64 = 3;
@@ -1422,6 +1423,7 @@ pub(super) fn emit_operation<'fb>(
         InstrCodegen::Call(_) => None,
         InstrCodegen::CallDirect(_) => None,
         InstrCodegen::DirectCallableCall(_) => None,
+        InstrCodegen::DirectMethodCall(_) => None,
         InstrCodegen::BinOp(op) => Some(emit_counted_binop(op, state)),
         InstrCodegen::UnaryOp(op) => Some(emit_unary_op(op.kind, state, &[op.operand.as_ref()])),
         InstrCodegen::GetAttr(op) => {

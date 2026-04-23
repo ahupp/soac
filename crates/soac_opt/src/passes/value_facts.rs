@@ -1,9 +1,9 @@
-use crate::block_py::{
+use crate::passes::{CodegenModuleShape, InstrCodegen, InstrResolved};
+use soac_core::block_py::{
     BinOpKind, Block, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, ChildVisitable,
-    HasSemanticInstrId, InstrCodegen, InstrKey, InstrResolved, Literal, LocalLocation, NameLike,
-    NumberLiteralValue, RuntimeFunctionId, UnaryOpKind, Visit,
+    HasSemanticInstrId, InstrKey, LocalLocation, NameLike, RuntimeFunctionId, UnaryOpKind, Visit,
 };
-use crate::passes::CodegenModuleShape;
+use soac_lowering::block_py::literal::{Literal, NumberLiteralValue};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -518,10 +518,9 @@ impl FunctionFactInferer<'_> {
             }
             InstrCodegen::Call(op) => {
                 if op.keywords.is_empty()
-                    && op
-                        .args
-                        .iter()
-                        .all(|arg| matches!(arg, crate::block_py::CallArgPositional::Positional(_)))
+                    && op.args.iter().all(|arg| {
+                        matches!(arg, soac_core::block_py::CallArgPositional::Positional(_))
+                    })
                 {
                     self.infer_expr_facts(op.func.as_ref())
                         .runtime_helper()
@@ -533,10 +532,9 @@ impl FunctionFactInferer<'_> {
             }
             InstrCodegen::CallDirect(op) => {
                 if op.keywords.is_empty()
-                    && op
-                        .args
-                        .iter()
-                        .all(|arg| matches!(arg, crate::block_py::CallArgPositional::Positional(_)))
+                    && op.args.iter().all(|arg| {
+                        matches!(arg, soac_core::block_py::CallArgPositional::Positional(_))
+                    })
                 {
                     self.infer_expr_facts(op.callable.as_ref())
                         .runtime_helper()
@@ -645,7 +643,7 @@ impl FunctionFactInferer<'_> {
 
     fn infer_if_edge_facts(
         &self,
-        if_term: &crate::block_py::TermIf<InstrCodegen>,
+        if_term: &soac_core::block_py::TermIf<InstrCodegen>,
         exit: &EnvFacts,
     ) -> (EnvFacts, EnvFacts) {
         let Some((location, then_fact, else_fact)) = self.infer_branch_local_fact(&if_term.test)
@@ -722,7 +720,7 @@ impl Visit<InstrCodegen> for FunctionFactInferer<'_> {
             let facts = self.infer_expr_facts(expr);
             self.store.expr_facts.insert(key, facts);
         }
-        crate::block_py::walk_expr(self, expr);
+        soac_core::block_py::walk_expr(self, expr);
     }
 }
 
@@ -958,19 +956,19 @@ pub fn infer_module_value_facts(module: &BlockPyModule<CodegenModuleShape>) -> F
 #[cfg(test)]
 mod test {
     use super::{
-        infer_module_value_facts, BoolSingletonFact, CallableFact, EnvFacts, ProvenanceFact,
-        PyExactType, PyObjFacts, RefcountFact, RuntimeHelperId, ThrowSpec, ValueFacts,
+        BoolSingletonFact, CallableFact, EnvFacts, ProvenanceFact, PyExactType, PyObjFacts,
+        RefcountFact, RuntimeHelperId, ThrowSpec, ValueFacts, infer_module_value_facts,
     };
-    use crate::block_py::{
+    use soac_core::block_py::{
         BlockTerm, CallArgPositional, CallDirect, ChildVisitable, HasMeta, HasSemanticInstrId,
-        InstrCodegen, Load, NameLocation, ResolvedName, RuntimeFunctionId, RuntimeName, Visit,
-        WithMeta,
+        Load, NameLocation, ResolvedName, RuntimeFunctionId, RuntimeName, Visit, WithMeta,
     };
-    use crate::lower_python_to_blockpy_for_testing;
+    use soac_lowering::lower_python_to_blockpy_for_testing;
+    use soac_lowering::passes::InstrCodegen;
 
     struct ReturnExprFinder {
-        key: Option<crate::block_py::InstrKey>,
-        function_id: crate::block_py::RuntimeFunctionId,
+        key: Option<soac_core::block_py::InstrKey>,
+        function_id: soac_core::block_py::RuntimeFunctionId,
     }
 
     impl Visit<InstrCodegen> for ReturnExprFinder {
@@ -984,8 +982,8 @@ mod test {
     }
 
     struct FirstMatchingInstrFinder {
-        key: Option<crate::block_py::InstrKey>,
-        function_id: crate::block_py::RuntimeFunctionId,
+        key: Option<soac_core::block_py::InstrKey>,
+        function_id: soac_core::block_py::RuntimeFunctionId,
         matches: fn(&InstrCodegen) -> bool,
     }
 
@@ -1088,7 +1086,7 @@ def f(x):
             .stack_slots()
             .iter()
             .position(|name| name == "x")
-            .map(|slot| crate::block_py::LocalLocation(slot as u32))
+            .map(|slot| soac_core::block_py::LocalLocation(slot as u32))
             .expect("x should have a local slot");
         let block = function
             .blocks

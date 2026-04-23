@@ -1,13 +1,11 @@
 use crate::block_py::HasSemanticInstrId;
 use crate::block_py::{
     core_call_expr_with_meta, literal_expr, BlockPyFunction, BlockPyModule, BlockTerm,
-    CallArgPositional, ChildVisitable, CounterScope, CounterSite, DeoptEntrySource,
-    FunctionExecutionMode, IncrementCounter, InstrCodegen, InstrResolved, Load, Meta, NameLocation,
-    ResolvedName, RuntimeName, StringLiteral, Tuple, Visit, WithMeta,
+    CallArgPositional, ChildVisitable, CounterScope, CounterSite, FunctionExecutionMode,
+    IncrementCounter, InstrCodegen, InstrResolved, Load, Meta, NameLocation, ResolvedName,
+    RuntimeName, StringLiteral, Tuple, Visit, WithMeta,
 };
-use crate::passes::{
-    CodegenModuleShape, CounterBuilder, LocalEnvResumeModulePlan, LocalEnvResumePoint,
-};
+use crate::passes::{CodegenModuleShape, CounterBuilder};
 use soac_config::{SoacEnvConfig, SpecializationMode};
 use std::collections::HashMap;
 
@@ -192,42 +190,6 @@ pub fn instrument_bb_module_with_refcount_counters(
         }
     }
     Ok(())
-}
-
-pub fn define_bb_module_deopt_entry_counters(
-    module: &mut BlockPyModule<CodegenModuleShape>,
-    resume_plan: &LocalEnvResumeModulePlan,
-) {
-    let mut counters = CounterBuilder::new(&mut module.counter_defs);
-    for function in functions_with_counter_instrumentation(&module.callable_defs) {
-        let Some(function_plan) = resume_plan.function(function.function_id) else {
-            continue;
-        };
-        for entry in &function_plan.entries {
-            counters.define_if_missing(
-                CounterScope::This,
-                "deopt_entry_guard_miss",
-                CounterSite::DeoptEntry {
-                    function_id: function.function_id,
-                    source: deopt_entry_source_for_resume_point(entry.point),
-                },
-            );
-        }
-    }
-}
-
-fn deopt_entry_source_for_resume_point(point: LocalEnvResumePoint) -> DeoptEntrySource {
-    match point {
-        LocalEnvResumePoint::BlockEntry { block, .. } => {
-            DeoptEntrySource::BlockEntry { block_label: block }
-        }
-        LocalEnvResumePoint::BeforeInstr { key } => DeoptEntrySource::BeforeInstr {
-            instr_id: key.instr_id,
-        },
-        LocalEnvResumePoint::BeforeTerm { block, .. } => {
-            DeoptEntrySource::BeforeTerm { block_label: block }
-        }
-    }
 }
 
 pub fn instrument_bb_module_with_global_load_counters(

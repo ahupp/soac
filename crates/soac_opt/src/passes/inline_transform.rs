@@ -1,14 +1,15 @@
-use crate::block_py::{
-    instr_any, Block, BlockArg, BlockEdge, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm,
-    CallArgPositional, CallDirect, HasMeta, InstrCodegen, Literal, LocalLocation, MapInstr,
-    Mappable, NameLocation, ParamKind, ResolvedName, RuntimeFunctionId, RuntimeName, Store,
-    TryMapInstr, TryMapTerm, WithMeta,
-};
 use crate::passes::{
-    allocate_codegen_stack_temp, plan_module_inlining, reassign_codegen_function_instr_ids,
-    summarize_module_escapes, try_allocate_codegen_stack_temp, CodegenModuleShape,
-    ConstructorFieldValue, InlinePlanModule, InstrCodegenOp, InstrResolved,
+    CodegenModuleShape, ConstructorFieldValue, InlinePlanModule, InstrCodegen, InstrCodegenOp,
+    InstrResolved, allocate_codegen_stack_temp, plan_module_inlining,
+    reassign_codegen_function_instr_ids, summarize_module_escapes, try_allocate_codegen_stack_temp,
 };
+use soac_core::block_py::{
+    Block, BlockArg, BlockEdge, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm,
+    CallArgPositional, CallDirect, HasMeta, LocalLocation, MapInstr, Mappable, NameLocation,
+    ParamKind, ResolvedName, RuntimeFunctionId, RuntimeName, Store, TryMapInstr, TryMapTerm,
+    WithMeta, instr_any,
+};
+use soac_lowering::block_py::literal::Literal;
 use std::collections::{HashMap, HashSet};
 
 pub const DEFAULT_INLINE_SCALAR_FIXED_POINT_ITERATIONS: usize = 4;
@@ -1681,7 +1682,7 @@ fn scalar_initializer_for_field(
             };
             let arg = arg_locals.get(call_arg_index)?;
             Some(clear_codegen_instr_id(
-                crate::block_py::Load::new(arg.local.resolved_name()).into(),
+                soac_core::block_py::Load::new(arg.local.resolved_name()).into(),
             ))
         }
         ConstructorFieldValue::Local { .. }
@@ -1734,7 +1735,7 @@ fn rewrite_scalarized_instr_root(
             let field_name = constant_string_from_constants(constants, &getattr.attr)?;
             let field = allocation.fields.get(field_name.as_str())?;
             Some(clear_codegen_instr_id(
-                crate::block_py::Load::new(field.resolved_name()).into(),
+                soac_core::block_py::Load::new(field.resolved_name()).into(),
             ))
         }
         InstrCodegenOp::SetAttr(setattr)
@@ -1758,7 +1759,8 @@ fn rewrite_scalarized_instr_root(
             }
             let field_name = constant_string_from_constants(constants, &getattr.attr)?;
             let field = allocation.fields.get(field_name.as_str())?;
-            let field_load: InstrCodegen = crate::block_py::Load::new(field.resolved_name()).into();
+            let field_load: InstrCodegen =
+                soac_core::block_py::Load::new(field.resolved_name()).into();
             let meta = store.meta();
             Some(clear_codegen_instr_id(
                 Store::new(store.name, field_load).with_meta(meta).into(),
@@ -1814,7 +1816,7 @@ fn rewrite_scalarized_term(
             let field_name = constant_string_from_constants(constants, &getattr.attr)?;
             let field = allocation.fields.get(field_name.as_str())?;
             Some(BlockTerm::Return(clear_codegen_instr_id(
-                crate::block_py::Load::new(field.resolved_name()).into(),
+                soac_core::block_py::Load::new(field.resolved_name()).into(),
             )))
         }
         BlockTerm::IfTerm(term) => {
@@ -2661,6 +2663,9 @@ impl TryMapInstr<InstrCodegen, InstrCodegen, InlineUnsupportedReason>
             InstrCodegenOp::DirectCallableCall(op) => {
                 InstrCodegenOp::DirectCallableCall(op.try_map_children(self)?)
             }
+            InstrCodegenOp::DirectMethodCall(op) => {
+                InstrCodegenOp::DirectMethodCall(op.try_map_children(self)?)
+            }
             InstrCodegenOp::GetAttr(op) => InstrCodegenOp::GetAttr(op.try_map_children(self)?),
             InstrCodegenOp::SetAttr(op) => InstrCodegenOp::SetAttr(op.try_map_children(self)?),
             InstrCodegenOp::GetItem(op) => InstrCodegenOp::GetItem(op.try_map_children(self)?),
@@ -2765,6 +2770,9 @@ impl MapInstr<InstrCodegen, InstrCodegen> for InstrIdScrubber {
             InstrCodegenOp::DirectCallableCall(op) => {
                 InstrCodegenOp::DirectCallableCall(op.map_children(self))
             }
+            InstrCodegenOp::DirectMethodCall(op) => {
+                InstrCodegenOp::DirectMethodCall(op.map_children(self))
+            }
             InstrCodegenOp::GetAttr(op) => InstrCodegenOp::GetAttr(op.map_children(self)),
             InstrCodegenOp::SetAttr(op) => InstrCodegenOp::SetAttr(op.map_children(self)),
             InstrCodegenOp::GetItem(op) => InstrCodegenOp::GetItem(op.map_children(self)),
@@ -2791,14 +2799,16 @@ impl MapInstr<InstrCodegen, InstrCodegen> for InstrIdScrubber {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block_py::{BlockParam, BlockParamRole, Call, CallDirect, InstrId, Load, NameLike};
-    use crate::lower_python_to_blockpy_for_testing;
     use crate::passes::{
         plan_module_inlining, summarize_module_escapes, validate_codegen_instr_ids,
     };
+    use soac_core::block_py::{
+        BlockParam, BlockParamRole, Call, CallDirect, InstrId, Load, NameLike,
+    };
+    use soac_lowering::lower_python_to_blockpy_for_testing;
 
     fn function_by_qualname<'a>(
-        module: &'a crate::block_py::BlockPyModule<CodegenModuleShape>,
+        module: &'a soac_core::block_py::BlockPyModule<CodegenModuleShape>,
         qualname: &str,
     ) -> &'a BlockPyFunction<CodegenModuleShape> {
         module
@@ -2809,7 +2819,7 @@ mod tests {
     }
 
     fn function_index_by_qualname(
-        module: &crate::block_py::BlockPyModule<CodegenModuleShape>,
+        module: &soac_core::block_py::BlockPyModule<CodegenModuleShape>,
         qualname: &str,
     ) -> usize {
         module
@@ -2866,7 +2876,7 @@ mod tests {
     }
 
     fn rewrite_first_store_call_to_direct(
-        module: &mut crate::block_py::BlockPyModule<CodegenModuleShape>,
+        module: &mut soac_core::block_py::BlockPyModule<CodegenModuleShape>,
         qualname: &str,
         function_id: RuntimeFunctionId,
     ) {
@@ -2921,11 +2931,13 @@ mod tests {
 
     #[test]
     fn runtime_name_match_looks_through_copied_module_constants() {
-        let constants = vec![Load::new(ResolvedName {
-            id: RuntimeName::StopIteration.name().to_string().into(),
-            location: NameLocation::RuntimeName(RuntimeName::StopIteration),
-        })
-        .into()];
+        let constants = vec![
+            Load::new(ResolvedName {
+                id: RuntimeName::StopIteration.name().to_string().into(),
+                location: NameLocation::RuntimeName(RuntimeName::StopIteration),
+            })
+            .into(),
+        ];
         let stop_iteration = Load::new(ResolvedName {
             id: "constant slot 0".to_string().into(),
             location: NameLocation::Constant(0),
@@ -2938,11 +2950,13 @@ mod tests {
     #[test]
     fn rewrites_static_runtime_constructor_calls_to_direct_calls() {
         let constructor_id = RuntimeFunctionId::from_raw_parts(42, 7);
-        let constants = vec![Load::new(ResolvedName {
-            id: RuntimeName::IterRange.name().to_string().into(),
-            location: NameLocation::RuntimeName(RuntimeName::IterRange),
-        })
-        .into()];
+        let constants = vec![
+            Load::new(ResolvedName {
+                id: RuntimeName::IterRange.name().to_string().into(),
+                location: NameLocation::RuntimeName(RuntimeName::IterRange),
+            })
+            .into(),
+        ];
         let target = ResolvedName {
             id: "out".to_string().into(),
             location: NameLocation::Local(LocalLocation(0)),
@@ -3221,10 +3235,12 @@ def caller(x, y):
         assert_eq!(fragment.blocks.len(), 1);
         assert_ne!(fragment.entry_label, callee.blocks[0].label);
         assert_eq!(fragment.blocks[0].label, fragment.entry_label);
-        assert!(fragment.blocks[0]
-            .body
-            .iter()
-            .all(|instr| instr.meta().instr_id.is_none()));
+        assert!(
+            fragment.blocks[0]
+                .body
+                .iter()
+                .all(|instr| instr.meta().instr_id.is_none())
+        );
         assert_eq!(
             caller
                 .storage_layout
@@ -3259,12 +3275,14 @@ def caller(x, y):
 
         for (callee_location, fresh) in &fragment.locals {
             assert_ne!(callee_location, &fresh.location);
-            assert!(caller
-                .storage_layout
-                .as_ref()
-                .unwrap()
-                .stack_slots()
-                .contains(&fresh.name));
+            assert!(
+                caller
+                    .storage_layout
+                    .as_ref()
+                    .unwrap()
+                    .stack_slots()
+                    .contains(&fresh.name)
+            );
         }
     }
 
@@ -3480,10 +3498,12 @@ def make(obj, x):
             .iter()
             .find(|block| block.label == edge.target)
             .expect("inline fragment should be inserted");
-        assert!(fragment
-            .body
-            .iter()
-            .any(|instr| matches!(instr, InstrCodegen::SetAttr(_))));
+        assert!(
+            fragment
+                .body
+                .iter()
+                .any(|instr| matches!(instr, InstrCodegen::SetAttr(_)))
+        );
         let BlockTerm::Jump(edge) = &fragment.term else {
             panic!("inline fragment should jump to continuation");
         };
@@ -3605,14 +3625,17 @@ def make(x):
         );
         validate_codegen_instr_ids(&module).expect("rewritten module should have valid instr ids");
         let make = function_by_qualname(&module, "make");
-        assert!(!make.blocks[0]
-            .body
-            .iter()
-            .any(|instr| matches!(instr, InstrCodegen::CallDirect(_))));
-        assert!(!make.blocks[0]
-            .body
-            .iter()
-            .any(|instr| { matches!(instr, InstrCodegen::GetAttr(_) | InstrCodegen::SetAttr(_)) }));
+        assert!(
+            !make.blocks[0]
+                .body
+                .iter()
+                .any(|instr| matches!(instr, InstrCodegen::CallDirect(_)))
+        );
+        assert!(
+            !make.blocks[0].body.iter().any(|instr| {
+                matches!(instr, InstrCodegen::GetAttr(_) | InstrCodegen::SetAttr(_))
+            })
+        );
         assert!(make.blocks[0].body.iter().any(|instr| {
             matches!(
                 instr,
@@ -3712,16 +3735,20 @@ def make(x):
         );
         validate_codegen_instr_ids(&module).expect("rewritten module should have valid instr ids");
         let make = function_by_qualname(&module, "make");
-        assert!(!make
-            .blocks
-            .iter()
-            .flat_map(|block| block.body.iter())
-            .any(|instr| matches!(instr, InstrCodegen::CallDirect(_))));
-        assert!(!make
-            .blocks
-            .iter()
-            .flat_map(|block| block.body.iter())
-            .any(|instr| matches!(instr, InstrCodegen::GetAttr(_) | InstrCodegen::SetAttr(_))));
+        assert!(
+            !make
+                .blocks
+                .iter()
+                .flat_map(|block| block.body.iter())
+                .any(|instr| matches!(instr, InstrCodegen::CallDirect(_)))
+        );
+        assert!(
+            !make
+                .blocks
+                .iter()
+                .flat_map(|block| block.body.iter())
+                .any(|instr| matches!(instr, InstrCodegen::GetAttr(_) | InstrCodegen::SetAttr(_)))
+        );
         assert!(matches!(
             &make.blocks[1].term,
             BlockTerm::Return(InstrCodegen::Load(load))
@@ -3791,16 +3818,23 @@ def make(x, cond):
         );
         validate_codegen_instr_ids(&module).expect("rewritten module should have valid instr ids");
         let make = function_by_qualname(&module, "make");
-        assert!(!make
-            .blocks
-            .iter()
-            .flat_map(|block| block.body.iter())
-            .any(|instr| instr_any(instr, |child| matches!(child, InstrCodegen::CallDirect(_)))));
-        assert!(!make
-            .blocks
-            .iter()
-            .flat_map(|block| block.body.iter())
-            .any(|instr| matches!(instr, InstrCodegen::GetAttr(_) | InstrCodegen::SetAttr(_))));
+        assert!(
+            !make
+                .blocks
+                .iter()
+                .flat_map(|block| block.body.iter())
+                .any(|instr| instr_any(instr, |child| matches!(
+                    child,
+                    InstrCodegen::CallDirect(_)
+                )))
+        );
+        assert!(
+            !make
+                .blocks
+                .iter()
+                .flat_map(|block| block.body.iter())
+                .any(|instr| matches!(instr, InstrCodegen::GetAttr(_) | InstrCodegen::SetAttr(_)))
+        );
     }
 
     #[test]

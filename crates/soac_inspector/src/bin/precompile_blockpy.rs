@@ -567,9 +567,12 @@ mod test {
     use super::*;
     use soac_core::profile::{CounterDumpRecord, CounterDumpRow, parse_counter_dump_records};
     use soac_driver::codegen_cache::store_codegen_module_cache;
-    use soac_driver::{CodegenPreparationOptions, prepare_codegen_module_recorded_with_options};
-    use soac_opt::pipeline_v3::generate_optimization_plans_v3_for_cached_modules;
-    use soac_opt::plan::{CachedModuleOptimizationInput, ProfileEvidenceStore};
+    use soac_driver::{
+        CachedModuleOptimizationInput, CodegenPreparationOptions,
+        generate_optimization_plans_v3_for_cached_modules,
+        prepare_codegen_module_recorded_with_options,
+    };
+    use soac_opt::plan::ProfileEvidenceStore;
     use std::process::Stdio;
     use std::time::{SystemTime, UNIX_EPOCH};
 

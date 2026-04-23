@@ -20,9 +20,10 @@ use soac_jit::{
     render_instr_typed_for_codegen_with_runtime_state, render_jit_deopt_resume_module,
     render_jit_function_locals, render_jit_module_locals,
 };
-use soac_lowering::passes::{
-    CodegenModuleShape, infer_module_value_facts, plan_local_env_module,
-    plan_local_env_resume_module, render_local_env_function_plan, render_local_env_module_plan,
+use soac_lowering::passes::CodegenModuleShape;
+use soac_opt::passes::{
+    infer_module_value_facts, plan_local_env_module, plan_local_env_resume_module,
+    render_local_env_function_plan, render_local_env_module_plan,
     render_local_env_resume_function_plan, render_local_env_resume_module_plan,
 };
 use std::ffi::c_void;

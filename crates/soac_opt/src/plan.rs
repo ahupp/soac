@@ -6,8 +6,7 @@ use soac_core::profile::{
     CounterDumpFile, collect_module_key_layouts, collect_type_key_layouts, collect_type_table,
 };
 use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FunctionProfileEvidence {
@@ -423,70 +422,6 @@ impl ProfileEvidenceStore {
             }
         }
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CachedModuleOptimizationInput {
-    pub module_path: PathBuf,
-    pub strict: bool,
-}
-
-impl CachedModuleOptimizationInput {
-    pub fn new(module_path: PathBuf, strict: bool) -> Self {
-        Self {
-            module_path,
-            strict,
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ModuleOptimizationPlanReport {
-    pub output_path: PathBuf,
-    pub optimized_module_path: PathBuf,
-    pub module_name: String,
-    pub source_hash: u64,
-    pub function_count: usize,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct OptimizationPlanGenerationSummary {
-    pub reports: Vec<ModuleOptimizationPlanReport>,
-    pub skipped: usize,
-}
-
-impl OptimizationPlanGenerationSummary {
-    pub fn written(&self) -> usize {
-        self.reports.len()
-    }
-}
-
-pub fn cached_module_paths_under_root(root: &Path) -> Result<Vec<PathBuf>> {
-    let mut out = Vec::new();
-    collect_cached_module_paths(root, &mut out)?;
-    out.sort();
-    Ok(out)
-}
-
-fn collect_cached_module_paths(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-    let metadata = fs::metadata(path)
-        .with_context(|| format!("read module cache path metadata {}", path.display()))?;
-    if metadata.is_file() {
-        if path.file_name().and_then(|name| name.to_str()) == Some("mod.blockpy") {
-            out.push(path.to_path_buf());
-        }
-        return Ok(());
-    }
-    if !metadata.is_dir() {
-        return Ok(());
-    }
-    let entries = fs::read_dir(path)
-        .with_context(|| format!("read module cache directory {}", path.display()))?;
-    for entry in entries {
-        let entry = entry.with_context(|| format!("read entry in {}", path.display()))?;
-        collect_cached_module_paths(entry.path().as_path(), out)?;
-    }
-    Ok(())
 }
 
 fn push_observed_shape(

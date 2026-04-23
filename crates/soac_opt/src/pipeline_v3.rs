@@ -1,8 +1,5 @@
 use crate::alternatives_v3::AlternativeCatalog;
-use crate::artifacts_v3::{
-    ExactIntBranchV3Artifacts, single_function_optimization_artifacts_v3,
-    write_optimization_artifacts_v3,
-};
+use crate::artifacts_v3::{ExactIntBranchV3Artifacts, single_function_optimization_artifacts_v3};
 use crate::call_emission_v3::{ResolvedV3DirectCallPlan, direct_calls_for_function_from_artifacts};
 use crate::call_inlining_v3::{
     V3CallInliningProfile, V3ExternalInlineTarget, rewrite_v3_call_inlining_for_module,
@@ -12,10 +9,12 @@ use crate::evidence_v3::{
     PlannerFactHints, planner_fact_hints_from_module_constants_v3,
     planner_facts_from_profile_evidence_v3,
 };
-use crate::plan::{
-    CachedModuleOptimizationInput, FunctionProfileEvidence, ModuleOptimizationPlanReport,
-    OptimizationPlanGenerationSummary, ProfileEvidenceStore, cached_module_paths_under_root,
+use crate::passes::{
+    CodegenModuleShape, InlinePlanModule, InlineUnsupportedReason, InstrCodegen, InstrResolved,
+    bind_simple_direct_call_inline_args, build_direct_call_inline_fragment_to_target,
+    plan_module_inlining, summarize_module_escapes,
 };
+use crate::plan::{FunctionProfileEvidence, ProfileEvidenceStore};
 use crate::plan_v3::{
     DirectCallArgPlan, DirectCallArgSource, DirectCallSpecializationPlan,
     EXACT_LIST_EXACT_INT_ITEM_SHAPE_TAG, ExactListItemAccessKind, ExactListItemShape,
@@ -32,7 +31,7 @@ use crate::planner_v3::{
 use crate::region_v3::{
     RegionExtractionAttempt, RegionExtractionError, extract_function_regions_v3,
 };
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::Result;
 use soac_core::block_py::{
     BlockLabel, BlockPyFunction, BlockPyModule, Call, CallArgPositional, CallDirect,
     ChildVisitable, FunctionExecutionMode, HasSemanticInstrId, InstrId, LocalFunctionId,
@@ -40,19 +39,9 @@ use soac_core::block_py::{
     RuntimeFunctionId, RuntimeModuleId, SerializedFunctionDebugName, SerializedFunctionId,
     SerializedIdentityTables, SerializedModuleId, SerializedModuleIdentity, Visit,
 };
-use soac_driver::codegen_cache::{
-    CachedCodegenModule, CachedCodegenModuleMetadata, load_codegen_module_cache,
-    module_optimization_plan_v3_path, module_optimized_codegen_v3_path, store_codegen_module_cache,
-};
 use soac_lowering::block_py::literal::Literal;
-use soac_lowering::passes::{
-    CodegenModuleShape, InlinePlanModule, InlineUnsupportedReason, InstrCodegen, InstrResolved,
-    bind_simple_direct_call_inline_args, build_direct_call_inline_fragment_to_target,
-    plan_module_inlining, summarize_module_escapes,
-};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::path::Path;
 use std::sync::Arc;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -84,39 +73,64 @@ struct DirectCallTargetEntry {
     function: BlockPyFunction<CodegenModuleShape>,
 }
 
+#[derive(Clone, Debug)]
+pub struct ModuleOptimizationInput<'a> {
+    pub identity: ModulePlanIdentity,
+    pub module: &'a BlockPyModule<CodegenModuleShape>,
+    pub strict: bool,
+}
+
+impl<'a> ModuleOptimizationInput<'a> {
+    pub fn new(
+        identity: ModulePlanIdentity,
+        module: &'a BlockPyModule<CodegenModuleShape>,
+        strict: bool,
+    ) -> Self {
+        Self {
+            identity,
+            module,
+            strict,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct OptimizedModuleV3 {
+    pub identity: ModulePlanIdentity,
+    pub artifacts: ExactIntBranchV3Artifacts,
+    pub optimized_module: BlockPyModule<CodegenModuleShape>,
+}
+
+#[derive(Debug, Default)]
+pub struct OptimizeModulesV3Output {
+    pub modules: Vec<OptimizedModuleV3>,
+    pub skipped: usize,
+}
+
 impl DirectCallTargetIndex {
     fn from_current_module(
-        metadata: &CachedCodegenModuleMetadata,
+        identity: &ModulePlanIdentity,
         module: &BlockPyModule<CodegenModuleShape>,
     ) -> Self {
         let mut index = Self::default();
-        index.insert_module(metadata, module);
+        index.insert_module(identity, module);
         index
     }
 
-    fn from_cached_modules(
-        module_inputs: &[CachedModuleOptimizationInput],
-    ) -> Result<DirectCallTargetIndex> {
+    fn from_modules(module_inputs: &[ModuleOptimizationInput<'_>]) -> DirectCallTargetIndex {
         let mut index = DirectCallTargetIndex::default();
         for module_input in module_inputs {
-            let cache = load_codegen_module_cache(module_input.module_path.as_path())
-                .with_context(|| {
-                    format!(
-                        "load BlockPy module cache {} for optimizer v3 direct-call target index",
-                        module_input.module_path.display()
-                    )
-                })?;
-            index.insert_module(&cache.metadata, &cache.module);
+            index.insert_module(&module_input.identity, module_input.module);
         }
-        Ok(index)
+        index
     }
 
     fn insert_module(
         &mut self,
-        metadata: &CachedCodegenModuleMetadata,
+        identity: &ModulePlanIdentity,
         module: &BlockPyModule<CodegenModuleShape>,
     ) {
-        let content_id = ModuleContentId::new(metadata.module_name.clone(), metadata.source_hash);
+        let content_id = ModuleContentId::new(identity.module_name.clone(), identity.source_hash);
         let module_constants = Arc::new(module.module_constants.clone());
         let inline_plan = Arc::new(plan_module_inlining(&summarize_module_escapes(module)));
         for function in &module.callable_defs {
@@ -158,14 +172,14 @@ struct OptimizationPlanV3IdentityBuilder {
 }
 
 impl OptimizationPlanV3IdentityBuilder {
-    fn new(metadata: &CachedCodegenModuleMetadata) -> Self {
+    fn new(identity: &ModulePlanIdentity) -> Self {
         let mut builder = Self {
             tables: SerializedIdentityTables::default(),
             modules_by_content: HashMap::new(),
         };
         builder.intern_module(
-            ModuleContentId::new(metadata.module_name.clone(), metadata.source_hash),
-            Some(metadata.cache_identity.clone()),
+            ModuleContentId::new(identity.module_name.clone(), identity.source_hash),
+            Some(identity.cache_identity.clone()),
         );
         builder
     }
@@ -275,14 +289,14 @@ pub fn plan_and_emit_function_exact_int_branches_v3_with_module_constants(
 
 pub fn plan_and_emit_module_v3_from_raw_evidence(
     catalog: &AlternativeCatalog,
-    metadata: &CachedCodegenModuleMetadata,
+    module_identity: ModulePlanIdentity,
     lowered_module: &BlockPyModule<CodegenModuleShape>,
     evidence_store: &ProfileEvidenceStore,
 ) -> Result<ExactIntBranchV3Artifacts, ExactIntBranchV3Error> {
-    let target_index = DirectCallTargetIndex::from_current_module(metadata, lowered_module);
+    let target_index = DirectCallTargetIndex::from_current_module(&module_identity, lowered_module);
     plan_and_emit_module_v3_from_raw_evidence_with_target_index(
         catalog,
-        metadata,
+        &module_identity,
         lowered_module,
         evidence_store,
         &target_index,
@@ -291,17 +305,13 @@ pub fn plan_and_emit_module_v3_from_raw_evidence(
 
 fn plan_and_emit_module_v3_from_raw_evidence_with_target_index(
     catalog: &AlternativeCatalog,
-    metadata: &CachedCodegenModuleMetadata,
+    module_identity: &ModulePlanIdentity,
     lowered_module: &BlockPyModule<CodegenModuleShape>,
     evidence_store: &ProfileEvidenceStore,
     target_index: &DirectCallTargetIndex,
 ) -> Result<ExactIntBranchV3Artifacts, ExactIntBranchV3Error> {
-    let module = ModulePlanIdentity {
-        module_name: metadata.module_name.clone(),
-        source_hash: metadata.source_hash,
-        cache_identity: metadata.cache_identity.clone(),
-    };
-    let mut identity_builder = OptimizationPlanV3IdentityBuilder::new(metadata);
+    let module = module_identity.clone();
+    let mut identity_builder = OptimizationPlanV3IdentityBuilder::new(module_identity);
     let mut functions = Vec::new();
     let mut diagnostics_by_function = Vec::new();
     for function in &lowered_module.callable_defs {
@@ -320,8 +330,8 @@ fn plan_and_emit_module_v3_from_raw_evidence_with_target_index(
             })
             .collect::<HashMap<_, _>>();
         let evidence = evidence_store.evidence_for_runtime_function_v3(
-            metadata.module_name.as_str(),
-            metadata.source_hash,
+            module_identity.module_name.as_str(),
+            module_identity.source_hash,
             function.function_id,
         );
         let mut region_requests = Vec::new();
@@ -338,7 +348,7 @@ fn plan_and_emit_module_v3_from_raw_evidence_with_target_index(
         }
         let (direct_calls, direct_call_diagnostics) = direct_call_requests_from_evidence_v3(
             lowered_module,
-            metadata,
+            module_identity,
             function,
             evidence_store,
             target_index,
@@ -354,7 +364,7 @@ fn plan_and_emit_module_v3_from_raw_evidence_with_target_index(
             evidence_store,
         );
         let indexed_globals = indexed_global_requests_from_module_key_evidence_v3(
-            metadata.module_name.as_str(),
+            module_identity.module_name.as_str(),
             function,
             evidence_store,
         );
@@ -1168,7 +1178,7 @@ fn module_constant_string_value_v3(
 
 fn direct_call_requests_from_evidence_v3(
     lowered_module: &BlockPyModule<CodegenModuleShape>,
-    metadata: &CachedCodegenModuleMetadata,
+    module_identity: &ModulePlanIdentity,
     function: &BlockPyFunction<CodegenModuleShape>,
     evidence_store: &ProfileEvidenceStore,
     target_index: &DirectCallTargetIndex,
@@ -1176,11 +1186,14 @@ fn direct_call_requests_from_evidence_v3(
 ) -> (Vec<DirectCallPlanRequest>, Vec<PlanDiagnostic>) {
     let mut requests = Vec::new();
     let mut diagnostics = Vec::new();
-    let current_module = ModuleContentId::new(metadata.module_name.clone(), metadata.source_hash);
+    let current_module = ModuleContentId::new(
+        module_identity.module_name.clone(),
+        module_identity.source_hash,
+    );
     let mut entries = evidence_store
         .persistent_call_target_specializations_for_runtime_function_v3(
-            metadata.module_name.as_str(),
-            metadata.source_hash,
+            module_identity.module_name.as_str(),
+            module_identity.source_hash,
             function.function_id,
         )
         .into_iter()
@@ -1588,142 +1601,73 @@ fn extraction_diagnostic(block: BlockLabel, error: RegionExtractionError) -> Pla
     }
 }
 
-pub fn generate_optimization_plans_v3_for_cached_modules(
+pub fn optimize_modules_v3_from_raw_evidence<'a>(
     evidence_store: &ProfileEvidenceStore,
-    module_inputs: impl IntoIterator<Item = CachedModuleOptimizationInput>,
-    out_root: &Path,
-) -> Result<OptimizationPlanGenerationSummary> {
+    module_inputs: impl IntoIterator<Item = ModuleOptimizationInput<'a>>,
+) -> Result<OptimizeModulesV3Output> {
     let module_inputs = module_inputs.into_iter().collect::<Vec<_>>();
-    let target_index = DirectCallTargetIndex::from_cached_modules(module_inputs.as_slice())?;
-    let mut summary = OptimizationPlanGenerationSummary::default();
-    for module_input in module_inputs {
-        match generate_module_optimization_plan_v3_with_target_index(
+    let target_index = DirectCallTargetIndex::from_modules(module_inputs.as_slice());
+    let mut output = OptimizeModulesV3Output::default();
+    for module_input in &module_inputs {
+        match optimize_module_v3_from_raw_evidence_with_target_index(
             evidence_store,
-            module_input.module_path.as_path(),
-            out_root,
+            &module_input.identity,
+            module_input.module,
             module_input.strict,
             &target_index,
         )? {
-            Some(report) => summary.reports.push(report),
-            None => summary.skipped += 1,
+            Some(optimized) => output.modules.push(optimized),
+            None => output.skipped += 1,
         }
     }
-    Ok(summary)
+    Ok(output)
 }
 
-pub fn generate_optimization_plans_v3_for_counter_dump(
-    counters_path: &Path,
-    module_root: &Path,
-    out_root: &Path,
-) -> Result<OptimizationPlanGenerationSummary> {
-    let evidence_store = ProfileEvidenceStore::from_counter_dump(counters_path)?;
-    let module_inputs = cached_module_paths_under_root(module_root)?
-        .into_iter()
-        .map(|module_path| CachedModuleOptimizationInput::new(module_path, false));
-    generate_optimization_plans_v3_for_cached_modules(&evidence_store, module_inputs, out_root)
-}
-
-pub fn generate_module_optimization_plan_v3(
+pub fn optimize_module_v3_from_raw_evidence(
     evidence_store: &ProfileEvidenceStore,
-    module_path: &Path,
-    out_root: &Path,
+    module_identity: ModulePlanIdentity,
+    module: &BlockPyModule<CodegenModuleShape>,
     strict: bool,
-) -> Result<Option<ModuleOptimizationPlanReport>> {
-    let cache = load_codegen_module_cache(module_path)
-        .with_context(|| format!("load BlockPy module cache {}", module_path.display()))?;
-    let target_index = DirectCallTargetIndex::from_current_module(&cache.metadata, &cache.module);
-    generate_loaded_module_optimization_plan_v3(
+) -> Result<Option<OptimizedModuleV3>> {
+    let target_index = DirectCallTargetIndex::from_current_module(&module_identity, module);
+    optimize_module_v3_from_raw_evidence_with_target_index(
         evidence_store,
-        cache,
-        out_root,
+        &module_identity,
+        module,
         strict,
         &target_index,
     )
 }
 
-fn generate_module_optimization_plan_v3_with_target_index(
+fn optimize_module_v3_from_raw_evidence_with_target_index(
     evidence_store: &ProfileEvidenceStore,
-    module_path: &Path,
-    out_root: &Path,
+    module_identity: &ModulePlanIdentity,
+    module: &BlockPyModule<CodegenModuleShape>,
     strict: bool,
     target_index: &DirectCallTargetIndex,
-) -> Result<Option<ModuleOptimizationPlanReport>> {
-    let cache = load_codegen_module_cache(module_path)
-        .with_context(|| format!("load BlockPy module cache {}", module_path.display()))?;
-    generate_loaded_module_optimization_plan_v3(
-        evidence_store,
-        cache,
-        out_root,
-        strict,
-        target_index,
-    )
-}
-
-fn generate_loaded_module_optimization_plan_v3(
-    evidence_store: &ProfileEvidenceStore,
-    cache: CachedCodegenModule,
-    out_root: &Path,
-    strict: bool,
-    target_index: &DirectCallTargetIndex,
-) -> Result<Option<ModuleOptimizationPlanReport>> {
-    if !counter_evidence_matches_cached_module_v3(evidence_store, &cache, strict)? {
+) -> Result<Option<OptimizedModuleV3>> {
+    if !counter_evidence_matches_module_v3(evidence_store, module_identity, strict)? {
         return Ok(None);
     }
     let catalog = AlternativeCatalog::default_v3();
     let artifacts = plan_and_emit_module_v3_from_raw_evidence_with_target_index(
         &catalog,
-        &cache.metadata,
-        &cache.module,
+        module_identity,
+        module,
         evidence_store,
         target_index,
-    )
-    .map_err(|err| anyhow!("generate optimizer v3 plan: {err}"))?;
-    let output_path = module_optimization_plan_v3_path(
-        out_root,
-        cache.metadata.source,
-        cache.metadata.module_name.as_str(),
-    )
-    .with_context(|| {
-        format!(
-            "construct optimization plan v3 output path for module {}",
-            cache.metadata.module_name
-        )
-    })?;
-    let optimized_module = rewrite_cached_module_for_optimization_artifacts_v3(
-        &cache.metadata,
-        &cache.module,
-        &artifacts,
-        target_index,
-    )
-    .map_err(|err| anyhow!("rewrite optimizer v3 BlockPy module: {err}"))?;
-    let optimized_module_path = module_optimized_codegen_v3_path(
-        out_root,
-        cache.metadata.source,
-        cache.metadata.module_name.as_str(),
-    )
-    .with_context(|| {
-        format!(
-            "construct optimized codegen v3 output path for module {}",
-            cache.metadata.module_name
-        )
-    })?;
-    write_optimization_artifacts_v3(output_path.as_path(), &artifacts)?;
-    store_codegen_module_cache(
-        optimized_module_path.as_path(),
-        &cache.metadata,
-        &optimized_module,
     )?;
-    Ok(Some(ModuleOptimizationPlanReport {
-        output_path,
-        optimized_module_path,
-        module_name: cache.metadata.module_name,
-        source_hash: cache.metadata.source_hash,
-        function_count: artifacts.plan.functions.len(),
+    let optimized_module =
+        rewrite_module_for_optimization_artifacts_v3(module, &artifacts, target_index)
+            .map_err(anyhow::Error::msg)?;
+    Ok(Some(OptimizedModuleV3 {
+        identity: module_identity.clone(),
+        artifacts,
+        optimized_module,
     }))
 }
 
-fn rewrite_cached_module_for_optimization_artifacts_v3(
-    _metadata: &CachedCodegenModuleMetadata,
+fn rewrite_module_for_optimization_artifacts_v3(
     module: &BlockPyModule<CodegenModuleShape>,
     artifacts: &ExactIntBranchV3Artifacts,
     target_index: &DirectCallTargetIndex,
@@ -1790,21 +1734,21 @@ fn resolve_cached_v3_external_inline_target(
         }))
 }
 
-fn counter_evidence_matches_cached_module_v3(
+fn counter_evidence_matches_module_v3(
     evidence_store: &ProfileEvidenceStore,
-    cache: &CachedCodegenModule,
+    module_identity: &ModulePlanIdentity,
     strict: bool,
 ) -> Result<bool> {
-    match evidence_store.module_source_hash(cache.metadata.module_name.as_str()) {
-        Some(source_hash) if source_hash == cache.metadata.source_hash => Ok(true),
-        Some(source_hash) => bail!(
+    match evidence_store.module_source_hash(module_identity.module_name.as_str()) {
+        Some(source_hash) if source_hash == module_identity.source_hash => Ok(true),
+        Some(source_hash) => anyhow::bail!(
             "counter dump source hash for module {} is 0x{source_hash:016x}, but cached BlockPy module has 0x{:016x}",
-            cache.metadata.module_name,
-            cache.metadata.source_hash
+            module_identity.module_name,
+            module_identity.source_hash
         ),
-        None if strict => bail!(
+        None if strict => anyhow::bail!(
             "counter dump does not contain module {}",
-            cache.metadata.module_name
+            module_identity.module_name
         ),
         None => Ok(false),
     }

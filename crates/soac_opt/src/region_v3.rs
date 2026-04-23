@@ -218,6 +218,7 @@ fn instr_codegen_kind(instr: &InstrCodegen) -> &'static str {
         InstrCodegenOp::Call(_) => "Call",
         InstrCodegenOp::CallDirect(_) => "CallDirect",
         InstrCodegenOp::DirectCallableCall(_) => "DirectCallableCall",
+        InstrCodegenOp::DirectMethodCall(_) => "DirectMethodCall",
         InstrCodegenOp::GetAttr(_) => "GetAttr",
         InstrCodegenOp::SetAttr(_) => "SetAttr",
         InstrCodegenOp::GetItem(_) => "GetItem",
@@ -378,6 +379,10 @@ impl RegionBuilder {
             InstrCodegenOp::DirectCallableCall(_) => Err(RegionExtractionError::UnsupportedInstr {
                 source: instr.try_semantic_instr_id(),
                 kind: "DirectCallableCall",
+            }),
+            InstrCodegenOp::DirectMethodCall(_) => Err(RegionExtractionError::UnsupportedInstr {
+                source: instr.try_semantic_instr_id(),
+                kind: "DirectMethodCall",
             }),
             InstrCodegenOp::GetAttr(_) => Err(RegionExtractionError::UnsupportedInstr {
                 source: instr.try_semantic_instr_id(),

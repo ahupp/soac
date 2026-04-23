@@ -2,11 +2,11 @@ use soac_core::block_py::{
     Block, BlockArg, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, LocalLocation,
     RuntimeFunctionId,
 };
-pub use soac_lowering::passes::{
+pub use soac_opt::passes::{
     BlockParamFacts, FunctionLocalPlan, LocalRefKind, ParamBindingFacts, ParamProvenance,
     PlannedLocalBinding, PlannedLocalStorage, plan_function_locals, render_planned_local_binding,
 };
-use soac_lowering::passes::{
+use soac_opt::passes::{
     CodegenModuleShape, FactStore, FunctionLocalEnvResumePlan, FunctionRefcountPlan, InstrCodegen,
     LocalEnvModulePlan, LocalEnvResumeEntry, LocalEnvResumeModulePlan, LocalEnvResumePoint,
     LocalEnvResumeStatePrecision, RefcountActionKind, RefcountPlan, RefcountReleaseReason,
@@ -1638,8 +1638,8 @@ mod tests {
     use super::*;
     use soac_core::block_py::BlockTerm;
     use soac_lowering::lower_python_to_blockpy_for_testing;
-    use soac_lowering::passes::BlockLocalPlan;
-    use soac_lowering::passes::{
+    use soac_opt::passes::BlockLocalPlan;
+    use soac_opt::passes::{
         LocalEnvResumeBindingState, LocalEnvResumeValueSource, RefcountActionKind,
         RefcountReleaseReason, infer_module_value_facts,
     };

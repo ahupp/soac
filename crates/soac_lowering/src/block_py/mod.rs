@@ -8,8 +8,8 @@ mod scope_impls;
 pub mod validate;
 
 pub(crate) use crate::passes::{
-    InstrCodegen, InstrCodegenOp, InstrLow, InstrResolved, InstrRuff, InstrUnresolved,
-    InstrWithAwaitAndYield, InstrWithYield,
+    InstrCodegen, InstrLow, InstrResolved, InstrRuff, InstrUnresolved, InstrWithAwaitAndYield,
+    InstrWithYield,
 };
 pub(crate) use counters::IncrementCounter;
 pub(crate) use literal::literal_expr;

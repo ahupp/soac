@@ -1,0 +1,138 @@
+mod direct_call_transform;
+mod escape_analysis;
+mod inline_plan;
+mod inline_sites;
+mod inline_transform;
+mod local_env_plan;
+mod ownership_effects;
+mod profiled_method_transform;
+pub(crate) mod value_facts;
+
+use soac_core::block_py::{BlockPyFunction, LocalLocation, NameLocation, ResolvedName};
+pub use soac_lowering::passes::{
+    CodegenModuleShape, DirectCallableTypeVersionGuardTest, DirectFunctionIdGuardTest,
+    DirectReceiverTypeVersionGuardTest, InstrCodegen, InstrCodegenOp, InstrResolved,
+    TypedAttrAccessPlan, TypedAttrOwnerRef, TypedCall, TypedCallAccessPlan, TypedCallEmissionPlan,
+    TypedCallEmissionPlans, TypedDirectCallArgPlan, TypedDirectCallArgSource,
+    TypedDirectCallGuardTest, TypedDirectCallGuardTestKind, TypedDirectCallableCall,
+    TypedDirectCallableCallGuard, TypedDirectConstructorCallGuard, TypedDirectFunctionCallGuard,
+    TypedDirectMethodCall, TypedDirectMethodCallGuard, TypedGetAttr, TypedGuardedCallableCall,
+    TypedGuardedMethodCall, TypedIndexedFieldGuard, TypedIndexedFieldPlanSource, TypedSetAttr,
+    TypedTruthy, assign_missing_codegen_function_instr_ids, reassign_codegen_function_instr_ids,
+    validate_codegen_instr_ids,
+};
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CodegenTempLocal {
+    pub name: String,
+    pub location: LocalLocation,
+}
+
+impl CodegenTempLocal {
+    pub fn resolved_name(&self) -> ResolvedName {
+        ResolvedName {
+            id: self.name.clone().into(),
+            location: NameLocation::Local(self.location),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum CodegenTempAllocationError {
+    MissingStorageLayout,
+}
+
+pub fn try_allocate_codegen_stack_temp(
+    function: &mut BlockPyFunction<CodegenModuleShape>,
+    prefix: &str,
+) -> Result<CodegenTempLocal, CodegenTempAllocationError> {
+    let name = function.name_gen.next_tmp_name(prefix).as_str().to_string();
+    let layout = function
+        .storage_layout
+        .as_mut()
+        .ok_or(CodegenTempAllocationError::MissingStorageLayout)?;
+    let location = LocalLocation(
+        u32::try_from(layout.stack_slots().len())
+            .expect("codegen stack slot index should fit in u32"),
+    );
+    layout.ensure_stack_slot(name.clone());
+    Ok(CodegenTempLocal { name, location })
+}
+
+pub fn allocate_codegen_stack_temp(
+    function: &mut BlockPyFunction<CodegenModuleShape>,
+    prefix: &str,
+) -> CodegenTempLocal {
+    try_allocate_codegen_stack_temp(function, prefix)
+        .expect("codegen function should have storage before allocating stack temp")
+}
+
+pub use crate::typed::{
+    InstrTyped, InstrTypedCodegen, TypedCodegenModuleShape, TypedInstrExtra, TypedPlannedResult,
+    TypedPyObjectOwnershipPlan, TypedResultDemand, annotate_typed_function_planned_results,
+    annotate_typed_function_result_demands, annotate_typed_function_value_facts,
+    annotate_typed_module_value_facts, lower_codegen_function_to_typed,
+    lower_codegen_module_to_typed, lower_typed_function_call_access_plan_instrs,
+    lower_typed_function_call_emission_plans, lower_typed_function_if_tests_to_truthy,
+    refresh_typed_function_value_facts, try_lower_typed_instr_to_codegen_legacy,
+    try_lower_typed_module_to_codegen_legacy, try_lower_typed_term_to_codegen_legacy,
+    validate_typed_function_call_access_plans, validate_typed_function_value_facts,
+    validate_typed_module_call_access_plans,
+};
+pub use direct_call_transform::{
+    DirectCallStoreRewriteStats, rewrite_profiled_function_call_store_sites,
+    rewrite_profiled_function_call_store_sites_with_constructor_targets,
+};
+pub use escape_analysis::{
+    ConstructorFieldAccess, ConstructorFieldStore, ConstructorFieldValue, EscapeSummaryModule,
+    FieldInitializerConstructorSummary, FunctionEscapeSummary,
+    NonEscapingConstructorAllocationSummary, NonEscapingConstructorSummary,
+    straightline_field_initializer_rejection_reason, summarize_module_escapes,
+};
+pub use inline_plan::{
+    FunctionInlinePlan, InlinePlanModule, StraightlineConstructorInlinePlan, plan_module_inlining,
+};
+pub use inline_sites::{
+    InlineCallSiteModule, StraightlineConstructorCallSite, collect_inline_call_sites,
+};
+pub use inline_transform::{
+    InlineCallee, InlineFragment, InlineLocal, InlineRewriteStats, InlineScalarRewriteStats,
+    InlineUnsupportedReason, InlineValueBindings, ScalarReplacementStats,
+    bind_simple_direct_call_inline_args, bind_simple_direct_method_inline_args,
+    build_cross_module_direct_call_inline_fragment_to_target,
+    build_cross_module_direct_method_inline_fragment_to_target,
+    build_direct_call_inline_fragment_to_target, build_direct_method_inline_fragment_to_target,
+    build_single_block_inline_fragment, build_single_block_inline_fragment_to_target,
+    build_single_block_inline_fragment_with_bindings, inline_and_scalar_replace_until_fixed_point,
+    inline_and_scalar_replace_with_callees_until_fixed_point,
+    inline_direct_call_stores_with_callees, inline_simple_direct_call_stores,
+    rewrite_static_runtime_constructor_call_stores,
+    scalar_replace_non_escaping_constructor_allocations,
+};
+pub use local_env_plan::{
+    BlockLocalPlan, BlockParamFacts, FunctionLocalEnvResumePlan, FunctionLocalPlan,
+    LocalEnvModulePlan, LocalEnvResumeBinding, LocalEnvResumeBindingState, LocalEnvResumeEntry,
+    LocalEnvResumeModulePlan, LocalEnvResumePoint, LocalEnvResumeStatePrecision,
+    LocalEnvResumeValueSource, LocalRefKind, ParamBindingFacts, ParamProvenance,
+    PlannedLocalBinding, PlannedLocalStorage, plan_function_local_env_resume, plan_function_locals,
+    plan_local_env_module, plan_local_env_resume_module, render_local_env_function_plan,
+    render_local_env_module_plan, render_local_env_resume_function_plan,
+    render_local_env_resume_module_plan, render_planned_local_binding,
+    validate_local_env_module_plan, validate_local_env_resume_module_plan,
+};
+pub use ownership_effects::{
+    BlockRefcountPlan, FunctionRefcountPlan, LocalRefState, RefcountAction, RefcountActionKind,
+    RefcountLocal, RefcountPlan, RefcountReleaseReason, RefcountSite,
+    compute_function_local_live_ins, compute_function_local_must_bound_ins, plan_ownership_effects,
+    validate_ownership_effects,
+};
+pub use profiled_method_transform::{
+    ProfiledMethodInlineRewriteStats, ProfiledOwnerAttrKey, ProfiledOwnerAttrSpecialization,
+    ProfiledRuntimeIterConstructorCall, collect_profiled_runtime_iter_method_target_ids,
+    rewrite_profiled_no_arg_method_call_store_sites,
+};
+pub use value_facts::{
+    BoolFacts, BoolSingletonFact, CallableFact, EnvFacts, FactStore, I32Facts, I64Facts, NoneFact,
+    ProvenanceFact, PyExactType, PyObjFacts, RefcountFact, RuntimeHelperId, RuntimeHelperSignature,
+    RuntimeSingleton, ThrowSpec, TruthinessFact, TypeFact, ValueFacts, infer_module_value_facts,
+};

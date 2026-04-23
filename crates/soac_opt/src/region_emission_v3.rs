@@ -1,5 +1,6 @@
 use crate::artifacts_v3::ExactIntBranchV3Artifacts;
 use crate::emit_v3::{MechanicalExitKind, MechanicalRegionEmission, MechanicalStepOp};
+use crate::passes::InstrTyped;
 use crate::plan_v3::{
     FailureMode, FallbackTarget, GuardFailure, RegionId, RegionPlan, ScalarLocalThreadPlan,
     ScalarThreadFallback, ScalarThreadLocalCleanup, ScalarThreadLocalLocation,
@@ -9,7 +10,7 @@ use soac_core::block_py::{
     BlockArg, BlockLabel, BlockPyFunction, BlockTerm, ChildVisitable, InstrId, LocalLocation,
     NameLike, ResolvedName, Visit,
 };
-use soac_lowering::passes::{CodegenModuleShape, InstrCodegen, InstrTyped};
+use soac_lowering::passes::{CodegenModuleShape, InstrCodegen};
 use std::collections::HashMap;
 
 #[derive(Clone, Copy)]

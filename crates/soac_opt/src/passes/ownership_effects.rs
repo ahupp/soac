@@ -6,12 +6,11 @@
 //! operations once representation choices such as SSA block params, stack-slot
 //! mirrors, borrowed helper results, and immortal constants are known.
 
-use crate::block_py::{
+use crate::passes::{CodegenModuleShape, FactStore, InstrCodegen, PyObjFacts, ValueFacts};
+use soac_core::block_py::{
     Block, BlockArg, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, CellLocation,
-    ChildVisitable, HasSemanticInstrId, InstrCodegen, InstrKey, LocalLocation, RuntimeFunctionId,
-    Visit,
+    ChildVisitable, HasSemanticInstrId, InstrKey, LocalLocation, RuntimeFunctionId, Visit,
 };
-use crate::passes::{CodegenModuleShape, FactStore, PyObjFacts, ValueFacts};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -1400,7 +1399,7 @@ fn owned_cell_locations(
 }
 
 fn store_binding_location(
-    op: &crate::block_py::Store<InstrCodegen>,
+    op: &soac_core::block_py::Store<InstrCodegen>,
     owned_cell_locations: &HashMap<u32, LocalLocation>,
 ) -> Option<LocalLocation> {
     op.name.local_location().or_else(|| {
@@ -1799,20 +1798,19 @@ fn expected_release_actions(
 #[cfg(test)]
 mod tests {
     use super::{
-        compute_function_local_live_ins, compute_function_local_must_bound_ins,
-        forwarded_locations, plan_ownership_effects, validate_ownership_effects, LocalRefState,
-        RefcountActionKind, RefcountReleaseReason,
+        LocalRefState, RefcountActionKind, RefcountReleaseReason, compute_function_local_live_ins,
+        compute_function_local_must_bound_ins, forwarded_locations, plan_ownership_effects,
+        validate_ownership_effects,
     };
-    use crate::block_py::cfg::RelabelBlockTargets;
-    use crate::block_py::{BlockArg, BlockLabel, BlockTerm, LocalLocation};
-    use crate::lower_python_to_blockpy_for_testing;
     use crate::passes::infer_module_value_facts;
+    use soac_core::block_py::{BlockArg, BlockLabel, BlockTerm, LocalLocation};
+    use soac_lowering::lower_python_to_blockpy_for_testing;
     use std::collections::{HashMap, HashSet};
 
     fn refcount_actions_for_function(
         source: &str,
     ) -> (
-        crate::block_py::BlockPyFunction<crate::passes::CodegenModuleShape>,
+        soac_core::block_py::BlockPyFunction<crate::passes::CodegenModuleShape>,
         Vec<RefcountActionKind>,
     ) {
         refcount_actions_for_named_function(source, "f")
@@ -1822,7 +1820,7 @@ mod tests {
         source: &str,
         qualname: &str,
     ) -> (
-        crate::block_py::BlockPyFunction<crate::passes::CodegenModuleShape>,
+        soac_core::block_py::BlockPyFunction<crate::passes::CodegenModuleShape>,
         Vec<RefcountActionKind>,
     ) {
         let lowered = lower_python_to_blockpy_for_testing(source)
@@ -2136,7 +2134,9 @@ def f(flag):
             block.label = *relabel
                 .get(&block.label)
                 .expect("test relabel should cover block");
-            block.term.relabel_targets(&relabel);
+            for (from, to) in &relabel {
+                block.term.replace_target(*from, *to);
+            }
             if let Some(exc_edge) = &mut block.exc_edge {
                 exc_edge.target = *relabel
                     .get(&exc_edge.target)

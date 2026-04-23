@@ -1761,6 +1761,7 @@ dependencies = [
  "soac_config",
  "soac_core",
  "soac_lowering",
+ "soac_opt",
  "tracing",
 ]
 
@@ -1854,10 +1855,12 @@ name = "soac_opt"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "derive_more",
  "rkyv",
  "soac_core",
- "soac_driver",
  "soac_lowering",
+ "soac_macros",
+ "tracing",
 ]
 
 [[package]]
