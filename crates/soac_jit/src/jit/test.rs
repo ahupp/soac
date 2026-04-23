@@ -13752,12 +13752,6 @@ def g():
             unsafe { std::env::set_var(name, value) };
             Self { name, old_value }
         }
-
-        fn remove(name: &'static str) -> Self {
-            let old_value = std::env::var_os(name);
-            unsafe { std::env::remove_var(name) };
-            Self { name, old_value }
-        }
     }
 
     impl Drop for EnvVarGuard {
@@ -14160,49 +14154,6 @@ def g():
     }
 
     #[test]
-    fn jit_refcount_emission_env_defaults_to_enabled() {
-        if crate::run_test_in_isolated_process_if_needed(
-            module_path!(),
-            "jit_refcount_emission_env_defaults_to_enabled",
-        ) {
-            return;
-        }
-        let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        {
-            let _env = EnvVarGuard::remove(SOAC_JIT_EMIT_REFCOUNTS_ENV);
-            assert!(
-                soac_config::SoacEnvConfig::from_env()
-                    .unwrap()
-                    .jit_refcount_emission_enabled(),
-                "refcount emission should be enabled by default"
-            );
-        }
-        for value in ["0", "false", "False", "no", "off"] {
-            let _env = EnvVarGuard::set(SOAC_JIT_EMIT_REFCOUNTS_ENV, value);
-            assert!(
-                !soac_config::SoacEnvConfig::from_env()
-                    .unwrap()
-                    .jit_refcount_emission_enabled(),
-                "{SOAC_JIT_EMIT_REFCOUNTS_ENV}={value:?} should disable refcount emission"
-            );
-        }
-        for value in ["1", "true", "yes", "on"] {
-            let _env = EnvVarGuard::set(SOAC_JIT_EMIT_REFCOUNTS_ENV, value);
-            assert!(
-                soac_config::SoacEnvConfig::from_env()
-                    .unwrap()
-                    .jit_refcount_emission_enabled(),
-                "{SOAC_JIT_EMIT_REFCOUNTS_ENV}={value:?} should keep refcount emission enabled"
-            );
-        }
-        let _env = EnvVarGuard::set(SOAC_JIT_EMIT_REFCOUNTS_ENV, "");
-        assert!(
-            soac_config::SoacEnvConfig::from_env().is_err(),
-            "{SOAC_JIT_EMIT_REFCOUNTS_ENV}=empty should be rejected"
-        );
-    }
-
-    #[test]
     fn runtime_support_inliner_uses_noop_refcount_helpers_when_disabled() {
         if crate::run_test_in_isolated_process_if_needed(
             module_path!(),
@@ -14212,7 +14163,6 @@ def g():
         }
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         let disabled_insts = {
-            let _env = EnvVarGuard::set(SOAC_JIT_EMIT_REFCOUNTS_ENV, "0");
             let (_compile_session, mut jit_module, mut ctx, _wrapper_id, helper_names) =
                 unsafe { build_runtime_refcount_smoke_context() };
             let before_calls = count_direct_calls_to_runtime_helpers(&ctx.func, &helper_names);
@@ -14223,7 +14173,7 @@ def g():
 
             let inlined = inline_runtime_support_calls(
                 &mut jit_module,
-                &SoacEnvConfig::from_env().expect("disabled refcount test env should parse"),
+                &SoacEnvConfig::default().with_jit_refcount_emission_enabled(false),
                 &mut ctx,
                 "test runtime support inliner should run with refcounts disabled",
             )
@@ -14241,12 +14191,11 @@ def g():
         };
 
         let enabled_insts = {
-            let _env = EnvVarGuard::set(SOAC_JIT_EMIT_REFCOUNTS_ENV, "1");
             let (_compile_session, mut jit_module, mut ctx, _wrapper_id, _helper_names) =
                 unsafe { build_runtime_refcount_smoke_context() };
             inline_runtime_support_calls(
                 &mut jit_module,
-                &SoacEnvConfig::from_env().expect("enabled refcount test env should parse"),
+                &SoacEnvConfig::default().with_jit_refcount_emission_enabled(true),
                 &mut ctx,
                 "test runtime support inliner should run with refcounts enabled",
             )
@@ -17950,6 +17899,7 @@ def f(x, y):
     fn build_indexed_global_guard_miss_with_runtime_profile(
         py: Python<'_>,
         mode: &str,
+        env_config: Option<SoacEnvConfig>,
     ) -> BuiltSpecializedFunction {
         let _opt_mode = set_opt_mode(mode);
         let soac_work_dir = fresh_test_work_dir("indexed-global-deopt-profile");
@@ -17979,7 +17929,10 @@ def f(x, y):
                 matches!(mode, "verify" | "apply"),
             )
         });
-        let compile_session = crate::session::CompileSession::new();
+        let compile_session = match env_config {
+            Some(env_config) => crate::session::CompileSession::new_with_env_config(env_config),
+            None => crate::session::CompileSession::new(),
+        };
         let mut jit_module =
             new_jit_module(&compile_session).expect("test jit module should construct");
         let module_constant_ptrs = shared_state.module_constant_ptrs();
@@ -18105,7 +18058,7 @@ def f(x, y):
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         crate::initialize_test_python();
         Python::attach(|py| {
-            let built = build_indexed_global_guard_miss_with_runtime_profile(py, "verify");
+            let built = build_indexed_global_guard_miss_with_runtime_profile(py, "verify", None);
             let deopt_helpers = import_user_names_for_symbols(&built, &["dp_jit_deopt_resume"]);
             let slow_global_helpers =
                 import_user_names_for_symbols(&built, &["soac_runtime_load_global_slow"]);
@@ -18138,8 +18091,11 @@ def f(x, y):
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         crate::initialize_test_python();
         Python::attach(|py| {
-            let _refcount_env = EnvVarGuard::set(SOAC_JIT_EMIT_REFCOUNTS_ENV, "0");
-            let built = build_indexed_global_guard_miss_with_runtime_profile(py, "verify");
+            let built = build_indexed_global_guard_miss_with_runtime_profile(
+                py,
+                "verify",
+                Some(SoacEnvConfig::default().with_jit_refcount_emission_enabled(false)),
+            );
             let deopt_helpers = import_user_names_for_symbols(&built, &["dp_jit_deopt_resume"]);
             let slow_global_helpers =
                 import_user_names_for_symbols(&built, &["soac_runtime_load_global_slow"]);
@@ -18167,7 +18123,7 @@ def f(x, y):
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         crate::initialize_test_python();
         Python::attach(|py| {
-            let built = build_indexed_global_guard_miss_with_runtime_profile(py, "profile");
+            let built = build_indexed_global_guard_miss_with_runtime_profile(py, "profile", None);
             let deopt_helpers = import_user_names_for_symbols(&built, &["dp_jit_deopt_resume"]);
             let slow_global_helpers =
                 import_user_names_for_symbols(&built, &["soac_runtime_load_global_slow"]);

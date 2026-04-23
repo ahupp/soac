@@ -1,12 +1,8 @@
 use cranelift_codegen::isa::TargetIsa;
 use cranelift_codegen::settings;
 use cranelift_codegen::settings::Configurable;
-#[cfg(test)]
-pub(crate) use soac_config::SOAC_JIT_EMIT_REFCOUNTS_ENV;
+use soac_config::SoacEnvConfig;
 pub(crate) use soac_config::SpecializationMode;
-use soac_config::{
-    SoacEnvConfig, precompiled_library_path_from_env as config_precompiled_library_path_from_env,
-};
 pub use soac_driver::codegen_cache::CachedCodegenModuleMetadata;
 use soac_driver::codegen_cache::{
     module_optimization_plan_v3_path as blockpy_module_optimization_plan_v3_path,
@@ -144,7 +140,9 @@ pub fn module_optimized_codegen_v3_path(
         .map_err(|err| err.to_string())
 }
 
-pub(crate) fn precompiled_library_path_from_env() -> Result<Option<PathBuf>, String> {
-    config_precompiled_library_path_from_env()
+pub(crate) fn precompiled_library_path() -> Result<Option<PathBuf>, String> {
+    Ok(SoacEnvConfig::from_env()?
+        .precompiled_library_path()
+        .map(Path::to_path_buf))
 }
 pub use soac_driver::codegen_cache::PythonModuleCacheSource;

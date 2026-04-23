@@ -86,6 +86,13 @@ impl CompileSession {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_with_env_config(env_config: SoacEnvConfig) -> Self {
+        let session = Self::new();
+        let _ = session.env_config.set(Ok(env_config));
+        session
+    }
+
     pub fn process() -> Arc<Self> {
         Arc::clone(PROCESS_COMPILE_SESSION.get_or_init(|| Arc::new(Self::new())))
     }

@@ -3,8 +3,6 @@ use self::precompiled_object::{
     ObjectFunctionDefinition, R_X86_64_64, write_precompiled_object,
 };
 use crate::SOAC_JIT_RUNTIME_CLIF;
-#[cfg(test)]
-use crate::config::SOAC_JIT_EMIT_REFCOUNTS_ENV;
 use crate::config::{
     CraneliftTargetConfig, PythonModuleCacheSource, SpecializationMode,
     module_optimization_plan_v3_path, module_optimized_codegen_v3_path,
@@ -634,7 +632,7 @@ fn precompiled_library() -> Result<Option<&'static PrecompiledLibrary>, String> 
 }
 
 fn load_precompiled_library_from_env() -> Result<Option<PrecompiledLibrary>, String> {
-    let Some(path) = crate::config::precompiled_library_path_from_env()? else {
+    let Some(path) = crate::config::precompiled_library_path()? else {
         return Ok(None);
     };
     promote_current_soac_extension_symbols_for_precompiled_library()?;
