@@ -106,24 +106,6 @@ pub(super) trait OperationEmitState<'fb, E> {
         panic!("this operation emitter cannot materialize JIT deopt live values")
     }
 
-    fn emit_guard_miss_deopt_resume_return(
-        &mut self,
-        block: ir::Block,
-        fallback_counter_id: Option<super::CounterRef>,
-        arg_values: &[(ir::Value, bool)],
-        target: JitDeoptExitRef,
-        deopt_resume_ref: ir::FuncRef,
-    ) where
-        Self: Sized,
-    {
-        self.fb().switch_to_block(block);
-        self.fb().set_cold_block(block);
-        increment_counter_with_state(self, fallback_counter_id);
-        self.release_arg_values(arg_values);
-        let deopt_result = self.emit_deopt_resume_result(target, deopt_resume_ref);
-        self.emit_deopt_result_return_or_step_null(deopt_result);
-    }
-
     fn emit_deopt_result_return_or_step_null(&mut self, deopt_result: ir::Value)
     where
         Self: Sized,

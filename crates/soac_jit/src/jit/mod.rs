@@ -45,8 +45,6 @@ use soac_core::block_py::{
 use soac_core::profile::{
     CollectedTypeKeyLayout, CounterDumpTypeKey, read_block_entry_counts_from_file,
 };
-#[cfg(test)]
-use soac_core::profile::{CounterDumpFile, collect_type_key_layouts, collect_type_table};
 use soac_driver::codegen_cache::{
     load_codegen_module_cache, remap_cached_codegen_module_function_ids,
     validate_codegen_module_cache_metadata,
@@ -6693,7 +6691,6 @@ struct JitEmitCtx<'mc> {
     field_generic_getattr_counter_ids: &'mc HashMap<InstrId, CounterRef>,
     field_generic_setattr_counter_ids: &'mc HashMap<InstrId, CounterRef>,
     deopt_entry_guard_miss_counter_ids: &'mc HashMap<usize, CounterId>,
-    field_index_specializations_by_instr: &'mc HashMap<InstrId, Vec<FieldIndexSpecialization>>,
     behavior_change_indexed_stores: bool,
     allow_local_only_slot_backed_stores: bool,
     exception_forwarded_local_names: Option<&'mc [String]>,
@@ -12778,51 +12775,6 @@ fn push_unique_specialization(
     if !specializations.contains(&specialization) {
         specializations.push(specialization);
     }
-}
-
-#[cfg(test)]
-fn load_field_index_specializations_from_path(
-    path: &Path,
-) -> Result<HashMap<String, Vec<FieldIndexSpecialization>>, String> {
-    let dump = CounterDumpFile::open(path)?;
-    let records = dump.records()?;
-    let type_table = collect_type_table(records.as_slice())?;
-    let type_key_layouts = collect_type_key_layouts(records.as_slice())?;
-    let mut out = HashMap::<String, Vec<FieldIndexSpecialization>>::new();
-    for (type_id, layouts) in type_key_layouts {
-        let Some(type_key) = type_table.get(&type_id) else {
-            continue;
-        };
-        let Some(owner_type) = resolve_type_key_to_type(type_key)? else {
-            continue;
-        };
-        prime_field_index_layout(owner_type, layouts.as_slice())?;
-        for layout in layouts {
-            if let Some(specialization) =
-                field_index_specialization_for_type(owner_type, layout.key.as_str(), layout.index)?
-            {
-                out.entry(layout.key).or_default().push(specialization);
-            }
-        }
-    }
-    Ok(out)
-}
-
-#[cfg(test)]
-fn load_field_index_specializations()
--> Result<HashMap<String, Vec<FieldIndexSpecialization>>, String> {
-    let env_config = SoacEnvConfig::from_env()?;
-    if env_config.specialization_mode() == Some(SpecializationMode::Profile) {
-        return Ok(HashMap::new());
-    }
-    let Some(path) = env_config.counter_dump_input_path() else {
-        return Ok(HashMap::new());
-    };
-    let path = path.as_path();
-    if !path.exists() {
-        return Ok(HashMap::new());
-    }
-    load_field_index_specializations_from_path(path)
 }
 
 fn collect_cold_block_labels_from_path(
@@ -26911,7 +26863,6 @@ fn build_cranelift_run_bb_specialized_function(
                 field_generic_setattr_counter_ids: &field_generic_setattr_counter_ids,
                 deopt_entry_guard_miss_counter_ids: &deopt_entry_guard_miss_counter_ids,
                 branch_outcome_counter_ids: &branch_outcome_counter_ids,
-                field_index_specializations_by_instr: &field_index_specializations_by_instr,
                 behavior_change_indexed_stores,
                 allow_local_only_slot_backed_stores: true,
                 exception_forwarded_local_names: exc_dispatches[index]
