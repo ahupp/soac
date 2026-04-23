@@ -63,8 +63,6 @@ pub enum InstrTyped {
     LegacyMakeFunctionWithClosure(MakeFunctionWithClosure<Self>),
 }
 
-pub type InstrTypedCodegen = InstrTyped;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TypedResultDemand {
     EffectOnly,

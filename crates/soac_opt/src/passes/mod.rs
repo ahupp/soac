@@ -68,7 +68,7 @@ pub fn allocate_codegen_stack_temp(
 }
 
 pub use crate::typed::{
-    InstrTyped, InstrTypedCodegen, TypedCodegenModuleShape, TypedInstrExtra, TypedPlannedResult,
+    InstrTyped, TypedCodegenModuleShape, TypedInstrExtra, TypedPlannedResult,
     TypedPyObjectOwnershipPlan, TypedResultDemand, annotate_typed_function_planned_results,
     annotate_typed_function_result_demands, annotate_typed_function_value_facts,
     annotate_typed_module_value_facts, lower_codegen_function_to_typed,
