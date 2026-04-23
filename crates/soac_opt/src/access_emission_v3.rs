@@ -2,11 +2,12 @@ use crate::artifacts_v3::ExactIntBranchV3Artifacts;
 use crate::emit_v3::MechanicalIndexedFieldGuard;
 use crate::plan_v3::{
     ExactListItemAccessKind, ExactListItemFallbackKind, ExactListItemGuardKind, ExactListItemShape,
-    IndexedFieldAccessKind, IndexedFieldFallbackKind, IndexedGlobalAccessKind,
-    IndexedGlobalFallbackKind, IndexedGlobalGuardKind,
+    IndexedFieldAccessKind, IndexedFieldFallbackKind, IndexedFieldGuardKind,
+    IndexedGlobalAccessKind, IndexedGlobalFallbackKind, IndexedGlobalGuardKind,
 };
 use soac_core::block_py::InstrId;
-use std::collections::HashMap;
+use soac_core::profile::{CollectedTypeKeyLayout, CounterDumpTypeKey};
+use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExactListItemAccessPlan {
@@ -22,6 +23,31 @@ pub struct IndexedFieldAccessPlan {
     pub access: IndexedFieldAccessKind,
     pub guard: MechanicalIndexedFieldGuard,
     pub fallback: IndexedFieldFallbackKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexedFieldLayoutGroup {
+    pub type_key: CounterDumpTypeKey,
+    pub layouts: Vec<CollectedTypeKeyLayout>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexedFieldRuntimeAccessRequest {
+    pub access: IndexedFieldAccessKind,
+    pub attr_name: String,
+    pub guard: IndexedFieldGuardKind,
+    pub fallback: IndexedFieldFallbackKind,
+    pub type_key: CounterDumpTypeKey,
+    pub expected_index: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedIndexedFieldAccess<T> {
+    pub access: IndexedFieldAccessKind,
+    pub attr_name: String,
+    pub guard: IndexedFieldGuardKind,
+    pub fallback: IndexedFieldFallbackKind,
+    pub specialization: T,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -56,6 +82,111 @@ pub fn indexed_fields_for_function_from_artifacts(
         }
     }
     Ok(Some(by_source))
+}
+
+pub fn indexed_field_type_key(plan: &IndexedFieldAccessPlan) -> CounterDumpTypeKey {
+    CounterDumpTypeKey {
+        module_name: plan.guard.owner_type.module_name.clone(),
+        qualname: plan.guard.owner_type.qualname.clone(),
+    }
+}
+
+pub fn indexed_field_runtime_access_request(
+    plan: &IndexedFieldAccessPlan,
+) -> IndexedFieldRuntimeAccessRequest {
+    IndexedFieldRuntimeAccessRequest {
+        access: plan.access,
+        attr_name: plan.guard.attr_name.clone(),
+        guard: plan.guard.kind,
+        fallback: plan.fallback,
+        type_key: indexed_field_type_key(plan),
+        expected_index: plan.guard.expected_index,
+    }
+}
+
+pub fn indexed_field_layout_groups<'a>(
+    plans: impl IntoIterator<Item = &'a IndexedFieldAccessPlan>,
+) -> Vec<IndexedFieldLayoutGroup> {
+    let mut layouts_by_type = HashMap::<CounterDumpTypeKey, Vec<CollectedTypeKeyLayout>>::new();
+    let mut seen_layouts = HashSet::<(CounterDumpTypeKey, String, u32)>::new();
+    for plan in plans {
+        let request = indexed_field_runtime_access_request(plan);
+        if !seen_layouts.insert((
+            request.type_key.clone(),
+            request.attr_name.clone(),
+            request.expected_index,
+        )) {
+            continue;
+        }
+        layouts_by_type
+            .entry(request.type_key)
+            .or_default()
+            .push(CollectedTypeKeyLayout {
+                owner_type_id: 0,
+                key: request.attr_name,
+                index: request.expected_index,
+            });
+    }
+
+    let mut groups = layouts_by_type
+        .into_iter()
+        .map(|(type_key, mut layouts)| {
+            layouts.sort_by(|lhs, rhs| {
+                lhs.index
+                    .cmp(&rhs.index)
+                    .then_with(|| lhs.key.cmp(&rhs.key))
+            });
+            IndexedFieldLayoutGroup { type_key, layouts }
+        })
+        .collect::<Vec<_>>();
+    groups.sort_by(|lhs, rhs| {
+        lhs.type_key
+            .module_name
+            .cmp(&rhs.type_key.module_name)
+            .then_with(|| lhs.type_key.qualname.cmp(&rhs.type_key.qualname))
+    });
+    groups
+}
+
+pub fn prepare_indexed_field_accesses_for_codegen<T: PartialEq>(
+    planned_by_instr: Option<&HashMap<InstrId, Vec<IndexedFieldAccessPlan>>>,
+    mut resolve: impl FnMut(&IndexedFieldRuntimeAccessRequest) -> Result<T, String>,
+) -> Result<HashMap<InstrId, Vec<ResolvedIndexedFieldAccess<T>>>, String> {
+    let Some(planned_by_instr) = planned_by_instr else {
+        return Ok(HashMap::new());
+    };
+    let mut by_instr = HashMap::new();
+    for (instr_id, planned_accesses) in planned_by_instr {
+        let mut resolved_accesses = Vec::new();
+        let mut seen_requests = Vec::<IndexedFieldRuntimeAccessRequest>::new();
+        for planned in planned_accesses {
+            let request = indexed_field_runtime_access_request(planned);
+            if seen_requests.contains(&request) {
+                continue;
+            }
+            seen_requests.push(request.clone());
+            let specialization = resolve(&request).map_err(|err| {
+                format!(
+                    "optimizer v3 indexed-field plan {:?} for {} attr {:?} could not bind a runtime field guard: {err}",
+                    request.access, instr_id, request.attr_name
+                )
+            })?;
+            let resolved = ResolvedIndexedFieldAccess {
+                access: request.access,
+                attr_name: request.attr_name,
+                guard: request.guard,
+                fallback: request.fallback,
+                specialization,
+            };
+            if !resolved_accesses.contains(&resolved) {
+                resolved_accesses.push(resolved);
+            }
+        }
+        if !resolved_accesses.is_empty() {
+            by_instr.insert(*instr_id, resolved_accesses);
+        }
+    }
+    Ok(by_instr)
 }
 
 pub fn exact_list_items_for_function_from_artifacts(
@@ -106,4 +237,109 @@ pub fn indexed_globals_for_function_from_artifacts(
         );
     }
     Ok(Some(by_source))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plan_v3::{
+        IndexedFieldGuardKind, IndexedFieldOwnerType, IndexedFieldSpecializationPlan,
+    };
+    use soac_core::block_py::BlockLabel;
+
+    fn field_plan(
+        module_name: &str,
+        qualname: &str,
+        attr_name: &str,
+        expected_index: u32,
+        access: IndexedFieldAccessKind,
+    ) -> IndexedFieldAccessPlan {
+        let source = InstrId::new(BlockLabel::from_index(0), expected_index);
+        let emitted = IndexedFieldSpecializationPlan {
+            source,
+            access,
+            guard: crate::plan_v3::IndexedFieldGuardPlan {
+                kind: IndexedFieldGuardKind::OwnerTypeVersionAndFieldIndex,
+            },
+            fallback: crate::plan_v3::IndexedFieldFallbackPlan {
+                kind: IndexedFieldFallbackKind::OriginalAttrAccess,
+            },
+            owner_type: IndexedFieldOwnerType {
+                module_name: module_name.to_string(),
+                qualname: qualname.to_string(),
+            },
+            attr_name: attr_name.to_string(),
+            expected_index,
+            reason: "test".to_string(),
+        };
+        IndexedFieldAccessPlan {
+            access: emitted.access,
+            guard: MechanicalIndexedFieldGuard {
+                kind: emitted.guard.kind,
+                owner_type: emitted.owner_type,
+                attr_name: emitted.attr_name,
+                expected_index: emitted.expected_index,
+            },
+            fallback: emitted.fallback.kind,
+        }
+    }
+
+    #[test]
+    fn indexed_field_layout_groups_are_deduped_and_sorted() {
+        let duplicate = field_plan("zmod", "B", "z", 2, IndexedFieldAccessKind::Load);
+        let plans = [
+            duplicate.clone(),
+            field_plan("amod", "A", "b", 3, IndexedFieldAccessKind::Store),
+            field_plan("amod", "A", "a", 1, IndexedFieldAccessKind::Load),
+            duplicate,
+        ];
+
+        let groups = indexed_field_layout_groups(plans.iter());
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].type_key.module_name, "amod");
+        assert_eq!(
+            groups[0]
+                .layouts
+                .iter()
+                .map(|layout| (layout.key.as_str(), layout.index))
+                .collect::<Vec<_>>(),
+            vec![("a", 1), ("b", 3)]
+        );
+        assert_eq!(groups[1].type_key.module_name, "zmod");
+        assert_eq!(
+            groups[1]
+                .layouts
+                .iter()
+                .map(|layout| (layout.key.as_str(), layout.index))
+                .collect::<Vec<_>>(),
+            vec![("z", 2)]
+        );
+    }
+
+    #[test]
+    fn prepare_indexed_field_accesses_dedupes_before_runtime_resolution() {
+        let instr_id = InstrId::new(BlockLabel::from_index(1), 4);
+        let plan = field_plan("module", "Owner", "field", 7, IndexedFieldAccessKind::Load);
+        let mut by_instr = HashMap::new();
+        by_instr.insert(instr_id, vec![plan.clone(), plan]);
+        let mut resolved_requests = Vec::new();
+
+        let prepared = prepare_indexed_field_accesses_for_codegen(Some(&by_instr), |request| {
+            resolved_requests.push((
+                request.type_key.module_name.clone(),
+                request.attr_name.clone(),
+                request.expected_index,
+            ));
+            Ok(request.expected_index)
+        })
+        .expect("indexed-field requests should prepare");
+
+        assert_eq!(
+            resolved_requests,
+            vec![("module".to_string(), "field".to_string(), 7)]
+        );
+        assert_eq!(prepared[&instr_id].len(), 1);
+        assert_eq!(prepared[&instr_id][0].specialization, 7);
+    }
 }

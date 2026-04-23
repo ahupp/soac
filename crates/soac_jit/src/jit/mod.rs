@@ -85,10 +85,16 @@ use soac_lowering::passes::{
 use soac_opt::access_emission_v3::{
     ExactListItemAccessPlan as OptV3ExactListItemAccessPlan,
     IndexedFieldAccessPlan as OptV3IndexedFieldAccessPlan,
+    IndexedFieldLayoutGroup as OptV3IndexedFieldLayoutGroup,
+    IndexedFieldRuntimeAccessRequest as OptV3IndexedFieldRuntimeAccessRequest,
     IndexedGlobalAccessPlan as OptV3IndexedGlobalAccessPlan,
+    ResolvedIndexedFieldAccess as OptV3ResolvedIndexedFieldAccessFromOpt,
     exact_list_items_for_function_from_artifacts as opt_v3_emitted_exact_list_items_for_function,
+    indexed_field_layout_groups as opt_v3_indexed_field_layout_groups,
+    indexed_field_runtime_access_request as opt_v3_indexed_field_runtime_access_request,
     indexed_fields_for_function_from_artifacts as opt_v3_emitted_indexed_fields_for_function,
     indexed_globals_for_function_from_artifacts as opt_v3_emitted_indexed_globals_for_function,
+    prepare_indexed_field_accesses_for_codegen as opt_v3_prepare_indexed_field_accesses_for_codegen,
 };
 use soac_opt::artifacts_v3::{
     ExactIntBranchV3Artifacts, load_optimization_artifacts_v3,
@@ -122,8 +128,6 @@ use soac_opt::plan::{
 use soac_opt::plan_v3::{
     CallBodyKind as PlanV3CallBodyKind, ConversionKind, FallbackTarget, GuardFailure, GuardKind,
     IndexedFieldAccessKind as PlanV3IndexedFieldAccessKind,
-    IndexedFieldFallbackKind as PlanV3IndexedFieldFallbackKind,
-    IndexedFieldGuardKind as PlanV3IndexedFieldGuardKind,
     IndexedGlobalAccessKind as PlanV3IndexedGlobalAccessKind, MaterializeKind, PlanNodeId,
     PlanValue, PlannedConstant, RegionId, RegionInputSource, RegionPlan, Rep, RichCompareOp,
     ScalarThreadMaterialization,
@@ -1399,7 +1403,9 @@ fn predeclare_specialization_type_imports(
     let planned_fields = profile.planned_legacy_field_index_specializations();
     prime_planned_field_index_layouts(planned_fields.iter().copied())?;
     let opt_v3_planned_fields = profile.opt_v3_indexed_field_access_plans();
-    prime_opt_v3_field_index_layouts(opt_v3_planned_fields.iter().copied())?;
+    let opt_v3_layout_groups =
+        opt_v3_indexed_field_layout_groups(opt_v3_planned_fields.iter().copied());
+    prime_opt_v3_field_index_layouts(opt_v3_layout_groups.iter())?;
     let mut type_refs = HashSet::new();
     for planned in planned_fields {
         if let Some(specialization) = field_index_specialization_from_primed_planned(planned)? {
@@ -1407,7 +1413,8 @@ fn predeclare_specialization_type_imports(
         }
     }
     for planned in opt_v3_planned_fields {
-        if let Some(specialization) = field_index_specialization_from_primed_opt_v3(planned)? {
+        let request = opt_v3_indexed_field_runtime_access_request(planned);
+        if let Some(specialization) = field_index_specialization_from_primed_opt_v3(&request)? {
             type_refs.insert(specialization.owner_type_ref);
         }
     }
@@ -8259,14 +8266,8 @@ impl FieldIndexSpecialization {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct OptV3ResolvedIndexedFieldAccess {
-    access: PlanV3IndexedFieldAccessKind,
-    attr_name: String,
-    guard: PlanV3IndexedFieldGuardKind,
-    fallback: PlanV3IndexedFieldFallbackKind,
-    specialization: FieldIndexSpecialization,
-}
+type OptV3ResolvedIndexedFieldAccess =
+    OptV3ResolvedIndexedFieldAccessFromOpt<FieldIndexSpecialization>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct IndexedFieldLoweringPlan {
@@ -13533,7 +13534,9 @@ impl<'a> SpecializationProfile<'a> {
         let planned_fields = self.planned_legacy_field_index_specializations();
         prime_planned_field_index_layouts(planned_fields.iter().copied())?;
         let opt_v3_planned_fields = self.opt_v3_indexed_field_access_plans();
-        prime_opt_v3_field_index_layouts(opt_v3_planned_fields.iter().copied())?;
+        let opt_v3_layout_groups =
+            opt_v3_indexed_field_layout_groups(opt_v3_planned_fields.iter().copied());
+        prime_opt_v3_field_index_layouts(opt_v3_layout_groups.iter())?;
         let mut by_attr = HashMap::<String, Vec<FieldIndexSpecialization>>::new();
         for planned in planned_fields {
             if let Some(specialization) = field_index_specialization_from_primed_planned(planned)? {
@@ -13549,8 +13552,9 @@ impl<'a> SpecializationProfile<'a> {
                 .get(&function_id)
                 .map(|evidence| &evidence.field_index_specializations),
         )?;
-        let opt_v3_by_instr = self.opt_v3_indexed_fields_by_instr_from_emitted(
+        let opt_v3_by_instr = opt_v3_prepare_indexed_field_accesses_for_codegen(
             self.opt_v3_emitted_indexed_fields.get(&function_id),
+            required_field_index_specialization_from_primed_opt_v3,
         )?;
         Ok((by_attr, by_instr, opt_v3_by_instr))
     }
@@ -13574,44 +13578,6 @@ impl<'a> SpecializationProfile<'a> {
             }
             if !specializations.is_empty() {
                 by_instr.insert(*instr_id, specializations);
-            }
-        }
-        Ok(by_instr)
-    }
-
-    fn opt_v3_indexed_fields_by_instr_from_emitted(
-        &self,
-        planned_by_instr: Option<&HashMap<InstrId, Vec<OptV3IndexedFieldAccessPlan>>>,
-    ) -> Result<HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>, String> {
-        let Some(planned_by_instr) = planned_by_instr else {
-            return Ok(HashMap::new());
-        };
-        let mut by_instr = HashMap::new();
-        for (instr_id, planned_accesses) in planned_by_instr {
-            let mut resolved_accesses = Vec::new();
-            for planned in planned_accesses {
-                let specialization =
-                    required_field_index_specialization_from_primed_opt_v3(planned).map_err(
-                        |err| {
-                            format!(
-                                "optimizer v3 indexed-field plan {:?} for {} attr {:?} could not bind a runtime field guard: {err}",
-                                planned.access, instr_id, planned.guard.attr_name
-                            )
-                        },
-                    )?;
-                let resolved = OptV3ResolvedIndexedFieldAccess {
-                    access: planned.access,
-                    attr_name: planned.guard.attr_name.clone(),
-                    guard: planned.guard.kind,
-                    fallback: planned.fallback,
-                    specialization,
-                };
-                if !resolved_accesses.contains(&resolved) {
-                    resolved_accesses.push(resolved);
-                }
-            }
-            if !resolved_accesses.is_empty() {
-                by_instr.insert(*instr_id, resolved_accesses);
             }
         }
         Ok(by_instr)
@@ -14200,13 +14166,6 @@ fn planned_field_index_type_key(planned: &PlannedIndexedFieldSpecialization) -> 
     }
 }
 
-fn opt_v3_field_index_type_key(planned: &OptV3IndexedFieldAccessPlan) -> CounterDumpTypeKey {
-    CounterDumpTypeKey {
-        module_name: planned.guard.owner_type.module_name.clone(),
-        qualname: planned.guard.owner_type.qualname.clone(),
-    }
-}
-
 fn prime_planned_field_index_layouts<'a>(
     planned_fields: impl IntoIterator<Item = &'a PlannedIndexedFieldSpecialization>,
 ) -> Result<(), String> {
@@ -14245,38 +14204,13 @@ fn prime_planned_field_index_layouts<'a>(
 }
 
 fn prime_opt_v3_field_index_layouts<'a>(
-    planned_fields: impl IntoIterator<Item = &'a OptV3IndexedFieldAccessPlan>,
+    layout_groups: impl IntoIterator<Item = &'a OptV3IndexedFieldLayoutGroup>,
 ) -> Result<(), String> {
-    let mut layouts_by_type = HashMap::<CounterDumpTypeKey, Vec<CollectedTypeKeyLayout>>::new();
-    let mut seen_layouts = HashSet::<(CounterDumpTypeKey, String, u32)>::new();
-    for planned in planned_fields {
-        let type_key = opt_v3_field_index_type_key(planned);
-        if !seen_layouts.insert((
-            type_key.clone(),
-            planned.guard.attr_name.clone(),
-            planned.guard.expected_index,
-        )) {
-            continue;
-        }
-        layouts_by_type
-            .entry(type_key)
-            .or_default()
-            .push(CollectedTypeKeyLayout {
-                owner_type_id: 0,
-                key: planned.guard.attr_name.clone(),
-                index: planned.guard.expected_index,
-            });
-    }
-    for (type_key, mut layouts) in layouts_by_type {
-        layouts.sort_by(|lhs, rhs| {
-            lhs.index
-                .cmp(&rhs.index)
-                .then_with(|| lhs.key.cmp(&rhs.key))
-        });
-        let Some(owner_type) = resolve_type_key_to_type(&type_key)? else {
+    for group in layout_groups {
+        let Some(owner_type) = resolve_type_key_to_type(&group.type_key)? else {
             continue;
         };
-        prime_field_index_layout(owner_type, layouts.as_slice())?;
+        prime_field_index_layout(owner_type, group.layouts.as_slice())?;
     }
     Ok(())
 }
@@ -14296,24 +14230,23 @@ fn field_index_specialization_from_primed_planned(
 }
 
 fn field_index_specialization_from_primed_opt_v3(
-    planned: &OptV3IndexedFieldAccessPlan,
+    request: &OptV3IndexedFieldRuntimeAccessRequest,
 ) -> Result<Option<FieldIndexSpecialization>, String> {
-    let type_key = opt_v3_field_index_type_key(planned);
-    let Some(owner_type) = resolve_type_key_to_type(&type_key)? else {
+    let Some(owner_type) = resolve_type_key_to_type(&request.type_key)? else {
         return Ok(None);
     };
     field_index_specialization_for_type(
         owner_type,
-        planned.guard.attr_name.as_str(),
-        planned.guard.expected_index,
+        request.attr_name.as_str(),
+        request.expected_index,
     )
 }
 
 fn required_field_index_specialization_from_primed_opt_v3(
-    planned: &OptV3IndexedFieldAccessPlan,
+    request: &OptV3IndexedFieldRuntimeAccessRequest,
 ) -> Result<FieldIndexSpecialization, String> {
-    let type_key = opt_v3_field_index_type_key(planned);
-    let Some(owner_type) = resolve_type_key_to_type(&type_key)? else {
+    let type_key = &request.type_key;
+    let Some(owner_type) = resolve_type_key_to_type(type_key)? else {
         return Err(format!(
             "owner type {}.{} is not loaded or cannot be resolved",
             type_key.module_name, type_key.qualname
@@ -14321,16 +14254,16 @@ fn required_field_index_specialization_from_primed_opt_v3(
     };
     field_index_specialization_for_type(
         owner_type,
-        planned.guard.attr_name.as_str(),
-        planned.guard.expected_index,
+        request.attr_name.as_str(),
+        request.expected_index,
     )?
     .ok_or_else(|| {
         format!(
             "owner type {}.{} does not support indexed-field lowering for attr {:?} at expected index {}; this requires a heap type with generic getattro/setattro, no class binding for the attr, and a nonzero type version tag",
             type_key.module_name,
             type_key.qualname,
-            planned.guard.attr_name,
-            planned.guard.expected_index
+            request.attr_name,
+            request.expected_index
         )
     })
 }
