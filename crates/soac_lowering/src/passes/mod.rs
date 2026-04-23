@@ -33,7 +33,7 @@ use soac_macros::{enum_broadcast, DelegateMatchDefault};
 
 #[derive(Clone, derive_more::From, DelegateMatchDefault)]
 #[enum_broadcast(HasMeta, WithMeta, ChildVisitable, Mappable, PrettyPrint, Debug)]
-pub enum InstrRuff {
+pub(crate) enum InstrRuff {
     ExprBoolOp(ExprBoolOp<Self>),
     ExprNamed(ExprNamed<Self>),
     BinOp(BinOp<Self>),
@@ -95,7 +95,8 @@ pub enum InstrRuff {
 }
 
 #[derive(Debug, Clone)]
-pub struct RuffModuleShape;
+#[allow(dead_code)]
+pub(crate) struct RuffModuleShape;
 
 impl ModuleShape for RuffModuleShape {
     type Instr = InstrRuff;
@@ -167,7 +168,7 @@ impl InstrWithConstantNone for InstrCodegenOp {
 
 #[derive(Clone, derive_more::From, DelegateMatchDefault)]
 #[enum_broadcast(HasMeta, WithMeta, ChildVisitable, Mappable, PrettyPrint, Debug)]
-pub enum InstrWithAwaitAndYield {
+pub(crate) enum InstrWithAwaitAndYield {
     Literal(LiteralValue),
     BinOp(BinOp<Self>),
     UnaryOp(UnaryOp<Self>),
@@ -203,7 +204,7 @@ impl InstrWithConstantNone for InstrWithAwaitAndYield {
 
 #[derive(Clone, derive_more::From, DelegateMatchDefault)]
 #[enum_broadcast(HasMeta, WithMeta, ChildVisitable, Mappable, PrettyPrint, Debug)]
-pub enum InstrWithYield {
+pub(crate) enum InstrWithYield {
     Literal(LiteralValue),
     BinOp(BinOp<Self>),
     UnaryOp(UnaryOp<Self>),
@@ -259,7 +260,7 @@ impl InstrWithConstantNone for InstrWithYield {
     rkyv::Archived<N>: rkyv::bytecheck::CheckBytes<__C>,
 )))]
 #[enum_broadcast(HasMeta, WithMeta, ChildVisitable, Mappable, PrettyPrint, Debug)]
-pub enum InstrLow<N: NameLike> {
+pub(crate) enum InstrLow<N: NameLike> {
     Literal(LiteralValue),
     BinOp(#[rkyv(omit_bounds)] BinOp<Self>),
     UnaryOp(#[rkyv(omit_bounds)] UnaryOp<Self>),
@@ -291,7 +292,7 @@ impl<N: NameLike> InstrWithConstantNone for InstrLow<N> {
     }
 }
 
-pub type InstrUnresolved = InstrLow<UnresolvedName>;
+pub(crate) type InstrUnresolved = InstrLow<UnresolvedName>;
 
 #[derive(
     Clone,
@@ -341,7 +342,7 @@ impl InstrWithConstantNone for InstrResolved {
 }
 
 #[derive(Debug, Clone)]
-pub struct CoreModuleShapeWithAwaitAndYield;
+pub(crate) struct CoreModuleShapeWithAwaitAndYield;
 
 impl ModuleShape for CoreModuleShapeWithAwaitAndYield {
     type Instr = InstrWithAwaitAndYield;
@@ -349,7 +350,7 @@ impl ModuleShape for CoreModuleShapeWithAwaitAndYield {
 }
 
 #[derive(Debug, Clone)]
-pub struct CoreModuleShapeWithYield;
+pub(crate) struct CoreModuleShapeWithYield;
 
 impl ModuleShape for CoreModuleShapeWithYield {
     type Instr = InstrWithYield;
@@ -357,7 +358,7 @@ impl ModuleShape for CoreModuleShapeWithYield {
 }
 
 #[derive(Debug, Clone)]
-pub struct CoreModuleShape;
+pub(crate) struct CoreModuleShape;
 
 impl ModuleShape for CoreModuleShape {
     type Instr = InstrLow<UnresolvedName>;
@@ -365,7 +366,7 @@ impl ModuleShape for CoreModuleShape {
 }
 
 #[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-pub struct ResolvedStorageModuleShape;
+pub(crate) struct ResolvedStorageModuleShape;
 
 impl ModuleShape for ResolvedStorageModuleShape {
     type Instr = InstrResolved;
@@ -381,7 +382,7 @@ impl ModuleShape for CodegenModuleShape {
 }
 
 #[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-pub struct CodegenUnidentifiedModuleShape;
+pub(crate) struct CodegenUnidentifiedModuleShape;
 
 impl ModuleShape for CodegenUnidentifiedModuleShape {
     type Instr = InstrCodegen;
@@ -389,11 +390,11 @@ impl ModuleShape for CodegenUnidentifiedModuleShape {
 }
 
 pub(crate) use blockpy_generators::lower_yield_in_lowered_core_blockpy_module_bundle;
-pub use blockpy_to_bb::{lower_try_jump_exception_flow, normalize_bb_module_strings};
+pub(crate) use blockpy_to_bb::{lower_try_jump_exception_flow, normalize_bb_module_strings};
+pub(crate) use instr_id::assign_module_instr_ids;
 pub use instr_id::{
-    assign_function_instr_ids, assign_missing_codegen_function_instr_ids, assign_module_instr_ids,
-    reassign_codegen_function_instr_ids, reassign_codegen_module_instr_ids,
-    validate_codegen_instr_ids,
+    assign_missing_codegen_function_instr_ids, reassign_codegen_function_instr_ids,
+    reassign_codegen_module_instr_ids, validate_codegen_instr_ids,
 };
 pub use instrument::{
     CounterBuilder, CounterHandle, CounterSpec, InstrumentInstr, OptBlock, OptInstr,

@@ -1,4 +1,7 @@
-use super::*;
+use super::{
+    ChildVisitable, HasMeta, Instr, MapInstr, Mappable, Meta, PrettyPrint, PrettyPrinter,
+    TryMapInstr, Visit, VisitMut, WithMeta,
+};
 use std::fmt;
 
 #[derive(Clone, derive_more::From, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -106,17 +109,6 @@ impl LiteralValue {
     pub fn into_literal(self) -> Literal {
         self.literal
     }
-}
-
-pub(crate) fn literal_value(literal: impl Into<Literal>, meta: Meta) -> LiteralValue {
-    LiteralValue::new(literal.into()).with_meta(meta)
-}
-
-pub(crate) fn literal_expr<E>(literal: impl Into<Literal>, meta: Meta) -> E
-where
-    E: Instr + From<LiteralValue>,
-{
-    E::from(literal_value(literal, meta))
 }
 
 #[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]

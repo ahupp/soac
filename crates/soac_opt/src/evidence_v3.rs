@@ -3,7 +3,7 @@ use crate::plan::FunctionProfileEvidence;
 use crate::planner_v3::PlannerFacts;
 use crate::region_v3::{ExtractedRegion, ExtractedValueId, ExtractedValueKind};
 use soac_core::block_py::NameLocation;
-use soac_lowering::block_py::literal::{Literal, NumberLiteralValue};
+use soac_core::block_py::literal::{Literal, NumberLiteralValue};
 use soac_lowering::passes::InstrResolved;
 use std::collections::HashMap;
 
@@ -100,12 +100,12 @@ mod tests {
         plan_module_optimization_v3,
     };
     use crate::region_v3::extract_block_region_v3;
+    use soac_core::block_py::literal::{IntLiteral, LiteralValue, NumberLiteral};
     use soac_core::block_py::{
         BinOp, BinOpKind, Block, BlockLabel, BlockParam, BlockPyName, BlockTerm, InstrId, Load,
         LocalFunctionId, LocalLocation, Meta, NameLocation, ResolvedName, SerializedFunctionId,
         SerializedIdentityTables, SerializedModuleId, SerializedModuleIdentity, TermIf, WithMeta,
     };
-    use soac_lowering::block_py::literal::{IntLiteral, LiteralValue, NumberLiteral};
 
     fn label(index: usize) -> BlockLabel {
         BlockLabel::from_index(index)

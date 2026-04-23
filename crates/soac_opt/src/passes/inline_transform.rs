@@ -3,13 +3,13 @@ use crate::passes::{
     InstrResolved, allocate_codegen_stack_temp, plan_module_inlining,
     reassign_codegen_function_instr_ids, summarize_module_escapes, try_allocate_codegen_stack_temp,
 };
+use soac_core::block_py::literal::Literal;
 use soac_core::block_py::{
     Block, BlockArg, BlockEdge, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm,
     CallArgPositional, CallDirect, HasMeta, LocalLocation, MapInstr, Mappable, NameLocation,
     ParamKind, ResolvedName, RuntimeFunctionId, RuntimeName, Store, TryMapInstr, TryMapTerm,
     WithMeta, instr_any,
 };
-use soac_lowering::block_py::literal::Literal;
 use std::collections::{HashMap, HashSet};
 
 pub const DEFAULT_INLINE_SCALAR_FIXED_POINT_ITERATIONS: usize = 4;

@@ -1738,6 +1738,7 @@ name = "soac_core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "derive_more",
  "memmap2",
  "rkyv",
  "ruff_python_ast",

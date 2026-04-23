@@ -75,20 +75,13 @@ fn qualified_case_name(path: &Path, block: &FixtureBlock) -> Result<String, Stri
 }
 
 fn render_blockpy_snapshot(_source: &str, result: &LoweringResult) -> (String, usize, usize) {
-    let core_blockpy = result.pass_tracker.pass_core_blockpy_with_await_and_yield();
     let blockpy_rendered = result
         .pass_tracker
         .render_pass_text("core_blockpy_with_await_and_yield")
         .unwrap_or_else(|| "; no BlockPy module emitted".to_string());
-    let blockpy_blocks = core_blockpy
-        .as_ref()
-        .map(|module| {
-            module
-                .callable_defs
-                .iter()
-                .map(|function| function.blocks.len())
-                .sum()
-        })
+    let blockpy_blocks = result
+        .pass_tracker
+        .pass_block_count("core_blockpy_with_await_and_yield")
         .unwrap_or(0);
     let clif_blocks = count_clif_blocks(&result.codegen_module);
     (blockpy_rendered, blockpy_blocks, clif_blocks)

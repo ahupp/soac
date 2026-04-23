@@ -32,6 +32,7 @@ use crate::region_v3::{
     RegionExtractionAttempt, RegionExtractionError, extract_function_regions_v3,
 };
 use anyhow::Result;
+use soac_core::block_py::literal::Literal;
 use soac_core::block_py::{
     BlockLabel, BlockPyFunction, BlockPyModule, Call, CallArgPositional, CallDirect,
     ChildVisitable, FunctionExecutionMode, HasSemanticInstrId, InstrId, LocalFunctionId,
@@ -39,7 +40,6 @@ use soac_core::block_py::{
     RuntimeFunctionId, RuntimeModuleId, SerializedFunctionDebugName, SerializedFunctionId,
     SerializedIdentityTables, SerializedModuleId, SerializedModuleIdentity, Visit,
 };
-use soac_lowering::block_py::literal::Literal;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
@@ -1760,6 +1760,7 @@ mod tests {
     use crate::operator_specialization::{ExactTypeTag, pack_binary_shape};
     use crate::plan_v3::{RegionId, validate_module_plan_v3};
     use crate::region_v3::{ExtractedValueId, extract_block_region_v3};
+    use soac_core::block_py::literal::{LiteralValue, StringLiteral};
     use soac_core::block_py::{
         BinOp, BinOpKind, Block, BlockLabel, BlockParam, BlockPyName, BlockTerm, FunctionName,
         GetAttr, GetItem, InstrId, Load, LocalFunctionId, LocalLocation, Meta, ModuleNameGen,
@@ -1770,7 +1771,6 @@ mod tests {
         CounterDumpKeyLayout, CounterDumpRecord, CounterDumpTypeKey, CounterDumpTypeKeyLayout,
         CounterDumpTypeTableEntry,
     };
-    use soac_lowering::block_py::literal::{LiteralValue, StringLiteral};
     use soac_lowering::passes::{InstrCodegen, InstrResolved};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};

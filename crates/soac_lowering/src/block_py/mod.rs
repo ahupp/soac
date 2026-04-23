@@ -2,7 +2,6 @@ pub(crate) use soac_core::block_py::*;
 
 pub(crate) mod cfg;
 pub mod counters;
-pub mod literal;
 mod pretty;
 mod scope_impls;
 pub mod validate;
@@ -12,11 +11,6 @@ pub(crate) use crate::passes::{
     InstrWithYield,
 };
 pub(crate) use counters::IncrementCounter;
-pub(crate) use literal::literal_expr;
-pub(crate) use literal::{
-    BytesLiteral, IntLiteral, Literal, LiteralValue, NumberLiteral, NumberLiteralValue,
-    StringLiteral,
-};
 pub(crate) use scope_impls::{
     build_storage_layout_from_capture_names, compute_make_function_capture_bindings_from_scope,
     compute_storage_layout_from_scope, is_runtime_closure_name, ScopeExprNode,
@@ -27,6 +21,17 @@ pub(crate) use validate::validate_module;
 pub(crate) type ResolvedStorageBlock = Block<InstrResolved>;
 #[cfg(test)]
 pub(crate) type CodegenBlock = Block<InstrCodegen>;
+
+pub(crate) fn literal_value(literal: impl Into<Literal>, meta: Meta) -> LiteralValue {
+    LiteralValue::new(literal.into()).with_meta(meta)
+}
+
+pub(crate) fn literal_expr<E>(literal: impl Into<Literal>, meta: Meta) -> E
+where
+    E: Instr + From<LiteralValue>,
+{
+    E::from(literal_value(literal, meta))
+}
 
 pub(crate) fn core_call_expr_with_meta<E>(
     func: E,

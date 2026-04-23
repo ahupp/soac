@@ -4,7 +4,7 @@ use crate::block_py::{
 use crate::passes::ruff_to_blockpy::populate_exception_edge_args;
 use crate::passes::ResolvedStorageModuleShape;
 
-pub fn lower_try_jump_exception_flow(
+pub(crate) fn lower_try_jump_exception_flow(
     module: &BlockPyModule<ResolvedStorageModuleShape>,
 ) -> BlockPyModule<ResolvedStorageModuleShape> {
     let callable_defs = module

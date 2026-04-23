@@ -3,7 +3,7 @@ use crate::passes::{
 };
 use ruff_python_ast::{self as ast, ModModule};
 use ruff_text_size::TextRange;
-use soac_core::block_py::{BlockPyModule, PrettyPrint};
+use soac_core::block_py::{BlockPyModule, ModuleShape, PrettyPrint};
 use std::any::Any;
 use std::time::{Duration, Instant};
 
@@ -57,6 +57,17 @@ where
         .downcast_ref::<T>()
         .expect("tracked pass renderer type should match stored value")
         .debug_pretty_print()
+}
+
+fn blockpy_module_block_count<S>(module: &BlockPyModule<S>) -> usize
+where
+    S: ModuleShape,
+{
+    module
+        .callable_defs
+        .iter()
+        .map(|function| function.blocks.len())
+        .sum()
 }
 
 impl NoopPassTracker {
@@ -121,11 +132,11 @@ impl RecordingPassTracker {
             })
     }
 
-    pub fn pass_core_blockpy(&self) -> Option<&BlockPyModule<CoreModuleShape>> {
+    pub(crate) fn pass_core_blockpy(&self) -> Option<&BlockPyModule<CoreModuleShape>> {
         self.get::<BlockPyModule<CoreModuleShape>>("core_blockpy")
     }
 
-    pub fn pass_core_blockpy_with_await_and_yield(
+    pub(crate) fn pass_core_blockpy_with_await_and_yield(
         &self,
     ) -> Option<&BlockPyModule<CoreModuleShapeWithAwaitAndYield>> {
         self.get::<BlockPyModule<CoreModuleShapeWithAwaitAndYield>>(
@@ -133,8 +144,19 @@ impl RecordingPassTracker {
         )
     }
 
-    pub fn pass_name_binding(&self) -> Option<&BlockPyModule<ResolvedStorageModuleShape>> {
+    pub(crate) fn pass_name_binding(&self) -> Option<&BlockPyModule<ResolvedStorageModuleShape>> {
         self.get::<BlockPyModule<ResolvedStorageModuleShape>>("name_binding")
+    }
+
+    pub fn pass_block_count(&self, name: &str) -> Option<usize> {
+        match name {
+            "core_blockpy" => self.pass_core_blockpy().map(blockpy_module_block_count),
+            "core_blockpy_with_await_and_yield" => self
+                .pass_core_blockpy_with_await_and_yield()
+                .map(blockpy_module_block_count),
+            "name_binding" => self.pass_name_binding().map(blockpy_module_block_count),
+            _ => None,
+        }
     }
 
     pub fn render_pass_text(&self, name: &str) -> Option<String> {

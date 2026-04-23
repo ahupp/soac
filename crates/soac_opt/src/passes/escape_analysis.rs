@@ -1,10 +1,10 @@
 use crate::passes::{CodegenModuleShape, InstrCodegen, InstrCodegenOp, InstrResolved};
 use soac_core::block_py::PrettyPrint;
+use soac_core::block_py::literal::Literal;
 use soac_core::block_py::{
     Block, BlockPyFunction, BlockPyModule, BlockTerm, HasMeta, InstrId, LocalLocation, NameLike,
     NameLocation, RuntimeFunctionId, instr_any,
 };
-use soac_lowering::block_py::literal::Literal;
 use std::collections::{HashMap, HashSet};
 
 #[derive(

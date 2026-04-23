@@ -31,6 +31,7 @@ use cranelift_reader::parse_functions;
 use pyo3::{Py, PyAny, Python, ffi};
 use soac_config::SoacEnvConfig;
 use soac_core::block_py as blockpy_intrinsics;
+use soac_core::block_py::literal::Literal;
 use soac_core::block_py::{
     AbruptKind, Block, BlockArg, BlockEdge, BlockLabel, BlockParamRole, BlockPyFunction,
     BlockPyModule, BlockTerm, CallArgKeyword, CallArgPositional, CallableScopeKind, CellLocation,
@@ -48,7 +49,6 @@ use soac_driver::codegen_cache::{
     validate_codegen_module_cache_metadata,
 };
 use soac_driver::finish_cached_codegen_module_for_runtime_with_counter_defs;
-use soac_lowering::block_py::literal::Literal;
 use soac_opt::access_emission_v3::{
     ExactListItemAccessPlan as OptV3ExactListItemAccessPlan,
     IndexedFieldAccessPlan as OptV3IndexedFieldAccessPlan,

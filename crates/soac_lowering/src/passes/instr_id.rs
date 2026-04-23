@@ -38,7 +38,9 @@ impl VisitMut<InstrCodegen> for BlockInstrIdAssigner {
     }
 }
 
-pub fn assign_function_instr_ids(function: &mut BlockPyFunction<CodegenUnidentifiedModuleShape>) {
+pub(crate) fn assign_function_instr_ids(
+    function: &mut BlockPyFunction<CodegenUnidentifiedModuleShape>,
+) {
     for block in &mut function.blocks {
         let mut assigner = BlockInstrIdAssigner {
             block_label: block.label,
@@ -175,7 +177,7 @@ fn into_identified_function(
     }
 }
 
-pub fn assign_module_instr_ids(
+pub(crate) fn assign_module_instr_ids(
     module: BlockPyModule<CodegenUnidentifiedModuleShape>,
 ) -> BlockPyModule<CodegenModuleShape> {
     BlockPyModule {

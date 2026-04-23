@@ -1,4 +1,7 @@
 use super::*;
+use soac_core::block_py::literal::{
+    Literal, LiteralValue, NumberLiteral, NumberLiteralValue, StringLiteral,
+};
 use soac_core::block_py::{
     AbruptKind, BinOp, BinOpKind, BlockArg, BlockEdge, BlockLabel, BlockParam, BlockParamRole,
     BlockPyFunction, BlockPyModule, BlockTerm, Call, CallArgKeyword, CallArgPositional, CallDirect,
@@ -11,9 +14,6 @@ use soac_core::block_py::{
     StorageLayout, Store, Tuple, UnaryOp, UnaryOpKind, Visit, VisitMut, WithMeta,
 };
 use soac_lowering::block_py::counters::IncrementCounter;
-use soac_lowering::block_py::literal::{
-    Literal, LiteralValue, NumberLiteral, NumberLiteralValue, StringLiteral,
-};
 use soac_lowering::passes::{
     CodegenModuleShape, InstrCodegen, InstrResolved,
     instrument_bb_module_with_block_entry_counters, instrument_bb_module_with_call_target_counters,

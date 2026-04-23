@@ -11,6 +11,10 @@ pub use self::instr::{
     StmtMatch, StmtNonlocal, StmtPass, StmtRaise, StmtReturn, StmtTry, StmtTypeAlias, StmtWhile,
     StmtWith, Store, Tuple, UnaryOp, UnaryOpKind, Yield, YieldFrom,
 };
+pub use self::literal::{
+    BytesLiteral, IntLiteral, Literal, LiteralValue, NumberLiteral, NumberLiteralValue,
+    StringLiteral,
+};
 #[allow(unused_imports)]
 pub use self::map::{
     InstrField, MapBlock, MapFunction, MapInstr, MapModule, MapTerm, Mappable, TryMapBlock,
@@ -41,6 +45,7 @@ use std::fmt::Write;
 mod counters;
 mod instr;
 mod instr_macro;
+pub mod literal;
 mod map;
 mod meta;
 mod name_gen;

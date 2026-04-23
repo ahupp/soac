@@ -1,9 +1,9 @@
 use crate::passes::{CodegenModuleShape, InstrCodegen, InstrResolved};
+use soac_core::block_py::literal::{Literal, NumberLiteralValue};
 use soac_core::block_py::{
     BinOpKind, Block, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, ChildVisitable,
     HasSemanticInstrId, InstrKey, LocalLocation, NameLike, RuntimeFunctionId, UnaryOpKind, Visit,
 };
-use soac_lowering::block_py::literal::{Literal, NumberLiteralValue};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]

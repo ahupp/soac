@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = { version = "1.0.100", features = ["backtrace"] }
+derive_more = { version = "2", features = ["from"] }
 memmap2 = "0.9"
 rkyv = { version = "0.8", default-features = false, features = ["std", "bytecheck"] }
 ruff_python_ast = { workspace = true }
