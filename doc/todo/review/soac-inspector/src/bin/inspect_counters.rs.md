@@ -20,5 +20,4 @@ CLI for inspecting SOAC counter dump files. It can print module/type key layouts
 ## Context Read
 
 - `crates/soac_jit/src/counter_dump.rs`
-- `.codex/skills/soac-clif-snippet/scripts/profile_snippet_clif.py`
-
+- `.codex/skills/soac-annotate/scripts/profile_snippet_annotation.py`

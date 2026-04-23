@@ -102,10 +102,11 @@
   Runs vendored CPython regression tests through SOAC's import-hook path and
   writes structured logs for full, partitioned, or single-file regrtest runs.
 
-- `soac-clif-snippet`
-  Profiles a small Python snippet, renders pre-inlining and final specialized
-  CLIF, and prepares annotation context for explaining generated blocks,
-  guards, counters, and helper calls.
+- `soac-annotate`
+  Profiles a small Python snippet, collects post-opt-v3 BlockPy, specialized
+  CLIF, and VCode views, and prepares annotation context for explaining
+  generated blocks, guards, counters, and helper calls. It defaults to the
+  post-opt-v3 view unless CLIF or VCode is requested.
 
 - `soac-profile-benchmark`
   Runs the SOAC pystone profile/verify/apply benchmark workflow and summarizes
@@ -117,11 +118,11 @@
 
 ## CLI Inspection Tools
 
-Most command-line inspection tools live in `soac-inspector` and can be run as
-`cargo run -p soac-inspector --bin <tool> -- ...`. The offline optimization
+Most command-line inspection tools live in `soac_inspector` and can be run as
+`cargo run -p soac_inspector --bin <tool> -- ...`. The offline optimization
 planner lives in `soac-opt`.
 
-- `soac-inspector`
+- `soac_inspector`
   Starts the local web inspector server. It serves the interactive pass,
   BlockPy, CLIF, and typed-instruction views, binding to `HOST`/`PORT` or
   `127.0.0.1:8000` by default.

@@ -47,10 +47,9 @@ def main() -> int:
         raise RuntimeError(f"SOAC did not write profile counters at {profile_dump}")
 
     function_id = lookup_function_id(source_path, target_name)
-    optimization_decisions = decide_optimizations(profile_dump, counters_dir, mode="legacy")
     optimization_decisions_v3 = decide_optimizations(profile_dump, counters_dir, mode="v3")
-    optimization_plan = print_optimization_plans(counters_dir)
     optimization_plan_v3 = print_optimization_plans_v3(counters_dir)
+    post_opt_v3 = print_post_opt_v3_definition(counters_dir)
     specializations = inspect_specializations(profile_dump)
     pre_inline_clif = render_specialized_clif(
         module_name=module_name,
@@ -59,13 +58,16 @@ def main() -> int:
         counters_dir=counters_dir,
         pre_inline=True,
     )
+    vcode_path = artifact_dir / "specialized.vcode"
     clif = render_specialized_clif(
         module_name=module_name,
         source_path=source_path,
         function_id=function_id,
         counters_dir=counters_dir,
         pre_inline=False,
+        vcode_out=vcode_path,
     )
+    vcode = vcode_path.read_text(encoding="utf-8")
     instr_typed = render_specialized_instr_typed(
         module_name=module_name,
         source_path=source_path,
@@ -74,10 +76,9 @@ def main() -> int:
     )
 
     specializations_path = artifact_dir / "specializations.txt"
-    optimization_decisions_path = artifact_dir / "optimization_decisions.txt"
     optimization_decisions_v3_path = artifact_dir / "optimization_decisions_v3.txt"
-    optimization_plan_path = artifact_dir / "optimization_plan.txt"
     optimization_plan_v3_path = artifact_dir / "optimization_plan_v3.txt"
+    post_opt_v3_path = artifact_dir / "post_opt_v3.blockpy.txt"
     pre_inline_clif_path = artifact_dir / "pre_inline.clif"
     clif_path = artifact_dir / "specialized.clif"
     instr_typed_path = artifact_dir / "instr_typed.txt"
@@ -85,17 +86,17 @@ def main() -> int:
     metadata_path = artifact_dir / "metadata.json"
 
     specializations_path.write_text(specializations, encoding="utf-8")
-    optimization_decisions_path.write_text(optimization_decisions, encoding="utf-8")
     optimization_decisions_v3_path.write_text(
         optimization_decisions_v3, encoding="utf-8"
     )
-    optimization_plan_path.write_text(optimization_plan, encoding="utf-8")
     optimization_plan_v3_path.write_text(optimization_plan_v3, encoding="utf-8")
+    post_opt_v3_path.write_text(post_opt_v3, encoding="utf-8")
     pre_inline_clif_path.write_text(pre_inline_clif, encoding="utf-8")
     clif_path.write_text(clif, encoding="utf-8")
     instr_typed_path.write_text(instr_typed, encoding="utf-8")
     metadata = {
         "artifact_dir": str(artifact_dir),
+        "preferred_view": args.view,
         "module_name": module_name,
         "function_name": target_name,
         "function_id": function_id,
@@ -104,12 +105,12 @@ def main() -> int:
         "result_repr": result_repr,
         "profile_dump": str(profile_dump),
         "specializations_path": str(specializations_path),
-        "optimization_decisions_path": str(optimization_decisions_path),
         "optimization_decisions_v3_path": str(optimization_decisions_v3_path),
-        "optimization_plan_path": str(optimization_plan_path),
         "optimization_plan_v3_path": str(optimization_plan_v3_path),
+        "post_opt_v3_path": str(post_opt_v3_path),
         "pre_inline_clif_path": str(pre_inline_clif_path),
         "clif_path": str(clif_path),
+        "vcode_path": str(vcode_path),
         "instr_typed_path": str(instr_typed_path),
         "annotation_context_path": str(context_path),
     }
@@ -118,26 +119,26 @@ def main() -> int:
         annotation_context(
             metadata=metadata,
             source=source_path.read_text(encoding="utf-8"),
-            optimization_decisions=optimization_decisions,
             optimization_decisions_v3=optimization_decisions_v3,
-            optimization_plan=optimization_plan,
             optimization_plan_v3=optimization_plan_v3,
+            post_opt_v3=post_opt_v3,
             specializations=specializations,
             instr_typed=instr_typed,
             pre_inline_clif=pre_inline_clif,
             clif=clif,
+            vcode=vcode,
         ),
         encoding="utf-8",
     )
 
     print(f"artifact_dir: {artifact_dir}")
     print(f"annotation_context: {context_path}")
-    print(f"optimization_decisions: {optimization_decisions_path}")
     print(f"optimization_decisions_v3: {optimization_decisions_v3_path}")
-    print(f"optimization_plan: {optimization_plan_path}")
     print(f"optimization_plan_v3: {optimization_plan_v3_path}")
+    print(f"post_opt_v3: {post_opt_v3_path}")
     print(f"pre_inline_clif: {pre_inline_clif_path}")
     print(f"specialized_clif: {clif_path}")
+    print(f"specialized_vcode: {vcode_path}")
     print(f"instr_typed: {instr_typed_path}")
     print(f"specializations: {specializations_path}")
     print(f"metadata: {metadata_path}")
@@ -146,7 +147,9 @@ def main() -> int:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Profile a Python snippet workload and render specialized SOAC CLIF."
+        description=(
+            "Profile a Python snippet workload and collect annotated SOAC views."
+        )
     )
     parser.add_argument(
         "--workload",
@@ -165,7 +168,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--artifact-dir",
         type=Path,
-        help="Directory for generated artifacts. Defaults to work/logs/soac-clif-snippets/<name>-<id>.",
+        help="Directory for generated artifacts. Defaults to work/logs/soac-annotations/<name>-<id>.",
+    )
+    parser.add_argument(
+        "--view",
+        choices=("post-opt", "clif", "vcode"),
+        default="post-opt",
+        help="Preferred view to annotate in the answer. Defaults to post-opt.",
     )
     return parser.parse_args()
 
@@ -188,7 +197,7 @@ def choose_artifact_dir(args: argparse.Namespace, target_name: str) -> Path:
         Path(import_hook.REPO_ROOT)
         / "work"
         / "logs"
-        / "soac-clif-snippets"
+        / "soac-annotations"
         / f"{sanitize_name(target_name)}-{unique}"
     )
 
@@ -279,13 +288,8 @@ def inspect_specializations(profile_dump: Path) -> str:
             "--specializations",
             str(profile_dump),
         ).stdout
-    except subprocess.CalledProcessError as err:
-        return (
-            "inspect_counters failed\n"
-            f"exit_code: {err.returncode}\n"
-            f"stdout:\n{err.stdout or ''}\n"
-            f"stderr:\n{err.stderr or ''}\n"
-        )
+    except RuntimeError as err:
+        return f"inspect_counters failed\n{err}\n"
 
 
 def decide_optimizations(profile_dump: Path, counters_dir: Path, *, mode: str) -> str:
@@ -301,23 +305,6 @@ def decide_optimizations(profile_dump: Path, counters_dir: Path, *, mode: str) -
         "--out",
         str(module_root),
     ).stdout
-
-
-def print_optimization_plans(counters_dir: Path) -> str:
-    module_root = counters_dir / "modules"
-    plan_paths = sorted(module_root.glob("**/mod.opt"))
-    if not plan_paths:
-        return f"no optimization plans found under {module_root}\n"
-
-    rendered = []
-    for plan_path in plan_paths:
-        plan_text = run_inspector(
-            "print_optimization_plan",
-            "--plan",
-            str(plan_path),
-        ).stdout
-        rendered.append(f"# {plan_path}\n{plan_text.rstrip()}\n")
-    return "\n".join(rendered)
 
 
 def print_optimization_plans_v3(counters_dir: Path) -> str:
@@ -338,6 +325,22 @@ def print_optimization_plans_v3(counters_dir: Path) -> str:
     return "\n".join(rendered)
 
 
+def print_post_opt_v3_definition(counters_dir: Path) -> str:
+    module_root = counters_dir / "modules"
+    module_paths = sorted(module_root.glob("**/mod.optv3.blockpy"))
+    if not module_paths:
+        return f"no optimizer v3 BlockPy modules found under {module_root}\n"
+
+    rendered = []
+    for module_path in module_paths:
+        module_text = run_inspector(
+            "print_codegen_module_cache",
+            str(module_path),
+        ).stdout
+        rendered.append(f"# {module_path}\n{module_text.rstrip()}\n")
+    return "\n".join(rendered)
+
+
 def render_specialized_clif(
     *,
     module_name: str,
@@ -345,6 +348,7 @@ def render_specialized_clif(
     function_id: str,
     counters_dir: Path,
     pre_inline: bool,
+    vcode_out: Path | None = None,
 ) -> str:
     env = {
         **os.environ,
@@ -361,6 +365,8 @@ def render_specialized_clif(
     ]
     if pre_inline:
         args.insert(2, "--pre-inline")
+    if vcode_out is not None:
+        args[1:1] = ["--vcode-out", str(vcode_out)]
     return run_inspector(*args, env=env).stdout
 
 
@@ -392,49 +398,60 @@ def run_inspector(
     *args: str,
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        [
-            "cargo",
-            "run",
-            "-q",
-            "-p",
-            "soac-inspector",
-            "--bin",
-            bin_name,
-            "--",
-            *args,
-        ],
+    package = "soac_opt" if bin_name == "decide_optimizations" else "soac_inspector"
+    command = [
+        "cargo",
+        "run",
+        "-q",
+        "-p",
+        package,
+        "--bin",
+        bin_name,
+        "--",
+        *args,
+    ]
+    result = subprocess.run(
+        command,
         cwd=import_hook.REPO_ROOT,
         env=env,
-        check=True,
         capture_output=True,
         text=True,
     )
+    if result.returncode != 0:
+        raise RuntimeError(
+            "inspector command failed\n"
+            f"command: {command!r}\n"
+            f"exit_code: {result.returncode}\n"
+            f"stdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}"
+        )
+    return result
 
 
 def annotation_context(
     *,
     metadata: dict[str, Any],
     source: str,
-    optimization_decisions: str,
     optimization_decisions_v3: str,
-    optimization_plan: str,
     optimization_plan_v3: str,
+    post_opt_v3: str,
     specializations: str,
     instr_typed: str,
     pre_inline_clif: str,
     clif: str,
+    vcode: str,
 ) -> str:
-    return f"""# SOAC CLIF Annotation Context
+    return f"""# SOAC Annotation Context
 
 ## Instructions
 
-Annotate the specialized CLIF below. Prefer the pre-inlining CLIF when explaining
-semantically meaningful helper calls, because runtime support calls are still
-visible there. Preserve CLIF order and add `;` comments before each block and
-beside important instructions. Explain guards, fast paths, slow paths, exception
-edges, helper calls, refcount cleanup, and direct indexed access. Use the source
-and counter context as evidence; mark uncertain block purposes as inferred.
+Produce an annotated view for `preferred_view` from the metadata. Default to the
+post-opt-v3 BlockPy definition unless the user asked for CLIF or VCode. Preserve
+the original order and add concise comments beside important instructions or
+blocks. Explain guards, fast paths, slow paths, exception edges, helper calls,
+refcount cleanup, direct indexed access, and lowered v3 optimization shapes. Use
+the source, plan, and counter context as evidence; mark uncertain block purposes
+as inferred.
 
 ## Metadata
 
@@ -454,28 +471,22 @@ and counter context as evidence; mark uncertain block purposes as inferred.
 {specializations.rstrip()}
 ```
 
-## Optimization Decision CLI Output
-
-```text
-{optimization_decisions.rstrip()}
-```
-
 ## Optimizer v3 Decision CLI Output
 
 ```text
 {optimization_decisions_v3.rstrip()}
 ```
 
-## Optimization Plan
-
-```text
-{optimization_plan.rstrip()}
-```
-
 ## Optimizer v3 Plan
 
 ```text
 {optimization_plan_v3.rstrip()}
+```
+
+## Post-Opt-V3 BlockPy Definition
+
+```text
+{post_opt_v3.rstrip()}
 ```
 
 ## InstrTyped Input To Codegen
@@ -494,6 +505,12 @@ and counter context as evidence; mark uncertain block purposes as inferred.
 
 ```clif
 {clif.rstrip()}
+```
+
+## Specialized VCode
+
+```text
+{vcode.rstrip()}
 ```
 """
 
