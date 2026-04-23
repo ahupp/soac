@@ -1,4 +1,6 @@
-use crate::config::SpecializationMode;
+use crate::config::{
+    SpecializationMode, module_optimization_plan_v3_path, pre_optimization_module_cache_identity,
+};
 use crate::counter::{CounterEntry, GilTopValueCounter, TopValueCounter};
 use crate::jit::JitCodegenStats;
 use crate::module_constants::{ModuleCodegenConstants, load_runtime_name_owned_by_id};
@@ -9,8 +11,9 @@ use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyAnyMethods, PyList, PyTuple};
 use soac_config::SoacEnvConfig;
 use soac_core::block_py::{
-    BlockPyFunction, BlockPyModule, CounterDef, CounterId, CounterScope, CounterSite,
-    DeoptEntrySource, FunctionExecutionMode, RuntimeFunctionId, RuntimeName,
+    BlockPyFunction, BlockPyModule, ChildVisitable, CounterBranch, CounterDef, CounterId,
+    CounterScope, CounterSite, DeoptEntrySource, FunctionExecutionMode, HasSemanticInstrId,
+    InstrId, RuntimeFunctionId, RuntimeModuleId, RuntimeName, SerializedFunctionId, Visit,
 };
 use soac_core::profile::{
     CounterDumpBranchValue, CounterDumpKeyLayout, CounterDumpRecord, CounterDumpRow,
@@ -23,9 +26,18 @@ use soac_driver::codegen_cache::{
 };
 use soac_driver::finish_cached_codegen_module_for_runtime_with_counter_defs;
 use soac_lowering::passes::{
-    CodegenModuleShape, deopt_entry_counter_instrumentation_enabled,
+    CodegenModuleShape, InstrCodegen, deopt_entry_counter_instrumentation_enabled,
     specialization_runtime_logging_enabled,
 };
+use soac_opt::access_emission_v3::{
+    IndexedFieldAccessPlan as OptV3IndexedFieldAccessPlan,
+    indexed_fields_for_function_from_artifacts as opt_v3_emitted_indexed_fields_for_function,
+};
+use soac_opt::artifacts_v3::{
+    ExactIntBranchV3Artifacts, load_optimization_artifacts_v3,
+    single_function_optimization_artifacts_v3, validate_optimization_artifacts_v3_for_module,
+};
+use soac_opt::plan_v3::IndexedFieldAccessKind as PlanV3IndexedFieldAccessKind;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, c_int, c_void};
 use std::fs::{OpenOptions, create_dir_all};
@@ -809,6 +821,235 @@ fn build_counter_storage(
     ))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FieldAccessCounterAccess {
+    Load,
+    Store,
+}
+
+impl FieldAccessCounterAccess {
+    fn generic_branch(self) -> &'static str {
+        match self {
+            Self::Load => "generic_getattr",
+            Self::Store => "generic_setattr",
+        }
+    }
+
+    fn indexed_plan_access(self) -> PlanV3IndexedFieldAccessKind {
+        match self {
+            Self::Load => PlanV3IndexedFieldAccessKind::Load,
+            Self::Store => PlanV3IndexedFieldAccessKind::Store,
+        }
+    }
+}
+
+struct FieldAccessCounterSiteCollector<'a> {
+    function_id: RuntimeFunctionId,
+    sites: &'a mut HashMap<(RuntimeFunctionId, InstrId), FieldAccessCounterAccess>,
+}
+
+impl Visit<InstrCodegen> for FieldAccessCounterSiteCollector<'_> {
+    fn visit_instr(&mut self, expr: &InstrCodegen) {
+        match expr {
+            InstrCodegen::GetAttr(_) => {
+                self.sites.insert(
+                    (self.function_id, expr.semantic_instr_id()),
+                    FieldAccessCounterAccess::Load,
+                );
+            }
+            InstrCodegen::SetAttr(_) => {
+                self.sites.insert(
+                    (self.function_id, expr.semantic_instr_id()),
+                    FieldAccessCounterAccess::Store,
+                );
+            }
+            _ => {}
+        }
+        expr.visit_children(self);
+    }
+}
+
+fn collect_field_access_counter_sites(
+    module: &BlockPyModule<CodegenModuleShape>,
+) -> HashMap<(RuntimeFunctionId, InstrId), FieldAccessCounterAccess> {
+    let mut sites = HashMap::new();
+    for function in &module.callable_defs {
+        let mut collector = FieldAccessCounterSiteCollector {
+            function_id: function.function_id,
+            sites: &mut sites,
+        };
+        for block in &function.blocks {
+            collector.visit_block(block);
+        }
+    }
+    sites
+}
+
+fn field_access_has_indexed_emission(
+    indexed_fields_by_function: &HashMap<
+        RuntimeFunctionId,
+        HashMap<InstrId, Vec<OptV3IndexedFieldAccessPlan>>,
+    >,
+    function_id: RuntimeFunctionId,
+    instr_id: InstrId,
+    access: FieldAccessCounterAccess,
+) -> bool {
+    indexed_fields_by_function
+        .get(&function_id)
+        .and_then(|by_instr| by_instr.get(&instr_id))
+        .is_some_and(|plans| {
+            plans
+                .iter()
+                .any(|plan| plan.access == access.indexed_plan_access())
+        })
+}
+
+pub(crate) fn specialize_field_access_counter_branches(
+    module: &mut BlockPyModule<CodegenModuleShape>,
+    indexed_fields_by_function: &HashMap<
+        RuntimeFunctionId,
+        HashMap<InstrId, Vec<OptV3IndexedFieldAccessPlan>>,
+    >,
+) {
+    let sites = collect_field_access_counter_sites(module);
+    for counter in &mut module.counter_defs {
+        if counter.kind != "field_access" {
+            continue;
+        }
+        let CounterSite::Runtime {
+            function_id: Some(function_id),
+            instr_id: Some(instr_id),
+        } = counter.site
+        else {
+            continue;
+        };
+        let Some(access) = sites.get(&(function_id, instr_id)).copied() else {
+            continue;
+        };
+        let branches: &[&str] = if field_access_has_indexed_emission(
+            indexed_fields_by_function,
+            function_id,
+            instr_id,
+            access,
+        ) {
+            &["indexed_hit", "indexed_fallback"]
+        } else {
+            &[access.generic_branch()]
+        };
+        counter.branches = branches.iter().copied().map(CounterBranch::new).collect();
+    }
+}
+
+fn opt_v3_single_function_artifacts(
+    artifacts: &ExactIntBranchV3Artifacts,
+    function: SerializedFunctionId,
+) -> Result<Option<ExactIntBranchV3Artifacts>, String> {
+    single_function_optimization_artifacts_v3(artifacts, function).map_err(|err| err.to_string())
+}
+
+fn load_runtime_indexed_field_counter_emissions(
+    module: &BlockPyModule<CodegenModuleShape>,
+    module_name: &str,
+    source_hash: u64,
+    module_cache_source: Option<PythonModuleCacheSource>,
+    env_config: &SoacEnvConfig,
+) -> Result<HashMap<RuntimeFunctionId, HashMap<InstrId, Vec<OptV3IndexedFieldAccessPlan>>>, String>
+{
+    if !matches!(
+        env_config.specialization_mode(),
+        Some(SpecializationMode::Verify | SpecializationMode::Apply)
+    ) {
+        return Ok(HashMap::new());
+    }
+    let Some(cache_root) = env_config.module_cache_root() else {
+        return Err(format!(
+            "SOAC_OPT_MODE=verify/apply requires SOAC_WORK_DIR/module cache to load mod.optv3 for module {module_name}"
+        ));
+    };
+    let cache_identity = pre_optimization_module_cache_identity(
+        env!("SOAC_BUILD_IDENTITY"),
+        module_name == "soac.runtime",
+    );
+    let candidate_sources = match module_cache_source {
+        Some(source) => vec![source],
+        None => vec![
+            PythonModuleCacheSource::Project,
+            PythonModuleCacheSource::PythonStdlib,
+        ],
+    };
+
+    for source in candidate_sources {
+        let path = module_optimization_plan_v3_path(cache_root.as_path(), source, module_name)?;
+        if !path.exists() {
+            continue;
+        }
+        let artifacts =
+            load_optimization_artifacts_v3(path.as_path()).map_err(|err| err.to_string())?;
+        validate_optimization_artifacts_v3_for_module(
+            &artifacts,
+            module_name,
+            source_hash,
+            cache_identity.as_str(),
+        )
+        .map_err(|err| err.to_string())?;
+
+        let mut by_function = HashMap::new();
+        let module_id = RuntimeModuleId::new(module.module_name_gen.module_id());
+        for planned_function in &artifacts.plan.functions {
+            let local_function_id = planned_function.function.function.local_function_id();
+            let function_id = RuntimeFunctionId::new(module_id, local_function_id);
+            if !module
+                .callable_defs
+                .iter()
+                .any(|function| function.function_id == function_id)
+            {
+                return Err(format!(
+                    "optimization plan v3 for module {module_name} references missing function id {} ({})",
+                    local_function_id,
+                    planned_function
+                        .function
+                        .debug_name
+                        .as_deref()
+                        .unwrap_or("<unknown>")
+                ));
+            }
+            let Some(function_artifacts) =
+                opt_v3_single_function_artifacts(&artifacts, planned_function.function.function)?
+            else {
+                continue;
+            };
+            if let Some(indexed_fields) =
+                opt_v3_emitted_indexed_fields_for_function(&function_artifacts)?
+            {
+                by_function.insert(function_id, indexed_fields);
+            }
+        }
+        return Ok(by_function);
+    }
+    Err(format!(
+        "SOAC_OPT_MODE=verify/apply requires mod.optv3 for module {module_name} under {}",
+        cache_root.display()
+    ))
+}
+
+fn specialize_runtime_field_access_counter_branches(
+    module: &mut BlockPyModule<CodegenModuleShape>,
+    module_name: &str,
+    source_hash: u64,
+    module_cache_source: Option<PythonModuleCacheSource>,
+    env_config: &SoacEnvConfig,
+) -> Result<(), String> {
+    let indexed_fields = load_runtime_indexed_field_counter_emissions(
+        module,
+        module_name,
+        source_hash,
+        module_cache_source,
+        env_config,
+    )?;
+    specialize_field_access_counter_branches(module, &indexed_fields);
+    Ok(())
+}
+
 pub(crate) fn build_module_constant_objects(
     py: Python<'_>,
     codegen_constants: &ModuleCodegenConstants,
@@ -1124,6 +1365,17 @@ impl SoacExtModuleState {
             source_hash,
             module_cache_source,
         )?;
+        let env_config = compile_session
+            .env_config()
+            .map_err(PyRuntimeError::new_err)?;
+        specialize_runtime_field_access_counter_branches(
+            &mut lowered_module,
+            module_name.as_str(),
+            source_hash,
+            module_cache_source,
+            env_config,
+        )
+        .map_err(PyRuntimeError::new_err)?;
         let function_index_by_id = build_function_index_by_id(&lowered_module)?;
         let (counter_slots_by_id, counter_values, top_value_counters) =
             build_counter_storage(&lowered_module.counter_defs)?;

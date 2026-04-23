@@ -16,7 +16,10 @@ use crate::function_instantiation::{
     soac_jit_make_function_with_closure,
 };
 use crate::module_constants::{ModuleCodegenConstants, ModuleConstantId};
-use crate::module_type::{CounterRuntimeSlot, SharedModuleState, build_counter_storage_layout};
+use crate::module_type::{
+    CounterRuntimeSlot, SharedModuleState, build_counter_storage_layout,
+    specialize_field_access_counter_branches,
+};
 use cranelift_codegen::cfg_printer::CFGPrinter;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::inline::{Inline, InlineCommand};
@@ -14053,7 +14056,7 @@ fn emit_typed_setattr_fallback(
 fn emit_typed_indexed_getattr(
     fb: &mut FunctionBuilder<'_>,
     op: &TypedGetAttr<InstrTyped>,
-    guards: &[TypedIndexedFieldGuard],
+    _guards: &[TypedIndexedFieldGuard],
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     codegen_env: &mut impl JitCodegenEnv,
@@ -14219,7 +14222,7 @@ fn emit_typed_indexed_getattr(
 fn emit_typed_indexed_setattr(
     fb: &mut FunctionBuilder<'_>,
     op: &TypedSetAttr<InstrTyped>,
-    guards: &[TypedIndexedFieldGuard],
+    _guards: &[TypedIndexedFieldGuard],
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     demand: ResultDemand,
@@ -14242,8 +14245,6 @@ fn emit_typed_indexed_setattr(
     let instr_id = op.semantic_instr_id();
     let Some(plan) = IndexedFieldLoweringPlan::for_access(
         instr_id,
-        source,
-        guards,
         PlanV3IndexedFieldAccessKind::Store,
         emit_ctx.opt_v3_indexed_fields_by_instr,
     )?
@@ -23437,7 +23438,20 @@ fn precompile_codegen_module_to_object_bytes(
     let mut function_definitions =
         compile_runtime_support_clif_for_object(&mut jit_module, env_config, object_isa.as_ref())?;
 
-    let module_constants = ModuleCodegenConstants::collect_from_module(module);
+    let planned_inputs = planned_optimization_inputs_for_precompile(
+        optimization_plan,
+        module_index,
+        module_name,
+        source_hash,
+        module,
+    )?;
+    let mut module_for_codegen = module.clone();
+    specialize_field_access_counter_branches(
+        &mut module_for_codegen,
+        &planned_inputs.opt_v3_emitted_indexed_fields,
+    );
+
+    let module_constants = ModuleCodegenConstants::collect_from_module(&module_for_codegen);
     let module_constant_ptrs = placeholder_module_constant_ptrs(module_constants.len());
     let module_constant_symbol_prefix =
         module_constant_symbol_prefix_for_module_identity(module_name, source_hash);
@@ -23448,13 +23462,13 @@ fn precompile_codegen_module_to_object_bytes(
     )?;
 
     let (counter_slots_by_id, scalar_counter_count, top_value_counter_count) =
-        build_counter_storage_layout(module.counter_defs.as_slice())?;
+        build_counter_storage_layout(module_for_codegen.counter_defs.as_slice())?;
     let scalar_counter_data_id = if scalar_counter_count == 0 {
         None
     } else {
         Some(define_scalar_counter_storage_data(
             &mut jit_module,
-            module,
+            &module_for_codegen,
             scalar_counter_count,
         )?)
     };
@@ -23463,7 +23477,7 @@ fn precompile_codegen_module_to_object_bytes(
     } else {
         Some(define_top_value_counter_storage_data(
             &mut jit_module,
-            module,
+            &module_for_codegen,
             top_value_counter_count,
         )?)
     };
@@ -23513,7 +23527,7 @@ fn precompile_codegen_module_to_object_bytes(
     if let Some(data_id) = scalar_counter_data_id {
         data_definitions.push(ObjectDataDefinition {
             data_id,
-            symbol: scalar_counter_storage_symbol(module),
+            symbol: scalar_counter_storage_symbol(&module_for_codegen),
             binding: ElfSymbolBinding::Global,
             bytes: vec![
                 0;
@@ -23531,7 +23545,7 @@ fn precompile_codegen_module_to_object_bytes(
     if let Some(data_id) = top_value_counter_data_id {
         data_definitions.push(ObjectDataDefinition {
             data_id,
-            symbol: top_value_counter_storage_symbol(module),
+            symbol: top_value_counter_storage_symbol(&module_for_codegen),
             binding: ElfSymbolBinding::Global,
             bytes: vec![
                 0;
@@ -23547,23 +23561,16 @@ fn precompile_codegen_module_to_object_bytes(
         });
     }
 
-    let planned_inputs = planned_optimization_inputs_for_precompile(
-        optimization_plan,
-        module_index,
-        module_name,
-        source_hash,
-        module,
-    )?;
     let specialization_profile = SpecializationProfile::from_precompile(
         env_config,
         module_name,
         counter_dump_path,
-        planned_inputs,
+        planned_inputs.clone(),
     )?;
     let jit_module_plan = if specialization_profile.optimized_module.is_some() {
-        build_profiled_jit_module_plan(module, &specialization_profile)?
+        build_profiled_jit_module_plan(&module_for_codegen, &specialization_profile)?
     } else {
-        build_jit_module_plan(module)?
+        build_jit_module_plan(&module_for_codegen)?
     };
     let planned_module = jit_module_plan.module.as_ref();
     let external_direct_call_target_functions = precompile_external_direct_call_target_functions(

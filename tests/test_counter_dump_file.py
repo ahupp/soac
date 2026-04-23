@@ -250,6 +250,7 @@ def write_and_read(value):
     profile = _inspect_counter_dump_json(work_dir / "profile.bin")
 
     by_kind = {}
+    field_access_branch_sets = []
     for record in profile["records"]:
         if record["module_name"] != module_name:
             continue
@@ -257,6 +258,7 @@ def write_and_read(value):
             if row["function_qualname"] != "write_and_read":
                 continue
             if row["kind"] == "field_access":
+                field_access_branch_sets.append(set(row["branches"]))
                 for branch, value in row["branches"].items():
                     by_kind[f"field_access.{branch}"] = (
                         by_kind.get(f"field_access.{branch}", 0) + value
@@ -266,6 +268,11 @@ def write_and_read(value):
 
     assert by_kind["field_access.generic_getattr"] >= 5, profile
     assert by_kind["field_access.generic_setattr"] >= 5, profile
+    assert field_access_branch_sets
+    assert all(
+        branches in [{"generic_getattr"}, {"generic_setattr"}]
+        for branches in field_access_branch_sets
+    ), profile
     assert by_kind.get("field_access.indexed_hit", 0) == 0, profile
     assert by_kind.get("field_access.indexed_fallback", 0) == 0, profile
 
@@ -847,6 +854,11 @@ def run():
             continue
         for row in record["rows"]:
             if row["kind"] == "field_access":
+                if _counter_branch(row, "indexed_hit") > 0:
+                    assert set(row["branches"]) == {
+                        "indexed_hit",
+                        "indexed_fallback",
+                    }, verify
                 hit_values_by_function[row["function_qualname"]] = (
                     hit_values_by_function.get(row["function_qualname"], 0)
                     + _counter_branch(row, "indexed_hit")

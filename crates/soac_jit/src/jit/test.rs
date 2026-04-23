@@ -17197,8 +17197,6 @@ def write_point(point, value):
 
         let annotated = annotate_typed_attr_accesses(
             &mut typed_function,
-            &HashMap::new(),
-            &HashMap::new(),
             &opt_v3_indexed_fields_by_instr,
             true,
         )
@@ -17266,8 +17264,6 @@ def write_point(point, value):
 
         let annotated = annotate_typed_attr_accesses(
             &mut typed_function,
-            &HashMap::new(),
-            &HashMap::new(),
             &opt_v3_indexed_fields_by_instr,
             true,
         )
