@@ -443,6 +443,7 @@ impl CachedModuleOptimizationInput {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModuleOptimizationPlanReport {
     pub output_path: PathBuf,
+    pub optimized_module_path: PathBuf,
     pub module_name: String,
     pub source_hash: u64,
     pub function_count: usize,

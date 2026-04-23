@@ -42,7 +42,7 @@ pub struct ProfiledRuntimeIterConstructorCall {
     pub inline_target: Option<RuntimeFunctionId>,
 }
 
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub struct ProfiledMethodInlineRewriteStats {
     pub candidate_stores: usize,
     pub missing_callee_targets: usize,

@@ -7,7 +7,8 @@ use crate::SOAC_JIT_RUNTIME_CLIF;
 use crate::config::SOAC_JIT_EMIT_REFCOUNTS_ENV;
 use crate::config::{
     CraneliftTargetConfig, PythonModuleCacheSource, SpecializationMode,
-    module_optimization_plan_v3_path, pre_optimization_module_cache_identity,
+    module_optimization_plan_v3_path, module_optimized_codegen_v3_path,
+    pre_optimization_module_cache_identity, pre_optimization_module_cache_metadata,
 };
 use crate::counter::TopValueCounter;
 use crate::function_instantiation::{
@@ -46,36 +47,32 @@ use soac_core::profile::{
 };
 #[cfg(test)]
 use soac_core::profile::{CounterDumpFile, collect_type_key_layouts, collect_type_table};
+use soac_driver::codegen_cache::{
+    load_codegen_module_cache, remap_cached_codegen_module_function_ids,
+    validate_codegen_module_cache_metadata,
+};
+use soac_driver::finish_cached_codegen_module_for_runtime_with_counter_defs;
 use soac_lowering::block_py::literal::Literal;
 use soac_lowering::passes::{
-    CodegenModuleShape, ConstructorFieldValue, DirectCallableTypeVersionGuardTest,
-    DirectFunctionIdGuardTest, DirectReceiverTypeVersionGuardTest, FactStore, FunctionRefcountPlan,
-    InlineCallee, InlinePlanModule, InstrCodegen, InstrResolved, InstrTyped, LocalEnvResumeBinding,
-    LocalEnvResumeBindingState, LocalEnvResumeEntry, LocalEnvResumePoint,
-    LocalEnvResumeStatePrecision, LocalEnvResumeValueSource, LocalRefState, ProfiledOwnerAttrKey,
-    ProfiledOwnerAttrSpecialization, ProfiledRuntimeIterConstructorCall, PyExactType, PyObjFacts,
-    RefcountActionKind, RefcountReleaseReason, RefcountSite, RuntimeHelperId, TypedAttrAccessPlan,
-    TypedAttrOwnerRef, TypedCall, TypedCallAccessPlan, TypedCallEmissionPlan,
-    TypedCallEmissionPlans, TypedCodegenModuleShape, TypedDirectCallArgPlan,
-    TypedDirectCallArgSource, TypedDirectCallGuardTest, TypedDirectCallGuardTestKind,
-    TypedDirectCallableCall, TypedDirectCallableCallGuard, TypedDirectConstructorCallGuard,
-    TypedDirectFunctionCallGuard, TypedDirectMethodCall, TypedDirectMethodCallGuard, TypedGetAttr,
-    TypedGuardedCallableCall, TypedGuardedMethodCall, TypedIndexedFieldGuard,
-    TypedIndexedFieldPlanSource, TypedPlannedResult, TypedPyObjectOwnershipPlan, TypedSetAttr,
-    ValueFacts, annotate_typed_function_planned_results, annotate_typed_function_result_demands,
-    annotate_typed_function_value_facts, collect_profiled_runtime_iter_method_target_ids,
-    infer_module_value_facts, inline_direct_call_stores_with_callees,
-    lower_codegen_function_to_typed, lower_typed_function_call_access_plan_instrs,
-    lower_typed_function_call_emission_plans, lower_typed_function_if_tests_to_truthy,
-    plan_module_inlining, refresh_typed_function_value_facts,
-    rewrite_profiled_function_call_store_sites,
-    rewrite_profiled_function_call_store_sites_with_constructor_targets,
-    rewrite_profiled_no_arg_method_call_store_sites,
-    scalar_replace_non_escaping_constructor_allocations,
-    straightline_field_initializer_rejection_reason, summarize_module_escapes,
+    CodegenModuleShape, DirectCallableTypeVersionGuardTest, DirectFunctionIdGuardTest,
+    DirectReceiverTypeVersionGuardTest, FactStore, FunctionRefcountPlan, InstrCodegen,
+    InstrResolved, InstrTyped, LocalEnvResumeBinding, LocalEnvResumeBindingState,
+    LocalEnvResumeEntry, LocalEnvResumePoint, LocalEnvResumeStatePrecision,
+    LocalEnvResumeValueSource, LocalRefState, PyExactType, PyObjFacts, RefcountActionKind,
+    RefcountReleaseReason, RefcountSite, RuntimeHelperId, TypedAttrAccessPlan, TypedAttrOwnerRef,
+    TypedCall, TypedCallAccessPlan, TypedCallEmissionPlan, TypedCallEmissionPlans,
+    TypedCodegenModuleShape, TypedDirectCallArgPlan, TypedDirectCallArgSource,
+    TypedDirectCallGuardTest, TypedDirectCallGuardTestKind, TypedDirectCallableCall,
+    TypedDirectCallableCallGuard, TypedDirectConstructorCallGuard, TypedDirectFunctionCallGuard,
+    TypedDirectMethodCall, TypedDirectMethodCallGuard, TypedGetAttr, TypedGuardedCallableCall,
+    TypedGuardedMethodCall, TypedIndexedFieldGuard, TypedIndexedFieldPlanSource,
+    TypedPlannedResult, TypedPyObjectOwnershipPlan, TypedSetAttr, ValueFacts,
+    annotate_typed_function_planned_results, annotate_typed_function_result_demands,
+    annotate_typed_function_value_facts, infer_module_value_facts, lower_codegen_function_to_typed,
+    lower_typed_function_call_access_plan_instrs, lower_typed_function_call_emission_plans,
+    lower_typed_function_if_tests_to_truthy, refresh_typed_function_value_facts,
     try_lower_typed_instr_to_codegen_legacy, try_lower_typed_term_to_codegen_legacy,
-    validate_codegen_instr_ids, validate_typed_function_call_access_plans,
-    validate_typed_function_value_facts,
+    validate_typed_function_call_access_plans, validate_typed_function_value_facts,
 };
 use soac_opt::access_emission_v3::{
     ExactListItemAccessPlan as OptV3ExactListItemAccessPlan,
@@ -97,20 +94,14 @@ use soac_opt::artifacts_v3::{
     single_function_optimization_artifacts_v3, validate_optimization_artifacts_v3_for_module,
 };
 use soac_opt::call_emission_v3::{
-    ConstructorCallGuardRequest as OptV3ConstructorCallGuardRequest,
-    MethodCallGuardRequest as OptV3MethodCallGuardRequest, PreparedV3ConstructorCallPlan,
-    PreparedV3MethodCallPlan, ResolvedV3ConstructorCallPlan, ResolvedV3DirectCallPlan,
-    ResolvedV3MethodCallPlan, RuntimeCallOwnerGuard as OptV3RuntimeCallOwnerGuard,
+    ResolvedV3ConstructorCallPlan, ResolvedV3DirectCallPlan, ResolvedV3MethodCallPlan,
     constructor_call_targets as opt_v3_constructor_call_targets,
     constructor_calls_for_function_from_artifacts as opt_v3_emitted_constructor_calls_for_function,
     direct_call_body_plans as opt_v3_direct_call_body_plans,
     direct_call_targets as opt_v3_direct_call_targets,
     direct_calls_for_function_from_artifacts as opt_v3_emitted_direct_calls_for_function,
-    inline_direct_call_targets as opt_v3_inline_direct_call_targets,
-    inline_method_call_targets as opt_v3_inline_method_call_targets,
     merge_call_target_specializations, method_call_targets as opt_v3_method_call_targets,
     method_calls_for_function_from_artifacts as opt_v3_emitted_method_calls_for_function,
-    prepare_constructor_call_plans_for_codegen, prepare_method_call_plans_for_codegen,
     typed_call_emission_plans_from_v3,
 };
 use soac_opt::emit_v3::{
@@ -121,7 +112,7 @@ use soac_opt::emit_v3::{
     mechanical_region_function_param_inputs as opt_v3_mechanical_region_function_param_inputs,
 };
 use soac_opt::plan_v3::{
-    CallBodyKind as PlanV3CallBodyKind, IndexedFieldAccessKind as PlanV3IndexedFieldAccessKind,
+    IndexedFieldAccessKind as PlanV3IndexedFieldAccessKind,
     IndexedGlobalAccessKind as PlanV3IndexedGlobalAccessKind, MaterializeKind, PlanNodeId,
     PlanValue, RegionId, RegionPlan, Rep, RichCompareOp,
 };
@@ -1361,21 +1352,6 @@ fn predeclare_reloc_callable_ref_import(
     Ok(())
 }
 
-fn predeclare_owner_attr_import_for_ref(
-    jit_module: &mut JITModule,
-    owner_type_ref: &RelocTypeRef,
-    attr_name: &str,
-) -> Result<(), String> {
-    predeclare_reloc_type_ref_import(jit_module, owner_type_ref)?;
-    predeclare_reloc_callable_ref_import(
-        jit_module,
-        &RelocCallableRef::OwnerAttr {
-            owner_type_ref: owner_type_ref.clone(),
-            attr_name: attr_name.to_string(),
-        },
-    )
-}
-
 fn predeclare_specialization_type_imports(
     jit_module: &mut JITModule,
     profile: &SpecializationProfile<'_>,
@@ -1449,76 +1425,6 @@ fn predeclare_prepared_opt_v3_call_imports(
         }
     }
     Ok(())
-}
-
-fn predeclare_direct_call_owner_type_imports(
-    jit_module: &mut JITModule,
-    _module: &BlockPyModule<CodegenModuleShape>,
-    function: &BlockPyFunction<CodegenModuleShape>,
-    profile: &SpecializationProfile<'_>,
-) -> Result<HashMap<DirectOwnerAttrKey, Vec<DirectOwnerAttrSpecialization>>, String> {
-    let mut out: HashMap<DirectOwnerAttrKey, Vec<DirectOwnerAttrSpecialization>> = HashMap::new();
-    let opt_v3_constructor_calls =
-        profile.codegen_opt_v3_constructor_calls(function.function_id)?;
-    for constructor_call in opt_v3_constructor_calls.values() {
-        for guard in &constructor_call.guards {
-            let Some(owner_type_ref) =
-                reloc_type_ref_from_typed_attr_owner_ref(&guard.owner_type_ref)
-            else {
-                continue;
-            };
-            predeclare_owner_attr_import_for_ref(jit_module, &owner_type_ref, "__init__")?;
-            push_direct_owner_attr_specialization(
-                &mut out,
-                guard.function_id,
-                "__init__",
-                owner_type_ref,
-                guard.type_version,
-            );
-        }
-    }
-    let opt_v3_method_calls = profile.codegen_opt_v3_method_calls(function.function_id)?;
-    for method_call in opt_v3_method_calls.values() {
-        for guard in &method_call.guards {
-            let Some(owner_type_ref) =
-                reloc_type_ref_from_typed_attr_owner_ref(&guard.owner_type_ref)
-            else {
-                continue;
-            };
-            predeclare_owner_attr_import_for_ref(
-                jit_module,
-                &owner_type_ref,
-                method_call.method_name.as_str(),
-            )?;
-            push_direct_owner_attr_specialization(
-                &mut out,
-                guard.function_id,
-                method_call.method_name.as_str(),
-                owner_type_ref,
-                guard.type_version,
-            );
-        }
-    }
-    Ok(out)
-}
-
-fn push_direct_owner_attr_specialization(
-    out: &mut HashMap<DirectOwnerAttrKey, Vec<DirectOwnerAttrSpecialization>>,
-    function_id: RuntimeFunctionId,
-    attr_name: &str,
-    owner_type_ref: RelocTypeRef,
-    type_version: u32,
-) {
-    let specialization = DirectOwnerAttrSpecialization {
-        owner_type_ref,
-        type_version,
-    };
-    let specializations = out
-        .entry(DirectOwnerAttrKey::new(function_id, attr_name))
-        .or_default();
-    if !specializations.contains(&specialization) {
-        specializations.push(specialization);
-    }
 }
 
 struct FuncBuildImports<'a> {
@@ -1642,8 +1548,6 @@ struct ReservedJitFunctionCompileInputs {
     scalar_counter_data_id: Option<DataId>,
     top_value_counter_data_id: Option<DataId>,
     counted_refcount_helpers: CountedRefcountHelpers,
-    direct_owner_attr_specializations:
-        HashMap<DirectOwnerAttrKey, Vec<DirectOwnerAttrSpecialization>>,
     specialization_inputs: FunctionSpecializationInputs,
     module_constant_binding_key: usize,
     symbol_scope: Option<String>,
@@ -1811,28 +1715,8 @@ impl JitBatchPlan<'_> {
                     Some(shared_state),
                     Some(inputs.session.as_ref()),
                 )?;
-                if profile.has_specialization_inputs() {
-                    let direct_owner_attr_specializations_by_function = self
-                        .function_compile_inputs
-                        .iter()
-                        .filter_map(|(index, reserved_inputs)| {
-                            (reserved_inputs.module_constant_binding_key == binding_key
-                                && !reserved_inputs.direct_owner_attr_specializations.is_empty())
-                            .then(|| {
-                                (
-                                    self.batch_functions[*index].function.function_id,
-                                    reserved_inputs.direct_owner_attr_specializations.clone(),
-                                )
-                            })
-                        })
-                        .collect::<HashMap<_, _>>();
-                    build_profiled_jit_module_plan(
-                        &shared_state.lowered_module,
-                        &profile,
-                        Some(inputs.session.as_ref()),
-                        None,
-                        &direct_owner_attr_specializations_by_function,
-                    )?
+                if profile.optimized_module.is_some() {
+                    build_profiled_jit_module_plan(&shared_state.lowered_module, &profile)?
                 } else {
                     shared_state.jit_module_plan()?
                 }
@@ -1951,545 +1835,21 @@ fn build_jit_module_plan(
 fn build_profiled_jit_module_plan(
     module: &BlockPyModule<CodegenModuleShape>,
     profile: &SpecializationProfile<'_>,
-    compile_session: Option<&crate::session::CompileSession>,
-    precompile_module_index: Option<&PrecompileModuleIndex>,
-    direct_owner_attr_specializations_by_function: &HashMap<
-        RuntimeFunctionId,
-        HashMap<DirectOwnerAttrKey, Vec<DirectOwnerAttrSpecialization>>,
-    >,
 ) -> Result<Arc<JitModulePlan>, String> {
-    let mut planned_module = module.clone();
-    let (callees, inline_callees, mut external_inline_plan) = build_profiled_inline_callee_maps(
-        &planned_module,
-        profile,
-        compile_session,
-        precompile_module_index,
-        direct_owner_attr_specializations_by_function,
-    )?;
-    let mut straightline_constructor_ids = straightline_constructor_ids_in_plan(
-        &plan_module_inlining(&summarize_module_escapes(&planned_module)),
-    );
-    straightline_constructor_ids
-        .extend(straightline_constructor_ids_in_plan(&external_inline_plan));
-    let mut rewritten_store_count = 0usize;
-    let mut runtime_constructor_function_ids = HashSet::new();
-    let module_constants = &mut planned_module.module_constants;
-    let empty_profiled_owner_attr_specializations = HashMap::new();
-    let planned_module_id = planned_module.module_name_gen.module_id();
-    for function in &mut planned_module.callable_defs {
-        let has_exact_int_branch_artifacts = profile
-            .opt_v3_exact_int_branch_artifacts
-            .contains_key(&function.function_id);
-        let inline_constructor_calls = if has_exact_int_branch_artifacts {
-            HashMap::new()
-        } else {
-            profile.v3_inline_constructor_calls(function.function_id)
-        };
-        let method_call_rewrite_targets = if has_exact_int_branch_artifacts {
-            HashMap::new()
-        } else {
-            merge_call_target_specializations(
-                profile.v3_inline_method_call_targets(function.function_id),
-                opt_v3_constructor_call_targets(&inline_constructor_calls),
-            )
-        };
-        let direct_call_rewrite_targets = if has_exact_int_branch_artifacts {
-            HashMap::new()
-        } else {
-            profile.v3_inline_direct_function_call_targets(function.function_id)
-        };
-        if method_call_rewrite_targets.is_empty() && direct_call_rewrite_targets.is_empty() {
-            continue;
-        }
-        if !method_call_rewrite_targets.is_empty() {
-            let profiled_owner_attr_specializations = direct_owner_attr_specializations_by_function
-                .get(&function.function_id)
-                .map(profiled_owner_attr_specializations_for_lowering);
-            let direct_owner_attr_specializations = profiled_owner_attr_specializations
-                .as_ref()
-                .unwrap_or(&empty_profiled_owner_attr_specializations);
-            let inline_constructor_calls =
-                profiled_runtime_iter_constructor_calls_for_lowering(&inline_constructor_calls);
-            let mut constructor_for_runtime_name =
-                |runtime_name| runtime_constructor_function_id(runtime_name);
-            let mut iter_target_for_constructor_guard =
-                runtime_iter_method_target_for_profiled_owner_attr;
-            let stats = rewrite_profiled_no_arg_method_call_store_sites(
-                function,
-                module_constants,
-                &method_call_rewrite_targets,
-                direct_owner_attr_specializations,
-                &inline_callees,
-                &straightline_constructor_ids,
-                &inline_constructor_calls,
-                &mut runtime_constructor_function_ids,
-                &mut constructor_for_runtime_name,
-                &mut iter_target_for_constructor_guard,
-            );
-            if stats.total_attempts() != 0 {
-                info!(
-                    target: "soac_jit_profiled_method_inline",
-                    module_id = planned_module_id,
-                    function_id = %function.function_id,
-                    qualname = %function.names.qualname,
-                    candidate_stores = stats.candidate_stores,
-                    missing_callee_targets = stats.missing_callee_targets,
-                    missing_owner_guard_targets = stats.missing_owner_guard_targets,
-                    owner_fragment_unsupported_targets = stats.owner_fragment_unsupported_targets,
-                    callable_fragment_unsupported_targets = stats.callable_fragment_unsupported_targets,
-                    stop_iteration_candidate_exc_edges = stats.stop_iteration_candidate_exc_edges,
-                    stop_iteration_current_exception_edges = stats.stop_iteration_current_exception_edges,
-                    stop_iteration_handler_blocks = stats.stop_iteration_handler_blocks,
-                    stop_iteration_handler_if_terms = stats.stop_iteration_handler_if_terms,
-                    stop_iteration_handler_test_matches = stats.stop_iteration_handler_test_matches,
-                    stop_iteration_handler_targets = stats.stop_iteration_handler_targets,
-                    stop_iteration_raises_rewritten = stats.stop_iteration_raises_rewritten,
-                    static_runtime_constructor_calls_rewritten =
-                        stats.static_runtime_constructor_calls_rewritten,
-                    rewritten_stores = stats.rewritten_stores,
-                    "soac_jit_profiled_method_inline"
-                );
-            }
-            rewritten_store_count += stats.rewritten_stores;
-        }
-        let stats = rewrite_profiled_function_call_store_sites(
-            function,
-            &direct_call_rewrite_targets,
-            &callees,
-        );
-        if stats.rewritten_stores != 0
-            || stats.skipped_empty_targets != 0
-            || stats.skipped_incompatible_targets != 0
-        {
-            info!(
-                target: "soac_jit_profiled_direct_call_rewrite",
-                module_id = planned_module_id,
-                function_id = %function.function_id,
-                qualname = %function.names.qualname,
-                rewritten_stores = stats.rewritten_stores,
-                skipped_empty_targets = stats.skipped_empty_targets,
-                skipped_incompatible_targets = stats.skipped_incompatible_targets,
-                skipped_missing_callee_targets = stats.skipped_missing_callee_targets,
-                skipped_arity_mismatch_targets = stats.skipped_arity_mismatch_targets,
-                skipped_unsupported_init_targets = stats.skipped_unsupported_init_targets,
-                skipped_missing_storage_layout_targets = stats.skipped_missing_storage_layout_targets,
-                skipped_unsupported_param_kind_targets =
-                    stats.skipped_unsupported_param_kind_targets,
-                skipped_missing_param_storage_targets = stats.skipped_missing_param_storage_targets,
-                "soac_jit_profiled_direct_call_rewrite"
-            );
-        }
-        rewritten_store_count += stats.rewritten_stores;
-    }
-    if rewritten_store_count != 0 {
-        validate_codegen_instr_ids(&planned_module)
-            .map_err(|err| format!("profiled direct-call rewrite validation failed: {err}"))?;
-        extend_external_inline_plan_for_function_ids(
-            &mut external_inline_plan,
-            &runtime_constructor_function_ids,
-            compile_session,
-            precompile_module_index,
-        )?;
-        let mut inline_plan = plan_jit_inlining(&planned_module);
-        inline_plan
-            .functions
-            .extend(external_inline_plan.functions.clone());
-        let runtime_constructor_inline_plan_hits = runtime_constructor_function_ids
-            .iter()
-            .filter(|function_id| {
-                inline_plan
-                    .straightline_constructor(**function_id)
-                    .is_some()
-            })
-            .count();
-        let inline_stats = inline_direct_call_stores_with_callees(
-            &mut planned_module,
-            &inline_plan,
-            &inline_callees,
-        );
-        let scalar_replacement_stats =
-            scalar_replace_non_escaping_constructor_allocations(&mut planned_module, &inline_plan);
-        if inline_stats.rewritten_stores != 0
-            || inline_stats.skipped_candidates != 0
-            || scalar_replacement_stats.candidate_allocations != 0
-            || scalar_replacement_stats.planned_allocations != 0
-            || scalar_replacement_stats.replaced_allocations != 0
-            || scalar_replacement_stats.skipped_allocations != 0
-            || scalar_replacement_stats.skipped_unbuildable_allocations != 0
-            || scalar_replacement_stats.skipped_live_alias_control_flow_allocations != 0
-        {
-            info!(
-                target: "soac_jit_profiled_inline_plan",
-                module_id = planned_module_id,
-                inline_rewritten_stores = inline_stats.rewritten_stores,
-                inline_skipped_candidates = inline_stats.skipped_candidates,
-                scalar_candidate_allocations = scalar_replacement_stats.candidate_allocations,
-                scalar_planned_allocations = scalar_replacement_stats.planned_allocations,
-                scalar_replaced_allocations = scalar_replacement_stats.replaced_allocations,
-                scalar_skipped_allocations = scalar_replacement_stats.skipped_allocations,
-                scalar_skipped_unbuildable_allocations =
-                    scalar_replacement_stats.skipped_unbuildable_allocations,
-                scalar_skipped_live_alias_control_flow_allocations =
-                    scalar_replacement_stats.skipped_live_alias_control_flow_allocations,
-                runtime_constructor_function_ids = runtime_constructor_function_ids.len(),
-                runtime_constructor_function_id_values = ?runtime_constructor_function_ids,
-                runtime_constructor_inline_plan_hits = runtime_constructor_inline_plan_hits,
-                "soac_jit_profiled_inline_plan"
-            );
-        }
-        if inline_stats.rewritten_stores != 0 || scalar_replacement_stats.replaced_allocations != 0
-        {
-            validate_codegen_instr_ids(&planned_module).map_err(|err| {
-                format!("profiled direct-call inline rewrite validation failed: {err}")
-            })?;
-        }
-    }
-    build_jit_module_plan_from_owned_module(planned_module)
-}
-
-fn profiled_owner_attr_specializations_for_lowering(
-    source: &HashMap<DirectOwnerAttrKey, Vec<DirectOwnerAttrSpecialization>>,
-) -> HashMap<ProfiledOwnerAttrKey, Vec<ProfiledOwnerAttrSpecialization>> {
-    source
-        .iter()
-        .map(|(key, guards)| {
-            (
-                ProfiledOwnerAttrKey {
-                    function_id: key.function_id,
-                    attr_name: key.attr_name.clone(),
-                },
-                guards
-                    .iter()
-                    .map(|guard| ProfiledOwnerAttrSpecialization {
-                        owner_type_ref: typed_attr_owner_ref_from_reloc_type_ref(
-                            &guard.owner_type_ref,
-                        ),
-                        type_version: guard.type_version,
-                    })
-                    .collect(),
-            )
-        })
-        .collect()
-}
-
-fn profiled_runtime_iter_constructor_calls_for_lowering(
-    source: &HashMap<InstrId, Vec<ResolvedV3ConstructorCallPlan>>,
-) -> HashMap<InstrId, Vec<ProfiledRuntimeIterConstructorCall>> {
-    source
-        .iter()
-        .filter_map(|(instr_id, plans)| {
-            let plans = plans
-                .iter()
-                .filter(|plan| plan.body.kind == PlanV3CallBodyKind::Inline)
-                .map(|plan| ProfiledRuntimeIterConstructorCall {
-                    constructor_function_id: plan.target,
-                    inline_target: plan.inline_target,
-                })
-                .collect::<Vec<_>>();
-            (!plans.is_empty()).then_some((*instr_id, plans))
-        })
-        .collect()
-}
-
-fn runtime_iter_method_target_for_profiled_owner_attr(
-    guard: &ProfiledOwnerAttrSpecialization,
-) -> Option<RuntimeFunctionId> {
-    let owner_type_ref = reloc_type_ref_from_typed_attr_owner_ref(&guard.owner_type_ref)?;
-    owner_attr_function_id_for_type_ref(&owner_type_ref, "__iter__")
-        .ok()
-        .flatten()
-}
-
-fn build_profiled_inline_callee_maps(
-    module: &BlockPyModule<CodegenModuleShape>,
-    profile: &SpecializationProfile<'_>,
-    compile_session: Option<&crate::session::CompileSession>,
-    precompile_module_index: Option<&PrecompileModuleIndex>,
-    direct_owner_attr_specializations_by_function: &HashMap<
-        RuntimeFunctionId,
-        HashMap<DirectOwnerAttrKey, Vec<DirectOwnerAttrSpecialization>>,
-    >,
-) -> Result<
-    (
-        HashMap<RuntimeFunctionId, BlockPyFunction<CodegenModuleShape>>,
-        HashMap<RuntimeFunctionId, InlineCallee>,
-        InlinePlanModule,
-    ),
-    String,
-> {
-    let mut callee_functions = module
-        .callable_defs
-        .iter()
-        .map(|function| (function.function_id, function.clone()))
-        .collect::<HashMap<_, _>>();
-    let mut inline_callees = module
-        .callable_defs
-        .iter()
-        .map(|function| {
-            (
-                function.function_id,
-                InlineCallee::same_module(function.clone()),
-            )
-        })
-        .collect::<HashMap<_, _>>();
-    let mut target_ids = HashSet::new();
-    let mut external_inline_plan = InlinePlanModule::default();
-    for function in &module.callable_defs {
-        let direct_call_rewrite_targets =
-            profile.v3_inline_direct_function_call_targets(function.function_id);
-        for targets in direct_call_rewrite_targets.values() {
-            target_ids.extend(targets.iter().copied());
-        }
-        for plans in profile
-            .v3_inline_constructor_calls(function.function_id)
-            .values()
-        {
-            for plan in plans {
-                target_ids.insert(plan.target);
-                if let Some(inline_target) = plan.inline_target {
-                    target_ids.insert(inline_target);
-                }
-            }
-        }
-        for targets in profile
-            .v3_inline_method_call_targets(function.function_id)
-            .values()
-        {
-            target_ids.extend(targets.iter().copied());
-        }
-        if let Some(direct_owner_attr_specializations) =
-            direct_owner_attr_specializations_by_function.get(&function.function_id)
-        {
-            let inline_constructor_calls =
-                profile.v3_inline_constructor_calls(function.function_id);
-            let constructor_call_targets =
-                opt_v3_constructor_call_targets(&inline_constructor_calls);
-            let direct_owner_attr_specializations =
-                profiled_owner_attr_specializations_for_lowering(direct_owner_attr_specializations);
-            let mut iter_target_for_constructor_guard =
-                runtime_iter_method_target_for_profiled_owner_attr;
-            target_ids.extend(collect_profiled_runtime_iter_method_target_ids(
-                function,
-                module.module_constants.as_slice(),
-                &direct_owner_attr_specializations,
-                &constructor_call_targets,
-                &mut iter_target_for_constructor_guard,
-            ));
-        }
-    }
-    let mut pending_target_ids = target_ids.iter().copied().collect::<VecDeque<_>>();
-    while let Some(function_id) = pending_target_ids.pop_front() {
-        if callee_functions.contains_key(&function_id) {
-            continue;
-        }
-        if let Some(precompile_module_index) = precompile_module_index
-            && let Some(target) = precompile_module_index.function(function_id)
-        {
-            if let Some(inline_plan) = precompile_module_index.inline_plan_for_function(function_id)
-            {
-                external_inline_plan
-                    .functions
-                    .extend(inline_plan.functions.clone());
-            }
-            callee_functions.insert(function_id, target.function.clone());
-            inline_callees.insert(
-                function_id,
-                InlineCallee::cross_module(
-                    target.function.clone(),
-                    target.module_constants.clone(),
-                ),
-            );
-            continue;
-        }
-        let Some(compile_session) = compile_session else {
-            continue;
-        };
-        let Some((shared_state, function)) = compile_session.lookup_shared_function(function_id)?
-        else {
-            continue;
-        };
-        let shared_inline_plan =
-            plan_module_inlining(&summarize_module_escapes(&shared_state.lowered_module));
-        external_inline_plan
-            .functions
-            .extend(shared_inline_plan.functions);
-        callee_functions.insert(function_id, function.clone());
-        inline_callees.insert(
-            function_id,
-            InlineCallee::cross_module(
-                function,
-                shared_state.lowered_module.module_constants.clone(),
-            ),
-        );
-        let direct_call_rewrite_targets =
-            profile.v3_inline_direct_function_call_targets(function_id);
-        for targets in direct_call_rewrite_targets.values() {
-            for target_id in targets {
-                if target_ids.insert(*target_id) {
-                    pending_target_ids.push_back(*target_id);
-                }
-            }
-        }
-    }
-    specialize_profiled_inline_callees(profile, &mut callee_functions, &mut inline_callees)?;
-    Ok((callee_functions, inline_callees, external_inline_plan))
-}
-
-fn specialize_profiled_inline_callees(
-    profile: &SpecializationProfile<'_>,
-    callee_functions: &mut HashMap<RuntimeFunctionId, BlockPyFunction<CodegenModuleShape>>,
-    inline_callees: &mut HashMap<RuntimeFunctionId, InlineCallee>,
-) -> Result<(), String> {
-    let function_ids = inline_callees.keys().copied().collect::<Vec<_>>();
-    for function_id in function_ids {
-        let direct_call_rewrite_targets =
-            profile.v3_inline_direct_function_call_targets(function_id);
-        if direct_call_rewrite_targets.is_empty() {
-            continue;
-        }
-        let Some(inline_callee) = inline_callees.get(&function_id).cloned() else {
-            continue;
-        };
-        let mut function = inline_callee.function().clone();
-        let stats = rewrite_profiled_function_call_store_sites_with_constructor_targets(
-            &mut function,
-            &direct_call_rewrite_targets,
-            callee_functions,
-            true,
-        );
-        if stats.rewritten_stores == 0 {
-            continue;
-        }
-        info!(
-            target: "soac_jit_profiled_inline_callee_specialization",
-            function_id = %function.function_id,
-            qualname = %function.names.qualname,
-            rewritten_stores = stats.rewritten_stores,
-            skipped_empty_targets = stats.skipped_empty_targets,
-            skipped_incompatible_targets = stats.skipped_incompatible_targets,
-            skipped_missing_callee_targets = stats.skipped_missing_callee_targets,
-            skipped_arity_mismatch_targets = stats.skipped_arity_mismatch_targets,
-            skipped_unsupported_init_targets = stats.skipped_unsupported_init_targets,
-            skipped_missing_storage_layout_targets = stats.skipped_missing_storage_layout_targets,
-            skipped_unsupported_param_kind_targets = stats.skipped_unsupported_param_kind_targets,
-            skipped_missing_param_storage_targets = stats.skipped_missing_param_storage_targets,
-            "soac_jit_profiled_inline_callee_specialization"
-        );
-        callee_functions.insert(function_id, function.clone());
-        inline_callees.insert(function_id, inline_callee.with_function(function));
-    }
-    Ok(())
-}
-
-fn straightline_constructor_ids_in_plan(
-    inline_plan: &InlinePlanModule,
-) -> HashSet<RuntimeFunctionId> {
-    inline_plan
-        .functions
-        .iter()
-        .filter_map(|(function_id, plan)| {
-            plan.straightline_constructor.as_ref().map(|_| *function_id)
-        })
-        .collect()
-}
-
-fn extend_external_inline_plan_for_function_ids(
-    external_inline_plan: &mut InlinePlanModule,
-    function_ids: &HashSet<RuntimeFunctionId>,
-    compile_session: Option<&crate::session::CompileSession>,
-    precompile_module_index: Option<&PrecompileModuleIndex>,
-) -> Result<(), String> {
-    for function_id in function_ids {
-        if external_inline_plan.functions.contains_key(function_id) {
-            continue;
-        }
-        if let Some(precompile_module_index) = precompile_module_index
-            && let Some(inline_plan) =
-                precompile_module_index.inline_plan_for_function(*function_id)
-        {
-            external_inline_plan
-                .functions
-                .extend(inline_plan.functions.clone());
-            continue;
-        }
-        let Some(compile_session) = compile_session else {
-            continue;
-        };
-        let Some(shared_state) =
-            compile_session.shared_module_state_for_function_id(*function_id)?
-        else {
-            info!(
-                target: "soac_jit_external_inline_plan",
-                requested_function_id = %function_id,
-                "missing shared module state for external inline plan function id"
-            );
-            continue;
-        };
-        let requested_function = shared_state.lookup_function(*function_id);
-        let requested_qualname = requested_function
-            .map(|function| function.names.qualname.as_str())
-            .unwrap_or("<missing>");
-        let shared_inline_plan =
-            plan_module_inlining(&summarize_module_escapes(&shared_state.lowered_module));
-        let requested_has_straightline_constructor = shared_inline_plan
-            .straightline_constructor(*function_id)
-            .is_some();
-        let requested_rejection_reason = requested_function
-            .and_then(|function| {
-                straightline_field_initializer_rejection_reason(
-                    &shared_state.lowered_module,
-                    function,
-                )
-            })
-            .unwrap_or_else(|| "<none>".to_string());
-        let straightline_constructor_count = shared_inline_plan
-            .functions
-            .values()
-            .filter(|plan| plan.straightline_constructor.is_some())
-            .count();
-        info!(
-            target: "soac_jit_external_inline_plan",
-            requested_function_id = %function_id,
-            requested_qualname,
-            shared_module_id = shared_state.module_id(),
-            shared_module_name = %shared_state.module_name,
-            requested_has_straightline_constructor,
-            requested_rejection_reason,
-            straightline_constructor_count,
-            "extended external inline plan from shared module"
-        );
-        external_inline_plan
-            .functions
-            .extend(shared_inline_plan.functions);
-    }
-    Ok(())
-}
-
-fn runtime_constructor_function_id(runtime_name: RuntimeName) -> Option<RuntimeFunctionId> {
-    let obj = unsafe { crate::module_constants::load_runtime_name_owned_by_id(runtime_name) };
-    if obj.is_null() {
-        unsafe { ffi::PyErr_Clear() };
-        return None;
-    }
-    let function_id = unsafe {
-        if ffi::PyType_Check(obj) == 0 {
-            ffi::Py_DECREF(obj);
-            return None;
-        }
-        let owner_type = obj.cast::<ffi::PyTypeObject>();
-        let function_id =
-            reloc_type_ref_for_type(owner_type)
-                .ok()
-                .flatten()
-                .and_then(|owner_type_ref| {
-                    owner_attr_function_id_for_type_ref(&owner_type_ref, "__init__")
-                        .ok()
-                        .flatten()
-                });
-        ffi::Py_DECREF(obj);
-        function_id
+    let Some(optimized_module) = profile.optimized_module.as_ref() else {
+        return Err(format!(
+            "optimizer v3 selected specialization inputs for module {}, but no optimized BlockPy module artifact was loaded",
+            profile.module_name.unwrap_or("<unknown>")
+        ));
     };
-    function_id
+    if optimized_module.module_name_gen.module_id() != module.module_name_gen.module_id() {
+        return Err(format!(
+            "optimizer v3 optimized module id {} does not match lowered module id {}",
+            optimized_module.module_name_gen.module_id(),
+            module.module_name_gen.module_id()
+        ));
+    }
+    build_jit_module_plan(optimized_module.as_ref())
 }
 
 impl SharedModuleState {
@@ -3292,12 +2652,6 @@ impl ProcessJitState {
                 Some(inputs.session.as_ref()),
             )?;
             predeclare_specialization_type_imports(jit_module, &specialization_profile)?;
-            let direct_owner_attr_specializations = predeclare_direct_call_owner_type_imports(
-                jit_module,
-                &shared_state.lowered_module,
-                &batch_function.function,
-                &specialization_profile,
-            )?;
             let specialization_inputs = FunctionSpecializationInputs::from_profile(
                 &specialization_profile,
                 &batch_function.function,
@@ -3311,7 +2665,6 @@ impl ProcessJitState {
                 scalar_counter_data_id,
                 top_value_counter_data_id,
                 counted_refcount_helpers,
-                direct_owner_attr_specializations,
                 specialization_inputs,
                 module_constant_binding_key: instance_key,
                 symbol_scope: Some(symbol_scope),
@@ -3367,7 +2720,6 @@ impl ProcessJitState {
             scalar_counter_data_id,
             top_value_counter_data_id,
             counted_refcount_helpers,
-            direct_owner_attr_specializations: HashMap::new(),
             specialization_inputs,
             module_constant_binding_key: instance_key,
             symbol_scope: None,
@@ -3650,9 +3002,6 @@ impl ProcessJitState {
             Some(&plan.predeclared),
             BuildSpecializedFunctionOptions {
                 counted_refcount_helpers: Some(reserved_inputs.counted_refcount_helpers),
-                direct_owner_attr_specializations: Some(
-                    reserved_inputs.direct_owner_attr_specializations.clone(),
-                ),
                 specialization_inputs: Some(reserved_inputs.specialization_inputs.clone()),
                 ..BuildSpecializedFunctionOptions::default()
             },
@@ -7141,8 +6490,6 @@ struct JitEmitCtx<'mc> {
     module: &'mc BlockPyModule<CodegenModuleShape>,
     function_id: RuntimeFunctionId,
     function_kind: FunctionKind,
-    shared_state: Option<&'mc crate::module_type::SharedModuleState>,
-    inline_plan: &'mc InlinePlanModule,
     module_constants: &'mc ModuleCodegenConstants,
     value_facts: &'mc FactStore,
     deopt_resume_plan: &'mc PlannedJitDeoptResumeFunction,
@@ -7174,7 +6521,6 @@ struct JitEmitCtx<'mc> {
     pyobject_setitem_ref: ir::FuncRef,
     py_long_from_i64_ref: ir::FuncRef,
     raise_deleted_name_error_ref: ir::FuncRef,
-    raise_missing_required_argument_ref: ir::FuncRef,
     make_function_with_closure_ref: ir::FuncRef,
     make_cell_ref: ir::FuncRef,
     load_cell_ref: ir::FuncRef,
@@ -7192,8 +6538,6 @@ struct JitEmitCtx<'mc> {
         &'mc HashMap<RuntimeFunctionId, BlockPyFunction<CodegenModuleShape>>,
     direct_call_functions: &'mc HashMap<RuntimeFunctionId, DeclaredJitFunction>,
     call_target_counter_ids: &'mc HashMap<InstrId, CounterId>,
-    direct_owner_attr_specializations:
-        Option<&'mc HashMap<DirectOwnerAttrKey, Vec<DirectOwnerAttrSpecialization>>>,
     call_direct_hit_counter_ids: &'mc HashMap<InstrId, CounterRef>,
     call_direct_fallback_counter_ids: &'mc HashMap<InstrId, CounterRef>,
     operator_shape_counter_ids: &'mc HashMap<InstrId, CounterId>,
@@ -7635,11 +6979,6 @@ fn infer_jit_value_facts(module: &BlockPyModule<CodegenModuleShape>) -> FactStor
     infer_module_value_facts(module)
 }
 
-fn plan_jit_inlining(module: &BlockPyModule<CodegenModuleShape>) -> InlinePlanModule {
-    let escape_summary = summarize_module_escapes(module);
-    plan_module_inlining(&escape_summary)
-}
-
 #[derive(Clone)]
 struct DirectMethodSpecialization {
     function_id: RuntimeFunctionId,
@@ -7656,27 +6995,6 @@ struct DirectConstructorSpecialization {
     owner_type_ref: RelocTypeRef,
     type_version: u32,
     arg_plan: DirectCallArgPlan,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct DirectOwnerAttrKey {
-    function_id: RuntimeFunctionId,
-    attr_name: String,
-}
-
-impl DirectOwnerAttrKey {
-    fn new(function_id: RuntimeFunctionId, attr_name: &str) -> Self {
-        Self {
-            function_id,
-            attr_name: attr_name.to_string(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct DirectOwnerAttrSpecialization {
-    owner_type_ref: RelocTypeRef,
-    type_version: u32,
 }
 
 #[derive(Clone)]
@@ -11956,182 +11274,12 @@ fn annotate_typed_attr_accesses(
     Ok(annotator.count)
 }
 
-fn direct_method_owner_attr_specializations(
-    ctx: &JitEmitCtx<'_>,
-    function_id: RuntimeFunctionId,
-    method_name: &str,
-) -> Vec<DirectOwnerAttrSpecialization> {
-    let key = DirectOwnerAttrKey::new(function_id, method_name);
-    if let Some(predeclared) = ctx.direct_owner_attr_specializations {
-        return predeclared.get(&key).cloned().unwrap_or_default();
-    }
-    let Ok(owner_types) =
-        (unsafe { crate::lookup_exact_owner_types_for_method(function_id, method_name) })
-    else {
-        return Vec::new();
-    };
-    owner_types
-        .into_iter()
-        .filter_map(|owner| {
-            let Ok(Some(owner_type_ref)) = reloc_type_ref_for_type(owner.owner_type) else {
-                return None;
-            };
-            Some(DirectOwnerAttrSpecialization {
-                owner_type_ref,
-                type_version: owner.type_version,
-            })
-        })
-        .collect()
-}
-
-fn direct_constructor_owner_attr_specializations(
-    ctx: &JitEmitCtx<'_>,
-    function_id: RuntimeFunctionId,
-) -> Vec<DirectOwnerAttrSpecialization> {
-    let key = DirectOwnerAttrKey::new(function_id, "__init__");
-    if let Some(predeclared) = ctx.direct_owner_attr_specializations {
-        return predeclared.get(&key).cloned().unwrap_or_default();
-    }
-    let Ok(owner_types) = (unsafe { crate::lookup_exact_owner_types_for_constructor(function_id) })
-    else {
-        return Vec::new();
-    };
-    owner_types
-        .into_iter()
-        .filter_map(|owner| {
-            let Ok(Some(owner_type_ref)) = reloc_type_ref_for_type(owner.owner_type) else {
-                return None;
-            };
-            Some(DirectOwnerAttrSpecialization {
-                owner_type_ref,
-                type_version: owner.type_version,
-            })
-        })
-        .collect()
-}
-
 fn call_site_profiled_targets<'a>(
     call: &blockpy_intrinsics::Call<InstrCodegen>,
     profiled_targets: Option<&'a [RuntimeFunctionId]>,
 ) -> Option<&'a [RuntimeFunctionId]> {
     let _ = call.try_semantic_instr_id()?;
     profiled_targets.filter(|targets| !targets.is_empty())
-}
-
-fn direct_method_specializations_for_call_site(
-    call: &blockpy_intrinsics::Call<InstrCodegen>,
-    ctx: &JitEmitCtx<'_>,
-    profiled_targets: Option<&[RuntimeFunctionId]>,
-) -> Vec<DirectMethodSpecialization> {
-    if ctx.shared_state.is_none() {
-        return Vec::new();
-    }
-    let InstrCodegen::GetAttr(getattr) = call.func.as_ref() else {
-        return Vec::new();
-    };
-    let Some(method_name) = codegen_constant_string_value(ctx.module, getattr.attr.as_ref()) else {
-        return Vec::new();
-    };
-    let Some(targets) = call_site_profiled_targets(call, profiled_targets) else {
-        return Vec::new();
-    };
-    let explicit_positional_arg_count = direct_call_positional_arg_count(&call.args);
-    let has_starred_arguments = direct_call_has_starred_arguments(&call.args, &call.keywords);
-    let has_keywords = !call.keywords.is_empty();
-    let mut out = Vec::new();
-    for function_id in targets.iter().copied() {
-        let owners = direct_method_owner_attr_specializations(ctx, function_id, method_name);
-        if owners.is_empty() {
-            continue;
-        }
-        let Some(target_function) = direct_call_target_function(ctx, function_id) else {
-            ctx.direct_edge_stats
-                .record_profiled_missing_target_candidate();
-            continue;
-        };
-        let arg_plan = match validate_direct_call_compatibility(
-            target_function,
-            ctx.direct_call_functions,
-            explicit_positional_arg_count,
-            1,
-            has_starred_arguments,
-            has_keywords,
-        ) {
-            Ok(arg_plan) => arg_plan,
-            Err(incompatibility) => {
-                record_profiled_direct_call_incompatibility(ctx.direct_edge_stats, incompatibility);
-                continue;
-            }
-        };
-        for owner in owners {
-            out.push(DirectMethodSpecialization {
-                function_id,
-                descriptor_function_ref: RelocCallableRef::OwnerAttr {
-                    owner_type_ref: owner.owner_type_ref.clone(),
-                    attr_name: method_name.to_string(),
-                },
-                owner_type_ref: owner.owner_type_ref.clone(),
-                type_version: owner.type_version,
-                arg_plan: arg_plan.clone(),
-            });
-        }
-    }
-    out
-}
-
-fn direct_constructor_specializations_for_call_site(
-    call: &blockpy_intrinsics::Call<InstrCodegen>,
-    ctx: &JitEmitCtx<'_>,
-    profiled_targets: Option<&[RuntimeFunctionId]>,
-) -> Vec<DirectConstructorSpecialization> {
-    if ctx.shared_state.is_none() {
-        return Vec::new();
-    }
-    let Some(targets) = call_site_profiled_targets(call, profiled_targets) else {
-        return Vec::new();
-    };
-    let explicit_positional_arg_count = direct_call_positional_arg_count(&call.args);
-    let has_starred_arguments = direct_call_has_starred_arguments(&call.args, &call.keywords);
-    let has_keywords = !call.keywords.is_empty();
-    let mut out = Vec::new();
-    for function_id in targets.iter().copied() {
-        let owners = direct_constructor_owner_attr_specializations(ctx, function_id);
-        if owners.is_empty() {
-            continue;
-        }
-        let Some(target_function) = direct_call_target_function(ctx, function_id) else {
-            ctx.direct_edge_stats
-                .record_profiled_missing_target_candidate();
-            continue;
-        };
-        let arg_plan = match validate_direct_call_compatibility(
-            target_function,
-            ctx.direct_call_functions,
-            explicit_positional_arg_count,
-            1,
-            has_starred_arguments,
-            has_keywords,
-        ) {
-            Ok(arg_plan) => arg_plan,
-            Err(incompatibility) => {
-                record_profiled_direct_call_incompatibility(ctx.direct_edge_stats, incompatibility);
-                continue;
-            }
-        };
-        for owner in owners {
-            out.push(DirectConstructorSpecialization {
-                function_id,
-                init_function_ref: RelocCallableRef::OwnerAttr {
-                    owner_type_ref: owner.owner_type_ref.clone(),
-                    attr_name: "__init__".to_string(),
-                },
-                owner_type_ref: owner.owner_type_ref.clone(),
-                type_version: owner.type_version,
-                arg_plan: arg_plan.clone(),
-            });
-        }
-    }
-    out
 }
 
 fn collect_call_direct_targets(
@@ -12294,6 +11442,7 @@ fn collect_deopt_entry_counter_ids_by_kind(
 struct SpecializationProfile<'a> {
     module_name: Option<&'a str>,
     counter_dump_path: Option<Cow<'a, Path>>,
+    optimized_module: Option<Arc<BlockPyModule<CodegenModuleShape>>>,
     opt_v3_emitted_direct_calls:
         HashMap<RuntimeFunctionId, HashMap<InstrId, Vec<ResolvedV3DirectCallPlan>>>,
     opt_v3_emitted_constructor_calls:
@@ -12314,6 +11463,7 @@ struct SpecializationProfile<'a> {
 
 #[derive(Clone, Default)]
 struct PlannedOptimizationInputs {
+    optimized_module: Option<BlockPyModule<CodegenModuleShape>>,
     opt_v3_emitted_direct_calls:
         HashMap<RuntimeFunctionId, HashMap<InstrId, Vec<ResolvedV3DirectCallPlan>>>,
     opt_v3_emitted_constructor_calls:
@@ -12445,17 +11595,54 @@ fn load_planned_optimization_inputs_for_runtime_state(
             cache_identity.as_str(),
         )
         .map_err(|err| err.to_string())?;
-        return planned_optimization_inputs_from_v3_artifacts(
+        let mut inputs = planned_optimization_inputs_from_v3_artifacts(
             &artifacts,
             shared_state,
             compile_session,
-        );
+        )?;
+        inputs.optimized_module = Some(load_optimized_codegen_module_v3_for_runtime_state(
+            cache_root.as_path(),
+            source,
+            shared_state,
+            env_config,
+        )?);
+        return Ok(inputs);
     }
     Err(format!(
         "SOAC_OPT_MODE=verify/apply requires mod.optv3 for module {} under {}",
         shared_state.module_name,
         cache_root.display()
     ))
+}
+
+fn load_optimized_codegen_module_v3_for_runtime_state(
+    cache_root: &Path,
+    source: PythonModuleCacheSource,
+    shared_state: &SharedModuleState,
+    env_config: &SoacEnvConfig,
+) -> Result<BlockPyModule<CodegenModuleShape>, String> {
+    let path =
+        module_optimized_codegen_v3_path(cache_root, source, shared_state.module_name.as_str())?;
+    let mut cache = load_codegen_module_cache(path.as_path()).map_err(|err| err.to_string())?;
+    let expected = pre_optimization_module_cache_metadata(
+        source,
+        shared_state.module_name.as_str(),
+        shared_state.source_hash,
+        env!("SOAC_BUILD_IDENTITY"),
+        shared_state.module_name == "soac.runtime",
+    );
+    validate_codegen_module_cache_metadata(&cache.metadata, &expected)
+        .map_err(|err| err.to_string())?;
+    remap_cached_codegen_module_function_ids(
+        &mut cache,
+        shared_state.lowered_module.module_name_gen.clone(),
+    );
+    finish_cached_codegen_module_for_runtime_with_counter_defs(
+        cache.module,
+        env_config,
+        shared_state.lowered_module.counter_defs.as_slice(),
+    )
+    .map_err(|err| err.to_string())
 }
 
 fn planned_optimization_inputs_from_v3_artifacts(
@@ -12733,13 +11920,39 @@ fn planned_optimization_inputs_for_precompile(
         plan_input.cache_identity,
     )
     .map_err(|err| err.to_string())?;
-    planned_optimization_inputs_from_v3_artifacts_for_codegen_module(
+    let mut inputs = planned_optimization_inputs_from_v3_artifacts_for_codegen_module(
         &artifacts,
         module,
         module_name,
         source_hash,
         module_index,
-    )
+    )?;
+    let Some(optimized_module_path) = plan_input
+        .optimized_module_path
+        .filter(|path| path.exists())
+    else {
+        return Err(format!(
+            "precompile requires mod.optv3.blockpy for module {module_name}"
+        ));
+    };
+    let mut optimized_cache =
+        load_codegen_module_cache(optimized_module_path).map_err(|err| err.to_string())?;
+    if optimized_cache.metadata.module_name != module_name
+        || optimized_cache.metadata.source_hash != source_hash
+        || optimized_cache.metadata.cache_identity != plan_input.cache_identity
+    {
+        return Err(format!(
+            "optimized v3 BlockPy module metadata mismatch for module {module_name}: loaded module={} source_hash=0x{:016x} cache_identity={:?}; expected module={} source_hash=0x{source_hash:016x} cache_identity={:?}",
+            optimized_cache.metadata.module_name,
+            optimized_cache.metadata.source_hash,
+            optimized_cache.metadata.cache_identity,
+            module_name,
+            plan_input.cache_identity
+        ));
+    }
+    remap_cached_codegen_module_function_ids(&mut optimized_cache, module.module_name_gen.clone());
+    inputs.optimized_module = Some(optimized_cache.module);
+    Ok(inputs)
 }
 
 impl FunctionSpecializationInputs {
@@ -12754,10 +11967,28 @@ impl FunctionSpecializationInputs {
         ) = profile.field_index_specialization_maps(function.function_id)?;
         let opt_v3_direct_calls_by_instr =
             profile.codegen_opt_v3_direct_calls(function.function_id);
-        let opt_v3_constructor_calls_by_instr =
-            profile.codegen_opt_v3_constructor_calls(function.function_id)?;
-        let opt_v3_method_calls_by_instr =
-            profile.codegen_opt_v3_method_calls(function.function_id)?;
+        if profile
+            .opt_v3_emitted_constructor_calls
+            .get(&function.function_id)
+            .is_some_and(|plans| !plans.is_empty())
+        {
+            return Err(format!(
+                "optimizer v3 emitted constructor-call plans for {}, but constructor guards are not a mechanical JIT input yet",
+                function.names.qualname
+            ));
+        }
+        if profile
+            .opt_v3_emitted_method_calls
+            .get(&function.function_id)
+            .is_some_and(|plans| !plans.is_empty())
+        {
+            return Err(format!(
+                "optimizer v3 emitted method-call plans for {}, but method guards are not a mechanical JIT input yet",
+                function.names.qualname
+            ));
+        }
+        let opt_v3_constructor_calls_by_instr = HashMap::new();
+        let opt_v3_method_calls_by_instr = HashMap::new();
         let opt_v3_call_emissions = typed_call_emission_plans_from_v3(
             &opt_v3_direct_calls_by_instr,
             &opt_v3_constructor_calls_by_instr,
@@ -12814,6 +12045,7 @@ impl<'a> SpecializationProfile<'a> {
         Ok(Self {
             module_name: shared_state.map(|shared_state| shared_state.module_name.as_str()),
             counter_dump_path: counter_dump_path.map(Cow::Owned),
+            optimized_module: planned_inputs.optimized_module.map(Arc::new),
             opt_v3_emitted_direct_calls: planned_inputs.opt_v3_emitted_direct_calls,
             opt_v3_emitted_constructor_calls: planned_inputs.opt_v3_emitted_constructor_calls,
             opt_v3_emitted_method_calls: planned_inputs.opt_v3_emitted_method_calls,
@@ -12840,6 +12072,7 @@ impl<'a> SpecializationProfile<'a> {
         Ok(Self {
             module_name: Some(module_name),
             counter_dump_path: counter_dump_path.map(Cow::Borrowed),
+            optimized_module: planned_inputs.optimized_module.map(Arc::new),
             opt_v3_emitted_direct_calls: planned_inputs.opt_v3_emitted_direct_calls,
             opt_v3_emitted_constructor_calls: planned_inputs.opt_v3_emitted_constructor_calls,
             opt_v3_emitted_method_calls: planned_inputs.opt_v3_emitted_method_calls,
@@ -12851,22 +12084,6 @@ impl<'a> SpecializationProfile<'a> {
             profiled_cold_blocks: env_config.profiled_cold_blocks_enabled(),
             guard_miss_deopt: true,
         })
-    }
-
-    fn has_existing_counter_dump(&self) -> bool {
-        self.module_name.is_some()
-            && existing_counter_dump_path(self.counter_dump_path.as_deref()).is_some()
-    }
-
-    fn has_specialization_inputs(&self) -> bool {
-        !self.opt_v3_emitted_direct_calls.is_empty()
-            || !self.opt_v3_emitted_constructor_calls.is_empty()
-            || !self.opt_v3_emitted_method_calls.is_empty()
-            || !self.opt_v3_emitted_exact_list_items.is_empty()
-            || !self.opt_v3_emitted_indexed_fields.is_empty()
-            || !self.opt_v3_emitted_indexed_globals.is_empty()
-            || !self.opt_v3_exact_int_branch_artifacts.is_empty()
-            || (self.profiled_cold_blocks && self.has_existing_counter_dump())
     }
 
     fn opt_v3_indexed_field_access_plans(&self) -> Vec<&OptV3IndexedFieldAccessPlan> {
@@ -12887,16 +12104,6 @@ impl<'a> SpecializationProfile<'a> {
             .unwrap_or_default()
     }
 
-    fn v3_inline_direct_function_call_targets(
-        &self,
-        function_id: RuntimeFunctionId,
-    ) -> HashMap<InstrId, Vec<RuntimeFunctionId>> {
-        self.opt_v3_emitted_direct_calls
-            .get(&function_id)
-            .map(opt_v3_inline_direct_call_targets)
-            .unwrap_or_default()
-    }
-
     fn v3_constructor_call_targets(
         &self,
         function_id: RuntimeFunctionId,
@@ -12904,30 +12111,6 @@ impl<'a> SpecializationProfile<'a> {
         self.opt_v3_emitted_constructor_calls
             .get(&function_id)
             .map(opt_v3_constructor_call_targets)
-            .unwrap_or_default()
-    }
-
-    fn v3_inline_constructor_calls(
-        &self,
-        function_id: RuntimeFunctionId,
-    ) -> HashMap<InstrId, Vec<ResolvedV3ConstructorCallPlan>> {
-        self.opt_v3_emitted_constructor_calls
-            .get(&function_id)
-            .map(|constructor_calls_by_source| {
-                constructor_calls_by_source
-                    .iter()
-                    .filter_map(|(source, constructor_calls)| {
-                        let plans = constructor_calls
-                            .iter()
-                            .filter(|constructor_call| {
-                                constructor_call.body.kind == PlanV3CallBodyKind::Inline
-                            })
-                            .cloned()
-                            .collect::<Vec<_>>();
-                        (!plans.is_empty()).then_some((*source, plans))
-                    })
-                    .collect()
-            })
             .unwrap_or_default()
     }
 
@@ -12941,16 +12124,6 @@ impl<'a> SpecializationProfile<'a> {
             .unwrap_or_default()
     }
 
-    fn v3_inline_method_call_targets(
-        &self,
-        function_id: RuntimeFunctionId,
-    ) -> HashMap<InstrId, Vec<RuntimeFunctionId>> {
-        self.opt_v3_emitted_method_calls
-            .get(&function_id)
-            .map(opt_v3_inline_method_call_targets)
-            .unwrap_or_default()
-    }
-
     fn codegen_opt_v3_direct_calls(
         &self,
         function_id: RuntimeFunctionId,
@@ -12959,35 +12132,6 @@ impl<'a> SpecializationProfile<'a> {
             .get(&function_id)
             .map(opt_v3_direct_call_body_plans)
             .unwrap_or_default()
-    }
-
-    fn codegen_opt_v3_constructor_calls(
-        &self,
-        function_id: RuntimeFunctionId,
-    ) -> Result<HashMap<InstrId, PreparedV3ConstructorCallPlan>, String> {
-        let Some(constructor_calls) = self.opt_v3_emitted_constructor_calls.get(&function_id)
-        else {
-            return Ok(HashMap::new());
-        };
-        prepare_constructor_call_plans_for_codegen(
-            constructor_calls,
-            opt_v3_constructor_call_runtime_guard_from_request,
-            register_opt_v3_prepared_constructor_guard_symbols,
-        )
-    }
-
-    fn codegen_opt_v3_method_calls(
-        &self,
-        function_id: RuntimeFunctionId,
-    ) -> Result<HashMap<InstrId, PreparedV3MethodCallPlan>, String> {
-        let Some(method_calls) = self.opt_v3_emitted_method_calls.get(&function_id) else {
-            return Ok(HashMap::new());
-        };
-        prepare_method_call_plans_for_codegen(
-            method_calls,
-            opt_v3_method_call_runtime_guard_from_request,
-            register_opt_v3_prepared_method_guard_symbols,
-        )
     }
 
     fn field_index_specialization_maps(
@@ -13027,55 +12171,6 @@ impl<'a> SpecializationProfile<'a> {
         };
         collect_cold_block_labels_from_path(path, function, module_name)
     }
-}
-
-fn register_opt_v3_prepared_constructor_guard_symbols(
-    guard: &TypedDirectConstructorCallGuard,
-) -> Result<(), String> {
-    let owner_type_ref = reloc_type_ref_from_typed_attr_owner_ref(&guard.owner_type_ref)
-        .ok_or_else(|| {
-            "optimizer v3 constructor-call guard has invalid owner type ref".to_string()
-        })?;
-    if !ensure_reloc_type_symbol_registered(&owner_type_ref)? {
-        return Err(format!(
-            "optimizer v3 constructor-call target {} could not register owner type {:?}",
-            guard.function_id, guard.owner_type_ref
-        ));
-    }
-    if !ensure_reloc_callable_symbol_registered(&RelocCallableRef::OwnerAttr {
-        owner_type_ref,
-        attr_name: "__init__".to_string(),
-    })? {
-        return Err(format!(
-            "optimizer v3 constructor-call target {} could not register owner __init__ callable",
-            guard.function_id
-        ));
-    }
-    Ok(())
-}
-
-fn register_opt_v3_prepared_method_guard_symbols(
-    guard: &TypedDirectMethodCallGuard,
-    method_name: &str,
-) -> Result<(), String> {
-    let owner_type_ref = reloc_type_ref_from_typed_attr_owner_ref(&guard.owner_type_ref)
-        .ok_or_else(|| "optimizer v3 method-call guard has invalid owner type ref".to_string())?;
-    if !ensure_reloc_type_symbol_registered(&owner_type_ref)? {
-        return Err(format!(
-            "optimizer v3 method-call target {} could not register owner type {:?}",
-            guard.function_id, guard.owner_type_ref
-        ));
-    }
-    if !ensure_reloc_callable_symbol_registered(&RelocCallableRef::OwnerAttr {
-        owner_type_ref,
-        attr_name: method_name.to_string(),
-    })? {
-        return Err(format!(
-            "optimizer v3 method-call target {} could not register owner method callable {method_name}",
-            guard.function_id
-        ));
-    }
-    Ok(())
 }
 
 fn existing_counter_dump_path(path: Option<&Path>) -> Option<&Path> {
@@ -13339,28 +12434,6 @@ fn resolve_reloc_callable_ref_to_object(
             Ok(Some(value as ObjPtr))
         }
     }
-}
-
-fn owner_attr_function_id_for_type_ref(
-    owner_type_ref: &RelocTypeRef,
-    attr_name: &str,
-) -> Result<Option<RuntimeFunctionId>, String> {
-    let callable_ref = RelocCallableRef::OwnerAttr {
-        owner_type_ref: owner_type_ref.clone(),
-        attr_name: attr_name.to_string(),
-    };
-    let Some(callable) = resolve_reloc_callable_ref_to_object(&callable_ref)? else {
-        return Ok(None);
-    };
-    register_jit_data_symbol(
-        reloc_callable_ref_symbol_name(&callable_ref).as_str(),
-        callable.cast::<u8>(),
-    );
-    let packed = unsafe { crate::PyFunction_GetSoacFunctionId(callable as *mut ffi::PyObject) };
-    if packed == RuntimeFunctionId::global().to_packed_runtime_u64() {
-        return Ok(None);
-    }
-    Ok(Some(RuntimeFunctionId::from_packed_runtime_u64(packed)))
 }
 
 fn ensure_reloc_callable_symbol_registered(
@@ -14318,277 +13391,6 @@ fn emit_direct_call_resolved_with_arg_values(
     fb.block_params(call_ok_block)[0]
 }
 
-fn emit_straightline_constructor_initializer_inline(
-    fb: &mut FunctionBuilder<'_>,
-    allocated: ir::Value,
-    init_arg_values: &[ir::Value],
-    init_arg_borrowed: &[bool],
-    specialization: &DirectConstructorSpecialization,
-    target_function: &BlockPyFunction<CodegenModuleShape>,
-    ctx: &JitEmitCtx<'_>,
-    codegen_env: &mut impl JitCodegenEnv,
-) -> Option<ir::Value> {
-    let plan = ctx
-        .inline_plan
-        .straightline_constructor(specialization.function_id)?;
-    let field_stores = plan
-        .field_stores
-        .iter()
-        .map(|store| {
-            let ConstructorFieldValue::Param { index, .. } = store.value else {
-                return None;
-            };
-            Some((store.field_name.as_str(), index))
-        })
-        .collect::<Option<Vec<_>>>()?;
-    if init_arg_values.len() != target_function.params.len()
-        || init_arg_borrowed.len() != target_function.params.len()
-        || specialization.arg_plan.sources.len() != target_function.params.len()
-        || field_stores
-            .iter()
-            .any(|(_, param_index)| *param_index >= init_arg_values.len())
-    {
-        return None;
-    }
-    let (init_arg_values, init_arg_borrowed) = emit_resolved_straightline_constructor_init_args(
-        fb,
-        allocated,
-        init_arg_values,
-        init_arg_borrowed,
-        specialization,
-        target_function,
-        ctx,
-        codegen_env,
-    )?;
-    let mut field_values = Vec::with_capacity(field_stores.len());
-    for (field_name, index) in field_stores {
-        let value = *init_arg_values.get(index)?;
-        field_values.push((field_name, value));
-    }
-
-    let owned_init_args = init_arg_values
-        .iter()
-        .copied()
-        .zip(init_arg_borrowed.iter().copied())
-        .filter_map(|(value, borrowed)| (!borrowed).then_some(value))
-        .collect::<Vec<_>>();
-    let ptr_ty = ctx.consts.ptr_ty;
-    let null_ptr = fb.ins().iconst(ptr_ty, 0);
-    for (field_name, value) in field_values {
-        let set_result = emit_inlined_constructor_field_store(
-            fb,
-            allocated,
-            field_name,
-            value,
-            specialization,
-            ctx,
-        );
-        let set_failed = fb
-            .ins()
-            .icmp(ir::condcodes::IntCC::Equal, set_result, null_ptr);
-        let set_ok_block = fb.create_block();
-        let set_fail_block = fb.create_block();
-        fb.ins()
-            .brif(set_failed, set_fail_block, &[], set_ok_block, &[]);
-
-        fb.switch_to_block(set_fail_block);
-        emit_release_owned_inputs(fb, ctx, &[allocated]);
-        emit_release_owned_inputs(fb, ctx, &owned_init_args);
-        fb.ins()
-            .jump(ctx.consts.step_null_block, &step_null_block_args(ctx));
-
-        fb.switch_to_block(set_ok_block);
-        emit_release_owned_inputs(fb, ctx, &[set_result]);
-    }
-    emit_release_owned_inputs(fb, ctx, &owned_init_args);
-    Some(allocated)
-}
-
-fn emit_resolved_straightline_constructor_init_args(
-    fb: &mut FunctionBuilder<'_>,
-    allocated: ir::Value,
-    init_arg_values: &[ir::Value],
-    init_arg_borrowed: &[bool],
-    specialization: &DirectConstructorSpecialization,
-    target_function: &BlockPyFunction<CodegenModuleShape>,
-    ctx: &JitEmitCtx<'_>,
-    codegen_env: &mut impl JitCodegenEnv,
-) -> Option<(Vec<ir::Value>, Vec<bool>)> {
-    if !specialization.arg_plan.requires_default_resolving_entry() {
-        return Some((init_arg_values.to_vec(), init_arg_borrowed.to_vec()));
-    }
-
-    let init_callable =
-        emit_callable_ptr_value_for_ref(fb, codegen_env, ctx, &specialization.init_function_ref)
-            .unwrap_or_else(|err| panic!("failed to bind constructor callable symbol: {err}"))?;
-    let ptr_ty = ctx.consts.ptr_ty;
-    let null_ptr = fb.ins().iconst(ptr_ty, 0);
-    let missing_block = fb.create_block();
-    fb.set_cold_block(missing_block);
-
-    let (_function_metadata, function_env) =
-        emit_resolved_direct_function_metadata_and_env(fb, init_callable, ctx);
-    let function_data = fb
-        .ins()
-        .iadd_imm(function_env, i64::from(FUNCTION_ENV_RUNTIME_OBJECTS_OFFSET));
-    let runtime_layout = FunctionRuntimeDataLayout::from_function(target_function);
-
-    let mut selected_args = Vec::with_capacity(init_arg_values.len());
-    let mut selected_borrowed = Vec::with_capacity(init_arg_borrowed.len());
-    for (param_index, ((param, source), (arg_value, arg_borrowed))) in target_function
-        .params
-        .iter()
-        .zip(specialization.arg_plan.sources.iter())
-        .zip(
-            init_arg_values
-                .iter()
-                .copied()
-                .zip(init_arg_borrowed.iter().copied()),
-        )
-        .enumerate()
-    {
-        match source {
-            DirectCallArgSource::Provided(_) => {
-                selected_args.push(arg_value);
-                selected_borrowed.push(arg_borrowed);
-            }
-            DirectCallArgSource::DefaultSentinel => {
-                let default_slot = param_runtime_default_slot(&runtime_layout, param, param_index)
-                    .expect("default sentinel should have a runtime default slot");
-                let default_value =
-                    emit_function_data_slot_borrowed(fb, function_data, default_slot, ptr_ty);
-                let default_is_missing =
-                    fb.ins()
-                        .icmp(ir::condcodes::IntCC::Equal, default_value, null_ptr);
-                let default_ok_block = fb.create_block();
-                fb.ins().brif(
-                    default_is_missing,
-                    missing_block,
-                    &[],
-                    default_ok_block,
-                    &[],
-                );
-                fb.switch_to_block(default_ok_block);
-                selected_args.push(default_value);
-                selected_borrowed.push(true);
-            }
-        }
-    }
-
-    let resume_block = fb.create_block();
-    for _ in &selected_args {
-        fb.append_block_param(resume_block, ptr_ty);
-    }
-    fb.ins()
-        .jump(resume_block, &block_arg_values(&selected_args));
-
-    fb.switch_to_block(missing_block);
-    fb.ins().call(ctx.raise_missing_required_argument_ref, &[]);
-    emit_release_owned_inputs(fb, ctx, &[allocated]);
-    let owned_init_args = init_arg_values
-        .iter()
-        .copied()
-        .zip(init_arg_borrowed.iter().copied())
-        .filter_map(|(value, borrowed)| (!borrowed).then_some(value))
-        .collect::<Vec<_>>();
-    emit_release_owned_inputs(fb, ctx, &owned_init_args);
-    fb.ins()
-        .jump(ctx.consts.step_null_block, &step_null_block_args(ctx));
-
-    fb.switch_to_block(resume_block);
-    let resolved_args = fb.block_params(resume_block).to_vec();
-    Some((resolved_args, selected_borrowed))
-}
-
-fn constructor_field_index_specialization<'a>(
-    ctx: &'a JitEmitCtx<'_>,
-    specialization: &DirectConstructorSpecialization,
-    field_name: &str,
-) -> Option<&'a FieldIndexSpecialization> {
-    ctx.field_index_specializations
-        .get(field_name)?
-        .iter()
-        .find(|field_specialization| {
-            field_specialization.owner_type_ref == specialization.owner_type_ref
-                && field_specialization.type_version == specialization.type_version
-        })
-}
-
-fn emit_inlined_constructor_field_store(
-    fb: &mut FunctionBuilder<'_>,
-    allocated: ir::Value,
-    field_name: &str,
-    value: ir::Value,
-    specialization: &DirectConstructorSpecialization,
-    ctx: &JitEmitCtx<'_>,
-) -> ir::Value {
-    let ptr_ty = ctx.consts.ptr_ty;
-    let attr = emit_owned_module_constant(
-        fb,
-        ctx.module_constants.require_unicode_constant_id(field_name),
-        ctx,
-    );
-
-    if ctx.behavior_change_indexed_stores
-        && let Some(field_specialization) =
-            constructor_field_index_specialization(ctx, specialization, field_name)
-    {
-        let i64_ty = ctx.consts.i64_ty;
-        let i32_ty = ctx.consts.i32_ty;
-        let zero_i32 = fb.ins().iconst(i32_ty, 0);
-        let expected_index = fb
-            .ins()
-            .iconst(i64_ty, i64::from(field_specialization.expected_index));
-        let direct_inst = fb.ins().call(
-            ctx.store_field_indexed_ref,
-            &[
-                ctx.consts.thread_state_value,
-                allocated,
-                attr,
-                expected_index,
-                value,
-            ],
-        );
-        let direct_result = fb.inst_results(direct_inst)[0];
-        let direct_missed = fb
-            .ins()
-            .icmp(ir::condcodes::IntCC::Equal, direct_result, zero_i32);
-        let fallback_block = fb.create_block();
-        fb.set_cold_block(fallback_block);
-        let done_block = fb.create_block();
-        fb.append_block_param(done_block, ptr_ty);
-        let none_const = emit_none_const(fb, ctx);
-        fb.ins().call(ctx.incref_ref, &[none_const]);
-        fb.ins().brif(
-            direct_missed,
-            fallback_block,
-            &[],
-            done_block,
-            &[ir::BlockArg::Value(none_const)],
-        );
-
-        fb.switch_to_block(fallback_block);
-        emit_release_owned_inputs(fb, ctx, &[none_const]);
-        let fallback_inst = fb
-            .ins()
-            .call(ctx.pyobject_setattr_ref, &[allocated, attr, value]);
-        let fallback_result = fb.inst_results(fallback_inst)[0];
-        fb.ins()
-            .jump(done_block, &[ir::BlockArg::Value(fallback_result)]);
-
-        fb.switch_to_block(done_block);
-        emit_release_owned_inputs(fb, ctx, &[attr]);
-        return fb.block_params(done_block)[0];
-    }
-
-    let set_inst = fb
-        .ins()
-        .call(ctx.pyobject_setattr_ref, &[allocated, attr, value]);
-    let set_result = fb.inst_results(set_inst)[0];
-    emit_release_owned_inputs(fb, ctx, &[attr]);
-    set_result
-}
-
 fn emit_direct_constructor_resolved_with_arg_values(
     fb: &mut FunctionBuilder<'_>,
     callable: ir::Value,
@@ -14651,18 +13453,6 @@ fn emit_direct_constructor_resolved_with_arg_values(
         provided_arg_borrowed,
         ptr_ty,
     );
-    if let Some(result) = emit_straightline_constructor_initializer_inline(
-        fb,
-        allocated,
-        init_arg_values.as_slice(),
-        init_arg_borrowed.as_slice(),
-        specialization,
-        target_function,
-        ctx,
-        codegen_env,
-    ) {
-        return result;
-    }
     let init_callable =
         emit_callable_ptr_value_for_ref(fb, codegen_env, ctx, &specialization.init_function_ref)
             .unwrap_or_else(|err| panic!("failed to bind constructor callable symbol: {err}"))
@@ -17427,11 +16217,7 @@ fn emit_codegen_simple_call_with_local_env(
             ),
             Some(_) => (Vec::new(), Vec::new()),
             _ => {
-                let constructor_specializations = direct_constructor_specializations_for_call_site(
-                    call,
-                    emit_ctx,
-                    profiled_targets,
-                );
+                let constructor_specializations = Vec::new();
                 let direct_specializations = call_site_profiled_targets(call, profiled_targets)
                     .map(|targets| {
                         targets
@@ -17483,7 +16269,7 @@ fn emit_codegen_simple_call_with_local_env(
                 method_guards,
             }) => direct_method_specializations_from_typed_guards(method_guards, method_name),
             Some(_) => Vec::new(),
-            _ => direct_method_specializations_for_call_site(call, emit_ctx, profiled_targets),
+            _ => Vec::new(),
         };
         if !direct_method_specializations.is_empty() {
             let InstrCodegen::GetAttr(getattr) = call.func.as_ref() else {
@@ -19274,7 +18060,6 @@ fn emit_typed_codegen_call_result_with_local_env(
         fb,
         call,
         &legacy_call,
-        profiled_targets,
         local_env,
         emit_ctx,
         demand,
@@ -19346,7 +18131,6 @@ fn emit_typed_codegen_direct_callable_specialization_result_with_local_env(
     fb: &mut FunctionBuilder<'_>,
     call: &TypedCall<InstrTyped>,
     legacy_call: &soac_core::block_py::Call<InstrCodegen>,
-    profiled_targets: Option<&[RuntimeFunctionId]>,
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     demand: ResultDemand,
@@ -19386,54 +18170,7 @@ fn emit_typed_codegen_direct_callable_specialization_result_with_local_env(
             direct_function_specializations_from_typed_guards(function_guards),
         ),
         TypedCallAccessPlan::Generic | TypedCallAccessPlan::ProfiledCallableTargets { .. } => {
-            let constructor_specializations = direct_constructor_specializations_for_call_site(
-                legacy_call,
-                emit_ctx,
-                profiled_targets,
-            );
-            let direct_specializations = call_site_profiled_targets(legacy_call, profiled_targets)
-                .map(|targets| {
-                    targets
-                        .iter()
-                        .copied()
-                        .filter_map(|function_id| {
-                            let Some(target_function) =
-                                direct_call_target_function(emit_ctx, function_id)
-                            else {
-                                emit_ctx
-                                    .direct_edge_stats
-                                    .record_profiled_missing_target_candidate();
-                                return None;
-                            };
-                            if target_function.names.fn_name == "__init__" {
-                                return None;
-                            }
-                            let arg_plan = match validate_direct_call_compatibility(
-                                target_function,
-                                emit_ctx.direct_call_functions,
-                                simple_args.len(),
-                                0,
-                                false,
-                                false,
-                            ) {
-                                Ok(arg_plan) => arg_plan,
-                                Err(incompatibility) => {
-                                    record_profiled_direct_call_incompatibility(
-                                        emit_ctx.direct_edge_stats,
-                                        incompatibility,
-                                    );
-                                    return None;
-                                }
-                            };
-                            Some(DirectFunctionSpecialization {
-                                function_id,
-                                arg_plan,
-                            })
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            (constructor_specializations, direct_specializations)
+            (Vec::new(), Vec::new())
         }
         TypedCallAccessPlan::ProfiledMethodTargets { .. }
         | TypedCallAccessPlan::GuardedMethod { .. }
@@ -26250,13 +24987,11 @@ struct PrecompileIndexedFunction {
     source_hash: u64,
     persistent_id: PersistentFunctionId,
     function: BlockPyFunction<CodegenModuleShape>,
-    module_constants: Vec<InstrResolved>,
 }
 
 #[derive(Debug, Clone)]
 struct PrecompileIndexedModule {
     module_id: RuntimeModuleId,
-    inline_plan: InlinePlanModule,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -26282,13 +25017,7 @@ impl PrecompileModuleIndex {
         let module_id = entry.module.module_name_gen.runtime_module_id();
         if self
             .modules_by_identity
-            .insert(
-                identity.clone(),
-                PrecompileIndexedModule {
-                    module_id,
-                    inline_plan: plan_module_inlining(&summarize_module_escapes(entry.module)),
-                },
-            )
+            .insert(identity.clone(), PrecompileIndexedModule { module_id })
             .is_some()
         {
             return Err(format!(
@@ -26306,7 +25035,6 @@ impl PrecompileModuleIndex {
                     function.function_id.local_function_id(),
                 ),
                 function: function.clone(),
-                module_constants: entry.module.module_constants.clone(),
             };
             if let Some(previous) = self.functions_by_id.insert(function.function_id, indexed)
                 && (previous.module_name != entry.module_name
@@ -26332,16 +25060,6 @@ impl PrecompileModuleIndex {
             return None;
         }
         self.functions_by_id.get(&function_id)
-    }
-
-    fn inline_plan_for_function(
-        &self,
-        function_id: RuntimeFunctionId,
-    ) -> Option<&InlinePlanModule> {
-        let function = self.function(function_id)?;
-        self.modules_by_identity
-            .get(&(function.module_name.clone(), function.source_hash))
-            .map(|module| &module.inline_plan)
     }
 
     fn precompiled_symbol_scope_for_function(
@@ -26400,6 +25118,7 @@ fn precompile_external_direct_call_target_functions(
 #[derive(Debug, Clone, Copy)]
 pub struct PrecompileOptimizationPlanInput<'a> {
     pub v3_path: Option<&'a Path>,
+    pub optimized_module_path: Option<&'a Path>,
     pub cache_identity: &'a str,
 }
 
@@ -26659,13 +25378,11 @@ fn precompile_codegen_module_to_object_bytes(
         counter_dump_path,
         planned_inputs,
     )?;
-    let jit_module_plan = build_profiled_jit_module_plan(
-        module,
-        &specialization_profile,
-        None,
-        module_index,
-        &HashMap::new(),
-    )?;
+    let jit_module_plan = if specialization_profile.optimized_module.is_some() {
+        build_profiled_jit_module_plan(module, &specialization_profile)?
+    } else {
+        build_jit_module_plan(module)?
+    };
     let planned_module = jit_module_plan.module.as_ref();
     let external_direct_call_target_functions = precompile_external_direct_call_target_functions(
         planned_module,
@@ -27065,8 +25782,6 @@ struct BuildSpecializedFunctionOptions {
     guard_miss_deopt_stub: bool,
     module_constant_accesses: ModuleConstantAccessTable,
     counted_refcount_helpers: Option<CountedRefcountHelpers>,
-    direct_owner_attr_specializations:
-        Option<HashMap<DirectOwnerAttrKey, Vec<DirectOwnerAttrSpecialization>>>,
     specialization_inputs: Option<FunctionSpecializationInputs>,
     external_direct_call_target_functions:
         HashMap<RuntimeFunctionId, BlockPyFunction<CodegenModuleShape>>,
@@ -27152,90 +25867,6 @@ fn validate_typed_function_preserves_codegen_cfg(
         }
     }
     Ok(())
-}
-
-fn opt_v3_constructor_call_runtime_guard_from_request(
-    request: &OptV3ConstructorCallGuardRequest,
-) -> Result<Option<OptV3RuntimeCallOwnerGuard>, String> {
-    let type_key = &request.owner_type_key;
-    let Some(owner_type) = resolve_type_key_to_type(type_key)? else {
-        return Ok(None);
-    };
-    if unsafe { (*owner_type).tp_version_tag } == 0 {
-        let _ = unsafe { PyUnstable_Type_AssignVersionTag(owner_type) };
-    }
-    let type_version = unsafe { (*owner_type).tp_version_tag };
-    if type_version == 0 {
-        return Err(format!(
-            "optimizer v3 constructor-call at {} owner type {}.{} has no type version tag",
-            request.source, type_key.module_name, type_key.qualname
-        ));
-    }
-    let owner_type_ref = reloc_type_ref_for_type(owner_type)?.ok_or_else(|| {
-        format!(
-            "optimizer v3 constructor-call at {} owner type {}.{} has no relocatable type reference",
-            request.source, type_key.module_name, type_key.qualname
-        )
-    })?;
-    let function_id = owner_attr_function_id_for_type_ref(&owner_type_ref, "__init__")?
-        .ok_or_else(|| {
-            format!(
-                "optimizer v3 constructor-call at {} could not resolve owner __init__ function id",
-                request.source
-            )
-        })?;
-    if function_id != request.target {
-        return Err(format!(
-            "optimizer v3 constructor-call at {} selected target {}, but runtime owner __init__ resolves to {}",
-            request.source, request.target, function_id
-        ));
-    }
-    Ok(Some(OptV3RuntimeCallOwnerGuard {
-        owner_type_ref: typed_attr_owner_ref_from_reloc_type_ref(&owner_type_ref),
-        type_version,
-    }))
-}
-
-fn opt_v3_method_call_runtime_guard_from_request(
-    request: &OptV3MethodCallGuardRequest,
-) -> Result<Option<OptV3RuntimeCallOwnerGuard>, String> {
-    let type_key = &request.owner_type_key;
-    let Some(owner_type) = resolve_type_key_to_type(type_key)? else {
-        return Ok(None);
-    };
-    if unsafe { (*owner_type).tp_version_tag } == 0 {
-        let _ = unsafe { PyUnstable_Type_AssignVersionTag(owner_type) };
-    }
-    let type_version = unsafe { (*owner_type).tp_version_tag };
-    if type_version == 0 {
-        return Err(format!(
-            "optimizer v3 method-call at {} owner type {}.{} has no type version tag",
-            request.source, type_key.module_name, type_key.qualname
-        ));
-    }
-    let owner_type_ref = reloc_type_ref_for_type(owner_type)?.ok_or_else(|| {
-        format!(
-            "optimizer v3 method-call at {} owner type {}.{} has no relocatable type reference",
-            request.source, type_key.module_name, type_key.qualname
-        )
-    })?;
-    let function_id = owner_attr_function_id_for_type_ref(&owner_type_ref, &request.method_name)?
-        .ok_or_else(|| {
-        format!(
-            "optimizer v3 method-call at {} could not resolve owner method {:?} function id",
-            request.source, request.method_name
-        )
-    })?;
-    if function_id != request.target {
-        return Err(format!(
-            "optimizer v3 method-call at {} selected target {}, but runtime owner method {:?} resolves to {}",
-            request.source, request.target, request.method_name, function_id
-        ));
-    }
-    Ok(Some(OptV3RuntimeCallOwnerGuard {
-        owner_type_ref: typed_attr_owner_ref_from_reloc_type_ref(&owner_type_ref),
-        type_version,
-    }))
 }
 
 fn prepare_specialized_typed_function(
@@ -27407,9 +26038,6 @@ fn build_cranelift_run_bb_specialized_function(
         }
     }
     jit_deopt_resume_plan.validate_for_function(function)?;
-    let computed_inline_plan = plan_jit_inlining(module);
-    let inline_plan = &computed_inline_plan;
-
     let call_target_counter_ids =
         collect_runtime_counter_ids_by_kind(counter_defs, function.function_id, "call_hot_targets");
     let call_direct_hit_counter_ids = collect_runtime_counter_refs_by_kind_branch(
@@ -27955,11 +26583,6 @@ fn build_cranelift_run_bb_specialized_function(
             &mut fb.func,
             &DP_JIT_RAISE_DELETED_NAME_ERROR_IMPORT,
         );
-        let raise_missing_required_argument_ref = func_imports.get_or_panic(
-            codegen_env,
-            &mut fb.func,
-            &DP_JIT_RAISE_MISSING_REQUIRED_ARGUMENT_IMPORT,
-        );
         let make_function_with_closure_ref = func_imports.get_or_panic(
             codegen_env,
             &mut fb.func,
@@ -28176,8 +26799,6 @@ fn build_cranelift_run_bb_specialized_function(
                 module,
                 function_id: function.function_id,
                 function_kind: function.kind,
-                shared_state: direct_call_resolver,
-                inline_plan,
                 module_constants,
                 value_facts,
                 deopt_resume_plan: jit_deopt_resume_plan,
@@ -28227,7 +26848,6 @@ fn build_cranelift_run_bb_specialized_function(
                 pyobject_setitem_ref,
                 py_long_from_i64_ref,
                 raise_deleted_name_error_ref,
-                raise_missing_required_argument_ref,
                 make_function_with_closure_ref,
                 make_cell_ref,
                 load_cell_ref,
@@ -28244,9 +26864,6 @@ fn build_cranelift_run_bb_specialized_function(
                 direct_call_target_functions: &direct_call_target_functions,
                 direct_call_functions,
                 call_target_counter_ids: &call_target_counter_ids,
-                direct_owner_attr_specializations: options
-                    .direct_owner_attr_specializations
-                    .as_ref(),
                 call_direct_hit_counter_ids: &call_direct_hit_counter_ids,
                 call_direct_fallback_counter_ids: &call_direct_fallback_counter_ids,
                 operator_shape_counter_ids: &operator_shape_counter_ids,
@@ -28287,9 +26904,6 @@ fn build_cranelift_run_bb_specialized_function(
                     .deopt_points_for_block(codegen_block.label)
                     .all(|point| point.id.function_id == function.function_id)
             );
-            debug_assert!(emit_ctx.inline_plan.functions.keys().all(|function_id| {
-                function_id.runtime_module_id().as_u32() == module.module_name_gen.module_id()
-            }));
             emit_ctx.require_deopt_point_at_block_entry(codegen_block.label)?;
             let _block_refcount_plan = emit_ctx.refcount_plan.block(codegen_block.label);
 
@@ -28673,30 +27287,9 @@ pub unsafe fn render_instr_typed_for_codegen_with_runtime_state(
         Some(compile_session),
     )?;
     predeclare_specialization_type_imports(&mut jit_module, &specialization_profile)?;
-    let mut direct_owner_attr_specializations_by_function = HashMap::new();
-    if runtime_state.is_some() && specialization_profile.has_specialization_inputs() {
-        for function in &module.callable_defs {
-            let direct_owner_attr_specializations = predeclare_direct_call_owner_type_imports(
-                &mut jit_module,
-                module,
-                function,
-                &specialization_profile,
-            )?;
-            if !direct_owner_attr_specializations.is_empty() {
-                direct_owner_attr_specializations_by_function
-                    .insert(function.function_id, direct_owner_attr_specializations);
-            }
-        }
-    }
     let jit_module_plan =
-        if runtime_state.is_some() && specialization_profile.has_specialization_inputs() {
-            build_profiled_jit_module_plan(
-                module,
-                &specialization_profile,
-                Some(compile_session),
-                None,
-                &direct_owner_attr_specializations_by_function,
-            )?
+        if runtime_state.is_some() && specialization_profile.optimized_module.is_some() {
+            build_profiled_jit_module_plan(module, &specialization_profile)?
         } else {
             build_jit_module_plan(module)?
         };
@@ -28794,30 +27387,9 @@ pub unsafe fn render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
         Some(compile_session),
     )?;
     predeclare_specialization_type_imports(&mut jit_module, &specialization_profile)?;
-    let mut direct_owner_attr_specializations_by_function = HashMap::new();
-    if runtime_state.is_some() && specialization_profile.has_specialization_inputs() {
-        for function in &module.callable_defs {
-            let direct_owner_attr_specializations = predeclare_direct_call_owner_type_imports(
-                &mut jit_module,
-                module,
-                function,
-                &specialization_profile,
-            )?;
-            if !direct_owner_attr_specializations.is_empty() {
-                direct_owner_attr_specializations_by_function
-                    .insert(function.function_id, direct_owner_attr_specializations);
-            }
-        }
-    }
     let jit_module_plan =
-        if runtime_state.is_some() && specialization_profile.has_specialization_inputs() {
-            build_profiled_jit_module_plan(
-                module,
-                &specialization_profile,
-                Some(compile_session),
-                None,
-                &direct_owner_attr_specializations_by_function,
-            )?
+        if runtime_state.is_some() && specialization_profile.optimized_module.is_some() {
+            build_profiled_jit_module_plan(module, &specialization_profile)?
         } else {
             build_jit_module_plan(module)?
         };
@@ -28917,10 +27489,6 @@ pub unsafe fn render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
         })?;
     let specialization_inputs =
         FunctionSpecializationInputs::from_profile(&specialization_profile, render_function)?;
-    let direct_owner_attr_specializations = direct_owner_attr_specializations_by_function
-        .get(&render_function.function_id)
-        .cloned()
-        .unwrap_or_default();
     let built = build_cranelift_run_bb_specialized_function(
         &mut jit_module,
         render_blocks,
@@ -28941,7 +27509,6 @@ pub unsafe fn render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
         None,
         None,
         BuildSpecializedFunctionOptions {
-            direct_owner_attr_specializations: Some(direct_owner_attr_specializations),
             specialization_inputs: Some(specialization_inputs),
             ..BuildSpecializedFunctionOptions::default()
         },

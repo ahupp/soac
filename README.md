@@ -150,7 +150,8 @@ planner lives in `soac-opt`.
 
 - `decide_optimizations`
   Reads profile counters plus cached BlockPy modules and writes v3 `mod.optv3`
-  optimization artifacts under a module-cache root.
+  decision artifacts plus optimized `mod.optv3.blockpy` codegen modules under a
+  module-cache root.
 
 - `print_optimization_plan_v3`
   Pretty-prints a v3 `mod.optv3` optimization artifact, with `--details` for
@@ -336,7 +337,8 @@ typed variables must use recognized values. Boolean knobs accept `1`, `true`,
   - `events.jsonl`: default tracing JSONL when `SOAC_LOG` is not
     set.
   - `modules/`: root for cached pre-optimization BlockPy modules and sibling
-    `mod.optv3` optimization plans. Cached modules use stable
+    `mod.optv3` optimization plans plus `mod.optv3.blockpy` optimized codegen
+    modules. Cached modules use stable
     per-module artifact paths such as `project/pkg/submod/mod.blockpy`, with
     source hash and build identity stored as cache metadata.
 
@@ -349,14 +351,16 @@ typed variables must use recognized values. Boolean knobs accept `1`, `true`,
     already set it.
   - `profile`: run unspecialized, instrument specialization input
     counters, and write `$SOAC_WORK_DIR/profile.bin`.
-  - `verify`: read per-module `mod.optv3` optimization plans from the active
-    module cache, apply their specializations,
+  - `verify`: read per-module `mod.optv3` optimization plans and
+    `mod.optv3.blockpy` optimized modules from the active module cache,
+    apply their specializations,
     instrument specialization input counters again, and write
     `$SOAC_WORK_DIR/verify.bin`. Verify mode exercises indexed store
     fast paths so their hit/fallback counters measure the specialized
     steady-state path.
-  - `apply`: read per-module `mod.optv3` optimization plans from the active
-    module cache, apply their specializations,
+  - `apply`: read per-module `mod.optv3` optimization plans and
+    `mod.optv3.blockpy` optimized modules from the active module cache,
+    apply their specializations,
     and emit no specialization counter dump files.
     When event logging is enabled through `SOAC_LOG` or the default
     `$SOAC_WORK_DIR/events.jsonl`, apply mode still records in-process
@@ -367,9 +371,9 @@ typed variables must use recognized values. Boolean knobs accept `1`, `true`,
   unspecialized/no-counter path.
 
 - Optimization plans are v3-only. `decide_optimizations` and the Justfile
-  profile-to-plan recipes write `mod.optv3` from cached unoptimized BlockPy
-  modules and raw profile evidence. `verify`, `apply`, and precompile consume
-  those artifacts directly.
+  profile-to-plan recipes write `mod.optv3` and `mod.optv3.blockpy` from cached
+  unoptimized BlockPy modules and raw profile evidence. `verify`, `apply`, and
+  precompile consume those artifacts directly.
 
 Notes:
 - In normal workflows set one `SOAC_WORK_DIR` for the whole multi-pass
@@ -421,9 +425,10 @@ tree, with pystone benchmark runs writing to `work/bench/`.
 - `just precompile-shared-library counters=<profile.bin> out=<lib.so>`
   Offline precompile a counter-referenced set of cached BlockPy modules into
   relocatable object files and link them into a shared library. The recipe
-  regenerates `mod.optv3` optimization plans from the counter file before
-  compiling. The counter file normally comes from a previous profile pass, and the matching
-  pre-optimization BlockPy cache entries must still exist in the active
+  regenerates `mod.optv3` optimization plans and `mod.optv3.blockpy` optimized
+  codegen modules from the counter file before compiling. The counter file
+  normally comes from a previous profile pass, and the matching pre-optimization
+  BlockPy cache entries must still exist in the active
   `$SOAC_WORK_DIR/modules` cache. With the default benchmark cache isolation,
   that cache is the benchmark result's `counters/modules` directory. When
   `counters` is omitted, the recipe uses `$LAST_BENCHMARK_COUNTERS`. Set
@@ -432,9 +437,10 @@ tree, with pystone benchmark runs writing to `work/bench/`.
 
 - `cargo run -p soac_opt --bin decide_optimizations -- --counters <profile.bin> --out <modules-root>`
   Load a counter dump once, scan the cached BlockPy module root for
-  `mod.blockpy` files, and write sibling `mod.optv3` artifacts from raw profile
-  evidence and cached unoptimized BlockPy modules using stable module artifact
-  paths such as `python-stdlib/typing/mod.optv3`. `--mode v3` is accepted for
+  `mod.blockpy` files, and write sibling `mod.optv3` and `mod.optv3.blockpy`
+  artifacts from raw profile evidence and cached unoptimized BlockPy modules
+  using stable module artifact paths such as `python-stdlib/typing/mod.optv3`
+  and `python-stdlib/typing/mod.optv3.blockpy`. `--mode v3` is accepted for
   compatibility with existing scripts.
   Pass `--module-root <root-dir>` to scan a different input root, or one or more
   `--module <mod.blockpy>` arguments for narrower debugging.

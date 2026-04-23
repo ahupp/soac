@@ -100,7 +100,9 @@ def test_apply_mode_direct_call_failure_preserves_exception(tmp_path: Path) -> N
     assert result == ["Marker", "boom", True]
 
 
-def test_apply_mode_direct_constructor_failure_preserves_exception(tmp_path: Path) -> None:
+def test_apply_mode_constructor_failure_preserves_exception_without_v3_constructor_fast_path(
+    tmp_path: Path,
+) -> None:
     result, rows = _run_apply_module(
         tmp_path,
         "direct_constructor_failure_exception",
@@ -125,7 +127,7 @@ def test_apply_mode_direct_constructor_failure_preserves_exception(tmp_path: Pat
         for row in rows
         if row.get("target") == "soac_jit_direct_edges" and row.get("clif_direct_edges", 0) > 0
     ]
-    assert direct_edge_rows, rows
+    assert not direct_edge_rows, rows
     assert result == ["Marker", "boom:7", True]
 
 

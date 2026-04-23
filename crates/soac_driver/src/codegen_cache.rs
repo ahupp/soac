@@ -25,6 +25,7 @@ pub enum ModuleCacheArtifact {
     CodegenModule,
     Profile,
     OptimizationPlanV3,
+    OptimizedCodegenModuleV3,
 }
 
 #[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -129,6 +130,7 @@ impl ModuleCacheArtifact {
             Self::CodegenModule => "mod.blockpy",
             Self::Profile => "mod.profile",
             Self::OptimizationPlanV3 => "mod.optv3",
+            Self::OptimizedCodegenModuleV3 => "mod.optv3.blockpy",
         }
     }
 }
@@ -183,6 +185,19 @@ pub fn module_optimization_plan_v3_path(
         source,
         module_name,
         ModuleCacheArtifact::OptimizationPlanV3,
+    )
+}
+
+pub fn module_optimized_codegen_v3_path(
+    cache_root: impl AsRef<Path>,
+    source: PythonModuleCacheSource,
+    module_name: &str,
+) -> Result<PathBuf> {
+    module_cache_artifact_path(
+        cache_root,
+        source,
+        module_name,
+        ModuleCacheArtifact::OptimizedCodegenModuleV3,
     )
 }
 
@@ -513,9 +528,9 @@ mod test {
         CachedCodegenModuleMetadata, CachedPreparedCodegen, ModuleCacheArtifact,
         PythonModuleCacheSource, codegen_module_cache_key, codegen_module_cache_path,
         load_codegen_module_cache, module_cache_artifact_path, module_optimization_plan_v3_path,
-        module_profile_path, remap_cached_codegen_module_function_ids,
-        remap_codegen_module_function_ids, store_codegen_module_cache,
-        validate_codegen_module_cache_metadata,
+        module_optimized_codegen_v3_path, module_profile_path,
+        remap_cached_codegen_module_function_ids, remap_codegen_module_function_ids,
+        store_codegen_module_cache, validate_codegen_module_cache_metadata,
     };
     use soac_core::block_py::{
         BlockPyModule, ChildVisitable, HasSemanticInstrId, ModuleNameGen, RuntimeFunctionId, Visit,
@@ -678,6 +693,15 @@ def g(y):
             )
             .expect("stdlib optimization v3 path"),
             PathBuf::from("/cache/root/python-stdlib/typing/mod.optv3")
+        );
+        assert_eq!(
+            module_optimized_codegen_v3_path(
+                &root,
+                PythonModuleCacheSource::PythonStdlib,
+                "typing"
+            )
+            .expect("stdlib optimized codegen v3 path"),
+            PathBuf::from("/cache/root/python-stdlib/typing/mod.optv3.blockpy")
         );
         assert_eq!(
             module_cache_artifact_path(

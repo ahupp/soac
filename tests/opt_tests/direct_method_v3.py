@@ -24,7 +24,7 @@ for _ in range(80):
     {
         "type": "v3_plan",
         "function": "caller",
-        "method_calls": {"min": 1},
-        "emitted_method_calls": {"min": 1},
+        "method_calls": 0,
+        "emitted_method_calls": 0,
     },
 ]

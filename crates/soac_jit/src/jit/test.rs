@@ -32,11 +32,15 @@ mod tests {
     };
     use soac_driver::codegen_cache::{
         CachedCodegenModuleMetadata, PythonModuleCacheSource, module_optimization_plan_v3_path,
-        pre_optimization_module_cache_identity,
+        module_optimized_codegen_v3_path, pre_optimization_module_cache_identity,
+        store_codegen_module_cache,
     };
     use soac_lowering::passes::{TypedInstrExtra, TypedPlannedResult as PlannedResult};
     use soac_opt::alternatives_v3::AlternativeCatalog;
     use soac_opt::artifacts_v3::{ExactIntBranchV3Artifacts, write_optimization_artifacts_v3};
+    use soac_opt::call_emission_v3::{
+        prepare_constructor_call_plans_for_codegen, prepare_method_call_plans_for_codegen,
+    };
     use soac_opt::emit_v3::{MechanicalIndexedFieldGuard, MechanicalModuleEmission};
     use soac_opt::pipeline_v3::{
         plan_and_emit_function_exact_int_branches_v3_with_module_constants,
@@ -3128,6 +3132,60 @@ def build(values):
             .expect("test optimization plan v3 should be writable");
     }
 
+    fn test_codegen_cache_metadata_for_shared_state(
+        shared_state: &crate::module_type::SharedModuleState,
+        cache_source: PythonModuleCacheSource,
+    ) -> CachedCodegenModuleMetadata {
+        CachedCodegenModuleMetadata {
+            source: cache_source,
+            module_name: shared_state.module_name.clone(),
+            source_hash: shared_state.source_hash,
+            cache_identity: pre_optimization_module_cache_identity(
+                env!("SOAC_BUILD_IDENTITY"),
+                shared_state.module_name == "soac.runtime",
+            ),
+        }
+    }
+
+    fn write_test_optimized_codegen_module_v3(
+        cache_root: &Path,
+        cache_source: PythonModuleCacheSource,
+        metadata: &CachedCodegenModuleMetadata,
+        module: &BlockPyModule<CodegenModuleShape>,
+    ) -> Result<(), String> {
+        let path = module_optimized_codegen_v3_path(
+            cache_root,
+            cache_source,
+            metadata.module_name.as_str(),
+        )
+        .map_err(|err| err.to_string())?;
+        store_codegen_module_cache(path.as_path(), metadata, module, None)
+            .map_err(|err| err.to_string())
+    }
+
+    fn write_test_optimization_artifacts_v3_for_shared_state(
+        cache_root: &Path,
+        cache_source: PythonModuleCacheSource,
+        shared_state: &crate::module_type::SharedModuleState,
+        artifacts: &ExactIntBranchV3Artifacts,
+    ) {
+        let v3_path = module_optimization_plan_v3_path(
+            cache_root,
+            cache_source,
+            shared_state.module_name.as_str(),
+        )
+        .expect("v3 test optimization plan path should build");
+        write_test_optimization_artifacts_v3(v3_path.as_path(), artifacts);
+        let metadata = test_codegen_cache_metadata_for_shared_state(shared_state, cache_source);
+        write_test_optimized_codegen_module_v3(
+            cache_root,
+            cache_source,
+            &metadata,
+            &shared_state.lowered_module,
+        )
+        .expect("test optimized v3 BlockPy module cache should be writable");
+    }
+
     fn ensure_test_optimization_artifacts_v3_for_shared_state(
         shared_state: &crate::module_type::SharedModuleState,
     ) -> Result<(), String> {
@@ -3150,6 +3208,24 @@ def build(values):
             shared_state.module_name.as_str(),
         )
         .map_err(|err| err.to_string())?;
+        let optimized_output_path = module_optimized_codegen_v3_path(
+            cache_root.as_path(),
+            cache_source,
+            shared_state.module_name.as_str(),
+        )
+        .map_err(|err| err.to_string())?;
+        if output_path.exists() && optimized_output_path.exists() {
+            return Ok(());
+        }
+        let metadata = test_codegen_cache_metadata_for_shared_state(shared_state, cache_source);
+        if !optimized_output_path.exists() {
+            write_test_optimized_codegen_module_v3(
+                cache_root.as_path(),
+                cache_source,
+                &metadata,
+                &shared_state.lowered_module,
+            )?;
+        }
         if output_path.exists() {
             return Ok(());
         }
@@ -3160,16 +3236,6 @@ def build(values):
             Some(path) => ProfileEvidenceStore::from_counter_dump(path.as_path())
                 .map_err(|err| err.to_string())?,
             None => ProfileEvidenceStore::default(),
-        };
-        let cache_identity = pre_optimization_module_cache_identity(
-            env!("SOAC_BUILD_IDENTITY"),
-            shared_state.module_name == "soac.runtime",
-        );
-        let metadata = CachedCodegenModuleMetadata {
-            source: cache_source,
-            module_name: shared_state.module_name.clone(),
-            source_hash: shared_state.source_hash,
-            cache_identity,
         };
         let catalog = AlternativeCatalog::default_v3();
         let artifacts = plan_and_emit_module_v3_from_raw_evidence(
@@ -3454,23 +3520,10 @@ def build(values):
             Some(compile_session),
         )?;
         predeclare_specialization_type_imports(jit_module, &specialization_profile)?;
-        let direct_owner_attr_specializations = if direct_call_resolver.is_some() {
-            predeclare_direct_call_owner_type_imports(
-                jit_module,
-                module,
-                function,
-                &specialization_profile,
-            )?
-        } else {
-            HashMap::new()
-        };
         let specialization_inputs =
             FunctionSpecializationInputs::from_profile(&specialization_profile, function)?;
         predeclare_prepared_opt_v3_call_imports(jit_module, &specialization_inputs)?;
         let mut options = options;
-        if options.direct_owner_attr_specializations.is_none() {
-            options.direct_owner_attr_specializations = Some(direct_owner_attr_specializations);
-        }
         if options.specialization_inputs.is_none() {
             options.specialization_inputs = Some(specialization_inputs);
         }
@@ -4144,6 +4197,7 @@ def build(values):
         let profile = SpecializationProfile {
             module_name: None,
             counter_dump_path: None,
+            optimized_module: None,
             opt_v3_emitted_direct_calls: HashMap::from([(
                 function_id,
                 HashMap::from([(source, vec![direct_call])]),
@@ -7168,13 +7222,12 @@ def read_point(point):
                     reason: "profiled type_keys selected this indexed-field layout".to_string(),
                 },
             );
-            let v3_path = module_optimization_plan_v3_path(
+            write_test_optimization_artifacts_v3_for_shared_state(
                 module_cache_root.as_path(),
                 PythonModuleCacheSource::Project,
-                module_name,
-            )
-            .expect("v3 test optimization plan path should build");
-            write_test_optimization_artifacts_v3(v3_path.as_path(), &artifacts);
+                shared_state.as_ref(),
+                &artifacts,
+            );
 
             let runtime = unsafe { build_test_module_runtime(py, shared_state.clone()) };
             let module_constant_ptrs = shared_state.module_constant_ptrs();
@@ -17555,13 +17608,12 @@ def read_point(point):
                     reason: "profiled type_keys selected this indexed-field layout".to_string(),
                 },
             );
-            let v3_path = module_optimization_plan_v3_path(
+            write_test_optimization_artifacts_v3_for_shared_state(
                 module_cache_root.as_path(),
                 PythonModuleCacheSource::Project,
-                module_name,
-            )
-            .expect("v3 test optimization plan path should build");
-            write_test_optimization_artifacts_v3(v3_path.as_path(), &artifacts);
+                shared_state.as_ref(),
+                &artifacts,
+            );
 
             let profile = SpecializationProfile::from_runtime_state_with_session(
                 Some(shared_state.as_ref()),
@@ -17628,6 +17680,7 @@ def read_point(point):
             let profile = SpecializationProfile {
                 module_name: None,
                 counter_dump_path: None,
+                optimized_module: None,
                 opt_v3_emitted_direct_calls: HashMap::new(),
                 opt_v3_emitted_constructor_calls: HashMap::new(),
                 opt_v3_emitted_method_calls: HashMap::new(),
@@ -17785,13 +17838,12 @@ def write_point(point, value):
                     reason: store_reason,
                 },
             );
-            let v3_path = module_optimization_plan_v3_path(
+            write_test_optimization_artifacts_v3_for_shared_state(
                 module_cache_root.as_path(),
                 PythonModuleCacheSource::Project,
-                module_name,
-            )
-            .expect("v3 test optimization plan path should build");
-            write_test_optimization_artifacts_v3(v3_path.as_path(), &artifacts);
+                shared_state.as_ref(),
+                &artifacts,
+            );
 
             let profile = SpecializationProfile::from_runtime_state_with_session(
                 Some(shared_state.as_ref()),
@@ -19315,13 +19367,12 @@ def f(x, y):
                 0,
                 current_function,
             );
-            let v3_path = module_optimization_plan_v3_path(
+            write_test_optimization_artifacts_v3_for_shared_state(
                 module_cache_root.as_path(),
                 PythonModuleCacheSource::Project,
-                module_name,
-            )
-            .expect("v3 test optimization plan path should build");
-            write_test_optimization_artifacts_v3(v3_path.as_path(), &artifacts);
+                shared_state.as_ref(),
+                &artifacts,
+            );
 
             let profile = SpecializationProfile::from_runtime_state_with_session(
                 Some(shared_state.as_ref()),
@@ -19329,11 +19380,11 @@ def f(x, y):
             )
             .expect("strict v3 plan mode should load serialized runtime artifacts");
             assert!(
-                profile.has_specialization_inputs(),
-                "serialized v3 artifacts should count as specialization input"
+                profile.optimized_module.is_some(),
+                "serialized v3 artifacts should load the paired optimized BlockPy module"
             );
             assert!(
-                !profile.has_existing_counter_dump(),
+                existing_counter_dump_path(profile.counter_dump_path.as_deref()).is_none(),
                 "test should prove the profile is not relying on a profile.bin fallback"
             );
             let function_artifacts = profile
@@ -20230,10 +20281,10 @@ def f(x, y):
     }
 
     #[test]
-    fn method_call_guard_miss_deopt_enabled_for_replay_safe_receiver() {
+    fn method_call_guard_miss_keeps_fallback_until_method_guards_are_mechanical() {
         if crate::run_test_in_isolated_process_if_needed(
             module_path!(),
-            "method_call_guard_miss_deopt_enabled_for_replay_safe_receiver",
+            "method_call_guard_miss_keeps_fallback_until_method_guards_are_mechanical",
         ) {
             return;
         }
@@ -20246,18 +20297,13 @@ def f(x, y):
                 import_user_names_for_symbols(&built, &[DP_JIT_PYOBJECT_GETATTR_IMPORT.symbol]);
             assert_eq!(
                 count_direct_calls_to_runtime_helpers(&built.ctx.func, &deopt_helpers),
-                1,
-                "verify mode should enable method-call guard-miss deopt for replay-safe receivers"
-            );
-            assert_eq!(
-                count_cold_block_direct_calls_to_runtime_helpers(&built.ctx.func, &deopt_helpers),
-                1,
-                "method-call guard-miss deopt should keep the helper call cold"
+                0,
+                "v3 method-call guard misses stay on the local fallback until method guards are mechanical plan inputs"
             );
             assert_eq!(
                 count_direct_calls_to_runtime_helpers(&built.ctx.func, &getattr_helpers),
-                0,
-                "method-call guard miss should not emit the local getattr fallback when deopt is planned"
+                1,
+                "v3 method-call guard misses keep the local getattr fallback until soac_opt emits a static guard payload"
             );
         });
     }
@@ -20882,7 +20928,7 @@ def f(x, y):
     }
 
     #[test]
-    fn source_keyed_v3_emissions_still_allow_plan_level_direct_call_rewrite() {
+    fn profiled_v3_module_plan_uses_loaded_optimized_module_without_rewriting_direct_calls() {
         let module_name = "v3_source_keyed_shape_test";
         let module_name_gen = ModuleNameGen::new(0);
         let mut callee_function = test_function_in_module(&module_name_gen, "callee");
@@ -20960,6 +21006,7 @@ def f(x, y):
         let profile = SpecializationProfile {
             module_name: Some(module_name),
             counter_dump_path: None,
+            optimized_module: Some(Arc::new(module.clone())),
             opt_v3_emitted_direct_calls: HashMap::from([(
                 caller_function.function_id,
                 HashMap::from([(call_instr_id, vec![v3_plan])]),
@@ -20977,7 +21024,7 @@ def f(x, y):
             profiled_cold_blocks: false,
             guard_miss_deopt: false,
         };
-        let plan = build_profiled_jit_module_plan(&module, &profile, None, None, &HashMap::new())
+        let plan = build_profiled_jit_module_plan(&module, &profile)
             .expect("v3-profiled JIT module plan should build");
         let planned_caller = plan
             .module
@@ -20987,14 +21034,14 @@ def f(x, y):
             .expect("planned module should keep caller");
 
         assert!(
-            planned_caller.blocks.iter().any(|block| {
+            !planned_caller.blocks.iter().any(|block| {
                 matches!(
                     &block.term,
                     BlockTerm::IfTerm(term)
                         if matches!(term.test, InstrCodegen::DirectFunctionIdGuardTest(_))
                 )
             }),
-            "source-keyed v3 emissions should not block plan-level v3 direct-call CFG expansion"
+            "JIT should not perform plan-level direct-call CFG expansion; it should trust the loaded optimized module"
         );
         assert!(
             planned_caller
@@ -21002,19 +21049,19 @@ def f(x, y):
                 .iter()
                 .flat_map(|block| &block.body)
                 .any(|instr| matches!(instr, InstrCodegen::Store(store) if matches!(store.value.as_ref(), InstrCodegen::Call(_)))),
-            "fallback arm should retain a generic call for the original Python semantics"
+            "loaded optimized module fixture intentionally still has the original generic call"
         );
         let specialization_inputs =
             FunctionSpecializationInputs::from_profile(&profile, planned_caller)
                 .expect("planned profile inputs should filter consumed v3 direct calls");
         assert!(
             specialization_inputs.opt_v3_call_emissions.is_empty(),
-            "v3 direct calls consumed by the profiled module plan should not reach typed JIT lowering"
+            "inline direct-call body plans are consumed by the offline optimized module, not typed JIT lowering"
         );
     }
 
     #[test]
-    fn v3_no_arg_method_store_rewrite_runs_before_typed_lowering() {
+    fn profiled_v3_module_plan_does_not_rewrite_method_calls_in_jit() {
         let module_name = "v3_profiled_method_call_inline_plan_test";
         let module_name_gen = ModuleNameGen::new(0);
         let mut constants = TestConstantPool::default();
@@ -21071,6 +21118,7 @@ def f(x, y):
         );
         module.module_constants = constants.module_constants;
         let inputs = PlannedOptimizationInputs {
+            optimized_module: Some(module.clone()),
             opt_v3_emitted_method_calls: HashMap::from([(
                 caller_function.function_id,
                 HashMap::from([(
@@ -21102,27 +21150,8 @@ def f(x, y):
             inputs,
         )
         .expect("test specialization profile should construct");
-        let direct_owner_attr_specializations = HashMap::from([(
-            caller_function.function_id,
-            HashMap::from([(
-                DirectOwnerAttrKey::new(next_function.function_id, "__next__"),
-                vec![DirectOwnerAttrSpecialization {
-                    owner_type_ref: RelocTypeRef::TypeKey(CounterDumpTypeKey {
-                        module_name: module_name.to_string(),
-                        qualname: "IterRange".to_string(),
-                    }),
-                    type_version: 1,
-                }],
-            )]),
-        )]);
-        let plan = build_profiled_jit_module_plan(
-            &module,
-            &profile,
-            None,
-            None,
-            &direct_owner_attr_specializations,
-        )
-        .expect("profiled JIT module plan should build");
+        let plan = build_profiled_jit_module_plan(&module, &profile)
+            .expect("profiled JIT module plan should build");
         let planned_caller = plan
             .module
             .callable_defs
@@ -21131,7 +21160,7 @@ def f(x, y):
             .expect("planned module should keep caller");
 
         assert!(
-            planned_caller.blocks.iter().any(|block| {
+            !planned_caller.blocks.iter().any(|block| {
                 matches!(
                     &block.term,
                     BlockTerm::IfTerm(term)
@@ -21141,22 +21170,21 @@ def f(x, y):
                         )
                 )
             }),
-            "v3 method rewrite should guard the receiver type/version before typed lowering"
+            "JIT should not run the v3 method inliner; it should compile the loaded optimized module"
         );
         assert!(
             planned_caller
                 .blocks
                 .iter()
                 .flat_map(|block| &block.body)
-                .any(|instr| matches!(instr, InstrCodegen::Store(store) if store.name.id_str() == "y" && matches!(store.value.as_ref(), InstrCodegen::Load(_)))),
-            "v3 hot method arm should inline the callee body into a direct local store"
+                .any(|instr| matches!(instr, InstrCodegen::Store(store) if store.name.id_str() == "y" && matches!(store.value.as_ref(), InstrCodegen::Call(_)))),
+            "loaded optimized module fixture intentionally still has the original generic method call"
         );
-        let specialization_inputs =
-            FunctionSpecializationInputs::from_profile(&profile, planned_caller)
-                .expect("planned profile inputs should filter consumed v3 method calls");
+        let err = FunctionSpecializationInputs::from_profile(&profile, planned_caller)
+            .expect_err("JIT should reject runtime-guarded method-call plans");
         assert!(
-            specialization_inputs.opt_v3_call_emissions.is_empty(),
-            "v3 method calls consumed by the profiled module plan should not reach typed JIT lowering"
+            err.contains("method guards are not a mechanical JIT input yet"),
+            "unexpected error: {err}"
         );
     }
 
@@ -22491,10 +22519,10 @@ def f(x, y):
     }
 
     #[test]
-    fn specialized_jit_type_constructors_use_constructor_fast_path() {
+    fn specialized_jit_type_constructors_stay_generic_until_constructor_guards_are_mechanical() {
         if crate::run_test_in_isolated_process_if_needed(
             module_path!(),
-            "specialized_jit_type_constructors_use_constructor_fast_path",
+            "specialized_jit_type_constructors_stay_generic_until_constructor_guards_are_mechanical",
         ) {
             return;
         }
@@ -22763,8 +22791,8 @@ def f(x, y):
                 );
                 assert_eq!(
                     count_direct_calls_to_runtime_helpers(&built.ctx.func, &alloc_helpers),
-                    1,
-                    "constructor specialization should allocate via the constructor fast path",
+                    0,
+                    "v3 constructor calls should not use the constructor fast path until constructor guards are mechanical plan inputs",
                 );
                 let finish_helpers = import_user_names_for_symbols(
                     &built,
@@ -22773,14 +22801,21 @@ def f(x, y):
                 assert_eq!(
                     count_direct_calls_to_runtime_helpers(&built.ctx.func, &finish_helpers),
                     0,
-                    "straight-line constructor initializer should inline instead of calling __init__",
+                    "constructor init should not be inlined in the JIT without a mechanical v3 constructor plan",
                 );
                 let setattr_helpers =
                     import_user_names_for_symbols(&built, &[DP_JIT_PYOBJECT_SETATTR_IMPORT.symbol]);
                 assert_eq!(
                     count_direct_calls_to_runtime_helpers(&built.ctx.func, &setattr_helpers),
+                    0,
+                    "constructor init body should not be locally emitted by the JIT without a mechanical v3 constructor plan",
+                );
+                let generic_call_helpers =
+                    import_user_names_for_symbols(&built, &[DP_JIT_PY_VECTORCALL_IMPORT.symbol]);
+                assert_eq!(
+                    count_direct_calls_to_runtime_helpers(&built.ctx.func, &generic_call_helpers),
                     1,
-                    "straight-line constructor initializer should keep a cold generic setattr fallback",
+                    "unmechanized constructor calls should remain generic vectorcalls"
                 );
                 let indexed_setattr_helpers = declared_user_names_for_symbols(
                     &built,

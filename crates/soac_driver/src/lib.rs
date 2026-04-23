@@ -6,10 +6,11 @@ use crate::codegen_cache::{
     store_codegen_module_cache, validate_codegen_module_cache_metadata,
 };
 use soac_config::{SoacEnvConfig, init_logging_with_config};
-use soac_core::block_py::{BlockPyModule, CounterScope, ModuleNameGen};
+use soac_core::block_py::{BlockPyModule, CounterDef, CounterId, CounterScope, ModuleNameGen};
 use soac_lowering::pass_tracker::{NoopPassTracker, PassTracker, RecordingPassTracker};
-use soac_lowering::passes::{self, CodegenModuleShape};
+use soac_lowering::passes::{self, CodegenModuleShape, InstrCodegen};
 pub use soac_lowering::{LoweringError, LoweringResult, Result};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use tracing::{info, warn};
@@ -448,6 +449,51 @@ fn finish_codegen_module_with_tracker(
     })?;
 
     Ok(bb_deopt_entry_counted)
+}
+
+pub fn finish_cached_codegen_module_for_runtime(
+    module: BlockPyModule<CodegenModuleShape>,
+    env_config: &SoacEnvConfig,
+) -> Result<BlockPyModule<CodegenModuleShape>> {
+    finish_codegen_module_with_tracker(
+        PreOptimizationModule {
+            module,
+            prepared: None,
+            cache_path_for_store: None,
+            cache_metadata_for_store: None,
+        },
+        &mut NoopPassTracker::new(),
+        env_config,
+    )
+}
+
+pub fn finish_cached_codegen_module_for_runtime_with_counter_defs(
+    module: BlockPyModule<CodegenModuleShape>,
+    env_config: &SoacEnvConfig,
+    counter_defs: &[CounterDef],
+) -> Result<BlockPyModule<CodegenModuleShape>> {
+    let mut module = finish_cached_codegen_module_for_runtime(module, env_config)?;
+    retain_defined_explicit_counter_increments(&mut module, counter_defs);
+    module.counter_defs = counter_defs.to_vec();
+    Ok(module)
+}
+
+fn retain_defined_explicit_counter_increments(
+    module: &mut BlockPyModule<CodegenModuleShape>,
+    counter_defs: &[CounterDef],
+) {
+    let valid_counter_ids = counter_defs
+        .iter()
+        .map(|counter| counter.id)
+        .collect::<HashSet<CounterId>>();
+    for function in &mut module.callable_defs {
+        for block in &mut function.blocks {
+            block.body.retain(|expr| match expr {
+                InstrCodegen::IncrementCounter(op) => valid_counter_ids.contains(&op.counter_id),
+                _ => true,
+            });
+        }
+    }
 }
 
 #[cfg(test)]

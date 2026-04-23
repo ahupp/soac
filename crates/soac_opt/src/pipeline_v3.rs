@@ -1,5 +1,16 @@
 use crate::alternatives_v3::AlternativeCatalog;
-use crate::artifacts_v3::{ExactIntBranchV3Artifacts, write_optimization_artifacts_v3};
+use crate::artifacts_v3::{
+    ExactIntBranchV3Artifacts, single_function_optimization_artifacts_v3,
+    write_optimization_artifacts_v3,
+};
+use crate::call_emission_v3::{
+    ResolvedV3ConstructorCallPlan, ResolvedV3DirectCallPlan, ResolvedV3MethodCallPlan,
+    constructor_calls_for_function_from_artifacts, direct_calls_for_function_from_artifacts,
+    method_calls_for_function_from_artifacts,
+};
+use crate::call_inlining_v3::{
+    V3CallInliningProfile, V3ExternalInlineTarget, rewrite_v3_call_inlining_for_module,
+};
 use crate::emit_v3::{MechanicalEmitError, emit_mechanical_plan_v3};
 use crate::evidence_v3::{
     PlannerFactHints, planner_fact_hints_from_module_constants_v3,
@@ -10,19 +21,18 @@ use crate::plan::{
     OptimizationPlanGenerationSummary, ProfileEvidenceStore, cached_module_paths_under_root,
 };
 use crate::plan_v3::{
-    ConstructorCallOwnerType, ConstructorCallSpecializationPlan, DirectCallArgPlan,
-    DirectCallArgSource, DirectCallSpecializationPlan, EXACT_LIST_EXACT_INT_ITEM_SHAPE_TAG,
-    ExactListItemAccessKind, ExactListItemShape, ExactListItemSpecializationPlan,
-    FunctionOptimizationPlanV3, FunctionPlanIdentity, IndexedFieldAccessKind,
-    IndexedFieldOwnerType, IndexedFieldSpecializationPlan, IndexedGlobalAccessKind,
-    IndexedGlobalSpecializationPlan, MethodCallOwnerType, MethodCallSpecializationPlan,
-    ModuleOptimizationPlanV3, ModulePlanIdentity, PlanDiagnostic, RegionId,
+    ConstructorCallSpecializationPlan, DirectCallArgPlan, DirectCallArgSource,
+    DirectCallSpecializationPlan, EXACT_LIST_EXACT_INT_ITEM_SHAPE_TAG, ExactListItemAccessKind,
+    ExactListItemShape, ExactListItemSpecializationPlan, FunctionOptimizationPlanV3,
+    FunctionPlanIdentity, IndexedFieldAccessKind, IndexedFieldOwnerType,
+    IndexedFieldSpecializationPlan, IndexedGlobalAccessKind, IndexedGlobalSpecializationPlan,
+    MethodCallSpecializationPlan, ModuleOptimizationPlanV3, ModulePlanIdentity, PlanDiagnostic,
+    RegionId,
 };
 use crate::planner_v3::{
-    CallBodyPlanRequest, ConstructorCallPlanRequest, DirectCallPlanRequest,
-    ExactListItemPlanRequest, ExtractedRegionPlanRequest, FunctionPlanRequest,
-    IndexedFieldPlanRequest, IndexedGlobalPlanRequest, MethodCallPlanRequest, ModulePlanRequest,
-    plan_module_optimization_v3,
+    CallBodyPlanRequest, DirectCallPlanRequest, ExactListItemPlanRequest,
+    ExtractedRegionPlanRequest, FunctionPlanRequest, IndexedFieldPlanRequest,
+    IndexedGlobalPlanRequest, ModulePlanRequest, plan_module_optimization_v3,
 };
 use crate::region_v3::{
     RegionExtractionAttempt, RegionExtractionError, extract_function_regions_v3,
@@ -32,21 +42,20 @@ use soac_core::block_py::{
     BlockLabel, BlockPyFunction, BlockPyModule, Call, CallArgPositional, CallDirect,
     ChildVisitable, FunctionExecutionMode, HasSemanticInstrId, InstrId, LocalFunctionId,
     ModuleContentId, NameLike, NameLocation, ParamKind, PersistentFunctionId, ResolvedName,
-    RuntimeName, SerializedFunctionDebugName, SerializedFunctionId, SerializedIdentityTables,
-    SerializedModuleId, SerializedModuleIdentity, Visit,
+    RuntimeFunctionId, RuntimeModuleId, SerializedFunctionDebugName, SerializedFunctionId,
+    SerializedIdentityTables, SerializedModuleId, SerializedModuleIdentity, Visit,
 };
 use soac_driver::codegen_cache::{
     CachedCodegenModule, CachedCodegenModuleMetadata, load_codegen_module_cache,
-    module_optimization_plan_v3_path,
+    module_optimization_plan_v3_path, module_optimized_codegen_v3_path, store_codegen_module_cache,
 };
 use soac_lowering::block_py::literal::Literal;
 use soac_lowering::passes::{
-    CodegenModuleShape, InlineUnsupportedReason, InstrCodegen, InstrResolved,
-    bind_simple_direct_call_inline_args, build_cross_module_direct_call_inline_fragment_to_target,
-    build_cross_module_direct_method_inline_fragment_to_target,
-    build_direct_call_inline_fragment_to_target, build_direct_method_inline_fragment_to_target,
+    CodegenModuleShape, InlinePlanModule, InlineUnsupportedReason, InstrCodegen, InstrResolved,
+    bind_simple_direct_call_inline_args, build_direct_call_inline_fragment_to_target,
+    plan_module_inlining, summarize_module_escapes,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
@@ -69,13 +78,14 @@ impl std::error::Error for ExactIntBranchV3Error {}
 #[derive(Clone, Debug, Default)]
 pub struct DirectCallTargetIndex {
     functions: HashMap<PersistentFunctionId, DirectCallTargetEntry>,
-    functions_by_qualname: HashMap<(ModuleContentId, String), PersistentFunctionId>,
+    functions_by_runtime_id: HashMap<RuntimeFunctionId, PersistentFunctionId>,
 }
 
 #[derive(Clone, Debug)]
 struct DirectCallTargetEntry {
     module: ModuleContentId,
     module_constants: Arc<Vec<InstrResolved>>,
+    inline_plan: Arc<InlinePlanModule>,
     function: BlockPyFunction<CodegenModuleShape>,
 }
 
@@ -113,23 +123,23 @@ impl DirectCallTargetIndex {
     ) {
         let content_id = ModuleContentId::new(metadata.module_name.clone(), metadata.source_hash);
         let module_constants = Arc::new(module.module_constants.clone());
+        let inline_plan = Arc::new(plan_module_inlining(&summarize_module_escapes(module)));
         for function in &module.callable_defs {
             let persistent_id = PersistentFunctionId::new(
                 content_id.clone(),
                 function.function_id.local_function_id(),
             );
-            self.functions_by_qualname.insert(
-                (content_id.clone(), function.names.qualname.clone()),
-                persistent_id.clone(),
-            );
             self.functions.insert(
-                persistent_id,
+                persistent_id.clone(),
                 DirectCallTargetEntry {
                     module: content_id.clone(),
                     module_constants: module_constants.clone(),
+                    inline_plan: inline_plan.clone(),
                     function: function.clone(),
                 },
             );
+            self.functions_by_runtime_id
+                .insert(function.function_id, persistent_id);
         }
     }
 
@@ -137,15 +147,13 @@ impl DirectCallTargetIndex {
         self.functions.get(function_id)
     }
 
-    fn entry_by_module_qualname(
+    fn entry_by_runtime_id(
         &self,
-        module: &ModuleContentId,
-        qualname: &str,
-    ) -> Option<(PersistentFunctionId, &DirectCallTargetEntry)> {
-        let function_id = self
-            .functions_by_qualname
-            .get(&(module.clone(), qualname.to_string()))?;
-        Some((function_id.clone(), self.entry(function_id)?))
+        function_id: RuntimeFunctionId,
+    ) -> Option<&DirectCallTargetEntry> {
+        self.functions_by_runtime_id
+            .get(&function_id)
+            .and_then(|persistent_id| self.functions.get(persistent_id))
     }
 }
 
@@ -342,25 +350,8 @@ fn plan_and_emit_module_v3_from_raw_evidence_with_target_index(
             &mut identity_builder,
         );
         diagnostics.extend(direct_call_diagnostics);
-        let (constructor_calls, constructor_call_diagnostics) =
-            constructor_call_requests_from_evidence_v3(
-                lowered_module,
-                metadata,
-                function,
-                evidence_store,
-                target_index,
-                &mut identity_builder,
-            );
-        diagnostics.extend(constructor_call_diagnostics);
-        let (method_calls, method_call_diagnostics) = method_call_requests_from_evidence_v3(
-            lowered_module,
-            metadata,
-            function,
-            evidence_store,
-            target_index,
-            &mut identity_builder,
-        );
-        diagnostics.extend(method_call_diagnostics);
+        let constructor_calls = Vec::new();
+        let method_calls = Vec::new();
         let (exact_list_items, exact_list_item_diagnostics) =
             exact_list_item_requests_from_profile_evidence_v3(function, &evidence);
         diagnostics.extend(exact_list_item_diagnostics);
@@ -1348,290 +1339,6 @@ fn direct_call_requests_from_evidence_v3(
     (requests, diagnostics)
 }
 
-fn constructor_call_requests_from_evidence_v3(
-    lowered_module: &BlockPyModule<CodegenModuleShape>,
-    metadata: &CachedCodegenModuleMetadata,
-    function: &BlockPyFunction<CodegenModuleShape>,
-    evidence_store: &ProfileEvidenceStore,
-    target_index: &DirectCallTargetIndex,
-    identity_builder: &mut OptimizationPlanV3IdentityBuilder,
-) -> (Vec<ConstructorCallPlanRequest>, Vec<PlanDiagnostic>) {
-    let mut requests = Vec::new();
-    let mut diagnostics = Vec::new();
-    let current_module = ModuleContentId::new(metadata.module_name.clone(), metadata.source_hash);
-    let mut entries = evidence_store
-        .persistent_call_target_specializations_for_runtime_function_v3(
-            metadata.module_name.as_str(),
-            metadata.source_hash,
-            function.function_id,
-        )
-        .into_iter()
-        .collect::<Vec<_>>();
-    entries.sort_by_key(|(source, _)| *source);
-    for (source, targets) in entries {
-        if is_method_call_source_v3(lowered_module, function, source) {
-            continue;
-        }
-        let mut targets = targets;
-        targets.sort();
-        targets.dedup();
-        for target in targets {
-            let serialized_target = identity_builder.function_id_for_persistent(target.clone());
-            let Some(target_entry) = target_index.entry(&target) else {
-                diagnostics.push(PlanDiagnostic {
-                    source: Some(source),
-                    message: format!(
-                        "v3 constructor-call declined target {serialized_target}: target function is missing from cached modules"
-                    ),
-                });
-                continue;
-            };
-            let target_function = &target_entry.function;
-            if target_function.names.fn_name != "__init__" {
-                continue;
-            }
-            if target_function.execution_mode() != FunctionExecutionMode::Jit {
-                diagnostics.push(PlanDiagnostic {
-                    source: Some(source),
-                    message: format!(
-                        "v3 constructor-call declined target {serialized_target}: target function is not JIT lowered"
-                    ),
-                });
-                continue;
-            }
-            let Some(owner_type) = constructor_call_owner_type_from_target_v3(
-                &target_function.names.qualname,
-                &target,
-            ) else {
-                diagnostics.push(PlanDiagnostic {
-                    source: Some(source),
-                    message: format!(
-                        "v3 constructor-call declined target {serialized_target}: could not derive owner type from __init__ qualname"
-                    ),
-                });
-                continue;
-            };
-            let arg_plan = match direct_call_arg_plan_for_instr_id_v3(
-                function,
-                source,
-                target_function,
-                1,
-            ) {
-                Some(Ok(arg_plan)) => arg_plan,
-                Some(Err(reason)) => {
-                    diagnostics.push(PlanDiagnostic {
-                        source: Some(source),
-                        message: format!(
-                            "v3 constructor-call declined target {serialized_target}: {reason}"
-                        ),
-                    });
-                    continue;
-                }
-                None => {
-                    diagnostics.push(PlanDiagnostic {
-                        source: Some(source),
-                        message: format!(
-                            "v3 constructor-call declined target {serialized_target}: source instruction is not a lowered call"
-                        ),
-                    });
-                    continue;
-                }
-            };
-            let inline_target = constructor_call_runtime_iter_inline_target_v3(
-                lowered_module,
-                &current_module,
-                function,
-                source,
-                target_index,
-                target_entry,
-                &owner_type,
-            )
-            .map(|(function_id, qualname)| {
-                let serialized_function_id =
-                    identity_builder.function_id_for_persistent(function_id);
-                identity_builder.add_debug_name(serialized_function_id, qualname);
-                serialized_function_id
-            });
-            requests.push(ConstructorCallPlanRequest {
-                source,
-                target: serialized_target,
-                owner_type,
-                arg_plan,
-                body: CallBodyPlanRequest::with_inline_target_candidate(inline_target),
-                reason: "profiled call_hot_targets selected this constructor __init__ target with validated constructor arguments".to_string(),
-            });
-            identity_builder
-                .add_debug_name(serialized_target, target_function.names.qualname.clone());
-        }
-    }
-    (requests, diagnostics)
-}
-
-fn method_call_requests_from_evidence_v3(
-    lowered_module: &BlockPyModule<CodegenModuleShape>,
-    metadata: &CachedCodegenModuleMetadata,
-    function: &BlockPyFunction<CodegenModuleShape>,
-    evidence_store: &ProfileEvidenceStore,
-    target_index: &DirectCallTargetIndex,
-    identity_builder: &mut OptimizationPlanV3IdentityBuilder,
-) -> (Vec<MethodCallPlanRequest>, Vec<PlanDiagnostic>) {
-    let mut requests = Vec::new();
-    let mut diagnostics = Vec::new();
-    let current_module = ModuleContentId::new(metadata.module_name.clone(), metadata.source_hash);
-    let mut entries = evidence_store
-        .persistent_call_target_specializations_for_runtime_function_v3(
-            metadata.module_name.as_str(),
-            metadata.source_hash,
-            function.function_id,
-        )
-        .into_iter()
-        .collect::<Vec<_>>();
-    entries.sort_by_key(|(source, _)| *source);
-    for (source, targets) in entries {
-        let method_name = match method_call_name_for_instr_id_v3(lowered_module, function, source) {
-            Some(Some(method_name)) => method_name,
-            Some(None) => {
-                diagnostics.push(PlanDiagnostic {
-                    source: Some(source),
-                    message: "v3 method-call declined source: method attribute name is not a constant string".to_string(),
-                });
-                continue;
-            }
-            None => continue,
-        };
-        let mut targets = targets;
-        targets.sort();
-        targets.dedup();
-        for target in targets {
-            let serialized_target = identity_builder.function_id_for_persistent(target.clone());
-            let Some(target_entry) = target_index.entry(&target) else {
-                diagnostics.push(PlanDiagnostic {
-                    source: Some(source),
-                    message: format!(
-                        "v3 method-call declined target {serialized_target}: target function is missing from cached modules"
-                    ),
-                });
-                continue;
-            };
-            let target_function = &target_entry.function;
-            if target_function.execution_mode() != FunctionExecutionMode::Jit {
-                diagnostics.push(PlanDiagnostic {
-                    source: Some(source),
-                    message: format!(
-                        "v3 method-call declined target {serialized_target}: target function is not JIT lowered"
-                    ),
-                });
-                continue;
-            }
-            if target_function.names.fn_name == "__init__" {
-                diagnostics.push(PlanDiagnostic {
-                    source: Some(source),
-                    message: format!(
-                        "v3 method-call declined target {serialized_target}: constructor targets require constructor allocation semantics"
-                    ),
-                });
-                continue;
-            }
-            let Some(owner_type) =
-                method_call_owner_type_from_target_v3(&target, target_function, &method_name)
-            else {
-                diagnostics.push(PlanDiagnostic {
-                    source: Some(source),
-                    message: format!(
-                        "v3 method-call declined target {serialized_target}: could not derive owner type for method {method_name}"
-                    ),
-                });
-                continue;
-            };
-            let arg_plan = match direct_call_arg_plan_for_instr_id_v3(
-                function,
-                source,
-                target_function,
-                1,
-            ) {
-                Some(Ok(arg_plan)) => arg_plan,
-                Some(Err(reason)) => {
-                    diagnostics.push(PlanDiagnostic {
-                        source: Some(source),
-                        message: format!(
-                            "v3 method-call declined target {serialized_target}: {reason}"
-                        ),
-                    });
-                    continue;
-                }
-                None => {
-                    diagnostics.push(PlanDiagnostic {
-                        source: Some(source),
-                        message: format!(
-                            "v3 method-call declined target {serialized_target}: source instruction is not a lowered call"
-                        ),
-                    });
-                    continue;
-                }
-            };
-            requests.push(MethodCallPlanRequest {
-                source,
-                target: serialized_target,
-                method_name: method_name.clone(),
-                owner_type,
-                arg_plan,
-                body: CallBodyPlanRequest::with_inline_candidate(method_call_inline_candidate_v3(
-                    lowered_module,
-                    &current_module,
-                    function,
-                    source,
-                    target_entry,
-                )),
-                reason: "profiled call_hot_targets selected this owner-method target with validated receiver-call arguments".to_string(),
-            });
-            identity_builder
-                .add_debug_name(serialized_target, target_function.names.qualname.clone());
-        }
-    }
-    (requests, diagnostics)
-}
-
-fn constructor_call_owner_type_from_target_v3(
-    target_qualname: &str,
-    target: &PersistentFunctionId,
-) -> Option<ConstructorCallOwnerType> {
-    let owner_qualname = target_qualname.strip_suffix(".__init__")?;
-    if owner_qualname.is_empty()
-        || owner_qualname
-            .split('.')
-            .any(|part| part.is_empty() || part == "<locals>")
-    {
-        return None;
-    }
-    Some(ConstructorCallOwnerType {
-        module_name: target.module.module_name.clone(),
-        qualname: owner_qualname.to_string(),
-    })
-}
-
-fn method_call_owner_type_from_target_v3(
-    target: &PersistentFunctionId,
-    target_function: &BlockPyFunction<CodegenModuleShape>,
-    method_name: &str,
-) -> Option<MethodCallOwnerType> {
-    let suffix = format!(".{method_name}");
-    let owner_qualname = target_function
-        .names
-        .qualname
-        .strip_suffix(suffix.as_str())?;
-    if owner_qualname.is_empty()
-        || owner_qualname
-            .split('.')
-            .any(|part| part.is_empty() || part == "<locals>")
-    {
-        return None;
-    }
-    Some(MethodCallOwnerType {
-        module_name: target.module.module_name.clone(),
-        qualname: owner_qualname.to_string(),
-    })
-}
-
 fn is_method_call_source_v3(
     module: &BlockPyModule<CodegenModuleShape>,
     function: &BlockPyFunction<CodegenModuleShape>,
@@ -1734,6 +1441,9 @@ fn direct_call_inline_candidate_v3(
     source: InstrId,
     target: &DirectCallTargetEntry,
 ) -> bool {
+    if target.module != *current_module {
+        return false;
+    }
     let Some((return_target, call)) = store_call_and_target_for_instr_id_v3(function, source)
     else {
         return false;
@@ -1754,129 +1464,6 @@ fn direct_call_inline_candidate_v3(
         target,
     )
     .is_ok()
-}
-
-fn method_call_inline_candidate_v3(
-    module: &BlockPyModule<CodegenModuleShape>,
-    current_module: &ModuleContentId,
-    function: &BlockPyFunction<CodegenModuleShape>,
-    source: InstrId,
-    target: &DirectCallTargetEntry,
-) -> bool {
-    let Some((return_target, call)) = store_call_and_target_for_instr_id_v3(function, source)
-    else {
-        return false;
-    };
-    if !call.args.is_empty() || !call.keywords.is_empty() {
-        return false;
-    }
-    let InstrCodegen::GetAttr(getattr) = call.func.as_ref() else {
-        return false;
-    };
-    if codegen_constant_string_value_v3(module, getattr.attr.as_ref()).is_none() {
-        return false;
-    }
-    let target_function = &target.function;
-    if !call_inline_signature_candidate_v3(call, target_function, 1) {
-        return false;
-    }
-    direct_method_inline_body_buildable_v3(
-        module,
-        current_module,
-        function,
-        return_target,
-        getattr.value.as_ref().clone(),
-        call.args.as_slice(),
-        target,
-    )
-    .is_ok()
-}
-
-fn constructor_call_runtime_iter_inline_target_v3(
-    module: &BlockPyModule<CodegenModuleShape>,
-    current_module: &ModuleContentId,
-    function: &BlockPyFunction<CodegenModuleShape>,
-    source: InstrId,
-    target_index: &DirectCallTargetIndex,
-    constructor_target: &DirectCallTargetEntry,
-    owner_type: &ConstructorCallOwnerType,
-) -> Option<(PersistentFunctionId, String)> {
-    let (return_target, receiver) =
-        runtime_iter_call_for_constructor_instr_id_v3(module, function, source)?;
-    let iter_qualname = format!("{}.__iter__", owner_type.qualname);
-    let (iter_function_id, iter_target) = target_index
-        .entry_by_module_qualname(&constructor_target.module, iter_qualname.as_str())?;
-    if iter_target.function.execution_mode() != FunctionExecutionMode::Jit {
-        return None;
-    }
-    direct_method_inline_body_buildable_v3(
-        module,
-        current_module,
-        function,
-        return_target,
-        receiver,
-        &[],
-        iter_target,
-    )
-    .ok()?;
-    Some((
-        iter_function_id,
-        iter_target.function.names.qualname.clone(),
-    ))
-}
-
-fn runtime_iter_call_for_constructor_instr_id_v3(
-    module: &BlockPyModule<CodegenModuleShape>,
-    function: &BlockPyFunction<CodegenModuleShape>,
-    source: InstrId,
-) -> Option<(ResolvedName, InstrCodegen)> {
-    for block in &function.blocks {
-        for instr in &block.body {
-            let InstrCodegen::Store(store) = instr else {
-                continue;
-            };
-            let InstrCodegen::Call(iter_call) = store.value.as_ref() else {
-                continue;
-            };
-            if !is_runtime_name_expr_v3(module, iter_call.func.as_ref(), RuntimeName::Iter)
-                || !iter_call.keywords.is_empty()
-                || iter_call.args.len() != 1
-            {
-                continue;
-            }
-            let Some(CallArgPositional::Positional(receiver)) = iter_call.args.first() else {
-                continue;
-            };
-            let InstrCodegen::Call(constructor_call) = receiver else {
-                continue;
-            };
-            if constructor_call.try_semantic_instr_id() == Some(source) {
-                return Some((store.name.clone(), receiver.clone()));
-            }
-        }
-    }
-    None
-}
-
-fn is_runtime_name_expr_v3(
-    module: &BlockPyModule<CodegenModuleShape>,
-    expr: &InstrCodegen,
-    runtime_name: RuntimeName,
-) -> bool {
-    let InstrCodegen::Load(load) = expr else {
-        return false;
-    };
-    if load.name.location == NameLocation::RuntimeName(runtime_name) {
-        return true;
-    }
-    let Some(constant_index) = load.name.location.as_constant() else {
-        return false;
-    };
-    let Some(InstrResolved::Load(load)) = module.module_constants.get(constant_index as usize)
-    else {
-        return false;
-    };
-    load.name.location == NameLocation::RuntimeName(runtime_name)
 }
 
 fn store_call_and_target_for_instr_id_v3(
@@ -1900,7 +1487,7 @@ fn store_call_and_target_for_instr_id_v3(
 }
 
 fn direct_call_inline_body_buildable_v3(
-    module: &BlockPyModule<CodegenModuleShape>,
+    _module: &BlockPyModule<CodegenModuleShape>,
     current_module: &ModuleContentId,
     function: &BlockPyFunction<CodegenModuleShape>,
     return_target: ResolvedName,
@@ -1908,7 +1495,6 @@ fn direct_call_inline_body_buildable_v3(
     target: &DirectCallTargetEntry,
 ) -> Result<(), InlineUnsupportedReason> {
     let mut caller = function.clone();
-    let mut caller_constants = module.module_constants.clone();
     let continuation = caller.name_gen.next_block_name();
     let direct_call = CallDirect::new(
         call.func.as_ref().clone(),
@@ -1917,61 +1503,18 @@ fn direct_call_inline_body_buildable_v3(
         call.keywords.clone(),
     );
     let bindings = bind_simple_direct_call_inline_args(&target.function, &direct_call)?;
-    if target.module == *current_module {
-        build_direct_call_inline_fragment_to_target(
-            &mut caller,
-            &target.function,
-            continuation,
-            &bindings,
-            return_target,
-        )?;
-    } else {
-        build_cross_module_direct_call_inline_fragment_to_target(
-            &mut caller,
-            &mut caller_constants,
-            &target.function,
-            target.module_constants.as_slice(),
-            continuation,
-            &bindings,
-            return_target,
-        )?;
+    if target.module != *current_module {
+        return Err(InlineUnsupportedReason::CrossModuleGlobalName(
+            target.module.module_name.clone(),
+        ));
     }
-    Ok(())
-}
-
-fn direct_method_inline_body_buildable_v3(
-    module: &BlockPyModule<CodegenModuleShape>,
-    current_module: &ModuleContentId,
-    function: &BlockPyFunction<CodegenModuleShape>,
-    return_target: ResolvedName,
-    receiver: InstrCodegen,
-    args: &[CallArgPositional<InstrCodegen>],
-    target: &DirectCallTargetEntry,
-) -> Result<(), InlineUnsupportedReason> {
-    let mut caller = function.clone();
-    let mut caller_constants = module.module_constants.clone();
-    let continuation = caller.name_gen.next_block_name();
-    if target.module == *current_module {
-        build_direct_method_inline_fragment_to_target(
-            &mut caller,
-            &target.function,
-            continuation,
-            receiver,
-            args,
-            return_target,
-        )?;
-    } else {
-        build_cross_module_direct_method_inline_fragment_to_target(
-            &mut caller,
-            &mut caller_constants,
-            &target.function,
-            target.module_constants.as_slice(),
-            continuation,
-            receiver,
-            args,
-            return_target,
-        )?;
-    }
+    build_direct_call_inline_fragment_to_target(
+        &mut caller,
+        &target.function,
+        continuation,
+        &bindings,
+        return_target,
+    )?;
     Ok(())
 }
 
@@ -2222,13 +1765,141 @@ fn generate_loaded_module_optimization_plan_v3(
             cache.metadata.module_name
         )
     })?;
+    let optimized_module = rewrite_cached_module_for_optimization_artifacts_v3(
+        &cache.metadata,
+        &cache.module,
+        &artifacts,
+        target_index,
+    )
+    .map_err(|err| anyhow!("rewrite optimizer v3 BlockPy module: {err}"))?;
+    let optimized_module_path = module_optimized_codegen_v3_path(
+        out_root,
+        cache.metadata.source,
+        cache.metadata.module_name.as_str(),
+    )
+    .with_context(|| {
+        format!(
+            "construct optimized codegen v3 output path for module {}",
+            cache.metadata.module_name
+        )
+    })?;
     write_optimization_artifacts_v3(output_path.as_path(), &artifacts)?;
+    store_codegen_module_cache(
+        optimized_module_path.as_path(),
+        &cache.metadata,
+        &optimized_module,
+        None,
+    )?;
     Ok(Some(ModuleOptimizationPlanReport {
         output_path,
+        optimized_module_path,
         module_name: cache.metadata.module_name,
         source_hash: cache.metadata.source_hash,
         function_count: artifacts.plan.functions.len(),
     }))
+}
+
+fn rewrite_cached_module_for_optimization_artifacts_v3(
+    metadata: &CachedCodegenModuleMetadata,
+    module: &BlockPyModule<CodegenModuleShape>,
+    artifacts: &ExactIntBranchV3Artifacts,
+    target_index: &DirectCallTargetIndex,
+) -> Result<BlockPyModule<CodegenModuleShape>, String> {
+    let module_id = RuntimeModuleId::new(module.module_name_gen.module_id());
+    let mut direct_calls_by_function =
+        HashMap::<RuntimeFunctionId, HashMap<InstrId, Vec<ResolvedV3DirectCallPlan>>>::new();
+    let mut constructor_calls_by_function =
+        HashMap::<RuntimeFunctionId, HashMap<InstrId, Vec<ResolvedV3ConstructorCallPlan>>>::new();
+    let mut method_calls_by_function =
+        HashMap::<RuntimeFunctionId, HashMap<InstrId, Vec<ResolvedV3MethodCallPlan>>>::new();
+    let mut exact_int_branch_function_ids = HashSet::<RuntimeFunctionId>::new();
+
+    for planned_function in &artifacts.plan.functions {
+        let local_function_id = planned_function.function.function.local_function_id();
+        let function_id = RuntimeFunctionId::new(module_id, local_function_id);
+        let Some(function_artifacts) = single_function_optimization_artifacts_v3(
+            artifacts,
+            planned_function.function.function,
+        )
+        .map_err(|err| err.to_string())?
+        else {
+            continue;
+        };
+        let emitted_function = &function_artifacts.emission.functions[0];
+        if !emitted_function.regions.is_empty() || !emitted_function.scalar_threads.is_empty() {
+            exact_int_branch_function_ids.insert(function_id);
+        }
+        if let Some(direct_calls) =
+            direct_calls_for_function_from_artifacts(&function_artifacts, |target| {
+                resolve_cached_v3_call_target(target_index, target)
+            })?
+        {
+            direct_calls_by_function.insert(function_id, direct_calls);
+        }
+        if let Some(constructor_calls) =
+            constructor_calls_for_function_from_artifacts(&function_artifacts, |target| {
+                resolve_cached_v3_call_target(target_index, target)
+            })?
+        {
+            constructor_calls_by_function.insert(function_id, constructor_calls);
+        }
+        if let Some(method_calls) =
+            method_calls_for_function_from_artifacts(&function_artifacts, |target| {
+                resolve_cached_v3_call_target(target_index, target)
+            })?
+        {
+            method_calls_by_function.insert(function_id, method_calls);
+        }
+    }
+
+    let direct_owner_attr_specializations_by_function = HashMap::new();
+    let output = rewrite_v3_call_inlining_for_module(
+        module,
+        V3CallInliningProfile {
+            direct_calls_by_function: &direct_calls_by_function,
+            constructor_calls_by_function: &constructor_calls_by_function,
+            method_calls_by_function: &method_calls_by_function,
+            exact_int_branch_function_ids: &exact_int_branch_function_ids,
+        },
+        &direct_owner_attr_specializations_by_function,
+        |function_id| resolve_cached_v3_external_inline_target(target_index, function_id),
+        |_| None,
+        |_| None,
+    )?;
+    if output
+        .summary
+        .method_rewrites
+        .iter()
+        .any(|report| report.stats.rewritten_stores != 0)
+    {
+        return Err(format!(
+            "optimizer v3 unexpectedly rewrote runtime-guarded method/constructor calls for module {}",
+            metadata.module_name
+        ));
+    }
+    Ok(output.module)
+}
+
+fn resolve_cached_v3_call_target(
+    target_index: &DirectCallTargetIndex,
+    target: PersistentFunctionId,
+) -> Result<Option<RuntimeFunctionId>, String> {
+    Ok(target_index
+        .entry(&target)
+        .map(|entry| entry.function.function_id))
+}
+
+fn resolve_cached_v3_external_inline_target(
+    target_index: &DirectCallTargetIndex,
+    function_id: RuntimeFunctionId,
+) -> Result<Option<V3ExternalInlineTarget>, String> {
+    Ok(target_index
+        .entry_by_runtime_id(function_id)
+        .map(|entry| V3ExternalInlineTarget {
+            function: entry.function.clone(),
+            module_constants: entry.module_constants.as_ref().clone(),
+            inline_plan: entry.inline_plan.as_ref().clone(),
+        }))
 }
 
 fn counter_evidence_matches_cached_module_v3(
@@ -2424,18 +2095,9 @@ mod tests {
         DirectCallTargetEntry {
             module,
             module_constants: Arc::new(Vec::new()),
+            inline_plan: Arc::new(InlinePlanModule::default()),
             function,
         }
-    }
-
-    fn simple_arg_return_callee_named(
-        fn_name: &str,
-        qualname: &str,
-        params: &[(&str, bool)],
-    ) -> BlockPyFunction<CodegenModuleShape> {
-        let mut function = simple_arg_return_callee(params);
-        function.names = FunctionName::new(fn_name, fn_name, fn_name, qualname);
-        function
     }
 
     fn unique_counter_path_v3() -> std::path::PathBuf {
@@ -2574,85 +2236,6 @@ mod tests {
             source,
             &default_target
         ));
-    }
-
-    #[test]
-    fn constructor_runtime_iter_inline_candidate_names_iter_body_target() {
-        let source = instr_id(9);
-        let current_module = ModuleContentId::new("pkg.mod", 0x99);
-        let constructor_call = with_instr_id(
-            InstrCodegen::Call(Call::new(
-                local("Box", 0),
-                vec![CallArgPositional::Positional(local("x", 1))],
-                Vec::new(),
-            )),
-            9,
-        );
-        let iter_call = InstrCodegen::Call(Call::new(
-            InstrCodegen::Load(Load::new(ResolvedName {
-                id: BlockPyName::new("iter"),
-                location: NameLocation::RuntimeName(RuntimeName::Iter),
-            })),
-            vec![CallArgPositional::Positional(constructor_call)],
-            Vec::new(),
-        ));
-        let mut caller = function_with_blocks(vec![Block::new(
-            label(0),
-            vec![InstrCodegen::Store(Store::new(
-                local_name("result", 2),
-                iter_call,
-            ))],
-            BlockTerm::Return(local("result", 2)),
-            Vec::<BlockParam>::new(),
-            None,
-        )]);
-        set_stack_slots(&mut caller, &["Box", "x", "result"]);
-        let module = module_with_constants(Vec::new());
-
-        let init_function = simple_arg_return_callee_named(
-            "__init__",
-            "Box.__init__",
-            &[("self", false), ("x", false)],
-        );
-        let iter_function =
-            simple_arg_return_callee_named("__iter__", "Box.__iter__", &[("self", false)]);
-        let init_function_id =
-            PersistentFunctionId::new(current_module.clone(), LocalFunctionId::new(2));
-        let iter_function_id =
-            PersistentFunctionId::new(current_module.clone(), LocalFunctionId::new(3));
-        let mut target_index = DirectCallTargetIndex::default();
-        target_index.functions.insert(
-            init_function_id.clone(),
-            direct_call_target_entry(current_module.clone(), init_function),
-        );
-        target_index.functions.insert(
-            iter_function_id.clone(),
-            direct_call_target_entry(current_module.clone(), iter_function),
-        );
-        target_index.functions_by_qualname.insert(
-            (current_module.clone(), "Box.__iter__".to_string()),
-            iter_function_id.clone(),
-        );
-        let constructor_target = target_index.entry(&init_function_id).unwrap();
-        let owner_type = ConstructorCallOwnerType {
-            module_name: "pkg.mod".to_string(),
-            qualname: "Box".to_string(),
-        };
-
-        let selected = constructor_call_runtime_iter_inline_target_v3(
-            &module,
-            &current_module,
-            &caller,
-            source,
-            &target_index,
-            constructor_target,
-            &owner_type,
-        );
-
-        assert_eq!(
-            selected,
-            Some((iter_function_id, "Box.__iter__".to_string()))
-        );
     }
 
     #[test]

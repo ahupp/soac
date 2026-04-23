@@ -4,7 +4,8 @@ use soac_core::profile::{CounterDumpFile, CounterDumpRecordView, CounterDumpRowV
 use soac_driver::codegen_cache::{
     CachedCodegenModuleMetadata, PythonModuleCacheSource, codegen_module_cache_path,
     hash_module_source, load_codegen_module_cache, module_optimization_plan_v3_path,
-    remap_cached_codegen_module_function_ids, validate_codegen_module_cache_metadata,
+    module_optimized_codegen_v3_path, remap_cached_codegen_module_function_ids,
+    validate_codegen_module_cache_metadata,
 };
 use soac_jit::{
     PrecompileModuleIndex, PrecompileModuleIndexEntry, PrecompileOptimizationPlanInput,
@@ -159,8 +160,15 @@ fn run_with_args(args: impl IntoIterator<Item = OsString>) -> Result<(), String>
             module_ref.module_name.as_str(),
         )
         .map_err(|err| err.to_string())?;
+        let optimized_module_v3_path = module_optimized_codegen_v3_path(
+            module_cache_dir.as_path(),
+            metadata.source,
+            module_ref.module_name.as_str(),
+        )
+        .map_err(|err| err.to_string())?;
         let optimization_plan = PrecompileOptimizationPlanInput {
             v3_path: Some(optimization_plan_v3_path.as_path()),
+            optimized_module_path: Some(optimized_module_v3_path.as_path()),
             cache_identity: metadata.cache_identity.as_str(),
         };
 

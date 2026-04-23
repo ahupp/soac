@@ -22,7 +22,7 @@ def _soac_opt_verify():
     {
         "type": "v3_plan",
         "function": "make",
-        "constructor_calls": {"min": 1},
-        "emitted_constructor_calls": {"min": 1},
+        "constructor_calls": 0,
+        "emitted_constructor_calls": 0,
     },
 ]
