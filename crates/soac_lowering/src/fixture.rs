@@ -1,17 +1,17 @@
 #[derive(Default, Clone)]
-pub struct FixtureBlock {
-    pub name: String,
-    pub input: String,
-    pub output: String,
-    pub seen_separator: bool,
+pub(crate) struct FixtureBlock {
+    pub(crate) name: String,
+    pub(crate) input: String,
+    pub(crate) output: String,
+    pub(crate) seen_separator: bool,
 }
 
-pub enum FixtureSection {
+enum FixtureSection {
     Waiting,
     Block(FixtureBlock),
 }
 
-pub fn parse_fixture(contents: &str) -> Result<Vec<FixtureBlock>, String> {
+pub(crate) fn parse_fixture(contents: &str) -> Result<Vec<FixtureBlock>, String> {
     let mut blocks = Vec::new();
     let mut section = FixtureSection::Waiting;
 
@@ -98,29 +98,4 @@ pub fn parse_fixture(contents: &str) -> Result<Vec<FixtureBlock>, String> {
     }
 
     Ok(blocks)
-}
-
-pub fn render_fixture(blocks: &[FixtureBlock]) -> String {
-    let mut output = String::new();
-    for (index, block) in blocks.iter().enumerate() {
-        if index > 0 {
-            output.push('\n');
-        }
-        output.push_str("# ");
-        output.push_str(&block.name);
-        output.push_str("\n\n");
-        let input = block.input.trim_matches('\n');
-        if !input.is_empty() {
-            output.push_str(input);
-            output.push('\n');
-        }
-        output.push('\n');
-        output.push_str("# ==\n\n");
-        let output_block = block.output.trim_matches('\n');
-        if !output_block.is_empty() {
-            output.push_str(output_block);
-            output.push('\n');
-        }
-    }
-    output
 }

@@ -14,7 +14,8 @@ use std::time::{Duration, Instant};
 
 pub mod block_py;
 mod driver;
-pub mod fixture;
+#[cfg(test)]
+pub(crate) mod fixture;
 mod namegen;
 pub mod pass_tracker;
 pub mod passes;

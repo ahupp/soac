@@ -349,7 +349,7 @@ pub use trace::{
 
 pub(crate) use global_index::lower_global_index_in_resolved_module_default;
 pub(crate) use name_binding::lower_name_binding_in_core_blockpy_module_with_options;
-pub fn relabel_dense_bb_module<P: ModuleShape>(module: &mut BlockPyModule<P>) {
+pub(crate) fn relabel_dense_bb_module<P: ModuleShape>(module: &mut BlockPyModule<P>) {
     for callable in &mut module.callable_defs {
         relabel_blockpy_blocks_dense(&mut callable.blocks);
     }

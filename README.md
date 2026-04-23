@@ -169,11 +169,6 @@ planner lives in `soac-opt`.
   Correlates perf samples with SOAC JIT basic-block maps for a benchmark result
   directory, writes annotated VCode files, and prints block-level sample rows.
 
-- `regen_snapshots`
-  Regenerates ignored `snapshot/` fixtures and summary rows from checked-in
-  snapshot source cases. This is mainly a maintenance tool for inspector and
-  lowering snapshot workflows.
-
 # Setup
 
 ```

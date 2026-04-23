@@ -16,17 +16,19 @@ impl CounterHandle {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct CounterBranchHandle {
+#[allow(dead_code)]
+pub(crate) struct CounterBranchHandle {
     id: CounterId,
     branch_id: CounterBranchId,
 }
 
+#[allow(dead_code)]
 impl CounterBranchHandle {
-    pub const fn id(self) -> CounterId {
+    pub(crate) const fn id(self) -> CounterId {
         self.id
     }
 
-    pub const fn branch_id(self) -> CounterBranchId {
+    pub(crate) const fn branch_id(self) -> CounterBranchId {
         self.branch_id
     }
 }
@@ -138,7 +140,8 @@ impl<'a> CounterBuilder<'a> {
         self.define_branch_counter(scope, kind, site, branches)
     }
 
-    pub fn branch_handle(&self, handle: CounterHandle, branch: &str) -> CounterBranchHandle {
+    #[allow(dead_code)]
+    pub(crate) fn branch_handle(&self, handle: CounterHandle, branch: &str) -> CounterBranchHandle {
         let counter = self
             .defs
             .iter()
