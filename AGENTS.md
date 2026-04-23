@@ -348,6 +348,13 @@ so a later turn can resume without rediscovering context.
 - `just fmt-rust-check <cargo-package> ...`
   Package-scoped Rust formatting check. Use this for validation after scoped
   Rust edits.
+- `cargo test -p <package> <test-filter>`
+  Cargo accepts only one test-name filter before `--`. To run multiple named
+  focused Rust tests, run separate `cargo test` commands serially, use one shared
+  substring/module-path filter that matches all intended tests, or run the
+  package test target and let the test harness filter internally. Do not pass
+  multiple test names as separate positional arguments; Cargo treats the second
+  one as an unexpected argument.
 - `just pytest ...`
   Authoritative transformed-runtime pytest entrypoint.
 - `just pytest-fast ...`
