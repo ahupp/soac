@@ -382,7 +382,7 @@ fn finish_codegen_module_with_tracker(
 fn define_deopt_entry_counters_for_current_module(
     module: &mut BlockPyModule<CodegenModuleShape>,
     pass_tracker: &mut impl PassTracker,
-) -> Result<()> {
+) -> soac_lowering::Result<()> {
     let value_facts = pass_tracker.record_timing("deopt_entry_value_facts", || {
         passes::infer_module_value_facts(module)
     });
@@ -413,7 +413,7 @@ fn define_deopt_entry_counters_for_current_module(
 pub fn finish_cached_codegen_module_for_runtime(
     module: BlockPyModule<CodegenModuleShape>,
     env_config: &SoacEnvConfig,
-) -> Result<BlockPyModule<CodegenModuleShape>> {
+) -> soac_lowering::Result<BlockPyModule<CodegenModuleShape>> {
     finish_codegen_module_with_tracker(
         PreOptimizationModule {
             module,
@@ -429,7 +429,7 @@ pub fn finish_cached_codegen_module_for_runtime_with_counter_defs(
     module: BlockPyModule<CodegenModuleShape>,
     env_config: &SoacEnvConfig,
     counter_defs: &[CounterDef],
-) -> Result<BlockPyModule<CodegenModuleShape>> {
+) -> soac_lowering::Result<BlockPyModule<CodegenModuleShape>> {
     let mut module = finish_cached_codegen_module_for_runtime(module, env_config)?;
     retain_defined_explicit_counter_increments(&mut module, counter_defs);
     module.counter_defs = counter_defs.to_vec();
