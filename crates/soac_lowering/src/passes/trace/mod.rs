@@ -284,8 +284,7 @@ pub fn instrument_bb_module_with_call_target_counters(
         function_id: crate::block_py::RuntimeFunctionId,
         instr_id: crate::block_py::InstrId,
         shape_kind: &'static str,
-        hit_kind: &'static str,
-        fallback_kind: &'static str,
+        branch_kind: &'static str,
     ) {
         counters.define_if_missing(
             CounterScope::This,
@@ -295,46 +294,52 @@ pub fn instrument_bb_module_with_call_target_counters(
                 instr_id: Some(instr_id),
             },
         );
-        counters.define_if_missing(
+        counters.define_branch_counter_if_missing(
             CounterScope::This,
-            hit_kind,
+            branch_kind,
             CounterSite::Runtime {
                 function_id: Some(function_id),
                 instr_id: Some(instr_id),
             },
-        );
-        counters.define_if_missing(
-            CounterScope::This,
-            fallback_kind,
-            CounterSite::Runtime {
-                function_id: Some(function_id),
-                instr_id: Some(instr_id),
-            },
+            ["hit", "fallback"],
         );
     }
 
-    fn define_indexed_hit_fallback_counters(
+    fn define_indexed_counter(
         counters: &mut CounterBuilder<'_>,
         function_id: crate::block_py::RuntimeFunctionId,
         instr_id: crate::block_py::InstrId,
-        hit_kind: &'static str,
-        fallback_kind: &'static str,
+        kind: &'static str,
     ) {
-        counters.define_if_missing(
+        counters.define_branch_counter_if_missing(
             CounterScope::This,
-            hit_kind,
+            kind,
             CounterSite::Runtime {
                 function_id: Some(function_id),
                 instr_id: Some(instr_id),
             },
+            ["hit", "fallback"],
         );
-        counters.define_if_missing(
+    }
+
+    fn define_field_access_counter(
+        counters: &mut CounterBuilder<'_>,
+        function_id: crate::block_py::RuntimeFunctionId,
+        instr_id: crate::block_py::InstrId,
+    ) {
+        counters.define_branch_counter_if_missing(
             CounterScope::This,
-            fallback_kind,
+            "field_access",
             CounterSite::Runtime {
                 function_id: Some(function_id),
                 instr_id: Some(instr_id),
             },
+            [
+                "indexed_hit",
+                "indexed_fallback",
+                "generic_getattr",
+                "generic_setattr",
+            ],
         );
     }
 
@@ -347,50 +352,16 @@ pub fn instrument_bb_module_with_call_target_counters(
         fn visit_instr(&mut self, expr: &InstrCodegen) {
             if is_global_index_candidate(expr) {
                 let instr_id = expr.semantic_instr_id();
-                define_indexed_hit_fallback_counters(
-                    self.counters,
-                    self.function_id,
-                    instr_id,
-                    "global_indexed_hit",
-                    "global_indexed_fallback",
-                );
+                define_indexed_counter(self.counters, self.function_id, instr_id, "global_indexed");
             }
             match expr {
                 InstrCodegen::GetAttr(_) => {
                     let instr_id = expr.semantic_instr_id();
-                    define_indexed_hit_fallback_counters(
-                        self.counters,
-                        self.function_id,
-                        instr_id,
-                        "field_indexed_hit",
-                        "field_indexed_fallback",
-                    );
-                    self.counters.define_if_missing(
-                        CounterScope::This,
-                        "field_generic_getattr",
-                        CounterSite::Runtime {
-                            function_id: Some(self.function_id),
-                            instr_id: Some(instr_id),
-                        },
-                    );
+                    define_field_access_counter(self.counters, self.function_id, instr_id);
                 }
                 InstrCodegen::SetAttr(_) => {
                     let instr_id = expr.semantic_instr_id();
-                    define_indexed_hit_fallback_counters(
-                        self.counters,
-                        self.function_id,
-                        instr_id,
-                        "field_indexed_hit",
-                        "field_indexed_fallback",
-                    );
-                    self.counters.define_if_missing(
-                        CounterScope::This,
-                        "field_generic_setattr",
-                        CounterSite::Runtime {
-                            function_id: Some(self.function_id),
-                            instr_id: Some(instr_id),
-                        },
-                    );
+                    define_field_access_counter(self.counters, self.function_id, instr_id);
                 }
                 _ => {}
             }
@@ -404,21 +375,14 @@ pub fn instrument_bb_module_with_call_target_counters(
                         instr_id: Some(instr_id),
                     },
                 );
-                self.counters.define_if_missing(
+                self.counters.define_branch_counter_if_missing(
                     CounterScope::This,
-                    "operator_specialized_hit",
+                    "operator_specialized",
                     CounterSite::Runtime {
                         function_id: Some(self.function_id),
                         instr_id: Some(instr_id),
                     },
-                );
-                self.counters.define_if_missing(
-                    CounterScope::This,
-                    "operator_specialized_fallback",
-                    CounterSite::Runtime {
-                        function_id: Some(self.function_id),
-                        instr_id: Some(instr_id),
-                    },
+                    ["hit", "fallback"],
                 );
             }
             if is_getitem_specialization_candidate(expr) {
@@ -428,8 +392,7 @@ pub fn instrument_bb_module_with_call_target_counters(
                     self.function_id,
                     instr_id,
                     "getitem_hot_shapes",
-                    "getitem_specialized_hit",
-                    "getitem_specialized_fallback",
+                    "getitem_specialized",
                 );
             }
             if is_setitem_specialization_candidate(expr) {
@@ -439,8 +402,7 @@ pub fn instrument_bb_module_with_call_target_counters(
                     self.function_id,
                     instr_id,
                     "setitem_hot_shapes",
-                    "setitem_specialized_hit",
-                    "setitem_specialized_fallback",
+                    "setitem_specialized",
                 );
             }
             if let InstrCodegen::Call(call) = expr {
@@ -459,21 +421,14 @@ pub fn instrument_bb_module_with_call_target_counters(
                             instr_id: Some(instr_id),
                         },
                     );
-                    self.counters.define_if_missing(
+                    self.counters.define_branch_counter_if_missing(
                         CounterScope::This,
-                        "call_direct_hit",
+                        "call_direct",
                         CounterSite::Runtime {
                             function_id: Some(self.function_id),
                             instr_id: Some(instr_id),
                         },
-                    );
-                    self.counters.define_if_missing(
-                        CounterScope::This,
-                        "call_direct_fallback",
-                        CounterSite::Runtime {
-                            function_id: Some(self.function_id),
-                            instr_id: Some(instr_id),
-                        },
+                        ["hit", "fallback"],
                     );
                 }
             }

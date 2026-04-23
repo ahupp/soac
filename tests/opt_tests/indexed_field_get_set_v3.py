@@ -45,17 +45,20 @@ for _ in range(80):
     },
     {
         "function": "read_fields",
-        "kind": "field_indexed_hit",
+        "kind": "field_access",
+        "branch": "indexed_hit",
         "min": 2,
     },
     {
         "function": "write_fields",
-        "kind": "field_indexed_hit",
+        "kind": "field_access",
+        "branch": "indexed_hit",
         "min": 3,
     },
     {
         "function": "write_fields",
-        "kind": "field_indexed_fallback",
+        "kind": "field_access",
+        "branch": "indexed_fallback",
         "max": 0,
     },
 ]

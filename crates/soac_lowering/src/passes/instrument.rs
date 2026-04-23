@@ -1,5 +1,6 @@
 use crate::block_py::{
-    Block, BlockLabel, BlockTerm, CounterDef, CounterId, CounterScope, CounterSite, Instr,
+    Block, BlockLabel, BlockTerm, CounterBranchId, CounterDef, CounterId, CounterScope,
+    CounterSite, Instr,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -11,6 +12,22 @@ pub struct CounterHandle {
 impl CounterHandle {
     pub const fn id(self) -> CounterId {
         self.id
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CounterBranchHandle {
+    id: CounterId,
+    branch_id: CounterBranchId,
+}
+
+impl CounterBranchHandle {
+    pub const fn id(self) -> CounterId {
+        self.id
+    }
+
+    pub const fn branch_id(self) -> CounterBranchId {
+        self.branch_id
     }
 }
 
@@ -46,12 +63,25 @@ impl<'a> CounterBuilder<'a> {
             id: CounterId(self.next_id),
         };
         self.next_id += 1;
-        self.defs.push(CounterDef {
-            id: handle.id,
-            scope,
-            kind: kind.into(),
-            site,
-        });
+        self.defs
+            .push(CounterDef::scalar(handle.id, scope, kind, site));
+        handle
+    }
+
+    pub fn define_branch_counter(
+        &mut self,
+        scope: CounterScope,
+        kind: impl Into<String>,
+        site: CounterSite,
+        branches: impl IntoIterator<Item = impl Into<String>>,
+    ) -> CounterHandle {
+        let handle = CounterHandle {
+            id: CounterId(self.next_id),
+        };
+        self.next_id += 1;
+        self.defs.push(CounterDef::branch_counter(
+            handle.id, scope, kind, site, branches,
+        ));
         handle
     }
 
@@ -74,6 +104,56 @@ impl<'a> CounterBuilder<'a> {
             return CounterHandle { id: existing.id };
         }
         self.define(scope, kind, site)
+    }
+
+    pub fn define_branch_counter_if_missing(
+        &mut self,
+        scope: CounterScope,
+        kind: impl Into<String>,
+        site: CounterSite,
+        branches: impl IntoIterator<Item = impl Into<String>>,
+    ) -> CounterHandle {
+        let kind = kind.into();
+        let branches = branches
+            .into_iter()
+            .map(Into::into)
+            .collect::<Vec<String>>();
+        if let Some(existing) = self
+            .defs
+            .iter()
+            .find(|counter| counter.scope == scope && counter.kind == kind && counter.site == site)
+        {
+            let existing_branches = existing
+                .branches
+                .iter()
+                .map(|branch| branch.name.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                existing_branches,
+                branches.iter().map(String::as_str).collect::<Vec<_>>(),
+                "counter {kind:?} at {site:?} was already defined with different branches",
+            );
+            return CounterHandle { id: existing.id };
+        }
+        self.define_branch_counter(scope, kind, site, branches)
+    }
+
+    pub fn branch_handle(&self, handle: CounterHandle, branch: &str) -> CounterBranchHandle {
+        let counter = self
+            .defs
+            .iter()
+            .find(|counter| counter.id == handle.id)
+            .unwrap_or_else(|| panic!("missing counter definition for id {}", handle.id.0));
+        let branch_id = counter.branch_id(branch).unwrap_or_else(|| {
+            panic!(
+                "missing branch {branch:?} for counter {} ({})",
+                handle.id.0, counter.kind
+            )
+        });
+        CounterBranchHandle {
+            id: handle.id,
+            branch_id,
+        }
     }
 
     pub fn define_if_missing_spec(&mut self, spec: &impl CounterSpec) -> CounterHandle {
@@ -429,6 +509,7 @@ mod tests {
             scope: CounterScope::Function,
             kind: "runtime_incref".to_string(),
             site: site.clone(),
+            branches: Vec::new(),
         }];
 
         let handle = CounterBuilder::new(&mut defs).define_if_missing(

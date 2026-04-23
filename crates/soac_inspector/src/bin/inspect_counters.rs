@@ -58,6 +58,11 @@ fn print_usage() {
 }
 
 fn format_counter_row(row: &CounterDumpRowView<'_>) -> String {
+    let branches = if row.branch_values.is_empty() {
+        String::new()
+    } else {
+        format!(" branches={}", format_branch_values(row))
+    };
     let observed_value = if row.kind == "call_hot_targets" {
         row.observed_value
             .map(RuntimeFunctionId::from_packed_runtime_u64)
@@ -73,7 +78,7 @@ fn format_counter_row(row: &CounterDumpRowView<'_>) -> String {
         .map(|value| value.to_string())
         .unwrap_or_else(|| "-".to_string());
     format!(
-        "  counter={} scope={} kind={} site={} site_function_id={} current_function_id={} instr_id={} function={} block={} value={} {} max_overcount={}",
+        "  counter={} scope={} kind={} site={} site_function_id={} current_function_id={} instr_id={} function={} block={} value={}{} {} max_overcount={}",
         row.counter_id,
         row.scope,
         row.kind,
@@ -90,9 +95,18 @@ fn format_counter_row(row: &CounterDumpRowView<'_>) -> String {
         row.function_qualname.unwrap_or("-"),
         row.block_label.unwrap_or("-"),
         row.value,
+        branches,
         observed_value,
         max_overcount,
     )
+}
+
+fn format_branch_values(row: &CounterDumpRowView<'_>) -> String {
+    row.branch_values
+        .iter()
+        .map(|branch| format!("{}:{}", branch.branch, branch.value))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn build_function_qualname_map<'a>(
@@ -142,6 +156,9 @@ fn format_pretty_counter_row(
         fields.push(format!("instr={instr_id}"));
     }
     fields.push(format!("value={}", row.value));
+    if !row.branch_values.is_empty() {
+        fields.push(format!("branches={}", format_branch_values(row)));
+    }
     if let Some(observed_value) = row.observed_value {
         if row.kind == "call_hot_targets" {
             fields.push(format!(
@@ -230,6 +247,9 @@ fn main() -> Result<(), String> {
                     "function_qualname": row.function_qualname,
                     "block_label": row.block_label,
                     "value": row.value,
+                    "branches": row.branch_values.iter().map(|branch| {
+                        (branch.branch.to_string(), json!(branch.value))
+                    }).collect::<serde_json::Map<String, serde_json::Value>>(),
                     "observed_value": row.observed_value,
                     "max_overcount": row.max_overcount,
                 }));
@@ -300,8 +320,8 @@ mod tests {
     use super::{build_function_qualname_map, format_counter_row, format_pretty_counter_row};
     use soac_core::block_py::{BlockLabel, InstrId, RuntimeFunctionId};
     use soac_core::profile::{
-        CounterDumpRecord, CounterDumpRow, CounterDumpRowView, parse_counter_dump_records,
-        render_call_target_specializations,
+        CounterDumpBranchValueView, CounterDumpRecord, CounterDumpRow, CounterDumpRowView,
+        parse_counter_dump_records, render_call_target_specializations,
     };
 
     #[test]
@@ -317,6 +337,7 @@ mod tests {
             function_qualname: Some("pkg.mod.f"),
             block_label: None,
             value: 11,
+            branch_values: Vec::new(),
             observed_value: Some(12),
             max_overcount: Some(1),
         };
@@ -360,6 +381,7 @@ mod tests {
             function_qualname: None,
             block_label: None,
             value: 11,
+            branch_values: Vec::new(),
             observed_value: None,
             max_overcount: None,
         };
@@ -400,6 +422,7 @@ mod tests {
             function_qualname: Some("pkg.mod.f"),
             block_label: None,
             value: 11,
+            branch_values: Vec::new(),
             observed_value: Some(RuntimeFunctionId::from_raw_parts(1, 9).to_packed_runtime_u64()),
             max_overcount: Some(1),
         };
@@ -421,6 +444,7 @@ mod tests {
             function_qualname: Some("run"),
             block_label: Some("bb9"),
             value: 10200,
+            branch_values: Vec::new(),
             observed_value: None,
             max_overcount: Some(1),
         };
@@ -452,6 +476,7 @@ mod tests {
                 function_qualname: Some("pkg.mod.caller"),
                 block_label: None,
                 value: 11,
+                branch_values: Vec::new(),
                 observed_value: Some(
                     RuntimeFunctionId::from_raw_parts(1, 9).to_packed_runtime_u64(),
                 ),
@@ -468,6 +493,7 @@ mod tests {
                 function_qualname: Some("pkg.mod.target"),
                 block_label: None,
                 value: 1,
+                branch_values: Vec::new(),
                 observed_value: None,
                 max_overcount: None,
             },
@@ -483,6 +509,42 @@ mod tests {
         assert!(!rendered.contains("observed_function_id"), "{rendered}");
         assert!(!rendered.contains("4294967305"), "{rendered}");
         assert!(!rendered.contains("max_overcount"), "{rendered}");
+    }
+
+    #[test]
+    fn pretty_row_outputs_branch_values() {
+        let row = CounterDumpRowView {
+            counter_id: 4,
+            scope: "this",
+            kind: "operator_specialized",
+            site_kind: "runtime",
+            function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
+            current_function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
+            instr_id: Some(InstrId::new(BlockLabel::from_index(0), 0)),
+            function_qualname: Some("add"),
+            block_label: None,
+            value: 0,
+            branch_values: vec![
+                CounterDumpBranchValueView {
+                    branch: "hit",
+                    value: 3,
+                },
+                CounterDumpBranchValueView {
+                    branch: "fallback",
+                    value: 1,
+                },
+            ],
+            observed_value: None,
+            max_overcount: None,
+        };
+
+        let rows = vec![row];
+        let function_qualnames = build_function_qualname_map(rows.as_slice());
+        let rendered = format_pretty_counter_row(&rows[0], &function_qualnames);
+        assert_eq!(
+            rendered,
+            "  counter=4 kind=operator_specialized scope=this site=runtime function=add instr=bb0:0 value=0 branches=hit:3,fallback:1"
+        );
     }
 
     #[test]
@@ -506,6 +568,7 @@ mod tests {
                     function_qualname: Some("pkg.mod.f".to_string()),
                     block_label: None,
                     value: 11,
+                    branch_values: Vec::new(),
                     observed_value: Some(
                         RuntimeFunctionId::from_raw_parts(1, 9).to_packed_runtime_u64(),
                     ),
@@ -522,6 +585,7 @@ mod tests {
                     function_qualname: Some("pkg.mod.f".to_string()),
                     block_label: None,
                     value: 5,
+                    branch_values: Vec::new(),
                     observed_value: Some(
                         RuntimeFunctionId::from_raw_parts(1, 10).to_packed_runtime_u64(),
                     ),
@@ -538,6 +602,7 @@ mod tests {
                     function_qualname: Some("pkg.mod.g".to_string()),
                     block_label: None,
                     value: 4,
+                    branch_values: Vec::new(),
                     observed_value: Some(RuntimeFunctionId::global().to_packed_runtime_u64()),
                     max_overcount: Some(0),
                 },
@@ -552,6 +617,7 @@ mod tests {
                     function_qualname: Some("pkg.mod.h".to_string()),
                     block_label: None,
                     value: 4,
+                    branch_values: Vec::new(),
                     observed_value: Some(0),
                     max_overcount: Some(0),
                 },

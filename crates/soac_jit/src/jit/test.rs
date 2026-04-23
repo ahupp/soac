@@ -70,6 +70,34 @@ mod tests {
         fn PyCell_New(obj: *mut ffi::PyObject) -> *mut ffi::PyObject;
     }
 
+    fn runtime_branch_counter_for(
+        counter_defs: &[CounterDef],
+        function_id: RuntimeFunctionId,
+        instr_id: InstrId,
+        kind: &str,
+        branch: &str,
+    ) -> (CounterId, soac_core::block_py::CounterBranchId) {
+        counter_defs
+            .iter()
+            .find_map(|counter| match &counter.site {
+                CounterSite::Runtime {
+                    function_id: Some(counter_function_id),
+                    instr_id: Some(counter_instr_id),
+                } if counter.kind == kind
+                    && *counter_function_id == function_id
+                    && *counter_instr_id == instr_id =>
+                {
+                    counter
+                        .branch_id(branch)
+                        .map(|branch_id| (counter.id, branch_id))
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                panic!("missing {kind}.{branch} counter for {function_id} at {instr_id}")
+            })
+    }
+
     fn test_v3_call_body(kind: CallBodyKind) -> CallBodyPlan {
         CallBodyPlan {
             kind,
@@ -6027,6 +6055,7 @@ def build(values):
                         function_qualname: Some(function.names.qualname.clone()),
                         block_label: Some(block_label.to_string()),
                         value: *count,
+                        branch_values: Vec::new(),
                         observed_value: None,
                         max_overcount: None,
                     })
@@ -6399,63 +6428,20 @@ def write_point(point, value):
                     _ => None,
                 })
                 .expect("write_point should contain a SetAttr");
-            let field_counter_sites = lowered
-                .counter_defs
-                .iter()
-                .filter_map(|counter| match &counter.site {
-                    CounterSite::Runtime {
-                        function_id: Some(counter_function_id),
-                        instr_id: Some(counter_instr_id),
-                    } if *counter_function_id == function.function_id
-                        && counter.kind.starts_with("field_indexed") =>
-                    {
-                        Some(format!("{}@{:?}", counter.kind, counter_instr_id))
-                    }
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            let hit_counter_id = lowered
-                .counter_defs
-                .iter()
-                .find_map(|counter| match &counter.site {
-                    CounterSite::Runtime {
-                        function_id: Some(counter_function_id),
-                        instr_id: Some(counter_instr_id),
-                    } if counter.kind == "field_indexed_hit"
-                        && *counter_function_id == function.function_id
-                        && *counter_instr_id == setattr_instr_id =>
-                    {
-                        Some(counter.id)
-                    }
-                    _ => None,
-                })
-                .unwrap_or_else(|| {
-                    panic!(
-                        "missing field_indexed_hit counter for SetAttr {:?} in {:?}",
-                        setattr_instr_id, field_counter_sites
-                    )
-                });
-            let fallback_counter_id = lowered
-                .counter_defs
-                .iter()
-                .find_map(|counter| match &counter.site {
-                    CounterSite::Runtime {
-                        function_id: Some(counter_function_id),
-                        instr_id: Some(counter_instr_id),
-                    } if counter.kind == "field_indexed_fallback"
-                        && *counter_function_id == function.function_id
-                        && *counter_instr_id == setattr_instr_id =>
-                    {
-                        Some(counter.id)
-                    }
-                    _ => None,
-                })
-                .unwrap_or_else(|| {
-                    panic!(
-                        "missing field_indexed_fallback counter for SetAttr {:?} in {:?}",
-                        setattr_instr_id, field_counter_sites
-                    )
-                });
+            let (hit_counter_id, hit_branch_id) = runtime_branch_counter_for(
+                &lowered.counter_defs,
+                function.function_id,
+                setattr_instr_id,
+                "field_access",
+                "indexed_hit",
+            );
+            let (fallback_counter_id, fallback_branch_id) = runtime_branch_counter_for(
+                &lowered.counter_defs,
+                function.function_id,
+                setattr_instr_id,
+                "field_access",
+                "indexed_fallback",
+            );
 
             let shared_state =
                 crate::module_type::build_shared_state_for_testing(py, lowered, "counter_test", "")
@@ -6514,12 +6500,12 @@ def write_point(point, value):
             );
 
             assert_eq!(
-                shared_state.counter_value(hit_counter_id),
+                shared_state.counter_branch_value(hit_counter_id, hit_branch_id),
                 1,
                 "apply-mode SetAttr should take the indexed-store fast path"
             );
             assert_eq!(
-                shared_state.counter_value(fallback_counter_id),
+                shared_state.counter_branch_value(fallback_counter_id, fallback_branch_id),
                 0,
                 "apply-mode SetAttr should avoid the generic setattr fallback"
             );
@@ -6712,51 +6698,25 @@ class Record:
             let hit_counter_ids = setattr_instr_ids
                 .iter()
                 .map(|setattr_instr_id| {
-                    shared_state
-                        .lowered_module
-                        .counter_defs
-                        .iter()
-                        .find_map(|counter| match &counter.site {
-                            CounterSite::Runtime {
-                                function_id: Some(counter_function_id),
-                                instr_id: Some(counter_instr_id),
-                            } if counter.kind == "field_indexed_hit"
-                                && *counter_function_id == function.function_id
-                                && counter_instr_id == setattr_instr_id =>
-                            {
-                                Some(counter.id)
-                            }
-                            _ => None,
-                        })
-                        .unwrap_or_else(|| {
-                            panic!("missing field_indexed_hit counter for {setattr_instr_id:?}")
-                        })
+                    runtime_branch_counter_for(
+                        &shared_state.lowered_module.counter_defs,
+                        function.function_id,
+                        *setattr_instr_id,
+                        "field_access",
+                        "indexed_hit",
+                    )
                 })
                 .collect::<Vec<_>>();
             let fallback_counter_ids = setattr_instr_ids
                 .iter()
                 .map(|setattr_instr_id| {
-                    shared_state
-                        .lowered_module
-                        .counter_defs
-                        .iter()
-                        .find_map(|counter| match &counter.site {
-                            CounterSite::Runtime {
-                                function_id: Some(counter_function_id),
-                                instr_id: Some(counter_instr_id),
-                            } if counter.kind == "field_indexed_fallback"
-                                && *counter_function_id == function.function_id
-                                && counter_instr_id == setattr_instr_id =>
-                            {
-                                Some(counter.id)
-                            }
-                            _ => None,
-                        })
-                        .unwrap_or_else(|| {
-                            panic!(
-                                "missing field_indexed_fallback counter for {setattr_instr_id:?}"
-                            )
-                        })
+                    runtime_branch_counter_for(
+                        &shared_state.lowered_module.counter_defs,
+                        function.function_id,
+                        *setattr_instr_id,
+                        "field_access",
+                        "indexed_fallback",
+                    )
                 })
                 .collect::<Vec<_>>();
 
@@ -6832,16 +6792,16 @@ class Record:
             assert!(!result.is_null(), "Record.__init__ should return None");
             unsafe { ffi::Py_DECREF(result.cast::<ffi::PyObject>()) };
 
-            for counter_id in hit_counter_ids {
+            for (counter_id, branch_id) in hit_counter_ids {
                 assert_eq!(
-                    shared_state.counter_value(counter_id),
+                    shared_state.counter_branch_value(counter_id, branch_id),
                     1,
                     "constructor SetAttr should take the indexed-store fast path"
                 );
             }
-            for counter_id in fallback_counter_ids {
+            for (counter_id, branch_id) in fallback_counter_ids {
                 assert_eq!(
-                    shared_state.counter_value(counter_id),
+                    shared_state.counter_branch_value(counter_id, branch_id),
                     0,
                     "verify-mode constructor SetAttr should avoid the generic setattr fallback"
                 );
@@ -6983,63 +6943,20 @@ def read_point(point):
                 .expect("missing lowered function read_point")
                 .clone();
             let getattr_instr_id = first_getattr_instr_id(&function);
-            let field_counter_sites = lowered
-                .counter_defs
-                .iter()
-                .filter_map(|counter| match &counter.site {
-                    CounterSite::Runtime {
-                        function_id: Some(counter_function_id),
-                        instr_id: Some(counter_instr_id),
-                    } if *counter_function_id == function.function_id
-                        && counter.kind.starts_with("field_indexed") =>
-                    {
-                        Some(format!("{}@{:?}", counter.kind, counter_instr_id))
-                    }
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            let hit_counter_id = lowered
-                .counter_defs
-                .iter()
-                .find_map(|counter| match &counter.site {
-                    CounterSite::Runtime {
-                        function_id: Some(counter_function_id),
-                        instr_id: Some(counter_instr_id),
-                    } if counter.kind == "field_indexed_hit"
-                        && *counter_function_id == function.function_id
-                        && *counter_instr_id == getattr_instr_id =>
-                    {
-                        Some(counter.id)
-                    }
-                    _ => None,
-                })
-                .unwrap_or_else(|| {
-                    panic!(
-                        "missing field_indexed_hit counter for GetAttr {:?} in {:?}",
-                        getattr_instr_id, field_counter_sites
-                    )
-                });
-            let fallback_counter_id = lowered
-                .counter_defs
-                .iter()
-                .find_map(|counter| match &counter.site {
-                    CounterSite::Runtime {
-                        function_id: Some(counter_function_id),
-                        instr_id: Some(counter_instr_id),
-                    } if counter.kind == "field_indexed_fallback"
-                        && *counter_function_id == function.function_id
-                        && *counter_instr_id == getattr_instr_id =>
-                    {
-                        Some(counter.id)
-                    }
-                    _ => None,
-                })
-                .unwrap_or_else(|| {
-                    panic!(
-                        "missing field_indexed_fallback counter for GetAttr {:?} in {:?}",
-                        getattr_instr_id, field_counter_sites
-                    )
-                });
+            let (hit_counter_id, hit_branch_id) = runtime_branch_counter_for(
+                &lowered.counter_defs,
+                function.function_id,
+                getattr_instr_id,
+                "field_access",
+                "indexed_hit",
+            );
+            let (fallback_counter_id, fallback_branch_id) = runtime_branch_counter_for(
+                &lowered.counter_defs,
+                function.function_id,
+                getattr_instr_id,
+                "field_access",
+                "indexed_fallback",
+            );
 
             let shared_state =
                 crate::module_type::build_shared_state_for_testing(py, lowered, "counter_test", "")
@@ -7094,12 +7011,12 @@ def read_point(point):
             );
 
             assert_eq!(
-                shared_state.counter_value(hit_counter_id),
+                shared_state.counter_branch_value(hit_counter_id, hit_branch_id),
                 1,
                 "apply-mode GetAttr should take the indexed-load fast path"
             );
             assert_eq!(
-                shared_state.counter_value(fallback_counter_id),
+                shared_state.counter_branch_value(fallback_counter_id, fallback_branch_id),
                 0,
                 "apply-mode GetAttr should avoid the generic getattr fallback"
             );
@@ -7183,63 +7100,20 @@ def read_point(point):
                 .expect("missing lowered function read_point")
                 .clone();
             let getattr_instr_id = first_getattr_instr_id(&function);
-            let field_counter_sites = lowered
-                .counter_defs
-                .iter()
-                .filter_map(|counter| match &counter.site {
-                    CounterSite::Runtime {
-                        function_id: Some(counter_function_id),
-                        instr_id: Some(counter_instr_id),
-                    } if *counter_function_id == function.function_id
-                        && counter.kind.starts_with("field_indexed") =>
-                    {
-                        Some(format!("{}@{:?}", counter.kind, counter_instr_id))
-                    }
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            let hit_counter_id = lowered
-                .counter_defs
-                .iter()
-                .find_map(|counter| match &counter.site {
-                    CounterSite::Runtime {
-                        function_id: Some(counter_function_id),
-                        instr_id: Some(counter_instr_id),
-                    } if counter.kind == "field_indexed_hit"
-                        && *counter_function_id == function.function_id
-                        && *counter_instr_id == getattr_instr_id =>
-                    {
-                        Some(counter.id)
-                    }
-                    _ => None,
-                })
-                .unwrap_or_else(|| {
-                    panic!(
-                        "missing field_indexed_hit counter for GetAttr {:?} in {:?}",
-                        getattr_instr_id, field_counter_sites
-                    )
-                });
-            let fallback_counter_id = lowered
-                .counter_defs
-                .iter()
-                .find_map(|counter| match &counter.site {
-                    CounterSite::Runtime {
-                        function_id: Some(counter_function_id),
-                        instr_id: Some(counter_instr_id),
-                    } if counter.kind == "field_indexed_fallback"
-                        && *counter_function_id == function.function_id
-                        && *counter_instr_id == getattr_instr_id =>
-                    {
-                        Some(counter.id)
-                    }
-                    _ => None,
-                })
-                .unwrap_or_else(|| {
-                    panic!(
-                        "missing field_indexed_fallback counter for GetAttr {:?} in {:?}",
-                        getattr_instr_id, field_counter_sites
-                    )
-                });
+            let (hit_counter_id, hit_branch_id) = runtime_branch_counter_for(
+                &lowered.counter_defs,
+                function.function_id,
+                getattr_instr_id,
+                "field_access",
+                "indexed_hit",
+            );
+            let (fallback_counter_id, fallback_branch_id) = runtime_branch_counter_for(
+                &lowered.counter_defs,
+                function.function_id,
+                getattr_instr_id,
+                "field_access",
+                "indexed_fallback",
+            );
 
             let shared_state =
                 crate::module_type::build_shared_state_for_testing(py, lowered, module_name, "")
@@ -7352,12 +7226,12 @@ def read_point(point):
             );
 
             assert_eq!(
-                shared_state.counter_value(hit_counter_id),
+                shared_state.counter_branch_value(hit_counter_id, hit_branch_id),
                 1,
                 "v3 indexed GetAttr used as a store RHS should take the fast path"
             );
             assert_eq!(
-                shared_state.counter_value(fallback_counter_id),
+                shared_state.counter_branch_value(fallback_counter_id, fallback_branch_id),
                 0,
                 "v3 indexed GetAttr used as a store RHS should avoid generic getattr"
             );
@@ -15457,6 +15331,7 @@ def f(x):
                         function_qualname: Some(function.names.qualname.clone()),
                         block_label: None,
                         value: 1,
+                        branch_values: Vec::new(),
                         observed_value: Some(soac_opt::operator_specialization::pack_binary_shape(
                             soac_opt::operator_specialization::ExactTypeTag::Int,
                             soac_opt::operator_specialization::ExactTypeTag::Int,
@@ -17488,38 +17363,28 @@ def f(x):
             CounterDef {
                 id: CounterId(0),
                 scope: CounterScope::This,
-                kind: "global_indexed_hit".to_string(),
+                kind: "global_indexed".to_string(),
                 site: CounterSite::Runtime {
                     function_id: Some(function.function_id),
                     instr_id: Some(load_source),
                 },
+                branches: vec![
+                    soac_core::block_py::CounterBranch::new("hit"),
+                    soac_core::block_py::CounterBranch::new("fallback"),
+                ],
             },
             CounterDef {
                 id: CounterId(1),
                 scope: CounterScope::This,
-                kind: "global_indexed_hit".to_string(),
+                kind: "global_indexed".to_string(),
                 site: CounterSite::Runtime {
                     function_id: Some(function.function_id),
                     instr_id: Some(store_source),
                 },
-            },
-            CounterDef {
-                id: CounterId(2),
-                scope: CounterScope::This,
-                kind: "global_indexed_fallback".to_string(),
-                site: CounterSite::Runtime {
-                    function_id: Some(function.function_id),
-                    instr_id: Some(load_source),
-                },
-            },
-            CounterDef {
-                id: CounterId(3),
-                scope: CounterScope::This,
-                kind: "global_indexed_fallback".to_string(),
-                site: CounterSite::Runtime {
-                    function_id: Some(function.function_id),
-                    instr_id: Some(store_source),
-                },
+                branches: vec![
+                    soac_core::block_py::CounterBranch::new("hit"),
+                    soac_core::block_py::CounterBranch::new("fallback"),
+                ],
             },
         ]);
         let module_constants =
@@ -17948,49 +17813,27 @@ def write_point(point, value):
                 "v3 indexed SetAttr should not be converted into legacy field evidence"
             );
 
-            let counter_id_for = |kind: &str| {
-                let field_counter_sites = shared_state
-                    .lowered_module
-                    .counter_defs
-                    .iter()
-                    .filter_map(|counter| match &counter.site {
-                        CounterSite::Runtime {
-                            function_id: Some(counter_function_id),
-                            instr_id: Some(counter_instr_id),
-                        } if *counter_function_id == function.function_id
-                            && counter.kind.starts_with("field_") =>
-                        {
-                            Some(format!("{}@{:?}", counter.kind, counter_instr_id))
-                        }
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>();
-                shared_state
-                    .lowered_module
-                    .counter_defs
-                    .iter()
-                    .find_map(|counter| match &counter.site {
-                        CounterSite::Runtime {
-                            function_id: Some(counter_function_id),
-                            instr_id: Some(counter_instr_id),
-                        } if counter.kind == kind
-                            && *counter_function_id == function.function_id
-                            && *counter_instr_id == setattr_instr_id =>
-                        {
-                            Some(counter.id)
-                        }
-                        _ => None,
-                    })
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "missing {kind} counter for SetAttr {:?} in {:?}",
-                            setattr_instr_id, field_counter_sites
-                        )
-                    })
-            };
-            let hit_counter_id = counter_id_for("field_indexed_hit");
-            let fallback_counter_id = counter_id_for("field_indexed_fallback");
-            let generic_counter_id = counter_id_for("field_generic_setattr");
+            let (hit_counter_id, hit_branch_id) = runtime_branch_counter_for(
+                &shared_state.lowered_module.counter_defs,
+                function.function_id,
+                setattr_instr_id,
+                "field_access",
+                "indexed_hit",
+            );
+            let (fallback_counter_id, fallback_branch_id) = runtime_branch_counter_for(
+                &shared_state.lowered_module.counter_defs,
+                function.function_id,
+                setattr_instr_id,
+                "field_access",
+                "indexed_fallback",
+            );
+            let (generic_counter_id, generic_branch_id) = runtime_branch_counter_for(
+                &shared_state.lowered_module.counter_defs,
+                function.function_id,
+                setattr_instr_id,
+                "field_access",
+                "generic_setattr",
+            );
 
             let runtime = unsafe { build_test_module_runtime(py, shared_state.clone()) };
             let module_constant_ptrs = shared_state.module_constant_ptrs();
@@ -18046,17 +17889,17 @@ def write_point(point, value):
             );
 
             assert_eq!(
-                shared_state.counter_value(hit_counter_id),
+                shared_state.counter_branch_value(hit_counter_id, hit_branch_id),
                 1,
                 "strict v3 SetAttr should take the indexed-store fast path"
             );
             assert_eq!(
-                shared_state.counter_value(fallback_counter_id),
+                shared_state.counter_branch_value(fallback_counter_id, fallback_branch_id),
                 0,
                 "strict v3 SetAttr should avoid selected indexed fallback"
             );
             assert_eq!(
-                shared_state.counter_value(generic_counter_id),
+                shared_state.counter_branch_value(generic_counter_id, generic_branch_id),
                 0,
                 "strict v3 SetAttr should avoid the generic setattr path"
             );
@@ -18483,6 +18326,7 @@ def write_point(point, value):
                         function_qualname: Some(function.names.qualname.clone()),
                         block_label: None,
                         value: 1,
+                        branch_values: Vec::new(),
                         observed_value: Some(soac_opt::operator_specialization::pack_binary_shape(
                             soac_opt::operator_specialization::ExactTypeTag::Int,
                             soac_opt::operator_specialization::ExactTypeTag::Int,
@@ -18706,6 +18550,7 @@ def write_point(point, value):
                         function_qualname: Some(function.names.qualname.clone()),
                         block_label: None,
                         value: 1,
+                        branch_values: Vec::new(),
                         observed_value: Some(soac_opt::operator_specialization::pack_binary_shape(
                             soac_opt::operator_specialization::ExactTypeTag::Int,
                             soac_opt::operator_specialization::ExactTypeTag::Int,
@@ -18893,6 +18738,7 @@ def write_point(point, value):
                         function_qualname: Some(function.names.qualname.clone()),
                         block_label: None,
                         value: 1,
+                        branch_values: Vec::new(),
                         observed_value: Some(soac_opt::operator_specialization::pack_unary_shape(
                             soac_opt::operator_specialization::ExactTypeTag::Int,
                         )),
@@ -20000,6 +19846,7 @@ def f(x, y):
                     function_qualname: Some(caller_function.names.qualname.clone()),
                     block_label: None,
                     value: 1,
+                    branch_values: Vec::new(),
                     observed_value: Some(callee_function.function_id.to_packed_runtime_u64()),
                     max_overcount: Some(0),
                 }],
@@ -20251,6 +20098,7 @@ def f(x, y):
                     function_qualname: Some(caller_function.names.qualname.clone()),
                     block_label: None,
                     value: 1,
+                    branch_values: Vec::new(),
                     observed_value: Some(method_function.function_id.to_packed_runtime_u64()),
                     max_overcount: Some(0),
                 }],
@@ -20556,6 +20404,7 @@ def f(x, y):
                         function_qualname: Some(caller_function.names.qualname.clone()),
                         block_label: None,
                         value: 1,
+                        branch_values: Vec::new(),
                         observed_value: Some(method_function.function_id.to_packed_runtime_u64()),
                         max_overcount: Some(0),
                     }],
@@ -20856,6 +20705,7 @@ def f(x, y):
                         function_qualname: Some(caller_function.names.qualname.clone()),
                         block_label: None,
                         value: 1,
+                        branch_values: Vec::new(),
                         observed_value: Some(callee_function.function_id.to_packed_runtime_u64()),
                         max_overcount: Some(0),
                     }],
@@ -22768,6 +22618,7 @@ def f(x, y):
                             function_qualname: Some(caller_function.names.qualname.clone()),
                             block_label: None,
                             value: 1,
+                            branch_values: Vec::new(),
                             observed_value: Some(init_function.function_id.to_packed_runtime_u64()),
                             max_overcount: Some(0),
                         }],

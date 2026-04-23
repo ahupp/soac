@@ -708,6 +708,7 @@ mod tests {
             function_qualname: Some("f".to_string()),
             block_label: Some("bb0".to_string()),
             value,
+            branch_values: Vec::new(),
             observed_value,
             max_overcount: None,
         }

@@ -28,12 +28,14 @@ for _ in range(80):
     },
     {
         "function": "set_get_global",
-        "kind": "global_indexed_hit",
+        "kind": "global_indexed",
+        "branch": "hit",
         "min": 2,
     },
     {
         "function": "set_get_global",
-        "kind": "global_indexed_fallback",
+        "kind": "global_indexed",
+        "branch": "fallback",
         "max": 0,
     },
 ]

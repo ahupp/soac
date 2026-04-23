@@ -48,7 +48,10 @@ mod param_specs;
 mod pretty;
 mod scope;
 mod visit;
-pub use counters::{CounterDef, CounterId, CounterScope, CounterSite, DeoptEntrySource};
+pub use counters::{
+    CounterBranch, CounterBranchId, CounterDef, CounterId, CounterScope, CounterSite,
+    DeoptEntrySource,
+};
 pub use name_gen::{
     BlockLabel, FunctionNameGen, LocalFunctionId, ModuleContentId, ModuleNameGen,
     PersistentFunctionId, RuntimeFunctionId, RuntimeModuleId, SerializedFunctionDebugName,

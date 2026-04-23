@@ -27,22 +27,26 @@ for _ in range(80):
     },
     {
         "function": "list_get_set",
-        "kind": "getitem_specialized_hit",
+        "kind": "getitem_specialized",
+        "branch": "hit",
         "min": 1,
     },
     {
         "function": "list_get_set",
-        "kind": "setitem_specialized_hit",
+        "kind": "setitem_specialized",
+        "branch": "hit",
         "min": 1,
     },
     {
         "function": "list_get_set",
-        "kind": "getitem_specialized_fallback",
+        "kind": "getitem_specialized",
+        "branch": "fallback",
         "max": 0,
     },
     {
         "function": "list_get_set",
-        "kind": "setitem_specialized_fallback",
+        "kind": "setitem_specialized",
+        "branch": "fallback",
         "max": 0,
     },
 ]

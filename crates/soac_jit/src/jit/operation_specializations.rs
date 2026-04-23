@@ -354,8 +354,8 @@ fn emit_exact_list_item_getitem_from_plan<'fb>(
     state: &mut impl OperationEmitState<'fb, InstrCodegen>,
     arg_values: &[(ir::Value, bool)],
     plan: ExactListItemLoweringPlan,
-    specialized_hit_counter_id: Option<CounterId>,
-    specialized_fallback_counter_id: Option<CounterId>,
+    specialized_hit_counter_id: Option<super::CounterRef>,
+    specialized_fallback_counter_id: Option<super::CounterRef>,
 ) -> ir::Value {
     plan.expect_exact_list_exact_int(ExactListItemAccessKind::Get);
     emit_exact_list_exact_int_getitem(
@@ -371,8 +371,8 @@ fn emit_exact_list_item_setitem_from_plan<'fb>(
     state: &mut impl OperationEmitState<'fb, InstrCodegen>,
     arg_values: &[(ir::Value, bool)],
     plan: ExactListItemLoweringPlan,
-    specialized_hit_counter_id: Option<CounterId>,
-    specialized_fallback_counter_id: Option<CounterId>,
+    specialized_hit_counter_id: Option<super::CounterRef>,
+    specialized_fallback_counter_id: Option<super::CounterRef>,
 ) -> ir::Value {
     plan.expect_exact_list_exact_int(ExactListItemAccessKind::Set);
     emit_exact_list_exact_int_setitem(
@@ -563,8 +563,8 @@ fn emit_exact_list_exact_int_getitem<'fb>(
     state: &mut impl OperationEmitState<'fb, InstrCodegen>,
     arg_values: &[(ir::Value, bool)],
     plan: ExactListItemLoweringPlan,
-    specialized_hit_counter_id: Option<CounterId>,
-    specialized_fallback_counter_id: Option<CounterId>,
+    specialized_hit_counter_id: Option<super::CounterRef>,
+    specialized_fallback_counter_id: Option<super::CounterRef>,
 ) -> ir::Value {
     let Some(list_type) =
         state.emit_type_ptr_value(&RelocTypeRef::CpythonTypeSymbol(CpythonTypeSymbol::List))
@@ -640,8 +640,8 @@ fn emit_exact_list_exact_int_setitem<'fb>(
     state: &mut impl OperationEmitState<'fb, InstrCodegen>,
     arg_values: &[(ir::Value, bool)],
     plan: ExactListItemLoweringPlan,
-    specialized_hit_counter_id: Option<CounterId>,
-    specialized_fallback_counter_id: Option<CounterId>,
+    specialized_hit_counter_id: Option<super::CounterRef>,
+    specialized_fallback_counter_id: Option<super::CounterRef>,
 ) -> ir::Value {
     debug_assert_eq!(arg_values.len(), 3);
     let Some(list_type) =

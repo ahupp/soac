@@ -103,6 +103,9 @@ fn inspect_counter_dump_json(path: &str) -> PyResult<String> {
                 "function_qualname": row.function_qualname,
                 "block_label": row.block_label,
                 "value": row.value,
+                "branches": row.branch_values.iter().map(|branch| {
+                    (branch.branch.to_string(), json!(branch.value))
+                }).collect::<serde_json::Map<String, serde_json::Value>>(),
                 "observed_value": row.observed_value,
                 "max_overcount": row.max_overcount,
             }));

@@ -13,8 +13,8 @@ use soac_core::block_py::{
     DeoptEntrySource, FunctionExecutionMode, RuntimeFunctionId, RuntimeName,
 };
 use soac_core::profile::{
-    CounterDumpKeyLayout, CounterDumpRecord, CounterDumpRow, CounterDumpTypeKey,
-    CounterDumpTypeKeyLayout, CounterDumpTypeTableEntry,
+    CounterDumpBranchValue, CounterDumpKeyLayout, CounterDumpRecord, CounterDumpRow,
+    CounterDumpTypeKey, CounterDumpTypeKeyLayout, CounterDumpTypeTableEntry,
 };
 use soac_driver::codegen_cache::PythonModuleCacheSource;
 use soac_lowering::passes::{
@@ -89,6 +89,7 @@ enum CounterStorageKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CounterRuntimeSlot {
     Scalar(usize),
+    Branches { start: usize, len: usize },
     TopValues(usize),
 }
 
@@ -232,7 +233,34 @@ impl SharedModuleState {
             CounterRuntimeSlot::Scalar(slot) => {
                 self.counter_values.get(slot).copied().unwrap_or_default()
             }
+            CounterRuntimeSlot::Branches { start, len } => self
+                .counter_values
+                .get(start..start.saturating_add(len))
+                .unwrap_or_default()
+                .iter()
+                .copied()
+                .sum(),
             CounterRuntimeSlot::TopValues(_) => 0,
+        }
+    }
+
+    pub fn counter_branch_value(
+        &self,
+        counter_id: CounterId,
+        branch_id: soac_core::block_py::CounterBranchId,
+    ) -> u64 {
+        let Some(slot) = self.counter_slots_by_id.get(counter_id.0).copied() else {
+            return 0;
+        };
+        match slot {
+            CounterRuntimeSlot::Branches { start, len } if branch_id.0 < len => self
+                .counter_values
+                .get(start + branch_id.0)
+                .copied()
+                .unwrap_or_default(),
+            CounterRuntimeSlot::Scalar(_)
+            | CounterRuntimeSlot::Branches { .. }
+            | CounterRuntimeSlot::TopValues(_) => 0,
         }
     }
 
@@ -351,28 +379,33 @@ impl SharedModuleState {
         }
         for counter in &self.lowered_module.counter_defs {
             let kind = counter.kind.as_str();
-            if !matches!(
+            let is_specialization_counter = matches!(
                 kind,
-                "global_indexed_hit"
-                    | "global_indexed_fallback"
-                    | "field_indexed_hit"
-                    | "field_indexed_fallback"
-                    | "field_generic_getattr"
-                    | "field_generic_setattr"
-                    | "operator_specialized_hit"
-                    | "operator_specialized_fallback"
-                    | "getitem_specialized_hit"
-                    | "getitem_specialized_fallback"
-                    | "setitem_specialized_hit"
-                    | "setitem_specialized_fallback"
-                    | "call_direct_hit"
-                    | "call_direct_fallback"
+                "global_indexed"
+                    | "field_access"
+                    | "operator_specialized"
+                    | "getitem_specialized"
+                    | "setitem_specialized"
+                    | "call_direct"
                     | "deopt_entry_guard_miss"
-            ) {
+            );
+            if !is_specialization_counter {
                 continue;
             }
-            let value = self.counter_value(counter.id);
-            if value == 0 {
+            let branch_values = counter
+                .branches
+                .iter()
+                .enumerate()
+                .filter_map(|(branch_index, branch)| {
+                    let value = self.counter_branch_value(
+                        counter.id,
+                        soac_core::block_py::CounterBranchId(branch_index),
+                    );
+                    (value > 0).then_some((branch.name.as_str(), value))
+                })
+                .collect::<Vec<_>>();
+            let scalar_value = self.counter_value(counter.id);
+            if scalar_value == 0 && branch_values.is_empty() {
                 continue;
             }
             let (function_id, instr_id, function_qualname, block_label) = match &counter.site {
@@ -411,20 +444,40 @@ impl SharedModuleState {
                     String::new(),
                 ),
             };
-            info!(
-                target: "soac_specialization_runtime",
-                event = "soac.specialization_runtime",
-                module_name = self.module_name,
-                package_name = self.package_name,
-                kind,
-                scope = counter_scope_name(counter.scope),
-                function_id,
-                function_qualname,
-                instr_id,
-                block_label,
-                value,
-                "specialization_runtime",
-            );
+            if branch_values.is_empty() {
+                info!(
+                    target: "soac_specialization_runtime",
+                    event = "soac.specialization_runtime",
+                    module_name = self.module_name,
+                    package_name = self.package_name,
+                    kind,
+                    scope = counter_scope_name(counter.scope),
+                    function_id,
+                    function_qualname,
+                    instr_id,
+                    block_label,
+                    value = scalar_value,
+                    "specialization_runtime",
+                );
+            } else {
+                for (branch, value) in branch_values {
+                    info!(
+                        target: "soac_specialization_runtime",
+                        event = "soac.specialization_runtime",
+                        module_name = self.module_name,
+                        package_name = self.package_name,
+                        kind,
+                        branch,
+                        scope = counter_scope_name(counter.scope),
+                        function_id,
+                        function_qualname,
+                        instr_id,
+                        block_label,
+                        value,
+                        "specialization_runtime",
+                    );
+                }
+            }
         }
     }
 
@@ -497,6 +550,7 @@ impl SharedModuleState {
                 function_qualname,
                 block_label,
                 value: 0,
+                branch_values: Vec::new(),
                 observed_value: None,
                 max_overcount: None,
             };
@@ -518,7 +572,23 @@ impl SharedModuleState {
                 }
             } else {
                 let mut row = base_row;
-                row.value = self.counter_value(counter.id);
+                if counter.is_branch_counter() {
+                    row.branch_values = counter
+                        .branches
+                        .iter()
+                        .enumerate()
+                        .map(|(branch_index, branch)| CounterDumpBranchValue {
+                            branch: branch.name.clone(),
+                            value: self.counter_branch_value(
+                                counter.id,
+                                soac_core::block_py::CounterBranchId(branch_index),
+                            ),
+                        })
+                        .collect();
+                    row.value = row.branch_values.iter().map(|branch| branch.value).sum();
+                } else {
+                    row.value = self.counter_value(counter.id);
+                }
                 rows.push(row);
             }
         }
@@ -655,6 +725,7 @@ pub(crate) fn build_counter_storage_layout(
     let mut slots_by_id = vec![None; counter_defs.len()];
     let mut scalar_slot_by_key = HashMap::new();
     let mut top_values_slot_by_key = HashMap::new();
+    let mut scalar_slot_count = 0usize;
     for counter in counter_defs {
         if counter.id.0 >= slots_by_id.len() {
             return Err(format!(
@@ -664,6 +735,12 @@ pub(crate) fn build_counter_storage_layout(
             ));
         }
         let key = counter_storage_key(counter)?;
+        if counter.is_branch_counter() && counter_uses_call_target_storage(counter) {
+            return Err(format!(
+                "counter {} ({}) cannot use both branch and top-value storage",
+                counter.id.0, counter.kind
+            ));
+        }
         let slot = if counter_uses_call_target_storage(counter) {
             let slot = if let Some(slot) = top_values_slot_by_key.get(&key).copied() {
                 slot
@@ -673,12 +750,26 @@ pub(crate) fn build_counter_storage_layout(
                 slot
             };
             CounterRuntimeSlot::TopValues(slot)
+        } else if counter.is_branch_counter() {
+            let start = if let Some(start) = scalar_slot_by_key.get(&key).copied() {
+                start
+            } else {
+                let start = scalar_slot_count;
+                scalar_slot_by_key.insert(key, start);
+                scalar_slot_count += counter.branches.len();
+                start
+            };
+            CounterRuntimeSlot::Branches {
+                start,
+                len: counter.branches.len(),
+            }
         } else {
             let slot = if let Some(slot) = scalar_slot_by_key.get(&key).copied() {
                 slot
             } else {
-                let slot = scalar_slot_by_key.len();
+                let slot = scalar_slot_count;
                 scalar_slot_by_key.insert(key, slot);
+                scalar_slot_count += 1;
                 slot
             };
             CounterRuntimeSlot::Scalar(slot)
@@ -691,7 +782,7 @@ pub(crate) fn build_counter_storage_layout(
             .map(|slot| slot.expect("every counter id should map to a runtime counter slot"))
             .collect::<Vec<_>>()
             .into_boxed_slice(),
-        scalar_slot_by_key.len(),
+        scalar_slot_count,
         top_values_slot_by_key.len(),
     ))
 }
@@ -1755,6 +1846,7 @@ def f(x):
                     block_label: entry_label,
                 },
             },
+            branches: Vec::new(),
         });
 
         let shared_state = SharedModuleState {
@@ -1807,6 +1899,7 @@ def f(x):
                     function_id: Some(RuntimeFunctionId::from_raw_parts(0, 7)),
                     instr_id: None,
                 },
+                branches: Vec::new(),
             },
             CounterDef {
                 id: CounterId(1),
@@ -1816,6 +1909,7 @@ def f(x):
                     function_id: Some(RuntimeFunctionId::from_raw_parts(0, 7)),
                     instr_id: None,
                 },
+                branches: Vec::new(),
             },
             CounterDef {
                 id: CounterId(2),
@@ -1825,6 +1919,7 @@ def f(x):
                     function_id: None,
                     instr_id: None,
                 },
+                branches: Vec::new(),
             },
             CounterDef {
                 id: CounterId(3),
@@ -1834,6 +1929,7 @@ def f(x):
                     function_id: None,
                     instr_id: None,
                 },
+                branches: Vec::new(),
             },
             CounterDef {
                 id: CounterId(4),
@@ -1843,6 +1939,7 @@ def f(x):
                     function_id: RuntimeFunctionId::from_raw_parts(0, 7),
                     block_label: soac_core::block_py::BlockLabel::from_index(0),
                 },
+                branches: Vec::new(),
             },
         ];
 
@@ -1855,6 +1952,33 @@ def f(x):
         assert_ne!(slots_by_id[0], slots_by_id[2]);
         assert_ne!(slots_by_id[0], slots_by_id[4]);
         assert_ne!(slots_by_id[2], slots_by_id[4]);
+    }
+
+    #[test]
+    fn branch_counter_storage_uses_one_counter_id_with_named_slots() {
+        let counter_defs = vec![CounterDef {
+            id: CounterId(0),
+            scope: CounterScope::This,
+            kind: "call_direct".to_string(),
+            site: CounterSite::Runtime {
+                function_id: Some(RuntimeFunctionId::from_raw_parts(0, 7)),
+                instr_id: None,
+            },
+            branches: vec![
+                soac_core::block_py::CounterBranch::new("hit"),
+                soac_core::block_py::CounterBranch::new("fallback"),
+            ],
+        }];
+
+        let (slots_by_id, counter_values, top_value_counters) =
+            build_counter_storage(&counter_defs).expect("counter storage should build");
+
+        assert_eq!(counter_values.len(), 2);
+        assert!(top_value_counters.is_empty());
+        assert_eq!(
+            slots_by_id[0],
+            CounterRuntimeSlot::Branches { start: 0, len: 2 }
+        );
     }
 
     #[test]

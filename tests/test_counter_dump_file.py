@@ -58,6 +58,10 @@ def _decide_optimizations_for_env(work_dir, *, mode="v3"):
     return decide_optimizations_for_work_dir(work_dir, mode=mode)
 
 
+def _counter_branch(row, branch):
+    return row.get("branches", {}).get(branch, 0)
+
+
 def _import_and_run_script(module_root, import_stmt, body):
     body_lines = textwrap.dedent(body).strip().splitlines()
     return "\n".join(
@@ -252,12 +256,18 @@ def write_and_read(value):
         for row in record["rows"]:
             if row["function_qualname"] != "write_and_read":
                 continue
-            by_kind[row["kind"]] = by_kind.get(row["kind"], 0) + row["value"]
+            if row["kind"] == "field_access":
+                for branch, value in row["branches"].items():
+                    by_kind[f"field_access.{branch}"] = (
+                        by_kind.get(f"field_access.{branch}", 0) + value
+                    )
+            else:
+                by_kind[row["kind"]] = by_kind.get(row["kind"], 0) + row["value"]
 
-    assert by_kind["field_generic_getattr"] >= 5, profile
-    assert by_kind["field_generic_setattr"] >= 5, profile
-    assert by_kind.get("field_indexed_hit", 0) == 0, profile
-    assert by_kind.get("field_indexed_fallback", 0) == 0, profile
+    assert by_kind["field_access.generic_getattr"] >= 5, profile
+    assert by_kind["field_access.generic_setattr"] >= 5, profile
+    assert by_kind.get("field_access.indexed_hit", 0) == 0, profile
+    assert by_kind.get("field_access.indexed_fallback", 0) == 0, profile
 
 
 def test_module_load_event_is_written_to_soac_log_json(tmp_path):
@@ -544,18 +554,18 @@ def run_case():
     verify_dump_path = work_dir / "verify.bin"
     verify = _inspect_counter_dump_json(verify_dump_path)
     hit_count = sum(
-        row["value"]
+        _counter_branch(row, "hit")
         for record in verify["records"]
         if record["module_name"] == "getitem_specialization_case"
         for row in record["rows"]
-        if row["kind"] == "getitem_specialized_hit"
+        if row["kind"] == "getitem_specialized"
     )
     fallback_count = sum(
-        row["value"]
+        _counter_branch(row, "fallback")
         for record in verify["records"]
         if record["module_name"] == "getitem_specialization_case"
         for row in record["rows"]
-        if row["kind"] == "getitem_specialized_fallback"
+        if row["kind"] == "getitem_specialized"
     )
     assert hit_count >= 2, verify
     assert fallback_count >= 1, verify
@@ -621,18 +631,18 @@ def run_case():
     verify_dump_path = work_dir / "verify.bin"
     verify = _inspect_counter_dump_json(verify_dump_path)
     hit_count = sum(
-        row["value"]
+        _counter_branch(row, "hit")
         for record in verify["records"]
         if record["module_name"] == "setitem_specialization_case"
         for row in record["rows"]
-        if row["kind"] == "setitem_specialized_hit"
+        if row["kind"] == "setitem_specialized"
     )
     fallback_count = sum(
-        row["value"]
+        _counter_branch(row, "fallback")
         for record in verify["records"]
         if record["module_name"] == "setitem_specialization_case"
         for row in record["rows"]
-        if row["kind"] == "setitem_specialized_fallback"
+        if row["kind"] == "setitem_specialized"
     )
     assert hit_count >= 2, verify
     assert fallback_count >= 1, verify
@@ -748,7 +758,7 @@ def write_field():
         for record in verify["records"]
         if record["module_name"] == "field_user_case"
         for row in record["rows"]
-        if row["kind"] == "field_indexed_hit" and row["value"] > 0
+        if row["kind"] == "field_access" and _counter_branch(row, "indexed_hit") > 0
     ]
     assert field_hits, verify
     hit_counts_by_function = {}
@@ -836,14 +846,14 @@ def run():
         if record["module_name"] != module_name:
             continue
         for row in record["rows"]:
-            if row["kind"] == "field_indexed_hit":
+            if row["kind"] == "field_access":
                 hit_values_by_function[row["function_qualname"]] = (
-                    hit_values_by_function.get(row["function_qualname"], 0) + row["value"]
+                    hit_values_by_function.get(row["function_qualname"], 0)
+                    + _counter_branch(row, "indexed_hit")
                 )
-            elif row["kind"] == "field_indexed_fallback":
                 fallback_values_by_function[row["function_qualname"]] = (
                     fallback_values_by_function.get(row["function_qualname"], 0)
-                    + row["value"]
+                    + _counter_branch(row, "indexed_fallback")
                 )
 
     assert hit_values_by_function["run"] >= 4, verify

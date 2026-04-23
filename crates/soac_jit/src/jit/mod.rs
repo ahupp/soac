@@ -35,11 +35,11 @@ use soac_core::block_py as blockpy_intrinsics;
 use soac_core::block_py::{
     AbruptKind, Block, BlockArg, BlockEdge, BlockLabel, BlockParamRole, BlockPyFunction,
     BlockPyModule, BlockTerm, CallArgKeyword, CallArgPositional, CallableScopeKind, CellLocation,
-    ChildVisitable, CounterDef, CounterId, CounterScope, CounterSite, Del, DeoptEntrySource,
-    FunctionExecutionMode, FunctionKind, HasMeta, HasSemanticInstrId, InstrId, InstrKey,
-    LocalFunctionId, LocalLocation, ModuleContentId, NameLocation, ParamKind, PersistentFunctionId,
-    ResolvedName, RuntimeFunctionId, RuntimeModuleId, RuntimeName, SerializedFunctionId,
-    StorageLayout, Store, Visit, VisitMut, WithMeta,
+    ChildVisitable, CounterBranchId, CounterDef, CounterId, CounterScope, CounterSite, Del,
+    DeoptEntrySource, FunctionExecutionMode, FunctionKind, HasMeta, HasSemanticInstrId, InstrId,
+    InstrKey, LocalFunctionId, LocalLocation, ModuleContentId, NameLocation, ParamKind,
+    PersistentFunctionId, ResolvedName, RuntimeFunctionId, RuntimeModuleId, RuntimeName,
+    SerializedFunctionId, StorageLayout, Store, Visit, VisitMut, WithMeta,
 };
 use soac_core::profile::{
     CollectedTypeKeyLayout, CounterDumpTypeKey, read_block_entry_counts_from_file,
@@ -6257,16 +6257,16 @@ fn emit_cell_value_load_from_raw_cell(
 fn emit_optional_counter_increment_for_kind(
     fb: &mut FunctionBuilder<'_>,
     ctx: &JitEmitCtx<'_>,
-    counters: &HashMap<InstrId, CounterId>,
+    counters: &HashMap<InstrId, CounterRef>,
     instr_id: InstrId,
 ) {
-    if let Some(counter_id) = counters.get(&instr_id).copied() {
-        let counter_slot = scalar_counter_slot_for_id(ctx.counter_slots_by_id, counter_id)
+    if let Some(counter_ref) = counters.get(&instr_id).copied() {
+        let counter_slot = scalar_counter_slot_for_ref(ctx.counter_slots_by_id, counter_ref)
             .unwrap_or_else(|err| panic!("{err}"));
         let scalar_counter_base_value = ctx.consts.scalar_counter_base_value.unwrap_or_else(|| {
             panic!(
                 "missing scalar counter base for counter id {}",
-                counter_id.0
+                counter_ref.counter_id.0
             )
         });
         emit_increment_counter_slot(fb, scalar_counter_base_value, counter_slot);
@@ -7194,28 +7194,28 @@ struct JitEmitCtx<'mc> {
     call_target_counter_ids: &'mc HashMap<InstrId, CounterId>,
     direct_owner_attr_specializations:
         Option<&'mc HashMap<DirectOwnerAttrKey, Vec<DirectOwnerAttrSpecialization>>>,
-    call_direct_hit_counter_ids: &'mc HashMap<InstrId, CounterId>,
-    call_direct_fallback_counter_ids: &'mc HashMap<InstrId, CounterId>,
+    call_direct_hit_counter_ids: &'mc HashMap<InstrId, CounterRef>,
+    call_direct_fallback_counter_ids: &'mc HashMap<InstrId, CounterRef>,
     operator_shape_counter_ids: &'mc HashMap<InstrId, CounterId>,
-    operator_specialized_hit_counter_ids: &'mc HashMap<InstrId, CounterId>,
-    operator_specialized_fallback_counter_ids: &'mc HashMap<InstrId, CounterId>,
+    operator_specialized_hit_counter_ids: &'mc HashMap<InstrId, CounterRef>,
+    operator_specialized_fallback_counter_ids: &'mc HashMap<InstrId, CounterRef>,
     opt_v3_exact_int_branch_artifacts: Option<Arc<ExactIntBranchV3Artifacts>>,
     getitem_shape_counter_ids: &'mc HashMap<InstrId, CounterId>,
-    getitem_specialized_hit_counter_ids: &'mc HashMap<InstrId, CounterId>,
-    getitem_specialized_fallback_counter_ids: &'mc HashMap<InstrId, CounterId>,
+    getitem_specialized_hit_counter_ids: &'mc HashMap<InstrId, CounterRef>,
+    getitem_specialized_fallback_counter_ids: &'mc HashMap<InstrId, CounterRef>,
     setitem_shape_counter_ids: &'mc HashMap<InstrId, CounterId>,
-    setitem_specialized_hit_counter_ids: &'mc HashMap<InstrId, CounterId>,
-    setitem_specialized_fallback_counter_ids: &'mc HashMap<InstrId, CounterId>,
+    setitem_specialized_hit_counter_ids: &'mc HashMap<InstrId, CounterRef>,
+    setitem_specialized_fallback_counter_ids: &'mc HashMap<InstrId, CounterRef>,
     opt_v3_exact_list_items_by_instr: &'mc HashMap<InstrId, OptV3ExactListItemAccessPlan>,
     branch_outcome_counter_ids: &'mc HashMap<InstrId, CounterId>,
-    global_indexed_hit_counter_ids: &'mc HashMap<InstrId, CounterId>,
-    global_indexed_fallback_counter_ids: &'mc HashMap<InstrId, CounterId>,
+    global_indexed_hit_counter_ids: &'mc HashMap<InstrId, CounterRef>,
+    global_indexed_fallback_counter_ids: &'mc HashMap<InstrId, CounterRef>,
     opt_v3_indexed_globals_by_instr: &'mc HashMap<InstrId, OptV3IndexedGlobalAccessPlan>,
     opt_v3_indexed_fields_by_instr: &'mc HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>,
-    field_indexed_hit_counter_ids: &'mc HashMap<InstrId, CounterId>,
-    field_indexed_fallback_counter_ids: &'mc HashMap<InstrId, CounterId>,
-    field_generic_getattr_counter_ids: &'mc HashMap<InstrId, CounterId>,
-    field_generic_setattr_counter_ids: &'mc HashMap<InstrId, CounterId>,
+    field_indexed_hit_counter_ids: &'mc HashMap<InstrId, CounterRef>,
+    field_indexed_fallback_counter_ids: &'mc HashMap<InstrId, CounterRef>,
+    field_generic_getattr_counter_ids: &'mc HashMap<InstrId, CounterRef>,
+    field_generic_setattr_counter_ids: &'mc HashMap<InstrId, CounterRef>,
     deopt_entry_guard_miss_counter_ids: &'mc HashMap<usize, CounterId>,
     field_index_specializations: &'mc HashMap<String, Vec<FieldIndexSpecialization>>,
     field_index_specializations_by_instr: &'mc HashMap<InstrId, Vec<FieldIndexSpecialization>>,
@@ -7224,6 +7224,21 @@ struct JitEmitCtx<'mc> {
     exception_forwarded_local_names: Option<&'mc [String]>,
     type_ptr_data_ids: RefCell<HashMap<RelocTypeRef, DataId>>,
     callable_ptr_data_ids: RefCell<HashMap<RelocCallableRef, DataId>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct CounterRef {
+    pub(super) counter_id: CounterId,
+    branch_id: Option<CounterBranchId>,
+}
+
+impl CounterRef {
+    const fn branch(counter_id: CounterId, branch_id: CounterBranchId) -> Self {
+        Self {
+            counter_id,
+            branch_id: Some(branch_id),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -10214,6 +10229,10 @@ fn scalar_counter_slot_for_id(
 ) -> Result<usize, String> {
     match counter_slots_by_id.get(counter_id.0).copied() {
         Some(CounterRuntimeSlot::Scalar(slot)) => Ok(slot),
+        Some(CounterRuntimeSlot::Branches { .. }) => Err(format!(
+            "counter id {} uses branch storage where a scalar counter was required",
+            counter_id.0
+        )),
         Some(CounterRuntimeSlot::TopValues(_)) => Err(format!(
             "counter id {} uses top-value storage where a scalar counter was required",
             counter_id.0
@@ -10221,6 +10240,43 @@ fn scalar_counter_slot_for_id(
         None => Err(format!(
             "missing scalar counter slot for counter id {}",
             counter_id.0
+        )),
+    }
+}
+
+pub(super) fn scalar_counter_slot_for_ref(
+    counter_slots_by_id: &[CounterRuntimeSlot],
+    counter_ref: CounterRef,
+) -> Result<usize, String> {
+    match (
+        counter_slots_by_id.get(counter_ref.counter_id.0).copied(),
+        counter_ref.branch_id,
+    ) {
+        (Some(CounterRuntimeSlot::Scalar(slot)), None) => Ok(slot),
+        (Some(CounterRuntimeSlot::Branches { start, len }), Some(branch_id))
+            if branch_id.0 < len =>
+        {
+            Ok(start + branch_id.0)
+        }
+        (Some(CounterRuntimeSlot::Branches { .. }), None) => Err(format!(
+            "counter id {} uses branch storage but no branch was selected",
+            counter_ref.counter_id.0
+        )),
+        (Some(CounterRuntimeSlot::Scalar(_)), Some(branch_id)) => Err(format!(
+            "counter id {} uses scalar storage but branch {} was selected",
+            counter_ref.counter_id.0, branch_id.0
+        )),
+        (Some(CounterRuntimeSlot::TopValues(_)), _) => Err(format!(
+            "counter id {} uses top-value storage where a scalar counter was required",
+            counter_ref.counter_id.0
+        )),
+        (Some(CounterRuntimeSlot::Branches { len, .. }), Some(branch_id)) => Err(format!(
+            "counter id {} branch {} is out of range for {} branches",
+            counter_ref.counter_id.0, branch_id.0, len
+        )),
+        (None, _) => Err(format!(
+            "missing scalar counter slot for counter id {}",
+            counter_ref.counter_id.0
         )),
     }
 }
@@ -10233,6 +10289,10 @@ pub(super) fn top_value_counter_slot_for_id(
         Some(CounterRuntimeSlot::TopValues(slot)) => Ok(slot),
         Some(CounterRuntimeSlot::Scalar(_)) => Err(format!(
             "counter id {} uses scalar storage where a top-value counter was required",
+            counter_id.0
+        )),
+        Some(CounterRuntimeSlot::Branches { .. }) => Err(format!(
+            "counter id {} uses branch storage where a top-value counter was required",
             counter_id.0
         )),
         None => Err(format!(
@@ -10295,6 +10355,22 @@ fn emit_increment_counter(
     let none_const = emit_none_const(fb, ctx);
     fb.ins().call(ctx.incref_ref, &[none_const]);
     none_const
+}
+
+fn emit_increment_counter_ref(
+    fb: &mut FunctionBuilder<'_>,
+    counter_ref: CounterRef,
+    ctx: &JitEmitCtx<'_>,
+) {
+    let counter_slot = scalar_counter_slot_for_ref(ctx.counter_slots_by_id, counter_ref)
+        .unwrap_or_else(|err| panic!("{err}"));
+    let scalar_counter_base_value = ctx.consts.scalar_counter_base_value.unwrap_or_else(|| {
+        panic!(
+            "missing scalar counter base for counter id {}",
+            counter_ref.counter_id.0
+        )
+    });
+    emit_increment_counter_slot(fb, scalar_counter_base_value, counter_slot);
 }
 
 pub(super) fn emit_increment_counter_slot(
@@ -12147,6 +12223,27 @@ fn collect_runtime_counter_ids_by_kind(
                 instr_id: Some(instr_id),
             } if counter.kind == kind && *counter_function_id == function_id => {
                 Some((*instr_id, counter.id))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn collect_runtime_counter_refs_by_kind_branch(
+    counter_defs: &[CounterDef],
+    function_id: RuntimeFunctionId,
+    kind: &str,
+    branch: &str,
+) -> HashMap<InstrId, CounterRef> {
+    counter_defs
+        .iter()
+        .filter_map(|counter| match &counter.site {
+            CounterSite::Runtime {
+                function_id: Some(counter_function_id),
+                instr_id: Some(instr_id),
+            } if counter.kind == kind && *counter_function_id == function_id => {
+                let branch_id = counter.branch_id(branch)?;
+                Some((*instr_id, CounterRef::branch(counter.id, branch_id)))
             }
             _ => None,
         })
@@ -15880,7 +15977,7 @@ fn emit_typed_guard_miss_deopt_resume_return(
     local_env: &LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     block: ir::Block,
-    fallback_counter_id: Option<CounterId>,
+    fallback_counter_id: Option<CounterRef>,
     owned_inputs: &[ir::Value],
     target: JitDeoptExitRef,
     deopt_resume_ref: ir::FuncRef,
@@ -15888,7 +15985,7 @@ fn emit_typed_guard_miss_deopt_resume_return(
     fb.switch_to_block(block);
     fb.set_cold_block(block);
     if let Some(counter_id) = fallback_counter_id {
-        let _ = emit_increment_counter(fb, counter_id, emit_ctx);
+        emit_increment_counter_ref(fb, counter_id, emit_ctx);
     }
     emit_release_owned_inputs(fb, emit_ctx, owned_inputs);
     let deopt_result = emit_deopt_resume_call_with_local_env(
@@ -15936,7 +16033,7 @@ fn emit_typed_getattr_fallback(
         .get(&op.semantic_instr_id())
         .copied()
     {
-        let _ = emit_increment_counter(fb, counter_id, emit_ctx);
+        emit_increment_counter_ref(fb, counter_id, emit_ctx);
     }
     let getattr_inst = fb.ins().call(emit_ctx.pyobject_getattr_ref, &[value, attr]);
     let result = emit_decref_owned_inputs_after_nullable_result(
@@ -15994,7 +16091,7 @@ fn emit_typed_setattr_fallback(
         .get(&op.semantic_instr_id())
         .copied()
     {
-        let _ = emit_increment_counter(fb, counter_id, emit_ctx);
+        emit_increment_counter_ref(fb, counter_id, emit_ctx);
     }
     let setattr_inst = fb
         .ins()
@@ -16132,7 +16229,7 @@ fn emit_typed_indexed_getattr(
         let direct_value = fb.block_params(direct_block)[0];
         fb.ins().call(emit_ctx.incref_ref, &[direct_value]);
         if let Some(counter_id) = hit_counter_id {
-            let _ = emit_increment_counter(fb, counter_id, emit_ctx);
+            emit_increment_counter_ref(fb, counter_id, emit_ctx);
         }
         emit_release_owned_inputs(fb, emit_ctx, owned_inputs.as_slice());
         fb.ins()
@@ -16147,7 +16244,7 @@ fn emit_typed_indexed_getattr(
         JitGuardMissDispatch::FallbackBlock(fallback_block) => {
             fb.switch_to_block(fallback_block);
             if let Some(counter_id) = fallback_counter_id {
-                let _ = emit_increment_counter(fb, counter_id, emit_ctx);
+                emit_increment_counter_ref(fb, counter_id, emit_ctx);
             }
             let getattr_inst = fb.ins().call(emit_ctx.pyobject_getattr_ref, &[value, attr]);
             let fallback_value = emit_decref_owned_inputs_after_nullable_result(
@@ -16333,7 +16430,7 @@ fn emit_typed_indexed_setattr(
 
         fb.switch_to_block(direct_block);
         if let Some(counter_id) = hit_counter_id {
-            let _ = emit_increment_counter(fb, counter_id, emit_ctx);
+            emit_increment_counter_ref(fb, counter_id, emit_ctx);
         }
         if result_needs_pyobject {
             let none_const = emit_none_const(fb, emit_ctx);
@@ -16355,7 +16452,7 @@ fn emit_typed_indexed_setattr(
         JitGuardMissDispatch::FallbackBlock(fallback_block) => {
             fb.switch_to_block(fallback_block);
             if let Some(counter_id) = fallback_counter_id {
-                let _ = emit_increment_counter(fb, counter_id, emit_ctx);
+                emit_increment_counter_ref(fb, counter_id, emit_ctx);
             }
             let setattr_inst = fb
                 .ins()
@@ -17270,7 +17367,7 @@ fn emit_codegen_simple_call_with_local_env(
                         emit_record_call_target_sample(fb, counter_id, callee_id, emit_ctx);
                     }
                     if let Some(counter_id) = direct_hit_counter_id {
-                        let _ = emit_increment_counter(fb, counter_id, emit_ctx);
+                        emit_increment_counter_ref(fb, counter_id, emit_ctx);
                     }
                     let direct_result = emit_direct_method_resolved_with_args_from_local_env(
                         fb,
@@ -17302,7 +17399,7 @@ fn emit_codegen_simple_call_with_local_env(
                     emit_record_call_target_sample(fb, counter_id, callee_id, emit_ctx);
                 }
                 if let Some(counter_id) = direct_fallback_counter_id {
-                    let _ = emit_increment_counter(fb, counter_id, emit_ctx);
+                    emit_increment_counter_ref(fb, counter_id, emit_ctx);
                 }
                 let (generic_result, _, _) = emit_positional_call_three_result_with_arg_values(
                     fb,
@@ -17466,7 +17563,7 @@ fn emit_codegen_simple_call_with_local_env(
                     emit_record_call_target_sample(fb, counter_id, callee_id, emit_ctx);
                 }
                 if let Some(counter_id) = direct_hit_counter_id {
-                    let _ = emit_increment_counter(fb, counter_id, emit_ctx);
+                    emit_increment_counter_ref(fb, counter_id, emit_ctx);
                 }
                 let direct_result = emit_direct_method_resolved_with_args_from_local_env(
                     fb,
@@ -17540,7 +17637,7 @@ fn emit_codegen_simple_call_with_local_env(
                         emit_record_call_target_sample(fb, counter_id, callee_id, emit_ctx);
                     }
                     if let Some(counter_id) = direct_fallback_counter_id {
-                        let _ = emit_increment_counter(fb, counter_id, emit_ctx);
+                        emit_increment_counter_ref(fb, counter_id, emit_ctx);
                     }
                     let generic_result = if simple_args.len() <= 3 {
                         emit_positional_call_three_with_local_env(
@@ -17576,7 +17673,7 @@ fn emit_codegen_simple_call_with_local_env(
                     fb.switch_to_block(block);
                     fb.set_cold_block(block);
                     if let Some(counter_id) = direct_fallback_counter_id {
-                        let _ = emit_increment_counter(fb, counter_id, emit_ctx);
+                        emit_increment_counter_ref(fb, counter_id, emit_ctx);
                     }
                     if !receiver_is_borrowed {
                         emit_release_owned_inputs(fb, emit_ctx, &[receiver]);
@@ -17696,7 +17793,7 @@ fn emit_codegen_simple_call_with_local_env(
                         direct_call_target_function(emit_ctx, specialization.function_id)
                             .expect("direct constructor specialization target should exist");
                     if let Some(counter_id) = direct_hit_counter_id {
-                        let _ = emit_increment_counter(fb, counter_id, emit_ctx);
+                        emit_increment_counter_ref(fb, counter_id, emit_ctx);
                     }
                     let direct_result = emit_direct_constructor_resolved_with_args_from_local_env(
                         fb,
@@ -17763,7 +17860,7 @@ fn emit_codegen_simple_call_with_local_env(
                         direct_call_target_function(emit_ctx, specialization.function_id)
                             .expect("direct specialization target should exist");
                     if let Some(counter_id) = direct_hit_counter_id {
-                        let _ = emit_increment_counter(fb, counter_id, emit_ctx);
+                        emit_increment_counter_ref(fb, counter_id, emit_ctx);
                     }
                     let direct_result = emit_direct_call_resolved_with_arg_plan_from_local_env(
                         fb,
@@ -17792,7 +17889,7 @@ fn emit_codegen_simple_call_with_local_env(
                         .direct_edge_stats
                         .record_guarded_generic_fallback_block();
                     if let Some(counter_id) = direct_fallback_counter_id {
-                        let _ = emit_increment_counter(fb, counter_id, emit_ctx);
+                        emit_increment_counter_ref(fb, counter_id, emit_ctx);
                     }
                     let generic_result = if simple_args.len() <= 3 {
                         emit_positional_call_three_with_local_env(
@@ -17831,7 +17928,7 @@ fn emit_codegen_simple_call_with_local_env(
                         .direct_edge_stats
                         .record_guarded_generic_fallback_block();
                     if let Some(counter_id) = direct_fallback_counter_id {
-                        let _ = emit_increment_counter(fb, counter_id, emit_ctx);
+                        emit_increment_counter_ref(fb, counter_id, emit_ctx);
                     }
                     if !callable_is_borrowed {
                         emit_release_owned_inputs(fb, emit_ctx, &[callable]);
@@ -19476,7 +19573,7 @@ fn emit_typed_prepared_direct_callable_specialization_result_with_local_env(
             let target_function = direct_call_target_function(emit_ctx, specialization.function_id)
                 .expect("direct constructor specialization target should exist");
             if let Some(counter_id) = direct_hit_counter_id {
-                let _ = emit_increment_counter(fb, counter_id, emit_ctx);
+                emit_increment_counter_ref(fb, counter_id, emit_ctx);
             }
             let direct_result = emit_typed_direct_constructor_resolved_with_args_from_local_env(
                 fb,
@@ -19542,7 +19639,7 @@ fn emit_typed_prepared_direct_callable_specialization_result_with_local_env(
             let target_function = direct_call_target_function(emit_ctx, specialization.function_id)
                 .expect("direct specialization target should exist");
             if let Some(counter_id) = direct_hit_counter_id {
-                let _ = emit_increment_counter(fb, counter_id, emit_ctx);
+                emit_increment_counter_ref(fb, counter_id, emit_ctx);
             }
             let direct_result = emit_typed_direct_call_resolved_with_arg_plan_from_local_env(
                 fb,
@@ -19571,7 +19668,7 @@ fn emit_typed_prepared_direct_callable_specialization_result_with_local_env(
                 .direct_edge_stats
                 .record_guarded_generic_fallback_block();
             if let Some(counter_id) = direct_fallback_counter_id {
-                let _ = emit_increment_counter(fb, counter_id, emit_ctx);
+                emit_increment_counter_ref(fb, counter_id, emit_ctx);
             }
             let generic_result = emit_typed_positional_call_result_with_arg_refs(
                 fb,
@@ -19601,7 +19698,7 @@ fn emit_typed_prepared_direct_callable_specialization_result_with_local_env(
                 .direct_edge_stats
                 .record_guarded_generic_fallback_block();
             if let Some(counter_id) = direct_fallback_counter_id {
-                let _ = emit_increment_counter(fb, counter_id, emit_ctx);
+                emit_increment_counter_ref(fb, counter_id, emit_ctx);
             }
             if !callable_is_borrowed {
                 emit_release_owned_inputs(fb, emit_ctx, &[callable]);
@@ -19832,7 +19929,7 @@ fn emit_typed_codegen_guarded_method_call_result_with_local_env(
             emit_record_call_target_sample(fb, counter_id, callee_id, emit_ctx);
         }
         if let Some(counter_id) = direct_hit_counter_id {
-            let _ = emit_increment_counter(fb, counter_id, emit_ctx);
+            emit_increment_counter_ref(fb, counter_id, emit_ctx);
         }
         let direct_result = emit_typed_direct_method_resolved_with_args_from_local_env(
             fb,
@@ -19901,7 +19998,7 @@ fn emit_typed_codegen_guarded_method_call_result_with_local_env(
                 emit_record_call_target_sample(fb, counter_id, callee_id, emit_ctx);
             }
             if let Some(counter_id) = direct_fallback_counter_id {
-                let _ = emit_increment_counter(fb, counter_id, emit_ctx);
+                emit_increment_counter_ref(fb, counter_id, emit_ctx);
             }
             let generic_result = emit_typed_positional_call_result_with_arg_refs(
                 fb,
@@ -19928,7 +20025,7 @@ fn emit_typed_codegen_guarded_method_call_result_with_local_env(
             fb.switch_to_block(block);
             fb.set_cold_block(block);
             if let Some(counter_id) = direct_fallback_counter_id {
-                let _ = emit_increment_counter(fb, counter_id, emit_ctx);
+                emit_increment_counter_ref(fb, counter_id, emit_ctx);
             }
             if !receiver_is_borrowed {
                 emit_release_owned_inputs(fb, emit_ctx, &[receiver]);
@@ -27315,87 +27412,104 @@ fn build_cranelift_run_bb_specialized_function(
 
     let call_target_counter_ids =
         collect_runtime_counter_ids_by_kind(counter_defs, function.function_id, "call_hot_targets");
-    let call_direct_hit_counter_ids =
-        collect_runtime_counter_ids_by_kind(counter_defs, function.function_id, "call_direct_hit");
-    let call_direct_fallback_counter_ids = collect_runtime_counter_ids_by_kind(
+    let call_direct_hit_counter_ids = collect_runtime_counter_refs_by_kind_branch(
         counter_defs,
         function.function_id,
-        "call_direct_fallback",
+        "call_direct",
+        "hit",
+    );
+    let call_direct_fallback_counter_ids = collect_runtime_counter_refs_by_kind_branch(
+        counter_defs,
+        function.function_id,
+        "call_direct",
+        "fallback",
     );
     let operator_shape_counter_ids = collect_runtime_counter_ids_by_kind(
         counter_defs,
         function.function_id,
         "operator_hot_shapes",
     );
-    let operator_specialized_hit_counter_ids = collect_runtime_counter_ids_by_kind(
+    let operator_specialized_hit_counter_ids = collect_runtime_counter_refs_by_kind_branch(
         counter_defs,
         function.function_id,
-        "operator_specialized_hit",
+        "operator_specialized",
+        "hit",
     );
-    let operator_specialized_fallback_counter_ids = collect_runtime_counter_ids_by_kind(
+    let operator_specialized_fallback_counter_ids = collect_runtime_counter_refs_by_kind_branch(
         counter_defs,
         function.function_id,
-        "operator_specialized_fallback",
+        "operator_specialized",
+        "fallback",
     );
     let getitem_shape_counter_ids = collect_runtime_counter_ids_by_kind(
         counter_defs,
         function.function_id,
         "getitem_hot_shapes",
     );
-    let getitem_specialized_hit_counter_ids = collect_runtime_counter_ids_by_kind(
+    let getitem_specialized_hit_counter_ids = collect_runtime_counter_refs_by_kind_branch(
         counter_defs,
         function.function_id,
-        "getitem_specialized_hit",
+        "getitem_specialized",
+        "hit",
     );
-    let getitem_specialized_fallback_counter_ids = collect_runtime_counter_ids_by_kind(
+    let getitem_specialized_fallback_counter_ids = collect_runtime_counter_refs_by_kind_branch(
         counter_defs,
         function.function_id,
-        "getitem_specialized_fallback",
+        "getitem_specialized",
+        "fallback",
     );
     let setitem_shape_counter_ids = collect_runtime_counter_ids_by_kind(
         counter_defs,
         function.function_id,
         "setitem_hot_shapes",
     );
-    let setitem_specialized_hit_counter_ids = collect_runtime_counter_ids_by_kind(
+    let setitem_specialized_hit_counter_ids = collect_runtime_counter_refs_by_kind_branch(
         counter_defs,
         function.function_id,
-        "setitem_specialized_hit",
+        "setitem_specialized",
+        "hit",
     );
-    let setitem_specialized_fallback_counter_ids = collect_runtime_counter_ids_by_kind(
+    let setitem_specialized_fallback_counter_ids = collect_runtime_counter_refs_by_kind_branch(
         counter_defs,
         function.function_id,
-        "setitem_specialized_fallback",
+        "setitem_specialized",
+        "fallback",
     );
-    let global_indexed_hit_counter_ids = collect_runtime_counter_ids_by_kind(
+    let global_indexed_hit_counter_ids = collect_runtime_counter_refs_by_kind_branch(
         counter_defs,
         function.function_id,
-        "global_indexed_hit",
+        "global_indexed",
+        "hit",
     );
-    let global_indexed_fallback_counter_ids = collect_runtime_counter_ids_by_kind(
+    let global_indexed_fallback_counter_ids = collect_runtime_counter_refs_by_kind_branch(
         counter_defs,
         function.function_id,
-        "global_indexed_fallback",
+        "global_indexed",
+        "fallback",
     );
-    let field_indexed_hit_counter_ids = collect_runtime_counter_ids_by_kind(
+    let field_indexed_hit_counter_ids = collect_runtime_counter_refs_by_kind_branch(
         counter_defs,
         function.function_id,
-        "field_indexed_hit",
+        "field_access",
+        "indexed_hit",
     );
-    let field_indexed_fallback_counter_ids = collect_runtime_counter_ids_by_kind(
+    let field_indexed_fallback_counter_ids = collect_runtime_counter_refs_by_kind_branch(
         counter_defs,
         function.function_id,
-        "field_indexed_fallback",
+        "field_access",
+        "indexed_fallback",
     );
-    let field_generic_getattr_counter_ids = collect_runtime_counter_ids_by_kind(
+    let field_generic_getattr_counter_ids = collect_runtime_counter_refs_by_kind_branch(
         counter_defs,
         function.function_id,
-        "field_generic_getattr",
+        "field_access",
+        "generic_getattr",
     );
-    let field_generic_setattr_counter_ids = collect_runtime_counter_ids_by_kind(
+    let field_generic_setattr_counter_ids = collect_runtime_counter_refs_by_kind_branch(
         counter_defs,
         function.function_id,
-        "field_generic_setattr",
+        "field_access",
+        "generic_setattr",
     );
     let deopt_entry_guard_miss_counter_ids = collect_deopt_entry_counter_ids_by_kind(
         counter_defs,
@@ -27416,6 +27530,29 @@ fn build_cranelift_run_bb_specialized_function(
             format!(
                 "specialized JIT top-value counter layout is missing counter id {} for function {}",
                 counter_id.0, function.names.qualname
+            )
+        })?;
+    }
+    for counter_ref in call_direct_hit_counter_ids
+        .values()
+        .chain(call_direct_fallback_counter_ids.values())
+        .chain(operator_specialized_hit_counter_ids.values())
+        .chain(operator_specialized_fallback_counter_ids.values())
+        .chain(getitem_specialized_hit_counter_ids.values())
+        .chain(getitem_specialized_fallback_counter_ids.values())
+        .chain(setitem_specialized_hit_counter_ids.values())
+        .chain(setitem_specialized_fallback_counter_ids.values())
+        .chain(global_indexed_hit_counter_ids.values())
+        .chain(global_indexed_fallback_counter_ids.values())
+        .chain(field_indexed_hit_counter_ids.values())
+        .chain(field_indexed_fallback_counter_ids.values())
+        .chain(field_generic_getattr_counter_ids.values())
+        .chain(field_generic_setattr_counter_ids.values())
+    {
+        scalar_counter_slot_for_ref(counter_slots_by_id, *counter_ref).map_err(|err| {
+            format!(
+                "{err} for function {} ({})",
+                function.names.qualname, function.function_id
             )
         })?;
     }

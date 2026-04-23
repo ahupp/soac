@@ -11,7 +11,7 @@ use cranelift_codegen::ir::InstBuilder;
 use cranelift_frontend::FunctionBuilder;
 use pyo3::ffi;
 use soac_core::block_py::{
-    CounterId, HasSemanticInstrId, Instr, InstrId, NameLike, NameLocation, ResolvedName,
+    HasSemanticInstrId, Instr, InstrId, NameLike, NameLocation, ResolvedName,
 };
 use soac_lowering::passes::{InstrCodegen, InstrTyped, PyExactType, PyObjFacts};
 use soac_opt::operator_specialization::{
@@ -111,7 +111,7 @@ pub(super) trait OperationEmitState<'fb, E> {
     fn emit_guard_miss_deopt_resume_return(
         &mut self,
         block: ir::Block,
-        fallback_counter_id: Option<CounterId>,
+        fallback_counter_id: Option<super::CounterRef>,
         arg_values: &[(ir::Value, bool)],
         target: JitDeoptExitRef,
         deopt_resume_ref: ir::FuncRef,
@@ -1188,7 +1188,7 @@ fn emit_compact_long_binary_op_or_deopt<'fb, E>(
     instr_id: soac_core::block_py::InstrId,
     pre_guard_operands: &[&E],
     arg_values: &[(ir::Value, bool)],
-    fallback_counter_id: Option<CounterId>,
+    fallback_counter_id: Option<super::CounterRef>,
     generic_fallback_on_guard_miss: bool,
 ) -> Option<ir::Value>
 where
@@ -1273,8 +1273,8 @@ fn emit_compact_long_compare_i32_bool01_or_deopt<'fb, E>(
     instr_id: soac_core::block_py::InstrId,
     pre_guard_operands: &[&E],
     arg_values: &[(ir::Value, bool)],
-    hit_counter_id: Option<CounterId>,
-    fallback_counter_id: Option<CounterId>,
+    hit_counter_id: Option<super::CounterRef>,
+    fallback_counter_id: Option<super::CounterRef>,
 ) -> Option<ir::Value>
 where
     E: Instr,
@@ -1976,13 +1976,13 @@ where
 
 pub(super) fn increment_counter_with_state<'fb, E>(
     state: &mut impl OperationEmitState<'fb, E>,
-    counter_id: Option<CounterId>,
+    counter_ref: Option<super::CounterRef>,
 ) {
-    let Some(counter_id) = counter_id else {
+    let Some(counter_ref) = counter_ref else {
         return;
     };
     let scalar_counter_slot =
-        super::scalar_counter_slot_for_id(state.ctx().counter_slots_by_id, counter_id)
+        super::scalar_counter_slot_for_ref(state.ctx().counter_slots_by_id, counter_ref)
             .unwrap_or_else(|err| panic!("{err}"));
     let scalar_counter_base_value =
         state
@@ -1992,7 +1992,7 @@ pub(super) fn increment_counter_with_state<'fb, E>(
             .unwrap_or_else(|| {
                 panic!(
                     "missing scalar counter base for counter id {}",
-                    counter_id.0
+                    counter_ref.counter_id.0
                 )
             });
     emit_increment_counter_slot(state.fb(), scalar_counter_base_value, scalar_counter_slot);

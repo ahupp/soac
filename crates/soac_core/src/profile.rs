@@ -11,7 +11,7 @@ use std::io::Write;
 use std::path::Path;
 
 pub const COUNTER_DUMP_MAGIC: [u8; 8] = *b"SOACRKV1";
-pub const COUNTER_DUMP_VERSION: u16 = 3;
+pub const COUNTER_DUMP_VERSION: u16 = 4;
 const COUNTER_DUMP_FRAME_HEADER_LEN: usize = 32;
 const COUNTER_DUMP_FRAME_ALIGN: usize = 16;
 pub const COUNTER_DUMP_NONE_U64: u64 = u64::MAX;
@@ -29,8 +29,15 @@ pub struct CounterDumpRow {
     pub function_qualname: Option<String>,
     pub block_label: Option<String>,
     pub value: u64,
+    pub branch_values: Vec<CounterDumpBranchValue>,
     pub observed_value: Option<u64>,
     pub max_overcount: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CounterDumpBranchValue {
+    pub branch: String,
+    pub value: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,8 +97,15 @@ pub struct CounterDumpRowView<'a> {
     pub function_qualname: Option<&'a str>,
     pub block_label: Option<&'a str>,
     pub value: u64,
+    pub branch_values: Vec<CounterDumpBranchValueView<'a>>,
     pub observed_value: Option<u64>,
     pub max_overcount: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CounterDumpBranchValueView<'a> {
+    pub branch: &'a str,
+    pub value: u64,
 }
 
 pub struct CounterDumpKeyLayoutView<'a> {
@@ -141,8 +155,16 @@ struct CounterDumpRowArchive {
     block_label: String,
     has_block_label: bool,
     value: u64,
+    branch_values: Vec<CounterDumpBranchValueArchive>,
     observed_value: u64,
     max_overcount: u64,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug)]
+#[rkyv(derive(Debug))]
+struct CounterDumpBranchValueArchive {
+    branch: String,
+    value: u64,
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug)]
@@ -274,8 +296,22 @@ impl CounterDumpRowArchive {
             block_label: row.block_label.clone().unwrap_or_default(),
             has_block_label: row.block_label.is_some(),
             value: row.value,
+            branch_values: row
+                .branch_values
+                .iter()
+                .map(CounterDumpBranchValueArchive::from_branch_value)
+                .collect(),
             observed_value: row.observed_value.unwrap_or(COUNTER_DUMP_NONE_U64),
             max_overcount: row.max_overcount.unwrap_or(COUNTER_DUMP_NONE_U64),
+        }
+    }
+}
+
+impl CounterDumpBranchValueArchive {
+    fn from_branch_value(branch_value: &CounterDumpBranchValue) -> Self {
+        Self {
+            branch: branch_value.branch.clone(),
+            value: branch_value.value,
         }
     }
 }
@@ -382,6 +418,14 @@ impl<'a> CounterDumpRecordView<'a> {
                 .then_some(row.function_qualname.as_str()),
             block_label: row.has_block_label.then_some(row.block_label.as_str()),
             value: row.value.into(),
+            branch_values: row
+                .branch_values
+                .iter()
+                .map(|branch_value| CounterDumpBranchValueView {
+                    branch: branch_value.branch.as_str(),
+                    value: branch_value.value.into(),
+                })
+                .collect(),
             observed_value: (observed_value != COUNTER_DUMP_NONE_U64).then_some(observed_value),
             max_overcount: (max_overcount != COUNTER_DUMP_NONE_U64).then_some(max_overcount),
         })
@@ -1076,6 +1120,7 @@ mod tests {
                     function_qualname: Some("f".to_string()),
                     block_label: Some("bb0".to_string()),
                     value: 11,
+                    branch_values: Vec::new(),
                     observed_value: None,
                     max_overcount: None,
                 },
@@ -1090,6 +1135,7 @@ mod tests {
                     function_qualname: None,
                     block_label: None,
                     value: 19,
+                    branch_values: Vec::new(),
                     observed_value: Some(42),
                     max_overcount: Some(7),
                 },
@@ -1167,6 +1213,7 @@ mod tests {
                 function_qualname: Some("f".to_string()),
                 block_label: Some("bb0".to_string()),
                 value: 5,
+                branch_values: Vec::new(),
                 observed_value: None,
                 max_overcount: None,
             }],
@@ -1189,6 +1236,7 @@ mod tests {
                 function_qualname: None,
                 block_label: None,
                 value: 11,
+                branch_values: Vec::new(),
                 observed_value: Some(7),
                 max_overcount: Some(2),
             }],
@@ -1423,6 +1471,7 @@ mod tests {
                     function_qualname: Some("pkg.mod.f".to_string()),
                     block_label: None,
                     value: 11,
+                    branch_values: Vec::new(),
                     observed_value: Some(
                         RuntimeFunctionId::from_raw_parts(1, 9).to_packed_runtime_u64(),
                     ),
@@ -1439,6 +1488,7 @@ mod tests {
                     function_qualname: Some("pkg.mod.f".to_string()),
                     block_label: None,
                     value: 5,
+                    branch_values: Vec::new(),
                     observed_value: Some(
                         RuntimeFunctionId::from_raw_parts(1, 10).to_packed_runtime_u64(),
                     ),
@@ -1455,6 +1505,7 @@ mod tests {
                     function_qualname: Some("pkg.mod.g".to_string()),
                     block_label: None,
                     value: 4,
+                    branch_values: Vec::new(),
                     observed_value: Some(RuntimeFunctionId::global().to_packed_runtime_u64()),
                     max_overcount: Some(0),
                 },
@@ -1469,6 +1520,7 @@ mod tests {
                     function_qualname: Some("pkg.mod.h".to_string()),
                     block_label: None,
                     value: 4,
+                    branch_values: Vec::new(),
                     observed_value: Some(0),
                     max_overcount: Some(0),
                 },
@@ -1518,6 +1570,7 @@ mod tests {
                     function_qualname: Some("pkg.mod.f".to_string()),
                     block_label: None,
                     value: 11,
+                    branch_values: Vec::new(),
                     observed_value: Some(1),
                     max_overcount: Some(0),
                 },
@@ -1532,6 +1585,7 @@ mod tests {
                     function_qualname: Some("pkg.mod.f".to_string()),
                     block_label: None,
                     value: 5,
+                    branch_values: Vec::new(),
                     observed_value: Some(257),
                     max_overcount: Some(0),
                 },
@@ -1546,6 +1600,7 @@ mod tests {
                     function_qualname: Some("pkg.mod.f".to_string()),
                     block_label: None,
                     value: 4,
+                    branch_values: Vec::new(),
                     observed_value: Some(1),
                     max_overcount: Some(0),
                 },
@@ -1560,6 +1615,7 @@ mod tests {
                     function_qualname: Some("pkg.mod.g".to_string()),
                     block_label: None,
                     value: 7,
+                    branch_values: Vec::new(),
                     observed_value: Some(513),
                     max_overcount: Some(0),
                 },
@@ -1574,6 +1630,7 @@ mod tests {
                     function_qualname: Some("pkg.mod.f".to_string()),
                     block_label: None,
                     value: 1,
+                    branch_values: Vec::new(),
                     observed_value: Some(0),
                     max_overcount: Some(0),
                 },
@@ -1620,6 +1677,7 @@ mod tests {
                     function_qualname: Some("pkg.mod.f".to_string()),
                     block_label: None,
                     value: 11,
+                    branch_values: Vec::new(),
                     observed_value: Some(1),
                     max_overcount: Some(0),
                 },
@@ -1634,6 +1692,7 @@ mod tests {
                     function_qualname: Some("pkg.mod.f".to_string()),
                     block_label: None,
                     value: 4,
+                    branch_values: Vec::new(),
                     observed_value: Some(1),
                     max_overcount: Some(0),
                 },
@@ -1648,6 +1707,7 @@ mod tests {
                     function_qualname: Some("pkg.mod.g".to_string()),
                     block_label: None,
                     value: 7,
+                    branch_values: Vec::new(),
                     observed_value: Some(1),
                     max_overcount: Some(0),
                 },
@@ -1662,6 +1722,7 @@ mod tests {
                     function_qualname: Some("pkg.mod.f".to_string()),
                     block_label: None,
                     value: 1,
+                    branch_values: Vec::new(),
                     observed_value: Some(0),
                     max_overcount: Some(0),
                 },
@@ -1708,6 +1769,7 @@ mod tests {
                     function_qualname: Some("pkg.mod.f".to_string()),
                     block_label: None,
                     value: 11,
+                    branch_values: Vec::new(),
                     observed_value: Some(1),
                     max_overcount: Some(0),
                 },
@@ -1722,6 +1784,7 @@ mod tests {
                     function_qualname: Some("pkg.mod.f".to_string()),
                     block_label: None,
                     value: 4,
+                    branch_values: Vec::new(),
                     observed_value: Some(1),
                     max_overcount: Some(0),
                 },
@@ -1736,6 +1799,7 @@ mod tests {
                     function_qualname: Some("pkg.mod.g".to_string()),
                     block_label: None,
                     value: 7,
+                    branch_values: Vec::new(),
                     observed_value: Some(1),
                     max_overcount: Some(0),
                 },
@@ -1750,6 +1814,7 @@ mod tests {
                     function_qualname: Some("pkg.mod.f".to_string()),
                     block_label: None,
                     value: 1,
+                    branch_values: Vec::new(),
                     observed_value: Some(0),
                     max_overcount: Some(0),
                 },
@@ -1798,6 +1863,7 @@ mod tests {
                     function_qualname: Some("pkg.mod.f".to_string()),
                     block_label: None,
                     value: 20,
+                    branch_values: Vec::new(),
                     observed_value: Some(0),
                     max_overcount: Some(0),
                 },
@@ -1812,6 +1878,7 @@ mod tests {
                     function_qualname: Some("pkg.mod.f".to_string()),
                     block_label: None,
                     value: 3,
+                    branch_values: Vec::new(),
                     observed_value: Some(1),
                     max_overcount: Some(0),
                 },
@@ -1826,6 +1893,7 @@ mod tests {
                     function_qualname: Some("pkg.mod.f".to_string()),
                     block_label: None,
                     value: 9,
+                    branch_values: Vec::new(),
                     observed_value: Some(1),
                     max_overcount: Some(0),
                 },
