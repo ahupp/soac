@@ -7,8 +7,8 @@ use soac_core::block_py::{
 };
 
 use super::{
-    CodegenModuleShape, DirectFunctionIdGuardTest, InstrCodegen, InstrCodegenOp,
-    allocate_codegen_stack_temp, assign_missing_codegen_function_instr_ids,
+    CodegenModuleShape, DirectFunctionIdGuardTest, InstrCodegen, allocate_codegen_stack_temp,
+    assign_missing_codegen_function_instr_ids,
 };
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
@@ -291,10 +291,10 @@ fn find_store_call_candidate(
         .iter()
         .enumerate()
         .find_map(|(instr_index, instr)| {
-            let InstrCodegenOp::Store(store) = instr else {
+            let InstrCodegen::Store(store) = instr else {
                 return None;
             };
-            let InstrCodegenOp::Call(call) = store.value.as_ref() else {
+            let InstrCodegen::Call(call) = store.value.as_ref() else {
                 return None;
             };
             let instr_id = call.try_semantic_instr_id()?;

@@ -114,55 +114,10 @@ impl InstrWithConstantNone for InstrRuff {
     }
 }
 
-#[derive(Clone, derive_more::From, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-#[rkyv(serialize_bounds(
-    __S: rkyv::ser::Writer + rkyv::ser::Allocator,
-    __S::Error: rkyv::rancor::Source,
-))]
-#[rkyv(deserialize_bounds(__D::Error: rkyv::rancor::Source))]
-#[rkyv(bytecheck(bounds(
-    __C: rkyv::validation::ArchiveContext,
-)))]
-#[enum_broadcast(HasMeta, WithMeta, ChildVisitable, Mappable, PrettyPrint, Debug)]
-pub enum InstrCodegenOp {
-    BinOp(#[rkyv(omit_bounds)] BinOp<Self>),
-    UnaryOp(#[rkyv(omit_bounds)] UnaryOp<Self>),
-    CalleeFunctionId(#[rkyv(omit_bounds)] CalleeFunctionId<Self>),
-    DirectFunctionIdGuardTest(#[rkyv(omit_bounds)] DirectFunctionIdGuardTest<Self>),
-    Tuple(#[rkyv(omit_bounds)] Tuple<Self>),
-    Call(#[rkyv(omit_bounds)] Call<Self>),
-    CallDirect(#[rkyv(omit_bounds)] CallDirect<Self>),
-    GetAttr(#[rkyv(omit_bounds)] GetAttr<Self>),
-    SetAttr(#[rkyv(omit_bounds)] SetAttr<Self>),
-    GetItem(#[rkyv(omit_bounds)] GetItem<Self>),
-    SetItem(#[rkyv(omit_bounds)] SetItem<Self>),
-    DelItem(#[rkyv(omit_bounds)] DelItem<Self>),
-    Load(#[rkyv(omit_bounds)] Load<Self>),
-    Store(#[rkyv(omit_bounds)] Store<Self>),
-    Del(#[rkyv(omit_bounds)] Del<Self>),
-    MakeCell(#[rkyv(omit_bounds)] MakeCell<Self>),
-    IncrementCounter(IncrementCounter),
-    CellRef(CellRef),
-    MakeFunctionWithClosure(#[rkyv(omit_bounds)] MakeFunctionWithClosure<Self>),
-}
-
-pub type InstrCodegen = InstrCodegenOp;
-
-impl Instr for InstrCodegenOp {
-    type Name = ResolvedName;
-    type Extra = ();
-}
-
 define_instr! {
     pub struct DirectFunctionIdGuardTest<E> {
         value: Box<E>,
         function_id: RuntimeFunctionId,
-    }
-}
-
-impl InstrWithConstantNone for InstrCodegenOp {
-    fn constant_none() -> Self {
-        runtime_name_load("NONE")
     }
 }
 
@@ -373,22 +328,6 @@ impl ModuleShape for ResolvedStorageModuleShape {
     type ModuleConstant = InstrResolved;
 }
 
-#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-pub struct CodegenModuleShape;
-
-impl ModuleShape for CodegenModuleShape {
-    type Instr = InstrCodegen;
-    type ModuleConstant = InstrResolved;
-}
-
-#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-pub(crate) struct CodegenUnidentifiedModuleShape;
-
-impl ModuleShape for CodegenUnidentifiedModuleShape {
-    type Instr = InstrCodegen;
-    type ModuleConstant = InstrResolved;
-}
-
 pub(crate) use blockpy_generators::lower_yield_in_lowered_core_blockpy_module_bundle;
 pub(crate) use blockpy_to_bb::{lower_try_jump_exception_flow, normalize_bb_module_strings};
 pub(crate) use instr_id::assign_module_instr_ids;
@@ -414,6 +353,65 @@ pub fn relabel_dense_bb_module<P: ModuleShape>(module: &mut BlockPyModule<P>) {
     for callable in &mut module.callable_defs {
         relabel_blockpy_blocks_dense(&mut callable.blocks);
     }
+}
+
+#[derive(Clone, derive_more::From, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[rkyv(serialize_bounds(
+    __S: rkyv::ser::Writer + rkyv::ser::Allocator,
+    __S::Error: rkyv::rancor::Source,
+))]
+#[rkyv(deserialize_bounds(__D::Error: rkyv::rancor::Source))]
+#[rkyv(bytecheck(bounds(
+    __C: rkyv::validation::ArchiveContext,
+)))]
+#[enum_broadcast(HasMeta, WithMeta, ChildVisitable, Mappable, PrettyPrint, Debug)]
+pub enum InstrCodegen {
+    BinOp(#[rkyv(omit_bounds)] BinOp<Self>),
+    UnaryOp(#[rkyv(omit_bounds)] UnaryOp<Self>),
+    CalleeFunctionId(#[rkyv(omit_bounds)] CalleeFunctionId<Self>),
+    DirectFunctionIdGuardTest(#[rkyv(omit_bounds)] DirectFunctionIdGuardTest<Self>),
+    Tuple(#[rkyv(omit_bounds)] Tuple<Self>),
+    Call(#[rkyv(omit_bounds)] Call<Self>),
+    CallDirect(#[rkyv(omit_bounds)] CallDirect<Self>),
+    GetAttr(#[rkyv(omit_bounds)] GetAttr<Self>),
+    SetAttr(#[rkyv(omit_bounds)] SetAttr<Self>),
+    GetItem(#[rkyv(omit_bounds)] GetItem<Self>),
+    SetItem(#[rkyv(omit_bounds)] SetItem<Self>),
+    DelItem(#[rkyv(omit_bounds)] DelItem<Self>),
+    Load(#[rkyv(omit_bounds)] Load<Self>),
+    Store(#[rkyv(omit_bounds)] Store<Self>),
+    Del(#[rkyv(omit_bounds)] Del<Self>),
+    MakeCell(#[rkyv(omit_bounds)] MakeCell<Self>),
+    IncrementCounter(IncrementCounter),
+    CellRef(CellRef),
+    MakeFunctionWithClosure(#[rkyv(omit_bounds)] MakeFunctionWithClosure<Self>),
+}
+
+impl Instr for InstrCodegen {
+    type Name = ResolvedName;
+    type Extra = ();
+}
+
+impl InstrWithConstantNone for InstrCodegen {
+    fn constant_none() -> Self {
+        runtime_name_load("NONE")
+    }
+}
+
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct CodegenModuleShape;
+
+impl ModuleShape for CodegenModuleShape {
+    type Instr = InstrCodegen;
+    type ModuleConstant = InstrResolved;
+}
+
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub(crate) struct CodegenUnidentifiedModuleShape;
+
+impl ModuleShape for CodegenUnidentifiedModuleShape {
+    type Instr = InstrCodegen;
+    type ModuleConstant = InstrResolved;
 }
 
 #[cfg(test)]

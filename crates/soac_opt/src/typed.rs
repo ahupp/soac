@@ -14,7 +14,7 @@ use soac_core::block_py::{
 use soac_lowering::block_py::counters::IncrementCounter;
 #[allow(unused_imports)]
 use soac_lowering::passes::{
-    CodegenModuleShape, DirectFunctionIdGuardTest, InstrCodegen, InstrCodegenOp, InstrResolved,
+    CodegenModuleShape, DirectFunctionIdGuardTest, InstrCodegen, InstrResolved,
 };
 use soac_macros::{DelegateMatchDefault, enum_broadcast};
 use std::collections::{HashMap, HashSet};
@@ -1327,13 +1327,13 @@ struct CodegenToTyped;
 impl MapInstr<InstrCodegen, InstrTyped> for CodegenToTyped {
     fn map_instr(&mut self, instr: InstrCodegen) -> InstrTyped {
         match instr {
-            InstrCodegenOp::BinOp(op) => InstrTyped::BinOp(op.map_children(self)),
-            InstrCodegenOp::Tuple(op) => InstrTyped::LegacyTuple(op.map_children(self)),
-            InstrCodegenOp::UnaryOp(op) => InstrTyped::LegacyUnaryOp(op.map_children(self)),
-            InstrCodegenOp::CalleeFunctionId(op) => {
+            InstrCodegen::BinOp(op) => InstrTyped::BinOp(op.map_children(self)),
+            InstrCodegen::Tuple(op) => InstrTyped::LegacyTuple(op.map_children(self)),
+            InstrCodegen::UnaryOp(op) => InstrTyped::LegacyUnaryOp(op.map_children(self)),
+            InstrCodegen::CalleeFunctionId(op) => {
                 InstrTyped::LegacyCalleeFunctionId(op.map_children(self))
             }
-            InstrCodegenOp::DirectFunctionIdGuardTest(op) => {
+            InstrCodegen::DirectFunctionIdGuardTest(op) => {
                 let meta = op.meta();
                 InstrTyped::DirectCallGuardTest(
                     TypedDirectCallGuardTest::new(
@@ -1345,26 +1345,26 @@ impl MapInstr<InstrCodegen, InstrTyped> for CodegenToTyped {
                     .with_meta(meta),
                 )
             }
-            InstrCodegenOp::Call(op) => {
+            InstrCodegen::Call(op) => {
                 InstrTyped::CallTyped(TypedCall::from_legacy(op.map_children(self)))
             }
-            InstrCodegenOp::CallDirect(op) => InstrTyped::LegacyCallDirect(op.map_children(self)),
-            InstrCodegenOp::GetAttr(op) => {
+            InstrCodegen::CallDirect(op) => InstrTyped::LegacyCallDirect(op.map_children(self)),
+            InstrCodegen::GetAttr(op) => {
                 InstrTyped::GetAttrTyped(TypedGetAttr::from_legacy(op.map_children(self)))
             }
-            InstrCodegenOp::SetAttr(op) => {
+            InstrCodegen::SetAttr(op) => {
                 InstrTyped::SetAttrTyped(TypedSetAttr::from_legacy(op.map_children(self)))
             }
-            InstrCodegenOp::GetItem(op) => InstrTyped::LegacyGetItem(op.map_children(self)),
-            InstrCodegenOp::SetItem(op) => InstrTyped::LegacySetItem(op.map_children(self)),
-            InstrCodegenOp::DelItem(op) => InstrTyped::LegacyDelItem(op.map_children(self)),
-            InstrCodegenOp::Load(op) => InstrTyped::Load(op.map_children(self)),
-            InstrCodegenOp::Store(op) => InstrTyped::LegacyStore(op.map_children(self)),
-            InstrCodegenOp::Del(op) => InstrTyped::LegacyDel(op.map_children(self)),
-            InstrCodegenOp::MakeCell(op) => InstrTyped::LegacyMakeCell(op.map_children(self)),
-            InstrCodegenOp::IncrementCounter(op) => InstrTyped::LegacyIncrementCounter(op),
-            InstrCodegenOp::CellRef(op) => InstrTyped::LegacyCellRef(op),
-            InstrCodegenOp::MakeFunctionWithClosure(op) => {
+            InstrCodegen::GetItem(op) => InstrTyped::LegacyGetItem(op.map_children(self)),
+            InstrCodegen::SetItem(op) => InstrTyped::LegacySetItem(op.map_children(self)),
+            InstrCodegen::DelItem(op) => InstrTyped::LegacyDelItem(op.map_children(self)),
+            InstrCodegen::Load(op) => InstrTyped::Load(op.map_children(self)),
+            InstrCodegen::Store(op) => InstrTyped::LegacyStore(op.map_children(self)),
+            InstrCodegen::Del(op) => InstrTyped::LegacyDel(op.map_children(self)),
+            InstrCodegen::MakeCell(op) => InstrTyped::LegacyMakeCell(op.map_children(self)),
+            InstrCodegen::IncrementCounter(op) => InstrTyped::LegacyIncrementCounter(op),
+            InstrCodegen::CellRef(op) => InstrTyped::LegacyCellRef(op),
+            InstrCodegen::MakeFunctionWithClosure(op) => {
                 InstrTyped::LegacyMakeFunctionWithClosure(op.map_children(self))
             }
         }
@@ -2242,18 +2242,18 @@ impl TryMapInstr<InstrTyped, InstrCodegen, String> for TypedToCodegen {
                     "typed truthiness instruction requires typed codegen emission".to_string(),
                 );
             }
-            InstrTyped::Load(op) => InstrCodegenOp::Load(op.try_map_children(self)?),
-            InstrTyped::BinOp(op) => InstrCodegenOp::BinOp(op.try_map_children(self)?),
-            InstrTyped::LegacyTuple(op) => InstrCodegenOp::Tuple(op.try_map_children(self)?),
-            InstrTyped::LegacyUnaryOp(op) => InstrCodegenOp::UnaryOp(op.try_map_children(self)?),
+            InstrTyped::Load(op) => InstrCodegen::Load(op.try_map_children(self)?),
+            InstrTyped::BinOp(op) => InstrCodegen::BinOp(op.try_map_children(self)?),
+            InstrTyped::LegacyTuple(op) => InstrCodegen::Tuple(op.try_map_children(self)?),
+            InstrTyped::LegacyUnaryOp(op) => InstrCodegen::UnaryOp(op.try_map_children(self)?),
             InstrTyped::LegacyCalleeFunctionId(op) => {
-                InstrCodegenOp::CalleeFunctionId(op.try_map_children(self)?)
+                InstrCodegen::CalleeFunctionId(op.try_map_children(self)?)
             }
             InstrTyped::DirectCallGuardTest(op) => {
                 let meta = op.meta();
                 match op.kind {
                     TypedDirectCallGuardTestKind::RuntimeFunctionId { function_id } => {
-                        InstrCodegenOp::DirectFunctionIdGuardTest(
+                        InstrCodegen::DirectFunctionIdGuardTest(
                             DirectFunctionIdGuardTest::new(
                                 self.try_map_instr(*op.value)?,
                                 function_id,
@@ -2264,7 +2264,7 @@ impl TryMapInstr<InstrTyped, InstrCodegen, String> for TypedToCodegen {
                 }
             }
             InstrTyped::CallTyped(op) => {
-                InstrCodegenOp::Call(op.try_map_children(self)?.into_legacy())
+                InstrCodegen::Call(op.try_map_children(self)?.into_legacy())
             }
             InstrTyped::GuardedCallableCallTyped(_) => {
                 return Err(
@@ -2282,28 +2282,28 @@ impl TryMapInstr<InstrTyped, InstrCodegen, String> for TypedToCodegen {
             InstrTyped::DirectMethodCallTyped(_) => {
                 return Err("typed direct method call requires typed codegen emission".to_string());
             }
-            InstrTyped::LegacyCall(op) => InstrCodegenOp::Call(op.try_map_children(self)?),
+            InstrTyped::LegacyCall(op) => InstrCodegen::Call(op.try_map_children(self)?),
             InstrTyped::LegacyCallDirect(op) => {
-                InstrCodegenOp::CallDirect(op.try_map_children(self)?)
+                InstrCodegen::CallDirect(op.try_map_children(self)?)
             }
             InstrTyped::GetAttrTyped(op) => {
-                InstrCodegenOp::GetAttr(op.try_map_children(self)?.into_legacy())
+                InstrCodegen::GetAttr(op.try_map_children(self)?.into_legacy())
             }
             InstrTyped::SetAttrTyped(op) => {
-                InstrCodegenOp::SetAttr(op.try_map_children(self)?.into_legacy())
+                InstrCodegen::SetAttr(op.try_map_children(self)?.into_legacy())
             }
-            InstrTyped::LegacyGetAttr(op) => InstrCodegenOp::GetAttr(op.try_map_children(self)?),
-            InstrTyped::LegacySetAttr(op) => InstrCodegenOp::SetAttr(op.try_map_children(self)?),
-            InstrTyped::LegacyGetItem(op) => InstrCodegenOp::GetItem(op.try_map_children(self)?),
-            InstrTyped::LegacySetItem(op) => InstrCodegenOp::SetItem(op.try_map_children(self)?),
-            InstrTyped::LegacyDelItem(op) => InstrCodegenOp::DelItem(op.try_map_children(self)?),
-            InstrTyped::LegacyStore(op) => InstrCodegenOp::Store(op.try_map_children(self)?),
-            InstrTyped::LegacyDel(op) => InstrCodegenOp::Del(op.try_map_children(self)?),
-            InstrTyped::LegacyMakeCell(op) => InstrCodegenOp::MakeCell(op.try_map_children(self)?),
-            InstrTyped::LegacyIncrementCounter(op) => InstrCodegenOp::IncrementCounter(op),
-            InstrTyped::LegacyCellRef(op) => InstrCodegenOp::CellRef(op),
+            InstrTyped::LegacyGetAttr(op) => InstrCodegen::GetAttr(op.try_map_children(self)?),
+            InstrTyped::LegacySetAttr(op) => InstrCodegen::SetAttr(op.try_map_children(self)?),
+            InstrTyped::LegacyGetItem(op) => InstrCodegen::GetItem(op.try_map_children(self)?),
+            InstrTyped::LegacySetItem(op) => InstrCodegen::SetItem(op.try_map_children(self)?),
+            InstrTyped::LegacyDelItem(op) => InstrCodegen::DelItem(op.try_map_children(self)?),
+            InstrTyped::LegacyStore(op) => InstrCodegen::Store(op.try_map_children(self)?),
+            InstrTyped::LegacyDel(op) => InstrCodegen::Del(op.try_map_children(self)?),
+            InstrTyped::LegacyMakeCell(op) => InstrCodegen::MakeCell(op.try_map_children(self)?),
+            InstrTyped::LegacyIncrementCounter(op) => InstrCodegen::IncrementCounter(op),
+            InstrTyped::LegacyCellRef(op) => InstrCodegen::CellRef(op),
             InstrTyped::LegacyMakeFunctionWithClosure(op) => {
-                InstrCodegenOp::MakeFunctionWithClosure(op.try_map_children(self)?)
+                InstrCodegen::MakeFunctionWithClosure(op.try_map_children(self)?)
             }
         })
     }

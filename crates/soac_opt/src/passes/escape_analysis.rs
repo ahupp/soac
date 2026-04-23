@@ -1,4 +1,4 @@
-use crate::passes::{CodegenModuleShape, InstrCodegen, InstrCodegenOp, InstrResolved};
+use crate::passes::{CodegenModuleShape, InstrCodegen, InstrResolved};
 use soac_core::block_py::PrettyPrint;
 use soac_core::block_py::literal::Literal;
 use soac_core::block_py::{
@@ -253,13 +253,13 @@ fn summarize_non_escaping_constructor_allocations(
     let normal_predecessor_counts = normal_predecessor_counts(function);
     for block in &function.blocks {
         for (instr_index, instr) in block.body.iter().enumerate() {
-            let InstrCodegenOp::Store(store) = instr else {
+            let InstrCodegen::Store(store) = instr else {
                 continue;
             };
             let Some(local_location) = store.name.location.as_local() else {
                 continue;
             };
-            let InstrCodegenOp::CallDirect(call) = store.value.as_ref() else {
+            let InstrCodegen::CallDirect(call) = store.value.as_ref() else {
                 continue;
             };
             if !straightline_constructor_ids.contains(&call.function_id) {
@@ -309,7 +309,7 @@ fn summarize_constructor_allocation_uses_in_block(
     let mut visited_jump_targets = HashSet::new();
     loop {
         for instr in current_body {
-            if let InstrCodegenOp::Store(store) = instr {
+            if let InstrCodegen::Store(store) = instr {
                 if store.name.location.as_local() == Some(local_location) {
                     break;
                 }
@@ -321,7 +321,7 @@ fn summarize_constructor_allocation_uses_in_block(
                     aliases.remove(&target_location);
                 }
             }
-            if let InstrCodegenOp::Del(del) = instr {
+            if let InstrCodegen::Del(del) = instr {
                 if let Some(location) = del.name.location.as_local() {
                     if aliases.remove(&location) {
                         continue;
@@ -424,7 +424,7 @@ fn record_allowed_constructor_local_use(
     summary: &mut NonEscapingConstructorAllocationSummary,
 ) -> bool {
     match instr {
-        InstrCodegenOp::GetAttr(getattr)
+        InstrCodegen::GetAttr(getattr)
             if is_local_alias_load(&getattr.value, aliases)
                 && !instr_uses_any_local(&getattr.attr, aliases) =>
         {
@@ -436,7 +436,7 @@ fn record_allowed_constructor_local_use(
                 .push(ConstructorFieldAccess { field_name });
             true
         }
-        InstrCodegenOp::SetAttr(setattr)
+        InstrCodegen::SetAttr(setattr)
             if is_local_alias_load(&setattr.value, aliases)
                 && !instr_uses_any_local(&setattr.attr, aliases)
                 && !instr_uses_any_local(&setattr.replacement, aliases) =>
@@ -454,7 +454,7 @@ fn record_allowed_constructor_local_use(
 }
 
 fn is_local_alias_load(instr: &InstrCodegen, aliases: &HashSet<LocalLocation>) -> bool {
-    let InstrCodegenOp::Load(load) = instr else {
+    let InstrCodegen::Load(load) = instr else {
         return false;
     };
     load.name
@@ -465,7 +465,7 @@ fn is_local_alias_load(instr: &InstrCodegen, aliases: &HashSet<LocalLocation>) -
 
 fn instr_uses_any_local(instr: &InstrCodegen, aliases: &HashSet<LocalLocation>) -> bool {
     instr_any(instr, |child| match child {
-        InstrCodegenOp::Load(load) => load
+        InstrCodegen::Load(load) => load
             .name
             .location
             .as_local()
@@ -478,7 +478,7 @@ fn constant_string(
     module: &BlockPyModule<CodegenModuleShape>,
     instr: &InstrCodegen,
 ) -> Option<String> {
-    let InstrCodegenOp::Load(load) = instr else {
+    let InstrCodegen::Load(load) = instr else {
         return None;
     };
     let constant_index = load.name.location.as_constant()? as usize;
@@ -638,7 +638,7 @@ impl ConstructorBuilder<'_> {
 
     fn scan_instr(&mut self, instr: &InstrCodegen) {
         match instr {
-            InstrCodegenOp::Store(store) => {
+            InstrCodegen::Store(store) => {
                 let Some(location) = store.name.location.as_local() else {
                     if self.instr_uses_self_or_alias(&store.value) {
                         self.reject("self used in non-local store value");
@@ -658,7 +658,7 @@ impl ConstructorBuilder<'_> {
                     }
                 }
             }
-            InstrCodegenOp::Del(del) => {
+            InstrCodegen::Del(del) => {
                 if let Some(location) = del.name.location.as_local() {
                     self.aliases.remove(&location);
                 }
@@ -666,7 +666,7 @@ impl ConstructorBuilder<'_> {
                     self.reject("deleted self");
                 }
             }
-            InstrCodegenOp::SetAttr(setattr) if self.is_self_alias(&setattr.value) => {
+            InstrCodegen::SetAttr(setattr) if self.is_self_alias(&setattr.value) => {
                 if self.instr_uses_self_or_alias(&setattr.attr)
                     || self.instr_uses_self_or_alias(&setattr.replacement)
                 {
@@ -751,7 +751,7 @@ impl ConstructorBuilder<'_> {
     }
 
     fn value_alias(&mut self, instr: &InstrCodegen) -> Option<ValueAlias> {
-        let InstrCodegenOp::Load(load) = instr else {
+        let InstrCodegen::Load(load) = instr else {
             return None;
         };
         if load.name.id_str() == self.self_name {
@@ -793,7 +793,7 @@ impl ConstructorBuilder<'_> {
     }
 
     fn constant_string(&self, instr: &InstrCodegen) -> Option<String> {
-        let InstrCodegenOp::Load(load) = instr else {
+        let InstrCodegen::Load(load) = instr else {
             return None;
         };
         let constant_index = load.name.location.as_constant()? as usize;
@@ -807,7 +807,7 @@ impl ConstructorBuilder<'_> {
     }
 
     fn is_runtime_none(&self, instr: &InstrCodegen) -> bool {
-        let InstrCodegenOp::Load(load) = instr else {
+        let InstrCodegen::Load(load) = instr else {
             return false;
         };
         if load.name.id_str() == "NONE"
@@ -853,7 +853,7 @@ impl ConstructorBuilder<'_> {
     }
 
     fn value_alias_readonly(&self, instr: &InstrCodegen) -> Option<ValueAlias> {
-        let InstrCodegenOp::Load(load) = instr else {
+        let InstrCodegen::Load(load) = instr else {
             return None;
         };
         if let Some(location) = load.name.location.as_local() {
@@ -889,7 +889,7 @@ impl ConstructorBuilder<'_> {
 
     fn instr_uses_self_alias(&self, instr: &InstrCodegen) -> bool {
         instr_any(instr, |child| match child {
-            InstrCodegenOp::Load(load) => load
+            InstrCodegen::Load(load) => load
                 .name
                 .location
                 .as_local()
@@ -902,7 +902,7 @@ impl ConstructorBuilder<'_> {
 
 fn instr_uses_self(instr: &InstrCodegen, self_name: &str) -> bool {
     instr_any(instr, |child| match child {
-        InstrCodegenOp::Load(load) => load.name.id_str() == self_name,
+        InstrCodegen::Load(load) => load.name.id_str() == self_name,
         _ => false,
     })
 }
@@ -960,10 +960,10 @@ mod tests {
     fn rewrite_first_box_call_as_direct(module: &mut BlockPyModule<CodegenModuleShape>) {
         let constructor_id = function_by_qualname(module, "Box.__init__").function_id;
         let function = function_by_qualname_mut(module, "make");
-        let Some(InstrCodegenOp::Store(store)) = function.blocks[0].body.first_mut() else {
+        let Some(InstrCodegen::Store(store)) = function.blocks[0].body.first_mut() else {
             panic!("make should start with a store");
         };
-        let InstrCodegenOp::Call(call) = store.value.as_ref() else {
+        let InstrCodegen::Call(call) = store.value.as_ref() else {
             panic!("store value should start as a generic call");
         };
         let args: Vec<CallArgPositional<InstrCodegen>> = call

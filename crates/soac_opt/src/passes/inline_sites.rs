@@ -1,4 +1,4 @@
-use crate::passes::{CodegenModuleShape, InlinePlanModule, InstrCodegen, InstrCodegenOp};
+use crate::passes::{CodegenModuleShape, InlinePlanModule, InstrCodegen};
 use soac_core::block_py::{
     BlockLabel, BlockPyModule, CallArgKeyword, CallArgPositional, ChildVisitable, HasMeta, InstrId,
     RuntimeFunctionId, Visit, walk_block, walk_expr,
@@ -52,7 +52,7 @@ impl Visit<InstrCodegen> for InlineCallSiteCollector<'_> {
     where
         InstrCodegen: ChildVisitable<InstrCodegen>,
     {
-        if let InstrCodegenOp::CallDirect(call) = expr {
+        if let InstrCodegen::CallDirect(call) = expr {
             if self
                 .inline_plan
                 .straightline_constructor(call.function_id)

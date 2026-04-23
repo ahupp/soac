@@ -9,7 +9,7 @@ pub(crate) mod value_facts;
 
 use soac_core::block_py::{BlockPyFunction, LocalLocation, NameLocation, ResolvedName};
 pub use soac_lowering::passes::{
-    CodegenModuleShape, DirectFunctionIdGuardTest, InstrCodegen, InstrCodegenOp, InstrResolved,
+    CodegenModuleShape, DirectFunctionIdGuardTest, InstrCodegen, InstrResolved,
     assign_missing_codegen_function_instr_ids, reassign_codegen_function_instr_ids,
     validate_codegen_instr_ids,
 };

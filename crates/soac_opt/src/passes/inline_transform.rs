@@ -1,7 +1,7 @@
 use crate::passes::{
-    CodegenModuleShape, ConstructorFieldValue, InlinePlanModule, InstrCodegen, InstrCodegenOp,
-    InstrResolved, allocate_codegen_stack_temp, plan_module_inlining,
-    reassign_codegen_function_instr_ids, summarize_module_escapes, try_allocate_codegen_stack_temp,
+    CodegenModuleShape, ConstructorFieldValue, InlinePlanModule, InstrCodegen, InstrResolved,
+    allocate_codegen_stack_temp, plan_module_inlining, reassign_codegen_function_instr_ids,
+    summarize_module_escapes, try_allocate_codegen_stack_temp,
 };
 use soac_core::block_py::literal::Literal;
 use soac_core::block_py::{
@@ -551,7 +551,7 @@ fn is_exception_matches_stop_iteration_test(
     module_constants: &[InstrResolved],
 ) -> bool {
     match expr {
-        InstrCodegenOp::Call(call) => {
+        InstrCodegen::Call(call) => {
             call.keywords.is_empty()
                 && is_runtime_name_expr(
                     call.func.as_ref(),
@@ -566,7 +566,7 @@ fn is_exception_matches_stop_iteration_test(
                     ] if is_runtime_stop_iteration_expr(stop_iteration, module_constants)
                 )
         }
-        InstrCodegenOp::CallDirect(call) => {
+        InstrCodegen::CallDirect(call) => {
             call.keywords.is_empty()
                 && is_runtime_name_expr(
                     call.callable.as_ref(),
@@ -594,7 +594,7 @@ fn is_runtime_name_expr(
     runtime_name: RuntimeName,
     module_constants: &[InstrResolved],
 ) -> bool {
-    let InstrCodegenOp::Load(load) = expr else {
+    let InstrCodegen::Load(load) = expr else {
         return false;
     };
     if load.name.location == NameLocation::RuntimeName(runtime_name)
@@ -1502,11 +1502,11 @@ fn find_scalarizable_allocation_candidate(
         .iter()
         .enumerate()
         .find_map(|(instr_index, instr)| {
-            let InstrCodegenOp::Store(store) = instr else {
+            let InstrCodegen::Store(store) = instr else {
                 return None;
             };
             let local_location = store.name.location.as_local()?;
-            let InstrCodegenOp::CallDirect(call) = store.value.as_ref() else {
+            let InstrCodegen::CallDirect(call) = store.value.as_ref() else {
                 return None;
             };
             if !straightline_constructor_ids.contains(&call.function_id) {
@@ -1693,12 +1693,12 @@ fn scalar_initializer_for_field(
 
 fn is_scalar_evaluatable_argument_expr(instr: &InstrCodegen, constants: &[InstrResolved]) -> bool {
     match instr {
-        InstrCodegenOp::Load(load) => {
+        InstrCodegen::Load(load) => {
             load.name.location.as_local().is_some()
                 || constant_string_from_constants(constants, instr).is_some()
                 || matches!(load.name.location, NameLocation::RuntimeName(_))
         }
-        InstrCodegenOp::GetAttr(getattr) => {
+        InstrCodegen::GetAttr(getattr) => {
             is_scalar_evaluatable_argument_expr(&getattr.value, constants)
                 && constant_string_from_constants(constants, &getattr.attr).is_some()
         }
@@ -1729,7 +1729,7 @@ fn rewrite_scalarized_instr_root(
     constants: &[InstrResolved],
 ) -> Option<InstrCodegen> {
     match instr {
-        InstrCodegenOp::GetAttr(getattr)
+        InstrCodegen::GetAttr(getattr)
             if is_local_alias_load(&getattr.value, &allocation.aliases) =>
         {
             let field_name = constant_string_from_constants(constants, &getattr.attr)?;
@@ -1738,7 +1738,7 @@ fn rewrite_scalarized_instr_root(
                 soac_core::block_py::Load::new(field.resolved_name()).into(),
             ))
         }
-        InstrCodegenOp::SetAttr(setattr)
+        InstrCodegen::SetAttr(setattr)
             if is_local_alias_load(&setattr.value, &allocation.aliases) =>
         {
             let field_name = constant_string_from_constants(constants, &setattr.attr)?;
@@ -1750,8 +1750,8 @@ fn rewrite_scalarized_instr_root(
                 Store::new(field.resolved_name(), setattr.replacement).into(),
             ))
         }
-        InstrCodegenOp::Store(store) => {
-            let InstrCodegenOp::GetAttr(getattr) = store.value.as_ref() else {
+        InstrCodegen::Store(store) => {
+            let InstrCodegen::GetAttr(getattr) = store.value.as_ref() else {
                 return None;
             };
             if !is_local_alias_load(&getattr.value, &allocation.aliases) {
@@ -1775,7 +1775,7 @@ fn record_or_remove_scalarized_alias(
     allocation: &mut ScalarizedAllocation,
 ) -> bool {
     match instr {
-        InstrCodegenOp::Store(store) => {
+        InstrCodegen::Store(store) => {
             let Some(target_location) = store.name.location.as_local() else {
                 return false;
             };
@@ -1785,7 +1785,7 @@ fn record_or_remove_scalarized_alias(
             }
             false
         }
-        InstrCodegenOp::Del(del) => {
+        InstrCodegen::Del(del) => {
             let Some(target_location) = del.name.location.as_local() else {
                 return false;
             };
@@ -1807,7 +1807,7 @@ fn rewrite_scalarized_term(
 ) -> Option<BlockTerm<InstrCodegen>> {
     match term {
         BlockTerm::Return(value) => {
-            let InstrCodegenOp::GetAttr(getattr) = value else {
+            let InstrCodegen::GetAttr(getattr) = value else {
                 return None;
             };
             if !is_local_alias_load(&getattr.value, &allocation.aliases) {
@@ -1825,7 +1825,7 @@ fn rewrite_scalarized_term(
 }
 
 fn is_store_to_any_alias(instr: &InstrCodegen, aliases: &HashSet<LocalLocation>) -> bool {
-    let InstrCodegenOp::Store(store) = instr else {
+    let InstrCodegen::Store(store) = instr else {
         return false;
     };
     store
@@ -1836,7 +1836,7 @@ fn is_store_to_any_alias(instr: &InstrCodegen, aliases: &HashSet<LocalLocation>)
 }
 
 fn is_local_alias_load(instr: &InstrCodegen, aliases: &HashSet<LocalLocation>) -> bool {
-    let InstrCodegenOp::Load(load) = instr else {
+    let InstrCodegen::Load(load) = instr else {
         return false;
     };
     load.name
@@ -1847,7 +1847,7 @@ fn is_local_alias_load(instr: &InstrCodegen, aliases: &HashSet<LocalLocation>) -
 
 fn instr_references_any_alias(instr: &InstrCodegen, aliases: &HashSet<LocalLocation>) -> bool {
     match instr {
-        InstrCodegenOp::Store(store)
+        InstrCodegen::Store(store)
             if store
                 .name
                 .location
@@ -1856,7 +1856,7 @@ fn instr_references_any_alias(instr: &InstrCodegen, aliases: &HashSet<LocalLocat
         {
             true
         }
-        InstrCodegenOp::Del(del)
+        InstrCodegen::Del(del)
             if del
                 .name
                 .location
@@ -1866,7 +1866,7 @@ fn instr_references_any_alias(instr: &InstrCodegen, aliases: &HashSet<LocalLocat
             true
         }
         _ => instr_any(instr, |child| match child {
-            InstrCodegenOp::Load(load) => load
+            InstrCodegen::Load(load) => load
                 .name
                 .location
                 .as_local()
@@ -1945,7 +1945,7 @@ fn constant_string_from_constants(
     constants: &[InstrResolved],
     instr: &InstrCodegen,
 ) -> Option<String> {
-    let InstrCodegenOp::Load(load) = instr else {
+    let InstrCodegen::Load(load) = instr else {
         return None;
     };
     let constant_index = load.name.location.as_constant()? as usize;
@@ -1976,10 +1976,10 @@ fn find_inline_store_candidate(
         .iter()
         .enumerate()
         .find_map(|(instr_index, instr)| {
-            let InstrCodegenOp::Store(store) = instr else {
+            let InstrCodegen::Store(store) = instr else {
                 return None;
             };
-            let InstrCodegenOp::CallDirect(call) = store.value.as_ref() else {
+            let InstrCodegen::CallDirect(call) = store.value.as_ref() else {
                 return None;
             };
             if call.function_id == caller_id {
@@ -2334,7 +2334,7 @@ fn build_multi_block_inline_fragment_to_target_impl(
             .cloned()
             // Inlined profiling counters belong to the callee's counter
             // layout; the caller does not have storage for those ids.
-            .filter(|instr| !matches!(instr, InstrCodegenOp::IncrementCounter(_)))
+            .filter(|instr| !matches!(instr, InstrCodegen::IncrementCounter(_)))
             .map(|instr| remapper.try_map_instr(instr))
             .collect::<Result<Vec<_>, _>>()?;
         let term = match &callee_block.term {
@@ -2469,7 +2469,7 @@ fn build_single_block_inline_fragment_with_constant_scope(
         .cloned()
         // Inlined profiling counters belong to the callee's counter layout;
         // the caller does not have storage for those ids.
-        .filter(|instr| !matches!(instr, InstrCodegenOp::IncrementCounter(_)))
+        .filter(|instr| !matches!(instr, InstrCodegen::IncrementCounter(_)))
         .map(|instr| remapper.try_map_instr(instr))
         .collect::<Result<Vec<_>, _>>()?;
     let return_value = remapper.try_map_instr(return_value.clone())?;
@@ -2633,53 +2633,51 @@ impl TryMapInstr<InstrCodegen, InstrCodegen, InlineUnsupportedReason>
         instr: InstrCodegen,
     ) -> Result<InstrCodegen, InlineUnsupportedReason> {
         let mapped = match instr {
-            InstrCodegenOp::BinOp(op) => InstrCodegenOp::BinOp(op.try_map_children(self)?),
-            InstrCodegenOp::UnaryOp(op) => InstrCodegenOp::UnaryOp(op.try_map_children(self)?),
-            InstrCodegenOp::CalleeFunctionId(op) => {
-                InstrCodegenOp::CalleeFunctionId(op.try_map_children(self)?)
+            InstrCodegen::BinOp(op) => InstrCodegen::BinOp(op.try_map_children(self)?),
+            InstrCodegen::UnaryOp(op) => InstrCodegen::UnaryOp(op.try_map_children(self)?),
+            InstrCodegen::CalleeFunctionId(op) => {
+                InstrCodegen::CalleeFunctionId(op.try_map_children(self)?)
             }
-            InstrCodegenOp::DirectFunctionIdGuardTest(op) => {
-                InstrCodegenOp::DirectFunctionIdGuardTest(op.try_map_children(self)?)
+            InstrCodegen::DirectFunctionIdGuardTest(op) => {
+                InstrCodegen::DirectFunctionIdGuardTest(op.try_map_children(self)?)
             }
-            InstrCodegenOp::Tuple(op) => InstrCodegenOp::Tuple(op.try_map_children(self)?),
-            InstrCodegenOp::Call(op) => InstrCodegenOp::Call(op.try_map_children(self)?),
-            InstrCodegenOp::CallDirect(op) => {
-                InstrCodegenOp::CallDirect(op.try_map_children(self)?)
-            }
-            InstrCodegenOp::GetAttr(op) => InstrCodegenOp::GetAttr(op.try_map_children(self)?),
-            InstrCodegenOp::SetAttr(op) => InstrCodegenOp::SetAttr(op.try_map_children(self)?),
-            InstrCodegenOp::GetItem(op) => InstrCodegenOp::GetItem(op.try_map_children(self)?),
-            InstrCodegenOp::SetItem(op) => InstrCodegenOp::SetItem(op.try_map_children(self)?),
-            InstrCodegenOp::DelItem(op) => InstrCodegenOp::DelItem(op.try_map_children(self)?),
-            InstrCodegenOp::Load(op) => {
+            InstrCodegen::Tuple(op) => InstrCodegen::Tuple(op.try_map_children(self)?),
+            InstrCodegen::Call(op) => InstrCodegen::Call(op.try_map_children(self)?),
+            InstrCodegen::CallDirect(op) => InstrCodegen::CallDirect(op.try_map_children(self)?),
+            InstrCodegen::GetAttr(op) => InstrCodegen::GetAttr(op.try_map_children(self)?),
+            InstrCodegen::SetAttr(op) => InstrCodegen::SetAttr(op.try_map_children(self)?),
+            InstrCodegen::GetItem(op) => InstrCodegen::GetItem(op.try_map_children(self)?),
+            InstrCodegen::SetItem(op) => InstrCodegen::SetItem(op.try_map_children(self)?),
+            InstrCodegen::DelItem(op) => InstrCodegen::DelItem(op.try_map_children(self)?),
+            InstrCodegen::Load(op) => {
                 if let Some(location) = op.name.local_location() {
                     if let Some(value) = self.value_bindings.get(&location) {
                         return Ok(clear_codegen_instr_ids(value.clone()));
                     }
                 }
-                InstrCodegenOp::Load(op.try_map_children(self)?)
+                InstrCodegen::Load(op.try_map_children(self)?)
             }
-            InstrCodegenOp::Store(op) => {
+            InstrCodegen::Store(op) => {
                 if let Some(location) = op.name.local_location() {
                     if self.value_bindings.contains_key(&location) {
                         return Err(InlineUnsupportedReason::RebindsBoundLocal(location));
                     }
                 }
-                InstrCodegenOp::Store(op.try_map_children(self)?)
+                InstrCodegen::Store(op.try_map_children(self)?)
             }
-            InstrCodegenOp::Del(op) => {
+            InstrCodegen::Del(op) => {
                 if let Some(location) = op.name.local_location() {
                     if self.value_bindings.contains_key(&location) {
                         return Err(InlineUnsupportedReason::RebindsBoundLocal(location));
                     }
                 }
-                InstrCodegenOp::Del(op.try_map_children(self)?)
+                InstrCodegen::Del(op.try_map_children(self)?)
             }
-            InstrCodegenOp::MakeCell(op) => InstrCodegenOp::MakeCell(op.try_map_children(self)?),
-            InstrCodegenOp::IncrementCounter(op) => InstrCodegenOp::IncrementCounter(op),
-            InstrCodegenOp::CellRef(op) => InstrCodegenOp::CellRef(op),
-            InstrCodegenOp::MakeFunctionWithClosure(op) => {
-                InstrCodegenOp::MakeFunctionWithClosure(op.try_map_children(self)?)
+            InstrCodegen::MakeCell(op) => InstrCodegen::MakeCell(op.try_map_children(self)?),
+            InstrCodegen::IncrementCounter(op) => InstrCodegen::IncrementCounter(op),
+            InstrCodegen::CellRef(op) => InstrCodegen::CellRef(op),
+            InstrCodegen::MakeFunctionWithClosure(op) => {
+                InstrCodegen::MakeFunctionWithClosure(op.try_map_children(self)?)
             }
         };
         Ok(clear_codegen_instr_id(mapped))
@@ -2730,30 +2728,30 @@ struct InstrIdScrubber;
 impl MapInstr<InstrCodegen, InstrCodegen> for InstrIdScrubber {
     fn map_instr(&mut self, instr: InstrCodegen) -> InstrCodegen {
         let mapped = match instr {
-            InstrCodegenOp::BinOp(op) => InstrCodegenOp::BinOp(op.map_children(self)),
-            InstrCodegenOp::UnaryOp(op) => InstrCodegenOp::UnaryOp(op.map_children(self)),
-            InstrCodegenOp::CalleeFunctionId(op) => {
-                InstrCodegenOp::CalleeFunctionId(op.map_children(self))
+            InstrCodegen::BinOp(op) => InstrCodegen::BinOp(op.map_children(self)),
+            InstrCodegen::UnaryOp(op) => InstrCodegen::UnaryOp(op.map_children(self)),
+            InstrCodegen::CalleeFunctionId(op) => {
+                InstrCodegen::CalleeFunctionId(op.map_children(self))
             }
-            InstrCodegenOp::DirectFunctionIdGuardTest(op) => {
-                InstrCodegenOp::DirectFunctionIdGuardTest(op.map_children(self))
+            InstrCodegen::DirectFunctionIdGuardTest(op) => {
+                InstrCodegen::DirectFunctionIdGuardTest(op.map_children(self))
             }
-            InstrCodegenOp::Tuple(op) => InstrCodegenOp::Tuple(op.map_children(self)),
-            InstrCodegenOp::Call(op) => InstrCodegenOp::Call(op.map_children(self)),
-            InstrCodegenOp::CallDirect(op) => InstrCodegenOp::CallDirect(op.map_children(self)),
-            InstrCodegenOp::GetAttr(op) => InstrCodegenOp::GetAttr(op.map_children(self)),
-            InstrCodegenOp::SetAttr(op) => InstrCodegenOp::SetAttr(op.map_children(self)),
-            InstrCodegenOp::GetItem(op) => InstrCodegenOp::GetItem(op.map_children(self)),
-            InstrCodegenOp::SetItem(op) => InstrCodegenOp::SetItem(op.map_children(self)),
-            InstrCodegenOp::DelItem(op) => InstrCodegenOp::DelItem(op.map_children(self)),
-            InstrCodegenOp::Load(op) => InstrCodegenOp::Load(op.map_children(self)),
-            InstrCodegenOp::Store(op) => InstrCodegenOp::Store(op.map_children(self)),
-            InstrCodegenOp::Del(op) => InstrCodegenOp::Del(op.map_children(self)),
-            InstrCodegenOp::MakeCell(op) => InstrCodegenOp::MakeCell(op.map_children(self)),
-            InstrCodegenOp::IncrementCounter(op) => InstrCodegenOp::IncrementCounter(op),
-            InstrCodegenOp::CellRef(op) => InstrCodegenOp::CellRef(op),
-            InstrCodegenOp::MakeFunctionWithClosure(op) => {
-                InstrCodegenOp::MakeFunctionWithClosure(op.map_children(self))
+            InstrCodegen::Tuple(op) => InstrCodegen::Tuple(op.map_children(self)),
+            InstrCodegen::Call(op) => InstrCodegen::Call(op.map_children(self)),
+            InstrCodegen::CallDirect(op) => InstrCodegen::CallDirect(op.map_children(self)),
+            InstrCodegen::GetAttr(op) => InstrCodegen::GetAttr(op.map_children(self)),
+            InstrCodegen::SetAttr(op) => InstrCodegen::SetAttr(op.map_children(self)),
+            InstrCodegen::GetItem(op) => InstrCodegen::GetItem(op.map_children(self)),
+            InstrCodegen::SetItem(op) => InstrCodegen::SetItem(op.map_children(self)),
+            InstrCodegen::DelItem(op) => InstrCodegen::DelItem(op.map_children(self)),
+            InstrCodegen::Load(op) => InstrCodegen::Load(op.map_children(self)),
+            InstrCodegen::Store(op) => InstrCodegen::Store(op.map_children(self)),
+            InstrCodegen::Del(op) => InstrCodegen::Del(op.map_children(self)),
+            InstrCodegen::MakeCell(op) => InstrCodegen::MakeCell(op.map_children(self)),
+            InstrCodegen::IncrementCounter(op) => InstrCodegen::IncrementCounter(op),
+            InstrCodegen::CellRef(op) => InstrCodegen::CellRef(op),
+            InstrCodegen::MakeFunctionWithClosure(op) => {
+                InstrCodegen::MakeFunctionWithClosure(op.map_children(self))
             }
         };
         clear_codegen_instr_id(mapped)
@@ -3130,13 +3128,13 @@ def caller(obj):
             .iter()
             .flat_map(|block| block.body.iter())
             .find_map(|instr| {
-                let InstrCodegenOp::Store(store) = instr else {
+                let InstrCodegen::Store(store) = instr else {
                     return None;
                 };
-                let InstrCodegenOp::GetAttr(getattr) = store.value.as_ref() else {
+                let InstrCodegen::GetAttr(getattr) = store.value.as_ref() else {
                     return None;
                 };
-                let InstrCodegenOp::Load(load) = getattr.attr.as_ref() else {
+                let InstrCodegen::Load(load) = getattr.attr.as_ref() else {
                     return None;
                 };
                 load.name.location.as_constant()
@@ -3560,11 +3558,11 @@ def make(x):
             .body
             .iter_mut()
             .find_map(|instr| match instr {
-                InstrCodegenOp::Store(store) if store.name.id_str() == "out" => Some(store),
+                InstrCodegen::Store(store) if store.name.id_str() == "out" => Some(store),
                 _ => None,
             })
             .expect("make should store the constructor result into out");
-        let InstrCodegenOp::Call(call) = allocation_store.value.as_ref() else {
+        let InstrCodegen::Call(call) = allocation_store.value.as_ref() else {
             panic!("constructor store should start as a generic call");
         };
         let args = call.args.clone();
@@ -3642,12 +3640,12 @@ def make(x):
             let allocation_index = block
                 .body
                 .iter()
-                .position(|instr| matches!(instr, InstrCodegenOp::Store(store) if store.name.id_str() == "out"))
+                .position(|instr| matches!(instr, InstrCodegen::Store(store) if store.name.id_str() == "out"))
                 .expect("make should store the constructor result into out");
-            let InstrCodegenOp::Store(allocation_store) = &mut block.body[allocation_index] else {
+            let InstrCodegen::Store(allocation_store) = &mut block.body[allocation_index] else {
                 unreachable!("allocation index should point at a store");
             };
-            let InstrCodegenOp::Call(call) = allocation_store.value.as_ref() else {
+            let InstrCodegen::Call(call) = allocation_store.value.as_ref() else {
                 panic!("constructor store should start as a generic call");
             };
             let args = call.args.clone();
@@ -3753,11 +3751,11 @@ def make(x, cond):
             .iter_mut()
             .flat_map(|block| block.body.iter_mut())
             .find_map(|instr| match instr {
-                InstrCodegenOp::Store(store) if store.name.id_str() == "out" => Some(store),
+                InstrCodegen::Store(store) if store.name.id_str() == "out" => Some(store),
                 _ => None,
             })
             .expect("make should store the constructor result into out");
-        let InstrCodegenOp::Call(call) = allocation_store.value.as_ref() else {
+        let InstrCodegen::Call(call) = allocation_store.value.as_ref() else {
             panic!("constructor store should start as a generic call");
         };
         let args = call.args.clone();

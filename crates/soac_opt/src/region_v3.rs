@@ -3,7 +3,7 @@ use soac_core::block_py::{
     BinOpKind, Block, BlockLabel, BlockPyFunction, BlockTerm, HasSemanticInstrId, InstrId, Load,
     ResolvedName, TermIf, UnaryOpKind,
 };
-use soac_lowering::passes::{CodegenModuleShape, InstrCodegen, InstrCodegenOp};
+use soac_lowering::passes::{CodegenModuleShape, InstrCodegen};
 use std::fmt;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -166,7 +166,7 @@ fn extract_block_body_instr_region_v3(
         return Err(RegionExtractionError::BlockHasExceptionEdge { block: block.label });
     }
 
-    let InstrCodegenOp::Store(store) = instr else {
+    let InstrCodegen::Store(store) = instr else {
         return Err(unsupported_instr_error(instr));
     };
     let mut builder = RegionBuilder::new(id, block.label);
@@ -204,25 +204,25 @@ fn unsupported_instr_error(instr: &InstrCodegen) -> RegionExtractionError {
 
 fn instr_codegen_kind(instr: &InstrCodegen) -> &'static str {
     match instr {
-        InstrCodegenOp::BinOp(_) => "BinOp",
-        InstrCodegenOp::UnaryOp(_) => "UnaryOp",
-        InstrCodegenOp::CalleeFunctionId(_) => "CalleeFunctionId",
-        InstrCodegenOp::DirectFunctionIdGuardTest(_) => "DirectFunctionIdGuardTest",
-        InstrCodegenOp::Tuple(_) => "Tuple",
-        InstrCodegenOp::Call(_) => "Call",
-        InstrCodegenOp::CallDirect(_) => "CallDirect",
-        InstrCodegenOp::GetAttr(_) => "GetAttr",
-        InstrCodegenOp::SetAttr(_) => "SetAttr",
-        InstrCodegenOp::GetItem(_) => "GetItem",
-        InstrCodegenOp::SetItem(_) => "SetItem",
-        InstrCodegenOp::DelItem(_) => "DelItem",
-        InstrCodegenOp::Load(_) => "Load",
-        InstrCodegenOp::Store(_) => "Store",
-        InstrCodegenOp::Del(_) => "Del",
-        InstrCodegenOp::MakeCell(_) => "MakeCell",
-        InstrCodegenOp::IncrementCounter(_) => "IncrementCounter",
-        InstrCodegenOp::CellRef(_) => "CellRef",
-        InstrCodegenOp::MakeFunctionWithClosure(_) => "MakeFunctionWithClosure",
+        InstrCodegen::BinOp(_) => "BinOp",
+        InstrCodegen::UnaryOp(_) => "UnaryOp",
+        InstrCodegen::CalleeFunctionId(_) => "CalleeFunctionId",
+        InstrCodegen::DirectFunctionIdGuardTest(_) => "DirectFunctionIdGuardTest",
+        InstrCodegen::Tuple(_) => "Tuple",
+        InstrCodegen::Call(_) => "Call",
+        InstrCodegen::CallDirect(_) => "CallDirect",
+        InstrCodegen::GetAttr(_) => "GetAttr",
+        InstrCodegen::SetAttr(_) => "SetAttr",
+        InstrCodegen::GetItem(_) => "GetItem",
+        InstrCodegen::SetItem(_) => "SetItem",
+        InstrCodegen::DelItem(_) => "DelItem",
+        InstrCodegen::Load(_) => "Load",
+        InstrCodegen::Store(_) => "Store",
+        InstrCodegen::Del(_) => "Del",
+        InstrCodegen::MakeCell(_) => "MakeCell",
+        InstrCodegen::IncrementCounter(_) => "IncrementCounter",
+        InstrCodegen::CellRef(_) => "CellRef",
+        InstrCodegen::MakeFunctionWithClosure(_) => "MakeFunctionWithClosure",
     }
 }
 
@@ -308,10 +308,10 @@ impl RegionBuilder {
         instr: &InstrCodegen,
     ) -> Result<ExtractedValueId, RegionExtractionError> {
         match instr {
-            InstrCodegenOp::Load(load) => {
+            InstrCodegen::Load(load) => {
                 Ok(self.linearize_load(load, instr.try_semantic_instr_id()))
             }
-            InstrCodegenOp::BinOp(op) => {
+            InstrCodegen::BinOp(op) => {
                 let left = self.linearize_instr(&op.left)?;
                 let right = self.linearize_instr(&op.right)?;
                 Ok(self.push(
@@ -323,80 +323,80 @@ impl RegionBuilder {
                     },
                 ))
             }
-            InstrCodegenOp::UnaryOp(op) if op.kind == UnaryOpKind::Truth => {
+            InstrCodegen::UnaryOp(op) if op.kind == UnaryOpKind::Truth => {
                 let value = self.linearize_instr(&op.operand)?;
                 Ok(self.push(
                     instr.try_semantic_instr_id(),
                     ExtractedValueKind::Truthiness { value },
                 ))
             }
-            InstrCodegenOp::Tuple(_) => Err(RegionExtractionError::UnsupportedInstr {
+            InstrCodegen::Tuple(_) => Err(RegionExtractionError::UnsupportedInstr {
                 source: instr.try_semantic_instr_id(),
                 kind: "Tuple",
             }),
-            InstrCodegenOp::UnaryOp(_) => Err(RegionExtractionError::UnsupportedInstr {
+            InstrCodegen::UnaryOp(_) => Err(RegionExtractionError::UnsupportedInstr {
                 source: instr.try_semantic_instr_id(),
                 kind: "UnaryOp",
             }),
-            InstrCodegenOp::CalleeFunctionId(_) => Err(RegionExtractionError::UnsupportedInstr {
+            InstrCodegen::CalleeFunctionId(_) => Err(RegionExtractionError::UnsupportedInstr {
                 source: instr.try_semantic_instr_id(),
                 kind: "CalleeFunctionId",
             }),
-            InstrCodegenOp::DirectFunctionIdGuardTest(_) => {
+            InstrCodegen::DirectFunctionIdGuardTest(_) => {
                 Err(RegionExtractionError::UnsupportedInstr {
                     source: instr.try_semantic_instr_id(),
                     kind: "DirectFunctionIdGuardTest",
                 })
             }
-            InstrCodegenOp::Call(_) => Err(RegionExtractionError::UnsupportedInstr {
+            InstrCodegen::Call(_) => Err(RegionExtractionError::UnsupportedInstr {
                 source: instr.try_semantic_instr_id(),
                 kind: "Call",
             }),
-            InstrCodegenOp::CallDirect(_) => Err(RegionExtractionError::UnsupportedInstr {
+            InstrCodegen::CallDirect(_) => Err(RegionExtractionError::UnsupportedInstr {
                 source: instr.try_semantic_instr_id(),
                 kind: "CallDirect",
             }),
-            InstrCodegenOp::GetAttr(_) => Err(RegionExtractionError::UnsupportedInstr {
+            InstrCodegen::GetAttr(_) => Err(RegionExtractionError::UnsupportedInstr {
                 source: instr.try_semantic_instr_id(),
                 kind: "GetAttr",
             }),
-            InstrCodegenOp::SetAttr(_) => Err(RegionExtractionError::UnsupportedInstr {
+            InstrCodegen::SetAttr(_) => Err(RegionExtractionError::UnsupportedInstr {
                 source: instr.try_semantic_instr_id(),
                 kind: "SetAttr",
             }),
-            InstrCodegenOp::GetItem(_) => Err(RegionExtractionError::UnsupportedInstr {
+            InstrCodegen::GetItem(_) => Err(RegionExtractionError::UnsupportedInstr {
                 source: instr.try_semantic_instr_id(),
                 kind: "GetItem",
             }),
-            InstrCodegenOp::SetItem(_) => Err(RegionExtractionError::UnsupportedInstr {
+            InstrCodegen::SetItem(_) => Err(RegionExtractionError::UnsupportedInstr {
                 source: instr.try_semantic_instr_id(),
                 kind: "SetItem",
             }),
-            InstrCodegenOp::DelItem(_) => Err(RegionExtractionError::UnsupportedInstr {
+            InstrCodegen::DelItem(_) => Err(RegionExtractionError::UnsupportedInstr {
                 source: instr.try_semantic_instr_id(),
                 kind: "DelItem",
             }),
-            InstrCodegenOp::Store(_) => Err(RegionExtractionError::UnsupportedInstr {
+            InstrCodegen::Store(_) => Err(RegionExtractionError::UnsupportedInstr {
                 source: instr.try_semantic_instr_id(),
                 kind: "Store",
             }),
-            InstrCodegenOp::Del(_) => Err(RegionExtractionError::UnsupportedInstr {
+            InstrCodegen::Del(_) => Err(RegionExtractionError::UnsupportedInstr {
                 source: instr.try_semantic_instr_id(),
                 kind: "Del",
             }),
-            InstrCodegenOp::MakeCell(_) => Err(RegionExtractionError::UnsupportedInstr {
+            InstrCodegen::MakeCell(_) => Err(RegionExtractionError::UnsupportedInstr {
                 source: instr.try_semantic_instr_id(),
                 kind: "MakeCell",
             }),
-            InstrCodegenOp::IncrementCounter(_) => Err(RegionExtractionError::UnsupportedInstr {
+            InstrCodegen::IncrementCounter(_) => Err(RegionExtractionError::UnsupportedInstr {
                 source: instr.try_semantic_instr_id(),
                 kind: "IncrementCounter",
             }),
-            InstrCodegenOp::CellRef(_) => Err(RegionExtractionError::UnsupportedInstr {
+            InstrCodegen::CellRef(_) => Err(RegionExtractionError::UnsupportedInstr {
                 source: instr.try_semantic_instr_id(),
                 kind: "CellRef",
             }),
-            InstrCodegenOp::MakeFunctionWithClosure(_) => {
+            InstrCodegen::MakeFunctionWithClosure(_) => {
                 Err(RegionExtractionError::UnsupportedInstr {
                     source: instr.try_semantic_instr_id(),
                     kind: "MakeFunctionWithClosure",
