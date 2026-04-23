@@ -86,6 +86,19 @@ use soac_opt::artifacts_v3::{
     ExactIntBranchV3Artifacts, load_optimization_artifacts_v3,
     single_function_optimization_artifacts_v3, validate_optimization_artifacts_v3_for_module,
 };
+use soac_opt::call_emission_v3::{
+    PreparedV3ConstructorCallPlan, PreparedV3MethodCallPlan, ResolvedV3ConstructorCallPlan,
+    ResolvedV3DirectCallPlan, ResolvedV3MethodCallPlan,
+    constructor_call_targets as opt_v3_constructor_call_targets,
+    direct_call_body_plans as opt_v3_direct_call_body_plans,
+    direct_call_targets as opt_v3_direct_call_targets,
+    inline_direct_call_targets as opt_v3_inline_direct_call_targets,
+    inline_method_call_targets as opt_v3_inline_method_call_targets,
+    merge_call_target_specializations, method_call_targets as opt_v3_method_call_targets,
+    prepare_constructor_call_plans_for_codegen, prepare_method_call_plans_for_codegen,
+    typed_call_emission_plans_from_v3, typed_direct_call_arg_plan_from_v3,
+    v3_call_emission_sources as opt_v3_call_emission_sources,
+};
 use soac_opt::emit_v3::{
     MechanicalExactListItemEmission, MechanicalExitKind, MechanicalIndexedFieldEmission,
     MechanicalIndexedFieldGuard, MechanicalIndexedGlobalEmission, MechanicalOperation,
@@ -98,11 +111,7 @@ use soac_opt::plan::{
     load_optimization_plan,
 };
 use soac_opt::plan_v3::{
-    CallBodyKind as PlanV3CallBodyKind, CallBodyPlan as PlanV3CallBodyPlan,
-    ConstructorCallFallbackKind as PlanV3ConstructorCallFallbackKind,
-    ConstructorCallGuardKind as PlanV3ConstructorCallGuardKind,
-    ConstructorCallOwnerType as PlanV3ConstructorCallOwnerType, ConversionKind,
-    DirectCallArgPlan as PlanV3DirectCallArgPlan, DirectCallArgSource as PlanV3DirectCallArgSource,
+    CallBodyKind as PlanV3CallBodyKind, ConversionKind,
     ExactListItemAccessKind as PlanV3ExactListItemAccessKind,
     ExactListItemFallbackKind as PlanV3ExactListItemFallbackKind,
     ExactListItemGuardKind as PlanV3ExactListItemGuardKind,
@@ -112,13 +121,10 @@ use soac_opt::plan_v3::{
     IndexedFieldGuardKind as PlanV3IndexedFieldGuardKind,
     IndexedGlobalAccessKind as PlanV3IndexedGlobalAccessKind,
     IndexedGlobalFallbackKind as PlanV3IndexedGlobalFallbackKind,
-    IndexedGlobalGuardKind as PlanV3IndexedGlobalGuardKind, MaterializeKind,
-    MethodCallFallbackKind as PlanV3MethodCallFallbackKind,
-    MethodCallGuardKind as PlanV3MethodCallGuardKind,
-    MethodCallOwnerType as PlanV3MethodCallOwnerType, PlanNodeId, PlanValue, PlannedConstant,
-    RegionId, RegionInputSource, RegionPlan, Rep, RichCompareOp, ScalarLocalThreadPlan,
-    ScalarThreadFallback, ScalarThreadLocalCleanup, ScalarThreadLocalLocation,
-    ScalarThreadLocalState, ScalarThreadMaterialization,
+    IndexedGlobalGuardKind as PlanV3IndexedGlobalGuardKind, MaterializeKind, PlanNodeId, PlanValue,
+    PlannedConstant, RegionId, RegionInputSource, RegionPlan, Rep, RichCompareOp,
+    ScalarLocalThreadPlan, ScalarThreadFallback, ScalarThreadLocalCleanup,
+    ScalarThreadLocalLocation, ScalarThreadLocalState, ScalarThreadMaterialization,
 };
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
@@ -2346,7 +2352,7 @@ fn profiled_owner_attr_specializations_for_lowering(
 }
 
 fn profiled_runtime_iter_constructor_calls_for_lowering(
-    source: &HashMap<InstrId, Vec<OptV3ConstructorCallPlan>>,
+    source: &HashMap<InstrId, Vec<ResolvedV3ConstructorCallPlan>>,
 ) -> HashMap<InstrId, Vec<ProfiledRuntimeIterConstructorCall>> {
     source
         .iter()
@@ -12445,11 +12451,11 @@ struct SpecializationProfile<'a> {
     counter_dump_path: Option<Cow<'a, Path>>,
     planned_evidence: HashMap<RuntimeFunctionId, FunctionProfileEvidence>,
     opt_v3_emitted_direct_calls:
-        HashMap<RuntimeFunctionId, HashMap<InstrId, Vec<OptV3DirectCallPlan>>>,
+        HashMap<RuntimeFunctionId, HashMap<InstrId, Vec<ResolvedV3DirectCallPlan>>>,
     opt_v3_emitted_constructor_calls:
-        HashMap<RuntimeFunctionId, HashMap<InstrId, Vec<OptV3ConstructorCallPlan>>>,
+        HashMap<RuntimeFunctionId, HashMap<InstrId, Vec<ResolvedV3ConstructorCallPlan>>>,
     opt_v3_emitted_method_calls:
-        HashMap<RuntimeFunctionId, HashMap<InstrId, Vec<OptV3MethodCallPlan>>>,
+        HashMap<RuntimeFunctionId, HashMap<InstrId, Vec<ResolvedV3MethodCallPlan>>>,
     opt_v3_emitted_exact_list_items:
         HashMap<RuntimeFunctionId, HashMap<InstrId, OptV3ExactListItemAccessPlan>>,
     opt_v3_emitted_indexed_fields:
@@ -12466,11 +12472,11 @@ struct SpecializationProfile<'a> {
 struct PlannedOptimizationInputs {
     evidence_by_function: HashMap<RuntimeFunctionId, FunctionProfileEvidence>,
     opt_v3_emitted_direct_calls:
-        HashMap<RuntimeFunctionId, HashMap<InstrId, Vec<OptV3DirectCallPlan>>>,
+        HashMap<RuntimeFunctionId, HashMap<InstrId, Vec<ResolvedV3DirectCallPlan>>>,
     opt_v3_emitted_constructor_calls:
-        HashMap<RuntimeFunctionId, HashMap<InstrId, Vec<OptV3ConstructorCallPlan>>>,
+        HashMap<RuntimeFunctionId, HashMap<InstrId, Vec<ResolvedV3ConstructorCallPlan>>>,
     opt_v3_emitted_method_calls:
-        HashMap<RuntimeFunctionId, HashMap<InstrId, Vec<OptV3MethodCallPlan>>>,
+        HashMap<RuntimeFunctionId, HashMap<InstrId, Vec<ResolvedV3MethodCallPlan>>>,
     opt_v3_emitted_exact_list_items:
         HashMap<RuntimeFunctionId, HashMap<InstrId, OptV3ExactListItemAccessPlan>>,
     opt_v3_emitted_indexed_fields:
@@ -12546,166 +12552,6 @@ impl PlannedOptimizationInputs {
         );
         merge_call_target_specializations(merged_targets, self.v3_method_call_targets(function_id))
     }
-}
-
-fn opt_v3_direct_call_targets(
-    direct_calls_by_source: &HashMap<InstrId, Vec<OptV3DirectCallPlan>>,
-) -> HashMap<InstrId, Vec<RuntimeFunctionId>> {
-    direct_calls_by_source
-        .iter()
-        .map(|(source, direct_calls)| {
-            (
-                *source,
-                direct_calls
-                    .iter()
-                    .map(|direct_call| direct_call.target)
-                    .collect(),
-            )
-        })
-        .collect()
-}
-
-fn opt_v3_inline_direct_call_targets(
-    direct_calls_by_source: &HashMap<InstrId, Vec<OptV3DirectCallPlan>>,
-) -> HashMap<InstrId, Vec<RuntimeFunctionId>> {
-    direct_calls_by_source
-        .iter()
-        .filter_map(|(source, direct_calls)| {
-            let targets = direct_calls
-                .iter()
-                .filter(|direct_call| direct_call.body.kind == PlanV3CallBodyKind::Inline)
-                .map(|direct_call| direct_call.target)
-                .collect::<Vec<_>>();
-            (!targets.is_empty()).then_some((*source, targets))
-        })
-        .collect()
-}
-
-fn opt_v3_direct_call_body_plans(
-    direct_calls_by_source: &HashMap<InstrId, Vec<OptV3DirectCallPlan>>,
-) -> HashMap<InstrId, Vec<OptV3DirectCallPlan>> {
-    direct_calls_by_source
-        .iter()
-        .filter_map(|(source, direct_calls)| {
-            let plans = direct_calls
-                .iter()
-                .filter(|direct_call| direct_call.body.kind == PlanV3CallBodyKind::DirectCall)
-                .cloned()
-                .collect::<Vec<_>>();
-            (!plans.is_empty()).then_some((*source, plans))
-        })
-        .collect()
-}
-
-fn opt_v3_constructor_call_targets(
-    constructor_calls_by_source: &HashMap<InstrId, Vec<OptV3ConstructorCallPlan>>,
-) -> HashMap<InstrId, Vec<RuntimeFunctionId>> {
-    constructor_calls_by_source
-        .iter()
-        .map(|(source, constructor_calls)| {
-            (
-                *source,
-                constructor_calls
-                    .iter()
-                    .map(|constructor_call| constructor_call.target)
-                    .collect(),
-            )
-        })
-        .collect()
-}
-
-fn opt_v3_method_call_targets(
-    method_calls_by_source: &HashMap<InstrId, Vec<OptV3MethodCallPlan>>,
-) -> HashMap<InstrId, Vec<RuntimeFunctionId>> {
-    method_calls_by_source
-        .iter()
-        .map(|(source, method_calls)| {
-            (
-                *source,
-                method_calls
-                    .iter()
-                    .map(|method_call| method_call.target)
-                    .collect(),
-            )
-        })
-        .collect()
-}
-
-fn opt_v3_inline_method_call_targets(
-    method_calls_by_source: &HashMap<InstrId, Vec<OptV3MethodCallPlan>>,
-) -> HashMap<InstrId, Vec<RuntimeFunctionId>> {
-    method_calls_by_source
-        .iter()
-        .filter_map(|(source, method_calls)| {
-            let targets = method_calls
-                .iter()
-                .filter(|method_call| method_call.body.kind == PlanV3CallBodyKind::Inline)
-                .map(|method_call| method_call.target)
-                .collect::<Vec<_>>();
-            (!targets.is_empty()).then_some((*source, targets))
-        })
-        .collect()
-}
-
-fn merge_call_target_specializations(
-    mut left: HashMap<InstrId, Vec<RuntimeFunctionId>>,
-    right: HashMap<InstrId, Vec<RuntimeFunctionId>>,
-) -> HashMap<InstrId, Vec<RuntimeFunctionId>> {
-    for (source, targets) in right {
-        let entry = left.entry(source).or_default();
-        for target in targets {
-            if !entry.contains(&target) {
-                entry.push(target);
-            }
-        }
-    }
-    left
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct OptV3DirectCallPlan {
-    source: InstrId,
-    target: RuntimeFunctionId,
-    arg_plan: TypedDirectCallArgPlan,
-    body: PlanV3CallBodyPlan,
-    reason: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct OptV3ConstructorCallPlan {
-    source: InstrId,
-    target: RuntimeFunctionId,
-    owner_type: PlanV3ConstructorCallOwnerType,
-    arg_plan: TypedDirectCallArgPlan,
-    guard: PlanV3ConstructorCallGuardKind,
-    fallback: PlanV3ConstructorCallFallbackKind,
-    body: PlanV3CallBodyPlan,
-    inline_target: Option<RuntimeFunctionId>,
-    reason: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct OptV3MethodCallPlan {
-    source: InstrId,
-    target: RuntimeFunctionId,
-    method_name: String,
-    owner_type: PlanV3MethodCallOwnerType,
-    arg_plan: TypedDirectCallArgPlan,
-    guard: PlanV3MethodCallGuardKind,
-    fallback: PlanV3MethodCallFallbackKind,
-    body: PlanV3CallBodyPlan,
-    reason: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct OptV3PreparedConstructorCallPlan {
-    guards: Vec<TypedDirectConstructorCallGuard>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct OptV3PreparedMethodCallPlan {
-    method_name: String,
-    guards: Vec<TypedDirectMethodCallGuard>,
 }
 
 #[derive(Clone, Debug)]
@@ -13143,13 +12989,13 @@ fn resolve_opt_v3_codegen_module_function_target(
 fn opt_v3_emitted_direct_calls_for_function(
     artifacts: &ExactIntBranchV3Artifacts,
     mut resolve_target: impl FnMut(PersistentFunctionId) -> Result<Option<RuntimeFunctionId>, String>,
-) -> Result<Option<HashMap<InstrId, Vec<OptV3DirectCallPlan>>>, String> {
+) -> Result<Option<HashMap<InstrId, Vec<ResolvedV3DirectCallPlan>>>, String> {
     let emitted_function = &artifacts.emission.functions[0];
     if emitted_function.direct_calls.is_empty() {
         return Ok(None);
     }
 
-    let mut direct_calls = HashMap::<InstrId, Vec<OptV3DirectCallPlan>>::new();
+    let mut direct_calls = HashMap::<InstrId, Vec<ResolvedV3DirectCallPlan>>::new();
     for direct_call in &emitted_function.direct_calls {
         let persistent_target = artifacts
             .plan
@@ -13169,7 +13015,7 @@ fn opt_v3_emitted_direct_calls_for_function(
         };
         let plans = direct_calls.entry(direct_call.source).or_default();
         if !plans.iter().any(|plan| plan.target == target) {
-            plans.push(OptV3DirectCallPlan {
+            plans.push(ResolvedV3DirectCallPlan {
                 source: direct_call.source,
                 target,
                 arg_plan: typed_direct_call_arg_plan_from_v3(&direct_call.arg_plan),
@@ -13184,13 +13030,13 @@ fn opt_v3_emitted_direct_calls_for_function(
 fn opt_v3_emitted_constructor_calls_for_function(
     artifacts: &ExactIntBranchV3Artifacts,
     mut resolve_target: impl FnMut(PersistentFunctionId) -> Result<Option<RuntimeFunctionId>, String>,
-) -> Result<Option<HashMap<InstrId, Vec<OptV3ConstructorCallPlan>>>, String> {
+) -> Result<Option<HashMap<InstrId, Vec<ResolvedV3ConstructorCallPlan>>>, String> {
     let emitted_function = &artifacts.emission.functions[0];
     if emitted_function.constructor_calls.is_empty() {
         return Ok(None);
     }
 
-    let mut constructor_calls = HashMap::<InstrId, Vec<OptV3ConstructorCallPlan>>::new();
+    let mut constructor_calls = HashMap::<InstrId, Vec<ResolvedV3ConstructorCallPlan>>::new();
     for constructor_call in &emitted_function.constructor_calls {
         let persistent_target = artifacts
             .plan
@@ -13239,7 +13085,7 @@ fn opt_v3_emitted_constructor_calls_for_function(
                 && plan.owner_type == constructor_call.owner_type
                 && plan.inline_target == inline_target
         }) {
-            plans.push(OptV3ConstructorCallPlan {
+            plans.push(ResolvedV3ConstructorCallPlan {
                 source: constructor_call.source,
                 target,
                 owner_type: constructor_call.owner_type.clone(),
@@ -13258,13 +13104,13 @@ fn opt_v3_emitted_constructor_calls_for_function(
 fn opt_v3_emitted_method_calls_for_function(
     artifacts: &ExactIntBranchV3Artifacts,
     mut resolve_target: impl FnMut(PersistentFunctionId) -> Result<Option<RuntimeFunctionId>, String>,
-) -> Result<Option<HashMap<InstrId, Vec<OptV3MethodCallPlan>>>, String> {
+) -> Result<Option<HashMap<InstrId, Vec<ResolvedV3MethodCallPlan>>>, String> {
     let emitted_function = &artifacts.emission.functions[0];
     if emitted_function.method_calls.is_empty() {
         return Ok(None);
     }
 
-    let mut method_calls = HashMap::<InstrId, Vec<OptV3MethodCallPlan>>::new();
+    let mut method_calls = HashMap::<InstrId, Vec<ResolvedV3MethodCallPlan>>::new();
     for method_call in &emitted_function.method_calls {
         let persistent_target = artifacts
             .plan
@@ -13288,7 +13134,7 @@ fn opt_v3_emitted_method_calls_for_function(
                 && plan.method_name == method_call.method_name
                 && plan.owner_type == method_call.owner_type
         }) {
-            plans.push(OptV3MethodCallPlan {
+            plans.push(ResolvedV3MethodCallPlan {
                 source: method_call.source,
                 target,
                 method_name: method_call.method_name.clone(),
@@ -13302,23 +13148,6 @@ fn opt_v3_emitted_method_calls_for_function(
         }
     }
     Ok(Some(method_calls))
-}
-
-fn typed_direct_call_arg_plan_from_v3(plan: &PlanV3DirectCallArgPlan) -> TypedDirectCallArgPlan {
-    TypedDirectCallArgPlan {
-        sources: plan
-            .sources
-            .iter()
-            .map(|source| match source {
-                PlanV3DirectCallArgSource::Provided(index) => {
-                    TypedDirectCallArgSource::Provided(*index as usize)
-                }
-                PlanV3DirectCallArgSource::DefaultSentinel => {
-                    TypedDirectCallArgSource::DefaultSentinel
-                }
-            })
-            .collect(),
-    }
 }
 
 fn opt_v3_single_function_artifacts(
@@ -13705,68 +13534,6 @@ impl FunctionSpecializationInputs {
     }
 }
 
-fn typed_call_emission_plans_from_v3(
-    direct_calls_by_instr: &HashMap<InstrId, Vec<OptV3DirectCallPlan>>,
-    constructor_calls_by_instr: &HashMap<InstrId, OptV3PreparedConstructorCallPlan>,
-    method_calls_by_instr: &HashMap<InstrId, OptV3PreparedMethodCallPlan>,
-) -> Result<TypedCallEmissionPlans, String> {
-    let mut by_source = HashMap::<InstrId, TypedCallEmissionPlan>::new();
-    for (source, direct_calls) in direct_calls_by_instr {
-        let plan = by_source
-            .entry(*source)
-            .or_insert_with(|| TypedCallEmissionPlan::Callable {
-                function_guards: Vec::new(),
-                constructor_guards: Vec::new(),
-            });
-        let TypedCallEmissionPlan::Callable {
-            function_guards, ..
-        } = plan
-        else {
-            return Err(format!(
-                "optimizer v3 call source {source} has both direct and method emissions"
-            ));
-        };
-        function_guards.extend(direct_calls.iter().map(|direct_call| {
-            TypedDirectFunctionCallGuard {
-                function_id: direct_call.target,
-                arg_plan: direct_call.arg_plan.clone(),
-            }
-        }));
-    }
-    for (source, constructor_calls) in constructor_calls_by_instr {
-        let plan = by_source
-            .entry(*source)
-            .or_insert_with(|| TypedCallEmissionPlan::Callable {
-                function_guards: Vec::new(),
-                constructor_guards: Vec::new(),
-            });
-        let TypedCallEmissionPlan::Callable {
-            constructor_guards, ..
-        } = plan
-        else {
-            return Err(format!(
-                "optimizer v3 call source {source} has both constructor and method emissions"
-            ));
-        };
-        constructor_guards.extend(constructor_calls.guards.clone());
-    }
-    for (source, method_calls) in method_calls_by_instr {
-        if by_source.contains_key(source) {
-            return Err(format!(
-                "optimizer v3 call source {source} has both method and callable emissions"
-            ));
-        }
-        by_source.insert(
-            *source,
-            TypedCallEmissionPlan::Method {
-                method_name: method_calls.method_name.clone(),
-                method_guards: method_calls.guards.clone(),
-            },
-        );
-    }
-    Ok(TypedCallEmissionPlans { by_source })
-}
-
 fn legacy_call_targets_excluding_sources(
     call_target_specializations: &HashMap<InstrId, Vec<RuntimeFunctionId>>,
     v3_sources: &HashSet<InstrId>,
@@ -13863,17 +13630,11 @@ impl<'a> SpecializationProfile<'a> {
     }
 
     fn v3_call_emission_sources(&self, function_id: RuntimeFunctionId) -> HashSet<InstrId> {
-        let mut sources = HashSet::new();
-        if let Some(direct_calls) = self.opt_v3_emitted_direct_calls.get(&function_id) {
-            sources.extend(direct_calls.keys().copied());
-        }
-        if let Some(constructor_calls) = self.opt_v3_emitted_constructor_calls.get(&function_id) {
-            sources.extend(constructor_calls.keys().copied());
-        }
-        if let Some(method_calls) = self.opt_v3_emitted_method_calls.get(&function_id) {
-            sources.extend(method_calls.keys().copied());
-        }
-        sources
+        opt_v3_call_emission_sources(
+            self.opt_v3_emitted_direct_calls.get(&function_id),
+            self.opt_v3_emitted_constructor_calls.get(&function_id),
+            self.opt_v3_emitted_method_calls.get(&function_id),
+        )
     }
 
     fn planned_legacy_field_index_specializations(
@@ -13938,7 +13699,7 @@ impl<'a> SpecializationProfile<'a> {
     fn v3_inline_constructor_calls(
         &self,
         function_id: RuntimeFunctionId,
-    ) -> HashMap<InstrId, Vec<OptV3ConstructorCallPlan>> {
+    ) -> HashMap<InstrId, Vec<ResolvedV3ConstructorCallPlan>> {
         self.opt_v3_emitted_constructor_calls
             .get(&function_id)
             .map(|constructor_calls_by_source| {
@@ -13982,7 +13743,7 @@ impl<'a> SpecializationProfile<'a> {
     fn codegen_opt_v3_direct_calls(
         &self,
         function_id: RuntimeFunctionId,
-    ) -> HashMap<InstrId, Vec<OptV3DirectCallPlan>> {
+    ) -> HashMap<InstrId, Vec<ResolvedV3DirectCallPlan>> {
         self.opt_v3_emitted_direct_calls
             .get(&function_id)
             .map(opt_v3_direct_call_body_plans)
@@ -13992,22 +13753,30 @@ impl<'a> SpecializationProfile<'a> {
     fn codegen_opt_v3_constructor_calls(
         &self,
         function_id: RuntimeFunctionId,
-    ) -> Result<HashMap<InstrId, OptV3PreparedConstructorCallPlan>, String> {
+    ) -> Result<HashMap<InstrId, PreparedV3ConstructorCallPlan>, String> {
         let Some(constructor_calls) = self.opt_v3_emitted_constructor_calls.get(&function_id)
         else {
             return Ok(HashMap::new());
         };
-        prepare_opt_v3_constructor_call_plans_for_codegen(constructor_calls)
+        prepare_constructor_call_plans_for_codegen(
+            constructor_calls,
+            opt_v3_constructor_call_guard_from_plan,
+            register_opt_v3_prepared_constructor_guard_symbols,
+        )
     }
 
     fn codegen_opt_v3_method_calls(
         &self,
         function_id: RuntimeFunctionId,
-    ) -> Result<HashMap<InstrId, OptV3PreparedMethodCallPlan>, String> {
+    ) -> Result<HashMap<InstrId, PreparedV3MethodCallPlan>, String> {
         let Some(method_calls) = self.opt_v3_emitted_method_calls.get(&function_id) else {
             return Ok(HashMap::new());
         };
-        prepare_opt_v3_method_call_plans_for_codegen(method_calls)
+        prepare_method_call_plans_for_codegen(
+            method_calls,
+            opt_v3_method_call_guard_from_plan,
+            register_opt_v3_prepared_method_guard_symbols,
+        )
     }
 
     fn operator_specializations(
@@ -14145,72 +13914,6 @@ impl<'a> SpecializationProfile<'a> {
         };
         collect_cold_block_labels_from_path(path, function, module_name)
     }
-}
-
-fn prepare_opt_v3_constructor_call_plans_for_codegen(
-    constructor_calls_by_instr: &HashMap<InstrId, Vec<OptV3ConstructorCallPlan>>,
-) -> Result<HashMap<InstrId, OptV3PreparedConstructorCallPlan>, String> {
-    let mut prepared = HashMap::new();
-    for (source, constructor_calls) in constructor_calls_by_instr {
-        let constructor_calls = constructor_calls
-            .iter()
-            .filter(|constructor_call| constructor_call.body.kind == PlanV3CallBodyKind::DirectCall)
-            .collect::<Vec<_>>();
-        if constructor_calls.is_empty() {
-            continue;
-        }
-        let mut guards = Vec::new();
-        for constructor_call in constructor_calls {
-            let guard = opt_v3_constructor_call_guard_from_plan(constructor_call)?;
-            register_opt_v3_prepared_constructor_guard_symbols(&guard)?;
-            if !guards.contains(&guard) {
-                guards.push(guard);
-            }
-        }
-        prepared.insert(*source, OptV3PreparedConstructorCallPlan { guards });
-    }
-    Ok(prepared)
-}
-
-fn prepare_opt_v3_method_call_plans_for_codegen(
-    method_calls_by_instr: &HashMap<InstrId, Vec<OptV3MethodCallPlan>>,
-) -> Result<HashMap<InstrId, OptV3PreparedMethodCallPlan>, String> {
-    let mut prepared = HashMap::new();
-    for (source, method_calls) in method_calls_by_instr {
-        let method_calls = method_calls
-            .iter()
-            .filter(|method_call| method_call.body.kind == PlanV3CallBodyKind::DirectCall)
-            .collect::<Vec<_>>();
-        let Some(first_method_call) = method_calls.first() else {
-            continue;
-        };
-        let method_name = first_method_call.method_name.clone();
-        if let Some(mismatched_method) = method_calls
-            .iter()
-            .find(|method_call| method_call.method_name != method_name)
-        {
-            return Err(format!(
-                "optimizer v3 emitted method-call at {} for method {}, but another plan uses {}",
-                source, method_name, mismatched_method.method_name
-            ));
-        }
-        let mut guards = Vec::new();
-        for method_call in method_calls {
-            let guard = opt_v3_method_call_guard_from_plan(method_call)?;
-            register_opt_v3_prepared_method_guard_symbols(&guard, &method_name)?;
-            if !guards.contains(&guard) {
-                guards.push(guard);
-            }
-        }
-        prepared.insert(
-            *source,
-            OptV3PreparedMethodCallPlan {
-                method_name,
-                guards,
-            },
-        );
-    }
-    Ok(prepared)
 }
 
 fn register_opt_v3_prepared_constructor_guard_symbols(
@@ -28931,7 +28634,7 @@ fn validate_typed_function_preserves_codegen_cfg(
 }
 
 fn opt_v3_constructor_call_guard_from_plan(
-    plan: &OptV3ConstructorCallPlan,
+    plan: &ResolvedV3ConstructorCallPlan,
 ) -> Result<TypedDirectConstructorCallGuard, String> {
     let type_key = CounterDumpTypeKey {
         module_name: plan.owner_type.module_name.clone(),
@@ -28981,7 +28684,7 @@ fn opt_v3_constructor_call_guard_from_plan(
 }
 
 fn opt_v3_method_call_guard_from_plan(
-    plan: &OptV3MethodCallPlan,
+    plan: &ResolvedV3MethodCallPlan,
 ) -> Result<TypedDirectMethodCallGuard, String> {
     let type_key = CounterDumpTypeKey {
         module_name: plan.owner_type.module_name.clone(),

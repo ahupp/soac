@@ -4135,7 +4135,7 @@ def build(values):
         let opt_v3_call_emissions = typed_call_emission_plans_from_v3(
             &HashMap::from([(
                 direct_source,
-                vec![OptV3DirectCallPlan {
+                vec![ResolvedV3DirectCallPlan {
                     source: direct_source,
                     target: direct_target,
                     arg_plan: arg_plan.clone(),
@@ -4145,11 +4145,11 @@ def build(values):
             )]),
             &HashMap::from([(
                 constructor_source,
-                OptV3PreparedConstructorCallPlan { guards: Vec::new() },
+                PreparedV3ConstructorCallPlan { guards: Vec::new() },
             )]),
             &HashMap::from([(
                 method_source,
-                OptV3PreparedMethodCallPlan {
+                PreparedV3MethodCallPlan {
                     method_name: "get".to_string(),
                     guards: Vec::new(),
                 },
@@ -4196,7 +4196,7 @@ def build(values):
             (v3_source, vec![legacy_target]),
             (legacy_source, vec![legacy_target]),
         ]);
-        let v3_plan = OptV3DirectCallPlan {
+        let v3_plan = ResolvedV3DirectCallPlan {
             source: v3_source,
             target: v3_target,
             arg_plan: TypedDirectCallArgPlan {
@@ -4247,7 +4247,7 @@ def build(values):
         let function_id = RuntimeFunctionId::from_raw_parts(0, 1);
         let source = InstrId::new(BlockLabel::from_index(0), 7);
         let target = RuntimeFunctionId::from_raw_parts(0, 9);
-        let direct_call = OptV3DirectCallPlan {
+        let direct_call = ResolvedV3DirectCallPlan {
             source,
             target,
             arg_plan: TypedDirectCallArgPlan {
@@ -4279,53 +4279,55 @@ def build(values):
             "Inline direct-call body plans are owned by the early BlockPy rewrite path"
         );
 
-        let constructor_call = OptV3ConstructorCallPlan {
+        let constructor_call = ResolvedV3ConstructorCallPlan {
             source,
             target,
-            owner_type: PlanV3ConstructorCallOwnerType {
+            owner_type: ConstructorCallOwnerType {
                 module_name: "missing_v3_constructor_type".to_string(),
                 qualname: "Box".to_string(),
             },
             arg_plan: TypedDirectCallArgPlan {
                 sources: vec![TypedDirectCallArgSource::Provided(0)],
             },
-            guard: PlanV3ConstructorCallGuardKind::ExactCallableTypeVersion,
-            fallback: PlanV3ConstructorCallFallbackKind::OriginalConstructorCall,
+            guard: ConstructorCallGuardKind::ExactCallableTypeVersion,
+            fallback: ConstructorCallFallbackKind::OriginalConstructorCall,
             body: test_v3_inline_call_body(),
             inline_target: None,
             reason: "profiled constructor call".to_string(),
         };
         assert!(
-            prepare_opt_v3_constructor_call_plans_for_codegen(&HashMap::from([(
-                source,
-                vec![constructor_call],
-            )]))
+            prepare_constructor_call_plans_for_codegen(
+                &HashMap::from([(source, vec![constructor_call])]),
+                |_| panic!("inline constructor body should not require guard preparation"),
+                |_| panic!("inline constructor body should not require guard validation"),
+            )
             .unwrap()
             .is_empty(),
             "Inline constructor body plans are owned by the early BlockPy rewrite path"
         );
 
-        let method_call = OptV3MethodCallPlan {
+        let method_call = ResolvedV3MethodCallPlan {
             source,
             target,
             method_name: "get".to_string(),
-            owner_type: PlanV3MethodCallOwnerType {
+            owner_type: MethodCallOwnerType {
                 module_name: "missing_v3_method_type".to_string(),
                 qualname: "Box".to_string(),
             },
             arg_plan: TypedDirectCallArgPlan {
                 sources: vec![TypedDirectCallArgSource::Provided(0)],
             },
-            guard: PlanV3MethodCallGuardKind::ExactReceiverTypeVersion,
-            fallback: PlanV3MethodCallFallbackKind::OriginalMethodCall,
+            guard: MethodCallGuardKind::ExactReceiverTypeVersion,
+            fallback: MethodCallFallbackKind::OriginalMethodCall,
             body: test_v3_inline_call_body(),
             reason: "profiled method call".to_string(),
         };
         assert!(
-            prepare_opt_v3_method_call_plans_for_codegen(&HashMap::from([(
-                source,
-                vec![method_call],
-            )]))
+            prepare_method_call_plans_for_codegen(
+                &HashMap::from([(source, vec![method_call])]),
+                |_| panic!("inline method body should not require guard preparation"),
+                |_, _| panic!("inline method body should not require guard validation"),
+            )
             .unwrap()
             .is_empty(),
             "Inline method body plans are owned by the early BlockPy rewrite path"
@@ -17328,7 +17330,7 @@ def f(x):
                 .unwrap()
                 .first()
                 .unwrap(),
-            &OptV3DirectCallPlan {
+            &ResolvedV3DirectCallPlan {
                 source,
                 target: callee_id,
                 arg_plan: soac_lowering::passes::TypedDirectCallArgPlan {
@@ -17724,7 +17726,7 @@ def f(x):
                 .unwrap()
                 .first()
                 .unwrap(),
-            &OptV3DirectCallPlan {
+            &ResolvedV3DirectCallPlan {
                 source,
                 target: callee_id,
                 arg_plan: soac_lowering::passes::TypedDirectCallArgPlan {
@@ -19286,7 +19288,7 @@ def write_point(point, value):
         let mut planned_evidence = HashMap::new();
         planned_evidence.insert(caller_id, legacy_evidence);
 
-        let v3_plan = OptV3DirectCallPlan {
+        let v3_plan = ResolvedV3DirectCallPlan {
             source,
             target: v3_target,
             arg_plan: soac_lowering::passes::TypedDirectCallArgPlan {
@@ -23367,7 +23369,7 @@ def f(x, y):
             module_name_gen,
             vec![callee_function.clone(), caller_function.clone()],
         );
-        let v3_plan = OptV3DirectCallPlan {
+        let v3_plan = ResolvedV3DirectCallPlan {
             source: call_instr_id,
             target: callee_function.function_id,
             arg_plan: TypedDirectCallArgPlan {
@@ -23489,7 +23491,7 @@ def f(x, y):
             module_name_gen,
             vec![callee_function.clone(), caller_function.clone()],
         );
-        let v3_plan = OptV3DirectCallPlan {
+        let v3_plan = ResolvedV3DirectCallPlan {
             source: call_instr_id,
             target: callee_function.function_id,
             arg_plan: TypedDirectCallArgPlan {
@@ -23747,19 +23749,19 @@ def f(x, y):
                 caller_function.function_id,
                 HashMap::from([(
                     call_instr_id,
-                    vec![OptV3MethodCallPlan {
+                    vec![ResolvedV3MethodCallPlan {
                         source: call_instr_id,
                         target: next_function.function_id,
                         method_name: "__next__".to_string(),
-                        owner_type: PlanV3MethodCallOwnerType {
+                        owner_type: MethodCallOwnerType {
                             module_name: module_name.to_string(),
                             qualname: "IterRange".to_string(),
                         },
                         arg_plan: TypedDirectCallArgPlan {
                             sources: Vec::new(),
                         },
-                        guard: PlanV3MethodCallGuardKind::ExactReceiverTypeVersion,
-                        fallback: PlanV3MethodCallFallbackKind::OriginalMethodCall,
+                        guard: MethodCallGuardKind::ExactReceiverTypeVersion,
+                        fallback: MethodCallFallbackKind::OriginalMethodCall,
                         body: test_v3_inline_call_body(),
                         reason: "profiled method call".to_string(),
                     }],

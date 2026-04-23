@@ -1,5 +1,6 @@
 pub mod alternatives_v3;
 pub mod artifacts_v3;
+pub mod call_emission_v3;
 pub mod emit_v3;
 pub mod evidence_v3;
 pub mod operator_specialization;
