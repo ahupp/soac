@@ -52,32 +52,3 @@ def test_dp_jit_py_vectorcall_with_frame_keeps_helper_frame():
     assert "call" in body
     assert "jmp" not in body
 
-
-@REQUIRES_RELEASE_EXTENSION
-def test_default_dp_jit_exact_long_binary_op_stays_tail_call_fast_path():
-    body = _symbol_body("soac_jit::jit::specialized_helpers::dp_jit_exact_long_binary_op")
-    assert "jmp" in body
-
-
-@REQUIRES_RELEASE_EXTENSION
-def test_dp_jit_exact_long_binary_op_with_frame_keeps_helper_frame():
-    body = _symbol_body(
-        "soac_jit::jit::specialized_helpers::dp_jit_exact_long_binary_op_with_frame"
-    )
-    assert "call" in body
-    assert "jmp" not in body
-
-
-@REQUIRES_RELEASE_EXTENSION
-def test_default_dp_jit_exact_long_unary_op_stays_tail_call_fast_path():
-    body = _symbol_body("soac_jit::jit::specialized_helpers::dp_jit_exact_long_unary_op")
-    assert "jmp" in body
-
-
-@REQUIRES_RELEASE_EXTENSION
-def test_dp_jit_exact_long_unary_op_with_frame_keeps_helper_frame():
-    body = _symbol_body(
-        "soac_jit::jit::specialized_helpers::dp_jit_exact_long_unary_op_with_frame"
-    )
-    assert "call" in body
-    assert "jmp" not in body

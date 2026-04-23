@@ -1,16 +1,14 @@
 use crate::plan_v3::{
-    CallBodyPlan, ConstructorCallFallbackPlan, ConstructorCallGuardPlan, ConstructorCallOwnerType,
-    ConstructorCallSpecializationPlan, ConversionKind, DeoptPointId, DirectCallArgPlan,
-    DirectCallSpecializationPlan, ExactListItemAccessKind, ExactListItemFallbackPlan,
-    ExactListItemGuardPlan, ExactListItemShape, ExactListItemSpecializationPlan, FailureMode,
-    GuardFailure, GuardKind, IndexedFieldAccessKind, IndexedFieldFallbackPlan,
-    IndexedFieldGuardKind, IndexedFieldOwnerType, IndexedFieldSpecializationPlan,
-    IndexedGlobalAccessKind, IndexedGlobalFallbackPlan, IndexedGlobalGuardPlan,
-    IndexedGlobalSpecializationPlan, MaterializeKind, MethodCallFallbackPlan, MethodCallGuardPlan,
-    MethodCallOwnerType, MethodCallSpecializationPlan, ModuleOptimizationPlanV3, OperationNode,
-    PlanNodeId, PlanNodeKind, PlanValidationError, PlanValue, PlannedConstant, PlannedOp,
-    RegionExitKind, RegionExitTarget, RegionId, RegionInputSource, RegionPlan, Rep, RichCompareOp,
-    ScalarLocalThreadPlan, validate_module_plan_v3,
+    CallBodyPlan, ConversionKind, DeoptPointId, DirectCallArgPlan, DirectCallSpecializationPlan,
+    ExactListItemAccessKind, ExactListItemFallbackPlan, ExactListItemGuardPlan, ExactListItemShape,
+    ExactListItemSpecializationPlan, FailureMode, GuardFailure, GuardKind, IndexedFieldAccessKind,
+    IndexedFieldFallbackPlan, IndexedFieldGuardKind, IndexedFieldOwnerType,
+    IndexedFieldSpecializationPlan, IndexedGlobalAccessKind, IndexedGlobalFallbackPlan,
+    IndexedGlobalGuardPlan, IndexedGlobalSpecializationPlan, MaterializeKind,
+    ModuleOptimizationPlanV3, OperationNode, PlanNodeId, PlanNodeKind, PlanValidationError,
+    PlanValue, PlannedConstant, PlannedOp, RegionExitKind, RegionExitTarget, RegionId,
+    RegionInputSource, RegionPlan, Rep, RichCompareOp, ScalarLocalThreadPlan,
+    validate_module_plan_v3,
 };
 use soac_core::block_py::{InstrId, SerializedFunctionId};
 use std::collections::{HashMap, HashSet};
@@ -27,8 +25,6 @@ pub struct MechanicalFunctionEmission {
     pub function: SerializedFunctionId,
     pub debug_name: Option<String>,
     pub direct_calls: Vec<MechanicalDirectCallEmission>,
-    pub constructor_calls: Vec<MechanicalConstructorCallEmission>,
-    pub method_calls: Vec<MechanicalMethodCallEmission>,
     pub exact_list_items: Vec<MechanicalExactListItemEmission>,
     pub indexed_fields: Vec<MechanicalIndexedFieldEmission>,
     pub indexed_globals: Vec<MechanicalIndexedGlobalEmission>,
@@ -47,31 +43,6 @@ pub struct MechanicalDirectCallEmission {
     pub source: InstrId,
     pub target: SerializedFunctionId,
     pub arg_plan: DirectCallArgPlan,
-    pub body: CallBodyPlan,
-    pub reason: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-pub struct MechanicalConstructorCallEmission {
-    pub source: InstrId,
-    pub target: SerializedFunctionId,
-    pub owner_type: ConstructorCallOwnerType,
-    pub arg_plan: DirectCallArgPlan,
-    pub guard: ConstructorCallGuardPlan,
-    pub fallback: ConstructorCallFallbackPlan,
-    pub body: CallBodyPlan,
-    pub reason: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-pub struct MechanicalMethodCallEmission {
-    pub source: InstrId,
-    pub target: SerializedFunctionId,
-    pub method_name: String,
-    pub owner_type: MethodCallOwnerType,
-    pub arg_plan: DirectCallArgPlan,
-    pub guard: MethodCallGuardPlan,
-    pub fallback: MethodCallFallbackPlan,
     pub body: CallBodyPlan,
     pub reason: String,
 }
@@ -774,12 +745,6 @@ fn emit_function(
         function: function.function.function,
         debug_name: function.function.debug_name.clone(),
         direct_calls: function.direct_calls.iter().map(emit_direct_call).collect(),
-        constructor_calls: function
-            .constructor_calls
-            .iter()
-            .map(emit_constructor_call)
-            .collect(),
-        method_calls: function.method_calls.iter().map(emit_method_call).collect(),
         exact_list_items: function
             .exact_list_items
             .iter()
@@ -1559,35 +1524,6 @@ fn emit_direct_call(direct_call: &DirectCallSpecializationPlan) -> MechanicalDir
     }
 }
 
-fn emit_constructor_call(
-    constructor_call: &ConstructorCallSpecializationPlan,
-) -> MechanicalConstructorCallEmission {
-    MechanicalConstructorCallEmission {
-        source: constructor_call.source,
-        target: constructor_call.target,
-        owner_type: constructor_call.owner_type.clone(),
-        arg_plan: constructor_call.arg_plan.clone(),
-        guard: constructor_call.guard.clone(),
-        fallback: constructor_call.fallback.clone(),
-        body: constructor_call.body.clone(),
-        reason: constructor_call.reason.clone(),
-    }
-}
-
-fn emit_method_call(method_call: &MethodCallSpecializationPlan) -> MechanicalMethodCallEmission {
-    MechanicalMethodCallEmission {
-        source: method_call.source,
-        target: method_call.target,
-        method_name: method_call.method_name.clone(),
-        owner_type: method_call.owner_type.clone(),
-        arg_plan: method_call.arg_plan.clone(),
-        guard: method_call.guard.clone(),
-        fallback: method_call.fallback.clone(),
-        body: method_call.body.clone(),
-        reason: method_call.reason.clone(),
-    }
-}
-
 fn emit_exact_list_item(item: &ExactListItemSpecializationPlan) -> MechanicalExactListItemEmission {
     MechanicalExactListItemEmission {
         source: item.source,
@@ -1696,20 +1632,16 @@ fn emit_exit_kind(kind: &RegionExitKind) -> MechanicalExitKind {
 mod tests {
     use super::*;
     use crate::plan_v3::{
-        CallBodyKind, CallBodyPlan, ConstructorCallFallbackKind, ConstructorCallFallbackPlan,
-        ConstructorCallGuardKind, ConstructorCallGuardPlan, ConstructorCallOwnerType,
-        ConstructorCallSpecializationPlan, ConversionOwnership, ConversionPrecondition,
-        ConvertNode, Cost, DirectCallArgPlan, DirectCallArgSource, DirectCallSpecializationPlan,
+        CallBodyKind, CallBodyPlan, ConversionOwnership, ConversionPrecondition, ConvertNode, Cost,
+        DirectCallArgPlan, DirectCallArgSource, DirectCallSpecializationPlan,
         ExactListItemAccessKind, ExactListItemFallbackKind, ExactListItemFallbackPlan,
         ExactListItemGuardKind, ExactListItemGuardPlan, ExactListItemShape,
         ExactListItemSpecializationPlan, FallbackReason, FallbackTarget,
         FunctionOptimizationPlanV3, FunctionOwnershipPlan, FunctionPlanIdentity,
         IndexedFieldAccessKind, IndexedFieldFallbackKind, IndexedFieldFallbackPlan,
         IndexedFieldGuardKind, IndexedFieldGuardPlan, IndexedFieldOwnerType,
-        IndexedFieldSpecializationPlan, MaterializeNode, MethodCallFallbackKind,
-        MethodCallFallbackPlan, MethodCallGuardKind, MethodCallGuardPlan, MethodCallOwnerType,
-        MethodCallSpecializationPlan, ModulePlanIdentity, PythonExceptionSpec, RegionExitPlan,
-        RegionInput, RegionInputSource, RegionPlan, RegionSource, Rep,
+        IndexedFieldSpecializationPlan, MaterializeNode, ModulePlanIdentity, PythonExceptionSpec,
+        RegionExitPlan, RegionInput, RegionInputSource, RegionPlan, RegionSource, Rep,
     };
     use soac_core::block_py::{
         BlockLabel, LocalFunctionId, SerializedIdentityTables, SerializedModuleId,
@@ -1862,8 +1794,6 @@ mod tests {
                 ],
                 scalar_threads: Vec::new(),
                 direct_calls: Vec::new(),
-                constructor_calls: Vec::new(),
-                method_calls: Vec::new(),
                 exact_list_items: Vec::new(),
                 indexed_fields: Vec::new(),
                 indexed_globals: Vec::new(),
@@ -2142,119 +2072,6 @@ mod tests {
                 },
                 body,
                 reason: "profiled call_hot_targets selected this same-module function".to_string(),
-            }]
-        );
-    }
-
-    #[test]
-    fn emits_constructor_call_decisions_mechanically() {
-        let mut plan = test_plan(true);
-        let source = InstrId::new(BlockLabel::from_index(0), 7);
-        let target = SerializedFunctionId::new(SerializedModuleId::new(0), LocalFunctionId::new(2));
-        let owner_type = ConstructorCallOwnerType {
-            module_name: "pkg.mod".to_string(),
-            qualname: "Box".to_string(),
-        };
-        let guard = ConstructorCallGuardPlan {
-            kind: ConstructorCallGuardKind::ExactCallableTypeVersion,
-        };
-        let fallback = ConstructorCallFallbackPlan {
-            kind: ConstructorCallFallbackKind::OriginalConstructorCall,
-        };
-        let inline_target =
-            SerializedFunctionId::new(SerializedModuleId::new(0), LocalFunctionId::new(3));
-        let body = CallBodyPlan {
-            inline_target: Some(inline_target),
-            ..inline_call_body()
-        };
-        plan.functions[0]
-            .constructor_calls
-            .push(ConstructorCallSpecializationPlan {
-                source,
-                target,
-                owner_type: owner_type.clone(),
-                arg_plan: DirectCallArgPlan {
-                    sources: vec![
-                        DirectCallArgSource::Provided(0),
-                        DirectCallArgSource::Provided(1),
-                    ],
-                },
-                guard: guard.clone(),
-                fallback: fallback.clone(),
-                body: body.clone(),
-                reason: "profiled constructor target".to_string(),
-            });
-
-        let emission = emit_mechanical_plan_v3(&plan).unwrap();
-
-        assert_eq!(
-            emission.functions[0].constructor_calls,
-            vec![MechanicalConstructorCallEmission {
-                source,
-                target,
-                owner_type,
-                arg_plan: DirectCallArgPlan {
-                    sources: vec![
-                        DirectCallArgSource::Provided(0),
-                        DirectCallArgSource::Provided(1),
-                    ],
-                },
-                guard,
-                fallback,
-                body,
-                reason: "profiled constructor target".to_string(),
-            }]
-        );
-    }
-
-    #[test]
-    fn emits_method_call_decisions_mechanically() {
-        let mut plan = test_plan(true);
-        let source = InstrId::new(BlockLabel::from_index(0), 7);
-        let target = SerializedFunctionId::new(SerializedModuleId::new(0), LocalFunctionId::new(2));
-        let owner_type = MethodCallOwnerType {
-            module_name: "pkg.mod".to_string(),
-            qualname: "Box".to_string(),
-        };
-        let guard = MethodCallGuardPlan {
-            kind: MethodCallGuardKind::ExactReceiverTypeVersion,
-        };
-        let fallback = MethodCallFallbackPlan {
-            kind: MethodCallFallbackKind::OriginalMethodCall,
-        };
-        let body = inline_call_body();
-        plan.functions[0]
-            .method_calls
-            .push(MethodCallSpecializationPlan {
-                source,
-                target,
-                method_name: "get".to_string(),
-                owner_type: owner_type.clone(),
-                arg_plan: DirectCallArgPlan {
-                    sources: vec![DirectCallArgSource::Provided(0)],
-                },
-                guard: guard.clone(),
-                fallback: fallback.clone(),
-                body: body.clone(),
-                reason: "profiled call_hot_targets selected this owner method".to_string(),
-            });
-
-        let emission = emit_mechanical_plan_v3(&plan).unwrap();
-
-        assert_eq!(
-            emission.functions[0].method_calls,
-            vec![MechanicalMethodCallEmission {
-                source,
-                target,
-                method_name: "get".to_string(),
-                owner_type,
-                arg_plan: DirectCallArgPlan {
-                    sources: vec![DirectCallArgSource::Provided(0)],
-                },
-                guard,
-                fallback,
-                body,
-                reason: "profiled call_hot_targets selected this owner method".to_string(),
             }]
         );
     }

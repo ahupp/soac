@@ -383,7 +383,6 @@ impl SharedModuleState {
                 kind,
                 "global_indexed"
                     | "field_access"
-                    | "operator_specialized"
                     | "getitem_specialized"
                     | "setitem_specialized"
                     | "call_direct"

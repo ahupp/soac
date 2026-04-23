@@ -3,7 +3,6 @@ pub enum V3MigrationStatus {
     RepresentedForComparison,
     LiveValidationOnly,
     LiveCodegenInputOnly,
-    LegacyOnly,
     NotAnOptimizationPlanTarget,
 }
 
@@ -20,13 +19,7 @@ pub const V3_OPTIMIZATION_FAMILY_STATUS: &[V3OptimizationFamilyStatus] = &[
         family: "exact-int direct-compare/add-compare branches, add/sub/mul/bitwise returns, and comparison returns",
         legacy_input: "operator_hot_shapes",
         status: V3MigrationStatus::LiveCodegenInputOnly,
-        next_step: "migrate the remaining division/modulo/shift and unary value-producing exact-int operators to v3 plans",
-    },
-    V3OptimizationFamilyStatus {
-        family: "remaining division/modulo/shift and unary value-producing exact-int operators",
-        legacy_input: "operator_hot_shapes",
-        status: V3MigrationStatus::LegacyOnly,
-        next_step: "model remaining operator semantics, fallback ownership, and unsupported-overflow boundaries",
+        next_step: "keep unsupported binary and unary operators generic unless v3 grows explicit plan alternatives for them",
     },
     V3OptimizationFamilyStatus {
         family: "profiled direct calls, guarded receiver-method calls, and guarded constructor calls",

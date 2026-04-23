@@ -28,8 +28,6 @@ pub struct FunctionOptimizationPlanV3 {
     pub regions: Vec<RegionPlan>,
     pub scalar_threads: Vec<ScalarLocalThreadPlan>,
     pub direct_calls: Vec<DirectCallSpecializationPlan>,
-    pub constructor_calls: Vec<ConstructorCallSpecializationPlan>,
-    pub method_calls: Vec<MethodCallSpecializationPlan>,
     pub exact_list_items: Vec<ExactListItemSpecializationPlan>,
     pub indexed_fields: Vec<IndexedFieldSpecializationPlan>,
     pub indexed_globals: Vec<IndexedGlobalSpecializationPlan>,
@@ -78,91 +76,6 @@ pub struct DirectCallArgPlan {
 pub enum DirectCallArgSource {
     Provided(u32),
     DefaultSentinel,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-pub struct ConstructorCallSpecializationPlan {
-    pub source: InstrId,
-    pub target: SerializedFunctionId,
-    pub owner_type: ConstructorCallOwnerType,
-    pub arg_plan: DirectCallArgPlan,
-    pub guard: ConstructorCallGuardPlan,
-    pub fallback: ConstructorCallFallbackPlan,
-    pub body: CallBodyPlan,
-    pub reason: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-pub struct ConstructorCallOwnerType {
-    pub module_name: String,
-    pub qualname: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-pub struct ConstructorCallGuardPlan {
-    pub kind: ConstructorCallGuardKind,
-}
-
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
-)]
-pub enum ConstructorCallGuardKind {
-    ExactCallableTypeVersion,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-pub struct ConstructorCallFallbackPlan {
-    pub kind: ConstructorCallFallbackKind,
-}
-
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
-)]
-pub enum ConstructorCallFallbackKind {
-    OriginalConstructorCall,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-pub struct MethodCallSpecializationPlan {
-    pub source: InstrId,
-    pub target: SerializedFunctionId,
-    pub method_name: String,
-    pub owner_type: MethodCallOwnerType,
-    pub arg_plan: DirectCallArgPlan,
-    pub guard: MethodCallGuardPlan,
-    pub fallback: MethodCallFallbackPlan,
-    pub body: CallBodyPlan,
-    pub reason: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-pub struct MethodCallOwnerType {
-    pub module_name: String,
-    pub qualname: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-pub struct MethodCallGuardPlan {
-    pub kind: MethodCallGuardKind,
-}
-
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
-)]
-pub enum MethodCallGuardKind {
-    ExactReceiverTypeVersion,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-pub struct MethodCallFallbackPlan {
-    pub kind: MethodCallFallbackKind,
-}
-
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
-)]
-pub enum MethodCallFallbackKind {
-    OriginalMethodCall,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -941,8 +854,6 @@ fn validate_function_plan(
         );
     }
     validate_direct_call_plans(function, identity_tables, errors);
-    validate_constructor_call_plans(function, identity_tables, errors);
-    validate_method_call_plans(function, identity_tables, errors);
     validate_exact_list_item_plans(function, errors);
     validate_indexed_field_plans(function, errors);
     validate_indexed_global_plans(function, errors);
@@ -1010,199 +921,6 @@ fn validate_direct_call_plans(
             direct_call.source,
             &direct_call.body,
             &direct_call.arg_plan,
-            errors,
-        );
-    }
-}
-
-fn validate_constructor_call_plans(
-    function: &FunctionOptimizationPlanV3,
-    identity_tables: &SerializedIdentityTables,
-    errors: &mut Vec<String>,
-) {
-    let mut seen = HashSet::new();
-    for constructor_call in &function.constructor_calls {
-        if !seen.insert((
-            constructor_call.source,
-            constructor_call.target,
-            constructor_call.owner_type.clone(),
-        )) {
-            errors.push(format!(
-                "function {} has duplicate constructor-call target {} {}.{} at {}",
-                function.function.function,
-                constructor_call.target,
-                constructor_call.owner_type.module_name,
-                constructor_call.owner_type.qualname,
-                constructor_call.source
-            ));
-        }
-        if constructor_call.reason.is_empty() {
-            errors.push(format!(
-                "function {} constructor-call target {} at {} has empty reason",
-                function.function.function, constructor_call.target, constructor_call.source
-            ));
-        }
-        if identity_tables
-            .module(constructor_call.target.module_id())
-            .is_err()
-        {
-            errors.push(format!(
-                "function {} constructor-call target {} references missing module id {}",
-                function.function.function,
-                constructor_call.target,
-                constructor_call.target.module_id()
-            ));
-        }
-        if constructor_call.owner_type.module_name.is_empty() {
-            errors.push(format!(
-                "function {} constructor-call target {} at {} has empty owner module",
-                function.function.function, constructor_call.target, constructor_call.source
-            ));
-        }
-        if constructor_call.owner_type.qualname.is_empty() {
-            errors.push(format!(
-                "function {} constructor-call target {} at {} has empty owner qualname",
-                function.function.function, constructor_call.target, constructor_call.source
-            ));
-        }
-        if constructor_call.guard.kind != ConstructorCallGuardKind::ExactCallableTypeVersion {
-            errors.push(format!(
-                "function {} constructor-call target {} at {} has unsupported guard {:?}",
-                function.function.function,
-                constructor_call.target,
-                constructor_call.source,
-                constructor_call.guard.kind
-            ));
-        }
-        if constructor_call.fallback.kind != ConstructorCallFallbackKind::OriginalConstructorCall {
-            errors.push(format!(
-                "function {} constructor-call target {} at {} has unsupported fallback {:?}",
-                function.function.function,
-                constructor_call.target,
-                constructor_call.source,
-                constructor_call.fallback.kind
-            ));
-        }
-        validate_call_body_plan(
-            function,
-            identity_tables,
-            "constructor-call",
-            constructor_call.target,
-            constructor_call.source,
-            &constructor_call.body,
-            errors,
-        );
-        validate_direct_call_arg_plan(
-            function,
-            "constructor-call",
-            constructor_call.target,
-            constructor_call.source,
-            &constructor_call.arg_plan,
-            errors,
-        );
-    }
-}
-
-fn validate_method_call_plans(
-    function: &FunctionOptimizationPlanV3,
-    identity_tables: &SerializedIdentityTables,
-    errors: &mut Vec<String>,
-) {
-    let mut seen = HashSet::new();
-    for method_call in &function.method_calls {
-        if !seen.insert((
-            method_call.source,
-            method_call.target,
-            method_call.method_name.clone(),
-            method_call.owner_type.clone(),
-        )) {
-            errors.push(format!(
-                "function {} has duplicate method-call target {} {}.{} method={} at {}",
-                function.function.function,
-                method_call.target,
-                method_call.owner_type.module_name,
-                method_call.owner_type.qualname,
-                method_call.method_name,
-                method_call.source
-            ));
-        }
-        if method_call.reason.is_empty() {
-            errors.push(format!(
-                "function {} method-call target {} at {} has empty reason",
-                function.function.function, method_call.target, method_call.source
-            ));
-        }
-        if identity_tables
-            .module(method_call.target.module_id())
-            .is_err()
-        {
-            errors.push(format!(
-                "function {} method-call target {} references missing module id {}",
-                function.function.function,
-                method_call.target,
-                method_call.target.module_id()
-            ));
-        }
-        if method_call.method_name.is_empty() {
-            errors.push(format!(
-                "function {} method-call target {} at {} has empty method name",
-                function.function.function, method_call.target, method_call.source
-            ));
-        }
-        if method_call.owner_type.module_name.is_empty() {
-            errors.push(format!(
-                "function {} method-call target {} at {} has empty owner module",
-                function.function.function, method_call.target, method_call.source
-            ));
-        }
-        if method_call.owner_type.qualname.is_empty() {
-            errors.push(format!(
-                "function {} method-call target {} at {} has empty owner qualname",
-                function.function.function, method_call.target, method_call.source
-            ));
-        }
-        if method_call.guard.kind != MethodCallGuardKind::ExactReceiverTypeVersion {
-            errors.push(format!(
-                "function {} method-call target {} at {} has unsupported guard {:?}",
-                function.function.function,
-                method_call.target,
-                method_call.source,
-                method_call.guard.kind
-            ));
-        }
-        if method_call.fallback.kind != MethodCallFallbackKind::OriginalMethodCall {
-            errors.push(format!(
-                "function {} method-call target {} at {} has unsupported fallback {:?}",
-                function.function.function,
-                method_call.target,
-                method_call.source,
-                method_call.fallback.kind
-            ));
-        }
-        validate_call_body_plan(
-            function,
-            identity_tables,
-            "method-call",
-            method_call.target,
-            method_call.source,
-            &method_call.body,
-            errors,
-        );
-        validate_direct_call_arg_plan(
-            function,
-            "method-call",
-            method_call.target,
-            method_call.source,
-            &method_call.arg_plan,
-            errors,
-        );
-        validate_inline_call_body_arg_plan(
-            function,
-            "method-call",
-            method_call.target,
-            method_call.source,
-            &method_call.body,
-            &method_call.arg_plan,
             errors,
         );
     }
@@ -2489,22 +2207,6 @@ mod tests {
         module
     }
 
-    fn module_with_constructor_calls(
-        constructor_calls: Vec<ConstructorCallSpecializationPlan>,
-    ) -> ModuleOptimizationPlanV3 {
-        let mut module = module_with_regions(Vec::new());
-        module.functions[0].constructor_calls = constructor_calls;
-        module
-    }
-
-    fn module_with_method_calls(
-        method_calls: Vec<MethodCallSpecializationPlan>,
-    ) -> ModuleOptimizationPlanV3 {
-        let mut module = module_with_regions(Vec::new());
-        module.functions[0].method_calls = method_calls;
-        module
-    }
-
     fn module_with_indexed_fields(
         indexed_fields: Vec<IndexedFieldSpecializationPlan>,
     ) -> ModuleOptimizationPlanV3 {
@@ -2557,8 +2259,6 @@ mod tests {
                 regions,
                 scalar_threads,
                 direct_calls: Vec::new(),
-                constructor_calls: Vec::new(),
-                method_calls: Vec::new(),
                 exact_list_items: Vec::new(),
                 indexed_fields: Vec::new(),
                 indexed_globals: Vec::new(),
@@ -2610,13 +2310,6 @@ mod tests {
             },
             inline_target: None,
             reason: "test inline body".to_string(),
-        }
-    }
-
-    fn constructor_inline_call_body(inline_target: SerializedFunctionId) -> CallBodyPlan {
-        CallBodyPlan {
-            inline_target: Some(inline_target),
-            ..inline_call_body()
         }
     }
 
@@ -2698,94 +2391,6 @@ mod tests {
     }
 
     #[test]
-    fn validates_constructor_call_selections() {
-        let target = SerializedFunctionId::new(SerializedModuleId::new(0), LocalFunctionId::new(2));
-        let plan = module_with_constructor_calls(vec![ConstructorCallSpecializationPlan {
-            source: instr_id(7),
-            target,
-            owner_type: ConstructorCallOwnerType {
-                module_name: "pkg.mod".to_string(),
-                qualname: "Box".to_string(),
-            },
-            arg_plan: DirectCallArgPlan {
-                sources: vec![
-                    DirectCallArgSource::Provided(0),
-                    DirectCallArgSource::Provided(1),
-                ],
-            },
-            guard: ConstructorCallGuardPlan {
-                kind: ConstructorCallGuardKind::ExactCallableTypeVersion,
-            },
-            fallback: ConstructorCallFallbackPlan {
-                kind: ConstructorCallFallbackKind::OriginalConstructorCall,
-            },
-            body: direct_call_body(),
-            reason: "profiled constructor target".to_string(),
-        }]);
-
-        validate_module_plan_v3(&plan).unwrap();
-    }
-
-    #[test]
-    fn validates_constructor_call_inline_body_with_runtime_iter_target() {
-        let target = SerializedFunctionId::new(SerializedModuleId::new(0), LocalFunctionId::new(2));
-        let iter_target =
-            SerializedFunctionId::new(SerializedModuleId::new(0), LocalFunctionId::new(3));
-        let plan = module_with_constructor_calls(vec![ConstructorCallSpecializationPlan {
-            source: instr_id(7),
-            target,
-            owner_type: ConstructorCallOwnerType {
-                module_name: "pkg.mod".to_string(),
-                qualname: "Box".to_string(),
-            },
-            arg_plan: DirectCallArgPlan {
-                sources: vec![DirectCallArgSource::Provided(0)],
-            },
-            guard: ConstructorCallGuardPlan {
-                kind: ConstructorCallGuardKind::ExactCallableTypeVersion,
-            },
-            fallback: ConstructorCallFallbackPlan {
-                kind: ConstructorCallFallbackKind::OriginalConstructorCall,
-            },
-            body: constructor_inline_call_body(iter_target),
-            reason: "profiled constructor target".to_string(),
-        }]);
-
-        validate_module_plan_v3(&plan).unwrap();
-    }
-
-    #[test]
-    fn rejects_constructor_call_inline_body_without_runtime_iter_target() {
-        let target = SerializedFunctionId::new(SerializedModuleId::new(0), LocalFunctionId::new(2));
-        let plan = module_with_constructor_calls(vec![ConstructorCallSpecializationPlan {
-            source: instr_id(7),
-            target,
-            owner_type: ConstructorCallOwnerType {
-                module_name: "pkg.mod".to_string(),
-                qualname: "Box".to_string(),
-            },
-            arg_plan: DirectCallArgPlan {
-                sources: vec![DirectCallArgSource::Provided(0)],
-            },
-            guard: ConstructorCallGuardPlan {
-                kind: ConstructorCallGuardKind::ExactCallableTypeVersion,
-            },
-            fallback: ConstructorCallFallbackPlan {
-                kind: ConstructorCallFallbackKind::OriginalConstructorCall,
-            },
-            body: inline_call_body(),
-            reason: "profiled constructor target".to_string(),
-        }]);
-
-        let err = validate_module_plan_v3(&plan).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("inline call-body plan without runtime-iter inline target"),
-            "{err}"
-        );
-    }
-
-    #[test]
     fn rejects_direct_call_inline_body_with_explicit_inline_target() {
         let target = SerializedFunctionId::new(SerializedModuleId::new(0), LocalFunctionId::new(2));
         let inline_target =
@@ -2807,131 +2412,6 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("unexpected explicit inline target"),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn rejects_constructor_call_selections_with_missing_target_module_identity() {
-        let target = SerializedFunctionId::new(SerializedModuleId::new(1), LocalFunctionId::new(2));
-        let plan = module_with_constructor_calls(vec![ConstructorCallSpecializationPlan {
-            source: instr_id(7),
-            target,
-            owner_type: ConstructorCallOwnerType {
-                module_name: "pkg.mod".to_string(),
-                qualname: "Box".to_string(),
-            },
-            arg_plan: DirectCallArgPlan {
-                sources: vec![DirectCallArgSource::Provided(0)],
-            },
-            guard: ConstructorCallGuardPlan {
-                kind: ConstructorCallGuardKind::ExactCallableTypeVersion,
-            },
-            fallback: ConstructorCallFallbackPlan {
-                kind: ConstructorCallFallbackKind::OriginalConstructorCall,
-            },
-            body: direct_call_body(),
-            reason: "profiled constructor target".to_string(),
-        }]);
-
-        let err = validate_module_plan_v3(&plan).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("constructor-call target 1:2 references missing module id 1"),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn validates_method_call_selections() {
-        let target = SerializedFunctionId::new(SerializedModuleId::new(0), LocalFunctionId::new(2));
-        let plan = module_with_method_calls(vec![MethodCallSpecializationPlan {
-            source: instr_id(7),
-            target,
-            method_name: "get".to_string(),
-            owner_type: MethodCallOwnerType {
-                module_name: "pkg.mod".to_string(),
-                qualname: "Box".to_string(),
-            },
-            arg_plan: DirectCallArgPlan {
-                sources: vec![DirectCallArgSource::Provided(0)],
-            },
-            guard: MethodCallGuardPlan {
-                kind: MethodCallGuardKind::ExactReceiverTypeVersion,
-            },
-            fallback: MethodCallFallbackPlan {
-                kind: MethodCallFallbackKind::OriginalMethodCall,
-            },
-            body: direct_call_body(),
-            reason: "profiled owner-method target".to_string(),
-        }]);
-
-        validate_module_plan_v3(&plan).unwrap();
-    }
-
-    #[test]
-    fn rejects_method_call_selections_with_missing_target_module_identity() {
-        let target = SerializedFunctionId::new(SerializedModuleId::new(1), LocalFunctionId::new(2));
-        let plan = module_with_method_calls(vec![MethodCallSpecializationPlan {
-            source: instr_id(7),
-            target,
-            method_name: "get".to_string(),
-            owner_type: MethodCallOwnerType {
-                module_name: "pkg.mod".to_string(),
-                qualname: "Box".to_string(),
-            },
-            arg_plan: DirectCallArgPlan {
-                sources: vec![DirectCallArgSource::Provided(0)],
-            },
-            guard: MethodCallGuardPlan {
-                kind: MethodCallGuardKind::ExactReceiverTypeVersion,
-            },
-            fallback: MethodCallFallbackPlan {
-                kind: MethodCallFallbackKind::OriginalMethodCall,
-            },
-            body: direct_call_body(),
-            reason: "profiled owner-method target".to_string(),
-        }]);
-
-        let err = validate_module_plan_v3(&plan).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("method-call target 1:2 references missing module id 1"),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn rejects_method_call_inline_body_with_default_arg_sentinel() {
-        let target = SerializedFunctionId::new(SerializedModuleId::new(0), LocalFunctionId::new(2));
-        let plan = module_with_method_calls(vec![MethodCallSpecializationPlan {
-            source: instr_id(7),
-            target,
-            method_name: "get".to_string(),
-            owner_type: MethodCallOwnerType {
-                module_name: "pkg.mod".to_string(),
-                qualname: "Box".to_string(),
-            },
-            arg_plan: DirectCallArgPlan {
-                sources: vec![
-                    DirectCallArgSource::Provided(0),
-                    DirectCallArgSource::DefaultSentinel,
-                ],
-            },
-            guard: MethodCallGuardPlan {
-                kind: MethodCallGuardKind::ExactReceiverTypeVersion,
-            },
-            fallback: MethodCallFallbackPlan {
-                kind: MethodCallFallbackKind::OriginalMethodCall,
-            },
-            body: inline_call_body(),
-            reason: "profiled owner-method target".to_string(),
-        }]);
-
-        let err = validate_module_plan_v3(&plan).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("inline call-body plan with default-sentinel arguments"),
             "{err}"
         );
     }

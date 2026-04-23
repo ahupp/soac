@@ -3,11 +3,7 @@ use crate::artifacts_v3::{
     ExactIntBranchV3Artifacts, single_function_optimization_artifacts_v3,
     write_optimization_artifacts_v3,
 };
-use crate::call_emission_v3::{
-    ResolvedV3ConstructorCallPlan, ResolvedV3DirectCallPlan, ResolvedV3MethodCallPlan,
-    constructor_calls_for_function_from_artifacts, direct_calls_for_function_from_artifacts,
-    method_calls_for_function_from_artifacts,
-};
+use crate::call_emission_v3::{ResolvedV3DirectCallPlan, direct_calls_for_function_from_artifacts};
 use crate::call_inlining_v3::{
     V3CallInliningProfile, V3ExternalInlineTarget, rewrite_v3_call_inlining_for_module,
 };
@@ -21,13 +17,12 @@ use crate::plan::{
     OptimizationPlanGenerationSummary, ProfileEvidenceStore, cached_module_paths_under_root,
 };
 use crate::plan_v3::{
-    ConstructorCallSpecializationPlan, DirectCallArgPlan, DirectCallArgSource,
-    DirectCallSpecializationPlan, EXACT_LIST_EXACT_INT_ITEM_SHAPE_TAG, ExactListItemAccessKind,
-    ExactListItemShape, ExactListItemSpecializationPlan, FunctionOptimizationPlanV3,
-    FunctionPlanIdentity, IndexedFieldAccessKind, IndexedFieldOwnerType,
-    IndexedFieldSpecializationPlan, IndexedGlobalAccessKind, IndexedGlobalSpecializationPlan,
-    MethodCallSpecializationPlan, ModuleOptimizationPlanV3, ModulePlanIdentity, PlanDiagnostic,
-    RegionId,
+    DirectCallArgPlan, DirectCallArgSource, DirectCallSpecializationPlan,
+    EXACT_LIST_EXACT_INT_ITEM_SHAPE_TAG, ExactListItemAccessKind, ExactListItemShape,
+    ExactListItemSpecializationPlan, FunctionOptimizationPlanV3, FunctionPlanIdentity,
+    IndexedFieldAccessKind, IndexedFieldOwnerType, IndexedFieldSpecializationPlan,
+    IndexedGlobalAccessKind, IndexedGlobalSpecializationPlan, ModuleOptimizationPlanV3,
+    ModulePlanIdentity, PlanDiagnostic, RegionId,
 };
 use crate::planner_v3::{
     CallBodyPlanRequest, DirectCallPlanRequest, ExactListItemPlanRequest,
@@ -350,8 +345,6 @@ fn plan_and_emit_module_v3_from_raw_evidence_with_target_index(
             &mut identity_builder,
         );
         diagnostics.extend(direct_call_diagnostics);
-        let constructor_calls = Vec::new();
-        let method_calls = Vec::new();
         let (exact_list_items, exact_list_item_diagnostics) =
             exact_list_item_requests_from_profile_evidence_v3(function, &evidence);
         diagnostics.extend(exact_list_item_diagnostics);
@@ -369,8 +362,6 @@ fn plan_and_emit_module_v3_from_raw_evidence_with_target_index(
             function: function_plan_identity_v3(function),
             regions: region_requests,
             direct_calls,
-            constructor_calls,
-            method_calls,
             exact_list_items,
             indexed_fields,
             indexed_globals,
@@ -424,8 +415,6 @@ pub fn plan_and_emit_extracted_exact_int_branches_v3(
             module,
             functions: vec![FunctionPlanRequest {
                 direct_calls: Vec::new(),
-                constructor_calls: Vec::new(),
-                method_calls: Vec::new(),
                 exact_list_items: Vec::new(),
                 indexed_fields: Vec::new(),
                 indexed_globals: Vec::new(),
@@ -475,30 +464,11 @@ fn validate_function_plan_v3_against_lowered_function(
     lowered_module: &BlockPyModule<CodegenModuleShape>,
     lowered_function: &BlockPyFunction<CodegenModuleShape>,
 ) -> Result<(), MechanicalEmitError> {
-    if !planned_function.direct_calls.is_empty()
-        || !planned_function.constructor_calls.is_empty()
-        || !planned_function.method_calls.is_empty()
-    {
+    if !planned_function.direct_calls.is_empty() {
         let lowered_calls = lowered_calls_by_instr_v3(lowered_module, lowered_function)?;
         for direct_call in &planned_function.direct_calls {
             validate_direct_call_plan_against_lowered_function(
                 direct_call,
-                planned_function,
-                lowered_function,
-                &lowered_calls,
-            )?;
-        }
-        for constructor_call in &planned_function.constructor_calls {
-            validate_constructor_call_plan_against_lowered_function(
-                constructor_call,
-                planned_function,
-                lowered_function,
-                &lowered_calls,
-            )?;
-        }
-        for method_call in &planned_function.method_calls {
-            validate_method_call_plan_against_lowered_function(
-                method_call,
                 planned_function,
                 lowered_function,
                 &lowered_calls,
@@ -623,52 +593,6 @@ fn validate_direct_call_plan_against_lowered_function(
         )));
     }
     Ok(())
-}
-
-fn validate_constructor_call_plan_against_lowered_function(
-    plan: &ConstructorCallSpecializationPlan,
-    planned_function: &FunctionOptimizationPlanV3,
-    lowered_function: &BlockPyFunction<CodegenModuleShape>,
-    lowered_calls: &HashMap<InstrId, LoweredCallAccessV3>,
-) -> Result<(), MechanicalEmitError> {
-    let Some(lowered) = lowered_calls.get(&plan.source) else {
-        return Err(MechanicalEmitError::EmissionMismatch(format!(
-            "function {} constructor-call at {}, but lowered function {} has no call with that source",
-            planned_function.function.function, plan.source, lowered_function.function_id
-        )));
-    };
-    if lowered.method_name.is_some() {
-        return Err(MechanicalEmitError::EmissionMismatch(format!(
-            "function {} constructor-call at {} selects a lowered method call",
-            planned_function.function.function, plan.source
-        )));
-    }
-    Ok(())
-}
-
-fn validate_method_call_plan_against_lowered_function(
-    plan: &MethodCallSpecializationPlan,
-    planned_function: &FunctionOptimizationPlanV3,
-    lowered_function: &BlockPyFunction<CodegenModuleShape>,
-    lowered_calls: &HashMap<InstrId, LoweredCallAccessV3>,
-) -> Result<(), MechanicalEmitError> {
-    let Some(lowered) = lowered_calls.get(&plan.source) else {
-        return Err(MechanicalEmitError::EmissionMismatch(format!(
-            "function {} method-call at {}, but lowered function {} has no call with that source",
-            planned_function.function.function, plan.source, lowered_function.function_id
-        )));
-    };
-    match lowered.method_name.as_deref() {
-        Some(method_name) if method_name == plan.method_name => Ok(()),
-        Some(method_name) => Err(MechanicalEmitError::EmissionMismatch(format!(
-            "function {} method-call at {} selects method {}, but lowered call uses {}",
-            planned_function.function.function, plan.source, plan.method_name, method_name
-        ))),
-        None => Err(MechanicalEmitError::EmissionMismatch(format!(
-            "function {} method-call at {} does not lower from GetAttr",
-            planned_function.function.function, plan.source
-        ))),
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1800,7 +1724,7 @@ fn generate_loaded_module_optimization_plan_v3(
 }
 
 fn rewrite_cached_module_for_optimization_artifacts_v3(
-    metadata: &CachedCodegenModuleMetadata,
+    _metadata: &CachedCodegenModuleMetadata,
     module: &BlockPyModule<CodegenModuleShape>,
     artifacts: &ExactIntBranchV3Artifacts,
     target_index: &DirectCallTargetIndex,
@@ -1808,10 +1732,6 @@ fn rewrite_cached_module_for_optimization_artifacts_v3(
     let module_id = RuntimeModuleId::new(module.module_name_gen.module_id());
     let mut direct_calls_by_function =
         HashMap::<RuntimeFunctionId, HashMap<InstrId, Vec<ResolvedV3DirectCallPlan>>>::new();
-    let mut constructor_calls_by_function =
-        HashMap::<RuntimeFunctionId, HashMap<InstrId, Vec<ResolvedV3ConstructorCallPlan>>>::new();
-    let mut method_calls_by_function =
-        HashMap::<RuntimeFunctionId, HashMap<InstrId, Vec<ResolvedV3MethodCallPlan>>>::new();
     let mut exact_int_branch_function_ids = HashSet::<RuntimeFunctionId>::new();
 
     for planned_function in &artifacts.plan.functions {
@@ -1836,47 +1756,16 @@ fn rewrite_cached_module_for_optimization_artifacts_v3(
         {
             direct_calls_by_function.insert(function_id, direct_calls);
         }
-        if let Some(constructor_calls) =
-            constructor_calls_for_function_from_artifacts(&function_artifacts, |target| {
-                resolve_cached_v3_call_target(target_index, target)
-            })?
-        {
-            constructor_calls_by_function.insert(function_id, constructor_calls);
-        }
-        if let Some(method_calls) =
-            method_calls_for_function_from_artifacts(&function_artifacts, |target| {
-                resolve_cached_v3_call_target(target_index, target)
-            })?
-        {
-            method_calls_by_function.insert(function_id, method_calls);
-        }
     }
 
-    let direct_owner_attr_specializations_by_function = HashMap::new();
     let output = rewrite_v3_call_inlining_for_module(
         module,
         V3CallInliningProfile {
             direct_calls_by_function: &direct_calls_by_function,
-            constructor_calls_by_function: &constructor_calls_by_function,
-            method_calls_by_function: &method_calls_by_function,
             exact_int_branch_function_ids: &exact_int_branch_function_ids,
         },
-        &direct_owner_attr_specializations_by_function,
         |function_id| resolve_cached_v3_external_inline_target(target_index, function_id),
-        |_| None,
-        |_| None,
     )?;
-    if output
-        .summary
-        .method_rewrites
-        .iter()
-        .any(|report| report.stats.rewritten_stores != 0)
-    {
-        return Err(format!(
-            "optimizer v3 unexpectedly rewrote runtime-guarded method/constructor calls for module {}",
-            metadata.module_name
-        ));
-    }
     Ok(output.module)
 }
 

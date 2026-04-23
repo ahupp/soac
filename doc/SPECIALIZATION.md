@@ -30,10 +30,9 @@ inline path as the lower-cost body alternative. `Inline` selection validates
 that the BlockPy inline-fragment builder can construct the selected body from
 the cached target module, and the optimized `mod.optv3.blockpy` artifact is the
 source of truth consumed by the JIT. Runtime-guarded receiver-method and
-constructor call plans are not currently live v3 codegen inputs; they are
-disabled in planning and rejected if they appear in an artifact until their
-owner/type guard payload can be represented as a static, validated codegen
-input.
+constructor call specializations are not represented in v3 artifacts today;
+those call shapes stay on generic lowering unless a future plan format adds
+validated static guard inputs for them.
 Constant-attribute indexed-field load/store selections from `type_keys` are
 also emitted as mechanical v3 indexed-field decisions; JIT validation checks
 those emitted decisions against the selected plan and lowered
@@ -81,8 +80,6 @@ Current migration surface:
   `NameLocation::Global(slot)` load/store sites, emitted with explicit
   module-dict guard and original-global-access fallback effects, and consumed
   as v3-owned global load/store inputs.
-- Legacy only: division/modulo/shift and unary exact-int value-producing
-  operators.
 - Not currently a v3 semantic-plan target: branch locality and cold block
   layout hints. These remain layout metadata unless a future CFG-placement plan
   needs to represent them.
@@ -523,18 +520,18 @@ method-call family should reintroduce this only when the plan can serialize the
 method name, owner type key, direct-entry argument plan, receiver
 type-version guard, callable relocation, and original-call fallback as a static
 validated codegen input. Until then, v3 planning leaves method calls generic and
-the JIT rejects method-call plans if an artifact contains them.
+the v3 artifact schema does not carry method-call plan entries.
 
 
 ## Type Constructors
 
 Constructor calls still reuse `call_hot_targets` evidence, but they are not a
-live optimizer-v3 codegen family today. The v3 planner currently declines them,
-and the JIT rejects constructor-call plans if an artifact contains them. A
-future constructor family needs a static plan payload for the owner type key,
-the `__init__` callable relocation, the direct-entry argument plan with
-implicit `self`, the callable type-version guard, and the original constructor
-fallback before codegen should emit a fast path.
+live optimizer-v3 codegen family today. The v3 artifact schema does not carry
+constructor-call plan entries. A future constructor family needs a static plan
+payload for the owner type key, the `__init__` callable relocation, the
+direct-entry argument plan with implicit `self`, the callable type-version
+guard, and the original constructor fallback before codegen should emit a fast
+path.
 
 Constructor allocation, initializer inlining, and constructor scalar
 replacement should be represented by the optimized `mod.optv3.blockpy` module
@@ -661,59 +658,47 @@ access goes through the CPython item APIs.
   - preserve effect-only result demand so successful stores do not materialize
     owned `None` when the value is unused
 
-## Exact-Int Binary Operators
+## Exact-Int Operators
 
 ### Counted Input
 
 - Source input is `operator_hot_shapes`.
-- Candidate operators are `BinOp` nodes excluding:
-  - `Contains`
-  - `Is`
-  - `MatMul`
-  - `InplaceMatMul`
+- Candidate operators are the v3-supported binary `BinOp` nodes:
+  - `Add`, `Sub`, `Mul`
+  - `And`, `Or`, `Xor`
+  - `Eq`, `Ne`, `Lt`, `Le`, `Gt`, `Ge`
 - Candidate detection is in
-  `instrument_bb_module_with_call_target_counters`, at
-  `crates/soac_lowering/src/passes/trace/mod.rs:235`.
+  `instrument_bb_module_with_call_target_counters` in
+  `crates/soac_lowering/src/passes/trace/mod.rs`.
 - Shapes are packed exact-type tags defined in
-  `crates/soac_jit/src/operator_specialization.rs:4`.
+  `crates/soac_opt/src/operator_specialization.rs`.
 - Today the only exact type tag is `ExactTypeTag::Int`.
+- Unary operators, division, modulo, shifts, power, identity/contains tests,
+  matmul, and in-place variants are not counted for this specialization and use
+  generic lowering unless v3 grows explicit alternatives for them.
 
 ### Codegen
 
-- Binary specialization is emitted in
-  `emit_specialized_binop`, at
-  `crates/soac_jit/src/jit/intrinsics.rs:714`.
-- The fast path:
-  - records the current observed operand shape
-  - compares it against the profiled exact-int shape for operations that still
-    use the helper fallback path
-  - skips the shape guard when value facts already prove both operands are
-    exact `int`
-  - for profiled or fact-proven exact-int `Add`, `Sub`, and `Mul`, guards that
-    both runtime objects are compact exact `PyLong` objects, unboxes them,
-    performs the arithmetic as machine `i64`, boxes the result with
-    `PyLong_FromLongLong`, and deopts or falls back on type/compactness/
-    overflow miss
-  - for other profiled-only exact-int binary operators, calls the profiled
-    `PyLong` number slot helper after the exact shape guard
-  - on miss in `verify`/`apply` mode, uses a cold
-    `dp_jit_deopt_resume` continuation when both operands are safe to
-    replay
-  - otherwise, falls back to the normal Python operator lowering
-- The current specialized operator space covers:
-  - arithmetic
-  - bitwise ops
-  - in-place arithmetic / bitwise ops
-  - comparisons represented as binary op kinds
+- v3 planning emits mechanical hot regions plus local fallback regions.
+- The hot path guards that both operands are compact exact `PyLong` objects,
+  unboxes them as machine `i64`, and then emits the selected operation:
+  - checked machine add/sub/mul with PythonLong materialization when the result
+    is demanded as an object
+  - machine bitwise and/or/xor with PythonLong materialization when needed
+  - direct integer comparisons with branch or Python bool materialization based
+    on result demand
+- On type/compactness/overflow miss, codegen runs the local generic fallback
+  region emitted from the original Python operation shape. When the fallback is
+  replay-safe, guard-miss lowering can instead target a cold
+  `dp_jit_deopt_resume` continuation.
 
 ### Limitations / Soundness / Extensions
 
 - Current limitations:
   - only exact `int`/`int`
   - no mixed-type shapes
-  - excluded binops still always use generic lowering
+  - unsupported operator kinds always use generic lowering
 - Soundness boundary:
-  - helper-backed specialization is guarded by exact observed type-shape match
   - compact-long machine-code specialization guards exact runtime `PyLong`
     layout and compact representation before direct memory access
   - unsupported or mismatched shapes either deopt to the generic
@@ -721,46 +706,7 @@ access goes through the CPython item APIs.
 - Natural extensions:
   - `float`, `str`, `bytes`, `bool`, and mixed-type shapes
   - richer shape encodings
-  - specialization for more operations that are currently excluded
-
-
-## Exact-Int Unary Operators
-
-### Counted Input
-
-- Source input is `operator_hot_shapes`.
-- Candidate operators are all `UnaryOp` nodes, via
-  `instrument_bb_module_with_call_target_counters`, at
-  `crates/soac_lowering/src/passes/trace/mod.rs:235`.
-- Shapes are packed exact-type tags from
-  `crates/soac_jit/src/operator_specialization.rs:4`.
-
-### Codegen
-
-- Unary specialization is emitted in
-  `emit_specialized_unary_op`, at
-  `crates/soac_jit/src/jit/intrinsics.rs`.
-- The fast path:
-  - records the observed unary operand shape
-  - checks for exact `int`
-  - skips the shape guard when value facts already prove the operand is
-    exact `int`
-  - on hit, calls the exact-int unary helper
-  - on miss in `verify`/`apply` mode, deopts to the generic
-    continuation when the operand is safe to replay
-  - on miss without a deopt plan, falls back to generic Python unary
-    lowering
-
-### Limitations / Soundness / Extensions
-
-- Current limitations:
-  - only exact `int`
-- Soundness boundary:
-  - exact-type guard plus deopt to the generic continuation or generic
-    fallback
-- Natural extensions:
-  - additional exact-type tags
-  - mixed numeric shape handling where unary semantics make sense
+  - specialization for more operators that are currently generic
 
 
 ## Exact-Int Comparisons
@@ -774,9 +720,7 @@ access goes through the CPython item APIs.
 
 ### Codegen
 
-- Comparison specialization also goes through
-  `emit_specialized_binop`, at
-  `crates/soac_jit/src/jit/intrinsics.rs`.
+- Comparison specialization is emitted from v3 exact-int operator regions.
 - If the profiled shape is exact `int`/`int`, comparisons such as
   `Eq`, `Ne`, `Lt`, `Le`, `Gt`, and `Ge` guard compact exact `PyLong` layout
   and emit a direct integer comparison instead of generic

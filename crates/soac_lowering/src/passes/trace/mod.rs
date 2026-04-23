@@ -251,14 +251,21 @@ pub fn instrument_bb_module_with_call_target_counters(
 ) {
     fn is_operator_specialization_candidate(expr: &InstrCodegen) -> bool {
         match expr {
-            InstrCodegen::BinOp(op) => !matches!(
+            InstrCodegen::BinOp(op) => matches!(
                 op.kind,
-                crate::block_py::BinOpKind::Contains
-                    | crate::block_py::BinOpKind::Is
-                    | crate::block_py::BinOpKind::MatMul
-                    | crate::block_py::BinOpKind::InplaceMatMul
+                crate::block_py::BinOpKind::Add
+                    | crate::block_py::BinOpKind::Sub
+                    | crate::block_py::BinOpKind::Mul
+                    | crate::block_py::BinOpKind::And
+                    | crate::block_py::BinOpKind::Or
+                    | crate::block_py::BinOpKind::Xor
+                    | crate::block_py::BinOpKind::Eq
+                    | crate::block_py::BinOpKind::Ne
+                    | crate::block_py::BinOpKind::Lt
+                    | crate::block_py::BinOpKind::Le
+                    | crate::block_py::BinOpKind::Gt
+                    | crate::block_py::BinOpKind::Ge
             ),
-            InstrCodegen::UnaryOp(_) => true,
             _ => false,
         }
     }
@@ -374,15 +381,6 @@ pub fn instrument_bb_module_with_call_target_counters(
                         function_id: Some(self.function_id),
                         instr_id: Some(instr_id),
                     },
-                );
-                self.counters.define_branch_counter_if_missing(
-                    CounterScope::This,
-                    "operator_specialized",
-                    CounterSite::Runtime {
-                        function_id: Some(self.function_id),
-                        instr_id: Some(instr_id),
-                    },
-                    ["hit", "fallback"],
                 );
             }
             if is_getitem_specialization_candidate(expr) {

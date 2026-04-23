@@ -87,11 +87,6 @@ dp_jit_dict_new
 dp_jit_dict_set_item
 dp_jit_is_true
 dp_jit_raise_i64_overflow
-dp_jit_exact_long_add_slot
-dp_jit_exact_long_sub_slot
-dp_jit_exact_long_mul_slot
-dp_jit_exact_long_true_div_slot
-dp_jit_exact_long_richcompare_slot
 ```
 
 Perf-frame toggle helper pairs:
@@ -113,10 +108,6 @@ dp_jit_py_call_with_kw
 dp_jit_py_call_with_kw_with_frame
 dp_jit_get_arg_item
 dp_jit_get_arg_item_with_frame
-dp_jit_exact_long_binary_op
-dp_jit_exact_long_binary_op_with_frame
-dp_jit_exact_long_unary_op
-dp_jit_exact_long_unary_op_with_frame
 ```
 
 Registered CPython-wrapper call targets:

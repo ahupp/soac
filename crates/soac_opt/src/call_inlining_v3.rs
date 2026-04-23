@@ -1,21 +1,13 @@
-use crate::call_emission_v3::{
-    ResolvedV3ConstructorCallPlan, ResolvedV3DirectCallPlan, ResolvedV3MethodCallPlan,
-    constructor_call_targets, inline_direct_call_targets, inline_method_call_targets,
-    merge_call_target_specializations,
-};
-use crate::plan_v3::CallBodyKind;
+use crate::call_emission_v3::{ResolvedV3DirectCallPlan, inline_direct_call_targets};
 use soac_core::block_py::{
-    BlockLabel, BlockPyFunction, BlockPyModule, InstrId, RuntimeFunctionId, RuntimeName, VisitMut,
+    BlockLabel, BlockPyFunction, BlockPyModule, InstrId, RuntimeFunctionId, VisitMut,
 };
 use soac_lowering::passes::{
     CodegenModuleShape, DirectCallStoreRewriteStats, InlineCallee, InlinePlanModule,
-    InlineRewriteStats, InstrCodegen, InstrResolved, ProfiledMethodInlineRewriteStats,
-    ProfiledOwnerAttrKey, ProfiledOwnerAttrSpecialization, ProfiledRuntimeIterConstructorCall,
-    ScalarReplacementStats, collect_profiled_runtime_iter_method_target_ids,
+    InlineRewriteStats, InstrCodegen, InstrResolved, ScalarReplacementStats,
     inline_direct_call_stores_with_callees, plan_module_inlining,
     rewrite_profiled_function_call_store_sites,
     rewrite_profiled_function_call_store_sites_with_constructor_targets,
-    rewrite_profiled_no_arg_method_call_store_sites,
     scalar_replace_non_escaping_constructor_allocations, summarize_module_escapes,
     validate_codegen_instr_ids,
 };
@@ -25,10 +17,6 @@ use std::collections::{HashMap, HashSet, VecDeque};
 pub struct V3CallInliningProfile<'a> {
     pub direct_calls_by_function:
         &'a HashMap<RuntimeFunctionId, HashMap<InstrId, Vec<ResolvedV3DirectCallPlan>>>,
-    pub constructor_calls_by_function:
-        &'a HashMap<RuntimeFunctionId, HashMap<InstrId, Vec<ResolvedV3ConstructorCallPlan>>>,
-    pub method_calls_by_function:
-        &'a HashMap<RuntimeFunctionId, HashMap<InstrId, Vec<ResolvedV3MethodCallPlan>>>,
     pub exact_int_branch_function_ids: &'a HashSet<RuntimeFunctionId>,
 }
 
@@ -41,20 +29,10 @@ pub struct V3ExternalInlineTarget {
 
 #[derive(Debug, Clone, Default)]
 pub struct V3CallInliningRewriteSummary {
-    pub method_rewrites: Vec<V3MethodCallInlineRewriteReport>,
     pub direct_rewrites: Vec<V3DirectCallRewriteReport>,
     pub inline_callee_specializations: Vec<V3InlineCalleeSpecializationReport>,
     pub inline_rewrite: InlineRewriteStats,
     pub scalar_replacement: ScalarReplacementStats,
-    pub runtime_constructor_function_ids: HashSet<RuntimeFunctionId>,
-    pub runtime_constructor_inline_plan_hits: usize,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct V3MethodCallInlineRewriteReport {
-    pub function_id: RuntimeFunctionId,
-    pub qualname: String,
-    pub stats: ProfiledMethodInlineRewriteStats,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -77,44 +55,22 @@ pub struct V3CallInliningRewriteOutput {
     pub summary: V3CallInliningRewriteSummary,
 }
 
-pub fn rewrite_v3_call_inlining_for_module<ResolveExternal, RuntimeConstructor, IterTarget>(
+pub fn rewrite_v3_call_inlining_for_module<ResolveExternal>(
     module: &BlockPyModule<CodegenModuleShape>,
     profile: V3CallInliningProfile<'_>,
-    direct_owner_attr_specializations_by_function: &HashMap<
-        RuntimeFunctionId,
-        HashMap<ProfiledOwnerAttrKey, Vec<ProfiledOwnerAttrSpecialization>>,
-    >,
     mut resolve_external_target: ResolveExternal,
-    mut constructor_for_runtime_name: RuntimeConstructor,
-    mut iter_target_for_constructor_guard: IterTarget,
 ) -> Result<V3CallInliningRewriteOutput, String>
 where
     ResolveExternal: FnMut(RuntimeFunctionId) -> Result<Option<V3ExternalInlineTarget>, String>,
-    RuntimeConstructor: FnMut(RuntimeName) -> Option<RuntimeFunctionId>,
-    IterTarget: FnMut(&ProfiledOwnerAttrSpecialization) -> Option<RuntimeFunctionId>,
 {
     let mut planned_module = module.clone();
-    let (callees, inline_callees, mut external_inline_plan, inline_callee_specializations) =
-        build_v3_inline_callee_maps(
-            &planned_module,
-            profile,
-            direct_owner_attr_specializations_by_function,
-            &mut resolve_external_target,
-            &mut iter_target_for_constructor_guard,
-        )?;
+    let (callees, inline_callees, external_inline_plan, inline_callee_specializations) =
+        build_v3_inline_callee_maps(&planned_module, profile, &mut resolve_external_target)?;
     let mut summary = V3CallInliningRewriteSummary {
         inline_callee_specializations,
         ..V3CallInliningRewriteSummary::default()
     };
-    let mut straightline_constructor_ids =
-        straightline_constructor_ids_in_plan(&plan_v3_call_inlining(&planned_module));
-    straightline_constructor_ids
-        .extend(straightline_constructor_ids_in_plan(&external_inline_plan));
-
     let mut rewritten_store_count = 0usize;
-    let mut runtime_constructor_function_ids = HashSet::new();
-    let module_constants = &mut planned_module.module_constants;
-    let empty_profiled_owner_attr_specializations = HashMap::new();
     for function in &mut planned_module.callable_defs {
         if profile
             .exact_int_branch_function_ids
@@ -122,44 +78,10 @@ where
         {
             continue;
         }
-        let inline_constructor_calls = v3_inline_constructor_calls(profile, function.function_id);
-        let method_call_rewrite_targets = merge_call_target_specializations(
-            v3_inline_method_call_targets(profile, function.function_id),
-            constructor_call_targets(&inline_constructor_calls),
-        );
         let direct_call_rewrite_targets =
             v3_inline_direct_function_call_targets(profile, function.function_id);
-        if method_call_rewrite_targets.is_empty() && direct_call_rewrite_targets.is_empty() {
+        if direct_call_rewrite_targets.is_empty() {
             continue;
-        }
-        if !method_call_rewrite_targets.is_empty() {
-            let direct_owner_attr_specializations = direct_owner_attr_specializations_by_function
-                .get(&function.function_id)
-                .unwrap_or(&empty_profiled_owner_attr_specializations);
-            let inline_constructor_calls =
-                profiled_runtime_iter_constructor_calls_for_lowering(&inline_constructor_calls);
-            let stats = rewrite_profiled_no_arg_method_call_store_sites(
-                function,
-                module_constants,
-                &method_call_rewrite_targets,
-                direct_owner_attr_specializations,
-                &inline_callees,
-                &straightline_constructor_ids,
-                &inline_constructor_calls,
-                &mut runtime_constructor_function_ids,
-                &mut constructor_for_runtime_name,
-                &mut iter_target_for_constructor_guard,
-            );
-            if stats.total_attempts() != 0 {
-                summary
-                    .method_rewrites
-                    .push(V3MethodCallInlineRewriteReport {
-                        function_id: function.function_id,
-                        qualname: function.names.qualname.clone(),
-                        stats,
-                    });
-            }
-            rewritten_store_count += stats.rewritten_stores;
         }
 
         let stats = rewrite_profiled_function_call_store_sites(
@@ -181,23 +103,10 @@ where
         normalize_module_block_labels_dense(&mut planned_module);
         validate_codegen_instr_ids(&planned_module)
             .map_err(|err| format!("v3 call-inline rewrite validation failed: {err}"))?;
-        extend_external_inline_plan_for_function_ids(
-            &mut external_inline_plan,
-            &runtime_constructor_function_ids,
-            &mut resolve_external_target,
-        )?;
         let mut inline_plan = plan_v3_call_inlining(&planned_module);
         inline_plan
             .functions
             .extend(external_inline_plan.functions.clone());
-        summary.runtime_constructor_inline_plan_hits = runtime_constructor_function_ids
-            .iter()
-            .filter(|function_id| {
-                inline_plan
-                    .straightline_constructor(**function_id)
-                    .is_some()
-            })
-            .count();
         summary.inline_rewrite = inline_direct_call_stores_with_callees(
             &mut planned_module,
             &inline_plan,
@@ -214,22 +123,16 @@ where
         }
     }
 
-    summary.runtime_constructor_function_ids = runtime_constructor_function_ids;
     Ok(V3CallInliningRewriteOutput {
         module: planned_module,
         summary,
     })
 }
 
-fn build_v3_inline_callee_maps<ResolveExternal, IterTarget>(
+fn build_v3_inline_callee_maps<ResolveExternal>(
     module: &BlockPyModule<CodegenModuleShape>,
     profile: V3CallInliningProfile<'_>,
-    direct_owner_attr_specializations_by_function: &HashMap<
-        RuntimeFunctionId,
-        HashMap<ProfiledOwnerAttrKey, Vec<ProfiledOwnerAttrSpecialization>>,
-    >,
     resolve_external_target: &mut ResolveExternal,
-    iter_target_for_constructor_guard: &mut IterTarget,
 ) -> Result<
     (
         HashMap<RuntimeFunctionId, soac_core::block_py::BlockPyFunction<CodegenModuleShape>>,
@@ -241,7 +144,6 @@ fn build_v3_inline_callee_maps<ResolveExternal, IterTarget>(
 >
 where
     ResolveExternal: FnMut(RuntimeFunctionId) -> Result<Option<V3ExternalInlineTarget>, String>,
-    IterTarget: FnMut(&ProfiledOwnerAttrSpecialization) -> Option<RuntimeFunctionId>,
 {
     let mut callee_functions = module
         .callable_defs
@@ -266,33 +168,7 @@ where
         for targets in direct_call_rewrite_targets.values() {
             target_ids.extend(targets.iter().copied());
         }
-        for plans in v3_inline_constructor_calls(profile, function.function_id).values() {
-            for plan in plans {
-                target_ids.insert(plan.target);
-                if let Some(inline_target) = plan.inline_target {
-                    target_ids.insert(inline_target);
-                }
-            }
-        }
-        for targets in v3_inline_method_call_targets(profile, function.function_id).values() {
-            target_ids.extend(targets.iter().copied());
-        }
-        if let Some(direct_owner_attr_specializations) =
-            direct_owner_attr_specializations_by_function.get(&function.function_id)
-        {
-            let inline_constructor_calls =
-                v3_inline_constructor_calls(profile, function.function_id);
-            let constructor_call_targets = constructor_call_targets(&inline_constructor_calls);
-            target_ids.extend(collect_profiled_runtime_iter_method_target_ids(
-                function,
-                module.module_constants.as_slice(),
-                direct_owner_attr_specializations,
-                &constructor_call_targets,
-                iter_target_for_constructor_guard,
-            ));
-        }
     }
-
     let mut pending_target_ids = target_ids.iter().copied().collect::<VecDeque<_>>();
     while let Some(function_id) = pending_target_ids.pop_front() {
         if callee_functions.contains_key(&function_id) {
@@ -370,28 +246,6 @@ fn specialize_v3_inline_callees(
     reports
 }
 
-fn extend_external_inline_plan_for_function_ids<ResolveExternal>(
-    external_inline_plan: &mut InlinePlanModule,
-    function_ids: &HashSet<RuntimeFunctionId>,
-    resolve_external_target: &mut ResolveExternal,
-) -> Result<(), String>
-where
-    ResolveExternal: FnMut(RuntimeFunctionId) -> Result<Option<V3ExternalInlineTarget>, String>,
-{
-    for function_id in function_ids {
-        if external_inline_plan.functions.contains_key(function_id) {
-            continue;
-        }
-        let Some(target) = resolve_external_target(*function_id)? else {
-            continue;
-        };
-        external_inline_plan
-            .functions
-            .extend(target.inline_plan.functions);
-    }
-    Ok(())
-}
-
 fn v3_inline_direct_function_call_targets(
     profile: V3CallInliningProfile<'_>,
     function_id: RuntimeFunctionId,
@@ -401,73 +255,6 @@ fn v3_inline_direct_function_call_targets(
         .get(&function_id)
         .map(inline_direct_call_targets)
         .unwrap_or_default()
-}
-
-fn v3_inline_constructor_calls(
-    profile: V3CallInliningProfile<'_>,
-    function_id: RuntimeFunctionId,
-) -> HashMap<InstrId, Vec<ResolvedV3ConstructorCallPlan>> {
-    profile
-        .constructor_calls_by_function
-        .get(&function_id)
-        .map(|constructor_calls_by_source| {
-            constructor_calls_by_source
-                .iter()
-                .filter_map(|(source, constructor_calls)| {
-                    let plans = constructor_calls
-                        .iter()
-                        .filter(|constructor_call| {
-                            constructor_call.body.kind == CallBodyKind::Inline
-                        })
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    (!plans.is_empty()).then_some((*source, plans))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn v3_inline_method_call_targets(
-    profile: V3CallInliningProfile<'_>,
-    function_id: RuntimeFunctionId,
-) -> HashMap<InstrId, Vec<RuntimeFunctionId>> {
-    profile
-        .method_calls_by_function
-        .get(&function_id)
-        .map(inline_method_call_targets)
-        .unwrap_or_default()
-}
-
-fn profiled_runtime_iter_constructor_calls_for_lowering(
-    source: &HashMap<InstrId, Vec<ResolvedV3ConstructorCallPlan>>,
-) -> HashMap<InstrId, Vec<ProfiledRuntimeIterConstructorCall>> {
-    source
-        .iter()
-        .filter_map(|(instr_id, plans)| {
-            let plans = plans
-                .iter()
-                .filter(|plan| plan.body.kind == CallBodyKind::Inline)
-                .map(|plan| ProfiledRuntimeIterConstructorCall {
-                    constructor_function_id: plan.target,
-                    inline_target: plan.inline_target,
-                })
-                .collect::<Vec<_>>();
-            (!plans.is_empty()).then_some((*instr_id, plans))
-        })
-        .collect()
-}
-
-fn straightline_constructor_ids_in_plan(
-    inline_plan: &InlinePlanModule,
-) -> HashSet<RuntimeFunctionId> {
-    inline_plan
-        .functions
-        .iter()
-        .filter_map(|(function_id, plan)| {
-            plan.straightline_constructor.as_ref().map(|_| *function_id)
-        })
-        .collect()
 }
 
 fn plan_v3_call_inlining(module: &BlockPyModule<CodegenModuleShape>) -> InlinePlanModule {
@@ -532,7 +319,7 @@ fn normalize_function_block_labels_dense(function: &mut BlockPyFunction<CodegenM
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plan_v3::{CallBodyPlan, Cost};
+    use crate::plan_v3::{CallBodyKind, CallBodyPlan, Cost};
     use soac_core::block_py::{ChildVisitable, HasSemanticInstrId, Visit};
     use soac_lowering::lower_python_to_blockpy_for_testing;
     use soac_lowering::passes::{
@@ -623,23 +410,15 @@ def caller(fn, x):\n    y = fn(x)\n    return y\n",
                 }],
             )]),
         )]);
-        let constructor_calls = HashMap::new();
-        let method_calls = HashMap::new();
         let exact_int_branch_function_ids = HashSet::new();
-        let owner_attr_specializations = HashMap::new();
 
         let output = rewrite_v3_call_inlining_for_module(
             &module,
             V3CallInliningProfile {
                 direct_calls_by_function: &direct_calls,
-                constructor_calls_by_function: &constructor_calls,
-                method_calls_by_function: &method_calls,
                 exact_int_branch_function_ids: &exact_int_branch_function_ids,
             },
-            &owner_attr_specializations,
             |_| Ok(None),
-            |_| None,
-            |_| None,
         )
         .expect("v3 call inlining should rewrite the module");
 

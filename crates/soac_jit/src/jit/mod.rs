@@ -94,14 +94,9 @@ use soac_opt::artifacts_v3::{
     single_function_optimization_artifacts_v3, validate_optimization_artifacts_v3_for_module,
 };
 use soac_opt::call_emission_v3::{
-    ResolvedV3ConstructorCallPlan, ResolvedV3DirectCallPlan, ResolvedV3MethodCallPlan,
-    constructor_call_targets as opt_v3_constructor_call_targets,
-    constructor_calls_for_function_from_artifacts as opt_v3_emitted_constructor_calls_for_function,
-    direct_call_body_plans as opt_v3_direct_call_body_plans,
+    ResolvedV3DirectCallPlan, direct_call_body_plans as opt_v3_direct_call_body_plans,
     direct_call_targets as opt_v3_direct_call_targets,
     direct_calls_for_function_from_artifacts as opt_v3_emitted_direct_calls_for_function,
-    merge_call_target_specializations, method_call_targets as opt_v3_method_call_targets,
-    method_calls_for_function_from_artifacts as opt_v3_emitted_method_calls_for_function,
     typed_call_emission_plans_from_v3,
 };
 use soac_opt::emit_v3::{
@@ -6541,8 +6536,6 @@ struct JitEmitCtx<'mc> {
     call_direct_hit_counter_ids: &'mc HashMap<InstrId, CounterRef>,
     call_direct_fallback_counter_ids: &'mc HashMap<InstrId, CounterRef>,
     operator_shape_counter_ids: &'mc HashMap<InstrId, CounterId>,
-    operator_specialized_hit_counter_ids: &'mc HashMap<InstrId, CounterRef>,
-    operator_specialized_fallback_counter_ids: &'mc HashMap<InstrId, CounterRef>,
     opt_v3_exact_int_branch_artifacts: Option<Arc<ExactIntBranchV3Artifacts>>,
     getitem_shape_counter_ids: &'mc HashMap<InstrId, CounterId>,
     getitem_specialized_hit_counter_ids: &'mc HashMap<InstrId, CounterRef>,
@@ -6561,7 +6554,6 @@ struct JitEmitCtx<'mc> {
     field_generic_getattr_counter_ids: &'mc HashMap<InstrId, CounterRef>,
     field_generic_setattr_counter_ids: &'mc HashMap<InstrId, CounterRef>,
     deopt_entry_guard_miss_counter_ids: &'mc HashMap<usize, CounterId>,
-    field_index_specializations: &'mc HashMap<String, Vec<FieldIndexSpecialization>>,
     field_index_specializations_by_instr: &'mc HashMap<InstrId, Vec<FieldIndexSpecialization>>,
     behavior_change_indexed_stores: bool,
     allow_local_only_slot_backed_stores: bool,
@@ -11445,10 +11437,6 @@ struct SpecializationProfile<'a> {
     optimized_module: Option<Arc<BlockPyModule<CodegenModuleShape>>>,
     opt_v3_emitted_direct_calls:
         HashMap<RuntimeFunctionId, HashMap<InstrId, Vec<ResolvedV3DirectCallPlan>>>,
-    opt_v3_emitted_constructor_calls:
-        HashMap<RuntimeFunctionId, HashMap<InstrId, Vec<ResolvedV3ConstructorCallPlan>>>,
-    opt_v3_emitted_method_calls:
-        HashMap<RuntimeFunctionId, HashMap<InstrId, Vec<ResolvedV3MethodCallPlan>>>,
     opt_v3_emitted_exact_list_items:
         HashMap<RuntimeFunctionId, HashMap<InstrId, OptV3ExactListItemAccessPlan>>,
     opt_v3_emitted_indexed_fields:
@@ -11466,10 +11454,6 @@ struct PlannedOptimizationInputs {
     optimized_module: Option<BlockPyModule<CodegenModuleShape>>,
     opt_v3_emitted_direct_calls:
         HashMap<RuntimeFunctionId, HashMap<InstrId, Vec<ResolvedV3DirectCallPlan>>>,
-    opt_v3_emitted_constructor_calls:
-        HashMap<RuntimeFunctionId, HashMap<InstrId, Vec<ResolvedV3ConstructorCallPlan>>>,
-    opt_v3_emitted_method_calls:
-        HashMap<RuntimeFunctionId, HashMap<InstrId, Vec<ResolvedV3MethodCallPlan>>>,
     opt_v3_emitted_exact_list_items:
         HashMap<RuntimeFunctionId, HashMap<InstrId, OptV3ExactListItemAccessPlan>>,
     opt_v3_emitted_indexed_fields:
@@ -11490,43 +11474,11 @@ impl PlannedOptimizationInputs {
             .unwrap_or_default()
     }
 
-    fn v3_constructor_call_targets(
-        &self,
-        function_id: RuntimeFunctionId,
-    ) -> HashMap<InstrId, Vec<RuntimeFunctionId>> {
-        self.opt_v3_emitted_constructor_calls
-            .get(&function_id)
-            .map(opt_v3_constructor_call_targets)
-            .unwrap_or_default()
-    }
-
-    fn v3_method_call_targets(
-        &self,
-        function_id: RuntimeFunctionId,
-    ) -> HashMap<InstrId, Vec<RuntimeFunctionId>> {
-        self.opt_v3_emitted_method_calls
-            .get(&function_id)
-            .map(opt_v3_method_call_targets)
-            .unwrap_or_default()
-    }
-
-    fn v3_direct_call_targets_for_batch(
-        &self,
-        function_id: RuntimeFunctionId,
-    ) -> HashMap<InstrId, Vec<RuntimeFunctionId>> {
-        let v3_targets = self.v3_direct_function_call_targets(function_id);
-        let merged_targets = merge_call_target_specializations(
-            v3_targets,
-            self.v3_constructor_call_targets(function_id),
-        );
-        merge_call_target_specializations(merged_targets, self.v3_method_call_targets(function_id))
-    }
-
     fn direct_call_targets_for_batch(
         &self,
         function_id: RuntimeFunctionId,
     ) -> HashMap<InstrId, Vec<RuntimeFunctionId>> {
-        self.v3_direct_call_targets_for_batch(function_id)
+        self.v3_direct_function_call_targets(function_id)
     }
 }
 
@@ -11685,24 +11637,6 @@ fn planned_optimization_inputs_from_v3_artifacts(
                 .opt_v3_emitted_direct_calls
                 .insert(current_function_id, direct_calls);
         }
-        if let Some(constructor_calls) =
-            opt_v3_emitted_constructor_calls_for_function(&function_artifacts, |target| {
-                resolve_opt_v3_runtime_function_target(shared_state, compile_session, target)
-            })?
-        {
-            inputs
-                .opt_v3_emitted_constructor_calls
-                .insert(current_function_id, constructor_calls);
-        }
-        if let Some(method_calls) =
-            opt_v3_emitted_method_calls_for_function(&function_artifacts, |target| {
-                resolve_opt_v3_runtime_function_target(shared_state, compile_session, target)
-            })?
-        {
-            inputs
-                .opt_v3_emitted_method_calls
-                .insert(current_function_id, method_calls);
-        }
         if let Some(items) = opt_v3_emitted_exact_list_items_for_function(&function_artifacts)? {
             inputs
                 .opt_v3_emitted_exact_list_items
@@ -11777,38 +11711,6 @@ fn planned_optimization_inputs_from_v3_artifacts_for_codegen_module(
             inputs
                 .opt_v3_emitted_direct_calls
                 .insert(current_function_id, direct_calls);
-        }
-        if let Some(constructor_calls) =
-            opt_v3_emitted_constructor_calls_for_function(&function_artifacts, |target| {
-                resolve_opt_v3_codegen_module_function_target(
-                    module_name,
-                    source_hash,
-                    module_id,
-                    module,
-                    module_index,
-                    target,
-                )
-            })?
-        {
-            inputs
-                .opt_v3_emitted_constructor_calls
-                .insert(current_function_id, constructor_calls);
-        }
-        if let Some(method_calls) =
-            opt_v3_emitted_method_calls_for_function(&function_artifacts, |target| {
-                resolve_opt_v3_codegen_module_function_target(
-                    module_name,
-                    source_hash,
-                    module_id,
-                    module,
-                    module_index,
-                    target,
-                )
-            })?
-        {
-            inputs
-                .opt_v3_emitted_method_calls
-                .insert(current_function_id, method_calls);
         }
         if let Some(items) = opt_v3_emitted_exact_list_items_for_function(&function_artifacts)? {
             inputs
@@ -11967,33 +11869,8 @@ impl FunctionSpecializationInputs {
         ) = profile.field_index_specialization_maps(function.function_id)?;
         let opt_v3_direct_calls_by_instr =
             profile.codegen_opt_v3_direct_calls(function.function_id);
-        if profile
-            .opt_v3_emitted_constructor_calls
-            .get(&function.function_id)
-            .is_some_and(|plans| !plans.is_empty())
-        {
-            return Err(format!(
-                "optimizer v3 emitted constructor-call plans for {}, but constructor guards are not a mechanical JIT input yet",
-                function.names.qualname
-            ));
-        }
-        if profile
-            .opt_v3_emitted_method_calls
-            .get(&function.function_id)
-            .is_some_and(|plans| !plans.is_empty())
-        {
-            return Err(format!(
-                "optimizer v3 emitted method-call plans for {}, but method guards are not a mechanical JIT input yet",
-                function.names.qualname
-            ));
-        }
-        let opt_v3_constructor_calls_by_instr = HashMap::new();
-        let opt_v3_method_calls_by_instr = HashMap::new();
-        let opt_v3_call_emissions = typed_call_emission_plans_from_v3(
-            &opt_v3_direct_calls_by_instr,
-            &opt_v3_constructor_calls_by_instr,
-            &opt_v3_method_calls_by_instr,
-        )?;
+        let opt_v3_call_emissions =
+            typed_call_emission_plans_from_v3(&opt_v3_direct_calls_by_instr)?;
         Ok(Self {
             opt_v3_call_emissions,
             opt_v3_exact_list_items_by_instr: profile
@@ -12047,8 +11924,6 @@ impl<'a> SpecializationProfile<'a> {
             counter_dump_path: counter_dump_path.map(Cow::Owned),
             optimized_module: planned_inputs.optimized_module.map(Arc::new),
             opt_v3_emitted_direct_calls: planned_inputs.opt_v3_emitted_direct_calls,
-            opt_v3_emitted_constructor_calls: planned_inputs.opt_v3_emitted_constructor_calls,
-            opt_v3_emitted_method_calls: planned_inputs.opt_v3_emitted_method_calls,
             opt_v3_emitted_exact_list_items: planned_inputs.opt_v3_emitted_exact_list_items,
             opt_v3_emitted_indexed_fields: planned_inputs.opt_v3_emitted_indexed_fields,
             opt_v3_emitted_indexed_globals: planned_inputs.opt_v3_emitted_indexed_globals,
@@ -12074,8 +11949,6 @@ impl<'a> SpecializationProfile<'a> {
             counter_dump_path: counter_dump_path.map(Cow::Borrowed),
             optimized_module: planned_inputs.optimized_module.map(Arc::new),
             opt_v3_emitted_direct_calls: planned_inputs.opt_v3_emitted_direct_calls,
-            opt_v3_emitted_constructor_calls: planned_inputs.opt_v3_emitted_constructor_calls,
-            opt_v3_emitted_method_calls: planned_inputs.opt_v3_emitted_method_calls,
             opt_v3_emitted_exact_list_items: planned_inputs.opt_v3_emitted_exact_list_items,
             opt_v3_emitted_indexed_fields: planned_inputs.opt_v3_emitted_indexed_fields,
             opt_v3_emitted_indexed_globals: planned_inputs.opt_v3_emitted_indexed_globals,
@@ -12101,26 +11974,6 @@ impl<'a> SpecializationProfile<'a> {
         self.opt_v3_emitted_direct_calls
             .get(&function_id)
             .map(opt_v3_direct_call_targets)
-            .unwrap_or_default()
-    }
-
-    fn v3_constructor_call_targets(
-        &self,
-        function_id: RuntimeFunctionId,
-    ) -> HashMap<InstrId, Vec<RuntimeFunctionId>> {
-        self.opt_v3_emitted_constructor_calls
-            .get(&function_id)
-            .map(opt_v3_constructor_call_targets)
-            .unwrap_or_default()
-    }
-
-    fn v3_method_call_targets(
-        &self,
-        function_id: RuntimeFunctionId,
-    ) -> HashMap<InstrId, Vec<RuntimeFunctionId>> {
-        self.opt_v3_emitted_method_calls
-            .get(&function_id)
-            .map(opt_v3_method_call_targets)
             .unwrap_or_default()
     }
 
@@ -25091,18 +24944,6 @@ fn precompile_external_direct_call_target_functions(
         {
             target_ids.extend(targets.iter().copied());
         }
-        for targets in profile
-            .v3_constructor_call_targets(function.function_id)
-            .values()
-        {
-            target_ids.extend(targets.iter().copied());
-        }
-        for targets in profile
-            .v3_method_call_targets(function.function_id)
-            .values()
-        {
-            target_ids.extend(targets.iter().copied());
-        }
     }
     Ok(target_ids
         .into_iter()
@@ -26057,18 +25898,6 @@ fn build_cranelift_run_bb_specialized_function(
         function.function_id,
         "operator_hot_shapes",
     );
-    let operator_specialized_hit_counter_ids = collect_runtime_counter_refs_by_kind_branch(
-        counter_defs,
-        function.function_id,
-        "operator_specialized",
-        "hit",
-    );
-    let operator_specialized_fallback_counter_ids = collect_runtime_counter_refs_by_kind_branch(
-        counter_defs,
-        function.function_id,
-        "operator_specialized",
-        "fallback",
-    );
     let getitem_shape_counter_ids = collect_runtime_counter_ids_by_kind(
         counter_defs,
         function.function_id,
@@ -26164,8 +25993,6 @@ fn build_cranelift_run_bb_specialized_function(
     for counter_ref in call_direct_hit_counter_ids
         .values()
         .chain(call_direct_fallback_counter_ids.values())
-        .chain(operator_specialized_hit_counter_ids.values())
-        .chain(operator_specialized_fallback_counter_ids.values())
         .chain(getitem_specialized_hit_counter_ids.values())
         .chain(getitem_specialized_fallback_counter_ids.values())
         .chain(setitem_specialized_hit_counter_ids.values())
@@ -26867,9 +26694,6 @@ fn build_cranelift_run_bb_specialized_function(
                 call_direct_hit_counter_ids: &call_direct_hit_counter_ids,
                 call_direct_fallback_counter_ids: &call_direct_fallback_counter_ids,
                 operator_shape_counter_ids: &operator_shape_counter_ids,
-                operator_specialized_hit_counter_ids: &operator_specialized_hit_counter_ids,
-                operator_specialized_fallback_counter_ids:
-                    &operator_specialized_fallback_counter_ids,
                 opt_v3_exact_int_branch_artifacts: opt_v3_exact_int_branch_artifacts.clone(),
                 getitem_shape_counter_ids: &getitem_shape_counter_ids,
                 getitem_specialized_hit_counter_ids: &getitem_specialized_hit_counter_ids,
@@ -26888,7 +26712,6 @@ fn build_cranelift_run_bb_specialized_function(
                 field_generic_setattr_counter_ids: &field_generic_setattr_counter_ids,
                 deopt_entry_guard_miss_counter_ids: &deopt_entry_guard_miss_counter_ids,
                 branch_outcome_counter_ids: &branch_outcome_counter_ids,
-                field_index_specializations: &field_index_specializations,
                 field_index_specializations_by_instr: &field_index_specializations_by_instr,
                 behavior_change_indexed_stores,
                 allow_local_only_slot_backed_stores: true,

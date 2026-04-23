@@ -38,9 +38,6 @@ mod tests {
     use soac_lowering::passes::{TypedInstrExtra, TypedPlannedResult as PlannedResult};
     use soac_opt::alternatives_v3::AlternativeCatalog;
     use soac_opt::artifacts_v3::{ExactIntBranchV3Artifacts, write_optimization_artifacts_v3};
-    use soac_opt::call_emission_v3::{
-        prepare_constructor_call_plans_for_codegen, prepare_method_call_plans_for_codegen,
-    };
     use soac_opt::emit_v3::{MechanicalIndexedFieldGuard, MechanicalModuleEmission};
     use soac_opt::pipeline_v3::{
         plan_and_emit_function_exact_int_branches_v3_with_module_constants,
@@ -48,9 +45,7 @@ mod tests {
     };
     use soac_opt::plan::{FunctionProfileEvidence, ProfileEvidenceStore};
     use soac_opt::plan_v3::{
-        CallBodyKind, CallBodyPlan, ConstructorCallFallbackKind, ConstructorCallFallbackPlan,
-        ConstructorCallGuardKind, ConstructorCallGuardPlan, ConstructorCallOwnerType,
-        ConstructorCallSpecializationPlan, Cost, DirectCallArgPlan as PlanV3DirectCallArgPlan,
+        CallBodyKind, CallBodyPlan, Cost, DirectCallArgPlan as PlanV3DirectCallArgPlan,
         DirectCallArgSource as PlanV3DirectCallArgSource, DirectCallSpecializationPlan,
         ExactListItemAccessKind as PlanV3ExactListItemAccessKind,
         ExactListItemFallbackKind as PlanV3ExactListItemFallbackKind,
@@ -60,9 +55,7 @@ mod tests {
         IndexedFieldGuardKind, IndexedFieldGuardPlan, IndexedFieldOwnerType,
         IndexedFieldSpecializationPlan, IndexedGlobalAccessKind, IndexedGlobalFallbackKind,
         IndexedGlobalFallbackPlan, IndexedGlobalGuardKind, IndexedGlobalGuardPlan,
-        IndexedGlobalSpecializationPlan, MethodCallFallbackKind, MethodCallFallbackPlan,
-        MethodCallGuardKind, MethodCallGuardPlan, MethodCallOwnerType,
-        MethodCallSpecializationPlan, ModuleOptimizationPlanV3, ModulePlanIdentity,
+        IndexedGlobalSpecializationPlan, ModuleOptimizationPlanV3, ModulePlanIdentity,
     };
     use std::collections::{HashMap, VecDeque};
     use std::ffi::c_void;
@@ -3283,8 +3276,6 @@ def build(values):
                     regions: Vec::new(),
                     scalar_threads: Vec::new(),
                     direct_calls: Vec::new(),
-                    constructor_calls: Vec::new(),
-                    method_calls: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
                     indexed_globals: Vec::new(),
@@ -3299,8 +3290,6 @@ def build(values):
                     function: serialized_function,
                     debug_name: Some(function.names.qualname.clone()),
                     direct_calls: Vec::new(),
-                    constructor_calls: Vec::new(),
-                    method_calls: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
                     indexed_globals: Vec::new(),
@@ -4202,8 +4191,6 @@ def build(values):
                 function_id,
                 HashMap::from([(source, vec![direct_call])]),
             )]),
-            opt_v3_emitted_constructor_calls: HashMap::new(),
-            opt_v3_emitted_method_calls: HashMap::new(),
             opt_v3_emitted_exact_list_items: HashMap::new(),
             opt_v3_emitted_indexed_fields: HashMap::new(),
             opt_v3_emitted_indexed_globals: HashMap::new(),
@@ -4215,60 +4202,6 @@ def build(values):
         assert!(
             profile.codegen_opt_v3_direct_calls(function_id).is_empty(),
             "Inline direct-call body plans are owned by the early BlockPy rewrite path"
-        );
-
-        let constructor_call = ResolvedV3ConstructorCallPlan {
-            source,
-            target,
-            owner_type: ConstructorCallOwnerType {
-                module_name: "missing_v3_constructor_type".to_string(),
-                qualname: "Box".to_string(),
-            },
-            arg_plan: TypedDirectCallArgPlan {
-                sources: vec![TypedDirectCallArgSource::Provided(0)],
-            },
-            guard: ConstructorCallGuardKind::ExactCallableTypeVersion,
-            fallback: ConstructorCallFallbackKind::OriginalConstructorCall,
-            body: test_v3_inline_call_body(),
-            inline_target: None,
-            reason: "profiled constructor call".to_string(),
-        };
-        assert!(
-            prepare_constructor_call_plans_for_codegen(
-                &HashMap::from([(source, vec![constructor_call])]),
-                |_| panic!("inline constructor body should not require guard preparation"),
-                |_| panic!("inline constructor body should not require guard validation"),
-            )
-            .unwrap()
-            .is_empty(),
-            "Inline constructor body plans are owned by the early BlockPy rewrite path"
-        );
-
-        let method_call = ResolvedV3MethodCallPlan {
-            source,
-            target,
-            method_name: "get".to_string(),
-            owner_type: MethodCallOwnerType {
-                module_name: "missing_v3_method_type".to_string(),
-                qualname: "Box".to_string(),
-            },
-            arg_plan: TypedDirectCallArgPlan {
-                sources: vec![TypedDirectCallArgSource::Provided(0)],
-            },
-            guard: MethodCallGuardKind::ExactReceiverTypeVersion,
-            fallback: MethodCallFallbackKind::OriginalMethodCall,
-            body: test_v3_inline_call_body(),
-            reason: "profiled method call".to_string(),
-        };
-        assert!(
-            prepare_method_call_plans_for_codegen(
-                &HashMap::from([(source, vec![method_call])]),
-                |_| panic!("inline method body should not require guard preparation"),
-                |_, _| panic!("inline method body should not require guard validation"),
-            )
-            .unwrap()
-            .is_empty(),
-            "Inline method body plans are owned by the early BlockPy rewrite path"
         );
     }
 
@@ -15225,290 +15158,6 @@ def f(x):
         );
     }
 
-    fn build_fact_proven_exact_int_binop(kind: BinOpKind) -> BuiltSpecializedFunction {
-        let blocks = [1usize as ObjPtr];
-        let mut constants = TestConstantPool::default();
-        let function = with_single_test_block(
-            test_function(),
-            vec![],
-            ret_term(op_expr(BinOp::new(
-                kind,
-                constants.int_expr(1),
-                constants.int_expr(2),
-            ))),
-        );
-        let mut module = test_module(ModuleNameGen::new(0), vec![function]);
-        module.module_constants = constants.module_constants;
-        let function = module.callable_defs[0].clone();
-        let module_constants =
-            crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
-        build_test_jit_function_with_constants_and_options(
-            &module,
-            &function,
-            &blocks,
-            &module_constants,
-            BuildSpecializedFunctionOptions {
-                guard_miss_deopt_stub: true,
-                ..BuildSpecializedFunctionOptions::default()
-            },
-        )
-    }
-
-    #[test]
-    fn facts_proven_exact_int_binop_uses_compact_long_fast_path() {
-        if crate::run_test_in_isolated_process_if_needed(
-            module_path!(),
-            "facts_proven_exact_int_binop_uses_compact_long_fast_path",
-        ) {
-            return;
-        }
-        let built = build_fact_proven_exact_int_binop(BinOpKind::Add);
-        let box_helpers = import_user_names_for_symbols(&built, &["PyLong_FromLongLong"]);
-        assert_eq!(
-            count_direct_calls_to_runtime_helpers(&built.ctx.func, &box_helpers),
-            1,
-            "facts-proven exact-int add should box the machine result directly",
-        );
-        let generic_helpers =
-            import_user_names_for_symbols(&built, &["PyNumber_Add", "dp_jit_exact_long_add_slot"]);
-        assert_eq!(
-            count_direct_calls_to_runtime_helpers(&built.ctx.func, &generic_helpers),
-            0,
-            "facts-proven exact-int add should not call generic or profiled PyLong helpers",
-        );
-        let deopt_helpers = import_user_names_for_symbols(&built, &["dp_jit_deopt_resume"]);
-        assert_eq!(
-            count_cold_block_direct_calls_to_runtime_helpers(&built.ctx.func, &deopt_helpers),
-            1,
-            "facts-proven exact-int guard miss should use the cold deopt path",
-        );
-    }
-
-    #[test]
-    fn facts_proven_exact_int_compare_uses_compact_long_fast_path() {
-        if crate::run_test_in_isolated_process_if_needed(
-            module_path!(),
-            "facts_proven_exact_int_compare_uses_compact_long_fast_path",
-        ) {
-            return;
-        }
-        let built = build_fact_proven_exact_int_binop(BinOpKind::Lt);
-        let generic_helpers = import_user_names_for_symbols(
-            &built,
-            &["PyObject_RichCompare", "dp_jit_exact_long_richcompare_slot"],
-        );
-        assert_eq!(
-            count_direct_calls_to_runtime_helpers(&built.ctx.func, &generic_helpers),
-            0,
-            "facts-proven exact-int compare should not call generic or profiled compare helpers",
-        );
-        let deopt_helpers = import_user_names_for_symbols(&built, &["dp_jit_deopt_resume"]);
-        assert_eq!(
-            count_cold_block_direct_calls_to_runtime_helpers(&built.ctx.func, &deopt_helpers),
-            1,
-            "facts-proven exact-int compare guard miss should use the cold deopt path",
-        );
-    }
-
-    #[test]
-    fn exact_int_binop_guard_miss_deopt_resumes_generic_binop_runtime() {
-        if crate::run_test_in_isolated_process_if_needed(
-            module_path!(),
-            "exact_int_binop_guard_miss_deopt_resumes_generic_binop_runtime",
-        ) {
-            return;
-        }
-        let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        crate::initialize_test_python();
-        Python::attach(|py| unsafe {
-            #[repr(C)]
-            struct TestFunctionEnv {
-                direct_code_ptr: *const u8,
-                default_direct_code_ptr: *const u8,
-                deopt_table_ptr: ObjPtr,
-                globals_obj: ObjPtr,
-            }
-
-            let _opt_mode = set_opt_mode("apply");
-            let soac_work_dir = fresh_test_work_dir("exact-int-binop-deopt-runtime");
-            let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
-            let mut function = test_function();
-            function.params = ParamSpec {
-                params: vec![
-                    Param {
-                        name: "a".into(),
-                        kind: ParamKind::Any,
-                        has_default: false,
-                    },
-                    Param {
-                        name: "b".into(),
-                        kind: ParamKind::Any,
-                        has_default: false,
-                    },
-                ],
-            };
-            let block_label = function.name_gen.next_block_name();
-            let instr_id = InstrId::new(block_label, 0);
-            function.blocks = vec![CodegenBlock {
-                label: block_label,
-                body: vec![],
-                term: ret_term(with_instr_id(
-                    op_expr(BinOp::new(
-                        BinOpKind::Add,
-                        name_expr(test_name("a")),
-                        name_expr(test_local_name("b", 1)),
-                    )),
-                    instr_id,
-                )),
-                params: vec![],
-                exc_edge: None,
-            }];
-            set_stack_slots(&mut function, &["a", "b"]);
-            let mut module = test_module(ModuleNameGen::new(0), vec![function]);
-            instrument_bb_module_with_call_target_counters(&mut module);
-            let function = module.callable_defs[0].clone();
-            write_test_counter_dump(
-                soac_work_dir.join("profile.bin").as_path(),
-                &CounterDumpRecord {
-                    source_hash: 0,
-                    module_name: "operator_deopt_runtime_test".to_string(),
-                    package_name: None,
-                    rows: vec![CounterDumpRow {
-                        counter_id: 0,
-                        scope: "this".to_string(),
-                        kind: "operator_hot_shapes".to_string(),
-                        site_kind: "runtime".to_string(),
-                        function_id: Some(function.function_id),
-                        current_function_id: Some(function.function_id),
-                        instr_id: Some(instr_id),
-                        function_qualname: Some(function.names.qualname.clone()),
-                        block_label: None,
-                        value: 1,
-                        branch_values: Vec::new(),
-                        observed_value: Some(soac_opt::operator_specialization::pack_binary_shape(
-                            soac_opt::operator_specialization::ExactTypeTag::Int,
-                            soac_opt::operator_specialization::ExactTypeTag::Int,
-                        )),
-                        max_overcount: Some(0),
-                    }],
-                    module_keys: Vec::new(),
-                    type_keys: Vec::new(),
-                    type_table: Vec::new(),
-                },
-            );
-            let shared_state = crate::module_type::build_shared_state_for_testing(
-                py,
-                module,
-                "operator_deopt_runtime_test",
-                "",
-            )
-            .expect("shared state should build");
-            let _runtime = build_test_module_runtime(py, shared_state.clone());
-            let function = shared_state.lowered_module.callable_defs[0].clone();
-            let compile_session = crate::session::CompileSession::new();
-            let mut jit_module =
-                new_jit_module(&compile_session).expect("test jit module should construct");
-            let module_constant_ptrs = shared_state.module_constant_ptrs();
-            let module_constant_object_data_ids = declare_module_constant_object_data(
-                &mut jit_module,
-                &shared_state.lowered_module,
-                &module_constant_ptrs,
-            )
-            .expect("module constant object data should declare");
-            let (counter_slots_by_id, scalar_counter_data_id, top_value_counter_data_id) =
-                define_test_counter_storage(
-                    &mut jit_module,
-                    &shared_state.lowered_module,
-                    shared_state.lowered_module.counter_defs.as_slice(),
-                );
-            let blocks = vec![std::ptr::null_mut::<c_void>(); function.blocks.len()];
-            let built = build_test_cranelift_run_bb_specialized_function(
-                &mut jit_module,
-                blocks.as_slice(),
-                &shared_state.lowered_module,
-                &function,
-                &shared_state.codegen_constants,
-                shared_state.lowered_module.counter_defs.as_slice(),
-                module_constant_object_data_ids.as_slice(),
-                counter_slots_by_id.as_ref(),
-                scalar_counter_data_id,
-                top_value_counter_data_id,
-                &compile_session,
-                Some(shared_state.as_ref()),
-                None,
-                None,
-                BuildSpecializedFunctionOptions::default(),
-            )
-            .expect("specialized JIT build should succeed");
-            let facts = infer_jit_value_facts(&shared_state.lowered_module);
-            let module_plan = plan_jit_deopt_resume_module(&shared_state.lowered_module, &facts)
-                .expect("JIT deopt resume planning should succeed");
-            let function_plan = module_plan
-                .function(function.function_id)
-                .expect("function should have a JIT deopt plan");
-            let deopt_table =
-                RuntimeJitDeoptTable::from_plan(&function, function_plan, &module_constant_ptrs)
-                    .expect("runtime deopt table should build from plan");
-
-            let mut ctx = built.ctx;
-            define_prepared_function(
-                &mut jit_module,
-                &SoacEnvConfig::default(),
-                built.main_id,
-                &mut ctx,
-                "test-exact-int-binop-deopt-resume",
-                "exact-int binop deopt test should define",
-            )
-            .expect("test function should define");
-            jit_module.clear_context(&mut ctx);
-            jit_module
-                .finalize_definitions()
-                .expect("test jit module should finalize");
-            let code_ptr = jit_module.get_finalized_function(built.main_id);
-
-            let globals = ffi::PyDict_New();
-            assert!(!globals.is_null(), "test globals dict should allocate");
-            let left = ffi::PyUnicode_FromString(c"a".as_ptr());
-            let right = ffi::PyUnicode_FromString(c"b".as_ptr());
-            let expected = ffi::PyUnicode_FromString(c"ab".as_ptr());
-            assert!(!left.is_null(), "left string should allocate");
-            assert!(!right.is_null(), "right string should allocate");
-            assert!(!expected.is_null(), "expected string should allocate");
-
-            let function_env = TestFunctionEnv {
-                direct_code_ptr: code_ptr,
-                default_direct_code_ptr: std::ptr::null(),
-                deopt_table_ptr: std::ptr::addr_of!(deopt_table).cast_mut().cast(),
-                globals_obj: globals.cast(),
-            };
-            let entry: unsafe extern "C" fn(ObjPtr, ObjPtr, ObjPtr, ObjPtr) -> ObjPtr =
-                std::mem::transmute(code_ptr);
-            let result = entry(
-                std::ptr::addr_of!(function_env).cast_mut().cast(),
-                ffi::PyThreadState_Get().cast(),
-                left.cast(),
-                right.cast(),
-            );
-            if !ffi::PyErr_Occurred().is_null() {
-                ffi::PyErr_Print();
-                panic!(
-                    "successful exact-int binop guard-miss deopt should not leave a Python exception"
-                );
-            }
-            assert_eq!(
-                ffi::PyObject_RichCompareBool(result.cast(), expected, ffi::Py_EQ),
-                1,
-                "exact-int binop guard-miss deopt should resume and execute generic string concatenation"
-            );
-
-            ffi::Py_DECREF(result.cast::<ffi::PyObject>());
-            ffi::Py_DECREF(expected);
-            ffi::Py_DECREF(right);
-            ffi::Py_DECREF(left);
-            ffi::Py_DECREF(globals);
-        });
-    }
-
     #[test]
     fn specialized_jit_opt_v3_exact_int_branch_artifact_emits_machine_path() {
         if crate::run_test_in_isolated_process_if_needed(
@@ -15661,19 +15310,6 @@ def f(x):
             count_direct_calls_to_runtime_helpers(&built.ctx.func, &generic_helpers),
             4,
             "v3 exact-int branch should keep a local generic fallback region"
-        );
-        let legacy_exact_helpers = import_user_names_for_symbols(
-            &built,
-            &[
-                "dp_jit_exact_long_add_slot",
-                "dp_jit_exact_long_richcompare_slot",
-                "dp_jit_exact_long_richcompare_bool_slot",
-            ],
-        );
-        assert_eq!(
-            count_direct_calls_to_runtime_helpers(&built.ctx.func, &legacy_exact_helpers),
-            0,
-            "v3 exact-int branch should not rely on legacy exact-long helper calls"
         );
     }
 
@@ -15854,19 +15490,6 @@ def f(x):
             1,
             "v3 scalar-thread hot path should not materialize c when both branch targets return without reading it"
         );
-        let legacy_exact_helpers = import_user_names_for_symbols(
-            &built,
-            &[
-                "dp_jit_exact_long_add_slot",
-                "dp_jit_exact_long_richcompare_slot",
-                "dp_jit_exact_long_richcompare_bool_slot",
-            ],
-        );
-        assert_eq!(
-            count_direct_calls_to_runtime_helpers(&built.ctx.func, &legacy_exact_helpers),
-            0,
-            "v3 add-store/compare should not rely on legacy exact-long helper calls"
-        );
     }
 
     #[test]
@@ -15877,24 +15500,17 @@ def f(x):
         ) {
             return;
         }
-        for (kind, opcode, generic_helper, legacy_helper) in [
-            (
-                BinOpKind::Add,
-                ir::Opcode::SaddOverflow,
-                "PyNumber_Add",
-                "dp_jit_exact_long_add_slot",
-            ),
+        for (kind, opcode, generic_helper) in [
+            (BinOpKind::Add, ir::Opcode::SaddOverflow, "PyNumber_Add"),
             (
                 BinOpKind::Sub,
                 ir::Opcode::SsubOverflow,
                 "PyNumber_Subtract",
-                "dp_jit_exact_long_sub_slot",
             ),
             (
                 BinOpKind::Mul,
                 ir::Opcode::SmulOverflow,
                 "PyNumber_Multiply",
-                "dp_jit_exact_long_mul_slot",
             ),
         ] {
             let blocks = [1usize as ObjPtr];
@@ -16000,12 +15616,6 @@ def f(x):
                 count_direct_calls_to_runtime_helpers(&built.ctx.func, &helper_names),
                 2,
                 "v3 exact-int {kind:?} return should keep generic fallback and PyLong materialization"
-            );
-            let legacy_exact_helpers = import_user_names_for_symbols(&built, &[legacy_helper]);
-            assert_eq!(
-                count_direct_calls_to_runtime_helpers(&built.ctx.func, &legacy_exact_helpers),
-                0,
-                "v3 exact-int {kind:?} return should not rely on legacy exact-long helpers"
             );
         }
     }
@@ -16126,13 +15736,6 @@ def f(x):
                 2,
                 "v3 exact-int {kind:?} return should keep generic fallback and PyLong materialization"
             );
-            let legacy_exact_helpers =
-                import_user_names_for_symbols(&built, &["dp_jit_exact_long_binary_op"]);
-            assert_eq!(
-                count_direct_calls_to_runtime_helpers(&built.ctx.func, &legacy_exact_helpers),
-                0,
-                "v3 exact-int {kind:?} return should not rely on the legacy exact-long dispatcher"
-            );
         }
     }
 
@@ -16242,18 +15845,6 @@ def f(x):
             1,
             "v3 exact-int comparison return should keep one generic rich-compare fallback"
         );
-        let legacy_exact_helpers = import_user_names_for_symbols(
-            &built,
-            &[
-                "dp_jit_exact_long_richcompare_slot",
-                "dp_jit_exact_long_richcompare_bool_slot",
-            ],
-        );
-        assert_eq!(
-            count_direct_calls_to_runtime_helpers(&built.ctx.func, &legacy_exact_helpers),
-            0,
-            "v3 exact-int comparison return should not rely on legacy exact-long compare helpers"
-        );
     }
 
     #[test]
@@ -16290,8 +15881,6 @@ def f(x):
                     regions: Vec::new(),
                     scalar_threads: Vec::new(),
                     direct_calls: Vec::new(),
-                    constructor_calls: Vec::new(),
-                    method_calls: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
                     indexed_globals: Vec::new(),
@@ -16306,8 +15895,6 @@ def f(x):
                     function: serialized_function,
                     debug_name: Some(function.names.qualname.clone()),
                     direct_calls: Vec::new(),
-                    constructor_calls: Vec::new(),
-                    method_calls: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
                     indexed_globals: Vec::new(),
@@ -16386,8 +15973,6 @@ def f(x):
                         body: test_v3_inline_call_body(),
                         reason: "profiled direct call".to_string(),
                     }],
-                    constructor_calls: Vec::new(),
-                    method_calls: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
                     indexed_globals: Vec::new(),
@@ -16410,8 +15995,6 @@ def f(x):
                         body: test_v3_inline_call_body(),
                         reason: "profiled direct call".to_string(),
                     }],
-                    constructor_calls: Vec::new(),
-                    method_calls: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
                     indexed_globals: Vec::new(),
@@ -16449,260 +16032,6 @@ def f(x):
                 reason: "profiled direct call".to_string(),
             }
         );
-    }
-
-    #[test]
-    fn planned_precompile_inputs_consume_v3_emitted_constructor_calls() {
-        let module_name_gen = ModuleNameGen::new(7);
-        let caller = test_function_in_module(&module_name_gen, "caller");
-        let callee = test_function_in_module(&module_name_gen, "Box.__init__");
-        let iter_callee = test_function_in_module(&module_name_gen, "Box.__iter__");
-        let caller_id = caller.function_id;
-        let callee_id = callee.function_id;
-        let iter_callee_id = iter_callee.function_id;
-        let module = test_module(module_name_gen, vec![caller, callee, iter_callee]);
-        let source = InstrId::new(BlockLabel::from_index(0), 11);
-        let serialized_caller =
-            SerializedFunctionId::new(SerializedModuleId::new(0), caller_id.local_function_id());
-        let serialized_callee =
-            SerializedFunctionId::new(SerializedModuleId::new(0), callee_id.local_function_id());
-        let serialized_iter_callee = SerializedFunctionId::new(
-            SerializedModuleId::new(0),
-            iter_callee_id.local_function_id(),
-        );
-        let owner_type = ConstructorCallOwnerType {
-            module_name: "test".to_string(),
-            qualname: "Box".to_string(),
-        };
-        let guard = ConstructorCallGuardPlan {
-            kind: ConstructorCallGuardKind::ExactCallableTypeVersion,
-        };
-        let fallback = ConstructorCallFallbackPlan {
-            kind: ConstructorCallFallbackKind::OriginalConstructorCall,
-        };
-        let artifacts = ExactIntBranchV3Artifacts {
-            plan: ModuleOptimizationPlanV3 {
-                module: ModulePlanIdentity {
-                    module_name: "test".to_string(),
-                    source_hash: 0,
-                    cache_identity: "test-cache".to_string(),
-                },
-                identity_tables: test_plan_identities(
-                    "test",
-                    0,
-                    "test-cache",
-                    serialized_caller,
-                    "caller",
-                    &[],
-                ),
-                helper_catalog_version: 1,
-                cost_model_version: 1,
-                functions: vec![soac_opt::plan_v3::FunctionOptimizationPlanV3 {
-                    function: FunctionPlanIdentity {
-                        function: serialized_caller,
-                        debug_name: Some("caller".to_string()),
-                    },
-                    regions: Vec::new(),
-                    scalar_threads: Vec::new(),
-                    direct_calls: Vec::new(),
-                    constructor_calls: vec![ConstructorCallSpecializationPlan {
-                        source,
-                        target: serialized_callee,
-                        owner_type: owner_type.clone(),
-                        arg_plan: PlanV3DirectCallArgPlan {
-                            sources: vec![
-                                PlanV3DirectCallArgSource::Provided(0),
-                                PlanV3DirectCallArgSource::Provided(1),
-                            ],
-                        },
-                        guard: guard.clone(),
-                        fallback: fallback.clone(),
-                        body: CallBodyPlan {
-                            inline_target: Some(serialized_iter_callee),
-                            ..test_v3_inline_call_body()
-                        },
-                        reason: "profiled constructor call".to_string(),
-                    }],
-                    method_calls: Vec::new(),
-                    exact_list_items: Vec::new(),
-                    indexed_fields: Vec::new(),
-                    indexed_globals: Vec::new(),
-                    deopt_points: Vec::new(),
-                    ownership: soac_opt::plan_v3::FunctionOwnershipPlan::default(),
-                    diagnostics: Vec::new(),
-                }],
-            },
-            emission: MechanicalModuleEmission {
-                module_name: "test".to_string(),
-                functions: vec![soac_opt::emit_v3::MechanicalFunctionEmission {
-                    function: serialized_caller,
-                    debug_name: Some("caller".to_string()),
-                    direct_calls: Vec::new(),
-                    constructor_calls: vec![soac_opt::emit_v3::MechanicalConstructorCallEmission {
-                        source,
-                        target: serialized_callee,
-                        owner_type,
-                        arg_plan: PlanV3DirectCallArgPlan {
-                            sources: vec![
-                                PlanV3DirectCallArgSource::Provided(0),
-                                PlanV3DirectCallArgSource::Provided(1),
-                            ],
-                        },
-                        guard,
-                        fallback,
-                        body: CallBodyPlan {
-                            inline_target: Some(serialized_iter_callee),
-                            ..test_v3_inline_call_body()
-                        },
-                        reason: "profiled constructor call".to_string(),
-                    }],
-                    method_calls: Vec::new(),
-                    exact_list_items: Vec::new(),
-                    indexed_fields: Vec::new(),
-                    indexed_globals: Vec::new(),
-                    scalar_threads: Vec::new(),
-                    regions: Vec::new(),
-                }],
-            },
-        };
-
-        let planned_inputs = planned_optimization_inputs_from_v3_artifacts_for_codegen_module(
-            &artifacts,
-            &module,
-            artifacts.plan.module.module_name.as_str(),
-            artifacts.plan.module.source_hash,
-            None,
-        )
-        .expect("v3 module artifact should map constructor calls onto the current codegen module");
-        let constructor_calls = planned_inputs
-            .opt_v3_emitted_constructor_calls
-            .get(&caller_id)
-            .and_then(|calls| calls.get(&source))
-            .expect("v3 constructor-call emission should be available for codegen");
-        assert_eq!(constructor_calls.len(), 1);
-        assert_eq!(constructor_calls[0].target, callee_id);
-        assert_eq!(constructor_calls[0].inline_target, Some(iter_callee_id));
-        assert_eq!(constructor_calls[0].owner_type.module_name, "test");
-        assert_eq!(constructor_calls[0].owner_type.qualname, "Box");
-    }
-
-    #[test]
-    fn planned_precompile_inputs_consume_v3_emitted_method_calls() {
-        let module_name_gen = ModuleNameGen::new(7);
-        let caller = test_function_in_module(&module_name_gen, "caller");
-        let callee = test_function_in_module(&module_name_gen, "Box.get");
-        let caller_id = caller.function_id;
-        let callee_id = callee.function_id;
-        let module = test_module(module_name_gen, vec![caller, callee]);
-        let source = InstrId::new(BlockLabel::from_index(0), 11);
-        let serialized_caller =
-            SerializedFunctionId::new(SerializedModuleId::new(0), caller_id.local_function_id());
-        let serialized_callee =
-            SerializedFunctionId::new(SerializedModuleId::new(0), callee_id.local_function_id());
-        let owner_type = MethodCallOwnerType {
-            module_name: "test".to_string(),
-            qualname: "Box".to_string(),
-        };
-        let guard = MethodCallGuardPlan {
-            kind: MethodCallGuardKind::ExactReceiverTypeVersion,
-        };
-        let fallback = MethodCallFallbackPlan {
-            kind: MethodCallFallbackKind::OriginalMethodCall,
-        };
-        let artifacts = ExactIntBranchV3Artifacts {
-            plan: ModuleOptimizationPlanV3 {
-                module: ModulePlanIdentity {
-                    module_name: "test".to_string(),
-                    source_hash: 0,
-                    cache_identity: "test-cache".to_string(),
-                },
-                identity_tables: test_plan_identities(
-                    "test",
-                    0,
-                    "test-cache",
-                    serialized_caller,
-                    "caller",
-                    &[],
-                ),
-                helper_catalog_version: 1,
-                cost_model_version: 1,
-                functions: vec![soac_opt::plan_v3::FunctionOptimizationPlanV3 {
-                    function: FunctionPlanIdentity {
-                        function: serialized_caller,
-                        debug_name: Some("caller".to_string()),
-                    },
-                    regions: Vec::new(),
-                    scalar_threads: Vec::new(),
-                    direct_calls: Vec::new(),
-                    constructor_calls: Vec::new(),
-                    method_calls: vec![MethodCallSpecializationPlan {
-                        source,
-                        target: serialized_callee,
-                        method_name: "get".to_string(),
-                        owner_type: owner_type.clone(),
-                        arg_plan: PlanV3DirectCallArgPlan {
-                            sources: vec![PlanV3DirectCallArgSource::Provided(0)],
-                        },
-                        guard: guard.clone(),
-                        fallback: fallback.clone(),
-                        body: test_v3_inline_call_body(),
-                        reason: "profiled method call".to_string(),
-                    }],
-                    exact_list_items: Vec::new(),
-                    indexed_fields: Vec::new(),
-                    indexed_globals: Vec::new(),
-                    deopt_points: Vec::new(),
-                    ownership: soac_opt::plan_v3::FunctionOwnershipPlan::default(),
-                    diagnostics: Vec::new(),
-                }],
-            },
-            emission: MechanicalModuleEmission {
-                module_name: "test".to_string(),
-                functions: vec![soac_opt::emit_v3::MechanicalFunctionEmission {
-                    function: serialized_caller,
-                    debug_name: Some("caller".to_string()),
-                    direct_calls: Vec::new(),
-                    constructor_calls: Vec::new(),
-                    method_calls: vec![soac_opt::emit_v3::MechanicalMethodCallEmission {
-                        source,
-                        target: serialized_callee,
-                        method_name: "get".to_string(),
-                        owner_type,
-                        arg_plan: PlanV3DirectCallArgPlan {
-                            sources: vec![PlanV3DirectCallArgSource::Provided(0)],
-                        },
-                        guard,
-                        fallback,
-                        body: test_v3_inline_call_body(),
-                        reason: "profiled method call".to_string(),
-                    }],
-                    exact_list_items: Vec::new(),
-                    indexed_fields: Vec::new(),
-                    indexed_globals: Vec::new(),
-                    scalar_threads: Vec::new(),
-                    regions: Vec::new(),
-                }],
-            },
-        };
-
-        let planned_inputs = planned_optimization_inputs_from_v3_artifacts_for_codegen_module(
-            &artifacts,
-            &module,
-            artifacts.plan.module.module_name.as_str(),
-            artifacts.plan.module.source_hash,
-            None,
-        )
-        .expect("v3 module artifact should map method calls onto the current codegen module");
-        let method_calls = planned_inputs
-            .opt_v3_emitted_method_calls
-            .get(&caller_id)
-            .and_then(|calls| calls.get(&source))
-            .expect("v3 method-call emission should be available for codegen");
-        assert_eq!(method_calls.len(), 1);
-        assert_eq!(method_calls[0].target, callee_id);
-        assert_eq!(method_calls[0].method_name, "get");
-        assert_eq!(method_calls[0].owner_type.module_name, "test");
-        assert_eq!(method_calls[0].owner_type.qualname, "Box");
     }
 
     #[test]
@@ -16770,8 +16099,6 @@ def f(x):
                         body: test_v3_inline_call_body(),
                         reason: "profiled cross-module direct call".to_string(),
                     }],
-                    constructor_calls: Vec::new(),
-                    method_calls: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
                     indexed_globals: Vec::new(),
@@ -16794,8 +16121,6 @@ def f(x):
                         body: test_v3_inline_call_body(),
                         reason: "profiled cross-module direct call".to_string(),
                     }],
-                    constructor_calls: Vec::new(),
-                    method_calls: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
                     indexed_globals: Vec::new(),
@@ -16913,8 +16238,6 @@ def f(x):
                     regions: Vec::new(),
                     scalar_threads: Vec::new(),
                     direct_calls: Vec::new(),
-                    constructor_calls: Vec::new(),
-                    method_calls: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: vec![
                         IndexedFieldSpecializationPlan {
@@ -16960,8 +16283,6 @@ def f(x):
                     function: serialized_caller,
                     debug_name: Some("caller".to_string()),
                     direct_calls: Vec::new(),
-                    constructor_calls: Vec::new(),
-                    method_calls: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: vec![
                         soac_opt::emit_v3::MechanicalIndexedFieldEmission {
@@ -17101,8 +16422,6 @@ def f(x):
                     regions: Vec::new(),
                     scalar_threads: Vec::new(),
                     direct_calls: Vec::new(),
-                    constructor_calls: Vec::new(),
-                    method_calls: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
                     indexed_globals: vec![
@@ -17140,8 +16459,6 @@ def f(x):
                     function: serialized_caller,
                     debug_name: Some("caller".to_string()),
                     direct_calls: Vec::new(),
-                    constructor_calls: Vec::new(),
-                    method_calls: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
                     indexed_globals: vec![
@@ -17682,8 +16999,6 @@ def read_point(point):
                 counter_dump_path: None,
                 optimized_module: None,
                 opt_v3_emitted_direct_calls: HashMap::new(),
-                opt_v3_emitted_constructor_calls: HashMap::new(),
-                opt_v3_emitted_method_calls: HashMap::new(),
                 opt_v3_emitted_exact_list_items: HashMap::new(),
                 opt_v3_emitted_indexed_fields: HashMap::from([(
                     function.function_id,
@@ -18163,8 +17478,6 @@ def write_point(point, value):
                         body: test_v3_inline_call_body(),
                         reason: "profiled direct call".to_string(),
                     }],
-                    constructor_calls: Vec::new(),
-                    method_calls: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
                     indexed_globals: Vec::new(),
@@ -18179,8 +17492,6 @@ def write_point(point, value):
                     function: serialized_caller,
                     debug_name: Some("caller".to_string()),
                     direct_calls: Vec::new(),
-                    constructor_calls: Vec::new(),
-                    method_calls: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
                     indexed_globals: Vec::new(),
@@ -18246,8 +17557,6 @@ def write_point(point, value):
                     regions: Vec::new(),
                     scalar_threads: Vec::new(),
                     direct_calls: Vec::new(),
-                    constructor_calls: Vec::new(),
-                    method_calls: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: vec![IndexedFieldSpecializationPlan {
                         source,
@@ -18275,8 +17584,6 @@ def write_point(point, value):
                     function: serialized_caller,
                     debug_name: Some("caller".to_string()),
                     direct_calls: Vec::new(),
-                    constructor_calls: Vec::new(),
-                    method_calls: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
                     indexed_globals: Vec::new(),
@@ -18302,609 +17609,6 @@ def write_point(point, value):
                 && err.contains("optimization plan v3 emission mismatch"),
             "{err}"
         );
-    }
-
-    #[test]
-    fn exact_int_compare_guard_miss_deopt_resumes_generic_compare_runtime() {
-        if crate::run_test_in_isolated_process_if_needed(
-            module_path!(),
-            "exact_int_compare_guard_miss_deopt_resumes_generic_compare_runtime",
-        ) {
-            return;
-        }
-        let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        crate::initialize_test_python();
-        Python::attach(|py| unsafe {
-            #[repr(C)]
-            struct TestFunctionEnv {
-                direct_code_ptr: *const u8,
-                default_direct_code_ptr: *const u8,
-                deopt_table_ptr: ObjPtr,
-                globals_obj: ObjPtr,
-            }
-
-            let _opt_mode = set_opt_mode("apply");
-            let soac_work_dir = fresh_test_work_dir("exact-int-compare-deopt-runtime");
-            let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
-            let mut function = test_function();
-            function.params = ParamSpec {
-                params: vec![
-                    Param {
-                        name: "a".into(),
-                        kind: ParamKind::Any,
-                        has_default: false,
-                    },
-                    Param {
-                        name: "b".into(),
-                        kind: ParamKind::Any,
-                        has_default: false,
-                    },
-                ],
-            };
-            let block_label = function.name_gen.next_block_name();
-            let instr_id = InstrId::new(block_label, 0);
-            function.blocks = vec![CodegenBlock {
-                label: block_label,
-                body: vec![],
-                term: ret_term(with_instr_id(
-                    op_expr(BinOp::new(
-                        BinOpKind::Lt,
-                        name_expr(test_name("a")),
-                        name_expr(test_local_name("b", 1)),
-                    )),
-                    instr_id,
-                )),
-                params: vec![],
-                exc_edge: None,
-            }];
-            set_stack_slots(&mut function, &["a", "b"]);
-            let mut module = test_module(ModuleNameGen::new(0), vec![function]);
-            instrument_bb_module_with_call_target_counters(&mut module);
-            let function = module.callable_defs[0].clone();
-            write_test_counter_dump(
-                soac_work_dir.join("profile.bin").as_path(),
-                &CounterDumpRecord {
-                    source_hash: 0,
-                    module_name: "operator_deopt_runtime_test".to_string(),
-                    package_name: None,
-                    rows: vec![CounterDumpRow {
-                        counter_id: 0,
-                        scope: "this".to_string(),
-                        kind: "operator_hot_shapes".to_string(),
-                        site_kind: "runtime".to_string(),
-                        function_id: Some(function.function_id),
-                        current_function_id: Some(function.function_id),
-                        instr_id: Some(instr_id),
-                        function_qualname: Some(function.names.qualname.clone()),
-                        block_label: None,
-                        value: 1,
-                        branch_values: Vec::new(),
-                        observed_value: Some(soac_opt::operator_specialization::pack_binary_shape(
-                            soac_opt::operator_specialization::ExactTypeTag::Int,
-                            soac_opt::operator_specialization::ExactTypeTag::Int,
-                        )),
-                        max_overcount: Some(0),
-                    }],
-                    module_keys: Vec::new(),
-                    type_keys: Vec::new(),
-                    type_table: Vec::new(),
-                },
-            );
-            let shared_state = crate::module_type::build_shared_state_for_testing(
-                py,
-                module,
-                "operator_deopt_runtime_test",
-                "",
-            )
-            .expect("shared state should build");
-            let _runtime = build_test_module_runtime(py, shared_state.clone());
-            let function = shared_state.lowered_module.callable_defs[0].clone();
-            let compile_session = crate::session::CompileSession::new();
-            let mut jit_module =
-                new_jit_module(&compile_session).expect("test jit module should construct");
-            let module_constant_ptrs = shared_state.module_constant_ptrs();
-            let module_constant_object_data_ids = declare_module_constant_object_data(
-                &mut jit_module,
-                &shared_state.lowered_module,
-                &module_constant_ptrs,
-            )
-            .expect("module constant object data should declare");
-            let (counter_slots_by_id, scalar_counter_data_id, top_value_counter_data_id) =
-                define_test_counter_storage(
-                    &mut jit_module,
-                    &shared_state.lowered_module,
-                    shared_state.lowered_module.counter_defs.as_slice(),
-                );
-            let blocks = vec![std::ptr::null_mut::<c_void>(); function.blocks.len()];
-            let built = build_test_cranelift_run_bb_specialized_function(
-                &mut jit_module,
-                blocks.as_slice(),
-                &shared_state.lowered_module,
-                &function,
-                &shared_state.codegen_constants,
-                shared_state.lowered_module.counter_defs.as_slice(),
-                module_constant_object_data_ids.as_slice(),
-                counter_slots_by_id.as_ref(),
-                scalar_counter_data_id,
-                top_value_counter_data_id,
-                &compile_session,
-                Some(shared_state.as_ref()),
-                None,
-                None,
-                BuildSpecializedFunctionOptions::default(),
-            )
-            .expect("specialized JIT build should succeed");
-            let facts = infer_jit_value_facts(&shared_state.lowered_module);
-            let module_plan = plan_jit_deopt_resume_module(&shared_state.lowered_module, &facts)
-                .expect("JIT deopt resume planning should succeed");
-            let function_plan = module_plan
-                .function(function.function_id)
-                .expect("function should have a JIT deopt plan");
-            let deopt_table =
-                RuntimeJitDeoptTable::from_plan(&function, function_plan, &module_constant_ptrs)
-                    .expect("runtime deopt table should build from plan");
-
-            let mut ctx = built.ctx;
-            define_prepared_function(
-                &mut jit_module,
-                &SoacEnvConfig::default(),
-                built.main_id,
-                &mut ctx,
-                "test-exact-int-compare-deopt-resume",
-                "exact-int compare deopt test should define",
-            )
-            .expect("test function should define");
-            jit_module.clear_context(&mut ctx);
-            jit_module
-                .finalize_definitions()
-                .expect("test jit module should finalize");
-            let code_ptr = jit_module.get_finalized_function(built.main_id);
-
-            let globals = ffi::PyDict_New();
-            assert!(!globals.is_null(), "test globals dict should allocate");
-            let left = ffi::PyUnicode_FromString(c"a".as_ptr());
-            let right = ffi::PyUnicode_FromString(c"b".as_ptr());
-            assert!(!left.is_null(), "left string should allocate");
-            assert!(!right.is_null(), "right string should allocate");
-
-            let function_env = TestFunctionEnv {
-                direct_code_ptr: code_ptr,
-                default_direct_code_ptr: std::ptr::null(),
-                deopt_table_ptr: std::ptr::addr_of!(deopt_table).cast_mut().cast(),
-                globals_obj: globals.cast(),
-            };
-            let entry: unsafe extern "C" fn(ObjPtr, ObjPtr, ObjPtr, ObjPtr) -> ObjPtr =
-                std::mem::transmute(code_ptr);
-            let result = entry(
-                std::ptr::addr_of!(function_env).cast_mut().cast(),
-                ffi::PyThreadState_Get().cast(),
-                left.cast(),
-                right.cast(),
-            );
-            if !ffi::PyErr_Occurred().is_null() {
-                ffi::PyErr_Print();
-                panic!(
-                    "successful exact-int compare guard-miss deopt should not leave a Python exception"
-                );
-            }
-            assert_eq!(
-                ffi::PyObject_IsTrue(result.cast()),
-                1,
-                "exact-int compare guard-miss deopt should resume and execute generic string comparison"
-            );
-
-            ffi::Py_DECREF(result.cast::<ffi::PyObject>());
-            ffi::Py_DECREF(right);
-            ffi::Py_DECREF(left);
-            ffi::Py_DECREF(globals);
-        });
-    }
-
-    #[test]
-    fn exact_int_if_compare_guard_miss_deopt_preserves_live_locals_runtime() {
-        if crate::run_test_in_isolated_process_if_needed(
-            module_path!(),
-            "exact_int_if_compare_guard_miss_deopt_preserves_live_locals_runtime",
-        ) {
-            return;
-        }
-        let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        crate::initialize_test_python();
-        Python::attach(|py| unsafe {
-            #[repr(C)]
-            struct TestFunctionEnv {
-                direct_code_ptr: *const u8,
-                default_direct_code_ptr: *const u8,
-                deopt_table_ptr: ObjPtr,
-                globals_obj: ObjPtr,
-            }
-
-            let _opt_mode = set_opt_mode("apply");
-            let soac_work_dir = fresh_test_work_dir("exact-int-if-compare-deopt-runtime");
-            let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
-            let mut constants = TestConstantPool::default();
-            let mut function = test_function();
-            function.params = ParamSpec {
-                params: vec![
-                    Param {
-                        name: "loops".into(),
-                        kind: ParamKind::Any,
-                        has_default: false,
-                    },
-                    Param {
-                        name: "value".into(),
-                        kind: ParamKind::Any,
-                        has_default: false,
-                    },
-                ],
-            };
-            let entry_label = function.name_gen.next_block_name();
-            let then_label = function.name_gen.next_block_name();
-            let else_label = function.name_gen.next_block_name();
-            let instr_id = InstrId::new(entry_label, 0);
-            function.blocks = vec![
-                CodegenBlock {
-                    label: entry_label,
-                    body: vec![],
-                    term: BlockTerm::IfTerm(soac_core::block_py::TermIf {
-                        test: with_instr_id(
-                            op_expr(BinOp::new(
-                                BinOpKind::Eq,
-                                name_expr(test_local_name("value", 1)),
-                                constants.int_expr(0),
-                            )),
-                            instr_id,
-                        ),
-                        then_label,
-                        else_label,
-                    }),
-                    params: vec![],
-                    exc_edge: None,
-                },
-                CodegenBlock {
-                    label: then_label,
-                    body: vec![],
-                    term: ret_term(constants.int_expr(0)),
-                    params: vec![],
-                    exc_edge: None,
-                },
-                CodegenBlock {
-                    label: else_label,
-                    body: vec![],
-                    term: ret_term(op_expr(BinOp::new(
-                        BinOpKind::TrueDiv,
-                        name_expr(test_name("loops")),
-                        name_expr(test_local_name("value", 1)),
-                    ))),
-                    params: vec![],
-                    exc_edge: None,
-                },
-            ];
-            set_stack_slots(&mut function, &["loops", "value"]);
-            let mut module = test_module(ModuleNameGen::new(0), vec![function]);
-            module.module_constants = constants.module_constants;
-            instrument_bb_module_with_call_target_counters(&mut module);
-            let function = module.callable_defs[0].clone();
-            write_test_counter_dump(
-                soac_work_dir.join("profile.bin").as_path(),
-                &CounterDumpRecord {
-                    source_hash: 0,
-                    module_name: "operator_deopt_if_runtime_test".to_string(),
-                    package_name: None,
-                    rows: vec![CounterDumpRow {
-                        counter_id: 0,
-                        scope: "this".to_string(),
-                        kind: "operator_hot_shapes".to_string(),
-                        site_kind: "runtime".to_string(),
-                        function_id: Some(function.function_id),
-                        current_function_id: Some(function.function_id),
-                        instr_id: Some(instr_id),
-                        function_qualname: Some(function.names.qualname.clone()),
-                        block_label: None,
-                        value: 1,
-                        branch_values: Vec::new(),
-                        observed_value: Some(soac_opt::operator_specialization::pack_binary_shape(
-                            soac_opt::operator_specialization::ExactTypeTag::Int,
-                            soac_opt::operator_specialization::ExactTypeTag::Int,
-                        )),
-                        max_overcount: Some(0),
-                    }],
-                    module_keys: Vec::new(),
-                    type_keys: Vec::new(),
-                    type_table: Vec::new(),
-                },
-            );
-            let shared_state = crate::module_type::build_shared_state_for_testing(
-                py,
-                module,
-                "operator_deopt_if_runtime_test",
-                "",
-            )
-            .expect("shared state should build");
-            let _runtime = build_test_module_runtime(py, shared_state.clone());
-            let function = shared_state.lowered_module.callable_defs[0].clone();
-            let compile_session = crate::session::CompileSession::new();
-            let mut jit_module =
-                new_jit_module(&compile_session).expect("test jit module should construct");
-            let module_constant_ptrs = shared_state.module_constant_ptrs();
-            let module_constant_object_data_ids = declare_module_constant_object_data(
-                &mut jit_module,
-                &shared_state.lowered_module,
-                &module_constant_ptrs,
-            )
-            .expect("module constant object data should declare");
-            let (counter_slots_by_id, scalar_counter_data_id, top_value_counter_data_id) =
-                define_test_counter_storage(
-                    &mut jit_module,
-                    &shared_state.lowered_module,
-                    shared_state.lowered_module.counter_defs.as_slice(),
-                );
-            let blocks = vec![std::ptr::null_mut::<c_void>(); function.blocks.len()];
-            let built = build_test_cranelift_run_bb_specialized_function(
-                &mut jit_module,
-                blocks.as_slice(),
-                &shared_state.lowered_module,
-                &function,
-                &shared_state.codegen_constants,
-                shared_state.lowered_module.counter_defs.as_slice(),
-                module_constant_object_data_ids.as_slice(),
-                counter_slots_by_id.as_ref(),
-                scalar_counter_data_id,
-                top_value_counter_data_id,
-                &compile_session,
-                Some(shared_state.as_ref()),
-                None,
-                None,
-                BuildSpecializedFunctionOptions::default(),
-            )
-            .expect("specialized JIT build should succeed");
-            let facts = infer_jit_value_facts(&shared_state.lowered_module);
-            let module_plan = plan_jit_deopt_resume_module(&shared_state.lowered_module, &facts)
-                .expect("JIT deopt resume planning should succeed");
-            let function_plan = module_plan
-                .function(function.function_id)
-                .expect("function should have a JIT deopt plan");
-            let deopt_table =
-                RuntimeJitDeoptTable::from_plan(&function, function_plan, &module_constant_ptrs)
-                    .expect("runtime deopt table should build from plan");
-
-            let mut ctx = built.ctx;
-            define_prepared_function(
-                &mut jit_module,
-                &SoacEnvConfig::default(),
-                built.main_id,
-                &mut ctx,
-                "test-exact-int-if-compare-deopt-resume",
-                "exact-int if compare deopt test should define",
-            )
-            .expect("test function should define");
-            jit_module.clear_context(&mut ctx);
-            jit_module
-                .finalize_definitions()
-                .expect("test jit module should finalize");
-            let code_ptr = jit_module.get_finalized_function(built.main_id);
-
-            let globals = ffi::PyDict_New();
-            assert!(!globals.is_null(), "test globals dict should allocate");
-            let loops = ffi::PyLong_FromLong(7);
-            let value = ffi::PyLong_FromLongLong(2_000_000_000);
-            assert!(!loops.is_null(), "loops int should allocate");
-            assert!(!value.is_null(), "non-compact value int should allocate");
-
-            let function_env = TestFunctionEnv {
-                direct_code_ptr: code_ptr,
-                default_direct_code_ptr: std::ptr::null(),
-                deopt_table_ptr: std::ptr::addr_of!(deopt_table).cast_mut().cast(),
-                globals_obj: globals.cast(),
-            };
-            let entry: unsafe extern "C" fn(ObjPtr, ObjPtr, ObjPtr, ObjPtr) -> ObjPtr =
-                std::mem::transmute(code_ptr);
-            let result = entry(
-                std::ptr::addr_of!(function_env).cast_mut().cast(),
-                ffi::PyThreadState_Get().cast(),
-                loops.cast(),
-                value.cast(),
-            );
-            if !ffi::PyErr_Occurred().is_null() {
-                ffi::PyErr_Print();
-                panic!(
-                    "successful exact-int if-compare guard-miss deopt should not leave a Python exception"
-                );
-            }
-            assert_eq!(
-                ffi::PyFloat_AsDouble(result.cast()),
-                7.0 / 2_000_000_000.0,
-                "if-condition exact-int guard-miss deopt should preserve live locals"
-            );
-
-            ffi::Py_DECREF(result.cast::<ffi::PyObject>());
-            ffi::Py_DECREF(value);
-            ffi::Py_DECREF(loops);
-            ffi::Py_DECREF(globals);
-        });
-    }
-
-    #[test]
-    fn exact_int_unary_guard_miss_deopt_resumes_generic_unary_runtime() {
-        if crate::run_test_in_isolated_process_if_needed(
-            module_path!(),
-            "exact_int_unary_guard_miss_deopt_resumes_generic_unary_runtime",
-        ) {
-            return;
-        }
-        let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        crate::initialize_test_python();
-        Python::attach(|py| unsafe {
-            #[repr(C)]
-            struct TestFunctionEnv {
-                direct_code_ptr: *const u8,
-                default_direct_code_ptr: *const u8,
-                deopt_table_ptr: ObjPtr,
-                globals_obj: ObjPtr,
-            }
-
-            let _opt_mode = set_opt_mode("apply");
-            let soac_work_dir = fresh_test_work_dir("exact-int-unary-deopt-runtime");
-            let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
-            let mut function = test_function();
-            function.params = ParamSpec {
-                params: vec![Param {
-                    name: "value".into(),
-                    kind: ParamKind::Any,
-                    has_default: false,
-                }],
-            };
-            let block_label = function.name_gen.next_block_name();
-            let instr_id = InstrId::new(block_label, 0);
-            function.blocks = vec![CodegenBlock {
-                label: block_label,
-                body: vec![],
-                term: ret_term(with_instr_id(
-                    op_expr(UnaryOp::new(
-                        UnaryOpKind::Neg,
-                        name_expr(test_name("value")),
-                    )),
-                    instr_id,
-                )),
-                params: vec![],
-                exc_edge: None,
-            }];
-            set_stack_slots(&mut function, &["value"]);
-            let mut module = test_module(ModuleNameGen::new(0), vec![function]);
-            instrument_bb_module_with_call_target_counters(&mut module);
-            let function = module.callable_defs[0].clone();
-            write_test_counter_dump(
-                soac_work_dir.join("profile.bin").as_path(),
-                &CounterDumpRecord {
-                    source_hash: 0,
-                    module_name: "operator_deopt_runtime_test".to_string(),
-                    package_name: None,
-                    rows: vec![CounterDumpRow {
-                        counter_id: 0,
-                        scope: "this".to_string(),
-                        kind: "operator_hot_shapes".to_string(),
-                        site_kind: "runtime".to_string(),
-                        function_id: Some(function.function_id),
-                        current_function_id: Some(function.function_id),
-                        instr_id: Some(instr_id),
-                        function_qualname: Some(function.names.qualname.clone()),
-                        block_label: None,
-                        value: 1,
-                        branch_values: Vec::new(),
-                        observed_value: Some(soac_opt::operator_specialization::pack_unary_shape(
-                            soac_opt::operator_specialization::ExactTypeTag::Int,
-                        )),
-                        max_overcount: Some(0),
-                    }],
-                    module_keys: Vec::new(),
-                    type_keys: Vec::new(),
-                    type_table: Vec::new(),
-                },
-            );
-            let shared_state = crate::module_type::build_shared_state_for_testing(
-                py,
-                module,
-                "operator_deopt_runtime_test",
-                "",
-            )
-            .expect("shared state should build");
-            let _runtime = build_test_module_runtime(py, shared_state.clone());
-            let function = shared_state.lowered_module.callable_defs[0].clone();
-            let compile_session = crate::session::CompileSession::new();
-            let mut jit_module =
-                new_jit_module(&compile_session).expect("test jit module should construct");
-            let module_constant_ptrs = shared_state.module_constant_ptrs();
-            let module_constant_object_data_ids = declare_module_constant_object_data(
-                &mut jit_module,
-                &shared_state.lowered_module,
-                &module_constant_ptrs,
-            )
-            .expect("module constant object data should declare");
-            let (counter_slots_by_id, scalar_counter_data_id, top_value_counter_data_id) =
-                define_test_counter_storage(
-                    &mut jit_module,
-                    &shared_state.lowered_module,
-                    shared_state.lowered_module.counter_defs.as_slice(),
-                );
-            let blocks = vec![std::ptr::null_mut::<c_void>(); function.blocks.len()];
-            let built = build_test_cranelift_run_bb_specialized_function(
-                &mut jit_module,
-                blocks.as_slice(),
-                &shared_state.lowered_module,
-                &function,
-                &shared_state.codegen_constants,
-                shared_state.lowered_module.counter_defs.as_slice(),
-                module_constant_object_data_ids.as_slice(),
-                counter_slots_by_id.as_ref(),
-                scalar_counter_data_id,
-                top_value_counter_data_id,
-                &compile_session,
-                Some(shared_state.as_ref()),
-                None,
-                None,
-                BuildSpecializedFunctionOptions::default(),
-            )
-            .expect("specialized JIT build should succeed");
-            let facts = infer_jit_value_facts(&shared_state.lowered_module);
-            let module_plan = plan_jit_deopt_resume_module(&shared_state.lowered_module, &facts)
-                .expect("JIT deopt resume planning should succeed");
-            let function_plan = module_plan
-                .function(function.function_id)
-                .expect("function should have a JIT deopt plan");
-            let deopt_table =
-                RuntimeJitDeoptTable::from_plan(&function, function_plan, &module_constant_ptrs)
-                    .expect("runtime deopt table should build from plan");
-
-            let mut ctx = built.ctx;
-            define_prepared_function(
-                &mut jit_module,
-                &SoacEnvConfig::default(),
-                built.main_id,
-                &mut ctx,
-                "test-exact-int-unary-deopt-resume",
-                "exact-int unary deopt test should define",
-            )
-            .expect("test function should define");
-            jit_module.clear_context(&mut ctx);
-            jit_module
-                .finalize_definitions()
-                .expect("test jit module should finalize");
-            let code_ptr = jit_module.get_finalized_function(built.main_id);
-
-            let globals = ffi::PyDict_New();
-            assert!(!globals.is_null(), "test globals dict should allocate");
-            let value = ffi::PyBool_FromLong(1);
-            assert!(!value.is_null(), "bool value should allocate");
-
-            let function_env = TestFunctionEnv {
-                direct_code_ptr: code_ptr,
-                default_direct_code_ptr: std::ptr::null(),
-                deopt_table_ptr: std::ptr::addr_of!(deopt_table).cast_mut().cast(),
-                globals_obj: globals.cast(),
-            };
-            let entry: unsafe extern "C" fn(ObjPtr, ObjPtr, ObjPtr) -> ObjPtr =
-                std::mem::transmute(code_ptr);
-            let result = entry(
-                std::ptr::addr_of!(function_env).cast_mut().cast(),
-                ffi::PyThreadState_Get().cast(),
-                value.cast(),
-            );
-            if !ffi::PyErr_Occurred().is_null() {
-                ffi::PyErr_Print();
-                panic!(
-                    "successful exact-int unary guard-miss deopt should not leave a Python exception"
-                );
-            }
-            assert_eq!(
-                ffi::PyLong_AsLong(result.cast()),
-                -1,
-                "exact-int unary guard-miss deopt should resume and execute generic bool negation"
-            );
-
-            ffi::Py_DECREF(result.cast::<ffi::PyObject>());
-            ffi::Py_DECREF(value);
-            ffi::Py_DECREF(globals);
-        });
     }
 
     #[test]
@@ -21011,8 +19715,6 @@ def f(x, y):
                 caller_function.function_id,
                 HashMap::from([(call_instr_id, vec![v3_plan])]),
             )]),
-            opt_v3_emitted_constructor_calls: HashMap::new(),
-            opt_v3_emitted_method_calls: HashMap::new(),
             opt_v3_emitted_exact_list_items: HashMap::from([(
                 caller_function.function_id,
                 HashMap::from([(non_call_v3_source, exact_list_item)]),
@@ -21057,134 +19759,6 @@ def f(x, y):
         assert!(
             specialization_inputs.opt_v3_call_emissions.is_empty(),
             "inline direct-call body plans are consumed by the offline optimized module, not typed JIT lowering"
-        );
-    }
-
-    #[test]
-    fn profiled_v3_module_plan_does_not_rewrite_method_calls_in_jit() {
-        let module_name = "v3_profiled_method_call_inline_plan_test";
-        let module_name_gen = ModuleNameGen::new(0);
-        let mut constants = TestConstantPool::default();
-
-        let mut next_function = test_function_in_module(&module_name_gen, "IterRange.__next__");
-        next_function.params.params.push(Param {
-            name: "self".into(),
-            kind: ParamKind::Any,
-            has_default: false,
-        });
-        next_function = with_single_test_block(
-            next_function,
-            vec![],
-            ret_term(name_expr(test_local_name("self", 0))),
-        );
-        set_stack_slots(&mut next_function, &["self"]);
-
-        let mut caller_function = test_function_in_module(&module_name_gen, "caller");
-        caller_function.params.params.push(Param {
-            name: "it".into(),
-            kind: ParamKind::Any,
-            has_default: false,
-        });
-        let caller_block_label = caller_function.name_gen.next_block_name();
-        let call_instr_id = InstrId::new(caller_block_label, 1);
-        caller_function = with_test_blocks(
-            caller_function,
-            vec![CodegenBlock {
-                label: caller_block_label,
-                body: vec![assign_stmt(
-                    test_local_name("y", 1),
-                    with_instr_id(
-                        op_expr(Call::new(
-                            op_expr(GetAttr::new(
-                                name_expr(test_local_name("it", 0)),
-                                constants.string_expr("__next__"),
-                            )),
-                            Vec::<CallArgPositional<InstrCodegen>>::new(),
-                            Vec::<CallArgKeyword<InstrCodegen>>::new(),
-                        )),
-                        call_instr_id,
-                    ),
-                )],
-                term: ret_term(name_expr(test_local_name("y", 1))),
-                params: vec![],
-                exc_edge: None,
-            }],
-        );
-        set_stack_slots(&mut caller_function, &["it", "y"]);
-
-        let mut module = test_module(
-            module_name_gen,
-            vec![next_function.clone(), caller_function.clone()],
-        );
-        module.module_constants = constants.module_constants;
-        let inputs = PlannedOptimizationInputs {
-            optimized_module: Some(module.clone()),
-            opt_v3_emitted_method_calls: HashMap::from([(
-                caller_function.function_id,
-                HashMap::from([(
-                    call_instr_id,
-                    vec![ResolvedV3MethodCallPlan {
-                        source: call_instr_id,
-                        target: next_function.function_id,
-                        method_name: "__next__".to_string(),
-                        owner_type: MethodCallOwnerType {
-                            module_name: module_name.to_string(),
-                            qualname: "IterRange".to_string(),
-                        },
-                        arg_plan: TypedDirectCallArgPlan {
-                            sources: Vec::new(),
-                        },
-                        guard: MethodCallGuardKind::ExactReceiverTypeVersion,
-                        fallback: MethodCallFallbackKind::OriginalMethodCall,
-                        body: test_v3_inline_call_body(),
-                        reason: "profiled method call".to_string(),
-                    }],
-                )]),
-            )]),
-            ..PlannedOptimizationInputs::default()
-        };
-        let profile = SpecializationProfile::from_precompile(
-            &SoacEnvConfig::default(),
-            module_name,
-            None,
-            inputs,
-        )
-        .expect("test specialization profile should construct");
-        let plan = build_profiled_jit_module_plan(&module, &profile)
-            .expect("profiled JIT module plan should build");
-        let planned_caller = plan
-            .module
-            .callable_defs
-            .iter()
-            .find(|function| function.function_id == caller_function.function_id)
-            .expect("planned module should keep caller");
-
-        assert!(
-            !planned_caller.blocks.iter().any(|block| {
-                matches!(
-                    &block.term,
-                    BlockTerm::IfTerm(term)
-                        if matches!(
-                            term.test,
-                            InstrCodegen::DirectReceiverTypeVersionGuardTest(_)
-                        )
-                )
-            }),
-            "JIT should not run the v3 method inliner; it should compile the loaded optimized module"
-        );
-        assert!(
-            planned_caller
-                .blocks
-                .iter()
-                .flat_map(|block| &block.body)
-                .any(|instr| matches!(instr, InstrCodegen::Store(store) if store.name.id_str() == "y" && matches!(store.value.as_ref(), InstrCodegen::Call(_)))),
-            "loaded optimized module fixture intentionally still has the original generic method call"
-        );
-        let err = FunctionSpecializationInputs::from_profile(&profile, planned_caller)
-            .expect_err("JIT should reject runtime-guarded method-call plans");
-        assert!(
-            err.contains("method guards are not a mechanical JIT input yet"),
-            "unexpected error: {err}"
         );
     }
 

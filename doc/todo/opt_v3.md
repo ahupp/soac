@@ -153,40 +153,18 @@ Implemented:
   misses or overflow still enter the local fallback region that performs the
   original store before branching.
 
-Remaining legacy-only families are intentionally visible:
-
-- remaining division/modulo/shift and unary exact-int value-producing operators;
-
 Partially migrated families are also intentionally visible:
 
 - scalar-threading is only implemented for the adjacent, no-exception,
   store-RHS-to-empty-compare shape;
-- profiled direct calls are represented as v3 plan selections plus mechanical
-  direct-call/method-call/constructor-call emissions with validated argument
-  plans and consumed through mechanical typed-call lowering for ordinary-function,
-  receiver method, and class-constructor targets.
+- profiled ordinary-function direct calls are represented as v3 plan selections
+  plus mechanical direct-call emissions with validated argument plans.
   Cross-module targets are represented through serialized module identities and
   resolved from the loaded module set. Module-level ordinary direct-call CFG
-  rewrites are now fed only by v3 emitted inline direct-call plans. Module-level no-argument method
-  and runtime-iter rewrites are likewise fed only by v3 inline method or
-  constructor plans. Constructor-call plans own the selected
-  `__init__` target, owner type, type-version guard kind, original-call
-  fallback, and implicit-`self` argument plan; the existing constructor emitter
-  still owns allocation, initializer inlining, and `__init__` result validation.
-  Runtime owner type or attribute resolution can still decline a selected
-  method/constructor source to the original generic call; that decline now
-  happens while preparing `FunctionSpecializationInputs`, not during typed-call
-  lowering. Prepared guards must also prove that their exact owner-type and
-  owner-attribute callable relocations can be registered and predeclared before
-  worker codegen. A guardless or early-consumed v3-owned source remains a local
-  fallback, not a separate call-target replan.
-  Receiver-method store sites whose v3 body choice
-  is `DirectCall` can now expand before typed lowering into an explicit
-  receiver guard, direct-method hot arm, and generic method fallback while
-  preserving explicit positional arguments from the original lowered call.
-  Constructor store sites whose v3 body choice is `DirectCall` can now expand
-  into an explicit callable guard, direct-callable constructor hot arm, and
-  generic constructor fallback before typed lowering.
+  rewrites are now fed only by v3 emitted inline direct-call plans. Runtime
+  receiver-method and constructor calls are no longer placeholder v3 plan
+  families; they stay generic unless a future plan format adds validated static
+  guard inputs for them.
 - indexed fields are represented as v3 plan selections plus mechanical
   indexed-field emissions. `soac_jit` now keeps the emitted access kind and
   attribute name separate and validates that they match the lowered
@@ -577,7 +555,9 @@ struct FunctionOptimizationPlanV3 {
     regions: Vec<RegionPlan>,
     scalar_threads: Vec<ScalarLocalThreadPlan>,
     direct_calls: Vec<DirectCallSpecializationPlan>,
-    method_calls: Vec<MethodCallSpecializationPlan>,
+    exact_list_items: Vec<ExactListItemSpecializationPlan>,
+    indexed_fields: Vec<IndexedFieldSpecializationPlan>,
+    indexed_globals: Vec<IndexedGlobalSpecializationPlan>,
     deopt_points: Vec<PlannedDeoptPoint>,
     ownership: FunctionOwnershipPlan,
     diagnostics: Vec<PlanDiagnostic>,

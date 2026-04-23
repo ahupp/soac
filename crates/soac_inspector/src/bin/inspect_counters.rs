@@ -516,7 +516,7 @@ mod tests {
         let row = CounterDumpRowView {
             counter_id: 4,
             scope: "this",
-            kind: "operator_specialized",
+            kind: "getitem_specialized",
             site_kind: "runtime",
             function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
             current_function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
@@ -543,7 +543,7 @@ mod tests {
         let rendered = format_pretty_counter_row(&rows[0], &function_qualnames);
         assert_eq!(
             rendered,
-            "  counter=4 kind=operator_specialized scope=this site=runtime function=add instr=bb0:0 value=0 branches=hit:3,fallback:1"
+            "  counter=4 kind=getitem_specialized scope=this site=runtime function=add instr=bb0:0 value=0 branches=hit:3,fallback:1"
         );
     }
 

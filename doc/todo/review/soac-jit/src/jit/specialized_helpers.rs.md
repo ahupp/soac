@@ -3,8 +3,8 @@
 ## File Responsibilities
 
 Provides Rust/CPython helper functions registered as symbols for generated JIT code. These helpers cover CPython calls,
-global/name/cell operations, object/item/attribute access, deopt entry, exact-long specialization, counters, constructor
-helpers, exception helpers, and perf-attribution wrapper variants. The file is intentionally ABI-shaped and mostly raw FFI.
+global/name/cell operations, object/item/attribute access, deopt entry, counters, constructor helpers, exception helpers,
+and perf-attribution wrapper variants. The file is intentionally ABI-shaped and mostly raw FFI.
 
 ## Datatypes
 
@@ -22,8 +22,7 @@ helpers, exception helpers, and perf-attribution wrapper variants. The file is i
 ## Functions
 
 - Basic validation/error helpers: `is_cell_object`, `object_type_name`, `soac_runtime_set_runtime_error_static`,
-  `raise_expected_cell`, `exact_long_type_mismatch_error`, `exact_long_missing_slot_error`,
-  `exact_long_i64_overflow_error`, and `dp_jit_raise_i64_overflow`.
+  `raise_expected_cell`, `raise_i64_overflow_error`, and `dp_jit_raise_i64_overflow`.
 - Call helpers: `py_call_positional_three_hook`, `dp_jit_py_call_positional_three`,
   `py_call_object_hook`, `dp_jit_py_call_object`, `py_vectorcall_hook`, `dp_jit_py_vectorcall`,
   `py_call_with_kw_hook`, `dp_jit_py_call_with_kw`, `get_arg_item_hook`, and `dp_jit_get_arg_item` bridge generated call
@@ -51,18 +50,13 @@ helpers, exception helpers, and perf-attribution wrapper variants. The file is i
   `dp_jit_deopt_resume`, `run_deopt_resume`, `set_deopt_unsupported_continuation_error`, `dict_new_hook`,
   `dp_jit_dict_new`, `dict_set_item_hook`, `dp_jit_dict_set_item`, `is_true_hook`, and `dp_jit_is_true`.
 - Numeric helpers: `pyobject_to_i64_hook`, `dp_jit_pyobject_to_i64`, `pyobject_richcompare_wrapper`,
-  `load_python_capi_symbol`, generated CPython wrapper functions, `exact_long_binary_op_hook`,
-  `dp_jit_exact_long_binary_op`, `exact_long_unary_op_hook`, `dp_jit_exact_long_unary_op`,
-  `exact_long_number_slot_symbol`, `exact_long_richcompare_slot_symbol`, `exact_long_number_slot_call`,
-  `dp_jit_exact_long_add_slot`, `dp_jit_exact_long_sub_slot`, `dp_jit_exact_long_mul_slot`,
-  `dp_jit_exact_long_true_div_slot`, and `dp_jit_exact_long_richcompare_slot`.
-- Symbol registration: `chosen_helper_symbol`, `register_exact_long_slot_symbols`, and
-  `register_specialized_jit_symbols` publish helper and CPython wrapper addresses to the Cranelift `JITBuilder`.
+  `load_python_capi_symbol`, generated CPython wrapper functions, and `dp_jit_raise_i64_overflow`.
+- Symbol registration: `chosen_helper_symbol` and `register_specialized_jit_symbols` publish helper and CPython wrapper
+  addresses to the Cranelift `JITBuilder`.
 
 ## Context Read
 
 - `crates/soac_jit/src/jit/mod.rs`: declares import specs for these helpers and calls `register_specialized_jit_symbols`.
 - `crates/soac_jit/src/jit/deopt_interpreter.rs`: invoked by `dp_jit_deopt_resume`.
 - `crate::module_constants`: runtime-name load and missing-name error helpers.
-- `crate::operator_specialization`: exact-int operator enums used by numeric specialization helpers.
 - `crate::config::jit_perf_helper_frames_enabled`: selects fast versus perf-frame helper symbols.
