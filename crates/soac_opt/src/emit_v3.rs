@@ -36,6 +36,12 @@ pub struct MechanicalFunctionEmission {
     pub regions: Vec<MechanicalRegionEmission>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MechanicalRegionFunctionParamInput<'a> {
+    pub value: PlanValue,
+    pub name: &'a str,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct MechanicalDirectCallEmission {
     pub source: InstrId,
@@ -332,6 +338,35 @@ pub fn validate_mechanical_emission_matches_plan_v3(
     )?;
     validate_current_mechanical_lowering_shape_v3(plan, emission)
         .map_err(MechanicalEmitError::EmissionMismatch)
+}
+
+pub fn mechanical_region_function_param_inputs<'a>(
+    region: &'a RegionPlan,
+    context: &str,
+) -> Result<Vec<MechanicalRegionFunctionParamInput<'a>>, String> {
+    let mut inputs = Vec::with_capacity(region.inputs.len());
+    for input in &region.inputs {
+        let RegionInputSource::FunctionParam {
+            name: Some(name), ..
+        } = &input.source
+        else {
+            return Err(format!(
+                "prevalidated optimizer v3 {context} input {:?} has non-mechanical source {:?}",
+                input.value, input.source
+            ));
+        };
+        if input.value.rep != Rep::PyObjectBorrowed {
+            return Err(format!(
+                "prevalidated optimizer v3 {context} input {:?} has non-mechanical rep {:?}",
+                input.value, input.value.rep
+            ));
+        }
+        inputs.push(MechanicalRegionFunctionParamInput {
+            value: input.value,
+            name,
+        });
+    }
+    Ok(inputs)
 }
 
 pub fn mechanical_codegen_step(
@@ -1902,6 +1937,32 @@ mod tests {
         )
         .expect_err("checked i64 add without local fallback should be rejected before JIT");
         assert!(err.contains("local fallback"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn prepares_region_function_param_inputs() {
+        let value = PlanValue::new(0, Rep::PyObjectBorrowed);
+        let region = RegionPlan {
+            id: RegionId(0),
+            source: RegionSource::FunctionEntry,
+            inputs: vec![RegionInput {
+                value,
+                source: RegionInputSource::FunctionParam {
+                    index: 0,
+                    name: Some("arg".to_string()),
+                },
+            }],
+            nodes: Vec::new(),
+            exits: Vec::new(),
+        };
+
+        let inputs = mechanical_region_function_param_inputs(&region, "test region")
+            .expect("named function-param input should prepare");
+
+        assert_eq!(
+            inputs,
+            vec![MechanicalRegionFunctionParamInput { value, name: "arg" }]
+        );
     }
 
     #[test]

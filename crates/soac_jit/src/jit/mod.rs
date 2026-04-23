@@ -124,6 +124,7 @@ use soac_opt::emit_v3::{
     MechanicalExitKind, MechanicalRegionEmission,
     mechanical_codegen_step as opt_v3_mechanical_codegen_step,
     mechanical_convert_inputs_for_output as opt_v3_mechanical_convert_inputs_for_output,
+    mechanical_region_function_param_inputs as opt_v3_mechanical_region_function_param_inputs,
 };
 #[cfg(test)]
 use soac_opt::plan::ProfileEvidenceStore;
@@ -134,8 +135,7 @@ use soac_opt::plan::{
 use soac_opt::plan_v3::{
     CallBodyKind as PlanV3CallBodyKind, IndexedFieldAccessKind as PlanV3IndexedFieldAccessKind,
     IndexedGlobalAccessKind as PlanV3IndexedGlobalAccessKind, MaterializeKind, PlanNodeId,
-    PlanValue, RegionId, RegionInputSource, RegionPlan, Rep, RichCompareOp,
-    ScalarThreadMaterialization,
+    PlanValue, RegionId, RegionPlan, Rep, RichCompareOp, ScalarThreadMaterialization,
 };
 use soac_opt::region_emission_v3::{
     ExactIntBranchSelection as OptV3ExactIntBranchSelection,
@@ -21876,22 +21876,13 @@ fn opt_v3_region_input_values(
     context: &str,
 ) -> Result<HashMap<PlanValue, OptV3MechanicalValue>, String> {
     let mut values = HashMap::new();
-    for input in &region.inputs {
-        let RegionInputSource::FunctionParam {
-            name: Some(name), ..
-        } = &input.source
-        else {
-            return Err(format!(
-                "prevalidated optimizer v3 {context} input {:?} has non-mechanical source {:?}",
-                input.value, input.source
-            ));
-        };
+    for input in opt_v3_mechanical_region_function_param_inputs(region, context)? {
         let value = local_env
-            .load_name(fb, name, emit_ctx, true)
+            .load_name(fb, input.name, emit_ctx, true)
             .ok_or_else(|| {
                 format!(
-                    "optimizer v3 {context} input {:?} references unavailable local {name:?}",
-                    input.value
+                    "optimizer v3 {context} input {:?} references unavailable local {:?}",
+                    input.value, input.name
                 )
             })?;
         opt_v3_store_mechanical_value(
