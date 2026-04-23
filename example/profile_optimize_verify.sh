@@ -33,11 +33,14 @@ export SOAC_DECIDE_OPT_MODE="${SOAC_DECIDE_OPT_MODE:-v3}"
 
 echo "work dir: $SOAC_WORK_DIR"
 
+echo "build release workspace"
+cargo build --release --workspace
+
 echo "profile"
 SOAC_OPT_MODE=profile just py "$SCRIPT_DIR/specialization_demo.py"
 
 echo "optimize"
-cargo run --release -p soac_opt --bin decide_optimizations -- \
+"$REPO_ROOT/target/release/decide_optimizations" \
   --mode "$SOAC_DECIDE_OPT_MODE" \
   --counters "$SOAC_WORK_DIR/profile.bin" \
   --out "$SOAC_WORK_DIR/modules"
@@ -46,7 +49,7 @@ echo "verify"
 SOAC_OPT_MODE=verify just py "$SCRIPT_DIR/specialization_demo.py"
 
 echo "dump verify counters"
-cargo run --release -p soac_inspector --bin inspect_counters -- \
+"$REPO_ROOT/target/release/inspect_counters" \
   "$SOAC_WORK_DIR/verify.bin" | tee "$SOAC_WORK_DIR/verify_counters.txt"
 
 echo "wrote profile: $SOAC_WORK_DIR/profile.bin"
