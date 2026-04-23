@@ -536,12 +536,6 @@ impl ModuleConstantCollector {
             InstrCodegen::DirectFunctionIdGuardTest(op) => {
                 self.collect_expr(op.value.as_ref());
             }
-            InstrCodegen::DirectCallableTypeVersionGuardTest(op) => {
-                self.collect_expr(op.value.as_ref());
-            }
-            InstrCodegen::DirectReceiverTypeVersionGuardTest(op) => {
-                self.collect_expr(op.value.as_ref());
-            }
             InstrCodegen::Call(call) => {
                 if let Some(const_bytes) = self.string_constant_bytes_for_specialized_codegen(expr)
                 {
@@ -573,12 +567,6 @@ impl ModuleConstantCollector {
                     }
                     self.collect_expr(keyword.expr());
                 }
-            }
-            InstrCodegen::DirectCallableCall(op) => {
-                op.visit_children(self);
-            }
-            InstrCodegen::DirectMethodCall(op) => {
-                op.visit_children(self);
             }
             InstrCodegen::GetAttr(op) => {
                 if let Some(attr_bytes) =

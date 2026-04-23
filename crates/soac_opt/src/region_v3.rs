@@ -208,17 +208,9 @@ fn instr_codegen_kind(instr: &InstrCodegen) -> &'static str {
         InstrCodegenOp::UnaryOp(_) => "UnaryOp",
         InstrCodegenOp::CalleeFunctionId(_) => "CalleeFunctionId",
         InstrCodegenOp::DirectFunctionIdGuardTest(_) => "DirectFunctionIdGuardTest",
-        InstrCodegenOp::DirectCallableTypeVersionGuardTest(_) => {
-            "DirectCallableTypeVersionGuardTest"
-        }
-        InstrCodegenOp::DirectReceiverTypeVersionGuardTest(_) => {
-            "DirectReceiverTypeVersionGuardTest"
-        }
         InstrCodegenOp::Tuple(_) => "Tuple",
         InstrCodegenOp::Call(_) => "Call",
         InstrCodegenOp::CallDirect(_) => "CallDirect",
-        InstrCodegenOp::DirectCallableCall(_) => "DirectCallableCall",
-        InstrCodegenOp::DirectMethodCall(_) => "DirectMethodCall",
         InstrCodegenOp::GetAttr(_) => "GetAttr",
         InstrCodegenOp::SetAttr(_) => "SetAttr",
         InstrCodegenOp::GetItem(_) => "GetItem",
@@ -356,18 +348,6 @@ impl RegionBuilder {
                     kind: "DirectFunctionIdGuardTest",
                 })
             }
-            InstrCodegenOp::DirectCallableTypeVersionGuardTest(_) => {
-                Err(RegionExtractionError::UnsupportedInstr {
-                    source: instr.try_semantic_instr_id(),
-                    kind: "DirectCallableTypeVersionGuardTest",
-                })
-            }
-            InstrCodegenOp::DirectReceiverTypeVersionGuardTest(_) => {
-                Err(RegionExtractionError::UnsupportedInstr {
-                    source: instr.try_semantic_instr_id(),
-                    kind: "DirectReceiverTypeVersionGuardTest",
-                })
-            }
             InstrCodegenOp::Call(_) => Err(RegionExtractionError::UnsupportedInstr {
                 source: instr.try_semantic_instr_id(),
                 kind: "Call",
@@ -375,14 +355,6 @@ impl RegionBuilder {
             InstrCodegenOp::CallDirect(_) => Err(RegionExtractionError::UnsupportedInstr {
                 source: instr.try_semantic_instr_id(),
                 kind: "CallDirect",
-            }),
-            InstrCodegenOp::DirectCallableCall(_) => Err(RegionExtractionError::UnsupportedInstr {
-                source: instr.try_semantic_instr_id(),
-                kind: "DirectCallableCall",
-            }),
-            InstrCodegenOp::DirectMethodCall(_) => Err(RegionExtractionError::UnsupportedInstr {
-                source: instr.try_semantic_instr_id(),
-                kind: "DirectMethodCall",
             }),
             InstrCodegenOp::GetAttr(_) => Err(RegionExtractionError::UnsupportedInstr {
                 source: instr.try_semantic_instr_id(),

@@ -82,8 +82,7 @@ use soac_opt::emit_v3::{
     mechanical_region_function_param_inputs as opt_v3_mechanical_region_function_param_inputs,
 };
 use soac_opt::passes::{
-    CodegenModuleShape, DirectCallableTypeVersionGuardTest, DirectFunctionIdGuardTest,
-    DirectReceiverTypeVersionGuardTest, FactStore, FunctionRefcountPlan, InstrCodegen,
+    CodegenModuleShape, DirectFunctionIdGuardTest, FactStore, FunctionRefcountPlan, InstrCodegen,
     InstrResolved, InstrTyped, LocalEnvResumeBinding, LocalEnvResumeBindingState,
     LocalEnvResumePoint, LocalEnvResumeStatePrecision, LocalEnvResumeValueSource, LocalRefState,
     PyExactType, PyObjFacts, RefcountActionKind, RefcountReleaseReason, RefcountSite,
@@ -4612,12 +4611,6 @@ fn runtime_jit_deopt_expr_supported(
         InstrCodegen::DirectFunctionIdGuardTest(guard) => {
             runtime_jit_deopt_expr_supported(&guard.value, support)
         }
-        InstrCodegen::DirectCallableTypeVersionGuardTest(guard) => {
-            runtime_jit_deopt_expr_supported(&guard.value, support)
-        }
-        InstrCodegen::DirectReceiverTypeVersionGuardTest(guard) => {
-            runtime_jit_deopt_expr_supported(&guard.value, support)
-        }
         InstrCodegen::Call(call) => {
             runtime_jit_deopt_call_parts_supported(&call.func, &call.args, &call.keywords, support)
         }
@@ -4627,8 +4620,6 @@ fn runtime_jit_deopt_expr_supported(
             &call.keywords,
             support,
         ),
-        InstrCodegen::DirectCallableCall(_) => false,
-        InstrCodegen::DirectMethodCall(_) => false,
         InstrCodegen::Store(store) => {
             runtime_jit_deopt_name_location_supported(store.name.location, support)
                 && runtime_jit_deopt_expr_supported(&store.value, support)
@@ -11041,19 +11032,6 @@ fn collect_call_direct_targets(
             if let InstrCodegen::CallDirect(call) = expr {
                 self.out.insert(call.function_id);
             }
-            if let InstrCodegen::DirectCallableCall(call) = expr {
-                match &call.guard {
-                    TypedDirectCallableCallGuard::Function(guard) => {
-                        self.out.insert(guard.function_id);
-                    }
-                    TypedDirectCallableCallGuard::Constructor(guard) => {
-                        self.out.insert(guard.function_id);
-                    }
-                }
-            }
-            if let InstrCodegen::DirectMethodCall(call) = expr {
-                self.out.insert(call.guard.function_id);
-            }
             expr.visit_children(self);
         }
     }
@@ -12443,97 +12421,6 @@ pub(super) fn emit_exact_type_version_match(
         i64::from(expected_version),
     );
     fb.ins().band(type_matches, version_matches)
-}
-
-fn emit_exact_receiver_type_version_match_bool01(
-    fb: &mut FunctionBuilder<'_>,
-    receiver: ir::Value,
-    expected_type: ir::Value,
-    expected_version: u32,
-    ctx: &JitEmitCtx<'_>,
-) -> SoacValue {
-    let i32_ty = ctx.consts.i32_ty;
-    let null_ptr = fb.ins().iconst(ctx.consts.ptr_ty, 0);
-    let zero_i32 = fb.ins().iconst(i32_ty, 0);
-    let done_block = fb.create_block();
-    let non_null_block = fb.create_block();
-    fb.append_block_param(done_block, i32_ty);
-
-    let is_null = fb
-        .ins()
-        .icmp(ir::condcodes::IntCC::Equal, receiver, null_ptr);
-    fb.ins().brif(
-        is_null,
-        done_block,
-        &[ir::BlockArg::Value(zero_i32)],
-        non_null_block,
-        &[],
-    );
-
-    fb.switch_to_block(non_null_block);
-    let is_match = emit_exact_type_version_match(fb, receiver, expected_type, expected_version);
-    let truth = emit_i32_bool01_from_cond(fb, is_match, ctx).expect_i32_bool01("receiver guard");
-    fb.ins().jump(done_block, &[ir::BlockArg::Value(truth)]);
-
-    fb.switch_to_block(done_block);
-    SoacValue::i32(fb.block_params(done_block)[0], IntFacts::i32_bool01())
-}
-
-fn emit_exact_callable_type_version_match_bool01(
-    fb: &mut FunctionBuilder<'_>,
-    callable: ir::Value,
-    expected_type: ir::Value,
-    expected_version: u32,
-    ctx: &JitEmitCtx<'_>,
-) -> SoacValue {
-    let i32_ty = ctx.consts.i32_ty;
-    let null_ptr = fb.ins().iconst(ctx.consts.ptr_ty, 0);
-    let zero_i32 = fb.ins().iconst(i32_ty, 0);
-    let done_block = fb.create_block();
-    let non_null_block = fb.create_block();
-    let version_block = fb.create_block();
-    let miss_block = fb.create_block();
-    fb.append_block_param(done_block, i32_ty);
-
-    let is_null = fb
-        .ins()
-        .icmp(ir::condcodes::IntCC::Equal, callable, null_ptr);
-    fb.ins().brif(
-        is_null,
-        done_block,
-        &[ir::BlockArg::Value(zero_i32)],
-        non_null_block,
-        &[],
-    );
-
-    fb.switch_to_block(non_null_block);
-    let type_matches = fb
-        .ins()
-        .icmp(ir::condcodes::IntCC::Equal, callable, expected_type);
-    fb.ins()
-        .brif(type_matches, version_block, &[], miss_block, &[]);
-
-    fb.switch_to_block(version_block);
-    let actual_version = fb.ins().load(
-        ir::types::I32,
-        ir::MemFlags::trusted(),
-        callable,
-        offset_of!(ffi::PyTypeObject, tp_version_tag) as i32,
-    );
-    let version_matches = fb.ins().icmp_imm(
-        ir::condcodes::IntCC::Equal,
-        actual_version,
-        i64::from(expected_version),
-    );
-    let truth = emit_i32_bool01_from_cond(fb, version_matches, ctx)
-        .expect_i32_bool01("callable type guard");
-    fb.ins().jump(done_block, &[ir::BlockArg::Value(truth)]);
-
-    fb.switch_to_block(miss_block);
-    fb.ins().jump(done_block, &[ir::BlockArg::Value(zero_i32)]);
-
-    fb.switch_to_block(done_block);
-    SoacValue::i32(fb.block_params(done_block)[0], IntFacts::i32_bool01())
 }
 
 fn emit_exact_function_id_match_bool01(
@@ -18700,40 +18587,6 @@ fn emit_typed_direct_call_guard_test_value_with_local_env(
         TypedDirectCallGuardTestKind::RuntimeFunctionId { function_id } => {
             emit_exact_function_id_match_bool01(fb, raw_value, *function_id, emit_ctx, codegen_env)?
         }
-        TypedDirectCallGuardTestKind::ExactCallableTypeVersion {
-            owner_type_ref,
-            type_version,
-        } => {
-            let owner_type_ref = reloc_type_ref_from_typed_attr_owner_ref(owner_type_ref)
-                .ok_or_else(|| "invalid typed callable guard owner type ref".to_string())?;
-            match emit_type_ptr_value_for_ref(fb, codegen_env, emit_ctx, &owner_type_ref)? {
-                Some(expected_type) => emit_exact_callable_type_version_match_bool01(
-                    fb,
-                    raw_value,
-                    expected_type,
-                    *type_version,
-                    emit_ctx,
-                ),
-                None => emit_i32_bool01_const(fb, false, emit_ctx),
-            }
-        }
-        TypedDirectCallGuardTestKind::ExactReceiverTypeVersion {
-            owner_type_ref,
-            type_version,
-        } => {
-            let owner_type_ref = reloc_type_ref_from_typed_attr_owner_ref(owner_type_ref)
-                .ok_or_else(|| "invalid typed receiver guard owner type ref".to_string())?;
-            match emit_type_ptr_value_for_ref(fb, codegen_env, emit_ctx, &owner_type_ref)? {
-                Some(expected_type) => emit_exact_receiver_type_version_match_bool01(
-                    fb,
-                    raw_value,
-                    expected_type,
-                    *type_version,
-                    emit_ctx,
-                ),
-                None => emit_i32_bool01_const(fb, false, emit_ctx),
-            }
-        }
     };
 
     if ownership.is_owned() {
@@ -18767,90 +18620,6 @@ fn emit_codegen_direct_function_id_guard_test_value_with_local_env(
     let (raw_value, ownership, facts) = value.expect_pyobject("direct function-id guard input");
     let guard =
         emit_exact_function_id_match_bool01(fb, raw_value, op.function_id, emit_ctx, codegen_env)?;
-    if ownership.is_owned() {
-        emit_release_owned_pyobject(fb, raw_value, Some(facts), emit_ctx);
-    }
-    Ok(guard)
-}
-
-fn emit_codegen_direct_callable_type_version_guard_test_value_with_local_env(
-    fb: &mut FunctionBuilder<'_>,
-    op: &DirectCallableTypeVersionGuardTest<InstrCodegen>,
-    local_env: &mut LocalEnv,
-    emit_ctx: &JitEmitCtx<'_>,
-    codegen_env: &mut impl JitCodegenEnv,
-    func_imports: &mut FuncBuildImports<'_>,
-) -> Result<SoacValue, String> {
-    let value_is_borrowed = codegen_expr_pyobject_input_is_borrowed_from_local_env(
-        op.value.as_ref(),
-        local_env,
-        emit_ctx,
-    );
-    let value = emit_codegen_expr_value_with_local_env(
-        fb,
-        op.value.as_ref(),
-        local_env,
-        emit_ctx,
-        value_is_borrowed,
-        codegen_env,
-        func_imports,
-    );
-    let (raw_value, ownership, facts) =
-        value.expect_pyobject("direct callable type-version guard input");
-    let owner_type_ref = reloc_type_ref_from_typed_attr_owner_ref(&op.owner_type_ref)
-        .ok_or_else(|| "invalid direct callable guard owner type ref".to_string())?;
-    let guard = match emit_type_ptr_value_for_ref(fb, codegen_env, emit_ctx, &owner_type_ref)? {
-        Some(expected_type) => emit_exact_callable_type_version_match_bool01(
-            fb,
-            raw_value,
-            expected_type,
-            op.type_version,
-            emit_ctx,
-        ),
-        None => emit_i32_bool01_const(fb, false, emit_ctx),
-    };
-    if ownership.is_owned() {
-        emit_release_owned_pyobject(fb, raw_value, Some(facts), emit_ctx);
-    }
-    Ok(guard)
-}
-
-fn emit_codegen_direct_receiver_type_version_guard_test_value_with_local_env(
-    fb: &mut FunctionBuilder<'_>,
-    op: &DirectReceiverTypeVersionGuardTest<InstrCodegen>,
-    local_env: &mut LocalEnv,
-    emit_ctx: &JitEmitCtx<'_>,
-    codegen_env: &mut impl JitCodegenEnv,
-    func_imports: &mut FuncBuildImports<'_>,
-) -> Result<SoacValue, String> {
-    let value_is_borrowed = codegen_expr_pyobject_input_is_borrowed_from_local_env(
-        op.value.as_ref(),
-        local_env,
-        emit_ctx,
-    );
-    let value = emit_codegen_expr_value_with_local_env(
-        fb,
-        op.value.as_ref(),
-        local_env,
-        emit_ctx,
-        value_is_borrowed,
-        codegen_env,
-        func_imports,
-    );
-    let (raw_value, ownership, facts) =
-        value.expect_pyobject("direct receiver type-version guard input");
-    let owner_type_ref = reloc_type_ref_from_typed_attr_owner_ref(&op.owner_type_ref)
-        .ok_or_else(|| "invalid direct receiver guard owner type ref".to_string())?;
-    let guard = match emit_type_ptr_value_for_ref(fb, codegen_env, emit_ctx, &owner_type_ref)? {
-        Some(expected_type) => emit_exact_receiver_type_version_match_bool01(
-            fb,
-            raw_value,
-            expected_type,
-            op.type_version,
-            emit_ctx,
-        ),
-        None => emit_i32_bool01_const(fb, false, emit_ctx),
-    };
     if ownership.is_owned() {
         emit_release_owned_pyobject(fb, raw_value, Some(facts), emit_ctx);
     }
@@ -21602,28 +21371,6 @@ fn emit_codegen_term(
                         func_imports,
                     )?
                     .expect_i32_bool01("direct function-id guard")
-                }
-                InstrCodegen::DirectCallableTypeVersionGuardTest(guard) => {
-                    emit_codegen_direct_callable_type_version_guard_test_value_with_local_env(
-                        fb,
-                        guard,
-                        local_env,
-                        emit_ctx,
-                        codegen_env,
-                        func_imports,
-                    )?
-                    .expect_i32_bool01("direct callable type-version guard")
-                }
-                InstrCodegen::DirectReceiverTypeVersionGuardTest(guard) => {
-                    emit_codegen_direct_receiver_type_version_guard_test_value_with_local_env(
-                        fb,
-                        guard,
-                        local_env,
-                        emit_ctx,
-                        codegen_env,
-                        func_imports,
-                    )?
-                    .expect_i32_bool01("direct receiver type-version guard")
                 }
                 _ => {
                     let is_true_ref =

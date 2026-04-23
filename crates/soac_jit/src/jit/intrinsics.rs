@@ -1398,14 +1398,10 @@ pub(super) fn emit_operation<'fb>(
 ) -> Option<ir::Value> {
     match operation {
         InstrCodegen::CalleeFunctionId(_) => None,
-        InstrCodegen::DirectFunctionIdGuardTest(_)
-        | InstrCodegen::DirectCallableTypeVersionGuardTest(_)
-        | InstrCodegen::DirectReceiverTypeVersionGuardTest(_) => None,
+        InstrCodegen::DirectFunctionIdGuardTest(_) => None,
         InstrCodegen::Tuple(_) => None,
         InstrCodegen::Call(_) => None,
         InstrCodegen::CallDirect(_) => None,
-        InstrCodegen::DirectCallableCall(_) => None,
-        InstrCodegen::DirectMethodCall(_) => None,
         InstrCodegen::BinOp(op) => Some(emit_counted_binop(op, state)),
         InstrCodegen::UnaryOp(op) => Some(emit_unary_op(op.kind, state, &[op.operand.as_ref()])),
         InstrCodegen::GetAttr(op) => {

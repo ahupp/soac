@@ -130,17 +130,9 @@ pub enum InstrCodegenOp {
     UnaryOp(#[rkyv(omit_bounds)] UnaryOp<Self>),
     CalleeFunctionId(#[rkyv(omit_bounds)] CalleeFunctionId<Self>),
     DirectFunctionIdGuardTest(#[rkyv(omit_bounds)] DirectFunctionIdGuardTest<Self>),
-    DirectCallableTypeVersionGuardTest(
-        #[rkyv(omit_bounds)] DirectCallableTypeVersionGuardTest<Self>,
-    ),
-    DirectReceiverTypeVersionGuardTest(
-        #[rkyv(omit_bounds)] DirectReceiverTypeVersionGuardTest<Self>,
-    ),
     Tuple(#[rkyv(omit_bounds)] Tuple<Self>),
     Call(#[rkyv(omit_bounds)] Call<Self>),
     CallDirect(#[rkyv(omit_bounds)] CallDirect<Self>),
-    DirectCallableCall(#[rkyv(omit_bounds)] TypedDirectCallableCall<Self>),
-    DirectMethodCall(#[rkyv(omit_bounds)] TypedDirectMethodCall<Self>),
     GetAttr(#[rkyv(omit_bounds)] GetAttr<Self>),
     SetAttr(#[rkyv(omit_bounds)] SetAttr<Self>),
     GetItem(#[rkyv(omit_bounds)] GetItem<Self>),
@@ -166,22 +158,6 @@ define_instr! {
     pub struct DirectFunctionIdGuardTest<E> {
         value: Box<E>,
         function_id: RuntimeFunctionId,
-    }
-}
-
-define_instr! {
-    pub struct DirectCallableTypeVersionGuardTest<E> {
-        value: Box<E>,
-        owner_type_ref: TypedAttrOwnerRef,
-        type_version: u32,
-    }
-}
-
-define_instr! {
-    pub struct DirectReceiverTypeVersionGuardTest<E> {
-        value: Box<E>,
-        owner_type_ref: TypedAttrOwnerRef,
-        type_version: u32,
     }
 }
 
@@ -1101,17 +1077,7 @@ where
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TypedDirectCallGuardTestKind {
-    RuntimeFunctionId {
-        function_id: RuntimeFunctionId,
-    },
-    ExactCallableTypeVersion {
-        owner_type_ref: TypedAttrOwnerRef,
-        type_version: u32,
-    },
-    ExactReceiverTypeVersion {
-        owner_type_ref: TypedAttrOwnerRef,
-        type_version: u32,
-    },
+    RuntimeFunctionId { function_id: RuntimeFunctionId },
 }
 
 define_ruff_instr! {

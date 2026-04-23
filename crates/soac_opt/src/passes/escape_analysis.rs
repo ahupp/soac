@@ -347,20 +347,6 @@ fn summarize_constructor_allocation_uses_in_block(
                 current_body = target.body.as_slice();
                 current_term = &target.term;
             }
-            BlockTerm::IfTerm(term)
-                if direct_receiver_type_guard_uses_alias(&term.test, &aliases)
-                    && normal_predecessor_counts.get(&term.then_label).copied() == Some(1) =>
-            {
-                if !visited_jump_targets.insert(term.then_label) {
-                    return None;
-                }
-                let target = block_by_label.get(&term.then_label)?;
-                if !target.params.is_empty() {
-                    return None;
-                }
-                current_body = target.body.as_slice();
-                current_term = &target.term;
-            }
             _ => {
                 if !record_allowed_constructor_local_use_in_term(
                     module,
@@ -403,16 +389,6 @@ fn normal_predecessor_counts(
         }
     }
     counts
-}
-
-fn direct_receiver_type_guard_uses_alias(
-    instr: &InstrCodegen,
-    aliases: &HashSet<LocalLocation>,
-) -> bool {
-    let InstrCodegenOp::DirectReceiverTypeVersionGuardTest(test) = instr else {
-        return false;
-    };
-    is_local_alias_load(&test.value, aliases)
 }
 
 fn record_allowed_constructor_local_use_in_term(

@@ -13,8 +13,7 @@ use soac_core::block_py::{
 use soac_lowering::block_py::counters::IncrementCounter;
 #[allow(unused_imports)]
 use soac_lowering::passes::{
-    CodegenModuleShape, DirectCallableTypeVersionGuardTest, DirectFunctionIdGuardTest,
-    DirectReceiverTypeVersionGuardTest, InstrCodegen, InstrCodegenOp, InstrResolved,
+    CodegenModuleShape, DirectFunctionIdGuardTest, InstrCodegen, InstrCodegenOp, InstrResolved,
     TypedAttrAccessPlan, TypedCall, TypedCallAccessPlan, TypedCallEmissionPlan,
     TypedCallEmissionPlans, TypedDirectCallArgPlan, TypedDirectCallArgSource,
     TypedDirectCallGuardTest, TypedDirectCallGuardTestKind, TypedDirectCallableCall,
@@ -314,42 +313,10 @@ impl MapInstr<InstrCodegen, InstrTyped> for CodegenToTyped {
                     .with_meta(meta),
                 )
             }
-            InstrCodegenOp::DirectCallableTypeVersionGuardTest(op) => {
-                let meta = op.meta();
-                InstrTyped::DirectCallGuardTest(
-                    TypedDirectCallGuardTest::new(
-                        self.map_instr(*op.value),
-                        TypedDirectCallGuardTestKind::ExactCallableTypeVersion {
-                            owner_type_ref: op.owner_type_ref,
-                            type_version: op.type_version,
-                        },
-                    )
-                    .with_meta(meta),
-                )
-            }
-            InstrCodegenOp::DirectReceiverTypeVersionGuardTest(op) => {
-                let meta = op.meta();
-                InstrTyped::DirectCallGuardTest(
-                    TypedDirectCallGuardTest::new(
-                        self.map_instr(*op.value),
-                        TypedDirectCallGuardTestKind::ExactReceiverTypeVersion {
-                            owner_type_ref: op.owner_type_ref,
-                            type_version: op.type_version,
-                        },
-                    )
-                    .with_meta(meta),
-                )
-            }
             InstrCodegenOp::Call(op) => {
                 InstrTyped::CallTyped(TypedCall::from_legacy(op.map_children(self)))
             }
             InstrCodegenOp::CallDirect(op) => InstrTyped::LegacyCallDirect(op.map_children(self)),
-            InstrCodegenOp::DirectCallableCall(op) => {
-                InstrTyped::DirectCallableCallTyped(op.map_children(self))
-            }
-            InstrCodegenOp::DirectMethodCall(op) => {
-                InstrTyped::DirectMethodCallTyped(op.map_children(self))
-            }
             InstrCodegenOp::GetAttr(op) => {
                 InstrTyped::GetAttrTyped(TypedGetAttr::from_legacy(op.map_children(self)))
             }
@@ -1262,28 +1229,6 @@ impl TryMapInstr<InstrTyped, InstrCodegen, String> for TypedToCodegen {
                             .with_meta(meta),
                         )
                     }
-                    TypedDirectCallGuardTestKind::ExactReceiverTypeVersion {
-                        owner_type_ref,
-                        type_version,
-                    } => InstrCodegenOp::DirectReceiverTypeVersionGuardTest(
-                        DirectReceiverTypeVersionGuardTest::new(
-                            self.try_map_instr(*op.value)?,
-                            owner_type_ref,
-                            type_version,
-                        )
-                        .with_meta(meta),
-                    ),
-                    TypedDirectCallGuardTestKind::ExactCallableTypeVersion {
-                        owner_type_ref,
-                        type_version,
-                    } => InstrCodegenOp::DirectCallableTypeVersionGuardTest(
-                        DirectCallableTypeVersionGuardTest::new(
-                            self.try_map_instr(*op.value)?,
-                            owner_type_ref,
-                            type_version,
-                        )
-                        .with_meta(meta),
-                    ),
                 }
             }
             InstrTyped::CallTyped(op) => {
@@ -1297,8 +1242,10 @@ impl TryMapInstr<InstrTyped, InstrCodegen, String> for TypedToCodegen {
             InstrTyped::GuardedMethodCallTyped(_) => {
                 return Err("typed guarded method call requires typed codegen emission".to_string());
             }
-            InstrTyped::DirectCallableCallTyped(op) => {
-                InstrCodegenOp::DirectCallableCall(op.try_map_children(self)?)
+            InstrTyped::DirectCallableCallTyped(_) => {
+                return Err(
+                    "typed direct callable call requires typed codegen emission".to_string()
+                );
             }
             InstrTyped::DirectMethodCallTyped(_) => {
                 return Err("typed direct method call requires typed codegen emission".to_string());
@@ -2171,42 +2118,6 @@ def caller(a):\n    return add(a)\n",
             ),
             "function-id direct-call guards should lower to the codegen guard representation"
         );
-
-        let receiver_guard = InstrTyped::DirectCallGuardTest(TypedDirectCallGuardTest::new(
-            runtime_name_load::<InstrTyped>("NONE"),
-            TypedDirectCallGuardTestKind::ExactReceiverTypeVersion {
-                owner_type_ref: TypedAttrOwnerRef::TypeKey {
-                    module_name: "__main__".to_string(),
-                    qualname: "Receiver".to_string(),
-                },
-                type_version: 1,
-            },
-        ));
-        assert!(
-            matches!(
-                try_lower_typed_instr_to_codegen_legacy(receiver_guard),
-                Ok(InstrCodegen::DirectReceiverTypeVersionGuardTest(_))
-            ),
-            "receiver type-version direct-call guards should lower to the codegen guard representation"
-        );
-
-        let non_function_guard = InstrTyped::DirectCallGuardTest(TypedDirectCallGuardTest::new(
-            runtime_name_load::<InstrTyped>("NONE"),
-            TypedDirectCallGuardTestKind::ExactCallableTypeVersion {
-                owner_type_ref: TypedAttrOwnerRef::TypeKey {
-                    module_name: "__main__".to_string(),
-                    qualname: "Callable".to_string(),
-                },
-                type_version: 1,
-            },
-        ));
-        assert!(
-            matches!(
-                try_lower_typed_instr_to_codegen_legacy(non_function_guard),
-                Ok(InstrCodegen::DirectCallableTypeVersionGuardTest(_))
-            ),
-            "callable type-version direct-call guards should lower to the codegen guard representation"
-        );
     }
 
     #[test]
@@ -2234,11 +2145,8 @@ def caller(a):\n    return add(a)\n",
             counter.loads + counter.direct_callable_calls
         );
         assert!(
-            matches!(
-                try_lower_typed_instr_to_codegen_legacy(direct_call),
-                Ok(InstrCodegen::DirectCallableCall(_))
-            ),
-            "typed direct callable calls should lower to the codegen direct-callable representation"
+            try_lower_typed_instr_to_codegen_legacy(direct_call).is_err(),
+            "typed direct callable calls should not silently lower through the legacy adapter"
         );
     }
 
