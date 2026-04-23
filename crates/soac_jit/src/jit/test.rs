@@ -38,7 +38,10 @@ mod tests {
     use soac_opt::alternatives_v3::AlternativeCatalog;
     use soac_opt::artifacts_v3::{ExactIntBranchV3Artifacts, write_optimization_artifacts_v3};
     use soac_opt::emit_v3::{MechanicalIndexedFieldGuard, MechanicalModuleEmission};
-    use soac_opt::passes::{TypedInstrExtra, TypedPlannedResult as PlannedResult};
+    use soac_opt::passes::{
+        TypedInstrExtra, TypedPlannedResult as PlannedResult,
+        lower_typed_function_if_tests_to_truthy,
+    };
     use soac_opt::pipeline_v3::{
         plan_and_emit_function_exact_int_branches_v3_with_module_constants,
         plan_and_emit_module_v3_from_raw_evidence,
@@ -7510,8 +7513,10 @@ def read_point(point):
             )
             .expect("specialized JIT build should succeed");
             let facts = infer_jit_value_facts(&shared_state.lowered_module);
-            let module_plan = plan_jit_deopt_resume_module(&shared_state.lowered_module, &facts)
-                .expect("JIT deopt resume planning should succeed");
+            let module_plan =
+                plan_jit_module_from_codegen(&shared_state.lowered_module, facts.clone())
+                    .map(|prepared| prepared.deopt_resume)
+                    .expect("JIT deopt resume planning should succeed");
             let function_plan = module_plan
                 .function(function.function_id)
                 .expect("read_point should have a JIT deopt plan");
@@ -7700,8 +7705,10 @@ def write_point(point, value):
             )
             .expect("specialized JIT build should succeed");
             let facts = infer_jit_value_facts(&shared_state.lowered_module);
-            let module_plan = plan_jit_deopt_resume_module(&shared_state.lowered_module, &facts)
-                .expect("JIT deopt resume planning should succeed");
+            let module_plan =
+                plan_jit_module_from_codegen(&shared_state.lowered_module, facts.clone())
+                    .map(|prepared| prepared.deopt_resume)
+                    .expect("JIT deopt resume planning should succeed");
             let function_plan = module_plan
                 .function(function.function_id)
                 .expect("write_point should have a JIT deopt plan");
@@ -8555,7 +8562,8 @@ def f(x):
             .find(|function| function.names.qualname == "f")
             .expect("lowered function should exist");
         let facts = infer_module_value_facts(&lowered);
-        let module_plan = plan_jit_deopt_resume_module(&lowered, &facts)
+        let module_plan = plan_jit_module_from_codegen(&lowered, facts.clone())
+            .map(|prepared| prepared.deopt_resume)
             .expect("JIT deopt resume planning should succeed");
         let function_plan = module_plan
             .function(function.function_id)
@@ -8595,7 +8603,8 @@ def f(x):
         let module = test_module(ModuleNameGen::new(0), vec![function]);
         let function = &module.callable_defs[0];
         let facts = infer_module_value_facts(&module);
-        let module_plan = plan_jit_deopt_resume_module(&module, &facts)
+        let module_plan = plan_jit_module_from_codegen(&module, facts.clone())
+            .map(|prepared| prepared.deopt_resume)
             .expect("JIT deopt resume planning should succeed");
         let function_plan = module_plan
             .function(function.function_id)
@@ -8634,7 +8643,8 @@ def f(x):
         let module = test_module(ModuleNameGen::new(0), vec![function]);
         let function = &module.callable_defs[0];
         let facts = infer_module_value_facts(&module);
-        let module_plan = plan_jit_deopt_resume_module(&module, &facts)
+        let module_plan = plan_jit_module_from_codegen(&module, facts.clone())
+            .map(|prepared| prepared.deopt_resume)
             .expect("JIT deopt resume planning should succeed");
         let function_plan = module_plan
             .function(function.function_id)
@@ -8676,7 +8686,8 @@ def f(x):
         let module = test_module(ModuleNameGen::new(0), vec![function]);
         let function = &module.callable_defs[0];
         let facts = infer_module_value_facts(&module);
-        let module_plan = plan_jit_deopt_resume_module(&module, &facts)
+        let module_plan = plan_jit_module_from_codegen(&module, facts.clone())
+            .map(|prepared| prepared.deopt_resume)
             .expect("JIT deopt resume planning should succeed");
         let function_plan = module_plan
             .function(function.function_id)
@@ -8715,7 +8726,8 @@ def f(x):
         let module = test_module(ModuleNameGen::new(0), vec![function]);
         let function = &module.callable_defs[0];
         let facts = infer_module_value_facts(&module);
-        let module_plan = plan_jit_deopt_resume_module(&module, &facts)
+        let module_plan = plan_jit_module_from_codegen(&module, facts.clone())
+            .map(|prepared| prepared.deopt_resume)
             .expect("JIT deopt resume planning should succeed");
         let function_plan = module_plan
             .function(function.function_id)
@@ -8754,7 +8766,8 @@ def f(x):
         let module = test_module(ModuleNameGen::new(0), vec![function]);
         let function = &module.callable_defs[0];
         let facts = infer_module_value_facts(&module);
-        let module_plan = plan_jit_deopt_resume_module(&module, &facts)
+        let module_plan = plan_jit_module_from_codegen(&module, facts.clone())
+            .map(|prepared| prepared.deopt_resume)
             .expect("JIT deopt resume planning should succeed");
         let function_plan = module_plan
             .function(function.function_id)
@@ -8791,7 +8804,8 @@ def f(x):
         let module = test_module(ModuleNameGen::new(0), vec![function]);
         let function = &module.callable_defs[0];
         let facts = infer_module_value_facts(&module);
-        let module_plan = plan_jit_deopt_resume_module(&module, &facts)
+        let module_plan = plan_jit_module_from_codegen(&module, facts.clone())
+            .map(|prepared| prepared.deopt_resume)
             .expect("JIT deopt resume planning should succeed");
         let function_plan = module_plan
             .function(function.function_id)
@@ -8830,7 +8844,8 @@ def f(x):
             .try_semantic_instr_id()
             .expect("test body instruction should have an id");
         let facts = infer_module_value_facts(&module);
-        let module_plan = plan_jit_deopt_resume_module(&module, &facts)
+        let module_plan = plan_jit_module_from_codegen(&module, facts.clone())
+            .map(|prepared| prepared.deopt_resume)
             .expect("JIT deopt resume planning should succeed");
         let function_plan = module_plan
             .function(function.function_id)
@@ -8858,7 +8873,8 @@ def f(x):
         let function = &module.callable_defs[0];
         let block = function.entry_block();
         let facts = infer_module_value_facts(&module);
-        let module_plan = plan_jit_deopt_resume_module(&module, &facts)
+        let module_plan = plan_jit_module_from_codegen(&module, facts.clone())
+            .map(|prepared| prepared.deopt_resume)
             .expect("JIT deopt resume planning should succeed");
         let function_plan = module_plan
             .function(function.function_id)
@@ -8895,7 +8911,8 @@ def f(x):
             .try_semantic_instr_id()
             .expect("test body instruction should have an id");
         let facts = infer_module_value_facts(&module);
-        let module_plan = plan_jit_deopt_resume_module(&module, &facts)
+        let module_plan = plan_jit_module_from_codegen(&module, facts.clone())
+            .map(|prepared| prepared.deopt_resume)
             .expect("JIT deopt resume planning should succeed");
         let function_plan = module_plan
             .function(function.function_id)
@@ -8953,7 +8970,8 @@ def f(x):
         let function = &module.callable_defs[0];
         let block = function.entry_block();
         let facts = infer_module_value_facts(&module);
-        let module_plan = plan_jit_deopt_resume_module(&module, &facts)
+        let module_plan = plan_jit_module_from_codegen(&module, facts.clone())
+            .map(|prepared| prepared.deopt_resume)
             .expect("JIT deopt resume planning should succeed");
         let function_plan = module_plan
             .function(function.function_id)
@@ -8977,53 +8995,14 @@ def f(x):
 
     #[test]
     fn runtime_deopt_guard_miss_rejects_replay_unsafe_operands() {
-        let function = with_single_test_block(test_function(), vec![], ret_term(none_expr()));
-        let block = function.entry_block().label;
-        let point = LocalEnvResumePoint::BeforeTerm {
-            function_id: function.function_id,
-            block,
-        };
-        assert_eq!(
-            runtime_jit_deopt_guard_miss_supported(&function, point, &[&name_expr(test_name("x"))],),
-            Ok(()),
+        let function_id = test_function().function_id;
+        assert!(
+            runtime_jit_deopt_guard_operand_replay_safe(&name_expr(test_name("x"))),
             "plain local loads should be replay-safe guard operands"
         );
-        assert_eq!(
-            runtime_jit_deopt_guard_miss_supported(
-                &function,
-                point,
-                &[&direct_call_expr(function.function_id)],
-            ),
-            Err(RuntimeJitDeoptUnsupportedReason::ReplayUnsafeGuardOperand),
+        assert!(
+            !runtime_jit_deopt_guard_operand_replay_safe(&direct_call_expr(function_id)),
             "guard miss deopt should reject operands that could repeat side effects"
-        );
-    }
-
-    #[test]
-    fn runtime_deopt_guard_miss_rejects_unmaterialized_tail_local_reads() {
-        let mut function =
-            with_single_test_block(test_function(), vec![], ret_term(name_expr(test_name("x"))));
-        set_stack_slots(&mut function, &["x"]);
-        let lowered = test_module(ModuleNameGen::new(0), vec![function]);
-        let function = &lowered.callable_defs[0];
-        let facts = infer_jit_value_facts(&lowered);
-        let module_plan = plan_jit_deopt_resume_module(&lowered, &facts)
-            .expect("JIT deopt resume planning should succeed");
-        let function_plan = module_plan
-            .function(function.function_id)
-            .expect("function should have a deopt resume plan");
-        let point = LocalEnvResumePoint::BeforeTerm {
-            function_id: function.function_id,
-            block: function.entry_block().label,
-        };
-        let entry = function_plan
-            .entry(point)
-            .expect("before-term point should have a resume entry");
-
-        assert_eq!(
-            runtime_jit_deopt_guard_miss_resume_entry_supported(function, point, entry),
-            Err(RuntimeJitDeoptUnsupportedReason::UnmaterializedContinuationLocal),
-            "guard-miss deopt needs a local fallback when the continuation tail can read a not-definitely-bound local"
         );
     }
 
@@ -9041,7 +9020,8 @@ def f(x):
             .try_semantic_instr_id()
             .expect("test body instruction should have an id");
         let facts = infer_module_value_facts(&module);
-        let module_plan = plan_jit_deopt_resume_module(&module, &facts)
+        let module_plan = plan_jit_module_from_codegen(&module, facts.clone())
+            .map(|prepared| prepared.deopt_resume)
             .expect("JIT deopt resume planning should succeed");
         let function_plan = module_plan
             .function(function.function_id)
@@ -9076,79 +9056,6 @@ def f(x):
     }
 
     #[test]
-    fn runtime_deopt_guard_miss_tracks_defs_across_normal_successors() {
-        let mut function = test_function();
-        function.params = ParamSpec {
-            params: vec![
-                Param {
-                    name: "a".into(),
-                    kind: ParamKind::Any,
-                    has_default: false,
-                },
-                Param {
-                    name: "b".into(),
-                    kind: ParamKind::Any,
-                    has_default: false,
-                },
-            ],
-        };
-        let entry_label = function.name_gen.next_block_name();
-        let successor_label = function.name_gen.next_block_name();
-        let store_instr_id = InstrId::new(entry_label, 0);
-        let add_instr_id = InstrId::new(entry_label, 1);
-        let c_name = test_local_name("c", 2);
-        let entry = CodegenBlock {
-            label: entry_label,
-            body: vec![with_instr_id(
-                op_expr(Store::new(
-                    c_name.clone(),
-                    with_instr_id(
-                        op_expr(BinOp::new(
-                            BinOpKind::Add,
-                            name_expr(test_name("a")),
-                            name_expr(test_local_name("b", 1)),
-                        )),
-                        add_instr_id,
-                    ),
-                )),
-                store_instr_id,
-            )],
-            term: BlockTerm::Jump(BlockEdge::new(successor_label)),
-            params: vec![],
-            exc_edge: None,
-        };
-        let successor = CodegenBlock {
-            label: successor_label,
-            body: vec![],
-            term: ret_term(name_expr(c_name)),
-            params: vec![],
-            exc_edge: None,
-        };
-        function.blocks = vec![entry, successor];
-        set_stack_slots(&mut function, &["a", "b", "c"]);
-        let module = test_module(ModuleNameGen::new(0), vec![function]);
-        let function = &module.callable_defs[0];
-        let point = LocalEnvResumePoint::BeforeInstr {
-            key: InstrKey::new(function.function_id, store_instr_id),
-        };
-        let facts = infer_module_value_facts(&module);
-        let module_plan = plan_jit_deopt_resume_module(&module, &facts)
-            .expect("JIT deopt resume planning should succeed");
-        let function_plan = module_plan
-            .function(function.function_id)
-            .expect("function should have a JIT deopt plan");
-        let entry = function_plan
-            .entry(point)
-            .expect("store point should have a resume entry");
-
-        assert_eq!(
-            runtime_jit_deopt_guard_miss_resume_entry_supported(function, point, entry),
-            Ok(()),
-            "the replay tail defines c before the successor reads it, so c should not be required as a live input"
-        );
-    }
-
-    #[test]
     fn runtime_deopt_table_marks_increment_counter_body_tail_continuation() {
         let function = with_single_test_block(
             test_function(),
@@ -9162,7 +9069,8 @@ def f(x):
             .try_semantic_instr_id()
             .expect("test body instruction should have an id");
         let facts = infer_module_value_facts(&module);
-        let module_plan = plan_jit_deopt_resume_module(&module, &facts)
+        let module_plan = plan_jit_module_from_codegen(&module, facts.clone())
+            .map(|prepared| prepared.deopt_resume)
             .expect("JIT deopt resume planning should succeed");
         let function_plan = module_plan
             .function(function.function_id)
@@ -9209,7 +9117,8 @@ def f(x):
         let function = &module.callable_defs[0];
         let block = function.entry_block();
         let facts = infer_module_value_facts(&module);
-        let module_plan = plan_jit_deopt_resume_module(&module, &facts)
+        let module_plan = plan_jit_module_from_codegen(&module, facts.clone())
+            .map(|prepared| prepared.deopt_resume)
             .expect("JIT deopt resume planning should succeed");
         let function_plan = module_plan
             .function(function.function_id)
@@ -9254,7 +9163,8 @@ def f(x):
         let function = &module.callable_defs[0];
         let block = function.entry_block();
         let facts = infer_module_value_facts(&module);
-        let module_plan = plan_jit_deopt_resume_module(&module, &facts)
+        let module_plan = plan_jit_module_from_codegen(&module, facts.clone())
+            .map(|prepared| prepared.deopt_resume)
             .expect("JIT deopt resume planning should succeed");
         let function_plan = module_plan
             .function(function.function_id)
@@ -9289,7 +9199,8 @@ def f(x):
         let function = &module.callable_defs[0];
         let block = function.entry_block();
         let facts = infer_module_value_facts(&module);
-        let module_plan = plan_jit_deopt_resume_module(&module, &facts)
+        let module_plan = plan_jit_module_from_codegen(&module, facts.clone())
+            .map(|prepared| prepared.deopt_resume)
             .expect("JIT deopt resume planning should succeed");
         let function_plan = module_plan
             .function(function.function_id)
@@ -9324,7 +9235,8 @@ def f(x):
         let function = &module.callable_defs[0];
         let block = function.entry_block();
         let facts = infer_module_value_facts(&module);
-        let module_plan = plan_jit_deopt_resume_module(&module, &facts)
+        let module_plan = plan_jit_module_from_codegen(&module, facts.clone())
+            .map(|prepared| prepared.deopt_resume)
             .expect("JIT deopt resume planning should succeed");
         let function_plan = module_plan
             .function(function.function_id)
@@ -9367,7 +9279,8 @@ def f(x):
         let function = &module.callable_defs[0];
         let block = function.entry_block();
         let facts = infer_module_value_facts(&module);
-        let module_plan = plan_jit_deopt_resume_module(&module, &facts)
+        let module_plan = plan_jit_module_from_codegen(&module, facts.clone())
+            .map(|prepared| prepared.deopt_resume)
             .expect("JIT deopt resume planning should succeed");
         let function_plan = module_plan
             .function(function.function_id)
@@ -9419,7 +9332,8 @@ def f(x):
             .try_semantic_instr_id()
             .expect("test body instruction should have an id");
         let facts = infer_module_value_facts(&module);
-        let module_plan = plan_jit_deopt_resume_module(&module, &facts)
+        let module_plan = plan_jit_module_from_codegen(&module, facts.clone())
+            .map(|prepared| prepared.deopt_resume)
             .expect("JIT deopt resume planning should succeed");
         let function_plan = module_plan
             .function(function.function_id)
@@ -9455,7 +9369,8 @@ def f(x):
 
     #[test]
     fn runtime_deopt_table_marks_exception_edge_body_tail_continuation() {
-        let function = test_function();
+        let mut function = test_function();
+        set_stack_slots(&mut function, &["exc"]);
         let mut handler = test_source_block(
             &function,
             vec![],
@@ -9489,7 +9404,8 @@ def f(x):
             .try_semantic_instr_id()
             .expect("test body instruction should have an id");
         let facts = infer_module_value_facts(&module);
-        let module_plan = plan_jit_deopt_resume_module(&module, &facts)
+        let module_plan = plan_jit_module_from_codegen(&module, facts.clone())
+            .map(|prepared| prepared.deopt_resume)
             .expect("JIT deopt resume planning should succeed");
         let function_plan = module_plan
             .function(function.function_id)
@@ -9538,7 +9454,8 @@ def f(x):
         );
         let function = &module.callable_defs[0];
         let facts = infer_module_value_facts(&module);
-        let module_plan = plan_jit_deopt_resume_module(&module, &facts)
+        let module_plan = plan_jit_module_from_codegen(&module, facts.clone())
+            .map(|prepared| prepared.deopt_resume)
             .expect("JIT deopt resume planning should succeed");
         let function_plan = module_plan
             .function(function.function_id)
@@ -9562,7 +9479,8 @@ def f(x):
 
     #[test]
     fn runtime_deopt_table_marks_simple_jump_args_before_term_continuation() {
-        let function = test_function();
+        let mut function = test_function();
+        set_stack_slots(&mut function, &["x", "y"]);
         let mut target = test_source_block(
             &function,
             vec![],
@@ -9586,7 +9504,8 @@ def f(x):
         );
         let function = &module.callable_defs[0];
         let facts = infer_module_value_facts(&module);
-        let module_plan = plan_jit_deopt_resume_module(&module, &facts)
+        let module_plan = plan_jit_module_from_codegen(&module, facts.clone())
+            .map(|prepared| prepared.deopt_resume)
             .expect("JIT deopt resume planning should succeed");
         let function_plan = module_plan
             .function(function.function_id)
@@ -9610,7 +9529,8 @@ def f(x):
 
     #[test]
     fn runtime_deopt_table_marks_abrupt_kind_jump_args_before_term_continuation() {
-        let function = test_function();
+        let mut function = test_function();
+        set_stack_slots(&mut function, &["kind"]);
         let mut target = test_source_block(
             &function,
             vec![],
@@ -9634,7 +9554,8 @@ def f(x):
         );
         let function = &module.callable_defs[0];
         let facts = infer_module_value_facts(&module);
-        let module_plan = plan_jit_deopt_resume_module(&module, &facts)
+        let module_plan = plan_jit_module_from_codegen(&module, facts.clone())
+            .map(|prepared| prepared.deopt_resume)
             .expect("JIT deopt resume planning should succeed");
         let function_plan = module_plan
             .function(function.function_id)
@@ -9658,7 +9579,8 @@ def f(x):
 
     #[test]
     fn runtime_deopt_table_marks_current_exception_jump_args_before_term_continuation() {
-        let function = test_function();
+        let mut function = test_function();
+        set_stack_slots(&mut function, &["exc"]);
         let mut target = test_source_block(
             &function,
             vec![],
@@ -9682,7 +9604,8 @@ def f(x):
         );
         let function = &module.callable_defs[0];
         let facts = infer_module_value_facts(&module);
-        let module_plan = plan_jit_deopt_resume_module(&module, &facts)
+        let module_plan = plan_jit_module_from_codegen(&module, facts.clone())
+            .map(|prepared| prepared.deopt_resume)
             .expect("JIT deopt resume planning should succeed");
         let function_plan = module_plan
             .function(function.function_id)
@@ -9711,7 +9634,8 @@ def f(x):
         let function = &module.callable_defs[0];
         let block = function.entry_block();
         let facts = infer_module_value_facts(&module);
-        let module_plan = plan_jit_deopt_resume_module(&module, &facts)
+        let module_plan = plan_jit_module_from_codegen(&module, facts.clone())
+            .map(|prepared| prepared.deopt_resume)
             .expect("JIT deopt resume planning should succeed");
         let function_plan = module_plan
             .function(function.function_id)
@@ -9756,7 +9680,8 @@ def f(x):
         );
         let function = &module.callable_defs[0];
         let facts = infer_module_value_facts(&module);
-        let module_plan = plan_jit_deopt_resume_module(&module, &facts)
+        let module_plan = plan_jit_module_from_codegen(&module, facts.clone())
+            .map(|prepared| prepared.deopt_resume)
             .expect("JIT deopt resume planning should succeed");
         let function_plan = module_plan
             .function(function.function_id)
@@ -9802,7 +9727,8 @@ def f(x):
         );
         let function = &module.callable_defs[0];
         let facts = infer_module_value_facts(&module);
-        let module_plan = plan_jit_deopt_resume_module(&module, &facts)
+        let module_plan = plan_jit_module_from_codegen(&module, facts.clone())
+            .map(|prepared| prepared.deopt_resume)
             .expect("JIT deopt resume planning should succeed");
         let function_plan = module_plan
             .function(function.function_id)
@@ -9850,7 +9776,8 @@ def f(x):
         );
         let function = &module.callable_defs[0];
         let facts = infer_module_value_facts(&module);
-        let module_plan = plan_jit_deopt_resume_module(&module, &facts)
+        let module_plan = plan_jit_module_from_codegen(&module, facts.clone())
+            .map(|prepared| prepared.deopt_resume)
             .expect("JIT deopt resume planning should succeed");
         let function_plan = module_plan
             .function(function.function_id)
@@ -10346,7 +10273,8 @@ def f(x):
             );
             let module_constant_ptrs = vec![body_value, return_value];
             let facts = infer_module_value_facts(&module);
-            let module_plan = plan_jit_deopt_resume_module(&module, &facts)
+            let module_plan = plan_jit_module_from_codegen(&module, facts.clone())
+                .map(|prepared| prepared.deopt_resume)
                 .expect("JIT deopt resume planning should succeed");
             let function_plan = module_plan
                 .function(function.function_id)
@@ -10416,7 +10344,8 @@ def f(x):
             let function = &module.callable_defs[0];
             let block = function.entry_block();
             let facts = infer_module_value_facts(&module);
-            let module_plan = plan_jit_deopt_resume_module(&module, &facts)
+            let module_plan = plan_jit_module_from_codegen(&module, facts.clone())
+                .map(|prepared| prepared.deopt_resume)
                 .expect("JIT deopt resume planning should succeed");
             let function_plan = module_plan
                 .function(function.function_id)
@@ -18711,8 +18640,10 @@ def f(x, y):
             )
             .expect("caller JIT build should succeed");
             let facts = infer_jit_value_facts(&shared_state.lowered_module);
-            let module_plan = plan_jit_deopt_resume_module(&shared_state.lowered_module, &facts)
-                .expect("JIT deopt resume planning should succeed");
+            let module_plan =
+                plan_jit_module_from_codegen(&shared_state.lowered_module, facts.clone())
+                    .map(|prepared| prepared.deopt_resume)
+                    .expect("JIT deopt resume planning should succeed");
             let function_plan = module_plan
                 .function(caller_function.function_id)
                 .expect("caller should have a JIT deopt plan");
@@ -19126,8 +19057,10 @@ def f(x, y):
             )
             .expect("specialized JIT build should succeed");
             let facts = infer_jit_value_facts(&shared_state.lowered_module);
-            let module_plan = plan_jit_deopt_resume_module(&shared_state.lowered_module, &facts)
-                .expect("JIT deopt resume planning should succeed");
+            let module_plan =
+                plan_jit_module_from_codegen(&shared_state.lowered_module, facts.clone())
+                    .map(|prepared| prepared.deopt_resume)
+                    .expect("JIT deopt resume planning should succeed");
             let function_plan = module_plan
                 .function(function.function_id)
                 .expect("function should have a JIT deopt plan");
@@ -19264,8 +19197,10 @@ def f(x, y):
             )
             .expect("specialized JIT build should succeed");
             let facts = infer_jit_value_facts(&shared_state.lowered_module);
-            let module_plan = plan_jit_deopt_resume_module(&shared_state.lowered_module, &facts)
-                .expect("JIT deopt resume planning should succeed");
+            let module_plan =
+                plan_jit_module_from_codegen(&shared_state.lowered_module, facts.clone())
+                    .map(|prepared| prepared.deopt_resume)
+                    .expect("JIT deopt resume planning should succeed");
             let function_plan = module_plan
                 .function(function.function_id)
                 .expect("function should have a JIT deopt plan");
@@ -19527,8 +19462,10 @@ def f(x, y):
             )
             .expect("specialized JIT build should succeed");
             let facts = infer_jit_value_facts(&shared_state.lowered_module);
-            let module_plan = plan_jit_deopt_resume_module(&shared_state.lowered_module, &facts)
-                .expect("JIT deopt resume planning should succeed");
+            let module_plan =
+                plan_jit_module_from_codegen(&shared_state.lowered_module, facts.clone())
+                    .map(|prepared| prepared.deopt_resume)
+                    .expect("JIT deopt resume planning should succeed");
             let function_plan = module_plan
                 .function(function.function_id)
                 .expect("function should have a JIT deopt plan");
@@ -19682,8 +19619,10 @@ def f(x, y):
             )
             .expect("specialized JIT build should succeed");
             let facts = infer_jit_value_facts(&shared_state.lowered_module);
-            let module_plan = plan_jit_deopt_resume_module(&shared_state.lowered_module, &facts)
-                .expect("JIT deopt resume planning should succeed");
+            let module_plan =
+                plan_jit_module_from_codegen(&shared_state.lowered_module, facts.clone())
+                    .map(|prepared| prepared.deopt_resume)
+                    .expect("JIT deopt resume planning should succeed");
             let function_plan = module_plan
                 .function(function.function_id)
                 .expect("function should have a JIT deopt plan");

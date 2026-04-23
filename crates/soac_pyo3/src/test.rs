@@ -2,7 +2,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyModule;
 use soac_core::block_py::FunctionKind;
 use soac_driver::codegen_cache::hash_module_source;
-use soac_jit::{module_type::indexed_module_info, plan_jit_module_locals};
+use soac_jit::{module_type::indexed_module_info, plan_jit_module_from_codegen};
 use soac_opt::passes::infer_module_value_facts;
 use std::any::Any;
 use std::collections::HashSet;
@@ -314,8 +314,9 @@ def exercise():
         .expect("missing lowered generator resume function");
     let registered_function = gen_function;
     let value_facts = infer_module_value_facts(&normalized);
-    let jit_module_local_plan =
-        plan_jit_module_locals(&normalized, &value_facts).expect("JIT local plan should validate");
+    let jit_module_local_plan = plan_jit_module_from_codegen(&normalized, value_facts)
+        .expect("JIT local plan should validate")
+        .locals;
     let jit_local_plan = jit_module_local_plan
         .function(registered_function.function_id)
         .expect("generator resume function should have a JIT local plan");

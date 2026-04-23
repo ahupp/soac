@@ -4,179 +4,38 @@ use soac_core::block_py::{
 };
 pub use soac_opt::passes::{
     BlockParamFacts, FunctionLocalPlan, LocalRefKind, ParamBindingFacts, ParamProvenance,
-    PlannedLocalBinding, PlannedLocalStorage, plan_function_locals, render_planned_local_binding,
+    PlannedLocalBinding, PlannedLocalStorage, render_planned_local_binding,
 };
 use soac_opt::passes::{
-    CodegenModuleShape, FactStore, FunctionLocalEnvResumePlan, FunctionRefcountPlan, InstrCodegen,
-    InstrTyped, LocalEnvModulePlan, LocalEnvResumeEntry, LocalEnvResumeModulePlan,
-    LocalEnvResumePoint, LocalEnvResumeStatePrecision, RefcountActionKind, RefcountPlan,
-    RefcountReleaseReason, TypedCodegenModuleShape, compute_function_local_live_ins,
-    compute_function_local_must_bound_ins, compute_typed_function_local_live_ins,
-    compute_typed_function_local_must_bound_ins, plan_local_env_module,
-    plan_local_env_resume_module, plan_ownership_effects, plan_typed_local_env_module,
+    CodegenModuleShape, FactStore, FunctionLocalEnvResumePlan, FunctionRefcountPlan, InstrTyped,
+    LocalEnvModulePlan, LocalEnvResumeEntry, LocalEnvResumeModulePlan, LocalEnvResumePoint,
+    LocalEnvResumeStatePrecision, RefcountActionKind, RefcountPlan, RefcountReleaseReason,
+    TypedCodegenModuleShape, annotate_typed_module_value_facts,
+    compute_typed_function_local_live_ins, compute_typed_function_local_must_bound_ins,
+    lower_codegen_module_to_typed, lower_typed_if_tests_to_truthy, plan_typed_local_env_module,
     plan_typed_local_env_resume_module, plan_typed_ownership_effects,
-    validate_local_env_module_plan, validate_local_env_resume_module_plan,
-    validate_ownership_effects, validate_typed_local_env_module_plan,
-    validate_typed_local_env_resume_module_plan, validate_typed_ownership_effects,
+    validate_typed_local_env_module_plan, validate_typed_local_env_resume_module_plan,
+    validate_typed_ownership_effects,
 };
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
-type CodegenBlock = Block<InstrCodegen>;
 type TypedBlock = Block<InstrTyped>;
+
+#[derive(Clone, Debug)]
+pub struct PreparedJitTypedModulePlan {
+    pub module: BlockPyModule<TypedCodegenModuleShape>,
+    pub value_facts: FactStore,
+    pub local_env_plan: LocalEnvModulePlan,
+    pub local_env_resume_plan: LocalEnvResumeModulePlan,
+    pub locals: PlannedJitModuleLocals,
+    pub deopt_resume: PlannedJitDeoptResumeModule,
+}
 
 fn can_release_via_stack_slot_fallback(name: &str) -> bool {
     name.starts_with("_dp_try_exc_")
         || name.starts_with("_dp_try_abrupt_kind_")
         || name.starts_with("_dp_try_abrupt_payload_")
-}
-
-pub fn plan_function_refcount_ownership(
-    module: &BlockPyModule<CodegenModuleShape>,
-    function: &BlockPyFunction<CodegenModuleShape>,
-    facts: &FactStore,
-) -> Result<FunctionRefcountPlan, String> {
-    let plan = plan_ownership_effects(module, facts);
-    validate_ownership_effects(module, facts, &plan)?;
-    Ok(plan
-        .function(function.function_id)
-        .cloned()
-        .unwrap_or_default())
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct CurrentJitRefcountPlanCheck {
-    pub local_rebinds: usize,
-    pub local_deletes: usize,
-    pub terminal_local_releases: usize,
-    pub normal_edge_local_releases: usize,
-    pub exception_edge_stack_slot_releases: usize,
-    pub normal_edge_release_gaps: usize,
-    pub exception_edge_release_gaps: usize,
-}
-
-impl CurrentJitRefcountPlanCheck {
-    pub fn has_edge_release_gaps(&self) -> bool {
-        self.normal_edge_release_gaps > 0 || self.exception_edge_release_gaps > 0
-    }
-}
-
-pub fn check_refcount_plan_against_current_jit(
-    function: &BlockPyFunction<CodegenModuleShape>,
-    plan: &FunctionRefcountPlan,
-) -> Result<CurrentJitRefcountPlanCheck, String> {
-    let storage_layout_local_names = function
-        .storage_layout()
-        .as_ref()
-        .map(|layout| layout.stack_slots().iter().cloned().collect::<HashSet<_>>())
-        .unwrap_or_default();
-    let block_labels = function
-        .blocks
-        .iter()
-        .map(|block| block.label)
-        .collect::<HashSet<_>>();
-    let mut check = CurrentJitRefcountPlanCheck::default();
-    let mut errors = Vec::new();
-
-    for (block_label, block_plan) in &plan.blocks {
-        if !block_labels.contains(block_label) {
-            errors.push(format!(
-                "refcount plan for function {} ({}) contains unknown block {block_label}",
-                function.function_id, function.names.qualname
-            ));
-        }
-        for action in &block_plan.actions {
-            match &action.kind {
-                RefcountActionKind::RebindLocal { local, .. } => {
-                    check_local_has_storage_layout_entry(
-                        function,
-                        &storage_layout_local_names,
-                        &local.name,
-                        &mut errors,
-                    );
-                    check.local_rebinds += 1;
-                }
-                RefcountActionKind::DeleteLocal { local, .. } => {
-                    check_local_has_storage_layout_entry(
-                        function,
-                        &storage_layout_local_names,
-                        &local.name,
-                        &mut errors,
-                    );
-                    check.local_deletes += 1;
-                }
-                RefcountActionKind::ReleaseLocal { local, reason, .. } => {
-                    check_local_has_storage_layout_entry(
-                        function,
-                        &storage_layout_local_names,
-                        &local.name,
-                        &mut errors,
-                    );
-                    match reason {
-                        RefcountReleaseReason::Return | RefcountReleaseReason::Raise => {
-                            check.terminal_local_releases += 1;
-                        }
-                        RefcountReleaseReason::Jump { .. }
-                        | RefcountReleaseReason::IfThen { .. }
-                        | RefcountReleaseReason::IfElse { .. }
-                        | RefcountReleaseReason::BranchCase { .. }
-                        | RefcountReleaseReason::BranchDefault { .. } => {
-                            check.normal_edge_local_releases += 1;
-                        }
-                        RefcountReleaseReason::ExceptionEdge { .. } => {
-                            check.exception_edge_stack_slot_releases += 1;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if errors.is_empty() {
-        Ok(check)
-    } else {
-        Err(errors.join("\n"))
-    }
-}
-
-fn check_local_has_storage_layout_entry(
-    function: &BlockPyFunction<CodegenModuleShape>,
-    storage_layout_local_names: &HashSet<String>,
-    local_name: &str,
-    errors: &mut Vec<String>,
-) {
-    if storage_layout_local_names.contains(local_name) {
-        return;
-    }
-    errors.push(format!(
-        "refcount plan action for function {} ({}) references local {local_name:?}, \
-         but the current JIT cleanup model only tracks storage-layout locals",
-        function.function_id, function.names.qualname
-    ));
-}
-
-fn block_indices_by_label(
-    function: &BlockPyFunction<CodegenModuleShape>,
-) -> HashMap<BlockLabel, usize> {
-    function
-        .blocks
-        .iter()
-        .enumerate()
-        .map(|(index, block)| (block.label, index))
-        .collect()
-}
-
-fn block_index_for_label(
-    function: &BlockPyFunction<CodegenModuleShape>,
-    block_indices_by_label: &HashMap<BlockLabel, usize>,
-    label: BlockLabel,
-) -> usize {
-    *block_indices_by_label.get(&label).unwrap_or_else(|| {
-        panic!(
-            "function {} ({}) references unknown block label {}",
-            function.function_id, function.names.qualname, label
-        )
-    })
 }
 
 fn typed_block_indices_by_label(
@@ -295,34 +154,6 @@ impl PlannedJitModuleLocals {
         self.functions.get(&function_id)
     }
 
-    pub fn validate_for_module(
-        &self,
-        module: &BlockPyModule<CodegenModuleShape>,
-    ) -> Result<(), String> {
-        let expected_function_ids = module
-            .callable_defs
-            .iter()
-            .map(|function| function.function_id)
-            .collect::<HashSet<_>>();
-        for function in &module.callable_defs {
-            let function_plan = self.function(function.function_id).ok_or_else(|| {
-                format!(
-                    "missing JIT local plan for function {} ({})",
-                    function.function_id, function.names.qualname
-                )
-            })?;
-            function_plan.validate_for_function(function)?;
-        }
-        for function_id in self.functions.keys() {
-            if !expected_function_ids.contains(function_id) {
-                return Err(format!(
-                    "JIT local plan contains unknown function id {function_id}"
-                ));
-            }
-        }
-        Ok(())
-    }
-
     pub fn validate_for_typed_module(
         &self,
         module: &BlockPyModule<TypedCodegenModuleShape>,
@@ -376,91 +207,6 @@ impl PlannedJitDeoptResumeFunction {
         self.deopt_points
             .iter()
             .filter(move |point| point.point.block_label() == block)
-    }
-
-    pub fn validate_for_function(
-        &self,
-        function: &BlockPyFunction<CodegenModuleShape>,
-    ) -> Result<(), String> {
-        let mut errors = Vec::new();
-        if self.deopt_points.len() != self.resume_plan.entries.len() {
-            errors.push(format!(
-                "JIT deopt resume plan for function {} ({}) has {} deopt points but {} \
-                 LocalEnv resume entries",
-                function.function_id,
-                function.names.qualname,
-                self.deopt_points.len(),
-                self.resume_plan.entries.len()
-            ));
-        }
-
-        for (ordinal, entry) in self.resume_plan.entries.iter().enumerate() {
-            let Some(deopt_point) = self.deopt_points.get(ordinal) else {
-                errors.push(format!(
-                    "JIT deopt resume plan for function {} ({}) is missing deopt point {ordinal}",
-                    function.function_id, function.names.qualname
-                ));
-                continue;
-            };
-            if deopt_point.id.function_id != function.function_id {
-                errors.push(format!(
-                    "JIT deopt point {ordinal} for function {} ({}) has wrong function id {}",
-                    function.function_id, function.names.qualname, deopt_point.id.function_id
-                ));
-            }
-            if deopt_point.id.ordinal != ordinal {
-                errors.push(format!(
-                    "JIT deopt point for function {} ({}) at index {ordinal} has id ordinal {}",
-                    function.function_id, function.names.qualname, deopt_point.id.ordinal
-                ));
-            }
-            if deopt_point.point != entry.point || deopt_point.resume_point != entry.point {
-                errors.push(format!(
-                    "JIT deopt point {:?} for function {} ({}) does not map exactly to LocalEnv \
-                     resume point {:?}",
-                    deopt_point.point, function.function_id, function.names.qualname, entry.point
-                ));
-            }
-            if deopt_point.precision != entry.precision {
-                errors.push(format!(
-                    "JIT deopt point {:?} for function {} ({}) has precision {:?}, expected {:?}",
-                    deopt_point.point,
-                    function.function_id,
-                    function.names.qualname,
-                    deopt_point.precision,
-                    entry.precision
-                ));
-            }
-
-            let mut seen_locations = HashSet::new();
-            for location in &deopt_point.local_locations {
-                if !seen_locations.insert(*location) {
-                    errors.push(format!(
-                        "JIT deopt point {:?} for function {} ({}) duplicates local location {}",
-                        deopt_point.point,
-                        function.function_id,
-                        function.names.qualname,
-                        location.0
-                    ));
-                }
-                if entry.binding_for_location(*location).is_none() {
-                    errors.push(format!(
-                        "JIT deopt point {:?} for function {} ({}) references unavailable local \
-                         location {}",
-                        deopt_point.point,
-                        function.function_id,
-                        function.names.qualname,
-                        location.0
-                    ));
-                }
-            }
-        }
-
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors.join("\n"))
-        }
     }
 
     pub fn validate_for_typed_function(
@@ -565,51 +311,6 @@ impl PlannedJitDeoptResumeModule {
     pub fn deopt_point(&self, point: LocalEnvResumePoint) -> Option<&PlannedJitDeoptPoint> {
         self.function(point.function_id())
             .and_then(|function| function.deopt_point(point))
-    }
-
-    pub fn validate_for_module(
-        &self,
-        module: &BlockPyModule<CodegenModuleShape>,
-    ) -> Result<(), String> {
-        let expected_function_ids = module
-            .callable_defs
-            .iter()
-            .map(|function| function.function_id)
-            .collect::<HashSet<_>>();
-        for function in &module.callable_defs {
-            let function_plan = self.function(function.function_id).ok_or_else(|| {
-                format!(
-                    "missing JIT deopt resume plan for function {} ({})",
-                    function.function_id, function.names.qualname
-                )
-            })?;
-            function_plan.validate_for_function(function)?;
-            for block in &function.blocks {
-                if function_plan
-                    .resume_plan
-                    .block_entry(function.function_id, block.label)
-                    .is_none()
-                    || function_plan
-                        .resume_plan
-                        .before_term(function.function_id, block.label)
-                        .is_none()
-                {
-                    return Err(format!(
-                        "JIT deopt resume plan for function {} ({}) is missing block boundary \
-                         entries for block {}",
-                        function.function_id, function.names.qualname, block.label
-                    ));
-                }
-            }
-        }
-        for function_id in self.functions.keys() {
-            if !expected_function_ids.contains(function_id) {
-                return Err(format!(
-                    "JIT deopt resume plan contains unknown function id {function_id}"
-                ));
-            }
-        }
-        Ok(())
     }
 
     pub fn validate_for_typed_module(
@@ -724,137 +425,6 @@ impl PlannedJitFunctionLocals {
                     .collect()
             })
             .unwrap_or_default()
-    }
-
-    pub fn validate_for_function(
-        &self,
-        function: &BlockPyFunction<CodegenModuleShape>,
-    ) -> Result<(), String> {
-        let block_count = function.blocks.len();
-        let block_indices_by_label = block_indices_by_label(function);
-        if self.runtime_block_params.len() != block_count
-            || self.implicit_target_transports.len() != block_count
-            || self.jump_edge_transports.len() != block_count
-            || self.stack_slot_entry_seeds.len() != block_count
-            || self.entry_materializations.len() != block_count
-            || self.exc_dispatches.len() != block_count
-        {
-            return Err(format!(
-                "planned JIT local state for function {} ({}) has inconsistent block counts",
-                function.function_id, function.names.qualname
-            ));
-        }
-
-        for (index, block) in function.blocks.iter().enumerate() {
-            let block_plan = self.local_plan.block(block.label);
-            if block_plan.is_none()
-                && (!self.runtime_block_params[index].is_empty()
-                    || !self.stack_slot_entry_seeds[index].is_empty()
-                    || !self.entry_materializations[index].is_empty())
-            {
-                return Err(format!(
-                    "planned JIT local state for function {} ({}) is missing block {}",
-                    function.function_id, function.names.qualname, block.label
-                ));
-            }
-            if let Some(block_plan) = block_plan {
-                for param in &self.runtime_block_params[index] {
-                    if block_plan
-                        .binding_for_block_arg_name(param.arg_name.as_str())
-                        .is_none()
-                    {
-                        return Err(format!(
-                            "runtime block param {:?} for function {} ({}) block {} has no local binding",
-                            param.arg_name,
-                            function.function_id,
-                            function.names.qualname,
-                            block.label
-                        ));
-                    }
-                    if param.binding.storage != PlannedLocalStorage::BlockParam {
-                        return Err(format!(
-                            "runtime block param {:?} for function {} ({}) block {} is not block-param backed",
-                            param.arg_name,
-                            function.function_id,
-                            function.names.qualname,
-                            block.label
-                        ));
-                    }
-                }
-            }
-            for seed in &self.stack_slot_entry_seeds[index] {
-                if seed.binding.storage != PlannedLocalStorage::StackSlot {
-                    return Err(format!(
-                        "stack-slot entry seed {:?} for function {} ({}) block {} is not stack-slot backed",
-                        seed.binding.name,
-                        function.function_id,
-                        function.names.qualname,
-                        block.label
-                    ));
-                }
-            }
-            validate_entry_materializations_for_block(
-                function,
-                block.label,
-                index,
-                &self.runtime_block_params[index],
-                &self.stack_slot_entry_seeds[index],
-                &self.entry_materializations[index],
-            )?;
-
-            let expected_jump = matches!(block.term, BlockTerm::Jump(_));
-            if self.jump_edge_transports[index].is_some() != expected_jump {
-                return Err(format!(
-                    "jump edge transport presence mismatch for function {} ({}) block {}",
-                    function.function_id, function.names.qualname, block.label
-                ));
-            }
-            if self.exc_dispatches[index].is_some() != block.exc_edge.is_some() {
-                return Err(format!(
-                    "exception dispatch presence mismatch for function {} ({}) block {}",
-                    function.function_id, function.names.qualname, block.label
-                ));
-            }
-            if let Some(dispatch) = &self.exc_dispatches[index] {
-                let Some(exc_edge) = block.exc_edge.as_ref() else {
-                    unreachable!("presence checked above");
-                };
-                let expected_target_index =
-                    block_index_for_label(function, &block_indices_by_label, exc_edge.target);
-                if dispatch.target_index != expected_target_index {
-                    return Err(format!(
-                        "exception dispatch target mismatch for function {} ({}) block {}",
-                        function.function_id, function.names.qualname, block.label
-                    ));
-                }
-                if dispatch.target_args.len()
-                    != self.runtime_block_params[dispatch.target_index].len()
-                {
-                    return Err(format!(
-                        "exception dispatch target arg count mismatch for function {} ({}) block {}",
-                        function.function_id, function.names.qualname, block.label
-                    ));
-                }
-                for release_name in &dispatch.release_local_names {
-                    if !dispatch
-                        .forwarded_local_names
-                        .iter()
-                        .any(|name| name == release_name)
-                    {
-                        return Err(format!(
-                            "exception dispatch release local {:?} for function {} ({}) block {} is not forwarded",
-                            release_name,
-                            function.function_id,
-                            function.names.qualname,
-                            block.label
-                        ));
-                    }
-                }
-                validate_exception_dispatch_ownership_sinks(function, block.label, dispatch)?;
-            }
-        }
-
-        Ok(())
     }
 
     pub fn validate_for_typed_function(
@@ -1165,62 +735,6 @@ fn validate_entry_materializations_for_block<P: soac_core::block_py::ModuleShape
     Ok(())
 }
 
-pub fn plan_jit_module_locals(
-    module: &BlockPyModule<CodegenModuleShape>,
-    facts: &FactStore,
-) -> Result<PlannedJitModuleLocals, String> {
-    let local_env_plan = plan_local_env_module(module, facts);
-    let refcount_plan = plan_ownership_effects(module, facts);
-    plan_jit_module_locals_from_passes(module, facts, &local_env_plan, &refcount_plan)
-}
-
-pub fn plan_jit_module_locals_from_passes(
-    module: &BlockPyModule<CodegenModuleShape>,
-    facts: &FactStore,
-    local_env_plan: &LocalEnvModulePlan,
-    refcount_plan: &RefcountPlan,
-) -> Result<PlannedJitModuleLocals, String> {
-    validate_local_env_module_plan(module, facts, local_env_plan)?;
-    validate_ownership_effects(module, facts, refcount_plan)?;
-    let mut functions = HashMap::with_capacity(module.callable_defs.len());
-    for function in &module.callable_defs {
-        let local_plan = local_env_plan
-            .function(function.function_id)
-            .cloned()
-            .ok_or_else(|| {
-                format!(
-                    "missing LocalEnv plan for function {} ({})",
-                    function.function_id, function.names.qualname
-                )
-            })?;
-        let function_refcount_plan = refcount_plan
-            .function(function.function_id)
-            .cloned()
-            .unwrap_or_default();
-        let function_plan =
-            plan_jit_function_locals_from_plans(function, local_plan, function_refcount_plan)?;
-        if functions
-            .insert(function.function_id, function_plan)
-            .is_some()
-        {
-            return Err(format!(
-                "duplicate JIT local plan for function id {} ({})",
-                function.function_id, function.names.qualname
-            ));
-        }
-    }
-    Ok(PlannedJitModuleLocals { functions })
-}
-
-pub fn plan_jit_typed_module_locals(
-    module: &BlockPyModule<TypedCodegenModuleShape>,
-    facts: &FactStore,
-) -> Result<PlannedJitModuleLocals, String> {
-    let local_env_plan = plan_typed_local_env_module(module, facts);
-    let refcount_plan = plan_typed_ownership_effects(module, facts);
-    plan_jit_typed_module_locals_from_passes(module, facts, &local_env_plan, &refcount_plan)
-}
-
 pub fn plan_jit_typed_module_locals_from_passes(
     module: &BlockPyModule<TypedCodegenModuleShape>,
     facts: &FactStore,
@@ -1260,66 +774,6 @@ pub fn plan_jit_typed_module_locals_from_passes(
         }
     }
     Ok(PlannedJitModuleLocals { functions })
-}
-
-pub fn plan_jit_deopt_resume_module(
-    module: &BlockPyModule<CodegenModuleShape>,
-    facts: &FactStore,
-) -> Result<PlannedJitDeoptResumeModule, String> {
-    let local_env_plan = plan_local_env_module(module, facts);
-    let resume_plan = plan_local_env_resume_module(module, &local_env_plan, facts);
-    plan_jit_deopt_resume_module_from_passes(module, facts, &local_env_plan, &resume_plan)
-}
-
-pub fn plan_jit_deopt_resume_module_from_passes(
-    module: &BlockPyModule<CodegenModuleShape>,
-    facts: &FactStore,
-    local_env_plan: &LocalEnvModulePlan,
-    resume_plan: &LocalEnvResumeModulePlan,
-) -> Result<PlannedJitDeoptResumeModule, String> {
-    validate_local_env_module_plan(module, facts, local_env_plan)?;
-    validate_local_env_resume_module_plan(module, local_env_plan, facts, resume_plan)?;
-    let mut functions = HashMap::with_capacity(module.callable_defs.len());
-    for function in &module.callable_defs {
-        let resume_plan = resume_plan
-            .function(function.function_id)
-            .cloned()
-            .ok_or_else(|| {
-                format!(
-                    "missing LocalEnv resume plan for function {} ({})",
-                    function.function_id, function.names.qualname
-                )
-            })?;
-        let deopt_points =
-            planned_deopt_points_from_resume_plan(function.function_id, &resume_plan);
-        if functions
-            .insert(
-                function.function_id,
-                PlannedJitDeoptResumeFunction {
-                    resume_plan,
-                    deopt_points,
-                },
-            )
-            .is_some()
-        {
-            return Err(format!(
-                "duplicate JIT deopt resume plan for function id {} ({})",
-                function.function_id, function.names.qualname
-            ));
-        }
-    }
-    let plan = PlannedJitDeoptResumeModule { functions };
-    plan.validate_for_module(module)?;
-    Ok(plan)
-}
-
-pub fn plan_jit_typed_deopt_resume_module(
-    module: &BlockPyModule<TypedCodegenModuleShape>,
-    facts: &FactStore,
-) -> Result<PlannedJitDeoptResumeModule, String> {
-    let local_env_plan = plan_typed_local_env_module(module, facts);
-    let resume_plan = plan_typed_local_env_resume_module(module, &local_env_plan, facts);
-    plan_jit_typed_deopt_resume_module_from_passes(module, facts, &local_env_plan, &resume_plan)
 }
 
 pub fn plan_jit_typed_deopt_resume_module_from_passes(
@@ -1364,6 +818,46 @@ pub fn plan_jit_typed_deopt_resume_module_from_passes(
     Ok(plan)
 }
 
+pub fn plan_jit_typed_module(
+    module: BlockPyModule<TypedCodegenModuleShape>,
+    value_facts: FactStore,
+) -> Result<PreparedJitTypedModulePlan, String> {
+    let local_env_plan = plan_typed_local_env_module(&module, &value_facts);
+    let local_env_resume_plan =
+        plan_typed_local_env_resume_module(&module, &local_env_plan, &value_facts);
+    let refcount_plan = plan_typed_ownership_effects(&module, &value_facts);
+    let locals = plan_jit_typed_module_locals_from_passes(
+        &module,
+        &value_facts,
+        &local_env_plan,
+        &refcount_plan,
+    )?;
+    let deopt_resume = plan_jit_typed_deopt_resume_module_from_passes(
+        &module,
+        &value_facts,
+        &local_env_plan,
+        &local_env_resume_plan,
+    )?;
+    Ok(PreparedJitTypedModulePlan {
+        module,
+        value_facts,
+        local_env_plan,
+        local_env_resume_plan,
+        locals,
+        deopt_resume,
+    })
+}
+
+pub fn plan_jit_module_from_codegen(
+    module: &BlockPyModule<CodegenModuleShape>,
+    value_facts: FactStore,
+) -> Result<PreparedJitTypedModulePlan, String> {
+    let mut typed_module = lower_codegen_module_to_typed(module.clone());
+    annotate_typed_module_value_facts(&mut typed_module, &value_facts);
+    let typed_module = lower_typed_if_tests_to_truthy(typed_module);
+    plan_jit_typed_module(typed_module, value_facts)
+}
+
 fn planned_deopt_points_from_resume_plan(
     function_id: RuntimeFunctionId,
     resume_plan: &FunctionLocalEnvResumePlan,
@@ -1390,10 +884,10 @@ fn planned_deopt_points_from_resume_plan(
 }
 
 pub fn render_jit_deopt_resume_module(
-    module: &BlockPyModule<CodegenModuleShape>,
+    module: &BlockPyModule<TypedCodegenModuleShape>,
     plan: &PlannedJitDeoptResumeModule,
 ) -> Result<String, String> {
-    plan.validate_for_module(module)?;
+    plan.validate_for_typed_module(module)?;
     let mut out = String::new();
     for function in &module.callable_defs {
         let function_plan = plan.function(function.function_id).ok_or_else(|| {
@@ -1411,10 +905,10 @@ pub fn render_jit_deopt_resume_module(
 }
 
 pub fn render_jit_deopt_resume_function(
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<TypedCodegenModuleShape>,
     plan: &PlannedJitDeoptResumeFunction,
 ) -> Result<String, String> {
-    plan.validate_for_function(function)?;
+    plan.validate_for_typed_function(function)?;
     let mut out = String::new();
     writeln!(
         out,
@@ -1475,10 +969,10 @@ fn render_jit_deopt_point(point: LocalEnvResumePoint) -> String {
 }
 
 pub fn render_jit_module_locals(
-    module: &BlockPyModule<CodegenModuleShape>,
+    module: &BlockPyModule<TypedCodegenModuleShape>,
     plan: &PlannedJitModuleLocals,
 ) -> Result<String, String> {
-    plan.validate_for_module(module)?;
+    plan.validate_for_typed_module(module)?;
     let mut out = String::new();
     for function in &module.callable_defs {
         let function_plan = plan.function(function.function_id).ok_or_else(|| {
@@ -1496,10 +990,10 @@ pub fn render_jit_module_locals(
 }
 
 pub fn render_jit_function_locals(
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<TypedCodegenModuleShape>,
     plan: &PlannedJitFunctionLocals,
 ) -> Result<String, String> {
-    plan.validate_for_function(function)?;
+    plan.validate_for_typed_function(function)?;
     let mut out = String::new();
     writeln!(
         out,
@@ -1657,59 +1151,6 @@ pub fn local_ref_kind_for_stack_mirror(ref_kind: LocalRefKind) -> LocalRefKind {
     }
 }
 
-pub fn planned_jit_params_for_function(
-    function: &BlockPyFunction<CodegenModuleShape>,
-    local_plan: &FunctionLocalPlan,
-) -> Result<Vec<Vec<RuntimeBlockParamPlan>>, String> {
-    function
-        .blocks
-        .iter()
-        .map(|block| {
-            let mut params = Vec::new();
-            let mut seen_names = HashSet::new();
-            let block_plan = local_plan.block(block.label);
-            for name in block.bb_param_names() {
-                let arg_name = name.to_string();
-                seen_names.insert(arg_name.clone());
-                let Some(binding) = block_plan
-                    .and_then(|plan| plan.binding_for_block_arg_name(arg_name.as_str()).cloned())
-                else {
-                    return Err(format!(
-                        "missing runtime block-param binding for function {} ({}) block {} arg {:?}",
-                        function.function_id, function.names.qualname, block.label, arg_name
-                    ));
-                };
-                let entry_aliases = if arg_name == binding.name {
-                    Vec::new()
-                } else {
-                    vec![arg_name.clone()]
-                };
-                params.push(RuntimeBlockParamPlan {
-                    arg_name,
-                    entry_aliases,
-                    binding,
-                });
-            }
-            if let Some(block_plan) = block_plan {
-                for binding in &block_plan.entry_locals {
-                    if binding.storage != PlannedLocalStorage::BlockParam {
-                        continue;
-                    }
-                    if !seen_names.insert(binding.name.clone()) {
-                        continue;
-                    }
-                    params.push(RuntimeBlockParamPlan {
-                        arg_name: binding.name.clone(),
-                        binding: binding.clone(),
-                        entry_aliases: Vec::new(),
-                    });
-                }
-            }
-            Ok(params)
-        })
-        .collect()
-}
-
 pub fn planned_jit_params_for_typed_function(
     function: &BlockPyFunction<TypedCodegenModuleShape>,
     local_plan: &FunctionLocalPlan,
@@ -1759,51 +1200,6 @@ pub fn planned_jit_params_for_typed_function(
                 }
             }
             Ok(params)
-        })
-        .collect()
-}
-
-pub fn planned_stack_slot_entry_seeds_for_function(
-    function: &BlockPyFunction<CodegenModuleShape>,
-    local_plan: &FunctionLocalPlan,
-) -> Vec<Vec<PlannedStackSlotEntrySeed>> {
-    let live_ins = compute_function_local_live_ins(function);
-    let must_bound_ins = compute_function_local_must_bound_ins(function);
-    function
-        .blocks
-        .iter()
-        .map(|block| {
-            let live_in_locations = live_ins.get(&block.label).cloned().unwrap_or_default();
-            let must_bound_locations = must_bound_ins
-                .get(&block.label)
-                .cloned()
-                .unwrap_or_default();
-            local_plan
-                .block(block.label)
-                .map(|block_plan| {
-                    block_plan
-                        .entry_locals
-                        .iter()
-                        .cloned()
-                        .filter_map(|binding| {
-                            if binding.storage != PlannedLocalStorage::StackSlot {
-                                return None;
-                            }
-                            if !live_in_locations.contains(&binding.location)
-                                && !must_bound_locations.contains(&binding.location)
-                            {
-                                return None;
-                            }
-                            let entry_ref_kind =
-                                local_ref_kind_for_stack_mirror(binding.param_facts.ownership);
-                            Some(PlannedStackSlotEntrySeed {
-                                entry_ref_kind,
-                                binding,
-                            })
-                        })
-                        .collect()
-                })
-                .unwrap_or_default()
         })
         .collect()
 }
@@ -1958,26 +1354,6 @@ pub fn plan_edge_transport(
     }
 }
 
-pub fn planned_implicit_target_transports_for_function(
-    function: &BlockPyFunction<CodegenModuleShape>,
-    runtime_block_params: &[Vec<RuntimeBlockParamPlan>],
-) -> Vec<EdgeTransportPlan> {
-    let no_slot_writes = HashSet::new();
-    function
-        .blocks
-        .iter()
-        .enumerate()
-        .map(|(index, block)| {
-            plan_edge_transport(
-                &block.param_name_vec(),
-                &[],
-                &runtime_block_params[index],
-                &no_slot_writes,
-            )
-        })
-        .collect()
-}
-
 pub fn planned_implicit_target_transports_for_typed_function(
     function: &BlockPyFunction<TypedCodegenModuleShape>,
     runtime_block_params: &[Vec<RuntimeBlockParamPlan>],
@@ -1994,32 +1370,6 @@ pub fn planned_implicit_target_transports_for_typed_function(
                 &runtime_block_params[index],
                 &no_slot_writes,
             )
-        })
-        .collect()
-}
-
-pub fn planned_jump_edge_transports_for_function(
-    function: &BlockPyFunction<CodegenModuleShape>,
-    runtime_block_params: &[Vec<RuntimeBlockParamPlan>],
-) -> Vec<Option<EdgeTransportPlan>> {
-    let no_slot_writes = HashSet::new();
-    let block_indices_by_label = block_indices_by_label(function);
-    function
-        .blocks
-        .iter()
-        .map(|block| match &block.term {
-            BlockTerm::Jump(target) => {
-                let target_index =
-                    block_index_for_label(function, &block_indices_by_label, target.target);
-                let target_block = &function.blocks[target_index];
-                Some(plan_edge_transport(
-                    &target_block.param_name_vec(),
-                    &target.args,
-                    &runtime_block_params[target_index],
-                    &no_slot_writes,
-                ))
-            }
-            _ => None,
         })
         .collect()
 }
@@ -2048,75 +1398,6 @@ pub fn planned_jump_edge_transports_for_typed_function(
             _ => None,
         })
         .collect()
-}
-
-pub fn exc_dispatch_plan(
-    function: &BlockPyFunction<CodegenModuleShape>,
-    block: &CodegenBlock,
-    runtime_target_params: &[RuntimeBlockParamPlan],
-    refcount_plan: &FunctionRefcountPlan,
-) -> Option<BlockExcDispatchPlan> {
-    let exc_edge = block.exc_edge.as_ref()?;
-    let block_indices_by_label = block_indices_by_label(function);
-    let target_index = block_index_for_label(function, &block_indices_by_label, exc_edge.target);
-    let target_block = &function.blocks[target_index];
-    let stack_slot_name_set = function
-        .storage_layout()
-        .as_ref()
-        .map(|layout| {
-            layout
-                .stack_slots()
-                .iter()
-                .cloned()
-                .into_iter()
-                .collect::<HashSet<_>>()
-        })
-        .unwrap_or_default();
-    let full_target_param_names = target_block.param_name_vec();
-    let transport = plan_edge_transport(
-        &full_target_param_names,
-        &exc_edge.args,
-        runtime_target_params,
-        &stack_slot_name_set,
-    );
-    let release_reason = RefcountReleaseReason::ExceptionEdge {
-        target: exc_edge.target,
-    };
-    let mut forwarded_local_names = transport.forwarded_local_names;
-    let mut release_local_names = Vec::new();
-    if let Some(block_plan) = refcount_plan.block(block.label) {
-        for action in &block_plan.actions {
-            let RefcountActionKind::ReleaseLocal {
-                local,
-                reason: action_reason,
-                ..
-            } = &action.kind
-            else {
-                continue;
-            };
-            if action_reason != &release_reason
-                || can_release_via_stack_slot_fallback(local.name.as_str())
-                || forwarded_local_names.iter().any(|name| name == &local.name)
-            {
-                continue;
-            }
-            forwarded_local_names.push(local.name.clone());
-            release_local_names.push(local.name.clone());
-        }
-    }
-    let drop_forwarded_local_names = planned_drop_forwarded_local_names(
-        &forwarded_local_names,
-        &transport.target_args,
-        &release_local_names,
-    );
-    Some(BlockExcDispatchPlan {
-        target_index,
-        slot_writes: transport.slot_writes,
-        target_args: transport.target_args,
-        forwarded_local_names,
-        release_local_names,
-        drop_forwarded_local_names,
-    })
 }
 
 pub fn typed_exc_dispatch_plan(
@@ -2209,64 +1490,6 @@ fn planned_drop_forwarded_local_names(
         .collect()
 }
 
-pub fn plan_jit_function_locals(
-    module: &BlockPyModule<CodegenModuleShape>,
-    function: &BlockPyFunction<CodegenModuleShape>,
-    facts: &FactStore,
-) -> Result<PlannedJitFunctionLocals, String> {
-    let local_plan = plan_function_locals(function, facts);
-    let refcount_plan = plan_function_refcount_ownership(module, function, facts)?;
-    plan_jit_function_locals_from_plans(function, local_plan, refcount_plan)
-}
-
-pub fn plan_jit_function_locals_from_plans(
-    function: &BlockPyFunction<CodegenModuleShape>,
-    local_plan: FunctionLocalPlan,
-    refcount_plan: FunctionRefcountPlan,
-) -> Result<PlannedJitFunctionLocals, String> {
-    let _refcount_plan_check = check_refcount_plan_against_current_jit(function, &refcount_plan)?;
-    let block_indices_by_label = block_indices_by_label(function);
-    let runtime_block_params = planned_jit_params_for_function(function, &local_plan)?;
-    let implicit_target_transports =
-        planned_implicit_target_transports_for_function(function, &runtime_block_params);
-    let jump_edge_transports =
-        planned_jump_edge_transports_for_function(function, &runtime_block_params);
-    let stack_slot_entry_seeds = planned_stack_slot_entry_seeds_for_function(function, &local_plan);
-    let entry_materializations = planned_local_env_entry_materializations_for_function(
-        &runtime_block_params,
-        &stack_slot_entry_seeds,
-    )?;
-    let exc_dispatches = function
-        .blocks
-        .iter()
-        .map(|block| {
-            let runtime_target_params = block
-                .exc_edge
-                .as_ref()
-                .map(|edge| {
-                    let target_index =
-                        block_index_for_label(function, &block_indices_by_label, edge.target);
-                    runtime_block_params[target_index].as_slice()
-                })
-                .unwrap_or(&[]);
-            exc_dispatch_plan(function, block, runtime_target_params, &refcount_plan)
-        })
-        .collect::<Vec<_>>();
-
-    let plan = PlannedJitFunctionLocals {
-        local_plan,
-        refcount_plan,
-        runtime_block_params,
-        implicit_target_transports,
-        jump_edge_transports,
-        stack_slot_entry_seeds,
-        entry_materializations,
-        exc_dispatches,
-    };
-    plan.validate_for_function(function)?;
-    Ok(plan)
-}
-
 pub fn plan_jit_typed_function_locals_from_plans(
     function: &BlockPyFunction<TypedCodegenModuleShape>,
     local_plan: FunctionLocalPlan,
@@ -2344,6 +1567,30 @@ mod tests {
         (lowered, function_index)
     }
 
+    fn plan_typed_module_from_codegen_module(
+        module: &BlockPyModule<CodegenModuleShape>,
+    ) -> PreparedJitTypedModulePlan {
+        let facts = infer_module_value_facts(module);
+        plan_jit_module_from_codegen(module, facts)
+            .expect("typed JIT module planning should succeed")
+    }
+
+    fn prepared_typed_function(
+        source: &str,
+        qualname: &str,
+    ) -> (PreparedJitTypedModulePlan, usize) {
+        let (lowered, codegen_function_index) = lowered_function(source, qualname);
+        let function_id = lowered.callable_defs[codegen_function_index].function_id;
+        let prepared = plan_typed_module_from_codegen_module(&lowered);
+        let typed_function_index = prepared
+            .module
+            .callable_defs
+            .iter()
+            .position(|function| function.function_id == function_id)
+            .unwrap_or_else(|| panic!("missing typed function {qualname}"));
+        (prepared, typed_function_index)
+    }
+
     fn binding_for_name<'a>(block_plan: &'a BlockLocalPlan, name: &str) -> &'a PlannedLocalBinding {
         block_plan
             .entry_locals
@@ -2399,7 +1646,7 @@ mod tests {
 
     #[test]
     fn local_plan_marks_immortal_entry_locals_from_value_facts() {
-        let (lowered, function_index) = lowered_function(
+        let (prepared, function_index) = prepared_typed_function(
             r#"
 def f(flag):
     x = None
@@ -2409,7 +1656,7 @@ def f(flag):
 "#,
             "f",
         );
-        let function = &lowered.callable_defs[function_index];
+        let function = &prepared.module.callable_defs[function_index];
         let if_term = function
             .blocks
             .iter()
@@ -2419,8 +1666,10 @@ def f(flag):
             })
             .last()
             .expect("expected lowered conditional branch");
-        let facts = infer_module_value_facts(&lowered);
-        let plan = plan_function_locals(function, &facts);
+        let plan = prepared
+            .local_env_plan
+            .function(function.function_id)
+            .expect("missing typed local plan");
 
         for label in [if_term.then_label, if_term.else_label] {
             let block_plan = plan.block(label).expect("missing block local plan");
@@ -2444,16 +1693,18 @@ def f(flag):
 
     #[test]
     fn local_plan_treats_function_params_as_owned_without_entry_fact() {
-        let (lowered, function_index) = lowered_function(
+        let (prepared, function_index) = prepared_typed_function(
             r#"
 def f(x):
     return x
 "#,
             "f",
         );
-        let function = &lowered.callable_defs[function_index];
-        let facts = infer_module_value_facts(&lowered);
-        let plan = plan_function_locals(function, &facts);
+        let function = &prepared.module.callable_defs[function_index];
+        let plan = prepared
+            .local_env_plan
+            .function(function.function_id)
+            .expect("missing typed local plan");
         let entry_block = function.blocks.first().expect("expected an entry block");
 
         let block_plan = plan
@@ -2472,7 +1723,7 @@ def f(x):
 
     #[test]
     fn planned_jit_params_include_semantic_and_cleanup_live_ins() {
-        let (lowered, function_index) = lowered_function(
+        let (prepared, function_index) = prepared_typed_function(
             r#"
 def f(flag):
     x = []
@@ -2483,7 +1734,7 @@ def f(flag):
 "#,
             "f",
         );
-        let function = &lowered.callable_defs[function_index];
+        let function = &prepared.module.callable_defs[function_index];
         let if_term = function
             .blocks
             .iter()
@@ -2493,26 +1744,28 @@ def f(flag):
             })
             .last()
             .expect("expected lowered conditional branch");
-        let facts = infer_module_value_facts(&lowered);
-        let plan = plan_function_locals(function, &facts);
-        let runtime_params =
-            planned_jit_params_for_function(function, &plan).expect("runtime params should bind");
-        let block_indices_by_label = block_indices_by_label(function);
+        let plan = prepared
+            .local_env_plan
+            .function(function.function_id)
+            .expect("missing typed local plan");
+        let runtime_params = planned_jit_params_for_typed_function(function, plan)
+            .expect("runtime params should bind");
+        let block_indices_by_label = typed_block_indices_by_label(function);
 
         let then_params = &runtime_params
-            [block_index_for_label(function, &block_indices_by_label, if_term.then_label)];
+            [typed_block_index_for_label(function, &block_indices_by_label, if_term.then_label)];
         assert!(then_params.iter().any(|param| param.arg_name == "x"));
         assert!(then_params.iter().any(|param| param.arg_name == "y"));
 
         let else_params = &runtime_params
-            [block_index_for_label(function, &block_indices_by_label, if_term.else_label)];
+            [typed_block_index_for_label(function, &block_indices_by_label, if_term.else_label)];
         assert!(else_params.iter().any(|param| param.arg_name == "y"));
         assert!(else_params.iter().any(|param| param.arg_name == "x"));
     }
 
     #[test]
     fn planned_jit_params_keep_binding_metadata_for_forwarded_locals() {
-        let (lowered, function_index) = lowered_function(
+        let (prepared, function_index) = prepared_typed_function(
             r#"
 def f(flag):
     x = None
@@ -2522,7 +1775,7 @@ def f(flag):
 "#,
             "f",
         );
-        let function = &lowered.callable_defs[function_index];
+        let function = &prepared.module.callable_defs[function_index];
         let if_term = function
             .blocks
             .iter()
@@ -2532,13 +1785,15 @@ def f(flag):
             })
             .last()
             .expect("expected lowered conditional branch");
-        let facts = infer_module_value_facts(&lowered);
-        let plan = plan_function_locals(function, &facts);
-        let runtime_params =
-            planned_jit_params_for_function(function, &plan).expect("runtime params should bind");
-        let block_indices_by_label = block_indices_by_label(function);
+        let plan = prepared
+            .local_env_plan
+            .function(function.function_id)
+            .expect("missing typed local plan");
+        let runtime_params = planned_jit_params_for_typed_function(function, plan)
+            .expect("runtime params should bind");
+        let block_indices_by_label = typed_block_indices_by_label(function);
         let then_params = &runtime_params
-            [block_index_for_label(function, &block_indices_by_label, if_term.then_label)];
+            [typed_block_index_for_label(function, &block_indices_by_label, if_term.then_label)];
         let x = then_params
             .iter()
             .find(|param| param.arg_name == "x")
@@ -2553,8 +1808,8 @@ def f(flag):
     }
 
     #[test]
-    fn planned_jit_params_for_function_validate_handler_exception_carriers() {
-        let (lowered, function_index) = lowered_function(
+    fn planned_jit_params_for_typed_function_validate_handler_exception_carriers() {
+        let (prepared, function_index) = prepared_typed_function(
             r#"
 def f():
     try:
@@ -2564,12 +1819,14 @@ def f():
 "#,
             "f",
         );
-        let function = &lowered.callable_defs[function_index];
-        let facts = infer_module_value_facts(&lowered);
-        let plan = plan_function_locals(function, &facts);
+        let function = &prepared.module.callable_defs[function_index];
+        let plan = prepared
+            .local_env_plan
+            .function(function.function_id)
+            .expect("missing typed local plan");
 
-        let runtime_params =
-            planned_jit_params_for_function(function, &plan).expect("runtime params should bind");
+        let runtime_params = planned_jit_params_for_typed_function(function, plan)
+            .expect("runtime params should bind");
         let handler_params = runtime_params
             .iter()
             .enumerate()
@@ -2596,7 +1853,7 @@ def f():
 
     #[test]
     fn must_bound_cleanup_locals_travel_as_block_params() {
-        let (lowered, function_index) = lowered_function(
+        let (prepared, function_index) = prepared_typed_function(
             r#"
 def f(flag):
     x = 1
@@ -2606,7 +1863,7 @@ def f(flag):
 "#,
             "f",
         );
-        let function = &lowered.callable_defs[function_index];
+        let function = &prepared.module.callable_defs[function_index];
         let if_term = function
             .blocks
             .iter()
@@ -2616,14 +1873,16 @@ def f(flag):
             })
             .last()
             .expect("expected lowered conditional branch");
-        let facts = infer_module_value_facts(&lowered);
-        let plan = plan_function_locals(function, &facts);
-        let runtime_params =
-            planned_jit_params_for_function(function, &plan).expect("runtime params should bind");
-        let seeds = planned_stack_slot_entry_seeds_for_function(function, &plan);
-        let block_indices_by_label = block_indices_by_label(function);
+        let plan = prepared
+            .local_env_plan
+            .function(function.function_id)
+            .expect("missing typed local plan");
+        let runtime_params = planned_jit_params_for_typed_function(function, plan)
+            .expect("runtime params should bind");
+        let seeds = planned_stack_slot_entry_seeds_for_typed_function(function, plan);
+        let block_indices_by_label = typed_block_indices_by_label(function);
         let else_index =
-            block_index_for_label(function, &block_indices_by_label, if_term.else_label);
+            typed_block_index_for_label(function, &block_indices_by_label, if_term.else_label);
 
         let else_params = &runtime_params[else_index];
         let x = else_params
@@ -2649,7 +1908,7 @@ def f(flag):
 
     #[test]
     fn local_plan_carries_maybe_unbound_live_ins_as_block_params() {
-        let (lowered, function_index) = lowered_function(
+        let (prepared, function_index) = prepared_typed_function(
             r#"
 def f(flag):
     if flag:
@@ -2658,12 +1917,14 @@ def f(flag):
 "#,
             "f",
         );
-        let function = &lowered.callable_defs[function_index];
-        let facts = infer_module_value_facts(&lowered);
-        let plan = plan_function_locals(function, &facts);
+        let function = &prepared.module.callable_defs[function_index];
+        let plan = prepared
+            .local_env_plan
+            .function(function.function_id)
+            .expect("missing typed local plan");
         let entry_label = function.entry_block().label;
-        let runtime_params =
-            planned_jit_params_for_function(function, &plan).expect("runtime params should bind");
+        let runtime_params = planned_jit_params_for_typed_function(function, plan)
+            .expect("runtime params should bind");
 
         let non_entry_x_bindings = function
             .blocks
@@ -2705,7 +1966,7 @@ def f(flag):
 
     #[test]
     fn local_plan_carries_entry_maybe_unbound_live_ins_as_synthetic_block_params() {
-        let (lowered, function_index) = lowered_function(
+        let (prepared, function_index) = prepared_typed_function(
             r#"
 def f(flag):
     if flag:
@@ -2714,17 +1975,20 @@ def f(flag):
 "#,
             "f",
         );
-        let function = &lowered.callable_defs[function_index];
-        let facts = infer_module_value_facts(&lowered);
-        let plan = plan_function_locals(function, &facts);
-        let runtime_params =
-            planned_jit_params_for_function(function, &plan).expect("runtime params should bind");
-        let seeds = planned_stack_slot_entry_seeds_for_function(function, &plan);
+        let function = &prepared.module.callable_defs[function_index];
+        let plan = prepared
+            .local_env_plan
+            .function(function.function_id)
+            .expect("missing typed local plan");
+        let runtime_params = planned_jit_params_for_typed_function(function, plan)
+            .expect("runtime params should bind");
+        let seeds = planned_stack_slot_entry_seeds_for_typed_function(function, plan);
         let entry_label = function.entry_block().label;
         let entry_plan = plan.block(entry_label).expect("missing entry local plan");
         let entry_x = binding_for_name(entry_plan, "x");
-        let block_indices_by_label = block_indices_by_label(function);
-        let entry_index = block_index_for_label(function, &block_indices_by_label, entry_label);
+        let block_indices_by_label = typed_block_indices_by_label(function);
+        let entry_index =
+            typed_block_index_for_label(function, &block_indices_by_label, entry_label);
 
         assert_eq!(entry_x.storage, PlannedLocalStorage::BlockParam);
         assert_eq!(entry_x.param_facts.binding, ParamBindingFacts::MaybeUnbound);
@@ -2749,7 +2013,7 @@ def f(flag):
 
     #[test]
     fn refcount_plan_is_available_to_jit_planning() {
-        let (lowered, function_index) = lowered_function(
+        let (prepared, function_index) = prepared_typed_function(
             r#"
 def f():
     x = []
@@ -2757,10 +2021,12 @@ def f():
 "#,
             "f",
         );
-        let function = &lowered.callable_defs[function_index];
-        let facts = infer_module_value_facts(&lowered);
-        let plan = plan_function_refcount_ownership(&lowered, function, &facts)
-            .expect("JIT planning should accept the verified BlockPy refcount plan");
+        let function = &prepared.module.callable_defs[function_index];
+        let plan = &prepared
+            .locals
+            .function(function.function_id)
+            .expect("missing JIT local plan")
+            .refcount_plan;
 
         assert!(plan.blocks.values().any(|block| {
             block.actions.iter().any(|action| {
@@ -2778,7 +2044,7 @@ def f():
 
     #[test]
     fn planned_jit_function_locals_collects_codegen_local_state() {
-        let (lowered, function_index) = lowered_function(
+        let (prepared, function_index) = prepared_typed_function(
             r#"
 def f(flag):
     x = []
@@ -2791,10 +2057,11 @@ def f(flag):
 "#,
             "f",
         );
-        let function = &lowered.callable_defs[function_index];
-        let facts = infer_module_value_facts(&lowered);
-        let plan = plan_jit_function_locals(&lowered, function, &facts)
-            .expect("JIT local state should plan before codegen");
+        let function = &prepared.module.callable_defs[function_index];
+        let plan = prepared
+            .locals
+            .function(function.function_id)
+            .expect("missing JIT local plan");
 
         assert_eq!(plan.local_plan.blocks.len(), function.blocks.len());
         assert_eq!(plan.runtime_block_params.len(), function.blocks.len());
@@ -2946,25 +2213,24 @@ def g(flag):
         )
         .expect("lowering should succeed")
         .codegen_module;
-        let facts = infer_module_value_facts(&lowered);
-        let plan = plan_jit_module_locals(&lowered, &facts)
-            .expect("JIT module local state should plan before codegen");
-        plan.validate_for_module(&lowered)
+        let prepared = plan_typed_module_from_codegen_module(&lowered);
+        let plan = &prepared.locals;
+        plan.validate_for_typed_module(&prepared.module)
             .expect("module-level function plan should validate");
 
-        assert_eq!(plan.functions.len(), lowered.callable_defs.len());
-        for function in &lowered.callable_defs {
+        assert_eq!(plan.functions.len(), prepared.module.callable_defs.len());
+        for function in &prepared.module.callable_defs {
             let function_plan = plan
                 .function(function.function_id)
                 .unwrap_or_else(|| panic!("missing plan for {}", function.names.qualname));
             function_plan
-                .validate_for_function(function)
+                .validate_for_typed_function(function)
                 .expect("module-level function plan should validate");
         }
     }
 
     #[test]
-    fn planned_jit_module_locals_accepts_precomputed_blockpy_pass_plans() {
+    fn planned_jit_module_uses_precomputed_typed_pass_sidecars() {
         let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
             r#"
 def f(flag):
@@ -2976,16 +2242,20 @@ def f(flag):
         )
         .expect("lowering should succeed")
         .codegen_module;
-        let facts = infer_module_value_facts(&lowered);
-        let local_env_plan = plan_local_env_module(&lowered, &facts);
-        let refcount_plan = plan_ownership_effects(&lowered, &facts);
-        let plan =
-            plan_jit_module_locals_from_passes(&lowered, &facts, &local_env_plan, &refcount_plan)
-                .expect("JIT planning should consume BlockPy pass sidecars");
+        let prepared = plan_typed_module_from_codegen_module(&lowered);
 
-        plan.validate_for_module(&lowered)
-            .expect("JIT plan from BlockPy pass sidecars should validate");
-        assert_eq!(plan.functions.len(), lowered.callable_defs.len());
+        prepared
+            .locals
+            .validate_for_typed_module(&prepared.module)
+            .expect("JIT local plan from typed pass sidecars should validate");
+        prepared
+            .deopt_resume
+            .validate_for_typed_module(&prepared.module)
+            .expect("JIT deopt plan from typed pass sidecars should validate");
+        assert_eq!(
+            prepared.locals.functions.len(),
+            prepared.module.callable_defs.len()
+        );
     }
 
     #[test]
@@ -3003,12 +2273,20 @@ def f(flag):
             "f",
         );
         sparsely_relabel_function_blocks(&mut lowered.callable_defs[function_index]);
-        let facts = infer_module_value_facts(&lowered);
-        let function = &lowered.callable_defs[function_index];
-        let plan = plan_jit_function_locals(&lowered, function, &facts)
-            .expect("JIT planning should not assume dense block labels");
+        let function_id = lowered.callable_defs[function_index].function_id;
+        let prepared = plan_typed_module_from_codegen_module(&lowered);
+        let function = prepared
+            .module
+            .callable_defs
+            .iter()
+            .find(|function| function.function_id == function_id)
+            .expect("missing typed function");
+        let plan = prepared
+            .locals
+            .function(function.function_id)
+            .expect("missing JIT local plan");
 
-        plan.validate_for_function(function)
+        plan.validate_for_typed_function(function)
             .expect("sparse-label JIT local plan should validate");
     }
 
@@ -3024,13 +2302,13 @@ def f():
         )
         .expect("lowering should succeed")
         .codegen_module;
-        let facts = infer_module_value_facts(&lowered);
-        let plan = plan_jit_deopt_resume_module(&lowered, &facts)
-            .expect("JIT deopt resume planning should consume LocalEnv resume sidecar");
-        plan.validate_for_module(&lowered)
+        let prepared = plan_typed_module_from_codegen_module(&lowered);
+        let plan = &prepared.deopt_resume;
+        plan.validate_for_typed_module(&prepared.module)
             .expect("JIT deopt resume plan should validate");
 
-        let function = lowered
+        let function = prepared
+            .module
             .callable_defs
             .iter()
             .find(|function| function.names.qualname == "f")
@@ -3085,7 +2363,7 @@ def f():
 
     #[test]
     fn exc_dispatch_plan_for_handler_preserves_forwarded_live_in_local() {
-        let (lowered, function_index) = lowered_function(
+        let (prepared, function_index) = prepared_typed_function(
             r#"
 def f():
     import builtins
@@ -3098,10 +2376,12 @@ def f():
 "#,
             "f",
         );
-        let function = &lowered.callable_defs[function_index];
-        let facts = infer_module_value_facts(&lowered);
-        let local_plan = plan_function_locals(function, &facts);
-        let runtime_params = planned_jit_params_for_function(function, &local_plan)
+        let function = &prepared.module.callable_defs[function_index];
+        let local_plan = prepared
+            .local_env_plan
+            .function(function.function_id)
+            .expect("missing typed local plan");
+        let runtime_params = planned_jit_params_for_typed_function(function, local_plan)
             .expect("runtime params should bind");
         let source_block = function
             .blocks
@@ -3109,10 +2389,10 @@ def f():
             .find(|block| block.exc_edge.is_some())
             .expect("expected exception edge source block");
         let exc_edge = source_block.exc_edge.as_ref().expect("checked above");
-        let block_indices_by_label = block_indices_by_label(function);
+        let block_indices_by_label = typed_block_indices_by_label(function);
         let runtime_target_params = &runtime_params
-            [block_index_for_label(function, &block_indices_by_label, exc_edge.target)];
-        let dispatch_plan = exc_dispatch_plan(
+            [typed_block_index_for_label(function, &block_indices_by_label, exc_edge.target)];
+        let dispatch_plan = typed_exc_dispatch_plan(
             function,
             source_block,
             &runtime_target_params,
@@ -3131,7 +2411,7 @@ def f():
 
     #[test]
     fn exc_dispatch_plan_carries_ordinary_exception_cleanup_locals_as_target_args() {
-        let (lowered, function_index) = lowered_function(
+        let (prepared, function_index) = prepared_typed_function(
             r#"
 def f():
     try:
@@ -3143,29 +2423,37 @@ def f():
 "#,
             "f",
         );
-        let function = &lowered.callable_defs[function_index];
-        let facts = infer_module_value_facts(&lowered);
-        let local_plan = plan_function_locals(function, &facts);
-        let refcount_plan = plan_function_refcount_ownership(&lowered, function, &facts)
-            .expect("refcount plan should validate");
-        let runtime_params = planned_jit_params_for_function(function, &local_plan)
+        let function = &prepared.module.callable_defs[function_index];
+        let local_plan = prepared
+            .local_env_plan
+            .function(function.function_id)
+            .expect("missing typed local plan");
+        let refcount_plan = &prepared
+            .locals
+            .function(function.function_id)
+            .expect("missing JIT local plan")
+            .refcount_plan;
+        let runtime_params = planned_jit_params_for_typed_function(function, local_plan)
             .expect("runtime params should bind");
 
         let dispatches = function
             .blocks
             .iter()
             .filter_map(|block| {
-                let block_indices_by_label = block_indices_by_label(function);
+                let block_indices_by_label = typed_block_indices_by_label(function);
                 let runtime_target_params = block
                     .exc_edge
                     .as_ref()
                     .map(|edge| {
-                        let target_index =
-                            block_index_for_label(function, &block_indices_by_label, edge.target);
+                        let target_index = typed_block_index_for_label(
+                            function,
+                            &block_indices_by_label,
+                            edge.target,
+                        );
                         runtime_params[target_index].as_slice()
                     })
                     .unwrap_or(&[]);
-                exc_dispatch_plan(function, block, runtime_target_params, &refcount_plan)
+                typed_exc_dispatch_plan(function, block, runtime_target_params, refcount_plan)
             })
             .collect::<Vec<_>>();
 
@@ -3337,95 +2625,5 @@ def f():
             other => panic!("expected implicit forwarded name, got {other:?}"),
         }
         assert_eq!(transport.forwarded_local_names, vec!["x".to_string()]);
-    }
-
-    #[test]
-    fn refcount_plan_check_maps_terminal_releases_to_local_env_cleanup() {
-        let (lowered, function_index) = lowered_function(
-            r#"
-def f():
-    x = []
-    return None
-"#,
-            "f",
-        );
-        let function = &lowered.callable_defs[function_index];
-        let facts = infer_module_value_facts(&lowered);
-        let plan = plan_function_refcount_ownership(&lowered, function, &facts)
-            .expect("refcount plan should validate");
-        let check = check_refcount_plan_against_current_jit(function, &plan)
-            .expect("current JIT should account for storage-layout locals");
-
-        assert_eq!(check.local_rebinds, 1);
-        assert_eq!(check.terminal_local_releases, 1);
-        assert_eq!(check.normal_edge_local_releases, 0);
-        assert_eq!(check.exception_edge_stack_slot_releases, 0);
-        assert_eq!(check.normal_edge_release_gaps, 0);
-        assert_eq!(check.exception_edge_release_gaps, 0);
-        assert!(!check.has_edge_release_gaps());
-    }
-
-    #[test]
-    fn refcount_plan_check_maps_normal_edge_releases_to_local_env_cleanup() {
-        let (lowered, function_index) = lowered_function(
-            r#"
-def f(flag):
-    x = []
-    if flag:
-        return None
-    return None
-"#,
-            "f",
-        );
-        let function = &lowered.callable_defs[function_index];
-        let facts = infer_module_value_facts(&lowered);
-        let plan = plan_function_refcount_ownership(&lowered, function, &facts)
-            .expect("refcount plan should validate");
-        let check = check_refcount_plan_against_current_jit(function, &plan)
-            .expect("current JIT should account for storage-layout locals");
-
-        assert!(
-            check.normal_edge_local_releases > 0,
-            "expected the plan to expose normal-edge LocalEnv releases: {check:#?}"
-        );
-        assert_eq!(
-            check.normal_edge_release_gaps, 0,
-            "normal edges are now consumed by planned LocalEnv releases"
-        );
-        assert_eq!(check.exception_edge_release_gaps, 0);
-        assert!(!check.has_edge_release_gaps());
-    }
-
-    #[test]
-    fn refcount_plan_check_maps_exception_edge_releases_to_stack_slot_cleanup() {
-        let (lowered, function_index) = lowered_function(
-            r#"
-def f():
-    try:
-        x = []
-        raise ValueError("boom")
-    except ValueError:
-        return None
-    return x
-"#,
-            "f",
-        );
-        let function = &lowered.callable_defs[function_index];
-        let facts = infer_module_value_facts(&lowered);
-        let plan = plan_function_refcount_ownership(&lowered, function, &facts)
-            .expect("refcount plan should validate");
-        let check = check_refcount_plan_against_current_jit(function, &plan)
-            .expect("current JIT should account for storage-layout locals");
-
-        assert!(
-            check.exception_edge_stack_slot_releases > 0,
-            "expected the plan to expose exception-edge stack-slot releases: {check:#?}"
-        );
-        assert_eq!(
-            check.exception_edge_release_gaps, 0,
-            "exception edges are still consumed by planned stack-slot releases"
-        );
-        assert_eq!(check.normal_edge_release_gaps, 0);
-        assert!(!check.has_edge_release_gaps());
     }
 }

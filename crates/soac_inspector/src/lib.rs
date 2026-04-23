@@ -15,7 +15,7 @@ use soac_jit::module_type::{
     build_shared_state_for_inspection_with_source_hash,
 };
 use soac_jit::{
-    CompileSession, plan_jit_deopt_resume_module, plan_jit_module_locals,
+    CompileSession, plan_jit_module_from_codegen,
     render_cranelift_run_bb_specialized_with_runtime_state_and_cfg,
     render_instr_typed_for_codegen_with_runtime_state, render_jit_deopt_resume_module,
     render_jit_function_locals, render_jit_module_locals,
@@ -258,8 +258,8 @@ fn render_inspector_payload(source: &str, output: &soac_lowering::LoweringResult
         "text": local_env_resume_plan_text,
     }));
     let jit_deopt_resume_plan_text = (|| {
-        let plan = plan_jit_deopt_resume_module(&output.codegen_module, &facts)?;
-        render_jit_deopt_resume_module(&output.codegen_module, &plan)
+        let prepared = plan_jit_module_from_codegen(&output.codegen_module, facts.clone())?;
+        render_jit_deopt_resume_module(&prepared.module, &prepared.deopt_resume)
     })()
     .unwrap_or_else(|err| format!("; failed to render jit_deopt_resume_plan: {err}"));
     steps.push(json!({
@@ -268,8 +268,8 @@ fn render_inspector_payload(source: &str, output: &soac_lowering::LoweringResult
         "text": jit_deopt_resume_plan_text,
     }));
     let jit_local_plan_text = (|| {
-        let plan = plan_jit_module_locals(&output.codegen_module, &facts)?;
-        render_jit_module_locals(&output.codegen_module, &plan)
+        let prepared = plan_jit_module_from_codegen(&output.codegen_module, facts.clone())?;
+        render_jit_module_locals(&prepared.module, &prepared.locals)
     })()
     .unwrap_or_else(|err| format!("; failed to render jit_local_plan: {err}"));
     steps.push(json!({
@@ -391,11 +391,18 @@ pub fn jit_debug_plan(
                 format!("missing LocalEnv resume plan for {module_name}.fn#{function_id}")
             })?,
     )?;
-    let jit_module_local_plan = plan_jit_module_locals(module, &facts)?;
-    let jit_local_plan = jit_module_local_plan
+    let prepared = plan_jit_module_from_codegen(module, facts.clone())?;
+    let typed_function = prepared
+        .module
+        .callable_defs
+        .iter()
+        .find(|function| function.function_id == function_id)
+        .ok_or_else(|| format!("missing typed function for {module_name}.fn#{function_id}"))?;
+    let jit_local_plan = prepared
+        .locals
         .function(function.function_id)
         .ok_or_else(|| format!("missing JIT local plan for {module_name}.fn#{function_id}"))?;
-    let jit_local_plan_text = render_jit_function_locals(function, jit_local_plan)?;
+    let jit_local_plan_text = render_jit_function_locals(typed_function, jit_local_plan)?;
     Ok(format!(
         "function:\n{function:#?}\n\nlocal_env_plan:\n{local_env_plan_text}\n\nlocal_env_resume_plan:\n{local_env_resume_plan_text}\n\njit_local_plan:\n{jit_local_plan_text}"
     ))

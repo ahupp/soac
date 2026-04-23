@@ -87,21 +87,18 @@ use soac_opt::passes::{
     CodegenModuleShape, DirectCallableTypeVersionGuardTest, DirectFunctionIdGuardTest,
     DirectReceiverTypeVersionGuardTest, FactStore, FunctionRefcountPlan, InstrCodegen,
     InstrResolved, InstrTyped, LocalEnvResumeBinding, LocalEnvResumeBindingState,
-    LocalEnvResumeEntry, LocalEnvResumePoint, LocalEnvResumeStatePrecision,
-    LocalEnvResumeValueSource, LocalRefState, PyExactType, PyObjFacts, RefcountActionKind,
-    RefcountReleaseReason, RefcountSite, RuntimeHelperId, TypedAttrAccessPlan, TypedAttrOwnerRef,
-    TypedCall, TypedCallAccessPlan, TypedCallEmissionPlan, TypedCallEmissionPlans,
-    TypedCodegenModuleShape, TypedDirectCallArgPlan, TypedDirectCallArgSource,
-    TypedDirectCallGuardTest, TypedDirectCallGuardTestKind, TypedDirectCallableCall,
-    TypedDirectCallableCallGuard, TypedDirectConstructorCallGuard, TypedDirectFunctionCallGuard,
-    TypedDirectMethodCall, TypedDirectMethodCallGuard, TypedGetAttr, TypedGuardedCallableCall,
-    TypedGuardedMethodCall, TypedIndexedFieldGuard, TypedIndexedFieldPlanSource,
-    TypedPlannedResult, TypedPyObjectOwnershipPlan, TypedSetAttr, ValueFacts,
-    annotate_typed_function_planned_results, annotate_typed_function_result_demands,
-    annotate_typed_function_value_facts, annotate_typed_module_value_facts,
-    infer_module_value_facts, lower_codegen_function_to_typed, lower_codegen_module_to_typed,
+    LocalEnvResumePoint, LocalEnvResumeStatePrecision, LocalEnvResumeValueSource, LocalRefState,
+    PyExactType, PyObjFacts, RefcountActionKind, RefcountReleaseReason, RefcountSite,
+    RuntimeHelperId, TypedAttrAccessPlan, TypedAttrOwnerRef, TypedCall, TypedCallAccessPlan,
+    TypedCallEmissionPlan, TypedCallEmissionPlans, TypedCodegenModuleShape, TypedDirectCallArgPlan,
+    TypedDirectCallArgSource, TypedDirectCallGuardTest, TypedDirectCallGuardTestKind,
+    TypedDirectCallableCall, TypedDirectCallableCallGuard, TypedDirectConstructorCallGuard,
+    TypedDirectFunctionCallGuard, TypedDirectMethodCall, TypedDirectMethodCallGuard, TypedGetAttr,
+    TypedGuardedCallableCall, TypedGuardedMethodCall, TypedIndexedFieldGuard,
+    TypedIndexedFieldPlanSource, TypedPlannedResult, TypedPyObjectOwnershipPlan, TypedSetAttr,
+    ValueFacts, annotate_typed_function_planned_results, annotate_typed_function_result_demands,
+    annotate_typed_function_value_facts, infer_module_value_facts, lower_codegen_function_to_typed,
     lower_typed_function_call_access_plan_instrs, lower_typed_function_call_emission_plans,
-    lower_typed_function_if_tests_to_truthy, lower_typed_if_tests_to_truthy,
     refresh_typed_function_value_facts, try_lower_typed_instr_to_codegen_legacy,
     try_lower_typed_term_to_codegen_legacy, validate_typed_function_call_access_plans,
     validate_typed_function_value_facts,
@@ -175,20 +172,18 @@ use direct_abi::{
     ParamAbi, PyLongI64Coercion, ResultAbi,
 };
 pub use planning::{
-    BlockExcDispatchPlan, BlockParamFacts, CurrentJitRefcountPlanCheck, EdgeTransportPlan,
-    FunctionLocalPlan, LocalRefKind, ParamBindingFacts, ParamProvenance, PlannedJitDeoptPoint,
-    PlannedJitDeoptPointId, PlannedJitDeoptResumeFunction, PlannedJitDeoptResumeModule,
-    PlannedJitFunctionLocals, PlannedJitModuleLocals, PlannedLocalEnvEntryMaterialization,
-    PlannedLocalEnvEntrySource, PlannedLocalStorage, PlannedStackSlotEntrySeed,
-    RuntimeBlockParamPlan, check_refcount_plan_against_current_jit, exc_dispatch_plan,
-    local_ref_kind_for_stack_mirror, plan_function_locals, plan_function_refcount_ownership,
-    plan_jit_deopt_resume_module, plan_jit_deopt_resume_module_from_passes,
-    plan_jit_function_locals, plan_jit_module_locals, plan_jit_typed_deopt_resume_module,
-    plan_jit_typed_module_locals, planned_implicit_target_transports_for_function,
-    planned_jit_params_for_function, planned_jump_edge_transports_for_function,
+    BlockExcDispatchPlan, BlockParamFacts, EdgeTransportPlan, FunctionLocalPlan, LocalRefKind,
+    ParamBindingFacts, ParamProvenance, PlannedJitDeoptPoint, PlannedJitDeoptPointId,
+    PlannedJitDeoptResumeFunction, PlannedJitDeoptResumeModule, PlannedJitFunctionLocals,
+    PlannedJitModuleLocals, PlannedLocalEnvEntryMaterialization, PlannedLocalEnvEntrySource,
+    PlannedLocalStorage, PlannedStackSlotEntrySeed, PreparedJitTypedModulePlan,
+    RuntimeBlockParamPlan, local_ref_kind_for_stack_mirror, plan_jit_module_from_codegen,
+    plan_jit_typed_module, planned_implicit_target_transports_for_typed_function,
+    planned_jit_params_for_typed_function, planned_jump_edge_transports_for_typed_function,
     planned_local_env_entry_materializations_for_function,
-    planned_stack_slot_entry_seeds_for_function, render_jit_deopt_resume_function,
+    planned_stack_slot_entry_seeds_for_typed_function, render_jit_deopt_resume_function,
     render_jit_deopt_resume_module, render_jit_function_locals, render_jit_module_locals,
+    typed_exc_dispatch_plan,
 };
 use runtime_context::{
     FUNCTION_ENV_DEFAULT_DIRECT_CODE_PTR_OFFSET, FUNCTION_ENV_DEOPT_TABLE_PTR_OFFSET,
@@ -1811,26 +1806,21 @@ fn build_jit_module_plan_from_owned_module(
     module: BlockPyModule<CodegenModuleShape>,
 ) -> Result<Arc<JitModulePlan>, String> {
     let value_facts = infer_jit_value_facts(&module);
-    let mut typed_module = lower_codegen_module_to_typed(module);
-    annotate_typed_module_value_facts(&mut typed_module, &value_facts);
-    let typed_module = lower_typed_if_tests_to_truthy(typed_module);
-    build_jit_typed_module_plan_from_owned_module(typed_module, value_facts)
+    let prepared = plan_jit_module_from_codegen(&module, value_facts)?;
+    build_jit_module_plan_from_prepared_typed_module(prepared)
 }
 
-fn build_jit_typed_module_plan_from_owned_module(
-    typed_module: BlockPyModule<TypedCodegenModuleShape>,
-    value_facts: FactStore,
+fn build_jit_module_plan_from_prepared_typed_module(
+    prepared: PreparedJitTypedModulePlan,
 ) -> Result<Arc<JitModulePlan>, String> {
-    for function in &typed_module.callable_defs {
+    for function in &prepared.module.callable_defs {
         validate_typed_function_value_facts(function)?;
     }
-    let locals = plan_jit_typed_module_locals(&typed_module, &value_facts)?;
-    let deopt_resume = plan_jit_typed_deopt_resume_module(&typed_module, &value_facts)?;
     Ok(Arc::new(JitModulePlan {
-        module: Arc::new(typed_module),
-        value_facts,
-        locals,
-        deopt_resume,
+        module: Arc::new(prepared.module),
+        value_facts: prepared.value_facts,
+        locals: prepared.locals,
+        deopt_resume: prepared.deopt_resume,
     }))
 }
 
@@ -3465,7 +3455,7 @@ fn build_precompiled_module_runtime(
     patch_precompiled_module_constant_slots(library, shared_state)?;
     let value_facts = infer_jit_value_facts(&shared_state.lowered_module);
     let deopt_resume_plan =
-        plan_jit_deopt_resume_module(&shared_state.lowered_module, &value_facts)?;
+        plan_jit_module_from_codegen(&shared_state.lowered_module, value_facts)?.deopt_resume;
     let module_constant_ptrs = shared_state
         .module_constant_ptrs()
         .into_iter()
@@ -3598,7 +3588,6 @@ pub(crate) enum RuntimeJitDeoptUnsupportedReason {
     MissingPlanRecord,
     UnsupportedBlockTail,
     ReplayUnsafeGuardOperand,
-    UnmaterializedContinuationLocal,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4204,384 +4193,6 @@ fn runtime_jit_typed_deopt_continuation_for_point(
                 )
             }
         }
-    }
-}
-
-fn runtime_jit_deopt_guard_miss_supported(
-    function: &BlockPyFunction<CodegenModuleShape>,
-    point: LocalEnvResumePoint,
-    pre_guard_operands: &[&InstrCodegen],
-) -> Result<(), RuntimeJitDeoptUnsupportedReason> {
-    if let Some(reason) =
-        runtime_jit_deopt_continuation_for_point(function, point).unsupported_reason()
-    {
-        return Err(reason);
-    }
-    if pre_guard_operands
-        .iter()
-        .any(|expr| !runtime_jit_deopt_guard_operand_replay_safe(expr))
-    {
-        return Err(RuntimeJitDeoptUnsupportedReason::ReplayUnsafeGuardOperand);
-    }
-    Ok(())
-}
-
-fn runtime_jit_deopt_guard_miss_resume_entry_supported(
-    function: &BlockPyFunction<CodegenModuleShape>,
-    point: LocalEnvResumePoint,
-    entry: &LocalEnvResumeEntry,
-) -> Result<(), RuntimeJitDeoptUnsupportedReason> {
-    let continuation = runtime_jit_deopt_continuation_for_point(function, point);
-    if let Some(reason) = continuation.unsupported_reason() {
-        return Err(reason);
-    }
-    let Some(cursor) = continuation.initial_cursor() else {
-        return Err(RuntimeJitDeoptUnsupportedReason::UnsupportedBlockTail);
-    };
-    for location in runtime_jit_deopt_continuation_local_reads(function, cursor)? {
-        let Some(binding) = entry.binding_for_location(location) else {
-            return Err(RuntimeJitDeoptUnsupportedReason::UnmaterializedContinuationLocal);
-        };
-        if binding.binding != LocalEnvResumeBindingState::Bound
-            || matches!(binding.source, LocalEnvResumeValueSource::Unbound)
-        {
-            return Err(RuntimeJitDeoptUnsupportedReason::UnmaterializedContinuationLocal);
-        }
-    }
-    Ok(())
-}
-
-fn runtime_jit_deopt_continuation_local_reads(
-    function: &BlockPyFunction<CodegenModuleShape>,
-    cursor: RuntimeJitDeoptCursor,
-) -> Result<HashSet<LocalLocation>, RuntimeJitDeoptUnsupportedReason> {
-    let Some(storage_layout) = function.storage_layout().as_ref() else {
-        return Ok(HashSet::new());
-    };
-    let blocks_by_label = function
-        .blocks
-        .iter()
-        .map(|block| (block.label, block))
-        .collect::<HashMap<_, _>>();
-    let location_by_name = storage_layout
-        .stack_slots()
-        .iter()
-        .enumerate()
-        .map(|(slot, name)| {
-            (
-                name.clone(),
-                LocalLocation(u32::try_from(slot).expect("local slot index should fit in u32")),
-            )
-        })
-        .collect::<HashMap<_, _>>();
-    let owned_cell_locations = runtime_jit_deopt_owned_cell_locations(function, &location_by_name);
-    let mut reads = HashSet::new();
-    let mut visited = HashSet::new();
-    // Track locals definitely written by the replayed tail along normal control flow.
-    // Exception edges stay conservative because they can leave before later tail writes.
-    let mut worklist = VecDeque::from([(cursor, HashSet::new())]);
-    while let Some((cursor, incoming_defs)) = worklist.pop_front() {
-        if !visited.insert((
-            cursor.block(),
-            cursor.body_index(),
-            runtime_jit_deopt_sorted_local_slots(&incoming_defs),
-        )) {
-            continue;
-        }
-        let Some(block) = blocks_by_label.get(&cursor.block()).copied() else {
-            return Err(RuntimeJitDeoptUnsupportedReason::MissingBlock);
-        };
-        let Some(body_tail) = block.body.get(cursor.body_index()..) else {
-            return Err(RuntimeJitDeoptUnsupportedReason::UnsupportedBlockTail);
-        };
-        let mut defs = incoming_defs;
-        for instr in body_tail {
-            runtime_jit_deopt_collect_local_reads(
-                instr,
-                &defs,
-                &location_by_name,
-                &owned_cell_locations,
-                &mut reads,
-            );
-            runtime_jit_deopt_mark_local_definition(instr, &owned_cell_locations, &mut defs);
-        }
-        runtime_jit_deopt_collect_term_local_reads(
-            &block.term,
-            &defs,
-            &location_by_name,
-            &owned_cell_locations,
-            &mut reads,
-        );
-        if let Some(edge) = &block.exc_edge {
-            runtime_jit_deopt_collect_edge_local_reads(
-                edge,
-                &HashSet::new(),
-                &location_by_name,
-                &mut reads,
-            );
-            worklist.push_back((
-                RuntimeJitDeoptCursor::at_block_entry(edge.target),
-                HashSet::new(),
-            ));
-        }
-        match &block.term {
-            BlockTerm::Jump(edge) => {
-                runtime_jit_deopt_collect_edge_local_reads(
-                    edge,
-                    &defs,
-                    &location_by_name,
-                    &mut reads,
-                );
-                worklist.push_back((RuntimeJitDeoptCursor::at_block_entry(edge.target), defs));
-            }
-            BlockTerm::IfTerm(if_term) => {
-                worklist.push_back((
-                    RuntimeJitDeoptCursor::at_block_entry(if_term.then_label),
-                    defs.clone(),
-                ));
-                worklist.push_back((
-                    RuntimeJitDeoptCursor::at_block_entry(if_term.else_label),
-                    defs,
-                ));
-            }
-            BlockTerm::BranchTable(branch) => {
-                for target in &branch.targets {
-                    worklist
-                        .push_back((RuntimeJitDeoptCursor::at_block_entry(*target), defs.clone()));
-                }
-                worklist.push_back((
-                    RuntimeJitDeoptCursor::at_block_entry(branch.default_label),
-                    defs,
-                ));
-            }
-            BlockTerm::Raise(_) | BlockTerm::Return(_) => {}
-        }
-    }
-    Ok(reads)
-}
-
-fn runtime_jit_deopt_sorted_local_slots(defs: &HashSet<LocalLocation>) -> Vec<u32> {
-    let mut slots = defs
-        .iter()
-        .map(|location| location.slot())
-        .collect::<Vec<_>>();
-    slots.sort_unstable();
-    slots
-}
-
-fn runtime_jit_deopt_owned_cell_locations(
-    function: &BlockPyFunction<CodegenModuleShape>,
-    location_by_name: &HashMap<String, LocalLocation>,
-) -> HashMap<u32, LocalLocation> {
-    let Some(storage_layout) = function.storage_layout().as_ref() else {
-        return HashMap::new();
-    };
-    storage_layout
-        .cellvars
-        .iter()
-        .chain(storage_layout.runtime_cells.iter())
-        .enumerate()
-        .filter_map(|(slot, cell)| {
-            let location = location_by_name.get(cell.storage_name.as_str()).copied()?;
-            let slot = u32::try_from(slot).expect("owned cell slot should fit in u32");
-            Some((slot, location))
-        })
-        .collect()
-}
-
-fn runtime_jit_deopt_mark_local_definition(
-    expr: &InstrCodegen,
-    owned_cell_locations: &HashMap<u32, LocalLocation>,
-    defs: &mut HashSet<LocalLocation>,
-) {
-    match expr {
-        InstrCodegen::Store(op) => {
-            if let Some(location) = op.name.local_location().or_else(|| {
-                let CellLocation::Owned(slot) = op.name.cell_location()? else {
-                    return None;
-                };
-                matches!(op.value.as_ref(), InstrCodegen::MakeCell(_))
-                    .then(|| owned_cell_locations.get(&slot).copied())
-                    .flatten()
-            }) {
-                defs.insert(location);
-            }
-        }
-        InstrCodegen::Del(op) => {
-            if let Some(location) = op.name.local_location() {
-                defs.insert(location);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn runtime_jit_deopt_collect_local_reads(
-    expr: &InstrCodegen,
-    defs: &HashSet<LocalLocation>,
-    location_by_name: &HashMap<String, LocalLocation>,
-    owned_cell_locations: &HashMap<u32, LocalLocation>,
-    reads: &mut HashSet<LocalLocation>,
-) {
-    struct LocalReadCollector<'a> {
-        defs: &'a HashSet<LocalLocation>,
-        location_by_name: &'a HashMap<String, LocalLocation>,
-        owned_cell_locations: &'a HashMap<u32, LocalLocation>,
-        reads: &'a mut HashSet<LocalLocation>,
-    }
-
-    impl Visit<InstrCodegen> for LocalReadCollector<'_> {
-        fn visit_instr(&mut self, expr: &InstrCodegen)
-        where
-            InstrCodegen: ChildVisitable<InstrCodegen>,
-        {
-            match expr {
-                InstrCodegen::Load(op) => {
-                    if let Some(location) = op.name.local_location() {
-                        runtime_jit_deopt_mark_local_read(location, self.defs, self.reads);
-                    }
-                    if let Some(cell_location) = op.name.cell_location() {
-                        runtime_jit_deopt_mark_cell_read(
-                            cell_location,
-                            self.defs,
-                            self.owned_cell_locations,
-                            self.reads,
-                        );
-                    }
-                }
-                InstrCodegen::Del(op) => {
-                    if let Some(location) = op.name.local_location() {
-                        runtime_jit_deopt_mark_local_read(location, self.defs, self.reads);
-                    }
-                    if let Some(cell_location) = op.name.cell_location() {
-                        runtime_jit_deopt_mark_cell_read(
-                            cell_location,
-                            self.defs,
-                            self.owned_cell_locations,
-                            self.reads,
-                        );
-                    }
-                }
-                InstrCodegen::Store(op) => {
-                    if let Some(cell_location) = op.name.cell_location() {
-                        runtime_jit_deopt_mark_cell_read(
-                            cell_location,
-                            self.defs,
-                            self.owned_cell_locations,
-                            self.reads,
-                        );
-                    }
-                }
-                InstrCodegen::CellRef(op) => runtime_jit_deopt_mark_cell_read(
-                    op.location,
-                    self.defs,
-                    self.owned_cell_locations,
-                    self.reads,
-                ),
-                _ => {}
-            }
-            expr.visit_children(self);
-        }
-
-        fn visit_block_arg(&mut self, arg: &BlockArg) {
-            if let BlockArg::Name(name) = arg
-                && let Some(location) = self.location_by_name.get(name)
-            {
-                runtime_jit_deopt_mark_local_read(*location, self.defs, self.reads);
-            }
-        }
-    }
-
-    LocalReadCollector {
-        defs,
-        location_by_name,
-        owned_cell_locations,
-        reads,
-    }
-    .visit_instr(expr);
-}
-
-fn runtime_jit_deopt_collect_term_local_reads(
-    term: &BlockTerm<InstrCodegen>,
-    defs: &HashSet<LocalLocation>,
-    location_by_name: &HashMap<String, LocalLocation>,
-    owned_cell_locations: &HashMap<u32, LocalLocation>,
-    reads: &mut HashSet<LocalLocation>,
-) {
-    struct TermReadCollector<'a> {
-        defs: &'a HashSet<LocalLocation>,
-        location_by_name: &'a HashMap<String, LocalLocation>,
-        owned_cell_locations: &'a HashMap<u32, LocalLocation>,
-        reads: &'a mut HashSet<LocalLocation>,
-    }
-
-    impl Visit<InstrCodegen> for TermReadCollector<'_> {
-        fn visit_instr(&mut self, expr: &InstrCodegen)
-        where
-            InstrCodegen: ChildVisitable<InstrCodegen>,
-        {
-            runtime_jit_deopt_collect_local_reads(
-                expr,
-                self.defs,
-                self.location_by_name,
-                self.owned_cell_locations,
-                self.reads,
-            );
-        }
-
-        fn visit_block_arg(&mut self, arg: &BlockArg) {
-            if let BlockArg::Name(name) = arg
-                && let Some(location) = self.location_by_name.get(name)
-            {
-                runtime_jit_deopt_mark_local_read(*location, self.defs, self.reads);
-            }
-        }
-    }
-
-    TermReadCollector {
-        defs,
-        location_by_name,
-        owned_cell_locations,
-        reads,
-    }
-    .visit_term(term);
-}
-
-fn runtime_jit_deopt_collect_edge_local_reads(
-    edge: &BlockEdge,
-    defs: &HashSet<LocalLocation>,
-    location_by_name: &HashMap<String, LocalLocation>,
-    reads: &mut HashSet<LocalLocation>,
-) {
-    for arg in &edge.args {
-        if let BlockArg::Name(name) = arg
-            && let Some(location) = location_by_name.get(name)
-        {
-            runtime_jit_deopt_mark_local_read(*location, defs, reads);
-        }
-    }
-}
-
-fn runtime_jit_deopt_mark_local_read(
-    location: LocalLocation,
-    defs: &HashSet<LocalLocation>,
-    reads: &mut HashSet<LocalLocation>,
-) {
-    if !defs.contains(&location) {
-        reads.insert(location);
-    }
-}
-
-fn runtime_jit_deopt_mark_cell_read(
-    cell_location: CellLocation,
-    defs: &HashSet<LocalLocation>,
-    owned_cell_locations: &HashMap<u32, LocalLocation>,
-    reads: &mut HashSet<LocalLocation>,
-) {
-    if let CellLocation::Owned(slot) = cell_location
-        && let Some(location) = owned_cell_locations.get(&slot)
-    {
-        runtime_jit_deopt_mark_local_read(*location, defs, reads);
     }
 }
 
