@@ -4,17 +4,20 @@ use soac_core::profile::{
     CounterDumpFile, CounterDumpKeyLayoutView, CounterDumpRowView, CounterDumpTypeKeyLayoutView,
     render_call_target_specializations,
 };
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 struct Args {
     emit_specializations: bool,
     emit_json: bool,
+    emit_pretty: bool,
     path: PathBuf,
 }
 
 fn parse_args() -> Result<Args, String> {
     let mut emit_specializations = false;
     let mut emit_json = false;
+    let mut emit_pretty = false;
     let mut positionals = Vec::new();
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
@@ -28,6 +31,9 @@ fn parse_args() -> Result<Args, String> {
             "--json" => {
                 emit_json = true;
             }
+            "--pretty" => {
+                emit_pretty = true;
+            }
             _ if arg.starts_with('-') => {
                 return Err(format!("unknown option: {arg}"));
             }
@@ -40,12 +46,15 @@ fn parse_args() -> Result<Args, String> {
     Ok(Args {
         emit_specializations,
         emit_json,
+        emit_pretty,
         path: PathBuf::from(&positionals[0]),
     })
 }
 
 fn print_usage() {
-    eprintln!("usage: inspect_counters [--json | --specializations] <counter-dump-file>");
+    eprintln!(
+        "usage: inspect_counters [--json | --pretty | --specializations] <counter-dump-file>"
+    );
 }
 
 fn format_counter_row(row: &CounterDumpRowView<'_>) -> String {
@@ -86,6 +95,66 @@ fn format_counter_row(row: &CounterDumpRowView<'_>) -> String {
     )
 }
 
+fn build_function_qualname_map<'a>(
+    rows: &[CounterDumpRowView<'a>],
+) -> HashMap<RuntimeFunctionId, &'a str> {
+    let mut out = HashMap::new();
+    for row in rows {
+        if let (Some(function_id), Some(qualname)) = (row.function_id, row.function_qualname) {
+            out.entry(function_id).or_insert(qualname);
+        }
+    }
+    out
+}
+
+fn pretty_observed_function(
+    observed_value: u64,
+    function_qualnames: &HashMap<RuntimeFunctionId, &str>,
+) -> String {
+    let function_id = RuntimeFunctionId::from_packed_runtime_u64(observed_value);
+    if function_id == RuntimeFunctionId::global() {
+        return "<global>".to_string();
+    }
+    function_qualnames
+        .get(&function_id)
+        .copied()
+        .unwrap_or("<unknown>")
+        .to_string()
+}
+
+fn format_pretty_counter_row(
+    row: &CounterDumpRowView<'_>,
+    function_qualnames: &HashMap<RuntimeFunctionId, &str>,
+) -> String {
+    let mut fields = vec![
+        format!("counter={}", row.counter_id),
+        format!("kind={}", row.kind),
+        format!("scope={}", row.scope),
+        format!("site={}", row.site_kind),
+    ];
+    if let Some(qualname) = row.function_qualname {
+        fields.push(format!("function={qualname}"));
+    }
+    if let Some(block_label) = row.block_label {
+        fields.push(format!("block={block_label}"));
+    }
+    if let Some(instr_id) = row.instr_id {
+        fields.push(format!("instr={instr_id}"));
+    }
+    fields.push(format!("value={}", row.value));
+    if let Some(observed_value) = row.observed_value {
+        if row.kind == "call_hot_targets" {
+            fields.push(format!(
+                "observed_function={}",
+                pretty_observed_function(observed_value, function_qualnames)
+            ));
+        } else {
+            fields.push(format!("observed_value={observed_value}"));
+        }
+    }
+    format!("  {}", fields.join(" "))
+}
+
 fn format_key_layout_row(kind: &str, row: &CounterDumpKeyLayoutView<'_>) -> String {
     format!(
         "  {kind}_key owner={} key={} index={}",
@@ -102,8 +171,11 @@ fn format_type_key_layout_row(row: &CounterDumpTypeKeyLayoutView<'_>) -> String 
 
 fn main() -> Result<(), String> {
     let args = parse_args().inspect_err(|_| print_usage())?;
-    if args.emit_json && args.emit_specializations {
-        return Err("--json and --specializations are mutually exclusive".to_string());
+    let output_mode_count = usize::from(args.emit_json)
+        + usize::from(args.emit_pretty)
+        + usize::from(args.emit_specializations);
+    if output_mode_count > 1 {
+        return Err("--json, --pretty, and --specializations are mutually exclusive".to_string());
     }
     let dump = CounterDumpFile::open(args.path.as_path())?;
     let records = dump.records()?;
@@ -207,9 +279,17 @@ fn main() -> Result<(), String> {
                 entry.type_id, entry.module_name, entry.qualname
             );
         }
+        let mut rows = Vec::new();
         for row_index in 0..record.row_count() {
-            let row = record.row(row_index)?;
-            println!("{}", format_counter_row(&row));
+            rows.push(record.row(row_index)?);
+        }
+        let function_qualnames = build_function_qualname_map(rows.as_slice());
+        for row in rows {
+            if args.emit_pretty {
+                println!("{}", format_pretty_counter_row(&row, &function_qualnames));
+            } else {
+                println!("{}", format_counter_row(&row));
+            }
         }
     }
     Ok(())
@@ -217,7 +297,7 @@ fn main() -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::format_counter_row;
+    use super::{build_function_qualname_map, format_counter_row, format_pretty_counter_row};
     use soac_core::block_py::{BlockLabel, InstrId, RuntimeFunctionId};
     use soac_core::profile::{
         CounterDumpRecord, CounterDumpRow, CounterDumpRowView, parse_counter_dump_records,
@@ -326,6 +406,83 @@ mod tests {
 
         let rendered = format_counter_row(&row);
         assert!(rendered.contains("observed_function_id=1:9"), "{rendered}");
+    }
+
+    #[test]
+    fn pretty_row_uses_qualname_and_omits_debug_only_empty_fields() {
+        let row = CounterDumpRowView {
+            counter_id: 55,
+            scope: "this",
+            kind: "block_entry",
+            site_kind: "block_entry",
+            function_id: Some(RuntimeFunctionId::from_raw_parts(1, 8)),
+            current_function_id: Some(RuntimeFunctionId::from_raw_parts(1, 8)),
+            instr_id: None,
+            function_qualname: Some("run"),
+            block_label: Some("bb9"),
+            value: 10200,
+            observed_value: None,
+            max_overcount: Some(1),
+        };
+
+        let rows = vec![row];
+        let function_qualnames = build_function_qualname_map(rows.as_slice());
+        let rendered = format_pretty_counter_row(&rows[0], &function_qualnames);
+        assert_eq!(
+            rendered,
+            "  counter=55 kind=block_entry scope=this site=block_entry function=run block=bb9 value=10200"
+        );
+        assert!(!rendered.contains("site_function_id"), "{rendered}");
+        assert!(!rendered.contains("current_function_id"), "{rendered}");
+        assert!(!rendered.contains("observed_value"), "{rendered}");
+        assert!(!rendered.contains("max_overcount"), "{rendered}");
+    }
+
+    #[test]
+    fn pretty_call_hot_target_row_resolves_observed_function_qualname() {
+        let rows = vec![
+            CounterDumpRowView {
+                counter_id: 1,
+                scope: "this",
+                kind: "call_hot_targets",
+                site_kind: "runtime",
+                function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
+                current_function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
+                instr_id: Some(InstrId::new(BlockLabel::from_index(2), 4)),
+                function_qualname: Some("pkg.mod.caller"),
+                block_label: None,
+                value: 11,
+                observed_value: Some(
+                    RuntimeFunctionId::from_raw_parts(1, 9).to_packed_runtime_u64(),
+                ),
+                max_overcount: Some(1),
+            },
+            CounterDumpRowView {
+                counter_id: 2,
+                scope: "this",
+                kind: "runtime_incref",
+                site_kind: "runtime",
+                function_id: Some(RuntimeFunctionId::from_raw_parts(1, 9)),
+                current_function_id: Some(RuntimeFunctionId::from_raw_parts(1, 9)),
+                instr_id: None,
+                function_qualname: Some("pkg.mod.target"),
+                block_label: None,
+                value: 1,
+                observed_value: None,
+                max_overcount: None,
+            },
+        ];
+
+        let function_qualnames = build_function_qualname_map(rows.as_slice());
+        let rendered = format_pretty_counter_row(&rows[0], &function_qualnames);
+        assert!(rendered.contains("function=pkg.mod.caller"), "{rendered}");
+        assert!(
+            rendered.contains("observed_function=pkg.mod.target"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("observed_function_id"), "{rendered}");
+        assert!(!rendered.contains("4294967305"), "{rendered}");
+        assert!(!rendered.contains("max_overcount"), "{rendered}");
     }
 
     #[test]
