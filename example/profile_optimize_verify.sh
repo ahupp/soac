@@ -45,6 +45,11 @@ cargo run --release -p soac_opt --bin decide_optimizations -- \
 echo "verify"
 SOAC_OPT_MODE=verify just py "$SCRIPT_DIR/specialization_demo.py"
 
+echo "dump verify counters"
+cargo run --release -p soac_inspector --bin inspect_counters -- \
+  "$SOAC_WORK_DIR/verify.bin" | tee "$SOAC_WORK_DIR/verify_counters.txt"
+
 echo "wrote profile: $SOAC_WORK_DIR/profile.bin"
 echo "wrote verify:  $SOAC_WORK_DIR/verify.bin"
+echo "wrote dump:    $SOAC_WORK_DIR/verify_counters.txt"
 echo "module cache:   $SOAC_WORK_DIR/modules"
