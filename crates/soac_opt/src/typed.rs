@@ -5,29 +5,1061 @@ use soac_core::block_py;
 use soac_core::block_py::{
     BinOp, BlockPyFunction, BlockPyModule, BlockTerm, Call, CallArgKeyword, CallArgPositional,
     CallDirect, CalleeFunctionId, CellRef, ChildVisitable, Del, DelItem, GetAttr, GetItem, HasMeta,
-    HasSemanticInstrId, Instr, InstrKey, InstrWithConstantNone, Load, MakeCell,
+    HasSemanticInstrId, Instr, InstrId, InstrKey, InstrWithConstantNone, Load, MakeCell,
     MakeFunctionWithClosure, MapFunction, MapInstr, MapModule, Mappable, Meta, ModuleShape,
-    NameLike, PrettyPrint, ResolvedName, RuntimeFunctionId, RuntimeName, SetAttr, SetItem, Store,
-    TryMapInstr, TryMapModule, TryMapTerm, Tuple, UnaryOp, Visit, VisitMut, WithMeta,
+    NameLike, PrettyPrint, PrettyPrinter, ResolvedName, RuntimeFunctionId, RuntimeName, SetAttr,
+    SetItem, Store, TryMapInstr, TryMapModule, TryMapTerm, Tuple, UnaryOp, Visit, VisitMut,
+    WithMeta, define_instr, define_ruff_instr,
 };
 use soac_lowering::block_py::counters::IncrementCounter;
 #[allow(unused_imports)]
 use soac_lowering::passes::{
     CodegenModuleShape, DirectFunctionIdGuardTest, InstrCodegen, InstrCodegenOp, InstrResolved,
-    TypedAttrAccessPlan, TypedCall, TypedCallAccessPlan, TypedCallEmissionPlan,
-    TypedCallEmissionPlans, TypedDirectCallArgPlan, TypedDirectCallArgSource,
-    TypedDirectCallGuardTest, TypedDirectCallGuardTestKind, TypedDirectCallableCall,
-    TypedDirectCallableCallGuard, TypedDirectConstructorCallGuard, TypedDirectFunctionCallGuard,
-    TypedDirectMethodCall, TypedDirectMethodCallGuard, TypedGetAttr, TypedGuardedCallableCall,
-    TypedGuardedMethodCall, TypedSetAttr, TypedTruthy,
 };
 use soac_macros::{DelegateMatchDefault, enum_broadcast};
+use std::collections::{HashMap, HashSet};
 
 fn runtime_name_load<E>(name: &str) -> E
 where
     E: Instr + From<Load<E>>,
 {
     Load::new(E::Name::runtime_name(name)).into()
+}
+
+define_ruff_instr! {
+    pub struct TypedTruthy<E> {
+        value: Box<E>,
+    }
+}
+
+impl<E: Instr> TypedTruthy<E> {
+    pub fn value(&self) -> &E {
+        &self.value
+    }
+
+    pub fn into_value(self) -> E {
+        *self.value
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub enum TypedDirectCallArgSource {
+    Provided(usize),
+    DefaultSentinel,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct TypedDirectCallArgPlan {
+    pub sources: Vec<TypedDirectCallArgSource>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct TypedDirectFunctionCallGuard {
+    pub function_id: RuntimeFunctionId,
+    pub arg_plan: TypedDirectCallArgPlan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct TypedDirectMethodCallGuard {
+    pub function_id: RuntimeFunctionId,
+    pub owner_type_ref: TypedAttrOwnerRef,
+    pub type_version: u32,
+    pub arg_plan: TypedDirectCallArgPlan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct TypedDirectConstructorCallGuard {
+    pub function_id: RuntimeFunctionId,
+    pub owner_type_ref: TypedAttrOwnerRef,
+    pub type_version: u32,
+    pub arg_plan: TypedDirectCallArgPlan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub enum TypedDirectCallableCallGuard {
+    Function(TypedDirectFunctionCallGuard),
+    Constructor(TypedDirectConstructorCallGuard),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TypedCallAccessPlan {
+    Generic,
+    ProfiledCallableTargets {
+        targets: Vec<RuntimeFunctionId>,
+    },
+    ProfiledMethodTargets {
+        targets: Vec<RuntimeFunctionId>,
+    },
+    GuardedCallable {
+        function_guards: Vec<TypedDirectFunctionCallGuard>,
+        constructor_guards: Vec<TypedDirectConstructorCallGuard>,
+    },
+    GuardedMethod {
+        method_name: String,
+        method_guards: Vec<TypedDirectMethodCallGuard>,
+    },
+    GuardedRuntimeProtocolMethod {
+        runtime_name: RuntimeName,
+        method_name: String,
+        method_guards: Vec<TypedDirectMethodCallGuard>,
+    },
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TypedCallEmissionPlans {
+    pub by_source: HashMap<InstrId, TypedCallEmissionPlan>,
+}
+
+impl TypedCallEmissionPlans {
+    pub fn is_empty(&self) -> bool {
+        self.by_source.is_empty()
+    }
+
+    pub fn sources(&self) -> HashSet<InstrId> {
+        self.by_source.keys().copied().collect()
+    }
+
+    pub fn target_function_ids(&self) -> Vec<RuntimeFunctionId> {
+        self.by_source
+            .values()
+            .flat_map(TypedCallEmissionPlan::target_function_ids)
+            .collect()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TypedCallEmissionPlan {
+    Callable {
+        function_guards: Vec<TypedDirectFunctionCallGuard>,
+        constructor_guards: Vec<TypedDirectConstructorCallGuard>,
+    },
+    Method {
+        method_name: String,
+        method_guards: Vec<TypedDirectMethodCallGuard>,
+    },
+}
+
+impl TypedCallEmissionPlan {
+    pub fn target_function_ids(&self) -> Vec<RuntimeFunctionId> {
+        match self {
+            Self::Callable {
+                function_guards,
+                constructor_guards,
+            } => function_guards
+                .iter()
+                .map(|guard| guard.function_id)
+                .chain(constructor_guards.iter().map(|guard| guard.function_id))
+                .collect(),
+            Self::Method { method_guards, .. } => method_guards
+                .iter()
+                .map(|guard| guard.function_id)
+                .collect(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::Callable {
+                function_guards,
+                constructor_guards,
+            } => function_guards.is_empty() && constructor_guards.is_empty(),
+            Self::Method { method_guards, .. } => method_guards.is_empty(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct TypedCall<E: Instr> {
+    _meta: Meta,
+    pub extra: E::Extra,
+    pub func: Box<E>,
+    pub args: Vec<CallArgPositional<E>>,
+    pub keywords: Vec<CallArgKeyword<E>>,
+    pub access: TypedCallAccessPlan,
+}
+
+impl<E: Instr> TypedCall<E> {
+    pub fn generic(
+        func: impl Into<Box<E>>,
+        args: impl Into<Vec<CallArgPositional<E>>>,
+        keywords: impl Into<Vec<CallArgKeyword<E>>>,
+    ) -> Self {
+        Self {
+            _meta: Meta::default(),
+            extra: Default::default(),
+            func: func.into(),
+            args: args.into(),
+            keywords: keywords.into(),
+            access: TypedCallAccessPlan::Generic,
+        }
+    }
+
+    pub fn from_legacy(op: Call<E>) -> Self {
+        Self {
+            _meta: op.meta(),
+            extra: op.extra,
+            func: op.func,
+            args: op.args,
+            keywords: op.keywords,
+            access: TypedCallAccessPlan::Generic,
+        }
+    }
+
+    pub fn into_legacy(self) -> Call<E> {
+        Call::new(self.func, self.args, self.keywords)
+            .with_extra(self.extra)
+            .with_meta(self._meta)
+    }
+}
+
+impl<E: Instr + std::fmt::Debug> std::fmt::Debug for TypedCall<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TypedCall")
+            .field("func", &self.func)
+            .field("args", &self.args)
+            .field("keywords", &self.keywords)
+            .field("access", &self.access)
+            .finish()
+    }
+}
+
+impl<E: Instr> HasMeta for TypedCall<E> {
+    fn meta(&self) -> Meta {
+        self._meta.clone()
+    }
+}
+
+impl<E: Instr> WithMeta for TypedCall<E> {
+    fn with_meta(mut self, meta: Meta) -> Self {
+        self._meta = meta;
+        self
+    }
+}
+
+impl<E> ChildVisitable<E> for TypedCall<E>
+where
+    E: Instr + ChildVisitable<E>,
+{
+    fn visit_children<V>(&self, visitor: &mut V)
+    where
+        V: block_py::Visit<E> + ?Sized,
+    {
+        visitor.visit_instr(&self.func);
+        for arg in &self.args {
+            visitor.visit_instr(arg.expr());
+        }
+        for keyword in &self.keywords {
+            visitor.visit_instr(keyword.expr());
+        }
+    }
+
+    fn visit_children_mut<V>(&mut self, visitor: &mut V)
+    where
+        V: block_py::VisitMut<E> + ?Sized,
+    {
+        visitor.visit_instr_mut(&mut self.func);
+        for arg in &mut self.args {
+            visitor.visit_instr_mut(arg.expr_mut());
+        }
+        for keyword in &mut self.keywords {
+            visitor.visit_instr_mut(keyword.expr_mut());
+        }
+    }
+}
+
+impl<E: Instr> Mappable<E> for TypedCall<E> {
+    type Mapped<T: Instr> = TypedCall<T>;
+
+    fn map_children<T, M>(self, map: &mut M) -> Self::Mapped<T>
+    where
+        T: Instr,
+        M: MapInstr<E, T>,
+    {
+        TypedCall {
+            _meta: self._meta,
+            extra: Default::default(),
+            func: Box::new(map.map_instr(*self.func)),
+            args: self
+                .args
+                .into_iter()
+                .map(|arg| arg.map_instr(|expr| map.map_instr(expr)))
+                .collect(),
+            keywords: self
+                .keywords
+                .into_iter()
+                .map(|keyword| keyword.map_instr(|expr| map.map_instr(expr)))
+                .collect(),
+            access: self.access,
+        }
+    }
+
+    fn try_map_children<T, Error, M>(self, map: &mut M) -> Result<Self::Mapped<T>, Error>
+    where
+        T: Instr,
+        M: TryMapInstr<E, T, Error>,
+    {
+        Ok(TypedCall {
+            _meta: self._meta,
+            extra: Default::default(),
+            func: Box::new(map.try_map_instr(*self.func)?),
+            args: self
+                .args
+                .into_iter()
+                .map(|arg| arg.try_map_instr(|expr| map.try_map_instr(expr)))
+                .collect::<Result<Vec<_>, _>>()?,
+            keywords: self
+                .keywords
+                .into_iter()
+                .map(|keyword| keyword.try_map_instr(|expr| map.try_map_instr(expr)))
+                .collect::<Result<Vec<_>, _>>()?,
+            access: self.access,
+        })
+    }
+}
+
+#[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct TypedDirectCallableCall<E: Instr> {
+    _meta: Meta,
+    pub extra: E::Extra,
+    pub func: Box<E>,
+    pub args: Vec<CallArgPositional<E>>,
+    pub guard: TypedDirectCallableCallGuard,
+}
+
+impl<E: Instr> TypedDirectCallableCall<E> {
+    pub fn new(
+        func: impl Into<Box<E>>,
+        args: impl Into<Vec<CallArgPositional<E>>>,
+        guard: TypedDirectCallableCallGuard,
+    ) -> Self {
+        Self {
+            _meta: Meta::default(),
+            extra: Default::default(),
+            func: func.into(),
+            args: args.into(),
+            guard,
+        }
+    }
+}
+
+impl<E: Instr + std::fmt::Debug> std::fmt::Debug for TypedDirectCallableCall<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TypedDirectCallableCall")
+            .field("func", &self.func)
+            .field("args", &self.args)
+            .field("guard", &self.guard)
+            .finish()
+    }
+}
+
+impl<E: Instr> HasMeta for TypedDirectCallableCall<E> {
+    fn meta(&self) -> Meta {
+        self._meta.clone()
+    }
+}
+
+impl<E: Instr> WithMeta for TypedDirectCallableCall<E> {
+    fn with_meta(mut self, meta: Meta) -> Self {
+        self._meta = meta;
+        self
+    }
+}
+
+impl<E> ChildVisitable<E> for TypedDirectCallableCall<E>
+where
+    E: Instr + ChildVisitable<E>,
+{
+    fn visit_children<V>(&self, visitor: &mut V)
+    where
+        V: block_py::Visit<E> + ?Sized,
+    {
+        visitor.visit_instr(&self.func);
+        for arg in &self.args {
+            visitor.visit_instr(arg.expr());
+        }
+    }
+
+    fn visit_children_mut<V>(&mut self, visitor: &mut V)
+    where
+        V: block_py::VisitMut<E> + ?Sized,
+    {
+        visitor.visit_instr_mut(&mut self.func);
+        for arg in &mut self.args {
+            visitor.visit_instr_mut(arg.expr_mut());
+        }
+    }
+}
+
+impl<E: Instr> Mappable<E> for TypedDirectCallableCall<E> {
+    type Mapped<T: Instr> = TypedDirectCallableCall<T>;
+
+    fn map_children<T, M>(self, map: &mut M) -> Self::Mapped<T>
+    where
+        T: Instr,
+        M: MapInstr<E, T>,
+    {
+        TypedDirectCallableCall {
+            _meta: self._meta,
+            extra: Default::default(),
+            func: Box::new(map.map_instr(*self.func)),
+            args: self
+                .args
+                .into_iter()
+                .map(|arg| arg.map_instr(|expr| map.map_instr(expr)))
+                .collect(),
+            guard: self.guard,
+        }
+    }
+
+    fn try_map_children<T, Error, M>(self, map: &mut M) -> Result<Self::Mapped<T>, Error>
+    where
+        T: Instr,
+        M: TryMapInstr<E, T, Error>,
+    {
+        Ok(TypedDirectCallableCall {
+            _meta: self._meta,
+            extra: Default::default(),
+            func: Box::new(map.try_map_instr(*self.func)?),
+            args: self
+                .args
+                .into_iter()
+                .map(|arg| arg.try_map_instr(|expr| map.try_map_instr(expr)))
+                .collect::<Result<Vec<_>, _>>()?,
+            guard: self.guard,
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct TypedGuardedCallableCall<E: Instr> {
+    _meta: Meta,
+    pub extra: E::Extra,
+    pub func: Box<E>,
+    pub args: Vec<CallArgPositional<E>>,
+    pub keywords: Vec<CallArgKeyword<E>>,
+    pub function_guards: Vec<TypedDirectFunctionCallGuard>,
+    pub constructor_guards: Vec<TypedDirectConstructorCallGuard>,
+}
+
+impl<E: Instr> TypedGuardedCallableCall<E> {
+    pub fn from_typed_call(
+        call: TypedCall<E>,
+        function_guards: Vec<TypedDirectFunctionCallGuard>,
+        constructor_guards: Vec<TypedDirectConstructorCallGuard>,
+    ) -> Self {
+        Self {
+            _meta: call._meta,
+            extra: call.extra,
+            func: call.func,
+            args: call.args,
+            keywords: call.keywords,
+            function_guards,
+            constructor_guards,
+        }
+    }
+
+    pub fn into_typed_call(self) -> TypedCall<E> {
+        TypedCall {
+            _meta: self._meta,
+            extra: self.extra,
+            func: self.func,
+            args: self.args,
+            keywords: self.keywords,
+            access: TypedCallAccessPlan::GuardedCallable {
+                function_guards: self.function_guards,
+                constructor_guards: self.constructor_guards,
+            },
+        }
+    }
+}
+
+impl<E: Instr + std::fmt::Debug> std::fmt::Debug for TypedGuardedCallableCall<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TypedGuardedCallableCall")
+            .field("func", &self.func)
+            .field("args", &self.args)
+            .field("keywords", &self.keywords)
+            .field("function_guards", &self.function_guards)
+            .field("constructor_guards", &self.constructor_guards)
+            .finish()
+    }
+}
+
+impl<E: Instr> HasMeta for TypedGuardedCallableCall<E> {
+    fn meta(&self) -> Meta {
+        self._meta.clone()
+    }
+}
+
+impl<E: Instr> WithMeta for TypedGuardedCallableCall<E> {
+    fn with_meta(mut self, meta: Meta) -> Self {
+        self._meta = meta;
+        self
+    }
+}
+
+impl<E> ChildVisitable<E> for TypedGuardedCallableCall<E>
+where
+    E: Instr + ChildVisitable<E>,
+{
+    fn visit_children<V>(&self, visitor: &mut V)
+    where
+        V: block_py::Visit<E> + ?Sized,
+    {
+        visitor.visit_instr(&self.func);
+        for arg in &self.args {
+            visitor.visit_instr(arg.expr());
+        }
+        for keyword in &self.keywords {
+            visitor.visit_instr(keyword.expr());
+        }
+    }
+
+    fn visit_children_mut<V>(&mut self, visitor: &mut V)
+    where
+        V: block_py::VisitMut<E> + ?Sized,
+    {
+        visitor.visit_instr_mut(&mut self.func);
+        for arg in &mut self.args {
+            visitor.visit_instr_mut(arg.expr_mut());
+        }
+        for keyword in &mut self.keywords {
+            visitor.visit_instr_mut(keyword.expr_mut());
+        }
+    }
+}
+
+impl<E: Instr> Mappable<E> for TypedGuardedCallableCall<E> {
+    type Mapped<T: Instr> = TypedGuardedCallableCall<T>;
+
+    fn map_children<T, M>(self, map: &mut M) -> Self::Mapped<T>
+    where
+        T: Instr,
+        M: MapInstr<E, T>,
+    {
+        TypedGuardedCallableCall {
+            _meta: self._meta,
+            extra: Default::default(),
+            func: Box::new(map.map_instr(*self.func)),
+            args: self
+                .args
+                .into_iter()
+                .map(|arg| arg.map_instr(|expr| map.map_instr(expr)))
+                .collect(),
+            keywords: self
+                .keywords
+                .into_iter()
+                .map(|keyword| keyword.map_instr(|expr| map.map_instr(expr)))
+                .collect(),
+            function_guards: self.function_guards,
+            constructor_guards: self.constructor_guards,
+        }
+    }
+
+    fn try_map_children<T, Error, M>(self, map: &mut M) -> Result<Self::Mapped<T>, Error>
+    where
+        T: Instr,
+        M: TryMapInstr<E, T, Error>,
+    {
+        Ok(TypedGuardedCallableCall {
+            _meta: self._meta,
+            extra: Default::default(),
+            func: Box::new(map.try_map_instr(*self.func)?),
+            args: self
+                .args
+                .into_iter()
+                .map(|arg| arg.try_map_instr(|expr| map.try_map_instr(expr)))
+                .collect::<Result<Vec<_>, _>>()?,
+            keywords: self
+                .keywords
+                .into_iter()
+                .map(|keyword| keyword.try_map_instr(|expr| map.try_map_instr(expr)))
+                .collect::<Result<Vec<_>, _>>()?,
+            function_guards: self.function_guards,
+            constructor_guards: self.constructor_guards,
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct TypedGuardedMethodCall<E: Instr> {
+    _meta: Meta,
+    pub extra: E::Extra,
+    pub func: Box<E>,
+    pub args: Vec<CallArgPositional<E>>,
+    pub keywords: Vec<CallArgKeyword<E>>,
+    pub method_name: String,
+    pub method_guards: Vec<TypedDirectMethodCallGuard>,
+}
+
+impl<E: Instr> TypedGuardedMethodCall<E> {
+    pub fn from_typed_call(
+        call: TypedCall<E>,
+        method_name: String,
+        method_guards: Vec<TypedDirectMethodCallGuard>,
+    ) -> Self {
+        Self {
+            _meta: call._meta,
+            extra: call.extra,
+            func: call.func,
+            args: call.args,
+            keywords: call.keywords,
+            method_name,
+            method_guards,
+        }
+    }
+
+    pub fn into_typed_call(self) -> TypedCall<E> {
+        TypedCall {
+            _meta: self._meta,
+            extra: self.extra,
+            func: self.func,
+            args: self.args,
+            keywords: self.keywords,
+            access: TypedCallAccessPlan::GuardedMethod {
+                method_name: self.method_name,
+                method_guards: self.method_guards,
+            },
+        }
+    }
+}
+
+impl<E: Instr + std::fmt::Debug> std::fmt::Debug for TypedGuardedMethodCall<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TypedGuardedMethodCall")
+            .field("func", &self.func)
+            .field("args", &self.args)
+            .field("keywords", &self.keywords)
+            .field("method_name", &self.method_name)
+            .field("method_guards", &self.method_guards)
+            .finish()
+    }
+}
+
+impl<E: Instr> HasMeta for TypedGuardedMethodCall<E> {
+    fn meta(&self) -> Meta {
+        self._meta.clone()
+    }
+}
+
+impl<E: Instr> WithMeta for TypedGuardedMethodCall<E> {
+    fn with_meta(mut self, meta: Meta) -> Self {
+        self._meta = meta;
+        self
+    }
+}
+
+impl<E> ChildVisitable<E> for TypedGuardedMethodCall<E>
+where
+    E: Instr + ChildVisitable<E>,
+{
+    fn visit_children<V>(&self, visitor: &mut V)
+    where
+        V: block_py::Visit<E> + ?Sized,
+    {
+        visitor.visit_instr(&self.func);
+        for arg in &self.args {
+            visitor.visit_instr(arg.expr());
+        }
+        for keyword in &self.keywords {
+            visitor.visit_instr(keyword.expr());
+        }
+    }
+
+    fn visit_children_mut<V>(&mut self, visitor: &mut V)
+    where
+        V: block_py::VisitMut<E> + ?Sized,
+    {
+        visitor.visit_instr_mut(&mut self.func);
+        for arg in &mut self.args {
+            visitor.visit_instr_mut(arg.expr_mut());
+        }
+        for keyword in &mut self.keywords {
+            visitor.visit_instr_mut(keyword.expr_mut());
+        }
+    }
+}
+
+impl<E: Instr> Mappable<E> for TypedGuardedMethodCall<E> {
+    type Mapped<T: Instr> = TypedGuardedMethodCall<T>;
+
+    fn map_children<T, M>(self, map: &mut M) -> Self::Mapped<T>
+    where
+        T: Instr,
+        M: MapInstr<E, T>,
+    {
+        TypedGuardedMethodCall {
+            _meta: self._meta,
+            extra: Default::default(),
+            func: Box::new(map.map_instr(*self.func)),
+            args: self
+                .args
+                .into_iter()
+                .map(|arg| arg.map_instr(|expr| map.map_instr(expr)))
+                .collect(),
+            keywords: self
+                .keywords
+                .into_iter()
+                .map(|keyword| keyword.map_instr(|expr| map.map_instr(expr)))
+                .collect(),
+            method_name: self.method_name,
+            method_guards: self.method_guards,
+        }
+    }
+
+    fn try_map_children<T, Error, M>(self, map: &mut M) -> Result<Self::Mapped<T>, Error>
+    where
+        T: Instr,
+        M: TryMapInstr<E, T, Error>,
+    {
+        Ok(TypedGuardedMethodCall {
+            _meta: self._meta,
+            extra: Default::default(),
+            func: Box::new(map.try_map_instr(*self.func)?),
+            args: self
+                .args
+                .into_iter()
+                .map(|arg| arg.try_map_instr(|expr| map.try_map_instr(expr)))
+                .collect::<Result<Vec<_>, _>>()?,
+            keywords: self
+                .keywords
+                .into_iter()
+                .map(|keyword| keyword.try_map_instr(|expr| map.try_map_instr(expr)))
+                .collect::<Result<Vec<_>, _>>()?,
+            method_name: self.method_name,
+            method_guards: self.method_guards,
+        })
+    }
+}
+
+#[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct TypedDirectMethodCall<E: Instr> {
+    _meta: Meta,
+    pub extra: E::Extra,
+    pub receiver: Box<E>,
+    pub args: Vec<CallArgPositional<E>>,
+    pub method_name: String,
+    pub guard: TypedDirectMethodCallGuard,
+}
+
+impl<E: Instr> TypedDirectMethodCall<E> {
+    pub fn new(
+        receiver: impl Into<Box<E>>,
+        args: impl Into<Vec<CallArgPositional<E>>>,
+        method_name: impl Into<String>,
+        guard: TypedDirectMethodCallGuard,
+    ) -> Self {
+        Self {
+            _meta: Meta::default(),
+            extra: Default::default(),
+            receiver: receiver.into(),
+            args: args.into(),
+            method_name: method_name.into(),
+            guard,
+        }
+    }
+}
+
+impl<E: Instr + std::fmt::Debug> std::fmt::Debug for TypedDirectMethodCall<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TypedDirectMethodCall")
+            .field("receiver", &self.receiver)
+            .field("args", &self.args)
+            .field("method_name", &self.method_name)
+            .field("guard", &self.guard)
+            .finish()
+    }
+}
+
+impl<E: Instr> HasMeta for TypedDirectMethodCall<E> {
+    fn meta(&self) -> Meta {
+        self._meta.clone()
+    }
+}
+
+impl<E: Instr> WithMeta for TypedDirectMethodCall<E> {
+    fn with_meta(mut self, meta: Meta) -> Self {
+        self._meta = meta;
+        self
+    }
+}
+
+impl<E> ChildVisitable<E> for TypedDirectMethodCall<E>
+where
+    E: Instr + ChildVisitable<E>,
+{
+    fn visit_children<V>(&self, visitor: &mut V)
+    where
+        V: block_py::Visit<E> + ?Sized,
+    {
+        visitor.visit_instr(&self.receiver);
+        for arg in &self.args {
+            visitor.visit_instr(arg.expr());
+        }
+    }
+
+    fn visit_children_mut<V>(&mut self, visitor: &mut V)
+    where
+        V: block_py::VisitMut<E> + ?Sized,
+    {
+        visitor.visit_instr_mut(&mut self.receiver);
+        for arg in &mut self.args {
+            visitor.visit_instr_mut(arg.expr_mut());
+        }
+    }
+}
+
+impl<E: Instr> Mappable<E> for TypedDirectMethodCall<E> {
+    type Mapped<T: Instr> = TypedDirectMethodCall<T>;
+
+    fn map_children<T, M>(self, map: &mut M) -> Self::Mapped<T>
+    where
+        T: Instr,
+        M: MapInstr<E, T>,
+    {
+        TypedDirectMethodCall {
+            _meta: self._meta,
+            extra: Default::default(),
+            receiver: Box::new(map.map_instr(*self.receiver)),
+            args: self
+                .args
+                .into_iter()
+                .map(|arg| arg.map_instr(|expr| map.map_instr(expr)))
+                .collect(),
+            method_name: self.method_name,
+            guard: self.guard,
+        }
+    }
+
+    fn try_map_children<T, Error, M>(self, map: &mut M) -> Result<Self::Mapped<T>, Error>
+    where
+        T: Instr,
+        M: TryMapInstr<E, T, Error>,
+    {
+        Ok(TypedDirectMethodCall {
+            _meta: self._meta,
+            extra: Default::default(),
+            receiver: Box::new(map.try_map_instr(*self.receiver)?),
+            args: self
+                .args
+                .into_iter()
+                .map(|arg| arg.try_map_instr(|expr| map.try_map_instr(expr)))
+                .collect::<Result<Vec<_>, _>>()?,
+            method_name: self.method_name,
+            guard: self.guard,
+        })
+    }
+}
+
+impl<E> PrettyPrint for TypedCall<E>
+where
+    E: Instr + PrettyPrint,
+{
+    fn fmt_pretty(&self, printer: &mut PrettyPrinter<'_>) -> std::fmt::Result {
+        std::fmt::Write::write_str(printer, "TypedCall { func: ")?;
+        self.func.fmt_pretty(printer)?;
+        std::fmt::Write::write_str(printer, ", args: ")?;
+        self.args.fmt_pretty(printer)?;
+        std::fmt::Write::write_str(printer, ", keywords: ")?;
+        self.keywords.fmt_pretty(printer)?;
+        std::fmt::Write::write_fmt(printer, format_args!(", access: {:?} }}", self.access))
+    }
+}
+
+impl<E> PrettyPrint for TypedDirectCallableCall<E>
+where
+    E: Instr + PrettyPrint,
+{
+    fn fmt_pretty(&self, printer: &mut PrettyPrinter<'_>) -> std::fmt::Result {
+        std::fmt::Write::write_str(printer, "TypedDirectCallableCall { func: ")?;
+        self.func.fmt_pretty(printer)?;
+        std::fmt::Write::write_str(printer, ", args: ")?;
+        self.args.fmt_pretty(printer)?;
+        std::fmt::Write::write_fmt(printer, format_args!(", guard: {:?} }}", self.guard))
+    }
+}
+
+impl<E> PrettyPrint for TypedGuardedCallableCall<E>
+where
+    E: Instr + PrettyPrint,
+{
+    fn fmt_pretty(&self, printer: &mut PrettyPrinter<'_>) -> std::fmt::Result {
+        std::fmt::Write::write_str(printer, "TypedGuardedCallableCall { func: ")?;
+        self.func.fmt_pretty(printer)?;
+        std::fmt::Write::write_str(printer, ", args: ")?;
+        self.args.fmt_pretty(printer)?;
+        std::fmt::Write::write_str(printer, ", keywords: ")?;
+        self.keywords.fmt_pretty(printer)?;
+        std::fmt::Write::write_fmt(
+            printer,
+            format_args!(
+                ", function_guards: {:?}, constructor_guards: {:?} }}",
+                self.function_guards, self.constructor_guards
+            ),
+        )
+    }
+}
+
+impl<E> PrettyPrint for TypedGuardedMethodCall<E>
+where
+    E: Instr + PrettyPrint,
+{
+    fn fmt_pretty(&self, printer: &mut PrettyPrinter<'_>) -> std::fmt::Result {
+        std::fmt::Write::write_str(printer, "TypedGuardedMethodCall { func: ")?;
+        self.func.fmt_pretty(printer)?;
+        std::fmt::Write::write_str(printer, ", args: ")?;
+        self.args.fmt_pretty(printer)?;
+        std::fmt::Write::write_str(printer, ", keywords: ")?;
+        self.keywords.fmt_pretty(printer)?;
+        std::fmt::Write::write_fmt(
+            printer,
+            format_args!(
+                ", method_name: {:?}, method_guards: {:?} }}",
+                self.method_name, self.method_guards
+            ),
+        )
+    }
+}
+
+impl<E> PrettyPrint for TypedDirectMethodCall<E>
+where
+    E: Instr + PrettyPrint,
+{
+    fn fmt_pretty(&self, printer: &mut PrettyPrinter<'_>) -> std::fmt::Result {
+        std::fmt::Write::write_str(printer, "TypedDirectMethodCall { receiver: ")?;
+        self.receiver.fmt_pretty(printer)?;
+        std::fmt::Write::write_str(printer, ", args: ")?;
+        self.args.fmt_pretty(printer)?;
+        std::fmt::Write::write_fmt(
+            printer,
+            format_args!(
+                ", method_name: {:?}, guard: {:?} }}",
+                self.method_name, self.guard
+            ),
+        )
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TypedDirectCallGuardTestKind {
+    RuntimeFunctionId { function_id: RuntimeFunctionId },
+}
+
+define_ruff_instr! {
+    pub struct TypedDirectCallGuardTest<E> {
+        value: Box<E>,
+        kind: TypedDirectCallGuardTestKind,
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub enum TypedAttrOwnerRef {
+    CpythonTypeSymbol(String),
+    TypeKey {
+        module_name: String,
+        qualname: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TypedIndexedFieldGuard {
+    pub expected_index: u32,
+    pub owner_type_ref: TypedAttrOwnerRef,
+    pub type_version: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TypedIndexedFieldPlanSource {
+    LegacyProfile,
+    OptimizationPlanV3,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TypedAttrAccessPlan {
+    Generic,
+    IndexedField {
+        source: TypedIndexedFieldPlanSource,
+        guards: Vec<TypedIndexedFieldGuard>,
+    },
+}
+
+define_ruff_instr! {
+    pub struct TypedGetAttr<E> {
+        value: Box<E>,
+        attr: Box<E>,
+        access: TypedAttrAccessPlan,
+    }
+}
+
+impl<E: Instr> TypedGetAttr<E> {
+    pub fn generic(value: impl Into<Box<E>>, attr: impl Into<Box<E>>) -> Self {
+        Self {
+            _meta: Meta::default(),
+            extra: Default::default(),
+            value: value.into(),
+            attr: attr.into(),
+            access: TypedAttrAccessPlan::Generic,
+        }
+    }
+
+    pub fn from_legacy(op: GetAttr<E>) -> Self {
+        Self {
+            _meta: op.meta(),
+            extra: op.extra,
+            value: op.value,
+            attr: op.attr,
+            access: TypedAttrAccessPlan::Generic,
+        }
+    }
+
+    pub fn into_legacy(self) -> GetAttr<E> {
+        GetAttr::new(self.value, self.attr)
+            .with_extra(self.extra)
+            .with_meta(self._meta)
+    }
+}
+
+define_ruff_instr! {
+    pub struct TypedSetAttr<E> {
+        value: Box<E>,
+        attr: Box<E>,
+        replacement: Box<E>,
+        access: TypedAttrAccessPlan,
+    }
+}
+
+impl<E: Instr> TypedSetAttr<E> {
+    pub fn generic(
+        value: impl Into<Box<E>>,
+        attr: impl Into<Box<E>>,
+        replacement: impl Into<Box<E>>,
+    ) -> Self {
+        Self {
+            _meta: Meta::default(),
+            extra: Default::default(),
+            value: value.into(),
+            attr: attr.into(),
+            replacement: replacement.into(),
+            access: TypedAttrAccessPlan::Generic,
+        }
+    }
+
+    pub fn from_legacy(op: SetAttr<E>) -> Self {
+        Self {
+            _meta: op.meta(),
+            extra: op.extra,
+            value: op.value,
+            attr: op.attr,
+            replacement: op.replacement,
+            access: TypedAttrAccessPlan::Generic,
+        }
+    }
+
+    pub fn into_legacy(self) -> SetAttr<E> {
+        SetAttr::new(self.value, self.attr, self.replacement)
+            .with_extra(self.extra)
+            .with_meta(self._meta)
+    }
 }
 
 #[derive(Clone, derive_more::From, DelegateMatchDefault)]

@@ -10,13 +10,7 @@ pub(crate) mod value_facts;
 use soac_core::block_py::{BlockPyFunction, LocalLocation, NameLocation, ResolvedName};
 pub use soac_lowering::passes::{
     CodegenModuleShape, DirectFunctionIdGuardTest, InstrCodegen, InstrCodegenOp, InstrResolved,
-    TypedAttrAccessPlan, TypedAttrOwnerRef, TypedCall, TypedCallAccessPlan, TypedCallEmissionPlan,
-    TypedCallEmissionPlans, TypedDirectCallArgPlan, TypedDirectCallArgSource,
-    TypedDirectCallGuardTest, TypedDirectCallGuardTestKind, TypedDirectCallableCall,
-    TypedDirectCallableCallGuard, TypedDirectConstructorCallGuard, TypedDirectFunctionCallGuard,
-    TypedDirectMethodCall, TypedDirectMethodCallGuard, TypedGetAttr, TypedGuardedCallableCall,
-    TypedGuardedMethodCall, TypedIndexedFieldGuard, TypedIndexedFieldPlanSource, TypedSetAttr,
-    TypedTruthy, assign_missing_codegen_function_instr_ids, reassign_codegen_function_instr_ids,
+    assign_missing_codegen_function_instr_ids, reassign_codegen_function_instr_ids,
     validate_codegen_instr_ids,
 };
 
@@ -66,8 +60,14 @@ pub fn allocate_codegen_stack_temp(
 }
 
 pub use crate::typed::{
-    InstrTyped, TypedCodegenModuleShape, TypedInstrExtra, TypedPlannedResult,
-    TypedPyObjectOwnershipPlan, TypedResultDemand, annotate_typed_function_planned_results,
+    InstrTyped, TypedAttrAccessPlan, TypedAttrOwnerRef, TypedCall, TypedCallAccessPlan,
+    TypedCallEmissionPlan, TypedCallEmissionPlans, TypedCodegenModuleShape, TypedDirectCallArgPlan,
+    TypedDirectCallArgSource, TypedDirectCallGuardTest, TypedDirectCallGuardTestKind,
+    TypedDirectCallableCall, TypedDirectCallableCallGuard, TypedDirectConstructorCallGuard,
+    TypedDirectFunctionCallGuard, TypedDirectMethodCall, TypedDirectMethodCallGuard, TypedGetAttr,
+    TypedGuardedCallableCall, TypedGuardedMethodCall, TypedIndexedFieldGuard,
+    TypedIndexedFieldPlanSource, TypedInstrExtra, TypedPlannedResult, TypedPyObjectOwnershipPlan,
+    TypedResultDemand, TypedSetAttr, TypedTruthy, annotate_typed_function_planned_results,
     annotate_typed_function_result_demands, annotate_typed_function_value_facts,
     annotate_typed_module_value_facts, lower_codegen_function_to_typed,
     lower_codegen_module_to_typed, lower_typed_function_call_access_plan_instrs,
