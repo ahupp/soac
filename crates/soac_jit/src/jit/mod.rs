@@ -135,7 +135,7 @@ use soac_opt::plan::{
 use soac_opt::plan_v3::{
     CallBodyKind as PlanV3CallBodyKind, IndexedFieldAccessKind as PlanV3IndexedFieldAccessKind,
     IndexedGlobalAccessKind as PlanV3IndexedGlobalAccessKind, MaterializeKind, PlanNodeId,
-    PlanValue, RegionId, RegionPlan, Rep, RichCompareOp, ScalarThreadMaterialization,
+    PlanValue, RegionId, RegionPlan, Rep, RichCompareOp,
 };
 use soac_opt::region_emission_v3::{
     ExactIntBranchSelection as OptV3ExactIntBranchSelection,
@@ -22967,15 +22967,6 @@ fn emit_opt_v3_scalar_threaded_store_branch(
     else {
         return Ok(None);
     };
-    if !matches!(
-        selection.thread.materialization,
-        ScalarThreadMaterialization::DeferredUntilPythonObjectUse { .. }
-    ) {
-        return Err(format!(
-            "prevalidated optimizer v3 scalar thread for local {} has non-mechanical materialization {:?}",
-            selection.thread.local.name, selection.thread.materialization
-        ));
-    }
 
     if let Some(store_instr_id) = store_expr.try_semantic_instr_id() {
         emit_ctx.require_deopt_point_before_instr_id(store_instr_id)?;

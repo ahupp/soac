@@ -3,7 +3,7 @@ use crate::emit_v3::{MechanicalExitKind, MechanicalRegionEmission, MechanicalSte
 use crate::plan_v3::{
     FailureMode, FallbackTarget, GuardFailure, RegionId, RegionPlan, ScalarLocalThreadPlan,
     ScalarThreadFallback, ScalarThreadLocalCleanup, ScalarThreadLocalLocation,
-    ScalarThreadLocalState,
+    ScalarThreadLocalState, ScalarThreadMaterialization,
 };
 use soac_core::block_py::{
     BlockArg, BlockLabel, BlockPyFunction, BlockTerm, ChildVisitable, InstrId, LocalLocation,
@@ -189,6 +189,15 @@ pub fn scalar_thread_selection_for_store_branch<'a>(
     };
     let ScalarThreadFallback::LocalFallbackRegion { region, .. } = &thread.fallback;
     debug_assert_eq!(*region, producer.fallback_plan.id);
+    if !matches!(
+        thread.materialization,
+        ScalarThreadMaterialization::DeferredUntilPythonObjectUse { .. }
+    ) {
+        return Err(format!(
+            "optimizer v3 scalar thread for local {} has materialization unsupported by current mechanical lowering: {:?}",
+            thread.local.name, thread.materialization
+        ));
+    }
     Ok(Some(ScalarThreadSelection {
         thread,
         producer,
