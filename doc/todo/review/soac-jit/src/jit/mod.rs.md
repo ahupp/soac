@@ -3,7 +3,7 @@
 ## File Responsibilities
 
 This is the main SOAC JIT backend. It owns Cranelift module setup, import/local symbol declaration, process-global JIT state,
-runtime support loading/inlining, module constants and counters, direct-call and constructor specialization, typed-value and
+runtime support loading/inlining, module constants and counters, direct-call specialization, typed-value and
 demand-aware lowering, deopt metadata, offline object emission, CLIF rendering, JIT dump recording, and compiled-handle
 lifetime management.
 
@@ -33,10 +33,9 @@ lifetime management.
   `RuntimeJitDeoptLocals`, `RuntimeJitDeoptCursor`, `RuntimeJitDeoptContinuation`, `RuntimeJitDeoptSupportCtx`, and
   `JitDeoptExitRef` describe deopt points, live values, resume cursors, and runtime materialization.
 - Codegen structures: `FunctionRuntimeDataLayout`, `JitEmitConsts`, `ModuleConstantAccess`, `ResultDemandPlan`,
-  `JitEmitCtx`, `JitGuardMissTarget`, `JitGuardMissDispatch`, `DirectMethodSpecialization`,
-  `DirectConstructorSpecialization`, `DirectFunctionSpecialization`, `DirectCallArgPlan`, `DirectCallArgSource`,
+  `JitEmitCtx`, `JitGuardMissTarget`, `JitGuardMissDispatch`, `DirectFunctionSpecialization`, `DirectCallArgPlan`, `DirectCallArgSource`,
   `DirectCallIncompatibility`, `DirectCallEntryKind`, `DirectEdgeStats`, `FieldIndexSpecialization`,
-  `CpythonTypeSymbol`, `RelocTypeRef`, `RelocCallableRef`, `LocalEnvCodegenIntrinsicEmitState`, `LocalEnvEntry`,
+  `CpythonTypeSymbol`, `RelocTypeRef`, `LocalEnvCodegenIntrinsicEmitState`, `LocalEnvEntry`,
   `LocalEnvStorage`, `LocalEnv`, `LocalFailureCleanupValue`, `LocalFailureCleanupValueKey`, `StackSlots`,
   `ExceptionStateSlots`, `PendingLocalFailureCleanup`, `PendingLocalFailureContinuation`, and `LocalFailureCleanupKey`
   hold codegen context, local storage, cleanup, specialization, and relocation state.
@@ -50,7 +49,7 @@ lifetime management.
 
 - Symbol/name helpers: `py_dealloc_symbol`, `jit_data_symbols`, `type_key_runtime_registry`, `register_jit_data_symbol`,
   `lookup_registered_jit_data_symbol`, `cpython_type_symbol_name`, `push_symbol_component_hex`,
-  `reloc_type_ref_symbol_name`, `reloc_callable_ref_symbol_name`, module/counter/direct symbol-scope helpers, and
+  `reloc_type_ref_symbol_name`, module/counter/direct symbol-scope helpers, and
   `jit_python_perf_symbol_name` construct stable names and maintain symbol registries.
 - Module constants/counters: `declare_module_constant_object_data*`, `define_scalar_counter_storage_data*`,
   `declare_scalar_counter_storage_import`, `define_top_value_counter_storage_data*`,
@@ -84,10 +83,9 @@ lifetime management.
   `emit_i32_bool01_*`, `emit_to_python_bool`, `emit_checked_owned_pyobject_result`, `emit_to_python_long`,
   `emit_release_*`, `emit_owned_bool_from_*`, `emit_truthy_from_*`, and `emit_branch_index_i64` produce typed and boxed
   values with Python error checks.
-- Calls/direct calls: `direct_method_specializations_for_call_site`, `direct_constructor_specializations_for_call_site`,
-  `collect_call_direct_targets`, call-target specialization loaders, direct-call compatibility/planning helpers,
-  direct-call emitters, vectorcall/tuple/kwargs/unpack emitters, runtime primitive ABI helpers, and scalar result emitters
-  implement direct Python calls, constructor fast paths, and builtin/runtime primitive calls.
+- Calls/direct calls: `collect_call_direct_targets`, call-target specialization loaders, direct-call
+  compatibility/planning helpers, direct-call emitters, vectorcall/tuple/kwargs/unpack emitters, runtime primitive ABI
+  helpers, and scalar result emitters implement direct Python calls and builtin/runtime primitive calls.
 - Expression/statement/term codegen: `emit_codegen_expr*_with_local_env`, `emit_typed_codegen_expr*_with_local_env`,
   `emit_codegen_simple_call*`, `emit_codegen_call*`, `emit_codegen_stmt*`, `emit_typed_codegen_stmt*`,
   `emit_typed_codegen_ops`, `emit_codegen_if_*`, `emit_codegen_return_pyobject`, `emit_codegen_branch_table_from_i64`,

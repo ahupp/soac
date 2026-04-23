@@ -271,20 +271,6 @@ fn transformed_module_methods_register_owner_types_for_lookup() {
             .getattr("C")
             .expect("executed module should define C");
         let owner_type = cls.as_ptr() as *mut pyo3::ffi::PyTypeObject;
-        let function = class_dict_function(owner_type, c"f");
-        let function_id = soac_jit::registered_clif_function_id(function)
-            .expect("registered function id lookup should succeed")
-            .expect("transformed method should carry a RuntimeFunctionId");
-        let owners = soac_jit::lookup_exact_owner_types_for_method(function_id, "f")
-            .expect("exact owner lookup should succeed");
-        assert_eq!(
-            owners.len(),
-            1,
-            "expected one owner type for transformed C.f"
-        );
-        assert_eq!(owners[0].owner_type, owner_type);
-        assert_eq!(owners[0].function_obj, function);
-
         let init_function = class_dict_function(owner_type, c"__init__");
         let init_function_id = soac_jit::registered_clif_function_id(init_function)
             .expect("registered __init__ function id lookup should succeed")
@@ -301,7 +287,6 @@ fn transformed_module_methods_register_owner_types_for_lookup() {
         assert_eq!(constructor_owners[0].init_function_obj, init_function);
 
         pyo3::ffi::Py_DECREF(init_function);
-        pyo3::ffi::Py_DECREF(function);
     });
 }
 

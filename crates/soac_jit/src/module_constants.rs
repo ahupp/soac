@@ -471,11 +471,6 @@ impl ModuleConstantCollector {
             InstrCodegen::DirectCallableCall(op) => {
                 op.visit_children(self);
             }
-            InstrCodegen::DirectMethodCall(op) => {
-                self.constants
-                    .intern_unicode_bytes(op.method_name.as_str().as_bytes());
-                op.visit_children(self);
-            }
             InstrCodegen::GetAttr(op) => {
                 if let Some(attr_bytes) =
                     self.string_constant_bytes_for_specialized_codegen(op.attr.as_ref())

@@ -3,7 +3,7 @@
 ## File Responsibilities
 
 Provides Rust/CPython helper functions registered as symbols for generated JIT code. These helpers cover CPython calls,
-global/name/cell operations, object/item/attribute access, deopt entry, counters, constructor helpers, exception helpers,
+global/name/cell operations, object/item/attribute access, deopt entry, counters, exception helpers,
 and perf-attribution wrapper variants. The file is intentionally ABI-shaped and mostly raw FFI.
 
 ## Datatypes
@@ -27,9 +27,8 @@ and perf-attribution wrapper variants. The file is intentionally ABI-shaped and 
   `py_call_object_hook`, `dp_jit_py_call_object`, `py_vectorcall_hook`, `dp_jit_py_vectorcall`,
   `py_call_with_kw_hook`, `dp_jit_py_call_with_kw`, `get_arg_item_hook`, and `dp_jit_get_arg_item` bridge generated call
   shapes to CPython call APIs.
-- Iterator/recursion/constructor helpers: `next_or_sentinel_hook`, `dp_jit_next_or_sentinel`,
-  `enter_recursive_call_hook`, `dp_jit_enter_recursive_call`, `pytype_generic_alloc_hook`,
-  `dp_jit_pytype_generic_alloc`, `finish_constructor_init_hook`, and `dp_jit_finish_constructor_init`.
+- Iterator/recursion helpers: `next_or_sentinel_hook`, `dp_jit_next_or_sentinel`,
+  `enter_recursive_call_hook`, and `dp_jit_enter_recursive_call`.
 - Global and runtime-name helpers: `load_global_obj_impl`, `ensure_global_load_error`, `guarded_indexed_global_slot`,
   `globals_builtins_owned`, `load_global_slow`, `load_global_obj_hook`, `dp_jit_load_global_obj`,
   `soac_runtime_load_global_slow`, `store_global_hook`, `dp_jit_store_global`, `del_quietly_hook`,

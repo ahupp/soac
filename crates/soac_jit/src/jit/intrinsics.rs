@@ -1696,7 +1696,6 @@ pub(super) fn emit_operation<'fb>(
         InstrCodegen::Call(_) => None,
         InstrCodegen::CallDirect(_) => None,
         InstrCodegen::DirectCallableCall(_) => None,
-        InstrCodegen::DirectMethodCall(_) => None,
         InstrCodegen::BinOp(op) => Some(emit_counted_binop(op, state)),
         InstrCodegen::UnaryOp(op) => Some(emit_unary_op(op.kind, state, &[op.operand.as_ref()])),
         InstrCodegen::GetAttr(op) => {

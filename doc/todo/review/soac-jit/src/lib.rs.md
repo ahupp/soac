@@ -5,7 +5,7 @@
 Crate root and Python-function integration layer for SOAC's JIT extension. It exposes submodules, embeds generated runtime
 CLIF, manages CPython metadata attached to `PyFunction`/heap types, creates per-function JIT environments, binds vectorcall
 arguments for direct entries, lazily compiles CLIF function bodies/trampolines, and registers owner-type relationships used by
-direct method and constructor specialization.
+constructor-local specialization metadata.
 
 ## Datatypes
 
@@ -22,9 +22,8 @@ direct method and constructor specialization.
 - `DirectArgParamBinding`: parameter metadata needed for vectorcall-to-direct argument binding.
 - `DirectArgBindingPlan`: precomputed binding plan for positional, keyword, `*args`, `**kwargs`, and default slots.
 - `RegisteredFunctionOwnerTypes`: weakrefs from one function to owner types that currently define it.
-- `FunctionOwnerTypeRegistry`: process-wide function watcher plus weakref registry for method/constructor specialization.
-- `DirectMethodOwnerType`: exact owner type plus function object/version data for direct method guards.
-- `DirectConstructorOwnerType`: exact owner type plus `__init__` function/version data for direct constructor guards.
+- `FunctionOwnerTypeRegistry`: process-wide function watcher plus weakref registry for constructor owner metadata.
+- `ConstructorOwnerType`: exact owner type plus `__init__` function/version data.
 
 ## Functions
 
@@ -60,8 +59,7 @@ direct method and constructor specialization.
 - `registered_clif_function_id`, `registered_clif_type_function_id`: read SOAC function ids from CPython function/type
   metadata.
 - Owner-type registration helpers: `register_owner_type_for_function`, `incref_weakref_snapshot`, `resolve_weakref_target`,
-  `lookup_exact_owner_types_for_function_object`, `owner_type_has_simple_default_constructor`,
-  `lookup_exact_owner_types_for_constructor_object`, `lookup_exact_owner_types_for_method`,
+  `lookup_exact_owner_types_for_function_object`, `lookup_exact_owner_types_for_constructor_object`,
   `lookup_exact_owner_types_for_constructor`, `type_is_defined_in_module`, `register_owner_types_from_type`,
   `register_function_owner_type_value`, `register_function_owner_type_indexed_key`,
   `register_function_owner_types_for_globals`, `register_function_owner_types_for_module`,
@@ -85,4 +83,3 @@ direct method and constructor specialization.
 - `crates/soac_jit/src/jit/direct_abi.rs`
 - `crates/soac_jit/src/module_type.rs`
 - `soac-blockpy/src/block_py.rs`
-

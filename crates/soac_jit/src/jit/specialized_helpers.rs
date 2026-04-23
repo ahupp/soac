@@ -27,10 +27,6 @@ unsafe extern "C" {
         dict: *mut ffi::PyObject,
         key: *mut ffi::PyObject,
     ) -> ffi::Py_ssize_t;
-    fn PyType_GenericAlloc(
-        type_obj: *mut ffi::PyTypeObject,
-        nitems: ffi::Py_ssize_t,
-    ) -> *mut ffi::PyObject;
     fn PyDict_GetItemRef(
         dict: *mut ffi::PyObject,
         key: *mut ffi::PyObject,
@@ -173,57 +169,6 @@ pub unsafe extern "C" fn dp_jit_enter_recursive_call(tstate: ObjPtr) -> i32 {
     enter_recursive_call_hook(tstate)
 }
 
-unsafe extern "C" fn pytype_generic_alloc_hook(type_obj: ObjPtr, nitems: i64) -> ObjPtr {
-    if type_obj.is_null() || nitems < 0 {
-        ffi::PyErr_SetString(
-            ffi::PyExc_RuntimeError,
-            b"invalid arguments to dp_jit_pytype_generic_alloc\0".as_ptr() as *const i8,
-        );
-        return ptr::null_mut();
-    }
-    PyType_GenericAlloc(
-        type_obj as *mut ffi::PyTypeObject,
-        nitems as ffi::Py_ssize_t,
-    ) as ObjPtr
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn dp_jit_pytype_generic_alloc(type_obj: ObjPtr, nitems: i64) -> ObjPtr {
-    pytype_generic_alloc_hook(type_obj, nitems)
-}
-
-unsafe extern "C" fn finish_constructor_init_hook(obj: ObjPtr, init_result: ObjPtr) -> ObjPtr {
-    if obj.is_null() {
-        ffi::PyErr_SetString(
-            ffi::PyExc_RuntimeError,
-            b"invalid constructor object in dp_jit_finish_constructor_init\0".as_ptr() as *const i8,
-        );
-        return ptr::null_mut();
-    }
-    let obj = obj as *mut ffi::PyObject;
-    let init_result = init_result as *mut ffi::PyObject;
-    if init_result.is_null() {
-        ffi::Py_DECREF(obj);
-        return ptr::null_mut();
-    }
-    if init_result != ffi::Py_None() {
-        let type_name = object_type_name(init_result);
-        let message = format!("__init__() should return None, not '{type_name}'");
-        if let Ok(c_message) = std::ffi::CString::new(message) {
-            ffi::PyErr_SetString(ffi::PyExc_TypeError, c_message.as_ptr());
-        } else {
-            ffi::PyErr_SetString(
-                ffi::PyExc_TypeError,
-                b"__init__() should return None\0".as_ptr() as *const i8,
-            );
-        }
-        ffi::Py_DECREF(init_result);
-        ffi::Py_DECREF(obj);
-        return ptr::null_mut();
-    }
-    ffi::Py_DECREF(init_result);
-    obj as ObjPtr
-}
 unsafe extern "C" fn guard_method_type_version_hook(
     receiver: ObjPtr,
     expected_type: ObjPtr,
@@ -635,14 +580,6 @@ unsafe extern "C" fn raise_deleted_name_error_hook(name_obj: ObjPtr) {
         ffi::PyExc_UnboundLocalError,
         b"cannot access local variable before assignment\0".as_ptr() as *const i8,
     );
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn dp_jit_finish_constructor_init(
-    obj: ObjPtr,
-    init_result: ObjPtr,
-) -> ObjPtr {
-    finish_constructor_init_hook(obj, init_result)
 }
 
 unsafe extern "C" fn raise_missing_required_argument_hook() {
@@ -1564,14 +1501,6 @@ pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
     builder.symbol(
         "dp_jit_enter_recursive_call",
         enter_recursive_call_hook as *const u8,
-    );
-    builder.symbol(
-        "dp_jit_pytype_generic_alloc",
-        pytype_generic_alloc_hook as *const u8,
-    );
-    builder.symbol(
-        "dp_jit_finish_constructor_init",
-        finish_constructor_init_hook as *const u8,
     );
     builder.symbol(
         "dp_jit_py_call_with_kw",

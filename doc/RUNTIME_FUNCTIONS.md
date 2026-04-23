@@ -58,8 +58,6 @@ Direct exported helpers:
 soac_runtime_set_runtime_error_static
 soac_runtime_load_global_slow
 dp_jit_enter_recursive_call
-dp_jit_pytype_generic_alloc
-dp_jit_finish_constructor_init
 dp_jit_push_handled_exception
 dp_jit_pop_handled_exception
 dp_jit_record_top_value_sample

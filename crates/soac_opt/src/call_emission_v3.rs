@@ -130,16 +130,8 @@ pub fn typed_call_emission_plans_from_v3(
             .entry(*source)
             .or_insert_with(|| TypedCallEmissionPlan::Callable {
                 function_guards: Vec::new(),
-                constructor_guards: Vec::new(),
             });
-        let TypedCallEmissionPlan::Callable {
-            function_guards, ..
-        } = plan
-        else {
-            return Err(format!(
-                "optimizer v3 call source {source} has both direct and method emissions"
-            ));
-        };
+        let TypedCallEmissionPlan::Callable { function_guards } = plan;
         function_guards.extend(direct_calls.iter().map(|direct_call| {
             TypedDirectFunctionCallGuard {
                 function_id: direct_call.target,

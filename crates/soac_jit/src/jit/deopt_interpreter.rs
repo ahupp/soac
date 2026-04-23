@@ -932,9 +932,6 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
             InstrCodegen::DirectCallableCall(_) => {
                 Err("deopt continuation direct callable call is unsupported".to_string())
             }
-            InstrCodegen::DirectMethodCall(_) => {
-                Err("deopt continuation direct method call is unsupported".to_string())
-            }
             InstrCodegen::Store(store) => unsafe { self.execute_store_owned(store) },
             InstrCodegen::Del(del) => unsafe { self.execute_del_owned(del) },
             InstrCodegen::IncrementCounter(_) => Ok(owned_none()),

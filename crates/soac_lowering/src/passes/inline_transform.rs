@@ -2661,9 +2661,6 @@ impl TryMapInstr<InstrCodegen, InstrCodegen, InlineUnsupportedReason>
             InstrCodegenOp::DirectCallableCall(op) => {
                 InstrCodegenOp::DirectCallableCall(op.try_map_children(self)?)
             }
-            InstrCodegenOp::DirectMethodCall(op) => {
-                InstrCodegenOp::DirectMethodCall(op.try_map_children(self)?)
-            }
             InstrCodegenOp::GetAttr(op) => InstrCodegenOp::GetAttr(op.try_map_children(self)?),
             InstrCodegenOp::SetAttr(op) => InstrCodegenOp::SetAttr(op.try_map_children(self)?),
             InstrCodegenOp::GetItem(op) => InstrCodegenOp::GetItem(op.try_map_children(self)?),
@@ -2767,9 +2764,6 @@ impl MapInstr<InstrCodegen, InstrCodegen> for InstrIdScrubber {
             InstrCodegenOp::CallDirect(op) => InstrCodegenOp::CallDirect(op.map_children(self)),
             InstrCodegenOp::DirectCallableCall(op) => {
                 InstrCodegenOp::DirectCallableCall(op.map_children(self))
-            }
-            InstrCodegenOp::DirectMethodCall(op) => {
-                InstrCodegenOp::DirectMethodCall(op.map_children(self))
             }
             InstrCodegenOp::GetAttr(op) => InstrCodegenOp::GetAttr(op.map_children(self)),
             InstrCodegenOp::SetAttr(op) => InstrCodegenOp::SetAttr(op.map_children(self)),

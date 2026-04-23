@@ -104,9 +104,6 @@ fn collect_helper_like_names_in_expr(out: &mut Vec<String>, expr: &InstrCodegen)
         InstrCodegen::DirectCallableCall(operation) => {
             operation.visit_children(&mut HelperNameVisitor { out });
         }
-        InstrCodegen::DirectMethodCall(operation) => {
-            operation.visit_children(&mut HelperNameVisitor { out });
-        }
         InstrCodegen::BinOp(operation) => {
             operation.visit_children(&mut HelperNameVisitor { out });
         }

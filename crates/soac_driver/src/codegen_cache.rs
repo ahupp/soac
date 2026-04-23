@@ -368,15 +368,7 @@ impl VisitMut<InstrCodegen> for FunctionIdRemapper {
             InstrCodegen::CallDirect(op) => {
                 op.function_id = self.remap(op.function_id);
             }
-            InstrCodegen::DirectCallableCall(op) => match &mut op.guard {
-                soac_lowering::passes::TypedDirectCallableCallGuard::Function(guard) => {
-                    guard.function_id = self.remap(guard.function_id);
-                }
-                soac_lowering::passes::TypedDirectCallableCallGuard::Constructor(guard) => {
-                    guard.function_id = self.remap(guard.function_id);
-                }
-            },
-            InstrCodegen::DirectMethodCall(op) => {
+            InstrCodegen::DirectCallableCall(op) => {
                 op.guard.function_id = self.remap(op.guard.function_id);
             }
             InstrCodegen::DirectFunctionIdGuardTest(op) => {
