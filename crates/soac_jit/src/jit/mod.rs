@@ -38,8 +38,8 @@ use soac_core::block_py::{
     BlockPyModule, BlockTerm, CallArgKeyword, CallArgPositional, CallableScopeKind, CellLocation,
     ChildVisitable, CounterBranchId, CounterDef, CounterId, CounterScope, CounterSite, Del,
     DeoptEntrySource, FunctionExecutionMode, FunctionKind, HasMeta, HasSemanticInstrId, InstrId,
-    InstrKey, LocalFunctionId, LocalLocation, ModuleContentId, NameLocation, ParamKind,
-    PersistentFunctionId, ResolvedName, RuntimeFunctionId, RuntimeModuleId, RuntimeName,
+    InstrKey, LocalFunctionId, LocalLocation, ModuleContentId, ModuleShape, NameLocation,
+    ParamKind, PersistentFunctionId, ResolvedName, RuntimeFunctionId, RuntimeModuleId, RuntimeName,
     SerializedFunctionId, StorageLayout, Store, Visit, VisitMut, WithMeta,
 };
 use soac_core::profile::{
@@ -53,10 +53,6 @@ use soac_driver::codegen_cache::{
 };
 use soac_driver::finish_cached_codegen_module_for_runtime_with_counter_defs;
 use soac_lowering::block_py::literal::Literal;
-use soac_lowering::passes::{
-    CodegenModuleShape, DirectCallableTypeVersionGuardTest, DirectFunctionIdGuardTest,
-    DirectReceiverTypeVersionGuardTest, InstrCodegen, InstrResolved,
-};
 use soac_opt::access_emission_v3::{
     ExactListItemAccessPlan as OptV3ExactListItemAccessPlan,
     IndexedFieldAccessPlan as OptV3IndexedFieldAccessPlan,
@@ -90,7 +86,9 @@ use soac_opt::emit_v3::{
     mechanical_region_function_param_inputs as opt_v3_mechanical_region_function_param_inputs,
 };
 use soac_opt::passes::{
-    FactStore, FunctionRefcountPlan, InstrTyped, LocalEnvResumeBinding, LocalEnvResumeBindingState,
+    CodegenModuleShape, DirectCallableTypeVersionGuardTest, DirectFunctionIdGuardTest,
+    DirectReceiverTypeVersionGuardTest, FactStore, FunctionRefcountPlan, InstrCodegen,
+    InstrResolved, InstrTyped, LocalEnvResumeBinding, LocalEnvResumeBindingState,
     LocalEnvResumeEntry, LocalEnvResumePoint, LocalEnvResumeStatePrecision,
     LocalEnvResumeValueSource, LocalRefState, PyExactType, PyObjFacts, RefcountActionKind,
     RefcountReleaseReason, RefcountSite, RuntimeHelperId, TypedAttrAccessPlan, TypedAttrOwnerRef,
@@ -102,11 +100,13 @@ use soac_opt::passes::{
     TypedGuardedMethodCall, TypedIndexedFieldGuard, TypedIndexedFieldPlanSource,
     TypedPlannedResult, TypedPyObjectOwnershipPlan, TypedSetAttr, ValueFacts,
     annotate_typed_function_planned_results, annotate_typed_function_result_demands,
-    annotate_typed_function_value_facts, infer_module_value_facts, lower_codegen_function_to_typed,
+    annotate_typed_function_value_facts, annotate_typed_module_value_facts,
+    infer_module_value_facts, lower_codegen_function_to_typed, lower_codegen_module_to_typed,
     lower_typed_function_call_access_plan_instrs, lower_typed_function_call_emission_plans,
-    lower_typed_function_if_tests_to_truthy, refresh_typed_function_value_facts,
-    try_lower_typed_instr_to_codegen_legacy, try_lower_typed_term_to_codegen_legacy,
-    validate_typed_function_call_access_plans, validate_typed_function_value_facts,
+    lower_typed_function_if_tests_to_truthy, lower_typed_if_tests_to_truthy,
+    refresh_typed_function_value_facts, try_lower_typed_instr_to_codegen_legacy,
+    try_lower_typed_term_to_codegen_legacy, validate_typed_function_call_access_plans,
+    validate_typed_function_value_facts,
 };
 use soac_opt::plan_v3::{
     IndexedFieldAccessKind as PlanV3IndexedFieldAccessKind,
@@ -185,9 +185,9 @@ pub use planning::{
     RuntimeBlockParamPlan, check_refcount_plan_against_current_jit, exc_dispatch_plan,
     local_ref_kind_for_stack_mirror, plan_function_locals, plan_function_refcount_ownership,
     plan_jit_deopt_resume_module, plan_jit_deopt_resume_module_from_passes,
-    plan_jit_function_locals, plan_jit_module_locals,
-    planned_implicit_target_transports_for_function, planned_jit_params_for_function,
-    planned_jump_edge_transports_for_function,
+    plan_jit_function_locals, plan_jit_module_locals, plan_jit_typed_deopt_resume_module,
+    plan_jit_typed_module_locals, planned_implicit_target_transports_for_function,
+    planned_jit_params_for_function, planned_jump_edge_transports_for_function,
     planned_local_env_entry_materializations_for_function,
     planned_stack_slot_entry_seeds_for_function, render_jit_deopt_resume_function,
     render_jit_deopt_resume_module, render_jit_function_locals, render_jit_module_locals,
@@ -217,6 +217,7 @@ static TYPE_KEY_RUNTIME_REGISTRY: OnceLock<Mutex<HashMap<CounterDumpTypeKey, usi
     OnceLock::new();
 const JIT_ARENA_BYTES: usize = 256 * 1024 * 1024;
 const MISSING_PYTHON_EXCEPTION_TRAP: ir::TrapCode = ir::TrapCode::unwrap_user(1);
+#[allow(dead_code)]
 const OPT_V3_FUSED_CONSUMER_TRAP: ir::TrapCode = ir::TrapCode::unwrap_user(2);
 const COLD_BLOCK_ENTRY_RATE_DENOMINATOR: u64 = 100;
 thread_local! {
@@ -312,43 +313,43 @@ fn reloc_callable_ref_symbol_name(callable_ref: &RelocCallableRef) -> String {
     }
 }
 
-fn module_constant_symbol_prefix(module: &BlockPyModule<CodegenModuleShape>) -> String {
+fn module_constant_symbol_prefix<P: ModuleShape>(module: &BlockPyModule<P>) -> String {
     format!(
         "__soac_module_constant_{}",
         module.module_name_gen.module_id()
     )
 }
 
-fn module_constant_symbol_prefix_for_instance(
-    module: &BlockPyModule<CodegenModuleShape>,
+fn module_constant_symbol_prefix_for_instance<P: ModuleShape>(
+    module: &BlockPyModule<P>,
     instance_key: usize,
 ) -> String {
     format!("{}_{}", module_constant_symbol_prefix(module), instance_key)
 }
 
-fn scalar_counter_storage_symbol(module: &BlockPyModule<CodegenModuleShape>) -> String {
+fn scalar_counter_storage_symbol<P: ModuleShape>(module: &BlockPyModule<P>) -> String {
     format!(
         "__soac_scalar_counters_{}",
         module.module_name_gen.module_id()
     )
 }
 
-fn scalar_counter_storage_symbol_for_instance(
-    module: &BlockPyModule<CodegenModuleShape>,
+fn scalar_counter_storage_symbol_for_instance<P: ModuleShape>(
+    module: &BlockPyModule<P>,
     instance_key: usize,
 ) -> String {
     format!("{}_{}", scalar_counter_storage_symbol(module), instance_key)
 }
 
-fn top_value_counter_storage_symbol(module: &BlockPyModule<CodegenModuleShape>) -> String {
+fn top_value_counter_storage_symbol<P: ModuleShape>(module: &BlockPyModule<P>) -> String {
     format!(
         "__soac_top_value_counters_{}",
         module.module_name_gen.module_id()
     )
 }
 
-fn top_value_counter_storage_symbol_for_instance(
-    module: &BlockPyModule<CodegenModuleShape>,
+fn top_value_counter_storage_symbol_for_instance<P: ModuleShape>(
+    module: &BlockPyModule<P>,
     instance_key: usize,
 ) -> String {
     format!(
@@ -486,10 +487,10 @@ fn declare_module_constant_object_data_for_symbol(
 
 fn declare_module_constant_object_data(
     jit_module: &mut JITModule,
-    module: &BlockPyModule<CodegenModuleShape>,
+    module: &BlockPyModule<impl ModuleShape>,
     module_constant_ptrs: &[*mut ffi::PyObject],
 ) -> Result<Vec<DataId>, String> {
-    let instance_key = module as *const BlockPyModule<CodegenModuleShape> as usize;
+    let instance_key = std::ptr::from_ref(module).cast::<()>() as usize;
     let symbol_prefix = module_constant_symbol_prefix_for_instance(module, instance_key);
     declare_module_constant_object_data_for_prefix(
         jit_module,
@@ -543,7 +544,7 @@ fn define_scalar_counter_storage_data_for_symbol(
 
 fn define_scalar_counter_storage_data(
     jit_module: &mut JITModule,
-    module: &BlockPyModule<CodegenModuleShape>,
+    module: &BlockPyModule<impl ModuleShape>,
     scalar_counter_count: usize,
 ) -> Result<DataId, String> {
     define_scalar_counter_storage_data_for_symbol(
@@ -589,7 +590,7 @@ fn define_top_value_counter_storage_data_for_symbol(
 
 fn define_top_value_counter_storage_data(
     jit_module: &mut JITModule,
-    module: &BlockPyModule<CodegenModuleShape>,
+    module: &BlockPyModule<impl ModuleShape>,
     top_value_counter_count: usize,
 ) -> Result<DataId, String> {
     define_top_value_counter_storage_data_for_symbol(
@@ -1764,8 +1765,7 @@ impl JitBatchPlan<'_> {
             })?;
             let ptrs = owners.iter().map(|obj| obj.as_ptr()).collect::<Vec<_>>();
             let owners = Arc::new(owners);
-            let object_binding_key =
-                planned_module as *const BlockPyModule<CodegenModuleShape> as usize;
+            let object_binding_key = std::ptr::from_ref(planned_module).cast::<()>() as usize;
             let symbol_prefix =
                 module_constant_symbol_prefix_for_instance(planned_module, object_binding_key);
             let data_ids = state.ensure_module_constant_objects(
@@ -1792,7 +1792,7 @@ impl JitBatchPlan<'_> {
 }
 
 pub(crate) struct JitModulePlan {
-    module: Arc<BlockPyModule<CodegenModuleShape>>,
+    module: Arc<BlockPyModule<TypedCodegenModuleShape>>,
     value_facts: FactStore,
     locals: PlannedJitModuleLocals,
     deopt_resume: PlannedJitDeoptResumeModule,
@@ -1800,12 +1800,12 @@ pub(crate) struct JitModulePlan {
 
 fn collect_codegen_constants_for_module_name(
     module_name: &str,
-    module: &BlockPyModule<CodegenModuleShape>,
+    module: &BlockPyModule<TypedCodegenModuleShape>,
 ) -> ModuleCodegenConstants {
     if module_name == "soac.runtime" {
-        ModuleCodegenConstants::collect_from_runtime_module(module)
+        ModuleCodegenConstants::collect_from_typed_runtime_module(module)
     } else {
-        ModuleCodegenConstants::collect_from_module(module)
+        ModuleCodegenConstants::collect_from_typed_module(module)
     }
 }
 
@@ -1813,10 +1813,23 @@ fn build_jit_module_plan_from_owned_module(
     module: BlockPyModule<CodegenModuleShape>,
 ) -> Result<Arc<JitModulePlan>, String> {
     let value_facts = infer_jit_value_facts(&module);
-    let locals = plan_jit_module_locals(&module, &value_facts)?;
-    let deopt_resume = plan_jit_deopt_resume_module(&module, &value_facts)?;
+    let mut typed_module = lower_codegen_module_to_typed(module);
+    annotate_typed_module_value_facts(&mut typed_module, &value_facts);
+    let typed_module = lower_typed_if_tests_to_truthy(typed_module);
+    build_jit_typed_module_plan_from_owned_module(typed_module, value_facts)
+}
+
+fn build_jit_typed_module_plan_from_owned_module(
+    typed_module: BlockPyModule<TypedCodegenModuleShape>,
+    value_facts: FactStore,
+) -> Result<Arc<JitModulePlan>, String> {
+    for function in &typed_module.callable_defs {
+        validate_typed_function_value_facts(function)?;
+    }
+    let locals = plan_jit_typed_module_locals(&typed_module, &value_facts)?;
+    let deopt_resume = plan_jit_typed_deopt_resume_module(&typed_module, &value_facts)?;
     Ok(Arc::new(JitModulePlan {
-        module: Arc::new(module),
+        module: Arc::new(typed_module),
         value_facts,
         locals,
         deopt_resume,
@@ -2593,6 +2606,10 @@ impl ProcessJitState {
         batch_function: &ProcessJitBatchFunction<'_>,
     ) -> Result<ReservedJitFunctionCompileInputs, String> {
         if let Some(shared_state) = batch_function.source.shared_state() {
+            let specialization_profile = SpecializationProfile::from_runtime_state_with_session(
+                Some(shared_state),
+                Some(inputs.session.as_ref()),
+            )?;
             let module_constant_ptrs = shared_state.module_constant_ptrs();
             let instance_key = shared_state.storage_instance_key();
             let scalar_counter_symbol =
@@ -2643,10 +2660,6 @@ impl ProcessJitState {
                 shared_state.counter_slots_by_id(),
                 scalar_counter_data_id,
                 Some(symbol_scope.as_str()),
-            )?;
-            let specialization_profile = SpecializationProfile::from_runtime_state_with_session(
-                Some(shared_state),
-                Some(inputs.session.as_ref()),
             )?;
             predeclare_specialization_type_imports(jit_module, &specialization_profile)?;
             let specialization_inputs = FunctionSpecializationInputs::from_profile(
@@ -2973,7 +2986,7 @@ impl ProcessJitState {
                 )
             })?;
         let function_deopt_table = Arc::new(RuntimeJitDeoptTable::from_plan_with_owned_constants(
-            function,
+            original_function,
             function_jit_deopt_resume_plan,
             reserved_inputs.module_constant_ptrs.as_slice(),
             reserved_inputs.module_constant_owners.clone(),
@@ -2983,6 +2996,7 @@ impl ProcessJitState {
             function_blocks,
             function_module,
             function,
+            Some(original_function),
             &function_module_plan.value_facts,
             function_jit_local_plan,
             function_jit_deopt_resume_plan,
@@ -3579,6 +3593,7 @@ pub(crate) struct RuntimeJitDeoptCursor {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RuntimeJitDeoptUnsupportedReason {
     WrongFunction,
+    #[allow(dead_code)]
     MissingFunction,
     MissingBlock,
     MissingInstruction,
@@ -4119,6 +4134,75 @@ fn runtime_jit_deopt_continuation_for_point(
             } else {
                 RuntimeJitDeoptContinuation::unsupported(
                     RuntimeJitDeoptUnsupportedReason::UnsupportedBlockTail,
+                )
+            }
+        }
+    }
+}
+
+fn runtime_jit_typed_deopt_continuation_for_point(
+    function: &BlockPyFunction<TypedCodegenModuleShape>,
+    point: LocalEnvResumePoint,
+) -> RuntimeJitDeoptContinuation {
+    match point {
+        LocalEnvResumePoint::BeforeTerm { function_id, block } => {
+            if function_id != function.function_id {
+                return RuntimeJitDeoptContinuation::unsupported(
+                    RuntimeJitDeoptUnsupportedReason::WrongFunction,
+                );
+            }
+            if let Some(block) = function
+                .blocks
+                .iter()
+                .find(|candidate| candidate.label == block)
+            {
+                RuntimeJitDeoptContinuation::ResumeBlockTail {
+                    cursor: RuntimeJitDeoptCursor::new(block.label, block.body.len()),
+                }
+            } else {
+                RuntimeJitDeoptContinuation::unsupported(
+                    RuntimeJitDeoptUnsupportedReason::MissingBlock,
+                )
+            }
+        }
+        LocalEnvResumePoint::BeforeInstr { key } => {
+            if key.function_id != function.function_id {
+                return RuntimeJitDeoptContinuation::unsupported(
+                    RuntimeJitDeoptUnsupportedReason::WrongFunction,
+                );
+            }
+            for block in &function.blocks {
+                if let Some(index) = block
+                    .body
+                    .iter()
+                    .position(|instr| instr.try_semantic_instr_id() == Some(key.instr_id))
+                {
+                    return RuntimeJitDeoptContinuation::ResumeBlockTail {
+                        cursor: RuntimeJitDeoptCursor::new(block.label, index),
+                    };
+                }
+            }
+            RuntimeJitDeoptContinuation::unsupported(
+                RuntimeJitDeoptUnsupportedReason::MissingInstruction,
+            )
+        }
+        LocalEnvResumePoint::BlockEntry { function_id, block } => {
+            if function_id != function.function_id {
+                return RuntimeJitDeoptContinuation::unsupported(
+                    RuntimeJitDeoptUnsupportedReason::WrongFunction,
+                );
+            }
+            if function
+                .blocks
+                .iter()
+                .any(|candidate| candidate.label == block)
+            {
+                RuntimeJitDeoptContinuation::ResumeBlockTail {
+                    cursor: RuntimeJitDeoptCursor::at_block_entry(block),
+                }
+            } else {
+                RuntimeJitDeoptContinuation::unsupported(
+                    RuntimeJitDeoptUnsupportedReason::MissingBlock,
                 )
             }
         }
@@ -6310,6 +6394,17 @@ pub(crate) struct FunctionRuntimeDataLayout {
 
 impl FunctionRuntimeDataLayout {
     pub(crate) fn from_function(function: &BlockPyFunction<CodegenModuleShape>) -> Self {
+        Self::from_parts(function, max_referenced_function_closure_slot(function))
+    }
+
+    pub(crate) fn from_typed_function(function: &BlockPyFunction<TypedCodegenModuleShape>) -> Self {
+        Self::from_parts(
+            function,
+            max_referenced_typed_function_closure_slot(function),
+        )
+    }
+
+    fn from_parts<P: ModuleShape>(function: &BlockPyFunction<P>, max_closure_slot: usize) -> Self {
         let positional_param_indices = function
             .params
             .params
@@ -6338,8 +6433,7 @@ impl FunctionRuntimeDataLayout {
             .as_ref()
             .map(|layout| layout.freevars.len())
             .unwrap_or(0);
-        let closure_len =
-            storage_layout_closure_len.max(max_referenced_function_closure_slot(function));
+        let closure_len = storage_layout_closure_len.max(max_closure_slot);
         let total_len = closure_start + closure_len;
         Self {
             positional_default_count,
@@ -6434,6 +6528,49 @@ fn max_referenced_function_closure_slot(function: &BlockPyFunction<CodegenModule
     collector.max_slot_plus_one
 }
 
+fn max_referenced_typed_function_closure_slot(
+    function: &BlockPyFunction<TypedCodegenModuleShape>,
+) -> usize {
+    #[derive(Default)]
+    struct Collector {
+        max_slot_plus_one: usize,
+    }
+
+    impl Collector {
+        fn visit_cell_location(&mut self, location: CellLocation) {
+            match location {
+                CellLocation::Closure(slot) | CellLocation::CapturedSource(slot) => {
+                    self.max_slot_plus_one = self.max_slot_plus_one.max(slot as usize + 1);
+                }
+                CellLocation::Owned(_) => {}
+            }
+        }
+
+        fn visit_name(&mut self, name: &ResolvedName) {
+            if let Some(location) = name.cell_location() {
+                self.visit_cell_location(location);
+            }
+        }
+    }
+
+    impl Visit<InstrTyped> for Collector {
+        fn visit_instr(&mut self, expr: &InstrTyped) {
+            match expr {
+                InstrTyped::Load(op) => self.visit_name(&op.name),
+                InstrTyped::LegacyStore(op) => self.visit_name(&op.name),
+                InstrTyped::LegacyDel(op) => self.visit_name(&op.name),
+                InstrTyped::LegacyCellRef(op) => self.visit_cell_location(op.location),
+                _ => {}
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    let mut collector = Collector::default();
+    collector.visit_fn(function);
+    collector.max_slot_plus_one
+}
+
 #[derive(Clone)]
 struct JitEmitConsts {
     step_null_block: ir::Block,
@@ -6484,7 +6621,7 @@ impl ModuleConstantAccessTable {
 
 #[derive(Clone)]
 struct JitEmitCtx<'mc> {
-    module: &'mc BlockPyModule<CodegenModuleShape>,
+    module: &'mc BlockPyModule<TypedCodegenModuleShape>,
     function_id: RuntimeFunctionId,
     function_kind: FunctionKind,
     module_constants: &'mc ModuleCodegenConstants,
@@ -6532,7 +6669,7 @@ struct JitEmitCtx<'mc> {
     pop_handled_exception_ref: ir::FuncRef,
     direct_edge_stats: &'mc DirectEdgeStats,
     direct_call_target_functions:
-        &'mc HashMap<RuntimeFunctionId, BlockPyFunction<CodegenModuleShape>>,
+        &'mc HashMap<RuntimeFunctionId, BlockPyFunction<TypedCodegenModuleShape>>,
     direct_call_functions: &'mc HashMap<RuntimeFunctionId, DeclaredJitFunction>,
     call_target_counter_ids: &'mc HashMap<InstrId, CounterId>,
     call_direct_hit_counter_ids: &'mc HashMap<InstrId, CounterRef>,
@@ -6720,8 +6857,9 @@ fn emit_deopt_entry_guard_miss_counter(
     let Some(counter_id) = ctx.deopt_entry_guard_miss_counter_ids.get(&ordinal) else {
         return;
     };
-    let counter_slot = scalar_counter_slot_for_id(ctx.counter_slots_by_id, *counter_id)
-        .unwrap_or_else(|err| panic!("{err}"));
+    let Ok(counter_slot) = scalar_counter_slot_for_id(ctx.counter_slots_by_id, *counter_id) else {
+        return;
+    };
     let scalar_counter_base_value = ctx.consts.scalar_counter_base_value.unwrap_or_else(|| {
         panic!(
             "missing scalar counter base for deopt-entry counter id {}",
@@ -6936,12 +7074,21 @@ impl JitEmitCtx<'_> {
             .iter()
             .find(|function| function.function_id == self.function_id)
             .ok_or(RuntimeJitDeoptUnsupportedReason::MissingFunction)?;
-        runtime_jit_deopt_guard_miss_supported(function, point, pre_guard_operands)?;
-        let entry = self
+        if let Some(reason) =
+            runtime_jit_typed_deopt_continuation_for_point(function, point).unsupported_reason()
+        {
+            return Err(reason);
+        }
+        if pre_guard_operands
+            .iter()
+            .any(|expr| !runtime_jit_deopt_guard_operand_replay_safe(expr))
+        {
+            return Err(RuntimeJitDeoptUnsupportedReason::ReplayUnsafeGuardOperand);
+        }
+        let _entry = self
             .deopt_resume_plan
             .entry(point)
             .ok_or(RuntimeJitDeoptUnsupportedReason::MissingPlanRecord)?;
-        runtime_jit_deopt_guard_miss_resume_entry_supported(function, point, entry)?;
         let deopt_exit = self
             .require_deopt_record_ref(point)
             .map_err(|_| RuntimeJitDeoptUnsupportedReason::MissingPlanRecord)?;
@@ -7183,7 +7330,7 @@ impl DirectEdgeStats {
             + self.profiled_unsupported_shape_candidates.get()
     }
 
-    fn emit_trace(&self, module_name: &str, function: &BlockPyFunction<CodegenModuleShape>) {
+    fn emit_trace(&self, module_name: &str, function: &BlockPyFunction<impl ModuleShape>) {
         if self.total() == 0 {
             return;
         }
@@ -7226,7 +7373,7 @@ impl DirectEdgeStats {
 fn direct_call_target_function<'a>(
     ctx: &'a JitEmitCtx<'_>,
     function_id: RuntimeFunctionId,
-) -> Option<&'a BlockPyFunction<CodegenModuleShape>> {
+) -> Option<&'a BlockPyFunction<TypedCodegenModuleShape>> {
     ctx.module
         .callable_defs
         .iter()
@@ -7252,8 +7399,8 @@ fn direct_call_has_starred_arguments(
             .any(|keyword| matches!(keyword, CallArgKeyword::Starred(_)))
 }
 
-fn plan_direct_call_args_for_target(
-    target_function: &BlockPyFunction<CodegenModuleShape>,
+fn plan_direct_call_args_for_target<P: ModuleShape>(
+    target_function: &BlockPyFunction<P>,
     explicit_positional_arg_count: usize,
     implicit_positional_arg_count: usize,
     has_starred_arguments: bool,
@@ -7317,7 +7464,7 @@ fn plan_direct_call_args_for_target(
 }
 
 fn function_has_default_resolving_direct_entry(
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<impl ModuleShape>,
 ) -> bool {
     // The adapter is also needed for parameters without source defaults:
     // __defaults__ / __kwdefaults__ can be assigned after function creation.
@@ -7344,7 +7491,7 @@ fn param_runtime_default_slot(
 }
 
 fn validate_direct_call_compatibility(
-    target_function: &BlockPyFunction<CodegenModuleShape>,
+    target_function: &BlockPyFunction<impl ModuleShape>,
     _direct_call_functions: &HashMap<RuntimeFunctionId, DeclaredJitFunction>,
     explicit_positional_arg_count: usize,
     implicit_positional_arg_count: usize,
@@ -8757,7 +8904,7 @@ struct ExceptionStateSlots {
 }
 
 impl ExceptionStateSlots {
-    fn new(fb: &mut FunctionBuilder<'_>, function: &BlockPyFunction<CodegenModuleShape>) -> Self {
+    fn new(fb: &mut FunctionBuilder<'_>, function: &BlockPyFunction<impl ModuleShape>) -> Self {
         let mut previous_handled_by_name = HashMap::new();
         let mut previous_handled_is_pushed_by_name = HashMap::new();
         for block in &function.blocks {
@@ -9841,7 +9988,7 @@ fn build_counted_runtime_refcount_helper(
 fn build_counted_runtime_refcount_helpers(
     jit_module: &mut JITModule,
     env_config: &SoacEnvConfig,
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<impl ModuleShape>,
     counter_defs: &[CounterDef],
     counter_slots_by_id: &[CounterRuntimeSlot],
     scalar_counter_data_id: Option<DataId>,
@@ -11120,7 +11267,7 @@ fn emit_branch_index_i64(
 }
 
 fn module_constant_string_value<'a>(
-    module: &'a BlockPyModule<CodegenModuleShape>,
+    module: &'a BlockPyModule<impl ModuleShape<ModuleConstant = InstrResolved>>,
     constant_index: u32,
 ) -> Option<&'a str> {
     let InstrResolved::Literal(literal) = module.module_constants.get(constant_index as usize)?
@@ -11134,7 +11281,7 @@ fn module_constant_string_value<'a>(
 }
 
 pub(super) fn codegen_constant_string_value<'a>(
-    module: &'a BlockPyModule<CodegenModuleShape>,
+    module: &'a BlockPyModule<impl ModuleShape<ModuleConstant = InstrResolved>>,
     expr: &InstrCodegen,
 ) -> Option<&'a str> {
     let InstrCodegen::Load(load) = expr else {
@@ -11299,6 +11446,41 @@ fn collect_call_direct_targets(
                 }
             }
             if let InstrCodegen::DirectMethodCall(call) = expr {
+                self.out.insert(call.guard.function_id);
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    let mut out = HashSet::new();
+    let mut collector = CallDirectTargetCollector { out: &mut out };
+    collector.visit_fn(function);
+    out
+}
+
+fn collect_typed_call_direct_targets(
+    function: &BlockPyFunction<TypedCodegenModuleShape>,
+) -> HashSet<RuntimeFunctionId> {
+    struct CallDirectTargetCollector<'a> {
+        out: &'a mut HashSet<RuntimeFunctionId>,
+    }
+
+    impl Visit<InstrTyped> for CallDirectTargetCollector<'_> {
+        fn visit_instr(&mut self, expr: &InstrTyped) {
+            if let InstrTyped::LegacyCallDirect(call) = expr {
+                self.out.insert(call.function_id);
+            }
+            if let InstrTyped::DirectCallableCallTyped(call) = expr {
+                match &call.guard {
+                    TypedDirectCallableCallGuard::Function(guard) => {
+                        self.out.insert(guard.function_id);
+                    }
+                    TypedDirectCallableCallGuard::Constructor(guard) => {
+                        self.out.insert(guard.function_id);
+                    }
+                }
+            }
+            if let InstrTyped::DirectMethodCallTyped(call) = expr {
                 self.out.insert(call.guard.function_id);
             }
             expr.visit_children(self);
@@ -11862,7 +12044,7 @@ fn planned_optimization_inputs_for_precompile(
 impl FunctionSpecializationInputs {
     fn from_profile(
         profile: &SpecializationProfile<'_>,
-        function: &BlockPyFunction<CodegenModuleShape>,
+        function: &BlockPyFunction<impl ModuleShape>,
     ) -> Result<Self, String> {
         let (
             field_index_specializations,
@@ -12013,7 +12195,7 @@ impl<'a> SpecializationProfile<'a> {
 
     fn cold_block_labels(
         &self,
-        function: &BlockPyFunction<CodegenModuleShape>,
+        function: &BlockPyFunction<impl ModuleShape>,
     ) -> Result<HashSet<BlockLabel>, String> {
         if !self.profiled_cold_blocks {
             return Ok(HashSet::new());
@@ -12645,7 +12827,7 @@ fn load_field_index_specializations()
 
 fn collect_cold_block_labels_from_path(
     path: &Path,
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<impl ModuleShape>,
     module_name: &str,
 ) -> Result<HashSet<BlockLabel>, String> {
     let block_entry_counts =
@@ -13126,7 +13308,7 @@ fn emit_direct_call_resolved_raw_with_arg_values(
     arg_values: Vec<ir::Value>,
     arg_borrowed: Vec<bool>,
     entry_kind: DirectCallEntryKind,
-    target_function: &BlockPyFunction<CodegenModuleShape>,
+    target_function: &BlockPyFunction<impl ModuleShape>,
     ctx: &JitEmitCtx<'_>,
     codegen_env: &mut impl JitCodegenEnv,
 ) -> ir::Value {
@@ -13213,7 +13395,7 @@ fn emit_direct_call_resolved_with_arg_values(
     arg_values: Vec<ir::Value>,
     arg_borrowed: Vec<bool>,
     entry_kind: DirectCallEntryKind,
-    target_function: &BlockPyFunction<CodegenModuleShape>,
+    target_function: &BlockPyFunction<impl ModuleShape>,
     ctx: &JitEmitCtx<'_>,
     codegen_env: &mut impl JitCodegenEnv,
 ) -> ir::Value {
@@ -13253,7 +13435,7 @@ fn emit_direct_constructor_resolved_with_arg_values(
     arg_values: Vec<ir::Value>,
     arg_borrowed: Vec<bool>,
     specialization: &DirectConstructorSpecialization,
-    target_function: &BlockPyFunction<CodegenModuleShape>,
+    target_function: &BlockPyFunction<impl ModuleShape>,
     ctx: &JitEmitCtx<'_>,
     codegen_env: &mut impl JitCodegenEnv,
 ) -> ir::Value {
@@ -13405,7 +13587,7 @@ fn emit_direct_call_resolved_with_arg_plan_from_local_env(
     callable_is_borrowed: bool,
     args: &[&InstrCodegen],
     arg_plan: &DirectCallArgPlan,
-    target_function: &BlockPyFunction<CodegenModuleShape>,
+    target_function: &BlockPyFunction<impl ModuleShape>,
     local_env: &mut LocalEnv,
     ctx: &JitEmitCtx<'_>,
     codegen_env: &mut impl JitCodegenEnv,
@@ -13491,7 +13673,7 @@ fn emit_typed_direct_call_resolved_with_arg_plan_from_local_env(
     callable_is_borrowed: bool,
     args: &[&InstrTyped],
     arg_plan: &DirectCallArgPlan,
-    target_function: &BlockPyFunction<CodegenModuleShape>,
+    target_function: &BlockPyFunction<impl ModuleShape>,
     local_env: &mut LocalEnv,
     ctx: &JitEmitCtx<'_>,
     codegen_env: &mut impl JitCodegenEnv,
@@ -13543,7 +13725,7 @@ fn emit_direct_constructor_resolved_with_args_from_local_env(
     callable_is_borrowed: bool,
     args: &[&InstrCodegen],
     specialization: &DirectConstructorSpecialization,
-    target_function: &BlockPyFunction<CodegenModuleShape>,
+    target_function: &BlockPyFunction<impl ModuleShape>,
     local_env: &mut LocalEnv,
     ctx: &JitEmitCtx<'_>,
     codegen_env: &mut impl JitCodegenEnv,
@@ -13584,7 +13766,7 @@ fn emit_typed_direct_constructor_resolved_with_args_from_local_env(
     callable_is_borrowed: bool,
     args: &[&InstrTyped],
     specialization: &DirectConstructorSpecialization,
-    target_function: &BlockPyFunction<CodegenModuleShape>,
+    target_function: &BlockPyFunction<impl ModuleShape>,
     local_env: &mut LocalEnv,
     ctx: &JitEmitCtx<'_>,
     codegen_env: &mut impl JitCodegenEnv,
@@ -13624,7 +13806,7 @@ fn emit_direct_method_resolved_with_args_from_local_env(
     receiver_is_borrowed: bool,
     args: &[&InstrCodegen],
     specialization: &DirectMethodSpecialization,
-    target_function: &BlockPyFunction<CodegenModuleShape>,
+    target_function: &BlockPyFunction<impl ModuleShape>,
     local_env: &mut LocalEnv,
     ctx: &JitEmitCtx<'_>,
     codegen_env: &mut impl JitCodegenEnv,
@@ -13687,7 +13869,7 @@ fn emit_typed_direct_method_resolved_with_args_from_local_env(
     receiver_is_borrowed: bool,
     args: &[&InstrTyped],
     specialization: &DirectMethodSpecialization,
-    target_function: &BlockPyFunction<CodegenModuleShape>,
+    target_function: &BlockPyFunction<impl ModuleShape>,
     local_env: &mut LocalEnv,
     ctx: &JitEmitCtx<'_>,
     codegen_env: &mut impl JitCodegenEnv,
@@ -14258,7 +14440,7 @@ fn emit_pop_handled_exception_if_not_forwarded<'a, I>(
 }
 
 fn block_exception_name(
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<impl ModuleShape>,
     label: BlockLabel,
 ) -> Option<&str> {
     function
@@ -14275,7 +14457,7 @@ fn block_exception_name(
 }
 
 fn codegen_block_indices_by_label(
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<impl ModuleShape>,
 ) -> HashMap<BlockLabel, usize> {
     function
         .blocks
@@ -14286,7 +14468,7 @@ fn codegen_block_indices_by_label(
 }
 
 fn codegen_block_index_for_label(
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<impl ModuleShape>,
     block_indices_by_label: &HashMap<BlockLabel, usize>,
     label: BlockLabel,
 ) -> Result<usize, String> {
@@ -19903,6 +20085,7 @@ fn emit_opt_v3_mechanical_region_steps(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 fn emit_opt_v3_mechanical_region_steps_until_value(
     fb: &mut FunctionBuilder<'_>,
     region: &MechanicalRegionEmission,
@@ -19929,6 +20112,7 @@ fn emit_opt_v3_mechanical_region_steps_until_value(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 fn emit_opt_v3_mechanical_region_steps_with_preseeded_scalar(
     fb: &mut FunctionBuilder<'_>,
     region: &MechanicalRegionEmission,
@@ -20723,6 +20907,7 @@ fn emit_typed_codegen_ops(
     Ok(())
 }
 
+#[allow(dead_code)]
 fn codegen_block_has_predecessor(
     function: &BlockPyFunction<CodegenModuleShape>,
     target: BlockLabel,
@@ -20743,6 +20928,7 @@ fn codegen_block_has_predecessor(
         .count()
 }
 
+#[allow(dead_code)]
 fn cranelift_value_args(args: &[ir::BlockArg]) -> Result<Vec<ir::Value>, String> {
     args.iter()
         .map(|arg| match arg {
@@ -20755,6 +20941,7 @@ fn cranelift_value_args(args: &[ir::BlockArg]) -> Result<Vec<ir::Value>, String>
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 fn emit_opt_v3_scalar_thread_inline_return_branch(
     fb: &mut FunctionBuilder<'_>,
     source_label: BlockLabel,
@@ -20837,6 +21024,7 @@ fn emit_opt_v3_scalar_thread_inline_return_branch(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 fn emit_opt_v3_scalar_thread_inline_return_arm(
     fb: &mut FunctionBuilder<'_>,
     branch_block: ir::Block,
@@ -20876,6 +21064,7 @@ fn emit_opt_v3_scalar_thread_inline_return_arm(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 fn emit_opt_v3_scalar_threaded_store_branch(
     fb: &mut FunctionBuilder<'_>,
     source_label: BlockLabel,
@@ -21287,7 +21476,7 @@ fn emit_codegen_if_target_arm(
     target_exception_name: Option<&str>,
     release_reason: RefcountReleaseReason,
     current_exception_name: Option<&str>,
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<impl ModuleShape>,
     exec_blocks: &[ir::Block],
     block_indices_by_label: &HashMap<BlockLabel, usize>,
     implicit_target_transports: &[EdgeTransportPlan],
@@ -21350,7 +21539,7 @@ fn emit_codegen_if_truth_i32(
     then_label: BlockLabel,
     else_label: BlockLabel,
     current_exception_name: Option<&str>,
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<impl ModuleShape>,
     exec_blocks: &[ir::Block],
     block_indices_by_label: &HashMap<BlockLabel, usize>,
     implicit_target_transports: &[EdgeTransportPlan],
@@ -21492,7 +21681,7 @@ fn emit_codegen_branch_table_from_i64(
     targets: &[BlockLabel],
     default_label: BlockLabel,
     index_i64: ir::Value,
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<impl ModuleShape>,
     exec_blocks: &[ir::Block],
     block_indices_by_label: &HashMap<BlockLabel, usize>,
     implicit_target_transports: &[EdgeTransportPlan],
@@ -21769,7 +21958,7 @@ fn emit_codegen_term(
     fb: &mut FunctionBuilder<'_>,
     source_label: BlockLabel,
     term: &BlockTerm<InstrCodegen>,
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<impl ModuleShape>,
     exec_blocks: &[ir::Block],
     block_indices_by_label: &HashMap<BlockLabel, usize>,
     jump_edge_transports: &[Option<EdgeTransportPlan>],
@@ -21993,7 +22182,7 @@ fn emit_typed_codegen_term(
     fb: &mut FunctionBuilder<'_>,
     source_label: BlockLabel,
     term: &BlockTerm<InstrTyped>,
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<TypedCodegenModuleShape>,
     exec_blocks: &[ir::Block],
     block_indices_by_label: &HashMap<BlockLabel, usize>,
     jump_edge_transports: &[Option<EdgeTransportPlan>],
@@ -24174,7 +24363,7 @@ fn declare_local_fn(
 
 fn make_direct_function_signature(
     codegen_env: &impl JitCodegenEnv,
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<impl ModuleShape>,
 ) -> ir::Signature {
     let ptr_ty = codegen_env.codegen_target_config().pointer_type();
     let mut sig = codegen_env.codegen_make_signature();
@@ -24188,7 +24377,7 @@ fn make_direct_function_signature(
 }
 
 fn direct_function_symbol(
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<impl ModuleShape>,
     symbol_scope: Option<&str>,
 ) -> String {
     let base =
@@ -24197,7 +24386,7 @@ fn direct_function_symbol(
 }
 
 fn default_direct_function_symbol(
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<impl ModuleShape>,
     symbol_scope: Option<&str>,
 ) -> String {
     let base = format!(
@@ -24212,7 +24401,7 @@ fn direct_function_symbol_scope(function_id: RuntimeFunctionId, symbol_id: u64) 
 }
 
 fn direct_function_backend_name(
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<impl ModuleShape>,
     shared_state: Option<&SharedModuleState>,
 ) -> String {
     let mut name = String::from("direct:");
@@ -24249,7 +24438,7 @@ fn push_direct_function_module_identity(out: &mut String, module_name: &str, sou
 
 fn declare_direct_function(
     codegen_env: &mut impl JitCodegenEnv,
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<impl ModuleShape>,
     symbol_scope: Option<&str>,
 ) -> Result<(ir::Signature, DeclaredJitFunction), String> {
     let sig = make_direct_function_signature(codegen_env, function);
@@ -24278,7 +24467,7 @@ fn declare_direct_function(
 
 fn declare_imported_direct_function(
     codegen_env: &mut impl JitCodegenEnv,
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<impl ModuleShape>,
     symbol_scope: &str,
 ) -> Result<DeclaredJitFunction, String> {
     let sig = make_direct_function_signature(codegen_env, function);
@@ -24304,12 +24493,12 @@ fn declare_imported_direct_function(
 
 fn build_default_resolving_direct_adapter(
     codegen_env: &mut impl JitCodegenEnv,
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<impl ModuleShape>,
     core_func_id: FuncId,
     adapter_func_id: FuncId,
 ) -> Result<cranelift_codegen::Context, String> {
     let ptr_ty = codegen_env.codegen_target_config().pointer_type();
-    let runtime_layout = FunctionRuntimeDataLayout::from_function(function);
+    let runtime_layout = FunctionRuntimeDataLayout::from_parts(function, 0);
     let mut module_imports = ModuleFuncImports::new();
     let mut ctx = codegen_env.codegen_make_context();
     ctx.func.signature = make_direct_function_signature(codegen_env, function);
@@ -24929,17 +25118,17 @@ impl PrecompileModuleIndex {
 }
 
 fn precompile_external_direct_call_target_functions(
-    module: &BlockPyModule<CodegenModuleShape>,
+    module: &BlockPyModule<TypedCodegenModuleShape>,
     profile: &SpecializationProfile<'_>,
     module_index: Option<&PrecompileModuleIndex>,
-) -> Result<HashMap<RuntimeFunctionId, BlockPyFunction<CodegenModuleShape>>, String> {
+) -> Result<HashMap<RuntimeFunctionId, BlockPyFunction<TypedCodegenModuleShape>>, String> {
     let Some(module_index) = module_index else {
         return Ok(HashMap::new());
     };
     let current_module_id = module.module_name_gen.module_id();
     let mut target_ids = HashSet::new();
     for function in &module.callable_defs {
-        target_ids.extend(collect_call_direct_targets(function));
+        target_ids.extend(collect_typed_call_direct_targets(function));
         for targets in profile
             .v3_direct_function_call_targets(function.function_id)
             .values()
@@ -24951,9 +25140,12 @@ fn precompile_external_direct_call_target_functions(
         .into_iter()
         .filter(|function_id| function_id.runtime_module_id().as_u32() != current_module_id)
         .filter_map(|function_id| {
-            module_index
-                .function(function_id)
-                .map(|target| (function_id, target.function.clone()))
+            module_index.function(function_id).map(|target| {
+                (
+                    function_id,
+                    lower_codegen_function_to_typed(target.function.clone()),
+                )
+            })
         })
         .collect())
 }
@@ -25287,6 +25479,10 @@ fn precompile_codegen_module_to_object_bytes(
             placeholder_blocks.as_slice(),
             planned_module,
             function,
+            module
+                .callable_defs
+                .iter()
+                .find(|candidate| candidate.function_id == function.function_id),
             &jit_module_plan.value_facts,
             jit_local_plan,
             jit_deopt_resume_plan,
@@ -25627,7 +25823,7 @@ struct BuildSpecializedFunctionOptions {
     counted_refcount_helpers: Option<CountedRefcountHelpers>,
     specialization_inputs: Option<FunctionSpecializationInputs>,
     external_direct_call_target_functions:
-        HashMap<RuntimeFunctionId, BlockPyFunction<CodegenModuleShape>>,
+        HashMap<RuntimeFunctionId, BlockPyFunction<TypedCodegenModuleShape>>,
 }
 
 struct PreparedSpecializedTypedFunction {
@@ -25666,7 +25862,7 @@ fn block_term_shape<I: soac_core::block_py::Instr>(
 }
 
 fn validate_typed_function_preserves_codegen_cfg(
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<TypedCodegenModuleShape>,
     typed_function: &BlockPyFunction<TypedCodegenModuleShape>,
 ) -> Result<(), String> {
     if typed_function.blocks.len() != function.blocks.len() {
@@ -25713,8 +25909,7 @@ fn validate_typed_function_preserves_codegen_cfg(
 }
 
 fn prepare_specialized_typed_function(
-    _module: &BlockPyModule<CodegenModuleShape>,
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<TypedCodegenModuleShape>,
     value_facts: &FactStore,
     field_index_specializations: &HashMap<String, Vec<FieldIndexSpecialization>>,
     field_index_specializations_by_instr: &HashMap<InstrId, Vec<FieldIndexSpecialization>>,
@@ -25722,10 +25917,9 @@ fn prepare_specialized_typed_function(
     specialize_field_stores: bool,
     opt_v3_call_emissions: &TypedCallEmissionPlans,
 ) -> Result<PreparedSpecializedTypedFunction, String> {
-    let mut typed_function = lower_codegen_function_to_typed(function.clone());
+    let mut typed_function = function.clone();
     annotate_typed_function_value_facts(&mut typed_function, value_facts);
     validate_typed_function_value_facts(&typed_function)?;
-    let mut typed_function = lower_typed_function_if_tests_to_truthy(typed_function);
 
     annotate_typed_attr_accesses(
         &mut typed_function,
@@ -25838,8 +26032,9 @@ fn render_instr_typed_preorder_extras(
 fn build_cranelift_run_bb_specialized_function(
     codegen_env: &mut impl JitCodegenEnv,
     blocks: &[ObjPtr],
-    module: &BlockPyModule<CodegenModuleShape>,
-    function: &BlockPyFunction<CodegenModuleShape>,
+    module: &BlockPyModule<TypedCodegenModuleShape>,
+    function: &BlockPyFunction<TypedCodegenModuleShape>,
+    legacy_scalar_thread_function: Option<&BlockPyFunction<CodegenModuleShape>>,
     value_facts: &FactStore,
     jit_local_plan: &PlannedJitFunctionLocals,
     jit_deopt_resume_plan: &PlannedJitDeoptResumeFunction,
@@ -25870,7 +26065,7 @@ fn build_cranelift_run_bb_specialized_function(
     }
     for block in &function.blocks {
         for expr in &block.body {
-            if let InstrCodegen::IncrementCounter(op) = expr {
+            if let InstrTyped::LegacyIncrementCounter(op) = expr {
                 if scalar_counter_slot_for_id(counter_slots_by_id, op.counter_id).is_err() {
                     return Err(format!(
                         "specialized JIT scalar counter layout is missing counter id {} for function {}",
@@ -25880,7 +26075,7 @@ fn build_cranelift_run_bb_specialized_function(
             }
         }
     }
-    jit_deopt_resume_plan.validate_for_function(function)?;
+    jit_deopt_resume_plan.validate_for_typed_function(function)?;
     let call_target_counter_ids =
         collect_runtime_counter_ids_by_kind(counter_defs, function.function_id, "call_hot_targets");
     let call_direct_hit_counter_ids = collect_runtime_counter_refs_by_kind_branch(
@@ -26047,13 +26242,13 @@ fn build_cranelift_run_bb_specialized_function(
     let opt_v3_exact_int_branch_artifacts = specialization_inputs.opt_v3_exact_int_branch_artifacts;
     let behavior_change_indexed_stores = specialization_inputs.behavior_change_indexed_stores;
     let guard_miss_deopt_stub = specialization_inputs.guard_miss_deopt_stub;
-    let function_runtime_data_layout = FunctionRuntimeDataLayout::from_function(function);
+    let function_runtime_data_layout = FunctionRuntimeDataLayout::from_typed_function(function);
     let true_constant_id = module_constants.require_runtime_name_constant_id("TRUE");
     let false_constant_id = module_constants.require_runtime_name_constant_id("FALSE");
     let none_constant_id = module_constants.require_runtime_name_constant_id("NONE");
     let empty_tuple_constant_id = module_constants.require_runtime_name_constant_id("EMPTY_TUPLE");
 
-    let mut direct_call_targets = collect_call_direct_targets(function);
+    let mut direct_call_targets = collect_typed_call_direct_targets(function);
     direct_call_targets.extend(opt_v3_call_emissions.target_function_ids());
     let empty_direct_functions = HashMap::new();
     let direct_call_functions = predeclared_direct_functions.unwrap_or(&empty_direct_functions);
@@ -26076,11 +26271,13 @@ fn build_cranelift_run_bb_specialized_function(
         else {
             continue;
         };
-        direct_call_target_functions.insert(function_id, target_function);
+        direct_call_target_functions.insert(
+            function_id,
+            lower_codegen_function_to_typed(target_function),
+        );
     }
     let direct_edge_stats = DirectEdgeStats::default();
     let PreparedSpecializedTypedFunction { typed_function } = prepare_specialized_typed_function(
-        module,
         function,
         value_facts,
         &field_index_specializations,
@@ -26152,7 +26349,7 @@ fn build_cranelift_run_bb_specialized_function(
         let full_block_param_names = function
             .blocks
             .iter()
-            .map(CodegenBlock::param_name_vec)
+            .map(Block::param_name_vec)
             .collect::<Vec<_>>();
         let shared_null_cleanup = function
             .blocks
@@ -26597,7 +26794,7 @@ fn build_cranelift_run_bb_specialized_function(
             }
         }
 
-        let mut opt_v3_fused_scalar_thread_consumers = HashSet::new();
+        let mut opt_v3_fused_scalar_thread_consumers = HashSet::<BlockLabel>::new();
         for (index, block) in exec_blocks.iter().enumerate() {
             fb.switch_to_block(*block);
             let codegen_block = &function.blocks[index];
@@ -26732,28 +26929,30 @@ fn build_cranelift_run_bb_specialized_function(
             emit_ctx.require_deopt_point_at_block_entry(codegen_block.label)?;
             let _block_refcount_plan = emit_ctx.refcount_plan.block(codegen_block.label);
 
-            if let Some(fused_labels) = emit_opt_v3_scalar_threaded_store_branch(
-                &mut fb,
-                codegen_block.label,
-                &typed_function.blocks[index],
-                &typed_function,
-                function,
-                jit_local_plan,
-                &exec_blocks,
-                &block_indices_by_label,
-                jump_edge_transports,
-                implicit_target_transports,
-                &mut local_env,
-                &emit_ctx,
-                cleanup_null_blocks[index],
-                &mut pending_local_failure_cleanups,
-                &mut local_failure_cleanup_blocks,
-                codegen_env,
-                &mut func_imports,
-                codegen_block.exception_param(),
-            )? {
-                opt_v3_fused_scalar_thread_consumers.extend(fused_labels);
-                continue;
+            if let Some(legacy_scalar_thread_function) = legacy_scalar_thread_function {
+                if let Some(fused_labels) = emit_opt_v3_scalar_threaded_store_branch(
+                    &mut fb,
+                    codegen_block.label,
+                    &typed_function.blocks[index],
+                    &typed_function,
+                    legacy_scalar_thread_function,
+                    jit_local_plan,
+                    &exec_blocks,
+                    &block_indices_by_label,
+                    jump_edge_transports,
+                    implicit_target_transports,
+                    &mut local_env,
+                    &emit_ctx,
+                    cleanup_null_blocks[index],
+                    &mut pending_local_failure_cleanups,
+                    &mut local_failure_cleanup_blocks,
+                    codegen_env,
+                    &mut func_imports,
+                    codegen_block.exception_param(),
+                )? {
+                    opt_v3_fused_scalar_thread_consumers.extend(fused_labels);
+                    continue;
+                }
             }
 
             emit_typed_codegen_ops(
@@ -27131,7 +27330,7 @@ pub unsafe fn render_instr_typed_for_codegen_with_runtime_state(
         })?;
     let specialization_inputs =
         FunctionSpecializationInputs::from_profile(&specialization_profile, render_function)?;
-    let mut direct_call_targets = collect_call_direct_targets(render_function);
+    let mut direct_call_targets = collect_typed_call_direct_targets(render_function);
     direct_call_targets.extend(
         specialization_inputs
             .opt_v3_call_emissions
@@ -27156,10 +27355,12 @@ pub unsafe fn render_instr_typed_for_codegen_with_runtime_state(
         else {
             continue;
         };
-        direct_call_target_functions.insert(function_id, target_function);
+        direct_call_target_functions.insert(
+            function_id,
+            lower_codegen_function_to_typed(target_function),
+        );
     }
     let PreparedSpecializedTypedFunction { typed_function } = prepare_specialized_typed_function(
-        render_module,
         render_function,
         &jit_module_plan.value_facts,
         &specialization_inputs.field_index_specializations,
@@ -27319,6 +27520,7 @@ pub unsafe fn render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
         render_blocks,
         render_module,
         render_function,
+        Some(function),
         &jit_module_plan.value_facts,
         jit_local_plan,
         jit_deopt_resume_plan,

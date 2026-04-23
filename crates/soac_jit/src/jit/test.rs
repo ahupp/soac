@@ -3485,23 +3485,34 @@ def build(values):
         predeclared_direct_functions: Option<&HashMap<RuntimeFunctionId, DeclaredJitFunction>>,
         options: BuildSpecializedFunctionOptions,
     ) -> Result<BuiltSpecializedFunction, String> {
-        let value_facts = infer_jit_value_facts(module);
-        let jit_module_local_plan = plan_jit_module_locals(module, &value_facts)?;
-        let jit_module_deopt_resume_plan = plan_jit_deopt_resume_module(module, &value_facts)?;
-        let jit_local_plan = jit_module_local_plan
-            .function(function.function_id)
+        let jit_module_plan = build_jit_module_plan(module)?;
+        let planned_module = jit_module_plan.module.as_ref();
+        let planned_function = planned_module
+            .callable_defs
+            .iter()
+            .find(|candidate| candidate.function_id == function.function_id)
             .ok_or_else(|| {
                 format!(
-                    "missing JIT local plan for function {} ({})",
+                    "missing planned function {} ({})",
                     function.function_id, function.names.qualname
                 )
             })?;
-        let jit_deopt_resume_plan = jit_module_deopt_resume_plan
-            .function(function.function_id)
+        let jit_local_plan = jit_module_plan
+            .locals
+            .function(planned_function.function_id)
+            .ok_or_else(|| {
+                format!(
+                    "missing JIT local plan for function {} ({})",
+                    planned_function.function_id, planned_function.names.qualname
+                )
+            })?;
+        let jit_deopt_resume_plan = jit_module_plan
+            .deopt_resume
+            .function(planned_function.function_id)
             .ok_or_else(|| {
                 format!(
                     "missing JIT deopt resume plan for function {} ({})",
-                    function.function_id, function.names.qualname
+                    planned_function.function_id, planned_function.names.qualname
                 )
             })?;
         if let Some(shared_state) = direct_call_resolver {
@@ -3513,7 +3524,7 @@ def build(values):
         )?;
         predeclare_specialization_type_imports(jit_module, &specialization_profile)?;
         let specialization_inputs =
-            FunctionSpecializationInputs::from_profile(&specialization_profile, function)?;
+            FunctionSpecializationInputs::from_profile(&specialization_profile, planned_function)?;
         predeclare_prepared_opt_v3_call_imports(jit_module, &specialization_inputs)?;
         let mut options = options;
         if options.specialization_inputs.is_none() {
@@ -3522,9 +3533,10 @@ def build(values):
         build_cranelift_run_bb_specialized_function(
             jit_module,
             blocks,
-            module,
-            function,
-            &value_facts,
+            planned_module,
+            planned_function,
+            Some(function),
+            &jit_module_plan.value_facts,
             jit_local_plan,
             jit_deopt_resume_plan,
             module_constants,
@@ -18904,7 +18916,7 @@ def f(x, y):
                 matches!(
                     &block.term,
                     BlockTerm::IfTerm(term)
-                        if matches!(term.test, InstrCodegen::DirectFunctionIdGuardTest(_))
+                        if matches!(term.test, InstrTyped::DirectCallGuardTest(_))
                 )
             }),
             "JIT should not perform plan-level direct-call CFG expansion; it should trust the loaded optimized module"
@@ -18914,7 +18926,7 @@ def f(x, y):
                 .blocks
                 .iter()
                 .flat_map(|block| &block.body)
-                .any(|instr| matches!(instr, InstrCodegen::Store(store) if matches!(store.value.as_ref(), InstrCodegen::Call(_)))),
+                .any(|instr| matches!(instr, InstrTyped::LegacyStore(store) if matches!(store.value.as_ref(), InstrTyped::CallTyped(_)))),
             "loaded optimized module fixture intentionally still has the original generic call"
         );
         let specialization_inputs =

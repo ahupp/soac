@@ -6,7 +6,9 @@ use soac_core::block_py::{
     ChildVisitable, NameLike, ParamDefaultSource, RuntimeName,
 };
 use soac_lowering::block_py::literal::{Literal, NumberLiteralValue};
-use soac_lowering::passes::{CodegenModuleShape, InstrCodegen, InstrResolved};
+use soac_opt::passes::{
+    CodegenModuleShape, InstrCodegen, InstrResolved, InstrTyped, TypedCall, TypedCodegenModuleShape,
+};
 use std::collections::HashMap;
 
 mod materialization;
@@ -60,6 +62,16 @@ impl ModuleCodegenConstants {
         Self::collect_from_module_with_runtime_prelude(module, true)
     }
 
+    pub fn collect_from_typed_module(module: &BlockPyModule<TypedCodegenModuleShape>) -> Self {
+        Self::collect_from_typed_module_with_runtime_prelude(module, true)
+    }
+
+    pub fn collect_from_typed_runtime_module(
+        module: &BlockPyModule<TypedCodegenModuleShape>,
+    ) -> Self {
+        Self::collect_from_typed_module_with_runtime_prelude(module, true)
+    }
+
     fn collect_from_module_with_runtime_prelude(
         module: &BlockPyModule<CodegenModuleShape>,
         include_runtime_name_prelude: bool,
@@ -82,6 +94,28 @@ impl ModuleCodegenConstants {
         collector.constants
     }
 
+    fn collect_from_typed_module_with_runtime_prelude(
+        module: &BlockPyModule<TypedCodegenModuleShape>,
+        include_runtime_name_prelude: bool,
+    ) -> Self {
+        let mut collector = ModuleConstantCollector::default();
+        for expr in &module.module_constants {
+            collector.constants.push_explicit_constant_expr(expr);
+        }
+        for name in ALWAYS_REQUIRED_UNICODE_CONSTANTS {
+            collector.constants.intern_unicode_bytes(name.as_bytes());
+        }
+        if include_runtime_name_prelude {
+            for name in ALWAYS_REQUIRED_RUNTIME_NAME_CONSTANTS {
+                collector.constants.intern_runtime_name(*name);
+            }
+        }
+        for function in &module.callable_defs {
+            collector.collect_typed_function(function);
+        }
+        collector.constants
+    }
+
     pub fn collect_from_functions<'a>(
         functions: impl IntoIterator<Item = &'a BlockPyFunction<CodegenModuleShape>>,
     ) -> Self {
@@ -94,6 +128,22 @@ impl ModuleCodegenConstants {
         }
         for function in functions {
             collector.collect_function(function);
+        }
+        collector.constants
+    }
+
+    pub fn collect_from_typed_functions<'a>(
+        functions: impl IntoIterator<Item = &'a BlockPyFunction<TypedCodegenModuleShape>>,
+    ) -> Self {
+        let mut collector = ModuleConstantCollector::default();
+        for name in ALWAYS_REQUIRED_UNICODE_CONSTANTS {
+            collector.constants.intern_unicode_bytes(name.as_bytes());
+        }
+        for name in ALWAYS_REQUIRED_RUNTIME_NAME_CONSTANTS {
+            collector.constants.intern_runtime_name(*name);
+        }
+        for function in functions {
+            collector.collect_typed_function(function);
         }
         collector.constants
     }
@@ -395,8 +445,48 @@ impl ModuleConstantCollector {
         }
     }
 
+    fn collect_typed_function(&mut self, function: &BlockPyFunction<TypedCodegenModuleShape>) {
+        if let Some(storage_layout) = function.storage_layout() {
+            for name in storage_layout.stack_slots() {
+                if should_include_in_locals_snapshot(name) {
+                    self.constants.intern_unicode_bytes(name.as_bytes());
+                }
+            }
+        }
+        for (param, default_source) in function.params.iter_with_default_sources() {
+            match default_source {
+                Some(ParamDefaultSource::Positional(_)) => {
+                    self.constants.intern_unicode_bytes(param.name.as_bytes());
+                }
+                Some(ParamDefaultSource::KeywordOnly(name)) => {
+                    self.constants.intern_unicode_bytes(name.as_bytes());
+                }
+                None => {}
+            }
+        }
+        if let Some(storage_layout) = function.storage_layout().as_ref() {
+            for name in storage_layout.stack_slots() {
+                self.constants.intern_unicode_bytes(name.as_bytes());
+                if name.starts_with("_dp_try_abrupt_kind_") {
+                    self.constants
+                        .intern_int(abrupt_kind_tag(AbruptKind::Fallthrough));
+                }
+            }
+        }
+        for block in &function.blocks {
+            for stmt in &block.body {
+                self.collect_typed_stmt(stmt);
+            }
+            self.collect_typed_term(&block.term);
+        }
+    }
+
     fn collect_stmt(&mut self, stmt: &InstrCodegen) {
         self.collect_expr(stmt);
+    }
+
+    fn collect_typed_stmt(&mut self, stmt: &InstrTyped) {
+        self.collect_typed_expr(stmt);
     }
 
     fn collect_term(&mut self, term: &BlockTerm<InstrCodegen>) {
@@ -410,6 +500,22 @@ impl ModuleConstantCollector {
                 }
             }
             BlockTerm::Return(value) => self.collect_expr(value),
+        }
+    }
+
+    fn collect_typed_term(&mut self, term: &BlockTerm<InstrTyped>) {
+        match term {
+            BlockTerm::Jump(edge) => self.collect_block_args(&edge.args),
+            BlockTerm::IfTerm(if_term) => self.collect_typed_expr(&if_term.test),
+            BlockTerm::BranchTable(branch_table) => {
+                self.collect_typed_expr(&branch_table.index);
+            }
+            BlockTerm::Raise(raise_stmt) => {
+                if let Some(exc) = &raise_stmt.exc {
+                    self.collect_typed_expr(exc);
+                }
+            }
+            BlockTerm::Return(value) => self.collect_typed_expr(value),
         }
     }
 
@@ -543,6 +649,153 @@ impl ModuleConstantCollector {
         }
     }
 
+    fn collect_typed_expr(&mut self, expr: &InstrTyped) {
+        match expr {
+            InstrTyped::LegacyIncrementCounter(_) => {}
+            InstrTyped::LegacyCalleeFunctionId(op) => {
+                self.collect_typed_expr(op.value.as_ref());
+            }
+            InstrTyped::DirectCallGuardTest(op) => {
+                op.visit_children(self);
+            }
+            InstrTyped::CallTyped(call) => {
+                if let Some(const_bytes) =
+                    self.typed_string_constant_bytes_for_specialized_codegen(expr)
+                {
+                    self.constants.intern_unicode_bytes(const_bytes.as_slice());
+                }
+                if let Some(delete_name_bytes) = self.deleted_name_arg_bytes_typed_call(call) {
+                    self.constants
+                        .intern_unicode_bytes(delete_name_bytes.as_slice());
+                }
+                self.collect_typed_expr(call.func.as_ref());
+                for arg in &call.args {
+                    self.collect_typed_expr(arg.expr());
+                }
+                for keyword in &call.keywords {
+                    if let CallArgKeyword::Named { arg, .. } = keyword {
+                        self.constants.intern_unicode_bytes(arg.as_str().as_bytes());
+                    }
+                    self.collect_typed_expr(keyword.expr());
+                }
+            }
+            InstrTyped::LegacyCall(call) => {
+                if let Some(const_bytes) =
+                    self.typed_string_constant_bytes_for_specialized_codegen(expr)
+                {
+                    self.constants.intern_unicode_bytes(const_bytes.as_slice());
+                }
+                if let Some(delete_name_bytes) = self.deleted_name_arg_bytes_typed_legacy(call) {
+                    self.constants
+                        .intern_unicode_bytes(delete_name_bytes.as_slice());
+                }
+                self.collect_typed_expr(call.func.as_ref());
+                for arg in &call.args {
+                    self.collect_typed_expr(arg.expr());
+                }
+                for keyword in &call.keywords {
+                    if let CallArgKeyword::Named { arg, .. } = keyword {
+                        self.constants.intern_unicode_bytes(arg.as_str().as_bytes());
+                    }
+                    self.collect_typed_expr(keyword.expr());
+                }
+            }
+            InstrTyped::GuardedCallableCallTyped(call) => {
+                call.visit_children(self);
+            }
+            InstrTyped::GuardedMethodCallTyped(call) => {
+                call.visit_children(self);
+            }
+            InstrTyped::LegacyCallDirect(call) => {
+                self.collect_typed_expr(call.callable.as_ref());
+                for arg in &call.args {
+                    self.collect_typed_expr(arg.expr());
+                }
+                for keyword in &call.keywords {
+                    if let CallArgKeyword::Named { arg, .. } = keyword {
+                        self.constants.intern_unicode_bytes(arg.as_str().as_bytes());
+                    }
+                    self.collect_typed_expr(keyword.expr());
+                }
+            }
+            InstrTyped::DirectCallableCallTyped(op) => {
+                op.visit_children(self);
+            }
+            InstrTyped::DirectMethodCallTyped(op) => {
+                op.visit_children(self);
+            }
+            InstrTyped::GetAttrTyped(op) => {
+                if let Some(attr_bytes) =
+                    self.typed_string_constant_bytes_for_specialized_codegen(op.attr.as_ref())
+                {
+                    self.constants.intern_unicode_bytes(attr_bytes.as_slice());
+                }
+                op.visit_children(self);
+            }
+            InstrTyped::SetAttrTyped(op) => {
+                if let Some(attr_bytes) =
+                    self.typed_string_constant_bytes_for_specialized_codegen(op.attr.as_ref())
+                {
+                    self.constants.intern_unicode_bytes(attr_bytes.as_slice());
+                }
+                op.visit_children(self);
+            }
+            InstrTyped::LegacyGetAttr(op) => {
+                if let Some(attr_bytes) =
+                    self.typed_string_constant_bytes_for_specialized_codegen(op.attr.as_ref())
+                {
+                    self.constants.intern_unicode_bytes(attr_bytes.as_slice());
+                }
+                op.visit_children(self);
+            }
+            InstrTyped::LegacySetAttr(op) => {
+                if let Some(attr_bytes) =
+                    self.typed_string_constant_bytes_for_specialized_codegen(op.attr.as_ref())
+                {
+                    self.constants.intern_unicode_bytes(attr_bytes.as_slice());
+                }
+                op.visit_children(self);
+            }
+            InstrTyped::Load(op)
+                if op.name.location.is_global() || op.name.location.is_runtime_name() =>
+            {
+                self.constants
+                    .intern_unicode_bytes(op.name.id_str().as_bytes());
+            }
+            InstrTyped::Load(op) if op.name.local_location().is_some() => {
+                self.constants
+                    .intern_unicode_bytes(op.name.id_str().as_bytes());
+                if op.name.id_str().starts_with("_dp_try_abrupt_kind_") {
+                    self.constants
+                        .intern_int(abrupt_kind_tag(AbruptKind::Fallthrough));
+                }
+            }
+            InstrTyped::Load(_) => {}
+            InstrTyped::LegacyStore(op) if op.name.location.is_global() => {
+                self.constants
+                    .intern_unicode_bytes(op.name.id_str().as_bytes());
+                op.visit_children(self);
+            }
+            InstrTyped::LegacyStore(op) => {
+                op.visit_children(self);
+            }
+            InstrTyped::LegacyDel(op) if op.name.location.is_global() => {
+                self.constants
+                    .intern_unicode_bytes(op.name.id_str().as_bytes());
+            }
+            InstrTyped::BinOp(op) => op.visit_children(self),
+            InstrTyped::LegacyUnaryOp(op) => op.visit_children(self),
+            InstrTyped::LegacyTuple(op) => op.visit_children(self),
+            InstrTyped::Truthy(op) => op.visit_children(self),
+            InstrTyped::LegacyGetItem(op) => op.visit_children(self),
+            InstrTyped::LegacySetItem(op) => op.visit_children(self),
+            InstrTyped::LegacyDelItem(op) => op.visit_children(self),
+            InstrTyped::LegacyMakeCell(op) => op.visit_children(self),
+            InstrTyped::LegacyMakeFunctionWithClosure(op) => op.visit_children(self),
+            InstrTyped::LegacyDel(_) | InstrTyped::LegacyCellRef(_) => {}
+        }
+    }
+
     fn deleted_name_arg_bytes(
         &self,
         call: &blockpy_intrinsics::Call<InstrCodegen>,
@@ -552,6 +805,25 @@ impl ModuleConstantCollector {
             _ => return None,
         }
         self.string_constant_bytes_for_specialized_codegen(call.args[0].expr())
+    }
+
+    fn deleted_name_arg_bytes_typed_legacy(
+        &self,
+        call: &blockpy_intrinsics::Call<InstrTyped>,
+    ) -> Option<Vec<u8>> {
+        match helper_name_for_typed_expr(call.func.as_ref(), &self.constants) {
+            Some("raise_deleted_name") if call.args.len() == 1 => {}
+            _ => return None,
+        }
+        self.typed_string_constant_bytes_for_specialized_codegen(call.args[0].expr())
+    }
+
+    fn deleted_name_arg_bytes_typed_call(&self, call: &TypedCall<InstrTyped>) -> Option<Vec<u8>> {
+        match helper_name_for_typed_expr(call.func.as_ref(), &self.constants) {
+            Some("raise_deleted_name") if call.args.len() == 1 => {}
+            _ => return None,
+        }
+        self.typed_string_constant_bytes_for_specialized_codegen(call.args[0].expr())
     }
 
     fn string_constant_bytes_for_specialized_codegen(
@@ -576,11 +848,49 @@ impl ModuleConstantCollector {
             _ => None,
         }
     }
+
+    fn typed_string_constant_bytes_for_specialized_codegen(
+        &self,
+        expr: &InstrTyped,
+    ) -> Option<Vec<u8>> {
+        match expr {
+            InstrTyped::Load(op) => op.name.location.as_constant().and_then(|index| {
+                self.constants
+                    .constant_string_bytes_value(ModuleConstantId(index as usize))
+                    .map(ToOwned::to_owned)
+            }),
+            InstrTyped::CallTyped(call) => {
+                if helper_name_for_typed_expr(call.func.as_ref(), &self.constants) != Some("str")
+                    || call.args.len() != 1
+                    || !call.keywords.is_empty()
+                {
+                    return None;
+                }
+                self.typed_string_constant_bytes_for_specialized_codegen(call.args[0].expr())
+            }
+            InstrTyped::LegacyCall(call) => {
+                if helper_name_for_typed_expr(call.func.as_ref(), &self.constants) != Some("str")
+                    || call.args.len() != 1
+                    || !call.keywords.is_empty()
+                {
+                    return None;
+                }
+                self.typed_string_constant_bytes_for_specialized_codegen(call.args[0].expr())
+            }
+            _ => None,
+        }
+    }
 }
 
 impl soac_core::block_py::Visit<InstrCodegen> for ModuleConstantCollector {
     fn visit_instr(&mut self, expr: &InstrCodegen) {
         self.collect_expr(expr);
+    }
+}
+
+impl soac_core::block_py::Visit<InstrTyped> for ModuleConstantCollector {
+    fn visit_instr(&mut self, expr: &InstrTyped) {
+        self.collect_typed_expr(expr);
     }
 }
 
@@ -595,6 +905,23 @@ fn helper_name_for_codegen_expr<'a>(
             Some(op.name.id.as_str())
         }
         InstrCodegen::Load(op) => op.name.location.as_constant().and_then(|index| {
+            module_constants.constant_runtime_name_value(ModuleConstantId(index as usize))
+        }),
+        _ => None,
+    }
+}
+
+fn helper_name_for_typed_expr<'a>(
+    expr: &'a InstrTyped,
+    module_constants: &'a ModuleCodegenConstants,
+) -> Option<&'a str> {
+    match expr {
+        InstrTyped::Load(op)
+            if op.name.location.is_global() || op.name.location.is_runtime_name() =>
+        {
+            Some(op.name.id.as_str())
+        }
+        InstrTyped::Load(op) => op.name.location.as_constant().and_then(|index| {
             module_constants.constant_runtime_name_value(ModuleConstantId(index as usize))
         }),
         _ => None,

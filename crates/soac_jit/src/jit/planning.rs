@@ -8,16 +8,22 @@ pub use soac_opt::passes::{
 };
 use soac_opt::passes::{
     CodegenModuleShape, FactStore, FunctionLocalEnvResumePlan, FunctionRefcountPlan, InstrCodegen,
-    LocalEnvModulePlan, LocalEnvResumeEntry, LocalEnvResumeModulePlan, LocalEnvResumePoint,
-    LocalEnvResumeStatePrecision, RefcountActionKind, RefcountPlan, RefcountReleaseReason,
-    compute_function_local_live_ins, compute_function_local_must_bound_ins, plan_local_env_module,
-    plan_local_env_resume_module, plan_ownership_effects, validate_local_env_module_plan,
-    validate_local_env_resume_module_plan, validate_ownership_effects,
+    InstrTyped, LocalEnvModulePlan, LocalEnvResumeEntry, LocalEnvResumeModulePlan,
+    LocalEnvResumePoint, LocalEnvResumeStatePrecision, RefcountActionKind, RefcountPlan,
+    RefcountReleaseReason, TypedCodegenModuleShape, compute_function_local_live_ins,
+    compute_function_local_must_bound_ins, compute_typed_function_local_live_ins,
+    compute_typed_function_local_must_bound_ins, plan_local_env_module,
+    plan_local_env_resume_module, plan_ownership_effects, plan_typed_local_env_module,
+    plan_typed_local_env_resume_module, plan_typed_ownership_effects,
+    validate_local_env_module_plan, validate_local_env_resume_module_plan,
+    validate_ownership_effects, validate_typed_local_env_module_plan,
+    validate_typed_local_env_resume_module_plan, validate_typed_ownership_effects,
 };
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
 type CodegenBlock = Block<InstrCodegen>;
+type TypedBlock = Block<InstrTyped>;
 
 fn can_release_via_stack_slot_fallback(name: &str) -> bool {
     name.starts_with("_dp_try_exc_")
@@ -173,6 +179,30 @@ fn block_index_for_label(
     })
 }
 
+fn typed_block_indices_by_label(
+    function: &BlockPyFunction<TypedCodegenModuleShape>,
+) -> HashMap<BlockLabel, usize> {
+    function
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(index, block)| (block.label, index))
+        .collect()
+}
+
+fn typed_block_index_for_label(
+    function: &BlockPyFunction<TypedCodegenModuleShape>,
+    block_indices_by_label: &HashMap<BlockLabel, usize>,
+    label: BlockLabel,
+) -> usize {
+    *block_indices_by_label.get(&label).unwrap_or_else(|| {
+        panic!(
+            "function {} ({}) references unknown block label {}",
+            function.function_id, function.names.qualname, label
+        )
+    })
+}
+
 #[derive(Clone, Debug)]
 pub struct BlockExcDispatchPlan {
     pub target_index: usize,
@@ -292,6 +322,34 @@ impl PlannedJitModuleLocals {
         }
         Ok(())
     }
+
+    pub fn validate_for_typed_module(
+        &self,
+        module: &BlockPyModule<TypedCodegenModuleShape>,
+    ) -> Result<(), String> {
+        let expected_function_ids = module
+            .callable_defs
+            .iter()
+            .map(|function| function.function_id)
+            .collect::<HashSet<_>>();
+        for function in &module.callable_defs {
+            let function_plan = self.function(function.function_id).ok_or_else(|| {
+                format!(
+                    "missing JIT local plan for function {} ({})",
+                    function.function_id, function.names.qualname
+                )
+            })?;
+            function_plan.validate_for_typed_function(function)?;
+        }
+        for function_id in self.functions.keys() {
+            if !expected_function_ids.contains(function_id) {
+                return Err(format!(
+                    "JIT local plan contains unknown function id {function_id}"
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl PlannedJitDeoptResumeFunction {
@@ -323,6 +381,91 @@ impl PlannedJitDeoptResumeFunction {
     pub fn validate_for_function(
         &self,
         function: &BlockPyFunction<CodegenModuleShape>,
+    ) -> Result<(), String> {
+        let mut errors = Vec::new();
+        if self.deopt_points.len() != self.resume_plan.entries.len() {
+            errors.push(format!(
+                "JIT deopt resume plan for function {} ({}) has {} deopt points but {} \
+                 LocalEnv resume entries",
+                function.function_id,
+                function.names.qualname,
+                self.deopt_points.len(),
+                self.resume_plan.entries.len()
+            ));
+        }
+
+        for (ordinal, entry) in self.resume_plan.entries.iter().enumerate() {
+            let Some(deopt_point) = self.deopt_points.get(ordinal) else {
+                errors.push(format!(
+                    "JIT deopt resume plan for function {} ({}) is missing deopt point {ordinal}",
+                    function.function_id, function.names.qualname
+                ));
+                continue;
+            };
+            if deopt_point.id.function_id != function.function_id {
+                errors.push(format!(
+                    "JIT deopt point {ordinal} for function {} ({}) has wrong function id {}",
+                    function.function_id, function.names.qualname, deopt_point.id.function_id
+                ));
+            }
+            if deopt_point.id.ordinal != ordinal {
+                errors.push(format!(
+                    "JIT deopt point for function {} ({}) at index {ordinal} has id ordinal {}",
+                    function.function_id, function.names.qualname, deopt_point.id.ordinal
+                ));
+            }
+            if deopt_point.point != entry.point || deopt_point.resume_point != entry.point {
+                errors.push(format!(
+                    "JIT deopt point {:?} for function {} ({}) does not map exactly to LocalEnv \
+                     resume point {:?}",
+                    deopt_point.point, function.function_id, function.names.qualname, entry.point
+                ));
+            }
+            if deopt_point.precision != entry.precision {
+                errors.push(format!(
+                    "JIT deopt point {:?} for function {} ({}) has precision {:?}, expected {:?}",
+                    deopt_point.point,
+                    function.function_id,
+                    function.names.qualname,
+                    deopt_point.precision,
+                    entry.precision
+                ));
+            }
+
+            let mut seen_locations = HashSet::new();
+            for location in &deopt_point.local_locations {
+                if !seen_locations.insert(*location) {
+                    errors.push(format!(
+                        "JIT deopt point {:?} for function {} ({}) duplicates local location {}",
+                        deopt_point.point,
+                        function.function_id,
+                        function.names.qualname,
+                        location.0
+                    ));
+                }
+                if entry.binding_for_location(*location).is_none() {
+                    errors.push(format!(
+                        "JIT deopt point {:?} for function {} ({}) references unavailable local \
+                         location {}",
+                        deopt_point.point,
+                        function.function_id,
+                        function.names.qualname,
+                        location.0
+                    ));
+                }
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("\n"))
+        }
+    }
+
+    pub fn validate_for_typed_function(
+        &self,
+        function: &BlockPyFunction<TypedCodegenModuleShape>,
     ) -> Result<(), String> {
         let mut errors = Vec::new();
         if self.deopt_points.len() != self.resume_plan.entries.len() {
@@ -468,12 +611,57 @@ impl PlannedJitDeoptResumeModule {
         }
         Ok(())
     }
+
+    pub fn validate_for_typed_module(
+        &self,
+        module: &BlockPyModule<TypedCodegenModuleShape>,
+    ) -> Result<(), String> {
+        let expected_function_ids = module
+            .callable_defs
+            .iter()
+            .map(|function| function.function_id)
+            .collect::<HashSet<_>>();
+        for function in &module.callable_defs {
+            let function_plan = self.function(function.function_id).ok_or_else(|| {
+                format!(
+                    "missing JIT deopt resume plan for function {} ({})",
+                    function.function_id, function.names.qualname
+                )
+            })?;
+            function_plan.validate_for_typed_function(function)?;
+            for block in &function.blocks {
+                if function_plan
+                    .resume_plan
+                    .block_entry(function.function_id, block.label)
+                    .is_none()
+                    || function_plan
+                        .resume_plan
+                        .before_term(function.function_id, block.label)
+                        .is_none()
+                {
+                    return Err(format!(
+                        "JIT deopt resume plan for function {} ({}) is missing block boundary \
+                         entries for block {}",
+                        function.function_id, function.names.qualname, block.label
+                    ));
+                }
+            }
+        }
+        for function_id in self.functions.keys() {
+            if !expected_function_ids.contains(function_id) {
+                return Err(format!(
+                    "JIT deopt resume plan contains unknown function id {function_id}"
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl PlannedJitFunctionLocals {
     pub fn required_stack_slot_names_for_function(
         &self,
-        function: &BlockPyFunction<CodegenModuleShape>,
+        function: &BlockPyFunction<impl soac_core::block_py::ModuleShape>,
     ) -> Vec<String> {
         let mut required = HashSet::new();
 
@@ -668,10 +856,141 @@ impl PlannedJitFunctionLocals {
 
         Ok(())
     }
+
+    pub fn validate_for_typed_function(
+        &self,
+        function: &BlockPyFunction<TypedCodegenModuleShape>,
+    ) -> Result<(), String> {
+        let block_count = function.blocks.len();
+        let block_indices_by_label = typed_block_indices_by_label(function);
+        if self.runtime_block_params.len() != block_count
+            || self.implicit_target_transports.len() != block_count
+            || self.jump_edge_transports.len() != block_count
+            || self.stack_slot_entry_seeds.len() != block_count
+            || self.entry_materializations.len() != block_count
+            || self.exc_dispatches.len() != block_count
+        {
+            return Err(format!(
+                "planned JIT local state for function {} ({}) has inconsistent block counts",
+                function.function_id, function.names.qualname
+            ));
+        }
+
+        for (index, block) in function.blocks.iter().enumerate() {
+            let block_plan = self.local_plan.block(block.label);
+            if block_plan.is_none()
+                && (!self.runtime_block_params[index].is_empty()
+                    || !self.stack_slot_entry_seeds[index].is_empty()
+                    || !self.entry_materializations[index].is_empty())
+            {
+                return Err(format!(
+                    "planned JIT local state for function {} ({}) is missing block {}",
+                    function.function_id, function.names.qualname, block.label
+                ));
+            }
+            if let Some(block_plan) = block_plan {
+                for param in &self.runtime_block_params[index] {
+                    if block_plan
+                        .binding_for_block_arg_name(param.arg_name.as_str())
+                        .is_none()
+                    {
+                        return Err(format!(
+                            "runtime block param {:?} for function {} ({}) block {} has no local binding",
+                            param.arg_name,
+                            function.function_id,
+                            function.names.qualname,
+                            block.label
+                        ));
+                    }
+                    if param.binding.storage != PlannedLocalStorage::BlockParam {
+                        return Err(format!(
+                            "runtime block param {:?} for function {} ({}) block {} is not block-param backed",
+                            param.arg_name,
+                            function.function_id,
+                            function.names.qualname,
+                            block.label
+                        ));
+                    }
+                }
+            }
+            for seed in &self.stack_slot_entry_seeds[index] {
+                if seed.binding.storage != PlannedLocalStorage::StackSlot {
+                    return Err(format!(
+                        "stack-slot entry seed {:?} for function {} ({}) block {} is not stack-slot backed",
+                        seed.binding.name,
+                        function.function_id,
+                        function.names.qualname,
+                        block.label
+                    ));
+                }
+            }
+            validate_entry_materializations_for_block(
+                function,
+                block.label,
+                index,
+                &self.runtime_block_params[index],
+                &self.stack_slot_entry_seeds[index],
+                &self.entry_materializations[index],
+            )?;
+
+            let expected_jump = matches!(block.term, BlockTerm::Jump(_));
+            if self.jump_edge_transports[index].is_some() != expected_jump {
+                return Err(format!(
+                    "jump edge transport presence mismatch for function {} ({}) block {}",
+                    function.function_id, function.names.qualname, block.label
+                ));
+            }
+            if self.exc_dispatches[index].is_some() != block.exc_edge.is_some() {
+                return Err(format!(
+                    "exception dispatch presence mismatch for function {} ({}) block {}",
+                    function.function_id, function.names.qualname, block.label
+                ));
+            }
+            if let Some(dispatch) = &self.exc_dispatches[index] {
+                let Some(exc_edge) = block.exc_edge.as_ref() else {
+                    unreachable!("presence checked above");
+                };
+                let expected_target_index =
+                    typed_block_index_for_label(function, &block_indices_by_label, exc_edge.target);
+                if dispatch.target_index != expected_target_index {
+                    return Err(format!(
+                        "exception dispatch target mismatch for function {} ({}) block {}",
+                        function.function_id, function.names.qualname, block.label
+                    ));
+                }
+                if dispatch.target_args.len()
+                    != self.runtime_block_params[dispatch.target_index].len()
+                {
+                    return Err(format!(
+                        "exception dispatch target arg count mismatch for function {} ({}) block {}",
+                        function.function_id, function.names.qualname, block.label
+                    ));
+                }
+                for release_name in &dispatch.release_local_names {
+                    if !dispatch
+                        .forwarded_local_names
+                        .iter()
+                        .any(|name| name == release_name)
+                    {
+                        return Err(format!(
+                            "exception dispatch release local {:?} for function {} ({}) block {} is not forwarded",
+                            release_name,
+                            function.function_id,
+                            function.names.qualname,
+                            block.label
+                        ));
+                    }
+                }
+                validate_exception_dispatch_ownership_sinks(function, block.label, dispatch)?;
+            }
+        }
+
+        Ok(())
+    }
 }
 
-fn validate_exception_dispatch_ownership_sinks(
-    function: &BlockPyFunction<CodegenModuleShape>,
+fn validate_exception_dispatch_ownership_sinks<P: soac_core::block_py::ModuleShape>(
+    function: &BlockPyFunction<P>,
     block_label: BlockLabel,
     dispatch: &BlockExcDispatchPlan,
 ) -> Result<(), String> {
@@ -785,8 +1104,8 @@ fn named_block_arg_sources(args: &[(String, BlockArg)]) -> HashSet<&str> {
         .collect()
 }
 
-fn validate_entry_materializations_for_block(
-    function: &BlockPyFunction<CodegenModuleShape>,
+fn validate_entry_materializations_for_block<P: soac_core::block_py::ModuleShape>(
+    function: &BlockPyFunction<P>,
     block_label: BlockLabel,
     block_index: usize,
     runtime_params: &[RuntimeBlockParamPlan],
@@ -893,6 +1212,56 @@ pub fn plan_jit_module_locals_from_passes(
     Ok(PlannedJitModuleLocals { functions })
 }
 
+pub fn plan_jit_typed_module_locals(
+    module: &BlockPyModule<TypedCodegenModuleShape>,
+    facts: &FactStore,
+) -> Result<PlannedJitModuleLocals, String> {
+    let local_env_plan = plan_typed_local_env_module(module, facts);
+    let refcount_plan = plan_typed_ownership_effects(module, facts);
+    plan_jit_typed_module_locals_from_passes(module, facts, &local_env_plan, &refcount_plan)
+}
+
+pub fn plan_jit_typed_module_locals_from_passes(
+    module: &BlockPyModule<TypedCodegenModuleShape>,
+    facts: &FactStore,
+    local_env_plan: &LocalEnvModulePlan,
+    refcount_plan: &RefcountPlan,
+) -> Result<PlannedJitModuleLocals, String> {
+    validate_typed_local_env_module_plan(module, facts, local_env_plan)?;
+    validate_typed_ownership_effects(module, facts, refcount_plan)?;
+    let mut functions = HashMap::with_capacity(module.callable_defs.len());
+    for function in &module.callable_defs {
+        let local_plan = local_env_plan
+            .function(function.function_id)
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "missing LocalEnv plan for function {} ({})",
+                    function.function_id, function.names.qualname
+                )
+            })?;
+        let function_refcount_plan = refcount_plan
+            .function(function.function_id)
+            .cloned()
+            .unwrap_or_default();
+        let function_plan = plan_jit_typed_function_locals_from_plans(
+            function,
+            local_plan,
+            function_refcount_plan,
+        )?;
+        if functions
+            .insert(function.function_id, function_plan)
+            .is_some()
+        {
+            return Err(format!(
+                "duplicate JIT local plan for function id {} ({})",
+                function.function_id, function.names.qualname
+            ));
+        }
+    }
+    Ok(PlannedJitModuleLocals { functions })
+}
+
 pub fn plan_jit_deopt_resume_module(
     module: &BlockPyModule<CodegenModuleShape>,
     facts: &FactStore,
@@ -941,6 +1310,57 @@ pub fn plan_jit_deopt_resume_module_from_passes(
     }
     let plan = PlannedJitDeoptResumeModule { functions };
     plan.validate_for_module(module)?;
+    Ok(plan)
+}
+
+pub fn plan_jit_typed_deopt_resume_module(
+    module: &BlockPyModule<TypedCodegenModuleShape>,
+    facts: &FactStore,
+) -> Result<PlannedJitDeoptResumeModule, String> {
+    let local_env_plan = plan_typed_local_env_module(module, facts);
+    let resume_plan = plan_typed_local_env_resume_module(module, &local_env_plan, facts);
+    plan_jit_typed_deopt_resume_module_from_passes(module, facts, &local_env_plan, &resume_plan)
+}
+
+pub fn plan_jit_typed_deopt_resume_module_from_passes(
+    module: &BlockPyModule<TypedCodegenModuleShape>,
+    facts: &FactStore,
+    local_env_plan: &LocalEnvModulePlan,
+    resume_plan: &LocalEnvResumeModulePlan,
+) -> Result<PlannedJitDeoptResumeModule, String> {
+    validate_typed_local_env_module_plan(module, facts, local_env_plan)?;
+    validate_typed_local_env_resume_module_plan(module, local_env_plan, facts, resume_plan)?;
+    let mut functions = HashMap::with_capacity(module.callable_defs.len());
+    for function in &module.callable_defs {
+        let resume_plan = resume_plan
+            .function(function.function_id)
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "missing LocalEnv resume plan for function {} ({})",
+                    function.function_id, function.names.qualname
+                )
+            })?;
+        let deopt_points =
+            planned_deopt_points_from_resume_plan(function.function_id, &resume_plan);
+        if functions
+            .insert(
+                function.function_id,
+                PlannedJitDeoptResumeFunction {
+                    resume_plan,
+                    deopt_points,
+                },
+            )
+            .is_some()
+        {
+            return Err(format!(
+                "duplicate JIT deopt resume plan for function id {} ({})",
+                function.function_id, function.names.qualname
+            ));
+        }
+    }
+    let plan = PlannedJitDeoptResumeModule { functions };
+    plan.validate_for_typed_module(module)?;
     Ok(plan)
 }
 
@@ -1290,12 +1710,110 @@ pub fn planned_jit_params_for_function(
         .collect()
 }
 
+pub fn planned_jit_params_for_typed_function(
+    function: &BlockPyFunction<TypedCodegenModuleShape>,
+    local_plan: &FunctionLocalPlan,
+) -> Result<Vec<Vec<RuntimeBlockParamPlan>>, String> {
+    function
+        .blocks
+        .iter()
+        .map(|block| {
+            let mut params = Vec::new();
+            let mut seen_names = HashSet::new();
+            let block_plan = local_plan.block(block.label);
+            for name in block.bb_param_names() {
+                let arg_name = name.to_string();
+                seen_names.insert(arg_name.clone());
+                let Some(binding) = block_plan
+                    .and_then(|plan| plan.binding_for_block_arg_name(arg_name.as_str()).cloned())
+                else {
+                    return Err(format!(
+                        "missing runtime block-param binding for function {} ({}) block {} arg {:?}",
+                        function.function_id, function.names.qualname, block.label, arg_name
+                    ));
+                };
+                let entry_aliases = if arg_name == binding.name {
+                    Vec::new()
+                } else {
+                    vec![arg_name.clone()]
+                };
+                params.push(RuntimeBlockParamPlan {
+                    arg_name,
+                    entry_aliases,
+                    binding,
+                });
+            }
+            if let Some(block_plan) = block_plan {
+                for binding in &block_plan.entry_locals {
+                    if binding.storage != PlannedLocalStorage::BlockParam {
+                        continue;
+                    }
+                    if !seen_names.insert(binding.name.clone()) {
+                        continue;
+                    }
+                    params.push(RuntimeBlockParamPlan {
+                        arg_name: binding.name.clone(),
+                        binding: binding.clone(),
+                        entry_aliases: Vec::new(),
+                    });
+                }
+            }
+            Ok(params)
+        })
+        .collect()
+}
+
 pub fn planned_stack_slot_entry_seeds_for_function(
     function: &BlockPyFunction<CodegenModuleShape>,
     local_plan: &FunctionLocalPlan,
 ) -> Vec<Vec<PlannedStackSlotEntrySeed>> {
     let live_ins = compute_function_local_live_ins(function);
     let must_bound_ins = compute_function_local_must_bound_ins(function);
+    function
+        .blocks
+        .iter()
+        .map(|block| {
+            let live_in_locations = live_ins.get(&block.label).cloned().unwrap_or_default();
+            let must_bound_locations = must_bound_ins
+                .get(&block.label)
+                .cloned()
+                .unwrap_or_default();
+            local_plan
+                .block(block.label)
+                .map(|block_plan| {
+                    block_plan
+                        .entry_locals
+                        .iter()
+                        .cloned()
+                        .filter_map(|binding| {
+                            if binding.storage != PlannedLocalStorage::StackSlot {
+                                return None;
+                            }
+                            if !live_in_locations.contains(&binding.location)
+                                && !must_bound_locations.contains(&binding.location)
+                            {
+                                return None;
+                            }
+                            let entry_ref_kind =
+                                local_ref_kind_for_stack_mirror(binding.param_facts.ownership);
+                            Some(PlannedStackSlotEntrySeed {
+                                entry_ref_kind,
+                                binding,
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+pub fn planned_stack_slot_entry_seeds_for_typed_function(
+    function: &BlockPyFunction<TypedCodegenModuleShape>,
+    local_plan: &FunctionLocalPlan,
+) -> Vec<Vec<PlannedStackSlotEntrySeed>> {
+    let live_ins = compute_typed_function_local_live_ins(function);
+    let must_bound_ins = compute_typed_function_local_must_bound_ins(function);
     function
         .blocks
         .iter()
@@ -1460,6 +1978,26 @@ pub fn planned_implicit_target_transports_for_function(
         .collect()
 }
 
+pub fn planned_implicit_target_transports_for_typed_function(
+    function: &BlockPyFunction<TypedCodegenModuleShape>,
+    runtime_block_params: &[Vec<RuntimeBlockParamPlan>],
+) -> Vec<EdgeTransportPlan> {
+    let no_slot_writes = HashSet::new();
+    function
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(index, block)| {
+            plan_edge_transport(
+                &block.param_name_vec(),
+                &[],
+                &runtime_block_params[index],
+                &no_slot_writes,
+            )
+        })
+        .collect()
+}
+
 pub fn planned_jump_edge_transports_for_function(
     function: &BlockPyFunction<CodegenModuleShape>,
     runtime_block_params: &[Vec<RuntimeBlockParamPlan>],
@@ -1486,6 +2024,32 @@ pub fn planned_jump_edge_transports_for_function(
         .collect()
 }
 
+pub fn planned_jump_edge_transports_for_typed_function(
+    function: &BlockPyFunction<TypedCodegenModuleShape>,
+    runtime_block_params: &[Vec<RuntimeBlockParamPlan>],
+) -> Vec<Option<EdgeTransportPlan>> {
+    let no_slot_writes = HashSet::new();
+    let block_indices_by_label = typed_block_indices_by_label(function);
+    function
+        .blocks
+        .iter()
+        .map(|block| match &block.term {
+            BlockTerm::Jump(target) => {
+                let target_index =
+                    typed_block_index_for_label(function, &block_indices_by_label, target.target);
+                let target_block = &function.blocks[target_index];
+                Some(plan_edge_transport(
+                    &target_block.param_name_vec(),
+                    &target.args,
+                    &runtime_block_params[target_index],
+                    &no_slot_writes,
+                ))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 pub fn exc_dispatch_plan(
     function: &BlockPyFunction<CodegenModuleShape>,
     block: &CodegenBlock,
@@ -1495,6 +2059,76 @@ pub fn exc_dispatch_plan(
     let exc_edge = block.exc_edge.as_ref()?;
     let block_indices_by_label = block_indices_by_label(function);
     let target_index = block_index_for_label(function, &block_indices_by_label, exc_edge.target);
+    let target_block = &function.blocks[target_index];
+    let stack_slot_name_set = function
+        .storage_layout()
+        .as_ref()
+        .map(|layout| {
+            layout
+                .stack_slots()
+                .iter()
+                .cloned()
+                .into_iter()
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
+    let full_target_param_names = target_block.param_name_vec();
+    let transport = plan_edge_transport(
+        &full_target_param_names,
+        &exc_edge.args,
+        runtime_target_params,
+        &stack_slot_name_set,
+    );
+    let release_reason = RefcountReleaseReason::ExceptionEdge {
+        target: exc_edge.target,
+    };
+    let mut forwarded_local_names = transport.forwarded_local_names;
+    let mut release_local_names = Vec::new();
+    if let Some(block_plan) = refcount_plan.block(block.label) {
+        for action in &block_plan.actions {
+            let RefcountActionKind::ReleaseLocal {
+                local,
+                reason: action_reason,
+                ..
+            } = &action.kind
+            else {
+                continue;
+            };
+            if action_reason != &release_reason
+                || can_release_via_stack_slot_fallback(local.name.as_str())
+                || forwarded_local_names.iter().any(|name| name == &local.name)
+            {
+                continue;
+            }
+            forwarded_local_names.push(local.name.clone());
+            release_local_names.push(local.name.clone());
+        }
+    }
+    let drop_forwarded_local_names = planned_drop_forwarded_local_names(
+        &forwarded_local_names,
+        &transport.target_args,
+        &release_local_names,
+    );
+    Some(BlockExcDispatchPlan {
+        target_index,
+        slot_writes: transport.slot_writes,
+        target_args: transport.target_args,
+        forwarded_local_names,
+        release_local_names,
+        drop_forwarded_local_names,
+    })
+}
+
+pub fn typed_exc_dispatch_plan(
+    function: &BlockPyFunction<TypedCodegenModuleShape>,
+    block: &TypedBlock,
+    runtime_target_params: &[RuntimeBlockParamPlan],
+    refcount_plan: &FunctionRefcountPlan,
+) -> Option<BlockExcDispatchPlan> {
+    let exc_edge = block.exc_edge.as_ref()?;
+    let block_indices_by_label = typed_block_indices_by_label(function);
+    let target_index =
+        typed_block_index_for_label(function, &block_indices_by_label, exc_edge.target);
     let target_block = &function.blocks[target_index];
     let stack_slot_name_set = function
         .storage_layout()
@@ -1630,6 +2264,54 @@ pub fn plan_jit_function_locals_from_plans(
         exc_dispatches,
     };
     plan.validate_for_function(function)?;
+    Ok(plan)
+}
+
+pub fn plan_jit_typed_function_locals_from_plans(
+    function: &BlockPyFunction<TypedCodegenModuleShape>,
+    local_plan: FunctionLocalPlan,
+    refcount_plan: FunctionRefcountPlan,
+) -> Result<PlannedJitFunctionLocals, String> {
+    let block_indices_by_label = typed_block_indices_by_label(function);
+    let runtime_block_params = planned_jit_params_for_typed_function(function, &local_plan)?;
+    let implicit_target_transports =
+        planned_implicit_target_transports_for_typed_function(function, &runtime_block_params);
+    let jump_edge_transports =
+        planned_jump_edge_transports_for_typed_function(function, &runtime_block_params);
+    let stack_slot_entry_seeds =
+        planned_stack_slot_entry_seeds_for_typed_function(function, &local_plan);
+    let entry_materializations = planned_local_env_entry_materializations_for_function(
+        &runtime_block_params,
+        &stack_slot_entry_seeds,
+    )?;
+    let exc_dispatches = function
+        .blocks
+        .iter()
+        .map(|block| {
+            let runtime_target_params = block
+                .exc_edge
+                .as_ref()
+                .map(|edge| {
+                    let target_index =
+                        typed_block_index_for_label(function, &block_indices_by_label, edge.target);
+                    runtime_block_params[target_index].as_slice()
+                })
+                .unwrap_or(&[]);
+            typed_exc_dispatch_plan(function, block, runtime_target_params, &refcount_plan)
+        })
+        .collect::<Vec<_>>();
+
+    let plan = PlannedJitFunctionLocals {
+        local_plan,
+        refcount_plan,
+        runtime_block_params,
+        implicit_target_transports,
+        jump_edge_transports,
+        stack_slot_entry_seeds,
+        entry_materializations,
+        exc_dispatches,
+    };
+    plan.validate_for_typed_function(function)?;
     Ok(plan)
 }
 

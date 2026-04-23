@@ -74,10 +74,10 @@ pub use crate::typed::{
     annotate_typed_module_value_facts, lower_codegen_function_to_typed,
     lower_codegen_module_to_typed, lower_typed_function_call_access_plan_instrs,
     lower_typed_function_call_emission_plans, lower_typed_function_if_tests_to_truthy,
-    refresh_typed_function_value_facts, try_lower_typed_instr_to_codegen_legacy,
-    try_lower_typed_module_to_codegen_legacy, try_lower_typed_term_to_codegen_legacy,
-    validate_typed_function_call_access_plans, validate_typed_function_value_facts,
-    validate_typed_module_call_access_plans,
+    lower_typed_if_tests_to_truthy, refresh_typed_function_value_facts,
+    try_lower_typed_instr_to_codegen_legacy, try_lower_typed_module_to_codegen_legacy,
+    try_lower_typed_term_to_codegen_legacy, validate_typed_function_call_access_plans,
+    validate_typed_function_value_facts, validate_typed_module_call_access_plans,
 };
 pub use direct_call_transform::{
     DirectCallStoreRewriteStats, rewrite_profiled_function_call_store_sites,
@@ -115,16 +115,21 @@ pub use local_env_plan::{
     LocalEnvResumeModulePlan, LocalEnvResumePoint, LocalEnvResumeStatePrecision,
     LocalEnvResumeValueSource, LocalRefKind, ParamBindingFacts, ParamProvenance,
     PlannedLocalBinding, PlannedLocalStorage, plan_function_local_env_resume, plan_function_locals,
-    plan_local_env_module, plan_local_env_resume_module, render_local_env_function_plan,
-    render_local_env_module_plan, render_local_env_resume_function_plan,
-    render_local_env_resume_module_plan, render_planned_local_binding,
-    validate_local_env_module_plan, validate_local_env_resume_module_plan,
+    plan_local_env_module, plan_local_env_resume_module, plan_typed_function_local_env_resume,
+    plan_typed_function_locals, plan_typed_local_env_module, plan_typed_local_env_resume_module,
+    render_local_env_function_plan, render_local_env_module_plan,
+    render_local_env_resume_function_plan, render_local_env_resume_module_plan,
+    render_planned_local_binding, validate_local_env_module_plan,
+    validate_local_env_resume_module_plan, validate_typed_local_env_module_plan,
+    validate_typed_local_env_resume_module_plan,
 };
 pub use ownership_effects::{
     BlockRefcountPlan, FunctionRefcountPlan, LocalRefState, RefcountAction, RefcountActionKind,
     RefcountLocal, RefcountPlan, RefcountReleaseReason, RefcountSite,
-    compute_function_local_live_ins, compute_function_local_must_bound_ins, plan_ownership_effects,
-    validate_ownership_effects,
+    compute_function_local_live_ins, compute_function_local_must_bound_ins,
+    compute_typed_function_local_live_ins, compute_typed_function_local_must_bound_ins,
+    plan_ownership_effects, plan_typed_ownership_effects, validate_ownership_effects,
+    validate_typed_ownership_effects,
 };
 pub use profiled_method_transform::{
     ProfiledMethodInlineRewriteStats, ProfiledOwnerAttrKey, ProfiledOwnerAttrSpecialization,

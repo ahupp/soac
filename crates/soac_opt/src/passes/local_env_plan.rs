@@ -7,8 +7,11 @@
 
 use crate::passes::ownership_effects::{
     compute_function_local_live_ins, compute_function_local_must_bound_ins,
+    compute_typed_function_local_live_ins, compute_typed_function_local_must_bound_ins,
 };
-use crate::passes::{CodegenModuleShape, FactStore, InstrCodegen, PyObjFacts};
+use crate::passes::{
+    CodegenModuleShape, FactStore, InstrCodegen, InstrTyped, PyObjFacts, TypedCodegenModuleShape,
+};
 use soac_core::block_py::{
     BlockLabel, BlockPyFunction, BlockPyModule, HasSemanticInstrId, InstrKey, LocalLocation,
     RuntimeFunctionId,
@@ -376,6 +379,42 @@ pub fn plan_local_env_resume_module(
     LocalEnvResumeModulePlan { functions }
 }
 
+pub fn plan_typed_local_env_module(
+    module: &BlockPyModule<TypedCodegenModuleShape>,
+    facts: &FactStore,
+) -> LocalEnvModulePlan {
+    let functions = module
+        .callable_defs
+        .iter()
+        .map(|function| {
+            (
+                function.function_id,
+                plan_typed_function_locals(function, facts),
+            )
+        })
+        .collect();
+    LocalEnvModulePlan { functions }
+}
+
+pub fn plan_typed_local_env_resume_module(
+    module: &BlockPyModule<TypedCodegenModuleShape>,
+    local_env_plan: &LocalEnvModulePlan,
+    facts: &FactStore,
+) -> LocalEnvResumeModulePlan {
+    let functions = module
+        .callable_defs
+        .iter()
+        .filter_map(|function| {
+            let function_plan = local_env_plan.function(function.function_id)?;
+            Some((
+                function.function_id,
+                plan_typed_function_local_env_resume(function, function_plan, facts),
+            ))
+        })
+        .collect();
+    LocalEnvResumeModulePlan { functions }
+}
+
 pub fn plan_function_local_env_resume(
     function: &BlockPyFunction<CodegenModuleShape>,
     local_env_plan: &FunctionLocalPlan,
@@ -412,6 +451,55 @@ pub fn plan_function_local_env_resume(
                 locals: locals.clone(),
             });
             transfer_resume_local_state(function.function_id, instr, facts, &mut locals);
+        }
+        entries.push(LocalEnvResumeEntry {
+            point: LocalEnvResumePoint::BeforeTerm {
+                function_id: function.function_id,
+                block: block.label,
+            },
+            precision: LocalEnvResumeStatePrecision::InstructionBoundary,
+            locals,
+        });
+    }
+    FunctionLocalEnvResumePlan { entries }
+}
+
+pub fn plan_typed_function_local_env_resume(
+    function: &BlockPyFunction<TypedCodegenModuleShape>,
+    local_env_plan: &FunctionLocalPlan,
+    facts: &FactStore,
+) -> FunctionLocalEnvResumePlan {
+    let mut entries = Vec::new();
+    for block in &function.blocks {
+        let Some(block_plan) = local_env_plan.block(block.label) else {
+            continue;
+        };
+        let mut locals = block_plan
+            .entry_locals
+            .iter()
+            .map(resume_binding_from_planned_local)
+            .collect::<Vec<_>>();
+        entries.push(LocalEnvResumeEntry {
+            point: LocalEnvResumePoint::BlockEntry {
+                function_id: function.function_id,
+                block: block.label,
+            },
+            precision: LocalEnvResumeStatePrecision::BlockEntry,
+            locals: locals.clone(),
+        });
+        for instr in &block.body {
+            let Some(instr_id) = instr.try_semantic_instr_id() else {
+                transfer_typed_resume_local_state(function.function_id, instr, facts, &mut locals);
+                continue;
+            };
+            entries.push(LocalEnvResumeEntry {
+                point: LocalEnvResumePoint::BeforeInstr {
+                    key: InstrKey::new(function.function_id, instr_id),
+                },
+                precision: LocalEnvResumeStatePrecision::InstructionBoundary,
+                locals: locals.clone(),
+            });
+            transfer_typed_resume_local_state(function.function_id, instr, facts, &mut locals);
         }
         entries.push(LocalEnvResumeEntry {
             point: LocalEnvResumePoint::BeforeTerm {
@@ -473,6 +561,92 @@ pub fn validate_local_env_resume_module_plan(
     if &expected != resume_plan {
         return Err(format!(
             "LocalEnv resume plan mismatch\nexpected: {expected:#?}\nactual: {resume_plan:#?}"
+        ));
+    }
+
+    let expected_function_ids = module
+        .callable_defs
+        .iter()
+        .map(|function| function.function_id)
+        .collect::<HashSet<_>>();
+    let mut errors = Vec::new();
+    for function in &module.callable_defs {
+        if resume_plan.function(function.function_id).is_none() {
+            errors.push(format!(
+                "missing LocalEnv resume plan for function {} ({})",
+                function.function_id, function.names.qualname
+            ));
+        }
+    }
+    for function_id in resume_plan.functions.keys() {
+        if !expected_function_ids.contains(function_id) {
+            errors.push(format!(
+                "LocalEnv resume plan contains unknown function id {function_id}"
+            ));
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("\n"))
+    }
+}
+
+pub fn validate_typed_local_env_module_plan(
+    module: &BlockPyModule<TypedCodegenModuleShape>,
+    facts: &FactStore,
+    plan: &LocalEnvModulePlan,
+) -> Result<(), String> {
+    let expected_function_ids = module
+        .callable_defs
+        .iter()
+        .map(|function| function.function_id)
+        .collect::<HashSet<_>>();
+    let mut errors = Vec::new();
+
+    for function in &module.callable_defs {
+        let Some(function_plan) = plan.function(function.function_id) else {
+            errors.push(format!(
+                "missing LocalEnv plan for function {} ({})",
+                function.function_id, function.names.qualname
+            ));
+            continue;
+        };
+        let expected = plan_typed_function_locals(function, facts);
+        if &expected != function_plan {
+            errors.push(format!(
+                "typed LocalEnv plan mismatch for function {} ({})\nexpected: {expected:#?}\nactual: {function_plan:#?}",
+                function.function_id, function.names.qualname
+            ));
+        }
+    }
+
+    for function_id in plan.functions.keys() {
+        if !expected_function_ids.contains(function_id) {
+            errors.push(format!(
+                "LocalEnv plan contains unknown function id {function_id}"
+            ));
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("\n"))
+    }
+}
+
+pub fn validate_typed_local_env_resume_module_plan(
+    module: &BlockPyModule<TypedCodegenModuleShape>,
+    local_env_plan: &LocalEnvModulePlan,
+    facts: &FactStore,
+    resume_plan: &LocalEnvResumeModulePlan,
+) -> Result<(), String> {
+    let expected = plan_typed_local_env_resume_module(module, local_env_plan, facts);
+    if &expected != resume_plan {
+        return Err(format!(
+            "typed LocalEnv resume plan mismatch\nexpected: {expected:#?}\nactual: {resume_plan:#?}"
         ));
     }
 
@@ -595,6 +769,119 @@ pub fn plan_function_locals(
                         binding: binding_facts,
                         provenance,
                         ownership: local_ref_kind_for_block_entry(
+                            function,
+                            is_entry_block,
+                            name,
+                            explicit_param_names.contains(name.as_str())
+                                || is_function_param_on_entry,
+                            is_must_bound_on_entry,
+                            py_facts,
+                        ),
+                    },
+                }
+            })
+            .collect();
+        blocks.insert(
+            block.label,
+            BlockLocalPlan {
+                label: block.label,
+                entry_locals,
+            },
+        );
+    }
+    FunctionLocalPlan { blocks }
+}
+
+pub fn plan_typed_function_locals(
+    function: &BlockPyFunction<TypedCodegenModuleShape>,
+    facts: &FactStore,
+) -> FunctionLocalPlan {
+    let Some(storage_layout) = function.storage_layout().as_ref() else {
+        let blocks = function
+            .blocks
+            .iter()
+            .map(|block| {
+                (
+                    block.label,
+                    BlockLocalPlan {
+                        label: block.label,
+                        entry_locals: Vec::new(),
+                    },
+                )
+            })
+            .collect();
+        return FunctionLocalPlan { blocks };
+    };
+    let live_ins = compute_typed_function_local_live_ins(function);
+    let must_bound_ins = compute_typed_function_local_must_bound_ins(function);
+    let entry_label = function.entry_block().label;
+    let mut blocks = HashMap::with_capacity(function.blocks.len());
+    for block in &function.blocks {
+        let entry_facts = facts.block_entry_fact(function.function_id, block.label);
+        let is_entry_block = block.label == entry_label;
+        let live_in_locations = live_ins.get(&block.label).cloned().unwrap_or_default();
+        let must_bound_locations = must_bound_ins
+            .get(&block.label)
+            .cloned()
+            .unwrap_or_default();
+        let explicit_param_names = block.param_names().collect::<HashSet<_>>();
+        let entry_locals = storage_layout
+            .stack_slots()
+            .iter()
+            .enumerate()
+            .map(|(slot, name)| {
+                let location = LocalLocation(
+                    u32::try_from(slot).expect("storage layout slot index should fit in u32"),
+                );
+                let is_function_param_on_entry = is_entry_block
+                    && function
+                        .params
+                        .iter()
+                        .any(|param| param.name == name.as_str());
+                let is_must_bound_on_entry = must_bound_locations.contains(&location);
+                let py_facts = entry_facts
+                    .and_then(|env| env.local_pyobj_fact(location))
+                    .filter(|_| is_must_bound_on_entry);
+                let is_live_in = live_in_locations.contains(&location);
+                let storage = if explicit_param_names.contains(name.as_str()) {
+                    PlannedLocalStorage::BlockParam
+                } else if is_function_param_on_entry {
+                    PlannedLocalStorage::BlockParam
+                } else if is_live_in || is_must_bound_on_entry {
+                    PlannedLocalStorage::BlockParam
+                } else {
+                    PlannedLocalStorage::StackSlot
+                };
+                let binding_facts = if is_function_param_on_entry {
+                    ParamBindingFacts::DefinitelyBound
+                } else if is_must_bound_on_entry {
+                    match storage {
+                        PlannedLocalStorage::BlockParam => ParamBindingFacts::DefinitelyBound,
+                        PlannedLocalStorage::StackSlot => ParamBindingFacts::CheckedLocalValue,
+                    }
+                } else {
+                    ParamBindingFacts::MaybeUnbound
+                };
+                let provenance = if explicit_param_names.contains(name.as_str()) {
+                    ParamProvenance::ExplicitBlockParam(location)
+                } else if is_function_param_on_entry {
+                    ParamProvenance::ForwardedLocal(location)
+                } else if is_entry_block && storage == PlannedLocalStorage::BlockParam {
+                    ParamProvenance::SyntheticUnbound(location)
+                } else if storage == PlannedLocalStorage::BlockParam {
+                    ParamProvenance::ForwardedLocal(location)
+                } else {
+                    ParamProvenance::StackSlot(location)
+                };
+                PlannedLocalBinding {
+                    name: name.clone(),
+                    location,
+                    storage,
+                    param_facts: BlockParamFacts {
+                        value: py_facts,
+                        binding: binding_facts,
+                        provenance,
+                        ownership: local_ref_kind_for_typed_block_entry(
                             function,
                             is_entry_block,
                             name,
@@ -851,6 +1138,61 @@ fn transfer_resume_local_state(
     }
 }
 
+fn transfer_typed_resume_local_state(
+    function_id: RuntimeFunctionId,
+    instr: &InstrTyped,
+    facts: &FactStore,
+    locals: &mut [LocalEnvResumeBinding],
+) {
+    match instr {
+        InstrTyped::LegacyStore(op) => {
+            let Some(location) = op.name.local_location() else {
+                return;
+            };
+            let value_key = op
+                .value
+                .try_semantic_instr_id()
+                .map(|instr_id| InstrKey::new(function_id, instr_id));
+            let py_facts = op
+                .value
+                .typed_extra()
+                .and_then(|extra| extra.result_facts())
+                .and_then(|facts| facts.as_pyobj())
+                .or_else(|| {
+                    value_key
+                        .and_then(|key| facts.fact_for(key))
+                        .and_then(|facts| facts.as_pyobj())
+                });
+            if let Some(binding) = locals
+                .iter_mut()
+                .find(|binding| binding.location == location)
+            {
+                binding.binding = LocalEnvResumeBindingState::Bound;
+                binding.source = value_key
+                    .map(LocalEnvResumeValueSource::StoredValue)
+                    .unwrap_or(LocalEnvResumeValueSource::Unknown);
+                binding.ownership = local_ref_kind_for_resume_value(py_facts);
+                binding.value = py_facts;
+            }
+        }
+        InstrTyped::LegacyDel(op) => {
+            let Some(location) = op.name.local_location() else {
+                return;
+            };
+            if let Some(binding) = locals
+                .iter_mut()
+                .find(|binding| binding.location == location)
+            {
+                binding.binding = LocalEnvResumeBindingState::Unbound;
+                binding.source = LocalEnvResumeValueSource::Unbound;
+                binding.ownership = LocalRefKind::Unbound;
+                binding.value = None;
+            }
+        }
+        _ => {}
+    }
+}
+
 fn local_ref_kind_for_resume_value(facts: Option<PyObjFacts>) -> LocalRefKind {
     match facts {
         Some(facts) if facts.is_immortal() => LocalRefKind::Immortal,
@@ -875,6 +1217,31 @@ fn validate_function_local_plan(
 
 fn local_ref_kind_for_block_entry(
     function: &BlockPyFunction<CodegenModuleShape>,
+    is_entry_block: bool,
+    name: &str,
+    is_explicit_block_param: bool,
+    is_must_bound_on_entry: bool,
+    facts: Option<PyObjFacts>,
+) -> LocalRefKind {
+    match facts {
+        Some(facts) if facts.is_immortal() => return LocalRefKind::Immortal,
+        Some(_) => return LocalRefKind::Owned,
+        None => {}
+    }
+    if is_entry_block && function.params.iter().any(|param| param.name == name) {
+        return LocalRefKind::Owned;
+    }
+    if is_must_bound_on_entry {
+        return LocalRefKind::Owned;
+    }
+    if is_explicit_block_param {
+        return LocalRefKind::Unknown;
+    }
+    LocalRefKind::Unbound
+}
+
+fn local_ref_kind_for_typed_block_entry(
+    function: &BlockPyFunction<TypedCodegenModuleShape>,
     is_entry_block: bool,
     name: &str,
     is_explicit_block_param: bool,
