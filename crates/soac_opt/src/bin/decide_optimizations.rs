@@ -160,7 +160,7 @@ mod test {
         hash_module_source, load_codegen_module_cache, module_optimization_plan_v3_path,
         module_optimized_codegen_v3_path,
     };
-    use soac_driver::{LoweringOptions, lower_python_to_blockpy_recorded_with_options};
+    use soac_driver::{CodegenPreparationOptions, prepare_codegen_module_recorded_with_options};
     use soac_lowering::passes::{CodegenModuleShape, InstrCodegen};
     use soac_opt::artifacts_v3::load_optimization_artifacts_v3;
     use std::fs;
@@ -187,11 +187,13 @@ mod test {
             metadata.module_name.as_str(),
         )
         .unwrap();
-        let lowered = lower_python_to_blockpy_recorded_with_options(
+        let lowered = prepare_codegen_module_recorded_with_options(
             source,
             ModuleNameGen::new(7),
-            LoweringOptions {
-                runtime_names_as_globals: false,
+            CodegenPreparationOptions {
+                lowering: soac_lowering::LoweringOptions {
+                    runtime_names_as_globals: false,
+                },
                 pre_optimization_cache_path: Some(module_cache_path.clone()),
                 pre_optimization_cache_metadata: Some(metadata.clone()),
             },
@@ -620,11 +622,13 @@ mod test {
             metadata.module_name.as_str(),
         )
         .unwrap();
-        let lowered = lower_python_to_blockpy_recorded_with_options(
+        let lowered = prepare_codegen_module_recorded_with_options(
             source,
             ModuleNameGen::new(module_id),
-            LoweringOptions {
-                runtime_names_as_globals: false,
+            CodegenPreparationOptions {
+                lowering: soac_lowering::LoweringOptions {
+                    runtime_names_as_globals: false,
+                },
                 pre_optimization_cache_path: Some(module_cache_path),
                 pre_optimization_cache_metadata: Some(metadata),
             },

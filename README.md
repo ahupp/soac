@@ -24,9 +24,10 @@
   modules for tests, and initializes Python for Rust-side integration tests.
 
 - `soac-driver`
-  Pipeline orchestration around lowering and codegen module caching. It exposes
-  production and test lowering entrypoints and owns the cache path/metadata
-  helpers used by the runtime and optimizer.
+  Codegen-preparation orchestration layered on top of `soac-lowering`. It owns
+  pre-optimization module-cache lookup/store, prepared codegen facts,
+  env-configured instrumentation, and cache path/metadata helpers used by the
+  runtime and optimizer.
 
 - `soac-inspector`
   Local web inspector and command-line tooling for lowering, counter dumps,
@@ -46,7 +47,8 @@
 - `soac-lowering`
   Parser-to-BlockPy lowering pipeline, transformation passes, pass tracking,
   source fixtures, validation, and structured render helpers. It is where raw
-  Python syntax is turned into progressively more resolved compiler IR.
+  Python syntax is turned into progressively more resolved compiler IR, and it
+  owns the public lowering entrypoints.
 
 - `soac-macros`
   Procedural macros used by the lowering and IR layers to reduce repetitive

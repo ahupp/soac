@@ -9,27 +9,40 @@ use soac_config::{SoacEnvConfig, init_logging_with_config};
 use soac_core::block_py::{BlockPyModule, CounterDef, CounterId, CounterScope, ModuleNameGen};
 use soac_lowering::pass_tracker::{NoopPassTracker, PassTracker, RecordingPassTracker};
 use soac_lowering::passes::{self, CodegenModuleShape, InstrCodegen};
-pub use soac_lowering::{LoweringError, LoweringResult, Result};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use tracing::{info, warn};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct LoweringOptions {
-    /// If `true`, compile `soac.runtime` bootstrap references as ordinary
-    /// globals instead of `RuntimeName` constants. `RuntimeName` constants load
-    /// from `soac.runtime`, so using them while compiling `soac.runtime` itself
-    /// would make module initialization circular.
-    pub runtime_names_as_globals: bool,
+pub struct CodegenPreparationOptions {
+    pub lowering: soac_lowering::LoweringOptions,
     pub pre_optimization_cache_path: Option<PathBuf>,
     pub pre_optimization_cache_metadata: Option<CachedCodegenModuleMetadata>,
 }
 
-impl LoweringOptions {
-    const fn lowering_options(&self) -> soac_lowering::LoweringOptions {
-        soac_lowering::LoweringOptions {
-            runtime_names_as_globals: self.runtime_names_as_globals,
+impl CodegenPreparationOptions {
+    pub fn with_runtime_names_as_globals(mut self, runtime_names_as_globals: bool) -> Self {
+        self.lowering.runtime_names_as_globals = runtime_names_as_globals;
+        self
+    }
+
+    pub fn with_pre_optimization_cache(
+        mut self,
+        path: PathBuf,
+        metadata: CachedCodegenModuleMetadata,
+    ) -> Self {
+        self.pre_optimization_cache_path = Some(path);
+        self.pre_optimization_cache_metadata = Some(metadata);
+        self
+    }
+}
+
+impl From<soac_lowering::LoweringOptions> for CodegenPreparationOptions {
+    fn from(lowering: soac_lowering::LoweringOptions) -> Self {
+        Self {
+            lowering,
+            ..Self::default()
         }
     }
 }
@@ -40,33 +53,33 @@ struct PreOptimizationModule {
     cache_metadata_for_store: Option<CachedCodegenModuleMetadata>,
 }
 
-fn lower_python_to_blockpy_with_tracker<P>(
+fn prepare_codegen_module_with_tracker<P>(
     source: &str,
     module_name_gen: ModuleNameGen,
     pass_tracker: P,
-) -> Result<LoweringResult<P>>
+) -> soac_lowering::Result<soac_lowering::LoweringResult<P>>
 where
     P: PassTracker,
 {
-    lower_python_to_blockpy_with_tracker_and_options(
+    prepare_codegen_module_with_tracker_and_options(
         source,
         module_name_gen,
         pass_tracker,
-        LoweringOptions::default(),
+        CodegenPreparationOptions::default(),
     )
 }
 
-fn lower_python_to_blockpy_with_tracker_and_options<P>(
+fn prepare_codegen_module_with_tracker_and_options<P>(
     source: &str,
     module_name_gen: ModuleNameGen,
     pass_tracker: P,
-    options: LoweringOptions,
-) -> Result<LoweringResult<P>>
+    options: CodegenPreparationOptions,
+) -> soac_lowering::Result<soac_lowering::LoweringResult<P>>
 where
     P: PassTracker,
 {
     let env_config = SoacEnvConfig::from_env().map_err(anyhow::Error::msg)?;
-    lower_python_to_blockpy_with_tracker_options_and_config(
+    prepare_codegen_module_with_tracker_options_and_config(
         source,
         module_name_gen,
         pass_tracker,
@@ -75,13 +88,13 @@ where
     )
 }
 
-fn lower_python_to_blockpy_with_tracker_options_and_config<P>(
+fn prepare_codegen_module_with_tracker_options_and_config<P>(
     source: &str,
     module_name_gen: ModuleNameGen,
     mut pass_tracker: P,
-    options: LoweringOptions,
+    options: CodegenPreparationOptions,
     env_config: &SoacEnvConfig,
-) -> Result<LoweringResult<P>>
+) -> soac_lowering::Result<soac_lowering::LoweringResult<P>>
 where
     P: PassTracker,
 {
@@ -97,50 +110,46 @@ where
         env_config,
     )?;
 
-    Ok(LoweringResult {
+    Ok(soac_lowering::LoweringResult {
         total_time: total_start.elapsed(),
         codegen_module,
         pass_tracker,
     })
 }
 
-pub fn lower_python_to_blockpy_for_testing(source: &str) -> Result<LoweringResult> {
-    lower_python_to_blockpy_with_tracker(source, ModuleNameGen::new(0), RecordingPassTracker::new())
-}
-
-pub fn lower_python_to_blockpy_for_testing_with_config(
+pub fn prepare_codegen_module_for_testing_with_config(
     source: &str,
     env_config: &SoacEnvConfig,
-) -> Result<LoweringResult> {
-    lower_python_to_blockpy_with_tracker_options_and_config(
+) -> soac_lowering::Result<soac_lowering::LoweringResult> {
+    prepare_codegen_module_with_tracker_options_and_config(
         source,
         ModuleNameGen::new(0),
         RecordingPassTracker::new(),
-        LoweringOptions::default(),
+        CodegenPreparationOptions::default(),
         env_config,
     )
 }
 
-pub fn lower_python_to_blockpy(
+pub fn prepare_codegen_module(
     source: &str,
     module_name_gen: ModuleNameGen,
-) -> Result<LoweringResult<NoopPassTracker>> {
-    lower_python_to_blockpy_with_tracker(source, module_name_gen, NoopPassTracker::new())
+) -> soac_lowering::Result<soac_lowering::LoweringResult<NoopPassTracker>> {
+    prepare_codegen_module_with_tracker(source, module_name_gen, NoopPassTracker::new())
 }
 
-pub fn lower_python_to_blockpy_recorded(
+pub fn prepare_codegen_module_recorded(
     source: &str,
     module_name_gen: ModuleNameGen,
-) -> Result<LoweringResult<RecordingPassTracker>> {
-    lower_python_to_blockpy_with_tracker(source, module_name_gen, RecordingPassTracker::new())
+) -> soac_lowering::Result<soac_lowering::LoweringResult<RecordingPassTracker>> {
+    prepare_codegen_module_with_tracker(source, module_name_gen, RecordingPassTracker::new())
 }
 
-pub fn lower_python_to_blockpy_recorded_with_options(
+pub fn prepare_codegen_module_recorded_with_options(
     source: &str,
     module_name_gen: ModuleNameGen,
-    options: LoweringOptions,
-) -> Result<LoweringResult<RecordingPassTracker>> {
-    lower_python_to_blockpy_with_tracker_and_options(
+    options: CodegenPreparationOptions,
+) -> soac_lowering::Result<soac_lowering::LoweringResult<RecordingPassTracker>> {
+    prepare_codegen_module_with_tracker_and_options(
         source,
         module_name_gen,
         RecordingPassTracker::new(),
@@ -152,9 +161,9 @@ fn rewrite_module_with_tracker_with_options(
     source: &str,
     module_name_gen: ModuleNameGen,
     pass_tracker: &mut impl PassTracker,
-    options: LoweringOptions,
+    options: CodegenPreparationOptions,
     env_config: &SoacEnvConfig,
-) -> Result<BlockPyModule<CodegenModuleShape>> {
+) -> soac_lowering::Result<BlockPyModule<CodegenModuleShape>> {
     let pre_optimization =
         rewrite_pre_optimization_module_with_cache(source, module_name_gen, pass_tracker, options)?;
     finish_codegen_module_with_tracker(pre_optimization, pass_tracker, env_config)
@@ -164,8 +173,8 @@ fn rewrite_pre_optimization_module_with_cache(
     source: &str,
     module_name_gen: ModuleNameGen,
     pass_tracker: &mut impl PassTracker,
-    options: LoweringOptions,
-) -> Result<PreOptimizationModule> {
+    options: CodegenPreparationOptions,
+) -> soac_lowering::Result<PreOptimizationModule> {
     if let Some(cache_path) = &options.pre_optimization_cache_path {
         let cache_exists =
             pass_tracker.record_timing("bb_codegen_cache_lookup", || cache_path.is_file());
@@ -239,7 +248,7 @@ fn rewrite_pre_optimization_module_with_cache(
             source,
             module_name_gen,
             pass_tracker,
-            options.lowering_options(),
+            options.lowering.clone(),
         )?;
         Ok(PreOptimizationModule {
             module,
@@ -251,7 +260,7 @@ fn rewrite_pre_optimization_module_with_cache(
             source,
             module_name_gen,
             pass_tracker,
-            options.lowering_options(),
+            options.lowering.clone(),
         )?;
         Ok(PreOptimizationModule {
             module,
@@ -295,7 +304,7 @@ fn finish_codegen_module_with_tracker(
     pre_optimization: PreOptimizationModule,
     pass_tracker: &mut impl PassTracker,
     env_config: &SoacEnvConfig,
-) -> Result<BlockPyModule<CodegenModuleShape>> {
+) -> soac_lowering::Result<BlockPyModule<CodegenModuleShape>> {
     let PreOptimizationModule {
         module: bb_codegen,
         cache_path_for_store,
@@ -476,14 +485,11 @@ mod tests {
         store_codegen_module_cache(cache_path.as_path(), &stale_metadata, &stale_module)
             .expect("stale cache should be writable");
 
-        if let Err(err) = lower_python_to_blockpy_recorded_with_options(
+        if let Err(err) = prepare_codegen_module_recorded_with_options(
             source,
             ModuleNameGen::new(2),
-            LoweringOptions {
-                runtime_names_as_globals: false,
-                pre_optimization_cache_path: Some(cache_path.clone()),
-                pre_optimization_cache_metadata: Some(expected_metadata.clone()),
-            },
+            CodegenPreparationOptions::default()
+                .with_pre_optimization_cache(cache_path.clone(), expected_metadata.clone()),
         ) {
             panic!(
                 "stale cache metadata should be treated as a miss, not as a lowering error: {err}"
@@ -498,7 +504,7 @@ mod tests {
     #[test]
     fn pre_optimization_lowering_does_not_compute_or_store_prepared_codegen_facts() {
         let source = "def callee(x):\n    return x\n\ndef caller(x):\n    return callee(x)\n";
-        let lowered = lower_python_to_blockpy_recorded(source, ModuleNameGen::new(0))
+        let lowered = prepare_codegen_module_recorded(source, ModuleNameGen::new(0))
             .expect("transform should succeed");
         let pass_names = lowered.pass_tracker.pass_names().collect::<Vec<_>>();
         let timing_names = lowered
@@ -545,7 +551,7 @@ mod tests {
         let source = "def f(x):\n    if x:\n        return 1\n    return 0\n";
         for mode in [SpecializationMode::Profile, SpecializationMode::Verify] {
             let config = SoacEnvConfig::default().with_specialization_mode(Some(mode));
-            let lowered = lower_python_to_blockpy_for_testing_with_config(source, &config)
+            let lowered = prepare_codegen_module_for_testing_with_config(source, &config)
                 .expect("transform should succeed")
                 .codegen_module;
             assert!(
@@ -566,7 +572,7 @@ mod tests {
             );
 
             let config = config.with_profiled_cold_blocks_enabled(true);
-            let lowered = lower_python_to_blockpy_for_testing_with_config(source, &config)
+            let lowered = prepare_codegen_module_for_testing_with_config(source, &config)
                 .expect("transform should succeed")
                 .codegen_module;
 
@@ -620,7 +626,7 @@ mod tests {
             let config =
                 SoacEnvConfig::default().with_specialization_mode(Some(SpecializationMode::Verify));
             assert!(passes::refcount_counter_instrumentation_enabled(&config));
-            let lowered = lower_python_to_blockpy_for_testing_with_config(source, &config)
+            let lowered = prepare_codegen_module_for_testing_with_config(source, &config)
                 .expect("transform should succeed")
                 .codegen_module;
             let refcount_counters = lowered
@@ -652,7 +658,7 @@ mod tests {
         for mode in [SpecializationMode::Profile, SpecializationMode::Apply] {
             let config = SoacEnvConfig::default().with_specialization_mode(Some(mode));
             assert!(!passes::refcount_counter_instrumentation_enabled(&config));
-            let lowered = lower_python_to_blockpy_for_testing_with_config(source, &config)
+            let lowered = prepare_codegen_module_for_testing_with_config(source, &config)
                 .expect("transform should succeed")
                 .codegen_module;
             assert!(
@@ -679,7 +685,7 @@ mod tests {
                 true,
             );
         let source = "VALUE = 7\n\ndef read(x):\n    return x + VALUE\n";
-        let lowered = lower_python_to_blockpy_for_testing_with_config(source, &config)
+        let lowered = prepare_codegen_module_for_testing_with_config(source, &config)
             .expect("transform should succeed")
             .codegen_module;
 
@@ -697,7 +703,7 @@ mod tests {
     #[test]
     fn cached_runtime_finish_defines_deopt_entry_counters_on_final_module() {
         let source = "VALUE = 7\n\ndef read(x):\n    return x + VALUE\n";
-        let module = lower_python_to_blockpy_for_testing(source)
+        let module = soac_lowering::lower_python_to_blockpy_for_testing(source)
             .expect("transform should succeed")
             .codegen_module;
         let config = SoacEnvConfig::default()

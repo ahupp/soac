@@ -9,7 +9,7 @@ use soac_core::block_py::{
 use soac_driver::codegen_cache::{
     CachedCodegenModuleMetadata, PythonModuleCacheSource, hash_module_source,
 };
-use soac_driver::{LoweringOptions, lower_python_to_blockpy_recorded_with_options};
+use soac_driver::{CodegenPreparationOptions, prepare_codegen_module_recorded_with_options};
 use soac_jit::module_type::{ModuleInfo, SoacExtModule};
 use soac_lowering::passes::CodegenModuleShape;
 use std::cell::Cell;
@@ -480,18 +480,20 @@ fn create_module(py: Python<'_>, path: &str, spec: Py<PyAny>) -> PyResult<Py<PyA
         source_hash,
         runtime_names_as_globals,
     )?;
-    let lowering_options = LoweringOptions {
-        runtime_names_as_globals,
+    let preparation_options = CodegenPreparationOptions {
+        lowering: soac_lowering::LoweringOptions {
+            runtime_names_as_globals,
+        },
         pre_optimization_cache_path: pre_optimization_cache
             .as_ref()
             .map(|(path, _metadata)| path.clone()),
         pre_optimization_cache_metadata: pre_optimization_cache.map(|(_path, metadata)| metadata),
     };
     let output = time_phase(&mut create_timings, "lower_blockpy", || {
-        lower_python_to_blockpy_recorded_with_options(
+        prepare_codegen_module_recorded_with_options(
             &source,
             session.module_name_gen(),
-            lowering_options,
+            preparation_options,
         )
         .map_err(lowering_error_to_pyerr)
     })?;
