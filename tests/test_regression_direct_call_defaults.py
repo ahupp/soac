@@ -73,7 +73,6 @@ def run():
         {
             "SOAC_MODULE_ENABLED": f"path:{tmp_path}",
             "SOAC_WORK_DIR": str(work_dir),
-            "SOAC_OPT_PLAN_MODE": "legacy",
         }
     )
 

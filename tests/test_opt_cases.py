@@ -14,7 +14,7 @@ import pytest
 from tests._integration import decide_optimizations_for_work_dir
 
 OPT_TESTS_DIR = Path(__file__).resolve().parent / "opt_tests"
-PLAN_MODE_RE = re.compile(r"^# soac: opt-plan-mode=(legacy|v3)\s*$", re.MULTILINE)
+PLAN_MODE_RE = re.compile(r"^# soac: opt-plan-mode=(v3)\s*$", re.MULTILINE)
 VERIFY_DELIMITER = "# soac: verify"
 COUNTER_DELIMITER = "# soac: verify-counters"
 
@@ -53,7 +53,7 @@ def _split_opt_case(case_path: Path) -> tuple[str, str, list[dict[str, Any]]]:
     plan_mode_matches = PLAN_MODE_RE.findall(raw_source)
     if len(plan_mode_matches) > 1:
         raise ValueError(f"{case_path} declares multiple opt-test plan modes")
-    plan_mode = plan_mode_matches[0] if plan_mode_matches else "legacy"
+    plan_mode = plan_mode_matches[0] if plan_mode_matches else "v3"
     module_source = raw_source.rstrip() + "\n\n" + raw_verify.lstrip()
     return module_source.rstrip() + "\n", plan_mode, expectations
 
@@ -64,7 +64,6 @@ def _soac_subprocess_env(
     env = dict(os.environ)
     env["SOAC_MODULE_ENABLED"] = f"path:{module_root}"
     env["SOAC_WORK_DIR"] = str(work_dir)
-    env["SOAC_OPT_PLAN_MODE"] = plan_mode
     env.pop("SOAC_LOG", None)
     env.pop("SOAC_COMPILE_MODE", None)
     return env

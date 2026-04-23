@@ -3,9 +3,8 @@ use soac_core::block_py::{BlockPyModule, ModuleNameGen, RuntimeFunctionId};
 use soac_core::profile::{CounterDumpFile, CounterDumpRecordView, CounterDumpRowView};
 use soac_driver::codegen_cache::{
     CachedCodegenModuleMetadata, PythonModuleCacheSource, codegen_module_cache_path,
-    hash_module_source, load_codegen_module_cache, module_optimization_plan_path,
-    module_optimization_plan_v3_path, remap_cached_codegen_module_function_ids,
-    validate_codegen_module_cache_metadata,
+    hash_module_source, load_codegen_module_cache, module_optimization_plan_v3_path,
+    remap_cached_codegen_module_function_ids, validate_codegen_module_cache_metadata,
 };
 use soac_jit::{
     PrecompileModuleIndex, PrecompileModuleIndexEntry, PrecompileOptimizationPlanInput,
@@ -154,12 +153,6 @@ fn run_with_args(args: impl IntoIterator<Item = OsString>) -> Result<(), String>
     for loaded in loaded_modules {
         let module_ref = loaded.module_ref;
         let metadata = loaded.metadata;
-        let optimization_plan_path = module_optimization_plan_path(
-            module_cache_dir.as_path(),
-            metadata.source,
-            module_ref.module_name.as_str(),
-        )
-        .map_err(|err| err.to_string())?;
         let optimization_plan_v3_path = module_optimization_plan_v3_path(
             module_cache_dir.as_path(),
             metadata.source,
@@ -167,9 +160,7 @@ fn run_with_args(args: impl IntoIterator<Item = OsString>) -> Result<(), String>
         )
         .map_err(|err| err.to_string())?;
         let optimization_plan = PrecompileOptimizationPlanInput {
-            path: optimization_plan_path.as_path(),
             v3_path: Some(optimization_plan_v3_path.as_path()),
-            source: metadata.source,
             cache_identity: metadata.cache_identity.as_str(),
         };
 

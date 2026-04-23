@@ -15,9 +15,9 @@ The plan is written in two layers:
 
 Updated direction:
 
-- Optimizer v3 must not consume the legacy optimization plan as input. The
-  legacy plan can remain as a transition fallback, but it should not shape v3
-  evidence, alternatives, or codegen artifacts.
+- Optimizer v3 must not consume the legacy optimization plan as input. Legacy
+  `mod.opt` is no longer a runtime fallback or a planner output for the normal
+  optimization pipeline.
 - The intended v3 pipeline is:
 
   ```text
@@ -107,10 +107,9 @@ Implemented:
   with `--details` showing region inputs, plan nodes, exits, mechanical
   emission steps, scalar threads, direct-call and method-call decisions, and
   indexed-field decisions.
-- JIT `verify`/`apply` loading prefers `mod.optv3`, validates module identity,
-  splits module-level artifacts into per-function mechanical artifacts, and only
-  falls back to legacy `mod.opt` when no v3 artifact is present.
-- Offline precompile also prefers `mod.optv3` artifacts when available.
+- JIT `verify`/`apply` loading requires `mod.optv3`, validates module identity,
+  and splits module-level artifacts into per-function mechanical artifacts.
+- Offline precompile consumes `mod.optv3` artifacts from the module cache.
 - `FunctionSpecializationInputs`: carries validated exact-int branch v3
   artifacts into the JIT build path, where codegen validates that the artifact
   function identity matches the function being compiled. Same-module profiled
@@ -118,13 +117,12 @@ Implemented:
   mechanical `mod.optv3` emission as v3-owned codegen inputs; the JIT consumes
   the emitted call plan through mechanical typed-call lowering and uses its
   targets only for direct-call function predeclaration, module-plan direct-call
-  rewrites, precompile target lookup, and process-JIT batch scheduling, not as
-  legacy profile evidence. When a call source has an emitted v3 direct,
-  constructor, or method call node, JIT preparation also filters that source
-  out of the legacy call-target map before typed-call annotation and
-  runtime-protocol collection, so overlapping legacy evidence cannot reselect
-  a different call shape. Direct-call emission rejects a selected source that
-  is absent from the lowered typed function.
+  rewrites, precompile target lookup, and process-JIT batch scheduling. When a
+  call source has an emitted v3 direct, constructor, or method call node, that
+  source is v3-owned; guardless or early-consumed sources remain generic
+  fallbacks instead of being replanned from another evidence path. Direct-call
+  emission rejects a selected source that is absent from the lowered typed
+  function.
   Method-call decisions are also derived from mechanical `mod.optv3` emission
   as v3-owned codegen inputs. They carry owner type, method name, receiver
   type-version guard kind, original-call fallback kind, and an argument plan
@@ -169,8 +167,7 @@ Partially migrated families are also intentionally visible:
   receiver method, and class-constructor targets.
   Cross-module targets are represented through serialized module identities and
   resolved from the loaded module set. Module-level ordinary direct-call CFG
-  rewrites are now fed only by v3 emitted inline direct-call plans, not by
-  legacy call-target specialization evidence. Module-level no-argument method
+  rewrites are now fed only by v3 emitted inline direct-call plans. Module-level no-argument method
   and runtime-iter rewrites are likewise fed only by v3 inline method or
   constructor plans. Constructor-call plans own the selected
   `__init__` target, owner type, type-version guard kind, original-call
@@ -181,9 +178,8 @@ Partially migrated families are also intentionally visible:
   happens while preparing `FunctionSpecializationInputs`, not during typed-call
   lowering. Prepared guards must also prove that their exact owner-type and
   owner-attribute callable relocations can be registered and predeclared before
-  worker codegen. `FunctionSpecializationInputs` also filters legacy call-target
-  evidence at raw v3 emitted call-source keys, so a guardless or early-consumed
-  v3-owned source remains a local fallback, not a legacy call-target replan.
+  worker codegen. A guardless or early-consumed v3-owned source remains a local
+  fallback, not a separate call-target replan.
   Receiver-method store sites whose v3 body choice
   is `DirectCall` can now expand before typed lowering into an explicit
   receiver guard, direct-method hot arm, and generic method fallback while
@@ -193,8 +189,8 @@ Partially migrated families are also intentionally visible:
   generic constructor fallback before typed lowering.
 - indexed fields are represented as v3 plan selections plus mechanical
   indexed-field emissions. `soac_jit` now keeps the emitted access kind and
-  attribute name separate from legacy per-instruction field evidence and
-  validates that they match the lowered `GetAttr`/`SetAttr` site while loading
+  attribute name separate and validates that they match the lowered
+  `GetAttr`/`SetAttr` site while loading
   v3 artifacts, before constructing typed/codegen inputs. By-attribute layout
   availability is still shared with the existing constructor initializer fast
   path, but selected v3 indexed-field inputs must now resolve to usable
@@ -205,8 +201,8 @@ Partially migrated families are also intentionally visible:
   indexed-global emissions with explicit module-dict guard and original global
   fallback effects. The JIT validates emitted global name/access/index against
   lowered `NameLocation::Global(slot)` and consumes the v3 entry as the
-  indexed global load/store input. Legacy indexed-global profile maps remain
-  serialized evidence for planning, but are no longer consumed by JIT lowering.
+  indexed global load/store input. Raw indexed-global profile maps remain
+  serialized evidence for planning, but are no longer consumed directly by JIT lowering.
   The final helper-call builder remains in the existing global load/store
   emitters as a mechanical lowering helper for the validated v3 global node.
 - exact-list getitem/setitem are represented as v3 plan selections plus
@@ -214,8 +210,8 @@ Partially migrated families are also intentionally visible:
   in-bounds guard and original item-access fallback effects. The JIT validates
   emitted access kind against lowered `GetItem`/`SetItem` sites and consumes the
   v3 entry directly as the item-specialization input, without translating it
-  through legacy hot-shape maps. Legacy item hot-shape maps remain serialized
-  profiling evidence for planning, but are no longer consumed by JIT lowering.
+  through hot-shape maps. Raw item hot-shape maps remain serialized profiling
+  evidence for planning, but are no longer consumed directly by JIT lowering.
   The final inline list load/store builder remains in the operation-specialization
   module as a mechanical lowering helper for the validated v3 item node.
 
@@ -235,8 +231,8 @@ semantic plan targets.
 Current integration target:
 
 - Expand v3 coverage while keeping `mod.optv3` as the source of truth for v3.
-- Stop generating or consuming legacy `mod.opt` once v3 covers the required
-  optimization families.
+- Continue deleting legacy optimization-plan code now that runtime consumption
+  and normal offline generation are v3-only.
 
 Scalar-thread generalization notes:
 
@@ -718,8 +714,8 @@ the branch exit demands `I32Bool01`. If a later Python-observable boundary needs
 
 7. Integrate profile evidence.
    - First consume raw per-site evidence directly from profile counters.
-   - Do not route v3 evidence through legacy `OptimizationDecision` or
-     `OptimizationPlan`.
+   - Consume raw profile evidence directly; the legacy `mod.opt` plan model has
+     been deleted.
    - Then add correlated region evidence where local evidence cannot choose a
      sequence reliably.
    - Feed verify/apply hit, fallback, and deopt counts back into diagnostics.
@@ -1019,8 +1015,9 @@ should absorb them rather than restart.
   tests demand `I32Bool01`; returns demand owned `PyObject`.
 - Existing `SoacValue` and integer facts are close to the desired codegen value
   representation. The v3 plan should decide when those values appear.
-- Existing `OptimizationPlan` is a per-instruction precursor. V3 should extend
-  the idea from instruction replacement to region plans with explicit nodes.
+- The old legacy optimization plan was a per-instruction precursor. V3 extends
+  that idea from instruction replacement to region plans with explicit nodes,
+  and the precursor model has now been removed from production code.
 - Existing exact-int operator specialization is the first migration target
   because it already contains the core decision that v3 wants to move out of
   codegen.

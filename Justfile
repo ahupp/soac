@@ -1126,14 +1126,6 @@ _decide-optimizations-for-counters-dir counters_dir:
   #!/usr/bin/env bash
   set -euo pipefail
   cd "$REPO_ROOT"
-  OPTIMIZATION_PLAN_MODE="${SOAC_DECIDE_OPT_MODE:-v3}"
-  case "$OPTIMIZATION_PLAN_MODE" in
-    legacy|v3) ;;
-    *)
-      echo "SOAC_DECIDE_OPT_MODE must be legacy or v3, got: $OPTIMIZATION_PLAN_MODE" >&2
-      exit 2
-      ;;
-  esac
   COUNTERS_DIR="{{counters_dir}}"
   if [[ "$COUNTERS_DIR" != /* ]]; then
     COUNTERS_DIR="$REPO_ROOT/$COUNTERS_DIR"
@@ -1144,18 +1136,14 @@ _decide-optimizations-for-counters-dir counters_dir:
   fi
   MODULE_CACHE_DIR="$COUNTERS_DIR/modules"
   echo "decide optimization plans"
-  echo "optimization plan mode: $OPTIMIZATION_PLAN_MODE"
+  echo "optimization plan mode: v3"
   echo "counters: $COUNTERS_DIR/profile.bin"
   echo "module cache dir: $MODULE_CACHE_DIR"
   if [[ -d "$MODULE_CACHE_DIR" ]]; then
-    if [[ "$OPTIMIZATION_PLAN_MODE" == "v3" ]]; then
-      find "$MODULE_CACHE_DIR" -name mod.opt -delete
-    else
-      find "$MODULE_CACHE_DIR" -name mod.optv3 -delete
-    fi
+    find "$MODULE_CACHE_DIR" -name mod.opt -delete
   fi
   cargo run --release -p soac_opt --bin decide_optimizations -- \
-    --mode "$OPTIMIZATION_PLAN_MODE" \
+    --mode v3 \
     --counters "$COUNTERS_DIR/profile.bin" \
     --out "$MODULE_CACHE_DIR"
 
@@ -1166,7 +1154,6 @@ benchmark-verify loops="100000" counters_dir="": (update-venv-offline) (build-ex
   WARMUP_LOOPS="${WARMUP_LOOPS:-1000}"
   BENCHMARK_CPU="${BENCHMARK_CPU:-}"
   BENCHMARK_CONSTANT_CLOCKS="${BENCHMARK_CONSTANT_CLOCKS:-0}"
-  RUNTIME_OPT_PLAN_MODE="${SOAC_OPT_PLAN_MODE:-v3}"
   COUNTERS_DIR="{{counters_dir}}"
   if [[ -z "$COUNTERS_DIR" ]]; then
     COUNTERS_DIR="$LAST_BENCHMARK_COUNTERS_DIR"
@@ -1184,14 +1171,13 @@ benchmark-verify loops="100000" counters_dir="": (update-venv-offline) (build-ex
   echo "loops: {{loops}}"
   echo "counters dir: $COUNTERS_DIR"
   echo "module cache dir: $COUNTERS_DIR/modules"
-  echo "runtime optimization plan mode: $RUNTIME_OPT_PLAN_MODE"
+  echo "runtime optimization plan mode: v3"
   LOOPS="{{loops}}" \
   WARMUP_LOOPS="${WARMUP_LOOPS}" \
   BENCHMARK_CPU="${BENCHMARK_CPU}" \
   BENCHMARK_CONSTANT_CLOCKS="${BENCHMARK_CONSTANT_CLOCKS}" \
   SOAC_WORK_DIR="$COUNTERS_DIR" \
   SOAC_OPT_MODE=verify \
-  SOAC_OPT_PLAN_MODE="$RUNTIME_OPT_PLAN_MODE" \
     "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, os.environ["BENCHMARK_SOURCE_DIR"]); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
   echo "verification counters: $COUNTERS_DIR/verify.bin"
   echo "SOAC events log: $COUNTERS_DIR/events.jsonl"
@@ -1242,7 +1228,6 @@ benchmark benchmark_loops="1000000" verify_loops="100000" results_root="work/ben
   RESULTS_ROOT="{{results_root}}"
   RESULT_MODE="{{result_mode}}"
   CRANELIFT_OPT_LEVEL="${SOAC_CRANELIFT_OPT_LEVEL:-speed}"
-  RUNTIME_OPT_PLAN_MODE="${SOAC_OPT_PLAN_MODE:-v3}"
   if [[ "$RESULTS_ROOT" != /* ]]; then
     RESULTS_ROOT="$REPO_ROOT/$RESULTS_ROOT"
   fi
@@ -1293,7 +1278,7 @@ benchmark benchmark_loops="1000000" verify_loops="100000" results_root="work/ben
     echo "benchmark cpu: $BENCHMARK_CPU"
     echo "benchmark constant clocks: $BENCHMARK_CONSTANT_CLOCKS"
     echo "cranelift opt level: $CRANELIFT_OPT_LEVEL"
-    echo "runtime optimization plan mode: $RUNTIME_OPT_PLAN_MODE"
+    echo "runtime optimization plan mode: v3"
     echo "module cache dir: $counters_dir/modules"
     echo "apply refcount modes: enabled, disabled diagnostic"
     echo
@@ -1320,7 +1305,6 @@ benchmark benchmark_loops="1000000" verify_loops="100000" results_root="work/ben
     SOAC_WORK_DIR="$counters_dir" \
     SOAC_CRANELIFT_OPT_LEVEL="$CRANELIFT_OPT_LEVEL" \
     SOAC_OPT_MODE=verify \
-    SOAC_OPT_PLAN_MODE="$RUNTIME_OPT_PLAN_MODE" \
       "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, os.environ["BENCHMARK_SOURCE_DIR"]); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
 
     site_count="$(just _call-target-specializations-from-dump "$counters_dir/profile.bin" | awk -F';' 'NF { print NF }')"
@@ -1338,7 +1322,6 @@ benchmark benchmark_loops="1000000" verify_loops="100000" results_root="work/ben
           SOAC_WORK_DIR="$counters_dir" \
           SOAC_CRANELIFT_OPT_LEVEL="$CRANELIFT_OPT_LEVEL" \
           SOAC_OPT_MODE=apply \
-          SOAC_OPT_PLAN_MODE="$RUNTIME_OPT_PLAN_MODE" \
           SOAC_JIT_EMIT_REFCOUNTS="$refcount_env" \
             "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, os.environ["BENCHMARK_SOURCE_DIR"]); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
         then
@@ -1405,7 +1388,6 @@ precompile-shared-library counters="" out="work/logs/libsoac_precompiled.so" obj
   fi
 
   SOAC_WORK_DIR="$COUNTERS_DIR" \
-  SOAC_OPT_PLAN_MODE="${SOAC_OPT_PLAN_MODE:-v3}" \
     cargo run -p soac_inspector --bin precompile_blockpy -- "${args[@]}"
 
 [private]

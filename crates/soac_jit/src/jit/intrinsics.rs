@@ -1579,12 +1579,7 @@ where
         .operator_specialized_fallback_counter_ids
         .get(&instr_id)
         .copied();
-    let hot_shapes = state
-        .ctx()
-        .operator_specializations
-        .get(&instr_id)
-        .cloned()
-        .unwrap_or_default();
+    let hot_shapes = Vec::new();
     let specialized_hit_counter_id = specialized_hit_counter_id;
     let specialized_fallback_counter_id = specialized_fallback_counter_id;
     if counter_id.is_none() && hot_shapes.is_empty() && !facts_prove_exact_int {
@@ -1761,12 +1756,7 @@ where
         .operator_specialized_fallback_counter_ids
         .get(&instr_id)
         .copied();
-    let hot_shapes = state
-        .ctx()
-        .operator_specializations
-        .get(&instr_id)
-        .cloned()
-        .unwrap_or_default();
+    let hot_shapes = Vec::new();
     if counter_id.is_none() && hot_shapes.is_empty() && !facts_prove_exact_int {
         return None;
     }
@@ -1863,12 +1853,7 @@ where
         .operator_specialized_fallback_counter_ids
         .get(&instr_id)
         .copied();
-    let hot_shapes = state
-        .ctx()
-        .operator_specializations
-        .get(&instr_id)
-        .cloned()
-        .unwrap_or_default();
+    let hot_shapes = Vec::new();
     let specialized_hit_counter_id = specialized_hit_counter_id;
     let specialized_fallback_counter_id = specialized_fallback_counter_id;
     if counter_id.is_none() && hot_shapes.is_empty() && !facts_prove_exact_int {

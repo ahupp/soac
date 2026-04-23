@@ -2,7 +2,6 @@ use anyhow::{Result, anyhow, bail};
 use soac_opt::pipeline_v3::generate_optimization_plans_v3_for_cached_modules;
 use soac_opt::plan::{
     CachedModuleOptimizationInput, ProfileEvidenceStore, cached_module_paths_under_root,
-    generate_optimization_plans_for_cached_modules,
 };
 use std::collections::BTreeMap;
 use std::env;
@@ -15,14 +14,6 @@ struct Args {
     modules: Vec<PathBuf>,
     module_root: Option<PathBuf>,
     out: Option<PathBuf>,
-    mode: OptimizationMode,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum OptimizationMode {
-    #[default]
-    Legacy,
-    V3,
 }
 
 fn main() {
@@ -50,18 +41,11 @@ fn run_with_args(args: impl IntoIterator<Item = OsString>) -> Result<()> {
     let evidence_store = ProfileEvidenceStore::from_counter_dump(counters_path)?;
     let module_inputs = module_inputs_for_args(&args, out_root)?;
 
-    let summary = match args.mode {
-        OptimizationMode::Legacy => generate_optimization_plans_for_cached_modules(
-            &evidence_store,
-            module_inputs,
-            out_root,
-        )?,
-        OptimizationMode::V3 => generate_optimization_plans_v3_for_cached_modules(
-            &evidence_store,
-            module_inputs,
-            out_root,
-        )?,
-    };
+    let summary = generate_optimization_plans_v3_for_cached_modules(
+        &evidence_store,
+        module_inputs,
+        out_root,
+    )?;
     for report in &summary.reports {
         println!(
             "wrote {} for module={} source_hash=0x{:016x} ({} functions)",
@@ -122,7 +106,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Args> {
             "--counters" => parsed.counters = Some(next_path(&mut args, flag)?),
             "--module" => parsed.modules.push(next_path(&mut args, flag)?),
             "--module-root" => parsed.module_root = Some(next_path(&mut args, flag)?),
-            "--mode" => parsed.mode = next_mode(&mut args, flag)?,
+            "--mode" => parse_mode(&mut args, flag)?,
             "--out" => parsed.out = Some(next_path(&mut args, flag)?),
             "--help" | "-h" => {
                 print_usage();
@@ -140,7 +124,7 @@ fn next_path(args: &mut impl Iterator<Item = OsString>, flag: &str) -> Result<Pa
         .ok_or_else(|| anyhow!("{flag} requires a value"))
 }
 
-fn next_mode(args: &mut impl Iterator<Item = OsString>, flag: &str) -> Result<OptimizationMode> {
+fn parse_mode(args: &mut impl Iterator<Item = OsString>, flag: &str) -> Result<()> {
     let mode = args
         .next()
         .ok_or_else(|| anyhow!("{flag} requires a value"))?;
@@ -148,15 +132,14 @@ fn next_mode(args: &mut impl Iterator<Item = OsString>, flag: &str) -> Result<Op
         .to_str()
         .ok_or_else(|| anyhow!("non-UTF-8 {flag} value is unsupported: {mode:?}"))?;
     match mode {
-        "legacy" => Ok(OptimizationMode::Legacy),
-        "v3" => Ok(OptimizationMode::V3),
-        _ => bail!("{flag} must be 'legacy' or 'v3', got {mode:?}"),
+        "v3" => Ok(()),
+        _ => bail!("{flag} only accepts 'v3', got {mode:?}"),
     }
 }
 
 fn print_usage() {
     println!(
-        "usage: decide_optimizations --counters <profile.bin> [--mode legacy|v3] [--module <mod.blockpy> ...] [--module-root <root-dir>] --out <root-dir>\n\nBy default, scans <root-dir> for cached mod.blockpy files and writes sibling mod.opt files. Use --mode v3 to write sibling mod.optv3 files from raw profile evidence and cached unoptimized BlockPy modules. Use --module-root to scan a different input root, or --module for narrow debugging."
+        "usage: decide_optimizations --counters <profile.bin> [--mode v3] [--module <mod.blockpy> ...] [--module-root <root-dir>] --out <root-dir>\n\nScans cached mod.blockpy files and writes sibling mod.optv3 files from raw profile evidence and cached unoptimized BlockPy modules. Use --module-root to scan a different input root, or --module for narrow debugging."
     );
 }
 
@@ -173,19 +156,18 @@ mod test {
     };
     use soac_driver::codegen_cache::{
         CachedCodegenModuleMetadata, PythonModuleCacheSource, codegen_module_cache_path,
-        hash_module_source, module_optimization_plan_path, module_optimization_plan_v3_path,
+        hash_module_source, module_optimization_plan_v3_path,
     };
     use soac_driver::{LoweringOptions, lower_python_to_blockpy_recorded_with_options};
     use soac_lowering::passes::{CodegenModuleShape, InstrCodegen};
     use soac_opt::artifacts_v3::load_optimization_artifacts_v3;
-    use soac_opt::plan::{OptimizationPlan, PlannedAction, PlannedReplacement};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     const TEST_BUILD_IDENTITY: &str = "test-build-identity";
 
     #[test]
-    fn emits_mod_opt_under_requested_root() {
+    fn emits_mod_optv3_under_requested_root() {
         let root = unique_temp_dir();
         let module_name = "pkg.mod";
         let source = "def f(obj):\n    return obj.x\n";
@@ -248,63 +230,38 @@ mod test {
         ])
         .unwrap();
 
-        let output_path = module_optimization_plan_path(
+        let output_path = module_optimization_plan_v3_path(
             out_root.as_path(),
             PythonModuleCacheSource::Project,
             module_name,
         )
         .unwrap();
-        let bytes = fs::read(output_path.as_path()).unwrap();
-        let plan =
-            rkyv::from_bytes::<OptimizationPlan, rkyv::rancor::Error>(bytes.as_slice()).unwrap();
-        assert_eq!(plan.module_name, module_name);
-        assert_eq!(plan.source_hash, source_hash);
+        let artifacts = load_optimization_artifacts_v3(output_path.as_path()).unwrap();
+        let plan = &artifacts.plan;
+        assert_eq!(plan.module.module_name, module_name);
+        assert_eq!(plan.module.source_hash, source_hash);
         assert_eq!(plan.identity_tables.modules[0].module_name, module_name);
         assert_eq!(plan.identity_tables.modules[0].source_hash, source_hash);
-        assert_eq!(plan.functions.len(), 1);
-        assert_eq!(
-            plan.functions[0].local_function_id(),
-            function_id.local_function_id()
-        );
-        assert_eq!(plan.functions[0].decisions.len(), 3);
-        assert!(matches!(
-            plan.functions[0].decisions[0].replacement,
-            PlannedReplacement::Guarded { .. }
-        ));
+        let function_plan = plan
+            .functions
+            .iter()
+            .find(|function_plan| {
+                function_plan.function.function.local_function_id()
+                    == function_id.local_function_id()
+            })
+            .expect("expected a v3 plan for f");
         assert!(
-            plan.functions[0].decisions.iter().any(|decision| {
-                let PlannedReplacement::Guarded { alternatives, .. } = &decision.replacement else {
-                    return false;
-                };
-                alternatives.iter().any(|alternative| {
-                    let PlannedAction::DirectCall { ref target } = alternative.action else {
-                        return false;
-                    };
-                    let target = plan
-                        .persistent_function_id(target.function)
-                        .expect("direct-call target should resolve through plan identity table");
-                    target.module.module_name == "pkg.callee"
-                        && target.module.source_hash == 0x5678
-                        && target.local.as_u32() == 2
-                })
+            plan.identity_tables.modules.iter().any(|module| {
+                module.module_name == "pkg.callee" && module.source_hash == 0x5678
             }),
             "expected a cross-module direct-call decision"
         );
         assert!(
-            plan.functions[0].decisions.iter().any(|decision| {
-                let PlannedReplacement::Guarded { alternatives, .. } = &decision.replacement else {
-                    return false;
-                };
-                alternatives.iter().any(|alternative| {
-                    matches!(
-                        alternative.action,
-                        PlannedAction::IndexedField { ref specialization }
-                            if specialization.attr_name == "x"
-                                && specialization.expected_index == 2
-                                && specialization.owner_type.module_name == "pkg.types"
-                                && specialization.owner_type.qualname == "Point"
-                    )
-                })
+            function_plan.indexed_fields.iter().any(|indexed_field| {
+                indexed_field.attr_name == "x"
+                    && indexed_field.expected_index == 2
+                    && indexed_field.owner_type.module_name == "pkg.types"
+                    && indexed_field.owner_type.qualname == "Point"
             }),
             "expected a per-instruction indexed-field decision"
         );
@@ -363,7 +320,7 @@ mod test {
         .unwrap();
 
         for module_name in ["pkg.first", "pkg.second"] {
-            let output_path = module_optimization_plan_path(
+            let output_path = module_optimization_plan_v3_path(
                 out_root.as_path(),
                 PythonModuleCacheSource::Project,
                 module_name,
@@ -375,7 +332,7 @@ mod test {
                 output_path.display()
             );
         }
-        let unused_path = module_optimization_plan_path(
+        let unused_path = module_optimization_plan_v3_path(
             out_root.as_path(),
             PythonModuleCacheSource::Project,
             "pkg.unused",
@@ -445,17 +402,6 @@ mod test {
                     == module.function_id.local_function_id()
             }),
             "v3 plan should include the profiled function"
-        );
-
-        let legacy_path = module_optimization_plan_path(
-            out_root.as_path(),
-            PythonModuleCacheSource::Project,
-            module_name,
-        )
-        .unwrap();
-        assert!(
-            !legacy_path.exists(),
-            "v3 mode should not write the legacy optimization plan"
         );
         let _ = fs::remove_dir_all(root);
     }
@@ -613,7 +559,7 @@ mod test {
         ])
         .unwrap();
 
-        let output_path = module_optimization_plan_path(
+        let output_path = module_optimization_plan_v3_path(
             out_root.as_path(),
             PythonModuleCacheSource::Project,
             "pkg.scanned",

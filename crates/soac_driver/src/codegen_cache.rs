@@ -24,7 +24,6 @@ pub enum PythonModuleCacheSource {
 pub enum ModuleCacheArtifact {
     CodegenModule,
     Profile,
-    OptimizationPlan,
     OptimizationPlanV3,
 }
 
@@ -129,7 +128,6 @@ impl ModuleCacheArtifact {
         match self {
             Self::CodegenModule => "mod.blockpy",
             Self::Profile => "mod.profile",
-            Self::OptimizationPlan => "mod.opt",
             Self::OptimizationPlanV3 => "mod.optv3",
         }
     }
@@ -172,19 +170,6 @@ pub fn module_profile_path(
         source,
         module_name,
         ModuleCacheArtifact::Profile,
-    )
-}
-
-pub fn module_optimization_plan_path(
-    cache_root: impl AsRef<Path>,
-    source: PythonModuleCacheSource,
-    module_name: &str,
-) -> Result<PathBuf> {
-    module_cache_artifact_path(
-        cache_root,
-        source,
-        module_name,
-        ModuleCacheArtifact::OptimizationPlan,
     )
 }
 
@@ -527,10 +512,10 @@ mod test {
     use super::{
         CachedCodegenModuleMetadata, CachedPreparedCodegen, ModuleCacheArtifact,
         PythonModuleCacheSource, codegen_module_cache_key, codegen_module_cache_path,
-        load_codegen_module_cache, module_cache_artifact_path, module_optimization_plan_path,
-        module_optimization_plan_v3_path, module_profile_path,
-        remap_cached_codegen_module_function_ids, remap_codegen_module_function_ids,
-        store_codegen_module_cache, validate_codegen_module_cache_metadata,
+        load_codegen_module_cache, module_cache_artifact_path, module_optimization_plan_v3_path,
+        module_profile_path, remap_cached_codegen_module_function_ids,
+        remap_codegen_module_function_ids, store_codegen_module_cache,
+        validate_codegen_module_cache_metadata,
     };
     use soac_core::block_py::{
         BlockPyModule, ChildVisitable, HasSemanticInstrId, ModuleNameGen, RuntimeFunctionId, Visit,
@@ -684,11 +669,6 @@ def g(y):
             module_profile_path(&root, PythonModuleCacheSource::PythonStdlib, "typing")
                 .expect("stdlib profile path"),
             PathBuf::from("/cache/root/python-stdlib/typing/mod.profile")
-        );
-        assert_eq!(
-            module_optimization_plan_path(&root, PythonModuleCacheSource::PythonStdlib, "typing")
-                .expect("stdlib optimization path"),
-            PathBuf::from("/cache/root/python-stdlib/typing/mod.opt")
         );
         assert_eq!(
             module_optimization_plan_v3_path(

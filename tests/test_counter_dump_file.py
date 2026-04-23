@@ -29,7 +29,6 @@ def _read_jsonl(path):
 def _soac_subprocess_env(module_root, *, work_dir=None, extra_env=None):
     env = dict(os.environ)
     env["SOAC_MODULE_ENABLED"] = f"path:{module_root}"
-    env["SOAC_OPT_PLAN_MODE"] = "legacy"
     env.pop("SOAC_COMPILE_MODE", None)
     if work_dir is not None:
         env["SOAC_WORK_DIR"] = str(work_dir)
@@ -55,7 +54,7 @@ def _assert_subprocess_ok(result):
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def _decide_optimizations_for_env(work_dir, *, mode="legacy"):
+def _decide_optimizations_for_env(work_dir, *, mode="v3"):
     return decide_optimizations_for_work_dir(work_dir, mode=mode)
 
 
@@ -168,7 +167,6 @@ def run():
         "assert module.run() is True",
     )
     base_env = _soac_subprocess_env(tmp_path, work_dir=work_dir)
-    base_env.pop("SOAC_OPT_PLAN_MODE", None)
     profile_result = _run_soac_subprocess(
         script,
         env={**base_env, "SOAC_OPT_MODE": "profile"},
@@ -517,9 +515,7 @@ def run_case():
         "import getitem_specialization_case",
         "assert getitem_specialization_case.run_case() == 182",
     )
-    base_env = _soac_subprocess_env(
-        tmp_path, work_dir=work_dir, extra_env={"SOAC_OPT_PLAN_MODE": "v3"}
-    )
+    base_env = _soac_subprocess_env(tmp_path, work_dir=work_dir)
 
     profile_result = _run_soac_subprocess(
         script,
@@ -596,9 +592,7 @@ def run_case():
         "import setitem_specialization_case",
         "assert setitem_specialization_case.run_case() == 281",
     )
-    base_env = _soac_subprocess_env(
-        tmp_path, work_dir=work_dir, extra_env={"SOAC_OPT_PLAN_MODE": "v3"}
-    )
+    base_env = _soac_subprocess_env(tmp_path, work_dir=work_dir)
 
     profile_result = _run_soac_subprocess(
         script,

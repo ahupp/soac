@@ -10,7 +10,6 @@ use soac_core::profile::CounterDumpFile;
 use soac_lowering::{lower_python_to_blockpy_for_testing, ruff_ast_to_string};
 use soac_opt::artifacts_v3::load_optimization_artifacts_v3;
 use soac_opt::pipeline_v3::generate_optimization_plans_v3_for_counter_dump;
-use soac_opt::plan::generate_optimization_plans_for_counter_dump;
 use std::path::{Path, PathBuf};
 use tracing::trace;
 
@@ -173,7 +172,7 @@ fn inspect_optimization_artifacts_v3_json(path: &str) -> PyResult<String> {
     .map_err(|err| PyRuntimeError::new_err(format!("failed to encode v3 plan JSON: {err}")))
 }
 
-#[pyfunction(signature = (counters_path, module_root, out_root=None, mode="legacy"))]
+#[pyfunction(signature = (counters_path, module_root, out_root=None, mode="v3"))]
 fn decide_optimizations_for_counter_dump(
     counters_path: &str,
     module_root: &str,
@@ -186,11 +185,6 @@ fn decide_optimizations_for_counter_dump(
         .map(PathBuf::from)
         .unwrap_or_else(|| module_root.to_path_buf());
     let summary = match mode {
-        "legacy" => generate_optimization_plans_for_counter_dump(
-            counters_path,
-            module_root,
-            out_root.as_path(),
-        ),
         "v3" => generate_optimization_plans_v3_for_counter_dump(
             counters_path,
             module_root,
@@ -198,7 +192,7 @@ fn decide_optimizations_for_counter_dump(
         ),
         other => {
             return Err(PyRuntimeError::new_err(format!(
-                "optimization mode must be 'legacy' or 'v3', got {other:?}"
+                "optimization mode must be 'v3', got {other:?}"
             )));
         }
     };

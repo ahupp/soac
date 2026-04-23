@@ -156,7 +156,7 @@ pub fn indexed_field_layout_groups<'a>(
 
 pub fn prepare_indexed_field_accesses_for_codegen<T: PartialEq>(
     planned_by_instr: Option<&HashMap<InstrId, Vec<IndexedFieldAccessPlan>>>,
-    mut resolve: impl FnMut(&IndexedFieldRuntimeAccessRequest) -> Result<T, String>,
+    mut resolve: impl FnMut(&IndexedFieldRuntimeAccessRequest) -> Result<Option<T>, String>,
 ) -> Result<HashMap<InstrId, Vec<ResolvedIndexedFieldAccess<T>>>, String> {
     let Some(planned_by_instr) = planned_by_instr else {
         return Ok(HashMap::new());
@@ -171,12 +171,15 @@ pub fn prepare_indexed_field_accesses_for_codegen<T: PartialEq>(
                 continue;
             }
             seen_requests.push(request.clone());
-            let specialization = resolve(&request).map_err(|err| {
+            let Some(specialization) = resolve(&request).map_err(|err| {
                 format!(
                     "optimizer v3 indexed-field plan {:?} for {} attr {:?} could not bind a runtime field guard: {err}",
                     request.access, instr_id, request.attr_name
                 )
-            })?;
+            })?
+            else {
+                continue;
+            };
             let resolved = ResolvedIndexedFieldAccess {
                 access: request.access,
                 attr_name: request.attr_name,
@@ -372,7 +375,7 @@ mod tests {
                 request.attr_name.clone(),
                 request.expected_index,
             ));
-            Ok(request.expected_index)
+            Ok(Some(request.expected_index))
         })
         .expect("indexed-field requests should prepare");
 

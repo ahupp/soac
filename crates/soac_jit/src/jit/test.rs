@@ -26,24 +26,23 @@ mod tests {
     use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyModule, PyModuleMethods, PyTuple};
     use pyo3::{Bound, Py, PyAny, PyErr, PyResult, Python, ffi};
     use ruff_python_ast as ast;
-    use soac_config::OptimizationPlanMode;
     use soac_core::profile::{
         CounterDumpRecord, CounterDumpRow, CounterDumpTypeKey, CounterDumpTypeKeyLayout,
         CounterDumpTypeTableEntry, write_counter_dump_records,
     };
     use soac_driver::codegen_cache::{
-        PythonModuleCacheSource, module_optimization_plan_path, module_optimization_plan_v3_path,
+        CachedCodegenModuleMetadata, PythonModuleCacheSource, module_optimization_plan_v3_path,
+        pre_optimization_module_cache_identity,
     };
     use soac_lowering::passes::{TypedInstrExtra, TypedPlannedResult as PlannedResult};
     use soac_opt::alternatives_v3::AlternativeCatalog;
     use soac_opt::artifacts_v3::{ExactIntBranchV3Artifacts, write_optimization_artifacts_v3};
     use soac_opt::emit_v3::{MechanicalIndexedFieldGuard, MechanicalModuleEmission};
-    use soac_opt::pipeline_v3::plan_and_emit_function_exact_int_branches_v3_with_module_constants;
-    use soac_opt::plan::{
-        FunctionOptimizationPlan, FunctionProfileEvidence, OptimizationDecision, OptimizationPlan,
-        PlannedAction, PlannedAlternative, PlannedFallback, PlannedFunctionTarget, PlannedGuard,
-        PlannedIndexedFieldSpecialization, PlannedReplacement, PlannedTypeKey, ShapeFamily,
+    use soac_opt::pipeline_v3::{
+        plan_and_emit_function_exact_int_branches_v3_with_module_constants,
+        plan_and_emit_module_v3_from_raw_evidence,
     };
+    use soac_opt::plan::{FunctionProfileEvidence, ProfileEvidenceStore};
     use soac_opt::plan_v3::{
         CallBodyKind, CallBodyPlan, ConstructorCallFallbackKind, ConstructorCallFallbackPlan,
         ConstructorCallGuardKind, ConstructorCallGuardPlan, ConstructorCallOwnerType,
@@ -101,10 +100,6 @@ mod tests {
 
     fn test_v3_inline_call_body() -> CallBodyPlan {
         test_v3_call_body(CallBodyKind::Inline)
-    }
-
-    fn test_v3_direct_call_body() -> CallBodyPlan {
-        test_v3_call_body(CallBodyKind::DirectCall)
     }
 
     unsafe fn test_dp_jit_deopt_resume(
@@ -810,7 +805,6 @@ def add(a, b):
         .expect("lowering precompile smoke source should succeed")
         .codegen_module;
 
-        let _plan_mode = set_legacy_optimization_plan_mode();
         let object = precompile_codegen_module_to_object_bytes(
             "precompile_smoke",
             0x1234,
@@ -887,7 +881,6 @@ def get_value():
             module_constant_symbol_prefix_for_module_identity(module_name, source_hash);
         let constant_symbol = module_constant_object_symbol(symbol_prefix.as_str(), constant_id);
 
-        let _plan_mode = set_legacy_optimization_plan_mode();
         let object = precompile_codegen_module_to_object_bytes(
             module_name,
             source_hash,
@@ -935,7 +928,6 @@ def get_value():
             module_constant_symbol_prefix_for_module_identity(module_name, source_hash);
         let constant_symbol = module_constant_object_symbol(symbol_prefix.as_str(), constant_id);
 
-        let _plan_mode = set_legacy_optimization_plan_mode();
         let object = precompile_codegen_module_to_object_bytes(
             module_name,
             source_hash,
@@ -981,7 +973,6 @@ def get_value():
             module_constant_symbol_prefix_for_module_identity(module_name, source_hash);
         let constant_symbol = module_constant_object_symbol(symbol_prefix.as_str(), constant_id);
 
-        let _plan_mode = set_legacy_optimization_plan_mode();
         let object = precompile_codegen_module_to_object_bytes(
             module_name,
             source_hash,
@@ -1028,7 +1019,6 @@ def get_value():
             module_constant_symbol_prefix_for_module_identity(module_name, source_hash);
         let constant_symbol = module_constant_object_symbol(symbol_prefix.as_str(), constant_id);
 
-        let _plan_mode = set_legacy_optimization_plan_mode();
         let object = precompile_codegen_module_to_object_bytes(
             module_name,
             source_hash,
@@ -3105,18 +3095,64 @@ def build(values):
             .expect("test counter dump should be writable");
     }
 
-    fn write_test_optimization_plan(path: &Path, plan: &OptimizationPlan) {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).expect("test optimization plan dir should exist");
-        }
-        let archive = rkyv::to_bytes::<rkyv::rancor::Error>(plan)
-            .expect("test optimization plan should serialize");
-        std::fs::write(path, archive.as_ref()).expect("test optimization plan should be writable");
-    }
-
     fn write_test_optimization_artifacts_v3(path: &Path, artifacts: &ExactIntBranchV3Artifacts) {
         write_optimization_artifacts_v3(path, artifacts)
             .expect("test optimization plan v3 should be writable");
+    }
+
+    fn ensure_test_optimization_artifacts_v3_for_shared_state(
+        shared_state: &crate::module_type::SharedModuleState,
+    ) -> Result<(), String> {
+        let env_config = SoacEnvConfig::from_env()?;
+        if !matches!(
+            env_config.specialization_mode(),
+            Some(SpecializationMode::Verify | SpecializationMode::Apply)
+        ) {
+            return Ok(());
+        }
+        let Some(cache_root) = env_config.module_cache_root() else {
+            return Ok(());
+        };
+        let cache_source = shared_state
+            .module_cache_source
+            .unwrap_or(PythonModuleCacheSource::Project);
+        let output_path = module_optimization_plan_v3_path(
+            cache_root.as_path(),
+            cache_source,
+            shared_state.module_name.as_str(),
+        )
+        .map_err(|err| err.to_string())?;
+        if output_path.exists() {
+            return Ok(());
+        }
+        let evidence_store = match env_config
+            .counter_dump_input_path()
+            .filter(|path| path.exists())
+        {
+            Some(path) => ProfileEvidenceStore::from_counter_dump(path.as_path())
+                .map_err(|err| err.to_string())?,
+            None => ProfileEvidenceStore::default(),
+        };
+        let cache_identity = pre_optimization_module_cache_identity(
+            env!("SOAC_BUILD_IDENTITY"),
+            shared_state.module_name == "soac.runtime",
+        );
+        let metadata = CachedCodegenModuleMetadata {
+            source: cache_source,
+            module_name: shared_state.module_name.clone(),
+            source_hash: shared_state.source_hash,
+            cache_identity,
+        };
+        let catalog = AlternativeCatalog::default_v3();
+        let artifacts = plan_and_emit_module_v3_from_raw_evidence(
+            &catalog,
+            &metadata,
+            &shared_state.lowered_module,
+            &evidence_store,
+        )
+        .map_err(|err| format!("generate test optimization plan v3: {err}"))?;
+        write_optimization_artifacts_v3(output_path.as_path(), &artifacts)
+            .map_err(|err| err.to_string())
     }
 
     fn test_empty_v3_artifacts_for_function(
@@ -3181,60 +3217,6 @@ def build(values):
         }
     }
 
-    fn write_test_operator_optimization_plan(
-        module_cache_root: &Path,
-        module_name: &str,
-        source_hash: u64,
-        cache_identity: &str,
-        function: &BlockPyFunction<CodegenModuleShape>,
-        operator_specializations: &[(InstrId, u64)],
-    ) {
-        let serialized_function = test_serialized_function_id(0, function.function_id);
-        let plan = OptimizationPlan {
-            source: PythonModuleCacheSource::Project,
-            module_name: module_name.to_string(),
-            source_hash,
-            cache_identity: cache_identity.to_string(),
-            identity_tables: test_plan_identities(
-                module_name,
-                source_hash,
-                cache_identity,
-                serialized_function,
-                function.names.qualname.as_str(),
-                &[],
-            ),
-            functions: vec![FunctionOptimizationPlan {
-                function: serialized_function,
-                decisions: operator_specializations
-                    .iter()
-                    .map(|(instr_id, shape)| OptimizationDecision {
-                        instr_id: *instr_id,
-                        replacement: PlannedReplacement::Guarded {
-                            alternatives: vec![PlannedAlternative {
-                                guards: vec![PlannedGuard::ObservedShape {
-                                    family: ShapeFamily::Operator,
-                                    shape: *shape,
-                                }],
-                                action: PlannedAction::SpecializedShape {
-                                    family: ShapeFamily::Operator,
-                                    shape: *shape,
-                                },
-                            }],
-                            fallback: PlannedFallback::OriginalInstruction,
-                        },
-                    })
-                    .collect(),
-            }],
-        };
-        let plan_path = module_optimization_plan_path(
-            module_cache_root,
-            PythonModuleCacheSource::Project,
-            module_name,
-        )
-        .expect("test optimization plan path should build");
-        write_test_optimization_plan(plan_path.as_path(), &plan);
-    }
-
     fn test_serialized_function_id(
         serialized_module_id: u32,
         function_id: RuntimeFunctionId,
@@ -3243,16 +3225,6 @@ def build(values):
             SerializedModuleId::new(serialized_module_id),
             function_id.local_function_id(),
         )
-    }
-
-    fn test_planned_function_target(
-        serialized_module_id: u32,
-        function_id: RuntimeFunctionId,
-    ) -> PlannedFunctionTarget {
-        PlannedFunctionTarget::new(test_serialized_function_id(
-            serialized_module_id,
-            function_id,
-        ))
     }
 
     fn test_plan_identities(
@@ -3446,6 +3418,9 @@ def build(values):
                     function.function_id, function.names.qualname
                 )
             })?;
+        if let Some(shared_state) = direct_call_resolver {
+            ensure_test_optimization_artifacts_v3_for_shared_state(shared_state)?;
+        }
         let specialization_profile = SpecializationProfile::from_runtime_state_with_session(
             direct_call_resolver,
             Some(compile_session),
@@ -4125,128 +4100,6 @@ def build(values):
     }
 
     #[test]
-    fn legacy_call_targets_for_codegen_exclude_v3_call_sources() {
-        let legacy_source = InstrId::new(BlockLabel::from_index(0), 1);
-        let direct_source = InstrId::new(BlockLabel::from_index(0), 2);
-        let constructor_source = InstrId::new(BlockLabel::from_index(0), 3);
-        let method_source = InstrId::new(BlockLabel::from_index(0), 4);
-        let legacy_target = RuntimeFunctionId::from_raw_parts(0, 11);
-        let direct_target = RuntimeFunctionId::from_raw_parts(0, 12);
-        let arg_plan = TypedDirectCallArgPlan {
-            sources: vec![TypedDirectCallArgSource::Provided(0)],
-        };
-
-        let opt_v3_call_emissions = typed_call_emission_plans_from_v3(
-            &HashMap::from([(
-                direct_source,
-                vec![ResolvedV3DirectCallPlan {
-                    source: direct_source,
-                    target: direct_target,
-                    arg_plan: arg_plan.clone(),
-                    body: test_v3_direct_call_body(),
-                    reason: "profiled direct call".to_string(),
-                }],
-            )]),
-            &HashMap::from([(
-                constructor_source,
-                PreparedV3ConstructorCallPlan { guards: Vec::new() },
-            )]),
-            &HashMap::from([(
-                method_source,
-                PreparedV3MethodCallPlan {
-                    method_name: "get".to_string(),
-                    guards: Vec::new(),
-                },
-            )]),
-        )
-        .expect("v3 call emissions should merge into typed emission plan");
-        let filtered = legacy_call_targets_excluding_sources(
-            &HashMap::from([
-                (legacy_source, vec![legacy_target]),
-                (direct_source, vec![legacy_target]),
-                (constructor_source, vec![legacy_target]),
-                (method_source, vec![legacy_target]),
-            ]),
-            &opt_v3_call_emissions.sources(),
-        );
-
-        assert_eq!(
-            filtered,
-            HashMap::from([(legacy_source, vec![legacy_target])])
-        );
-    }
-
-    #[test]
-    fn function_specialization_inputs_exclude_legacy_targets_for_raw_v3_call_sources() {
-        let mut constants = TestConstantPool::default();
-        let v3_source = InstrId::new(BlockLabel::from_index(0), 1);
-        let legacy_source = InstrId::new(BlockLabel::from_index(0), 2);
-        let legacy_target = RuntimeFunctionId::from_raw_parts(0, 11);
-        let v3_target = RuntimeFunctionId::from_raw_parts(0, 12);
-        let call = with_instr_id(
-            op_expr(Call::new(
-                name_expr(test_local_name("fn", 0)),
-                Vec::<CallArgPositional<InstrCodegen>>::new(),
-                Vec::<CallArgKeyword<InstrCodegen>>::new(),
-            )),
-            v3_source,
-        );
-        let mut function =
-            with_single_test_block(test_function(), vec![call], ret_term(constants.int_expr(2)));
-        set_stack_slots(&mut function, &["fn"]);
-
-        let mut legacy_evidence = FunctionProfileEvidence::default();
-        legacy_evidence.call_target_specializations = HashMap::from([
-            (v3_source, vec![legacy_target]),
-            (legacy_source, vec![legacy_target]),
-        ]);
-        let v3_plan = ResolvedV3DirectCallPlan {
-            source: v3_source,
-            target: v3_target,
-            arg_plan: TypedDirectCallArgPlan {
-                sources: Vec::new(),
-            },
-            body: test_v3_inline_call_body(),
-            reason: "profiled direct call".to_string(),
-        };
-        let profile = SpecializationProfile {
-            module_name: None,
-            counter_dump_path: None,
-            planned_evidence: HashMap::from([(function.function_id, legacy_evidence)]),
-            opt_v3_emitted_direct_calls: HashMap::from([(
-                function.function_id,
-                HashMap::from([(v3_source, vec![v3_plan])]),
-            )]),
-            opt_v3_emitted_constructor_calls: HashMap::new(),
-            opt_v3_emitted_method_calls: HashMap::new(),
-            opt_v3_emitted_exact_list_items: HashMap::new(),
-            opt_v3_emitted_indexed_fields: HashMap::new(),
-            opt_v3_emitted_indexed_globals: HashMap::new(),
-            opt_v3_exact_int_branch_artifacts: HashMap::new(),
-            behavior_change_indexed_stores: false,
-            profiled_cold_blocks: false,
-            guard_miss_deopt: false,
-        };
-
-        let inputs = FunctionSpecializationInputs::from_profile(&profile, &function)
-            .expect("specialization inputs should prepare");
-
-        assert!(
-            !inputs.call_target_specializations.contains_key(&v3_source),
-            "raw v3-owned call sources should not retain legacy call-target evidence"
-        );
-        assert_eq!(
-            inputs.call_target_specializations.get(&legacy_source),
-            Some(&vec![legacy_target]),
-            "unowned legacy call-target evidence should remain available"
-        );
-        assert!(
-            inputs.opt_v3_call_emissions.is_empty(),
-            "inline-body v3 direct calls are consumed before typed lowering"
-        );
-    }
-
-    #[test]
     fn opt_v3_typed_call_preparation_skips_inline_body_plans() {
         let function_id = RuntimeFunctionId::from_raw_parts(0, 1);
         let source = InstrId::new(BlockLabel::from_index(0), 7);
@@ -4263,7 +4116,6 @@ def build(values):
         let profile = SpecializationProfile {
             module_name: None,
             counter_dump_path: None,
-            planned_evidence: HashMap::new(),
             opt_v3_emitted_direct_calls: HashMap::from([(
                 function_id,
                 HashMap::from([(source, vec![direct_call])]),
@@ -5927,108 +5779,6 @@ def build(values):
     }
 
     #[test]
-    fn process_jit_batch_collection_uses_optimization_plan_targets() {
-        if crate::run_test_in_isolated_process_if_needed(
-            module_path!(),
-            "process_jit_batch_collection_uses_optimization_plan_targets",
-        ) {
-            return;
-        }
-        let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        crate::initialize_test_python();
-        Python::attach(|py| {
-            let soac_work_dir = fresh_test_work_dir("planned-process-jit-batch");
-            let module_cache_root = soac_work_dir.join("modules");
-            let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
-            let (_opt_mode, _plan_mode) = set_legacy_opt_mode("verify");
-            let session = std::sync::Arc::new(crate::session::CompileSession::new());
-            let module_name = "planned_process_jit_batch_test";
-            let module_name_gen = ModuleNameGen::new(105);
-            let callee = with_single_test_block(
-                test_function_in_module(&module_name_gen, "callee"),
-                vec![],
-                ret_term(none_expr()),
-            );
-            let caller = with_single_test_block(
-                test_function_in_module(&module_name_gen, "caller"),
-                vec![],
-                ret_term(none_expr()),
-            );
-            let callee_function_id = callee.function_id;
-            let caller_function_id = caller.function_id;
-            let call_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
-            let shared_state = crate::module_type::build_shared_state_for_testing(
-                py,
-                test_module(module_name_gen, vec![callee, caller.clone()]),
-                module_name,
-                "",
-            )
-            .expect("shared state should build");
-            session
-                .retain_shared_module_state(std::sync::Arc::clone(&shared_state))
-                .expect("shared state should be retained");
-
-            let planned_callee_target = test_planned_function_target(0, callee_function_id);
-            let planned_caller_function = test_serialized_function_id(0, caller_function_id);
-            let cache_identity = pre_optimization_module_cache_identity(
-                env!("SOAC_BUILD_IDENTITY"),
-                shared_state.module_name == "soac.runtime",
-            );
-            let plan = OptimizationPlan {
-                source: PythonModuleCacheSource::Project,
-                module_name: module_name.to_string(),
-                source_hash: shared_state.source_hash,
-                cache_identity: cache_identity.clone(),
-                identity_tables: test_plan_identities(
-                    module_name,
-                    shared_state.source_hash,
-                    cache_identity.as_str(),
-                    planned_caller_function,
-                    "caller",
-                    &[],
-                ),
-                functions: vec![FunctionOptimizationPlan {
-                    function: planned_caller_function,
-                    decisions: vec![OptimizationDecision {
-                        instr_id: call_instr_id,
-                        replacement: PlannedReplacement::Guarded {
-                            alternatives: vec![PlannedAlternative {
-                                guards: vec![PlannedGuard::FunctionTarget {
-                                    target: planned_callee_target.clone(),
-                                }],
-                                action: PlannedAction::DirectCall {
-                                    target: planned_callee_target,
-                                },
-                            }],
-                            fallback: PlannedFallback::OriginalInstruction,
-                        },
-                    }],
-                }],
-            };
-            let plan_path = module_optimization_plan_path(
-                module_cache_root.as_path(),
-                PythonModuleCacheSource::Project,
-                module_name,
-            )
-            .expect("test optimization plan path should build");
-            write_test_optimization_plan(plan_path.as_path(), &plan);
-
-            let batch =
-                collect_process_jit_batch_functions(&session, &caller, Some(shared_state.as_ref()))
-                    .expect("process JIT batch should collect planned direct-call targets");
-            let function_ids = batch
-                .iter()
-                .map(|batch_function| batch_function.function.function_id)
-                .collect::<Vec<_>>();
-            assert_eq!(
-                function_ids,
-                vec![caller_function_id, callee_function_id],
-                "same-module planned call targets should enter the process-JIT batch without profile.bin fallback"
-            );
-        });
-    }
-
-    #[test]
     fn process_jit_compile_direct_function_handles_mutual_recursion() {
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         crate::initialize_test_python();
@@ -6244,100 +5994,6 @@ def build(values):
         render_test_jit_function_with_constants(&module, &function, blocks, &module_constants)
     }
 
-    fn build_test_jit_function_with_operator_specializations(
-        function: &BlockPyFunction<CodegenModuleShape>,
-        blocks: &[ObjPtr],
-        module_constants: Vec<InstrResolved>,
-        operator_specializations: &[(InstrId, u64)],
-    ) -> (JITModule, BuiltSpecializedFunction) {
-        let mut module = test_module(ModuleNameGen::new(0), vec![function.clone()]);
-        module.module_constants = module_constants;
-        let function = module.callable_defs[0].clone();
-        let module_name = "counter_test";
-        let soac_work_dir = fresh_test_work_dir("test-work");
-        let module_cache_root = soac_work_dir.join("modules");
-
-        let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        let old_soac_work_dir = std::env::var_os("SOAC_WORK_DIR");
-        let old_soac_opt_mode = std::env::var_os("SOAC_OPT_MODE");
-        unsafe {
-            std::env::set_var("SOAC_WORK_DIR", &soac_work_dir);
-            std::env::set_var("SOAC_OPT_MODE", "apply");
-        }
-        let _plan_mode = set_legacy_optimization_plan_mode();
-        crate::initialize_test_python();
-
-        let (jit_module, built) = Python::attach(|py| {
-            let shared_state =
-                crate::module_type::build_shared_state_for_testing(py, module, module_name, "")
-                    .expect("shared state should build");
-            let cache_identity = pre_optimization_module_cache_identity(
-                env!("SOAC_BUILD_IDENTITY"),
-                shared_state.module_name == "soac.runtime",
-            );
-            write_test_operator_optimization_plan(
-                module_cache_root.as_path(),
-                module_name,
-                shared_state.source_hash,
-                cache_identity.as_str(),
-                &function,
-                operator_specializations,
-            );
-            let compile_session = crate::session::CompileSession::new();
-            let mut jit_module =
-                new_jit_module(&compile_session).expect("test jit module should construct");
-            let module_constant_ptrs = shared_state.module_constant_ptrs();
-            let module_constant_object_data_ids = declare_module_constant_object_data(
-                &mut jit_module,
-                &shared_state.lowered_module,
-                &module_constant_ptrs,
-            )
-            .expect("module constant object data should declare");
-            let (counter_slots_by_id, scalar_counter_data_id, _top_value_counter_data_id) =
-                define_test_counter_storage(
-                    &mut jit_module,
-                    &shared_state.lowered_module,
-                    &shared_state.lowered_module.counter_defs,
-                );
-            let top_value_counter_data_id = declare_shared_state_top_value_counter_storage(
-                &mut jit_module,
-                shared_state.as_ref(),
-            );
-            let built = build_test_cranelift_run_bb_specialized_function(
-                &mut jit_module,
-                blocks,
-                &shared_state.lowered_module,
-                &function,
-                &shared_state.codegen_constants,
-                &shared_state.lowered_module.counter_defs,
-                module_constant_object_data_ids.as_slice(),
-                counter_slots_by_id.as_ref(),
-                scalar_counter_data_id,
-                top_value_counter_data_id,
-                &compile_session,
-                Some(shared_state.as_ref()),
-                None,
-                None,
-                BuildSpecializedFunctionOptions::default(),
-            )
-            .expect("specialized JIT build should succeed");
-            (jit_module, built)
-        });
-
-        unsafe {
-            match old_soac_work_dir {
-                Some(value) => std::env::set_var("SOAC_WORK_DIR", value),
-                None => std::env::remove_var("SOAC_WORK_DIR"),
-            }
-            match old_soac_opt_mode {
-                Some(value) => std::env::set_var("SOAC_OPT_MODE", value),
-                None => std::env::remove_var("SOAC_OPT_MODE"),
-            }
-        }
-
-        (jit_module, built)
-    }
-
     fn render_test_jit_function_with_block_entry_counts(
         function: &BlockPyFunction<CodegenModuleShape>,
         blocks: &[ObjPtr],
@@ -6394,7 +6050,7 @@ def build(values):
                 std::env::remove_var("SOAC_ENABLE_PROFILED_COLD_BLOCKS");
             }
         }
-        let _plan_mode = set_legacy_optimization_plan_mode();
+
         crate::initialize_test_python();
 
         let rendered = Python::attach(|py| {
@@ -6480,7 +6136,7 @@ def build(values):
         let old_soac_work_dir = std::env::var_os("SOAC_WORK_DIR");
         let old_soac_opt_mode = std::env::var_os("SOAC_OPT_MODE");
         let soac_work_dir = fresh_test_work_dir("test-work");
-        let _plan_mode = set_legacy_optimization_plan_mode();
+
         unsafe {
             std::env::set_var("SOAC_WORK_DIR", &soac_work_dir);
             std::env::set_var("SOAC_OPT_MODE", "verify");
@@ -6657,87 +6313,6 @@ class Point:
     }
 
     #[test]
-    fn planned_field_index_layout_priming_uses_profiled_index_order() {
-        let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        crate::initialize_test_python();
-
-        Python::attach(|py| {
-            let module_name = "planned_field_type_test";
-            let module = PyModule::from_code(
-                py,
-                c"
-class Record:
-    pass
-",
-                c"planned_field_type_test.py",
-                c"planned_field_type_test",
-            )
-            .expect("test module should execute");
-            let sys = PyModule::import(py, "sys").expect("sys should import");
-            let modules = sys
-                .getattr("modules")
-                .expect("sys.modules should exist")
-                .cast_into::<pyo3::types::PyDict>()
-                .expect("sys.modules should be a dict");
-            modules
-                .set_item(module_name, module.as_any())
-                .expect("test module should be registered");
-            let owner_type = module
-                .getattr("Record")
-                .expect("Record should exist")
-                .as_ptr() as *mut ffi::PyTypeObject;
-
-            assert!(
-                unsafe { owner_type_supports_field_layout_priming(owner_type) },
-                "expected Record to support field-layout priming"
-            );
-            assert_eq!(
-                cached_split_key_layout(py, owner_type),
-                Vec::<(String, u32)>::new()
-            );
-
-            let owner_type_key = PlannedTypeKey {
-                module_name: module_name.to_string(),
-                qualname: "Record".to_string(),
-            };
-            let planned_fields = [
-                ("IntComp", 3),
-                ("PtrComp", 0),
-                ("StringComp", 4),
-                ("Discr", 1),
-                ("EnumComp", 2),
-            ]
-            .into_iter()
-            .map(
-                |(attr_name, expected_index)| PlannedIndexedFieldSpecialization {
-                    owner_type: owner_type_key.clone(),
-                    attr_name: attr_name.to_string(),
-                    expected_index,
-                },
-            )
-            .collect::<Vec<_>>();
-
-            prime_planned_field_index_layouts(planned_fields.iter())
-                .expect("planned field-layout priming should succeed");
-
-            assert!(
-                cached_split_key_layout(py, owner_type).starts_with(&[
-                    ("PtrComp".to_string(), 0),
-                    ("Discr".to_string(), 1),
-                    ("EnumComp".to_string(), 2),
-                    ("IntComp".to_string(), 3),
-                    ("StringComp".to_string(), 4),
-                ]),
-                "planned priming should replay the profiled split-key order"
-            );
-
-            modules
-                .del_item(module_name)
-                .expect("test module should be removed");
-        });
-    }
-
-    #[test]
     fn field_index_specialized_setattr_hits_apply_mode_first_insert() {
         if crate::run_test_in_isolated_process_if_needed(
             module_path!(),
@@ -6749,7 +6324,7 @@ class Record:
         let old_soac_work_dir = std::env::var_os("SOAC_WORK_DIR");
         let old_soac_opt_mode = std::env::var_os("SOAC_OPT_MODE");
         let soac_work_dir = fresh_test_work_dir("test-work");
-        let _plan_mode = set_legacy_optimization_plan_mode();
+
         unsafe {
             std::env::set_var("SOAC_WORK_DIR", &soac_work_dir);
             std::env::set_var("SOAC_OPT_MODE", "apply");
@@ -6995,7 +6570,7 @@ def write_point(point, value):
         let old_soac_work_dir = std::env::var_os("SOAC_WORK_DIR");
         let old_soac_opt_mode = std::env::var_os("SOAC_OPT_MODE");
         let soac_work_dir = fresh_test_work_dir("test-work");
-        let _plan_mode = set_legacy_optimization_plan_mode();
+
         unsafe {
             std::env::set_var("SOAC_WORK_DIR", &soac_work_dir);
             std::env::set_var("SOAC_OPT_MODE", "verify");
@@ -7341,7 +6916,7 @@ class Record:
         let old_soac_work_dir = std::env::var_os("SOAC_WORK_DIR");
         let old_soac_opt_mode = std::env::var_os("SOAC_OPT_MODE");
         let soac_work_dir = fresh_test_work_dir("test-work");
-        let _plan_mode = set_legacy_optimization_plan_mode();
+
         unsafe {
             std::env::set_var("SOAC_WORK_DIR", &soac_work_dir);
             std::env::set_var("SOAC_OPT_MODE", "apply");
@@ -7569,8 +7144,7 @@ def read_point(point):
             let soac_work_dir = fresh_test_work_dir("v3-field-getattr-store-rhs");
             let module_cache_root = soac_work_dir.join("modules");
             let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
-            let (_opt_mode, _plan_mode) = set_legacy_opt_mode("apply");
-            let _plan_mode = EnvVarGuard::set(SOAC_OPT_PLAN_MODE_ENV, "v3");
+            let _opt_mode = set_opt_mode("apply");
             let owner_module = PyModule::from_code(
                 py,
                 c"
@@ -7809,7 +7383,7 @@ def read_point(point):
         source: &str,
         function_bind_name: &str,
     ) -> BuiltSpecializedFunction {
-        let (_opt_mode, _plan_mode) = set_legacy_opt_mode(mode);
+        let _opt_mode = set_opt_mode(mode);
         let soac_work_dir = fresh_test_work_dir("field-getattr-deopt");
         let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
         let owner_module = PyModule::from_code(
@@ -8085,7 +7659,7 @@ def write_point(factory, value):
                 globals_obj: ObjPtr,
             }
 
-            let (_opt_mode, _plan_mode) = set_legacy_opt_mode("verify");
+            let _opt_mode = set_opt_mode("verify");
             let soac_work_dir = fresh_test_work_dir("field-getattr-deopt-runtime");
             let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
             let owner_module = PyModule::from_code(
@@ -8274,7 +7848,7 @@ def read_point(point):
                 globals_obj: ObjPtr,
             }
 
-            let (_opt_mode, _plan_mode) = set_legacy_opt_mode("verify");
+            let _opt_mode = set_opt_mode("verify");
             let soac_work_dir = fresh_test_work_dir("field-setattr-deopt-runtime");
             let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
             let owner_module = PyModule::from_code(
@@ -8720,6 +8294,8 @@ def write_point(point, value):
         _py: Python<'_>,
         shared_state: std::sync::Arc<crate::module_type::SharedModuleState>,
     ) -> crate::jit::ModuleRuntimeContext {
+        ensure_test_optimization_artifacts_v3_for_shared_state(shared_state.as_ref())
+            .expect("test optimization plan v3 should generate for specialized mode");
         let globals_obj = ffi::PyDict_New().cast::<c_void>();
         assert!(
             !globals_obj.is_null(),
@@ -9145,13 +8721,6 @@ def write_point(point, value):
                     .then(|| ir::UserExternalName::new(0, *func_id))
             })
             .collect()
-    }
-
-    fn imported_symbol_names(built: &BuiltSpecializedFunction) -> Vec<&'static str> {
-        let mut symbols: Vec<&'static str> = built.import_id_to_symbol.values().copied().collect();
-        symbols.sort_unstable();
-        symbols.dedup();
-        symbols
     }
 
     #[test]
@@ -14524,19 +14093,8 @@ def g():
         }
     }
 
-    fn set_legacy_optimization_plan_mode() -> EnvVarGuard {
-        EnvVarGuard::set(SOAC_OPT_PLAN_MODE_ENV, "legacy")
-    }
-
-    fn set_legacy_opt_mode(mode: &str) -> (EnvVarGuard, EnvVarGuard) {
-        (
-            EnvVarGuard::set("SOAC_OPT_MODE", mode),
-            set_legacy_optimization_plan_mode(),
-        )
-    }
-
-    fn legacy_plan_env_config() -> SoacEnvConfig {
-        SoacEnvConfig::default().with_optimization_plan_mode(OptimizationPlanMode::Legacy)
+    fn set_opt_mode(mode: &str) -> EnvVarGuard {
+        EnvVarGuard::set("SOAC_OPT_MODE", mode)
     }
 
     unsafe fn build_runtime_refcount_smoke_context() -> (
@@ -15740,97 +15298,6 @@ def f(x):
         );
     }
 
-    #[test]
-    fn specialized_jit_exact_int_binop_uses_compact_long_fast_path() {
-        if crate::run_test_in_isolated_process_if_needed(
-            module_path!(),
-            "specialized_jit_exact_int_binop_uses_compact_long_fast_path",
-        ) {
-            return;
-        }
-        let blocks = [1usize as ObjPtr];
-        let mut function = test_function();
-        function.params = ParamSpec {
-            params: vec![
-                Param {
-                    name: "a".into(),
-                    kind: ParamKind::Any,
-                    has_default: false,
-                },
-                Param {
-                    name: "b".into(),
-                    kind: ParamKind::Any,
-                    has_default: false,
-                },
-            ],
-        };
-        let block_label = function.name_gen.next_block_name();
-        let instr_id = InstrId::new(block_label, 0);
-        let block = CodegenBlock {
-            label: block_label,
-            body: vec![],
-            term: ret_term(with_instr_id(
-                op_expr(BinOp::new(
-                    BinOpKind::Add,
-                    name_expr(test_name("a")),
-                    name_expr(test_local_name("b", 1)),
-                )),
-                instr_id,
-            )),
-            params: vec![],
-            exc_edge: None,
-        };
-        function.blocks = vec![block];
-        set_stack_slots(&mut function, &["a", "b"]);
-        let baseline_module = test_module(ModuleNameGen::new(0), vec![function.clone()]);
-        let baseline_function = baseline_module.callable_defs[0].clone();
-        let baseline_module_constants =
-            crate::module_constants::ModuleCodegenConstants::collect_from_module(&baseline_module);
-        let baseline_built = build_test_jit_function_with_constants(
-            &baseline_module,
-            &baseline_function,
-            &blocks,
-            &baseline_module_constants,
-        );
-        let baseline_symbolic_globals = count_symbolic_global_values(&baseline_built.ctx.func);
-        let (_jit_module, built) = build_test_jit_function_with_operator_specializations(
-            &function,
-            &blocks,
-            Vec::new(),
-            &[(
-                instr_id,
-                soac_opt::operator_specialization::pack_binary_shape(
-                    soac_opt::operator_specialization::ExactTypeTag::Int,
-                    soac_opt::operator_specialization::ExactTypeTag::Int,
-                ),
-            )],
-        );
-        let box_helpers = import_user_names_for_symbols(&built, &["PyLong_FromLongLong"]);
-        assert_eq!(
-            count_direct_calls_to_runtime_helpers(&built.ctx.func, &box_helpers),
-            1,
-            "profiled exact-int add should box the machine result directly",
-        );
-        let generic_helpers =
-            import_user_names_for_symbols(&built, &["PyNumber_Add", "dp_jit_exact_long_add_slot"]);
-        assert_eq!(
-            count_direct_calls_to_runtime_helpers(&built.ctx.func, &generic_helpers),
-            0,
-            "profiled exact-int add should not call generic or profiled PyLong helpers",
-        );
-        assert!(
-            !function_contains_iconst_imm(
-                &built.ctx.func,
-                std::ptr::addr_of_mut!(PyLong_Type) as i64
-            ),
-            "exact-int binop specialization should not bake the PyLong type pointer into the function body",
-        );
-        assert!(
-            count_symbolic_global_values(&built.ctx.func) > baseline_symbolic_globals,
-            "exact-int binop specialization should add a symbolic global for the PyLong guard",
-        );
-    }
-
     fn build_fact_proven_exact_int_binop(kind: BinOpKind) -> BuiltSpecializedFunction {
         let blocks = [1usize as ObjPtr];
         let mut constants = TestConstantPool::default();
@@ -15917,66 +15384,6 @@ def f(x):
     }
 
     #[test]
-    fn specialized_jit_exact_int_binop_guard_miss_deopts_for_replay_safe_operands() {
-        if crate::run_test_in_isolated_process_if_needed(
-            module_path!(),
-            "specialized_jit_exact_int_binop_guard_miss_deopts_for_replay_safe_operands",
-        ) {
-            return;
-        }
-        let blocks = [1usize as ObjPtr];
-        let mut function = test_function();
-        function.params = ParamSpec {
-            params: vec![
-                Param {
-                    name: "a".into(),
-                    kind: ParamKind::Any,
-                    has_default: false,
-                },
-                Param {
-                    name: "b".into(),
-                    kind: ParamKind::Any,
-                    has_default: false,
-                },
-            ],
-        };
-        let block_label = function.name_gen.next_block_name();
-        let instr_id = InstrId::new(block_label, 0);
-        function.blocks = vec![CodegenBlock {
-            label: block_label,
-            body: vec![],
-            term: ret_term(with_instr_id(
-                op_expr(BinOp::new(
-                    BinOpKind::Add,
-                    name_expr(test_name("a")),
-                    name_expr(test_local_name("b", 1)),
-                )),
-                instr_id,
-            )),
-            params: vec![],
-            exc_edge: None,
-        }];
-        set_stack_slots(&mut function, &["a", "b"]);
-        let (_jit_module, built) = build_test_jit_function_with_operator_specializations(
-            &function,
-            &blocks,
-            Vec::new(),
-            &[(
-                instr_id,
-                soac_opt::operator_specialization::pack_binary_shape(
-                    soac_opt::operator_specialization::ExactTypeTag::Int,
-                    soac_opt::operator_specialization::ExactTypeTag::Int,
-                ),
-            )],
-        );
-        assert_guard_miss_deopts_without_local_fallback(
-            &built,
-            &["PyNumber_Add"],
-            "exact-int binary op",
-        );
-    }
-
-    #[test]
     fn exact_int_binop_guard_miss_deopt_resumes_generic_binop_runtime() {
         if crate::run_test_in_isolated_process_if_needed(
             module_path!(),
@@ -15995,7 +15402,7 @@ def f(x):
                 globals_obj: ObjPtr,
             }
 
-            let (_opt_mode, _plan_mode) = set_legacy_opt_mode("apply");
+            let _opt_mode = set_opt_mode("apply");
             let soac_work_dir = fresh_test_work_dir("exact-int-binop-deopt-runtime");
             let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
             let mut function = test_function();
@@ -16175,221 +15582,6 @@ def f(x):
     }
 
     #[test]
-    fn specialized_jit_exact_int_compare_uses_compact_long_fast_path() {
-        if crate::run_test_in_isolated_process_if_needed(
-            module_path!(),
-            "specialized_jit_exact_int_compare_uses_compact_long_fast_path",
-        ) {
-            return;
-        }
-        let blocks = [1usize as ObjPtr];
-        let mut function = test_function();
-        function.params = ParamSpec {
-            params: vec![
-                Param {
-                    name: "a".into(),
-                    kind: ParamKind::Any,
-                    has_default: false,
-                },
-                Param {
-                    name: "b".into(),
-                    kind: ParamKind::Any,
-                    has_default: false,
-                },
-            ],
-        };
-        let block_label = function.name_gen.next_block_name();
-        let instr_id = InstrId::new(block_label, 0);
-        let block = CodegenBlock {
-            label: block_label,
-            body: vec![],
-            term: ret_term(with_instr_id(
-                op_expr(BinOp::new(
-                    BinOpKind::Lt,
-                    name_expr(test_name("a")),
-                    name_expr(test_local_name("b", 1)),
-                )),
-                instr_id,
-            )),
-            params: vec![],
-            exc_edge: None,
-        };
-        function.blocks = vec![block];
-        set_stack_slots(&mut function, &["a", "b"]);
-        let baseline_module = test_module(ModuleNameGen::new(0), vec![function.clone()]);
-        let baseline_function = baseline_module.callable_defs[0].clone();
-        let baseline_module_constants =
-            crate::module_constants::ModuleCodegenConstants::collect_from_module(&baseline_module);
-        let baseline_built = build_test_jit_function_with_constants(
-            &baseline_module,
-            &baseline_function,
-            &blocks,
-            &baseline_module_constants,
-        );
-        let baseline_symbolic_globals = count_symbolic_global_values(&baseline_built.ctx.func);
-        let (_jit_module, built) = build_test_jit_function_with_operator_specializations(
-            &function,
-            &blocks,
-            Vec::new(),
-            &[(
-                instr_id,
-                soac_opt::operator_specialization::pack_binary_shape(
-                    soac_opt::operator_specialization::ExactTypeTag::Int,
-                    soac_opt::operator_specialization::ExactTypeTag::Int,
-                ),
-            )],
-        );
-        let helper_names = import_user_names_for_symbols(
-            &built,
-            &["PyObject_RichCompare", "dp_jit_exact_long_richcompare_slot"],
-        );
-        assert_eq!(
-            count_direct_calls_to_runtime_helpers(&built.ctx.func, &helper_names),
-            0,
-            "profiled exact-int compare should lower to compact-long guards and a raw integer compare",
-        );
-        assert!(
-            !function_contains_iconst_imm(
-                &built.ctx.func,
-                std::ptr::addr_of_mut!(PyLong_Type) as i64
-            ),
-            "exact-int compare specialization should not bake the PyLong type pointer into the function body",
-        );
-        assert!(
-            count_symbolic_global_values(&built.ctx.func) > baseline_symbolic_globals,
-            "exact-int compare specialization should add a symbolic global for the PyLong guard",
-        );
-    }
-
-    #[test]
-    fn specialized_jit_exact_int_add_then_if_compare_uses_compact_long_machine_ops() {
-        if crate::run_test_in_isolated_process_if_needed(
-            module_path!(),
-            "specialized_jit_exact_int_add_then_if_compare_uses_compact_long_machine_ops",
-        ) {
-            return;
-        }
-        let blocks = [
-            1usize as ObjPtr,
-            2usize as ObjPtr,
-            3usize as ObjPtr,
-            4usize as ObjPtr,
-        ];
-        let mut constants = TestConstantPool::default();
-        let mut function = test_function();
-        function.params = ParamSpec {
-            params: vec![
-                Param {
-                    name: "a".into(),
-                    kind: ParamKind::Any,
-                    has_default: false,
-                },
-                Param {
-                    name: "b".into(),
-                    kind: ParamKind::Any,
-                    has_default: false,
-                },
-            ],
-        };
-        let entry_label = function.name_gen.next_block_name();
-        let test_label = function.name_gen.next_block_name();
-        let then_label = function.name_gen.next_block_name();
-        let else_label = function.name_gen.next_block_name();
-        let store_instr_id = InstrId::new(entry_label, 0);
-        let add_instr_id = InstrId::new(entry_label, 1);
-        let compare_instr_id = InstrId::new(test_label, 0);
-        let c_name = test_local_name("c", 2);
-        let entry = CodegenBlock {
-            label: entry_label,
-            body: vec![with_instr_id(
-                op_expr(Store::new(
-                    c_name.clone(),
-                    with_instr_id(
-                        op_expr(BinOp::new(
-                            BinOpKind::Add,
-                            name_expr(test_name("a")),
-                            name_expr(test_local_name("b", 1)),
-                        )),
-                        add_instr_id,
-                    ),
-                )),
-                store_instr_id,
-            )],
-            term: BlockTerm::Jump(BlockEdge::new(test_label)),
-            params: vec![],
-            exc_edge: None,
-        };
-        let test_block = CodegenBlock {
-            label: test_label,
-            body: vec![],
-            term: BlockTerm::IfTerm(soac_core::block_py::TermIf {
-                test: with_instr_id(
-                    op_expr(BinOp::new(
-                        BinOpKind::Gt,
-                        name_expr(c_name),
-                        constants.int_expr(0),
-                    )),
-                    compare_instr_id,
-                ),
-                then_label,
-                else_label,
-            }),
-            params: vec![],
-            exc_edge: None,
-        };
-        let then_block = CodegenBlock {
-            label: then_label,
-            body: vec![],
-            term: ret_term(name_expr(test_runtime_name("TRUE"))),
-            params: vec![],
-            exc_edge: None,
-        };
-        let else_block = CodegenBlock {
-            label: else_label,
-            body: vec![],
-            term: ret_term(none_expr()),
-            params: vec![],
-            exc_edge: None,
-        };
-        function.blocks = vec![entry, test_block, then_block, else_block];
-        set_stack_slots(&mut function, &["a", "b", "c"]);
-        let exact_int_shape = soac_opt::operator_specialization::pack_binary_shape(
-            soac_opt::operator_specialization::ExactTypeTag::Int,
-            soac_opt::operator_specialization::ExactTypeTag::Int,
-        );
-        let (_jit_module, built) = build_test_jit_function_with_operator_specializations(
-            &function,
-            &blocks,
-            constants.module_constants,
-            &[
-                (add_instr_id, exact_int_shape),
-                (compare_instr_id, exact_int_shape),
-            ],
-        );
-        let helper_names = import_user_names_for_symbols(
-            &built,
-            &[
-                "PyNumber_Add",
-                "dp_jit_exact_long_add_slot",
-                "PyObject_RichCompare",
-                "dp_jit_exact_long_richcompare_slot",
-                "dp_jit_is_true",
-            ],
-        );
-        assert_eq!(
-            count_direct_calls_to_runtime_helpers(&built.ctx.func, &helper_names),
-            0,
-            "profiled add-then-if exact-int path should use compact-long machine ops"
-        );
-        let deopt_helpers = import_user_names_for_symbols(&built, &["dp_jit_deopt_resume"]);
-        assert_eq!(
-            count_cold_block_direct_calls_to_runtime_helpers(&built.ctx.func, &deopt_helpers),
-            2,
-            "add and compare compact-long guard misses should each deopt"
-        );
-    }
-
-    #[test]
     fn specialized_jit_opt_v3_exact_int_branch_artifact_emits_machine_path() {
         if crate::run_test_in_isolated_process_if_needed(
             module_path!(),
@@ -16508,15 +15700,12 @@ def f(x):
             &module_constants,
             BuildSpecializedFunctionOptions {
                 specialization_inputs: Some(FunctionSpecializationInputs {
-                    call_target_specializations: HashMap::new(),
                     opt_v3_call_emissions: TypedCallEmissionPlans::default(),
-                    operator_specializations: HashMap::new(),
                     opt_v3_exact_list_items_by_instr: HashMap::new(),
                     field_index_specializations: HashMap::new(),
                     field_index_specializations_by_instr: HashMap::new(),
                     opt_v3_indexed_fields_by_instr: HashMap::new(),
                     opt_v3_indexed_globals_by_instr: HashMap::new(),
-                    branch_prefer_true: HashMap::new(),
                     cold_block_labels: HashSet::new(),
                     opt_v3_exact_int_branch_artifacts: Some(std::sync::Arc::new(artifacts)),
                     behavior_change_indexed_stores: false,
@@ -16702,15 +15891,12 @@ def f(x):
             &module_constants,
             BuildSpecializedFunctionOptions {
                 specialization_inputs: Some(FunctionSpecializationInputs {
-                    call_target_specializations: HashMap::new(),
                     opt_v3_call_emissions: TypedCallEmissionPlans::default(),
-                    operator_specializations: HashMap::new(),
                     opt_v3_exact_list_items_by_instr: HashMap::new(),
                     field_index_specializations: HashMap::new(),
                     field_index_specializations_by_instr: HashMap::new(),
                     opt_v3_indexed_fields_by_instr: HashMap::new(),
                     opt_v3_indexed_globals_by_instr: HashMap::new(),
-                    branch_prefer_true: HashMap::new(),
                     cold_block_labels: HashSet::new(),
                     opt_v3_exact_int_branch_artifacts: Some(std::sync::Arc::new(artifacts)),
                     behavior_change_indexed_stores: false,
@@ -16860,15 +16046,12 @@ def f(x):
                 &module_constants,
                 BuildSpecializedFunctionOptions {
                     specialization_inputs: Some(FunctionSpecializationInputs {
-                        call_target_specializations: HashMap::new(),
                         opt_v3_call_emissions: TypedCallEmissionPlans::default(),
-                        operator_specializations: HashMap::new(),
                         opt_v3_exact_list_items_by_instr: HashMap::new(),
                         field_index_specializations: HashMap::new(),
                         field_index_specializations_by_instr: HashMap::new(),
                         opt_v3_indexed_fields_by_instr: HashMap::new(),
                         opt_v3_indexed_globals_by_instr: HashMap::new(),
-                        branch_prefer_true: HashMap::new(),
                         cold_block_labels: HashSet::new(),
                         opt_v3_exact_int_branch_artifacts: Some(std::sync::Arc::new(artifacts)),
                         behavior_change_indexed_stores: false,
@@ -16989,15 +16172,12 @@ def f(x):
                 &module_constants,
                 BuildSpecializedFunctionOptions {
                     specialization_inputs: Some(FunctionSpecializationInputs {
-                        call_target_specializations: HashMap::new(),
                         opt_v3_call_emissions: TypedCallEmissionPlans::default(),
-                        operator_specializations: HashMap::new(),
                         opt_v3_exact_list_items_by_instr: HashMap::new(),
                         field_index_specializations: HashMap::new(),
                         field_index_specializations_by_instr: HashMap::new(),
                         opt_v3_indexed_fields_by_instr: HashMap::new(),
                         opt_v3_indexed_globals_by_instr: HashMap::new(),
-                        branch_prefer_true: HashMap::new(),
                         cold_block_labels: HashSet::new(),
                         opt_v3_exact_int_branch_artifacts: Some(std::sync::Arc::new(artifacts)),
                         behavior_change_indexed_stores: false,
@@ -17113,15 +16293,12 @@ def f(x):
             &module_constants,
             BuildSpecializedFunctionOptions {
                 specialization_inputs: Some(FunctionSpecializationInputs {
-                    call_target_specializations: HashMap::new(),
                     opt_v3_call_emissions: TypedCallEmissionPlans::default(),
-                    operator_specializations: HashMap::new(),
                     opt_v3_exact_list_items_by_instr: HashMap::new(),
                     field_index_specializations: HashMap::new(),
                     field_index_specializations_by_instr: HashMap::new(),
                     opt_v3_indexed_fields_by_instr: HashMap::new(),
                     opt_v3_indexed_globals_by_instr: HashMap::new(),
-                    branch_prefer_true: HashMap::new(),
                     cold_block_labels: HashSet::new(),
                     opt_v3_exact_int_branch_artifacts: Some(std::sync::Arc::new(artifacts)),
                     behavior_change_indexed_stores: false,
@@ -17344,10 +16521,6 @@ def f(x):
                 reason: "profiled direct call".to_string(),
             }
         );
-        assert!(
-            planned_inputs.evidence_by_function.is_empty(),
-            "v3 emitted direct calls should not be converted into legacy profile evidence"
-        );
     }
 
     #[test]
@@ -17483,10 +16656,6 @@ def f(x):
         assert_eq!(constructor_calls[0].inline_target, Some(iter_callee_id));
         assert_eq!(constructor_calls[0].owner_type.module_name, "test");
         assert_eq!(constructor_calls[0].owner_type.qualname, "Box");
-        assert!(
-            planned_inputs.evidence_by_function.is_empty(),
-            "v3 emitted constructor calls should not be converted into legacy profile evidence"
-        );
     }
 
     #[test]
@@ -17606,10 +16775,6 @@ def f(x):
         assert_eq!(method_calls[0].method_name, "get");
         assert_eq!(method_calls[0].owner_type.module_name, "test");
         assert_eq!(method_calls[0].owner_type.qualname, "Box");
-        assert!(
-            planned_inputs.evidence_by_function.is_empty(),
-            "v3 emitted method calls should not be converted into legacy profile evidence"
-        );
     }
 
     #[test]
@@ -17740,10 +16905,6 @@ def f(x):
                 reason: "profiled cross-module direct call".to_string(),
             },
             "JIT precompile loading should resolve v3 cross-module direct-call targets through the identity table and module index"
-        );
-        assert!(
-            planned_inputs.evidence_by_function.is_empty(),
-            "cross-module v3 emitted direct calls should not synthesize legacy evidence"
         );
     }
 
@@ -17958,10 +17119,6 @@ def f(x):
                 fallback: IndexedFieldFallbackKind::OriginalAttrAccess,
             }]
         );
-        assert!(
-            planned_inputs.evidence_by_function.is_empty(),
-            "v3 emitted indexed fields should not be converted into legacy profile evidence"
-        );
     }
 
     #[test]
@@ -18132,10 +17289,6 @@ def f(x):
                 fallback: IndexedGlobalFallbackKind::OriginalGlobalAccess,
             }
         );
-        assert!(
-            planned_inputs.evidence_by_function.is_empty(),
-            "v3 emitted indexed globals should not be converted into legacy profile evidence"
-        );
     }
 
     fn indexed_global_test_function(
@@ -18244,9 +17397,7 @@ def f(x):
     ) -> FunctionSpecializationInputs {
         let source = first_indexed_global_access_source(function, access, name);
         FunctionSpecializationInputs {
-            call_target_specializations: HashMap::new(),
             opt_v3_call_emissions: TypedCallEmissionPlans::default(),
-            operator_specializations: HashMap::new(),
             opt_v3_exact_list_items_by_instr: HashMap::new(),
             field_index_specializations: HashMap::new(),
             field_index_specializations_by_instr: HashMap::new(),
@@ -18255,7 +17406,6 @@ def f(x):
                 source,
                 opt_v3_indexed_global_plan_for_name(source, access, name),
             )]),
-            branch_prefer_true: HashMap::new(),
             cold_block_labels: HashSet::new(),
             opt_v3_exact_int_branch_artifacts: None,
             behavior_change_indexed_stores,
@@ -18281,9 +17431,7 @@ def f(x):
             &module_constants,
             BuildSpecializedFunctionOptions {
                 specialization_inputs: Some(FunctionSpecializationInputs {
-                    call_target_specializations: HashMap::new(),
                     opt_v3_call_emissions: TypedCallEmissionPlans::default(),
-                    operator_specializations: HashMap::new(),
                     opt_v3_exact_list_items_by_instr: HashMap::new(),
                     field_index_specializations: HashMap::new(),
                     field_index_specializations_by_instr: HashMap::new(),
@@ -18301,7 +17449,6 @@ def f(x):
                             ),
                         ),
                     ]),
-                    branch_prefer_true: HashMap::new(),
                     cold_block_labels: HashSet::new(),
                     opt_v3_exact_int_branch_artifacts: None,
                     behavior_change_indexed_stores: true,
@@ -18385,15 +17532,12 @@ def f(x):
             &module_constants,
             BuildSpecializedFunctionOptions {
                 specialization_inputs: Some(FunctionSpecializationInputs {
-                    call_target_specializations: HashMap::new(),
                     opt_v3_call_emissions: TypedCallEmissionPlans::default(),
-                    operator_specializations: HashMap::new(),
                     opt_v3_exact_list_items_by_instr: HashMap::new(),
                     field_index_specializations: HashMap::new(),
                     field_index_specializations_by_instr: HashMap::new(),
                     opt_v3_indexed_fields_by_instr: HashMap::new(),
                     opt_v3_indexed_globals_by_instr: HashMap::new(),
-                    branch_prefer_true: HashMap::new(),
                     cold_block_labels: HashSet::new(),
                     opt_v3_exact_int_branch_artifacts: None,
                     behavior_change_indexed_stores: true,
@@ -18430,8 +17574,7 @@ def f(x):
             let soac_work_dir = fresh_test_work_dir("strict-v3-indexed-field-input");
             let module_cache_root = soac_work_dir.join("modules");
             let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
-            let (_opt_mode, _plan_mode) = set_legacy_opt_mode("apply");
-            let _plan_mode = EnvVarGuard::set(SOAC_OPT_PLAN_MODE_ENV, "v3");
+            let _opt_mode = set_opt_mode("apply");
             let owner_module = PyModule::from_code(
                 py,
                 c"
@@ -18560,10 +17703,6 @@ def read_point(point):
                 None,
             )
             .expect("strict v3 indexed-field artifact should load");
-            assert!(
-                profile.planned_evidence.is_empty(),
-                "v3 indexed fields should not synthesize legacy evidence"
-            );
             let inputs = FunctionSpecializationInputs::from_profile(&profile, &function)
                 .expect("v3 indexed-field input should resolve to codegen guards");
             assert!(
@@ -18586,7 +17725,7 @@ def read_point(point):
     }
 
     #[test]
-    fn v3_indexed_field_input_rejects_unresolvable_owner_type() {
+    fn v3_indexed_field_input_skips_unresolvable_owner_type() {
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         crate::initialize_test_python();
         Python::attach(|_| {
@@ -18624,7 +17763,6 @@ def read_point(point):
             let profile = SpecializationProfile {
                 module_name: None,
                 counter_dump_path: None,
-                planned_evidence: HashMap::new(),
                 opt_v3_emitted_direct_calls: HashMap::new(),
                 opt_v3_emitted_constructor_calls: HashMap::new(),
                 opt_v3_emitted_method_calls: HashMap::new(),
@@ -18652,15 +17790,13 @@ def read_point(point):
                 guard_miss_deopt: false,
             };
 
-            let err = match FunctionSpecializationInputs::from_profile(&profile, &function) {
-                Ok(_) => panic!("v3 indexed-field input should reject an unresolved owner type"),
-                Err(err) => err,
-            };
+            let inputs = FunctionSpecializationInputs::from_profile(&profile, &function)
+                .expect("unresolvable v3 indexed-field owner should keep local fallback");
             assert!(
-                err.contains("optimizer v3 indexed-field plan")
-                    && err.contains("missing_field_owner_module.Point")
-                    && err.contains("not loaded or cannot be resolved"),
-                "{err}"
+                !inputs
+                    .opt_v3_indexed_fields_by_instr
+                    .contains_key(&getattr_instr_id),
+                "unresolvable v3 indexed-field owner should not become codegen input"
             );
         });
     }
@@ -18680,8 +17816,7 @@ def read_point(point):
             let soac_work_dir = fresh_test_work_dir("strict-v3-indexed-field-setattr");
             let module_cache_root = soac_work_dir.join("modules");
             let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
-            let (_opt_mode, _plan_mode) = set_legacy_opt_mode("apply");
-            let _plan_mode = EnvVarGuard::set(SOAC_OPT_PLAN_MODE_ENV, "v3");
+            let _opt_mode = set_opt_mode("apply");
             let owner_module = PyModule::from_code(
                 py,
                 c"
@@ -18798,10 +17933,6 @@ def write_point(point, value):
                 None,
             )
             .expect("strict v3 indexed-field SetAttr artifact should load");
-            assert!(
-                profile.planned_evidence.is_empty(),
-                "v3 indexed SetAttr should not synthesize legacy evidence"
-            );
             let inputs = FunctionSpecializationInputs::from_profile(&profile, &function)
                 .expect("v3 indexed-field SetAttr input should resolve to codegen guards");
             assert!(
@@ -19279,216 +18410,6 @@ def write_point(point, value):
     }
 
     #[test]
-    fn specialization_profile_uses_v3_emitted_direct_calls_only_for_codegen_inputs() {
-        let caller_id = RuntimeFunctionId::from_raw_parts(0, 1);
-        let legacy_target = RuntimeFunctionId::from_raw_parts(0, 2);
-        let v3_target = RuntimeFunctionId::from_raw_parts(0, 3);
-        let source = InstrId::new(BlockLabel::from_index(0), 4);
-
-        let mut legacy_evidence = FunctionProfileEvidence::default();
-        legacy_evidence
-            .call_target_specializations
-            .insert(source, vec![legacy_target]);
-        let mut planned_evidence = HashMap::new();
-        planned_evidence.insert(caller_id, legacy_evidence);
-
-        let v3_plan = ResolvedV3DirectCallPlan {
-            source,
-            target: v3_target,
-            arg_plan: soac_lowering::passes::TypedDirectCallArgPlan {
-                sources: vec![soac_lowering::passes::TypedDirectCallArgSource::Provided(0)],
-            },
-            body: test_v3_direct_call_body(),
-            reason: "profiled direct call".to_string(),
-        };
-        let mut opt_v3_emitted_direct_calls = HashMap::new();
-        opt_v3_emitted_direct_calls
-            .insert(caller_id, HashMap::from([(source, vec![v3_plan.clone()])]));
-
-        let profile = SpecializationProfile {
-            module_name: None,
-            counter_dump_path: None,
-            planned_evidence,
-            opt_v3_emitted_direct_calls,
-            opt_v3_emitted_constructor_calls: HashMap::new(),
-            opt_v3_emitted_method_calls: HashMap::new(),
-            opt_v3_emitted_exact_list_items: HashMap::new(),
-            opt_v3_emitted_indexed_fields: HashMap::new(),
-            opt_v3_emitted_indexed_globals: HashMap::new(),
-            opt_v3_exact_int_branch_artifacts: HashMap::new(),
-            behavior_change_indexed_stores: false,
-            profiled_cold_blocks: false,
-            guard_miss_deopt: false,
-        };
-
-        assert_eq!(
-            profile
-                .call_target_specializations(caller_id)
-                .unwrap()
-                .get(&source)
-                .unwrap(),
-            &vec![legacy_target],
-            "legacy planning queries should not see v3 emitted direct-call targets"
-        );
-        assert_eq!(
-            profile
-                .codegen_opt_v3_direct_calls(caller_id)
-                .get(&source)
-                .unwrap(),
-            &vec![v3_plan],
-            "codegen direct-call inputs should consume the emitted v3 argument plan"
-        );
-        assert_eq!(
-            profile
-                .v3_direct_function_call_targets(caller_id)
-                .get(&source)
-                .unwrap(),
-            &vec![v3_target],
-            "v3 direct-call targets should stay separate from legacy call-target evidence"
-        );
-        assert!(
-            profile
-                .v3_call_emission_sources(caller_id)
-                .contains(&source),
-            "v3 direct-call emissions should mark the call source as v3-owned"
-        );
-        assert!(
-            profile
-                .v3_inline_direct_function_call_targets(caller_id)
-                .is_empty(),
-            "DirectCall body plans should stay out of the module-level inline rewrite"
-        );
-    }
-
-    #[test]
-    fn planned_precompile_inputs_require_v3_artifact_in_strict_plan_mode() {
-        let _plan_mode = EnvVarGuard::set(SOAC_OPT_PLAN_MODE_ENV, "v3");
-        let module_cache_root = fresh_test_work_dir("strict-v3-precompile-plan");
-        let module_name = "strict_v3_precompile_plan_test";
-        let source_hash = 0xabcddcba;
-        let module_name_gen = ModuleNameGen::new(0);
-        let function = with_single_test_block(
-            test_function_in_module(&module_name_gen, "target"),
-            vec![],
-            ret_term(none_expr()),
-        );
-        let function_id = function.function_id;
-        let module = test_module(module_name_gen, vec![function]);
-        let cache_identity =
-            pre_optimization_module_cache_identity(env!("SOAC_BUILD_IDENTITY"), false);
-        let planned_function = test_serialized_function_id(0, function_id);
-        let legacy_plan = OptimizationPlan {
-            source: PythonModuleCacheSource::Project,
-            module_name: module_name.to_string(),
-            source_hash,
-            cache_identity: cache_identity.clone(),
-            identity_tables: test_plan_identities(
-                module_name,
-                source_hash,
-                cache_identity.as_str(),
-                planned_function,
-                "target",
-                &[],
-            ),
-            functions: Vec::new(),
-        };
-        let legacy_path = module_optimization_plan_path(
-            module_cache_root.as_path(),
-            PythonModuleCacheSource::Project,
-            module_name,
-        )
-        .expect("legacy test optimization plan path should build");
-        write_test_optimization_plan(legacy_path.as_path(), &legacy_plan);
-        let missing_v3_path = module_optimization_plan_v3_path(
-            module_cache_root.as_path(),
-            PythonModuleCacheSource::Project,
-            module_name,
-        )
-        .expect("v3 test optimization plan path should build");
-
-        let err = match planned_optimization_inputs_for_precompile(
-            &SoacEnvConfig::from_env().expect("strict v3 test env should parse"),
-            Some(PrecompileOptimizationPlanInput {
-                path: legacy_path.as_path(),
-                v3_path: Some(missing_v3_path.as_path()),
-                source: PythonModuleCacheSource::Project,
-                cache_identity: cache_identity.as_str(),
-            }),
-            None,
-            module_name,
-            source_hash,
-            &module,
-        ) {
-            Ok(_) => panic!("strict v3 plan mode should reject legacy-only precompile inputs"),
-            Err(err) => err,
-        };
-        assert!(
-            err.contains("SOAC_OPT_PLAN_MODE=v3 requires precompile mod.optv3"),
-            "unexpected strict v3 precompile error: {err}"
-        );
-    }
-
-    #[test]
-    fn specialized_jit_exact_int_compare_guard_miss_deopts_for_replay_safe_operands() {
-        if crate::run_test_in_isolated_process_if_needed(
-            module_path!(),
-            "specialized_jit_exact_int_compare_guard_miss_deopts_for_replay_safe_operands",
-        ) {
-            return;
-        }
-        let blocks = [1usize as ObjPtr];
-        let mut function = test_function();
-        function.params = ParamSpec {
-            params: vec![
-                Param {
-                    name: "a".into(),
-                    kind: ParamKind::Any,
-                    has_default: false,
-                },
-                Param {
-                    name: "b".into(),
-                    kind: ParamKind::Any,
-                    has_default: false,
-                },
-            ],
-        };
-        let block_label = function.name_gen.next_block_name();
-        let instr_id = InstrId::new(block_label, 0);
-        function.blocks = vec![CodegenBlock {
-            label: block_label,
-            body: vec![],
-            term: ret_term(with_instr_id(
-                op_expr(BinOp::new(
-                    BinOpKind::Lt,
-                    name_expr(test_name("a")),
-                    name_expr(test_local_name("b", 1)),
-                )),
-                instr_id,
-            )),
-            params: vec![],
-            exc_edge: None,
-        }];
-        set_stack_slots(&mut function, &["a", "b"]);
-        let (_jit_module, built) = build_test_jit_function_with_operator_specializations(
-            &function,
-            &blocks,
-            Vec::new(),
-            &[(
-                instr_id,
-                soac_opt::operator_specialization::pack_binary_shape(
-                    soac_opt::operator_specialization::ExactTypeTag::Int,
-                    soac_opt::operator_specialization::ExactTypeTag::Int,
-                ),
-            )],
-        );
-        assert_guard_miss_deopts_without_local_fallback(
-            &built,
-            &["PyObject_RichCompare"],
-            "exact-int comparison",
-        );
-    }
-
-    #[test]
     fn exact_int_compare_guard_miss_deopt_resumes_generic_compare_runtime() {
         if crate::run_test_in_isolated_process_if_needed(
             module_path!(),
@@ -19507,7 +18428,7 @@ def write_point(point, value):
                 globals_obj: ObjPtr,
             }
 
-            let (_opt_mode, _plan_mode) = set_legacy_opt_mode("apply");
+            let _opt_mode = set_opt_mode("apply");
             let soac_work_dir = fresh_test_work_dir("exact-int-compare-deopt-runtime");
             let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
             let mut function = test_function();
@@ -19702,7 +18623,7 @@ def write_point(point, value):
                 globals_obj: ObjPtr,
             }
 
-            let (_opt_mode, _plan_mode) = set_legacy_opt_mode("apply");
+            let _opt_mode = set_opt_mode("apply");
             let soac_work_dir = fresh_test_work_dir("exact-int-if-compare-deopt-runtime");
             let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
             let mut constants = TestConstantPool::default();
@@ -19907,141 +18828,6 @@ def write_point(point, value):
     }
 
     #[test]
-    fn specialized_jit_exact_int_unary_uses_operator_fast_path() {
-        if crate::run_test_in_isolated_process_if_needed(
-            module_path!(),
-            "specialized_jit_exact_int_unary_uses_operator_fast_path",
-        ) {
-            return;
-        }
-        let blocks = [1usize as ObjPtr];
-        let mut function = test_function();
-        function.params = ParamSpec {
-            params: vec![Param {
-                name: "value".into(),
-                kind: ParamKind::Any,
-                has_default: false,
-            }],
-        };
-        let block_label = function.name_gen.next_block_name();
-        let instr_id = InstrId::new(block_label, 0);
-        let block = CodegenBlock {
-            label: block_label,
-            body: vec![],
-            term: ret_term(with_instr_id(
-                op_expr(soac_core::block_py::UnaryOp::new(
-                    soac_core::block_py::UnaryOpKind::Neg,
-                    name_expr(test_name("value")),
-                )),
-                instr_id,
-            )),
-            params: vec![],
-            exc_edge: None,
-        };
-        function.blocks = vec![block];
-        set_stack_slots(&mut function, &["value"]);
-        let baseline_module = test_module(ModuleNameGen::new(0), vec![function.clone()]);
-        let baseline_function = baseline_module.callable_defs[0].clone();
-        let baseline_module_constants =
-            crate::module_constants::ModuleCodegenConstants::collect_from_module(&baseline_module);
-        let baseline_built = build_test_jit_function_with_constants(
-            &baseline_module,
-            &baseline_function,
-            &blocks,
-            &baseline_module_constants,
-        );
-        let baseline_symbolic_globals = count_symbolic_global_values(&baseline_built.ctx.func);
-        let (_jit_module, built) = build_test_jit_function_with_operator_specializations(
-            &function,
-            &blocks,
-            Vec::new(),
-            &[(
-                instr_id,
-                soac_opt::operator_specialization::pack_unary_shape(
-                    soac_opt::operator_specialization::ExactTypeTag::Int,
-                ),
-            )],
-        );
-        let helper_names = import_user_names_for_symbols(&built, &["dp_jit_exact_long_unary_op"]);
-        assert_eq!(
-            count_direct_calls_to_runtime_helpers(&built.ctx.func, &helper_names),
-            1,
-            "exact-int unary specialization should call the direct helper",
-        );
-        assert!(
-            function_contains_iconst_imm(
-                &built.ctx.func,
-                soac_opt::operator_specialization::pack_unary_shape(
-                    soac_opt::operator_specialization::ExactTypeTag::Int,
-                ) as i64,
-            ),
-            "exact-int unary specialization should guard on the profiled exact-int shape",
-        );
-        assert!(
-            !function_contains_iconst_imm(
-                &built.ctx.func,
-                std::ptr::addr_of_mut!(PyLong_Type) as i64
-            ),
-            "exact-int unary specialization should not bake the PyLong type pointer into the function body",
-        );
-        assert!(
-            count_symbolic_global_values(&built.ctx.func) > baseline_symbolic_globals,
-            "exact-int unary specialization should add a symbolic global for the profiled type guard",
-        );
-    }
-
-    #[test]
-    fn specialized_jit_exact_int_unary_guard_miss_deopts_for_replay_safe_operand() {
-        if crate::run_test_in_isolated_process_if_needed(
-            module_path!(),
-            "specialized_jit_exact_int_unary_guard_miss_deopts_for_replay_safe_operand",
-        ) {
-            return;
-        }
-        let blocks = [1usize as ObjPtr];
-        let mut function = test_function();
-        function.params = ParamSpec {
-            params: vec![Param {
-                name: "value".into(),
-                kind: ParamKind::Any,
-                has_default: false,
-            }],
-        };
-        let block_label = function.name_gen.next_block_name();
-        let instr_id = InstrId::new(block_label, 0);
-        function.blocks = vec![CodegenBlock {
-            label: block_label,
-            body: vec![],
-            term: ret_term(with_instr_id(
-                op_expr(UnaryOp::new(
-                    UnaryOpKind::Neg,
-                    name_expr(test_name("value")),
-                )),
-                instr_id,
-            )),
-            params: vec![],
-            exc_edge: None,
-        }];
-        set_stack_slots(&mut function, &["value"]);
-        let (_jit_module, built) = build_test_jit_function_with_operator_specializations(
-            &function,
-            &blocks,
-            Vec::new(),
-            &[(
-                instr_id,
-                soac_opt::operator_specialization::pack_unary_shape(
-                    soac_opt::operator_specialization::ExactTypeTag::Int,
-                ),
-            )],
-        );
-        assert_guard_miss_deopts_without_local_fallback(
-            &built,
-            &["PyNumber_Negative"],
-            "exact-int unary op",
-        );
-    }
-
-    #[test]
     fn exact_int_unary_guard_miss_deopt_resumes_generic_unary_runtime() {
         if crate::run_test_in_isolated_process_if_needed(
             module_path!(),
@@ -20060,7 +18846,7 @@ def write_point(point, value):
                 globals_obj: ObjPtr,
             }
 
-            let (_opt_mode, _plan_mode) = set_legacy_opt_mode("apply");
+            let _opt_mode = set_opt_mode("apply");
             let soac_work_dir = fresh_test_work_dir("exact-int-unary-deopt-runtime");
             let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
             let mut function = test_function();
@@ -20221,48 +19007,6 @@ def write_point(point, value):
             ffi::Py_DECREF(value);
             ffi::Py_DECREF(globals);
         });
-    }
-
-    #[test]
-    fn apply_mode_operator_specialization_omits_top_value_counter_helper_imports() {
-        let blocks = [1usize as ObjPtr];
-        let mut constants = TestConstantPool::default();
-        let mut function = test_function();
-        let block_label = function.name_gen.next_block_name();
-        let instr_id = InstrId::new(block_label, 0);
-        function.blocks = vec![CodegenBlock {
-            label: block_label,
-            body: vec![],
-            term: ret_term(with_instr_id(
-                op_expr(BinOp::new(
-                    BinOpKind::Add,
-                    constants.int_expr(1),
-                    constants.int_expr(2),
-                )),
-                instr_id,
-            )),
-            params: vec![],
-            exc_edge: None,
-        }];
-
-        let (_jit_module, built) = build_test_jit_function_with_operator_specializations(
-            &function,
-            &blocks,
-            constants.module_constants,
-            &[(
-                instr_id,
-                soac_opt::operator_specialization::pack_binary_shape(
-                    soac_opt::operator_specialization::ExactTypeTag::Int,
-                    soac_opt::operator_specialization::ExactTypeTag::Int,
-                ),
-            )],
-        );
-        let imported_symbols = imported_symbol_names(&built);
-        assert!(
-            !imported_symbols.contains(&DP_JIT_RECORD_TOP_VALUE_SAMPLE_IMPORT.symbol),
-            "apply-mode specialization should not import top-value counter helpers: {:?}",
-            imported_symbols
-        );
     }
 
     #[test]
@@ -20631,7 +19375,7 @@ def f(x, y):
         let old_soac_work_dir = std::env::var_os("SOAC_WORK_DIR");
         let old_soac_opt_mode = std::env::var_os("SOAC_OPT_MODE");
         let soac_work_dir = fresh_test_work_dir("test-work");
-        let _plan_mode = set_legacy_optimization_plan_mode();
+
         unsafe {
             std::env::set_var("SOAC_WORK_DIR", &soac_work_dir);
             std::env::set_var("SOAC_OPT_MODE", "verify");
@@ -20685,641 +19429,6 @@ def f(x, y):
     }
 
     #[test]
-    fn precompile_profile_loads_module_optimization_plan_by_function_id() {
-        let module_cache_root = fresh_test_work_dir("planned-precompile-modules");
-        let module_name = "planned_precompile_profile_test";
-        let source_hash = 0xabcdef01;
-        let module_name_gen = ModuleNameGen::new(37);
-        let callee = with_single_test_block(
-            test_function_in_module(&module_name_gen, "callee"),
-            vec![],
-            ret_term(none_expr()),
-        );
-        let caller = with_single_test_block(
-            test_function_in_module(&module_name_gen, "caller"),
-            vec![],
-            ret_term(none_expr()),
-        );
-        let callee_function_id = callee.function_id;
-        let caller_function_id = caller.function_id;
-        let module = test_module(module_name_gen, vec![callee, caller]);
-        let instr_id = InstrId::new(BlockLabel::from_index(0), 0);
-        let planned_target = test_planned_function_target(0, callee_function_id);
-        let cache_identity = pre_optimization_module_cache_identity(
-            env!("SOAC_BUILD_IDENTITY"),
-            module_name == "soac.runtime",
-        );
-        let planned_caller_function = test_serialized_function_id(0, caller_function_id);
-        let plan = OptimizationPlan {
-            source: PythonModuleCacheSource::Project,
-            module_name: module_name.to_string(),
-            source_hash,
-            cache_identity: cache_identity.clone(),
-            identity_tables: test_plan_identities(
-                module_name,
-                source_hash,
-                cache_identity.as_str(),
-                planned_caller_function,
-                "caller",
-                &[],
-            ),
-            functions: vec![FunctionOptimizationPlan {
-                function: planned_caller_function,
-                decisions: vec![OptimizationDecision {
-                    instr_id,
-                    replacement: PlannedReplacement::Guarded {
-                        alternatives: vec![PlannedAlternative {
-                            guards: vec![PlannedGuard::FunctionTarget {
-                                target: planned_target.clone(),
-                            }],
-                            action: PlannedAction::DirectCall {
-                                target: planned_target,
-                            },
-                        }],
-                        fallback: PlannedFallback::OriginalInstruction,
-                    },
-                }],
-            }],
-        };
-        let plan_path = module_optimization_plan_path(
-            module_cache_root.as_path(),
-            PythonModuleCacheSource::Project,
-            module_name,
-        )
-        .expect("test optimization plan path should build");
-        write_test_optimization_plan(plan_path.as_path(), &plan);
-
-        let inputs = planned_optimization_inputs_for_precompile(
-            &legacy_plan_env_config(),
-            Some(PrecompileOptimizationPlanInput {
-                path: plan_path.as_path(),
-                v3_path: None,
-                source: PythonModuleCacheSource::Project,
-                cache_identity: cache_identity.as_str(),
-            }),
-            None,
-            module_name,
-            source_hash,
-            &module,
-        )
-        .expect("precompile should load planned same-module evidence");
-        assert_eq!(
-            inputs
-                .evidence_by_function
-                .get(&caller_function_id)
-                .and_then(|evidence| evidence.call_target_specializations.get(&instr_id)),
-            Some(&vec![callee_function_id]),
-            "precompile plan loading should remap planned function ids onto the cached module ids"
-        );
-    }
-
-    #[test]
-    fn precompile_profile_resolves_cross_module_plan_targets_by_function_id() {
-        let module_cache_root = fresh_test_work_dir("planned-precompile-cross-module");
-        let caller_module_name = "planned_precompile_cross_module_caller";
-        let callee_module_name = "planned_precompile_cross_module_callee";
-        let caller_source_hash = 0xabcdef03;
-        let callee_source_hash = 0xabcdef04;
-        let caller_module_name_gen = ModuleNameGen::new(39);
-        let callee_module_name_gen = ModuleNameGen::new(40);
-        let caller = with_single_test_block(
-            test_function_in_module(&caller_module_name_gen, "caller"),
-            vec![],
-            ret_term(none_expr()),
-        );
-        let callee = with_single_test_block(
-            test_function_in_module(&callee_module_name_gen, "callee"),
-            vec![],
-            ret_term(none_expr()),
-        );
-        let caller_function_id = caller.function_id;
-        let callee_function_id = callee.function_id;
-        let caller_module = test_module(caller_module_name_gen, vec![caller]);
-        let callee_module = test_module(callee_module_name_gen, vec![callee]);
-        let module_index = PrecompileModuleIndex::from_entries([
-            PrecompileModuleIndexEntry {
-                module_name: caller_module_name,
-                source_hash: caller_source_hash,
-                module: &caller_module,
-            },
-            PrecompileModuleIndexEntry {
-                module_name: callee_module_name,
-                source_hash: callee_source_hash,
-                module: &callee_module,
-            },
-        ])
-        .expect("precompile module index should build");
-        let instr_id = InstrId::new(BlockLabel::from_index(0), 0);
-        let planned_target = test_planned_function_target(1, callee_function_id);
-        let cache_identity = pre_optimization_module_cache_identity(
-            env!("SOAC_BUILD_IDENTITY"),
-            caller_module_name == "soac.runtime",
-        );
-        let planned_caller_function = test_serialized_function_id(0, caller_function_id);
-        let plan = OptimizationPlan {
-            source: PythonModuleCacheSource::Project,
-            module_name: caller_module_name.to_string(),
-            source_hash: caller_source_hash,
-            cache_identity: cache_identity.clone(),
-            identity_tables: test_plan_identities(
-                caller_module_name,
-                caller_source_hash,
-                cache_identity.as_str(),
-                planned_caller_function,
-                "caller",
-                &[(callee_module_name, callee_source_hash)],
-            ),
-            functions: vec![FunctionOptimizationPlan {
-                function: planned_caller_function,
-                decisions: vec![OptimizationDecision {
-                    instr_id,
-                    replacement: PlannedReplacement::Guarded {
-                        alternatives: vec![PlannedAlternative {
-                            guards: vec![PlannedGuard::FunctionTarget {
-                                target: planned_target.clone(),
-                            }],
-                            action: PlannedAction::DirectCall {
-                                target: planned_target,
-                            },
-                        }],
-                        fallback: PlannedFallback::OriginalInstruction,
-                    },
-                }],
-            }],
-        };
-        let plan_path = module_optimization_plan_path(
-            module_cache_root.as_path(),
-            PythonModuleCacheSource::Project,
-            caller_module_name,
-        )
-        .expect("test optimization plan path should build");
-        write_test_optimization_plan(plan_path.as_path(), &plan);
-
-        let inputs = planned_optimization_inputs_for_precompile(
-            &legacy_plan_env_config(),
-            Some(PrecompileOptimizationPlanInput {
-                path: plan_path.as_path(),
-                v3_path: None,
-                source: PythonModuleCacheSource::Project,
-                cache_identity: cache_identity.as_str(),
-            }),
-            Some(&module_index),
-            caller_module_name,
-            caller_source_hash,
-            &caller_module,
-        )
-        .expect("precompile should resolve indexed cross-module planned targets");
-        assert_eq!(
-            inputs
-                .evidence_by_function
-                .get(&caller_function_id)
-                .and_then(|evidence| evidence.call_target_specializations.get(&instr_id)),
-            Some(&vec![callee_function_id]),
-            "precompile plan loading should remap cross-module target ids through the module index"
-        );
-    }
-
-    #[test]
-    fn precompile_codegen_module_imports_cross_module_direct_symbol_from_plan() {
-        let module_cache_root = fresh_test_work_dir("planned-precompile-cross-module-codegen");
-        let caller_module_name = "planned_precompile_cross_module_codegen_caller";
-        let callee_module_name = "planned_precompile_cross_module_codegen_callee";
-        let caller_source_hash = 0xabcdef05;
-        let callee_source_hash = 0xabcdef06;
-        let caller_module_name_gen = ModuleNameGen::new(41);
-        let callee_module_name_gen = ModuleNameGen::new(42);
-        let callee = with_single_test_block(
-            test_function_in_module(&callee_module_name_gen, "callee"),
-            vec![],
-            ret_term(none_expr()),
-        );
-        let callee_function_id = callee.function_id;
-
-        let caller_name_gen = caller_module_name_gen.next_function_name_gen();
-        let caller_function_id = caller_name_gen.function_id();
-        let call_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
-        let mut caller = BlockPyFunction {
-            function_id: caller_function_id,
-            name_gen: caller_name_gen,
-            names: FunctionName::new("caller", "caller", "caller", "caller"),
-            kind: soac_core::block_py::FunctionKind::Function,
-            execution_mode: Default::default(),
-            params: ParamSpec {
-                params: vec![Param {
-                    name: "fn".into(),
-                    kind: ParamKind::Any,
-                    has_default: false,
-                }],
-            },
-            blocks: vec![CodegenBlock {
-                label: BlockLabel::from_index(0),
-                body: vec![],
-                term: ret_term(with_instr_id(
-                    op_expr(Call::new(
-                        name_expr(test_name("fn")),
-                        Vec::<CallArgPositional<InstrCodegen>>::new(),
-                        Vec::<CallArgKeyword<InstrCodegen>>::new(),
-                    )),
-                    call_instr_id,
-                )),
-                params: vec![],
-                exc_edge: None,
-            }],
-            doc: None,
-            storage_layout: None,
-            scope: Default::default(),
-        };
-        set_stack_slots(&mut caller, &["fn"]);
-
-        let caller_module = test_module(caller_module_name_gen, vec![caller]);
-        let callee_module = test_module(callee_module_name_gen, vec![callee.clone()]);
-        let module_index = PrecompileModuleIndex::from_entries([
-            PrecompileModuleIndexEntry {
-                module_name: caller_module_name,
-                source_hash: caller_source_hash,
-                module: &caller_module,
-            },
-            PrecompileModuleIndexEntry {
-                module_name: callee_module_name,
-                source_hash: callee_source_hash,
-                module: &callee_module,
-            },
-        ])
-        .expect("precompile module index should build");
-        let planned_target = test_planned_function_target(1, callee_function_id);
-        let cache_identity = pre_optimization_module_cache_identity(
-            env!("SOAC_BUILD_IDENTITY"),
-            caller_module_name == "soac.runtime",
-        );
-        let planned_caller_function = test_serialized_function_id(0, caller_function_id);
-        let plan = OptimizationPlan {
-            source: PythonModuleCacheSource::Project,
-            module_name: caller_module_name.to_string(),
-            source_hash: caller_source_hash,
-            cache_identity: cache_identity.clone(),
-            identity_tables: test_plan_identities(
-                caller_module_name,
-                caller_source_hash,
-                cache_identity.as_str(),
-                planned_caller_function,
-                "caller",
-                &[(callee_module_name, callee_source_hash)],
-            ),
-            functions: vec![FunctionOptimizationPlan {
-                function: planned_caller_function,
-                decisions: vec![OptimizationDecision {
-                    instr_id: call_instr_id,
-                    replacement: PlannedReplacement::Guarded {
-                        alternatives: vec![PlannedAlternative {
-                            guards: vec![PlannedGuard::FunctionTarget {
-                                target: planned_target.clone(),
-                            }],
-                            action: PlannedAction::DirectCall {
-                                target: planned_target,
-                            },
-                        }],
-                        fallback: PlannedFallback::OriginalInstruction,
-                    },
-                }],
-            }],
-        };
-        let plan_path = module_optimization_plan_path(
-            module_cache_root.as_path(),
-            PythonModuleCacheSource::Project,
-            caller_module_name,
-        )
-        .expect("test optimization plan path should build");
-        write_test_optimization_plan(plan_path.as_path(), &plan);
-
-        let _plan_mode = set_legacy_optimization_plan_mode();
-        let object = precompile_codegen_module_to_object_bytes(
-            caller_module_name,
-            caller_source_hash,
-            &caller_module,
-            None,
-            Some(PrecompileOptimizationPlanInput {
-                path: plan_path.as_path(),
-                v3_path: None,
-                source: PythonModuleCacheSource::Project,
-                cache_identity: cache_identity.as_str(),
-            }),
-            Some(&module_index),
-        )
-        .expect("precompile should emit an object that imports the cross-module target");
-        let callee_persistent_id = persistent_function_id_for_module_function(
-            callee_module_name,
-            callee_source_hash,
-            callee_function_id.local_function_id(),
-        );
-        let callee_scope =
-            precompiled_direct_function_symbol_scope_for_persistent(&callee_persistent_id);
-        let callee_symbol = direct_function_symbol(&callee, Some(callee_scope.as_str()));
-        assert!(
-            object
-                .object
-                .windows(callee_symbol.len())
-                .any(|window| window == callee_symbol.as_bytes()),
-            "precompiled caller object should reference the callee direct-entry symbol {callee_symbol}"
-        );
-    }
-
-    #[test]
-    fn precompile_plan_skips_unresolved_cross_module_targets_without_shadowing_counters() {
-        let module_cache_root = fresh_test_work_dir("planned-precompile-cross-module-skip");
-        let module_name = "planned_precompile_cross_module_caller";
-        let source_hash = 0xabcdef02;
-        let module_name_gen = ModuleNameGen::new(38);
-        let caller = with_single_test_block(
-            test_function_in_module(&module_name_gen, "caller"),
-            vec![],
-            ret_term(none_expr()),
-        );
-        let caller_function_id = caller.function_id;
-        let module = test_module(module_name_gen, vec![caller]);
-        let instr_id = InstrId::new(BlockLabel::from_index(0), 0);
-        let planned_target = PlannedFunctionTarget::new(SerializedFunctionId::new(
-            SerializedModuleId::new(1),
-            LocalFunctionId::new(7),
-        ));
-        let cache_identity = pre_optimization_module_cache_identity(
-            env!("SOAC_BUILD_IDENTITY"),
-            module_name == "soac.runtime",
-        );
-        let planned_caller_function = test_serialized_function_id(0, caller_function_id);
-        let plan = OptimizationPlan {
-            source: PythonModuleCacheSource::Project,
-            module_name: module_name.to_string(),
-            source_hash,
-            cache_identity: cache_identity.clone(),
-            identity_tables: test_plan_identities(
-                module_name,
-                source_hash,
-                cache_identity.as_str(),
-                planned_caller_function,
-                "caller",
-                &[("planned_precompile_cross_module_callee", 0xdecafbad)],
-            ),
-            functions: vec![FunctionOptimizationPlan {
-                function: planned_caller_function,
-                decisions: vec![OptimizationDecision {
-                    instr_id,
-                    replacement: PlannedReplacement::Guarded {
-                        alternatives: vec![PlannedAlternative {
-                            guards: vec![PlannedGuard::FunctionTarget {
-                                target: planned_target.clone(),
-                            }],
-                            action: PlannedAction::DirectCall {
-                                target: planned_target,
-                            },
-                        }],
-                        fallback: PlannedFallback::OriginalInstruction,
-                    },
-                }],
-            }],
-        };
-        let plan_path = module_optimization_plan_path(
-            module_cache_root.as_path(),
-            PythonModuleCacheSource::Project,
-            module_name,
-        )
-        .expect("test optimization plan path should build");
-        write_test_optimization_plan(plan_path.as_path(), &plan);
-
-        let inputs = planned_optimization_inputs_for_precompile(
-            &legacy_plan_env_config(),
-            Some(PrecompileOptimizationPlanInput {
-                path: plan_path.as_path(),
-                v3_path: None,
-                source: PythonModuleCacheSource::Project,
-                cache_identity: cache_identity.as_str(),
-            }),
-            None,
-            module_name,
-            source_hash,
-            &module,
-        )
-        .expect("precompile should ignore unresolved cross-module planned targets");
-        assert!(
-            !inputs
-                .evidence_by_function
-                .contains_key(&caller_function_id),
-            "an unresolved precompile-only plan should not shadow counter fallback for the function"
-        );
-    }
-
-    #[test]
-    fn specialization_profile_loads_module_optimization_plan() {
-        if crate::run_test_in_isolated_process_if_needed(
-            module_path!(),
-            "specialization_profile_loads_module_optimization_plan",
-        ) {
-            return;
-        }
-        let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        crate::initialize_test_python();
-        Python::attach(|py| {
-            let soac_work_dir = fresh_test_work_dir("planned-specialization-modules");
-            let module_cache_root = soac_work_dir.join("modules");
-            let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
-            let (_opt_mode, _plan_mode) = set_legacy_opt_mode("verify");
-            let module_name = "planned_specialization_profile_test";
-            let module_name_gen = ModuleNameGen::new(0);
-            let callee = with_single_test_block(
-                test_function_in_module(&module_name_gen, "callee"),
-                vec![],
-                ret_term(none_expr()),
-            );
-            let caller = with_single_test_block(
-                test_function_in_module(&module_name_gen, "caller"),
-                vec![],
-                ret_term(none_expr()),
-            );
-            let callee_function_id = callee.function_id;
-            let caller_function_id = caller.function_id;
-            let instr_id = InstrId::new(BlockLabel::from_index(0), 0);
-            let module = test_module(module_name_gen, vec![callee, caller]);
-            let shared_state =
-                crate::module_type::build_shared_state_for_testing(py, module, module_name, "")
-                    .expect("shared state should build");
-            let planned_callee_target = test_planned_function_target(0, callee_function_id);
-            let cache_identity = pre_optimization_module_cache_identity(
-                env!("SOAC_BUILD_IDENTITY"),
-                shared_state.module_name == "soac.runtime",
-            );
-            let planned_caller_function = test_serialized_function_id(0, caller_function_id);
-            let plan = OptimizationPlan {
-                source: PythonModuleCacheSource::Project,
-                module_name: module_name.to_string(),
-                source_hash: shared_state.source_hash,
-                cache_identity: cache_identity.clone(),
-                identity_tables: test_plan_identities(
-                    module_name,
-                    shared_state.source_hash,
-                    cache_identity.as_str(),
-                    planned_caller_function,
-                    "callee",
-                    &[],
-                ),
-                functions: vec![FunctionOptimizationPlan {
-                    function: planned_caller_function,
-                    // Runtime plan loading must use the module-local function id,
-                    // not qualname, so duplicate function names remain distinct.
-                    decisions: vec![
-                        OptimizationDecision {
-                            instr_id,
-                            replacement: PlannedReplacement::Guarded {
-                                alternatives: vec![PlannedAlternative {
-                                    guards: vec![PlannedGuard::FunctionTarget {
-                                        target: planned_callee_target.clone(),
-                                    }],
-                                    action: PlannedAction::DirectCall {
-                                        target: planned_callee_target.clone(),
-                                    },
-                                }],
-                                fallback: PlannedFallback::OriginalInstruction,
-                            },
-                        },
-                        OptimizationDecision {
-                            instr_id,
-                            replacement: PlannedReplacement::Guarded {
-                                alternatives: vec![PlannedAlternative {
-                                    guards: vec![PlannedGuard::ObservedShape {
-                                        family: ShapeFamily::Operator,
-                                        shape: 257,
-                                    }],
-                                    action: PlannedAction::SpecializedShape {
-                                        family: ShapeFamily::Operator,
-                                        shape: 257,
-                                    },
-                                }],
-                                fallback: PlannedFallback::OriginalInstruction,
-                            },
-                        },
-                        OptimizationDecision {
-                            instr_id,
-                            replacement: PlannedReplacement::BranchPreference {
-                                prefer_true: false,
-                            },
-                        },
-                    ],
-                }],
-            };
-            let plan_path = module_optimization_plan_path(
-                module_cache_root.as_path(),
-                PythonModuleCacheSource::Project,
-                module_name,
-            )
-            .expect("test optimization plan path should build");
-            write_test_optimization_plan(plan_path.as_path(), &plan);
-
-            let profile = SpecializationProfile::from_runtime_state_with_session(
-                Some(shared_state.as_ref()),
-                None,
-            )
-            .expect("specialization profile should load planned evidence");
-            assert!(
-                profile.has_specialization_inputs(),
-                "mod.opt should count as specialization input even without a counter dump"
-            );
-            assert!(
-                !profile.has_existing_counter_dump(),
-                "test should prove the profile is not relying on a profile.bin fallback"
-            );
-            assert_eq!(
-                profile
-                    .call_target_specializations(caller_function_id)
-                    .unwrap()
-                    .get(&instr_id),
-                Some(&vec![callee_function_id])
-            );
-            assert_eq!(
-                profile
-                    .operator_specializations(caller_function_id)
-                    .unwrap()
-                    .get(&instr_id),
-                Some(&vec![257])
-            );
-            assert_eq!(
-                profile
-                    .branch_preferences(caller_function_id)
-                    .unwrap()
-                    .get(&instr_id),
-                Some(&false)
-            );
-        });
-    }
-
-    #[test]
-    fn specialization_profile_v3_plan_mode_rejects_legacy_plan_fallback() {
-        if crate::run_test_in_isolated_process_if_needed(
-            module_path!(),
-            "specialization_profile_v3_plan_mode_rejects_legacy_plan_fallback",
-        ) {
-            return;
-        }
-        let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        crate::initialize_test_python();
-        Python::attach(|py| {
-            let soac_work_dir = fresh_test_work_dir("strict-v3-runtime-legacy-plan");
-            let module_cache_root = soac_work_dir.join("modules");
-            let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
-            let (_opt_mode, _plan_mode) = set_legacy_opt_mode("verify");
-            let _plan_mode = EnvVarGuard::set(SOAC_OPT_PLAN_MODE_ENV, "v3");
-            let module_name = "strict_v3_runtime_legacy_plan_test";
-            let module_name_gen = ModuleNameGen::new(0);
-            let function = with_single_test_block(
-                test_function_in_module(&module_name_gen, "target"),
-                vec![],
-                ret_term(none_expr()),
-            );
-            let function_id = function.function_id;
-            let module = test_module(module_name_gen, vec![function]);
-            let shared_state =
-                crate::module_type::build_shared_state_for_testing(py, module, module_name, "")
-                    .expect("shared state should build");
-            let cache_identity = pre_optimization_module_cache_identity(
-                env!("SOAC_BUILD_IDENTITY"),
-                shared_state.module_name == "soac.runtime",
-            );
-            let planned_function = test_serialized_function_id(0, function_id);
-            let legacy_plan = OptimizationPlan {
-                source: PythonModuleCacheSource::Project,
-                module_name: module_name.to_string(),
-                source_hash: shared_state.source_hash,
-                cache_identity: cache_identity.clone(),
-                identity_tables: test_plan_identities(
-                    module_name,
-                    shared_state.source_hash,
-                    cache_identity.as_str(),
-                    planned_function,
-                    "target",
-                    &[],
-                ),
-                functions: Vec::new(),
-            };
-            let legacy_path = module_optimization_plan_path(
-                module_cache_root.as_path(),
-                PythonModuleCacheSource::Project,
-                module_name,
-            )
-            .expect("legacy test optimization plan path should build");
-            write_test_optimization_plan(legacy_path.as_path(), &legacy_plan);
-
-            let err = match SpecializationProfile::from_runtime_state_with_session(
-                Some(shared_state.as_ref()),
-                None,
-            ) {
-                Ok(_) => panic!("strict v3 plan mode should reject a legacy-only runtime plan"),
-                Err(err) => err,
-            };
-            assert!(
-                err.contains("SOAC_OPT_PLAN_MODE=v3 requires mod.optv3"),
-                "unexpected strict v3 runtime error: {err}"
-            );
-        });
-    }
-
-    #[test]
     fn specialization_profile_loads_serialized_v3_artifact_in_strict_plan_mode() {
         if crate::run_test_in_isolated_process_if_needed(
             module_path!(),
@@ -21333,8 +19442,7 @@ def f(x, y):
             let soac_work_dir = fresh_test_work_dir("strict-v3-runtime-v3-plan");
             let module_cache_root = soac_work_dir.join("modules");
             let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
-            let (_opt_mode, _plan_mode) = set_legacy_opt_mode("verify");
-            let _plan_mode = EnvVarGuard::set(SOAC_OPT_PLAN_MODE_ENV, "v3");
+            let _opt_mode = set_opt_mode("verify");
             let module_name = "strict_v3_runtime_v3_plan_test";
             let module_name_gen = ModuleNameGen::new(0);
             let function = with_single_test_block(
@@ -21382,10 +19490,6 @@ def f(x, y):
                 !profile.has_existing_counter_dump(),
                 "test should prove the profile is not relying on a profile.bin fallback"
             );
-            assert!(
-                profile.planned_evidence.is_empty(),
-                "strict v3 artifact loading should not synthesize legacy planned evidence"
-            );
             let function_artifacts = profile
                 .opt_v3_exact_int_branch_artifacts
                 .get(&function_id)
@@ -21398,312 +19502,6 @@ def f(x, y):
                     .function
                     .local_function_id(),
                 function_id.local_function_id()
-            );
-        });
-    }
-
-    #[test]
-    fn specialization_profile_resolves_cross_module_plan_targets_by_function_id() {
-        if crate::run_test_in_isolated_process_if_needed(
-            module_path!(),
-            "specialization_profile_resolves_cross_module_plan_targets_by_function_id",
-        ) {
-            return;
-        }
-        let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        crate::initialize_test_python();
-        Python::attach(|py| {
-            let soac_work_dir = fresh_test_work_dir("planned-cross-module-specializations");
-            let module_cache_root = soac_work_dir.join("modules");
-            let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
-            let (_opt_mode, _plan_mode) = set_legacy_opt_mode("verify");
-            let session = std::sync::Arc::new(crate::session::CompileSession::new());
-            let caller_module_name = "planned_cross_module_caller_test";
-            let callee_module_name = "planned_cross_module_callee_test";
-            let caller_module_name_gen = ModuleNameGen::new(101);
-            let callee_module_name_gen = ModuleNameGen::new(102);
-            let caller = with_single_test_block(
-                test_function_in_module(&caller_module_name_gen, "duplicate"),
-                vec![],
-                ret_term(none_expr()),
-            );
-            let callee = with_single_test_block(
-                test_function_in_module(&callee_module_name_gen, "duplicate"),
-                vec![],
-                ret_term(none_expr()),
-            );
-            let caller_function_id = caller.function_id;
-            let callee_function_id = callee.function_id;
-            let caller_state = crate::module_type::build_shared_state_for_testing(
-                py,
-                test_module(caller_module_name_gen, vec![caller]),
-                caller_module_name,
-                "",
-            )
-            .expect("caller shared state should build");
-            let callee_state = crate::module_type::build_shared_state_for_testing(
-                py,
-                test_module(callee_module_name_gen, vec![callee]),
-                callee_module_name,
-                "",
-            )
-            .expect("callee shared state should build");
-            session
-                .retain_shared_module_state(std::sync::Arc::clone(&caller_state))
-                .expect("caller state should be retained");
-            session
-                .retain_shared_module_state(std::sync::Arc::clone(&callee_state))
-                .expect("callee state should be retained");
-            let instr_id = InstrId::new(BlockLabel::from_index(0), 0);
-            let planned_callee_target = test_planned_function_target(1, callee_function_id);
-            let planned_caller_function = test_serialized_function_id(0, caller_function_id);
-            let cache_identity = pre_optimization_module_cache_identity(
-                env!("SOAC_BUILD_IDENTITY"),
-                caller_state.module_name == "soac.runtime",
-            );
-            let plan = OptimizationPlan {
-                source: PythonModuleCacheSource::Project,
-                module_name: caller_module_name.to_string(),
-                source_hash: caller_state.source_hash,
-                cache_identity: cache_identity.clone(),
-                identity_tables: test_plan_identities(
-                    caller_module_name,
-                    caller_state.source_hash,
-                    cache_identity.as_str(),
-                    planned_caller_function,
-                    "duplicate",
-                    &[(callee_module_name, callee_state.source_hash)],
-                ),
-                functions: vec![FunctionOptimizationPlan {
-                    function: planned_caller_function,
-                    decisions: vec![OptimizationDecision {
-                        instr_id,
-                        replacement: PlannedReplacement::Guarded {
-                            alternatives: vec![PlannedAlternative {
-                                guards: vec![PlannedGuard::FunctionTarget {
-                                    target: planned_callee_target.clone(),
-                                }],
-                                action: PlannedAction::DirectCall {
-                                    target: planned_callee_target,
-                                },
-                            }],
-                            fallback: PlannedFallback::OriginalInstruction,
-                        },
-                    }],
-                }],
-            };
-            let plan_path = module_optimization_plan_path(
-                module_cache_root.as_path(),
-                PythonModuleCacheSource::Project,
-                caller_module_name,
-            )
-            .expect("test optimization plan path should build");
-            write_test_optimization_plan(plan_path.as_path(), &plan);
-
-            let profile = SpecializationProfile::from_runtime_state_with_session(
-                Some(caller_state.as_ref()),
-                Some(session.as_ref()),
-            )
-            .expect("specialization profile should load planned evidence");
-            assert_eq!(
-                profile
-                    .call_target_specializations(caller_function_id)
-                    .unwrap()
-                    .get(&instr_id),
-                Some(&vec![callee_function_id])
-            );
-        });
-    }
-
-    #[test]
-    fn specialized_jit_uses_cross_module_direct_call_from_optimization_plan() {
-        if crate::run_test_in_isolated_process_if_needed(
-            module_path!(),
-            "specialized_jit_uses_cross_module_direct_call_from_optimization_plan",
-        ) {
-            return;
-        }
-        let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        crate::initialize_test_python();
-        Python::attach(|py| {
-            let soac_work_dir = fresh_test_work_dir("planned-cross-module-direct-codegen");
-            let module_cache_root = soac_work_dir.join("modules");
-            let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
-            let (_opt_mode, _plan_mode) = set_legacy_opt_mode("verify");
-            let session = std::sync::Arc::new(crate::session::CompileSession::new());
-            let caller_module_name = "planned_cross_module_direct_codegen_caller_test";
-            let callee_module_name = "planned_cross_module_direct_codegen_callee_test";
-            let caller_module_name_gen = ModuleNameGen::new(103);
-            let callee_module_name_gen = ModuleNameGen::new(104);
-            let callee = with_single_test_block(
-                test_function_in_module(&callee_module_name_gen, "callee"),
-                vec![],
-                ret_term(none_expr()),
-            );
-            let callee_function_id = callee.function_id;
-
-            let caller_name_gen = caller_module_name_gen.next_function_name_gen();
-            let caller_function_id = caller_name_gen.function_id();
-            let call_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
-            let mut caller = BlockPyFunction {
-                function_id: caller_function_id,
-                name_gen: caller_name_gen,
-                names: FunctionName::new("caller", "caller", "caller", "caller"),
-                kind: soac_core::block_py::FunctionKind::Function,
-                execution_mode: Default::default(),
-                params: ParamSpec {
-                    params: vec![Param {
-                        name: "fn".into(),
-                        kind: ParamKind::Any,
-                        has_default: false,
-                    }],
-                },
-                blocks: vec![CodegenBlock {
-                    label: BlockLabel::from_index(0),
-                    body: vec![],
-                    term: ret_term(with_instr_id(
-                        op_expr(Call::new(
-                            name_expr(test_name("fn")),
-                            Vec::<CallArgPositional<InstrCodegen>>::new(),
-                            Vec::<CallArgKeyword<InstrCodegen>>::new(),
-                        )),
-                        call_instr_id,
-                    )),
-                    params: vec![],
-                    exc_edge: None,
-                }],
-                doc: None,
-                storage_layout: None,
-                scope: Default::default(),
-            };
-            set_stack_slots(&mut caller, &["fn"]);
-
-            let caller_state = crate::module_type::build_shared_state_for_testing(
-                py,
-                test_module(caller_module_name_gen, vec![caller]),
-                caller_module_name,
-                "",
-            )
-            .expect("caller shared state should build");
-            let callee_state = crate::module_type::build_shared_state_for_testing(
-                py,
-                test_module(callee_module_name_gen, vec![callee]),
-                callee_module_name,
-                "",
-            )
-            .expect("callee shared state should build");
-            session
-                .retain_shared_module_state(std::sync::Arc::clone(&caller_state))
-                .expect("caller state should be retained");
-            session
-                .retain_shared_module_state(std::sync::Arc::clone(&callee_state))
-                .expect("callee state should be retained");
-
-            let planned_callee_target = test_planned_function_target(1, callee_function_id);
-            let planned_caller_function = test_serialized_function_id(0, caller_function_id);
-            let cache_identity = pre_optimization_module_cache_identity(
-                env!("SOAC_BUILD_IDENTITY"),
-                caller_state.module_name == "soac.runtime",
-            );
-            let plan = OptimizationPlan {
-                source: PythonModuleCacheSource::Project,
-                module_name: caller_module_name.to_string(),
-                source_hash: caller_state.source_hash,
-                cache_identity: cache_identity.clone(),
-                identity_tables: test_plan_identities(
-                    caller_module_name,
-                    caller_state.source_hash,
-                    cache_identity.as_str(),
-                    planned_caller_function,
-                    "caller",
-                    &[(callee_module_name, callee_state.source_hash)],
-                ),
-                functions: vec![FunctionOptimizationPlan {
-                    function: planned_caller_function,
-                    decisions: vec![OptimizationDecision {
-                        instr_id: call_instr_id,
-                        replacement: PlannedReplacement::Guarded {
-                            alternatives: vec![PlannedAlternative {
-                                guards: vec![PlannedGuard::FunctionTarget {
-                                    target: planned_callee_target.clone(),
-                                }],
-                                action: PlannedAction::DirectCall {
-                                    target: planned_callee_target,
-                                },
-                            }],
-                            fallback: PlannedFallback::OriginalInstruction,
-                        },
-                    }],
-                }],
-            };
-            let plan_path = module_optimization_plan_path(
-                module_cache_root.as_path(),
-                PythonModuleCacheSource::Project,
-                caller_module_name,
-            )
-            .expect("test optimization plan path should build");
-            write_test_optimization_plan(plan_path.as_path(), &plan);
-
-            let caller_function = caller_state.lowered_module.callable_defs[0].clone();
-            let compile_session = session.as_ref();
-            let mut jit_module =
-                new_jit_module(compile_session).expect("test jit module should construct");
-            let module_constant_ptrs = caller_state.module_constant_ptrs();
-            let module_constant_object_data_ids = declare_module_constant_object_data(
-                &mut jit_module,
-                &caller_state.lowered_module,
-                &module_constant_ptrs,
-            )
-            .expect("module constant object data should declare");
-            let (counter_slots_by_id, scalar_counter_data_id, top_value_counter_data_id) =
-                define_test_counter_storage(
-                    &mut jit_module,
-                    &caller_state.lowered_module,
-                    caller_state.lowered_module.counter_defs.as_slice(),
-                );
-            let blocks = vec![std::ptr::null_mut::<c_void>(); caller_function.blocks.len()];
-            let built = build_test_cranelift_run_bb_specialized_function(
-                &mut jit_module,
-                blocks.as_slice(),
-                &caller_state.lowered_module,
-                &caller_function,
-                &caller_state.codegen_constants,
-                caller_state.lowered_module.counter_defs.as_slice(),
-                module_constant_object_data_ids.as_slice(),
-                counter_slots_by_id.as_ref(),
-                scalar_counter_data_id,
-                top_value_counter_data_id,
-                compile_session,
-                Some(caller_state.as_ref()),
-                None,
-                None,
-                BuildSpecializedFunctionOptions::default(),
-            )
-            .expect("caller JIT build should consume planned direct-call evidence");
-
-            let deopt_helpers = import_user_names_for_symbols(&built, &["dp_jit_deopt_resume"]);
-            let generic_call_helpers = import_user_names_for_symbols(
-                &built,
-                &[
-                    DP_JIT_PY_CALL_OBJECT_IMPORT.symbol,
-                    DP_JIT_PY_VECTORCALL_IMPORT.symbol,
-                    DP_JIT_PY_CALL_WITH_KW_IMPORT.symbol,
-                    DP_JIT_PY_CALL_POSITIONAL_THREE_IMPORT.symbol,
-                ],
-            );
-            assert!(
-                count_indirect_calls(&built.ctx.func) >= 1,
-                "planned cross-module direct call should indirect through the callee FunctionEnv.direct_code_ptr",
-            );
-            assert_eq!(
-                count_direct_calls_to_runtime_helpers(&built.ctx.func, &deopt_helpers),
-                1,
-                "planned direct-call guard miss should deopt instead of emitting a generic fallback",
-            );
-            assert_eq!(
-                count_direct_calls_to_runtime_helpers(&built.ctx.func, &generic_call_helpers),
-                0,
-                "planned cross-module direct call should not use generic Python call helpers",
             );
         });
     }
@@ -21813,7 +19611,7 @@ def f(x, y):
         py: Python<'_>,
         mode: &str,
     ) -> BuiltSpecializedFunction {
-        let (_opt_mode, _plan_mode) = set_legacy_opt_mode(mode);
+        let _opt_mode = set_opt_mode(mode);
         let soac_work_dir = fresh_test_work_dir("indexed-global-deopt-profile");
         let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
         let blocks = [1usize as ObjPtr];
@@ -21884,7 +19682,7 @@ def f(x, y):
         py: Python<'_>,
         mode: &str,
     ) -> BuiltSpecializedFunction {
-        let (_opt_mode, _plan_mode) = set_legacy_opt_mode(mode);
+        let _opt_mode = set_opt_mode(mode);
         let soac_work_dir = fresh_test_work_dir("indexed-global-store-deopt-profile");
         let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
         let blocks = [1usize as ObjPtr];
@@ -22118,7 +19916,7 @@ def f(x, y):
         py: Python<'_>,
         callable_replay_safe: bool,
     ) -> BuiltSpecializedFunction {
-        let (_opt_mode, _plan_mode) = set_legacy_opt_mode("verify");
+        let _opt_mode = set_opt_mode("verify");
         let soac_work_dir = fresh_test_work_dir("direct-call-deopt-profile");
         let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
         let blocks = [1usize as ObjPtr];
@@ -22339,7 +20137,7 @@ def f(x, y):
         py: Python<'_>,
         receiver_replay_safe: bool,
     ) -> BuiltSpecializedFunction {
-        let (_opt_mode, _plan_mode) = set_legacy_opt_mode("verify");
+        let _opt_mode = set_opt_mode("verify");
         let soac_work_dir = fresh_test_work_dir("direct-method-deopt-profile");
         let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
         let blocks = [1usize as ObjPtr];
@@ -22349,7 +20147,7 @@ def f(x, y):
         let mut method_function = BlockPyFunction {
             function_id: method_function_id,
             name_gen: method_name_gen,
-            names: FunctionName::new("Thing.f", "Thing.f", "Thing.f", "Thing.f"),
+            names: FunctionName::new("Thing.f", "f", "Thing.f", "Thing.f"),
             kind: soac_core::block_py::FunctionKind::Function,
             execution_mode: Default::default(),
             params: ParamSpec {
@@ -22524,6 +20322,18 @@ def f(x, y):
                 ffi::PyDict_SetItemString(module_dict, c"Thing".as_ptr(), cls.as_ptr()) == 0,
                 "test module should accept Thing binding"
             );
+            let sys = PyModule::import(py, "sys").expect("sys should import");
+            let modules = sys
+                .getattr("modules")
+                .expect("sys.modules should exist")
+                .cast_into::<pyo3::types::PyDict>()
+                .expect("sys.modules should be a dict");
+            modules
+                .set_item(
+                    "direct_method_deopt_profile_test",
+                    pyo3::Bound::from_borrowed_ptr(py, module_obj),
+                )
+                .expect("test module should be import-resolvable while loading method guards");
             crate::register_function_owner_types_for_module(module_obj)
                 .expect("owner types should register from explicit test module");
             ffi::Py_DECREF(module_obj);
@@ -22651,7 +20461,7 @@ def f(x, y):
                 globals_obj: ObjPtr,
             }
 
-            let (_opt_mode, _plan_mode) = set_legacy_opt_mode("verify");
+            let _opt_mode = set_opt_mode("verify");
             let soac_work_dir = fresh_test_work_dir("direct-method-deopt-runtime");
             let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
             let module_name = "direct_method_deopt_runtime_test";
@@ -22661,7 +20471,7 @@ def f(x, y):
             let mut method_function = BlockPyFunction {
                 function_id: method_function_id,
                 name_gen: method_name_gen,
-                names: FunctionName::new("Thing.f", "Thing.f", "Thing.f", "Thing.f"),
+                names: FunctionName::new("Thing.f", "f", "Thing.f", "Thing.f"),
                 kind: soac_core::block_py::FunctionKind::Function,
                 execution_mode: Default::default(),
                 params: ParamSpec {
@@ -22815,6 +20625,15 @@ def f(x, y):
                 ffi::PyDict_SetItemString(module_dict, c"Thing".as_ptr(), thing_cls.as_ptr()) == 0,
                 "test module should accept Thing binding"
             );
+            let sys = PyModule::import(py, "sys").expect("sys should import");
+            let modules = sys
+                .getattr("modules")
+                .expect("sys.modules should exist")
+                .cast_into::<pyo3::types::PyDict>()
+                .expect("sys.modules should be a dict");
+            modules
+                .set_item(module_name, pyo3::Bound::from_borrowed_ptr(py, module_obj))
+                .expect("test module should be import-resolvable while loading method guards");
             crate::register_function_owner_types_for_module(module_obj)
                 .expect("owner types should register from explicit test module");
             ffi::Py_DECREF(module_obj);
@@ -22970,7 +20789,7 @@ def f(x, y):
                 globals_obj: ObjPtr,
             }
 
-            let (_opt_mode, _plan_mode) = set_legacy_opt_mode("verify");
+            let _opt_mode = set_opt_mode("verify");
             let soac_work_dir = fresh_test_work_dir("direct-call-deopt-runtime");
             let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
             let module_name_gen = ModuleNameGen::new(0);
@@ -23213,230 +21032,6 @@ def f(x, y):
     }
 
     #[test]
-    fn legacy_store_call_evidence_does_not_feed_module_direct_call_rewrite() {
-        let module_name = "legacy_store_call_no_inline_plan_test";
-        let module_name_gen = ModuleNameGen::new(0);
-        let mut callee_function = test_function_in_module(&module_name_gen, "callee");
-        callee_function.params.params.push(Param {
-            name: "x".into(),
-            kind: ParamKind::Any,
-            has_default: false,
-        });
-        callee_function = with_single_test_block(
-            callee_function,
-            vec![],
-            ret_term(name_expr(test_local_name("x", 0))),
-        );
-        set_stack_slots(&mut callee_function, &["x"]);
-
-        let mut caller_function = test_function_in_module(&module_name_gen, "caller");
-        caller_function.params.params.extend([
-            Param {
-                name: "fn".into(),
-                kind: ParamKind::Any,
-                has_default: false,
-            },
-            Param {
-                name: "x".into(),
-                kind: ParamKind::Any,
-                has_default: false,
-            },
-        ]);
-        let caller_block_label = caller_function.name_gen.next_block_name();
-        let call_instr_id = InstrId::new(caller_block_label, 1);
-        caller_function = with_test_blocks(
-            caller_function,
-            vec![CodegenBlock {
-                label: caller_block_label,
-                body: vec![assign_stmt(
-                    test_local_name("y", 2),
-                    with_instr_id(
-                        op_expr(Call::new(
-                            name_expr(test_local_name("fn", 0)),
-                            vec![CallArgPositional::Positional(name_expr(test_local_name(
-                                "x", 1,
-                            )))],
-                            Vec::<CallArgKeyword<InstrCodegen>>::new(),
-                        )),
-                        call_instr_id,
-                    ),
-                )],
-                term: ret_term(name_expr(test_local_name("y", 2))),
-                params: vec![],
-                exc_edge: None,
-            }],
-        );
-        set_stack_slots(&mut caller_function, &["fn", "x", "y"]);
-        let module = test_module(
-            module_name_gen,
-            vec![callee_function.clone(), caller_function.clone()],
-        );
-        let mut caller_evidence = FunctionProfileEvidence::default();
-        caller_evidence
-            .call_target_specializations
-            .insert(call_instr_id, vec![callee_function.function_id]);
-        let profile = SpecializationProfile::from_precompile(
-            &SoacEnvConfig::default(),
-            module_name,
-            None,
-            PlannedOptimizationInputs::from_evidence_by_function(HashMap::from([(
-                caller_function.function_id,
-                caller_evidence,
-            )])),
-        )
-        .expect("test specialization profile should construct");
-        let plan = build_profiled_jit_module_plan(&module, &profile, None, None, &HashMap::new())
-            .expect("profiled JIT module plan should build");
-        let planned_caller = plan
-            .module
-            .callable_defs
-            .iter()
-            .find(|function| function.function_id == caller_function.function_id)
-            .expect("planned module should keep caller");
-
-        assert!(
-            !planned_caller.blocks.iter().any(|block| {
-                matches!(
-                    &block.term,
-                    BlockTerm::IfTerm(term)
-                        if matches!(term.test, InstrCodegen::DirectFunctionIdGuardTest(_))
-                )
-            }),
-            "legacy call-target evidence should not feed the v3 module direct-call rewrite"
-        );
-        assert!(
-            planned_caller
-                .blocks
-                .iter()
-                .flat_map(|block| &block.body)
-                .any(|instr| matches!(instr, InstrCodegen::Store(store) if matches!(store.value.as_ref(), InstrCodegen::Call(_)))),
-            "the original generic call should remain in the module plan"
-        );
-    }
-
-    #[test]
-    fn v3_direct_call_store_rewrite_feeds_blockpy_inliner_without_legacy_evidence() {
-        let module_name = "v3_store_call_inline_plan_test";
-        let module_name_gen = ModuleNameGen::new(0);
-        let mut callee_function = test_function_in_module(&module_name_gen, "callee");
-        callee_function.params.params.push(Param {
-            name: "x".into(),
-            kind: ParamKind::Any,
-            has_default: false,
-        });
-        callee_function = with_single_test_block(
-            callee_function,
-            vec![],
-            ret_term(name_expr(test_local_name("x", 0))),
-        );
-        set_stack_slots(&mut callee_function, &["x"]);
-
-        let mut caller_function = test_function_in_module(&module_name_gen, "caller");
-        caller_function.params.params.extend([
-            Param {
-                name: "fn".into(),
-                kind: ParamKind::Any,
-                has_default: false,
-            },
-            Param {
-                name: "x".into(),
-                kind: ParamKind::Any,
-                has_default: false,
-            },
-        ]);
-        let caller_block_label = caller_function.name_gen.next_block_name();
-        let call_instr_id = InstrId::new(caller_block_label, 1);
-        caller_function = with_test_blocks(
-            caller_function,
-            vec![CodegenBlock {
-                label: caller_block_label,
-                body: vec![assign_stmt(
-                    test_local_name("y", 2),
-                    with_instr_id(
-                        op_expr(Call::new(
-                            name_expr(test_local_name("fn", 0)),
-                            vec![CallArgPositional::Positional(name_expr(test_local_name(
-                                "x", 1,
-                            )))],
-                            Vec::<CallArgKeyword<InstrCodegen>>::new(),
-                        )),
-                        call_instr_id,
-                    ),
-                )],
-                term: ret_term(name_expr(test_local_name("y", 2))),
-                params: vec![],
-                exc_edge: None,
-            }],
-        );
-        set_stack_slots(&mut caller_function, &["fn", "x", "y"]);
-        let module = test_module(
-            module_name_gen,
-            vec![callee_function.clone(), caller_function.clone()],
-        );
-        let v3_plan = ResolvedV3DirectCallPlan {
-            source: call_instr_id,
-            target: callee_function.function_id,
-            arg_plan: TypedDirectCallArgPlan {
-                sources: vec![TypedDirectCallArgSource::Provided(0)],
-            },
-            body: test_v3_inline_call_body(),
-            reason: "profiled direct call".to_string(),
-        };
-        let profile = SpecializationProfile {
-            module_name: Some(module_name),
-            counter_dump_path: None,
-            planned_evidence: HashMap::new(),
-            opt_v3_emitted_direct_calls: HashMap::from([(
-                caller_function.function_id,
-                HashMap::from([(call_instr_id, vec![v3_plan])]),
-            )]),
-            opt_v3_emitted_constructor_calls: HashMap::new(),
-            opt_v3_emitted_method_calls: HashMap::new(),
-            opt_v3_emitted_exact_list_items: HashMap::new(),
-            opt_v3_emitted_indexed_fields: HashMap::new(),
-            opt_v3_emitted_indexed_globals: HashMap::new(),
-            opt_v3_exact_int_branch_artifacts: HashMap::new(),
-            behavior_change_indexed_stores: false,
-            profiled_cold_blocks: false,
-            guard_miss_deopt: false,
-        };
-        assert!(
-            profile
-                .call_target_specializations(caller_function.function_id)
-                .unwrap()
-                .is_empty(),
-            "v3 direct-call module rewrite should not depend on legacy profile evidence"
-        );
-        let plan = build_profiled_jit_module_plan(&module, &profile, None, None, &HashMap::new())
-            .expect("v3-profiled JIT module plan should build");
-        let planned_caller = plan
-            .module
-            .callable_defs
-            .iter()
-            .find(|function| function.function_id == caller_function.function_id)
-            .expect("planned module should keep caller");
-
-        assert!(
-            planned_caller.blocks.iter().any(|block| {
-                matches!(
-                    &block.term,
-                    BlockTerm::IfTerm(term)
-                        if matches!(term.test, InstrCodegen::DirectFunctionIdGuardTest(_))
-                )
-            }),
-            "v3 direct-call rewrite should keep the function-id guard explicit"
-        );
-        assert!(
-            !planned_caller
-                .blocks
-                .iter()
-                .flat_map(|block| &block.body)
-                .any(|instr| matches!(instr, InstrCodegen::Store(store) if matches!(store.value.as_ref(), InstrCodegen::CallDirect(_)))),
-            "v3 hot CallDirect store should be consumed by the BlockPy inliner"
-        );
-    }
-
-    #[test]
     fn source_keyed_v3_emissions_still_allow_plan_level_direct_call_rewrite() {
         let module_name = "v3_source_keyed_shape_test";
         let module_name_gen = ModuleNameGen::new(0);
@@ -23515,7 +21110,6 @@ def f(x, y):
         let profile = SpecializationProfile {
             module_name: Some(module_name),
             counter_dump_path: None,
-            planned_evidence: HashMap::new(),
             opt_v3_emitted_direct_calls: HashMap::from([(
                 caller_function.function_id,
                 HashMap::from([(call_instr_id, vec![v3_plan])]),
@@ -23566,128 +21160,6 @@ def f(x, y):
         assert!(
             specialization_inputs.opt_v3_call_emissions.is_empty(),
             "v3 direct calls consumed by the profiled module plan should not reach typed JIT lowering"
-        );
-    }
-
-    #[test]
-    fn legacy_no_arg_method_evidence_does_not_feed_module_method_rewrite() {
-        let module_name = "legacy_method_call_no_inline_plan_test";
-        let module_name_gen = ModuleNameGen::new(0);
-        let mut constants = TestConstantPool::default();
-
-        let mut next_function = test_function_in_module(&module_name_gen, "IterRange.__next__");
-        next_function.params.params.push(Param {
-            name: "self".into(),
-            kind: ParamKind::Any,
-            has_default: false,
-        });
-        next_function = with_single_test_block(
-            next_function,
-            vec![],
-            ret_term(name_expr(test_local_name("self", 0))),
-        );
-        set_stack_slots(&mut next_function, &["self"]);
-
-        let mut caller_function = test_function_in_module(&module_name_gen, "caller");
-        caller_function.params.params.push(Param {
-            name: "it".into(),
-            kind: ParamKind::Any,
-            has_default: false,
-        });
-        let caller_block_label = caller_function.name_gen.next_block_name();
-        let call_instr_id = InstrId::new(caller_block_label, 1);
-        caller_function = with_test_blocks(
-            caller_function,
-            vec![CodegenBlock {
-                label: caller_block_label,
-                body: vec![assign_stmt(
-                    test_local_name("y", 1),
-                    with_instr_id(
-                        op_expr(Call::new(
-                            op_expr(GetAttr::new(
-                                name_expr(test_local_name("it", 0)),
-                                constants.string_expr("__next__"),
-                            )),
-                            Vec::<CallArgPositional<InstrCodegen>>::new(),
-                            Vec::<CallArgKeyword<InstrCodegen>>::new(),
-                        )),
-                        call_instr_id,
-                    ),
-                )],
-                term: ret_term(name_expr(test_local_name("y", 1))),
-                params: vec![],
-                exc_edge: None,
-            }],
-        );
-        set_stack_slots(&mut caller_function, &["it", "y"]);
-
-        let mut module = test_module(
-            module_name_gen,
-            vec![next_function.clone(), caller_function.clone()],
-        );
-        module.module_constants = constants.module_constants;
-        let mut caller_evidence = FunctionProfileEvidence::default();
-        caller_evidence
-            .call_target_specializations
-            .insert(call_instr_id, vec![next_function.function_id]);
-        let profile = SpecializationProfile::from_precompile(
-            &SoacEnvConfig::default(),
-            module_name,
-            None,
-            PlannedOptimizationInputs::from_evidence_by_function(HashMap::from([(
-                caller_function.function_id,
-                caller_evidence,
-            )])),
-        )
-        .expect("test specialization profile should construct");
-        let direct_owner_attr_specializations = HashMap::from([(
-            caller_function.function_id,
-            HashMap::from([(
-                DirectOwnerAttrKey::new(next_function.function_id, "__next__"),
-                vec![DirectOwnerAttrSpecialization {
-                    owner_type_ref: RelocTypeRef::TypeKey(CounterDumpTypeKey {
-                        module_name: module_name.to_string(),
-                        qualname: "IterRange".to_string(),
-                    }),
-                    type_version: 1,
-                }],
-            )]),
-        )]);
-        let plan = build_profiled_jit_module_plan(
-            &module,
-            &profile,
-            None,
-            None,
-            &direct_owner_attr_specializations,
-        )
-        .expect("profiled JIT module plan should build");
-        let planned_caller = plan
-            .module
-            .callable_defs
-            .iter()
-            .find(|function| function.function_id == caller_function.function_id)
-            .expect("planned module should keep caller");
-
-        assert!(
-            !planned_caller.blocks.iter().any(|block| {
-                matches!(
-                    &block.term,
-                    BlockTerm::IfTerm(term)
-                        if matches!(
-                            term.test,
-                            InstrCodegen::DirectReceiverTypeVersionGuardTest(_)
-                        )
-                )
-            }),
-            "legacy method evidence should not feed the v3 module method rewrite"
-        );
-        assert!(
-            planned_caller
-                .blocks
-                .iter()
-                .flat_map(|block| &block.body)
-                .any(|instr| matches!(instr, InstrCodegen::Store(store) if store.name.id_str() == "y" && matches!(store.value.as_ref(), InstrCodegen::Call(_)))),
-            "the original generic method call should remain in the module plan"
         );
     }
 
@@ -24504,7 +21976,7 @@ def f(x, y):
                 globals_obj: ObjPtr,
             }
 
-            let (_opt_mode, _plan_mode) = set_legacy_opt_mode("verify");
+            let _opt_mode = set_opt_mode("verify");
             let soac_work_dir = fresh_test_work_dir("indexed-global-store-deopt-runtime");
             let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
             let mut function = test_function();
@@ -25180,7 +22652,7 @@ def f(x, y):
         let old_soac_work_dir = std::env::var_os("SOAC_WORK_DIR");
         let old_soac_opt_mode = std::env::var_os("SOAC_OPT_MODE");
         let soac_work_dir = fresh_test_work_dir("test-work");
-        let _plan_mode = set_legacy_optimization_plan_mode();
+
         unsafe {
             std::env::set_var("SOAC_WORK_DIR", &soac_work_dir);
             std::env::set_var("SOAC_OPT_MODE", "apply");
@@ -25202,7 +22674,7 @@ def f(x, y):
                     name_gen: init_name_gen,
                     names: FunctionName::new(
                         "Record.__init__",
-                        "Record.__init__",
+                        "__init__",
                         "Record.__init__",
                         "Record.__init__",
                     ),
@@ -25468,8 +22940,8 @@ def f(x, y):
                         &built.ctx.func,
                         &indexed_setattr_helpers
                     ),
-                    1,
-                    "straight-line constructor initializer should try the indexed field store before fallback",
+                    0,
+                    "callee-local indexed-field plans should not be implicitly threaded through constructor inlining without an explicit v3 remap",
                 );
                 assert!(
                     !function_contains_iconst_imm(&built.ctx.func, owner_type as i64),

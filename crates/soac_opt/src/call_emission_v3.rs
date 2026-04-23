@@ -375,20 +375,6 @@ pub fn merge_call_target_specializations(
     left
 }
 
-pub fn legacy_call_targets_excluding_sources(
-    call_target_specializations: &HashMap<InstrId, Vec<RuntimeFunctionId>>,
-    v3_sources: &HashSet<InstrId>,
-) -> HashMap<InstrId, Vec<RuntimeFunctionId>> {
-    if v3_sources.is_empty() {
-        return call_target_specializations.clone();
-    }
-    call_target_specializations
-        .iter()
-        .filter(|(source, _targets)| !v3_sources.contains(source))
-        .map(|(source, targets)| (*source, targets.clone()))
-        .collect()
-}
-
 pub fn constructor_call_guard_request(
     plan: &ResolvedV3ConstructorCallPlan,
 ) -> ConstructorCallGuardRequest {
@@ -420,7 +406,7 @@ pub fn prepare_constructor_call_plans_for_codegen(
     constructor_calls_by_instr: &HashMap<InstrId, Vec<ResolvedV3ConstructorCallPlan>>,
     mut runtime_guard_from_request: impl FnMut(
         &ConstructorCallGuardRequest,
-    ) -> Result<RuntimeCallOwnerGuard, String>,
+    ) -> Result<Option<RuntimeCallOwnerGuard>, String>,
     mut validate_guard: impl FnMut(&TypedDirectConstructorCallGuard) -> Result<(), String>,
 ) -> Result<HashMap<InstrId, PreparedV3ConstructorCallPlan>, String> {
     let mut prepared = HashMap::new();
@@ -435,7 +421,9 @@ pub fn prepare_constructor_call_plans_for_codegen(
         let mut guards = Vec::new();
         for constructor_call in constructor_calls {
             let request = constructor_call_guard_request(constructor_call);
-            let runtime_guard = runtime_guard_from_request(&request)?;
+            let Some(runtime_guard) = runtime_guard_from_request(&request)? else {
+                continue;
+            };
             let guard = TypedDirectConstructorCallGuard {
                 function_id: request.target,
                 owner_type_ref: runtime_guard.owner_type_ref,
@@ -447,7 +435,9 @@ pub fn prepare_constructor_call_plans_for_codegen(
                 guards.push(guard);
             }
         }
-        prepared.insert(*source, PreparedV3ConstructorCallPlan { guards });
+        if !guards.is_empty() {
+            prepared.insert(*source, PreparedV3ConstructorCallPlan { guards });
+        }
     }
     Ok(prepared)
 }
@@ -456,7 +446,7 @@ pub fn prepare_method_call_plans_for_codegen(
     method_calls_by_instr: &HashMap<InstrId, Vec<ResolvedV3MethodCallPlan>>,
     mut runtime_guard_from_request: impl FnMut(
         &MethodCallGuardRequest,
-    ) -> Result<RuntimeCallOwnerGuard, String>,
+    ) -> Result<Option<RuntimeCallOwnerGuard>, String>,
     mut validate_guard: impl FnMut(&TypedDirectMethodCallGuard, &str) -> Result<(), String>,
 ) -> Result<HashMap<InstrId, PreparedV3MethodCallPlan>, String> {
     let mut prepared = HashMap::new();
@@ -481,7 +471,9 @@ pub fn prepare_method_call_plans_for_codegen(
         let mut guards = Vec::new();
         for method_call in method_calls {
             let request = method_call_guard_request(method_call);
-            let runtime_guard = runtime_guard_from_request(&request)?;
+            let Some(runtime_guard) = runtime_guard_from_request(&request)? else {
+                continue;
+            };
             let guard = TypedDirectMethodCallGuard {
                 function_id: request.target,
                 owner_type_ref: runtime_guard.owner_type_ref,
@@ -493,13 +485,15 @@ pub fn prepare_method_call_plans_for_codegen(
                 guards.push(guard);
             }
         }
-        prepared.insert(
-            *source,
-            PreparedV3MethodCallPlan {
-                method_name,
-                guards,
-            },
-        );
+        if !guards.is_empty() {
+            prepared.insert(
+                *source,
+                PreparedV3MethodCallPlan {
+                    method_name,
+                    guards,
+                },
+            );
+        }
     }
     Ok(prepared)
 }
@@ -639,10 +633,10 @@ mod tests {
                 assert_eq!(request.target, target);
                 assert_eq!(request.owner_type_key.module_name, "module");
                 assert_eq!(request.owner_type_key.qualname, "Box");
-                Ok(RuntimeCallOwnerGuard {
+                Ok(Some(RuntimeCallOwnerGuard {
                     owner_type_ref: owner_type_ref.clone(),
                     type_version: 42,
-                })
+                }))
             },
             |_| Ok(()),
         )
@@ -687,10 +681,10 @@ mod tests {
                 assert_eq!(request.method_name, "get");
                 assert_eq!(request.owner_type_key.module_name, "module");
                 assert_eq!(request.owner_type_key.qualname, "Box");
-                Ok(RuntimeCallOwnerGuard {
+                Ok(Some(RuntimeCallOwnerGuard {
                     owner_type_ref: owner_type_ref.clone(),
                     type_version: 77,
-                })
+                }))
             },
             |_, method_name| {
                 assert_eq!(method_name, "get");

@@ -1,15 +1,14 @@
 use cranelift_codegen::isa::TargetIsa;
 use cranelift_codegen::settings;
 use cranelift_codegen::settings::Configurable;
-pub(crate) use soac_config::SpecializationMode;
 #[cfg(test)]
-pub(crate) use soac_config::{SOAC_JIT_EMIT_REFCOUNTS_ENV, SOAC_OPT_PLAN_MODE_ENV};
+pub(crate) use soac_config::SOAC_JIT_EMIT_REFCOUNTS_ENV;
+pub(crate) use soac_config::SpecializationMode;
 use soac_config::{
     SoacEnvConfig, precompiled_library_path_from_env as config_precompiled_library_path_from_env,
 };
 pub use soac_driver::codegen_cache::CachedCodegenModuleMetadata;
 use soac_driver::codegen_cache::{
-    module_optimization_plan_path as blockpy_module_optimization_plan_path,
     module_optimization_plan_v3_path as blockpy_module_optimization_plan_v3_path,
     pre_optimization_module_cache_identity as blockpy_pre_optimization_module_cache_identity,
     pre_optimization_module_cache_metadata as blockpy_pre_optimization_module_cache_metadata,
@@ -124,15 +123,6 @@ pub fn pre_optimization_module_cache_metadata(
         build_identity,
         runtime_names_as_globals,
     )
-}
-
-pub fn module_optimization_plan_path(
-    cache_root: &Path,
-    source: PythonModuleCacheSource,
-    module_name: &str,
-) -> Result<PathBuf, String> {
-    blockpy_module_optimization_plan_path(cache_root, source, module_name)
-        .map_err(|err| err.to_string())
 }
 
 pub fn module_optimization_plan_v3_path(
