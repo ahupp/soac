@@ -3,12 +3,12 @@ use soac_core::block_py::{
     AbruptKind, BinOp, BinOpKind, BlockArg, BlockEdge, BlockLabel, BlockParam, BlockParamRole,
     BlockPyFunction, BlockPyModule, BlockTerm, Call, CallArgKeyword, CallArgPositional, CallDirect,
     CalleeFunctionId, CellLocation, CellRef, ChildVisitable, ClosureInit, ClosureSlot, CounterDef,
-    CounterSite, Del, DelItem, FunctionKind, FunctionName, GetAttr, GetItem, HasMeta,
-    HasSemanticInstrId, Load, LocalFunctionId, LocalLocation, MakeCell, Meta, ModuleNameGen,
-    NameLike, NameLocation, Param, ParamKind, ParamSpec, ResolvedName, RuntimeFunctionId,
-    RuntimeName, SerializedFunctionDebugName, SerializedFunctionId, SerializedIdentityTables,
-    SerializedModuleId, SerializedModuleIdentity, SetAttr, SetItem, StorageLayout, Store, Tuple,
-    UnaryOp, UnaryOpKind, Visit, VisitMut, WithMeta,
+    CounterSite, Del, DelItem, FunctionExecutionMode, FunctionKind, FunctionName, GetAttr, GetItem,
+    HasMeta, HasSemanticInstrId, Load, LocalFunctionId, LocalLocation, MakeCell, Meta,
+    ModuleNameGen, NameLike, NameLocation, Param, ParamKind, ParamSpec, ResolvedName,
+    RuntimeFunctionId, RuntimeName, SerializedFunctionDebugName, SerializedFunctionId,
+    SerializedIdentityTables, SerializedModuleId, SerializedModuleIdentity, SetAttr, SetItem,
+    StorageLayout, Store, Tuple, UnaryOp, UnaryOpKind, Visit, VisitMut, WithMeta,
 };
 use soac_lowering::block_py::counters::IncrementCounter;
 use soac_lowering::block_py::literal::{
@@ -1394,10 +1394,11 @@ def add_default(left, right=9):
     fn original_code_lookup_key_for_test(
         function: &BlockPyFunction<CodegenModuleShape>,
     ) -> Option<&str> {
+        if function.execution_mode() == FunctionExecutionMode::Interpreted {
+            return None;
+        }
         let qualname = function.names.qualname.as_str();
         if qualname == "_dp_module_init"
-            || qualname == "__annotate__"
-            || qualname.ends_with(".__annotate_func__")
             || function.names.fn_name == "_dp_resume"
             || is_synthetic_class_helper_for_original_code(function)
         {

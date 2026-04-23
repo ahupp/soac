@@ -827,18 +827,43 @@ def f():
 fn module_init_is_tagged_for_interpreted_execution() {
     let bb_module = tracked_name_binding_module(
         r#"
-VALUE = 1
+VALUE: int = 1
 
-def f():
-    return VALUE
+def f(value: int) -> int:
+    return value + VALUE
+
+class C:
+    field: int = 1
 "#,
     )
     .expect("transform should succeed")
     .expect("bb module should be available");
     let module_init = function_by_name(&bb_module, "_dp_module_init");
     let f = function_by_name(&bb_module, "f");
+    let module_annotate = function_by_name(&bb_module, "__annotate__");
+    let function_annotate = function_by_name(&bb_module, "_dp_annotate_func_f");
+    let class_annotate = bb_module
+        .callable_defs
+        .iter()
+        .find(|function| {
+            function.names.bind_name == "__annotate_func__"
+                || function.names.qualname.ends_with(".__annotate_func__")
+        })
+        .unwrap_or_else(|| panic!("missing class __annotate_func__; got {bb_module:?}"));
     assert_eq!(
         module_init.execution_mode(),
+        FunctionExecutionMode::Interpreted
+    );
+    assert_eq!(
+        module_annotate.execution_mode(),
+        FunctionExecutionMode::Interpreted
+    );
+    assert_eq!(
+        function_annotate.execution_mode(),
+        FunctionExecutionMode::Interpreted
+    );
+    assert_eq!(
+        class_annotate.execution_mode(),
         FunctionExecutionMode::Interpreted
     );
     assert_eq!(f.execution_mode(), FunctionExecutionMode::Jit);

@@ -8,6 +8,7 @@ use crate::block_py::{
 };
 use crate::namegen::fresh_name;
 use crate::passes::ast_to_ast::context::Context;
+use crate::passes::ast_to_ast::rewrite_stmt::annotation::FUNCTION_ANNOTATE_PREFIX;
 use crate::passes::{CoreModuleShapeWithAwaitAndYield, InstrRuff};
 use crate::ruff_ast_to_string;
 use crate::template::is_simple;
@@ -532,6 +533,9 @@ fn default_execution_mode_for_function(names: &FunctionName) -> FunctionExecutio
     if names.bind_name == "_dp_module_init"
         || names.bind_name.starts_with("_dp_class_ns_")
         || names.bind_name.starts_with("_dp_define_class_")
+        || names.bind_name == "__annotate__"
+        || names.bind_name == "__annotate_func__"
+        || names.bind_name.starts_with(FUNCTION_ANNOTATE_PREFIX)
     {
         FunctionExecutionMode::Interpreted
     } else {

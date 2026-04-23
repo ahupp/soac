@@ -3,7 +3,9 @@ use pyo3::exceptions::{PyOSError, PyRuntimeError, PyTypeError};
 use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyModule, PyTuple};
-use soac_core::block_py::{BlockPyFunction, BlockPyModule, RuntimeFunctionId};
+use soac_core::block_py::{
+    BlockPyFunction, BlockPyModule, FunctionExecutionMode, RuntimeFunctionId,
+};
 use soac_driver::codegen_cache::{
     CachedCodegenModuleMetadata, PythonModuleCacheSource, hash_module_source,
 };
@@ -342,10 +344,11 @@ fn is_synthetic_class_helper(function: &BlockPyFunction<CodegenModuleShape>) -> 
 }
 
 fn original_code_lookup_key(function: &BlockPyFunction<CodegenModuleShape>) -> Option<&str> {
+    if function.execution_mode() == FunctionExecutionMode::Interpreted {
+        return None;
+    }
     let qualname = function.names.qualname.as_str();
     if qualname == "_dp_module_init"
-        || qualname == "__annotate__"
-        || qualname.ends_with(".__annotate_func__")
         || function.names.fn_name == "_dp_resume"
         || is_synthetic_class_helper(function)
     {
