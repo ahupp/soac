@@ -235,6 +235,22 @@ class C:
         .map(|function| function.function_id)
         .collect::<HashSet<_>>();
     assert!(!interpreted_ids.is_empty());
+    assert!(
+        codegen.callable_defs.iter().any(|function| {
+            interpreted_ids.contains(&function.function_id)
+                && function
+                    .names
+                    .qualname
+                    .starts_with("_dp_annotate_func_f.<locals>.")
+                && function.names.qualname.ends_with(".<lambda>")
+        }),
+        "function annotation helper lambda should be interpreted: {:?}",
+        codegen
+            .callable_defs
+            .iter()
+            .map(|function| (function.names.qualname.as_str(), function.execution_mode()))
+            .collect::<Vec<_>>()
+    );
 
     instrument_bb_module_with_block_entry_counters(&mut codegen);
     instrument_bb_module_with_call_target_counters(&mut codegen);

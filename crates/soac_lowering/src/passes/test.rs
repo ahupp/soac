@@ -850,6 +850,22 @@ class C:
                 || function.names.qualname.ends_with(".__annotate_func__")
         })
         .unwrap_or_else(|| panic!("missing class __annotate_func__; got {bb_module:?}"));
+    let annotation_lambdas = bb_module
+        .callable_defs
+        .iter()
+        .filter(|function| {
+            function.names.qualname.ends_with(".<lambda>")
+                && (function.names.qualname.contains("__annotate")
+                    || function.names.qualname.starts_with("_dp_annotate_func_"))
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        annotation_lambdas.iter().any(|function| function
+            .names
+            .qualname
+            .starts_with("_dp_annotate_func_f.<locals>.")),
+        "missing function annotation helper lambda; got {bb_module:?}"
+    );
     assert_eq!(
         module_init.execution_mode(),
         FunctionExecutionMode::Interpreted
@@ -865,6 +881,12 @@ class C:
     assert_eq!(
         class_annotate.execution_mode(),
         FunctionExecutionMode::Interpreted
+    );
+    assert!(
+        annotation_lambdas
+            .iter()
+            .all(|function| function.execution_mode() == FunctionExecutionMode::Interpreted),
+        "annotation helper lambdas should be interpreted: {annotation_lambdas:?}"
     );
     assert_eq!(f.execution_mode(), FunctionExecutionMode::Jit);
 }

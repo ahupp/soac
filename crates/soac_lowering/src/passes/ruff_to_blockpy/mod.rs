@@ -533,14 +533,22 @@ fn default_execution_mode_for_function(names: &FunctionName) -> FunctionExecutio
     if names.bind_name == "_dp_module_init"
         || names.bind_name.starts_with("_dp_class_ns_")
         || names.bind_name.starts_with("_dp_define_class_")
-        || names.bind_name == "__annotate__"
-        || names.bind_name == "__annotate_func__"
-        || names.bind_name.starts_with(FUNCTION_ANNOTATE_PREFIX)
+        || is_annotation_helper_or_descendant(names)
     {
         FunctionExecutionMode::Interpreted
     } else {
         FunctionExecutionMode::Jit
     }
+}
+
+fn is_annotation_helper_or_descendant(names: &FunctionName) -> bool {
+    names.bind_name == "__annotate__"
+        || names.bind_name == "__annotate_func__"
+        || names.bind_name.starts_with(FUNCTION_ANNOTATE_PREFIX)
+        || names.qualname == "__annotate__"
+        || names.qualname.starts_with("__annotate__.<locals>.")
+        || names.qualname.starts_with(FUNCTION_ANNOTATE_PREFIX)
+        || names.qualname.contains(".__annotate_func__")
 }
 
 #[derive(Clone)]
