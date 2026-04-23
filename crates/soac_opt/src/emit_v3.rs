@@ -185,6 +185,62 @@ pub enum MechanicalOperation {
     DirectHelper { name: String },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MechanicalCodegenStep {
+    Input {
+        output: PlanValue,
+    },
+    ConstantI64 {
+        output: PlanValue,
+        value: i64,
+    },
+    SpecializationGuard {
+        inputs: Vec<PlanValue>,
+    },
+    Convert {
+        kind: MechanicalCodegenConversion,
+        input: PlanValue,
+        output: PlanValue,
+    },
+    PreseededConvert {
+        output: PlanValue,
+    },
+    Operation {
+        op: MechanicalCodegenOperation,
+        inputs: [PlanValue; 2],
+        output: PlanValue,
+    },
+    Materialize {
+        kind: MaterializeKind,
+        input: PlanValue,
+        output: PlanValue,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MechanicalCodegenConversion {
+    FromPythonLongCompactToI64,
+    TruthinessToI32Bool01,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MechanicalCodegenOperation {
+    PyNumberAdd,
+    PyNumberSubtract,
+    PyNumberMultiply,
+    PyNumberBitAnd,
+    PyNumberBitOr,
+    PyNumberBitXor,
+    PyObjectRichCompare { op: RichCompareOp },
+    CheckedI64Add,
+    CheckedI64Sub,
+    CheckedI64Mul,
+    I64BitAnd,
+    I64BitOr,
+    I64BitXor,
+    I64CompareToBool01 { op: RichCompareOp },
+}
+
 impl From<&PlannedOp> for MechanicalOperation {
     fn from(value: &PlannedOp) -> Self {
         match value {
@@ -276,6 +332,395 @@ pub fn validate_mechanical_emission_matches_plan_v3(
     )?;
     validate_current_mechanical_lowering_shape_v3(plan, emission)
         .map_err(MechanicalEmitError::EmissionMismatch)
+}
+
+pub fn mechanical_codegen_step(
+    region: RegionId,
+    step: &MechanicalStep,
+    has_local_fallback: bool,
+    preseeded_scalar: Option<PlanValue>,
+    preseeded_convert_inputs: &HashSet<PlanValue>,
+) -> Result<MechanicalCodegenStep, String> {
+    match &step.op {
+        MechanicalStepOp::Input { output } => Ok(MechanicalCodegenStep::Input { output: *output }),
+        MechanicalStepOp::Constant { output, constant } => match constant {
+            PlannedConstant::I64(value) if output.rep == Rep::I64 => {
+                Ok(MechanicalCodegenStep::ConstantI64 {
+                    output: *output,
+                    value: *value,
+                })
+            }
+            PlannedConstant::I64(_) => Err(format!(
+                "prevalidated optimizer v3 region {region:?} constant node {:?} produces {:?}; current mechanical lowering only emits i64 constants",
+                step.node, output.rep
+            )),
+            other => Err(format!(
+                "prevalidated optimizer v3 region {region:?} constant node {:?} has non-i64 constant {other:?}",
+                step.node
+            )),
+        },
+        MechanicalStepOp::Guard {
+            kind,
+            inputs,
+            failure,
+        } => {
+            if *kind != GuardKind::SpecializationCheck {
+                return Err(format!(
+                    "prevalidated optimizer v3 region {region:?} guard node {:?} has non-mechanical kind {kind:?}",
+                    step.node
+                ));
+            }
+            if inputs.is_empty() {
+                return Err(format!(
+                    "prevalidated optimizer v3 region {region:?} guard node {:?} has no inputs",
+                    step.node
+                ));
+            }
+            let preseeded_guard = !preseeded_convert_inputs.is_empty()
+                && inputs
+                    .iter()
+                    .all(|input| preseeded_convert_inputs.contains(input));
+            if !has_local_fallback && !preseeded_guard {
+                return Err(format!(
+                    "optimizer v3 region {region:?} guard node {:?} appears outside a local-fallback hot region",
+                    step.node
+                ));
+            }
+            if !matches!(
+                failure,
+                GuardFailure::FallbackToPlan {
+                    target: crate::plan_v3::FallbackTarget::Region(_),
+                    ..
+                }
+            ) {
+                return Err(format!(
+                    "prevalidated optimizer v3 region {region:?} guard node {:?} has non-mechanical failure {failure:?}",
+                    step.node
+                ));
+            }
+            Ok(MechanicalCodegenStep::SpecializationGuard {
+                inputs: inputs.clone(),
+            })
+        }
+        MechanicalStepOp::Convert {
+            kind,
+            input,
+            output,
+            failure,
+        } => {
+            if preseeded_scalar == Some(*output) {
+                return Ok(MechanicalCodegenStep::PreseededConvert { output: *output });
+            }
+            let kind = mechanical_codegen_conversion(
+                region,
+                step.node,
+                *kind,
+                *input,
+                *output,
+                failure,
+                has_local_fallback,
+            )?;
+            Ok(MechanicalCodegenStep::Convert {
+                kind,
+                input: *input,
+                output: *output,
+            })
+        }
+        MechanicalStepOp::Operation {
+            op,
+            inputs,
+            output,
+            failure,
+        } => {
+            let (op, inputs, output) = mechanical_codegen_operation(
+                region,
+                step.node,
+                op,
+                inputs,
+                *output,
+                failure,
+                has_local_fallback,
+            )?;
+            Ok(MechanicalCodegenStep::Operation { op, inputs, output })
+        }
+        MechanicalStepOp::Materialize {
+            kind,
+            input,
+            output,
+        } => {
+            let expected = match kind {
+                MaterializeKind::PythonLong => (Rep::I64, Rep::PyObjectOwned),
+                MaterializeKind::PythonBool => (Rep::I32Bool01, Rep::PyObjectImmortal),
+            };
+            if input.rep != expected.0 || output.rep != expected.1 {
+                return Err(format!(
+                    "prevalidated optimizer v3 region {region:?} materialize node {:?} {kind:?} expects {:?}->{:?}, got {:?}->{:?}",
+                    step.node, expected.0, expected.1, input.rep, output.rep
+                ));
+            }
+            Ok(MechanicalCodegenStep::Materialize {
+                kind: *kind,
+                input: *input,
+                output: *output,
+            })
+        }
+        MechanicalStepOp::Fallback { .. }
+        | MechanicalStepOp::Deopt { .. }
+        | MechanicalStepOp::Ownership { .. } => Err(format!(
+            "prevalidated optimizer v3 region {region:?} node {:?} contains a non-emittable codegen step {:?}",
+            step.node, step.op
+        )),
+    }
+}
+
+pub fn mechanical_convert_inputs_for_output(
+    region: &MechanicalRegionEmission,
+    output: PlanValue,
+) -> HashSet<PlanValue> {
+    region
+        .steps
+        .iter()
+        .filter_map(|step| match &step.op {
+            MechanicalStepOp::Convert {
+                input,
+                output: step_output,
+                ..
+            } if *step_output == output => Some(*input),
+            _ => None,
+        })
+        .collect()
+}
+
+fn mechanical_codegen_conversion(
+    region: RegionId,
+    node: PlanNodeId,
+    kind: ConversionKind,
+    input: PlanValue,
+    output: PlanValue,
+    failure: &FailureMode,
+    has_local_fallback: bool,
+) -> Result<MechanicalCodegenConversion, String> {
+    match kind {
+        ConversionKind::FromPythonLongCompactToI64 => {
+            if input.rep != Rep::PyObjectBorrowed || output.rep != Rep::I64 {
+                return Err(format!(
+                    "prevalidated optimizer v3 region {region:?} conversion node {node:?} expects PyObjectBorrowed->I64, got {:?}->{:?}",
+                    input.rep, output.rep
+                ));
+            }
+            if !has_local_fallback
+                || !matches!(
+                    failure,
+                    FailureMode::FallbackToPlan {
+                        target: crate::plan_v3::FallbackTarget::Region(_),
+                        ..
+                    }
+                )
+            {
+                return Err(format!(
+                    "prevalidated optimizer v3 region {region:?} conversion node {node:?} needs a region local fallback for compact-long guard misses"
+                ));
+            }
+            Ok(MechanicalCodegenConversion::FromPythonLongCompactToI64)
+        }
+        ConversionKind::TruthinessToI32Bool01 => {
+            if input.rep != Rep::PyObjectOwned || output.rep != Rep::I32Bool01 {
+                return Err(format!(
+                    "prevalidated optimizer v3 region {region:?} conversion node {node:?} expects PyObjectOwned->I32Bool01, got {:?}->{:?}",
+                    input.rep, output.rep
+                ));
+            }
+            if !matches!(failure, FailureMode::Raise(_)) {
+                return Err(format!(
+                    "prevalidated optimizer v3 region {region:?} conversion node {node:?} expects Python truthiness failure to raise locally, got {failure:?}"
+                ));
+            }
+            Ok(MechanicalCodegenConversion::TruthinessToI32Bool01)
+        }
+        other => Err(format!(
+            "prevalidated optimizer v3 region {region:?} conversion node {node:?} contains conversion outside the validated emitter capability set {other:?}"
+        )),
+    }
+}
+
+fn mechanical_codegen_operation(
+    region: RegionId,
+    node: PlanNodeId,
+    operation: &MechanicalOperation,
+    inputs: &[PlanValue],
+    output: Option<PlanValue>,
+    failure: &FailureMode,
+    has_local_fallback: bool,
+) -> Result<(MechanicalCodegenOperation, [PlanValue; 2], PlanValue), String> {
+    let (inputs, output) = binary_operation_parts(region, node, operation, inputs, output)?;
+    match operation {
+        MechanicalOperation::PyNumberAdd
+        | MechanicalOperation::PyNumberSubtract
+        | MechanicalOperation::PyNumberMultiply
+        | MechanicalOperation::PyNumberBitAnd
+        | MechanicalOperation::PyNumberBitOr
+        | MechanicalOperation::PyNumberBitXor
+        | MechanicalOperation::PyObjectRichCompare { .. } => {
+            if !inputs.iter().all(|input| input.rep.is_python_object())
+                || output.rep != Rep::PyObjectOwned
+            {
+                return Err(format!(
+                    "prevalidated optimizer v3 region {region:?} operation node {node:?} {operation:?} expects PyObject inputs and PyObjectOwned output, got {:?}, {:?}",
+                    inputs.map(|input| input.rep),
+                    output.rep
+                ));
+            }
+            if !matches!(failure, FailureMode::Raise(_)) {
+                return Err(format!(
+                    "prevalidated optimizer v3 region {region:?} operation node {node:?} {operation:?} expects local Python raise failure, got {failure:?}"
+                ));
+            }
+            let op = match operation {
+                MechanicalOperation::PyNumberAdd => MechanicalCodegenOperation::PyNumberAdd,
+                MechanicalOperation::PyNumberSubtract => {
+                    MechanicalCodegenOperation::PyNumberSubtract
+                }
+                MechanicalOperation::PyNumberMultiply => {
+                    MechanicalCodegenOperation::PyNumberMultiply
+                }
+                MechanicalOperation::PyNumberBitAnd => MechanicalCodegenOperation::PyNumberBitAnd,
+                MechanicalOperation::PyNumberBitOr => MechanicalCodegenOperation::PyNumberBitOr,
+                MechanicalOperation::PyNumberBitXor => MechanicalCodegenOperation::PyNumberBitXor,
+                MechanicalOperation::PyObjectRichCompare { op } => {
+                    MechanicalCodegenOperation::PyObjectRichCompare { op: *op }
+                }
+                _ => unreachable!("matched Python object operation"),
+            };
+            Ok((op, inputs, output))
+        }
+        MechanicalOperation::CheckedI64Add
+        | MechanicalOperation::CheckedI64Sub
+        | MechanicalOperation::CheckedI64Mul => {
+            require_binary_signature(
+                region,
+                node,
+                operation,
+                inputs,
+                output,
+                [Rep::I64, Rep::I64],
+                Rep::I64,
+            )?;
+            if !has_local_fallback
+                || !matches!(
+                    failure,
+                    FailureMode::FallbackToPlan {
+                        target: crate::plan_v3::FallbackTarget::Region(_),
+                        ..
+                    }
+                )
+            {
+                return Err(format!(
+                    "prevalidated optimizer v3 region {region:?} operation node {node:?} {operation:?} needs a region local fallback for overflow"
+                ));
+            }
+            let op = match operation {
+                MechanicalOperation::CheckedI64Add => MechanicalCodegenOperation::CheckedI64Add,
+                MechanicalOperation::CheckedI64Sub => MechanicalCodegenOperation::CheckedI64Sub,
+                MechanicalOperation::CheckedI64Mul => MechanicalCodegenOperation::CheckedI64Mul,
+                _ => unreachable!("matched checked i64 operation"),
+            };
+            Ok((op, inputs, output))
+        }
+        MechanicalOperation::I64BitAnd
+        | MechanicalOperation::I64BitOr
+        | MechanicalOperation::I64BitXor => {
+            require_binary_signature(
+                region,
+                node,
+                operation,
+                inputs,
+                output,
+                [Rep::I64, Rep::I64],
+                Rep::I64,
+            )?;
+            if failure != &FailureMode::CannotFail {
+                return Err(format!(
+                    "prevalidated optimizer v3 region {region:?} operation node {node:?} {operation:?} must be CannotFail, got {failure:?}"
+                ));
+            }
+            let op = match operation {
+                MechanicalOperation::I64BitAnd => MechanicalCodegenOperation::I64BitAnd,
+                MechanicalOperation::I64BitOr => MechanicalCodegenOperation::I64BitOr,
+                MechanicalOperation::I64BitXor => MechanicalCodegenOperation::I64BitXor,
+                _ => unreachable!("matched i64 bitwise operation"),
+            };
+            Ok((op, inputs, output))
+        }
+        MechanicalOperation::I64CompareToBool01 { op: compare_op } => {
+            require_binary_signature(
+                region,
+                node,
+                operation,
+                inputs,
+                output,
+                [Rep::I64, Rep::I64],
+                Rep::I32Bool01,
+            )?;
+            if failure != &FailureMode::CannotFail {
+                return Err(format!(
+                    "prevalidated optimizer v3 region {region:?} operation node {node:?} I64CompareToBool01 must be CannotFail, got {failure:?}"
+                ));
+            }
+            Ok((
+                MechanicalCodegenOperation::I64CompareToBool01 { op: *compare_op },
+                inputs,
+                output,
+            ))
+        }
+        other => Err(format!(
+            "prevalidated optimizer v3 region {region:?} node {node:?} contains operation outside the validated emitter capability set {other:?}"
+        )),
+    }
+}
+
+fn binary_operation_parts(
+    region: RegionId,
+    node: PlanNodeId,
+    op: &MechanicalOperation,
+    inputs: &[PlanValue],
+    output: Option<PlanValue>,
+) -> Result<([PlanValue; 2], PlanValue), String> {
+    let [lhs, rhs] = inputs else {
+        return Err(format!(
+            "prevalidated optimizer v3 region {region:?} operation node {node:?} {op:?} expects two inputs, got {}",
+            inputs.len()
+        ));
+    };
+    let output = output.ok_or_else(|| {
+        format!("prevalidated optimizer v3 region {region:?} node {node:?} {op:?} has no output")
+    })?;
+    Ok(([*lhs, *rhs], output))
+}
+
+fn require_binary_signature(
+    region: RegionId,
+    node: PlanNodeId,
+    op: &MechanicalOperation,
+    inputs: [PlanValue; 2],
+    output: PlanValue,
+    expected_inputs: [Rep; 2],
+    expected_output: Rep,
+) -> Result<(), String> {
+    for (index, (input, expected)) in inputs.iter().zip(expected_inputs.iter()).enumerate() {
+        if input.rep != *expected {
+            return Err(format!(
+                "prevalidated optimizer v3 region {region:?} operation node {node:?} {op:?} input {index} expects {expected:?}, got {:?}",
+                input.rep
+            ));
+        }
+    }
+    if output.rep != expected_output {
+        return Err(format!(
+            "prevalidated optimizer v3 region {region:?} operation node {node:?} {op:?} output expects {expected_output:?}, got {:?}",
+            output.rep
+        ));
+    }
+    Ok(())
 }
 
 fn expected_mechanical_emission_for_plan_v3(
@@ -1425,6 +1870,38 @@ mod tests {
                 }
             }
         ));
+    }
+
+    #[test]
+    fn prepares_supported_codegen_steps() {
+        let emission = emit_mechanical_plan_v3(&test_plan(true)).unwrap();
+        let region = &emission.functions[0].regions[0];
+
+        let step =
+            mechanical_codegen_step(region.region, &region.steps[2], true, None, &HashSet::new())
+                .expect("checked i64 add should prepare for current codegen");
+
+        assert!(matches!(
+            step,
+            MechanicalCodegenStep::Operation {
+                op: MechanicalCodegenOperation::CheckedI64Add,
+                inputs: [
+                    PlanValue { rep: Rep::I64, .. },
+                    PlanValue { rep: Rep::I64, .. }
+                ],
+                output: PlanValue { rep: Rep::I64, .. }
+            }
+        ));
+
+        let err = mechanical_codegen_step(
+            region.region,
+            &region.steps[2],
+            false,
+            None,
+            &HashSet::new(),
+        )
+        .expect_err("checked i64 add without local fallback should be rejected before JIT");
+        assert!(err.contains("local fallback"), "unexpected error: {err}");
     }
 
     #[test]

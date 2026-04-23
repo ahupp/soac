@@ -120,7 +120,10 @@ use soac_opt::call_emission_v3::{
     typed_call_emission_plans_from_v3, v3_call_emission_sources as opt_v3_call_emission_sources,
 };
 use soac_opt::emit_v3::{
-    MechanicalExitKind, MechanicalOperation, MechanicalRegionEmission, MechanicalStepOp,
+    MechanicalCodegenConversion, MechanicalCodegenOperation, MechanicalCodegenStep,
+    MechanicalExitKind, MechanicalRegionEmission,
+    mechanical_codegen_step as opt_v3_mechanical_codegen_step,
+    mechanical_convert_inputs_for_output as opt_v3_mechanical_convert_inputs_for_output,
 };
 #[cfg(test)]
 use soac_opt::plan::ProfileEvidenceStore;
@@ -129,10 +132,9 @@ use soac_opt::plan::{
     load_optimization_plan,
 };
 use soac_opt::plan_v3::{
-    CallBodyKind as PlanV3CallBodyKind, ConversionKind, FallbackTarget, GuardFailure, GuardKind,
-    IndexedFieldAccessKind as PlanV3IndexedFieldAccessKind,
+    CallBodyKind as PlanV3CallBodyKind, IndexedFieldAccessKind as PlanV3IndexedFieldAccessKind,
     IndexedGlobalAccessKind as PlanV3IndexedGlobalAccessKind, MaterializeKind, PlanNodeId,
-    PlanValue, PlannedConstant, RegionId, RegionInputSource, RegionPlan, Rep, RichCompareOp,
+    PlanValue, RegionId, RegionInputSource, RegionPlan, Rep, RichCompareOp,
     ScalarThreadMaterialization,
 };
 use soac_opt::region_emission_v3::{
@@ -22000,85 +22002,55 @@ fn emit_opt_v3_mechanical_region_steps_controlled(
         return Ok(());
     }
     let preseeded_convert_inputs = if let Some(preseeded_scalar) = preseeded_scalar {
-        opt_v3_convert_inputs_for_output(region, preseeded_scalar)
+        opt_v3_mechanical_convert_inputs_for_output(region, preseeded_scalar)
     } else {
         HashSet::new()
     };
     for step in &region.steps {
-        match &step.op {
-            MechanicalStepOp::Input { output } => {
-                if preseeded_convert_inputs.contains(output) {
+        match opt_v3_mechanical_codegen_step(
+            region.region,
+            step,
+            local_fallback_block.is_some(),
+            preseeded_scalar,
+            &preseeded_convert_inputs,
+        )? {
+            MechanicalCodegenStep::Input { output } => {
+                if preseeded_convert_inputs.contains(&output) {
                     continue;
                 }
-                if !values.contains_key(output) {
+                if !values.contains_key(&output) {
                     return Err(format!(
                         "optimizer v3 region {:?} input node {:?} references missing value {:?}",
                         region.region, step.node, output
                     ));
                 }
             }
-            MechanicalStepOp::Constant { output, constant } => {
-                let value = match constant {
-                    PlannedConstant::I64(value) => {
-                        OptV3MechanicalValue::I64(fb.ins().iconst(emit_ctx.consts.i64_ty, *value))
-                    }
-                    other => {
-                        return Err(format!(
-                            "prevalidated optimizer v3 region {:?} constant node {:?} has non-i64 constant {other:?}",
-                            region.region, step.node
-                        ));
-                    }
-                };
-                opt_v3_store_mechanical_value(values, *output, value)?;
+            MechanicalCodegenStep::ConstantI64 { output, value } => {
+                let value =
+                    OptV3MechanicalValue::I64(fb.ins().iconst(emit_ctx.consts.i64_ty, value));
+                opt_v3_store_mechanical_value(values, output, value)?;
             }
-            MechanicalStepOp::Guard { inputs, .. }
-                if !preseeded_convert_inputs.is_empty()
-                    && !inputs.is_empty()
-                    && inputs
-                        .iter()
-                        .all(|input| preseeded_convert_inputs.contains(input)) => {}
-            MechanicalStepOp::Guard { kind, failure, .. } => {
-                if *kind != GuardKind::SpecializationCheck {
+            MechanicalCodegenStep::SpecializationGuard { .. } => {}
+            MechanicalCodegenStep::PreseededConvert { output } => {
+                if !values.contains_key(&output) {
                     return Err(format!(
-                        "prevalidated optimizer v3 region {:?} guard node {:?} has non-mechanical kind {kind:?}",
-                        region.region, step.node
-                    ));
-                }
-                if local_fallback_block.is_none() {
-                    return Err(format!(
-                        "optimizer v3 region {:?} guard node {:?} appears outside a local-fallback hot region",
-                        region.region, step.node
-                    ));
-                }
-                if !matches!(
-                    failure,
-                    GuardFailure::FallbackToPlan {
-                        target: FallbackTarget::Region(_),
-                        ..
-                    }
-                ) {
-                    return Err(format!(
-                        "prevalidated optimizer v3 region {:?} guard node {:?} has non-mechanical failure {failure:?}",
-                        region.region, step.node
+                        "optimizer v3 region {:?} preseeded conversion node {:?} references missing value {:?}",
+                        region.region, step.node, output
                     ));
                 }
             }
-            MechanicalStepOp::Convert {
+            MechanicalCodegenStep::Convert {
                 kind,
                 input,
                 output,
-                ..
             } => {
-                if preseeded_scalar == Some(*output) && values.contains_key(output) {
-                    continue;
-                }
                 emit_opt_v3_mechanical_convert(
                     fb,
                     region.region,
                     step.node,
-                    *kind,
-                    *input,
-                    *output,
+                    kind,
+                    input,
+                    output,
                     values,
                     local_fallback_block,
                     local_env,
@@ -22087,16 +22059,14 @@ fn emit_opt_v3_mechanical_region_steps_controlled(
                     func_imports,
                 )?;
             }
-            MechanicalStepOp::Operation {
-                op, inputs, output, ..
-            } => {
+            MechanicalCodegenStep::Operation { op, inputs, output } => {
                 emit_opt_v3_mechanical_operation(
                     fb,
                     region.region,
                     step.node,
                     op,
                     inputs,
-                    *output,
+                    output,
                     values,
                     local_fallback_block,
                     emit_ctx,
@@ -22104,7 +22074,7 @@ fn emit_opt_v3_mechanical_region_steps_controlled(
                     func_imports,
                 )?;
             }
-            MechanicalStepOp::Materialize {
+            MechanicalCodegenStep::Materialize {
                 kind,
                 input,
                 output,
@@ -22113,20 +22083,12 @@ fn emit_opt_v3_mechanical_region_steps_controlled(
                     fb,
                     region.region,
                     step.node,
-                    *kind,
-                    *input,
-                    *output,
+                    kind,
+                    input,
+                    output,
                     values,
                     emit_ctx,
                 )?;
-            }
-            MechanicalStepOp::Fallback { .. }
-            | MechanicalStepOp::Deopt { .. }
-            | MechanicalStepOp::Ownership { .. } => {
-                return Err(format!(
-                    "prevalidated optimizer v3 region {:?} node {:?} contains a non-emittable codegen step {:?}",
-                    region.region, step.node, step.op
-                ));
             }
         }
         if let Some(value) = stop_after_value
@@ -22144,30 +22106,12 @@ fn emit_opt_v3_mechanical_region_steps_controlled(
     Ok(())
 }
 
-fn opt_v3_convert_inputs_for_output(
-    region: &MechanicalRegionEmission,
-    output: PlanValue,
-) -> HashSet<PlanValue> {
-    region
-        .steps
-        .iter()
-        .filter_map(|step| match &step.op {
-            MechanicalStepOp::Convert {
-                input,
-                output: step_output,
-                ..
-            } if *step_output == output => Some(*input),
-            _ => None,
-        })
-        .collect()
-}
-
 #[allow(clippy::too_many_arguments)]
 fn emit_opt_v3_mechanical_convert(
     fb: &mut FunctionBuilder<'_>,
     region: RegionId,
     node: PlanNodeId,
-    kind: ConversionKind,
+    kind: MechanicalCodegenConversion,
     input: PlanValue,
     output: PlanValue,
     values: &mut HashMap<PlanValue, OptV3MechanicalValue>,
@@ -22178,7 +22122,7 @@ fn emit_opt_v3_mechanical_convert(
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<(), String> {
     match kind {
-        ConversionKind::FromPythonLongCompactToI64 => {
+        MechanicalCodegenConversion::FromPythonLongCompactToI64 => {
             let fallback_block = local_fallback_block.ok_or_else(|| {
                 format!(
                     "optimizer v3 region {region:?} conversion node {node:?} needs a local fallback block"
@@ -22206,7 +22150,7 @@ fn emit_opt_v3_mechanical_convert(
             };
             opt_v3_store_mechanical_value(values, output, OptV3MechanicalValue::I64(converted))
         }
-        ConversionKind::TruthinessToI32Bool01 => {
+        MechanicalCodegenConversion::TruthinessToI32Bool01 => {
             let (value, owned) = opt_v3_take_pyobject_value(values, input)?;
             let is_true_ref =
                 func_imports.get(codegen_env, &mut fb.func, &DP_JIT_IS_TRUE_IMPORT)?;
@@ -22225,9 +22169,6 @@ fn emit_opt_v3_mechanical_convert(
                 OptV3MechanicalValue::I32Bool01(truth_i32),
             )
         }
-        other => Err(format!(
-            "prevalidated optimizer v3 region {region:?} conversion node {node:?} contains conversion outside the validated emitter capability set {other:?}"
-        )),
     }
 }
 
@@ -22236,9 +22177,9 @@ fn emit_opt_v3_mechanical_operation(
     fb: &mut FunctionBuilder<'_>,
     region: RegionId,
     node: PlanNodeId,
-    op: &MechanicalOperation,
-    inputs: &[PlanValue],
-    output: Option<PlanValue>,
+    op: MechanicalCodegenOperation,
+    inputs: [PlanValue; 2],
+    output: PlanValue,
     values: &mut HashMap<PlanValue, OptV3MechanicalValue>,
     local_fallback_block: Option<ir::Block>,
     emit_ctx: &JitEmitCtx<'_>,
@@ -22246,35 +22187,22 @@ fn emit_opt_v3_mechanical_operation(
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<(), String> {
     match op {
-        MechanicalOperation::PyNumberAdd
-        | MechanicalOperation::PyNumberSubtract
-        | MechanicalOperation::PyNumberMultiply
-        | MechanicalOperation::PyNumberBitAnd
-        | MechanicalOperation::PyNumberBitOr
-        | MechanicalOperation::PyNumberBitXor => {
-            let (op_name, import) = match op {
-                MechanicalOperation::PyNumberAdd => ("PyNumberAdd", &PYNUMBER_ADD_IMPORT),
-                MechanicalOperation::PyNumberSubtract => {
-                    ("PyNumberSubtract", &PYNUMBER_SUBTRACT_IMPORT)
-                }
-                MechanicalOperation::PyNumberMultiply => {
-                    ("PyNumberMultiply", &PYNUMBER_MULTIPLY_IMPORT)
-                }
-                MechanicalOperation::PyNumberBitAnd => ("PyNumberBitAnd", &PYNUMBER_AND_IMPORT),
-                MechanicalOperation::PyNumberBitOr => ("PyNumberBitOr", &PYNUMBER_OR_IMPORT),
-                MechanicalOperation::PyNumberBitXor => ("PyNumberBitXor", &PYNUMBER_XOR_IMPORT),
+        MechanicalCodegenOperation::PyNumberAdd
+        | MechanicalCodegenOperation::PyNumberSubtract
+        | MechanicalCodegenOperation::PyNumberMultiply
+        | MechanicalCodegenOperation::PyNumberBitAnd
+        | MechanicalCodegenOperation::PyNumberBitOr
+        | MechanicalCodegenOperation::PyNumberBitXor => {
+            let import = match op {
+                MechanicalCodegenOperation::PyNumberAdd => &PYNUMBER_ADD_IMPORT,
+                MechanicalCodegenOperation::PyNumberSubtract => &PYNUMBER_SUBTRACT_IMPORT,
+                MechanicalCodegenOperation::PyNumberMultiply => &PYNUMBER_MULTIPLY_IMPORT,
+                MechanicalCodegenOperation::PyNumberBitAnd => &PYNUMBER_AND_IMPORT,
+                MechanicalCodegenOperation::PyNumberBitOr => &PYNUMBER_OR_IMPORT,
+                MechanicalCodegenOperation::PyNumberBitXor => &PYNUMBER_XOR_IMPORT,
                 _ => unreachable!("matched PyNumber binary operation"),
             };
-            let output = output.ok_or_else(|| {
-                format!("optimizer v3 region {region:?} node {node:?} {op_name} has no output")
-            })?;
-            if inputs.len() != 2 {
-                return Err(format!(
-                    "optimizer v3 region {region:?} node {node:?} {op_name} expects two inputs, got {}",
-                    inputs.len()
-                ));
-            }
-            let args = opt_v3_take_pyobject_call_args(values, inputs)?;
+            let args = opt_v3_take_pyobject_call_args(values, inputs.as_slice())?;
             let arg_values = args.iter().map(|(value, _)| *value).collect::<Vec<_>>();
             let owned_inputs = args
                 .iter()
@@ -22297,19 +22225,8 @@ fn emit_opt_v3_mechanical_operation(
                 },
             )
         }
-        MechanicalOperation::PyObjectRichCompare { op } => {
-            let output = output.ok_or_else(|| {
-                format!(
-                    "optimizer v3 region {region:?} node {node:?} PyObjectRichCompare has no output"
-                )
-            })?;
-            if inputs.len() != 2 {
-                return Err(format!(
-                    "optimizer v3 region {region:?} node {node:?} PyObjectRichCompare expects two inputs, got {}",
-                    inputs.len()
-                ));
-            }
-            let args = opt_v3_take_pyobject_call_args(values, inputs)?;
+        MechanicalCodegenOperation::PyObjectRichCompare { op } => {
+            let args = opt_v3_take_pyobject_call_args(values, inputs.as_slice())?;
             let mut arg_values = args.iter().map(|(value, _)| *value).collect::<Vec<_>>();
             let owned_inputs = args
                 .iter()
@@ -22317,7 +22234,7 @@ fn emit_opt_v3_mechanical_operation(
                 .collect::<Vec<_>>();
             let compare_op = fb.ins().iconst(
                 emit_ctx.consts.i32_ty,
-                i64::from(opt_v3_rich_compare_op_code(*op)),
+                i64::from(opt_v3_rich_compare_op_code(op)),
             );
             arg_values.push(compare_op);
             let compare_ref =
@@ -22338,35 +22255,26 @@ fn emit_opt_v3_mechanical_operation(
                 },
             )
         }
-        MechanicalOperation::CheckedI64Add
-        | MechanicalOperation::CheckedI64Sub
-        | MechanicalOperation::CheckedI64Mul => {
+        MechanicalCodegenOperation::CheckedI64Add
+        | MechanicalCodegenOperation::CheckedI64Sub
+        | MechanicalCodegenOperation::CheckedI64Mul => {
             let op_name = match op {
-                MechanicalOperation::CheckedI64Add => "CheckedI64Add",
-                MechanicalOperation::CheckedI64Sub => "CheckedI64Sub",
-                MechanicalOperation::CheckedI64Mul => "CheckedI64Mul",
+                MechanicalCodegenOperation::CheckedI64Add => "CheckedI64Add",
+                MechanicalCodegenOperation::CheckedI64Sub => "CheckedI64Sub",
+                MechanicalCodegenOperation::CheckedI64Mul => "CheckedI64Mul",
                 _ => unreachable!("matched checked i64 arithmetic operation"),
             };
-            let output = output.ok_or_else(|| {
-                format!("optimizer v3 region {region:?} node {node:?} {op_name} has no output")
-            })?;
             let fallback_block = local_fallback_block.ok_or_else(|| {
                 format!(
                     "optimizer v3 region {region:?} node {node:?} {op_name} needs a local fallback block"
                 )
             })?;
-            if inputs.len() != 2 {
-                return Err(format!(
-                    "optimizer v3 region {region:?} node {node:?} {op_name} expects two inputs, got {}",
-                    inputs.len()
-                ));
-            }
             let lhs = opt_v3_i64_value(values, inputs[0])?;
             let rhs = opt_v3_i64_value(values, inputs[1])?;
             let (result, overflow) = match op {
-                MechanicalOperation::CheckedI64Add => fb.ins().sadd_overflow(lhs, rhs),
-                MechanicalOperation::CheckedI64Sub => fb.ins().ssub_overflow(lhs, rhs),
-                MechanicalOperation::CheckedI64Mul => fb.ins().smul_overflow(lhs, rhs),
+                MechanicalCodegenOperation::CheckedI64Add => fb.ins().sadd_overflow(lhs, rhs),
+                MechanicalCodegenOperation::CheckedI64Sub => fb.ins().ssub_overflow(lhs, rhs),
+                MechanicalCodegenOperation::CheckedI64Mul => fb.ins().smul_overflow(lhs, rhs),
                 _ => unreachable!("matched checked i64 arithmetic operation"),
             };
             let ok_block = fb.create_block();
@@ -22382,51 +22290,28 @@ fn emit_opt_v3_mechanical_operation(
             let result = fb.block_params(ok_block)[0];
             opt_v3_store_mechanical_value(values, output, OptV3MechanicalValue::I64(result))
         }
-        MechanicalOperation::I64BitAnd
-        | MechanicalOperation::I64BitOr
-        | MechanicalOperation::I64BitXor => {
-            let output = output.ok_or_else(|| {
-                format!("optimizer v3 region {region:?} node {node:?} {op:?} has no output")
-            })?;
-            if inputs.len() != 2 {
-                return Err(format!(
-                    "optimizer v3 region {region:?} node {node:?} {op:?} expects two inputs, got {}",
-                    inputs.len()
-                ));
-            }
+        MechanicalCodegenOperation::I64BitAnd
+        | MechanicalCodegenOperation::I64BitOr
+        | MechanicalCodegenOperation::I64BitXor => {
             let lhs = opt_v3_i64_value(values, inputs[0])?;
             let rhs = opt_v3_i64_value(values, inputs[1])?;
             let result = match op {
-                MechanicalOperation::I64BitAnd => fb.ins().band(lhs, rhs),
-                MechanicalOperation::I64BitOr => fb.ins().bor(lhs, rhs),
-                MechanicalOperation::I64BitXor => fb.ins().bxor(lhs, rhs),
+                MechanicalCodegenOperation::I64BitAnd => fb.ins().band(lhs, rhs),
+                MechanicalCodegenOperation::I64BitOr => fb.ins().bor(lhs, rhs),
+                MechanicalCodegenOperation::I64BitXor => fb.ins().bxor(lhs, rhs),
                 _ => unreachable!("matched i64 bitwise operation"),
             };
             opt_v3_store_mechanical_value(values, output, OptV3MechanicalValue::I64(result))
         }
-        MechanicalOperation::I64CompareToBool01 { op } => {
-            let output = output.ok_or_else(|| {
-                format!(
-                    "optimizer v3 region {region:?} node {node:?} I64CompareToBool01 has no output"
-                )
-            })?;
-            if inputs.len() != 2 {
-                return Err(format!(
-                    "optimizer v3 region {region:?} node {node:?} I64CompareToBool01 expects two inputs, got {}",
-                    inputs.len()
-                ));
-            }
+        MechanicalCodegenOperation::I64CompareToBool01 { op } => {
             let lhs = opt_v3_i64_value(values, inputs[0])?;
             let rhs = opt_v3_i64_value(values, inputs[1])?;
-            let cond = fb.ins().icmp(opt_v3_rich_compare_intcc(*op), lhs, rhs);
+            let cond = fb.ins().icmp(opt_v3_rich_compare_intcc(op), lhs, rhs);
             let zero = fb.ins().iconst(emit_ctx.consts.i32_ty, 0);
             let one = fb.ins().iconst(emit_ctx.consts.i32_ty, 1);
             let value = fb.ins().select(cond, one, zero);
             opt_v3_store_mechanical_value(values, output, OptV3MechanicalValue::I32Bool01(value))
         }
-        other => Err(format!(
-            "prevalidated optimizer v3 region {region:?} node {node:?} contains operation outside the validated emitter capability set {other:?}"
-        )),
     }
 }
 
