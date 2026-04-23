@@ -172,6 +172,12 @@ fn format_pretty_counter_row(
     format!("  {}", fields.join(" "))
 }
 
+fn should_emit_pretty_counter_row(row: &CounterDumpRowView<'_>) -> bool {
+    row.kind != "deopt_entry_guard_miss"
+        || row.value > 0
+        || row.branch_values.iter().any(|branch| branch.value > 0)
+}
+
 fn format_key_layout_row(kind: &str, row: &CounterDumpKeyLayoutView<'_>) -> String {
     format!(
         "  {kind}_key owner={} key={} index={}",
@@ -306,6 +312,9 @@ fn main() -> Result<(), String> {
         let function_qualnames = build_function_qualname_map(rows.as_slice());
         for row in rows {
             if args.emit_pretty {
+                if !should_emit_pretty_counter_row(&row) {
+                    continue;
+                }
                 println!("{}", format_pretty_counter_row(&row, &function_qualnames));
             } else {
                 println!("{}", format_counter_row(&row));
@@ -317,7 +326,10 @@ fn main() -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_function_qualname_map, format_counter_row, format_pretty_counter_row};
+    use super::{
+        build_function_qualname_map, format_counter_row, format_pretty_counter_row,
+        should_emit_pretty_counter_row,
+    };
     use soac_core::block_py::{BlockLabel, InstrId, RuntimeFunctionId};
     use soac_core::profile::{
         CounterDumpBranchValueView, CounterDumpRecord, CounterDumpRow, CounterDumpRowView,
@@ -545,6 +557,42 @@ mod tests {
             rendered,
             "  counter=4 kind=getitem_specialized scope=this site=runtime function=add instr=bb0:0 value=0 branches=hit:3,fallback:1"
         );
+    }
+
+    #[test]
+    fn pretty_output_suppresses_zero_deopt_entry_guard_miss_rows() {
+        let zero_row = CounterDumpRowView {
+            counter_id: 9,
+            scope: "this",
+            kind: "deopt_entry_guard_miss",
+            site_kind: "runtime",
+            function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
+            current_function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
+            instr_id: None,
+            function_qualname: Some("run"),
+            block_label: None,
+            value: 0,
+            branch_values: Vec::new(),
+            observed_value: None,
+            max_overcount: None,
+        };
+        assert!(!should_emit_pretty_counter_row(&zero_row));
+        let hit_row = CounterDumpRowView {
+            counter_id: 9,
+            scope: "this",
+            kind: "deopt_entry_guard_miss",
+            site_kind: "runtime",
+            function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
+            current_function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
+            instr_id: None,
+            function_qualname: Some("run"),
+            block_label: None,
+            value: 1,
+            branch_values: Vec::new(),
+            observed_value: None,
+            max_overcount: None,
+        };
+        assert!(should_emit_pretty_counter_row(&hit_row));
     }
 
     #[test]
