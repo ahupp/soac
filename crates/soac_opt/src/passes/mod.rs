@@ -5,7 +5,6 @@ mod inline_sites;
 mod inline_transform;
 mod local_env_plan;
 mod ownership_effects;
-mod profiled_method_transform;
 pub(crate) mod value_facts;
 
 use soac_core::block_py::{BlockPyFunction, LocalLocation, NameLocation, ResolvedName};
@@ -130,11 +129,6 @@ pub use ownership_effects::{
     compute_typed_function_local_live_ins, compute_typed_function_local_must_bound_ins,
     plan_ownership_effects, plan_typed_ownership_effects, validate_ownership_effects,
     validate_typed_ownership_effects,
-};
-pub use profiled_method_transform::{
-    ProfiledMethodInlineRewriteStats, ProfiledOwnerAttrKey, ProfiledOwnerAttrSpecialization,
-    ProfiledRuntimeIterConstructorCall, collect_profiled_runtime_iter_method_target_ids,
-    rewrite_profiled_no_arg_method_call_store_sites,
 };
 pub use value_facts::{
     BoolFacts, BoolSingletonFact, CallableFact, EnvFacts, FactStore, I32Facts, I64Facts, NoneFact,
