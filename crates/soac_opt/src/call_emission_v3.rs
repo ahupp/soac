@@ -1,9 +1,10 @@
+use crate::artifacts_v3::ExactIntBranchV3Artifacts;
 use crate::plan_v3::{
     CallBodyKind, CallBodyPlan, ConstructorCallFallbackKind, ConstructorCallGuardKind,
     ConstructorCallOwnerType, DirectCallArgPlan, DirectCallArgSource, MethodCallFallbackKind,
     MethodCallGuardKind, MethodCallOwnerType,
 };
-use soac_core::block_py::{InstrId, RuntimeFunctionId};
+use soac_core::block_py::{InstrId, PersistentFunctionId, RuntimeFunctionId};
 use soac_lowering::passes::{
     TypedCallEmissionPlan, TypedCallEmissionPlans, TypedDirectCallArgPlan,
     TypedDirectCallArgSource, TypedDirectConstructorCallGuard, TypedDirectFunctionCallGuard,
@@ -70,6 +71,170 @@ pub fn typed_direct_call_arg_plan_from_v3(plan: &DirectCallArgPlan) -> TypedDire
             })
             .collect(),
     }
+}
+
+pub fn direct_calls_for_function_from_artifacts(
+    artifacts: &ExactIntBranchV3Artifacts,
+    mut resolve_target: impl FnMut(PersistentFunctionId) -> Result<Option<RuntimeFunctionId>, String>,
+) -> Result<Option<HashMap<InstrId, Vec<ResolvedV3DirectCallPlan>>>, String> {
+    let emitted_function = &artifacts.emission.functions[0];
+    if emitted_function.direct_calls.is_empty() {
+        return Ok(None);
+    }
+
+    let mut direct_calls = HashMap::<InstrId, Vec<ResolvedV3DirectCallPlan>>::new();
+    for direct_call in &emitted_function.direct_calls {
+        let persistent_target = artifacts
+            .plan
+            .identity_tables
+            .persistent_function_id(direct_call.target)
+            .map_err(|err| {
+                format!(
+                    "optimization plan v3 emitted direct-call target {} at {} cannot resolve identity: {err}",
+                    direct_call.target, direct_call.source
+                )
+            })?;
+        let Some(target) = resolve_target(persistent_target.clone())? else {
+            return Err(format!(
+                "optimization plan v3 emitted direct-call target {} ({:?}) at {} does not exist in loaded module set",
+                direct_call.target, persistent_target, direct_call.source
+            ));
+        };
+        let plans = direct_calls.entry(direct_call.source).or_default();
+        if !plans.iter().any(|plan| plan.target == target) {
+            plans.push(ResolvedV3DirectCallPlan {
+                source: direct_call.source,
+                target,
+                arg_plan: typed_direct_call_arg_plan_from_v3(&direct_call.arg_plan),
+                body: direct_call.body.clone(),
+                reason: direct_call.reason.clone(),
+            });
+        }
+    }
+    Ok(Some(direct_calls))
+}
+
+pub fn constructor_calls_for_function_from_artifacts(
+    artifacts: &ExactIntBranchV3Artifacts,
+    mut resolve_target: impl FnMut(PersistentFunctionId) -> Result<Option<RuntimeFunctionId>, String>,
+) -> Result<Option<HashMap<InstrId, Vec<ResolvedV3ConstructorCallPlan>>>, String> {
+    let emitted_function = &artifacts.emission.functions[0];
+    if emitted_function.constructor_calls.is_empty() {
+        return Ok(None);
+    }
+
+    let mut constructor_calls = HashMap::<InstrId, Vec<ResolvedV3ConstructorCallPlan>>::new();
+    for constructor_call in &emitted_function.constructor_calls {
+        let persistent_target = artifacts
+            .plan
+            .identity_tables
+            .persistent_function_id(constructor_call.target)
+            .map_err(|err| {
+                format!(
+                    "optimization plan v3 emitted constructor-call target {} at {} cannot resolve identity: {err}",
+                    constructor_call.target, constructor_call.source
+                )
+            })?;
+        let Some(target) = resolve_target(persistent_target.clone())? else {
+            return Err(format!(
+                "optimization plan v3 emitted constructor-call target {} ({:?}) at {} does not exist in loaded module set",
+                constructor_call.target, persistent_target, constructor_call.source
+            ));
+        };
+        let inline_target = if let Some(serialized_inline_target) =
+            constructor_call.body.inline_target
+        {
+            let persistent_inline_target = artifacts
+                    .plan
+                    .identity_tables
+                    .persistent_function_id(serialized_inline_target)
+                    .map_err(|err| {
+                        format!(
+                            "optimization plan v3 emitted constructor-call inline target {} at {} cannot resolve identity: {err}",
+                            serialized_inline_target, constructor_call.source
+                        )
+                    })?;
+            let Some(inline_target) = resolve_target(persistent_inline_target.clone())? else {
+                return Err(format!(
+                    "optimization plan v3 emitted constructor-call inline target {} ({:?}) at {} does not exist in loaded module set",
+                    serialized_inline_target, persistent_inline_target, constructor_call.source
+                ));
+            };
+            Some(inline_target)
+        } else {
+            None
+        };
+        let plans = constructor_calls
+            .entry(constructor_call.source)
+            .or_default();
+        if !plans.iter().any(|plan| {
+            plan.target == target
+                && plan.owner_type == constructor_call.owner_type
+                && plan.inline_target == inline_target
+        }) {
+            plans.push(ResolvedV3ConstructorCallPlan {
+                source: constructor_call.source,
+                target,
+                owner_type: constructor_call.owner_type.clone(),
+                arg_plan: typed_direct_call_arg_plan_from_v3(&constructor_call.arg_plan),
+                guard: constructor_call.guard.kind,
+                fallback: constructor_call.fallback.kind,
+                body: constructor_call.body.clone(),
+                inline_target,
+                reason: constructor_call.reason.clone(),
+            });
+        }
+    }
+    Ok(Some(constructor_calls))
+}
+
+pub fn method_calls_for_function_from_artifacts(
+    artifacts: &ExactIntBranchV3Artifacts,
+    mut resolve_target: impl FnMut(PersistentFunctionId) -> Result<Option<RuntimeFunctionId>, String>,
+) -> Result<Option<HashMap<InstrId, Vec<ResolvedV3MethodCallPlan>>>, String> {
+    let emitted_function = &artifacts.emission.functions[0];
+    if emitted_function.method_calls.is_empty() {
+        return Ok(None);
+    }
+
+    let mut method_calls = HashMap::<InstrId, Vec<ResolvedV3MethodCallPlan>>::new();
+    for method_call in &emitted_function.method_calls {
+        let persistent_target = artifacts
+            .plan
+            .identity_tables
+            .persistent_function_id(method_call.target)
+            .map_err(|err| {
+                format!(
+                    "optimization plan v3 emitted method-call target {} at {} cannot resolve identity: {err}",
+                    method_call.target, method_call.source
+                )
+            })?;
+        let Some(target) = resolve_target(persistent_target.clone())? else {
+            return Err(format!(
+                "optimization plan v3 emitted method-call target {} ({:?}) at {} does not exist in loaded module set",
+                method_call.target, persistent_target, method_call.source
+            ));
+        };
+        let plans = method_calls.entry(method_call.source).or_default();
+        if !plans.iter().any(|plan| {
+            plan.target == target
+                && plan.method_name == method_call.method_name
+                && plan.owner_type == method_call.owner_type
+        }) {
+            plans.push(ResolvedV3MethodCallPlan {
+                source: method_call.source,
+                target,
+                method_name: method_call.method_name.clone(),
+                owner_type: method_call.owner_type.clone(),
+                arg_plan: typed_direct_call_arg_plan_from_v3(&method_call.arg_plan),
+                guard: method_call.guard.kind,
+                fallback: method_call.fallback.kind,
+                body: method_call.body.clone(),
+                reason: method_call.reason.clone(),
+            });
+        }
+    }
+    Ok(Some(method_calls))
 }
 
 pub fn direct_call_targets(
@@ -184,6 +349,20 @@ pub fn merge_call_target_specializations(
         }
     }
     left
+}
+
+pub fn legacy_call_targets_excluding_sources(
+    call_target_specializations: &HashMap<InstrId, Vec<RuntimeFunctionId>>,
+    v3_sources: &HashSet<InstrId>,
+) -> HashMap<InstrId, Vec<RuntimeFunctionId>> {
+    if v3_sources.is_empty() {
+        return call_target_specializations.clone();
+    }
+    call_target_specializations
+        .iter()
+        .filter(|(source, _targets)| !v3_sources.contains(source))
+        .map(|(source, targets)| (*source, targets.clone()))
+        .collect()
 }
 
 pub fn prepare_constructor_call_plans_for_codegen(

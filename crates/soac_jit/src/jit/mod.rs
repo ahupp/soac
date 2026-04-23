@@ -82,6 +82,14 @@ use soac_lowering::passes::{
     validate_codegen_instr_ids, validate_typed_function_call_access_plans,
     validate_typed_function_value_facts,
 };
+use soac_opt::access_emission_v3::{
+    ExactListItemAccessPlan as OptV3ExactListItemAccessPlan,
+    IndexedFieldAccessPlan as OptV3IndexedFieldAccessPlan,
+    IndexedGlobalAccessPlan as OptV3IndexedGlobalAccessPlan,
+    exact_list_items_for_function_from_artifacts as opt_v3_emitted_exact_list_items_for_function,
+    indexed_fields_for_function_from_artifacts as opt_v3_emitted_indexed_fields_for_function,
+    indexed_globals_for_function_from_artifacts as opt_v3_emitted_indexed_globals_for_function,
+};
 use soac_opt::artifacts_v3::{
     ExactIntBranchV3Artifacts, load_optimization_artifacts_v3,
     single_function_optimization_artifacts_v3, validate_optimization_artifacts_v3_for_module,
@@ -90,19 +98,20 @@ use soac_opt::call_emission_v3::{
     PreparedV3ConstructorCallPlan, PreparedV3MethodCallPlan, ResolvedV3ConstructorCallPlan,
     ResolvedV3DirectCallPlan, ResolvedV3MethodCallPlan,
     constructor_call_targets as opt_v3_constructor_call_targets,
+    constructor_calls_for_function_from_artifacts as opt_v3_emitted_constructor_calls_for_function,
     direct_call_body_plans as opt_v3_direct_call_body_plans,
     direct_call_targets as opt_v3_direct_call_targets,
+    direct_calls_for_function_from_artifacts as opt_v3_emitted_direct_calls_for_function,
     inline_direct_call_targets as opt_v3_inline_direct_call_targets,
     inline_method_call_targets as opt_v3_inline_method_call_targets,
-    merge_call_target_specializations, method_call_targets as opt_v3_method_call_targets,
+    legacy_call_targets_excluding_sources, merge_call_target_specializations,
+    method_call_targets as opt_v3_method_call_targets,
+    method_calls_for_function_from_artifacts as opt_v3_emitted_method_calls_for_function,
     prepare_constructor_call_plans_for_codegen, prepare_method_call_plans_for_codegen,
-    typed_call_emission_plans_from_v3, typed_direct_call_arg_plan_from_v3,
-    v3_call_emission_sources as opt_v3_call_emission_sources,
+    typed_call_emission_plans_from_v3, v3_call_emission_sources as opt_v3_call_emission_sources,
 };
 use soac_opt::emit_v3::{
-    MechanicalExactListItemEmission, MechanicalExitKind, MechanicalIndexedFieldEmission,
-    MechanicalIndexedFieldGuard, MechanicalIndexedGlobalEmission, MechanicalOperation,
-    MechanicalRegionEmission, MechanicalStepOp,
+    MechanicalExitKind, MechanicalOperation, MechanicalRegionEmission, MechanicalStepOp,
 };
 #[cfg(test)]
 use soac_opt::plan::ProfileEvidenceStore;
@@ -111,20 +120,21 @@ use soac_opt::plan::{
     load_optimization_plan,
 };
 use soac_opt::plan_v3::{
-    CallBodyKind as PlanV3CallBodyKind, ConversionKind,
-    ExactListItemAccessKind as PlanV3ExactListItemAccessKind,
-    ExactListItemFallbackKind as PlanV3ExactListItemFallbackKind,
-    ExactListItemGuardKind as PlanV3ExactListItemGuardKind,
-    ExactListItemShape as PlanV3ExactListItemShape, FailureMode, FallbackTarget, GuardFailure,
-    GuardKind, IndexedFieldAccessKind as PlanV3IndexedFieldAccessKind,
+    CallBodyKind as PlanV3CallBodyKind, ConversionKind, FallbackTarget, GuardFailure, GuardKind,
+    IndexedFieldAccessKind as PlanV3IndexedFieldAccessKind,
     IndexedFieldFallbackKind as PlanV3IndexedFieldFallbackKind,
     IndexedFieldGuardKind as PlanV3IndexedFieldGuardKind,
-    IndexedGlobalAccessKind as PlanV3IndexedGlobalAccessKind,
-    IndexedGlobalFallbackKind as PlanV3IndexedGlobalFallbackKind,
-    IndexedGlobalGuardKind as PlanV3IndexedGlobalGuardKind, MaterializeKind, PlanNodeId, PlanValue,
-    PlannedConstant, RegionId, RegionInputSource, RegionPlan, Rep, RichCompareOp,
-    ScalarLocalThreadPlan, ScalarThreadFallback, ScalarThreadLocalCleanup,
-    ScalarThreadLocalLocation, ScalarThreadLocalState, ScalarThreadMaterialization,
+    IndexedGlobalAccessKind as PlanV3IndexedGlobalAccessKind, MaterializeKind, PlanNodeId,
+    PlanValue, PlannedConstant, RegionId, RegionInputSource, RegionPlan, Rep, RichCompareOp,
+    ScalarThreadMaterialization,
+};
+use soac_opt::region_emission_v3::{
+    ExactIntBranchSelection as OptV3ExactIntBranchSelection,
+    ExactIntReturnSelection as OptV3ExactIntReturnSelection,
+    exact_int_branch_selection_for_source as opt_v3_exact_int_branch_selection_for_source,
+    exact_int_return_selection_for_source as opt_v3_exact_int_return_selection_for_source,
+    scalar_thread_selection_for_store_branch as opt_v3_scalar_thread_selection_for_store_branch,
+    scalar_thread_unmaterialized_local_location as opt_v3_scalar_thread_unmaterialized_local_location,
 };
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
@@ -8250,22 +8260,6 @@ impl FieldIndexSpecialization {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct OptV3ExactListItemAccessPlan {
-    source: InstrId,
-    access: PlanV3ExactListItemAccessKind,
-    shape: PlanV3ExactListItemShape,
-    guard: PlanV3ExactListItemGuardKind,
-    fallback: PlanV3ExactListItemFallbackKind,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct OptV3IndexedFieldAccessPlan {
-    access: PlanV3IndexedFieldAccessKind,
-    guard: MechanicalIndexedFieldGuard,
-    fallback: PlanV3IndexedFieldFallbackKind,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 struct OptV3ResolvedIndexedFieldAccess {
     access: PlanV3IndexedFieldAccessKind,
     attr_name: String,
@@ -8377,17 +8371,6 @@ impl IndexedFieldLoweringPlan {
             None => Ok(None),
         }
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct OptV3IndexedGlobalAccessPlan {
-    source: InstrId,
-    access: PlanV3IndexedGlobalAccessKind,
-    module_name: String,
-    name: String,
-    expected_index: u32,
-    guard: PlanV3IndexedGlobalGuardKind,
-    fallback: PlanV3IndexedGlobalFallbackKind,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -12870,93 +12853,6 @@ fn planned_optimization_inputs_from_v3_artifacts_for_codegen_module(
     Ok(inputs)
 }
 
-fn opt_v3_emitted_indexed_fields_for_function(
-    artifacts: &ExactIntBranchV3Artifacts,
-) -> Result<Option<HashMap<InstrId, Vec<OptV3IndexedFieldAccessPlan>>>, String> {
-    let emitted_function = &artifacts.emission.functions[0];
-    if emitted_function.indexed_fields.is_empty() {
-        return Ok(None);
-    }
-
-    let mut by_source = HashMap::<InstrId, Vec<OptV3IndexedFieldAccessPlan>>::new();
-    for indexed_field in &emitted_function.indexed_fields {
-        let access = opt_v3_indexed_field_access_plan_from_emission(indexed_field);
-        let entry = by_source.entry(indexed_field.source).or_default();
-        if !entry.contains(&access) {
-            entry.push(access);
-        }
-    }
-    Ok(Some(by_source))
-}
-
-fn opt_v3_indexed_field_access_plan_from_emission(
-    indexed_field: &MechanicalIndexedFieldEmission,
-) -> OptV3IndexedFieldAccessPlan {
-    OptV3IndexedFieldAccessPlan {
-        access: indexed_field.access,
-        guard: indexed_field.guard.clone(),
-        fallback: indexed_field.fallback.kind,
-    }
-}
-
-fn opt_v3_emitted_exact_list_items_for_function(
-    artifacts: &ExactIntBranchV3Artifacts,
-) -> Result<Option<HashMap<InstrId, OptV3ExactListItemAccessPlan>>, String> {
-    let emitted_function = &artifacts.emission.functions[0];
-    if emitted_function.exact_list_items.is_empty() {
-        return Ok(None);
-    }
-
-    let mut by_source = HashMap::<InstrId, OptV3ExactListItemAccessPlan>::new();
-    for item in &emitted_function.exact_list_items {
-        let access = opt_v3_exact_list_item_access_plan_from_emission(item);
-        by_source.insert(item.source, access);
-    }
-    Ok(Some(by_source))
-}
-
-fn opt_v3_exact_list_item_access_plan_from_emission(
-    item: &MechanicalExactListItemEmission,
-) -> OptV3ExactListItemAccessPlan {
-    OptV3ExactListItemAccessPlan {
-        source: item.source,
-        access: item.access,
-        shape: item.shape,
-        guard: item.guard.kind,
-        fallback: item.fallback.kind,
-    }
-}
-
-fn opt_v3_emitted_indexed_globals_for_function(
-    artifacts: &ExactIntBranchV3Artifacts,
-) -> Result<Option<HashMap<InstrId, OptV3IndexedGlobalAccessPlan>>, String> {
-    let emitted_function = &artifacts.emission.functions[0];
-    if emitted_function.indexed_globals.is_empty() {
-        return Ok(None);
-    }
-
-    let mut by_source = HashMap::<InstrId, OptV3IndexedGlobalAccessPlan>::new();
-    for indexed_global in &emitted_function.indexed_globals {
-        let access = opt_v3_indexed_global_access_plan_from_emission(indexed_global);
-        by_source.insert(indexed_global.source, access);
-    }
-    Ok(Some(by_source))
-}
-
-fn opt_v3_indexed_global_access_plan_from_emission(
-    indexed_global: &MechanicalIndexedGlobalEmission,
-) -> OptV3IndexedGlobalAccessPlan {
-    OptV3IndexedGlobalAccessPlan {
-        source: indexed_global.source,
-        access: indexed_global.access,
-        module_name: indexed_global.module_name.clone(),
-        name: indexed_global.name.clone(),
-        expected_index: indexed_global.expected_index,
-        guard: indexed_global.guard.kind,
-        fallback: indexed_global.fallback.kind,
-    }
-}
-
 fn resolve_opt_v3_runtime_function_target(
     shared_state: &SharedModuleState,
     compile_session: Option<&crate::session::CompileSession>,
@@ -12984,170 +12880,6 @@ fn resolve_opt_v3_codegen_module_function_target(
         .iter()
         .any(|function| function.function_id == target_function_id)
         .then_some(target_function_id))
-}
-
-fn opt_v3_emitted_direct_calls_for_function(
-    artifacts: &ExactIntBranchV3Artifacts,
-    mut resolve_target: impl FnMut(PersistentFunctionId) -> Result<Option<RuntimeFunctionId>, String>,
-) -> Result<Option<HashMap<InstrId, Vec<ResolvedV3DirectCallPlan>>>, String> {
-    let emitted_function = &artifacts.emission.functions[0];
-    if emitted_function.direct_calls.is_empty() {
-        return Ok(None);
-    }
-
-    let mut direct_calls = HashMap::<InstrId, Vec<ResolvedV3DirectCallPlan>>::new();
-    for direct_call in &emitted_function.direct_calls {
-        let persistent_target = artifacts
-            .plan
-            .identity_tables
-            .persistent_function_id(direct_call.target)
-            .map_err(|err| {
-                format!(
-                    "optimization plan v3 emitted direct-call target {} at {} cannot resolve identity: {err}",
-                    direct_call.target, direct_call.source
-                )
-            })?;
-        let Some(target) = resolve_target(persistent_target.clone())? else {
-            return Err(format!(
-                "optimization plan v3 emitted direct-call target {} ({:?}) at {} does not exist in loaded module set",
-                direct_call.target, persistent_target, direct_call.source
-            ));
-        };
-        let plans = direct_calls.entry(direct_call.source).or_default();
-        if !plans.iter().any(|plan| plan.target == target) {
-            plans.push(ResolvedV3DirectCallPlan {
-                source: direct_call.source,
-                target,
-                arg_plan: typed_direct_call_arg_plan_from_v3(&direct_call.arg_plan),
-                body: direct_call.body.clone(),
-                reason: direct_call.reason.clone(),
-            });
-        }
-    }
-    Ok(Some(direct_calls))
-}
-
-fn opt_v3_emitted_constructor_calls_for_function(
-    artifacts: &ExactIntBranchV3Artifacts,
-    mut resolve_target: impl FnMut(PersistentFunctionId) -> Result<Option<RuntimeFunctionId>, String>,
-) -> Result<Option<HashMap<InstrId, Vec<ResolvedV3ConstructorCallPlan>>>, String> {
-    let emitted_function = &artifacts.emission.functions[0];
-    if emitted_function.constructor_calls.is_empty() {
-        return Ok(None);
-    }
-
-    let mut constructor_calls = HashMap::<InstrId, Vec<ResolvedV3ConstructorCallPlan>>::new();
-    for constructor_call in &emitted_function.constructor_calls {
-        let persistent_target = artifacts
-            .plan
-            .identity_tables
-            .persistent_function_id(constructor_call.target)
-            .map_err(|err| {
-                format!(
-                    "optimization plan v3 emitted constructor-call target {} at {} cannot resolve identity: {err}",
-                    constructor_call.target, constructor_call.source
-                )
-            })?;
-        let Some(target) = resolve_target(persistent_target.clone())? else {
-            return Err(format!(
-                "optimization plan v3 emitted constructor-call target {} ({:?}) at {} does not exist in loaded module set",
-                constructor_call.target, persistent_target, constructor_call.source
-            ));
-        };
-        let inline_target = if let Some(serialized_inline_target) =
-            constructor_call.body.inline_target
-        {
-            let persistent_inline_target = artifacts
-                    .plan
-                    .identity_tables
-                    .persistent_function_id(serialized_inline_target)
-                    .map_err(|err| {
-                        format!(
-                            "optimization plan v3 emitted constructor-call inline target {} at {} cannot resolve identity: {err}",
-                            serialized_inline_target, constructor_call.source
-                        )
-                    })?;
-            let Some(inline_target) = resolve_target(persistent_inline_target.clone())? else {
-                return Err(format!(
-                    "optimization plan v3 emitted constructor-call inline target {} ({:?}) at {} does not exist in loaded module set",
-                    serialized_inline_target, persistent_inline_target, constructor_call.source
-                ));
-            };
-            Some(inline_target)
-        } else {
-            None
-        };
-        let plans = constructor_calls
-            .entry(constructor_call.source)
-            .or_default();
-        if !plans.iter().any(|plan| {
-            plan.target == target
-                && plan.owner_type == constructor_call.owner_type
-                && plan.inline_target == inline_target
-        }) {
-            plans.push(ResolvedV3ConstructorCallPlan {
-                source: constructor_call.source,
-                target,
-                owner_type: constructor_call.owner_type.clone(),
-                arg_plan: typed_direct_call_arg_plan_from_v3(&constructor_call.arg_plan),
-                guard: constructor_call.guard.kind,
-                fallback: constructor_call.fallback.kind,
-                body: constructor_call.body.clone(),
-                inline_target,
-                reason: constructor_call.reason.clone(),
-            });
-        }
-    }
-    Ok(Some(constructor_calls))
-}
-
-fn opt_v3_emitted_method_calls_for_function(
-    artifacts: &ExactIntBranchV3Artifacts,
-    mut resolve_target: impl FnMut(PersistentFunctionId) -> Result<Option<RuntimeFunctionId>, String>,
-) -> Result<Option<HashMap<InstrId, Vec<ResolvedV3MethodCallPlan>>>, String> {
-    let emitted_function = &artifacts.emission.functions[0];
-    if emitted_function.method_calls.is_empty() {
-        return Ok(None);
-    }
-
-    let mut method_calls = HashMap::<InstrId, Vec<ResolvedV3MethodCallPlan>>::new();
-    for method_call in &emitted_function.method_calls {
-        let persistent_target = artifacts
-            .plan
-            .identity_tables
-            .persistent_function_id(method_call.target)
-            .map_err(|err| {
-                format!(
-                    "optimization plan v3 emitted method-call target {} at {} cannot resolve identity: {err}",
-                    method_call.target, method_call.source
-                )
-            })?;
-        let Some(target) = resolve_target(persistent_target.clone())? else {
-            return Err(format!(
-                "optimization plan v3 emitted method-call target {} ({:?}) at {} does not exist in loaded module set",
-                method_call.target, persistent_target, method_call.source
-            ));
-        };
-        let plans = method_calls.entry(method_call.source).or_default();
-        if !plans.iter().any(|plan| {
-            plan.target == target
-                && plan.method_name == method_call.method_name
-                && plan.owner_type == method_call.owner_type
-        }) {
-            plans.push(ResolvedV3MethodCallPlan {
-                source: method_call.source,
-                target,
-                method_name: method_call.method_name.clone(),
-                owner_type: method_call.owner_type.clone(),
-                arg_plan: typed_direct_call_arg_plan_from_v3(&method_call.arg_plan),
-                guard: method_call.guard.kind,
-                fallback: method_call.fallback.kind,
-                body: method_call.body.clone(),
-                reason: method_call.reason.clone(),
-            });
-        }
-    }
-    Ok(Some(method_calls))
 }
 
 fn opt_v3_single_function_artifacts(
@@ -13532,20 +13264,6 @@ impl FunctionSpecializationInputs {
                 && function.scope.scope_kind != CallableScopeKind::Module,
         })
     }
-}
-
-fn legacy_call_targets_excluding_sources(
-    call_target_specializations: &HashMap<InstrId, Vec<RuntimeFunctionId>>,
-    v3_sources: &HashSet<InstrId>,
-) -> HashMap<InstrId, Vec<RuntimeFunctionId>> {
-    if v3_sources.is_empty() {
-        return call_target_specializations.clone();
-    }
-    call_target_specializations
-        .iter()
-        .filter(|(source, _targets)| !v3_sources.contains(source))
-        .map(|(source, targets)| (*source, targets.clone()))
-        .collect()
 }
 
 impl<'a> SpecializationProfile<'a> {
@@ -21958,29 +21676,6 @@ fn emit_typed_local_load_result_with_local_env(
 }
 
 #[derive(Clone, Copy)]
-struct OptV3ExactIntBranchSelection<'a> {
-    hot_plan: &'a RegionPlan,
-    hot_region: &'a MechanicalRegionEmission,
-    fallback_plan: &'a RegionPlan,
-    fallback_region: &'a MechanicalRegionEmission,
-}
-
-#[derive(Clone, Copy)]
-struct OptV3ExactIntReturnSelection<'a> {
-    hot_plan: &'a RegionPlan,
-    hot_region: &'a MechanicalRegionEmission,
-    fallback_plan: &'a RegionPlan,
-    fallback_region: &'a MechanicalRegionEmission,
-}
-
-#[derive(Clone, Copy)]
-struct OptV3ScalarThreadSelection<'a> {
-    thread: &'a ScalarLocalThreadPlan,
-    producer: OptV3ExactIntReturnSelection<'a>,
-    consumer: OptV3ExactIntBranchSelection<'a>,
-}
-
-#[derive(Clone, Copy)]
 struct OptV3ScalarThreadInlineReturnTargets<'a> {
     then_label: BlockLabel,
     then_term: &'a BlockTerm<InstrCodegen>,
@@ -22014,194 +21709,6 @@ impl OptV3MechanicalValue {
             ) | (Self::I64(_), Rep::I64)
                 | (Self::I32Bool01(_), Rep::I32Bool01)
         )
-    }
-}
-
-fn opt_v3_exact_int_branch_selection_for_source<'a>(
-    artifacts: &'a ExactIntBranchV3Artifacts,
-    source: InstrId,
-) -> Result<Option<OptV3ExactIntBranchSelection<'a>>, String> {
-    let Some(planned_function) = artifacts.plan.functions.first() else {
-        return Ok(None);
-    };
-    let Some(emitted_function) = artifacts.emission.functions.first() else {
-        return Ok(None);
-    };
-    let Some(hot_region) = emitted_function
-        .regions
-        .iter()
-        .find(|region| opt_v3_region_has_branch_source(region, source))
-    else {
-        return Ok(None);
-    };
-    let hot_plan = planned_function
-        .regions
-        .iter()
-        .find(|region| region.id == hot_region.region)
-        .ok_or_else(|| {
-            format!(
-                "optimizer v3 emission region {:?} for source {source} has no matching plan region",
-                hot_region.region
-            )
-        })?;
-    let fallback_region_id = opt_v3_local_fallback_region(hot_region).ok_or_else(|| {
-        format!(
-            "prevalidated optimizer v3 branch region {:?} for source {source} has no local fallback region",
-            hot_region.region
-        )
-    })?;
-    let fallback_region = emitted_function
-        .regions
-        .iter()
-        .find(|region| region.region == fallback_region_id)
-        .ok_or_else(|| {
-            format!(
-                "optimizer v3 branch region {:?} for source {source} references missing fallback region {:?}",
-                hot_region.region, fallback_region_id
-            )
-        })?;
-    let fallback_plan = planned_function
-        .regions
-        .iter()
-        .find(|region| region.id == fallback_region_id)
-        .ok_or_else(|| {
-            format!(
-                "optimizer v3 fallback emission region {:?} for source {source} has no matching plan region",
-                fallback_region_id
-            )
-        })?;
-    Ok(Some(OptV3ExactIntBranchSelection {
-        hot_plan,
-        hot_region,
-        fallback_plan,
-        fallback_region,
-    }))
-}
-
-fn opt_v3_region_has_branch_source(region: &MechanicalRegionEmission, source: InstrId) -> bool {
-    region.exits.iter().any(|exit| {
-        exit.source == Some(source) && matches!(exit.kind, MechanicalExitKind::Branch { .. })
-    })
-}
-
-fn opt_v3_exact_int_return_selection_for_source<'a>(
-    artifacts: &'a ExactIntBranchV3Artifacts,
-    source: InstrId,
-) -> Result<Option<OptV3ExactIntReturnSelection<'a>>, String> {
-    let Some(planned_function) = artifacts.plan.functions.first() else {
-        return Ok(None);
-    };
-    let Some(emitted_function) = artifacts.emission.functions.first() else {
-        return Ok(None);
-    };
-    let Some(hot_region) = emitted_function
-        .regions
-        .iter()
-        .find(|region| opt_v3_region_has_return_source(region, source))
-    else {
-        return Ok(None);
-    };
-    let hot_plan = planned_function
-        .regions
-        .iter()
-        .find(|region| region.id == hot_region.region)
-        .ok_or_else(|| {
-            format!(
-                "optimizer v3 emission region {:?} for source {source} has no matching plan region",
-                hot_region.region
-            )
-        })?;
-    let fallback_region_id = opt_v3_local_fallback_region(hot_region).ok_or_else(|| {
-        format!(
-            "prevalidated optimizer v3 return region {:?} for source {source} has no local fallback region",
-            hot_region.region
-        )
-    })?;
-    let fallback_region = emitted_function
-        .regions
-        .iter()
-        .find(|region| region.region == fallback_region_id)
-        .ok_or_else(|| {
-            format!(
-                "optimizer v3 return region {:?} for source {source} references missing fallback region {:?}",
-                hot_region.region, fallback_region_id
-            )
-        })?;
-    let fallback_plan = planned_function
-        .regions
-        .iter()
-        .find(|region| region.id == fallback_region_id)
-        .ok_or_else(|| {
-            format!(
-                "optimizer v3 fallback emission region {:?} for source {source} has no matching plan region",
-                fallback_region_id
-            )
-        })?;
-    Ok(Some(OptV3ExactIntReturnSelection {
-        hot_plan,
-        hot_region,
-        fallback_plan,
-        fallback_region,
-    }))
-}
-
-fn opt_v3_scalar_thread_selection_for_store_branch<'a>(
-    artifacts: &'a ExactIntBranchV3Artifacts,
-    producer_source: InstrId,
-    consumer_source: InstrId,
-    local_name: &ResolvedName,
-) -> Result<Option<OptV3ScalarThreadSelection<'a>>, String> {
-    let Some(emitted_function) = artifacts.emission.functions.first() else {
-        return Ok(None);
-    };
-    let Some(producer) = opt_v3_exact_int_return_selection_for_source(artifacts, producer_source)?
-    else {
-        return Ok(None);
-    };
-    let Some(consumer) = opt_v3_exact_int_branch_selection_for_source(artifacts, consumer_source)?
-    else {
-        return Ok(None);
-    };
-    let Some(thread) = emitted_function.scalar_threads.iter().find(|thread| {
-        thread.producer.region == producer.hot_plan.id
-            && thread.consumer.region == consumer.hot_plan.id
-            && opt_v3_scalar_thread_matches_local(thread, local_name)
-    }) else {
-        return Ok(None);
-    };
-    let ScalarThreadFallback::LocalFallbackRegion { region, .. } = &thread.fallback;
-    debug_assert_eq!(*region, producer.fallback_plan.id);
-    Ok(Some(OptV3ScalarThreadSelection {
-        thread,
-        producer,
-        consumer,
-    }))
-}
-
-fn opt_v3_scalar_thread_matches_local(
-    thread: &ScalarLocalThreadPlan,
-    local_name: &ResolvedName,
-) -> bool {
-    let Some(location) = local_name.local_location() else {
-        return false;
-    };
-    match thread.local.location {
-        ScalarThreadLocalLocation::Local { slot } => {
-            slot == location.slot() && thread.local.name == local_name.id_str()
-        }
-    }
-}
-
-fn opt_v3_scalar_thread_unmaterialized_local_location(
-    thread: &ScalarLocalThreadPlan,
-) -> Result<Option<LocalLocation>, String> {
-    match &thread.local_state {
-        ScalarThreadLocalState::ScalarOnlyHotPath {
-            cleanup: ScalarThreadLocalCleanup::NoPyObjectSlotOwnership,
-            ..
-        } => match thread.local.location {
-            ScalarThreadLocalLocation::Local { slot } => Ok(Some(LocalLocation(slot))),
-        },
     }
 }
 
@@ -22302,47 +21809,6 @@ fn opt_v3_scalar_thread_inline_return_target<'a>(
         return Ok(None);
     }
     Ok(Some(&target_block.term))
-}
-
-fn opt_v3_region_has_return_source(region: &MechanicalRegionEmission, source: InstrId) -> bool {
-    region.exits.iter().any(|exit| {
-        exit.source == Some(source) && matches!(exit.kind, MechanicalExitKind::Return { .. })
-    })
-}
-
-fn opt_v3_local_fallback_region(region: &MechanicalRegionEmission) -> Option<RegionId> {
-    for step in &region.steps {
-        match &step.op {
-            MechanicalStepOp::Guard { failure, .. } => match failure {
-                GuardFailure::FallbackToPlan {
-                    target: FallbackTarget::Region(region),
-                    ..
-                } => return Some(*region),
-                GuardFailure::FallbackToPlan { .. } | GuardFailure::DeoptTo { .. } => {}
-            },
-            MechanicalStepOp::Convert { failure, .. }
-            | MechanicalStepOp::Operation { failure, .. } => {
-                if let Some(region) = opt_v3_failure_fallback_region(failure) {
-                    return Some(region);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-fn opt_v3_failure_fallback_region(failure: &FailureMode) -> Option<RegionId> {
-    match failure {
-        FailureMode::FallbackToPlan {
-            target: FallbackTarget::Region(region),
-            ..
-        } => Some(*region),
-        FailureMode::CannotFail
-        | FailureMode::Raise(_)
-        | FailureMode::FallbackToPlan { .. }
-        | FailureMode::DeoptTo { .. } => None,
-    }
 }
 
 fn emit_opt_v3_exact_int_branch_truth_i32(
