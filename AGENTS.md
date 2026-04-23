@@ -460,8 +460,9 @@ explicit ordinary
 - `SOAC_ENABLE_PROFILED_COLD_BLOCKS`
   Optional opt-in for replaying `block_entry` counters from
   `$SOAC_WORK_DIR/profile.bin` as Cranelift `cold` block hints during
-  `verify`/`apply`. This is disabled by default; the counters remain
-  recorded in `profile`/`verify` either way.
+  `verify`/`apply`. This is disabled by default; `profile` and
+  `verify` only insert the underlying `block_entry` counters when this
+  flag is enabled.
 - `BENCHMARK_CPU` / `BENCHMARK_CONSTANT_CLOCKS`
   The benchmark recipes use
   [scripts/run_benchmark_with_cpu_mode.sh](/home/adam/project/soac-profile/scripts/run_benchmark_with_cpu_mode.sh)

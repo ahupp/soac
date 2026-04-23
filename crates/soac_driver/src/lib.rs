@@ -406,7 +406,9 @@ fn finish_codegen_module_with_tracker(
         if passes::locality_counter_instrumentation_enabled(env_config) {
             pass_tracker.run_pass("bb_locality_counters", || {
                 let mut counted = bb_call_target_counted;
-                passes::instrument_bb_module_with_block_entry_counters(&mut counted);
+                if env_config.profiled_cold_blocks_enabled() {
+                    passes::instrument_bb_module_with_block_entry_counters(&mut counted);
+                }
                 passes::instrument_bb_module_with_locality_counters(&mut counted);
                 counted
             })
@@ -524,53 +526,75 @@ mod tests {
     }
 
     #[test]
-    fn profile_mode_adds_block_entry_counters() {
-        let config =
-            SoacEnvConfig::default().with_specialization_mode(Some(SpecializationMode::Profile));
+    fn profile_and_verify_mode_add_block_entry_counters_only_for_profiled_cold_blocks() {
         let source = "def f(x):\n    if x:\n        return 1\n    return 0\n";
-        let lowered = lower_python_to_blockpy_for_testing_with_config(source, &config)
-            .expect("transform should succeed")
-            .codegen_module;
+        for mode in [SpecializationMode::Profile, SpecializationMode::Verify] {
+            let config = SoacEnvConfig::default().with_specialization_mode(Some(mode));
+            let lowered = lower_python_to_blockpy_for_testing_with_config(source, &config)
+                .expect("transform should succeed")
+                .codegen_module;
+            assert!(
+                lowered
+                    .counter_defs
+                    .iter()
+                    .all(|counter| counter.kind != "block_entry"),
+                "{mode:?} lowering should not attach block_entry counters by default"
+            );
+            assert_eq!(
+                lowered
+                    .counter_defs
+                    .iter()
+                    .filter(|counter| counter.kind == "branch_outcomes")
+                    .count(),
+                1,
+                "{mode:?} lowering should still add branch_outcomes counters"
+            );
 
-        let block_entry_counters = lowered
-            .counter_defs
-            .iter()
-            .filter(|counter| counter.kind == "block_entry")
-            .collect::<Vec<_>>();
-        let jit_function_ids = lowered
-            .callable_defs
-            .iter()
-            .filter(|function| function.execution_mode() == FunctionExecutionMode::Jit)
-            .map(|function| function.function_id)
-            .collect::<Vec<_>>();
-        let total_jit_blocks = lowered
-            .callable_defs
-            .iter()
-            .filter(|function| function.execution_mode() == FunctionExecutionMode::Jit)
-            .map(|function| function.blocks.len())
-            .sum::<usize>();
-        assert_eq!(
-            block_entry_counters.len(),
-            total_jit_blocks,
-            "profile lowering should attach one block_entry counter per lowered JIT block"
-        );
-        assert!(block_entry_counters.iter().all(|counter| {
-            counter.scope == CounterScope::This
-                && matches!(
-                    &counter.site,
-                    CounterSite::BlockEntry { function_id, .. }
-                    if jit_function_ids.contains(function_id)
-                )
-        }));
-        assert_eq!(
-            lowered
+            let config = config.with_profiled_cold_blocks_enabled(true);
+            let lowered = lower_python_to_blockpy_for_testing_with_config(source, &config)
+                .expect("transform should succeed")
+                .codegen_module;
+
+            let block_entry_counters = lowered
                 .counter_defs
                 .iter()
-                .filter(|counter| counter.kind == "branch_outcomes")
-                .count(),
-            1,
-            "profile lowering should still add branch_outcomes counters"
-        );
+                .filter(|counter| counter.kind == "block_entry")
+                .collect::<Vec<_>>();
+            let jit_function_ids = lowered
+                .callable_defs
+                .iter()
+                .filter(|function| function.execution_mode() == FunctionExecutionMode::Jit)
+                .map(|function| function.function_id)
+                .collect::<Vec<_>>();
+            let total_jit_blocks = lowered
+                .callable_defs
+                .iter()
+                .filter(|function| function.execution_mode() == FunctionExecutionMode::Jit)
+                .map(|function| function.blocks.len())
+                .sum::<usize>();
+            assert_eq!(
+                block_entry_counters.len(),
+                total_jit_blocks,
+                "{mode:?} lowering should attach one block_entry counter per lowered JIT block when profiled cold blocks are enabled"
+            );
+            assert!(block_entry_counters.iter().all(|counter| {
+                counter.scope == CounterScope::This
+                    && matches!(
+                        &counter.site,
+                        CounterSite::BlockEntry { function_id, .. }
+                        if jit_function_ids.contains(function_id)
+                    )
+            }));
+            assert_eq!(
+                lowered
+                    .counter_defs
+                    .iter()
+                    .filter(|counter| counter.kind == "branch_outcomes")
+                    .count(),
+                1,
+                "{mode:?} lowering should still add branch_outcomes counters"
+            );
+        }
     }
 
     #[test]

@@ -250,6 +250,11 @@ impl SoacEnvConfig {
         self
     }
 
+    pub fn with_profiled_cold_blocks_enabled(mut self, enabled: bool) -> Self {
+        self.profiled_cold_blocks_enabled = enabled;
+        self
+    }
+
     pub fn with_soac_log(mut self, soac_log: SoacLogConfig, explicit: bool) -> Self {
         self.soac_log = soac_log;
         self.soac_log_explicit = explicit;
