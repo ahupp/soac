@@ -107,7 +107,6 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Args> {
             "--counters" => parsed.counters = Some(next_path(&mut args, flag)?),
             "--module" => parsed.modules.push(next_path(&mut args, flag)?),
             "--module-root" => parsed.module_root = Some(next_path(&mut args, flag)?),
-            "--mode" => parse_mode(&mut args, flag)?,
             "--out" => parsed.out = Some(next_path(&mut args, flag)?),
             "--help" | "-h" => {
                 print_usage();
@@ -125,22 +124,9 @@ fn next_path(args: &mut impl Iterator<Item = OsString>, flag: &str) -> Result<Pa
         .ok_or_else(|| anyhow!("{flag} requires a value"))
 }
 
-fn parse_mode(args: &mut impl Iterator<Item = OsString>, flag: &str) -> Result<()> {
-    let mode = args
-        .next()
-        .ok_or_else(|| anyhow!("{flag} requires a value"))?;
-    let mode = mode
-        .to_str()
-        .ok_or_else(|| anyhow!("non-UTF-8 {flag} value is unsupported: {mode:?}"))?;
-    match mode {
-        "v3" => Ok(()),
-        _ => bail!("{flag} only accepts 'v3', got {mode:?}"),
-    }
-}
-
 fn print_usage() {
     println!(
-        "usage: decide_optimizations --counters <profile.bin> [--mode v3] [--module <mod.blockpy> ...] [--module-root <root-dir>] --out <root-dir>\n\nScans cached mod.blockpy files and writes sibling mod.optv3 and mod.optv3.blockpy files from raw profile evidence and cached unoptimized BlockPy modules. Use --module-root to scan a different input root, or --module for narrow debugging."
+        "usage: decide_optimizations --counters <profile.bin> [--module <mod.blockpy> ...] [--module-root <root-dir>] --out <root-dir>\n\nScans cached mod.blockpy files and writes sibling mod.optv3 and mod.optv3.blockpy files from raw profile evidence and cached unoptimized BlockPy modules. Use --module-root to scan a different input root, or --module for narrow debugging."
     );
 }
 
@@ -370,7 +356,7 @@ mod test {
     }
 
     #[test]
-    fn mode_v3_emits_mod_optv3_under_requested_root() {
+    fn emits_v3_mod_optv3_under_requested_root() {
         let root = unique_temp_dir();
         let module_name = "pkg.modv3";
         let module = store_test_module(
@@ -401,8 +387,6 @@ mod test {
         run_with_args([
             OsString::from("--counters"),
             counters_path.into_os_string(),
-            OsString::from("--mode"),
-            OsString::from("v3"),
             OsString::from("--module"),
             module_cache_path.into_os_string(),
             OsString::from("--out"),
@@ -431,7 +415,7 @@ mod test {
     }
 
     #[test]
-    fn mode_v3_emits_cross_module_direct_call_identity() {
+    fn emits_v3_cross_module_direct_call_identity() {
         let root = unique_temp_dir();
         let module_cache_root = root.join("modules-in");
         let out_root = root.join("modules-out");
@@ -489,8 +473,6 @@ mod test {
         run_with_args([
             OsString::from("--counters"),
             counters_path.into_os_string(),
-            OsString::from("--mode"),
-            OsString::from("v3"),
             OsString::from("--module"),
             caller_cache_path.into_os_string(),
             OsString::from("--module"),

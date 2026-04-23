@@ -1,5 +1,3 @@
-# soac: opt-plan-mode=v3
-
 VALUE = 0
 
 

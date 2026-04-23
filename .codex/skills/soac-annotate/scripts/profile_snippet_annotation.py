@@ -47,7 +47,7 @@ def main() -> int:
         raise RuntimeError(f"SOAC did not write profile counters at {profile_dump}")
 
     function_id = lookup_function_id(source_path, target_name)
-    optimization_decisions_v3 = decide_optimizations(profile_dump, counters_dir, mode="v3")
+    optimization_decisions_v3 = decide_optimizations(profile_dump, counters_dir)
     optimization_plan_v3 = print_optimization_plans_v3(counters_dir)
     post_opt_v3 = print_post_opt_v3_definition(counters_dir)
     specializations = inspect_specializations(profile_dump)
@@ -292,14 +292,12 @@ def inspect_specializations(profile_dump: Path) -> str:
         return f"inspect_counters failed\n{err}\n"
 
 
-def decide_optimizations(profile_dump: Path, counters_dir: Path, *, mode: str) -> str:
+def decide_optimizations(profile_dump: Path, counters_dir: Path) -> str:
     module_root = counters_dir / "modules"
     return run_inspector(
         "decide_optimizations",
         "--counters",
         str(profile_dump),
-        "--mode",
-        mode,
         "--module-root",
         str(module_root),
         "--out",

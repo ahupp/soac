@@ -243,12 +243,11 @@ def integration_module(
         yield module
 
 
-def decide_optimizations_for_work_dir(work_dir: Path, *, mode: str = "v3") -> int:
+def decide_optimizations_for_work_dir(work_dir: Path) -> int:
     counters_path = work_dir / "profile.bin"
     module_root = work_dir / "modules"
     return _soac_ext.decide_optimizations_for_counter_dump(
         str(counters_path),
         str(module_root),
         str(module_root),
-        mode=mode,
     )

@@ -1,6 +1,3 @@
-# soac: opt-plan-mode=v3
-
-
 def list_get_set(items, index, value):
     items[index] = value
     return items[index]

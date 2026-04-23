@@ -408,7 +408,7 @@ tree, with pystone benchmark runs writing to `work/bench/`.
   `verify.bin`, `events.jsonl`), generated optimization plans, and the
   revision-scoped BlockPy module cache under `counters/modules`; it does not
   run `perf` and it does not build inspector-based counter/CLIF artifacts. The
-  profile pass is immediately followed by `decide_optimizations --mode v3`, so
+  profile pass is immediately followed by `decide_optimizations`, so
   verify and apply consume serialized v3 plan artifacts rather than raw counters
   or legacy decisions. The specialized apply phase reports both the default
   refcounts-enabled throughput and an additional unsound
@@ -443,8 +443,7 @@ tree, with pystone benchmark runs writing to `work/bench/`.
   `mod.blockpy` files, and write sibling `mod.optv3` and `mod.optv3.blockpy`
   artifacts from raw profile evidence and cached unoptimized BlockPy modules
   using stable module artifact paths such as `python-stdlib/typing/mod.optv3`
-  and `python-stdlib/typing/mod.optv3.blockpy`. `--mode v3` is accepted for
-  compatibility with existing scripts.
+  and `python-stdlib/typing/mod.optv3.blockpy`.
   Pass `--module-root <root-dir>` to scan a different input root, or one or more
   `--module <mod.blockpy>` arguments for narrower debugging.
   Use `cargo run -p soac_inspector --bin print_optimization_plan_v3 -- --plan <mod.optv3>`

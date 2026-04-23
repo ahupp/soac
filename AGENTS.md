@@ -447,9 +447,8 @@ explicit ordinary
   dumps. `profile` writes raw evidence to `profile.bin`; run
   `decide_optimizations` to turn that evidence plus cached BlockPy modules into
   per-module `mod.optv3` optimization plans and `mod.optv3.blockpy` optimized
-  codegen modules before entering `verify` or `apply`. Use `--mode v3` to write
-  those artifacts from raw profile evidence and cached unoptimized BlockPy
-  modules. `verify`/`apply` require matching `mod.optv3` and
+  codegen modules before entering `verify` or `apply`. `verify`/`apply` require
+  matching `mod.optv3` and
   `mod.optv3.blockpy` artifacts; there is no runtime fallback to legacy
   `mod.opt`.
   `verify` exercises indexed store
@@ -525,9 +524,8 @@ explicit ordinary
   Standalone optimization-decision planner. It loads the counter dump once,
   scans cached BlockPy modules under the output root by default, and writes
   binary `mod.optv3` and `mod.optv3.blockpy` artifacts beside those modules,
-  such as `$SOAC_WORK_DIR/modules/python-stdlib/typing/mod.optv3`. `--mode v3`
-  is accepted for compatibility with existing scripts. Use `--module` for a narrow
-  debugging input or `--module-root` to scan a different cache root. Use
+  such as `$SOAC_WORK_DIR/modules/python-stdlib/typing/mod.optv3`. Use `--module`
+  for a narrow debugging input or `--module-root` to scan a different cache root. Use
   `cargo run -p soac_inspector --bin print_optimization_plan_v3 -- --plan <mod.optv3>`
   to inspect a v3 artifact summary. In `SOAC_OPT_MODE=verify|apply`, runtime
   loading requires a matching serialized v3 artifact and optimized codegen

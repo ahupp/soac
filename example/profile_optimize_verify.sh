@@ -28,8 +28,6 @@ fi
 
 export SOAC_WORK_DIR="$WORK_DIR"
 export SOAC_MODULE_ENABLED="path:$SCRIPT_DIR"
-export SOAC_OPT_PLAN_MODE="${SOAC_OPT_PLAN_MODE:-v3}"
-export SOAC_DECIDE_OPT_MODE="${SOAC_DECIDE_OPT_MODE:-v3}"
 
 echo "work dir: $SOAC_WORK_DIR"
 
@@ -41,7 +39,6 @@ SOAC_OPT_MODE=profile just py "$SCRIPT_DIR/specialization_demo.py"
 
 echo "optimize"
 "$REPO_ROOT/target/release/decide_optimizations" \
-  --mode "$SOAC_DECIDE_OPT_MODE" \
   --counters "$SOAC_WORK_DIR/profile.bin" \
   --out "$SOAC_WORK_DIR/modules"
 

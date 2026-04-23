@@ -171,31 +171,18 @@ fn inspect_optimization_artifacts_v3_json(path: &str) -> PyResult<String> {
     .map_err(|err| PyRuntimeError::new_err(format!("failed to encode v3 plan JSON: {err}")))
 }
 
-#[pyfunction(signature = (counters_path, module_root, out_root=None, mode="v3"))]
+#[pyfunction(signature = (counters_path, module_root, out_root=None))]
 fn decide_optimizations_for_counter_dump(
     counters_path: &str,
     module_root: &str,
     out_root: Option<&str>,
-    mode: &str,
 ) -> PyResult<usize> {
     let counters_path = Path::new(counters_path);
     let module_root = Path::new(module_root);
     let out_root = out_root
         .map(PathBuf::from)
         .unwrap_or_else(|| module_root.to_path_buf());
-    let summary = match mode {
-        "v3" => generate_optimization_plans_v3_for_counter_dump(
-            counters_path,
-            module_root,
-            out_root.as_path(),
-        ),
-        other => {
-            return Err(PyRuntimeError::new_err(format!(
-                "optimization mode must be 'v3', got {other:?}"
-            )));
-        }
-    };
-    summary
+    generate_optimization_plans_v3_for_counter_dump(counters_path, module_root, out_root.as_path())
         .map(|summary| summary.written())
         .map_err(|err| PyRuntimeError::new_err(err.to_string()))
 }

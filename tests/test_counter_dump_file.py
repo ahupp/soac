@@ -54,8 +54,8 @@ def _assert_subprocess_ok(result):
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def _decide_optimizations_for_env(work_dir, *, mode="v3"):
-    return decide_optimizations_for_work_dir(work_dir, mode=mode)
+def _decide_optimizations_for_env(work_dir):
+    return decide_optimizations_for_work_dir(work_dir)
 
 
 def _counter_branch(row, branch):
@@ -152,7 +152,7 @@ def read():
     assert int(dump["records"][0]["source_hash"], 16) > 0
 
 
-def test_default_v3_plan_mode_consumes_helper_written_v3_plan(tmp_path):
+def test_default_optimizer_consumes_helper_written_v3_plan(tmp_path):
     module_name = "counter_dump_strict_v3_plan_case"
     (tmp_path / f"{module_name}.py").write_text(
         """
@@ -177,7 +177,7 @@ def run():
     )
     _assert_subprocess_ok(profile_result)
 
-    assert decide_optimizations_for_work_dir(work_dir, mode="v3") >= 1
+    assert decide_optimizations_for_work_dir(work_dir) >= 1
     assert list((work_dir / "modules").rglob("mod.optv3"))
     assert not list((work_dir / "modules").rglob("mod.opt"))
 
@@ -544,7 +544,7 @@ def run_case():
         and row["value"] > 0
     ]
     assert profiled_shapes, profile
-    assert _decide_optimizations_for_env(work_dir, mode="v3") >= 1
+    assert _decide_optimizations_for_env(work_dir) >= 1
 
     verify_result = _run_soac_subprocess(
         script,
@@ -621,7 +621,7 @@ def run_case():
         and row["value"] > 0
     ]
     assert profiled_shapes, profile
-    assert _decide_optimizations_for_env(work_dir, mode="v3") >= 1
+    assert _decide_optimizations_for_env(work_dir) >= 1
 
     verify_result = _run_soac_subprocess(
         script,

@@ -1,6 +1,3 @@
-# soac: opt-plan-mode=v3
-
-
 def target(left, right):
     return left + right
 

@@ -1,6 +1,3 @@
-# soac: opt-plan-mode=v3
-
-
 class Record:
     def __init__(self, left=0, right=0):
         self.left = left

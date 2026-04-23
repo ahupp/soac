@@ -1136,14 +1136,13 @@ _decide-optimizations-for-counters-dir counters_dir:
   fi
   MODULE_CACHE_DIR="$COUNTERS_DIR/modules"
   echo "decide optimization plans"
-  echo "optimization plan mode: v3"
+  echo "optimization planner: v3"
   echo "counters: $COUNTERS_DIR/profile.bin"
   echo "module cache dir: $MODULE_CACHE_DIR"
   if [[ -d "$MODULE_CACHE_DIR" ]]; then
     find "$MODULE_CACHE_DIR" -name mod.opt -delete
   fi
   cargo run --release -p soac_opt --bin decide_optimizations -- \
-    --mode v3 \
     --counters "$COUNTERS_DIR/profile.bin" \
     --out "$MODULE_CACHE_DIR"
 
@@ -1171,7 +1170,7 @@ benchmark-verify loops="100000" counters_dir="": (update-venv-offline) (build-ex
   echo "loops: {{loops}}"
   echo "counters dir: $COUNTERS_DIR"
   echo "module cache dir: $COUNTERS_DIR/modules"
-  echo "runtime optimization plan mode: v3"
+  echo "runtime optimization plan: v3"
   LOOPS="{{loops}}" \
   WARMUP_LOOPS="${WARMUP_LOOPS}" \
   BENCHMARK_CPU="${BENCHMARK_CPU}" \
@@ -1278,7 +1277,7 @@ benchmark benchmark_loops="1000000" verify_loops="100000" results_root="work/ben
     echo "benchmark cpu: $BENCHMARK_CPU"
     echo "benchmark constant clocks: $BENCHMARK_CONSTANT_CLOCKS"
     echo "cranelift opt level: $CRANELIFT_OPT_LEVEL"
-    echo "runtime optimization plan mode: v3"
+    echo "runtime optimization plan: v3"
     echo "module cache dir: $counters_dir/modules"
     echo "apply refcount modes: enabled, disabled diagnostic"
     echo

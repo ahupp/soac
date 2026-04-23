@@ -22,7 +22,7 @@ Updated direction:
 
   ```text
   cached unoptimized BlockPy module + raw profile evidence
-    -> decide_optimizations --mode v3
+    -> decide_optimizations
     -> serialized v3 optimization artifact
     -> JIT codegen consumes the selected mechanical shape
   ```
@@ -100,7 +100,7 @@ Implemented:
   module constants into v3 planner facts.
 - `soac_opt::pipeline_v3`: exact-int pipeline that composes
   extraction, evidence, planning, validation, and mechanical emission.
-- `decide_optimizations --mode v3`: offline planner mode that reads cached
+- `decide_optimizations`: offline planner that reads cached
   unoptimized `mod.blockpy` plus `profile.bin`, derives v3 facts directly from
   raw profile evidence, and writes a serialized `mod.optv3` artifact.
 - `print_optimization_plan_v3`: inspection summary for serialized v3 artifacts,
@@ -683,7 +683,7 @@ the branch exit demands `I32Bool01`. If a later Python-observable boundary needs
 
 5. Persist and inspect v3 artifacts offline.
    - Add a `mod.optv3` cache artifact beside `mod.blockpy`. Done.
-   - Add `decide_optimizations --mode v3` to write it from raw counters and the
+   - Add `decide_optimizations` to write it from raw counters and the
      cached unoptimized module. Done.
    - Add a printer/inspector for `mod.optv3`. Done for summary inspection.
 

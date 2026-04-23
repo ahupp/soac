@@ -1,6 +1,3 @@
-# soac: opt-plan-mode=v3
-
-
 def add(a, b):
     c = a + b
     if c > 0:

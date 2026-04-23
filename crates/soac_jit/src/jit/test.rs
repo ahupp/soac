@@ -18029,10 +18029,10 @@ def f(x, y):
     }
 
     #[test]
-    fn specialization_profile_loads_serialized_v3_artifact_in_strict_plan_mode() {
+    fn specialization_profile_loads_serialized_v3_artifact_in_verify_mode() {
         if crate::run_test_in_isolated_process_if_needed(
             module_path!(),
-            "specialization_profile_loads_serialized_v3_artifact_in_strict_plan_mode",
+            "specialization_profile_loads_serialized_v3_artifact_in_verify_mode",
         ) {
             return;
         }
@@ -18080,7 +18080,7 @@ def f(x, y):
                 Some(shared_state.as_ref()),
                 None,
             )
-            .expect("strict v3 plan mode should load serialized runtime artifacts");
+            .expect("verify mode should load serialized runtime artifacts");
             assert!(
                 profile.optimized_module.is_some(),
                 "serialized v3 artifacts should load the paired optimized BlockPy module"
