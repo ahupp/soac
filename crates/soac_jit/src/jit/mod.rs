@@ -38,9 +38,9 @@ use soac_core::block_py::{
     BlockPyModule, BlockTerm, CallArgKeyword, CallArgPositional, CallableScopeKind, CellLocation,
     ChildVisitable, CounterDef, CounterId, CounterScope, CounterSite, Del, DeoptEntrySource,
     FunctionExecutionMode, FunctionKind, HasMeta, HasSemanticInstrId, InstrId, InstrKey,
-    LocalFunctionId, LocalLocation, ModuleContentId, NameLike, NameLocation, ParamKind,
-    PersistentFunctionId, ResolvedName, RuntimeFunctionId, RuntimeModuleId, RuntimeName,
-    SerializedFunctionId, StorageLayout, Store, Visit, VisitMut, WithMeta,
+    LocalFunctionId, LocalLocation, ModuleContentId, NameLocation, ParamKind, PersistentFunctionId,
+    ResolvedName, RuntimeFunctionId, RuntimeModuleId, RuntimeName, SerializedFunctionId,
+    StorageLayout, Store, Visit, VisitMut, WithMeta,
 };
 use soac_core::profile::{
     CollectedTypeKeyLayout, CounterDumpTypeKey, read_block_entry_counts_from_file,
@@ -137,8 +137,10 @@ use soac_opt::plan_v3::{
 use soac_opt::region_emission_v3::{
     ExactIntBranchSelection as OptV3ExactIntBranchSelection,
     ExactIntReturnSelection as OptV3ExactIntReturnSelection,
+    ScalarThreadInlineReturnTargets as OptV3ScalarThreadInlineReturnTargets,
     exact_int_branch_selection_for_source as opt_v3_exact_int_branch_selection_for_source,
     exact_int_return_selection_for_source as opt_v3_exact_int_return_selection_for_source,
+    scalar_thread_inline_return_targets as opt_v3_scalar_thread_inline_return_targets,
     scalar_thread_selection_for_store_branch as opt_v3_scalar_thread_selection_for_store_branch,
     scalar_thread_unmaterialized_local_location as opt_v3_scalar_thread_unmaterialized_local_location,
 };
@@ -21610,14 +21612,6 @@ fn emit_typed_local_load_result_with_local_env(
     })
 }
 
-#[derive(Clone, Copy)]
-struct OptV3ScalarThreadInlineReturnTargets<'a> {
-    then_label: BlockLabel,
-    then_term: &'a BlockTerm<InstrCodegen>,
-    else_label: BlockLabel,
-    else_term: &'a BlockTerm<InstrCodegen>,
-}
-
 #[derive(Clone, Copy, Debug)]
 enum OptV3MechanicalValue {
     PyObject { value: ir::Value, owned: bool },
@@ -21645,105 +21639,6 @@ impl OptV3MechanicalValue {
                 | (Self::I32Bool01(_), Rep::I32Bool01)
         )
     }
-}
-
-fn opt_v3_term_references_local(term: &BlockTerm<InstrCodegen>, local_name: &ResolvedName) -> bool {
-    struct LocalRefFinder<'a> {
-        local_name: &'a ResolvedName,
-        found: bool,
-    }
-
-    impl Visit<InstrCodegen> for LocalRefFinder<'_> {
-        fn visit_instr(&mut self, expr: &InstrCodegen)
-        where
-            InstrCodegen: ChildVisitable<InstrCodegen>,
-        {
-            if let InstrCodegen::Load(load) = expr
-                && same_resolved_local_name(&load.name, self.local_name)
-            {
-                self.found = true;
-                return;
-            }
-            expr.visit_children(self);
-        }
-
-        fn visit_block_arg(&mut self, arg: &BlockArg) {
-            if let BlockArg::Name(name) = arg
-                && name == self.local_name.id_str()
-            {
-                self.found = true;
-            }
-        }
-    }
-
-    let mut finder = LocalRefFinder {
-        local_name,
-        found: false,
-    };
-    finder.visit_term(term);
-    finder.found
-}
-
-fn same_resolved_local_name(left: &ResolvedName, right: &ResolvedName) -> bool {
-    left.local_location() == right.local_location() && left.id_str() == right.id_str()
-}
-
-fn opt_v3_scalar_thread_inline_return_targets<'a>(
-    function: &'a BlockPyFunction<CodegenModuleShape>,
-    block_indices_by_label: &HashMap<BlockLabel, usize>,
-    if_term: &soac_core::block_py::TermIf<InstrTyped>,
-    local_name: &ResolvedName,
-) -> Result<Option<OptV3ScalarThreadInlineReturnTargets<'a>>, String> {
-    if if_term.then_label == if_term.else_label {
-        return Ok(None);
-    }
-    let Some(then_term) = opt_v3_scalar_thread_inline_return_target(
-        function,
-        block_indices_by_label,
-        if_term.then_label,
-        local_name,
-    )?
-    else {
-        return Ok(None);
-    };
-    let Some(else_term) = opt_v3_scalar_thread_inline_return_target(
-        function,
-        block_indices_by_label,
-        if_term.else_label,
-        local_name,
-    )?
-    else {
-        return Ok(None);
-    };
-    Ok(Some(OptV3ScalarThreadInlineReturnTargets {
-        then_label: if_term.then_label,
-        then_term,
-        else_label: if_term.else_label,
-        else_term,
-    }))
-}
-
-fn opt_v3_scalar_thread_inline_return_target<'a>(
-    function: &'a BlockPyFunction<CodegenModuleShape>,
-    block_indices_by_label: &HashMap<BlockLabel, usize>,
-    target: BlockLabel,
-    local_name: &ResolvedName,
-) -> Result<Option<&'a BlockTerm<InstrCodegen>>, String> {
-    if codegen_block_has_predecessor(function, target) != 1 {
-        return Ok(None);
-    }
-    let target_index = codegen_block_index_for_label(function, block_indices_by_label, target)?;
-    let target_block = &function.blocks[target_index];
-    if !target_block.body.is_empty() || target_block.exception_param().is_some() {
-        return Ok(None);
-    }
-    let BlockTerm::Return(_) = &target_block.term else {
-        return Ok(None);
-    };
-    if opt_v3_term_references_local(&target_block.term, local_name) {
-        return Ok(None);
-    }
-    Ok(Some(&target_block.term))
 }
 
 fn emit_opt_v3_exact_int_branch_truth_i32(
