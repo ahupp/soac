@@ -1503,6 +1503,16 @@ fn apply_profile_typed_plans_to_typed_function(
     Ok(())
 }
 
+fn apply_profile_typed_plans_to_module(
+    module: &mut BlockPyModule<TypedCodegenModuleShape>,
+    profile: &SpecializationProfile<'_>,
+) -> Result<(), String> {
+    for function in &mut module.callable_defs {
+        apply_profile_typed_plans_to_typed_function(function, Some(profile))?;
+    }
+    Ok(())
+}
+
 fn typed_function_with_profile_plans(
     function: &BlockPyFunction<CodegenModuleShape>,
     profile: Option<&SpecializationProfile<'_>>,
@@ -2083,7 +2093,15 @@ fn build_profiled_jit_module_plan(
             module.module_name_gen.module_id()
         ));
     }
-    build_jit_module_plan(optimized_module.as_ref())
+    let value_facts = infer_jit_value_facts(optimized_module.as_ref());
+    let mut typed_module = lower_codegen_module_to_typed(optimized_module.as_ref().clone());
+    annotate_typed_module_value_facts(&mut typed_module, &value_facts);
+    typed_module = lower_typed_if_tests_to_truthy(typed_module);
+    apply_profile_typed_plans_to_module(&mut typed_module, profile)?;
+    build_jit_module_plan_from_prepared_typed_module(plan_jit_typed_module(
+        typed_module,
+        value_facts,
+    )?)
 }
 
 impl SharedModuleState {
@@ -26291,13 +26309,6 @@ fn prepare_specialized_typed_function(
         .unwrap_or_else(|| function.clone());
     annotate_typed_function_value_facts(&mut typed_function, value_facts);
     validate_typed_function_value_facts(&typed_function)?;
-    if planned_typed_function.is_none()
-        && !specialization_profile
-            .is_some_and(SpecializationProfile::typed_specializations_embedded)
-    {
-        apply_profile_typed_plans_to_typed_function(&mut typed_function, specialization_profile)?;
-    }
-
     lower_typed_function_call_access_plan_instrs(&mut typed_function);
     refresh_typed_function_value_facts(&mut typed_function);
     annotate_typed_function_result_demands(&mut typed_function);

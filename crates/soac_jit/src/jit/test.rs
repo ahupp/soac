@@ -3626,6 +3626,10 @@ def build(values):
         )?;
         lower_typed_function_call_access_plan_instrs(&mut direct_call_typed_function);
         predeclare_typed_direct_call_imports(jit_module, &direct_call_typed_function)?;
+        let mut options = options;
+        if options.planned_typed_function.is_none() {
+            options.planned_typed_function = Some(direct_call_typed_function);
+        }
         build_cranelift_run_bb_specialized_function(
             jit_module,
             blocks,
@@ -19997,14 +20001,6 @@ class Point:
             body: test_v3_inline_call_body(),
             reason: "profiled direct call".to_string(),
         };
-        let non_call_v3_source = InstrId::new(caller_block_label, 99);
-        let exact_list_item = OptV3ExactListItemAccessPlan {
-            source: non_call_v3_source,
-            access: PlanV3ExactListItemAccessKind::Get,
-            shape: PlanV3ExactListItemShape::ExactListExactInt,
-            guard: PlanV3ExactListItemGuardKind::ExactListExactCompactIntInBounds,
-            fallback: PlanV3ExactListItemFallbackKind::OriginalItemAccess,
-        };
         let profile = SpecializationProfile {
             module_name: Some(module_name),
             counter_dump_path: None,
@@ -20014,10 +20010,7 @@ class Point:
                 caller_function.function_id,
                 HashMap::from([(call_instr_id, vec![v3_plan])]),
             )]),
-            opt_v3_emitted_exact_list_items: HashMap::from([(
-                caller_function.function_id,
-                HashMap::from([(non_call_v3_source, exact_list_item)]),
-            )]),
+            opt_v3_emitted_exact_list_items: HashMap::new(),
             opt_v3_emitted_indexed_fields: HashMap::new(),
             opt_v3_emitted_indexed_globals: HashMap::new(),
             opt_v3_exact_int_branch_artifacts: HashMap::new(),
