@@ -21326,7 +21326,7 @@ class Point:
         );
         let module = test_module(ModuleNameGen::new(0), vec![function.clone()]);
         let facts = infer_jit_value_facts(&module);
-        let typed_function = lower_codegen_function_to_typed(function);
+        let mut typed_function = lower_codegen_function_to_typed(function);
         let profile = SpecializationProfile {
             module_name: Some(module_name),
             counter_dump_path: Some(std::borrow::Cow::Owned(profile_path)),
@@ -21342,10 +21342,11 @@ class Point:
             guard_miss_deopt: false,
         };
 
-        let prepared =
-            prepare_specialized_typed_function(&typed_function, None, Some(&profile), &facts)
-                .expect("typed function should prepare with profiled cold blocks")
-                .typed_function;
+        apply_profile_typed_block_metadata_to_typed_function(&mut typed_function, &profile)
+            .expect("typed function should be annotated with profiled cold blocks");
+        let prepared = prepare_specialized_typed_function(&typed_function, None, &facts)
+            .expect("typed function should prepare with profiled cold blocks")
+            .typed_function;
         let block_layout = prepared
             .blocks
             .iter()

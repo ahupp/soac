@@ -1486,6 +1486,35 @@ fn typed_call_emission_plans_for_profile_function(
     typed_call_emission_plans_from_v3(&opt_v3_direct_calls_by_instr)
 }
 
+fn apply_profile_call_emission_plans_to_typed_function(
+    function: &mut BlockPyFunction<TypedCodegenModuleShape>,
+    profile: &SpecializationProfile<'_>,
+) -> Result<(), String> {
+    let call_emissions =
+        typed_call_emission_plans_for_profile_function(profile, function.function_id)?;
+    lower_typed_function_call_emission_plans(function, &call_emissions)?;
+    Ok(())
+}
+
+fn apply_profile_access_and_scalar_plans_to_typed_function(
+    function: &mut BlockPyFunction<TypedCodegenModuleShape>,
+    profile: &SpecializationProfile<'_>,
+) -> Result<(), String> {
+    annotate_typed_indexed_field_accesses_from_profile(function, profile)?;
+    annotate_typed_indexed_global_accesses_from_profile(function, profile)?;
+    annotate_typed_exact_list_item_accesses_from_profile(function, profile)?;
+    annotate_typed_exact_int_selections_from_profile(function, profile)?;
+    Ok(())
+}
+
+fn apply_profile_typed_block_metadata_to_typed_function(
+    function: &mut BlockPyFunction<TypedCodegenModuleShape>,
+    profile: &SpecializationProfile<'_>,
+) -> Result<(), String> {
+    annotate_typed_profiled_cold_blocks(function, profile)?;
+    Ok(())
+}
+
 fn apply_profile_typed_plans_to_typed_function(
     function: &mut BlockPyFunction<TypedCodegenModuleShape>,
     profile: Option<&SpecializationProfile<'_>>,
@@ -1493,13 +1522,9 @@ fn apply_profile_typed_plans_to_typed_function(
     let Some(profile) = profile else {
         return Ok(());
     };
-    let call_emissions =
-        typed_call_emission_plans_for_profile_function(profile, function.function_id)?;
-    lower_typed_function_call_emission_plans(function, &call_emissions)?;
-    annotate_typed_indexed_field_accesses_from_profile(function, profile)?;
-    annotate_typed_indexed_global_accesses_from_profile(function, profile)?;
-    annotate_typed_exact_list_item_accesses_from_profile(function, profile)?;
-    annotate_typed_exact_int_selections_from_profile(function, profile)?;
+    apply_profile_call_emission_plans_to_typed_function(function, profile)?;
+    apply_profile_access_and_scalar_plans_to_typed_function(function, profile)?;
+    apply_profile_typed_block_metadata_to_typed_function(function, profile)?;
     Ok(())
 }
 
@@ -2025,9 +2050,7 @@ fn apply_typed_v3_module_rewrites(
     let callee_module = module.clone();
     let external_callees = HashMap::new();
     for function in &mut module.callable_defs {
-        let call_emissions =
-            typed_call_emission_plans_for_profile_function(profile, function.function_id)?;
-        lower_typed_function_call_emission_plans(function, &call_emissions)?;
+        apply_profile_call_emission_plans_to_typed_function(function, profile)?;
         let inline_direct_calls = profile.typed_inline_resolved_direct_calls(function.function_id);
         if !inline_direct_calls.is_empty() {
             let inline_targets = profile.typed_inline_direct_calls(function.function_id);
@@ -2042,36 +2065,8 @@ fn apply_typed_v3_module_rewrites(
                 refresh_typed_function_value_facts(function);
             }
         }
-        let (_, _, opt_v3_indexed_fields_by_instr) =
-            profile.field_index_specialization_maps(function.function_id)?;
-        if !opt_v3_indexed_fields_by_instr.is_empty() {
-            let specialize_field_stores = profile.typed_specializations_embedded()
-                || (profile.behavior_change_indexed_stores
-                    && function.scope.scope_kind != CallableScopeKind::Module);
-            annotate_typed_attr_accesses(
-                function,
-                &opt_v3_indexed_fields_by_instr,
-                specialize_field_stores,
-            )?;
-        }
-        if let Some(indexed_globals_by_instr) = profile
-            .opt_v3_emitted_indexed_globals
-            .get(&function.function_id)
-        {
-            annotate_typed_indexed_global_accesses(function, indexed_globals_by_instr)?;
-        }
-        if let Some(exact_list_items_by_instr) = profile
-            .opt_v3_emitted_exact_list_items
-            .get(&function.function_id)
-        {
-            annotate_typed_exact_list_item_accesses(function, exact_list_items_by_instr)?;
-        }
-        if let Some(exact_int_artifacts) = profile
-            .opt_v3_exact_int_branch_artifacts
-            .get(&function.function_id)
-        {
-            annotate_typed_exact_int_selections(function, exact_int_artifacts)?;
-        }
+        apply_profile_access_and_scalar_plans_to_typed_function(function, profile)?;
+        apply_profile_typed_block_metadata_to_typed_function(function, profile)?;
     }
     Ok(())
 }
@@ -25505,7 +25500,7 @@ fn precompile_external_direct_call_target_functions(
     let mut target_ids = HashSet::new();
     for function in &module.callable_defs {
         let mut typed_function = function.clone();
-        apply_profile_typed_plans_to_typed_function(&mut typed_function, Some(profile))?;
+        apply_profile_call_emission_plans_to_typed_function(&mut typed_function, profile)?;
         lower_typed_function_call_access_plan_instrs(&mut typed_function);
         target_ids.extend(collect_typed_call_direct_targets(&typed_function));
     }
@@ -26284,9 +26279,8 @@ fn validate_typed_function_preserves_codegen_cfg(
 fn annotate_typed_profiled_cold_blocks(
     typed_function: &mut BlockPyFunction<TypedCodegenModuleShape>,
     profile: &SpecializationProfile<'_>,
-    source_function: &BlockPyFunction<TypedCodegenModuleShape>,
 ) -> Result<(), String> {
-    let cold_block_labels = profile.cold_block_labels(source_function)?;
+    let cold_block_labels = profile.cold_block_labels(typed_function)?;
     if cold_block_labels.is_empty() {
         return Ok(());
     }
@@ -26301,7 +26295,6 @@ fn annotate_typed_profiled_cold_blocks(
 fn prepare_specialized_typed_function(
     function: &BlockPyFunction<TypedCodegenModuleShape>,
     planned_typed_function: Option<&BlockPyFunction<TypedCodegenModuleShape>>,
-    specialization_profile: Option<&SpecializationProfile<'_>>,
     value_facts: &FactStore,
 ) -> Result<PreparedSpecializedTypedFunction, String> {
     let mut typed_function = planned_typed_function
@@ -26313,9 +26306,6 @@ fn prepare_specialized_typed_function(
     refresh_typed_function_value_facts(&mut typed_function);
     annotate_typed_function_result_demands(&mut typed_function);
     annotate_typed_function_planned_results(&mut typed_function);
-    if let Some(profile) = specialization_profile {
-        annotate_typed_profiled_cold_blocks(&mut typed_function, profile, function)?;
-    }
     validate_typed_function_call_access_plans(&typed_function)?;
     validate_typed_function_value_facts(&typed_function)?;
     validate_typed_function_preserves_codegen_cfg(function, &typed_function)?;
@@ -26616,7 +26606,6 @@ fn build_cranelift_run_bb_specialized_function(
     let PreparedSpecializedTypedFunction { typed_function } = prepare_specialized_typed_function(
         function,
         options.planned_typed_function.as_ref(),
-        specialization_profile,
         value_facts,
     )?;
     let direct_call_targets = collect_typed_call_direct_targets(&typed_function);
@@ -27681,12 +27670,8 @@ pub unsafe fn render_instr_typed_for_codegen_with_runtime_state(
                 function.function_id, function.names.qualname
             )
         })?;
-    let PreparedSpecializedTypedFunction { typed_function } = prepare_specialized_typed_function(
-        render_function,
-        None,
-        Some(&specialization_profile),
-        &jit_module_plan.value_facts,
-    )?;
+    let PreparedSpecializedTypedFunction { typed_function } =
+        prepare_specialized_typed_function(render_function, None, &jit_module_plan.value_facts)?;
     let direct_call_targets = collect_typed_call_direct_targets(&typed_function);
     let mut direct_call_target_functions = HashMap::new();
     for function_id in direct_call_targets {
