@@ -87,6 +87,8 @@ because it should affect engineering decisions:
 When I submit a request, if it's a simple, fully-specific or
 mechanical request to change something, just go ahead and do it.
 Otherwise make a plan for that change.
+When I ask to add a TODO without naming a file, add it to
+`doc/todo/TODO.md` by default.
 
 ### Planning
 

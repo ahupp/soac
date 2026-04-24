@@ -9,6 +9,8 @@
  * Treat `exec` as a keyword explicitly instead of handling it as a runtime helper name.
  * Review stable identifiers for modules, functions, types, and pyc-to-function mapping.
  * Replace the function-instantiation fallback for `co_freevars`/capture mismatches with a cleaner explicit closure entry/code-object alignment.
+ * Remove global state use in `reset_lowering_state`.
+ * Audit `panic!` and `unreachable!` usage.
  * Track slow CPython fast-suite cases that pass with longer timeouts, including `test_dataclasses` and `test_bytes -m test_count`.
  * If Python blocks on a queued background function compilation, steal the queued job and run it
    synchronously; if it is already running, wait for it to complete.
