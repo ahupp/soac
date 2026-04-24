@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use soac_config::SoacEnvConfig;
 use soac_core::block_py::{BlockPyFunction, BlockPyModule, ModuleNameGen, RuntimeFunctionId};
+use soac_core::pass_tracker::RecordingPassTracker;
 use soac_jit::module_constants::ModuleCodegenConstants;
 use soac_jit::module_type::{
     build_shared_state_for_inspection_with_placeholder_constants_and_source_hash,
@@ -299,9 +300,13 @@ pub fn lower_source_to_codegen_module_with_module_id(
     source: &str,
     module_id: u32,
 ) -> Result<BlockPyModule<CodegenModuleShape>, String> {
-    let output =
-        soac_lowering::lower_python_to_blockpy_recorded(source, ModuleNameGen::new(module_id))
-            .map_err(|err| err.to_string())?;
+    let output = soac_lowering::lower_python_to_blockpy_with_tracker_and_options(
+        source,
+        ModuleNameGen::new(module_id),
+        RecordingPassTracker::new(),
+        soac_lowering::LoweringOptions::default(),
+    )
+    .map_err(|err| err.to_string())?;
     Ok(output.codegen_module)
 }
 

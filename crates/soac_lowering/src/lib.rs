@@ -6,7 +6,7 @@ use crate::passes::CodegenModuleShape;
 use anyhow::Error as AnyhowError;
 pub use ruff_python_parser::ParseError;
 use soac_core::block_py::{BlockPyModule, ModuleNameGen};
-use soac_core::pass_tracker::{NoopPassTracker, PassTracker, RecordingPassTracker};
+use soac_core::pass_tracker::{PassTracker, RecordingPassTracker};
 use std::time::{Duration, Instant};
 
 pub(crate) mod block_py;
@@ -87,7 +87,7 @@ where
     )
 }
 
-fn lower_python_to_blockpy_with_tracker_and_options<P>(
+pub fn lower_python_to_blockpy_with_tracker_and_options<P>(
     source: &str,
     module_name_gen: ModuleNameGen,
     mut pass_tracker: P,
@@ -114,33 +114,6 @@ where
 
 pub fn lower_python_to_blockpy_for_testing(source: &str) -> Result<LoweringResult> {
     lower_python_to_blockpy_with_tracker(source, ModuleNameGen::new(0), RecordingPassTracker::new())
-}
-
-pub fn lower_python_to_blockpy(
-    source: &str,
-    module_name_gen: ModuleNameGen,
-) -> Result<LoweringResult<NoopPassTracker>> {
-    lower_python_to_blockpy_with_tracker(source, module_name_gen, NoopPassTracker::new())
-}
-
-pub fn lower_python_to_blockpy_recorded(
-    source: &str,
-    module_name_gen: ModuleNameGen,
-) -> Result<LoweringResult<RecordingPassTracker>> {
-    lower_python_to_blockpy_with_tracker(source, module_name_gen, RecordingPassTracker::new())
-}
-
-pub fn lower_python_to_blockpy_recorded_with_options(
-    source: &str,
-    module_name_gen: ModuleNameGen,
-    options: LoweringOptions,
-) -> Result<LoweringResult<RecordingPassTracker>> {
-    lower_python_to_blockpy_with_tracker_and_options(
-        source,
-        module_name_gen,
-        RecordingPassTracker::new(),
-        options,
-    )
 }
 
 #[cfg(test)]

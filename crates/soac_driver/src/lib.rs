@@ -644,10 +644,14 @@ mod tests {
             .join("mod.blockpy");
         let stale_metadata = metadata(module_name, "old-build");
         let expected_metadata = metadata(module_name, "new-build");
-        let stale_module =
-            soac_lowering::lower_python_to_blockpy_recorded(source, ModuleNameGen::new(1))
-                .expect("initial lowering should succeed")
-                .codegen_module;
+        let stale_module = soac_lowering::lower_python_to_blockpy_with_tracker_and_options(
+            source,
+            ModuleNameGen::new(1),
+            RecordingPassTracker::new(),
+            soac_lowering::LoweringOptions::default(),
+        )
+        .expect("initial lowering should succeed")
+        .codegen_module;
         store_codegen_module_cache(cache_path.as_path(), &stale_metadata, &stale_module)
             .expect("stale cache should be writable");
 

@@ -912,9 +912,10 @@ mod tests {
     use super::*;
     use soac_core::block_py::ModuleNameGen;
     use soac_core::block_py::{CallArgPositional, CallDirect};
+    use soac_core::pass_tracker::RecordingPassTracker;
     use soac_lowering::{
         LoweringOptions, lower_python_to_blockpy_for_testing,
-        lower_python_to_blockpy_recorded_with_options,
+        lower_python_to_blockpy_with_tracker_and_options,
     };
 
     fn lowered(source: &str) -> BlockPyModule<CodegenModuleShape> {
@@ -924,9 +925,10 @@ mod tests {
     }
 
     fn lowered_with_runtime_names_as_globals(source: &str) -> BlockPyModule<CodegenModuleShape> {
-        lower_python_to_blockpy_recorded_with_options(
+        lower_python_to_blockpy_with_tracker_and_options(
             source,
             ModuleNameGen::new(0),
+            RecordingPassTracker::new(),
             LoweringOptions {
                 runtime_names_as_globals: true,
             },
