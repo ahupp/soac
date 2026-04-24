@@ -1,6 +1,6 @@
 use super::{
     instrument_bb_module_for_trace, instrument_bb_module_with_global_load_counters,
-    instrument_bb_module_with_locality_counters, instrument_module_with_tracker,
+    instrument_bb_module_with_locality_counters, instrument_codegen_module_with_tracker,
 };
 use crate::{
     CounterInstrumentationConfig, ExplicitCounterPlacement, InstrumentationConfig,
@@ -235,8 +235,9 @@ class C:
         deopt_entry_counters: false,
         specialization_runtime_logging: false,
     };
-    let codegen = instrument_module_with_tracker(codegen, &config, &mut NoopPassTracker::new())
-        .expect("configured legacy counter instrumentation should succeed");
+    let codegen =
+        instrument_codegen_module_with_tracker(codegen, &config, &mut NoopPassTracker::new())
+            .expect("configured legacy counter instrumentation should succeed");
 
     for function in &codegen.callable_defs {
         if interpreted_ids.contains(&function.function_id) {
@@ -282,7 +283,7 @@ fn typed_explicit_counter_placement_skips_codegen_counter_definitions_and_increm
     );
 
     let instrumented =
-        instrument_module_with_tracker(codegen, &config, &mut NoopPassTracker::new())
+        instrument_codegen_module_with_tracker(codegen, &config, &mut NoopPassTracker::new())
             .expect("codegen counter definition pass should succeed");
 
     assert!(

@@ -1,4 +1,4 @@
-use super::{define_module_counter_defs, instrument_module_with_tracker};
+use super::{define_typed_module_counter_defs, instrument_typed_module_with_tracker};
 use crate::InstrumentationConfig;
 use soac_config::{RuntimeOptimizationPipeline, SoacEnvConfig, SpecializationMode};
 use soac_core::block_py::{
@@ -61,8 +61,9 @@ class C:
             .with_runtime_optimization_pipeline(RuntimeOptimizationPipeline::TypedV3),
     );
 
-    let instrumented = instrument_module_with_tracker(typed, &config, &mut NoopPassTracker::new())
-        .expect("typed counter instrumentation should succeed");
+    let instrumented =
+        instrument_typed_module_with_tracker(typed, &config, &mut NoopPassTracker::new())
+            .expect("typed counter instrumentation should succeed");
 
     assert!(
         instrumented
@@ -112,7 +113,7 @@ def g(i):
             .with_runtime_optimization_pipeline(RuntimeOptimizationPipeline::TypedV3),
     );
 
-    define_module_counter_defs(&mut typed, &config)
+    define_typed_module_counter_defs(&mut typed, &config)
         .expect("typed counter definition scan should succeed");
 
     for expected_kind in [

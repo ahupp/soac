@@ -24,7 +24,7 @@ fn functions_with_counter_instrumentation<P: ModuleShape>(
         .filter(|function| function.execution_mode() == FunctionExecutionMode::Jit)
 }
 
-pub fn instrument_module_with_tracker(
+pub fn instrument_codegen_module_with_tracker(
     module: BlockPyModule<CodegenModuleShape>,
     config: &InstrumentationConfig,
     pass_tracker: &mut impl PassTracker,

@@ -28,14 +28,14 @@ fn functions_with_counter_instrumentation(
         .filter(|function| function.execution_mode() == FunctionExecutionMode::Jit)
 }
 
-pub fn instrument_module(
+pub fn instrument_typed_module(
     module: BlockPyModule<TypedCodegenModuleShape>,
     config: &InstrumentationConfig,
 ) -> Result<BlockPyModule<TypedCodegenModuleShape>, String> {
-    instrument_module_with_tracker(module, config, &mut NoopPassTracker::new())
+    instrument_typed_module_with_tracker(module, config, &mut NoopPassTracker::new())
 }
 
-pub fn instrument_module_with_tracker(
+pub fn instrument_typed_module_with_tracker(
     module: BlockPyModule<TypedCodegenModuleShape>,
     config: &InstrumentationConfig,
     pass_tracker: &mut impl PassTracker,
@@ -56,7 +56,7 @@ pub fn instrument_module_with_tracker(
     }
 }
 
-pub fn define_module_counter_defs(
+pub fn define_typed_module_counter_defs(
     module: &mut BlockPyModule<TypedCodegenModuleShape>,
     config: &InstrumentationConfig,
 ) -> Result<(), String> {
