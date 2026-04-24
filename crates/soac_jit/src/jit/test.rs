@@ -15067,9 +15067,11 @@ def f(x):
             &module_constants,
             BuildSpecializedFunctionOptions {
                 specialization_inputs: Some(FunctionSpecializationInputs {
-                    legacy_overlays: Some(LegacyFunctionSpecializationOverlays::default()),
+                    legacy_overlays: Some(LegacyFunctionSpecializationOverlays {
+                        exact_int_branch_artifacts: Some(std::sync::Arc::new(artifacts)),
+                        ..LegacyFunctionSpecializationOverlays::default()
+                    }),
                     cold_block_labels: HashSet::new(),
-                    opt_v3_exact_int_branch_artifacts: Some(std::sync::Arc::new(artifacts)),
                     behavior_change_indexed_stores: false,
                     guard_miss_deopt_stub: false,
                 }),
@@ -15240,9 +15242,11 @@ def f(x):
             &module_constants,
             BuildSpecializedFunctionOptions {
                 specialization_inputs: Some(FunctionSpecializationInputs {
-                    legacy_overlays: Some(LegacyFunctionSpecializationOverlays::default()),
+                    legacy_overlays: Some(LegacyFunctionSpecializationOverlays {
+                        exact_int_branch_artifacts: Some(std::sync::Arc::new(artifacts)),
+                        ..LegacyFunctionSpecializationOverlays::default()
+                    }),
                     cold_block_labels: HashSet::new(),
-                    opt_v3_exact_int_branch_artifacts: Some(std::sync::Arc::new(artifacts)),
                     behavior_change_indexed_stores: false,
                     guard_miss_deopt_stub: false,
                 }),
@@ -15370,9 +15374,11 @@ def f(x):
                 &module_constants,
                 BuildSpecializedFunctionOptions {
                     specialization_inputs: Some(FunctionSpecializationInputs {
-                        legacy_overlays: Some(LegacyFunctionSpecializationOverlays::default()),
+                        legacy_overlays: Some(LegacyFunctionSpecializationOverlays {
+                            exact_int_branch_artifacts: Some(std::sync::Arc::new(artifacts)),
+                            ..LegacyFunctionSpecializationOverlays::default()
+                        }),
                         cold_block_labels: HashSet::new(),
-                        opt_v3_exact_int_branch_artifacts: Some(std::sync::Arc::new(artifacts)),
                         behavior_change_indexed_stores: false,
                         guard_miss_deopt_stub: false,
                     }),
@@ -15485,9 +15491,11 @@ def f(x):
                 &module_constants,
                 BuildSpecializedFunctionOptions {
                     specialization_inputs: Some(FunctionSpecializationInputs {
-                        legacy_overlays: Some(LegacyFunctionSpecializationOverlays::default()),
+                        legacy_overlays: Some(LegacyFunctionSpecializationOverlays {
+                            exact_int_branch_artifacts: Some(std::sync::Arc::new(artifacts)),
+                            ..LegacyFunctionSpecializationOverlays::default()
+                        }),
                         cold_block_labels: HashSet::new(),
-                        opt_v3_exact_int_branch_artifacts: Some(std::sync::Arc::new(artifacts)),
                         behavior_change_indexed_stores: false,
                         guard_miss_deopt_stub: false,
                     }),
@@ -15594,9 +15602,11 @@ def f(x):
             &module_constants,
             BuildSpecializedFunctionOptions {
                 specialization_inputs: Some(FunctionSpecializationInputs {
-                    legacy_overlays: Some(LegacyFunctionSpecializationOverlays::default()),
+                    legacy_overlays: Some(LegacyFunctionSpecializationOverlays {
+                        exact_int_branch_artifacts: Some(std::sync::Arc::new(artifacts)),
+                        ..LegacyFunctionSpecializationOverlays::default()
+                    }),
                     cold_block_labels: HashSet::new(),
-                    opt_v3_exact_int_branch_artifacts: Some(std::sync::Arc::new(artifacts)),
                     behavior_change_indexed_stores: false,
                     guard_miss_deopt_stub: false,
                 }),
@@ -16415,7 +16425,6 @@ def f(x):
                 ..LegacyFunctionSpecializationOverlays::default()
             }),
             cold_block_labels: HashSet::new(),
-            opt_v3_exact_int_branch_artifacts: None,
             behavior_change_indexed_stores,
             guard_miss_deopt_stub,
         }
@@ -16459,7 +16468,6 @@ def f(x):
                         ..LegacyFunctionSpecializationOverlays::default()
                     }),
                     cold_block_labels: HashSet::new(),
-                    opt_v3_exact_int_branch_artifacts: None,
                     behavior_change_indexed_stores: true,
                     guard_miss_deopt_stub: false,
                 }),
@@ -16533,7 +16541,6 @@ def f(x):
                 specialization_inputs: Some(FunctionSpecializationInputs {
                     legacy_overlays: Some(LegacyFunctionSpecializationOverlays::default()),
                     cold_block_labels: HashSet::new(),
-                    opt_v3_exact_int_branch_artifacts: None,
                     behavior_change_indexed_stores: true,
                     guard_miss_deopt_stub: false,
                 }),
@@ -18808,6 +18815,174 @@ class Point:
                 .first()
                 .and_then(|exit| exit.source),
             Some(return_add_instr_id)
+        );
+    }
+
+    #[test]
+    fn runtime_typed_v3_module_plan_carries_exact_int_scalar_thread_shape() {
+        let module_name = "runtime_typed_v3_exact_int_scalar_thread_test";
+        let module_name_gen = ModuleNameGen::new(0);
+        let mut function = test_function_in_module(&module_name_gen, "store_then_compare");
+        function.params = ParamSpec {
+            params: vec![
+                test_param("a", ParamKind::Any, false),
+                test_param("b", ParamKind::Any, false),
+            ],
+        };
+        let entry_label = function.name_gen.next_block_name();
+        let test_label = function.name_gen.next_block_name();
+        let then_label = function.name_gen.next_block_name();
+        let else_label = function.name_gen.next_block_name();
+        let store_instr_id = InstrId::new(entry_label, 0);
+        let add_instr_id = InstrId::new(entry_label, 1);
+        let compare_instr_id = InstrId::new(test_label, 0);
+        let c_name = test_local_name("c", 2);
+        let mut constants = TestConstantPool::default();
+        function.blocks = vec![
+            CodegenBlock {
+                label: entry_label,
+                body: vec![with_instr_id(
+                    op_expr(Store::new(
+                        c_name.clone(),
+                        with_instr_id(
+                            op_expr(BinOp::new(
+                                BinOpKind::Add,
+                                name_expr(test_name("a")),
+                                name_expr(test_local_name("b", 1)),
+                            )),
+                            add_instr_id,
+                        ),
+                    )),
+                    store_instr_id,
+                )],
+                term: BlockTerm::Jump(BlockEdge::new(test_label)),
+                params: Vec::new(),
+                exc_edge: None,
+            },
+            CodegenBlock {
+                label: test_label,
+                body: Vec::new(),
+                term: BlockTerm::IfTerm(soac_core::block_py::TermIf {
+                    test: with_instr_id(
+                        op_expr(BinOp::new(
+                            BinOpKind::Gt,
+                            name_expr(c_name),
+                            constants.int_expr(0),
+                        )),
+                        compare_instr_id,
+                    ),
+                    then_label,
+                    else_label,
+                }),
+                params: Vec::new(),
+                exc_edge: None,
+            },
+            CodegenBlock {
+                label: then_label,
+                body: Vec::new(),
+                term: ret_term(name_expr(test_runtime_name("TRUE"))),
+                params: Vec::new(),
+                exc_edge: None,
+            },
+            CodegenBlock {
+                label: else_label,
+                body: Vec::new(),
+                term: ret_term(none_expr()),
+                params: Vec::new(),
+                exc_edge: None,
+            },
+        ];
+        set_stack_slots(&mut function, &["a", "b", "c"]);
+        let function_id = function.function_id;
+        let mut module = test_module(module_name_gen, vec![function]);
+        module.module_constants = constants.module_constants;
+        let function = module.callable_defs[0].clone();
+        let exact_int_shape = soac_opt::operator_specialization::pack_binary_shape(
+            soac_opt::operator_specialization::ExactTypeTag::Int,
+            soac_opt::operator_specialization::ExactTypeTag::Int,
+        );
+        let mut evidence = FunctionProfileEvidence::default();
+        evidence
+            .operator_specializations
+            .insert(add_instr_id, vec![exact_int_shape]);
+        evidence
+            .operator_specializations
+            .insert(compare_instr_id, vec![exact_int_shape]);
+        let artifacts = plan_and_emit_function_exact_int_branches_v3_with_module_constants(
+            &AlternativeCatalog::default_v3(),
+            ModulePlanIdentity {
+                module_name: module_name.to_string(),
+                source_hash: 0,
+                cache_identity: "test-cache".to_string(),
+            },
+            FunctionPlanIdentity {
+                function: SerializedFunctionId::new(
+                    SerializedModuleId::new(0),
+                    function.function_id.local_function_id(),
+                ),
+                debug_name: Some(function.names.qualname.clone()),
+            },
+            &function,
+            &evidence,
+            module.module_constants.as_slice(),
+        )
+        .expect("exact-int v3 artifacts should plan scalar thread");
+        assert_eq!(artifacts.plan.functions[0].scalar_threads.len(), 1);
+        let profile = SpecializationProfile {
+            module_name: Some(module_name),
+            counter_dump_path: None,
+            optimized_module: None,
+            direct_call_emission_scope: DirectCallEmissionScope::AllDirectCallCandidates,
+            opt_v3_emitted_direct_calls: HashMap::new(),
+            opt_v3_emitted_exact_list_items: HashMap::new(),
+            opt_v3_emitted_indexed_fields: HashMap::new(),
+            opt_v3_emitted_indexed_globals: HashMap::new(),
+            opt_v3_exact_int_branch_artifacts: HashMap::from([(
+                function_id,
+                std::sync::Arc::new(artifacts),
+            )]),
+            behavior_change_indexed_stores: false,
+            profiled_cold_blocks: false,
+            guard_miss_deopt: false,
+        };
+
+        let module_plan =
+            build_typed_v3_jit_module_plan(&module, Some(&profile), &typed_v3_env_config())
+                .expect("typed-v3 module plan should attach scalar-thread selection");
+        let planned_function = module_plan
+            .module
+            .callable_defs
+            .iter()
+            .find(|function| function.function_id == function_id)
+            .expect("planned module should include store_then_compare");
+        let InstrTyped::LegacyStore(store) = &planned_function.blocks[0].body[0] else {
+            panic!("entry block should keep a typed producer store");
+        };
+        let scalar_thread_plan = store
+            .extra()
+            .exact_int_scalar_thread_plan()
+            .expect("typed-v3 module plan should carry exact-int scalar-thread selection");
+        assert_eq!(
+            scalar_thread_plan.source,
+            TypedExactIntPlanSource::OptimizationPlanV3
+        );
+        assert_eq!(scalar_thread_plan.store_instr_id, store_instr_id);
+        assert_eq!(scalar_thread_plan.producer_instr_id, add_instr_id);
+        assert_eq!(scalar_thread_plan.consumer_instr_id, compare_instr_id);
+        assert_eq!(
+            scalar_thread_plan.producer_hot_plan.id,
+            scalar_thread_plan.producer_hot_region.region
+        );
+        assert_eq!(
+            scalar_thread_plan.consumer_hot_plan.id,
+            scalar_thread_plan.consumer_hot_region.region
+        );
+        let specialization_inputs =
+            FunctionSpecializationInputs::from_profile(&profile, planned_function)
+                .expect("typed-v3 scalar thread should not require sidecar inputs");
+        assert!(
+            specialization_inputs.legacy_overlays.is_none(),
+            "typed-v3 scalar-int selection should be represented in InstrTyped, not in FunctionSpecializationInputs"
         );
     }
 

@@ -93,8 +93,8 @@ use soac_opt::passes::{
     TypedDirectCallableCall, TypedDirectCallableCallGuard, TypedDirectConstructorCallGuard,
     TypedDirectFunctionCallGuard, TypedDirectMethodCall, TypedDirectMethodCallGuard,
     TypedExactIntBranchPlan, TypedExactIntPlanSource, TypedExactIntReturnPlan,
-    TypedExactListItemAccessPlan, TypedExactListItemPlanSource, TypedGetAttr,
-    TypedGuardedCallableCall, TypedGuardedMethodCall, TypedIndexedFieldGuard,
+    TypedExactIntScalarThreadPlan, TypedExactListItemAccessPlan, TypedExactListItemPlanSource,
+    TypedGetAttr, TypedGuardedCallableCall, TypedGuardedMethodCall, TypedIndexedFieldGuard,
     TypedIndexedFieldPlanSource, TypedIndexedGlobalAccessPlan, TypedIndexedGlobalPlanSource,
     TypedPlannedResult, TypedPyObjectOwnershipPlan, TypedSetAttr, ValueFacts,
     annotate_typed_function_planned_results, annotate_typed_function_result_demands,
@@ -118,6 +118,7 @@ use soac_opt::region_emission_v3::{
     ExactIntBranchSelection as OptV3ExactIntBranchSelection,
     ExactIntReturnSelection as OptV3ExactIntReturnSelection,
     ScalarThreadInlineReturnTargets as OptV3ScalarThreadInlineReturnTargets,
+    ScalarThreadSelection as OptV3ScalarThreadSelection,
     exact_int_branch_selection_for_source as opt_v3_exact_int_branch_selection_for_source,
     exact_int_return_selection_for_source as opt_v3_exact_int_return_selection_for_source,
     scalar_thread_inline_return_targets as opt_v3_scalar_thread_inline_return_targets,
@@ -6491,7 +6492,6 @@ struct JitEmitCtx<'mc> {
     call_direct_hit_counter_ids: &'mc HashMap<InstrId, CounterRef>,
     call_direct_fallback_counter_ids: &'mc HashMap<InstrId, CounterRef>,
     operator_shape_counter_ids: &'mc HashMap<InstrId, CounterId>,
-    opt_v3_exact_int_branch_artifacts: Option<Arc<ExactIntBranchV3Artifacts>>,
     getitem_shape_counter_ids: &'mc HashMap<InstrId, CounterId>,
     getitem_specialized_hit_counter_ids: &'mc HashMap<InstrId, CounterRef>,
     getitem_specialized_fallback_counter_ids: &'mc HashMap<InstrId, CounterRef>,
@@ -11504,6 +11504,29 @@ fn typed_exact_int_return_plan_from_opt_v3(
     }
 }
 
+fn typed_exact_int_scalar_thread_plan_from_opt_v3(
+    store_instr_id: InstrId,
+    producer_instr_id: InstrId,
+    consumer_instr_id: InstrId,
+    selection: OptV3ScalarThreadSelection<'_>,
+) -> TypedExactIntScalarThreadPlan {
+    TypedExactIntScalarThreadPlan {
+        source: TypedExactIntPlanSource::OptimizationPlanV3,
+        store_instr_id,
+        producer_instr_id,
+        consumer_instr_id,
+        thread: selection.thread.clone(),
+        producer_hot_plan: selection.producer.hot_plan.clone(),
+        producer_hot_region: selection.producer.hot_region.clone(),
+        producer_fallback_plan: selection.producer.fallback_plan.clone(),
+        producer_fallback_region: selection.producer.fallback_region.clone(),
+        consumer_hot_plan: selection.consumer.hot_plan.clone(),
+        consumer_hot_region: selection.consumer.hot_region.clone(),
+        consumer_fallback_plan: selection.consumer.fallback_plan.clone(),
+        consumer_fallback_region: selection.consumer.fallback_region.clone(),
+    }
+}
+
 fn annotate_typed_exact_int_selections(
     function: &mut BlockPyFunction<TypedCodegenModuleShape>,
     artifacts: &ExactIntBranchV3Artifacts,
@@ -11564,6 +11587,47 @@ fn annotate_typed_exact_int_selections(
             let plan = typed_exact_int_return_plan_from_opt_v3(instr_id, selection);
             self.count += usize::from(extra.set_exact_int_return_plan(plan));
         }
+
+        fn attach_scalar_thread_plan(
+            &mut self,
+            store_expr: &mut InstrTyped,
+            consumer_test: &InstrTyped,
+        ) {
+            let Some(store_instr_id) = store_expr.try_semantic_instr_id() else {
+                return;
+            };
+            let InstrTyped::LegacyStore(store) = store_expr else {
+                return;
+            };
+            let Some(producer_instr_id) = store.value.try_semantic_instr_id() else {
+                return;
+            };
+            let Some(consumer_instr_id) = consumer_test.try_semantic_instr_id() else {
+                return;
+            };
+            let selection = match opt_v3_scalar_thread_selection_for_store_branch(
+                self.artifacts,
+                producer_instr_id,
+                consumer_instr_id,
+                &store.name,
+            ) {
+                Ok(selection) => selection,
+                Err(error) => {
+                    self.error = Some(error);
+                    return;
+                }
+            };
+            let Some(selection) = selection else {
+                return;
+            };
+            let plan = typed_exact_int_scalar_thread_plan_from_opt_v3(
+                store_instr_id,
+                producer_instr_id,
+                consumer_instr_id,
+                selection,
+            );
+            self.count += usize::from(store.extra_mut().set_exact_int_scalar_thread_plan(plan));
+        }
     }
 
     impl VisitMut<InstrTyped> for Annotator<'_> {
@@ -11581,7 +11645,30 @@ fn annotate_typed_exact_int_selections(
         count: 0,
         error: None,
     };
+    let empty_if_tests_by_label = function
+        .blocks
+        .iter()
+        .filter_map(|block| {
+            if !block.body.is_empty() {
+                return None;
+            }
+            let BlockTerm::IfTerm(if_term) = &block.term else {
+                return None;
+            };
+            Some((block.label, if_term.test.clone()))
+        })
+        .collect::<HashMap<_, _>>();
     for block in &mut function.blocks {
+        if let [store_expr] = block.body.as_mut_slice()
+            && let BlockTerm::Jump(edge) = &block.term
+            && edge.args.is_empty()
+            && let Some(consumer_test) = empty_if_tests_by_label.get(&edge.target)
+        {
+            annotator.attach_scalar_thread_plan(store_expr, consumer_test);
+            if let Some(error) = annotator.error.take() {
+                return Err(error);
+            }
+        }
         if let BlockTerm::IfTerm(if_term) = &mut block.term {
             annotator.attach_branch_plan(&mut if_term.test);
             if let Some(error) = annotator.error.take() {
@@ -11885,13 +11972,13 @@ struct LegacyFunctionSpecializationOverlays {
     field_index_specializations_by_instr: HashMap<InstrId, Vec<FieldIndexSpecialization>>,
     indexed_fields_by_instr: HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>,
     indexed_globals_by_instr: HashMap<InstrId, OptV3IndexedGlobalAccessPlan>,
+    exact_int_branch_artifacts: Option<Arc<ExactIntBranchV3Artifacts>>,
 }
 
 #[derive(Clone, Debug)]
 struct FunctionSpecializationInputs {
     legacy_overlays: Option<LegacyFunctionSpecializationOverlays>,
     cold_block_labels: HashSet<BlockLabel>,
-    opt_v3_exact_int_branch_artifacts: Option<Arc<ExactIntBranchV3Artifacts>>,
     behavior_change_indexed_stores: bool,
     guard_miss_deopt_stub: bool,
 }
@@ -12327,15 +12414,15 @@ impl FunctionSpecializationInputs {
                     .get(&function.function_id)
                     .cloned()
                     .unwrap_or_default(),
+                exact_int_branch_artifacts: profile
+                    .opt_v3_exact_int_branch_artifacts
+                    .get(&function.function_id)
+                    .cloned(),
             })
         };
         Ok(Self {
             legacy_overlays,
             cold_block_labels: profile.cold_block_labels(function)?,
-            opt_v3_exact_int_branch_artifacts: profile
-                .opt_v3_exact_int_branch_artifacts
-                .get(&function.function_id)
-                .cloned(),
             behavior_change_indexed_stores: profile.behavior_change_indexed_stores
                 && function.scope.scope_kind != CallableScopeKind::Module,
             guard_miss_deopt_stub: profile.guard_miss_deopt
@@ -21290,6 +21377,40 @@ fn emit_opt_v3_scalar_thread_inline_return_arm(
     )
 }
 
+fn typed_exact_int_scalar_thread_selection(
+    plan: &TypedExactIntScalarThreadPlan,
+    producer_source: InstrId,
+    consumer_source: InstrId,
+) -> Result<Option<OptV3ScalarThreadSelection<'_>>, String> {
+    if plan.producer_instr_id != producer_source || plan.consumer_instr_id != consumer_source {
+        return Ok(None);
+    }
+    if !matches!(
+        plan.thread.materialization,
+        soac_opt::plan_v3::ScalarThreadMaterialization::DeferredUntilPythonObjectUse { .. }
+    ) {
+        return Err(format!(
+            "optimizer v3 scalar thread for local {} has materialization unsupported by current mechanical lowering: {:?}",
+            plan.thread.local.name, plan.thread.materialization
+        ));
+    }
+    Ok(Some(OptV3ScalarThreadSelection {
+        thread: &plan.thread,
+        producer: OptV3ExactIntReturnSelection {
+            hot_plan: &plan.producer_hot_plan,
+            hot_region: &plan.producer_hot_region,
+            fallback_plan: &plan.producer_fallback_plan,
+            fallback_region: &plan.producer_fallback_region,
+        },
+        consumer: OptV3ExactIntBranchSelection {
+            hot_plan: &plan.consumer_hot_plan,
+            hot_region: &plan.consumer_hot_region,
+            fallback_plan: &plan.consumer_fallback_plan,
+            fallback_region: &plan.consumer_fallback_region,
+        },
+    }))
+}
+
 #[allow(clippy::too_many_arguments)]
 #[allow(dead_code)]
 fn emit_opt_v3_scalar_threaded_store_branch(
@@ -21349,15 +21470,11 @@ fn emit_opt_v3_scalar_threaded_store_branch(
     let Some(consumer_source) = if_term.test.try_semantic_instr_id() else {
         return Ok(None);
     };
-    let Some(artifacts) = emit_ctx.opt_v3_exact_int_branch_artifacts.as_deref() else {
+    let Some(plan) = store.extra().exact_int_scalar_thread_plan() else {
         return Ok(None);
     };
-    let Some(selection) = opt_v3_scalar_thread_selection_for_store_branch(
-        artifacts,
-        producer_source,
-        consumer_source,
-        &store.name,
-    )?
+    let Some(selection) =
+        typed_exact_int_scalar_thread_selection(plan, producer_source, consumer_source)?
     else {
         return Ok(None);
     };
@@ -26124,7 +26241,6 @@ fn prepare_specialized_typed_function(
     specialization_profile: Option<&SpecializationProfile<'_>>,
     value_facts: &FactStore,
     legacy_overlays: Option<&LegacyFunctionSpecializationOverlays>,
-    opt_v3_exact_int_branch_artifacts: Option<&ExactIntBranchV3Artifacts>,
     specialize_field_stores: bool,
 ) -> Result<PreparedSpecializedTypedFunction, String> {
     let mut typed_function = legacy_call_emission_typed_function
@@ -26158,7 +26274,7 @@ fn prepare_specialized_typed_function(
             &mut typed_function,
             &legacy_overlays.exact_list_items_by_instr,
         )?;
-        if let Some(exact_int_artifacts) = opt_v3_exact_int_branch_artifacts {
+        if let Some(exact_int_artifacts) = legacy_overlays.exact_int_branch_artifacts.as_deref() {
             annotate_typed_exact_int_selections(&mut typed_function, exact_int_artifacts)?;
         }
     }
@@ -26466,7 +26582,6 @@ fn build_cranelift_run_bb_specialized_function(
     };
     let legacy_overlays = specialization_inputs.legacy_overlays;
     let cold_block_labels = specialization_inputs.cold_block_labels;
-    let opt_v3_exact_int_branch_artifacts = specialization_inputs.opt_v3_exact_int_branch_artifacts;
     let behavior_change_indexed_stores = specialization_inputs.behavior_change_indexed_stores;
     let guard_miss_deopt_stub = specialization_inputs.guard_miss_deopt_stub;
     let function_runtime_data_layout = FunctionRuntimeDataLayout::from_typed_function(function);
@@ -26482,7 +26597,6 @@ fn build_cranelift_run_bb_specialized_function(
         specialization_profile,
         value_facts,
         legacy_overlays.as_ref(),
-        opt_v3_exact_int_branch_artifacts.as_deref(),
         behavior_change_indexed_stores,
     )?;
     let direct_call_targets = collect_typed_call_direct_targets(&typed_function);
@@ -27119,7 +27233,6 @@ fn build_cranelift_run_bb_specialized_function(
                 call_direct_hit_counter_ids: &call_direct_hit_counter_ids,
                 call_direct_fallback_counter_ids: &call_direct_fallback_counter_ids,
                 operator_shape_counter_ids: &operator_shape_counter_ids,
-                opt_v3_exact_int_branch_artifacts: opt_v3_exact_int_branch_artifacts.clone(),
                 getitem_shape_counter_ids: &getitem_shape_counter_ids,
                 getitem_specialized_hit_counter_ids: &getitem_specialized_hit_counter_ids,
                 getitem_specialized_fallback_counter_ids: &getitem_specialized_fallback_counter_ids,
@@ -27558,9 +27671,6 @@ pub unsafe fn render_instr_typed_for_codegen_with_runtime_state(
         Some(&specialization_profile),
         &jit_module_plan.value_facts,
         specialization_inputs.legacy_overlays.as_ref(),
-        specialization_inputs
-            .opt_v3_exact_int_branch_artifacts
-            .as_deref(),
         specialization_inputs.behavior_change_indexed_stores,
     )?;
     let direct_call_targets = collect_typed_call_direct_targets(&typed_function);

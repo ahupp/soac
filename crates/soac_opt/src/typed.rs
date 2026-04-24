@@ -3,6 +3,7 @@ use crate::passes::{BoolFacts, FactStore, PyObjFacts, ValueFacts, value_facts};
 use crate::plan_v3::{
     ExactListItemAccessKind, ExactListItemFallbackKind, ExactListItemGuardKind, ExactListItemShape,
     IndexedGlobalAccessKind, IndexedGlobalFallbackKind, IndexedGlobalGuardKind, RegionPlan,
+    ScalarLocalThreadPlan,
 };
 #[allow(unused_imports)]
 use soac_core::block_py;
@@ -1046,6 +1047,23 @@ pub struct TypedExactIntReturnPlan {
     pub fallback_region: MechanicalRegionEmission,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TypedExactIntScalarThreadPlan {
+    pub source: TypedExactIntPlanSource,
+    pub store_instr_id: InstrId,
+    pub producer_instr_id: InstrId,
+    pub consumer_instr_id: InstrId,
+    pub thread: ScalarLocalThreadPlan,
+    pub producer_hot_plan: RegionPlan,
+    pub producer_hot_region: MechanicalRegionEmission,
+    pub producer_fallback_plan: RegionPlan,
+    pub producer_fallback_region: MechanicalRegionEmission,
+    pub consumer_hot_plan: RegionPlan,
+    pub consumer_hot_region: MechanicalRegionEmission,
+    pub consumer_fallback_plan: RegionPlan,
+    pub consumer_fallback_region: MechanicalRegionEmission,
+}
+
 define_ruff_instr! {
     pub struct TypedGetAttr<E> {
         value: Box<E>,
@@ -1228,6 +1246,7 @@ pub struct TypedInstrExtra {
     pub exact_list_item_access: Option<TypedExactListItemAccessPlan>,
     pub exact_int_branch: Option<TypedExactIntBranchPlan>,
     pub exact_int_return: Option<TypedExactIntReturnPlan>,
+    pub exact_int_scalar_thread: Option<TypedExactIntScalarThreadPlan>,
 }
 
 impl TypedInstrExtra {
@@ -1341,6 +1360,25 @@ impl TypedInstrExtra {
 
     pub fn clear_exact_int_return_plan(&mut self) -> bool {
         self.exact_int_return.take().is_some()
+    }
+
+    pub fn exact_int_scalar_thread_plan(&self) -> Option<&TypedExactIntScalarThreadPlan> {
+        self.exact_int_scalar_thread.as_ref()
+    }
+
+    pub fn set_exact_int_scalar_thread_plan(
+        &mut self,
+        plan: TypedExactIntScalarThreadPlan,
+    ) -> bool {
+        if self.exact_int_scalar_thread.as_ref() == Some(&plan) {
+            return false;
+        }
+        self.exact_int_scalar_thread = Some(plan);
+        true
+    }
+
+    pub fn clear_exact_int_scalar_thread_plan(&mut self) -> bool {
+        self.exact_int_scalar_thread.take().is_some()
     }
 }
 
