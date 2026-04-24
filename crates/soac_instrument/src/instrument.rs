@@ -1,6 +1,6 @@
 use soac_core::block_py::{
-    Block, BlockLabel, BlockTerm, CounterBranchId, CounterDef, CounterId, CounterScope,
-    CounterSite, Instr, InstrId, RuntimeFunctionId,
+    BinOpKind, Block, BlockLabel, BlockTerm, CallArgKeyword, CallArgPositional, CounterBranchId,
+    CounterDef, CounterId, CounterScope, CounterSite, Instr, InstrId, RuntimeFunctionId,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -336,6 +336,83 @@ pub(crate) fn define_call_counters(
         },
         ["hit", "fallback"],
     );
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SpecializationCounterCandidate {
+    GlobalIndexed { instr_id: InstrId },
+    FieldAccess { instr_id: InstrId },
+    OperatorHotShapes { instr_id: InstrId },
+    GetItem { instr_id: InstrId },
+    SetItem { instr_id: InstrId },
+    Call { instr_id: InstrId },
+}
+
+pub(crate) fn is_operator_specialization_binop_kind(kind: BinOpKind) -> bool {
+    matches!(
+        kind,
+        BinOpKind::Add
+            | BinOpKind::Sub
+            | BinOpKind::Mul
+            | BinOpKind::And
+            | BinOpKind::Or
+            | BinOpKind::Xor
+            | BinOpKind::Eq
+            | BinOpKind::Ne
+            | BinOpKind::Lt
+            | BinOpKind::Le
+            | BinOpKind::Gt
+            | BinOpKind::Ge
+    )
+}
+
+pub(crate) fn is_profile_call_candidate<I>(
+    args: &[CallArgPositional<I>],
+    keywords: &[CallArgKeyword<I>],
+) -> bool {
+    keywords.is_empty()
+        && args
+            .iter()
+            .all(|arg| matches!(arg, CallArgPositional::Positional(_)))
+}
+
+pub(crate) fn define_specialization_counter_candidate(
+    counters: &mut CounterBuilder<'_>,
+    function_id: RuntimeFunctionId,
+    candidate: SpecializationCounterCandidate,
+) {
+    match candidate {
+        SpecializationCounterCandidate::GlobalIndexed { instr_id } => {
+            define_indexed_counter(counters, function_id, instr_id, "global_indexed");
+        }
+        SpecializationCounterCandidate::FieldAccess { instr_id } => {
+            define_field_access_counter(counters, function_id, instr_id);
+        }
+        SpecializationCounterCandidate::OperatorHotShapes { instr_id } => {
+            define_operator_hot_shapes_counter(counters, function_id, instr_id);
+        }
+        SpecializationCounterCandidate::GetItem { instr_id } => {
+            define_instr_shape_counters(
+                counters,
+                function_id,
+                instr_id,
+                "getitem_hot_shapes",
+                "getitem_specialized",
+            );
+        }
+        SpecializationCounterCandidate::SetItem { instr_id } => {
+            define_instr_shape_counters(
+                counters,
+                function_id,
+                instr_id,
+                "setitem_hot_shapes",
+                "setitem_specialized",
+            );
+        }
+        SpecializationCounterCandidate::Call { instr_id } => {
+            define_call_counters(counters, function_id, instr_id);
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

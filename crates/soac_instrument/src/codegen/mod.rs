@@ -1,12 +1,12 @@
 use crate::instrument::{
-    define_block_entry_counter, define_branch_outcome_counter, define_call_counters,
-    define_field_access_counter, define_indexed_counter, define_instr_shape_counters,
-    define_operator_hot_shapes_counter, define_refcount_counters,
+    SpecializationCounterCandidate, define_block_entry_counter, define_branch_outcome_counter,
+    define_refcount_counters, define_specialization_counter_candidate,
+    is_operator_specialization_binop_kind, is_profile_call_candidate,
 };
 use crate::{CounterBuilder, ExplicitCounterPlacement, InstrumentationConfig};
 use soac_config::{ExecTraceConfig, SoacEnvConfig};
 use soac_core::block_py::{
-    BinOpKind, BlockPyFunction, BlockPyModule, BlockTerm, Call, CallArgPositional, ChildVisitable,
+    BlockPyFunction, BlockPyModule, BlockTerm, Call, CallArgPositional, ChildVisitable,
     CounterScope, CounterSite, FunctionExecutionMode, HasSemanticInstrId, LiteralValue, Load, Meta,
     ModuleShape, NameLocation, ResolvedName, RuntimeFunctionId, RuntimeName, StringLiteral, Tuple,
     Visit, WithMeta,
@@ -226,21 +226,7 @@ pub fn instrument_bb_module_with_call_target_counters(
 ) {
     fn is_operator_specialization_candidate(expr: &InstrCodegen) -> bool {
         match expr {
-            InstrCodegen::BinOp(op) => matches!(
-                op.kind,
-                BinOpKind::Add
-                    | BinOpKind::Sub
-                    | BinOpKind::Mul
-                    | BinOpKind::And
-                    | BinOpKind::Or
-                    | BinOpKind::Xor
-                    | BinOpKind::Eq
-                    | BinOpKind::Ne
-                    | BinOpKind::Lt
-                    | BinOpKind::Le
-                    | BinOpKind::Gt
-                    | BinOpKind::Ge
-            ),
+            InstrCodegen::BinOp(op) => is_operator_specialization_binop_kind(op.kind),
             _ => false,
         }
     }
@@ -270,52 +256,63 @@ pub fn instrument_bb_module_with_call_target_counters(
         fn visit_instr(&mut self, expr: &InstrCodegen) {
             if is_global_index_candidate(expr) {
                 let instr_id = expr.semantic_instr_id();
-                define_indexed_counter(self.counters, self.function_id, instr_id, "global_indexed");
+                define_specialization_counter_candidate(
+                    self.counters,
+                    self.function_id,
+                    SpecializationCounterCandidate::GlobalIndexed { instr_id },
+                );
             }
             match expr {
                 InstrCodegen::GetAttr(_) => {
                     let instr_id = expr.semantic_instr_id();
-                    define_field_access_counter(self.counters, self.function_id, instr_id);
+                    define_specialization_counter_candidate(
+                        self.counters,
+                        self.function_id,
+                        SpecializationCounterCandidate::FieldAccess { instr_id },
+                    );
                 }
                 InstrCodegen::SetAttr(_) => {
                     let instr_id = expr.semantic_instr_id();
-                    define_field_access_counter(self.counters, self.function_id, instr_id);
+                    define_specialization_counter_candidate(
+                        self.counters,
+                        self.function_id,
+                        SpecializationCounterCandidate::FieldAccess { instr_id },
+                    );
                 }
                 _ => {}
             }
             if is_operator_specialization_candidate(expr) {
                 let instr_id = expr.semantic_instr_id();
-                define_operator_hot_shapes_counter(self.counters, self.function_id, instr_id);
+                define_specialization_counter_candidate(
+                    self.counters,
+                    self.function_id,
+                    SpecializationCounterCandidate::OperatorHotShapes { instr_id },
+                );
             }
             if is_getitem_specialization_candidate(expr) {
                 let instr_id = expr.semantic_instr_id();
-                define_instr_shape_counters(
+                define_specialization_counter_candidate(
                     self.counters,
                     self.function_id,
-                    instr_id,
-                    "getitem_hot_shapes",
-                    "getitem_specialized",
+                    SpecializationCounterCandidate::GetItem { instr_id },
                 );
             }
             if is_setitem_specialization_candidate(expr) {
                 let instr_id = expr.semantic_instr_id();
-                define_instr_shape_counters(
+                define_specialization_counter_candidate(
                     self.counters,
                     self.function_id,
-                    instr_id,
-                    "setitem_hot_shapes",
-                    "setitem_specialized",
+                    SpecializationCounterCandidate::SetItem { instr_id },
                 );
             }
             if let InstrCodegen::Call(call) = expr {
-                let is_candidate = call.keywords.is_empty()
-                    && call
-                        .args
-                        .iter()
-                        .all(|arg| matches!(arg, CallArgPositional::Positional(_)));
-                if is_candidate {
+                if is_profile_call_candidate(&call.args, &call.keywords) {
                     let instr_id = expr.semantic_instr_id();
-                    define_call_counters(self.counters, self.function_id, instr_id);
+                    define_specialization_counter_candidate(
+                        self.counters,
+                        self.function_id,
+                        SpecializationCounterCandidate::Call { instr_id },
+                    );
                 }
             }
             expr.visit_children(self);

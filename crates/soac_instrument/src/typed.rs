@@ -1,13 +1,12 @@
 use crate::instrument::{
-    define_block_entry_counter, define_branch_outcome_counter, define_call_counters,
-    define_field_access_counter, define_indexed_counter, define_instr_shape_counters,
-    define_operator_hot_shapes_counter, define_refcount_counters,
+    SpecializationCounterCandidate, define_block_entry_counter, define_branch_outcome_counter,
+    define_refcount_counters, define_specialization_counter_candidate,
+    is_operator_specialization_binop_kind, is_profile_call_candidate,
 };
 use crate::{CounterBuilder, ExplicitCounterPlacement, InstrumentationConfig};
 use soac_core::block_py::{
-    BinOpKind, BlockPyFunction, BlockPyModule, BlockTerm, CallArgKeyword, CallArgPositional,
-    ChildVisitable, CounterScope, FunctionExecutionMode, HasSemanticInstrId, Meta, NameLocation,
-    RuntimeFunctionId, Visit, WithMeta,
+    BlockPyFunction, BlockPyModule, BlockTerm, ChildVisitable, CounterScope, FunctionExecutionMode,
+    HasSemanticInstrId, Meta, NameLocation, RuntimeFunctionId, Visit, WithMeta,
 };
 use soac_core::pass_tracker::{NoopPassTracker, PassTracker};
 use soac_lowering::block_py::counters::IncrementCounter;
@@ -112,21 +111,7 @@ fn define_module_locality_counters(module: &mut BlockPyModule<TypedCodegenModule
 fn define_module_call_target_counters(module: &mut BlockPyModule<TypedCodegenModuleShape>) {
     fn is_operator_specialization_candidate(expr: &InstrTyped) -> bool {
         match expr {
-            InstrTyped::BinOp(op) => matches!(
-                op.kind,
-                BinOpKind::Add
-                    | BinOpKind::Sub
-                    | BinOpKind::Mul
-                    | BinOpKind::And
-                    | BinOpKind::Or
-                    | BinOpKind::Xor
-                    | BinOpKind::Eq
-                    | BinOpKind::Ne
-                    | BinOpKind::Lt
-                    | BinOpKind::Le
-                    | BinOpKind::Gt
-                    | BinOpKind::Ge
-            ),
+            InstrTyped::BinOp(op) => is_operator_specialization_binop_kind(op.kind),
             _ => false,
         }
     }
@@ -139,16 +124,6 @@ fn define_module_call_target_counters(module: &mut BlockPyModule<TypedCodegenMod
         }
     }
 
-    fn is_profile_call_candidate(
-        args: &[CallArgPositional<InstrTyped>],
-        keywords: &[CallArgKeyword<InstrTyped>],
-    ) -> bool {
-        keywords.is_empty()
-            && args
-                .iter()
-                .all(|arg| matches!(arg, CallArgPositional::Positional(_)))
-    }
-
     struct SpecializationCandidateCounterCollector<'a, 'b> {
         function_id: RuntimeFunctionId,
         counters: &'a mut CounterBuilder<'b>,
@@ -158,41 +133,53 @@ fn define_module_call_target_counters(module: &mut BlockPyModule<TypedCodegenMod
         fn visit_instr(&mut self, expr: &InstrTyped) {
             if is_global_index_candidate(expr) {
                 let instr_id = expr.semantic_instr_id();
-                define_indexed_counter(self.counters, self.function_id, instr_id, "global_indexed");
+                define_specialization_counter_candidate(
+                    self.counters,
+                    self.function_id,
+                    SpecializationCounterCandidate::GlobalIndexed { instr_id },
+                );
             }
             match expr {
                 InstrTyped::GetAttrTyped(_) | InstrTyped::LegacyGetAttr(_) => {
                     let instr_id = expr.semantic_instr_id();
-                    define_field_access_counter(self.counters, self.function_id, instr_id);
+                    define_specialization_counter_candidate(
+                        self.counters,
+                        self.function_id,
+                        SpecializationCounterCandidate::FieldAccess { instr_id },
+                    );
                 }
                 InstrTyped::SetAttrTyped(_) | InstrTyped::LegacySetAttr(_) => {
                     let instr_id = expr.semantic_instr_id();
-                    define_field_access_counter(self.counters, self.function_id, instr_id);
+                    define_specialization_counter_candidate(
+                        self.counters,
+                        self.function_id,
+                        SpecializationCounterCandidate::FieldAccess { instr_id },
+                    );
                 }
                 _ => {}
             }
             if is_operator_specialization_candidate(expr) {
                 let instr_id = expr.semantic_instr_id();
-                define_operator_hot_shapes_counter(self.counters, self.function_id, instr_id);
+                define_specialization_counter_candidate(
+                    self.counters,
+                    self.function_id,
+                    SpecializationCounterCandidate::OperatorHotShapes { instr_id },
+                );
             }
             if matches!(expr, InstrTyped::LegacyGetItem(_)) {
                 let instr_id = expr.semantic_instr_id();
-                define_instr_shape_counters(
+                define_specialization_counter_candidate(
                     self.counters,
                     self.function_id,
-                    instr_id,
-                    "getitem_hot_shapes",
-                    "getitem_specialized",
+                    SpecializationCounterCandidate::GetItem { instr_id },
                 );
             }
             if matches!(expr, InstrTyped::LegacySetItem(_)) {
                 let instr_id = expr.semantic_instr_id();
-                define_instr_shape_counters(
+                define_specialization_counter_candidate(
                     self.counters,
                     self.function_id,
-                    instr_id,
-                    "setitem_hot_shapes",
-                    "setitem_specialized",
+                    SpecializationCounterCandidate::SetItem { instr_id },
                 );
             }
             match expr {
@@ -200,13 +187,21 @@ fn define_module_call_target_counters(module: &mut BlockPyModule<TypedCodegenMod
                     if is_profile_call_candidate(&call.args, &call.keywords) =>
                 {
                     let instr_id = expr.semantic_instr_id();
-                    define_call_counters(self.counters, self.function_id, instr_id);
+                    define_specialization_counter_candidate(
+                        self.counters,
+                        self.function_id,
+                        SpecializationCounterCandidate::Call { instr_id },
+                    );
                 }
                 InstrTyped::LegacyCall(call)
                     if is_profile_call_candidate(&call.args, &call.keywords) =>
                 {
                     let instr_id = expr.semantic_instr_id();
-                    define_call_counters(self.counters, self.function_id, instr_id);
+                    define_specialization_counter_candidate(
+                        self.counters,
+                        self.function_id,
+                        SpecializationCounterCandidate::Call { instr_id },
+                    );
                 }
                 _ => {}
             }
