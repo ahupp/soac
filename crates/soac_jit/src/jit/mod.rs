@@ -3187,9 +3187,11 @@ impl ProcessJitState {
             BuildSpecializedFunctionOptions {
                 counted_refcount_helpers: Some(reserved_inputs.counted_refcount_helpers),
                 specialization_inputs: Some(reserved_inputs.specialization_inputs.clone()),
-                call_emission_typed_function: Some(
-                    reserved_inputs.direct_call_typed_function.clone(),
-                ),
+                call_emission_typed_function: (!plan
+                    .env_config
+                    .runtime_optimization_pipeline()
+                    .uses_typed_v3_runtime())
+                .then(|| reserved_inputs.direct_call_typed_function.clone()),
                 ..BuildSpecializedFunctionOptions::default()
             },
         )
