@@ -29,6 +29,13 @@ use crate::block_py::{
 use ruff_python_ast::{self as ast};
 use soac_macros::{enum_broadcast, DelegateMatchDefault};
 
+/// BlockPy's Ruff-like phase, immediately after the AST-to-AST rewrite.
+///
+/// Compared with the previous phase, this is no longer a raw `ruff_python_ast`
+/// tree: module and function bodies have been put into BlockPy containers, but
+/// Python source constructs such as `while`, `try`, `with`, `await`, and
+/// comprehensions are still represented directly. Names are still unresolved
+/// source names. This is the bridge IR for syntax-directed lowering.
 #[derive(Clone, derive_more::From, DelegateMatchDefault)]
 #[enum_broadcast(HasMeta, WithMeta, ChildVisitable, Mappable, PrettyPrint, Debug)]
 pub(crate) enum InstrRuff {
@@ -92,16 +99,6 @@ pub(crate) enum InstrRuff {
     StmtIpyEscapeCommand(StmtIpyEscapeCommand),
 }
 
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub(crate) struct RuffModuleShape;
-
-impl ModuleShape for RuffModuleShape {
-    type Instr = InstrRuff;
-    type ModuleConstant = InstrResolved;
-    type BlockExtra = ();
-}
-
 impl Instr for InstrRuff {
     type Name = UnresolvedName;
     type Extra = ();
@@ -113,13 +110,23 @@ impl InstrWithConstantNone for InstrRuff {
     }
 }
 
-define_instr! {
-    pub struct DirectFunctionIdGuardTest<E> {
-        value: Box<E>,
-        function_id: RuntimeFunctionId,
-    }
+/// Module shape for the Ruff-like BlockPy phase.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub(crate) struct RuffModuleShape;
+
+impl ModuleShape for RuffModuleShape {
+    type Instr = InstrRuff;
+    type ModuleConstant = InstrResolved;
+    type BlockExtra = ();
 }
 
+/// Core BlockPy after syntax-level control flow has been lowered to blocks.
+///
+/// Compared with `InstrRuff`, structured statements and expressions that affect
+/// control flow have been converted into block edges and simpler operations.
+/// `await`, `yield`, and `yield from` still remain because coroutine and
+/// generator lowering happens in later phases. Names are still unresolved.
 #[derive(Clone, derive_more::From, DelegateMatchDefault)]
 #[enum_broadcast(HasMeta, WithMeta, ChildVisitable, Mappable, PrettyPrint, Debug)]
 pub(crate) enum InstrWithAwaitAndYield {
@@ -156,6 +163,22 @@ impl InstrWithConstantNone for InstrWithAwaitAndYield {
     }
 }
 
+/// Module shape for core BlockPy before await/yield lowering.
+#[derive(Debug, Clone)]
+pub(crate) struct CoreModuleShapeWithAwaitAndYield;
+
+impl ModuleShape for CoreModuleShapeWithAwaitAndYield {
+    type Instr = InstrWithAwaitAndYield;
+    type ModuleConstant = InstrResolved;
+    type BlockExtra = ();
+}
+
+/// Core BlockPy after `await` has been rewritten but generator yields remain.
+///
+/// Compared with `InstrWithAwaitAndYield`, `await expr` has been lowered into
+/// the runtime await-iterator protocol, so only `yield` and `yield from` still
+/// require generator/coroutine state-machine handling. Names are still
+/// unresolved.
 #[derive(Clone, derive_more::From, DelegateMatchDefault)]
 #[enum_broadcast(HasMeta, WithMeta, ChildVisitable, Mappable, PrettyPrint, Debug)]
 pub(crate) enum InstrWithYield {
@@ -191,6 +214,23 @@ impl InstrWithConstantNone for InstrWithYield {
     }
 }
 
+/// Module shape for core BlockPy after await lowering and before yield lowering.
+#[derive(Debug, Clone)]
+pub(crate) struct CoreModuleShapeWithYield;
+
+impl ModuleShape for CoreModuleShapeWithYield {
+    type Instr = InstrWithYield;
+    type ModuleConstant = InstrResolved;
+    type BlockExtra = ();
+}
+
+/// Core BlockPy after generator/coroutine yield lowering.
+///
+/// Compared with `InstrWithYield`, yield points have been lowered into explicit
+/// resume/state-machine structure, and functions now use only ordinary
+/// expression, storage, call, and function-construction operations. Names are
+/// still unresolved, so name binding has not yet chosen local/global/cell
+/// storage.
 #[derive(Clone, derive_more::From, DelegateMatchDefault)]
 #[enum_broadcast(HasMeta, WithMeta, ChildVisitable, Mappable, PrettyPrint, Debug)]
 pub(crate) enum InstrLow<N: NameLike> {
@@ -227,6 +267,23 @@ impl<N: NameLike> InstrWithConstantNone for InstrLow<N> {
 
 pub(crate) type InstrUnresolved = InstrLow<UnresolvedName>;
 
+/// Module shape for core BlockPy before name binding.
+#[derive(Debug, Clone)]
+pub(crate) struct CoreModuleShape;
+
+impl ModuleShape for CoreModuleShape {
+    type Instr = InstrUnresolved;
+    type ModuleConstant = InstrResolved;
+    type BlockExtra = ();
+}
+
+/// BlockPy after name binding has resolved source names to storage locations.
+///
+/// Compared with `InstrUnresolved`, loads/stores/deletes no longer carry raw
+/// source names: they refer to resolved local, global, constant, cell, closure,
+/// or runtime locations. This shape is reused through global-indexing and
+/// exception-edge CFG preparation until the final codegen-only operations are
+/// introduced.
 #[derive(
     Clone,
     derive_more::From,
@@ -274,33 +331,7 @@ impl InstrWithConstantNone for InstrResolved {
     }
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct CoreModuleShapeWithAwaitAndYield;
-
-impl ModuleShape for CoreModuleShapeWithAwaitAndYield {
-    type Instr = InstrWithAwaitAndYield;
-    type ModuleConstant = InstrResolved;
-    type BlockExtra = ();
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct CoreModuleShapeWithYield;
-
-impl ModuleShape for CoreModuleShapeWithYield {
-    type Instr = InstrWithYield;
-    type ModuleConstant = InstrResolved;
-    type BlockExtra = ();
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct CoreModuleShape;
-
-impl ModuleShape for CoreModuleShape {
-    type Instr = InstrLow<UnresolvedName>;
-    type ModuleConstant = InstrResolved;
-    type BlockExtra = ();
-}
-
+/// Module shape for resolved-storage BlockPy.
 #[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub(crate) struct ResolvedStorageModuleShape;
 
@@ -310,21 +341,21 @@ impl ModuleShape for ResolvedStorageModuleShape {
     type BlockExtra = ();
 }
 
-pub(crate) use blockpy_generators::lower_yield_in_lowered_core_blockpy_module_bundle;
-pub(crate) use blockpy_to_bb::{hoist_module_constants, lower_try_jump_exception_flow};
-pub(crate) use global_index::lower_global_index_in_resolved_module_default;
-pub(crate) use instr_id::assign_module_instr_ids;
-pub use instr_id::{
-    assign_missing_codegen_function_instr_ids, reassign_codegen_function_instr_ids,
-    reassign_codegen_module_instr_ids, validate_codegen_instr_ids,
-};
-pub(crate) use name_binding::lower_name_binding_in_core_blockpy_module_with_options;
-pub(crate) fn relabel_dense_bb_module<P: ModuleShape>(module: &mut BlockPyModule<P>) {
-    for callable in &mut module.callable_defs {
-        relabel_blockpy_blocks_dense(&mut callable.blocks);
+// Codegen-only payload for guarding profiled direct-function calls.
+define_instr! {
+    pub struct DirectFunctionIdGuardTest<E> {
+        value: Box<E>,
+        function_id: RuntimeFunctionId,
     }
 }
 
+/// Final lowered BlockPy form consumed by optimization, instrumentation, and JIT.
+///
+/// Compared with `InstrResolved`, module constants have been hoisted into the
+/// module constant table and codegen-facing operations such as direct-call
+/// payloads, direct-function guards, and explicit counter increments can appear.
+/// Instruction IDs are assigned on this shape before validation returns the
+/// module to the driver.
 #[derive(Clone, derive_more::From, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 #[rkyv(serialize_bounds(
     __S: rkyv::ser::Writer + rkyv::ser::Allocator,
@@ -368,6 +399,7 @@ impl InstrWithConstantNone for InstrCodegen {
     }
 }
 
+/// Module shape for final codegen-ready BlockPy.
 #[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct CodegenModuleShape;
 
@@ -375,6 +407,21 @@ impl ModuleShape for CodegenModuleShape {
     type Instr = InstrCodegen;
     type ModuleConstant = InstrResolved;
     type BlockExtra = ();
+}
+
+pub(crate) use blockpy_generators::lower_yield_in_lowered_core_blockpy_module_bundle;
+pub(crate) use blockpy_to_bb::{hoist_module_constants, lower_try_jump_exception_flow};
+pub(crate) use global_index::lower_global_index_in_resolved_module_default;
+pub(crate) use instr_id::assign_module_instr_ids;
+pub use instr_id::{
+    assign_missing_codegen_function_instr_ids, reassign_codegen_function_instr_ids,
+    reassign_codegen_module_instr_ids, validate_codegen_instr_ids,
+};
+pub(crate) use name_binding::lower_name_binding_in_core_blockpy_module_with_options;
+pub(crate) fn relabel_dense_bb_module<P: ModuleShape>(module: &mut BlockPyModule<P>) {
+    for callable in &mut module.callable_defs {
+        relabel_blockpy_blocks_dense(&mut callable.blocks);
+    }
 }
 
 #[cfg(test)]
