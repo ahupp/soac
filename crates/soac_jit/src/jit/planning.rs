@@ -1,5 +1,5 @@
 use soac_core::block_py::{
-    Block, BlockArg, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, LocalLocation,
+    BlockArg, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, LocalLocation,
     RuntimeFunctionId,
 };
 pub use soac_opt::passes::{
@@ -7,10 +7,10 @@ pub use soac_opt::passes::{
     PlannedLocalBinding, PlannedLocalStorage, render_planned_local_binding,
 };
 use soac_opt::passes::{
-    CodegenModuleShape, FactStore, FunctionLocalEnvResumePlan, FunctionRefcountPlan, InstrTyped,
+    CodegenModuleShape, FactStore, FunctionLocalEnvResumePlan, FunctionRefcountPlan,
     LocalEnvModulePlan, LocalEnvResumeEntry, LocalEnvResumeModulePlan, LocalEnvResumePoint,
     LocalEnvResumeStatePrecision, RefcountActionKind, RefcountPlan, RefcountReleaseReason,
-    TypedCodegenModuleShape, annotate_typed_module_value_facts,
+    TypedBlock, TypedCodegenModuleShape, annotate_typed_module_value_facts,
     compute_typed_function_local_live_ins, compute_typed_function_local_must_bound_ins,
     lower_codegen_module_to_typed, lower_typed_if_tests_to_truthy, plan_typed_local_env_module,
     plan_typed_local_env_resume_module, plan_typed_ownership_effects,
@@ -19,8 +19,6 @@ use soac_opt::passes::{
 };
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
-
-type TypedBlock = Block<InstrTyped>;
 
 #[derive(Clone, Debug)]
 pub struct PreparedJitTypedModulePlan {

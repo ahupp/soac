@@ -380,12 +380,13 @@ where
 {
 }
 
-pub trait MapBlock<In, Out>: MapTerm<In, Out>
+pub trait MapBlock<In, Out, InExtra = (), OutExtra = ()>: MapTerm<In, Out>
 where
     In: Instr,
     Out: Instr,
+    OutExtra: Default,
 {
-    fn map_block(&mut self, block: Block<In>) -> Block<Out> {
+    fn map_block(&mut self, block: Block<In, InExtra>) -> Block<Out, OutExtra> {
         Block {
             label: block.label,
             body: block
@@ -396,19 +397,22 @@ where
             term: self.map_term(block.term),
             params: block.params,
             exc_edge: block.exc_edge,
+            extra: OutExtra::default(),
         }
     }
 }
 
-impl<In, Out, M> MapBlock<In, Out> for M
+impl<In, Out, InExtra, OutExtra, M> MapBlock<In, Out, InExtra, OutExtra> for M
 where
     In: Instr,
     Out: Instr,
+    OutExtra: Default,
     M: MapTerm<In, Out>,
 {
 }
 
-pub trait MapFunction<PIn, POut>: MapBlock<PIn::Instr, POut::Instr>
+pub trait MapFunction<PIn, POut>:
+    MapBlock<PIn::Instr, POut::Instr, PIn::BlockExtra, POut::BlockExtra>
 where
     PIn: ModuleShape,
     POut: ModuleShape,
@@ -437,7 +441,7 @@ impl<PIn, POut, M> MapFunction<PIn, POut> for M
 where
     PIn: ModuleShape,
     POut: ModuleShape,
-    M: MapBlock<PIn::Instr, POut::Instr>,
+    M: MapBlock<PIn::Instr, POut::Instr, PIn::BlockExtra, POut::BlockExtra>,
 {
 }
 
@@ -471,7 +475,9 @@ where
 
 pub fn map_function_blocks<PIn, POut>(
     func: BlockPyFunction<PIn>,
-    mut map_block: impl FnMut(Block<PIn::Instr>) -> Block<POut::Instr>,
+    mut map_block: impl FnMut(
+        Block<PIn::Instr, PIn::BlockExtra>,
+    ) -> Block<POut::Instr, POut::BlockExtra>,
 ) -> BlockPyFunction<POut>
 where
     PIn: ModuleShape,
@@ -548,12 +554,14 @@ where
 {
 }
 
-pub trait TryMapBlock<In, Out, Error>: TryMapTerm<In, Out, Error>
+pub trait TryMapBlock<In, Out, Error, InExtra = (), OutExtra = ()>:
+    TryMapTerm<In, Out, Error>
 where
     In: Instr,
     Out: Instr,
+    OutExtra: Default,
 {
-    fn try_map_block(&mut self, block: Block<In>) -> Result<Block<Out>, Error> {
+    fn try_map_block(&mut self, block: Block<In, InExtra>) -> Result<Block<Out, OutExtra>, Error> {
         Ok(Block {
             label: block.label,
             body: block
@@ -564,19 +572,22 @@ where
             term: self.try_map_term(block.term)?,
             params: block.params,
             exc_edge: block.exc_edge,
+            extra: OutExtra::default(),
         })
     }
 }
 
-impl<In, Out, Error, M> TryMapBlock<In, Out, Error> for M
+impl<In, Out, Error, InExtra, OutExtra, M> TryMapBlock<In, Out, Error, InExtra, OutExtra> for M
 where
     In: Instr,
     Out: Instr,
+    OutExtra: Default,
     M: TryMapTerm<In, Out, Error>,
 {
 }
 
-pub trait TryMapFunction<PIn, POut, Error>: TryMapBlock<PIn::Instr, POut::Instr, Error>
+pub trait TryMapFunction<PIn, POut, Error>:
+    TryMapBlock<PIn::Instr, POut::Instr, Error, PIn::BlockExtra, POut::BlockExtra>
 where
     PIn: ModuleShape,
     POut: ModuleShape,
@@ -605,7 +616,7 @@ impl<PIn, POut, Error, M> TryMapFunction<PIn, POut, Error> for M
 where
     PIn: ModuleShape,
     POut: ModuleShape,
-    M: TryMapBlock<PIn::Instr, POut::Instr, Error>,
+    M: TryMapBlock<PIn::Instr, POut::Instr, Error, PIn::BlockExtra, POut::BlockExtra>,
 {
 }
 

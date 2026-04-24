@@ -454,11 +454,11 @@ where
         walk_expr::<Self, I>(self, expr);
     }
 
-    fn visit_block(&mut self, block: &Block<I>) {
+    fn visit_block<E>(&mut self, block: &Block<I, E>) {
         if let Some(exc_param) = block.exception_param() {
             self.used_names.insert(exc_param.to_string());
         }
-        walk_block::<Self, I>(self, block);
+        walk_block::<Self, I, E>(self, block);
     }
 
     fn visit_stmt(&mut self, stmt: &I) {

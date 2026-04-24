@@ -22,6 +22,7 @@ where
             term: block.term.clone(),
             params: block.bb_params().cloned().collect(),
             exc_edge: block.exc_edge.clone(),
+            extra: Default::default(),
         })
         .collect::<Vec<_>>();
     populate_exception_edge_args(&mut bb_blocks);

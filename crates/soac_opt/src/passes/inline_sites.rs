@@ -89,7 +89,7 @@ impl Visit<InstrCodegen> for InlineCallSiteCollector<'_> {
         walk_expr(self, expr);
     }
 
-    fn visit_block(&mut self, block: &soac_core::block_py::Block<InstrCodegen>)
+    fn visit_block<E>(&mut self, block: &soac_core::block_py::Block<InstrCodegen, E>)
     where
         InstrCodegen: ChildVisitable<InstrCodegen>,
     {

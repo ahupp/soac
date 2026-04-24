@@ -14,7 +14,7 @@ enum IfBranchKind {
 }
 
 pub trait BlockPyFormat: ModuleShape {
-    fn block_metadata_lines(block: &Block<Self::Instr>) -> Vec<String>
+    fn block_metadata_lines(block: &Block<Self::Instr, Self::BlockExtra>) -> Vec<String>
     where
         Self: Sized,
     {
@@ -289,7 +289,7 @@ impl BlockPyFormatter {
         function: &BlockPyFunction<P>,
         render_layout: &BlockRenderLayout,
         current_block_index: Option<usize>,
-        block: &Block<P::Instr>,
+        block: &Block<P::Instr, P::BlockExtra>,
         referenced_labels: &HashSet<BlockLabel>,
     ) where
         P: BlockPyFormat,
@@ -533,7 +533,7 @@ fn render_block_arg(arg: &BlockArg) -> String {
     format!("{arg:?}")
 }
 
-fn render_blockpy_block_metadata<I: Instr>(block: &Block<I>) -> Vec<String> {
+fn render_blockpy_block_metadata<I: Instr, E>(block: &Block<I, E>) -> Vec<String> {
     let mut lines = Vec::new();
     if let Some(exc_param) = block.exception_param() {
         lines.push(format!("exc_param: {exc_param}"));
@@ -541,7 +541,7 @@ fn render_blockpy_block_metadata<I: Instr>(block: &Block<I>) -> Vec<String> {
     lines
 }
 
-fn render_block_header<I: Instr>(block: &Block<I>) -> String {
+fn render_block_header<I: Instr, E>(block: &Block<I, E>) -> String {
     let params = block
         .params
         .iter()
@@ -715,7 +715,7 @@ fn can_inline_if_term_target(
 }
 
 fn collect_top_level_successors_from_block<P>(
-    block: &Block<P::Instr>,
+    block: &Block<P::Instr, P::BlockExtra>,
     label_to_index: &HashMap<BlockLabel, usize>,
 ) -> Vec<usize>
 where
@@ -906,7 +906,9 @@ fn compute_immediate_dominators(
     immediate_dominators
 }
 
-fn collect_referenced_labels_from_blocks<P>(blocks: &[Block<P::Instr>]) -> HashSet<BlockLabel>
+fn collect_referenced_labels_from_blocks<P>(
+    blocks: &[Block<P::Instr, P::BlockExtra>],
+) -> HashSet<BlockLabel>
 where
     P: ModuleShape,
 {

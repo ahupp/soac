@@ -1249,6 +1249,20 @@ pub struct TypedInstrExtra {
     pub exact_int_scalar_thread: Option<TypedExactIntScalarThreadPlan>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TypedBlockLayoutHint {
+    #[default]
+    Normal,
+    Cold,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TypedBlockExtra {
+    pub layout: TypedBlockLayoutHint,
+}
+
+pub type TypedBlock = Block<InstrTyped, TypedBlockExtra>;
+
 impl TypedInstrExtra {
     pub fn result_facts(&self) -> Option<ValueFacts> {
         self.result_facts
@@ -2322,8 +2336,8 @@ pub fn inline_typed_function_direct_call_stores(
 }
 
 enum TypedInlineBlockRewrite {
-    Rewritten(Vec<Block<InstrTyped>>),
-    Unchanged(Block<InstrTyped>),
+    Rewritten(Vec<TypedBlock>),
+    Unchanged(TypedBlock),
 }
 
 struct TypedInlineStoreCandidate {
@@ -2337,7 +2351,7 @@ fn build_typed_direct_call_inline_rewrite(
     caller: &mut BlockPyFunction<TypedCodegenModuleShape>,
     module: &BlockPyModule<TypedCodegenModuleShape>,
     external_callees: &HashMap<RuntimeFunctionId, BlockPyFunction<TypedCodegenModuleShape>>,
-    block: Block<InstrTyped>,
+    block: TypedBlock,
     direct_calls_by_instr_id: &HashMap<InstrId, Vec<(RuntimeFunctionId, TypedDirectCallArgPlan)>>,
     stats: &mut TypedInlineRewriteStats,
 ) -> TypedInlineBlockRewrite {
@@ -2408,7 +2422,7 @@ fn build_typed_direct_call_inline_rewrite(
         );
     }
 
-    let entry = Block::new(
+    let entry = Block::new_with_extra(
         block.label,
         before,
         typed_direct_call_guard_term(
@@ -2419,9 +2433,10 @@ fn build_typed_direct_call_inline_rewrite(
         ),
         block.params,
         None,
+        block.extra,
     );
 
-    let mut blocks = Vec::new();
+    let mut blocks: Vec<TypedBlock> = Vec::new();
     blocks.push(entry);
 
     for (guard_index, guard_label) in guard_labels.iter().copied().enumerate() {
@@ -2430,7 +2445,7 @@ fn build_typed_direct_call_inline_rewrite(
             .get(guard_index + 1)
             .copied()
             .unwrap_or(generic_label);
-        blocks.push(Block::new(
+        blocks.push(Block::new_with_extra(
             guard_label,
             Vec::new(),
             typed_direct_call_guard_term(
@@ -2441,6 +2456,7 @@ fn build_typed_direct_call_inline_rewrite(
             ),
             Vec::new(),
             None,
+            TypedBlockExtra::default(),
         ));
     }
 
@@ -2473,7 +2489,7 @@ fn build_typed_direct_call_inline_rewrite(
         blocks.extend(fragment.blocks);
     }
 
-    blocks.push(Block::new(
+    blocks.push(Block::new_with_extra(
         generic_label,
         typed_generic_call_fallback_body(
             &candidate.target,
@@ -2483,31 +2499,34 @@ fn build_typed_direct_call_inline_rewrite(
         BlockTerm::Jump(BlockEdge::new(continuation_label)),
         Vec::new(),
         None,
+        TypedBlockExtra::default(),
     ));
 
     let mut cleanup_body = Vec::new();
     append_typed_cleanup_dels_to_body(&mut cleanup_body, &arg_temps);
     append_typed_cleanup_del_to_body(&mut cleanup_body, &callable_temp.resolved_name());
-    blocks.push(Block::new(
+    blocks.push(Block::new_with_extra(
         cleanup_label,
         cleanup_body,
         BlockTerm::Jump(BlockEdge::new(continuation_label)),
         Vec::new(),
         None,
+        TypedBlockExtra::default(),
     ));
-    blocks.push(Block::new(
+    blocks.push(Block::new_with_extra(
         continuation_label,
         after,
         block.term,
         Vec::new(),
         None,
+        TypedBlockExtra::default(),
     ));
 
     TypedInlineBlockRewrite::Rewritten(blocks)
 }
 
 fn find_typed_inline_store_candidate(
-    block: &Block<InstrTyped>,
+    block: &TypedBlock,
     caller_id: RuntimeFunctionId,
     direct_calls_by_instr_id: &HashMap<InstrId, Vec<(RuntimeFunctionId, TypedDirectCallArgPlan)>>,
 ) -> Option<TypedInlineStoreCandidate> {
@@ -2739,7 +2758,7 @@ fn build_typed_direct_call_inline_fragment_to_target(
 }
 
 struct TypedInlineFragment {
-    blocks: Vec<Block<InstrTyped>>,
+    blocks: Vec<TypedBlock>,
 }
 
 fn build_single_block_typed_inline_fragment_to_target(
@@ -2790,12 +2809,13 @@ fn build_single_block_typed_inline_fragment_to_target(
     );
 
     Ok(TypedInlineFragment {
-        blocks: vec![Block::new(
+        blocks: vec![Block::new_with_extra(
             caller.name_gen.next_block_name(),
             body,
             BlockTerm::Jump(BlockEdge::new(continuation)),
             Vec::new(),
             None,
+            TypedBlockExtra::default(),
         )],
     })
 }
@@ -2835,7 +2855,7 @@ fn build_multi_block_typed_inline_fragment_to_target(
         .map(|block| (block.label, caller.name_gen.next_block_name()))
         .collect::<HashMap<_, _>>();
     let mut remapper = TypedInlineLocalRemapper::new(&locals, value_bindings);
-    let mut blocks = Vec::with_capacity(callee.blocks.len());
+    let mut blocks: Vec<TypedBlock> = Vec::with_capacity(callee.blocks.len());
     for callee_block in &callee.blocks {
         let label = typed_remapped_label(&label_map, callee_block.label)?;
         let mut body = callee_block
@@ -2860,7 +2880,14 @@ fn build_multi_block_typed_inline_fragment_to_target(
                 typed_remap_inline_term_labels(remapper.try_map_term(term.clone())?, &label_map)?
             }
         };
-        blocks.push(Block::new(label, body, term, Vec::new(), None));
+        blocks.push(Block::new_with_extra(
+            label,
+            body,
+            term,
+            Vec::new(),
+            None,
+            callee_block.extra.clone(),
+        ));
     }
     Ok(TypedInlineFragment { blocks })
 }
@@ -3426,6 +3453,7 @@ pub struct TypedCodegenModuleShape;
 impl ModuleShape for TypedCodegenModuleShape {
     type Instr = InstrTyped;
     type ModuleConstant = InstrResolved;
+    type BlockExtra = TypedBlockExtra;
 }
 
 #[cfg(test)]

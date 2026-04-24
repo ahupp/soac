@@ -60,8 +60,9 @@ pub fn allocate_codegen_stack_temp(
 }
 
 pub use crate::typed::{
-    InstrTyped, TypedAttrAccessPlan, TypedAttrOwnerRef, TypedCall, TypedCallAccessPlan,
-    TypedCallEmissionPlan, TypedCallEmissionPlans, TypedCodegenModuleShape, TypedDirectCallArgPlan,
+    InstrTyped, TypedAttrAccessPlan, TypedAttrOwnerRef, TypedBlock, TypedBlockExtra,
+    TypedBlockLayoutHint, TypedCall, TypedCallAccessPlan, TypedCallEmissionPlan,
+    TypedCallEmissionPlans, TypedCodegenModuleShape, TypedDirectCallArgPlan,
     TypedDirectCallArgSource, TypedDirectCallGuardTest, TypedDirectCallGuardTestKind,
     TypedDirectCallableCall, TypedDirectCallableCallGuard, TypedDirectConstructorCallGuard,
     TypedDirectFunctionCallGuard, TypedDirectMethodCall, TypedDirectMethodCallGuard,

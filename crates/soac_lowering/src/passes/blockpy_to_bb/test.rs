@@ -41,6 +41,7 @@ fn rewrites_current_exception_placeholders_in_final_core_blocks() {
             role: crate::block_py::BlockParamRole::Exception,
         }],
         exc_edge: None,
+        extra: Default::default(),
     };
 
     let lowered = lower_structured_located_blocks_to_bb_blocks(&[Block {
@@ -49,6 +50,7 @@ fn rewrites_current_exception_placeholders_in_final_core_blocks() {
         term: block.term,
         params: block.params,
         exc_edge: None,
+        extra: Default::default(),
     }]);
     let block = &lowered[0];
 
@@ -90,6 +92,7 @@ fn rewrites_current_exception_inside_intrinsic_helper_args() {
             role: crate::block_py::BlockParamRole::Exception,
         }],
         exc_edge: None,
+        extra: Default::default(),
     };
 
     let lowered = lower_structured_located_blocks_to_bb_blocks(&[Block {
@@ -98,6 +101,7 @@ fn rewrites_current_exception_inside_intrinsic_helper_args() {
         term: block.term,
         params: block.params,
         exc_edge: None,
+        extra: Default::default(),
     }]);
     let block = &lowered[0];
 
@@ -130,6 +134,7 @@ fn exception_edges_seed_hidden_try_exception_locals_from_current_exception() {
                 role: crate::block_py::BlockParamRole::Exception,
             }],
             exc_edge: Some(crate::block_py::BlockEdge::new(BlockLabel::from_index(1))),
+            extra: Default::default(),
         },
         crate::block_py::Block {
             label: BlockLabel::from_index(1),
@@ -152,6 +157,7 @@ fn exception_edges_seed_hidden_try_exception_locals_from_current_exception() {
                 },
             ],
             exc_edge: None,
+            extra: Default::default(),
         },
         crate::block_py::Block {
             label: BlockLabel::from_index(2),
@@ -159,6 +165,7 @@ fn exception_edges_seed_hidden_try_exception_locals_from_current_exception() {
             term: BlockTerm::<InstrResolved>::Return(InstrResolved::constant_none()),
             params: Vec::new(),
             exc_edge: None,
+            extra: Default::default(),
         },
     ];
 

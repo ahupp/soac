@@ -99,6 +99,7 @@ pub(crate) struct RuffModuleShape;
 impl ModuleShape for RuffModuleShape {
     type Instr = InstrRuff;
     type ModuleConstant = InstrResolved;
+    type BlockExtra = ();
 }
 
 impl Instr for InstrRuff {
@@ -300,6 +301,7 @@ pub(crate) struct CoreModuleShapeWithAwaitAndYield;
 impl ModuleShape for CoreModuleShapeWithAwaitAndYield {
     type Instr = InstrWithAwaitAndYield;
     type ModuleConstant = InstrResolved;
+    type BlockExtra = ();
 }
 
 #[derive(Debug, Clone)]
@@ -308,6 +310,7 @@ pub(crate) struct CoreModuleShapeWithYield;
 impl ModuleShape for CoreModuleShapeWithYield {
     type Instr = InstrWithYield;
     type ModuleConstant = InstrResolved;
+    type BlockExtra = ();
 }
 
 #[derive(Debug, Clone)]
@@ -316,6 +319,7 @@ pub(crate) struct CoreModuleShape;
 impl ModuleShape for CoreModuleShape {
     type Instr = InstrLow<UnresolvedName>;
     type ModuleConstant = InstrResolved;
+    type BlockExtra = ();
 }
 
 #[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -324,6 +328,7 @@ pub(crate) struct ResolvedStorageModuleShape;
 impl ModuleShape for ResolvedStorageModuleShape {
     type Instr = InstrResolved;
     type ModuleConstant = InstrResolved;
+    type BlockExtra = ();
 }
 
 pub(crate) use blockpy_generators::lower_yield_in_lowered_core_blockpy_module_bundle;
@@ -390,6 +395,7 @@ pub struct CodegenModuleShape;
 impl ModuleShape for CodegenModuleShape {
     type Instr = InstrCodegen;
     type ModuleConstant = InstrResolved;
+    type BlockExtra = ();
 }
 
 #[cfg(test)]

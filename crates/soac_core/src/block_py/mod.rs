@@ -754,15 +754,16 @@ impl Default for FunctionExecutionMode {
 }
 
 #[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-pub struct Block<I: Instr> {
+pub struct Block<I: Instr, E = ()> {
     pub label: BlockLabel,
     pub body: Vec<I>,
     pub term: BlockTerm<I>,
     pub params: Vec<BlockParam>,
     pub exc_edge: Option<BlockEdge>,
+    pub extra: E,
 }
 
-impl<I: Instr> Block<I> {
+impl<I: Instr, E> Block<I, E> {
     pub fn label_str(&self) -> String {
         self.label.to_string()
     }
@@ -782,6 +783,27 @@ impl<I: Instr> Block<I> {
             term,
             params,
             exc_edge,
+            extra: (),
+        }
+    }
+}
+
+impl<I: Instr, E> Block<I, E> {
+    pub fn new_with_extra(
+        label: BlockLabel,
+        body: Vec<I>,
+        term: BlockTerm<I>,
+        params: Vec<BlockParam>,
+        exc_edge: Option<BlockEdge>,
+        extra: E,
+    ) -> Self {
+        Self {
+            label,
+            body,
+            term,
+            params,
+            exc_edge,
+            extra,
         }
     }
 }
@@ -810,7 +832,7 @@ impl<I: Instr> Block<I> {
     }
 }
 
-impl<I: Instr> Block<I> {
+impl<I: Instr, E> Block<I, E> {
     pub fn ensure_param(&mut self, name: impl Into<String>, role: BlockParamRole) {
         let name = name.into();
         if self.params.iter().any(|param| param.name == name) {
@@ -1092,7 +1114,7 @@ pub struct BlockPyFunction<P: ModuleShape> {
     pub kind: FunctionKind,
     pub execution_mode: FunctionExecutionMode,
     pub params: ParamSpec,
-    pub blocks: Vec<Block<P::Instr>>,
+    pub blocks: Vec<Block<P::Instr, P::BlockExtra>>,
     pub doc: Option<String>,
     pub storage_layout: Option<StorageLayout>,
     pub scope: CallableScopeInfo,
@@ -1130,7 +1152,7 @@ impl<P: ModuleShape> BlockPyFunction<P> {
         &self.storage_layout
     }
 
-    pub fn entry_block(&self) -> &Block<P::Instr> {
+    pub fn entry_block(&self) -> &Block<P::Instr, P::BlockExtra> {
         self.blocks
             .first()
             .expect("BlockPyFunction should have at least one block")
@@ -1140,6 +1162,7 @@ impl<P: ModuleShape> BlockPyFunction<P> {
 pub trait ModuleShape: Clone + fmt::Debug {
     type Instr: Instr;
     type ModuleConstant: Clone + fmt::Debug;
+    type BlockExtra: Clone + Default + fmt::Debug;
 }
 
 #[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]

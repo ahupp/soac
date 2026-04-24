@@ -3486,6 +3486,7 @@ def build(values):
             term,
             params: vec![],
             exc_edge: None,
+            extra: Default::default(),
         }
     }
 
@@ -3697,6 +3698,7 @@ def build(values):
             }),
             params: vec![],
             exc_edge: None,
+            extra: Default::default(),
         };
         let then_block = CodegenBlock {
             label: then_label,
@@ -3704,6 +3706,7 @@ def build(values):
             term: ret_term(constants.int_expr(1)),
             params: vec![],
             exc_edge: None,
+            extra: Default::default(),
         };
         let else_block = CodegenBlock {
             label: else_label,
@@ -3711,6 +3714,7 @@ def build(values):
             term: ret_term(constants.int_expr(0)),
             params: vec![],
             exc_edge: None,
+            extra: Default::default(),
         };
         let function = with_test_blocks(function, vec![entry, then_block, else_block]);
         let module = BlockPyModule {
@@ -3769,6 +3773,7 @@ def build(values):
             }),
             params: vec![],
             exc_edge: None,
+            extra: Default::default(),
         };
         let case_block = CodegenBlock {
             label: case_label,
@@ -3776,6 +3781,7 @@ def build(values):
             term: ret_term(constants.int_expr(1)),
             params: vec![],
             exc_edge: None,
+            extra: Default::default(),
         };
         let default_block = CodegenBlock {
             label: default_label,
@@ -3783,6 +3789,7 @@ def build(values):
             term: ret_term(constants.int_expr(2)),
             params: vec![],
             exc_edge: None,
+            extra: Default::default(),
         };
         let function = with_test_blocks(function, vec![entry, case_block, default_block]);
         let module = BlockPyModule {
@@ -4472,6 +4479,7 @@ def build(values):
                 term: ret_term(op_expr(chr_call)),
                 params: vec![],
                 exc_edge: None,
+                extra: Default::default(),
             };
             function.blocks = vec![block];
             let mut module = test_module(ModuleNameGen::new(0), vec![function.clone()]);
@@ -4618,6 +4626,7 @@ def build(values):
             }),
             params: vec![],
             exc_edge: None,
+            extra: Default::default(),
         };
         let then_block = CodegenBlock {
             label: then_label,
@@ -4625,6 +4634,7 @@ def build(values):
             term: ret_term(constants.int_expr(1)),
             params: vec![],
             exc_edge: None,
+            extra: Default::default(),
         };
         let else_block = CodegenBlock {
             label: else_label,
@@ -4632,6 +4642,7 @@ def build(values):
             term: ret_term(constants.int_expr(2)),
             params: vec![],
             exc_edge: None,
+            extra: Default::default(),
         };
         let function = with_test_blocks(function, vec![entry, then_block, else_block]);
         let typed_function =
@@ -4662,6 +4673,7 @@ def build(values):
             }),
             params: vec![],
             exc_edge: None,
+            extra: Default::default(),
         };
         let case_block = CodegenBlock {
             label: case_label,
@@ -4669,6 +4681,7 @@ def build(values):
             term: ret_term(constants.int_expr(1)),
             params: vec![],
             exc_edge: None,
+            extra: Default::default(),
         };
         let default_block = CodegenBlock {
             label: default_label,
@@ -4676,6 +4689,7 @@ def build(values):
             term: ret_term(constants.int_expr(2)),
             params: vec![],
             exc_edge: None,
+            extra: Default::default(),
         };
         let function = with_test_blocks(function, vec![entry, case_block, default_block]);
         let typed_function = lower_codegen_function_to_typed(function);
@@ -15008,6 +15022,7 @@ def f(x):
             }),
             params: vec![],
             exc_edge: None,
+            extra: Default::default(),
         };
         let then_block = CodegenBlock {
             label: then_label,
@@ -15015,6 +15030,7 @@ def f(x):
             term: ret_term(constants.int_expr(1)),
             params: vec![],
             exc_edge: None,
+            extra: Default::default(),
         };
         let else_block = CodegenBlock {
             label: else_label,
@@ -15022,6 +15038,7 @@ def f(x):
             term: ret_term(constants.int_expr(0)),
             params: vec![],
             exc_edge: None,
+            extra: Default::default(),
         };
         function.blocks = vec![entry, then_block, else_block];
         set_stack_slots(&mut function, &["a", "b"]);
@@ -15071,7 +15088,6 @@ def f(x):
                         exact_int_branch_artifacts: Some(std::sync::Arc::new(artifacts)),
                         ..LegacyFunctionSpecializationOverlays::default()
                     }),
-                    cold_block_labels: HashSet::new(),
                 }),
                 ..BuildSpecializedFunctionOptions::default()
             },
@@ -15155,6 +15171,7 @@ def f(x):
             term: BlockTerm::Jump(BlockEdge::new(test_label)),
             params: vec![],
             exc_edge: None,
+            extra: Default::default(),
         };
         let test_block = CodegenBlock {
             label: test_label,
@@ -15173,6 +15190,7 @@ def f(x):
             }),
             params: vec![],
             exc_edge: None,
+            extra: Default::default(),
         };
         let then_block = CodegenBlock {
             label: then_label,
@@ -15180,6 +15198,7 @@ def f(x):
             term: ret_term(name_expr(test_runtime_name("TRUE"))),
             params: vec![],
             exc_edge: None,
+            extra: Default::default(),
         };
         let else_block = CodegenBlock {
             label: else_label,
@@ -15187,6 +15206,7 @@ def f(x):
             term: ret_term(none_expr()),
             params: vec![],
             exc_edge: None,
+            extra: Default::default(),
         };
         function.blocks = vec![entry, test_block, then_block, else_block];
         set_stack_slots(&mut function, &["a", "b", "c"]);
@@ -15244,7 +15264,6 @@ def f(x):
                         exact_int_branch_artifacts: Some(std::sync::Arc::new(artifacts)),
                         ..LegacyFunctionSpecializationOverlays::default()
                     }),
-                    cold_block_labels: HashSet::new(),
                 }),
                 ..BuildSpecializedFunctionOptions::default()
             },
@@ -15327,6 +15346,7 @@ def f(x):
                 )),
                 params: vec![],
                 exc_edge: None,
+                extra: Default::default(),
             }];
             set_stack_slots(&mut function, &["a", "b"]);
 
@@ -15374,7 +15394,6 @@ def f(x):
                             exact_int_branch_artifacts: Some(std::sync::Arc::new(artifacts)),
                             ..LegacyFunctionSpecializationOverlays::default()
                         }),
-                        cold_block_labels: HashSet::new(),
                     }),
                     ..BuildSpecializedFunctionOptions::default()
                 },
@@ -15442,6 +15461,7 @@ def f(x):
                 )),
                 params: vec![],
                 exc_edge: None,
+                extra: Default::default(),
             }];
             set_stack_slots(&mut function, &["a", "b"]);
 
@@ -15489,7 +15509,6 @@ def f(x):
                             exact_int_branch_artifacts: Some(std::sync::Arc::new(artifacts)),
                             ..LegacyFunctionSpecializationOverlays::default()
                         }),
-                        cold_block_labels: HashSet::new(),
                     }),
                     ..BuildSpecializedFunctionOptions::default()
                 },
@@ -15551,6 +15570,7 @@ def f(x):
             )),
             params: vec![],
             exc_edge: None,
+            extra: Default::default(),
         }];
         set_stack_slots(&mut function, &["a", "b"]);
 
@@ -15598,7 +15618,6 @@ def f(x):
                         exact_int_branch_artifacts: Some(std::sync::Arc::new(artifacts)),
                         ..LegacyFunctionSpecializationOverlays::default()
                     }),
-                    cold_block_labels: HashSet::new(),
                 }),
                 ..BuildSpecializedFunctionOptions::default()
             },
@@ -15967,6 +15986,7 @@ def f(x):
             )),
             params: vec![],
             exc_edge: None,
+            extra: Default::default(),
         }];
         set_stack_slots(&mut caller, &["obj", "replacement"]);
         let caller_id = caller.function_id;
@@ -16412,7 +16432,6 @@ def f(x):
                 )]),
                 ..LegacyFunctionSpecializationOverlays::default()
             }),
-            cold_block_labels: HashSet::new(),
         }
     }
 
@@ -16453,7 +16472,6 @@ def f(x):
                         ]),
                         ..LegacyFunctionSpecializationOverlays::default()
                     }),
-                    cold_block_labels: HashSet::new(),
                 }),
                 ..BuildSpecializedFunctionOptions::default()
             },
@@ -16524,7 +16542,6 @@ def f(x):
             BuildSpecializedFunctionOptions {
                 specialization_inputs: Some(FunctionSpecializationInputs {
                     legacy_overlays: Some(LegacyFunctionSpecializationOverlays::default()),
-                    cold_block_labels: HashSet::new(),
                 }),
                 ..BuildSpecializedFunctionOptions::default()
             },
@@ -16732,6 +16749,7 @@ def read_point(point):
                 )),
                 params: vec![],
                 exc_edge: None,
+                extra: Default::default(),
             }];
             set_stack_slots(&mut function, &["obj"]);
 
@@ -17074,6 +17092,7 @@ def write_point(point, value):
             term: ret_term(none_expr()),
             params: vec![],
             exc_edge: None,
+            extra: Default::default(),
         }];
         set_stack_slots(&mut function, &["obj", "value"]);
 
@@ -17143,6 +17162,7 @@ def write_point(point, value):
             )),
             params: vec![],
             exc_edge: None,
+            extra: Default::default(),
         }];
         set_stack_slots(&mut function, &["obj"]);
 
@@ -17916,6 +17936,7 @@ def f(x, y):
                     term: ret_term(name_expr(test_local_name("y", 2))),
                     params: vec![],
                     exc_edge: None,
+                    extra: Default::default(),
                 }],
             );
             set_stack_slots(&mut caller_function, &["fn", "x", "y"]);
@@ -18102,6 +18123,7 @@ def f(x, y):
                 term: ret_term(name_expr(test_local_name("y", 2))),
                 params: vec![],
                 exc_edge: None,
+                extra: Default::default(),
             }],
         );
         set_stack_slots(&mut caller_function, &["fn", "x", "y"]);
@@ -18214,6 +18236,7 @@ def f(x, y):
                     )),
                     params: Vec::new(),
                     exc_edge: None,
+                    extra: Default::default(),
                 }],
             );
             let function_id = function.function_id;
@@ -18344,6 +18367,7 @@ class Point:
                 )),
                 params: Vec::new(),
                 exc_edge: None,
+                extra: Default::default(),
             }];
             set_stack_slots(&mut function, &["point"]);
             let function_id = function.function_id;
@@ -18458,6 +18482,7 @@ class Point:
             )),
             params: Vec::new(),
             exc_edge: None,
+            extra: Default::default(),
         }];
         let function_id = function.function_id;
         let mut module = test_module(module_name_gen, vec![function]);
@@ -18550,7 +18575,6 @@ class Point:
             BuildSpecializedFunctionOptions {
                 specialization_inputs: Some(FunctionSpecializationInputs {
                     legacy_overlays: None,
-                    cold_block_labels: HashSet::new(),
                 }),
                 legacy_call_emission_typed_function: Some(planned_function.clone()),
                 ..BuildSpecializedFunctionOptions::default()
@@ -18600,6 +18624,7 @@ class Point:
             )),
             params: Vec::new(),
             exc_edge: None,
+            extra: Default::default(),
         }];
         set_stack_slots(&mut function, &["items", "index"]);
         let function_id = function.function_id;
@@ -18729,6 +18754,7 @@ class Point:
                 }),
                 params: Vec::new(),
                 exc_edge: None,
+                extra: Default::default(),
             },
             CodegenBlock {
                 label: then_label,
@@ -18746,6 +18772,7 @@ class Point:
                 )),
                 params: Vec::new(),
                 exc_edge: None,
+                extra: Default::default(),
             },
             CodegenBlock {
                 label: else_label,
@@ -18753,6 +18780,7 @@ class Point:
                 term: ret_term(constants.int_expr(0)),
                 params: Vec::new(),
                 exc_edge: None,
+                extra: Default::default(),
             },
         ];
         set_stack_slots(&mut function, &["a", "b"]);
@@ -18903,6 +18931,7 @@ class Point:
                 term: BlockTerm::Jump(BlockEdge::new(test_label)),
                 params: Vec::new(),
                 exc_edge: None,
+                extra: Default::default(),
             },
             CodegenBlock {
                 label: test_label,
@@ -18921,6 +18950,7 @@ class Point:
                 }),
                 params: Vec::new(),
                 exc_edge: None,
+                extra: Default::default(),
             },
             CodegenBlock {
                 label: then_label,
@@ -18928,6 +18958,7 @@ class Point:
                 term: ret_term(name_expr(test_runtime_name("TRUE"))),
                 params: Vec::new(),
                 exc_edge: None,
+                extra: Default::default(),
             },
             CodegenBlock {
                 label: else_label,
@@ -18935,6 +18966,7 @@ class Point:
                 term: ret_term(none_expr()),
                 params: Vec::new(),
                 exc_edge: None,
+                extra: Default::default(),
             },
         ];
         set_stack_slots(&mut function, &["a", "b", "c"]);
@@ -19496,6 +19528,7 @@ class Point:
                 )),
                 params: vec![],
                 exc_edge: None,
+                extra: Default::default(),
             }],
             doc: None,
             storage_layout: None,
@@ -19718,6 +19751,7 @@ class Point:
                     )),
                     params: vec![],
                     exc_edge: None,
+                    extra: Default::default(),
                 }],
                 doc: None,
                 storage_layout: None,
@@ -19976,6 +20010,7 @@ class Point:
                 term: ret_term(name_expr(test_local_name("y", 2))),
                 params: vec![],
                 exc_edge: None,
+                extra: Default::default(),
             }],
         );
         set_stack_slots(&mut caller_function, &["fn", "x", "y"]);
@@ -21159,6 +21194,7 @@ class Point:
                 }),
                 params: vec![],
                 exc_edge: None,
+                extra: Default::default(),
             },
             CodegenBlock {
                 label: hot_label,
@@ -21166,6 +21202,7 @@ class Point:
                 term: ret_term(none_expr()),
                 params: vec![],
                 exc_edge: None,
+                extra: Default::default(),
             },
             CodegenBlock {
                 label: cold_label,
@@ -21173,6 +21210,7 @@ class Point:
                 term: ret_term(none_expr()),
                 params: vec![],
                 exc_edge: None,
+                extra: Default::default(),
             },
         ];
         assign_missing_test_instr_ids(&mut function);
@@ -21213,6 +21251,7 @@ class Point:
                 }),
                 params: vec![],
                 exc_edge: None,
+                extra: Default::default(),
             },
             CodegenBlock {
                 label: hot_label,
@@ -21220,6 +21259,7 @@ class Point:
                 term: ret_term(none_expr()),
                 params: vec![],
                 exc_edge: None,
+                extra: Default::default(),
             },
             CodegenBlock {
                 label: cold_label,
@@ -21227,6 +21267,7 @@ class Point:
                 term: ret_term(none_expr()),
                 params: vec![],
                 exc_edge: None,
+                extra: Default::default(),
             },
         ];
         assign_missing_test_instr_ids(&mut function);
@@ -21246,6 +21287,117 @@ class Point:
         assert!(
             !rendered.contains(&format!(" cold: ; block {hot_label}(")),
             "frequently visited block should stay hot in rendered CLIF:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn profiled_cold_blocks_are_attached_to_typed_block_extra() {
+        let mut function = test_function();
+        let entry_label = function.name_gen.next_block_name();
+        let hot_label = function.name_gen.next_block_name();
+        let cold_label = function.name_gen.next_block_name();
+        function.blocks = vec![
+            CodegenBlock {
+                label: entry_label,
+                body: vec![],
+                term: BlockTerm::IfTerm(soac_core::block_py::TermIf {
+                    test: none_expr(),
+                    then_label: hot_label,
+                    else_label: cold_label,
+                }),
+                params: vec![],
+                exc_edge: None,
+                extra: Default::default(),
+            },
+            CodegenBlock {
+                label: hot_label,
+                body: vec![],
+                term: ret_term(none_expr()),
+                params: vec![],
+                exc_edge: None,
+                extra: Default::default(),
+            },
+            CodegenBlock {
+                label: cold_label,
+                body: vec![],
+                term: ret_term(none_expr()),
+                params: vec![],
+                exc_edge: None,
+                extra: Default::default(),
+            },
+        ];
+        assign_missing_test_instr_ids(&mut function);
+        let module_name = "typed_cold_block_extra_test";
+        let soac_work_dir = fresh_test_work_dir("typed-cold-block-extra");
+        let profile_path = soac_work_dir.join("profile.bin");
+        write_test_counter_dump(
+            profile_path.as_path(),
+            &CounterDumpRecord {
+                source_hash: 0,
+                module_name: module_name.to_string(),
+                package_name: None,
+                rows: [(entry_label, 10_000), (hot_label, 9_500), (cold_label, 75)]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, (block_label, count))| CounterDumpRow {
+                        counter_id: u32::try_from(index)
+                            .expect("test block-entry counter count should fit in u32"),
+                        scope: "this".to_string(),
+                        kind: "block_entry".to_string(),
+                        site_kind: "block_entry".to_string(),
+                        function_id: Some(function.function_id),
+                        current_function_id: Some(function.function_id),
+                        instr_id: None,
+                        function_qualname: Some(function.names.qualname.clone()),
+                        block_label: Some(block_label.to_string()),
+                        value: count,
+                        branch_values: Vec::new(),
+                        observed_value: None,
+                        max_overcount: None,
+                    })
+                    .collect(),
+                module_keys: Vec::new(),
+                type_keys: Vec::new(),
+                type_table: Vec::new(),
+            },
+        );
+        let module = test_module(ModuleNameGen::new(0), vec![function.clone()]);
+        let facts = infer_jit_value_facts(&module);
+        let typed_function = lower_codegen_function_to_typed(function);
+        let profile = SpecializationProfile {
+            module_name: Some(module_name),
+            counter_dump_path: Some(std::borrow::Cow::Owned(profile_path)),
+            optimized_module: None,
+            direct_call_emission_scope: DirectCallEmissionScope::DirectCallBodiesOnly,
+            opt_v3_emitted_direct_calls: HashMap::new(),
+            opt_v3_emitted_exact_list_items: HashMap::new(),
+            opt_v3_emitted_indexed_fields: HashMap::new(),
+            opt_v3_emitted_indexed_globals: HashMap::new(),
+            opt_v3_exact_int_branch_artifacts: HashMap::new(),
+            behavior_change_indexed_stores: false,
+            profiled_cold_blocks: true,
+            guard_miss_deopt: false,
+        };
+
+        let prepared =
+            prepare_specialized_typed_function(&typed_function, None, Some(&profile), &facts, None)
+                .expect("typed function should prepare with profiled cold blocks")
+                .typed_function;
+        let block_layout = prepared
+            .blocks
+            .iter()
+            .map(|block| (block.label, block.extra.layout))
+            .collect::<HashMap<_, _>>();
+
+        assert_eq!(
+            block_layout.get(&cold_label).copied(),
+            Some(TypedBlockLayoutHint::Cold),
+            "rarely visited block should carry cold layout in typed block extra"
+        );
+        assert_eq!(
+            block_layout.get(&hot_label).copied(),
+            Some(TypedBlockLayoutHint::Normal),
+            "frequently visited block should stay normal in typed block extra"
         );
     }
 

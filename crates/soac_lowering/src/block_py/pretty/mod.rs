@@ -19,7 +19,7 @@ impl_default_blockpy_format!(
 );
 
 impl BlockPyFormat for ResolvedStorageModuleShape {
-    fn block_metadata_lines(block: &Block<Self::Instr>) -> Vec<String> {
+    fn block_metadata_lines(block: &Block<Self::Instr, Self::BlockExtra>) -> Vec<String> {
         let mut lines = Vec::new();
         if let Some(exc_edge) = &block.exc_edge {
             lines.push(format!("exc_target: {}", exc_edge.target));
@@ -32,12 +32,12 @@ impl BlockPyFormat for ResolvedStorageModuleShape {
 }
 
 impl BlockPyFormat for CodegenModuleShape {
-    fn block_metadata_lines(block: &Block<Self::Instr>) -> Vec<String> {
+    fn block_metadata_lines(block: &Block<Self::Instr, Self::BlockExtra>) -> Vec<String> {
         render_resolved_storage_block_metadata::<Self>(block)
     }
 }
 
-fn render_resolved_storage_block_metadata<P>(block: &Block<P::Instr>) -> Vec<String>
+fn render_resolved_storage_block_metadata<P>(block: &Block<P::Instr, P::BlockExtra>) -> Vec<String>
 where
     P: ModuleShape,
     P::Instr: Instr<Name = ResolvedName>,

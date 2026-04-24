@@ -2637,6 +2637,7 @@ fn refresh_bb_callable_block_params(
                 term: block.term,
                 params,
                 exc_edge: block.exc_edge,
+                extra: Default::default(),
             }
         })
         .collect::<Vec<_>>();

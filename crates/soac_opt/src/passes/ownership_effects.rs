@@ -7,8 +7,8 @@
 //! mirrors, borrowed helper results, and immortal constants are known.
 
 use crate::passes::{
-    CodegenModuleShape, FactStore, InstrCodegen, InstrTyped, PyObjFacts, TypedCodegenModuleShape,
-    ValueFacts,
+    CodegenModuleShape, FactStore, InstrCodegen, InstrTyped, PyObjFacts, TypedBlock,
+    TypedCodegenModuleShape, ValueFacts,
 };
 use soac_core::block_py::{
     Block, BlockArg, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, CellLocation,
@@ -863,7 +863,7 @@ fn plan_block_refcounts(
 #[allow(clippy::too_many_arguments)]
 fn plan_typed_block_refcounts(
     function: &BlockPyFunction<TypedCodegenModuleShape>,
-    block: &Block<InstrTyped>,
+    block: &TypedBlock,
     facts: &FactStore,
     locals: &HashMap<LocalLocation, RefcountLocal>,
     location_by_name: &HashMap<String, LocalLocation>,
@@ -1365,7 +1365,7 @@ fn validate_block_refcount_plan(
 #[allow(clippy::too_many_arguments)]
 fn validate_typed_block_refcount_plan(
     function: &BlockPyFunction<TypedCodegenModuleShape>,
-    block: &Block<InstrTyped>,
+    block: &TypedBlock,
     block_plan: &BlockRefcountPlan,
     facts: &FactStore,
     locals: &HashMap<LocalLocation, RefcountLocal>,
@@ -1454,7 +1454,7 @@ fn state_for_expr(
 
 fn initial_typed_block_env(
     function: &BlockPyFunction<TypedCodegenModuleShape>,
-    block: &Block<InstrTyped>,
+    block: &TypedBlock,
     facts: &FactStore,
     locals: &HashMap<LocalLocation, RefcountLocal>,
     location_by_name: &HashMap<String, LocalLocation>,
@@ -2082,7 +2082,7 @@ fn transfer_must_bound_through_block(
 
 fn transfer_typed_must_bound_through_block(
     function: &BlockPyFunction<TypedCodegenModuleShape>,
-    block: &Block<InstrTyped>,
+    block: &TypedBlock,
     must_bound_in: &LocalBitSet,
     owned_cell_locations: &HashMap<u32, LocalLocation>,
 ) -> LocalBitSet {
@@ -2165,7 +2165,7 @@ fn block_local_effects(
 }
 
 fn typed_block_local_effects(
-    block: &Block<InstrTyped>,
+    block: &TypedBlock,
     location_by_name: &HashMap<String, LocalLocation>,
     owned_cell_locations: &HashMap<u32, LocalLocation>,
 ) -> BlockLocalEffects {
@@ -2576,7 +2576,7 @@ fn collect_typed_term_local_reads(
     .visit_term(term);
 }
 
-fn typed_block_successors(block: &Block<InstrTyped>) -> Vec<BlockLabel> {
+fn typed_block_successors(block: &TypedBlock) -> Vec<BlockLabel> {
     let mut successors = Vec::new();
     if let Some(edge) = &block.exc_edge {
         successors.push(edge.target);

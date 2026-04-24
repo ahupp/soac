@@ -112,7 +112,7 @@ where
 
 fn validate_non_exception_edge<P: ModuleShape, S>(
     function: &BlockPyFunction<P>,
-    source_block: &Block<P::Instr>,
+    source_block: &Block<P::Instr, P::BlockExtra>,
     edge: &BlockEdge,
     qualname: &str,
     label_kind: &str,
@@ -138,8 +138,8 @@ where
 }
 
 fn validate_edge_param_forwarding<P: ModuleShape, S>(
-    source_block: &Block<P::Instr>,
-    target_block: &Block<P::Instr>,
+    source_block: &Block<P::Instr, P::BlockExtra>,
+    target_block: &Block<P::Instr, P::BlockExtra>,
     explicit_args: &[BlockArg],
     qualname: &str,
     label_kind: &str,
@@ -206,8 +206,8 @@ where
 }
 
 fn validate_explicit_edge_arg<P: ModuleShape, S>(
-    source_block: &Block<P::Instr>,
-    target_block: &Block<P::Instr>,
+    source_block: &Block<P::Instr, P::BlockExtra>,
+    target_block: &Block<P::Instr, P::BlockExtra>,
     target_param: &BlockParam,
     source_arg: &BlockArg,
     qualname: &str,
@@ -316,7 +316,7 @@ fn lookup_known_block<'a, P: ModuleShape>(
     qualname: &str,
     block_label: BlockLabel,
     label_kind: &str,
-) -> Result<&'a Block<P::Instr>, String> {
+) -> Result<&'a Block<P::Instr, P::BlockExtra>, String> {
     let Some(target_block) = function.blocks.get(label.index()) else {
         return Err(format!(
             "unknown {label_kind} {label} in {}:{}",

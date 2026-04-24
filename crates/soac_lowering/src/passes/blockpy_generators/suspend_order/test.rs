@@ -83,6 +83,7 @@ fn eval_order_hoists_call_arguments_in_return_value_to_temps() {
         ))),
         params: Vec::new(),
         exc_edge: None,
+        extra: Default::default(),
     };
 
     let lowered = lower_yield_block(block);
@@ -111,6 +112,7 @@ fn eval_order_hoists_return_value_to_temp() {
         ))),
         params: Vec::new(),
         exc_edge: None,
+        extra: Default::default(),
     };
 
     let lowered = lower_yield_block(block);
@@ -137,6 +139,7 @@ fn eval_order_hoists_nested_call_in_assignment_rhs() {
         ))),
         params: Vec::new(),
         exc_edge: None,
+        extra: Default::default(),
     };
 
     let lowered = lower_yield_block(block);
@@ -172,6 +175,7 @@ fn eval_order_hoists_lowered_await_in_assignment_call_argument() {
         ))),
         params: Vec::new(),
         exc_edge: None,
+        extra: Default::default(),
     };
 
     let lowered = lower_yield_block(block);
@@ -212,6 +216,7 @@ fn eval_order_hoists_yield_from_in_assignment_call_argument() {
         ))),
         params: Vec::new(),
         exc_edge: None,
+        extra: Default::default(),
     };
 
     let lowered = lower_yield_block(block);
@@ -249,6 +254,7 @@ fn eval_order_leaves_non_yield_binop_stmt_shape_alone() {
         ))),
         params: Vec::new(),
         exc_edge: None,
+        extra: Default::default(),
     };
 
     let lowered = lower_yield_block(block);

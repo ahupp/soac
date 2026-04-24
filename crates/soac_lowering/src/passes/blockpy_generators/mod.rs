@@ -815,6 +815,7 @@ fn push_completion_raise_block(
             term: BlockTerm::Jump(BlockEdge::new(completion_label.clone())),
             params: params.clone(),
             exc_edge: None,
+            extra: Default::default(),
         },
         exc_target,
     );
@@ -825,6 +826,7 @@ fn push_completion_raise_block(
             term: completion_raise(state.kind, value),
             params,
             exc_edge: None,
+            extra: Default::default(),
         },
         None,
     );
@@ -1089,6 +1091,7 @@ fn lower_resume_fragment(
                     term: lowered_term,
                     params,
                     exc_edge: None,
+                    extra: Default::default(),
                 },
                 exc_target,
             );
@@ -1118,6 +1121,7 @@ fn emit_yield_site(
                     term: BlockTerm::Return(yield_value_expr(value)),
                     params: params.clone(),
                     exc_edge: None,
+                    extra: Default::default(),
                 },
                 exc_target.clone(),
             );
@@ -1142,6 +1146,7 @@ fn emit_yield_site(
                     term: BlockTerm::Return(yield_value_expr(value)),
                     params: params.clone(),
                     exc_edge: None,
+                    extra: Default::default(),
                 },
                 exc_target.clone(),
             );
@@ -1166,6 +1171,7 @@ fn emit_yield_site(
                     term: BlockTerm::Return(yield_value_expr(value)),
                     params: params.clone(),
                     exc_edge: None,
+                    extra: Default::default(),
                 },
                 exc_target.clone(),
             );
@@ -1231,6 +1237,7 @@ fn emit_resume_after_yield(
             }),
             params: params.clone(),
             exc_edge: None,
+            extra: Default::default(),
         },
         exc_target.clone(),
     );
@@ -1241,6 +1248,7 @@ fn emit_resume_after_yield(
             term: resume_exc_raise_term(),
             params: params.clone(),
             exc_edge: None,
+            extra: Default::default(),
         },
         exc_target.clone(),
     );
@@ -1307,6 +1315,7 @@ fn emit_yield_from_site(
             term: BlockTerm::Jump(BlockEdge::new(delegate_label.clone())),
             params: params.clone(),
             exc_edge: None,
+            extra: Default::default(),
         },
         exc_target.clone(),
     );
@@ -1324,6 +1333,7 @@ fn emit_yield_from_site(
             }),
             params: params.clone(),
             exc_edge: None,
+            extra: Default::default(),
         },
         exc_target.clone(),
     );
@@ -1338,6 +1348,7 @@ fn emit_yield_from_site(
             }),
             params: params.clone(),
             exc_edge: None,
+            extra: Default::default(),
         },
         exc_target.clone(),
     );
@@ -1351,6 +1362,7 @@ fn emit_yield_from_site(
             term: BlockTerm::Jump(BlockEdge::new(yielded_label.clone())),
             params: params.clone(),
             exc_edge: None,
+            extra: Default::default(),
         },
         Some(call_except_label.clone()),
     );
@@ -1364,6 +1376,7 @@ fn emit_yield_from_site(
             term: BlockTerm::Jump(BlockEdge::new(yielded_label.clone())),
             params: params.clone(),
             exc_edge: None,
+            extra: Default::default(),
         },
         Some(call_except_label.clone()),
     );
@@ -1378,6 +1391,7 @@ fn emit_yield_from_site(
             }),
             params: params.clone(),
             exc_edge: None,
+            extra: Default::default(),
         },
         exc_target.clone(),
     );
@@ -1395,6 +1409,7 @@ fn emit_yield_from_site(
             }),
             params: params.clone(),
             exc_edge: None,
+            extra: Default::default(),
         },
         exc_target.clone(),
     );
@@ -1405,6 +1420,7 @@ fn emit_yield_from_site(
             term: BlockTerm::Jump(BlockEdge::new(raise_resume_exc_label.clone())),
             params: params.clone(),
             exc_edge: None,
+            extra: Default::default(),
         },
         exc_target.clone(),
     );
@@ -1422,6 +1438,7 @@ fn emit_yield_from_site(
             }),
             params: params.clone(),
             exc_edge: None,
+            extra: Default::default(),
         },
         exc_target.clone(),
     );
@@ -1435,6 +1452,7 @@ fn emit_yield_from_site(
             term: BlockTerm::Jump(BlockEdge::new(yielded_label.clone())),
             params: params.clone(),
             exc_edge: None,
+            extra: Default::default(),
         },
         Some(call_except_label.clone()),
     );
@@ -1463,6 +1481,7 @@ fn emit_yield_from_site(
             }),
             params: except_params.clone(),
             exc_edge: None,
+            extra: Default::default(),
         },
         exc_target.clone(),
     );
@@ -1479,6 +1498,7 @@ fn emit_yield_from_site(
             )),
             params: except_params.clone(),
             exc_edge: None,
+            extra: Default::default(),
         },
         exc_target.clone(),
     );
@@ -1494,6 +1514,7 @@ fn emit_yield_from_site(
             }),
             params: except_params,
             exc_edge: None,
+            extra: Default::default(),
         },
         exc_target.clone(),
     );
@@ -1504,6 +1525,7 @@ fn emit_yield_from_site(
             term: BlockTerm::Return(core_name(yielded_value_name.as_str())),
             params: params.clone(),
             exc_edge: None,
+            extra: Default::default(),
         },
         exc_target.clone(),
     );
@@ -1514,6 +1536,7 @@ fn emit_yield_from_site(
             term: resume_exc_raise_term(),
             params: params.clone(),
             exc_edge: None,
+            extra: Default::default(),
         },
         exc_target.clone(),
     );
@@ -1620,6 +1643,7 @@ fn lower_resume_blocks(
                 term,
                 params: block.params,
                 exc_edge: None,
+                extra: Default::default(),
             }
         })
         .collect::<Vec<_>>();
@@ -1694,6 +1718,7 @@ fn lower_resume_blocks(
         }),
         params: Vec::new(),
         exc_edge: None,
+        extra: Default::default(),
     }];
     blocks.append(&mut state.blocks);
     blocks.push(LinearCoreBlock {
@@ -1702,6 +1727,7 @@ fn lower_resume_blocks(
         term: completion_raise(state.kind, None),
         params: Vec::new(),
         exc_edge: None,
+        extra: Default::default(),
     });
     state.exception_edges.insert(dispatch_label.clone(), None);
     state

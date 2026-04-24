@@ -457,6 +457,7 @@ pub(crate) fn attach_exception_edges_to_blocks<E: Instr>(
                 .cloned()
                 .flatten()
                 .map(BlockEdge::new),
+            extra: block.extra,
         })
         .collect()
 }
@@ -503,6 +504,7 @@ pub(crate) fn build_core_blockpy_callable_def_from_runtime_input(
             term: BlockTerm::implicit_function_return(),
             params: Vec::new(),
             exc_edge: None,
+            extra: Default::default(),
         });
     }
     fold_jumps_to_trivial_return_blockpy(&mut blocks);

@@ -87,17 +87,17 @@ use soac_opt::passes::{
     InstrResolved, InstrTyped, LocalEnvResumeBinding, LocalEnvResumeBindingState,
     LocalEnvResumePoint, LocalEnvResumeStatePrecision, LocalEnvResumeValueSource, LocalRefState,
     PyExactType, PyObjFacts, RefcountActionKind, RefcountReleaseReason, RefcountSite,
-    RuntimeHelperId, TypedAttrAccessPlan, TypedAttrOwnerRef, TypedCall, TypedCallAccessPlan,
-    TypedCallEmissionPlans, TypedCodegenModuleShape, TypedDirectCallArgPlan,
-    TypedDirectCallArgSource, TypedDirectCallGuardTest, TypedDirectCallGuardTestKind,
-    TypedDirectCallableCall, TypedDirectCallableCallGuard, TypedDirectConstructorCallGuard,
-    TypedDirectFunctionCallGuard, TypedDirectMethodCall, TypedDirectMethodCallGuard,
-    TypedExactIntBranchPlan, TypedExactIntPlanSource, TypedExactIntReturnPlan,
-    TypedExactIntScalarThreadPlan, TypedExactListItemAccessPlan, TypedExactListItemPlanSource,
-    TypedGetAttr, TypedGuardedCallableCall, TypedGuardedMethodCall, TypedIndexedFieldGuard,
-    TypedIndexedFieldPlanSource, TypedIndexedGlobalAccessPlan, TypedIndexedGlobalPlanSource,
-    TypedPlannedResult, TypedPyObjectOwnershipPlan, TypedSetAttr, ValueFacts,
-    annotate_typed_function_planned_results, annotate_typed_function_result_demands,
+    RuntimeHelperId, TypedAttrAccessPlan, TypedAttrOwnerRef, TypedBlock, TypedBlockLayoutHint,
+    TypedCall, TypedCallAccessPlan, TypedCallEmissionPlans, TypedCodegenModuleShape,
+    TypedDirectCallArgPlan, TypedDirectCallArgSource, TypedDirectCallGuardTest,
+    TypedDirectCallGuardTestKind, TypedDirectCallableCall, TypedDirectCallableCallGuard,
+    TypedDirectConstructorCallGuard, TypedDirectFunctionCallGuard, TypedDirectMethodCall,
+    TypedDirectMethodCallGuard, TypedExactIntBranchPlan, TypedExactIntPlanSource,
+    TypedExactIntReturnPlan, TypedExactIntScalarThreadPlan, TypedExactListItemAccessPlan,
+    TypedExactListItemPlanSource, TypedGetAttr, TypedGuardedCallableCall, TypedGuardedMethodCall,
+    TypedIndexedFieldGuard, TypedIndexedFieldPlanSource, TypedIndexedGlobalAccessPlan,
+    TypedIndexedGlobalPlanSource, TypedPlannedResult, TypedPyObjectOwnershipPlan, TypedSetAttr,
+    ValueFacts, annotate_typed_function_planned_results, annotate_typed_function_result_demands,
     annotate_typed_function_value_facts, annotate_typed_module_value_facts,
     assign_missing_typed_function_instr_ids, infer_module_value_facts,
     inline_typed_function_direct_call_stores, lower_codegen_function_to_typed,
@@ -12007,7 +12007,6 @@ struct LegacyFunctionSpecializationOverlays {
 #[derive(Clone, Debug)]
 struct FunctionSpecializationInputs {
     legacy_overlays: Option<LegacyFunctionSpecializationOverlays>,
-    cold_block_labels: HashSet<BlockLabel>,
 }
 
 fn load_planned_optimization_inputs_for_runtime_state(
@@ -12449,10 +12448,7 @@ impl FunctionSpecializationInputs {
                     .cloned(),
             })
         };
-        Ok(Self {
-            legacy_overlays,
-            cold_block_labels: profile.cold_block_labels(function)?,
-        })
+        Ok(Self { legacy_overlays })
     }
 }
 
@@ -21432,7 +21428,7 @@ fn typed_exact_int_scalar_thread_selection(
 fn emit_opt_v3_scalar_threaded_store_branch(
     fb: &mut FunctionBuilder<'_>,
     source_label: BlockLabel,
-    typed_block: &Block<InstrTyped>,
+    typed_block: &TypedBlock,
     typed_function: &BlockPyFunction<TypedCodegenModuleShape>,
     function: &BlockPyFunction<CodegenModuleShape>,
     jit_local_plan: &PlannedJitFunctionLocals,
@@ -26305,6 +26301,23 @@ fn validate_typed_function_preserves_codegen_cfg(
     Ok(())
 }
 
+fn annotate_typed_profiled_cold_blocks(
+    typed_function: &mut BlockPyFunction<TypedCodegenModuleShape>,
+    profile: &SpecializationProfile<'_>,
+    source_function: &BlockPyFunction<TypedCodegenModuleShape>,
+) -> Result<(), String> {
+    let cold_block_labels = profile.cold_block_labels(source_function)?;
+    if cold_block_labels.is_empty() {
+        return Ok(());
+    }
+    for block in &mut typed_function.blocks {
+        if cold_block_labels.contains(&block.label) {
+            block.extra.layout = TypedBlockLayoutHint::Cold;
+        }
+    }
+    Ok(())
+}
+
 fn prepare_specialized_typed_function(
     function: &BlockPyFunction<TypedCodegenModuleShape>,
     legacy_call_emission_typed_function: Option<&BlockPyFunction<TypedCodegenModuleShape>>,
@@ -26351,6 +26364,9 @@ fn prepare_specialized_typed_function(
     refresh_typed_function_value_facts(&mut typed_function);
     annotate_typed_function_result_demands(&mut typed_function);
     annotate_typed_function_planned_results(&mut typed_function);
+    if let Some(profile) = specialization_profile {
+        annotate_typed_profiled_cold_blocks(&mut typed_function, profile, function)?;
+    }
     validate_typed_function_call_access_plans(&typed_function)?;
     validate_typed_function_value_facts(&typed_function)?;
     validate_typed_function_preserves_codegen_cfg(function, &typed_function)?;
@@ -26650,7 +26666,6 @@ fn build_cranelift_run_bb_specialized_function(
         }
     };
     let legacy_overlays = specialization_inputs.legacy_overlays;
-    let cold_block_labels = specialization_inputs.cold_block_labels;
     let guard_miss_deopt_stub = options.guard_miss_deopt_stub
         || specialization_profile.is_some_and(|profile| {
             profile.guard_miss_deopt && function.scope.scope_kind != CallableScopeKind::Module
@@ -26785,7 +26800,7 @@ fn build_cranelift_run_bb_specialized_function(
             }
         }
         for (index, block) in exec_blocks.iter().enumerate() {
-            if cold_block_labels.contains(&function.blocks[index].label) {
+            if typed_function.blocks[index].extra.layout == TypedBlockLayoutHint::Cold {
                 fb.set_cold_block(*block);
             }
         }

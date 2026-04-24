@@ -202,6 +202,7 @@ fn storage_layout_semantics_collects_structured_cell_ref_logical_names() {
             term: BlockTerm::Return(InstrUnresolved::constant_none()),
             params: Vec::new(),
             exc_edge: None,
+            extra: (),
         }],
         doc: None,
         storage_layout: None,

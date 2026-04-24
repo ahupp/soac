@@ -20,6 +20,7 @@ fn lowers_await_to_yield_from_await_iter() {
         ))),
         params: Vec::new(),
         exc_edge: None,
+        extra: (),
     };
     let module = BlockPyModule {
         module_name_gen: crate::block_py::ModuleNameGen::new(0),
@@ -37,6 +38,7 @@ fn lowers_await_to_yield_from_await_iter() {
                 term: structured_block.term,
                 params: structured_block.params,
                 exc_edge: structured_block.exc_edge,
+                extra: Default::default(),
             }],
             doc: None,
             storage_layout: None,

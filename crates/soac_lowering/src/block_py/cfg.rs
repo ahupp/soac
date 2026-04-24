@@ -277,6 +277,7 @@ where
             term: input_term,
             params,
             exc_edge,
+            extra,
         } = block;
         let mut body = Vec::new();
         for expr in input_body {
@@ -298,11 +299,12 @@ where
             term,
             params,
             exc_edge,
+            extra,
         }
     })
 }
 
-pub(crate) fn relabel_blockpy_blocks_dense<I: Instr>(blocks: &mut [Block<I>]) {
+pub(crate) fn relabel_blockpy_blocks_dense<I: Instr, E>(blocks: &mut [Block<I, E>]) {
     let relabel = blocks
         .iter()
         .enumerate()

@@ -76,6 +76,7 @@ fn split_exception_blocks_for_expr_checks(
                     term: BlockTerm::Jump(BlockEdge::new(next_label)),
                     params: segment_params.clone(),
                     exc_edge: exc_edge.clone(),
+                    extra: Default::default(),
                 });
                 current_label = next_label;
             }
@@ -87,6 +88,7 @@ fn split_exception_blocks_for_expr_checks(
                     term: block.term.clone(),
                     params: segment_params.clone(),
                     exc_edge: exc_edge.clone(),
+                    extra: Default::default(),
                 });
             }
         }

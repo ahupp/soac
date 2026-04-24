@@ -152,6 +152,7 @@ fn lower_structured_core_blocks_to_bb_blocks_handles_unlocated_names() {
                 role: BlockParamRole::Exception,
             }],
             exc_edge: None,
+            extra: Default::default(),
         },
         Block {
             label: BlockLabel::from_index(1),
@@ -163,6 +164,7 @@ fn lower_structured_core_blocks_to_bb_blocks_handles_unlocated_names() {
             term: BlockTerm::Return(core_name_expr("__dp_NONE")),
             params: Vec::new(),
             exc_edge: None,
+            extra: Default::default(),
         },
         Block {
             label: BlockLabel::from_index(2),
@@ -174,6 +176,7 @@ fn lower_structured_core_blocks_to_bb_blocks_handles_unlocated_names() {
             term: BlockTerm::Return(core_name_expr("__dp_NONE")),
             params: Vec::new(),
             exc_edge: None,
+            extra: Default::default(),
         },
     ];
 

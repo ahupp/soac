@@ -75,6 +75,7 @@ def f(x):
                 role: crate::block_py::BlockParamRole::Exception,
             }],
             exc_edge: Some(BlockEdge::new(except_label.clone())),
+            extra: Default::default(),
         });
         function.blocks.push(ResolvedStorageBlock {
             label: except_label.clone(),
@@ -82,6 +83,7 @@ def f(x):
             term: BlockTerm::<InstrResolved>::Return(InstrResolved::constant_none()),
             params: Vec::new(),
             exc_edge: None,
+            extra: Default::default(),
         });
         (body_label, except_label)
     };
@@ -224,6 +226,7 @@ def f():
             role: BlockParamRole::Exception,
         }],
         exc_edge: None,
+        extra: Default::default(),
     });
     function.blocks[0].term = BlockTerm::Jump(BlockEdge::new(target));
 
@@ -302,6 +305,7 @@ def f():
         term: BlockTerm::<InstrResolved>::Return(InstrResolved::constant_none()),
         params: Vec::new(),
         exc_edge: None,
+        extra: Default::default(),
     });
     function.blocks[block_index].exc_edge = Some(BlockEdge::new(except_label.clone()));
     function.blocks[block_index].set_exception_param("_dp_try_exc_split");
@@ -368,6 +372,7 @@ def f():
         term: BlockTerm::<InstrResolved>::Return(InstrResolved::constant_none()),
         params: Vec::new(),
         exc_edge: None,
+        extra: Default::default(),
     });
     function.blocks[block_index].exc_edge = Some(BlockEdge::new(except_label.clone()));
     function.blocks[block_index].set_exception_param("_dp_try_exc_group");
