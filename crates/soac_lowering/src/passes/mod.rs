@@ -191,48 +191,27 @@ impl InstrWithConstantNone for InstrWithYield {
     }
 }
 
-#[derive(
-    Clone,
-    derive_more::From,
-    DelegateMatchDefault,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
-)]
-#[rkyv(archive_bounds(N: rkyv::Archive))]
-#[rkyv(serialize_bounds(
-    N: rkyv::Serialize<__S>,
-    __S: rkyv::ser::Writer + rkyv::ser::Allocator,
-    __S::Error: rkyv::rancor::Source,
-))]
-#[rkyv(deserialize_bounds(
-    rkyv::Archived<N>: rkyv::Deserialize<N, __D>,
-    __D::Error: rkyv::rancor::Source,
-))]
-#[rkyv(bytecheck(bounds(
-    __C: rkyv::validation::ArchiveContext,
-    rkyv::Archived<N>: rkyv::bytecheck::CheckBytes<__C>,
-)))]
+#[derive(Clone, derive_more::From, DelegateMatchDefault)]
 #[enum_broadcast(HasMeta, WithMeta, ChildVisitable, Mappable, PrettyPrint, Debug)]
 pub(crate) enum InstrLow<N: NameLike> {
     Literal(LiteralValue),
-    BinOp(#[rkyv(omit_bounds)] BinOp<Self>),
-    UnaryOp(#[rkyv(omit_bounds)] UnaryOp<Self>),
-    Tuple(#[rkyv(omit_bounds)] Tuple<Self>),
-    Call(#[rkyv(omit_bounds)] Call<Self>),
-    GetAttr(#[rkyv(omit_bounds)] GetAttr<Self>),
-    SetAttr(#[rkyv(omit_bounds)] SetAttr<Self>),
-    GetItem(#[rkyv(omit_bounds)] GetItem<Self>),
-    SetItem(#[rkyv(omit_bounds)] SetItem<Self>),
-    DelItem(#[rkyv(omit_bounds)] DelItem<Self>),
-    Load(#[rkyv(omit_bounds)] Load<Self>),
-    Store(#[rkyv(omit_bounds)] Store<Self>),
-    Del(#[rkyv(omit_bounds)] Del<Self>),
-    MakeCell(#[rkyv(omit_bounds)] MakeCell<Self>),
+    BinOp(BinOp<Self>),
+    UnaryOp(UnaryOp<Self>),
+    Tuple(Tuple<Self>),
+    Call(Call<Self>),
+    GetAttr(GetAttr<Self>),
+    SetAttr(SetAttr<Self>),
+    GetItem(GetItem<Self>),
+    SetItem(SetItem<Self>),
+    DelItem(DelItem<Self>),
+    Load(Load<Self>),
+    Store(Store<Self>),
+    Del(Del<Self>),
+    MakeCell(MakeCell<Self>),
     CellRefForName(CellRefForName),
     CellRef(CellRef),
-    MakeFunction(#[rkyv(omit_bounds)] MakeFunction<Self>),
-    MakeFunctionWithClosure(#[rkyv(omit_bounds)] MakeFunctionWithClosure<Self>),
+    MakeFunction(MakeFunction<Self>),
+    MakeFunctionWithClosure(MakeFunctionWithClosure<Self>),
 }
 
 impl<N: NameLike> Instr for InstrLow<N> {
