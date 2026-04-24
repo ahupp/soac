@@ -11980,7 +11980,6 @@ struct LegacyFunctionSpecializationOverlays {
 struct FunctionSpecializationInputs {
     legacy_overlays: Option<LegacyFunctionSpecializationOverlays>,
     cold_block_labels: HashSet<BlockLabel>,
-    guard_miss_deopt_stub: bool,
 }
 
 fn load_planned_optimization_inputs_for_runtime_state(
@@ -12425,8 +12424,6 @@ impl FunctionSpecializationInputs {
         Ok(Self {
             legacy_overlays,
             cold_block_labels: profile.cold_block_labels(function)?,
-            guard_miss_deopt_stub: profile.guard_miss_deopt
-                && function.scope.scope_kind != CallableScopeKind::Module,
         })
     }
 }
@@ -26572,7 +26569,10 @@ fn build_cranelift_run_bb_specialized_function(
     };
     let legacy_overlays = specialization_inputs.legacy_overlays;
     let cold_block_labels = specialization_inputs.cold_block_labels;
-    let guard_miss_deopt_stub = specialization_inputs.guard_miss_deopt_stub;
+    let guard_miss_deopt_stub = options.guard_miss_deopt_stub
+        || specialization_profile.is_some_and(|profile| {
+            profile.guard_miss_deopt && function.scope.scope_kind != CallableScopeKind::Module
+        });
     let function_runtime_data_layout = FunctionRuntimeDataLayout::from_typed_function(function);
     let true_constant_id = module_constants.require_runtime_name_constant_id("TRUE");
     let false_constant_id = module_constants.require_runtime_name_constant_id("FALSE");
@@ -26876,9 +26876,8 @@ fn build_cranelift_run_bb_specialized_function(
             &mut fb.func,
             &SOAC_RUNTIME_LOAD_GLOBAL_SLOW_IMPORT,
         );
-        let guard_miss_deopt_stub_ref = (env_config.jit_refcount_emission_enabled()
-            && (options.guard_miss_deopt_stub || guard_miss_deopt_stub))
-            .then(|| {
+        let guard_miss_deopt_stub_ref =
+            (env_config.jit_refcount_emission_enabled() && guard_miss_deopt_stub).then(|| {
                 func_imports.get_or_panic(codegen_env, &mut fb.func, &DP_JIT_DEOPT_RESUME_IMPORT)
             });
         let store_global_indexed_ref = func_imports.get_or_panic(

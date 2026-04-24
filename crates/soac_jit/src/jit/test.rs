@@ -15072,7 +15072,6 @@ def f(x):
                         ..LegacyFunctionSpecializationOverlays::default()
                     }),
                     cold_block_labels: HashSet::new(),
-                    guard_miss_deopt_stub: false,
                 }),
                 ..BuildSpecializedFunctionOptions::default()
             },
@@ -15246,7 +15245,6 @@ def f(x):
                         ..LegacyFunctionSpecializationOverlays::default()
                     }),
                     cold_block_labels: HashSet::new(),
-                    guard_miss_deopt_stub: false,
                 }),
                 ..BuildSpecializedFunctionOptions::default()
             },
@@ -15377,7 +15375,6 @@ def f(x):
                             ..LegacyFunctionSpecializationOverlays::default()
                         }),
                         cold_block_labels: HashSet::new(),
-                        guard_miss_deopt_stub: false,
                     }),
                     ..BuildSpecializedFunctionOptions::default()
                 },
@@ -15493,7 +15490,6 @@ def f(x):
                             ..LegacyFunctionSpecializationOverlays::default()
                         }),
                         cold_block_labels: HashSet::new(),
-                        guard_miss_deopt_stub: false,
                     }),
                     ..BuildSpecializedFunctionOptions::default()
                 },
@@ -15603,7 +15599,6 @@ def f(x):
                         ..LegacyFunctionSpecializationOverlays::default()
                     }),
                     cold_block_labels: HashSet::new(),
-                    guard_miss_deopt_stub: false,
                 }),
                 ..BuildSpecializedFunctionOptions::default()
             },
@@ -16407,7 +16402,6 @@ def f(x):
         function: &BlockPyFunction<CodegenModuleShape>,
         access: IndexedGlobalAccessKind,
         name: &str,
-        guard_miss_deopt_stub: bool,
     ) -> FunctionSpecializationInputs {
         let source = first_indexed_global_access_source(function, access, name);
         FunctionSpecializationInputs {
@@ -16419,7 +16413,6 @@ def f(x):
                 ..LegacyFunctionSpecializationOverlays::default()
             }),
             cold_block_labels: HashSet::new(),
-            guard_miss_deopt_stub,
         }
     }
 
@@ -16461,7 +16454,6 @@ def f(x):
                         ..LegacyFunctionSpecializationOverlays::default()
                     }),
                     cold_block_labels: HashSet::new(),
-                    guard_miss_deopt_stub: false,
                 }),
                 ..BuildSpecializedFunctionOptions::default()
             },
@@ -16533,7 +16525,6 @@ def f(x):
                 specialization_inputs: Some(FunctionSpecializationInputs {
                     legacy_overlays: Some(LegacyFunctionSpecializationOverlays::default()),
                     cold_block_labels: HashSet::new(),
-                    guard_miss_deopt_stub: false,
                 }),
                 ..BuildSpecializedFunctionOptions::default()
             },
@@ -18560,7 +18551,6 @@ class Point:
                 specialization_inputs: Some(FunctionSpecializationInputs {
                     legacy_overlays: None,
                     cold_block_labels: HashSet::new(),
-                    guard_miss_deopt_stub: false,
                 }),
                 legacy_call_emission_typed_function: Some(planned_function.clone()),
                 ..BuildSpecializedFunctionOptions::default()
@@ -19103,7 +19093,6 @@ class Point:
             &function,
             IndexedGlobalAccessKind::Load,
             "x",
-            false,
         );
         let built = build_test_jit_function_with_constants_and_options(
             &module,
@@ -19170,7 +19159,6 @@ class Point:
                 &function,
                 IndexedGlobalAccessKind::Load,
                 "x",
-                matches!(mode, "verify" | "apply"),
             )
         });
         let compile_session = match env_config {
@@ -19248,7 +19236,6 @@ class Point:
                 &function,
                 IndexedGlobalAccessKind::Store,
                 "x",
-                matches!(mode, "verify" | "apply"),
             )
         });
         let compile_session = crate::session::CompileSession::new();
@@ -20089,7 +20076,6 @@ class Point:
             &function,
             IndexedGlobalAccessKind::Load,
             "x",
-            false,
         );
         let built = build_test_jit_function_with_constants_and_options(
             &module,
@@ -20133,7 +20119,6 @@ class Point:
             &function,
             IndexedGlobalAccessKind::Load,
             "x",
-            false,
         );
         let built = build_test_jit_function_with_constants_and_options(
             &module,
@@ -20222,7 +20207,6 @@ class Point:
                 &function,
                 IndexedGlobalAccessKind::Load,
                 "x",
-                false,
             );
             let built = build_test_cranelift_run_bb_specialized_function(
                 &mut jit_module,
@@ -20361,7 +20345,6 @@ class Point:
                 &function,
                 IndexedGlobalAccessKind::Load,
                 "x",
-                false,
             );
             let built = build_test_cranelift_run_bb_specialized_function(
                 &mut jit_module,
@@ -20474,7 +20457,6 @@ class Point:
             &function,
             IndexedGlobalAccessKind::Load,
             "y",
-            false,
         );
         let built = build_test_jit_function_with_constants_and_options(
             &module,
@@ -20540,7 +20522,6 @@ class Point:
             &function,
             IndexedGlobalAccessKind::Load,
             "x",
-            false,
         );
         let built = build_test_jit_function_with_constants_and_options(
             &module,
@@ -20623,7 +20604,6 @@ class Point:
                 &function,
                 IndexedGlobalAccessKind::Load,
                 "x",
-                false,
             );
             let built = build_test_cranelift_run_bb_specialized_function(
                 &mut jit_module,
@@ -20780,7 +20760,6 @@ class Point:
                 &function,
                 IndexedGlobalAccessKind::Store,
                 "x",
-                true,
             );
             let built = build_test_cranelift_run_bb_specialized_function(
                 &mut jit_module,
