@@ -5294,7 +5294,7 @@ def build(values):
         op_extra.refine_result_facts(ValueFacts::PyObj(PyObjFacts::bool_object()));
         op_extra.set_planned_result(PlannedResult::PYOBJECT_IMMORTAL);
         let operand = InstrTyped::Load(Load::<InstrTyped>::new(test_runtime_name("NONE")));
-        let expr = InstrTyped::LegacyUnaryOp(
+        let expr = InstrTyped::UnaryOp(
             UnaryOp::new(UnaryOpKind::Not, Box::new(operand)).with_extra(op_extra),
         );
 
@@ -18568,7 +18568,7 @@ class Point:
             .iter()
             .find(|function| function.function_id == function_id)
             .expect("planned module should include update_counter");
-        let [InstrTyped::LegacyStore(store)] = planned_function.blocks[0].body.as_slice() else {
+        let [InstrTyped::Store(store)] = planned_function.blocks[0].body.as_slice() else {
             panic!("update_counter should keep the global store as a typed legacy store");
         };
         let store_plan = store
@@ -18705,8 +18705,7 @@ class Point:
             .iter()
             .find(|function| function.function_id == function_id)
             .expect("planned module should include replace_first");
-        let [InstrTyped::LegacySetItem(setitem)] = planned_function.blocks[0].body.as_slice()
-        else {
+        let [InstrTyped::SetItem(setitem)] = planned_function.blocks[0].body.as_slice() else {
             panic!("replace_first should keep setitem as a typed legacy SetItem");
         };
         let setitem_plan = setitem
@@ -18720,8 +18719,7 @@ class Point:
         assert_eq!(setitem_plan.instr_id, setitem_instr_id);
         assert_eq!(setitem_plan.access, PlanV3ExactListItemAccessKind::Set);
 
-        let BlockTerm::Return(InstrTyped::LegacyGetItem(getitem)) =
-            &planned_function.blocks[0].term
+        let BlockTerm::Return(InstrTyped::GetItem(getitem)) = &planned_function.blocks[0].term
         else {
             panic!("replace_first should still return a typed legacy GetItem");
         };
@@ -19064,7 +19062,7 @@ class Point:
             .iter()
             .find(|function| function.function_id == function_id)
             .expect("planned module should include store_then_compare");
-        let InstrTyped::LegacyStore(store) = &planned_function.blocks[0].body[0] else {
+        let InstrTyped::Store(store) = &planned_function.blocks[0].body[0] else {
             panic!("entry block should keep a typed producer store");
         };
         let scalar_thread_plan = store
@@ -20092,7 +20090,7 @@ class Point:
                 .blocks
                 .iter()
                 .flat_map(|block| &block.body)
-                .any(|instr| matches!(instr, InstrTyped::LegacyStore(store) if matches!(store.value.as_ref(), InstrTyped::CallTyped(_)))),
+                .any(|instr| matches!(instr, InstrTyped::Store(store) if matches!(store.value.as_ref(), InstrTyped::CallTyped(_)))),
             "loaded optimized module fixture intentionally still has the original generic call"
         );
     }

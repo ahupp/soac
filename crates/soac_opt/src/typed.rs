@@ -1148,8 +1148,8 @@ pub enum InstrTyped {
     Truthy(TypedTruthy<Self>),
     Load(Load<Self>),
     BinOp(BinOp<Self>),
-    LegacyTuple(Tuple<Self>),
-    LegacyUnaryOp(UnaryOp<Self>),
+    Tuple(Tuple<Self>),
+    UnaryOp(UnaryOp<Self>),
     LegacyCalleeFunctionId(CalleeFunctionId<Self>),
     CallTyped(TypedCall<Self>),
     GuardedCallableCallTyped(TypedGuardedCallableCall<Self>),
@@ -1163,15 +1163,15 @@ pub enum InstrTyped {
     SetAttrTyped(TypedSetAttr<Self>),
     LegacyGetAttr(GetAttr<Self>),
     LegacySetAttr(SetAttr<Self>),
-    LegacyGetItem(GetItem<Self>),
-    LegacySetItem(SetItem<Self>),
-    LegacyDelItem(DelItem<Self>),
-    LegacyStore(Store<Self>),
-    LegacyDel(Del<Self>),
-    LegacyMakeCell(MakeCell<Self>),
-    LegacyIncrementCounter(IncrementCounter),
-    LegacyCellRef(CellRef),
-    LegacyMakeFunctionWithClosure(MakeFunctionWithClosure<Self>),
+    GetItem(GetItem<Self>),
+    SetItem(SetItem<Self>),
+    DelItem(DelItem<Self>),
+    Store(Store<Self>),
+    Del(Del<Self>),
+    MakeCell(MakeCell<Self>),
+    IncrementCounter(IncrementCounter),
+    CellRef(CellRef),
+    MakeFunctionWithClosure(MakeFunctionWithClosure<Self>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1412,22 +1412,11 @@ impl InstrTyped {
     pub fn is_legacy(&self) -> bool {
         matches!(
             self,
-            Self::LegacyUnaryOp(_)
-                | Self::LegacyCalleeFunctionId(_)
+            Self::LegacyCalleeFunctionId(_)
                 | Self::LegacyCall(_)
-                | Self::LegacyTuple(_)
                 | Self::LegacyCallDirect(_)
                 | Self::LegacyGetAttr(_)
                 | Self::LegacySetAttr(_)
-                | Self::LegacyGetItem(_)
-                | Self::LegacySetItem(_)
-                | Self::LegacyDelItem(_)
-                | Self::LegacyStore(_)
-                | Self::LegacyDel(_)
-                | Self::LegacyMakeCell(_)
-                | Self::LegacyIncrementCounter(_)
-                | Self::LegacyCellRef(_)
-                | Self::LegacyMakeFunctionWithClosure(_)
         )
     }
 
@@ -1436,8 +1425,8 @@ impl InstrTyped {
             Self::Truthy(op) => Some(&op.extra),
             Self::Load(op) => Some(op.extra()),
             Self::BinOp(op) => Some(op.extra()),
-            Self::LegacyTuple(op) => Some(op.extra()),
-            Self::LegacyUnaryOp(op) => Some(op.extra()),
+            Self::Tuple(op) => Some(op.extra()),
+            Self::UnaryOp(op) => Some(op.extra()),
             Self::LegacyCalleeFunctionId(op) => Some(op.extra()),
             Self::CallTyped(op) => Some(&op.extra),
             Self::GuardedCallableCallTyped(op) => Some(&op.extra),
@@ -1451,14 +1440,14 @@ impl InstrTyped {
             Self::SetAttrTyped(op) => Some(&op.extra),
             Self::LegacyGetAttr(op) => Some(op.extra()),
             Self::LegacySetAttr(op) => Some(op.extra()),
-            Self::LegacyGetItem(op) => Some(op.extra()),
-            Self::LegacySetItem(op) => Some(op.extra()),
-            Self::LegacyDelItem(op) => Some(op.extra()),
-            Self::LegacyStore(op) => Some(op.extra()),
-            Self::LegacyDel(op) => Some(op.extra()),
-            Self::LegacyMakeCell(op) => Some(op.extra()),
-            Self::LegacyMakeFunctionWithClosure(op) => Some(op.extra()),
-            Self::LegacyIncrementCounter(_) | Self::LegacyCellRef(_) => None,
+            Self::GetItem(op) => Some(op.extra()),
+            Self::SetItem(op) => Some(op.extra()),
+            Self::DelItem(op) => Some(op.extra()),
+            Self::Store(op) => Some(op.extra()),
+            Self::Del(op) => Some(op.extra()),
+            Self::MakeCell(op) => Some(op.extra()),
+            Self::MakeFunctionWithClosure(op) => Some(op.extra()),
+            Self::IncrementCounter(_) | Self::CellRef(_) => None,
         }
     }
 
@@ -1467,8 +1456,8 @@ impl InstrTyped {
             Self::Truthy(op) => Some(&mut op.extra),
             Self::Load(op) => Some(op.extra_mut()),
             Self::BinOp(op) => Some(op.extra_mut()),
-            Self::LegacyTuple(op) => Some(op.extra_mut()),
-            Self::LegacyUnaryOp(op) => Some(op.extra_mut()),
+            Self::Tuple(op) => Some(op.extra_mut()),
+            Self::UnaryOp(op) => Some(op.extra_mut()),
             Self::LegacyCalleeFunctionId(op) => Some(op.extra_mut()),
             Self::CallTyped(op) => Some(&mut op.extra),
             Self::GuardedCallableCallTyped(op) => Some(&mut op.extra),
@@ -1482,14 +1471,14 @@ impl InstrTyped {
             Self::SetAttrTyped(op) => Some(&mut op.extra),
             Self::LegacyGetAttr(op) => Some(op.extra_mut()),
             Self::LegacySetAttr(op) => Some(op.extra_mut()),
-            Self::LegacyGetItem(op) => Some(op.extra_mut()),
-            Self::LegacySetItem(op) => Some(op.extra_mut()),
-            Self::LegacyDelItem(op) => Some(op.extra_mut()),
-            Self::LegacyStore(op) => Some(op.extra_mut()),
-            Self::LegacyDel(op) => Some(op.extra_mut()),
-            Self::LegacyMakeCell(op) => Some(op.extra_mut()),
-            Self::LegacyMakeFunctionWithClosure(op) => Some(op.extra_mut()),
-            Self::LegacyIncrementCounter(_) | Self::LegacyCellRef(_) => None,
+            Self::GetItem(op) => Some(op.extra_mut()),
+            Self::SetItem(op) => Some(op.extra_mut()),
+            Self::DelItem(op) => Some(op.extra_mut()),
+            Self::Store(op) => Some(op.extra_mut()),
+            Self::Del(op) => Some(op.extra_mut()),
+            Self::MakeCell(op) => Some(op.extra_mut()),
+            Self::MakeFunctionWithClosure(op) => Some(op.extra_mut()),
+            Self::IncrementCounter(_) | Self::CellRef(_) => None,
         }
     }
 
@@ -1528,8 +1517,8 @@ impl MapInstr<InstrCodegen, InstrTyped> for CodegenToTyped {
     fn map_instr(&mut self, instr: InstrCodegen) -> InstrTyped {
         match instr {
             InstrCodegen::BinOp(op) => InstrTyped::BinOp(op.map_children(self)),
-            InstrCodegen::Tuple(op) => InstrTyped::LegacyTuple(op.map_children(self)),
-            InstrCodegen::UnaryOp(op) => InstrTyped::LegacyUnaryOp(op.map_children(self)),
+            InstrCodegen::Tuple(op) => InstrTyped::Tuple(op.map_children(self)),
+            InstrCodegen::UnaryOp(op) => InstrTyped::UnaryOp(op.map_children(self)),
             InstrCodegen::CalleeFunctionId(op) => {
                 InstrTyped::LegacyCalleeFunctionId(op.map_children(self))
             }
@@ -1555,17 +1544,17 @@ impl MapInstr<InstrCodegen, InstrTyped> for CodegenToTyped {
             InstrCodegen::SetAttr(op) => {
                 InstrTyped::SetAttrTyped(TypedSetAttr::from_legacy(op.map_children(self)))
             }
-            InstrCodegen::GetItem(op) => InstrTyped::LegacyGetItem(op.map_children(self)),
-            InstrCodegen::SetItem(op) => InstrTyped::LegacySetItem(op.map_children(self)),
-            InstrCodegen::DelItem(op) => InstrTyped::LegacyDelItem(op.map_children(self)),
+            InstrCodegen::GetItem(op) => InstrTyped::GetItem(op.map_children(self)),
+            InstrCodegen::SetItem(op) => InstrTyped::SetItem(op.map_children(self)),
+            InstrCodegen::DelItem(op) => InstrTyped::DelItem(op.map_children(self)),
             InstrCodegen::Load(op) => InstrTyped::Load(op.map_children(self)),
-            InstrCodegen::Store(op) => InstrTyped::LegacyStore(op.map_children(self)),
-            InstrCodegen::Del(op) => InstrTyped::LegacyDel(op.map_children(self)),
-            InstrCodegen::MakeCell(op) => InstrTyped::LegacyMakeCell(op.map_children(self)),
-            InstrCodegen::IncrementCounter(op) => InstrTyped::LegacyIncrementCounter(op),
-            InstrCodegen::CellRef(op) => InstrTyped::LegacyCellRef(op),
+            InstrCodegen::Store(op) => InstrTyped::Store(op.map_children(self)),
+            InstrCodegen::Del(op) => InstrTyped::Del(op.map_children(self)),
+            InstrCodegen::MakeCell(op) => InstrTyped::MakeCell(op.map_children(self)),
+            InstrCodegen::IncrementCounter(op) => InstrTyped::IncrementCounter(op),
+            InstrCodegen::CellRef(op) => InstrTyped::CellRef(op),
             InstrCodegen::MakeFunctionWithClosure(op) => {
-                InstrTyped::LegacyMakeFunctionWithClosure(op.map_children(self))
+                InstrTyped::MakeFunctionWithClosure(op.map_children(self))
             }
         }
     }
@@ -1765,10 +1754,8 @@ fn annotate_typed_child_demands(expr: &mut InstrTyped) -> usize {
             annotate_pyobject_borrowed_input_demand(op.left.as_mut())
                 + annotate_pyobject_borrowed_input_demand(op.right.as_mut())
         }
-        InstrTyped::LegacyUnaryOp(op) => {
-            annotate_pyobject_borrowed_input_demand(op.operand.as_mut())
-        }
-        InstrTyped::LegacyTuple(op) => op
+        InstrTyped::UnaryOp(op) => annotate_pyobject_borrowed_input_demand(op.operand.as_mut()),
+        InstrTyped::Tuple(op) => op
             .values
             .iter_mut()
             .map(annotate_pyobject_borrowed_input_demand)
@@ -1776,7 +1763,7 @@ fn annotate_typed_child_demands(expr: &mut InstrTyped) -> usize {
         InstrTyped::LegacyCalleeFunctionId(op) => {
             annotate_pyobject_borrowed_input_demand(op.value.as_mut())
         }
-        InstrTyped::LegacyStore(store) => {
+        InstrTyped::Store(store) => {
             let mut changed =
                 set_typed_instr_demand(store.value.as_mut(), TypedResultDemand::PYOBJECT_OWNED);
             changed += annotate_typed_child_demands(store.value.as_mut());
@@ -1871,20 +1858,20 @@ fn annotate_typed_child_demands(expr: &mut InstrTyped) -> usize {
                 + annotate_pyobject_borrowed_input_demand(op.attr.as_mut())
                 + annotate_pyobject_borrowed_input_demand(op.replacement.as_mut())
         }
-        InstrTyped::LegacyGetItem(op) => {
+        InstrTyped::GetItem(op) => {
             annotate_pyobject_borrowed_input_demand(op.value.as_mut())
                 + annotate_pyobject_borrowed_input_demand(op.index.as_mut())
         }
-        InstrTyped::LegacySetItem(op) => {
+        InstrTyped::SetItem(op) => {
             annotate_pyobject_borrowed_input_demand(op.value.as_mut())
                 + annotate_pyobject_borrowed_input_demand(op.index.as_mut())
                 + annotate_pyobject_borrowed_input_demand(op.replacement.as_mut())
         }
-        InstrTyped::LegacyDelItem(op) => {
+        InstrTyped::DelItem(op) => {
             annotate_pyobject_borrowed_input_demand(op.value.as_mut())
                 + annotate_pyobject_borrowed_input_demand(op.index.as_mut())
         }
-        InstrTyped::LegacyMakeFunctionWithClosure(op) => {
+        InstrTyped::MakeFunctionWithClosure(op) => {
             annotate_pyobject_borrowed_input_demand(op.captures.as_mut())
                 + annotate_pyobject_borrowed_input_demand(op.param_defaults.as_mut())
                 + annotate_pyobject_borrowed_input_demand(op.annotate_fn.as_mut())
@@ -2030,11 +2017,11 @@ fn infer_typed_instr_result_facts(expr: &InstrTyped) -> Option<ValueFacts> {
             op.right.result_facts()?,
         )
         .or(Some(ValueFacts::unknown_pyobj())),
-        InstrTyped::LegacyUnaryOp(op) => {
+        InstrTyped::UnaryOp(op) => {
             value_facts::infer_unary_result_facts(op.kind, op.operand.result_facts()?)
                 .or(Some(ValueFacts::unknown_pyobj()))
         }
-        InstrTyped::LegacyTuple(_) => Some(ValueFacts::PyObj(PyObjFacts::known_not_none())),
+        InstrTyped::Tuple(_) => Some(ValueFacts::PyObj(PyObjFacts::known_not_none())),
         InstrTyped::CallTyped(op) => infer_typed_call_result_facts(
             op.func.as_ref(),
             op.args.as_slice(),
@@ -2056,10 +2043,10 @@ fn infer_typed_instr_result_facts(expr: &InstrTyped) -> Option<ValueFacts> {
         InstrTyped::DirectCallGuardTest(_) => Some(ValueFacts::Bool(BoolFacts)),
         InstrTyped::SetAttrTyped(_)
         | InstrTyped::LegacySetAttr(_)
-        | InstrTyped::LegacyStore(_)
-        | InstrTyped::LegacySetItem(_)
-        | InstrTyped::LegacyDelItem(_)
-        | InstrTyped::LegacyDel(_) => Some(ValueFacts::PyObj(PyObjFacts::none_singleton())),
+        | InstrTyped::Store(_)
+        | InstrTyped::SetItem(_)
+        | InstrTyped::DelItem(_)
+        | InstrTyped::Del(_) => Some(ValueFacts::PyObj(PyObjFacts::none_singleton())),
         _ => expr.typed_extra().map(|_| ValueFacts::unknown_pyobj()),
     }
 }
@@ -2552,7 +2539,7 @@ fn find_typed_inline_store_candidate(
         .iter()
         .enumerate()
         .find_map(|(instr_index, instr)| {
-            let InstrTyped::LegacyStore(store) = instr else {
+            let InstrTyped::Store(store) = instr else {
                 return None;
             };
             let InstrTyped::GuardedCallableCallTyped(call) = store.value.as_ref() else {
@@ -2814,7 +2801,7 @@ fn build_single_block_typed_inline_fragment_to_target(
         .body
         .iter()
         .cloned()
-        .filter(|instr| !matches!(instr, InstrTyped::LegacyIncrementCounter(_)))
+        .filter(|instr| !matches!(instr, InstrTyped::IncrementCounter(_)))
         .map(|instr| remapper.try_map_instr(instr))
         .collect::<Result<Vec<_>, _>>()?;
     let return_value = remapper.try_map_instr(return_value.clone())?;
@@ -2879,7 +2866,7 @@ fn build_multi_block_typed_inline_fragment_to_target(
             .body
             .iter()
             .cloned()
-            .filter(|instr| !matches!(instr, InstrTyped::LegacyIncrementCounter(_)))
+            .filter(|instr| !matches!(instr, InstrTyped::IncrementCounter(_)))
             .map(|instr| remapper.try_map_instr(instr))
             .collect::<Result<Vec<_>, _>>()?;
         let term = match &callee_block.term {
@@ -3010,8 +2997,8 @@ impl TryMapInstr<InstrTyped, InstrTyped, TypedInlineUnsupportedReason>
                 InstrTyped::Load(op.try_map_children(self)?)
             }
             InstrTyped::BinOp(op) => InstrTyped::BinOp(op.try_map_children(self)?),
-            InstrTyped::LegacyTuple(op) => InstrTyped::LegacyTuple(op.try_map_children(self)?),
-            InstrTyped::LegacyUnaryOp(op) => InstrTyped::LegacyUnaryOp(op.try_map_children(self)?),
+            InstrTyped::Tuple(op) => InstrTyped::Tuple(op.try_map_children(self)?),
+            InstrTyped::UnaryOp(op) => InstrTyped::UnaryOp(op.try_map_children(self)?),
             InstrTyped::LegacyCalleeFunctionId(op) => {
                 InstrTyped::LegacyCalleeFunctionId(op.try_map_children(self)?)
             }
@@ -3039,32 +3026,30 @@ impl TryMapInstr<InstrTyped, InstrTyped, TypedInlineUnsupportedReason>
             InstrTyped::SetAttrTyped(op) => InstrTyped::SetAttrTyped(op.try_map_children(self)?),
             InstrTyped::LegacyGetAttr(op) => InstrTyped::LegacyGetAttr(op.try_map_children(self)?),
             InstrTyped::LegacySetAttr(op) => InstrTyped::LegacySetAttr(op.try_map_children(self)?),
-            InstrTyped::LegacyGetItem(op) => InstrTyped::LegacyGetItem(op.try_map_children(self)?),
-            InstrTyped::LegacySetItem(op) => InstrTyped::LegacySetItem(op.try_map_children(self)?),
-            InstrTyped::LegacyDelItem(op) => InstrTyped::LegacyDelItem(op.try_map_children(self)?),
-            InstrTyped::LegacyStore(op) => {
+            InstrTyped::GetItem(op) => InstrTyped::GetItem(op.try_map_children(self)?),
+            InstrTyped::SetItem(op) => InstrTyped::SetItem(op.try_map_children(self)?),
+            InstrTyped::DelItem(op) => InstrTyped::DelItem(op.try_map_children(self)?),
+            InstrTyped::Store(op) => {
                 if let Some(location) = op.name.local_location()
                     && self.value_bindings.contains_key(&location)
                 {
                     return Err(TypedInlineUnsupportedReason::RebindsBoundLocal(location));
                 }
-                InstrTyped::LegacyStore(op.try_map_children(self)?)
+                InstrTyped::Store(op.try_map_children(self)?)
             }
-            InstrTyped::LegacyDel(op) => {
+            InstrTyped::Del(op) => {
                 if let Some(location) = op.name.local_location()
                     && self.value_bindings.contains_key(&location)
                 {
                     return Err(TypedInlineUnsupportedReason::RebindsBoundLocal(location));
                 }
-                InstrTyped::LegacyDel(op.try_map_children(self)?)
+                InstrTyped::Del(op.try_map_children(self)?)
             }
-            InstrTyped::LegacyMakeCell(op) => {
-                InstrTyped::LegacyMakeCell(op.try_map_children(self)?)
-            }
-            InstrTyped::LegacyIncrementCounter(op) => InstrTyped::LegacyIncrementCounter(op),
-            InstrTyped::LegacyCellRef(op) => InstrTyped::LegacyCellRef(op),
-            InstrTyped::LegacyMakeFunctionWithClosure(op) => {
-                InstrTyped::LegacyMakeFunctionWithClosure(op.try_map_children(self)?)
+            InstrTyped::MakeCell(op) => InstrTyped::MakeCell(op.try_map_children(self)?),
+            InstrTyped::IncrementCounter(op) => InstrTyped::IncrementCounter(op),
+            InstrTyped::CellRef(op) => InstrTyped::CellRef(op),
+            InstrTyped::MakeFunctionWithClosure(op) => {
+                InstrTyped::MakeFunctionWithClosure(op.try_map_children(self)?)
             }
         };
         Ok(clear_typed_instr_id(mapped))
@@ -3362,8 +3347,8 @@ impl TryMapInstr<InstrTyped, InstrCodegen, String> for TypedToCodegen {
             }
             InstrTyped::Load(op) => InstrCodegen::Load(op.try_map_children(self)?),
             InstrTyped::BinOp(op) => InstrCodegen::BinOp(op.try_map_children(self)?),
-            InstrTyped::LegacyTuple(op) => InstrCodegen::Tuple(op.try_map_children(self)?),
-            InstrTyped::LegacyUnaryOp(op) => InstrCodegen::UnaryOp(op.try_map_children(self)?),
+            InstrTyped::Tuple(op) => InstrCodegen::Tuple(op.try_map_children(self)?),
+            InstrTyped::UnaryOp(op) => InstrCodegen::UnaryOp(op.try_map_children(self)?),
             InstrTyped::LegacyCalleeFunctionId(op) => {
                 InstrCodegen::CalleeFunctionId(op.try_map_children(self)?)
             }
@@ -3412,15 +3397,15 @@ impl TryMapInstr<InstrTyped, InstrCodegen, String> for TypedToCodegen {
             }
             InstrTyped::LegacyGetAttr(op) => InstrCodegen::GetAttr(op.try_map_children(self)?),
             InstrTyped::LegacySetAttr(op) => InstrCodegen::SetAttr(op.try_map_children(self)?),
-            InstrTyped::LegacyGetItem(op) => InstrCodegen::GetItem(op.try_map_children(self)?),
-            InstrTyped::LegacySetItem(op) => InstrCodegen::SetItem(op.try_map_children(self)?),
-            InstrTyped::LegacyDelItem(op) => InstrCodegen::DelItem(op.try_map_children(self)?),
-            InstrTyped::LegacyStore(op) => InstrCodegen::Store(op.try_map_children(self)?),
-            InstrTyped::LegacyDel(op) => InstrCodegen::Del(op.try_map_children(self)?),
-            InstrTyped::LegacyMakeCell(op) => InstrCodegen::MakeCell(op.try_map_children(self)?),
-            InstrTyped::LegacyIncrementCounter(op) => InstrCodegen::IncrementCounter(op),
-            InstrTyped::LegacyCellRef(op) => InstrCodegen::CellRef(op),
-            InstrTyped::LegacyMakeFunctionWithClosure(op) => {
+            InstrTyped::GetItem(op) => InstrCodegen::GetItem(op.try_map_children(self)?),
+            InstrTyped::SetItem(op) => InstrCodegen::SetItem(op.try_map_children(self)?),
+            InstrTyped::DelItem(op) => InstrCodegen::DelItem(op.try_map_children(self)?),
+            InstrTyped::Store(op) => InstrCodegen::Store(op.try_map_children(self)?),
+            InstrTyped::Del(op) => InstrCodegen::Del(op.try_map_children(self)?),
+            InstrTyped::MakeCell(op) => InstrCodegen::MakeCell(op.try_map_children(self)?),
+            InstrTyped::IncrementCounter(op) => InstrCodegen::IncrementCounter(op),
+            InstrTyped::CellRef(op) => InstrCodegen::CellRef(op),
+            InstrTyped::MakeFunctionWithClosure(op) => {
                 InstrCodegen::MakeFunctionWithClosure(op.try_map_children(self)?)
             }
         })
@@ -3481,11 +3466,13 @@ mod typed_codegen_tests {
     use std::collections::HashMap;
 
     #[derive(Default)]
-    struct LegacyInstrCounter {
+    struct TypedInstrCounter {
         total: usize,
         truthy: usize,
         loads: usize,
         binops: usize,
+        tuples: usize,
+        unary_ops: usize,
         typed_calls: usize,
         guarded_callable_calls: usize,
         guarded_method_calls: usize,
@@ -3494,10 +3481,19 @@ mod typed_codegen_tests {
         direct_call_guard_tests: usize,
         typed_getattrs: usize,
         typed_setattrs: usize,
+        getitems: usize,
+        setitems: usize,
+        delitems: usize,
+        stores: usize,
+        dels: usize,
+        make_cells: usize,
+        increment_counters: usize,
+        cell_refs: usize,
+        make_functions_with_closure: usize,
         non_legacy: usize,
     }
 
-    impl Visit<InstrTyped> for LegacyInstrCounter {
+    impl Visit<InstrTyped> for TypedInstrCounter {
         fn visit_instr(&mut self, expr: &InstrTyped) {
             self.total += 1;
             if matches!(expr, InstrTyped::Truthy(_)) {
@@ -3511,6 +3507,12 @@ mod typed_codegen_tests {
             }
             if matches!(expr, InstrTyped::BinOp(_)) {
                 self.binops += 1;
+            }
+            if matches!(expr, InstrTyped::Tuple(_)) {
+                self.tuples += 1;
+            }
+            if matches!(expr, InstrTyped::UnaryOp(_)) {
+                self.unary_ops += 1;
             }
             if matches!(expr, InstrTyped::CallTyped(_)) {
                 self.typed_calls += 1;
@@ -3536,8 +3538,60 @@ mod typed_codegen_tests {
             if matches!(expr, InstrTyped::SetAttrTyped(_)) {
                 self.typed_setattrs += 1;
             }
+            if matches!(expr, InstrTyped::GetItem(_)) {
+                self.getitems += 1;
+            }
+            if matches!(expr, InstrTyped::SetItem(_)) {
+                self.setitems += 1;
+            }
+            if matches!(expr, InstrTyped::DelItem(_)) {
+                self.delitems += 1;
+            }
+            if matches!(expr, InstrTyped::Store(_)) {
+                self.stores += 1;
+            }
+            if matches!(expr, InstrTyped::Del(_)) {
+                self.dels += 1;
+            }
+            if matches!(expr, InstrTyped::MakeCell(_)) {
+                self.make_cells += 1;
+            }
+            if matches!(expr, InstrTyped::IncrementCounter(_)) {
+                self.increment_counters += 1;
+            }
+            if matches!(expr, InstrTyped::CellRef(_)) {
+                self.cell_refs += 1;
+            }
+            if matches!(expr, InstrTyped::MakeFunctionWithClosure(_)) {
+                self.make_functions_with_closure += 1;
+            }
             expr.visit_children(self);
         }
+    }
+
+    fn first_class_count(counter: &TypedInstrCounter) -> usize {
+        counter.truthy
+            + counter.loads
+            + counter.binops
+            + counter.tuples
+            + counter.unary_ops
+            + counter.typed_calls
+            + counter.guarded_callable_calls
+            + counter.guarded_method_calls
+            + counter.direct_callable_calls
+            + counter.direct_method_calls
+            + counter.direct_call_guard_tests
+            + counter.typed_getattrs
+            + counter.typed_setattrs
+            + counter.getitems
+            + counter.setitems
+            + counter.delitems
+            + counter.stores
+            + counter.dels
+            + counter.make_cells
+            + counter.increment_counters
+            + counter.cell_refs
+            + counter.make_functions_with_closure
     }
 
     #[derive(Default, Eq, PartialEq, Debug)]
@@ -3699,7 +3753,7 @@ mod typed_codegen_tests {
         assert_eq!(typed.callable_defs.len(), function_count);
         assert_eq!(typed.global_names, global_names);
 
-        let mut counter = LegacyInstrCounter::default();
+        let mut counter = TypedInstrCounter::default();
         for function in &typed.callable_defs {
             for block in &function.blocks {
                 for instr in &block.body {
@@ -3713,19 +3767,7 @@ mod typed_codegen_tests {
         assert!(counter.binops > 0);
         assert!(counter.loads > 0);
         assert_eq!(counter.truthy, 0);
-        assert_eq!(
-            counter.non_legacy,
-            counter.loads
-                + counter.binops
-                + counter.typed_calls
-                + counter.guarded_callable_calls
-                + counter.guarded_method_calls
-                + counter.direct_callable_calls
-                + counter.direct_method_calls
-                + counter.direct_call_guard_tests
-                + counter.typed_getattrs
-                + counter.typed_setattrs
-        );
+        assert_eq!(counter.non_legacy, first_class_count(&counter));
     }
 
     #[test]
@@ -3847,7 +3889,7 @@ mod typed_codegen_tests {
 
         let typed = lower_codegen_module_to_typed(lowered.codegen_module);
 
-        let mut counter = LegacyInstrCounter::default();
+        let mut counter = TypedInstrCounter::default();
         for function in &typed.callable_defs {
             for block in &function.blocks {
                 for instr in &block.body {
@@ -3859,6 +3901,69 @@ mod typed_codegen_tests {
 
         assert!(counter.typed_getattrs > 0);
         assert!(counter.typed_setattrs > 0);
+    }
+
+    #[test]
+    fn lower_codegen_module_to_typed_makes_core_ops_first_class() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            r#"
+def outer(seq, value):
+    x = (-value, value)
+    seq[0] = value
+    y = seq[0]
+    del seq[0]
+    del y
+    def inner():
+        return x
+    return inner
+"#,
+        )
+        .expect("source should lower");
+
+        let typed = lower_codegen_module_to_typed(lowered.codegen_module);
+
+        let mut counter = TypedInstrCounter::default();
+        for function in &typed.callable_defs {
+            counter.visit_fn(function);
+        }
+
+        assert!(
+            counter.tuples > 0,
+            "tuple ops should be first-class typed ops"
+        );
+        assert!(
+            counter.unary_ops > 0,
+            "unary ops should be first-class typed ops"
+        );
+        assert!(
+            counter.getitems > 0,
+            "getitem ops should be first-class typed ops"
+        );
+        assert!(
+            counter.setitems > 0,
+            "setitem ops should be first-class typed ops"
+        );
+        assert!(
+            counter.delitems > 0,
+            "delitem ops should be first-class typed ops"
+        );
+        assert!(
+            counter.stores > 0,
+            "store ops should be first-class typed ops"
+        );
+        assert!(counter.dels > 0, "del ops should be first-class typed ops");
+        assert!(
+            counter.make_cells > 0,
+            "make-cell ops should be first-class typed ops"
+        );
+        assert!(
+            counter.cell_refs > 0,
+            "cell-ref ops should be first-class typed ops"
+        );
+        assert!(
+            counter.make_functions_with_closure > 0,
+            "closure function creation should be a first-class typed op"
+        );
     }
 
     #[test]
@@ -3888,7 +3993,7 @@ mod typed_codegen_tests {
 
         let typed = lower_typed_if_tests_to_truthy(typed);
 
-        let mut counter = LegacyInstrCounter::default();
+        let mut counter = TypedInstrCounter::default();
         for function in &typed.callable_defs {
             for block in &function.blocks {
                 if let BlockTerm::IfTerm(if_term) = &block.term {
@@ -3910,20 +4015,7 @@ mod typed_codegen_tests {
 
         assert!(counter.truthy > 0);
         assert!(counter.loads > 0);
-        assert_eq!(
-            counter.non_legacy,
-            counter.truthy
-                + counter.loads
-                + counter.binops
-                + counter.typed_calls
-                + counter.guarded_callable_calls
-                + counter.guarded_method_calls
-                + counter.direct_callable_calls
-                + counter.direct_method_calls
-                + counter.direct_call_guard_tests
-                + counter.typed_getattrs
-                + counter.typed_setattrs
-        );
+        assert_eq!(counter.non_legacy, first_class_count(&counter));
         assert!(
             try_lower_typed_module_to_codegen_legacy(typed).is_err(),
             "typed truthiness should not silently lower through the legacy adapter"
@@ -3992,7 +4084,7 @@ def caller(a, b):\n    return add(a, b)\n",
         validate_typed_function_call_access_plans(caller)
             .expect("lowered guarded callable shape is valid");
 
-        let mut counter = LegacyInstrCounter::default();
+        let mut counter = TypedInstrCounter::default();
         for block in &caller.blocks {
             for instr in &block.body {
                 counter.visit_instr(instr);
@@ -4036,7 +4128,7 @@ def caller(it):\n    return it.__next__()\n",
         validate_typed_function_call_access_plans(caller)
             .expect("lowered guarded method shape is valid");
 
-        let mut counter = LegacyInstrCounter::default();
+        let mut counter = TypedInstrCounter::default();
         for block in &caller.blocks {
             for instr in &block.body {
                 counter.visit_instr(instr);
@@ -4084,7 +4176,7 @@ def caller(a):\n    return add(a)\n",
             "mechanical call emission lowering should not round-trip through access plans"
         );
 
-        let mut counter = LegacyInstrCounter::default();
+        let mut counter = TypedInstrCounter::default();
         counter.visit_fn(caller);
         assert_eq!(counter.typed_calls, 0);
         assert_eq!(counter.guarded_callable_calls, 1);
@@ -4130,7 +4222,7 @@ def caller(a):\n    return add(a)\n",
                 .expect("typed callable emission plan should lower"),
             1
         );
-        let mut counter = LegacyInstrCounter::default();
+        let mut counter = TypedInstrCounter::default();
         counter.visit_fn(caller);
         assert_eq!(counter.guarded_callable_calls, 1);
     }
@@ -4176,7 +4268,7 @@ def caller(a):\n    return add(a)\n",
             "mechanical method emission lowering should not round-trip through access plans"
         );
 
-        let mut counter = LegacyInstrCounter::default();
+        let mut counter = TypedInstrCounter::default();
         counter.visit_fn(caller);
         assert_eq!(counter.typed_calls, 0);
         assert_eq!(counter.guarded_method_calls, 1);
@@ -4206,7 +4298,7 @@ def caller(a):\n    return add(a)\n",
                 .expect("empty typed emission plan should be a local fallback"),
             0
         );
-        let mut counter = LegacyInstrCounter::default();
+        let mut counter = TypedInstrCounter::default();
         counter.visit_fn(caller);
         assert_eq!(counter.typed_calls, 1);
         assert_eq!(counter.guarded_method_calls, 0);
@@ -4254,7 +4346,7 @@ def caller(a):\n    return add(a)\n",
             },
         ));
 
-        let mut counter = LegacyInstrCounter::default();
+        let mut counter = TypedInstrCounter::default();
         counter.visit_instr(&guard);
 
         assert_eq!(counter.direct_call_guard_tests, 1);
@@ -4286,7 +4378,7 @@ def caller(a):\n    return add(a)\n",
             }),
         ));
 
-        let mut counter = LegacyInstrCounter::default();
+        let mut counter = TypedInstrCounter::default();
         counter.visit_instr(&direct_call);
 
         assert_eq!(counter.direct_callable_calls, 1);
@@ -4325,7 +4417,7 @@ def caller(a):\n    return add(a)\n",
             },
         ));
 
-        let mut counter = LegacyInstrCounter::default();
+        let mut counter = TypedInstrCounter::default();
         counter.visit_instr(&direct_call);
 
         assert_eq!(counter.direct_method_calls, 1);

@@ -119,7 +119,7 @@ fn define_module_call_target_counters(module: &mut BlockPyModule<TypedCodegenMod
     fn is_global_index_candidate(expr: &InstrTyped) -> bool {
         match expr {
             InstrTyped::Load(op) => matches!(op.name.location, NameLocation::Global(_)),
-            InstrTyped::LegacyStore(op) => matches!(op.name.location, NameLocation::Global(_)),
+            InstrTyped::Store(op) => matches!(op.name.location, NameLocation::Global(_)),
             _ => false,
         }
     }
@@ -166,7 +166,7 @@ fn define_module_call_target_counters(module: &mut BlockPyModule<TypedCodegenMod
                     SpecializationCounterCandidate::OperatorHotShapes { instr_id },
                 );
             }
-            if matches!(expr, InstrTyped::LegacyGetItem(_)) {
+            if matches!(expr, InstrTyped::GetItem(_)) {
                 let instr_id = expr.semantic_instr_id();
                 define_specialization_counter_candidate(
                     self.counters,
@@ -174,7 +174,7 @@ fn define_module_call_target_counters(module: &mut BlockPyModule<TypedCodegenMod
                     SpecializationCounterCandidate::GetItem { instr_id },
                 );
             }
-            if matches!(expr, InstrTyped::LegacySetItem(_)) {
+            if matches!(expr, InstrTyped::SetItem(_)) {
                 let instr_id = expr.semantic_instr_id();
                 define_specialization_counter_candidate(
                     self.counters,
@@ -234,7 +234,7 @@ pub(crate) fn instrument_typed_module_with_block_entry_counters(
                 define_block_entry_counter(&mut counters, function.function_id, block.label).id();
             block.body.insert(
                 0,
-                InstrTyped::LegacyIncrementCounter(
+                InstrTyped::IncrementCounter(
                     IncrementCounter::new(counter_id).with_meta(Meta::synthetic()),
                 ),
             );

@@ -639,7 +639,7 @@ impl ModuleConstantCollector {
 
     fn collect_typed_expr(&mut self, expr: &InstrTyped) {
         match expr {
-            InstrTyped::LegacyIncrementCounter(_) => {}
+            InstrTyped::IncrementCounter(_) => {}
             InstrTyped::LegacyCalleeFunctionId(op) => {
                 self.collect_typed_expr(op.value.as_ref());
             }
@@ -759,28 +759,28 @@ impl ModuleConstantCollector {
                 }
             }
             InstrTyped::Load(_) => {}
-            InstrTyped::LegacyStore(op) if op.name.location.is_global() => {
+            InstrTyped::Store(op) if op.name.location.is_global() => {
                 self.constants
                     .intern_unicode_bytes(op.name.id_str().as_bytes());
                 op.visit_children(self);
             }
-            InstrTyped::LegacyStore(op) => {
+            InstrTyped::Store(op) => {
                 op.visit_children(self);
             }
-            InstrTyped::LegacyDel(op) if op.name.location.is_global() => {
+            InstrTyped::Del(op) if op.name.location.is_global() => {
                 self.constants
                     .intern_unicode_bytes(op.name.id_str().as_bytes());
             }
             InstrTyped::BinOp(op) => op.visit_children(self),
-            InstrTyped::LegacyUnaryOp(op) => op.visit_children(self),
-            InstrTyped::LegacyTuple(op) => op.visit_children(self),
+            InstrTyped::UnaryOp(op) => op.visit_children(self),
+            InstrTyped::Tuple(op) => op.visit_children(self),
             InstrTyped::Truthy(op) => op.visit_children(self),
-            InstrTyped::LegacyGetItem(op) => op.visit_children(self),
-            InstrTyped::LegacySetItem(op) => op.visit_children(self),
-            InstrTyped::LegacyDelItem(op) => op.visit_children(self),
-            InstrTyped::LegacyMakeCell(op) => op.visit_children(self),
-            InstrTyped::LegacyMakeFunctionWithClosure(op) => op.visit_children(self),
-            InstrTyped::LegacyDel(_) | InstrTyped::LegacyCellRef(_) => {}
+            InstrTyped::GetItem(op) => op.visit_children(self),
+            InstrTyped::SetItem(op) => op.visit_children(self),
+            InstrTyped::DelItem(op) => op.visit_children(self),
+            InstrTyped::MakeCell(op) => op.visit_children(self),
+            InstrTyped::MakeFunctionWithClosure(op) => op.visit_children(self),
+            InstrTyped::Del(_) | InstrTyped::CellRef(_) => {}
         }
     }
 

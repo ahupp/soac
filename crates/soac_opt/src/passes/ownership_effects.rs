@@ -890,7 +890,7 @@ fn plan_typed_block_refcounts(
 
     for instr in &block.body {
         match instr {
-            InstrTyped::LegacyStore(op) => {
+            InstrTyped::Store(op) => {
                 let Some(location) = typed_store_binding_location(op, owned_cell_locations) else {
                     continue;
                 };
@@ -912,7 +912,7 @@ fn plan_typed_block_refcounts(
                 });
                 env.insert(location, new_state);
             }
-            InstrTyped::LegacyDel(op) => {
+            InstrTyped::Del(op) => {
                 let Some(location) = op.name.local_location() else {
                     continue;
                 };
@@ -2103,12 +2103,12 @@ fn transfer_typed_must_bound_through_block(
     }
     for instr in &block.body {
         match instr {
-            InstrTyped::LegacyStore(op) => {
+            InstrTyped::Store(op) => {
                 if let Some(location) = typed_store_binding_location(op, owned_cell_locations) {
                     must_bound.insert(location);
                 }
             }
-            InstrTyped::LegacyDel(op) => {
+            InstrTyped::Del(op) => {
                 if let Some(location) = op.name.local_location() {
                     must_bound.remove(location);
                 }
@@ -2185,12 +2185,12 @@ fn typed_block_local_effects(
             &mut effects.uses,
         );
         match instr {
-            InstrTyped::LegacyStore(op) => {
+            InstrTyped::Store(op) => {
                 if let Some(location) = op.name.local_location() {
                     effects.defs.insert(location);
                 }
             }
-            InstrTyped::LegacyDel(op) => {
+            InstrTyped::Del(op) => {
                 if let Some(location) = op.name.local_location() {
                     effects.defs.insert(location);
                 }
@@ -2271,7 +2271,7 @@ fn typed_store_binding_location(
         let CellLocation::Owned(slot) = op.name.cell_location()? else {
             return None;
         };
-        matches!(op.value.as_ref(), InstrTyped::LegacyMakeCell(_))
+        matches!(op.value.as_ref(), InstrTyped::MakeCell(_))
             .then(|| owned_cell_locations.get(&slot).copied())
             .flatten()
     })
@@ -2481,7 +2481,7 @@ fn collect_typed_local_reads(
                         );
                     }
                 }
-                InstrTyped::LegacyStore(op) => {
+                InstrTyped::Store(op) => {
                     if let Some(cell_location) = op.name.cell_location() {
                         mark_cell_use(
                             cell_location,
@@ -2491,7 +2491,7 @@ fn collect_typed_local_reads(
                         );
                     }
                 }
-                InstrTyped::LegacyDel(op) => {
+                InstrTyped::Del(op) => {
                     if let Some(location) = op.name.local_location() {
                         mark_local_use(location, self.defs, self.uses);
                     }
@@ -2504,7 +2504,7 @@ fn collect_typed_local_reads(
                         );
                     }
                 }
-                InstrTyped::LegacyCellRef(op) => {
+                InstrTyped::CellRef(op) => {
                     mark_cell_use(op.location, self.defs, self.owned_cell_locations, self.uses)
                 }
                 _ => {}

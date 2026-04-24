@@ -1343,10 +1343,10 @@ pub(super) fn emit_typed_operation<'fb>(
 ) -> Option<ir::Value> {
     match operation {
         InstrTyped::BinOp(op) => Some(emit_counted_binop(op, state)),
-        InstrTyped::LegacyUnaryOp(op) => {
+        InstrTyped::UnaryOp(op) => {
             Some(emit_unary_op(op.kind, state, &[op.operand.as_ref()]))
         }
-        InstrTyped::LegacyGetItem(op) => {
+        InstrTyped::GetItem(op) => {
             let lowering_plan = op.extra().exact_list_item_access_plan().map(|plan| {
                 operation_specializations::lowering_plan_from_typed_exact_list_item(
                     plan,
@@ -1359,7 +1359,7 @@ pub(super) fn emit_typed_operation<'fb>(
                 Some(lowering_plan),
             ))
         }
-        InstrTyped::LegacySetItem(op) => {
+        InstrTyped::SetItem(op) => {
             let lowering_plan = op.extra().exact_list_item_access_plan().map(|plan| {
                 operation_specializations::lowering_plan_from_typed_exact_list_item(
                     plan,
@@ -1372,7 +1372,7 @@ pub(super) fn emit_typed_operation<'fb>(
                 Some(lowering_plan),
             ))
         }
-        InstrTyped::LegacyStore(op) => op.name.location.is_global().then(|| {
+        InstrTyped::Store(op) => op.name.location.is_global().then(|| {
             let indexed_global_plan = op.extra().indexed_global_access_plan().map(|plan| {
                 if plan.access != soac_opt::plan_v3::IndexedGlobalAccessKind::Store {
                     panic!(

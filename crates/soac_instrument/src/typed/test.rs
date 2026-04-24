@@ -23,7 +23,7 @@ fn function_contains_increment_counter(
 
     impl Visit<InstrTyped> for IncrementCounterProbe {
         fn visit_instr(&mut self, expr: &InstrTyped) {
-            self.found |= matches!(expr, InstrTyped::LegacyIncrementCounter(_));
+            self.found |= matches!(expr, InstrTyped::IncrementCounter(_));
             expr.visit_children(self);
         }
     }
@@ -34,7 +34,7 @@ fn function_contains_increment_counter(
 }
 
 #[test]
-fn typed_block_entry_counters_insert_legacy_increment_counters_for_jit_functions() {
+fn typed_block_entry_counters_insert_typed_increment_counters_for_jit_functions() {
     let source = r#"
 VALUE: int = 1
 

@@ -4522,7 +4522,7 @@ fn typed_nested_guard_scan_expr(expr: &InstrTyped, saw_replay_unsafe_effect: &mu
                 )
                 && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
         }
-        InstrTyped::LegacyUnaryOp(op) => {
+        InstrTyped::UnaryOp(op) => {
             typed_nested_guard_scan_expr(op.operand.as_ref(), saw_replay_unsafe_effect)
                 && nested_guard_candidate_seen_before_replay_unsafe_effect(
                     true,
@@ -4530,7 +4530,7 @@ fn typed_nested_guard_scan_expr(expr: &InstrTyped, saw_replay_unsafe_effect: &mu
                 )
                 && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
         }
-        InstrTyped::LegacyTuple(op) => op
+        InstrTyped::Tuple(op) => op
             .values
             .iter()
             .all(|value| typed_nested_guard_scan_expr(value, saw_replay_unsafe_effect)),
@@ -4731,23 +4731,23 @@ fn typed_nested_guard_scan_expr(expr: &InstrTyped, saw_replay_unsafe_effect: &mu
                 )
                 && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
         }
-        InstrTyped::LegacyGetItem(op) => {
+        InstrTyped::GetItem(op) => {
             typed_nested_guard_scan_expr(op.value.as_ref(), saw_replay_unsafe_effect)
                 && typed_nested_guard_scan_expr(op.index.as_ref(), saw_replay_unsafe_effect)
                 && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
         }
-        InstrTyped::LegacySetItem(op) => {
+        InstrTyped::SetItem(op) => {
             typed_nested_guard_scan_expr(op.value.as_ref(), saw_replay_unsafe_effect)
                 && typed_nested_guard_scan_expr(op.index.as_ref(), saw_replay_unsafe_effect)
                 && typed_nested_guard_scan_expr(op.replacement.as_ref(), saw_replay_unsafe_effect)
                 && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
         }
-        InstrTyped::LegacyDelItem(op) => {
+        InstrTyped::DelItem(op) => {
             typed_nested_guard_scan_expr(op.value.as_ref(), saw_replay_unsafe_effect)
                 && typed_nested_guard_scan_expr(op.index.as_ref(), saw_replay_unsafe_effect)
                 && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
         }
-        InstrTyped::LegacyStore(op) => {
+        InstrTyped::Store(op) => {
             typed_nested_guard_scan_expr(op.value.as_ref(), saw_replay_unsafe_effect)
                 && nested_guard_candidate_seen_before_replay_unsafe_effect(
                     matches!(op.name.location, NameLocation::Global(_)),
@@ -4755,17 +4755,15 @@ fn typed_nested_guard_scan_expr(expr: &InstrTyped, saw_replay_unsafe_effect: &mu
                 )
                 && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
         }
-        InstrTyped::LegacyDel(_) => mark_replay_unsafe_effect(saw_replay_unsafe_effect),
-        InstrTyped::LegacyMakeCell(op) => {
+        InstrTyped::Del(_) => mark_replay_unsafe_effect(saw_replay_unsafe_effect),
+        InstrTyped::MakeCell(op) => {
             op.initial_value.as_ref().map_or(true, |initial_value| {
                 typed_nested_guard_scan_expr(initial_value.as_ref(), saw_replay_unsafe_effect)
             }) && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
         }
-        InstrTyped::LegacyIncrementCounter(_) => {
-            mark_replay_unsafe_effect(saw_replay_unsafe_effect)
-        }
-        InstrTyped::LegacyCellRef(_) => true,
-        InstrTyped::LegacyMakeFunctionWithClosure(op) => {
+        InstrTyped::IncrementCounter(_) => mark_replay_unsafe_effect(saw_replay_unsafe_effect),
+        InstrTyped::CellRef(_) => true,
+        InstrTyped::MakeFunctionWithClosure(op) => {
             typed_nested_guard_scan_expr(op.captures.as_ref(), saw_replay_unsafe_effect)
                 && typed_nested_guard_scan_expr(
                     op.param_defaults.as_ref(),
@@ -6435,9 +6433,9 @@ fn max_referenced_typed_function_closure_slot(
         fn visit_instr(&mut self, expr: &InstrTyped) {
             match expr {
                 InstrTyped::Load(op) => self.visit_name(&op.name),
-                InstrTyped::LegacyStore(op) => self.visit_name(&op.name),
-                InstrTyped::LegacyDel(op) => self.visit_name(&op.name),
-                InstrTyped::LegacyCellRef(op) => self.visit_cell_location(op.location),
+                InstrTyped::Store(op) => self.visit_name(&op.name),
+                InstrTyped::Del(op) => self.visit_name(&op.name),
+                InstrTyped::CellRef(op) => self.visit_cell_location(op.location),
                 _ => {}
             }
             expr.visit_children(self);
@@ -11422,7 +11420,7 @@ fn annotate_typed_indexed_global_accesses(
                         self.count += 1;
                     }
                 }
-                InstrTyped::LegacyStore(op) => {
+                InstrTyped::Store(op) => {
                     if let Some(instr_id) = op.try_semantic_instr_id()
                         && let Some(plan) = self.plan_for_instr(
                             instr_id,
@@ -11527,7 +11525,7 @@ fn annotate_typed_exact_list_item_accesses(
                 return;
             }
             match expr {
-                InstrTyped::LegacyGetItem(op) => {
+                InstrTyped::GetItem(op) => {
                     if let Some(instr_id) = op.try_semantic_instr_id()
                         && let Some(plan) = self.plan_for_instr(
                             instr_id,
@@ -11538,7 +11536,7 @@ fn annotate_typed_exact_list_item_accesses(
                         self.count += 1;
                     }
                 }
-                InstrTyped::LegacySetItem(op) => {
+                InstrTyped::SetItem(op) => {
                     if let Some(instr_id) = op.try_semantic_instr_id()
                         && let Some(plan) = self.plan_for_instr(
                             instr_id,
@@ -11713,7 +11711,7 @@ fn annotate_typed_exact_int_selections(
             let Some(store_instr_id) = store_expr.try_semantic_instr_id() else {
                 return;
             };
-            let InstrTyped::LegacyStore(store) = store_expr else {
+            let InstrTyped::Store(store) = store_expr else {
                 return;
             };
             let Some(producer_instr_id) = store.value.try_semantic_instr_id() else {
@@ -15741,7 +15739,7 @@ fn emit_typed_codegen_expr_value_with_local_env(
         ));
     }
 
-    if matches!(expr, InstrTyped::BinOp(_) | InstrTyped::LegacyUnaryOp(_)) {
+    if matches!(expr, InstrTyped::BinOp(_) | InstrTyped::UnaryOp(_)) {
         assert!(
             !borrowed,
             "typed operation expression must not use borrowed result"
@@ -15759,7 +15757,7 @@ fn emit_typed_codegen_expr_value_with_local_env(
         }
     }
 
-    if let InstrTyped::LegacyTuple(op) = expr {
+    if let InstrTyped::Tuple(op) = expr {
         assert!(
             !borrowed,
             "typed tuple expression must not request a borrowed result"
@@ -19660,7 +19658,7 @@ fn emit_typed_codegen_stmt_with_local_env(
     codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<ir::Value, String> {
-    if let InstrTyped::LegacyStore(op) = expr
+    if let InstrTyped::Store(op) = expr
         && op.name.location.is_global()
     {
         let mut intrinsic_state = LocalEnvCodegenIntrinsicEmitState {
@@ -19674,10 +19672,7 @@ fn emit_typed_codegen_stmt_with_local_env(
             return Ok(value);
         }
     }
-    if matches!(
-        expr,
-        InstrTyped::LegacyGetItem(_) | InstrTyped::LegacySetItem(_)
-    ) {
+    if matches!(expr, InstrTyped::GetItem(_) | InstrTyped::SetItem(_)) {
         let mut intrinsic_state = LocalEnvCodegenIntrinsicEmitState {
             fb,
             local_env,
@@ -19695,8 +19690,8 @@ fn emit_typed_codegen_stmt_with_local_env(
         InstrTyped::Truthy(_)
             | InstrTyped::Load(_)
             | InstrTyped::BinOp(_)
-            | InstrTyped::LegacyTuple(_)
-            | InstrTyped::LegacyUnaryOp(_)
+            | InstrTyped::Tuple(_)
+            | InstrTyped::UnaryOp(_)
             | InstrTyped::CallTyped(_)
             | InstrTyped::GuardedCallableCallTyped(_)
             | InstrTyped::GuardedMethodCallTyped(_)
@@ -19740,7 +19735,7 @@ fn emit_typed_codegen_stmt_result_with_local_env(
     {
         return Ok(result);
     }
-    if let InstrTyped::LegacyTuple(_) = expr {
+    if let InstrTyped::Tuple(_) = expr {
         let result = emit_typed_codegen_expr_value_with_local_env(
             fb,
             expr,
@@ -19916,7 +19911,7 @@ fn emit_typed_codegen_stmt_result_with_local_env(
         );
     }
 
-    if let InstrTyped::LegacyStore(op) = expr {
+    if let InstrTyped::Store(op) = expr {
         if let Some(result) = emit_typed_local_store_result_with_local_env(
             fb,
             expr,
@@ -19948,10 +19943,7 @@ fn emit_typed_codegen_stmt_result_with_local_env(
             }
         }
     }
-    if matches!(
-        expr,
-        InstrTyped::LegacyGetItem(_) | InstrTyped::LegacySetItem(_)
-    ) {
+    if matches!(expr, InstrTyped::GetItem(_) | InstrTyped::SetItem(_)) {
         let mut intrinsic_state = LocalEnvCodegenIntrinsicEmitState {
             fb,
             local_env,
@@ -21498,7 +21490,7 @@ fn emit_opt_v3_scalar_threaded_store_branch(
     let [store_expr] = typed_block.body.as_slice() else {
         return Ok(None);
     };
-    let InstrTyped::LegacyStore(store) = store_expr else {
+    let InstrTyped::Store(store) = store_expr else {
         return Ok(None);
     };
     let Some(location) = store.name.local_location() else {
@@ -26389,8 +26381,8 @@ fn instr_typed_variant_name(expr: &InstrTyped) -> &'static str {
         InstrTyped::Truthy(_) => "Truthy",
         InstrTyped::Load(_) => "Load",
         InstrTyped::BinOp(_) => "BinOp",
-        InstrTyped::LegacyTuple(_) => "LegacyTuple",
-        InstrTyped::LegacyUnaryOp(_) => "LegacyUnaryOp",
+        InstrTyped::Tuple(_) => "Tuple",
+        InstrTyped::UnaryOp(_) => "UnaryOp",
         InstrTyped::LegacyCalleeFunctionId(_) => "LegacyCalleeFunctionId",
         InstrTyped::CallTyped(_) => "CallTyped",
         InstrTyped::GuardedCallableCallTyped(_) => "GuardedCallableCallTyped",
@@ -26404,15 +26396,15 @@ fn instr_typed_variant_name(expr: &InstrTyped) -> &'static str {
         InstrTyped::SetAttrTyped(_) => "SetAttrTyped",
         InstrTyped::LegacyGetAttr(_) => "LegacyGetAttr",
         InstrTyped::LegacySetAttr(_) => "LegacySetAttr",
-        InstrTyped::LegacyGetItem(_) => "LegacyGetItem",
-        InstrTyped::LegacySetItem(_) => "LegacySetItem",
-        InstrTyped::LegacyDelItem(_) => "LegacyDelItem",
-        InstrTyped::LegacyStore(_) => "LegacyStore",
-        InstrTyped::LegacyDel(_) => "LegacyDel",
-        InstrTyped::LegacyMakeCell(_) => "LegacyMakeCell",
-        InstrTyped::LegacyIncrementCounter(_) => "LegacyIncrementCounter",
-        InstrTyped::LegacyCellRef(_) => "LegacyCellRef",
-        InstrTyped::LegacyMakeFunctionWithClosure(_) => "LegacyMakeFunctionWithClosure",
+        InstrTyped::GetItem(_) => "GetItem",
+        InstrTyped::SetItem(_) => "SetItem",
+        InstrTyped::DelItem(_) => "DelItem",
+        InstrTyped::Store(_) => "Store",
+        InstrTyped::Del(_) => "Del",
+        InstrTyped::MakeCell(_) => "MakeCell",
+        InstrTyped::IncrementCounter(_) => "IncrementCounter",
+        InstrTyped::CellRef(_) => "CellRef",
+        InstrTyped::MakeFunctionWithClosure(_) => "MakeFunctionWithClosure",
     }
 }
 
@@ -26509,7 +26501,7 @@ fn build_cranelift_run_bb_specialized_function(
     }
     for block in &function.blocks {
         for expr in &block.body {
-            if let InstrTyped::LegacyIncrementCounter(op) = expr {
+            if let InstrTyped::IncrementCounter(op) = expr {
                 if scalar_counter_slot_for_id(counter_slots_by_id, op.counter_id).is_err() {
                     return Err(format!(
                         "specialized JIT scalar counter layout is missing counter id {} for function {}",

@@ -1149,7 +1149,7 @@ fn transfer_typed_resume_local_state(
     locals: &mut [LocalEnvResumeBinding],
 ) {
     match instr {
-        InstrTyped::LegacyStore(op) => {
+        InstrTyped::Store(op) => {
             let Some(location) = op.name.local_location() else {
                 return;
             };
@@ -1179,7 +1179,7 @@ fn transfer_typed_resume_local_state(
                 binding.value = py_facts;
             }
         }
-        InstrTyped::LegacyDel(op) => {
+        InstrTyped::Del(op) => {
             let Some(location) = op.name.local_location() else {
                 return;
             };
