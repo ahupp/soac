@@ -3077,7 +3077,6 @@ def build(values):
     }
 
     struct ExplicitTestInstrIdCollector {
-        block_label: BlockLabel,
         used: std::collections::HashSet<u32>,
     }
 
@@ -3086,18 +3085,15 @@ def build(values):
         where
             InstrCodegen: ChildVisitable<InstrCodegen>,
         {
-            if let Some(instr_id) = expr.try_semantic_instr_id()
-                && instr_id.block_label() == self.block_label
-            {
-                self.used.insert(instr_id.instr_index_in_block());
+            if let Some(instr_id) = expr.try_semantic_instr_id() {
+                self.used.insert(instr_id.index());
             }
             expr.visit_children(self);
         }
     }
 
     struct MissingTestInstrIdAssigner {
-        block_label: BlockLabel,
-        next_instr_index_in_block: u32,
+        next_instr_index: u32,
         used: std::collections::HashSet<u32>,
     }
 
@@ -3107,18 +3103,18 @@ def build(values):
             InstrCodegen: ChildVisitable<InstrCodegen>,
         {
             if expr.try_semantic_instr_id().is_none() {
-                while self.used.contains(&self.next_instr_index_in_block) {
-                    self.next_instr_index_in_block = self
-                        .next_instr_index_in_block
+                while self.used.contains(&self.next_instr_index) {
+                    self.next_instr_index = self
+                        .next_instr_index
                         .checked_add(1)
-                        .expect("test block instruction count should fit in u32");
+                        .expect("test function instruction count should fit in u32");
                 }
-                let instr_id = InstrId::new(self.block_label, self.next_instr_index_in_block);
-                self.used.insert(self.next_instr_index_in_block);
-                self.next_instr_index_in_block = self
-                    .next_instr_index_in_block
+                let instr_id = InstrId::new(self.next_instr_index);
+                self.used.insert(self.next_instr_index);
+                self.next_instr_index = self
+                    .next_instr_index
                     .checked_add(1)
-                    .expect("test block instruction count should fit in u32");
+                    .expect("test function instruction count should fit in u32");
                 let mut meta = expr.meta();
                 meta.instr_id = Some(instr_id);
                 *expr = expr.clone().with_meta(meta);
@@ -3128,18 +3124,16 @@ def build(values):
     }
 
     fn assign_missing_test_instr_ids(function: &mut BlockPyFunction<CodegenModuleShape>) {
-        for block in &mut function.blocks {
-            let mut collector = ExplicitTestInstrIdCollector {
-                block_label: block.label,
-                used: std::collections::HashSet::new(),
-            };
-            collector.visit_block(block);
+        let mut collector = ExplicitTestInstrIdCollector {
+            used: std::collections::HashSet::new(),
+        };
+        collector.visit_fn(function);
 
-            let mut assigner = MissingTestInstrIdAssigner {
-                block_label: block.label,
-                next_instr_index_in_block: 0,
-                used: collector.used,
-            };
+        let mut assigner = MissingTestInstrIdAssigner {
+            next_instr_index: 0,
+            used: collector.used,
+        };
+        for block in &mut function.blocks {
             assigner.visit_block_mut(block);
         }
     }
@@ -3993,7 +3987,7 @@ def build(values):
     #[test]
     fn typed_result_demand_extra_marks_statement_roots_effect_only() {
         let mut constants = TestConstantPool::default();
-        let instr_id = InstrId::new(BlockLabel::from_index(0), 0);
+        let instr_id = InstrId::new(0);
         let function = with_single_test_block(
             test_function(),
             vec![expr_stmt(with_instr_id(constants.int_expr(1), instr_id))],
@@ -4012,7 +4006,7 @@ def build(values):
     #[test]
     fn typed_planned_result_extra_marks_statement_roots_effect_only() {
         let mut constants = TestConstantPool::default();
-        let instr_id = InstrId::new(BlockLabel::from_index(0), 0);
+        let instr_id = InstrId::new(0);
         let function = with_single_test_block(
             test_function(),
             vec![expr_stmt(with_instr_id(constants.int_expr(1), instr_id))],
@@ -4031,7 +4025,7 @@ def build(values):
     #[test]
     fn typed_planned_result_extra_marks_borrowed_local_for_borrowed_input_demand() {
         let mut constants = TestConstantPool::default();
-        let arg_instr_id = InstrId::new(BlockLabel::from_index(0), 2);
+        let arg_instr_id = InstrId::new(2);
         let call = op_expr(Call::new(
             name_expr(test_runtime_name("callable")),
             vec![CallArgPositional::Positional(with_instr_id(
@@ -4053,7 +4047,7 @@ def build(values):
 
     #[test]
     fn typed_planned_result_extra_marks_immortal_pyobject_from_value_facts() {
-        let return_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
+        let return_instr_id = InstrId::new(0);
         let function = with_single_test_block(
             test_function(),
             vec![],
@@ -4074,7 +4068,7 @@ def build(values):
 
     #[test]
     fn typed_planned_result_extra_marks_module_constant_inputs_immortal() {
-        let attr_instr_id = InstrId::new(BlockLabel::from_index(0), 1);
+        let attr_instr_id = InstrId::new(1);
         let mut constants = TestConstantPool::default();
         let function = with_single_test_block(
             test_function(),
@@ -4101,8 +4095,8 @@ def build(values):
     #[test]
     fn typed_result_demand_extra_marks_local_store_rhs_pyobject_owned() {
         let mut constants = TestConstantPool::default();
-        let store_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
-        let rhs_instr_id = InstrId::new(BlockLabel::from_index(0), 1);
+        let store_instr_id = InstrId::new(0);
+        let rhs_instr_id = InstrId::new(1);
         let store = with_instr_id(
             op_expr(Store::new(
                 test_name("x"),
@@ -4132,10 +4126,10 @@ def build(values):
     #[test]
     fn typed_result_demand_extra_marks_call_inputs_pyobject_borrowed_ok() {
         let mut constants = TestConstantPool::default();
-        let call_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
-        let func_instr_id = InstrId::new(BlockLabel::from_index(0), 1);
-        let positional_instr_id = InstrId::new(BlockLabel::from_index(0), 2);
-        let keyword_instr_id = InstrId::new(BlockLabel::from_index(0), 3);
+        let call_instr_id = InstrId::new(0);
+        let func_instr_id = InstrId::new(1);
+        let positional_instr_id = InstrId::new(2);
+        let keyword_instr_id = InstrId::new(3);
         let call = with_instr_id(
             op_expr(Call::new(
                 with_instr_id(name_expr(test_runtime_name("callable")), func_instr_id),
@@ -4176,9 +4170,9 @@ def build(values):
     #[test]
     fn typed_result_demand_extra_marks_lowered_guarded_call_inputs_borrowed_ok() {
         let mut constants = TestConstantPool::default();
-        let call_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
-        let func_instr_id = InstrId::new(BlockLabel::from_index(0), 1);
-        let positional_instr_id = InstrId::new(BlockLabel::from_index(0), 2);
+        let call_instr_id = InstrId::new(0);
+        let func_instr_id = InstrId::new(1);
+        let positional_instr_id = InstrId::new(2);
         let call = with_instr_id(
             op_expr(Call::new(
                 with_instr_id(name_expr(test_runtime_name("callable")), func_instr_id),
@@ -4240,7 +4234,7 @@ def build(values):
     #[test]
     fn opt_v3_typed_call_preparation_skips_inline_body_plans() {
         let function_id = RuntimeFunctionId::from_raw_parts(0, 1);
-        let source = InstrId::new(BlockLabel::from_index(0), 7);
+        let source = InstrId::new(7);
         let target = RuntimeFunctionId::from_raw_parts(0, 9);
         let direct_call = ResolvedV3DirectCallPlan {
             source,
@@ -4277,9 +4271,9 @@ def build(values):
     #[test]
     fn typed_result_demand_extra_marks_direct_call_inputs_pyobject_borrowed_ok() {
         let mut constants = TestConstantPool::default();
-        let call_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
-        let callable_instr_id = InstrId::new(BlockLabel::from_index(0), 1);
-        let positional_instr_id = InstrId::new(BlockLabel::from_index(0), 2);
+        let call_instr_id = InstrId::new(0);
+        let callable_instr_id = InstrId::new(1);
+        let positional_instr_id = InstrId::new(2);
         let call = with_instr_id(
             InstrCodegen::CallDirect(CallDirect::new(
                 with_instr_id(name_expr(test_global_name("callee")), callable_instr_id),
@@ -4314,7 +4308,7 @@ def build(values):
     #[test]
     fn typed_planned_result_extra_marks_direct_call_local_inputs_borrowed() {
         let mut constants = TestConstantPool::default();
-        let positional_instr_id = InstrId::new(BlockLabel::from_index(0), 2);
+        let positional_instr_id = InstrId::new(2);
         let call = InstrCodegen::CallDirect(CallDirect::new(
             name_expr(test_global_name("callee")),
             RuntimeFunctionId::from_raw_parts(0, 1),
@@ -4596,9 +4590,9 @@ def build(values):
     #[test]
     fn typed_result_demand_extra_marks_intrinsic_inputs_pyobject_borrowed_ok() {
         let mut constants = TestConstantPool::default();
-        let binop_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
-        let left_instr_id = InstrId::new(BlockLabel::from_index(0), 1);
-        let right_instr_id = InstrId::new(BlockLabel::from_index(0), 2);
+        let binop_instr_id = InstrId::new(0);
+        let left_instr_id = InstrId::new(1);
+        let right_instr_id = InstrId::new(2);
         let binop = with_instr_id(
             op_expr(BinOp::new(
                 BinOpKind::Add,
@@ -4636,7 +4630,7 @@ def build(values):
         let entry_label = function.name_gen.next_block_name();
         let then_label = function.name_gen.next_block_name();
         let else_label = function.name_gen.next_block_name();
-        let test_instr_id = InstrId::new(entry_label, 0);
+        let test_instr_id = InstrId::new(0);
         let entry = CodegenBlock {
             label: entry_label,
             body: vec![],
@@ -4683,7 +4677,7 @@ def build(values):
         let entry_label = function.name_gen.next_block_name();
         let case_label = function.name_gen.next_block_name();
         let default_label = function.name_gen.next_block_name();
-        let index_instr_id = InstrId::new(entry_label, 0);
+        let index_instr_id = InstrId::new(0);
         let entry = CodegenBlock {
             label: entry_label,
             body: vec![],
@@ -4725,7 +4719,7 @@ def build(values):
     #[test]
     fn typed_result_demand_extra_marks_return_values_pyobject_owned() {
         let mut constants = TestConstantPool::default();
-        let return_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
+        let return_instr_id = InstrId::new(0);
         let function = with_single_test_block(
             test_function(),
             vec![],
@@ -4743,7 +4737,7 @@ def build(values):
     #[test]
     fn typed_result_demand_extra_marks_raise_values_pyobject_owned() {
         let mut constants = TestConstantPool::default();
-        let raise_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
+        let raise_instr_id = InstrId::new(0);
         let function = with_single_test_block(
             test_function(),
             vec![],
@@ -10144,7 +10138,7 @@ def f(x):
                         ordinal: 0,
                     },
                     resume_point: LocalEnvResumePoint::BeforeInstr {
-                        key: InstrKey::new(function_id, InstrId::new(block, 0)),
+                        key: InstrKey::new(function_id, InstrId::new(0)),
                     },
                     precision: LocalEnvResumeStatePrecision::InstructionBoundary,
                     locals: vec![],
@@ -10260,7 +10254,7 @@ def f(x):
                         ordinal: 0,
                     },
                     resume_point: LocalEnvResumePoint::BeforeInstr {
-                        key: InstrKey::new(function_id, InstrId::new(entry.label, 0)),
+                        key: InstrKey::new(function_id, InstrId::new(0)),
                     },
                     precision: LocalEnvResumeStatePrecision::InstructionBoundary,
                     locals: vec![exc_binding],
@@ -11297,7 +11291,7 @@ def g():
                         ordinal: 0,
                     },
                     resume_point: LocalEnvResumePoint::BeforeInstr {
-                        key: InstrKey::new(function_id, InstrId::new(block, 0)),
+                        key: InstrKey::new(function_id, InstrId::new(0)),
                     },
                     precision: LocalEnvResumeStatePrecision::InstructionBoundary,
                     locals: vec![],
@@ -13401,7 +13395,7 @@ def g():
                         ordinal: 0,
                     },
                     resume_point: LocalEnvResumePoint::BeforeInstr {
-                        key: InstrKey::new(function_id, InstrId::new(block, 0)),
+                        key: InstrKey::new(function_id, InstrId::new(0)),
                     },
                     precision: LocalEnvResumeStatePrecision::InstructionBoundary,
                     locals: vec![],
@@ -13481,7 +13475,7 @@ def g():
                         ordinal: 0,
                     },
                     resume_point: LocalEnvResumePoint::BeforeInstr {
-                        key: InstrKey::new(function_id, InstrId::new(block, 0)),
+                        key: InstrKey::new(function_id, InstrId::new(0)),
                     },
                     precision: LocalEnvResumeStatePrecision::InstructionBoundary,
                     locals: vec![],
@@ -13589,7 +13583,7 @@ def g():
                         ordinal: 0,
                     },
                     resume_point: LocalEnvResumePoint::BeforeInstr {
-                        key: InstrKey::new(function_id, InstrId::new(block, 0)),
+                        key: InstrKey::new(function_id, InstrId::new(0)),
                     },
                     precision: LocalEnvResumeStatePrecision::InstructionBoundary,
                     locals: vec![binding],
@@ -13673,7 +13667,7 @@ def g():
                         ordinal: 0,
                     },
                     resume_point: LocalEnvResumePoint::BeforeInstr {
-                        key: InstrKey::new(function_id, InstrId::new(block, 0)),
+                        key: InstrKey::new(function_id, InstrId::new(0)),
                     },
                     precision: LocalEnvResumeStatePrecision::InstructionBoundary,
                     locals: vec![binding],
@@ -15011,8 +15005,8 @@ def f(x):
         let entry_label = function.name_gen.next_block_name();
         let then_label = function.name_gen.next_block_name();
         let else_label = function.name_gen.next_block_name();
-        let add_instr_id = InstrId::new(entry_label, 2);
-        let compare_instr_id = InstrId::new(entry_label, 4);
+        let add_instr_id = InstrId::new(2);
+        let compare_instr_id = InstrId::new(4);
         let entry = CodegenBlock {
             label: entry_label,
             body: vec![],
@@ -15023,18 +15017,12 @@ def f(x):
                         with_instr_id(
                             op_expr(BinOp::new(
                                 BinOpKind::Add,
-                                with_instr_id(
-                                    name_expr(test_name("a")),
-                                    InstrId::new(entry_label, 0),
-                                ),
-                                with_instr_id(
-                                    name_expr(test_local_name("b", 1)),
-                                    InstrId::new(entry_label, 1),
-                                ),
+                                with_instr_id(name_expr(test_name("a")), InstrId::new(0)),
+                                with_instr_id(name_expr(test_local_name("b", 1)), InstrId::new(1)),
                             )),
                             add_instr_id,
                         ),
-                        with_instr_id(constants.int_expr(0), InstrId::new(entry_label, 3)),
+                        with_instr_id(constants.int_expr(0), InstrId::new(3)),
                     )),
                     compare_instr_id,
                 ),
@@ -15166,9 +15154,9 @@ def f(x):
         let test_label = function.name_gen.next_block_name();
         let then_label = function.name_gen.next_block_name();
         let else_label = function.name_gen.next_block_name();
-        let store_instr_id = InstrId::new(entry_label, 0);
-        let add_instr_id = InstrId::new(entry_label, 1);
-        let compare_instr_id = InstrId::new(test_label, 0);
+        let store_instr_id = InstrId::new(0);
+        let add_instr_id = InstrId::new(1);
+        let compare_instr_id = InstrId::new(2);
         let c_name = test_local_name("c", 2);
         let entry = CodegenBlock {
             label: entry_label,
@@ -15344,18 +15332,15 @@ def f(x):
                 ],
             };
             let block_label = function.name_gen.next_block_name();
-            let op_instr_id = InstrId::new(block_label, 2);
+            let op_instr_id = InstrId::new(2);
             function.blocks = vec![CodegenBlock {
                 label: block_label,
                 body: vec![],
                 term: ret_term(with_instr_id(
                     op_expr(BinOp::new(
                         kind,
-                        with_instr_id(name_expr(test_name("a")), InstrId::new(block_label, 0)),
-                        with_instr_id(
-                            name_expr(test_local_name("b", 1)),
-                            InstrId::new(block_label, 1),
-                        ),
+                        with_instr_id(name_expr(test_name("a")), InstrId::new(0)),
+                        with_instr_id(name_expr(test_local_name("b", 1)), InstrId::new(1)),
                     )),
                     op_instr_id,
                 )),
@@ -15456,18 +15441,15 @@ def f(x):
                 ],
             };
             let block_label = function.name_gen.next_block_name();
-            let op_instr_id = InstrId::new(block_label, 2);
+            let op_instr_id = InstrId::new(2);
             function.blocks = vec![CodegenBlock {
                 label: block_label,
                 body: vec![],
                 term: ret_term(with_instr_id(
                     op_expr(BinOp::new(
                         kind,
-                        with_instr_id(name_expr(test_name("a")), InstrId::new(block_label, 0)),
-                        with_instr_id(
-                            name_expr(test_local_name("b", 1)),
-                            InstrId::new(block_label, 1),
-                        ),
+                        with_instr_id(name_expr(test_name("a")), InstrId::new(0)),
+                        with_instr_id(name_expr(test_local_name("b", 1)), InstrId::new(1)),
                     )),
                     op_instr_id,
                 )),
@@ -15562,18 +15544,15 @@ def f(x):
             ],
         };
         let block_label = function.name_gen.next_block_name();
-        let compare_instr_id = InstrId::new(block_label, 2);
+        let compare_instr_id = InstrId::new(2);
         function.blocks = vec![CodegenBlock {
             label: block_label,
             body: vec![],
             term: ret_term(with_instr_id(
                 op_expr(BinOp::new(
                     BinOpKind::Lt,
-                    with_instr_id(name_expr(test_name("a")), InstrId::new(block_label, 0)),
-                    with_instr_id(
-                        name_expr(test_local_name("b", 1)),
-                        InstrId::new(block_label, 1),
-                    ),
+                    with_instr_id(name_expr(test_name("a")), InstrId::new(0)),
+                    with_instr_id(name_expr(test_local_name("b", 1)), InstrId::new(1)),
                 )),
                 compare_instr_id,
             )),
@@ -15725,7 +15704,7 @@ def f(x):
         let caller_id = caller.function_id;
         let callee_id = callee.function_id;
         let module = test_module(module_name_gen, vec![caller, callee]);
-        let source = InstrId::new(BlockLabel::from_index(0), 11);
+        let source = InstrId::new(11);
         let serialized_caller =
             SerializedFunctionId::new(SerializedModuleId::new(0), caller_id.local_function_id());
         let serialized_callee =
@@ -15851,7 +15830,7 @@ def f(x):
             },
         ])
         .expect("precompile module index should build");
-        let source = InstrId::new(BlockLabel::from_index(0), 11);
+        let source = InstrId::new(11);
         let serialized_caller =
             SerializedFunctionId::new(SerializedModuleId::new(0), caller_id.local_function_id());
         let serialized_callee =
@@ -15971,8 +15950,8 @@ def f(x):
             ],
         };
         let block_label = caller.name_gen.next_block_name();
-        let load_source = InstrId::new(block_label, 11);
-        let store_source = InstrId::new(block_label, 13);
+        let load_source = InstrId::new(11);
+        let store_source = InstrId::new(13);
         caller.blocks = vec![CodegenBlock {
             label: block_label,
             body: vec![with_instr_id(
@@ -16164,8 +16143,8 @@ def f(x):
     #[test]
     fn planned_precompile_inputs_consume_v3_emitted_indexed_globals() {
         let module_name_gen = ModuleNameGen::new(7);
-        let load_source = InstrId::new(BlockLabel::from_index(0), 11);
-        let store_source = InstrId::new(BlockLabel::from_index(0), 13);
+        let load_source = InstrId::new(11);
+        let store_source = InstrId::new(13);
         let caller = with_single_test_block(
             test_function_in_module(&module_name_gen, "caller"),
             vec![with_instr_id(
@@ -16483,8 +16462,8 @@ def f(x):
     #[test]
     fn codegen_consumes_v3_indexed_global_instr_typed_plan_without_legacy_counters() {
         let module_name_gen = ModuleNameGen::new(7);
-        let load_source = InstrId::new(BlockLabel::from_index(0), 11);
-        let store_source = InstrId::new(BlockLabel::from_index(0), 13);
+        let load_source = InstrId::new(11);
+        let store_source = InstrId::new(13);
         let function = indexed_global_test_function(&module_name_gen, load_source, store_source);
         let mut module = test_module(module_name_gen, vec![function.clone()]);
         module.global_names = vec!["counter".to_string()];
@@ -16538,8 +16517,8 @@ def f(x):
     #[test]
     fn codegen_does_not_rediscover_indexed_globals_from_profile_counters() {
         let module_name_gen = ModuleNameGen::new(7);
-        let load_source = InstrId::new(BlockLabel::from_index(0), 11);
-        let store_source = InstrId::new(BlockLabel::from_index(0), 13);
+        let load_source = InstrId::new(11);
+        let store_source = InstrId::new(13);
         let function = indexed_global_test_function(&module_name_gen, load_source, store_source);
         let mut module = test_module(module_name_gen, vec![function.clone()]);
         module.global_names = vec!["counter".to_string()];
@@ -16775,7 +16754,7 @@ def read_point(point):
                 }],
             };
             let block_label = function.name_gen.next_block_name();
-            let getattr_instr_id = InstrId::new(block_label, 1);
+            let getattr_instr_id = InstrId::new(1);
             function.blocks = vec![CodegenBlock {
                 label: block_label,
                 body: vec![],
@@ -17131,7 +17110,7 @@ def write_point(point, value):
             ],
         };
         let block_label = function.name_gen.next_block_name();
-        let setattr_instr_id = InstrId::new(block_label, 1);
+        let setattr_instr_id = InstrId::new(1);
         function.blocks = vec![CodegenBlock {
             label: block_label,
             body: vec![with_instr_id(
@@ -17200,7 +17179,7 @@ def write_point(point, value):
             }],
         };
         let block_label = function.name_gen.next_block_name();
-        let getattr_instr_id = InstrId::new(block_label, 1);
+        let getattr_instr_id = InstrId::new(1);
         function.blocks = vec![CodegenBlock {
             label: block_label,
             body: vec![],
@@ -17254,7 +17233,7 @@ def write_point(point, value):
         let caller_id = caller.function_id;
         let callee_id = callee.function_id;
         let module = test_module(module_name_gen, vec![caller, callee]);
-        let source = InstrId::new(BlockLabel::from_index(0), 11);
+        let source = InstrId::new(11);
         let serialized_caller =
             SerializedFunctionId::new(SerializedModuleId::new(0), caller_id.local_function_id());
         let serialized_callee =
@@ -17339,7 +17318,7 @@ def write_point(point, value):
         let caller = test_function_in_module(&module_name_gen, "caller");
         let caller_id = caller.function_id;
         let module = test_module(module_name_gen, vec![caller]);
-        let source = InstrId::new(BlockLabel::from_index(0), 11);
+        let source = InstrId::new(11);
         let serialized_caller =
             SerializedFunctionId::new(SerializedModuleId::new(0), caller_id.local_function_id());
         let owner_type = IndexedFieldOwnerType {
@@ -17964,7 +17943,7 @@ def f(x, y):
                 },
             ]);
             let caller_block_label = caller_function.name_gen.next_block_name();
-            let call_instr_id = InstrId::new(caller_block_label, 1);
+            let call_instr_id = InstrId::new(1);
             caller_function = with_test_blocks(
                 caller_function,
                 vec![CodegenBlock {
@@ -18151,7 +18130,7 @@ def f(x, y):
             },
         ]);
         let caller_block_label = caller_function.name_gen.next_block_name();
-        let call_instr_id = InstrId::new(caller_block_label, 1);
+        let call_instr_id = InstrId::new(1);
         caller_function = with_test_blocks(
             caller_function,
             vec![CodegenBlock {
@@ -18273,7 +18252,7 @@ def f(x, y):
             let module_name_gen = ModuleNameGen::new(0);
             let mut function = test_function_in_module(&module_name_gen, "load_global");
             let block_label = function.name_gen.next_block_name();
-            let load_instr_id = InstrId::new(block_label, 0);
+            let load_instr_id = InstrId::new(0);
             function = with_test_blocks(
                 function,
                 vec![CodegenBlock {
@@ -18381,8 +18360,8 @@ class Point:
                 }],
             };
             let block_label = function.name_gen.next_block_name();
-            let setattr_instr_id = InstrId::new(block_label, 0);
-            let getattr_instr_id = InstrId::new(block_label, 1);
+            let setattr_instr_id = InstrId::new(0);
+            let getattr_instr_id = InstrId::new(1);
             function.blocks = vec![CodegenBlock {
                 label: block_label,
                 body: vec![with_instr_id(
@@ -18503,8 +18482,8 @@ class Point:
         let module_name_gen = ModuleNameGen::new(0);
         let mut function = test_function_in_module(&module_name_gen, "update_counter");
         let block_label = function.name_gen.next_block_name();
-        let store_instr_id = InstrId::new(block_label, 0);
-        let load_instr_id = InstrId::new(block_label, 1);
+        let store_instr_id = InstrId::new(0);
+        let load_instr_id = InstrId::new(1);
         function.blocks = vec![CodegenBlock {
             label: block_label,
             body: vec![with_instr_id(
@@ -18635,8 +18614,8 @@ class Point:
             ],
         };
         let block_label = function.name_gen.next_block_name();
-        let setitem_instr_id = InstrId::new(block_label, 0);
-        let getitem_instr_id = InstrId::new(block_label, 1);
+        let setitem_instr_id = InstrId::new(0);
+        let getitem_instr_id = InstrId::new(1);
         function.blocks = vec![CodegenBlock {
             label: block_label,
             body: vec![with_instr_id(
@@ -18749,9 +18728,9 @@ class Point:
         let entry_label = function.name_gen.next_block_name();
         let then_label = function.name_gen.next_block_name();
         let else_label = function.name_gen.next_block_name();
-        let branch_add_instr_id = InstrId::new(entry_label, 2);
-        let compare_instr_id = InstrId::new(entry_label, 4);
-        let return_add_instr_id = InstrId::new(then_label, 2);
+        let branch_add_instr_id = InstrId::new(2);
+        let compare_instr_id = InstrId::new(4);
+        let return_add_instr_id = InstrId::new(7);
         let mut constants = TestConstantPool::default();
         function.blocks = vec![
             CodegenBlock {
@@ -18764,18 +18743,15 @@ class Point:
                             with_instr_id(
                                 op_expr(BinOp::new(
                                     BinOpKind::Add,
-                                    with_instr_id(
-                                        name_expr(test_name("a")),
-                                        InstrId::new(entry_label, 0),
-                                    ),
+                                    with_instr_id(name_expr(test_name("a")), InstrId::new(0)),
                                     with_instr_id(
                                         name_expr(test_local_name("b", 1)),
-                                        InstrId::new(entry_label, 1),
+                                        InstrId::new(1),
                                     ),
                                 )),
                                 branch_add_instr_id,
                             ),
-                            with_instr_id(constants.int_expr(0), InstrId::new(entry_label, 3)),
+                            with_instr_id(constants.int_expr(0), InstrId::new(3)),
                         )),
                         compare_instr_id,
                     ),
@@ -18792,11 +18768,8 @@ class Point:
                 term: ret_term(with_instr_id(
                     op_expr(BinOp::new(
                         BinOpKind::Add,
-                        with_instr_id(name_expr(test_name("a")), InstrId::new(then_label, 0)),
-                        with_instr_id(
-                            name_expr(test_local_name("b", 1)),
-                            InstrId::new(then_label, 1),
-                        ),
+                        with_instr_id(name_expr(test_name("a")), InstrId::new(5)),
+                        with_instr_id(name_expr(test_local_name("b", 1)), InstrId::new(6)),
                     )),
                     return_add_instr_id,
                 )),
@@ -18936,9 +18909,9 @@ class Point:
         let test_label = function.name_gen.next_block_name();
         let then_label = function.name_gen.next_block_name();
         let else_label = function.name_gen.next_block_name();
-        let store_instr_id = InstrId::new(entry_label, 0);
-        let add_instr_id = InstrId::new(entry_label, 1);
-        let compare_instr_id = InstrId::new(test_label, 0);
+        let store_instr_id = InstrId::new(0);
+        let add_instr_id = InstrId::new(1);
+        let compare_instr_id = InstrId::new(2);
         let c_name = test_local_name("c", 2);
         let mut constants = TestConstantPool::default();
         function.blocks = vec![
@@ -19509,7 +19482,7 @@ class Point:
 
         let caller_name_gen = module_name_gen.next_function_name_gen();
         let caller_function_id = caller_name_gen.function_id();
-        let call_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
+        let call_instr_id = InstrId::new(0);
         let callable_expr = if callable_replay_safe {
             name_expr(test_name("fn"))
         } else {
@@ -19746,7 +19719,7 @@ class Point:
 
             let caller_name_gen = module_name_gen.next_function_name_gen();
             let caller_function_id = caller_name_gen.function_id();
-            let call_instr_id = InstrId::new(BlockLabel::from_index(0), 0);
+            let call_instr_id = InstrId::new(0);
             let mut caller_function = BlockPyFunction {
                 function_id: caller_function_id,
                 name_gen: caller_name_gen,
@@ -20011,7 +19984,7 @@ class Point:
             },
         ]);
         let caller_block_label = caller_function.name_gen.next_block_name();
-        let call_instr_id = InstrId::new(caller_block_label, 1);
+        let call_instr_id = InstrId::new(1);
         caller_function = with_test_blocks(
             caller_function,
             vec![CodegenBlock {

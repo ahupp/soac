@@ -330,7 +330,7 @@ mod tests {
         build_function_qualname_map, format_counter_row, format_pretty_counter_row,
         should_emit_pretty_counter_row,
     };
-    use soac_core::block_py::{BlockLabel, InstrId, RuntimeFunctionId};
+    use soac_core::block_py::{InstrId, RuntimeFunctionId};
     use soac_core::profile::{
         CounterDumpBranchValueView, CounterDumpRecord, CounterDumpRow, CounterDumpRowView,
         parse_counter_dump_records, render_call_target_specializations,
@@ -345,7 +345,7 @@ mod tests {
             site_kind: "runtime",
             function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
             current_function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
-            instr_id: Some(InstrId::new(BlockLabel::from_index(2), 4)),
+            instr_id: Some(InstrId::new(4)),
             function_qualname: Some("pkg.mod.f"),
             block_label: None,
             value: 11,
@@ -375,7 +375,7 @@ mod tests {
             ),
             "{rendered}"
         );
-        assert!(rendered.contains("instr_id=bb2:4"), "{rendered}");
+        assert!(rendered.contains("instr_id=#4"), "{rendered}");
         assert!(rendered.contains("observed_value=12"), "{rendered}");
         assert!(rendered.contains("max_overcount=1"), "{rendered}");
     }
@@ -430,7 +430,7 @@ mod tests {
             site_kind: "runtime",
             function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
             current_function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
-            instr_id: Some(InstrId::new(BlockLabel::from_index(2), 4)),
+            instr_id: Some(InstrId::new(4)),
             function_qualname: Some("pkg.mod.f"),
             block_label: None,
             value: 11,
@@ -484,7 +484,7 @@ mod tests {
                 site_kind: "runtime",
                 function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
                 current_function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
-                instr_id: Some(InstrId::new(BlockLabel::from_index(2), 4)),
+                instr_id: Some(InstrId::new(4)),
                 function_qualname: Some("pkg.mod.caller"),
                 block_label: None,
                 value: 11,
@@ -532,7 +532,7 @@ mod tests {
             site_kind: "runtime",
             function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
             current_function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
-            instr_id: Some(InstrId::new(BlockLabel::from_index(0), 0)),
+            instr_id: Some(InstrId::new(0)),
             function_qualname: Some("add"),
             block_label: None,
             value: 0,
@@ -555,7 +555,7 @@ mod tests {
         let rendered = format_pretty_counter_row(&rows[0], &function_qualnames);
         assert_eq!(
             rendered,
-            "  counter=4 kind=getitem_specialized scope=this site=runtime function=add instr=bb0:0 value=0 branches=hit:3,fallback:1"
+            "  counter=4 kind=getitem_specialized scope=this site=runtime function=add instr=#0 value=0 branches=hit:3,fallback:1"
         );
     }
 
@@ -612,7 +612,7 @@ mod tests {
                     site_kind: "runtime".to_string(),
                     function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
                     current_function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
-                    instr_id: Some(InstrId::new(BlockLabel::from_index(2), 4)),
+                    instr_id: Some(InstrId::new(4)),
                     function_qualname: Some("pkg.mod.f".to_string()),
                     block_label: None,
                     value: 11,
@@ -629,7 +629,7 @@ mod tests {
                     site_kind: "runtime".to_string(),
                     function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
                     current_function_id: Some(RuntimeFunctionId::from_raw_parts(1, 7)),
-                    instr_id: Some(InstrId::new(BlockLabel::from_index(2), 4)),
+                    instr_id: Some(InstrId::new(4)),
                     function_qualname: Some("pkg.mod.f".to_string()),
                     block_label: None,
                     value: 5,
@@ -646,7 +646,7 @@ mod tests {
                     site_kind: "runtime".to_string(),
                     function_id: Some(RuntimeFunctionId::from_raw_parts(1, 8)),
                     current_function_id: Some(RuntimeFunctionId::from_raw_parts(1, 8)),
-                    instr_id: Some(InstrId::new(BlockLabel::from_index(3), 1)),
+                    instr_id: Some(InstrId::new(1)),
                     function_qualname: Some("pkg.mod.g".to_string()),
                     block_label: None,
                     value: 4,
@@ -661,7 +661,7 @@ mod tests {
                     site_kind: "runtime".to_string(),
                     function_id: Some(RuntimeFunctionId::from_raw_parts(1, 8)),
                     current_function_id: Some(RuntimeFunctionId::from_raw_parts(1, 8)),
-                    instr_id: Some(InstrId::new(BlockLabel::from_index(3), 2)),
+                    instr_id: Some(InstrId::new(2)),
                     function_qualname: Some("pkg.mod.h".to_string()),
                     block_label: None,
                     value: 4,
@@ -676,6 +676,6 @@ mod tests {
             parse_counter_dump_records(bytes.as_slice()).expect("counter dump should parse");
         let rendered =
             render_call_target_specializations(&records).expect("specializations should render");
-        assert_eq!(rendered, "mod|4294967303|2|4=4294967305,4294967306");
+        assert_eq!(rendered, "mod|4294967303|4=4294967305,4294967306");
     }
 }

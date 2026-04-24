@@ -676,9 +676,7 @@ fn plan_compact_int_add_gt_zero_branch(
     let hot_region = RegionPlan {
         id: region.id,
         source: RegionSource::Instr {
-            instr_id: shape
-                .source
-                .unwrap_or_else(|| InstrId::new(region.block, 0)),
+            instr_id: shape.source.unwrap_or_else(|| InstrId::new(0)),
         },
         inputs: vec![
             region_input(a_obj, 0, shape.left_name.clone()),
@@ -816,9 +814,7 @@ fn plan_compact_int_compare_constant_branch(
     let hot_region = RegionPlan {
         id: region.id,
         source: RegionSource::Instr {
-            instr_id: shape
-                .source
-                .unwrap_or_else(|| InstrId::new(region.block, 0)),
+            instr_id: shape.source.unwrap_or_else(|| InstrId::new(0)),
         },
         inputs: vec![region_input(value_obj, 0, shape.value_name.clone())],
         nodes: vec![
@@ -933,9 +929,7 @@ fn plan_compact_int_binary_return(
     let hot_region = RegionPlan {
         id: region.id,
         source: RegionSource::Instr {
-            instr_id: shape
-                .source
-                .unwrap_or_else(|| InstrId::new(region.block, 0)),
+            instr_id: shape.source.unwrap_or_else(|| InstrId::new(0)),
         },
         inputs: vec![
             region_input(a_obj, 0, shape.left_name.clone()),
@@ -1021,9 +1015,7 @@ fn plan_compact_int_compare_branch(
     let hot_region = RegionPlan {
         id: region.id,
         source: RegionSource::Instr {
-            instr_id: shape
-                .source
-                .unwrap_or_else(|| InstrId::new(region.block, 0)),
+            instr_id: shape.source.unwrap_or_else(|| InstrId::new(0)),
         },
         inputs: vec![
             region_input(a_obj, 0, shape.left_name.clone()),
@@ -1123,9 +1115,7 @@ fn plan_compact_int_compare_return(
     let hot_region = RegionPlan {
         id: region.id,
         source: RegionSource::Instr {
-            instr_id: shape
-                .source
-                .unwrap_or_else(|| InstrId::new(region.block, 0)),
+            instr_id: shape.source.unwrap_or_else(|| InstrId::new(0)),
         },
         inputs: vec![
             region_input(a_obj, 0, shape.left_name.clone()),
@@ -1619,8 +1609,8 @@ mod tests {
         BlockLabel::from_index(index)
     }
 
-    fn instr_id_in_label(block: BlockLabel, index: u32) -> InstrId {
-        InstrId::new(block, index)
+    fn instr_id_in_label(_block: BlockLabel, index: u32) -> InstrId {
+        InstrId::new(index)
     }
 
     fn with_instr_id(instr: InstrCodegen, index: u32) -> InstrCodegen {
@@ -1831,7 +1821,7 @@ mod tests {
     #[test]
     fn plans_same_module_direct_call_selection_from_profiled_targets() {
         let mut request = module_request_regions(Vec::new());
-        let source = InstrId::new(label(0), 9);
+        let source = InstrId::new(9);
         let target = SerializedFunctionId::new(SerializedModuleId::new(0), LocalFunctionId::new(2));
         request.functions[0].direct_calls = vec![
             DirectCallPlanRequest {
@@ -1874,7 +1864,7 @@ mod tests {
     #[test]
     fn direct_call_body_cost_model_declines_inline_without_candidate() {
         let mut request = module_request_regions(Vec::new());
-        let source = InstrId::new(label(0), 9);
+        let source = InstrId::new(9);
         let target = SerializedFunctionId::new(SerializedModuleId::new(0), LocalFunctionId::new(2));
         request.functions[0].direct_calls = vec![DirectCallPlanRequest {
             source,
@@ -1898,8 +1888,8 @@ mod tests {
     #[test]
     fn plans_exact_list_item_selection_from_profiled_shapes() {
         let mut request = module_request_regions(Vec::new());
-        let get_source = InstrId::new(label(0), 9);
-        let set_source = InstrId::new(label(0), 11);
+        let get_source = InstrId::new(9);
+        let set_source = InstrId::new(11);
         request.functions[0].exact_list_items = vec![
             ExactListItemPlanRequest {
                 source: get_source,
@@ -1941,8 +1931,8 @@ mod tests {
     #[test]
     fn plans_indexed_field_selections_from_profiled_type_keys() {
         let mut request = module_request_regions(Vec::new());
-        let load_source = InstrId::new(label(0), 9);
-        let store_source = InstrId::new(label(0), 3);
+        let load_source = InstrId::new(9);
+        let store_source = InstrId::new(3);
         let owner_type = IndexedFieldOwnerType {
             module_name: "pkg.model".to_string(),
             qualname: "Record".to_string(),

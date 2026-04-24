@@ -289,8 +289,6 @@ mod tests {
     use crate::plan_v3::{
         IndexedFieldGuardKind, IndexedFieldOwnerType, IndexedFieldSpecializationPlan,
     };
-    use soac_core::block_py::BlockLabel;
-
     fn field_plan(
         module_name: &str,
         qualname: &str,
@@ -298,7 +296,7 @@ mod tests {
         expected_index: u32,
         access: IndexedFieldAccessKind,
     ) -> IndexedFieldAccessPlan {
-        let source = InstrId::new(BlockLabel::from_index(0), expected_index);
+        let source = InstrId::new(expected_index);
         let emitted = IndexedFieldSpecializationPlan {
             source,
             access,
@@ -363,7 +361,7 @@ mod tests {
 
     #[test]
     fn prepare_indexed_field_accesses_dedupes_before_runtime_resolution() {
-        let instr_id = InstrId::new(BlockLabel::from_index(1), 4);
+        let instr_id = InstrId::new(4);
         let plan = field_plan("module", "Owner", "field", 7, IndexedFieldAccessKind::Load);
         let mut by_instr = HashMap::new();
         by_instr.insert(instr_id, vec![plan.clone(), plan]);
@@ -389,7 +387,7 @@ mod tests {
 
     #[test]
     fn prepared_indexed_field_access_plan_validates_requested_access() {
-        let instr_id = InstrId::new(BlockLabel::from_index(1), 4);
+        let instr_id = InstrId::new(4);
         let resolved = ResolvedIndexedFieldAccess {
             access: IndexedFieldAccessKind::Load,
             attr_name: "field".to_string(),

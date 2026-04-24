@@ -1557,8 +1557,7 @@ pub fn lower_codegen_function_to_typed(
 }
 
 struct MissingTypedBlockInstrIdAssigner<'a> {
-    block_label: BlockLabel,
-    next_instr_index_in_block: u32,
+    next_instr_index: u32,
     used: &'a mut HashSet<InstrId>,
 }
 
@@ -1567,23 +1566,20 @@ impl MissingTypedBlockInstrIdAssigner<'_> {
         if expr.try_semantic_instr_id().is_some() {
             return;
         }
-        while self.used.contains(&InstrId::new(
-            self.block_label,
-            self.next_instr_index_in_block,
-        )) {
-            self.next_instr_index_in_block = self
-                .next_instr_index_in_block
+        while self.used.contains(&InstrId::new(self.next_instr_index)) {
+            self.next_instr_index = self
+                .next_instr_index
                 .checked_add(1)
-                .expect("per-block instruction count should fit in u32");
+                .expect("per-function instruction count should fit in u32");
         }
         let mut meta = expr.meta();
-        let instr_id = InstrId::new(self.block_label, self.next_instr_index_in_block);
+        let instr_id = InstrId::new(self.next_instr_index);
         meta.instr_id = Some(instr_id);
         self.used.insert(instr_id);
-        self.next_instr_index_in_block = self
-            .next_instr_index_in_block
+        self.next_instr_index = self
+            .next_instr_index
             .checked_add(1)
-            .expect("per-block instruction count should fit in u32");
+            .expect("per-function instruction count should fit in u32");
         *expr = expr.clone().with_meta(meta);
     }
 }
@@ -1598,11 +1594,11 @@ impl VisitMut<InstrTyped> for MissingTypedBlockInstrIdAssigner<'_> {
 pub fn assign_missing_typed_function_instr_ids(
     function: &mut BlockPyFunction<TypedCodegenModuleShape>,
 ) {
-    let mut next_by_block = HashMap::new();
+    let mut next_instr_index = 0;
     let mut used = HashSet::new();
     {
         struct MaxIdCollector<'a> {
-            next_by_block: &'a mut HashMap<BlockLabel, u32>,
+            next_instr_index: &'a mut u32,
             used: &'a mut HashSet<InstrId>,
         }
 
@@ -1610,32 +1606,29 @@ pub fn assign_missing_typed_function_instr_ids(
             fn visit_instr(&mut self, expr: &InstrTyped) {
                 if let Some(instr_id) = expr.try_semantic_instr_id() {
                     self.used.insert(instr_id);
-                    let next = instr_id
-                        .instr_index_in_block()
-                        .checked_add(1)
-                        .expect("per-block instruction count should fit in u32");
-                    self.next_by_block
-                        .entry(instr_id.block_label())
-                        .and_modify(|current| *current = (*current).max(next))
-                        .or_insert(next);
+                    *self.next_instr_index = (*self.next_instr_index).max(
+                        instr_id
+                            .index()
+                            .checked_add(1)
+                            .expect("per-function instruction count should fit in u32"),
+                    );
                 }
                 expr.visit_children(self);
             }
         }
 
         let mut collector = MaxIdCollector {
-            next_by_block: &mut next_by_block,
+            next_instr_index: &mut next_instr_index,
             used: &mut used,
         };
         collector.visit_fn(function);
     }
 
+    let mut assigner = MissingTypedBlockInstrIdAssigner {
+        next_instr_index,
+        used: &mut used,
+    };
     for block in &mut function.blocks {
-        let mut assigner = MissingTypedBlockInstrIdAssigner {
-            block_label: block.label,
-            next_instr_index_in_block: next_by_block.remove(&block.label).unwrap_or(0),
-            used: &mut used,
-        };
         assigner.visit_block_mut(block);
     }
 }

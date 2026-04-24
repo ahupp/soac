@@ -452,7 +452,7 @@ mod tests {
             "call_hot_targets",
             CounterSite::Runtime {
                 function_id: Some(RuntimeFunctionId::from_raw_parts(1, 2)),
-                instr_id: Some(InstrId::new(BlockLabel::from_index(3), 4)),
+                instr_id: Some(InstrId::new(4)),
             },
         );
         let second = builder.define(
@@ -472,7 +472,7 @@ mod tests {
     fn counter_builder_reuses_existing_definition() {
         let site = CounterSite::Runtime {
             function_id: Some(RuntimeFunctionId::from_raw_parts(1, 2)),
-            instr_id: Some(InstrId::new(BlockLabel::from_index(0), 7)),
+            instr_id: Some(InstrId::new(7)),
         };
         let mut defs = vec![CounterDef {
             id: CounterId(9),
@@ -496,7 +496,7 @@ mod tests {
     fn counter_builder_defines_from_counter_spec() {
         let spec = CallHotTargetsCounterSpec {
             function_id: RuntimeFunctionId::from_raw_parts(1, 2),
-            instr_id: InstrId::new(BlockLabel::from_index(3), 4),
+            instr_id: InstrId::new(4),
         };
         let mut defs = Vec::new();
         let handle = CounterBuilder::new(&mut defs).define_spec(&spec);
@@ -508,7 +508,7 @@ mod tests {
             defs[0].site,
             CounterSite::Runtime {
                 function_id: Some(RuntimeFunctionId::from_raw_parts(1, 2)),
-                instr_id: Some(InstrId::new(BlockLabel::from_index(3), 4)),
+                instr_id: Some(InstrId::new(4)),
             }
         );
     }

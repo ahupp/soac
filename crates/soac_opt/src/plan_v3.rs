@@ -2187,9 +2187,7 @@ fn finish_validation(errors: Vec<String>) -> Result<(), PlanValidationError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soac_core::block_py::{
-        BlockLabel, LocalFunctionId, SerializedModuleId, SerializedModuleIdentity,
-    };
+    use soac_core::block_py::{LocalFunctionId, SerializedModuleId, SerializedModuleIdentity};
 
     fn function_id() -> SerializedFunctionId {
         SerializedFunctionId::new(SerializedModuleId::new(0), LocalFunctionId::new(1))
@@ -2276,7 +2274,7 @@ mod tests {
     }
 
     fn instr_id(index: u32) -> InstrId {
-        InstrId::new(BlockLabel::from_index(0), index)
+        InstrId::new(index)
     }
 
     fn direct_call_body() -> CallBodyPlan {

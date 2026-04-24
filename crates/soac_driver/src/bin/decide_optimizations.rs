@@ -149,7 +149,7 @@ fn print_usage() {
 mod test {
     use super::*;
     use soac_core::block_py::{
-        BlockLabel, BlockPyFunction, ChildVisitable, HasSemanticInstrId, InstrId, ModuleNameGen,
+        BlockPyFunction, ChildVisitable, HasSemanticInstrId, InstrId, ModuleNameGen,
         RuntimeFunctionId, Visit,
     };
     use soac_core::profile::{
@@ -207,7 +207,7 @@ mod test {
             .find(|function| function.names.qualname == "f")
             .map(|function| function.function_id)
             .expect("test module should contain f");
-        let instr_id = InstrId::new(BlockLabel::from_index(0), 0);
+        let instr_id = InstrId::new(0);
         let counters_path = root.join("profile.bin");
         let mut counters = counter_record(module_name, source_hash, function_id, instr_id)
             .encode()
@@ -306,7 +306,7 @@ mod test {
             "def h(obj):\n    return obj.x\n",
             12,
         );
-        let instr_id = InstrId::new(BlockLabel::from_index(0), 0);
+        let instr_id = InstrId::new(0);
         let mut counters =
             counter_record("pkg.first", first.source_hash, first.function_id, instr_id)
                 .encode()
@@ -380,7 +380,7 @@ mod test {
             "def f(a, b):\n    return a + b\n",
             17,
         );
-        let instr_id = InstrId::new(BlockLabel::from_index(0), 0);
+        let instr_id = InstrId::new(0);
         let counters = counter_record(
             module_name,
             module.source_hash,
@@ -562,7 +562,7 @@ mod test {
             "def f(obj):\n    return obj.x\n",
             13,
         );
-        let instr_id = InstrId::new(BlockLabel::from_index(0), 0);
+        let instr_id = InstrId::new(0);
         let counters = counter_record(
             "pkg.scanned",
             module.source_hash,
@@ -767,7 +767,7 @@ mod test {
                 site_kind: "operator_hot_shapes".to_string(),
                 function_id: Some(function_id),
                 current_function_id: Some(function_id),
-                instr_id: Some(InstrId::new(BlockLabel::from_index(0), 0)),
+                instr_id: Some(InstrId::new(0)),
                 function_qualname: Some("unrelated".to_string()),
                 block_label: Some("bb0".to_string()),
                 value: 1,

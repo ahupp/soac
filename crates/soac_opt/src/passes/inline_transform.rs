@@ -3290,7 +3290,7 @@ def caller(x):
         let callee_a = local_location(callee, "a");
         let mut bound_x = local_load(&caller, "x");
         let mut bound_x_meta = bound_x.meta();
-        bound_x_meta.instr_id = Some(InstrId::new(BlockLabel::from_index(20_000), 7));
+        bound_x_meta.instr_id = Some(InstrId::new(7));
         bound_x = bound_x.with_meta(bound_x_meta);
         let mut bindings = InlineValueBindings::new();
         bindings.insert(callee_a, bound_x);

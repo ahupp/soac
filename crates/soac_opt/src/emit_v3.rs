@@ -1644,8 +1644,7 @@ mod tests {
         RegionExitPlan, RegionInput, RegionInputSource, RegionPlan, RegionSource, Rep,
     };
     use soac_core::block_py::{
-        BlockLabel, LocalFunctionId, SerializedIdentityTables, SerializedModuleId,
-        SerializedModuleIdentity,
+        LocalFunctionId, SerializedIdentityTables, SerializedModuleId, SerializedModuleIdentity,
     };
 
     fn inline_call_body() -> CallBodyPlan {
@@ -2045,7 +2044,7 @@ mod tests {
     #[test]
     fn emits_direct_call_decisions_mechanically() {
         let mut plan = test_plan(true);
-        let source = InstrId::new(BlockLabel::from_index(0), 7);
+        let source = InstrId::new(7);
         let target = SerializedFunctionId::new(SerializedModuleId::new(0), LocalFunctionId::new(2));
         let body = inline_call_body();
         plan.functions[0]
@@ -2079,8 +2078,8 @@ mod tests {
     #[test]
     fn emits_exact_list_item_decisions_mechanically() {
         let mut plan = test_plan(true);
-        let get_source = InstrId::new(BlockLabel::from_index(0), 7);
-        let set_source = InstrId::new(BlockLabel::from_index(0), 9);
+        let get_source = InstrId::new(7);
+        let set_source = InstrId::new(9);
         let guard = ExactListItemGuardPlan {
             kind: ExactListItemGuardKind::ExactListExactCompactIntInBounds,
         };
@@ -2136,8 +2135,8 @@ mod tests {
     #[test]
     fn emits_indexed_field_decisions_mechanically() {
         let mut plan = test_plan(true);
-        let load_source = InstrId::new(BlockLabel::from_index(0), 7);
-        let store_source = InstrId::new(BlockLabel::from_index(0), 9);
+        let load_source = InstrId::new(7);
+        let store_source = InstrId::new(9);
         let owner_type = IndexedFieldOwnerType {
             module_name: "pkg.model".to_string(),
             qualname: "Record".to_string(),
@@ -2209,8 +2208,8 @@ mod tests {
     #[test]
     fn emits_indexed_global_decisions_mechanically() {
         let mut plan = test_plan(true);
-        let load_source = InstrId::new(BlockLabel::from_index(0), 7);
-        let store_source = InstrId::new(BlockLabel::from_index(0), 9);
+        let load_source = InstrId::new(7);
+        let store_source = InstrId::new(9);
         plan.functions[0]
             .indexed_globals
             .push(IndexedGlobalSpecializationPlan {

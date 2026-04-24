@@ -447,7 +447,7 @@ fn push_unique<T: Eq>(values: &mut Vec<T>, value: T) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soac_core::block_py::{BlockLabel, InstrId};
+    use soac_core::block_py::InstrId;
     use soac_core::profile::{
         CounterDumpKeyLayout, CounterDumpRecord, CounterDumpRow, CounterDumpTypeKey,
         CounterDumpTypeKeyLayout, CounterDumpTypeTableEntry,
@@ -458,7 +458,7 @@ mod tests {
     #[test]
     fn profile_evidence_store_loads_counter_dump_once_into_function_views() {
         let function_id = RuntimeFunctionId::from_raw_parts(7, 1);
-        let instr_id = InstrId::new(BlockLabel::from_index(3), 4);
+        let instr_id = InstrId::new(4);
         let target_id = RuntimeFunctionId::from_raw_parts(7, 2);
         let target_persistent = PersistentFunctionId::new(
             ModuleContentId::new("pkg.mod", 0x1234),
@@ -566,7 +566,7 @@ mod tests {
         let caller_id = RuntimeFunctionId::from_raw_parts(7, 1);
         let target_id = RuntimeFunctionId::from_raw_parts(8, 2);
         let unrelated_callee_id = RuntimeFunctionId::from_raw_parts(8, 99);
-        let instr_id = InstrId::new(BlockLabel::from_index(3), 4);
+        let instr_id = InstrId::new(4);
         let caller_record = CounterDumpRecord {
             source_hash: 0x1234,
             module_name: "pkg.caller".to_string(),

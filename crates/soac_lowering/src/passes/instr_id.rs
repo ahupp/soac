@@ -1,13 +1,12 @@
 use crate::block_py::{
-    walk_expr_mut, BlockLabel, BlockPyFunction, BlockPyModule, ChildVisitable, HasMeta,
-    HasSemanticInstrId, InstrCodegen, InstrId, InstrKey, Visit, VisitMut, WithMeta,
+    walk_expr_mut, BlockPyFunction, BlockPyModule, ChildVisitable, HasMeta, HasSemanticInstrId,
+    InstrCodegen, InstrId, InstrKey, Visit, VisitMut, WithMeta,
 };
 use crate::passes::CodegenModuleShape;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 struct BlockInstrIdAssigner {
-    block_label: BlockLabel,
-    next_instr_index_in_block: u32,
+    next_instr_index: u32,
 }
 
 impl BlockInstrIdAssigner {
@@ -16,14 +15,11 @@ impl BlockInstrIdAssigner {
         I: crate::block_py::Instr + ChildVisitable<I> + HasMeta + WithMeta + Clone,
     {
         let mut meta = expr.meta();
-        meta.instr_id = Some(InstrId::new(
-            self.block_label,
-            self.next_instr_index_in_block,
-        ));
-        self.next_instr_index_in_block = self
-            .next_instr_index_in_block
+        meta.instr_id = Some(InstrId::new(self.next_instr_index));
+        self.next_instr_index = self
+            .next_instr_index
             .checked_add(1)
-            .expect("per-block instruction count should fit in u32");
+            .expect("per-function instruction count should fit in u32");
         *expr = expr.clone().with_meta(meta);
     }
 }
@@ -39,13 +35,10 @@ impl VisitMut<InstrCodegen> for BlockInstrIdAssigner {
 }
 
 pub(crate) fn assign_function_instr_ids(function: &mut BlockPyFunction<CodegenModuleShape>) {
-    for block in &mut function.blocks {
-        let mut assigner = BlockInstrIdAssigner {
-            block_label: block.label,
-            next_instr_index_in_block: 0,
-        };
-        assigner.visit_block_mut(block);
-    }
+    let mut assigner = BlockInstrIdAssigner {
+        next_instr_index: 0,
+    };
+    assigner.visit_fn_mut(function);
 }
 
 pub fn reassign_codegen_function_instr_ids(function: &mut BlockPyFunction<CodegenModuleShape>) {
@@ -53,8 +46,7 @@ pub fn reassign_codegen_function_instr_ids(function: &mut BlockPyFunction<Codege
 }
 
 struct MissingBlockInstrIdAssigner<'a> {
-    block_label: BlockLabel,
-    next_instr_index_in_block: u32,
+    next_instr_index: u32,
     used: &'a mut HashSet<InstrId>,
 }
 
@@ -66,23 +58,20 @@ impl MissingBlockInstrIdAssigner<'_> {
         if expr.try_semantic_instr_id().is_some() {
             return;
         }
-        while self.used.contains(&InstrId::new(
-            self.block_label,
-            self.next_instr_index_in_block,
-        )) {
-            self.next_instr_index_in_block = self
-                .next_instr_index_in_block
+        while self.used.contains(&InstrId::new(self.next_instr_index)) {
+            self.next_instr_index = self
+                .next_instr_index
                 .checked_add(1)
-                .expect("per-block instruction count should fit in u32");
+                .expect("per-function instruction count should fit in u32");
         }
         let mut meta = expr.meta();
-        let instr_id = InstrId::new(self.block_label, self.next_instr_index_in_block);
+        let instr_id = InstrId::new(self.next_instr_index);
         meta.instr_id = Some(instr_id);
         self.used.insert(instr_id);
-        self.next_instr_index_in_block = self
-            .next_instr_index_in_block
+        self.next_instr_index = self
+            .next_instr_index
             .checked_add(1)
-            .expect("per-block instruction count should fit in u32");
+            .expect("per-function instruction count should fit in u32");
         *expr = expr.clone().with_meta(meta);
     }
 }
@@ -100,11 +89,11 @@ impl VisitMut<InstrCodegen> for MissingBlockInstrIdAssigner<'_> {
 pub fn assign_missing_codegen_function_instr_ids(
     function: &mut BlockPyFunction<CodegenModuleShape>,
 ) {
-    let mut next_by_block = HashMap::new();
+    let mut next_instr_index = 0;
     let mut used = HashSet::new();
     {
         struct MaxIdCollector<'a> {
-            next_by_block: &'a mut HashMap<BlockLabel, u32>,
+            next_instr_index: &'a mut u32,
             used: &'a mut HashSet<InstrId>,
         }
 
@@ -115,32 +104,29 @@ pub fn assign_missing_codegen_function_instr_ids(
             {
                 if let Some(instr_id) = expr.try_semantic_instr_id() {
                     self.used.insert(instr_id);
-                    let next = instr_id
-                        .instr_index_in_block()
-                        .checked_add(1)
-                        .expect("per-block instruction count should fit in u32");
-                    self.next_by_block
-                        .entry(instr_id.block_label())
-                        .and_modify(|current| *current = (*current).max(next))
-                        .or_insert(next);
+                    *self.next_instr_index = (*self.next_instr_index).max(
+                        instr_id
+                            .index()
+                            .checked_add(1)
+                            .expect("per-function instruction count should fit in u32"),
+                    );
                 }
                 crate::block_py::walk_expr(self, expr);
             }
         }
 
         let mut collector = MaxIdCollector {
-            next_by_block: &mut next_by_block,
+            next_instr_index: &mut next_instr_index,
             used: &mut used,
         };
         collector.visit_fn(function);
     }
 
+    let mut assigner = MissingBlockInstrIdAssigner {
+        next_instr_index,
+        used: &mut used,
+    };
     for block in &mut function.blocks {
-        let mut assigner = MissingBlockInstrIdAssigner {
-            block_label: block.label,
-            next_instr_index_in_block: next_by_block.remove(&block.label).unwrap_or(0),
-            used: &mut used,
-        };
         assigner.visit_block_mut(block);
     }
 }
@@ -235,16 +221,15 @@ pub fn validate_codegen_instr_ids(
 mod test {
     use super::validate_codegen_instr_ids;
     use crate::block_py::{
-        current_instr_locations, walk_block, BlockLabel, ChildVisitable, CounterId, HasMeta,
-        HasSemanticInstrId, InstrCodegen, InstrId, Meta, Visit, VisitMut, WithMeta,
+        current_instr_locations, ChildVisitable, CounterId, HasMeta, HasSemanticInstrId,
+        InstrCodegen, InstrId, Meta, Visit, VisitMut, WithMeta,
     };
     use crate::lower_python_to_blockpy_for_testing;
     use crate::passes::CodegenModuleShape;
     use soac_core::block_py::IncrementCounter;
-    use std::collections::HashMap;
 
     struct InstrIdCollector {
-        ids_by_block: HashMap<crate::block_py::BlockLabel, Vec<InstrId>>,
+        ids: Vec<InstrId>,
     }
 
     impl Visit<InstrCodegen> for InstrIdCollector {
@@ -253,10 +238,7 @@ mod test {
             InstrCodegen: ChildVisitable<InstrCodegen>,
         {
             let instr_id = expr.semantic_instr_id();
-            self.ids_by_block
-                .entry(instr_id.block_label())
-                .or_default()
-                .push(instr_id);
+            self.ids.push(instr_id);
             crate::block_py::walk_expr(self, expr);
         }
     }
@@ -332,7 +314,7 @@ mod test {
     }
 
     #[test]
-    fn assigns_sequential_instr_ids_per_block() {
+    fn assigns_sequential_instr_ids_per_function() {
         let lowered = lower_python_to_blockpy_for_testing(
             r#"
 def f(x):
@@ -353,19 +335,13 @@ def g(v):
             .iter()
             .find(|function| function.names.qualname == "f")
             .expect("missing lowered function f");
-        let mut collector = InstrIdCollector {
-            ids_by_block: HashMap::new(),
-        };
-        for block in &f.blocks {
-            walk_block(&mut collector, block);
-        }
+        let mut collector = InstrIdCollector { ids: Vec::new() };
+        collector.visit_fn(f);
 
-        for (block_label, ids) in &collector.ids_by_block {
-            let expected = (0..u32::try_from(ids.len()).unwrap())
-                .map(|instr_index_in_block| InstrId::new(*block_label, instr_index_in_block))
-                .collect::<Vec<_>>();
-            assert_eq!(*ids, expected);
-        }
+        let expected = (0..u32::try_from(collector.ids.len()).unwrap())
+            .map(InstrId::new)
+            .collect::<Vec<_>>();
+        assert_eq!(collector.ids, expected);
     }
 
     #[test]
@@ -431,7 +407,7 @@ def f(x):
     }
 
     #[test]
-    fn current_instr_locations_use_containing_block_not_embedded_id_label() {
+    fn current_instr_locations_track_containing_block_for_opaque_id() {
         let mut lowered = lower_python_to_blockpy_for_testing(
             r#"
 def f(x):
@@ -448,19 +424,14 @@ def f(x):
             .find(|function| function.names.qualname == "f")
             .expect("missing lowered function f");
         let containing_block = f.blocks[0].label;
-        let original_id = nth_instr_id(f, 0);
-        let stale_id = InstrId::new(
-            BlockLabel::from_index(999),
-            original_id.instr_index_in_block(),
-        );
-        set_nth_instr_id(f, 0, Some(stale_id));
+        let explicit_id = InstrId::new(999);
+        set_nth_instr_id(f, 0, Some(explicit_id));
 
         let locations = current_instr_locations(f);
         let location = locations
-            .get(&stale_id)
+            .get(&explicit_id)
             .expect("updated instruction id should be located");
         assert_eq!(location.block_label(), containing_block);
-        assert_ne!(location.block_label(), BlockLabel::from_index(999));
         assert_eq!(location.body_index(), Some(0));
     }
 

@@ -21,30 +21,22 @@ use std::fmt;
 )]
 #[rkyv(derive(Hash, PartialEq, Eq, Debug))]
 pub struct InstrId {
-    block_label: BlockLabel,
-    instr_index_in_block: u32,
+    index: u32,
 }
 
 impl InstrId {
-    pub const fn new(block_label: BlockLabel, instr_index_in_block: u32) -> Self {
-        Self {
-            block_label,
-            instr_index_in_block,
-        }
+    pub const fn new(index: u32) -> Self {
+        Self { index }
     }
 
-    pub const fn block_label(self) -> BlockLabel {
-        self.block_label
-    }
-
-    pub const fn instr_index_in_block(self) -> u32 {
-        self.instr_index_in_block
+    pub const fn index(self) -> u32 {
+        self.index
     }
 }
 
 impl fmt::Display for InstrId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}", self.block_label, self.instr_index_in_block)
+        write!(f, "#{}", self.index)
     }
 }
 

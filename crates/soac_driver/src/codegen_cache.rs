@@ -539,11 +539,11 @@ mod test {
         qualname: String,
         block_labels: Vec<u32>,
         block_body_lens: Vec<usize>,
-        instr_ids: Vec<(u32, u32)>,
+        instr_ids: Vec<u32>,
     }
 
     struct InstrIdCollector {
-        instr_ids: Vec<(u32, u32)>,
+        instr_ids: Vec<u32>,
     }
 
     impl Visit<InstrCodegen> for InstrIdCollector {
@@ -552,10 +552,7 @@ mod test {
             InstrCodegen: ChildVisitable<InstrCodegen>,
         {
             let instr_id = expr.semantic_instr_id();
-            self.instr_ids.push((
-                instr_id.block_label().as_u32(),
-                instr_id.instr_index_in_block(),
-            ));
+            self.instr_ids.push(instr_id.index());
             walk_expr(self, expr);
         }
     }
@@ -796,9 +793,7 @@ def outer():
         }
     }
 
-    fn instr_ids(
-        function: &soac_core::block_py::BlockPyFunction<CodegenModuleShape>,
-    ) -> Vec<(u32, u32)> {
+    fn instr_ids(function: &soac_core::block_py::BlockPyFunction<CodegenModuleShape>) -> Vec<u32> {
         let mut collector = InstrIdCollector {
             instr_ids: Vec::new(),
         };

@@ -1780,7 +1780,7 @@ mod tests {
     }
 
     fn instr_id(index: u32) -> InstrId {
-        InstrId::new(label(0), index)
+        InstrId::new(index)
     }
 
     fn with_instr_id(instr: InstrCodegen, index: u32) -> InstrCodegen {
@@ -2072,8 +2072,8 @@ mod tests {
 
     #[test]
     fn exact_list_item_requests_are_derived_from_raw_shape_evidence() {
-        let get_source = InstrId::new(label(0), 5);
-        let set_source = InstrId::new(label(0), 8);
+        let get_source = InstrId::new(5);
+        let set_source = InstrId::new(8);
         let block = Block::new(
             label(0),
             vec![
@@ -2121,8 +2121,8 @@ mod tests {
     #[test]
     fn indexed_field_requests_are_derived_from_raw_type_key_evidence() {
         let attr_name = constant_name(0);
-        let get_source = InstrId::new(label(0), 5);
-        let set_source = InstrId::new(label(0), 8);
+        let get_source = InstrId::new(5);
+        let set_source = InstrId::new(8);
         let block = Block::new(
             label(0),
             vec![
@@ -2198,8 +2198,8 @@ mod tests {
 
     #[test]
     fn indexed_global_requests_are_derived_from_raw_module_key_evidence() {
-        let load_source = InstrId::new(label(0), 5);
-        let store_source = InstrId::new(label(0), 8);
+        let load_source = InstrId::new(5);
+        let store_source = InstrId::new(8);
         let block = Block::new(
             label(0),
             vec![
@@ -2213,7 +2213,7 @@ mod tests {
                         ..Meta::synthetic()
                     }),
                 InstrCodegen::Load(Load::new(global_name("other", 2))).with_meta(Meta {
-                    instr_id: Some(InstrId::new(label(0), 11)),
+                    instr_id: Some(InstrId::new(11)),
                     ..Meta::synthetic()
                 }),
             ],

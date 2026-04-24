@@ -1273,7 +1273,7 @@ mod tests {
         RegionInput, RegionInputSource, RegionPlan, RegionSource, validate_module_plan_v3,
     };
     use soac_core::block_py::{
-        BlockLabel, InstrId, LocalFunctionId, SerializedFunctionId, SerializedIdentityTables,
+        InstrId, LocalFunctionId, SerializedFunctionId, SerializedIdentityTables,
         SerializedModuleId, SerializedModuleIdentity,
     };
 
@@ -1282,7 +1282,7 @@ mod tests {
     }
 
     fn instr_id(index: u32) -> InstrId {
-        InstrId::new(BlockLabel::from_index(0), index)
+        InstrId::new(index)
     }
 
     fn input(value: PlanValue, index: u32, name: &str) -> RegionInput {

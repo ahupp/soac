@@ -112,7 +112,7 @@ mod tests {
     }
 
     fn instr_id(index: u32) -> InstrId {
-        InstrId::new(label(0), index)
+        InstrId::new(index)
     }
 
     fn with_instr_id(
