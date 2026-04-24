@@ -1,7 +1,7 @@
 use ruff_python_ast::{self as ast, ModModule};
 use ruff_text_size::TextRange;
 use soac_core::block_py::{BlockPyModule, ModuleShape};
-pub use soac_core::pass_tracker::{NoopPassTracker, PassTiming, PassTracker, RecordingPassTracker};
+use soac_core::pass_tracker::RecordingPassTracker;
 
 fn blockpy_module_block_count<S>(module: &BlockPyModule<S>) -> usize
 where

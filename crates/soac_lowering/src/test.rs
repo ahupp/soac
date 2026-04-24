@@ -1,7 +1,7 @@
-use crate::pass_tracker::{PassTracker, RecordingPassTracker};
 use crate::passes::ast_to_ast::body::Suite;
 use crate::passes::InstrCodegen;
 use soac_core::block_py::{ChildVisitable, PrettyPrint, Visit};
+use soac_core::pass_tracker::{PassTracker, RecordingPassTracker};
 
 #[derive(Clone)]
 struct TestPrettySuite(Suite);
