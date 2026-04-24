@@ -16557,10 +16557,10 @@ def f(x):
     }
 
     #[test]
-    fn specialization_profile_consumes_v3_indexed_fields_as_codegen_inputs() {
+    fn specialization_profile_consumes_v3_indexed_fields_as_instr_typed_plans() {
         if crate::run_test_in_isolated_process_if_needed(
             module_path!(),
-            "specialization_profile_consumes_v3_indexed_fields_as_codegen_inputs",
+            "specialization_profile_consumes_v3_indexed_fields_as_instr_typed_plans",
         ) {
             return;
         }
@@ -16698,17 +16698,21 @@ def read_point(point):
                 None,
             )
             .expect("strict v3 indexed-field artifact should load");
-            let inputs = FunctionSpecializationInputs::from_profile(&profile, &function)
-                .expect("v3 indexed-field input should resolve to codegen guards");
-            assert!(
-                inputs
-                    .legacy_overlays
-                    .as_ref()
-                    .expect("legacy artifact path should carry sidecar overlays")
-                    .indexed_fields_by_instr
-                    .contains_key(&getattr_instr_id),
-                "v3 emitted indexed-field decision should become explicit v3 codegen input"
-            );
+            let mut typed_function = lower_codegen_function_to_typed(function.clone());
+            apply_profile_typed_plans_to_typed_function(&mut typed_function, Some(&profile))
+                .expect("v3 indexed-field input should resolve to typed guards");
+            let BlockTerm::Return(InstrTyped::GetAttrTyped(getattr)) =
+                &typed_function.blocks[0].term
+            else {
+                panic!("read_point should return a typed GetAttr");
+            };
+            let TypedAttrAccessPlan::IndexedField { source, guards } = &getattr.access else {
+                panic!("v3 emitted indexed-field decision should become an InstrTyped plan");
+            };
+            assert_eq!(*source, TypedIndexedFieldPlanSource::OptimizationPlanV3);
+            assert_eq!(getattr.semantic_instr_id(), getattr_instr_id);
+            assert_eq!(guards.len(), 1);
+            assert_eq!(guards[0].expected_index, 0);
 
             modules
                 .del_item("field_type_test")
@@ -16783,16 +16787,18 @@ def read_point(point):
                 guard_miss_deopt: false,
             };
 
-            let inputs = FunctionSpecializationInputs::from_profile(&profile, &function)
+            let mut typed_function = lower_codegen_function_to_typed(function);
+            apply_profile_typed_plans_to_typed_function(&mut typed_function, Some(&profile))
                 .expect("unresolvable v3 indexed-field owner should keep local fallback");
-            assert!(
-                !inputs
-                    .legacy_overlays
-                    .as_ref()
-                    .expect("legacy artifact path should carry sidecar overlays")
-                    .indexed_fields_by_instr
-                    .contains_key(&getattr_instr_id),
-                "unresolvable v3 indexed-field owner should not become codegen input"
+            let BlockTerm::Return(InstrTyped::GetAttrTyped(getattr)) =
+                &typed_function.blocks[0].term
+            else {
+                panic!("read_missing_owner should return a typed GetAttr");
+            };
+            assert_eq!(
+                getattr.access,
+                TypedAttrAccessPlan::Generic,
+                "unresolvable v3 indexed-field owner should not become an InstrTyped plan"
             );
         });
     }
@@ -16928,17 +16934,29 @@ def write_point(point, value):
                 None,
             )
             .expect("strict v3 indexed-field SetAttr artifact should load");
-            let inputs = FunctionSpecializationInputs::from_profile(&profile, &function)
-                .expect("v3 indexed-field SetAttr input should resolve to codegen guards");
-            assert!(
-                inputs
-                    .legacy_overlays
-                    .as_ref()
-                    .expect("legacy artifact path should carry sidecar overlays")
-                    .indexed_fields_by_instr
-                    .contains_key(&setattr_instr_id),
-                "v3 emitted indexed-field Store decision should become explicit v3 codegen input"
-            );
+            let mut typed_function = lower_codegen_function_to_typed(function.clone());
+            apply_profile_typed_plans_to_typed_function(&mut typed_function, Some(&profile))
+                .expect("v3 indexed-field SetAttr input should resolve to typed guards");
+            let setattr = typed_function
+                .blocks
+                .iter()
+                .flat_map(|block| block.body.iter())
+                .find_map(|instr| match instr {
+                    InstrTyped::SetAttrTyped(setattr)
+                        if setattr.semantic_instr_id() == setattr_instr_id =>
+                    {
+                        Some(setattr)
+                    }
+                    _ => None,
+                })
+                .expect("write_point should contain the planned typed SetAttr");
+            let TypedAttrAccessPlan::IndexedField { source, guards } = &setattr.access else {
+                panic!("v3 emitted indexed-field Store decision should become an InstrTyped plan");
+            };
+            assert_eq!(*source, TypedIndexedFieldPlanSource::OptimizationPlanV3);
+            assert_eq!(setattr.semantic_instr_id(), setattr_instr_id);
+            assert_eq!(guards.len(), 1);
+            assert_eq!(guards[0].expected_index, 0);
 
             let (hit_counter_id, hit_branch_id) = runtime_branch_counter_for(
                 &shared_state.lowered_module.counter_defs,
@@ -17114,8 +17132,6 @@ def write_point(point, value):
 
         let annotated = annotate_typed_attr_accesses(
             &mut typed_function,
-            &HashMap::new(),
-            &HashMap::new(),
             &opt_v3_indexed_fields_by_instr,
             true,
         )
@@ -17184,8 +17200,6 @@ def write_point(point, value):
 
         let annotated = annotate_typed_attr_accesses(
             &mut typed_function,
-            &HashMap::new(),
-            &HashMap::new(),
             &opt_v3_indexed_fields_by_instr,
             true,
         )

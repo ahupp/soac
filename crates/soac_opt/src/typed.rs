@@ -977,7 +977,6 @@ pub struct TypedIndexedFieldGuard {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TypedIndexedFieldPlanSource {
-    LegacyProfile,
     OptimizationPlanV3,
 }
 

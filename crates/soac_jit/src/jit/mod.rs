@@ -1496,7 +1496,9 @@ fn apply_profile_typed_plans_to_typed_function(
     let call_emissions =
         typed_call_emission_plans_for_profile_function(profile, function.function_id)?;
     lower_typed_function_call_emission_plans(function, &call_emissions)?;
+    annotate_typed_indexed_field_accesses_from_profile(function, profile)?;
     annotate_typed_indexed_global_accesses_from_profile(function, profile)?;
+    annotate_typed_exact_list_item_accesses_from_profile(function, profile)?;
     Ok(())
 }
 
@@ -2038,8 +2040,6 @@ fn apply_typed_v3_module_rewrites(
                     && function.scope.scope_kind != CallableScopeKind::Module);
             annotate_typed_attr_accesses(
                 function,
-                &HashMap::new(),
-                &HashMap::new(),
                 &opt_v3_indexed_fields_by_instr,
                 specialize_field_stores,
             )?;
@@ -7396,8 +7396,7 @@ impl IndexedFieldLoweringPlan {
         expected_access: PlanV3IndexedFieldAccessKind,
     ) -> Result<Option<Self>, String> {
         match source {
-            TypedIndexedFieldPlanSource::LegacyProfile
-            | TypedIndexedFieldPlanSource::OptimizationPlanV3 => {
+            TypedIndexedFieldPlanSource::OptimizationPlanV3 => {
                 Self::from_typed_guards(instr_id, source, guards, expected_access)
             }
         }
@@ -11159,13 +11158,10 @@ pub(super) fn codegen_constant_string_value<'a>(
 
 fn annotate_typed_attr_accesses(
     function: &mut BlockPyFunction<TypedCodegenModuleShape>,
-    _field_index_specializations: &HashMap<String, Vec<FieldIndexSpecialization>>,
-    field_index_specializations_by_instr: &HashMap<InstrId, Vec<FieldIndexSpecialization>>,
     opt_v3_indexed_fields_by_instr: &HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>,
     specialize_stores: bool,
 ) -> Result<usize, String> {
     struct Annotator<'a> {
-        field_index_specializations_by_instr: &'a HashMap<InstrId, Vec<FieldIndexSpecialization>>,
         opt_v3_indexed_fields_by_instr: &'a HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>,
         specialize_stores: bool,
         count: usize,
@@ -11173,26 +11169,6 @@ fn annotate_typed_attr_accesses(
     }
 
     impl Annotator<'_> {
-        fn legacy_guards_for_attr(
-            &self,
-            instr_id: InstrId,
-            _attr: &InstrTyped,
-        ) -> Option<TypedAttrAccessPlan> {
-            self.field_index_specializations_by_instr
-                .get(&instr_id)
-                .filter(|specializations| !specializations.is_empty())
-                .map(|specializations| {
-                    let guards = specializations
-                        .iter()
-                        .map(FieldIndexSpecialization::to_typed_guard)
-                        .collect::<Vec<_>>();
-                    TypedAttrAccessPlan::IndexedField {
-                        source: TypedIndexedFieldPlanSource::LegacyProfile,
-                        guards,
-                    }
-                })
-        }
-
         fn opt_v3_guards_for_attr(&mut self, instr_id: InstrId) -> Option<TypedAttrAccessPlan> {
             let accesses = self.opt_v3_indexed_fields_by_instr.get(&instr_id)?;
             let mut guards = Vec::with_capacity(accesses.len());
@@ -11208,7 +11184,6 @@ fn annotate_typed_attr_accesses(
         fn annotate_attr(
             &mut self,
             instr_id: InstrId,
-            attr: &InstrTyped,
             expected_access: PlanV3IndexedFieldAccessKind,
         ) -> Option<TypedAttrAccessPlan> {
             if self.opt_v3_indexed_fields_by_instr.contains_key(&instr_id) {
@@ -11223,7 +11198,7 @@ fn annotate_typed_attr_accesses(
                 }
                 return self.opt_v3_guards_for_attr(instr_id);
             }
-            self.legacy_guards_for_attr(instr_id, attr)
+            None
         }
     }
 
@@ -11234,21 +11209,17 @@ fn annotate_typed_attr_accesses(
             }
             match expr {
                 InstrTyped::GetAttrTyped(op) => {
-                    if let Some(access) = self.annotate_attr(
-                        op.semantic_instr_id(),
-                        op.attr.as_ref(),
-                        PlanV3IndexedFieldAccessKind::Load,
-                    ) {
+                    if let Some(access) = self
+                        .annotate_attr(op.semantic_instr_id(), PlanV3IndexedFieldAccessKind::Load)
+                    {
                         op.access = access;
                         self.count += 1;
                     }
                 }
                 InstrTyped::SetAttrTyped(op) if self.specialize_stores => {
-                    if let Some(access) = self.annotate_attr(
-                        op.semantic_instr_id(),
-                        op.attr.as_ref(),
-                        PlanV3IndexedFieldAccessKind::Store,
-                    ) {
+                    if let Some(access) = self
+                        .annotate_attr(op.semantic_instr_id(), PlanV3IndexedFieldAccessKind::Store)
+                    {
                         op.access = access;
                         self.count += 1;
                     }
@@ -11270,7 +11241,6 @@ fn annotate_typed_attr_accesses(
     }
 
     let mut annotator = Annotator {
-        field_index_specializations_by_instr,
         opt_v3_indexed_fields_by_instr,
         specialize_stores,
         count: 0,
@@ -11286,6 +11256,26 @@ fn annotate_typed_attr_accesses(
         }
     }
     Ok(annotator.count)
+}
+
+fn annotate_typed_indexed_field_accesses_from_profile(
+    function: &mut BlockPyFunction<TypedCodegenModuleShape>,
+    profile: &SpecializationProfile<'_>,
+) -> Result<(), String> {
+    let (_, _, opt_v3_indexed_fields_by_instr) =
+        profile.field_index_specialization_maps(function.function_id)?;
+    if opt_v3_indexed_fields_by_instr.is_empty() {
+        return Ok(());
+    }
+    let specialize_field_stores = profile.typed_specializations_embedded()
+        || (profile.behavior_change_indexed_stores
+            && function.scope.scope_kind != CallableScopeKind::Module);
+    annotate_typed_attr_accesses(
+        function,
+        &opt_v3_indexed_fields_by_instr,
+        specialize_field_stores,
+    )?;
+    Ok(())
 }
 
 fn typed_indexed_global_access_plan_from_opt_v3(
@@ -11513,6 +11503,20 @@ fn annotate_typed_exact_list_item_accesses(
         ));
     }
     Ok(annotator.count)
+}
+
+fn annotate_typed_exact_list_item_accesses_from_profile(
+    function: &mut BlockPyFunction<TypedCodegenModuleShape>,
+    profile: &SpecializationProfile<'_>,
+) -> Result<(), String> {
+    let Some(exact_list_items_by_instr) = profile
+        .opt_v3_emitted_exact_list_items
+        .get(&function.function_id)
+    else {
+        return Ok(());
+    };
+    annotate_typed_exact_list_item_accesses(function, exact_list_items_by_instr)?;
+    Ok(())
 }
 
 fn typed_exact_int_branch_plan_from_opt_v3(
@@ -12006,11 +12010,6 @@ impl PlannedOptimizationInputs {
 
 #[derive(Clone, Debug, Default)]
 struct LegacyFunctionSpecializationOverlays {
-    exact_list_items_by_instr: HashMap<InstrId, OptV3ExactListItemAccessPlan>,
-    field_index_specializations: HashMap<String, Vec<FieldIndexSpecialization>>,
-    field_index_specializations_by_instr: HashMap<InstrId, Vec<FieldIndexSpecialization>>,
-    indexed_fields_by_instr: HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>,
-    specialize_indexed_field_stores: bool,
     exact_int_branch_artifacts: Option<Arc<ExactIntBranchV3Artifacts>>,
 }
 
@@ -12431,22 +12430,7 @@ impl FunctionSpecializationInputs {
         let legacy_overlays = if profile.typed_specializations_embedded() {
             None
         } else {
-            let (
-                field_index_specializations,
-                field_index_specializations_by_instr,
-                indexed_fields_by_instr,
-            ) = profile.field_index_specialization_maps(function.function_id)?;
             Some(LegacyFunctionSpecializationOverlays {
-                exact_list_items_by_instr: profile
-                    .opt_v3_emitted_exact_list_items
-                    .get(&function.function_id)
-                    .cloned()
-                    .unwrap_or_default(),
-                field_index_specializations,
-                field_index_specializations_by_instr,
-                indexed_fields_by_instr,
-                specialize_indexed_field_stores: profile.behavior_change_indexed_stores
-                    && function.scope.scope_kind != CallableScopeKind::Module,
                 exact_int_branch_artifacts: profile
                     .opt_v3_exact_int_branch_artifacts
                     .get(&function.function_id)
@@ -26343,17 +26327,6 @@ fn prepare_specialized_typed_function(
     }
 
     if let Some(legacy_overlays) = legacy_overlays {
-        annotate_typed_attr_accesses(
-            &mut typed_function,
-            &legacy_overlays.field_index_specializations,
-            &legacy_overlays.field_index_specializations_by_instr,
-            &legacy_overlays.indexed_fields_by_instr,
-            legacy_overlays.specialize_indexed_field_stores,
-        )?;
-        annotate_typed_exact_list_item_accesses(
-            &mut typed_function,
-            &legacy_overlays.exact_list_items_by_instr,
-        )?;
         if let Some(exact_int_artifacts) = legacy_overlays.exact_int_branch_artifacts.as_deref() {
             annotate_typed_exact_int_selections(&mut typed_function, exact_int_artifacts)?;
         }
