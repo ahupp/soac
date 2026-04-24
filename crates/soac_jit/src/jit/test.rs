@@ -3123,6 +3123,38 @@ def build(values):
             .expect("test counter dump should be writable");
     }
 
+    fn count_typed_instrs(
+        function: &BlockPyFunction<TypedCodegenModuleShape>,
+        mut predicate: impl FnMut(&InstrTyped) -> bool,
+    ) -> usize {
+        struct Counter<'a, P> {
+            predicate: &'a mut P,
+            count: usize,
+        }
+
+        impl<P> Visit<InstrTyped> for Counter<'_, P>
+        where
+            P: FnMut(&InstrTyped) -> bool,
+        {
+            fn visit_instr(&mut self, expr: &InstrTyped)
+            where
+                InstrTyped: ChildVisitable<InstrTyped>,
+            {
+                if (self.predicate)(expr) {
+                    self.count += 1;
+                }
+                expr.visit_children(self);
+            }
+        }
+
+        let mut counter = Counter {
+            predicate: &mut predicate,
+            count: 0,
+        };
+        counter.visit_fn(function);
+        counter.count
+    }
+
     fn write_test_optimization_artifacts_v3(path: &Path, artifacts: &ExactIntBranchV3Artifacts) {
         write_optimization_artifacts_v3(path, artifacts)
             .expect("test optimization plan v3 should be writable");
@@ -17781,7 +17813,7 @@ def f(x, y):
             assert!(!profile.behavior_change_indexed_stores);
             assert!(!profile.guard_miss_deopt);
 
-            let module_plan = build_typed_v3_jit_module_plan(&shared_state.lowered_module)
+            let module_plan = build_typed_v3_jit_module_plan(&shared_state.lowered_module, None)
                 .expect("typed-v3 runtime should lower CodegenModuleShape to typed JIT");
             assert_eq!(module_plan.module.callable_defs.len(), 1);
             assert_eq!(
@@ -17938,8 +17970,9 @@ def f(x, y):
                 "the raw v3 planner can still record that inline won the body cost model"
             );
 
-            let module_plan = build_typed_v3_jit_module_plan(&shared_state.lowered_module)
-                .expect("typed-v3 runtime should lower the cached pre-opt module to typed JIT");
+            let module_plan =
+                build_typed_v3_jit_module_plan(&shared_state.lowered_module, Some(&profile))
+                    .expect("typed-v3 runtime should lower the cached pre-opt module to typed JIT");
             let planned_caller = module_plan
                 .module
                 .callable_defs
@@ -17954,7 +17987,45 @@ def f(x, y):
                     .opt_v3_call_emissions
                     .target_function_ids(),
                 vec![callee_id],
-                "typed-v3 direct-call slice should emit a direct-call guard before inline lowering is ported"
+                "typed-v3 direct-call planning should first lower the call site to a typed direct-call candidate"
+            );
+            assert_eq!(
+                profile
+                    .typed_inline_direct_calls(caller_id)
+                    .get(&call_instr_id)
+                    .map(Vec::len),
+                Some(1),
+                "typed-v3 should preserve inline-winning v3 body decisions for typed inlining"
+            );
+
+            let guarded_callable_calls = count_typed_instrs(planned_caller, |expr| {
+                matches!(expr, InstrTyped::GuardedCallableCallTyped(_))
+            });
+            let generic_typed_calls = count_typed_instrs(planned_caller, |expr| {
+                matches!(expr, InstrTyped::CallTyped(_))
+            });
+            let direct_call_guard_tests = planned_caller
+                .blocks
+                .iter()
+                .filter(|block| {
+                    matches!(
+                        &block.term,
+                        BlockTerm::IfTerm(term)
+                            if matches!(term.test, InstrTyped::DirectCallGuardTest(_))
+                    )
+                })
+                .count();
+            assert_eq!(
+                guarded_callable_calls, 0,
+                "inline-winning typed-v3 direct calls should be expanded into typed CFG instead of a local guarded call expression"
+            );
+            assert_eq!(
+                direct_call_guard_tests, 1,
+                "typed-v3 inlining should expose the direct-call guard as typed CFG"
+            );
+            assert_eq!(
+                generic_typed_calls, 1,
+                "typed-v3 inlining should keep a generic fallback call"
             );
         });
     }

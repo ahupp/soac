@@ -95,8 +95,11 @@ use soac_opt::passes::{
     TypedGuardedCallableCall, TypedGuardedMethodCall, TypedIndexedFieldGuard,
     TypedIndexedFieldPlanSource, TypedPlannedResult, TypedPyObjectOwnershipPlan, TypedSetAttr,
     ValueFacts, annotate_typed_function_planned_results, annotate_typed_function_result_demands,
-    annotate_typed_function_value_facts, infer_module_value_facts, lower_codegen_function_to_typed,
-    lower_typed_function_call_access_plan_instrs, lower_typed_function_call_emission_plans,
+    annotate_typed_function_value_facts, annotate_typed_module_value_facts,
+    assign_missing_typed_function_instr_ids, infer_module_value_facts,
+    inline_typed_function_direct_call_stores, lower_codegen_function_to_typed,
+    lower_codegen_module_to_typed, lower_typed_function_call_access_plan_instrs,
+    lower_typed_function_call_emission_plans, lower_typed_if_tests_to_truthy,
     refresh_typed_function_value_facts, try_lower_typed_instr_to_codegen_legacy,
     try_lower_typed_term_to_codegen_legacy, validate_typed_function_call_access_plans,
     validate_typed_function_value_facts,
@@ -104,7 +107,7 @@ use soac_opt::passes::{
 use soac_opt::pipeline_v3::plan_and_emit_module_v3_from_raw_evidence;
 use soac_opt::plan::ProfileEvidenceStore;
 use soac_opt::plan_v3::{
-    IndexedFieldAccessKind as PlanV3IndexedFieldAccessKind,
+    CallBodyKind, IndexedFieldAccessKind as PlanV3IndexedFieldAccessKind,
     IndexedGlobalAccessKind as PlanV3IndexedGlobalAccessKind, MaterializeKind, ModulePlanIdentity,
     PlanNodeId, PlanValue, RegionId, RegionPlan, Rep, RichCompareOp,
 };
@@ -1708,7 +1711,7 @@ impl JitBatchPlan<'_> {
                     Some(inputs.session.as_ref()),
                 )?;
                 if runtime_pipeline.uses_typed_v3_runtime() {
-                    build_typed_v3_jit_module_plan(&shared_state.lowered_module)?
+                    build_typed_v3_jit_module_plan(&shared_state.lowered_module, Some(&profile))?
                 } else if profile.optimized_module.is_some() {
                     build_profiled_jit_module_plan(&shared_state.lowered_module, &profile)?
                 } else {
@@ -1720,7 +1723,7 @@ impl JitBatchPlan<'_> {
                         build_jit_module_plan(inputs.module)?
                     }
                     RuntimeOptimizationPipeline::TypedV3 => {
-                        build_typed_v3_jit_module_plan(inputs.module)?
+                        build_typed_v3_jit_module_plan(inputs.module, None)?
                     }
                 }
             };
@@ -1842,8 +1845,47 @@ fn build_jit_module_plan(
 
 fn build_typed_v3_jit_module_plan(
     module: &BlockPyModule<CodegenModuleShape>,
+    profile: Option<&SpecializationProfile<'_>>,
 ) -> Result<Arc<JitModulePlan>, String> {
-    build_jit_module_plan(module)
+    let value_facts = infer_jit_value_facts(module);
+    let mut typed_module = lower_codegen_module_to_typed(module.clone());
+    annotate_typed_module_value_facts(&mut typed_module, &value_facts);
+    typed_module = lower_typed_if_tests_to_truthy(typed_module);
+    if let Some(profile) = profile {
+        apply_typed_v3_inline_module_rewrites(&mut typed_module, profile)?;
+    }
+    build_jit_module_plan_from_prepared_typed_module(plan_jit_typed_module(
+        typed_module,
+        value_facts,
+    )?)
+}
+
+fn apply_typed_v3_inline_module_rewrites(
+    module: &mut BlockPyModule<TypedCodegenModuleShape>,
+    profile: &SpecializationProfile<'_>,
+) -> Result<(), String> {
+    let callee_module = module.clone();
+    let external_callees = HashMap::new();
+    for function in &mut module.callable_defs {
+        let inline_direct_calls = profile.typed_inline_resolved_direct_calls(function.function_id);
+        if inline_direct_calls.is_empty() {
+            continue;
+        }
+        let inline_call_emissions = typed_call_emission_plans_from_v3(&inline_direct_calls)?;
+        lower_typed_function_call_emission_plans(function, &inline_call_emissions)?;
+        let inline_targets = profile.typed_inline_direct_calls(function.function_id);
+        let stats = inline_typed_function_direct_call_stores(
+            function,
+            &callee_module,
+            &external_callees,
+            &inline_targets,
+        );
+        if stats.rewritten_stores != 0 {
+            assign_missing_typed_function_instr_ids(function);
+            refresh_typed_function_value_facts(function);
+        }
+    }
+    Ok(())
 }
 
 fn build_profiled_jit_module_plan(
@@ -11894,6 +11936,49 @@ impl<'a> SpecializationProfile<'a> {
                 .cloned()
                 .unwrap_or_default(),
         }
+    }
+
+    fn typed_inline_direct_calls(
+        &self,
+        function_id: RuntimeFunctionId,
+    ) -> HashMap<InstrId, Vec<(RuntimeFunctionId, TypedDirectCallArgPlan)>> {
+        self.typed_inline_resolved_direct_calls(function_id)
+            .into_iter()
+            .map(|(source, plans)| {
+                (
+                    source,
+                    plans
+                        .into_iter()
+                        .map(|plan| (plan.target, plan.arg_plan))
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    fn typed_inline_resolved_direct_calls(
+        &self,
+        function_id: RuntimeFunctionId,
+    ) -> HashMap<InstrId, Vec<ResolvedV3DirectCallPlan>> {
+        if self.direct_call_emission_scope != DirectCallEmissionScope::AllDirectCallCandidates {
+            return HashMap::new();
+        }
+        self.opt_v3_emitted_direct_calls
+            .get(&function_id)
+            .map(|direct_calls| {
+                direct_calls
+                    .iter()
+                    .filter_map(|(source, plans)| {
+                        let inline_plans = plans
+                            .iter()
+                            .filter(|plan| plan.body.kind == CallBodyKind::Inline)
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        (!inline_plans.is_empty()).then_some((*source, inline_plans))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn field_index_specialization_maps(

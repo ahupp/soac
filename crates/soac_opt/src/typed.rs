@@ -3,12 +3,13 @@ use crate::passes::{BoolFacts, FactStore, PyObjFacts, ValueFacts, value_facts};
 use soac_core::block_py;
 #[allow(unused_imports)]
 use soac_core::block_py::{
-    BinOp, BlockPyFunction, BlockPyModule, BlockTerm, Call, CallArgKeyword, CallArgPositional,
-    CallDirect, CalleeFunctionId, CellRef, ChildVisitable, Del, DelItem, GetAttr, GetItem, HasMeta,
-    HasSemanticInstrId, Instr, InstrId, InstrKey, InstrWithConstantNone, Load, MakeCell,
-    MakeFunctionWithClosure, MapFunction, MapInstr, MapModule, Mappable, Meta, ModuleShape,
-    NameLike, PrettyPrint, PrettyPrinter, ResolvedName, RuntimeFunctionId, RuntimeName, SetAttr,
-    SetItem, Store, TryMapInstr, TryMapModule, TryMapTerm, Tuple, UnaryOp, Visit, VisitMut,
+    BinOp, Block, BlockEdge, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, Call,
+    CallArgKeyword, CallArgPositional, CallDirect, CalleeFunctionId, CellRef, ChildVisitable, Del,
+    DelItem, GetAttr, GetItem, HasMeta, HasSemanticInstrId, Instr, InstrId, InstrKey,
+    InstrWithConstantNone, Load, LocalLocation, MakeCell, MakeFunctionWithClosure, MapFunction,
+    MapInstr, MapModule, Mappable, Meta, ModuleShape, NameLike, NameLocation, ParamKind,
+    PrettyPrint, PrettyPrinter, ResolvedName, RuntimeFunctionId, RuntimeName, SetAttr, SetItem,
+    Store, TermIf, TryMapInstr, TryMapModule, TryMapTerm, Tuple, UnaryOp, Visit, VisitMut,
     WithMeta, define_instr, define_ruff_instr,
 };
 use soac_lowering::block_py::counters::IncrementCounter;
@@ -1387,6 +1388,90 @@ pub fn lower_codegen_function_to_typed(
     CodegenToTyped.map_fn(function)
 }
 
+struct MissingTypedBlockInstrIdAssigner<'a> {
+    block_label: BlockLabel,
+    next_instr_index_in_block: u32,
+    used: &'a mut HashSet<InstrId>,
+}
+
+impl MissingTypedBlockInstrIdAssigner<'_> {
+    fn assign(&mut self, expr: &mut InstrTyped) {
+        if expr.try_semantic_instr_id().is_some() {
+            return;
+        }
+        while self.used.contains(&InstrId::new(
+            self.block_label,
+            self.next_instr_index_in_block,
+        )) {
+            self.next_instr_index_in_block = self
+                .next_instr_index_in_block
+                .checked_add(1)
+                .expect("per-block instruction count should fit in u32");
+        }
+        let mut meta = expr.meta();
+        let instr_id = InstrId::new(self.block_label, self.next_instr_index_in_block);
+        meta.instr_id = Some(instr_id);
+        self.used.insert(instr_id);
+        self.next_instr_index_in_block = self
+            .next_instr_index_in_block
+            .checked_add(1)
+            .expect("per-block instruction count should fit in u32");
+        *expr = expr.clone().with_meta(meta);
+    }
+}
+
+impl VisitMut<InstrTyped> for MissingTypedBlockInstrIdAssigner<'_> {
+    fn visit_instr_mut(&mut self, expr: &mut InstrTyped) {
+        self.assign(expr);
+        expr.visit_children_mut(self);
+    }
+}
+
+pub fn assign_missing_typed_function_instr_ids(
+    function: &mut BlockPyFunction<TypedCodegenModuleShape>,
+) {
+    let mut next_by_block = HashMap::new();
+    let mut used = HashSet::new();
+    {
+        struct MaxIdCollector<'a> {
+            next_by_block: &'a mut HashMap<BlockLabel, u32>,
+            used: &'a mut HashSet<InstrId>,
+        }
+
+        impl Visit<InstrTyped> for MaxIdCollector<'_> {
+            fn visit_instr(&mut self, expr: &InstrTyped) {
+                if let Some(instr_id) = expr.try_semantic_instr_id() {
+                    self.used.insert(instr_id);
+                    let next = instr_id
+                        .instr_index_in_block()
+                        .checked_add(1)
+                        .expect("per-block instruction count should fit in u32");
+                    self.next_by_block
+                        .entry(instr_id.block_label())
+                        .and_modify(|current| *current = (*current).max(next))
+                        .or_insert(next);
+                }
+                expr.visit_children(self);
+            }
+        }
+
+        let mut collector = MaxIdCollector {
+            next_by_block: &mut next_by_block,
+            used: &mut used,
+        };
+        collector.visit_fn(function);
+    }
+
+    for block in &mut function.blocks {
+        let mut assigner = MissingTypedBlockInstrIdAssigner {
+            block_label: block.label,
+            next_instr_index_in_block: next_by_block.remove(&block.label).unwrap_or(0),
+            used: &mut used,
+        };
+        assigner.visit_block_mut(block);
+    }
+}
+
 pub fn annotate_typed_module_value_facts(
     module: &mut BlockPyModule<TypedCodegenModuleShape>,
     facts: &FactStore,
@@ -1736,37 +1821,47 @@ pub fn refresh_typed_function_value_facts(
 fn infer_typed_instr_result_facts(expr: &InstrTyped) -> Option<ValueFacts> {
     match expr {
         InstrTyped::Truthy(_) => Some(ValueFacts::Bool(BoolFacts)),
-        InstrTyped::Load(op) => op.extra().result_facts(),
+        InstrTyped::Load(op) => op
+            .extra()
+            .result_facts()
+            .or(Some(ValueFacts::unknown_pyobj())),
         InstrTyped::BinOp(op) => value_facts::infer_binop_result_facts(
             op.kind,
             op.left.result_facts()?,
             op.right.result_facts()?,
-        ),
+        )
+        .or(Some(ValueFacts::unknown_pyobj())),
         InstrTyped::LegacyUnaryOp(op) => {
             value_facts::infer_unary_result_facts(op.kind, op.operand.result_facts()?)
+                .or(Some(ValueFacts::unknown_pyobj()))
         }
         InstrTyped::LegacyTuple(_) => Some(ValueFacts::PyObj(PyObjFacts::known_not_none())),
         InstrTyped::CallTyped(op) => infer_typed_call_result_facts(
             op.func.as_ref(),
             op.args.as_slice(),
             op.keywords.as_slice(),
-        ),
+        )
+        .or(Some(ValueFacts::unknown_pyobj())),
         InstrTyped::LegacyCall(op) => infer_typed_call_result_facts(
             op.func.as_ref(),
             op.args.as_slice(),
             op.keywords.as_slice(),
-        ),
+        )
+        .or(Some(ValueFacts::unknown_pyobj())),
         InstrTyped::LegacyCallDirect(op) => infer_typed_call_result_facts(
             op.callable.as_ref(),
             op.args.as_slice(),
             op.keywords.as_slice(),
-        ),
+        )
+        .or(Some(ValueFacts::unknown_pyobj())),
+        InstrTyped::DirectCallGuardTest(_) => Some(ValueFacts::Bool(BoolFacts)),
         InstrTyped::SetAttrTyped(_)
         | InstrTyped::LegacySetAttr(_)
+        | InstrTyped::LegacyStore(_)
         | InstrTyped::LegacySetItem(_)
         | InstrTyped::LegacyDelItem(_)
         | InstrTyped::LegacyDel(_) => Some(ValueFacts::PyObj(PyObjFacts::none_singleton())),
-        _ => None,
+        _ => expr.typed_extra().map(|_| ValueFacts::unknown_pyobj()),
     }
 }
 
@@ -1989,6 +2084,817 @@ pub fn lower_typed_function_call_access_plan_instrs(
     let mut rewriter = Rewriter { count: 0 };
     rewriter.visit_fn_mut(function);
     rewriter.count
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub struct TypedInlineRewriteStats {
+    pub rewritten_stores: usize,
+    pub skipped_candidates: usize,
+    pub skipped_exception_edges: usize,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum TypedInlineUnsupportedReason {
+    MissingCallerStorageLayout,
+    MissingCalleeStorageLayout,
+    MissingCalleeLocal(LocalLocation),
+    MissingParameterLocal,
+    RebindsBoundLocal(LocalLocation),
+    ArityMismatch,
+    KeywordArguments,
+    StarredArguments,
+    DefaultArguments,
+    UnsupportedParameterKind,
+    TooManyBlocks,
+    MultipleBlocks,
+    UnknownLabel(BlockLabel),
+    BlockParams,
+    JumpArgs,
+    ExceptionEdge,
+    NonReturnTerm,
+}
+
+#[derive(Clone)]
+struct TypedInlineDirectCallPlan {
+    target: RuntimeFunctionId,
+    arg_plan: TypedDirectCallArgPlan,
+}
+
+pub fn inline_typed_function_direct_call_stores(
+    function: &mut BlockPyFunction<TypedCodegenModuleShape>,
+    module: &BlockPyModule<TypedCodegenModuleShape>,
+    external_callees: &HashMap<RuntimeFunctionId, BlockPyFunction<TypedCodegenModuleShape>>,
+    direct_calls_by_instr_id: &HashMap<InstrId, Vec<(RuntimeFunctionId, TypedDirectCallArgPlan)>>,
+) -> TypedInlineRewriteStats {
+    if direct_calls_by_instr_id.is_empty() {
+        return TypedInlineRewriteStats::default();
+    }
+
+    let mut stats = TypedInlineRewriteStats::default();
+    let original_blocks = std::mem::take(&mut function.blocks);
+    let mut rewritten_blocks = Vec::with_capacity(original_blocks.len());
+    for block in original_blocks {
+        match build_typed_direct_call_inline_rewrite(
+            function,
+            module,
+            external_callees,
+            block,
+            direct_calls_by_instr_id,
+            &mut stats,
+        ) {
+            TypedInlineBlockRewrite::Rewritten(blocks) => {
+                stats.rewritten_stores += 1;
+                rewritten_blocks.extend(blocks);
+            }
+            TypedInlineBlockRewrite::Unchanged(block) => rewritten_blocks.push(block),
+        }
+    }
+    function.blocks = rewritten_blocks;
+    stats
+}
+
+enum TypedInlineBlockRewrite {
+    Rewritten(Vec<Block<InstrTyped>>),
+    Unchanged(Block<InstrTyped>),
+}
+
+struct TypedInlineStoreCandidate {
+    instr_index: usize,
+    target: ResolvedName,
+    call: TypedGuardedCallableCall<InstrTyped>,
+    inline_plans: Vec<TypedInlineDirectCallPlan>,
+}
+
+fn build_typed_direct_call_inline_rewrite(
+    caller: &mut BlockPyFunction<TypedCodegenModuleShape>,
+    module: &BlockPyModule<TypedCodegenModuleShape>,
+    external_callees: &HashMap<RuntimeFunctionId, BlockPyFunction<TypedCodegenModuleShape>>,
+    block: Block<InstrTyped>,
+    direct_calls_by_instr_id: &HashMap<InstrId, Vec<(RuntimeFunctionId, TypedDirectCallArgPlan)>>,
+    stats: &mut TypedInlineRewriteStats,
+) -> TypedInlineBlockRewrite {
+    let original_block = block.clone();
+    let original_storage_layout = caller.storage_layout.clone();
+    let Some(candidate) =
+        find_typed_inline_store_candidate(&block, caller.function_id, direct_calls_by_instr_id)
+    else {
+        return TypedInlineBlockRewrite::Unchanged(block);
+    };
+    if block.exc_edge.is_some() {
+        stats.skipped_exception_edges += 1;
+        return TypedInlineBlockRewrite::Unchanged(block);
+    }
+    if !candidate.call.keywords.is_empty() {
+        stats.skipped_candidates += 1;
+        return TypedInlineBlockRewrite::Unchanged(block);
+    }
+    let Some(positional_arg_exprs) = typed_positional_arg_exprs(candidate.call.args.clone()) else {
+        stats.skipped_candidates += 1;
+        return TypedInlineBlockRewrite::Unchanged(block);
+    };
+
+    let callable_temp = match try_allocate_typed_stack_temp(caller, "typed_inline_callable") {
+        Ok(temp) => temp,
+        Err(_) => {
+            stats.skipped_candidates += 1;
+            return TypedInlineBlockRewrite::Unchanged(block);
+        }
+    };
+    let arg_temps = match (0..positional_arg_exprs.len())
+        .map(|_| try_allocate_typed_stack_temp(caller, "typed_inline_arg"))
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(temps) => temps,
+        Err(_) => {
+            stats.skipped_candidates += 1;
+            caller.storage_layout = original_storage_layout;
+            return TypedInlineBlockRewrite::Unchanged(block);
+        }
+    };
+
+    let continuation_label = caller.name_gen.next_block_name();
+    let generic_label = caller.name_gen.next_block_name();
+    let cleanup_label = caller.name_gen.next_block_name();
+    let guard_labels = (0..candidate.inline_plans.len().saturating_sub(1))
+        .map(|_| caller.name_gen.next_block_name())
+        .collect::<Vec<_>>();
+    let hot_labels = candidate
+        .inline_plans
+        .iter()
+        .map(|_| caller.name_gen.next_block_name())
+        .collect::<Vec<_>>();
+
+    let mut before = block.body;
+    let after = before.split_off(candidate.instr_index + 1);
+    before.truncate(candidate.instr_index);
+    before.push(
+        Store::new(callable_temp.resolved_name(), *candidate.call.func.clone())
+            .with_meta(Meta::synthetic())
+            .into(),
+    );
+    for (arg_temp, arg_expr) in arg_temps.iter().zip(positional_arg_exprs) {
+        before.push(
+            Store::new(arg_temp.resolved_name(), arg_expr)
+                .with_meta(Meta::synthetic())
+                .into(),
+        );
+    }
+
+    let entry = Block::new(
+        block.label,
+        before,
+        typed_direct_call_guard_term(
+            &callable_temp.resolved_name(),
+            candidate.inline_plans[0].target,
+            hot_labels[0],
+            guard_labels.first().copied().unwrap_or(generic_label),
+        ),
+        block.params,
+        None,
+    );
+
+    let mut blocks = Vec::new();
+    blocks.push(entry);
+
+    for (guard_index, guard_label) in guard_labels.iter().copied().enumerate() {
+        let target_index = guard_index + 1;
+        let else_label = guard_labels
+            .get(guard_index + 1)
+            .copied()
+            .unwrap_or(generic_label);
+        blocks.push(Block::new(
+            guard_label,
+            Vec::new(),
+            typed_direct_call_guard_term(
+                &callable_temp.resolved_name(),
+                candidate.inline_plans[target_index].target,
+                hot_labels[target_index],
+                else_label,
+            ),
+            Vec::new(),
+            None,
+        ));
+    }
+
+    for (plan, hot_label) in candidate.inline_plans.iter().zip(hot_labels) {
+        let Some(callee) = typed_inline_callee(module, external_callees, plan.target) else {
+            stats.skipped_candidates += 1;
+            caller.storage_layout = original_storage_layout;
+            return TypedInlineBlockRewrite::Unchanged(original_block);
+        };
+        let Ok(bindings) = bind_typed_direct_call_inline_args(callee, &plan.arg_plan, &arg_temps)
+        else {
+            stats.skipped_candidates += 1;
+            caller.storage_layout = original_storage_layout;
+            return TypedInlineBlockRewrite::Unchanged(original_block);
+        };
+        let Ok(mut fragment) = build_typed_direct_call_inline_fragment_to_target(
+            caller,
+            callee,
+            cleanup_label,
+            &bindings,
+            candidate.target.clone(),
+        ) else {
+            stats.skipped_candidates += 1;
+            caller.storage_layout = original_storage_layout;
+            return TypedInlineBlockRewrite::Unchanged(original_block);
+        };
+        if let Some(entry) = fragment.blocks.first_mut() {
+            entry.label = hot_label;
+        }
+        blocks.extend(fragment.blocks);
+    }
+
+    blocks.push(Block::new(
+        generic_label,
+        typed_generic_call_fallback_body(
+            &candidate.target,
+            &callable_temp.resolved_name(),
+            &arg_temps,
+        ),
+        BlockTerm::Jump(BlockEdge::new(continuation_label)),
+        Vec::new(),
+        None,
+    ));
+
+    let mut cleanup_body = Vec::new();
+    append_typed_cleanup_dels_to_body(&mut cleanup_body, &arg_temps);
+    append_typed_cleanup_del_to_body(&mut cleanup_body, &callable_temp.resolved_name());
+    blocks.push(Block::new(
+        cleanup_label,
+        cleanup_body,
+        BlockTerm::Jump(BlockEdge::new(continuation_label)),
+        Vec::new(),
+        None,
+    ));
+    blocks.push(Block::new(
+        continuation_label,
+        after,
+        block.term,
+        Vec::new(),
+        None,
+    ));
+
+    TypedInlineBlockRewrite::Rewritten(blocks)
+}
+
+fn find_typed_inline_store_candidate(
+    block: &Block<InstrTyped>,
+    caller_id: RuntimeFunctionId,
+    direct_calls_by_instr_id: &HashMap<InstrId, Vec<(RuntimeFunctionId, TypedDirectCallArgPlan)>>,
+) -> Option<TypedInlineStoreCandidate> {
+    block
+        .body
+        .iter()
+        .enumerate()
+        .find_map(|(instr_index, instr)| {
+            let InstrTyped::LegacyStore(store) = instr else {
+                return None;
+            };
+            let InstrTyped::GuardedCallableCallTyped(call) = store.value.as_ref() else {
+                return None;
+            };
+            let instr_id = call.try_semantic_instr_id()?;
+            let plans = direct_calls_by_instr_id.get(&instr_id)?;
+            let inline_plans = plans
+                .iter()
+                .filter_map(|(target, arg_plan)| {
+                    if *target == caller_id
+                        || !call
+                            .function_guards
+                            .iter()
+                            .any(|guard| guard.function_id == *target)
+                    {
+                        return None;
+                    }
+                    Some(TypedInlineDirectCallPlan {
+                        target: *target,
+                        arg_plan: arg_plan.clone(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            (!inline_plans.is_empty()).then_some(TypedInlineStoreCandidate {
+                instr_index,
+                target: store.name.clone(),
+                call: call.clone(),
+                inline_plans,
+            })
+        })
+}
+
+fn typed_inline_callee<'a>(
+    module: &'a BlockPyModule<TypedCodegenModuleShape>,
+    external_callees: &'a HashMap<RuntimeFunctionId, BlockPyFunction<TypedCodegenModuleShape>>,
+    function_id: RuntimeFunctionId,
+) -> Option<&'a BlockPyFunction<TypedCodegenModuleShape>> {
+    module
+        .callable_defs
+        .iter()
+        .find(|function| function.function_id == function_id)
+        .or_else(|| external_callees.get(&function_id))
+}
+
+fn typed_positional_arg_exprs(args: Vec<CallArgPositional<InstrTyped>>) -> Option<Vec<InstrTyped>> {
+    args.into_iter()
+        .map(|arg| match arg {
+            CallArgPositional::Positional(expr) => Some(expr),
+            CallArgPositional::Starred(_) => None,
+        })
+        .collect()
+}
+
+fn typed_direct_call_guard_term(
+    callable_temp: &ResolvedName,
+    function_id: RuntimeFunctionId,
+    then_label: BlockLabel,
+    else_label: BlockLabel,
+) -> BlockTerm<InstrTyped> {
+    BlockTerm::IfTerm(TermIf {
+        test: InstrTyped::DirectCallGuardTest(TypedDirectCallGuardTest::new(
+            typed_load_temp(callable_temp),
+            TypedDirectCallGuardTestKind::RuntimeFunctionId { function_id },
+        )),
+        then_label,
+        else_label,
+    })
+}
+
+fn typed_generic_call_fallback_body(
+    target: &ResolvedName,
+    callable_temp: &ResolvedName,
+    arg_temps: &[TypedTempLocal],
+) -> Vec<InstrTyped> {
+    let mut body = vec![
+        Store::new(
+            target.clone(),
+            Box::new(InstrTyped::CallTyped(TypedCall::generic(
+                typed_load_temp(callable_temp),
+                typed_load_temp_args(arg_temps),
+                Vec::<CallArgKeyword<InstrTyped>>::new(),
+            ))),
+        )
+        .with_meta(Meta::synthetic())
+        .into(),
+    ];
+    append_typed_cleanup_dels_to_body(&mut body, arg_temps);
+    append_typed_cleanup_del_to_body(&mut body, callable_temp);
+    body
+}
+
+fn typed_load_temp(temp_name: &ResolvedName) -> InstrTyped {
+    InstrTyped::Load(Load::new(temp_name.clone()).with_meta(Meta::synthetic()))
+}
+
+fn typed_load_temp_args(temp_names: &[TypedTempLocal]) -> Vec<CallArgPositional<InstrTyped>> {
+    temp_names
+        .iter()
+        .map(|temp| CallArgPositional::Positional(typed_load_temp(&temp.resolved_name())))
+        .collect()
+}
+
+fn append_typed_cleanup_dels_to_body(body: &mut Vec<InstrTyped>, temp_names: &[TypedTempLocal]) {
+    for temp_name in temp_names.iter().rev() {
+        append_typed_cleanup_del_to_body(body, &temp_name.resolved_name());
+    }
+}
+
+fn append_typed_cleanup_del_to_body(body: &mut Vec<InstrTyped>, temp_name: &ResolvedName) {
+    body.push(
+        Del::new(temp_name.clone(), false)
+            .with_meta(Meta::synthetic())
+            .into(),
+    );
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct TypedTempLocal {
+    name: String,
+    location: LocalLocation,
+}
+
+impl TypedTempLocal {
+    fn resolved_name(&self) -> ResolvedName {
+        ResolvedName {
+            id: self.name.clone().into(),
+            location: NameLocation::Local(self.location),
+        }
+    }
+}
+
+fn try_allocate_typed_stack_temp(
+    function: &mut BlockPyFunction<TypedCodegenModuleShape>,
+    prefix: &str,
+) -> Result<TypedTempLocal, TypedInlineUnsupportedReason> {
+    let name = function.name_gen.next_tmp_name(prefix).as_str().to_string();
+    let layout = function
+        .storage_layout
+        .as_mut()
+        .ok_or(TypedInlineUnsupportedReason::MissingCallerStorageLayout)?;
+    let location = LocalLocation(
+        u32::try_from(layout.stack_slots().len())
+            .expect("typed stack slot index should fit in u32"),
+    );
+    layout.ensure_stack_slot(name.clone());
+    Ok(TypedTempLocal { name, location })
+}
+
+type TypedInlineValueBindings = HashMap<LocalLocation, InstrTyped>;
+
+fn bind_typed_direct_call_inline_args(
+    callee: &BlockPyFunction<TypedCodegenModuleShape>,
+    arg_plan: &TypedDirectCallArgPlan,
+    arg_temps: &[TypedTempLocal],
+) -> Result<TypedInlineValueBindings, TypedInlineUnsupportedReason> {
+    if arg_plan.sources.len() != callee.params.len() {
+        return Err(TypedInlineUnsupportedReason::ArityMismatch);
+    }
+    let mut bindings = TypedInlineValueBindings::new();
+    for (param, source) in callee.params.iter().zip(&arg_plan.sources) {
+        if !matches!(param.kind, ParamKind::PosOnly | ParamKind::Any) {
+            return Err(TypedInlineUnsupportedReason::UnsupportedParameterKind);
+        }
+        let TypedDirectCallArgSource::Provided(index) = source else {
+            return Err(TypedInlineUnsupportedReason::DefaultArguments);
+        };
+        let Some(arg_temp) = arg_temps.get(*index) else {
+            return Err(TypedInlineUnsupportedReason::ArityMismatch);
+        };
+        let location = typed_parameter_local_location(callee, &param.name)?;
+        bindings.insert(location, typed_load_temp(&arg_temp.resolved_name()));
+    }
+    Ok(bindings)
+}
+
+fn typed_parameter_local_location(
+    function: &BlockPyFunction<TypedCodegenModuleShape>,
+    name: &str,
+) -> Result<LocalLocation, TypedInlineUnsupportedReason> {
+    let layout = function
+        .storage_layout
+        .as_ref()
+        .ok_or(TypedInlineUnsupportedReason::MissingCalleeStorageLayout)?;
+    let Some(slot) = layout
+        .stack_slots()
+        .iter()
+        .position(|slot_name| slot_name == name)
+    else {
+        return Err(TypedInlineUnsupportedReason::MissingParameterLocal);
+    };
+    Ok(LocalLocation(
+        u32::try_from(slot).expect("parameter stack slot index should fit in u32"),
+    ))
+}
+
+fn build_typed_direct_call_inline_fragment_to_target(
+    caller: &mut BlockPyFunction<TypedCodegenModuleShape>,
+    callee: &BlockPyFunction<TypedCodegenModuleShape>,
+    continuation: BlockLabel,
+    value_bindings: &TypedInlineValueBindings,
+    return_target: ResolvedName,
+) -> Result<TypedInlineFragment, TypedInlineUnsupportedReason> {
+    if callee.blocks.len() == 1 {
+        return build_single_block_typed_inline_fragment_to_target(
+            caller,
+            callee,
+            continuation,
+            value_bindings,
+            return_target,
+        );
+    }
+    build_multi_block_typed_inline_fragment_to_target(
+        caller,
+        callee,
+        continuation,
+        value_bindings,
+        return_target,
+    )
+}
+
+struct TypedInlineFragment {
+    blocks: Vec<Block<InstrTyped>>,
+}
+
+fn build_single_block_typed_inline_fragment_to_target(
+    caller: &mut BlockPyFunction<TypedCodegenModuleShape>,
+    callee: &BlockPyFunction<TypedCodegenModuleShape>,
+    continuation: BlockLabel,
+    value_bindings: &TypedInlineValueBindings,
+    return_target: ResolvedName,
+) -> Result<TypedInlineFragment, TypedInlineUnsupportedReason> {
+    let callee_layout = callee
+        .storage_layout
+        .as_ref()
+        .ok_or(TypedInlineUnsupportedReason::MissingCalleeStorageLayout)?;
+    for location in value_bindings.keys().copied() {
+        if location.slot() as usize >= callee_layout.stack_slots().len() {
+            return Err(TypedInlineUnsupportedReason::MissingCalleeLocal(location));
+        }
+    }
+    if callee.blocks.len() != 1 {
+        return Err(TypedInlineUnsupportedReason::MultipleBlocks);
+    }
+    let callee_block = &callee.blocks[0];
+    if !callee_block.params.is_empty() {
+        return Err(TypedInlineUnsupportedReason::BlockParams);
+    }
+    if callee_block.exc_edge.is_some() {
+        return Err(TypedInlineUnsupportedReason::ExceptionEdge);
+    }
+    let BlockTerm::Return(return_value) = &callee_block.term else {
+        return Err(TypedInlineUnsupportedReason::NonReturnTerm);
+    };
+
+    let locals = allocate_typed_inline_locals(caller, callee_layout, value_bindings)?;
+    let mut remapper = TypedInlineLocalRemapper::new(&locals, value_bindings);
+    let mut body = callee_block
+        .body
+        .iter()
+        .cloned()
+        .filter(|instr| !matches!(instr, InstrTyped::LegacyIncrementCounter(_)))
+        .map(|instr| remapper.try_map_instr(instr))
+        .collect::<Result<Vec<_>, _>>()?;
+    let return_value = remapper.try_map_instr(return_value.clone())?;
+    let return_meta = return_value.meta();
+    body.push(
+        Store::new(return_target, Box::new(return_value))
+            .with_meta(return_meta)
+            .into(),
+    );
+
+    Ok(TypedInlineFragment {
+        blocks: vec![Block::new(
+            caller.name_gen.next_block_name(),
+            body,
+            BlockTerm::Jump(BlockEdge::new(continuation)),
+            Vec::new(),
+            None,
+        )],
+    })
+}
+
+fn build_multi_block_typed_inline_fragment_to_target(
+    caller: &mut BlockPyFunction<TypedCodegenModuleShape>,
+    callee: &BlockPyFunction<TypedCodegenModuleShape>,
+    continuation: BlockLabel,
+    value_bindings: &TypedInlineValueBindings,
+    return_target: ResolvedName,
+) -> Result<TypedInlineFragment, TypedInlineUnsupportedReason> {
+    let callee_layout = callee
+        .storage_layout
+        .as_ref()
+        .ok_or(TypedInlineUnsupportedReason::MissingCalleeStorageLayout)?;
+    for location in value_bindings.keys().copied() {
+        if location.slot() as usize >= callee_layout.stack_slots().len() {
+            return Err(TypedInlineUnsupportedReason::MissingCalleeLocal(location));
+        }
+    }
+    for block in &callee.blocks {
+        if !block.params.is_empty() {
+            return Err(TypedInlineUnsupportedReason::BlockParams);
+        }
+        if block.exc_edge.is_some() {
+            return Err(TypedInlineUnsupportedReason::ExceptionEdge);
+        }
+        if typed_term_has_jump_args(&block.term) {
+            return Err(TypedInlineUnsupportedReason::JumpArgs);
+        }
+    }
+
+    let locals = allocate_typed_inline_locals(caller, callee_layout, value_bindings)?;
+    let label_map = callee
+        .blocks
+        .iter()
+        .map(|block| (block.label, caller.name_gen.next_block_name()))
+        .collect::<HashMap<_, _>>();
+    let mut remapper = TypedInlineLocalRemapper::new(&locals, value_bindings);
+    let mut blocks = Vec::with_capacity(callee.blocks.len());
+    for callee_block in &callee.blocks {
+        let label = typed_remapped_label(&label_map, callee_block.label)?;
+        let mut body = callee_block
+            .body
+            .iter()
+            .cloned()
+            .filter(|instr| !matches!(instr, InstrTyped::LegacyIncrementCounter(_)))
+            .map(|instr| remapper.try_map_instr(instr))
+            .collect::<Result<Vec<_>, _>>()?;
+        let term = match &callee_block.term {
+            BlockTerm::Return(value) => {
+                let return_value = remapper.try_map_instr(value.clone())?;
+                let return_meta = return_value.meta();
+                body.push(
+                    Store::new(return_target.clone(), Box::new(return_value))
+                        .with_meta(return_meta)
+                        .into(),
+                );
+                BlockTerm::Jump(BlockEdge::new(continuation))
+            }
+            term => {
+                typed_remap_inline_term_labels(remapper.try_map_term(term.clone())?, &label_map)?
+            }
+        };
+        blocks.push(Block::new(label, body, term, Vec::new(), None));
+    }
+    Ok(TypedInlineFragment { blocks })
+}
+
+fn allocate_typed_inline_locals(
+    caller: &mut BlockPyFunction<TypedCodegenModuleShape>,
+    callee_layout: &soac_core::block_py::StorageLayout,
+    value_bindings: &TypedInlineValueBindings,
+) -> Result<HashMap<LocalLocation, TypedTempLocal>, TypedInlineUnsupportedReason> {
+    let mut locals = HashMap::new();
+    for (slot, _name) in callee_layout.stack_slots().iter().enumerate() {
+        let location =
+            LocalLocation(u32::try_from(slot).expect("callee stack slot index should fit in u32"));
+        if value_bindings.contains_key(&location) {
+            continue;
+        }
+        locals.insert(
+            location,
+            try_allocate_typed_stack_temp(caller, "typed_inline")?,
+        );
+    }
+    Ok(locals)
+}
+
+fn typed_term_has_jump_args(term: &BlockTerm<InstrTyped>) -> bool {
+    match term {
+        BlockTerm::Jump(edge) => !edge.args.is_empty(),
+        BlockTerm::IfTerm(_)
+        | BlockTerm::BranchTable(_)
+        | BlockTerm::Raise(_)
+        | BlockTerm::Return(_) => false,
+    }
+}
+
+fn typed_remapped_label(
+    label_map: &HashMap<BlockLabel, BlockLabel>,
+    label: BlockLabel,
+) -> Result<BlockLabel, TypedInlineUnsupportedReason> {
+    label_map
+        .get(&label)
+        .copied()
+        .ok_or(TypedInlineUnsupportedReason::UnknownLabel(label))
+}
+
+fn typed_remap_inline_term_labels(
+    term: BlockTerm<InstrTyped>,
+    label_map: &HashMap<BlockLabel, BlockLabel>,
+) -> Result<BlockTerm<InstrTyped>, TypedInlineUnsupportedReason> {
+    Ok(match term {
+        BlockTerm::Jump(edge) => BlockTerm::Jump(BlockEdge::new(typed_remapped_label(
+            label_map,
+            edge.target,
+        )?)),
+        BlockTerm::IfTerm(mut term) => {
+            term.then_label = typed_remapped_label(label_map, term.then_label)?;
+            term.else_label = typed_remapped_label(label_map, term.else_label)?;
+            BlockTerm::IfTerm(term)
+        }
+        BlockTerm::BranchTable(mut term) => {
+            for target in &mut term.targets {
+                *target = typed_remapped_label(label_map, *target)?;
+            }
+            term.default_label = typed_remapped_label(label_map, term.default_label)?;
+            BlockTerm::BranchTable(term)
+        }
+        BlockTerm::Raise(term) => BlockTerm::Raise(term),
+        BlockTerm::Return(_) => return Err(TypedInlineUnsupportedReason::NonReturnTerm),
+    })
+}
+
+struct TypedInlineLocalRemapper<'locals, 'bindings> {
+    locals: &'locals HashMap<LocalLocation, TypedTempLocal>,
+    value_bindings: &'bindings TypedInlineValueBindings,
+}
+
+impl<'locals, 'bindings> TypedInlineLocalRemapper<'locals, 'bindings> {
+    fn new(
+        locals: &'locals HashMap<LocalLocation, TypedTempLocal>,
+        value_bindings: &'bindings TypedInlineValueBindings,
+    ) -> Self {
+        Self {
+            locals,
+            value_bindings,
+        }
+    }
+}
+
+impl TryMapInstr<InstrTyped, InstrTyped, TypedInlineUnsupportedReason>
+    for TypedInlineLocalRemapper<'_, '_>
+{
+    fn try_map_instr(
+        &mut self,
+        instr: InstrTyped,
+    ) -> Result<InstrTyped, TypedInlineUnsupportedReason> {
+        let mapped = match instr {
+            InstrTyped::Truthy(op) => InstrTyped::Truthy(op.try_map_children(self)?),
+            InstrTyped::Load(op) => {
+                if let Some(location) = op.name.local_location()
+                    && let Some(value) = self.value_bindings.get(&location)
+                {
+                    return Ok(clear_typed_instr_ids(value.clone()));
+                }
+                InstrTyped::Load(op.try_map_children(self)?)
+            }
+            InstrTyped::BinOp(op) => InstrTyped::BinOp(op.try_map_children(self)?),
+            InstrTyped::LegacyTuple(op) => InstrTyped::LegacyTuple(op.try_map_children(self)?),
+            InstrTyped::LegacyUnaryOp(op) => InstrTyped::LegacyUnaryOp(op.try_map_children(self)?),
+            InstrTyped::LegacyCalleeFunctionId(op) => {
+                InstrTyped::LegacyCalleeFunctionId(op.try_map_children(self)?)
+            }
+            InstrTyped::CallTyped(op) => InstrTyped::CallTyped(op.try_map_children(self)?),
+            InstrTyped::GuardedCallableCallTyped(op) => {
+                InstrTyped::GuardedCallableCallTyped(op.try_map_children(self)?)
+            }
+            InstrTyped::GuardedMethodCallTyped(op) => {
+                InstrTyped::GuardedMethodCallTyped(op.try_map_children(self)?)
+            }
+            InstrTyped::DirectCallableCallTyped(op) => {
+                InstrTyped::DirectCallableCallTyped(op.try_map_children(self)?)
+            }
+            InstrTyped::DirectMethodCallTyped(op) => {
+                InstrTyped::DirectMethodCallTyped(op.try_map_children(self)?)
+            }
+            InstrTyped::DirectCallGuardTest(op) => {
+                InstrTyped::DirectCallGuardTest(op.try_map_children(self)?)
+            }
+            InstrTyped::LegacyCall(op) => InstrTyped::LegacyCall(op.try_map_children(self)?),
+            InstrTyped::LegacyCallDirect(op) => {
+                InstrTyped::LegacyCallDirect(op.try_map_children(self)?)
+            }
+            InstrTyped::GetAttrTyped(op) => InstrTyped::GetAttrTyped(op.try_map_children(self)?),
+            InstrTyped::SetAttrTyped(op) => InstrTyped::SetAttrTyped(op.try_map_children(self)?),
+            InstrTyped::LegacyGetAttr(op) => InstrTyped::LegacyGetAttr(op.try_map_children(self)?),
+            InstrTyped::LegacySetAttr(op) => InstrTyped::LegacySetAttr(op.try_map_children(self)?),
+            InstrTyped::LegacyGetItem(op) => InstrTyped::LegacyGetItem(op.try_map_children(self)?),
+            InstrTyped::LegacySetItem(op) => InstrTyped::LegacySetItem(op.try_map_children(self)?),
+            InstrTyped::LegacyDelItem(op) => InstrTyped::LegacyDelItem(op.try_map_children(self)?),
+            InstrTyped::LegacyStore(op) => {
+                if let Some(location) = op.name.local_location()
+                    && self.value_bindings.contains_key(&location)
+                {
+                    return Err(TypedInlineUnsupportedReason::RebindsBoundLocal(location));
+                }
+                InstrTyped::LegacyStore(op.try_map_children(self)?)
+            }
+            InstrTyped::LegacyDel(op) => {
+                if let Some(location) = op.name.local_location()
+                    && self.value_bindings.contains_key(&location)
+                {
+                    return Err(TypedInlineUnsupportedReason::RebindsBoundLocal(location));
+                }
+                InstrTyped::LegacyDel(op.try_map_children(self)?)
+            }
+            InstrTyped::LegacyMakeCell(op) => {
+                InstrTyped::LegacyMakeCell(op.try_map_children(self)?)
+            }
+            InstrTyped::LegacyIncrementCounter(op) => InstrTyped::LegacyIncrementCounter(op),
+            InstrTyped::LegacyCellRef(op) => InstrTyped::LegacyCellRef(op),
+            InstrTyped::LegacyMakeFunctionWithClosure(op) => {
+                InstrTyped::LegacyMakeFunctionWithClosure(op.try_map_children(self)?)
+            }
+        };
+        Ok(clear_typed_instr_id(mapped))
+    }
+
+    fn try_map_name(
+        &mut self,
+        mut name: ResolvedName,
+    ) -> Result<ResolvedName, TypedInlineUnsupportedReason> {
+        let Some(location) = name.location.as_local() else {
+            return Ok(name);
+        };
+        if self.value_bindings.contains_key(&location) {
+            return Err(TypedInlineUnsupportedReason::RebindsBoundLocal(location));
+        }
+        let Some(fresh) = self.locals.get(&location) else {
+            return Err(TypedInlineUnsupportedReason::MissingCalleeLocal(location));
+        };
+        name.id = fresh.name.clone().into();
+        name.location = NameLocation::Local(fresh.location);
+        Ok(name)
+    }
+}
+
+fn clear_typed_instr_ids(mut instr: InstrTyped) -> InstrTyped {
+    struct Scrubber;
+    impl VisitMut<InstrTyped> for Scrubber {
+        fn visit_instr_mut(&mut self, expr: &mut InstrTyped) {
+            expr.visit_children_mut(self);
+            let mut meta = expr.meta();
+            meta.instr_id = None;
+            *expr = expr.clone().with_meta(meta);
+        }
+    }
+    Scrubber.visit_instr_mut(&mut instr);
+    instr
+}
+
+fn clear_typed_instr_id(instr: InstrTyped) -> InstrTyped {
+    let mut meta = instr.meta();
+    meta.instr_id = None;
+    instr.with_meta(meta)
 }
 
 pub fn validate_typed_function_call_access_plans(
