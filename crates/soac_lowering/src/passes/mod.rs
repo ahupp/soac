@@ -311,7 +311,7 @@ impl ModuleShape for ResolvedStorageModuleShape {
 }
 
 pub(crate) use blockpy_generators::lower_yield_in_lowered_core_blockpy_module_bundle;
-pub(crate) use blockpy_to_bb::{lower_try_jump_exception_flow, normalize_bb_module_strings};
+pub(crate) use blockpy_to_bb::{hoist_module_constants, lower_try_jump_exception_flow};
 pub(crate) use global_index::lower_global_index_in_resolved_module_default;
 pub(crate) use instr_id::assign_module_instr_ids;
 pub use instr_id::{

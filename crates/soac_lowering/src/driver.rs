@@ -286,7 +286,7 @@ pub fn lower_source_to_codegen_module_with_tracker(
         });
     let bb_codegen: BlockPyModule<CodegenModuleShape> = pass_tracker.run_pass("bb_codegen", || {
         let mut bb_codegen: BlockPyModule<CodegenModuleShape> =
-            passes::normalize_bb_module_strings(&bb_prepared);
+            passes::hoist_module_constants(&bb_prepared);
         passes::relabel_dense_bb_module(&mut bb_codegen);
         passes::assign_module_instr_ids(bb_codegen)
     });

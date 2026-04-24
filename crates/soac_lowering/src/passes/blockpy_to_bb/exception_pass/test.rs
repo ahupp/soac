@@ -23,7 +23,7 @@ fn tracked_name_binding_module(
 fn tracked_codegen_module(source: &str) -> crate::block_py::BlockPyModule<CodegenModuleShape> {
     let name_binding = tracked_name_binding_module(source);
     let lowered = lower_try_jump_exception_flow(&name_binding);
-    let mut codegen = crate::passes::normalize_bb_module_strings(&lowered);
+    let mut codegen = crate::passes::hoist_module_constants(&lowered);
     crate::passes::relabel_dense_bb_module(&mut codegen);
     crate::passes::assign_module_instr_ids(codegen)
 }

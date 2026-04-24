@@ -1,4 +1,4 @@
-use super::normalize_bb_module_strings;
+use super::hoist_module_constants;
 use crate::{
     block_py::{ChildVisitable, InstrCodegen, InstrResolved, Literal, NameLike, Visit},
     lower_python_to_blockpy_for_testing,
@@ -141,7 +141,7 @@ def f():
 "#;
     let bb_module = tracked_name_binding_module(source);
     let prepared = lower_try_jump_exception_flow(&bb_module);
-    let normalized = normalize_bb_module_strings(&prepared);
+    let normalized = hoist_module_constants(&prepared);
 
     assert!(
         module_constants_contain_string(&normalized.module_constants),
@@ -161,7 +161,7 @@ def f(obj, mapping, key, value):
 "#;
     let bb_module = tracked_name_binding_module(source);
     let prepared = lower_try_jump_exception_flow(&bb_module);
-    let normalized = normalize_bb_module_strings(&prepared);
+    let normalized = hoist_module_constants(&prepared);
 
     let mut helper_names = Vec::new();
     for function in normalized.callable_defs {

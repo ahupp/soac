@@ -5,7 +5,7 @@ use crate::block_py::{
 use crate::passes::{CodegenModuleShape, ResolvedStorageModuleShape};
 use soac_macros::match_default;
 
-pub(crate) fn normalize_bb_module_strings(
+pub(crate) fn hoist_module_constants(
     module: &BlockPyModule<ResolvedStorageModuleShape>,
 ) -> BlockPyModule<CodegenModuleShape> {
     let mut normalizer = CodegenExprNormalizer::default();
