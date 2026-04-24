@@ -10,9 +10,7 @@ pub use config::{
     CounterInstrumentationConfig, ExplicitCounterPlacement, InstrumentationConfig,
     RefcountCounterMode,
 };
-pub use instrument::{
-    CounterBuilder, CounterHandle, CounterSpec, InstrumentInstr, OptBlock, OptInstr,
-};
+pub use instrument::{CounterBuilder, CounterHandle, CounterSpec};
 pub use typed::{
     define_typed_module_counter_defs, instrument_typed_module, instrument_typed_module_with_tracker,
 };

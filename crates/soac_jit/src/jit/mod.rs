@@ -1844,12 +1844,11 @@ impl JitBatchPlan<'_> {
         Ok(())
     }
 
-    fn refresh_planned_module_constant_bindings(
-        &mut self,
-        state: &mut ProcessJitState,
-        jit_module: &mut JITModule,
-    ) -> Result<(), String> {
-        let mut refreshed = HashMap::new();
+    fn prepare_planned_module_constant_bindings(
+        &self,
+    ) -> Result<Vec<PreparedModuleConstantRefresh>, String> {
+        let mut prepared = Vec::new();
+        let mut refreshed = HashSet::new();
         for batch_function_index in &self.function_indices_to_define {
             let batch_function = &self.batch_functions[*batch_function_index];
             let Some(shared_state) = batch_function.source.shared_state() else {
@@ -1860,7 +1859,7 @@ impl JitBatchPlan<'_> {
                 .get(batch_function_index)
                 .expect("reserved JIT batch function should have compile inputs")
                 .module_constant_binding_key;
-            if refreshed.contains_key(&binding_key) {
+            if !refreshed.insert(binding_key) {
                 continue;
             }
             let module_plan = self
@@ -1882,17 +1881,38 @@ impl JitBatchPlan<'_> {
                 .map_err(|err| err.to_string())
             })?;
             let ptrs = owners.iter().map(|obj| obj.as_ptr()).collect::<Vec<_>>();
-            let owners = Arc::new(owners);
             let object_binding_key = std::ptr::from_ref(planned_module).cast::<()>() as usize;
             let symbol_prefix =
                 module_constant_symbol_prefix_for_instance(planned_module, object_binding_key);
+            prepared.push(PreparedModuleConstantRefresh {
+                binding_key,
+                ptrs,
+                owners: Arc::new(owners),
+                object_binding_key,
+                symbol_prefix,
+            });
+        }
+        Ok(prepared)
+    }
+
+    fn bind_prepared_module_constant_bindings(
+        &mut self,
+        prepared: Vec<PreparedModuleConstantRefresh>,
+        state: &mut ProcessJitState,
+        jit_module: &mut JITModule,
+    ) -> Result<(), String> {
+        let mut refreshed = HashMap::new();
+        for refresh in prepared {
             let data_ids = state.ensure_module_constant_objects(
                 jit_module,
-                ptrs.as_slice(),
-                object_binding_key,
-                symbol_prefix.as_str(),
+                refresh.ptrs.as_slice(),
+                refresh.object_binding_key,
+                refresh.symbol_prefix.as_str(),
             )?;
-            refreshed.insert(binding_key, (ptrs, owners, data_ids));
+            refreshed.insert(
+                refresh.binding_key,
+                (refresh.ptrs, refresh.owners, data_ids),
+            );
         }
 
         for reserved_inputs in self.function_compile_inputs.values_mut() {
@@ -1907,6 +1927,14 @@ impl JitBatchPlan<'_> {
         }
         Ok(())
     }
+}
+
+struct PreparedModuleConstantRefresh {
+    binding_key: usize,
+    ptrs: Vec<*mut ffi::PyObject>,
+    owners: Arc<Vec<Py<PyAny>>>,
+    object_binding_key: usize,
+    symbol_prefix: String,
 }
 
 pub(crate) struct JitModulePlan {
@@ -23479,6 +23507,29 @@ impl ProcessJitEngine {
             return Err(err);
         }
         let refresh_start = Instant::now();
+        let prepared_module_constant_bindings =
+            match plan.prepare_planned_module_constant_bindings() {
+                Ok(bindings) => bindings,
+                Err(err) => {
+                    emit_jit_batch_codegen_log(
+                        function,
+                        direct_call_resolver,
+                        "error",
+                        "constant-refresh",
+                        Some(&err),
+                        plan.batch_functions.len(),
+                        plan.function_indices_to_define.len(),
+                        Duration::ZERO,
+                        reservation_elapsed,
+                        refresh_start.elapsed(),
+                        Duration::ZERO,
+                        total_start.elapsed(),
+                        JitBatchWorkerMetrics::default(),
+                    );
+                    self.fail_reserved_direct_function_batch(&plan, &err);
+                    return Err(err);
+                }
+            };
         let refresh_result = {
             let mut state = self
                 .state
@@ -23486,7 +23537,11 @@ impl ProcessJitEngine {
                 .map_err(|_| "process JIT state lock poisoned".to_string())?;
             let mut jit_module = self.module.lock_for_serial_phase()?;
             let _guard = ProcessJitCompileGuard::enter();
-            let result = plan.refresh_planned_module_constant_bindings(&mut state, &mut jit_module);
+            let result = plan.bind_prepared_module_constant_bindings(
+                prepared_module_constant_bindings,
+                &mut state,
+                &mut jit_module,
+            );
             if result.is_ok() {
                 plan.module_declarations = JitModuleDeclarationSnapshot::from_module(&jit_module);
             }
@@ -23749,6 +23804,29 @@ impl ProcessJitEngine {
             return Err(err);
         }
         let refresh_start = Instant::now();
+        let prepared_module_constant_bindings =
+            match plan.prepare_planned_module_constant_bindings() {
+                Ok(bindings) => bindings,
+                Err(err) => {
+                    emit_jit_batch_codegen_log(
+                        function,
+                        direct_call_resolver,
+                        "error",
+                        "constant-refresh",
+                        Some(&err),
+                        plan.batch_functions.len(),
+                        plan.function_indices_to_define.len(),
+                        batch_collect_elapsed,
+                        reservation_elapsed,
+                        refresh_start.elapsed(),
+                        Duration::ZERO,
+                        total_start.elapsed(),
+                        JitBatchWorkerMetrics::default(),
+                    );
+                    self.fail_reserved_direct_function_batch(&plan, &err);
+                    return Err(err);
+                }
+            };
         let refresh_result = {
             let mut state = self
                 .state
@@ -23756,7 +23834,11 @@ impl ProcessJitEngine {
                 .map_err(|_| "process JIT state lock poisoned".to_string())?;
             let mut jit_module = self.module.lock_for_serial_phase()?;
             let _guard = ProcessJitCompileGuard::enter();
-            let result = plan.refresh_planned_module_constant_bindings(&mut state, &mut jit_module);
+            let result = plan.bind_prepared_module_constant_bindings(
+                prepared_module_constant_bindings,
+                &mut state,
+                &mut jit_module,
+            );
             if result.is_ok() {
                 plan.module_declarations = JitModuleDeclarationSnapshot::from_module(&jit_module);
             }
