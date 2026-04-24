@@ -5633,6 +5633,19 @@ fn codegen_expr_static_runtime_name<'a>(
     }
 }
 
+fn typed_expr_static_runtime_name<'a>(
+    expr: &'a InstrTyped,
+    module_constants: &'a ModuleCodegenConstants,
+) -> Option<&'a str> {
+    match expr {
+        InstrTyped::Load(op) if op.name.location.is_runtime_name() => Some(op.name.id.as_str()),
+        InstrTyped::Load(op) => op.name.location.as_constant().and_then(|index| {
+            module_constants.constant_runtime_name_value(ModuleConstantId(index as usize))
+        }),
+        _ => None,
+    }
+}
+
 fn codegen_expr_runtime_helper(
     expr: &InstrCodegen,
     ctx: &JitEmitCtx<'_>,
@@ -15425,7 +15438,7 @@ fn emit_typed_codegen_expr_value_with_local_env(
     }
 
     if let InstrTyped::GuardedCallableCallTyped(op) = expr {
-        if let Some(result) = emit_typed_codegen_guarded_callable_call_result_with_local_env(
+        let result = emit_typed_codegen_guarded_callable_call_result_with_local_env(
             fb,
             op,
             local_env,
@@ -15433,31 +15446,18 @@ fn emit_typed_codegen_expr_value_with_local_env(
             ResultDemand::PYOBJECT_OWNED,
             codegen_env,
             func_imports,
-        )? {
-            let (value, ownership, facts) =
-                result.expect_pyobject("typed guarded callable call expression result");
-            assert!(
-                ownership.can_satisfy_pyobject_demand(ResultDemand::PYOBJECT_OWNED),
-                "typed guarded callable call expression result should satisfy owned PyObject demand"
-            );
-            return Ok(SoacValue::pyobject_with_ownership(value, ownership, facts));
-        }
-        let typed_call = op.clone().into_typed_call();
-        let legacy_expr =
-            try_lower_typed_instr_to_codegen_legacy(InstrTyped::CallTyped(typed_call))?;
-        return Ok(emit_codegen_expr_value_with_local_env(
-            fb,
-            &legacy_expr,
-            local_env,
-            emit_ctx,
-            borrowed,
-            codegen_env,
-            func_imports,
-        ));
+        )?;
+        let (value, ownership, facts) =
+            result.expect_pyobject("typed guarded callable call expression result");
+        assert!(
+            ownership.can_satisfy_pyobject_demand(ResultDemand::PYOBJECT_OWNED),
+            "typed guarded callable call expression result should satisfy owned PyObject demand"
+        );
+        return Ok(SoacValue::pyobject_with_ownership(value, ownership, facts));
     }
 
     if let InstrTyped::GuardedMethodCallTyped(op) = expr {
-        if let Some(result) = emit_typed_codegen_guarded_method_call_result_with_local_env(
+        let result = emit_typed_codegen_guarded_method_call_result_with_local_env(
             fb,
             op,
             local_env,
@@ -15465,27 +15465,14 @@ fn emit_typed_codegen_expr_value_with_local_env(
             ResultDemand::PYOBJECT_OWNED,
             codegen_env,
             func_imports,
-        )? {
-            let (value, ownership, facts) =
-                result.expect_pyobject("typed guarded method call expression result");
-            assert!(
-                ownership.can_satisfy_pyobject_demand(ResultDemand::PYOBJECT_OWNED),
-                "typed guarded method call expression result should satisfy owned PyObject demand"
-            );
-            return Ok(SoacValue::pyobject_with_ownership(value, ownership, facts));
-        }
-        let typed_call = op.clone().into_typed_call();
-        let legacy_expr =
-            try_lower_typed_instr_to_codegen_legacy(InstrTyped::CallTyped(typed_call))?;
-        return Ok(emit_codegen_expr_value_with_local_env(
-            fb,
-            &legacy_expr,
-            local_env,
-            emit_ctx,
-            borrowed,
-            codegen_env,
-            func_imports,
-        ));
+        )?;
+        let (value, ownership, facts) =
+            result.expect_pyobject("typed guarded method call expression result");
+        assert!(
+            ownership.can_satisfy_pyobject_demand(ResultDemand::PYOBJECT_OWNED),
+            "typed guarded method call expression result should satisfy owned PyObject demand"
+        );
+        return Ok(SoacValue::pyobject_with_ownership(value, ownership, facts));
     }
 
     if let InstrTyped::DirectCallableCallTyped(op) = expr {
@@ -17223,6 +17210,22 @@ fn direct_positional_call_args(
         .collect()
 }
 
+fn typed_direct_positional_call_args(
+    call: &TypedCall<InstrTyped>,
+    param_count: usize,
+) -> Option<Vec<&InstrTyped>> {
+    if !call.keywords.is_empty() || call.args.len() != param_count {
+        return None;
+    }
+    call.args
+        .iter()
+        .map(|arg| match arg {
+            CallArgPositional::Positional(value) => Some(value),
+            CallArgPositional::Starred(_) => None,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 fn static_runtime_primitive_for_call(
     call: &soac_core::block_py::Call<InstrCodegen>,
@@ -17243,6 +17246,17 @@ fn static_runtime_primitive_desc_for_call(
     let primitive = direct_abi::runtime_primitive_for_builtin_name(name)?;
     let desc = direct_abi::runtime_primitive_desc(primitive);
     let _ = direct_positional_call_args(call, desc.abi.params.len())?;
+    Some(desc)
+}
+
+fn static_runtime_primitive_desc_for_typed_call(
+    call: &TypedCall<InstrTyped>,
+    module_constants: &ModuleCodegenConstants,
+) -> Option<&'static DirectCallableDesc> {
+    let name = typed_expr_static_runtime_name(call.func.as_ref(), module_constants)?;
+    let primitive = direct_abi::runtime_primitive_for_builtin_name(name)?;
+    let desc = direct_abi::runtime_primitive_desc(primitive);
+    let _ = typed_direct_positional_call_args(call, desc.abi.params.len())?;
     Some(desc)
 }
 
@@ -17366,12 +17380,56 @@ fn codegen_expr_i64_demand_facts(
     }
 }
 
+fn typed_expr_i64_demand_facts(
+    expr: &InstrTyped,
+    local_env: &LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+) -> Option<IntFacts> {
+    if let Some(value) = typed_expr_const_i64(expr, emit_ctx.module_constants) {
+        return Some(IntFacts::i64_known(value));
+    }
+    match expr {
+        InstrTyped::CallTyped(call) => {
+            let Some(desc) =
+                static_runtime_primitive_desc_for_typed_call(call, emit_ctx.module_constants)
+            else {
+                return None;
+            };
+            if !matches!(desc.abi.result, ResultAbi::I64)
+                || !runtime_primitive_typed_call_params_can_satisfy_abi(
+                    call, desc, local_env, emit_ctx,
+                )
+            {
+                return None;
+            }
+            Some(runtime_primitive_i64_result_facts(desc))
+        }
+        InstrTyped::BinOp(op) => {
+            let lhs_facts = typed_expr_i64_demand_facts(op.left.as_ref(), local_env, emit_ctx)?;
+            let rhs_facts = typed_expr_i64_demand_facts(op.right.as_ref(), local_env, emit_ctx)?;
+            i64_binop_result_facts(op.kind, lhs_facts, rhs_facts)
+        }
+        _ => match expr.result_facts() {
+            Some(ValueFacts::I64(_)) => Some(IntFacts::i64_unknown()),
+            _ => None,
+        },
+    }
+}
+
 fn codegen_expr_can_satisfy_i64_demand(
     expr: &InstrCodegen,
     local_env: &LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
 ) -> bool {
     codegen_expr_i64_demand_facts(expr, local_env, emit_ctx).is_some()
+}
+
+fn typed_expr_can_satisfy_i64_demand(
+    expr: &InstrTyped,
+    local_env: &LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+) -> bool {
+    typed_expr_i64_demand_facts(expr, local_env, emit_ctx).is_some()
 }
 
 fn codegen_expr_has_exact_int_pyobject_facts(
@@ -17403,6 +17461,34 @@ fn codegen_expr_has_exact_int_pyobject_facts(
         .is_some_and(|py_facts| py_facts.is_exact_type(PyExactType::Int))
 }
 
+fn typed_expr_has_exact_int_pyobject_facts(
+    expr: &InstrTyped,
+    local_env: &LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+) -> bool {
+    if !matches!(emit_ctx.function_kind, FunctionKind::Function) {
+        return false;
+    }
+    if let InstrTyped::Load(op) = expr {
+        if local_env
+            .py_facts_for_load(&op.name)
+            .is_some_and(|py_facts| py_facts.is_exact_type(PyExactType::Int))
+        {
+            return true;
+        }
+        if op.name.location.as_constant().is_some_and(|index| {
+            emit_ctx
+                .module_constants
+                .constant_is_int(ModuleConstantId(index as usize))
+        }) {
+            return true;
+        }
+    }
+    expr.result_facts()
+        .and_then(ValueFacts::as_pyobj)
+        .is_some_and(|py_facts| py_facts.is_exact_type(PyExactType::Int))
+}
+
 fn codegen_expr_can_satisfy_param_abi(
     expr: &InstrCodegen,
     param: ParamAbi,
@@ -17415,6 +17501,23 @@ fn codegen_expr_can_satisfy_param_abi(
             codegen_expr_can_satisfy_i64_demand(expr, local_env, emit_ctx)
                 || (py_long_coercion.is_some()
                     && codegen_expr_has_exact_int_pyobject_facts(expr, local_env, emit_ctx))
+        }
+        ParamAbi::I32 => false,
+    }
+}
+
+fn typed_expr_can_satisfy_param_abi(
+    expr: &InstrTyped,
+    param: ParamAbi,
+    local_env: &LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+) -> bool {
+    match param {
+        ParamAbi::PyObject { .. } => true,
+        ParamAbi::I64 { py_long_coercion } => {
+            typed_expr_can_satisfy_i64_demand(expr, local_env, emit_ctx)
+                || (py_long_coercion.is_some()
+                    && typed_expr_has_exact_int_pyobject_facts(expr, local_env, emit_ctx))
         }
         ParamAbi::I32 => false,
     }
@@ -17435,6 +17538,23 @@ fn runtime_primitive_call_params_can_satisfy_abi(
     args.into_iter()
         .zip(desc.abi.params.iter().copied())
         .all(|(arg, param)| codegen_expr_can_satisfy_param_abi(arg, param, local_env, emit_ctx))
+}
+
+fn runtime_primitive_typed_call_params_can_satisfy_abi(
+    call: &TypedCall<InstrTyped>,
+    desc: &DirectCallableDesc,
+    local_env: &LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+) -> bool {
+    let DirectTargetId::RuntimePrimitive(_) = desc.target else {
+        return false;
+    };
+    let Some(args) = typed_direct_positional_call_args(call, desc.abi.params.len()) else {
+        return false;
+    };
+    args.into_iter()
+        .zip(desc.abi.params.iter().copied())
+        .all(|(arg, param)| typed_expr_can_satisfy_param_abi(arg, param, local_env, emit_ctx))
 }
 
 #[cfg(test)]
@@ -17660,6 +17780,72 @@ fn emit_i64_binop_result_with_local_env(
     ))
 }
 
+fn emit_typed_i64_binop_result_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    op: &blockpy_intrinsics::BinOp<InstrTyped>,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    demand: ResultDemand,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<Option<EmitResult>, String> {
+    if !matches!(demand, ResultDemand::I64 | ResultDemand::I64Index) {
+        return Ok(None);
+    }
+    let lhs_facts = typed_expr_i64_demand_facts(op.left.as_ref(), local_env, emit_ctx);
+    let Some(lhs_facts) = lhs_facts else {
+        return Ok(None);
+    };
+    let Some(rhs_facts) = typed_expr_i64_demand_facts(op.right.as_ref(), local_env, emit_ctx)
+    else {
+        return Ok(None);
+    };
+    let Some(result_facts) = i64_binop_result_facts(op.kind, lhs_facts, rhs_facts) else {
+        return Ok(None);
+    };
+    let lhs = emit_typed_codegen_stmt_result_with_local_env(
+        fb,
+        op.left.as_ref(),
+        local_env,
+        emit_ctx,
+        ResultDemand::I64_VALUE,
+        codegen_env,
+        func_imports,
+    )?;
+    let (lhs, _) = lhs.expect_i64("typed I64 BinOp left operand");
+    let rhs = emit_typed_codegen_stmt_result_with_local_env(
+        fb,
+        op.right.as_ref(),
+        local_env,
+        emit_ctx,
+        ResultDemand::I64_VALUE,
+        codegen_env,
+        func_imports,
+    )?;
+    let (rhs, _) = rhs.expect_i64("typed I64 BinOp right operand");
+    let (raw_value, overflow) = match op.kind {
+        blockpy_intrinsics::BinOpKind::Add => fb.ins().sadd_overflow(lhs, rhs),
+        blockpy_intrinsics::BinOpKind::Sub => fb.ins().ssub_overflow(lhs, rhs),
+        blockpy_intrinsics::BinOpKind::Mul => fb.ins().smul_overflow(lhs, rhs),
+        _ => unreachable!("unsupported typed I64 BinOp should not pass demand analysis"),
+    };
+    let value = emit_checked_i64_overflow_result(
+        fb,
+        raw_value,
+        overflow,
+        emit_ctx,
+        codegen_env,
+        func_imports,
+    );
+    Ok(Some(emit_i64_result_for_demand(
+        fb,
+        value,
+        result_facts,
+        emit_ctx,
+        demand,
+    )))
+}
+
 fn emit_exact_pylong_as_i64_saturating_result_with_local_env(
     fb: &mut FunctionBuilder<'_>,
     expr: &InstrCodegen,
@@ -17703,6 +17889,56 @@ fn emit_exact_pylong_as_i64_saturating_result_with_local_env(
         emit_ctx,
     );
     emit_i64_result_for_demand(fb, value_i64, IntFacts::i64_unknown(), emit_ctx, demand)
+}
+
+fn emit_typed_exact_pylong_as_i64_saturating_result_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    expr: &InstrTyped,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    demand: ResultDemand,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<EmitResult, String> {
+    let value = emit_typed_codegen_expr_value_with_local_env(
+        fb,
+        expr,
+        local_env,
+        emit_ctx,
+        typed_expr_pyobject_input_is_borrowed_from_local_env(expr, local_env, emit_ctx),
+        codegen_env,
+        func_imports,
+    )?;
+    let (value, ownership, _) = value.expect_pyobject("typed runtime primitive exact-int param");
+    let pylong_as_i64_saturating_ref = func_imports.get_or_panic(
+        codegen_env,
+        &mut fb.func,
+        &SOAC_RUNTIME_PYLONG_AS_I64_SATURATING_IMPORT,
+    );
+    let as_i64_inst = fb.ins().call(
+        pylong_as_i64_saturating_ref,
+        &[emit_ctx.consts.thread_state_value, value],
+    );
+    let raw_i64 = fb.inst_results(as_i64_inst)[0];
+    let owned_inputs = if ownership.is_owned() {
+        vec![value]
+    } else {
+        Vec::new()
+    };
+    let value_i64 = emit_scalar_result_after_current_exception_check_with_cleanup(
+        fb,
+        raw_i64,
+        emit_ctx.consts.i64_ty,
+        owned_inputs.as_slice(),
+        emit_ctx,
+    );
+    Ok(emit_i64_result_for_demand(
+        fb,
+        value_i64,
+        IntFacts::i64_unknown(),
+        emit_ctx,
+        demand,
+    ))
 }
 
 fn emit_runtime_primitive_hidden_args(
@@ -17785,6 +18021,75 @@ fn emit_runtime_primitive_param_value_with_local_env(
         }
         ParamAbi::I32 => panic!("runtime primitive I32 params are not implemented"),
     }
+}
+
+fn emit_runtime_primitive_typed_param_value_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    expr: &InstrTyped,
+    param: ParamAbi,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<(ir::Value, Option<ir::Value>), String> {
+    Ok(match param {
+        ParamAbi::PyObject {
+            ownership: ArgOwnership::BorrowedOk,
+        } => {
+            let value = emit_typed_codegen_expr_value_with_local_env(
+                fb,
+                expr,
+                local_env,
+                emit_ctx,
+                typed_expr_pyobject_input_is_borrowed_from_local_env(expr, local_env, emit_ctx),
+                codegen_env,
+                func_imports,
+            )?;
+            let (value, ownership, _) =
+                value.expect_pyobject("typed runtime primitive PyObject param");
+            let owned_after_call = if ownership.is_owned() {
+                Some(value)
+            } else {
+                None
+            };
+            (value, owned_after_call)
+        }
+        ParamAbi::PyObject { ownership } => {
+            panic!("runtime primitive PyObject param ownership {ownership:?} is not implemented")
+        }
+        ParamAbi::I64 {
+            py_long_coercion: Some(PyLongI64Coercion::Saturating),
+        } if typed_expr_const_i64(expr, emit_ctx.module_constants).is_none()
+            && !typed_expr_can_satisfy_i64_demand(expr, local_env, emit_ctx)
+            && typed_expr_has_exact_int_pyobject_facts(expr, local_env, emit_ctx) =>
+        {
+            let coerced = emit_typed_exact_pylong_as_i64_saturating_result_with_local_env(
+                fb,
+                expr,
+                local_env,
+                emit_ctx,
+                ResultDemand::I64_VALUE,
+                codegen_env,
+                func_imports,
+            )?;
+            let (value, _) = coerced.expect_i64("typed runtime primitive PyLong-to-I64 param");
+            (value, None)
+        }
+        ParamAbi::I64 { .. } => {
+            let arg_result = emit_typed_codegen_stmt_result_with_local_env(
+                fb,
+                expr,
+                local_env,
+                emit_ctx,
+                ResultDemand::I64_VALUE,
+                codegen_env,
+                func_imports,
+            )?;
+            let (value, _) = arg_result.expect_i64("typed runtime primitive I64 param");
+            (value, None)
+        }
+        ParamAbi::I32 => panic!("runtime primitive I32 params are not implemented"),
+    })
 }
 
 fn emit_runtime_primitive_result_for_demand(
@@ -17903,6 +18208,52 @@ fn emit_runtime_builtin_primitive_desc_call_result_with_local_env(
     )
 }
 
+fn emit_runtime_builtin_primitive_typed_desc_call_result_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    call: &TypedCall<InstrTyped>,
+    desc: &DirectCallableDesc,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    demand: ResultDemand,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<EmitResult, String> {
+    let args = typed_direct_positional_call_args(call, desc.abi.params.len())
+        .expect("typed runtime primitive call arity should match descriptor");
+    let mut call_args = emit_runtime_primitive_hidden_args(desc, emit_ctx);
+    let mut owned_inputs = Vec::new();
+    for (arg, param) in args.into_iter().zip(desc.abi.params.iter().copied()) {
+        let (value, owned_after_call) = emit_runtime_primitive_typed_param_value_with_local_env(
+            fb,
+            arg,
+            param,
+            local_env,
+            emit_ctx,
+            codegen_env,
+            func_imports,
+        )?;
+        call_args.push(value);
+        if let Some(owned_after_call) = owned_after_call {
+            owned_inputs.push(owned_after_call);
+        }
+    }
+    let func_ref = func_imports.get_or_panic(
+        codegen_env,
+        &mut fb.func,
+        runtime_primitive_import_spec(desc),
+    );
+    let call_inst = fb.ins().call(func_ref, call_args.as_slice());
+    let raw_result = fb.inst_results(call_inst).first().copied();
+    Ok(emit_runtime_primitive_result_for_demand(
+        fb,
+        desc,
+        raw_result,
+        owned_inputs.as_slice(),
+        emit_ctx,
+        demand,
+    ))
+}
+
 fn emit_runtime_builtin_primitive_call_result_with_local_env(
     fb: &mut FunctionBuilder<'_>,
     call: &soac_core::block_py::Call<InstrCodegen>,
@@ -17931,6 +18282,39 @@ fn emit_runtime_builtin_primitive_call_result_with_local_env(
             func_imports,
         ),
     )
+}
+
+fn emit_runtime_builtin_primitive_typed_call_result_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    call: &TypedCall<InstrTyped>,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    demand: ResultDemand,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<Option<EmitResult>, String> {
+    let Some(desc) = static_runtime_primitive_desc_for_typed_call(call, emit_ctx.module_constants)
+    else {
+        return Ok(None);
+    };
+    if !runtime_primitive_typed_call_params_can_satisfy_abi(call, desc, local_env, emit_ctx) {
+        return Ok(None);
+    }
+    let DirectTargetId::RuntimePrimitive(_) = desc.target else {
+        return Ok(None);
+    };
+    Ok(Some(
+        emit_runtime_builtin_primitive_typed_desc_call_result_with_local_env(
+            fb,
+            call,
+            desc,
+            local_env,
+            emit_ctx,
+            demand,
+            codegen_env,
+            func_imports,
+        )?,
+    ))
 }
 
 fn emit_codegen_call_result_with_local_env(
@@ -18001,43 +18385,15 @@ fn emit_typed_codegen_call_result_with_local_env(
         return Ok(Some(result));
     }
 
-    let legacy_call =
-        match try_lower_typed_instr_to_codegen_legacy(InstrTyped::CallTyped(call.clone())) {
-            Ok(InstrCodegen::Call(legacy_call)) => legacy_call,
-            Ok(_) => unreachable!("typed call should lower to a legacy call"),
-            Err(_) => {
-                return emit_typed_codegen_simple_positional_call_result_with_local_env(
-                    fb,
-                    call,
-                    local_env,
-                    emit_ctx,
-                    demand,
-                    codegen_env,
-                    func_imports,
-                );
-            }
-        };
-    if let Some(result) = emit_runtime_builtin_primitive_call_result_with_local_env(
+    if let Some(result) = emit_runtime_builtin_primitive_typed_call_result_with_local_env(
         fb,
-        &legacy_call,
+        call,
         local_env,
         emit_ctx,
         demand,
         codegen_env,
         func_imports,
-    ) {
-        return Ok(Some(result));
-    }
-    if demand == ResultDemand::EffectOnly
-        && let Some(result) = emit_codegen_simple_call_effect_only_with_local_env(
-            fb,
-            &legacy_call,
-            local_env,
-            emit_ctx,
-            codegen_env,
-            func_imports,
-        )
-    {
+    )? {
         return Ok(Some(result));
     }
     if typed_call_can_emit_simple_positional_with_typed_inputs(call, emit_ctx) {
@@ -18051,50 +18407,7 @@ fn emit_typed_codegen_call_result_with_local_env(
             func_imports,
         );
     }
-    let guarded_targets;
-    let profiled_targets = match &call.access {
-        TypedCallAccessPlan::Generic => None,
-        TypedCallAccessPlan::ProfiledCallableTargets { targets }
-        | TypedCallAccessPlan::ProfiledMethodTargets { targets } => Some(targets.as_slice()),
-        TypedCallAccessPlan::GuardedCallable {
-            function_guards,
-            constructor_guards,
-        } => {
-            guarded_targets = function_guards
-                .iter()
-                .map(|guard| guard.function_id)
-                .chain(constructor_guards.iter().map(|guard| guard.function_id))
-                .collect::<Vec<_>>();
-            Some(guarded_targets.as_slice())
-        }
-        TypedCallAccessPlan::GuardedMethod { method_guards, .. } => {
-            guarded_targets = method_guards
-                .iter()
-                .map(|guard| guard.function_id)
-                .collect::<Vec<_>>();
-            Some(guarded_targets.as_slice())
-        }
-        TypedCallAccessPlan::GuardedRuntimeProtocolMethod { method_guards, .. } => {
-            guarded_targets = method_guards
-                .iter()
-                .map(|guard| guard.function_id)
-                .collect::<Vec<_>>();
-            Some(guarded_targets.as_slice())
-        }
-    };
-    Ok(emit_codegen_simple_call_with_local_env(
-        fb,
-        &legacy_call,
-        local_env,
-        emit_ctx,
-        profiled_targets,
-        Some(&call.access),
-        codegen_env,
-        func_imports,
-    )
-    .map(|value| {
-        emit_owned_pyobject_result_for_demand(fb, value, PyObjFacts::unknown(), emit_ctx, demand)
-    }))
+    Ok(None)
 }
 
 fn emit_typed_codegen_simple_positional_call_result_with_local_env(
@@ -18182,9 +18495,47 @@ fn emit_typed_codegen_direct_callable_specialization_result_with_local_env(
             direct_constructor_specializations_from_typed_guards(constructor_guards),
             direct_function_specializations_from_typed_guards(function_guards),
         ),
-        TypedCallAccessPlan::Generic | TypedCallAccessPlan::ProfiledCallableTargets { .. } => {
-            (Vec::new(), Vec::new())
+        TypedCallAccessPlan::ProfiledCallableTargets { targets } => {
+            let direct_specializations = targets
+                .iter()
+                .copied()
+                .filter_map(|function_id| {
+                    let Some(target_function) = direct_call_target_function(emit_ctx, function_id)
+                    else {
+                        emit_ctx
+                            .direct_edge_stats
+                            .record_profiled_missing_target_candidate();
+                        return None;
+                    };
+                    if target_function.names.fn_name == "__init__" {
+                        return None;
+                    }
+                    let arg_plan = match validate_direct_call_compatibility(
+                        target_function,
+                        emit_ctx.direct_call_functions,
+                        simple_args.len(),
+                        0,
+                        false,
+                        false,
+                    ) {
+                        Ok(arg_plan) => arg_plan,
+                        Err(incompatibility) => {
+                            record_profiled_direct_call_incompatibility(
+                                emit_ctx.direct_edge_stats,
+                                incompatibility,
+                            );
+                            return None;
+                        }
+                    };
+                    Some(DirectFunctionSpecialization {
+                        function_id,
+                        arg_plan,
+                    })
+                })
+                .collect::<Vec<_>>();
+            (Vec::new(), direct_specializations)
         }
+        TypedCallAccessPlan::Generic => (Vec::new(), Vec::new()),
         TypedCallAccessPlan::ProfiledMethodTargets { .. }
         | TypedCallAccessPlan::GuardedMethod { .. }
         | TypedCallAccessPlan::GuardedRuntimeProtocolMethod { .. } => return Ok(None),
@@ -18532,7 +18883,7 @@ fn emit_typed_codegen_guarded_callable_call_result_with_local_env(
     demand: ResultDemand,
     codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
-) -> Result<Option<EmitResult>, String> {
+) -> Result<EmitResult, String> {
     let arg_refs = typed_simple_positional_arg_refs(
         call.args.as_slice(),
         call.keywords.as_slice(),
@@ -18554,7 +18905,7 @@ fn emit_typed_codegen_guarded_callable_call_result_with_local_env(
             codegen_env,
             func_imports,
         )?;
-        return Ok(Some(result));
+        return Ok(result);
     }
 
     emit_typed_prepared_direct_callable_specialization_result_with_local_env(
@@ -18570,6 +18921,11 @@ fn emit_typed_codegen_guarded_callable_call_result_with_local_env(
         codegen_env,
         func_imports,
     )
+    .and_then(|maybe_result| {
+        maybe_result.ok_or_else(|| {
+            "typed guarded callable call has no generic or direct emission path".to_string()
+        })
+    })
 }
 
 fn emit_typed_codegen_guarded_method_call_result_with_local_env(
@@ -18580,7 +18936,7 @@ fn emit_typed_codegen_guarded_method_call_result_with_local_env(
     demand: ResultDemand,
     codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
-) -> Result<Option<EmitResult>, String> {
+) -> Result<EmitResult, String> {
     let arg_refs = typed_simple_positional_arg_refs(
         call.args.as_slice(),
         call.keywords.as_slice(),
@@ -18602,7 +18958,7 @@ fn emit_typed_codegen_guarded_method_call_result_with_local_env(
             codegen_env,
             func_imports,
         )?;
-        return Ok(Some(result));
+        return Ok(result);
     }
 
     let Some((receiver_expr, attr_expr)) = typed_getattr_parts(call.func.as_ref()) else {
@@ -18793,13 +19149,13 @@ fn emit_typed_codegen_guarded_method_call_result_with_local_env(
 
     fb.switch_to_block(result_block);
     let result = fb.block_params(result_block)[0];
-    Ok(Some(emit_owned_pyobject_result_for_demand(
+    Ok(emit_owned_pyobject_result_for_demand(
         fb,
         result,
         PyObjFacts::unknown(),
         emit_ctx,
         demand,
-    )))
+    ))
 }
 
 fn emit_typed_codegen_direct_callable_call_result_with_local_env(
@@ -19289,6 +19645,18 @@ fn emit_typed_codegen_stmt_result_with_local_env(
     {
         return Ok(result);
     }
+    if matches!(demand, ResultDemand::I64 | ResultDemand::I64Index)
+        && let Some(const_value) = typed_expr_const_i64(expr, emit_ctx.module_constants)
+    {
+        let value = fb.ins().iconst(emit_ctx.consts.i64_ty, const_value);
+        return Ok(emit_i64_result_for_demand(
+            fb,
+            value,
+            IntFacts::i64_known(const_value),
+            emit_ctx,
+            demand,
+        ));
+    }
     if let InstrTyped::Tuple(_) = expr {
         let result = emit_typed_codegen_expr_value_with_local_env(
             fb,
@@ -19341,8 +19709,8 @@ fn emit_typed_codegen_stmt_result_with_local_env(
             return Ok(result);
         }
     }
-    if let InstrTyped::GuardedCallableCallTyped(op) = expr {
-        if let Some(result) = emit_typed_codegen_guarded_callable_call_result_with_local_env(
+    if let InstrTyped::BinOp(op) = expr
+        && let Some(result) = emit_typed_i64_binop_result_with_local_env(
             fb,
             op,
             local_env,
@@ -19350,12 +19718,23 @@ fn emit_typed_codegen_stmt_result_with_local_env(
             demand,
             codegen_env,
             func_imports,
-        )? {
-            return Ok(result);
-        }
+        )?
+    {
+        return Ok(result);
+    }
+    if let InstrTyped::GuardedCallableCallTyped(op) = expr {
+        return emit_typed_codegen_guarded_callable_call_result_with_local_env(
+            fb,
+            op,
+            local_env,
+            emit_ctx,
+            demand,
+            codegen_env,
+            func_imports,
+        );
     }
     if let InstrTyped::GuardedMethodCallTyped(op) = expr {
-        if let Some(result) = emit_typed_codegen_guarded_method_call_result_with_local_env(
+        return emit_typed_codegen_guarded_method_call_result_with_local_env(
             fb,
             op,
             local_env,
@@ -19363,9 +19742,7 @@ fn emit_typed_codegen_stmt_result_with_local_env(
             demand,
             codegen_env,
             func_imports,
-        )? {
-            return Ok(result);
-        }
+        );
     }
     if let InstrTyped::DirectCallableCallTyped(op) = expr {
         return emit_typed_codegen_direct_callable_call_result_with_local_env(
