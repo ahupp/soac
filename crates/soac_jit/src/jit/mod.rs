@@ -1852,7 +1852,7 @@ fn build_typed_v3_jit_module_plan(
     annotate_typed_module_value_facts(&mut typed_module, &value_facts);
     typed_module = lower_typed_if_tests_to_truthy(typed_module);
     if let Some(profile) = profile {
-        apply_typed_v3_inline_module_rewrites(&mut typed_module, profile)?;
+        apply_typed_v3_module_rewrites(&mut typed_module, profile)?;
     }
     build_jit_module_plan_from_prepared_typed_module(plan_jit_typed_module(
         typed_module,
@@ -1860,7 +1860,7 @@ fn build_typed_v3_jit_module_plan(
     )?)
 }
 
-fn apply_typed_v3_inline_module_rewrites(
+fn apply_typed_v3_module_rewrites(
     module: &mut BlockPyModule<TypedCodegenModuleShape>,
     profile: &SpecializationProfile<'_>,
 ) -> Result<(), String> {
@@ -1868,21 +1868,33 @@ fn apply_typed_v3_inline_module_rewrites(
     let external_callees = HashMap::new();
     for function in &mut module.callable_defs {
         let inline_direct_calls = profile.typed_inline_resolved_direct_calls(function.function_id);
-        if inline_direct_calls.is_empty() {
-            continue;
+        if !inline_direct_calls.is_empty() {
+            let inline_call_emissions = typed_call_emission_plans_from_v3(&inline_direct_calls)?;
+            lower_typed_function_call_emission_plans(function, &inline_call_emissions)?;
+            let inline_targets = profile.typed_inline_direct_calls(function.function_id);
+            let stats = inline_typed_function_direct_call_stores(
+                function,
+                &callee_module,
+                &external_callees,
+                &inline_targets,
+            );
+            if stats.rewritten_stores != 0 {
+                assign_missing_typed_function_instr_ids(function);
+                refresh_typed_function_value_facts(function);
+            }
         }
-        let inline_call_emissions = typed_call_emission_plans_from_v3(&inline_direct_calls)?;
-        lower_typed_function_call_emission_plans(function, &inline_call_emissions)?;
-        let inline_targets = profile.typed_inline_direct_calls(function.function_id);
-        let stats = inline_typed_function_direct_call_stores(
-            function,
-            &callee_module,
-            &external_callees,
-            &inline_targets,
-        );
-        if stats.rewritten_stores != 0 {
-            assign_missing_typed_function_instr_ids(function);
-            refresh_typed_function_value_facts(function);
+        let (_, _, opt_v3_indexed_fields_by_instr) =
+            profile.field_index_specialization_maps(function.function_id)?;
+        if !opt_v3_indexed_fields_by_instr.is_empty() {
+            let specialize_field_stores = profile.behavior_change_indexed_stores
+                && function.scope.scope_kind != CallableScopeKind::Module;
+            annotate_typed_attr_accesses(
+                function,
+                &HashMap::new(),
+                &HashMap::new(),
+                &opt_v3_indexed_fields_by_instr,
+                specialize_field_stores,
+            )?;
         }
     }
     Ok(())

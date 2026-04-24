@@ -18137,6 +18137,126 @@ def f(x, y):
     }
 
     #[test]
+    fn runtime_typed_v3_module_plan_carries_indexed_field_access_shape() {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "runtime_typed_v3_module_plan_carries_indexed_field_access_shape",
+        ) {
+            return;
+        }
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| {
+            let owner_module = PyModule::from_code(
+                py,
+                c"
+class Point:
+    pass
+",
+                c"field_type_test.py",
+                c"field_type_test",
+            )
+            .expect("owner module should execute");
+            let sys = PyModule::import(py, "sys").expect("sys should import");
+            let modules = sys
+                .getattr("modules")
+                .expect("sys.modules should exist")
+                .cast_into::<pyo3::types::PyDict>()
+                .expect("sys.modules should be a dict");
+            modules
+                .set_item("field_type_test", owner_module.as_any())
+                .expect("owner module should be registered");
+
+            let module_name = "runtime_typed_v3_indexed_field_plan_test";
+            let module_name_gen = ModuleNameGen::new(0);
+            let mut constants = TestConstantPool::default();
+            let mut function = test_function_in_module(&module_name_gen, "read_point");
+            function.params = ParamSpec {
+                params: vec![Param {
+                    name: "point".into(),
+                    kind: ParamKind::Any,
+                    has_default: false,
+                }],
+            };
+            let block_label = function.name_gen.next_block_name();
+            let getattr_instr_id = InstrId::new(block_label, 1);
+            function.blocks = vec![CodegenBlock {
+                label: block_label,
+                body: Vec::new(),
+                term: ret_term(with_instr_id(
+                    op_expr(GetAttr::new(
+                        name_expr(test_name("point")),
+                        constants.string_expr("x"),
+                    )),
+                    getattr_instr_id,
+                )),
+                params: Vec::new(),
+                exc_edge: None,
+            }];
+            set_stack_slots(&mut function, &["point"]);
+            let function_id = function.function_id;
+            let mut module = test_module(module_name_gen, vec![function]);
+            module.module_constants = constants.module_constants;
+
+            let profile = SpecializationProfile {
+                module_name: Some(module_name),
+                counter_dump_path: None,
+                optimized_module: None,
+                direct_call_emission_scope: DirectCallEmissionScope::AllDirectCallCandidates,
+                opt_v3_emitted_direct_calls: HashMap::new(),
+                opt_v3_emitted_exact_list_items: HashMap::new(),
+                opt_v3_emitted_indexed_fields: HashMap::from([(
+                    function_id,
+                    HashMap::from([(
+                        getattr_instr_id,
+                        vec![OptV3IndexedFieldAccessPlan {
+                            access: IndexedFieldAccessKind::Load,
+                            guard: MechanicalIndexedFieldGuard {
+                                kind: IndexedFieldGuardKind::OwnerTypeVersionAndFieldIndex,
+                                owner_type: IndexedFieldOwnerType {
+                                    module_name: "field_type_test".to_string(),
+                                    qualname: "Point".to_string(),
+                                },
+                                attr_name: "x".to_string(),
+                                expected_index: 0,
+                            },
+                            fallback: IndexedFieldFallbackKind::OriginalAttrAccess,
+                        }],
+                    )]),
+                )]),
+                opt_v3_emitted_indexed_globals: HashMap::new(),
+                opt_v3_exact_int_branch_artifacts: HashMap::new(),
+                behavior_change_indexed_stores: false,
+                profiled_cold_blocks: false,
+                guard_miss_deopt: false,
+            };
+
+            let module_plan = build_typed_v3_jit_module_plan(&module, Some(&profile))
+                .expect("typed-v3 module plan should attach indexed-field access plans");
+            let planned_function = module_plan
+                .module
+                .callable_defs
+                .iter()
+                .find(|function| function.function_id == function_id)
+                .expect("planned module should include read_point");
+            let BlockTerm::Return(InstrTyped::GetAttrTyped(op)) = &planned_function.blocks[0].term
+            else {
+                panic!("read_point should still return a typed GetAttr");
+            };
+            let TypedAttrAccessPlan::IndexedField { source, guards } = &op.access else {
+                panic!("typed-v3 module plan should carry indexed-field access shape");
+            };
+            assert_eq!(*source, TypedIndexedFieldPlanSource::OptimizationPlanV3);
+            assert_eq!(guards.len(), 1);
+            assert_eq!(guards[0].expected_index, 0);
+
+            modules
+                .del_item("field_type_test")
+                .expect("owner module should be removed");
+        });
+    }
+
+    #[test]
     fn specialized_jit_assignment_to_direct_entry_param_avoids_stack_mirror() {
         let blocks = [1usize as ObjPtr];
         let mut constants = TestConstantPool::default();
