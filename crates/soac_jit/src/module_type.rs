@@ -2063,7 +2063,7 @@ mod test {
     use soac_core::profile::COUNTER_DUMP_MAGIC;
     use soac_instrument::{
         CounterInstrumentationConfig, ExplicitCounterPlacement, InstrumentationConfig,
-        RefcountCounterMode, codegen as codegen_instrumentation,
+        RefcountCounterMode, instrument_codegen_module_with_tracker,
     };
     use soac_lowering::lower_python_to_blockpy_for_testing;
     use std::fs;
@@ -2084,7 +2084,7 @@ mod test {
             deopt_entry_counters: false,
             specialization_runtime_logging: false,
         };
-        let instrumented = codegen_instrumentation::instrument_module_with_tracker(
+        let instrumented = instrument_codegen_module_with_tracker(
             module.clone(),
             &config,
             &mut NoopPassTracker::new(),

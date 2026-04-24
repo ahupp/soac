@@ -14,7 +14,8 @@ use soac_core::block_py::{
 };
 use soac_core::pass_tracker::{NoopPassTracker, PassTracker, RecordingPassTracker};
 use soac_instrument::{
-    CounterBuilder, ExplicitCounterPlacement, InstrumentationConfig, codegen as instrumentation,
+    CounterBuilder, ExplicitCounterPlacement, InstrumentationConfig,
+    define_typed_module_counter_defs, instrument_codegen_module_with_tracker,
 };
 use soac_lowering::passes::{self, CodegenModuleShape, InstrCodegen};
 pub use soac_lowering::{LoweringError, LoweringResult, Result};
@@ -339,24 +340,17 @@ fn finish_codegen_module_with_tracker(
         == ExplicitCounterPlacement::Typed
     {
         let mut typed_for_counters = opt_passes::lower_codegen_module_to_typed(bb_codegen.clone());
-        soac_instrument::typed::define_module_counter_defs(
-            &mut typed_for_counters,
-            &instrumentation_config,
-        )
-        .map_err(anyhow::Error::msg)?;
+        define_typed_module_counter_defs(&mut typed_for_counters, &instrumentation_config)
+            .map_err(anyhow::Error::msg)?;
         let mut bb_codegen = bb_codegen;
         bb_codegen.counter_defs = typed_for_counters.counter_defs;
         bb_codegen
     } else {
         bb_codegen
     };
-    instrumentation::instrument_module_with_tracker(
-        bb_codegen,
-        &instrumentation_config,
-        pass_tracker,
-    )
-    .map_err(anyhow::Error::msg)
-    .map_err(Into::into)
+    instrument_codegen_module_with_tracker(bb_codegen, &instrumentation_config, pass_tracker)
+        .map_err(anyhow::Error::msg)
+        .map_err(Into::into)
 }
 
 fn define_deopt_entry_counters_for_current_module(

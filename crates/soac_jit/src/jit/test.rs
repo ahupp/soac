@@ -36,7 +36,7 @@ mod tests {
     };
     use soac_instrument::{
         CounterInstrumentationConfig, ExplicitCounterPlacement, InstrumentationConfig,
-        RefcountCounterMode, codegen as codegen_instrumentation,
+        RefcountCounterMode, instrument_codegen_module_with_tracker,
     };
     use soac_opt::alternatives_v3::AlternativeCatalog;
     use soac_opt::artifacts_v3::{ExactIntBranchV3Artifacts, write_optimization_artifacts_v3};
@@ -99,7 +99,7 @@ mod tests {
     fn instrument_module_with_legacy_call_target_counters(
         module: &mut BlockPyModule<CodegenModuleShape>,
     ) {
-        let instrumented = codegen_instrumentation::instrument_module_with_tracker(
+        let instrumented = instrument_codegen_module_with_tracker(
             module.clone(),
             &legacy_counter_instrumentation_config(true, false),
             &mut NoopPassTracker::new(),
@@ -111,7 +111,7 @@ mod tests {
     fn instrument_module_with_legacy_block_entry_counters(
         module: &mut BlockPyModule<CodegenModuleShape>,
     ) {
-        let instrumented = codegen_instrumentation::instrument_module_with_tracker(
+        let instrumented = instrument_codegen_module_with_tracker(
             module.clone(),
             &legacy_counter_instrumentation_config(false, true),
             &mut NoopPassTracker::new(),

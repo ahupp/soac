@@ -49,7 +49,7 @@ use soac_driver::codegen_cache::{
     validate_codegen_module_cache_metadata,
 };
 use soac_driver::finish_cached_codegen_module_for_runtime_with_counter_defs;
-use soac_instrument::InstrumentationConfig;
+use soac_instrument::{InstrumentationConfig, instrument_typed_module};
 use soac_opt::access_emission_v3::{
     ExactListItemAccessPlan as OptV3ExactListItemAccessPlan,
     IndexedFieldAccessPlan as OptV3IndexedFieldAccessPlan,
@@ -1962,7 +1962,7 @@ fn build_typed_v3_jit_module_plan(
 ) -> Result<Arc<JitModulePlan>, String> {
     let value_facts = infer_jit_value_facts(module);
     let mut typed_module = lower_codegen_module_to_typed(module.clone());
-    typed_module = soac_instrument::typed::instrument_module(
+    typed_module = instrument_typed_module(
         typed_module,
         &InstrumentationConfig::from_env_config(env_config),
     )?;
