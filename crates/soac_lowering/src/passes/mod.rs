@@ -392,13 +392,5 @@ impl ModuleShape for CodegenModuleShape {
     type ModuleConstant = InstrResolved;
 }
 
-#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-pub(crate) struct CodegenUnidentifiedModuleShape;
-
-impl ModuleShape for CodegenUnidentifiedModuleShape {
-    type Instr = InstrCodegen;
-    type ModuleConstant = InstrResolved;
-}
-
 #[cfg(test)]
 mod test;

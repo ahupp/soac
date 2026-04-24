@@ -8,8 +8,8 @@ use crate::passes::ast_to_ast::{
 use crate::passes::core_await_lower::lower_awaits_in_core_blockpy_module;
 use crate::passes::ruff_to_blockpy::rewrite_ast_to_core_blockpy_module_with_module;
 use crate::passes::{
-    self, CodegenModuleShape, CodegenUnidentifiedModuleShape, CoreModuleShape,
-    CoreModuleShapeWithAwaitAndYield, CoreModuleShapeWithYield, ResolvedStorageModuleShape,
+    self, CodegenModuleShape, CoreModuleShape, CoreModuleShapeWithAwaitAndYield,
+    CoreModuleShapeWithYield, ResolvedStorageModuleShape,
 };
 use crate::{ParseError, Result};
 use ruff_python_ast::{self as ast, Stmt};
@@ -194,7 +194,7 @@ pub fn lower_source_to_codegen_module_with_tracker(
             passes::lower_try_jump_exception_flow(&global_index)
         });
     let bb_codegen: BlockPyModule<CodegenModuleShape> = pass_tracker.run_pass("bb_codegen", || {
-        let mut bb_codegen: BlockPyModule<CodegenUnidentifiedModuleShape> =
+        let mut bb_codegen: BlockPyModule<CodegenModuleShape> =
             passes::normalize_bb_module_strings(&bb_prepared);
         passes::relabel_dense_bb_module(&mut bb_codegen);
         passes::assign_module_instr_ids(bb_codegen)

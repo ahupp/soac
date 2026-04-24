@@ -2,7 +2,7 @@ use crate::block_py::{
     walk_expr_mut, BlockLabel, BlockPyFunction, BlockPyModule, ChildVisitable, HasMeta,
     HasSemanticInstrId, InstrCodegen, InstrId, InstrKey, Visit, VisitMut, WithMeta,
 };
-use crate::passes::{CodegenModuleShape, CodegenUnidentifiedModuleShape};
+use crate::passes::CodegenModuleShape;
 use std::collections::{HashMap, HashSet};
 
 struct BlockInstrIdAssigner {
@@ -38,9 +38,7 @@ impl VisitMut<InstrCodegen> for BlockInstrIdAssigner {
     }
 }
 
-pub(crate) fn assign_function_instr_ids(
-    function: &mut BlockPyFunction<CodegenUnidentifiedModuleShape>,
-) {
+pub(crate) fn assign_function_instr_ids(function: &mut BlockPyFunction<CodegenModuleShape>) {
     for block in &mut function.blocks {
         let mut assigner = BlockInstrIdAssigner {
             block_label: block.label,
@@ -51,13 +49,7 @@ pub(crate) fn assign_function_instr_ids(
 }
 
 pub fn reassign_codegen_function_instr_ids(function: &mut BlockPyFunction<CodegenModuleShape>) {
-    for block in &mut function.blocks {
-        let mut assigner = BlockInstrIdAssigner {
-            block_label: block.label,
-            next_instr_index_in_block: 0,
-        };
-        assigner.visit_block_mut(block);
-    }
+    assign_function_instr_ids(function);
 }
 
 struct MissingBlockInstrIdAssigner<'a> {
@@ -159,38 +151,13 @@ pub fn reassign_codegen_module_instr_ids(module: &mut BlockPyModule<CodegenModul
     }
 }
 
-fn into_identified_function(
-    mut function: BlockPyFunction<CodegenUnidentifiedModuleShape>,
-) -> BlockPyFunction<CodegenModuleShape> {
-    assign_function_instr_ids(&mut function);
-    BlockPyFunction {
-        function_id: function.function_id,
-        name_gen: function.name_gen,
-        names: function.names,
-        kind: function.kind,
-        execution_mode: function.execution_mode,
-        params: function.params,
-        blocks: function.blocks,
-        doc: function.doc,
-        storage_layout: function.storage_layout,
-        scope: function.scope,
-    }
-}
-
 pub(crate) fn assign_module_instr_ids(
-    module: BlockPyModule<CodegenUnidentifiedModuleShape>,
+    mut module: BlockPyModule<CodegenModuleShape>,
 ) -> BlockPyModule<CodegenModuleShape> {
-    BlockPyModule {
-        module_name_gen: module.module_name_gen,
-        global_names: module.global_names,
-        callable_defs: module
-            .callable_defs
-            .into_iter()
-            .map(into_identified_function)
-            .collect(),
-        module_constants: module.module_constants,
-        counter_defs: module.counter_defs,
+    for function in &mut module.callable_defs {
+        assign_function_instr_ids(function);
     }
+    module
 }
 
 struct CodegenInstrIdValidator<'a> {

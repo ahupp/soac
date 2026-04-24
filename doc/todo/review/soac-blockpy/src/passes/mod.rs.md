@@ -11,7 +11,7 @@ Defines the central instruction enums and module-shape types for every major com
 - `InstrTyped` / `InstrTypedCodegen`: transitional typed instruction enum, containing typed operations plus legacy codegen operations.
 - `CodegenToTyped`: mapper from codegen to typed instruction shape.
 - `InstrWithAwaitAndYield`, `InstrWithYield`, `InstrLow<N>`, `InstrUnresolved`, and `InstrResolved`: intermediate instruction enums for progressively lowered pipeline stages.
-- Module shape structs: `CoreModuleShapeWithAwaitAndYield`, `CoreModuleShapeWithYield`, `CoreModuleShape`, `ResolvedStorageModuleShape`, `CodegenModuleShape`, `TypedCodegenModuleShape`, and `CodegenUnidentifiedModuleShape`.
+- Module shape structs: `CoreModuleShapeWithAwaitAndYield`, `CoreModuleShapeWithYield`, `CoreModuleShape`, `ResolvedStorageModuleShape`, `CodegenModuleShape`, and `TypedCodegenModuleShape`.
 
 ## Functions
 - `TypedTruthy::new`, `value`, and `into_value`: construct and access typed truthiness operands.

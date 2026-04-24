@@ -403,9 +403,9 @@ Started:
 - The codegen instruction enum has been split by name into `InstrCodegenOp`,
   with `InstrCodegen` retained as a compatibility alias. The next step is to
   replace the alias with an identified wrapper.
-- `CodegenUnidentifiedModuleShape` now represents normalized codegen IR before
-  ID assignment. `assign_module_instr_ids` consumes that shape and returns
-  `CodegenModuleShape`, making the pre-ID/post-ID pass boundary explicit.
+- Normalized codegen IR uses `CodegenModuleShape` before and after ID assignment.
+  `assign_module_instr_ids` fills semantic instruction IDs, and validation
+  enforces the post-ID invariant immediately afterward.
 - `constant_none` has been split out of the base `Instr` trait so future
   identified codegen instructions are not required to synthesize fake semantic
   IDs.
