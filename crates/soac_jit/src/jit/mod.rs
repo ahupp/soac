@@ -5725,6 +5725,32 @@ fn codegen_expr_runtime_helper(
         })
 }
 
+fn typed_expr_helper_name<'a>(
+    expr: &'a InstrTyped,
+    module_constants: &'a ModuleCodegenConstants,
+) -> Option<&'a str> {
+    match expr {
+        InstrTyped::Load(op)
+            if op.name.location.is_global() || op.name.location.is_runtime_name() =>
+        {
+            Some(op.name.id.as_str())
+        }
+        InstrTyped::Load(op) => op.name.location.as_constant().and_then(|index| {
+            module_constants.constant_runtime_name_value(ModuleConstantId(index as usize))
+        }),
+        _ => None,
+    }
+}
+
+fn typed_expr_runtime_helper(expr: &InstrTyped, ctx: &JitEmitCtx<'_>) -> Option<RuntimeHelperId> {
+    expr.result_facts()
+        .and_then(ValueFacts::runtime_helper)
+        .or_else(|| {
+            typed_expr_helper_name(expr, ctx.module_constants)
+                .and_then(RuntimeHelperId::from_runtime_symbol)
+        })
+}
+
 struct SuperInstanceArg {
     value: ir::Value,
     is_borrowed: bool,
@@ -15948,6 +15974,12 @@ struct SimpleCallParts<'a> {
     has_unpack: bool,
 }
 
+struct TypedSimpleCallParts<'a> {
+    simple_args: Vec<&'a InstrTyped>,
+    simple_keywords: Vec<(&'a str, &'a InstrTyped)>,
+    has_unpack: bool,
+}
+
 fn simple_call_parts(call: &soac_core::block_py::Call<InstrCodegen>) -> SimpleCallParts<'_> {
     let mut simple_args: Vec<&InstrCodegen> = Vec::new();
     let mut simple_keywords: Vec<(&str, &InstrCodegen)> = Vec::new();
@@ -15971,28 +16003,50 @@ fn simple_call_parts(call: &soac_core::block_py::Call<InstrCodegen>) -> SimpleCa
     }
 }
 
+fn typed_simple_call_parts(call: &TypedCall<InstrTyped>) -> TypedSimpleCallParts<'_> {
+    let mut simple_args: Vec<&InstrTyped> = Vec::new();
+    let mut simple_keywords: Vec<(&str, &InstrTyped)> = Vec::new();
+    let mut has_unpack = false;
+    for arg in &call.args {
+        match arg {
+            CallArgPositional::Positional(value) => simple_args.push(value),
+            CallArgPositional::Starred(_) => has_unpack = true,
+        }
+    }
+    for keyword in &call.keywords {
+        match keyword {
+            CallArgKeyword::Named { arg, value } => simple_keywords.push((arg.as_str(), value)),
+            CallArgKeyword::Starred(_) => has_unpack = true,
+        }
+    }
+    TypedSimpleCallParts {
+        simple_args,
+        simple_keywords,
+        has_unpack,
+    }
+}
+
 fn typed_call_can_emit_simple_positional_with_typed_inputs(
     call: &TypedCall<InstrTyped>,
-    legacy_call: &soac_core::block_py::Call<InstrCodegen>,
     emit_ctx: &JitEmitCtx<'_>,
 ) -> bool {
     if !matches!(call.access, TypedCallAccessPlan::Generic) {
         return false;
     }
-    let SimpleCallParts {
+    let TypedSimpleCallParts {
         simple_args,
         simple_keywords,
         has_unpack,
-    } = simple_call_parts(legacy_call);
+    } = typed_simple_call_parts(call);
     if has_unpack || !simple_keywords.is_empty() {
         return false;
     }
-    if codegen_expr_runtime_helper(legacy_call.func.as_ref(), emit_ctx).is_some() {
+    if typed_expr_runtime_helper(call.func.as_ref(), emit_ctx).is_some() {
         return false;
     }
     if simple_args.len() == 3
         && matches!(
-            codegen_expr_helper_name(legacy_call.func.as_ref(), emit_ctx.module_constants),
+            typed_expr_helper_name(call.func.as_ref(), emit_ctx.module_constants),
             Some("call_super")
         )
     {
@@ -18331,6 +18385,18 @@ fn emit_typed_codegen_call_result_with_local_env(
     codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<Option<EmitResult>, String> {
+    if let Some(result) = emit_typed_codegen_direct_callable_specialization_result_with_local_env(
+        fb,
+        call,
+        local_env,
+        emit_ctx,
+        demand,
+        codegen_env,
+        func_imports,
+    )? {
+        return Ok(Some(result));
+    }
+
     let legacy_call =
         match try_lower_typed_instr_to_codegen_legacy(InstrTyped::CallTyped(call.clone())) {
             Ok(InstrCodegen::Call(legacy_call)) => legacy_call,
@@ -18370,7 +18436,7 @@ fn emit_typed_codegen_call_result_with_local_env(
     {
         return Ok(Some(result));
     }
-    if typed_call_can_emit_simple_positional_with_typed_inputs(call, &legacy_call, emit_ctx) {
+    if typed_call_can_emit_simple_positional_with_typed_inputs(call, emit_ctx) {
         return emit_typed_codegen_simple_positional_call_result_with_local_env(
             fb,
             call,
@@ -18412,18 +18478,6 @@ fn emit_typed_codegen_call_result_with_local_env(
             Some(guarded_targets.as_slice())
         }
     };
-    if let Some(result) = emit_typed_codegen_direct_callable_specialization_result_with_local_env(
-        fb,
-        call,
-        &legacy_call,
-        local_env,
-        emit_ctx,
-        demand,
-        codegen_env,
-        func_imports,
-    )? {
-        return Ok(Some(result));
-    }
     Ok(emit_codegen_simple_call_with_local_env(
         fb,
         &legacy_call,
@@ -18486,27 +18540,26 @@ fn emit_typed_codegen_simple_positional_call_result_with_local_env(
 fn emit_typed_codegen_direct_callable_specialization_result_with_local_env(
     fb: &mut FunctionBuilder<'_>,
     call: &TypedCall<InstrTyped>,
-    legacy_call: &soac_core::block_py::Call<InstrCodegen>,
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     demand: ResultDemand,
     codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<Option<EmitResult>, String> {
-    let SimpleCallParts {
+    let TypedSimpleCallParts {
         simple_args,
         simple_keywords,
         has_unpack,
-    } = simple_call_parts(legacy_call);
+    } = typed_simple_call_parts(call);
     if has_unpack || !simple_keywords.is_empty() {
         return Ok(None);
     }
-    if codegen_expr_runtime_helper(legacy_call.func.as_ref(), emit_ctx).is_some() {
+    if typed_expr_runtime_helper(call.func.as_ref(), emit_ctx).is_some() {
         return Ok(None);
     }
     if simple_args.len() == 3
         && matches!(
-            codegen_expr_helper_name(legacy_call.func.as_ref(), emit_ctx.module_constants),
+            typed_expr_helper_name(call.func.as_ref(), emit_ctx.module_constants),
             Some("call_super")
         )
     {
@@ -18516,7 +18569,7 @@ fn emit_typed_codegen_direct_callable_specialization_result_with_local_env(
     let arg_refs = typed_simple_positional_args(call)?;
     debug_assert_eq!(simple_args.len(), arg_refs.len());
 
-    let site_instr_id = legacy_call.try_semantic_instr_id();
+    let site_instr_id = call.try_semantic_instr_id();
     let (constructor_specializations, direct_specializations) = match &call.access {
         TypedCallAccessPlan::GuardedCallable {
             function_guards,
