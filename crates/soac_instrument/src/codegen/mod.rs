@@ -1,12 +1,13 @@
-use crate::block_py::HasSemanticInstrId;
-use crate::block_py::{
-    core_call_expr_with_meta, literal_expr, BlockPyFunction, BlockPyModule, BlockTerm,
-    CallArgPositional, ChildVisitable, CounterScope, CounterSite, FunctionExecutionMode,
-    IncrementCounter, InstrCodegen, InstrResolved, Load, Meta, NameLocation, ResolvedName,
-    RuntimeName, StringLiteral, Tuple, Visit, WithMeta,
-};
-use crate::passes::{CodegenModuleShape, CounterBuilder};
+use crate::CounterBuilder;
 use soac_config::{ExecTraceConfig, SoacEnvConfig, SpecializationMode};
+use soac_core::block_py::{
+    BinOpKind, BlockPyFunction, BlockPyModule, BlockTerm, Call, CallArgPositional, ChildVisitable,
+    CounterScope, CounterSite, FunctionExecutionMode, HasSemanticInstrId, InstrId, LiteralValue,
+    Load, Meta, NameLocation, ResolvedName, RuntimeFunctionId, RuntimeName, StringLiteral, Tuple,
+    Visit, WithMeta,
+};
+use soac_lowering::block_py::counters::IncrementCounter;
+use soac_lowering::passes::{CodegenModuleShape, InstrCodegen, InstrResolved};
 use std::collections::HashMap;
 
 pub fn call_target_counter_instrumentation_enabled(config: &SoacEnvConfig) -> bool {
@@ -191,18 +192,18 @@ pub fn instrument_bb_module_with_call_target_counters(
         match expr {
             InstrCodegen::BinOp(op) => matches!(
                 op.kind,
-                crate::block_py::BinOpKind::Add
-                    | crate::block_py::BinOpKind::Sub
-                    | crate::block_py::BinOpKind::Mul
-                    | crate::block_py::BinOpKind::And
-                    | crate::block_py::BinOpKind::Or
-                    | crate::block_py::BinOpKind::Xor
-                    | crate::block_py::BinOpKind::Eq
-                    | crate::block_py::BinOpKind::Ne
-                    | crate::block_py::BinOpKind::Lt
-                    | crate::block_py::BinOpKind::Le
-                    | crate::block_py::BinOpKind::Gt
-                    | crate::block_py::BinOpKind::Ge
+                BinOpKind::Add
+                    | BinOpKind::Sub
+                    | BinOpKind::Mul
+                    | BinOpKind::And
+                    | BinOpKind::Or
+                    | BinOpKind::Xor
+                    | BinOpKind::Eq
+                    | BinOpKind::Ne
+                    | BinOpKind::Lt
+                    | BinOpKind::Le
+                    | BinOpKind::Gt
+                    | BinOpKind::Ge
             ),
             _ => false,
         }
@@ -226,8 +227,8 @@ pub fn instrument_bb_module_with_call_target_counters(
 
     fn define_instr_shape_counters(
         counters: &mut CounterBuilder<'_>,
-        function_id: crate::block_py::RuntimeFunctionId,
-        instr_id: crate::block_py::InstrId,
+        function_id: RuntimeFunctionId,
+        instr_id: InstrId,
         shape_kind: &'static str,
         branch_kind: &'static str,
     ) {
@@ -252,8 +253,8 @@ pub fn instrument_bb_module_with_call_target_counters(
 
     fn define_indexed_counter(
         counters: &mut CounterBuilder<'_>,
-        function_id: crate::block_py::RuntimeFunctionId,
-        instr_id: crate::block_py::InstrId,
+        function_id: RuntimeFunctionId,
+        instr_id: InstrId,
         kind: &'static str,
     ) {
         counters.define_branch_counter_if_missing(
@@ -269,8 +270,8 @@ pub fn instrument_bb_module_with_call_target_counters(
 
     fn define_field_access_counter(
         counters: &mut CounterBuilder<'_>,
-        function_id: crate::block_py::RuntimeFunctionId,
-        instr_id: crate::block_py::InstrId,
+        function_id: RuntimeFunctionId,
+        instr_id: InstrId,
     ) {
         counters.define_branch_counter_if_missing(
             CounterScope::This,
@@ -289,7 +290,7 @@ pub fn instrument_bb_module_with_call_target_counters(
     }
 
     struct SpecializationCandidateCounterCollector<'a, 'b> {
-        function_id: crate::block_py::RuntimeFunctionId,
+        function_id: RuntimeFunctionId,
         counters: &'a mut CounterBuilder<'b>,
     }
 
@@ -508,34 +509,35 @@ fn helper_call_expr(helper_name: &str, args: Vec<InstrCodegen>) -> InstrCodegen 
     let meta = Meta::synthetic();
     let runtime_name = RuntimeName::from_name(helper_name)
         .unwrap_or_else(|| panic!("unknown SOAC trace helper runtime name {helper_name:?}"));
-    let func = Load::new(ResolvedName {
+    let func: InstrCodegen = Load::new(ResolvedName {
         id: runtime_name.name().into(),
         location: NameLocation::RuntimeName(runtime_name),
     })
     .with_meta(meta.clone())
     .into();
-    core_call_expr_with_meta(
+    Call::new(
         func,
-        meta.node_index,
-        meta.range,
         args.into_iter()
             .map(CallArgPositional::Positional)
-            .collect(),
+            .collect::<Vec<_>>(),
         Vec::new(),
     )
+    .with_meta(meta)
+    .into()
 }
 
 fn string_literal_expr(module_constants: &mut Vec<InstrResolved>, value: &str) -> InstrCodegen {
     let meta = Meta::synthetic();
     let index = u32::try_from(module_constants.len())
         .expect("trace module constant count should fit in u32");
-    module_constants.push(literal_expr(
-        StringLiteral {
+    module_constants.push(
+        LiteralValue::new(StringLiteral {
             value: value.to_string(),
-        },
-        meta.clone(),
-    ));
-    crate::block_py::Load::new(crate::block_py::ResolvedName {
+        })
+        .with_meta(meta.clone())
+        .into(),
+    );
+    Load::new(ResolvedName {
         id: format!("__dp_constant_{index}").into(),
         location: NameLocation::Constant(index),
     })

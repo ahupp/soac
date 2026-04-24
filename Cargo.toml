@@ -3,6 +3,7 @@ members = [
     "crates/build_support",
     "crates/soac_core",
     "crates/soac_opt",
+    "crates/soac_instrument",
     "crates/soac_driver",
     "crates/soac_config",
     "crates/soac_cpython",
@@ -15,6 +16,7 @@ members = [
 default-members = [
     "crates/soac_core",
     "crates/soac_opt",
+    "crates/soac_instrument",
     "crates/soac_driver",
     "crates/soac_config",
     "crates/soac_cpython",

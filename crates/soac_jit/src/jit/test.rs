@@ -13,11 +13,12 @@ use soac_core::block_py::{
     SerializedIdentityTables, SerializedModuleId, SerializedModuleIdentity, SetAttr, SetItem,
     StorageLayout, Store, Tuple, UnaryOp, UnaryOpKind, Visit, VisitMut, WithMeta,
 };
+use soac_instrument::codegen::{
+    instrument_bb_module_with_block_entry_counters, instrument_bb_module_with_call_target_counters,
+};
 use soac_lowering::block_py::counters::IncrementCounter;
 use soac_lowering::passes::{
-    CodegenModuleShape, InstrCodegen, InstrResolved,
-    instrument_bb_module_with_block_entry_counters, instrument_bb_module_with_call_target_counters,
-    validate_codegen_instr_ids,
+    CodegenModuleShape, InstrCodegen, InstrResolved, validate_codegen_instr_ids,
 };
 mod tests {
     use super::*;

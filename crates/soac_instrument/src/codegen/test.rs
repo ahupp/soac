@@ -3,28 +3,14 @@ use super::{
     instrument_bb_module_with_call_target_counters, instrument_bb_module_with_global_load_counters,
     instrument_bb_module_with_locality_counters, instrument_bb_module_with_refcount_counters,
 };
-use crate::block_py::{
-    BlockPyFunction, BlockPyModule, Call, ChildVisitable, CounterScope, CounterSite,
-    FunctionExecutionMode, InstrCodegen, NameLike, NameLocation, RuntimeFunctionId, Visit,
-};
-use crate::lower_python_to_blockpy_for_testing;
-use crate::pass_tracker::LoweringPassTrackerInternalExt;
-use crate::passes::{
-    assign_module_instr_ids, lower_try_jump_exception_flow, normalize_bb_module_strings,
-    CodegenModuleShape,
-};
 use soac_config::ExecTraceConfig;
+use soac_core::block_py::{
+    BlockPyFunction, BlockPyModule, Call, ChildVisitable, CounterScope, CounterSite,
+    FunctionExecutionMode, NameLike, NameLocation, RuntimeFunctionId, Visit,
+};
+use soac_lowering::lower_python_to_blockpy_for_testing;
+use soac_lowering::passes::{CodegenModuleShape, InstrCodegen};
 use std::collections::HashSet;
-
-fn tracked_name_binding_module(
-    source: &str,
-) -> anyhow::Result<Option<crate::block_py::BlockPyModule<crate::passes::ResolvedStorageModuleShape>>>
-{
-    Ok(lower_python_to_blockpy_for_testing(source)?
-        .pass_tracker
-        .pass_name_binding()
-        .cloned())
-}
 
 fn trace_enter_calls(function: &BlockPyFunction<CodegenModuleShape>) -> Vec<&Call<InstrCodegen>> {
     function
@@ -46,13 +32,9 @@ fn trace_enter_calls(function: &BlockPyFunction<CodegenModuleShape>) -> Vec<&Cal
 }
 
 fn codegen_module_for_trace_test(source: &str) -> BlockPyModule<CodegenModuleShape> {
-    let bb_module = tracked_name_binding_module(source)
+    lower_python_to_blockpy_for_testing(source)
         .expect("transform should succeed")
-        .expect("bb module should be available");
-    let prepared = lower_try_jump_exception_flow(&bb_module);
-    let mut normalized = normalize_bb_module_strings(&prepared);
-    crate::passes::relabel_dense_bb_module(&mut normalized);
-    assign_module_instr_ids(normalized)
+        .codegen_module
 }
 
 struct LocalLoadProbe {

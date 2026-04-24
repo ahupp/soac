@@ -1,4 +1,4 @@
-use crate::block_py::{
+use soac_core::block_py::{
     Block, BlockLabel, BlockTerm, CounterBranchId, CounterDef, CounterId, CounterScope,
     CounterSite, Instr,
 };
@@ -328,13 +328,12 @@ fn all_paths_end_in_fallthrough<I: Instr>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block_py::{
+    use soac_core::block_py::{
         BlockEdge, Call, CallArgPositional, CallDirect, CalleeFunctionId, HasMeta,
-        HasSemanticInstrId, InstrCodegen, InstrId, InstrWithConstantNone, Load, Meta, NameLocation,
-        ResolvedName, RuntimeFunctionId, RuntimeName, TermBranchTable, WithMeta,
+        HasSemanticInstrId, InstrId, InstrWithConstantNone, Load, Meta, NameLocation, ResolvedName,
+        RuntimeFunctionId, RuntimeName, TermBranchTable, WithMeta,
     };
-    use crate::passes::InstrRuff;
-    use crate::py_expr;
+    use soac_lowering::passes::InstrCodegen;
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct CallHotTargetsCounterSpec {
         function_id: RuntimeFunctionId,
@@ -550,7 +549,7 @@ mod tests {
     fn opt_block_accepts_fallthrough_fragment() {
         let entry = Block::new(
             BlockLabel::from_index(0),
-            vec![crate::passes::ast_to_instr::from_ast_expr(py_expr!("x"))],
+            vec![runtime_name_expr("NONE", Meta::synthetic())],
             BlockTerm::Jump(BlockEdge::new(BlockLabel::fallthrough())),
             Vec::new(),
             None,
@@ -565,14 +564,14 @@ mod tests {
     fn opt_block_rejects_non_fallthrough_cycle() {
         let entry = Block::new(
             BlockLabel::from_index(0),
-            Vec::<InstrRuff>::new(),
+            Vec::<InstrCodegen>::new(),
             BlockTerm::Jump(BlockEdge::new(BlockLabel::from_index(1))),
             Vec::new(),
             None,
         );
         let dep = Block::new(
             BlockLabel::from_index(1),
-            Vec::<InstrRuff>::new(),
+            Vec::<InstrCodegen>::new(),
             BlockTerm::Jump(BlockEdge::new(BlockLabel::from_index(0))),
             Vec::new(),
             None,
@@ -587,8 +586,8 @@ mod tests {
     fn opt_block_rejects_return_exit() {
         let entry = Block::new(
             BlockLabel::from_index(0),
-            Vec::<InstrRuff>::new(),
-            BlockTerm::Return(InstrRuff::constant_none()),
+            Vec::<InstrCodegen>::new(),
+            BlockTerm::Return(InstrCodegen::constant_none()),
             Vec::new(),
             None,
         );

@@ -1,0 +1,13 @@
+[package]
+name = "soac_instrument"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "soac_instrument"
+path = "src/lib.rs"
+
+[dependencies]
+soac_config = { path = "../soac_config" }
+soac_core = { path = "../soac_core" }
+soac_lowering = { path = "../soac_lowering" }

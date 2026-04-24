@@ -7,10 +7,8 @@ mod blockpy_to_bb;
 pub(crate) mod core_await_lower;
 mod global_index;
 mod instr_id;
-mod instrument;
 mod name_binding;
 pub(crate) mod ruff_to_blockpy;
-mod trace;
 
 use crate::block_py::{
     cfg::relabel_blockpy_blocks_dense, define_instr, runtime_name_load, Await, BinOp,
@@ -330,24 +328,12 @@ impl ModuleShape for ResolvedStorageModuleShape {
 
 pub(crate) use blockpy_generators::lower_yield_in_lowered_core_blockpy_module_bundle;
 pub(crate) use blockpy_to_bb::{lower_try_jump_exception_flow, normalize_bb_module_strings};
+pub(crate) use global_index::lower_global_index_in_resolved_module_default;
 pub(crate) use instr_id::assign_module_instr_ids;
 pub use instr_id::{
     assign_missing_codegen_function_instr_ids, reassign_codegen_function_instr_ids,
     reassign_codegen_module_instr_ids, validate_codegen_instr_ids,
 };
-pub use instrument::{
-    CounterBuilder, CounterHandle, CounterSpec, InstrumentInstr, OptBlock, OptInstr,
-};
-pub use trace::{
-    call_target_counter_instrumentation_enabled, deopt_entry_counter_instrumentation_enabled,
-    instrument_bb_module_for_trace, instrument_bb_module_with_block_entry_counters,
-    instrument_bb_module_with_call_target_counters, instrument_bb_module_with_global_load_counters,
-    instrument_bb_module_with_locality_counters, instrument_bb_module_with_refcount_counters,
-    locality_counter_instrumentation_enabled, refcount_counter_instrumentation_enabled,
-    specialization_runtime_logging_enabled,
-};
-
-pub(crate) use global_index::lower_global_index_in_resolved_module_default;
 pub(crate) use name_binding::lower_name_binding_in_core_blockpy_module_with_options;
 pub(crate) fn relabel_dense_bb_module<P: ModuleShape>(module: &mut BlockPyModule<P>) {
     for callable in &mut module.callable_defs {

@@ -268,11 +268,11 @@ pub fn validate_codegen_instr_ids(
 mod test {
     use super::validate_codegen_instr_ids;
     use crate::block_py::{
-        walk_block, ChildVisitable, HasMeta, HasSemanticInstrId, InstrCodegen, InstrId, Visit,
-        VisitMut, WithMeta,
+        counters::IncrementCounter, walk_block, ChildVisitable, CounterId, HasMeta,
+        HasSemanticInstrId, InstrCodegen, InstrId, Meta, Visit, VisitMut, WithMeta,
     };
     use crate::lower_python_to_blockpy_for_testing;
-    use crate::passes::{instrument_bb_module_with_block_entry_counters, CodegenModuleShape};
+    use crate::passes::CodegenModuleShape;
     use std::collections::HashMap;
 
     struct InstrIdCollector {
@@ -448,7 +448,15 @@ def f(x):
         .expect("transform should succeed")
         .codegen_module;
 
-        instrument_bb_module_with_block_entry_counters(&mut lowered);
+        let f = lowered
+            .callable_defs
+            .iter_mut()
+            .find(|function| function.names.qualname == "f")
+            .expect("missing lowered function f");
+        f.blocks[0].body.insert(
+            0,
+            InstrCodegen::from(IncrementCounter::new(CounterId(0)).with_meta(Meta::synthetic())),
+        );
 
         validate_codegen_instr_ids(&lowered)
             .expect("synthetic counter instrumentation should not require semantic ids");

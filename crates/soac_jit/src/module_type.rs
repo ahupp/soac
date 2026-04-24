@@ -25,10 +25,10 @@ use soac_driver::codegen_cache::{
     validate_codegen_module_cache_metadata,
 };
 use soac_driver::finish_cached_codegen_module_for_runtime_with_counter_defs;
-use soac_lowering::passes::{
-    CodegenModuleShape, InstrCodegen, deopt_entry_counter_instrumentation_enabled,
-    specialization_runtime_logging_enabled,
+use soac_instrument::codegen::{
+    deopt_entry_counter_instrumentation_enabled, specialization_runtime_logging_enabled,
 };
+use soac_lowering::passes::{CodegenModuleShape, InstrCodegen};
 use soac_opt::access_emission_v3::{
     IndexedFieldAccessPlan as OptV3IndexedFieldAccessPlan,
     indexed_fields_for_function_from_artifacts as opt_v3_emitted_indexed_fields_for_function,
@@ -2060,8 +2060,8 @@ mod test {
     use super::*;
     use pyo3::types::PyModule;
     use soac_core::profile::COUNTER_DUMP_MAGIC;
+    use soac_instrument::codegen::instrument_bb_module_with_block_entry_counters;
     use soac_lowering::lower_python_to_blockpy_for_testing;
-    use soac_lowering::passes::instrument_bb_module_with_block_entry_counters;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
