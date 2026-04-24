@@ -62,7 +62,6 @@ use soac_opt::access_emission_v3::{
     indexed_fields_for_function_from_artifacts as opt_v3_emitted_indexed_fields_for_function,
     indexed_globals_for_function_from_artifacts as opt_v3_emitted_indexed_globals_for_function,
     prepare_indexed_field_accesses_for_codegen as opt_v3_prepare_indexed_field_accesses_for_codegen,
-    prepared_indexed_field_access_plan as opt_v3_prepared_indexed_field_access_plan,
 };
 use soac_opt::alternatives_v3::AlternativeCatalog;
 use soac_opt::artifacts_v3::{
@@ -6397,7 +6396,6 @@ struct JitEmitCtx<'mc> {
     global_indexed_hit_counter_ids: &'mc HashMap<InstrId, CounterRef>,
     global_indexed_fallback_counter_ids: &'mc HashMap<InstrId, CounterRef>,
     opt_v3_indexed_globals_by_instr: &'mc HashMap<InstrId, OptV3IndexedGlobalAccessPlan>,
-    opt_v3_indexed_fields_by_instr: &'mc HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>,
     field_indexed_hit_counter_ids: &'mc HashMap<InstrId, CounterRef>,
     field_indexed_fallback_counter_ids: &'mc HashMap<InstrId, CounterRef>,
     field_generic_getattr_counter_ids: &'mc HashMap<InstrId, CounterRef>,
@@ -7266,25 +7264,28 @@ impl IndexedFieldLoweringPlan {
         source: TypedIndexedFieldPlanSource,
         guards: &[TypedIndexedFieldGuard],
         expected_access: PlanV3IndexedFieldAccessKind,
-        opt_v3_indexed_fields_by_instr: &HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>,
     ) -> Result<Option<Self>, String> {
         match source {
-            TypedIndexedFieldPlanSource::LegacyProfile => {
-                Self::from_legacy_typed_guards(guards, expected_access)
+            TypedIndexedFieldPlanSource::LegacyProfile
+            | TypedIndexedFieldPlanSource::OptimizationPlanV3 => {
+                Self::from_typed_guards(instr_id, source, guards, expected_access)
             }
-            TypedIndexedFieldPlanSource::OptimizationPlanV3 => Self::from_prevalidated_v3_accesses(
-                instr_id,
-                expected_access,
-                opt_v3_indexed_fields_by_instr,
-            ),
         }
     }
 
-    fn from_legacy_typed_guards(
+    fn from_typed_guards(
+        instr_id: InstrId,
+        source: TypedIndexedFieldPlanSource,
         guards: &[TypedIndexedFieldGuard],
         expected_access: PlanV3IndexedFieldAccessKind,
     ) -> Result<Option<Self>, String> {
         if guards.is_empty() {
+            if source == TypedIndexedFieldPlanSource::OptimizationPlanV3 {
+                return Err(format!(
+                    "optimizer v3 indexed-field {:?} for {instr_id} lost all typed codegen guards",
+                    expected_access
+                ));
+            }
             return Ok(None);
         }
 
@@ -7297,30 +7298,19 @@ impl IndexedFieldLoweringPlan {
         }
 
         if specializations.is_empty() {
+            if source == TypedIndexedFieldPlanSource::OptimizationPlanV3 {
+                return Err(format!(
+                    "optimizer v3 indexed-field {:?} for {instr_id} has no resolvable typed codegen guards",
+                    expected_access
+                ));
+            }
             return Ok(None);
         }
 
         Ok(Some(Self {
-            source: TypedIndexedFieldPlanSource::LegacyProfile,
+            source,
             access: expected_access,
             specializations,
-        }))
-    }
-
-    fn from_prevalidated_v3_accesses(
-        instr_id: InstrId,
-        expected_access: PlanV3IndexedFieldAccessKind,
-        opt_v3_indexed_fields_by_instr: &HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>,
-    ) -> Result<Option<Self>, String> {
-        let prepared = opt_v3_prepared_indexed_field_access_plan(
-            instr_id,
-            expected_access,
-            opt_v3_indexed_fields_by_instr,
-        )?;
-        Ok(Some(Self {
-            source: TypedIndexedFieldPlanSource::OptimizationPlanV3,
-            access: prepared.access,
-            specializations: prepared.specializations,
         }))
     }
 
@@ -11054,9 +11044,18 @@ fn annotate_typed_attr_accesses(
             &mut self,
             instr_id: InstrId,
             attr: &InstrTyped,
-            _expected_access: PlanV3IndexedFieldAccessKind,
+            expected_access: PlanV3IndexedFieldAccessKind,
         ) -> Option<TypedAttrAccessPlan> {
             if self.opt_v3_indexed_fields_by_instr.contains_key(&instr_id) {
+                for access in self.opt_v3_indexed_fields_by_instr.get(&instr_id)? {
+                    if access.access != expected_access {
+                        self.error = Some(format!(
+                            "optimizer v3 indexed-field for {instr_id} was prevalidated as {:?}, but typed node requires {:?}",
+                            access.access, expected_access
+                        ));
+                        return None;
+                    }
+                }
                 return self.opt_v3_guards_for_attr(instr_id);
             }
             self.legacy_guards_for_attr(instr_id, attr)
@@ -14974,7 +14973,6 @@ fn emit_typed_indexed_getattr(
         source,
         guards,
         PlanV3IndexedFieldAccessKind::Load,
-        emit_ctx.opt_v3_indexed_fields_by_instr,
     )?
     else {
         return Ok(None);
@@ -15160,7 +15158,6 @@ fn emit_typed_indexed_setattr(
         source,
         guards,
         PlanV3IndexedFieldAccessKind::Store,
-        emit_ctx.opt_v3_indexed_fields_by_instr,
     )?
     else {
         return Ok(None);
@@ -27035,7 +27032,6 @@ fn build_cranelift_run_bb_specialized_function(
                 global_indexed_hit_counter_ids: &global_indexed_hit_counter_ids,
                 global_indexed_fallback_counter_ids: &global_indexed_fallback_counter_ids,
                 opt_v3_indexed_globals_by_instr: &opt_v3_indexed_globals_by_instr,
-                opt_v3_indexed_fields_by_instr: &opt_v3_indexed_fields_by_instr,
                 field_indexed_hit_counter_ids: &field_indexed_hit_counter_ids,
                 field_indexed_fallback_counter_ids: &field_indexed_fallback_counter_ids,
                 field_generic_getattr_counter_ids: &field_generic_getattr_counter_ids,
