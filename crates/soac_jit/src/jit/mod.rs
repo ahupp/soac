@@ -1499,6 +1499,7 @@ fn apply_profile_typed_plans_to_typed_function(
     annotate_typed_indexed_field_accesses_from_profile(function, profile)?;
     annotate_typed_indexed_global_accesses_from_profile(function, profile)?;
     annotate_typed_exact_list_item_accesses_from_profile(function, profile)?;
+    annotate_typed_exact_int_selections_from_profile(function, profile)?;
     Ok(())
 }
 
@@ -1650,7 +1651,6 @@ struct ReservedJitFunctionCompileInputs {
     scalar_counter_data_id: Option<DataId>,
     top_value_counter_data_id: Option<DataId>,
     counted_refcount_helpers: CountedRefcountHelpers,
-    specialization_inputs: FunctionSpecializationInputs,
     planned_typed_function: Option<BlockPyFunction<TypedCodegenModuleShape>>,
     module_constant_binding_key: usize,
     symbol_scope: Option<String>,
@@ -2886,10 +2886,6 @@ impl ProcessJitState {
                 Some(symbol_scope.as_str()),
             )?;
             predeclare_specialization_type_imports(jit_module, &specialization_profile)?;
-            let specialization_inputs = FunctionSpecializationInputs::from_profile(
-                &specialization_profile,
-                &batch_function.function,
-            )?;
             let planned_typed_function = planned_typed_function_for_reservation(
                 jit_module,
                 inputs.session.env_config()?,
@@ -2904,7 +2900,6 @@ impl ProcessJitState {
                 scalar_counter_data_id,
                 top_value_counter_data_id,
                 counted_refcount_helpers,
-                specialization_inputs,
                 planned_typed_function,
                 module_constant_binding_key: instance_key,
                 symbol_scope: Some(symbol_scope),
@@ -2947,10 +2942,6 @@ impl ProcessJitState {
             Some(inputs.session.as_ref()),
         )?;
         predeclare_specialization_type_imports(jit_module, &specialization_profile)?;
-        let specialization_inputs = FunctionSpecializationInputs::from_profile(
-            &specialization_profile,
-            &batch_function.function,
-        )?;
         let planned_typed_function = planned_typed_function_for_reservation(
             jit_module,
             inputs.session.env_config()?,
@@ -2965,7 +2956,6 @@ impl ProcessJitState {
             scalar_counter_data_id,
             top_value_counter_data_id,
             counted_refcount_helpers,
-            specialization_inputs,
             planned_typed_function,
             module_constant_binding_key: instance_key,
             symbol_scope: None,
@@ -3249,7 +3239,6 @@ impl ProcessJitState {
             Some(&plan.predeclared),
             BuildSpecializedFunctionOptions {
                 counted_refcount_helpers: Some(reserved_inputs.counted_refcount_helpers),
-                specialization_inputs: Some(reserved_inputs.specialization_inputs.clone()),
                 planned_typed_function: reserved_inputs.planned_typed_function.clone(),
                 ..BuildSpecializedFunctionOptions::default()
             },
@@ -11732,6 +11721,20 @@ fn annotate_typed_exact_int_selections(
     Ok(annotator.count)
 }
 
+fn annotate_typed_exact_int_selections_from_profile(
+    function: &mut BlockPyFunction<TypedCodegenModuleShape>,
+    profile: &SpecializationProfile<'_>,
+) -> Result<(), String> {
+    let Some(artifacts) = profile
+        .opt_v3_exact_int_branch_artifacts
+        .get(&function.function_id)
+    else {
+        return Ok(());
+    };
+    annotate_typed_exact_int_selections(function, artifacts)?;
+    Ok(())
+}
+
 fn call_site_profiled_targets<'a>(
     call: &blockpy_intrinsics::Call<InstrCodegen>,
     profiled_targets: Option<&'a [RuntimeFunctionId]>,
@@ -12006,16 +12009,6 @@ impl PlannedOptimizationInputs {
     ) -> HashMap<InstrId, Vec<RuntimeFunctionId>> {
         self.v3_direct_function_call_targets(function_id)
     }
-}
-
-#[derive(Clone, Debug, Default)]
-struct LegacyFunctionSpecializationOverlays {
-    exact_int_branch_artifacts: Option<Arc<ExactIntBranchV3Artifacts>>,
-}
-
-#[derive(Clone, Debug)]
-struct FunctionSpecializationInputs {
-    legacy_overlays: Option<LegacyFunctionSpecializationOverlays>,
 }
 
 fn load_planned_optimization_inputs_for_runtime_state(
@@ -12420,25 +12413,6 @@ fn planned_optimization_inputs_for_precompile(
     remap_cached_codegen_module_function_ids(&mut optimized_cache, module.module_name_gen.clone());
     inputs.optimized_module = Some(optimized_cache.module);
     Ok(inputs)
-}
-
-impl FunctionSpecializationInputs {
-    fn from_profile(
-        profile: &SpecializationProfile<'_>,
-        function: &BlockPyFunction<impl ModuleShape>,
-    ) -> Result<Self, String> {
-        let legacy_overlays = if profile.typed_specializations_embedded() {
-            None
-        } else {
-            Some(LegacyFunctionSpecializationOverlays {
-                exact_int_branch_artifacts: profile
-                    .opt_v3_exact_int_branch_artifacts
-                    .get(&function.function_id)
-                    .cloned(),
-            })
-        };
-        Ok(Self { legacy_overlays })
-    }
 }
 
 impl<'a> SpecializationProfile<'a> {
@@ -26202,7 +26176,6 @@ struct BuildSpecializedFunctionOptions {
     guard_miss_deopt_stub: bool,
     module_constant_accesses: ModuleConstantAccessTable,
     counted_refcount_helpers: Option<CountedRefcountHelpers>,
-    specialization_inputs: Option<FunctionSpecializationInputs>,
     planned_typed_function: Option<BlockPyFunction<TypedCodegenModuleShape>>,
     external_direct_call_target_functions:
         HashMap<RuntimeFunctionId, BlockPyFunction<TypedCodegenModuleShape>>,
@@ -26312,7 +26285,6 @@ fn prepare_specialized_typed_function(
     planned_typed_function: Option<&BlockPyFunction<TypedCodegenModuleShape>>,
     specialization_profile: Option<&SpecializationProfile<'_>>,
     value_facts: &FactStore,
-    legacy_overlays: Option<&LegacyFunctionSpecializationOverlays>,
 ) -> Result<PreparedSpecializedTypedFunction, String> {
     let mut typed_function = planned_typed_function
         .cloned()
@@ -26326,11 +26298,6 @@ fn prepare_specialized_typed_function(
         apply_profile_typed_plans_to_typed_function(&mut typed_function, specialization_profile)?;
     }
 
-    if let Some(legacy_overlays) = legacy_overlays {
-        if let Some(exact_int_artifacts) = legacy_overlays.exact_int_branch_artifacts.as_deref() {
-            annotate_typed_exact_int_selections(&mut typed_function, exact_int_artifacts)?;
-        }
-    }
     lower_typed_function_call_access_plan_instrs(&mut typed_function);
     refresh_typed_function_value_facts(&mut typed_function);
     annotate_typed_function_result_demands(&mut typed_function);
@@ -26624,19 +26591,6 @@ fn build_cranelift_run_bb_specialized_function(
             function.names.qualname
         ));
     }
-    let specialization_inputs = match options.specialization_inputs.clone() {
-        Some(inputs) => inputs,
-        None => {
-            let profile = specialization_profile.ok_or_else(|| {
-                format!(
-                    "missing specialization profile for function {} ({})",
-                    function.function_id, function.names.qualname
-                )
-            })?;
-            FunctionSpecializationInputs::from_profile(profile, function)?
-        }
-    };
-    let legacy_overlays = specialization_inputs.legacy_overlays;
     let guard_miss_deopt_stub = options.guard_miss_deopt_stub
         || specialization_profile.is_some_and(|profile| {
             profile.guard_miss_deopt && function.scope.scope_kind != CallableScopeKind::Module
@@ -26653,7 +26607,6 @@ fn build_cranelift_run_bb_specialized_function(
         options.planned_typed_function.as_ref(),
         specialization_profile,
         value_facts,
-        legacy_overlays.as_ref(),
     )?;
     let direct_call_targets = collect_typed_call_direct_targets(&typed_function);
     let empty_direct_functions = HashMap::new();
@@ -27717,14 +27670,11 @@ pub unsafe fn render_instr_typed_for_codegen_with_runtime_state(
                 function.function_id, function.names.qualname
             )
         })?;
-    let specialization_inputs =
-        FunctionSpecializationInputs::from_profile(&specialization_profile, render_function)?;
     let PreparedSpecializedTypedFunction { typed_function } = prepare_specialized_typed_function(
         render_function,
         None,
         Some(&specialization_profile),
         &jit_module_plan.value_facts,
-        specialization_inputs.legacy_overlays.as_ref(),
     )?;
     let direct_call_targets = collect_typed_call_direct_targets(&typed_function);
     let mut direct_call_target_functions = HashMap::new();
@@ -27895,8 +27845,6 @@ pub unsafe fn render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
                 render_function.function_id, render_function.names.qualname
             )
         })?;
-    let specialization_inputs =
-        FunctionSpecializationInputs::from_profile(&specialization_profile, render_function)?;
     let built = build_cranelift_run_bb_specialized_function(
         &mut jit_module,
         render_blocks,
@@ -27917,10 +27865,7 @@ pub unsafe fn render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
         Some(&specialization_profile),
         None,
         None,
-        BuildSpecializedFunctionOptions {
-            specialization_inputs: Some(specialization_inputs),
-            ..BuildSpecializedFunctionOptions::default()
-        },
+        BuildSpecializedFunctionOptions::default(),
     )?;
     let mut out = String::new();
     out.push_str("; import fn aliases (Cranelift display id -> symbol)\n");

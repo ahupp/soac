@@ -3545,6 +3545,16 @@ def build(values):
             .set_stack_slots(names.iter().map(|name| (*name).to_string()).collect());
     }
 
+    fn typed_function_with_exact_int_artifacts(
+        function: &BlockPyFunction<CodegenModuleShape>,
+        artifacts: &ExactIntBranchV3Artifacts,
+    ) -> BlockPyFunction<TypedCodegenModuleShape> {
+        let mut typed_function = lower_codegen_function_to_typed(function.clone());
+        annotate_typed_exact_int_selections(&mut typed_function, artifacts)
+            .expect("exact-int v3 artifacts should annotate the typed test function");
+        typed_function
+    }
+
     fn with_single_test_block(
         function: BlockPyFunction<CodegenModuleShape>,
         ops: Vec<InstrCodegen>,
@@ -3609,8 +3619,6 @@ def build(values):
             Some(compile_session),
         )?;
         predeclare_specialization_type_imports(jit_module, &specialization_profile)?;
-        let specialization_inputs =
-            FunctionSpecializationInputs::from_profile(&specialization_profile, planned_function)?;
         let mut direct_call_typed_function = planned_function.clone();
         apply_profile_typed_plans_to_typed_function(
             &mut direct_call_typed_function,
@@ -3618,10 +3626,6 @@ def build(values):
         )?;
         lower_typed_function_call_access_plan_instrs(&mut direct_call_typed_function);
         predeclare_typed_direct_call_imports(jit_module, &direct_call_typed_function)?;
-        let mut options = options;
-        if options.specialization_inputs.is_none() {
-            options.specialization_inputs = Some(specialization_inputs);
-        }
         build_cranelift_run_bb_specialized_function(
             jit_module,
             blocks,
@@ -15083,12 +15087,9 @@ def f(x):
             &blocks,
             &module_constants,
             BuildSpecializedFunctionOptions {
-                specialization_inputs: Some(FunctionSpecializationInputs {
-                    legacy_overlays: Some(LegacyFunctionSpecializationOverlays {
-                        exact_int_branch_artifacts: Some(std::sync::Arc::new(artifacts)),
-                        ..LegacyFunctionSpecializationOverlays::default()
-                    }),
-                }),
+                planned_typed_function: Some(typed_function_with_exact_int_artifacts(
+                    &function, &artifacts,
+                )),
                 ..BuildSpecializedFunctionOptions::default()
             },
         );
@@ -15259,12 +15260,9 @@ def f(x):
             &blocks,
             &module_constants,
             BuildSpecializedFunctionOptions {
-                specialization_inputs: Some(FunctionSpecializationInputs {
-                    legacy_overlays: Some(LegacyFunctionSpecializationOverlays {
-                        exact_int_branch_artifacts: Some(std::sync::Arc::new(artifacts)),
-                        ..LegacyFunctionSpecializationOverlays::default()
-                    }),
-                }),
+                planned_typed_function: Some(typed_function_with_exact_int_artifacts(
+                    &function, &artifacts,
+                )),
                 ..BuildSpecializedFunctionOptions::default()
             },
         );
@@ -15389,12 +15387,9 @@ def f(x):
                 &blocks,
                 &module_constants,
                 BuildSpecializedFunctionOptions {
-                    specialization_inputs: Some(FunctionSpecializationInputs {
-                        legacy_overlays: Some(LegacyFunctionSpecializationOverlays {
-                            exact_int_branch_artifacts: Some(std::sync::Arc::new(artifacts)),
-                            ..LegacyFunctionSpecializationOverlays::default()
-                        }),
-                    }),
+                    planned_typed_function: Some(typed_function_with_exact_int_artifacts(
+                        &function, &artifacts,
+                    )),
                     ..BuildSpecializedFunctionOptions::default()
                 },
             );
@@ -15504,12 +15499,9 @@ def f(x):
                 &blocks,
                 &module_constants,
                 BuildSpecializedFunctionOptions {
-                    specialization_inputs: Some(FunctionSpecializationInputs {
-                        legacy_overlays: Some(LegacyFunctionSpecializationOverlays {
-                            exact_int_branch_artifacts: Some(std::sync::Arc::new(artifacts)),
-                            ..LegacyFunctionSpecializationOverlays::default()
-                        }),
-                    }),
+                    planned_typed_function: Some(typed_function_with_exact_int_artifacts(
+                        &function, &artifacts,
+                    )),
                     ..BuildSpecializedFunctionOptions::default()
                 },
             );
@@ -15613,12 +15605,9 @@ def f(x):
             &blocks,
             &module_constants,
             BuildSpecializedFunctionOptions {
-                specialization_inputs: Some(FunctionSpecializationInputs {
-                    legacy_overlays: Some(LegacyFunctionSpecializationOverlays {
-                        exact_int_branch_artifacts: Some(std::sync::Arc::new(artifacts)),
-                        ..LegacyFunctionSpecializationOverlays::default()
-                    }),
-                }),
+                planned_typed_function: Some(typed_function_with_exact_int_artifacts(
+                    &function, &artifacts,
+                )),
                 ..BuildSpecializedFunctionOptions::default()
             },
         );
@@ -16535,12 +16524,7 @@ def f(x):
             &function,
             &blocks,
             &module_constants,
-            BuildSpecializedFunctionOptions {
-                specialization_inputs: Some(FunctionSpecializationInputs {
-                    legacy_overlays: Some(LegacyFunctionSpecializationOverlays::default()),
-                }),
-                ..BuildSpecializedFunctionOptions::default()
-            },
+            BuildSpecializedFunctionOptions::default(),
         );
 
         let indexed_helpers = declared_user_names_for_symbols(
@@ -18296,20 +18280,6 @@ def f(x, y):
             assert_eq!(indexed_global.module_name, module_name);
             assert_eq!(indexed_global.name, "x");
             assert_eq!(indexed_global.expected_index, 0);
-
-            let planned_function = shared_state
-                .lowered_module
-                .callable_defs
-                .iter()
-                .find(|function| function.function_id == function_id)
-                .expect("lowered module should include the test function");
-            let specialization_inputs =
-                FunctionSpecializationInputs::from_profile(&profile, planned_function)
-                    .expect("typed-v3 access plans should become specialization inputs");
-            assert!(
-                specialization_inputs.legacy_overlays.is_none(),
-                "typed-v3 runtime should keep indexed-global access plans embedded in InstrTyped"
-            );
         });
     }
 
@@ -18583,9 +18553,6 @@ class Point:
             &[1usize as ObjPtr],
             &module_constants,
             BuildSpecializedFunctionOptions {
-                specialization_inputs: Some(FunctionSpecializationInputs {
-                    legacy_overlays: None,
-                }),
                 planned_typed_function: Some(planned_function.clone()),
                 ..BuildSpecializedFunctionOptions::default()
             },
@@ -19063,13 +19030,6 @@ class Point:
         assert_eq!(
             scalar_thread_plan.consumer_hot_plan.id,
             scalar_thread_plan.consumer_hot_region.region
-        );
-        let specialization_inputs =
-            FunctionSpecializationInputs::from_profile(&profile, planned_function)
-                .expect("typed-v3 scalar thread should not require sidecar inputs");
-        assert!(
-            specialization_inputs.legacy_overlays.is_none(),
-            "typed-v3 scalar-int selection should be represented in InstrTyped, not in FunctionSpecializationInputs"
         );
     }
 
@@ -21390,7 +21350,7 @@ class Point:
         };
 
         let prepared =
-            prepare_specialized_typed_function(&typed_function, None, Some(&profile), &facts, None)
+            prepare_specialized_typed_function(&typed_function, None, Some(&profile), &facts)
                 .expect("typed function should prepare with profiled cold blocks")
                 .typed_function;
         let block_layout = prepared
