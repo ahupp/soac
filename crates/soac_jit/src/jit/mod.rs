@@ -6464,7 +6464,6 @@ struct JitEmitCtx<'mc> {
     setitem_shape_counter_ids: &'mc HashMap<InstrId, CounterId>,
     setitem_specialized_hit_counter_ids: &'mc HashMap<InstrId, CounterRef>,
     setitem_specialized_fallback_counter_ids: &'mc HashMap<InstrId, CounterRef>,
-    opt_v3_exact_list_items_by_instr: &'mc HashMap<InstrId, OptV3ExactListItemAccessPlan>,
     branch_outcome_counter_ids: &'mc HashMap<InstrId, CounterId>,
     global_indexed_hit_counter_ids: &'mc HashMap<InstrId, CounterRef>,
     global_indexed_fallback_counter_ids: &'mc HashMap<InstrId, CounterRef>,
@@ -26202,6 +26201,7 @@ fn prepare_specialized_typed_function(
     field_index_specializations_by_instr: &HashMap<InstrId, Vec<FieldIndexSpecialization>>,
     opt_v3_indexed_fields_by_instr: &HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>,
     opt_v3_indexed_globals_by_instr: &HashMap<InstrId, OptV3IndexedGlobalAccessPlan>,
+    opt_v3_exact_list_items_by_instr: &HashMap<InstrId, OptV3ExactListItemAccessPlan>,
     specialize_field_stores: bool,
 ) -> Result<PreparedSpecializedTypedFunction, String> {
     let mut typed_function = call_emission_typed_function
@@ -26224,6 +26224,7 @@ fn prepare_specialized_typed_function(
         specialize_field_stores,
     )?;
     annotate_typed_indexed_global_accesses(&mut typed_function, opt_v3_indexed_globals_by_instr)?;
+    annotate_typed_exact_list_item_accesses(&mut typed_function, opt_v3_exact_list_items_by_instr)?;
     lower_typed_function_call_access_plan_instrs(&mut typed_function);
     refresh_typed_function_value_facts(&mut typed_function);
     annotate_typed_function_result_demands(&mut typed_function);
@@ -26552,6 +26553,7 @@ fn build_cranelift_run_bb_specialized_function(
         &field_index_specializations_by_instr,
         &opt_v3_indexed_fields_by_instr,
         &opt_v3_indexed_globals_by_instr,
+        &opt_v3_exact_list_items_by_instr,
         behavior_change_indexed_stores,
     )?;
     let direct_call_targets = collect_typed_call_direct_targets(&typed_function);
@@ -27195,7 +27197,6 @@ fn build_cranelift_run_bb_specialized_function(
                 setitem_shape_counter_ids: &setitem_shape_counter_ids,
                 setitem_specialized_hit_counter_ids: &setitem_specialized_hit_counter_ids,
                 setitem_specialized_fallback_counter_ids: &setitem_specialized_fallback_counter_ids,
-                opt_v3_exact_list_items_by_instr: &opt_v3_exact_list_items_by_instr,
                 global_indexed_hit_counter_ids: &global_indexed_hit_counter_ids,
                 global_indexed_fallback_counter_ids: &global_indexed_fallback_counter_ids,
                 field_indexed_hit_counter_ids: &field_indexed_hit_counter_ids,
@@ -27631,6 +27632,7 @@ pub unsafe fn render_instr_typed_for_codegen_with_runtime_state(
         &specialization_inputs.field_index_specializations_by_instr,
         &specialization_inputs.opt_v3_indexed_fields_by_instr,
         &specialization_inputs.opt_v3_indexed_globals_by_instr,
+        &specialization_inputs.opt_v3_exact_list_items_by_instr,
         specialization_inputs.behavior_change_indexed_stores,
     )?;
     let direct_call_targets = collect_typed_call_direct_targets(&typed_function);

@@ -1,9 +1,9 @@
 use super::intrinsics::{OperationEmitState, increment_counter_with_state};
-use super::{CpythonTypeSymbol, OptV3ExactListItemAccessPlan, RelocTypeRef};
+use super::{CpythonTypeSymbol, RelocTypeRef};
 use cranelift_codegen::ir;
 use cranelift_codegen::ir::InstBuilder;
 use pyo3::ffi;
-use soac_core::block_py::{CounterId, GetItem, HasSemanticInstrId, Instr, InstrId, SetItem};
+use soac_core::block_py::{CounterId, GetItem, HasSemanticInstrId, Instr, SetItem};
 use soac_lowering::passes::InstrCodegen;
 use soac_opt::passes::TypedExactListItemAccessPlan;
 use soac_opt::plan_v3::{EXACT_LIST_EXACT_INT_ITEM_SHAPE_TAG, ExactListItemAccessKind};
@@ -30,16 +30,6 @@ pub(super) struct ExactListItemLoweringPlan {
 }
 
 impl ExactListItemLoweringPlan {
-    fn from_v3(
-        plan: &OptV3ExactListItemAccessPlan,
-        expected_access: ExactListItemAccessKind,
-    ) -> Self {
-        debug_assert_eq!(plan.access, expected_access);
-        Self {
-            access: plan.access,
-        }
-    }
-
     fn expect_exact_list_exact_int(self, expected_access: ExactListItemAccessKind) {
         assert_eq!(
             self.access, expected_access,
@@ -59,39 +49,11 @@ pub(super) fn lowering_plan_from_typed_exact_list_item(
     }
 }
 
-fn selected_v3_getitem_lowering_plan<'fb>(
-    state: &impl OperationEmitState<'fb, InstrCodegen>,
-    instr_id: InstrId,
-) -> Option<ExactListItemLoweringPlan> {
-    state
-        .ctx()
-        .opt_v3_exact_list_items_by_instr
-        .get(&instr_id)
-        .filter(|plan| plan.access == ExactListItemAccessKind::Get)
-        .map(|plan| ExactListItemLoweringPlan::from_v3(plan, ExactListItemAccessKind::Get))
-}
-
-fn selected_v3_setitem_lowering_plan<'fb>(
-    state: &impl OperationEmitState<'fb, InstrCodegen>,
-    instr_id: InstrId,
-) -> Option<ExactListItemLoweringPlan> {
-    state
-        .ctx()
-        .opt_v3_exact_list_items_by_instr
-        .get(&instr_id)
-        .filter(|plan| plan.access == ExactListItemAccessKind::Set)
-        .map(|plan| ExactListItemLoweringPlan::from_v3(plan, ExactListItemAccessKind::Set))
-}
-
 pub(super) fn emit_getitem<'fb>(
     op: &GetItem<InstrCodegen>,
     state: &mut impl OperationEmitState<'fb, InstrCodegen>,
 ) -> ir::Value {
-    emit_getitem_with_plan(
-        op,
-        state,
-        selected_v3_getitem_lowering_plan(state, op.semantic_instr_id()),
-    )
+    emit_getitem_with_plan(op, state, None)
 }
 
 pub(super) fn emit_getitem_with_plan<'fb, E: Instr>(
@@ -144,11 +106,7 @@ pub(super) fn emit_setitem<'fb>(
     op: &SetItem<InstrCodegen>,
     state: &mut impl OperationEmitState<'fb, InstrCodegen>,
 ) -> ir::Value {
-    emit_setitem_with_plan(
-        op,
-        state,
-        selected_v3_setitem_lowering_plan(state, op.semantic_instr_id()),
-    )
+    emit_setitem_with_plan(op, state, None)
 }
 
 pub(super) fn emit_setitem_with_plan<'fb, E: Instr>(
