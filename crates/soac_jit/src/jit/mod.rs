@@ -3187,11 +3187,11 @@ impl ProcessJitState {
             BuildSpecializedFunctionOptions {
                 counted_refcount_helpers: Some(reserved_inputs.counted_refcount_helpers),
                 specialization_inputs: Some(reserved_inputs.specialization_inputs.clone()),
-                call_emission_typed_function: (!plan
+                call_emission_typed_function: plan
                     .env_config
                     .runtime_optimization_pipeline()
-                    .uses_typed_v3_runtime())
-                .then(|| reserved_inputs.direct_call_typed_function.clone()),
+                    .uses_legacy_plan_artifacts_runtime()
+                    .then(|| reserved_inputs.direct_call_typed_function.clone()),
                 ..BuildSpecializedFunctionOptions::default()
             },
         )
@@ -12292,11 +12292,11 @@ impl<'a> SpecializationProfile<'a> {
     ) -> Result<Self, String> {
         let env_config = env_config_for_session(compile_session)?;
         let specialization_mode = env_config.specialization_mode();
-        let typed_v3_runtime = env_config
-            .runtime_optimization_pipeline()
-            .uses_typed_v3_runtime();
+        let runtime_pipeline = env_config.runtime_optimization_pipeline();
+        let typed_v3_runtime = runtime_pipeline.uses_typed_v3_runtime();
+        let legacy_plan_artifacts_runtime = runtime_pipeline.uses_legacy_plan_artifacts_runtime();
         let counter_dump_path = if shared_state.is_some()
-            && !typed_v3_runtime
+            && legacy_plan_artifacts_runtime
             && specialization_mode != Some(crate::config::SpecializationMode::Profile)
         {
             env_config.counter_dump_input_path()

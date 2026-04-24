@@ -85,6 +85,10 @@ impl RuntimeOptimizationPipeline {
     pub fn uses_typed_v3_runtime(self) -> bool {
         matches!(self, Self::TypedV3)
     }
+
+    pub fn uses_legacy_plan_artifacts_runtime(self) -> bool {
+        matches!(self, Self::PlanArtifacts)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -371,7 +375,10 @@ impl SoacEnvConfig {
     }
 
     pub fn specialization_runtime_logging_enabled(&self) -> bool {
-        if self.runtime_optimization_pipeline.uses_typed_v3_runtime() {
+        if !self
+            .runtime_optimization_pipeline
+            .uses_legacy_plan_artifacts_runtime()
+        {
             return false;
         }
         self.specialization_mode == Some(SpecializationMode::Apply)

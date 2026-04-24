@@ -961,9 +961,9 @@ fn load_runtime_indexed_field_counter_emissions(
     ) {
         return Ok(HashMap::new());
     }
-    if env_config
+    if !env_config
         .runtime_optimization_pipeline()
-        .uses_typed_v3_runtime()
+        .uses_legacy_plan_artifacts_runtime()
     {
         return Ok(HashMap::new());
     }
