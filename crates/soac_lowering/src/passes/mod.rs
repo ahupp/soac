@@ -343,8 +343,8 @@ pub use trace::{
     instrument_bb_module_for_trace, instrument_bb_module_with_block_entry_counters,
     instrument_bb_module_with_call_target_counters, instrument_bb_module_with_global_load_counters,
     instrument_bb_module_with_locality_counters, instrument_bb_module_with_refcount_counters,
-    locality_counter_instrumentation_enabled, parse_trace_env,
-    refcount_counter_instrumentation_enabled, specialization_runtime_logging_enabled,
+    locality_counter_instrumentation_enabled, refcount_counter_instrumentation_enabled,
+    specialization_runtime_logging_enabled,
 };
 
 pub(crate) use global_index::lower_global_index_in_resolved_module_default;

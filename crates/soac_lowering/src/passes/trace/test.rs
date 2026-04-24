@@ -2,7 +2,6 @@ use super::{
     instrument_bb_module_for_trace, instrument_bb_module_with_block_entry_counters,
     instrument_bb_module_with_call_target_counters, instrument_bb_module_with_global_load_counters,
     instrument_bb_module_with_locality_counters, instrument_bb_module_with_refcount_counters,
-    parse_trace_config, TraceConfig,
 };
 use crate::block_py::{
     BlockPyFunction, BlockPyModule, Call, ChildVisitable, CounterScope, CounterSite,
@@ -13,6 +12,7 @@ use crate::passes::{
     assign_module_instr_ids, lower_try_jump_exception_flow, normalize_bb_module_strings,
     CodegenModuleShape,
 };
+use soac_config::ExecTraceConfig;
 use std::collections::HashSet;
 
 fn tracked_name_binding_module(
@@ -100,38 +100,12 @@ fn counter_site_function_id(site: &CounterSite) -> Option<RuntimeFunctionId> {
 }
 
 #[test]
-fn parses_all_and_params_variants() {
-    assert_eq!(
-        parse_trace_config("all:params"),
-        Some(TraceConfig {
-            qualname_filter: None,
-            include_params: true,
-        })
-    );
-    assert_eq!(
-        parse_trace_config("run"),
-        Some(TraceConfig {
-            qualname_filter: Some("run".to_string()),
-            include_params: false,
-        })
-    );
-    assert_eq!(
-        parse_trace_config("run:params"),
-        Some(TraceConfig {
-            qualname_filter: Some("run".to_string()),
-            include_params: true,
-        })
-    );
-    assert_eq!(parse_trace_config("0"), None);
-}
-
-#[test]
 fn instruments_matching_function_blocks() {
     let source = "def f(x):\n    try:\n        return x + 1\n    except Exception:\n        return 0\n\ndef g(y):\n    return y + 2\n";
     let mut codegen = codegen_module_for_trace_test(source);
     instrument_bb_module_for_trace(
         &mut codegen,
-        &TraceConfig {
+        &ExecTraceConfig {
             qualname_filter: Some("f".to_string()),
             include_params: true,
         },

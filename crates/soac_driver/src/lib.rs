@@ -332,10 +332,10 @@ fn finish_codegen_module_with_tracker(
     }
 
     let bb_traced: BlockPyModule<CodegenModuleShape> =
-        if let Some(config) = passes::parse_trace_env(env_config) {
+        if let Some(config) = env_config.soac_exec_trace() {
             pass_tracker.run_pass("bb_trace", || {
                 let mut traced = bb_codegen;
-                passes::instrument_bb_module_for_trace(&mut traced, &config);
+                passes::instrument_bb_module_for_trace(&mut traced, config);
                 traced
             })
         } else {

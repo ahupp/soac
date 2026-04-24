@@ -249,8 +249,8 @@ typed variables must use recognized values. Boolean knobs accept `1`, `true`,
   of waiting for first execution.
 
 - `SOAC_EXEC_TRACE=<selector>`
-  In `fn parse_trace_env`, at
-  [crates/soac_lowering/src/passes/trace/mod.rs:20](/home/adam/project/soac-profile/crates/soac_lowering/src/passes/trace/mod.rs#L20),
+  In `SoacEnvConfig::from_env`, at
+  [crates/soac_config/src/runtime.rs](/home/adam/project/soac-profile/crates/soac_config/src/runtime.rs),
   enable basic-block tracing. Accepted forms are:
   - `all`, `1`, `*`, or empty selector: trace all functions
   - `<exact-qualname>`: trace one function

@@ -111,6 +111,34 @@ pub struct SoacLogConfig {
     pub json_path: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecTraceConfig {
+    pub qualname_filter: Option<String>,
+    pub include_params: bool,
+}
+
+impl ExecTraceConfig {
+    pub fn from_env_value(raw: &str) -> Option<Self> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed == "0" {
+            return None;
+        }
+        let (selector, include_params) = if let Some(stripped) = trimmed.strip_suffix(":params") {
+            (stripped.trim(), true)
+        } else {
+            (trimmed, false)
+        };
+        let qualname_filter = match selector {
+            "" | "1" | "*" | "all" => None,
+            value => Some(value.to_string()),
+        };
+        Some(Self {
+            qualname_filter,
+            include_params,
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SoacEnvConfig {
     cranelift_opt_level: String,
@@ -124,7 +152,7 @@ pub struct SoacEnvConfig {
     background_jit_enabled: bool,
     jit_perf_helper_frames_enabled: bool,
     precompiled_library_path: Option<PathBuf>,
-    soac_exec_trace: Option<String>,
+    soac_exec_trace: Option<ExecTraceConfig>,
     soac_log: SoacLogConfig,
     soac_log_explicit: bool,
 }
@@ -206,7 +234,9 @@ impl SoacEnvConfig {
         let background_jit_enabled = env_bool(SOAC_BACKGROUND_JIT_ENV, true)?;
         let jit_perf_helper_frames_enabled = env_bool(SOAC_JIT_PERF_HELPER_FRAMES_ENV, false)?;
         let precompiled_library_path = env_path(SOAC_PRECOMPILED_LIBRARY_ENV)?;
-        let soac_exec_trace = env_string(SOAC_EXEC_TRACE_ENV)?;
+        let soac_exec_trace = env_string(SOAC_EXEC_TRACE_ENV)?
+            .as_deref()
+            .and_then(ExecTraceConfig::from_env_value);
         let soac_log_raw = env_string(SOAC_LOG_ENV)?;
         let soac_log_explicit = soac_log_raw
             .as_ref()
@@ -332,8 +362,8 @@ impl SoacEnvConfig {
         self.precompiled_library_path.as_deref()
     }
 
-    pub fn soac_exec_trace(&self) -> Option<&str> {
-        self.soac_exec_trace.as_deref()
+    pub fn soac_exec_trace(&self) -> Option<&ExecTraceConfig> {
+        self.soac_exec_trace.as_ref()
     }
 
     pub fn soac_log(&self) -> &SoacLogConfig {
@@ -627,6 +657,53 @@ mod tests {
             config.runtime_optimization_pipeline(),
             RuntimeOptimizationPipeline::TypedV3
         );
+    }
+
+    #[test]
+    fn env_config_parses_exec_trace() {
+        let _lock = env_lock().lock().unwrap();
+        let _guards = clear_soac_config_env();
+        let _trace = EnvVarGuard::set(SOAC_EXEC_TRACE_ENV, "all:params");
+
+        let config = SoacEnvConfig::from_env().unwrap();
+
+        assert_eq!(
+            config.soac_exec_trace(),
+            Some(&ExecTraceConfig {
+                qualname_filter: None,
+                include_params: true,
+            })
+        );
+
+        drop(_trace);
+        let _trace = EnvVarGuard::set(SOAC_EXEC_TRACE_ENV, "run");
+        let config = SoacEnvConfig::from_env().unwrap();
+
+        assert_eq!(
+            config.soac_exec_trace(),
+            Some(&ExecTraceConfig {
+                qualname_filter: Some("run".to_string()),
+                include_params: false,
+            })
+        );
+
+        drop(_trace);
+        let _trace = EnvVarGuard::set(SOAC_EXEC_TRACE_ENV, "run:params");
+        let config = SoacEnvConfig::from_env().unwrap();
+
+        assert_eq!(
+            config.soac_exec_trace(),
+            Some(&ExecTraceConfig {
+                qualname_filter: Some("run".to_string()),
+                include_params: true,
+            })
+        );
+
+        drop(_trace);
+        let _trace = EnvVarGuard::set(SOAC_EXEC_TRACE_ENV, "0");
+        let config = SoacEnvConfig::from_env().unwrap();
+
+        assert_eq!(config.soac_exec_trace(), None);
     }
 
     #[test]

@@ -6,18 +6,8 @@ use crate::block_py::{
     RuntimeName, StringLiteral, Tuple, Visit, WithMeta,
 };
 use crate::passes::{CodegenModuleShape, CounterBuilder};
-use soac_config::{SoacEnvConfig, SpecializationMode};
+use soac_config::{ExecTraceConfig, SoacEnvConfig, SpecializationMode};
 use std::collections::HashMap;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TraceConfig {
-    pub qualname_filter: Option<String>,
-    pub include_params: bool,
-}
-
-pub fn parse_trace_env(config: &SoacEnvConfig) -> Option<TraceConfig> {
-    parse_trace_config(config.soac_exec_trace()?)
-}
 
 pub fn call_target_counter_instrumentation_enabled(config: &SoacEnvConfig) -> bool {
     specialization_mode_instruments_top_values(config)
@@ -70,29 +60,9 @@ fn functions_with_counter_instrumentation_mut(
         .filter(|function| function.execution_mode() == FunctionExecutionMode::Jit)
 }
 
-pub(crate) fn parse_trace_config(raw: &str) -> Option<TraceConfig> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() || trimmed == "0" {
-        return None;
-    }
-    let (selector, include_params) = if let Some(stripped) = trimmed.strip_suffix(":params") {
-        (stripped.trim(), true)
-    } else {
-        (trimmed, false)
-    };
-    let qualname_filter = match selector {
-        "" | "1" | "*" | "all" => None,
-        value => Some(value.to_string()),
-    };
-    Some(TraceConfig {
-        qualname_filter,
-        include_params,
-    })
-}
-
 pub fn instrument_bb_module_for_trace(
     module: &mut BlockPyModule<CodegenModuleShape>,
-    config: &TraceConfig,
+    config: &ExecTraceConfig,
 ) {
     let global_names = module.global_names.clone();
     let module_constants = &mut module.module_constants;
