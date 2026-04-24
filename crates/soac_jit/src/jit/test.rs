@@ -18471,6 +18471,188 @@ class Point:
     }
 
     #[test]
+    fn runtime_typed_v3_module_plan_carries_exact_int_selection_shapes() {
+        let module_name = "runtime_typed_v3_exact_int_plan_test";
+        let module_name_gen = ModuleNameGen::new(0);
+        let mut function = test_function_in_module(&module_name_gen, "branch_and_add");
+        function.params = ParamSpec {
+            params: vec![
+                test_param("a", ParamKind::Any, false),
+                test_param("b", ParamKind::Any, false),
+            ],
+        };
+        let entry_label = function.name_gen.next_block_name();
+        let then_label = function.name_gen.next_block_name();
+        let else_label = function.name_gen.next_block_name();
+        let branch_add_instr_id = InstrId::new(entry_label, 2);
+        let compare_instr_id = InstrId::new(entry_label, 4);
+        let return_add_instr_id = InstrId::new(then_label, 2);
+        let mut constants = TestConstantPool::default();
+        function.blocks = vec![
+            CodegenBlock {
+                label: entry_label,
+                body: Vec::new(),
+                term: BlockTerm::IfTerm(soac_core::block_py::TermIf {
+                    test: with_instr_id(
+                        op_expr(BinOp::new(
+                            BinOpKind::Gt,
+                            with_instr_id(
+                                op_expr(BinOp::new(
+                                    BinOpKind::Add,
+                                    with_instr_id(
+                                        name_expr(test_name("a")),
+                                        InstrId::new(entry_label, 0),
+                                    ),
+                                    with_instr_id(
+                                        name_expr(test_local_name("b", 1)),
+                                        InstrId::new(entry_label, 1),
+                                    ),
+                                )),
+                                branch_add_instr_id,
+                            ),
+                            with_instr_id(constants.int_expr(0), InstrId::new(entry_label, 3)),
+                        )),
+                        compare_instr_id,
+                    ),
+                    then_label,
+                    else_label,
+                }),
+                params: Vec::new(),
+                exc_edge: None,
+            },
+            CodegenBlock {
+                label: then_label,
+                body: Vec::new(),
+                term: ret_term(with_instr_id(
+                    op_expr(BinOp::new(
+                        BinOpKind::Add,
+                        with_instr_id(name_expr(test_name("a")), InstrId::new(then_label, 0)),
+                        with_instr_id(
+                            name_expr(test_local_name("b", 1)),
+                            InstrId::new(then_label, 1),
+                        ),
+                    )),
+                    return_add_instr_id,
+                )),
+                params: Vec::new(),
+                exc_edge: None,
+            },
+            CodegenBlock {
+                label: else_label,
+                body: Vec::new(),
+                term: ret_term(constants.int_expr(0)),
+                params: Vec::new(),
+                exc_edge: None,
+            },
+        ];
+        set_stack_slots(&mut function, &["a", "b"]);
+        let function_id = function.function_id;
+        let mut module = test_module(module_name_gen, vec![function]);
+        module.module_constants = constants.module_constants;
+        let function = module.callable_defs[0].clone();
+        let exact_int_shape = soac_opt::operator_specialization::pack_binary_shape(
+            soac_opt::operator_specialization::ExactTypeTag::Int,
+            soac_opt::operator_specialization::ExactTypeTag::Int,
+        );
+        let mut evidence = FunctionProfileEvidence::default();
+        evidence
+            .operator_specializations
+            .insert(branch_add_instr_id, vec![exact_int_shape]);
+        evidence
+            .operator_specializations
+            .insert(return_add_instr_id, vec![exact_int_shape]);
+        let artifacts = plan_and_emit_function_exact_int_branches_v3_with_module_constants(
+            &AlternativeCatalog::default_v3(),
+            ModulePlanIdentity {
+                module_name: module_name.to_string(),
+                source_hash: 0,
+                cache_identity: "test-cache".to_string(),
+            },
+            FunctionPlanIdentity {
+                function: SerializedFunctionId::new(
+                    SerializedModuleId::new(0),
+                    function.function_id.local_function_id(),
+                ),
+                debug_name: Some(function.names.qualname.clone()),
+            },
+            &function,
+            &evidence,
+            module.module_constants.as_slice(),
+        )
+        .expect("exact-int v3 artifacts should plan for branch and return sources");
+        let profile = SpecializationProfile {
+            module_name: Some(module_name),
+            counter_dump_path: None,
+            optimized_module: None,
+            direct_call_emission_scope: DirectCallEmissionScope::AllDirectCallCandidates,
+            opt_v3_emitted_direct_calls: HashMap::new(),
+            opt_v3_emitted_exact_list_items: HashMap::new(),
+            opt_v3_emitted_indexed_fields: HashMap::new(),
+            opt_v3_emitted_indexed_globals: HashMap::new(),
+            opt_v3_exact_int_branch_artifacts: HashMap::from([(
+                function_id,
+                std::sync::Arc::new(artifacts),
+            )]),
+            behavior_change_indexed_stores: false,
+            profiled_cold_blocks: false,
+            guard_miss_deopt: false,
+        };
+
+        let module_plan = build_typed_v3_jit_module_plan(&module, Some(&profile))
+            .expect("typed-v3 module plan should attach exact-int selections");
+        let planned_function = module_plan
+            .module
+            .callable_defs
+            .iter()
+            .find(|function| function.function_id == function_id)
+            .expect("planned module should include branch_and_add");
+        let BlockTerm::IfTerm(if_term) = &planned_function.blocks[0].term else {
+            panic!("entry block should remain a typed if term");
+        };
+        let branch_plan = if_term
+            .test
+            .typed_extra()
+            .and_then(|extra| extra.exact_int_branch_plan())
+            .expect("typed-v3 module plan should carry exact-int branch selection");
+        assert_eq!(
+            branch_plan.source,
+            TypedExactIntPlanSource::OptimizationPlanV3
+        );
+        assert_eq!(branch_plan.instr_id, compare_instr_id);
+        assert_eq!(branch_plan.hot_plan.id, branch_plan.hot_region.region);
+        assert_eq!(
+            branch_plan
+                .hot_region
+                .exits
+                .first()
+                .and_then(|exit| exit.source),
+            Some(compare_instr_id)
+        );
+
+        let BlockTerm::Return(return_value) = &planned_function.blocks[1].term else {
+            panic!("then block should remain a typed return");
+        };
+        let return_plan = return_value
+            .typed_extra()
+            .and_then(|extra| extra.exact_int_return_plan())
+            .expect("typed-v3 module plan should carry exact-int return selection");
+        assert_eq!(
+            return_plan.source,
+            TypedExactIntPlanSource::OptimizationPlanV3
+        );
+        assert_eq!(return_plan.instr_id, return_add_instr_id);
+        assert_eq!(return_plan.hot_plan.id, return_plan.hot_region.region);
+        assert_eq!(
+            return_plan
+                .hot_region
+                .exits
+                .first()
+                .and_then(|exit| exit.source),
+            Some(return_add_instr_id)
+        );
+    }
+
+    #[test]
     fn specialized_jit_assignment_to_direct_entry_param_avoids_stack_mirror() {
         let blocks = [1usize as ObjPtr];
         let mut constants = TestConstantPool::default();

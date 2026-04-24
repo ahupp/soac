@@ -1,7 +1,8 @@
+use crate::emit_v3::MechanicalRegionEmission;
 use crate::passes::{BoolFacts, FactStore, PyObjFacts, ValueFacts, value_facts};
 use crate::plan_v3::{
     ExactListItemAccessKind, ExactListItemFallbackKind, ExactListItemGuardKind, ExactListItemShape,
-    IndexedGlobalAccessKind, IndexedGlobalFallbackKind, IndexedGlobalGuardKind,
+    IndexedGlobalAccessKind, IndexedGlobalFallbackKind, IndexedGlobalGuardKind, RegionPlan,
 };
 #[allow(unused_imports)]
 use soac_core::block_py;
@@ -1020,6 +1021,31 @@ pub struct TypedExactListItemAccessPlan {
     pub fallback: ExactListItemFallbackKind,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TypedExactIntPlanSource {
+    OptimizationPlanV3,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TypedExactIntBranchPlan {
+    pub source: TypedExactIntPlanSource,
+    pub instr_id: InstrId,
+    pub hot_plan: RegionPlan,
+    pub hot_region: MechanicalRegionEmission,
+    pub fallback_plan: RegionPlan,
+    pub fallback_region: MechanicalRegionEmission,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TypedExactIntReturnPlan {
+    pub source: TypedExactIntPlanSource,
+    pub instr_id: InstrId,
+    pub hot_plan: RegionPlan,
+    pub hot_region: MechanicalRegionEmission,
+    pub fallback_plan: RegionPlan,
+    pub fallback_region: MechanicalRegionEmission,
+}
+
 define_ruff_instr! {
     pub struct TypedGetAttr<E> {
         value: Box<E>,
@@ -1200,6 +1226,8 @@ pub struct TypedInstrExtra {
     pub planned_result: Option<TypedPlannedResult>,
     pub indexed_global_access: Option<TypedIndexedGlobalAccessPlan>,
     pub exact_list_item_access: Option<TypedExactListItemAccessPlan>,
+    pub exact_int_branch: Option<TypedExactIntBranchPlan>,
+    pub exact_int_return: Option<TypedExactIntReturnPlan>,
 }
 
 impl TypedInstrExtra {
@@ -1281,6 +1309,38 @@ impl TypedInstrExtra {
 
     pub fn clear_exact_list_item_access_plan(&mut self) -> bool {
         self.exact_list_item_access.take().is_some()
+    }
+
+    pub fn exact_int_branch_plan(&self) -> Option<&TypedExactIntBranchPlan> {
+        self.exact_int_branch.as_ref()
+    }
+
+    pub fn set_exact_int_branch_plan(&mut self, plan: TypedExactIntBranchPlan) -> bool {
+        if self.exact_int_branch.as_ref() == Some(&plan) {
+            return false;
+        }
+        self.exact_int_branch = Some(plan);
+        true
+    }
+
+    pub fn clear_exact_int_branch_plan(&mut self) -> bool {
+        self.exact_int_branch.take().is_some()
+    }
+
+    pub fn exact_int_return_plan(&self) -> Option<&TypedExactIntReturnPlan> {
+        self.exact_int_return.as_ref()
+    }
+
+    pub fn set_exact_int_return_plan(&mut self, plan: TypedExactIntReturnPlan) -> bool {
+        if self.exact_int_return.as_ref() == Some(&plan) {
+            return false;
+        }
+        self.exact_int_return = Some(plan);
+        true
+    }
+
+    pub fn clear_exact_int_return_plan(&mut self) -> bool {
+        self.exact_int_return.take().is_some()
     }
 }
 

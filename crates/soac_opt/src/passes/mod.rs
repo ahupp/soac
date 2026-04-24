@@ -65,6 +65,7 @@ pub use crate::typed::{
     TypedDirectCallArgSource, TypedDirectCallGuardTest, TypedDirectCallGuardTestKind,
     TypedDirectCallableCall, TypedDirectCallableCallGuard, TypedDirectConstructorCallGuard,
     TypedDirectFunctionCallGuard, TypedDirectMethodCall, TypedDirectMethodCallGuard,
+    TypedExactIntBranchPlan, TypedExactIntPlanSource, TypedExactIntReturnPlan,
     TypedExactListItemAccessPlan, TypedExactListItemPlanSource, TypedGetAttr,
     TypedGuardedCallableCall, TypedGuardedMethodCall, TypedIndexedFieldGuard,
     TypedIndexedFieldPlanSource, TypedIndexedGlobalAccessPlan, TypedIndexedGlobalPlanSource,

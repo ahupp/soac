@@ -92,6 +92,7 @@ use soac_opt::passes::{
     TypedDirectCallArgSource, TypedDirectCallGuardTest, TypedDirectCallGuardTestKind,
     TypedDirectCallableCall, TypedDirectCallableCallGuard, TypedDirectConstructorCallGuard,
     TypedDirectFunctionCallGuard, TypedDirectMethodCall, TypedDirectMethodCallGuard,
+    TypedExactIntBranchPlan, TypedExactIntPlanSource, TypedExactIntReturnPlan,
     TypedExactListItemAccessPlan, TypedExactListItemPlanSource, TypedGetAttr,
     TypedGuardedCallableCall, TypedGuardedMethodCall, TypedIndexedFieldGuard,
     TypedIndexedFieldPlanSource, TypedIndexedGlobalAccessPlan, TypedIndexedGlobalPlanSource,
@@ -1909,6 +1910,12 @@ fn apply_typed_v3_module_rewrites(
             .get(&function.function_id)
         {
             annotate_typed_exact_list_item_accesses(function, exact_list_items_by_instr)?;
+        }
+        if let Some(exact_int_artifacts) = profile
+            .opt_v3_exact_int_branch_artifacts
+            .get(&function.function_id)
+        {
+            annotate_typed_exact_int_selections(function, exact_int_artifacts)?;
         }
     }
     Ok(())
@@ -11330,6 +11337,132 @@ fn annotate_typed_exact_list_item_accesses(
     Ok(annotator.count)
 }
 
+fn typed_exact_int_branch_plan_from_opt_v3(
+    instr_id: InstrId,
+    selection: OptV3ExactIntBranchSelection<'_>,
+) -> TypedExactIntBranchPlan {
+    TypedExactIntBranchPlan {
+        source: TypedExactIntPlanSource::OptimizationPlanV3,
+        instr_id,
+        hot_plan: selection.hot_plan.clone(),
+        hot_region: selection.hot_region.clone(),
+        fallback_plan: selection.fallback_plan.clone(),
+        fallback_region: selection.fallback_region.clone(),
+    }
+}
+
+fn typed_exact_int_return_plan_from_opt_v3(
+    instr_id: InstrId,
+    selection: OptV3ExactIntReturnSelection<'_>,
+) -> TypedExactIntReturnPlan {
+    TypedExactIntReturnPlan {
+        source: TypedExactIntPlanSource::OptimizationPlanV3,
+        instr_id,
+        hot_plan: selection.hot_plan.clone(),
+        hot_region: selection.hot_region.clone(),
+        fallback_plan: selection.fallback_plan.clone(),
+        fallback_region: selection.fallback_region.clone(),
+    }
+}
+
+fn annotate_typed_exact_int_selections(
+    function: &mut BlockPyFunction<TypedCodegenModuleShape>,
+    artifacts: &ExactIntBranchV3Artifacts,
+) -> Result<usize, String> {
+    struct Annotator<'a> {
+        artifacts: &'a ExactIntBranchV3Artifacts,
+        count: usize,
+        error: Option<String>,
+    }
+
+    impl Annotator<'_> {
+        fn attach_branch_plan(&mut self, expr: &mut InstrTyped) {
+            let Some(instr_id) = expr.try_semantic_instr_id() else {
+                return;
+            };
+            let selection =
+                match opt_v3_exact_int_branch_selection_for_source(self.artifacts, instr_id) {
+                    Ok(selection) => selection,
+                    Err(error) => {
+                        self.error = Some(error);
+                        return;
+                    }
+                };
+            let Some(selection) = selection else {
+                return;
+            };
+            let Some(extra) = expr.typed_extra_mut() else {
+                self.error = Some(format!(
+                    "optimizer v3 exact-int branch plan for {instr_id} reached a typed node without metadata"
+                ));
+                return;
+            };
+            let plan = typed_exact_int_branch_plan_from_opt_v3(instr_id, selection);
+            self.count += usize::from(extra.set_exact_int_branch_plan(plan));
+        }
+
+        fn attach_return_plan(&mut self, expr: &mut InstrTyped) {
+            let Some(instr_id) = expr.try_semantic_instr_id() else {
+                return;
+            };
+            let selection =
+                match opt_v3_exact_int_return_selection_for_source(self.artifacts, instr_id) {
+                    Ok(selection) => selection,
+                    Err(error) => {
+                        self.error = Some(error);
+                        return;
+                    }
+                };
+            let Some(selection) = selection else {
+                return;
+            };
+            let Some(extra) = expr.typed_extra_mut() else {
+                self.error = Some(format!(
+                    "optimizer v3 exact-int return plan for {instr_id} reached a typed node without metadata"
+                ));
+                return;
+            };
+            let plan = typed_exact_int_return_plan_from_opt_v3(instr_id, selection);
+            self.count += usize::from(extra.set_exact_int_return_plan(plan));
+        }
+    }
+
+    impl VisitMut<InstrTyped> for Annotator<'_> {
+        fn visit_instr_mut(&mut self, expr: &mut InstrTyped) {
+            if self.error.is_some() {
+                return;
+            }
+            self.attach_return_plan(expr);
+            expr.visit_children_mut(self);
+        }
+    }
+
+    let mut annotator = Annotator {
+        artifacts,
+        count: 0,
+        error: None,
+    };
+    for block in &mut function.blocks {
+        if let BlockTerm::IfTerm(if_term) = &mut block.term {
+            annotator.attach_branch_plan(&mut if_term.test);
+            if let Some(error) = annotator.error.take() {
+                return Err(error);
+            }
+        }
+        for instr in &mut block.body {
+            annotator.visit_instr_mut(instr);
+            if let Some(error) = annotator.error.take() {
+                return Err(error);
+            }
+        }
+        annotator.visit_term_mut(&mut block.term);
+        if let Some(error) = annotator.error.take() {
+            return Err(error);
+        }
+    }
+    Ok(annotator.count)
+}
+
 fn call_site_profiled_targets<'a>(
     call: &blockpy_intrinsics::Call<InstrCodegen>,
     profiled_targets: Option<&'a [RuntimeFunctionId]>,
@@ -19465,6 +19598,18 @@ fn emit_typed_codegen_stmt_result_with_local_env(
         }
     }
 
+    if let Some(result) = emit_typed_exact_int_expr_pyobject_result(
+        fb,
+        expr,
+        local_env,
+        emit_ctx,
+        demand,
+        codegen_env,
+        func_imports,
+    )? {
+        return Ok(result);
+    }
+
     if let Some(result) = emit_opt_v3_exact_int_expr_pyobject_result(
         fb,
         expr,
@@ -19596,6 +19741,66 @@ struct OptV3PyObjectResult {
     ownership: ValueOwnership,
 }
 
+#[derive(Clone, Copy)]
+struct ExactIntBranchEmissionSelection<'a> {
+    hot_plan: &'a RegionPlan,
+    hot_region: &'a MechanicalRegionEmission,
+    fallback_plan: &'a RegionPlan,
+    fallback_region: &'a MechanicalRegionEmission,
+}
+
+#[derive(Clone, Copy)]
+struct ExactIntReturnEmissionSelection<'a> {
+    hot_plan: &'a RegionPlan,
+    hot_region: &'a MechanicalRegionEmission,
+    fallback_plan: &'a RegionPlan,
+    fallback_region: &'a MechanicalRegionEmission,
+}
+
+impl<'a> From<OptV3ExactIntBranchSelection<'a>> for ExactIntBranchEmissionSelection<'a> {
+    fn from(selection: OptV3ExactIntBranchSelection<'a>) -> Self {
+        Self {
+            hot_plan: selection.hot_plan,
+            hot_region: selection.hot_region,
+            fallback_plan: selection.fallback_plan,
+            fallback_region: selection.fallback_region,
+        }
+    }
+}
+
+impl<'a> From<OptV3ExactIntReturnSelection<'a>> for ExactIntReturnEmissionSelection<'a> {
+    fn from(selection: OptV3ExactIntReturnSelection<'a>) -> Self {
+        Self {
+            hot_plan: selection.hot_plan,
+            hot_region: selection.hot_region,
+            fallback_plan: selection.fallback_plan,
+            fallback_region: selection.fallback_region,
+        }
+    }
+}
+
+impl<'a> From<&'a TypedExactIntBranchPlan> for ExactIntBranchEmissionSelection<'a> {
+    fn from(plan: &'a TypedExactIntBranchPlan) -> Self {
+        Self {
+            hot_plan: &plan.hot_plan,
+            hot_region: &plan.hot_region,
+            fallback_plan: &plan.fallback_plan,
+            fallback_region: &plan.fallback_region,
+        }
+    }
+}
+
+impl<'a> From<&'a TypedExactIntReturnPlan> for ExactIntReturnEmissionSelection<'a> {
+    fn from(plan: &'a TypedExactIntReturnPlan) -> Self {
+        Self {
+            hot_plan: &plan.hot_plan,
+            hot_region: &plan.hot_region,
+            fallback_plan: &plan.fallback_plan,
+            fallback_region: &plan.fallback_region,
+        }
+    }
+}
+
 impl OptV3MechanicalValue {
     fn matches_rep(self, rep: Rep) -> bool {
         matches!(
@@ -19633,7 +19838,33 @@ fn emit_opt_v3_exact_int_branch_truth_i32(
     emit_opt_v3_exact_int_branch_selection(
         fb,
         test_instr_id,
-        selection,
+        selection.into(),
+        local_env,
+        emit_ctx,
+        codegen_env,
+        func_imports,
+    )
+    .map(Some)
+}
+
+fn emit_typed_exact_int_branch_truth_i32(
+    fb: &mut FunctionBuilder<'_>,
+    expr: &InstrTyped,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<Option<ir::Value>, String> {
+    let Some(plan) = expr
+        .typed_extra()
+        .and_then(|extra| extra.exact_int_branch_plan())
+    else {
+        return Ok(None);
+    };
+    emit_opt_v3_exact_int_branch_selection(
+        fb,
+        plan.instr_id,
+        plan.into(),
         local_env,
         emit_ctx,
         codegen_env,
@@ -19664,7 +19895,34 @@ fn emit_opt_v3_exact_int_return_pyobject(
     emit_opt_v3_exact_int_return_selection(
         fb,
         value_instr_id,
-        selection,
+        selection.into(),
+        local_env,
+        emit_ctx,
+        codegen_env,
+        func_imports,
+    )
+    .map(|result| Some(result.value))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_typed_exact_int_return_pyobject(
+    fb: &mut FunctionBuilder<'_>,
+    expr: &InstrTyped,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<Option<ir::Value>, String> {
+    let Some(plan) = expr
+        .typed_extra()
+        .and_then(|extra| extra.exact_int_return_plan())
+    else {
+        return Ok(None);
+    };
+    emit_opt_v3_exact_int_return_selection(
+        fb,
+        plan.instr_id,
+        plan.into(),
         local_env,
         emit_ctx,
         codegen_env,
@@ -19702,7 +19960,7 @@ fn emit_opt_v3_exact_int_expr_pyobject_result(
     let result = emit_opt_v3_exact_int_return_selection(
         fb,
         value_instr_id,
-        selection,
+        selection.into(),
         local_env,
         emit_ctx,
         codegen_env,
@@ -19723,10 +19981,56 @@ fn emit_opt_v3_exact_int_expr_pyobject_result(
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn emit_typed_exact_int_expr_pyobject_result(
+    fb: &mut FunctionBuilder<'_>,
+    expr: &InstrTyped,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    demand: ResultDemand,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<Option<EmitResult>, String> {
+    if !matches!(expr, InstrTyped::BinOp(_)) {
+        return Ok(None);
+    }
+    let ResultDemand::PyObject { borrowed_ok: false } = demand else {
+        return Ok(None);
+    };
+    let Some(plan) = expr
+        .typed_extra()
+        .and_then(|extra| extra.exact_int_return_plan())
+    else {
+        return Ok(None);
+    };
+    let result = emit_opt_v3_exact_int_return_selection(
+        fb,
+        plan.instr_id,
+        plan.into(),
+        local_env,
+        emit_ctx,
+        codegen_env,
+        func_imports,
+    )?;
+    if !result.ownership.can_satisfy_pyobject_demand(demand) {
+        return Err(format!(
+            "optimizer v3 expression result for {} produced {:?}, but demand is {demand:?}",
+            plan.instr_id, result.ownership
+        ));
+    }
+    let facts =
+        py_facts_for_typed_expr_with_local_env(expr, local_env).unwrap_or_else(PyObjFacts::unknown);
+    Ok(Some(EmitResult::PyObject {
+        value: result.value,
+        ownership: result.ownership,
+        facts,
+    }))
+}
+
 fn emit_opt_v3_exact_int_branch_selection(
     fb: &mut FunctionBuilder<'_>,
     test_instr_id: InstrId,
-    selection: OptV3ExactIntBranchSelection<'_>,
+    selection: ExactIntBranchEmissionSelection<'_>,
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     codegen_env: &mut impl JitCodegenEnv,
@@ -19790,7 +20094,7 @@ fn emit_opt_v3_exact_int_branch_selection(
 fn emit_opt_v3_exact_int_return_selection(
     fb: &mut FunctionBuilder<'_>,
     value_instr_id: InstrId,
-    selection: OptV3ExactIntReturnSelection<'_>,
+    selection: ExactIntReturnEmissionSelection<'_>,
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     codegen_env: &mut impl JitCodegenEnv,
@@ -22012,7 +22316,16 @@ fn emit_typed_codegen_term(
             .unwrap_or(ResultDemand::I32_BOOL01);
         let truth = match demand {
             ResultDemand::I32Bool01 => {
-                if let Some(truth_i32) = emit_opt_v3_exact_int_branch_truth_i32(
+                if let Some(truth_i32) = emit_typed_exact_int_branch_truth_i32(
+                    fb,
+                    &if_term.test,
+                    local_env,
+                    emit_ctx,
+                    codegen_env,
+                    func_imports,
+                )? {
+                    EmitResult::i32(truth_i32, IntFacts::i32_bool01())
+                } else if let Some(truth_i32) = emit_opt_v3_exact_int_branch_truth_i32(
                     fb,
                     test_instr_id,
                     local_env,
@@ -22067,6 +22380,23 @@ fn emit_typed_codegen_term(
             .unwrap_or(ResultDemand::PYOBJECT_OWNED);
         let result = match demand {
             ResultDemand::PyObject { borrowed_ok: false } => {
+                if let Some(ret_value) = emit_typed_exact_int_return_pyobject(
+                    fb,
+                    value,
+                    local_env,
+                    emit_ctx,
+                    codegen_env,
+                    func_imports,
+                )? {
+                    return emit_codegen_return_pyobject(
+                        fb,
+                        source_label,
+                        ret_value,
+                        local_env,
+                        emit_ctx,
+                        current_exception_name,
+                    );
+                }
                 if let Some(ret_value) = emit_opt_v3_exact_int_return_pyobject(
                     fb,
                     value.try_semantic_instr_id(),
