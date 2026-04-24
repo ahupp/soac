@@ -5363,8 +5363,8 @@ fn local_name_for_location<'a>(
 fn emit_codegen_non_local_name_load(
     fb: &mut FunctionBuilder<'_>,
     name: &ResolvedName,
-    load_instr_id: Option<InstrId>,
-    local_env: &LocalEnv,
+    _load_instr_id: Option<InstrId>,
+    _local_env: &LocalEnv,
     ctx: &JitEmitCtx<'_>,
     _borrowed: bool,
 ) -> Option<ir::Value> {
@@ -5382,26 +5382,19 @@ fn emit_codegen_non_local_name_load(
         }
         NameLocation::Global(slot) => {
             let globals_obj = ctx.consts.block_const;
-            let opt_v3_plan = load_instr_id
-                .and_then(|load_instr_id| ctx.opt_v3_indexed_globals_by_instr.get(&load_instr_id))
-                .filter(|plan| plan.access == PlanV3IndexedGlobalAccessKind::Load);
-            let value = if let Some(plan) = opt_v3_plan {
-                emit_codegen_opt_v3_indexed_global_load(fb, globals_obj, plan, local_env, ctx)
-            } else {
-                let name_obj = emit_owned_module_constant(
-                    fb,
-                    ctx.module_constants
-                        .require_unicode_constant_id(name.id.as_str()),
-                    ctx,
-                );
-                let slot_index = fb.ins().iconst(ir::types::I64, i64::from(slot.slot()));
-                let value_inst = fb.ins().call(
-                    ctx.load_global_fast_ref,
-                    &[globals_obj, name_obj, slot_index],
-                );
-                let value = fb.inst_results(value_inst)[0];
-                emit_decref_owned_input_after_nullable_result(fb, ctx, value, name_obj)
-            };
+            let name_obj = emit_owned_module_constant(
+                fb,
+                ctx.module_constants
+                    .require_unicode_constant_id(name.id.as_str()),
+                ctx,
+            );
+            let slot_index = fb.ins().iconst(ir::types::I64, i64::from(slot.slot()));
+            let value_inst = fb.ins().call(
+                ctx.load_global_fast_ref,
+                &[globals_obj, name_obj, slot_index],
+            );
+            let value = fb.inst_results(value_inst)[0];
+            let value = emit_decref_owned_input_after_nullable_result(fb, ctx, value, name_obj);
             let value_ok_block = fb.create_block();
             fb.append_block_param(value_ok_block, ptr_ty);
             let value_is_null = fb.ins().icmp(ir::condcodes::IntCC::Equal, value, null_ptr);
@@ -5617,24 +5610,6 @@ fn emit_planned_indexed_global_load(
         slot_index,
         instr_id,
         guard_miss_resume_point,
-        local_env,
-        ctx,
-    )
-}
-
-fn emit_codegen_opt_v3_indexed_global_load(
-    fb: &mut FunctionBuilder<'_>,
-    globals_obj: ir::Value,
-    plan: &OptV3IndexedGlobalAccessPlan,
-    local_env: &LocalEnv,
-    ctx: &JitEmitCtx<'_>,
-) -> ir::Value {
-    emit_planned_indexed_global_load(
-        fb,
-        globals_obj,
-        plan.name.as_str(),
-        plan.expected_index,
-        plan.source,
         local_env,
         ctx,
     )
@@ -6493,7 +6468,6 @@ struct JitEmitCtx<'mc> {
     branch_outcome_counter_ids: &'mc HashMap<InstrId, CounterId>,
     global_indexed_hit_counter_ids: &'mc HashMap<InstrId, CounterRef>,
     global_indexed_fallback_counter_ids: &'mc HashMap<InstrId, CounterRef>,
-    opt_v3_indexed_globals_by_instr: &'mc HashMap<InstrId, OptV3IndexedGlobalAccessPlan>,
     field_indexed_hit_counter_ids: &'mc HashMap<InstrId, CounterRef>,
     field_indexed_fallback_counter_ids: &'mc HashMap<InstrId, CounterRef>,
     field_generic_getattr_counter_ids: &'mc HashMap<InstrId, CounterRef>,
@@ -10092,6 +10066,41 @@ fn emit_codegen_tuple_with_local_env(
         }
     }
     tuple_value
+}
+
+fn emit_typed_tuple_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    tuple: &blockpy_intrinsics::Tuple<InstrTyped>,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<ir::Value, String> {
+    let mut arg_values: Vec<ir::Value> = Vec::with_capacity(tuple.values.len());
+    let mut borrowed_args: Vec<bool> = Vec::with_capacity(tuple.values.len());
+    for arg in &tuple.values {
+        let (value, borrowed_arg) = emit_typed_pyobject_input_with_local_env(
+            fb,
+            arg,
+            local_env,
+            emit_ctx,
+            codegen_env,
+            func_imports,
+            "typed tuple element",
+        )?;
+        arg_values.push(value);
+        borrowed_args.push(borrowed_arg);
+    }
+    let tuple_value = emit_pack_current_values_tuple(fb, arg_values.as_slice(), emit_ctx);
+    for (value, borrowed_arg) in arg_values.into_iter().zip(borrowed_args.into_iter()) {
+        if !borrowed_arg {
+            fb.ins().call(
+                emit_ctx.decref_ref,
+                &[emit_ctx.consts.thread_state_value, value],
+            );
+        }
+    }
+    Ok(tuple_value)
 }
 
 fn emit_call_args_tuple_from_values(
@@ -15539,6 +15548,22 @@ fn emit_typed_codegen_expr_value_with_local_env(
         }
     }
 
+    if let InstrTyped::LegacyTuple(op) = expr {
+        assert!(
+            !borrowed,
+            "typed tuple expression must not request a borrowed result"
+        );
+        let value = emit_typed_tuple_with_local_env(
+            fb,
+            op,
+            local_env,
+            emit_ctx,
+            codegen_env,
+            func_imports,
+        )?;
+        return Ok(SoacValue::pyobject(value, PyObjFacts::unknown()));
+    }
+
     if let InstrTyped::CallTyped(op) = expr {
         if let Some(result) = emit_typed_codegen_call_result_with_local_env(
             fb,
@@ -19457,6 +19482,7 @@ fn emit_typed_codegen_stmt_with_local_env(
         InstrTyped::Truthy(_)
             | InstrTyped::Load(_)
             | InstrTyped::BinOp(_)
+            | InstrTyped::LegacyTuple(_)
             | InstrTyped::LegacyUnaryOp(_)
             | InstrTyped::CallTyped(_)
             | InstrTyped::GuardedCallableCallTyped(_)
@@ -19500,6 +19526,44 @@ fn emit_typed_codegen_stmt_result_with_local_env(
         emit_typed_local_load_result_with_local_env(fb, expr, local_env, emit_ctx, demand)
     {
         return Ok(result);
+    }
+    if let InstrTyped::LegacyTuple(_) = expr {
+        let result = emit_typed_codegen_expr_value_with_local_env(
+            fb,
+            expr,
+            local_env,
+            emit_ctx,
+            false,
+            codegen_env,
+            func_imports,
+        )?;
+        let (value, ownership, facts) = result.expect_pyobject("typed tuple statement result");
+        return Ok(match demand {
+            ResultDemand::EffectOnly => {
+                if ownership.is_owned() && !facts.is_immortal() {
+                    fb.ins().call(
+                        emit_ctx.decref_ref,
+                        &[emit_ctx.consts.thread_state_value, value],
+                    );
+                }
+                EmitResult::no_value()
+            }
+            ResultDemand::PyObject { .. } => {
+                if !ownership.can_satisfy_pyobject_demand(demand) {
+                    return Err(format!(
+                        "typed tuple statement result produced {ownership:?}, but demand is {demand:?}"
+                    ));
+                }
+                EmitResult::PyObject {
+                    value,
+                    ownership,
+                    facts,
+                }
+            }
+            ResultDemand::I32Bool01 | ResultDemand::I64 | ResultDemand::I64Index => {
+                panic!("typed tuple cannot satisfy non-PyObject demand {demand:?}")
+            }
+        });
     }
 
     if let InstrTyped::CallTyped(op) = expr {
@@ -26137,6 +26201,7 @@ fn prepare_specialized_typed_function(
     field_index_specializations: &HashMap<String, Vec<FieldIndexSpecialization>>,
     field_index_specializations_by_instr: &HashMap<InstrId, Vec<FieldIndexSpecialization>>,
     opt_v3_indexed_fields_by_instr: &HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>,
+    opt_v3_indexed_globals_by_instr: &HashMap<InstrId, OptV3IndexedGlobalAccessPlan>,
     specialize_field_stores: bool,
 ) -> Result<PreparedSpecializedTypedFunction, String> {
     let mut typed_function = call_emission_typed_function
@@ -26158,6 +26223,7 @@ fn prepare_specialized_typed_function(
         opt_v3_indexed_fields_by_instr,
         specialize_field_stores,
     )?;
+    annotate_typed_indexed_global_accesses(&mut typed_function, opt_v3_indexed_globals_by_instr)?;
     lower_typed_function_call_access_plan_instrs(&mut typed_function);
     refresh_typed_function_value_facts(&mut typed_function);
     annotate_typed_function_result_demands(&mut typed_function);
@@ -26485,6 +26551,7 @@ fn build_cranelift_run_bb_specialized_function(
         &field_index_specializations,
         &field_index_specializations_by_instr,
         &opt_v3_indexed_fields_by_instr,
+        &opt_v3_indexed_globals_by_instr,
         behavior_change_indexed_stores,
     )?;
     let direct_call_targets = collect_typed_call_direct_targets(&typed_function);
@@ -27131,7 +27198,6 @@ fn build_cranelift_run_bb_specialized_function(
                 opt_v3_exact_list_items_by_instr: &opt_v3_exact_list_items_by_instr,
                 global_indexed_hit_counter_ids: &global_indexed_hit_counter_ids,
                 global_indexed_fallback_counter_ids: &global_indexed_fallback_counter_ids,
-                opt_v3_indexed_globals_by_instr: &opt_v3_indexed_globals_by_instr,
                 field_indexed_hit_counter_ids: &field_indexed_hit_counter_ids,
                 field_indexed_fallback_counter_ids: &field_indexed_fallback_counter_ids,
                 field_generic_getattr_counter_ids: &field_generic_getattr_counter_ids,
@@ -27564,6 +27630,7 @@ pub unsafe fn render_instr_typed_for_codegen_with_runtime_state(
         &specialization_inputs.field_index_specializations,
         &specialization_inputs.field_index_specializations_by_instr,
         &specialization_inputs.opt_v3_indexed_fields_by_instr,
+        &specialization_inputs.opt_v3_indexed_globals_by_instr,
         specialization_inputs.behavior_change_indexed_stores,
     )?;
     let direct_call_targets = collect_typed_call_direct_targets(&typed_function);
