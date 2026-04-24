@@ -565,16 +565,54 @@ fn print_usage() {
 #[cfg(test)]
 mod test {
     use super::*;
+    use soac_core::pass_tracker::RecordingPassTracker;
     use soac_core::profile::{CounterDumpRecord, CounterDumpRow, parse_counter_dump_records};
     use soac_driver::codegen_cache::store_codegen_module_cache;
     use soac_driver::{
         CachedModuleOptimizationInput, CodegenPreparationOptions,
-        generate_optimization_plans_v3_for_cached_modules,
-        prepare_codegen_module_recorded_with_options,
+        generate_optimization_plans_v3_for_cached_modules, prepare_codegen_module,
     };
     use soac_opt::plan::ProfileEvidenceStore;
     use std::process::Stdio;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn prepare_for_test(
+        source: &str,
+        module_id: u32,
+        options: CodegenPreparationOptions,
+    ) -> BlockPyModule<CodegenModuleShape> {
+        let mut pass_tracker = RecordingPassTracker::new();
+        prepare_codegen_module(
+            source,
+            ModuleNameGen::new(module_id),
+            options,
+            &SoacEnvConfig::default(),
+            &mut pass_tracker,
+        )
+        .unwrap()
+    }
+
+    fn prepare_with_cache_for_test(
+        source: &str,
+        module_id: u32,
+        cache_root: &Path,
+        cache_source: PythonModuleCacheSource,
+        module_name: &str,
+        runtime_names_as_globals: bool,
+    ) -> BlockPyModule<CodegenModuleShape> {
+        prepare_for_test(
+            source,
+            module_id,
+            CodegenPreparationOptions::default()
+                .with_runtime_names_as_globals(runtime_names_as_globals)
+                .with_pre_optimization_cache(
+                    cache_root.to_path_buf(),
+                    cache_source,
+                    module_name,
+                    SOAC_BUILD_IDENTITY,
+                ),
+        )
+    }
 
     #[test]
     fn counter_modules_dedup_by_module_source_and_module_id() {
@@ -632,22 +670,14 @@ mod test {
         };
         let path = module_cache_path_for_identity(root.as_path(), &module_ref, SOAC_BUILD_IDENTITY)
             .unwrap();
-        prepare_codegen_module_recorded_with_options(
+        prepare_with_cache_for_test(
             source,
-            ModuleNameGen::new(7),
-            CodegenPreparationOptions {
-                lowering: soac_lowering::LoweringOptions {
-                    runtime_names_as_globals: false,
-                },
-                pre_optimization_cache_path: Some(path.clone()),
-                pre_optimization_cache_metadata: Some(module_cache_metadata_for_source(
-                    PythonModuleCacheSource::Project,
-                    &module_ref,
-                    SOAC_BUILD_IDENTITY,
-                )),
-            },
-        )
-        .unwrap();
+            7,
+            root.as_path(),
+            PythonModuleCacheSource::Project,
+            module_ref.module_name.as_str(),
+            false,
+        );
 
         let resolved = resolve_module_cache_path(root.as_path(), &module_ref, None).unwrap();
 
@@ -659,13 +689,7 @@ mod test {
     fn cache_resolution_rejects_ambiguous_source_subtrees() {
         let root = unique_temp_dir();
         let source = "def f():\n    return 1\n";
-        let lowered = prepare_codegen_module_recorded_with_options(
-            source,
-            ModuleNameGen::new(7),
-            CodegenPreparationOptions::default(),
-        )
-        .unwrap()
-        .codegen_module;
+        let lowered = prepare_for_test(source, 7, CodegenPreparationOptions::default());
         let module_ref = CounterModuleRef {
             module_name: "pkg.mod".to_string(),
             source_hash: hash_module_source(source),
@@ -696,13 +720,7 @@ mod test {
     fn cache_resolution_ignores_stale_metadata() {
         let root = unique_temp_dir();
         let source = "def f():\n    return 1\n";
-        let lowered = prepare_codegen_module_recorded_with_options(
-            source,
-            ModuleNameGen::new(7),
-            CodegenPreparationOptions::default(),
-        )
-        .unwrap()
-        .codegen_module;
+        let lowered = prepare_for_test(source, 7, CodegenPreparationOptions::default());
         let module_ref = CounterModuleRef {
             module_name: "pkg.mod".to_string(),
             source_hash: hash_module_source(source),
@@ -745,25 +763,14 @@ mod test {
             source_hash: hash_module_source(runtime_source.as_str()),
             module_id: None,
         };
-        let runtime_cache_path =
-            module_cache_path_for_identity(cache_root.as_path(), &runtime_ref, SOAC_BUILD_IDENTITY)
-                .unwrap();
-        prepare_codegen_module_recorded_with_options(
+        prepare_with_cache_for_test(
             runtime_source.as_str(),
-            ModuleNameGen::new(11),
-            CodegenPreparationOptions {
-                lowering: soac_lowering::LoweringOptions {
-                    runtime_names_as_globals: true,
-                },
-                pre_optimization_cache_path: Some(runtime_cache_path.clone()),
-                pre_optimization_cache_metadata: Some(module_cache_metadata_for_source(
-                    PythonModuleCacheSource::Project,
-                    &runtime_ref,
-                    SOAC_BUILD_IDENTITY,
-                )),
-            },
-        )
-        .unwrap();
+            11,
+            cache_root.as_path(),
+            PythonModuleCacheSource::Project,
+            runtime_ref.module_name.as_str(),
+            true,
+        );
         let mut modules = vec![CounterModuleRef {
             module_name: "pkg.mod".to_string(),
             source_hash: 0x1234,
@@ -811,22 +818,14 @@ mod test {
         let cache_path =
             module_cache_path_for_identity(cache_root.as_path(), &module_ref, SOAC_BUILD_IDENTITY)
                 .unwrap();
-        let output = prepare_codegen_module_recorded_with_options(
+        let output = prepare_with_cache_for_test(
             source,
-            ModuleNameGen::new(module_id),
-            CodegenPreparationOptions {
-                lowering: soac_lowering::LoweringOptions {
-                    runtime_names_as_globals: false,
-                },
-                pre_optimization_cache_path: Some(cache_path.clone()),
-                pre_optimization_cache_metadata: Some(module_cache_metadata_for_source(
-                    PythonModuleCacheSource::Project,
-                    &module_ref,
-                    SOAC_BUILD_IDENTITY,
-                )),
-            },
-        )
-        .unwrap();
+            module_id,
+            cache_root.as_path(),
+            PythonModuleCacheSource::Project,
+            module_ref.module_name.as_str(),
+            false,
+        );
         assert!(
             cache_path.exists(),
             "lowering should populate the module cache"
@@ -840,24 +839,15 @@ mod test {
         let runtime_cache_path =
             module_cache_path_for_identity(cache_root.as_path(), &runtime_ref, SOAC_BUILD_IDENTITY)
                 .unwrap();
-        prepare_codegen_module_recorded_with_options(
+        prepare_with_cache_for_test(
             runtime_source.as_str(),
-            ModuleNameGen::new(11),
-            CodegenPreparationOptions {
-                lowering: soac_lowering::LoweringOptions {
-                    runtime_names_as_globals: true,
-                },
-                pre_optimization_cache_path: Some(runtime_cache_path.clone()),
-                pre_optimization_cache_metadata: Some(module_cache_metadata_for_source(
-                    PythonModuleCacheSource::Project,
-                    &runtime_ref,
-                    SOAC_BUILD_IDENTITY,
-                )),
-            },
-        )
-        .unwrap();
+            11,
+            cache_root.as_path(),
+            PythonModuleCacheSource::Project,
+            runtime_ref.module_name.as_str(),
+            true,
+        );
         let function_id = output
-            .codegen_module
             .callable_defs
             .iter()
             .find(|function| function.names.qualname == "f")

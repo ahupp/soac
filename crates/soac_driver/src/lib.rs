@@ -1,24 +1,26 @@
 pub mod codegen_cache;
 
 use crate::codegen_cache::{
-    CachedCodegenModule, CachedCodegenModuleMetadata, cached_module_paths_under_root,
-    load_codegen_module_cache, module_optimization_plan_v3_path, module_optimized_codegen_v3_path,
+    CachedCodegenModule, CachedCodegenModuleMetadata, PythonModuleCacheSource,
+    cached_module_paths_under_root, hash_module_source, load_codegen_module_cache,
+    module_optimization_plan_v3_path, module_optimized_codegen_v3_path,
+    pre_optimization_module_cache_metadata, pre_optimization_module_cache_path,
     remap_cached_codegen_module_function_ids, store_codegen_module_cache,
     validate_codegen_module_cache_metadata,
 };
 use anyhow::{Context, Result as AnyhowResult};
-use soac_config::{SoacEnvConfig, init_logging_with_config};
+use soac_config::SoacEnvConfig;
 use soac_core::block_py::{
     BlockPyModule, CounterDef, CounterId, CounterScope, CounterSite, DeoptEntrySource,
     FunctionExecutionMode, ModuleNameGen,
 };
-use soac_core::pass_tracker::{NoopPassTracker, PassTracker, RecordingPassTracker};
+use soac_core::pass_tracker::{NoopPassTracker, PassTracker};
 use soac_instrument::{
     CounterBuilder, ExplicitCounterPlacement, InstrumentationConfig,
     define_typed_module_counter_defs, instrument_codegen_module_with_tracker,
 };
 use soac_lowering::passes::{self, CodegenModuleShape, InstrCodegen};
-pub use soac_lowering::{LoweringError, LoweringResult, Result};
+pub use soac_lowering::{LoweringError, Result};
 use soac_opt::artifacts_v3::write_optimization_artifacts_v3;
 use soac_opt::passes as opt_passes;
 use soac_opt::pipeline_v3::{ModuleOptimizationInput, optimize_modules_v3_from_raw_evidence};
@@ -26,14 +28,60 @@ use soac_opt::plan::ProfileEvidenceStore;
 use soac_opt::plan_v3::ModulePlanIdentity;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
 use tracing::{info, warn};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CodegenPreparationOptions {
     pub lowering: soac_lowering::LoweringOptions,
-    pub pre_optimization_cache_path: Option<PathBuf>,
-    pub pre_optimization_cache_metadata: Option<CachedCodegenModuleMetadata>,
+    pub pre_optimization_cache: Option<PreOptimizationCacheRequest>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreOptimizationCacheRequest {
+    pub cache_root: PathBuf,
+    pub source: PythonModuleCacheSource,
+    pub module_name: String,
+    pub build_identity: String,
+}
+
+impl PreOptimizationCacheRequest {
+    pub fn new(
+        cache_root: PathBuf,
+        source: PythonModuleCacheSource,
+        module_name: impl Into<String>,
+        build_identity: impl Into<String>,
+    ) -> Self {
+        Self {
+            cache_root,
+            source,
+            module_name: module_name.into(),
+            build_identity: build_identity.into(),
+        }
+    }
+
+    fn target(
+        &self,
+        source_hash: u64,
+        runtime_names_as_globals: bool,
+    ) -> soac_lowering::Result<PreOptimizationCacheTarget> {
+        let path = pre_optimization_module_cache_path(
+            self.cache_root.as_path(),
+            self.source,
+            self.module_name.as_str(),
+            source_hash,
+            self.build_identity.as_str(),
+            runtime_names_as_globals,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let metadata = pre_optimization_module_cache_metadata(
+            self.source,
+            self.module_name.as_str(),
+            source_hash,
+            self.build_identity.as_str(),
+            runtime_names_as_globals,
+        );
+        Ok(PreOptimizationCacheTarget { path, metadata })
+    }
 }
 
 impl CodegenPreparationOptions {
@@ -44,11 +92,17 @@ impl CodegenPreparationOptions {
 
     pub fn with_pre_optimization_cache(
         mut self,
-        path: PathBuf,
-        metadata: CachedCodegenModuleMetadata,
+        cache_root: PathBuf,
+        source: PythonModuleCacheSource,
+        module_name: impl Into<String>,
+        build_identity: impl Into<String>,
     ) -> Self {
-        self.pre_optimization_cache_path = Some(path);
-        self.pre_optimization_cache_metadata = Some(metadata);
+        self.pre_optimization_cache = Some(PreOptimizationCacheRequest::new(
+            cache_root,
+            source,
+            module_name,
+            build_identity,
+        ));
         self
     }
 }
@@ -62,225 +116,135 @@ impl From<soac_lowering::LoweringOptions> for CodegenPreparationOptions {
     }
 }
 
-struct PreOptimizationModule {
-    module: BlockPyModule<CodegenModuleShape>,
-    cache_path_for_store: Option<PathBuf>,
-    cache_metadata_for_store: Option<CachedCodegenModuleMetadata>,
-}
-
-fn prepare_codegen_module_with_tracker<P>(
-    source: &str,
-    module_name_gen: ModuleNameGen,
-    pass_tracker: P,
-) -> soac_lowering::Result<soac_lowering::LoweringResult<P>>
-where
-    P: PassTracker,
-{
-    prepare_codegen_module_with_tracker_and_options(
-        source,
-        module_name_gen,
-        pass_tracker,
-        CodegenPreparationOptions::default(),
-    )
-}
-
-fn prepare_codegen_module_with_tracker_and_options<P>(
-    source: &str,
-    module_name_gen: ModuleNameGen,
-    pass_tracker: P,
-    options: CodegenPreparationOptions,
-) -> soac_lowering::Result<soac_lowering::LoweringResult<P>>
-where
-    P: PassTracker,
-{
-    let env_config = SoacEnvConfig::from_env().map_err(anyhow::Error::msg)?;
-    prepare_codegen_module_with_tracker_options_and_config(
-        source,
-        module_name_gen,
-        pass_tracker,
-        options,
-        &env_config,
-    )
-}
-
-fn prepare_codegen_module_with_tracker_options_and_config<P>(
-    source: &str,
-    module_name_gen: ModuleNameGen,
-    mut pass_tracker: P,
-    options: CodegenPreparationOptions,
-    env_config: &SoacEnvConfig,
-) -> soac_lowering::Result<soac_lowering::LoweringResult<P>>
-where
-    P: PassTracker,
-{
-    init_logging_with_config(env_config).map_err(anyhow::Error::msg)?;
-    let total_start = Instant::now();
-
-    let codegen_module = rewrite_module_with_tracker_with_options(
-        source,
-        module_name_gen,
-        &mut pass_tracker,
-        options,
-        env_config,
-    )?;
-
-    Ok(soac_lowering::LoweringResult {
-        total_time: total_start.elapsed(),
-        codegen_module,
-        pass_tracker,
-    })
-}
-
-pub fn prepare_codegen_module_for_testing_with_config(
-    source: &str,
-    env_config: &SoacEnvConfig,
-) -> soac_lowering::Result<soac_lowering::LoweringResult> {
-    prepare_codegen_module_with_tracker_options_and_config(
-        source,
-        ModuleNameGen::new(0),
-        RecordingPassTracker::new(),
-        CodegenPreparationOptions::default(),
-        env_config,
-    )
+struct PreOptimizationCacheTarget {
+    path: PathBuf,
+    metadata: CachedCodegenModuleMetadata,
 }
 
 pub fn prepare_codegen_module(
     source: &str,
     module_name_gen: ModuleNameGen,
-) -> soac_lowering::Result<soac_lowering::LoweringResult<NoopPassTracker>> {
-    prepare_codegen_module_with_tracker(source, module_name_gen, NoopPassTracker::new())
-}
-
-pub fn prepare_codegen_module_recorded(
-    source: &str,
-    module_name_gen: ModuleNameGen,
-) -> soac_lowering::Result<soac_lowering::LoweringResult<RecordingPassTracker>> {
-    prepare_codegen_module_with_tracker(source, module_name_gen, RecordingPassTracker::new())
-}
-
-pub fn prepare_codegen_module_recorded_with_options(
-    source: &str,
-    module_name_gen: ModuleNameGen,
-    options: CodegenPreparationOptions,
-) -> soac_lowering::Result<soac_lowering::LoweringResult<RecordingPassTracker>> {
-    prepare_codegen_module_with_tracker_and_options(
-        source,
-        module_name_gen,
-        RecordingPassTracker::new(),
-        options,
-    )
-}
-
-fn rewrite_module_with_tracker_with_options(
-    source: &str,
-    module_name_gen: ModuleNameGen,
-    pass_tracker: &mut impl PassTracker,
     options: CodegenPreparationOptions,
     env_config: &SoacEnvConfig,
+    pass_tracker: &mut impl PassTracker,
 ) -> soac_lowering::Result<BlockPyModule<CodegenModuleShape>> {
     let pre_optimization =
-        rewrite_pre_optimization_module_with_cache(source, module_name_gen, pass_tracker, options)?;
-    finish_codegen_module_with_tracker(pre_optimization, pass_tracker, env_config)
+        load_or_lower_pre_optimization_module(source, module_name_gen, pass_tracker, options)?;
+    finish_pre_optimization_module(pre_optimization, pass_tracker, env_config)
 }
 
-fn rewrite_pre_optimization_module_with_cache(
+fn load_or_lower_pre_optimization_module(
     source: &str,
     module_name_gen: ModuleNameGen,
     pass_tracker: &mut impl PassTracker,
     options: CodegenPreparationOptions,
-) -> soac_lowering::Result<PreOptimizationModule> {
-    if let Some(cache_path) = &options.pre_optimization_cache_path {
-        let cache_exists =
-            pass_tracker.record_timing("bb_codegen_cache_lookup", || cache_path.is_file());
-        if cache_exists {
-            let loaded = pass_tracker.record_timing("bb_codegen_cache_load", || {
-                load_codegen_module_cache(cache_path)
-            });
-            match loaded {
-                Ok(mut cache) => {
-                    let metadata_mismatch = if let Some(expected) =
-                        &options.pre_optimization_cache_metadata
-                    {
-                        match validate_codegen_module_cache_metadata(&cache.metadata, expected) {
-                            Ok(()) => None,
-                            Err(err) => Some(err),
-                        }
-                    } else {
-                        None
-                    };
-                    if let Some(err) = metadata_mismatch {
-                        warn!(
-                            target: "soac_blockpy_module_cache",
-                            event = "soac.blockpy_module_cache",
-                            cache_hit = false,
-                            path = %cache_path.display(),
-                            error = %err,
-                            "blockpy_module_cache_metadata_mismatch",
-                        );
-                    } else {
-                        remap_cached_codegen_module_function_ids(&mut cache, module_name_gen);
-                        info!(
-                            target: "soac_blockpy_module_cache",
-                            event = "soac.blockpy_module_cache",
-                            cache_hit = true,
-                            path = %cache_path.display(),
-                            "blockpy_module_cache_hit",
-                        );
-                        let CachedCodegenModule {
-                            metadata: _,
-                            module,
-                        } = cache;
-                        return Ok(PreOptimizationModule {
-                            module: pass_tracker.run_pass("bb_codegen", || module),
-                            cache_path_for_store: None,
-                            cache_metadata_for_store: None,
-                        });
-                    }
-                }
-                Err(err) => {
-                    warn!(
-                        target: "soac_blockpy_module_cache",
-                        event = "soac.blockpy_module_cache",
-                        cache_hit = false,
-                        path = %cache_path.display(),
-                        error = %err,
-                        "blockpy_module_cache_load_failed",
-                    );
-                }
+) -> soac_lowering::Result<BlockPyModule<CodegenModuleShape>> {
+    let cache_target = options
+        .pre_optimization_cache
+        .as_ref()
+        .map(|cache| {
+            cache.target(
+                hash_module_source(source),
+                options.lowering.runtime_names_as_globals,
+            )
+        })
+        .transpose()?;
+
+    if let Some(cache_target) = &cache_target {
+        if let Some(module) =
+            try_load_pre_optimization_cache(cache_target, module_name_gen.clone(), pass_tracker)
+        {
+            return Ok(module);
+        }
+    }
+
+    let module = soac_lowering::lower_source_to_codegen_module_with_tracker(
+        source,
+        module_name_gen,
+        pass_tracker,
+        options.lowering.clone(),
+    )?;
+
+    if let Some(cache_target) = &cache_target {
+        store_pre_optimization_cache(
+            &cache_target.path,
+            &cache_target.metadata,
+            &module,
+            pass_tracker,
+        );
+    }
+
+    Ok(module)
+}
+
+fn try_load_pre_optimization_cache(
+    cache_target: &PreOptimizationCacheTarget,
+    module_name_gen: ModuleNameGen,
+    pass_tracker: &mut impl PassTracker,
+) -> Option<BlockPyModule<CodegenModuleShape>> {
+    let cache_path = &cache_target.path;
+    let cache_exists =
+        pass_tracker.record_timing("bb_codegen_cache_lookup", || cache_path.is_file());
+    if !cache_exists {
+        info!(
+            target: "soac_blockpy_module_cache",
+            event = "soac.blockpy_module_cache",
+            cache_hit = false,
+            path = %cache_path.display(),
+            "blockpy_module_cache_miss",
+        );
+        return None;
+    }
+
+    let loaded = pass_tracker.record_timing("bb_codegen_cache_load", || {
+        load_codegen_module_cache(cache_path)
+    });
+    match loaded {
+        Ok(mut cache) => {
+            let metadata_mismatch = match validate_codegen_module_cache_metadata(
+                &cache.metadata,
+                &cache_target.metadata,
+            ) {
+                Ok(()) => None,
+                Err(err) => Some(err),
+            };
+            if let Some(err) = metadata_mismatch {
+                warn!(
+                    target: "soac_blockpy_module_cache",
+                    event = "soac.blockpy_module_cache",
+                    cache_hit = false,
+                    path = %cache_path.display(),
+                    error = %err,
+                    "blockpy_module_cache_metadata_mismatch",
+                );
+                return None;
             }
-        } else {
+
+            remap_cached_codegen_module_function_ids(&mut cache, module_name_gen);
             info!(
+                target: "soac_blockpy_module_cache",
+                event = "soac.blockpy_module_cache",
+                cache_hit = true,
+                path = %cache_path.display(),
+                "blockpy_module_cache_hit",
+            );
+            let CachedCodegenModule {
+                metadata: _,
+                module,
+            } = cache;
+            Some(pass_tracker.run_pass("bb_codegen", || module))
+        }
+        Err(err) => {
+            warn!(
                 target: "soac_blockpy_module_cache",
                 event = "soac.blockpy_module_cache",
                 cache_hit = false,
                 path = %cache_path.display(),
-                "blockpy_module_cache_miss",
+                error = %err,
+                "blockpy_module_cache_load_failed",
             );
+            None
         }
-
-        let module = soac_lowering::lower_source_to_codegen_module_with_tracker(
-            source,
-            module_name_gen,
-            pass_tracker,
-            options.lowering.clone(),
-        )?;
-        Ok(PreOptimizationModule {
-            module,
-            cache_path_for_store: Some(cache_path.clone()),
-            cache_metadata_for_store: options.pre_optimization_cache_metadata.clone(),
-        })
-    } else {
-        let module = soac_lowering::lower_source_to_codegen_module_with_tracker(
-            source,
-            module_name_gen,
-            pass_tracker,
-            options.lowering.clone(),
-        )?;
-        Ok(PreOptimizationModule {
-            module,
-            cache_path_for_store: None,
-            cache_metadata_for_store: None,
-        })
     }
 }
 
@@ -314,25 +278,14 @@ fn store_pre_optimization_cache(
     }
 }
 
-fn finish_codegen_module_with_tracker(
-    pre_optimization: PreOptimizationModule,
+fn finish_pre_optimization_module(
+    bb_codegen: BlockPyModule<CodegenModuleShape>,
     pass_tracker: &mut impl PassTracker,
     env_config: &SoacEnvConfig,
 ) -> soac_lowering::Result<BlockPyModule<CodegenModuleShape>> {
-    let PreOptimizationModule {
-        module: bb_codegen,
-        cache_path_for_store,
-        cache_metadata_for_store,
-    } = pre_optimization;
     pass_tracker.record_timing("validate_codegen_instr_ids", || {
         passes::validate_codegen_instr_ids(&bb_codegen).map_err(anyhow::Error::msg)
     })?;
-
-    if let Some(cache_path) = &cache_path_for_store {
-        if let Some(metadata) = &cache_metadata_for_store {
-            store_pre_optimization_cache(cache_path, metadata, &bb_codegen, pass_tracker);
-        }
-    }
 
     let instrumentation_config = InstrumentationConfig::from_env_config(env_config);
     let bb_codegen = if instrumentation_config.explicit_counter_placement
@@ -427,15 +380,7 @@ pub fn finish_cached_codegen_module_for_runtime(
     module: BlockPyModule<CodegenModuleShape>,
     env_config: &SoacEnvConfig,
 ) -> soac_lowering::Result<BlockPyModule<CodegenModuleShape>> {
-    finish_codegen_module_with_tracker(
-        PreOptimizationModule {
-            module,
-            cache_path_for_store: None,
-            cache_metadata_for_store: None,
-        },
-        &mut NoopPassTracker::new(),
-        env_config,
-    )
+    finish_pre_optimization_module(module, &mut NoopPassTracker::new(), env_config)
 }
 
 pub fn finish_cached_codegen_module_for_runtime_with_counter_defs(
@@ -623,6 +568,7 @@ mod tests {
     use soac_core::block_py::{
         ChildVisitable, CounterSite, FunctionExecutionMode, ModuleNameGen, Visit,
     };
+    use soac_core::pass_tracker::RecordingPassTracker;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -634,16 +580,45 @@ mod tests {
             .is_some()
     }
 
+    fn prepare_for_test(
+        source: &str,
+        config: &SoacEnvConfig,
+    ) -> soac_lowering::Result<BlockPyModule<CodegenModuleShape>> {
+        let mut pass_tracker = RecordingPassTracker::new();
+        prepare_codegen_module(
+            source,
+            ModuleNameGen::new(0),
+            CodegenPreparationOptions::default(),
+            config,
+            &mut pass_tracker,
+        )
+    }
+
+    fn prepare_recorded_for_test(
+        source: &str,
+    ) -> soac_lowering::Result<(BlockPyModule<CodegenModuleShape>, RecordingPassTracker)> {
+        let mut pass_tracker = RecordingPassTracker::new();
+        let module = prepare_codegen_module(
+            source,
+            ModuleNameGen::new(0),
+            CodegenPreparationOptions::default(),
+            &SoacEnvConfig::default(),
+            &mut pass_tracker,
+        )?;
+        Ok((module, pass_tracker))
+    }
+
     #[test]
     fn pre_optimization_cache_metadata_mismatch_rebuilds_and_replaces_cache() {
         let source = "def f():\n    return 1\n";
         let module_name = "cache_metadata_mismatch_test";
-        let cache_path = unique_temp_dir()
+        let cache_root = unique_temp_dir();
+        let cache_path = cache_root
             .join("project")
             .join(module_name)
             .join("mod.blockpy");
-        let stale_metadata = metadata(module_name, "old-build");
-        let expected_metadata = metadata(module_name, "new-build");
+        let stale_metadata = metadata(module_name, source, "old-build");
+        let expected_metadata = metadata(module_name, source, "new-build");
         let stale_module = soac_lowering::lower_python_to_blockpy_with_tracker_and_options(
             source,
             ModuleNameGen::new(1),
@@ -655,11 +630,18 @@ mod tests {
         store_codegen_module_cache(cache_path.as_path(), &stale_metadata, &stale_module)
             .expect("stale cache should be writable");
 
-        if let Err(err) = prepare_codegen_module_recorded_with_options(
+        let mut pass_tracker = RecordingPassTracker::new();
+        if let Err(err) = prepare_codegen_module(
             source,
             ModuleNameGen::new(2),
-            CodegenPreparationOptions::default()
-                .with_pre_optimization_cache(cache_path.clone(), expected_metadata.clone()),
+            CodegenPreparationOptions::default().with_pre_optimization_cache(
+                cache_root,
+                PythonModuleCacheSource::Project,
+                module_name,
+                "new-build",
+            ),
+            &SoacEnvConfig::default(),
+            &mut pass_tracker,
         ) {
             panic!(
                 "stale cache metadata should be treated as a miss, not as a lowering error: {err}"
@@ -674,11 +656,10 @@ mod tests {
     #[test]
     fn pre_optimization_lowering_does_not_compute_or_store_prepared_codegen_facts() {
         let source = "def callee(x):\n    return x\n\ndef caller(x):\n    return callee(x)\n";
-        let lowered = prepare_codegen_module_recorded(source, ModuleNameGen::new(0))
-            .expect("transform should succeed");
-        let pass_names = lowered.pass_tracker.pass_names().collect::<Vec<_>>();
-        let timing_names = lowered
-            .pass_tracker
+        let (_lowered, pass_tracker) =
+            prepare_recorded_for_test(source).expect("transform should succeed");
+        let pass_names = pass_tracker.pass_names().collect::<Vec<_>>();
+        let timing_names = pass_tracker
             .pass_timings()
             .map(|timing| timing.name)
             .collect::<Vec<_>>();
@@ -721,9 +702,7 @@ mod tests {
         let source = "def f(x):\n    if x:\n        return 1\n    return 0\n";
         for mode in [SpecializationMode::Profile, SpecializationMode::Verify] {
             let config = SoacEnvConfig::default().with_specialization_mode(Some(mode));
-            let lowered = prepare_codegen_module_for_testing_with_config(source, &config)
-                .expect("transform should succeed")
-                .codegen_module;
+            let lowered = prepare_for_test(source, &config).expect("transform should succeed");
             assert!(
                 lowered
                     .counter_defs
@@ -742,9 +721,7 @@ mod tests {
             );
 
             let config = config.with_profiled_cold_blocks_enabled(true);
-            let lowered = prepare_codegen_module_for_testing_with_config(source, &config)
-                .expect("transform should succeed")
-                .codegen_module;
+            let lowered = prepare_for_test(source, &config).expect("transform should succeed");
 
             let block_entry_counters = lowered
                 .counter_defs
@@ -806,9 +783,7 @@ mod tests {
             .with_specialization_mode(Some(SpecializationMode::Profile))
             .with_profiled_cold_blocks_enabled(true)
             .with_runtime_optimization_pipeline(RuntimeOptimizationPipeline::TypedV3);
-        let lowered = prepare_codegen_module_for_testing_with_config(source, &config)
-            .expect("transform should succeed")
-            .codegen_module;
+        let lowered = prepare_for_test(source, &config).expect("transform should succeed");
 
         assert!(
             lowered
@@ -842,9 +817,7 @@ mod tests {
             let config =
                 SoacEnvConfig::default().with_specialization_mode(Some(SpecializationMode::Verify));
             assert!(refcount_counter_instrumentation_enabled(&config));
-            let lowered = prepare_codegen_module_for_testing_with_config(source, &config)
-                .expect("transform should succeed")
-                .codegen_module;
+            let lowered = prepare_for_test(source, &config).expect("transform should succeed");
             let refcount_counters = lowered
                 .counter_defs
                 .iter()
@@ -874,9 +847,7 @@ mod tests {
         for mode in [SpecializationMode::Profile, SpecializationMode::Apply] {
             let config = SoacEnvConfig::default().with_specialization_mode(Some(mode));
             assert!(!refcount_counter_instrumentation_enabled(&config));
-            let lowered = prepare_codegen_module_for_testing_with_config(source, &config)
-                .expect("transform should succeed")
-                .codegen_module;
+            let lowered = prepare_for_test(source, &config).expect("transform should succeed");
             assert!(
                 lowered
                     .counter_defs
@@ -901,9 +872,7 @@ mod tests {
                 true,
             );
         let source = "VALUE = 7\n\ndef read(x):\n    return x + VALUE\n";
-        let lowered = prepare_codegen_module_for_testing_with_config(source, &config)
-            .expect("transform should succeed")
-            .codegen_module;
+        let lowered = prepare_for_test(source, &config).expect("transform should succeed");
 
         assert!(
             lowered.counter_defs.is_empty(),
@@ -941,13 +910,18 @@ mod tests {
         );
     }
 
-    fn metadata(module_name: &str, cache_identity: &str) -> CachedCodegenModuleMetadata {
-        CachedCodegenModuleMetadata {
-            source: PythonModuleCacheSource::Project,
-            module_name: module_name.to_string(),
-            source_hash: 0x1234,
-            cache_identity: cache_identity.to_string(),
-        }
+    fn metadata(
+        module_name: &str,
+        source: &str,
+        build_identity: &str,
+    ) -> CachedCodegenModuleMetadata {
+        pre_optimization_module_cache_metadata(
+            PythonModuleCacheSource::Project,
+            module_name,
+            hash_module_source(source),
+            build_identity,
+            false,
+        )
     }
 
     fn fresh_test_work_dir(label: &str) -> PathBuf {

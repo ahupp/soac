@@ -6,10 +6,9 @@ use pyo3::types::{PyAny, PyDict, PyModule, PyTuple};
 use soac_core::block_py::{
     BlockPyFunction, BlockPyModule, FunctionExecutionMode, RuntimeFunctionId,
 };
-use soac_driver::codegen_cache::{
-    CachedCodegenModuleMetadata, PythonModuleCacheSource, hash_module_source,
-};
-use soac_driver::{CodegenPreparationOptions, prepare_codegen_module_recorded_with_options};
+use soac_core::pass_tracker::RecordingPassTracker;
+use soac_driver::codegen_cache::{PythonModuleCacheSource, hash_module_source};
+use soac_driver::{CodegenPreparationOptions, PreOptimizationCacheRequest, prepare_codegen_module};
 use soac_jit::module_type::{ModuleInfo, SoacExtModule};
 use soac_lowering::passes::CodegenModuleShape;
 use std::cell::Cell;
@@ -182,9 +181,7 @@ fn pre_optimization_module_cache(
     session: &soac_jit::CompileSession,
     module_name: &str,
     source: PythonModuleCacheSource,
-    source_hash: u64,
-    runtime_names_as_globals: bool,
-) -> PyResult<Option<(PathBuf, CachedCodegenModuleMetadata)>> {
+) -> PyResult<Option<PreOptimizationCacheRequest>> {
     let Some(cache_root) = session
         .env_config()
         .map_err(PyRuntimeError::new_err)?
@@ -192,23 +189,12 @@ fn pre_optimization_module_cache(
     else {
         return Ok(None);
     };
-    let path = soac_jit::config::pre_optimization_module_cache_path(
-        cache_root.as_path(),
+    Ok(Some(PreOptimizationCacheRequest::new(
+        cache_root.to_path_buf(),
         source,
         module_name,
-        source_hash,
         SOAC_BUILD_IDENTITY,
-        runtime_names_as_globals,
-    )
-    .map_err(PyRuntimeError::new_err)?;
-    let metadata = soac_jit::config::pre_optimization_module_cache_metadata(
-        source,
-        module_name,
-        source_hash,
-        SOAC_BUILD_IDENTITY,
-        runtime_names_as_globals,
-    );
-    Ok(Some((path, metadata)))
+    )))
 }
 
 fn pending_module_load_timings() -> &'static Mutex<HashMap<usize, PendingModuleLoadTiming>> {
@@ -473,48 +459,44 @@ fn create_module(py: Python<'_>, path: &str, spec: Py<PyAny>) -> PyResult<Py<PyA
     };
     let session = soac_jit::CompileSession::process();
     let runtime_names_as_globals = module_name == "soac.runtime";
-    let pre_optimization_cache = pre_optimization_module_cache(
-        session.as_ref(),
-        module_name.as_str(),
-        module_cache_source,
-        source_hash,
-        runtime_names_as_globals,
-    )?;
+    let pre_optimization_cache =
+        pre_optimization_module_cache(session.as_ref(), module_name.as_str(), module_cache_source)?;
+    let env_config = session.env_config().map_err(PyRuntimeError::new_err)?;
     let preparation_options = CodegenPreparationOptions {
         lowering: soac_lowering::LoweringOptions {
             runtime_names_as_globals,
         },
-        pre_optimization_cache_path: pre_optimization_cache
-            .as_ref()
-            .map(|(path, _metadata)| path.clone()),
-        pre_optimization_cache_metadata: pre_optimization_cache.map(|(_path, metadata)| metadata),
+        pre_optimization_cache,
     };
-    let output = time_phase(&mut create_timings, "lower_blockpy", || {
-        prepare_codegen_module_recorded_with_options(
+    let mut pass_tracker = RecordingPassTracker::new();
+    let lowering_start = Instant::now();
+    let codegen_module = time_phase(&mut create_timings, "lower_blockpy", || {
+        prepare_codegen_module(
             &source,
             session.module_name_gen(),
             preparation_options,
+            env_config,
+            &mut pass_tracker,
         )
         .map_err(lowering_error_to_pyerr)
     })?;
-    let lowering_total = output.total_time;
-    let blockpy_pass_timings: Vec<TimedPhase> = output
-        .pass_tracker
+    let lowering_total = lowering_start.elapsed();
+    let blockpy_pass_timings: Vec<TimedPhase> = pass_tracker
         .pass_timings()
         .map(|timing| TimedPhase {
             name: timing.name,
             elapsed: timing.elapsed,
         })
         .collect();
-    let function_count = output.codegen_module.callable_defs.len();
-    let counter_count = output.codegen_module.counter_defs.len();
-    let global_name_count = output.codegen_module.global_names.len();
+    let function_count = codegen_module.callable_defs.len();
+    let counter_count = codegen_module.counter_defs.len();
+    let global_name_count = codegen_module.global_names.len();
     let module_code = time_phase(&mut create_timings, "compile_original_code", || {
         compile_original_module_code(py, &source, path)
     })?;
     let original_code_by_function_id =
         time_phase(&mut create_timings, "match_original_code", || {
-            match_original_code_to_functions(py, module_code.bind(py), &output.codegen_module)
+            match_original_code_to_functions(py, module_code.bind(py), &codegen_module)
         })?;
     let original_code_count = original_code_by_function_id.len();
     let module = time_phase(&mut create_timings, "soac_ext_module_create", || {
@@ -522,7 +504,7 @@ fn create_module(py: Python<'_>, path: &str, spec: Py<PyAny>) -> PyResult<Py<PyA
             py,
             spec.as_any(),
             &session,
-            output.codegen_module,
+            codegen_module,
             module_info,
             original_code_by_function_id,
         )

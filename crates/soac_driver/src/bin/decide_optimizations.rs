@@ -152,16 +152,17 @@ mod test {
         BlockPyFunction, ChildVisitable, HasSemanticInstrId, InstrId, ModuleNameGen,
         RuntimeFunctionId, Visit,
     };
+    use soac_core::pass_tracker::RecordingPassTracker;
     use soac_core::profile::{
         CounterDumpRecord, CounterDumpRow, CounterDumpTypeKey, CounterDumpTypeKeyLayout,
         CounterDumpTypeTableEntry,
     };
     use soac_driver::codegen_cache::{
-        CachedCodegenModuleMetadata, PythonModuleCacheSource, codegen_module_cache_path,
-        hash_module_source, load_codegen_module_cache, module_optimization_plan_v3_path,
-        module_optimized_codegen_v3_path,
+        PythonModuleCacheSource, codegen_module_cache_path, hash_module_source,
+        load_codegen_module_cache, module_optimization_plan_v3_path,
+        module_optimized_codegen_v3_path, pre_optimization_module_cache_metadata,
     };
-    use soac_driver::{CodegenPreparationOptions, prepare_codegen_module_recorded_with_options};
+    use soac_driver::{CodegenPreparationOptions, prepare_codegen_module};
     use soac_lowering::passes::{CodegenModuleShape, InstrCodegen};
     use soac_opt::artifacts_v3::load_optimization_artifacts_v3;
     use std::fs;
@@ -175,12 +176,13 @@ mod test {
         let module_name = "pkg.mod";
         let source = "def f(obj):\n    return obj.x\n";
         let source_hash = hash_module_source(source);
-        let metadata = CachedCodegenModuleMetadata {
-            source: PythonModuleCacheSource::Project,
-            module_name: module_name.to_string(),
+        let metadata = pre_optimization_module_cache_metadata(
+            PythonModuleCacheSource::Project,
+            module_name,
             source_hash,
-            cache_identity: TEST_BUILD_IDENTITY.to_string(),
-        };
+            TEST_BUILD_IDENTITY,
+            false,
+        );
         let module_cache_root = root.join("modules-in");
         let module_cache_path = codegen_module_cache_path(
             module_cache_root.as_path(),
@@ -188,20 +190,21 @@ mod test {
             metadata.module_name.as_str(),
         )
         .unwrap();
-        let lowered = prepare_codegen_module_recorded_with_options(
+        let mut pass_tracker = RecordingPassTracker::new();
+        let lowered = prepare_codegen_module(
             source,
             ModuleNameGen::new(7),
-            CodegenPreparationOptions {
-                lowering: soac_lowering::LoweringOptions {
-                    runtime_names_as_globals: false,
-                },
-                pre_optimization_cache_path: Some(module_cache_path.clone()),
-                pre_optimization_cache_metadata: Some(metadata.clone()),
-            },
+            CodegenPreparationOptions::default().with_pre_optimization_cache(
+                module_cache_root.clone(),
+                metadata.source,
+                metadata.module_name.as_str(),
+                TEST_BUILD_IDENTITY,
+            ),
+            &soac_config::SoacEnvConfig::default(),
+            &mut pass_tracker,
         )
         .unwrap();
         let function_id = lowered
-            .codegen_module
             .callable_defs
             .iter()
             .find(|function| function.names.qualname == "f")
@@ -611,32 +614,28 @@ mod test {
         module_id: u32,
     ) -> StoredTestModule {
         let source_hash = hash_module_source(source);
-        let metadata = CachedCodegenModuleMetadata {
-            source: PythonModuleCacheSource::Project,
-            module_name: module_name.to_string(),
+        let metadata = pre_optimization_module_cache_metadata(
+            PythonModuleCacheSource::Project,
+            module_name,
             source_hash,
-            cache_identity: TEST_BUILD_IDENTITY.to_string(),
-        };
-        let module_cache_path = codegen_module_cache_path(
-            module_cache_root,
-            metadata.source,
-            metadata.module_name.as_str(),
-        )
-        .unwrap();
-        let lowered = prepare_codegen_module_recorded_with_options(
+            TEST_BUILD_IDENTITY,
+            false,
+        );
+        let mut pass_tracker = RecordingPassTracker::new();
+        let lowered = prepare_codegen_module(
             source,
             ModuleNameGen::new(module_id),
-            CodegenPreparationOptions {
-                lowering: soac_lowering::LoweringOptions {
-                    runtime_names_as_globals: false,
-                },
-                pre_optimization_cache_path: Some(module_cache_path),
-                pre_optimization_cache_metadata: Some(metadata),
-            },
+            CodegenPreparationOptions::default().with_pre_optimization_cache(
+                module_cache_root.to_path_buf(),
+                metadata.source,
+                metadata.module_name.as_str(),
+                TEST_BUILD_IDENTITY,
+            ),
+            &soac_config::SoacEnvConfig::default(),
+            &mut pass_tracker,
         )
         .unwrap();
         let function = lowered
-            .codegen_module
             .callable_defs
             .first()
             .expect("test module should contain one function");
