@@ -3612,7 +3612,7 @@ def build(values):
         let specialization_inputs =
             FunctionSpecializationInputs::from_profile(&specialization_profile, planned_function)?;
         let mut direct_call_typed_function = planned_function.clone();
-        apply_profile_call_emissions_to_typed_function(
+        apply_profile_typed_plans_to_typed_function(
             &mut direct_call_typed_function,
             Some(&specialization_profile),
         )?;
@@ -16418,25 +16418,26 @@ def f(x):
         })
     }
 
-    fn indexed_global_specialization_inputs_for_function(
+    fn typed_function_with_indexed_global_access_plan(
         function: &BlockPyFunction<CodegenModuleShape>,
         access: IndexedGlobalAccessKind,
         name: &str,
-    ) -> FunctionSpecializationInputs {
+    ) -> BlockPyFunction<TypedCodegenModuleShape> {
         let source = first_indexed_global_access_source(function, access, name);
-        FunctionSpecializationInputs {
-            legacy_overlays: Some(LegacyFunctionSpecializationOverlays {
-                indexed_globals_by_instr: HashMap::from([(
-                    source,
-                    opt_v3_indexed_global_plan_for_name(source, access, name),
-                )]),
-                ..LegacyFunctionSpecializationOverlays::default()
-            }),
-        }
+        let mut typed_function = lower_codegen_function_to_typed(function.clone());
+        annotate_typed_indexed_global_accesses(
+            &mut typed_function,
+            &HashMap::from([(
+                source,
+                opt_v3_indexed_global_plan_for_name(source, access, name),
+            )]),
+        )
+        .expect("indexed-global plan should attach to typed function");
+        typed_function
     }
 
     #[test]
-    fn codegen_consumes_v3_indexed_global_inputs_without_legacy_counters() {
+    fn codegen_consumes_v3_indexed_global_instr_typed_plan_without_legacy_counters() {
         let module_name_gen = ModuleNameGen::new(7);
         let load_source = InstrId::new(BlockLabel::from_index(0), 11);
         let store_source = InstrId::new(BlockLabel::from_index(0), 13);
@@ -16446,33 +16447,28 @@ def f(x):
         let module_constants =
             crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
         let blocks = [1usize as ObjPtr];
+        let mut typed_function = lower_codegen_function_to_typed(function.clone());
+        annotate_typed_indexed_global_accesses(
+            &mut typed_function,
+            &HashMap::from([
+                (
+                    load_source,
+                    opt_v3_indexed_global_plan(load_source, IndexedGlobalAccessKind::Load),
+                ),
+                (
+                    store_source,
+                    opt_v3_indexed_global_plan(store_source, IndexedGlobalAccessKind::Store),
+                ),
+            ]),
+        )
+        .expect("indexed-global plans should attach to typed function");
         let built = build_test_jit_function_with_constants_and_options(
             &module,
             &function,
             &blocks,
             &module_constants,
             BuildSpecializedFunctionOptions {
-                specialization_inputs: Some(FunctionSpecializationInputs {
-                    legacy_overlays: Some(LegacyFunctionSpecializationOverlays {
-                        indexed_globals_by_instr: HashMap::from([
-                            (
-                                load_source,
-                                opt_v3_indexed_global_plan(
-                                    load_source,
-                                    IndexedGlobalAccessKind::Load,
-                                ),
-                            ),
-                            (
-                                store_source,
-                                opt_v3_indexed_global_plan(
-                                    store_source,
-                                    IndexedGlobalAccessKind::Store,
-                                ),
-                            ),
-                        ]),
-                        ..LegacyFunctionSpecializationOverlays::default()
-                    }),
-                }),
+                planned_typed_function: Some(typed_function),
                 ..BuildSpecializedFunctionOptions::default()
             },
         );
@@ -18576,7 +18572,7 @@ class Point:
                 specialization_inputs: Some(FunctionSpecializationInputs {
                     legacy_overlays: None,
                 }),
-                legacy_call_emission_typed_function: Some(planned_function.clone()),
+                planned_typed_function: Some(planned_function.clone()),
                 ..BuildSpecializedFunctionOptions::default()
             },
         );
@@ -19121,7 +19117,7 @@ class Point:
         let function = module.callable_defs[0].clone();
         let module_constants =
             crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
-        let specialization_inputs = indexed_global_specialization_inputs_for_function(
+        let typed_indexed_global_function = typed_function_with_indexed_global_access_plan(
             &function,
             IndexedGlobalAccessKind::Load,
             "x",
@@ -19133,7 +19129,7 @@ class Point:
             &module_constants,
             BuildSpecializedFunctionOptions {
                 guard_miss_deopt_stub: true,
-                specialization_inputs: Some(specialization_inputs),
+                planned_typed_function: Some(typed_indexed_global_function),
                 ..BuildSpecializedFunctionOptions::default()
             },
         );
@@ -19186,8 +19182,8 @@ class Point:
         )
         .expect("shared state should build");
         let function = shared_state.lowered_module.callable_defs[0].clone();
-        let specialization_inputs = (mode != "profile").then(|| {
-            indexed_global_specialization_inputs_for_function(
+        let typed_indexed_global_function = (mode != "profile").then(|| {
+            typed_function_with_indexed_global_access_plan(
                 &function,
                 IndexedGlobalAccessKind::Load,
                 "x",
@@ -19228,7 +19224,7 @@ class Point:
             None,
             None,
             BuildSpecializedFunctionOptions {
-                specialization_inputs,
+                planned_typed_function: typed_indexed_global_function,
                 ..BuildSpecializedFunctionOptions::default()
             },
         )
@@ -19263,8 +19259,8 @@ class Point:
         )
         .expect("shared state should build");
         let function = shared_state.lowered_module.callable_defs[0].clone();
-        let specialization_inputs = (mode != "profile").then(|| {
-            indexed_global_specialization_inputs_for_function(
+        let typed_indexed_global_function = (mode != "profile").then(|| {
+            typed_function_with_indexed_global_access_plan(
                 &function,
                 IndexedGlobalAccessKind::Store,
                 "x",
@@ -19302,7 +19298,7 @@ class Point:
             None,
             None,
             BuildSpecializedFunctionOptions {
-                specialization_inputs,
+                planned_typed_function: typed_indexed_global_function,
                 ..BuildSpecializedFunctionOptions::default()
             },
         )
@@ -20107,7 +20103,7 @@ class Point:
         let function = module.callable_defs[0].clone();
         let module_constants =
             crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
-        let specialization_inputs = indexed_global_specialization_inputs_for_function(
+        let typed_indexed_global_function = typed_function_with_indexed_global_access_plan(
             &function,
             IndexedGlobalAccessKind::Load,
             "x",
@@ -20119,7 +20115,7 @@ class Point:
             &module_constants,
             BuildSpecializedFunctionOptions {
                 guard_miss_deopt_stub: true,
-                specialization_inputs: Some(specialization_inputs),
+                planned_typed_function: Some(typed_indexed_global_function),
                 ..BuildSpecializedFunctionOptions::default()
             },
         );
@@ -20150,7 +20146,7 @@ class Point:
         let function = module.callable_defs[0].clone();
         let module_constants =
             crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
-        let specialization_inputs = indexed_global_specialization_inputs_for_function(
+        let typed_indexed_global_function = typed_function_with_indexed_global_access_plan(
             &function,
             IndexedGlobalAccessKind::Load,
             "x",
@@ -20162,7 +20158,7 @@ class Point:
             &module_constants,
             BuildSpecializedFunctionOptions {
                 guard_miss_deopt_stub: true,
-                specialization_inputs: Some(specialization_inputs),
+                planned_typed_function: Some(typed_indexed_global_function),
                 ..BuildSpecializedFunctionOptions::default()
             },
         );
@@ -20238,7 +20234,7 @@ class Point:
                     shared_state.lowered_module.counter_defs.as_slice(),
                 );
             let blocks = vec![std::ptr::null_mut::<c_void>(); function.blocks.len()];
-            let specialization_inputs = indexed_global_specialization_inputs_for_function(
+            let typed_indexed_global_function = typed_function_with_indexed_global_access_plan(
                 &function,
                 IndexedGlobalAccessKind::Load,
                 "x",
@@ -20260,7 +20256,7 @@ class Point:
                 None,
                 BuildSpecializedFunctionOptions {
                     guard_miss_deopt_stub: true,
-                    specialization_inputs: Some(specialization_inputs),
+                    planned_typed_function: Some(typed_indexed_global_function),
                     ..BuildSpecializedFunctionOptions::default()
                 },
             )
@@ -20376,7 +20372,7 @@ class Point:
                     shared_state.lowered_module.counter_defs.as_slice(),
                 );
             let blocks = vec![std::ptr::null_mut::<c_void>(); function.blocks.len()];
-            let specialization_inputs = indexed_global_specialization_inputs_for_function(
+            let typed_indexed_global_function = typed_function_with_indexed_global_access_plan(
                 &function,
                 IndexedGlobalAccessKind::Load,
                 "x",
@@ -20398,7 +20394,7 @@ class Point:
                 None,
                 BuildSpecializedFunctionOptions {
                     guard_miss_deopt_stub: true,
-                    specialization_inputs: Some(specialization_inputs),
+                    planned_typed_function: Some(typed_indexed_global_function),
                     ..BuildSpecializedFunctionOptions::default()
                 },
             )
@@ -20488,7 +20484,7 @@ class Point:
         let function = module.callable_defs[0].clone();
         let module_constants =
             crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
-        let specialization_inputs = indexed_global_specialization_inputs_for_function(
+        let typed_indexed_global_function = typed_function_with_indexed_global_access_plan(
             &function,
             IndexedGlobalAccessKind::Load,
             "y",
@@ -20500,7 +20496,7 @@ class Point:
             &module_constants,
             BuildSpecializedFunctionOptions {
                 guard_miss_deopt_stub: true,
-                specialization_inputs: Some(specialization_inputs),
+                planned_typed_function: Some(typed_indexed_global_function),
                 ..BuildSpecializedFunctionOptions::default()
             },
         );
@@ -20553,7 +20549,7 @@ class Point:
         let function = module.callable_defs[0].clone();
         let module_constants =
             crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
-        let specialization_inputs = indexed_global_specialization_inputs_for_function(
+        let typed_indexed_global_function = typed_function_with_indexed_global_access_plan(
             &function,
             IndexedGlobalAccessKind::Load,
             "x",
@@ -20565,7 +20561,7 @@ class Point:
             &module_constants,
             BuildSpecializedFunctionOptions {
                 guard_miss_deopt_stub: true,
-                specialization_inputs: Some(specialization_inputs),
+                planned_typed_function: Some(typed_indexed_global_function),
                 ..BuildSpecializedFunctionOptions::default()
             },
         );
@@ -20635,7 +20631,7 @@ class Point:
                     shared_state.lowered_module.counter_defs.as_slice(),
                 );
             let blocks = vec![std::ptr::null_mut::<c_void>(); function.blocks.len()];
-            let specialization_inputs = indexed_global_specialization_inputs_for_function(
+            let typed_indexed_global_function = typed_function_with_indexed_global_access_plan(
                 &function,
                 IndexedGlobalAccessKind::Load,
                 "x",
@@ -20657,7 +20653,7 @@ class Point:
                 None,
                 BuildSpecializedFunctionOptions {
                     guard_miss_deopt_stub: true,
-                    specialization_inputs: Some(specialization_inputs),
+                    planned_typed_function: Some(typed_indexed_global_function),
                     ..BuildSpecializedFunctionOptions::default()
                 },
             )
@@ -20791,7 +20787,7 @@ class Point:
                     shared_state.lowered_module.counter_defs.as_slice(),
                 );
             let blocks = vec![std::ptr::null_mut::<c_void>(); function.blocks.len()];
-            let specialization_inputs = indexed_global_specialization_inputs_for_function(
+            let typed_indexed_global_function = typed_function_with_indexed_global_access_plan(
                 &function,
                 IndexedGlobalAccessKind::Store,
                 "x",
@@ -20812,7 +20808,7 @@ class Point:
                 None,
                 None,
                 BuildSpecializedFunctionOptions {
-                    specialization_inputs: Some(specialization_inputs),
+                    planned_typed_function: Some(typed_indexed_global_function),
                     ..BuildSpecializedFunctionOptions::default()
                 },
             )
