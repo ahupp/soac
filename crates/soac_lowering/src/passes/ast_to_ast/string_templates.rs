@@ -59,6 +59,7 @@ fn rewrite_interpolation(interp: &ast::InterpolatedElement, is_raw: bool) -> Vec
     value = match conversion {
         ast::ConversionFlag::Ascii => py_expr!("__soac__.ascii({value:expr})", value = value),
         ast::ConversionFlag::Repr => py_expr!("__soac__.repr({value:expr})", value = value),
+        ast::ConversionFlag::Str if matches!(value, Expr::StringLiteral(_)) => value,
         ast::ConversionFlag::Str => py_expr!("__soac__.str({value:expr})", value = value),
         ast::ConversionFlag::None => value,
     };
