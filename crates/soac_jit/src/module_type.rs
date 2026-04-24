@@ -2059,11 +2059,39 @@ impl SoacExtModule {
 mod test {
     use super::*;
     use pyo3::types::PyModule;
+    use soac_core::pass_tracker::NoopPassTracker;
     use soac_core::profile::COUNTER_DUMP_MAGIC;
-    use soac_instrument::codegen::instrument_bb_module_with_block_entry_counters;
+    use soac_instrument::{
+        CounterInstrumentationConfig, ExplicitCounterPlacement, InstrumentationConfig,
+        RefcountCounterMode, codegen as codegen_instrumentation,
+    };
     use soac_lowering::lower_python_to_blockpy_for_testing;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn instrument_module_with_legacy_block_entry_counters(
+        module: &mut BlockPyModule<CodegenModuleShape>,
+    ) {
+        let config = InstrumentationConfig {
+            trace: None,
+            counters: CounterInstrumentationConfig {
+                call_targets: false,
+                locality: true,
+                profiled_cold_blocks: true,
+                refcounts: RefcountCounterMode::Disabled,
+            },
+            explicit_counter_placement: ExplicitCounterPlacement::Codegen,
+            deopt_entry_counters: false,
+            specialization_runtime_logging: false,
+        };
+        let instrumented = codegen_instrumentation::instrument_module_with_tracker(
+            module.clone(),
+            &config,
+            &mut NoopPassTracker::new(),
+        )
+        .expect("legacy block-entry counter instrumentation should succeed");
+        *module = instrumented;
+    }
 
     #[test]
     fn counter_dump_record_includes_block_entry_metadata_and_value() {
@@ -2075,7 +2103,7 @@ def f():
         )
         .expect("transform should succeed")
         .codegen_module;
-        instrument_bb_module_with_block_entry_counters(&mut lowered);
+        instrument_module_with_legacy_block_entry_counters(&mut lowered);
 
         let function = lowered
             .callable_defs
@@ -2347,7 +2375,7 @@ def f():
         )
         .expect("transform should succeed")
         .codegen_module;
-        instrument_bb_module_with_block_entry_counters(&mut lowered);
+        instrument_module_with_legacy_block_entry_counters(&mut lowered);
 
         let shared_state = SharedModuleState {
             function_index_by_id: build_function_index_by_id(&lowered)

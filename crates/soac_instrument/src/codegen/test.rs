@@ -1,10 +1,11 @@
 use super::{
-    instrument_bb_module_for_trace, instrument_bb_module_with_block_entry_counters,
-    instrument_bb_module_with_call_target_counters, instrument_bb_module_with_global_load_counters,
-    instrument_bb_module_with_locality_counters, instrument_bb_module_with_refcount_counters,
-    instrument_module_with_tracker,
+    instrument_bb_module_for_trace, instrument_bb_module_with_global_load_counters,
+    instrument_bb_module_with_locality_counters, instrument_module_with_tracker,
 };
-use crate::{ExplicitCounterPlacement, InstrumentationConfig};
+use crate::{
+    CounterInstrumentationConfig, ExplicitCounterPlacement, InstrumentationConfig,
+    RefcountCounterMode,
+};
 use soac_config::{
     ExecTraceConfig, RuntimeOptimizationPipeline, SoacEnvConfig, SpecializationMode,
 };
@@ -197,7 +198,7 @@ def f(value: int) -> int:
 class C:
     field: int = 1
 "#;
-    let mut codegen = codegen_module_for_trace_test(source);
+    let codegen = codegen_module_for_trace_test(source);
     let interpreted_ids = codegen
         .callable_defs
         .iter()
@@ -222,11 +223,20 @@ class C:
             .collect::<Vec<_>>()
     );
 
-    instrument_bb_module_with_block_entry_counters(&mut codegen);
-    instrument_bb_module_with_call_target_counters(&mut codegen);
-    instrument_bb_module_with_locality_counters(&mut codegen);
-    instrument_bb_module_with_refcount_counters(&mut codegen, CounterScope::Function)
-        .expect("function refcount counters should be defined");
+    let config = InstrumentationConfig {
+        trace: None,
+        counters: CounterInstrumentationConfig {
+            call_targets: true,
+            locality: true,
+            profiled_cold_blocks: true,
+            refcounts: RefcountCounterMode::Scoped(CounterScope::Function),
+        },
+        explicit_counter_placement: ExplicitCounterPlacement::Codegen,
+        deopt_entry_counters: false,
+        specialization_runtime_logging: false,
+    };
+    let codegen = instrument_module_with_tracker(codegen, &config, &mut NoopPassTracker::new())
+        .expect("configured legacy counter instrumentation should succeed");
 
     for function in &codegen.callable_defs {
         if interpreted_ids.contains(&function.function_id) {

@@ -145,7 +145,7 @@ pub(crate) fn define_bb_module_block_entry_counters<P: ModuleShape>(module: &mut
     }
 }
 
-pub fn instrument_bb_module_with_block_entry_counters(
+pub(crate) fn instrument_bb_module_with_block_entry_counters(
     module: &mut BlockPyModule<CodegenModuleShape>,
 ) {
     let BlockPyModule {
@@ -196,7 +196,7 @@ pub(crate) fn instrument_bb_module_with_global_load_counters(
     }
 }
 
-pub fn instrument_bb_module_with_call_target_counters(
+pub(crate) fn instrument_bb_module_with_call_target_counters(
     module: &mut BlockPyModule<CodegenModuleShape>,
 ) {
     fn is_operator_specialization_candidate(expr: &InstrCodegen) -> bool {
