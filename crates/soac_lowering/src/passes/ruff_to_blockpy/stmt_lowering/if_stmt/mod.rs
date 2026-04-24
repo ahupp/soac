@@ -3,6 +3,7 @@ use crate::block_py::TermIf;
 use crate::passes::ast_to_ast::ast_rewrite::Rewrite;
 use crate::passes::ast_to_ast::body::Suite;
 use crate::passes::InstrRuff;
+use crate::ruff_ast::ruff_ast_to_string;
 use ruff_text_size::TextRange;
 
 pub(crate) fn expand_if_chain(mut if_stmt: ast::StmtIf) -> Rewrite {

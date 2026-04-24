@@ -34,7 +34,7 @@ pub struct LoweringOptions {
 
 impl PrettyPrint for AstToAstPassResult {
     fn fmt_pretty(&self, printer: &mut PrettyPrinter<'_>) -> std::fmt::Result {
-        std::fmt::Write::write_str(printer, &crate::ruff_ast_to_string(&self.module))
+        std::fmt::Write::write_str(printer, &crate::ruff_ast::ruff_ast_to_string(&self.module))
     }
 }
 

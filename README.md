@@ -127,11 +127,6 @@ planner lives in `soac-opt`.
   BlockPy, CLIF, and typed-instruction views, binding to `HOST`/`PORT` or
   `127.0.0.1:8000` by default.
 
-- `diet-python`
-  Lowers a Python file through the transform pipeline and prints the final
-  rewritten Python source. Pass `--timing` to emit per-pass timing JSON on
-  stderr.
-
 - `list_jit_functions`
   Prints the packed runtime function ID and qualified name for each lowered JIT
   function in a source file. Use this before rendering CLIF or typed

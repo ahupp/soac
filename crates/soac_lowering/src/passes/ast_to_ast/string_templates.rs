@@ -63,7 +63,7 @@ fn rewrite_interpolation(interp: &ast::InterpolatedElement, is_raw: bool) -> Vec
     };
 
     if let Some(debug) = &interp.debug_text {
-        let expr_text = crate::ruff_ast_to_string(&*interp.expression)
+        let expr_text = crate::ruff_ast::ruff_ast_to_string(&*interp.expression)
             .trim_end()
             .to_string();
         let trailing = strip_debug_comment(debug.trailing.as_str());
@@ -112,7 +112,7 @@ fn rewrite_elements(elements: &ast::InterpolatedStringElements, is_raw: bool) ->
 
 fn rewrite_tstring_interpolation(interp: &ast::InterpolatedElement) -> Expr {
     let value = (*interp.expression).clone();
-    let expr_text = crate::ruff_ast_to_string(&*interp.expression)
+    let expr_text = crate::ruff_ast::ruff_ast_to_string(&*interp.expression)
         .trim_end()
         .to_string();
     let conversion_expr = match interp.conversion {

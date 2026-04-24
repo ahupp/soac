@@ -5,12 +5,10 @@ use ruff_text_size::{Ranged, TextRange};
 use tracing::{enabled, trace, Level};
 
 use crate::passes::ast_to_ast::body::Suite;
+use crate::passes::ast_to_ast::context::{Context, ScopeFrame};
 use crate::passes::ast_to_ast::scope_helpers::ScopeKind;
+use crate::ruff_ast::ruff_ast_to_string;
 use crate::transformer::{walk_expr, walk_stmt, Transformer};
-use crate::{
-    passes::ast_to_ast::context::{Context, ScopeFrame},
-    ruff_ast_to_string,
-};
 
 pub(crate) enum Rewrite {
     Unmodified(Stmt),
@@ -188,7 +186,7 @@ impl<'a> RewriteLoop<'a> {
             if let Some(stmt_pass) = self.stmt_pass {
                 let mut before = None;
                 if enabled!(Level::TRACE) {
-                    before = Some(crate::ruff_ast_to_string(&stmt));
+                    before = Some(ruff_ast_to_string(&stmt));
                 }
                 let res = stmt_pass.lower_stmt(self.context, stmt);
                 match res {
@@ -200,7 +198,7 @@ impl<'a> RewriteLoop<'a> {
                             trace!(
                                 "rewrite before: \n{} after: \n{}",
                                 before.unwrap_or_default(),
-                                crate::ruff_ast_to_string(stmts.as_slice()).trim_end()
+                                ruff_ast_to_string(stmts.as_slice()).trim_end()
                             );
                         }
                         self.modified = true;

@@ -450,7 +450,7 @@ impl SyntaxTemplate {
         match stmts.len() {
             1 => stmts.remove(0),
             len => {
-                let expanded = crate::ruff_ast_to_string(stmts.as_slice());
+                let expanded = crate::ruff_ast::ruff_ast_to_string(stmts.as_slice());
                 panic!(
                     "py_stmt template at {call_file}:{call_line}:{call_column} must produce exactly one statement, got {len}\n\
                      template:\n{template_source}\n\

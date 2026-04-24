@@ -855,7 +855,7 @@ impl InstrWithAwaitAndYield {
             }
             other => panic!(
                 "unexpected expr reached late core BlockPy boundary: {}",
-                crate::ruff_ast_to_string(&other)
+                crate::ruff_ast::ruff_ast_to_string(&other)
             ),
         }
     }

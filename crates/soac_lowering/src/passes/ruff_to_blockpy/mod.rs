@@ -10,7 +10,7 @@ use crate::namegen::fresh_name;
 use crate::passes::ast_to_ast::context::Context;
 use crate::passes::ast_to_ast::rewrite_stmt::annotation::FUNCTION_ANNOTATE_PREFIX;
 use crate::passes::{CoreModuleShapeWithAwaitAndYield, InstrRuff};
-use crate::ruff_ast_to_string;
+use crate::ruff_ast::ruff_ast_to_string;
 use crate::template::is_simple;
 use crate::{py_expr, py_stmt};
 use ruff_python_ast::{self as ast, Expr, Stmt};

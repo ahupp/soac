@@ -381,8 +381,10 @@ def f():
             StmtSequenceHeadPlan::If(_)
         ),
         "{}",
-        crate::ruff_ast_to_string(crate::passes::ast_to_instr::into_ast_stmt(match_if.clone()))
-            .trim_end()
+        crate::ruff_ast::ruff_ast_to_string(crate::passes::ast_to_instr::into_ast_stmt(
+            match_if.clone()
+        ))
+        .trim_end()
     );
 }
 

@@ -4,11 +4,7 @@
 pub use crate::driver::{lower_source_to_codegen_module_with_tracker, LoweringOptions};
 use crate::passes::CodegenModuleShape;
 use anyhow::Error as AnyhowError;
-use ruff_python_ast::{self as ast, Expr, Stmt};
-use ruff_python_codegen::{Generator, Indentation};
 pub use ruff_python_parser::ParseError;
-use ruff_source_file::LineEnding;
-use ruff_text_size::TextRange;
 use soac_core::block_py::{BlockPyModule, ModuleNameGen};
 use soac_core::pass_tracker::{NoopPassTracker, PassTracker, RecordingPassTracker};
 use std::time::{Duration, Instant};
@@ -20,6 +16,7 @@ pub(crate) mod fixture;
 mod namegen;
 pub mod pass_tracker;
 pub mod passes;
+pub(crate) mod ruff_ast;
 #[macro_use]
 mod template;
 #[cfg(test)]
@@ -151,68 +148,5 @@ pub fn lower_python_to_blockpy_recorded_with_options(
     )
 }
 
-pub trait ToRuffAst {
-    fn to_ruff_ast(&self) -> Vec<Stmt>;
-}
-
-impl ToRuffAst for Expr {
-    fn to_ruff_ast(&self) -> Vec<Stmt> {
-        vec![Stmt::Expr(ast::StmtExpr {
-            value: Box::new(self.clone()),
-            range: TextRange::default(),
-            node_index: ast::AtomicNodeIndex::default(),
-        })]
-    }
-}
-
-impl ToRuffAst for Stmt {
-    fn to_ruff_ast(&self) -> Vec<Stmt> {
-        vec![self.clone()]
-    }
-}
-
-impl ToRuffAst for &Stmt {
-    fn to_ruff_ast(&self) -> Vec<Stmt> {
-        vec![self.to_owned().clone()]
-    }
-}
-
-impl ToRuffAst for &Vec<Stmt> {
-    fn to_ruff_ast(&self) -> Vec<Stmt> {
-        self.to_vec()
-    }
-}
-
-impl ToRuffAst for &Expr {
-    fn to_ruff_ast(&self) -> Vec<Stmt> {
-        let expr = self.to_owned().clone();
-        vec![Stmt::Expr(ast::StmtExpr {
-            value: Box::new(expr),
-            range: TextRange::default(),
-            node_index: ast::AtomicNodeIndex::default(),
-        })]
-    }
-}
-
-impl ToRuffAst for &[Stmt] {
-    fn to_ruff_ast(&self) -> Vec<Stmt> {
-        self.to_vec()
-    }
-}
-
 #[cfg(test)]
 mod test;
-
-/// Convert a ruff AST ModModule to a pretty-printed string.
-pub fn ruff_ast_to_string(module: impl ToRuffAst) -> String {
-    let module = module.to_ruff_ast();
-    // Use default stylist settings for pretty printing
-    let indent = Indentation::new("    ".to_string());
-    let mut output = String::new();
-    for stmt in module {
-        let gen = Generator::new(&indent, LineEnding::default());
-        output.push_str(&gen.stmt(&stmt));
-        output.push_str(LineEnding::default().as_str());
-    }
-    output
-}

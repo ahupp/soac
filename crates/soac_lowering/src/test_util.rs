@@ -4,8 +4,9 @@ use ruff_python_ast::{comparable::ComparableStmt, Stmt};
 use ruff_python_parser::parse_module;
 
 use crate::fixture::parse_fixture;
+use crate::lower_python_to_blockpy_for_testing;
 use crate::pass_tracker::{LoweringPassTrackerExt, LoweringPassTrackerInternalExt};
-use crate::{lower_python_to_blockpy_for_testing, ruff_ast_to_string};
+use crate::ruff_ast::ruff_ast_to_string;
 use similar::TextDiff;
 
 fn expected_output_for_mode(expected: &str) -> &str {
