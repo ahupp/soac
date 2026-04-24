@@ -18341,10 +18341,18 @@ class Point:
                 }],
             };
             let block_label = function.name_gen.next_block_name();
+            let setattr_instr_id = InstrId::new(block_label, 0);
             let getattr_instr_id = InstrId::new(block_label, 1);
             function.blocks = vec![CodegenBlock {
                 label: block_label,
-                body: Vec::new(),
+                body: vec![with_instr_id(
+                    op_expr(SetAttr::new(
+                        name_expr(test_name("point")),
+                        constants.string_expr("x"),
+                        constants.int_expr(7),
+                    )),
+                    setattr_instr_id,
+                )],
                 term: ret_term(with_instr_id(
                     op_expr(GetAttr::new(
                         name_expr(test_name("point")),
@@ -18369,22 +18377,40 @@ class Point:
                 opt_v3_emitted_exact_list_items: HashMap::new(),
                 opt_v3_emitted_indexed_fields: HashMap::from([(
                     function_id,
-                    HashMap::from([(
-                        getattr_instr_id,
-                        vec![OptV3IndexedFieldAccessPlan {
-                            access: IndexedFieldAccessKind::Load,
-                            guard: MechanicalIndexedFieldGuard {
-                                kind: IndexedFieldGuardKind::OwnerTypeVersionAndFieldIndex,
-                                owner_type: IndexedFieldOwnerType {
-                                    module_name: "field_type_test".to_string(),
-                                    qualname: "Point".to_string(),
+                    HashMap::from([
+                        (
+                            getattr_instr_id,
+                            vec![OptV3IndexedFieldAccessPlan {
+                                access: IndexedFieldAccessKind::Load,
+                                guard: MechanicalIndexedFieldGuard {
+                                    kind: IndexedFieldGuardKind::OwnerTypeVersionAndFieldIndex,
+                                    owner_type: IndexedFieldOwnerType {
+                                        module_name: "field_type_test".to_string(),
+                                        qualname: "Point".to_string(),
+                                    },
+                                    attr_name: "x".to_string(),
+                                    expected_index: 0,
                                 },
-                                attr_name: "x".to_string(),
-                                expected_index: 0,
-                            },
-                            fallback: IndexedFieldFallbackKind::OriginalAttrAccess,
-                        }],
-                    )]),
+                                fallback: IndexedFieldFallbackKind::OriginalAttrAccess,
+                            }],
+                        ),
+                        (
+                            setattr_instr_id,
+                            vec![OptV3IndexedFieldAccessPlan {
+                                access: IndexedFieldAccessKind::Store,
+                                guard: MechanicalIndexedFieldGuard {
+                                    kind: IndexedFieldGuardKind::OwnerTypeVersionAndFieldIndex,
+                                    owner_type: IndexedFieldOwnerType {
+                                        module_name: "field_type_test".to_string(),
+                                        qualname: "Point".to_string(),
+                                    },
+                                    attr_name: "x".to_string(),
+                                    expected_index: 0,
+                                },
+                                fallback: IndexedFieldFallbackKind::OriginalAttrAccess,
+                            }],
+                        ),
+                    ]),
                 )]),
                 opt_v3_emitted_indexed_globals: HashMap::new(),
                 opt_v3_exact_int_branch_artifacts: HashMap::new(),
@@ -18402,6 +18428,17 @@ class Point:
                 .iter()
                 .find(|function| function.function_id == function_id)
                 .expect("planned module should include read_point");
+            let [InstrTyped::SetAttrTyped(setattr)] = planned_function.blocks[0].body.as_slice()
+            else {
+                panic!("read_point should keep an indexed typed SetAttr in the body");
+            };
+            let TypedAttrAccessPlan::IndexedField { source, guards } = &setattr.access else {
+                panic!("typed-v3 module plan should carry indexed-field store shape");
+            };
+            assert_eq!(*source, TypedIndexedFieldPlanSource::OptimizationPlanV3);
+            assert_eq!(guards.len(), 1);
+            assert_eq!(guards[0].expected_index, 0);
+
             let BlockTerm::Return(InstrTyped::GetAttrTyped(op)) = &planned_function.blocks[0].term
             else {
                 panic!("read_point should still return a typed GetAttr");
@@ -18520,6 +18557,34 @@ class Point:
         assert_eq!(load_plan.access, IndexedGlobalAccessKind::Load);
         assert_eq!(load_plan.name, "counter");
         assert_eq!(load_plan.expected_index, 0);
+
+        let module_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+        let built = build_test_jit_function_with_constants_and_options(
+            &module,
+            &module.callable_defs[0],
+            &[1usize as ObjPtr],
+            &module_constants,
+            BuildSpecializedFunctionOptions {
+                specialization_inputs: Some(FunctionSpecializationInputs {
+                    legacy_overlays: None,
+                    cold_block_labels: HashSet::new(),
+                    behavior_change_indexed_stores: false,
+                    guard_miss_deopt_stub: false,
+                }),
+                legacy_call_emission_typed_function: Some(planned_function.clone()),
+                ..BuildSpecializedFunctionOptions::default()
+            },
+        );
+        let store_helper = declared_user_names_for_symbols(
+            &built,
+            &[super::SOAC_RUNTIME_STORE_GLOBAL_INDEXED_SYMBOL],
+        );
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&built.ctx.func, &store_helper),
+            1,
+            "typed-v3 indexed-global store codegen should be driven by the InstrTyped plan, not the legacy sidecar flag"
+        );
     }
 
     #[test]

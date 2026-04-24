@@ -1167,12 +1167,6 @@ fn emit_indexed_global_store_plan_with_state<'fb, E: Instr<Name = ResolvedName>>
     arg_values: &[(ir::Value, bool)],
     plan: IndexedGlobalStoreEmissionPlan,
 ) -> ir::Value {
-    if !state.ctx().behavior_change_indexed_stores {
-        panic!(
-            "optimizer v3 indexed-global store emission for {} reached codegen with indexed stores disabled",
-            plan.source
-        );
-    }
     let name_obj = state.emit_owned_string_constant(plan.name.as_str());
     let slot_index = state
         .fb()

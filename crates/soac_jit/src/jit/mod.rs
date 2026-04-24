@@ -2004,8 +2004,9 @@ fn apply_typed_v3_module_rewrites(
         let (_, _, opt_v3_indexed_fields_by_instr) =
             profile.field_index_specialization_maps(function.function_id)?;
         if !opt_v3_indexed_fields_by_instr.is_empty() {
-            let specialize_field_stores = profile.behavior_change_indexed_stores
-                && function.scope.scope_kind != CallableScopeKind::Module;
+            let specialize_field_stores = profile.typed_specializations_embedded()
+                || (profile.behavior_change_indexed_stores
+                    && function.scope.scope_kind != CallableScopeKind::Module);
             annotate_typed_attr_accesses(
                 function,
                 &HashMap::new(),
@@ -6506,7 +6507,6 @@ struct JitEmitCtx<'mc> {
     field_generic_getattr_counter_ids: &'mc HashMap<InstrId, CounterRef>,
     field_generic_setattr_counter_ids: &'mc HashMap<InstrId, CounterRef>,
     deopt_entry_guard_miss_counter_ids: &'mc HashMap<usize, CounterId>,
-    behavior_change_indexed_stores: bool,
     allow_local_only_slot_backed_stores: bool,
     exception_forwarded_local_names: Option<&'mc [String]>,
     type_ptr_data_ids: RefCell<HashMap<RelocTypeRef, DataId>>,
@@ -15394,15 +15394,6 @@ fn emit_typed_indexed_setattr(
     codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<Option<EmitResult>, String> {
-    if !emit_ctx.behavior_change_indexed_stores {
-        if source == TypedIndexedFieldPlanSource::OptimizationPlanV3 {
-            return Err(format!(
-                "optimizer v3 indexed-field store emission for {} reached codegen with indexed stores disabled",
-                op.semantic_instr_id()
-            ));
-        }
-        return Ok(None);
-    }
     let result_needs_pyobject = match demand {
         ResultDemand::EffectOnly => false,
         ResultDemand::PyObject { .. } => true,
@@ -27247,7 +27238,6 @@ fn build_cranelift_run_bb_specialized_function(
                 field_generic_setattr_counter_ids: &field_generic_setattr_counter_ids,
                 deopt_entry_guard_miss_counter_ids: &deopt_entry_guard_miss_counter_ids,
                 branch_outcome_counter_ids: &branch_outcome_counter_ids,
-                behavior_change_indexed_stores,
                 allow_local_only_slot_backed_stores: true,
                 exception_forwarded_local_names: exc_dispatches[index]
                     .as_ref()
