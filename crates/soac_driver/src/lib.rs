@@ -13,7 +13,9 @@ use soac_core::block_py::{
     FunctionExecutionMode, ModuleNameGen,
 };
 use soac_core::pass_tracker::{NoopPassTracker, PassTracker, RecordingPassTracker};
-use soac_instrument::{CounterBuilder, InstrumentationConfig, codegen as instrumentation};
+use soac_instrument::{
+    CounterBuilder, ExplicitCounterPlacement, InstrumentationConfig, codegen as instrumentation,
+};
 use soac_lowering::passes::{self, CodegenModuleShape, InstrCodegen};
 pub use soac_lowering::{LoweringError, LoweringResult, Result};
 use soac_opt::artifacts_v3::write_optimization_artifacts_v3;
@@ -333,6 +335,21 @@ fn finish_codegen_module_with_tracker(
     }
 
     let instrumentation_config = InstrumentationConfig::from_env_config(env_config);
+    let bb_codegen = if instrumentation_config.explicit_counter_placement
+        == ExplicitCounterPlacement::Typed
+    {
+        let mut typed_for_counters = opt_passes::lower_codegen_module_to_typed(bb_codegen.clone());
+        soac_instrument::typed::define_module_counter_defs(
+            &mut typed_for_counters,
+            &instrumentation_config,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let mut bb_codegen = bb_codegen;
+        bb_codegen.counter_defs = typed_for_counters.counter_defs;
+        bb_codegen
+    } else {
+        bb_codegen
+    };
     instrumentation::instrument_module_with_tracker(
         bb_codegen,
         &instrumentation_config,
@@ -607,8 +624,12 @@ mod tests {
     use crate::codegen_cache::{
         PythonModuleCacheSource, load_codegen_module_cache, store_codegen_module_cache,
     };
-    use soac_config::{SoacEnvConfig, SoacLogConfig, SpecializationMode};
-    use soac_core::block_py::{CounterSite, FunctionExecutionMode, ModuleNameGen};
+    use soac_config::{
+        RuntimeOptimizationPipeline, SoacEnvConfig, SoacLogConfig, SpecializationMode,
+    };
+    use soac_core::block_py::{
+        ChildVisitable, CounterSite, FunctionExecutionMode, ModuleNameGen, Visit,
+    };
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -760,6 +781,52 @@ mod tests {
                 "{mode:?} lowering should still add branch_outcomes counters"
             );
         }
+    }
+
+    #[test]
+    fn typed_v3_profiled_cold_blocks_define_counters_without_codegen_increment_instrs() {
+        struct IncrementCounterProbe {
+            found: bool,
+        }
+
+        impl Visit<InstrCodegen> for IncrementCounterProbe {
+            fn visit_instr(&mut self, expr: &InstrCodegen) {
+                self.found |= matches!(expr, InstrCodegen::IncrementCounter(_));
+                expr.visit_children(self);
+            }
+        }
+
+        let source = "def f(x):\n    if x:\n        return 1\n    return 0\n";
+        let config = SoacEnvConfig::default()
+            .with_specialization_mode(Some(SpecializationMode::Profile))
+            .with_profiled_cold_blocks_enabled(true)
+            .with_runtime_optimization_pipeline(RuntimeOptimizationPipeline::TypedV3);
+        let lowered = prepare_codegen_module_for_testing_with_config(source, &config)
+            .expect("transform should succeed")
+            .codegen_module;
+
+        assert!(
+            lowered
+                .counter_defs
+                .iter()
+                .any(|counter| counter.kind == "block_entry"),
+            "typed-v3 lowering should still define block_entry counters for runtime storage"
+        );
+        assert!(
+            lowered
+                .counter_defs
+                .iter()
+                .any(|counter| counter.kind == "branch_outcomes"),
+            "typed-v3 lowering should define locality counters from InstrTyped"
+        );
+        let mut probe = IncrementCounterProbe { found: false };
+        for function in &lowered.callable_defs {
+            probe.visit_fn(function);
+        }
+        assert!(
+            !probe.found,
+            "typed-v3 lowering should not insert explicit counter instructions into Codegen IR"
+        );
     }
 
     #[test]

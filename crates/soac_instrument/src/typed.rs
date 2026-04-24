@@ -1,6 +1,10 @@
 use crate::codegen::define_block_entry_counter;
 use crate::{CounterBuilder, ExplicitCounterPlacement, InstrumentationConfig};
-use soac_core::block_py::{BlockPyFunction, BlockPyModule, FunctionExecutionMode, Meta, WithMeta};
+use soac_core::block_py::{
+    BinOpKind, BlockPyFunction, BlockPyModule, BlockTerm, CallArgKeyword, CallArgPositional,
+    ChildVisitable, CounterScope, CounterSite, FunctionExecutionMode, HasSemanticInstrId, InstrId,
+    Meta, NameLocation, RuntimeFunctionId, Visit, WithMeta,
+};
 use soac_core::pass_tracker::{NoopPassTracker, PassTracker};
 use soac_lowering::block_py::counters::IncrementCounter;
 use soac_opt::typed::{InstrTyped, TypedCodegenModuleShape};
@@ -10,6 +14,14 @@ fn functions_with_counter_instrumentation_mut(
 ) -> impl Iterator<Item = &mut BlockPyFunction<TypedCodegenModuleShape>> {
     functions
         .iter_mut()
+        .filter(|function| function.execution_mode() == FunctionExecutionMode::Jit)
+}
+
+fn functions_with_counter_instrumentation(
+    functions: &[BlockPyFunction<TypedCodegenModuleShape>],
+) -> impl Iterator<Item = &BlockPyFunction<TypedCodegenModuleShape>> {
+    functions
+        .iter()
         .filter(|function| function.execution_mode() == FunctionExecutionMode::Jit)
 }
 
@@ -38,6 +50,309 @@ pub fn instrument_module_with_tracker(
         )
     } else {
         Ok(module)
+    }
+}
+
+pub fn define_module_counter_defs(
+    module: &mut BlockPyModule<TypedCodegenModuleShape>,
+    config: &InstrumentationConfig,
+) -> Result<(), String> {
+    if config.counters.call_targets {
+        define_module_call_target_counters(module);
+    }
+    if config.counters.locality {
+        if config.counters.profiled_cold_blocks {
+            define_module_block_entry_counters(module);
+        }
+        define_module_locality_counters(module);
+    }
+    if let Some(scope) = config.counters.refcounts.scope() {
+        define_module_refcount_counters(module, scope)?;
+    }
+    Ok(())
+}
+
+fn define_module_block_entry_counters(module: &mut BlockPyModule<TypedCodegenModuleShape>) {
+    let mut counters = CounterBuilder::new(&mut module.counter_defs);
+    for function in functions_with_counter_instrumentation(&module.callable_defs) {
+        for block in &function.blocks {
+            define_block_entry_counter(&mut counters, function.function_id, block.label);
+        }
+    }
+}
+
+fn define_module_refcount_counters(
+    module: &mut BlockPyModule<TypedCodegenModuleShape>,
+    scope: CounterScope,
+) -> Result<(), String> {
+    let mut counters = CounterBuilder::new(&mut module.counter_defs);
+    match scope {
+        CounterScope::This => {
+            return Err(
+                "refcount counters do not yet support CounterScope::This; use Function or Global"
+                    .to_string(),
+            );
+        }
+        CounterScope::Function => {
+            let function_ids = functions_with_counter_instrumentation(&module.callable_defs)
+                .map(|function| function.function_id)
+                .collect::<Vec<_>>();
+            for function_id in function_ids {
+                for kind in ["runtime_incref", "runtime_decref"] {
+                    counters.define_if_missing(
+                        scope,
+                        kind,
+                        CounterSite::Runtime {
+                            function_id: Some(function_id),
+                            instr_id: None,
+                        },
+                    );
+                }
+            }
+        }
+        CounterScope::Global => {
+            for kind in ["runtime_incref", "runtime_decref"] {
+                counters.define_if_missing(
+                    scope,
+                    kind,
+                    CounterSite::Runtime {
+                        function_id: None,
+                        instr_id: None,
+                    },
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn define_module_locality_counters(module: &mut BlockPyModule<TypedCodegenModuleShape>) {
+    let mut counters = CounterBuilder::new(&mut module.counter_defs);
+    for function in functions_with_counter_instrumentation(&module.callable_defs) {
+        for block in &function.blocks {
+            let BlockTerm::IfTerm(if_term) = &block.term else {
+                continue;
+            };
+            let instr_id = if_term.test.semantic_instr_id();
+            counters.define_if_missing(
+                CounterScope::This,
+                "branch_outcomes",
+                CounterSite::Runtime {
+                    function_id: Some(function.function_id),
+                    instr_id: Some(instr_id),
+                },
+            );
+        }
+    }
+}
+
+fn define_module_call_target_counters(module: &mut BlockPyModule<TypedCodegenModuleShape>) {
+    fn is_operator_specialization_candidate(expr: &InstrTyped) -> bool {
+        match expr {
+            InstrTyped::BinOp(op) => matches!(
+                op.kind,
+                BinOpKind::Add
+                    | BinOpKind::Sub
+                    | BinOpKind::Mul
+                    | BinOpKind::And
+                    | BinOpKind::Or
+                    | BinOpKind::Xor
+                    | BinOpKind::Eq
+                    | BinOpKind::Ne
+                    | BinOpKind::Lt
+                    | BinOpKind::Le
+                    | BinOpKind::Gt
+                    | BinOpKind::Ge
+            ),
+            _ => false,
+        }
+    }
+
+    fn is_global_index_candidate(expr: &InstrTyped) -> bool {
+        match expr {
+            InstrTyped::Load(op) => matches!(op.name.location, NameLocation::Global(_)),
+            InstrTyped::LegacyStore(op) => matches!(op.name.location, NameLocation::Global(_)),
+            _ => false,
+        }
+    }
+
+    fn define_instr_shape_counters(
+        counters: &mut CounterBuilder<'_>,
+        function_id: RuntimeFunctionId,
+        instr_id: InstrId,
+        shape_kind: &'static str,
+        branch_kind: &'static str,
+    ) {
+        counters.define_if_missing(
+            CounterScope::This,
+            shape_kind,
+            CounterSite::Runtime {
+                function_id: Some(function_id),
+                instr_id: Some(instr_id),
+            },
+        );
+        counters.define_branch_counter_if_missing(
+            CounterScope::This,
+            branch_kind,
+            CounterSite::Runtime {
+                function_id: Some(function_id),
+                instr_id: Some(instr_id),
+            },
+            ["hit", "fallback"],
+        );
+    }
+
+    fn define_indexed_counter(
+        counters: &mut CounterBuilder<'_>,
+        function_id: RuntimeFunctionId,
+        instr_id: InstrId,
+        kind: &'static str,
+    ) {
+        counters.define_branch_counter_if_missing(
+            CounterScope::This,
+            kind,
+            CounterSite::Runtime {
+                function_id: Some(function_id),
+                instr_id: Some(instr_id),
+            },
+            ["hit", "fallback"],
+        );
+    }
+
+    fn define_field_access_counter(
+        counters: &mut CounterBuilder<'_>,
+        function_id: RuntimeFunctionId,
+        instr_id: InstrId,
+    ) {
+        counters.define_branch_counter_if_missing(
+            CounterScope::This,
+            "field_access",
+            CounterSite::Runtime {
+                function_id: Some(function_id),
+                instr_id: Some(instr_id),
+            },
+            [
+                "indexed_hit",
+                "indexed_fallback",
+                "generic_getattr",
+                "generic_setattr",
+            ],
+        );
+    }
+
+    fn is_profile_call_candidate(
+        args: &[CallArgPositional<InstrTyped>],
+        keywords: &[CallArgKeyword<InstrTyped>],
+    ) -> bool {
+        keywords.is_empty()
+            && args
+                .iter()
+                .all(|arg| matches!(arg, CallArgPositional::Positional(_)))
+    }
+
+    fn define_call_counters(
+        counters: &mut CounterBuilder<'_>,
+        function_id: RuntimeFunctionId,
+        instr_id: InstrId,
+    ) {
+        counters.define_if_missing(
+            CounterScope::This,
+            "call_hot_targets",
+            CounterSite::Runtime {
+                function_id: Some(function_id),
+                instr_id: Some(instr_id),
+            },
+        );
+        counters.define_branch_counter_if_missing(
+            CounterScope::This,
+            "call_direct",
+            CounterSite::Runtime {
+                function_id: Some(function_id),
+                instr_id: Some(instr_id),
+            },
+            ["hit", "fallback"],
+        );
+    }
+
+    struct SpecializationCandidateCounterCollector<'a, 'b> {
+        function_id: RuntimeFunctionId,
+        counters: &'a mut CounterBuilder<'b>,
+    }
+
+    impl Visit<InstrTyped> for SpecializationCandidateCounterCollector<'_, '_> {
+        fn visit_instr(&mut self, expr: &InstrTyped) {
+            if is_global_index_candidate(expr) {
+                let instr_id = expr.semantic_instr_id();
+                define_indexed_counter(self.counters, self.function_id, instr_id, "global_indexed");
+            }
+            match expr {
+                InstrTyped::GetAttrTyped(_) | InstrTyped::LegacyGetAttr(_) => {
+                    let instr_id = expr.semantic_instr_id();
+                    define_field_access_counter(self.counters, self.function_id, instr_id);
+                }
+                InstrTyped::SetAttrTyped(_) | InstrTyped::LegacySetAttr(_) => {
+                    let instr_id = expr.semantic_instr_id();
+                    define_field_access_counter(self.counters, self.function_id, instr_id);
+                }
+                _ => {}
+            }
+            if is_operator_specialization_candidate(expr) {
+                let instr_id = expr.semantic_instr_id();
+                self.counters.define_if_missing(
+                    CounterScope::This,
+                    "operator_hot_shapes",
+                    CounterSite::Runtime {
+                        function_id: Some(self.function_id),
+                        instr_id: Some(instr_id),
+                    },
+                );
+            }
+            if matches!(expr, InstrTyped::LegacyGetItem(_)) {
+                let instr_id = expr.semantic_instr_id();
+                define_instr_shape_counters(
+                    self.counters,
+                    self.function_id,
+                    instr_id,
+                    "getitem_hot_shapes",
+                    "getitem_specialized",
+                );
+            }
+            if matches!(expr, InstrTyped::LegacySetItem(_)) {
+                let instr_id = expr.semantic_instr_id();
+                define_instr_shape_counters(
+                    self.counters,
+                    self.function_id,
+                    instr_id,
+                    "setitem_hot_shapes",
+                    "setitem_specialized",
+                );
+            }
+            match expr {
+                InstrTyped::CallTyped(call)
+                    if is_profile_call_candidate(&call.args, &call.keywords) =>
+                {
+                    let instr_id = expr.semantic_instr_id();
+                    define_call_counters(self.counters, self.function_id, instr_id);
+                }
+                InstrTyped::LegacyCall(call)
+                    if is_profile_call_candidate(&call.args, &call.keywords) =>
+                {
+                    let instr_id = expr.semantic_instr_id();
+                    define_call_counters(self.counters, self.function_id, instr_id);
+                }
+                _ => {}
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    let mut counters = CounterBuilder::new(&mut module.counter_defs);
+    for function in functions_with_counter_instrumentation(&module.callable_defs) {
+        let mut collector = SpecializationCandidateCounterCollector {
+            function_id: function.function_id,
+            counters: &mut counters,
+        };
+        collector.visit_fn(function);
     }
 }
 

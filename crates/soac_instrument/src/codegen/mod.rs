@@ -62,6 +62,10 @@ pub fn instrument_module_with_tracker(
         module
     };
 
+    if config.explicit_counter_placement == ExplicitCounterPlacement::Typed {
+        return Ok(traced);
+    }
+
     let call_target_counted = if config.counters.call_targets {
         pass_tracker.run_pass("bb_call_target_counters", || {
             let mut counted = traced;

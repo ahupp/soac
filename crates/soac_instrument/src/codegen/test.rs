@@ -257,7 +257,7 @@ class C:
 }
 
 #[test]
-fn typed_explicit_counter_placement_defines_codegen_block_entry_counters_without_increments() {
+fn typed_explicit_counter_placement_skips_codegen_counter_definitions_and_increments() {
     let source = "def f(x):\n    if x:\n        return 1\n    return 0\n";
     let codegen = codegen_module_for_trace_test(source);
     let config = InstrumentationConfig::from_env_config(
@@ -276,8 +276,8 @@ fn typed_explicit_counter_placement_defines_codegen_block_entry_counters_without
             .expect("codegen counter definition pass should succeed");
 
     assert!(
-        block_entry_counter_count(&instrumented) > 0,
-        "typed runtime still needs codegen counter definitions for storage layout"
+        block_entry_counter_count(&instrumented) == 0,
+        "typed runtime counter definitions should come from InstrTyped, not Codegen IR"
     );
     assert!(
         instrumented

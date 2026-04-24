@@ -1,4 +1,4 @@
-use super::instrument_module_with_tracker;
+use super::{define_module_counter_defs, instrument_module_with_tracker};
 use crate::InstrumentationConfig;
 use soac_config::{RuntimeOptimizationPipeline, SoacEnvConfig, SpecializationMode};
 use soac_core::block_py::{
@@ -89,4 +89,48 @@ class C:
         }),
         "typed counter definitions should not target interpreted functions"
     );
+}
+
+#[test]
+fn typed_counter_definition_scan_records_profile_counter_shapes() {
+    let source = r#"
+VALUE = 1
+
+def f(xs, i):
+    if i:
+        xs[0] = VALUE + i
+    return VALUE
+
+def g(i):
+    return f([], i)
+"#;
+    let mut typed = typed_module_for_test(source);
+    let config = InstrumentationConfig::from_env_config(
+        &SoacEnvConfig::default()
+            .with_specialization_mode(Some(SpecializationMode::Profile))
+            .with_profiled_cold_blocks_enabled(true)
+            .with_runtime_optimization_pipeline(RuntimeOptimizationPipeline::TypedV3),
+    );
+
+    define_module_counter_defs(&mut typed, &config)
+        .expect("typed counter definition scan should succeed");
+
+    for expected_kind in [
+        "block_entry",
+        "branch_outcomes",
+        "global_indexed",
+        "operator_hot_shapes",
+        "setitem_hot_shapes",
+        "setitem_specialized",
+        "call_hot_targets",
+        "call_direct",
+    ] {
+        assert!(
+            typed
+                .counter_defs
+                .iter()
+                .any(|counter| counter.kind == expected_kind),
+            "missing typed counter definition for {expected_kind}"
+        );
+    }
 }
