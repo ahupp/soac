@@ -122,7 +122,15 @@ current `@`. Do not treat another workspace's live `@` as a dependency.
 4. Keep generated artifacts out of logical changes unless explicitly requested.
    The generated `snapshot/` directory is ignored and should not be committed.
 
-5. Add focused regression coverage for real bugs.
+5. Keep public crate APIs explicit.
+
+   For crates whose `lib.rs` has `#![deny(unreachable_pub)]`, public items
+   must only be re-exports from `lib.rs`; do not add `pub` items in internal
+   modules. Follow the structure used by `soac_config` and `soac_lowering`.
+   If you add a new public item in one of these crates, mention it explicitly
+   in the change summary.
+
+6. Add focused regression coverage for real bugs.
    For each CPython regression you fix, add a minimal reproducing integration
    test under `tests/` first.
    If you discover a performance regression because a specialization stopped
@@ -137,7 +145,7 @@ current `@`. Do not treat another workspace's live `@` as a dependency.
    structure, or API tests; exact renderer output changes too often to be a
    useful default regression surface.
 
-6. Avoid render-as-behavior tests.
+7. Avoid render-as-behavior tests.
 
    Outside tests for the renderer/pretty-printer itself, avoid testing a
    compiler behavior by rendering an AST/IR/debug value to text and asserting
@@ -146,7 +154,7 @@ current `@`. Do not treat another workspace's live `@` as a dependency.
    AST, IR, CFG edge, binding/storage layout, module constant, or other
    structured output shape.
 
-7. Keep specialization docs in sync.
+8. Keep specialization docs in sync.
 
    If you add or materially change a specialization, update
    `doc/SPECIALIZATION.md` in the same logical change. The doc should
@@ -154,7 +162,7 @@ current `@`. Do not treat another workspace's live `@` as a dependency.
    emitted, and the current limitations, soundness boundaries, or likely
    extensions.
 
-8. Keep specialization regression tests structured and easy to write.
+9. Keep specialization regression tests structured and easy to write.
 
    Prefer a dedicated specialization-regression test family over broad
    benchmark assertions. A good test should:
@@ -177,21 +185,21 @@ current `@`. Do not treat another workspace's live `@` as a dependency.
    `assert_exact_type_guard(...)`. The purpose should be obvious from the test
    name: "this specialization still applies for this source/profile shape."
 
-9. Keep environment-variable docs in sync.
+10. Keep environment-variable docs in sync.
 
    If you add or materially change an environment variable that controls
    runtime behavior, testing, benchmarking, profiling, or the local web
    tooling, document it in `README.md` and add or update the relevant
    note in `AGENTS.md` in the same logical change.
 
-10. Keep runtime helper inventory in sync.
+11. Keep runtime helper inventory in sync.
 
    If you add, remove, rename, or move runtime helper functions in
    `soac_jit_runtime`, `crates/soac_jit/src/jit/specialized_helpers.rs`, or
    `soac_py/src/soac/runtime.py`, update `doc/RUNTIME_FUNCTIONS.md`
    in the same logical change.
 
-11. Record finalized performance changes.
+12. Record finalized performance changes.
 
 When a change is expected to affect performance, validate it with a before/after
 benchmark before treating it as complete. Use the repo benchmark comparison
@@ -214,7 +222,7 @@ workspace to that revision first, for example with `jj edit <rev>`. Use
 `jj new <rev>` only when you intentionally want a fresh child revision and
 benchmark artifacts named for that child rather than the existing revision.
 
-12. Run the full gate before submitting code changes.
+13. Run the full gate before submitting code changes.
 
 Run `just test-all` before submitting unless the change is docs-only,
 such as `doc/todo/TODO.md`, `AGENTS.md`, or similar documentation-only files.
@@ -232,26 +240,26 @@ Put test output in `work/logs/`. Summarize the failures, separate expected
 failures from unexpected failures, investigate the root cause, report
 it, then fix it.
 
-13. When a logical set of changes is complete, freeze it before
+14. When a logical set of changes is complete, freeze it before
    integrating it.
 
 Run `jj new` so the finished work is no longer the live working commit.
 Rebase and integrate the finished change, not the live `@`.
 
-14. Try to advance `main` directly to the finished head.
+15. Try to advance `main` directly to the finished head.
 
 Prefer `jj bookmark move main -t <finished-head>` when the finished
 change is already a descendant of the current `main`. This avoids
 unnecessary rebases and duplicate sibling revisions.
 
-15. If advancing `main` fails because the finished head is not a
+16. If advancing `main` fails because the finished head is not a
    descendant of `main`, rebase the finished commit or finished stack
    onto `main`.
 
 Use `jj rebase` on the finished revision or stack root so the completed
 work sits directly on top of the current shared base.
 
-16. Resolve any conflicts and rerun the relevant tests.
+17. Resolve any conflicts and rerun the relevant tests.
 
 The rebased change is not ready to advance `main` until conflicts are
 resolved and the relevant checks have been rerun.
@@ -261,7 +269,7 @@ revision, inspect `jj diff --summary <good-rev>..main` and restore the entire
 logical file set before validating. Partial restores can leave the change in an
 internally inconsistent state that compiles or fails for misleading reasons.
 
-17. Advance `main` to the finished head.
+18. Advance `main` to the finished head.
 
 This is the synchronization point. Once `main` moves, the finished work
 becomes the new shared base for future work.
@@ -271,14 +279,14 @@ main", do not stop after the stack is merely based on `main`. After conflict
 resolution and validation, explicitly move `main` to the validated head and
 verify the bookmark in `jj log`.
 
-18. When another agent advances `main`, refresh and continue on top of
+19. When another agent advances `main`, refresh and continue on top of
     it.
 
 Run `jj workspace update-stale` and rebase your live work onto the new
 `main` as needed. Other agents should only depend on `main`, not on a
 peer workspace's live `@`.
 
-19. Report the result: run `jj diff --stat` on the completed change and
+20. Report the result: run `jj diff --stat` on the completed change and
 report its output. At the end of each completed turn or substantial pass,
 summarize what is currently being worked on, the state it is in, and the
 next concrete steps for that work. If I did not ask to approve each step
