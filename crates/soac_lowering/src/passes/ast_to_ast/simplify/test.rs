@@ -75,6 +75,18 @@ fn lower_string_templates_keeps_literal_str_conversion_as_literal() {
 }
 
 #[test]
+fn lower_string_templates_routes_nonliteral_str_conversion_through_runtime_builtin() {
+    let mut module = parse_assign_module("x = f\"{value!s}\"\n");
+    let Stmt::Assign(assign) = &mut module.body[0] else {
+        panic!("expected first statement to be an assignment");
+    };
+    lower_string_templates_in_expr(assign.value.as_mut());
+
+    let probe = probe_assignment_value(&module);
+    assert!(probe.has_str_call);
+}
+
+#[test]
 fn lower_string_templates_keeps_tstring_expr_text_available() {
     let mut module = parse_assign_module("x = t\"{value}\"\n");
     let Stmt::Assign(assign) = &mut module.body[0] else {

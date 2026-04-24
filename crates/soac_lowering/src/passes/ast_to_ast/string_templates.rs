@@ -60,6 +60,9 @@ fn rewrite_interpolation(interp: &ast::InterpolatedElement, is_raw: bool) -> Vec
         ast::ConversionFlag::Ascii => py_expr!("__soac__.ascii({value:expr})", value = value),
         ast::ConversionFlag::Repr => py_expr!("__soac__.repr({value:expr})", value = value),
         ast::ConversionFlag::Str if matches!(value, Expr::StringLiteral(_)) => value,
+        // `__soac__.str` lowers to RuntimeName::Str, which is `soac.runtime.str`
+        // bound to builtins.str. Do not emit a bare `str(...)`: user globals
+        // named `str` must not affect f-string conversion semantics.
         ast::ConversionFlag::Str => py_expr!("__soac__.str({value:expr})", value = value),
         ast::ConversionFlag::None => value,
     };

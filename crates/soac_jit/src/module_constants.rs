@@ -758,15 +758,6 @@ impl ModuleConstantCollector {
                     .constant_string_bytes_value(ModuleConstantId(index as usize))
                     .map(ToOwned::to_owned)
             }),
-            InstrCodegen::Call(call) => {
-                if helper_name_for_codegen_expr(call.func.as_ref(), &self.constants) != Some("str")
-                    || call.args.len() != 1
-                    || !call.keywords.is_empty()
-                {
-                    return None;
-                }
-                self.string_constant_bytes_for_specialized_codegen(call.args[0].expr())
-            }
             _ => None,
         }
     }
@@ -781,15 +772,6 @@ impl ModuleConstantCollector {
                     .constant_string_bytes_value(ModuleConstantId(index as usize))
                     .map(ToOwned::to_owned)
             }),
-            InstrTyped::CallTyped(call) => {
-                if helper_name_for_typed_expr(call.func.as_ref(), &self.constants) != Some("str")
-                    || call.args.len() != 1
-                    || !call.keywords.is_empty()
-                {
-                    return None;
-                }
-                self.typed_string_constant_bytes_for_specialized_codegen(call.args[0].expr())
-            }
             _ => None,
         }
     }

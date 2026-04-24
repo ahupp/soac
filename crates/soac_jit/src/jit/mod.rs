@@ -5587,18 +5587,6 @@ fn codegen_expr_const_string(
         InstrCodegen::Load(op) => op.name.location.as_constant().and_then(|index| {
             module_constants.constant_string_value(ModuleConstantId(index as usize))
         }),
-        InstrCodegen::Call(call) => {
-            if codegen_expr_helper_name(call.func.as_ref(), module_constants) != Some("str")
-                || call.args.len() != 1
-                || !call.keywords.is_empty()
-            {
-                return None;
-            }
-            let CallArgPositional::Positional(arg) = &call.args[0] else {
-                return None;
-            };
-            codegen_expr_const_string(arg, module_constants)
-        }
         _ => None,
     }
 }
@@ -16551,22 +16539,6 @@ fn emit_codegen_simple_call_with_local_env(
             codegen_env,
             func_imports,
         ));
-    }
-
-    if !has_unpack
-        && simple_keywords.is_empty()
-        && codegen_expr_runtime_helper(call.func.as_ref(), emit_ctx) == Some(RuntimeHelperId::Str)
-        && simple_args.len() == 1
-    {
-        if let Some(value) = codegen_expr_const_string(simple_args[0], emit_ctx.module_constants) {
-            return Some(emit_owned_module_constant(
-                fb,
-                emit_ctx
-                    .module_constants
-                    .require_unicode_constant_id(value.as_str()),
-                emit_ctx,
-            ));
-        }
     }
 
     if !has_unpack

@@ -737,6 +737,29 @@ def fmt(value):
 }
 
 #[test]
+fn name_binding_keeps_fstring_str_conversion_on_runtime_builtin() {
+    let source = r#"
+str = lambda value: "shadowed"
+
+def fmt(value):
+    return f"{value!s}"
+"#;
+
+    let lowered = TrackedLowering::new(source);
+    let fmt = lowered.bb_function("fmt");
+    assert!(
+        blockpy_function_instr_any(fmt, |expr| {
+            runtime_call_by_name(lowered.bb_module(), expr, "str").is_some()
+        }),
+        "f-string !s should call soac.runtime.str, not the module global str: {fmt:?}"
+    );
+    assert!(
+        module_constant_runtime_name(lowered.bb_module(), "str"),
+        "expected the f-string !s conversion to hoist RuntimeName::Str as a module constant"
+    );
+}
+
+#[test]
 fn core_blockpy_lowers_tstring_before_bb_lowering() {
     let source = r#"
 def fmt(value):
