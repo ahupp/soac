@@ -1,0 +1,4 @@
+interface:
+  display_name: "SOAC Selfdoc"
+  short_description: "Refresh SOAC README inventories and module lifecycle docs"
+  default_prompt: "Use this skill to update SOAC's README crate, skill, and CLI inventories, and create or refresh doc/MODULE_LIFECYCLE.md with module dataflow, dependency graph, and lowering/optimization/codegen walkthroughs."
