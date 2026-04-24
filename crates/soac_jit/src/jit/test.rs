@@ -16442,6 +16442,44 @@ def f(x):
         typed_function
     }
 
+    fn typed_function_with_deopting_indexed_global_access_plan(
+        function: &BlockPyFunction<CodegenModuleShape>,
+        access: IndexedGlobalAccessKind,
+        name: &str,
+    ) -> BlockPyFunction<TypedCodegenModuleShape> {
+        let source = first_indexed_global_access_source(function, access, name);
+        let mut typed_function =
+            typed_function_with_indexed_global_access_plan(function, access, name);
+
+        struct Annotator {
+            source: InstrId,
+            found: bool,
+        }
+
+        impl VisitMut<InstrTyped> for Annotator {
+            fn visit_instr_mut(&mut self, expr: &mut InstrTyped) {
+                if expr.try_semantic_instr_id() == Some(self.source)
+                    && let Some(extra) = expr.typed_extra_mut()
+                {
+                    extra.set_guard_miss_deopt_enabled(true);
+                    self.found = true;
+                }
+                expr.visit_children_mut(self);
+            }
+        }
+
+        let mut annotator = Annotator {
+            source,
+            found: false,
+        };
+        annotator.visit_fn_mut(&mut typed_function);
+        assert!(
+            annotator.found,
+            "indexed-global typed node {source} should carry typed metadata"
+        );
+        typed_function
+    }
+
     #[test]
     fn codegen_consumes_v3_indexed_global_instr_typed_plan_without_legacy_counters() {
         let module_name_gen = ModuleNameGen::new(7);
@@ -19108,7 +19146,7 @@ class Point:
         let function = module.callable_defs[0].clone();
         let module_constants =
             crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
-        let typed_indexed_global_function = typed_function_with_indexed_global_access_plan(
+        let typed_indexed_global_function = typed_function_with_deopting_indexed_global_access_plan(
             &function,
             IndexedGlobalAccessKind::Load,
             "x",
@@ -19119,7 +19157,6 @@ class Point:
             &blocks,
             &module_constants,
             BuildSpecializedFunctionOptions {
-                guard_miss_deopt_stub: true,
                 planned_typed_function: Some(typed_indexed_global_function),
                 ..BuildSpecializedFunctionOptions::default()
             },
@@ -20083,7 +20120,7 @@ class Point:
         let function = module.callable_defs[0].clone();
         let module_constants =
             crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
-        let typed_indexed_global_function = typed_function_with_indexed_global_access_plan(
+        let typed_indexed_global_function = typed_function_with_deopting_indexed_global_access_plan(
             &function,
             IndexedGlobalAccessKind::Load,
             "x",
@@ -20094,7 +20131,6 @@ class Point:
             &blocks,
             &module_constants,
             BuildSpecializedFunctionOptions {
-                guard_miss_deopt_stub: true,
                 planned_typed_function: Some(typed_indexed_global_function),
                 ..BuildSpecializedFunctionOptions::default()
             },
@@ -20126,7 +20162,7 @@ class Point:
         let function = module.callable_defs[0].clone();
         let module_constants =
             crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
-        let typed_indexed_global_function = typed_function_with_indexed_global_access_plan(
+        let typed_indexed_global_function = typed_function_with_deopting_indexed_global_access_plan(
             &function,
             IndexedGlobalAccessKind::Load,
             "x",
@@ -20137,7 +20173,6 @@ class Point:
             &blocks,
             &module_constants,
             BuildSpecializedFunctionOptions {
-                guard_miss_deopt_stub: true,
                 planned_typed_function: Some(typed_indexed_global_function),
                 ..BuildSpecializedFunctionOptions::default()
             },
@@ -20214,11 +20249,12 @@ class Point:
                     shared_state.lowered_module.counter_defs.as_slice(),
                 );
             let blocks = vec![std::ptr::null_mut::<c_void>(); function.blocks.len()];
-            let typed_indexed_global_function = typed_function_with_indexed_global_access_plan(
-                &function,
-                IndexedGlobalAccessKind::Load,
-                "x",
-            );
+            let typed_indexed_global_function =
+                typed_function_with_deopting_indexed_global_access_plan(
+                    &function,
+                    IndexedGlobalAccessKind::Load,
+                    "x",
+                );
             let built = build_test_cranelift_run_bb_specialized_function(
                 &mut jit_module,
                 blocks.as_slice(),
@@ -20235,7 +20271,6 @@ class Point:
                 None,
                 None,
                 BuildSpecializedFunctionOptions {
-                    guard_miss_deopt_stub: true,
                     planned_typed_function: Some(typed_indexed_global_function),
                     ..BuildSpecializedFunctionOptions::default()
                 },
@@ -20352,11 +20387,12 @@ class Point:
                     shared_state.lowered_module.counter_defs.as_slice(),
                 );
             let blocks = vec![std::ptr::null_mut::<c_void>(); function.blocks.len()];
-            let typed_indexed_global_function = typed_function_with_indexed_global_access_plan(
-                &function,
-                IndexedGlobalAccessKind::Load,
-                "x",
-            );
+            let typed_indexed_global_function =
+                typed_function_with_deopting_indexed_global_access_plan(
+                    &function,
+                    IndexedGlobalAccessKind::Load,
+                    "x",
+                );
             let built = build_test_cranelift_run_bb_specialized_function(
                 &mut jit_module,
                 blocks.as_slice(),
@@ -20373,7 +20409,6 @@ class Point:
                 None,
                 None,
                 BuildSpecializedFunctionOptions {
-                    guard_miss_deopt_stub: true,
                     planned_typed_function: Some(typed_indexed_global_function),
                     ..BuildSpecializedFunctionOptions::default()
                 },
@@ -20464,7 +20499,7 @@ class Point:
         let function = module.callable_defs[0].clone();
         let module_constants =
             crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
-        let typed_indexed_global_function = typed_function_with_indexed_global_access_plan(
+        let typed_indexed_global_function = typed_function_with_deopting_indexed_global_access_plan(
             &function,
             IndexedGlobalAccessKind::Load,
             "y",
@@ -20475,7 +20510,6 @@ class Point:
             &blocks,
             &module_constants,
             BuildSpecializedFunctionOptions {
-                guard_miss_deopt_stub: true,
                 planned_typed_function: Some(typed_indexed_global_function),
                 ..BuildSpecializedFunctionOptions::default()
             },
@@ -20529,7 +20563,7 @@ class Point:
         let function = module.callable_defs[0].clone();
         let module_constants =
             crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
-        let typed_indexed_global_function = typed_function_with_indexed_global_access_plan(
+        let typed_indexed_global_function = typed_function_with_deopting_indexed_global_access_plan(
             &function,
             IndexedGlobalAccessKind::Load,
             "x",
@@ -20540,7 +20574,6 @@ class Point:
             &blocks,
             &module_constants,
             BuildSpecializedFunctionOptions {
-                guard_miss_deopt_stub: true,
                 planned_typed_function: Some(typed_indexed_global_function),
                 ..BuildSpecializedFunctionOptions::default()
             },
@@ -20611,11 +20644,12 @@ class Point:
                     shared_state.lowered_module.counter_defs.as_slice(),
                 );
             let blocks = vec![std::ptr::null_mut::<c_void>(); function.blocks.len()];
-            let typed_indexed_global_function = typed_function_with_indexed_global_access_plan(
-                &function,
-                IndexedGlobalAccessKind::Load,
-                "x",
-            );
+            let typed_indexed_global_function =
+                typed_function_with_deopting_indexed_global_access_plan(
+                    &function,
+                    IndexedGlobalAccessKind::Load,
+                    "x",
+                );
             let built = build_test_cranelift_run_bb_specialized_function(
                 &mut jit_module,
                 blocks.as_slice(),
@@ -20632,7 +20666,6 @@ class Point:
                 None,
                 None,
                 BuildSpecializedFunctionOptions {
-                    guard_miss_deopt_stub: true,
                     planned_typed_function: Some(typed_indexed_global_function),
                     ..BuildSpecializedFunctionOptions::default()
                 },

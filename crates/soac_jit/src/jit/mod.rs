@@ -6660,17 +6660,14 @@ fn prepare_optional_guard_miss_dispatch(
 
 fn collect_typed_guard_miss_deopt_instr_ids(
     function: &BlockPyFunction<TypedCodegenModuleShape>,
-    force_all_with_typed_extra: bool,
 ) -> HashSet<InstrId> {
     struct Collector {
-        force_all_with_typed_extra: bool,
         instr_ids: HashSet<InstrId>,
     }
 
     impl Visit<InstrTyped> for Collector {
         fn visit_instr(&mut self, expr: &InstrTyped) {
-            if (self.force_all_with_typed_extra || expr.guard_miss_deopt_enabled())
-                && expr.typed_extra().is_some()
+            if expr.guard_miss_deopt_enabled()
                 && let Some(instr_id) = expr.try_semantic_instr_id()
             {
                 self.instr_ids.insert(instr_id);
@@ -6680,7 +6677,6 @@ fn collect_typed_guard_miss_deopt_instr_ids(
     }
 
     let mut collector = Collector {
-        force_all_with_typed_extra,
         instr_ids: HashSet::new(),
     };
     collector.visit_fn(function);
@@ -26263,7 +26259,6 @@ pub fn run_cranelift_smoke(module: &BlockPyModule<CodegenModuleShape>) -> Result
 
 #[derive(Clone, Debug, Default)]
 struct BuildSpecializedFunctionOptions {
-    guard_miss_deopt_stub: bool,
     module_constant_accesses: ModuleConstantAccessTable,
     counted_refcount_helpers: Option<CountedRefcountHelpers>,
     planned_typed_function: Option<BlockPyFunction<TypedCodegenModuleShape>>,
@@ -26680,8 +26675,7 @@ fn build_cranelift_run_bb_specialized_function(
         options.planned_typed_function.as_ref(),
         value_facts,
     )?;
-    let guard_miss_deopt_instr_ids =
-        collect_typed_guard_miss_deopt_instr_ids(&typed_function, options.guard_miss_deopt_stub);
+    let guard_miss_deopt_instr_ids = collect_typed_guard_miss_deopt_instr_ids(&typed_function);
     let guard_miss_deopt_stub = !guard_miss_deopt_instr_ids.is_empty();
     let direct_call_targets = collect_typed_call_direct_targets(&typed_function);
     let empty_direct_functions = HashMap::new();
