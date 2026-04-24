@@ -8,11 +8,8 @@ use pyo3::types::PyModule;
 use serde_json::json;
 use soac_core::profile::CounterDumpFile;
 use soac_driver::generate_optimization_plans_v3_for_counter_dump;
-use soac_lowering::pass_tracker::LoweringPassTrackerExt;
-use soac_lowering::{lower_python_to_blockpy_for_testing, ruff_ast_to_string};
 use soac_opt::artifacts_v3::load_optimization_artifacts_v3;
 use std::path::{Path, PathBuf};
-use tracing::trace;
 
 #[cfg(test)]
 mod test;
@@ -26,26 +23,6 @@ pub(crate) fn lowering_error_to_pyerr(err: soac_lowering::LoweringError) -> PyEr
             pyo3::exceptions::PyRuntimeError::new_err(err.to_string())
         }
     }
-}
-
-fn lower_source(source: &str) -> PyResult<soac_lowering::LoweringResult> {
-    lower_python_to_blockpy_for_testing(source).map_err(lowering_error_to_pyerr)
-}
-
-fn rendered_ast_to_ast_source(source: &str, output: &soac_lowering::LoweringResult) -> String {
-    output
-        .pass_tracker
-        .pass_ast_to_ast()
-        .map(|module| ruff_ast_to_string(&module.body))
-        .unwrap_or_else(|| source.to_string())
-}
-
-#[pyfunction]
-fn transform_source_with_name(source: &str, module_name: &str) -> PyResult<String> {
-    let preview = source.get(..100).unwrap_or(source);
-    trace!("transform_source_with_name({module_name}): {}", preview);
-    let output = lower_source(source)?;
-    Ok(rendered_ast_to_ast_source(source, &output))
 }
 
 #[pyfunction]
@@ -197,7 +174,6 @@ fn _soac_ext(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
         "IndexedModuleType",
         soac_jit::module_type::indexed_module_type_for_python(py)?,
     )?;
-    module.add_function(wrap_pyfunction!(transform_source_with_name, module)?)?;
     module.add_function(wrap_pyfunction!(inspect_counter_dump_json, module)?)?;
     module.add_function(wrap_pyfunction!(
         inspect_optimization_artifacts_v3_json,

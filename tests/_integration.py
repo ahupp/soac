@@ -58,26 +58,6 @@ def split_integration_case(module_path: Path) -> tuple[str, str]:
 
 
 @contextmanager
-def _soac_env_for_mode(mode: str | None) -> Iterator[None]:
-    prior_mode = os.environ.get("DIET_PYTHON_MODE")
-    try:
-        if mode in {"soac", "entry"}:
-            os.environ["DIET_PYTHON_MODE"] = "transform"
-        elif mode == "stock":
-            os.environ.pop("DIET_PYTHON_MODE", None)
-        elif mode is None:
-            pass
-        else:
-            raise ValueError(f"unsupported integration mode: {mode!r}")
-        yield
-    finally:
-        if prior_mode is None:
-            os.environ.pop("DIET_PYTHON_MODE", None)
-        else:
-            os.environ["DIET_PYTHON_MODE"] = prior_mode
-
-
-@contextmanager
 def _force_entry_interpreter_for_tests(enabled: bool) -> Iterator[None]:
     previous = _soac_ext.force_entry_interpreter_for_tests(enabled)
     try:
@@ -94,42 +74,14 @@ def _print_integration_failure_context(module_path: Path, mode: str | None = Non
     except OSError as err:
         source = f"<<failed to read source: {err}>>"
 
-    try:
-        with _soac_env_for_mode(mode):
-            transformed = render_transformed_source(module_path)
-    except Exception as err:
-        transformed = f"<<failed to transform source: {err}>>"
-
     print("\n--- diet-python integration failure context ---", file=sys.stderr)
     print(f"module: {module_path}", file=sys.stderr)
     if mode is not None:
         print(f"mode: {mode}", file=sys.stderr)
-    print("--- transformed module ---", file=sys.stderr)
-    print(transformed, file=sys.stderr)
     print("--- input module ---", file=sys.stderr)
     print(source, file=sys.stderr)
     print("--- end diet-python integration context ---", file=sys.stderr)
     _PRINTED_MODULES.add(module_path)
-
-
-def render_transformed_source(module_path: Path) -> str:
-    try:
-        source = module_path.read_text(encoding="utf-8")
-    except OSError as err:
-        raise ImportError(
-            f"diet-python could not read source for {module_path}: {err}"
-        ) from err
-    try:
-        return _soac_ext.transform_source_with_name(
-            source,
-            module_path.stem,
-        )
-    except SyntaxError as err:
-        if err.filename is None:
-            err.filename = str(module_path)
-        raise
-    except Exception as err:
-        raise ImportError(f"diet-python failed for {module_path}: {err}") from err
 
 
 @contextmanager

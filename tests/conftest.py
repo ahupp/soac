@@ -29,17 +29,10 @@ def _print_integration_failure_context(module_path: Path) -> None:
     except OSError as err:
         source = f"<<failed to read source: {err}>>"
 
-    try:
-        transformed = _integration.render_transformed_source(module_path)
-    except Exception as err:
-        transformed = f"<<failed to transform source: {err}>>"
-
     print("\n--- diet-python integration failure context ---", file=sys.stderr)
     print(f"module: {module_path}", file=sys.stderr)
     print("--- input module ---", file=sys.stderr)
     print(source, file=sys.stderr)
-    print("--- transformed module ---", file=sys.stderr)
-    print(transformed, file=sys.stderr)
     print("--- end diet-python integration context ---", file=sys.stderr)
 
 
