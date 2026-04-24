@@ -268,11 +268,12 @@ pub fn validate_codegen_instr_ids(
 mod test {
     use super::validate_codegen_instr_ids;
     use crate::block_py::{
-        counters::IncrementCounter, walk_block, ChildVisitable, CounterId, HasMeta,
-        HasSemanticInstrId, InstrCodegen, InstrId, Meta, Visit, VisitMut, WithMeta,
+        walk_block, ChildVisitable, CounterId, HasMeta, HasSemanticInstrId, InstrCodegen, InstrId,
+        Meta, Visit, VisitMut, WithMeta,
     };
     use crate::lower_python_to_blockpy_for_testing;
     use crate::passes::CodegenModuleShape;
+    use soac_core::block_py::IncrementCounter;
     use std::collections::HashMap;
 
     struct InstrIdCollector {

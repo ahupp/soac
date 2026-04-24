@@ -1,7 +1,6 @@
 pub(crate) use soac_core::block_py::*;
 
 pub(crate) mod cfg;
-pub mod counters;
 mod pretty;
 mod scope_impls;
 pub(crate) mod validate;
@@ -10,7 +9,6 @@ pub(crate) use crate::passes::{
     InstrCodegen, InstrLow, InstrResolved, InstrRuff, InstrUnresolved, InstrWithAwaitAndYield,
     InstrWithYield,
 };
-pub(crate) use counters::IncrementCounter;
 pub(crate) use scope_impls::{
     build_storage_layout_from_capture_names, compute_make_function_capture_bindings_from_scope,
     compute_storage_layout_from_scope, is_runtime_closure_name, ScopeExprNode,

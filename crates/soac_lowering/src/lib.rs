@@ -13,7 +13,7 @@ use soac_core::block_py::{BlockPyModule, ModuleNameGen};
 use soac_core::pass_tracker::{NoopPassTracker, PassTracker, RecordingPassTracker};
 use std::time::{Duration, Instant};
 
-pub mod block_py;
+pub(crate) mod block_py;
 mod driver;
 #[cfg(test)]
 pub(crate) mod fixture;

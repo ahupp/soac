@@ -1,3 +1,4 @@
+use super::instr_macro::define_instr;
 use super::*;
 
 #[derive(
@@ -133,5 +134,11 @@ impl CounterDef {
 
     pub fn is_branch_counter(&self) -> bool {
         !self.branches.is_empty()
+    }
+}
+
+define_instr! {
+    pub struct IncrementCounter {
+        counter_id: CounterId,
     }
 }

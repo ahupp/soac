@@ -55,7 +55,7 @@ mod scope;
 mod visit;
 pub use counters::{
     CounterBranch, CounterBranchId, CounterDef, CounterId, CounterScope, CounterSite,
-    DeoptEntrySource,
+    DeoptEntrySource, IncrementCounter,
 };
 pub use name_gen::{
     BlockLabel, FunctionNameGen, LocalFunctionId, ModuleContentId, ModuleNameGen,

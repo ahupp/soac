@@ -5,6 +5,7 @@ use crate::instrument::{
 };
 use crate::{CounterBuilder, ExplicitCounterPlacement, InstrumentationConfig};
 use soac_config::ExecTraceConfig;
+use soac_core::block_py::IncrementCounter;
 use soac_core::block_py::{
     BlockPyFunction, BlockPyModule, BlockTerm, Call, CallArgPositional, ChildVisitable,
     CounterScope, FunctionExecutionMode, HasSemanticInstrId, LiteralValue, Load, Meta, ModuleShape,
@@ -12,7 +13,6 @@ use soac_core::block_py::{
     WithMeta,
 };
 use soac_core::pass_tracker::PassTracker;
-use soac_lowering::block_py::counters::IncrementCounter;
 use soac_lowering::passes::{CodegenModuleShape, InstrCodegen, InstrResolved};
 use std::collections::HashMap;
 

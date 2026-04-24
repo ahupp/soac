@@ -1,4 +1,5 @@
 use super::*;
+use soac_core::block_py::IncrementCounter;
 use soac_core::block_py::literal::{
     Literal, LiteralValue, NumberLiteral, NumberLiteralValue, StringLiteral,
 };
@@ -13,7 +14,6 @@ use soac_core::block_py::{
     SerializedIdentityTables, SerializedModuleId, SerializedModuleIdentity, SetAttr, SetItem,
     StorageLayout, Store, Tuple, UnaryOp, UnaryOpKind, Visit, VisitMut, WithMeta,
 };
-use soac_lowering::block_py::counters::IncrementCounter;
 use soac_lowering::passes::{
     CodegenModuleShape, InstrCodegen, InstrResolved, validate_codegen_instr_ids,
 };

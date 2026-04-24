@@ -4,12 +4,12 @@ use crate::instrument::{
     is_operator_specialization_binop_kind, is_profile_call_candidate,
 };
 use crate::{CounterBuilder, ExplicitCounterPlacement, InstrumentationConfig};
+use soac_core::block_py::IncrementCounter;
 use soac_core::block_py::{
     BlockPyFunction, BlockPyModule, BlockTerm, ChildVisitable, CounterScope, FunctionExecutionMode,
     HasSemanticInstrId, Meta, NameLocation, RuntimeFunctionId, Visit, WithMeta,
 };
 use soac_core::pass_tracker::{NoopPassTracker, PassTracker};
-use soac_lowering::block_py::counters::IncrementCounter;
 use soac_opt::typed::{InstrTyped, TypedCodegenModuleShape};
 
 fn functions_with_counter_instrumentation_mut(
