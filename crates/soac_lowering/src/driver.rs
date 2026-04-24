@@ -79,6 +79,7 @@ pub fn lower_source_to_codegen_module_with_tracker(
     pass_tracker: &mut impl PassTracker,
     options: LoweringOptions,
 ) -> Result<BlockPyModule<CodegenModuleShape>> {
+    crate::namegen::reset_namegen_state();
     let module =
         pass_tracker.record_timing("parse", || -> std::result::Result<_, ParseError> {
             let mut module = parse_module(source).map(|module| module.into_syntax())?;

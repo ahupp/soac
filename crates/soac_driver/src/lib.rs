@@ -114,7 +114,6 @@ where
     P: PassTracker,
 {
     init_logging_with_config(env_config).map_err(anyhow::Error::msg)?;
-    soac_lowering::reset_lowering_state();
     let total_start = Instant::now();
 
     let codegen_module = rewrite_module_with_tracker_with_options(

@@ -96,7 +96,6 @@ fn lower_python_to_blockpy_with_tracker_and_options<P>(
 where
     P: PassTracker,
 {
-    reset_lowering_state();
     let total_start = Instant::now();
 
     let codegen_module = lower_source_to_codegen_module_with_tracker(
@@ -111,10 +110,6 @@ where
         codegen_module,
         pass_tracker,
     })
-}
-
-pub fn reset_lowering_state() {
-    namegen::reset_namegen_state();
 }
 
 pub fn lower_python_to_blockpy_for_testing(source: &str) -> Result<LoweringResult> {
