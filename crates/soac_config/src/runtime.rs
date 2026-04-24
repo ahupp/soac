@@ -68,22 +68,22 @@ impl SpecializationMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeOptimizationPipeline {
     PlanArtifacts,
-    TypedV3Identity,
+    TypedV3,
 }
 
 impl RuntimeOptimizationPipeline {
     pub fn from_str(mode: &str) -> Result<Self, String> {
         match mode.trim() {
             "plan-artifacts" => Ok(Self::PlanArtifacts),
-            "typed-v3" => Ok(Self::TypedV3Identity),
+            "typed-v3" => Ok(Self::TypedV3),
             value => Err(format!(
                 "unrecognized runtime optimization pipeline {value:?}; expected one of: plan-artifacts, typed-v3"
             )),
         }
     }
 
-    pub fn uses_identity_typed_runtime(self) -> bool {
-        matches!(self, Self::TypedV3Identity)
+    pub fn uses_typed_v3_runtime(self) -> bool {
+        matches!(self, Self::TypedV3)
     }
 }
 
@@ -341,10 +341,7 @@ impl SoacEnvConfig {
     }
 
     pub fn specialization_runtime_logging_enabled(&self) -> bool {
-        if self
-            .runtime_optimization_pipeline
-            .uses_identity_typed_runtime()
-        {
+        if self.runtime_optimization_pipeline.uses_typed_v3_runtime() {
             return false;
         }
         self.specialization_mode == Some(SpecializationMode::Apply)
@@ -628,7 +625,7 @@ mod tests {
 
         assert_eq!(
             config.runtime_optimization_pipeline(),
-            RuntimeOptimizationPipeline::TypedV3Identity
+            RuntimeOptimizationPipeline::TypedV3
         );
     }
 

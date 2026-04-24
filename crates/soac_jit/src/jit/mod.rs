@@ -64,6 +64,7 @@ use soac_opt::access_emission_v3::{
     prepare_indexed_field_accesses_for_codegen as opt_v3_prepare_indexed_field_accesses_for_codegen,
     prepared_indexed_field_access_plan as opt_v3_prepared_indexed_field_access_plan,
 };
+use soac_opt::alternatives_v3::AlternativeCatalog;
 use soac_opt::artifacts_v3::{
     ExactIntBranchV3Artifacts, load_optimization_artifacts_v3,
     single_function_optimization_artifacts_v3, validate_optimization_artifacts_v3_for_module,
@@ -100,10 +101,12 @@ use soac_opt::passes::{
     try_lower_typed_term_to_codegen_legacy, validate_typed_function_call_access_plans,
     validate_typed_function_value_facts,
 };
+use soac_opt::pipeline_v3::plan_and_emit_module_v3_from_raw_evidence;
+use soac_opt::plan::ProfileEvidenceStore;
 use soac_opt::plan_v3::{
     IndexedFieldAccessKind as PlanV3IndexedFieldAccessKind,
-    IndexedGlobalAccessKind as PlanV3IndexedGlobalAccessKind, MaterializeKind, PlanNodeId,
-    PlanValue, RegionId, RegionPlan, Rep, RichCompareOp,
+    IndexedGlobalAccessKind as PlanV3IndexedGlobalAccessKind, MaterializeKind, ModulePlanIdentity,
+    PlanNodeId, PlanValue, RegionId, RegionPlan, Rep, RichCompareOp,
 };
 use soac_opt::region_emission_v3::{
     ExactIntBranchSelection as OptV3ExactIntBranchSelection,
@@ -1704,8 +1707,8 @@ impl JitBatchPlan<'_> {
                     Some(shared_state),
                     Some(inputs.session.as_ref()),
                 )?;
-                if runtime_pipeline.uses_identity_typed_runtime() {
-                    build_identity_typed_jit_module_plan(&shared_state.lowered_module)?
+                if runtime_pipeline.uses_typed_v3_runtime() {
+                    build_typed_v3_jit_module_plan(&shared_state.lowered_module)?
                 } else if profile.optimized_module.is_some() {
                     build_profiled_jit_module_plan(&shared_state.lowered_module, &profile)?
                 } else {
@@ -1716,8 +1719,8 @@ impl JitBatchPlan<'_> {
                     RuntimeOptimizationPipeline::PlanArtifacts => {
                         build_jit_module_plan(inputs.module)?
                     }
-                    RuntimeOptimizationPipeline::TypedV3Identity => {
-                        build_identity_typed_jit_module_plan(inputs.module)?
+                    RuntimeOptimizationPipeline::TypedV3 => {
+                        build_typed_v3_jit_module_plan(inputs.module)?
                     }
                 }
             };
@@ -1837,7 +1840,7 @@ fn build_jit_module_plan(
     build_jit_module_plan_from_owned_module(module.clone())
 }
 
-fn build_identity_typed_jit_module_plan(
+fn build_typed_v3_jit_module_plan(
     module: &BlockPyModule<CodegenModuleShape>,
 ) -> Result<Arc<JitModulePlan>, String> {
     build_jit_module_plan(module)
@@ -11219,6 +11222,7 @@ struct SpecializationProfile<'a> {
     module_name: Option<&'a str>,
     counter_dump_path: Option<Cow<'a, Path>>,
     optimized_module: Option<Arc<BlockPyModule<CodegenModuleShape>>>,
+    direct_call_emission_scope: DirectCallEmissionScope,
     opt_v3_emitted_direct_calls:
         HashMap<RuntimeFunctionId, HashMap<InstrId, Vec<ResolvedV3DirectCallPlan>>>,
     opt_v3_emitted_exact_list_items:
@@ -11231,6 +11235,12 @@ struct SpecializationProfile<'a> {
     behavior_change_indexed_stores: bool,
     profiled_cold_blocks: bool,
     guard_miss_deopt: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DirectCallEmissionScope {
+    DirectCallBodiesOnly,
+    AllDirectCallCandidates,
 }
 
 #[derive(Clone, Default)]
@@ -11294,9 +11304,16 @@ fn load_planned_optimization_inputs_for_runtime_state(
     }
     if env_config
         .runtime_optimization_pipeline()
-        .uses_identity_typed_runtime()
+        .uses_typed_v3_runtime()
     {
-        return Ok(PlannedOptimizationInputs::default());
+        let Some(shared_state) = shared_state else {
+            return Ok(PlannedOptimizationInputs::default());
+        };
+        return planned_typed_v3_runtime_direct_call_inputs_from_raw_evidence(
+            shared_state,
+            compile_session,
+            env_config,
+        );
     }
     let Some(shared_state) = shared_state else {
         return Ok(PlannedOptimizationInputs::default());
@@ -11355,6 +11372,36 @@ fn load_planned_optimization_inputs_for_runtime_state(
         shared_state.module_name,
         cache_root.display()
     ))
+}
+
+fn planned_typed_v3_runtime_direct_call_inputs_from_raw_evidence(
+    shared_state: &SharedModuleState,
+    compile_session: Option<&crate::session::CompileSession>,
+    env_config: &SoacEnvConfig,
+) -> Result<PlannedOptimizationInputs, String> {
+    let Some(counter_dump_path) = env_config.counter_dump_input_path() else {
+        return Ok(PlannedOptimizationInputs::default());
+    };
+    if !counter_dump_path.exists() {
+        return Ok(PlannedOptimizationInputs::default());
+    }
+    let evidence_store = ProfileEvidenceStore::from_counter_dump(counter_dump_path.as_path())
+        .map_err(|err| err.to_string())?;
+    let artifacts = plan_and_emit_module_v3_from_raw_evidence(
+        &AlternativeCatalog::default_v3(),
+        ModulePlanIdentity {
+            module_name: shared_state.module_name.clone(),
+            source_hash: shared_state.source_hash,
+            cache_identity: pre_optimization_module_cache_identity(
+                env!("SOAC_BUILD_IDENTITY"),
+                shared_state.module_name == "soac.runtime",
+            ),
+        },
+        &shared_state.lowered_module,
+        &evidence_store,
+    )
+    .map_err(|err| err.to_string())?;
+    planned_direct_call_inputs_from_v3_artifacts(&artifacts, shared_state, compile_session)
 }
 
 fn load_optimized_codegen_module_v3_for_runtime_state(
@@ -11449,6 +11496,50 @@ fn planned_optimization_inputs_from_v3_artifacts(
         inputs
             .opt_v3_exact_int_branch_artifacts
             .insert(current_function_id, Arc::new(function_artifacts));
+    }
+    Ok(inputs)
+}
+
+fn planned_direct_call_inputs_from_v3_artifacts(
+    artifacts: &ExactIntBranchV3Artifacts,
+    shared_state: &SharedModuleState,
+    compile_session: Option<&crate::session::CompileSession>,
+) -> Result<PlannedOptimizationInputs, String> {
+    let mut inputs = PlannedOptimizationInputs::default();
+    for planned_function in &artifacts.plan.functions {
+        let local_function_id = planned_function.function.function.local_function_id();
+        let current_function_id = RuntimeFunctionId::new(
+            RuntimeModuleId::new(shared_state.module_id()),
+            local_function_id,
+        );
+        shared_state
+            .lookup_function(current_function_id)
+            .ok_or_else(|| {
+                format!(
+                    "optimization plan v3 for module {} references missing function id {} ({})",
+                    artifacts.plan.module.module_name,
+                    local_function_id,
+                    planned_function
+                        .function
+                        .debug_name
+                        .as_deref()
+                        .unwrap_or("<unknown>")
+                )
+            })?;
+        let Some(function_artifacts) =
+            opt_v3_single_function_artifacts(artifacts, planned_function.function.function)?
+        else {
+            continue;
+        };
+        if let Some(direct_calls) =
+            opt_v3_emitted_direct_calls_for_function(&function_artifacts, |target| {
+                resolve_opt_v3_runtime_function_target(shared_state, compile_session, target)
+            })?
+        {
+            inputs
+                .opt_v3_emitted_direct_calls
+                .insert(current_function_id, direct_calls);
+        }
     }
     Ok(inputs)
 }
@@ -11658,7 +11749,7 @@ impl FunctionSpecializationInputs {
             opt_v3_indexed_fields_by_instr,
         ) = profile.field_index_specialization_maps(function.function_id)?;
         let opt_v3_direct_calls_by_instr =
-            profile.codegen_opt_v3_direct_calls(function.function_id);
+            profile.typed_call_emission_direct_calls(function.function_id);
         let opt_v3_call_emissions =
             typed_call_emission_plans_from_v3(&opt_v3_direct_calls_by_instr)?;
         Ok(Self {
@@ -11696,11 +11787,11 @@ impl<'a> SpecializationProfile<'a> {
     ) -> Result<Self, String> {
         let env_config = env_config_for_session(compile_session)?;
         let specialization_mode = env_config.specialization_mode();
-        let identity_typed_runtime = env_config
+        let typed_v3_runtime = env_config
             .runtime_optimization_pipeline()
-            .uses_identity_typed_runtime();
+            .uses_typed_v3_runtime();
         let counter_dump_path = if shared_state.is_some()
-            && !identity_typed_runtime
+            && !typed_v3_runtime
             && specialization_mode != Some(crate::config::SpecializationMode::Profile)
         {
             env_config.counter_dump_input_path()
@@ -11717,17 +11808,21 @@ impl<'a> SpecializationProfile<'a> {
             module_name: shared_state.map(|shared_state| shared_state.module_name.as_str()),
             counter_dump_path: counter_dump_path.map(Cow::Owned),
             optimized_module: planned_inputs.optimized_module.map(Arc::new),
+            direct_call_emission_scope: if typed_v3_runtime {
+                DirectCallEmissionScope::AllDirectCallCandidates
+            } else {
+                DirectCallEmissionScope::DirectCallBodiesOnly
+            },
             opt_v3_emitted_direct_calls: planned_inputs.opt_v3_emitted_direct_calls,
             opt_v3_emitted_exact_list_items: planned_inputs.opt_v3_emitted_exact_list_items,
             opt_v3_emitted_indexed_fields: planned_inputs.opt_v3_emitted_indexed_fields,
             opt_v3_emitted_indexed_globals: planned_inputs.opt_v3_emitted_indexed_globals,
             opt_v3_exact_int_branch_artifacts: planned_inputs.opt_v3_exact_int_branch_artifacts,
-            behavior_change_indexed_stores: !identity_typed_runtime
+            behavior_change_indexed_stores: !typed_v3_runtime
                 && specialization_mode
                     .is_some_and(SpecializationMode::behavior_change_indexed_stores_enabled),
-            profiled_cold_blocks: !identity_typed_runtime
-                && env_config.profiled_cold_blocks_enabled(),
-            guard_miss_deopt: !identity_typed_runtime
+            profiled_cold_blocks: !typed_v3_runtime && env_config.profiled_cold_blocks_enabled(),
+            guard_miss_deopt: !typed_v3_runtime
                 && matches!(
                     specialization_mode,
                     Some(SpecializationMode::Verify | SpecializationMode::Apply)
@@ -11745,6 +11840,7 @@ impl<'a> SpecializationProfile<'a> {
             module_name: Some(module_name),
             counter_dump_path: counter_dump_path.map(Cow::Borrowed),
             optimized_module: planned_inputs.optimized_module.map(Arc::new),
+            direct_call_emission_scope: DirectCallEmissionScope::DirectCallBodiesOnly,
             opt_v3_emitted_direct_calls: planned_inputs.opt_v3_emitted_direct_calls,
             opt_v3_emitted_exact_list_items: planned_inputs.opt_v3_emitted_exact_list_items,
             opt_v3_emitted_indexed_fields: planned_inputs.opt_v3_emitted_indexed_fields,
@@ -11782,6 +11878,22 @@ impl<'a> SpecializationProfile<'a> {
             .get(&function_id)
             .map(opt_v3_direct_call_body_plans)
             .unwrap_or_default()
+    }
+
+    fn typed_call_emission_direct_calls(
+        &self,
+        function_id: RuntimeFunctionId,
+    ) -> HashMap<InstrId, Vec<ResolvedV3DirectCallPlan>> {
+        match self.direct_call_emission_scope {
+            DirectCallEmissionScope::DirectCallBodiesOnly => {
+                self.codegen_opt_v3_direct_calls(function_id)
+            }
+            DirectCallEmissionScope::AllDirectCallCandidates => self
+                .opt_v3_emitted_direct_calls
+                .get(&function_id)
+                .cloned()
+                .unwrap_or_default(),
+        }
     }
 
     fn field_index_specialization_maps(

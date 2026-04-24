@@ -454,7 +454,7 @@ explicit ordinary
   `SOAC_OPT_RUNTIME_PIPELINE=typed-v3` is the experimental runtime typed path:
   it bypasses required serialized v3 artifacts, uses the cached pre-optimization
   `mod.blockpy`, lowers `CodegenModuleShape` to `TypedCodegenModuleShape`, and
-  emits typed JIT without optimization rewrites.
+  currently applies typed direct-call emissions from raw profile evidence.
   `verify` exercises indexed store
   fast paths so hit/fallback counters measure the specialized steady-state path.
   `apply` still skips counter dump files, but when event logging is enabled it
@@ -534,8 +534,9 @@ explicit ordinary
   to inspect a v3 artifact summary. In `SOAC_OPT_MODE=verify|apply`, normal
   runtime loading requires a matching serialized v3 artifact and optimized
   codegen module in the active module cache. Set
-  `SOAC_OPT_RUNTIME_PIPELINE=typed-v3` only for the experimental identity typed
-  runtime path that bypasses those artifacts.
+  `SOAC_OPT_RUNTIME_PIPELINE=typed-v3` only for the experimental runtime typed
+  path that bypasses those artifacts and currently applies typed direct-call
+  emissions from raw profile evidence.
 - `SOAC_CRANELIFT_OPT_LEVEL`
   Optional Cranelift process-JIT optimization level override:
   `none`, `speed`, or `speed_and_size`. Normal runtime and benchmark

@@ -963,7 +963,7 @@ fn load_runtime_indexed_field_counter_emissions(
     }
     if env_config
         .runtime_optimization_pipeline()
-        .uses_identity_typed_runtime()
+        .uses_typed_v3_runtime()
     {
         return Ok(HashMap::new());
     }

@@ -34,7 +34,7 @@ pub fn refcount_counter_instrumentation_enabled(config: &SoacEnvConfig) -> bool 
 pub fn deopt_entry_counter_instrumentation_enabled(config: &SoacEnvConfig) -> bool {
     if config
         .runtime_optimization_pipeline()
-        .uses_identity_typed_runtime()
+        .uses_typed_v3_runtime()
     {
         return false;
     }

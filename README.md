@@ -377,8 +377,9 @@ typed variables must use recognized values. Boolean knobs accept `1`, `true`,
   pipeline for `verify`/`apply`. It bypasses required `mod.optv3` and
   `mod.optv3.blockpy` loading, builds the JIT module from the cached
   pre-optimization `mod.blockpy`, lowers `CodegenModuleShape` to
-  `TypedCodegenModuleShape`, and emits the typed JIT without optimization
-  rewrites. Leave it unset for normal serialized-plan execution.
+  `TypedCodegenModuleShape`, and currently applies typed direct-call emissions
+  from raw profile evidence. Leave it unset for normal serialized-plan
+  execution.
 
 Notes:
 - In normal workflows set one `SOAC_WORK_DIR` for the whole multi-pass

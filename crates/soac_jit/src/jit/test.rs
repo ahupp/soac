@@ -4139,6 +4139,7 @@ def build(values):
             module_name: None,
             counter_dump_path: None,
             optimized_module: None,
+            direct_call_emission_scope: DirectCallEmissionScope::DirectCallBodiesOnly,
             opt_v3_emitted_direct_calls: HashMap::from([(
                 function_id,
                 HashMap::from([(source, vec![direct_call])]),
@@ -16693,6 +16694,7 @@ def read_point(point):
                 module_name: None,
                 counter_dump_path: None,
                 optimized_module: None,
+                direct_call_emission_scope: DirectCallEmissionScope::DirectCallBodiesOnly,
                 opt_v3_emitted_direct_calls: HashMap::new(),
                 opt_v3_emitted_exact_list_items: HashMap::new(),
                 opt_v3_emitted_indexed_fields: HashMap::from([(
@@ -17765,11 +17767,11 @@ def f(x, y):
             .expect("typed-v3 runtime pipeline should not require serialized v3 artifacts");
             assert!(
                 profile.optimized_module.is_none(),
-                "typed-v3 identity runtime should use the pre-optimization BlockPy module"
+                "typed-v3 runtime should use the pre-optimization BlockPy module"
             );
             assert!(
                 profile.counter_dump_path.is_none(),
-                "typed-v3 identity runtime should not consume profile evidence yet"
+                "typed-v3 runtime should not enable legacy profile evidence fallback"
             );
             assert!(profile.opt_v3_emitted_direct_calls.is_empty());
             assert!(profile.opt_v3_emitted_exact_list_items.is_empty());
@@ -17779,12 +17781,180 @@ def f(x, y):
             assert!(!profile.behavior_change_indexed_stores);
             assert!(!profile.guard_miss_deopt);
 
-            let module_plan = build_identity_typed_jit_module_plan(&shared_state.lowered_module)
-                .expect("typed-v3 identity runtime should lower CodegenModuleShape to typed JIT");
+            let module_plan = build_typed_v3_jit_module_plan(&shared_state.lowered_module)
+                .expect("typed-v3 runtime should lower CodegenModuleShape to typed JIT");
             assert_eq!(module_plan.module.callable_defs.len(), 1);
             assert_eq!(
                 module_plan.module.module_name_gen.module_id(),
                 shared_state.lowered_module.module_name_gen.module_id()
+            );
+        });
+    }
+
+    #[test]
+    fn runtime_typed_v3_pipeline_emits_direct_calls_from_raw_profile_evidence() {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "runtime_typed_v3_pipeline_emits_direct_calls_from_raw_profile_evidence",
+        ) {
+            return;
+        }
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| {
+            let soac_work_dir = fresh_test_work_dir("runtime-typed-v3-direct-call");
+            let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
+            let _opt_mode = set_opt_mode("verify");
+            let _pipeline = EnvVarGuard::set("SOAC_OPT_RUNTIME_PIPELINE", "typed-v3");
+
+            let module_name = "runtime_typed_v3_direct_call_test";
+            let module_name_gen = ModuleNameGen::new(0);
+            let mut callee_function = test_function_in_module(&module_name_gen, "callee");
+            callee_function.params.params.push(Param {
+                name: "x".into(),
+                kind: ParamKind::Any,
+                has_default: false,
+            });
+            callee_function = with_single_test_block(
+                callee_function,
+                vec![],
+                ret_term(name_expr(test_local_name("x", 0))),
+            );
+            set_stack_slots(&mut callee_function, &["x"]);
+
+            let mut caller_function = test_function_in_module(&module_name_gen, "caller");
+            caller_function.params.params.extend([
+                Param {
+                    name: "fn".into(),
+                    kind: ParamKind::Any,
+                    has_default: false,
+                },
+                Param {
+                    name: "x".into(),
+                    kind: ParamKind::Any,
+                    has_default: false,
+                },
+            ]);
+            let caller_block_label = caller_function.name_gen.next_block_name();
+            let call_instr_id = InstrId::new(caller_block_label, 1);
+            caller_function = with_test_blocks(
+                caller_function,
+                vec![CodegenBlock {
+                    label: caller_block_label,
+                    body: vec![assign_stmt(
+                        test_local_name("y", 2),
+                        with_instr_id(
+                            op_expr(Call::new(
+                                name_expr(test_local_name("fn", 0)),
+                                vec![CallArgPositional::Positional(name_expr(test_local_name(
+                                    "x", 1,
+                                )))],
+                                Vec::<CallArgKeyword<InstrCodegen>>::new(),
+                            )),
+                            call_instr_id,
+                        ),
+                    )],
+                    term: ret_term(name_expr(test_local_name("y", 2))),
+                    params: vec![],
+                    exc_edge: None,
+                }],
+            );
+            set_stack_slots(&mut caller_function, &["fn", "x", "y"]);
+
+            let caller_id = caller_function.function_id;
+            let callee_id = callee_function.function_id;
+            write_test_counter_dump(
+                soac_work_dir.join("profile.bin").as_path(),
+                &CounterDumpRecord {
+                    source_hash: 0,
+                    module_name: module_name.to_string(),
+                    package_name: None,
+                    rows: vec![
+                        CounterDumpRow {
+                            counter_id: 0,
+                            scope: "this".to_string(),
+                            kind: "call_hot_targets".to_string(),
+                            site_kind: "runtime".to_string(),
+                            function_id: Some(caller_id),
+                            current_function_id: Some(caller_id),
+                            instr_id: Some(call_instr_id),
+                            function_qualname: Some(caller_function.names.qualname.clone()),
+                            block_label: None,
+                            value: 1,
+                            branch_values: Vec::new(),
+                            observed_value: Some(callee_id.to_packed_runtime_u64()),
+                            max_overcount: Some(0),
+                        },
+                        CounterDumpRow {
+                            counter_id: 1,
+                            scope: "this".to_string(),
+                            kind: "function_seen".to_string(),
+                            site_kind: "runtime".to_string(),
+                            function_id: Some(callee_id),
+                            current_function_id: Some(callee_id),
+                            instr_id: None,
+                            function_qualname: Some(callee_function.names.qualname.clone()),
+                            block_label: None,
+                            value: 1,
+                            branch_values: Vec::new(),
+                            observed_value: None,
+                            max_overcount: Some(0),
+                        },
+                    ],
+                    module_keys: Vec::new(),
+                    type_keys: Vec::new(),
+                    type_table: Vec::new(),
+                },
+            );
+
+            let mut module = test_module(module_name_gen, vec![callee_function, caller_function]);
+            instrument_bb_module_with_call_target_counters(&mut module);
+            let shared_state =
+                crate::module_type::build_shared_state_for_testing(py, module, module_name, "")
+                    .expect("shared state should build");
+
+            let profile = SpecializationProfile::from_runtime_state_with_session(
+                Some(shared_state.as_ref()),
+                None,
+            )
+            .expect("typed-v3 runtime should plan direct calls from raw profile evidence");
+            assert!(
+                profile.optimized_module.is_none(),
+                "typed-v3 runtime should not require an optimized BlockPy artifact"
+            );
+            assert!(
+                profile.counter_dump_path.is_none(),
+                "typed-v3 direct-call planning should not enable legacy profile evidence fallback"
+            );
+            let direct_calls = profile
+                .opt_v3_emitted_direct_calls
+                .get(&caller_id)
+                .and_then(|calls| calls.get(&call_instr_id))
+                .expect("typed-v3 runtime should retain the profiled direct-call candidate");
+            assert_eq!(direct_calls[0].target, callee_id);
+            assert_eq!(
+                direct_calls[0].body.kind,
+                CallBodyKind::Inline,
+                "the raw v3 planner can still record that inline won the body cost model"
+            );
+
+            let module_plan = build_typed_v3_jit_module_plan(&shared_state.lowered_module)
+                .expect("typed-v3 runtime should lower the cached pre-opt module to typed JIT");
+            let planned_caller = module_plan
+                .module
+                .callable_defs
+                .iter()
+                .find(|function| function.function_id == caller_id)
+                .expect("planned module should include caller");
+            let specialization_inputs =
+                FunctionSpecializationInputs::from_profile(&profile, planned_caller)
+                    .expect("typed-v3 direct-call candidates should become typed emissions");
+            assert_eq!(
+                specialization_inputs
+                    .opt_v3_call_emissions
+                    .target_function_ids(),
+                vec![callee_id],
+                "typed-v3 direct-call slice should emit a direct-call guard before inline lowering is ported"
             );
         });
     }
@@ -18768,6 +18938,7 @@ def f(x, y):
             module_name: Some(module_name),
             counter_dump_path: None,
             optimized_module: Some(Arc::new(module.clone())),
+            direct_call_emission_scope: DirectCallEmissionScope::DirectCallBodiesOnly,
             opt_v3_emitted_direct_calls: HashMap::from([(
                 caller_function.function_id,
                 HashMap::from([(call_instr_id, vec![v3_plan])]),
