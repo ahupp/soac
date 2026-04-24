@@ -9058,6 +9058,16 @@ def f(x):
             !runtime_jit_deopt_guard_operand_replay_safe(&direct_call_expr(function_id)),
             "guard miss deopt should reject operands that could repeat side effects"
         );
+        let typed_load = InstrTyped::Load(Load::<InstrTyped>::new(test_name("x")));
+        assert!(
+            runtime_jit_typed_deopt_guard_operand_replay_safe(&typed_load),
+            "plain typed local loads should be replay-safe guard operands"
+        );
+        let typed_tuple = InstrTyped::Tuple(Tuple::<InstrTyped>::new(Vec::new()));
+        assert!(
+            !runtime_jit_typed_deopt_guard_operand_replay_safe(&typed_tuple),
+            "typed guard miss deopt should reject operands that could repeat side effects"
+        );
     }
 
     #[test]

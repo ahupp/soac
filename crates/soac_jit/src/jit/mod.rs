@@ -4491,6 +4491,17 @@ fn runtime_jit_deopt_guard_operand_replay_safe(expr: &InstrCodegen) -> bool {
     )
 }
 
+fn runtime_jit_typed_deopt_guard_operand_replay_safe(expr: &InstrTyped) -> bool {
+    matches!(
+        expr,
+        InstrTyped::Load(load)
+            if matches!(
+                load.name.location,
+                NameLocation::Local(_) | NameLocation::Cell(_) | NameLocation::Constant(_)
+            )
+    )
+}
+
 fn typed_nested_guard_misses_can_resume_before_instr(expr: &InstrTyped) -> bool {
     let mut saw_replay_unsafe_effect = false;
     typed_nested_guard_scan_expr(expr, &mut saw_replay_unsafe_effect)
@@ -5546,7 +5557,7 @@ fn emit_codegen_indexed_global_load(
     let fallback_block = fb.create_block();
     fb.set_cold_block(fallback_block);
     let guard_miss_dispatch = prepare_optional_guard_miss_dispatch(
-        ctx.guard_miss_target_for_resume_point(guard_miss_resume_point, &[], fallback_block),
+        ctx.guard_miss_target_for_resume_point(guard_miss_resume_point, fallback_block),
         fallback_block,
         ctx.guard_miss_deopt_ref_for_instr_id(instr_id),
     );
@@ -6938,7 +6949,6 @@ impl JitEmitCtx<'_> {
     fn guard_miss_target_for_resume_point(
         &self,
         point: LocalEnvResumePoint,
-        pre_guard_operands: &[&InstrCodegen],
         fallback_block: ir::Block,
     ) -> Result<JitGuardMissTarget, RuntimeJitDeoptUnsupportedReason> {
         let function = self
@@ -6953,12 +6963,6 @@ impl JitEmitCtx<'_> {
         {
             return Err(reason);
         }
-        if pre_guard_operands
-            .iter()
-            .any(|expr| !runtime_jit_deopt_guard_operand_replay_safe(expr))
-        {
-            return Err(RuntimeJitDeoptUnsupportedReason::ReplayUnsafeGuardOperand);
-        }
         let _entry = self
             .deopt_resume_plan
             .entry(point)
@@ -6970,6 +6974,36 @@ impl JitEmitCtx<'_> {
             fallback_block,
             deopt_exit,
         })
+    }
+
+    fn guard_miss_target_for_codegen_resume_point(
+        &self,
+        point: LocalEnvResumePoint,
+        pre_guard_operands: &[&InstrCodegen],
+        fallback_block: ir::Block,
+    ) -> Result<JitGuardMissTarget, RuntimeJitDeoptUnsupportedReason> {
+        if pre_guard_operands
+            .iter()
+            .any(|expr| !runtime_jit_deopt_guard_operand_replay_safe(expr))
+        {
+            return Err(RuntimeJitDeoptUnsupportedReason::ReplayUnsafeGuardOperand);
+        }
+        self.guard_miss_target_for_resume_point(point, fallback_block)
+    }
+
+    fn guard_miss_target_for_typed_resume_point(
+        &self,
+        point: LocalEnvResumePoint,
+        pre_guard_operands: &[&InstrTyped],
+        fallback_block: ir::Block,
+    ) -> Result<JitGuardMissTarget, RuntimeJitDeoptUnsupportedReason> {
+        if pre_guard_operands
+            .iter()
+            .any(|expr| !runtime_jit_typed_deopt_guard_operand_replay_safe(expr))
+        {
+            return Err(RuntimeJitDeoptUnsupportedReason::ReplayUnsafeGuardOperand);
+        }
+        self.guard_miss_target_for_resume_point(point, fallback_block)
     }
 
     fn guard_miss_deopt_ref_for_instr_id(&self, instr_id: InstrId) -> Option<ir::FuncRef> {
@@ -8951,7 +8985,7 @@ impl<'a, 'b, 'mc, 'c, 'd, Env: JitCodegenEnv> intrinsics::OperationEmitState<'b,
                     key: InstrKey::new(self.ctx.function_id, instr_id),
                 });
         prepare_optional_guard_miss_dispatch(
-            self.ctx.guard_miss_target_for_resume_point(
+            self.ctx.guard_miss_target_for_codegen_resume_point(
                 guard_miss_resume_point,
                 pre_guard_operands,
                 fallback_block,
@@ -9103,25 +9137,12 @@ impl<'a, 'b, 'mc, 'c, 'd, Env: JitCodegenEnv> intrinsics::OperationEmitState<'b,
                 .unwrap_or(LocalEnvResumePoint::BeforeInstr {
                     key: InstrKey::new(self.ctx.function_id, instr_id),
                 });
-        let legacy_operands = pre_guard_operands
-            .iter()
-            .map(|operand| try_lower_typed_instr_to_codegen_legacy((*operand).clone()))
-            .collect::<Result<Vec<_>, _>>();
-        let guard_miss_target = legacy_operands
-            .as_ref()
-            .map(|legacy_operands| {
-                let legacy_operand_refs = legacy_operands.iter().collect::<Vec<_>>();
-                self.ctx.guard_miss_target_for_resume_point(
-                    guard_miss_resume_point,
-                    &legacy_operand_refs,
-                    fallback_block,
-                )
-            })
-            .unwrap_or(Err(
-                RuntimeJitDeoptUnsupportedReason::ReplayUnsafeGuardOperand,
-            ));
         prepare_optional_guard_miss_dispatch(
-            guard_miss_target,
+            self.ctx.guard_miss_target_for_typed_resume_point(
+                guard_miss_resume_point,
+                pre_guard_operands,
+                fallback_block,
+            ),
             fallback_block,
             self.ctx.guard_miss_deopt_ref_for_instr_id(instr_id),
         )
@@ -11896,6 +11917,18 @@ fn codegen_expr_const_i64(
 ) -> Option<i64> {
     match expr {
         InstrCodegen::Load(op) => op.name.location.as_constant().and_then(|index| {
+            module_constants.constant_i64_value(ModuleConstantId(index as usize))
+        }),
+        _ => None,
+    }
+}
+
+fn typed_expr_const_i64(
+    expr: &InstrTyped,
+    module_constants: &ModuleCodegenConstants,
+) -> Option<i64> {
+    match expr {
+        InstrTyped::Load(op) => op.name.location.as_constant().and_then(|index| {
             module_constants.constant_i64_value(ModuleConstantId(index as usize))
         }),
         _ => None,
@@ -15094,14 +15127,6 @@ fn prepare_typed_guard_miss_dispatch_for_instr(
     pre_guard_operands: &[&InstrTyped],
     fallback_block: ir::Block,
 ) -> JitGuardMissDispatch {
-    let legacy_operands = pre_guard_operands
-        .iter()
-        .map(|operand| try_lower_typed_instr_to_codegen_legacy((*operand).clone()))
-        .collect::<Result<Vec<_>, _>>();
-    let Ok(legacy_operands) = legacy_operands else {
-        return JitGuardMissDispatch::FallbackBlock(fallback_block);
-    };
-    let legacy_operand_refs = legacy_operands.iter().collect::<Vec<_>>();
     let guard_miss_resume_point =
         emit_ctx
             .guard_miss_resume_point
@@ -15109,9 +15134,9 @@ fn prepare_typed_guard_miss_dispatch_for_instr(
                 key: InstrKey::new(emit_ctx.function_id, instr_id),
             });
     prepare_optional_guard_miss_dispatch(
-        emit_ctx.guard_miss_target_for_resume_point(
+        emit_ctx.guard_miss_target_for_typed_resume_point(
             guard_miss_resume_point,
-            &legacy_operand_refs,
+            pre_guard_operands,
             fallback_block,
         ),
         fallback_block,
@@ -16709,7 +16734,7 @@ fn emit_codegen_simple_call_with_local_env(
             let method_guard_miss_dispatch = method_guard_miss_resume_point
                 .map(|guard_miss_resume_point| {
                     prepare_optional_guard_miss_dispatch(
-                        emit_ctx.guard_miss_target_for_resume_point(
+                        emit_ctx.guard_miss_target_for_codegen_resume_point(
                             guard_miss_resume_point,
                             &[getattr.value.as_ref()],
                             generic_block,
@@ -16926,7 +16951,7 @@ fn emit_codegen_simple_call_with_local_env(
                             key: InstrKey::new(emit_ctx.function_id, site_instr_id),
                         });
                 prepare_optional_guard_miss_dispatch(
-                    emit_ctx.guard_miss_target_for_resume_point(
+                    emit_ctx.guard_miss_target_for_codegen_resume_point(
                         guard_miss_resume_point,
                         &[call.func.as_ref()],
                         generic_block,
@@ -21124,17 +21149,29 @@ fn emit_typed_codegen_i64_index_result_with_local_env(
     func_imports: &mut FuncBuildImports<'_>,
     pyobject_to_i64_ref: ir::FuncRef,
 ) -> Result<EmitResult, String> {
-    if let Ok(legacy_expr) = try_lower_typed_instr_to_codegen_legacy(expr.clone()) {
-        let index_i64 = emit_branch_index_i64(
+    if let Some(const_value) = typed_expr_const_i64(expr, emit_ctx.module_constants) {
+        let value = fb.ins().iconst(emit_ctx.consts.i64_ty, const_value);
+        return Ok(EmitResult::i64(value, IntFacts::i64_known(const_value)));
+    }
+
+    if let InstrTyped::CalleeFunctionId(op) = expr {
+        let (callable, callable_is_borrowed) = emit_typed_pyobject_input_with_local_env(
             fb,
-            &legacy_expr,
+            op.value.as_ref(),
             local_env,
             emit_ctx,
             codegen_env,
             func_imports,
-            pyobject_to_i64_ref,
-        );
-        return Ok(EmitResult::i64(index_i64, IntFacts::i64_unknown()));
+            "typed callee_function_id",
+        )?;
+        let callee_id = emit_callee_function_id_checked(fb, callable, emit_ctx, codegen_env);
+        if !callable_is_borrowed {
+            fb.ins().call(
+                emit_ctx.decref_ref,
+                &[emit_ctx.consts.thread_state_value, callable],
+            );
+        }
+        return Ok(EmitResult::i64(callee_id, IntFacts::i64_unknown()));
     }
 
     let index_value = emit_typed_codegen_expr_value_with_local_env(
