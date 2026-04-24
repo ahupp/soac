@@ -640,7 +640,7 @@ impl ModuleConstantCollector {
     fn collect_typed_expr(&mut self, expr: &InstrTyped) {
         match expr {
             InstrTyped::IncrementCounter(_) => {}
-            InstrTyped::LegacyCalleeFunctionId(op) => {
+            InstrTyped::CalleeFunctionId(op) => {
                 self.collect_typed_expr(op.value.as_ref());
             }
             InstrTyped::DirectCallGuardTest(op) => {
@@ -667,34 +667,13 @@ impl ModuleConstantCollector {
                     self.collect_typed_expr(keyword.expr());
                 }
             }
-            InstrTyped::LegacyCall(call) => {
-                if let Some(const_bytes) =
-                    self.typed_string_constant_bytes_for_specialized_codegen(expr)
-                {
-                    self.constants.intern_unicode_bytes(const_bytes.as_slice());
-                }
-                if let Some(delete_name_bytes) = self.deleted_name_arg_bytes_typed_legacy(call) {
-                    self.constants
-                        .intern_unicode_bytes(delete_name_bytes.as_slice());
-                }
-                self.collect_typed_expr(call.func.as_ref());
-                for arg in &call.args {
-                    self.collect_typed_expr(arg.expr());
-                }
-                for keyword in &call.keywords {
-                    if let CallArgKeyword::Named { arg, .. } = keyword {
-                        self.constants.intern_unicode_bytes(arg.as_str().as_bytes());
-                    }
-                    self.collect_typed_expr(keyword.expr());
-                }
-            }
             InstrTyped::GuardedCallableCallTyped(call) => {
                 call.visit_children(self);
             }
             InstrTyped::GuardedMethodCallTyped(call) => {
                 call.visit_children(self);
             }
-            InstrTyped::LegacyCallDirect(call) => {
+            InstrTyped::CallDirect(call) => {
                 self.collect_typed_expr(call.callable.as_ref());
                 for arg in &call.args {
                     self.collect_typed_expr(arg.expr());
@@ -721,22 +700,6 @@ impl ModuleConstantCollector {
                 op.visit_children(self);
             }
             InstrTyped::SetAttrTyped(op) => {
-                if let Some(attr_bytes) =
-                    self.typed_string_constant_bytes_for_specialized_codegen(op.attr.as_ref())
-                {
-                    self.constants.intern_unicode_bytes(attr_bytes.as_slice());
-                }
-                op.visit_children(self);
-            }
-            InstrTyped::LegacyGetAttr(op) => {
-                if let Some(attr_bytes) =
-                    self.typed_string_constant_bytes_for_specialized_codegen(op.attr.as_ref())
-                {
-                    self.constants.intern_unicode_bytes(attr_bytes.as_slice());
-                }
-                op.visit_children(self);
-            }
-            InstrTyped::LegacySetAttr(op) => {
                 if let Some(attr_bytes) =
                     self.typed_string_constant_bytes_for_specialized_codegen(op.attr.as_ref())
                 {
@@ -795,17 +758,6 @@ impl ModuleConstantCollector {
         self.string_constant_bytes_for_specialized_codegen(call.args[0].expr())
     }
 
-    fn deleted_name_arg_bytes_typed_legacy(
-        &self,
-        call: &blockpy_intrinsics::Call<InstrTyped>,
-    ) -> Option<Vec<u8>> {
-        match helper_name_for_typed_expr(call.func.as_ref(), &self.constants) {
-            Some("raise_deleted_name") if call.args.len() == 1 => {}
-            _ => return None,
-        }
-        self.typed_string_constant_bytes_for_specialized_codegen(call.args[0].expr())
-    }
-
     fn deleted_name_arg_bytes_typed_call(&self, call: &TypedCall<InstrTyped>) -> Option<Vec<u8>> {
         match helper_name_for_typed_expr(call.func.as_ref(), &self.constants) {
             Some("raise_deleted_name") if call.args.len() == 1 => {}
@@ -848,15 +800,6 @@ impl ModuleConstantCollector {
                     .map(ToOwned::to_owned)
             }),
             InstrTyped::CallTyped(call) => {
-                if helper_name_for_typed_expr(call.func.as_ref(), &self.constants) != Some("str")
-                    || call.args.len() != 1
-                    || !call.keywords.is_empty()
-                {
-                    return None;
-                }
-                self.typed_string_constant_bytes_for_specialized_codegen(call.args[0].expr())
-            }
-            InstrTyped::LegacyCall(call) => {
                 if helper_name_for_typed_expr(call.func.as_ref(), &self.constants) != Some("str")
                     || call.args.len() != 1
                     || !call.keywords.is_empty()

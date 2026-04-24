@@ -4534,7 +4534,7 @@ fn typed_nested_guard_scan_expr(expr: &InstrTyped, saw_replay_unsafe_effect: &mu
             .values
             .iter()
             .all(|value| typed_nested_guard_scan_expr(value, saw_replay_unsafe_effect)),
-        InstrTyped::LegacyCalleeFunctionId(op) => {
+        InstrTyped::CalleeFunctionId(op) => {
             typed_nested_guard_scan_expr(op.value.as_ref(), saw_replay_unsafe_effect)
         }
         InstrTyped::CallTyped(op) => {
@@ -4646,38 +4646,7 @@ fn typed_nested_guard_scan_expr(expr: &InstrTyped, saw_replay_unsafe_effect: &mu
                     *saw_replay_unsafe_effect,
                 )
         }
-        InstrTyped::LegacyCall(op) => {
-            if op.args.is_empty()
-                && op.keywords.is_empty()
-                && let InstrTyped::GetAttrTyped(getattr) = op.func.as_ref()
-            {
-                // Direct-method guard code evaluates only the receiver before the guard.
-                // Keep this no-arg only until argument guard points carry their own
-                // precise resume state.
-                return typed_nested_guard_scan_expr(
-                    getattr.value.as_ref(),
-                    saw_replay_unsafe_effect,
-                ) && nested_guard_candidate_seen_before_replay_unsafe_effect(
-                    true,
-                    *saw_replay_unsafe_effect,
-                ) && mark_replay_unsafe_effect(saw_replay_unsafe_effect);
-            }
-            typed_nested_guard_scan_expr(op.func.as_ref(), saw_replay_unsafe_effect)
-                && typed_nested_guard_scan_positional_args(
-                    op.args.as_slice(),
-                    saw_replay_unsafe_effect,
-                )
-                && typed_nested_guard_scan_keyword_args(
-                    op.keywords.as_slice(),
-                    saw_replay_unsafe_effect,
-                )
-                && nested_guard_candidate_seen_before_replay_unsafe_effect(
-                    true,
-                    *saw_replay_unsafe_effect,
-                )
-                && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
-        }
-        InstrTyped::LegacyCallDirect(op) => {
+        InstrTyped::CallDirect(op) => {
             typed_nested_guard_scan_expr(op.callable.as_ref(), saw_replay_unsafe_effect)
                 && typed_nested_guard_scan_positional_args(
                     op.args.as_slice(),
@@ -4703,25 +4672,6 @@ fn typed_nested_guard_scan_expr(expr: &InstrTyped, saw_replay_unsafe_effect: &mu
                 && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
         }
         InstrTyped::SetAttrTyped(op) => {
-            typed_nested_guard_scan_expr(op.value.as_ref(), saw_replay_unsafe_effect)
-                && typed_nested_guard_scan_expr(op.attr.as_ref(), saw_replay_unsafe_effect)
-                && typed_nested_guard_scan_expr(op.replacement.as_ref(), saw_replay_unsafe_effect)
-                && nested_guard_candidate_seen_before_replay_unsafe_effect(
-                    true,
-                    *saw_replay_unsafe_effect,
-                )
-                && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
-        }
-        InstrTyped::LegacyGetAttr(op) => {
-            typed_nested_guard_scan_expr(op.value.as_ref(), saw_replay_unsafe_effect)
-                && typed_nested_guard_scan_expr(op.attr.as_ref(), saw_replay_unsafe_effect)
-                && nested_guard_candidate_seen_before_replay_unsafe_effect(
-                    true,
-                    *saw_replay_unsafe_effect,
-                )
-                && mark_replay_unsafe_effect(saw_replay_unsafe_effect)
-        }
-        InstrTyped::LegacySetAttr(op) => {
             typed_nested_guard_scan_expr(op.value.as_ref(), saw_replay_unsafe_effect)
                 && typed_nested_guard_scan_expr(op.attr.as_ref(), saw_replay_unsafe_effect)
                 && typed_nested_guard_scan_expr(op.replacement.as_ref(), saw_replay_unsafe_effect)
@@ -11857,7 +11807,7 @@ fn collect_typed_call_direct_targets(
 
     impl Visit<InstrTyped> for CallDirectTargetCollector<'_> {
         fn visit_instr(&mut self, expr: &InstrTyped) {
-            if let InstrTyped::LegacyCallDirect(call) = expr {
+            if let InstrTyped::CallDirect(call) = expr {
                 self.out.insert(call.function_id);
             }
             if let InstrTyped::GuardedCallableCallTyped(call) = expr {
@@ -18913,7 +18863,6 @@ fn emit_typed_generic_positional_call_result_with_local_env(
 fn typed_getattr_parts(expr: &InstrTyped) -> Option<(&InstrTyped, &InstrTyped)> {
     match expr {
         InstrTyped::GetAttrTyped(getattr) => Some((getattr.value.as_ref(), getattr.attr.as_ref())),
-        InstrTyped::LegacyGetAttr(getattr) => Some((getattr.value.as_ref(), getattr.attr.as_ref())),
         _ => None,
     }
 }
@@ -26383,19 +26332,16 @@ fn instr_typed_variant_name(expr: &InstrTyped) -> &'static str {
         InstrTyped::BinOp(_) => "BinOp",
         InstrTyped::Tuple(_) => "Tuple",
         InstrTyped::UnaryOp(_) => "UnaryOp",
-        InstrTyped::LegacyCalleeFunctionId(_) => "LegacyCalleeFunctionId",
+        InstrTyped::CalleeFunctionId(_) => "CalleeFunctionId",
         InstrTyped::CallTyped(_) => "CallTyped",
         InstrTyped::GuardedCallableCallTyped(_) => "GuardedCallableCallTyped",
         InstrTyped::GuardedMethodCallTyped(_) => "GuardedMethodCallTyped",
         InstrTyped::DirectCallableCallTyped(_) => "DirectCallableCallTyped",
         InstrTyped::DirectMethodCallTyped(_) => "DirectMethodCallTyped",
         InstrTyped::DirectCallGuardTest(_) => "DirectCallGuardTest",
-        InstrTyped::LegacyCall(_) => "LegacyCall",
-        InstrTyped::LegacyCallDirect(_) => "LegacyCallDirect",
+        InstrTyped::CallDirect(_) => "CallDirect",
         InstrTyped::GetAttrTyped(_) => "GetAttrTyped",
         InstrTyped::SetAttrTyped(_) => "SetAttrTyped",
-        InstrTyped::LegacyGetAttr(_) => "LegacyGetAttr",
-        InstrTyped::LegacySetAttr(_) => "LegacySetAttr",
         InstrTyped::GetItem(_) => "GetItem",
         InstrTyped::SetItem(_) => "SetItem",
         InstrTyped::DelItem(_) => "DelItem",

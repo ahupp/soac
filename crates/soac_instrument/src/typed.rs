@@ -140,7 +140,7 @@ fn define_module_call_target_counters(module: &mut BlockPyModule<TypedCodegenMod
                 );
             }
             match expr {
-                InstrTyped::GetAttrTyped(_) | InstrTyped::LegacyGetAttr(_) => {
+                InstrTyped::GetAttrTyped(_) => {
                     let instr_id = expr.semantic_instr_id();
                     define_specialization_counter_candidate(
                         self.counters,
@@ -148,7 +148,7 @@ fn define_module_call_target_counters(module: &mut BlockPyModule<TypedCodegenMod
                         SpecializationCounterCandidate::FieldAccess { instr_id },
                     );
                 }
-                InstrTyped::SetAttrTyped(_) | InstrTyped::LegacySetAttr(_) => {
+                InstrTyped::SetAttrTyped(_) => {
                     let instr_id = expr.semantic_instr_id();
                     define_specialization_counter_candidate(
                         self.counters,
@@ -184,16 +184,6 @@ fn define_module_call_target_counters(module: &mut BlockPyModule<TypedCodegenMod
             }
             match expr {
                 InstrTyped::CallTyped(call)
-                    if is_profile_call_candidate(&call.args, &call.keywords) =>
-                {
-                    let instr_id = expr.semantic_instr_id();
-                    define_specialization_counter_candidate(
-                        self.counters,
-                        self.function_id,
-                        SpecializationCounterCandidate::Call { instr_id },
-                    );
-                }
-                InstrTyped::LegacyCall(call)
                     if is_profile_call_candidate(&call.args, &call.keywords) =>
                 {
                     let instr_id = expr.semantic_instr_id();
