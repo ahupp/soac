@@ -3560,7 +3560,13 @@ def build(values):
         predeclare_specialization_type_imports(jit_module, &specialization_profile)?;
         let specialization_inputs =
             FunctionSpecializationInputs::from_profile(&specialization_profile, planned_function)?;
-        predeclare_prepared_opt_v3_call_imports(jit_module, &specialization_inputs)?;
+        let mut direct_call_typed_function = planned_function.clone();
+        apply_profile_call_emissions_to_typed_function(
+            &mut direct_call_typed_function,
+            Some(&specialization_profile),
+        )?;
+        lower_typed_function_call_access_plan_instrs(&mut direct_call_typed_function);
+        predeclare_typed_direct_call_imports(jit_module, &direct_call_typed_function)?;
         let mut options = options;
         if options.specialization_inputs.is_none() {
             options.specialization_inputs = Some(specialization_inputs);
@@ -15011,7 +15017,6 @@ def f(x):
             &module_constants,
             BuildSpecializedFunctionOptions {
                 specialization_inputs: Some(FunctionSpecializationInputs {
-                    opt_v3_call_emissions: TypedCallEmissionPlans::default(),
                     opt_v3_exact_list_items_by_instr: HashMap::new(),
                     field_index_specializations: HashMap::new(),
                     field_index_specializations_by_instr: HashMap::new(),
@@ -15189,7 +15194,6 @@ def f(x):
             &module_constants,
             BuildSpecializedFunctionOptions {
                 specialization_inputs: Some(FunctionSpecializationInputs {
-                    opt_v3_call_emissions: TypedCallEmissionPlans::default(),
                     opt_v3_exact_list_items_by_instr: HashMap::new(),
                     field_index_specializations: HashMap::new(),
                     field_index_specializations_by_instr: HashMap::new(),
@@ -15324,7 +15328,6 @@ def f(x):
                 &module_constants,
                 BuildSpecializedFunctionOptions {
                     specialization_inputs: Some(FunctionSpecializationInputs {
-                        opt_v3_call_emissions: TypedCallEmissionPlans::default(),
                         opt_v3_exact_list_items_by_instr: HashMap::new(),
                         field_index_specializations: HashMap::new(),
                         field_index_specializations_by_instr: HashMap::new(),
@@ -15444,7 +15447,6 @@ def f(x):
                 &module_constants,
                 BuildSpecializedFunctionOptions {
                     specialization_inputs: Some(FunctionSpecializationInputs {
-                        opt_v3_call_emissions: TypedCallEmissionPlans::default(),
                         opt_v3_exact_list_items_by_instr: HashMap::new(),
                         field_index_specializations: HashMap::new(),
                         field_index_specializations_by_instr: HashMap::new(),
@@ -15558,7 +15560,6 @@ def f(x):
             &module_constants,
             BuildSpecializedFunctionOptions {
                 specialization_inputs: Some(FunctionSpecializationInputs {
-                    opt_v3_call_emissions: TypedCallEmissionPlans::default(),
                     opt_v3_exact_list_items_by_instr: HashMap::new(),
                     field_index_specializations: HashMap::new(),
                     field_index_specializations_by_instr: HashMap::new(),
@@ -16376,7 +16377,6 @@ def f(x):
     ) -> FunctionSpecializationInputs {
         let source = first_indexed_global_access_source(function, access, name);
         FunctionSpecializationInputs {
-            opt_v3_call_emissions: TypedCallEmissionPlans::default(),
             opt_v3_exact_list_items_by_instr: HashMap::new(),
             field_index_specializations: HashMap::new(),
             field_index_specializations_by_instr: HashMap::new(),
@@ -16410,7 +16410,6 @@ def f(x):
             &module_constants,
             BuildSpecializedFunctionOptions {
                 specialization_inputs: Some(FunctionSpecializationInputs {
-                    opt_v3_call_emissions: TypedCallEmissionPlans::default(),
                     opt_v3_exact_list_items_by_instr: HashMap::new(),
                     field_index_specializations: HashMap::new(),
                     field_index_specializations_by_instr: HashMap::new(),
@@ -16501,7 +16500,6 @@ def f(x):
             &module_constants,
             BuildSpecializedFunctionOptions {
                 specialization_inputs: Some(FunctionSpecializationInputs {
-                    opt_v3_call_emissions: TypedCallEmissionPlans::default(),
                     opt_v3_exact_list_items_by_instr: HashMap::new(),
                     field_index_specializations: HashMap::new(),
                     field_index_specializations_by_instr: HashMap::new(),
@@ -17979,16 +17977,6 @@ def f(x, y):
                 .iter()
                 .find(|function| function.function_id == caller_id)
                 .expect("planned module should include caller");
-            let specialization_inputs =
-                FunctionSpecializationInputs::from_profile(&profile, planned_caller)
-                    .expect("typed-v3 direct-call candidates should become typed emissions");
-            assert_eq!(
-                specialization_inputs
-                    .opt_v3_call_emissions
-                    .target_function_ids(),
-                vec![callee_id],
-                "typed-v3 direct-call planning should first lower the call site to a typed direct-call candidate"
-            );
             assert_eq!(
                 profile
                     .typed_inline_direct_calls(caller_id)
@@ -18121,10 +18109,6 @@ def f(x, y):
             let specialization_inputs =
                 FunctionSpecializationInputs::from_profile(&profile, planned_function)
                     .expect("typed-v3 access plans should become specialization inputs");
-            assert!(
-                specialization_inputs.opt_v3_call_emissions.is_empty(),
-                "access-only evidence should not synthesize direct-call emissions"
-            );
             assert_eq!(
                 specialization_inputs
                     .opt_v3_indexed_globals_by_instr
@@ -19673,13 +19657,6 @@ class Point:
                 .flat_map(|block| &block.body)
                 .any(|instr| matches!(instr, InstrTyped::LegacyStore(store) if matches!(store.value.as_ref(), InstrTyped::CallTyped(_)))),
             "loaded optimized module fixture intentionally still has the original generic call"
-        );
-        let specialization_inputs =
-            FunctionSpecializationInputs::from_profile(&profile, planned_caller)
-                .expect("planned profile inputs should filter consumed v3 direct calls");
-        assert!(
-            specialization_inputs.opt_v3_call_emissions.is_empty(),
-            "inline direct-call body plans are consumed by the offline optimized module, not typed JIT lowering"
         );
     }
 

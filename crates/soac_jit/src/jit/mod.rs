@@ -87,7 +87,7 @@ use soac_opt::passes::{
     LocalEnvResumePoint, LocalEnvResumeStatePrecision, LocalEnvResumeValueSource, LocalRefState,
     PyExactType, PyObjFacts, RefcountActionKind, RefcountReleaseReason, RefcountSite,
     RuntimeHelperId, TypedAttrAccessPlan, TypedAttrOwnerRef, TypedCall, TypedCallAccessPlan,
-    TypedCallEmissionPlan, TypedCallEmissionPlans, TypedCodegenModuleShape, TypedDirectCallArgPlan,
+    TypedCallEmissionPlans, TypedCodegenModuleShape, TypedDirectCallArgPlan,
     TypedDirectCallArgSource, TypedDirectCallGuardTest, TypedDirectCallGuardTestKind,
     TypedDirectCallableCall, TypedDirectCallableCallGuard, TypedDirectConstructorCallGuard,
     TypedDirectFunctionCallGuard, TypedDirectMethodCall, TypedDirectMethodCallGuard,
@@ -1369,58 +1369,142 @@ fn predeclare_specialization_type_imports(
     Ok(())
 }
 
-fn predeclare_prepared_opt_v3_call_imports(
+fn predeclare_typed_direct_call_imports(
     jit_module: &mut JITModule,
-    specialization_inputs: &FunctionSpecializationInputs,
+    function: &BlockPyFunction<TypedCodegenModuleShape>,
 ) -> Result<(), String> {
-    for plan in specialization_inputs
-        .opt_v3_call_emissions
-        .by_source
-        .values()
-    {
-        match plan {
-            TypedCallEmissionPlan::Callable {
-                constructor_guards, ..
-            } => {
-                for guard in constructor_guards {
-                    let Some(owner_type_ref) =
-                        reloc_type_ref_from_typed_attr_owner_ref(&guard.owner_type_ref)
-                    else {
-                        continue;
-                    };
-                    predeclare_reloc_type_ref_import(jit_module, &owner_type_ref)?;
-                    predeclare_reloc_callable_ref_import(
-                        jit_module,
-                        &RelocCallableRef::OwnerAttr {
-                            owner_type_ref,
-                            attr_name: "__init__".to_string(),
-                        },
-                    )?;
-                }
-            }
-            TypedCallEmissionPlan::Method {
-                method_name,
-                method_guards,
-            } => {
-                for guard in method_guards {
-                    let Some(owner_type_ref) =
-                        reloc_type_ref_from_typed_attr_owner_ref(&guard.owner_type_ref)
-                    else {
-                        continue;
-                    };
-                    predeclare_reloc_type_ref_import(jit_module, &owner_type_ref)?;
-                    predeclare_reloc_callable_ref_import(
-                        jit_module,
-                        &RelocCallableRef::OwnerAttr {
-                            owner_type_ref,
-                            attr_name: method_name.clone(),
-                        },
-                    )?;
-                }
-            }
+    struct ImportCollector<'a> {
+        jit_module: &'a mut JITModule,
+        error: Option<String>,
+    }
+
+    impl ImportCollector<'_> {
+        fn predeclare_constructor_guard(
+            &mut self,
+            guard: &TypedDirectConstructorCallGuard,
+        ) -> Result<(), String> {
+            let Some(owner_type_ref) =
+                reloc_type_ref_from_typed_attr_owner_ref(&guard.owner_type_ref)
+            else {
+                return Ok(());
+            };
+            predeclare_reloc_type_ref_import(self.jit_module, &owner_type_ref)?;
+            predeclare_reloc_callable_ref_import(
+                self.jit_module,
+                &RelocCallableRef::OwnerAttr {
+                    owner_type_ref,
+                    attr_name: "__init__".to_string(),
+                },
+            )
+        }
+
+        fn predeclare_method_guard(
+            &mut self,
+            method_name: &str,
+            guard: &TypedDirectMethodCallGuard,
+        ) -> Result<(), String> {
+            let Some(owner_type_ref) =
+                reloc_type_ref_from_typed_attr_owner_ref(&guard.owner_type_ref)
+            else {
+                return Ok(());
+            };
+            predeclare_reloc_type_ref_import(self.jit_module, &owner_type_ref)?;
+            predeclare_reloc_callable_ref_import(
+                self.jit_module,
+                &RelocCallableRef::OwnerAttr {
+                    owner_type_ref,
+                    attr_name: method_name.to_string(),
+                },
+            )
         }
     }
+
+    impl Visit<InstrTyped> for ImportCollector<'_> {
+        fn visit_instr(&mut self, expr: &InstrTyped) {
+            if self.error.is_some() {
+                return;
+            }
+            let result = match expr {
+                InstrTyped::GuardedCallableCallTyped(call) => {
+                    for guard in &call.constructor_guards {
+                        if let Err(error) = self.predeclare_constructor_guard(guard) {
+                            self.error = Some(error);
+                            return;
+                        }
+                    }
+                    Ok(())
+                }
+                InstrTyped::GuardedMethodCallTyped(call) => {
+                    for guard in &call.method_guards {
+                        if let Err(error) =
+                            self.predeclare_method_guard(call.method_name.as_str(), guard)
+                        {
+                            self.error = Some(error);
+                            return;
+                        }
+                    }
+                    Ok(())
+                }
+                InstrTyped::DirectCallableCallTyped(call) => match &call.guard {
+                    TypedDirectCallableCallGuard::Function(_) => Ok(()),
+                    TypedDirectCallableCallGuard::Constructor(guard) => {
+                        self.predeclare_constructor_guard(guard)
+                    }
+                },
+                InstrTyped::DirectMethodCallTyped(call) => {
+                    self.predeclare_method_guard(call.method_name.as_str(), &call.guard)
+                }
+                _ => Ok(()),
+            };
+            if let Err(error) = result {
+                self.error = Some(error);
+                return;
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    let mut collector = ImportCollector {
+        jit_module,
+        error: None,
+    };
+    collector.visit_fn(function);
+    if let Some(error) = collector.error {
+        Err(error)
+    } else {
+        Ok(())
+    }
+}
+
+fn typed_call_emission_plans_for_profile_function(
+    profile: &SpecializationProfile<'_>,
+    function_id: RuntimeFunctionId,
+) -> Result<TypedCallEmissionPlans, String> {
+    let opt_v3_direct_calls_by_instr = profile.typed_call_emission_direct_calls(function_id);
+    typed_call_emission_plans_from_v3(&opt_v3_direct_calls_by_instr)
+}
+
+fn apply_profile_call_emissions_to_typed_function(
+    function: &mut BlockPyFunction<TypedCodegenModuleShape>,
+    profile: Option<&SpecializationProfile<'_>>,
+) -> Result<(), String> {
+    let Some(profile) = profile else {
+        return Ok(());
+    };
+    let call_emissions =
+        typed_call_emission_plans_for_profile_function(profile, function.function_id)?;
+    lower_typed_function_call_emission_plans(function, &call_emissions)?;
     Ok(())
+}
+
+fn typed_function_with_profile_call_emissions(
+    function: &BlockPyFunction<CodegenModuleShape>,
+    profile: Option<&SpecializationProfile<'_>>,
+) -> Result<BlockPyFunction<TypedCodegenModuleShape>, String> {
+    let mut typed_function = lower_codegen_function_to_typed(function.clone());
+    apply_profile_call_emissions_to_typed_function(&mut typed_function, profile)?;
+    lower_typed_function_call_access_plan_instrs(&mut typed_function);
+    Ok(typed_function)
 }
 
 struct FuncBuildImports<'a> {
@@ -1545,6 +1629,7 @@ struct ReservedJitFunctionCompileInputs {
     top_value_counter_data_id: Option<DataId>,
     counted_refcount_helpers: CountedRefcountHelpers,
     specialization_inputs: FunctionSpecializationInputs,
+    direct_call_typed_function: BlockPyFunction<TypedCodegenModuleShape>,
     module_constant_binding_key: usize,
     symbol_scope: Option<String>,
 }
@@ -2744,7 +2829,11 @@ impl ProcessJitState {
                 &specialization_profile,
                 &batch_function.function,
             )?;
-            predeclare_prepared_opt_v3_call_imports(jit_module, &specialization_inputs)?;
+            let direct_call_typed_function = typed_function_with_profile_call_emissions(
+                &batch_function.function,
+                Some(&specialization_profile),
+            )?;
+            predeclare_typed_direct_call_imports(jit_module, &direct_call_typed_function)?;
             return Ok(ReservedJitFunctionCompileInputs {
                 module_constant_ptrs,
                 module_constant_owners: None,
@@ -2754,6 +2843,7 @@ impl ProcessJitState {
                 top_value_counter_data_id,
                 counted_refcount_helpers,
                 specialization_inputs,
+                direct_call_typed_function,
                 module_constant_binding_key: instance_key,
                 symbol_scope: Some(symbol_scope),
             });
@@ -2799,7 +2889,11 @@ impl ProcessJitState {
             &specialization_profile,
             &batch_function.function,
         )?;
-        predeclare_prepared_opt_v3_call_imports(jit_module, &specialization_inputs)?;
+        let direct_call_typed_function = typed_function_with_profile_call_emissions(
+            &batch_function.function,
+            Some(&specialization_profile),
+        )?;
+        predeclare_typed_direct_call_imports(jit_module, &direct_call_typed_function)?;
         Ok(ReservedJitFunctionCompileInputs {
             module_constant_ptrs,
             module_constant_owners: None,
@@ -2809,6 +2903,7 @@ impl ProcessJitState {
             top_value_counter_data_id,
             counted_refcount_helpers,
             specialization_inputs,
+            direct_call_typed_function,
             module_constant_binding_key: instance_key,
             symbol_scope: None,
         })
@@ -3092,6 +3187,9 @@ impl ProcessJitState {
             BuildSpecializedFunctionOptions {
                 counted_refcount_helpers: Some(reserved_inputs.counted_refcount_helpers),
                 specialization_inputs: Some(reserved_inputs.specialization_inputs.clone()),
+                call_emission_typed_function: Some(
+                    reserved_inputs.direct_call_typed_function.clone(),
+                ),
                 ..BuildSpecializedFunctionOptions::default()
             },
         )
@@ -11504,6 +11602,22 @@ fn collect_typed_call_direct_targets(
             if let InstrTyped::LegacyCallDirect(call) = expr {
                 self.out.insert(call.function_id);
             }
+            if let InstrTyped::GuardedCallableCallTyped(call) = expr {
+                self.out.extend(
+                    call.function_guards
+                        .iter()
+                        .map(|guard| guard.function_id)
+                        .chain(
+                            call.constructor_guards
+                                .iter()
+                                .map(|guard| guard.function_id),
+                        ),
+                );
+            }
+            if let InstrTyped::GuardedMethodCallTyped(call) = expr {
+                self.out
+                    .extend(call.method_guards.iter().map(|guard| guard.function_id));
+            }
             if let InstrTyped::DirectCallableCallTyped(call) = expr {
                 match &call.guard {
                     TypedDirectCallableCallGuard::Function(guard) => {
@@ -11709,7 +11823,6 @@ impl PlannedOptimizationInputs {
 
 #[derive(Clone, Debug)]
 struct FunctionSpecializationInputs {
-    opt_v3_call_emissions: TypedCallEmissionPlans,
     opt_v3_exact_list_items_by_instr: HashMap<InstrId, OptV3ExactListItemAccessPlan>,
     field_index_specializations: HashMap<String, Vec<FieldIndexSpecialization>>,
     field_index_specializations_by_instr: HashMap<InstrId, Vec<FieldIndexSpecialization>>,
@@ -12135,12 +12248,7 @@ impl FunctionSpecializationInputs {
             field_index_specializations_by_instr,
             opt_v3_indexed_fields_by_instr,
         ) = profile.field_index_specialization_maps(function.function_id)?;
-        let opt_v3_direct_calls_by_instr =
-            profile.typed_call_emission_direct_calls(function.function_id);
-        let opt_v3_call_emissions =
-            typed_call_emission_plans_from_v3(&opt_v3_direct_calls_by_instr)?;
         Ok(Self {
-            opt_v3_call_emissions,
             opt_v3_exact_list_items_by_instr: profile
                 .opt_v3_emitted_exact_list_items
                 .get(&function.function_id)
@@ -12245,16 +12353,6 @@ impl<'a> SpecializationProfile<'a> {
             .flat_map(|accesses_by_instr| accesses_by_instr.values())
             .flat_map(|accesses| accesses.iter())
             .collect()
-    }
-
-    fn v3_direct_function_call_targets(
-        &self,
-        function_id: RuntimeFunctionId,
-    ) -> HashMap<InstrId, Vec<RuntimeFunctionId>> {
-        self.opt_v3_emitted_direct_calls
-            .get(&function_id)
-            .map(opt_v3_direct_call_targets)
-            .unwrap_or_default()
     }
 
     fn codegen_opt_v3_direct_calls(
@@ -22859,12 +22957,9 @@ impl ProcessJitEngine {
             let function_id = batch_function.function.function_id;
             let mut direct_targets = collect_call_direct_targets(&batch_function.function);
             if let Some(reserved_inputs) = plan.function_compile_inputs.get(batch_function_index) {
-                direct_targets.extend(
-                    reserved_inputs
-                        .specialization_inputs
-                        .opt_v3_call_emissions
-                        .target_function_ids(),
-                );
+                direct_targets.extend(collect_typed_call_direct_targets(
+                    &reserved_inputs.direct_call_typed_function,
+                ));
             }
             direct_targets.retain(|target| function_ids_to_define.contains(target));
             dependencies.insert(function_id, direct_targets);
@@ -25256,13 +25351,10 @@ fn precompile_external_direct_call_target_functions(
     let current_module_id = module.module_name_gen.module_id();
     let mut target_ids = HashSet::new();
     for function in &module.callable_defs {
-        target_ids.extend(collect_typed_call_direct_targets(function));
-        for targets in profile
-            .v3_direct_function_call_targets(function.function_id)
-            .values()
-        {
-            target_ids.extend(targets.iter().copied());
-        }
+        let mut typed_function = function.clone();
+        apply_profile_call_emissions_to_typed_function(&mut typed_function, Some(profile))?;
+        lower_typed_function_call_access_plan_instrs(&mut typed_function);
+        target_ids.extend(collect_typed_call_direct_targets(&typed_function));
     }
     Ok(target_ids
         .into_iter()
@@ -25950,6 +26042,7 @@ struct BuildSpecializedFunctionOptions {
     module_constant_accesses: ModuleConstantAccessTable,
     counted_refcount_helpers: Option<CountedRefcountHelpers>,
     specialization_inputs: Option<FunctionSpecializationInputs>,
+    call_emission_typed_function: Option<BlockPyFunction<TypedCodegenModuleShape>>,
     external_direct_call_target_functions:
         HashMap<RuntimeFunctionId, BlockPyFunction<TypedCodegenModuleShape>>,
 }
@@ -26038,16 +26131,25 @@ fn validate_typed_function_preserves_codegen_cfg(
 
 fn prepare_specialized_typed_function(
     function: &BlockPyFunction<TypedCodegenModuleShape>,
+    call_emission_typed_function: Option<&BlockPyFunction<TypedCodegenModuleShape>>,
+    specialization_profile: Option<&SpecializationProfile<'_>>,
     value_facts: &FactStore,
     field_index_specializations: &HashMap<String, Vec<FieldIndexSpecialization>>,
     field_index_specializations_by_instr: &HashMap<InstrId, Vec<FieldIndexSpecialization>>,
     opt_v3_indexed_fields_by_instr: &HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>,
     specialize_field_stores: bool,
-    opt_v3_call_emissions: &TypedCallEmissionPlans,
 ) -> Result<PreparedSpecializedTypedFunction, String> {
-    let mut typed_function = function.clone();
+    let mut typed_function = call_emission_typed_function
+        .cloned()
+        .unwrap_or_else(|| function.clone());
     annotate_typed_function_value_facts(&mut typed_function, value_facts);
     validate_typed_function_value_facts(&typed_function)?;
+    if call_emission_typed_function.is_none() {
+        apply_profile_call_emissions_to_typed_function(
+            &mut typed_function,
+            specialization_profile,
+        )?;
+    }
 
     annotate_typed_attr_accesses(
         &mut typed_function,
@@ -26056,7 +26158,6 @@ fn prepare_specialized_typed_function(
         opt_v3_indexed_fields_by_instr,
         specialize_field_stores,
     )?;
-    lower_typed_function_call_emission_plans(&mut typed_function, opt_v3_call_emissions)?;
     lower_typed_function_call_access_plan_instrs(&mut typed_function);
     refresh_typed_function_value_facts(&mut typed_function);
     annotate_typed_function_result_demands(&mut typed_function);
@@ -26359,7 +26460,6 @@ fn build_cranelift_run_bb_specialized_function(
             FunctionSpecializationInputs::from_profile(profile, function)?
         }
     };
-    let opt_v3_call_emissions = specialization_inputs.opt_v3_call_emissions;
     let opt_v3_exact_list_items_by_instr = specialization_inputs.opt_v3_exact_list_items_by_instr;
     let field_index_specializations = specialization_inputs.field_index_specializations;
     let field_index_specializations_by_instr =
@@ -26376,8 +26476,18 @@ fn build_cranelift_run_bb_specialized_function(
     let none_constant_id = module_constants.require_runtime_name_constant_id("NONE");
     let empty_tuple_constant_id = module_constants.require_runtime_name_constant_id("EMPTY_TUPLE");
 
-    let mut direct_call_targets = collect_typed_call_direct_targets(function);
-    direct_call_targets.extend(opt_v3_call_emissions.target_function_ids());
+    let direct_edge_stats = DirectEdgeStats::default();
+    let PreparedSpecializedTypedFunction { typed_function } = prepare_specialized_typed_function(
+        function,
+        options.call_emission_typed_function.as_ref(),
+        specialization_profile,
+        value_facts,
+        &field_index_specializations,
+        &field_index_specializations_by_instr,
+        &opt_v3_indexed_fields_by_instr,
+        behavior_change_indexed_stores,
+    )?;
+    let direct_call_targets = collect_typed_call_direct_targets(&typed_function);
     let empty_direct_functions = HashMap::new();
     let direct_call_functions = predeclared_direct_functions.unwrap_or(&empty_direct_functions);
     let mut direct_call_target_functions = options.external_direct_call_target_functions.clone();
@@ -26404,16 +26514,6 @@ fn build_cranelift_run_bb_specialized_function(
             lower_codegen_function_to_typed(target_function),
         );
     }
-    let direct_edge_stats = DirectEdgeStats::default();
-    let PreparedSpecializedTypedFunction { typed_function } = prepare_specialized_typed_function(
-        function,
-        value_facts,
-        &field_index_specializations,
-        &field_index_specializations_by_instr,
-        &opt_v3_indexed_fields_by_instr,
-        behavior_change_indexed_stores,
-        &opt_v3_call_emissions,
-    )?;
     let ptr_ty = codegen_env.codegen_target_config().pointer_type();
     let i64_ty = ir::types::I64;
     let mut module_imports = ModuleFuncImports::new();
@@ -27456,12 +27556,17 @@ pub unsafe fn render_instr_typed_for_codegen_with_runtime_state(
         })?;
     let specialization_inputs =
         FunctionSpecializationInputs::from_profile(&specialization_profile, render_function)?;
-    let mut direct_call_targets = collect_typed_call_direct_targets(render_function);
-    direct_call_targets.extend(
-        specialization_inputs
-            .opt_v3_call_emissions
-            .target_function_ids(),
-    );
+    let PreparedSpecializedTypedFunction { typed_function } = prepare_specialized_typed_function(
+        render_function,
+        None,
+        Some(&specialization_profile),
+        &jit_module_plan.value_facts,
+        &specialization_inputs.field_index_specializations,
+        &specialization_inputs.field_index_specializations_by_instr,
+        &specialization_inputs.opt_v3_indexed_fields_by_instr,
+        specialization_inputs.behavior_change_indexed_stores,
+    )?;
+    let direct_call_targets = collect_typed_call_direct_targets(&typed_function);
     let mut direct_call_target_functions = HashMap::new();
     for function_id in direct_call_targets {
         if render_module
@@ -27486,15 +27591,6 @@ pub unsafe fn render_instr_typed_for_codegen_with_runtime_state(
             lower_codegen_function_to_typed(target_function),
         );
     }
-    let PreparedSpecializedTypedFunction { typed_function } = prepare_specialized_typed_function(
-        render_function,
-        &jit_module_plan.value_facts,
-        &specialization_inputs.field_index_specializations,
-        &specialization_inputs.field_index_specializations_by_instr,
-        &specialization_inputs.opt_v3_indexed_fields_by_instr,
-        specialization_inputs.behavior_change_indexed_stores,
-        &specialization_inputs.opt_v3_call_emissions,
-    )?;
 
     let mut out = String::new();
     out.push_str("; ---- InstrTyped input to specialized codegen ----\n");
