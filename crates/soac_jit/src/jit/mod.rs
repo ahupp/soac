@@ -19768,18 +19768,6 @@ fn emit_typed_codegen_stmt_result_with_local_env(
         return Ok(result);
     }
 
-    if let Some(result) = emit_opt_v3_exact_int_expr_pyobject_result(
-        fb,
-        expr,
-        local_env,
-        emit_ctx,
-        demand,
-        codegen_env,
-        func_imports,
-    )? {
-        return Ok(result);
-    }
-
     if matches!(
         expr,
         InstrTyped::Truthy(_)
@@ -19975,36 +19963,6 @@ impl OptV3MechanicalValue {
     }
 }
 
-fn emit_opt_v3_exact_int_branch_truth_i32(
-    fb: &mut FunctionBuilder<'_>,
-    test_instr_id: Option<InstrId>,
-    local_env: &mut LocalEnv,
-    emit_ctx: &JitEmitCtx<'_>,
-    codegen_env: &mut impl JitCodegenEnv,
-    func_imports: &mut FuncBuildImports<'_>,
-) -> Result<Option<ir::Value>, String> {
-    let Some(test_instr_id) = test_instr_id else {
-        return Ok(None);
-    };
-    let Some(artifacts) = emit_ctx.opt_v3_exact_int_branch_artifacts.as_deref() else {
-        return Ok(None);
-    };
-    let Some(selection) = opt_v3_exact_int_branch_selection_for_source(artifacts, test_instr_id)?
-    else {
-        return Ok(None);
-    };
-    emit_opt_v3_exact_int_branch_selection(
-        fb,
-        test_instr_id,
-        selection.into(),
-        local_env,
-        emit_ctx,
-        codegen_env,
-        func_imports,
-    )
-    .map(Some)
-}
-
 fn emit_typed_exact_int_branch_truth_i32(
     fb: &mut FunctionBuilder<'_>,
     expr: &InstrTyped,
@@ -20032,37 +19990,6 @@ fn emit_typed_exact_int_branch_truth_i32(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn emit_opt_v3_exact_int_return_pyobject(
-    fb: &mut FunctionBuilder<'_>,
-    value_instr_id: Option<InstrId>,
-    local_env: &mut LocalEnv,
-    emit_ctx: &JitEmitCtx<'_>,
-    codegen_env: &mut impl JitCodegenEnv,
-    func_imports: &mut FuncBuildImports<'_>,
-) -> Result<Option<ir::Value>, String> {
-    let Some(value_instr_id) = value_instr_id else {
-        return Ok(None);
-    };
-    let Some(artifacts) = emit_ctx.opt_v3_exact_int_branch_artifacts.as_deref() else {
-        return Ok(None);
-    };
-    let Some(selection) = opt_v3_exact_int_return_selection_for_source(artifacts, value_instr_id)?
-    else {
-        return Ok(None);
-    };
-    emit_opt_v3_exact_int_return_selection(
-        fb,
-        value_instr_id,
-        selection.into(),
-        local_env,
-        emit_ctx,
-        codegen_env,
-        func_imports,
-    )
-    .map(|result| Some(result.value))
-}
-
-#[allow(clippy::too_many_arguments)]
 fn emit_typed_exact_int_return_pyobject(
     fb: &mut FunctionBuilder<'_>,
     expr: &InstrTyped,
@@ -20087,56 +20014,6 @@ fn emit_typed_exact_int_return_pyobject(
         func_imports,
     )
     .map(|result| Some(result.value))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn emit_opt_v3_exact_int_expr_pyobject_result(
-    fb: &mut FunctionBuilder<'_>,
-    expr: &InstrTyped,
-    local_env: &mut LocalEnv,
-    emit_ctx: &JitEmitCtx<'_>,
-    demand: ResultDemand,
-    codegen_env: &mut impl JitCodegenEnv,
-    func_imports: &mut FuncBuildImports<'_>,
-) -> Result<Option<EmitResult>, String> {
-    if !matches!(expr, InstrTyped::BinOp(_)) {
-        return Ok(None);
-    }
-    let ResultDemand::PyObject { borrowed_ok: false } = demand else {
-        return Ok(None);
-    };
-    let Some(value_instr_id) = expr.try_semantic_instr_id() else {
-        return Ok(None);
-    };
-    let Some(artifacts) = emit_ctx.opt_v3_exact_int_branch_artifacts.as_deref() else {
-        return Ok(None);
-    };
-    let Some(selection) = opt_v3_exact_int_return_selection_for_source(artifacts, value_instr_id)?
-    else {
-        return Ok(None);
-    };
-    let result = emit_opt_v3_exact_int_return_selection(
-        fb,
-        value_instr_id,
-        selection.into(),
-        local_env,
-        emit_ctx,
-        codegen_env,
-        func_imports,
-    )?;
-    if !result.ownership.can_satisfy_pyobject_demand(demand) {
-        return Err(format!(
-            "optimizer v3 expression result for {value_instr_id} produced {:?}, but demand is {demand:?}",
-            result.ownership
-        ));
-    }
-    let facts =
-        py_facts_for_typed_expr_with_local_env(expr, local_env).unwrap_or_else(PyObjFacts::unknown);
-    Ok(Some(EmitResult::PyObject {
-        value: result.value,
-        ownership: result.ownership,
-        facts,
-    }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -22483,15 +22360,6 @@ fn emit_typed_codegen_term(
                     func_imports,
                 )? {
                     EmitResult::i32(truth_i32, IntFacts::i32_bool01())
-                } else if let Some(truth_i32) = emit_opt_v3_exact_int_branch_truth_i32(
-                    fb,
-                    test_instr_id,
-                    local_env,
-                    emit_ctx,
-                    codegen_env,
-                    func_imports,
-                )? {
-                    EmitResult::i32(truth_i32, IntFacts::i32_bool01())
                 } else {
                     emit_typed_codegen_i32_bool01_result_with_local_env(
                         fb,
@@ -22541,23 +22409,6 @@ fn emit_typed_codegen_term(
                 if let Some(ret_value) = emit_typed_exact_int_return_pyobject(
                     fb,
                     value,
-                    local_env,
-                    emit_ctx,
-                    codegen_env,
-                    func_imports,
-                )? {
-                    return emit_codegen_return_pyobject(
-                        fb,
-                        source_label,
-                        ret_value,
-                        local_env,
-                        emit_ctx,
-                        current_exception_name,
-                    );
-                }
-                if let Some(ret_value) = emit_opt_v3_exact_int_return_pyobject(
-                    fb,
-                    value.try_semantic_instr_id(),
                     local_env,
                     emit_ctx,
                     codegen_env,
@@ -26202,6 +26053,7 @@ fn prepare_specialized_typed_function(
     opt_v3_indexed_fields_by_instr: &HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>,
     opt_v3_indexed_globals_by_instr: &HashMap<InstrId, OptV3IndexedGlobalAccessPlan>,
     opt_v3_exact_list_items_by_instr: &HashMap<InstrId, OptV3ExactListItemAccessPlan>,
+    opt_v3_exact_int_branch_artifacts: Option<&ExactIntBranchV3Artifacts>,
     specialize_field_stores: bool,
 ) -> Result<PreparedSpecializedTypedFunction, String> {
     let mut typed_function = call_emission_typed_function
@@ -26225,6 +26077,9 @@ fn prepare_specialized_typed_function(
     )?;
     annotate_typed_indexed_global_accesses(&mut typed_function, opt_v3_indexed_globals_by_instr)?;
     annotate_typed_exact_list_item_accesses(&mut typed_function, opt_v3_exact_list_items_by_instr)?;
+    if let Some(exact_int_artifacts) = opt_v3_exact_int_branch_artifacts {
+        annotate_typed_exact_int_selections(&mut typed_function, exact_int_artifacts)?;
+    }
     lower_typed_function_call_access_plan_instrs(&mut typed_function);
     refresh_typed_function_value_facts(&mut typed_function);
     annotate_typed_function_result_demands(&mut typed_function);
@@ -26554,6 +26409,7 @@ fn build_cranelift_run_bb_specialized_function(
         &opt_v3_indexed_fields_by_instr,
         &opt_v3_indexed_globals_by_instr,
         &opt_v3_exact_list_items_by_instr,
+        opt_v3_exact_int_branch_artifacts.as_deref(),
         behavior_change_indexed_stores,
     )?;
     let direct_call_targets = collect_typed_call_direct_targets(&typed_function);
@@ -27633,6 +27489,9 @@ pub unsafe fn render_instr_typed_for_codegen_with_runtime_state(
         &specialization_inputs.opt_v3_indexed_fields_by_instr,
         &specialization_inputs.opt_v3_indexed_globals_by_instr,
         &specialization_inputs.opt_v3_exact_list_items_by_instr,
+        specialization_inputs
+            .opt_v3_exact_int_branch_artifacts
+            .as_deref(),
         specialization_inputs.behavior_change_indexed_stores,
     )?;
     let direct_call_targets = collect_typed_call_direct_targets(&typed_function);
