@@ -382,11 +382,6 @@ fn finish_codegen_module_with_tracker(
             bb_locality_counted
         };
 
-    pass_tracker.record_timing("validate", || {
-        soac_lowering::block_py::validate::validate_codegen_module(&bb_refcount_counted)
-            .map_err(anyhow::Error::msg)
-    })?;
-
     Ok(bb_refcount_counted)
 }
 

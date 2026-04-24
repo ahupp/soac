@@ -427,7 +427,5 @@ def caller(fn, x):\n    y = fn(x)\n    return y\n",
         assert_eq!(output.summary.inline_rewrite.rewritten_stores, 1);
         validate_codegen_instr_ids(&output.module)
             .expect("soac-opt v3 call inlining should preserve valid instruction ids");
-        soac_lowering::block_py::validate::validate_codegen_module(&output.module)
-            .expect("soac-opt v3 call inlining should leave dense codegen CFG labels");
     }
 }

@@ -199,6 +199,9 @@ pub fn lower_source_to_codegen_module_with_tracker(
         passes::relabel_dense_bb_module(&mut bb_codegen);
         passes::assign_module_instr_ids(bb_codegen)
     });
+    pass_tracker.record_timing("validate", || {
+        crate::block_py::validate::validate_codegen_module(&bb_codegen).map_err(anyhow::Error::msg)
+    })?;
 
     Ok(bb_codegen)
 }
