@@ -5,11 +5,10 @@ use crate::block_py::{
     BlockPyFunction, BlockPyModule, BlockTerm, Call, CallArgPositional, CallableScopeInfo,
     CallableScopeKind, CellBindingKind, CellCaptureBinding, CellLocation, CellRef, CellRefForName,
     ChildVisitable, ClassBodyFallback, ClosureInit, ClosureSlot, Del, DelItem, EffectiveBinding,
-    FunctionKind, HasMeta, InstrLow, InstrResolved, InstrUnresolved, IntLiteral, Load,
-    LocalLocation, MakeCell, MakeFunction, MakeFunctionWithClosure, MapFunction, MapInstr,
-    Mappable, NameLike, NameLocation, NumberLiteral, NumberLiteralValue, ResolvedName,
-    RuntimeFunctionId, RuntimeName, SetItem, StorageLayout, Store, StringLiteral, Tuple,
-    UnresolvedName, Visit, VisitMut, WithMeta,
+    FunctionKind, HasMeta, InstrLow, InstrResolved, InstrUnresolved, IntLiteral, Load, MakeCell,
+    MakeFunction, MakeFunctionWithClosure, MapFunction, MapInstr, Mappable, NameLike, NameLocation,
+    NumberLiteral, NumberLiteralValue, ResolvedName, RuntimeFunctionId, RuntimeName, SetItem,
+    StorageLayout, Store, StringLiteral, Tuple, UnresolvedName, Visit, VisitMut, WithMeta,
 };
 use crate::passes::ruff_to_blockpy::{
     populate_exception_edge_args, rewrite_current_exception_in_core_blocks,
@@ -410,197 +409,6 @@ fn rewrite_binding_delete(
     }
 }
 
-fn raise_deleted_name_expr(
-    logical_name: String,
-    node_index: ast::AtomicNodeIndex,
-    range: ruff_text_size::TextRange,
-) -> InstrUnresolved {
-    core_runtime_positional_call_expr_with_meta(
-        "raise_deleted_name",
-        node_index.clone(),
-        range,
-        vec![core_string_expr(logical_name, node_index, range)],
-    )
-}
-
-fn with_helper_arg_mut<N: NameLike + Clone>(
-    expr: &mut InstrLow<N>,
-    index: usize,
-    f: &mut impl FnMut(&mut InstrLow<N>),
-) -> bool {
-    match expr {
-        InstrLow::BinOp(operation) => with_helper_arg_mut_in_operation(operation, index, f),
-        InstrLow::UnaryOp(operation) => with_helper_arg_mut_in_operation(operation, index, f),
-        InstrLow::Call(operation) => with_helper_arg_mut_in_operation(operation, index, f),
-        InstrLow::GetAttr(operation) => with_helper_arg_mut_in_operation(operation, index, f),
-        InstrLow::SetAttr(operation) => with_helper_arg_mut_in_operation(operation, index, f),
-        InstrLow::GetItem(operation) => with_helper_arg_mut_in_operation(operation, index, f),
-        InstrLow::SetItem(operation) => with_helper_arg_mut_in_operation(operation, index, f),
-        InstrLow::DelItem(operation) => with_helper_arg_mut_in_operation(operation, index, f),
-        InstrLow::Load(operation) => with_helper_arg_mut_in_operation(operation, index, f),
-        InstrLow::Store(operation) => with_helper_arg_mut_in_operation(operation, index, f),
-        InstrLow::Del(operation) => with_helper_arg_mut_in_operation(operation, index, f),
-        InstrLow::MakeCell(operation) => with_helper_arg_mut_in_operation(operation, index, f),
-        InstrLow::CellRefForName(operation) => {
-            with_helper_arg_mut_in_operation(operation, index, f)
-        }
-        InstrLow::CellRef(operation) => with_helper_arg_mut_in_operation(operation, index, f),
-        InstrLow::MakeFunction(operation) => with_helper_arg_mut_in_operation(operation, index, f),
-        InstrLow::MakeFunctionWithClosure(operation) => {
-            with_helper_arg_mut_in_operation(operation, index, f)
-        }
-        _ => false,
-    }
-}
-
-fn with_helper_arg_mut_in_operation<N: NameLike + Clone, T>(
-    operation: &mut T,
-    index: usize,
-    f: &mut impl FnMut(&mut InstrLow<N>),
-) -> bool
-where
-    T: crate::block_py::Mappable<InstrLow<N>, Mapped<InstrLow<N>> = T>
-        + crate::block_py::ChildVisitable<InstrLow<N>>,
-{
-    let current = 0;
-    let applied = false;
-    struct IndexedArgMutVisitor<'a, N: NameLike, F> {
-        current: usize,
-        index: usize,
-        applied: bool,
-        f: &'a mut F,
-        _marker: std::marker::PhantomData<fn(InstrLow<N>)>,
-    }
-
-    impl<N, F> crate::block_py::VisitMut<InstrLow<N>> for IndexedArgMutVisitor<'_, N, F>
-    where
-        N: NameLike + Clone,
-        F: FnMut(&mut InstrLow<N>),
-    {
-        fn visit_instr_mut(&mut self, expr: &mut InstrLow<N>) {
-            if self.current == self.index && !self.applied {
-                (self.f)(expr);
-                self.applied = true;
-            }
-            self.current += 1;
-        }
-    }
-
-    let mut visitor = IndexedArgMutVisitor {
-        current,
-        index,
-        applied,
-        f,
-        _marker: std::marker::PhantomData,
-    };
-    operation.visit_children_mut(&mut visitor);
-    visitor.applied
-}
-
-fn rewrite_deleted_name_loads_in_expr(
-    expr: &mut InstrUnresolved,
-    scope: &CallableScopeInfo,
-    storage_layout: &StorageLayout,
-    resolver: &NameBindingMapper<'_>,
-    always_unbound_names: &HashSet<String>,
-) {
-    if let Some(logical_name) = cell_load_logical_name(expr, scope, storage_layout) {
-        if always_unbound_names.contains(logical_name.as_str()) {
-            let meta = expr.meta();
-            *expr = raise_deleted_name_expr(logical_name, meta.node_index.clone(), meta.range);
-            return;
-        }
-    }
-    match expr {
-        InstrUnresolved::Load(op) => {
-            let meta = op.meta();
-            let always_unbound = always_unbound_names.contains(op.name.id_str());
-            if always_unbound {
-                *expr = raise_deleted_name_expr(
-                    op.name.id_str().to_string(),
-                    meta.node_index.clone(),
-                    meta.range,
-                );
-                return;
-            }
-            if let UnresolvedName::SourceName(_) = &op.name {
-                if let Some(location) = resolver
-                    .local_slots
-                    .get(op.name.id_str())
-                    .copied()
-                    .map(LocalLocation)
-                {
-                    if let Some(logical_name) =
-                        logical_name_for_local_location(storage_layout, location)
-                    {
-                        let always_unbound = always_unbound_names.contains(logical_name.as_str());
-                        if always_unbound {
-                            *expr = raise_deleted_name_expr(
-                                logical_name,
-                                meta.node_index.clone(),
-                                meta.range,
-                            );
-                        }
-                    }
-                }
-            }
-        }
-        InstrUnresolved::BinOp(_)
-        | InstrUnresolved::UnaryOp(_)
-        | InstrUnresolved::Tuple(_)
-        | InstrUnresolved::Call(_)
-        | InstrUnresolved::GetAttr(_)
-        | InstrUnresolved::SetAttr(_)
-        | InstrUnresolved::GetItem(_)
-        | InstrUnresolved::SetItem(_)
-        | InstrUnresolved::DelItem(_)
-        | InstrUnresolved::MakeCell(_)
-        | InstrUnresolved::MakeFunction(_)
-        | InstrUnresolved::MakeFunctionWithClosure(_) => {
-            struct RewriteVisitor<'a> {
-                scope: &'a CallableScopeInfo,
-                storage_layout: &'a StorageLayout,
-                resolver: &'a NameBindingMapper<'a>,
-                always_unbound_names: &'a HashSet<String>,
-            }
-
-            impl crate::block_py::VisitMut<InstrUnresolved> for RewriteVisitor<'_> {
-                fn visit_instr_mut(&mut self, expr: &mut InstrUnresolved) {
-                    rewrite_deleted_name_loads_in_expr(
-                        expr,
-                        self.scope,
-                        self.storage_layout,
-                        self.resolver,
-                        self.always_unbound_names,
-                    );
-                }
-            }
-
-            expr.visit_children_mut(&mut RewriteVisitor {
-                scope,
-                storage_layout,
-                resolver,
-                always_unbound_names,
-            });
-        }
-        InstrUnresolved::Store(_) => {
-            with_helper_arg_mut(expr, 1, &mut |value_expr| {
-                rewrite_deleted_name_loads_in_expr(
-                    value_expr,
-                    scope,
-                    storage_layout,
-                    resolver,
-                    always_unbound_names,
-                );
-            });
-        }
-        InstrUnresolved::Del(_)
-        | InstrUnresolved::CellRefForName(_)
-        | InstrUnresolved::CellRef(_) => {}
-        InstrUnresolved::Literal(_) => {}
-    }
-}
-
 fn core_name_expr(
     id: &str,
     ctx: ast::ExprContext,
@@ -619,7 +427,6 @@ fn core_name_expr(
                 | "FALSE"
                 | "ELLIPSIS"
                 | "globals"
-                | "raise_deleted_name"
                 | "class_lookup_global"
                 | "class_lookup_cell"
                 | "tuple"
@@ -740,17 +547,6 @@ fn cell_ref_marker_target(expr: &InstrUnresolved) -> Option<String> {
         return None;
     };
     Some(logical_name.clone())
-}
-
-fn cell_load_logical_name(
-    expr: &InstrUnresolved,
-    scope: &CallableScopeInfo,
-    _storage_layout: &StorageLayout,
-) -> Option<String> {
-    let InstrUnresolved::Load(op) = expr else {
-        return None;
-    };
-    logical_name_for_cell_bound_name(scope, &op.name)
 }
 
 fn build_local_cell_init_assign(
@@ -876,41 +672,10 @@ fn prepend_owned_cell_init_preamble(callable: &mut BlockPyFunction<CoreModuleSha
         .splice(0..0, init_stmts.into_iter().map(Into::into));
 }
 
-fn logical_name_for_local_location(
-    layout: &StorageLayout,
-    location: LocalLocation,
-) -> Option<String> {
-    layout.stack_slots().get(location.slot() as usize).cloned()
-}
-
-fn logical_name_for_cell_bound_name(
-    scope: &CallableScopeInfo,
-    name: &UnresolvedName,
-) -> Option<String> {
-    let name = name.id_str();
-    if scope.is_cell_binding(name) {
-        return Some(name.to_string());
-    }
-    let storage_name = resolve_cell_storage_name(scope, name)?;
-    scope.logical_name_for_cell_storage(storage_name.as_str())
-}
-
-fn store_cell_runtime_logical_name(
-    expr: &InstrUnresolved,
-    scope: &CallableScopeInfo,
-    _storage_layout: &StorageLayout,
-) -> Option<String> {
-    let InstrUnresolved::Store(op) = expr else {
-        return None;
-    };
-    logical_name_for_cell_bound_name(scope, &op.name)
-}
-
 struct NameBindingMapper<'a> {
     scope: &'a CallableScopeInfo,
     callee_make_function_captures:
         &'a HashMap<crate::block_py::RuntimeFunctionId, Vec<CellCaptureBinding>>,
-    local_slots: HashMap<String, u32>,
 }
 
 impl NameBindingMapper<'_> {
@@ -1110,53 +875,6 @@ fn unresolved_semantic_delete_target(
         return None;
     }
     Some((op.name.clone().name(), op.meta()))
-}
-
-fn rewrite_deleted_name_loads_in_stmt(
-    stmt: &mut CoreStmt,
-    scope: &CallableScopeInfo,
-    storage_layout: &StorageLayout,
-    resolver: &NameBindingMapper<'_>,
-    always_unbound_names: &HashSet<String>,
-) {
-    rewrite_deleted_name_loads_in_expr(stmt, scope, storage_layout, resolver, always_unbound_names)
-}
-
-fn rewrite_deleted_name_loads_in_term(
-    term: &mut BlockTerm<InstrUnresolved>,
-    scope: &CallableScopeInfo,
-    storage_layout: &StorageLayout,
-    resolver: &NameBindingMapper<'_>,
-    always_unbound_names: &HashSet<String>,
-) {
-    struct RewriteTermVisitor<'a> {
-        scope: &'a CallableScopeInfo,
-        storage_layout: &'a StorageLayout,
-        resolver: &'a NameBindingMapper<'a>,
-        always_unbound_names: &'a HashSet<String>,
-    }
-
-    impl crate::block_py::VisitMut<InstrUnresolved> for RewriteTermVisitor<'_> {
-        fn visit_instr_mut(&mut self, expr: &mut InstrUnresolved) {
-            rewrite_deleted_name_loads_in_expr(
-                expr,
-                self.scope,
-                self.storage_layout,
-                self.resolver,
-                self.always_unbound_names,
-            );
-        }
-    }
-
-    crate::block_py::walk_term_mut(
-        &mut RewriteTermVisitor {
-            scope,
-            storage_layout,
-            resolver,
-            always_unbound_names,
-        },
-        term,
-    );
 }
 
 fn rewrite_raw_cell_loads_in_expr(
@@ -1374,63 +1092,6 @@ fn sync_cell_backed_block_params_in_block(
         return;
     }
     block.body.splice(0..0, sync_stmts);
-}
-
-fn collect_runtime_bound_local_names_in_stmt(
-    stmt: &CoreStmt,
-    scope: &CallableScopeInfo,
-    storage_layout: &StorageLayout,
-    names: &mut HashSet<String>,
-) {
-    if let Some((name, _, _, _)) = unresolved_semantic_store_parts(stmt) {
-        if scope.has_local_def(name.as_str()) {
-            names.insert(name);
-        }
-    }
-    if let Some(name) = store_cell_runtime_logical_name(stmt, scope, storage_layout) {
-        names.insert(name);
-    }
-}
-
-fn collect_runtime_bound_local_names(
-    blocks: &[crate::block_py::Block<InstrUnresolved>],
-    scope: &CallableScopeInfo,
-    storage_layout: &StorageLayout,
-) -> HashSet<String> {
-    let mut names = HashSet::new();
-    for block in blocks {
-        for stmt in &block.body {
-            collect_runtime_bound_local_names_in_stmt(stmt, scope, storage_layout, &mut names);
-        }
-    }
-    names
-}
-
-fn collect_always_unbound_local_names(
-    callable: &BlockPyFunction<CoreModuleShape>,
-) -> HashSet<String> {
-    let scope = &callable.scope;
-    let storage_layout = callable
-        .storage_layout
-        .as_ref()
-        .expect("name binding should have storage layout before local-name analysis");
-    let param_names = callable.params.names().into_iter().collect::<HashSet<_>>();
-    let runtime_bound_names =
-        collect_runtime_bound_local_names(&callable.blocks, scope, storage_layout);
-    scope
-        .local_defs
-        .iter()
-        .filter(|name| !param_names.contains(*name))
-        .filter(|name| !is_internal_symbol(name.as_str()))
-        .filter(|name| !runtime_bound_names.contains(*name))
-        .filter(|name| {
-            matches!(
-                scope.effective_binding(name.as_str(), BindingPurpose::Load),
-                Some(EffectiveBinding::Local | EffectiveBinding::Cell(CellBindingKind::Owner))
-            )
-        })
-        .cloned()
-        .collect()
 }
 
 fn collect_remaining_names_in_expr(expr: &InstrUnresolved, names: &mut HashSet<String>) {
@@ -2717,36 +2378,10 @@ fn lower_name_binding_callable(
     let mut mapper = NameBindingMapper {
         scope: &scope,
         callee_make_function_captures,
-        local_slots: local_slots.clone(),
     };
     let mut lowered = mapper.map_fn(callable);
     prepend_owned_cell_init_preamble(&mut lowered);
     populate_stack_slots_in_storage_layout(&mut lowered, local_slots);
-    let storage_layout = lowered
-        .storage_layout
-        .as_ref()
-        .expect("name binding should have storage layout before cell-location analysis");
-    let always_unbound_names = collect_always_unbound_local_names(&lowered);
-    if !always_unbound_names.is_empty() {
-        for block in &mut lowered.blocks {
-            for stmt in &mut block.body {
-                rewrite_deleted_name_loads_in_stmt(
-                    stmt,
-                    &scope,
-                    storage_layout,
-                    &mapper,
-                    &always_unbound_names,
-                );
-            }
-            rewrite_deleted_name_loads_in_term(
-                &mut block.term,
-                &scope,
-                storage_layout,
-                &mapper,
-                &always_unbound_names,
-            );
-        }
-    }
     rewrite_current_exception_in_core_blocks(&mut lowered.blocks);
     let normal_predecessors = normal_predecessor_exc_param_names(&lowered.blocks);
     for block in &mut lowered.blocks {

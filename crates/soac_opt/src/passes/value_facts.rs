@@ -68,7 +68,6 @@ pub enum RuntimeHelperId {
     Globals,
     Index,
     Str,
-    RaiseDeletedName,
     CellRef,
     NextOrSentinel,
     TupleFromIter,
@@ -102,7 +101,6 @@ impl RuntimeHelperId {
             b"globals" => Some(Self::Globals),
             b"_index" => Some(Self::Index),
             b"str" => Some(Self::Str),
-            b"raise_deleted_name" => Some(Self::RaiseDeletedName),
             b"cell_ref" => Some(Self::CellRef),
             b"next_or_sentinel" => Some(Self::NextOrSentinel),
             b"tuple_from_iter" => Some(Self::TupleFromIter),
@@ -381,7 +379,6 @@ const fn runtime_helper_result(helper: RuntimeHelperId) -> ValueFacts {
         RuntimeHelperId::Index => ValueFacts::PyObj(PyObjFacts::exact_type(PyExactType::Int)),
         RuntimeHelperId::Str => ValueFacts::PyObj(PyObjFacts::exact_type(PyExactType::Str)),
         RuntimeHelperId::Globals
-        | RuntimeHelperId::RaiseDeletedName
         | RuntimeHelperId::CellRef
         | RuntimeHelperId::NextOrSentinel
         | RuntimeHelperId::TupleFromIter
@@ -399,7 +396,6 @@ const fn runtime_helper_throw_spec(helper: RuntimeHelperId) -> ThrowSpec {
         RuntimeHelperId::Globals | RuntimeHelperId::CellRef => ThrowSpec::Never,
         RuntimeHelperId::Index
         | RuntimeHelperId::Str
-        | RuntimeHelperId::RaiseDeletedName
         | RuntimeHelperId::NextOrSentinel
         | RuntimeHelperId::TupleFromIter
         | RuntimeHelperId::MakeFunction

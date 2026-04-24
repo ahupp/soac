@@ -5579,18 +5579,6 @@ fn emit_planned_indexed_global_load(
     )
 }
 
-fn codegen_expr_const_string(
-    expr: &InstrCodegen,
-    module_constants: &ModuleCodegenConstants,
-) -> Option<String> {
-    match expr {
-        InstrCodegen::Load(op) => op.name.location.as_constant().and_then(|index| {
-            module_constants.constant_string_value(ModuleConstantId(index as usize))
-        }),
-        _ => None,
-    }
-}
-
 fn codegen_expr_helper_name<'a>(
     expr: &'a InstrCodegen,
     module_constants: &'a ModuleCodegenConstants,
@@ -16631,26 +16619,6 @@ fn emit_codegen_simple_call_with_local_env(
         && simple_keywords.is_empty()
         && let Some(helper_id) = codegen_expr_runtime_helper(call.func.as_ref(), emit_ctx)
     {
-        if helper_id == RuntimeHelperId::RaiseDeletedName
-            && simple_args.len() == 1
-            && let Some(name) = codegen_expr_const_string(simple_args[0], emit_ctx.module_constants)
-        {
-            let name_obj = emit_owned_module_constant(
-                fb,
-                emit_ctx
-                    .module_constants
-                    .require_unicode_constant_id(name.as_str()),
-                emit_ctx,
-            );
-            fb.ins()
-                .call(emit_ctx.raise_deleted_name_error_ref, &[name_obj]);
-            emit_release_owned_inputs(fb, emit_ctx, &[name_obj]);
-            fb.ins().jump(
-                emit_ctx.consts.step_null_block,
-                &step_null_block_args(emit_ctx),
-            );
-            return Some(null_ptr);
-        }
         if helper_id == RuntimeHelperId::CellRef && simple_args.len() == 1 {
             let InstrCodegen::Load(cell_name) = simple_args[0] else {
                 panic!(

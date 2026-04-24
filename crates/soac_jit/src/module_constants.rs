@@ -1,13 +1,12 @@
 use pyo3::ffi;
 use pyo3::prelude::*;
-use soac_core::block_py as blockpy_intrinsics;
 use soac_core::block_py::literal::{Literal, NumberLiteralValue};
 use soac_core::block_py::{
     AbruptKind, BlockArg, BlockPyFunction, BlockPyModule, BlockTerm, CallArgKeyword,
     ChildVisitable, NameLike, ParamDefaultSource, RuntimeName,
 };
 use soac_opt::passes::{
-    CodegenModuleShape, InstrCodegen, InstrResolved, InstrTyped, TypedCall, TypedCodegenModuleShape,
+    CodegenModuleShape, InstrCodegen, InstrResolved, InstrTyped, TypedCodegenModuleShape,
 };
 use std::collections::HashMap;
 
@@ -535,10 +534,6 @@ impl ModuleConstantCollector {
                 {
                     self.constants.intern_unicode_bytes(const_bytes.as_slice());
                 }
-                if let Some(delete_name_bytes) = self.deleted_name_arg_bytes(call) {
-                    self.constants
-                        .intern_unicode_bytes(delete_name_bytes.as_slice());
-                }
                 self.collect_expr(call.func.as_ref());
                 for arg in &call.args {
                     self.collect_expr(arg.expr());
@@ -634,10 +629,6 @@ impl ModuleConstantCollector {
                 {
                     self.constants.intern_unicode_bytes(const_bytes.as_slice());
                 }
-                if let Some(delete_name_bytes) = self.deleted_name_arg_bytes_typed_call(call) {
-                    self.constants
-                        .intern_unicode_bytes(delete_name_bytes.as_slice());
-                }
                 self.collect_typed_expr(call.func.as_ref());
                 for arg in &call.args {
                     self.collect_typed_expr(arg.expr());
@@ -729,25 +720,6 @@ impl ModuleConstantCollector {
         }
     }
 
-    fn deleted_name_arg_bytes(
-        &self,
-        call: &blockpy_intrinsics::Call<InstrCodegen>,
-    ) -> Option<Vec<u8>> {
-        match helper_name_for_codegen_expr(call.func.as_ref(), &self.constants) {
-            Some("raise_deleted_name") if call.args.len() == 1 => {}
-            _ => return None,
-        }
-        self.string_constant_bytes_for_specialized_codegen(call.args[0].expr())
-    }
-
-    fn deleted_name_arg_bytes_typed_call(&self, call: &TypedCall<InstrTyped>) -> Option<Vec<u8>> {
-        match helper_name_for_typed_expr(call.func.as_ref(), &self.constants) {
-            Some("raise_deleted_name") if call.args.len() == 1 => {}
-            _ => return None,
-        }
-        self.typed_string_constant_bytes_for_specialized_codegen(call.args[0].expr())
-    }
-
     fn string_constant_bytes_for_specialized_codegen(
         &self,
         expr: &InstrCodegen,
@@ -786,40 +758,6 @@ impl soac_core::block_py::Visit<InstrCodegen> for ModuleConstantCollector {
 impl soac_core::block_py::Visit<InstrTyped> for ModuleConstantCollector {
     fn visit_instr(&mut self, expr: &InstrTyped) {
         self.collect_typed_expr(expr);
-    }
-}
-
-fn helper_name_for_codegen_expr<'a>(
-    expr: &'a InstrCodegen,
-    module_constants: &'a ModuleCodegenConstants,
-) -> Option<&'a str> {
-    match expr {
-        InstrCodegen::Load(op)
-            if op.name.location.is_global() || op.name.location.is_runtime_name() =>
-        {
-            Some(op.name.id.as_str())
-        }
-        InstrCodegen::Load(op) => op.name.location.as_constant().and_then(|index| {
-            module_constants.constant_runtime_name_value(ModuleConstantId(index as usize))
-        }),
-        _ => None,
-    }
-}
-
-fn helper_name_for_typed_expr<'a>(
-    expr: &'a InstrTyped,
-    module_constants: &'a ModuleCodegenConstants,
-) -> Option<&'a str> {
-    match expr {
-        InstrTyped::Load(op)
-            if op.name.location.is_global() || op.name.location.is_runtime_name() =>
-        {
-            Some(op.name.id.as_str())
-        }
-        InstrTyped::Load(op) => op.name.location.as_constant().and_then(|index| {
-            module_constants.constant_runtime_name_value(ModuleConstantId(index as usize))
-        }),
-        _ => None,
     }
 }
 

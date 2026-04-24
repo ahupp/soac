@@ -415,6 +415,15 @@ fn resolved_function_uses_global(
     })
 }
 
+fn resolved_function_uses_local(
+    function: &BlockPyFunction<ResolvedStorageModuleShape>,
+    name: &str,
+) -> bool {
+    resolved_function_has_name_location(function, name, |location| {
+        matches!(location, NameLocation::Local(_))
+    })
+}
+
 fn resolved_module_uses_global(
     module: &BlockPyModule<ResolvedStorageModuleShape>,
     name: &str,
@@ -2396,10 +2405,14 @@ def f():
     let f = blockpy_function_by_name(&blockpy_module, "f");
     assert!(!blockpy_function_has_store_name(f, "x"));
 
+    let resolved_f = lowered.bb_function("f");
     assert!(
-        module_constant_text(lowered.bb_module()).contains("raise_deleted_name"),
-        "{:?}\n{}",
-        lowered.bb_function("f"),
+        resolved_function_uses_local(resolved_f, "x"),
+        "{resolved_f:?}"
+    );
+    assert!(
+        !module_constant_text(lowered.bb_module()).contains("raise_deleted_name"),
+        "{resolved_f:?}\n{}",
         module_constant_text(lowered.bb_module())
     );
 }
@@ -3883,7 +3896,11 @@ def f():
     let f = function_by_name(&bb_module, "f");
     let debug = format!("{f:?}");
     assert!(
-        module_constant_text(&bb_module).contains("raise_deleted_name"),
+        resolved_function_uses_local(f, "x"),
+        "dead-tail local should remain a normal local load:\n{debug}"
+    );
+    assert!(
+        !module_constant_text(&bb_module).contains("raise_deleted_name"),
         "{}\n{}",
         debug,
         module_constant_text(&bb_module)

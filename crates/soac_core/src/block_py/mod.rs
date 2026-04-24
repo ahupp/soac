@@ -299,7 +299,6 @@ define_runtime_names! {
     TypingUnpack => "typing_Unpack",
     TemplatelibTemplate => "templatelib_Template",
     TemplatelibInterpolation => "templatelib_Interpolation",
-    RaiseDeletedName => "raise_deleted_name",
     BbTraceEnter => "bb_trace_enter",
     YieldfromCellValue => "_yieldfrom_cell_value",
     CurrentYieldfrom => "_current_yieldfrom",

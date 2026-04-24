@@ -126,12 +126,6 @@ def templatelib_Interpolation(value, expr_text, conversion, format_spec):
     return _templatelib_Interpolation_type(value, expr_text, conversion, format_spec)
 
 
-def raise_deleted_name(name):
-    raise UnboundLocalError(
-        f"cannot access local variable {name!r} where it is not associated with a value"
-    )
-
-
 def bb_trace_enter(function_qualname, block_label, params=None):
     if params:
         pieces = []
