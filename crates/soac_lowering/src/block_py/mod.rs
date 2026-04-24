@@ -4,7 +4,7 @@ pub(crate) mod cfg;
 pub mod counters;
 mod pretty;
 mod scope_impls;
-pub mod validate;
+pub(crate) mod validate;
 
 pub(crate) use crate::passes::{
     InstrCodegen, InstrLow, InstrResolved, InstrRuff, InstrUnresolved, InstrWithAwaitAndYield,

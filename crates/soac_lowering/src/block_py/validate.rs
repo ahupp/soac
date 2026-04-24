@@ -3,7 +3,7 @@ use crate::block_py::{
     BlockPyFunction, BlockPyModule, BlockTerm, ModuleShape, ScopeExprNode,
 };
 
-pub fn validate_codegen_module(
+pub(crate) fn validate_codegen_module(
     module: &BlockPyModule<crate::passes::CodegenModuleShape>,
 ) -> Result<(), String> {
     validate_module(module)
