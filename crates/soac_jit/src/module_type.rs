@@ -25,9 +25,7 @@ use soac_driver::codegen_cache::{
     validate_codegen_module_cache_metadata,
 };
 use soac_driver::finish_cached_codegen_module_for_runtime_with_counter_defs;
-use soac_instrument::codegen::{
-    deopt_entry_counter_instrumentation_enabled, specialization_runtime_logging_enabled,
-};
+use soac_instrument::InstrumentationConfig;
 use soac_lowering::passes::{CodegenModuleShape, InstrCodegen};
 use soac_opt::access_emission_v3::{
     IndexedFieldAccessPlan as OptV3IndexedFieldAccessPlan,
@@ -390,7 +388,9 @@ impl SharedModuleState {
                 return;
             }
         };
-        if !specialization_runtime_logging_enabled(&env_config) {
+        if !InstrumentationConfig::from_env_config(&env_config)
+            .specialization_runtime_logging_enabled()
+        {
             return;
         }
         for counter in &self.lowered_module.counter_defs {
@@ -1290,7 +1290,7 @@ fn append_final_deopt_counter_defs_for_runtime(
     module_cache_source: Option<PythonModuleCacheSource>,
     env_config: &SoacEnvConfig,
 ) -> PyResult<()> {
-    if !deopt_entry_counter_instrumentation_enabled(env_config) {
+    if !InstrumentationConfig::from_env_config(env_config).deopt_entry_counters_enabled() {
         return Ok(());
     }
     let Some(cache_root) = env_config.module_cache_root() else {

@@ -633,6 +633,14 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    fn refcount_counter_instrumentation_enabled(config: &SoacEnvConfig) -> bool {
+        InstrumentationConfig::from_env_config(config)
+            .counters
+            .refcounts
+            .scope()
+            .is_some()
+    }
+
     #[test]
     fn pre_optimization_cache_metadata_mismatch_rebuilds_and_replaces_cache() {
         let source = "def f():\n    return 1\n";
@@ -836,9 +844,7 @@ mod tests {
         {
             let config =
                 SoacEnvConfig::default().with_specialization_mode(Some(SpecializationMode::Verify));
-            assert!(instrumentation::refcount_counter_instrumentation_enabled(
-                &config
-            ));
+            assert!(refcount_counter_instrumentation_enabled(&config));
             let lowered = prepare_codegen_module_for_testing_with_config(source, &config)
                 .expect("transform should succeed")
                 .codegen_module;
@@ -870,9 +876,7 @@ mod tests {
 
         for mode in [SpecializationMode::Profile, SpecializationMode::Apply] {
             let config = SoacEnvConfig::default().with_specialization_mode(Some(mode));
-            assert!(!instrumentation::refcount_counter_instrumentation_enabled(
-                &config
-            ));
+            assert!(!refcount_counter_instrumentation_enabled(&config));
             let lowered = prepare_codegen_module_for_testing_with_config(source, &config)
                 .expect("transform should succeed")
                 .codegen_module;

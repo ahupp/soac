@@ -4,45 +4,17 @@ use crate::instrument::{
     is_operator_specialization_binop_kind, is_profile_call_candidate,
 };
 use crate::{CounterBuilder, ExplicitCounterPlacement, InstrumentationConfig};
-use soac_config::{ExecTraceConfig, SoacEnvConfig};
+use soac_config::ExecTraceConfig;
 use soac_core::block_py::{
     BlockPyFunction, BlockPyModule, BlockTerm, Call, CallArgPositional, ChildVisitable,
-    CounterScope, CounterSite, FunctionExecutionMode, HasSemanticInstrId, LiteralValue, Load, Meta,
-    ModuleShape, NameLocation, ResolvedName, RuntimeFunctionId, RuntimeName, StringLiteral, Tuple,
-    Visit, WithMeta,
+    CounterScope, FunctionExecutionMode, HasSemanticInstrId, LiteralValue, Load, Meta, ModuleShape,
+    NameLocation, ResolvedName, RuntimeFunctionId, RuntimeName, StringLiteral, Tuple, Visit,
+    WithMeta,
 };
 use soac_core::pass_tracker::PassTracker;
 use soac_lowering::block_py::counters::IncrementCounter;
 use soac_lowering::passes::{CodegenModuleShape, InstrCodegen, InstrResolved};
 use std::collections::HashMap;
-
-pub fn call_target_counter_instrumentation_enabled(config: &SoacEnvConfig) -> bool {
-    InstrumentationConfig::from_env_config(config)
-        .counters
-        .call_targets
-}
-
-pub fn locality_counter_instrumentation_enabled(config: &SoacEnvConfig) -> bool {
-    InstrumentationConfig::from_env_config(config)
-        .counters
-        .locality
-}
-
-pub fn refcount_counter_instrumentation_enabled(config: &SoacEnvConfig) -> bool {
-    InstrumentationConfig::from_env_config(config)
-        .counters
-        .refcounts
-        .scope()
-        .is_some()
-}
-
-pub fn deopt_entry_counter_instrumentation_enabled(config: &SoacEnvConfig) -> bool {
-    InstrumentationConfig::from_env_config(config).deopt_entry_counters_enabled()
-}
-
-pub fn specialization_runtime_logging_enabled(config: &SoacEnvConfig) -> bool {
-    InstrumentationConfig::from_env_config(config).specialization_runtime_logging_enabled()
-}
 
 fn functions_with_counter_instrumentation<P: ModuleShape>(
     functions: &[BlockPyFunction<P>],
@@ -120,7 +92,7 @@ fn functions_with_counter_instrumentation_mut<P: ModuleShape>(
         .filter(|function| function.execution_mode() == FunctionExecutionMode::Jit)
 }
 
-pub fn instrument_bb_module_for_trace(
+pub(crate) fn instrument_bb_module_for_trace(
     module: &mut BlockPyModule<CodegenModuleShape>,
     config: &ExecTraceConfig,
 ) {
@@ -194,7 +166,7 @@ pub fn instrument_bb_module_with_block_entry_counters(
     }
 }
 
-pub fn instrument_bb_module_with_refcount_counters(
+pub(crate) fn instrument_bb_module_with_refcount_counters(
     module: &mut BlockPyModule<CodegenModuleShape>,
     scope: CounterScope,
 ) -> Result<(), String> {
@@ -205,9 +177,12 @@ pub fn instrument_bb_module_with_refcount_counters(
     define_refcount_counters(&mut counters, scope, function_ids)
 }
 
-pub fn instrument_bb_module_with_global_load_counters(
+#[cfg(test)]
+pub(crate) fn instrument_bb_module_with_global_load_counters(
     module: &mut BlockPyModule<CodegenModuleShape>,
 ) {
+    use soac_core::block_py::CounterSite;
+
     let mut counters = CounterBuilder::new(&mut module.counter_defs);
     for kind in ["global_load_hit", "global_load_miss"] {
         counters.define_if_missing(
@@ -329,7 +304,9 @@ pub fn instrument_bb_module_with_call_target_counters(
     }
 }
 
-pub fn instrument_bb_module_with_locality_counters(module: &mut BlockPyModule<CodegenModuleShape>) {
+pub(crate) fn instrument_bb_module_with_locality_counters(
+    module: &mut BlockPyModule<CodegenModuleShape>,
+) {
     let mut counters = CounterBuilder::new(&mut module.counter_defs);
     for function in functions_with_counter_instrumentation(&module.callable_defs) {
         for block in &function.blocks {

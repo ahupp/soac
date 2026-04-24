@@ -219,7 +219,7 @@ fn define_module_call_target_counters(module: &mut BlockPyModule<TypedCodegenMod
     }
 }
 
-pub fn instrument_typed_module_with_block_entry_counters(
+pub(crate) fn instrument_typed_module_with_block_entry_counters(
     module: &mut BlockPyModule<TypedCodegenModuleShape>,
 ) {
     let BlockPyModule {
