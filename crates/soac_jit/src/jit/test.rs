@@ -18032,6 +18032,131 @@ def f(x, y):
     }
 
     #[test]
+    fn runtime_typed_v3_module_plan_carries_non_inline_direct_call_shape() {
+        let module_name = "runtime_typed_v3_non_inline_direct_call_test";
+        let module_name_gen = ModuleNameGen::new(0);
+        let mut callee_function = test_function_in_module(&module_name_gen, "callee");
+        callee_function.params.params.push(Param {
+            name: "x".into(),
+            kind: ParamKind::Any,
+            has_default: false,
+        });
+        callee_function = with_single_test_block(
+            callee_function,
+            vec![],
+            ret_term(name_expr(test_local_name("x", 0))),
+        );
+        set_stack_slots(&mut callee_function, &["x"]);
+
+        let mut caller_function = test_function_in_module(&module_name_gen, "caller");
+        caller_function.params.params.extend([
+            Param {
+                name: "fn".into(),
+                kind: ParamKind::Any,
+                has_default: false,
+            },
+            Param {
+                name: "x".into(),
+                kind: ParamKind::Any,
+                has_default: false,
+            },
+        ]);
+        let caller_block_label = caller_function.name_gen.next_block_name();
+        let call_instr_id = InstrId::new(caller_block_label, 1);
+        caller_function = with_test_blocks(
+            caller_function,
+            vec![CodegenBlock {
+                label: caller_block_label,
+                body: vec![assign_stmt(
+                    test_local_name("y", 2),
+                    with_instr_id(
+                        op_expr(Call::new(
+                            name_expr(test_local_name("fn", 0)),
+                            vec![CallArgPositional::Positional(name_expr(test_local_name(
+                                "x", 1,
+                            )))],
+                            Vec::<CallArgKeyword<InstrCodegen>>::new(),
+                        )),
+                        call_instr_id,
+                    ),
+                )],
+                term: ret_term(name_expr(test_local_name("y", 2))),
+                params: vec![],
+                exc_edge: None,
+            }],
+        );
+        set_stack_slots(&mut caller_function, &["fn", "x", "y"]);
+
+        let caller_id = caller_function.function_id;
+        let callee_id = callee_function.function_id;
+        let module = test_module(module_name_gen, vec![callee_function, caller_function]);
+        let profile = SpecializationProfile {
+            module_name: Some(module_name),
+            counter_dump_path: None,
+            optimized_module: None,
+            direct_call_emission_scope: DirectCallEmissionScope::AllDirectCallCandidates,
+            opt_v3_emitted_direct_calls: HashMap::from([(
+                caller_id,
+                HashMap::from([(
+                    call_instr_id,
+                    vec![ResolvedV3DirectCallPlan {
+                        source: call_instr_id,
+                        target: callee_id,
+                        arg_plan: TypedDirectCallArgPlan {
+                            sources: vec![TypedDirectCallArgSource::Provided(0)],
+                        },
+                        body: CallBodyPlan {
+                            kind: CallBodyKind::DirectCall,
+                            cost: Cost::default(),
+                            inline_target: None,
+                            reason: "test keeps body as direct call".to_string(),
+                        },
+                        reason: "test direct-call candidate".to_string(),
+                    }],
+                )]),
+            )]),
+            opt_v3_emitted_exact_list_items: HashMap::new(),
+            opt_v3_emitted_indexed_fields: HashMap::new(),
+            opt_v3_emitted_indexed_globals: HashMap::new(),
+            opt_v3_exact_int_branch_artifacts: HashMap::new(),
+            behavior_change_indexed_stores: false,
+            profiled_cold_blocks: false,
+            guard_miss_deopt: false,
+        };
+
+        let module_plan =
+            build_typed_v3_jit_module_plan(&module, Some(&profile), &typed_v3_env_config())
+                .expect("typed-v3 module plan should lower non-inline direct calls");
+        let planned_caller = module_plan
+            .module
+            .callable_defs
+            .iter()
+            .find(|function| function.function_id == caller_id)
+            .expect("planned module should include caller");
+        assert_eq!(
+            count_typed_instrs(planned_caller, |expr| {
+                matches!(expr, InstrTyped::GuardedCallableCallTyped(_))
+            }),
+            1,
+            "non-inline typed-v3 direct calls should be represented in InstrTyped before codegen"
+        );
+        assert_eq!(
+            count_typed_instrs(planned_caller, |expr| {
+                matches!(expr, InstrTyped::CallTyped(_))
+            }),
+            0,
+            "the selected call site should no longer remain a generic typed call"
+        );
+        assert_eq!(
+            count_typed_instrs(planned_caller, |expr| {
+                matches!(expr, InstrTyped::DirectCallGuardTest(_))
+            }),
+            0,
+            "non-inline direct calls should not be expanded into inline guard CFG"
+        );
+    }
+
+    #[test]
     fn runtime_typed_v3_pipeline_keeps_access_plans_from_raw_profile_evidence() {
         if crate::run_test_in_isolated_process_if_needed(
             module_path!(),

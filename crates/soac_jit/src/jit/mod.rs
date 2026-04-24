@@ -1966,10 +1966,11 @@ fn apply_typed_v3_module_rewrites(
     let callee_module = module.clone();
     let external_callees = HashMap::new();
     for function in &mut module.callable_defs {
+        let call_emissions =
+            typed_call_emission_plans_for_profile_function(profile, function.function_id)?;
+        lower_typed_function_call_emission_plans(function, &call_emissions)?;
         let inline_direct_calls = profile.typed_inline_resolved_direct_calls(function.function_id);
         if !inline_direct_calls.is_empty() {
-            let inline_call_emissions = typed_call_emission_plans_from_v3(&inline_direct_calls)?;
-            lower_typed_function_call_emission_plans(function, &inline_call_emissions)?;
             let inline_targets = profile.typed_inline_direct_calls(function.function_id);
             let stats = inline_typed_function_direct_call_stores(
                 function,
