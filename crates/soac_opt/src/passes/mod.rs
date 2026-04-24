@@ -80,9 +80,8 @@ pub use crate::typed::{
     validate_typed_function_value_facts, validate_typed_module_call_access_plans,
 };
 pub use escape_analysis::{
-    ConstructorFieldAccess, ConstructorFieldStore, ConstructorFieldValue, EscapeSummaryModule,
-    FieldInitializerConstructorSummary, FunctionEscapeSummary,
-    NonEscapingConstructorAllocationSummary, NonEscapingConstructorSummary,
+    ConstructorFieldStore, ConstructorFieldValue, EscapeSummaryModule,
+    FieldInitializerConstructorSummary, FunctionEscapeSummary, NonEscapingConstructorSummary,
     straightline_field_initializer_rejection_reason, summarize_module_escapes,
 };
 pub use inline_plan::{

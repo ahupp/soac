@@ -2,10 +2,9 @@ use crate::passes::{CodegenModuleShape, InstrCodegen, InstrResolved};
 use soac_core::block_py::PrettyPrint;
 use soac_core::block_py::literal::Literal;
 use soac_core::block_py::{
-    BlockPyFunction, BlockPyModule, BlockTerm, InstrId, LocalLocation, NameLike, NameLocation,
-    RuntimeFunctionId, instr_any,
+    BlockPyFunction, BlockPyModule, BlockTerm, LocalLocation, NameLike, NameLocation, instr_any,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 #[derive(
     Clone, Debug, Default, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
@@ -45,10 +44,7 @@ impl EscapeSummaryModule {
     ) {
         self.functions = std::mem::take(&mut self.functions)
             .into_iter()
-            .map(|(function_id, mut summary)| {
-                summary.remap_function_ids(remap);
-                (remap(function_id), summary)
-            })
+            .map(|(function_id, summary)| (remap(function_id), summary))
             .collect();
     }
 }
@@ -65,7 +61,6 @@ impl PrettyPrint for EscapeSummaryModule {
                 .expect("function id was collected from this summary map");
             if summary.non_escaping_constructor.is_none()
                 && summary.straightline_field_initializer.is_none()
-                && summary.non_escaping_constructor_allocations.is_empty()
             {
                 continue;
             }
@@ -82,15 +77,6 @@ impl PrettyPrint for EscapeSummaryModule {
                     "  straightline_field_initializer self={} fields={}\n",
                     constructor.self_name,
                     render_field_stores(&constructor.field_stores),
-                ));
-            }
-            for allocation in &summary.non_escaping_constructor_allocations {
-                out.push_str(&format!(
-                    "  non_escaping_constructor_allocation local={} constructor={} reads={} writes={}\n",
-                    allocation.local_name,
-                    allocation.constructor_function_id,
-                    render_field_accesses(&allocation.field_reads),
-                    render_field_accesses(&allocation.field_writes),
                 ));
             }
         }
@@ -110,14 +96,6 @@ fn render_field_stores(stores: &[ConstructorFieldStore]) -> String {
         .join(", ")
 }
 
-fn render_field_accesses(accesses: &[ConstructorFieldAccess]) -> String {
-    accesses
-        .iter()
-        .map(|access| access.field_name.as_str())
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
 fn render_field_value(value: &ConstructorFieldValue) -> String {
     match value {
         ConstructorFieldValue::Param { name, index, .. } => format!("param#{index}:{name}"),
@@ -133,19 +111,6 @@ fn render_field_value(value: &ConstructorFieldValue) -> String {
 pub struct FunctionEscapeSummary {
     pub non_escaping_constructor: Option<NonEscapingConstructorSummary>,
     pub straightline_field_initializer: Option<FieldInitializerConstructorSummary>,
-    pub non_escaping_constructor_allocations: Vec<NonEscapingConstructorAllocationSummary>,
-}
-
-impl FunctionEscapeSummary {
-    fn remap_function_ids(
-        &mut self,
-        remap: impl Fn(soac_core::block_py::RuntimeFunctionId) -> soac_core::block_py::RuntimeFunctionId
-        + Copy,
-    ) {
-        for allocation in &mut self.non_escaping_constructor_allocations {
-            allocation.constructor_function_id = remap(allocation.constructor_function_id);
-        }
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -169,21 +134,6 @@ pub struct ConstructorFieldStore {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-pub struct NonEscapingConstructorAllocationSummary {
-    pub local_name: String,
-    pub local_location: LocalLocation,
-    pub constructor_function_id: RuntimeFunctionId,
-    pub call_instr_id: Option<InstrId>,
-    pub field_reads: Vec<ConstructorFieldAccess>,
-    pub field_writes: Vec<ConstructorFieldAccess>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-pub struct ConstructorFieldAccess {
-    pub field_name: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum ConstructorFieldValue {
     Param {
         name: String,
@@ -201,7 +151,7 @@ pub enum ConstructorFieldValue {
 }
 
 pub fn summarize_module_escapes(module: &BlockPyModule<CodegenModuleShape>) -> EscapeSummaryModule {
-    let mut functions = module
+    let functions = module
         .callable_defs
         .iter()
         .map(|function| {
@@ -212,39 +162,11 @@ pub fn summarize_module_escapes(module: &BlockPyModule<CodegenModuleShape>) -> E
                     straightline_field_initializer: summarize_straightline_field_initializer(
                         module, function,
                     ),
-                    non_escaping_constructor_allocations: Vec::new(),
                 },
             )
         })
         .collect::<HashMap<_, _>>();
-    let straightline_constructor_ids = functions
-        .iter()
-        .filter_map(|(function_id, summary)| {
-            summary
-                .straightline_field_initializer
-                .as_ref()
-                .map(|_| *function_id)
-        })
-        .collect::<HashSet<_>>();
-    for function in &module.callable_defs {
-        let allocations = summarize_non_escaping_constructor_allocations(
-            module,
-            function,
-            &straightline_constructor_ids,
-        );
-        if let Some(summary) = functions.get_mut(&function.function_id) {
-            summary.non_escaping_constructor_allocations = allocations;
-        }
-    }
     EscapeSummaryModule { functions }
-}
-
-fn summarize_non_escaping_constructor_allocations(
-    _module: &BlockPyModule<CodegenModuleShape>,
-    _function: &BlockPyFunction<CodegenModuleShape>,
-    _straightline_constructor_ids: &HashSet<RuntimeFunctionId>,
-) -> Vec<NonEscapingConstructorAllocationSummary> {
-    Vec::new()
 }
 
 fn summarize_non_escaping_constructor(
@@ -703,8 +625,6 @@ mod tests {
             .unwrap_or_else(|| panic!("missing function {qualname}; got {module:?}"))
     }
 
-    fn rewrite_first_box_call_as_direct(_module: &mut BlockPyModule<CodegenModuleShape>) {}
-
     #[test]
     fn summarizes_field_only_constructor_as_non_escaping() {
         let module = lowered(
@@ -858,33 +778,6 @@ class Box:
             summarize_module_escapes(&module)
                 .non_escaping_constructor(function.function_id)
                 .is_none()
-        );
-    }
-
-    #[test]
-    fn rejects_local_constructor_allocation_returned_directly() {
-        let mut module = lowered(
-            r#"
-class Box:
-    def __init__(self, value):
-        self.value = value
-
-def make(x):
-    box = Box(x)
-    return box
-"#,
-        );
-        rewrite_first_box_call_as_direct(&mut module);
-        let make_id = function_by_qualname(&module, "make").function_id;
-
-        let escapes = summarize_module_escapes(&module);
-
-        assert!(
-            escapes
-                .function(make_id)
-                .expect("make should have an escape summary")
-                .non_escaping_constructor_allocations
-                .is_empty()
         );
     }
 }
