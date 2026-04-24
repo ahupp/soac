@@ -2,12 +2,17 @@ use super::{
     instrument_bb_module_for_trace, instrument_bb_module_with_block_entry_counters,
     instrument_bb_module_with_call_target_counters, instrument_bb_module_with_global_load_counters,
     instrument_bb_module_with_locality_counters, instrument_bb_module_with_refcount_counters,
+    instrument_module_with_tracker,
 };
-use soac_config::ExecTraceConfig;
+use crate::{ExplicitCounterPlacement, InstrumentationConfig};
+use soac_config::{
+    ExecTraceConfig, RuntimeOptimizationPipeline, SoacEnvConfig, SpecializationMode,
+};
 use soac_core::block_py::{
     BlockPyFunction, BlockPyModule, Call, ChildVisitable, CounterScope, CounterSite,
     FunctionExecutionMode, NameLike, NameLocation, RuntimeFunctionId, Visit,
 };
+use soac_core::pass_tracker::NoopPassTracker;
 use soac_lowering::lower_python_to_blockpy_for_testing;
 use soac_lowering::passes::{CodegenModuleShape, InstrCodegen};
 use std::collections::HashSet;
@@ -80,6 +85,14 @@ fn counter_site_function_id(site: &CounterSite) -> Option<RuntimeFunctionId> {
         | CounterSite::DeoptEntry { function_id, .. } => Some(*function_id),
         CounterSite::Runtime { function_id, .. } => *function_id,
     }
+}
+
+fn block_entry_counter_count(module: &BlockPyModule<CodegenModuleShape>) -> usize {
+    module
+        .counter_defs
+        .iter()
+        .filter(|counter| counter.kind == "block_entry")
+        .count()
 }
 
 #[test]
@@ -240,5 +253,37 @@ class C:
             .all(|function_id| !interpreted_ids.contains(&function_id)),
         "counter definitions should not target interpreted functions: {:?}",
         codegen.counter_defs
+    );
+}
+
+#[test]
+fn typed_explicit_counter_placement_defines_codegen_block_entry_counters_without_increments() {
+    let source = "def f(x):\n    if x:\n        return 1\n    return 0\n";
+    let codegen = codegen_module_for_trace_test(source);
+    let config = InstrumentationConfig::from_env_config(
+        &SoacEnvConfig::default()
+            .with_specialization_mode(Some(SpecializationMode::Profile))
+            .with_profiled_cold_blocks_enabled(true)
+            .with_runtime_optimization_pipeline(RuntimeOptimizationPipeline::TypedV3),
+    );
+    assert_eq!(
+        config.explicit_counter_placement,
+        ExplicitCounterPlacement::Typed
+    );
+
+    let instrumented =
+        instrument_module_with_tracker(codegen, &config, &mut NoopPassTracker::new())
+            .expect("codegen counter definition pass should succeed");
+
+    assert!(
+        block_entry_counter_count(&instrumented) > 0,
+        "typed runtime still needs codegen counter definitions for storage layout"
+    );
+    assert!(
+        instrumented
+            .callable_defs
+            .iter()
+            .all(|function| !function_contains_increment_counter(function)),
+        "typed runtime should not insert explicit counter instructions into codegen IR"
     );
 }

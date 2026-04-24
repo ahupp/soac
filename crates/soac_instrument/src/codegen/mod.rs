@@ -1,10 +1,10 @@
-use crate::{CounterBuilder, InstrumentationConfig};
+use crate::{CounterBuilder, ExplicitCounterPlacement, InstrumentationConfig};
 use soac_config::{ExecTraceConfig, SoacEnvConfig};
 use soac_core::block_py::{
     BinOpKind, BlockPyFunction, BlockPyModule, BlockTerm, Call, CallArgPositional, ChildVisitable,
     CounterScope, CounterSite, FunctionExecutionMode, HasSemanticInstrId, InstrId, LiteralValue,
-    Load, Meta, NameLocation, ResolvedName, RuntimeFunctionId, RuntimeName, StringLiteral, Tuple,
-    Visit, WithMeta,
+    Load, Meta, ModuleShape, NameLocation, ResolvedName, RuntimeFunctionId, RuntimeName,
+    StringLiteral, Tuple, Visit, WithMeta,
 };
 use soac_core::pass_tracker::PassTracker;
 use soac_lowering::block_py::counters::IncrementCounter;
@@ -39,9 +39,9 @@ pub fn specialization_runtime_logging_enabled(config: &SoacEnvConfig) -> bool {
     InstrumentationConfig::from_env_config(config).specialization_runtime_logging_enabled()
 }
 
-fn functions_with_counter_instrumentation(
-    functions: &[BlockPyFunction<CodegenModuleShape>],
-) -> impl Iterator<Item = &BlockPyFunction<CodegenModuleShape>> {
+fn functions_with_counter_instrumentation<P: ModuleShape>(
+    functions: &[BlockPyFunction<P>],
+) -> impl Iterator<Item = &BlockPyFunction<P>> {
     functions
         .iter()
         .filter(|function| function.execution_mode() == FunctionExecutionMode::Jit)
@@ -76,7 +76,14 @@ pub fn instrument_module_with_tracker(
         pass_tracker.run_pass("bb_locality_counters", || {
             let mut counted = call_target_counted;
             if config.counters.profiled_cold_blocks {
-                instrument_bb_module_with_block_entry_counters(&mut counted);
+                match config.explicit_counter_placement {
+                    ExplicitCounterPlacement::Codegen => {
+                        instrument_bb_module_with_block_entry_counters(&mut counted);
+                    }
+                    ExplicitCounterPlacement::Typed => {
+                        define_bb_module_block_entry_counters(&mut counted);
+                    }
+                }
             }
             instrument_bb_module_with_locality_counters(&mut counted);
             counted
@@ -96,9 +103,9 @@ pub fn instrument_module_with_tracker(
     }
 }
 
-fn functions_with_counter_instrumentation_mut(
-    functions: &mut [BlockPyFunction<CodegenModuleShape>],
-) -> impl Iterator<Item = &mut BlockPyFunction<CodegenModuleShape>> {
+fn functions_with_counter_instrumentation_mut<P: ModuleShape>(
+    functions: &mut [BlockPyFunction<P>],
+) -> impl Iterator<Item = &mut BlockPyFunction<P>> {
     functions
         .iter_mut()
         .filter(|function| function.execution_mode() == FunctionExecutionMode::Jit)
@@ -143,22 +150,48 @@ pub fn instrument_bb_module_for_trace(
     }
 }
 
+pub(crate) fn define_block_entry_counter(
+    counters: &mut CounterBuilder<'_>,
+    function_id: RuntimeFunctionId,
+    block_label: soac_core::block_py::BlockLabel,
+) -> crate::CounterHandle {
+    counters.define_if_missing(
+        CounterScope::This,
+        "block_entry",
+        CounterSite::BlockEntry {
+            function_id,
+            block_label,
+        },
+    )
+}
+
+pub(crate) fn define_bb_module_block_entry_counters<P: ModuleShape>(module: &mut BlockPyModule<P>) {
+    let BlockPyModule {
+        callable_defs,
+        counter_defs,
+        ..
+    } = module;
+    let mut counters = CounterBuilder::new(counter_defs);
+    for function in functions_with_counter_instrumentation(callable_defs) {
+        for block in &function.blocks {
+            define_block_entry_counter(&mut counters, function.function_id, block.label);
+        }
+    }
+}
+
 pub fn instrument_bb_module_with_block_entry_counters(
     module: &mut BlockPyModule<CodegenModuleShape>,
 ) {
-    let mut counters = CounterBuilder::new(&mut module.counter_defs);
-    for function in functions_with_counter_instrumentation_mut(&mut module.callable_defs) {
+    let BlockPyModule {
+        callable_defs,
+        counter_defs,
+        ..
+    } = module;
+    let mut counters = CounterBuilder::new(counter_defs);
+    for function in functions_with_counter_instrumentation_mut(callable_defs) {
         for block in &mut function.blocks {
-            let counter_id = counters
-                .define(
-                    CounterScope::This,
-                    "block_entry",
-                    CounterSite::BlockEntry {
-                        function_id: function.function_id,
-                        block_label: block.label,
-                    },
-                )
-                .id();
+            let counter_id =
+                define_block_entry_counter(&mut counters, function.function_id, block.label).id();
             block.body.insert(
                 0,
                 InstrCodegen::from(IncrementCounter::new(counter_id).with_meta(Meta::synthetic())),

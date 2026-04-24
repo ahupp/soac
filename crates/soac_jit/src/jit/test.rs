@@ -71,6 +71,11 @@ mod tests {
         fn PyCell_New(obj: *mut ffi::PyObject) -> *mut ffi::PyObject;
     }
 
+    fn typed_v3_env_config() -> SoacEnvConfig {
+        SoacEnvConfig::default()
+            .with_runtime_optimization_pipeline(RuntimeOptimizationPipeline::TypedV3)
+    }
+
     fn runtime_branch_counter_for(
         counter_defs: &[CounterDef],
         function_id: RuntimeFunctionId,
@@ -17812,8 +17817,12 @@ def f(x, y):
             assert!(!profile.behavior_change_indexed_stores);
             assert!(!profile.guard_miss_deopt);
 
-            let module_plan = build_typed_v3_jit_module_plan(&shared_state.lowered_module, None)
-                .expect("typed-v3 runtime should lower CodegenModuleShape to typed JIT");
+            let module_plan = build_typed_v3_jit_module_plan(
+                &shared_state.lowered_module,
+                None,
+                &typed_v3_env_config(),
+            )
+            .expect("typed-v3 runtime should lower CodegenModuleShape to typed JIT");
             assert_eq!(module_plan.module.callable_defs.len(), 1);
             assert_eq!(
                 module_plan.module.module_name_gen.module_id(),
@@ -17969,9 +17978,12 @@ def f(x, y):
                 "the raw v3 planner can still record that inline won the body cost model"
             );
 
-            let module_plan =
-                build_typed_v3_jit_module_plan(&shared_state.lowered_module, Some(&profile))
-                    .expect("typed-v3 runtime should lower the cached pre-opt module to typed JIT");
+            let module_plan = build_typed_v3_jit_module_plan(
+                &shared_state.lowered_module,
+                Some(&profile),
+                &typed_v3_env_config(),
+            )
+            .expect("typed-v3 runtime should lower the cached pre-opt module to typed JIT");
             let planned_caller = module_plan
                 .module
                 .callable_defs
@@ -18216,8 +18228,9 @@ class Point:
                 guard_miss_deopt: false,
             };
 
-            let module_plan = build_typed_v3_jit_module_plan(&module, Some(&profile))
-                .expect("typed-v3 module plan should attach indexed-field access plans");
+            let module_plan =
+                build_typed_v3_jit_module_plan(&module, Some(&profile), &typed_v3_env_config())
+                    .expect("typed-v3 module plan should attach indexed-field access plans");
             let planned_function = module_plan
                 .module
                 .callable_defs
@@ -18302,8 +18315,9 @@ class Point:
             guard_miss_deopt: false,
         };
 
-        let module_plan = build_typed_v3_jit_module_plan(&module, Some(&profile))
-            .expect("typed-v3 module plan should attach indexed-global access plans");
+        let module_plan =
+            build_typed_v3_jit_module_plan(&module, Some(&profile), &typed_v3_env_config())
+                .expect("typed-v3 module plan should attach indexed-global access plans");
         let planned_function = module_plan
             .module
             .callable_defs
@@ -18415,8 +18429,9 @@ class Point:
             guard_miss_deopt: false,
         };
 
-        let module_plan = build_typed_v3_jit_module_plan(&module, Some(&profile))
-            .expect("typed-v3 module plan should attach exact-list item access plans");
+        let module_plan =
+            build_typed_v3_jit_module_plan(&module, Some(&profile), &typed_v3_env_config())
+                .expect("typed-v3 module plan should attach exact-list item access plans");
         let planned_function = module_plan
             .module
             .callable_defs
@@ -18583,8 +18598,9 @@ class Point:
             guard_miss_deopt: false,
         };
 
-        let module_plan = build_typed_v3_jit_module_plan(&module, Some(&profile))
-            .expect("typed-v3 module plan should attach exact-int selections");
+        let module_plan =
+            build_typed_v3_jit_module_plan(&module, Some(&profile), &typed_v3_env_config())
+                .expect("typed-v3 module plan should attach exact-int selections");
         let planned_function = module_plan
             .module
             .callable_defs

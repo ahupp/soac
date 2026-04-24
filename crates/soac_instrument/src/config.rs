@@ -5,6 +5,7 @@ use soac_core::block_py::CounterScope;
 pub struct InstrumentationConfig {
     pub trace: Option<ExecTraceConfig>,
     pub counters: CounterInstrumentationConfig,
+    pub explicit_counter_placement: ExplicitCounterPlacement,
     pub deopt_entry_counters: bool,
     pub specialization_runtime_logging: bool,
 }
@@ -23,11 +24,25 @@ pub enum RefcountCounterMode {
     Scoped(CounterScope),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExplicitCounterPlacement {
+    Codegen,
+    Typed,
+}
+
 impl InstrumentationConfig {
     pub fn from_env_config(config: &SoacEnvConfig) -> Self {
         let top_value_counters = config
             .specialization_mode()
             .is_some_and(SpecializationMode::records_counters);
+        let explicit_counter_placement = if config
+            .runtime_optimization_pipeline()
+            .uses_typed_v3_runtime()
+        {
+            ExplicitCounterPlacement::Typed
+        } else {
+            ExplicitCounterPlacement::Codegen
+        };
         let deopt_entry_counters = if config
             .runtime_optimization_pipeline()
             .uses_typed_v3_runtime()
@@ -52,6 +67,7 @@ impl InstrumentationConfig {
                 profiled_cold_blocks: config.profiled_cold_blocks_enabled(),
                 refcounts,
             },
+            explicit_counter_placement,
             deopt_entry_counters,
             specialization_runtime_logging: config.specialization_runtime_logging_enabled(),
         }
@@ -96,6 +112,20 @@ mod tests {
             RefcountCounterMode::Disabled
         );
         assert!(!instrumentation.deopt_entry_counters_enabled());
+    }
+
+    #[test]
+    fn typed_v3_runtime_places_explicit_counters_in_typed_ir() {
+        let config = SoacEnvConfig::default()
+            .with_specialization_mode(Some(SpecializationMode::Profile))
+            .with_runtime_optimization_pipeline(RuntimeOptimizationPipeline::TypedV3);
+
+        let instrumentation = InstrumentationConfig::from_env_config(&config);
+
+        assert_eq!(
+            instrumentation.explicit_counter_placement,
+            ExplicitCounterPlacement::Typed
+        );
     }
 
     #[test]

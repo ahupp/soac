@@ -49,6 +49,7 @@ use soac_driver::codegen_cache::{
     validate_codegen_module_cache_metadata,
 };
 use soac_driver::finish_cached_codegen_module_for_runtime_with_counter_defs;
+use soac_instrument::InstrumentationConfig;
 use soac_opt::access_emission_v3::{
     ExactListItemAccessPlan as OptV3ExactListItemAccessPlan,
     IndexedFieldAccessPlan as OptV3IndexedFieldAccessPlan,
@@ -1798,7 +1799,11 @@ impl JitBatchPlan<'_> {
                     Some(inputs.session.as_ref()),
                 )?;
                 if runtime_pipeline.uses_typed_v3_runtime() {
-                    build_typed_v3_jit_module_plan(&shared_state.lowered_module, Some(&profile))?
+                    build_typed_v3_jit_module_plan(
+                        &shared_state.lowered_module,
+                        Some(&profile),
+                        inputs.session.env_config()?,
+                    )?
                 } else if profile.optimized_module.is_some() {
                     build_profiled_jit_module_plan(&shared_state.lowered_module, &profile)?
                 } else {
@@ -1809,9 +1814,11 @@ impl JitBatchPlan<'_> {
                     RuntimeOptimizationPipeline::PlanArtifacts => {
                         build_jit_module_plan(inputs.module)?
                     }
-                    RuntimeOptimizationPipeline::TypedV3 => {
-                        build_typed_v3_jit_module_plan(inputs.module, None)?
-                    }
+                    RuntimeOptimizationPipeline::TypedV3 => build_typed_v3_jit_module_plan(
+                        inputs.module,
+                        None,
+                        inputs.session.env_config()?,
+                    )?,
                 }
             };
             self.module_plans.insert(binding_key, module_plan);
@@ -1933,9 +1940,14 @@ fn build_jit_module_plan(
 fn build_typed_v3_jit_module_plan(
     module: &BlockPyModule<CodegenModuleShape>,
     profile: Option<&SpecializationProfile<'_>>,
+    env_config: &SoacEnvConfig,
 ) -> Result<Arc<JitModulePlan>, String> {
     let value_facts = infer_jit_value_facts(module);
     let mut typed_module = lower_codegen_module_to_typed(module.clone());
+    typed_module = soac_instrument::typed::instrument_module(
+        typed_module,
+        &InstrumentationConfig::from_env_config(env_config),
+    )?;
     annotate_typed_module_value_facts(&mut typed_module, &value_facts);
     typed_module = lower_typed_if_tests_to_truthy(typed_module);
     if let Some(profile) = profile {
