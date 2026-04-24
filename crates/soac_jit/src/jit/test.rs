@@ -18154,6 +18154,13 @@ def f(x, y):
             0,
             "non-inline direct calls should not be expanded into inline guard CFG"
         );
+        let planned_direct_targets =
+            collect_planned_typed_call_direct_targets(&module_plan, caller_id)
+                .expect("planned module should expose direct-call dependency targets");
+        assert!(
+            planned_direct_targets.contains(&callee_id),
+            "typed-v3 worker dependencies should come from the planned InstrTyped module"
+        );
     }
 
     #[test]
