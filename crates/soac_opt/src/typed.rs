@@ -1246,6 +1246,7 @@ pub struct TypedInstrExtra {
     pub exact_int_branch: Option<TypedExactIntBranchPlan>,
     pub exact_int_return: Option<TypedExactIntReturnPlan>,
     pub exact_int_scalar_thread: Option<TypedExactIntScalarThreadPlan>,
+    pub guard_miss_deopt: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1393,6 +1394,18 @@ impl TypedInstrExtra {
     pub fn clear_exact_int_scalar_thread_plan(&mut self) -> bool {
         self.exact_int_scalar_thread.take().is_some()
     }
+
+    pub fn guard_miss_deopt_enabled(&self) -> bool {
+        self.guard_miss_deopt
+    }
+
+    pub fn set_guard_miss_deopt_enabled(&mut self, enabled: bool) -> bool {
+        if self.guard_miss_deopt == enabled {
+            return false;
+        }
+        self.guard_miss_deopt = enabled;
+        true
+    }
 }
 
 impl InstrTyped {
@@ -1490,6 +1503,11 @@ impl InstrTyped {
 
     pub fn planned_result(&self) -> Option<TypedPlannedResult> {
         self.typed_extra().and_then(TypedInstrExtra::planned_result)
+    }
+
+    pub fn guard_miss_deopt_enabled(&self) -> bool {
+        self.typed_extra()
+            .is_some_and(TypedInstrExtra::guard_miss_deopt_enabled)
     }
 }
 

@@ -3627,8 +3627,22 @@ def build(values):
         lower_typed_function_call_access_plan_instrs(&mut direct_call_typed_function);
         predeclare_typed_direct_call_imports(jit_module, &direct_call_typed_function)?;
         let mut options = options;
-        if options.planned_typed_function.is_none() {
-            options.planned_typed_function = Some(direct_call_typed_function);
+        match options.planned_typed_function.as_mut() {
+            Some(planned_typed_function) => {
+                apply_profile_typed_block_metadata_to_typed_function(
+                    planned_typed_function,
+                    &specialization_profile,
+                )?;
+                apply_profile_typed_guard_miss_policy_to_typed_function(
+                    planned_typed_function,
+                    &specialization_profile,
+                );
+                lower_typed_function_call_access_plan_instrs(planned_typed_function);
+                predeclare_typed_direct_call_imports(jit_module, planned_typed_function)?;
+            }
+            None => {
+                options.planned_typed_function = Some(direct_call_typed_function);
+            }
         }
         build_cranelift_run_bb_specialized_function(
             jit_module,
@@ -3647,7 +3661,6 @@ def build(values):
             top_value_counter_data_id,
             compile_session,
             direct_call_resolver,
-            Some(&specialization_profile),
             symbol_scope,
             predeclared_direct_functions,
             options,

@@ -1515,6 +1515,33 @@ fn apply_profile_typed_block_metadata_to_typed_function(
     Ok(())
 }
 
+fn apply_profile_typed_guard_miss_policy_to_typed_function(
+    function: &mut BlockPyFunction<TypedCodegenModuleShape>,
+    profile: &SpecializationProfile<'_>,
+) {
+    let enabled =
+        profile.guard_miss_deopt && function.scope.scope_kind != CallableScopeKind::Module;
+    if !enabled {
+        return;
+    }
+
+    struct Annotator;
+
+    impl VisitMut<InstrTyped> for Annotator {
+        fn visit_instr_mut(&mut self, expr: &mut InstrTyped) {
+            if expr.try_semantic_instr_id().is_some()
+                && let Some(extra) = expr.typed_extra_mut()
+            {
+                extra.set_guard_miss_deopt_enabled(true);
+            }
+            expr.visit_children_mut(self);
+        }
+    }
+
+    let mut annotator = Annotator;
+    annotator.visit_fn_mut(function);
+}
+
 fn apply_profile_typed_plans_to_typed_function(
     function: &mut BlockPyFunction<TypedCodegenModuleShape>,
     profile: Option<&SpecializationProfile<'_>>,
@@ -1525,6 +1552,7 @@ fn apply_profile_typed_plans_to_typed_function(
     apply_profile_call_emission_plans_to_typed_function(function, profile)?;
     apply_profile_access_and_scalar_plans_to_typed_function(function, profile)?;
     apply_profile_typed_block_metadata_to_typed_function(function, profile)?;
+    apply_profile_typed_guard_miss_policy_to_typed_function(function, profile);
     Ok(())
 }
 
@@ -2067,6 +2095,7 @@ fn apply_typed_v3_module_rewrites(
         }
         apply_profile_access_and_scalar_plans_to_typed_function(function, profile)?;
         apply_profile_typed_block_metadata_to_typed_function(function, profile)?;
+        apply_profile_typed_guard_miss_policy_to_typed_function(function, profile);
     }
     Ok(())
 }
@@ -3247,7 +3276,6 @@ impl ProcessJitState {
             reserved_inputs.top_value_counter_data_id,
             inputs.session.as_ref(),
             function_direct_call_resolver,
-            None,
             reserved_inputs.symbol_scope.as_deref(),
             Some(&plan.predeclared),
             BuildSpecializedFunctionOptions {
@@ -5567,7 +5595,7 @@ fn emit_codegen_indexed_global_load(
     let guard_miss_dispatch = prepare_optional_guard_miss_dispatch(
         ctx.guard_miss_target_for_resume_point(guard_miss_resume_point, &[], fallback_block),
         fallback_block,
-        ctx.guard_miss_deopt_stub_ref,
+        ctx.guard_miss_deopt_ref_for_instr_id(instr_id),
     );
     let direct_block = fb.create_block();
     fb.append_block_param(direct_block, ptr_ty);
@@ -6487,6 +6515,7 @@ struct JitEmitCtx<'mc> {
     probe_global_indexed_ref: ir::FuncRef,
     load_global_slow_ref: ir::FuncRef,
     guard_miss_deopt_stub_ref: Option<ir::FuncRef>,
+    guard_miss_deopt_instr_ids: &'mc HashSet<InstrId>,
     guard_miss_resume_point: Option<LocalEnvResumePoint>,
     store_global_indexed_ref: ir::FuncRef,
     probe_field_indexed_ref: ir::FuncRef,
@@ -6621,6 +6650,35 @@ fn prepare_optional_guard_miss_dispatch(
         return JitGuardMissDispatch::FallbackBlock(fallback_block);
     };
     prepare_guard_miss_dispatch(target, Some(deopt_resume_ref))
+}
+
+fn collect_typed_guard_miss_deopt_instr_ids(
+    function: &BlockPyFunction<TypedCodegenModuleShape>,
+    force_all_with_typed_extra: bool,
+) -> HashSet<InstrId> {
+    struct Collector {
+        force_all_with_typed_extra: bool,
+        instr_ids: HashSet<InstrId>,
+    }
+
+    impl Visit<InstrTyped> for Collector {
+        fn visit_instr(&mut self, expr: &InstrTyped) {
+            if (self.force_all_with_typed_extra || expr.guard_miss_deopt_enabled())
+                && expr.typed_extra().is_some()
+                && let Some(instr_id) = expr.try_semantic_instr_id()
+            {
+                self.instr_ids.insert(instr_id);
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    let mut collector = Collector {
+        force_all_with_typed_extra,
+        instr_ids: HashSet::new(),
+    };
+    collector.visit_fn(function);
+    collector.instr_ids
 }
 
 fn emit_deopt_resume_call(
@@ -6935,6 +6993,13 @@ impl JitEmitCtx<'_> {
             fallback_block,
             deopt_exit,
         })
+    }
+
+    fn guard_miss_deopt_ref_for_instr_id(&self, instr_id: InstrId) -> Option<ir::FuncRef> {
+        self.guard_miss_deopt_instr_ids
+            .contains(&instr_id)
+            .then_some(self.guard_miss_deopt_stub_ref)
+            .flatten()
     }
 
     fn with_guard_miss_resume_point(&self, point: LocalEnvResumePoint) -> Self {
@@ -8911,7 +8976,7 @@ impl<'a, 'b, 'mc, 'c, 'd, Env: JitCodegenEnv> intrinsics::OperationEmitState<'b,
                 fallback_block,
             ),
             fallback_block,
-            self.ctx.guard_miss_deopt_stub_ref,
+            self.ctx.guard_miss_deopt_ref_for_instr_id(instr_id),
         )
     }
 
@@ -9077,7 +9142,7 @@ impl<'a, 'b, 'mc, 'c, 'd, Env: JitCodegenEnv> intrinsics::OperationEmitState<'b,
         prepare_optional_guard_miss_dispatch(
             guard_miss_target,
             fallback_block,
-            self.ctx.guard_miss_deopt_stub_ref,
+            self.ctx.guard_miss_deopt_ref_for_instr_id(instr_id),
         )
     }
 
@@ -15069,7 +15134,7 @@ fn prepare_typed_guard_miss_dispatch_for_instr(
             fallback_block,
         ),
         fallback_block,
-        emit_ctx.guard_miss_deopt_stub_ref,
+        emit_ctx.guard_miss_deopt_ref_for_instr_id(instr_id),
     )
 }
 
@@ -16641,7 +16706,9 @@ fn emit_codegen_simple_call_with_local_env(
                             generic_block,
                         ),
                         generic_block,
-                        emit_ctx.guard_miss_deopt_stub_ref,
+                        site_instr_id.and_then(|instr_id| {
+                            emit_ctx.guard_miss_deopt_ref_for_instr_id(instr_id)
+                        }),
                     )
                 })
                 .unwrap_or(JitGuardMissDispatch::FallbackBlock(generic_block));
@@ -16856,7 +16923,7 @@ fn emit_codegen_simple_call_with_local_env(
                         generic_block,
                     ),
                     generic_block,
-                    emit_ctx.guard_miss_deopt_stub_ref,
+                    emit_ctx.guard_miss_deopt_ref_for_instr_id(site_instr_id),
                 )
             } else {
                 JitGuardMissDispatch::FallbackBlock(generic_block)
@@ -25862,7 +25929,6 @@ fn precompile_codegen_module_to_object_bytes(
             top_value_counter_data_id,
             &compile_session,
             None,
-            Some(&specialization_profile),
             symbol_scopes.get(&function.function_id).map(String::as_str),
             Some(&predeclared),
             BuildSpecializedFunctionOptions {
@@ -26419,7 +26485,6 @@ fn build_cranelift_run_bb_specialized_function(
     top_value_counter_data_id: Option<DataId>,
     compile_session: &crate::session::CompileSession,
     direct_call_resolver: Option<&crate::module_type::SharedModuleState>,
-    specialization_profile: Option<&SpecializationProfile<'_>>,
     symbol_scope: Option<&str>,
     predeclared_direct_functions: Option<&HashMap<RuntimeFunctionId, DeclaredJitFunction>>,
     options: BuildSpecializedFunctionOptions,
@@ -26592,10 +26657,6 @@ fn build_cranelift_run_bb_specialized_function(
             function.names.qualname
         ));
     }
-    let guard_miss_deopt_stub = options.guard_miss_deopt_stub
-        || specialization_profile.is_some_and(|profile| {
-            profile.guard_miss_deopt && function.scope.scope_kind != CallableScopeKind::Module
-        });
     let function_runtime_data_layout = FunctionRuntimeDataLayout::from_typed_function(function);
     let true_constant_id = module_constants.require_runtime_name_constant_id("TRUE");
     let false_constant_id = module_constants.require_runtime_name_constant_id("FALSE");
@@ -26608,6 +26669,9 @@ fn build_cranelift_run_bb_specialized_function(
         options.planned_typed_function.as_ref(),
         value_facts,
     )?;
+    let guard_miss_deopt_instr_ids =
+        collect_typed_guard_miss_deopt_instr_ids(&typed_function, options.guard_miss_deopt_stub);
+    let guard_miss_deopt_stub = !guard_miss_deopt_instr_ids.is_empty();
     let direct_call_targets = collect_typed_call_direct_targets(&typed_function);
     let empty_direct_functions = HashMap::new();
     let direct_call_functions = predeclared_direct_functions.unwrap_or(&empty_direct_functions);
@@ -27209,6 +27273,7 @@ fn build_cranelift_run_bb_specialized_function(
                 probe_global_indexed_ref,
                 load_global_slow_ref,
                 guard_miss_deopt_stub_ref,
+                guard_miss_deopt_instr_ids: &guard_miss_deopt_instr_ids,
                 guard_miss_resume_point: None,
                 store_global_indexed_ref,
                 probe_field_indexed_ref,
@@ -27858,7 +27923,6 @@ pub unsafe fn render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
         top_value_counter_data_id,
         compile_session,
         runtime_state,
-        Some(&specialization_profile),
         None,
         None,
         BuildSpecializedFunctionOptions::default(),
