@@ -1,6 +1,6 @@
 use soac_core::block_py::{
-    BlockArg, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, LocalLocation,
-    RuntimeFunctionId,
+    BlockArg, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, InstrLocationMap,
+    LocalLocation, RuntimeFunctionId, current_instr_locations,
 };
 pub use soac_opt::passes::{
     BlockParamFacts, FunctionLocalPlan, LocalRefKind, ParamBindingFacts, ParamProvenance,
@@ -201,10 +201,11 @@ impl PlannedJitDeoptResumeFunction {
     pub fn deopt_points_for_block(
         &self,
         block: BlockLabel,
+        instr_locations: &InstrLocationMap,
     ) -> impl Iterator<Item = &PlannedJitDeoptPoint> {
         self.deopt_points
             .iter()
-            .filter(move |point| point.point.block_label() == block)
+            .filter(move |point| point.point.current_block_label(instr_locations) == Some(block))
     }
 
     pub fn validate_for_typed_function(
@@ -212,6 +213,7 @@ impl PlannedJitDeoptResumeFunction {
         function: &BlockPyFunction<TypedCodegenModuleShape>,
     ) -> Result<(), String> {
         let mut errors = Vec::new();
+        let instr_locations = current_instr_locations(function);
         if self.deopt_points.len() != self.resume_plan.entries.len() {
             errors.push(format!(
                 "JIT deopt resume plan for function {} ({}) has {} deopt points but {} \
@@ -248,6 +250,16 @@ impl PlannedJitDeoptResumeFunction {
                     "JIT deopt point {:?} for function {} ({}) does not map exactly to LocalEnv \
                      resume point {:?}",
                     deopt_point.point, function.function_id, function.names.qualname, entry.point
+                ));
+            }
+            if deopt_point
+                .point
+                .current_block_label(&instr_locations)
+                .is_none()
+            {
+                errors.push(format!(
+                    "JIT deopt point {:?} for function {} ({}) does not resolve to a current block",
+                    deopt_point.point, function.function_id, function.names.qualname
                 ));
             }
             if deopt_point.precision != entry.precision {
@@ -914,9 +926,10 @@ pub fn render_jit_deopt_resume_function(
         function.function_id, function.names.qualname
     )
     .expect("writing to String should not fail");
+    let instr_locations = current_instr_locations(function);
     for block in &function.blocks {
         writeln!(out, "  block {}:", block.label).expect("writing to String should not fail");
-        for deopt_point in plan.deopt_points_for_block(block.label) {
+        for deopt_point in plan.deopt_points_for_block(block.label, &instr_locations) {
             let entry = plan.entry(deopt_point.resume_point).ok_or_else(|| {
                 format!(
                     "deopt point {:?} for function {} ({}) references missing resume entry",

@@ -22,7 +22,8 @@ pub use self::map::{
     map_module_functions,
 };
 pub use self::meta::{
-    HasMeta, HasSemanticInstrId, IdentifiedInstr, InstrId, InstrKey, Meta, WithMeta,
+    HasMeta, HasSemanticInstrId, IdentifiedInstr, InstrId, InstrKey, InstrLocation,
+    InstrLocationMap, Meta, WithMeta, current_instr_locations,
 };
 pub use self::param_specs::{Param, ParamDefaultSource, ParamKind, ParamSpec};
 pub use self::scope::{

@@ -235,8 +235,8 @@ pub fn validate_codegen_instr_ids(
 mod test {
     use super::validate_codegen_instr_ids;
     use crate::block_py::{
-        walk_block, ChildVisitable, CounterId, HasMeta, HasSemanticInstrId, InstrCodegen, InstrId,
-        Meta, Visit, VisitMut, WithMeta,
+        current_instr_locations, walk_block, BlockLabel, ChildVisitable, CounterId, HasMeta,
+        HasSemanticInstrId, InstrCodegen, InstrId, Meta, Visit, VisitMut, WithMeta,
     };
     use crate::lower_python_to_blockpy_for_testing;
     use crate::passes::CodegenModuleShape;
@@ -428,6 +428,40 @@ def f(x):
 
         validate_codegen_instr_ids(&lowered)
             .expect("synthetic counter instrumentation should not require semantic ids");
+    }
+
+    #[test]
+    fn current_instr_locations_use_containing_block_not_embedded_id_label() {
+        let mut lowered = lower_python_to_blockpy_for_testing(
+            r#"
+def f(x):
+    y = x + 1
+    return y
+"#,
+        )
+        .expect("transform should succeed")
+        .codegen_module;
+
+        let f = lowered
+            .callable_defs
+            .iter_mut()
+            .find(|function| function.names.qualname == "f")
+            .expect("missing lowered function f");
+        let containing_block = f.blocks[0].label;
+        let original_id = nth_instr_id(f, 0);
+        let stale_id = InstrId::new(
+            BlockLabel::from_index(999),
+            original_id.instr_index_in_block(),
+        );
+        set_nth_instr_id(f, 0, Some(stale_id));
+
+        let locations = current_instr_locations(f);
+        let location = locations
+            .get(&stale_id)
+            .expect("updated instruction id should be located");
+        assert_eq!(location.block_label(), containing_block);
+        assert_ne!(location.block_label(), BlockLabel::from_index(999));
+        assert_eq!(location.body_index(), Some(0));
     }
 
     #[test]

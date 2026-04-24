@@ -13,8 +13,8 @@ use crate::passes::{
     CodegenModuleShape, FactStore, InstrCodegen, InstrTyped, PyObjFacts, TypedCodegenModuleShape,
 };
 use soac_core::block_py::{
-    BlockLabel, BlockPyFunction, BlockPyModule, HasSemanticInstrId, InstrKey, LocalLocation,
-    RuntimeFunctionId,
+    BlockLabel, BlockPyFunction, BlockPyModule, HasSemanticInstrId, InstrKey, InstrLocationMap,
+    LocalLocation, RuntimeFunctionId, current_instr_locations,
 };
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
@@ -176,10 +176,12 @@ impl LocalEnvResumePoint {
         }
     }
 
-    pub const fn block_label(self) -> BlockLabel {
+    pub fn current_block_label(self, instr_locations: &InstrLocationMap) -> Option<BlockLabel> {
         match self {
-            Self::BlockEntry { block, .. } | Self::BeforeTerm { block, .. } => block,
-            Self::BeforeInstr { key } => key.instr_id.block_label(),
+            Self::BlockEntry { block, .. } | Self::BeforeTerm { block, .. } => Some(block),
+            Self::BeforeInstr { key } => instr_locations
+                .get(&key.instr_id)
+                .map(|location| location.block_label()),
         }
     }
 
@@ -289,10 +291,11 @@ impl FunctionLocalEnvResumePlan {
     pub fn entries_for_block(
         &self,
         block: BlockLabel,
+        instr_locations: &InstrLocationMap,
     ) -> impl Iterator<Item = &LocalEnvResumeEntry> {
         self.entries
             .iter()
-            .filter(move |entry| entry.point.block_label() == block)
+            .filter(move |entry| entry.point.current_block_label(instr_locations) == Some(block))
     }
 
     pub fn remap_function_ids(
@@ -964,9 +967,10 @@ pub fn render_local_env_resume_function_plan(
         function.function_id, function.names.qualname
     )
     .expect("writing to String should not fail");
+    let instr_locations = current_instr_locations(function);
     for block in &function.blocks {
         writeln!(out, "  block {}:", block.label).expect("writing to String should not fail");
-        for entry in plan.entries_for_block(block.label) {
+        for entry in plan.entries_for_block(block.label, &instr_locations) {
             writeln!(
                 out,
                 "    {} precision={:?}:",

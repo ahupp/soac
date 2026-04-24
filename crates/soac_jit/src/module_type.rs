@@ -14,6 +14,7 @@ use soac_core::block_py::{
     BlockPyFunction, BlockPyModule, ChildVisitable, CounterBranch, CounterDef, CounterId,
     CounterScope, CounterSite, DeoptEntrySource, FunctionExecutionMode, HasSemanticInstrId,
     InstrId, RuntimeFunctionId, RuntimeModuleId, RuntimeName, SerializedFunctionId, Visit,
+    current_instr_locations,
 };
 use soac_core::profile::{
     CounterDumpBranchValue, CounterDumpKeyLayout, CounterDumpRecord, CounterDumpRow,
@@ -177,6 +178,25 @@ impl SharedModuleState {
         let function = self.lowered_module.callable_defs.get(function_index)?;
         assert_eq!(function.function_id, function_id);
         Some(function)
+    }
+
+    fn deopt_entry_source_block_label(
+        &self,
+        function_id: RuntimeFunctionId,
+        source: DeoptEntrySource,
+    ) -> String {
+        match source {
+            DeoptEntrySource::BlockEntry { block_label }
+            | DeoptEntrySource::BeforeTerm { block_label } => block_label.to_string(),
+            DeoptEntrySource::BeforeInstr { instr_id } => self
+                .lookup_function(function_id)
+                .and_then(|function| {
+                    current_instr_locations(function)
+                        .get(&instr_id)
+                        .map(|location| location.block_label().to_string())
+                })
+                .unwrap_or_default(),
+        }
     }
 
     pub(crate) fn lookup_direct_call_target_function(
@@ -438,7 +458,7 @@ impl SharedModuleState {
                     self.lookup_function(*function_id)
                         .map(|function| function.names.qualname.clone())
                         .unwrap_or_default(),
-                    deopt_entry_source_block_label(*source),
+                    self.deopt_entry_source_block_label(*function_id, *source),
                 ),
                 CounterSite::Runtime {
                     function_id,
@@ -536,7 +556,7 @@ impl SharedModuleState {
                     deopt_entry_source_instr_id(*source),
                     self.lookup_function(*function_id)
                         .map(|function| function.names.qualname.clone()),
-                    Some(deopt_entry_source_block_label(*source)),
+                    Some(self.deopt_entry_source_block_label(*function_id, *source)),
                 ),
                 CounterSite::Runtime {
                     function_id,
@@ -701,14 +721,6 @@ fn deopt_entry_source_instr_id(source: DeoptEntrySource) -> Option<soac_core::bl
     match source {
         DeoptEntrySource::BeforeInstr { instr_id } => Some(instr_id),
         DeoptEntrySource::BlockEntry { .. } | DeoptEntrySource::BeforeTerm { .. } => None,
-    }
-}
-
-fn deopt_entry_source_block_label(source: DeoptEntrySource) -> String {
-    match source {
-        DeoptEntrySource::BlockEntry { block_label }
-        | DeoptEntrySource::BeforeTerm { block_label } => block_label.to_string(),
-        DeoptEntrySource::BeforeInstr { instr_id } => instr_id.block_label().to_string(),
     }
 }
 

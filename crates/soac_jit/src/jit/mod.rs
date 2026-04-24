@@ -37,9 +37,10 @@ use soac_core::block_py::{
     BlockPyModule, BlockTerm, CallArgKeyword, CallArgPositional, CallableScopeKind, CellLocation,
     ChildVisitable, CounterBranchId, CounterDef, CounterId, CounterScope, CounterSite, Del,
     DeoptEntrySource, FunctionExecutionMode, FunctionKind, HasMeta, HasSemanticInstrId, InstrId,
-    InstrKey, LocalFunctionId, LocalLocation, ModuleContentId, ModuleShape, NameLocation,
-    ParamKind, PersistentFunctionId, ResolvedName, RuntimeFunctionId, RuntimeModuleId, RuntimeName,
-    SerializedFunctionId, StorageLayout, Store, Visit, VisitMut, WithMeta,
+    InstrKey, InstrLocationMap, LocalFunctionId, LocalLocation, ModuleContentId, ModuleShape,
+    NameLocation, ParamKind, PersistentFunctionId, ResolvedName, RuntimeFunctionId,
+    RuntimeModuleId, RuntimeName, SerializedFunctionId, StorageLayout, Store, Visit, VisitMut,
+    WithMeta, current_instr_locations,
 };
 use soac_core::profile::{
     CollectedTypeKeyLayout, CounterDumpTypeKey, read_block_entry_counts_from_file,
@@ -4177,6 +4178,7 @@ impl RuntimeJitDeoptTable {
         >,
     ) -> Result<Self, String> {
         let mut points = Vec::with_capacity(plan.deopt_points.len());
+        let instr_locations = current_instr_locations(function);
         for deopt_point in &plan.deopt_points {
             let entry = plan.entry(deopt_point.resume_point).ok_or_else(|| {
                 format!(
@@ -4191,6 +4193,7 @@ impl RuntimeJitDeoptTable {
                 locals: entry.locals.clone(),
                 continuation: runtime_jit_deopt_continuation_for_point(
                     function,
+                    &instr_locations,
                     deopt_point.resume_point,
                 ),
             });
@@ -4315,6 +4318,7 @@ impl RuntimeJitDeoptTable {
 
 fn runtime_jit_deopt_continuation_for_point(
     function: &BlockPyFunction<CodegenModuleShape>,
+    instr_locations: &InstrLocationMap,
     point: LocalEnvResumePoint,
 ) -> RuntimeJitDeoptContinuation {
     match point {
@@ -4349,7 +4353,12 @@ fn runtime_jit_deopt_continuation_for_point(
                     RuntimeJitDeoptUnsupportedReason::WrongFunction,
                 );
             }
-            let block_label = key.instr_id.block_label();
+            let Some(location) = instr_locations.get(&key.instr_id).copied() else {
+                return RuntimeJitDeoptContinuation::unsupported(
+                    RuntimeJitDeoptUnsupportedReason::MissingInstruction,
+                );
+            };
+            let block_label = location.block_label();
             let Some(block) = function
                 .blocks
                 .iter()
@@ -4359,11 +4368,7 @@ fn runtime_jit_deopt_continuation_for_point(
                     RuntimeJitDeoptUnsupportedReason::MissingBlock,
                 );
             };
-            let Some(start_body_index) = block
-                .body
-                .iter()
-                .position(|instr| instr.try_semantic_instr_id() == Some(key.instr_id))
-            else {
+            let Some(start_body_index) = location.body_index() else {
                 return RuntimeJitDeoptContinuation::unsupported(
                     RuntimeJitDeoptUnsupportedReason::MissingInstruction,
                 );
@@ -4408,6 +4413,7 @@ fn runtime_jit_deopt_continuation_for_point(
 
 fn runtime_jit_typed_deopt_continuation_for_point(
     function: &BlockPyFunction<TypedCodegenModuleShape>,
+    instr_locations: &InstrLocationMap,
     point: LocalEnvResumePoint,
 ) -> RuntimeJitDeoptContinuation {
     match point {
@@ -4437,20 +4443,19 @@ fn runtime_jit_typed_deopt_continuation_for_point(
                     RuntimeJitDeoptUnsupportedReason::WrongFunction,
                 );
             }
-            for block in &function.blocks {
-                if let Some(index) = block
-                    .body
-                    .iter()
-                    .position(|instr| instr.try_semantic_instr_id() == Some(key.instr_id))
-                {
-                    return RuntimeJitDeoptContinuation::ResumeBlockTail {
-                        cursor: RuntimeJitDeoptCursor::new(block.label, index),
-                    };
-                }
+            let Some(location) = instr_locations.get(&key.instr_id).copied() else {
+                return RuntimeJitDeoptContinuation::unsupported(
+                    RuntimeJitDeoptUnsupportedReason::MissingInstruction,
+                );
+            };
+            let Some(body_index) = location.body_index() else {
+                return RuntimeJitDeoptContinuation::unsupported(
+                    RuntimeJitDeoptUnsupportedReason::MissingInstruction,
+                );
+            };
+            RuntimeJitDeoptContinuation::ResumeBlockTail {
+                cursor: RuntimeJitDeoptCursor::new(location.block_label(), body_index),
             }
-            RuntimeJitDeoptContinuation::unsupported(
-                RuntimeJitDeoptUnsupportedReason::MissingInstruction,
-            )
         }
         LocalEnvResumePoint::BlockEntry { function_id, block } => {
             if function_id != function.function_id {
@@ -6501,6 +6506,7 @@ struct JitEmitCtx<'mc> {
     value_facts: &'mc FactStore,
     deopt_resume_plan: &'mc PlannedJitDeoptResumeFunction,
     refcount_plan: &'mc FunctionRefcountPlan,
+    instr_locations: &'mc InstrLocationMap,
     counter_slots_by_id: &'mc [CounterRuntimeSlot],
     storage_layout: Option<StorageLayout>,
     function_runtime_data_layout: &'mc FunctionRuntimeDataLayout,
@@ -6972,7 +6978,8 @@ impl JitEmitCtx<'_> {
             .find(|function| function.function_id == self.function_id)
             .ok_or(RuntimeJitDeoptUnsupportedReason::MissingFunction)?;
         if let Some(reason) =
-            runtime_jit_typed_deopt_continuation_for_point(function, point).unsupported_reason()
+            runtime_jit_typed_deopt_continuation_for_point(function, self.instr_locations, point)
+                .unsupported_reason()
         {
             return Err(reason);
         }
@@ -8148,7 +8155,11 @@ fn planned_local_store_effect_for_key(
     location: LocalLocation,
     ctx: &JitEmitCtx<'_>,
 ) -> Option<PlannedLocalStoreEffect> {
-    let block_plan = ctx.refcount_plan.block(instr_key.instr_id.block_label())?;
+    let block_label = ctx
+        .instr_locations
+        .get(&instr_key.instr_id)
+        .map(|location| location.block_label())?;
+    let block_plan = ctx.refcount_plan.block(block_label)?;
     for action in &block_plan.actions {
         let RefcountSite::Instr(site_key) = action.site else {
             continue;
@@ -26759,6 +26770,7 @@ fn build_cranelift_run_bb_specialized_function(
         let entry_materializations = &jit_local_plan.entry_materializations;
         let exc_dispatches = &jit_local_plan.exc_dispatches;
         let refcount_plan = &jit_local_plan.refcount_plan;
+        let instr_locations = current_instr_locations(function);
         let full_block_param_names = function
             .blocks
             .iter()
@@ -27241,6 +27253,7 @@ fn build_cranelift_run_bb_specialized_function(
                 value_facts,
                 deopt_resume_plan: jit_deopt_resume_plan,
                 refcount_plan,
+                instr_locations: &instr_locations,
                 counter_slots_by_id,
                 storage_layout: function.storage_layout().clone(),
                 function_runtime_data_layout: &function_runtime_data_layout,
@@ -27330,7 +27343,7 @@ fn build_cranelift_run_bb_specialized_function(
             debug_assert!(
                 emit_ctx
                     .deopt_resume_plan
-                    .deopt_points_for_block(codegen_block.label)
+                    .deopt_points_for_block(codegen_block.label, &instr_locations)
                     .all(|point| point.id.function_id == function.function_id)
             );
             emit_ctx.require_deopt_point_at_block_entry(codegen_block.label)?;

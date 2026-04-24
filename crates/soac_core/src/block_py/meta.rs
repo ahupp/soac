@@ -1,6 +1,9 @@
-use super::{BlockLabel, Instr, RuntimeFunctionId};
+use super::{
+    BlockLabel, BlockPyFunction, ChildVisitable, Instr, ModuleShape, RuntimeFunctionId, Visit,
+};
 use ruff_python_ast::{self as ast, HasNodeIndex};
 use ruff_text_size::{Ranged, TextRange};
+use std::collections::HashMap;
 use std::fmt;
 
 #[derive(
@@ -43,6 +46,79 @@ impl fmt::Display for InstrId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}:{}", self.block_label, self.instr_index_in_block)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InstrLocation {
+    block_label: BlockLabel,
+    body_index: Option<usize>,
+}
+
+impl InstrLocation {
+    pub const fn new(block_label: BlockLabel, body_index: Option<usize>) -> Self {
+        Self {
+            block_label,
+            body_index,
+        }
+    }
+
+    pub const fn block_label(self) -> BlockLabel {
+        self.block_label
+    }
+
+    pub const fn body_index(self) -> Option<usize> {
+        self.body_index
+    }
+}
+
+pub type InstrLocationMap = HashMap<InstrId, InstrLocation>;
+
+struct InstrLocationCollector<'a> {
+    locations: &'a mut InstrLocationMap,
+    block_label: BlockLabel,
+    body_index: Option<usize>,
+}
+
+impl<I> super::Visit<I> for InstrLocationCollector<'_>
+where
+    I: Instr + ChildVisitable<I> + HasMeta,
+{
+    fn visit_instr(&mut self, expr: &I)
+    where
+        I: ChildVisitable<I>,
+    {
+        if let Some(instr_id) = expr.try_semantic_instr_id() {
+            self.locations
+                .entry(instr_id)
+                .or_insert_with(|| InstrLocation::new(self.block_label, self.body_index));
+        }
+        expr.visit_children(self);
+    }
+}
+
+pub fn current_instr_locations<P>(function: &BlockPyFunction<P>) -> InstrLocationMap
+where
+    P: ModuleShape,
+    P::Instr: ChildVisitable<P::Instr> + HasMeta,
+{
+    let mut locations = HashMap::new();
+    for block in &function.blocks {
+        for (body_index, instr) in block.body.iter().enumerate() {
+            let mut collector = InstrLocationCollector {
+                locations: &mut locations,
+                block_label: block.label,
+                body_index: Some(body_index),
+            };
+            collector.visit_instr(instr);
+        }
+        let mut collector = InstrLocationCollector {
+            locations: &mut locations,
+            block_label: block.label,
+            body_index: None,
+        };
+        collector.visit_term(&block.term);
+    }
+    locations
 }
 
 #[derive(
