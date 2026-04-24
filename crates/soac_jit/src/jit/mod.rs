@@ -11971,6 +11971,7 @@ struct LegacyFunctionSpecializationOverlays {
     field_index_specializations: HashMap<String, Vec<FieldIndexSpecialization>>,
     field_index_specializations_by_instr: HashMap<InstrId, Vec<FieldIndexSpecialization>>,
     indexed_fields_by_instr: HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>,
+    specialize_indexed_field_stores: bool,
     indexed_globals_by_instr: HashMap<InstrId, OptV3IndexedGlobalAccessPlan>,
     exact_int_branch_artifacts: Option<Arc<ExactIntBranchV3Artifacts>>,
 }
@@ -11979,7 +11980,6 @@ struct LegacyFunctionSpecializationOverlays {
 struct FunctionSpecializationInputs {
     legacy_overlays: Option<LegacyFunctionSpecializationOverlays>,
     cold_block_labels: HashSet<BlockLabel>,
-    behavior_change_indexed_stores: bool,
     guard_miss_deopt_stub: bool,
 }
 
@@ -12409,6 +12409,8 @@ impl FunctionSpecializationInputs {
                 field_index_specializations,
                 field_index_specializations_by_instr,
                 indexed_fields_by_instr,
+                specialize_indexed_field_stores: profile.behavior_change_indexed_stores
+                    && function.scope.scope_kind != CallableScopeKind::Module,
                 indexed_globals_by_instr: profile
                     .opt_v3_emitted_indexed_globals
                     .get(&function.function_id)
@@ -12423,8 +12425,6 @@ impl FunctionSpecializationInputs {
         Ok(Self {
             legacy_overlays,
             cold_block_labels: profile.cold_block_labels(function)?,
-            behavior_change_indexed_stores: profile.behavior_change_indexed_stores
-                && function.scope.scope_kind != CallableScopeKind::Module,
             guard_miss_deopt_stub: profile.guard_miss_deopt
                 && function.scope.scope_kind != CallableScopeKind::Module,
         })
@@ -26232,7 +26232,6 @@ fn prepare_specialized_typed_function(
     specialization_profile: Option<&SpecializationProfile<'_>>,
     value_facts: &FactStore,
     legacy_overlays: Option<&LegacyFunctionSpecializationOverlays>,
-    specialize_field_stores: bool,
 ) -> Result<PreparedSpecializedTypedFunction, String> {
     let mut typed_function = legacy_call_emission_typed_function
         .cloned()
@@ -26255,7 +26254,7 @@ fn prepare_specialized_typed_function(
             &legacy_overlays.field_index_specializations,
             &legacy_overlays.field_index_specializations_by_instr,
             &legacy_overlays.indexed_fields_by_instr,
-            specialize_field_stores,
+            legacy_overlays.specialize_indexed_field_stores,
         )?;
         annotate_typed_indexed_global_accesses(
             &mut typed_function,
@@ -26573,7 +26572,6 @@ fn build_cranelift_run_bb_specialized_function(
     };
     let legacy_overlays = specialization_inputs.legacy_overlays;
     let cold_block_labels = specialization_inputs.cold_block_labels;
-    let behavior_change_indexed_stores = specialization_inputs.behavior_change_indexed_stores;
     let guard_miss_deopt_stub = specialization_inputs.guard_miss_deopt_stub;
     let function_runtime_data_layout = FunctionRuntimeDataLayout::from_typed_function(function);
     let true_constant_id = module_constants.require_runtime_name_constant_id("TRUE");
@@ -26588,7 +26586,6 @@ fn build_cranelift_run_bb_specialized_function(
         specialization_profile,
         value_facts,
         legacy_overlays.as_ref(),
-        behavior_change_indexed_stores,
     )?;
     let direct_call_targets = collect_typed_call_direct_targets(&typed_function);
     let empty_direct_functions = HashMap::new();
@@ -27661,7 +27658,6 @@ pub unsafe fn render_instr_typed_for_codegen_with_runtime_state(
         Some(&specialization_profile),
         &jit_module_plan.value_facts,
         specialization_inputs.legacy_overlays.as_ref(),
-        specialization_inputs.behavior_change_indexed_stores,
     )?;
     let direct_call_targets = collect_typed_call_direct_targets(&typed_function);
     let mut direct_call_target_functions = HashMap::new();

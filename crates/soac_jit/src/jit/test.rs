@@ -15072,7 +15072,6 @@ def f(x):
                         ..LegacyFunctionSpecializationOverlays::default()
                     }),
                     cold_block_labels: HashSet::new(),
-                    behavior_change_indexed_stores: false,
                     guard_miss_deopt_stub: false,
                 }),
                 ..BuildSpecializedFunctionOptions::default()
@@ -15247,7 +15246,6 @@ def f(x):
                         ..LegacyFunctionSpecializationOverlays::default()
                     }),
                     cold_block_labels: HashSet::new(),
-                    behavior_change_indexed_stores: false,
                     guard_miss_deopt_stub: false,
                 }),
                 ..BuildSpecializedFunctionOptions::default()
@@ -15379,7 +15377,6 @@ def f(x):
                             ..LegacyFunctionSpecializationOverlays::default()
                         }),
                         cold_block_labels: HashSet::new(),
-                        behavior_change_indexed_stores: false,
                         guard_miss_deopt_stub: false,
                     }),
                     ..BuildSpecializedFunctionOptions::default()
@@ -15496,7 +15493,6 @@ def f(x):
                             ..LegacyFunctionSpecializationOverlays::default()
                         }),
                         cold_block_labels: HashSet::new(),
-                        behavior_change_indexed_stores: false,
                         guard_miss_deopt_stub: false,
                     }),
                     ..BuildSpecializedFunctionOptions::default()
@@ -15607,7 +15603,6 @@ def f(x):
                         ..LegacyFunctionSpecializationOverlays::default()
                     }),
                     cold_block_labels: HashSet::new(),
-                    behavior_change_indexed_stores: false,
                     guard_miss_deopt_stub: false,
                 }),
                 ..BuildSpecializedFunctionOptions::default()
@@ -16412,7 +16407,6 @@ def f(x):
         function: &BlockPyFunction<CodegenModuleShape>,
         access: IndexedGlobalAccessKind,
         name: &str,
-        behavior_change_indexed_stores: bool,
         guard_miss_deopt_stub: bool,
     ) -> FunctionSpecializationInputs {
         let source = first_indexed_global_access_source(function, access, name);
@@ -16425,7 +16419,6 @@ def f(x):
                 ..LegacyFunctionSpecializationOverlays::default()
             }),
             cold_block_labels: HashSet::new(),
-            behavior_change_indexed_stores,
             guard_miss_deopt_stub,
         }
     }
@@ -16468,7 +16461,6 @@ def f(x):
                         ..LegacyFunctionSpecializationOverlays::default()
                     }),
                     cold_block_labels: HashSet::new(),
-                    behavior_change_indexed_stores: true,
                     guard_miss_deopt_stub: false,
                 }),
                 ..BuildSpecializedFunctionOptions::default()
@@ -16541,7 +16533,6 @@ def f(x):
                 specialization_inputs: Some(FunctionSpecializationInputs {
                     legacy_overlays: Some(LegacyFunctionSpecializationOverlays::default()),
                     cold_block_labels: HashSet::new(),
-                    behavior_change_indexed_stores: true,
                     guard_miss_deopt_stub: false,
                 }),
                 ..BuildSpecializedFunctionOptions::default()
@@ -18569,7 +18560,6 @@ class Point:
                 specialization_inputs: Some(FunctionSpecializationInputs {
                     legacy_overlays: None,
                     cold_block_labels: HashSet::new(),
-                    behavior_change_indexed_stores: false,
                     guard_miss_deopt_stub: false,
                 }),
                 legacy_call_emission_typed_function: Some(planned_function.clone()),
@@ -19113,7 +19103,6 @@ class Point:
             &function,
             IndexedGlobalAccessKind::Load,
             "x",
-            true,
             false,
         );
         let built = build_test_jit_function_with_constants_and_options(
@@ -19181,7 +19170,6 @@ class Point:
                 &function,
                 IndexedGlobalAccessKind::Load,
                 "x",
-                true,
                 matches!(mode, "verify" | "apply"),
             )
         });
@@ -19260,7 +19248,6 @@ class Point:
                 &function,
                 IndexedGlobalAccessKind::Store,
                 "x",
-                matches!(mode, "verify" | "apply"),
                 matches!(mode, "verify" | "apply"),
             )
         });
@@ -20102,7 +20089,6 @@ class Point:
             &function,
             IndexedGlobalAccessKind::Load,
             "x",
-            true,
             false,
         );
         let built = build_test_jit_function_with_constants_and_options(
@@ -20147,7 +20133,6 @@ class Point:
             &function,
             IndexedGlobalAccessKind::Load,
             "x",
-            true,
             false,
         );
         let built = build_test_jit_function_with_constants_and_options(
@@ -20237,7 +20222,6 @@ class Point:
                 &function,
                 IndexedGlobalAccessKind::Load,
                 "x",
-                true,
                 false,
             );
             let built = build_test_cranelift_run_bb_specialized_function(
@@ -20377,7 +20361,6 @@ class Point:
                 &function,
                 IndexedGlobalAccessKind::Load,
                 "x",
-                true,
                 false,
             );
             let built = build_test_cranelift_run_bb_specialized_function(
@@ -20491,7 +20474,6 @@ class Point:
             &function,
             IndexedGlobalAccessKind::Load,
             "y",
-            true,
             false,
         );
         let built = build_test_jit_function_with_constants_and_options(
@@ -20558,7 +20540,6 @@ class Point:
             &function,
             IndexedGlobalAccessKind::Load,
             "x",
-            true,
             false,
         );
         let built = build_test_jit_function_with_constants_and_options(
@@ -20642,7 +20623,6 @@ class Point:
                 &function,
                 IndexedGlobalAccessKind::Load,
                 "x",
-                true,
                 false,
             );
             let built = build_test_cranelift_run_bb_specialized_function(
@@ -20800,7 +20780,6 @@ class Point:
                 &function,
                 IndexedGlobalAccessKind::Store,
                 "x",
-                true,
                 true,
             );
             let built = build_test_cranelift_run_bb_specialized_function(
