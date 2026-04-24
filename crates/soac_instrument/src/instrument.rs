@@ -1,6 +1,6 @@
 use soac_core::block_py::{
     Block, BlockLabel, BlockTerm, CounterBranchId, CounterDef, CounterId, CounterScope,
-    CounterSite, Instr,
+    CounterSite, Instr, InstrId, RuntimeFunctionId,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -162,6 +162,180 @@ impl<'a> CounterBuilder<'a> {
     pub fn define_if_missing_spec(&mut self, spec: &impl CounterSpec) -> CounterHandle {
         self.define_if_missing(spec.scope(), spec.kind(), spec.site())
     }
+}
+
+pub(crate) fn define_block_entry_counter(
+    counters: &mut CounterBuilder<'_>,
+    function_id: RuntimeFunctionId,
+    block_label: BlockLabel,
+) -> CounterHandle {
+    counters.define_if_missing(
+        CounterScope::This,
+        "block_entry",
+        CounterSite::BlockEntry {
+            function_id,
+            block_label,
+        },
+    )
+}
+
+pub(crate) fn define_refcount_counters(
+    counters: &mut CounterBuilder<'_>,
+    scope: CounterScope,
+    function_ids: impl IntoIterator<Item = RuntimeFunctionId>,
+) -> Result<(), String> {
+    match scope {
+        CounterScope::This => Err(
+            "refcount counters do not yet support CounterScope::This; use Function or Global"
+                .to_string(),
+        ),
+        CounterScope::Function => {
+            for function_id in function_ids {
+                for kind in ["runtime_incref", "runtime_decref"] {
+                    counters.define_if_missing(
+                        scope,
+                        kind,
+                        CounterSite::Runtime {
+                            function_id: Some(function_id),
+                            instr_id: None,
+                        },
+                    );
+                }
+            }
+            Ok(())
+        }
+        CounterScope::Global => {
+            for kind in ["runtime_incref", "runtime_decref"] {
+                counters.define_if_missing(
+                    scope,
+                    kind,
+                    CounterSite::Runtime {
+                        function_id: None,
+                        instr_id: None,
+                    },
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+pub(crate) fn define_branch_outcome_counter(
+    counters: &mut CounterBuilder<'_>,
+    function_id: RuntimeFunctionId,
+    instr_id: InstrId,
+) -> CounterHandle {
+    counters.define_if_missing(
+        CounterScope::This,
+        "branch_outcomes",
+        CounterSite::Runtime {
+            function_id: Some(function_id),
+            instr_id: Some(instr_id),
+        },
+    )
+}
+
+pub(crate) fn define_indexed_counter(
+    counters: &mut CounterBuilder<'_>,
+    function_id: RuntimeFunctionId,
+    instr_id: InstrId,
+    kind: &'static str,
+) -> CounterHandle {
+    counters.define_branch_counter_if_missing(
+        CounterScope::This,
+        kind,
+        CounterSite::Runtime {
+            function_id: Some(function_id),
+            instr_id: Some(instr_id),
+        },
+        ["hit", "fallback"],
+    )
+}
+
+pub(crate) fn define_field_access_counter(
+    counters: &mut CounterBuilder<'_>,
+    function_id: RuntimeFunctionId,
+    instr_id: InstrId,
+) -> CounterHandle {
+    counters.define_branch_counter_if_missing(
+        CounterScope::This,
+        "field_access",
+        CounterSite::Runtime {
+            function_id: Some(function_id),
+            instr_id: Some(instr_id),
+        },
+        [
+            "indexed_hit",
+            "indexed_fallback",
+            "generic_getattr",
+            "generic_setattr",
+        ],
+    )
+}
+
+pub(crate) fn define_instr_shape_counters(
+    counters: &mut CounterBuilder<'_>,
+    function_id: RuntimeFunctionId,
+    instr_id: InstrId,
+    shape_kind: &'static str,
+    branch_kind: &'static str,
+) {
+    counters.define_if_missing(
+        CounterScope::This,
+        shape_kind,
+        CounterSite::Runtime {
+            function_id: Some(function_id),
+            instr_id: Some(instr_id),
+        },
+    );
+    counters.define_branch_counter_if_missing(
+        CounterScope::This,
+        branch_kind,
+        CounterSite::Runtime {
+            function_id: Some(function_id),
+            instr_id: Some(instr_id),
+        },
+        ["hit", "fallback"],
+    );
+}
+
+pub(crate) fn define_operator_hot_shapes_counter(
+    counters: &mut CounterBuilder<'_>,
+    function_id: RuntimeFunctionId,
+    instr_id: InstrId,
+) -> CounterHandle {
+    counters.define_if_missing(
+        CounterScope::This,
+        "operator_hot_shapes",
+        CounterSite::Runtime {
+            function_id: Some(function_id),
+            instr_id: Some(instr_id),
+        },
+    )
+}
+
+pub(crate) fn define_call_counters(
+    counters: &mut CounterBuilder<'_>,
+    function_id: RuntimeFunctionId,
+    instr_id: InstrId,
+) {
+    counters.define_if_missing(
+        CounterScope::This,
+        "call_hot_targets",
+        CounterSite::Runtime {
+            function_id: Some(function_id),
+            instr_id: Some(instr_id),
+        },
+    );
+    counters.define_branch_counter_if_missing(
+        CounterScope::This,
+        "call_direct",
+        CounterSite::Runtime {
+            function_id: Some(function_id),
+            instr_id: Some(instr_id),
+        },
+        ["hit", "fallback"],
+    );
 }
 
 #[derive(Debug, Clone)]
