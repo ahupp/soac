@@ -11351,7 +11351,7 @@ fn load_planned_optimization_inputs_for_runtime_state(
         let Some(shared_state) = shared_state else {
             return Ok(PlannedOptimizationInputs::default());
         };
-        return planned_typed_v3_runtime_direct_call_inputs_from_raw_evidence(
+        return planned_typed_v3_runtime_inputs_from_raw_evidence(
             shared_state,
             compile_session,
             env_config,
@@ -11416,7 +11416,7 @@ fn load_planned_optimization_inputs_for_runtime_state(
     ))
 }
 
-fn planned_typed_v3_runtime_direct_call_inputs_from_raw_evidence(
+fn planned_typed_v3_runtime_inputs_from_raw_evidence(
     shared_state: &SharedModuleState,
     compile_session: Option<&crate::session::CompileSession>,
     env_config: &SoacEnvConfig,
@@ -11443,7 +11443,7 @@ fn planned_typed_v3_runtime_direct_call_inputs_from_raw_evidence(
         &evidence_store,
     )
     .map_err(|err| err.to_string())?;
-    planned_direct_call_inputs_from_v3_artifacts(&artifacts, shared_state, compile_session)
+    planned_optimization_inputs_from_v3_artifacts(&artifacts, shared_state, compile_session)
 }
 
 fn load_optimized_codegen_module_v3_for_runtime_state(
@@ -11538,50 +11538,6 @@ fn planned_optimization_inputs_from_v3_artifacts(
         inputs
             .opt_v3_exact_int_branch_artifacts
             .insert(current_function_id, Arc::new(function_artifacts));
-    }
-    Ok(inputs)
-}
-
-fn planned_direct_call_inputs_from_v3_artifacts(
-    artifacts: &ExactIntBranchV3Artifacts,
-    shared_state: &SharedModuleState,
-    compile_session: Option<&crate::session::CompileSession>,
-) -> Result<PlannedOptimizationInputs, String> {
-    let mut inputs = PlannedOptimizationInputs::default();
-    for planned_function in &artifacts.plan.functions {
-        let local_function_id = planned_function.function.function.local_function_id();
-        let current_function_id = RuntimeFunctionId::new(
-            RuntimeModuleId::new(shared_state.module_id()),
-            local_function_id,
-        );
-        shared_state
-            .lookup_function(current_function_id)
-            .ok_or_else(|| {
-                format!(
-                    "optimization plan v3 for module {} references missing function id {} ({})",
-                    artifacts.plan.module.module_name,
-                    local_function_id,
-                    planned_function
-                        .function
-                        .debug_name
-                        .as_deref()
-                        .unwrap_or("<unknown>")
-                )
-            })?;
-        let Some(function_artifacts) =
-            opt_v3_single_function_artifacts(artifacts, planned_function.function.function)?
-        else {
-            continue;
-        };
-        if let Some(direct_calls) =
-            opt_v3_emitted_direct_calls_for_function(&function_artifacts, |target| {
-                resolve_opt_v3_runtime_function_target(shared_state, compile_session, target)
-            })?
-        {
-            inputs
-                .opt_v3_emitted_direct_calls
-                .insert(current_function_id, direct_calls);
-        }
     }
     Ok(inputs)
 }

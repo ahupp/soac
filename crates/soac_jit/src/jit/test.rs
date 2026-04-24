@@ -27,8 +27,8 @@ mod tests {
     use pyo3::{Bound, Py, PyAny, PyErr, PyResult, Python, ffi};
     use ruff_python_ast as ast;
     use soac_core::profile::{
-        CounterDumpRecord, CounterDumpRow, CounterDumpTypeKey, CounterDumpTypeKeyLayout,
-        CounterDumpTypeTableEntry, write_counter_dump_records,
+        CounterDumpKeyLayout, CounterDumpRecord, CounterDumpRow, CounterDumpTypeKey,
+        CounterDumpTypeKeyLayout, CounterDumpTypeTableEntry, write_counter_dump_records,
     };
     use soac_driver::codegen_cache::{
         CachedCodegenModuleMetadata, PythonModuleCacheSource, module_optimization_plan_v3_path,
@@ -18026,6 +18026,112 @@ def f(x, y):
             assert_eq!(
                 generic_typed_calls, 1,
                 "typed-v3 inlining should keep a generic fallback call"
+            );
+        });
+    }
+
+    #[test]
+    fn runtime_typed_v3_pipeline_keeps_access_plans_from_raw_profile_evidence() {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "runtime_typed_v3_pipeline_keeps_access_plans_from_raw_profile_evidence",
+        ) {
+            return;
+        }
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| {
+            let soac_work_dir = fresh_test_work_dir("runtime-typed-v3-access-plans");
+            let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
+            let _opt_mode = set_opt_mode("verify");
+            let _pipeline = EnvVarGuard::set("SOAC_OPT_RUNTIME_PIPELINE", "typed-v3");
+
+            let module_name = "runtime_typed_v3_access_plan_test";
+            let module_name_gen = ModuleNameGen::new(0);
+            let mut function = test_function_in_module(&module_name_gen, "load_global");
+            let block_label = function.name_gen.next_block_name();
+            let load_instr_id = InstrId::new(block_label, 0);
+            function = with_test_blocks(
+                function,
+                vec![CodegenBlock {
+                    label: block_label,
+                    body: Vec::new(),
+                    term: ret_term(with_instr_id(
+                        op_expr(Load::new(test_global_name("x"))),
+                        load_instr_id,
+                    )),
+                    params: Vec::new(),
+                    exc_edge: None,
+                }],
+            );
+            let function_id = function.function_id;
+
+            write_test_counter_dump(
+                soac_work_dir.join("profile.bin").as_path(),
+                &CounterDumpRecord {
+                    source_hash: 0,
+                    module_name: module_name.to_string(),
+                    package_name: None,
+                    rows: Vec::new(),
+                    module_keys: vec![CounterDumpKeyLayout {
+                        owner: module_name.to_string(),
+                        key: "x".to_string(),
+                        index: 0,
+                    }],
+                    type_keys: Vec::new(),
+                    type_table: Vec::new(),
+                },
+            );
+
+            let mut module = test_module(module_name_gen, vec![function]);
+            module.global_names = vec!["x".to_string()];
+            let shared_state =
+                crate::module_type::build_shared_state_for_testing(py, module, module_name, "")
+                    .expect("shared state should build");
+
+            let profile = SpecializationProfile::from_runtime_state_with_session(
+                Some(shared_state.as_ref()),
+                None,
+            )
+            .expect("typed-v3 runtime should plan access emissions from raw profile evidence");
+            assert!(
+                profile.optimized_module.is_none(),
+                "typed-v3 runtime should not require an optimized BlockPy artifact"
+            );
+            assert!(
+                profile.counter_dump_path.is_none(),
+                "typed-v3 access planning should not enable legacy profile evidence fallback"
+            );
+            let indexed_global = profile
+                .opt_v3_emitted_indexed_globals
+                .get(&function_id)
+                .and_then(|globals| globals.get(&load_instr_id))
+                .expect("typed-v3 runtime should retain indexed-global plans from raw evidence");
+            assert_eq!(indexed_global.access, IndexedGlobalAccessKind::Load);
+            assert_eq!(indexed_global.module_name, module_name);
+            assert_eq!(indexed_global.name, "x");
+            assert_eq!(indexed_global.expected_index, 0);
+
+            let planned_function = shared_state
+                .lowered_module
+                .callable_defs
+                .iter()
+                .find(|function| function.function_id == function_id)
+                .expect("lowered module should include the test function");
+            let specialization_inputs =
+                FunctionSpecializationInputs::from_profile(&profile, planned_function)
+                    .expect("typed-v3 access plans should become specialization inputs");
+            assert!(
+                specialization_inputs.opt_v3_call_emissions.is_empty(),
+                "access-only evidence should not synthesize direct-call emissions"
+            );
+            assert_eq!(
+                specialization_inputs
+                    .opt_v3_indexed_globals_by_instr
+                    .get(&load_instr_id)
+                    .map(|plan| (plan.name.as_str(), plan.expected_index)),
+                Some(("x", 0)),
+                "typed-v3 runtime should feed indexed-global access plans into JIT specialization inputs"
             );
         });
     }
