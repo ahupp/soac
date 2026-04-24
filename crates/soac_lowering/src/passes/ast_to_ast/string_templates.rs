@@ -140,7 +140,7 @@ fn rewrite_tstring_interpolation(interp: &ast::InterpolatedElement) -> Expr {
     )
 }
 
-pub fn rewrite_fstring(expr: ast::ExprFString) -> Expr {
+pub(crate) fn rewrite_fstring(expr: ast::ExprFString) -> Expr {
     let mut parts = Vec::new();
     let mut has_interpolation = false;
     for part in expr.value.iter() {
@@ -159,7 +159,7 @@ pub fn rewrite_fstring(expr: ast::ExprFString) -> Expr {
     join_parts(parts, !has_interpolation)
 }
 
-pub fn rewrite_tstring(expr: ast::ExprTString) -> Expr {
+pub(crate) fn rewrite_tstring(expr: ast::ExprTString) -> Expr {
     let mut parts = Vec::new();
     for t in expr.value.iter() {
         for element in t.elements.iter() {
@@ -198,11 +198,11 @@ impl Transformer for StringTemplateLowerer {
     }
 }
 
-pub fn lower_string_templates_in_expr(expr: &mut Expr) {
+pub(crate) fn lower_string_templates_in_expr(expr: &mut Expr) {
     StringTemplateLowerer.visit_expr(expr);
 }
 
-pub fn lower_string_templates_in_instr_ruff(expr: InstrRuff) -> InstrRuff {
+pub(crate) fn lower_string_templates_in_instr_ruff(expr: InstrRuff) -> InstrRuff {
     match expr {
         InstrRuff::ExprFString(node) => {
             crate::passes::ast_to_instr::from_ast_expr(rewrite_fstring(ast::ExprFString {

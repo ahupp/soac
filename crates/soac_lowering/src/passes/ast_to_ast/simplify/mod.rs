@@ -107,7 +107,7 @@ impl Transformer for Flattener {
     }
 }
 
-pub fn flatten(stmts: &mut Suite) {
+pub(crate) fn flatten(stmts: &mut Suite) {
     let mut flattener = Flattener;
     (&mut flattener).visit_body(stmts);
 }

@@ -431,7 +431,7 @@ impl Transformer for NamedExprRewriter<'_> {
     }
 }
 
-pub struct ScopedHelperExprPass;
+pub(crate) struct ScopedHelperExprPass;
 
 impl ExprRewritePass for ScopedHelperExprPass {
     fn lower_expr(&self, context: &Context, expr: Expr) -> LoweredExpr {

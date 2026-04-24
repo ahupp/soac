@@ -66,7 +66,7 @@ impl VisitMut<InstrResolved> for GlobalIndexer {
     }
 }
 
-pub fn lower_global_index_in_resolved_module(
+pub(crate) fn lower_global_index_in_resolved_module(
     module: BlockPyModule<ResolvedStorageModuleShape>,
     preferred_global_names: impl IntoIterator<Item = String>,
 ) -> BlockPyModule<ResolvedStorageModuleShape> {
@@ -87,7 +87,7 @@ pub fn lower_global_index_in_resolved_module(
     lowered
 }
 
-pub fn lower_global_index_in_resolved_module_default(
+pub(crate) fn lower_global_index_in_resolved_module_default(
     module: BlockPyModule<ResolvedStorageModuleShape>,
 ) -> BlockPyModule<ResolvedStorageModuleShape> {
     lower_global_index_in_resolved_module(module, std::iter::empty())

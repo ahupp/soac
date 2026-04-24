@@ -1,4 +1,5 @@
 #![recursion_limit = "256"]
+#![deny(unreachable_pub)]
 
 pub use crate::driver::{lower_source_to_codegen_module_with_tracker, LoweringOptions};
 use crate::pass_tracker::{NoopPassTracker, PassTracker, RecordingPassTracker};

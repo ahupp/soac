@@ -82,7 +82,7 @@ fn is_super_call(expr: &Expr) -> bool {
     )
 }
 
-pub fn rewrite_explicit_super_classcell(class_def: &mut ast::StmtClassDef) -> bool {
+pub(crate) fn rewrite_explicit_super_classcell(class_def: &mut ast::StmtClassDef) -> bool {
     let mut rewriter = MethodExplicitSuperRewriter {
         needs_class_cell: false,
     };

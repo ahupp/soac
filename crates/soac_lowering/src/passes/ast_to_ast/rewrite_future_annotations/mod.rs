@@ -7,7 +7,7 @@ use ruff_python_parser::{ParseError, ParseErrorType};
 use ruff_source_file::LineEnding;
 use std::collections::HashSet;
 
-pub fn rewrite(body: &mut Suite) -> Result<HashSet<String>, ParseError> {
+pub(crate) fn rewrite(body: &mut Suite) -> Result<HashSet<String>, ParseError> {
     let mut rewriter = FutureAnnotationsRewriter::new();
     let future_features = rewriter.strip_future_imports(body)?;
     if future_features.contains("annotations") {

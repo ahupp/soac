@@ -4,7 +4,7 @@ use super::context::Context;
 use ruff_python_ast::{self as ast};
 use ruff_python_parser::parse_module;
 
-pub fn rewrite(ast::StmtImport { names, .. }: ast::StmtImport) -> Rewrite {
+pub(crate) fn rewrite(ast::StmtImport { names, .. }: ast::StmtImport) -> Rewrite {
     // TODO: hard-coded "import _testinternalcapi"
     let stmts: Vec<ast::Stmt> = names
         .into_iter()
@@ -43,7 +43,7 @@ pub fn rewrite(ast::StmtImport { names, .. }: ast::StmtImport) -> Rewrite {
     Rewrite::Walk(stmts)
 }
 
-pub fn rewrite_from(context: &Context, import_from: ast::StmtImportFrom) -> Rewrite {
+pub(crate) fn rewrite_from(context: &Context, import_from: ast::StmtImportFrom) -> Rewrite {
     let ast::StmtImportFrom {
         module,
         names,

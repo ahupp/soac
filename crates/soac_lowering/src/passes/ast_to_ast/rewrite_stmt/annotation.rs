@@ -14,7 +14,7 @@ use crate::{
 
 pub(crate) const FUNCTION_ANNOTATE_PREFIX: &str = "_dp_annotate_func_";
 
-pub fn rewrite_ann_assign_to_dunder_annotate(_context: &Context, stmt: &mut Suite) {
+pub(crate) fn rewrite_ann_assign_to_dunder_annotate(_context: &Context, stmt: &mut Suite) {
     // Assume called with module body stmt, which gets __annotate__.
     let entries = AnnotationStripper::strip(stmt);
     if entries.is_empty() {

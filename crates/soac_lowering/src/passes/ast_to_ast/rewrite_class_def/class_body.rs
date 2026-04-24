@@ -10,7 +10,7 @@ use crate::passes::ast_to_ast::semantic::{SemanticAstState, SemanticScope, Seman
 use crate::transformer::{walk_stmt, Transformer};
 use crate::{py_expr, py_stmt};
 
-pub fn rewrite_class_body_scopes(
+pub(crate) fn rewrite_class_body_scopes(
     context: &Context,
     semantic_state: &mut SemanticAstState,
     body: &mut Suite,

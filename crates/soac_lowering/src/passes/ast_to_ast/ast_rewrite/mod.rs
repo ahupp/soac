@@ -12,19 +12,19 @@ use crate::{
     ruff_ast_to_string,
 };
 
-pub enum Rewrite {
+pub(crate) enum Rewrite {
     Unmodified(Stmt),
     Walk(Vec<Stmt>),
 }
 
-pub struct LoweredExpr {
+pub(crate) struct LoweredExpr {
     pub stmts: Vec<Stmt>,
     pub expr: Expr,
     pub modified: bool,
 }
 
 impl LoweredExpr {
-    pub fn modified(expr: Expr, stmts: Vec<Stmt>) -> Self {
+    pub(crate) fn modified(expr: Expr, stmts: Vec<Stmt>) -> Self {
         trace!("LoweredExpr::modified {}", Backtrace::capture());
         Self {
             stmts,
@@ -33,7 +33,7 @@ impl LoweredExpr {
         }
     }
 
-    pub fn unmodified(expr: Expr) -> Self {
+    pub(crate) fn unmodified(expr: Expr) -> Self {
         Self {
             stmts: Vec::new(),
             expr,
@@ -42,7 +42,7 @@ impl LoweredExpr {
     }
 }
 
-pub fn rewrite_once_with_pass<'a>(
+pub(crate) fn rewrite_once_with_pass<'a>(
     context: &'a Context,
     stmt_pass: Option<&'a dyn StmtRewritePass>,
     expr_pass: Option<&'a dyn ExprRewritePass>,
@@ -60,7 +60,7 @@ pub fn rewrite_once_with_pass<'a>(
     rloop.modified
 }
 
-pub fn rewrite_with_pass<'a>(
+pub(crate) fn rewrite_with_pass<'a>(
     context: &'a Context,
     stmt_pass: Option<&'a dyn StmtRewritePass>,
     expr_pass: Option<&'a dyn ExprRewritePass>,
@@ -101,11 +101,11 @@ struct RewriteLoop<'a> {
     modified: bool,
 }
 
-pub trait StmtRewritePass {
+pub(crate) trait StmtRewritePass {
     fn lower_stmt(&self, context: &Context, stmt: Stmt) -> Rewrite;
 }
 
-pub trait BBRewritePass {
+pub(crate) trait BBRewritePass {
     fn lower_bb_stmt(&self, context: &Context, stmt: Stmt) -> Rewrite;
 }
 
@@ -115,7 +115,7 @@ impl<T: BBRewritePass + ?Sized> StmtRewritePass for T {
     }
 }
 
-pub trait ExprRewritePass {
+pub(crate) trait ExprRewritePass {
     fn lower_expr(&self, context: &Context, expr: Expr) -> LoweredExpr;
 }
 

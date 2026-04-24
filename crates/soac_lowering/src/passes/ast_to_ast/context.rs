@@ -6,7 +6,7 @@ use crate::passes::ast_to_ast::scope_helpers::ScopeKind;
 use crate::namegen::fresh_name;
 
 #[derive(Clone, Debug)]
-pub struct ScopeFrame {
+pub(crate) struct ScopeFrame {
     pub kind: ScopeKind,
     pub in_async_function: bool,
     pub globals: HashSet<String>,
@@ -14,7 +14,7 @@ pub struct ScopeFrame {
 }
 
 impl ScopeFrame {
-    pub fn module() -> Self {
+    pub(crate) fn module() -> Self {
         Self {
             kind: ScopeKind::Module,
             in_async_function: false,
@@ -23,7 +23,11 @@ impl ScopeFrame {
         }
     }
 
-    pub fn new(kind: ScopeKind, globals: HashSet<String>, nonlocals: HashSet<String>) -> Self {
+    pub(crate) fn new(
+        kind: ScopeKind,
+        globals: HashSet<String>,
+        nonlocals: HashSet<String>,
+    ) -> Self {
         Self {
             kind,
             in_async_function: false,
@@ -33,20 +37,20 @@ impl ScopeFrame {
     }
 }
 
-pub struct Context {
+pub(crate) struct Context {
     pub source: String,
     scope_stack: RefCell<Vec<ScopeFrame>>,
 }
 
 impl Context {
-    pub fn new(source: &str) -> Self {
+    pub(crate) fn new(source: &str) -> Self {
         Self {
             source: source.to_string(),
             scope_stack: RefCell::new(vec![ScopeFrame::module()]),
         }
     }
 
-    pub fn line_number_at(&self, offset: usize) -> usize {
+    pub(crate) fn line_number_at(&self, offset: usize) -> usize {
         self.source[..offset]
             .bytes()
             .filter(|&b| b == b'\n')
@@ -54,19 +58,19 @@ impl Context {
             + 1
     }
 
-    pub fn fresh(&self, name: &str) -> String {
+    pub(crate) fn fresh(&self, name: &str) -> String {
         fresh_name(name)
     }
 
-    pub fn push_scope(&self, frame: ScopeFrame) {
+    pub(crate) fn push_scope(&self, frame: ScopeFrame) {
         self.scope_stack.borrow_mut().push(frame);
     }
 
-    pub fn pop_scope(&self) {
+    pub(crate) fn pop_scope(&self) {
         self.scope_stack.borrow_mut().pop();
     }
 
-    pub fn current_scope(&self) -> ScopeFrame {
+    pub(crate) fn current_scope(&self) -> ScopeFrame {
         self.scope_stack
             .borrow()
             .last()

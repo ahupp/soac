@@ -311,7 +311,7 @@ fn is_generic_expr(expr: &Expr) -> bool {
     }
 }
 
-pub fn class_call_arguments(
+pub(crate) fn class_call_arguments(
     arguments: Option<Box<ast::Arguments>>,
     mut extra_bases: Vec<Expr>,
 ) -> (Expr, Expr) {

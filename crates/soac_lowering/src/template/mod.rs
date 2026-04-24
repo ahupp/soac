@@ -112,7 +112,7 @@ use std::{
     sync::LazyLock,
 };
 
-pub trait StmtTryFrom: Sized {
+pub(crate) trait StmtTryFrom: Sized {
     const EXPECTED: &'static str;
     fn try_from_stmt(stmt: Stmt) -> Result<Self, Stmt>;
 }
@@ -164,7 +164,7 @@ impl_stmt_try_from!(ast::StmtBreak, Break);
 impl_stmt_try_from!(ast::StmtContinue, Continue);
 impl_stmt_try_from!(ast::StmtIpyEscapeCommand, IpyEscapeCommand);
 
-pub fn expect_stmt<T: StmtTryFrom>(stmt: Stmt, template: &'static str) -> T {
+pub(crate) fn expect_stmt<T: StmtTryFrom>(stmt: Stmt, template: &'static str) -> T {
     match T::try_from_stmt(stmt) {
         Ok(value) => value,
         Err(other) => panic!(

@@ -3,7 +3,7 @@ use crate::passes::ast_to_ast::context::Context;
 use crate::transformer::{walk_expr, walk_parameter, walk_stmt, Transformer};
 use ruff_python_ast::{self as ast, name::Name, Expr, ExprContext, Stmt};
 
-pub fn rewrite_private_names(_context: &Context, body: &mut Suite) {
+pub(crate) fn rewrite_private_names(_context: &Context, body: &mut Suite) {
     let mut rewriter = PrivateRewriter { class_name: None };
     rewriter.visit_body(body);
 }
@@ -14,7 +14,7 @@ struct PrivateRewriter {
 }
 
 impl PrivateRewriter {
-    pub fn maybe_mangle(&self, attr: &str) -> Option<String> {
+    pub(crate) fn maybe_mangle(&self, attr: &str) -> Option<String> {
         let Some(mut class_name) = self.class_name.as_ref().map(|s| s.as_str()) else {
             return None;
         };
