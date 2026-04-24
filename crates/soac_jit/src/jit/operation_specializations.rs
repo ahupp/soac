@@ -3,8 +3,9 @@ use super::{CpythonTypeSymbol, OptV3ExactListItemAccessPlan, RelocTypeRef};
 use cranelift_codegen::ir;
 use cranelift_codegen::ir::InstBuilder;
 use pyo3::ffi;
-use soac_core::block_py::{CounterId, GetItem, HasSemanticInstrId, InstrId, SetItem};
+use soac_core::block_py::{CounterId, GetItem, HasSemanticInstrId, Instr, InstrId, SetItem};
 use soac_lowering::passes::InstrCodegen;
+use soac_opt::passes::TypedExactListItemAccessPlan;
 use soac_opt::plan_v3::{EXACT_LIST_EXACT_INT_ITEM_SHAPE_TAG, ExactListItemAccessKind};
 use std::mem::offset_of;
 
@@ -24,7 +25,7 @@ struct RawPyLongObject {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ExactListItemLoweringPlan {
+pub(super) struct ExactListItemLoweringPlan {
     access: ExactListItemAccessKind,
 }
 
@@ -45,6 +46,16 @@ impl ExactListItemLoweringPlan {
             "exact-list item plan {:?} reached {:?} lowering",
             self.access, expected_access
         );
+    }
+}
+
+pub(super) fn lowering_plan_from_typed_exact_list_item(
+    plan: &TypedExactListItemAccessPlan,
+    expected_access: ExactListItemAccessKind,
+) -> ExactListItemLoweringPlan {
+    debug_assert_eq!(plan.access, expected_access);
+    ExactListItemLoweringPlan {
+        access: plan.access,
     }
 }
 
@@ -76,6 +87,18 @@ pub(super) fn emit_getitem<'fb>(
     op: &GetItem<InstrCodegen>,
     state: &mut impl OperationEmitState<'fb, InstrCodegen>,
 ) -> ir::Value {
+    emit_getitem_with_plan(
+        op,
+        state,
+        selected_v3_getitem_lowering_plan(state, op.semantic_instr_id()),
+    )
+}
+
+pub(super) fn emit_getitem_with_plan<'fb, E: Instr>(
+    op: &GetItem<E>,
+    state: &mut impl OperationEmitState<'fb, E>,
+    lowering_plan: Option<ExactListItemLoweringPlan>,
+) -> ir::Value {
     let instr_id = op.semantic_instr_id();
     let shape_counter_id = state
         .ctx()
@@ -92,7 +115,6 @@ pub(super) fn emit_getitem<'fb>(
         .getitem_specialized_fallback_counter_ids
         .get(&instr_id)
         .copied();
-    let lowering_plan = selected_v3_getitem_lowering_plan(state, instr_id);
     if shape_counter_id.is_none() && lowering_plan.is_none() {
         return emit_generic_getitem_from_exprs(op, state);
     }
@@ -122,6 +144,18 @@ pub(super) fn emit_setitem<'fb>(
     op: &SetItem<InstrCodegen>,
     state: &mut impl OperationEmitState<'fb, InstrCodegen>,
 ) -> ir::Value {
+    emit_setitem_with_plan(
+        op,
+        state,
+        selected_v3_setitem_lowering_plan(state, op.semantic_instr_id()),
+    )
+}
+
+pub(super) fn emit_setitem_with_plan<'fb, E: Instr>(
+    op: &SetItem<E>,
+    state: &mut impl OperationEmitState<'fb, E>,
+    lowering_plan: Option<ExactListItemLoweringPlan>,
+) -> ir::Value {
     let instr_id = op.semantic_instr_id();
     let shape_counter_id = state
         .ctx()
@@ -138,7 +172,6 @@ pub(super) fn emit_setitem<'fb>(
         .setitem_specialized_fallback_counter_ids
         .get(&instr_id)
         .copied();
-    let lowering_plan = selected_v3_setitem_lowering_plan(state, instr_id);
     if shape_counter_id.is_none() && lowering_plan.is_none() {
         return emit_generic_setitem_from_exprs(op, state);
     }
@@ -168,9 +201,9 @@ pub(super) fn emit_setitem<'fb>(
     state.finish_owned_result(result)
 }
 
-fn emit_generic_getitem_from_exprs<'fb>(
-    op: &GetItem<InstrCodegen>,
-    state: &mut impl OperationEmitState<'fb, InstrCodegen>,
+fn emit_generic_getitem_from_exprs<'fb, E: Instr>(
+    op: &GetItem<E>,
+    state: &mut impl OperationEmitState<'fb, E>,
 ) -> ir::Value {
     let arg_values = state.emit_arg_values(&[op.value.as_ref(), op.index.as_ref()]);
     let result = emit_generic_getitem_from_arg_values(state, &arg_values);
@@ -178,9 +211,9 @@ fn emit_generic_getitem_from_exprs<'fb>(
     state.finish_owned_result(result)
 }
 
-fn emit_generic_setitem_from_exprs<'fb>(
-    op: &SetItem<InstrCodegen>,
-    state: &mut impl OperationEmitState<'fb, InstrCodegen>,
+fn emit_generic_setitem_from_exprs<'fb, E: Instr>(
+    op: &SetItem<E>,
+    state: &mut impl OperationEmitState<'fb, E>,
 ) -> ir::Value {
     let arg_values = state.emit_arg_values(&[
         op.value.as_ref(),
@@ -192,8 +225,8 @@ fn emit_generic_setitem_from_exprs<'fb>(
     state.finish_owned_result(result)
 }
 
-fn emit_record_item_shape_counter<'fb>(
-    state: &mut impl OperationEmitState<'fb, InstrCodegen>,
+fn emit_record_item_shape_counter<'fb, E>(
+    state: &mut impl OperationEmitState<'fb, E>,
     counter_id: CounterId,
     shape: ir::Value,
 ) {
@@ -226,8 +259,8 @@ fn emit_record_item_shape_counter<'fb>(
     );
 }
 
-fn emit_item_dispatch_shape_from_arg_values<'fb>(
-    state: &mut impl OperationEmitState<'fb, InstrCodegen>,
+fn emit_item_dispatch_shape_from_arg_values<'fb, E>(
+    state: &mut impl OperationEmitState<'fb, E>,
     arg_values: &[(ir::Value, bool)],
 ) -> ir::Value {
     debug_assert_eq!(arg_values.len(), 2);
@@ -324,8 +357,8 @@ fn emit_item_dispatch_shape_from_arg_values<'fb>(
     state.fb().block_params(result_block)[0]
 }
 
-fn emit_generic_getitem_from_arg_values<'fb>(
-    state: &mut impl OperationEmitState<'fb, InstrCodegen>,
+fn emit_generic_getitem_from_arg_values<'fb, E>(
+    state: &mut impl OperationEmitState<'fb, E>,
     arg_values: &[(ir::Value, bool)],
 ) -> ir::Value {
     debug_assert_eq!(arg_values.len(), 2);
@@ -337,8 +370,8 @@ fn emit_generic_getitem_from_arg_values<'fb>(
     state.fb().inst_results(call_inst)[0]
 }
 
-fn emit_generic_setitem_from_arg_values<'fb>(
-    state: &mut impl OperationEmitState<'fb, InstrCodegen>,
+fn emit_generic_setitem_from_arg_values<'fb, E>(
+    state: &mut impl OperationEmitState<'fb, E>,
     arg_values: &[(ir::Value, bool)],
 ) -> ir::Value {
     debug_assert_eq!(arg_values.len(), 3);
@@ -350,8 +383,8 @@ fn emit_generic_setitem_from_arg_values<'fb>(
     state.fb().inst_results(call_inst)[0]
 }
 
-fn emit_exact_list_item_getitem_from_plan<'fb>(
-    state: &mut impl OperationEmitState<'fb, InstrCodegen>,
+fn emit_exact_list_item_getitem_from_plan<'fb, E>(
+    state: &mut impl OperationEmitState<'fb, E>,
     arg_values: &[(ir::Value, bool)],
     plan: ExactListItemLoweringPlan,
     specialized_hit_counter_id: Option<super::CounterRef>,
@@ -367,8 +400,8 @@ fn emit_exact_list_item_getitem_from_plan<'fb>(
     )
 }
 
-fn emit_exact_list_item_setitem_from_plan<'fb>(
-    state: &mut impl OperationEmitState<'fb, InstrCodegen>,
+fn emit_exact_list_item_setitem_from_plan<'fb, E>(
+    state: &mut impl OperationEmitState<'fb, E>,
     arg_values: &[(ir::Value, bool)],
     plan: ExactListItemLoweringPlan,
     specialized_hit_counter_id: Option<super::CounterRef>,
@@ -384,8 +417,8 @@ fn emit_exact_list_item_setitem_from_plan<'fb>(
     )
 }
 
-fn emit_exact_list_exact_compact_int_in_bounds_guard<'fb>(
-    state: &mut impl OperationEmitState<'fb, InstrCodegen>,
+fn emit_exact_list_exact_compact_int_in_bounds_guard<'fb, E>(
+    state: &mut impl OperationEmitState<'fb, E>,
     plan: ExactListItemLoweringPlan,
     expected_access: ExactListItemAccessKind,
     obj: ir::Value,
@@ -559,8 +592,8 @@ fn emit_exact_list_exact_compact_int_in_bounds_guard<'fb>(
     normalized_index
 }
 
-fn emit_exact_list_exact_int_getitem<'fb>(
-    state: &mut impl OperationEmitState<'fb, InstrCodegen>,
+fn emit_exact_list_exact_int_getitem<'fb, E>(
+    state: &mut impl OperationEmitState<'fb, E>,
     arg_values: &[(ir::Value, bool)],
     plan: ExactListItemLoweringPlan,
     specialized_hit_counter_id: Option<super::CounterRef>,
@@ -636,8 +669,8 @@ fn emit_exact_list_exact_int_getitem<'fb>(
     state.finish_owned_result(result)
 }
 
-fn emit_exact_list_exact_int_setitem<'fb>(
-    state: &mut impl OperationEmitState<'fb, InstrCodegen>,
+fn emit_exact_list_exact_int_setitem<'fb, E>(
+    state: &mut impl OperationEmitState<'fb, E>,
     arg_values: &[(ir::Value, bool)],
     plan: ExactListItemLoweringPlan,
     specialized_hit_counter_id: Option<super::CounterRef>,

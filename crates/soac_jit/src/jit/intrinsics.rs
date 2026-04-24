@@ -1258,13 +1258,20 @@ fn emit_indexed_global_store_with_state<'fb, E: Instr<Name = ResolvedName>>(
     state.fb().block_params(result_block)[0]
 }
 
-fn emit_opt_v3_indexed_global_store_with_state<'fb, E: Instr<Name = ResolvedName>>(
+#[derive(Clone, Debug)]
+struct IndexedGlobalStoreEmissionPlan {
+    source: InstrId,
+    name: String,
+    expected_index: u32,
+}
+
+fn emit_indexed_global_store_plan_with_state<'fb, E: Instr<Name = ResolvedName>>(
     op: &blockpy_intrinsics::Store<E>,
     state: &mut impl OperationEmitState<'fb, E>,
     func_ref: ir::FuncRef,
     globals_obj: ir::Value,
     arg_values: &[(ir::Value, bool)],
-    plan: &OptV3IndexedGlobalAccessPlan,
+    plan: IndexedGlobalStoreEmissionPlan,
 ) -> ir::Value {
     if !state.ctx().behavior_change_indexed_stores {
         panic!(
@@ -1293,26 +1300,40 @@ fn emit_store<'fb, E: Instr<Name = ResolvedName>>(
     op: &blockpy_intrinsics::Store<E>,
     state: &mut impl OperationEmitState<'fb, E>,
 ) -> ir::Value {
+    emit_store_with_indexed_global_plan(op, state, None)
+}
+
+fn emit_store_with_indexed_global_plan<'fb, E: Instr<Name = ResolvedName>>(
+    op: &blockpy_intrinsics::Store<E>,
+    state: &mut impl OperationEmitState<'fb, E>,
+    indexed_global_plan: Option<IndexedGlobalStoreEmissionPlan>,
+) -> ir::Value {
     let arg_values = state.emit_arg_values(&[&op.value]);
     let func_ref = state.import_func(&SOAC_RUNTIME_STORE_GLOBAL_IMPORT);
     let decref_ref = state.ctx().decref_ref;
     let thread_state_value = state.ctx().consts.thread_state_value;
     let globals_obj = state.ctx().consts.block_const;
     let instr_id = op.semantic_instr_id();
-    let opt_v3_plan = state
-        .ctx()
-        .opt_v3_indexed_globals_by_instr
-        .get(&instr_id)
-        .filter(|plan| plan.access == soac_opt::plan_v3::IndexedGlobalAccessKind::Store)
-        .cloned();
+    let opt_v3_plan = indexed_global_plan.or_else(|| {
+        state
+            .ctx()
+            .opt_v3_indexed_globals_by_instr
+            .get(&instr_id)
+            .filter(|plan| plan.access == soac_opt::plan_v3::IndexedGlobalAccessKind::Store)
+            .map(|plan| IndexedGlobalStoreEmissionPlan {
+                source: plan.source,
+                name: plan.name.clone(),
+                expected_index: plan.expected_index,
+            })
+    });
     let result = if let Some(plan) = opt_v3_plan {
-        emit_opt_v3_indexed_global_store_with_state(
+        emit_indexed_global_store_plan_with_state(
             op,
             state,
             func_ref,
             globals_obj,
             &arg_values,
-            &plan,
+            plan,
         )
     } else {
         let expected_index = match op.name.location {
@@ -1450,7 +1471,48 @@ pub(super) fn emit_typed_operation<'fb>(
         InstrTyped::LegacyUnaryOp(op) => {
             Some(emit_unary_op(op.kind, state, &[op.operand.as_ref()]))
         }
-        InstrTyped::LegacyStore(op) => op.name.location.is_global().then(|| emit_store(op, state)),
+        InstrTyped::LegacyGetItem(op) => {
+            let lowering_plan = op.extra().exact_list_item_access_plan().map(|plan| {
+                operation_specializations::lowering_plan_from_typed_exact_list_item(
+                    plan,
+                    soac_opt::plan_v3::ExactListItemAccessKind::Get,
+                )
+            })?;
+            Some(operation_specializations::emit_getitem_with_plan(
+                op,
+                state,
+                Some(lowering_plan),
+            ))
+        }
+        InstrTyped::LegacySetItem(op) => {
+            let lowering_plan = op.extra().exact_list_item_access_plan().map(|plan| {
+                operation_specializations::lowering_plan_from_typed_exact_list_item(
+                    plan,
+                    soac_opt::plan_v3::ExactListItemAccessKind::Set,
+                )
+            })?;
+            Some(operation_specializations::emit_setitem_with_plan(
+                op,
+                state,
+                Some(lowering_plan),
+            ))
+        }
+        InstrTyped::LegacyStore(op) => op.name.location.is_global().then(|| {
+            let indexed_global_plan = op.extra().indexed_global_access_plan().map(|plan| {
+                if plan.access != soac_opt::plan_v3::IndexedGlobalAccessKind::Store {
+                    panic!(
+                        "typed indexed-global plan for {} expected {:?}, but typed store requires Store",
+                        plan.instr_id, plan.access
+                    );
+                }
+                IndexedGlobalStoreEmissionPlan {
+                    source: plan.instr_id,
+                    name: plan.name.clone(),
+                    expected_index: plan.expected_index,
+                }
+            });
+            emit_store_with_indexed_global_plan(op, state, indexed_global_plan)
+        }),
         _ => None,
     }
 }

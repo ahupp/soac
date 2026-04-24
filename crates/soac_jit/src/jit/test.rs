@@ -18257,6 +18257,220 @@ class Point:
     }
 
     #[test]
+    fn runtime_typed_v3_module_plan_carries_indexed_global_access_shape() {
+        let module_name = "runtime_typed_v3_indexed_global_plan_test";
+        let module_name_gen = ModuleNameGen::new(0);
+        let mut function = test_function_in_module(&module_name_gen, "update_counter");
+        let block_label = function.name_gen.next_block_name();
+        let store_instr_id = InstrId::new(block_label, 0);
+        let load_instr_id = InstrId::new(block_label, 1);
+        function.blocks = vec![CodegenBlock {
+            label: block_label,
+            body: vec![with_instr_id(
+                assign_stmt(test_global_name("counter"), none_expr()),
+                store_instr_id,
+            )],
+            term: ret_term(with_instr_id(
+                name_expr(test_global_name("counter")),
+                load_instr_id,
+            )),
+            params: Vec::new(),
+            exc_edge: None,
+        }];
+        let function_id = function.function_id;
+        let mut module = test_module(module_name_gen, vec![function]);
+        module.global_names = vec!["counter".to_string()];
+
+        let indexed_global_plan = |source, access| OptV3IndexedGlobalAccessPlan {
+            source,
+            access,
+            module_name: module_name.to_string(),
+            name: "counter".to_string(),
+            expected_index: 0,
+            guard: IndexedGlobalGuardKind::ModuleDictKeyAtIndex,
+            fallback: IndexedGlobalFallbackKind::OriginalGlobalAccess,
+        };
+        let profile = SpecializationProfile {
+            module_name: Some(module_name),
+            counter_dump_path: None,
+            optimized_module: None,
+            direct_call_emission_scope: DirectCallEmissionScope::AllDirectCallCandidates,
+            opt_v3_emitted_direct_calls: HashMap::new(),
+            opt_v3_emitted_exact_list_items: HashMap::new(),
+            opt_v3_emitted_indexed_fields: HashMap::new(),
+            opt_v3_emitted_indexed_globals: HashMap::from([(
+                function_id,
+                HashMap::from([
+                    (
+                        store_instr_id,
+                        indexed_global_plan(store_instr_id, IndexedGlobalAccessKind::Store),
+                    ),
+                    (
+                        load_instr_id,
+                        indexed_global_plan(load_instr_id, IndexedGlobalAccessKind::Load),
+                    ),
+                ]),
+            )]),
+            opt_v3_exact_int_branch_artifacts: HashMap::new(),
+            behavior_change_indexed_stores: false,
+            profiled_cold_blocks: false,
+            guard_miss_deopt: false,
+        };
+
+        let module_plan = build_typed_v3_jit_module_plan(&module, Some(&profile))
+            .expect("typed-v3 module plan should attach indexed-global access plans");
+        let planned_function = module_plan
+            .module
+            .callable_defs
+            .iter()
+            .find(|function| function.function_id == function_id)
+            .expect("planned module should include update_counter");
+        let [InstrTyped::LegacyStore(store)] = planned_function.blocks[0].body.as_slice() else {
+            panic!("update_counter should keep the global store as a typed legacy store");
+        };
+        let store_plan = store
+            .extra()
+            .indexed_global_access_plan()
+            .expect("typed-v3 module plan should carry indexed-global store shape");
+        assert_eq!(
+            store_plan.source,
+            TypedIndexedGlobalPlanSource::OptimizationPlanV3
+        );
+        assert_eq!(store_plan.instr_id, store_instr_id);
+        assert_eq!(store_plan.access, IndexedGlobalAccessKind::Store);
+        assert_eq!(store_plan.name, "counter");
+        assert_eq!(store_plan.expected_index, 0);
+
+        let BlockTerm::Return(InstrTyped::Load(load)) = &planned_function.blocks[0].term else {
+            panic!("update_counter should still return a typed Load");
+        };
+        let load_plan = load
+            .extra()
+            .indexed_global_access_plan()
+            .expect("typed-v3 module plan should carry indexed-global load shape");
+        assert_eq!(
+            load_plan.source,
+            TypedIndexedGlobalPlanSource::OptimizationPlanV3
+        );
+        assert_eq!(load_plan.instr_id, load_instr_id);
+        assert_eq!(load_plan.access, IndexedGlobalAccessKind::Load);
+        assert_eq!(load_plan.name, "counter");
+        assert_eq!(load_plan.expected_index, 0);
+    }
+
+    #[test]
+    fn runtime_typed_v3_module_plan_carries_exact_list_item_access_shape() {
+        let module_name = "runtime_typed_v3_exact_list_item_plan_test";
+        let module_name_gen = ModuleNameGen::new(0);
+        let mut function = test_function_in_module(&module_name_gen, "replace_first");
+        function.params = ParamSpec {
+            params: vec![
+                test_param("items", ParamKind::Any, false),
+                test_param("index", ParamKind::Any, false),
+            ],
+        };
+        let block_label = function.name_gen.next_block_name();
+        let setitem_instr_id = InstrId::new(block_label, 0);
+        let getitem_instr_id = InstrId::new(block_label, 1);
+        function.blocks = vec![CodegenBlock {
+            label: block_label,
+            body: vec![with_instr_id(
+                op_expr(SetItem::new(
+                    name_expr(test_name("items")),
+                    name_expr(test_name("index")),
+                    none_expr(),
+                )),
+                setitem_instr_id,
+            )],
+            term: ret_term(with_instr_id(
+                op_expr(GetItem::new(
+                    name_expr(test_name("items")),
+                    name_expr(test_name("index")),
+                )),
+                getitem_instr_id,
+            )),
+            params: Vec::new(),
+            exc_edge: None,
+        }];
+        set_stack_slots(&mut function, &["items", "index"]);
+        let function_id = function.function_id;
+        let module = test_module(module_name_gen, vec![function]);
+
+        let exact_list_item_plan = |source, access| OptV3ExactListItemAccessPlan {
+            source,
+            access,
+            shape: PlanV3ExactListItemShape::ExactListExactInt,
+            guard: PlanV3ExactListItemGuardKind::ExactListExactCompactIntInBounds,
+            fallback: PlanV3ExactListItemFallbackKind::OriginalItemAccess,
+        };
+        let profile = SpecializationProfile {
+            module_name: Some(module_name),
+            counter_dump_path: None,
+            optimized_module: None,
+            direct_call_emission_scope: DirectCallEmissionScope::AllDirectCallCandidates,
+            opt_v3_emitted_direct_calls: HashMap::new(),
+            opt_v3_emitted_exact_list_items: HashMap::from([(
+                function_id,
+                HashMap::from([
+                    (
+                        setitem_instr_id,
+                        exact_list_item_plan(setitem_instr_id, PlanV3ExactListItemAccessKind::Set),
+                    ),
+                    (
+                        getitem_instr_id,
+                        exact_list_item_plan(getitem_instr_id, PlanV3ExactListItemAccessKind::Get),
+                    ),
+                ]),
+            )]),
+            opt_v3_emitted_indexed_fields: HashMap::new(),
+            opt_v3_emitted_indexed_globals: HashMap::new(),
+            opt_v3_exact_int_branch_artifacts: HashMap::new(),
+            behavior_change_indexed_stores: false,
+            profiled_cold_blocks: false,
+            guard_miss_deopt: false,
+        };
+
+        let module_plan = build_typed_v3_jit_module_plan(&module, Some(&profile))
+            .expect("typed-v3 module plan should attach exact-list item access plans");
+        let planned_function = module_plan
+            .module
+            .callable_defs
+            .iter()
+            .find(|function| function.function_id == function_id)
+            .expect("planned module should include replace_first");
+        let [InstrTyped::LegacySetItem(setitem)] = planned_function.blocks[0].body.as_slice()
+        else {
+            panic!("replace_first should keep setitem as a typed legacy SetItem");
+        };
+        let setitem_plan = setitem
+            .extra()
+            .exact_list_item_access_plan()
+            .expect("typed-v3 module plan should carry exact-list setitem shape");
+        assert_eq!(
+            setitem_plan.source,
+            TypedExactListItemPlanSource::OptimizationPlanV3
+        );
+        assert_eq!(setitem_plan.instr_id, setitem_instr_id);
+        assert_eq!(setitem_plan.access, PlanV3ExactListItemAccessKind::Set);
+
+        let BlockTerm::Return(InstrTyped::LegacyGetItem(getitem)) =
+            &planned_function.blocks[0].term
+        else {
+            panic!("replace_first should still return a typed legacy GetItem");
+        };
+        let getitem_plan = getitem
+            .extra()
+            .exact_list_item_access_plan()
+            .expect("typed-v3 module plan should carry exact-list getitem shape");
+        assert_eq!(
+            getitem_plan.source,
+            TypedExactListItemPlanSource::OptimizationPlanV3
+        );
+        assert_eq!(getitem_plan.instr_id, getitem_instr_id);
+        assert_eq!(getitem_plan.access, PlanV3ExactListItemAccessKind::Get);
+    }
+
+    #[test]
     fn specialized_jit_assignment_to_direct_entry_param_avoids_stack_mirror() {
         let blocks = [1usize as ObjPtr];
         let mut constants = TestConstantPool::default();

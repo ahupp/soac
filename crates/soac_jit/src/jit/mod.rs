@@ -91,10 +91,12 @@ use soac_opt::passes::{
     TypedCallEmissionPlan, TypedCallEmissionPlans, TypedCodegenModuleShape, TypedDirectCallArgPlan,
     TypedDirectCallArgSource, TypedDirectCallGuardTest, TypedDirectCallGuardTestKind,
     TypedDirectCallableCall, TypedDirectCallableCallGuard, TypedDirectConstructorCallGuard,
-    TypedDirectFunctionCallGuard, TypedDirectMethodCall, TypedDirectMethodCallGuard, TypedGetAttr,
+    TypedDirectFunctionCallGuard, TypedDirectMethodCall, TypedDirectMethodCallGuard,
+    TypedExactListItemAccessPlan, TypedExactListItemPlanSource, TypedGetAttr,
     TypedGuardedCallableCall, TypedGuardedMethodCall, TypedIndexedFieldGuard,
-    TypedIndexedFieldPlanSource, TypedPlannedResult, TypedPyObjectOwnershipPlan, TypedSetAttr,
-    ValueFacts, annotate_typed_function_planned_results, annotate_typed_function_result_demands,
+    TypedIndexedFieldPlanSource, TypedIndexedGlobalAccessPlan, TypedIndexedGlobalPlanSource,
+    TypedPlannedResult, TypedPyObjectOwnershipPlan, TypedSetAttr, ValueFacts,
+    annotate_typed_function_planned_results, annotate_typed_function_result_demands,
     annotate_typed_function_value_facts, annotate_typed_module_value_facts,
     assign_missing_typed_function_instr_ids, infer_module_value_facts,
     inline_typed_function_direct_call_stores, lower_codegen_function_to_typed,
@@ -1895,6 +1897,18 @@ fn apply_typed_v3_module_rewrites(
                 &opt_v3_indexed_fields_by_instr,
                 specialize_field_stores,
             )?;
+        }
+        if let Some(indexed_globals_by_instr) = profile
+            .opt_v3_emitted_indexed_globals
+            .get(&function.function_id)
+        {
+            annotate_typed_indexed_global_accesses(function, indexed_globals_by_instr)?;
+        }
+        if let Some(exact_list_items_by_instr) = profile
+            .opt_v3_emitted_exact_list_items
+            .get(&function.function_id)
+        {
+            annotate_typed_exact_list_item_accesses(function, exact_list_items_by_instr)?;
         }
     }
     Ok(())
@@ -5472,6 +5486,38 @@ fn emit_codegen_indexed_global_load(
     fb.block_params(result_block)[0]
 }
 
+fn emit_planned_indexed_global_load(
+    fb: &mut FunctionBuilder<'_>,
+    globals_obj: ir::Value,
+    name: &str,
+    expected_index: u32,
+    instr_id: InstrId,
+    local_env: &LocalEnv,
+    ctx: &JitEmitCtx<'_>,
+) -> ir::Value {
+    let name_obj = emit_owned_module_constant(
+        fb,
+        ctx.module_constants.require_unicode_constant_id(name),
+        ctx,
+    );
+    let slot_index = fb.ins().iconst(ir::types::I64, i64::from(expected_index));
+    let guard_miss_resume_point =
+        ctx.guard_miss_resume_point
+            .unwrap_or(LocalEnvResumePoint::BeforeInstr {
+                key: InstrKey::new(ctx.function_id, instr_id),
+            });
+    emit_codegen_indexed_global_load(
+        fb,
+        globals_obj,
+        name_obj,
+        slot_index,
+        instr_id,
+        guard_miss_resume_point,
+        local_env,
+        ctx,
+    )
+}
+
 fn emit_codegen_opt_v3_indexed_global_load(
     fb: &mut FunctionBuilder<'_>,
     globals_obj: ir::Value,
@@ -5479,26 +5525,12 @@ fn emit_codegen_opt_v3_indexed_global_load(
     local_env: &LocalEnv,
     ctx: &JitEmitCtx<'_>,
 ) -> ir::Value {
-    let name_obj = emit_owned_module_constant(
-        fb,
-        ctx.module_constants.require_unicode_constant_id(&plan.name),
-        ctx,
-    );
-    let slot_index = fb
-        .ins()
-        .iconst(ir::types::I64, i64::from(plan.expected_index));
-    let guard_miss_resume_point =
-        ctx.guard_miss_resume_point
-            .unwrap_or(LocalEnvResumePoint::BeforeInstr {
-                key: InstrKey::new(ctx.function_id, plan.source),
-            });
-    emit_codegen_indexed_global_load(
+    emit_planned_indexed_global_load(
         fb,
         globals_obj,
-        name_obj,
-        slot_index,
+        plan.name.as_str(),
+        plan.expected_index,
         plan.source,
-        guard_miss_resume_point,
         local_env,
         ctx,
     )
@@ -11085,6 +11117,219 @@ fn annotate_typed_attr_accesses(
     Ok(annotator.count)
 }
 
+fn typed_indexed_global_access_plan_from_opt_v3(
+    plan: &OptV3IndexedGlobalAccessPlan,
+) -> TypedIndexedGlobalAccessPlan {
+    TypedIndexedGlobalAccessPlan {
+        source: TypedIndexedGlobalPlanSource::OptimizationPlanV3,
+        instr_id: plan.source,
+        access: plan.access,
+        module_name: plan.module_name.clone(),
+        name: plan.name.clone(),
+        expected_index: plan.expected_index,
+        guard: plan.guard,
+        fallback: plan.fallback,
+    }
+}
+
+fn annotate_typed_indexed_global_accesses(
+    function: &mut BlockPyFunction<TypedCodegenModuleShape>,
+    indexed_globals_by_instr: &HashMap<InstrId, OptV3IndexedGlobalAccessPlan>,
+) -> Result<usize, String> {
+    struct Annotator<'a> {
+        indexed_globals_by_instr: &'a HashMap<InstrId, OptV3IndexedGlobalAccessPlan>,
+        used: HashSet<InstrId>,
+        count: usize,
+        error: Option<String>,
+    }
+
+    impl Annotator<'_> {
+        fn plan_for_instr(
+            &mut self,
+            instr_id: InstrId,
+            expected_access: PlanV3IndexedGlobalAccessKind,
+            location_is_global: bool,
+        ) -> Option<TypedIndexedGlobalAccessPlan> {
+            let plan = self.indexed_globals_by_instr.get(&instr_id)?;
+            if plan.access != expected_access {
+                self.error = Some(format!(
+                    "optimizer v3 indexed-global plan for {instr_id} expected {:?}, but typed node requires {:?}",
+                    plan.access, expected_access
+                ));
+                return None;
+            }
+            if !location_is_global {
+                self.error = Some(format!(
+                    "optimizer v3 indexed-global plan for {instr_id} reached a non-global typed node"
+                ));
+                return None;
+            }
+            self.used.insert(instr_id);
+            Some(typed_indexed_global_access_plan_from_opt_v3(plan))
+        }
+    }
+
+    impl VisitMut<InstrTyped> for Annotator<'_> {
+        fn visit_instr_mut(&mut self, expr: &mut InstrTyped) {
+            if self.error.is_some() {
+                return;
+            }
+            match expr {
+                InstrTyped::Load(op) => {
+                    if let Some(instr_id) = op.try_semantic_instr_id()
+                        && let Some(plan) = self.plan_for_instr(
+                            instr_id,
+                            PlanV3IndexedGlobalAccessKind::Load,
+                            op.name.location.is_global(),
+                        )
+                    {
+                        op.extra_mut().set_indexed_global_access_plan(plan);
+                        self.count += 1;
+                    }
+                }
+                InstrTyped::LegacyStore(op) => {
+                    if let Some(instr_id) = op.try_semantic_instr_id()
+                        && let Some(plan) = self.plan_for_instr(
+                            instr_id,
+                            PlanV3IndexedGlobalAccessKind::Store,
+                            op.name.location.is_global(),
+                        )
+                    {
+                        op.extra_mut().set_indexed_global_access_plan(plan);
+                        self.count += 1;
+                    }
+                }
+                _ => {}
+            }
+            expr.visit_children_mut(self);
+        }
+    }
+
+    let mut annotator = Annotator {
+        indexed_globals_by_instr,
+        used: HashSet::new(),
+        count: 0,
+        error: None,
+    };
+    annotator.visit_fn_mut(function);
+    if let Some(error) = annotator.error {
+        return Err(error);
+    }
+    if annotator.used.len() != indexed_globals_by_instr.len() {
+        let missing = indexed_globals_by_instr
+            .keys()
+            .filter(|instr_id| !annotator.used.contains(instr_id))
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "optimizer v3 indexed-global plans were not attached to typed nodes: {missing}"
+        ));
+    }
+    Ok(annotator.count)
+}
+
+fn typed_exact_list_item_access_plan_from_opt_v3(
+    plan: &OptV3ExactListItemAccessPlan,
+) -> TypedExactListItemAccessPlan {
+    TypedExactListItemAccessPlan {
+        source: TypedExactListItemPlanSource::OptimizationPlanV3,
+        instr_id: plan.source,
+        access: plan.access,
+        shape: plan.shape,
+        guard: plan.guard,
+        fallback: plan.fallback,
+    }
+}
+
+fn annotate_typed_exact_list_item_accesses(
+    function: &mut BlockPyFunction<TypedCodegenModuleShape>,
+    exact_list_items_by_instr: &HashMap<InstrId, OptV3ExactListItemAccessPlan>,
+) -> Result<usize, String> {
+    struct Annotator<'a> {
+        exact_list_items_by_instr: &'a HashMap<InstrId, OptV3ExactListItemAccessPlan>,
+        used: HashSet<InstrId>,
+        count: usize,
+        error: Option<String>,
+    }
+
+    impl Annotator<'_> {
+        fn plan_for_instr(
+            &mut self,
+            instr_id: InstrId,
+            expected_access: soac_opt::plan_v3::ExactListItemAccessKind,
+        ) -> Option<TypedExactListItemAccessPlan> {
+            let plan = self.exact_list_items_by_instr.get(&instr_id)?;
+            if plan.access != expected_access {
+                self.error = Some(format!(
+                    "optimizer v3 exact-list item plan for {instr_id} expected {:?}, but typed node requires {:?}",
+                    plan.access, expected_access
+                ));
+                return None;
+            }
+            self.used.insert(instr_id);
+            Some(typed_exact_list_item_access_plan_from_opt_v3(plan))
+        }
+    }
+
+    impl VisitMut<InstrTyped> for Annotator<'_> {
+        fn visit_instr_mut(&mut self, expr: &mut InstrTyped) {
+            if self.error.is_some() {
+                return;
+            }
+            match expr {
+                InstrTyped::LegacyGetItem(op) => {
+                    if let Some(instr_id) = op.try_semantic_instr_id()
+                        && let Some(plan) = self.plan_for_instr(
+                            instr_id,
+                            soac_opt::plan_v3::ExactListItemAccessKind::Get,
+                        )
+                    {
+                        op.extra_mut().set_exact_list_item_access_plan(plan);
+                        self.count += 1;
+                    }
+                }
+                InstrTyped::LegacySetItem(op) => {
+                    if let Some(instr_id) = op.try_semantic_instr_id()
+                        && let Some(plan) = self.plan_for_instr(
+                            instr_id,
+                            soac_opt::plan_v3::ExactListItemAccessKind::Set,
+                        )
+                    {
+                        op.extra_mut().set_exact_list_item_access_plan(plan);
+                        self.count += 1;
+                    }
+                }
+                _ => {}
+            }
+            expr.visit_children_mut(self);
+        }
+    }
+
+    let mut annotator = Annotator {
+        exact_list_items_by_instr,
+        used: HashSet::new(),
+        count: 0,
+        error: None,
+    };
+    annotator.visit_fn_mut(function);
+    if let Some(error) = annotator.error {
+        return Err(error);
+    }
+    if annotator.used.len() != exact_list_items_by_instr.len() {
+        let missing = exact_list_items_by_instr
+            .keys()
+            .filter(|instr_id| !annotator.used.contains(instr_id))
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "optimizer v3 exact-list item plans were not attached to typed nodes: {missing}"
+        ));
+    }
+    Ok(annotator.count)
+}
+
 fn call_site_profiled_targets<'a>(
     call: &blockpy_intrinsics::Call<InstrCodegen>,
     profiled_targets: Option<&'a [RuntimeFunctionId]>,
@@ -14993,14 +15238,32 @@ fn emit_typed_codegen_expr_value_with_local_env(
             .result_facts()
             .and_then(ValueFacts::as_pyobj)
             .unwrap_or_else(PyObjFacts::unknown);
-        let value = emit_resolved_name_load_with_local_env(
-            fb,
-            &op.name,
-            op.try_semantic_instr_id(),
-            local_env,
-            emit_ctx,
-            borrowed,
-        );
+        let value = if let Some(plan) = op.extra().indexed_global_access_plan() {
+            if plan.access != PlanV3IndexedGlobalAccessKind::Load {
+                return Err(format!(
+                    "typed indexed-global plan for {} expected {:?}, but typed load requires Load",
+                    plan.instr_id, plan.access
+                ));
+            }
+            emit_planned_indexed_global_load(
+                fb,
+                emit_ctx.consts.block_const,
+                plan.name.as_str(),
+                plan.expected_index,
+                plan.instr_id,
+                local_env,
+                emit_ctx,
+            )
+        } else {
+            emit_resolved_name_load_with_local_env(
+                fb,
+                &op.name,
+                op.try_semantic_instr_id(),
+                local_env,
+                emit_ctx,
+                borrowed,
+            )
+        };
         let ownership = if facts.is_immortal() {
             ValueOwnership::Immortal
         } else if borrowed {
@@ -18945,6 +19208,21 @@ fn emit_typed_codegen_stmt_with_local_env(
             return Ok(value);
         }
     }
+    if matches!(
+        expr,
+        InstrTyped::LegacyGetItem(_) | InstrTyped::LegacySetItem(_)
+    ) {
+        let mut intrinsic_state = LocalEnvCodegenIntrinsicEmitState {
+            fb,
+            local_env,
+            ctx: emit_ctx,
+            codegen_env,
+            func_imports,
+        };
+        if let Some(value) = intrinsics::emit_typed_operation(expr, &mut intrinsic_state) {
+            return Ok(value);
+        }
+    }
 
     if matches!(
         expr,
@@ -19163,6 +19441,27 @@ fn emit_typed_codegen_stmt_result_with_local_env(
                     fb, value, facts, emit_ctx, demand,
                 ));
             }
+        }
+    }
+    if matches!(
+        expr,
+        InstrTyped::LegacyGetItem(_) | InstrTyped::LegacySetItem(_)
+    ) {
+        let mut intrinsic_state = LocalEnvCodegenIntrinsicEmitState {
+            fb,
+            local_env,
+            ctx: emit_ctx,
+            codegen_env,
+            func_imports,
+        };
+        if let Some(value) = intrinsics::emit_typed_operation(expr, &mut intrinsic_state) {
+            let facts = expr
+                .result_facts()
+                .and_then(ValueFacts::as_pyobj)
+                .unwrap_or_else(PyObjFacts::unknown);
+            return Ok(emit_owned_pyobject_result_for_demand(
+                fb, value, facts, emit_ctx, demand,
+            ));
         }
     }
 

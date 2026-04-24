@@ -1,4 +1,8 @@
 use crate::passes::{BoolFacts, FactStore, PyObjFacts, ValueFacts, value_facts};
+use crate::plan_v3::{
+    ExactListItemAccessKind, ExactListItemFallbackKind, ExactListItemGuardKind, ExactListItemShape,
+    IndexedGlobalAccessKind, IndexedGlobalFallbackKind, IndexedGlobalGuardKind,
+};
 #[allow(unused_imports)]
 use soac_core::block_py;
 #[allow(unused_imports)]
@@ -984,6 +988,38 @@ pub enum TypedAttrAccessPlan {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TypedIndexedGlobalPlanSource {
+    OptimizationPlanV3,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TypedIndexedGlobalAccessPlan {
+    pub source: TypedIndexedGlobalPlanSource,
+    pub instr_id: InstrId,
+    pub access: IndexedGlobalAccessKind,
+    pub module_name: String,
+    pub name: String,
+    pub expected_index: u32,
+    pub guard: IndexedGlobalGuardKind,
+    pub fallback: IndexedGlobalFallbackKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TypedExactListItemPlanSource {
+    OptimizationPlanV3,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TypedExactListItemAccessPlan {
+    pub source: TypedExactListItemPlanSource,
+    pub instr_id: InstrId,
+    pub access: ExactListItemAccessKind,
+    pub shape: ExactListItemShape,
+    pub guard: ExactListItemGuardKind,
+    pub fallback: ExactListItemFallbackKind,
+}
+
 define_ruff_instr! {
     pub struct TypedGetAttr<E> {
         value: Box<E>,
@@ -1162,6 +1198,8 @@ pub struct TypedInstrExtra {
     pub result_facts: Option<ValueFacts>,
     pub demand: Option<TypedResultDemand>,
     pub planned_result: Option<TypedPlannedResult>,
+    pub indexed_global_access: Option<TypedIndexedGlobalAccessPlan>,
+    pub exact_list_item_access: Option<TypedExactListItemAccessPlan>,
 }
 
 impl TypedInstrExtra {
@@ -1211,6 +1249,38 @@ impl TypedInstrExtra {
 
     pub fn clear_planned_result(&mut self) -> bool {
         self.planned_result.take().is_some()
+    }
+
+    pub fn indexed_global_access_plan(&self) -> Option<&TypedIndexedGlobalAccessPlan> {
+        self.indexed_global_access.as_ref()
+    }
+
+    pub fn set_indexed_global_access_plan(&mut self, plan: TypedIndexedGlobalAccessPlan) -> bool {
+        if self.indexed_global_access.as_ref() == Some(&plan) {
+            return false;
+        }
+        self.indexed_global_access = Some(plan);
+        true
+    }
+
+    pub fn clear_indexed_global_access_plan(&mut self) -> bool {
+        self.indexed_global_access.take().is_some()
+    }
+
+    pub fn exact_list_item_access_plan(&self) -> Option<&TypedExactListItemAccessPlan> {
+        self.exact_list_item_access.as_ref()
+    }
+
+    pub fn set_exact_list_item_access_plan(&mut self, plan: TypedExactListItemAccessPlan) -> bool {
+        if self.exact_list_item_access.as_ref() == Some(&plan) {
+            return false;
+        }
+        self.exact_list_item_access = Some(plan);
+        true
+    }
+
+    pub fn clear_exact_list_item_access_plan(&mut self) -> bool {
+        self.exact_list_item_access.take().is_some()
     }
 }
 
