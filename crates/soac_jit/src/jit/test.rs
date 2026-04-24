@@ -15023,11 +15023,7 @@ def f(x):
             &module_constants,
             BuildSpecializedFunctionOptions {
                 specialization_inputs: Some(FunctionSpecializationInputs {
-                    opt_v3_exact_list_items_by_instr: HashMap::new(),
-                    field_index_specializations: HashMap::new(),
-                    field_index_specializations_by_instr: HashMap::new(),
-                    opt_v3_indexed_fields_by_instr: HashMap::new(),
-                    opt_v3_indexed_globals_by_instr: HashMap::new(),
+                    legacy_overlays: Some(LegacyFunctionSpecializationOverlays::default()),
                     cold_block_labels: HashSet::new(),
                     opt_v3_exact_int_branch_artifacts: Some(std::sync::Arc::new(artifacts)),
                     behavior_change_indexed_stores: false,
@@ -15200,11 +15196,7 @@ def f(x):
             &module_constants,
             BuildSpecializedFunctionOptions {
                 specialization_inputs: Some(FunctionSpecializationInputs {
-                    opt_v3_exact_list_items_by_instr: HashMap::new(),
-                    field_index_specializations: HashMap::new(),
-                    field_index_specializations_by_instr: HashMap::new(),
-                    opt_v3_indexed_fields_by_instr: HashMap::new(),
-                    opt_v3_indexed_globals_by_instr: HashMap::new(),
+                    legacy_overlays: Some(LegacyFunctionSpecializationOverlays::default()),
                     cold_block_labels: HashSet::new(),
                     opt_v3_exact_int_branch_artifacts: Some(std::sync::Arc::new(artifacts)),
                     behavior_change_indexed_stores: false,
@@ -15334,11 +15326,7 @@ def f(x):
                 &module_constants,
                 BuildSpecializedFunctionOptions {
                     specialization_inputs: Some(FunctionSpecializationInputs {
-                        opt_v3_exact_list_items_by_instr: HashMap::new(),
-                        field_index_specializations: HashMap::new(),
-                        field_index_specializations_by_instr: HashMap::new(),
-                        opt_v3_indexed_fields_by_instr: HashMap::new(),
-                        opt_v3_indexed_globals_by_instr: HashMap::new(),
+                        legacy_overlays: Some(LegacyFunctionSpecializationOverlays::default()),
                         cold_block_labels: HashSet::new(),
                         opt_v3_exact_int_branch_artifacts: Some(std::sync::Arc::new(artifacts)),
                         behavior_change_indexed_stores: false,
@@ -15453,11 +15441,7 @@ def f(x):
                 &module_constants,
                 BuildSpecializedFunctionOptions {
                     specialization_inputs: Some(FunctionSpecializationInputs {
-                        opt_v3_exact_list_items_by_instr: HashMap::new(),
-                        field_index_specializations: HashMap::new(),
-                        field_index_specializations_by_instr: HashMap::new(),
-                        opt_v3_indexed_fields_by_instr: HashMap::new(),
-                        opt_v3_indexed_globals_by_instr: HashMap::new(),
+                        legacy_overlays: Some(LegacyFunctionSpecializationOverlays::default()),
                         cold_block_labels: HashSet::new(),
                         opt_v3_exact_int_branch_artifacts: Some(std::sync::Arc::new(artifacts)),
                         behavior_change_indexed_stores: false,
@@ -15566,11 +15550,7 @@ def f(x):
             &module_constants,
             BuildSpecializedFunctionOptions {
                 specialization_inputs: Some(FunctionSpecializationInputs {
-                    opt_v3_exact_list_items_by_instr: HashMap::new(),
-                    field_index_specializations: HashMap::new(),
-                    field_index_specializations_by_instr: HashMap::new(),
-                    opt_v3_indexed_fields_by_instr: HashMap::new(),
-                    opt_v3_indexed_globals_by_instr: HashMap::new(),
+                    legacy_overlays: Some(LegacyFunctionSpecializationOverlays::default()),
                     cold_block_labels: HashSet::new(),
                     opt_v3_exact_int_branch_artifacts: Some(std::sync::Arc::new(artifacts)),
                     behavior_change_indexed_stores: false,
@@ -16383,14 +16363,13 @@ def f(x):
     ) -> FunctionSpecializationInputs {
         let source = first_indexed_global_access_source(function, access, name);
         FunctionSpecializationInputs {
-            opt_v3_exact_list_items_by_instr: HashMap::new(),
-            field_index_specializations: HashMap::new(),
-            field_index_specializations_by_instr: HashMap::new(),
-            opt_v3_indexed_fields_by_instr: HashMap::new(),
-            opt_v3_indexed_globals_by_instr: HashMap::from([(
-                source,
-                opt_v3_indexed_global_plan_for_name(source, access, name),
-            )]),
+            legacy_overlays: Some(LegacyFunctionSpecializationOverlays {
+                indexed_globals_by_instr: HashMap::from([(
+                    source,
+                    opt_v3_indexed_global_plan_for_name(source, access, name),
+                )]),
+                ..LegacyFunctionSpecializationOverlays::default()
+            }),
             cold_block_labels: HashSet::new(),
             opt_v3_exact_int_branch_artifacts: None,
             behavior_change_indexed_stores,
@@ -16416,23 +16395,25 @@ def f(x):
             &module_constants,
             BuildSpecializedFunctionOptions {
                 specialization_inputs: Some(FunctionSpecializationInputs {
-                    opt_v3_exact_list_items_by_instr: HashMap::new(),
-                    field_index_specializations: HashMap::new(),
-                    field_index_specializations_by_instr: HashMap::new(),
-                    opt_v3_indexed_fields_by_instr: HashMap::new(),
-                    opt_v3_indexed_globals_by_instr: HashMap::from([
-                        (
-                            load_source,
-                            opt_v3_indexed_global_plan(load_source, IndexedGlobalAccessKind::Load),
-                        ),
-                        (
-                            store_source,
-                            opt_v3_indexed_global_plan(
-                                store_source,
-                                IndexedGlobalAccessKind::Store,
+                    legacy_overlays: Some(LegacyFunctionSpecializationOverlays {
+                        indexed_globals_by_instr: HashMap::from([
+                            (
+                                load_source,
+                                opt_v3_indexed_global_plan(
+                                    load_source,
+                                    IndexedGlobalAccessKind::Load,
+                                ),
                             ),
-                        ),
-                    ]),
+                            (
+                                store_source,
+                                opt_v3_indexed_global_plan(
+                                    store_source,
+                                    IndexedGlobalAccessKind::Store,
+                                ),
+                            ),
+                        ]),
+                        ..LegacyFunctionSpecializationOverlays::default()
+                    }),
                     cold_block_labels: HashSet::new(),
                     opt_v3_exact_int_branch_artifacts: None,
                     behavior_change_indexed_stores: true,
@@ -16506,11 +16487,7 @@ def f(x):
             &module_constants,
             BuildSpecializedFunctionOptions {
                 specialization_inputs: Some(FunctionSpecializationInputs {
-                    opt_v3_exact_list_items_by_instr: HashMap::new(),
-                    field_index_specializations: HashMap::new(),
-                    field_index_specializations_by_instr: HashMap::new(),
-                    opt_v3_indexed_fields_by_instr: HashMap::new(),
-                    opt_v3_indexed_globals_by_instr: HashMap::new(),
+                    legacy_overlays: Some(LegacyFunctionSpecializationOverlays::default()),
                     cold_block_labels: HashSet::new(),
                     opt_v3_exact_int_branch_artifacts: None,
                     behavior_change_indexed_stores: true,
@@ -16679,7 +16656,10 @@ def read_point(point):
                 .expect("v3 indexed-field input should resolve to codegen guards");
             assert!(
                 inputs
-                    .opt_v3_indexed_fields_by_instr
+                    .legacy_overlays
+                    .as_ref()
+                    .expect("legacy artifact path should carry sidecar overlays")
+                    .indexed_fields_by_instr
                     .contains_key(&getattr_instr_id),
                 "v3 emitted indexed-field decision should become explicit v3 codegen input"
             );
@@ -16760,7 +16740,10 @@ def read_point(point):
                 .expect("unresolvable v3 indexed-field owner should keep local fallback");
             assert!(
                 !inputs
-                    .opt_v3_indexed_fields_by_instr
+                    .legacy_overlays
+                    .as_ref()
+                    .expect("legacy artifact path should carry sidecar overlays")
+                    .indexed_fields_by_instr
                     .contains_key(&getattr_instr_id),
                 "unresolvable v3 indexed-field owner should not become codegen input"
             );
@@ -16902,7 +16885,10 @@ def write_point(point, value):
                 .expect("v3 indexed-field SetAttr input should resolve to codegen guards");
             assert!(
                 inputs
-                    .opt_v3_indexed_fields_by_instr
+                    .legacy_overlays
+                    .as_ref()
+                    .expect("legacy artifact path should carry sidecar overlays")
+                    .indexed_fields_by_instr
                     .contains_key(&setattr_instr_id),
                 "v3 emitted indexed-field Store decision should become explicit v3 codegen input"
             );
@@ -18254,13 +18240,9 @@ def f(x, y):
             let specialization_inputs =
                 FunctionSpecializationInputs::from_profile(&profile, planned_function)
                     .expect("typed-v3 access plans should become specialization inputs");
-            assert_eq!(
-                specialization_inputs
-                    .opt_v3_indexed_globals_by_instr
-                    .get(&load_instr_id)
-                    .map(|plan| (plan.name.as_str(), plan.expected_index)),
-                Some(("x", 0)),
-                "typed-v3 runtime should feed indexed-global access plans into JIT specialization inputs"
+            assert!(
+                specialization_inputs.legacy_overlays.is_none(),
+                "typed-v3 runtime should keep indexed-global access plans embedded in InstrTyped"
             );
         });
     }

@@ -11878,13 +11878,18 @@ impl PlannedOptimizationInputs {
     }
 }
 
-#[derive(Clone, Debug)]
-struct FunctionSpecializationInputs {
-    opt_v3_exact_list_items_by_instr: HashMap<InstrId, OptV3ExactListItemAccessPlan>,
+#[derive(Clone, Debug, Default)]
+struct LegacyFunctionSpecializationOverlays {
+    exact_list_items_by_instr: HashMap<InstrId, OptV3ExactListItemAccessPlan>,
     field_index_specializations: HashMap<String, Vec<FieldIndexSpecialization>>,
     field_index_specializations_by_instr: HashMap<InstrId, Vec<FieldIndexSpecialization>>,
-    opt_v3_indexed_fields_by_instr: HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>,
-    opt_v3_indexed_globals_by_instr: HashMap<InstrId, OptV3IndexedGlobalAccessPlan>,
+    indexed_fields_by_instr: HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>,
+    indexed_globals_by_instr: HashMap<InstrId, OptV3IndexedGlobalAccessPlan>,
+}
+
+#[derive(Clone, Debug)]
+struct FunctionSpecializationInputs {
+    legacy_overlays: Option<LegacyFunctionSpecializationOverlays>,
     cold_block_labels: HashSet<BlockLabel>,
     opt_v3_exact_int_branch_artifacts: Option<Arc<ExactIntBranchV3Artifacts>>,
     behavior_change_indexed_stores: bool,
@@ -12300,25 +12305,32 @@ impl FunctionSpecializationInputs {
         profile: &SpecializationProfile<'_>,
         function: &BlockPyFunction<impl ModuleShape>,
     ) -> Result<Self, String> {
-        let (
-            field_index_specializations,
-            field_index_specializations_by_instr,
-            opt_v3_indexed_fields_by_instr,
-        ) = profile.field_index_specialization_maps(function.function_id)?;
+        let legacy_overlays = if profile.typed_specializations_embedded() {
+            None
+        } else {
+            let (
+                field_index_specializations,
+                field_index_specializations_by_instr,
+                indexed_fields_by_instr,
+            ) = profile.field_index_specialization_maps(function.function_id)?;
+            Some(LegacyFunctionSpecializationOverlays {
+                exact_list_items_by_instr: profile
+                    .opt_v3_emitted_exact_list_items
+                    .get(&function.function_id)
+                    .cloned()
+                    .unwrap_or_default(),
+                field_index_specializations,
+                field_index_specializations_by_instr,
+                indexed_fields_by_instr,
+                indexed_globals_by_instr: profile
+                    .opt_v3_emitted_indexed_globals
+                    .get(&function.function_id)
+                    .cloned()
+                    .unwrap_or_default(),
+            })
+        };
         Ok(Self {
-            opt_v3_exact_list_items_by_instr: profile
-                .opt_v3_emitted_exact_list_items
-                .get(&function.function_id)
-                .cloned()
-                .unwrap_or_default(),
-            field_index_specializations,
-            field_index_specializations_by_instr,
-            opt_v3_indexed_fields_by_instr,
-            opt_v3_indexed_globals_by_instr: profile
-                .opt_v3_emitted_indexed_globals
-                .get(&function.function_id)
-                .cloned()
-                .unwrap_or_default(),
+            legacy_overlays,
             cold_block_labels: profile.cold_block_labels(function)?,
             opt_v3_exact_int_branch_artifacts: profile
                 .opt_v3_exact_int_branch_artifacts
@@ -12333,6 +12345,10 @@ impl FunctionSpecializationInputs {
 }
 
 impl<'a> SpecializationProfile<'a> {
+    fn typed_specializations_embedded(&self) -> bool {
+        self.direct_call_emission_scope == DirectCallEmissionScope::AllDirectCallCandidates
+    }
+
     fn from_runtime_state_with_session(
         shared_state: Option<&'a SharedModuleState>,
         compile_session: Option<&crate::session::CompileSession>,
@@ -26107,11 +26123,7 @@ fn prepare_specialized_typed_function(
     legacy_call_emission_typed_function: Option<&BlockPyFunction<TypedCodegenModuleShape>>,
     specialization_profile: Option<&SpecializationProfile<'_>>,
     value_facts: &FactStore,
-    field_index_specializations: &HashMap<String, Vec<FieldIndexSpecialization>>,
-    field_index_specializations_by_instr: &HashMap<InstrId, Vec<FieldIndexSpecialization>>,
-    opt_v3_indexed_fields_by_instr: &HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>,
-    opt_v3_indexed_globals_by_instr: &HashMap<InstrId, OptV3IndexedGlobalAccessPlan>,
-    opt_v3_exact_list_items_by_instr: &HashMap<InstrId, OptV3ExactListItemAccessPlan>,
+    legacy_overlays: Option<&LegacyFunctionSpecializationOverlays>,
     opt_v3_exact_int_branch_artifacts: Option<&ExactIntBranchV3Artifacts>,
     specialize_field_stores: bool,
 ) -> Result<PreparedSpecializedTypedFunction, String> {
@@ -26120,24 +26132,35 @@ fn prepare_specialized_typed_function(
         .unwrap_or_else(|| function.clone());
     annotate_typed_function_value_facts(&mut typed_function, value_facts);
     validate_typed_function_value_facts(&typed_function)?;
-    if legacy_call_emission_typed_function.is_none() {
+    if legacy_call_emission_typed_function.is_none()
+        && !specialization_profile
+            .is_some_and(SpecializationProfile::typed_specializations_embedded)
+    {
         apply_profile_call_emissions_to_typed_function(
             &mut typed_function,
             specialization_profile,
         )?;
     }
 
-    annotate_typed_attr_accesses(
-        &mut typed_function,
-        field_index_specializations,
-        field_index_specializations_by_instr,
-        opt_v3_indexed_fields_by_instr,
-        specialize_field_stores,
-    )?;
-    annotate_typed_indexed_global_accesses(&mut typed_function, opt_v3_indexed_globals_by_instr)?;
-    annotate_typed_exact_list_item_accesses(&mut typed_function, opt_v3_exact_list_items_by_instr)?;
-    if let Some(exact_int_artifacts) = opt_v3_exact_int_branch_artifacts {
-        annotate_typed_exact_int_selections(&mut typed_function, exact_int_artifacts)?;
+    if let Some(legacy_overlays) = legacy_overlays {
+        annotate_typed_attr_accesses(
+            &mut typed_function,
+            &legacy_overlays.field_index_specializations,
+            &legacy_overlays.field_index_specializations_by_instr,
+            &legacy_overlays.indexed_fields_by_instr,
+            specialize_field_stores,
+        )?;
+        annotate_typed_indexed_global_accesses(
+            &mut typed_function,
+            &legacy_overlays.indexed_globals_by_instr,
+        )?;
+        annotate_typed_exact_list_item_accesses(
+            &mut typed_function,
+            &legacy_overlays.exact_list_items_by_instr,
+        )?;
+        if let Some(exact_int_artifacts) = opt_v3_exact_int_branch_artifacts {
+            annotate_typed_exact_int_selections(&mut typed_function, exact_int_artifacts)?;
+        }
     }
     lower_typed_function_call_access_plan_instrs(&mut typed_function);
     refresh_typed_function_value_facts(&mut typed_function);
@@ -26441,12 +26464,7 @@ fn build_cranelift_run_bb_specialized_function(
             FunctionSpecializationInputs::from_profile(profile, function)?
         }
     };
-    let opt_v3_exact_list_items_by_instr = specialization_inputs.opt_v3_exact_list_items_by_instr;
-    let field_index_specializations = specialization_inputs.field_index_specializations;
-    let field_index_specializations_by_instr =
-        specialization_inputs.field_index_specializations_by_instr;
-    let opt_v3_indexed_fields_by_instr = specialization_inputs.opt_v3_indexed_fields_by_instr;
-    let opt_v3_indexed_globals_by_instr = specialization_inputs.opt_v3_indexed_globals_by_instr;
+    let legacy_overlays = specialization_inputs.legacy_overlays;
     let cold_block_labels = specialization_inputs.cold_block_labels;
     let opt_v3_exact_int_branch_artifacts = specialization_inputs.opt_v3_exact_int_branch_artifacts;
     let behavior_change_indexed_stores = specialization_inputs.behavior_change_indexed_stores;
@@ -26463,11 +26481,7 @@ fn build_cranelift_run_bb_specialized_function(
         options.legacy_call_emission_typed_function.as_ref(),
         specialization_profile,
         value_facts,
-        &field_index_specializations,
-        &field_index_specializations_by_instr,
-        &opt_v3_indexed_fields_by_instr,
-        &opt_v3_indexed_globals_by_instr,
-        &opt_v3_exact_list_items_by_instr,
+        legacy_overlays.as_ref(),
         opt_v3_exact_int_branch_artifacts.as_deref(),
         behavior_change_indexed_stores,
     )?;
@@ -27543,11 +27557,7 @@ pub unsafe fn render_instr_typed_for_codegen_with_runtime_state(
         None,
         Some(&specialization_profile),
         &jit_module_plan.value_facts,
-        &specialization_inputs.field_index_specializations,
-        &specialization_inputs.field_index_specializations_by_instr,
-        &specialization_inputs.opt_v3_indexed_fields_by_instr,
-        &specialization_inputs.opt_v3_indexed_globals_by_instr,
-        &specialization_inputs.opt_v3_exact_list_items_by_instr,
+        specialization_inputs.legacy_overlays.as_ref(),
         specialization_inputs
             .opt_v3_exact_int_branch_artifacts
             .as_deref(),
