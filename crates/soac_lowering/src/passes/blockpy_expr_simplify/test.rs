@@ -1,6 +1,7 @@
 use super::*;
 
 use crate::block_py::{BinOpKind, BlockTerm, Literal, NameLike, UnaryOpKind};
+use crate::pass_tracker::LoweringPassTrackerInternalExt;
 
 fn lower_semantic_expr_without_setup(expr: &Expr) -> InstrWithAwaitAndYield {
     InstrWithAwaitAndYield::from_ast_expr(expr.clone())

@@ -8,6 +8,7 @@ use crate::block_py::{
     EffectiveBinding, InstrWithAwaitAndYield, ModuleNameGen, NameLike,
 };
 use crate::lower_python_to_blockpy_for_testing;
+use crate::pass_tracker::LoweringPassTrackerInternalExt;
 use crate::passes::ast_to_ast::context::Context;
 use crate::passes::ast_to_ast::semantic::SemanticAstState;
 use crate::passes::ruff_to_blockpy::rewrite_ast_to_core_blockpy_module_with_module;

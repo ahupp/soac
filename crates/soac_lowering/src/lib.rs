@@ -2,7 +2,6 @@
 #![deny(unreachable_pub)]
 
 pub use crate::driver::{lower_source_to_codegen_module_with_tracker, LoweringOptions};
-use crate::pass_tracker::{NoopPassTracker, PassTracker, RecordingPassTracker};
 use crate::passes::CodegenModuleShape;
 use anyhow::Error as AnyhowError;
 use ruff_python_ast::{self as ast, Expr, Stmt};
@@ -11,6 +10,7 @@ pub use ruff_python_parser::ParseError;
 use ruff_source_file::LineEnding;
 use ruff_text_size::TextRange;
 use soac_core::block_py::{BlockPyModule, ModuleNameGen};
+use soac_core::pass_tracker::{NoopPassTracker, PassTracker, RecordingPassTracker};
 use std::time::{Duration, Instant};
 
 pub mod block_py;

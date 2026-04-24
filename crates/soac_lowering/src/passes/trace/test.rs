@@ -8,6 +8,7 @@ use crate::block_py::{
     FunctionExecutionMode, InstrCodegen, NameLike, NameLocation, RuntimeFunctionId, Visit,
 };
 use crate::lower_python_to_blockpy_for_testing;
+use crate::pass_tracker::LoweringPassTrackerInternalExt;
 use crate::passes::{
     assign_module_instr_ids, lower_try_jump_exception_flow, normalize_bb_module_strings,
     CodegenModuleShape,

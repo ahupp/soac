@@ -5,6 +5,7 @@ use crate::block_py::{
     FunctionKind, InstrResolved, NameLike, NameLocation, ResolvedStorageBlock, ScopeExprNode,
 };
 use crate::block_py::{BindingKind, ClosureInit, ClosureSlot, ModuleNameGen};
+use crate::pass_tracker::LoweringPassTrackerInternalExt;
 use crate::passes::ast_to_ast::ast_rewrite::rewrite_with_pass;
 use crate::passes::ast_to_ast::context::Context;
 use crate::passes::ast_to_ast::rewrite_class_def;

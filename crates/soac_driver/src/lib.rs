@@ -12,7 +12,7 @@ use soac_core::block_py::{
     BlockPyModule, CounterDef, CounterId, CounterScope, CounterSite, DeoptEntrySource,
     FunctionExecutionMode, ModuleNameGen,
 };
-use soac_lowering::pass_tracker::{NoopPassTracker, PassTracker, RecordingPassTracker};
+use soac_core::pass_tracker::{NoopPassTracker, PassTracker, RecordingPassTracker};
 use soac_lowering::passes::{self, CodegenModuleShape, InstrCodegen};
 pub use soac_lowering::{LoweringError, LoweringResult, Result};
 use soac_opt::artifacts_v3::write_optimization_artifacts_v3;

@@ -6,6 +6,7 @@ use crate::block_py::{
     ResolvedStorageBlock, StorageLayout,
 };
 use crate::lower_python_to_blockpy_for_testing;
+use crate::pass_tracker::LoweringPassTrackerInternalExt;
 use crate::passes::CodegenModuleShape;
 
 fn tracked_name_binding_module(

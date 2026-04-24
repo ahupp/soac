@@ -2,6 +2,7 @@ use super::normalize_bb_module_strings;
 use crate::{
     block_py::{ChildVisitable, InstrCodegen, InstrResolved, Literal, NameLike, Visit},
     lower_python_to_blockpy_for_testing,
+    pass_tracker::LoweringPassTrackerInternalExt,
     passes::lower_try_jump_exception_flow,
 };
 

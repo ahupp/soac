@@ -5,6 +5,7 @@ use crate::block_py::{
     InstrWithAwaitAndYield, ModuleShape, NameLike, ScopeExprNode, TermRaise,
 };
 use crate::lower_python_to_blockpy_for_testing;
+use crate::pass_tracker::LoweringPassTrackerInternalExt;
 use crate::passes::ast_to_ast::context::Context;
 use crate::passes::ruff_to_blockpy::stmt_sequences::{
     lower_for_stmt_sequence, lower_if_stmt_sequence, lower_if_stmt_sequence_from_stmt,
