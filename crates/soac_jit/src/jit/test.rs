@@ -31,8 +31,7 @@ mod tests {
     };
     use soac_driver::codegen_cache::{
         CachedCodegenModuleMetadata, PythonModuleCacheSource, module_optimization_plan_v3_path,
-        module_optimized_codegen_v3_path, pre_optimization_module_cache_identity,
-        store_codegen_module_cache,
+        pre_optimization_module_cache_identity,
     };
     use soac_instrument::{
         CounterInstrumentationConfig, ExplicitCounterPlacement, InstrumentationConfig,
@@ -3219,21 +3218,6 @@ def build(values):
         }
     }
 
-    fn write_test_optimized_codegen_module_v3(
-        cache_root: &Path,
-        cache_source: PythonModuleCacheSource,
-        metadata: &CachedCodegenModuleMetadata,
-        module: &BlockPyModule<CodegenModuleShape>,
-    ) -> Result<(), String> {
-        let path = module_optimized_codegen_v3_path(
-            cache_root,
-            cache_source,
-            metadata.module_name.as_str(),
-        )
-        .map_err(|err| err.to_string())?;
-        store_codegen_module_cache(path.as_path(), metadata, module).map_err(|err| err.to_string())
-    }
-
     fn write_test_optimization_artifacts_v3_for_shared_state(
         cache_root: &Path,
         cache_source: PythonModuleCacheSource,
@@ -3247,14 +3231,6 @@ def build(values):
         )
         .expect("v3 test optimization plan path should build");
         write_test_optimization_artifacts_v3(v3_path.as_path(), artifacts);
-        let metadata = test_codegen_cache_metadata_for_shared_state(shared_state, cache_source);
-        write_test_optimized_codegen_module_v3(
-            cache_root,
-            cache_source,
-            &metadata,
-            &shared_state.lowered_module,
-        )
-        .expect("test optimized v3 BlockPy module cache should be writable");
     }
 
     fn ensure_test_optimization_artifacts_v3_for_shared_state(
@@ -3279,24 +3255,10 @@ def build(values):
             shared_state.module_name.as_str(),
         )
         .map_err(|err| err.to_string())?;
-        let optimized_output_path = module_optimized_codegen_v3_path(
-            cache_root.as_path(),
-            cache_source,
-            shared_state.module_name.as_str(),
-        )
-        .map_err(|err| err.to_string())?;
-        if output_path.exists() && optimized_output_path.exists() {
+        if output_path.exists() {
             return Ok(());
         }
         let metadata = test_codegen_cache_metadata_for_shared_state(shared_state, cache_source);
-        if !optimized_output_path.exists() {
-            write_test_optimized_codegen_module_v3(
-                cache_root.as_path(),
-                cache_source,
-                &metadata,
-                &shared_state.lowered_module,
-            )?;
-        }
         if output_path.exists() {
             return Ok(());
         }
@@ -4248,7 +4210,6 @@ def build(values):
         let profile = SpecializationProfile {
             module_name: None,
             counter_dump_path: None,
-            optimized_module: None,
             direct_call_emission_scope: DirectCallEmissionScope::DirectCallBodiesOnly,
             opt_v3_emitted_direct_calls: HashMap::from([(
                 function_id,
@@ -16788,7 +16749,6 @@ def read_point(point):
             let profile = SpecializationProfile {
                 module_name: None,
                 counter_dump_path: None,
-                optimized_module: None,
                 direct_call_emission_scope: DirectCallEmissionScope::DirectCallBodiesOnly,
                 opt_v3_emitted_direct_calls: HashMap::new(),
                 opt_v3_emitted_exact_list_items: HashMap::new(),
@@ -17823,8 +17783,8 @@ def f(x, y):
             )
             .expect("verify mode should load serialized runtime artifacts");
             assert!(
-                profile.optimized_module.is_some(),
-                "serialized v3 artifacts should load the paired optimized BlockPy module"
+                profile.has_v3_optimization_inputs(),
+                "serialized v3 artifacts should load typed optimization inputs"
             );
             assert!(
                 existing_counter_dump_path(profile.counter_dump_path.as_deref()).is_none(),
@@ -17879,8 +17839,8 @@ def f(x, y):
             )
             .expect("typed-v3 runtime pipeline should not require serialized v3 artifacts");
             assert!(
-                profile.optimized_module.is_none(),
-                "typed-v3 runtime should use the pre-optimization BlockPy module"
+                !profile.has_v3_optimization_inputs(),
+                "typed-v3 runtime should use the pre-optimization BlockPy module without artifact-driven rewrites"
             );
             assert!(
                 profile.counter_dump_path.is_none(),
@@ -18037,10 +17997,6 @@ def f(x, y):
             )
             .expect("typed-v3 runtime should plan direct calls from raw profile evidence");
             assert!(
-                profile.optimized_module.is_none(),
-                "typed-v3 runtime should not require an optimized BlockPy artifact"
-            );
-            assert!(
                 profile.counter_dump_path.is_none(),
                 "typed-v3 direct-call planning should not enable legacy profile evidence fallback"
             );
@@ -18172,7 +18128,6 @@ def f(x, y):
         let profile = SpecializationProfile {
             module_name: Some(module_name),
             counter_dump_path: None,
-            optimized_module: None,
             direct_call_emission_scope: DirectCallEmissionScope::AllDirectCallCandidates,
             opt_v3_emitted_direct_calls: HashMap::from([(
                 caller_id,
@@ -18308,10 +18263,6 @@ def f(x, y):
             )
             .expect("typed-v3 runtime should plan access emissions from raw profile evidence");
             assert!(
-                profile.optimized_module.is_none(),
-                "typed-v3 runtime should not require an optimized BlockPy artifact"
-            );
-            assert!(
                 profile.counter_dump_path.is_none(),
                 "typed-v3 access planning should not enable legacy profile evidence fallback"
             );
@@ -18401,7 +18352,6 @@ class Point:
             let profile = SpecializationProfile {
                 module_name: Some(module_name),
                 counter_dump_path: None,
-                optimized_module: None,
                 direct_call_emission_scope: DirectCallEmissionScope::AllDirectCallCandidates,
                 opt_v3_emitted_direct_calls: HashMap::new(),
                 opt_v3_emitted_exact_list_items: HashMap::new(),
@@ -18524,7 +18474,6 @@ class Point:
         let profile = SpecializationProfile {
             module_name: Some(module_name),
             counter_dump_path: None,
-            optimized_module: None,
             direct_call_emission_scope: DirectCallEmissionScope::AllDirectCallCandidates,
             opt_v3_emitted_direct_calls: HashMap::new(),
             opt_v3_emitted_exact_list_items: HashMap::new(),
@@ -18661,7 +18610,6 @@ class Point:
         let profile = SpecializationProfile {
             module_name: Some(module_name),
             counter_dump_path: None,
-            optimized_module: None,
             direct_call_emission_scope: DirectCallEmissionScope::AllDirectCallCandidates,
             opt_v3_emitted_direct_calls: HashMap::new(),
             opt_v3_emitted_exact_list_items: HashMap::from([(
@@ -18834,7 +18782,6 @@ class Point:
         let profile = SpecializationProfile {
             module_name: Some(module_name),
             counter_dump_path: None,
-            optimized_module: None,
             direct_call_emission_scope: DirectCallEmissionScope::AllDirectCallCandidates,
             opt_v3_emitted_direct_calls: HashMap::new(),
             opt_v3_emitted_exact_list_items: HashMap::new(),
@@ -19021,7 +18968,6 @@ class Point:
         let profile = SpecializationProfile {
             module_name: Some(module_name),
             counter_dump_path: None,
-            optimized_module: None,
             direct_call_emission_scope: DirectCallEmissionScope::AllDirectCallCandidates,
             opt_v3_emitted_direct_calls: HashMap::new(),
             opt_v3_emitted_exact_list_items: HashMap::new(),
@@ -19964,7 +19910,7 @@ class Point:
     }
 
     #[test]
-    fn profiled_v3_module_plan_uses_loaded_optimized_module_without_rewriting_direct_calls() {
+    fn profiled_v3_module_plan_rewrites_direct_calls_on_typed_module() {
         let module_name = "v3_source_keyed_shape_test";
         let module_name_gen = ModuleNameGen::new(0);
         let mut callee_function = test_function_in_module(&module_name_gen, "callee");
@@ -20029,14 +19975,18 @@ class Point:
             arg_plan: TypedDirectCallArgPlan {
                 sources: vec![TypedDirectCallArgSource::Provided(0)],
             },
-            body: test_v3_inline_call_body(),
+            body: CallBodyPlan {
+                kind: CallBodyKind::DirectCall,
+                cost: Cost::default(),
+                inline_target: None,
+                reason: "test keeps body as direct call".to_string(),
+            },
             reason: "profiled direct call".to_string(),
         };
         let profile = SpecializationProfile {
             module_name: Some(module_name),
             counter_dump_path: None,
-            optimized_module: Some(Arc::new(module.clone())),
-            direct_call_emission_scope: DirectCallEmissionScope::DirectCallBodiesOnly,
+            direct_call_emission_scope: DirectCallEmissionScope::AllDirectCallCandidates,
             opt_v3_emitted_direct_calls: HashMap::from([(
                 caller_function.function_id,
                 HashMap::from([(call_instr_id, vec![v3_plan])]),
@@ -20049,8 +19999,8 @@ class Point:
             profiled_cold_blocks: false,
             guard_miss_deopt: false,
         };
-        let plan = build_profiled_jit_module_plan(&module, &profile)
-            .expect("v3-profiled JIT module plan should build");
+        let plan = build_typed_v3_jit_module_plan(&module, Some(&profile), &typed_v3_env_config())
+            .expect("v3-profiled JIT module plan should build from the pre-opt module");
         let planned_caller = plan
             .module
             .callable_defs
@@ -20058,23 +20008,20 @@ class Point:
             .find(|function| function.function_id == caller_function.function_id)
             .expect("planned module should keep caller");
 
-        assert!(
-            !planned_caller.blocks.iter().any(|block| {
-                matches!(
-                    &block.term,
-                    BlockTerm::IfTerm(term)
-                        if matches!(term.test, InstrTyped::DirectCallGuardTest(_))
-                )
+        assert_eq!(
+            count_typed_instrs(planned_caller, |expr| {
+                matches!(expr, InstrTyped::GuardedCallableCallTyped(_))
             }),
-            "JIT should not perform plan-level direct-call CFG expansion; it should trust the loaded optimized module"
+            1,
+            "v3 direct-call decisions should be applied while building the InstrTyped module"
         );
-        assert!(
-            planned_caller
-                .blocks
-                .iter()
-                .flat_map(|block| &block.body)
-                .any(|instr| matches!(instr, InstrTyped::Store(store) if matches!(store.value.as_ref(), InstrTyped::CallTyped(_)))),
-            "loaded optimized module fixture intentionally still has the original generic call"
+        assert_eq!(
+            count_typed_instrs(planned_caller, |expr| matches!(
+                expr,
+                InstrTyped::CallTyped(_)
+            )),
+            0,
+            "the selected call should not remain a generic typed call"
         );
     }
 
@@ -21357,7 +21304,6 @@ class Point:
         let profile = SpecializationProfile {
             module_name: Some(module_name),
             counter_dump_path: Some(std::borrow::Cow::Owned(profile_path)),
-            optimized_module: None,
             direct_call_emission_scope: DirectCallEmissionScope::DirectCallBodiesOnly,
             opt_v3_emitted_direct_calls: HashMap::new(),
             opt_v3_emitted_exact_list_items: HashMap::new(),

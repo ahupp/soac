@@ -49,9 +49,8 @@ fn run_with_args(args: impl IntoIterator<Item = OsString>) -> Result<()> {
     )?;
     for report in &summary.reports {
         println!(
-            "wrote {} and {} for module={} source_hash=0x{:016x} ({} functions)",
+            "wrote {} for module={} source_hash=0x{:016x} ({} functions)",
             report.output_path.display(),
-            report.optimized_module_path.display(),
             report.module_name,
             report.source_hash,
             report.function_count
@@ -141,7 +140,7 @@ fn parse_mode(args: &mut impl Iterator<Item = OsString>, flag: &str) -> Result<(
 
 fn print_usage() {
     println!(
-        "usage: decide_optimizations --counters <profile.bin> [--mode v3] [--module <mod.blockpy> ...] [--module-root <root-dir>] --out <root-dir>\n\nScans cached mod.blockpy files and writes sibling mod.optv3 and mod.optv3.blockpy files from raw profile evidence and cached unoptimized BlockPy modules. Use --module-root to scan a different input root, or --module for narrow debugging."
+        "usage: decide_optimizations --counters <profile.bin> [--mode v3] [--module <mod.blockpy> ...] [--module-root <root-dir>] --out <root-dir>\n\nScans cached mod.blockpy files and writes sibling mod.optv3 files from raw profile evidence and cached unoptimized BlockPy modules. Use --module-root to scan a different input root, or --module for narrow debugging."
     );
 }
 
@@ -159,8 +158,7 @@ mod test {
     };
     use soac_driver::codegen_cache::{
         PythonModuleCacheSource, codegen_module_cache_path, hash_module_source,
-        load_codegen_module_cache, module_optimization_plan_v3_path,
-        module_optimized_codegen_v3_path, pre_optimization_module_cache_metadata,
+        module_optimization_plan_v3_path, pre_optimization_module_cache_metadata,
     };
     use soac_driver::{CodegenPreparationOptions, prepare_codegen_module};
     use soac_lowering::passes::{CodegenModuleShape, InstrCodegen};
@@ -245,15 +243,6 @@ mod test {
         )
         .unwrap();
         let artifacts = load_optimization_artifacts_v3(output_path.as_path()).unwrap();
-        let optimized_module_path = module_optimized_codegen_v3_path(
-            out_root.as_path(),
-            PythonModuleCacheSource::Project,
-            module_name,
-        )
-        .unwrap();
-        let optimized_module_cache =
-            load_codegen_module_cache(optimized_module_path.as_path()).unwrap();
-        assert_eq!(optimized_module_cache.metadata, metadata);
         let plan = &artifacts.plan;
         assert_eq!(plan.module.module_name, module_name);
         assert_eq!(plan.module.source_hash, source_hash);
@@ -343,21 +332,10 @@ mod test {
                 module_name,
             )
             .unwrap();
-            let optimized_module_path = module_optimized_codegen_v3_path(
-                out_root.as_path(),
-                PythonModuleCacheSource::Project,
-                module_name,
-            )
-            .unwrap();
             assert!(
                 output_path.exists(),
                 "expected optimization plan for {module_name} at {}",
                 output_path.display()
-            );
-            assert!(
-                optimized_module_path.exists(),
-                "expected optimized v3 BlockPy module for {module_name} at {}",
-                optimized_module_path.display()
             );
         }
         let unused_path = module_optimization_plan_v3_path(

@@ -22,7 +22,7 @@ fn parse_args() -> Result<Args, String> {
         }
     }
     if positionals.len() != 1 {
-        return Err("expected <mod.blockpy-or-mod.optv3.blockpy>".to_string());
+        return Err("expected <mod.blockpy>".to_string());
     }
     Ok(Args {
         path: PathBuf::from(&positionals[0]),
@@ -30,7 +30,7 @@ fn parse_args() -> Result<Args, String> {
 }
 
 fn print_usage() {
-    eprintln!("usage: print_codegen_module_cache <mod.blockpy-or-mod.optv3.blockpy>");
+    eprintln!("usage: print_codegen_module_cache <mod.blockpy>");
 }
 
 fn main() -> Result<(), String> {

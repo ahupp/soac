@@ -1,18 +1,13 @@
 use crate::alternatives_v3::AlternativeCatalog;
-use crate::artifacts_v3::{ExactIntBranchV3Artifacts, single_function_optimization_artifacts_v3};
-use crate::call_emission_v3::{ResolvedV3DirectCallPlan, direct_calls_for_function_from_artifacts};
-use crate::call_inlining_v3::{
-    V3CallInliningProfile, V3ExternalInlineTarget, rewrite_v3_call_inlining_for_module,
-};
+use crate::artifacts_v3::ExactIntBranchV3Artifacts;
 use crate::emit_v3::{MechanicalEmitError, emit_mechanical_plan_v3};
 use crate::evidence_v3::{
     PlannerFactHints, planner_fact_hints_from_module_constants_v3,
     planner_facts_from_profile_evidence_v3,
 };
 use crate::passes::{
-    CodegenModuleShape, InlinePlanModule, InlineUnsupportedReason, InstrCodegen, InstrResolved,
+    CodegenModuleShape, InlineUnsupportedReason, InstrCodegen, InstrResolved,
     bind_simple_direct_call_inline_args, build_direct_call_inline_fragment_to_target,
-    plan_module_inlining, summarize_module_escapes,
 };
 use crate::plan::{FunctionProfileEvidence, ProfileEvidenceStore};
 use crate::plan_v3::{
@@ -37,12 +32,11 @@ use soac_core::block_py::{
     BlockLabel, BlockPyFunction, BlockPyModule, Call, CallArgPositional, CallDirect,
     ChildVisitable, FunctionExecutionMode, HasSemanticInstrId, InstrId, LocalFunctionId,
     ModuleContentId, NameLike, NameLocation, ParamKind, PersistentFunctionId, ResolvedName,
-    RuntimeFunctionId, RuntimeModuleId, SerializedFunctionDebugName, SerializedFunctionId,
-    SerializedIdentityTables, SerializedModuleId, SerializedModuleIdentity, Visit,
+    SerializedFunctionDebugName, SerializedFunctionId, SerializedIdentityTables,
+    SerializedModuleId, SerializedModuleIdentity, Visit,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt;
-use std::sync::Arc;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExactIntBranchV3Error {
@@ -62,14 +56,11 @@ impl std::error::Error for ExactIntBranchV3Error {}
 #[derive(Clone, Debug, Default)]
 pub struct DirectCallTargetIndex {
     functions: HashMap<PersistentFunctionId, DirectCallTargetEntry>,
-    functions_by_runtime_id: HashMap<RuntimeFunctionId, PersistentFunctionId>,
 }
 
 #[derive(Clone, Debug)]
 struct DirectCallTargetEntry {
     module: ModuleContentId,
-    module_constants: Arc<Vec<InstrResolved>>,
-    inline_plan: Arc<InlinePlanModule>,
     function: BlockPyFunction<CodegenModuleShape>,
 }
 
@@ -95,15 +86,14 @@ impl<'a> ModuleOptimizationInput<'a> {
 }
 
 #[derive(Debug)]
-pub struct OptimizedModuleV3 {
+pub struct PlannedModuleV3 {
     pub identity: ModulePlanIdentity,
     pub artifacts: ExactIntBranchV3Artifacts,
-    pub optimized_module: BlockPyModule<CodegenModuleShape>,
 }
 
 #[derive(Debug, Default)]
 pub struct OptimizeModulesV3Output {
-    pub modules: Vec<OptimizedModuleV3>,
+    pub modules: Vec<PlannedModuleV3>,
     pub skipped: usize,
 }
 
@@ -131,8 +121,6 @@ impl DirectCallTargetIndex {
         module: &BlockPyModule<CodegenModuleShape>,
     ) {
         let content_id = ModuleContentId::new(identity.module_name.clone(), identity.source_hash);
-        let module_constants = Arc::new(module.module_constants.clone());
-        let inline_plan = Arc::new(plan_module_inlining(&summarize_module_escapes(module)));
         for function in &module.callable_defs {
             let persistent_id = PersistentFunctionId::new(
                 content_id.clone(),
@@ -142,27 +130,14 @@ impl DirectCallTargetIndex {
                 persistent_id.clone(),
                 DirectCallTargetEntry {
                     module: content_id.clone(),
-                    module_constants: module_constants.clone(),
-                    inline_plan: inline_plan.clone(),
                     function: function.clone(),
                 },
             );
-            self.functions_by_runtime_id
-                .insert(function.function_id, persistent_id);
         }
     }
 
     fn entry(&self, function_id: &PersistentFunctionId) -> Option<&DirectCallTargetEntry> {
         self.functions.get(function_id)
-    }
-
-    fn entry_by_runtime_id(
-        &self,
-        function_id: RuntimeFunctionId,
-    ) -> Option<&DirectCallTargetEntry> {
-        self.functions_by_runtime_id
-            .get(&function_id)
-            .and_then(|persistent_id| self.functions.get(persistent_id))
     }
 }
 
@@ -1616,7 +1591,7 @@ pub fn optimize_modules_v3_from_raw_evidence<'a>(
             module_input.strict,
             &target_index,
         )? {
-            Some(optimized) => output.modules.push(optimized),
+            Some(planned) => output.modules.push(planned),
             None => output.skipped += 1,
         }
     }
@@ -1628,7 +1603,7 @@ pub fn optimize_module_v3_from_raw_evidence(
     module_identity: ModulePlanIdentity,
     module: &BlockPyModule<CodegenModuleShape>,
     strict: bool,
-) -> Result<Option<OptimizedModuleV3>> {
+) -> Result<Option<PlannedModuleV3>> {
     let target_index = DirectCallTargetIndex::from_current_module(&module_identity, module);
     optimize_module_v3_from_raw_evidence_with_target_index(
         evidence_store,
@@ -1645,7 +1620,7 @@ fn optimize_module_v3_from_raw_evidence_with_target_index(
     module: &BlockPyModule<CodegenModuleShape>,
     strict: bool,
     target_index: &DirectCallTargetIndex,
-) -> Result<Option<OptimizedModuleV3>> {
+) -> Result<Option<PlannedModuleV3>> {
     if !counter_evidence_matches_module_v3(evidence_store, module_identity, strict)? {
         return Ok(None);
     }
@@ -1657,81 +1632,10 @@ fn optimize_module_v3_from_raw_evidence_with_target_index(
         evidence_store,
         target_index,
     )?;
-    let optimized_module =
-        rewrite_module_for_optimization_artifacts_v3(module, &artifacts, target_index)
-            .map_err(anyhow::Error::msg)?;
-    Ok(Some(OptimizedModuleV3 {
+    Ok(Some(PlannedModuleV3 {
         identity: module_identity.clone(),
         artifacts,
-        optimized_module,
     }))
-}
-
-fn rewrite_module_for_optimization_artifacts_v3(
-    module: &BlockPyModule<CodegenModuleShape>,
-    artifacts: &ExactIntBranchV3Artifacts,
-    target_index: &DirectCallTargetIndex,
-) -> Result<BlockPyModule<CodegenModuleShape>, String> {
-    let module_id = RuntimeModuleId::new(module.module_name_gen.module_id());
-    let mut direct_calls_by_function =
-        HashMap::<RuntimeFunctionId, HashMap<InstrId, Vec<ResolvedV3DirectCallPlan>>>::new();
-    let mut exact_int_branch_function_ids = HashSet::<RuntimeFunctionId>::new();
-
-    for planned_function in &artifacts.plan.functions {
-        let local_function_id = planned_function.function.function.local_function_id();
-        let function_id = RuntimeFunctionId::new(module_id, local_function_id);
-        let Some(function_artifacts) = single_function_optimization_artifacts_v3(
-            artifacts,
-            planned_function.function.function,
-        )
-        .map_err(|err| err.to_string())?
-        else {
-            continue;
-        };
-        let emitted_function = &function_artifacts.emission.functions[0];
-        if !emitted_function.regions.is_empty() || !emitted_function.scalar_threads.is_empty() {
-            exact_int_branch_function_ids.insert(function_id);
-        }
-        if let Some(direct_calls) =
-            direct_calls_for_function_from_artifacts(&function_artifacts, |target| {
-                resolve_cached_v3_call_target(target_index, target)
-            })?
-        {
-            direct_calls_by_function.insert(function_id, direct_calls);
-        }
-    }
-
-    let output = rewrite_v3_call_inlining_for_module(
-        module,
-        V3CallInliningProfile {
-            direct_calls_by_function: &direct_calls_by_function,
-            exact_int_branch_function_ids: &exact_int_branch_function_ids,
-        },
-        |function_id| resolve_cached_v3_external_inline_target(target_index, function_id),
-    )?;
-    Ok(output.module)
-}
-
-fn resolve_cached_v3_call_target(
-    target_index: &DirectCallTargetIndex,
-    target: PersistentFunctionId,
-) -> Result<Option<RuntimeFunctionId>, String> {
-    Ok(target_index
-        .entry(&target)
-        .map(|entry| entry.function.function_id))
-}
-
-fn resolve_cached_v3_external_inline_target(
-    target_index: &DirectCallTargetIndex,
-    function_id: RuntimeFunctionId,
-) -> Result<Option<V3ExternalInlineTarget>, String> {
-    Ok(target_index
-        .entry_by_runtime_id(function_id)
-        .map(|entry| V3ExternalInlineTarget {
-            function: entry.function.clone(),
-            module_constants: entry.module_constants.as_ref().clone(),
-            inline_plan: entry.inline_plan.as_ref().clone(),
-        }))
 }
 
 fn counter_evidence_matches_module_v3(
@@ -1926,8 +1830,6 @@ mod tests {
     ) -> DirectCallTargetEntry {
         DirectCallTargetEntry {
             module,
-            module_constants: Arc::new(Vec::new()),
-            inline_plan: Arc::new(InlinePlanModule::default()),
             function,
         }
     }

@@ -5,8 +5,7 @@ use self::precompiled_object::{
 use crate::SOAC_JIT_RUNTIME_CLIF;
 use crate::config::{
     CraneliftTargetConfig, PythonModuleCacheSource, SpecializationMode,
-    module_optimization_plan_v3_path, module_optimized_codegen_v3_path,
-    pre_optimization_module_cache_identity, pre_optimization_module_cache_metadata,
+    module_optimization_plan_v3_path, pre_optimization_module_cache_identity,
 };
 use crate::counter::TopValueCounter;
 use crate::function_instantiation::{
@@ -45,11 +44,6 @@ use soac_core::block_py::{
 use soac_core::profile::{
     CollectedTypeKeyLayout, CounterDumpTypeKey, read_block_entry_counts_from_file,
 };
-use soac_driver::codegen_cache::{
-    load_codegen_module_cache, remap_cached_codegen_module_function_ids,
-    validate_codegen_module_cache_metadata,
-};
-use soac_driver::finish_cached_codegen_module_for_runtime_with_counter_defs;
 use soac_instrument::{InstrumentationConfig, instrument_typed_module};
 use soac_opt::access_emission_v3::{
     ExactListItemAccessPlan as OptV3ExactListItemAccessPlan,
@@ -1557,16 +1551,6 @@ fn apply_profile_typed_plans_to_typed_function(
     Ok(())
 }
 
-fn apply_profile_typed_plans_to_module(
-    module: &mut BlockPyModule<TypedCodegenModuleShape>,
-    profile: &SpecializationProfile<'_>,
-) -> Result<(), String> {
-    for function in &mut module.callable_defs {
-        apply_profile_typed_plans_to_typed_function(function, Some(profile))?;
-    }
-    Ok(())
-}
-
 fn typed_function_with_profile_plans(
     function: &BlockPyFunction<CodegenModuleShape>,
     profile: Option<&SpecializationProfile<'_>>,
@@ -1883,14 +1867,13 @@ impl JitBatchPlan<'_> {
                     Some(shared_state),
                     Some(inputs.session.as_ref()),
                 )?;
-                if runtime_pipeline.uses_typed_v3_runtime() {
+                if runtime_pipeline.uses_typed_v3_runtime() || profile.has_v3_optimization_inputs()
+                {
                     build_typed_v3_jit_module_plan(
                         &shared_state.lowered_module,
                         Some(&profile),
                         inputs.session.env_config()?,
                     )?
-                } else if profile.optimized_module.is_some() {
-                    build_profiled_jit_module_plan(&shared_state.lowered_module, &profile)?
                 } else {
                     shared_state.jit_module_plan()?
                 }
@@ -2099,34 +2082,6 @@ fn apply_typed_v3_module_rewrites(
         apply_profile_typed_guard_miss_policy_to_typed_function(function, profile);
     }
     Ok(())
-}
-
-fn build_profiled_jit_module_plan(
-    module: &BlockPyModule<CodegenModuleShape>,
-    profile: &SpecializationProfile<'_>,
-) -> Result<Arc<JitModulePlan>, String> {
-    let Some(optimized_module) = profile.optimized_module.as_ref() else {
-        return Err(format!(
-            "optimizer v3 selected specialization inputs for module {}, but no optimized BlockPy module artifact was loaded",
-            profile.module_name.unwrap_or("<unknown>")
-        ));
-    };
-    if optimized_module.module_name_gen.module_id() != module.module_name_gen.module_id() {
-        return Err(format!(
-            "optimizer v3 optimized module id {} does not match lowered module id {}",
-            optimized_module.module_name_gen.module_id(),
-            module.module_name_gen.module_id()
-        ));
-    }
-    let value_facts = infer_jit_value_facts(optimized_module.as_ref());
-    let mut typed_module = lower_codegen_module_to_typed(optimized_module.as_ref().clone());
-    annotate_typed_module_value_facts(&mut typed_module, &value_facts);
-    typed_module = lower_typed_if_tests_to_truthy(typed_module);
-    apply_profile_typed_plans_to_module(&mut typed_module, profile)?;
-    build_jit_module_plan_from_prepared_typed_module(plan_jit_typed_module(
-        typed_module,
-        value_facts,
-    )?)
 }
 
 impl SharedModuleState {
@@ -12048,7 +12003,6 @@ fn collect_deopt_entry_counter_ids_by_kind(
 struct SpecializationProfile<'a> {
     module_name: Option<&'a str>,
     counter_dump_path: Option<Cow<'a, Path>>,
-    optimized_module: Option<Arc<BlockPyModule<CodegenModuleShape>>>,
     direct_call_emission_scope: DirectCallEmissionScope,
     opt_v3_emitted_direct_calls:
         HashMap<RuntimeFunctionId, HashMap<InstrId, Vec<ResolvedV3DirectCallPlan>>>,
@@ -12072,7 +12026,6 @@ enum DirectCallEmissionScope {
 
 #[derive(Clone, Default)]
 struct PlannedOptimizationInputs {
-    optimized_module: Option<BlockPyModule<CodegenModuleShape>>,
     opt_v3_emitted_direct_calls:
         HashMap<RuntimeFunctionId, HashMap<InstrId, Vec<ResolvedV3DirectCallPlan>>>,
     opt_v3_emitted_exact_list_items:
@@ -12085,6 +12038,14 @@ struct PlannedOptimizationInputs {
 }
 
 impl PlannedOptimizationInputs {
+    fn has_v3_optimization_inputs(&self) -> bool {
+        !self.opt_v3_emitted_direct_calls.is_empty()
+            || !self.opt_v3_emitted_exact_list_items.is_empty()
+            || !self.opt_v3_emitted_indexed_fields.is_empty()
+            || !self.opt_v3_emitted_indexed_globals.is_empty()
+            || !self.opt_v3_exact_int_branch_artifacts.is_empty()
+    }
+
     fn v3_direct_function_call_targets(
         &self,
         function_id: RuntimeFunctionId,
@@ -12167,17 +12128,11 @@ fn load_planned_optimization_inputs_for_runtime_state(
             cache_identity.as_str(),
         )
         .map_err(|err| err.to_string())?;
-        let mut inputs = planned_optimization_inputs_from_v3_artifacts(
+        let inputs = planned_optimization_inputs_from_v3_artifacts(
             &artifacts,
             shared_state,
             compile_session,
         )?;
-        inputs.optimized_module = Some(load_optimized_codegen_module_v3_for_runtime_state(
-            cache_root.as_path(),
-            source,
-            shared_state,
-            env_config,
-        )?);
         return Ok(inputs);
     }
     Err(format!(
@@ -12215,36 +12170,6 @@ fn planned_typed_v3_runtime_inputs_from_raw_evidence(
     )
     .map_err(|err| err.to_string())?;
     planned_optimization_inputs_from_v3_artifacts(&artifacts, shared_state, compile_session)
-}
-
-fn load_optimized_codegen_module_v3_for_runtime_state(
-    cache_root: &Path,
-    source: PythonModuleCacheSource,
-    shared_state: &SharedModuleState,
-    env_config: &SoacEnvConfig,
-) -> Result<BlockPyModule<CodegenModuleShape>, String> {
-    let path =
-        module_optimized_codegen_v3_path(cache_root, source, shared_state.module_name.as_str())?;
-    let mut cache = load_codegen_module_cache(path.as_path()).map_err(|err| err.to_string())?;
-    let expected = pre_optimization_module_cache_metadata(
-        source,
-        shared_state.module_name.as_str(),
-        shared_state.source_hash,
-        env!("SOAC_BUILD_IDENTITY"),
-        shared_state.module_name == "soac.runtime",
-    );
-    validate_codegen_module_cache_metadata(&cache.metadata, &expected)
-        .map_err(|err| err.to_string())?;
-    remap_cached_codegen_module_function_ids(
-        &mut cache,
-        shared_state.lowered_module.module_name_gen.clone(),
-    );
-    finish_cached_codegen_module_for_runtime_with_counter_defs(
-        cache.module,
-        env_config,
-        shared_state.lowered_module.counter_defs.as_slice(),
-    )
-    .map_err(|err| err.to_string())
 }
 
 fn planned_optimization_inputs_from_v3_artifacts(
@@ -12472,42 +12397,24 @@ fn planned_optimization_inputs_for_precompile(
         plan_input.cache_identity,
     )
     .map_err(|err| err.to_string())?;
-    let mut inputs = planned_optimization_inputs_from_v3_artifacts_for_codegen_module(
+    planned_optimization_inputs_from_v3_artifacts_for_codegen_module(
         &artifacts,
         module,
         module_name,
         source_hash,
         module_index,
-    )?;
-    let Some(optimized_module_path) = plan_input
-        .optimized_module_path
-        .filter(|path| path.exists())
-    else {
-        return Err(format!(
-            "precompile requires mod.optv3.blockpy for module {module_name}"
-        ));
-    };
-    let mut optimized_cache =
-        load_codegen_module_cache(optimized_module_path).map_err(|err| err.to_string())?;
-    if optimized_cache.metadata.module_name != module_name
-        || optimized_cache.metadata.source_hash != source_hash
-        || optimized_cache.metadata.cache_identity != plan_input.cache_identity
-    {
-        return Err(format!(
-            "optimized v3 BlockPy module metadata mismatch for module {module_name}: loaded module={} source_hash=0x{:016x} cache_identity={:?}; expected module={} source_hash=0x{source_hash:016x} cache_identity={:?}",
-            optimized_cache.metadata.module_name,
-            optimized_cache.metadata.source_hash,
-            optimized_cache.metadata.cache_identity,
-            module_name,
-            plan_input.cache_identity
-        ));
-    }
-    remap_cached_codegen_module_function_ids(&mut optimized_cache, module.module_name_gen.clone());
-    inputs.optimized_module = Some(optimized_cache.module);
-    Ok(inputs)
+    )
 }
 
 impl<'a> SpecializationProfile<'a> {
+    fn has_v3_optimization_inputs(&self) -> bool {
+        !self.opt_v3_emitted_direct_calls.is_empty()
+            || !self.opt_v3_emitted_exact_list_items.is_empty()
+            || !self.opt_v3_emitted_indexed_fields.is_empty()
+            || !self.opt_v3_emitted_indexed_globals.is_empty()
+            || !self.opt_v3_exact_int_branch_artifacts.is_empty()
+    }
+
     fn typed_specializations_embedded(&self) -> bool {
         self.direct_call_emission_scope == DirectCallEmissionScope::AllDirectCallCandidates
     }
@@ -12538,8 +12445,9 @@ impl<'a> SpecializationProfile<'a> {
         Ok(Self {
             module_name: shared_state.map(|shared_state| shared_state.module_name.as_str()),
             counter_dump_path: counter_dump_path.map(Cow::Owned),
-            optimized_module: planned_inputs.optimized_module.map(Arc::new),
-            direct_call_emission_scope: if typed_v3_runtime {
+            direct_call_emission_scope: if typed_v3_runtime
+                || planned_inputs.has_v3_optimization_inputs()
+            {
                 DirectCallEmissionScope::AllDirectCallCandidates
             } else {
                 DirectCallEmissionScope::DirectCallBodiesOnly
@@ -12570,8 +12478,11 @@ impl<'a> SpecializationProfile<'a> {
         Ok(Self {
             module_name: Some(module_name),
             counter_dump_path: counter_dump_path.map(Cow::Borrowed),
-            optimized_module: planned_inputs.optimized_module.map(Arc::new),
-            direct_call_emission_scope: DirectCallEmissionScope::DirectCallBodiesOnly,
+            direct_call_emission_scope: if planned_inputs.has_v3_optimization_inputs() {
+                DirectCallEmissionScope::AllDirectCallCandidates
+            } else {
+                DirectCallEmissionScope::DirectCallBodiesOnly
+            },
             opt_v3_emitted_direct_calls: planned_inputs.opt_v3_emitted_direct_calls,
             opt_v3_emitted_exact_list_items: planned_inputs.opt_v3_emitted_exact_list_items,
             opt_v3_emitted_indexed_fields: planned_inputs.opt_v3_emitted_indexed_fields,
@@ -25626,7 +25537,6 @@ fn precompile_external_direct_call_target_functions(
 #[derive(Debug, Clone, Copy)]
 pub struct PrecompileOptimizationPlanInput<'a> {
     pub v3_path: Option<&'a Path>,
-    pub optimized_module_path: Option<&'a Path>,
     pub cache_identity: &'a str,
 }
 
@@ -25886,8 +25796,8 @@ fn precompile_codegen_module_to_object_bytes(
         counter_dump_path,
         planned_inputs,
     )?;
-    let jit_module_plan = if specialization_profile.optimized_module.is_some() {
-        build_profiled_jit_module_plan(module, &specialization_profile)?
+    let jit_module_plan = if specialization_profile.has_v3_optimization_inputs() {
+        build_typed_v3_jit_module_plan(module, Some(&specialization_profile), env_config)?
     } else {
         build_jit_module_plan(module)?
     };
@@ -27754,8 +27664,12 @@ pub unsafe fn render_instr_typed_for_codegen_with_runtime_state(
     )?;
     predeclare_specialization_type_imports(&mut jit_module, &specialization_profile)?;
     let jit_module_plan =
-        if runtime_state.is_some() && specialization_profile.optimized_module.is_some() {
-            build_profiled_jit_module_plan(module, &specialization_profile)?
+        if runtime_state.is_some() && specialization_profile.has_v3_optimization_inputs() {
+            build_typed_v3_jit_module_plan(
+                module,
+                Some(&specialization_profile),
+                compile_session.env_config()?,
+            )?
         } else {
             build_jit_module_plan(module)?
         };
@@ -27842,8 +27756,12 @@ pub unsafe fn render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
     )?;
     predeclare_specialization_type_imports(&mut jit_module, &specialization_profile)?;
     let jit_module_plan =
-        if runtime_state.is_some() && specialization_profile.optimized_module.is_some() {
-            build_profiled_jit_module_plan(module, &specialization_profile)?
+        if runtime_state.is_some() && specialization_profile.has_v3_optimization_inputs() {
+            build_typed_v3_jit_module_plan(
+                module,
+                Some(&specialization_profile),
+                compile_session.env_config()?,
+            )?
         } else {
             build_jit_module_plan(module)?
         };

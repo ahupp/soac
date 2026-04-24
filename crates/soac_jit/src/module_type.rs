@@ -20,12 +20,7 @@ use soac_core::profile::{
     CounterDumpBranchValue, CounterDumpKeyLayout, CounterDumpRecord, CounterDumpRow,
     CounterDumpTypeKey, CounterDumpTypeKeyLayout, CounterDumpTypeTableEntry,
 };
-use soac_driver::codegen_cache::{
-    PythonModuleCacheSource, load_codegen_module_cache, module_optimized_codegen_v3_path,
-    pre_optimization_module_cache_metadata, remap_cached_codegen_module_function_ids,
-    validate_codegen_module_cache_metadata,
-};
-use soac_driver::finish_cached_codegen_module_for_runtime_with_counter_defs;
+use soac_driver::codegen_cache::PythonModuleCacheSource;
 use soac_instrument::InstrumentationConfig;
 use soac_lowering::passes::{CodegenModuleShape, InstrCodegen};
 use soac_opt::access_emission_v3::{
@@ -1295,65 +1290,6 @@ fn build_function_index_by_id(
     Ok(function_index_by_id)
 }
 
-fn append_final_deopt_counter_defs_for_runtime(
-    lowered_module: &mut BlockPyModule<CodegenModuleShape>,
-    module_name: &str,
-    source_hash: u64,
-    module_cache_source: Option<PythonModuleCacheSource>,
-    env_config: &SoacEnvConfig,
-) -> PyResult<()> {
-    if !InstrumentationConfig::from_env_config(env_config).deopt_entry_counters_enabled() {
-        return Ok(());
-    }
-    let Some(cache_root) = env_config.module_cache_root() else {
-        return Ok(());
-    };
-    let candidate_sources = match module_cache_source {
-        Some(source) => vec![source],
-        None => vec![
-            PythonModuleCacheSource::Project,
-            PythonModuleCacheSource::PythonStdlib,
-        ],
-    };
-    for source in candidate_sources {
-        let path = module_optimized_codegen_v3_path(cache_root.as_path(), source, module_name)
-            .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
-        if !path.exists() {
-            continue;
-        }
-        let mut cache = load_codegen_module_cache(path.as_path())
-            .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
-        let expected = pre_optimization_module_cache_metadata(
-            source,
-            module_name,
-            source_hash,
-            env!("SOAC_BUILD_IDENTITY"),
-            module_name == "soac.runtime",
-        );
-        validate_codegen_module_cache_metadata(&cache.metadata, &expected)
-            .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
-        remap_cached_codegen_module_function_ids(
-            &mut cache,
-            lowered_module.module_name_gen.clone(),
-        );
-        let original_counter_count = lowered_module.counter_defs.len();
-        let finalized = finish_cached_codegen_module_for_runtime_with_counter_defs(
-            cache.module,
-            &env_config,
-            lowered_module.counter_defs.as_slice(),
-        )
-        .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
-        lowered_module.counter_defs.extend(
-            finalized
-                .counter_defs
-                .into_iter()
-                .skip(original_counter_count),
-        );
-        return Ok(());
-    }
-    Ok(())
-}
-
 #[repr(C)]
 struct SoacExtModuleState {
     initialized: bool,
@@ -1380,13 +1316,6 @@ impl SoacExtModuleState {
         let env_config = compile_session
             .env_config()
             .map_err(PyRuntimeError::new_err)?;
-        append_final_deopt_counter_defs_for_runtime(
-            &mut lowered_module,
-            module_name.as_str(),
-            source_hash,
-            module_cache_source,
-            env_config,
-        )?;
         specialize_runtime_field_access_counter_branches(
             &mut lowered_module,
             module_name.as_str(),
