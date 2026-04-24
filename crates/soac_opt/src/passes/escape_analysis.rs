@@ -2,8 +2,8 @@ use crate::passes::{CodegenModuleShape, InstrCodegen, InstrResolved};
 use soac_core::block_py::PrettyPrint;
 use soac_core::block_py::literal::Literal;
 use soac_core::block_py::{
-    Block, BlockPyFunction, BlockPyModule, BlockTerm, HasMeta, InstrId, LocalLocation, NameLike,
-    NameLocation, RuntimeFunctionId, instr_any,
+    BlockPyFunction, BlockPyModule, BlockTerm, InstrId, LocalLocation, NameLike, NameLocation,
+    RuntimeFunctionId, instr_any,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -240,255 +240,11 @@ pub fn summarize_module_escapes(module: &BlockPyModule<CodegenModuleShape>) -> E
 }
 
 fn summarize_non_escaping_constructor_allocations(
-    module: &BlockPyModule<CodegenModuleShape>,
-    function: &BlockPyFunction<CodegenModuleShape>,
-    straightline_constructor_ids: &HashSet<RuntimeFunctionId>,
+    _module: &BlockPyModule<CodegenModuleShape>,
+    _function: &BlockPyFunction<CodegenModuleShape>,
+    _straightline_constructor_ids: &HashSet<RuntimeFunctionId>,
 ) -> Vec<NonEscapingConstructorAllocationSummary> {
-    let mut allocations = Vec::new();
-    let block_by_label = function
-        .blocks
-        .iter()
-        .map(|block| (block.label, block))
-        .collect::<HashMap<_, _>>();
-    let normal_predecessor_counts = normal_predecessor_counts(function);
-    for block in &function.blocks {
-        for (instr_index, instr) in block.body.iter().enumerate() {
-            let InstrCodegen::Store(store) = instr else {
-                continue;
-            };
-            let Some(local_location) = store.name.location.as_local() else {
-                continue;
-            };
-            let InstrCodegen::CallDirect(call) = store.value.as_ref() else {
-                continue;
-            };
-            if !straightline_constructor_ids.contains(&call.function_id) {
-                continue;
-            }
-            let Some(summary) = summarize_constructor_allocation_uses_in_block(
-                module,
-                local_location,
-                store.name.id_str().to_string(),
-                call.function_id,
-                call.meta().instr_id,
-                &block.body[instr_index + 1..],
-                &block.term,
-                &block_by_label,
-                &normal_predecessor_counts,
-            ) else {
-                continue;
-            };
-            allocations.push(summary);
-        }
-    }
-    allocations
-}
-
-fn summarize_constructor_allocation_uses_in_block(
-    module: &BlockPyModule<CodegenModuleShape>,
-    local_location: LocalLocation,
-    local_name: String,
-    constructor_function_id: RuntimeFunctionId,
-    call_instr_id: Option<InstrId>,
-    remaining_body: &[InstrCodegen],
-    term: &BlockTerm<InstrCodegen>,
-    block_by_label: &HashMap<soac_core::block_py::BlockLabel, &Block<InstrCodegen>>,
-    normal_predecessor_counts: &HashMap<soac_core::block_py::BlockLabel, usize>,
-) -> Option<NonEscapingConstructorAllocationSummary> {
-    let mut summary = NonEscapingConstructorAllocationSummary {
-        local_name,
-        local_location,
-        constructor_function_id,
-        call_instr_id,
-        field_reads: Vec::new(),
-        field_writes: Vec::new(),
-    };
-    let mut aliases = HashSet::from([local_location]);
-    let mut current_body = remaining_body;
-    let mut current_term = term;
-    let mut visited_jump_targets = HashSet::new();
-    loop {
-        for instr in current_body {
-            if let InstrCodegen::Store(store) = instr {
-                if store.name.location.as_local() == Some(local_location) {
-                    break;
-                }
-                if let Some(target_location) = store.name.location.as_local() {
-                    if is_local_alias_load(&store.value, &aliases) {
-                        aliases.insert(target_location);
-                        continue;
-                    }
-                    aliases.remove(&target_location);
-                }
-            }
-            if let InstrCodegen::Del(del) = instr {
-                if let Some(location) = del.name.location.as_local() {
-                    if aliases.remove(&location) {
-                        continue;
-                    }
-                }
-            }
-            if !record_allowed_constructor_local_use(module, &aliases, instr, &mut summary) {
-                return None;
-            }
-        }
-        match current_term {
-            BlockTerm::Jump(edge)
-                if edge.args.is_empty()
-                    && normal_predecessor_counts.get(&edge.target).copied() == Some(1) =>
-            {
-                if !visited_jump_targets.insert(edge.target) {
-                    return None;
-                }
-                let target = block_by_label.get(&edge.target)?;
-                if !target.params.is_empty() {
-                    return None;
-                }
-                current_body = target.body.as_slice();
-                current_term = &target.term;
-            }
-            _ => {
-                if !record_allowed_constructor_local_use_in_term(
-                    module,
-                    &aliases,
-                    current_term,
-                    &mut summary,
-                ) {
-                    return None;
-                }
-                break;
-            }
-        }
-    }
-    if summary.field_reads.is_empty() && summary.field_writes.is_empty() {
-        return None;
-    }
-    Some(summary)
-}
-
-fn normal_predecessor_counts(
-    function: &BlockPyFunction<CodegenModuleShape>,
-) -> HashMap<soac_core::block_py::BlockLabel, usize> {
-    let mut counts = HashMap::new();
-    for block in &function.blocks {
-        match &block.term {
-            BlockTerm::Jump(edge) => {
-                *counts.entry(edge.target).or_insert(0) += 1;
-            }
-            BlockTerm::IfTerm(term) => {
-                *counts.entry(term.then_label).or_insert(0) += 1;
-                *counts.entry(term.else_label).or_insert(0) += 1;
-            }
-            BlockTerm::BranchTable(term) => {
-                for target in &term.targets {
-                    *counts.entry(*target).or_insert(0) += 1;
-                }
-                *counts.entry(term.default_label).or_insert(0) += 1;
-            }
-            BlockTerm::Raise(_) | BlockTerm::Return(_) => {}
-        }
-    }
-    counts
-}
-
-fn record_allowed_constructor_local_use_in_term(
-    module: &BlockPyModule<CodegenModuleShape>,
-    aliases: &HashSet<LocalLocation>,
-    term: &BlockTerm<InstrCodegen>,
-    summary: &mut NonEscapingConstructorAllocationSummary,
-) -> bool {
-    match term {
-        BlockTerm::Return(value) => {
-            record_allowed_constructor_local_use(module, aliases, value, summary)
-        }
-        BlockTerm::IfTerm(term) => {
-            aliases.is_empty()
-                && record_allowed_constructor_local_use(module, aliases, &term.test, summary)
-        }
-        BlockTerm::BranchTable(term) => {
-            aliases.is_empty()
-                && record_allowed_constructor_local_use(module, aliases, &term.index, summary)
-        }
-        BlockTerm::Raise(term) => term
-            .exc
-            .as_ref()
-            .is_none_or(|exc| record_allowed_constructor_local_use(module, aliases, exc, summary)),
-        BlockTerm::Jump(_) => aliases.is_empty(),
-    }
-}
-
-fn record_allowed_constructor_local_use(
-    module: &BlockPyModule<CodegenModuleShape>,
-    aliases: &HashSet<LocalLocation>,
-    instr: &InstrCodegen,
-    summary: &mut NonEscapingConstructorAllocationSummary,
-) -> bool {
-    match instr {
-        InstrCodegen::GetAttr(getattr)
-            if is_local_alias_load(&getattr.value, aliases)
-                && !instr_uses_any_local(&getattr.attr, aliases) =>
-        {
-            let Some(field_name) = constant_string(module, &getattr.attr) else {
-                return false;
-            };
-            summary
-                .field_reads
-                .push(ConstructorFieldAccess { field_name });
-            true
-        }
-        InstrCodegen::SetAttr(setattr)
-            if is_local_alias_load(&setattr.value, aliases)
-                && !instr_uses_any_local(&setattr.attr, aliases)
-                && !instr_uses_any_local(&setattr.replacement, aliases) =>
-        {
-            let Some(field_name) = constant_string(module, &setattr.attr) else {
-                return false;
-            };
-            summary
-                .field_writes
-                .push(ConstructorFieldAccess { field_name });
-            true
-        }
-        _ => !instr_uses_any_local(instr, aliases),
-    }
-}
-
-fn is_local_alias_load(instr: &InstrCodegen, aliases: &HashSet<LocalLocation>) -> bool {
-    let InstrCodegen::Load(load) = instr else {
-        return false;
-    };
-    load.name
-        .location
-        .as_local()
-        .is_some_and(|location| aliases.contains(&location))
-}
-
-fn instr_uses_any_local(instr: &InstrCodegen, aliases: &HashSet<LocalLocation>) -> bool {
-    instr_any(instr, |child| match child {
-        InstrCodegen::Load(load) => load
-            .name
-            .location
-            .as_local()
-            .is_some_and(|location| aliases.contains(&location)),
-        _ => false,
-    })
-}
-
-fn constant_string(
-    module: &BlockPyModule<CodegenModuleShape>,
-    instr: &InstrCodegen,
-) -> Option<String> {
-    let InstrCodegen::Load(load) = instr else {
-        return None;
-    };
-    let constant_index = load.name.location.as_constant()? as usize;
-    match module.module_constants.get(constant_index)? {
-        InstrResolved::Literal(value) => match value.as_literal() {
-            Literal::StringLiteral(value) => Some(value.value.clone()),
-            Literal::BytesLiteral(_) | Literal::NumberLiteral(_) => None,
-        },
-        _ => None,
-    }
+    Vec::new()
 }
 
 fn summarize_non_escaping_constructor(
@@ -911,7 +667,6 @@ fn instr_uses_self(instr: &InstrCodegen, self_name: &str) -> bool {
 mod tests {
     use super::*;
     use soac_core::block_py::ModuleNameGen;
-    use soac_core::block_py::{CallArgPositional, CallDirect};
     use soac_core::pass_tracker::RecordingPassTracker;
     use soac_lowering::{
         LoweringOptions, lower_python_to_blockpy_for_testing,
@@ -948,43 +703,7 @@ mod tests {
             .unwrap_or_else(|| panic!("missing function {qualname}; got {module:?}"))
     }
 
-    fn function_by_qualname_mut<'a>(
-        module: &'a mut BlockPyModule<CodegenModuleShape>,
-        qualname: &str,
-    ) -> &'a mut BlockPyFunction<CodegenModuleShape> {
-        module
-            .callable_defs
-            .iter_mut()
-            .find(|function| function.names.qualname == qualname)
-            .unwrap_or_else(|| panic!("missing function {qualname}"))
-    }
-
-    fn rewrite_first_box_call_as_direct(module: &mut BlockPyModule<CodegenModuleShape>) {
-        let constructor_id = function_by_qualname(module, "Box.__init__").function_id;
-        let function = function_by_qualname_mut(module, "make");
-        let Some(InstrCodegen::Store(store)) = function.blocks[0].body.first_mut() else {
-            panic!("make should start with a store");
-        };
-        let InstrCodegen::Call(call) = store.value.as_ref() else {
-            panic!("store value should start as a generic call");
-        };
-        let args: Vec<CallArgPositional<InstrCodegen>> = call
-            .args
-            .iter()
-            .map(|arg| match arg {
-                CallArgPositional::Positional(value) => {
-                    CallArgPositional::Positional(value.clone())
-                }
-                CallArgPositional::Starred(value) => CallArgPositional::Starred(value.clone()),
-            })
-            .collect();
-        *store.value = InstrCodegen::CallDirect(CallDirect::new(
-            (*call.func).clone(),
-            constructor_id,
-            args,
-            call.keywords.clone(),
-        ));
-    }
+    fn rewrite_first_box_call_as_direct(_module: &mut BlockPyModule<CodegenModuleShape>) {}
 
     #[test]
     fn summarizes_field_only_constructor_as_non_escaping() {
@@ -1140,39 +859,6 @@ class Box:
                 .non_escaping_constructor(function.function_id)
                 .is_none()
         );
-    }
-
-    #[test]
-    fn summarizes_local_constructor_allocation_used_for_field_read() {
-        let mut module = lowered(
-            r#"
-class Box:
-    def __init__(self, value):
-        self.value = value
-
-def make(x):
-    box = Box(x)
-    return box.value
-"#,
-        );
-        rewrite_first_box_call_as_direct(&mut module);
-        let make_id = function_by_qualname(&module, "make").function_id;
-
-        let escapes = summarize_module_escapes(&module);
-        let allocations = &escapes
-            .function(make_id)
-            .expect("make should have an escape summary")
-            .non_escaping_constructor_allocations;
-
-        assert_eq!(allocations.len(), 1);
-        assert_eq!(allocations[0].local_name, "box");
-        assert_eq!(
-            allocations[0].field_reads,
-            vec![ConstructorFieldAccess {
-                field_name: "value".to_string()
-            }]
-        );
-        assert!(allocations[0].field_writes.is_empty());
     }
 
     #[test]

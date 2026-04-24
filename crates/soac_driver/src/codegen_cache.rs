@@ -347,19 +347,12 @@ impl VisitMut<InstrCodegen> for FunctionIdRemapper {
         InstrCodegen: soac_core::block_py::ChildVisitable<InstrCodegen>,
     {
         match expr {
-            InstrCodegen::CallDirect(op) => {
-                op.function_id = self.remap(op.function_id);
-            }
-            InstrCodegen::DirectFunctionIdGuardTest(op) => {
-                op.function_id = self.remap(op.function_id);
-            }
             InstrCodegen::MakeFunctionWithClosure(op) => {
                 op.set_function_id(self.remap(op.function_id()));
             }
             InstrCodegen::BinOp(_)
             | InstrCodegen::UnaryOp(_)
             | InstrCodegen::Tuple(_)
-            | InstrCodegen::CalleeFunctionId(_)
             | InstrCodegen::Call(_)
             | InstrCodegen::GetAttr(_)
             | InstrCodegen::SetAttr(_)

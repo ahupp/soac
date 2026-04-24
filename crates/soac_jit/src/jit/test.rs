@@ -5,14 +5,14 @@ use soac_core::block_py::literal::{
 };
 use soac_core::block_py::{
     AbruptKind, BinOp, BinOpKind, BlockArg, BlockEdge, BlockLabel, BlockParam, BlockParamRole,
-    BlockPyFunction, BlockPyModule, BlockTerm, Call, CallArgKeyword, CallArgPositional, CallDirect,
-    CalleeFunctionId, CellLocation, CellRef, ChildVisitable, ClosureInit, ClosureSlot, CounterDef,
-    CounterSite, Del, DelItem, FunctionExecutionMode, FunctionKind, FunctionName, GetAttr, GetItem,
-    HasMeta, HasSemanticInstrId, Load, LocalFunctionId, LocalLocation, MakeCell, Meta,
-    ModuleNameGen, NameLike, NameLocation, Param, ParamKind, ParamSpec, ResolvedName,
-    RuntimeFunctionId, RuntimeName, SerializedFunctionDebugName, SerializedFunctionId,
-    SerializedIdentityTables, SerializedModuleId, SerializedModuleIdentity, SetAttr, SetItem,
-    StorageLayout, Store, Tuple, UnaryOp, UnaryOpKind, Visit, VisitMut, WithMeta,
+    BlockPyFunction, BlockPyModule, BlockTerm, Call, CallArgKeyword, CallArgPositional,
+    CellLocation, CellRef, ChildVisitable, ClosureInit, ClosureSlot, CounterDef, CounterSite, Del,
+    DelItem, FunctionExecutionMode, FunctionKind, FunctionName, GetAttr, GetItem, HasMeta,
+    HasSemanticInstrId, Load, LocalFunctionId, LocalLocation, MakeCell, Meta, ModuleNameGen,
+    NameLike, NameLocation, Param, ParamKind, ParamSpec, ResolvedName, RuntimeFunctionId,
+    RuntimeName, SerializedFunctionDebugName, SerializedFunctionId, SerializedIdentityTables,
+    SerializedModuleId, SerializedModuleIdentity, SetAttr, SetItem, StorageLayout, Store, Tuple,
+    UnaryOp, UnaryOpKind, Visit, VisitMut, WithMeta,
 };
 use soac_lowering::passes::{
     CodegenModuleShape, InstrCodegen, InstrResolved, validate_codegen_instr_ids,
@@ -4230,67 +4230,6 @@ def build(values):
     }
 
     #[test]
-    fn typed_result_demand_extra_marks_direct_call_inputs_pyobject_borrowed_ok() {
-        let mut constants = TestConstantPool::default();
-        let call_instr_id = InstrId::new(0);
-        let callable_instr_id = InstrId::new(1);
-        let positional_instr_id = InstrId::new(2);
-        let call = with_instr_id(
-            InstrCodegen::CallDirect(CallDirect::new(
-                with_instr_id(name_expr(test_global_name("callee")), callable_instr_id),
-                RuntimeFunctionId::from_raw_parts(0, 1),
-                vec![CallArgPositional::Positional(with_instr_id(
-                    constants.int_expr(1),
-                    positional_instr_id,
-                ))],
-                Vec::<CallArgKeyword<InstrCodegen>>::new(),
-            )),
-            call_instr_id,
-        );
-        let function =
-            with_single_test_block(test_function(), vec![call], ret_term(constants.int_expr(2)));
-        let typed_function = lower_codegen_function_to_typed(function);
-        let typed_function = annotate_test_result_demands(typed_function);
-
-        assert_eq!(
-            typed_demand_for_instr_id(&typed_function, call_instr_id),
-            Some(ResultDemand::EffectOnly)
-        );
-        assert_eq!(
-            typed_demand_for_instr_id(&typed_function, callable_instr_id),
-            Some(ResultDemand::PYOBJECT_BORROWED_OK)
-        );
-        assert_eq!(
-            typed_demand_for_instr_id(&typed_function, positional_instr_id),
-            Some(ResultDemand::PYOBJECT_BORROWED_OK)
-        );
-    }
-
-    #[test]
-    fn typed_planned_result_extra_marks_direct_call_local_inputs_borrowed() {
-        let mut constants = TestConstantPool::default();
-        let positional_instr_id = InstrId::new(2);
-        let call = InstrCodegen::CallDirect(CallDirect::new(
-            name_expr(test_global_name("callee")),
-            RuntimeFunctionId::from_raw_parts(0, 1),
-            vec![CallArgPositional::Positional(with_instr_id(
-                name_expr(test_name("x")),
-                positional_instr_id,
-            ))],
-            Vec::<CallArgKeyword<InstrCodegen>>::new(),
-        ));
-        let function =
-            with_single_test_block(test_function(), vec![call], ret_term(constants.int_expr(2)));
-        let typed_function = lower_codegen_function_to_typed(function);
-        let typed_function = annotate_test_result_demands_and_plans(typed_function);
-
-        assert_eq!(
-            typed_planned_result_for_instr_id(&typed_function, positional_instr_id),
-            Some(PlannedResult::PYOBJECT_BORROWED_LOCAL)
-        );
-    }
-
-    #[test]
     fn runtime_builtin_primitive_recognition_requires_static_runtime_name() {
         let mut module = test_module(ModuleNameGen::new(0), vec![test_function()]);
         module
@@ -4715,15 +4654,6 @@ def build(values):
         );
     }
 
-    fn direct_call_expr(function_id: RuntimeFunctionId) -> InstrCodegen {
-        InstrCodegen::CallDirect(CallDirect::new(
-            none_expr(),
-            function_id,
-            Vec::<CallArgPositional<InstrCodegen>>::new(),
-            Vec::<CallArgKeyword<InstrCodegen>>::new(),
-        ))
-    }
-
     fn test_param(name: &str, kind: ParamKind, has_default: bool) -> Param {
         Param {
             name: name.into(),
@@ -4830,53 +4760,6 @@ def build(values):
             Ok(DirectCallArgPlan {
                 sources: Vec::new(),
             })
-        );
-    }
-
-    #[test]
-    fn specialized_jit_call_direct_uses_loaded_function_env_without_predeclared_symbol() {
-        let blocks = [1usize as ObjPtr];
-        let module_name_gen = ModuleNameGen::new(95);
-        let mut constants = TestConstantPool::default();
-        let callee = with_single_test_block(
-            test_function_in_module(&module_name_gen, "callee"),
-            vec![],
-            ret_term(constants.int_expr(7)),
-        );
-        let caller = with_single_test_block(
-            test_function_in_module(&module_name_gen, "caller"),
-            vec![],
-            ret_term(InstrCodegen::CallDirect(CallDirect::new(
-                name_expr(test_global_name("callee")),
-                callee.function_id,
-                Vec::<CallArgPositional<InstrCodegen>>::new(),
-                Vec::<CallArgKeyword<InstrCodegen>>::new(),
-            ))),
-        );
-        let mut module = test_module(module_name_gen, vec![callee, caller.clone()]);
-        module.global_names = vec!["callee".into()];
-        module.module_constants = constants.module_constants;
-        let module_constants =
-            crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
-        let built =
-            build_test_jit_function_with_constants(&module, &caller, &blocks, &module_constants);
-        assert!(
-            count_indirect_calls(&built.ctx.func) >= 1,
-            "direct-call lowering without a predeclared target should indirect through FunctionEnv.direct_code_ptr",
-        );
-        let generic_call_helpers = import_user_names_for_symbols(
-            &built,
-            &[
-                DP_JIT_PY_CALL_OBJECT_IMPORT.symbol,
-                DP_JIT_PY_VECTORCALL_IMPORT.symbol,
-                DP_JIT_PY_CALL_WITH_KW_IMPORT.symbol,
-                DP_JIT_PY_CALL_POSITIONAL_THREE_IMPORT.symbol,
-            ],
-        );
-        assert_eq!(
-            count_direct_calls_to_runtime_helpers(&built.ctx.func, &generic_call_helpers),
-            0,
-            "direct-call lowering should not fall back to the generic Python call helpers",
         );
     }
 
@@ -5744,287 +5627,6 @@ def build(values):
             .declare_direct_function(&mut jit_module, &second, None)
             .expect("colliding function id with different shape should redeclare");
         assert_ne!(first_decl.symbol, second_decl.symbol);
-    }
-
-    #[test]
-    fn process_jit_batch_collection_skips_cross_module_targets_for_lazy_env_lookup() {
-        let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        crate::initialize_test_python();
-        let result = Python::attach(|py| {
-            let session = std::sync::Arc::new(crate::session::CompileSession::new());
-            let caller_module_name_gen = ModuleNameGen::new(91);
-            let callee_module_name_gen = ModuleNameGen::new(92);
-            let callee = test_function_in_module(&callee_module_name_gen, "callee");
-            let caller = test_function_in_module(&caller_module_name_gen, "caller");
-            let direct_call = InstrCodegen::CallDirect(CallDirect::new(
-                none_expr(),
-                callee.function_id,
-                Vec::<CallArgPositional<InstrCodegen>>::new(),
-                Vec::<CallArgKeyword<InstrCodegen>>::new(),
-            ));
-            let caller = with_single_test_block(caller, vec![direct_call], ret_term(none_expr()));
-            let caller_state = crate::module_type::build_shared_state_for_testing(
-                py,
-                test_module(caller_module_name_gen, vec![caller.clone()]),
-                "caller_test",
-                "",
-            )
-            .expect("caller shared state should build");
-            let callee_state = crate::module_type::build_shared_state_for_testing(
-                py,
-                test_module(callee_module_name_gen, vec![callee.clone()]),
-                "callee_test",
-                "",
-            )
-            .expect("callee shared state should build");
-            session
-                .retain_shared_module_state(std::sync::Arc::clone(&caller_state))
-                .expect("caller state should be retained");
-            session
-                .retain_shared_module_state(callee_state)
-                .expect("callee state should be retained");
-
-            let batch =
-                collect_process_jit_batch_functions(&session, &caller, Some(caller_state.as_ref()))
-                    .expect("cross-module process JIT batch should collect");
-            let function_ids = batch
-                .iter()
-                .map(|batch_function| batch_function.function.function_id)
-                .collect::<Vec<_>>();
-            assert_eq!(function_ids, vec![caller.function_id]);
-            assert_eq!(
-                caller_state
-                    .lookup_direct_call_target_function(session.as_ref(), callee.function_id)
-                    .expect("cross-module target lookup should succeed")
-                    .expect("cross-module target metadata should resolve")
-                    .function_id,
-                callee.function_id
-            );
-        });
-        result
-    }
-
-    #[test]
-    fn process_jit_batch_collection_handles_recursive_direct_call() {
-        let module_name_gen = ModuleNameGen::new(93);
-        let function = test_function_in_module(&module_name_gen, "recursive");
-        let function = with_single_test_block(
-            function.clone(),
-            vec![direct_call_expr(function.function_id)],
-            ret_term(none_expr()),
-        );
-
-        let session = std::sync::Arc::new(crate::session::CompileSession::new());
-        let batch = collect_process_jit_batch_functions(&session, &function, None)
-            .expect("recursive process JIT batch should collect");
-        let function_ids = batch
-            .iter()
-            .map(|batch_function| batch_function.function.function_id)
-            .collect::<Vec<_>>();
-        assert_eq!(function_ids, vec![function.function_id]);
-    }
-
-    #[test]
-    fn process_jit_compile_direct_function_handles_mutual_recursion() {
-        let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        crate::initialize_test_python();
-        let result = Python::attach(|py| {
-            let session = std::sync::Arc::new(crate::session::CompileSession::new());
-            let module_name_gen = ModuleNameGen::new(94);
-            let first = test_function_in_module(&module_name_gen, "first");
-            let second = test_function_in_module(&module_name_gen, "second");
-            let first = with_single_test_block(
-                first.clone(),
-                vec![direct_call_expr(second.function_id)],
-                ret_term(none_expr()),
-            );
-            let second = with_single_test_block(
-                second.clone(),
-                vec![direct_call_expr(first.function_id)],
-                ret_term(none_expr()),
-            );
-            let shared_state = crate::module_type::build_shared_state_for_testing(
-                py,
-                test_module(module_name_gen, vec![first.clone(), second.clone()]),
-                "mutual_recursion_test",
-                "",
-            )
-            .expect("shared state should build");
-            session
-                .retain_shared_module_state(std::sync::Arc::clone(&shared_state))
-                .expect("shared state should be retained");
-
-            let engine =
-                ProcessJitEngine::new(session.as_ref()).expect("process JIT should construct");
-            let module_constant_ptrs = shared_state.module_constant_ptrs();
-            let blocks = vec![std::ptr::null_mut::<c_void>(); first.blocks.len()];
-            let compiled = unsafe {
-                engine.compile_direct_function(
-                    &session,
-                    blocks.as_slice(),
-                    &shared_state.lowered_module,
-                    &first,
-                    &shared_state.codegen_constants,
-                    &shared_state.lowered_module.counter_defs,
-                    &module_constant_ptrs,
-                    Some(shared_state.as_ref()),
-                )
-            }
-            .expect("mutually-recursive process JIT batch should compile");
-            assert!(compiled.compiled);
-            let state = engine
-                .state
-                .lock()
-                .expect("process JIT state lock should not be poisoned");
-            let first_handle = state
-                .ready_direct_function(&first)
-                .expect("root function should be marked ready");
-            let second_handle = state
-                .ready_direct_function(&second)
-                .expect("mutually-recursive callee should be marked ready");
-            let first_deopt_table = first_handle
-                .direct_deopt_table()
-                .expect("root compiled handle should carry deopt metadata");
-            assert_eq!(first_deopt_table.function_id(), first.function_id);
-            assert!(
-                first_deopt_table.len() >= first.blocks.len() * 2,
-                "block entry and before-term points should be available for each block"
-            );
-            let first_entry_record = first_deopt_table
-                .record_for_point(LocalEnvResumePoint::BlockEntry {
-                    function_id: first.function_id,
-                    block: first.blocks[0].label,
-                })
-                .expect("block-entry deopt point should be addressable by resume point");
-            assert_eq!(first_entry_record.id().function_id, first.function_id);
-            assert_eq!(
-                first_entry_record.ordinal(),
-                0,
-                "runtime deopt records should preserve planned ordinal ids"
-            );
-            assert_eq!(
-                first_entry_record.precision(),
-                LocalEnvResumeStatePrecision::BlockEntry
-            );
-            assert_eq!(
-                first_deopt_table
-                    .record_for_ordinal(first_entry_record.ordinal() as i64)
-                    .expect("runtime deopt records should be addressable by ordinal")
-                    .resume_point(),
-                first_entry_record.resume_point()
-            );
-            assert_eq!(
-                first_deopt_table
-                    .record_for_ordinal(first_entry_record.ordinal() as i64)
-                    .expect("runtime deopt records should be addressable by ordinal")
-                    .locals(),
-                first_entry_record.locals()
-            );
-            let first_entry_description = first_deopt_table
-                .describe_record_ordinal(first_entry_record.ordinal() as i64)
-                .expect("runtime deopt record should be describable by ordinal");
-            assert!(
-                first_entry_description.contains(&format!("function {}", first.function_id))
-                    && first_entry_description.contains("record 0"),
-                "runtime deopt record descriptions should include stable lookup context: {first_entry_description}"
-            );
-            assert!(
-                first_deopt_table.describe_record_ordinal(-1).is_err(),
-                "runtime deopt record lookup should reject negative ordinals"
-            );
-            assert!(
-                first_deopt_table.record_for_ordinal(-1).is_err(),
-                "structured runtime deopt record lookup should reject negative ordinals"
-            );
-            assert_eq!(
-                compiled_direct_deopt_table_ptr(first_handle.raw_handle())
-                    .expect("root deopt table pointer should be available"),
-                std::sync::Arc::as_ptr(&first_deopt_table) as ObjPtr,
-                "compiled direct handle should expose the runtime deopt table pointer"
-            );
-            assert_eq!(
-                first_entry_record.continuation(),
-                &RuntimeJitDeoptContinuation::ResumeBlockTail {
-                    cursor: RuntimeJitDeoptCursor::at_block_entry(first.blocks[0].label),
-                },
-                "block-entry deopt records should now be executable from body index 0"
-            );
-            let second_deopt_table = second_handle
-                .direct_deopt_table()
-                .expect("callee compiled handle should carry deopt metadata");
-            assert_eq!(second_deopt_table.function_id(), second.function_id);
-        });
-        result
-    }
-
-    #[test]
-    fn process_jit_compile_direct_function_leaves_cross_module_callee_lazy() {
-        let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        crate::initialize_test_python();
-        let result = Python::attach(|py| {
-            let session = std::sync::Arc::new(crate::session::CompileSession::new());
-            let caller_module_name_gen = ModuleNameGen::new(96);
-            let callee_module_name_gen = ModuleNameGen::new(97);
-            let callee = test_function_in_module(&callee_module_name_gen, "callee");
-            let caller = test_function_in_module(&caller_module_name_gen, "caller");
-            let caller = with_single_test_block(
-                caller.clone(),
-                vec![direct_call_expr(callee.function_id)],
-                ret_term(none_expr()),
-            );
-            let caller_state = crate::module_type::build_shared_state_for_testing(
-                py,
-                test_module(caller_module_name_gen, vec![caller.clone()]),
-                "caller_test",
-                "",
-            )
-            .expect("caller shared state should build");
-            let callee_state = crate::module_type::build_shared_state_for_testing(
-                py,
-                test_module(callee_module_name_gen, vec![callee.clone()]),
-                "callee_test",
-                "",
-            )
-            .expect("callee shared state should build");
-            session
-                .retain_shared_module_state(std::sync::Arc::clone(&caller_state))
-                .expect("caller state should be retained");
-            session
-                .retain_shared_module_state(callee_state)
-                .expect("callee state should be retained");
-
-            let engine =
-                ProcessJitEngine::new(session.as_ref()).expect("process JIT should construct");
-            let module_constant_ptrs = caller_state.module_constant_ptrs();
-            let blocks = vec![std::ptr::null_mut::<c_void>(); caller.blocks.len()];
-            let compiled = unsafe {
-                engine.compile_direct_function(
-                    &session,
-                    blocks.as_slice(),
-                    &caller_state.lowered_module,
-                    &caller,
-                    &caller_state.codegen_constants,
-                    &caller_state.lowered_module.counter_defs,
-                    &module_constant_ptrs,
-                    Some(caller_state.as_ref()),
-                )
-            }
-            .expect("cross-module caller should compile without precompiling the callee");
-            assert!(compiled.compiled);
-            let state = engine
-                .state
-                .lock()
-                .expect("process JIT state lock should not be poisoned");
-            assert!(
-                state.ready_direct_function(&caller).is_some(),
-                "root function should be marked ready",
-            );
-            assert!(
-                state.ready_direct_function(&callee).is_none(),
-                "cross-module callee should stay lazy until its FunctionEnv is materialized",
-            );
-        });
-        result
     }
 
     fn render_test_jit_function_with_module_constants(
@@ -8440,26 +8042,6 @@ def write_point(point, value):
             .count()
     }
 
-    fn count_indirect_calls(function: &ir::Function) -> usize {
-        function
-            .layout
-            .blocks()
-            .map(|block| {
-                function
-                    .layout
-                    .block_insts(block)
-                    .filter(|inst| {
-                        matches!(
-                            function.dfg.insts[*inst],
-                            ir::InstructionData::CallIndirect { .. }
-                                | ir::InstructionData::TryCallIndirect { .. }
-                        )
-                    })
-                    .count()
-            })
-            .sum()
-    }
-
     fn import_user_names_for_symbols(
         built: &BuiltSpecializedFunction,
         symbols: &[&'static str],
@@ -8673,49 +8255,6 @@ def f(x):
         let record = table
             .record_for_point(point)
             .expect("before-term return-binop point should have a runtime record");
-        assert_eq!(
-            record.continuation(),
-            &RuntimeJitDeoptContinuation::ResumeBlockTail {
-                cursor: RuntimeJitDeoptCursor::new(
-                    function.entry_block().label,
-                    function.entry_block().body.len(),
-                ),
-            }
-        );
-    }
-
-    #[test]
-    fn runtime_deopt_table_marks_return_call_direct_before_term_continuation() {
-        let function = with_single_test_block(
-            test_function(),
-            vec![],
-            ret_term(InstrCodegen::CallDirect(CallDirect::new(
-                name_expr(test_constant_name(0)),
-                RuntimeFunctionId::from_raw_parts(0, 999),
-                vec![CallArgPositional::Positional(name_expr(
-                    test_constant_name(1),
-                ))],
-                Vec::<CallArgKeyword<InstrCodegen>>::new(),
-            ))),
-        );
-        let module = test_module(ModuleNameGen::new(0), vec![function]);
-        let function = &module.callable_defs[0];
-        let facts = infer_module_value_facts(&module);
-        let module_plan = plan_jit_module_from_codegen(&module, facts.clone())
-            .map(|prepared| prepared.deopt_resume)
-            .expect("JIT deopt resume planning should succeed");
-        let function_plan = module_plan
-            .function(function.function_id)
-            .expect("function should have a JIT deopt plan");
-        let table = RuntimeJitDeoptTable::from_plan(function, function_plan, &[])
-            .expect("runtime deopt table should build from plan");
-        let point = LocalEnvResumePoint::BeforeTerm {
-            function_id: function.function_id,
-            block: function.entry_block().label,
-        };
-        let record = table
-            .record_for_point(point)
-            .expect("before-term return-call-direct point should have a runtime record");
         assert_eq!(
             record.continuation(),
             &RuntimeJitDeoptContinuation::ResumeBlockTail {
@@ -9010,13 +8549,14 @@ def f(x):
 
     #[test]
     fn runtime_deopt_guard_miss_rejects_replay_unsafe_operands() {
-        let function_id = test_function().function_id;
         assert!(
             runtime_jit_deopt_guard_operand_replay_safe(&name_expr(test_name("x"))),
             "plain local loads should be replay-safe guard operands"
         );
         assert!(
-            !runtime_jit_deopt_guard_operand_replay_safe(&direct_call_expr(function_id)),
+            !runtime_jit_deopt_guard_operand_replay_safe(&InstrCodegen::Tuple(Tuple::new(vec![
+                name_expr(test_name("x")),
+            ]))),
             "guard miss deopt should reject operands that could repeat side effects"
         );
         let typed_load = InstrTyped::Load(Load::<InstrTyped>::new(test_name("x")));
@@ -9767,55 +9307,6 @@ def f(x):
         let record = table
             .record_for_point(point)
             .expect("before-term branch-table point should have a runtime record");
-        assert_eq!(
-            record.continuation(),
-            &RuntimeJitDeoptContinuation::ResumeBlockTail {
-                cursor: RuntimeJitDeoptCursor::new(entry.label, entry.body.len()),
-            }
-        );
-    }
-
-    #[test]
-    fn runtime_deopt_table_marks_callee_id_branch_table_before_term_continuation() {
-        let function = test_function();
-        let first_block = test_source_block(&function, vec![], ret_term(none_expr()));
-        let second_block = test_source_block(&function, vec![], ret_term(none_expr()));
-        let default_block = test_source_block(&function, vec![], ret_term(none_expr()));
-        let entry = test_source_block(
-            &function,
-            vec![],
-            BlockTerm::BranchTable(soac_core::block_py::TermBranchTable {
-                index: InstrCodegen::CalleeFunctionId(CalleeFunctionId::new(name_expr(
-                    test_constant_name(0),
-                ))),
-                targets: vec![first_block.label, second_block.label],
-                default_label: default_block.label,
-            }),
-        );
-        let module = test_module(
-            ModuleNameGen::new(0),
-            vec![with_test_blocks(
-                function,
-                vec![entry.clone(), first_block, second_block, default_block],
-            )],
-        );
-        let function = &module.callable_defs[0];
-        let facts = infer_module_value_facts(&module);
-        let module_plan = plan_jit_module_from_codegen(&module, facts.clone())
-            .map(|prepared| prepared.deopt_resume)
-            .expect("JIT deopt resume planning should succeed");
-        let function_plan = module_plan
-            .function(function.function_id)
-            .expect("function should have a JIT deopt plan");
-        let table = RuntimeJitDeoptTable::from_plan(function, function_plan, &[])
-            .expect("runtime deopt table should build from plan");
-        let point = LocalEnvResumePoint::BeforeTerm {
-            function_id: function.function_id,
-            block: entry.label,
-        };
-        let record = table
-            .record_for_point(point)
-            .expect("before-term callee-id branch-table point should have a runtime record");
         assert_eq!(
             record.continuation(),
             &RuntimeJitDeoptContinuation::ResumeBlockTail {
@@ -11092,150 +10583,6 @@ def f(x):
     }
 
     #[test]
-    fn deopt_block_tail_continuation_follows_callee_id_branch_table_term() {
-        let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        crate::initialize_test_python();
-        Python::attach(|py| {
-            let function = test_function();
-            let first_block = test_source_block(
-                &function,
-                vec![],
-                ret_term(name_expr(test_constant_name(1))),
-            );
-            let second_block = test_source_block(
-                &function,
-                vec![],
-                ret_term(name_expr(test_constant_name(2))),
-            );
-            let default_block = test_source_block(
-                &function,
-                vec![],
-                ret_term(name_expr(test_constant_name(3))),
-            );
-            let entry = test_source_block(
-                &function,
-                vec![],
-                BlockTerm::BranchTable(soac_core::block_py::TermBranchTable {
-                    index: InstrCodegen::CalleeFunctionId(CalleeFunctionId::new(name_expr(
-                        test_constant_name(0),
-                    ))),
-                    targets: vec![first_block.label, second_block.label],
-                    default_label: default_block.label,
-                }),
-            );
-            let function = with_test_blocks(
-                function,
-                vec![entry.clone(), first_block, second_block, default_block],
-            );
-            let function_id = function.function_id;
-            let module = PyModule::from_code(
-                py,
-                c"
-def g():
-    return None
-",
-                c"deopt_callee_id.py",
-                c"deopt_callee_id",
-            )
-            .expect("test module should execute");
-            let callable = module
-                .getattr("g")
-                .expect("test function should exist")
-                .as_ptr();
-            unsafe {
-                ffi::Py_INCREF(callable);
-                assert_eq!(
-                    crate::PyFunction_SetSoacMetadata(
-                        callable,
-                        RuntimeFunctionId::from_packed_runtime_u64(1).to_packed_runtime_u64(),
-                        std::ptr::null_mut(),
-                        None,
-                    ),
-                    0,
-                    "test function should accept SOAC function id metadata"
-                );
-            }
-            let first_value = unsafe { ffi::PyLong_FromLong(111_111_111) };
-            assert!(
-                !first_value.is_null(),
-                "test first-value allocation should succeed"
-            );
-            let second_value = unsafe { ffi::PyLong_FromLong(222_222_222) };
-            assert!(
-                !second_value.is_null(),
-                "test second-value allocation should succeed"
-            );
-            let default_value = unsafe { ffi::PyLong_FromLong(333_333_333) };
-            assert!(
-                !default_value.is_null(),
-                "test default-value allocation should succeed"
-            );
-            let table = RuntimeJitDeoptTable {
-                function_id,
-                function: Box::new(function),
-                module_constant_ptrs: vec![
-                    callable.cast(),
-                    first_value.cast(),
-                    second_value.cast(),
-                    default_value.cast(),
-                ],
-                points: vec![RuntimeJitDeoptRecord {
-                    id: PlannedJitDeoptPointId {
-                        function_id,
-                        ordinal: 0,
-                    },
-                    resume_point: LocalEnvResumePoint::BeforeTerm {
-                        function_id,
-                        block: entry.label,
-                    },
-                    precision: LocalEnvResumeStatePrecision::InstructionBoundary,
-                    locals: vec![],
-                    continuation: RuntimeJitDeoptContinuation::ResumeBlockTail {
-                        cursor: RuntimeJitDeoptCursor::new(entry.label, entry.body.len()),
-                    },
-                }],
-            };
-            let before_callable = unsafe { ffi::Py_REFCNT(callable) };
-            let before_second = unsafe { ffi::Py_REFCNT(second_value) };
-            let result = unsafe {
-                test_dp_jit_deopt_resume(
-                    std::ptr::addr_of!(table).cast_mut().cast(),
-                    std::ptr::null_mut(),
-                    0,
-                    std::ptr::null_mut(),
-                    0,
-                )
-            };
-            assert_eq!(
-                result,
-                second_value.cast(),
-                "callee-id branch-table deopt should select the branch matching the function id"
-            );
-            assert!(
-                unsafe { ffi::PyErr_Occurred() }.is_null(),
-                "successful callee-id branch-table deopt should not leave a Python exception"
-            );
-            assert_eq!(
-                unsafe { ffi::Py_REFCNT(callable) },
-                before_callable,
-                "callee-id evaluation should release its owned callable load"
-            );
-            assert_eq!(
-                unsafe { ffi::Py_REFCNT(second_value) },
-                before_second + 1,
-                "callee-id branch target return should be owned by the JIT caller"
-            );
-            unsafe {
-                ffi::Py_DECREF(result.cast::<ffi::PyObject>());
-                ffi::Py_DECREF(default_value);
-                ffi::Py_DECREF(second_value);
-                ffi::Py_DECREF(first_value);
-                ffi::Py_DECREF(callable);
-            }
-        });
-    }
-
-    #[test]
     fn deopt_block_tail_continuation_returns_owned_module_constant() {
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         crate::initialize_test_python();
@@ -12370,87 +11717,6 @@ def g():
                 ffi::Py_DECREF(duplicate);
                 ffi::Py_DECREF(kwargs);
                 ffi::Py_DECREF(dict_callable);
-            }
-        });
-    }
-
-    #[test]
-    fn deopt_block_tail_continuation_executes_return_call_direct() {
-        let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        crate::initialize_test_python();
-        Python::attach(|_| {
-            let function = with_single_test_block(
-                test_function(),
-                vec![],
-                ret_term(InstrCodegen::CallDirect(CallDirect::new(
-                    name_expr(test_constant_name(0)),
-                    RuntimeFunctionId::from_raw_parts(0, 999),
-                    vec![CallArgPositional::Positional(name_expr(
-                        test_constant_name(1),
-                    ))],
-                    Vec::<CallArgKeyword<InstrCodegen>>::new(),
-                ))),
-            );
-            let function_id = function.function_id;
-            let block = function.entry_block().label;
-            let int_callable = std::ptr::addr_of_mut!(ffi::PyLong_Type).cast::<ffi::PyObject>();
-            unsafe {
-                ffi::Py_INCREF(int_callable);
-            }
-            let input = unsafe { ffi::PyUnicode_FromString(c"333444555".as_ptr()) };
-            assert!(
-                !input.is_null(),
-                "test direct-call input string allocation should succeed"
-            );
-            let table = RuntimeJitDeoptTable {
-                function_id,
-                function: Box::new(function),
-                module_constant_ptrs: vec![int_callable.cast(), input.cast()],
-                points: vec![RuntimeJitDeoptRecord {
-                    id: PlannedJitDeoptPointId {
-                        function_id,
-                        ordinal: 0,
-                    },
-                    resume_point: LocalEnvResumePoint::BeforeTerm { function_id, block },
-                    precision: LocalEnvResumeStatePrecision::InstructionBoundary,
-                    locals: vec![],
-                    continuation: RuntimeJitDeoptContinuation::ResumeBlockTail {
-                        cursor: RuntimeJitDeoptCursor::at_block_entry(block),
-                    },
-                }],
-            };
-            let before_input = unsafe { ffi::Py_REFCNT(input) };
-            let result = unsafe {
-                test_dp_jit_deopt_resume(
-                    std::ptr::addr_of!(table).cast_mut().cast(),
-                    std::ptr::null_mut(),
-                    0,
-                    std::ptr::null_mut(),
-                    0,
-                )
-            };
-            assert!(
-                !result.is_null(),
-                "return-call-direct deopt should produce a value"
-            );
-            assert!(
-                unsafe { ffi::PyErr_Occurred() }.is_null(),
-                "successful return-call-direct deopt should not leave a Python exception"
-            );
-            assert_eq!(
-                unsafe { ffi::PyLong_AsLongLong(result.cast::<ffi::PyObject>()) },
-                333_444_555,
-                "return-call-direct deopt should execute a generic Python call"
-            );
-            assert_eq!(
-                unsafe { ffi::Py_REFCNT(input) },
-                before_input,
-                "direct-call argument module constant should not leak through call execution"
-            );
-            unsafe {
-                ffi::Py_DECREF(result.cast::<ffi::PyObject>());
-                ffi::Py_DECREF(input);
-                ffi::Py_DECREF(int_callable);
             }
         });
     }

@@ -1,7 +1,5 @@
-mod direct_call_transform;
 mod escape_analysis;
 mod inline_plan;
-mod inline_sites;
 mod inline_transform;
 mod local_env_plan;
 mod ownership_effects;
@@ -9,9 +7,8 @@ pub(crate) mod value_facts;
 
 use soac_core::block_py::{BlockPyFunction, LocalLocation, NameLocation, ResolvedName};
 pub use soac_lowering::passes::{
-    CodegenModuleShape, DirectFunctionIdGuardTest, InstrCodegen, InstrResolved,
-    assign_missing_codegen_function_instr_ids, reassign_codegen_function_instr_ids,
-    validate_codegen_instr_ids,
+    CodegenModuleShape, InstrCodegen, InstrResolved, assign_missing_codegen_function_instr_ids,
+    reassign_codegen_function_instr_ids, validate_codegen_instr_ids,
 };
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -82,10 +79,6 @@ pub use crate::typed::{
     try_lower_typed_term_to_codegen_legacy, validate_typed_function_call_access_plans,
     validate_typed_function_value_facts, validate_typed_module_call_access_plans,
 };
-pub use direct_call_transform::{
-    DirectCallStoreRewriteStats, rewrite_profiled_function_call_store_sites,
-    rewrite_profiled_function_call_store_sites_with_constructor_targets,
-};
 pub use escape_analysis::{
     ConstructorFieldAccess, ConstructorFieldStore, ConstructorFieldValue, EscapeSummaryModule,
     FieldInitializerConstructorSummary, FunctionEscapeSummary,
@@ -95,22 +88,14 @@ pub use escape_analysis::{
 pub use inline_plan::{
     FunctionInlinePlan, InlinePlanModule, StraightlineConstructorInlinePlan, plan_module_inlining,
 };
-pub use inline_sites::{
-    InlineCallSiteModule, StraightlineConstructorCallSite, collect_inline_call_sites,
-};
 pub use inline_transform::{
-    InlineCallee, InlineFragment, InlineLocal, InlineRewriteStats, InlineScalarRewriteStats,
-    InlineUnsupportedReason, InlineValueBindings, ScalarReplacementStats,
+    InlineFragment, InlineLocal, InlineUnsupportedReason, InlineValueBindings,
     bind_simple_direct_call_inline_args, bind_simple_direct_method_inline_args,
     build_cross_module_direct_call_inline_fragment_to_target,
     build_cross_module_direct_method_inline_fragment_to_target,
     build_direct_call_inline_fragment_to_target, build_direct_method_inline_fragment_to_target,
     build_single_block_inline_fragment, build_single_block_inline_fragment_to_target,
-    build_single_block_inline_fragment_with_bindings, inline_and_scalar_replace_until_fixed_point,
-    inline_and_scalar_replace_with_callees_until_fixed_point,
-    inline_direct_call_stores_with_callees, inline_simple_direct_call_stores,
-    rewrite_static_runtime_constructor_call_stores,
-    scalar_replace_non_escaping_constructor_allocations,
+    build_single_block_inline_fragment_with_bindings,
 };
 pub use local_env_plan::{
     BlockLocalPlan, BlockParamFacts, FunctionLocalEnvResumePlan, FunctionLocalPlan,

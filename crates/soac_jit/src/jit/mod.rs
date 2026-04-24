@@ -30,16 +30,14 @@ use cranelift_reader::parse_functions;
 use pyo3::{Py, PyAny, Python, ffi};
 use soac_config::{RuntimeOptimizationPipeline, SoacEnvConfig};
 use soac_core::block_py as blockpy_intrinsics;
-use soac_core::block_py::literal::Literal;
 use soac_core::block_py::{
     AbruptKind, Block, BlockArg, BlockEdge, BlockLabel, BlockParamRole, BlockPyFunction,
     BlockPyModule, BlockTerm, CallArgKeyword, CallArgPositional, CallableScopeKind, CellLocation,
     ChildVisitable, CounterBranchId, CounterDef, CounterId, CounterScope, CounterSite, Del,
-    DeoptEntrySource, FunctionExecutionMode, FunctionKind, HasMeta, HasSemanticInstrId, InstrId,
-    InstrKey, InstrLocationMap, LocalFunctionId, LocalLocation, ModuleContentId, ModuleShape,
-    NameLocation, ParamKind, PersistentFunctionId, ResolvedName, RuntimeFunctionId,
-    RuntimeModuleId, RuntimeName, SerializedFunctionId, StorageLayout, Store, Visit, VisitMut,
-    WithMeta, current_instr_locations,
+    DeoptEntrySource, FunctionExecutionMode, FunctionKind, HasSemanticInstrId, InstrId, InstrKey,
+    InstrLocationMap, LocalFunctionId, LocalLocation, ModuleContentId, ModuleShape, NameLocation,
+    ParamKind, PersistentFunctionId, ResolvedName, RuntimeFunctionId, RuntimeModuleId, RuntimeName,
+    SerializedFunctionId, StorageLayout, Store, Visit, VisitMut, current_instr_locations,
 };
 use soac_core::profile::{
     CollectedTypeKeyLayout, CounterDumpTypeKey, read_block_entry_counts_from_file,
@@ -78,21 +76,21 @@ use soac_opt::emit_v3::{
     mechanical_region_function_param_inputs as opt_v3_mechanical_region_function_param_inputs,
 };
 use soac_opt::passes::{
-    CodegenModuleShape, DirectFunctionIdGuardTest, FactStore, FunctionRefcountPlan, InstrCodegen,
-    InstrResolved, InstrTyped, LocalEnvResumeBinding, LocalEnvResumeBindingState,
-    LocalEnvResumePoint, LocalEnvResumeStatePrecision, LocalEnvResumeValueSource, LocalRefState,
-    PyExactType, PyObjFacts, RefcountActionKind, RefcountReleaseReason, RefcountSite,
-    RuntimeHelperId, TypedAttrAccessPlan, TypedAttrOwnerRef, TypedBlock, TypedBlockLayoutHint,
-    TypedCall, TypedCallAccessPlan, TypedCallEmissionPlans, TypedCodegenModuleShape,
-    TypedDirectCallArgPlan, TypedDirectCallArgSource, TypedDirectCallGuardTest,
-    TypedDirectCallGuardTestKind, TypedDirectCallableCall, TypedDirectCallableCallGuard,
-    TypedDirectConstructorCallGuard, TypedDirectFunctionCallGuard, TypedDirectMethodCall,
-    TypedDirectMethodCallGuard, TypedExactIntBranchPlan, TypedExactIntPlanSource,
-    TypedExactIntReturnPlan, TypedExactIntScalarThreadPlan, TypedExactListItemAccessPlan,
-    TypedExactListItemPlanSource, TypedGetAttr, TypedGuardedCallableCall, TypedGuardedMethodCall,
-    TypedIndexedFieldGuard, TypedIndexedFieldPlanSource, TypedIndexedGlobalAccessPlan,
-    TypedIndexedGlobalPlanSource, TypedPlannedResult, TypedPyObjectOwnershipPlan, TypedSetAttr,
-    ValueFacts, annotate_typed_function_planned_results, annotate_typed_function_result_demands,
+    CodegenModuleShape, FactStore, FunctionRefcountPlan, InstrCodegen, InstrTyped,
+    LocalEnvResumeBinding, LocalEnvResumeBindingState, LocalEnvResumePoint,
+    LocalEnvResumeStatePrecision, LocalEnvResumeValueSource, LocalRefState, PyExactType,
+    PyObjFacts, RefcountActionKind, RefcountReleaseReason, RefcountSite, RuntimeHelperId,
+    TypedAttrAccessPlan, TypedAttrOwnerRef, TypedBlock, TypedBlockLayoutHint, TypedCall,
+    TypedCallAccessPlan, TypedCallEmissionPlans, TypedCodegenModuleShape, TypedDirectCallArgPlan,
+    TypedDirectCallArgSource, TypedDirectCallGuardTest, TypedDirectCallGuardTestKind,
+    TypedDirectCallableCall, TypedDirectCallableCallGuard, TypedDirectConstructorCallGuard,
+    TypedDirectFunctionCallGuard, TypedDirectMethodCall, TypedDirectMethodCallGuard,
+    TypedExactIntBranchPlan, TypedExactIntPlanSource, TypedExactIntReturnPlan,
+    TypedExactIntScalarThreadPlan, TypedExactListItemAccessPlan, TypedExactListItemPlanSource,
+    TypedGetAttr, TypedGuardedCallableCall, TypedGuardedMethodCall, TypedIndexedFieldGuard,
+    TypedIndexedFieldPlanSource, TypedIndexedGlobalAccessPlan, TypedIndexedGlobalPlanSource,
+    TypedPlannedResult, TypedPyObjectOwnershipPlan, TypedSetAttr, ValueFacts,
+    annotate_typed_function_planned_results, annotate_typed_function_result_demands,
     annotate_typed_function_value_facts, annotate_typed_module_value_facts,
     assign_missing_typed_function_instr_ids, infer_module_value_facts,
     inline_typed_function_direct_call_stores, lower_codegen_function_to_typed,
@@ -3569,16 +3567,6 @@ impl CompiledFunctionHandle {
     pub(crate) fn direct_deopt_table_ptr(&self) -> Result<ObjPtr, String> {
         compiled_direct_deopt_table_ptr(self.handle)
     }
-
-    #[cfg(test)]
-    pub(crate) fn direct_deopt_table(&self) -> Result<Arc<RuntimeJitDeoptTable>, String> {
-        compiled_direct_deopt_table(self.handle)
-    }
-
-    #[cfg(test)]
-    fn raw_handle(&self) -> ObjPtr {
-        self.handle
-    }
 }
 
 pub(crate) fn lookup_precompiled_direct_function_handle(
@@ -4053,16 +4041,6 @@ impl RuntimeJitDeoptRecord {
         self.id.ordinal
     }
 
-    #[cfg(test)]
-    pub(crate) fn resume_point(&self) -> LocalEnvResumePoint {
-        self.resume_point
-    }
-
-    #[cfg(test)]
-    pub(crate) fn precision(&self) -> LocalEnvResumeStatePrecision {
-        self.precision
-    }
-
     pub(crate) fn locals(&self) -> &[LocalEnvResumeBinding] {
         &self.locals
     }
@@ -4250,17 +4228,6 @@ impl RuntimeJitDeoptTable {
             ));
         }
         Ok(record)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn describe_record_ordinal(&self, record_ordinal: i64) -> Result<String, String> {
-        self.record_for_ordinal(record_ordinal)
-            .map(|record| record.describe(self.function_id))
-    }
-
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.points.len()
     }
 
     #[cfg(test)]
@@ -4806,21 +4773,9 @@ fn runtime_jit_deopt_expr_supported(
             runtime_jit_deopt_expr_supported(&delitem.value, support)
                 && runtime_jit_deopt_expr_supported(&delitem.index, support)
         }
-        InstrCodegen::CalleeFunctionId(callee) => {
-            runtime_jit_deopt_expr_supported(&callee.value, support)
-        }
-        InstrCodegen::DirectFunctionIdGuardTest(guard) => {
-            runtime_jit_deopt_expr_supported(&guard.value, support)
-        }
         InstrCodegen::Call(call) => {
             runtime_jit_deopt_call_parts_supported(&call.func, &call.args, &call.keywords, support)
         }
-        InstrCodegen::CallDirect(call) => runtime_jit_deopt_call_parts_supported(
-            &call.callable,
-            &call.args,
-            &call.keywords,
-            support,
-        ),
         InstrCodegen::Store(store) => {
             runtime_jit_deopt_name_location_supported(store.name.location, support)
                 && runtime_jit_deopt_expr_supported(&store.value, support)
@@ -7144,8 +7099,6 @@ enum DirectCallEntryKind {
 struct DirectEdgeStats {
     clif_direct_edges: Cell<usize>,
     function_env_indirect_edges: Cell<usize>,
-    call_direct_missing_target_fallbacks: Cell<usize>,
-    call_direct_unsupported_shape_fallbacks: Cell<usize>,
     guarded_generic_fallback_blocks: Cell<usize>,
     profiled_missing_target_candidates: Cell<usize>,
     profiled_arity_mismatch_candidates: Cell<usize>,
@@ -7163,14 +7116,6 @@ impl DirectEdgeStats {
 
     fn record_function_env_indirect_edge(&self) {
         Self::increment(&self.function_env_indirect_edges);
-    }
-
-    fn record_call_direct_missing_target_fallback(&self) {
-        Self::increment(&self.call_direct_missing_target_fallbacks);
-    }
-
-    fn record_call_direct_unsupported_shape_fallback(&self) {
-        Self::increment(&self.call_direct_unsupported_shape_fallbacks);
     }
 
     fn record_guarded_generic_fallback_block(&self) {
@@ -7192,8 +7137,6 @@ impl DirectEdgeStats {
     fn total(&self) -> usize {
         self.clif_direct_edges.get()
             + self.function_env_indirect_edges.get()
-            + self.call_direct_missing_target_fallbacks.get()
-            + self.call_direct_unsupported_shape_fallbacks.get()
             + self.guarded_generic_fallback_blocks.get()
             + self.profiled_missing_target_candidates.get()
             + self.profiled_arity_mismatch_candidates.get()
@@ -7206,17 +7149,12 @@ impl DirectEdgeStats {
         }
         let clif_direct_edges = self.clif_direct_edges.get();
         let function_env_indirect_edges = self.function_env_indirect_edges.get();
-        let call_direct_missing_target_fallbacks = self.call_direct_missing_target_fallbacks.get();
-        let call_direct_unsupported_shape_fallbacks =
-            self.call_direct_unsupported_shape_fallbacks.get();
         let guarded_generic_fallback_blocks = self.guarded_generic_fallback_blocks.get();
         let profiled_missing_target_candidates = self.profiled_missing_target_candidates.get();
         let profiled_arity_mismatch_candidates = self.profiled_arity_mismatch_candidates.get();
         let profiled_unsupported_shape_candidates =
             self.profiled_unsupported_shape_candidates.get();
         let generic_fallback_edges = function_env_indirect_edges
-            + call_direct_missing_target_fallbacks
-            + call_direct_unsupported_shape_fallbacks
             + guarded_generic_fallback_blocks
             + profiled_missing_target_candidates
             + profiled_arity_mismatch_candidates
@@ -7229,8 +7167,6 @@ impl DirectEdgeStats {
             clif_direct_edges,
             function_env_indirect_edges,
             generic_fallback_edges,
-            call_direct_missing_target_fallbacks,
-            call_direct_unsupported_shape_fallbacks,
             guarded_generic_fallback_blocks,
             profiled_missing_target_candidates,
             profiled_arity_mismatch_candidates,
@@ -7250,23 +7186,6 @@ fn direct_call_target_function<'a>(
         .find(|function| function.function_id == function_id)
         .or_else(|| ctx.direct_call_target_functions.get(&function_id))
         .filter(|function| function.execution_mode() == FunctionExecutionMode::Jit)
-}
-
-fn direct_call_positional_arg_count(args: &[CallArgPositional<InstrCodegen>]) -> usize {
-    args.iter()
-        .filter(|arg| matches!(arg, CallArgPositional::Positional(_)))
-        .count()
-}
-
-fn direct_call_has_starred_arguments(
-    args: &[CallArgPositional<InstrCodegen>],
-    keywords: &[CallArgKeyword<InstrCodegen>],
-) -> bool {
-    args.iter()
-        .any(|arg| matches!(arg, CallArgPositional::Starred(_)))
-        || keywords
-            .iter()
-            .any(|keyword| matches!(keyword, CallArgKeyword::Starred(_)))
 }
 
 fn plan_direct_call_args_for_target<P: ModuleShape>(
@@ -11112,28 +11031,6 @@ fn emit_branch_index_i64(
     pyobject_to_i64_ref: ir::FuncRef,
 ) -> ir::Value {
     match expr {
-        InstrCodegen::CalleeFunctionId(op) => {
-            let callable_is_borrowed = codegen_expr_pyobject_input_is_borrowed_from_local_env(
-                op.value.as_ref(),
-                local_env,
-                ctx,
-            );
-            let callable = emit_codegen_expr_with_local_env(
-                fb,
-                op.value.as_ref(),
-                local_env,
-                ctx,
-                callable_is_borrowed,
-                codegen_env,
-                func_imports,
-            );
-            let callee_id = emit_callee_function_id_checked(fb, callable, ctx, codegen_env);
-            if !callable_is_borrowed {
-                fb.ins()
-                    .call(ctx.decref_ref, &[ctx.consts.thread_state_value, callable]);
-            }
-            callee_id
-        }
         _ => {
             let index_obj = emit_codegen_expr_with_local_env(
                 fb,
@@ -11151,33 +11048,6 @@ fn emit_branch_index_i64(
             index_i64
         }
     }
-}
-
-fn module_constant_string_value<'a>(
-    module: &'a BlockPyModule<impl ModuleShape<ModuleConstant = InstrResolved>>,
-    constant_index: u32,
-) -> Option<&'a str> {
-    let InstrResolved::Literal(literal) = module.module_constants.get(constant_index as usize)?
-    else {
-        return None;
-    };
-    let Literal::StringLiteral(literal) = literal.as_literal() else {
-        return None;
-    };
-    Some(literal.value.as_str())
-}
-
-pub(super) fn codegen_constant_string_value<'a>(
-    module: &'a BlockPyModule<impl ModuleShape<ModuleConstant = InstrResolved>>,
-    expr: &InstrCodegen,
-) -> Option<&'a str> {
-    let InstrCodegen::Load(load) = expr else {
-        return None;
-    };
-    let NameLocation::Constant(constant_index) = load.name.location else {
-        return None;
-    };
-    module_constant_string_value(module, constant_index)
 }
 
 fn annotate_typed_attr_accesses(
@@ -11779,25 +11649,9 @@ fn call_site_profiled_targets<'a>(
 }
 
 fn collect_call_direct_targets(
-    function: &BlockPyFunction<CodegenModuleShape>,
+    _function: &BlockPyFunction<CodegenModuleShape>,
 ) -> HashSet<RuntimeFunctionId> {
-    struct CallDirectTargetCollector<'a> {
-        out: &'a mut HashSet<RuntimeFunctionId>,
-    }
-
-    impl Visit<InstrCodegen> for CallDirectTargetCollector<'_> {
-        fn visit_instr(&mut self, expr: &InstrCodegen) {
-            if let InstrCodegen::CallDirect(call) = expr {
-                self.out.insert(call.function_id);
-            }
-            expr.visit_children(self);
-        }
-    }
-
-    let mut out = HashSet::new();
-    let mut collector = CallDirectTargetCollector { out: &mut out };
-    collector.visit_fn(function);
-    out
+    HashSet::new()
 }
 
 fn collect_typed_call_direct_targets(
@@ -14187,145 +14041,6 @@ fn emit_typed_direct_method_resolved_with_args_from_local_env(
         ctx,
         codegen_env,
     ))
-}
-
-fn emit_call_direct_expr_with_local_env(
-    fb: &mut FunctionBuilder<'_>,
-    call: &soac_core::block_py::CallDirect<InstrCodegen>,
-    local_env: &mut LocalEnv,
-    ctx: &JitEmitCtx<'_>,
-    codegen_env: &mut impl JitCodegenEnv,
-    func_imports: &mut FuncBuildImports<'_>,
-) -> ir::Value {
-    let fallback_call = || {
-        InstrCodegen::Call(
-            soac_core::block_py::Call::new(
-                (*call.callable).clone(),
-                call.args.clone(),
-                call.keywords.clone(),
-            )
-            .with_meta(call.meta()),
-        )
-    };
-
-    let Some(target_function) = direct_call_target_function(ctx, call.function_id) else {
-        ctx.direct_edge_stats
-            .record_call_direct_missing_target_fallback();
-        let fallback = fallback_call();
-        return emit_codegen_expr_with_local_env(
-            fb,
-            &fallback,
-            local_env,
-            ctx,
-            false,
-            codegen_env,
-            func_imports,
-        );
-    };
-    if target_function.names.fn_name == "__init__"
-        && !call_direct_callable_is_explicit_init_attr(call, ctx)
-    {
-        let fallback = fallback_call();
-        let InstrCodegen::Call(fallback_call) = &fallback else {
-            unreachable!("CallDirect fallback should be a generic Call");
-        };
-        let profiled_targets = [call.function_id];
-        if let Some(value) = emit_codegen_simple_call_with_local_env(
-            fb,
-            fallback_call,
-            local_env,
-            ctx,
-            Some(&profiled_targets),
-            None,
-            codegen_env,
-            func_imports,
-        ) {
-            return value;
-        }
-        ctx.direct_edge_stats
-            .record_call_direct_unsupported_shape_fallback();
-        return emit_codegen_expr_with_local_env(
-            fb,
-            &fallback,
-            local_env,
-            ctx,
-            false,
-            codegen_env,
-            func_imports,
-        );
-    }
-
-    let arg_plan = match validate_direct_call_compatibility(
-        target_function,
-        ctx.direct_call_functions,
-        direct_call_positional_arg_count(&call.args),
-        0,
-        direct_call_has_starred_arguments(&call.args, &call.keywords),
-        !call.keywords.is_empty(),
-    ) {
-        Ok(arg_plan) => arg_plan,
-        Err(_) => {
-            ctx.direct_edge_stats
-                .record_call_direct_unsupported_shape_fallback();
-            let fallback = fallback_call();
-            return emit_codegen_expr_with_local_env(
-                fb,
-                &fallback,
-                local_env,
-                ctx,
-                false,
-                codegen_env,
-                func_imports,
-            );
-        }
-    };
-
-    let callable_is_borrowed = codegen_expr_pyobject_input_is_borrowed_from_local_env(
-        call.callable.as_ref(),
-        local_env,
-        ctx,
-    );
-    let callable = emit_codegen_expr_with_local_env(
-        fb,
-        call.callable.as_ref(),
-        local_env,
-        ctx,
-        callable_is_borrowed,
-        codegen_env,
-        func_imports,
-    );
-    let args = call
-        .args
-        .iter()
-        .map(|arg| match arg {
-            CallArgPositional::Positional(expr) => expr,
-            CallArgPositional::Starred(_) => {
-                unreachable!("starred direct args should have used generic fallback")
-            }
-        })
-        .collect::<Vec<_>>();
-    emit_direct_call_resolved_with_arg_plan_from_local_env(
-        fb,
-        callable,
-        callable_is_borrowed,
-        args.as_slice(),
-        &arg_plan,
-        target_function,
-        local_env,
-        ctx,
-        codegen_env,
-        func_imports,
-    )
-}
-
-fn call_direct_callable_is_explicit_init_attr(
-    call: &soac_core::block_py::CallDirect<InstrCodegen>,
-    ctx: &JitEmitCtx<'_>,
-) -> bool {
-    let InstrCodegen::GetAttr(getattr) = call.callable.as_ref() else {
-        return false;
-    };
-    codegen_constant_string_value(ctx.module, getattr.attr.as_ref()) == Some("__init__")
 }
 
 fn abrupt_kind_tag(kind: AbruptKind) -> i64 {
@@ -17277,34 +16992,6 @@ fn emit_codegen_expr_with_local_env(
             func_imports,
         );
     }
-    if let InstrCodegen::CalleeFunctionId(op) = expr {
-        assert!(
-            !borrowed,
-            "callee_function_id must not request a borrowed result"
-        );
-        let callable_is_borrowed = codegen_expr_pyobject_input_is_borrowed_from_local_env(
-            op.value.as_ref(),
-            local_env,
-            emit_ctx,
-        );
-        let callable = emit_codegen_expr_with_local_env(
-            fb,
-            op.value.as_ref(),
-            local_env,
-            emit_ctx,
-            callable_is_borrowed,
-            codegen_env,
-            func_imports,
-        );
-        let callee_id = emit_callee_function_id_checked(fb, callable, emit_ctx, codegen_env);
-        if !callable_is_borrowed {
-            fb.ins().call(
-                emit_ctx.decref_ref,
-                &[emit_ctx.consts.thread_state_value, callable],
-            );
-        }
-        return callee_id;
-    }
     if let InstrCodegen::CellRef(op) = expr {
         assert!(
             !borrowed,
@@ -17424,20 +17111,6 @@ fn emit_codegen_expr_with_local_env(
             raw_cell,
             op.quietly,
             &mut intrinsic_state,
-        );
-    }
-    if let InstrCodegen::CallDirect(call) = expr {
-        assert!(
-            !borrowed,
-            "codegen direct-call expression must not use borrowed result"
-        );
-        return emit_call_direct_expr_with_local_env(
-            fb,
-            call,
-            local_env,
-            emit_ctx,
-            codegen_env,
-            func_imports,
         );
     }
     if let InstrCodegen::Call(call) = expr {
@@ -19272,26 +18945,6 @@ fn emit_typed_codegen_direct_method_call_result_with_local_env(
     ))
 }
 
-fn emit_codegen_call_direct_result_with_local_env(
-    fb: &mut FunctionBuilder<'_>,
-    call: &soac_core::block_py::CallDirect<InstrCodegen>,
-    local_env: &mut LocalEnv,
-    emit_ctx: &JitEmitCtx<'_>,
-    demand: ResultDemand,
-    codegen_env: &mut impl JitCodegenEnv,
-    func_imports: &mut FuncBuildImports<'_>,
-) -> EmitResult {
-    let value = emit_call_direct_expr_with_local_env(
-        fb,
-        call,
-        local_env,
-        emit_ctx,
-        codegen_env,
-        func_imports,
-    );
-    emit_owned_pyobject_result_for_demand(fb, value, PyObjFacts::unknown(), emit_ctx, demand)
-}
-
 fn emit_codegen_stmt_result_with_local_env(
     fb: &mut FunctionBuilder<'_>,
     expr: &InstrCodegen,
@@ -19347,17 +19000,6 @@ fn emit_codegen_stmt_result_with_local_env(
             ) {
                 return Ok(result);
             }
-        }
-        InstrCodegen::CallDirect(call) => {
-            return Ok(emit_codegen_call_direct_result_with_local_env(
-                fb,
-                call,
-                local_env,
-                emit_ctx,
-                demand,
-                codegen_env,
-                func_imports,
-            ));
         }
         InstrCodegen::Call(call) => {
             if let Some(result) = emit_codegen_call_result_with_local_env(
@@ -19448,37 +19090,6 @@ fn emit_typed_direct_call_guard_test_value_with_local_env(
         }
     };
 
-    if ownership.is_owned() {
-        emit_release_owned_pyobject(fb, raw_value, Some(facts), emit_ctx);
-    }
-    Ok(guard)
-}
-
-fn emit_codegen_direct_function_id_guard_test_value_with_local_env(
-    fb: &mut FunctionBuilder<'_>,
-    op: &DirectFunctionIdGuardTest<InstrCodegen>,
-    local_env: &mut LocalEnv,
-    emit_ctx: &JitEmitCtx<'_>,
-    codegen_env: &mut impl JitCodegenEnv,
-    func_imports: &mut FuncBuildImports<'_>,
-) -> Result<SoacValue, String> {
-    let value_is_borrowed = codegen_expr_pyobject_input_is_borrowed_from_local_env(
-        op.value.as_ref(),
-        local_env,
-        emit_ctx,
-    );
-    let value = emit_codegen_expr_value_with_local_env(
-        fb,
-        op.value.as_ref(),
-        local_env,
-        emit_ctx,
-        value_is_borrowed,
-        codegen_env,
-        func_imports,
-    );
-    let (raw_value, ownership, facts) = value.expect_pyobject("direct function-id guard input");
-    let guard =
-        emit_exact_function_id_match_bool01(fb, raw_value, op.function_id, emit_ctx, codegen_env)?;
     if ownership.is_owned() {
         emit_release_owned_pyobject(fb, raw_value, Some(facts), emit_ctx);
     }
@@ -22378,34 +21989,19 @@ fn emit_codegen_term(
         }
         BlockTerm::IfTerm(if_term) => {
             let test_instr_id = if_term.test.try_semantic_instr_id();
-            let truth_i32 = match &if_term.test {
-                InstrCodegen::DirectFunctionIdGuardTest(guard) => {
-                    emit_codegen_direct_function_id_guard_test_value_with_local_env(
-                        fb,
-                        guard,
-                        local_env,
-                        emit_ctx,
-                        codegen_env,
-                        func_imports,
-                    )?
-                    .expect_i32_bool01("direct function-id guard")
-                }
-                _ => {
-                    let is_true_ref =
-                        func_imports.get(codegen_env, &mut fb.func, &DP_JIT_IS_TRUE_IMPORT)?;
-                    let test_value = emit_codegen_expr_value_with_local_env(
-                        fb,
-                        &if_term.test,
-                        local_env,
-                        emit_ctx,
-                        false,
-                        codegen_env,
-                        func_imports,
-                    );
-                    let truth = emit_truthy_from_owned_value(fb, test_value, is_true_ref, emit_ctx);
-                    truth.expect_i32_bool01("if condition truthiness")
-                }
-            };
+            let is_true_ref =
+                func_imports.get(codegen_env, &mut fb.func, &DP_JIT_IS_TRUE_IMPORT)?;
+            let test_value = emit_codegen_expr_value_with_local_env(
+                fb,
+                &if_term.test,
+                local_env,
+                emit_ctx,
+                false,
+                codegen_env,
+                func_imports,
+            );
+            let truth = emit_truthy_from_owned_value(fb, test_value, is_true_ref, emit_ctx);
+            let truth_i32 = truth.expect_i32_bool01("if condition truthiness");
             emit_codegen_if_truth_i32(
                 fb,
                 source_label,
@@ -28047,21 +27643,6 @@ pub(crate) fn compiled_direct_deopt_table_ptr(compiled_handle: ObjPtr) -> Result
         .direct_deopt_table
         .as_ref()
         .map(|table| Arc::as_ptr(table) as ObjPtr)
-        .ok_or_else(|| "compiled direct handle does not carry a deopt table".to_string())
-}
-
-#[cfg(test)]
-fn compiled_direct_deopt_table(
-    compiled_handle: ObjPtr,
-) -> Result<Arc<RuntimeJitDeoptTable>, String> {
-    if compiled_handle.is_null() {
-        return Err("invalid null compiled handle for direct deopt table".to_string());
-    }
-    let compiled = unsafe { &*(compiled_handle as *const CompiledSpecializedRunner) };
-    compiled
-        .direct_deopt_table
-        .as_ref()
-        .cloned()
         .ok_or_else(|| "compiled direct handle does not carry a deopt table".to_string())
 }
 

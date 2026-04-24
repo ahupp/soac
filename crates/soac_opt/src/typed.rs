@@ -20,9 +20,7 @@ use soac_core::block_py::{
     WithMeta, define_instr, define_ruff_instr,
 };
 #[allow(unused_imports)]
-use soac_lowering::passes::{
-    CodegenModuleShape, DirectFunctionIdGuardTest, InstrCodegen, InstrResolved,
-};
+use soac_lowering::passes::{CodegenModuleShape, InstrCodegen, InstrResolved};
 use soac_macros::{DelegateMatchDefault, enum_broadcast};
 use std::collections::{HashMap, HashSet};
 
@@ -1499,25 +1497,9 @@ impl MapInstr<InstrCodegen, InstrTyped> for CodegenToTyped {
             InstrCodegen::BinOp(op) => InstrTyped::BinOp(op.map_children(self)),
             InstrCodegen::Tuple(op) => InstrTyped::Tuple(op.map_children(self)),
             InstrCodegen::UnaryOp(op) => InstrTyped::UnaryOp(op.map_children(self)),
-            InstrCodegen::CalleeFunctionId(op) => {
-                InstrTyped::CalleeFunctionId(op.map_children(self))
-            }
-            InstrCodegen::DirectFunctionIdGuardTest(op) => {
-                let meta = op.meta();
-                InstrTyped::DirectCallGuardTest(
-                    TypedDirectCallGuardTest::new(
-                        self.map_instr(*op.value),
-                        TypedDirectCallGuardTestKind::RuntimeFunctionId {
-                            function_id: op.function_id,
-                        },
-                    )
-                    .with_meta(meta),
-                )
-            }
             InstrCodegen::Call(op) => {
                 InstrTyped::CallTyped(TypedCall::from_legacy(op.map_children(self)))
             }
-            InstrCodegen::CallDirect(op) => InstrTyped::CallDirect(op.map_children(self)),
             InstrCodegen::GetAttr(op) => {
                 InstrTyped::GetAttrTyped(TypedGetAttr::from_legacy(op.map_children(self)))
             }
@@ -3288,23 +3270,16 @@ impl TryMapInstr<InstrTyped, InstrCodegen, String> for TypedToCodegen {
             InstrTyped::BinOp(op) => InstrCodegen::BinOp(op.try_map_children(self)?),
             InstrTyped::Tuple(op) => InstrCodegen::Tuple(op.try_map_children(self)?),
             InstrTyped::UnaryOp(op) => InstrCodegen::UnaryOp(op.try_map_children(self)?),
-            InstrTyped::CalleeFunctionId(op) => {
-                InstrCodegen::CalleeFunctionId(op.try_map_children(self)?)
+            InstrTyped::CalleeFunctionId(_) => {
+                return Err("typed callee function id requires typed codegen emission".to_string());
             }
-            InstrTyped::DirectCallGuardTest(op) => {
-                let meta = op.meta();
-                match op.kind {
-                    TypedDirectCallGuardTestKind::RuntimeFunctionId { function_id } => {
-                        InstrCodegen::DirectFunctionIdGuardTest(
-                            DirectFunctionIdGuardTest::new(
-                                self.try_map_instr(*op.value)?,
-                                function_id,
-                            )
-                            .with_meta(meta),
-                        )
-                    }
+            InstrTyped::DirectCallGuardTest(op) => match op.kind {
+                TypedDirectCallGuardTestKind::RuntimeFunctionId { .. } => {
+                    return Err(
+                        "typed direct-call guard requires typed codegen emission".to_string()
+                    );
                 }
-            }
+            },
             InstrTyped::CallTyped(op) => {
                 InstrCodegen::Call(op.try_map_children(self)?.into_legacy())
             }
@@ -3324,7 +3299,9 @@ impl TryMapInstr<InstrTyped, InstrCodegen, String> for TypedToCodegen {
             InstrTyped::DirectMethodCallTyped(_) => {
                 return Err("typed direct method call requires typed codegen emission".to_string());
             }
-            InstrTyped::CallDirect(op) => InstrCodegen::CallDirect(op.try_map_children(self)?),
+            InstrTyped::CallDirect(_) => {
+                return Err("typed direct call requires typed codegen emission".to_string());
+            }
             InstrTyped::GetAttrTyped(op) => {
                 InstrCodegen::GetAttr(op.try_map_children(self)?.into_legacy())
             }
@@ -4287,11 +4264,8 @@ def caller(a):\n    return add(a)\n",
             counter.loads + counter.direct_call_guard_tests
         );
         assert!(
-            matches!(
-                try_lower_typed_instr_to_codegen_legacy(guard),
-                Ok(InstrCodegen::DirectFunctionIdGuardTest(_))
-            ),
-            "function-id direct-call guards should lower to the codegen guard representation"
+            try_lower_typed_instr_to_codegen_legacy(guard).is_err(),
+            "function-id direct-call guards should not silently lower through the legacy adapter"
         );
     }
 

@@ -206,11 +206,8 @@ fn instr_codegen_kind(instr: &InstrCodegen) -> &'static str {
     match instr {
         InstrCodegen::BinOp(_) => "BinOp",
         InstrCodegen::UnaryOp(_) => "UnaryOp",
-        InstrCodegen::CalleeFunctionId(_) => "CalleeFunctionId",
-        InstrCodegen::DirectFunctionIdGuardTest(_) => "DirectFunctionIdGuardTest",
         InstrCodegen::Tuple(_) => "Tuple",
         InstrCodegen::Call(_) => "Call",
-        InstrCodegen::CallDirect(_) => "CallDirect",
         InstrCodegen::GetAttr(_) => "GetAttr",
         InstrCodegen::SetAttr(_) => "SetAttr",
         InstrCodegen::GetItem(_) => "GetItem",
@@ -338,23 +335,9 @@ impl RegionBuilder {
                 source: instr.try_semantic_instr_id(),
                 kind: "UnaryOp",
             }),
-            InstrCodegen::CalleeFunctionId(_) => Err(RegionExtractionError::UnsupportedInstr {
-                source: instr.try_semantic_instr_id(),
-                kind: "CalleeFunctionId",
-            }),
-            InstrCodegen::DirectFunctionIdGuardTest(_) => {
-                Err(RegionExtractionError::UnsupportedInstr {
-                    source: instr.try_semantic_instr_id(),
-                    kind: "DirectFunctionIdGuardTest",
-                })
-            }
             InstrCodegen::Call(_) => Err(RegionExtractionError::UnsupportedInstr {
                 source: instr.try_semantic_instr_id(),
                 kind: "Call",
-            }),
-            InstrCodegen::CallDirect(_) => Err(RegionExtractionError::UnsupportedInstr {
-                source: instr.try_semantic_instr_id(),
-                kind: "CallDirect",
             }),
             InstrCodegen::GetAttr(_) => Err(RegionExtractionError::UnsupportedInstr {
                 source: instr.try_semantic_instr_id(),

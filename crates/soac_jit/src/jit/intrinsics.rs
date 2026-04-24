@@ -1293,11 +1293,8 @@ pub(super) fn emit_operation<'fb>(
     state: &mut impl OperationEmitState<'fb, InstrCodegen>,
 ) -> Option<ir::Value> {
     match operation {
-        InstrCodegen::CalleeFunctionId(_) => None,
-        InstrCodegen::DirectFunctionIdGuardTest(_) => None,
         InstrCodegen::Tuple(_) => None,
         InstrCodegen::Call(_) => None,
-        InstrCodegen::CallDirect(_) => None,
         InstrCodegen::BinOp(op) => Some(emit_counted_binop(op, state)),
         InstrCodegen::UnaryOp(op) => Some(emit_unary_op(op.kind, state, &[op.operand.as_ref()])),
         InstrCodegen::GetAttr(op) => {

@@ -5,7 +5,6 @@ pub(crate) mod block_py {
     pub use soac_core::block_py::*;
 }
 pub mod call_emission_v3;
-pub mod call_inlining_v3;
 pub mod emit_v3;
 pub mod evidence_v3;
 pub mod operator_specialization;

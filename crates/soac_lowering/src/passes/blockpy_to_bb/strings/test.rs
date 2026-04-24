@@ -65,12 +65,6 @@ fn collect_helper_like_names_in_expr(out: &mut Vec<String>, expr: &InstrCodegen)
     }
 
     match expr {
-        InstrCodegen::CalleeFunctionId(operation) => {
-            operation.visit_children(&mut HelperNameVisitor { out });
-        }
-        InstrCodegen::DirectFunctionIdGuardTest(operation) => {
-            operation.visit_children(&mut HelperNameVisitor { out });
-        }
         InstrCodegen::GetAttr(operation) => {
             out.push("__dp_getattr".to_string());
             operation.visit_children(&mut HelperNameVisitor { out });
@@ -91,9 +85,6 @@ fn collect_helper_like_names_in_expr(out: &mut Vec<String>, expr: &InstrCodegen)
             if let InstrCodegen::Load(op) = &*operation.func {
                 out.push(op.name.id_str().to_string());
             }
-            operation.visit_children(&mut HelperNameVisitor { out });
-        }
-        InstrCodegen::CallDirect(operation) => {
             operation.visit_children(&mut HelperNameVisitor { out });
         }
         InstrCodegen::BinOp(operation) => {

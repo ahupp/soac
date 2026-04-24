@@ -445,45 +445,28 @@ owner/type guard payload is not yet a static mechanical JIT input.
 - Residual call nodes that were not selected by the plan use the normal generic
   typed call lowering.
 
-### Explicit CFG Representation
+### Explicit Typed Representation
 
-- The BlockPy codegen IR has a first-class `DirectFunctionIdGuardTest`
-  expression. It evaluates a callable once, compares the callable's SOAC
-  `FunctionId` metadata against a profiled target, and produces a boolean value
-  for an ordinary `IfTerm`.
-- `rewrite_profiled_function_call_store_sites`, at
-  `crates/soac_lowering/src/passes/direct_call_transform.rs`, rewrites simple
-  `Store(name, Call(...))` sites into explicit BlockPy CFG:
-  - evaluate the callable into one generated compiler temp
-  - evaluate each positional argument once, left-to-right, into generated
-    compiler temps before the guard
-  - test each hot `FunctionId` with `DirectFunctionIdGuardTest`
-  - emit a hot arm that stores `CallDirect(temp, target, temp_args)` into the
-    original destination
-  - emit a fallback arm that stores the original generic `Call(temp, temp_args)`
-    result into the original destination
-- The typed module-level rewrite is fed by v3 emitted inline direct-call plans.
-  When no v3 plan owns the site, the original generic call remains in
+- Direct-call specialization is represented on `InstrTyped`, not on
+  `InstrCodegen`. The typed rewrite evaluates the callable and arguments once,
+  emits typed guard tests for hot targets, emits typed direct-call or inline
+  bodies for selected hot arms, and leaves an explicit generic typed fallback
+  for the original call shape.
+- When no v3 plan owns the site, the original generic call remains in
   `InstrTyped`.
-  - delete the compiler temps before joining the continuation block
 - The rewrite only consumes profiled targets that match the ordinary direct-call
-  / BlockPy inliner shape: positional-only-or-normal parameters, no keywords,
-  no starred args, and positional inputs that can bind through the direct-entry
+  / typed inliner shape: positional-only-or-normal parameters, no keywords, no
+  starred args, and positional inputs that can bind through the direct-entry
   argument plan. Omitted trailing/defaulted parameters are passed as default
   sentinels and resolved by the callee's default-resolving direct entry.
-  Method and constructor-shaped targets, including `__init__`, are left as
-  generic calls until their static guard payload is represented in v3.
 - In apply/verify mode, JIT module planning consumes the cached pre-opt module
   plus `mod.optv3`. The offline planner has already made the call-body
   decisions; typed planning applies those decisions to `InstrTyped`, and codegen
   mechanically emits the resulting typed shapes.
-- JIT codegen has a direct boolean lowering for `IfTerm` tests that are
-  `DirectFunctionIdGuardTest`, so the guard does not round-trip through Python
-  truthiness. The deopt interpreter also supports the guard expression for
-  continuation paths.
-- This representation is intended to make profiled direct calls visible before
-  BlockPy inlining and scalar replacement, rather than hiding the guard/direct
-  call decision inside late codegen.
+- JIT codegen has direct boolean lowering for typed direct-call guard tests, so
+  those guards do not round-trip through Python truthiness. Replay/deopt support
+  consumes the typed metadata selected by the plan rather than legacy codegen
+  direct-call operations.
 
 ### Limitations / Soundness / Extensions
 

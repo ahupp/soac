@@ -530,12 +530,6 @@ impl ModuleConstantCollector {
     fn collect_expr(&mut self, expr: &InstrCodegen) {
         match expr {
             InstrCodegen::IncrementCounter(_) => {}
-            InstrCodegen::CalleeFunctionId(op) => {
-                self.collect_expr(op.value.as_ref());
-            }
-            InstrCodegen::DirectFunctionIdGuardTest(op) => {
-                self.collect_expr(op.value.as_ref());
-            }
             InstrCodegen::Call(call) => {
                 if let Some(const_bytes) = self.string_constant_bytes_for_specialized_codegen(expr)
                 {
@@ -546,18 +540,6 @@ impl ModuleConstantCollector {
                         .intern_unicode_bytes(delete_name_bytes.as_slice());
                 }
                 self.collect_expr(call.func.as_ref());
-                for arg in &call.args {
-                    self.collect_expr(arg.expr());
-                }
-                for keyword in &call.keywords {
-                    if let CallArgKeyword::Named { arg, .. } = keyword {
-                        self.constants.intern_unicode_bytes(arg.as_str().as_bytes());
-                    }
-                    self.collect_expr(keyword.expr());
-                }
-            }
-            InstrCodegen::CallDirect(call) => {
-                self.collect_expr(call.callable.as_ref());
                 for arg in &call.args {
                     self.collect_expr(arg.expr());
                 }

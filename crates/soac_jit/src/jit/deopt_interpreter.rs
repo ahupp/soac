@@ -13,11 +13,11 @@ use pyo3::types::PyAny;
 use pyo3::{Bound, Python};
 use soac_core::block_py::{
     AbruptKind, BinOp, BinOpKind, Block, BlockArg, BlockEdge, BlockLabel, BlockTerm,
-    CallArgKeyword, CallArgPositional, CalleeFunctionId, CellLocation, LocalLocation, NameLocation,
-    ParamKind, RuntimeName, UnaryOp, UnaryOpKind,
+    CallArgKeyword, CallArgPositional, CellLocation, LocalLocation, NameLocation, ParamKind,
+    RuntimeName, UnaryOp, UnaryOpKind,
 };
 use soac_core::block_py::{BlockPyFunction, FunctionKind};
-use soac_lowering::passes::{CodegenModuleShape, DirectFunctionIdGuardTest, InstrCodegen};
+use soac_lowering::passes::{CodegenModuleShape, InstrCodegen};
 use std::ffi::{c_int, c_void};
 use std::ptr;
 use std::sync::Arc;
@@ -36,9 +36,6 @@ fn block_for_label<'a>(
 }
 
 unsafe extern "C" {
-    static mut PyMethod_Type: ffi::PyTypeObject;
-
-    fn PyMethod_Function(meth: *mut ffi::PyObject) -> *mut ffi::PyObject;
     fn PyCell_New(obj: *mut ffi::PyObject) -> *mut ffi::PyObject;
     fn PyErr_SetRaisedException(exc: *mut ffi::PyObject);
     fn _PyDict_MergeEx(
@@ -910,15 +907,8 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
             InstrCodegen::SetAttr(setattr) => unsafe { self.execute_setattr_owned(setattr) },
             InstrCodegen::SetItem(setitem) => unsafe { self.execute_setitem_owned(setitem) },
             InstrCodegen::DelItem(delitem) => unsafe { self.execute_delitem_owned(delitem) },
-            InstrCodegen::CalleeFunctionId(callee) => unsafe {
-                self.execute_callee_function_id_owned(callee)
-            },
-            InstrCodegen::DirectFunctionIdGuardTest(guard) => unsafe {
-                self.execute_direct_function_id_guard_test_owned(guard)
-            },
             InstrCodegen::Tuple(tuple) => unsafe { self.execute_tuple_owned(tuple) },
             InstrCodegen::Call(call) => unsafe { self.execute_call_owned(call) },
-            InstrCodegen::CallDirect(call) => unsafe { self.execute_call_direct_owned(call) },
             InstrCodegen::Store(store) => unsafe { self.execute_store_owned(store) },
             InstrCodegen::Del(del) => unsafe { self.execute_del_owned(del) },
             InstrCodegen::IncrementCounter(_) => Ok(owned_none()),
@@ -1405,51 +1395,6 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
             }
         }
         Ok(tuple.cast())
-    }
-
-    #[cold]
-    unsafe fn execute_call_direct_owned(
-        &mut self,
-        call: &soac_core::block_py::CallDirect<InstrCodegen>,
-    ) -> Result<ObjPtr, String> {
-        unsafe { self.execute_call_parts_owned(&call.callable, &call.args, &call.keywords) }
-    }
-
-    #[cold]
-    unsafe fn execute_callee_function_id_owned(
-        &mut self,
-        callee: &CalleeFunctionId<InstrCodegen>,
-    ) -> Result<ObjPtr, String> {
-        let callable = unsafe { self.execute_expr_owned(&callee.value)? };
-        if callable.is_null() {
-            return Ok(ptr::null_mut());
-        }
-        let packed = unsafe { callable_soac_function_id(callable.cast::<ffi::PyObject>()) };
-        unsafe {
-            ffi::Py_DECREF(callable.cast::<ffi::PyObject>());
-        }
-        Ok(unsafe { ffi::PyLong_FromLongLong(packed as i64).cast() })
-    }
-
-    #[cold]
-    unsafe fn execute_direct_function_id_guard_test_owned(
-        &mut self,
-        guard: &DirectFunctionIdGuardTest<InstrCodegen>,
-    ) -> Result<ObjPtr, String> {
-        let callable = unsafe { self.execute_expr_owned(&guard.value)? };
-        if callable.is_null() {
-            return Ok(ptr::null_mut());
-        }
-        let packed = unsafe { callable_soac_function_id(callable.cast::<ffi::PyObject>()) };
-        unsafe {
-            ffi::Py_DECREF(callable.cast::<ffi::PyObject>());
-        }
-        Ok(unsafe {
-            ffi::PyBool_FromLong(
-                (packed == guard.function_id.to_packed_runtime_u64()) as libc::c_long,
-            )
-            .cast()
-        })
     }
 
     #[cold]
@@ -2209,29 +2154,6 @@ unsafe fn set_raise_exception_owned(exc: ObjPtr) {
             );
         }
     }
-}
-
-unsafe fn callable_soac_function_id(callable: *mut ffi::PyObject) -> u64 {
-    unsafe {
-        if ffi::PyFunction_Check(callable) != 0 {
-            return crate::PyFunction_GetSoacFunctionId(callable);
-        }
-
-        if ffi::Py_TYPE(callable) == ptr::addr_of_mut!(PyMethod_Type) {
-            let function = PyMethod_Function(callable);
-            if !function.is_null() && ffi::PyFunction_Check(function) != 0 {
-                return crate::PyFunction_GetSoacFunctionId(function);
-            }
-        }
-
-        if ffi::PyType_Check(callable) != 0 {
-            let type_obj = callable.cast::<ffi::PyTypeObject>();
-            if ((*type_obj).tp_flags & ffi::Py_TPFLAGS_HEAPTYPE as std::ffi::c_ulong) != 0 {
-                return crate::PyType_GetSoacFunctionId(callable);
-            }
-        }
-    }
-    0
 }
 
 fn is_runtime_name_load(expr: &InstrCodegen, runtime_name: RuntimeName) -> bool {

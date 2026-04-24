@@ -1828,10 +1828,7 @@ mod tests {
         module: ModuleContentId,
         function: BlockPyFunction<CodegenModuleShape>,
     ) -> DirectCallTargetEntry {
-        DirectCallTargetEntry {
-            module,
-            function,
-        }
+        DirectCallTargetEntry { module, function }
     }
 
     fn unique_counter_path_v3() -> std::path::PathBuf {

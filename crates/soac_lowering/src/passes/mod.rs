@@ -11,20 +11,19 @@ mod name_binding;
 pub(crate) mod ruff_to_blockpy;
 
 use crate::block_py::{
-    cfg::relabel_blockpy_blocks_dense, define_instr, runtime_name_load, Await, BinOp,
-    BlockPyModule, Call, CallArgKeyword, CallArgPositional, CallDirect, CalleeFunctionId, CellRef,
-    CellRefForName, ChildVisitable, Del, DelItem, ExprAttribute, ExprBoolOp, ExprBooleanLiteral,
-    ExprBytesLiteral, ExprCompare, ExprDict, ExprDictComp, ExprEllipsisLiteral, ExprFString,
-    ExprGenerator, ExprIf, ExprIpyEscapeCommand, ExprLambda, ExprList, ExprListComp, ExprName,
-    ExprNamed, ExprNoneLiteral, ExprNumberLiteral, ExprSet, ExprSetComp, ExprSlice, ExprStarred,
-    ExprStringLiteral, ExprSubscript, ExprTString, ExprTuple, GetAttr, GetItem, HasMeta,
-    IncrementCounter, Instr, InstrWithConstantNone, LiteralValue, Load, MakeCell, MakeFunction,
-    MakeFunctionWithClosure, MapInstr, Mappable, Meta, ModuleShape, NameLike, ResolvedName,
-    RuntimeFunctionId, SetAttr, SetItem, StmtAnnAssign, StmtAssert, StmtAssign, StmtAugAssign,
-    StmtBreak, StmtClassDef, StmtContinue, StmtDelete, StmtExpr, StmtFor, StmtFunctionDef,
-    StmtGlobal, StmtIf, StmtImport, StmtImportFrom, StmtIpyEscapeCommand, StmtMatch, StmtNonlocal,
-    StmtPass, StmtRaise, StmtReturn, StmtTry, StmtTypeAlias, StmtWhile, StmtWith, Store,
-    TryMapInstr, Tuple, UnaryOp, UnresolvedName, WithMeta, Yield, YieldFrom,
+    cfg::relabel_blockpy_blocks_dense, runtime_name_load, Await, BinOp, BlockPyModule, Call,
+    CallArgKeyword, CallArgPositional, CellRef, CellRefForName, ChildVisitable, Del, DelItem,
+    ExprAttribute, ExprBoolOp, ExprBooleanLiteral, ExprBytesLiteral, ExprCompare, ExprDict,
+    ExprDictComp, ExprEllipsisLiteral, ExprFString, ExprGenerator, ExprIf, ExprIpyEscapeCommand,
+    ExprLambda, ExprList, ExprListComp, ExprName, ExprNamed, ExprNoneLiteral, ExprNumberLiteral,
+    ExprSet, ExprSetComp, ExprSlice, ExprStarred, ExprStringLiteral, ExprSubscript, ExprTString,
+    ExprTuple, GetAttr, GetItem, HasMeta, IncrementCounter, Instr, InstrWithConstantNone,
+    LiteralValue, Load, MakeCell, MakeFunction, MakeFunctionWithClosure, MapInstr, Mappable, Meta,
+    ModuleShape, NameLike, ResolvedName, SetAttr, SetItem, StmtAnnAssign, StmtAssert, StmtAssign,
+    StmtAugAssign, StmtBreak, StmtClassDef, StmtContinue, StmtDelete, StmtExpr, StmtFor,
+    StmtFunctionDef, StmtGlobal, StmtIf, StmtImport, StmtImportFrom, StmtIpyEscapeCommand,
+    StmtMatch, StmtNonlocal, StmtPass, StmtRaise, StmtReturn, StmtTry, StmtTypeAlias, StmtWhile,
+    StmtWith, Store, TryMapInstr, Tuple, UnaryOp, UnresolvedName, WithMeta, Yield, YieldFrom,
 };
 use ruff_python_ast::{self as ast};
 use soac_macros::{enum_broadcast, DelegateMatchDefault};
@@ -341,21 +340,12 @@ impl ModuleShape for ResolvedStorageModuleShape {
     type BlockExtra = ();
 }
 
-// Codegen-only payload for guarding profiled direct-function calls.
-define_instr! {
-    pub struct DirectFunctionIdGuardTest<E> {
-        value: Box<E>,
-        function_id: RuntimeFunctionId,
-    }
-}
-
 /// Final lowered BlockPy form consumed by optimization, instrumentation, and JIT.
 ///
 /// Compared with `InstrResolved`, module constants have been hoisted into the
-/// module constant table and codegen-facing operations such as direct-call
-/// payloads, direct-function guards, and explicit counter increments can appear.
-/// Instruction IDs are assigned on this shape before validation returns the
-/// module to the driver.
+/// module constant table and codegen-facing operations such as explicit counter
+/// increments can appear. Instruction IDs are assigned on this shape before
+/// validation returns the module to the driver.
 #[derive(Clone, derive_more::From, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 #[rkyv(serialize_bounds(
     __S: rkyv::ser::Writer + rkyv::ser::Allocator,
@@ -369,11 +359,8 @@ define_instr! {
 pub enum InstrCodegen {
     BinOp(#[rkyv(omit_bounds)] BinOp<Self>),
     UnaryOp(#[rkyv(omit_bounds)] UnaryOp<Self>),
-    CalleeFunctionId(#[rkyv(omit_bounds)] CalleeFunctionId<Self>),
-    DirectFunctionIdGuardTest(#[rkyv(omit_bounds)] DirectFunctionIdGuardTest<Self>),
     Tuple(#[rkyv(omit_bounds)] Tuple<Self>),
     Call(#[rkyv(omit_bounds)] Call<Self>),
-    CallDirect(#[rkyv(omit_bounds)] CallDirect<Self>),
     GetAttr(#[rkyv(omit_bounds)] GetAttr<Self>),
     SetAttr(#[rkyv(omit_bounds)] SetAttr<Self>),
     GetItem(#[rkyv(omit_bounds)] GetItem<Self>),
