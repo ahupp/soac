@@ -56,7 +56,7 @@ macro_rules! py_stmts_internal {
 macro_rules! py_expr {
     ($template:literal $(, $name:ident = $value:expr)* $(,)?) => {{
         use ruff_python_ast::{self as ast, Stmt};
-        let stmt = $crate::py_stmt_internal!($template $(, $name = $value)*);
+        let stmt = $crate::template::py_stmt_internal!($template $(, $name = $value)*);
         match stmt {
             Stmt::Expr(ast::StmtExpr { value, .. }) => *value,
             other => {
@@ -75,19 +75,19 @@ macro_rules! py_expr {
 
 macro_rules! py_stmt {
     ($template:literal $(, $name:ident = $value:expr)* $(,)?) => {{
-            $crate::py_stmt_internal!($template $(, $name = $value)*)
+            $crate::template::py_stmt_internal!($template $(, $name = $value)*)
     }};
 }
 
 macro_rules! py_stmts {
     ($template:literal $(, $name:ident = $value:expr)* $(,)?) => {{
-            $crate::py_stmts_internal!($template $(, $name = $value)*)
+            $crate::template::py_stmts_internal!($template $(, $name = $value)*)
     }};
 }
 
 macro_rules! py_stmt_typed {
     ($template:literal $(, $name:ident = $value:expr)* $(,)?) => {{
-        let stmt = $crate::py_stmt_internal!($template $(, $name = $value)*);
+        let stmt = $crate::template::py_stmt_internal!($template $(, $name = $value)*);
         $crate::template::expect_stmt::<_>(stmt, $template)
     }};
 }
@@ -731,7 +731,7 @@ impl Transformer for PlaceholderReplacer {
                                     *stmt = Stmt::If(ast::StmtIf {
                                         node_index: ast::AtomicNodeIndex::default(),
                                         range: TextRange::default(),
-                                        test: Box::new(crate::py_expr!("True")),
+                                        test: Box::new(crate::template::py_expr!("True")),
                                         body: body_from_stmts(vec![Stmt::Expr(ast::StmtExpr {
                                             node_index: ast::AtomicNodeIndex::default(),
                                             range: TextRange::default(),

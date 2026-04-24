@@ -532,8 +532,9 @@ fn instr_ruff_from_ast_expr_normalizes_bare_yield_to_explicit_none() {
 
 #[test]
 fn instr_ruff_from_ast_expr_normalizes_call_args_and_keywords() {
-    let instr =
-        crate::passes::ast_to_instr::from_ast_expr(crate::py_expr!("f(x, *args, y=z, **kw)"));
+    let instr = crate::passes::ast_to_instr::from_ast_expr(crate::template::py_expr!(
+        "f(x, *args, y=z, **kw)"
+    ));
 
     let InstrRuff::Call(call) = instr else {
         panic!("expected InstrRuff::Call");
@@ -551,7 +552,8 @@ fn instr_ruff_from_ast_expr_normalizes_call_args_and_keywords() {
 
 #[test]
 fn instr_ruff_from_ast_stmt_recursively_lowers_assign_value() {
-    let instr = crate::passes::ast_to_instr::from_ast_stmt(crate::py_stmt!("x = bare_yield"));
+    let instr =
+        crate::passes::ast_to_instr::from_ast_stmt(crate::template::py_stmt!("x = bare_yield"));
 
     let InstrRuff::StmtAssign(assign) = instr else {
         panic!("expected InstrRuff::StmtAssign");
@@ -581,7 +583,7 @@ fn instr_ruff_from_ast_stmt_recursively_lowers_function_body_and_return() {
                 kwarg: None,
             }),
             returns: None,
-            body: vec![crate::py_stmt!("return g(x)")],
+            body: vec![crate::template::py_stmt!("return g(x)")],
         }));
 
     let InstrRuff::StmtFunctionDef(func) = instr else {
@@ -597,7 +599,7 @@ fn instr_ruff_from_ast_stmt_recursively_lowers_function_body_and_return() {
 
 #[test]
 fn instr_ruff_from_ast_stmt_normalizes_bare_return_to_explicit_none() {
-    let instr = crate::passes::ast_to_instr::from_ast_stmt(crate::py_stmt!("return"));
+    let instr = crate::passes::ast_to_instr::from_ast_stmt(crate::template::py_stmt!("return"));
 
     let InstrRuff::StmtReturn(ret) = instr else {
         panic!("expected InstrRuff::StmtReturn");
@@ -611,9 +613,9 @@ fn instr_ruff_from_ast_stmt_recursively_lowers_loop_body_and_orelse() {
     let instr = crate::passes::ast_to_instr::from_ast_stmt(Stmt::While(ast::StmtWhile {
         node_index: ast::AtomicNodeIndex::default(),
         range: ruff_text_size::TextRange::default(),
-        test: Box::new(crate::py_expr!("cond")),
-        body: vec![crate::py_stmt!("x = 1")],
-        orelse: vec![crate::py_stmt!("y = 2")],
+        test: Box::new(crate::template::py_expr!("cond")),
+        body: vec![crate::template::py_stmt!("x = 1")],
+        orelse: vec![crate::template::py_stmt!("y = 2")],
     }));
 
     let InstrRuff::StmtWhile(while_stmt) = instr else {

@@ -1,5 +1,5 @@
 use crate::passes::ast_to_ast::body::Suite;
-use crate::py_expr;
+use crate::template::py_expr;
 use crate::transformer::Transformer;
 use ruff_python_ast::{self as ast, Expr, Stmt};
 use ruff_python_codegen::{Generator, Indentation};

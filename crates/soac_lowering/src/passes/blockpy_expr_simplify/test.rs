@@ -9,7 +9,7 @@ fn lower_semantic_expr_without_setup(expr: &Expr) -> InstrWithAwaitAndYield {
 
 use crate::block_py::{CallArgKeyword, CallArgPositional, InstrWithAwaitAndYield};
 use crate::lower_python_to_blockpy_for_testing;
-use crate::py_expr;
+use crate::template::py_expr;
 use ruff_python_parser::parse_expression;
 
 fn is_raw_load_name_expr(expr: &InstrWithAwaitAndYield, expected: &str) -> bool {

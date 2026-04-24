@@ -6,7 +6,7 @@ use crate::block_py::{
     NumberLiteralValue, StringLiteral, WithMeta, Yield, YieldFrom,
 };
 use crate::passes::InstrRuff;
-use crate::py_expr;
+use crate::template::py_expr;
 use ruff_python_ast::{self as ast, Expr};
 
 fn core_builtin_name(id: &str) -> InstrWithAwaitAndYield {

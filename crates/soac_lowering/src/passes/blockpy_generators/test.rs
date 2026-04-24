@@ -12,7 +12,7 @@ use crate::block_py::{
 };
 use crate::passes::ast_to_ast::scope_helpers::is_internal_symbol;
 use crate::passes::InstrRuff;
-use crate::py_expr;
+use crate::template::py_expr;
 use ruff_python_ast::{self as ast, Expr};
 use ruff_text_size::TextRange;
 use std::collections::HashSet;

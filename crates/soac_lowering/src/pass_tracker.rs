@@ -1,22 +1,10 @@
 use ruff_python_ast::{self as ast, ModModule};
 use ruff_text_size::TextRange;
-use soac_core::block_py::{BlockPyModule, ModuleShape};
+use soac_core::block_py::BlockPyModule;
 use soac_core::pass_tracker::RecordingPassTracker;
 
-fn blockpy_module_block_count<S>(module: &BlockPyModule<S>) -> usize
-where
-    S: ModuleShape,
-{
-    module
-        .callable_defs
-        .iter()
-        .map(|function| function.blocks.len())
-        .sum()
-}
-
-pub trait LoweringPassTrackerExt {
+pub(crate) trait LoweringPassTrackerExt {
     fn pass_ast_to_ast(&self) -> Option<ModModule>;
-    fn pass_block_count(&self, name: &str) -> Option<usize>;
 }
 
 impl LoweringPassTrackerExt for RecordingPassTracker {
@@ -27,17 +15,6 @@ impl LoweringPassTrackerExt for RecordingPassTracker {
                 range: TextRange::default(),
                 body: pass.module.clone(),
             })
-    }
-
-    fn pass_block_count(&self, name: &str) -> Option<usize> {
-        match name {
-            "core_blockpy" => self.pass_core_blockpy().map(blockpy_module_block_count),
-            "core_blockpy_with_await_and_yield" => self
-                .pass_core_blockpy_with_await_and_yield()
-                .map(blockpy_module_block_count),
-            "name_binding" => self.pass_name_binding().map(blockpy_module_block_count),
-            _ => None,
-        }
     }
 }
 

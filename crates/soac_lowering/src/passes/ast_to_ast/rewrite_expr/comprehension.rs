@@ -6,8 +6,8 @@ use ruff_python_ast::{Expr, ExprContext, Stmt};
 use crate::passes::ast_to_ast::ast_rewrite::LoweredExpr;
 use crate::passes::ast_to_ast::context::Context;
 use crate::passes::ast_to_ast::scope_helpers::{is_internal_symbol, ScopeKind};
+use crate::template::{py_expr, py_stmt, py_stmt_typed};
 use crate::transformer::{walk_expr, Transformer};
-use crate::{py_expr, py_stmt, py_stmt_typed};
 use ruff_python_ast::name::Name;
 use ruff_text_size::TextRange;
 

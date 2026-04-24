@@ -2,7 +2,7 @@ use super::super::{lower_instr_for_test, simplify_stmt_ast_once_for_blockpy, Blo
 use crate::block_py::InstrWithAwaitAndYield;
 use crate::passes::ast_to_ast::context::Context;
 use crate::passes::ruff_to_blockpy::test_name_gen;
-use crate::py_stmt;
+use crate::template::py_stmt;
 use ruff_python_ast::Stmt;
 
 #[test]

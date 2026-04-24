@@ -3,7 +3,7 @@ use crate::block_py::{BlockLabel, BlockTerm, Meta, Store, TermIf, WithMeta};
 use crate::passes::ruff_to_blockpy::expr_lowering::fresh_setup_name;
 use crate::passes::ruff_to_blockpy::{FunctionNameGen, InlineFragment, LoopContext, LoweredExpr};
 use crate::passes::InstrRuff;
-use crate::py_expr;
+use crate::template::py_expr;
 use ruff_python_ast::{self as ast, CmpOp};
 
 fn store_name(name: &str) -> ast::name::Name {

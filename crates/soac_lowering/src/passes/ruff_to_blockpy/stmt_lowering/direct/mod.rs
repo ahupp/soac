@@ -1,6 +1,6 @@
 use super::*;
 use crate::passes::ast_to_ast::ast_rewrite::Rewrite;
-use crate::py_stmt;
+use crate::template::py_stmt;
 
 // Direct stmt lowerers map one Ruff stmt to either a BlockPy stmt, a terminator,
 // or no output at all. They do not need their own AST rewrite helpers.

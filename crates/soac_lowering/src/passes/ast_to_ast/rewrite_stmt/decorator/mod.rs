@@ -1,6 +1,6 @@
 use ruff_python_ast::{self as ast, Expr};
 
-use crate::py_expr;
+use crate::template::py_expr;
 
 pub(crate) fn collect_exprs(decorators: &[ast::Decorator]) -> Vec<Expr> {
     decorators

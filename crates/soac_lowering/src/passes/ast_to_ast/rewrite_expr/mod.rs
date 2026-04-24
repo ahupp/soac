@@ -5,11 +5,9 @@ use ruff_text_size::TextRange;
 
 use crate::passes::ast_to_ast::ast_rewrite::ExprRewritePass;
 use crate::passes::ast_to_ast::scope_helpers::ScopeKind;
+use crate::passes::ast_to_ast::{ast_rewrite::LoweredExpr, context::Context};
+use crate::template::{py_expr, py_stmt, py_stmt_typed};
 use crate::transformer::{walk_expr, Transformer};
-use crate::{
-    passes::ast_to_ast::{ast_rewrite::LoweredExpr, context::Context},
-    py_expr, py_stmt, py_stmt_typed,
-};
 use ruff_python_ast::Identifier;
 
 mod comprehension;
@@ -117,7 +115,7 @@ def {func:id}({param:id}):
             if is_outermost {
                 let iter_name = context.fresh("iter");
                 let target_tmp = context.fresh("tmp");
-                crate::py_stmts!(
+                crate::template::py_stmts!(
                     r#"
 {iter_name:id} = {iter:expr}
 while True:
@@ -148,7 +146,7 @@ async for {target:expr} in {iter:expr}:
         } else if is_outermost {
             let iter_name = context.fresh("iter");
             let target_tmp = context.fresh("tmp");
-            crate::py_stmts!(
+            crate::template::py_stmts!(
                 r#"
 {iter_name:id} = {iter:expr}
 while True:

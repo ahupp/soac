@@ -210,10 +210,10 @@ pub fn lower_source_to_codegen_module_with_tracker(
 pub(crate) fn wrap_module_init(semantic_state: &mut SemanticAstState, module: &mut Suite) {
     let mut init_body = std::mem::take(module);
     if init_body.is_empty() {
-        init_body.push(crate::py_stmt!("pass"));
+        init_body.push(crate::template::py_stmt!("pass"));
     }
 
-    let module_init: ast::StmtFunctionDef = crate::py_stmt_typed!(
+    let module_init: ast::StmtFunctionDef = crate::template::py_stmt_typed!(
         r#"
 def _dp_module_init():
     {init_body:stmt}

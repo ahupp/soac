@@ -7,8 +7,8 @@ use crate::passes::ast_to_ast::context::Context;
 use crate::passes::ast_to_ast::rewrite_class_def::{class_def_to_create_class_fn, method};
 use crate::passes::ast_to_ast::rewrite_stmt;
 use crate::passes::ast_to_ast::semantic::{SemanticAstState, SemanticScope, SemanticScopeKind};
+use crate::template::{py_expr, py_stmt};
 use crate::transformer::{walk_stmt, Transformer};
-use crate::{py_expr, py_stmt};
 
 pub(crate) fn rewrite_class_body_scopes(
     context: &Context,

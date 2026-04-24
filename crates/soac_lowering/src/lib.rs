@@ -14,18 +14,14 @@ mod driver;
 #[cfg(test)]
 pub(crate) mod fixture;
 mod namegen;
-pub mod pass_tracker;
+#[cfg(test)]
+mod pass_tracker;
 pub mod passes;
 pub(crate) mod ruff_ast;
-#[macro_use]
 mod template;
 #[cfg(test)]
 mod test_util;
-pub(crate) mod transformer;
-
-pub(crate) use template::{
-    py_expr, py_stmt, py_stmt_internal, py_stmt_typed, py_stmts, py_stmts_internal,
-};
+mod transformer;
 
 #[derive(Debug)]
 pub enum LoweringError {

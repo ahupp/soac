@@ -1,7 +1,7 @@
 use super::*;
 use crate::passes::ast_to_ast::ast_rewrite::Rewrite;
 use crate::passes::ast_to_ast::body::Suite;
-use crate::{py_expr, py_stmt};
+use crate::template::{py_expr, py_stmt};
 
 fn body_to_vec(body: Suite) -> Vec<Stmt> {
     body

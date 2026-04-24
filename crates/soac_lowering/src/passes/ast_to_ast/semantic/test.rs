@@ -122,7 +122,7 @@ fn synthesized_module_init_scope_reuses_module_children_and_translates_bindings(
         "    y = x\n",
     ));
     let mut semantic_state = SemanticAstState::from_ruff(&mut body);
-    let module_init: ast::StmtFunctionDef = crate::py_stmt_typed!(
+    let module_init: ast::StmtFunctionDef = crate::template::py_stmt_typed!(
         r#"
 def _dp_module_init():
     pass

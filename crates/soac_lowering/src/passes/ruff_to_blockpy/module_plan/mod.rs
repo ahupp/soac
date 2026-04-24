@@ -12,8 +12,8 @@ use crate::passes::ruff_to_blockpy::param_specs::{
     collect_param_spec_and_defaults, param_defaults_to_expr,
 };
 use crate::passes::CoreModuleShapeWithAwaitAndYield;
+use crate::template::{py_expr, py_stmt, py_stmt_typed};
 use crate::transformer::{walk_expr, walk_stmt, Transformer};
-use crate::{py_expr, py_stmt, py_stmt_typed};
 use ruff_python_ast::{self as ast, Expr, Stmt};
 
 use super::build_core_blockpy_callable_def_from_runtime_input;

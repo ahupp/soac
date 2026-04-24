@@ -12,7 +12,7 @@ use crate::passes::ast_to_ast::rewrite_stmt::annotation::FUNCTION_ANNOTATE_PREFI
 use crate::passes::{CoreModuleShapeWithAwaitAndYield, InstrRuff};
 use crate::ruff_ast::ruff_ast_to_string;
 use crate::template::is_simple;
-use crate::{py_expr, py_stmt};
+use crate::template::{py_expr, py_stmt};
 use ruff_python_ast::{self as ast, Expr, Stmt};
 use std::collections::HashMap;
 mod bb_shape;

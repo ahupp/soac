@@ -6,11 +6,9 @@ use ruff_python_codegen::{Generator, Indentation};
 use ruff_source_file::LineEnding;
 
 use crate::passes::ast_to_ast::body::Suite;
+use crate::passes::ast_to_ast::{context::Context, expr_utils::make_tuple};
+use crate::template::{py_expr, py_stmt};
 use crate::transformer::{walk_stmt, Transformer};
-use crate::{
-    passes::ast_to_ast::{context::Context, expr_utils::make_tuple},
-    py_expr, py_stmt,
-};
 
 pub(crate) const FUNCTION_ANNOTATE_PREFIX: &str = "_dp_annotate_func_";
 

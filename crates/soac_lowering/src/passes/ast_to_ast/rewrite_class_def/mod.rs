@@ -5,7 +5,7 @@ pub(crate) mod private;
 use crate::passes::ast_to_ast::body::{empty_suite, split_docstring};
 use crate::passes::ast_to_ast::context::Context;
 use crate::passes::ast_to_ast::expr_utils::make_tuple;
-use crate::{py_expr, py_stmt, py_stmt_typed};
+use crate::template::{py_expr, py_stmt, py_stmt_typed};
 use ruff_python_ast::{
     self as ast, Expr, Stmt, TypeParam, TypeParamParamSpec, TypeParamTypeVar, TypeParamTypeVarTuple,
 };

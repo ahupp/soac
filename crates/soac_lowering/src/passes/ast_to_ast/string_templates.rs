@@ -1,7 +1,8 @@
 use crate::block_py::{HasMeta, Mappable};
+use crate::passes::ast_to_ast::expr_utils::make_tuple;
 use crate::passes::InstrRuff;
+use crate::template::py_expr;
 use crate::transformer::{walk_expr, Transformer};
-use crate::{passes::ast_to_ast::expr_utils::make_tuple, py_expr};
 use ruff_python_ast::{self as ast, Expr};
 
 fn join_parts(parts: Vec<Expr>, force_join: bool) -> Expr {

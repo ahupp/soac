@@ -1,5 +1,6 @@
 use super::*;
-use crate::{passes::ast_to_ast::ast_rewrite::Rewrite, py_stmt};
+use crate::passes::ast_to_ast::ast_rewrite::Rewrite;
+use crate::template::py_stmt;
 
 pub(crate) fn rewrite_assert_stmt(ast::StmtAssert { test, msg, .. }: ast::StmtAssert) -> Rewrite {
     Rewrite::Walk(vec![if let Some(msg_expr) = msg {

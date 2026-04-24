@@ -2,7 +2,7 @@ use crate::block_py::{BinOpKind, InstrWithAwaitAndYield, NameLike};
 use crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_setup;
 use crate::passes::ruff_to_blockpy::stmt_lowering::BlockPyStmtBuilder;
 use crate::passes::ruff_to_blockpy::test_name_gen;
-use crate::py_expr;
+use crate::template::py_expr;
 
 #[test]
 fn boolop_lowering_emits_blockpy_setup_directly() {

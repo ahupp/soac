@@ -1,6 +1,6 @@
 use super::{rewrite_with_pass, ExprRewritePass, LoweredExpr};
 use crate::passes::ast_to_ast::context::Context;
-use crate::py_expr;
+use crate::template::py_expr;
 use ruff_python_ast::{Expr, Stmt};
 use ruff_python_parser::parse_module;
 

@@ -64,7 +64,7 @@ pub(super) fn desugar_structured_with_stmt_for_blockpy(with_stmt: ast::StmtWith)
         };
 
         lowered_body = if is_async {
-            crate::py_stmts!(
+            crate::template::py_stmts!(
                 r#"
 {ctx_placeholder_stmt:stmt}
 {exit_name:id} = __soac__.asynccontextmanager_get_aexit({ctx_expr:expr})
@@ -93,7 +93,7 @@ finally:
                 ctx_cleanup = ctx_cleanup,
             )
         } else {
-            crate::py_stmts!(
+            crate::template::py_stmts!(
                 r#"
 {ctx_placeholder_stmt:stmt}
 {exit_name:id} = __soac__.contextmanager_get_exit({ctx_expr:expr})

@@ -18,8 +18,11 @@ fn assert_call_name<'a>(expr: &'a Expr, expected: &str) -> &'a Expr {
 #[test]
 fn rewrite_exprs_applies_decorators_inside_out() {
     let decorated = rewrite_exprs(
-        vec![crate::py_expr!("d1"), crate::py_expr!("d2")],
-        crate::py_expr!("f"),
+        vec![
+            crate::template::py_expr!("d1"),
+            crate::template::py_expr!("d2"),
+        ],
+        crate::template::py_expr!("f"),
     );
     let inner = assert_call_name(&decorated, "d1");
     let original = assert_call_name(inner, "d2");

@@ -6,7 +6,7 @@ use ruff_text_size::TextRange;
 use tracing::{enabled, trace, Level};
 
 use crate::ruff_ast::ruff_ast_to_string;
-use crate::{py_expr, py_stmt};
+use crate::template::{py_expr, py_stmt};
 
 enum PatternTest {
     Test { expr: Expr, assigns: Vec<Stmt> },
@@ -580,7 +580,7 @@ else:
         }
     }
 
-    Rewrite::Walk(crate::py_stmts!(
+    Rewrite::Walk(crate::template::py_stmts!(
         "
 {assign:stmt}
 {chain:stmt}",

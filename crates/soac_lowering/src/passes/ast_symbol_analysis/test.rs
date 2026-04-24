@@ -1,5 +1,5 @@
 use super::*;
-use crate::py_stmt;
+use crate::template::py_stmt;
 
 #[test]
 fn collect_bound_names_stays_in_current_scope() {

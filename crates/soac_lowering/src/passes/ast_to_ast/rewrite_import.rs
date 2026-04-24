@@ -1,4 +1,5 @@
-use crate::{passes::ast_to_ast::ast_rewrite::Rewrite, py_stmt};
+use crate::passes::ast_to_ast::ast_rewrite::Rewrite;
+use crate::template::py_stmt;
 
 use super::context::Context;
 use ruff_python_ast::{self as ast};

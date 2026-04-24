@@ -1,11 +1,9 @@
 use ruff_python_ast::{self as ast, Expr, Stmt};
 
 use crate::passes::ast_to_ast::body::Suite;
+use crate::passes::ast_to_ast::util::{is_dp_helper_lookup_expr, is_noarg_call};
+use crate::template::py_expr;
 use crate::transformer::{walk_expr, walk_stmt, Transformer};
-use crate::{
-    passes::ast_to_ast::util::{is_dp_helper_lookup_expr, is_noarg_call},
-    py_expr,
-};
 
 struct MethodRewriteSuperClasscell {
     first_arg: Option<String>,

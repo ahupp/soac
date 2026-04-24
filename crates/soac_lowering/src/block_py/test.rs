@@ -1,6 +1,6 @@
 use super::*;
 use crate::passes::{CoreModuleShape, InstrRuff};
-use crate::py_expr;
+use crate::template::py_expr;
 use ruff_python_ast as ast;
 
 #[test]
