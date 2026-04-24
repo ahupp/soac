@@ -8500,6 +8500,226 @@ fn emit_typed_local_store_result_with_local_env(
     Ok(Some(emit_none_for_demand(fb, emit_ctx, demand)))
 }
 
+fn emit_typed_owned_cell_makecell_store_result_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    expr: &InstrTyped,
+    op: &Store<InstrTyped>,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    demand: ResultDemand,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<Option<EmitResult>, String> {
+    let Some(location) = op.name.cell_location() else {
+        return Ok(None);
+    };
+    if !(location.is_owned() && matches!(op.value.as_ref(), InstrTyped::MakeCell(_))) {
+        return Ok(None);
+    }
+    let layout = emit_ctx
+        .storage_layout
+        .as_ref()
+        .expect("Store owned cell slot should have storage layout during typed codegen");
+    let backing = owned_cell_backing_local(layout, location.slot());
+    let backing_name = backing
+        .as_ref()
+        .map(|(_, name)| *name)
+        .or_else(|| {
+            layout
+                .local_cell_slot(location.slot())
+                .map(|slot| slot.storage_name.as_str())
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "missing owned cell slot mapping for owned cell location {}",
+                location.slot()
+            )
+        });
+    let value_result = emit_typed_codegen_stmt_result_with_local_env(
+        fb,
+        &op.value,
+        local_env,
+        emit_ctx,
+        ResultDemand::PYOBJECT_OWNED,
+        codegen_env,
+        func_imports,
+    )?;
+    let (value, ownership, value_py_facts) =
+        value_result.expect_pyobject("typed owned cell MakeCell store RHS");
+    if !ownership.can_satisfy_pyobject_demand(ResultDemand::PYOBJECT_OWNED) {
+        return Err(format!(
+            "typed owned cell MakeCell store RHS produced {ownership:?}, but store requires owned PyObject"
+        ));
+    }
+    let value_py_facts = if matches!(emit_ctx.function_kind, FunctionKind::Function) {
+        py_facts_for_typed_expr_with_local_env(&op.value, local_env).unwrap_or(value_py_facts)
+    } else {
+        value_py_facts
+    };
+    let default_ref_kind = local_ref_kind_for_typed_stored_value(&op.value, ownership);
+    if let Some((backing_location, _)) = backing {
+        let value_ref_kind =
+            match planned_typed_local_store_effect(expr, backing_location, emit_ctx) {
+                Some(PlannedLocalStoreEffect::Rebind(ref_kind)) => ref_kind,
+                Some(PlannedLocalStoreEffect::Delete) => unreachable!(),
+                None => default_ref_kind,
+            };
+        local_env.store_location(
+            fb,
+            backing_location,
+            backing_name,
+            value,
+            value_ref_kind,
+            Some(value_py_facts),
+            emit_ctx.allow_local_only_slot_backed_stores,
+            &emit_ctx.stack_slots,
+            emit_ctx.consts.ptr_ty,
+            emit_ctx.consts.thread_state_value,
+            emit_ctx.incref_ref,
+            emit_ctx.decref_ref,
+        );
+    } else {
+        local_env.store_name(
+            fb,
+            backing_name,
+            value,
+            default_ref_kind,
+            Some(value_py_facts),
+            emit_ctx.consts.ptr_ty,
+            emit_ctx.consts.thread_state_value,
+            emit_ctx.decref_ref,
+        );
+    }
+    Ok(Some(emit_none_for_demand(fb, emit_ctx, demand)))
+}
+
+fn emit_typed_cell_store_result_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    op: &Store<InstrTyped>,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    demand: ResultDemand,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<Option<EmitResult>, String> {
+    let Some(location) = op.name.cell_location() else {
+        return Ok(None);
+    };
+    let raw_cell = emit_raw_cell_object_for_location_with_local_env(
+        fb,
+        location,
+        op.name.id.as_str(),
+        local_env,
+        emit_ctx,
+    );
+    let value = emit_typed_codegen_expr_value_with_local_env(
+        fb,
+        &op.value,
+        local_env,
+        emit_ctx,
+        typed_expr_pyobject_input_is_borrowed_from_local_env(&op.value, local_env, emit_ctx),
+        codegen_env,
+        func_imports,
+    )?;
+    let (value, ownership, _) = value.expect_pyobject("typed cell store value");
+    let call_inst = fb.ins().call(emit_ctx.store_cell_ref, &[raw_cell, value]);
+    fb.ins().call(
+        emit_ctx.decref_ref,
+        &[emit_ctx.consts.thread_state_value, raw_cell],
+    );
+    if ownership.is_owned() {
+        fb.ins().call(
+            emit_ctx.decref_ref,
+            &[emit_ctx.consts.thread_state_value, value],
+        );
+    }
+    let call_value = fb.inst_results(call_inst)[0];
+    let mut intrinsic_state = LocalEnvCodegenIntrinsicEmitState {
+        fb,
+        local_env,
+        ctx: emit_ctx,
+        codegen_env,
+        func_imports,
+    };
+    let value = intrinsics::OperationEmitState::<InstrTyped>::finish_owned_result(
+        &mut intrinsic_state,
+        call_value,
+    );
+    Ok(Some(emit_owned_pyobject_result_for_demand(
+        intrinsic_state.fb,
+        value,
+        PyObjFacts::none_singleton(),
+        intrinsic_state.ctx,
+        demand,
+    )))
+}
+
+fn emit_typed_local_delete_result_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    op: &Del<InstrTyped>,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    demand: ResultDemand,
+) -> Option<EmitResult> {
+    let location = op.name.local_location()?;
+    let layout = emit_ctx
+        .storage_layout
+        .as_ref()
+        .expect("Del local slot should have storage layout during typed codegen");
+    let name = local_name_for_location(layout, location);
+    local_env
+        .delete_location(
+            fb,
+            location,
+            name,
+            &emit_ctx.stack_slots,
+            emit_ctx.consts.ptr_ty,
+            emit_ctx.consts.thread_state_value,
+            emit_ctx.decref_ref,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+    Some(emit_none_for_demand(fb, emit_ctx, demand))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_typed_cell_delete_result_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    op: &Del<InstrTyped>,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    demand: ResultDemand,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Option<EmitResult> {
+    let location = op.name.cell_location()?;
+    let raw_cell = emit_raw_cell_object_for_location_with_local_env(
+        fb,
+        location,
+        op.name.id.as_str(),
+        local_env,
+        emit_ctx,
+    );
+    let mut intrinsic_state = LocalEnvCodegenIntrinsicEmitState {
+        fb,
+        local_env,
+        ctx: emit_ctx,
+        codegen_env,
+        func_imports,
+    };
+    let value = intrinsics::emit_del_deref_raw_cell::<InstrTyped>(
+        raw_cell,
+        op.quietly,
+        &mut intrinsic_state,
+    );
+    Some(emit_owned_pyobject_result_for_demand(
+        intrinsic_state.fb,
+        value,
+        PyObjFacts::none_singleton(),
+        intrinsic_state.ctx,
+        demand,
+    ))
+}
+
 fn emit_local_delete_with_local_env(
     fb: &mut FunctionBuilder<'_>,
     op: &Del<InstrCodegen>,
@@ -10662,6 +10882,100 @@ fn emit_keyword_call_result_with_local_env(
     )
 }
 
+fn emit_typed_pyobject_arg_value_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    expr: &InstrTyped,
+    local_env: &mut LocalEnv,
+    ctx: &JitEmitCtx<'_>,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<(ir::Value, bool), String> {
+    let value = emit_typed_codegen_expr_value_with_local_env(
+        fb,
+        expr,
+        local_env,
+        ctx,
+        typed_expr_pyobject_input_is_borrowed_from_local_env(expr, local_env, ctx),
+        codegen_env,
+        func_imports,
+    )?;
+    let (value, ownership, _) = value.expect_pyobject("typed PyObject call argument");
+    Ok((value, !ownership.is_owned()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_typed_keyword_call_result_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    callable: ir::Value,
+    callable_is_borrowed: bool,
+    args: &[&InstrTyped],
+    keywords: &[(&str, &InstrTyped)],
+    local_env: &mut LocalEnv,
+    ctx: &JitEmitCtx<'_>,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+    demand: ResultDemand,
+) -> Result<EmitResult, String> {
+    let mut tuple_items: Vec<(ir::Value, bool)> = Vec::with_capacity(args.len());
+    for arg in args {
+        tuple_items.push(emit_typed_pyobject_arg_value_with_local_env(
+            fb,
+            arg,
+            local_env,
+            ctx,
+            codegen_env,
+            func_imports,
+        )?);
+    }
+    let call_args_tuple = emit_call_args_tuple_from_values(fb, tuple_items.as_slice(), ctx);
+
+    let empty_tuple_len = fb.ins().iconst(ctx.consts.i64_ty, 0);
+    let empty_tuple_inst = fb.ins().call(ctx.tuple_new_ref, &[empty_tuple_len]);
+    let empty_tuple =
+        emit_checked_owned_pyobject_result(fb, fb.inst_results(empty_tuple_inst)[0], ctx);
+    let kwargs_obj = emit_empty_dict_with_args_tuple(fb, empty_tuple, false, ctx);
+
+    for (name, value_expr) in keywords {
+        let key_obj = emit_owned_module_constant(
+            fb,
+            ctx.module_constants.require_unicode_constant_id(name),
+            ctx,
+        );
+        let (value_obj, value_borrowed) = emit_typed_pyobject_arg_value_with_local_env(
+            fb,
+            value_expr,
+            local_env,
+            ctx,
+            codegen_env,
+            func_imports,
+        )?;
+        let mut cleanup_on_error = Vec::with_capacity(2);
+        cleanup_on_error.push(call_args_tuple);
+        if !callable_is_borrowed {
+            cleanup_on_error.push(callable);
+        }
+        emit_kwargs_setitem_or_cleanup(
+            fb,
+            kwargs_obj,
+            key_obj,
+            value_obj,
+            value_borrowed,
+            cleanup_on_error.as_slice(),
+            ctx,
+        );
+    }
+
+    Ok(emit_object_call_with_tuple_args_result(
+        fb,
+        callable,
+        callable_is_borrowed,
+        call_args_tuple,
+        Some(kwargs_obj),
+        ctx,
+        demand,
+    ))
+}
+
 fn emit_unpack_call_with_local_env(
     fb: &mut FunctionBuilder<'_>,
     callable: ir::Value,
@@ -10841,6 +11155,149 @@ fn emit_unpack_call_result_with_local_env(
         ctx,
         demand,
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_typed_unpack_call_result_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    callable: ir::Value,
+    callable_is_borrowed: bool,
+    args: &[CallArgPositional<InstrTyped>],
+    keywords: &[CallArgKeyword<InstrTyped>],
+    local_env: &mut LocalEnv,
+    ctx: &JitEmitCtx<'_>,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+    demand: ResultDemand,
+) -> Result<EmitResult, String> {
+    let ptr_ty = ctx.consts.ptr_ty;
+    let null_ptr = fb.ins().iconst(ptr_ty, 0);
+
+    let list_callable = emit_checked_runtime_name_object(fb, RuntimeName::List, ctx);
+    let empty_tuple_const = emit_empty_tuple_const(fb, ctx);
+    let args_list = emit_checked_owned_pyobject_call_with_cleanup(
+        fb,
+        ctx,
+        ctx.py_call_object_ref,
+        &[list_callable, empty_tuple_const],
+        &[list_callable],
+    );
+
+    let kwargs_obj = if keywords.is_empty() {
+        None
+    } else {
+        let empty_tuple_const = emit_empty_tuple_const(fb, ctx);
+        Some(emit_empty_dict_with_args_tuple(
+            fb,
+            empty_tuple_const,
+            true,
+            ctx,
+        ))
+    };
+
+    for arg in args {
+        let (value_expr, method_name) = match arg {
+            CallArgPositional::Positional(value_expr) => (value_expr, b"append".as_slice()),
+            CallArgPositional::Starred(value_expr) => (value_expr, b"extend".as_slice()),
+        };
+        let (value_obj, value_borrowed) = emit_typed_pyobject_arg_value_with_local_env(
+            fb,
+            value_expr,
+            local_env,
+            ctx,
+            codegen_env,
+            func_imports,
+        )?;
+        emit_one_arg_method_call_and_discard(
+            fb,
+            args_list,
+            method_name,
+            value_obj,
+            value_borrowed,
+            ctx,
+        );
+    }
+
+    for keyword in keywords {
+        match keyword {
+            CallArgKeyword::Named { arg, value } => {
+                let kwargs_obj = kwargs_obj.expect("kwargs object must exist for named kw part");
+                let key_obj = emit_owned_module_constant(
+                    fb,
+                    ctx.module_constants
+                        .require_unicode_constant_id(arg.as_str()),
+                    ctx,
+                );
+                let (value_obj, value_borrowed) = emit_typed_pyobject_arg_value_with_local_env(
+                    fb,
+                    value,
+                    local_env,
+                    ctx,
+                    codegen_env,
+                    func_imports,
+                )?;
+                let mut cleanup_on_error = Vec::with_capacity(2);
+                cleanup_on_error.push(args_list);
+                if !callable_is_borrowed {
+                    cleanup_on_error.push(callable);
+                }
+                emit_kwargs_setitem_or_cleanup(
+                    fb,
+                    kwargs_obj,
+                    key_obj,
+                    value_obj,
+                    value_borrowed,
+                    cleanup_on_error.as_slice(),
+                    ctx,
+                );
+            }
+            CallArgKeyword::Starred(value_expr) => {
+                let kwargs_obj = kwargs_obj.expect("kwargs object must exist for kwstar part");
+                let (value_obj, value_borrowed) = emit_typed_pyobject_arg_value_with_local_env(
+                    fb,
+                    value_expr,
+                    local_env,
+                    ctx,
+                    codegen_env,
+                    func_imports,
+                )?;
+                emit_one_arg_method_call_and_discard(
+                    fb,
+                    kwargs_obj,
+                    b"update",
+                    value_obj,
+                    value_borrowed,
+                    ctx,
+                );
+            }
+        }
+    }
+
+    let tuple_callable = emit_checked_runtime_name_object(fb, RuntimeName::TupleFromIter, ctx);
+    let call_args_tuple = emit_checked_owned_pyobject_call_with_cleanup(
+        fb,
+        ctx,
+        ctx.py_call_positional_three_ref,
+        &[
+            ctx.consts.thread_state_value,
+            tuple_callable,
+            args_list,
+            null_ptr,
+            null_ptr,
+            null_ptr,
+        ],
+        &[tuple_callable, args_list],
+    );
+
+    Ok(emit_object_call_with_tuple_args_result(
+        fb,
+        callable,
+        callable_is_borrowed,
+        call_args_tuple,
+        kwargs_obj,
+        ctx,
+        demand,
+    ))
 }
 
 fn emit_owned_bool_from_cond(
@@ -15330,6 +15787,135 @@ fn emit_typed_codegen_expr_value_with_local_env(
         return Ok(SoacValue::pyobject_with_ownership(value, ownership, facts));
     }
 
+    if let InstrTyped::IncrementCounter(op) = expr {
+        assert!(
+            !borrowed,
+            "typed increment_counter must not request a borrowed result"
+        );
+        let value = emit_increment_counter(fb, op.counter_id, emit_ctx);
+        return Ok(SoacValue::pyobject(value, PyObjFacts::none_singleton()));
+    }
+
+    if let InstrTyped::MakeFunctionWithClosure(op) = expr {
+        assert!(
+            !borrowed,
+            "typed MakeFunctionWithClosure must not request a borrowed result"
+        );
+        let value = emit_typed_codegen_make_function_with_closure_with_local_env(
+            fb,
+            op,
+            local_env,
+            emit_ctx,
+            codegen_env,
+            func_imports,
+        )?;
+        return Ok(SoacValue::pyobject(value, PyObjFacts::unknown()));
+    }
+
+    if let InstrTyped::CellRef(op) = expr {
+        assert!(
+            !borrowed,
+            "typed CellRef must not request a borrowed result"
+        );
+        let value = emit_raw_cell_object_for_location_with_local_env(
+            fb,
+            op.location,
+            "typed cell_ref",
+            local_env,
+            emit_ctx,
+        );
+        return Ok(SoacValue::pyobject(value, PyObjFacts::unknown()));
+    }
+
+    if let InstrTyped::Store(op) = expr {
+        assert!(!borrowed, "typed Store must not request a borrowed result");
+        if let Some(result) = emit_typed_local_store_result_with_local_env(
+            fb,
+            expr,
+            op,
+            local_env,
+            emit_ctx,
+            ResultDemand::PYOBJECT_OWNED,
+            codegen_env,
+            func_imports,
+        )? {
+            let (value, ownership, facts) = result.expect_pyobject("typed local store result");
+            assert!(
+                ownership.is_owned(),
+                "typed local store expression should produce an owned PyObject"
+            );
+            return Ok(SoacValue::pyobject(value, facts));
+        }
+        if let Some(result) = emit_typed_owned_cell_makecell_store_result_with_local_env(
+            fb,
+            expr,
+            op,
+            local_env,
+            emit_ctx,
+            ResultDemand::PYOBJECT_OWNED,
+            codegen_env,
+            func_imports,
+        )? {
+            let (value, ownership, facts) =
+                result.expect_pyobject("typed owned cell MakeCell store result");
+            assert!(
+                ownership.is_owned(),
+                "typed owned cell MakeCell store expression should produce an owned PyObject"
+            );
+            return Ok(SoacValue::pyobject(value, facts));
+        }
+        if let Some(result) = emit_typed_cell_store_result_with_local_env(
+            fb,
+            op,
+            local_env,
+            emit_ctx,
+            ResultDemand::PYOBJECT_OWNED,
+            codegen_env,
+            func_imports,
+        )? {
+            let (value, ownership, facts) = result.expect_pyobject("typed cell store result");
+            assert!(
+                ownership.is_owned(),
+                "typed cell store expression should produce an owned PyObject"
+            );
+            return Ok(SoacValue::pyobject(value, facts));
+        }
+    }
+
+    if let InstrTyped::Del(op) = expr {
+        assert!(!borrowed, "typed Del must not request a borrowed result");
+        if let Some(result) = emit_typed_local_delete_result_with_local_env(
+            fb,
+            op,
+            local_env,
+            emit_ctx,
+            ResultDemand::PYOBJECT_OWNED,
+        ) {
+            let (value, ownership, facts) = result.expect_pyobject("typed local delete result");
+            assert!(
+                ownership.is_owned(),
+                "typed local delete expression should produce an owned PyObject"
+            );
+            return Ok(SoacValue::pyobject(value, facts));
+        }
+        if let Some(result) = emit_typed_cell_delete_result_with_local_env(
+            fb,
+            op,
+            local_env,
+            emit_ctx,
+            ResultDemand::PYOBJECT_OWNED,
+            codegen_env,
+            func_imports,
+        ) {
+            let (value, ownership, facts) = result.expect_pyobject("typed cell delete result");
+            assert!(
+                ownership.is_owned(),
+                "typed cell delete expression should produce an owned PyObject"
+            );
+            return Ok(SoacValue::pyobject(value, facts));
+        }
+    }
+
     if let InstrTyped::Truthy(op) = expr {
         let value = emit_typed_codegen_expr_value_with_local_env(
             fb,
@@ -16920,6 +17506,107 @@ fn emit_codegen_make_function_with_closure_with_local_env(
     value
 }
 
+fn emit_typed_codegen_make_function_with_closure_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    make_function: &soac_core::block_py::MakeFunctionWithClosure<InstrTyped>,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<ir::Value, String> {
+    let function_id = fb.ins().iconst(
+        emit_ctx.consts.i64_ty,
+        make_function.function_id().to_packed_runtime_u64() as i64,
+    );
+    let kind = fb.ins().iconst(
+        emit_ctx.consts.i64_ty,
+        make_function_kind_abi_tag(make_function.kind),
+    );
+    let captures = emit_typed_codegen_expr_value_with_local_env(
+        fb,
+        make_function.captures.as_ref(),
+        local_env,
+        emit_ctx,
+        typed_expr_pyobject_input_is_borrowed_from_local_env(
+            make_function.captures.as_ref(),
+            local_env,
+            emit_ctx,
+        ),
+        codegen_env,
+        func_imports,
+    )?;
+    let (captures, captures_ownership, _) =
+        captures.expect_pyobject("typed make-function captures");
+    let param_defaults = emit_typed_codegen_expr_value_with_local_env(
+        fb,
+        make_function.param_defaults.as_ref(),
+        local_env,
+        emit_ctx,
+        typed_expr_pyobject_input_is_borrowed_from_local_env(
+            make_function.param_defaults.as_ref(),
+            local_env,
+            emit_ctx,
+        ),
+        codegen_env,
+        func_imports,
+    )?;
+    let (param_defaults, param_defaults_ownership, _) =
+        param_defaults.expect_pyobject("typed make-function param defaults");
+    let annotate_fn = emit_typed_codegen_expr_value_with_local_env(
+        fb,
+        make_function.annotate_fn.as_ref(),
+        local_env,
+        emit_ctx,
+        typed_expr_pyobject_input_is_borrowed_from_local_env(
+            make_function.annotate_fn.as_ref(),
+            local_env,
+            emit_ctx,
+        ),
+        codegen_env,
+        func_imports,
+    )?;
+    let (annotate_fn, annotate_fn_ownership, _) =
+        annotate_fn.expect_pyobject("typed make-function annotation function");
+    let globals = emit_ctx.consts.block_const;
+    let call_inst = fb.ins().call(
+        emit_ctx.make_function_with_closure_ref,
+        &[
+            function_id,
+            kind,
+            captures,
+            param_defaults,
+            annotate_fn,
+            globals,
+        ],
+    );
+    let mut owned_inputs = Vec::new();
+    if captures_ownership.is_owned() {
+        owned_inputs.push(captures);
+    }
+    if param_defaults_ownership.is_owned() {
+        owned_inputs.push(param_defaults);
+    }
+    if annotate_fn_ownership.is_owned() {
+        owned_inputs.push(annotate_fn);
+    }
+    let value = emit_decref_owned_inputs_after_nullable_result(
+        fb,
+        emit_ctx,
+        fb.inst_results(call_inst)[0],
+        owned_inputs.as_slice(),
+    );
+    let result = emit_checked_owned_pyobject_result_for_demand(
+        fb,
+        value,
+        PyObjFacts::unknown(),
+        emit_ctx,
+        ResultDemand::PYOBJECT_OWNED,
+    );
+    let (value, ownership, _) = result.expect_pyobject("typed make-function-with-closure result");
+    debug_assert!(ownership.is_owned());
+    Ok(value)
+}
+
 fn emit_codegen_expr_with_local_env(
     fb: &mut FunctionBuilder<'_>,
     expr: &InstrCodegen,
@@ -18396,6 +19083,57 @@ fn emit_typed_codegen_call_result_with_local_env(
     )? {
         return Ok(Some(result));
     }
+    let TypedSimpleCallParts {
+        simple_args,
+        simple_keywords,
+        has_unpack,
+    } = typed_simple_call_parts(call);
+    if has_unpack {
+        let (callable, callable_is_borrowed) = emit_typed_pyobject_arg_value_with_local_env(
+            fb,
+            call.func.as_ref(),
+            local_env,
+            emit_ctx,
+            codegen_env,
+            func_imports,
+        )?;
+        return emit_typed_unpack_call_result_with_local_env(
+            fb,
+            callable,
+            callable_is_borrowed,
+            call.args.as_slice(),
+            call.keywords.as_slice(),
+            local_env,
+            emit_ctx,
+            codegen_env,
+            func_imports,
+            demand,
+        )
+        .map(Some);
+    }
+    if !simple_keywords.is_empty() {
+        let (callable, callable_is_borrowed) = emit_typed_pyobject_arg_value_with_local_env(
+            fb,
+            call.func.as_ref(),
+            local_env,
+            emit_ctx,
+            codegen_env,
+            func_imports,
+        )?;
+        return emit_typed_keyword_call_result_with_local_env(
+            fb,
+            callable,
+            callable_is_borrowed,
+            simple_args.as_slice(),
+            simple_keywords.as_slice(),
+            local_env,
+            emit_ctx,
+            codegen_env,
+            func_imports,
+            demand,
+        )
+        .map(Some);
+    }
     if typed_call_can_emit_simple_positional_with_typed_inputs(call, emit_ctx) {
         return emit_typed_codegen_simple_positional_call_result_with_local_env(
             fb,
@@ -19568,17 +20306,88 @@ fn emit_typed_codegen_stmt_with_local_env(
     codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<ir::Value, String> {
-    if let InstrTyped::Store(op) = expr
-        && op.name.location.is_global()
-    {
-        let mut intrinsic_state = LocalEnvCodegenIntrinsicEmitState {
+    if let InstrTyped::Store(op) = expr {
+        if let Some(result) = emit_typed_local_store_result_with_local_env(
             fb,
+            expr,
+            op,
             local_env,
-            ctx: emit_ctx,
+            emit_ctx,
+            ResultDemand::PYOBJECT_OWNED,
             codegen_env,
             func_imports,
-        };
-        if let Some(value) = intrinsics::emit_typed_operation(expr, &mut intrinsic_state) {
+        )? {
+            let (value, ownership, _) = result.expect_pyobject("typed statement local store");
+            assert!(
+                ownership.is_owned(),
+                "typed statement local store should produce an owned PyObject"
+            );
+            return Ok(value);
+        }
+        if let Some(result) = emit_typed_owned_cell_makecell_store_result_with_local_env(
+            fb,
+            expr,
+            op,
+            local_env,
+            emit_ctx,
+            ResultDemand::PYOBJECT_OWNED,
+            codegen_env,
+            func_imports,
+        )? {
+            let (value, ownership, _) =
+                result.expect_pyobject("typed statement owned cell MakeCell store");
+            assert!(
+                ownership.is_owned(),
+                "typed statement owned cell MakeCell store should produce an owned PyObject"
+            );
+            return Ok(value);
+        }
+        if let Some(result) = emit_typed_cell_store_result_with_local_env(
+            fb,
+            op,
+            local_env,
+            emit_ctx,
+            ResultDemand::PYOBJECT_OWNED,
+            codegen_env,
+            func_imports,
+        )? {
+            let (value, ownership, _) = result.expect_pyobject("typed statement cell store");
+            assert!(
+                ownership.is_owned(),
+                "typed statement cell store should produce an owned PyObject"
+            );
+            return Ok(value);
+        }
+    }
+    if let InstrTyped::Del(op) = expr {
+        if let Some(result) = emit_typed_local_delete_result_with_local_env(
+            fb,
+            op,
+            local_env,
+            emit_ctx,
+            ResultDemand::PYOBJECT_OWNED,
+        ) {
+            let (value, ownership, _) = result.expect_pyobject("typed statement local delete");
+            assert!(
+                ownership.is_owned(),
+                "typed statement local delete should produce an owned PyObject"
+            );
+            return Ok(value);
+        }
+        if let Some(result) = emit_typed_cell_delete_result_with_local_env(
+            fb,
+            op,
+            local_env,
+            emit_ctx,
+            ResultDemand::PYOBJECT_OWNED,
+            codegen_env,
+            func_imports,
+        ) {
+            let (value, ownership, _) = result.expect_pyobject("typed statement cell delete");
+            assert!(
+                ownership.is_owned(),
+                "typed statement cell delete should produce an owned PyObject"
+            );
             return Ok(value);
         }
     }
@@ -19602,6 +20411,9 @@ fn emit_typed_codegen_stmt_with_local_env(
             | InstrTyped::BinOp(_)
             | InstrTyped::Tuple(_)
             | InstrTyped::UnaryOp(_)
+            | InstrTyped::IncrementCounter(_)
+            | InstrTyped::CellRef(_)
+            | InstrTyped::MakeFunctionWithClosure(_)
             | InstrTyped::CallTyped(_)
             | InstrTyped::GuardedCallableCallTyped(_)
             | InstrTyped::GuardedMethodCallTyped(_)
@@ -19855,6 +20667,29 @@ fn emit_typed_codegen_stmt_result_with_local_env(
         )? {
             return Ok(result);
         }
+        if let Some(result) = emit_typed_owned_cell_makecell_store_result_with_local_env(
+            fb,
+            expr,
+            op,
+            local_env,
+            emit_ctx,
+            demand,
+            codegen_env,
+            func_imports,
+        )? {
+            return Ok(result);
+        }
+        if let Some(result) = emit_typed_cell_store_result_with_local_env(
+            fb,
+            op,
+            local_env,
+            emit_ctx,
+            demand,
+            codegen_env,
+            func_imports,
+        )? {
+            return Ok(result);
+        }
         if op.name.location.is_global() {
             let mut intrinsic_state = LocalEnvCodegenIntrinsicEmitState {
                 fb,
@@ -19872,6 +20707,24 @@ fn emit_typed_codegen_stmt_result_with_local_env(
                     fb, value, facts, emit_ctx, demand,
                 ));
             }
+        }
+    }
+    if let InstrTyped::Del(op) = expr {
+        if let Some(result) =
+            emit_typed_local_delete_result_with_local_env(fb, op, local_env, emit_ctx, demand)
+        {
+            return Ok(result);
+        }
+        if let Some(result) = emit_typed_cell_delete_result_with_local_env(
+            fb,
+            op,
+            local_env,
+            emit_ctx,
+            demand,
+            codegen_env,
+            func_imports,
+        ) {
+            return Ok(result);
         }
     }
     if typed_intrinsic_operation_may_emit_pyobject(expr) {
@@ -19916,6 +20769,9 @@ fn emit_typed_codegen_stmt_result_with_local_env(
             | InstrTyped::DirectCallableCallTyped(_)
             | InstrTyped::DirectMethodCallTyped(_)
             | InstrTyped::DirectCallGuardTest(_)
+            | InstrTyped::IncrementCounter(_)
+            | InstrTyped::CellRef(_)
+            | InstrTyped::MakeFunctionWithClosure(_)
     ) {
         if demand == ResultDemand::I32_BOOL01 {
             return emit_typed_codegen_i32_bool01_result_with_local_env(
