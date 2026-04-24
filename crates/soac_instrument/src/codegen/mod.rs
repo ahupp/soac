@@ -1,48 +1,42 @@
-use crate::CounterBuilder;
-use soac_config::{ExecTraceConfig, SoacEnvConfig, SpecializationMode};
+use crate::{CounterBuilder, InstrumentationConfig};
+use soac_config::{ExecTraceConfig, SoacEnvConfig};
 use soac_core::block_py::{
     BinOpKind, BlockPyFunction, BlockPyModule, BlockTerm, Call, CallArgPositional, ChildVisitable,
     CounterScope, CounterSite, FunctionExecutionMode, HasSemanticInstrId, InstrId, LiteralValue,
     Load, Meta, NameLocation, ResolvedName, RuntimeFunctionId, RuntimeName, StringLiteral, Tuple,
     Visit, WithMeta,
 };
+use soac_core::pass_tracker::PassTracker;
 use soac_lowering::block_py::counters::IncrementCounter;
 use soac_lowering::passes::{CodegenModuleShape, InstrCodegen, InstrResolved};
 use std::collections::HashMap;
 
 pub fn call_target_counter_instrumentation_enabled(config: &SoacEnvConfig) -> bool {
-    specialization_mode_instruments_top_values(config)
+    InstrumentationConfig::from_env_config(config)
+        .counters
+        .call_targets
 }
 
 pub fn locality_counter_instrumentation_enabled(config: &SoacEnvConfig) -> bool {
-    specialization_mode_instruments_top_values(config)
+    InstrumentationConfig::from_env_config(config)
+        .counters
+        .locality
 }
 
 pub fn refcount_counter_instrumentation_enabled(config: &SoacEnvConfig) -> bool {
-    config.specialization_mode() == Some(SpecializationMode::Verify)
+    InstrumentationConfig::from_env_config(config)
+        .counters
+        .refcounts
+        .scope()
+        .is_some()
 }
 
 pub fn deopt_entry_counter_instrumentation_enabled(config: &SoacEnvConfig) -> bool {
-    if config
-        .runtime_optimization_pipeline()
-        .uses_typed_v3_runtime()
-    {
-        return false;
-    }
-    matches!(
-        config.specialization_mode(),
-        Some(SpecializationMode::Verify | SpecializationMode::Apply)
-    )
+    InstrumentationConfig::from_env_config(config).deopt_entry_counters_enabled()
 }
 
 pub fn specialization_runtime_logging_enabled(config: &SoacEnvConfig) -> bool {
-    config.specialization_runtime_logging_enabled()
-}
-
-fn specialization_mode_instruments_top_values(config: &SoacEnvConfig) -> bool {
-    config
-        .specialization_mode()
-        .is_some_and(SpecializationMode::records_counters)
+    InstrumentationConfig::from_env_config(config).specialization_runtime_logging_enabled()
 }
 
 fn functions_with_counter_instrumentation(
@@ -51,6 +45,55 @@ fn functions_with_counter_instrumentation(
     functions
         .iter()
         .filter(|function| function.execution_mode() == FunctionExecutionMode::Jit)
+}
+
+pub fn instrument_module_with_tracker(
+    module: BlockPyModule<CodegenModuleShape>,
+    config: &InstrumentationConfig,
+    pass_tracker: &mut impl PassTracker,
+) -> Result<BlockPyModule<CodegenModuleShape>, String> {
+    let traced = if let Some(trace_config) = config.trace.as_ref() {
+        pass_tracker.run_pass("bb_trace", || {
+            let mut traced = module;
+            instrument_bb_module_for_trace(&mut traced, trace_config);
+            traced
+        })
+    } else {
+        module
+    };
+
+    let call_target_counted = if config.counters.call_targets {
+        pass_tracker.run_pass("bb_call_target_counters", || {
+            let mut counted = traced;
+            instrument_bb_module_with_call_target_counters(&mut counted);
+            counted
+        })
+    } else {
+        traced
+    };
+
+    let locality_counted = if config.counters.locality {
+        pass_tracker.run_pass("bb_locality_counters", || {
+            let mut counted = call_target_counted;
+            if config.counters.profiled_cold_blocks {
+                instrument_bb_module_with_block_entry_counters(&mut counted);
+            }
+            instrument_bb_module_with_locality_counters(&mut counted);
+            counted
+        })
+    } else {
+        call_target_counted
+    };
+
+    if let Some(scope) = config.counters.refcounts.scope() {
+        pass_tracker.record_timing("bb_refcount_counters", || {
+            let mut counted = locality_counted;
+            instrument_bb_module_with_refcount_counters(&mut counted, scope)?;
+            Ok(counted)
+        })
+    } else {
+        Ok(locality_counted)
+    }
 }
 
 fn functions_with_counter_instrumentation_mut(

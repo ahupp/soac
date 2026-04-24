@@ -13,7 +13,7 @@ use soac_core::block_py::{
     FunctionExecutionMode, ModuleNameGen,
 };
 use soac_core::pass_tracker::{NoopPassTracker, PassTracker, RecordingPassTracker};
-use soac_instrument::{CounterBuilder, codegen as instrumentation};
+use soac_instrument::{CounterBuilder, InstrumentationConfig, codegen as instrumentation};
 use soac_lowering::passes::{self, CodegenModuleShape, InstrCodegen};
 pub use soac_lowering::{LoweringError, LoweringResult, Result};
 use soac_opt::artifacts_v3::write_optimization_artifacts_v3;
@@ -332,58 +332,14 @@ fn finish_codegen_module_with_tracker(
         }
     }
 
-    let bb_traced: BlockPyModule<CodegenModuleShape> =
-        if let Some(config) = env_config.soac_exec_trace() {
-            pass_tracker.run_pass("bb_trace", || {
-                let mut traced = bb_codegen;
-                instrumentation::instrument_bb_module_for_trace(&mut traced, config);
-                traced
-            })
-        } else {
-            bb_codegen
-        };
-
-    let bb_call_target_counted: BlockPyModule<CodegenModuleShape> =
-        if instrumentation::call_target_counter_instrumentation_enabled(env_config) {
-            pass_tracker.run_pass("bb_call_target_counters", || {
-                let mut counted = bb_traced;
-                instrumentation::instrument_bb_module_with_call_target_counters(&mut counted);
-                counted
-            })
-        } else {
-            bb_traced
-        };
-
-    let bb_locality_counted: BlockPyModule<CodegenModuleShape> =
-        if instrumentation::locality_counter_instrumentation_enabled(env_config) {
-            pass_tracker.run_pass("bb_locality_counters", || {
-                let mut counted = bb_call_target_counted;
-                if env_config.profiled_cold_blocks_enabled() {
-                    instrumentation::instrument_bb_module_with_block_entry_counters(&mut counted);
-                }
-                instrumentation::instrument_bb_module_with_locality_counters(&mut counted);
-                counted
-            })
-        } else {
-            bb_call_target_counted
-        };
-
-    let bb_refcount_counted: BlockPyModule<CodegenModuleShape> =
-        if instrumentation::refcount_counter_instrumentation_enabled(env_config) {
-            pass_tracker.record_timing("bb_refcount_counters", || {
-                let mut counted = bb_locality_counted;
-                instrumentation::instrument_bb_module_with_refcount_counters(
-                    &mut counted,
-                    CounterScope::Function,
-                )
-                .map_err(anyhow::Error::msg)?;
-                Ok::<BlockPyModule<CodegenModuleShape>, anyhow::Error>(counted)
-            })?
-        } else {
-            bb_locality_counted
-        };
-
-    Ok(bb_refcount_counted)
+    let instrumentation_config = InstrumentationConfig::from_env_config(env_config);
+    instrumentation::instrument_module_with_tracker(
+        bb_codegen,
+        &instrumentation_config,
+        pass_tracker,
+    )
+    .map_err(anyhow::Error::msg)
+    .map_err(Into::into)
 }
 
 fn define_deopt_entry_counters_for_current_module(
@@ -480,7 +436,8 @@ pub fn finish_cached_codegen_module_for_runtime_with_counter_defs(
     let mut module = finish_cached_codegen_module_for_runtime(module, env_config)?;
     retain_defined_explicit_counter_increments(&mut module, counter_defs);
     module.counter_defs = counter_defs.to_vec();
-    if instrumentation::deopt_entry_counter_instrumentation_enabled(env_config) {
+    let instrumentation_config = InstrumentationConfig::from_env_config(env_config);
+    if instrumentation_config.deopt_entry_counters_enabled() {
         define_deopt_entry_counters_for_current_module(&mut module, &mut NoopPassTracker::new())?;
     }
     Ok(module)
