@@ -550,9 +550,9 @@ fn emit_setattr_fallback<'fb>(
     state.fb().inst_results(call_inst)[0]
 }
 
-fn emit_make_cell<'fb>(
-    state: &mut impl OperationEmitState<'fb, InstrCodegen>,
-    initial_value: Option<&InstrCodegen>,
+fn emit_make_cell<'fb, E>(
+    state: &mut impl OperationEmitState<'fb, E>,
+    initial_value: Option<&E>,
 ) -> ir::Value {
     let ptr_ty = state.ctx().consts.ptr_ty;
     let Some(initial_value) = initial_value else {
@@ -1235,9 +1235,9 @@ fn emit_store_with_indexed_global_plan<'fb, E: Instr<Name = ResolvedName>>(
     state.finish_owned_result(result)
 }
 
-fn emit_del<'fb>(
-    op: &blockpy_intrinsics::Del<InstrCodegen>,
-    state: &mut impl OperationEmitState<'fb, InstrCodegen>,
+fn emit_del<'fb, E: Instr<Name = ResolvedName>>(
+    op: &blockpy_intrinsics::Del<E>,
+    state: &mut impl OperationEmitState<'fb, E>,
 ) -> ir::Value {
     let name_obj = state.emit_owned_string_constant(op.name.id_str());
     let func_ref = if op.quietly {
@@ -1349,11 +1349,11 @@ pub(super) fn emit_typed_operation<'fb>(
                     plan,
                     soac_opt::plan_v3::ExactListItemAccessKind::Get,
                 )
-            })?;
+            });
             Some(operation_specializations::emit_getitem_with_plan(
                 op,
                 state,
-                Some(lowering_plan),
+                lowering_plan,
             ))
         }
         InstrTyped::SetItem(op) => {
@@ -1362,13 +1362,19 @@ pub(super) fn emit_typed_operation<'fb>(
                     plan,
                     soac_opt::plan_v3::ExactListItemAccessKind::Set,
                 )
-            })?;
+            });
             Some(operation_specializations::emit_setitem_with_plan(
                 op,
                 state,
-                Some(lowering_plan),
+                lowering_plan,
             ))
         }
+        InstrTyped::DelItem(op) => Some(emit_positional_owned_call(
+            &DP_JIT_PYOBJECT_DELITEM_IMPORT,
+            state,
+            &[op.value.as_ref(), op.index.as_ref()],
+        )),
+        InstrTyped::MakeCell(op) => Some(emit_make_cell(state, op.initial_value.as_deref())),
         InstrTyped::Store(op) => op.name.location.is_global().then(|| {
             let indexed_global_plan = op.extra().indexed_global_access_plan().map(|plan| {
                 if plan.access != soac_opt::plan_v3::IndexedGlobalAccessKind::Store {
@@ -1385,6 +1391,7 @@ pub(super) fn emit_typed_operation<'fb>(
             });
             emit_store_with_indexed_global_plan(op, state, indexed_global_plan)
         }),
+        InstrTyped::Del(op) => op.name.location.is_global().then(|| emit_del(op, state)),
         _ => None,
     }
 }

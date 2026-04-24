@@ -97,8 +97,7 @@ use soac_opt::passes::{
     lower_codegen_module_to_typed, lower_typed_function_call_access_plan_instrs,
     lower_typed_function_call_emission_plans, lower_typed_if_tests_to_truthy,
     refresh_typed_function_value_facts, try_lower_typed_instr_to_codegen_legacy,
-    try_lower_typed_term_to_codegen_legacy, validate_typed_function_call_access_plans,
-    validate_typed_function_value_facts,
+    validate_typed_function_call_access_plans, validate_typed_function_value_facts,
 };
 use soac_opt::pipeline_v3::plan_and_emit_module_v3_from_raw_evidence;
 use soac_opt::plan::ProfileEvidenceStore;
@@ -11021,35 +11020,6 @@ fn emit_owned_bool_from_pyobject_truthiness(
     bool_value
 }
 
-fn emit_branch_index_i64(
-    fb: &mut FunctionBuilder<'_>,
-    expr: &InstrCodegen,
-    local_env: &mut LocalEnv,
-    ctx: &JitEmitCtx<'_>,
-    codegen_env: &mut impl JitCodegenEnv,
-    func_imports: &mut FuncBuildImports<'_>,
-    pyobject_to_i64_ref: ir::FuncRef,
-) -> ir::Value {
-    match expr {
-        _ => {
-            let index_obj = emit_codegen_expr_with_local_env(
-                fb,
-                expr,
-                local_env,
-                ctx,
-                false,
-                codegen_env,
-                func_imports,
-            );
-            let index_i64_inst = fb.ins().call(pyobject_to_i64_ref, &[index_obj]);
-            let index_i64 = fb.inst_results(index_i64_inst)[0];
-            fb.ins()
-                .call(ctx.decref_ref, &[ctx.consts.thread_state_value, index_obj]);
-            index_i64
-        }
-    }
-}
-
 fn annotate_typed_attr_accesses(
     function: &mut BlockPyFunction<TypedCodegenModuleShape>,
     opt_v3_indexed_fields_by_instr: &HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>,
@@ -15400,6 +15370,31 @@ fn emit_typed_codegen_expr_value_with_local_env(
         return Ok(SoacValue::pyobject(value, PyObjFacts::unknown()));
     }
 
+    if typed_intrinsic_operation_may_emit_pyobject(expr) {
+        assert!(
+            !borrowed,
+            "typed intrinsic operation expression must not request a borrowed result"
+        );
+        let mut intrinsic_state = LocalEnvCodegenIntrinsicEmitState {
+            fb,
+            local_env,
+            ctx: emit_ctx,
+            codegen_env,
+            func_imports,
+        };
+        if let Some(value) = intrinsics::emit_typed_operation(expr, &mut intrinsic_state) {
+            let facts = expr
+                .result_facts()
+                .and_then(ValueFacts::as_pyobj)
+                .unwrap_or_else(PyObjFacts::unknown);
+            return Ok(SoacValue::pyobject_with_ownership(
+                value,
+                ValueOwnership::Owned,
+                facts,
+            ));
+        }
+    }
+
     if let InstrTyped::CallTyped(op) = expr {
         if let Some(result) = emit_typed_codegen_call_result_with_local_env(
             fb,
@@ -19096,6 +19091,16 @@ fn emit_typed_direct_call_guard_test_value_with_local_env(
     Ok(guard)
 }
 
+fn typed_intrinsic_operation_may_emit_pyobject(expr: &InstrTyped) -> bool {
+    match expr {
+        InstrTyped::GetItem(_) | InstrTyped::SetItem(_) | InstrTyped::DelItem(_) => true,
+        InstrTyped::MakeCell(_) => true,
+        InstrTyped::Store(op) => op.name.location.is_global(),
+        InstrTyped::Del(op) => op.name.location.is_global(),
+        _ => false,
+    }
+}
+
 #[allow(dead_code)]
 fn emit_typed_codegen_expr_with_local_env(
     fb: &mut FunctionBuilder<'_>,
@@ -19221,7 +19226,7 @@ fn emit_typed_codegen_stmt_with_local_env(
             return Ok(value);
         }
     }
-    if matches!(expr, InstrTyped::GetItem(_) | InstrTyped::SetItem(_)) {
+    if typed_intrinsic_operation_may_emit_pyobject(expr) {
         let mut intrinsic_state = LocalEnvCodegenIntrinsicEmitState {
             fb,
             local_env,
@@ -19492,7 +19497,7 @@ fn emit_typed_codegen_stmt_result_with_local_env(
             }
         }
     }
-    if matches!(expr, InstrTyped::GetItem(_) | InstrTyped::SetItem(_)) {
+    if typed_intrinsic_operation_may_emit_pyobject(expr) {
         let mut intrinsic_state = LocalEnvCodegenIntrinsicEmitState {
             fb,
             local_env,
@@ -21913,192 +21918,6 @@ fn emit_codegen_raise_exception_from_function(
     Ok(())
 }
 
-fn emit_codegen_term(
-    fb: &mut FunctionBuilder<'_>,
-    source_label: BlockLabel,
-    term: &BlockTerm<InstrCodegen>,
-    function: &BlockPyFunction<impl ModuleShape>,
-    exec_blocks: &[ir::Block],
-    block_indices_by_label: &HashMap<BlockLabel, usize>,
-    jump_edge_transports: &[Option<EdgeTransportPlan>],
-    implicit_target_transports: &[EdgeTransportPlan],
-    local_env: &mut LocalEnv,
-    emit_ctx: &JitEmitCtx<'_>,
-    codegen_env: &mut impl JitCodegenEnv,
-    func_imports: &mut FuncBuildImports<'_>,
-    pyobject_to_i64_ref: ir::FuncRef,
-    raise_exc_ref: ir::FuncRef,
-    current_exception_name: Option<&str>,
-) -> Result<(), String> {
-    let decref_ref = emit_ctx.decref_ref;
-
-    match term {
-        BlockTerm::Jump(target_label) => {
-            let target_index = codegen_block_index_for_label(
-                function,
-                block_indices_by_label,
-                target_label.target,
-            )?;
-            let source_index =
-                codegen_block_index_for_label(function, block_indices_by_label, source_label)?;
-            let edge_transport = jump_edge_transports[source_index]
-                .as_ref()
-                .expect("jump term should have a planned edge transport");
-            let mut jump_args = Vec::with_capacity(edge_transport.target_args.len());
-            let (prepared_args, forwarded_locations) =
-                emit_planned_target_args_codegen_from_local_env(
-                    fb,
-                    &edge_transport.target_args,
-                    local_env,
-                    emit_ctx,
-                    codegen_env,
-                    func_imports,
-                )
-                .map_err(|err| {
-                    format!(
-                        "missing local mapping for jump block params in block {source_label}: {err}"
-                    )
-                })?;
-            jump_args.extend(prepared_args);
-            let release_reason = RefcountReleaseReason::Jump {
-                target: target_label.target,
-            };
-            emit_planned_local_releases_for_reason_with_local_env(
-                fb,
-                source_label,
-                &release_reason,
-                local_env,
-                &forwarded_locations,
-                emit_ctx,
-            )?;
-            emit_decref_unforwarded_local_env(
-                fb,
-                local_env,
-                &forwarded_locations,
-                &[],
-                emit_ctx.consts.thread_state_value,
-                decref_ref,
-            );
-            emit_pop_handled_exception_if_leaving(
-                fb,
-                current_exception_name,
-                block_exception_name(function, target_label.target),
-                emit_ctx,
-            );
-            fb.ins().jump(exec_blocks[target_index], &jump_args);
-        }
-        BlockTerm::IfTerm(if_term) => {
-            let test_instr_id = if_term.test.try_semantic_instr_id();
-            let is_true_ref =
-                func_imports.get(codegen_env, &mut fb.func, &DP_JIT_IS_TRUE_IMPORT)?;
-            let test_value = emit_codegen_expr_value_with_local_env(
-                fb,
-                &if_term.test,
-                local_env,
-                emit_ctx,
-                false,
-                codegen_env,
-                func_imports,
-            );
-            let truth = emit_truthy_from_owned_value(fb, test_value, is_true_ref, emit_ctx);
-            let truth_i32 = truth.expect_i32_bool01("if condition truthiness");
-            emit_codegen_if_truth_i32(
-                fb,
-                source_label,
-                test_instr_id,
-                truth_i32,
-                if_term.then_label,
-                if_term.else_label,
-                current_exception_name,
-                function,
-                exec_blocks,
-                block_indices_by_label,
-                implicit_target_transports,
-                local_env,
-                emit_ctx,
-                codegen_env,
-                func_imports,
-            )?;
-        }
-        BlockTerm::BranchTable(branch) => {
-            let index_i64 = emit_branch_index_i64(
-                fb,
-                &branch.index,
-                local_env,
-                emit_ctx,
-                codegen_env,
-                func_imports,
-                pyobject_to_i64_ref,
-            );
-            emit_codegen_branch_table_from_i64(
-                fb,
-                source_label,
-                &branch.targets,
-                branch.default_label,
-                index_i64,
-                function,
-                exec_blocks,
-                block_indices_by_label,
-                implicit_target_transports,
-                local_env,
-                emit_ctx,
-                codegen_env,
-                func_imports,
-                current_exception_name,
-            )?;
-        }
-        BlockTerm::Return(value) => {
-            let ret_value = emit_codegen_expr_with_local_env(
-                fb,
-                value,
-                local_env,
-                emit_ctx,
-                false,
-                codegen_env,
-                func_imports,
-            );
-            emit_codegen_return_pyobject(
-                fb,
-                source_label,
-                ret_value,
-                local_env,
-                emit_ctx,
-                current_exception_name,
-            )?;
-        }
-        BlockTerm::Raise(raise_stmt) => {
-            let raise_fn = emit_load_raise_from_function(fb, emit_ctx);
-            let exc_value = if let Some(exc_expr) = raise_stmt.exc.as_ref() {
-                emit_codegen_expr_with_local_env(
-                    fb,
-                    exc_expr,
-                    local_env,
-                    emit_ctx,
-                    false,
-                    codegen_env,
-                    func_imports,
-                )
-            } else {
-                let none_const = emit_none_const(fb, emit_ctx);
-                fb.ins().call(emit_ctx.incref_ref, &[none_const]);
-                none_const
-            };
-            emit_codegen_raise_exception_from_function(
-                fb,
-                source_label,
-                raise_fn,
-                exc_value,
-                ValueOwnership::Owned,
-                local_env,
-                emit_ctx,
-                raise_exc_ref,
-                current_exception_name,
-            )?;
-        }
-    }
-    Ok(())
-}
-
 #[allow(clippy::too_many_arguments)]
 fn emit_typed_codegen_term(
     fb: &mut FunctionBuilder<'_>,
@@ -22332,24 +22151,59 @@ fn emit_typed_codegen_term(
         );
     }
 
-    let legacy_term = try_lower_typed_term_to_codegen_legacy(term.clone())?;
-    emit_codegen_term(
-        fb,
-        source_label,
-        &legacy_term,
-        function,
-        exec_blocks,
-        block_indices_by_label,
-        jump_edge_transports,
-        implicit_target_transports,
-        local_env,
-        emit_ctx,
-        codegen_env,
-        func_imports,
-        pyobject_to_i64_ref,
-        raise_exc_ref,
-        current_exception_name,
-    )
+    if let BlockTerm::Jump(edge) = term {
+        let target_index =
+            codegen_block_index_for_label(function, block_indices_by_label, edge.target)?;
+        let source_index =
+            codegen_block_index_for_label(function, block_indices_by_label, source_label)?;
+        let edge_transport = jump_edge_transports[source_index]
+            .as_ref()
+            .expect("jump term should have a planned edge transport");
+        let mut jump_args = Vec::with_capacity(edge_transport.target_args.len());
+        let (prepared_args, forwarded_locations) = emit_planned_target_args_codegen_from_local_env(
+            fb,
+            &edge_transport.target_args,
+            local_env,
+            emit_ctx,
+            codegen_env,
+            func_imports,
+        )
+        .map_err(|err| {
+            format!(
+                "missing local mapping for typed jump block params in block {source_label}: {err}"
+            )
+        })?;
+        jump_args.extend(prepared_args);
+        let release_reason = RefcountReleaseReason::Jump {
+            target: edge.target,
+        };
+        emit_planned_local_releases_for_reason_with_local_env(
+            fb,
+            source_label,
+            &release_reason,
+            local_env,
+            &forwarded_locations,
+            emit_ctx,
+        )?;
+        emit_decref_unforwarded_local_env(
+            fb,
+            local_env,
+            &forwarded_locations,
+            &[],
+            emit_ctx.consts.thread_state_value,
+            emit_ctx.decref_ref,
+        );
+        emit_pop_handled_exception_if_leaving(
+            fb,
+            current_exception_name,
+            block_exception_name(function, edge.target),
+            emit_ctx,
+        );
+        fb.ins().jump(exec_blocks[target_index], &jump_args);
+        return Ok(());
+    }
+
+    unreachable!("all typed block terminators should be handled before legacy lowering")
 }
 
 fn new_jit_builder(env_config: &SoacEnvConfig) -> Result<JITBuilder, String> {
