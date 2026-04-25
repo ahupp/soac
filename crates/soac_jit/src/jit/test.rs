@@ -35,19 +35,8 @@ mod tests {
         CounterInstrumentationConfig, ExplicitCounterPlacement, InstrumentationConfig,
         RefcountCounterMode, instrument_codegen_module_with_tracker,
     };
-    use soac_opt::alternatives_v3::AlternativeCatalog;
-    use soac_opt::artifacts_v3::{ExactIntBranchV3Artifacts, write_optimization_artifacts_v3};
-    use soac_opt::emit_v3::{MechanicalIndexedFieldGuard, MechanicalModuleEmission};
-    use soac_opt::passes::{
-        TypedInstrExtra, TypedPlannedResult as PlannedResult,
-        lower_typed_function_if_tests_to_truthy,
-    };
-    use soac_opt::pipeline_v3::{
-        plan_and_emit_function_exact_int_branches_v3_with_module_constants,
-        plan_and_emit_module_v3_from_raw_evidence,
-    };
-    use soac_opt::plan::{FunctionProfileEvidence, ProfileEvidenceStore};
-    use soac_opt::plan_v3::{
+    use soac_ir_typed::emit_v3::{MechanicalIndexedFieldGuard, MechanicalModuleEmission};
+    use soac_ir_typed::plan_v3::{
         CallBodyKind, CallBodyPlan, Cost, DirectCallArgPlan as PlanV3DirectCallArgPlan,
         DirectCallArgSource as PlanV3DirectCallArgSource, DirectCallSpecializationPlan,
         ExactListItemAccessKind as PlanV3ExactListItemAccessKind,
@@ -60,6 +49,15 @@ mod tests {
         IndexedGlobalFallbackPlan, IndexedGlobalGuardKind, IndexedGlobalGuardPlan,
         IndexedGlobalSpecializationPlan, ModuleOptimizationPlanV3, ModulePlanIdentity,
     };
+    use soac_ir_typed::{TypedInstrExtra, TypedPlannedResult as PlannedResult};
+    use soac_opt::alternatives_v3::AlternativeCatalog;
+    use soac_opt::artifacts_v3::{ExactIntBranchV3Artifacts, write_optimization_artifacts_v3};
+    use soac_opt::passes::lower_typed_function_if_tests_to_truthy;
+    use soac_opt::pipeline_v3::{
+        plan_and_emit_function_exact_int_branches_v3_with_module_constants,
+        plan_and_emit_module_v3_from_raw_evidence,
+    };
+    use soac_opt::plan::{FunctionProfileEvidence, ProfileEvidenceStore};
     use std::collections::{HashMap, VecDeque};
     use std::ffi::c_void;
     use std::mem::size_of;
@@ -3316,7 +3314,7 @@ def build(values):
                 ),
                 helper_catalog_version: 1,
                 cost_model_version: 1,
-                functions: vec![soac_opt::plan_v3::FunctionOptimizationPlanV3 {
+                functions: vec![soac_ir_typed::plan_v3::FunctionOptimizationPlanV3 {
                     function: FunctionPlanIdentity {
                         function: serialized_function,
                         debug_name: Some(function.names.qualname.clone()),
@@ -3328,13 +3326,13 @@ def build(values):
                     indexed_fields: Vec::new(),
                     indexed_globals: Vec::new(),
                     deopt_points: Vec::new(),
-                    ownership: soac_opt::plan_v3::FunctionOwnershipPlan::default(),
+                    ownership: soac_ir_typed::plan_v3::FunctionOwnershipPlan::default(),
                     diagnostics: Vec::new(),
                 }],
             },
             emission: MechanicalModuleEmission {
                 module_name: module_name.to_string(),
-                functions: vec![soac_opt::emit_v3::MechanicalFunctionEmission {
+                functions: vec![soac_ir_typed::emit_v3::MechanicalFunctionEmission {
                     function: serialized_function,
                     debug_name: Some(function.names.qualname.clone()),
                     direct_calls: Vec::new(),
@@ -4157,14 +4155,14 @@ def build(values):
             .body
             .first_mut()
             .expect("test block should contain call");
-        let soac_opt::passes::InstrTyped::CallTyped(call) = first_instr else {
+        let soac_ir_typed::InstrTyped::CallTyped(call) = first_instr else {
             panic!("test call should lower to typed call");
         };
-        call.access = soac_opt::passes::TypedCallAccessPlan::GuardedCallable {
-            function_guards: vec![soac_opt::passes::TypedDirectFunctionCallGuard {
+        call.access = soac_ir_typed::TypedCallAccessPlan::GuardedCallable {
+            function_guards: vec![soac_ir_typed::TypedDirectFunctionCallGuard {
                 function_id: RuntimeFunctionId::from_raw_parts(0, 1),
-                arg_plan: soac_opt::passes::TypedDirectCallArgPlan {
-                    sources: vec![soac_opt::passes::TypedDirectCallArgSource::Provided(0)],
+                arg_plan: soac_ir_typed::TypedDirectCallArgPlan {
+                    sources: vec![soac_ir_typed::TypedDirectCallArgSource::Provided(0)],
                 },
             }],
             constructor_guards: Vec::new(),
@@ -4177,7 +4175,7 @@ def build(values):
         assert!(
             matches!(
                 typed_function.blocks[0].body.first(),
-                Some(soac_opt::passes::InstrTyped::GuardedCallableCallTyped(_))
+                Some(soac_ir_typed::InstrTyped::GuardedCallableCallTyped(_))
             ),
             "guarded call plan should lower before demand planning"
         );
@@ -6593,7 +6591,7 @@ def read_point(point):
                     reason: "profiled type_keys selected this indexed-field layout".to_string(),
                 });
             artifacts.emission.functions[0].indexed_fields.push(
-                soac_opt::emit_v3::MechanicalIndexedFieldEmission {
+                soac_ir_typed::emit_v3::MechanicalIndexedFieldEmission {
                     source: getattr_instr_id,
                     access: IndexedFieldAccessKind::Load,
                     guard: MechanicalIndexedFieldGuard {
@@ -14823,7 +14821,7 @@ def f(x):
                 ),
                 helper_catalog_version: 1,
                 cost_model_version: 1,
-                functions: vec![soac_opt::plan_v3::FunctionOptimizationPlanV3 {
+                functions: vec![soac_ir_typed::plan_v3::FunctionOptimizationPlanV3 {
                     function: FunctionPlanIdentity {
                         function: serialized_function,
                         debug_name: Some(function.names.qualname.clone()),
@@ -14835,13 +14833,13 @@ def f(x):
                     indexed_fields: Vec::new(),
                     indexed_globals: Vec::new(),
                     deopt_points: Vec::new(),
-                    ownership: soac_opt::plan_v3::FunctionOwnershipPlan::default(),
+                    ownership: soac_ir_typed::plan_v3::FunctionOwnershipPlan::default(),
                     diagnostics: Vec::new(),
                 }],
             },
             emission: MechanicalModuleEmission {
                 module_name: "test".to_string(),
-                functions: vec![soac_opt::emit_v3::MechanicalFunctionEmission {
+                functions: vec![soac_ir_typed::emit_v3::MechanicalFunctionEmission {
                     function: serialized_function,
                     debug_name: Some(function.names.qualname.clone()),
                     direct_calls: Vec::new(),
@@ -14907,7 +14905,7 @@ def f(x):
                 ),
                 helper_catalog_version: 1,
                 cost_model_version: 1,
-                functions: vec![soac_opt::plan_v3::FunctionOptimizationPlanV3 {
+                functions: vec![soac_ir_typed::plan_v3::FunctionOptimizationPlanV3 {
                     function: FunctionPlanIdentity {
                         function: serialized_caller,
                         debug_name: Some("caller".to_string()),
@@ -14927,16 +14925,16 @@ def f(x):
                     indexed_fields: Vec::new(),
                     indexed_globals: Vec::new(),
                     deopt_points: Vec::new(),
-                    ownership: soac_opt::plan_v3::FunctionOwnershipPlan::default(),
+                    ownership: soac_ir_typed::plan_v3::FunctionOwnershipPlan::default(),
                     diagnostics: Vec::new(),
                 }],
             },
             emission: MechanicalModuleEmission {
                 module_name: "test".to_string(),
-                functions: vec![soac_opt::emit_v3::MechanicalFunctionEmission {
+                functions: vec![soac_ir_typed::emit_v3::MechanicalFunctionEmission {
                     function: serialized_caller,
                     debug_name: Some("caller".to_string()),
-                    direct_calls: vec![soac_opt::emit_v3::MechanicalDirectCallEmission {
+                    direct_calls: vec![soac_ir_typed::emit_v3::MechanicalDirectCallEmission {
                         source,
                         target: serialized_callee,
                         arg_plan: PlanV3DirectCallArgPlan {
@@ -14975,8 +14973,8 @@ def f(x):
             &ResolvedV3DirectCallPlan {
                 source,
                 target: callee_id,
-                arg_plan: soac_opt::passes::TypedDirectCallArgPlan {
-                    sources: vec![soac_opt::passes::TypedDirectCallArgSource::Provided(0)],
+                arg_plan: soac_ir_typed::TypedDirectCallArgPlan {
+                    sources: vec![soac_ir_typed::TypedDirectCallArgSource::Provided(0)],
                 },
                 body: test_v3_inline_call_body(),
                 reason: "profiled direct call".to_string(),
@@ -15033,7 +15031,7 @@ def f(x):
                 ),
                 helper_catalog_version: 1,
                 cost_model_version: 1,
-                functions: vec![soac_opt::plan_v3::FunctionOptimizationPlanV3 {
+                functions: vec![soac_ir_typed::plan_v3::FunctionOptimizationPlanV3 {
                     function: FunctionPlanIdentity {
                         function: serialized_caller,
                         debug_name: Some("caller".to_string()),
@@ -15053,16 +15051,16 @@ def f(x):
                     indexed_fields: Vec::new(),
                     indexed_globals: Vec::new(),
                     deopt_points: Vec::new(),
-                    ownership: soac_opt::plan_v3::FunctionOwnershipPlan::default(),
+                    ownership: soac_ir_typed::plan_v3::FunctionOwnershipPlan::default(),
                     diagnostics: Vec::new(),
                 }],
             },
             emission: MechanicalModuleEmission {
                 module_name: caller_module_name.to_string(),
-                functions: vec![soac_opt::emit_v3::MechanicalFunctionEmission {
+                functions: vec![soac_ir_typed::emit_v3::MechanicalFunctionEmission {
                     function: serialized_caller,
                     debug_name: Some("caller".to_string()),
-                    direct_calls: vec![soac_opt::emit_v3::MechanicalDirectCallEmission {
+                    direct_calls: vec![soac_ir_typed::emit_v3::MechanicalDirectCallEmission {
                         source,
                         target: serialized_callee,
                         arg_plan: PlanV3DirectCallArgPlan {
@@ -15101,8 +15099,8 @@ def f(x):
             &ResolvedV3DirectCallPlan {
                 source,
                 target: callee_id,
-                arg_plan: soac_opt::passes::TypedDirectCallArgPlan {
-                    sources: vec![soac_opt::passes::TypedDirectCallArgSource::Provided(0)],
+                arg_plan: soac_ir_typed::TypedDirectCallArgPlan {
+                    sources: vec![soac_ir_typed::TypedDirectCallArgSource::Provided(0)],
                 },
                 body: test_v3_inline_call_body(),
                 reason: "profiled cross-module direct call".to_string(),
@@ -15181,7 +15179,7 @@ def f(x):
                 ),
                 helper_catalog_version: 1,
                 cost_model_version: 1,
-                functions: vec![soac_opt::plan_v3::FunctionOptimizationPlanV3 {
+                functions: vec![soac_ir_typed::plan_v3::FunctionOptimizationPlanV3 {
                     function: FunctionPlanIdentity {
                         function: serialized_caller,
                         debug_name: Some("caller".to_string()),
@@ -15224,19 +15222,19 @@ def f(x):
                     ],
                     indexed_globals: Vec::new(),
                     deopt_points: Vec::new(),
-                    ownership: soac_opt::plan_v3::FunctionOwnershipPlan::default(),
+                    ownership: soac_ir_typed::plan_v3::FunctionOwnershipPlan::default(),
                     diagnostics: Vec::new(),
                 }],
             },
             emission: MechanicalModuleEmission {
                 module_name: "test".to_string(),
-                functions: vec![soac_opt::emit_v3::MechanicalFunctionEmission {
+                functions: vec![soac_ir_typed::emit_v3::MechanicalFunctionEmission {
                     function: serialized_caller,
                     debug_name: Some("caller".to_string()),
                     direct_calls: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: vec![
-                        soac_opt::emit_v3::MechanicalIndexedFieldEmission {
+                        soac_ir_typed::emit_v3::MechanicalIndexedFieldEmission {
                             source: load_source,
                             access: IndexedFieldAccessKind::Load,
                             guard: MechanicalIndexedFieldGuard {
@@ -15251,7 +15249,7 @@ def f(x):
                             reason: "profiled type_keys selected this indexed-field layout"
                                 .to_string(),
                         },
-                        soac_opt::emit_v3::MechanicalIndexedFieldEmission {
+                        soac_ir_typed::emit_v3::MechanicalIndexedFieldEmission {
                             source: store_source,
                             access: IndexedFieldAccessKind::Store,
                             guard: MechanicalIndexedFieldGuard {
@@ -15365,7 +15363,7 @@ def f(x):
                 ),
                 helper_catalog_version: 1,
                 cost_model_version: 1,
-                functions: vec![soac_opt::plan_v3::FunctionOptimizationPlanV3 {
+                functions: vec![soac_ir_typed::plan_v3::FunctionOptimizationPlanV3 {
                     function: FunctionPlanIdentity {
                         function: serialized_caller,
                         debug_name: Some("caller".to_string()),
@@ -15400,20 +15398,20 @@ def f(x):
                         },
                     ],
                     deopt_points: Vec::new(),
-                    ownership: soac_opt::plan_v3::FunctionOwnershipPlan::default(),
+                    ownership: soac_ir_typed::plan_v3::FunctionOwnershipPlan::default(),
                     diagnostics: Vec::new(),
                 }],
             },
             emission: MechanicalModuleEmission {
                 module_name: "test".to_string(),
-                functions: vec![soac_opt::emit_v3::MechanicalFunctionEmission {
+                functions: vec![soac_ir_typed::emit_v3::MechanicalFunctionEmission {
                     function: serialized_caller,
                     debug_name: Some("caller".to_string()),
                     direct_calls: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
                     indexed_globals: vec![
-                        soac_opt::emit_v3::MechanicalIndexedGlobalEmission {
+                        soac_ir_typed::emit_v3::MechanicalIndexedGlobalEmission {
                             source: load_source,
                             access: IndexedGlobalAccessKind::Load,
                             module_name: "test".to_string(),
@@ -15424,7 +15422,7 @@ def f(x):
                             reason: "profiled module_keys selected this indexed-global slot"
                                 .to_string(),
                         },
-                        soac_opt::emit_v3::MechanicalIndexedGlobalEmission {
+                        soac_ir_typed::emit_v3::MechanicalIndexedGlobalEmission {
                             source: store_source,
                             access: IndexedGlobalAccessKind::Store,
                             module_name: "test".to_string(),
@@ -15872,7 +15870,7 @@ def read_point(point):
                     reason: "profiled type_keys selected this indexed-field layout".to_string(),
                 });
             artifacts.emission.functions[0].indexed_fields.push(
-                soac_opt::emit_v3::MechanicalIndexedFieldEmission {
+                soac_ir_typed::emit_v3::MechanicalIndexedFieldEmission {
                     source: getattr_instr_id,
                     access: IndexedFieldAccessKind::Load,
                     guard: MechanicalIndexedFieldGuard {
@@ -16107,7 +16105,7 @@ def write_point(point, value):
                     reason: store_reason.clone(),
                 });
             artifacts.emission.functions[0].indexed_fields.push(
-                soac_opt::emit_v3::MechanicalIndexedFieldEmission {
+                soac_ir_typed::emit_v3::MechanicalIndexedFieldEmission {
                     source: setattr_instr_id,
                     access: IndexedFieldAccessKind::Store,
                     guard: MechanicalIndexedFieldGuard {
@@ -16435,7 +16433,7 @@ def write_point(point, value):
                 ),
                 helper_catalog_version: 1,
                 cost_model_version: 1,
-                functions: vec![soac_opt::plan_v3::FunctionOptimizationPlanV3 {
+                functions: vec![soac_ir_typed::plan_v3::FunctionOptimizationPlanV3 {
                     function: FunctionPlanIdentity {
                         function: serialized_caller,
                         debug_name: Some("caller".to_string()),
@@ -16455,13 +16453,13 @@ def write_point(point, value):
                     indexed_fields: Vec::new(),
                     indexed_globals: Vec::new(),
                     deopt_points: Vec::new(),
-                    ownership: soac_opt::plan_v3::FunctionOwnershipPlan::default(),
+                    ownership: soac_ir_typed::plan_v3::FunctionOwnershipPlan::default(),
                     diagnostics: Vec::new(),
                 }],
             },
             emission: MechanicalModuleEmission {
                 module_name: "test".to_string(),
-                functions: vec![soac_opt::emit_v3::MechanicalFunctionEmission {
+                functions: vec![soac_ir_typed::emit_v3::MechanicalFunctionEmission {
                     function: serialized_caller,
                     debug_name: Some("caller".to_string()),
                     direct_calls: Vec::new(),
@@ -16522,7 +16520,7 @@ def write_point(point, value):
                 ),
                 helper_catalog_version: 1,
                 cost_model_version: 1,
-                functions: vec![soac_opt::plan_v3::FunctionOptimizationPlanV3 {
+                functions: vec![soac_ir_typed::plan_v3::FunctionOptimizationPlanV3 {
                     function: FunctionPlanIdentity {
                         function: serialized_caller,
                         debug_name: Some("caller".to_string()),
@@ -16547,13 +16545,13 @@ def write_point(point, value):
                     }],
                     indexed_globals: Vec::new(),
                     deopt_points: Vec::new(),
-                    ownership: soac_opt::plan_v3::FunctionOwnershipPlan::default(),
+                    ownership: soac_ir_typed::plan_v3::FunctionOwnershipPlan::default(),
                     diagnostics: Vec::new(),
                 }],
             },
             emission: MechanicalModuleEmission {
                 module_name: "test".to_string(),
-                functions: vec![soac_opt::emit_v3::MechanicalFunctionEmission {
+                functions: vec![soac_ir_typed::emit_v3::MechanicalFunctionEmission {
                     function: serialized_caller,
                     debug_name: Some("caller".to_string()),
                     direct_calls: Vec::new(),

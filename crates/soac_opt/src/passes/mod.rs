@@ -58,22 +58,9 @@ pub fn allocate_codegen_stack_temp(
 }
 
 pub use crate::typed::{
-    InstrTyped, TypedAttrAccessPlan, TypedAttrOwnerRef, TypedBlock, TypedBlockExtra,
-    TypedBlockLayoutHint, TypedCall, TypedCallAccessPlan, TypedCallEmissionPlan,
-    TypedCallEmissionPlans, TypedCodegenModuleShape, TypedDirectCallArgPlan,
-    TypedDirectCallArgSource, TypedDirectCallGuardTest, TypedDirectCallGuardTestKind,
-    TypedDirectCallableCall, TypedDirectCallableCallGuard, TypedDirectConstructorCallGuard,
-    TypedDirectFunctionCallGuard, TypedDirectMethodCall, TypedDirectMethodCallGuard,
-    TypedExactIntBranchPlan, TypedExactIntPlanSource, TypedExactIntReturnPlan,
-    TypedExactIntScalarThreadPlan, TypedExactListItemAccessPlan, TypedExactListItemPlanSource,
-    TypedGetAttr, TypedGuardedCallableCall, TypedGuardedMethodCall, TypedIndexedFieldGuard,
-    TypedIndexedFieldPlanSource, TypedIndexedGlobalAccessPlan, TypedIndexedGlobalPlanSource,
-    TypedInstrExtra, TypedPlannedResult, TypedPyObjectOwnershipPlan, TypedResultDemand,
-    TypedSetAttr, TypedTruthy, annotate_typed_function_planned_results,
-    annotate_typed_function_result_demands, annotate_typed_function_value_facts,
-    annotate_typed_module_value_facts, assign_missing_typed_function_instr_ids,
-    inline_typed_function_direct_call_stores, lower_codegen_function_to_typed,
-    lower_codegen_module_to_typed, lower_typed_function_call_access_plan_instrs,
+    annotate_typed_function_planned_results, annotate_typed_function_result_demands,
+    annotate_typed_function_value_facts, annotate_typed_module_value_facts,
+    inline_typed_function_direct_call_stores, lower_typed_function_call_access_plan_instrs,
     lower_typed_function_call_emission_plans, lower_typed_function_if_tests_to_truthy,
     lower_typed_if_tests_to_truthy, refresh_typed_function_value_facts,
     try_lower_typed_instr_to_codegen_legacy, try_lower_typed_module_to_codegen_legacy,
@@ -119,8 +106,4 @@ pub use ownership_effects::{
     plan_ownership_effects, plan_typed_ownership_effects, validate_ownership_effects,
     validate_typed_ownership_effects,
 };
-pub use value_facts::{
-    BoolFacts, BoolSingletonFact, CallableFact, EnvFacts, FactStore, I32Facts, I64Facts, NoneFact,
-    ProvenanceFact, PyExactType, PyObjFacts, RefcountFact, RuntimeHelperId, RuntimeHelperSignature,
-    RuntimeSingleton, ThrowSpec, TruthinessFact, TypeFact, ValueFacts, infer_module_value_facts,
-};
+pub use value_facts::infer_module_value_facts;

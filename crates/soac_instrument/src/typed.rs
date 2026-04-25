@@ -10,7 +10,7 @@ use soac_core::block_py::{
     HasSemanticInstrId, Meta, NameLocation, RuntimeFunctionId, Visit, WithMeta,
 };
 use soac_core::pass_tracker::{NoopPassTracker, PassTracker};
-use soac_opt::typed::{InstrTyped, TypedCodegenModuleShape};
+use soac_ir_typed::{InstrTyped, TypedCodegenModuleShape};
 
 fn functions_with_counter_instrumentation_mut(
     functions: &mut [BlockPyFunction<TypedCodegenModuleShape>],

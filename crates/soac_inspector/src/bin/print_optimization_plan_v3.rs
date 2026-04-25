@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow, bail};
+use soac_ir_typed::emit_v3::{MechanicalFunctionEmission, MechanicalRegionEmission};
+use soac_ir_typed::plan_v3::{RegionId, RegionPlan};
 use soac_opt::artifacts_v3::{ExactIntBranchV3Artifacts, load_optimization_artifacts_v3};
-use soac_opt::emit_v3::{MechanicalFunctionEmission, MechanicalRegionEmission};
-use soac_opt::plan_v3::{RegionId, RegionPlan};
 use std::env;
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -335,8 +335,8 @@ mod test {
         LocalFunctionId, SerializedFunctionId, SerializedIdentityTables, SerializedModuleId,
         SerializedModuleIdentity,
     };
-    use soac_opt::emit_v3::{MechanicalFunctionEmission, MechanicalModuleEmission};
-    use soac_opt::plan_v3::{
+    use soac_ir_typed::emit_v3::{MechanicalFunctionEmission, MechanicalModuleEmission};
+    use soac_ir_typed::plan_v3::{
         FunctionOptimizationPlanV3, FunctionOwnershipPlan, FunctionPlanIdentity,
         ModuleOptimizationPlanV3, ModulePlanIdentity,
     };

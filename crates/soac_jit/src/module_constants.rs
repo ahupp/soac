@@ -6,7 +6,7 @@ use soac_core::block_py::{
     ChildVisitable, ConstantExpr, NameLike, ParamDefaultSource, RuntimeName,
 };
 use soac_ir_blockpy::{CodegenModuleShape, InstrCodegen};
-use soac_opt::passes::{InstrTyped, TypedCodegenModuleShape};
+use soac_ir_typed::{InstrTyped, TypedCodegenModuleShape};
 use std::collections::HashMap;
 
 mod materialization;

@@ -1,6 +1,5 @@
 use crate::alternatives_v3::AlternativeCatalog;
 use crate::artifacts_v3::ExactIntBranchV3Artifacts;
-use crate::emit_v3::{MechanicalEmitError, emit_mechanical_plan_v3};
 use crate::evidence_v3::{
     PlannerFactHints, planner_fact_hints_from_module_constants_v3,
     planner_facts_from_profile_evidence_v3,
@@ -10,14 +9,6 @@ use crate::passes::{
     build_direct_call_inline_fragment_to_target,
 };
 use crate::plan::{FunctionProfileEvidence, ProfileEvidenceStore};
-use crate::plan_v3::{
-    DirectCallArgPlan, DirectCallArgSource, DirectCallSpecializationPlan,
-    EXACT_LIST_EXACT_INT_ITEM_SHAPE_TAG, ExactListItemAccessKind, ExactListItemShape,
-    ExactListItemSpecializationPlan, FunctionOptimizationPlanV3, FunctionPlanIdentity,
-    IndexedFieldAccessKind, IndexedFieldOwnerType, IndexedFieldSpecializationPlan,
-    IndexedGlobalAccessKind, IndexedGlobalSpecializationPlan, ModuleOptimizationPlanV3,
-    ModulePlanIdentity, PlanDiagnostic, RegionId,
-};
 use crate::planner_v3::{
     CallBodyPlanRequest, DirectCallPlanRequest, ExactListItemPlanRequest,
     ExtractedRegionPlanRequest, FunctionPlanRequest, IndexedFieldPlanRequest,
@@ -34,6 +25,15 @@ use soac_core::block_py::{
     LocalFunctionId, ModuleContentId, NameLike, NameLocation, ParamKind, PersistentFunctionId,
     ResolvedName, SerializedFunctionDebugName, SerializedFunctionId, SerializedIdentityTables,
     SerializedModuleId, SerializedModuleIdentity, Visit,
+};
+use soac_ir_typed::emit_v3::{MechanicalEmitError, emit_mechanical_plan_v3};
+use soac_ir_typed::plan_v3::{
+    DirectCallArgPlan, DirectCallArgSource, DirectCallSpecializationPlan,
+    EXACT_LIST_EXACT_INT_ITEM_SHAPE_TAG, ExactListItemAccessKind, ExactListItemShape,
+    ExactListItemSpecializationPlan, FunctionOptimizationPlanV3, FunctionPlanIdentity,
+    IndexedFieldAccessKind, IndexedFieldOwnerType, IndexedFieldSpecializationPlan,
+    IndexedGlobalAccessKind, IndexedGlobalSpecializationPlan, ModuleOptimizationPlanV3,
+    ModulePlanIdentity, PlanDiagnostic, RegionId,
 };
 use std::collections::HashMap;
 use std::fmt;
@@ -1662,7 +1662,6 @@ fn counter_evidence_matches_module_v3(
 mod tests {
     use super::*;
     use crate::operator_specialization::{ExactTypeTag, pack_binary_shape};
-    use crate::plan_v3::{RegionId, validate_module_plan_v3};
     use crate::region_v3::{ExtractedValueId, extract_block_region_v3};
     use soac_core::block_py::literal::{LiteralValue, StringLiteral};
     use soac_core::block_py::{
@@ -1676,6 +1675,7 @@ mod tests {
         CounterDumpTypeTableEntry,
     };
     use soac_ir_blockpy::InstrCodegen;
+    use soac_ir_typed::plan_v3::{RegionId, validate_module_plan_v3};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 

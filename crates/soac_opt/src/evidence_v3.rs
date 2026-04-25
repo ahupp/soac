@@ -91,9 +91,6 @@ mod tests {
     use crate::alternatives_v3::AlternativeCatalog;
     use crate::operator_specialization::{ExactTypeTag, pack_binary_shape};
     use crate::plan::FunctionProfileEvidence;
-    use crate::plan_v3::{
-        FunctionPlanIdentity, ModulePlanIdentity, RegionId, validate_module_plan_v3,
-    };
     use crate::planner_v3::{
         ExtractedRegionPlanRequest, FunctionPlanRequest, ModulePlanRequest,
         plan_module_optimization_v3,
@@ -104,6 +101,9 @@ mod tests {
         BinOp, BinOpKind, Block, BlockLabel, BlockParam, BlockPyName, BlockTerm, InstrId, Load,
         LocalFunctionId, LocalLocation, Meta, NameLocation, ResolvedName, SerializedFunctionId,
         SerializedIdentityTables, SerializedModuleId, SerializedModuleIdentity, TermIf, WithMeta,
+    };
+    use soac_ir_typed::plan_v3::{
+        FunctionPlanIdentity, ModulePlanIdentity, RegionId, validate_module_plan_v3,
     };
 
     fn label(index: usize) -> BlockLabel {
@@ -217,7 +217,7 @@ mod tests {
     fn plan_with(
         region: ExtractedRegion,
         facts: PlannerFacts,
-    ) -> crate::plan_v3::ModuleOptimizationPlanV3 {
+    ) -> soac_ir_typed::plan_v3::ModuleOptimizationPlanV3 {
         plan_module_optimization_v3(
             &AlternativeCatalog::default_v3(),
             ModulePlanRequest {

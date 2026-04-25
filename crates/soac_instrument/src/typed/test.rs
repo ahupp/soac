@@ -5,8 +5,8 @@ use soac_core::block_py::{
     BlockPyFunction, BlockPyModule, ChildVisitable, CounterSite, FunctionExecutionMode, Visit,
 };
 use soac_core::pass_tracker::NoopPassTracker;
+use soac_ir_typed::{InstrTyped, TypedCodegenModuleShape, lower_codegen_module_to_typed};
 use soac_lowering::lower_python_to_blockpy_for_testing;
-use soac_opt::typed::{InstrTyped, TypedCodegenModuleShape, lower_codegen_module_to_typed};
 use std::collections::HashSet;
 
 fn typed_module_for_test(source: &str) -> BlockPyModule<TypedCodegenModuleShape> {

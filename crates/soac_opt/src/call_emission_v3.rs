@@ -1,10 +1,10 @@
 use crate::artifacts_v3::ExactIntBranchV3Artifacts;
-use crate::plan_v3::{CallBodyKind, CallBodyPlan, DirectCallArgPlan, DirectCallArgSource};
-use crate::typed::{
+use soac_core::block_py::{InstrId, PersistentFunctionId, RuntimeFunctionId};
+use soac_ir_typed::plan_v3::{CallBodyKind, CallBodyPlan, DirectCallArgPlan, DirectCallArgSource};
+use soac_ir_typed::{
     TypedCallEmissionPlan, TypedCallEmissionPlans, TypedDirectCallArgPlan,
     TypedDirectCallArgSource, TypedDirectFunctionCallGuard,
 };
-use soac_core::block_py::{InstrId, PersistentFunctionId, RuntimeFunctionId};
 use std::collections::HashMap;
 
 #[derive(Clone, Debug, PartialEq, Eq)]

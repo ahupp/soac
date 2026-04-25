@@ -13,6 +13,7 @@ rkyv = { version = "0.8", default-features = false, features = ["std", "bytechec
 soac_config = { path = "../soac_config" }
 soac_core = { path = "../soac_core" }
 soac_ir_blockpy = { path = "../soac_ir_blockpy" }
+soac_ir_typed = { path = "../soac_ir_typed" }
 soac_instrument = { path = "../soac_instrument" }
 soac_lowering = { path = "../soac_lowering" }
 soac_opt = { path = "../soac_opt" }

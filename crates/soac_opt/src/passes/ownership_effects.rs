@@ -6,13 +6,13 @@
 //! operations once representation choices such as SSA block params, stack-slot
 //! mirrors, borrowed helper results, and immortal constants are known.
 
-use crate::passes::{
-    CodegenModuleShape, FactStore, InstrCodegen, InstrTyped, PyObjFacts, TypedBlock,
-    TypedCodegenModuleShape, ValueFacts,
-};
+use crate::passes::{CodegenModuleShape, InstrCodegen};
 use soac_core::block_py::{
     Block, BlockArg, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, CellLocation,
     ChildVisitable, HasSemanticInstrId, InstrKey, LocalLocation, RuntimeFunctionId, Visit,
+};
+use soac_ir_typed::{
+    FactStore, InstrTyped, PyObjFacts, TypedBlock, TypedCodegenModuleShape, ValueFacts,
 };
 use std::collections::{HashMap, HashSet};
 

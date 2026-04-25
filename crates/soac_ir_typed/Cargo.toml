@@ -1,5 +1,5 @@
 [package]
-name = "soac_opt"
+name = "soac_ir_typed"
 version = "0.1.0"
 edition = "2024"
 
@@ -7,12 +7,8 @@ edition = "2024"
 doctest = false
 
 [dependencies]
-anyhow = { version = "1.0.100", features = ["backtrace"] }
 derive_more = { version = "2", features = ["from"] }
-rkyv = { version = "0.8", features = ["alloc"] }
+rkyv = { version = "0.8", default-features = false, features = ["std", "bytecheck"] }
 soac_core = { path = "../soac_core" }
 soac_ir_blockpy = { path = "../soac_ir_blockpy" }
-soac_ir_typed = { path = "../soac_ir_typed" }
-soac_lowering = { path = "../soac_lowering" }
 soac_macros = { path = "../soac_macros" }
-tracing = "0.1"

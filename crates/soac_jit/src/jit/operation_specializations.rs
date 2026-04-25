@@ -5,8 +5,8 @@ use cranelift_codegen::ir::InstBuilder;
 use pyo3::ffi;
 use soac_core::block_py::{CounterId, GetItem, HasSemanticInstrId, Instr, SetItem};
 use soac_ir_blockpy::InstrCodegen;
-use soac_opt::passes::TypedExactListItemAccessPlan;
-use soac_opt::plan_v3::{EXACT_LIST_EXACT_INT_ITEM_SHAPE_TAG, ExactListItemAccessKind};
+use soac_ir_typed::TypedExactListItemAccessPlan;
+use soac_ir_typed::plan_v3::{EXACT_LIST_EXACT_INT_ITEM_SHAPE_TAG, ExactListItemAccessKind};
 use std::mem::offset_of;
 
 const PYLONG_COMPACT_TAG_LIMIT: i64 = 2 << 3;

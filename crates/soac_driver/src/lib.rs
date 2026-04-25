@@ -16,12 +16,12 @@ use soac_instrument::{
     instrument_codegen_module_with_tracker,
 };
 use soac_ir_blockpy::CodegenModuleShape;
+use soac_ir_typed::lower_codegen_module_to_typed;
+use soac_ir_typed::plan_v3::ModulePlanIdentity;
 pub use soac_lowering::{LoweringError, Result};
 use soac_opt::artifacts_v3::write_optimization_artifacts_v3;
-use soac_opt::passes as opt_passes;
 use soac_opt::pipeline_v3::{ModuleOptimizationInput, optimize_modules_v3_from_raw_evidence};
 use soac_opt::plan::ProfileEvidenceStore;
-use soac_opt::plan_v3::ModulePlanIdentity;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -171,18 +171,17 @@ fn finish_pre_optimization_module(
     })?;
 
     let instrumentation_config = InstrumentationConfig::from_env_config(env_config);
-    let bb_codegen = if instrumentation_config.explicit_counter_placement
-        == ExplicitCounterPlacement::Typed
-    {
-        let mut typed_for_counters = opt_passes::lower_codegen_module_to_typed(bb_codegen.clone());
-        define_typed_module_counter_defs(&mut typed_for_counters, &instrumentation_config)
-            .map_err(anyhow::Error::msg)?;
-        let mut bb_codegen = bb_codegen;
-        bb_codegen.counter_defs = typed_for_counters.counter_defs;
-        bb_codegen
-    } else {
-        bb_codegen
-    };
+    let bb_codegen =
+        if instrumentation_config.explicit_counter_placement == ExplicitCounterPlacement::Typed {
+            let mut typed_for_counters = lower_codegen_module_to_typed(bb_codegen.clone());
+            define_typed_module_counter_defs(&mut typed_for_counters, &instrumentation_config)
+                .map_err(anyhow::Error::msg)?;
+            let mut bb_codegen = bb_codegen;
+            bb_codegen.counter_defs = typed_for_counters.counter_defs;
+            bb_codegen
+        } else {
+            bb_codegen
+        };
     instrument_codegen_module_with_tracker(bb_codegen, &instrumentation_config, pass_tracker)
         .map_err(anyhow::Error::msg)
         .map_err(Into::into)

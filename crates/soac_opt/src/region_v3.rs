@@ -1,9 +1,9 @@
-use crate::plan_v3::RegionId;
 use soac_core::block_py::{
     BinOpKind, Block, BlockLabel, BlockPyFunction, BlockTerm, HasSemanticInstrId, InstrId, Load,
     ResolvedName, TermIf, UnaryOpKind,
 };
 use soac_ir_blockpy::{CodegenModuleShape, InstrCodegen};
+use soac_ir_typed::plan_v3::RegionId;
 use std::fmt;
 
 #[derive(Clone, Debug, PartialEq, Eq)]

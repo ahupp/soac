@@ -1763,6 +1763,7 @@ dependencies = [
  "soac_core",
  "soac_instrument",
  "soac_ir_blockpy",
+ "soac_ir_typed",
  "soac_lowering",
  "soac_opt",
  "tracing",
@@ -1785,6 +1786,7 @@ dependencies = [
  "soac_cpython",
  "soac_driver",
  "soac_ir_blockpy",
+ "soac_ir_typed",
  "soac_jit",
  "soac_lowering",
  "soac_opt",
@@ -1801,6 +1803,7 @@ dependencies = [
  "soac_config",
  "soac_core",
  "soac_ir_blockpy",
+ "soac_ir_typed",
  "soac_lowering",
  "soac_opt",
 ]
@@ -1812,6 +1815,17 @@ dependencies = [
  "derive_more",
  "rkyv",
  "soac_core",
+ "soac_macros",
+]
+
+[[package]]
+name = "soac_ir_typed"
+version = "0.1.0"
+dependencies = [
+ "derive_more",
+ "rkyv",
+ "soac_core",
+ "soac_ir_blockpy",
  "soac_macros",
 ]
 
@@ -1841,6 +1855,7 @@ dependencies = [
  "soac_driver",
  "soac_instrument",
  "soac_ir_blockpy",
+ "soac_ir_typed",
  "soac_lowering",
  "soac_opt",
  "tracing",
@@ -1887,6 +1902,7 @@ dependencies = [
  "rkyv",
  "soac_core",
  "soac_ir_blockpy",
+ "soac_ir_typed",
  "soac_lowering",
  "soac_macros",
  "tracing",

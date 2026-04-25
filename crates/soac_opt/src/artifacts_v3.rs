@@ -1,7 +1,9 @@
-use crate::emit_v3::{MechanicalModuleEmission, validate_mechanical_emission_matches_plan_v3};
-use crate::plan_v3::ModuleOptimizationPlanV3;
 use anyhow::{Context, Result, anyhow, bail};
 use soac_core::block_py::{SerializedFunctionId, SerializedModuleId};
+use soac_ir_typed::emit_v3::{
+    MechanicalModuleEmission, validate_mechanical_emission_matches_plan_v3,
+};
+use soac_ir_typed::plan_v3::ModuleOptimizationPlanV3;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;

@@ -1,16 +1,16 @@
 use crate::artifacts_v3::ExactIntBranchV3Artifacts;
-use crate::emit_v3::{MechanicalExitKind, MechanicalRegionEmission, MechanicalStepOp};
-use crate::passes::InstrTyped;
-use crate::plan_v3::{
-    FailureMode, FallbackTarget, GuardFailure, RegionId, RegionPlan, ScalarLocalThreadPlan,
-    ScalarThreadFallback, ScalarThreadLocalCleanup, ScalarThreadLocalLocation,
-    ScalarThreadLocalState, ScalarThreadMaterialization,
-};
 use soac_core::block_py::{
     BlockArg, BlockLabel, BlockPyFunction, BlockTerm, ChildVisitable, InstrId, LocalLocation,
     NameLike, ResolvedName, Visit,
 };
 use soac_ir_blockpy::{CodegenModuleShape, InstrCodegen};
+use soac_ir_typed::InstrTyped;
+use soac_ir_typed::emit_v3::{MechanicalExitKind, MechanicalRegionEmission, MechanicalStepOp};
+use soac_ir_typed::plan_v3::{
+    FailureMode, FallbackTarget, GuardFailure, RegionId, RegionPlan, ScalarLocalThreadPlan,
+    ScalarThreadFallback, ScalarThreadLocalCleanup, ScalarThreadLocalLocation,
+    ScalarThreadLocalState, ScalarThreadMaterialization,
+};
 use std::collections::HashMap;
 
 #[derive(Clone, Copy)]

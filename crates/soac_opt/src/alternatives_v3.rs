@@ -1,10 +1,10 @@
-use crate::plan_v3::{
+use soac_core::block_py::BinOpKind;
+use soac_ir_typed::plan_v3::{
     ConversionKind, Cost, DeoptPointId, DeoptReason, FailureMode, FailureReplayKind,
     FailureReplayPolicy, FallbackReason, FallbackTarget, GuardFailure, GuardKind, GuardNode,
     GuardSpec, MaterializeKind, PlannedOp, PythonExceptionSpec, Rep, RichCompareOp,
     conversion_signature,
 };
-use soac_core::block_py::BinOpKind;
 use std::collections::HashSet;
 use std::fmt;
 
@@ -1266,15 +1266,15 @@ fn exact_compact_int_guard(input: u32) -> GuardRequirement {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plan_v3::{
+    use soac_core::block_py::{
+        InstrId, LocalFunctionId, SerializedFunctionId, SerializedIdentityTables,
+        SerializedModuleId, SerializedModuleIdentity,
+    };
+    use soac_ir_typed::plan_v3::{
         ConversionOwnership, ConversionPrecondition, ConvertNode, MaterializeNode,
         ModuleOptimizationPlanV3, ModulePlanIdentity, PlanNode, PlanNodeId, PlanNodeKind,
         PlanValue, PlannedConstant, RegionExitKind, RegionExitPlan, RegionExitTarget, RegionId,
         RegionInput, RegionInputSource, RegionPlan, RegionSource, validate_module_plan_v3,
-    };
-    use soac_core::block_py::{
-        InstrId, LocalFunctionId, SerializedFunctionId, SerializedIdentityTables,
-        SerializedModuleId, SerializedModuleIdentity,
     };
 
     fn test_function_id() -> SerializedFunctionId {
@@ -1485,7 +1485,7 @@ mod tests {
                 unbox_node(3, b_obj, b_i64, 1),
                 node(
                     4,
-                    PlanNodeKind::Operation(crate::plan_v3::OperationNode {
+                    PlanNodeKind::Operation(soac_ir_typed::plan_v3::OperationNode {
                         op: add.planned_operation().unwrap(),
                         inputs: vec![a_i64, b_i64],
                         output: Some(sum_i64),
@@ -1503,7 +1503,7 @@ mod tests {
                 ),
                 node(
                     6,
-                    PlanNodeKind::Operation(crate::plan_v3::OperationNode {
+                    PlanNodeKind::Operation(soac_ir_typed::plan_v3::OperationNode {
                         op: compare.planned_operation().unwrap(),
                         inputs: vec![sum_i64, zero_i64],
                         output: Some(condition),
@@ -1537,7 +1537,7 @@ mod tests {
             nodes: vec![
                 node(
                     10,
-                    PlanNodeKind::Operation(crate::plan_v3::OperationNode {
+                    PlanNodeKind::Operation(soac_ir_typed::plan_v3::OperationNode {
                         op: generic_add.planned_operation().unwrap(),
                         inputs: vec![a_obj, b_obj],
                         output: Some(fallback_sum),
@@ -1563,7 +1563,7 @@ mod tests {
                 ),
                 node(
                     13,
-                    PlanNodeKind::Operation(crate::plan_v3::OperationNode {
+                    PlanNodeKind::Operation(soac_ir_typed::plan_v3::OperationNode {
                         op: generic_compare.planned_operation().unwrap(),
                         inputs: vec![fallback_sum, fallback_zero_obj],
                         output: Some(fallback_compare),
@@ -1617,8 +1617,8 @@ mod tests {
             },
             helper_catalog_version: ALTERNATIVE_CATALOG_V3_VERSION,
             cost_model_version: 1,
-            functions: vec![crate::plan_v3::FunctionOptimizationPlanV3 {
-                function: crate::plan_v3::FunctionPlanIdentity {
+            functions: vec![soac_ir_typed::plan_v3::FunctionOptimizationPlanV3 {
+                function: soac_ir_typed::plan_v3::FunctionPlanIdentity {
                     function: test_function_id(),
                     debug_name: Some("f".to_string()),
                 },
@@ -1629,7 +1629,7 @@ mod tests {
                 indexed_fields: Vec::new(),
                 indexed_globals: Vec::new(),
                 deopt_points: Vec::new(),
-                ownership: crate::plan_v3::FunctionOwnershipPlan::default(),
+                ownership: soac_ir_typed::plan_v3::FunctionOwnershipPlan::default(),
                 diagnostics: Vec::new(),
             }],
         }

@@ -9,13 +9,12 @@ use crate::passes::ownership_effects::{
     compute_function_local_live_ins, compute_function_local_must_bound_ins,
     compute_typed_function_local_live_ins, compute_typed_function_local_must_bound_ins,
 };
-use crate::passes::{
-    CodegenModuleShape, FactStore, InstrCodegen, InstrTyped, PyObjFacts, TypedCodegenModuleShape,
-};
+use crate::passes::{CodegenModuleShape, InstrCodegen};
 use soac_core::block_py::{
     BlockLabel, BlockPyFunction, BlockPyModule, HasSemanticInstrId, InstrKey, InstrLocationMap,
     LocalLocation, RuntimeFunctionId, current_instr_locations,
 };
+use soac_ir_typed::{FactStore, InstrTyped, PyObjFacts, TypedCodegenModuleShape};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 

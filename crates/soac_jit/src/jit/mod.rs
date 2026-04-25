@@ -44,6 +44,33 @@ use soac_core::profile::{
 };
 use soac_instrument::{InstrumentationConfig, instrument_typed_module};
 use soac_ir_blockpy::{CodegenModuleShape, InstrCodegen};
+use soac_ir_typed::emit_v3::{
+    MechanicalCodegenConversion, MechanicalCodegenOperation, MechanicalCodegenStep,
+    MechanicalExitKind, MechanicalRegionEmission,
+    mechanical_codegen_step as opt_v3_mechanical_codegen_step,
+    mechanical_convert_inputs_for_output as opt_v3_mechanical_convert_inputs_for_output,
+    mechanical_region_function_param_inputs as opt_v3_mechanical_region_function_param_inputs,
+};
+use soac_ir_typed::plan_v3::{
+    CallBodyKind, IndexedFieldAccessKind as PlanV3IndexedFieldAccessKind,
+    IndexedGlobalAccessKind as PlanV3IndexedGlobalAccessKind, MaterializeKind, ModulePlanIdentity,
+    PlanNodeId, PlanValue, RegionId, RegionPlan, Rep, RichCompareOp,
+};
+use soac_ir_typed::{
+    FactStore, InstrTyped, PyExactType, PyObjFacts, RuntimeHelperId, TypedAttrAccessPlan,
+    TypedAttrOwnerRef, TypedBlock, TypedBlockLayoutHint, TypedCall, TypedCallAccessPlan,
+    TypedCallEmissionPlans, TypedCodegenModuleShape, TypedDirectCallArgPlan,
+    TypedDirectCallArgSource, TypedDirectCallGuardTest, TypedDirectCallGuardTestKind,
+    TypedDirectCallableCall, TypedDirectCallableCallGuard, TypedDirectConstructorCallGuard,
+    TypedDirectFunctionCallGuard, TypedDirectMethodCall, TypedDirectMethodCallGuard,
+    TypedExactIntBranchPlan, TypedExactIntPlanSource, TypedExactIntReturnPlan,
+    TypedExactIntScalarThreadPlan, TypedExactListItemAccessPlan, TypedExactListItemPlanSource,
+    TypedGetAttr, TypedGuardedCallableCall, TypedGuardedMethodCall, TypedIndexedFieldGuard,
+    TypedIndexedFieldPlanSource, TypedIndexedGlobalAccessPlan, TypedIndexedGlobalPlanSource,
+    TypedPlannedResult, TypedPyObjectOwnershipPlan, TypedSetAttr, ValueFacts,
+    assign_missing_typed_function_instr_ids, lower_codegen_function_to_typed,
+    lower_codegen_module_to_typed,
+};
 use soac_opt::access_emission_v3::{
     ExactListItemAccessPlan as OptV3ExactListItemAccessPlan,
     IndexedFieldAccessPlan as OptV3IndexedFieldAccessPlan,
@@ -69,43 +96,19 @@ use soac_opt::call_emission_v3::{
     direct_calls_for_function_from_artifacts as opt_v3_emitted_direct_calls_for_function,
     typed_call_emission_plans_from_v3,
 };
-use soac_opt::emit_v3::{
-    MechanicalCodegenConversion, MechanicalCodegenOperation, MechanicalCodegenStep,
-    MechanicalExitKind, MechanicalRegionEmission,
-    mechanical_codegen_step as opt_v3_mechanical_codegen_step,
-    mechanical_convert_inputs_for_output as opt_v3_mechanical_convert_inputs_for_output,
-    mechanical_region_function_param_inputs as opt_v3_mechanical_region_function_param_inputs,
-};
 use soac_opt::passes::{
-    FactStore, FunctionRefcountPlan, InstrTyped, LocalEnvResumeBinding, LocalEnvResumeBindingState,
-    LocalEnvResumePoint, LocalEnvResumeStatePrecision, LocalEnvResumeValueSource, LocalRefState,
-    PyExactType, PyObjFacts, RefcountActionKind, RefcountReleaseReason, RefcountSite,
-    RuntimeHelperId, TypedAttrAccessPlan, TypedAttrOwnerRef, TypedBlock, TypedBlockLayoutHint,
-    TypedCall, TypedCallAccessPlan, TypedCallEmissionPlans, TypedCodegenModuleShape,
-    TypedDirectCallArgPlan, TypedDirectCallArgSource, TypedDirectCallGuardTest,
-    TypedDirectCallGuardTestKind, TypedDirectCallableCall, TypedDirectCallableCallGuard,
-    TypedDirectConstructorCallGuard, TypedDirectFunctionCallGuard, TypedDirectMethodCall,
-    TypedDirectMethodCallGuard, TypedExactIntBranchPlan, TypedExactIntPlanSource,
-    TypedExactIntReturnPlan, TypedExactIntScalarThreadPlan, TypedExactListItemAccessPlan,
-    TypedExactListItemPlanSource, TypedGetAttr, TypedGuardedCallableCall, TypedGuardedMethodCall,
-    TypedIndexedFieldGuard, TypedIndexedFieldPlanSource, TypedIndexedGlobalAccessPlan,
-    TypedIndexedGlobalPlanSource, TypedPlannedResult, TypedPyObjectOwnershipPlan, TypedSetAttr,
-    ValueFacts, annotate_typed_function_planned_results, annotate_typed_function_result_demands,
-    annotate_typed_function_value_facts, annotate_typed_module_value_facts,
-    assign_missing_typed_function_instr_ids, infer_module_value_facts,
-    inline_typed_function_direct_call_stores, lower_codegen_function_to_typed,
-    lower_codegen_module_to_typed, lower_typed_function_call_access_plan_instrs,
+    FunctionRefcountPlan, LocalEnvResumeBinding, LocalEnvResumeBindingState, LocalEnvResumePoint,
+    LocalEnvResumeStatePrecision, LocalEnvResumeValueSource, LocalRefState, RefcountActionKind,
+    RefcountReleaseReason, RefcountSite, annotate_typed_function_planned_results,
+    annotate_typed_function_result_demands, annotate_typed_function_value_facts,
+    annotate_typed_module_value_facts, infer_module_value_facts,
+    inline_typed_function_direct_call_stores, lower_typed_function_call_access_plan_instrs,
     lower_typed_function_call_emission_plans, lower_typed_if_tests_to_truthy,
     refresh_typed_function_value_facts, try_lower_typed_instr_to_codegen_legacy,
     validate_typed_function_call_access_plans, validate_typed_function_value_facts,
 };
 use soac_opt::pipeline_v3::plan_and_emit_module_v3_from_raw_evidence;
 use soac_opt::plan::ProfileEvidenceStore;
-use soac_opt::plan_v3::{
-    CallBodyKind, IndexedFieldAccessKind as PlanV3IndexedFieldAccessKind,
-    IndexedGlobalAccessKind as PlanV3IndexedGlobalAccessKind, MaterializeKind, ModulePlanIdentity,
-    PlanNodeId, PlanValue, RegionId, RegionPlan, Rep, RichCompareOp,
-};
 use soac_opt::region_emission_v3::{
     ExactIntBranchSelection as OptV3ExactIntBranchSelection,
     ExactIntReturnSelection as OptV3ExactIntReturnSelection,
@@ -7387,7 +7390,7 @@ fn annotate_typed_exact_list_item_accesses(
         fn plan_for_instr(
             &mut self,
             instr_id: InstrId,
-            expected_access: soac_opt::plan_v3::ExactListItemAccessKind,
+            expected_access: soac_ir_typed::plan_v3::ExactListItemAccessKind,
         ) -> Option<TypedExactListItemAccessPlan> {
             let plan = self.exact_list_items_by_instr.get(&instr_id)?;
             if plan.access != expected_access {
@@ -7412,7 +7415,7 @@ fn annotate_typed_exact_list_item_accesses(
                     if let Some(instr_id) = op.try_semantic_instr_id()
                         && let Some(plan) = self.plan_for_instr(
                             instr_id,
-                            soac_opt::plan_v3::ExactListItemAccessKind::Get,
+                            soac_ir_typed::plan_v3::ExactListItemAccessKind::Get,
                         )
                     {
                         op.extra_mut().set_exact_list_item_access_plan(plan);
@@ -7423,7 +7426,7 @@ fn annotate_typed_exact_list_item_accesses(
                     if let Some(instr_id) = op.try_semantic_instr_id()
                         && let Some(plan) = self.plan_for_instr(
                             instr_id,
-                            soac_opt::plan_v3::ExactListItemAccessKind::Set,
+                            soac_ir_typed::plan_v3::ExactListItemAccessKind::Set,
                         )
                     {
                         op.extra_mut().set_exact_list_item_access_plan(plan);
@@ -17766,7 +17769,7 @@ fn typed_exact_int_scalar_thread_selection(
     }
     if !matches!(
         plan.thread.materialization,
-        soac_opt::plan_v3::ScalarThreadMaterialization::DeferredUntilPythonObjectUse { .. }
+        soac_ir_typed::plan_v3::ScalarThreadMaterialization::DeferredUntilPythonObjectUse { .. }
     ) {
         return Err(format!(
             "optimizer v3 scalar thread for local {} has materialization unsupported by current mechanical lowering: {:?}",

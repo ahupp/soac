@@ -13,6 +13,7 @@ soac_driver = { path = "../soac_driver" }
 soac_config = { path = "../soac_config" }
 soac_core = { path = "../soac_core" }
 soac_ir_blockpy = { path = "../soac_ir_blockpy" }
+soac_ir_typed = { path = "../soac_ir_typed" }
 soac_instrument = { path = "../soac_instrument" }
 soac_opt = { path = "../soac_opt" }
 anyhow = { version = "1.0.100", features = ["backtrace"] }

@@ -1,6 +1,6 @@
 use cranelift_codegen::ir;
-use soac_opt::passes::PyObjFacts;
-pub use soac_opt::passes::TypedResultDemand as ResultDemand;
+use soac_ir_typed::PyObjFacts;
+pub use soac_ir_typed::TypedResultDemand as ResultDemand;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IntWidth {

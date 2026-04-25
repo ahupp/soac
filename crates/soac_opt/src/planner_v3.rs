@@ -1,7 +1,14 @@
 use crate::alternatives_v3::{
     AlternativeCatalog, AlternativeId, FailureTargets, LoweringAlternative,
 };
-use crate::plan_v3::{
+use crate::region_v3::{
+    ExtractedExit, ExtractedRegion, ExtractedValue, ExtractedValueId, ExtractedValueKind,
+};
+use soac_core::block_py::{
+    BinOpKind, InstrId, NameLike, NameLocation, ResolvedName, SerializedFunctionId,
+    SerializedIdentityTables,
+};
+use soac_ir_typed::plan_v3::{
     CallBodyKind, CallBodyPlan, ConversionKind, ConversionOwnership, ConversionPrecondition,
     ConvertNode, Cost, DirectCallArgPlan, DirectCallSpecializationPlan, ExactListItemAccessKind,
     ExactListItemFallbackKind, ExactListItemFallbackPlan, ExactListItemGuardKind,
@@ -17,13 +24,6 @@ use crate::plan_v3::{
     RegionInput, RegionInputSource, RegionPlan, RegionSource, RegionValueRef, Rep,
     ScalarLocalThreadPlan, ScalarThreadFallback, ScalarThreadLocal, ScalarThreadLocalCleanup,
     ScalarThreadLocalLocation, ScalarThreadLocalState, ScalarThreadMaterialization,
-};
-use crate::region_v3::{
-    ExtractedExit, ExtractedRegion, ExtractedValue, ExtractedValueId, ExtractedValueKind,
-};
-use soac_core::block_py::{
-    BinOpKind, InstrId, NameLike, NameLocation, ResolvedName, SerializedFunctionId,
-    SerializedIdentityTables,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -1594,8 +1594,6 @@ fn operation_node(
 mod tests {
     use super::*;
     use crate::alternatives_v3::ALTERNATIVE_CATALOG_V3_VERSION;
-    use crate::plan_v3::RichCompareOp;
-    use crate::plan_v3::validate_module_plan_v3;
     use crate::region_v3::{extract_block_region_v3, extract_function_regions_v3};
     use soac_core::block_py::{
         BinOp, Block, BlockEdge, BlockLabel, BlockParam, BlockPyFunction, BlockPyName, BlockTerm,
@@ -1604,6 +1602,8 @@ mod tests {
         SerializedModuleIdentity, Store, TermIf, WithMeta,
     };
     use soac_ir_blockpy::{CodegenModuleShape, InstrCodegen};
+    use soac_ir_typed::plan_v3::RichCompareOp;
+    use soac_ir_typed::plan_v3::validate_module_plan_v3;
 
     fn label(index: usize) -> BlockLabel {
         BlockLabel::from_index(index)
@@ -1828,7 +1828,7 @@ mod tests {
                 source,
                 target,
                 arg_plan: DirectCallArgPlan {
-                    sources: vec![crate::plan_v3::DirectCallArgSource::Provided(0)],
+                    sources: vec![soac_ir_typed::plan_v3::DirectCallArgSource::Provided(0)],
                 },
                 body: CallBodyPlanRequest::with_inline_candidate(true),
                 reason: "profiled call_hot_targets selected this same-module function".to_string(),
@@ -1837,7 +1837,7 @@ mod tests {
                 source,
                 target,
                 arg_plan: DirectCallArgPlan {
-                    sources: vec![crate::plan_v3::DirectCallArgSource::Provided(0)],
+                    sources: vec![soac_ir_typed::plan_v3::DirectCallArgSource::Provided(0)],
                 },
                 body: CallBodyPlanRequest::with_inline_candidate(true),
                 reason: "profiled call_hot_targets selected this same-module function".to_string(),
@@ -1854,7 +1854,7 @@ mod tests {
         assert_eq!(
             direct_calls[0].arg_plan,
             DirectCallArgPlan {
-                sources: vec![crate::plan_v3::DirectCallArgSource::Provided(0)]
+                sources: vec![soac_ir_typed::plan_v3::DirectCallArgSource::Provided(0)]
             }
         );
         assert_eq!(direct_calls[0].body.kind, CallBodyKind::Inline);
@@ -1870,7 +1870,7 @@ mod tests {
             source,
             target,
             arg_plan: DirectCallArgPlan {
-                sources: vec![crate::plan_v3::DirectCallArgSource::Provided(0)],
+                sources: vec![soac_ir_typed::plan_v3::DirectCallArgSource::Provided(0)],
             },
             body: CallBodyPlanRequest::with_inline_candidate(false),
             reason: "profiled call_hot_targets selected this same-module function".to_string(),
@@ -1990,14 +1990,14 @@ mod tests {
         assert!(matches!(
             function.regions[0].nodes[4].kind,
             PlanNodeKind::Operation(OperationNode {
-                op: crate::plan_v3::PlannedOp::CheckedI64Add,
+                op: soac_ir_typed::plan_v3::PlannedOp::CheckedI64Add,
                 ..
             })
         ));
         assert!(matches!(
             function.regions[0].nodes[6].kind,
             PlanNodeKind::Operation(OperationNode {
-                op: crate::plan_v3::PlannedOp::I64CompareToBool01 {
+                op: soac_ir_typed::plan_v3::PlannedOp::I64CompareToBool01 {
                     op: RichCompareOp::Gt
                 },
                 ..
@@ -2022,7 +2022,7 @@ mod tests {
         assert!(matches!(
             function.regions[0].nodes[4].kind,
             PlanNodeKind::Operation(OperationNode {
-                op: crate::plan_v3::PlannedOp::I64CompareToBool01 {
+                op: soac_ir_typed::plan_v3::PlannedOp::I64CompareToBool01 {
                     op: RichCompareOp::Lt
                 },
                 ..
@@ -2032,7 +2032,7 @@ mod tests {
         assert!(matches!(
             function.regions[1].nodes[0].kind,
             PlanNodeKind::Operation(OperationNode {
-                op: crate::plan_v3::PlannedOp::PyObjectRichCompare {
+                op: soac_ir_typed::plan_v3::PlannedOp::PyObjectRichCompare {
                     op: RichCompareOp::Lt
                 },
                 ..
@@ -2057,7 +2057,7 @@ mod tests {
         assert!(matches!(
             function.regions[0].nodes[4].kind,
             PlanNodeKind::Operation(OperationNode {
-                op: crate::plan_v3::PlannedOp::I64CompareToBool01 {
+                op: soac_ir_typed::plan_v3::PlannedOp::I64CompareToBool01 {
                     op: RichCompareOp::Ge
                 },
                 ..
@@ -2077,7 +2077,7 @@ mod tests {
         assert!(matches!(
             function.regions[1].nodes[0].kind,
             PlanNodeKind::Operation(OperationNode {
-                op: crate::plan_v3::PlannedOp::PyObjectRichCompare {
+                op: soac_ir_typed::plan_v3::PlannedOp::PyObjectRichCompare {
                     op: RichCompareOp::Ge
                 },
                 ..
@@ -2102,7 +2102,7 @@ mod tests {
         assert!(matches!(
             function.regions[0].nodes[4].kind,
             PlanNodeKind::Operation(OperationNode {
-                op: crate::plan_v3::PlannedOp::CheckedI64Add,
+                op: soac_ir_typed::plan_v3::PlannedOp::CheckedI64Add,
                 ..
             })
         ));
@@ -2120,7 +2120,7 @@ mod tests {
         assert!(matches!(
             function.regions[1].nodes[0].kind,
             PlanNodeKind::Operation(OperationNode {
-                op: crate::plan_v3::PlannedOp::PyNumberAdd,
+                op: soac_ir_typed::plan_v3::PlannedOp::PyNumberAdd,
                 ..
             })
         ));
@@ -2132,13 +2132,13 @@ mod tests {
         for (kind, exact_op, generic_op) in [
             (
                 BinOpKind::Sub,
-                crate::plan_v3::PlannedOp::CheckedI64Sub,
-                crate::plan_v3::PlannedOp::PyNumberSubtract,
+                soac_ir_typed::plan_v3::PlannedOp::CheckedI64Sub,
+                soac_ir_typed::plan_v3::PlannedOp::PyNumberSubtract,
             ),
             (
                 BinOpKind::Mul,
-                crate::plan_v3::PlannedOp::CheckedI64Mul,
-                crate::plan_v3::PlannedOp::PyNumberMultiply,
+                soac_ir_typed::plan_v3::PlannedOp::CheckedI64Mul,
+                soac_ir_typed::plan_v3::PlannedOp::PyNumberMultiply,
             ),
         ] {
             let request = module_request(
@@ -2175,18 +2175,18 @@ mod tests {
         for (kind, exact_op, generic_op) in [
             (
                 BinOpKind::And,
-                crate::plan_v3::PlannedOp::I64BitAnd,
-                crate::plan_v3::PlannedOp::PyNumberBitAnd,
+                soac_ir_typed::plan_v3::PlannedOp::I64BitAnd,
+                soac_ir_typed::plan_v3::PlannedOp::PyNumberBitAnd,
             ),
             (
                 BinOpKind::Or,
-                crate::plan_v3::PlannedOp::I64BitOr,
-                crate::plan_v3::PlannedOp::PyNumberBitOr,
+                soac_ir_typed::plan_v3::PlannedOp::I64BitOr,
+                soac_ir_typed::plan_v3::PlannedOp::PyNumberBitOr,
             ),
             (
                 BinOpKind::Xor,
-                crate::plan_v3::PlannedOp::I64BitXor,
-                crate::plan_v3::PlannedOp::PyNumberBitXor,
+                soac_ir_typed::plan_v3::PlannedOp::I64BitXor,
+                soac_ir_typed::plan_v3::PlannedOp::PyNumberBitXor,
             ),
         ] {
             let request = module_request(
@@ -2266,7 +2266,7 @@ mod tests {
         assert!(matches!(
             function.regions[0].nodes[3].kind,
             PlanNodeKind::Operation(OperationNode {
-                op: crate::plan_v3::PlannedOp::I64CompareToBool01 {
+                op: soac_ir_typed::plan_v3::PlannedOp::I64CompareToBool01 {
                     op: RichCompareOp::Gt
                 },
                 ..

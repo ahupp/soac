@@ -1,12 +1,12 @@
 use crate::artifacts_v3::ExactIntBranchV3Artifacts;
-use crate::emit_v3::MechanicalIndexedFieldGuard;
-use crate::plan_v3::{
+use soac_core::block_py::InstrId;
+use soac_core::profile::{CollectedTypeKeyLayout, CounterDumpTypeKey};
+use soac_ir_typed::emit_v3::MechanicalIndexedFieldGuard;
+use soac_ir_typed::plan_v3::{
     ExactListItemAccessKind, ExactListItemFallbackKind, ExactListItemGuardKind, ExactListItemShape,
     IndexedFieldAccessKind, IndexedFieldFallbackKind, IndexedFieldGuardKind,
     IndexedGlobalAccessKind, IndexedGlobalFallbackKind, IndexedGlobalGuardKind,
 };
-use soac_core::block_py::InstrId;
-use soac_core::profile::{CollectedTypeKeyLayout, CounterDumpTypeKey};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -286,7 +286,7 @@ pub fn indexed_globals_for_function_from_artifacts(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plan_v3::{
+    use soac_ir_typed::plan_v3::{
         IndexedFieldGuardKind, IndexedFieldOwnerType, IndexedFieldSpecializationPlan,
     };
     fn field_plan(
@@ -300,10 +300,10 @@ mod tests {
         let emitted = IndexedFieldSpecializationPlan {
             source,
             access,
-            guard: crate::plan_v3::IndexedFieldGuardPlan {
+            guard: soac_ir_typed::plan_v3::IndexedFieldGuardPlan {
                 kind: IndexedFieldGuardKind::OwnerTypeVersionAndFieldIndex,
             },
-            fallback: crate::plan_v3::IndexedFieldFallbackPlan {
+            fallback: soac_ir_typed::plan_v3::IndexedFieldFallbackPlan {
                 kind: IndexedFieldFallbackKind::OriginalAttrAccess,
             },
             owner_type: IndexedFieldOwnerType {

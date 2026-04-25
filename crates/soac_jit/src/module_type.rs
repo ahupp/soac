@@ -23,6 +23,7 @@ use soac_core::profile::{
 use soac_driver::codegen_cache::PythonModuleCacheSource;
 use soac_instrument::InstrumentationConfig;
 use soac_ir_blockpy::{CodegenModuleShape, InstrCodegen};
+use soac_ir_typed::plan_v3::IndexedFieldAccessKind as PlanV3IndexedFieldAccessKind;
 use soac_opt::access_emission_v3::{
     IndexedFieldAccessPlan as OptV3IndexedFieldAccessPlan,
     indexed_fields_for_function_from_artifacts as opt_v3_emitted_indexed_fields_for_function,
@@ -31,7 +32,6 @@ use soac_opt::artifacts_v3::{
     ExactIntBranchV3Artifacts, load_optimization_artifacts_v3,
     single_function_optimization_artifacts_v3, validate_optimization_artifacts_v3_for_module,
 };
-use soac_opt::plan_v3::IndexedFieldAccessKind as PlanV3IndexedFieldAccessKind;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, c_int, c_void};
 use std::fs::{OpenOptions, create_dir_all};

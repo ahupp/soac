@@ -3,17 +3,19 @@ use soac_core::block_py::{
     LocalLocation, RuntimeFunctionId, current_instr_locations,
 };
 use soac_ir_blockpy::CodegenModuleShape;
+use soac_ir_typed::{
+    FactStore, TypedBlock, TypedCodegenModuleShape, lower_codegen_module_to_typed,
+};
 pub use soac_opt::passes::{
     BlockParamFacts, FunctionLocalPlan, LocalRefKind, ParamBindingFacts, ParamProvenance,
     PlannedLocalBinding, PlannedLocalStorage, render_planned_local_binding,
 };
 use soac_opt::passes::{
-    FactStore, FunctionLocalEnvResumePlan, FunctionRefcountPlan, LocalEnvModulePlan,
-    LocalEnvResumeEntry, LocalEnvResumeModulePlan, LocalEnvResumePoint,
-    LocalEnvResumeStatePrecision, RefcountActionKind, RefcountPlan, RefcountReleaseReason,
-    TypedBlock, TypedCodegenModuleShape, annotate_typed_module_value_facts,
+    FunctionLocalEnvResumePlan, FunctionRefcountPlan, LocalEnvModulePlan, LocalEnvResumeEntry,
+    LocalEnvResumeModulePlan, LocalEnvResumePoint, LocalEnvResumeStatePrecision,
+    RefcountActionKind, RefcountPlan, RefcountReleaseReason, annotate_typed_module_value_facts,
     compute_typed_function_local_live_ins, compute_typed_function_local_must_bound_ins,
-    lower_codegen_module_to_typed, lower_typed_if_tests_to_truthy, plan_typed_local_env_module,
+    lower_typed_if_tests_to_truthy, plan_typed_local_env_module,
     plan_typed_local_env_resume_module, plan_typed_ownership_effects,
     validate_typed_local_env_module_plan, validate_typed_local_env_resume_module_plan,
     validate_typed_ownership_effects,

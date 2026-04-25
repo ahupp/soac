@@ -13,8 +13,8 @@ use soac_core::block_py::{
     HasSemanticInstrId, Instr, InstrId, NameLike, NameLocation, ResolvedName,
 };
 use soac_ir_blockpy::InstrCodegen;
+use soac_ir_typed::{InstrTyped, PyObjFacts};
 use soac_opt::operator_specialization::{BINARY_RHS_TAG_SHIFT, ExactTypeTag};
-use soac_opt::passes::{InstrTyped, PyObjFacts};
 use std::mem::offset_of;
 
 const PY_LONG_SIGN_MASK: i64 = 3;
@@ -1347,7 +1347,7 @@ pub(super) fn emit_typed_operation<'fb>(
             let lowering_plan = op.extra().exact_list_item_access_plan().map(|plan| {
                 operation_specializations::lowering_plan_from_typed_exact_list_item(
                     plan,
-                    soac_opt::plan_v3::ExactListItemAccessKind::Get,
+                    soac_ir_typed::plan_v3::ExactListItemAccessKind::Get,
                 )
             });
             Some(operation_specializations::emit_getitem_with_plan(
@@ -1360,7 +1360,7 @@ pub(super) fn emit_typed_operation<'fb>(
             let lowering_plan = op.extra().exact_list_item_access_plan().map(|plan| {
                 operation_specializations::lowering_plan_from_typed_exact_list_item(
                     plan,
-                    soac_opt::plan_v3::ExactListItemAccessKind::Set,
+                    soac_ir_typed::plan_v3::ExactListItemAccessKind::Set,
                 )
             });
             Some(operation_specializations::emit_setitem_with_plan(
@@ -1377,7 +1377,7 @@ pub(super) fn emit_typed_operation<'fb>(
         InstrTyped::MakeCell(op) => Some(emit_make_cell(state, op.initial_value.as_deref())),
         InstrTyped::Store(op) => op.name.location.is_global().then(|| {
             let indexed_global_plan = op.extra().indexed_global_access_plan().map(|plan| {
-                if plan.access != soac_opt::plan_v3::IndexedGlobalAccessKind::Store {
+                if plan.access != soac_ir_typed::plan_v3::IndexedGlobalAccessKind::Store {
                     panic!(
                         "typed indexed-global plan for {} expected {:?}, but typed store requires Store",
                         plan.instr_id, plan.access
