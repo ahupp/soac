@@ -3479,7 +3479,8 @@ class Field:
             .unwrap_or_else(|| panic!("missing genexpr helper in {name}"));
         eprintln!("==== {name} BB {:?} ====\n{gen:#?}", gen.names.qualname);
 
-        let prepared = crate::passes::lower_try_jump_exception_flow(&bb_module);
+        let prepared =
+            crate::passes::blockpy_to_bb::exception_pass::lower_try_jump_exception_flow(&bb_module);
         let prepared_gen = prepared
             .callable_defs
             .iter()

@@ -3,7 +3,7 @@ use crate::{
     block_py::{ChildVisitable, ConstantExpr, InstrCodegen, Literal, NameLike},
     lower_python_to_blockpy_for_testing,
     pass_tracker::LoweringPassTrackerInternalExt,
-    passes::lower_try_jump_exception_flow,
+    passes::blockpy_to_bb::exception_pass::lower_try_jump_exception_flow,
 };
 
 fn tracked_name_binding_module(

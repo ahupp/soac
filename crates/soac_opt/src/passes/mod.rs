@@ -6,8 +6,9 @@ mod ownership_effects;
 pub(crate) mod value_facts;
 
 use soac_core::block_py::{BlockPyFunction, LocalLocation, NameLocation, ResolvedName};
-pub use soac_lowering::passes::{
-    CodegenModuleShape, InstrCodegen, InstrResolved, assign_missing_codegen_function_instr_ids,
+pub use soac_lowering::{
+    assign_missing_codegen_function_instr_ids,
+    passes::{CodegenModuleShape, InstrCodegen, InstrResolved},
     reassign_codegen_function_instr_ids, validate_codegen_instr_ids,
 };
 

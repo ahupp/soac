@@ -1,7 +1,7 @@
 use super::{
-    instr_any, map_function_blocks, Block, BlockLabel, BlockPyFunction, BlockTerm, ChildVisitable,
-    Del, Instr, Load, MapInstr, MapTerm, Mappable, Meta, ModuleShape, Store, UnresolvedName,
-    WithMeta,
+    instr_any, map_function_blocks, Block, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm,
+    ChildVisitable, Del, Instr, Load, MapInstr, MapTerm, Mappable, Meta, ModuleShape, Store,
+    UnresolvedName, WithMeta,
 };
 use crate::namegen::fresh_name;
 use ruff_python_ast as ast;
@@ -323,6 +323,12 @@ pub(crate) fn relabel_blockpy_blocks_dense<I: Instr, E>(blocks: &mut [Block<I, E
                 .expect("dense relabel should cover every exception target")
                 .clone();
         }
+    }
+}
+
+pub(crate) fn relabel_dense_bb_module<P: ModuleShape>(module: &mut BlockPyModule<P>) {
+    for callable in &mut module.callable_defs {
+        relabel_blockpy_blocks_dense(&mut callable.blocks);
     }
 }
 

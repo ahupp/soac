@@ -14,7 +14,10 @@ use soac_core::block_py::{
     SerializedIdentityTables, SerializedModuleId, SerializedModuleIdentity, SetAttr, SetItem,
     StorageLayout, Store, Tuple, UnaryOp, UnaryOpKind, Visit, VisitMut, WithMeta,
 };
-use soac_lowering::passes::{CodegenModuleShape, InstrCodegen, validate_codegen_instr_ids};
+use soac_lowering::{
+    passes::{CodegenModuleShape, InstrCodegen},
+    validate_codegen_instr_ids,
+};
 mod tests {
     use super::*;
     use crate::jit::direct_abi::RuntimePrimitiveId;

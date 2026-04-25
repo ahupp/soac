@@ -8,7 +8,7 @@ use crate::passes::ast_to_ast::{
 use crate::passes::core_await_lower::lower_awaits_in_core_blockpy_module;
 use crate::passes::ruff_to_blockpy::rewrite_ast_to_core_blockpy_module_with_module;
 use crate::passes::{
-    self, CodegenModuleShape, CoreModuleShape, CoreModuleShapeWithAwaitAndYield,
+    CodegenModuleShape, CoreModuleShape, CoreModuleShapeWithAwaitAndYield,
     CoreModuleShapeWithYield, ResolvedStorageModuleShape,
 };
 use anyhow::Error as AnyhowError;
@@ -252,7 +252,9 @@ pub fn lower_source_to_codegen_module_with_tracker(
     */
     let core_blockpy_without_await_or_yield: BlockPyModule<CoreModuleShape> = pass_tracker
         .run_pass("core_blockpy", || {
-            passes::lower_yield_in_lowered_core_blockpy_module_bundle(core_blockpy_without_await)
+            crate::passes::blockpy_generators::lower_yield_in_lowered_core_blockpy_module_bundle(
+                core_blockpy_without_await,
+            )
         });
 
     /*
@@ -269,26 +271,30 @@ pub fn lower_source_to_codegen_module_with_tracker(
     // `soac.runtime`, so the bootstrap mode leaves those loads as globals.
     let name_binding: BlockPyModule<ResolvedStorageModuleShape> =
         pass_tracker.run_pass("name_binding", || {
-            passes::lower_name_binding_in_core_blockpy_module_with_options(
+            crate::passes::name_binding::lower_name_binding_in_core_blockpy_module_with_options(
                 core_blockpy_without_await_or_yield,
                 options.runtime_names_as_globals,
             )
         });
 
-    let global_index: BlockPyModule<ResolvedStorageModuleShape> = pass_tracker
-        .run_pass("global_index", || {
-            passes::lower_global_index_in_resolved_module_default(name_binding.clone())
+    let global_index: BlockPyModule<ResolvedStorageModuleShape> =
+        pass_tracker.run_pass("global_index", || {
+            crate::passes::global_index::lower_global_index_in_resolved_module_default(
+                name_binding.clone(),
+            )
         });
 
-    let bb_prepared: BlockPyModule<ResolvedStorageModuleShape> = pass_tracker
-        .run_pass("bb_prepared", || {
-            passes::lower_try_jump_exception_flow(&global_index)
+    let bb_prepared: BlockPyModule<ResolvedStorageModuleShape> =
+        pass_tracker.run_pass("bb_prepared", || {
+            crate::passes::blockpy_to_bb::exception_pass::lower_try_jump_exception_flow(
+                &global_index,
+            )
         });
     let bb_codegen: BlockPyModule<CodegenModuleShape> = pass_tracker.run_pass("bb_codegen", || {
         let mut bb_codegen: BlockPyModule<CodegenModuleShape> =
-            passes::hoist_module_constants(&bb_prepared);
-        passes::relabel_dense_bb_module(&mut bb_codegen);
-        passes::assign_module_instr_ids(bb_codegen)
+            crate::passes::blockpy_to_bb::strings::hoist_module_constants(&bb_prepared);
+        crate::block_py::cfg::relabel_dense_bb_module(&mut bb_codegen);
+        crate::passes::instr_id::assign_module_instr_ids(bb_codegen)
     });
     pass_tracker.record_timing("validate", || {
         crate::block_py::validate::validate_codegen_module(&bb_codegen).map_err(anyhow::Error::msg)

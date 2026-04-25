@@ -2,29 +2,28 @@ pub(crate) mod ast_symbol_analysis;
 pub(crate) mod ast_to_ast;
 pub(crate) mod ast_to_instr;
 pub(crate) mod blockpy_expr_simplify;
-mod blockpy_generators;
-mod blockpy_to_bb;
+pub(crate) mod blockpy_generators;
+pub(crate) mod blockpy_to_bb;
 pub(crate) mod core_await_lower;
-mod global_index;
-mod instr_id;
-mod name_binding;
+pub(crate) mod global_index;
+pub(crate) mod instr_id;
+pub(crate) mod name_binding;
 pub(crate) mod ruff_to_blockpy;
 
 use crate::block_py::{
-    cfg::relabel_blockpy_blocks_dense, runtime_name_load, Await, BinOp, BlockPyModule, Call,
-    CallArgKeyword, CallArgPositional, CellRef, CellRefForName, ChildVisitable, ConstantExpr, Del,
-    DelItem, ExprAttribute, ExprBoolOp, ExprBooleanLiteral, ExprBytesLiteral, ExprCompare,
-    ExprDict, ExprDictComp, ExprEllipsisLiteral, ExprFString, ExprGenerator, ExprIf,
-    ExprIpyEscapeCommand, ExprLambda, ExprList, ExprListComp, ExprName, ExprNamed, ExprNoneLiteral,
-    ExprNumberLiteral, ExprSet, ExprSetComp, ExprSlice, ExprStarred, ExprStringLiteral,
-    ExprSubscript, ExprTString, ExprTuple, GetAttr, GetItem, HasMeta, IncrementCounter, Instr,
-    InstrWithConstantNone, LiteralValue, Load, MakeCell, MakeFunction, MakeFunctionWithClosure,
-    MapInstr, Mappable, Meta, ModuleShape, NameLike, ResolvedName, SetAttr, SetItem, StmtAnnAssign,
-    StmtAssert, StmtAssign, StmtAugAssign, StmtBreak, StmtClassDef, StmtContinue, StmtDelete,
-    StmtExpr, StmtFor, StmtFunctionDef, StmtGlobal, StmtIf, StmtImport, StmtImportFrom,
-    StmtIpyEscapeCommand, StmtMatch, StmtNonlocal, StmtPass, StmtRaise, StmtReturn, StmtTry,
-    StmtTypeAlias, StmtWhile, StmtWith, Store, TryMapInstr, Tuple, UnaryOp, UnresolvedName,
-    WithMeta, Yield, YieldFrom,
+    runtime_name_load, Await, BinOp, Call, CallArgKeyword, CallArgPositional, CellRef,
+    CellRefForName, ChildVisitable, ConstantExpr, Del, DelItem, ExprAttribute, ExprBoolOp,
+    ExprBooleanLiteral, ExprBytesLiteral, ExprCompare, ExprDict, ExprDictComp, ExprEllipsisLiteral,
+    ExprFString, ExprGenerator, ExprIf, ExprIpyEscapeCommand, ExprLambda, ExprList, ExprListComp,
+    ExprName, ExprNamed, ExprNoneLiteral, ExprNumberLiteral, ExprSet, ExprSetComp, ExprSlice,
+    ExprStarred, ExprStringLiteral, ExprSubscript, ExprTString, ExprTuple, GetAttr, GetItem,
+    HasMeta, IncrementCounter, Instr, InstrWithConstantNone, LiteralValue, Load, MakeCell,
+    MakeFunction, MakeFunctionWithClosure, MapInstr, Mappable, Meta, ModuleShape, NameLike,
+    ResolvedName, SetAttr, SetItem, StmtAnnAssign, StmtAssert, StmtAssign, StmtAugAssign,
+    StmtBreak, StmtClassDef, StmtContinue, StmtDelete, StmtExpr, StmtFor, StmtFunctionDef,
+    StmtGlobal, StmtIf, StmtImport, StmtImportFrom, StmtIpyEscapeCommand, StmtMatch, StmtNonlocal,
+    StmtPass, StmtRaise, StmtReturn, StmtTry, StmtTypeAlias, StmtWhile, StmtWith, Store,
+    TryMapInstr, Tuple, UnaryOp, UnresolvedName, WithMeta, Yield, YieldFrom,
 };
 use ruff_python_ast::{self as ast};
 use soac_macros::{enum_broadcast, DelegateMatchDefault};
@@ -395,21 +394,6 @@ impl ModuleShape for CodegenModuleShape {
     type Instr = InstrCodegen;
     type ModuleConstant = ConstantExpr;
     type BlockExtra = ();
-}
-
-pub(crate) use blockpy_generators::lower_yield_in_lowered_core_blockpy_module_bundle;
-pub(crate) use blockpy_to_bb::{hoist_module_constants, lower_try_jump_exception_flow};
-pub(crate) use global_index::lower_global_index_in_resolved_module_default;
-pub(crate) use instr_id::assign_module_instr_ids;
-pub use instr_id::{
-    assign_missing_codegen_function_instr_ids, reassign_codegen_function_instr_ids,
-    reassign_codegen_module_instr_ids, validate_codegen_instr_ids,
-};
-pub(crate) use name_binding::lower_name_binding_in_core_blockpy_module_with_options;
-pub(crate) fn relabel_dense_bb_module<P: ModuleShape>(module: &mut BlockPyModule<P>) {
-    for callable in &mut module.callable_defs {
-        relabel_blockpy_blocks_dense(&mut callable.blocks);
-    }
 }
 
 #[cfg(test)]
