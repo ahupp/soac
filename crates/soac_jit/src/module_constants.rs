@@ -31,7 +31,6 @@ const ALWAYS_REQUIRED_RUNTIME_NAME_CONSTANTS: &[RuntimeName] = &[
     RuntimeName::False,
     RuntimeName::None,
     RuntimeName::EmptyTuple,
-    RuntimeName::IterComplete,
 ];
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub struct ModuleConstantId(pub usize);

@@ -3,7 +3,6 @@ from .bootstrap import (
     ELLIPSIS,
     EMPTY_TUPLE,
     FALSE,
-    ITER_COMPLETE,
     NO_DEFAULT,
     NONE,
     TRUE,
@@ -499,42 +498,6 @@ def await_iter(awaitable):
             f"object {awaitable_type!r} can't be used in 'await' expression"
         ) from None
     return iterator
-
-
-async def anext_or_sentinel(iterator):
-    try:
-        awaitable = iterator.__anext__()
-    except AttributeError:
-        iter_type = type(iterator).__name__
-        iterator = None
-        raise TypeError(
-            "'async for' received an object from __aiter__ that does not implement __anext__"
-            f": {iter_type}"
-        ) from None
-    try:
-        await_iter = _get_awaitable_iter(awaitable)
-    except Exception:
-        iterator = None
-        awaitable = None
-        raise
-    try:
-        return await _AwaitIterWrapper(await_iter)
-    except StopAsyncIteration:
-        return ITER_COMPLETE
-
-
-def next_or_sentinel(iterator):
-    try:
-        return iterator.__next__()
-    except AttributeError:
-        iter_type = type(iterator).__name__
-        iterator = None
-        raise TypeError(
-            "'for' received an object from __iter__ that does not implement __next__"
-            f": {iter_type}"
-        ) from None
-    except StopIteration:
-        return ITER_COMPLETE
 
 
 def raise_from(exc, cause):

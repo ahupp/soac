@@ -819,7 +819,6 @@ import soac.runtime as runtime
 
 assert runtime._SOAC_RUNTIME_READY is True
 assert isinstance(runtime.__spec__.loader, import_hook.SoacLoader)
-assert runtime.ITER_COMPLETE is runtime.ITER_COMPLETE
 for name in ("globals", "locals", "eval", "exec"):
     try:
         getattr(runtime, name)()

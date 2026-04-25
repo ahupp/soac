@@ -1,7 +1,7 @@
 use super::stmt_lowering::{lower_instr_into_with_expr, plan_instr_head_for_blockpy};
 use super::*;
 use crate::block_py::{
-    BlockTerm, Call, CallArgPositional, ExprAttribute, Instr, TermRaise, WithMeta,
+    Await, BlockTerm, Call, CallArgPositional, ExprAttribute, TermRaise, WithMeta,
 };
 use crate::passes::ast_to_ast::context::Context;
 use crate::passes::InstrRuff;
@@ -230,47 +230,6 @@ where
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn lower_for_stmt_sequence_head<F, E>(
-    context: &Context,
-    name_gen: &FunctionNameGen,
-    for_stmt: crate::block_py::StmtFor<InstrRuff>,
-    remaining_stmts: &[InstrRuff],
-    targets: RegionTargets,
-    linear: Vec<InstrRuff>,
-    blocks: &mut Vec<LoweredBlockPyBlock<E>>,
-    iter_name: &str,
-    tmp_name: &str,
-    loop_check_label: BlockLabel,
-    loop_continue_label: BlockLabel,
-    assign_body: Vec<InstrRuff>,
-    lower_region: &mut F,
-) -> BlockLabel
-where
-    F: FnMut(&[InstrRuff], RegionTargets, &mut Vec<LoweredBlockPyBlock<E>>) -> BlockLabel,
-    E: RuffToBlockPyExpr,
-{
-    let assign_label = name_gen.next_block_name();
-    let setup_label = name_gen.next_block_name();
-    lower_for_stmt_sequence(
-        context,
-        name_gen,
-        for_stmt,
-        remaining_stmts,
-        targets,
-        linear,
-        blocks,
-        iter_name,
-        tmp_name,
-        loop_check_label,
-        loop_continue_label,
-        assign_label,
-        setup_label,
-        assign_body,
-        lower_region,
-    )
-}
-
 fn synthetic_name_expr(name: &str) -> InstrRuff {
     crate::passes::ast_to_instr::from_ast_expr(py_expr!("{name:id}", name = name))
 }
@@ -292,21 +251,43 @@ fn synthetic_assign(target: InstrRuff, value: InstrRuff) -> InstrRuff {
         .into()
 }
 
-fn stop_iteration_handler_with_body(body: Vec<InstrRuff>) -> ast::ExceptHandler {
-    let ast::Stmt::Try(mut try_stmt) = py_stmt!(
-        r#"
+fn stop_iteration_handler_with_body(
+    exception_name: &str,
+    body: Vec<InstrRuff>,
+) -> ast::ExceptHandler {
+    let mut try_stmt = match exception_name {
+        "StopIteration" => {
+            let ast::Stmt::Try(try_stmt) = py_stmt!(
+                r#"
 try:
     pass
 except StopIteration:
     pass
 "#
-    ) else {
-        unreachable!("synthetic StopIteration handler should parse as try statement");
+            ) else {
+                unreachable!("synthetic StopIteration handler should parse as try statement");
+            };
+            try_stmt
+        }
+        "StopAsyncIteration" => {
+            let ast::Stmt::Try(try_stmt) = py_stmt!(
+                r#"
+try:
+    pass
+except StopAsyncIteration:
+    pass
+"#
+            ) else {
+                unreachable!("synthetic StopAsyncIteration handler should parse as try statement");
+            };
+            try_stmt
+        }
+        other => panic!("unsupported synthetic for-loop stop exception {other}"),
     };
     assert_eq!(
         try_stmt.handlers.len(),
         1,
-        "synthetic StopIteration handler should contain one handler"
+        "synthetic {exception_name} handler should contain one handler"
     );
     let handler = try_stmt.handlers.remove(0);
     let ast::ExceptHandler::ExceptHandler(mut handler) = handler;
@@ -317,19 +298,16 @@ except StopIteration:
     ast::ExceptHandler::ExceptHandler(handler)
 }
 
-fn expand_sync_for_stmt(
+fn expand_for_stmt(
+    name_gen: &FunctionNameGen,
     for_stmt: crate::block_py::StmtFor<InstrRuff>,
     iter_name: &str,
     tmp_name: &str,
     assign_body: Vec<InstrRuff>,
 ) -> Vec<InstrRuff> {
-    assert!(
-        !for_stmt.is_async,
-        "async for still lowers through the sentinel helper"
-    );
-
+    let iter_helper = if for_stmt.is_async { "aiter" } else { "iter" };
     let iter_value: InstrRuff = Call::new(
-        runtime_helper_expr("iter"),
+        runtime_helper_expr(iter_helper),
         vec![CallArgPositional::Positional(*for_stmt.iter)],
         Vec::new(),
     )
@@ -337,28 +315,48 @@ fn expand_sync_for_stmt(
     .into();
     let iter_assign = synthetic_assign(synthetic_name_expr(&iter_name), iter_value);
 
-    let next_attr: InstrRuff = ExprAttribute::new(
-        synthetic_name_expr(&iter_name),
-        ast::Identifier::new("__next__", Default::default()),
-        ast::ExprContext::Load,
+    let next_helper = if for_stmt.is_async { "anext" } else { "next" };
+    let next_call: InstrRuff = Call::new(
+        runtime_helper_expr(next_helper),
+        vec![CallArgPositional::Positional(synthetic_name_expr(
+            iter_name,
+        ))],
+        Vec::new(),
     )
     .with_meta(crate::block_py::Meta::synthetic())
     .into();
-    let next_call: InstrRuff = Call::new(next_attr, Vec::new(), Vec::new())
-        .with_meta(crate::block_py::Meta::synthetic())
-        .into();
-    let next_assign = synthetic_assign(synthetic_name_expr(&tmp_name), next_call);
+    let next_value = if for_stmt.is_async {
+        Await::new(next_call)
+            .with_meta(crate::block_py::Meta::synthetic())
+            .into()
+    } else {
+        next_call
+    };
+    let next_assign = synthetic_assign(synthetic_name_expr(tmp_name), next_value);
 
-    let mut stop_body = for_stmt.orelse;
+    let completed_name =
+        (!for_stmt.orelse.is_empty()).then(|| name_gen.next_tmp_name("completed").to_string());
+    let mut stop_body = Vec::new();
+    if let Some(completed_name) = &completed_name {
+        stop_body.push(synthetic_assign(
+            synthetic_name_expr(completed_name),
+            crate::passes::ast_to_instr::from_ast_expr(py_expr!("True")),
+        ));
+    }
     stop_body.push(
         crate::block_py::StmtBreak::new()
             .with_meta(crate::block_py::Meta::synthetic())
             .into(),
     );
 
+    let exception_name = if for_stmt.is_async {
+        "StopAsyncIteration"
+    } else {
+        "StopIteration"
+    };
     let fetch_next = crate::block_py::StmtTry::new(
         vec![next_assign],
-        vec![stop_iteration_handler_with_body(stop_body)],
+        vec![stop_iteration_handler_with_body(exception_name, stop_body)],
         Vec::new(),
         Vec::new(),
         false,
@@ -378,7 +376,29 @@ fn expand_sync_for_stmt(
     .with_meta(crate::block_py::Meta::synthetic())
     .into();
 
-    vec![iter_assign, while_stmt]
+    let mut expanded = vec![iter_assign];
+    if let Some(completed_name) = &completed_name {
+        expanded.push(synthetic_assign(
+            synthetic_name_expr(completed_name),
+            crate::passes::ast_to_instr::from_ast_expr(py_expr!("False")),
+        ));
+    }
+    expanded.push(while_stmt);
+    if let Some(completed_name) = completed_name {
+        expanded.push(
+            crate::block_py::StmtIf::new(
+                crate::passes::ast_to_instr::from_ast_expr(py_expr!(
+                    "{completed:id}",
+                    completed = completed_name.as_str()
+                )),
+                for_stmt.orelse,
+                Vec::new(),
+            )
+            .with_meta(crate::block_py::Meta::synthetic())
+            .into(),
+        );
+    }
+    expanded
 }
 
 pub(crate) fn lower_stmt_sequence_with_state<E>(
@@ -496,47 +516,17 @@ where
                     )),
                     tmp_name.as_str(),
                 );
-                if !for_stmt.is_async && for_stmt.orelse.is_empty() {
-                    let mut expanded = linear;
-                    expanded.extend(expand_sync_for_stmt(
-                        for_stmt,
-                        iter_name.as_str(),
-                        tmp_name.as_str(),
-                        assign_body,
-                    ));
-                    expanded.extend_from_slice(&stmts[index + 1..]);
-                    return lower_instr_stmt_sequence_with_state(
-                        context, &expanded, targets, blocks, name_gen,
-                    );
-                }
-                // A sync `for...else` cannot be desugared into a synthetic
-                // `while True` with the else body inside its StopIteration
-                // handler: user `break`/`continue` in the else clause target
-                // the surrounding real loop, not the completed synthetic loop.
-                let loop_check_label = name_gen.next_block_name();
-                let loop_continue_label = loop_check_label.clone();
-                return lower_for_stmt_sequence_head(
-                    context,
+                let mut expanded = linear;
+                expanded.extend(expand_for_stmt(
                     name_gen,
                     for_stmt,
-                    &stmts[index + 1..],
-                    targets.clone(),
-                    linear.clone(),
-                    blocks,
                     iter_name.as_str(),
                     tmp_name.as_str(),
-                    loop_check_label,
-                    loop_continue_label,
                     assign_body,
-                    &mut |stmts, nested_targets, blocks| {
-                        lower_instr_stmt_sequence_with_state(
-                            context,
-                            stmts,
-                            nested_targets,
-                            blocks,
-                            name_gen,
-                        )
-                    },
+                ));
+                expanded.extend_from_slice(&stmts[index + 1..]);
+                return lower_instr_stmt_sequence_with_state(
+                    context, &expanded, targets, blocks, name_gen,
                 );
             }
             StmtSequenceHeadPlan::Try(try_stmt) => {
@@ -856,112 +846,5 @@ where
         remaining_stmts,
         targets,
         lower_region,
-    )
-}
-
-pub(crate) fn lower_for_stmt_exit_entries<F, E>(
-    blocks: &mut Vec<LoweredBlockPyBlock<E>>,
-    else_body: &[InstrRuff],
-    remaining_stmts: &[InstrRuff],
-    targets: RegionTargets,
-    lower_region: &mut F,
-) -> (BlockLabel, BlockLabel)
-where
-    F: FnMut(&[InstrRuff], RegionTargets, &mut Vec<LoweredBlockPyBlock<E>>) -> BlockLabel,
-    E: Instr,
-{
-    let rest_entry = lower_region(remaining_stmts, targets.clone(), blocks);
-    let exhausted_entry = if else_body.is_empty() {
-        rest_entry.clone()
-    } else {
-        lower_region(else_body, targets.nested(rest_entry.clone()), blocks)
-    };
-    (rest_entry, exhausted_entry)
-}
-
-pub(crate) fn lower_for_stmt_body_entry<F, E>(
-    blocks: &mut Vec<LoweredBlockPyBlock<E>>,
-    loop_continue_label: BlockLabel,
-    body: &[InstrRuff],
-    break_label: BlockLabel,
-    targets: &RegionTargets,
-    lower_region: &mut F,
-) -> BlockLabel
-where
-    F: FnMut(&[InstrRuff], RegionTargets, &mut Vec<LoweredBlockPyBlock<E>>) -> BlockLabel,
-    E: Instr,
-{
-    let body_entry = lower_region(
-        body,
-        targets.nested_with_loop(
-            loop_continue_label.clone(),
-            Some(LoopLabels {
-                break_label,
-                continue_label: loop_continue_label.clone(),
-            }),
-        ),
-        blocks,
-    );
-    body_entry
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn lower_for_stmt_sequence<F, E>(
-    context: &Context,
-    name_gen: &FunctionNameGen,
-    for_stmt: crate::block_py::StmtFor<InstrRuff>,
-    remaining_stmts: &[InstrRuff],
-    targets: RegionTargets,
-    linear: Vec<InstrRuff>,
-    blocks: &mut Vec<LoweredBlockPyBlock<E>>,
-    iter_name: &str,
-    tmp_name: &str,
-    loop_check_label: BlockLabel,
-    loop_continue_label: BlockLabel,
-    assign_label: BlockLabel,
-    setup_label: BlockLabel,
-    assign_body: Vec<InstrRuff>,
-    lower_region: &mut F,
-) -> BlockLabel
-where
-    F: FnMut(&[InstrRuff], RegionTargets, &mut Vec<LoweredBlockPyBlock<E>>) -> BlockLabel,
-    E: RuffToBlockPyExpr,
-{
-    let else_body = &for_stmt.orelse.to_vec();
-    let (rest_entry, exhausted_entry) = lower_for_stmt_exit_entries(
-        blocks,
-        &else_body,
-        remaining_stmts,
-        targets.clone(),
-        lower_region,
-    );
-
-    let body = &for_stmt.body.to_vec();
-    let body_entry = lower_for_stmt_body_entry(
-        blocks,
-        loop_continue_label.clone(),
-        &body,
-        rest_entry.clone(),
-        &targets,
-        lower_region,
-    );
-
-    emit_for_loop_blocks(
-        context,
-        name_gen,
-        blocks,
-        setup_label,
-        assign_label,
-        loop_check_label,
-        loop_continue_label,
-        linear,
-        iter_name,
-        tmp_name,
-        *for_stmt.iter,
-        for_stmt.is_async,
-        exhausted_entry,
-        body_entry,
-        assign_body,
-        targets.active_exc.as_ref(),
     )
 }

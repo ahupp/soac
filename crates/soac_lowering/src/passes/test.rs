@@ -3310,15 +3310,11 @@ def run(items):
         .expect("bb module should be available");
     let run = function_by_name(&bb_module, "run");
     assert!(
-        function_or_constants_use_text(&bb_module, run, "next_or_sentinel"),
+        function_or_constants_use_text(&bb_module, run, "StopIteration"),
         "{run:?}"
     );
     assert!(
-        function_or_constants_use_text(&bb_module, run, "ITER_COMPLETE"),
-        "{run:?}"
-    );
-    assert!(
-        !function_or_constants_use_text(&bb_module, run, "StopIteration"),
+        function_or_constants_use_text(&bb_module, run, "next"),
         "{run:?}"
     );
     assert!(
@@ -3334,7 +3330,7 @@ def run(items):
 }
 
 #[test]
-fn lowers_async_for_else_directly_without_completed_flag() {
+fn lowers_async_for_else_with_stop_async_iteration() {
     let source = r#"
 async def run():
     async for x in ait:
@@ -3347,14 +3343,17 @@ async def run():
         .expect("bb module should be available");
     let run = function_by_name(&bb_module, "run");
     assert!(
-        function_or_constants_use_text(&bb_module, run, "anext_or_sentinel"),
+        function_or_constants_use_text(&bb_module, run, "anext"),
         "{run:?}"
     );
     assert!(
         function_or_constants_use_text(&bb_module, run, "aiter"),
         "{run:?}"
     );
-    assert!(!blockpy_function_has_root_name(run, "_dp_completed_"));
+    assert!(
+        function_or_constants_use_text(&bb_module, run, "StopAsyncIteration"),
+        "{run:?}"
+    );
 }
 
 #[test]
@@ -3372,7 +3371,7 @@ async def run():
         expr,
         InstrWithAwaitAndYield::Await(_)
     )));
-    assert!(blockpy_function_has_root_name(run, "anext_or_sentinel"));
+    assert!(blockpy_function_has_root_name(run, "anext"));
     assert!(blockpy_function_has_root_name(run, "aiter"));
     assert!(!blockpy_function_has_root_name(run, "await_iter"));
 }

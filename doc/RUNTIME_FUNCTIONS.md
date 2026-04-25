@@ -100,8 +100,6 @@ dp_jit_py_call_object
 dp_jit_py_call_object_with_frame
 dp_jit_py_vectorcall
 dp_jit_py_vectorcall_with_frame
-dp_jit_next_or_sentinel
-dp_jit_next_or_sentinel_with_frame
 dp_jit_py_call_with_kw
 dp_jit_py_call_with_kw_with_frame
 dp_jit_get_arg_item
@@ -226,8 +224,6 @@ exc_info
 exc_info_from_exception
 _get_awaitable_iter
 await_iter
-anext_or_sentinel
-next_or_sentinel
 raise_from
 _call_exception_class
 import_

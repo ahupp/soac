@@ -985,11 +985,6 @@ static DP_JIT_PY_VECTORCALL_IMPORT: ImportSpec = ImportSpec::new(
     ],
     &[SigType::Pointer],
 );
-static DP_JIT_NEXT_OR_SENTINEL_IMPORT: ImportSpec = ImportSpec::new(
-    "dp_jit_next_or_sentinel",
-    &[SigType::Pointer, SigType::Pointer],
-    &[SigType::Pointer],
-);
 static DP_JIT_ENTER_RECURSIVE_CALL_IMPORT: ImportSpec = ImportSpec::new(
     "dp_jit_enter_recursive_call",
     &[SigType::Pointer],
@@ -1197,7 +1192,6 @@ static JIT_RUNTIME_IMPORT_SPECS: &[&ImportSpec] = &[
     &DP_JIT_PY_CALL_POSITIONAL_THREE_IMPORT,
     &DP_JIT_PY_CALL_OBJECT_IMPORT,
     &DP_JIT_PY_VECTORCALL_IMPORT,
-    &DP_JIT_NEXT_OR_SENTINEL_IMPORT,
     &DP_JIT_ENTER_RECURSIVE_CALL_IMPORT,
     &PY_THREAD_STATE_GET_UNCHECKED_IMPORT,
     &DP_JIT_PY_CALL_WITH_KW_IMPORT,
@@ -16495,9 +16489,6 @@ fn emit_codegen_simple_call_with_local_env(
         has_unpack,
     } = simple_call_parts(call);
 
-    let ptr_ty = emit_ctx.consts.ptr_ty;
-    let null_ptr = fb.ins().iconst(ptr_ty, 0);
-
     if !has_unpack
         && simple_keywords.is_empty()
         && simple_args.is_empty()
@@ -16528,64 +16519,6 @@ fn emit_codegen_simple_call_with_local_env(
             codegen_env,
             func_imports,
         ));
-    }
-
-    if !has_unpack
-        && simple_keywords.is_empty()
-        && simple_args.len() == 1
-        && codegen_expr_runtime_helper(call.func.as_ref(), emit_ctx)
-            == Some(RuntimeHelperId::NextOrSentinel)
-    {
-        let iterator_expr = simple_args[0];
-        let iterator_is_borrowed = codegen_expr_pyobject_input_is_borrowed_from_local_env(
-            iterator_expr,
-            local_env,
-            emit_ctx,
-        );
-        let iterator = emit_codegen_expr_with_local_env(
-            fb,
-            iterator_expr,
-            local_env,
-            emit_ctx,
-            iterator_is_borrowed,
-            codegen_env,
-            func_imports,
-        );
-        let sentinel = emit_owned_module_constant(
-            fb,
-            emit_ctx
-                .module_constants
-                .require_runtime_name_constant_id("ITER_COMPLETE"),
-            emit_ctx,
-        );
-        let next_or_sentinel_ref =
-            func_imports.get_or_panic(codegen_env, &mut fb.func, &DP_JIT_NEXT_OR_SENTINEL_IMPORT);
-        let next_inst = fb.ins().call(next_or_sentinel_ref, &[iterator, sentinel]);
-        let mut owned_inputs = Vec::with_capacity(2);
-        if !iterator_is_borrowed {
-            owned_inputs.push(iterator);
-        }
-        owned_inputs.push(sentinel);
-        let next_value = emit_decref_owned_inputs_after_nullable_result(
-            fb,
-            emit_ctx,
-            fb.inst_results(next_inst)[0],
-            &owned_inputs,
-        );
-        let value_is_null = fb
-            .ins()
-            .icmp(ir::condcodes::IntCC::Equal, next_value, null_ptr);
-        let value_ok_block = fb.create_block();
-        fb.append_block_param(value_ok_block, ptr_ty);
-        fb.ins().brif(
-            value_is_null,
-            emit_ctx.consts.step_null_block,
-            &step_null_block_args(emit_ctx),
-            value_ok_block,
-            &[ir::BlockArg::Value(next_value)],
-        );
-        fb.switch_to_block(value_ok_block);
-        return Some(fb.block_params(value_ok_block)[0]);
     }
 
     if has_unpack {
@@ -16643,6 +16576,8 @@ fn emit_codegen_simple_call_with_local_env(
     }
 
     if !has_unpack && simple_keywords.is_empty() {
+        let ptr_ty = emit_ctx.consts.ptr_ty;
+        let null_ptr = fb.ins().iconst(ptr_ty, 0);
         let site_instr_id = call.try_semantic_instr_id();
         let call_target_counter = site_instr_id
             .and_then(|site_instr_id| emit_ctx.call_target_counter_ids.get(&site_instr_id))

@@ -69,7 +69,6 @@ pub enum RuntimeHelperId {
     Index,
     Str,
     CellRef,
-    NextOrSentinel,
     TupleFromIter,
     MakeFunction,
     CreateClass,
@@ -102,7 +101,6 @@ impl RuntimeHelperId {
             b"_index" => Some(Self::Index),
             b"str" => Some(Self::Str),
             b"cell_ref" => Some(Self::CellRef),
-            b"next_or_sentinel" => Some(Self::NextOrSentinel),
             b"tuple_from_iter" => Some(Self::TupleFromIter),
             b"make_function" => Some(Self::MakeFunction),
             b"create_class" => Some(Self::CreateClass),
@@ -380,7 +378,6 @@ const fn runtime_helper_result(helper: RuntimeHelperId) -> ValueFacts {
         RuntimeHelperId::Str => ValueFacts::PyObj(PyObjFacts::exact_type(PyExactType::Str)),
         RuntimeHelperId::Globals
         | RuntimeHelperId::CellRef
-        | RuntimeHelperId::NextOrSentinel
         | RuntimeHelperId::TupleFromIter
         | RuntimeHelperId::MakeFunction
         | RuntimeHelperId::CreateClass
@@ -396,7 +393,6 @@ const fn runtime_helper_throw_spec(helper: RuntimeHelperId) -> ThrowSpec {
         RuntimeHelperId::Globals | RuntimeHelperId::CellRef => ThrowSpec::Never,
         RuntimeHelperId::Index
         | RuntimeHelperId::Str
-        | RuntimeHelperId::NextOrSentinel
         | RuntimeHelperId::TupleFromIter
         | RuntimeHelperId::MakeFunction
         | RuntimeHelperId::CreateClass
@@ -1231,22 +1227,11 @@ def f(x, flag):
             RuntimeHelperId::from_runtime_symbol("_index"),
             Some(RuntimeHelperId::Index)
         );
-        assert_eq!(
-            RuntimeHelperId::from_runtime_symbol("next_or_sentinel"),
-            Some(RuntimeHelperId::NextOrSentinel)
-        );
         assert_eq!(RuntimeHelperId::from_runtime_symbol("not_a_helper"), None);
     }
 
     #[test]
     fn runtime_helper_signatures_declare_result_and_throw_policy() {
-        let signature = RuntimeHelperId::NextOrSentinel.signature();
-        assert_eq!(signature.throws, ThrowSpec::ThrowsOnNullPyObj);
-        let ValueFacts::PyObj(result_facts) = signature.result else {
-            panic!("next_or_sentinel should return a Python object");
-        };
-        assert!(result_facts.is_known_not_none());
-
         let signature = RuntimeHelperId::Str.signature();
         assert_eq!(signature.throws, ThrowSpec::ThrowsOnNullPyObj);
         let ValueFacts::PyObj(result_facts) = signature.result else {

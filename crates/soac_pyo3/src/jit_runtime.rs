@@ -87,7 +87,6 @@ fn install_soac_runtime_bootstrap_globals(
         ("ELLIPSIS", "ELLIPSIS"),
         ("EMPTY_TUPLE", "EMPTY_TUPLE"),
         ("FALSE", "FALSE"),
-        ("ITER_COMPLETE", "ITER_COMPLETE"),
         ("NO_DEFAULT", "NO_DEFAULT"),
         ("NONE", "NONE"),
         ("TRUE", "TRUE"),

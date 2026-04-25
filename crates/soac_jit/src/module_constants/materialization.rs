@@ -631,8 +631,7 @@ fn build_soac_runtime_bootstrap_runtime_name(
         | RuntimeName::False
         | RuntimeName::None
         | RuntimeName::Ellipsis
-        | RuntimeName::EmptyTuple
-        | RuntimeName::IterComplete => Ok(PyModule::import(py, "soac.bootstrap")?
+        | RuntimeName::EmptyTuple => Ok(PyModule::import(py, "soac.bootstrap")?
             .getattr(runtime_name.name())?
             .unbind()),
         other => Err(PyRuntimeError::new_err(format!(

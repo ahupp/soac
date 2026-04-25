@@ -119,12 +119,12 @@ def {func:id}({param:id}):
                     r#"
 {iter_name:id} = {iter:expr}
 while True:
-    {target_tmp:id} = await __soac__.anext_or_sentinel({iter_name:id})
-    if {target_tmp:id} is __soac__.ITER_COMPLETE:
+    try:
+        {target_tmp:id} = await __soac__.anext({iter_name:id})
+    except StopAsyncIteration:
         break
-    else:
-        {target:expr} = {target_tmp:id}
-        {body:stmt}
+    {target:expr} = {target_tmp:id}
+    {body:stmt}
 "#,
                     iter_name = iter_name.as_str(),
                     iter = iter,
@@ -150,12 +150,12 @@ async for {target:expr} in {iter:expr}:
                 r#"
 {iter_name:id} = {iter:expr}
 while True:
-    {target_tmp:id} = __soac__.next_or_sentinel({iter_name:id})
-    if {target_tmp:id} is __soac__.ITER_COMPLETE:
+    try:
+        {target_tmp:id} = __soac__.next({iter_name:id})
+    except StopIteration:
         break
-    else:
-        {target:expr} = {target_tmp:id}
-        {body:stmt}
+    {target:expr} = {target_tmp:id}
+    {body:stmt}
 "#,
                 iter_name = iter_name.as_str(),
                 iter = iter,

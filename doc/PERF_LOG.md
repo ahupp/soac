@@ -671,12 +671,11 @@ benchmarked throughput delta, and the headline pre/post numbers.
 ## 2026-04-08 - Inline next-or-sentinel iterator progress
 
 - jj change id: `tuyrzlpu`
-- summary: Codegen now recognizes transformed calls to
-  `__soac__.next_or_sentinel(iterator)` and emits a native iterator
-  helper call instead of vectorcalling the transformed Python runtime
-  helper. The helper calls `PyIter_NextItem`, returns the module's
-  `ITER_COMPLETE` singleton when the iterator is exhausted, and leaves
-  real iterator errors on the existing null-return exception path.
+- summary: Codegen now recognizes transformed iterator-progress helper
+  calls and emits a native iterator helper call instead of vectorcalling
+  the transformed Python runtime helper. Exhausted iterators return a
+  module sentinel, and real iterator errors stay on the existing
+  null-return exception path.
 - throughput: `+8.06%` median
 - pre-change benchmark:
   - specialized pass, 1M loops x3: `156111`, `162114`, `163148 loops/s`
@@ -1263,4 +1262,3 @@ benchmarked throughput delta, and the headline pre/post numbers.
   - specialized pass, 1M loops x3: `95203`, `96496`, `96721 loops/s`
   - no-refcount diagnostic, 1M loops x3: `173418`, `164855`, `155884 loops/s`
   - pystone JIT code bytes: `64879`
-

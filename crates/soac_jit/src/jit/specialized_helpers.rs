@@ -32,7 +32,6 @@ unsafe extern "C" {
         key: *mut ffi::PyObject,
         result: *mut *mut ffi::PyObject,
     ) -> libc::c_int;
-    fn PyIter_NextItem(iterator: *mut ffi::PyObject, item: *mut *mut ffi::PyObject) -> libc::c_int;
 }
 unsafe extern "C" {
     static mut PyCell_Type: ffi::PyTypeObject;
@@ -141,25 +140,6 @@ unsafe extern "C" fn py_vectorcall_hook(
         kwnames as *mut ffi::PyObject,
     ) as ObjPtr
 }
-unsafe extern "C" fn next_or_sentinel_hook(iterator: ObjPtr, sentinel: ObjPtr) -> ObjPtr {
-    if iterator.is_null() || sentinel.is_null() {
-        ffi::PyErr_SetString(
-            ffi::PyExc_RuntimeError,
-            b"invalid arguments to dp_jit_next_or_sentinel\0".as_ptr() as *const i8,
-        );
-        return ptr::null_mut();
-    }
-    let mut item: *mut ffi::PyObject = ptr::null_mut();
-    match PyIter_NextItem(iterator as *mut ffi::PyObject, ptr::addr_of_mut!(item)) {
-        1 => item as ObjPtr,
-        0 => {
-            ffi::Py_INCREF(sentinel as *mut ffi::PyObject);
-            sentinel
-        }
-        _ => ptr::null_mut(),
-    }
-}
-
 unsafe extern "C" fn enter_recursive_call_hook(_tstate: ObjPtr) -> i32 {
     ffi::Py_EnterRecursiveCall(b" while calling a Python object\0".as_ptr() as *const i8)
 }
@@ -871,10 +851,6 @@ mod test_only_export_stubs {
         nargsf: ObjPtr,
         kwnames: ObjPtr
     ));
-    panic_dual_obj_export!(dp_jit_next_or_sentinel, dp_jit_next_or_sentinel_with_frame(
-        iterator: ObjPtr,
-        sentinel: ObjPtr
-    ));
     panic_dual_obj_export!(dp_jit_py_call_with_kw, dp_jit_py_call_with_kw_with_frame(
         callable: ObjPtr,
         args: ObjPtr,
@@ -1006,11 +982,6 @@ define_perf_toggle_export!(
         nargsf: ObjPtr,
         kwnames: ObjPtr
     ) => py_vectorcall_hook(tstate, callable, args, nargsf, kwnames)
-);
-define_perf_toggle_export!(
-    ObjPtr,
-    dp_jit_next_or_sentinel,
-    dp_jit_next_or_sentinel_with_frame(iterator: ObjPtr, sentinel: ObjPtr) => next_or_sentinel_hook(iterator, sentinel)
 );
 define_perf_toggle_export!(
     ObjPtr,
@@ -1489,13 +1460,6 @@ pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
         chosen_helper_symbol(
             dp_jit_py_vectorcall as *const u8,
             dp_jit_py_vectorcall_with_frame as *const u8,
-        ),
-    );
-    builder.symbol(
-        "dp_jit_next_or_sentinel",
-        chosen_helper_symbol(
-            dp_jit_next_or_sentinel as *const u8,
-            dp_jit_next_or_sentinel_with_frame as *const u8,
         ),
     );
     builder.symbol(

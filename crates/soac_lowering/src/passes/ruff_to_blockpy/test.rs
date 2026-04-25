@@ -8,8 +8,8 @@ use crate::lower_python_to_blockpy_for_testing;
 use crate::pass_tracker::LoweringPassTrackerInternalExt;
 use crate::passes::ast_to_ast::context::Context;
 use crate::passes::ruff_to_blockpy::stmt_sequences::{
-    lower_for_stmt_sequence, lower_if_stmt_sequence, lower_if_stmt_sequence_from_stmt,
-    lower_while_stmt_sequence, lower_while_stmt_sequence_from_stmt, plan_instr_sequence_head,
+    lower_if_stmt_sequence, lower_if_stmt_sequence_from_stmt, lower_while_stmt_sequence,
+    lower_while_stmt_sequence_from_stmt, plan_instr_sequence_head,
 };
 use crate::passes::ruff_to_blockpy::try_regions::build_try_plan;
 use crate::passes::{CoreModuleShape, CoreModuleShapeWithAwaitAndYield, InstrRuff};
@@ -165,7 +165,7 @@ async def f(xs):
 "#,
     );
     let f = function_by_name(&blockpy, "f");
-    assert!(function_has_root_load(f, "anext_or_sentinel"));
+    assert!(function_has_root_load(f, "anext"));
     assert!(function_has_instr(f, |expr| matches!(
         expr,
         InstrWithAwaitAndYield::Await(_)
@@ -421,60 +421,6 @@ match "aa":
         expr,
         InstrWithAwaitAndYield::Store(store) if store.name.id_str() == "_dp_match_1"
     )));
-}
-
-#[test]
-fn lower_for_stmt_sequence_emits_loop_scaffolding() {
-    let module = ruff_python_parser::parse_module(
-        r#"
-def f(xs):
-    for x in xs:
-        body(x)
-"#,
-    )
-    .unwrap()
-    .into_syntax()
-    .body;
-    let ast::Stmt::FunctionDef(func) = &module[0] else {
-        panic!("expected function def");
-    };
-    let ast::Stmt::For(for_stmt) = &func.body[0] else {
-        panic!("expected for stmt");
-    };
-    let InstrRuff::StmtFor(for_stmt) =
-        crate::passes::ast_to_instr::from_ast_stmt(ast::Stmt::For(for_stmt.clone()))
-    else {
-        panic!("expected InstrRuff::StmtFor");
-    };
-
-    let mut blocks = Vec::new();
-    let name_gen = test_name_gen();
-    let entry = lower_for_stmt_sequence(
-        &Context::new(""),
-        &name_gen,
-        for_stmt,
-        &[],
-        RegionTargets::new(label(99), None),
-        Vec::new(),
-        &mut blocks,
-        "_dp_iter_0",
-        "_dp_tmp_0",
-        label(0),
-        label(0),
-        label(1),
-        label(2),
-        vec![
-            crate::passes::ast_to_instr::from_ast_stmt(py_stmt!("x = _dp_tmp_0")),
-            crate::passes::ast_to_instr::from_ast_stmt(py_stmt!("del _dp_tmp_0")),
-        ],
-        &mut |_stmts: &[InstrRuff], targets: RegionTargets, _blocks: &mut Vec<TestBlock>| {
-            targets.normal_cont
-        },
-    );
-
-    assert_eq!(entry, label(2));
-    assert!(blocks.iter().any(|block| block.label == label(1)));
-    assert!(blocks.iter().any(|block| block.label == label(2)));
 }
 
 #[test]
