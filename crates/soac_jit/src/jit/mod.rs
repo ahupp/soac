@@ -159,17 +159,35 @@ mod direct_abi;
 mod imports;
 mod intrinsics;
 mod jitdump;
+mod module_data;
 mod operation_specializations;
 mod planning;
 mod precompiled_object;
 mod runtime_context;
 mod signal_diagnostics;
 mod specialized_helpers;
+mod symbols;
 mod typed_value;
 
 use direct_abi::{
     ArgOwnership, DirectCallableDesc, DirectEntry, DirectTargetId, ErrorAbi, HiddenArgAbi,
     ParamAbi, PyLongI64Coercion, ResultAbi,
+};
+use module_data::{
+    declare_module_constant_object_data, declare_module_constant_object_data_for_prefix,
+    declare_scalar_counter_storage_import, declare_top_value_counter_storage_import,
+    declare_type_ptr_import, define_scalar_counter_storage_data,
+    define_scalar_counter_storage_data_for_symbol, define_top_value_counter_storage_data,
+    define_top_value_counter_storage_data_for_symbol,
+    direct_function_symbol_scope_for_shared_state, module_constant_object_symbol,
+    module_constant_symbol_prefix_for_instance, module_constant_symbol_prefix_for_module_identity,
+    module_constant_symbol_prefix_for_shared_state, persistent_function_id_for_module_function,
+    precompiled_direct_function_symbol_scope_for_persistent,
+    precompiled_direct_function_symbol_scope_for_shared_state, push_shared_module_symbol_identity,
+    scalar_counter_storage_symbol, scalar_counter_storage_symbol_for_instance,
+    scalar_counter_storage_symbol_for_shared_state, top_value_counter_storage_symbol,
+    top_value_counter_storage_symbol_for_instance,
+    top_value_counter_storage_symbol_for_shared_state,
 };
 pub use planning::{
     BlockExcDispatchPlan, BlockParamFacts, EdgeTransportPlan, FunctionLocalPlan, LocalRefKind,
@@ -194,6 +212,11 @@ use runtime_context::{
 pub use runtime_context::{ModuleJitContext, ModuleRuntimeContext};
 pub use specialized_helpers::ObjPtr;
 use specialized_helpers::register_specialized_jit_symbols;
+use symbols::{
+    cpython_type_symbol_from_name, cpython_type_symbol_name, lookup_registered_jit_data_symbol,
+    push_symbol_component_hex, py_dealloc_symbol, register_jit_data_symbol,
+    reloc_callable_ref_symbol_name, reloc_type_ref_symbol_name, type_key_runtime_registry,
+};
 pub use typed_value::{
     EmitResult, IntFacts, IntRange, IntWidth, ResultDemand, SoacRepr, SoacValue, ValueOwnership,
 };
@@ -204,9 +227,6 @@ pub fn install_sigill_diagnostics() -> Result<(), String> {
 
 static RUNTIME_SUPPORT_LIBRARY: OnceLock<Result<RuntimeSupportLibrary, String>> = OnceLock::new();
 static PRECOMPILED_LIBRARY: OnceLock<Result<Option<PrecompiledLibrary>, String>> = OnceLock::new();
-static JIT_DATA_SYMBOLS: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
-static TYPE_KEY_RUNTIME_REGISTRY: OnceLock<Mutex<HashMap<CounterDumpTypeKey, usize>>> =
-    OnceLock::new();
 const JIT_ARENA_BYTES: usize = 256 * 1024 * 1024;
 const MISSING_PYTHON_EXCEPTION_TRAP: ir::TrapCode = ir::TrapCode::unwrap_user(1);
 #[allow(dead_code)]
@@ -214,402 +234,6 @@ const OPT_V3_FUSED_CONSUMER_TRAP: ir::TrapCode = ir::TrapCode::unwrap_user(2);
 const COLD_BLOCK_ENTRY_RATE_DENOMINATOR: u64 = 100;
 thread_local! {
     static PROCESS_JIT_COMPILE_DEPTH: Cell<usize> = const { Cell::new(0) };
-}
-
-unsafe extern "C" {
-    fn _Py_Dealloc(obj: *mut ffi::PyObject);
-}
-
-fn py_dealloc_symbol() -> *const u8 {
-    _Py_Dealloc as *const u8
-}
-
-fn jit_data_symbols() -> &'static Mutex<HashMap<String, usize>> {
-    JIT_DATA_SYMBOLS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn type_key_runtime_registry() -> &'static Mutex<HashMap<CounterDumpTypeKey, usize>> {
-    TYPE_KEY_RUNTIME_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn register_jit_data_symbol(symbol: &str, ptr: *const u8) {
-    let mut symbols = jit_data_symbols()
-        .lock()
-        .expect("JIT data symbol registry lock poisoned");
-    symbols.insert(symbol.to_string(), ptr as usize);
-}
-
-fn lookup_registered_jit_data_symbol(symbol: &str) -> Option<*const u8> {
-    let symbols = jit_data_symbols()
-        .lock()
-        .expect("JIT data symbol registry lock poisoned");
-    symbols.get(symbol).copied().map(|ptr| ptr as *const u8)
-}
-
-fn cpython_type_symbol_name(symbol: CpythonTypeSymbol) -> &'static str {
-    match symbol {
-        CpythonTypeSymbol::Function => "PyFunction_Type",
-        CpythonTypeSymbol::Method => "PyMethod_Type",
-        CpythonTypeSymbol::Type => "PyType_Type",
-        CpythonTypeSymbol::Long => "PyLong_Type",
-        CpythonTypeSymbol::List => "PyList_Type",
-    }
-}
-
-fn cpython_type_symbol_from_name(name: &str) -> Option<CpythonTypeSymbol> {
-    match name {
-        "PyFunction_Type" => Some(CpythonTypeSymbol::Function),
-        "PyMethod_Type" => Some(CpythonTypeSymbol::Method),
-        "PyType_Type" => Some(CpythonTypeSymbol::Type),
-        "PyLong_Type" => Some(CpythonTypeSymbol::Long),
-        "PyList_Type" => Some(CpythonTypeSymbol::List),
-        _ => None,
-    }
-}
-
-fn push_symbol_component_hex(out: &mut String, component: &str) {
-    for byte in component.as_bytes() {
-        out.push(char::from_digit(u32::from(byte >> 4), 16).expect("upper hex digit should exist"));
-        out.push(
-            char::from_digit(u32::from(byte & 0x0f), 16).expect("lower hex digit should exist"),
-        );
-    }
-}
-
-fn reloc_type_ref_symbol_name(type_ref: &RelocTypeRef) -> Cow<'static, str> {
-    match type_ref {
-        RelocTypeRef::CpythonTypeSymbol(symbol) => Cow::Borrowed(cpython_type_symbol_name(*symbol)),
-        RelocTypeRef::TypeKey(type_key) => {
-            let mut symbol = String::from("__soac_typekey_");
-            push_symbol_component_hex(&mut symbol, type_key.module_name.as_str());
-            symbol.push('_');
-            push_symbol_component_hex(&mut symbol, type_key.qualname.as_str());
-            Cow::Owned(symbol)
-        }
-    }
-}
-
-fn reloc_callable_ref_symbol_name(callable_ref: &RelocCallableRef) -> String {
-    match callable_ref {
-        RelocCallableRef::OwnerAttr {
-            owner_type_ref,
-            attr_name,
-        } => {
-            let mut symbol = String::from("__soac_callable_owner_attr_");
-            let owner_symbol = reloc_type_ref_symbol_name(owner_type_ref);
-            push_symbol_component_hex(&mut symbol, owner_symbol.as_ref());
-            symbol.push('_');
-            push_symbol_component_hex(&mut symbol, attr_name.as_str());
-            symbol
-        }
-    }
-}
-
-fn module_constant_symbol_prefix<P: ModuleShape>(module: &BlockPyModule<P>) -> String {
-    format!(
-        "__soac_module_constant_{}",
-        module.module_name_gen.module_id()
-    )
-}
-
-fn module_constant_symbol_prefix_for_instance<P: ModuleShape>(
-    module: &BlockPyModule<P>,
-    instance_key: usize,
-) -> String {
-    format!("{}_{}", module_constant_symbol_prefix(module), instance_key)
-}
-
-fn scalar_counter_storage_symbol<P: ModuleShape>(module: &BlockPyModule<P>) -> String {
-    format!(
-        "__soac_scalar_counters_{}",
-        module.module_name_gen.module_id()
-    )
-}
-
-fn scalar_counter_storage_symbol_for_instance<P: ModuleShape>(
-    module: &BlockPyModule<P>,
-    instance_key: usize,
-) -> String {
-    format!("{}_{}", scalar_counter_storage_symbol(module), instance_key)
-}
-
-fn top_value_counter_storage_symbol<P: ModuleShape>(module: &BlockPyModule<P>) -> String {
-    format!(
-        "__soac_top_value_counters_{}",
-        module.module_name_gen.module_id()
-    )
-}
-
-fn top_value_counter_storage_symbol_for_instance<P: ModuleShape>(
-    module: &BlockPyModule<P>,
-    instance_key: usize,
-) -> String {
-    format!(
-        "{}_{}",
-        top_value_counter_storage_symbol(module),
-        instance_key
-    )
-}
-
-fn push_shared_module_symbol_identity(
-    out: &mut String,
-    module_name: &str,
-    source_hash: u64,
-    fallback_instance_key: Option<usize>,
-) {
-    push_symbol_component_hex(out, module_name);
-    out.push('_');
-    out.push_str(format!("{source_hash:016x}").as_str());
-    if source_hash == 0 {
-        if let Some(instance_key) = fallback_instance_key {
-            out.push_str("_inst_");
-            out.push_str(instance_key.to_string().as_str());
-        }
-    }
-}
-
-fn push_shared_module_symbol_identity_for_shared_state(
-    out: &mut String,
-    shared_state: &SharedModuleState,
-) {
-    push_shared_module_symbol_identity(
-        out,
-        shared_state.module_name.as_str(),
-        shared_state.source_hash(),
-        Some(shared_state.storage_instance_key()),
-    );
-}
-
-fn module_constant_symbol_prefix_for_shared_state(shared_state: &SharedModuleState) -> String {
-    let mut symbol = String::from("__soac_module_constant_shared_");
-    push_shared_module_symbol_identity_for_shared_state(&mut symbol, shared_state);
-    symbol
-}
-
-fn module_constant_symbol_prefix_for_module_identity(
-    module_name: &str,
-    source_hash: u64,
-) -> String {
-    let mut symbol = String::from("__soac_module_constant_shared_");
-    push_shared_module_symbol_identity(&mut symbol, module_name, source_hash, None);
-    symbol
-}
-
-fn scalar_counter_storage_symbol_for_shared_state(shared_state: &SharedModuleState) -> String {
-    let mut symbol = String::from("__soac_scalar_counters_shared_");
-    push_shared_module_symbol_identity_for_shared_state(&mut symbol, shared_state);
-    symbol
-}
-
-fn top_value_counter_storage_symbol_for_shared_state(shared_state: &SharedModuleState) -> String {
-    let mut symbol = String::from("__soac_top_value_counters_shared_");
-    push_shared_module_symbol_identity_for_shared_state(&mut symbol, shared_state);
-    symbol
-}
-
-fn direct_function_symbol_scope_for_shared_state(
-    shared_state: &SharedModuleState,
-    function_id: RuntimeFunctionId,
-) -> String {
-    let mut scope = String::from("shared_");
-    push_shared_module_symbol_identity_for_shared_state(&mut scope, shared_state);
-    scope.push_str("_fn_");
-    scope.push_str(function_id.to_packed_runtime_u64().to_string().as_str());
-    scope
-}
-
-fn precompiled_direct_function_symbol_scope_for_shared_state(
-    shared_state: &SharedModuleState,
-    function_id: RuntimeFunctionId,
-) -> String {
-    let persistent = persistent_function_id_for_module_function(
-        shared_state.module_name.as_str(),
-        shared_state.source_hash(),
-        function_id.local_function_id(),
-    );
-    precompiled_direct_function_symbol_scope_for_persistent(&persistent)
-}
-
-fn module_content_id_for_module_identity(module_name: &str, source_hash: u64) -> ModuleContentId {
-    ModuleContentId::new(module_name, source_hash)
-}
-
-fn persistent_function_id_for_module_function(
-    module_name: &str,
-    source_hash: u64,
-    local_function_id: LocalFunctionId,
-) -> PersistentFunctionId {
-    PersistentFunctionId::new(
-        module_content_id_for_module_identity(module_name, source_hash),
-        local_function_id,
-    )
-}
-
-fn precompiled_direct_function_symbol_scope_for_persistent(
-    function: &PersistentFunctionId,
-) -> String {
-    let mut scope = String::from("shared_");
-    push_shared_module_symbol_identity(
-        &mut scope,
-        function.module.module_name.as_str(),
-        function.module.source_hash,
-        None,
-    );
-    scope.push_str("_fn_");
-    scope.push_str(function.local.as_u32().to_string().as_str());
-    scope
-}
-
-fn module_constant_object_symbol(symbol_prefix: &str, constant_id: ModuleConstantId) -> String {
-    format!("{symbol_prefix}_object_{}", constant_id.0)
-}
-
-fn declare_module_constant_object_data_for_symbol(
-    jit_module: &mut JITModule,
-    symbol_prefix: &str,
-    constant_id: ModuleConstantId,
-    module_constant_ptr: *mut ffi::PyObject,
-) -> Result<DataId, String> {
-    let symbol = module_constant_object_symbol(symbol_prefix, constant_id);
-    register_jit_data_symbol(symbol.as_str(), module_constant_ptr.cast::<u8>());
-    jit_module
-        .codegen_declare_data(symbol.as_str(), Linkage::Import, true, false)
-        .map_err(|err| format!("failed to declare module constant object {symbol}: {err}"))
-}
-
-fn declare_module_constant_object_data(
-    jit_module: &mut JITModule,
-    module: &BlockPyModule<impl ModuleShape>,
-    module_constant_ptrs: &[*mut ffi::PyObject],
-) -> Result<Vec<DataId>, String> {
-    let instance_key = std::ptr::from_ref(module).cast::<()>() as usize;
-    let symbol_prefix = module_constant_symbol_prefix_for_instance(module, instance_key);
-    declare_module_constant_object_data_for_prefix(
-        jit_module,
-        symbol_prefix.as_str(),
-        module_constant_ptrs,
-    )
-}
-
-fn declare_module_constant_object_data_for_prefix(
-    jit_module: &mut JITModule,
-    symbol_prefix: &str,
-    module_constant_ptrs: &[*mut ffi::PyObject],
-) -> Result<Vec<DataId>, String> {
-    module_constant_ptrs
-        .iter()
-        .copied()
-        .enumerate()
-        .map(|(index, ptr)| {
-            declare_module_constant_object_data_for_symbol(
-                jit_module,
-                symbol_prefix,
-                ModuleConstantId(index),
-                ptr,
-            )
-        })
-        .collect()
-}
-
-fn define_scalar_counter_storage_data_for_symbol(
-    jit_module: &mut JITModule,
-    symbol: &str,
-    scalar_counter_count: usize,
-) -> Result<DataId, String> {
-    let data_id = jit_module
-        .codegen_declare_data(symbol, Linkage::Local, true, false)
-        .map_err(|err| format!("failed to declare scalar counter storage {symbol}: {err}"))?;
-    let mut data = DataDescription::new();
-    data.define_zeroinit(
-        scalar_counter_count
-            .checked_mul(std::mem::size_of::<u64>())
-            .ok_or_else(|| {
-                format!("scalar counter storage size overflow for {symbol}: {scalar_counter_count}")
-            })?,
-    );
-    data.set_align(std::mem::align_of::<u64>() as u64);
-    jit_module
-        .define_data(data_id, &data)
-        .map_err(|err| format!("failed to define scalar counter storage {symbol}: {err}"))?;
-    Ok(data_id)
-}
-
-fn define_scalar_counter_storage_data(
-    jit_module: &mut JITModule,
-    module: &BlockPyModule<impl ModuleShape>,
-    scalar_counter_count: usize,
-) -> Result<DataId, String> {
-    define_scalar_counter_storage_data_for_symbol(
-        jit_module,
-        scalar_counter_storage_symbol(module).as_str(),
-        scalar_counter_count,
-    )
-}
-
-fn declare_scalar_counter_storage_import(
-    jit_module: &mut JITModule,
-    symbol: &str,
-) -> Result<DataId, String> {
-    jit_module
-        .codegen_declare_data(symbol, Linkage::Import, true, false)
-        .map_err(|err| format!("failed to declare imported scalar counter storage {symbol}: {err}"))
-}
-
-fn define_top_value_counter_storage_data_for_symbol(
-    jit_module: &mut JITModule,
-    symbol: &str,
-    top_value_counter_count: usize,
-) -> Result<DataId, String> {
-    let data_id = jit_module
-        .codegen_declare_data(symbol, Linkage::Local, true, false)
-        .map_err(|err| format!("failed to declare top-value counter storage {symbol}: {err}"))?;
-    let mut data = DataDescription::new();
-    data.define_zeroinit(
-        top_value_counter_count
-            .checked_mul(std::mem::size_of::<TopValueCounter>())
-            .ok_or_else(|| {
-                format!(
-                    "top-value counter storage size overflow for {symbol}: {top_value_counter_count}"
-                )
-            })?,
-    );
-    data.set_align(std::mem::align_of::<TopValueCounter>() as u64);
-    jit_module
-        .define_data(data_id, &data)
-        .map_err(|err| format!("failed to define top-value counter storage {symbol}: {err}"))?;
-    Ok(data_id)
-}
-
-fn define_top_value_counter_storage_data(
-    jit_module: &mut JITModule,
-    module: &BlockPyModule<impl ModuleShape>,
-    top_value_counter_count: usize,
-) -> Result<DataId, String> {
-    define_top_value_counter_storage_data_for_symbol(
-        jit_module,
-        top_value_counter_storage_symbol(module).as_str(),
-        top_value_counter_count,
-    )
-}
-
-fn declare_top_value_counter_storage_import(
-    jit_module: &mut JITModule,
-    symbol: &str,
-) -> Result<DataId, String> {
-    jit_module
-        .codegen_declare_data(symbol, Linkage::Import, true, false)
-        .map_err(|err| {
-            format!("failed to declare imported top-value counter storage {symbol}: {err}")
-        })
-}
-
-fn declare_type_ptr_import(
-    codegen_env: &mut impl JitCodegenEnv,
-    symbol: &str,
-) -> Result<DataId, String> {
-    codegen_env
-        .codegen_declare_data(symbol, Linkage::Import, true, false)
-        .map_err(|err| format!("failed to declare imported type symbol {symbol}: {err}"))
 }
 
 fn runtime_support_library() -> Result<&'static RuntimeSupportLibrary, String> {
