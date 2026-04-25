@@ -550,11 +550,11 @@ unsafe extern "C" fn pyobject_to_i64_hook(value: ObjPtr) -> i64 {
         out as i64
     }
 }
-unsafe extern "C" fn raise_deleted_name_error_hook(name_obj: ObjPtr) {
+unsafe extern "C" fn raise_unbound_local_error_hook(name_obj: ObjPtr) {
     if name_obj.is_null() {
         ffi::PyErr_SetString(
             ffi::PyExc_RuntimeError,
-            b"invalid arguments to dp_jit_raise_deleted_name_error\0".as_ptr() as *const i8,
+            b"invalid arguments to dp_jit_raise_unbound_local_error\0".as_ptr() as *const i8,
         );
         return;
     }
@@ -918,7 +918,7 @@ mod test_only_export_stubs {
     panic_i64_export!(dp_jit_pyobject_to_i64(value: ObjPtr));
     panic_unit_export!(dp_jit_raise_i64_overflow());
     panic_obj_export!(dp_jit_make_cell(value: ObjPtr));
-    panic_unit_export!(dp_jit_raise_deleted_name_error(name: ObjPtr));
+    panic_unit_export!(dp_jit_raise_unbound_local_error(name: ObjPtr));
     panic_unit_export!(dp_jit_raise_missing_required_argument());
     panic_unit_export!(dp_jit_raise_super_arg_deleted());
     panic_obj_export!(dp_jit_load_cell(cell: ObjPtr));
@@ -1127,8 +1127,8 @@ pub unsafe extern "C" fn dp_jit_make_cell(value: ObjPtr) -> ObjPtr {
     make_cell_hook(value)
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn dp_jit_raise_deleted_name_error(name: ObjPtr) {
-    raise_deleted_name_error_hook(name)
+pub unsafe extern "C" fn dp_jit_raise_unbound_local_error(name: ObjPtr) {
+    raise_unbound_local_error_hook(name)
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dp_jit_raise_missing_required_argument() {
@@ -1591,8 +1591,8 @@ pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
         dp_jit_record_top_value_sample as *const u8,
     );
     builder.symbol(
-        "dp_jit_raise_deleted_name_error",
-        dp_jit_raise_deleted_name_error as *const u8,
+        "dp_jit_raise_unbound_local_error",
+        dp_jit_raise_unbound_local_error as *const u8,
     );
     builder.symbol(
         "dp_jit_raise_super_arg_deleted",

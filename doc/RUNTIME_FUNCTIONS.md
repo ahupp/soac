@@ -74,7 +74,7 @@ dp_jit_del_global_quietly
 dp_jit_del_quietly
 dp_jit_pyobject_to_i64
 dp_jit_make_cell
-dp_jit_raise_deleted_name_error
+dp_jit_raise_unbound_local_error
 dp_jit_raise_missing_required_argument
 dp_jit_load_cell
 dp_jit_store_cell

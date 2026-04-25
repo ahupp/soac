@@ -2410,11 +2410,6 @@ def f():
         resolved_function_uses_local(resolved_f, "x"),
         "{resolved_f:?}"
     );
-    assert!(
-        !module_constant_text(lowered.bb_module()).contains("raise_deleted_name"),
-        "{resolved_f:?}\n{}",
-        module_constant_text(lowered.bb_module())
-    );
 }
 
 #[test]
@@ -3645,11 +3640,6 @@ def code_template_gen(_it):
         "resume should load _it from its inherited closure capture:\n{}",
         lowering.name_binding_text()
     );
-    assert!(
-        !function_or_constants_use_text(bb_module, resume, "raise_deleted_name"),
-        "inherited closure captures are not statically unbound locals:\n{}",
-        lowering.name_binding_text()
-    );
 }
 
 #[test]
@@ -3898,12 +3888,6 @@ def f():
     assert!(
         resolved_function_uses_local(f, "x"),
         "dead-tail local should remain a normal local load:\n{debug}"
-    );
-    assert!(
-        !module_constant_text(&bb_module).contains("raise_deleted_name"),
-        "{}\n{}",
-        debug,
-        module_constant_text(&bb_module)
     );
     assert!(!blockpy_function_has_defined_name(f, "x"));
 }

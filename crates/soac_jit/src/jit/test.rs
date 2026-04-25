@@ -20341,14 +20341,14 @@ class Point:
     }
 
     #[test]
-    fn render_specialized_jit_deleted_name_checks_use_null_unbound_state() {
+    fn render_specialized_jit_unbound_local_checks_use_null_unbound_state() {
         let blocks = [1usize as ObjPtr];
         let mut function =
             with_single_test_block(test_function(), vec![], ret_term(name_expr(test_name("x"))));
         set_stack_slots(&mut function, &["x"]);
         let rendered = render_test_jit_function(&function, &blocks);
         assert!(
-            rendered.contains("call dp_jit_raise_deleted_name_error"),
+            rendered.contains("call dp_jit_raise_unbound_local_error"),
             "maybe-unbound local loads should lower through the null/unbound state:\n{rendered}"
         );
     }

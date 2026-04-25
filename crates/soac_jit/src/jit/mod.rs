@@ -1089,8 +1089,8 @@ static DP_JIT_RECORD_TOP_VALUE_SAMPLE_IMPORT: ImportSpec = ImportSpec::new(
     &[SigType::Pointer, SigType::I64],
     &[],
 );
-static DP_JIT_RAISE_DELETED_NAME_ERROR_IMPORT: ImportSpec =
-    ImportSpec::new("dp_jit_raise_deleted_name_error", &[SigType::Pointer], &[]);
+static DP_JIT_RAISE_UNBOUND_LOCAL_ERROR_IMPORT: ImportSpec =
+    ImportSpec::new("dp_jit_raise_unbound_local_error", &[SigType::Pointer], &[]);
 static DP_JIT_RAISE_MISSING_REQUIRED_ARGUMENT_IMPORT: ImportSpec =
     ImportSpec::new("dp_jit_raise_missing_required_argument", &[], &[]);
 static DP_JIT_RAISE_SUPER_ARG_DELETED_IMPORT: ImportSpec =
@@ -1219,7 +1219,7 @@ static JIT_RUNTIME_IMPORT_SPECS: &[&ImportSpec] = &[
     &PYOBJECT_RICHCOMPARE_IMPORT,
     &PYLONG_FROM_LONGLONG_IMPORT,
     &DP_JIT_RECORD_TOP_VALUE_SAMPLE_IMPORT,
-    &DP_JIT_RAISE_DELETED_NAME_ERROR_IMPORT,
+    &DP_JIT_RAISE_UNBOUND_LOCAL_ERROR_IMPORT,
     &DP_JIT_RAISE_MISSING_REQUIRED_ARGUMENT_IMPORT,
     &DP_JIT_RAISE_SUPER_ARG_DELETED_IMPORT,
     &DP_JIT_MAKE_CELL_IMPORT,
@@ -6417,7 +6417,7 @@ struct JitEmitCtx<'mc> {
     pyobject_getitem_ref: ir::FuncRef,
     pyobject_setitem_ref: ir::FuncRef,
     py_long_from_i64_ref: ir::FuncRef,
-    raise_deleted_name_error_ref: ir::FuncRef,
+    raise_unbound_local_error_ref: ir::FuncRef,
     make_function_with_closure_ref: ir::FuncRef,
     make_cell_ref: ir::FuncRef,
     load_cell_ref: ir::FuncRef,
@@ -7604,7 +7604,7 @@ impl LocalEnv {
             if entry.binding_facts.requires_checked_local_load()
                 || entry.ref_kind == LocalRefKind::Unbound
             {
-                return Some(emit_checked_local_value_or_deleted(
+                return Some(emit_checked_local_value_or_unbound(
                     fb, name, value, ctx, borrowed,
                 ));
             }
@@ -7629,7 +7629,7 @@ impl LocalEnv {
             if entry.binding_facts.requires_checked_local_load()
                 || entry.ref_kind == LocalRefKind::Unbound
             {
-                return Some(emit_checked_local_value_or_deleted(
+                return Some(emit_checked_local_value_or_unbound(
                     fb, name, value, ctx, borrowed,
                 ));
             }
@@ -9310,7 +9310,7 @@ fn emit_forwarded_block_arg_source_value(
     })
 }
 
-fn emit_checked_local_value_or_deleted(
+fn emit_checked_local_value_or_unbound(
     fb: &mut FunctionBuilder<'_>,
     name: &str,
     value: ir::Value,
@@ -9353,24 +9353,25 @@ fn emit_checked_local_value_or_deleted(
     }
     let null_ptr = fb.ins().iconst(ctx.consts.ptr_ty, 0);
     let value_is_null = fb.ins().icmp(ir::condcodes::IntCC::Equal, value, null_ptr);
-    let deleted_block = fb.create_block();
+    let unbound_block = fb.create_block();
     let value_ok_block = fb.create_block();
     fb.append_block_param(value_ok_block, ctx.consts.ptr_ty);
     fb.ins().brif(
         value_is_null,
-        deleted_block,
+        unbound_block,
         &[],
         value_ok_block,
         &[ir::BlockArg::Value(value)],
     );
 
-    fb.switch_to_block(deleted_block);
+    fb.switch_to_block(unbound_block);
     let name_obj = emit_owned_module_constant(
         fb,
         ctx.module_constants.require_unicode_constant_id(name),
         ctx,
     );
-    fb.ins().call(ctx.raise_deleted_name_error_ref, &[name_obj]);
+    fb.ins()
+        .call(ctx.raise_unbound_local_error_ref, &[name_obj]);
     emit_release_owned_inputs(fb, ctx, &[name_obj]);
     fb.ins()
         .jump(ctx.consts.step_null_block, &step_null_block_args(ctx));
@@ -27583,10 +27584,10 @@ fn build_cranelift_run_bb_specialized_function(
                 &DP_JIT_RECORD_TOP_VALUE_SAMPLE_IMPORT,
             )
         });
-        let raise_deleted_name_error_ref = func_imports.get_or_panic(
+        let raise_unbound_local_error_ref = func_imports.get_or_panic(
             codegen_env,
             &mut fb.func,
-            &DP_JIT_RAISE_DELETED_NAME_ERROR_IMPORT,
+            &DP_JIT_RAISE_UNBOUND_LOCAL_ERROR_IMPORT,
         );
         let make_function_with_closure_ref = func_imports.get_or_panic(
             codegen_env,
@@ -27854,7 +27855,7 @@ fn build_cranelift_run_bb_specialized_function(
                 pyobject_getitem_ref,
                 pyobject_setitem_ref,
                 py_long_from_i64_ref,
-                raise_deleted_name_error_ref,
+                raise_unbound_local_error_ref,
                 make_function_with_closure_ref,
                 make_cell_ref,
                 load_cell_ref,
