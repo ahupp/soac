@@ -88,21 +88,21 @@ fn typed_function_with_profile_plans(
     Ok(typed_function)
 }
 
-pub(super) fn planned_typed_function_for_reservation(
+pub(super) fn predeclare_planned_typed_function_imports_for_reservation(
     jit_module: &mut JITModule,
     env_config: &SoacEnvConfig,
     function: &BlockPyFunction<CodegenModuleShape>,
     profile: &SpecializationProfile<'_>,
-) -> Result<Option<BlockPyFunction<TypedCodegenModuleShape>>, String> {
+) -> Result<(), String> {
     if !env_config
         .runtime_optimization_pipeline()
         .uses_legacy_plan_artifacts_runtime()
     {
-        return Ok(None);
+        return Ok(());
     }
     let typed_function = typed_function_with_profile_plans(function, Some(profile))?;
     predeclare_typed_direct_call_imports(jit_module, &typed_function)?;
-    Ok(Some(typed_function))
+    Ok(())
 }
 
 pub(crate) struct JitModulePlan {

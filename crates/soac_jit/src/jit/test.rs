@@ -17328,6 +17328,40 @@ def f(x, y):
                 generic_typed_calls, 1,
                 "typed-v3 inlining should keep a generic fallback call"
             );
+
+            let original_caller = shared_state
+                .lowered_module
+                .callable_defs
+                .iter()
+                .find(|function| function.function_id == caller_id)
+                .expect("shared state should include original caller");
+            let mut reservation_typed_caller =
+                lower_codegen_function_to_typed(original_caller.clone());
+            apply_profile_typed_plans_to_typed_function(
+                &mut reservation_typed_caller,
+                Some(&profile),
+            )
+            .expect("reservation planning should still predeclare typed call imports");
+            lower_typed_function_call_access_plan_instrs(&mut reservation_typed_caller);
+            assert_ne!(
+                reservation_typed_caller.blocks.len(),
+                planned_caller.blocks.len(),
+                "inline typed-v3 module rewrites can change the CFG after reservation predeclaration"
+            );
+            prepare_specialized_typed_function(planned_caller, None, &module_plan.value_facts)
+                .expect("worker codegen should use the post-rewrite module-plan function body");
+            let stale_result = prepare_specialized_typed_function(
+                planned_caller,
+                Some(&reservation_typed_caller),
+                &module_plan.value_facts,
+            );
+            let Err(stale_err) = stale_result else {
+                panic!("stale reservation-time function should not override module-plan body");
+            };
+            assert!(
+                stale_err.contains("typed specialized JIT function block count mismatch"),
+                "{stale_err}"
+            );
         });
     }
 

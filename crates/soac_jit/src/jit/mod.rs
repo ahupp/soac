@@ -235,7 +235,7 @@ use typed_pipeline::{
     apply_profile_typed_guard_miss_policy_to_typed_function,
     apply_profile_typed_plans_to_typed_function, build_jit_module_plan,
     build_typed_v3_jit_module_plan, collect_codegen_constants_for_module_name,
-    planned_typed_function_for_reservation,
+    predeclare_planned_typed_function_imports_for_reservation,
 };
 pub use typed_value::{
     EmitResult, IntFacts, IntRange, IntWidth, ResultDemand, SoacRepr, SoacValue, ValueOwnership,
@@ -595,7 +595,6 @@ struct ReservedJitFunctionCompileInputs {
     scalar_counter_data_id: Option<DataId>,
     top_value_counter_data_id: Option<DataId>,
     counted_refcount_helpers: CountedRefcountHelpers,
-    planned_typed_function: Option<BlockPyFunction<TypedCodegenModuleShape>>,
     module_constant_binding_key: usize,
     symbol_scope: Option<String>,
 }
@@ -1683,7 +1682,7 @@ impl ProcessJitState {
                 Some(symbol_scope.as_str()),
             )?;
             predeclare_specialization_type_imports(jit_module, &specialization_profile)?;
-            let planned_typed_function = planned_typed_function_for_reservation(
+            predeclare_planned_typed_function_imports_for_reservation(
                 jit_module,
                 inputs.session.env_config()?,
                 &batch_function.function,
@@ -1697,7 +1696,6 @@ impl ProcessJitState {
                 scalar_counter_data_id,
                 top_value_counter_data_id,
                 counted_refcount_helpers,
-                planned_typed_function,
                 module_constant_binding_key: instance_key,
                 symbol_scope: Some(symbol_scope),
             });
@@ -1739,7 +1737,7 @@ impl ProcessJitState {
             Some(inputs.session.as_ref()),
         )?;
         predeclare_specialization_type_imports(jit_module, &specialization_profile)?;
-        let planned_typed_function = planned_typed_function_for_reservation(
+        predeclare_planned_typed_function_imports_for_reservation(
             jit_module,
             inputs.session.env_config()?,
             &batch_function.function,
@@ -1753,7 +1751,6 @@ impl ProcessJitState {
             scalar_counter_data_id,
             top_value_counter_data_id,
             counted_refcount_helpers,
-            planned_typed_function,
             module_constant_binding_key: instance_key,
             symbol_scope: None,
         })
@@ -2035,7 +2032,6 @@ impl ProcessJitState {
             Some(&plan.predeclared),
             BuildSpecializedFunctionOptions {
                 counted_refcount_helpers: Some(reserved_inputs.counted_refcount_helpers),
-                planned_typed_function: reserved_inputs.planned_typed_function.clone(),
                 ..BuildSpecializedFunctionOptions::default()
             },
         )
