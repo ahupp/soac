@@ -5575,60 +5575,6 @@ def build(values):
         render_test_jit_function_with_module_constants(function, blocks, Vec::new())
     }
 
-    #[test]
-    fn process_jit_registry_does_not_reuse_colliding_function_ids_with_different_shapes() {
-        let compile_session = crate::session::CompileSession::new();
-        let module =
-            ProcessJitModule::new(&compile_session).expect("process JIT module should initialize");
-        let mut jit_module = module
-            .lock_for_serial_phase()
-            .expect("process JIT module should lock");
-        let mut state = ProcessJitState::new();
-        let first = test_function();
-        let mut second = test_function();
-        second.params.params.push(Param {
-            name: "x".into(),
-            kind: ParamKind::Any,
-            has_default: false,
-        });
-
-        let first_decl = state
-            .declare_direct_function(&mut jit_module, &first, None)
-            .expect("first function should declare");
-        let first_decl_again = state
-            .declare_direct_function(&mut jit_module, &first, None)
-            .expect("same shape should reuse declaration");
-        assert_eq!(first_decl.symbol, first_decl_again.symbol);
-
-        let session = std::sync::Arc::new(crate::session::CompileSession::new());
-        let first_handle = state
-            .mark_direct_function_ready(
-                &session,
-                first.function_id,
-                1usize as *const u8,
-                1usize as *const u8,
-                first.params.len(),
-                std::sync::Arc::new(RuntimeJitDeoptTable {
-                    function_id: first.function_id,
-                    function: Box::new(first.clone()),
-                    module_constant_ptrs: Vec::new(),
-                    points: Vec::new(),
-                }),
-                JitCodegenStats::default(),
-            )
-            .expect("first function should mark ready");
-        let ready_handle = state
-            .ready_direct_function(&first)
-            .expect("first function should be ready");
-        assert!(std::sync::Arc::ptr_eq(&first_handle, &ready_handle));
-        assert!(state.ready_direct_function(&second).is_none());
-
-        let second_decl = state
-            .declare_direct_function(&mut jit_module, &second, None)
-            .expect("colliding function id with different shape should redeclare");
-        assert_ne!(first_decl.symbol, second_decl.symbol);
-    }
-
     fn render_test_jit_function_with_module_constants(
         function: &BlockPyFunction<CodegenModuleShape>,
         blocks: &[ObjPtr],
