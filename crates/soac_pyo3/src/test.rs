@@ -1,9 +1,9 @@
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
+use soac_config::SoacEnvConfig;
 use soac_core::block_py::FunctionKind;
 use soac_driver::codegen_cache::hash_module_source;
-use soac_jit::{module_type::indexed_module_info, plan_jit_module_from_codegen};
-use soac_opt::passes::infer_module_value_facts;
+use soac_jit::{module_type::indexed_module_info, plan_jit_typed_module};
 use std::any::Any;
 use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
@@ -313,8 +313,12 @@ def exercise():
         .find(|function| function.names.bind_name == "gen_resume")
         .expect("missing lowered generator resume function");
     let registered_function = gen_function;
-    let value_facts = infer_module_value_facts(&normalized);
-    let jit_module_local_plan = plan_jit_module_from_codegen(&normalized, value_facts)
+    let prepared = soac_driver::typed_runtime::prepare_typed_v3_runtime_module(
+        &normalized,
+        &SoacEnvConfig::default(),
+    )
+    .expect("typed runtime preparation should validate");
+    let jit_module_local_plan = plan_jit_typed_module(prepared.module, prepared.value_facts)
         .expect("JIT local plan should validate")
         .locals;
     let jit_local_plan = jit_module_local_plan

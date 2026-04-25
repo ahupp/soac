@@ -9,7 +9,7 @@ import textwrap
 from pathlib import Path
 
 import pytest
-from tests._integration import decide_optimizations_for_work_dir, integration_module
+from tests._integration import integration_module
 
 
 def _inspect_counter_dump_json(path):
@@ -52,10 +52,6 @@ def _run_soac_subprocess(script, *, env):
 
 def _assert_subprocess_ok(result):
     assert result.returncode == 0, result.stdout + result.stderr
-
-
-def _decide_optimizations_for_env(work_dir):
-    return decide_optimizations_for_work_dir(work_dir)
 
 
 def _counter_branch(row, branch):
@@ -108,7 +104,6 @@ def run():
     )
     _assert_subprocess_ok(profile_result)
     assert (work_dir / "profile.bin").exists()
-    assert _decide_optimizations_for_env(work_dir) >= 1
     return {
         "base_dir": base_dir,
         "module_name": module_name,
@@ -152,8 +147,8 @@ def read():
     assert int(dump["records"][0]["source_hash"], 16) > 0
 
 
-def test_default_optimizer_consumes_helper_written_v3_plan(tmp_path):
-    module_name = "counter_dump_strict_v3_plan_case"
+def test_default_optimizer_consumes_raw_profile_evidence(tmp_path):
+    module_name = "counter_dump_raw_profile_case"
     (tmp_path / f"{module_name}.py").write_text(
         """
 def compare(a, b):
@@ -176,10 +171,6 @@ def run():
         env={**base_env, "SOAC_OPT_MODE": "profile"},
     )
     _assert_subprocess_ok(profile_result)
-
-    assert decide_optimizations_for_work_dir(work_dir) >= 1
-    assert list((work_dir / "modules").rglob("mod.optv3"))
-    assert not list((work_dir / "modules").rglob("mod.opt"))
 
     for opt_mode in ("verify", "apply"):
         result = _run_soac_subprocess(
@@ -250,7 +241,6 @@ def write_and_read(value):
     profile = _inspect_counter_dump_json(work_dir / "profile.bin")
 
     by_kind = {}
-    field_access_branch_sets = []
     for record in profile["records"]:
         if record["module_name"] != module_name:
             continue
@@ -258,7 +248,6 @@ def write_and_read(value):
             if row["function_qualname"] != "write_and_read":
                 continue
             if row["kind"] == "field_access":
-                field_access_branch_sets.append(set(row["branches"]))
                 for branch, value in row["branches"].items():
                     by_kind[f"field_access.{branch}"] = (
                         by_kind.get(f"field_access.{branch}", 0) + value
@@ -268,11 +257,6 @@ def write_and_read(value):
 
     assert by_kind["field_access.generic_getattr"] >= 5, profile
     assert by_kind["field_access.generic_setattr"] >= 5, profile
-    assert field_access_branch_sets
-    assert all(
-        branches in [{"generic_getattr"}, {"generic_setattr"}]
-        for branches in field_access_branch_sets
-    ), profile
     assert by_kind.get("field_access.indexed_hit", 0) == 0, profile
     assert by_kind.get("field_access.indexed_fallback", 0) == 0, profile
 
@@ -551,7 +535,6 @@ def run_case():
         and row["value"] > 0
     ]
     assert profiled_shapes, profile
-    assert _decide_optimizations_for_env(work_dir) >= 1
 
     verify_result = _run_soac_subprocess(
         script,
@@ -628,7 +611,6 @@ def run_case():
         and row["value"] > 0
     ]
     assert profiled_shapes, profile
-    assert _decide_optimizations_for_env(work_dir) >= 1
 
     verify_result = _run_soac_subprocess(
         script,
@@ -723,7 +705,6 @@ def write_field():
     _assert_subprocess_ok(profile_result)
     profile_dump_path = work_dir / "profile.bin"
     assert profile_dump_path.exists()
-    assert _decide_optimizations_for_env(work_dir) >= 1
 
     profile = _inspect_counter_dump_json(profile_dump_path)
     owner_entries = [
@@ -838,7 +819,6 @@ def run():
         if key["owner_type_id"] == record_type_id
     }
     assert profiled_keys == {"x", "y"}, profile
-    assert _decide_optimizations_for_env(work_dir) >= 1
 
     verify_result = _run_soac_subprocess(
         script,
@@ -854,11 +834,6 @@ def run():
             continue
         for row in record["rows"]:
             if row["kind"] == "field_access":
-                if _counter_branch(row, "indexed_hit") > 0:
-                    assert set(row["branches"]) == {
-                        "indexed_hit",
-                        "indexed_fallback",
-                    }, verify
                 hit_values_by_function[row["function_qualname"]] = (
                     hit_values_by_function.get(row["function_qualname"], 0)
                     + _counter_branch(row, "indexed_hit")

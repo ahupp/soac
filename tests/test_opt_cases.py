@@ -10,8 +10,6 @@ from typing import Any
 
 import pytest
 
-from tests._integration import decide_optimizations_for_work_dir
-
 OPT_TESTS_DIR = Path(__file__).resolve().parent / "opt_tests"
 VERIFY_DELIMITER = "# soac: verify"
 COUNTER_DELIMITER = "# soac: verify-counters"
@@ -98,12 +96,6 @@ def _inspect_counter_dump_json(path: Path) -> dict[str, Any]:
     return json.loads(_soac_ext.inspect_counter_dump_json(str(path)))
 
 
-def _inspect_v3_plan_json(path: Path) -> dict[str, Any]:
-    import _soac_ext
-
-    return json.loads(_soac_ext.inspect_optimization_artifacts_v3_json(str(path)))
-
-
 def _counter_value(
     verify: dict[str, Any], expectation: dict[str, Any], *, module_name: str
 ) -> int:
@@ -155,71 +147,6 @@ def _assert_counter_expectation(
         raise ValueError(f"counter expectation has no comparator: {expectation!r}")
 
 
-def _assert_metric_expectation(
-    actual: int, expected: Any, case_path: Path, label: dict[str, Any]
-) -> None:
-    if isinstance(expected, int):
-        assert actual == expected, (case_path, label, actual)
-        return
-    if not isinstance(expected, dict):
-        raise TypeError(f"metric expectation must be an int or dictionary: {expected!r}")
-    if "equals" in expected:
-        assert actual == expected["equals"], (case_path, label, actual)
-    if "min" in expected:
-        assert actual >= expected["min"], (case_path, label, actual)
-    if "max" in expected:
-        assert actual <= expected["max"], (case_path, label, actual)
-    if not {"equals", "min", "max"} & expected.keys():
-        raise ValueError(f"metric expectation has no comparator: {expected!r}")
-
-
-def _v3_plan_for_module(work_dir: Path, module_name: str) -> dict[str, Any]:
-    plans = [_inspect_v3_plan_json(path) for path in (work_dir / "modules").rglob("mod.optv3")]
-    matches = [
-        plan for plan in plans if plan["module"]["module_name"] == module_name
-    ]
-    assert len(matches) == 1, (module_name, plans)
-    return matches[0]
-
-
-def _assert_v3_plan_expectation(
-    plan: dict[str, Any],
-    expectation: dict[str, Any],
-    case_path: Path,
-) -> None:
-    function_name = expectation.get("function")
-    if function_name is None:
-        raise ValueError(f"v3 plan expectation is missing function: {expectation!r}")
-    functions = [
-        function
-        for function in plan["functions"]
-        if function["debug_name"] == function_name
-    ]
-    assert len(functions) == 1, (case_path, function_name, plan)
-    function = functions[0]
-    for metric in (
-        "regions",
-        "emitted_regions",
-        "scalar_threads",
-        "direct_calls",
-        "emitted_direct_calls",
-        "exact_list_items",
-        "emitted_exact_list_items",
-        "indexed_fields",
-        "emitted_indexed_fields",
-        "indexed_globals",
-        "emitted_indexed_globals",
-        "diagnostics",
-    ):
-        if metric in expectation:
-            _assert_metric_expectation(
-                function[metric],
-                expectation[metric],
-                case_path,
-                {"function": function_name, "metric": metric},
-            )
-
-
 @pytest.mark.integration
 @pytest.mark.parametrize("case_path", _case_paths(), ids=lambda path: path.stem)
 def test_opt_case_verify_counters(tmp_path: Path, case_path: Path) -> None:
@@ -239,9 +166,6 @@ def test_opt_case_verify_counters(tmp_path: Path, case_path: Path) -> None:
     )
     _assert_subprocess_ok(profile_result)
     assert (work_dir / "profile.bin").exists()
-    assert decide_optimizations_for_work_dir(work_dir) >= 1
-    assert list((work_dir / "modules").rglob("mod.optv3"))
-    v3_plan = _v3_plan_for_module(work_dir, module_name)
 
     verify_result = _run_soac_subprocess(
         script,
@@ -253,9 +177,6 @@ def test_opt_case_verify_counters(tmp_path: Path, case_path: Path) -> None:
     verify = _inspect_counter_dump_json(verify_path)
 
     for expectation in expectations:
-        if expectation.get("type") == "v3_plan":
-            _assert_v3_plan_expectation(v3_plan, expectation, case_path)
-        else:
-            _assert_counter_expectation(
-                verify, expectation, case_path, module_name=module_name
-            )
+        _assert_counter_expectation(
+            verify, expectation, case_path, module_name=module_name
+        )

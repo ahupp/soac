@@ -1,6 +1,3 @@
-use crate::config::{
-    SpecializationMode, module_optimization_plan_v3_path, pre_optimization_module_cache_identity,
-};
 use crate::counter::{CounterEntry, GilTopValueCounter, TopValueCounter};
 use crate::jit::JitCodegenStats;
 use crate::module_constants::{ModuleCodegenConstants, load_runtime_name_owned_by_id};
@@ -10,28 +7,18 @@ use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyAnyMethods, PyList, PyTuple};
 use soac_config::SoacEnvConfig;
+use soac_config::SpecializationMode;
 use soac_core::block_py::{
-    BlockPyFunction, BlockPyModule, ChildVisitable, CounterBranch, CounterDef, CounterId,
-    CounterScope, CounterSite, DeoptEntrySource, FunctionExecutionMode, HasSemanticInstrId,
-    InstrId, RuntimeFunctionId, RuntimeModuleId, RuntimeName, SerializedFunctionId, Visit,
+    BlockPyFunction, BlockPyModule, CounterDef, CounterId, CounterScope, CounterSite,
+    DeoptEntrySource, FunctionExecutionMode, RuntimeFunctionId, RuntimeName,
     current_instr_locations,
 };
 use soac_core::profile::{
     CounterDumpBranchValue, CounterDumpKeyLayout, CounterDumpRecord, CounterDumpRow,
     CounterDumpTypeKey, CounterDumpTypeKeyLayout, CounterDumpTypeTableEntry,
 };
-use soac_driver::codegen_cache::PythonModuleCacheSource;
 use soac_instrument::InstrumentationConfig;
-use soac_ir_blockpy::{CodegenModuleShape, InstrCodegen};
-use soac_ir_typed::plan_v3::IndexedFieldAccessKind as PlanV3IndexedFieldAccessKind;
-use soac_opt::access_emission_v3::{
-    IndexedFieldAccessPlan as OptV3IndexedFieldAccessPlan,
-    indexed_fields_for_function_from_artifacts as opt_v3_emitted_indexed_fields_for_function,
-};
-use soac_opt::artifacts_v3::{
-    ExactIntBranchV3Artifacts, load_optimization_artifacts_v3,
-    single_function_optimization_artifacts_v3, validate_optimization_artifacts_v3_for_module,
-};
+use soac_ir_blockpy::CodegenModuleShape;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, c_int, c_void};
 use std::fs::{OpenOptions, create_dir_all};
@@ -60,7 +47,6 @@ pub struct SoacExtModuleDataRef<'a> {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ModuleInfo {
     pub hash: u64,
-    pub cache_source: Option<PythonModuleCacheSource>,
     pub indexed_module_keys: Vec<String>,
 }
 
@@ -69,7 +55,6 @@ pub struct SharedModuleState {
     pub module_name: String,
     pub package_name: String,
     pub source_hash: u64,
-    pub module_cache_source: Option<PythonModuleCacheSource>,
     pub codegen_constants: ModuleCodegenConstants,
     storage_instance_key: usize,
     function_index_by_id: HashMap<RuntimeFunctionId, usize>,
@@ -83,7 +68,6 @@ pub struct SharedModuleState {
     top_value_counters: Box<[GilTopValueCounter]>,
     pub(crate) precompiled_module_runtime:
         OnceLock<Result<Arc<crate::jit::PrecompiledModuleRuntime>, String>>,
-    pub(crate) jit_module_plan: OnceLock<Result<Arc<crate::jit::JitModulePlan>, String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -828,241 +812,6 @@ fn build_counter_storage(
     ))
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum FieldAccessCounterAccess {
-    Load,
-    Store,
-}
-
-impl FieldAccessCounterAccess {
-    fn generic_branch(self) -> &'static str {
-        match self {
-            Self::Load => "generic_getattr",
-            Self::Store => "generic_setattr",
-        }
-    }
-
-    fn indexed_plan_access(self) -> PlanV3IndexedFieldAccessKind {
-        match self {
-            Self::Load => PlanV3IndexedFieldAccessKind::Load,
-            Self::Store => PlanV3IndexedFieldAccessKind::Store,
-        }
-    }
-}
-
-struct FieldAccessCounterSiteCollector<'a> {
-    function_id: RuntimeFunctionId,
-    sites: &'a mut HashMap<(RuntimeFunctionId, InstrId), FieldAccessCounterAccess>,
-}
-
-impl Visit<InstrCodegen> for FieldAccessCounterSiteCollector<'_> {
-    fn visit_instr(&mut self, expr: &InstrCodegen) {
-        match expr {
-            InstrCodegen::GetAttr(_) => {
-                self.sites.insert(
-                    (self.function_id, expr.semantic_instr_id()),
-                    FieldAccessCounterAccess::Load,
-                );
-            }
-            InstrCodegen::SetAttr(_) => {
-                self.sites.insert(
-                    (self.function_id, expr.semantic_instr_id()),
-                    FieldAccessCounterAccess::Store,
-                );
-            }
-            _ => {}
-        }
-        expr.visit_children(self);
-    }
-}
-
-fn collect_field_access_counter_sites(
-    module: &BlockPyModule<CodegenModuleShape>,
-) -> HashMap<(RuntimeFunctionId, InstrId), FieldAccessCounterAccess> {
-    let mut sites = HashMap::new();
-    for function in &module.callable_defs {
-        let mut collector = FieldAccessCounterSiteCollector {
-            function_id: function.function_id,
-            sites: &mut sites,
-        };
-        for block in &function.blocks {
-            collector.visit_block(block);
-        }
-    }
-    sites
-}
-
-fn field_access_has_indexed_emission(
-    indexed_fields_by_function: &HashMap<
-        RuntimeFunctionId,
-        HashMap<InstrId, Vec<OptV3IndexedFieldAccessPlan>>,
-    >,
-    function_id: RuntimeFunctionId,
-    instr_id: InstrId,
-    access: FieldAccessCounterAccess,
-) -> bool {
-    indexed_fields_by_function
-        .get(&function_id)
-        .and_then(|by_instr| by_instr.get(&instr_id))
-        .is_some_and(|plans| {
-            plans
-                .iter()
-                .any(|plan| plan.access == access.indexed_plan_access())
-        })
-}
-
-pub(crate) fn specialize_field_access_counter_branches(
-    module: &mut BlockPyModule<CodegenModuleShape>,
-    indexed_fields_by_function: &HashMap<
-        RuntimeFunctionId,
-        HashMap<InstrId, Vec<OptV3IndexedFieldAccessPlan>>,
-    >,
-) {
-    let sites = collect_field_access_counter_sites(module);
-    for counter in &mut module.counter_defs {
-        if counter.kind != "field_access" {
-            continue;
-        }
-        let CounterSite::Runtime {
-            function_id: Some(function_id),
-            instr_id: Some(instr_id),
-        } = counter.site
-        else {
-            continue;
-        };
-        let Some(access) = sites.get(&(function_id, instr_id)).copied() else {
-            continue;
-        };
-        let branches: &[&str] = if field_access_has_indexed_emission(
-            indexed_fields_by_function,
-            function_id,
-            instr_id,
-            access,
-        ) {
-            &["indexed_hit", "indexed_fallback"]
-        } else {
-            &[access.generic_branch()]
-        };
-        counter.branches = branches.iter().copied().map(CounterBranch::new).collect();
-    }
-}
-
-fn opt_v3_single_function_artifacts(
-    artifacts: &ExactIntBranchV3Artifacts,
-    function: SerializedFunctionId,
-) -> Result<Option<ExactIntBranchV3Artifacts>, String> {
-    single_function_optimization_artifacts_v3(artifacts, function).map_err(|err| err.to_string())
-}
-
-fn load_runtime_indexed_field_counter_emissions(
-    module: &BlockPyModule<CodegenModuleShape>,
-    module_name: &str,
-    source_hash: u64,
-    module_cache_source: Option<PythonModuleCacheSource>,
-    env_config: &SoacEnvConfig,
-) -> Result<HashMap<RuntimeFunctionId, HashMap<InstrId, Vec<OptV3IndexedFieldAccessPlan>>>, String>
-{
-    if !matches!(
-        env_config.specialization_mode(),
-        Some(SpecializationMode::Verify | SpecializationMode::Apply)
-    ) {
-        return Ok(HashMap::new());
-    }
-    if !env_config
-        .runtime_optimization_pipeline()
-        .uses_legacy_plan_artifacts_runtime()
-    {
-        return Ok(HashMap::new());
-    }
-    let Some(cache_root) = env_config.module_cache_root() else {
-        return Err(format!(
-            "SOAC_OPT_MODE=verify/apply requires SOAC_WORK_DIR/module cache to load mod.optv3 for module {module_name}"
-        ));
-    };
-    let cache_identity = pre_optimization_module_cache_identity(
-        env!("SOAC_BUILD_IDENTITY"),
-        module_name == "soac.runtime",
-    );
-    let candidate_sources = match module_cache_source {
-        Some(source) => vec![source],
-        None => vec![
-            PythonModuleCacheSource::Project,
-            PythonModuleCacheSource::PythonStdlib,
-        ],
-    };
-
-    for source in candidate_sources {
-        let path = module_optimization_plan_v3_path(cache_root.as_path(), source, module_name)?;
-        if !path.exists() {
-            continue;
-        }
-        let artifacts =
-            load_optimization_artifacts_v3(path.as_path()).map_err(|err| err.to_string())?;
-        validate_optimization_artifacts_v3_for_module(
-            &artifacts,
-            module_name,
-            source_hash,
-            cache_identity.as_str(),
-        )
-        .map_err(|err| err.to_string())?;
-
-        let mut by_function = HashMap::new();
-        let module_id = RuntimeModuleId::new(module.module_name_gen.module_id());
-        for planned_function in &artifacts.plan.functions {
-            let local_function_id = planned_function.function.function.local_function_id();
-            let function_id = RuntimeFunctionId::new(module_id, local_function_id);
-            if !module
-                .callable_defs
-                .iter()
-                .any(|function| function.function_id == function_id)
-            {
-                return Err(format!(
-                    "optimization plan v3 for module {module_name} references missing function id {} ({})",
-                    local_function_id,
-                    planned_function
-                        .function
-                        .debug_name
-                        .as_deref()
-                        .unwrap_or("<unknown>")
-                ));
-            }
-            let Some(function_artifacts) =
-                opt_v3_single_function_artifacts(&artifacts, planned_function.function.function)?
-            else {
-                continue;
-            };
-            if let Some(indexed_fields) =
-                opt_v3_emitted_indexed_fields_for_function(&function_artifacts)?
-            {
-                by_function.insert(function_id, indexed_fields);
-            }
-        }
-        return Ok(by_function);
-    }
-    Err(format!(
-        "SOAC_OPT_MODE=verify/apply requires mod.optv3 for module {module_name} under {}",
-        cache_root.display()
-    ))
-}
-
-fn specialize_runtime_field_access_counter_branches(
-    module: &mut BlockPyModule<CodegenModuleShape>,
-    module_name: &str,
-    source_hash: u64,
-    module_cache_source: Option<PythonModuleCacheSource>,
-    env_config: &SoacEnvConfig,
-) -> Result<(), String> {
-    let indexed_fields = load_runtime_indexed_field_counter_emissions(
-        module,
-        module_name,
-        source_hash,
-        module_cache_source,
-        env_config,
-    )?;
-    specialize_field_access_counter_branches(module, &indexed_fields);
-    Ok(())
-}
-
 pub(crate) fn build_module_constant_objects(
     py: Python<'_>,
     codegen_constants: &ModuleCodegenConstants,
@@ -1137,7 +886,6 @@ pub fn build_shared_state_for_inspection_with_placeholder_constants(
         module_name: module_name.to_string(),
         package_name: package_name.to_string(),
         source_hash: 0,
-        module_cache_source: None,
         codegen_constants,
         storage_instance_key: allocate_shared_module_state_storage_key(),
         function_index_by_id,
@@ -1148,7 +896,6 @@ pub fn build_shared_state_for_inspection_with_placeholder_constants(
         counter_values,
         top_value_counters,
         precompiled_module_runtime: OnceLock::new(),
-        jit_module_plan: OnceLock::new(),
     }))
 }
 
@@ -1175,7 +922,6 @@ pub fn build_shared_state_for_inspection_with_placeholder_constants_and_source_h
         module_name: module_name.to_string(),
         package_name: package_name.to_string(),
         source_hash,
-        module_cache_source: None,
         codegen_constants,
         storage_instance_key: allocate_shared_module_state_storage_key(),
         function_index_by_id,
@@ -1186,7 +932,6 @@ pub fn build_shared_state_for_inspection_with_placeholder_constants_and_source_h
         counter_values,
         top_value_counters,
         precompiled_module_runtime: OnceLock::new(),
-        jit_module_plan: OnceLock::new(),
     }))
 }
 
@@ -1247,7 +992,6 @@ fn build_shared_state_for_inspection_with_original_code_and_source_hash(
         module_name: module_name.to_string(),
         package_name: package_name.to_string(),
         source_hash,
-        module_cache_source: None,
         codegen_constants,
         storage_instance_key: allocate_shared_module_state_storage_key(),
         function_index_by_id,
@@ -1258,7 +1002,6 @@ fn build_shared_state_for_inspection_with_original_code_and_source_hash(
         counter_values,
         top_value_counters,
         precompiled_module_runtime: OnceLock::new(),
-        jit_module_plan: OnceLock::new(),
     }))
 }
 
@@ -1301,29 +1044,17 @@ impl SoacExtModuleState {
         &mut self,
         py: Python<'_>,
         compile_session: &Arc<crate::session::CompileSession>,
-        mut lowered_module: BlockPyModule<CodegenModuleShape>,
+        lowered_module: BlockPyModule<CodegenModuleShape>,
         original_code_by_function_id: HashMap<RuntimeFunctionId, Py<PyAny>>,
         module_name: String,
         package_name: String,
         source_hash: u64,
-        module_cache_source: Option<PythonModuleCacheSource>,
     ) -> PyResult<()> {
         if self.initialized {
             return Err(PyRuntimeError::new_err(
                 "transformed module state was unexpectedly initialized twice",
             ));
         }
-        let env_config = compile_session
-            .env_config()
-            .map_err(PyRuntimeError::new_err)?;
-        specialize_runtime_field_access_counter_branches(
-            &mut lowered_module,
-            module_name.as_str(),
-            source_hash,
-            module_cache_source,
-            env_config,
-        )
-        .map_err(PyRuntimeError::new_err)?;
         let function_index_by_id = build_function_index_by_id(&lowered_module)?;
         let (counter_slots_by_id, counter_values, top_value_counters) =
             build_counter_storage(&lowered_module.counter_defs)?;
@@ -1343,7 +1074,6 @@ impl SoacExtModuleState {
             module_name,
             package_name,
             source_hash,
-            module_cache_source,
             codegen_constants,
             storage_instance_key: allocate_shared_module_state_storage_key(),
             function_index_by_id,
@@ -1354,7 +1084,6 @@ impl SoacExtModuleState {
             counter_values,
             top_value_counters,
             precompiled_module_runtime: OnceLock::new(),
-            jit_module_plan: OnceLock::new(),
         });
         compile_session
             .retain_shared_module_state(shared_state.clone())
@@ -1947,7 +1676,6 @@ impl SoacExtModule {
         ensure_module_dict_metadata_names(&mut lowered_module.global_names);
         module_info.indexed_module_keys = lowered_module.global_names.clone();
         let source_hash = module_info.hash;
-        let module_cache_source = module_info.cache_source;
         let module_name = spec
             .getattr("name")?
             .extract::<String>()
@@ -1976,7 +1704,6 @@ impl SoacExtModule {
                 module_name,
                 package_name,
                 source_hash,
-                module_cache_source,
             )?
         };
         Ok(module.unbind())
@@ -2060,7 +1787,6 @@ def f():
                 .expect("function index should build"),
             codegen_constants: ModuleCodegenConstants::collect_from_module(&lowered),
             source_hash: 0,
-            module_cache_source: None,
             storage_instance_key: allocate_shared_module_state_storage_key(),
             module_constant_objs: Vec::new(),
             runtime_name_cache: build_runtime_name_cache(),
@@ -2072,7 +1798,6 @@ def f():
             package_name: String::new(),
             original_code_by_function_id: HashMap::new(),
             precompiled_module_runtime: OnceLock::new(),
-            jit_module_plan: OnceLock::new(),
         };
 
         let record = shared_state
@@ -2136,7 +1861,6 @@ def f(x):
                 .expect("function index should build"),
             codegen_constants: ModuleCodegenConstants::collect_from_module(&lowered),
             source_hash: 0,
-            module_cache_source: None,
             storage_instance_key: allocate_shared_module_state_storage_key(),
             module_constant_objs: Vec::new(),
             runtime_name_cache: build_runtime_name_cache(),
@@ -2148,7 +1872,6 @@ def f(x):
             package_name: String::new(),
             original_code_by_function_id: HashMap::new(),
             precompiled_module_runtime: OnceLock::new(),
-            jit_module_plan: OnceLock::new(),
         };
 
         let record = shared_state
@@ -2323,7 +2046,6 @@ def f():
                 .expect("function index should build"),
             codegen_constants: ModuleCodegenConstants::collect_from_module(&lowered),
             source_hash: 0,
-            module_cache_source: None,
             storage_instance_key: allocate_shared_module_state_storage_key(),
             module_constant_objs: Vec::new(),
             runtime_name_cache: build_runtime_name_cache(),
@@ -2336,7 +2058,6 @@ def f():
             package_name: "pkg".to_string(),
             original_code_by_function_id: HashMap::new(),
             precompiled_module_runtime: OnceLock::new(),
-            jit_module_plan: OnceLock::new(),
         };
 
         let unique = SystemTime::now()

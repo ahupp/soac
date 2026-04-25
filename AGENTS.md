@@ -447,22 +447,19 @@ another revision's cache.
   Normal specialization runs use one work directory with conventional
 files: `profile.bin` for specialization input, `verify.bin` for the
 countered verification pass, and `events.jsonl` for default JSON
-tracing output. Cached pre-optimization BlockPy modules and sibling
-`mod.optv3` plans live under
+tracing output. Cached pre-optimization BlockPy modules live under
 `$SOAC_WORK_DIR/modules`. Set
 `SOAC_OPT_MODE=none`, `profile`, `verify`, or `apply`; recipes should pass the
 same `SOAC_WORK_DIR` and change only the mode between passes. `none` is the
 explicit ordinary
   unspecialized/no-counter mode and should not read or write counter
-  dumps. `profile` writes raw evidence to `profile.bin`; run
-  `decide_optimizations` to turn that evidence plus cached BlockPy modules into
-  per-module `mod.optv3` optimization plans before entering `verify` or
-  `apply`. `verify`/`apply` require matching `mod.optv3` artifacts; there is no
-  runtime fallback to legacy `mod.opt`.
-  `SOAC_OPT_RUNTIME_PIPELINE=typed-v3` is the experimental runtime typed path:
-  it bypasses required serialized v3 artifacts, uses the cached pre-optimization
-  `mod.blockpy`, lowers `CodegenModuleShape` to `TypedCodegenModuleShape`, and
-  currently applies typed direct-call emissions from raw profile evidence.
+  dumps. `profile` writes raw evidence to `profile.bin`. Runtime
+  `verify`/`apply` and offline precompile use the typed v3 path directly: they
+  use the cached pre-optimization `mod.blockpy`, lower `CodegenModuleShape` to
+  `TypedCodegenModuleShape`, and apply v3 decisions from raw `profile.bin`
+  evidence during typed JIT planning. There is no serialized optimization-plan
+  artifact between profiling and codegen, and there is no fallback to legacy
+  `mod.opt`.
   `verify` exercises indexed store
   fast paths so hit/fallback counters measure the specialized steady-state path.
   `apply` still skips counter dump files, but when event logging is enabled it
@@ -527,24 +524,11 @@ explicit ordinary
 - `just precompile-shared-library counters=<profile.bin> out=<lib.so>`
   Offline precompiles all modules referenced by a counter dump from cached
   pre-optimization BlockPy modules, writes per-module object files, and links a
-  shared library. The precompile JIT path consumes `mod.optv3` artifacts and
-  expects matching module-cache entries in
-  `$SOAC_WORK_DIR/modules`; run a profile/benchmark pass first when the cache is
-  empty. Use `SOAC_PRECOMPILED_LIBRARY` to point runtime execution at the
-  resulting shared library.
-- `cargo run -p soac_driver --bin decide_optimizations -- --counters <profile.bin> --out <root-dir>`
-  Standalone optimization-decision planner. It loads the counter dump once,
-  scans cached BlockPy modules under the output root by default, and writes
-  binary `mod.optv3` artifacts beside those modules, such as
-  `$SOAC_WORK_DIR/modules/python-stdlib/typing/mod.optv3`. Use `--module`
-  for a narrow debugging input or `--module-root` to scan a different cache root. Use
-  `cargo run -p soac_inspector --bin print_optimization_plan_v3 -- --plan <mod.optv3>`
-  to inspect a v3 artifact summary. In `SOAC_OPT_MODE=verify|apply`, normal
-  runtime loading requires a matching serialized v3 artifact and optimized
-  codegen module in the active module cache. Set
-  `SOAC_OPT_RUNTIME_PIPELINE=typed-v3` only for the experimental runtime typed
-  path that bypasses those artifacts and currently applies typed direct-call
-  emissions from raw profile evidence.
+  shared library. The precompile JIT path uses the same raw `profile.bin`
+  evidence and matching module-cache entries in `$SOAC_WORK_DIR/modules`; run a
+  profile/benchmark pass first when the cache is empty. Use
+  `SOAC_PRECOMPILED_LIBRARY` to point runtime execution at the resulting shared
+  library.
 - `SOAC_CRANELIFT_OPT_LEVEL`
   Optional Cranelift process-JIT optimization level override:
   `none`, `speed`, or `speed_and_size`. Normal runtime and benchmark

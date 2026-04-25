@@ -1,6 +1,6 @@
 use super::{define_typed_module_counter_defs, instrument_typed_module_with_tracker};
 use crate::InstrumentationConfig;
-use soac_config::{RuntimeOptimizationPipeline, SoacEnvConfig, SpecializationMode};
+use soac_config::{SoacEnvConfig, SpecializationMode};
 use soac_core::block_py::{
     BlockPyFunction, BlockPyModule, ChildVisitable, CounterSite, FunctionExecutionMode, Visit,
 };
@@ -57,8 +57,7 @@ class C:
     let config = InstrumentationConfig::from_env_config(
         &SoacEnvConfig::default()
             .with_specialization_mode(Some(SpecializationMode::Profile))
-            .with_profiled_cold_blocks_enabled(true)
-            .with_runtime_optimization_pipeline(RuntimeOptimizationPipeline::TypedV3),
+            .with_profiled_cold_blocks_enabled(true),
     );
 
     let instrumented =
@@ -109,8 +108,7 @@ def g(i):
     let config = InstrumentationConfig::from_env_config(
         &SoacEnvConfig::default()
             .with_specialization_mode(Some(SpecializationMode::Profile))
-            .with_profiled_cold_blocks_enabled(true)
-            .with_runtime_optimization_pipeline(RuntimeOptimizationPipeline::TypedV3),
+            .with_profiled_cold_blocks_enabled(true),
     );
 
     define_typed_module_counter_defs(&mut typed, &config)

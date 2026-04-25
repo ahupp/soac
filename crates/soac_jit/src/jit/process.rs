@@ -237,7 +237,7 @@ impl JitBatchPlan<'_> {
         &mut self,
         inputs: &DirectFunctionCompileInputs<'_>,
     ) -> Result<(), String> {
-        let runtime_pipeline = inputs.session.env_config()?.runtime_optimization_pipeline();
+        let env_config = inputs.session.env_config()?;
         for batch_function_index in &self.function_indices_to_define {
             let batch_function = &self.batch_functions[*batch_function_index];
             let reserved_inputs = self
@@ -253,27 +253,13 @@ impl JitBatchPlan<'_> {
                     Some(shared_state),
                     Some(inputs.session.as_ref()),
                 )?;
-                if runtime_pipeline.uses_typed_v3_runtime() || profile.has_v3_optimization_inputs()
-                {
-                    build_typed_v3_jit_module_plan(
-                        &shared_state.lowered_module,
-                        Some(&profile),
-                        inputs.session.env_config()?,
-                    )?
-                } else {
-                    shared_state.jit_module_plan()?
-                }
+                build_typed_v3_jit_module_plan(
+                    &shared_state.lowered_module,
+                    Some(&profile),
+                    env_config,
+                )?
             } else {
-                match runtime_pipeline {
-                    RuntimeOptimizationPipeline::PlanArtifacts => {
-                        build_jit_module_plan(inputs.module)?
-                    }
-                    RuntimeOptimizationPipeline::TypedV3 => build_typed_v3_jit_module_plan(
-                        inputs.module,
-                        None,
-                        inputs.session.env_config()?,
-                    )?,
-                }
+                build_typed_v3_jit_module_plan(inputs.module, None, env_config)?
             };
             self.module_plans.insert(binding_key, module_plan);
         }
@@ -317,15 +303,11 @@ impl JitBatchPlan<'_> {
                 .map_err(|err| err.to_string())
             })?;
             let ptrs = owners.iter().map(|obj| obj.as_ptr()).collect::<Vec<_>>();
-            let object_binding_key = std::ptr::from_ref(planned_module).cast::<()>() as usize;
-            let symbol_prefix =
-                module_constant_symbol_prefix_for_instance(planned_module, object_binding_key);
             prepared.push(PreparedModuleConstantRefresh {
                 binding_key,
                 ptrs,
                 owners: Arc::new(owners),
-                object_binding_key,
-                symbol_prefix,
+                planned_module_id: planned_module.module_name_gen.module_id(),
             });
         }
         Ok(prepared)
@@ -339,11 +321,17 @@ impl JitBatchPlan<'_> {
     ) -> Result<(), String> {
         let mut refreshed = HashMap::new();
         for refresh in prepared {
+            let (object_binding_key, object_binding_id) =
+                state.next_planned_module_constant_binding();
+            let symbol_prefix = format!(
+                "__soac_module_constant_{}_planned_{}",
+                refresh.planned_module_id, object_binding_id
+            );
             let data_ids = state.ensure_module_constant_objects(
                 jit_module,
                 refresh.ptrs.as_slice(),
-                refresh.object_binding_key,
-                refresh.symbol_prefix.as_str(),
+                object_binding_key,
+                symbol_prefix.as_str(),
             )?;
             refreshed.insert(
                 refresh.binding_key,
@@ -369,20 +357,7 @@ struct PreparedModuleConstantRefresh {
     binding_key: usize,
     ptrs: Vec<*mut ffi::PyObject>,
     owners: Arc<Vec<Py<PyAny>>>,
-    object_binding_key: usize,
-    symbol_prefix: String,
-}
-
-impl SharedModuleState {
-    fn jit_module_plan(&self) -> Result<Arc<JitModulePlan>, String> {
-        match self
-            .jit_module_plan
-            .get_or_init(|| build_jit_module_plan(&self.lowered_module))
-        {
-            Ok(plan) => Ok(Arc::clone(plan)),
-            Err(err) => Err(err.clone()),
-        }
-    }
+    planned_module_id: u32,
 }
 
 struct ReservedJitCodegenEnv<'a> {
@@ -595,10 +570,28 @@ struct ProcessJitModule {
 
 struct ProcessJitState {
     direct_functions: HashMap<RuntimeFunctionId, ProcessJitFunctionEntry>,
-    module_constant_objects: HashMap<usize, ModuleConstantObjectBinding>,
+    module_constant_objects: HashMap<ModuleConstantObjectBindingKey, ModuleConstantObjectBinding>,
     scalar_counter_storage: HashMap<usize, ScalarCounterStorageBinding>,
     top_value_counter_storage: HashMap<usize, TopValueCounterStorageBinding>,
     next_direct_symbol_id: u64,
+    next_planned_module_constant_binding_id: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum ModuleConstantObjectBindingKey {
+    SharedState(usize),
+    ExplicitModule(usize),
+    PlannedModule(u64),
+}
+
+impl std::fmt::Display for ModuleConstantObjectBindingKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SharedState(key) => write!(f, "shared-state:{key}"),
+            Self::ExplicitModule(key) => write!(f, "explicit-module:{key}"),
+            Self::PlannedModule(id) => write!(f, "planned-module:{id}"),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -753,14 +746,22 @@ impl ProcessJitState {
             scalar_counter_storage: HashMap::new(),
             top_value_counter_storage: HashMap::new(),
             next_direct_symbol_id: 0,
+            next_planned_module_constant_binding_id: 0,
         }
+    }
+
+    fn next_planned_module_constant_binding(&mut self) -> (ModuleConstantObjectBindingKey, u64) {
+        let id = self.next_planned_module_constant_binding_id;
+        self.next_planned_module_constant_binding_id =
+            self.next_planned_module_constant_binding_id.wrapping_add(1);
+        (ModuleConstantObjectBindingKey::PlannedModule(id), id)
     }
 
     fn ensure_module_constant_objects(
         &mut self,
         jit_module: &mut JITModule,
         module_constant_ptrs: &[*mut ffi::PyObject],
-        binding_key: usize,
+        binding_key: ModuleConstantObjectBindingKey,
         symbol_prefix: &str,
     ) -> Result<Vec<DataId>, String> {
         if let Some(binding) = self.module_constant_objects.get(&binding_key) {
@@ -1032,7 +1033,7 @@ impl ProcessJitState {
             let module_constant_object_data_ids = self.ensure_module_constant_objects(
                 jit_module,
                 module_constant_ptrs.as_slice(),
-                instance_key,
+                ModuleConstantObjectBindingKey::SharedState(instance_key),
                 module_constant_symbol_prefix_for_shared_state(shared_state).as_str(),
             )?;
             let symbol_scope = direct_function_symbol_scope_for_shared_state(
@@ -1049,12 +1050,6 @@ impl ProcessJitState {
                 Some(symbol_scope.as_str()),
             )?;
             predeclare_specialization_type_imports(jit_module, &specialization_profile)?;
-            predeclare_planned_typed_function_imports_for_reservation(
-                jit_module,
-                inputs.session.env_config()?,
-                &batch_function.function,
-                &specialization_profile,
-            )?;
             return Ok(ReservedJitFunctionCompileInputs {
                 module_constant_ptrs,
                 module_constant_owners: None,
@@ -1087,7 +1082,7 @@ impl ProcessJitState {
         let module_constant_object_data_ids = self.ensure_module_constant_objects(
             jit_module,
             module_constant_ptrs.as_slice(),
-            instance_key,
+            ModuleConstantObjectBindingKey::ExplicitModule(instance_key),
             module_constant_symbol_prefix_for_instance(inputs.module, instance_key).as_str(),
         )?;
         let counted_refcount_helpers = build_counted_runtime_refcount_helpers(
@@ -1104,12 +1099,6 @@ impl ProcessJitState {
             Some(inputs.session.as_ref()),
         )?;
         predeclare_specialization_type_imports(jit_module, &specialization_profile)?;
-        predeclare_planned_typed_function_imports_for_reservation(
-            jit_module,
-            inputs.session.env_config()?,
-            &batch_function.function,
-            &specialization_profile,
-        )?;
         Ok(ReservedJitFunctionCompileInputs {
             module_constant_ptrs,
             module_constant_owners: None,

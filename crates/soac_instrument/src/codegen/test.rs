@@ -6,9 +6,7 @@ use crate::{
     CounterInstrumentationConfig, ExplicitCounterPlacement, InstrumentationConfig,
     RefcountCounterMode,
 };
-use soac_config::{
-    ExecTraceConfig, RuntimeOptimizationPipeline, SoacEnvConfig, SpecializationMode,
-};
+use soac_config::{ExecTraceConfig, SoacEnvConfig, SpecializationMode};
 use soac_core::block_py::{
     BlockPyFunction, BlockPyModule, Call, ChildVisitable, CounterScope, CounterSite,
     FunctionExecutionMode, NameLike, NameLocation, RuntimeFunctionId, Visit,
@@ -274,8 +272,7 @@ fn typed_explicit_counter_placement_skips_codegen_counter_definitions_and_increm
     let config = InstrumentationConfig::from_env_config(
         &SoacEnvConfig::default()
             .with_specialization_mode(Some(SpecializationMode::Profile))
-            .with_profiled_cold_blocks_enabled(true)
-            .with_runtime_optimization_pipeline(RuntimeOptimizationPipeline::TypedV3),
+            .with_profiled_cold_blocks_enabled(true),
     );
     assert_eq!(
         config.explicit_counter_placement,

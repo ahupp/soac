@@ -3,13 +3,12 @@ use soac_core::block_py::{BlockPyModule, ModuleNameGen, RuntimeFunctionId};
 use soac_core::profile::{CounterDumpFile, CounterDumpRecordView, CounterDumpRowView};
 use soac_driver::codegen_cache::{
     CachedCodegenModuleMetadata, PythonModuleCacheSource, codegen_module_cache_path,
-    hash_module_source, load_codegen_module_cache, module_optimization_plan_v3_path,
-    remap_cached_codegen_module_function_ids, validate_codegen_module_cache_metadata,
+    hash_module_source, load_codegen_module_cache, remap_cached_codegen_module_function_ids,
+    validate_codegen_module_cache_metadata,
 };
 use soac_ir_blockpy::CodegenModuleShape;
 use soac_jit::{
-    PrecompileModuleIndex, PrecompileModuleIndexEntry, PrecompileOptimizationPlanInput,
-    precompile_codegen_module_to_object_file,
+    PrecompileModuleIndex, PrecompileModuleIndexEntry, precompile_codegen_module_to_object_file,
 };
 use std::collections::HashSet;
 use std::env;
@@ -153,16 +152,6 @@ fn run_with_args(args: impl IntoIterator<Item = OsString>) -> Result<(), String>
     for loaded in loaded_modules {
         let module_ref = loaded.module_ref;
         let metadata = loaded.metadata;
-        let optimization_plan_v3_path = module_optimization_plan_v3_path(
-            module_cache_dir.as_path(),
-            metadata.source,
-            module_ref.module_name.as_str(),
-        )
-        .map_err(|err| err.to_string())?;
-        let optimization_plan = PrecompileOptimizationPlanInput {
-            v3_path: Some(optimization_plan_v3_path.as_path()),
-            cache_identity: metadata.cache_identity.as_str(),
-        };
 
         let object_path = object_dir.join(object_file_name(&module_ref));
         let summary = precompile_codegen_module_to_object_file(
@@ -170,7 +159,7 @@ fn run_with_args(args: impl IntoIterator<Item = OsString>) -> Result<(), String>
             module_ref.source_hash,
             &loaded.module,
             Some(counters_path.as_path()),
-            Some(optimization_plan),
+            Some(metadata.cache_identity.as_str()),
             Some(&module_index),
             object_path.as_path(),
         )?;
@@ -560,11 +549,7 @@ mod test {
     use soac_core::pass_tracker::RecordingPassTracker;
     use soac_core::profile::{CounterDumpRecord, CounterDumpRow, parse_counter_dump_records};
     use soac_driver::codegen_cache::store_codegen_module_cache;
-    use soac_driver::{
-        CachedModuleOptimizationInput, CodegenPreparationOptions,
-        generate_optimization_plans_v3_for_cached_modules, prepare_codegen_module,
-    };
-    use soac_opt::plan::ProfileEvidenceStore;
+    use soac_driver::{CodegenPreparationOptions, prepare_codegen_module};
     use std::process::Stdio;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -828,9 +813,6 @@ mod test {
             source_hash: hash_module_source(runtime_source.as_str()),
             module_id: None,
         };
-        let runtime_cache_path =
-            module_cache_path_for_identity(cache_root.as_path(), &runtime_ref, SOAC_BUILD_IDENTITY)
-                .unwrap();
         prepare_with_cache_for_test(
             runtime_source.as_str(),
             11,
@@ -854,18 +836,6 @@ mod test {
             [record.encode().unwrap(), runtime_record.encode().unwrap()].concat(),
         )
         .unwrap();
-        let evidence_store = ProfileEvidenceStore::from_counter_dump(counters_path.as_path())
-            .expect("test counter dump should load");
-        generate_optimization_plans_v3_for_cached_modules(
-            &evidence_store,
-            [
-                CachedModuleOptimizationInput::new(cache_path.clone(), true),
-                CachedModuleOptimizationInput::new(runtime_cache_path, true),
-            ],
-            cache_root.as_path(),
-        )
-        .expect("test should generate v3 precompile plans");
-
         let out_path = root.join("libsoac_precompiled_test.so");
         let object_dir = root.join("objects");
         run_with_args([

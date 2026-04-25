@@ -19,12 +19,6 @@ for _ in range(80):
 # soac: verify-counters
 [
     {
-        "type": "v3_plan",
-        "function": "set_get_global",
-        "indexed_globals": {"min": 2},
-        "emitted_indexed_globals": {"min": 2},
-    },
-    {
         "function": "set_get_global",
         "kind": "global_indexed",
         "branch": "hit",

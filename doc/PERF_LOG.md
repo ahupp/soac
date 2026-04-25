@@ -1213,7 +1213,7 @@ benchmarked throughput delta, and the headline pre/post numbers.
 
 - jj change id: `otplqsxp`
 - summary: optimizer v3 now writes guarded constructor-call selections into
-  `mod.optv3`, and the JIT consumes those emitted constructor-call nodes as
+  its v3 plan, and the JIT consumes those emitted constructor-call nodes as
   typed-call inputs while preserving the existing constructor allocation/init
   lowering shape.
 - throughput: `-0.18%` specialized pystone median; no-refcount diagnostic

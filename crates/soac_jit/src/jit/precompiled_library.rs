@@ -234,7 +234,7 @@ pub(crate) fn lookup_precompiled_direct_function_handle(
         code_ptr
     };
 
-    let runtime = precompiled_module_runtime(library, shared_state)?;
+    let runtime = precompiled_module_runtime(library, shared_state, session)?;
     let function_deopt_resume_plan = runtime
         .deopt_resume_plan
         .function(function.function_id)
@@ -291,10 +291,11 @@ pub(crate) fn lookup_precompiled_static_module_constant(
 fn precompiled_module_runtime(
     library: &PrecompiledLibrary,
     shared_state: &SharedModuleState,
+    session: &Arc<crate::session::CompileSession>,
 ) -> Result<Arc<PrecompiledModuleRuntime>, String> {
     match shared_state
         .precompiled_module_runtime
-        .get_or_init(|| build_precompiled_module_runtime(library, shared_state))
+        .get_or_init(|| build_precompiled_module_runtime(library, shared_state, session))
     {
         Ok(runtime) => Ok(Arc::clone(runtime)),
         Err(error) => Err(error.clone()),
@@ -304,11 +305,13 @@ fn precompiled_module_runtime(
 fn build_precompiled_module_runtime(
     library: &PrecompiledLibrary,
     shared_state: &SharedModuleState,
+    session: &Arc<crate::session::CompileSession>,
 ) -> Result<Arc<PrecompiledModuleRuntime>, String> {
     patch_precompiled_module_constant_slots(library, shared_state)?;
-    let value_facts = infer_jit_value_facts(&shared_state.lowered_module);
     let deopt_resume_plan =
-        plan_jit_module_from_codegen(&shared_state.lowered_module, value_facts)?.deopt_resume;
+        build_typed_v3_jit_module_plan(&shared_state.lowered_module, None, session.env_config()?)?
+            .deopt_resume
+            .clone();
     let module_constant_ptrs = shared_state
         .module_constant_ptrs()
         .into_iter()

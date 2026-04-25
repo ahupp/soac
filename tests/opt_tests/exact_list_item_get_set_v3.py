@@ -17,12 +17,6 @@ for _ in range(80):
 # soac: verify-counters
 [
     {
-        "type": "v3_plan",
-        "function": "list_get_set",
-        "exact_list_items": {"min": 2},
-        "emitted_exact_list_items": {"min": 2},
-    },
-    {
         "function": "list_get_set",
         "kind": "getitem_specialized",
         "branch": "hit",

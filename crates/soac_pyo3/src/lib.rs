@@ -7,9 +7,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyModule;
 use serde_json::json;
 use soac_core::profile::CounterDumpFile;
-use soac_driver::generate_optimization_plans_v3_for_counter_dump;
-use soac_opt::artifacts_v3::load_optimization_artifacts_v3;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[cfg(test)]
 mod test;
@@ -104,67 +102,6 @@ fn inspect_counter_dump_json(path: &str) -> PyResult<String> {
     })
 }
 
-#[pyfunction]
-fn inspect_optimization_artifacts_v3_json(path: &str) -> PyResult<String> {
-    let artifacts = load_optimization_artifacts_v3(Path::new(path))
-        .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
-    let plan = &artifacts.plan;
-    let functions = plan
-        .functions
-        .iter()
-        .map(|function| {
-            let emitted_function = artifacts
-                .emission
-                .functions
-                .iter()
-                .find(|emitted| emitted.function == function.function.function);
-            json!({
-                "function_id": function.function.function.to_string(),
-                "debug_name": function.function.debug_name,
-                "regions": function.regions.len(),
-                "emitted_regions": emitted_function.map(|emitted| emitted.regions.len()).unwrap_or(0),
-                "scalar_threads": function.scalar_threads.len(),
-                "direct_calls": function.direct_calls.len(),
-                "emitted_direct_calls": emitted_function.map(|emitted| emitted.direct_calls.len()).unwrap_or(0),
-                "exact_list_items": function.exact_list_items.len(),
-                "emitted_exact_list_items": emitted_function.map(|emitted| emitted.exact_list_items.len()).unwrap_or(0),
-                "indexed_fields": function.indexed_fields.len(),
-                "emitted_indexed_fields": emitted_function.map(|emitted| emitted.indexed_fields.len()).unwrap_or(0),
-                "indexed_globals": function.indexed_globals.len(),
-                "emitted_indexed_globals": emitted_function.map(|emitted| emitted.indexed_globals.len()).unwrap_or(0),
-                "diagnostics": function.diagnostics.len(),
-            })
-        })
-        .collect::<Vec<_>>();
-    serde_json::to_string(&json!({
-        "module": {
-            "module_name": plan.module.module_name,
-            "source_hash": format!("0x{:016x}", plan.module.source_hash),
-            "cache_identity": plan.module.cache_identity,
-        },
-        "helper_catalog_version": plan.helper_catalog_version,
-        "cost_model_version": plan.cost_model_version,
-        "functions": functions,
-    }))
-    .map_err(|err| PyRuntimeError::new_err(format!("failed to encode v3 plan JSON: {err}")))
-}
-
-#[pyfunction(signature = (counters_path, module_root, out_root=None))]
-fn decide_optimizations_for_counter_dump(
-    counters_path: &str,
-    module_root: &str,
-    out_root: Option<&str>,
-) -> PyResult<usize> {
-    let counters_path = Path::new(counters_path);
-    let module_root = Path::new(module_root);
-    let out_root = out_root
-        .map(PathBuf::from)
-        .unwrap_or_else(|| module_root.to_path_buf());
-    generate_optimization_plans_v3_for_counter_dump(counters_path, module_root, out_root.as_path())
-        .map(|summary| summary.written())
-        .map_err(|err| PyRuntimeError::new_err(err.to_string()))
-}
-
 #[pymodule]
 fn _soac_ext(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     soac_config::init_logging().map_err(PyRuntimeError::new_err)?;
@@ -175,14 +112,6 @@ fn _soac_ext(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
         soac_jit::module_type::indexed_module_type_for_python(py)?,
     )?;
     module.add_function(wrap_pyfunction!(inspect_counter_dump_json, module)?)?;
-    module.add_function(wrap_pyfunction!(
-        inspect_optimization_artifacts_v3_json,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        decide_optimizations_for_counter_dump,
-        module
-    )?)?;
     jit_runtime::add_module_functions(module)?;
     Ok(())
 }

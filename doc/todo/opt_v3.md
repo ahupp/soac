@@ -22,8 +22,8 @@ Updated direction:
 
   ```text
   cached unoptimized BlockPy module + raw profile evidence
-    -> decide_optimizations
-    -> serialized v3 optimization artifact
+    -> v3 planning
+    -> typed v3 plan
     -> JIT codegen consumes the selected mechanical shape
   ```
 
@@ -55,13 +55,13 @@ Non-goals:
 
 ## Implementation Status
 
-The current implementation uses an offline v3 planner path. Shared
-serializable plan and mechanical artifact types live in `soac_opt`,
-the offline extraction/planning pipeline lives in `soac_opt`, and
-`soac_jit` consumes validated `mod.optv3` artifacts mechanically during
-`verify`/`apply` or precompile. The old live bridge that reconstructed v3
-artifacts from legacy `mod.opt` has been removed, so v3 no longer consumes
-legacy optimization decisions.
+The current implementation uses a v3 planner path. Shared plan and mechanical
+emission types live in `soac_opt`, the extraction/planning pipeline lives in
+`soac_opt`, and runtime `verify`/`apply` plus offline precompile build v3
+decisions from raw profile evidence and cached pre-optimization BlockPy modules.
+The old live bridge that reconstructed v3 artifacts from legacy `mod.opt` has
+been removed, and v3 no longer consumes legacy optimization decisions or
+serialized optimization-plan cache artifacts.
 
 Implemented:
 
@@ -100,31 +100,25 @@ Implemented:
   module constants into v3 planner facts.
 - `soac_opt::pipeline_v3`: exact-int pipeline that composes
   extraction, evidence, planning, validation, and mechanical emission.
-- `decide_optimizations`: offline planner that reads cached
-  unoptimized `mod.blockpy` plus `profile.bin`, derives v3 facts directly from
-  raw profile evidence, and writes a serialized `mod.optv3` artifact.
-- `print_optimization_plan_v3`: inspection summary for serialized v3 artifacts,
-  with `--details` showing region inputs, plan nodes, exits, mechanical
-  emission steps, scalar threads, direct-call and method-call decisions, and
-  indexed-field decisions.
-- JIT `verify`/`apply` loading requires `mod.optv3`, validates module identity,
-  and splits module-level artifacts into per-function mechanical artifacts.
-- Offline precompile consumes `mod.optv3` artifacts from the module cache.
+- JIT `verify`/`apply` loading consumes raw profile evidence, validates module
+  identity, and splits in-memory module-level artifacts into per-function
+  mechanical artifacts.
+- Offline precompile consumes raw profile evidence and cached pre-optimization
+  BlockPy modules directly.
 - `FunctionSpecializationInputs`: carries validated exact-int branch v3
-  artifacts into the JIT build path, where codegen validates that the artifact
+  artifacts into the JIT build path, where codegen validates that the planned
   function identity matches the function being compiled. Same-module profiled
-  direct-call decisions and ordinary-call argument plans are derived from the
-  mechanical `mod.optv3` emission as v3-owned codegen inputs; the JIT consumes
-  the emitted call plan through mechanical typed-call lowering and uses its
-  targets only for direct-call function predeclaration, module-plan direct-call
-  rewrites, precompile target lookup, and process-JIT batch scheduling. When a
-  call source has an emitted v3 direct, constructor, or method call node, that
-  source is v3-owned; guardless or early-consumed sources remain generic
-  fallbacks instead of being replanned from another evidence path. Direct-call
-  emission rejects a selected source that is absent from the lowered typed
-  function.
-  Method-call decisions are also derived from mechanical `mod.optv3` emission
-  as v3-owned codegen inputs. They carry owner type, method name, receiver
+  direct-call decisions and ordinary-call argument plans are derived from
+  mechanical v3 emission as v3-owned codegen inputs; the JIT consumes the
+  emitted call plan through mechanical typed-call lowering and uses its targets
+  only for direct-call function predeclaration, module-plan direct-call rewrites,
+  precompile target lookup, and process-JIT batch scheduling. When a call source
+  has an emitted v3 direct, constructor, or method call node, that source is
+  v3-owned; guardless or early-consumed sources remain generic fallbacks instead
+  of being replanned from another evidence path. Direct-call emission rejects a
+  selected source that is absent from the lowered typed function.
+  Method-call decisions are also derived from mechanical v3 emission as v3-owned
+  codegen inputs. They carry owner type, method name, receiver
   type-version guard kind, original-call fallback kind, and an argument plan
   with the implicit receiver represented explicitly. Specialization-input
   preparation validates the emitted method plan, resolves the current owner
@@ -135,9 +129,9 @@ Implemented:
   function. Typed-call lowering then mechanically lowers prepared guards and
   leaves guardless v3-owned sources as their original generic call.
   Indexed-field
-  decisions are also derived from mechanical `mod.optv3` emission as v3-owned
+  decisions are also derived from mechanical v3 emission as v3-owned
   typed-attribute inputs, with exact plan/emission validation before use.
-  Exact-list item decisions are derived from mechanical `mod.optv3` emission as
+  Exact-list item decisions are derived from mechanical v3 emission as
   v3-owned item-operation inputs, with lowered `GetItem`/`SetItem` validation
   before the existing list fast-path emitter uses them.
 - JIT term lowering now consumes matching exact-int direct-compare branch,
@@ -208,7 +202,9 @@ semantic plan targets.
 
 Current integration target:
 
-- Expand v3 coverage while keeping `mod.optv3` as the source of truth for v3.
+- Expand v3 coverage while keeping the typed v3 plan as the source of truth;
+  there is no serialized optimization-plan artifact between profiling and
+  codegen.
 - Continue deleting legacy optimization-plan code now that runtime consumption
   and normal offline generation are v3-only.
 
@@ -681,11 +677,11 @@ the branch exit demands `I32Bool01`. If a later Python-observable boundary needs
    - Select a cheapest plan satisfying the region exit demand.
    - Emit structured diagnostics for selected and declined alternatives.
 
-5. Persist and inspect v3 artifacts offline.
-   - Add a `mod.optv3` cache artifact beside `mod.blockpy`. Done.
-   - Add `decide_optimizations` to write it from raw counters and the
-     cached unoptimized module. Done.
-   - Add a printer/inspector for `mod.optv3`. Done for summary inspection.
+5. Keep optimizer inputs direct and in-memory.
+   - The old cache artifact, standalone writer, and serialized-artifact
+     inspector are gone.
+   - Keep runtime and precompile on raw profile evidence plus cached
+     pre-optimization BlockPy modules.
 
 6. Make codegen consume the plan mechanically.
    - Add an emitter for v3 plan nodes.

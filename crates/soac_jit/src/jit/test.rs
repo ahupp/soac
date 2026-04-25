@@ -142,10 +142,7 @@ mod tests {
         CounterDumpTypeKey, CounterDumpTypeKeyLayout, CounterDumpTypeTableEntry,
         write_counter_dump_records,
     };
-    use soac_driver::codegen_cache::{
-        CachedCodegenModuleMetadata, PythonModuleCacheSource, module_optimization_plan_v3_path,
-        pre_optimization_module_cache_identity,
-    };
+    use soac_driver::codegen_cache::pre_optimization_module_cache_identity;
     use soac_instrument::{
         CounterInstrumentationConfig, ExplicitCounterPlacement, InstrumentationConfig,
         RefcountCounterMode, instrument_codegen_module_with_tracker,
@@ -172,7 +169,7 @@ mod tests {
         ValueFacts, lower_codegen_function_to_typed,
     };
     use soac_opt::alternatives_v3::AlternativeCatalog;
-    use soac_opt::artifacts_v3::{ExactIntBranchV3Artifacts, write_optimization_artifacts_v3};
+    use soac_opt::artifacts_v3::ExactIntBranchV3Artifacts;
     use soac_opt::passes::{
         LocalEnvResumeBinding, LocalEnvResumeBindingState, LocalEnvResumePoint,
         LocalEnvResumeStatePrecision, LocalEnvResumeValueSource,
@@ -180,11 +177,8 @@ mod tests {
         annotate_typed_function_value_facts, infer_module_value_facts,
         lower_typed_function_call_access_plan_instrs, lower_typed_function_if_tests_to_truthy,
     };
-    use soac_opt::pipeline_v3::{
-        plan_and_emit_function_exact_int_branches_v3_with_module_constants,
-        plan_and_emit_module_v3_from_raw_evidence,
-    };
-    use soac_opt::plan::{FunctionProfileEvidence, ProfileEvidenceStore};
+    use soac_opt::pipeline_v3::plan_and_emit_function_exact_int_branches_v3_with_module_constants;
+    use soac_opt::plan::FunctionProfileEvidence;
     use std::collections::{HashMap, HashSet, VecDeque};
     use std::ffi::c_void;
     use std::mem::size_of;
@@ -197,7 +191,6 @@ mod tests {
 
     fn typed_v3_env_config() -> SoacEnvConfig {
         SoacEnvConfig::default()
-            .with_runtime_optimization_pipeline(RuntimeOptimizationPipeline::TypedV3)
     }
 
     fn legacy_counter_instrumentation_config(
@@ -3341,92 +3334,32 @@ def build(values):
         counter.count
     }
 
-    fn write_test_optimization_artifacts_v3(path: &Path, artifacts: &ExactIntBranchV3Artifacts) {
-        write_optimization_artifacts_v3(path, artifacts)
-            .expect("test optimization plan v3 should be writable");
-    }
-
-    fn test_codegen_cache_metadata_for_shared_state(
-        shared_state: &crate::module_type::SharedModuleState,
-        cache_source: PythonModuleCacheSource,
-    ) -> CachedCodegenModuleMetadata {
-        CachedCodegenModuleMetadata {
-            source: cache_source,
-            module_name: shared_state.module_name.clone(),
-            source_hash: shared_state.source_hash,
-            cache_identity: pre_optimization_module_cache_identity(
-                env!("SOAC_BUILD_IDENTITY"),
-                shared_state.module_name == "soac.runtime",
-            ),
-        }
-    }
-
-    fn write_test_optimization_artifacts_v3_for_shared_state(
-        cache_root: &Path,
-        cache_source: PythonModuleCacheSource,
-        shared_state: &crate::module_type::SharedModuleState,
-        artifacts: &ExactIntBranchV3Artifacts,
-    ) {
-        let v3_path = module_optimization_plan_v3_path(
-            cache_root,
-            cache_source,
-            shared_state.module_name.as_str(),
-        )
-        .expect("v3 test optimization plan path should build");
-        write_test_optimization_artifacts_v3(v3_path.as_path(), artifacts);
-    }
-
     fn ensure_test_optimization_artifacts_v3_for_shared_state(
-        shared_state: &crate::module_type::SharedModuleState,
+        _shared_state: &crate::module_type::SharedModuleState,
     ) -> Result<(), String> {
-        let env_config = SoacEnvConfig::from_env()?;
-        if !matches!(
-            env_config.specialization_mode(),
-            Some(SpecializationMode::Verify | SpecializationMode::Apply)
-        ) {
-            return Ok(());
+        Ok(())
+    }
+
+    fn test_profile_from_v3_artifacts<'a>(
+        shared_state: &'a crate::module_type::SharedModuleState,
+        artifacts: &ExactIntBranchV3Artifacts,
+    ) -> SpecializationProfile<'a> {
+        let planned_inputs =
+            planned_optimization_inputs_from_v3_artifacts(artifacts, shared_state, None)
+                .expect("test v3 artifacts should resolve against shared state");
+        SpecializationProfile {
+            module_name: Some(shared_state.module_name.as_str()),
+            counter_dump_path: None,
+            direct_call_emission_scope: DirectCallEmissionScope::AllDirectCallCandidates,
+            opt_v3_emitted_direct_calls: planned_inputs.opt_v3_emitted_direct_calls,
+            opt_v3_emitted_exact_list_items: planned_inputs.opt_v3_emitted_exact_list_items,
+            opt_v3_emitted_indexed_fields: planned_inputs.opt_v3_emitted_indexed_fields,
+            opt_v3_emitted_indexed_globals: planned_inputs.opt_v3_emitted_indexed_globals,
+            opt_v3_exact_int_branch_artifacts: planned_inputs.opt_v3_exact_int_branch_artifacts,
+            behavior_change_indexed_stores: false,
+            profiled_cold_blocks: false,
+            guard_miss_deopt: false,
         }
-        let Some(cache_root) = env_config.module_cache_root() else {
-            return Ok(());
-        };
-        let cache_source = shared_state
-            .module_cache_source
-            .unwrap_or(PythonModuleCacheSource::Project);
-        let output_path = module_optimization_plan_v3_path(
-            cache_root.as_path(),
-            cache_source,
-            shared_state.module_name.as_str(),
-        )
-        .map_err(|err| err.to_string())?;
-        if output_path.exists() {
-            return Ok(());
-        }
-        let metadata = test_codegen_cache_metadata_for_shared_state(shared_state, cache_source);
-        if output_path.exists() {
-            return Ok(());
-        }
-        let evidence_store = match env_config
-            .counter_dump_input_path()
-            .filter(|path| path.exists())
-        {
-            Some(path) => ProfileEvidenceStore::from_counter_dump(path.as_path())
-                .map_err(|err| err.to_string())?,
-            None => ProfileEvidenceStore::default(),
-        };
-        let catalog = AlternativeCatalog::default_v3();
-        let artifacts = plan_and_emit_module_v3_from_raw_evidence(
-            &catalog,
-            ModulePlanIdentity {
-                module_name: metadata.module_name.clone(),
-                source_hash: metadata.source_hash,
-                cache_identity: metadata.cache_identity.clone(),
-            },
-            &shared_state.lowered_module,
-            &evidence_store,
-        )
-        .map_err(|err| format!("generate test optimization plan v3: {err}"))?;
-        write_optimization_artifacts_v3(output_path.as_path(), &artifacts)
-            .map_err(|err| err.to_string())
     }
 
     fn test_empty_v3_artifacts_for_function(
@@ -3680,7 +3613,7 @@ def build(values):
         predeclared_direct_functions: Option<&HashMap<RuntimeFunctionId, DeclaredJitFunction>>,
         options: BuildSpecializedFunctionOptions,
     ) -> Result<BuiltSpecializedFunction, String> {
-        let jit_module_plan = build_jit_module_plan(module)?;
+        let jit_module_plan = build_typed_v3_jit_module_plan(module, None, &typed_v3_env_config())?;
         let planned_module = jit_module_plan.module.as_ref();
         let planned_function = planned_module
             .callable_defs
@@ -4333,42 +4266,6 @@ def build(values):
         assert_eq!(
             typed_demand_for_instr_id(&typed_function, positional_instr_id),
             Some(ResultDemand::PYOBJECT_BORROWED_OK)
-        );
-    }
-
-    #[test]
-    fn opt_v3_typed_call_preparation_skips_inline_body_plans() {
-        let function_id = RuntimeFunctionId::from_raw_parts(0, 1);
-        let source = InstrId::new(7);
-        let target = RuntimeFunctionId::from_raw_parts(0, 9);
-        let direct_call = ResolvedV3DirectCallPlan {
-            source,
-            target,
-            arg_plan: TypedDirectCallArgPlan {
-                sources: vec![TypedDirectCallArgSource::Provided(0)],
-            },
-            body: test_v3_inline_call_body(),
-            reason: "profiled direct call".to_string(),
-        };
-        let profile = SpecializationProfile {
-            module_name: None,
-            counter_dump_path: None,
-            direct_call_emission_scope: DirectCallEmissionScope::DirectCallBodiesOnly,
-            opt_v3_emitted_direct_calls: HashMap::from([(
-                function_id,
-                HashMap::from([(source, vec![direct_call])]),
-            )]),
-            opt_v3_emitted_exact_list_items: HashMap::new(),
-            opt_v3_emitted_indexed_fields: HashMap::new(),
-            opt_v3_emitted_indexed_globals: HashMap::new(),
-            opt_v3_exact_int_branch_artifacts: HashMap::new(),
-            behavior_change_indexed_stores: false,
-            profiled_cold_blocks: false,
-            guard_miss_deopt: false,
-        };
-        assert!(
-            profile.codegen_opt_v3_direct_calls(function_id).is_empty(),
-            "Inline direct-call body plans are owned by the early BlockPy rewrite path"
         );
     }
 
@@ -6624,209 +6521,6 @@ def read_point(point):
         }
     }
 
-    #[test]
-    fn v3_field_indexed_getattr_store_rhs_hits_apply_mode_fast_path() {
-        if crate::run_test_in_isolated_process_if_needed(
-            module_path!(),
-            "v3_field_indexed_getattr_store_rhs_hits_apply_mode_fast_path",
-        ) {
-            return;
-        }
-        let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        crate::initialize_test_python();
-        Python::attach(|py| {
-            let soac_work_dir = fresh_test_work_dir("v3-field-getattr-store-rhs");
-            let module_cache_root = soac_work_dir.join("modules");
-            let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
-            let _opt_mode = set_opt_mode("apply");
-            let owner_module = PyModule::from_code(
-                py,
-                c"
-class Point:
-    pass
-",
-                c"field_type_test.py",
-                c"field_type_test",
-            )
-            .expect("owner module should execute");
-            let sys = PyModule::import(py, "sys").expect("sys should import");
-            let modules = sys
-                .getattr("modules")
-                .expect("sys.modules should exist")
-                .cast_into::<pyo3::types::PyDict>()
-                .expect("sys.modules should be a dict");
-            modules
-                .set_item("field_type_test", owner_module.as_any())
-                .expect("owner module should be registered");
-
-            let module_name = "counter_test";
-            let mut lowered = soac_lowering::lower_python_to_blockpy_for_testing(
-                r#"
-def read_point(point):
-    value = point.x
-    return value
-"#,
-            )
-            .expect("lowering should succeed")
-            .codegen_module;
-            instrument_module_with_legacy_call_target_counters(&mut lowered);
-            let function = lowered
-                .callable_defs
-                .iter()
-                .find(|function| function.names.bind_name == "read_point")
-                .expect("missing lowered function read_point")
-                .clone();
-            let getattr_instr_id = first_getattr_instr_id(&function);
-            let (hit_counter_id, hit_branch_id) = runtime_branch_counter_for(
-                &lowered.counter_defs,
-                function.function_id,
-                getattr_instr_id,
-                "field_access",
-                "indexed_hit",
-            );
-            let (fallback_counter_id, fallback_branch_id) = runtime_branch_counter_for(
-                &lowered.counter_defs,
-                function.function_id,
-                getattr_instr_id,
-                "field_access",
-                "indexed_fallback",
-            );
-
-            let shared_state =
-                crate::module_type::build_shared_state_for_testing(py, lowered, module_name, "")
-                    .expect("shared state should build");
-            let current_function = shared_state
-                .lookup_function(function.function_id)
-                .expect("read_point should be present in shared state");
-            let cache_identity = pre_optimization_module_cache_identity(
-                env!("SOAC_BUILD_IDENTITY"),
-                shared_state.module_name == "soac.runtime",
-            );
-            let mut artifacts = test_empty_v3_artifacts_for_function(
-                module_name,
-                shared_state.source_hash,
-                cache_identity.as_str(),
-                0,
-                current_function,
-            );
-            let owner_type = IndexedFieldOwnerType {
-                module_name: "field_type_test".to_string(),
-                qualname: "Point".to_string(),
-            };
-            let field_guard = IndexedFieldGuardPlan {
-                kind: IndexedFieldGuardKind::OwnerTypeVersionAndFieldIndex,
-            };
-            let field_fallback = IndexedFieldFallbackPlan {
-                kind: IndexedFieldFallbackKind::OriginalAttrAccess,
-            };
-            artifacts.plan.functions[0]
-                .indexed_fields
-                .push(IndexedFieldSpecializationPlan {
-                    source: getattr_instr_id,
-                    access: IndexedFieldAccessKind::Load,
-                    owner_type: owner_type.clone(),
-                    attr_name: "x".to_string(),
-                    expected_index: 0,
-                    guard: field_guard.clone(),
-                    fallback: field_fallback.clone(),
-                    reason: "profiled type_keys selected this indexed-field layout".to_string(),
-                });
-            artifacts.emission.functions[0].indexed_fields.push(
-                soac_ir_typed::emit_v3::MechanicalIndexedFieldEmission {
-                    source: getattr_instr_id,
-                    access: IndexedFieldAccessKind::Load,
-                    guard: MechanicalIndexedFieldGuard {
-                        kind: field_guard.kind,
-                        owner_type,
-                        attr_name: "x".to_string(),
-                        expected_index: 0,
-                    },
-                    fallback: field_fallback,
-                    reason: "profiled type_keys selected this indexed-field layout".to_string(),
-                },
-            );
-            write_test_optimization_artifacts_v3_for_shared_state(
-                module_cache_root.as_path(),
-                PythonModuleCacheSource::Project,
-                shared_state.as_ref(),
-                &artifacts,
-            );
-
-            let runtime = unsafe { build_test_module_runtime(py, shared_state.clone()) };
-            let module_constant_ptrs = shared_state.module_constant_ptrs();
-            let blocks = vec![std::ptr::null_mut::<c_void>(); function.blocks.len()];
-            let compile_session = crate::session::CompileSession::process();
-            let compiled_handle = unsafe {
-                compile_cranelift_run_bb_specialized_cached(
-                    &compile_session,
-                    &blocks,
-                    &shared_state.lowered_module,
-                    &function,
-                    &shared_state.codegen_constants,
-                    &shared_state.lowered_module.counter_defs,
-                    &module_constant_ptrs,
-                    Some(shared_state.as_ref()),
-                )
-            }
-            .expect("specialized read_point should compile");
-            let (code_ptr, _default_code_ptr, param_count) = compiled_handle
-                .handle
-                .direct_runner_info()
-                .expect("compiled direct runner should expose entrypoint");
-            assert_eq!(param_count, 1, "read_point should take one direct arg");
-            let entry: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> *mut c_void =
-                unsafe { std::mem::transmute(code_ptr) };
-
-            let point_type = owner_module
-                .getattr("Point")
-                .expect("Point should exist on owner module");
-            let point = unsafe { ffi::PyObject_CallNoArgs(point_type.as_ptr()) };
-            assert!(!point.is_null(), "Point() should create a test instance");
-            let point_obj = unsafe { pyo3::Bound::from_borrowed_ptr(py, point) };
-            point_obj
-                .setattr("x", 123_456_i64)
-                .expect("Point instance should accept x");
-
-            let mut function_context = test_function_jit_context(&runtime, std::ptr::null_mut());
-            let thread_state = unsafe { ffi::PyThreadState_Get() }.cast::<c_void>();
-            let result = unsafe {
-                entry(
-                    std::ptr::addr_of_mut!(function_context).cast(),
-                    thread_state,
-                    point.cast(),
-                )
-            };
-            assert!(
-                !result.is_null(),
-                "read_point should return the stored value"
-            );
-
-            assert_eq!(
-                shared_state.counter_branch_value(hit_counter_id, hit_branch_id),
-                1,
-                "v3 indexed GetAttr used as a store RHS should take the fast path"
-            );
-            assert_eq!(
-                shared_state.counter_branch_value(fallback_counter_id, fallback_branch_id),
-                0,
-                "v3 indexed GetAttr used as a store RHS should avoid generic getattr"
-            );
-
-            let result_obj = unsafe { pyo3::Bound::from_owned_ptr(py, result.cast()) };
-            assert_eq!(
-                result_obj
-                    .extract::<i64>()
-                    .expect("read_point result should be an int"),
-                123_456
-            );
-
-            unsafe { ffi::Py_DECREF(point) };
-            modules
-                .del_item("field_type_test")
-                .expect("owner module should be removed");
-        });
-    }
-
     fn build_field_indexed_specialization_for_source(
         py: Python<'_>,
         mode: &str,
@@ -6935,10 +6629,10 @@ class Point:
     }
 
     #[test]
-    fn field_indexed_getattr_guard_miss_deopts_when_operands_are_replay_safe() {
+    fn field_indexed_getattr_guard_miss_keeps_fallback_when_operands_are_replay_safe() {
         if crate::run_test_in_isolated_process_if_needed(
             module_path!(),
-            "field_indexed_getattr_guard_miss_deopts_when_operands_are_replay_safe",
+            "field_indexed_getattr_guard_miss_keeps_fallback_when_operands_are_replay_safe",
         ) {
             return;
         }
@@ -6959,18 +6653,13 @@ def read_point(point):
                 import_user_names_for_symbols(&built, &["dp_jit_pyobject_getattr"]);
             assert_eq!(
                 count_direct_calls_to_runtime_helpers(&built.ctx.func, &deopt_helpers),
-                1,
-                "replay-safe indexed GetAttr guard miss should call the deopt resume helper"
-            );
-            assert_eq!(
-                count_cold_block_direct_calls_to_runtime_helpers(&built.ctx.func, &deopt_helpers),
-                1,
-                "replay-safe indexed GetAttr deopt helper call should be cold"
+                0,
+                "typed-v3 runtime indexed GetAttr guard miss should keep the local fallback"
             );
             assert_eq!(
                 count_direct_calls_to_runtime_helpers(&built.ctx.func, &getattr_helpers),
-                0,
-                "replay-safe indexed GetAttr should not emit a local getattr fallback"
+                1,
+                "typed-v3 runtime indexed GetAttr should emit the local getattr fallback"
             );
         });
     }
@@ -7012,10 +6701,10 @@ def read_point(factory):
     }
 
     #[test]
-    fn field_indexed_setattr_guard_miss_deopts_when_operands_are_replay_safe() {
+    fn field_indexed_setattr_guard_miss_keeps_fallback_when_operands_are_replay_safe() {
         if crate::run_test_in_isolated_process_if_needed(
             module_path!(),
-            "field_indexed_setattr_guard_miss_deopts_when_operands_are_replay_safe",
+            "field_indexed_setattr_guard_miss_keeps_fallback_when_operands_are_replay_safe",
         ) {
             return;
         }
@@ -7037,27 +6726,22 @@ def write_point(point, value):
                 import_user_names_for_symbols(&built, &[DP_JIT_PYOBJECT_SETATTR_IMPORT.symbol]);
             assert_eq!(
                 count_direct_calls_to_runtime_helpers(&built.ctx.func, &deopt_helpers),
-                1,
-                "replay-safe indexed SetAttr guard miss should call the deopt resume helper"
-            );
-            assert_eq!(
-                count_cold_block_direct_calls_to_runtime_helpers(&built.ctx.func, &deopt_helpers),
-                1,
-                "replay-safe indexed SetAttr deopt helper call should be cold"
+                0,
+                "typed-v3 runtime indexed SetAttr guard miss should keep the local fallback"
             );
             assert_eq!(
                 count_direct_calls_to_runtime_helpers(&built.ctx.func, &setattr_helpers),
-                0,
-                "replay-safe indexed SetAttr should not emit a local setattr fallback"
+                1,
+                "typed-v3 runtime indexed SetAttr should emit the local setattr fallback"
             );
         });
     }
 
     #[test]
-    fn field_indexed_setattr_guard_miss_deopts_when_receiver_call_is_presequenced() {
+    fn field_indexed_setattr_guard_miss_keeps_fallback_when_receiver_call_is_presequenced() {
         if crate::run_test_in_isolated_process_if_needed(
             module_path!(),
-            "field_indexed_setattr_guard_miss_deopts_when_receiver_call_is_presequenced",
+            "field_indexed_setattr_guard_miss_keeps_fallback_when_receiver_call_is_presequenced",
         ) {
             return;
         }
@@ -7079,13 +6763,13 @@ def write_point(factory, value):
                 import_user_names_for_symbols(&built, &[DP_JIT_PYOBJECT_SETATTR_IMPORT.symbol]);
             assert_eq!(
                 count_direct_calls_to_runtime_helpers(&built.ctx.func, &deopt_helpers),
-                1,
-                "lowering should sequence factory() before SetAttr, so the guard miss can deopt without replaying it"
+                0,
+                "typed-v3 runtime indexed SetAttr guard miss should keep the local fallback"
             );
             assert_eq!(
                 count_direct_calls_to_runtime_helpers(&built.ctx.func, &setattr_helpers),
-                0,
-                "presequenced indexed SetAttr should not keep the local setattr fallback"
+                1,
+                "presequenced indexed SetAttr should still emit the local setattr fallback"
             );
         });
     }
@@ -7214,7 +6898,7 @@ def read_point(point):
             .expect("specialized JIT build should succeed");
             let facts = infer_jit_value_facts(&shared_state.lowered_module);
             let module_plan =
-                plan_jit_module_from_codegen(&shared_state.lowered_module, facts.clone())
+                plan_typed_v3_jit_module_for_test(&shared_state.lowered_module, facts.clone())
                     .map(|prepared| prepared.deopt_resume)
                     .expect("JIT deopt resume planning should succeed");
             let function_plan = module_plan
@@ -7406,7 +7090,7 @@ def write_point(point, value):
             .expect("specialized JIT build should succeed");
             let facts = infer_jit_value_facts(&shared_state.lowered_module);
             let module_plan =
-                plan_jit_module_from_codegen(&shared_state.lowered_module, facts.clone())
+                plan_typed_v3_jit_module_for_test(&shared_state.lowered_module, facts.clone())
                     .map(|prepared| prepared.deopt_resume)
                     .expect("JIT deopt resume planning should succeed");
             let function_plan = module_plan
@@ -8242,7 +7926,7 @@ def f(x):
             .find(|function| function.names.qualname == "f")
             .expect("lowered function should exist");
         let facts = infer_module_value_facts(&lowered);
-        let module_plan = plan_jit_module_from_codegen(&lowered, facts.clone())
+        let module_plan = plan_typed_v3_jit_module_for_test(&lowered, facts.clone())
             .map(|prepared| prepared.deopt_resume)
             .expect("JIT deopt resume planning should succeed");
         let function_plan = module_plan
@@ -8283,7 +7967,7 @@ def f(x):
         let module = test_module(ModuleNameGen::new(0), vec![function]);
         let function = &module.callable_defs[0];
         let facts = infer_module_value_facts(&module);
-        let module_plan = plan_jit_module_from_codegen(&module, facts.clone())
+        let module_plan = plan_typed_v3_jit_module_for_test(&module, facts.clone())
             .map(|prepared| prepared.deopt_resume)
             .expect("JIT deopt resume planning should succeed");
         let function_plan = module_plan
@@ -8323,7 +8007,7 @@ def f(x):
         let module = test_module(ModuleNameGen::new(0), vec![function]);
         let function = &module.callable_defs[0];
         let facts = infer_module_value_facts(&module);
-        let module_plan = plan_jit_module_from_codegen(&module, facts.clone())
+        let module_plan = plan_typed_v3_jit_module_for_test(&module, facts.clone())
             .map(|prepared| prepared.deopt_resume)
             .expect("JIT deopt resume planning should succeed");
         let function_plan = module_plan
@@ -8363,7 +8047,7 @@ def f(x):
         let module = test_module(ModuleNameGen::new(0), vec![function]);
         let function = &module.callable_defs[0];
         let facts = infer_module_value_facts(&module);
-        let module_plan = plan_jit_module_from_codegen(&module, facts.clone())
+        let module_plan = plan_typed_v3_jit_module_for_test(&module, facts.clone())
             .map(|prepared| prepared.deopt_resume)
             .expect("JIT deopt resume planning should succeed");
         let function_plan = module_plan
@@ -8403,7 +8087,7 @@ def f(x):
         let module = test_module(ModuleNameGen::new(0), vec![function]);
         let function = &module.callable_defs[0];
         let facts = infer_module_value_facts(&module);
-        let module_plan = plan_jit_module_from_codegen(&module, facts.clone())
+        let module_plan = plan_typed_v3_jit_module_for_test(&module, facts.clone())
             .map(|prepared| prepared.deopt_resume)
             .expect("JIT deopt resume planning should succeed");
         let function_plan = module_plan
@@ -8441,7 +8125,7 @@ def f(x):
         let module = test_module(ModuleNameGen::new(0), vec![function]);
         let function = &module.callable_defs[0];
         let facts = infer_module_value_facts(&module);
-        let module_plan = plan_jit_module_from_codegen(&module, facts.clone())
+        let module_plan = plan_typed_v3_jit_module_for_test(&module, facts.clone())
             .map(|prepared| prepared.deopt_resume)
             .expect("JIT deopt resume planning should succeed");
         let function_plan = module_plan
@@ -8481,7 +8165,7 @@ def f(x):
             .try_semantic_instr_id()
             .expect("test body instruction should have an id");
         let facts = infer_module_value_facts(&module);
-        let module_plan = plan_jit_module_from_codegen(&module, facts.clone())
+        let module_plan = plan_typed_v3_jit_module_for_test(&module, facts.clone())
             .map(|prepared| prepared.deopt_resume)
             .expect("JIT deopt resume planning should succeed");
         let function_plan = module_plan
@@ -8510,7 +8194,7 @@ def f(x):
         let function = &module.callable_defs[0];
         let block = function.entry_block();
         let facts = infer_module_value_facts(&module);
-        let module_plan = plan_jit_module_from_codegen(&module, facts.clone())
+        let module_plan = plan_typed_v3_jit_module_for_test(&module, facts.clone())
             .map(|prepared| prepared.deopt_resume)
             .expect("JIT deopt resume planning should succeed");
         let function_plan = module_plan
@@ -8548,7 +8232,7 @@ def f(x):
             .try_semantic_instr_id()
             .expect("test body instruction should have an id");
         let facts = infer_module_value_facts(&module);
-        let module_plan = plan_jit_module_from_codegen(&module, facts.clone())
+        let module_plan = plan_typed_v3_jit_module_for_test(&module, facts.clone())
             .map(|prepared| prepared.deopt_resume)
             .expect("JIT deopt resume planning should succeed");
         let function_plan = module_plan
@@ -8607,7 +8291,7 @@ def f(x):
         let function = &module.callable_defs[0];
         let block = function.entry_block();
         let facts = infer_module_value_facts(&module);
-        let module_plan = plan_jit_module_from_codegen(&module, facts.clone())
+        let module_plan = plan_typed_v3_jit_module_for_test(&module, facts.clone())
             .map(|prepared| prepared.deopt_resume)
             .expect("JIT deopt resume planning should succeed");
         let function_plan = module_plan
@@ -8668,7 +8352,7 @@ def f(x):
             .try_semantic_instr_id()
             .expect("test body instruction should have an id");
         let facts = infer_module_value_facts(&module);
-        let module_plan = plan_jit_module_from_codegen(&module, facts.clone())
+        let module_plan = plan_typed_v3_jit_module_for_test(&module, facts.clone())
             .map(|prepared| prepared.deopt_resume)
             .expect("JIT deopt resume planning should succeed");
         let function_plan = module_plan
@@ -8717,7 +8401,7 @@ def f(x):
             .try_semantic_instr_id()
             .expect("test body instruction should have an id");
         let facts = infer_module_value_facts(&module);
-        let module_plan = plan_jit_module_from_codegen(&module, facts.clone())
+        let module_plan = plan_typed_v3_jit_module_for_test(&module, facts.clone())
             .map(|prepared| prepared.deopt_resume)
             .expect("JIT deopt resume planning should succeed");
         let function_plan = module_plan
@@ -8765,7 +8449,7 @@ def f(x):
         let function = &module.callable_defs[0];
         let block = function.entry_block();
         let facts = infer_module_value_facts(&module);
-        let module_plan = plan_jit_module_from_codegen(&module, facts.clone())
+        let module_plan = plan_typed_v3_jit_module_for_test(&module, facts.clone())
             .map(|prepared| prepared.deopt_resume)
             .expect("JIT deopt resume planning should succeed");
         let function_plan = module_plan
@@ -8811,7 +8495,7 @@ def f(x):
         let function = &module.callable_defs[0];
         let block = function.entry_block();
         let facts = infer_module_value_facts(&module);
-        let module_plan = plan_jit_module_from_codegen(&module, facts.clone())
+        let module_plan = plan_typed_v3_jit_module_for_test(&module, facts.clone())
             .map(|prepared| prepared.deopt_resume)
             .expect("JIT deopt resume planning should succeed");
         let function_plan = module_plan
@@ -8847,7 +8531,7 @@ def f(x):
         let function = &module.callable_defs[0];
         let block = function.entry_block();
         let facts = infer_module_value_facts(&module);
-        let module_plan = plan_jit_module_from_codegen(&module, facts.clone())
+        let module_plan = plan_typed_v3_jit_module_for_test(&module, facts.clone())
             .map(|prepared| prepared.deopt_resume)
             .expect("JIT deopt resume planning should succeed");
         let function_plan = module_plan
@@ -8883,7 +8567,7 @@ def f(x):
         let function = &module.callable_defs[0];
         let block = function.entry_block();
         let facts = infer_module_value_facts(&module);
-        let module_plan = plan_jit_module_from_codegen(&module, facts.clone())
+        let module_plan = plan_typed_v3_jit_module_for_test(&module, facts.clone())
             .map(|prepared| prepared.deopt_resume)
             .expect("JIT deopt resume planning should succeed");
         let function_plan = module_plan
@@ -8927,7 +8611,7 @@ def f(x):
         let function = &module.callable_defs[0];
         let block = function.entry_block();
         let facts = infer_module_value_facts(&module);
-        let module_plan = plan_jit_module_from_codegen(&module, facts.clone())
+        let module_plan = plan_typed_v3_jit_module_for_test(&module, facts.clone())
             .map(|prepared| prepared.deopt_resume)
             .expect("JIT deopt resume planning should succeed");
         let function_plan = module_plan
@@ -8980,7 +8664,7 @@ def f(x):
             .try_semantic_instr_id()
             .expect("test body instruction should have an id");
         let facts = infer_module_value_facts(&module);
-        let module_plan = plan_jit_module_from_codegen(&module, facts.clone())
+        let module_plan = plan_typed_v3_jit_module_for_test(&module, facts.clone())
             .map(|prepared| prepared.deopt_resume)
             .expect("JIT deopt resume planning should succeed");
         let function_plan = module_plan
@@ -9052,7 +8736,7 @@ def f(x):
             .try_semantic_instr_id()
             .expect("test body instruction should have an id");
         let facts = infer_module_value_facts(&module);
-        let module_plan = plan_jit_module_from_codegen(&module, facts.clone())
+        let module_plan = plan_typed_v3_jit_module_for_test(&module, facts.clone())
             .map(|prepared| prepared.deopt_resume)
             .expect("JIT deopt resume planning should succeed");
         let function_plan = module_plan
@@ -9102,7 +8786,7 @@ def f(x):
         );
         let function = &module.callable_defs[0];
         let facts = infer_module_value_facts(&module);
-        let module_plan = plan_jit_module_from_codegen(&module, facts.clone())
+        let module_plan = plan_typed_v3_jit_module_for_test(&module, facts.clone())
             .map(|prepared| prepared.deopt_resume)
             .expect("JIT deopt resume planning should succeed");
         let function_plan = module_plan
@@ -9152,7 +8836,7 @@ def f(x):
         );
         let function = &module.callable_defs[0];
         let facts = infer_module_value_facts(&module);
-        let module_plan = plan_jit_module_from_codegen(&module, facts.clone())
+        let module_plan = plan_typed_v3_jit_module_for_test(&module, facts.clone())
             .map(|prepared| prepared.deopt_resume)
             .expect("JIT deopt resume planning should succeed");
         let function_plan = module_plan
@@ -9202,7 +8886,7 @@ def f(x):
         );
         let function = &module.callable_defs[0];
         let facts = infer_module_value_facts(&module);
-        let module_plan = plan_jit_module_from_codegen(&module, facts.clone())
+        let module_plan = plan_typed_v3_jit_module_for_test(&module, facts.clone())
             .map(|prepared| prepared.deopt_resume)
             .expect("JIT deopt resume planning should succeed");
         let function_plan = module_plan
@@ -9252,7 +8936,7 @@ def f(x):
         );
         let function = &module.callable_defs[0];
         let facts = infer_module_value_facts(&module);
-        let module_plan = plan_jit_module_from_codegen(&module, facts.clone())
+        let module_plan = plan_typed_v3_jit_module_for_test(&module, facts.clone())
             .map(|prepared| prepared.deopt_resume)
             .expect("JIT deopt resume planning should succeed");
         let function_plan = module_plan
@@ -9282,7 +8966,7 @@ def f(x):
         let function = &module.callable_defs[0];
         let block = function.entry_block();
         let facts = infer_module_value_facts(&module);
-        let module_plan = plan_jit_module_from_codegen(&module, facts.clone())
+        let module_plan = plan_typed_v3_jit_module_for_test(&module, facts.clone())
             .map(|prepared| prepared.deopt_resume)
             .expect("JIT deopt resume planning should succeed");
         let function_plan = module_plan
@@ -9328,7 +9012,7 @@ def f(x):
         );
         let function = &module.callable_defs[0];
         let facts = infer_module_value_facts(&module);
-        let module_plan = plan_jit_module_from_codegen(&module, facts.clone())
+        let module_plan = plan_typed_v3_jit_module_for_test(&module, facts.clone())
             .map(|prepared| prepared.deopt_resume)
             .expect("JIT deopt resume planning should succeed");
         let function_plan = module_plan
@@ -9375,7 +9059,7 @@ def f(x):
         );
         let function = &module.callable_defs[0];
         let facts = infer_module_value_facts(&module);
-        let module_plan = plan_jit_module_from_codegen(&module, facts.clone())
+        let module_plan = plan_typed_v3_jit_module_for_test(&module, facts.clone())
             .map(|prepared| prepared.deopt_resume)
             .expect("JIT deopt resume planning should succeed");
         let function_plan = module_plan
@@ -9872,7 +9556,7 @@ def f(x):
             );
             let module_constant_ptrs = vec![body_value, return_value];
             let facts = infer_module_value_facts(&module);
-            let module_plan = plan_jit_module_from_codegen(&module, facts.clone())
+            let module_plan = plan_typed_v3_jit_module_for_test(&module, facts.clone())
                 .map(|prepared| prepared.deopt_resume)
                 .expect("JIT deopt resume planning should succeed");
             let function_plan = module_plan
@@ -9943,7 +9627,7 @@ def f(x):
             let function = &module.callable_defs[0];
             let block = function.entry_block();
             let facts = infer_module_value_facts(&module);
-            let module_plan = plan_jit_module_from_codegen(&module, facts.clone())
+            let module_plan = plan_typed_v3_jit_module_for_test(&module, facts.clone())
                 .map(|prepared| prepared.deopt_resume)
                 .expect("JIT deopt resume planning should succeed");
             let function_plan = module_plan
@@ -14937,7 +14621,7 @@ def f(x):
     }
 
     #[test]
-    fn planned_precompile_inputs_accept_serialized_v3_module_artifact() {
+    fn planned_precompile_inputs_accept_in_memory_v3_module_artifact() {
         let function = test_function();
         let module = test_module(ModuleNameGen::new(0), vec![function]);
         let function = &module.callable_defs[0];
@@ -15000,7 +14684,7 @@ def f(x):
             artifacts.plan.module.source_hash,
             None,
         )
-        .expect("v3 module artifact should map onto the current codegen module");
+        .expect("in-memory v3 module artifact should map onto the current codegen module");
         let function_artifacts = inputs
             .opt_v3_exact_int_branch_artifacts
             .get(&function.function_id)
@@ -15905,10 +15589,6 @@ def f(x):
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         crate::initialize_test_python();
         Python::attach(|py| {
-            let soac_work_dir = fresh_test_work_dir("strict-v3-indexed-field-input");
-            let module_cache_root = soac_work_dir.join("modules");
-            let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
-            let _opt_mode = set_opt_mode("apply");
             let owner_module = PyModule::from_code(
                 py,
                 c"
@@ -16024,18 +15704,7 @@ def read_point(point):
                     reason: "profiled type_keys selected this indexed-field layout".to_string(),
                 },
             );
-            write_test_optimization_artifacts_v3_for_shared_state(
-                module_cache_root.as_path(),
-                PythonModuleCacheSource::Project,
-                shared_state.as_ref(),
-                &artifacts,
-            );
-
-            let profile = SpecializationProfile::from_runtime_state_with_session(
-                Some(shared_state.as_ref()),
-                None,
-            )
-            .expect("strict v3 indexed-field artifact should load");
+            let profile = test_profile_from_v3_artifacts(shared_state.as_ref(), &artifacts);
             let mut typed_function = lower_codegen_function_to_typed(function.clone());
             apply_profile_typed_plans_to_typed_function(&mut typed_function, Some(&profile))
                 .expect("v3 indexed-field input should resolve to typed guards");
@@ -16098,7 +15767,7 @@ def read_point(point):
             let profile = SpecializationProfile {
                 module_name: None,
                 counter_dump_path: None,
-                direct_call_emission_scope: DirectCallEmissionScope::DirectCallBodiesOnly,
+                direct_call_emission_scope: DirectCallEmissionScope::AllDirectCallCandidates,
                 opt_v3_emitted_direct_calls: HashMap::new(),
                 opt_v3_emitted_exact_list_items: HashMap::new(),
                 opt_v3_emitted_indexed_fields: HashMap::from([(
@@ -16137,275 +15806,6 @@ def read_point(point):
                 TypedAttrAccessPlan::Generic,
                 "unresolvable v3 indexed-field owner should not become an InstrTyped plan"
             );
-        });
-    }
-
-    #[test]
-    fn strict_v3_indexed_field_setattr_hits_apply_mode_first_insert() {
-        if crate::run_test_in_isolated_process_if_needed(
-            module_path!(),
-            "strict_v3_indexed_field_setattr_hits_apply_mode_first_insert",
-        ) {
-            return;
-        }
-        let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        crate::initialize_test_python();
-
-        Python::attach(|py| {
-            let soac_work_dir = fresh_test_work_dir("strict-v3-indexed-field-setattr");
-            let module_cache_root = soac_work_dir.join("modules");
-            let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
-            let _opt_mode = set_opt_mode("apply");
-            let owner_module = PyModule::from_code(
-                py,
-                c"
-class Point:
-    pass
-",
-                c"field_type_test.py",
-                c"field_type_test",
-            )
-            .expect("owner module should execute");
-            let sys = PyModule::import(py, "sys").expect("sys should import");
-            let modules = sys
-                .getattr("modules")
-                .expect("sys.modules should exist")
-                .cast_into::<pyo3::types::PyDict>()
-                .expect("sys.modules should be a dict");
-            modules
-                .set_item("field_type_test", owner_module.as_any())
-                .expect("owner module should be registered");
-
-            let mut lowered = soac_lowering::lower_python_to_blockpy_for_testing(
-                r#"
-def write_point(point, value):
-    point.x = value
-    return point.x
-"#,
-            )
-            .expect("lowering should succeed")
-            .codegen_module;
-            instrument_module_with_legacy_call_target_counters(&mut lowered);
-            let module_name = "counter_test";
-            let shared_state =
-                crate::module_type::build_shared_state_for_testing(py, lowered, module_name, "")
-                    .expect("shared state should build");
-            let function = shared_state
-                .lowered_module
-                .callable_defs
-                .iter()
-                .find(|function| function.names.bind_name == "write_point")
-                .expect("missing write_point")
-                .clone();
-            let setattr_instr_id = function
-                .blocks
-                .iter()
-                .flat_map(|block| block.body.iter())
-                .find_map(|expr| match expr {
-                    InstrCodegen::SetAttr(_) => Some(expr.semantic_instr_id()),
-                    _ => None,
-                })
-                .expect("write_point should contain a SetAttr");
-
-            let current_function = shared_state
-                .lookup_function(function.function_id)
-                .expect("write_point should be present in shared state");
-            let cache_identity = pre_optimization_module_cache_identity(
-                env!("SOAC_BUILD_IDENTITY"),
-                shared_state.module_name == "soac.runtime",
-            );
-            let mut artifacts = test_empty_v3_artifacts_for_function(
-                module_name,
-                shared_state.source_hash,
-                cache_identity.as_str(),
-                0,
-                current_function,
-            );
-            let owner_type = IndexedFieldOwnerType {
-                module_name: "field_type_test".to_string(),
-                qualname: "Point".to_string(),
-            };
-            let field_guard = IndexedFieldGuardPlan {
-                kind: IndexedFieldGuardKind::OwnerTypeVersionAndFieldIndex,
-            };
-            let field_fallback = IndexedFieldFallbackPlan {
-                kind: IndexedFieldFallbackKind::OriginalAttrAccess,
-            };
-            let store_reason =
-                "profiled type_keys selected this indexed-field layout for SetAttr".to_string();
-            artifacts.plan.functions[0]
-                .indexed_fields
-                .push(IndexedFieldSpecializationPlan {
-                    source: setattr_instr_id,
-                    access: IndexedFieldAccessKind::Store,
-                    owner_type: owner_type.clone(),
-                    attr_name: "x".to_string(),
-                    expected_index: 0,
-                    guard: field_guard.clone(),
-                    fallback: field_fallback.clone(),
-                    reason: store_reason.clone(),
-                });
-            artifacts.emission.functions[0].indexed_fields.push(
-                soac_ir_typed::emit_v3::MechanicalIndexedFieldEmission {
-                    source: setattr_instr_id,
-                    access: IndexedFieldAccessKind::Store,
-                    guard: MechanicalIndexedFieldGuard {
-                        kind: field_guard.kind,
-                        owner_type,
-                        attr_name: "x".to_string(),
-                        expected_index: 0,
-                    },
-                    fallback: field_fallback,
-                    reason: store_reason,
-                },
-            );
-            write_test_optimization_artifacts_v3_for_shared_state(
-                module_cache_root.as_path(),
-                PythonModuleCacheSource::Project,
-                shared_state.as_ref(),
-                &artifacts,
-            );
-
-            let profile = SpecializationProfile::from_runtime_state_with_session(
-                Some(shared_state.as_ref()),
-                None,
-            )
-            .expect("strict v3 indexed-field SetAttr artifact should load");
-            let mut typed_function = lower_codegen_function_to_typed(function.clone());
-            apply_profile_typed_plans_to_typed_function(&mut typed_function, Some(&profile))
-                .expect("v3 indexed-field SetAttr input should resolve to typed guards");
-            let setattr = typed_function
-                .blocks
-                .iter()
-                .flat_map(|block| block.body.iter())
-                .find_map(|instr| match instr {
-                    InstrTyped::SetAttrTyped(setattr)
-                        if setattr.semantic_instr_id() == setattr_instr_id =>
-                    {
-                        Some(setattr)
-                    }
-                    _ => None,
-                })
-                .expect("write_point should contain the planned typed SetAttr");
-            let TypedAttrAccessPlan::IndexedField { source, guards } = &setattr.access else {
-                panic!("v3 emitted indexed-field Store decision should become an InstrTyped plan");
-            };
-            assert_eq!(*source, TypedIndexedFieldPlanSource::OptimizationPlanV3);
-            assert_eq!(setattr.semantic_instr_id(), setattr_instr_id);
-            assert_eq!(guards.len(), 1);
-            assert_eq!(guards[0].expected_index, 0);
-
-            let (hit_counter_id, hit_branch_id) = runtime_branch_counter_for(
-                &shared_state.lowered_module.counter_defs,
-                function.function_id,
-                setattr_instr_id,
-                "field_access",
-                "indexed_hit",
-            );
-            let (fallback_counter_id, fallback_branch_id) = runtime_branch_counter_for(
-                &shared_state.lowered_module.counter_defs,
-                function.function_id,
-                setattr_instr_id,
-                "field_access",
-                "indexed_fallback",
-            );
-            let (generic_counter_id, generic_branch_id) = runtime_branch_counter_for(
-                &shared_state.lowered_module.counter_defs,
-                function.function_id,
-                setattr_instr_id,
-                "field_access",
-                "generic_setattr",
-            );
-
-            let runtime = unsafe { build_test_module_runtime(py, shared_state.clone()) };
-            let module_constant_ptrs = shared_state.module_constant_ptrs();
-            let blocks = vec![std::ptr::null_mut::<c_void>(); function.blocks.len()];
-            let compile_session = crate::session::CompileSession::process();
-            let compiled_handle = unsafe {
-                compile_cranelift_run_bb_specialized_cached(
-                    &compile_session,
-                    &blocks,
-                    &shared_state.lowered_module,
-                    &function,
-                    &shared_state.codegen_constants,
-                    &shared_state.lowered_module.counter_defs,
-                    &module_constant_ptrs,
-                    Some(shared_state.as_ref()),
-                )
-            }
-            .expect("strict v3 specialized write_point should compile");
-            let (code_ptr, _default_code_ptr, param_count) = compiled_handle
-                .handle
-                .direct_runner_info()
-                .expect("compiled direct runner should expose entrypoint");
-            assert_eq!(param_count, 2, "write_point should take two direct args");
-            let entry: unsafe extern "C" fn(
-                *mut c_void,
-                *mut c_void,
-                *mut c_void,
-                *mut c_void,
-            ) -> *mut c_void = unsafe { std::mem::transmute(code_ptr) };
-
-            let point_type = owner_module
-                .getattr("Point")
-                .expect("Point should exist on owner module");
-            let point = unsafe { ffi::PyObject_CallNoArgs(point_type.as_ptr()) };
-            assert!(!point.is_null(), "Point() should create a test instance");
-            unsafe { ffi::Py_INCREF(point) };
-            let value = unsafe { ffi::PyLong_FromLong(7_654_321) };
-            assert!(!value.is_null(), "test value should allocate");
-
-            let mut function_context = test_function_jit_context(&runtime, std::ptr::null_mut());
-            let thread_state = unsafe { ffi::PyThreadState_Get() }.cast::<c_void>();
-            let result = unsafe {
-                entry(
-                    std::ptr::addr_of_mut!(function_context).cast(),
-                    thread_state,
-                    point.cast(),
-                    value.cast(),
-                )
-            };
-            assert!(
-                !result.is_null(),
-                "write_point should return the stored value"
-            );
-
-            assert_eq!(
-                shared_state.counter_branch_value(hit_counter_id, hit_branch_id),
-                1,
-                "strict v3 SetAttr should take the indexed-store fast path"
-            );
-            assert_eq!(
-                shared_state.counter_branch_value(fallback_counter_id, fallback_branch_id),
-                0,
-                "strict v3 SetAttr should avoid selected indexed fallback"
-            );
-            assert_eq!(
-                shared_state.counter_branch_value(generic_counter_id, generic_branch_id),
-                0,
-                "strict v3 SetAttr should avoid the generic setattr path"
-            );
-
-            let point_obj = unsafe { pyo3::Bound::from_borrowed_ptr(py, point) };
-            let stored = point_obj
-                .getattr("x")
-                .expect("Point instance should now expose x");
-            assert_eq!(
-                stored.extract::<i64>().expect("stored x should be an int"),
-                7_654_321
-            );
-            let result_obj = unsafe { pyo3::Bound::from_owned_ptr(py, result.cast()) };
-            assert_eq!(
-                result_obj
-                    .extract::<i64>()
-                    .expect("write_point result should be an int"),
-                7_654_321
-            );
-
-            unsafe { ffi::Py_DECREF(point) };
-            modules
-                .del_item("field_type_test")
-                .expect("owner module should be removed");
         });
     }
 
@@ -17079,83 +16479,6 @@ def f(x, y):
     }
 
     #[test]
-    fn specialization_profile_loads_serialized_v3_artifact_in_verify_mode() {
-        if crate::run_test_in_isolated_process_if_needed(
-            module_path!(),
-            "specialization_profile_loads_serialized_v3_artifact_in_verify_mode",
-        ) {
-            return;
-        }
-        let _guard = crate::python_runtime_test_lock().lock().unwrap();
-        crate::initialize_test_python();
-        Python::attach(|py| {
-            let soac_work_dir = fresh_test_work_dir("strict-v3-runtime-v3-plan");
-            let module_cache_root = soac_work_dir.join("modules");
-            let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
-            let _opt_mode = set_opt_mode("verify");
-            let module_name = "strict_v3_runtime_v3_plan_test";
-            let module_name_gen = ModuleNameGen::new(0);
-            let function = with_single_test_block(
-                test_function_in_module(&module_name_gen, "target"),
-                vec![],
-                ret_term(none_expr()),
-            );
-            let function_id = function.function_id;
-            let module = test_module(module_name_gen, vec![function]);
-            let shared_state =
-                crate::module_type::build_shared_state_for_testing(py, module, module_name, "")
-                    .expect("shared state should build");
-            let current_function = shared_state
-                .lookup_function(function_id)
-                .expect("test function should be present in shared state");
-            let cache_identity = pre_optimization_module_cache_identity(
-                env!("SOAC_BUILD_IDENTITY"),
-                shared_state.module_name == "soac.runtime",
-            );
-            let artifacts = test_empty_v3_artifacts_for_function(
-                module_name,
-                shared_state.source_hash,
-                cache_identity.as_str(),
-                0,
-                current_function,
-            );
-            write_test_optimization_artifacts_v3_for_shared_state(
-                module_cache_root.as_path(),
-                PythonModuleCacheSource::Project,
-                shared_state.as_ref(),
-                &artifacts,
-            );
-
-            let profile = SpecializationProfile::from_runtime_state_with_session(
-                Some(shared_state.as_ref()),
-                None,
-            )
-            .expect("verify mode should load serialized runtime artifacts");
-            assert!(
-                profile.has_v3_optimization_inputs(),
-                "serialized v3 artifacts should load typed optimization inputs"
-            );
-            assert!(
-                existing_counter_dump_path(profile.counter_dump_path.as_deref()).is_none(),
-                "test should prove the profile is not relying on a profile.bin fallback"
-            );
-            let function_artifacts = profile
-                .opt_v3_exact_int_branch_artifacts
-                .get(&function_id)
-                .expect("v3 profile should include the current function");
-            assert_eq!(function_artifacts.plan.functions.len(), 1);
-            assert_eq!(function_artifacts.emission.functions.len(), 1);
-            assert_eq!(
-                function_artifacts.plan.functions[0]
-                    .function
-                    .function
-                    .local_function_id(),
-                function_id.local_function_id()
-            );
-        });
-    }
-
-    #[test]
     fn runtime_typed_v3_pipeline_bypasses_serialized_v3_artifacts_in_verify_mode() {
         if crate::run_test_in_isolated_process_if_needed(
             module_path!(),
@@ -17169,7 +16492,6 @@ def f(x, y):
             let soac_work_dir = fresh_test_work_dir("runtime-typed-v3-identity");
             let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
             let _opt_mode = set_opt_mode("verify");
-            let _pipeline = EnvVarGuard::set("SOAC_OPT_RUNTIME_PIPELINE", "typed-v3");
             let module_name = "runtime_typed_v3_identity_test";
             let module_name_gen = ModuleNameGen::new(0);
             let function = with_single_test_block(
@@ -17187,10 +16509,6 @@ def f(x, y):
                 None,
             )
             .expect("typed-v3 runtime pipeline should not require serialized v3 artifacts");
-            assert!(
-                !profile.has_v3_optimization_inputs(),
-                "typed-v3 runtime should use the pre-optimization BlockPy module without artifact-driven rewrites"
-            );
             assert!(
                 profile.counter_dump_path.is_none(),
                 "typed-v3 runtime should not enable legacy profile evidence fallback"
@@ -17231,7 +16549,6 @@ def f(x, y):
             let soac_work_dir = fresh_test_work_dir("runtime-typed-v3-direct-call");
             let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
             let _opt_mode = set_opt_mode("verify");
-            let _pipeline = EnvVarGuard::set("SOAC_OPT_RUNTIME_PIPELINE", "typed-v3");
 
             let module_name = "runtime_typed_v3_direct_call_test";
             let module_name_gen = ModuleNameGen::new(0);
@@ -17345,9 +16662,10 @@ def f(x, y):
                 None,
             )
             .expect("typed-v3 runtime should plan direct calls from raw profile evidence");
-            assert!(
-                profile.counter_dump_path.is_none(),
-                "typed-v3 direct-call planning should not enable legacy profile evidence fallback"
+            assert_eq!(
+                profile.counter_dump_path.as_deref(),
+                Some(soac_work_dir.join("profile.bin").as_path()),
+                "typed-v3 direct-call planning should retain the raw profile evidence path"
             );
             let direct_calls = profile
                 .opt_v3_emitted_direct_calls
@@ -17594,7 +16912,6 @@ def f(x, y):
             let soac_work_dir = fresh_test_work_dir("runtime-typed-v3-access-plans");
             let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
             let _opt_mode = set_opt_mode("verify");
-            let _pipeline = EnvVarGuard::set("SOAC_OPT_RUNTIME_PIPELINE", "typed-v3");
 
             let module_name = "runtime_typed_v3_access_plan_test";
             let module_name_gen = ModuleNameGen::new(0);
@@ -17645,9 +16962,10 @@ def f(x, y):
                 None,
             )
             .expect("typed-v3 runtime should plan access emissions from raw profile evidence");
-            assert!(
-                profile.counter_dump_path.is_none(),
-                "typed-v3 access planning should not enable legacy profile evidence fallback"
+            assert_eq!(
+                profile.counter_dump_path.as_deref(),
+                Some(soac_work_dir.join("profile.bin").as_path()),
+                "typed-v3 access planning should retain the raw profile evidence path"
             );
             let indexed_global = profile
                 .opt_v3_emitted_indexed_globals
@@ -18644,10 +17962,10 @@ class Point:
     }
 
     #[test]
-    fn indexed_global_guard_miss_deopt_enabled_by_verify_mode_runtime_profile() {
+    fn indexed_global_guard_miss_keeps_fallback_by_verify_mode_runtime_profile() {
         if crate::run_test_in_isolated_process_if_needed(
             module_path!(),
-            "indexed_global_guard_miss_deopt_enabled_by_verify_mode_runtime_profile",
+            "indexed_global_guard_miss_keeps_fallback_by_verify_mode_runtime_profile",
         ) {
             return;
         }
@@ -18660,18 +17978,13 @@ class Point:
                 import_user_names_for_symbols(&built, &["soac_runtime_load_global_slow"]);
             assert_eq!(
                 count_direct_calls_to_runtime_helpers(&built.ctx.func, &deopt_helpers),
-                1,
-                "verify mode should enable indexed global guard-miss deopt through SpecializationProfile"
-            );
-            assert_eq!(
-                count_cold_block_direct_calls_to_runtime_helpers(&built.ctx.func, &deopt_helpers),
-                1,
-                "verify-mode guard-miss deopt should keep the helper call cold"
+                0,
+                "typed-v3 runtime should keep indexed global guard misses out of deopt replay"
             );
             assert_eq!(
                 count_direct_calls_to_runtime_helpers(&built.ctx.func, &slow_global_helpers),
-                0,
-                "verify mode should not emit the local slow global-load fallback for a planned deopt point"
+                1,
+                "typed-v3 runtime should preserve the local slow global-load fallback"
             );
         });
     }
@@ -18737,10 +18050,10 @@ class Point:
     }
 
     #[test]
-    fn indexed_global_store_guard_miss_deopt_enabled_by_verify_mode_runtime_profile() {
+    fn indexed_global_store_guard_miss_keeps_fallback_by_verify_mode_runtime_profile() {
         if crate::run_test_in_isolated_process_if_needed(
             module_path!(),
-            "indexed_global_store_guard_miss_deopt_enabled_by_verify_mode_runtime_profile",
+            "indexed_global_store_guard_miss_keeps_fallback_by_verify_mode_runtime_profile",
         ) {
             return;
         }
@@ -18750,26 +18063,16 @@ class Point:
             let built = build_indexed_global_store_guard_miss_with_runtime_profile(py, "verify");
             let deopt_helpers = import_user_names_for_symbols(&built, &["dp_jit_deopt_resume"]);
             let slow_store_helpers =
-                import_user_names_for_symbols(&built, &[SOAC_RUNTIME_STORE_GLOBAL_IMPORT.symbol]);
+                declared_user_names_for_symbols(&built, &[SOAC_RUNTIME_STORE_GLOBAL_IMPORT.symbol]);
             assert_eq!(
                 count_direct_calls_to_runtime_helpers(&built.ctx.func, &deopt_helpers),
-                1,
-                "verify mode should enable indexed global store guard-miss deopt"
-            );
-            assert_eq!(
-                count_cold_block_direct_calls_to_runtime_helpers(&built.ctx.func, &deopt_helpers),
-                1,
-                "verify-mode indexed global store deopt helper call should be cold"
-            );
-            assert_eq!(
-                count_deopt_helper_success_returns(&built.ctx.func, &deopt_helpers),
-                1,
-                "verify-mode indexed global store deopt should return a successful continuation result"
+                0,
+                "typed-v3 runtime should keep indexed global store guard misses out of deopt replay"
             );
             assert_eq!(
                 count_direct_calls_to_runtime_helpers(&built.ctx.func, &slow_store_helpers),
-                0,
-                "verify mode should not emit the local slow global-store fallback for a planned deopt point"
+                1,
+                "typed-v3 runtime should preserve the local slow global-store fallback"
             );
         });
     }
@@ -18949,10 +18252,10 @@ class Point:
     }
 
     #[test]
-    fn direct_call_guard_miss_deopt_enabled_for_replay_safe_callable() {
+    fn direct_call_guard_miss_keeps_fallback_for_replay_safe_callable() {
         if crate::run_test_in_isolated_process_if_needed(
             module_path!(),
-            "direct_call_guard_miss_deopt_enabled_for_replay_safe_callable",
+            "direct_call_guard_miss_keeps_fallback_for_replay_safe_callable",
         ) {
             return;
         }
@@ -18970,23 +18273,16 @@ class Point:
             );
             assert_eq!(
                 count_direct_calls_to_runtime_helpers(&built.ctx.func, &deopt_helpers),
-                1,
-                "verify mode should enable direct-call guard-miss deopt for replay-safe callables"
-            );
-            assert_eq!(
-                count_cold_block_direct_calls_to_runtime_helpers(&built.ctx.func, &deopt_helpers),
-                1,
-                "direct-call guard-miss deopt should keep the helper call cold"
-            );
-            assert_eq!(
-                count_deopt_helper_success_returns(&built.ctx.func, &deopt_helpers),
-                1,
-                "direct-call guard-miss deopt should return a successful deopt continuation result"
-            );
-            assert_eq!(
-                count_direct_calls_to_runtime_helpers(&built.ctx.func, &generic_call_helpers),
                 0,
-                "direct-call guard miss should not emit the local generic call fallback when deopt is planned"
+                "typed-v3 runtime should keep direct-call guard misses out of deopt replay"
+            );
+            assert_eq!(
+                count_cold_block_direct_calls_to_runtime_helpers(
+                    &built.ctx.func,
+                    &generic_call_helpers
+                ),
+                1,
+                "typed-v3 runtime should preserve the local generic call fallback"
             );
         });
     }
@@ -19195,7 +18491,7 @@ class Point:
             .expect("caller JIT build should succeed");
             let facts = infer_jit_value_facts(&shared_state.lowered_module);
             let module_plan =
-                plan_jit_module_from_codegen(&shared_state.lowered_module, facts.clone())
+                plan_typed_v3_jit_module_for_test(&shared_state.lowered_module, facts.clone())
                     .map(|prepared| prepared.deopt_resume)
                     .expect("JIT deopt resume planning should succeed");
             let function_plan = module_plan
@@ -19589,7 +18885,7 @@ class Point:
             .expect("specialized JIT build should succeed");
             let facts = infer_jit_value_facts(&shared_state.lowered_module);
             let module_plan =
-                plan_jit_module_from_codegen(&shared_state.lowered_module, facts.clone())
+                plan_typed_v3_jit_module_for_test(&shared_state.lowered_module, facts.clone())
                     .map(|prepared| prepared.deopt_resume)
                     .expect("JIT deopt resume planning should succeed");
             let function_plan = module_plan
@@ -19727,7 +19023,7 @@ class Point:
             .expect("specialized JIT build should succeed");
             let facts = infer_jit_value_facts(&shared_state.lowered_module);
             let module_plan =
-                plan_jit_module_from_codegen(&shared_state.lowered_module, facts.clone())
+                plan_typed_v3_jit_module_for_test(&shared_state.lowered_module, facts.clone())
                     .map(|prepared| prepared.deopt_resume)
                     .expect("JIT deopt resume planning should succeed");
             let function_plan = module_plan
@@ -19984,7 +19280,7 @@ class Point:
             .expect("specialized JIT build should succeed");
             let facts = infer_jit_value_facts(&shared_state.lowered_module);
             let module_plan =
-                plan_jit_module_from_codegen(&shared_state.lowered_module, facts.clone())
+                plan_typed_v3_jit_module_for_test(&shared_state.lowered_module, facts.clone())
                     .map(|prepared| prepared.deopt_resume)
                     .expect("JIT deopt resume planning should succeed");
             let function_plan = module_plan
@@ -20139,7 +19435,7 @@ class Point:
             .expect("specialized JIT build should succeed");
             let facts = infer_jit_value_facts(&shared_state.lowered_module);
             let module_plan =
-                plan_jit_module_from_codegen(&shared_state.lowered_module, facts.clone())
+                plan_typed_v3_jit_module_for_test(&shared_state.lowered_module, facts.clone())
                     .map(|prepared| prepared.deopt_resume)
                     .expect("JIT deopt resume planning should succeed");
             let function_plan = module_plan
@@ -20687,7 +19983,7 @@ class Point:
         let profile = SpecializationProfile {
             module_name: Some(module_name),
             counter_dump_path: Some(std::borrow::Cow::Owned(profile_path)),
-            direct_call_emission_scope: DirectCallEmissionScope::DirectCallBodiesOnly,
+            direct_call_emission_scope: DirectCallEmissionScope::AllDirectCallCandidates,
             opt_v3_emitted_direct_calls: HashMap::new(),
             opt_v3_emitted_exact_list_items: HashMap::new(),
             opt_v3_emitted_indexed_fields: HashMap::new(),

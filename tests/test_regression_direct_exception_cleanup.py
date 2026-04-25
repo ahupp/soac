@@ -7,8 +7,6 @@ import sys
 import textwrap
 from pathlib import Path
 
-from tests._integration import decide_optimizations_for_work_dir
-
 
 def _run_script(module_name: str, module_dir: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
     script = textwrap.dedent(
@@ -54,7 +52,6 @@ def _run_apply_module(tmp_path: Path, module_name: str, source: str) -> tuple[ob
     profile_result = _run_script(module_name, tmp_path, profile_env)
     assert profile_result.returncode == 0, profile_result.stdout + profile_result.stderr
     assert (work_dir / "profile.bin").exists()
-    assert decide_optimizations_for_work_dir(work_dir) >= 1
 
     apply_env = {
         **base_env,

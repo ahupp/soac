@@ -19,13 +19,6 @@ pub enum PythonModuleCacheSource {
     PythonStdlib,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ModuleCacheArtifact {
-    CodegenModule,
-    Profile,
-    OptimizationPlanV3,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct CachedCodegenModuleMetadata {
     pub source: PythonModuleCacheSource,
@@ -102,67 +95,17 @@ impl PythonModuleCacheSource {
     }
 }
 
-impl ModuleCacheArtifact {
-    const fn file_name(self) -> &'static str {
-        match self {
-            Self::CodegenModule => "mod.blockpy",
-            Self::Profile => "mod.profile",
-            Self::OptimizationPlanV3 => "mod.optv3",
-        }
-    }
-}
-
-pub fn module_cache_artifact_path(
-    cache_root: impl AsRef<Path>,
-    source: PythonModuleCacheSource,
-    module_name: &str,
-    artifact: ModuleCacheArtifact,
-) -> Result<PathBuf> {
-    let mut path = cache_root.as_ref().join(source.subtree());
-    for component in module_cache_path_components(module_name)? {
-        path.push(component);
-    }
-    path.push(artifact.file_name());
-    Ok(path)
-}
-
 pub fn codegen_module_cache_path(
     cache_root: impl AsRef<Path>,
     source: PythonModuleCacheSource,
     module_name: &str,
 ) -> Result<PathBuf> {
-    module_cache_artifact_path(
-        cache_root,
-        source,
-        module_name,
-        ModuleCacheArtifact::CodegenModule,
-    )
-}
-
-pub fn module_profile_path(
-    cache_root: impl AsRef<Path>,
-    source: PythonModuleCacheSource,
-    module_name: &str,
-) -> Result<PathBuf> {
-    module_cache_artifact_path(
-        cache_root,
-        source,
-        module_name,
-        ModuleCacheArtifact::Profile,
-    )
-}
-
-pub fn module_optimization_plan_v3_path(
-    cache_root: impl AsRef<Path>,
-    source: PythonModuleCacheSource,
-    module_name: &str,
-) -> Result<PathBuf> {
-    module_cache_artifact_path(
-        cache_root,
-        source,
-        module_name,
-        ModuleCacheArtifact::OptimizationPlanV3,
-    )
+    let mut path = cache_root.as_ref().join(source.subtree());
+    for component in module_cache_path_components(module_name)? {
+        path.push(component);
+    }
+    path.push("mod.blockpy");
+    Ok(path)
 }
 
 pub fn cached_module_paths_under_root(root: &Path) -> Result<Vec<PathBuf>> {
@@ -176,9 +119,7 @@ fn collect_cached_module_paths(path: &Path, out: &mut Vec<PathBuf>) -> Result<()
     let metadata = fs::metadata(path)
         .with_context(|| format!("read module cache path metadata {}", path.display()))?;
     if metadata.is_file() {
-        if path.file_name().and_then(|name| name.to_str())
-            == Some(ModuleCacheArtifact::CodegenModule.file_name())
-        {
+        if path.file_name().and_then(|name| name.to_str()) == Some("mod.blockpy") {
             out.push(path.to_path_buf());
         }
         return Ok(());
@@ -595,11 +536,9 @@ fn temp_cache_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod test {
     use super::{
-        CachedCodegenModuleMetadata, ModuleCacheArtifact, PythonModuleCacheSource,
-        codegen_module_cache_key, codegen_module_cache_path, load_codegen_module_cache,
-        module_cache_artifact_path, module_optimization_plan_v3_path, module_profile_path,
-        remap_codegen_module_function_ids, store_codegen_module_cache,
-        validate_codegen_module_cache_metadata,
+        CachedCodegenModuleMetadata, PythonModuleCacheSource, codegen_module_cache_key,
+        codegen_module_cache_path, load_codegen_module_cache, remap_codegen_module_function_ids,
+        store_codegen_module_cache, validate_codegen_module_cache_metadata,
     };
     use soac_core::block_py::{
         BlockPyModule, ChildVisitable, HasSemanticInstrId, ModuleNameGen, RuntimeFunctionId, Visit,
@@ -746,31 +685,6 @@ def g(y):
                 .expect("stdlib cache path"),
             PathBuf::from("/cache/root/python-stdlib/typing/mod.blockpy")
         );
-        assert_eq!(
-            module_profile_path(&root, PythonModuleCacheSource::PythonStdlib, "typing")
-                .expect("stdlib profile path"),
-            PathBuf::from("/cache/root/python-stdlib/typing/mod.profile")
-        );
-        assert_eq!(
-            module_optimization_plan_v3_path(
-                &root,
-                PythonModuleCacheSource::PythonStdlib,
-                "typing"
-            )
-            .expect("stdlib optimization v3 path"),
-            PathBuf::from("/cache/root/python-stdlib/typing/mod.optv3")
-        );
-        assert_eq!(
-            module_cache_artifact_path(
-                &root,
-                PythonModuleCacheSource::Project,
-                "pkg.submod",
-                ModuleCacheArtifact::CodegenModule,
-            )
-            .expect("explicit artifact path"),
-            PathBuf::from("/cache/root/project/pkg/submod/mod.blockpy")
-        );
-
         assert!(
             codegen_module_cache_path(&root, PythonModuleCacheSource::PythonStdlib, "../escape")
                 .is_err()

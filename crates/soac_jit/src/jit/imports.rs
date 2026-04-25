@@ -562,6 +562,7 @@ fn predeclare_reloc_type_ref_import(
     Ok(())
 }
 
+#[cfg(test)]
 fn predeclare_reloc_callable_ref_import(
     jit_module: &mut JITModule,
     callable_ref: &RelocCallableRef,
@@ -595,6 +596,7 @@ pub(super) fn predeclare_specialization_type_imports(
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn predeclare_typed_direct_call_imports(
     jit_module: &mut JITModule,
     function: &BlockPyFunction<TypedCodegenModuleShape>,

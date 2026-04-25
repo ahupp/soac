@@ -17,7 +17,7 @@ use soac_jit::module_type::{
     build_shared_state_for_inspection_with_source_hash,
 };
 use soac_jit::{
-    CompileSession, plan_jit_module_from_codegen,
+    CompileSession, PreparedJitTypedModulePlan, plan_jit_typed_module,
     render_cranelift_run_bb_specialized_with_runtime_state_and_cfg,
     render_instr_typed_for_codegen_with_runtime_state, render_jit_deopt_resume_module,
     render_jit_function_locals, render_jit_module_locals,
@@ -35,6 +35,16 @@ use tower_http::services::ServeDir;
 use soac_core::profile::CounterDumpFile;
 
 static NEXT_WEB_MODULE_ID: AtomicU64 = AtomicU64::new(1);
+
+fn plan_typed_jit_module_for_inspector(
+    module: &BlockPyModule<CodegenModuleShape>,
+) -> Result<PreparedJitTypedModulePlan, String> {
+    let prepared = soac_driver::typed_runtime::prepare_typed_v3_runtime_module(
+        module,
+        &SoacEnvConfig::default(),
+    )?;
+    plan_jit_typed_module(prepared.module, prepared.value_facts)
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -259,7 +269,7 @@ fn render_inspector_payload(source: &str, output: &soac_lowering::LoweringResult
         "text": local_env_resume_plan_text,
     }));
     let jit_deopt_resume_plan_text = (|| {
-        let prepared = plan_jit_module_from_codegen(&output.codegen_module, facts.clone())?;
+        let prepared = plan_typed_jit_module_for_inspector(&output.codegen_module)?;
         render_jit_deopt_resume_module(&prepared.module, &prepared.deopt_resume)
     })()
     .unwrap_or_else(|err| format!("; failed to render jit_deopt_resume_plan: {err}"));
@@ -269,7 +279,7 @@ fn render_inspector_payload(source: &str, output: &soac_lowering::LoweringResult
         "text": jit_deopt_resume_plan_text,
     }));
     let jit_local_plan_text = (|| {
-        let prepared = plan_jit_module_from_codegen(&output.codegen_module, facts.clone())?;
+        let prepared = plan_typed_jit_module_for_inspector(&output.codegen_module)?;
         render_jit_module_locals(&prepared.module, &prepared.locals)
     })()
     .unwrap_or_else(|err| format!("; failed to render jit_local_plan: {err}"));
@@ -396,7 +406,7 @@ pub fn jit_debug_plan(
                 format!("missing LocalEnv resume plan for {module_name}.fn#{function_id}")
             })?,
     )?;
-    let prepared = plan_jit_module_from_codegen(module, facts.clone())?;
+    let prepared = plan_typed_jit_module_for_inspector(module)?;
     let typed_function = prepared
         .module
         .callable_defs

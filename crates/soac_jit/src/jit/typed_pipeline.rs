@@ -98,6 +98,7 @@ pub(super) fn apply_profile_typed_guard_miss_policy_to_typed_function(
     annotator.visit_fn_mut(function);
 }
 
+#[cfg(test)]
 pub(super) fn apply_profile_typed_plans_to_typed_function(
     function: &mut BlockPyFunction<TypedCodegenModuleShape>,
     profile: Option<&SpecializationProfile<'_>>,
@@ -109,33 +110,6 @@ pub(super) fn apply_profile_typed_plans_to_typed_function(
     apply_profile_access_and_scalar_plans_to_typed_function(function, profile)?;
     apply_profile_typed_block_metadata_to_typed_function(function, profile)?;
     apply_profile_typed_guard_miss_policy_to_typed_function(function, profile);
-    Ok(())
-}
-
-fn typed_function_with_profile_plans(
-    function: &BlockPyFunction<CodegenModuleShape>,
-    profile: Option<&SpecializationProfile<'_>>,
-) -> Result<BlockPyFunction<TypedCodegenModuleShape>, String> {
-    let mut typed_function = lower_codegen_function_to_typed(function.clone());
-    apply_profile_typed_plans_to_typed_function(&mut typed_function, profile)?;
-    lower_typed_function_call_access_plan_instrs(&mut typed_function);
-    Ok(typed_function)
-}
-
-pub(super) fn predeclare_planned_typed_function_imports_for_reservation(
-    jit_module: &mut JITModule,
-    env_config: &SoacEnvConfig,
-    function: &BlockPyFunction<CodegenModuleShape>,
-    profile: &SpecializationProfile<'_>,
-) -> Result<(), String> {
-    if !env_config
-        .runtime_optimization_pipeline()
-        .uses_legacy_plan_artifacts_runtime()
-    {
-        return Ok(());
-    }
-    let typed_function = typed_function_with_profile_plans(function, Some(profile))?;
-    predeclare_typed_direct_call_imports(jit_module, &typed_function)?;
     Ok(())
 }
 
@@ -157,14 +131,6 @@ pub(super) fn collect_codegen_constants_for_module_name(
     }
 }
 
-fn build_jit_module_plan_from_owned_module(
-    module: BlockPyModule<CodegenModuleShape>,
-) -> Result<Arc<JitModulePlan>, String> {
-    let value_facts = infer_jit_value_facts(&module);
-    let prepared = plan_jit_module_from_codegen(&module, value_facts)?;
-    build_jit_module_plan_from_prepared_typed_module(prepared)
-}
-
 fn build_jit_module_plan_from_prepared_typed_module(
     prepared: PreparedJitTypedModulePlan,
 ) -> Result<Arc<JitModulePlan>, String> {
@@ -179,31 +145,24 @@ fn build_jit_module_plan_from_prepared_typed_module(
     }))
 }
 
-pub(super) fn build_jit_module_plan(
-    module: &BlockPyModule<CodegenModuleShape>,
-) -> Result<Arc<JitModulePlan>, String> {
-    build_jit_module_plan_from_owned_module(module.clone())
-}
-
 pub(super) fn build_typed_v3_jit_module_plan(
     module: &BlockPyModule<CodegenModuleShape>,
     profile: Option<&SpecializationProfile<'_>>,
     env_config: &SoacEnvConfig,
 ) -> Result<Arc<JitModulePlan>, String> {
-    let value_facts = infer_jit_value_facts(module);
-    let mut typed_module = lower_codegen_module_to_typed(module.clone());
-    typed_module = instrument_typed_module(
-        typed_module,
-        &InstrumentationConfig::from_env_config(env_config),
+    let prepared = soac_driver::typed_runtime::prepare_typed_v3_runtime_module_with_rewrites(
+        module,
+        env_config,
+        |typed_module, _value_facts| {
+            if let Some(profile) = profile {
+                apply_typed_v3_module_rewrites(typed_module, profile)?;
+            }
+            Ok(())
+        },
     )?;
-    annotate_typed_module_value_facts(&mut typed_module, &value_facts);
-    typed_module = lower_typed_if_tests_to_truthy(typed_module);
-    if let Some(profile) = profile {
-        apply_typed_v3_module_rewrites(&mut typed_module, profile)?;
-    }
     build_jit_module_plan_from_prepared_typed_module(plan_jit_typed_module(
-        typed_module,
-        value_facts,
+        prepared.module,
+        prepared.value_facts,
     )?)
 }
 

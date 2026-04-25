@@ -1521,9 +1521,7 @@ pub fn validate_typed_module_call_access_plans(
 
 fn validate_typed_call_access_plan(call: &TypedCall<InstrTyped>) -> Result<(), String> {
     match &call.access {
-        TypedCallAccessPlan::Generic
-        | TypedCallAccessPlan::ProfiledCallableTargets { .. }
-        | TypedCallAccessPlan::ProfiledMethodTargets { .. } => Ok(()),
+        TypedCallAccessPlan::Generic => Ok(()),
         TypedCallAccessPlan::GuardedCallable {
             function_guards,
             constructor_guards,

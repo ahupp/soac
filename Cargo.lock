@@ -1778,7 +1778,6 @@ dependencies = [
  "build_support",
  "http-body-util",
  "pyo3",
- "rkyv",
  "serde",
  "serde_json",
  "soac_config",
@@ -1846,7 +1845,6 @@ dependencies = [
  "libc",
  "pyo3",
  "pyo3-build-config",
- "rkyv",
  "ruff_python_ast",
  "serde_json",
  "soac_config",
@@ -1914,7 +1912,6 @@ version = "0.1.0"
 dependencies = [
  "build_support",
  "pyo3",
- "rkyv",
  "serde_json",
  "soac_config",
  "soac_core",
@@ -1923,7 +1920,6 @@ dependencies = [
  "soac_ir_blockpy",
  "soac_jit",
  "soac_lowering",
- "soac_opt",
  "tracing",
 ]
 

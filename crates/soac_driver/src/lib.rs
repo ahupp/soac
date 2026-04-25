@@ -1,13 +1,11 @@
 pub mod codegen_cache;
+pub mod typed_runtime;
 
 use crate::codegen_cache::{
-    CachedCodegenModule, CachedCodegenModuleMetadata, PreOptimizationCacheTarget,
-    PythonModuleCacheSource, cached_module_paths_under_root, hash_module_source,
-    load_codegen_module_cache, module_optimization_plan_v3_path,
+    PreOptimizationCacheTarget, PythonModuleCacheSource, hash_module_source,
     pre_optimization_module_cache_metadata, pre_optimization_module_cache_path,
     store_pre_optimization_cache, try_load_pre_optimization_cache,
 };
-use anyhow::{Context, Result as AnyhowResult};
 use soac_config::SoacEnvConfig;
 use soac_core::block_py::{BlockPyModule, ModuleNameGen};
 use soac_core::pass_tracker::PassTracker;
@@ -17,12 +15,8 @@ use soac_instrument::{
 };
 use soac_ir_blockpy::CodegenModuleShape;
 use soac_ir_typed::lower_codegen_module_to_typed;
-use soac_ir_typed::plan_v3::ModulePlanIdentity;
 pub use soac_lowering::{LoweringError, Result};
-use soac_opt::artifacts_v3::write_optimization_artifacts_v3;
-use soac_opt::pipeline_v3::{ModuleOptimizationInput, optimize_modules_v3_from_raw_evidence};
-use soac_opt::plan::ProfileEvidenceStore;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CodegenPreparationOptions {
@@ -187,143 +181,14 @@ fn finish_pre_optimization_module(
         .map_err(Into::into)
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CachedModuleOptimizationInput {
-    pub module_path: PathBuf,
-    pub strict: bool,
-}
-
-impl CachedModuleOptimizationInput {
-    pub fn new(module_path: PathBuf, strict: bool) -> Self {
-        Self {
-            module_path,
-            strict,
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ModuleOptimizationPlanReport {
-    pub output_path: PathBuf,
-    pub module_name: String,
-    pub source_hash: u64,
-    pub function_count: usize,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct OptimizationPlanGenerationSummary {
-    pub reports: Vec<ModuleOptimizationPlanReport>,
-    pub skipped: usize,
-}
-
-impl OptimizationPlanGenerationSummary {
-    pub fn written(&self) -> usize {
-        self.reports.len()
-    }
-}
-
-struct LoadedCachedModuleOptimizationInput {
-    strict: bool,
-    cache: CachedCodegenModule,
-}
-
-pub fn generate_optimization_plans_v3_for_counter_dump(
-    counters_path: &Path,
-    module_root: &Path,
-    out_root: &Path,
-) -> AnyhowResult<OptimizationPlanGenerationSummary> {
-    let evidence_store = ProfileEvidenceStore::from_counter_dump(counters_path)?;
-    let modules = cached_module_paths_under_root(module_root)?
-        .into_iter()
-        .map(|module_path| CachedModuleOptimizationInput::new(module_path, false));
-    generate_optimization_plans_v3_for_cached_modules(&evidence_store, modules, out_root)
-}
-
-pub fn generate_optimization_plans_v3_for_cached_modules(
-    evidence_store: &ProfileEvidenceStore,
-    module_inputs: impl IntoIterator<Item = CachedModuleOptimizationInput>,
-    out_root: &Path,
-) -> AnyhowResult<OptimizationPlanGenerationSummary> {
-    let loaded = module_inputs
-        .into_iter()
-        .map(|input| {
-            let cache =
-                load_codegen_module_cache(input.module_path.as_path()).with_context(|| {
-                    format!(
-                        "load BlockPy module cache {} for optimizer v3",
-                        input.module_path.display()
-                    )
-                })?;
-            Ok(LoadedCachedModuleOptimizationInput {
-                strict: input.strict,
-                cache,
-            })
-        })
-        .collect::<AnyhowResult<Vec<_>>>()?;
-    let module_inputs = loaded
-        .iter()
-        .map(|input| {
-            ModuleOptimizationInput::new(
-                module_plan_identity_for_cached_metadata(&input.cache.metadata),
-                &input.cache.module,
-                input.strict,
-            )
-        })
-        .collect::<Vec<_>>();
-    let optimized = optimize_modules_v3_from_raw_evidence(evidence_store, module_inputs)?;
-    let mut summary = OptimizationPlanGenerationSummary {
-        reports: Vec::new(),
-        skipped: optimized.skipped,
-    };
-    for planned_module in optimized.modules {
-        let loaded_input = loaded
-            .iter()
-            .find(|input| {
-                module_plan_identity_for_cached_metadata(&input.cache.metadata)
-                    == planned_module.identity
-            })
-            .with_context(|| {
-                format!(
-                    "planned module {} source_hash=0x{:016x} did not match a loaded cache input",
-                    planned_module.identity.module_name, planned_module.identity.source_hash
-                )
-            })?;
-        let metadata = &loaded_input.cache.metadata;
-        let output_path = module_optimization_plan_v3_path(
-            out_root,
-            metadata.source,
-            metadata.module_name.as_str(),
-        )?;
-        write_optimization_artifacts_v3(output_path.as_path(), &planned_module.artifacts)?;
-        summary.reports.push(ModuleOptimizationPlanReport {
-            output_path,
-            module_name: metadata.module_name.clone(),
-            source_hash: metadata.source_hash,
-            function_count: planned_module.artifacts.plan.functions.len(),
-        });
-    }
-    Ok(summary)
-}
-
-fn module_plan_identity_for_cached_metadata(
-    metadata: &CachedCodegenModuleMetadata,
-) -> ModulePlanIdentity {
-    ModulePlanIdentity {
-        module_name: metadata.module_name.clone(),
-        source_hash: metadata.source_hash,
-        cache_identity: metadata.cache_identity.clone(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::codegen_cache::{
-        PythonModuleCacheSource, load_codegen_module_cache, store_codegen_module_cache,
+        CachedCodegenModuleMetadata, PythonModuleCacheSource, load_codegen_module_cache,
+        store_codegen_module_cache,
     };
-    use soac_config::{
-        RuntimeOptimizationPipeline, SoacEnvConfig, SoacLogConfig, SpecializationMode,
-    };
+    use soac_config::{SoacEnvConfig, SoacLogConfig, SpecializationMode};
     use soac_core::block_py::{
         ChildVisitable, CounterScope, CounterSite, FunctionExecutionMode, ModuleNameGen, Visit,
     };
@@ -526,7 +391,7 @@ mod tests {
     }
 
     #[test]
-    fn typed_v3_profiled_cold_blocks_define_counters_without_codegen_increment_instrs() {
+    fn profiled_cold_blocks_define_typed_counters_without_codegen_increment_instrs() {
         struct IncrementCounterProbe {
             found: bool,
         }
@@ -541,8 +406,7 @@ mod tests {
         let source = "def f(x):\n    if x:\n        return 1\n    return 0\n";
         let config = SoacEnvConfig::default()
             .with_specialization_mode(Some(SpecializationMode::Profile))
-            .with_profiled_cold_blocks_enabled(true)
-            .with_runtime_optimization_pipeline(RuntimeOptimizationPipeline::TypedV3);
+            .with_profiled_cold_blocks_enabled(true);
         let lowered = prepare_for_test(source, &config).expect("transform should succeed");
 
         assert!(
@@ -550,14 +414,14 @@ mod tests {
                 .counter_defs
                 .iter()
                 .any(|counter| counter.kind == "block_entry"),
-            "typed-v3 lowering should still define block_entry counters for runtime storage"
+            "lowering should still define block_entry counters for runtime storage"
         );
         assert!(
             lowered
                 .counter_defs
                 .iter()
                 .any(|counter| counter.kind == "branch_outcomes"),
-            "typed-v3 lowering should define locality counters from InstrTyped"
+            "lowering should define locality counters from InstrTyped"
         );
         let mut probe = IncrementCounterProbe { found: false };
         for function in &lowered.callable_defs {
@@ -565,7 +429,7 @@ mod tests {
         }
         assert!(
             !probe.found,
-            "typed-v3 lowering should not insert explicit counter instructions into Codegen IR"
+            "lowering should not insert explicit counter instructions into Codegen IR"
         );
     }
 

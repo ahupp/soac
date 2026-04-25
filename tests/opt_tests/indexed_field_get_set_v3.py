@@ -29,18 +29,6 @@ for _ in range(80):
 # soac: verify-counters
 [
     {
-        "type": "v3_plan",
-        "function": "read_fields",
-        "indexed_fields": {"min": 2},
-        "emitted_indexed_fields": {"min": 2},
-    },
-    {
-        "type": "v3_plan",
-        "function": "write_fields",
-        "indexed_fields": {"min": 3},
-        "emitted_indexed_fields": {"min": 3},
-    },
-    {
         "function": "read_fields",
         "kind": "field_access",
         "branch": "indexed_hit",

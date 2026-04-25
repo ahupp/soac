@@ -1,11 +1,12 @@
+#[cfg(test)]
+use soac_config::SoacEnvConfig;
 use soac_core::block_py::{
     BlockArg, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, InstrLocationMap,
     LocalLocation, RuntimeFunctionId, current_instr_locations,
 };
+#[cfg(test)]
 use soac_ir_blockpy::CodegenModuleShape;
-use soac_ir_typed::{
-    FactStore, TypedBlock, TypedCodegenModuleShape, lower_codegen_module_to_typed,
-};
+use soac_ir_typed::{FactStore, TypedBlock, TypedCodegenModuleShape};
 pub use soac_opt::passes::{
     BlockParamFacts, FunctionLocalPlan, LocalRefKind, ParamBindingFacts, ParamProvenance,
     PlannedLocalBinding, PlannedLocalStorage, render_planned_local_binding,
@@ -13,9 +14,8 @@ pub use soac_opt::passes::{
 use soac_opt::passes::{
     FunctionLocalEnvResumePlan, FunctionRefcountPlan, LocalEnvModulePlan, LocalEnvResumeEntry,
     LocalEnvResumeModulePlan, LocalEnvResumePoint, LocalEnvResumeStatePrecision,
-    RefcountActionKind, RefcountPlan, RefcountReleaseReason, annotate_typed_module_value_facts,
-    compute_typed_function_local_live_ins, compute_typed_function_local_must_bound_ins,
-    lower_typed_if_tests_to_truthy, plan_typed_local_env_module,
+    RefcountActionKind, RefcountPlan, RefcountReleaseReason, compute_typed_function_local_live_ins,
+    compute_typed_function_local_must_bound_ins, plan_typed_local_env_module,
     plan_typed_local_env_resume_module, plan_typed_ownership_effects,
     validate_typed_local_env_module_plan, validate_typed_local_env_resume_module_plan,
     validate_typed_ownership_effects,
@@ -861,14 +861,16 @@ pub fn plan_jit_typed_module(
     })
 }
 
-pub fn plan_jit_module_from_codegen(
+#[cfg(test)]
+pub(super) fn plan_typed_v3_jit_module_for_test(
     module: &BlockPyModule<CodegenModuleShape>,
-    value_facts: FactStore,
+    _value_facts: FactStore,
 ) -> Result<PreparedJitTypedModulePlan, String> {
-    let mut typed_module = lower_codegen_module_to_typed(module.clone());
-    annotate_typed_module_value_facts(&mut typed_module, &value_facts);
-    let typed_module = lower_typed_if_tests_to_truthy(typed_module);
-    plan_jit_typed_module(typed_module, value_facts)
+    let prepared = soac_driver::typed_runtime::prepare_typed_v3_runtime_module(
+        module,
+        &SoacEnvConfig::default(),
+    )?;
+    plan_jit_typed_module(prepared.module, prepared.value_facts)
 }
 
 fn planned_deopt_points_from_resume_plan(
@@ -1600,7 +1602,7 @@ mod tests {
         module: &BlockPyModule<CodegenModuleShape>,
     ) -> PreparedJitTypedModulePlan {
         let facts = infer_module_value_facts(module);
-        plan_jit_module_from_codegen(module, facts)
+        plan_typed_v3_jit_module_for_test(module, facts)
             .expect("typed JIT module planning should succeed")
     }
 

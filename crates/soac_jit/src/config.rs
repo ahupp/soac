@@ -5,7 +5,6 @@ use soac_config::SoacEnvConfig;
 pub(crate) use soac_config::SpecializationMode;
 pub use soac_driver::codegen_cache::CachedCodegenModuleMetadata;
 use soac_driver::codegen_cache::{
-    module_optimization_plan_v3_path as blockpy_module_optimization_plan_v3_path,
     pre_optimization_module_cache_identity as blockpy_pre_optimization_module_cache_identity,
     pre_optimization_module_cache_metadata as blockpy_pre_optimization_module_cache_metadata,
     pre_optimization_module_cache_path as blockpy_pre_optimization_module_cache_path,
@@ -119,15 +118,6 @@ pub fn pre_optimization_module_cache_metadata(
         build_identity,
         runtime_names_as_globals,
     )
-}
-
-pub fn module_optimization_plan_v3_path(
-    cache_root: &Path,
-    source: PythonModuleCacheSource,
-    module_name: &str,
-) -> Result<PathBuf, String> {
-    blockpy_module_optimization_plan_v3_path(cache_root, source, module_name)
-        .map_err(|err| err.to_string())
 }
 
 pub(crate) fn precompiled_library_path() -> Result<Option<PathBuf>, String> {

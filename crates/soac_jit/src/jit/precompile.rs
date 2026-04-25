@@ -182,18 +182,12 @@ fn precompile_external_direct_call_target_functions(
         .collect())
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct PrecompileOptimizationPlanInput<'a> {
-    pub v3_path: Option<&'a Path>,
-    pub cache_identity: &'a str,
-}
-
 pub fn precompile_codegen_module_to_object_file(
     module_name: &str,
     source_hash: u64,
     module: &BlockPyModule<CodegenModuleShape>,
     counter_dump_path: Option<&Path>,
-    optimization_plan: Option<PrecompileOptimizationPlanInput<'_>>,
+    cache_identity: Option<&str>,
     module_index: Option<&PrecompileModuleIndex>,
     output_path: &Path,
 ) -> Result<PrecompileObjectSummary, String> {
@@ -202,7 +196,7 @@ pub fn precompile_codegen_module_to_object_file(
         source_hash,
         module,
         counter_dump_path,
-        optimization_plan,
+        cache_identity,
         module_index,
     )?;
     if let Some(parent) = output_path
@@ -247,7 +241,7 @@ pub(super) fn precompile_codegen_module_to_object_bytes(
     source_hash: u64,
     module: &BlockPyModule<CodegenModuleShape>,
     counter_dump_path: Option<&Path>,
-    optimization_plan: Option<PrecompileOptimizationPlanInput<'_>>,
+    cache_identity: Option<&str>,
     module_index: Option<&PrecompileModuleIndex>,
 ) -> Result<PrecompiledObjectBytes, String> {
     let compile_session = crate::session::CompileSession::new();
@@ -368,24 +362,28 @@ pub(super) fn precompile_codegen_module_to_object_bytes(
         });
     }
 
-    let planned_inputs = planned_optimization_inputs_for_precompile(
-        optimization_plan,
-        module_index,
-        module_name,
-        source_hash,
-        module,
-    )?;
+    let default_cache_identity;
+    let cache_identity = match cache_identity {
+        Some(cache_identity) => cache_identity,
+        None => {
+            default_cache_identity = pre_optimization_module_cache_identity(
+                env!("SOAC_BUILD_IDENTITY"),
+                module_name == "soac.runtime",
+            );
+            default_cache_identity.as_str()
+        }
+    };
     let specialization_profile = SpecializationProfile::from_precompile(
         env_config,
         module_name,
+        source_hash,
+        cache_identity,
+        module,
+        module_index,
         counter_dump_path,
-        planned_inputs,
     )?;
-    let jit_module_plan = if specialization_profile.has_v3_optimization_inputs() {
-        build_typed_v3_jit_module_plan(module, Some(&specialization_profile), env_config)?
-    } else {
-        build_jit_module_plan(module)?
-    };
+    let jit_module_plan =
+        build_typed_v3_jit_module_plan(module, Some(&specialization_profile), env_config)?;
     let planned_module = jit_module_plan.module.as_ref();
     let external_direct_call_target_functions = precompile_external_direct_call_target_functions(
         planned_module,

@@ -87,12 +87,6 @@ pub enum TypedDirectCallableCallGuard {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TypedCallAccessPlan {
     Generic,
-    ProfiledCallableTargets {
-        targets: Vec<RuntimeFunctionId>,
-    },
-    ProfiledMethodTargets {
-        targets: Vec<RuntimeFunctionId>,
-    },
     GuardedCallable {
         function_guards: Vec<TypedDirectFunctionCallGuard>,
         constructor_guards: Vec<TypedDirectConstructorCallGuard>,

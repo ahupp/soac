@@ -1121,32 +1121,6 @@ _call-target-specializations-from-dump dump_path:
   cd "$REPO_ROOT"
   cargo run --release -p soac_inspector --bin inspect_counters -- --specializations "{{dump_path}}"
 
-[private]
-_decide-optimizations-for-counters-dir counters_dir:
-  #!/usr/bin/env bash
-  set -euo pipefail
-  cd "$REPO_ROOT"
-  COUNTERS_DIR="{{counters_dir}}"
-  if [[ "$COUNTERS_DIR" != /* ]]; then
-    COUNTERS_DIR="$REPO_ROOT/$COUNTERS_DIR"
-  fi
-  if [[ ! -f "$COUNTERS_DIR/profile.bin" ]]; then
-    echo "counter profile not found at $COUNTERS_DIR/profile.bin; run a profile pass first" >&2
-    exit 1
-  fi
-  MODULE_CACHE_DIR="$COUNTERS_DIR/modules"
-  echo "decide optimization plans"
-  echo "optimization plan mode: v3"
-  echo "counters: $COUNTERS_DIR/profile.bin"
-  echo "module cache dir: $MODULE_CACHE_DIR"
-  if [[ -d "$MODULE_CACHE_DIR" ]]; then
-    find "$MODULE_CACHE_DIR" -name mod.opt -delete
-  fi
-  cargo run --release -p soac_driver --bin decide_optimizations -- \
-    --mode v3 \
-    --counters "$COUNTERS_DIR/profile.bin" \
-    --out "$MODULE_CACHE_DIR"
-
 benchmark-verify loops="100000" counters_dir="": (update-venv-offline) (build-extension "release")
   #!/usr/bin/env bash
   set -euo pipefail
@@ -1164,8 +1138,6 @@ benchmark-verify loops="100000" counters_dir="": (update-venv-offline) (build-ex
   fi
   rm -f "$COUNTERS_DIR/events.jsonl"
   rm -f "$COUNTERS_DIR/verify.bin"
-
-  just _decide-optimizations-for-counters-dir "$COUNTERS_DIR"
 
   echo "jit transformed verify pass"
   echo "loops: {{loops}}"
@@ -1294,9 +1266,6 @@ benchmark benchmark_loops="1000000" verify_loops="100000" results_root="work/ben
       "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, os.environ["BENCHMARK_SOURCE_DIR"]); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
 
     echo
-    just _decide-optimizations-for-counters-dir "$counters_dir"
-
-    echo
     echo "jit transformed verify pass"
     LOOPS="$VERIFY_LOOPS" \
     WARMUP_LOOPS="$WARMUP_LOOPS" \
@@ -1369,9 +1338,6 @@ precompile-shared-library counters="" out="work/logs/libsoac_precompiled.so" obj
     exit 1
   fi
   COUNTERS_DIR="$(dirname "$COUNTERS")"
-  if [[ "$(basename "$COUNTERS")" == "profile.bin" ]]; then
-    just _decide-optimizations-for-counters-dir "$COUNTERS_DIR"
-  fi
 
   OUT="{{out}}"
   if [[ "$OUT" != /* ]]; then

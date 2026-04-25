@@ -35,25 +35,8 @@ impl InstrumentationConfig {
         let top_value_counters = config
             .specialization_mode()
             .is_some_and(SpecializationMode::records_counters);
-        let explicit_counter_placement = if config
-            .runtime_optimization_pipeline()
-            .uses_typed_v3_runtime()
-        {
-            ExplicitCounterPlacement::Typed
-        } else {
-            ExplicitCounterPlacement::Codegen
-        };
-        let deopt_entry_counters = if config
-            .runtime_optimization_pipeline()
-            .uses_typed_v3_runtime()
-        {
-            false
-        } else {
-            matches!(
-                config.specialization_mode(),
-                Some(SpecializationMode::Verify | SpecializationMode::Apply)
-            )
-        };
+        let explicit_counter_placement = ExplicitCounterPlacement::Typed;
+        let deopt_entry_counters = false;
         let refcounts = if config.specialization_mode() == Some(SpecializationMode::Verify) {
             RefcountCounterMode::Scoped(CounterScope::Function)
         } else {
@@ -94,7 +77,6 @@ impl RefcountCounterMode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soac_config::RuntimeOptimizationPipeline;
 
     #[test]
     fn profile_mode_records_top_value_counters_without_refcount_counters() {
@@ -111,14 +93,17 @@ mod tests {
             instrumentation.counters.refcounts,
             RefcountCounterMode::Disabled
         );
+        assert_eq!(
+            instrumentation.explicit_counter_placement,
+            ExplicitCounterPlacement::Typed
+        );
         assert!(!instrumentation.deopt_entry_counters_enabled());
     }
 
     #[test]
-    fn typed_v3_runtime_places_explicit_counters_in_typed_ir() {
-        let config = SoacEnvConfig::default()
-            .with_specialization_mode(Some(SpecializationMode::Profile))
-            .with_runtime_optimization_pipeline(RuntimeOptimizationPipeline::TypedV3);
+    fn runtime_places_explicit_counters_in_typed_ir() {
+        let config =
+            SoacEnvConfig::default().with_specialization_mode(Some(SpecializationMode::Profile));
 
         let instrumentation = InstrumentationConfig::from_env_config(&config);
 
@@ -129,10 +114,9 @@ mod tests {
     }
 
     #[test]
-    fn verify_mode_records_refcount_and_deopt_entry_counters_for_plan_artifacts() {
-        let config = SoacEnvConfig::default()
-            .with_specialization_mode(Some(SpecializationMode::Verify))
-            .with_runtime_optimization_pipeline(RuntimeOptimizationPipeline::PlanArtifacts);
+    fn verify_mode_records_refcount_counters_without_deopt_entry_counters() {
+        let config =
+            SoacEnvConfig::default().with_specialization_mode(Some(SpecializationMode::Verify));
 
         let instrumentation = InstrumentationConfig::from_env_config(&config);
 
@@ -140,14 +124,13 @@ mod tests {
             instrumentation.counters.refcounts,
             RefcountCounterMode::Scoped(CounterScope::Function)
         );
-        assert!(instrumentation.deopt_entry_counters_enabled());
+        assert!(!instrumentation.deopt_entry_counters_enabled());
     }
 
     #[test]
-    fn typed_v3_runtime_disables_deopt_entry_counters() {
-        let config = SoacEnvConfig::default()
-            .with_specialization_mode(Some(SpecializationMode::Apply))
-            .with_runtime_optimization_pipeline(RuntimeOptimizationPipeline::TypedV3);
+    fn apply_mode_disables_deopt_entry_counters() {
+        let config =
+            SoacEnvConfig::default().with_specialization_mode(Some(SpecializationMode::Apply));
 
         let instrumentation = InstrumentationConfig::from_env_config(&config);
 
