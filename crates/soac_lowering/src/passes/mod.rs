@@ -12,18 +12,19 @@ pub(crate) mod ruff_to_blockpy;
 
 use crate::block_py::{
     cfg::relabel_blockpy_blocks_dense, runtime_name_load, Await, BinOp, BlockPyModule, Call,
-    CallArgKeyword, CallArgPositional, CellRef, CellRefForName, ChildVisitable, Del, DelItem,
-    ExprAttribute, ExprBoolOp, ExprBooleanLiteral, ExprBytesLiteral, ExprCompare, ExprDict,
-    ExprDictComp, ExprEllipsisLiteral, ExprFString, ExprGenerator, ExprIf, ExprIpyEscapeCommand,
-    ExprLambda, ExprList, ExprListComp, ExprName, ExprNamed, ExprNoneLiteral, ExprNumberLiteral,
-    ExprSet, ExprSetComp, ExprSlice, ExprStarred, ExprStringLiteral, ExprSubscript, ExprTString,
-    ExprTuple, GetAttr, GetItem, HasMeta, IncrementCounter, Instr, InstrWithConstantNone,
-    LiteralValue, Load, MakeCell, MakeFunction, MakeFunctionWithClosure, MapInstr, Mappable, Meta,
-    ModuleShape, NameLike, ResolvedName, SetAttr, SetItem, StmtAnnAssign, StmtAssert, StmtAssign,
-    StmtAugAssign, StmtBreak, StmtClassDef, StmtContinue, StmtDelete, StmtExpr, StmtFor,
-    StmtFunctionDef, StmtGlobal, StmtIf, StmtImport, StmtImportFrom, StmtIpyEscapeCommand,
-    StmtMatch, StmtNonlocal, StmtPass, StmtRaise, StmtReturn, StmtTry, StmtTypeAlias, StmtWhile,
-    StmtWith, Store, TryMapInstr, Tuple, UnaryOp, UnresolvedName, WithMeta, Yield, YieldFrom,
+    CallArgKeyword, CallArgPositional, CellRef, CellRefForName, ChildVisitable, ConstantExpr, Del,
+    DelItem, ExprAttribute, ExprBoolOp, ExprBooleanLiteral, ExprBytesLiteral, ExprCompare,
+    ExprDict, ExprDictComp, ExprEllipsisLiteral, ExprFString, ExprGenerator, ExprIf,
+    ExprIpyEscapeCommand, ExprLambda, ExprList, ExprListComp, ExprName, ExprNamed, ExprNoneLiteral,
+    ExprNumberLiteral, ExprSet, ExprSetComp, ExprSlice, ExprStarred, ExprStringLiteral,
+    ExprSubscript, ExprTString, ExprTuple, GetAttr, GetItem, HasMeta, IncrementCounter, Instr,
+    InstrWithConstantNone, LiteralValue, Load, MakeCell, MakeFunction, MakeFunctionWithClosure,
+    MapInstr, Mappable, Meta, ModuleShape, NameLike, ResolvedName, SetAttr, SetItem, StmtAnnAssign,
+    StmtAssert, StmtAssign, StmtAugAssign, StmtBreak, StmtClassDef, StmtContinue, StmtDelete,
+    StmtExpr, StmtFor, StmtFunctionDef, StmtGlobal, StmtIf, StmtImport, StmtImportFrom,
+    StmtIpyEscapeCommand, StmtMatch, StmtNonlocal, StmtPass, StmtRaise, StmtReturn, StmtTry,
+    StmtTypeAlias, StmtWhile, StmtWith, Store, TryMapInstr, Tuple, UnaryOp, UnresolvedName,
+    WithMeta, Yield, YieldFrom,
 };
 use ruff_python_ast::{self as ast};
 use soac_macros::{enum_broadcast, DelegateMatchDefault};
@@ -392,7 +393,7 @@ pub struct CodegenModuleShape;
 
 impl ModuleShape for CodegenModuleShape {
     type Instr = InstrCodegen;
-    type ModuleConstant = InstrResolved;
+    type ModuleConstant = ConstantExpr;
     type BlockExtra = ();
 }
 

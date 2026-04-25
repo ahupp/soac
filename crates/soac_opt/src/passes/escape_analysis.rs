@@ -1,8 +1,9 @@
-use crate::passes::{CodegenModuleShape, InstrCodegen, InstrResolved};
+use crate::passes::{CodegenModuleShape, InstrCodegen};
 use soac_core::block_py::PrettyPrint;
 use soac_core::block_py::literal::Literal;
 use soac_core::block_py::{
-    BlockPyFunction, BlockPyModule, BlockTerm, LocalLocation, NameLike, NameLocation, instr_any,
+    BlockPyFunction, BlockPyModule, BlockTerm, ConstantExpr, LocalLocation, NameLike, NameLocation,
+    RuntimeName, instr_any,
 };
 use std::collections::HashMap;
 
@@ -476,7 +477,7 @@ impl ConstructorBuilder<'_> {
         };
         let constant_index = load.name.location.as_constant()? as usize;
         match self.module.module_constants.get(constant_index)? {
-            InstrResolved::Literal(value) => match value.as_literal() {
+            ConstantExpr::Literal(value) => match value.as_literal() {
                 Literal::StringLiteral(value) => Some(value.value.clone()),
                 Literal::BytesLiteral(_) | Literal::NumberLiteral(_) => None,
             },
@@ -504,8 +505,7 @@ impl ConstructorBuilder<'_> {
         };
         matches!(
             self.module.module_constants.get(constant_index as usize),
-            Some(InstrResolved::Load(load))
-                if load.name.is_runtime_symbol("NONE")
+            Some(ConstantExpr::RuntimeName(RuntimeName::None))
         )
     }
 

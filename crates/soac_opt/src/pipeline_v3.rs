@@ -6,8 +6,8 @@ use crate::evidence_v3::{
     planner_facts_from_profile_evidence_v3,
 };
 use crate::passes::{
-    CodegenModuleShape, InlineUnsupportedReason, InstrCodegen, InstrResolved,
-    bind_simple_direct_call_inline_args, build_direct_call_inline_fragment_to_target,
+    CodegenModuleShape, InlineUnsupportedReason, InstrCodegen, bind_simple_direct_call_inline_args,
+    build_direct_call_inline_fragment_to_target,
 };
 use crate::plan::{FunctionProfileEvidence, ProfileEvidenceStore};
 use crate::plan_v3::{
@@ -30,9 +30,9 @@ use anyhow::Result;
 use soac_core::block_py::literal::Literal;
 use soac_core::block_py::{
     BlockLabel, BlockPyFunction, BlockPyModule, Call, CallArgPositional, CallDirect,
-    ChildVisitable, FunctionExecutionMode, HasSemanticInstrId, InstrId, LocalFunctionId,
-    ModuleContentId, NameLike, NameLocation, ParamKind, PersistentFunctionId, ResolvedName,
-    SerializedFunctionDebugName, SerializedFunctionId, SerializedIdentityTables,
+    ChildVisitable, ConstantExpr, FunctionExecutionMode, HasSemanticInstrId, InstrId,
+    LocalFunctionId, ModuleContentId, NameLike, NameLocation, ParamKind, PersistentFunctionId,
+    ResolvedName, SerializedFunctionDebugName, SerializedFunctionId, SerializedIdentityTables,
     SerializedModuleId, SerializedModuleIdentity, Visit,
 };
 use std::collections::HashMap;
@@ -239,7 +239,7 @@ pub fn plan_and_emit_function_exact_int_branches_v3_with_module_constants(
     function: FunctionPlanIdentity,
     lowered_function: &BlockPyFunction<CodegenModuleShape>,
     evidence: &FunctionProfileEvidence,
-    module_constants: &[InstrResolved],
+    module_constants: &[ConstantExpr],
 ) -> Result<ExactIntBranchV3Artifacts, ExactIntBranchV3Error> {
     let attempts = extract_function_regions_v3(lowered_function);
     let hints_by_region = attempts
@@ -1141,7 +1141,7 @@ fn module_constant_string_value_v3(
     module: &BlockPyModule<CodegenModuleShape>,
     constant_index: u32,
 ) -> Option<&str> {
-    let InstrResolved::Literal(literal) = module.module_constants.get(constant_index as usize)?
+    let ConstantExpr::Literal(literal) = module.module_constants.get(constant_index as usize)?
     else {
         return None;
     };
@@ -1675,7 +1675,7 @@ mod tests {
         CounterDumpKeyLayout, CounterDumpRecord, CounterDumpTypeKey, CounterDumpTypeKeyLayout,
         CounterDumpTypeTableEntry,
     };
-    use soac_lowering::passes::{InstrCodegen, InstrResolved};
+    use soac_lowering::passes::InstrCodegen;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1781,7 +1781,7 @@ mod tests {
     }
 
     fn module_with_constants(
-        module_constants: Vec<InstrResolved>,
+        module_constants: Vec<ConstantExpr>,
     ) -> BlockPyModule<CodegenModuleShape> {
         BlockPyModule {
             module_name_gen: ModuleNameGen::new(0),
@@ -2049,7 +2049,7 @@ mod tests {
             module_name_gen: ModuleNameGen::new(0),
             global_names: Vec::new(),
             callable_defs: vec![function],
-            module_constants: vec![InstrResolved::Literal(LiteralValue::new(StringLiteral {
+            module_constants: vec![ConstantExpr::Literal(LiteralValue::new(StringLiteral {
                 value: "value".to_string(),
             }))],
             counter_defs: Vec::new(),

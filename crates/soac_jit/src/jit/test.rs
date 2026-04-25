@@ -6,17 +6,15 @@ use soac_core::block_py::literal::{
 use soac_core::block_py::{
     AbruptKind, BinOp, BinOpKind, BlockArg, BlockEdge, BlockLabel, BlockParam, BlockParamRole,
     BlockPyFunction, BlockPyModule, BlockTerm, Call, CallArgKeyword, CallArgPositional,
-    CellLocation, CellRef, ChildVisitable, ClosureInit, ClosureSlot, CounterDef, CounterSite, Del,
-    DelItem, FunctionExecutionMode, FunctionKind, FunctionName, GetAttr, GetItem, HasMeta,
-    HasSemanticInstrId, Load, LocalFunctionId, LocalLocation, MakeCell, Meta, ModuleNameGen,
-    NameLike, NameLocation, Param, ParamKind, ParamSpec, ResolvedName, RuntimeFunctionId,
-    RuntimeName, SerializedFunctionDebugName, SerializedFunctionId, SerializedIdentityTables,
-    SerializedModuleId, SerializedModuleIdentity, SetAttr, SetItem, StorageLayout, Store, Tuple,
-    UnaryOp, UnaryOpKind, Visit, VisitMut, WithMeta,
+    CellLocation, CellRef, ChildVisitable, ClosureInit, ClosureSlot, ConstantExpr, CounterDef,
+    CounterSite, Del, DelItem, FunctionExecutionMode, FunctionKind, FunctionName, GetAttr, GetItem,
+    HasMeta, HasSemanticInstrId, Load, LocalFunctionId, LocalLocation, MakeCell, Meta,
+    ModuleNameGen, NameLike, NameLocation, Param, ParamKind, ParamSpec, ResolvedName,
+    RuntimeFunctionId, RuntimeName, SerializedFunctionDebugName, SerializedFunctionId,
+    SerializedIdentityTables, SerializedModuleId, SerializedModuleIdentity, SetAttr, SetItem,
+    StorageLayout, Store, Tuple, UnaryOp, UnaryOpKind, Visit, VisitMut, WithMeta,
 };
-use soac_lowering::passes::{
-    CodegenModuleShape, InstrCodegen, InstrResolved, validate_codegen_instr_ids,
-};
+use soac_lowering::passes::{CodegenModuleShape, InstrCodegen, validate_codegen_instr_ids};
 mod tests {
     use super::*;
     use crate::jit::direct_abi::RuntimePrimitiveId;
@@ -3007,7 +3005,7 @@ def build(values):
         }
     }
 
-    fn int_literal(value: i64) -> InstrResolved {
+    fn int_literal(value: i64) -> ConstantExpr {
         let value_str = value.to_string();
         let literal = Literal::NumberLiteral(NumberLiteral {
             value: NumberLiteralValue::Int(
@@ -3016,14 +3014,20 @@ def build(values):
                     .into(),
             ),
         });
-        InstrResolved::Literal(LiteralValue::new(literal))
+        ConstantExpr::Literal(LiteralValue::new(literal))
     }
 
-    fn string_literal(value: &str) -> InstrResolved {
+    fn string_literal(value: &str) -> ConstantExpr {
         let literal = Literal::StringLiteral(StringLiteral {
             value: value.to_string(),
         });
-        InstrResolved::Literal(LiteralValue::new(literal))
+        ConstantExpr::Literal(LiteralValue::new(literal))
+    }
+
+    fn runtime_name_constant(name: &str) -> ConstantExpr {
+        ConstantExpr::RuntimeName(
+            RuntimeName::from_name(name).expect("test runtime name should be known"),
+        )
     }
 
     fn none_expr() -> InstrCodegen {
@@ -3032,11 +3036,11 @@ def build(values):
 
     #[derive(Default)]
     struct TestConstantPool {
-        module_constants: Vec<InstrResolved>,
+        module_constants: Vec<ConstantExpr>,
     }
 
     impl TestConstantPool {
-        fn push_literal(&mut self, literal: InstrResolved) -> InstrCodegen {
+        fn push_literal(&mut self, literal: ConstantExpr) -> InstrCodegen {
             let index = u32::try_from(self.module_constants.len())
                 .expect("test module constant count should fit in u32");
             self.module_constants.push(literal);
@@ -4232,9 +4236,7 @@ def build(values):
     #[test]
     fn runtime_builtin_primitive_recognition_requires_static_runtime_name() {
         let mut module = test_module(ModuleNameGen::new(0), vec![test_function()]);
-        module
-            .module_constants
-            .push(InstrResolved::Load(Load::new(test_runtime_name("ord"))));
+        module.module_constants.push(runtime_name_constant("ord"));
         let module_constants =
             crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
         let arg = name_expr(test_name("x"));
@@ -4286,9 +4288,7 @@ def build(values):
     #[test]
     fn runtime_builtin_i64_demand_accepts_ord_and_i64_constants() {
         let mut module = test_module(ModuleNameGen::new(0), vec![test_function()]);
-        module
-            .module_constants
-            .push(InstrResolved::Load(Load::new(test_runtime_name("ord"))));
+        module.module_constants.push(runtime_name_constant("ord"));
         module.module_constants.push(int_literal(65));
         module.module_constants.push(int_literal(1));
         let module_constants =
@@ -4377,7 +4377,7 @@ def build(values):
             let mut constants = TestConstantPool::default();
             constants
                 .module_constants
-                .push(InstrResolved::Load(Load::new(test_runtime_name("chr"))));
+                .push(runtime_name_constant("chr"));
             let chr = name_expr(test_constant_name(0));
             let lhs = constants.int_expr(lhs);
             let rhs = constants.int_expr(rhs);
@@ -4426,9 +4426,7 @@ def build(values):
     #[test]
     fn runtime_builtin_param_matching_uses_descriptor_abi() {
         let mut module = test_module(ModuleNameGen::new(0), vec![test_function()]);
-        module
-            .module_constants
-            .push(InstrResolved::Load(Load::new(test_runtime_name("chr"))));
+        module.module_constants.push(runtime_name_constant("chr"));
         module.module_constants.push(int_literal(65));
         let module_constants =
             crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
@@ -5578,7 +5576,7 @@ def build(values):
     fn render_test_jit_function_with_module_constants(
         function: &BlockPyFunction<CodegenModuleShape>,
         blocks: &[ObjPtr],
-        module_constants: Vec<InstrResolved>,
+        module_constants: Vec<ConstantExpr>,
     ) -> String {
         let mut module = test_module(ModuleNameGen::new(0), vec![function.clone()]);
         module.module_constants = module_constants;
@@ -5591,7 +5589,7 @@ def build(values):
     fn render_test_jit_function_with_block_entry_counts(
         function: &BlockPyFunction<CodegenModuleShape>,
         blocks: &[ObjPtr],
-        module_constants: Vec<InstrResolved>,
+        module_constants: Vec<ConstantExpr>,
         block_entry_counts: &[(BlockLabel, u64)],
         enable_profiled_cold_blocks: bool,
     ) -> String {
@@ -7565,7 +7563,7 @@ def write_point(point, value):
     fn render_test_jit_function_with_runtime_inline(
         function: &BlockPyFunction<CodegenModuleShape>,
         blocks: &[ObjPtr],
-        module_constants: Vec<InstrResolved>,
+        module_constants: Vec<ConstantExpr>,
     ) -> String {
         let mut module = test_module(ModuleNameGen::new(0), vec![function.clone()]);
         module.module_constants = module_constants;
@@ -20348,7 +20346,7 @@ class Point:
         let rendered = render_test_jit_function_with_module_constants(
             &function,
             &blocks,
-            vec![InstrResolved::Load(Load::new(test_runtime_name("globals")))],
+            vec![runtime_name_constant("globals")],
         );
         assert!(
             !rendered.contains("call dp_jit_load_runtime_obj")

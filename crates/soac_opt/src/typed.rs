@@ -7,7 +7,6 @@ use crate::plan_v3::{
 };
 #[allow(unused_imports)]
 use soac_core::block_py;
-use soac_core::block_py::IncrementCounter;
 #[allow(unused_imports)]
 use soac_core::block_py::{
     BinOp, Block, BlockEdge, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, Call,
@@ -19,6 +18,7 @@ use soac_core::block_py::{
     Store, TermIf, TryMapInstr, TryMapModule, TryMapTerm, Tuple, UnaryOp, Visit, VisitMut,
     WithMeta, define_instr, define_ruff_instr,
 };
+use soac_core::block_py::{ConstantExpr, IncrementCounter};
 #[allow(unused_imports)]
 use soac_lowering::passes::{CodegenModuleShape, InstrCodegen, InstrResolved};
 use soac_macros::{DelegateMatchDefault, enum_broadcast};
@@ -3365,7 +3365,7 @@ pub struct TypedCodegenModuleShape;
 
 impl ModuleShape for TypedCodegenModuleShape {
     type Instr = InstrTyped;
-    type ModuleConstant = InstrResolved;
+    type ModuleConstant = ConstantExpr;
     type BlockExtra = TypedBlockExtra;
 }
 

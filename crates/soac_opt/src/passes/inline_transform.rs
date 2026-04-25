@@ -1,10 +1,8 @@
-use crate::passes::{
-    CodegenModuleShape, InstrCodegen, InstrResolved, try_allocate_codegen_stack_temp,
-};
+use crate::passes::{CodegenModuleShape, InstrCodegen, try_allocate_codegen_stack_temp};
 use soac_core::block_py::{
     Block, BlockArg, BlockEdge, BlockLabel, BlockPyFunction, BlockTerm, CallArgPositional,
-    CallDirect, HasMeta, LocalLocation, MapInstr, Mappable, NameLocation, ParamKind, ResolvedName,
-    RuntimeName, Store, TryMapInstr, TryMapTerm, WithMeta,
+    CallDirect, ConstantExpr, HasMeta, LocalLocation, MapInstr, Mappable, NameLocation, ParamKind,
+    ResolvedName, RuntimeName, Store, TryMapInstr, TryMapTerm, WithMeta,
 };
 use std::collections::HashMap;
 
@@ -205,9 +203,9 @@ pub fn build_direct_call_inline_fragment_to_target(
 
 pub fn build_cross_module_direct_call_inline_fragment_to_target(
     caller: &mut BlockPyFunction<CodegenModuleShape>,
-    caller_constants: &mut Vec<InstrResolved>,
+    caller_constants: &mut Vec<ConstantExpr>,
     callee: &BlockPyFunction<CodegenModuleShape>,
-    callee_constants: &[InstrResolved],
+    callee_constants: &[ConstantExpr],
     continuation: BlockLabel,
     value_bindings: &InlineValueBindings,
     return_target: ResolvedName,
@@ -258,9 +256,9 @@ pub fn build_direct_method_inline_fragment_to_target(
 
 pub fn build_cross_module_direct_method_inline_fragment_to_target(
     caller: &mut BlockPyFunction<CodegenModuleShape>,
-    caller_constants: &mut Vec<InstrResolved>,
+    caller_constants: &mut Vec<ConstantExpr>,
     callee: &BlockPyFunction<CodegenModuleShape>,
-    callee_constants: &[InstrResolved],
+    callee_constants: &[ConstantExpr],
     continuation: BlockLabel,
     receiver: InstrCodegen,
     args: &[CallArgPositional<InstrCodegen>],
@@ -614,15 +612,15 @@ impl InlineConstantScope<'_> {
 }
 
 struct InlineConstantRemapper<'a> {
-    caller_constants: &'a mut Vec<InstrResolved>,
-    callee_constants: &'a [InstrResolved],
+    caller_constants: &'a mut Vec<ConstantExpr>,
+    callee_constants: &'a [ConstantExpr],
     mapped_indices: HashMap<u32, u32>,
 }
 
 impl<'a> InlineConstantRemapper<'a> {
     fn new(
-        caller_constants: &'a mut Vec<InstrResolved>,
-        callee_constants: &'a [InstrResolved],
+        caller_constants: &'a mut Vec<ConstantExpr>,
+        callee_constants: &'a [ConstantExpr],
     ) -> Self {
         Self {
             caller_constants,

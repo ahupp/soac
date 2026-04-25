@@ -1,6 +1,6 @@
 use crate::block_py::{
-    BlockPyFunction, BlockPyModule, HasMeta, InstrCodegen, InstrResolved, LiteralValue, Load,
-    MapFunction, MapInstr, Mappable, NameLocation, ResolvedName, WithMeta,
+    BlockPyFunction, BlockPyModule, ConstantExpr, HasMeta, InstrCodegen, InstrResolved,
+    LiteralValue, Load, MapFunction, MapInstr, Mappable, NameLocation, ResolvedName, WithMeta,
 };
 use crate::passes::{CodegenModuleShape, ResolvedStorageModuleShape};
 use soac_macros::match_default;
@@ -10,7 +10,11 @@ pub(crate) fn hoist_module_constants(
 ) -> BlockPyModule<CodegenModuleShape> {
     let mut normalizer = CodegenExprNormalizer::default();
     let module = module.clone();
-    let mut module_constants = module.module_constants;
+    let mut module_constants = module
+        .module_constants
+        .into_iter()
+        .map(resolved_module_constant_to_constant_expr)
+        .collect::<Vec<_>>();
     let callable_defs = module
         .callable_defs
         .into_iter()
@@ -28,15 +32,27 @@ pub(crate) fn hoist_module_constants(
 
 #[derive(Default)]
 struct CodegenExprNormalizer {
-    module_constants: Vec<InstrResolved>,
+    module_constants: Vec<ConstantExpr>,
 }
 
 impl CodegenExprNormalizer {
     fn push_module_constant(&mut self, literal: LiteralValue) -> u32 {
         let index = u32::try_from(self.module_constants.len())
             .expect("module constant count should fit in u32");
-        self.module_constants.push(InstrResolved::Literal(literal));
+        self.module_constants.push(ConstantExpr::Literal(literal));
         index
+    }
+}
+
+fn resolved_module_constant_to_constant_expr(expr: InstrResolved) -> ConstantExpr {
+    match expr {
+        InstrResolved::Literal(literal) => ConstantExpr::Literal(literal),
+        InstrResolved::Load(load) if load.name.is_runtime_name() => ConstantExpr::RuntimeName(
+            load.name
+                .runtime_name_id()
+                .expect("runtime-name load should carry a RuntimeName id"),
+        ),
+        other => panic!("unsupported resolved module constant after name binding: {other:?}"),
     }
 }
 

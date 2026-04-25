@@ -1,8 +1,9 @@
-use crate::passes::{CodegenModuleShape, InstrCodegen, InstrResolved};
+use crate::passes::{CodegenModuleShape, InstrCodegen};
 use soac_core::block_py::literal::{Literal, NumberLiteralValue};
 use soac_core::block_py::{
     BinOpKind, Block, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, ChildVisitable,
-    HasSemanticInstrId, InstrKey, LocalLocation, NameLike, RuntimeFunctionId, UnaryOpKind, Visit,
+    ConstantExpr, HasSemanticInstrId, InstrKey, LocalLocation, NameLike, RuntimeFunctionId,
+    RuntimeName, UnaryOpKind, Visit,
 };
 use std::collections::HashMap;
 
@@ -872,13 +873,23 @@ fn module_constant_load_fact(index: u32, module_constant_facts: &[ValueFacts]) -
         })
 }
 
-fn infer_module_constant_facts(expr: &InstrResolved) -> ValueFacts {
+fn infer_module_constant_facts(expr: &ConstantExpr) -> ValueFacts {
     match expr {
-        InstrResolved::Load(op) => {
-            infer_runtime_name_load_facts(&op.name).unwrap_or_else(ValueFacts::unknown_pyobj)
+        ConstantExpr::RuntimeName(name) => {
+            infer_runtime_name_facts(*name).unwrap_or_else(ValueFacts::unknown_pyobj)
         }
-        InstrResolved::Literal(op) => infer_literal_facts(op.as_literal()),
-        _ => ValueFacts::unknown_pyobj(),
+        ConstantExpr::Literal(op) => infer_literal_facts(op.as_literal()),
+    }
+}
+
+fn infer_runtime_name_facts(name: RuntimeName) -> Option<ValueFacts> {
+    match name {
+        RuntimeName::None => Some(ValueFacts::PyObj(PyObjFacts::none_singleton())),
+        RuntimeName::True => Some(ValueFacts::PyObj(PyObjFacts::bool_singleton(true))),
+        RuntimeName::False => Some(ValueFacts::PyObj(PyObjFacts::bool_singleton(false))),
+        _ => RuntimeHelperId::from_runtime_symbol(name.name())
+            .map(PyObjFacts::runtime_helper)
+            .map(ValueFacts::PyObj),
     }
 }
 

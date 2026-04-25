@@ -3,11 +3,9 @@ use pyo3::prelude::*;
 use soac_core::block_py::literal::{Literal, NumberLiteralValue};
 use soac_core::block_py::{
     AbruptKind, BlockArg, BlockPyFunction, BlockPyModule, BlockTerm, CallArgKeyword,
-    ChildVisitable, NameLike, ParamDefaultSource, RuntimeName,
+    ChildVisitable, ConstantExpr, NameLike, ParamDefaultSource, RuntimeName,
 };
-use soac_opt::passes::{
-    CodegenModuleShape, InstrCodegen, InstrResolved, InstrTyped, TypedCodegenModuleShape,
-};
+use soac_opt::passes::{CodegenModuleShape, InstrCodegen, InstrTyped, TypedCodegenModuleShape};
 use std::collections::HashMap;
 
 mod materialization;
@@ -335,9 +333,9 @@ impl ModuleCodegenConstants {
         self.ids.get(value).copied()
     }
 
-    fn push_explicit_constant_expr(&mut self, expr: &InstrResolved) -> ModuleConstantId {
+    fn push_explicit_constant_expr(&mut self, expr: &ConstantExpr) -> ModuleConstantId {
         let value = match expr {
-            InstrResolved::Literal(literal) => match literal.as_literal() {
+            ConstantExpr::Literal(literal) => match literal.as_literal() {
                 Literal::StringLiteral(string) => {
                     ModuleConstantValue::Unicode(string.value.as_bytes().to_vec())
                 }
@@ -355,18 +353,7 @@ impl ModuleCodegenConstants {
                     }
                 },
             },
-            InstrResolved::Load(op) if op.name.is_runtime_name() => {
-                ModuleConstantValue::RuntimeName(
-                    op.name
-                        .runtime_name_id()
-                        .expect("runtime-name load should carry a RuntimeName id"),
-                )
-            }
-            _ => {
-                panic!(
-                    "unsupported explicit module constant expr after codegen lowering: {expr:?}"
-                );
-            }
+            ConstantExpr::RuntimeName(name) => ModuleConstantValue::RuntimeName(*name),
         };
         let id = ModuleConstantId(self.values.len());
         self.values.push(value.clone());

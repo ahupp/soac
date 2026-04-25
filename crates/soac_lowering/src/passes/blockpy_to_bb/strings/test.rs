@@ -1,6 +1,6 @@
 use super::hoist_module_constants;
 use crate::{
-    block_py::{ChildVisitable, InstrCodegen, InstrResolved, Literal, NameLike, Visit},
+    block_py::{ChildVisitable, ConstantExpr, InstrCodegen, Literal, NameLike},
     lower_python_to_blockpy_for_testing,
     pass_tracker::LoweringPassTrackerInternalExt,
     passes::lower_try_jump_exception_flow,
@@ -17,40 +17,29 @@ fn tracked_name_binding_module(
         .clone()
 }
 
-fn module_constants_contain_string(exprs: &[InstrResolved]) -> bool {
+fn module_constants_contain_string(exprs: &[ConstantExpr]) -> bool {
     exprs.iter().any(|expr| {
         matches!(
             expr,
-            InstrResolved::Literal(literal)
+            ConstantExpr::Literal(literal)
                 if matches!(literal.as_literal(), Literal::StringLiteral(_))
         )
     })
 }
 
 fn lowered_string_values(source: &str) -> Vec<String> {
-    struct StringLiteralCollector {
-        values: Vec<String>,
-    }
-
-    impl Visit<InstrResolved> for StringLiteralCollector {
-        fn visit_instr(&mut self, expr: &InstrResolved) {
-            if let InstrResolved::Literal(literal) = expr {
-                if let Literal::StringLiteral(value) = literal.as_literal() {
-                    self.values.push(value.value.clone());
-                }
-            }
-            expr.visit_children(self);
-        }
-    }
-
     let module = lower_python_to_blockpy_for_testing(source)
         .expect("transform should succeed")
         .codegen_module;
-    let mut collector = StringLiteralCollector { values: Vec::new() };
+    let mut values = Vec::new();
     for constant in &module.module_constants {
-        collector.visit_instr(constant);
+        if let ConstantExpr::Literal(literal) = constant {
+            if let Literal::StringLiteral(value) = literal.as_literal() {
+                values.push(value.value.clone());
+            }
+        }
     }
-    collector.values
+    values
 }
 
 fn collect_helper_like_names_in_expr(out: &mut Vec<String>, expr: &InstrCodegen) {

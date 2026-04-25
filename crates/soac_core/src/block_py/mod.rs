@@ -1,3 +1,4 @@
+pub use self::constant_expr::ConstantExpr;
 pub use self::instr::{
     Await, BinOp, BinOpKind, Call, CallDirect, CalleeFunctionId, CellRef, CellRefForName, Del,
     DelItem, ExprAttribute, ExprBoolOp, ExprBooleanLiteral, ExprBytesLiteral, ExprCompare,
@@ -43,6 +44,7 @@ use ruff_python_ast::{self as ast};
 use std::fmt;
 use std::fmt::Write;
 
+mod constant_expr;
 mod counters;
 mod instr;
 mod instr_macro;

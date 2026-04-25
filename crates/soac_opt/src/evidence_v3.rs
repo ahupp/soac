@@ -2,9 +2,8 @@ use crate::operator_specialization::{ExactTypeTag, unpack_binary_shape};
 use crate::plan::FunctionProfileEvidence;
 use crate::planner_v3::PlannerFacts;
 use crate::region_v3::{ExtractedRegion, ExtractedValueId, ExtractedValueKind};
-use soac_core::block_py::NameLocation;
 use soac_core::block_py::literal::{Literal, NumberLiteralValue};
-use soac_lowering::passes::InstrResolved;
+use soac_core::block_py::{ConstantExpr, NameLocation};
 use std::collections::HashMap;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -49,7 +48,7 @@ pub fn planner_facts_from_profile_evidence_v3(
 
 pub fn planner_fact_hints_from_module_constants_v3(
     region: &ExtractedRegion,
-    module_constants: &[InstrResolved],
+    module_constants: &[ConstantExpr],
 ) -> PlannerFactHints {
     let mut hints = PlannerFactHints::default();
     for value in &region.values {
@@ -67,8 +66,8 @@ pub fn planner_fact_hints_from_module_constants_v3(
     hints
 }
 
-fn module_i64_constant(module_constants: &[InstrResolved], index: u32) -> Option<i64> {
-    let InstrResolved::Literal(literal) = module_constants.get(index as usize)? else {
+fn module_i64_constant(module_constants: &[ConstantExpr], index: u32) -> Option<i64> {
+    let ConstantExpr::Literal(literal) = module_constants.get(index as usize)? else {
         return None;
     };
     let Literal::NumberLiteral(number) = literal.as_literal() else {
@@ -195,8 +194,8 @@ mod tests {
         extract_block_region_v3(&block, RegionId(0)).unwrap()
     }
 
-    fn int_constant(value: i64) -> InstrResolved {
-        InstrResolved::Literal(LiteralValue::new(Literal::NumberLiteral(NumberLiteral {
+    fn int_constant(value: i64) -> ConstantExpr {
+        ConstantExpr::Literal(LiteralValue::new(Literal::NumberLiteral(NumberLiteral {
             value: NumberLiteralValue::Int(IntLiteral::from_i64(value)),
         })))
     }

@@ -8,12 +8,12 @@ use soac_config::ExecTraceConfig;
 use soac_core::block_py::IncrementCounter;
 use soac_core::block_py::{
     BlockPyFunction, BlockPyModule, BlockTerm, Call, CallArgPositional, ChildVisitable,
-    CounterScope, FunctionExecutionMode, HasSemanticInstrId, LiteralValue, Load, Meta, ModuleShape,
-    NameLocation, ResolvedName, RuntimeFunctionId, RuntimeName, StringLiteral, Tuple, Visit,
-    WithMeta,
+    ConstantExpr, CounterScope, FunctionExecutionMode, HasSemanticInstrId, LiteralValue, Load,
+    Meta, ModuleShape, NameLocation, ResolvedName, RuntimeFunctionId, RuntimeName, StringLiteral,
+    Tuple, Visit, WithMeta,
 };
 use soac_core::pass_tracker::PassTracker;
-use soac_lowering::passes::{CodegenModuleShape, InstrCodegen, InstrResolved};
+use soac_lowering::passes::{CodegenModuleShape, InstrCodegen};
 use std::collections::HashMap;
 
 fn functions_with_counter_instrumentation<P: ModuleShape>(
@@ -442,17 +442,16 @@ fn helper_call_expr(helper_name: &str, args: Vec<InstrCodegen>) -> InstrCodegen 
     .into()
 }
 
-fn string_literal_expr(module_constants: &mut Vec<InstrResolved>, value: &str) -> InstrCodegen {
+fn string_literal_expr(module_constants: &mut Vec<ConstantExpr>, value: &str) -> InstrCodegen {
     let meta = Meta::synthetic();
     let index = u32::try_from(module_constants.len())
         .expect("trace module constant count should fit in u32");
-    module_constants.push(
+    module_constants.push(ConstantExpr::Literal(
         LiteralValue::new(StringLiteral {
             value: value.to_string(),
         })
-        .with_meta(meta.clone())
-        .into(),
-    );
+        .with_meta(meta.clone()),
+    ));
     Load::new(ResolvedName {
         id: format!("__dp_constant_{index}").into(),
         location: NameLocation::Constant(index),
@@ -466,7 +465,7 @@ fn tuple_expr(values: Vec<InstrCodegen>) -> InstrCodegen {
 }
 
 fn param_pairs_expr(
-    module_constants: &mut Vec<InstrResolved>,
+    module_constants: &mut Vec<ConstantExpr>,
     locator: &PreparedTraceNameLocator,
     params: &[String],
 ) -> InstrCodegen {
