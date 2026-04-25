@@ -949,8 +949,8 @@ mod test {
         RefcountFact, RuntimeHelperId, ThrowSpec, ValueFacts, infer_module_value_facts,
     };
     use soac_core::block_py::{BlockTerm, ChildVisitable, HasSemanticInstrId, Visit};
+    use soac_ir_blockpy::InstrCodegen;
     use soac_lowering::lower_python_to_blockpy_for_testing;
-    use soac_lowering::passes::InstrCodegen;
 
     struct ReturnExprFinder {
         key: Option<soac_core::block_py::InstrKey>,

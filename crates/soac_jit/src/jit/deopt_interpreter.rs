@@ -17,7 +17,7 @@ use soac_core::block_py::{
     RuntimeName, UnaryOp, UnaryOpKind,
 };
 use soac_core::block_py::{BlockPyFunction, FunctionKind};
-use soac_lowering::passes::{CodegenModuleShape, InstrCodegen};
+use soac_ir_blockpy::{CodegenModuleShape, InstrCodegen};
 use std::ffi::{c_int, c_void};
 use std::ptr;
 use std::sync::Arc;

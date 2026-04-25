@@ -4,14 +4,14 @@ use soac_core::block_py::{
     RuntimeModuleId, VisitMut, walk_expr_mut, walk_module_mut,
 };
 use soac_core::pass_tracker::PassTracker;
-use soac_lowering::passes::{CodegenModuleShape, InstrCodegen};
+use soac_ir_blockpy::{CodegenModuleShape, InstrCodegen};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
 const CODEGEN_MODULE_CACHE_MAGIC: &[u8] = b"SOAC_BLOCKPY_CODEGEN_CACHE\0";
-const CODEGEN_MODULE_CACHE_FORMAT_VERSION: u32 = 5;
+const CODEGEN_MODULE_CACHE_FORMAT_VERSION: u32 = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum PythonModuleCacheSource {
@@ -605,8 +605,8 @@ mod test {
         BlockPyModule, ChildVisitable, HasSemanticInstrId, ModuleNameGen, RuntimeFunctionId, Visit,
         walk_block, walk_expr,
     };
+    use soac_ir_blockpy::{CodegenModuleShape, InstrCodegen};
     use soac_lowering::lower_python_to_blockpy_for_testing;
-    use soac_lowering::passes::{CodegenModuleShape, InstrCodegen};
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 

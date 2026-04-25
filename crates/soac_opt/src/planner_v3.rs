@@ -1603,7 +1603,7 @@ mod tests {
         ParamSpec, SerializedFunctionId, SerializedIdentityTables, SerializedModuleId,
         SerializedModuleIdentity, Store, TermIf, WithMeta,
     };
-    use soac_lowering::passes::{CodegenModuleShape, InstrCodegen};
+    use soac_ir_blockpy::{CodegenModuleShape, InstrCodegen};
 
     fn label(index: usize) -> BlockLabel {
         BlockLabel::from_index(index)

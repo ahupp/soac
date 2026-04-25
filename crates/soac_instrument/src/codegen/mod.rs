@@ -13,7 +13,7 @@ use soac_core::block_py::{
     Tuple, Visit, WithMeta,
 };
 use soac_core::pass_tracker::PassTracker;
-use soac_lowering::passes::{CodegenModuleShape, InstrCodegen};
+use soac_ir_blockpy::{CodegenModuleShape, InstrCodegen};
 use std::collections::HashMap;
 
 fn functions_with_counter_instrumentation<P: ModuleShape>(

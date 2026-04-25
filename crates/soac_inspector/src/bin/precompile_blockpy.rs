@@ -6,11 +6,11 @@ use soac_driver::codegen_cache::{
     hash_module_source, load_codegen_module_cache, module_optimization_plan_v3_path,
     remap_cached_codegen_module_function_ids, validate_codegen_module_cache_metadata,
 };
+use soac_ir_blockpy::CodegenModuleShape;
 use soac_jit::{
     PrecompileModuleIndex, PrecompileModuleIndexEntry, PrecompileOptimizationPlanInput,
     precompile_codegen_module_to_object_file,
 };
-use soac_lowering::passes::CodegenModuleShape;
 use std::collections::HashSet;
 use std::env;
 use std::ffi::{OsStr, OsString};

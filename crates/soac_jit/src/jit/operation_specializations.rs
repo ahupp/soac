@@ -4,7 +4,7 @@ use cranelift_codegen::ir;
 use cranelift_codegen::ir::InstBuilder;
 use pyo3::ffi;
 use soac_core::block_py::{CounterId, GetItem, HasSemanticInstrId, Instr, SetItem};
-use soac_lowering::passes::InstrCodegen;
+use soac_ir_blockpy::InstrCodegen;
 use soac_opt::passes::TypedExactListItemAccessPlan;
 use soac_opt::plan_v3::{EXACT_LIST_EXACT_INT_ITEM_SHAPE_TAG, ExactListItemAccessKind};
 use std::mem::offset_of;

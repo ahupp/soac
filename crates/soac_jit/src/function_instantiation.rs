@@ -10,7 +10,7 @@ use pyo3::types::{PyAny, PyDict, PyFunction, PyModule, PyString, PyTuple};
 use soac_core::block_py::{
     BlockPyFunction, FunctionExecutionMode, FunctionKind, ParamKind, RuntimeFunctionId,
 };
-use soac_lowering::passes::CodegenModuleShape;
+use soac_ir_blockpy::CodegenModuleShape;
 use std::ffi::{CString, c_void};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;

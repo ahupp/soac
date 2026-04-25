@@ -2,13 +2,14 @@ use soac_core::block_py::{
     BlockArg, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, InstrLocationMap,
     LocalLocation, RuntimeFunctionId, current_instr_locations,
 };
+use soac_ir_blockpy::CodegenModuleShape;
 pub use soac_opt::passes::{
     BlockParamFacts, FunctionLocalPlan, LocalRefKind, ParamBindingFacts, ParamProvenance,
     PlannedLocalBinding, PlannedLocalStorage, render_planned_local_binding,
 };
 use soac_opt::passes::{
-    CodegenModuleShape, FactStore, FunctionLocalEnvResumePlan, FunctionRefcountPlan,
-    LocalEnvModulePlan, LocalEnvResumeEntry, LocalEnvResumeModulePlan, LocalEnvResumePoint,
+    FactStore, FunctionLocalEnvResumePlan, FunctionRefcountPlan, LocalEnvModulePlan,
+    LocalEnvResumeEntry, LocalEnvResumeModulePlan, LocalEnvResumePoint,
     LocalEnvResumeStatePrecision, RefcountActionKind, RefcountPlan, RefcountReleaseReason,
     TypedBlock, TypedCodegenModuleShape, annotate_typed_module_value_facts,
     compute_typed_function_local_live_ins, compute_typed_function_local_must_bound_ins,

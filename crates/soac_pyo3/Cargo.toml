@@ -14,6 +14,7 @@ soac_lowering = { path = "../soac_lowering" }
 soac_driver = { path = "../soac_driver" }
 soac_config = { path = "../soac_config" }
 soac_core = { path = "../soac_core" }
+soac_ir_blockpy = { path = "../soac_ir_blockpy" }
 soac_opt = { path = "../soac_opt" }
 soac_jit = { path = "../soac_jit" }
 pyo3 = { workspace = true, features = ["extension-module"] }

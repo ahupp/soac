@@ -4,7 +4,7 @@ use crate::block_py::{
 };
 
 pub(crate) fn validate_codegen_module(
-    module: &BlockPyModule<crate::passes::CodegenModuleShape>,
+    module: &BlockPyModule<soac_ir_blockpy::CodegenModuleShape>,
 ) -> Result<(), String> {
     validate_module(module)
 }

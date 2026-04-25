@@ -2,7 +2,8 @@ use crate::block_py::{
     BlockPyFunction, BlockPyModule, ConstantExpr, HasMeta, InstrCodegen, InstrResolved,
     LiteralValue, Load, MapFunction, MapInstr, Mappable, NameLocation, ResolvedName, WithMeta,
 };
-use crate::passes::{CodegenModuleShape, ResolvedStorageModuleShape};
+use crate::passes::ResolvedStorageModuleShape;
+use soac_ir_blockpy::CodegenModuleShape;
 use soac_macros::match_default;
 
 pub(crate) fn hoist_module_constants(

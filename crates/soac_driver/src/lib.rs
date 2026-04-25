@@ -15,7 +15,7 @@ use soac_instrument::{
     ExplicitCounterPlacement, InstrumentationConfig, define_typed_module_counter_defs,
     instrument_codegen_module_with_tracker,
 };
-use soac_lowering::passes::CodegenModuleShape;
+use soac_ir_blockpy::CodegenModuleShape;
 pub use soac_lowering::{LoweringError, Result};
 use soac_opt::artifacts_v3::write_optimization_artifacts_v3;
 use soac_opt::passes as opt_passes;
@@ -167,7 +167,7 @@ fn finish_pre_optimization_module(
     env_config: &SoacEnvConfig,
 ) -> soac_lowering::Result<BlockPyModule<CodegenModuleShape>> {
     pass_tracker.record_timing("validate_codegen_instr_ids", || {
-        soac_lowering::validate_codegen_instr_ids(&bb_codegen).map_err(anyhow::Error::msg)
+        soac_ir_blockpy::validate_codegen_instr_ids(&bb_codegen).map_err(anyhow::Error::msg)
     })?;
 
     let instrumentation_config = InstrumentationConfig::from_env_config(env_config);
@@ -329,7 +329,7 @@ mod tests {
         ChildVisitable, CounterScope, CounterSite, FunctionExecutionMode, ModuleNameGen, Visit,
     };
     use soac_core::pass_tracker::RecordingPassTracker;
-    use soac_lowering::passes::InstrCodegen;
+    use soac_ir_blockpy::InstrCodegen;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 

@@ -161,7 +161,7 @@ mod test {
         module_optimization_plan_v3_path, pre_optimization_module_cache_metadata,
     };
     use soac_driver::{CodegenPreparationOptions, prepare_codegen_module};
-    use soac_lowering::passes::{CodegenModuleShape, InstrCodegen};
+    use soac_ir_blockpy::{CodegenModuleShape, InstrCodegen};
     use soac_opt::artifacts_v3::load_optimization_artifacts_v3;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};

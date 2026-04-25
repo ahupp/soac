@@ -14,8 +14,8 @@ use soac_core::block_py::{
     FunctionExecutionMode, NameLike, NameLocation, RuntimeFunctionId, Visit,
 };
 use soac_core::pass_tracker::NoopPassTracker;
+use soac_ir_blockpy::{CodegenModuleShape, InstrCodegen};
 use soac_lowering::lower_python_to_blockpy_for_testing;
-use soac_lowering::passes::{CodegenModuleShape, InstrCodegen};
 use std::collections::HashSet;
 
 fn trace_enter_calls(function: &BlockPyFunction<CodegenModuleShape>) -> Vec<&Call<InstrCodegen>> {

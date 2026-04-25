@@ -7,7 +7,7 @@ use crate::block_py::{
 };
 use crate::lower_python_to_blockpy_for_testing;
 use crate::pass_tracker::LoweringPassTrackerInternalExt;
-use crate::passes::CodegenModuleShape;
+use soac_ir_blockpy::CodegenModuleShape;
 
 fn tracked_name_binding_module(
     source: &str,
@@ -25,7 +25,7 @@ fn tracked_codegen_module(source: &str) -> crate::block_py::BlockPyModule<Codege
     let lowered = lower_try_jump_exception_flow(&name_binding);
     let mut codegen = crate::passes::blockpy_to_bb::strings::hoist_module_constants(&lowered);
     crate::block_py::cfg::relabel_dense_bb_module(&mut codegen);
-    crate::passes::instr_id::assign_module_instr_ids(codegen)
+    soac_ir_blockpy::assign_codegen_module_instr_ids(codegen)
 }
 
 fn is_return_of_number_constant(term: &BlockTerm<InstrResolved>) -> bool {

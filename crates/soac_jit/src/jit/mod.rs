@@ -43,6 +43,7 @@ use soac_core::profile::{
     CollectedTypeKeyLayout, CounterDumpTypeKey, read_block_entry_counts_from_file,
 };
 use soac_instrument::{InstrumentationConfig, instrument_typed_module};
+use soac_ir_blockpy::{CodegenModuleShape, InstrCodegen};
 use soac_opt::access_emission_v3::{
     ExactListItemAccessPlan as OptV3ExactListItemAccessPlan,
     IndexedFieldAccessPlan as OptV3IndexedFieldAccessPlan,
@@ -76,21 +77,20 @@ use soac_opt::emit_v3::{
     mechanical_region_function_param_inputs as opt_v3_mechanical_region_function_param_inputs,
 };
 use soac_opt::passes::{
-    CodegenModuleShape, FactStore, FunctionRefcountPlan, InstrCodegen, InstrTyped,
-    LocalEnvResumeBinding, LocalEnvResumeBindingState, LocalEnvResumePoint,
-    LocalEnvResumeStatePrecision, LocalEnvResumeValueSource, LocalRefState, PyExactType,
-    PyObjFacts, RefcountActionKind, RefcountReleaseReason, RefcountSite, RuntimeHelperId,
-    TypedAttrAccessPlan, TypedAttrOwnerRef, TypedBlock, TypedBlockLayoutHint, TypedCall,
-    TypedCallAccessPlan, TypedCallEmissionPlans, TypedCodegenModuleShape, TypedDirectCallArgPlan,
-    TypedDirectCallArgSource, TypedDirectCallGuardTest, TypedDirectCallGuardTestKind,
-    TypedDirectCallableCall, TypedDirectCallableCallGuard, TypedDirectConstructorCallGuard,
-    TypedDirectFunctionCallGuard, TypedDirectMethodCall, TypedDirectMethodCallGuard,
-    TypedExactIntBranchPlan, TypedExactIntPlanSource, TypedExactIntReturnPlan,
-    TypedExactIntScalarThreadPlan, TypedExactListItemAccessPlan, TypedExactListItemPlanSource,
-    TypedGetAttr, TypedGuardedCallableCall, TypedGuardedMethodCall, TypedIndexedFieldGuard,
-    TypedIndexedFieldPlanSource, TypedIndexedGlobalAccessPlan, TypedIndexedGlobalPlanSource,
-    TypedPlannedResult, TypedPyObjectOwnershipPlan, TypedSetAttr, ValueFacts,
-    annotate_typed_function_planned_results, annotate_typed_function_result_demands,
+    FactStore, FunctionRefcountPlan, InstrTyped, LocalEnvResumeBinding, LocalEnvResumeBindingState,
+    LocalEnvResumePoint, LocalEnvResumeStatePrecision, LocalEnvResumeValueSource, LocalRefState,
+    PyExactType, PyObjFacts, RefcountActionKind, RefcountReleaseReason, RefcountSite,
+    RuntimeHelperId, TypedAttrAccessPlan, TypedAttrOwnerRef, TypedBlock, TypedBlockLayoutHint,
+    TypedCall, TypedCallAccessPlan, TypedCallEmissionPlans, TypedCodegenModuleShape,
+    TypedDirectCallArgPlan, TypedDirectCallArgSource, TypedDirectCallGuardTest,
+    TypedDirectCallGuardTestKind, TypedDirectCallableCall, TypedDirectCallableCallGuard,
+    TypedDirectConstructorCallGuard, TypedDirectFunctionCallGuard, TypedDirectMethodCall,
+    TypedDirectMethodCallGuard, TypedExactIntBranchPlan, TypedExactIntPlanSource,
+    TypedExactIntReturnPlan, TypedExactIntScalarThreadPlan, TypedExactListItemAccessPlan,
+    TypedExactListItemPlanSource, TypedGetAttr, TypedGuardedCallableCall, TypedGuardedMethodCall,
+    TypedIndexedFieldGuard, TypedIndexedFieldPlanSource, TypedIndexedGlobalAccessPlan,
+    TypedIndexedGlobalPlanSource, TypedPlannedResult, TypedPyObjectOwnershipPlan, TypedSetAttr,
+    ValueFacts, annotate_typed_function_planned_results, annotate_typed_function_result_demands,
     annotate_typed_function_value_facts, annotate_typed_module_value_facts,
     assign_missing_typed_function_instr_ids, infer_module_value_facts,
     inline_typed_function_direct_call_stores, lower_codegen_function_to_typed,

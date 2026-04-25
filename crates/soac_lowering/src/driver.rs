@@ -8,14 +8,15 @@ use crate::passes::ast_to_ast::{
 use crate::passes::core_await_lower::lower_awaits_in_core_blockpy_module;
 use crate::passes::ruff_to_blockpy::rewrite_ast_to_core_blockpy_module_with_module;
 use crate::passes::{
-    CodegenModuleShape, CoreModuleShape, CoreModuleShapeWithAwaitAndYield,
-    CoreModuleShapeWithYield, ResolvedStorageModuleShape,
+    CoreModuleShape, CoreModuleShapeWithAwaitAndYield, CoreModuleShapeWithYield,
+    ResolvedStorageModuleShape,
 };
 use anyhow::Error as AnyhowError;
 use ruff_python_ast::{self as ast, Stmt};
 use ruff_python_parser::{parse_module, ParseError};
 use soac_core::block_py::{BlockPyModule, ModuleNameGen, PrettyPrint, PrettyPrinter};
 use soac_core::pass_tracker::{PassTracker, RecordingPassTracker};
+use soac_ir_blockpy::CodegenModuleShape;
 use std::time::{Duration, Instant};
 
 #[derive(Debug)]
@@ -294,7 +295,7 @@ pub fn lower_source_to_codegen_module_with_tracker(
         let mut bb_codegen: BlockPyModule<CodegenModuleShape> =
             crate::passes::blockpy_to_bb::strings::hoist_module_constants(&bb_prepared);
         crate::block_py::cfg::relabel_dense_bb_module(&mut bb_codegen);
-        crate::passes::instr_id::assign_module_instr_ids(bb_codegen)
+        soac_ir_blockpy::assign_codegen_module_instr_ids(bb_codegen)
     });
     pass_tracker.record_timing("validate", || {
         crate::block_py::validate::validate_codegen_module(&bb_codegen).map_err(anyhow::Error::msg)

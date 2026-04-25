@@ -3,7 +3,7 @@ use soac_core::block_py::{
     BinOpKind, Block, BlockLabel, BlockPyFunction, BlockTerm, HasSemanticInstrId, InstrId, Load,
     ResolvedName, TermIf, UnaryOpKind,
 };
-use soac_lowering::passes::{CodegenModuleShape, InstrCodegen};
+use soac_ir_blockpy::{CodegenModuleShape, InstrCodegen};
 use std::fmt;
 
 #[derive(Clone, Debug, PartialEq, Eq)]

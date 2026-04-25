@@ -10,7 +10,7 @@ use soac_core::block_py::{
     BlockArg, BlockLabel, BlockPyFunction, BlockTerm, ChildVisitable, InstrId, LocalLocation,
     NameLike, ResolvedName, Visit,
 };
-use soac_lowering::passes::{CodegenModuleShape, InstrCodegen};
+use soac_ir_blockpy::{CodegenModuleShape, InstrCodegen};
 use std::collections::HashMap;
 
 #[derive(Clone, Copy)]

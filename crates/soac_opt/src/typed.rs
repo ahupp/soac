@@ -20,7 +20,9 @@ use soac_core::block_py::{
 };
 use soac_core::block_py::{ConstantExpr, IncrementCounter};
 #[allow(unused_imports)]
-use soac_lowering::passes::{CodegenModuleShape, InstrCodegen, InstrResolved};
+use soac_ir_blockpy::{CodegenModuleShape, InstrCodegen};
+#[allow(unused_imports)]
+use soac_lowering::passes::InstrResolved;
 use soac_macros::{DelegateMatchDefault, enum_broadcast};
 use std::collections::{HashMap, HashSet};
 

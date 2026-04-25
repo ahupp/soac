@@ -6,13 +6,13 @@ mod scope_impls;
 pub(crate) mod validate;
 
 pub(crate) use crate::passes::{
-    InstrCodegen, InstrLow, InstrResolved, InstrRuff, InstrUnresolved, InstrWithAwaitAndYield,
-    InstrWithYield,
+    InstrLow, InstrResolved, InstrRuff, InstrUnresolved, InstrWithAwaitAndYield, InstrWithYield,
 };
 pub(crate) use scope_impls::{
     build_storage_layout_from_capture_names, compute_make_function_capture_bindings_from_scope,
     compute_storage_layout_from_scope, is_runtime_closure_name, ScopeExprNode,
 };
+pub(crate) use soac_ir_blockpy::InstrCodegen;
 #[cfg(test)]
 pub(crate) use validate::validate_module;
 

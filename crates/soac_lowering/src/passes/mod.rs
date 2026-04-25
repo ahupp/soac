@@ -6,24 +6,23 @@ pub(crate) mod blockpy_generators;
 pub(crate) mod blockpy_to_bb;
 pub(crate) mod core_await_lower;
 pub(crate) mod global_index;
-pub(crate) mod instr_id;
 pub(crate) mod name_binding;
 pub(crate) mod ruff_to_blockpy;
 
 use crate::block_py::{
     runtime_name_load, Await, BinOp, Call, CallArgKeyword, CallArgPositional, CellRef,
-    CellRefForName, ChildVisitable, ConstantExpr, Del, DelItem, ExprAttribute, ExprBoolOp,
-    ExprBooleanLiteral, ExprBytesLiteral, ExprCompare, ExprDict, ExprDictComp, ExprEllipsisLiteral,
-    ExprFString, ExprGenerator, ExprIf, ExprIpyEscapeCommand, ExprLambda, ExprList, ExprListComp,
-    ExprName, ExprNamed, ExprNoneLiteral, ExprNumberLiteral, ExprSet, ExprSetComp, ExprSlice,
-    ExprStarred, ExprStringLiteral, ExprSubscript, ExprTString, ExprTuple, GetAttr, GetItem,
-    HasMeta, IncrementCounter, Instr, InstrWithConstantNone, LiteralValue, Load, MakeCell,
-    MakeFunction, MakeFunctionWithClosure, MapInstr, Mappable, Meta, ModuleShape, NameLike,
-    ResolvedName, SetAttr, SetItem, StmtAnnAssign, StmtAssert, StmtAssign, StmtAugAssign,
-    StmtBreak, StmtClassDef, StmtContinue, StmtDelete, StmtExpr, StmtFor, StmtFunctionDef,
-    StmtGlobal, StmtIf, StmtImport, StmtImportFrom, StmtIpyEscapeCommand, StmtMatch, StmtNonlocal,
-    StmtPass, StmtRaise, StmtReturn, StmtTry, StmtTypeAlias, StmtWhile, StmtWith, Store,
-    TryMapInstr, Tuple, UnaryOp, UnresolvedName, WithMeta, Yield, YieldFrom,
+    CellRefForName, ChildVisitable, Del, DelItem, ExprAttribute, ExprBoolOp, ExprBooleanLiteral,
+    ExprBytesLiteral, ExprCompare, ExprDict, ExprDictComp, ExprEllipsisLiteral, ExprFString,
+    ExprGenerator, ExprIf, ExprIpyEscapeCommand, ExprLambda, ExprList, ExprListComp, ExprName,
+    ExprNamed, ExprNoneLiteral, ExprNumberLiteral, ExprSet, ExprSetComp, ExprSlice, ExprStarred,
+    ExprStringLiteral, ExprSubscript, ExprTString, ExprTuple, GetAttr, GetItem, HasMeta, Instr,
+    InstrWithConstantNone, LiteralValue, Load, MakeCell, MakeFunction, MakeFunctionWithClosure,
+    MapInstr, Mappable, Meta, ModuleShape, NameLike, ResolvedName, SetAttr, SetItem, StmtAnnAssign,
+    StmtAssert, StmtAssign, StmtAugAssign, StmtBreak, StmtClassDef, StmtContinue, StmtDelete,
+    StmtExpr, StmtFor, StmtFunctionDef, StmtGlobal, StmtIf, StmtImport, StmtImportFrom,
+    StmtIpyEscapeCommand, StmtMatch, StmtNonlocal, StmtPass, StmtRaise, StmtReturn, StmtTry,
+    StmtTypeAlias, StmtWhile, StmtWith, Store, TryMapInstr, Tuple, UnaryOp, UnresolvedName,
+    WithMeta, Yield, YieldFrom,
 };
 use ruff_python_ast::{self as ast};
 use soac_macros::{enum_broadcast, DelegateMatchDefault};
@@ -337,62 +336,6 @@ pub(crate) struct ResolvedStorageModuleShape;
 impl ModuleShape for ResolvedStorageModuleShape {
     type Instr = InstrResolved;
     type ModuleConstant = InstrResolved;
-    type BlockExtra = ();
-}
-
-/// Final lowered BlockPy form consumed by optimization, instrumentation, and JIT.
-///
-/// Compared with `InstrResolved`, module constants have been hoisted into the
-/// module constant table and codegen-facing operations such as explicit counter
-/// increments can appear. Instruction IDs are assigned on this shape before
-/// validation returns the module to the driver.
-#[derive(Clone, derive_more::From, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-#[rkyv(serialize_bounds(
-    __S: rkyv::ser::Writer + rkyv::ser::Allocator,
-    __S::Error: rkyv::rancor::Source,
-))]
-#[rkyv(deserialize_bounds(__D::Error: rkyv::rancor::Source))]
-#[rkyv(bytecheck(bounds(
-    __C: rkyv::validation::ArchiveContext,
-)))]
-#[enum_broadcast(HasMeta, WithMeta, ChildVisitable, Mappable, PrettyPrint, Debug)]
-pub enum InstrCodegen {
-    BinOp(#[rkyv(omit_bounds)] BinOp<Self>),
-    UnaryOp(#[rkyv(omit_bounds)] UnaryOp<Self>),
-    Tuple(#[rkyv(omit_bounds)] Tuple<Self>),
-    Call(#[rkyv(omit_bounds)] Call<Self>),
-    GetAttr(#[rkyv(omit_bounds)] GetAttr<Self>),
-    SetAttr(#[rkyv(omit_bounds)] SetAttr<Self>),
-    GetItem(#[rkyv(omit_bounds)] GetItem<Self>),
-    SetItem(#[rkyv(omit_bounds)] SetItem<Self>),
-    DelItem(#[rkyv(omit_bounds)] DelItem<Self>),
-    Load(#[rkyv(omit_bounds)] Load<Self>),
-    Store(#[rkyv(omit_bounds)] Store<Self>),
-    Del(#[rkyv(omit_bounds)] Del<Self>),
-    MakeCell(#[rkyv(omit_bounds)] MakeCell<Self>),
-    IncrementCounter(IncrementCounter),
-    CellRef(CellRef),
-    MakeFunctionWithClosure(#[rkyv(omit_bounds)] MakeFunctionWithClosure<Self>),
-}
-
-impl Instr for InstrCodegen {
-    type Name = ResolvedName;
-    type Extra = ();
-}
-
-impl InstrWithConstantNone for InstrCodegen {
-    fn constant_none() -> Self {
-        runtime_name_load("NONE")
-    }
-}
-
-/// Module shape for final codegen-ready BlockPy.
-#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-pub struct CodegenModuleShape;
-
-impl ModuleShape for CodegenModuleShape {
-    type Instr = InstrCodegen;
-    type ModuleConstant = ConstantExpr;
     type BlockExtra = ();
 }
 

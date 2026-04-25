@@ -1675,7 +1675,7 @@ mod tests {
         CounterDumpKeyLayout, CounterDumpRecord, CounterDumpTypeKey, CounterDumpTypeKeyLayout,
         CounterDumpTypeTableEntry,
     };
-    use soac_lowering::passes::InstrCodegen;
+    use soac_ir_blockpy::InstrCodegen;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 

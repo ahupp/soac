@@ -12,7 +12,7 @@ use pyo3::ffi;
 use soac_core::block_py::{
     HasSemanticInstrId, Instr, InstrId, NameLike, NameLocation, ResolvedName,
 };
-use soac_lowering::passes::InstrCodegen;
+use soac_ir_blockpy::InstrCodegen;
 use soac_opt::operator_specialization::{BINARY_RHS_TAG_SHIFT, ExactTypeTag};
 use soac_opt::passes::{InstrTyped, PyObjFacts};
 use std::mem::offset_of;

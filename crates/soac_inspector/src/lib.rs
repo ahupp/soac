@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use soac_config::SoacEnvConfig;
 use soac_core::block_py::{BlockPyFunction, BlockPyModule, ModuleNameGen, RuntimeFunctionId};
 use soac_core::pass_tracker::RecordingPassTracker;
+use soac_ir_blockpy::CodegenModuleShape;
 use soac_jit::module_constants::ModuleCodegenConstants;
 use soac_jit::module_type::{
     build_shared_state_for_inspection_with_placeholder_constants_and_source_hash,
@@ -21,7 +22,6 @@ use soac_jit::{
     render_instr_typed_for_codegen_with_runtime_state, render_jit_deopt_resume_module,
     render_jit_function_locals, render_jit_module_locals,
 };
-use soac_lowering::passes::CodegenModuleShape;
 use soac_opt::passes::{
     infer_module_value_facts, plan_local_env_module, plan_local_env_resume_module,
     render_local_env_function_plan, render_local_env_module_plan,

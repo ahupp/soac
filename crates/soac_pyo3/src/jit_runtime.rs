@@ -9,8 +9,8 @@ use soac_core::block_py::{
 use soac_core::pass_tracker::RecordingPassTracker;
 use soac_driver::codegen_cache::{PythonModuleCacheSource, hash_module_source};
 use soac_driver::{CodegenPreparationOptions, PreOptimizationCacheRequest, prepare_codegen_module};
+use soac_ir_blockpy::CodegenModuleShape;
 use soac_jit::module_type::{ModuleInfo, SoacExtModule};
-use soac_lowering::passes::CodegenModuleShape;
 use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::fs;

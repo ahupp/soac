@@ -20,10 +20,6 @@ pub use crate::driver::{
     lower_source_to_codegen_module_with_tracker, LoweringError, LoweringOptions, LoweringResult,
     Result,
 };
-pub use crate::passes::instr_id::{
-    assign_missing_codegen_function_instr_ids, reassign_codegen_function_instr_ids,
-    reassign_codegen_module_instr_ids, validate_codegen_instr_ids,
-};
 
 #[cfg(test)]
 mod test;
