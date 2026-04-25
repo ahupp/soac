@@ -64,6 +64,111 @@ pub(super) fn push_symbol_component_hex(out: &mut String, component: &str) {
     }
 }
 
+pub(super) const JIT_PYTHON_PERF_SYMBOL_KIND_DIRECT: &str = "d";
+pub(super) const SOAC_RUNTIME_INCREF_SYMBOL: &str = "soac_runtime_incref";
+pub(super) const SOAC_RUNTIME_DECREF_SYMBOL: &str = "soac_runtime_decref";
+pub(super) const SOAC_RUNTIME_INCREF_APPLIED_SYMBOL: &str = "soac_runtime_incref_applied";
+pub(super) const SOAC_RUNTIME_DECREF_APPLIED_SYMBOL: &str = "soac_runtime_decref_applied";
+pub(super) const SOAC_RUNTIME_SET_RAISED_EXCEPTION_SYMBOL: &str =
+    "soac_runtime_set_raised_exception";
+pub(super) const SOAC_RUNTIME_LOAD_GLOBAL_SYMBOL: &str = "soac_runtime_load_global";
+pub(super) const SOAC_RUNTIME_PROBE_GLOBAL_INDEXED_SYMBOL: &str =
+    "soac_runtime_probe_global_indexed";
+pub(super) const SOAC_RUNTIME_STORE_GLOBAL_SYMBOL: &str = "soac_runtime_store_global";
+pub(super) const SOAC_RUNTIME_STORE_GLOBAL_INDEXED_SYMBOL: &str =
+    "soac_runtime_store_global_indexed";
+pub(super) const SOAC_RUNTIME_PROBE_FIELD_INDEXED_SYMBOL: &str = "soac_runtime_probe_field_indexed";
+pub(super) const SOAC_RUNTIME_STORE_FIELD_INDEXED_SYMBOL: &str = "soac_runtime_store_field_indexed";
+pub(super) const SOAC_RUNTIME_TUPLE_NEW_SYMBOL: &str = "soac_runtime_tuple_new";
+pub(super) const SOAC_RUNTIME_TUPLE_SET_ITEM_STOLEN_SYMBOL: &str =
+    "soac_runtime_tuple_set_item_stolen";
+#[cfg(test)]
+pub(super) const SOAC_RUNTIME_PYLONG_AS_I64_SYMBOL: &str = "soac_runtime_pylong_as_i64";
+pub(super) const SOAC_RUNTIME_PYLONG_AS_I64_SATURATING_SYMBOL: &str =
+    "soac_runtime_pylong_as_i64_saturating";
+
+pub(super) fn jit_python_perf_symbol_name(kind: &str, qualname: &str) -> String {
+    format!("py:{kind}:{qualname}")
+}
+
+pub(super) fn direct_function_symbol(
+    function: &BlockPyFunction<impl ModuleShape>,
+    symbol_scope: Option<&str>,
+) -> String {
+    let base =
+        jit_python_perf_symbol_name(JIT_PYTHON_PERF_SYMBOL_KIND_DIRECT, &function.names.qualname);
+    scoped_jit_symbol(&base, symbol_scope)
+}
+
+pub(super) fn default_direct_function_symbol(
+    function: &BlockPyFunction<impl ModuleShape>,
+    symbol_scope: Option<&str>,
+) -> String {
+    let base = format!(
+        "{}:defaults",
+        jit_python_perf_symbol_name(JIT_PYTHON_PERF_SYMBOL_KIND_DIRECT, &function.names.qualname)
+    );
+    scoped_jit_symbol(&base, symbol_scope)
+}
+
+pub(super) fn direct_function_symbol_scope(
+    function_id: RuntimeFunctionId,
+    symbol_id: u64,
+) -> String {
+    format!("fn_{}_{}", function_id.to_packed_runtime_u64(), symbol_id)
+}
+
+pub(super) fn direct_function_backend_name(
+    function: &BlockPyFunction<impl ModuleShape>,
+    shared_state: Option<&SharedModuleState>,
+) -> String {
+    let mut name = String::from("direct:");
+    match shared_state {
+        Some(shared_state) => push_direct_function_module_identity(
+            &mut name,
+            shared_state.module_name.as_str(),
+            shared_state.source_hash(),
+        ),
+        None => {
+            name.push_str("module_id:");
+            name.push_str(
+                function
+                    .function_id
+                    .runtime_module_id()
+                    .as_u32()
+                    .to_string()
+                    .as_str(),
+            );
+        }
+    }
+    name.push(':');
+    name.push_str(function.names.qualname.as_str());
+    name.push(':');
+    name.push_str(function.params.len().to_string().as_str());
+    name
+}
+
+pub(super) fn push_direct_function_module_identity(
+    out: &mut String,
+    module_name: &str,
+    source_hash: u64,
+) {
+    push_symbol_component_hex(out, module_name);
+    out.push(':');
+    out.push_str(format!("{source_hash:016x}").as_str());
+}
+
+pub(super) fn scoped_jit_symbol(base: &str, symbol_scope: Option<&str>) -> String {
+    match symbol_scope {
+        Some(scope) => format!("{base}:{scope}"),
+        None => base.to_string(),
+    }
+}
+
+pub(super) fn is_clif_ident_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
 pub(super) fn reloc_type_ref_symbol_name(type_ref: &RelocTypeRef) -> Cow<'static, str> {
     match type_ref {
         RelocTypeRef::CpythonTypeSymbol(symbol) => Cow::Borrowed(cpython_type_symbol_name(*symbol)),

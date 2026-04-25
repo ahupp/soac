@@ -244,10 +244,21 @@ use runtime_support::{
 pub use specialized_helpers::ObjPtr;
 use specialized_helpers::register_specialized_jit_symbols;
 use symbols::{
-    cpython_type_symbol_from_name, cpython_type_symbol_name, lookup_registered_jit_data_symbol,
-    push_symbol_component_hex, py_dealloc_symbol, register_jit_data_symbol,
-    reloc_callable_ref_symbol_name, reloc_type_ref_symbol_name, type_key_runtime_registry,
+    SOAC_RUNTIME_DECREF_APPLIED_SYMBOL, SOAC_RUNTIME_DECREF_SYMBOL,
+    SOAC_RUNTIME_INCREF_APPLIED_SYMBOL, SOAC_RUNTIME_INCREF_SYMBOL,
+    SOAC_RUNTIME_LOAD_GLOBAL_SYMBOL, SOAC_RUNTIME_PROBE_FIELD_INDEXED_SYMBOL,
+    SOAC_RUNTIME_PROBE_GLOBAL_INDEXED_SYMBOL, SOAC_RUNTIME_PYLONG_AS_I64_SATURATING_SYMBOL,
+    SOAC_RUNTIME_SET_RAISED_EXCEPTION_SYMBOL, SOAC_RUNTIME_STORE_FIELD_INDEXED_SYMBOL,
+    SOAC_RUNTIME_STORE_GLOBAL_INDEXED_SYMBOL, SOAC_RUNTIME_STORE_GLOBAL_SYMBOL,
+    SOAC_RUNTIME_TUPLE_NEW_SYMBOL, SOAC_RUNTIME_TUPLE_SET_ITEM_STOLEN_SYMBOL,
+    cpython_type_symbol_from_name, cpython_type_symbol_name, default_direct_function_symbol,
+    direct_function_backend_name, direct_function_symbol, direct_function_symbol_scope,
+    is_clif_ident_byte, lookup_registered_jit_data_symbol, push_symbol_component_hex,
+    py_dealloc_symbol, register_jit_data_symbol, reloc_callable_ref_symbol_name,
+    reloc_type_ref_symbol_name, scoped_jit_symbol, type_key_runtime_registry,
 };
+#[cfg(test)]
+use symbols::{SOAC_RUNTIME_PYLONG_AS_I64_SYMBOL, push_direct_function_module_identity};
 pub(crate) use typed_pipeline::JitModulePlan;
 use typed_pipeline::{
     apply_profile_call_emission_plans_to_typed_function, build_jit_module_plan,
@@ -19359,66 +19370,6 @@ fn make_direct_function_signature(
     sig
 }
 
-fn direct_function_symbol(
-    function: &BlockPyFunction<impl ModuleShape>,
-    symbol_scope: Option<&str>,
-) -> String {
-    let base =
-        jit_python_perf_symbol_name(JIT_PYTHON_PERF_SYMBOL_KIND_DIRECT, &function.names.qualname);
-    scoped_jit_symbol(&base, symbol_scope)
-}
-
-fn default_direct_function_symbol(
-    function: &BlockPyFunction<impl ModuleShape>,
-    symbol_scope: Option<&str>,
-) -> String {
-    let base = format!(
-        "{}:defaults",
-        jit_python_perf_symbol_name(JIT_PYTHON_PERF_SYMBOL_KIND_DIRECT, &function.names.qualname)
-    );
-    scoped_jit_symbol(&base, symbol_scope)
-}
-
-fn direct_function_symbol_scope(function_id: RuntimeFunctionId, symbol_id: u64) -> String {
-    format!("fn_{}_{}", function_id.to_packed_runtime_u64(), symbol_id)
-}
-
-fn direct_function_backend_name(
-    function: &BlockPyFunction<impl ModuleShape>,
-    shared_state: Option<&SharedModuleState>,
-) -> String {
-    let mut name = String::from("direct:");
-    match shared_state {
-        Some(shared_state) => push_direct_function_module_identity(
-            &mut name,
-            shared_state.module_name.as_str(),
-            shared_state.source_hash(),
-        ),
-        None => {
-            name.push_str("module_id:");
-            name.push_str(
-                function
-                    .function_id
-                    .runtime_module_id()
-                    .as_u32()
-                    .to_string()
-                    .as_str(),
-            );
-        }
-    }
-    name.push(':');
-    name.push_str(function.names.qualname.as_str());
-    name.push(':');
-    name.push_str(function.params.len().to_string().as_str());
-    name
-}
-
-fn push_direct_function_module_identity(out: &mut String, module_name: &str, source_hash: u64) {
-    push_symbol_component_hex(out, module_name);
-    out.push(':');
-    out.push_str(format!("{source_hash:016x}").as_str());
-}
-
 fn declare_direct_function(
     codegen_env: &mut impl JitCodegenEnv,
     function: &BlockPyFunction<impl ModuleShape>,
@@ -19597,44 +19548,6 @@ fn build_default_resolving_direct_adapter(
     }
     let _ = adapter_func_id;
     Ok(ctx)
-}
-
-fn scoped_jit_symbol(base: &str, symbol_scope: Option<&str>) -> String {
-    match symbol_scope {
-        Some(scope) => format!("{base}:{scope}"),
-        None => base.to_string(),
-    }
-}
-
-fn is_clif_ident_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'_'
-}
-
-pub(crate) const JIT_PYTHON_PERF_SYMBOL_KIND_DIRECT: &str = "d";
-pub(crate) const SOAC_RUNTIME_INCREF_SYMBOL: &str = "soac_runtime_incref";
-pub(crate) const SOAC_RUNTIME_DECREF_SYMBOL: &str = "soac_runtime_decref";
-pub(crate) const SOAC_RUNTIME_INCREF_APPLIED_SYMBOL: &str = "soac_runtime_incref_applied";
-pub(crate) const SOAC_RUNTIME_DECREF_APPLIED_SYMBOL: &str = "soac_runtime_decref_applied";
-pub(crate) const SOAC_RUNTIME_SET_RAISED_EXCEPTION_SYMBOL: &str =
-    "soac_runtime_set_raised_exception";
-pub(crate) const SOAC_RUNTIME_LOAD_GLOBAL_SYMBOL: &str = "soac_runtime_load_global";
-pub(crate) const SOAC_RUNTIME_PROBE_GLOBAL_INDEXED_SYMBOL: &str =
-    "soac_runtime_probe_global_indexed";
-pub(crate) const SOAC_RUNTIME_STORE_GLOBAL_SYMBOL: &str = "soac_runtime_store_global";
-pub(crate) const SOAC_RUNTIME_STORE_GLOBAL_INDEXED_SYMBOL: &str =
-    "soac_runtime_store_global_indexed";
-pub(crate) const SOAC_RUNTIME_PROBE_FIELD_INDEXED_SYMBOL: &str = "soac_runtime_probe_field_indexed";
-pub(crate) const SOAC_RUNTIME_STORE_FIELD_INDEXED_SYMBOL: &str = "soac_runtime_store_field_indexed";
-pub(crate) const SOAC_RUNTIME_TUPLE_NEW_SYMBOL: &str = "soac_runtime_tuple_new";
-pub(crate) const SOAC_RUNTIME_TUPLE_SET_ITEM_STOLEN_SYMBOL: &str =
-    "soac_runtime_tuple_set_item_stolen";
-#[cfg(test)]
-pub(crate) const SOAC_RUNTIME_PYLONG_AS_I64_SYMBOL: &str = "soac_runtime_pylong_as_i64";
-pub(crate) const SOAC_RUNTIME_PYLONG_AS_I64_SATURATING_SYMBOL: &str =
-    "soac_runtime_pylong_as_i64_saturating";
-
-pub(crate) fn jit_python_perf_symbol_name(kind: &str, qualname: &str) -> String {
-    format!("py:{kind}:{qualname}")
 }
 
 #[derive(Debug, Clone)]
