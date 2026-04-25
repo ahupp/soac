@@ -3,10 +3,12 @@ use soac_core::block_py::{
     BlockPyFunction, BlockPyModule, CounterSite, FunctionNameGen, ModuleNameGen, RuntimeFunctionId,
     RuntimeModuleId, VisitMut, walk_expr_mut, walk_module_mut,
 };
+use soac_core::pass_tracker::PassTracker;
 use soac_lowering::passes::{CodegenModuleShape, InstrCodegen};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use tracing::{info, warn};
 
 const CODEGEN_MODULE_CACHE_MAGIC: &[u8] = b"SOAC_BLOCKPY_CODEGEN_CACHE\0";
 const CODEGEN_MODULE_CACHE_FORMAT_VERSION: u32 = 5;
@@ -30,6 +32,11 @@ pub struct CachedCodegenModuleMetadata {
     pub module_name: String,
     pub source_hash: u64,
     pub cache_identity: String,
+}
+
+pub(crate) struct PreOptimizationCacheTarget {
+    pub(crate) path: PathBuf,
+    pub(crate) metadata: CachedCodegenModuleMetadata,
 }
 
 pub fn hash_module_source(source: &str) -> u64 {
@@ -247,6 +254,107 @@ pub fn load_codegen_module_cache(path: impl AsRef<Path>) -> Result<CachedCodegen
 
     rehydrate_codegen_module_generators(&mut cache.module);
     Ok(cache)
+}
+
+pub(crate) fn try_load_pre_optimization_cache(
+    cache_target: &PreOptimizationCacheTarget,
+    module_name_gen: ModuleNameGen,
+    pass_tracker: &mut impl PassTracker,
+) -> Option<BlockPyModule<CodegenModuleShape>> {
+    let cache_path = &cache_target.path;
+    let cache_exists =
+        pass_tracker.record_timing("bb_codegen_cache_lookup", || cache_path.is_file());
+    if !cache_exists {
+        info!(
+            target: "soac_blockpy_module_cache",
+            event = "soac.blockpy_module_cache",
+            cache_hit = false,
+            path = %cache_path.display(),
+            "blockpy_module_cache_miss",
+        );
+        return None;
+    }
+
+    let loaded = pass_tracker.record_timing("bb_codegen_cache_load", || {
+        load_codegen_module_cache(cache_path)
+    });
+    match loaded {
+        Ok(mut cache) => {
+            let metadata_mismatch = match validate_codegen_module_cache_metadata(
+                &cache.metadata,
+                &cache_target.metadata,
+            ) {
+                Ok(()) => None,
+                Err(err) => Some(err),
+            };
+            if let Some(err) = metadata_mismatch {
+                warn!(
+                    target: "soac_blockpy_module_cache",
+                    event = "soac.blockpy_module_cache",
+                    cache_hit = false,
+                    path = %cache_path.display(),
+                    error = %err,
+                    "blockpy_module_cache_metadata_mismatch",
+                );
+                return None;
+            }
+
+            remap_cached_codegen_module_function_ids(&mut cache, module_name_gen);
+            info!(
+                target: "soac_blockpy_module_cache",
+                event = "soac.blockpy_module_cache",
+                cache_hit = true,
+                path = %cache_path.display(),
+                "blockpy_module_cache_hit",
+            );
+            let CachedCodegenModule {
+                metadata: _,
+                module,
+            } = cache;
+            Some(pass_tracker.run_pass("bb_codegen", || module))
+        }
+        Err(err) => {
+            warn!(
+                target: "soac_blockpy_module_cache",
+                event = "soac.blockpy_module_cache",
+                cache_hit = false,
+                path = %cache_path.display(),
+                error = %err,
+                "blockpy_module_cache_load_failed",
+            );
+            None
+        }
+    }
+}
+
+pub(crate) fn store_pre_optimization_cache(
+    cache_target: &PreOptimizationCacheTarget,
+    module: &BlockPyModule<CodegenModuleShape>,
+    pass_tracker: &mut impl PassTracker,
+) {
+    let cache_path = &cache_target.path;
+    let stored = pass_tracker.record_timing("bb_codegen_cache_store", || {
+        store_codegen_module_cache(cache_path, &cache_target.metadata, module)
+    });
+    match stored {
+        Ok(()) => {
+            info!(
+                target: "soac_blockpy_module_cache",
+                event = "soac.blockpy_module_cache_store",
+                path = %cache_path.display(),
+                "blockpy_module_cache_store",
+            );
+        }
+        Err(err) => {
+            warn!(
+                target: "soac_blockpy_module_cache",
+                event = "soac.blockpy_module_cache_store",
+                path = %cache_path.display(),
+                error = %err,
+                "blockpy_module_cache_store_failed",
+            );
+        }
+    }
 }
 
 pub fn validate_codegen_module_cache_metadata(
