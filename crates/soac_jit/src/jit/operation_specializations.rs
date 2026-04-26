@@ -3,13 +3,15 @@ use super::counters::{
 };
 use super::intrinsics::{OperationEmitState, increment_counter_with_state};
 use super::symbols::{
-    CpythonTypeSymbol, RelocTypeRef, reloc_type_ref_from_typed_attr_owner_ref,
+    CpythonTypeSymbol, RelocTypeRef, register_runtime_type_for_key, reloc_type_ref_for_type,
+    reloc_type_ref_from_typed_attr_owner_ref, resolve_type_key_to_type, type_key_for_type,
     typed_attr_owner_ref_from_reloc_type_ref,
 };
 use cranelift_codegen::ir;
 use cranelift_codegen::ir::InstBuilder;
 use pyo3::ffi;
 use soac_core::block_py::{CounterId, GetItem, HasSemanticInstrId, Instr, InstrId, SetItem};
+use soac_core::profile::{CollectedTypeKeyLayout, CounterDumpTypeKey};
 use soac_ir_blockpy::InstrCodegen;
 use soac_ir_typed::plan_v3::{
     EXACT_LIST_EXACT_INT_ITEM_SHAPE_TAG, ExactListItemAccessKind,
@@ -18,11 +20,24 @@ use soac_ir_typed::plan_v3::{
 use soac_ir_typed::{
     TypedExactListItemAccessPlan, TypedIndexedFieldGuard, TypedIndexedFieldPlanSource,
 };
-use soac_opt::access_emission_v3::ResolvedIndexedFieldAccess as OptV3ResolvedIndexedFieldAccessFromOpt;
+use soac_opt::access_emission_v3::{
+    IndexedFieldLayoutGroup as OptV3IndexedFieldLayoutGroup,
+    IndexedFieldRuntimeAccessRequest as OptV3IndexedFieldRuntimeAccessRequest,
+    ResolvedIndexedFieldAccess as OptV3ResolvedIndexedFieldAccessFromOpt,
+};
+use std::ffi::CString;
 use std::mem::offset_of;
 
 const PYLONG_COMPACT_TAG_LIMIT: i64 = 2 << 3;
 const PYLONG_SIGN_MASK: i64 = 3;
+
+unsafe extern "C" {
+    fn PyUnstable_Type_AssignVersionTag(type_obj: *mut ffi::PyTypeObject) -> i32;
+    fn _PyType_LookupRef(
+        type_obj: *mut ffi::PyTypeObject,
+        name: *mut ffi::PyObject,
+    ) -> *mut ffi::PyObject;
+}
 
 #[repr(C)]
 struct RawPyLongValue {
@@ -80,6 +95,253 @@ impl FieldIndexSpecialization {
 
 pub(super) type OptV3ResolvedIndexedFieldAccess =
     OptV3ResolvedIndexedFieldAccessFromOpt<FieldIndexSpecialization>;
+
+fn owner_type_has_class_binding_for_attr(
+    owner_type: *mut ffi::PyTypeObject,
+    attr_name: &str,
+) -> Result<bool, String> {
+    let attr_name = CString::new(attr_name)
+        .map_err(|_| format!("field specialization attr contains NUL: {attr_name:?}"))?;
+    let attr_obj = unsafe { ffi::PyUnicode_FromString(attr_name.as_ptr()) };
+    if attr_obj.is_null() {
+        return Err("failed to allocate field specialization attr name".to_string());
+    }
+    let descriptor = unsafe { _PyType_LookupRef(owner_type, attr_obj) };
+    unsafe { ffi::Py_DECREF(attr_obj) };
+    if descriptor.is_null() {
+        if unsafe { !ffi::PyErr_Occurred().is_null() } {
+            return Err("failed while checking owner type class binding".to_string());
+        }
+        Ok(false)
+    } else {
+        unsafe { ffi::Py_DECREF(descriptor) };
+        Ok(true)
+    }
+}
+
+pub(super) unsafe fn owner_type_supports_field_layout_priming(
+    owner_type: *mut ffi::PyTypeObject,
+) -> bool {
+    const PY_TPFLAGS_MANAGED_DICT_SOAC: u64 = 1 << 4;
+    const PY_TPFLAGS_INLINE_VALUES_SOAC: u64 = 1 << 2;
+
+    if owner_type.is_null() {
+        return false;
+    }
+    if ((*owner_type).tp_flags & ffi::Py_TPFLAGS_HEAPTYPE) == 0
+        || ((*owner_type).tp_flags & PY_TPFLAGS_INLINE_VALUES_SOAC) == 0
+        || ((*owner_type).tp_flags & PY_TPFLAGS_MANAGED_DICT_SOAC) == 0
+    {
+        return false;
+    }
+    if ffi::Py_TYPE(owner_type as *mut ffi::PyObject) != std::ptr::addr_of_mut!(ffi::PyType_Type) {
+        return false;
+    }
+    let Some(owner_tp_alloc) = (*owner_type).tp_alloc else {
+        return false;
+    };
+    let generic_alloc: unsafe extern "C" fn(
+        *mut ffi::PyTypeObject,
+        ffi::Py_ssize_t,
+    ) -> *mut ffi::PyObject = ffi::PyType_GenericAlloc;
+    std::ptr::fn_addr_eq(owner_tp_alloc, generic_alloc)
+}
+
+unsafe fn owner_type_has_safe_zero_arg_priming_constructor(
+    owner_type: *mut ffi::PyTypeObject,
+) -> bool {
+    if !owner_type_supports_field_layout_priming(owner_type)
+        || ((*owner_type).tp_flags & ffi::Py_TPFLAGS_IS_ABSTRACT) != 0
+    {
+        return false;
+    }
+    let class_dict = (*owner_type).tp_dict;
+    if class_dict.is_null() {
+        return false;
+    }
+    unsafe { ffi::PyDict_GetItemString(class_dict, c"__init__".as_ptr()) }.is_null()
+        && unsafe { ffi::PyDict_GetItemString(class_dict, c"__new__".as_ptr()) }.is_null()
+}
+
+pub(super) fn prime_field_index_layout(
+    owner_type: *mut ffi::PyTypeObject,
+    layouts: &[CollectedTypeKeyLayout],
+) -> Result<(), String> {
+    if layouts.is_empty() || !unsafe { owner_type_supports_field_layout_priming(owner_type) } {
+        return Ok(());
+    }
+    let Some(owner_tp_alloc) = (unsafe { (*owner_type).tp_alloc }) else {
+        return Ok(());
+    };
+    let mut temp_instance =
+        if unsafe { owner_type_has_safe_zero_arg_priming_constructor(owner_type) } {
+            unsafe { ffi::PyObject_CallNoArgs(owner_type.cast()) }
+        } else {
+            std::ptr::null_mut()
+        };
+    if temp_instance.is_null() {
+        unsafe { ffi::PyErr_Clear() };
+        temp_instance = unsafe { owner_tp_alloc(owner_type, 0) };
+    }
+    if temp_instance.is_null() {
+        unsafe { ffi::PyErr_Clear() };
+        return Ok(());
+    }
+    let none = unsafe { ffi::Py_None() };
+    for layout in layouts {
+        let key_name = CString::new(layout.key.as_str())
+            .map_err(|_| format!("field specialization attr contains NUL: {:?}", layout.key))?;
+        let key = unsafe { ffi::PyUnicode_InternFromString(key_name.as_ptr()) };
+        if key.is_null() {
+            unsafe {
+                ffi::Py_DECREF(temp_instance);
+                ffi::PyErr_Clear();
+            }
+            return Ok(());
+        }
+        let set_result = unsafe { ffi::PyObject_SetAttr(temp_instance, key, none) };
+        unsafe { ffi::Py_DECREF(key) };
+        if set_result != 0 {
+            unsafe {
+                ffi::Py_DECREF(temp_instance);
+                ffi::PyErr_Clear();
+            }
+            return Ok(());
+        }
+    }
+    unsafe { ffi::Py_DECREF(temp_instance) };
+    Ok(())
+}
+
+fn field_index_specialization_for_type(
+    owner_type: *mut ffi::PyTypeObject,
+    attr_name: &str,
+    expected_index: u32,
+) -> Result<Option<FieldIndexSpecialization>, String> {
+    if owner_type.is_null() {
+        return Ok(None);
+    }
+    if unsafe { ((*owner_type).tp_flags & ffi::Py_TPFLAGS_HEAPTYPE) == 0 } {
+        return Ok(None);
+    }
+    let has_generic_getattr = unsafe { (*owner_type).tp_getattro }.is_some_and(|getattr| {
+        std::ptr::fn_addr_eq(
+            getattr,
+            ffi::PyObject_GenericGetAttr
+                as unsafe extern "C" fn(
+                    *mut ffi::PyObject,
+                    *mut ffi::PyObject,
+                ) -> *mut ffi::PyObject,
+        )
+    });
+    let has_generic_setattr = unsafe { (*owner_type).tp_setattro }.is_some_and(|setattr| {
+        std::ptr::fn_addr_eq(
+            setattr,
+            ffi::PyObject_GenericSetAttr
+                as unsafe extern "C" fn(
+                    *mut ffi::PyObject,
+                    *mut ffi::PyObject,
+                    *mut ffi::PyObject,
+                ) -> i32,
+        )
+    });
+    if !has_generic_getattr
+        || !has_generic_setattr
+        || owner_type_has_class_binding_for_attr(owner_type, attr_name)?
+    {
+        return Ok(None);
+    }
+
+    if unsafe { (*owner_type).tp_version_tag } == 0 {
+        let _ = unsafe { PyUnstable_Type_AssignVersionTag(owner_type) };
+    }
+    let type_version = unsafe { (*owner_type).tp_version_tag };
+    if type_version == 0 {
+        return Ok(None);
+    }
+    let Some(owner_type_ref) = reloc_type_ref_for_type(owner_type)? else {
+        return Ok(None);
+    };
+
+    Ok(Some(FieldIndexSpecialization {
+        expected_index,
+        owner_type_ref,
+        type_version,
+    }))
+}
+
+pub(super) fn prime_opt_v3_field_index_layouts<'a>(
+    layout_groups: impl IntoIterator<Item = &'a OptV3IndexedFieldLayoutGroup>,
+) -> Result<(), String> {
+    for group in layout_groups {
+        let Some(owner_type) = resolve_type_key_to_type(&group.type_key)? else {
+            continue;
+        };
+        prime_field_index_layout(owner_type, group.layouts.as_slice())?;
+    }
+    Ok(())
+}
+
+pub(super) fn field_index_specialization_from_primed_opt_v3(
+    request: &OptV3IndexedFieldRuntimeAccessRequest,
+) -> Result<Option<FieldIndexSpecialization>, String> {
+    let Some(owner_type) = resolve_type_key_to_type(&request.type_key)? else {
+        return Ok(None);
+    };
+    field_index_specialization_for_type(
+        owner_type,
+        request.attr_name.as_str(),
+        request.expected_index,
+    )
+}
+
+fn constructor_owner_type_for_type_key(
+    function_id: soac_core::block_py::RuntimeFunctionId,
+    type_key: &CounterDumpTypeKey,
+) -> Result<Option<*mut ffi::PyTypeObject>, String> {
+    let owner_types = unsafe { crate::lookup_exact_owner_types_for_constructor(function_id) }
+        .map_err(|_| format!("failed to resolve owner types for constructor {function_id}"))?;
+    for owner in owner_types {
+        if type_key_for_type(owner.owner_type)?.as_ref() == Some(type_key) {
+            register_runtime_type_for_key(type_key, owner.owner_type);
+            return Ok(Some(owner.owner_type));
+        }
+    }
+    Ok(None)
+}
+
+fn indexed_field_owner_type_for_function(
+    function_id: soac_core::block_py::RuntimeFunctionId,
+    type_key: &CounterDumpTypeKey,
+) -> Result<Option<*mut ffi::PyTypeObject>, String> {
+    if let Some(owner_type) = resolve_type_key_to_type(type_key)? {
+        return Ok(Some(owner_type));
+    }
+    constructor_owner_type_for_type_key(function_id, type_key)
+}
+
+pub(super) fn field_index_specialization_from_opt_v3_for_function(
+    function_id: soac_core::block_py::RuntimeFunctionId,
+    request: &OptV3IndexedFieldRuntimeAccessRequest,
+) -> Result<Option<FieldIndexSpecialization>, String> {
+    let type_key = &request.type_key;
+    let Some(owner_type) = indexed_field_owner_type_for_function(function_id, type_key)? else {
+        return Ok(None);
+    };
+    prime_field_index_layout(
+        owner_type,
+        &[CollectedTypeKeyLayout {
+            owner_type_id: 0,
+            key: request.attr_name.clone(),
+            index: request.expected_index,
+        }],
+    )?;
+    field_index_specialization_for_type(
+        owner_type,
+        request.attr_name.as_str(),
+        request.expected_index,
+    )
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct IndexedFieldLoweringPlan {

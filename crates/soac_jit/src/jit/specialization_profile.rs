@@ -1,8 +1,8 @@
-use super::operation_specializations::{FieldIndexSpecialization, OptV3ResolvedIndexedFieldAccess};
-use super::precompile::PrecompileModuleIndex;
-use super::{
+use super::operation_specializations::{
+    FieldIndexSpecialization, OptV3ResolvedIndexedFieldAccess,
     field_index_specialization_from_opt_v3_for_function, prime_opt_v3_field_index_layouts,
 };
+use super::precompile::PrecompileModuleIndex;
 use crate::config::{SpecializationMode, pre_optimization_module_cache_identity};
 use crate::module_type::SharedModuleState;
 use soac_config::SoacEnvConfig;

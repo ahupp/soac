@@ -1,9 +1,13 @@
+use super::SpecializationProfile;
 use super::codegen_env::{
     JitCodegenEnv, declare_import_fn, declare_local_fn, lower_static_signature,
 };
 use super::direct_abi;
 use super::intrinsics;
 use super::module_data::declare_type_ptr_import;
+use super::operation_specializations::{
+    field_index_specialization_from_primed_opt_v3, prime_opt_v3_field_index_layouts,
+};
 use super::symbols::{
     CpythonTypeSymbol, RelocTypeRef, SOAC_RUNTIME_DECREF_APPLIED_SYMBOL,
     SOAC_RUNTIME_DECREF_SYMBOL, SOAC_RUNTIME_INCREF_APPLIED_SYMBOL, SOAC_RUNTIME_INCREF_SYMBOL,
@@ -18,10 +22,6 @@ use super::symbols::{
 use super::symbols::{RelocCallableRef, reloc_type_ref_from_typed_attr_owner_ref};
 #[cfg(test)]
 use super::symbols::{ensure_reloc_callable_symbol_registered, reloc_callable_ref_symbol_name};
-use super::{
-    SpecializationProfile, field_index_specialization_from_primed_opt_v3,
-    prime_opt_v3_field_index_layouts,
-};
 use crate::function_instantiation::SOAC_JIT_MAKE_FUNCTION_WITH_CLOSURE_SYMBOL;
 use cranelift_jit::JITModule;
 use cranelift_module::{FuncId, Linkage};

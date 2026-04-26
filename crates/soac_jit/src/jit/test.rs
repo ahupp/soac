@@ -44,7 +44,10 @@ use soac_ir_blockpy::{CodegenModuleShape, InstrCodegen, validate_codegen_instr_i
 mod tests {
     use super::super::direct_abi;
     use super::super::function_targets::collect_planned_typed_call_direct_targets;
-    use super::super::symbols::resolve_reloc_type_ref_to_type;
+    use super::super::operation_specializations::{
+        owner_type_supports_field_layout_priming, prime_field_index_layout,
+    };
+    use super::super::symbols::{reloc_type_ref_for_type, resolve_reloc_type_ref_to_type};
     use super::super::typed_pipeline::{
         annotate_typed_attr_accesses, annotate_typed_exact_int_selections,
         annotate_typed_indexed_global_accesses,
@@ -74,14 +77,12 @@ mod tests {
         module_constant_symbol_prefix_for_instance,
         module_constant_symbol_prefix_for_module_identity,
         module_constant_symbol_prefix_for_shared_state, new_jit_module,
-        owner_type_supports_field_layout_priming, persistent_function_id_for_module_function,
-        plan_direct_call_args_for_target, plan_typed_v3_jit_module_for_test,
-        planned_optimization_inputs_from_v3_artifacts,
+        persistent_function_id_for_module_function, plan_direct_call_args_for_target,
+        plan_typed_v3_jit_module_for_test, planned_optimization_inputs_from_v3_artifacts,
         planned_optimization_inputs_from_v3_artifacts_for_codegen_module,
         precompiled_direct_function_symbol_scope_for_persistent,
-        prepare_specialized_typed_function, prime_field_index_layout,
-        push_direct_function_module_identity, push_shared_module_symbol_identity,
-        reloc_type_ref_for_type, runtime_primitive_call_static_params_can_satisfy_abi,
+        prepare_specialized_typed_function, push_direct_function_module_identity,
+        push_shared_module_symbol_identity, runtime_primitive_call_static_params_can_satisfy_abi,
         stable_cranelift_function_hash, stable_cranelift_function_name,
         typed_local_load_direct_result_plan, validate_direct_call_compatibility,
     };
