@@ -12,5 +12,6 @@ soac_config = { path = "../soac_config" }
 soac_core = { path = "../soac_core" }
 soac_ir_blockpy = { path = "../soac_ir_blockpy" }
 soac_ir_typed = { path = "../soac_ir_typed" }
+
+[dev-dependencies]
 soac_lowering = { path = "../soac_lowering" }
-soac_opt = { path = "../soac_opt" }

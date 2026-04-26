@@ -39,6 +39,16 @@ python3 .codex/skills/soac-selfdoc/scripts/inventory_selfdoc.py --out work/logs/
 Use the generated inventory as a checklist, not as final prose. It lists the
 current crates, local crate dependencies, CLI bin targets, and Codex skills.
 
+For the standalone Graphviz crate dependency source, run:
+
+```bash
+python3 .codex/skills/soac-selfdoc/scripts/crate_dependency_graph.py --out doc/crate_dependencies.dot
+dot -Tsvg doc/crate_dependencies.dot -o doc/crate_dependencies.svg
+```
+
+The default graph includes normal and build workspace dependencies. Use
+`--include-dev` only when the diagram intentionally needs test fixture edges.
+
 If the script fails, fall back to:
 
 ```bash
@@ -108,6 +118,8 @@ For docs-only updates, do not run the full code gate by default. Do run:
 
 ```bash
 python3 .codex/skills/soac-selfdoc/scripts/inventory_selfdoc.py --out work/logs/soac-selfdoc-inventory.md
+python3 .codex/skills/soac-selfdoc/scripts/crate_dependency_graph.py --out doc/crate_dependencies.dot
+dot -Tsvg doc/crate_dependencies.dot -o doc/crate_dependencies.svg
 rg -n "MODULE_LIFECYCLE|Important Crates|Utility / Helper Crates|soac-selfdoc" README.md doc/MODULE_LIFECYCLE.md
 ```
 

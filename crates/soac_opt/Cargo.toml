@@ -13,6 +13,8 @@ rkyv = { version = "0.8", features = ["alloc"] }
 soac_core = { path = "../soac_core" }
 soac_ir_blockpy = { path = "../soac_ir_blockpy" }
 soac_ir_typed = { path = "../soac_ir_typed" }
-soac_lowering = { path = "../soac_lowering" }
 soac_macros = { path = "../soac_macros" }
 tracing = "0.1"
+
+[dev-dependencies]
+soac_lowering = { path = "../soac_lowering" }

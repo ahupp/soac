@@ -1804,7 +1804,6 @@ dependencies = [
  "soac_ir_blockpy",
  "soac_ir_typed",
  "soac_lowering",
- "soac_opt",
 ]
 
 [[package]]
