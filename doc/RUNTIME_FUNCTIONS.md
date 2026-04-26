@@ -67,6 +67,8 @@ dp_jit_pyobject_setattr
 dp_jit_pyobject_getitem
 dp_jit_pyobject_setitem
 dp_jit_pyobject_delitem
+dp_jit_pytype_generic_alloc
+dp_jit_finish_constructor_init
 dp_jit_load_global_obj
 dp_jit_store_global
 dp_jit_del_global

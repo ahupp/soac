@@ -8,6 +8,9 @@ use super::module_data::declare_type_ptr_import;
 use super::operation_specializations::{
     field_index_specialization_from_primed_opt_v3, prime_opt_v3_field_index_layouts,
 };
+use super::symbols::RelocCallableRef;
+#[cfg(test)]
+use super::symbols::reloc_type_ref_from_typed_attr_owner_ref;
 use super::symbols::{
     CpythonTypeSymbol, RelocTypeRef, SOAC_RUNTIME_DECREF_APPLIED_SYMBOL,
     SOAC_RUNTIME_DECREF_SYMBOL, SOAC_RUNTIME_INCREF_APPLIED_SYMBOL, SOAC_RUNTIME_INCREF_SYMBOL,
@@ -16,12 +19,10 @@ use super::symbols::{
     SOAC_RUNTIME_SET_RAISED_EXCEPTION_SYMBOL, SOAC_RUNTIME_STORE_FIELD_INDEXED_SYMBOL,
     SOAC_RUNTIME_STORE_GLOBAL_INDEXED_SYMBOL, SOAC_RUNTIME_STORE_GLOBAL_SYMBOL,
     SOAC_RUNTIME_TUPLE_NEW_SYMBOL, SOAC_RUNTIME_TUPLE_SET_ITEM_STOLEN_SYMBOL,
-    cpython_type_symbol_name, ensure_reloc_type_symbol_registered, reloc_type_ref_symbol_name,
+    cpython_type_symbol_name, ensure_reloc_callable_symbol_registered,
+    ensure_reloc_type_symbol_registered, reloc_callable_ref_symbol_name, reloc_type_ref_for_type,
+    reloc_type_ref_symbol_name,
 };
-#[cfg(test)]
-use super::symbols::{RelocCallableRef, reloc_type_ref_from_typed_attr_owner_ref};
-#[cfg(test)]
-use super::symbols::{ensure_reloc_callable_symbol_registered, reloc_callable_ref_symbol_name};
 use crate::function_instantiation::SOAC_JIT_MAKE_FUNCTION_WITH_CLOSURE_SYMBOL;
 use cranelift_jit::JITModule;
 use cranelift_module::{FuncId, Linkage};
@@ -566,7 +567,6 @@ fn predeclare_reloc_type_ref_import(
     Ok(())
 }
 
-#[cfg(test)]
 fn predeclare_reloc_callable_ref_import(
     jit_module: &mut JITModule,
     callable_ref: &RelocCallableRef,
@@ -596,6 +596,33 @@ pub(super) fn predeclare_specialization_type_imports(
     }
     for type_ref in type_refs {
         predeclare_reloc_type_ref_import(jit_module, &type_ref)?;
+    }
+    let mut callable_refs = HashSet::new();
+    for direct_calls in profile.opt_v3_emitted_direct_calls.values() {
+        for plans in direct_calls.values() {
+            for plan in plans {
+                let owners =
+                    unsafe { crate::lookup_exact_owner_types_for_constructor(plan.target) }
+                        .map_err(|_| {
+                            format!(
+                                "failed to resolve owner types for constructor {}",
+                                plan.target
+                            )
+                        })?;
+                for owner in owners {
+                    let Some(owner_type_ref) = reloc_type_ref_for_type(owner.owner_type)? else {
+                        continue;
+                    };
+                    callable_refs.insert(RelocCallableRef::OwnerAttr {
+                        owner_type_ref,
+                        attr_name: "__init__".to_string(),
+                    });
+                }
+            }
+        }
+    }
+    for callable_ref in callable_refs {
+        predeclare_reloc_callable_ref_import(jit_module, &callable_ref)?;
     }
     Ok(())
 }

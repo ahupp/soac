@@ -1038,6 +1038,44 @@ pub unsafe extern "C" fn dp_jit_pyobject_setitem(
     pyobject_setitem_hook(obj, key, value)
 }
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn dp_jit_pytype_generic_alloc(callable: ObjPtr, nitems: i64) -> ObjPtr {
+    if callable.is_null() {
+        ffi::PyErr_SetString(
+            ffi::PyExc_RuntimeError,
+            c"invalid null type in direct constructor allocation".as_ptr(),
+        );
+        return ptr::null_mut();
+    }
+    ffi::PyType_GenericAlloc(
+        callable as *mut ffi::PyTypeObject,
+        nitems as ffi::Py_ssize_t,
+    ) as ObjPtr
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dp_jit_finish_constructor_init(
+    allocated: ObjPtr,
+    init_result: ObjPtr,
+) -> ObjPtr {
+    if allocated.is_null() || init_result.is_null() {
+        if !allocated.is_null() {
+            ffi::Py_DECREF(allocated as *mut ffi::PyObject);
+        }
+        return ptr::null_mut();
+    }
+    let none = ffi::Py_None();
+    if ptr::eq(init_result as *mut ffi::PyObject, none) {
+        ffi::Py_DECREF(init_result as *mut ffi::PyObject);
+        return allocated;
+    }
+    ffi::Py_DECREF(init_result as *mut ffi::PyObject);
+    ffi::Py_DECREF(allocated as *mut ffi::PyObject);
+    ffi::PyErr_SetString(
+        ffi::PyExc_TypeError,
+        c"__init__() should return None".as_ptr(),
+    );
+    ptr::null_mut()
+}
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn dp_jit_pyobject_delitem(obj: ObjPtr, key: ObjPtr) -> ObjPtr {
     pyobject_delitem_hook(obj, key)
 }
@@ -1335,6 +1373,14 @@ pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
     builder.symbol(
         "dp_jit_pyobject_setitem",
         dp_jit_pyobject_setitem as *const u8,
+    );
+    builder.symbol(
+        "dp_jit_pytype_generic_alloc",
+        dp_jit_pytype_generic_alloc as *const u8,
+    );
+    builder.symbol(
+        "dp_jit_finish_constructor_init",
+        dp_jit_finish_constructor_init as *const u8,
     );
     builder.symbol(
         "dp_jit_pyobject_delitem",

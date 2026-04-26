@@ -1202,14 +1202,13 @@ fn direct_call_requests_from_evidence_v3(
                 });
                 continue;
             }
-            if target_function.names.fn_name == "__init__" {
-                continue;
-            }
+            let implicit_positional_arg_count =
+                usize::from(target_function.names.fn_name == "__init__");
             let arg_plan = match direct_call_arg_plan_for_instr_id_v3(
                 function,
                 source,
                 target_function,
-                0,
+                implicit_positional_arg_count,
             ) {
                 Some(Ok(arg_plan)) => arg_plan,
                 Some(Err(reason)) => {
@@ -1242,7 +1241,11 @@ fn direct_call_requests_from_evidence_v3(
                     source,
                     target_entry,
                 )),
-                reason: "profiled call_hot_targets selected this function with validated ordinary-call arguments".to_string(),
+                reason: if target_function.names.fn_name == "__init__" {
+                    "profiled call_hot_targets selected this constructor with validated constructor-call arguments".to_string()
+                } else {
+                    "profiled call_hot_targets selected this function with validated ordinary-call arguments".to_string()
+                },
             });
             identity_builder
                 .add_debug_name(serialized_target, target_function.names.qualname.clone());

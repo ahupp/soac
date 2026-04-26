@@ -16,10 +16,11 @@ use soac_ir_typed::plan_v3::{
     IndexedGlobalAccessKind as PlanV3IndexedGlobalAccessKind,
 };
 use soac_ir_typed::{
-    FactStore, InstrTyped, TypedAttrAccessPlan, TypedCallEmissionPlans, TypedCodegenModuleShape,
-    TypedExactIntBranchPlan, TypedExactIntPlanSource, TypedExactIntReturnPlan,
-    TypedExactIntScalarThreadPlan, TypedExactListItemAccessPlan, TypedExactListItemPlanSource,
-    TypedIndexedFieldPlanSource, TypedIndexedGlobalAccessPlan, TypedIndexedGlobalPlanSource,
+    FactStore, InstrTyped, TypedAttrAccessPlan, TypedCallEmissionPlan, TypedCallEmissionPlans,
+    TypedCodegenModuleShape, TypedDirectConstructorCallGuard, TypedExactIntBranchPlan,
+    TypedExactIntPlanSource, TypedExactIntReturnPlan, TypedExactIntScalarThreadPlan,
+    TypedExactListItemAccessPlan, TypedExactListItemPlanSource, TypedIndexedFieldPlanSource,
+    TypedIndexedGlobalAccessPlan, TypedIndexedGlobalPlanSource,
     assign_missing_typed_function_instr_ids,
 };
 use soac_opt::access_emission_v3::{
@@ -27,7 +28,7 @@ use soac_opt::access_emission_v3::{
     IndexedGlobalAccessPlan as OptV3IndexedGlobalAccessPlan,
 };
 use soac_opt::artifacts_v3::ExactIntBranchV3Artifacts;
-use soac_opt::call_emission_v3::typed_call_emission_plans_from_v3;
+use soac_opt::call_emission_v3::{ResolvedV3DirectCallPlan, typed_call_emission_plans_from_v3};
 use soac_opt::passes::{
     inline_typed_function_direct_call_stores, lower_typed_function_call_emission_plans,
     refresh_typed_function_value_facts, validate_typed_function_value_facts,
@@ -43,12 +44,100 @@ use soac_opt::region_emission_v3::{
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+fn constructor_guards_for_v3_direct_call(
+    plan: &ResolvedV3DirectCallPlan,
+) -> Result<Vec<TypedDirectConstructorCallGuard>, String> {
+    let owners =
+        unsafe { crate::lookup_exact_owner_types_for_constructor(plan.target) }.map_err(|_| {
+            format!(
+                "failed to resolve owner types for constructor {}",
+                plan.target
+            )
+        })?;
+    let mut guards = Vec::with_capacity(owners.len());
+    for owner in owners {
+        let Some(owner_type_ref) = super::symbols::reloc_type_ref_for_type(owner.owner_type)?
+        else {
+            continue;
+        };
+        if !super::symbols::ensure_reloc_callable_symbol_registered(
+            &super::symbols::RelocCallableRef::OwnerAttr {
+                owner_type_ref: owner_type_ref.clone(),
+                attr_name: "__init__".to_string(),
+            },
+        )? {
+            continue;
+        }
+        guards.push(TypedDirectConstructorCallGuard {
+            function_id: plan.target,
+            owner_type_ref: super::symbols::typed_attr_owner_ref_from_reloc_type_ref(
+                &owner_type_ref,
+            ),
+            type_version: owner.type_version,
+            arg_plan: plan.arg_plan.clone(),
+        });
+    }
+    Ok(guards)
+}
+
+fn insert_constructor_guards(
+    emissions: &mut TypedCallEmissionPlans,
+    source: InstrId,
+    guards: Vec<TypedDirectConstructorCallGuard>,
+) -> Result<(), String> {
+    if guards.is_empty() {
+        return Ok(());
+    }
+    let plan =
+        emissions
+            .by_source
+            .entry(source)
+            .or_insert_with(|| TypedCallEmissionPlan::Callable {
+                function_guards: Vec::new(),
+                constructor_guards: Vec::new(),
+            });
+    let TypedCallEmissionPlan::Callable {
+        constructor_guards, ..
+    } = plan
+    else {
+        return Err(format!(
+            "constructor-call emission source {source:?} already has non-callable plan"
+        ));
+    };
+    constructor_guards.extend(guards);
+    Ok(())
+}
+
 fn typed_call_emission_plans_for_profile_function(
     profile: &SpecializationProfile<'_>,
     function_id: RuntimeFunctionId,
 ) -> Result<TypedCallEmissionPlans, String> {
     let opt_v3_direct_calls_by_instr = profile.typed_call_emission_direct_calls(function_id);
-    typed_call_emission_plans_from_v3(&opt_v3_direct_calls_by_instr)
+    let mut ordinary_direct_calls_by_instr =
+        HashMap::<InstrId, Vec<ResolvedV3DirectCallPlan>>::new();
+    let mut constructor_guards_by_instr =
+        HashMap::<InstrId, Vec<TypedDirectConstructorCallGuard>>::new();
+    for (source, plans) in opt_v3_direct_calls_by_instr {
+        for plan in plans {
+            let constructor_guards = constructor_guards_for_v3_direct_call(&plan)?;
+            if constructor_guards.is_empty() {
+                ordinary_direct_calls_by_instr
+                    .entry(source)
+                    .or_default()
+                    .push(plan);
+            } else {
+                constructor_guards_by_instr
+                    .entry(source)
+                    .or_default()
+                    .extend(constructor_guards);
+            }
+        }
+    }
+    let mut emissions = typed_call_emission_plans_from_v3(&ordinary_direct_calls_by_instr)?;
+    for (source, guards) in constructor_guards_by_instr {
+        insert_constructor_guards(&mut emissions, source, guards)?;
+    }
+    Ok(emissions)
 }
 
 pub(super) fn apply_profile_call_emission_plans_to_typed_function(

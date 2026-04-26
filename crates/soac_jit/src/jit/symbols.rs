@@ -466,7 +466,6 @@ pub(super) fn ensure_reloc_type_symbol_registered(
     }
 }
 
-#[cfg(test)]
 fn resolve_reloc_callable_ref_to_object(
     callable_ref: &RelocCallableRef,
 ) -> Result<Option<*mut ffi::PyObject>, String> {
@@ -494,7 +493,6 @@ fn resolve_reloc_callable_ref_to_object(
     }
 }
 
-#[cfg(test)]
 pub(super) fn ensure_reloc_callable_symbol_registered(
     callable_ref: &RelocCallableRef,
 ) -> Result<bool, String> {
