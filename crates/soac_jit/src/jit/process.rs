@@ -8,6 +8,10 @@ use super::compiled::{
 };
 use super::deopt::RuntimeJitDeoptTable;
 use super::direct_function::{build_default_resolving_direct_adapter, declare_direct_function};
+use super::function_targets::{
+    collect_call_direct_targets, collect_make_function_targets,
+    collect_planned_typed_call_direct_targets, is_synthetic_class_helper_function,
+};
 use super::imports::{predeclare_jit_runtime_imports, predeclare_specialization_type_imports};
 use super::jitdump;
 use super::module_data::{
@@ -31,8 +35,6 @@ use super::{
     BuildSpecializedFunctionOptions, CountedRefcountHelpers, DeclaredJitFunction,
     PROCESS_JIT_COMPILE_DEPTH, PlannedOptimizationInputs, SpecializationProfile,
     build_counted_runtime_refcount_helpers, build_cranelift_run_bb_specialized_function,
-    collect_call_direct_targets, collect_make_function_targets,
-    collect_planned_typed_call_direct_targets, is_synthetic_class_helper_function,
     load_planned_optimization_inputs_for_runtime_state,
 };
 use crate::config::CraneliftTargetConfig;

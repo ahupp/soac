@@ -103,6 +103,7 @@ pub(crate) use deopt_interpreter::{
 };
 mod direct_abi;
 mod direct_function;
+mod function_targets;
 mod imports;
 mod inspection;
 mod intrinsics;
@@ -174,6 +175,8 @@ use direct_function::{
 };
 #[cfg(test)]
 use direct_function::{DirectCallIncompatibility, plan_direct_call_args_for_target};
+use function_targets::collect_typed_call_direct_targets;
+pub(crate) use function_targets::is_synthetic_class_helper_function;
 use module_data::{
     ModuleConstantAccess, ModuleConstantAccessTable, declare_module_constant_object_data,
     declare_top_value_counter_storage_import, declare_type_ptr_import,
@@ -252,7 +255,6 @@ use symbols::{
     SOAC_RUNTIME_PYLONG_AS_I64_SYMBOL, SOAC_RUNTIME_STORE_GLOBAL_INDEXED_SYMBOL,
     push_direct_function_module_identity,
 };
-pub(crate) use typed_pipeline::JitModulePlan;
 #[cfg(test)]
 use typed_pipeline::{
     apply_profile_typed_block_metadata_to_typed_function,
@@ -5469,78 +5471,6 @@ fn call_site_profiled_targets<'a>(
     profiled_targets.filter(|targets| !targets.is_empty())
 }
 
-fn collect_call_direct_targets(
-    _function: &BlockPyFunction<CodegenModuleShape>,
-) -> HashSet<RuntimeFunctionId> {
-    HashSet::new()
-}
-
-fn collect_typed_call_direct_targets(
-    function: &BlockPyFunction<TypedCodegenModuleShape>,
-) -> HashSet<RuntimeFunctionId> {
-    struct CallDirectTargetCollector<'a> {
-        out: &'a mut HashSet<RuntimeFunctionId>,
-    }
-
-    impl Visit<InstrTyped> for CallDirectTargetCollector<'_> {
-        fn visit_instr(&mut self, expr: &InstrTyped) {
-            if let InstrTyped::CallDirect(call) = expr {
-                self.out.insert(call.function_id);
-            }
-            if let InstrTyped::GuardedCallableCallTyped(call) = expr {
-                self.out.extend(
-                    call.function_guards
-                        .iter()
-                        .map(|guard| guard.function_id)
-                        .chain(
-                            call.constructor_guards
-                                .iter()
-                                .map(|guard| guard.function_id),
-                        ),
-                );
-            }
-            if let InstrTyped::GuardedMethodCallTyped(call) = expr {
-                self.out
-                    .extend(call.method_guards.iter().map(|guard| guard.function_id));
-            }
-            if let InstrTyped::DirectCallableCallTyped(call) = expr {
-                match &call.guard {
-                    TypedDirectCallableCallGuard::Function(guard) => {
-                        self.out.insert(guard.function_id);
-                    }
-                    TypedDirectCallableCallGuard::Constructor(guard) => {
-                        self.out.insert(guard.function_id);
-                    }
-                }
-            }
-            if let InstrTyped::DirectMethodCallTyped(call) = expr {
-                self.out.insert(call.guard.function_id);
-            }
-            expr.visit_children(self);
-        }
-    }
-
-    let mut out = HashSet::new();
-    let mut collector = CallDirectTargetCollector { out: &mut out };
-    collector.visit_fn(function);
-    out
-}
-
-fn collect_planned_typed_call_direct_targets(
-    module_plan: &JitModulePlan,
-    function_id: RuntimeFunctionId,
-) -> Result<HashSet<RuntimeFunctionId>, String> {
-    let planned_function = module_plan
-        .module
-        .callable_defs
-        .iter()
-        .find(|function| function.function_id == function_id)
-        .ok_or_else(|| {
-            format!("planned JIT module is missing function {function_id} for direct-call targets")
-        })?;
-    Ok(collect_typed_call_direct_targets(planned_function))
-}
-
 fn codegen_expr_const_i64(
     expr: &InstrCodegen,
     module_constants: &ModuleCodegenConstants,
@@ -5563,35 +5493,6 @@ fn typed_expr_const_i64(
         }),
         _ => None,
     }
-}
-
-fn collect_make_function_targets(
-    function: &BlockPyFunction<CodegenModuleShape>,
-) -> HashSet<RuntimeFunctionId> {
-    struct MakeFunctionTargetCollector<'a> {
-        out: &'a mut HashSet<RuntimeFunctionId>,
-    }
-
-    impl Visit<InstrCodegen> for MakeFunctionTargetCollector<'_> {
-        fn visit_instr(&mut self, expr: &InstrCodegen) {
-            if let InstrCodegen::MakeFunctionWithClosure(op) = expr {
-                self.out.insert(op.function_id());
-            }
-            expr.visit_children(self);
-        }
-    }
-
-    let mut out = HashSet::new();
-    let mut collector = MakeFunctionTargetCollector { out: &mut out };
-    collector.visit_fn(function);
-    out
-}
-
-pub(crate) fn is_synthetic_class_helper_function(
-    function: &BlockPyFunction<CodegenModuleShape>,
-) -> bool {
-    function.names.bind_name.starts_with("_dp_class_ns_")
-        || function.names.bind_name.starts_with("_dp_define_class_")
 }
 
 fn collect_runtime_counter_ids_by_kind(

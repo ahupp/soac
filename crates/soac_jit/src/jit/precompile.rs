@@ -4,6 +4,7 @@ use super::direct_function::{
     build_default_resolving_direct_adapter, declare_direct_function,
     declare_imported_direct_function,
 };
+use super::function_targets::collect_typed_call_direct_targets;
 use super::module_data::{
     ModuleConstantAccess, ModuleConstantAccessTable,
     declare_module_constant_object_data_for_prefix, define_scalar_counter_storage_data,
@@ -23,8 +24,7 @@ use super::typed_pipeline::{
 };
 use super::{
     BuildSpecializedFunctionOptions, SpecializationProfile,
-    build_cranelift_run_bb_specialized_function, collect_typed_call_direct_targets,
-    placeholder_module_constant_ptrs,
+    build_cranelift_run_bb_specialized_function, placeholder_module_constant_ptrs,
 };
 use crate::config::{CraneliftTargetConfig, pre_optimization_module_cache_identity};
 use crate::counter::TopValueCounter;
