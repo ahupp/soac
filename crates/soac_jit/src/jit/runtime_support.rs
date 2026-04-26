@@ -1,3 +1,4 @@
+use super::precompiled_object::{ElfSymbolBinding, ObjectFunctionDefinition};
 use super::*;
 use crate::SOAC_JIT_RUNTIME_CLIF;
 use cranelift_codegen::inline::{Inline, InlineCommand};
