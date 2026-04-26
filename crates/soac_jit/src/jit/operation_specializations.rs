@@ -1,5 +1,5 @@
 use super::intrinsics::{OperationEmitState, increment_counter_with_state};
-use super::{CpythonTypeSymbol, RelocTypeRef};
+use super::symbols::{CpythonTypeSymbol, RelocTypeRef};
 use cranelift_codegen::ir;
 use cranelift_codegen::ir::InstBuilder;
 use pyo3::ffi;

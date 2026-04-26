@@ -1,8 +1,9 @@
 use super::operation_specializations;
+use super::symbols::{CpythonTypeSymbol, RelocTypeRef};
 use super::{
-    CpythonTypeSymbol, ImportSpec, JitDeoptExitRef, JitEmitCtx, JitGuardMissDispatch, RelocTypeRef,
-    SOAC_RUNTIME_LOAD_GLOBAL_IMPORT, SOAC_RUNTIME_STORE_GLOBAL_IMPORT, SigType,
-    emit_increment_counter_slot, emit_owned_module_constant_from_parts, step_null_block_args,
+    ImportSpec, JitDeoptExitRef, JitEmitCtx, JitGuardMissDispatch, SOAC_RUNTIME_LOAD_GLOBAL_IMPORT,
+    SOAC_RUNTIME_STORE_GLOBAL_IMPORT, SigType, emit_increment_counter_slot,
+    emit_owned_module_constant_from_parts, step_null_block_args,
 };
 use crate::jit::blockpy_intrinsics;
 use cranelift_codegen::ir;
@@ -578,9 +579,7 @@ fn emit_exact_type_tag_for_value<'fb, E>(
     let ptr_ty = state.ctx().consts.ptr_ty;
     let i64_ty = state.ctx().consts.i64_ty;
     let py_long_type = state
-        .emit_type_ptr_value(&RelocTypeRef::CpythonTypeSymbol(
-            super::CpythonTypeSymbol::Long,
-        ))
+        .emit_type_ptr_value(&RelocTypeRef::CpythonTypeSymbol(CpythonTypeSymbol::Long))
         .expect("PyLong_Type symbol should bind during JIT codegen");
     let object_type = state.fb().ins().load(
         ptr_ty,

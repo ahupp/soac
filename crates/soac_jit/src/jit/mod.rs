@@ -38,17 +38,16 @@ use soac_ir_typed::plan_v3::{
 };
 use soac_ir_typed::{
     FactStore, InstrTyped, PyExactType, PyObjFacts, RuntimeHelperId, TypedAttrAccessPlan,
-    TypedAttrOwnerRef, TypedBlock, TypedBlockLayoutHint, TypedCall, TypedCallAccessPlan,
-    TypedCodegenModuleShape, TypedDirectCallArgPlan, TypedDirectCallArgSource,
-    TypedDirectCallGuardTest, TypedDirectCallGuardTestKind, TypedDirectCallableCall,
-    TypedDirectCallableCallGuard, TypedDirectConstructorCallGuard, TypedDirectFunctionCallGuard,
-    TypedDirectMethodCall, TypedDirectMethodCallGuard, TypedExactIntBranchPlan,
-    TypedExactIntPlanSource, TypedExactIntReturnPlan, TypedExactIntScalarThreadPlan,
-    TypedExactListItemAccessPlan, TypedExactListItemPlanSource, TypedGetAttr,
-    TypedGuardedCallableCall, TypedGuardedMethodCall, TypedIndexedFieldGuard,
-    TypedIndexedFieldPlanSource, TypedIndexedGlobalAccessPlan, TypedIndexedGlobalPlanSource,
-    TypedPlannedResult, TypedPyObjectOwnershipPlan, TypedSetAttr, ValueFacts,
-    lower_codegen_function_to_typed,
+    TypedBlock, TypedBlockLayoutHint, TypedCall, TypedCallAccessPlan, TypedCodegenModuleShape,
+    TypedDirectCallArgPlan, TypedDirectCallArgSource, TypedDirectCallGuardTest,
+    TypedDirectCallGuardTestKind, TypedDirectCallableCall, TypedDirectCallableCallGuard,
+    TypedDirectConstructorCallGuard, TypedDirectFunctionCallGuard, TypedDirectMethodCall,
+    TypedDirectMethodCallGuard, TypedExactIntBranchPlan, TypedExactIntPlanSource,
+    TypedExactIntReturnPlan, TypedExactIntScalarThreadPlan, TypedExactListItemAccessPlan,
+    TypedExactListItemPlanSource, TypedGetAttr, TypedGuardedCallableCall, TypedGuardedMethodCall,
+    TypedIndexedFieldGuard, TypedIndexedFieldPlanSource, TypedIndexedGlobalAccessPlan,
+    TypedIndexedGlobalPlanSource, TypedPlannedResult, TypedPyObjectOwnershipPlan, TypedSetAttr,
+    ValueFacts, lower_codegen_function_to_typed,
 };
 use soac_opt::access_emission_v3::{
     ExactListItemAccessPlan as OptV3ExactListItemAccessPlan,
@@ -238,17 +237,18 @@ use runtime_support::inline_runtime_support_calls;
 #[cfg(test)]
 use runtime_support::{ParsedRuntimeClifFunction, parse_runtime_clif_functions};
 pub use specialized_helpers::ObjPtr;
+use symbols::{
+    CpythonTypeSymbol, RelocCallableRef, RelocTypeRef, lookup_registered_jit_data_symbol,
+    register_jit_data_symbol, reloc_callable_ref_symbol_name,
+    reloc_type_ref_from_typed_attr_owner_ref, reloc_type_ref_symbol_name, scoped_jit_symbol,
+    type_key_runtime_registry, typed_attr_owner_ref_from_reloc_type_ref,
+};
 #[cfg(test)]
 use symbols::{
     SOAC_RUNTIME_DECREF_SYMBOL, SOAC_RUNTIME_INCREF_SYMBOL,
     SOAC_RUNTIME_PROBE_GLOBAL_INDEXED_SYMBOL, SOAC_RUNTIME_PYLONG_AS_I64_SATURATING_SYMBOL,
     SOAC_RUNTIME_PYLONG_AS_I64_SYMBOL, SOAC_RUNTIME_STORE_GLOBAL_INDEXED_SYMBOL,
     push_direct_function_module_identity,
-};
-use symbols::{
-    cpython_type_symbol_from_name, cpython_type_symbol_name, lookup_registered_jit_data_symbol,
-    register_jit_data_symbol, reloc_callable_ref_symbol_name, reloc_type_ref_symbol_name,
-    scoped_jit_symbol, type_key_runtime_registry,
 };
 pub(crate) use typed_pipeline::JitModulePlan;
 #[cfg(test)]
@@ -2055,50 +2055,6 @@ impl IndexedFieldLoweringPlan {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum CpythonTypeSymbol {
-    Function,
-    Method,
-    Type,
-    Long,
-    List,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum RelocTypeRef {
-    CpythonTypeSymbol(CpythonTypeSymbol),
-    TypeKey(CounterDumpTypeKey),
-}
-
-fn typed_attr_owner_ref_from_reloc_type_ref(owner_type_ref: &RelocTypeRef) -> TypedAttrOwnerRef {
-    match owner_type_ref {
-        RelocTypeRef::CpythonTypeSymbol(symbol) => {
-            TypedAttrOwnerRef::CpythonTypeSymbol(cpython_type_symbol_name(*symbol).to_string())
-        }
-        RelocTypeRef::TypeKey(type_key) => TypedAttrOwnerRef::TypeKey {
-            module_name: type_key.module_name.clone(),
-            qualname: type_key.qualname.clone(),
-        },
-    }
-}
-
-fn reloc_type_ref_from_typed_attr_owner_ref(
-    owner_type_ref: &TypedAttrOwnerRef,
-) -> Option<RelocTypeRef> {
-    match owner_type_ref {
-        TypedAttrOwnerRef::CpythonTypeSymbol(symbol_name) => {
-            cpython_type_symbol_from_name(symbol_name).map(RelocTypeRef::CpythonTypeSymbol)
-        }
-        TypedAttrOwnerRef::TypeKey {
-            module_name,
-            qualname,
-        } => Some(RelocTypeRef::TypeKey(CounterDumpTypeKey {
-            module_name: module_name.clone(),
-            qualname: qualname.clone(),
-        })),
-    }
-}
-
 fn field_index_specialization_from_typed_guard(
     guard: &TypedIndexedFieldGuard,
 ) -> Option<FieldIndexSpecialization> {
@@ -2107,14 +2063,6 @@ fn field_index_specialization_from_typed_guard(
         owner_type_ref: reloc_type_ref_from_typed_attr_owner_ref(&guard.owner_type_ref)?,
         type_version: guard.type_version,
     })
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum RelocCallableRef {
-    OwnerAttr {
-        owner_type_ref: RelocTypeRef,
-        attr_name: String,
-    },
 }
 
 struct LocalEnvCodegenIntrinsicEmitState<'a, 'b, 'mc, 'c, 'd, Env: JitCodegenEnv> {

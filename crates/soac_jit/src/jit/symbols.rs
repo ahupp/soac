@@ -1,11 +1,65 @@
-use super::{CpythonTypeSymbol, RelocCallableRef, RelocTypeRef};
 use crate::module_type::SharedModuleState;
 use pyo3::ffi;
 use soac_core::block_py::{BlockPyFunction, ModuleShape, RuntimeFunctionId};
 use soac_core::profile::CounterDumpTypeKey;
+use soac_ir_typed::TypedAttrOwnerRef;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) enum CpythonTypeSymbol {
+    Function,
+    Method,
+    Type,
+    Long,
+    List,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(super) enum RelocTypeRef {
+    CpythonTypeSymbol(CpythonTypeSymbol),
+    TypeKey(CounterDumpTypeKey),
+}
+
+pub(super) fn typed_attr_owner_ref_from_reloc_type_ref(
+    owner_type_ref: &RelocTypeRef,
+) -> TypedAttrOwnerRef {
+    match owner_type_ref {
+        RelocTypeRef::CpythonTypeSymbol(symbol) => {
+            TypedAttrOwnerRef::CpythonTypeSymbol(cpython_type_symbol_name(*symbol).to_string())
+        }
+        RelocTypeRef::TypeKey(type_key) => TypedAttrOwnerRef::TypeKey {
+            module_name: type_key.module_name.clone(),
+            qualname: type_key.qualname.clone(),
+        },
+    }
+}
+
+pub(super) fn reloc_type_ref_from_typed_attr_owner_ref(
+    owner_type_ref: &TypedAttrOwnerRef,
+) -> Option<RelocTypeRef> {
+    match owner_type_ref {
+        TypedAttrOwnerRef::CpythonTypeSymbol(symbol_name) => {
+            cpython_type_symbol_from_name(symbol_name).map(RelocTypeRef::CpythonTypeSymbol)
+        }
+        TypedAttrOwnerRef::TypeKey {
+            module_name,
+            qualname,
+        } => Some(RelocTypeRef::TypeKey(CounterDumpTypeKey {
+            module_name: module_name.clone(),
+            qualname: qualname.clone(),
+        })),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(super) enum RelocCallableRef {
+    OwnerAttr {
+        owner_type_ref: RelocTypeRef,
+        attr_name: String,
+    },
+}
 
 static JIT_DATA_SYMBOLS: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
 static TYPE_KEY_RUNTIME_REGISTRY: OnceLock<Mutex<HashMap<CounterDumpTypeKey, usize>>> =

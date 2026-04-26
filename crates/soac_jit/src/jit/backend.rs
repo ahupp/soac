@@ -3,11 +3,12 @@ use super::runtime_support::{inline_runtime_support_calls, load_runtime_support_
 use super::signal_diagnostics;
 use super::specialized_helpers::register_specialized_jit_symbols;
 use super::symbols::{
-    cpython_type_symbol_name, lookup_registered_jit_data_symbol, py_dealloc_symbol,
+    CpythonTypeSymbol, cpython_type_symbol_name, lookup_registered_jit_data_symbol,
+    py_dealloc_symbol,
 };
 use super::{
-    _PyDict_IndexedValueTombstone, CpythonTypeSymbol, PyFunction_Type, PyList_Type, PyLong_Type,
-    PyMethod_Type, PyType_Type,
+    _PyDict_IndexedValueTombstone, PyFunction_Type, PyList_Type, PyLong_Type, PyMethod_Type,
+    PyType_Type,
 };
 use crate::config::CraneliftTargetConfig;
 use crate::function_instantiation::{
