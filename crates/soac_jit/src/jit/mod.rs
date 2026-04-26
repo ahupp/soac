@@ -13,7 +13,7 @@ use soac_core::block_py as blockpy_intrinsics;
 use soac_core::block_py::{
     AbruptKind, Block, BlockArg, BlockEdge, BlockLabel, BlockParamRole, BlockPyFunction,
     BlockPyModule, BlockTerm, CallArgKeyword, CallArgPositional, CallableScopeKind, CellLocation,
-    ChildVisitable, CounterDef, CounterId, CounterScope, CounterSite, Del, DeoptEntrySource,
+    ChildVisitable, CounterDef, CounterId, CounterSite, Del, DeoptEntrySource,
     FunctionExecutionMode, FunctionKind, HasSemanticInstrId, InstrId, InstrKey, InstrLocationMap,
     LocalLocation, ModuleShape, NameLocation, PersistentFunctionId, ResolvedName,
     RuntimeFunctionId, RuntimeModuleId, RuntimeName, SerializedFunctionId, StorageLayout, Store,
@@ -151,20 +151,27 @@ mod typed_value;
 mod vectorcall;
 
 #[cfg(test)]
+use backend::define_prepared_function;
+#[cfg(test)]
 use backend::new_jit_module;
 #[cfg(test)]
 use backend::normalize_postopt_clif_for_inspection;
-use backend::{CompiledFunctionBytes, define_prepared_function, new_jit_builder};
+use backend::{CompiledFunctionBytes, new_jit_builder};
 #[cfg(test)]
 use backend::{stable_cranelift_function_hash, stable_cranelift_function_name};
-use codegen_env::{FuncBuildImports, JitCodegenEnv, declare_local_fn, lower_static_signature};
+#[cfg(test)]
+use codegen_env::declare_local_fn;
+use codegen_env::{FuncBuildImports, JitCodegenEnv};
 pub(crate) use compiled::{
     CompiledFunctionHandle, DirectFunctionCompileResult, JitCodegenStats, VectorcallEntryFn,
 };
 pub(crate) use counters::CounterRef;
+#[cfg(test)]
+use counters::build_counted_runtime_refcount_helper;
 use counters::{
-    emit_increment_counter_slot, emit_record_top_value_counter_slot, scalar_counter_addr,
-    scalar_counter_slot_for_id, scalar_counter_slot_for_ref, top_value_counter_slot_for_id,
+    CountedRefcountHelpers, build_counted_runtime_refcount_helpers, emit_increment_counter_slot,
+    emit_record_top_value_counter_slot, scalar_counter_slot_for_id, scalar_counter_slot_for_ref,
+    top_value_counter_slot_for_id,
 };
 pub(crate) use deopt::RuntimeFunctionEntryPlan;
 #[cfg(test)]
@@ -246,7 +253,7 @@ pub use specialized_helpers::ObjPtr;
 use symbols::{
     CpythonTypeSymbol, RelocCallableRef, RelocTypeRef, lookup_registered_jit_data_symbol,
     register_jit_data_symbol, reloc_callable_ref_symbol_name,
-    reloc_type_ref_from_typed_attr_owner_ref, reloc_type_ref_symbol_name, scoped_jit_symbol,
+    reloc_type_ref_from_typed_attr_owner_ref, reloc_type_ref_symbol_name,
     type_key_runtime_registry, typed_attr_owner_ref_from_reloc_type_ref,
 };
 #[cfg(test)]
@@ -299,8 +306,7 @@ use imports::{
     PYNUMBER_MULTIPLY_IMPORT, PYNUMBER_OR_IMPORT, PYNUMBER_SUBTRACT_IMPORT, PYNUMBER_XOR_IMPORT,
     PYOBJECT_RICHCOMPARE_IMPORT, SOAC_JIT_MAKE_FUNCTION_WITH_CLOSURE_IMPORT,
     SOAC_RUNTIME_BUILTIN_CHR_I64_IMPORT, SOAC_RUNTIME_BUILTIN_LEN_I64_IMPORT,
-    SOAC_RUNTIME_BUILTIN_ORD_I64_IMPORT, SOAC_RUNTIME_DECREF_APPLIED_IMPORT,
-    SOAC_RUNTIME_INCREF_APPLIED_IMPORT, SOAC_RUNTIME_LOAD_GLOBAL_IMPORT,
+    SOAC_RUNTIME_BUILTIN_ORD_I64_IMPORT, SOAC_RUNTIME_LOAD_GLOBAL_IMPORT,
     SOAC_RUNTIME_LOAD_GLOBAL_SLOW_IMPORT, SOAC_RUNTIME_PROBE_FIELD_INDEXED_IMPORT,
     SOAC_RUNTIME_PROBE_GLOBAL_INDEXED_IMPORT, SOAC_RUNTIME_PYLONG_AS_I64_SATURATING_IMPORT,
     SOAC_RUNTIME_SET_RAISED_EXCEPTION_IMPORT, SOAC_RUNTIME_STORE_FIELD_INDEXED_IMPORT,
@@ -308,6 +314,8 @@ use imports::{
     SOAC_RUNTIME_TUPLE_NEW_IMPORT, SOAC_RUNTIME_TUPLE_SET_ITEM_STOLEN_IMPORT, SigType,
     predeclare_specialization_type_imports,
 };
+#[cfg(test)]
+use imports::{SOAC_RUNTIME_DECREF_APPLIED_IMPORT, SOAC_RUNTIME_INCREF_APPLIED_IMPORT};
 use inspection::{
     ClifBlockDisplayAnnotations, register_block_display_annotation,
     render_compiled_clif_and_vcode_disasm, render_instr_typed_preorder_extras,
@@ -4242,21 +4250,7 @@ fn emit_increment_counter(
             counter_id.0
         )
     });
-    let (counter_addr, counter_offset) =
-        scalar_counter_addr(fb, scalar_counter_base_value, counter_slot);
-    let old_value = fb.ins().load(
-        ir::types::I64,
-        ir::MemFlags::trusted(),
-        counter_addr,
-        counter_offset,
-    );
-    let new_value = fb.ins().iadd_imm(old_value, 1);
-    fb.ins().store(
-        ir::MemFlags::trusted(),
-        new_value,
-        counter_addr,
-        counter_offset,
-    );
+    emit_increment_counter_slot(fb, scalar_counter_base_value, counter_slot);
     // TODO: Split codegen instructions into value-producing vs non-value-producing ops
     // and elide retain/release work when a statement result is not consumed.
     let none_const = emit_none_const(fb, ctx);
@@ -4278,188 +4272,6 @@ fn emit_increment_counter_ref(
         )
     });
     emit_increment_counter_slot(fb, scalar_counter_base_value, counter_slot);
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct CountedRefcountHelpers {
-    incref_func_id: Option<FuncId>,
-    decref_func_id: Option<FuncId>,
-}
-
-fn lookup_counter_id(
-    counter_defs: &[CounterDef],
-    scope: CounterScope,
-    kind: &str,
-    site: &CounterSite,
-) -> Option<CounterId> {
-    counter_defs.iter().find_map(|counter| {
-        (counter.scope == scope && counter.kind == kind && &counter.site == site)
-            .then_some(counter.id)
-    })
-}
-
-fn lookup_runtime_counter_id(
-    counter_defs: &[CounterDef],
-    function_id: RuntimeFunctionId,
-    kind: &str,
-) -> Option<CounterId> {
-    lookup_counter_id(
-        counter_defs,
-        CounterScope::Function,
-        kind,
-        &CounterSite::Runtime {
-            function_id: Some(function_id),
-            instr_id: None,
-        },
-    )
-    .or_else(|| {
-        lookup_counter_id(
-            counter_defs,
-            CounterScope::Global,
-            kind,
-            &CounterSite::Runtime {
-                function_id: None,
-                instr_id: None,
-            },
-        )
-    })
-}
-
-fn build_counted_runtime_refcount_helper(
-    jit_module: &mut JITModule,
-    env_config: &SoacEnvConfig,
-    symbol_name: &str,
-    function_name: &str,
-    wrapper_import: &'static ImportSpec,
-    applied_import: &'static ImportSpec,
-    scalar_counter_data_id: DataId,
-    counter_slot: usize,
-) -> Result<FuncId, String> {
-    let ptr_ty = jit_module.codegen_target_config().pointer_type();
-    let sig = lower_static_signature(jit_module, wrapper_import.signature);
-    let helper_id = declare_local_fn(jit_module, symbol_name, &sig)?;
-
-    let mut ctx = jit_module.codegen_make_context();
-    ctx.func.signature = sig;
-    let mut builder_ctx = FunctionBuilderContext::new();
-    {
-        let mut fb = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
-        let entry_block = fb.create_block();
-        fb.append_block_params_for_function_params(entry_block);
-        fb.switch_to_block(entry_block);
-        let call_args = fb.block_params(entry_block).to_vec();
-        let mut module_imports = ModuleFuncImports::new();
-        let mut func_imports = FuncBuildImports::new(&mut module_imports);
-        let runtime_ref = func_imports.get_or_panic(jit_module, &mut fb.func, applied_import);
-        let runtime_call = fb.ins().call(runtime_ref, &call_args);
-        let applied = fb.inst_results(runtime_call)[0];
-        let counter_data =
-            jit_module.codegen_declare_data_in_func(scalar_counter_data_id, &mut fb.func)?;
-        let scalar_counter_base_value = fb.ins().global_value(ptr_ty, counter_data);
-        let (counter_addr, counter_offset) =
-            scalar_counter_addr(&mut fb, scalar_counter_base_value, counter_slot);
-        let old_value = fb.ins().load(
-            ir::types::I64,
-            ir::MemFlags::trusted(),
-            counter_addr,
-            counter_offset,
-        );
-        let applied_i64 = fb.ins().uextend(ir::types::I64, applied);
-        let new_value = fb.ins().iadd(old_value, applied_i64);
-        fb.ins().store(
-            ir::MemFlags::trusted(),
-            new_value,
-            counter_addr,
-            counter_offset,
-        );
-        fb.ins().return_(&[]);
-        fb.seal_all_blocks();
-        fb.finalize();
-    }
-
-    let _ = define_prepared_function(
-        jit_module,
-        env_config,
-        helper_id,
-        &mut ctx,
-        function_name,
-        "failed to define counted runtime refcount helper",
-    )?;
-    jit_module.codegen_clear_context(&mut ctx);
-    Ok(helper_id)
-}
-
-fn build_counted_runtime_refcount_helpers(
-    jit_module: &mut JITModule,
-    env_config: &SoacEnvConfig,
-    function: &BlockPyFunction<impl ModuleShape>,
-    counter_defs: &[CounterDef],
-    counter_slots_by_id: &[CounterRuntimeSlot],
-    scalar_counter_data_id: Option<DataId>,
-    symbol_scope: Option<&str>,
-) -> Result<CountedRefcountHelpers, String> {
-    if !env_config.jit_refcount_emission_enabled() {
-        return Ok(CountedRefcountHelpers::default());
-    }
-
-    let incref_func_id =
-        lookup_runtime_counter_id(counter_defs, function.function_id, "runtime_incref")
-            .map(|counter_id| {
-                let counter_slot = scalar_counter_slot_for_id(counter_slots_by_id, counter_id)?;
-                let scalar_counter_data_id = scalar_counter_data_id.ok_or_else(|| {
-                    format!(
-                        "missing scalar counter storage for runtime incref counter {}",
-                        counter_id.0
-                    )
-                })?;
-                let helper_name = scoped_jit_symbol(
-                    format!("py:rc:incref:{}", function.names.qualname).as_str(),
-                    symbol_scope,
-                );
-                build_counted_runtime_refcount_helper(
-                    jit_module,
-                    env_config,
-                    &helper_name,
-                    &helper_name,
-                    &DP_JIT_INCREF_IMPORT,
-                    &SOAC_RUNTIME_INCREF_APPLIED_IMPORT,
-                    scalar_counter_data_id,
-                    counter_slot,
-                )
-            })
-            .transpose()?;
-
-    let decref_func_id =
-        lookup_runtime_counter_id(counter_defs, function.function_id, "runtime_decref")
-            .map(|counter_id| {
-                let counter_slot = scalar_counter_slot_for_id(counter_slots_by_id, counter_id)?;
-                let scalar_counter_data_id = scalar_counter_data_id.ok_or_else(|| {
-                    format!(
-                        "missing scalar counter storage for runtime decref counter {}",
-                        counter_id.0
-                    )
-                })?;
-                let helper_name = scoped_jit_symbol(
-                    format!("py:rc:decref:{}", function.names.qualname).as_str(),
-                    symbol_scope,
-                );
-                build_counted_runtime_refcount_helper(
-                    jit_module,
-                    env_config,
-                    &helper_name,
-                    &helper_name,
-                    &DP_JIT_DECREF_IMPORT,
-                    &SOAC_RUNTIME_DECREF_APPLIED_IMPORT,
-                    scalar_counter_data_id,
-                    counter_slot,
-                )
-            })
-            .transpose()?;
-
-    Ok(CountedRefcountHelpers {
-        incref_func_id,
-        decref_func_id,
-    })
 }
 
 fn emit_raw_cell_object_for_name_with_local_env(
