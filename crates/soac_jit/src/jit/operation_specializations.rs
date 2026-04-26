@@ -1,3 +1,6 @@
+use super::counters::{
+    CounterRef, emit_record_top_value_counter_slot, top_value_counter_slot_for_id,
+};
 use super::intrinsics::{OperationEmitState, increment_counter_with_state};
 use super::symbols::{CpythonTypeSymbol, RelocTypeRef};
 use cranelift_codegen::ir;
@@ -188,9 +191,8 @@ fn emit_record_item_shape_counter<'fb, E>(
     counter_id: CounterId,
     shape: ir::Value,
 ) {
-    let counter_slot =
-        super::top_value_counter_slot_for_id(state.ctx().counter_slots_by_id, counter_id)
-            .unwrap_or_else(|err| panic!("{err}"));
+    let counter_slot = top_value_counter_slot_for_id(state.ctx().counter_slots_by_id, counter_id)
+        .unwrap_or_else(|err| panic!("{err}"));
     let top_value_counter_base_value = state
         .ctx()
         .consts
@@ -208,7 +210,7 @@ fn emit_record_item_shape_counter<'fb, E>(
                 counter_id.0
             )
         });
-    super::emit_record_top_value_counter_slot(
+    emit_record_top_value_counter_slot(
         state.fb(),
         top_value_counter_base_value,
         counter_slot,
@@ -345,8 +347,8 @@ fn emit_exact_list_item_getitem_from_plan<'fb, E>(
     state: &mut impl OperationEmitState<'fb, E>,
     arg_values: &[(ir::Value, bool)],
     plan: ExactListItemLoweringPlan,
-    specialized_hit_counter_id: Option<super::CounterRef>,
-    specialized_fallback_counter_id: Option<super::CounterRef>,
+    specialized_hit_counter_id: Option<CounterRef>,
+    specialized_fallback_counter_id: Option<CounterRef>,
 ) -> ir::Value {
     plan.expect_exact_list_exact_int(ExactListItemAccessKind::Get);
     emit_exact_list_exact_int_getitem(
@@ -362,8 +364,8 @@ fn emit_exact_list_item_setitem_from_plan<'fb, E>(
     state: &mut impl OperationEmitState<'fb, E>,
     arg_values: &[(ir::Value, bool)],
     plan: ExactListItemLoweringPlan,
-    specialized_hit_counter_id: Option<super::CounterRef>,
-    specialized_fallback_counter_id: Option<super::CounterRef>,
+    specialized_hit_counter_id: Option<CounterRef>,
+    specialized_fallback_counter_id: Option<CounterRef>,
 ) -> ir::Value {
     plan.expect_exact_list_exact_int(ExactListItemAccessKind::Set);
     emit_exact_list_exact_int_setitem(
@@ -554,8 +556,8 @@ fn emit_exact_list_exact_int_getitem<'fb, E>(
     state: &mut impl OperationEmitState<'fb, E>,
     arg_values: &[(ir::Value, bool)],
     plan: ExactListItemLoweringPlan,
-    specialized_hit_counter_id: Option<super::CounterRef>,
-    specialized_fallback_counter_id: Option<super::CounterRef>,
+    specialized_hit_counter_id: Option<CounterRef>,
+    specialized_fallback_counter_id: Option<CounterRef>,
 ) -> ir::Value {
     let Some(list_type) =
         state.emit_type_ptr_value(&RelocTypeRef::CpythonTypeSymbol(CpythonTypeSymbol::List))
@@ -631,8 +633,8 @@ fn emit_exact_list_exact_int_setitem<'fb, E>(
     state: &mut impl OperationEmitState<'fb, E>,
     arg_values: &[(ir::Value, bool)],
     plan: ExactListItemLoweringPlan,
-    specialized_hit_counter_id: Option<super::CounterRef>,
-    specialized_fallback_counter_id: Option<super::CounterRef>,
+    specialized_hit_counter_id: Option<CounterRef>,
+    specialized_fallback_counter_id: Option<CounterRef>,
 ) -> ir::Value {
     debug_assert_eq!(arg_values.len(), 3);
     let Some(list_type) =

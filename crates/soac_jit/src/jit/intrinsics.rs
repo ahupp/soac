@@ -1,9 +1,13 @@
+use super::counters::{
+    CounterRef, emit_increment_counter_slot, emit_record_top_value_counter_slot,
+    scalar_counter_slot_for_ref, top_value_counter_slot_for_id,
+};
 use super::operation_specializations;
 use super::symbols::{CpythonTypeSymbol, RelocTypeRef};
 use super::{
     ImportSpec, JitDeoptExitRef, JitEmitCtx, JitGuardMissDispatch, SOAC_RUNTIME_LOAD_GLOBAL_IMPORT,
-    SOAC_RUNTIME_STORE_GLOBAL_IMPORT, SigType, emit_increment_counter_slot,
-    emit_owned_module_constant_from_parts, step_null_block_args,
+    SOAC_RUNTIME_STORE_GLOBAL_IMPORT, SigType, emit_owned_module_constant_from_parts,
+    step_null_block_args,
 };
 use crate::jit::blockpy_intrinsics;
 use cranelift_codegen::ir;
@@ -628,9 +632,8 @@ where
         return false;
     };
     let shape = emit_binary_operator_shape_from_values(state, arg_values);
-    let counter_slot =
-        super::top_value_counter_slot_for_id(state.ctx().counter_slots_by_id, counter_id)
-            .unwrap_or_else(|err| panic!("{err}"));
+    let counter_slot = top_value_counter_slot_for_id(state.ctx().counter_slots_by_id, counter_id)
+        .unwrap_or_else(|err| panic!("{err}"));
     let top_value_counter_base_value = state
         .ctx()
         .consts
@@ -648,7 +651,7 @@ where
                 counter_id.0
             )
         });
-    super::emit_record_top_value_counter_slot(
+    emit_record_top_value_counter_slot(
         state.fb(),
         top_value_counter_base_value,
         counter_slot,
@@ -943,13 +946,13 @@ fn emit_unary_op<'fb, E>(
 
 pub(super) fn increment_counter_with_state<'fb, E>(
     state: &mut impl OperationEmitState<'fb, E>,
-    counter_ref: Option<super::CounterRef>,
+    counter_ref: Option<CounterRef>,
 ) {
     let Some(counter_ref) = counter_ref else {
         return;
     };
     let scalar_counter_slot =
-        super::scalar_counter_slot_for_ref(state.ctx().counter_slots_by_id, counter_ref)
+        scalar_counter_slot_for_ref(state.ctx().counter_slots_by_id, counter_ref)
             .unwrap_or_else(|err| panic!("{err}"));
     let scalar_counter_base_value =
         state
