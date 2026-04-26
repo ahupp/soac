@@ -1,13 +1,20 @@
 use super::codegen_env::{FuncBuildImports, JitCodegenEnv, declare_import_fn, declare_local_fn};
 use super::imports::{DP_JIT_RAISE_MISSING_REQUIRED_ARGUMENT_IMPORT, ModuleFuncImports};
 use super::runtime_context::{FUNCTION_ENV_RUNTIME_OBJECTS_OFFSET, FunctionRuntimeDataLayout};
-use super::symbols::{default_direct_function_symbol, direct_function_symbol};
+use super::symbols::{
+    RelocCallableRef, RelocTypeRef, default_direct_function_symbol, direct_function_symbol,
+    reloc_type_ref_from_typed_attr_owner_ref,
+};
 use super::{DeclaredJitFunction, block_arg_values, emit_function_data_slot_borrowed};
 use cranelift_codegen::ir;
 use cranelift_codegen::ir::InstBuilder;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_module::FuncId;
 use soac_core::block_py::{BlockPyFunction, ModuleShape, ParamKind, RuntimeFunctionId};
+use soac_ir_typed::{
+    InstrTyped, TypedDirectCallArgPlan, TypedDirectCallArgSource, TypedDirectConstructorCallGuard,
+    TypedDirectFunctionCallGuard, TypedDirectMethodCall, TypedDirectMethodCallGuard,
+};
 use std::cell::Cell;
 use std::collections::HashMap;
 use tracing::info;
@@ -33,6 +40,118 @@ impl DirectCallArgPlan {
 pub(super) enum DirectCallArgSource {
     Provided(usize),
     DefaultSentinel,
+}
+
+#[derive(Clone)]
+pub(super) struct DirectMethodSpecialization {
+    pub(super) function_id: RuntimeFunctionId,
+    pub(super) descriptor_function_ref: RelocCallableRef,
+    pub(super) owner_type_ref: RelocTypeRef,
+    pub(super) type_version: u32,
+    pub(super) arg_plan: DirectCallArgPlan,
+}
+
+#[derive(Clone)]
+pub(super) struct DirectConstructorSpecialization {
+    pub(super) function_id: RuntimeFunctionId,
+    pub(super) init_function_ref: RelocCallableRef,
+    pub(super) owner_type_ref: RelocTypeRef,
+    pub(super) type_version: u32,
+    pub(super) arg_plan: DirectCallArgPlan,
+}
+
+#[derive(Clone)]
+pub(super) struct DirectFunctionSpecialization {
+    pub(super) function_id: RuntimeFunctionId,
+    pub(super) arg_plan: DirectCallArgPlan,
+}
+
+pub(super) fn direct_call_arg_plan_from_typed(plan: &TypedDirectCallArgPlan) -> DirectCallArgPlan {
+    DirectCallArgPlan {
+        sources: plan
+            .sources
+            .iter()
+            .map(|source| match source {
+                TypedDirectCallArgSource::Provided(index) => DirectCallArgSource::Provided(*index),
+                TypedDirectCallArgSource::DefaultSentinel => DirectCallArgSource::DefaultSentinel,
+            })
+            .collect(),
+    }
+}
+
+pub(super) fn direct_function_specializations_from_typed_guards(
+    guards: &[TypedDirectFunctionCallGuard],
+) -> Vec<DirectFunctionSpecialization> {
+    guards
+        .iter()
+        .map(|guard| DirectFunctionSpecialization {
+            function_id: guard.function_id,
+            arg_plan: direct_call_arg_plan_from_typed(&guard.arg_plan),
+        })
+        .collect()
+}
+
+pub(super) fn direct_constructor_specializations_from_typed_guards(
+    guards: &[TypedDirectConstructorCallGuard],
+) -> Vec<DirectConstructorSpecialization> {
+    guards
+        .iter()
+        .filter_map(direct_constructor_specialization_from_typed_guard)
+        .collect()
+}
+
+pub(super) fn direct_constructor_specialization_from_typed_guard(
+    guard: &TypedDirectConstructorCallGuard,
+) -> Option<DirectConstructorSpecialization> {
+    let owner_type_ref = reloc_type_ref_from_typed_attr_owner_ref(&guard.owner_type_ref)?;
+    Some(DirectConstructorSpecialization {
+        function_id: guard.function_id,
+        init_function_ref: RelocCallableRef::OwnerAttr {
+            owner_type_ref: owner_type_ref.clone(),
+            attr_name: "__init__".to_string(),
+        },
+        owner_type_ref,
+        type_version: guard.type_version,
+        arg_plan: direct_call_arg_plan_from_typed(&guard.arg_plan),
+    })
+}
+
+pub(super) fn direct_method_specializations_from_typed_guards(
+    guards: &[TypedDirectMethodCallGuard],
+    method_name: &str,
+) -> Vec<DirectMethodSpecialization> {
+    guards
+        .iter()
+        .filter_map(|guard| {
+            let owner_type_ref = reloc_type_ref_from_typed_attr_owner_ref(&guard.owner_type_ref)?;
+            Some(DirectMethodSpecialization {
+                function_id: guard.function_id,
+                descriptor_function_ref: RelocCallableRef::OwnerAttr {
+                    owner_type_ref: owner_type_ref.clone(),
+                    attr_name: method_name.to_string(),
+                },
+                owner_type_ref,
+                type_version: guard.type_version,
+                arg_plan: direct_call_arg_plan_from_typed(&guard.arg_plan),
+            })
+        })
+        .collect()
+}
+
+pub(super) fn direct_method_specialization_from_typed_call(
+    call: &TypedDirectMethodCall<InstrTyped>,
+) -> Option<DirectMethodSpecialization> {
+    let owner_type_ref = reloc_type_ref_from_typed_attr_owner_ref(&call.guard.owner_type_ref)?;
+    Some(DirectMethodSpecialization {
+        function_id: call.guard.function_id,
+        descriptor_function_ref: RelocCallableRef::OwnerAttr {
+            owner_type_ref: owner_type_ref.clone(),
+            attr_name: call.method_name.clone(),
+        },
+        owner_type_ref,
+        type_version: call.guard.type_version,
+        arg_plan: direct_call_arg_plan_from_typed(&call.guard.arg_plan),
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

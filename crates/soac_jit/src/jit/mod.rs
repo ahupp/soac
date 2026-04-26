@@ -38,15 +38,14 @@ use soac_ir_typed::plan_v3::{
 use soac_ir_typed::{
     FactStore, InstrTyped, PyExactType, PyObjFacts, RuntimeHelperId, TypedAttrAccessPlan,
     TypedBlock, TypedBlockLayoutHint, TypedCall, TypedCallAccessPlan, TypedCodegenModuleShape,
-    TypedDirectCallArgPlan, TypedDirectCallArgSource, TypedDirectCallGuardTest,
-    TypedDirectCallGuardTestKind, TypedDirectCallableCall, TypedDirectCallableCallGuard,
-    TypedDirectConstructorCallGuard, TypedDirectFunctionCallGuard, TypedDirectMethodCall,
-    TypedDirectMethodCallGuard, TypedExactIntBranchPlan, TypedExactIntPlanSource,
-    TypedExactIntReturnPlan, TypedExactIntScalarThreadPlan, TypedExactListItemAccessPlan,
-    TypedExactListItemPlanSource, TypedGetAttr, TypedGuardedCallableCall, TypedGuardedMethodCall,
-    TypedIndexedFieldGuard, TypedIndexedFieldPlanSource, TypedIndexedGlobalAccessPlan,
-    TypedIndexedGlobalPlanSource, TypedPlannedResult, TypedPyObjectOwnershipPlan, TypedSetAttr,
-    ValueFacts, lower_codegen_function_to_typed,
+    TypedDirectCallArgPlan, TypedDirectCallGuardTest, TypedDirectCallGuardTestKind,
+    TypedDirectCallableCall, TypedDirectCallableCallGuard, TypedDirectMethodCall,
+    TypedExactIntBranchPlan, TypedExactIntPlanSource, TypedExactIntReturnPlan,
+    TypedExactIntScalarThreadPlan, TypedExactListItemAccessPlan, TypedExactListItemPlanSource,
+    TypedGetAttr, TypedGuardedCallableCall, TypedGuardedMethodCall, TypedIndexedFieldGuard,
+    TypedIndexedFieldPlanSource, TypedIndexedGlobalAccessPlan, TypedIndexedGlobalPlanSource,
+    TypedPlannedResult, TypedPyObjectOwnershipPlan, TypedSetAttr, ValueFacts,
+    lower_codegen_function_to_typed,
 };
 use soac_opt::access_emission_v3::{
     ExactListItemAccessPlan as OptV3ExactListItemAccessPlan,
@@ -188,9 +187,15 @@ use direct_abi::{
     ParamAbi, PyLongI64Coercion, ResultAbi,
 };
 use direct_function::{
-    DirectCallArgPlan, DirectCallArgSource, DirectCallEntryKind, DirectEdgeStats,
-    declare_direct_function, make_direct_function_signature,
-    record_profiled_direct_call_incompatibility, validate_direct_call_compatibility,
+    DirectCallArgPlan, DirectCallArgSource, DirectCallEntryKind, DirectConstructorSpecialization,
+    DirectEdgeStats, DirectFunctionSpecialization, DirectMethodSpecialization,
+    declare_direct_function, direct_call_arg_plan_from_typed,
+    direct_constructor_specialization_from_typed_guard,
+    direct_constructor_specializations_from_typed_guards,
+    direct_function_specializations_from_typed_guards,
+    direct_method_specialization_from_typed_call, direct_method_specializations_from_typed_guards,
+    make_direct_function_signature, record_profiled_direct_call_incompatibility,
+    validate_direct_call_compatibility,
 };
 #[cfg(test)]
 use direct_function::{DirectCallIncompatibility, plan_direct_call_args_for_target};
@@ -1802,118 +1807,6 @@ impl JitEmitCtx<'_> {
 #[cfg(test)]
 fn infer_jit_value_facts(module: &BlockPyModule<CodegenModuleShape>) -> FactStore {
     infer_module_value_facts(module)
-}
-
-#[derive(Clone)]
-struct DirectMethodSpecialization {
-    function_id: RuntimeFunctionId,
-    descriptor_function_ref: RelocCallableRef,
-    owner_type_ref: RelocTypeRef,
-    type_version: u32,
-    arg_plan: DirectCallArgPlan,
-}
-
-#[derive(Clone)]
-struct DirectConstructorSpecialization {
-    function_id: RuntimeFunctionId,
-    init_function_ref: RelocCallableRef,
-    owner_type_ref: RelocTypeRef,
-    type_version: u32,
-    arg_plan: DirectCallArgPlan,
-}
-
-#[derive(Clone)]
-struct DirectFunctionSpecialization {
-    function_id: RuntimeFunctionId,
-    arg_plan: DirectCallArgPlan,
-}
-
-fn direct_call_arg_plan_from_typed(plan: &TypedDirectCallArgPlan) -> DirectCallArgPlan {
-    DirectCallArgPlan {
-        sources: plan
-            .sources
-            .iter()
-            .map(|source| match source {
-                TypedDirectCallArgSource::Provided(index) => DirectCallArgSource::Provided(*index),
-                TypedDirectCallArgSource::DefaultSentinel => DirectCallArgSource::DefaultSentinel,
-            })
-            .collect(),
-    }
-}
-
-fn direct_function_specializations_from_typed_guards(
-    guards: &[TypedDirectFunctionCallGuard],
-) -> Vec<DirectFunctionSpecialization> {
-    guards
-        .iter()
-        .map(|guard| DirectFunctionSpecialization {
-            function_id: guard.function_id,
-            arg_plan: direct_call_arg_plan_from_typed(&guard.arg_plan),
-        })
-        .collect()
-}
-
-fn direct_constructor_specializations_from_typed_guards(
-    guards: &[TypedDirectConstructorCallGuard],
-) -> Vec<DirectConstructorSpecialization> {
-    guards
-        .iter()
-        .filter_map(direct_constructor_specialization_from_typed_guard)
-        .collect()
-}
-
-fn direct_constructor_specialization_from_typed_guard(
-    guard: &TypedDirectConstructorCallGuard,
-) -> Option<DirectConstructorSpecialization> {
-    let owner_type_ref = reloc_type_ref_from_typed_attr_owner_ref(&guard.owner_type_ref)?;
-    Some(DirectConstructorSpecialization {
-        function_id: guard.function_id,
-        init_function_ref: RelocCallableRef::OwnerAttr {
-            owner_type_ref: owner_type_ref.clone(),
-            attr_name: "__init__".to_string(),
-        },
-        owner_type_ref,
-        type_version: guard.type_version,
-        arg_plan: direct_call_arg_plan_from_typed(&guard.arg_plan),
-    })
-}
-
-fn direct_method_specializations_from_typed_guards(
-    guards: &[TypedDirectMethodCallGuard],
-    method_name: &str,
-) -> Vec<DirectMethodSpecialization> {
-    guards
-        .iter()
-        .filter_map(|guard| {
-            let owner_type_ref = reloc_type_ref_from_typed_attr_owner_ref(&guard.owner_type_ref)?;
-            Some(DirectMethodSpecialization {
-                function_id: guard.function_id,
-                descriptor_function_ref: RelocCallableRef::OwnerAttr {
-                    owner_type_ref: owner_type_ref.clone(),
-                    attr_name: method_name.to_string(),
-                },
-                owner_type_ref,
-                type_version: guard.type_version,
-                arg_plan: direct_call_arg_plan_from_typed(&guard.arg_plan),
-            })
-        })
-        .collect()
-}
-
-fn direct_method_specialization_from_typed_call(
-    call: &TypedDirectMethodCall<InstrTyped>,
-) -> Option<DirectMethodSpecialization> {
-    let owner_type_ref = reloc_type_ref_from_typed_attr_owner_ref(&call.guard.owner_type_ref)?;
-    Some(DirectMethodSpecialization {
-        function_id: call.guard.function_id,
-        descriptor_function_ref: RelocCallableRef::OwnerAttr {
-            owner_type_ref: owner_type_ref.clone(),
-            attr_name: call.method_name.clone(),
-        },
-        owner_type_ref,
-        type_version: call.guard.type_version,
-        arg_plan: direct_call_arg_plan_from_typed(&call.guard.arg_plan),
-    })
 }
 
 fn direct_call_target_function<'a>(
