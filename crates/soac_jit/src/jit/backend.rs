@@ -8,6 +8,7 @@ use crate::function_instantiation::{
     SOAC_JIT_MAKE_FUNCTION_WITH_CLOSURE_SYMBOL, soac_jit_make_function_with_closure,
 };
 use cranelift_codegen::flowgraph::ControlFlowGraph;
+use cranelift_control::ControlPlane;
 use cranelift_jit::{ArenaMemoryProvider, JITBuilder, JITModule};
 use cranelift_module::ModuleReloc;
 
