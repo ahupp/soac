@@ -45,7 +45,12 @@ mod tests {
     use super::super::direct_abi;
     use super::super::function_targets::collect_planned_typed_call_direct_targets;
     use super::super::operation_specializations::{
+        FieldIndexSpecialization, OptV3ResolvedIndexedFieldAccess,
         owner_type_supports_field_layout_priming, prime_field_index_layout,
+    };
+    use super::super::specialization_profile::{
+        DirectCallEmissionScope, planned_optimization_inputs_from_v3_artifacts,
+        planned_optimization_inputs_from_v3_artifacts_for_codegen_module,
     };
     use super::super::symbols::{reloc_type_ref_for_type, resolve_reloc_type_ref_to_type};
     use super::super::typed_pipeline::{
@@ -56,13 +61,11 @@ mod tests {
         CodegenBlock, DP_JIT_DECREF_IMPORT, DP_JIT_DEOPT_RESUME_IMPORT, DP_JIT_INCREF_IMPORT,
         DP_JIT_PY_CALL_POSITIONAL_THREE_IMPORT, DP_JIT_PY_VECTORCALL_IMPORT,
         DP_JIT_PYOBJECT_SETATTR_IMPORT, DirectCallArgPlan, DirectCallArgSource,
-        DirectCallEmissionScope, DirectCallIncompatibility, FUNCTION_ENV_DEOPT_TABLE_PTR_OFFSET,
-        FieldIndexSpecialization, IntFacts, IntRange, JitDeoptExitRef, LocalEnv, LocalEnvEntry,
-        LocalEnvStorage, LocalRefKind, ModuleConstantId, ModuleFuncImports, ObjPtr,
-        OptV3ExactListItemAccessPlan, OptV3IndexedFieldAccessPlan, OptV3IndexedGlobalAccessPlan,
-        OptV3ResolvedIndexedFieldAccess, ParamBindingFacts, ParsedRuntimeClifFunction,
+        DirectCallIncompatibility, FUNCTION_ENV_DEOPT_TABLE_PTR_OFFSET, IntFacts, IntRange,
+        JitDeoptExitRef, LocalEnv, LocalEnvEntry, LocalEnvStorage, LocalRefKind, ModuleConstantId,
+        ModuleFuncImports, ObjPtr, ParamBindingFacts, ParsedRuntimeClifFunction,
         PlannedJitDeoptPointId, PrecompileModuleIndex, PrecompileModuleIndexEntry,
-        ProcessJitEngine, PyLong_Type, RelocTypeRef, ResolvedV3DirectCallPlan, ResultDemand,
+        ProcessJitEngine, PyLong_Type, RelocTypeRef, ResultDemand,
         SOAC_RUNTIME_DECREF_APPLIED_IMPORT, SOAC_RUNTIME_DECREF_SYMBOL,
         SOAC_RUNTIME_INCREF_APPLIED_IMPORT, SOAC_RUNTIME_INCREF_SYMBOL,
         SOAC_RUNTIME_PYLONG_AS_I64_SATURATING_SYMBOL, SOAC_RUNTIME_PYLONG_AS_I64_SYMBOL,
@@ -79,9 +82,7 @@ mod tests {
         module_constant_symbol_prefix_for_module_identity,
         module_constant_symbol_prefix_for_shared_state, new_jit_module,
         persistent_function_id_for_module_function, plan_direct_call_args_for_target,
-        plan_typed_v3_jit_module_for_test, planned_optimization_inputs_from_v3_artifacts,
-        planned_optimization_inputs_from_v3_artifacts_for_codegen_module,
-        precompiled_direct_function_symbol_scope_for_persistent,
+        plan_typed_v3_jit_module_for_test, precompiled_direct_function_symbol_scope_for_persistent,
         prepare_specialized_typed_function, push_direct_function_module_identity,
         push_shared_module_symbol_identity, runtime_primitive_call_static_params_can_satisfy_abi,
         stable_cranelift_function_hash, stable_cranelift_function_name,
@@ -166,8 +167,14 @@ mod tests {
         TypedIndexedGlobalPlanSource, TypedInstrExtra, TypedPlannedResult as PlannedResult,
         ValueFacts, lower_codegen_function_to_typed, lower_codegen_module_to_typed,
     };
+    use soac_opt::access_emission_v3::{
+        ExactListItemAccessPlan as OptV3ExactListItemAccessPlan,
+        IndexedFieldAccessPlan as OptV3IndexedFieldAccessPlan,
+        IndexedGlobalAccessPlan as OptV3IndexedGlobalAccessPlan,
+    };
     use soac_opt::alternatives_v3::AlternativeCatalog;
     use soac_opt::artifacts_v3::ExactIntBranchV3Artifacts;
+    use soac_opt::call_emission_v3::ResolvedV3DirectCallPlan;
     use soac_opt::passes::{
         LocalEnvResumeBinding, LocalEnvResumeBindingState, LocalEnvResumePoint,
         LocalEnvResumeStatePrecision, LocalEnvResumeValueSource,

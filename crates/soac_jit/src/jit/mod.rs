@@ -39,12 +39,6 @@ use soac_ir_typed::{
     TypedPlannedResult, TypedPyObjectOwnershipPlan, TypedSetAttr, ValueFacts,
     lower_codegen_function_to_typed,
 };
-use soac_opt::access_emission_v3::{
-    ExactListItemAccessPlan as OptV3ExactListItemAccessPlan,
-    IndexedFieldAccessPlan as OptV3IndexedFieldAccessPlan,
-    IndexedGlobalAccessPlan as OptV3IndexedGlobalAccessPlan,
-};
-use soac_opt::call_emission_v3::ResolvedV3DirectCallPlan;
 #[cfg(test)]
 use soac_opt::passes::infer_module_value_facts;
 use soac_opt::passes::{
@@ -184,9 +178,7 @@ use module_data::{
     precompiled_direct_function_symbol_scope_for_persistent, push_shared_module_symbol_identity,
     scalar_counter_storage_symbol_for_instance, top_value_counter_storage_symbol_for_instance,
 };
-use operation_specializations::{
-    FieldIndexSpecialization, IndexedFieldLoweringPlan, OptV3ResolvedIndexedFieldAccess,
-};
+use operation_specializations::IndexedFieldLoweringPlan;
 #[cfg(test)]
 use planning::plan_typed_v3_jit_module_for_test;
 pub use planning::{
@@ -228,10 +220,8 @@ use runtime_support::inline_runtime_support_calls;
 #[cfg(test)]
 use runtime_support::{ParsedRuntimeClifFunction, parse_runtime_clif_functions};
 use specialization_profile::{
-    DirectCallEmissionScope, PlannedOptimizationInputs, SpecializationProfile,
+    PlannedOptimizationInputs, SpecializationProfile,
     load_planned_optimization_inputs_for_runtime_state,
-    planned_optimization_inputs_from_v3_artifacts,
-    planned_optimization_inputs_from_v3_artifacts_for_codegen_module,
 };
 pub use specialized_helpers::ObjPtr;
 use symbols::ensure_reloc_type_symbol_registered;
@@ -1931,7 +1921,12 @@ impl LocalEnv {
                 || entry.ref_kind == LocalRefKind::Unbound
             {
                 return Some(emit_checked_local_value_or_unbound(
-                    fb, name, value, ctx, borrowed,
+                    fb,
+                    name,
+                    value,
+                    entry.ref_kind,
+                    ctx,
+                    borrowed,
                 ));
             }
             if local_ref_kind_needs_incref_for_load(entry.ref_kind, borrowed) {
@@ -1956,7 +1951,12 @@ impl LocalEnv {
                 || entry.ref_kind == LocalRefKind::Unbound
             {
                 return Some(emit_checked_local_value_or_unbound(
-                    fb, name, value, ctx, borrowed,
+                    fb,
+                    name,
+                    value,
+                    entry.ref_kind,
+                    ctx,
+                    borrowed,
                 ));
             }
             if local_ref_kind_needs_incref_for_load(entry.ref_kind, borrowed) {
@@ -3657,6 +3657,7 @@ fn emit_checked_local_value_or_unbound(
     fb: &mut FunctionBuilder<'_>,
     name: &str,
     value: ir::Value,
+    ref_kind: LocalRefKind,
     ctx: &JitEmitCtx<'_>,
     borrowed: bool,
 ) -> ir::Value {
@@ -3681,18 +3682,20 @@ fn emit_checked_local_value_or_unbound(
         )
         .expect_pyobject("abrupt kind fallthrough materialize")
         .0;
+        if !borrowed {
+            emit_incref_if_not_null(fb, ctx.consts.ptr_ty, ctx.incref_ref, fallthrough_value);
+        }
         fb.ins()
             .jump(done_block, &[ir::BlockArg::Value(fallthrough_value)]);
 
         fb.switch_to_block(value_ok_block);
+        if local_ref_kind_needs_incref_for_load(ref_kind, borrowed) {
+            fb.ins().call(ctx.incref_ref, &[value]);
+        }
         fb.ins().jump(done_block, &[ir::BlockArg::Value(value)]);
 
         fb.switch_to_block(done_block);
-        let value = fb.block_params(done_block)[0];
-        if !borrowed {
-            emit_incref_if_not_null(fb, ctx.consts.ptr_ty, ctx.incref_ref, value);
-        }
-        return value;
+        return fb.block_params(done_block)[0];
     }
     let null_ptr = fb.ins().iconst(ctx.consts.ptr_ty, 0);
     let value_is_null = fb.ins().icmp(ir::condcodes::IntCC::Equal, value, null_ptr);
@@ -3721,7 +3724,7 @@ fn emit_checked_local_value_or_unbound(
 
     fb.switch_to_block(value_ok_block);
     let value = fb.block_params(value_ok_block)[0];
-    if !borrowed {
+    if local_ref_kind_needs_incref_for_load(ref_kind, borrowed) {
         fb.ins().call(ctx.incref_ref, &[value]);
     }
     value
