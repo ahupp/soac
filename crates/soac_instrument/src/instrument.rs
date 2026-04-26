@@ -335,6 +335,14 @@ pub(crate) fn define_call_counters(
         },
         ["hit", "fallback"],
     );
+    counters.define_if_missing(
+        CounterScope::This,
+        "call_direct_targets",
+        CounterSite::Runtime {
+            function_id: Some(function_id),
+            instr_id: Some(instr_id),
+        },
+    );
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

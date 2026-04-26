@@ -1563,6 +1563,7 @@ struct JitEmitCtx<'mc> {
         &'mc HashMap<RuntimeFunctionId, BlockPyFunction<TypedCodegenModuleShape>>,
     direct_call_functions: &'mc HashMap<RuntimeFunctionId, DeclaredJitFunction>,
     call_target_counter_ids: &'mc HashMap<InstrId, CounterId>,
+    call_direct_target_counter_ids: &'mc HashMap<InstrId, CounterId>,
     call_direct_hit_counter_ids: &'mc HashMap<InstrId, CounterRef>,
     call_direct_fallback_counter_ids: &'mc HashMap<InstrId, CounterRef>,
     operator_shape_counter_ids: &'mc HashMap<InstrId, CounterId>,
@@ -8856,6 +8857,24 @@ fn emit_record_call_target_sample(
     emit_record_top_value_sample(fb, counter_id, callee_id, ctx);
 }
 
+fn emit_record_direct_call_target_sample(
+    fb: &mut FunctionBuilder<'_>,
+    site_instr_id: Option<InstrId>,
+    function_id: RuntimeFunctionId,
+    ctx: &JitEmitCtx<'_>,
+) {
+    if let Some(counter_id) = site_instr_id
+        .and_then(|site_instr_id| ctx.call_direct_target_counter_ids.get(&site_instr_id))
+        .copied()
+    {
+        let callee_id = fb.ins().iconst(
+            ctx.consts.i64_ty,
+            function_id.to_packed_runtime_u64() as i64,
+        );
+        emit_record_call_target_sample(fb, counter_id, callee_id, ctx);
+    }
+}
+
 fn emit_record_branch_outcome_sample(
     fb: &mut FunctionBuilder<'_>,
     counter_id: CounterId,
@@ -14282,6 +14301,12 @@ fn emit_typed_prepared_direct_callable_specialization_result_with_local_env(
             fb.switch_to_block(direct_block);
             let target_function = direct_call_target_function(emit_ctx, specialization.function_id)
                 .expect("direct constructor specialization target should exist");
+            emit_record_direct_call_target_sample(
+                fb,
+                site_instr_id,
+                specialization.function_id,
+                emit_ctx,
+            );
             if let Some(counter_id) = direct_hit_counter_id {
                 emit_increment_counter_ref(fb, counter_id, emit_ctx);
             }
@@ -14348,6 +14373,12 @@ fn emit_typed_prepared_direct_callable_specialization_result_with_local_env(
             fb.switch_to_block(direct_block);
             let target_function = direct_call_target_function(emit_ctx, specialization.function_id)
                 .expect("direct specialization target should exist");
+            emit_record_direct_call_target_sample(
+                fb,
+                site_instr_id,
+                specialization.function_id,
+                emit_ctx,
+            );
             if let Some(counter_id) = direct_hit_counter_id {
                 emit_increment_counter_ref(fb, counter_id, emit_ctx);
             }
@@ -14642,6 +14673,12 @@ fn emit_typed_codegen_guarded_method_call_result_with_local_env(
             );
             emit_record_call_target_sample(fb, counter_id, callee_id, emit_ctx);
         }
+        emit_record_direct_call_target_sample(
+            fb,
+            site_instr_id,
+            specialization.function_id,
+            emit_ctx,
+        );
         if let Some(counter_id) = direct_hit_counter_id {
             emit_increment_counter_ref(fb, counter_id, emit_ctx);
         }
@@ -14801,6 +14838,12 @@ fn emit_typed_codegen_direct_callable_call_result_with_local_env(
                         guard.function_id
                     )
                 })?;
+            emit_record_direct_call_target_sample(
+                fb,
+                call.try_semantic_instr_id(),
+                guard.function_id,
+                emit_ctx,
+            );
             let arg_plan = direct_call_arg_plan_from_typed(&guard.arg_plan);
             emit_typed_direct_call_resolved_with_arg_plan_from_local_env(
                 fb,
@@ -14827,6 +14870,12 @@ fn emit_typed_codegen_direct_callable_call_result_with_local_env(
                         specialization.function_id
                     )
                 })?;
+            emit_record_direct_call_target_sample(
+                fb,
+                call.try_semantic_instr_id(),
+                specialization.function_id,
+                emit_ctx,
+            );
             emit_typed_direct_constructor_resolved_with_args_from_local_env(
                 fb,
                 callable,
@@ -14868,6 +14917,12 @@ fn emit_typed_codegen_direct_method_call_result_with_local_env(
                 specialization.function_id
             )
         })?;
+    emit_record_direct_call_target_sample(
+        fb,
+        call.try_semantic_instr_id(),
+        specialization.function_id,
+        emit_ctx,
+    );
     let (receiver, receiver_is_borrowed) = emit_typed_pyobject_input_with_local_env(
         fb,
         call.receiver.as_ref(),
@@ -17522,6 +17577,7 @@ fn emit_opt_v3_scalar_threaded_store_branch(
         condition,
         if_term.then_label,
         if_term.else_label,
+        IfTruthInstrumentation::default(),
         None,
         function,
         exec_blocks,
@@ -17535,6 +17591,34 @@ fn emit_opt_v3_scalar_threaded_store_branch(
     Ok(Some(vec![edge.target]))
 }
 
+#[derive(Clone, Copy, Default)]
+struct IfTruthInstrumentation {
+    true_counter_ref: Option<CounterRef>,
+    true_direct_call_target: Option<(InstrId, RuntimeFunctionId)>,
+}
+
+fn direct_call_guard_if_truth_instrumentation(
+    expr: &InstrTyped,
+    emit_ctx: &JitEmitCtx<'_>,
+) -> IfTruthInstrumentation {
+    let InstrTyped::DirectCallGuardTest(op) = expr else {
+        return IfTruthInstrumentation::default();
+    };
+    let Some(instr_id) = expr.try_semantic_instr_id() else {
+        return IfTruthInstrumentation::default();
+    };
+    let true_counter_ref = emit_ctx.call_direct_hit_counter_ids.get(&instr_id).copied();
+    let true_direct_call_target = match &op.kind {
+        TypedDirectCallGuardTestKind::RuntimeFunctionId { function_id } => {
+            Some((instr_id, *function_id))
+        }
+    };
+    IfTruthInstrumentation {
+        true_counter_ref,
+        true_direct_call_target,
+    }
+}
+
 fn emit_codegen_if_target_arm(
     fb: &mut FunctionBuilder<'_>,
     source_label: BlockLabel,
@@ -17543,6 +17627,8 @@ fn emit_codegen_if_target_arm(
     target_label: BlockLabel,
     target_exception_name: Option<&str>,
     release_reason: RefcountReleaseReason,
+    entry_counter_ref: Option<CounterRef>,
+    selected_direct_call_target: Option<(InstrId, RuntimeFunctionId)>,
     current_exception_name: Option<&str>,
     function: &BlockPyFunction<impl ModuleShape>,
     exec_blocks: &[ir::Block],
@@ -17554,6 +17640,12 @@ fn emit_codegen_if_target_arm(
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<(), String> {
     fb.switch_to_block(branch_block);
+    if let Some(counter_ref) = entry_counter_ref {
+        emit_increment_counter_ref(fb, counter_ref, emit_ctx);
+    }
+    if let Some((instr_id, function_id)) = selected_direct_call_target {
+        emit_record_direct_call_target_sample(fb, Some(instr_id), function_id, emit_ctx);
+    }
     let target_index =
         codegen_block_index_for_label(function, block_indices_by_label, target_label)?;
     let edge_transport = &implicit_target_transports[target_index];
@@ -17606,6 +17698,7 @@ fn emit_codegen_if_truth_i32(
     truth_i32: ir::Value,
     then_label: BlockLabel,
     else_label: BlockLabel,
+    instrumentation: IfTruthInstrumentation,
     current_exception_name: Option<&str>,
     function: &BlockPyFunction<impl ModuleShape>,
     exec_blocks: &[ir::Block],
@@ -17642,6 +17735,13 @@ fn emit_codegen_if_truth_i32(
     } else {
         ("else", else_label, "then", then_label)
     };
+    let hot_is_true = hot_label == then_label;
+    let hot_counter_ref = hot_is_true
+        .then_some(instrumentation.true_counter_ref)
+        .flatten();
+    let hot_direct_call_target = hot_is_true
+        .then_some(instrumentation.true_direct_call_target)
+        .flatten();
     let mut hot_local_env = local_env.clone();
     emit_codegen_if_target_arm(
         fb,
@@ -17655,6 +17755,8 @@ fn emit_codegen_if_truth_i32(
         } else {
             RefcountReleaseReason::IfElse { target: hot_label }
         },
+        hot_counter_ref,
+        hot_direct_call_target,
         current_exception_name,
         function,
         exec_blocks,
@@ -17665,6 +17767,13 @@ fn emit_codegen_if_truth_i32(
         codegen_env,
         func_imports,
     )?;
+    let cold_is_true = cold_label == then_label;
+    let cold_counter_ref = cold_is_true
+        .then_some(instrumentation.true_counter_ref)
+        .flatten();
+    let cold_direct_call_target = cold_is_true
+        .then_some(instrumentation.true_direct_call_target)
+        .flatten();
     let mut cold_local_env = local_env.clone();
     emit_codegen_if_target_arm(
         fb,
@@ -17678,6 +17787,8 @@ fn emit_codegen_if_truth_i32(
         } else {
             RefcountReleaseReason::IfElse { target: cold_label }
         },
+        cold_counter_ref,
+        cold_direct_call_target,
         current_exception_name,
         function,
         exec_blocks,
@@ -18083,6 +18194,7 @@ fn emit_typed_codegen_term(
             }
         };
         let truth_i32 = truth.expect_i32_bool01("typed if condition truthiness");
+        let instrumentation = direct_call_guard_if_truth_instrumentation(&if_term.test, emit_ctx);
         return emit_codegen_if_truth_i32(
             fb,
             source_label,
@@ -18090,6 +18202,7 @@ fn emit_typed_codegen_term(
             truth_i32,
             if_term.then_label,
             if_term.else_label,
+            instrumentation,
             current_exception_name,
             function,
             exec_blocks,
@@ -18485,6 +18598,11 @@ fn build_cranelift_run_bb_specialized_function(
     jit_deopt_resume_plan.validate_for_typed_function(function)?;
     let call_target_counter_ids =
         collect_runtime_counter_ids_by_kind(counter_defs, function.function_id, "call_hot_targets");
+    let call_direct_target_counter_ids = collect_runtime_counter_ids_by_kind(
+        counter_defs,
+        function.function_id,
+        "call_direct_targets",
+    );
     let call_direct_hit_counter_ids = collect_runtime_counter_refs_by_kind_branch(
         counter_defs,
         function.function_id,
@@ -18582,6 +18700,7 @@ fn build_cranelift_run_bb_specialized_function(
         collect_runtime_counter_ids_by_kind(counter_defs, function.function_id, "branch_outcomes");
     for counter_id in call_target_counter_ids
         .values()
+        .chain(call_direct_target_counter_ids.values())
         .chain(operator_shape_counter_ids.values())
         .chain(getitem_shape_counter_ids.values())
         .chain(setitem_shape_counter_ids.values())
@@ -18616,6 +18735,7 @@ fn build_cranelift_run_bb_specialized_function(
         })?;
     }
     let requires_top_value_counters = !call_target_counter_ids.is_empty()
+        || !call_direct_target_counter_ids.is_empty()
         || !operator_shape_counter_ids.is_empty()
         || !getitem_shape_counter_ids.is_empty()
         || !setitem_shape_counter_ids.is_empty()
@@ -19273,6 +19393,7 @@ fn build_cranelift_run_bb_specialized_function(
                 direct_call_target_functions: &direct_call_target_functions,
                 direct_call_functions,
                 call_target_counter_ids: &call_target_counter_ids,
+                call_direct_target_counter_ids: &call_direct_target_counter_ids,
                 call_direct_hit_counter_ids: &call_direct_hit_counter_ids,
                 call_direct_fallback_counter_ids: &call_direct_fallback_counter_ids,
                 operator_shape_counter_ids: &operator_shape_counter_ids,

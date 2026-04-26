@@ -770,6 +770,7 @@ fn build_typed_direct_call_inline_rewrite(
         typed_direct_call_guard_term(
             &callable_temp.resolved_name(),
             candidate.inline_plans[0].target,
+            candidate.call.meta(),
             hot_labels[0],
             guard_labels.first().copied().unwrap_or(generic_label),
         ),
@@ -793,6 +794,7 @@ fn build_typed_direct_call_inline_rewrite(
             typed_direct_call_guard_term(
                 &callable_temp.resolved_name(),
                 candidate.inline_plans[target_index].target,
+                candidate.call.meta(),
                 hot_labels[target_index],
                 else_label,
             ),
@@ -935,14 +937,18 @@ fn typed_positional_arg_exprs(args: Vec<CallArgPositional<InstrTyped>>) -> Optio
 fn typed_direct_call_guard_term(
     callable_temp: &ResolvedName,
     function_id: RuntimeFunctionId,
+    source_meta: Meta,
     then_label: BlockLabel,
     else_label: BlockLabel,
 ) -> BlockTerm<InstrTyped> {
     BlockTerm::IfTerm(TermIf {
-        test: InstrTyped::DirectCallGuardTest(TypedDirectCallGuardTest::new(
-            typed_load_temp(callable_temp),
-            TypedDirectCallGuardTestKind::RuntimeFunctionId { function_id },
-        )),
+        test: InstrTyped::DirectCallGuardTest(
+            TypedDirectCallGuardTest::new(
+                typed_load_temp(callable_temp),
+                TypedDirectCallGuardTestKind::RuntimeFunctionId { function_id },
+            )
+            .with_meta(source_meta),
+        ),
         then_label,
         else_label,
     })

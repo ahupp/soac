@@ -103,8 +103,14 @@ def _counter_value(
     kind = expectation.get("kind")
     branch = expectation.get("branch")
     instr_id = expectation.get("instr_id")
+    observed_value = expectation.get("observed_value")
     if kind is None:
         raise ValueError(f"counter expectation is missing kind: {expectation!r}")
+    if observed_value not in (None, "present") and not isinstance(observed_value, int):
+        raise ValueError(
+            "counter expectation observed_value must be an integer or 'present': "
+            f"{expectation!r}"
+        )
 
     total = 0
     for record in verify["records"]:
@@ -116,6 +122,10 @@ def _counter_value(
             if function is not None and row["function_qualname"] != function:
                 continue
             if instr_id is not None and row["instr_id"] != instr_id:
+                continue
+            if observed_value == "present" and row["observed_value"] is None:
+                continue
+            if isinstance(observed_value, int) and row["observed_value"] != observed_value:
                 continue
             if branch is None:
                 total += row["value"]
@@ -134,7 +144,7 @@ def _assert_counter_expectation(
     value = _counter_value(verify, expectation, module_name=module_name)
     label = {
         key: expectation[key]
-        for key in ("function", "kind", "branch", "instr_id")
+        for key in ("function", "kind", "branch", "instr_id", "observed_value")
         if key in expectation
     }
     if "equals" in expectation:

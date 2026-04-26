@@ -63,7 +63,7 @@ fn format_counter_row(row: &CounterDumpRowView<'_>) -> String {
     } else {
         format!(" branches={}", format_branch_values(row))
     };
-    let observed_value = if row.kind == "call_hot_targets" {
+    let observed_value = if matches!(row.kind, "call_hot_targets" | "call_direct_targets") {
         row.observed_value
             .map(RuntimeFunctionId::from_packed_runtime_u64)
             .map(|function_id| format!("observed_function_id={function_id}"))
@@ -160,7 +160,7 @@ fn format_pretty_counter_row(
         fields.push(format!("branches={}", format_branch_values(row)));
     }
     if let Some(observed_value) = row.observed_value {
-        if row.kind == "call_hot_targets" {
+        if matches!(row.kind, "call_hot_targets" | "call_direct_targets") {
             fields.push(format!(
                 "observed_function={}",
                 pretty_observed_function(observed_value, function_qualnames)

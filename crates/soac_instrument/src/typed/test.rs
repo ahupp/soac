@@ -123,6 +123,7 @@ def g(i):
         "setitem_specialized",
         "call_hot_targets",
         "call_direct",
+        "call_direct_targets",
     ] {
         assert!(
             typed

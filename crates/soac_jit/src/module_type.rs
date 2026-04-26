@@ -719,6 +719,7 @@ fn counter_uses_call_target_storage(counter: &CounterDef) -> bool {
         counter.kind.as_str(),
         "branch_outcomes"
             | "call_hot_targets"
+            | "call_direct_targets"
             | "operator_hot_shapes"
             | "getitem_hot_shapes"
             | "setitem_hot_shapes"
