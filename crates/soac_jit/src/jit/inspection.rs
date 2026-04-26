@@ -11,8 +11,11 @@ use cranelift_control::ControlPlane;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::JITModule;
 use soac_config::SoacEnvConfig;
-use soac_core::block_py::BlockPyModule;
+use soac_core::block_py::{
+    BlockLabel, BlockPyFunction, BlockPyModule, ChildVisitable, HasSemanticInstrId, Visit,
+};
 use soac_ir_blockpy::CodegenModuleShape;
+use soac_ir_typed::{InstrTyped, TypedCodegenModuleShape};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
@@ -107,6 +110,93 @@ pub(super) fn register_block_display_annotation(
             param_names,
         },
     );
+}
+
+fn instr_typed_variant_name(expr: &InstrTyped) -> &'static str {
+    match expr {
+        InstrTyped::Truthy(_) => "Truthy",
+        InstrTyped::Load(_) => "Load",
+        InstrTyped::BinOp(_) => "BinOp",
+        InstrTyped::Tuple(_) => "Tuple",
+        InstrTyped::UnaryOp(_) => "UnaryOp",
+        InstrTyped::CalleeFunctionId(_) => "CalleeFunctionId",
+        InstrTyped::CallTyped(_) => "CallTyped",
+        InstrTyped::GuardedCallableCallTyped(_) => "GuardedCallableCallTyped",
+        InstrTyped::GuardedMethodCallTyped(_) => "GuardedMethodCallTyped",
+        InstrTyped::DirectCallableCallTyped(_) => "DirectCallableCallTyped",
+        InstrTyped::DirectMethodCallTyped(_) => "DirectMethodCallTyped",
+        InstrTyped::DirectCallGuardTest(_) => "DirectCallGuardTest",
+        InstrTyped::CallDirect(_) => "CallDirect",
+        InstrTyped::GetAttrTyped(_) => "GetAttrTyped",
+        InstrTyped::SetAttrTyped(_) => "SetAttrTyped",
+        InstrTyped::GetItem(_) => "GetItem",
+        InstrTyped::SetItem(_) => "SetItem",
+        InstrTyped::DelItem(_) => "DelItem",
+        InstrTyped::Store(_) => "Store",
+        InstrTyped::Del(_) => "Del",
+        InstrTyped::MakeCell(_) => "MakeCell",
+        InstrTyped::IncrementCounter(_) => "IncrementCounter",
+        InstrTyped::CellRef(_) => "CellRef",
+        InstrTyped::MakeFunctionWithClosure(_) => "MakeFunctionWithClosure",
+    }
+}
+
+pub(super) fn render_instr_typed_preorder_extras(
+    function: &BlockPyFunction<TypedCodegenModuleShape>,
+) -> String {
+    struct ExtraRenderer<'a> {
+        out: &'a mut String,
+        block_label: Option<BlockLabel>,
+        ordinal: usize,
+    }
+
+    impl Visit<InstrTyped> for ExtraRenderer<'_> {
+        fn visit_instr(&mut self, expr: &InstrTyped) {
+            let block_label = self
+                .block_label
+                .map(|label| label.to_string())
+                .unwrap_or_else(|| "<unknown>".to_string());
+            let instr_id = expr
+                .try_semantic_instr_id()
+                .map(|instr_id| instr_id.to_string())
+                .unwrap_or_else(|| "<synthetic>".to_string());
+            match expr.typed_extra() {
+                Some(extra) => {
+                    self.out.push_str(&format!(
+                        "; typed_expr[{}] block={} instr_id={} kind={} extra={:?}\n",
+                        self.ordinal,
+                        block_label,
+                        instr_id,
+                        instr_typed_variant_name(expr),
+                        extra
+                    ));
+                }
+                None => {
+                    self.out.push_str(&format!(
+                        "; typed_expr[{}] block={} instr_id={} kind={} extra=<none>\n",
+                        self.ordinal,
+                        block_label,
+                        instr_id,
+                        instr_typed_variant_name(expr)
+                    ));
+                }
+            }
+            self.ordinal += 1;
+            expr.visit_children(self);
+        }
+    }
+
+    let mut out = String::new();
+    let mut renderer = ExtraRenderer {
+        out: &mut out,
+        block_label: None,
+        ordinal: 0,
+    };
+    for block in &function.blocks {
+        renderer.block_label = Some(block.label);
+        renderer.visit_block(block);
+    }
+    out
 }
 
 fn parse_block_header_for_display(line: &str) -> Option<(&str, Vec<&str>)> {

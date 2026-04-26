@@ -336,7 +336,8 @@ use imports::{
 };
 use inspection::{
     ClifBlockDisplayAnnotations, register_block_display_annotation,
-    render_compiled_clif_and_vcode_disasm, render_pre_inline_clif_for_inspection,
+    render_compiled_clif_and_vcode_disasm, render_instr_typed_preorder_extras,
+    render_pre_inline_clif_for_inspection,
 };
 pub use inspection::{RenderedSpecializedClif, run_cranelift_smoke};
 
@@ -18609,93 +18610,6 @@ fn prepare_specialized_typed_function(
     validate_typed_function_value_facts(&typed_function)?;
     validate_typed_function_preserves_codegen_cfg(function, &typed_function)?;
     Ok(PreparedSpecializedTypedFunction { typed_function })
-}
-
-fn instr_typed_variant_name(expr: &InstrTyped) -> &'static str {
-    match expr {
-        InstrTyped::Truthy(_) => "Truthy",
-        InstrTyped::Load(_) => "Load",
-        InstrTyped::BinOp(_) => "BinOp",
-        InstrTyped::Tuple(_) => "Tuple",
-        InstrTyped::UnaryOp(_) => "UnaryOp",
-        InstrTyped::CalleeFunctionId(_) => "CalleeFunctionId",
-        InstrTyped::CallTyped(_) => "CallTyped",
-        InstrTyped::GuardedCallableCallTyped(_) => "GuardedCallableCallTyped",
-        InstrTyped::GuardedMethodCallTyped(_) => "GuardedMethodCallTyped",
-        InstrTyped::DirectCallableCallTyped(_) => "DirectCallableCallTyped",
-        InstrTyped::DirectMethodCallTyped(_) => "DirectMethodCallTyped",
-        InstrTyped::DirectCallGuardTest(_) => "DirectCallGuardTest",
-        InstrTyped::CallDirect(_) => "CallDirect",
-        InstrTyped::GetAttrTyped(_) => "GetAttrTyped",
-        InstrTyped::SetAttrTyped(_) => "SetAttrTyped",
-        InstrTyped::GetItem(_) => "GetItem",
-        InstrTyped::SetItem(_) => "SetItem",
-        InstrTyped::DelItem(_) => "DelItem",
-        InstrTyped::Store(_) => "Store",
-        InstrTyped::Del(_) => "Del",
-        InstrTyped::MakeCell(_) => "MakeCell",
-        InstrTyped::IncrementCounter(_) => "IncrementCounter",
-        InstrTyped::CellRef(_) => "CellRef",
-        InstrTyped::MakeFunctionWithClosure(_) => "MakeFunctionWithClosure",
-    }
-}
-
-fn render_instr_typed_preorder_extras(
-    function: &BlockPyFunction<TypedCodegenModuleShape>,
-) -> String {
-    struct ExtraRenderer<'a> {
-        out: &'a mut String,
-        block_label: Option<BlockLabel>,
-        ordinal: usize,
-    }
-
-    impl Visit<InstrTyped> for ExtraRenderer<'_> {
-        fn visit_instr(&mut self, expr: &InstrTyped) {
-            let block_label = self
-                .block_label
-                .map(|label| label.to_string())
-                .unwrap_or_else(|| "<unknown>".to_string());
-            let instr_id = expr
-                .try_semantic_instr_id()
-                .map(|instr_id| instr_id.to_string())
-                .unwrap_or_else(|| "<synthetic>".to_string());
-            match expr.typed_extra() {
-                Some(extra) => {
-                    self.out.push_str(&format!(
-                        "; typed_expr[{}] block={} instr_id={} kind={} extra={:?}\n",
-                        self.ordinal,
-                        block_label,
-                        instr_id,
-                        instr_typed_variant_name(expr),
-                        extra
-                    ));
-                }
-                None => {
-                    self.out.push_str(&format!(
-                        "; typed_expr[{}] block={} instr_id={} kind={} extra=<none>\n",
-                        self.ordinal,
-                        block_label,
-                        instr_id,
-                        instr_typed_variant_name(expr)
-                    ));
-                }
-            }
-            self.ordinal += 1;
-            expr.visit_children(self);
-        }
-    }
-
-    let mut out = String::new();
-    let mut renderer = ExtraRenderer {
-        out: &mut out,
-        block_label: None,
-        ordinal: 0,
-    };
-    for block in &function.blocks {
-        renderer.block_label = Some(block.label);
-        renderer.visit_block(block);
-    }
-    out
 }
 
 fn build_cranelift_run_bb_specialized_function(
