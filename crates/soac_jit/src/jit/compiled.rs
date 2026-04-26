@@ -1,4 +1,6 @@
-use super::*;
+use super::deopt::RuntimeJitDeoptTable;
+use super::specialized_helpers::ObjPtr;
+use std::sync::Arc;
 
 struct CompiledSpecializedRunner {
     _session: Arc<crate::session::CompileSession>,
