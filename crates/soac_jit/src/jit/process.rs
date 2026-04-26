@@ -24,9 +24,7 @@ use super::symbols::{
     direct_function_backend_name, direct_function_symbol_scope, register_jit_data_symbol,
 };
 use super::typed_pipeline::{
-    JitModulePlan, build_jit_module_plan, build_typed_v3_jit_module_plan,
-    collect_codegen_constants_for_module_name,
-    predeclare_planned_typed_function_imports_for_reservation,
+    JitModulePlan, build_typed_v3_jit_module_plan, collect_codegen_constants_for_module_name,
 };
 use super::vectorcall::define_shared_vectorcall_trampoline;
 use super::{
@@ -39,13 +37,13 @@ use super::{
 };
 use crate::config::CraneliftTargetConfig;
 use crate::module_constants::ModuleCodegenConstants;
-use crate::module_type::{CounterRuntimeSlot, SharedModuleState, build_counter_storage_layout};
+use crate::module_type::{CounterRuntimeSlot, build_counter_storage_layout};
 use cranelift_codegen::ir;
 use cranelift_codegen::isa::{OwnedTargetIsa, TargetIsa};
 use cranelift_jit::JITModule;
 use cranelift_module::{DataId, FuncId, Linkage, Module};
 use pyo3::{Py, PyAny, Python, ffi};
-use soac_config::{RuntimeOptimizationPipeline, SoacEnvConfig};
+use soac_config::SoacEnvConfig;
 use soac_core::block_py::{
     BlockPyFunction, BlockPyModule, CounterDef, FunctionExecutionMode, InstrId, RuntimeFunctionId,
 };

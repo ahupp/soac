@@ -1560,7 +1560,7 @@ mod tests {
         BlockExcDispatchPlan, BlockParamFacts, LocalRefKind, ParamBindingFacts, ParamProvenance,
         PlannedLocalBinding, PlannedLocalEnvEntrySource, PlannedLocalStorage,
         PlannedStackSlotEntrySeed, PreparedJitTypedModulePlan, RuntimeBlockParamPlan,
-        plan_edge_transport, plan_jit_module_from_codegen, planned_drop_forwarded_local_names,
+        plan_edge_transport, plan_typed_v3_jit_module_for_test, planned_drop_forwarded_local_names,
         planned_jit_params_for_typed_function,
         planned_local_env_entry_materializations_for_function,
         planned_stack_slot_entry_seeds_for_typed_function, typed_block_index_for_label,

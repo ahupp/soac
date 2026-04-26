@@ -5,25 +5,24 @@ use super::{
     RuntimeJitDeoptInvocation, RuntimeJitDeoptRecord, RuntimeJitDeoptTable,
     RuntimeJitDeoptUnsupportedReason, SOAC_RUNTIME_PROBE_GLOBAL_INDEXED_SYMBOL,
     SOAC_RUNTIME_STORE_GLOBAL_INDEXED_SYMBOL, SpecializationProfile, StackSlots,
-    build_cranelift_run_bb_specialized_function, build_jit_module_plan,
-    build_typed_v3_jit_module_plan, codegen_expr_is_borrowable_from_local_env,
-    codegen_expr_static_can_satisfy_i64_demand, codegen_expr_static_i64_demand_facts,
-    collect_planned_typed_call_direct_targets, declare_local_fn,
-    declare_module_constant_object_data, declare_scalar_counter_storage_import,
+    build_cranelift_run_bb_specialized_function, build_typed_v3_jit_module_plan,
+    codegen_expr_is_borrowable_from_local_env, codegen_expr_static_can_satisfy_i64_demand,
+    codegen_expr_static_i64_demand_facts, collect_planned_typed_call_direct_targets,
+    declare_local_fn, declare_module_constant_object_data, declare_scalar_counter_storage_import,
     declare_top_value_counter_storage_import, define_prepared_function,
     define_scalar_counter_storage_data, define_scalar_counter_storage_data_for_symbol,
     define_top_value_counter_storage_data, direct_function_symbol_scope_for_shared_state,
     emit_decref_unforwarded_local_env, emit_deopt_resume_call, infer_jit_value_facts,
     local_ref_kind_for_stack_mirror, lookup_registered_jit_data_symbol,
     normalize_postopt_clif_for_inspection, parse_runtime_clif_functions,
-    placeholder_module_constant_ptrs, plan_jit_module_from_codegen,
-    planned_owned_pyobject_result_for_typed_expr, precompile_codegen_module_to_object_bytes,
-    predeclare_specialization_type_imports, predeclare_typed_direct_call_imports,
-    refresh_typed_function_value_facts, render_compiled_clif_and_vcode_disasm,
-    run_blockpy_function_from_entry, run_blockpy_function_from_vectorcall_entry,
-    runtime_jit_deopt_guard_operand_replay_safe, runtime_jit_typed_deopt_guard_operand_replay_safe,
-    scalar_counter_storage_symbol_for_instance, static_runtime_primitive_desc_for_call,
-    static_runtime_primitive_for_call, top_value_counter_storage_symbol_for_instance,
+    placeholder_module_constant_ptrs, planned_owned_pyobject_result_for_typed_expr,
+    precompile_codegen_module_to_object_bytes, predeclare_specialization_type_imports,
+    predeclare_typed_direct_call_imports, refresh_typed_function_value_facts,
+    render_compiled_clif_and_vcode_disasm, run_blockpy_function_from_entry,
+    run_blockpy_function_from_vectorcall_entry, runtime_jit_deopt_guard_operand_replay_safe,
+    runtime_jit_typed_deopt_guard_operand_replay_safe, scalar_counter_storage_symbol_for_instance,
+    static_runtime_primitive_desc_for_call, static_runtime_primitive_for_call,
+    top_value_counter_storage_symbol_for_instance,
     typed_expr_planned_pyobject_input_is_borrowed_from_local_env,
 };
 use soac_core::block_py::IncrementCounter;
@@ -66,13 +65,14 @@ mod tests {
         apply_profile_typed_guard_miss_policy_to_typed_function,
         apply_profile_typed_plans_to_typed_function, build_counted_runtime_refcount_helper,
         compile_cranelift_run_bb_specialized_cached, declare_direct_function,
-        existing_counter_dump_path, inline_runtime_support_calls,
-        local_binding_facts_for_stored_value, local_ref_kind_needs_incref_for_forward,
-        module_constant_object_symbol, module_constant_symbol_prefix_for_instance,
+        inline_runtime_support_calls, local_binding_facts_for_stored_value,
+        local_ref_kind_needs_incref_for_forward, module_constant_object_symbol,
+        module_constant_symbol_prefix_for_instance,
         module_constant_symbol_prefix_for_module_identity,
         module_constant_symbol_prefix_for_shared_state, new_jit_module,
         owner_type_supports_field_layout_priming, persistent_function_id_for_module_function,
-        plan_direct_call_args_for_target,
+        plan_direct_call_args_for_target, plan_typed_v3_jit_module_for_test,
+        planned_optimization_inputs_from_v3_artifacts,
         planned_optimization_inputs_from_v3_artifacts_for_codegen_module,
         precompiled_direct_function_symbol_scope_for_persistent,
         prepare_specialized_typed_function, prime_field_index_layout,
@@ -99,18 +99,17 @@ mod tests {
         SerializedFunctionId, SerializedIdentityTables, SerializedModuleId,
         SerializedModuleIdentity, SetAttr, SetItem, SpecializationProfile, StackSlots,
         StorageLayout, Store, StringLiteral, Tuple, UnaryOp, UnaryOpKind, Visit, VisitMut,
-        WithMeta, build_cranelift_run_bb_specialized_function, build_jit_module_plan,
-        build_typed_v3_jit_module_plan, codegen_expr_is_borrowable_from_local_env,
-        codegen_expr_static_can_satisfy_i64_demand, codegen_expr_static_i64_demand_facts,
-        collect_planned_typed_call_direct_targets, declare_local_fn,
-        declare_module_constant_object_data, declare_scalar_counter_storage_import,
-        declare_top_value_counter_storage_import, define_prepared_function,
-        define_scalar_counter_storage_data, define_scalar_counter_storage_data_for_symbol,
-        define_top_value_counter_storage_data, direct_function_symbol_scope_for_shared_state,
-        emit_decref_unforwarded_local_env, emit_deopt_resume_call, infer_jit_value_facts,
-        local_ref_kind_for_stack_mirror, lookup_registered_jit_data_symbol,
-        normalize_postopt_clif_for_inspection, parse_runtime_clif_functions,
-        placeholder_module_constant_ptrs, plan_jit_module_from_codegen,
+        WithMeta, build_cranelift_run_bb_specialized_function, build_typed_v3_jit_module_plan,
+        codegen_expr_is_borrowable_from_local_env, codegen_expr_static_can_satisfy_i64_demand,
+        codegen_expr_static_i64_demand_facts, collect_planned_typed_call_direct_targets,
+        declare_local_fn, declare_module_constant_object_data,
+        declare_scalar_counter_storage_import, declare_top_value_counter_storage_import,
+        define_prepared_function, define_scalar_counter_storage_data,
+        define_scalar_counter_storage_data_for_symbol, define_top_value_counter_storage_data,
+        direct_function_symbol_scope_for_shared_state, emit_decref_unforwarded_local_env,
+        emit_deopt_resume_call, infer_jit_value_facts, local_ref_kind_for_stack_mirror,
+        lookup_registered_jit_data_symbol, normalize_postopt_clif_for_inspection,
+        parse_runtime_clif_functions, placeholder_module_constant_ptrs,
         planned_owned_pyobject_result_for_typed_expr, precompile_codegen_module_to_object_bytes,
         predeclare_specialization_type_imports, predeclare_typed_direct_call_imports,
         refresh_typed_function_value_facts, render_compiled_clif_and_vcode_disasm,
@@ -121,7 +120,6 @@ mod tests {
         static_runtime_primitive_for_call, top_value_counter_storage_symbol_for_instance,
         typed_expr_planned_pyobject_input_is_borrowed_from_local_env, validate_codegen_instr_ids,
     };
-    use crate::config::SpecializationMode;
     use crate::jit::direct_abi::RuntimePrimitiveId;
     use crate::module_type::{CounterRuntimeSlot, build_counter_storage_layout};
     use cranelift_codegen::cursor::Cursor;
@@ -134,7 +132,7 @@ mod tests {
     use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyModule, PyModuleMethods, PyTuple};
     use pyo3::{Bound, Py, PyAny, PyErr, PyResult, Python, ffi};
     use ruff_python_ast as ast;
-    use soac_config::{RuntimeOptimizationPipeline, SoacEnvConfig};
+    use soac_config::SoacEnvConfig;
     use soac_core::block_py::{CounterId, CounterScope, InstrId, InstrKey};
     use soac_core::pass_tracker::NoopPassTracker;
     use soac_core::profile::{

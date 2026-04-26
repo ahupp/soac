@@ -71,13 +71,13 @@ use soac_opt::call_emission_v3::{
     ResolvedV3DirectCallPlan, direct_call_targets as opt_v3_direct_call_targets,
     direct_calls_for_function_from_artifacts as opt_v3_emitted_direct_calls_for_function,
 };
+#[cfg(test)]
+use soac_opt::passes::infer_module_value_facts;
 use soac_opt::passes::{
-    FunctionRefcountPlan, LocalEnvResumeBinding, LocalEnvResumeBindingState, LocalEnvResumePoint,
-    LocalEnvResumeStatePrecision, LocalEnvResumeValueSource, LocalRefState, RefcountActionKind,
-    RefcountReleaseReason, RefcountSite, annotate_typed_function_planned_results,
-    annotate_typed_function_result_demands, annotate_typed_function_value_facts,
-    infer_module_value_facts, inline_typed_function_direct_call_stores,
-    lower_typed_function_call_access_plan_instrs, lower_typed_function_call_emission_plans,
+    FunctionRefcountPlan, LocalEnvResumeBinding, LocalEnvResumePoint, LocalEnvResumeValueSource,
+    LocalRefState, RefcountActionKind, RefcountReleaseReason, RefcountSite,
+    annotate_typed_function_planned_results, annotate_typed_function_result_demands,
+    annotate_typed_function_value_facts, lower_typed_function_call_access_plan_instrs,
     refresh_typed_function_value_facts, try_lower_typed_instr_to_codegen_legacy,
     validate_typed_function_call_access_plans, validate_typed_function_value_facts,
 };
@@ -250,10 +250,7 @@ use typed_pipeline::{
     apply_profile_typed_guard_miss_policy_to_typed_function,
     apply_profile_typed_plans_to_typed_function,
 };
-use typed_pipeline::{
-    build_jit_module_plan, build_typed_v3_jit_module_plan,
-    collect_codegen_constants_for_module_name,
-};
+use typed_pipeline::{build_typed_v3_jit_module_plan, collect_codegen_constants_for_module_name};
 pub use typed_value::{
     EmitResult, IntFacts, IntRange, IntWidth, ResultDemand, SoacRepr, SoacValue, ValueOwnership,
 };

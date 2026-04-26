@@ -18,16 +18,14 @@ use super::precompiled_object::{
 use super::runtime_support::compile_runtime_support_clif_for_object;
 use super::symbols::direct_function_backend_name;
 use super::typed_pipeline::{
-    apply_profile_call_emission_plans_to_typed_function, build_jit_module_plan,
-    build_typed_v3_jit_module_plan,
+    apply_profile_call_emission_plans_to_typed_function, build_typed_v3_jit_module_plan,
 };
 use super::{
     BuildSpecializedFunctionOptions, ModuleConstantAccess, ModuleConstantAccessTable,
     SpecializationProfile, build_cranelift_run_bb_specialized_function,
     collect_typed_call_direct_targets, placeholder_module_constant_ptrs,
-    planned_optimization_inputs_for_precompile,
 };
-use crate::config::CraneliftTargetConfig;
+use crate::config::{CraneliftTargetConfig, pre_optimization_module_cache_identity};
 use crate::counter::TopValueCounter;
 use crate::module_constants::{ModuleCodegenConstants, ModuleConstantId};
 use crate::module_type::build_counter_storage_layout;
