@@ -2547,8 +2547,8 @@ fn emit_local_store_with_local_env(
     )?;
     let (value, ownership, _) = result.expect_pyobject("legacy local store result");
     assert!(
-        ownership.is_owned(),
-        "legacy local store result should produce an owned PyObject"
+        ownership.can_satisfy_pyobject_demand(ResultDemand::PYOBJECT_OWNED),
+        "legacy local store result should produce a PyObject that satisfies owned demand"
     );
     Some(value)
 }
@@ -2562,8 +2562,7 @@ fn emit_none_for_demand(
         ResultDemand::EffectOnly => EmitResult::no_value(),
         ResultDemand::PyObject { .. } => {
             let none_const = emit_none_const(fb, emit_ctx);
-            fb.ins().call(emit_ctx.incref_ref, &[none_const]);
-            EmitResult::owned_pyobject(none_const, PyObjFacts::none_singleton())
+            EmitResult::immortal_pyobject(none_const, PyObjFacts::none_singleton())
         }
         ResultDemand::I32Bool01 => {
             panic!("owned None materialization cannot satisfy I32Bool01 demand")

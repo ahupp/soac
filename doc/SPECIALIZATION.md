@@ -359,14 +359,13 @@ apply/verify mode:
   plan instead of reselecting guards from the raw counter tables.
   Generic typed attribute operations still lower directly to normal
   CPython attribute access.
-- After that guard, the inlineable local-runtime helper checks the
-  currently attached split dict, or the object's CPython inline-values
-  block when no dict has been materialized, for the expected key at the
-  recorded index. Loads return an owned reference to the value slot.
-- Missing values, invalidated inline-values blocks, promoted/combined
-  dicts, key-index mismatch, type guard miss, or type-version miss
-  increment the fallback counter when enabled and execute normal CPython
-  attribute lookup.
+- After that guard, the local-runtime helper checks the object's CPython
+  inline-values block for the expected key at the recorded index. Loads
+  return an owned reference to the value slot.
+- Missing values, invalidated inline-values blocks, materialized dicts,
+  promoted/combined dicts, key-index mismatch, type guard miss, or
+  type-version miss increment the fallback counter when enabled and execute
+  normal CPython attribute lookup.
 - In `verify`/`apply` mode, load guard misses for planned deopt points
   use a cold `dp_jit_deopt_resume` continuation when the receiver and
   attribute-key operands are safe to replay. If the receiver expression
@@ -380,9 +379,8 @@ apply/verify mode:
   instances in apply/verify mode already have the expected split-key
   slots.
 - After the guard, the local-runtime helper stores directly into the
-  expected split-dict or inline-values slot. First inserts update the
-  split-values insertion order and split-dict `ma_used` when the class
-  layout has already been primed.
+  expected inline-values slot. First inserts update the split-values
+  insertion order when the class layout has already been primed.
 - In `verify`/`apply` mode, store guard misses or helper misses for
   planned deopt points use a cold `dp_jit_deopt_resume` continuation
   when the receiver, attribute key, and replacement operands are safe to

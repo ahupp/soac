@@ -700,7 +700,7 @@ fn build_typed_direct_call_inline_rewrite(
     let original_block = block.clone();
     let original_storage_layout = caller.storage_layout.clone();
     let Some(candidate) =
-        find_typed_inline_store_candidate(&block, caller.function_id, direct_calls_by_instr_id)
+        find_typed_inline_candidate(&block, caller.function_id, direct_calls_by_instr_id)
     else {
         return TypedInlineBlockRewrite::Unchanged(block);
     };
@@ -735,7 +735,6 @@ fn build_typed_direct_call_inline_rewrite(
             return TypedInlineBlockRewrite::Unchanged(block);
         }
     };
-
     let continuation_label = caller.name_gen.next_block_name();
     let generic_label = caller.name_gen.next_block_name();
     let cleanup_label = caller.name_gen.next_block_name();
@@ -869,7 +868,7 @@ fn build_typed_direct_call_inline_rewrite(
     TypedInlineBlockRewrite::Rewritten(blocks)
 }
 
-fn find_typed_inline_store_candidate(
+fn find_typed_inline_candidate(
     block: &TypedBlock,
     caller_id: RuntimeFunctionId,
     direct_calls_by_instr_id: &HashMap<InstrId, Vec<(RuntimeFunctionId, TypedDirectCallArgPlan)>>,
