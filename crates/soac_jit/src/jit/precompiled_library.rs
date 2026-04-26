@@ -1,6 +1,6 @@
 use super::compiled::CompiledFunctionHandle;
 use super::deopt::RuntimeJitDeoptTable;
-use super::function_has_default_resolving_direct_entry;
+use super::direct_function::function_has_default_resolving_direct_entry;
 use super::module_data::{
     module_constant_object_symbol, module_constant_symbol_prefix_for_module_identity,
     module_constant_symbol_prefix_for_shared_state,

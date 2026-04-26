@@ -2,15 +2,263 @@ use super::codegen_env::{FuncBuildImports, JitCodegenEnv, declare_import_fn, dec
 use super::imports::{DP_JIT_RAISE_MISSING_REQUIRED_ARGUMENT_IMPORT, ModuleFuncImports};
 use super::runtime_context::{FUNCTION_ENV_RUNTIME_OBJECTS_OFFSET, FunctionRuntimeDataLayout};
 use super::symbols::{default_direct_function_symbol, direct_function_symbol};
-use super::{
-    DeclaredJitFunction, block_arg_values, emit_function_data_slot_borrowed,
-    function_has_default_resolving_direct_entry, param_runtime_default_slot,
-};
+use super::{DeclaredJitFunction, block_arg_values, emit_function_data_slot_borrowed};
 use cranelift_codegen::ir;
 use cranelift_codegen::ir::InstBuilder;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_module::FuncId;
-use soac_core::block_py::{BlockPyFunction, ModuleShape};
+use soac_core::block_py::{BlockPyFunction, ModuleShape, ParamKind, RuntimeFunctionId};
+use std::cell::Cell;
+use std::collections::HashMap;
+use tracing::info;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct DirectCallArgPlan {
+    pub(super) sources: Vec<DirectCallArgSource>,
+}
+
+impl DirectCallArgPlan {
+    pub(super) fn len(&self) -> usize {
+        self.sources.len()
+    }
+
+    pub(super) fn requires_default_resolving_entry(&self) -> bool {
+        self.sources
+            .iter()
+            .any(|source| matches!(source, DirectCallArgSource::DefaultSentinel))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DirectCallArgSource {
+    Provided(usize),
+    DefaultSentinel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DirectCallIncompatibility {
+    StarredArguments,
+    Keywords,
+    UnsupportedParameterKind { kind: ParamKind },
+    MissingRequiredArgument,
+    TooManyPositionalArguments { provided: usize, accepted: usize },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DirectCallEntryKind {
+    Core,
+    DefaultResolving,
+}
+
+#[derive(Default)]
+pub(super) struct DirectEdgeStats {
+    clif_direct_edges: Cell<usize>,
+    function_env_indirect_edges: Cell<usize>,
+    guarded_generic_fallback_blocks: Cell<usize>,
+    profiled_missing_target_candidates: Cell<usize>,
+    profiled_arity_mismatch_candidates: Cell<usize>,
+    profiled_unsupported_shape_candidates: Cell<usize>,
+}
+
+impl DirectEdgeStats {
+    fn increment(cell: &Cell<usize>) {
+        cell.set(cell.get() + 1);
+    }
+
+    pub(super) fn record_resolved_direct_edge(&self) {
+        Self::increment(&self.clif_direct_edges);
+    }
+
+    pub(super) fn record_function_env_indirect_edge(&self) {
+        Self::increment(&self.function_env_indirect_edges);
+    }
+
+    pub(super) fn record_guarded_generic_fallback_block(&self) {
+        Self::increment(&self.guarded_generic_fallback_blocks);
+    }
+
+    fn record_profiled_arity_mismatch_candidate(&self) {
+        Self::increment(&self.profiled_arity_mismatch_candidates);
+    }
+
+    pub(super) fn record_profiled_missing_target_candidate(&self) {
+        Self::increment(&self.profiled_missing_target_candidates);
+    }
+
+    fn record_profiled_unsupported_shape_candidate(&self) {
+        Self::increment(&self.profiled_unsupported_shape_candidates);
+    }
+
+    fn total(&self) -> usize {
+        self.clif_direct_edges.get()
+            + self.function_env_indirect_edges.get()
+            + self.guarded_generic_fallback_blocks.get()
+            + self.profiled_missing_target_candidates.get()
+            + self.profiled_arity_mismatch_candidates.get()
+            + self.profiled_unsupported_shape_candidates.get()
+    }
+
+    pub(super) fn emit_trace(
+        &self,
+        module_name: &str,
+        function: &BlockPyFunction<impl ModuleShape>,
+    ) {
+        if self.total() == 0 {
+            return;
+        }
+        let clif_direct_edges = self.clif_direct_edges.get();
+        let function_env_indirect_edges = self.function_env_indirect_edges.get();
+        let guarded_generic_fallback_blocks = self.guarded_generic_fallback_blocks.get();
+        let profiled_missing_target_candidates = self.profiled_missing_target_candidates.get();
+        let profiled_arity_mismatch_candidates = self.profiled_arity_mismatch_candidates.get();
+        let profiled_unsupported_shape_candidates =
+            self.profiled_unsupported_shape_candidates.get();
+        let generic_fallback_edges = function_env_indirect_edges
+            + guarded_generic_fallback_blocks
+            + profiled_missing_target_candidates
+            + profiled_arity_mismatch_candidates
+            + profiled_unsupported_shape_candidates;
+        info!(
+            target: "soac_jit_direct_edges",
+            module = module_name,
+            function_id = %function.function_id,
+            qualname = %function.names.qualname,
+            clif_direct_edges,
+            function_env_indirect_edges,
+            generic_fallback_edges,
+            guarded_generic_fallback_blocks,
+            profiled_missing_target_candidates,
+            profiled_arity_mismatch_candidates,
+            profiled_unsupported_shape_candidates,
+            "soac_jit_direct_edges"
+        );
+    }
+}
+
+pub(super) fn plan_direct_call_args_for_target<P: ModuleShape>(
+    target_function: &BlockPyFunction<P>,
+    explicit_positional_arg_count: usize,
+    implicit_positional_arg_count: usize,
+    has_starred_arguments: bool,
+    has_keywords: bool,
+) -> Result<DirectCallArgPlan, DirectCallIncompatibility> {
+    if has_starred_arguments {
+        return Err(DirectCallIncompatibility::StarredArguments);
+    }
+    if has_keywords {
+        return Err(DirectCallIncompatibility::Keywords);
+    }
+
+    for param in target_function.params.iter() {
+        if matches!(param.kind, ParamKind::VarArg | ParamKind::KwArg) {
+            return Err(DirectCallIncompatibility::UnsupportedParameterKind { kind: param.kind });
+        }
+    }
+
+    let provided_positional_arg_count =
+        implicit_positional_arg_count + explicit_positional_arg_count;
+    let accepted_positional_arg_count = target_function
+        .params
+        .iter()
+        .filter(|param| matches!(param.kind, ParamKind::PosOnly | ParamKind::Any))
+        .count();
+    if provided_positional_arg_count > accepted_positional_arg_count {
+        return Err(DirectCallIncompatibility::TooManyPositionalArguments {
+            provided: provided_positional_arg_count,
+            accepted: accepted_positional_arg_count,
+        });
+    }
+
+    let mut sources = Vec::with_capacity(target_function.params.len());
+    let mut next_provided_arg = 0usize;
+    for param in target_function.params.iter() {
+        match param.kind {
+            ParamKind::PosOnly | ParamKind::Any => {
+                if next_provided_arg < provided_positional_arg_count {
+                    sources.push(DirectCallArgSource::Provided(next_provided_arg));
+                    next_provided_arg += 1;
+                } else if param.has_default {
+                    sources.push(DirectCallArgSource::DefaultSentinel);
+                } else {
+                    return Err(DirectCallIncompatibility::MissingRequiredArgument);
+                }
+            }
+            ParamKind::KwOnly => {
+                if param.has_default {
+                    sources.push(DirectCallArgSource::DefaultSentinel);
+                } else {
+                    return Err(DirectCallIncompatibility::MissingRequiredArgument);
+                }
+            }
+            ParamKind::VarArg | ParamKind::KwArg => unreachable!(
+                "unsupported variadic params should be rejected before planning direct-call args"
+            ),
+        }
+    }
+    debug_assert_eq!(next_provided_arg, provided_positional_arg_count);
+    Ok(DirectCallArgPlan { sources })
+}
+
+pub(super) fn function_has_default_resolving_direct_entry(
+    function: &BlockPyFunction<impl ModuleShape>,
+) -> bool {
+    // The adapter is also needed for parameters without source defaults:
+    // __defaults__ / __kwdefaults__ can be assigned after function creation.
+    function.params.iter().any(|param| {
+        matches!(
+            param.kind,
+            ParamKind::PosOnly | ParamKind::Any | ParamKind::KwOnly
+        )
+    })
+}
+
+fn param_runtime_default_slot(
+    layout: &FunctionRuntimeDataLayout,
+    param: &soac_core::block_py::Param,
+    param_index: usize,
+) -> Option<usize> {
+    match param.kind {
+        ParamKind::PosOnly | ParamKind::Any => {
+            layout.positional_default_slot_for_param_index(param_index)
+        }
+        ParamKind::KwOnly => layout.kwonly_default_slot(&param.name),
+        ParamKind::VarArg | ParamKind::KwArg => None,
+    }
+}
+
+pub(super) fn validate_direct_call_compatibility(
+    target_function: &BlockPyFunction<impl ModuleShape>,
+    _direct_call_functions: &HashMap<RuntimeFunctionId, DeclaredJitFunction>,
+    explicit_positional_arg_count: usize,
+    implicit_positional_arg_count: usize,
+    has_starred_arguments: bool,
+    has_keywords: bool,
+) -> Result<DirectCallArgPlan, DirectCallIncompatibility> {
+    plan_direct_call_args_for_target(
+        target_function,
+        explicit_positional_arg_count,
+        implicit_positional_arg_count,
+        has_starred_arguments,
+        has_keywords,
+    )
+}
+
+pub(super) fn record_profiled_direct_call_incompatibility(
+    stats: &DirectEdgeStats,
+    incompatibility: DirectCallIncompatibility,
+) {
+    match incompatibility {
+        DirectCallIncompatibility::MissingRequiredArgument
+        | DirectCallIncompatibility::TooManyPositionalArguments { .. } => {
+            stats.record_profiled_arity_mismatch_candidate();
+        }
+        DirectCallIncompatibility::StarredArguments
+        | DirectCallIncompatibility::Keywords
+        | DirectCallIncompatibility::UnsupportedParameterKind { .. } => {
+            stats.record_profiled_unsupported_shape_candidate();
+        }
+    }
+}
 
 pub(super) fn make_direct_function_signature(
     codegen_env: &impl JitCodegenEnv,
