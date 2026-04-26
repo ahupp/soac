@@ -20,19 +20,21 @@ the typed result. Runtime `verify`/`apply` and offline precompile both use raw
 profile evidence directly; the JIT should not run legacy BlockPy optimization
 rewrites or require serialized optimization-plan artifacts.
 
-Profiled ordinary-function and simple constructor direct calls from v3 planning
-are selected with validated argument plans and serialized target module
+Profiled ordinary-function direct calls from v3 planning are selected with
+validated argument plans and serialized target module
 identities. Call plans also carry the selected call-body policy: `DirectCall`
 for guarded direct-call lowering, or `Inline` when the planner selected the
 early BlockPy inline path as the lower-cost body alternative. `Inline` selection
 validates that the BlockPy inline-fragment builder can construct the selected
 body from the cached target module, and the v3 plan is the source of truth
-consumed by typed JIT planning. Constructor targets are consumed as typed
-constructor-call guards after the JIT resolves the owner type and `__init__`
-callable relocation for the selected function. Runtime-guarded receiver-method
-specializations are not represented in v3 plan/emission data today; those call
-shapes stay on generic lowering unless a future plan format adds validated
-static guard inputs for them.
+consumed by typed JIT planning. Constructor type metadata now points at a
+synthetic constructor-entry function id rather than the underlying `__init__`
+id. Those entry functions are placeholders while constructor-thunk emission is
+being moved behind the ordinary direct-call target model, so constructor direct
+calls currently decline instead of using the old `__init__`-target fast path.
+Runtime-guarded receiver-method specializations are not represented in v3
+plan/emission data today; those call shapes stay on generic lowering unless a
+future plan format adds validated static guard inputs for them.
 Constant-attribute indexed-field load/store selections from `type_keys` are
 also emitted as mechanical v3 indexed-field decisions; JIT validation checks
 those emitted decisions against the selected plan and lowered
@@ -72,10 +74,10 @@ Current migration surface:
   the add store and the later branch as separate v3 regions. Profiled ordinary
   direct calls are selected by v3, emitted with serialized target identities and
   an explicit call-body policy, and embedded into `InstrTyped` during JIT
-  planning. Simple constructor calls are selected by v3 from the same
-  `call_hot_targets` input, embedded as typed constructor-call guards, and
-  lowered through the existing guarded constructor allocation/init codegen
-  shape. Constant-string indexed fields are selected by v3 from raw
+  planning. Constructor calls are temporarily not selected: class/type SOAC
+  metadata records a synthetic constructor-entry function id, but those entries
+  are interpreted placeholders until the thunk body and direct-call emitter path
+  are implemented. Constant-string indexed fields are selected by v3 from raw
   `type_keys`, emitted as mechanical
   indexed-field decisions, and consumed as v3-owned typed attribute inputs.
   Indexed globals are selected by v3 from raw `module_keys` plus lowered
@@ -508,19 +510,18 @@ the v3 plan/emission data does not carry method-call plan entries.
 
 ## Type Constructors
 
-Constructor calls reuse `call_hot_targets` evidence. When the hot target is an
-`__init__` function and the call site can bind positionals through a validated
-direct-entry argument plan with an implicit `self`, v3 records the selected
-direct-call target and argument plan. During typed JIT planning, the JIT resolves
-owner type metadata for that initializer, predeclares the owner type and
-`__init__` callable relocation, and embeds typed constructor guards into the
-call site.
+Constructor calls reuse `call_hot_targets` evidence, but the target identity is
+being migrated. A heap type's SOAC function id now names a synthetic
+`__soac_constructor_entry__` function for that class, distinct from the
+`__init__` function id. These entry functions are present in the BlockPy module
+so profile evidence no longer treats `__init__` itself as the class-call target.
 
-Codegen then emits the guarded constructor path: check the callable owner/type
-version, allocate through `dp_jit_pytype_generic_alloc`, direct-call the
-selected `__init__` with the allocated `self`, finish with
-`dp_jit_finish_constructor_init`, and fall back to the original generic
-constructor call on guard miss.
+The synthetic entries are currently interpreted placeholders. Until their body
+and direct-call emission path exist, v3 planning declines these targets and
+constructor calls fall back to the original generic Python call path. The
+intended replacement is for the constructor-entry function to own allocation,
+the internal direct call to `__init__`, `dp_jit_finish_constructor_init`, and
+the generic fallback boundary.
 
 Constructor initializer inlining and constructor scalar replacement should be
 represented directly in `InstrTyped` metadata or typed operation shape when

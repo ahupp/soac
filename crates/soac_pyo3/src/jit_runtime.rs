@@ -638,9 +638,10 @@ fn exec_module_inner(
         }
         time_phase(exec_timings, "register_function_owner_types", || {
             unsafe {
-                soac_jit::register_function_owner_types_for_module_keys(
+                soac_jit::register_function_owner_types_for_module_keys_with_constructor_entries(
                     module.as_ptr(),
                     &module_data.shared_state.lowered_module.global_names,
+                    module_data.shared_state,
                 )
             }
             .map_err(|_| {

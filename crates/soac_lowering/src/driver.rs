@@ -294,6 +294,7 @@ pub fn lower_source_to_codegen_module_with_tracker(
     let bb_codegen: BlockPyModule<CodegenModuleShape> = pass_tracker.run_pass("bb_codegen", || {
         let mut bb_codegen: BlockPyModule<CodegenModuleShape> =
             crate::passes::blockpy_to_bb::strings::hoist_module_constants(&bb_prepared);
+        soac_ir_blockpy::ensure_constructor_entry_functions(&mut bb_codegen);
         crate::block_py::cfg::relabel_dense_bb_module(&mut bb_codegen);
         soac_ir_blockpy::assign_codegen_module_instr_ids(bb_codegen)
     });

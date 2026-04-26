@@ -847,8 +847,10 @@ for function in runtime_functions:
     assert get_function_id(function) != 0
     assert get_function_metadata(function) is not None
 
-assert get_type_function_id(runtime.range) == get_function_id(runtime.range.__dict__["__init__"])
-assert get_type_function_id(runtime.IterRange) == get_function_id(
+assert get_type_function_id(runtime.range) != 0
+assert get_type_function_id(runtime.range) != get_function_id(runtime.range.__dict__["__init__"])
+assert get_type_function_id(runtime.IterRange) != 0
+assert get_type_function_id(runtime.IterRange) != get_function_id(
     runtime.IterRange.__dict__["__init__"]
 )
 """

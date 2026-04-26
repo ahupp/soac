@@ -1,8 +1,10 @@
 use crate::passes::ast_to_ast::body::Suite;
 use crate::template::py_stmt;
-use soac_core::block_py::{ChildVisitable, PrettyPrint, Visit};
+use soac_core::block_py::{ChildVisitable, FunctionExecutionMode, PrettyPrint, Visit};
 use soac_core::pass_tracker::{PassTracker, RecordingPassTracker};
-use soac_ir_blockpy::InstrCodegen;
+use soac_ir_blockpy::{
+    constructor_entry_function_id_for_init, InstrCodegen, CONSTRUCTOR_ENTRY_FUNCTION_NAME,
+};
 
 #[derive(Clone)]
 struct TestPrettySuite(Suite);
@@ -80,6 +82,43 @@ fn pure_lowering_does_not_insert_counters() {
         }
     }
     assert_eq!(probe.increment_counters, 0);
+}
+
+#[test]
+fn class_lowering_adds_constructor_entry_function() {
+    let lowered = crate::lower_python_to_blockpy_for_testing(
+        "class C:\n    def __init__(self, value, *, scale=1):\n        self.value = value * scale\n",
+    )
+    .expect("lowering should succeed")
+    .codegen_module;
+
+    let init_function = lowered
+        .callable_defs
+        .iter()
+        .find(|function| function.names.qualname == "C.__init__")
+        .expect("lowered __init__ should exist");
+    let constructor_entry_function_id =
+        constructor_entry_function_id_for_init(&lowered, init_function.function_id)
+            .expect("constructor entry placeholder should be associated with __init__");
+    let constructor_entry = lowered
+        .callable_defs
+        .iter()
+        .find(|function| function.function_id == constructor_entry_function_id)
+        .expect("constructor entry placeholder should exist");
+
+    assert_ne!(constructor_entry.function_id, init_function.function_id);
+    assert_eq!(
+        constructor_entry.names.fn_name,
+        CONSTRUCTOR_ENTRY_FUNCTION_NAME
+    );
+    assert_eq!(
+        constructor_entry.execution_mode,
+        FunctionExecutionMode::Interpreted
+    );
+    assert_eq!(
+        constructor_entry.params.names(),
+        vec!["value".to_string(), "scale".to_string()]
+    );
 }
 
 #[derive(Default)]

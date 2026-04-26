@@ -1,5 +1,6 @@
 #![deny(unreachable_pub)]
 
+mod constructor_entries;
 mod instr_id;
 
 pub(crate) mod block_py {
@@ -18,6 +19,10 @@ pub use crate::instr_id::{
     assign_codegen_module_instr_ids, assign_missing_codegen_function_instr_ids,
     reassign_codegen_function_instr_ids, reassign_codegen_module_instr_ids,
     validate_codegen_instr_ids,
+};
+pub use constructor_entries::{
+    CONSTRUCTOR_ENTRY_FUNCTION_NAME, constructor_entry_function_id_for_init,
+    ensure_constructor_entry_functions,
 };
 
 /// Final lowered BlockPy form consumed by optimization, instrumentation, and JIT.

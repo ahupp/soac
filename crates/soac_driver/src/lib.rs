@@ -153,10 +153,12 @@ fn load_or_lower_pre_optimization_module(
 }
 
 fn finish_pre_optimization_module(
-    bb_codegen: BlockPyModule<CodegenModuleShape>,
+    mut bb_codegen: BlockPyModule<CodegenModuleShape>,
     pass_tracker: &mut impl PassTracker,
     env_config: &SoacEnvConfig,
 ) -> soac_lowering::Result<BlockPyModule<CodegenModuleShape>> {
+    soac_ir_blockpy::ensure_constructor_entry_functions(&mut bb_codegen);
+
     pass_tracker.record_timing("validate_codegen_instr_ids", || {
         soac_ir_blockpy::validate_codegen_instr_ids(&bb_codegen).map_err(anyhow::Error::msg)
     })?;
@@ -165,7 +167,6 @@ fn finish_pre_optimization_module(
     let mut typed_for_counters = lower_codegen_module_to_typed(bb_codegen.clone());
     define_typed_module_counter_defs(&mut typed_for_counters, &instrumentation_config)
         .map_err(anyhow::Error::msg)?;
-    let mut bb_codegen = bb_codegen;
     bb_codegen.counter_defs = typed_for_counters.counter_defs;
     Ok(bb_codegen)
 }
