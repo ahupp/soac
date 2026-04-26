@@ -44,6 +44,10 @@ use soac_core::block_py::{
 use soac_ir_blockpy::{CodegenModuleShape, InstrCodegen, validate_codegen_instr_ids};
 mod tests {
     use super::super::direct_abi;
+    use super::super::typed_pipeline::{
+        annotate_typed_attr_accesses, annotate_typed_exact_int_selections,
+        annotate_typed_indexed_global_accesses,
+    };
     use super::super::{
         CodegenBlock, DP_JIT_DECREF_IMPORT, DP_JIT_DEOPT_RESUME_IMPORT, DP_JIT_INCREF_IMPORT,
         DP_JIT_PY_CALL_POSITIONAL_THREE_IMPORT, DP_JIT_PY_VECTORCALL_IMPORT,
@@ -60,9 +64,7 @@ mod tests {
         SOAC_RUNTIME_PYLONG_AS_I64_SATURATING_SYMBOL, SOAC_RUNTIME_PYLONG_AS_I64_SYMBOL,
         SOAC_RUNTIME_STORE_GLOBAL_IMPORT, SOAC_RUNTIME_STORE_GLOBAL_INDEXED_IMPORT,
         SOAC_RUNTIME_TUPLE_NEW_IMPORT, SOAC_RUNTIME_TUPLE_SET_ITEM_STOLEN_IMPORT, ValueOwnership,
-        abrupt_kind_tag, annotate_typed_attr_accesses, annotate_typed_exact_int_selections,
-        annotate_typed_indexed_global_accesses,
-        apply_profile_typed_block_metadata_to_typed_function,
+        abrupt_kind_tag, apply_profile_typed_block_metadata_to_typed_function,
         apply_profile_typed_guard_miss_policy_to_typed_function,
         apply_profile_typed_plans_to_typed_function, build_counted_runtime_refcount_helper,
         compile_cranelift_run_bb_specialized_cached, declare_direct_function,
