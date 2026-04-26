@@ -133,19 +133,15 @@ mod tests {
     use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyModule, PyModuleMethods, PyTuple};
     use pyo3::{Bound, Py, PyAny, PyErr, PyResult, Python, ffi};
     use ruff_python_ast as ast;
-    use soac_config::SoacEnvConfig;
+    use soac_config::{SoacEnvConfig, SpecializationMode};
     use soac_core::block_py::{CounterId, CounterScope, InstrId, InstrKey};
-    use soac_core::pass_tracker::NoopPassTracker;
     use soac_core::profile::{
         CollectedTypeKeyLayout, CounterDumpKeyLayout, CounterDumpRecord, CounterDumpRow,
         CounterDumpTypeKey, CounterDumpTypeKeyLayout, CounterDumpTypeTableEntry,
         write_counter_dump_records,
     };
     use soac_driver::codegen_cache::pre_optimization_module_cache_identity;
-    use soac_instrument::{
-        CounterInstrumentationConfig, ExplicitCounterPlacement, InstrumentationConfig,
-        RefcountCounterMode, instrument_codegen_module_with_tracker,
-    };
+    use soac_instrument::{InstrumentationConfig, define_typed_module_counter_defs};
     use soac_ir_typed::emit_v3::{MechanicalIndexedFieldGuard, MechanicalModuleEmission};
     use soac_ir_typed::plan_v3::{
         CallBodyKind, CallBodyPlan, Cost, DirectCallArgPlan as PlanV3DirectCallArgPlan,
@@ -165,7 +161,7 @@ mod tests {
         TypedCodegenModuleShape, TypedDirectCallArgPlan, TypedDirectCallArgSource,
         TypedExactIntPlanSource, TypedExactListItemPlanSource, TypedIndexedFieldPlanSource,
         TypedIndexedGlobalPlanSource, TypedInstrExtra, TypedPlannedResult as PlannedResult,
-        ValueFacts, lower_codegen_function_to_typed,
+        ValueFacts, lower_codegen_function_to_typed, lower_codegen_module_to_typed,
     };
     use soac_opt::alternatives_v3::AlternativeCatalog;
     use soac_opt::artifacts_v3::ExactIntBranchV3Artifacts;
@@ -192,46 +188,31 @@ mod tests {
         SoacEnvConfig::default()
     }
 
-    fn legacy_counter_instrumentation_config(
+    fn define_module_counter_defs_for_profile(
+        module: &mut BlockPyModule<CodegenModuleShape>,
         call_targets: bool,
         block_entry: bool,
-    ) -> InstrumentationConfig {
-        InstrumentationConfig {
-            trace: None,
-            counters: CounterInstrumentationConfig {
-                call_targets,
-                locality: block_entry,
-                profiled_cold_blocks: block_entry,
-                refcounts: RefcountCounterMode::Disabled,
-            },
-            explicit_counter_placement: ExplicitCounterPlacement::Codegen,
-            deopt_entry_counters: false,
-            specialization_runtime_logging: false,
-        }
+    ) {
+        let mut config = InstrumentationConfig::from_env_config(
+            &SoacEnvConfig::default()
+                .with_specialization_mode(Some(SpecializationMode::Profile))
+                .with_profiled_cold_blocks_enabled(block_entry),
+        );
+        config.counters.call_targets = call_targets;
+        config.counters.locality = block_entry;
+        config.counters.profiled_cold_blocks = block_entry;
+        let mut typed_for_counters = lower_codegen_module_to_typed(module.clone());
+        define_typed_module_counter_defs(&mut typed_for_counters, &config)
+            .expect("typed counter definitions should succeed");
+        module.counter_defs = typed_for_counters.counter_defs;
     }
 
-    fn instrument_module_with_legacy_call_target_counters(
-        module: &mut BlockPyModule<CodegenModuleShape>,
-    ) {
-        let instrumented = instrument_codegen_module_with_tracker(
-            module.clone(),
-            &legacy_counter_instrumentation_config(true, false),
-            &mut NoopPassTracker::new(),
-        )
-        .expect("legacy call-target counter instrumentation should succeed");
-        *module = instrumented;
+    fn define_module_call_target_counters(module: &mut BlockPyModule<CodegenModuleShape>) {
+        define_module_counter_defs_for_profile(module, true, false);
     }
 
-    fn instrument_module_with_legacy_block_entry_counters(
-        module: &mut BlockPyModule<CodegenModuleShape>,
-    ) {
-        let instrumented = instrument_codegen_module_with_tracker(
-            module.clone(),
-            &legacy_counter_instrumentation_config(false, true),
-            &mut NoopPassTracker::new(),
-        )
-        .expect("legacy block-entry counter instrumentation should succeed");
-        *module = instrumented;
+    fn define_module_block_entry_counters(module: &mut BlockPyModule<CodegenModuleShape>) {
+        define_module_counter_defs_for_profile(module, false, true);
     }
 
     fn runtime_branch_counter_for(
@@ -5906,7 +5887,7 @@ def write_point(point, value):
             )
             .expect("lowering should succeed")
             .codegen_module;
-            instrument_module_with_legacy_call_target_counters(&mut lowered);
+            define_module_call_target_counters(&mut lowered);
             let function = lowered
                 .callable_defs
                 .iter()
@@ -6144,7 +6125,7 @@ class Record:
             )
             .expect("lowering should succeed")
             .codegen_module;
-            instrument_module_with_legacy_call_target_counters(&mut lowered);
+            define_module_call_target_counters(&mut lowered);
             let function = lowered
                 .callable_defs
                 .iter()
@@ -6408,7 +6389,7 @@ def read_point(point):
             )
             .expect("lowering should succeed")
             .codegen_module;
-            instrument_module_with_legacy_call_target_counters(&mut lowered);
+            define_module_call_target_counters(&mut lowered);
             let function = lowered
                 .callable_defs
                 .iter()
@@ -6575,7 +6556,7 @@ class Point:
         let mut lowered = soac_lowering::lower_python_to_blockpy_for_testing(source)
             .expect("lowering should succeed")
             .codegen_module;
-        instrument_module_with_legacy_call_target_counters(&mut lowered);
+        define_module_call_target_counters(&mut lowered);
         let shared_state =
             crate::module_type::build_shared_state_for_testing(py, lowered, "counter_test", "")
                 .expect("shared state should build");
@@ -6849,7 +6830,7 @@ def read_point(point):
             )
             .expect("lowering should succeed")
             .codegen_module;
-            instrument_module_with_legacy_call_target_counters(&mut lowered);
+            define_module_call_target_counters(&mut lowered);
             let function = lowered
                 .callable_defs
                 .iter()
@@ -7041,7 +7022,7 @@ def write_point(point, value):
             )
             .expect("lowering should succeed")
             .codegen_module;
-            instrument_module_with_legacy_call_target_counters(&mut lowered);
+            define_module_call_target_counters(&mut lowered);
             let function = lowered
                 .callable_defs
                 .iter()
@@ -13525,7 +13506,7 @@ def f():
                 )
                 .expect("lowering should succeed")
                 .codegen_module;
-                instrument_module_with_legacy_block_entry_counters(&mut lowered);
+                define_module_block_entry_counters(&mut lowered);
 
                 let function = lowered
                     .callable_defs
@@ -13561,7 +13542,12 @@ def f():
                 let runtime = build_test_module_runtime(py, shared_state.clone());
                 let module_constant_ptrs = shared_state.module_constant_ptrs();
                 let blocks = vec![std::ptr::null_mut::<c_void>(); function.blocks.len()];
-                let compile_session = crate::session::CompileSession::process();
+                let compile_session =
+                    std::sync::Arc::new(crate::session::CompileSession::new_with_env_config(
+                        SoacEnvConfig::default()
+                            .with_specialization_mode(Some(SpecializationMode::Profile))
+                            .with_profiled_cold_blocks_enabled(true),
+                    ));
                 let compiled_handle = compile_cranelift_run_bb_specialized_cached(
                     &compile_session,
                     &blocks,
@@ -16214,7 +16200,7 @@ def f():
                 let baseline_symbolic_globals =
                     count_symbolic_global_values(&baseline_built.ctx.func);
 
-                instrument_module_with_legacy_block_entry_counters(&mut baseline);
+                define_module_block_entry_counters(&mut baseline);
 
                 let shared_state = crate::module_type::build_shared_state_for_testing(
                     py,
@@ -16327,7 +16313,7 @@ def f(x, y):
                 let mut instrumented = soac_lowering::lower_python_to_blockpy_for_testing(source)
                     .expect("lowering should succeed")
                     .codegen_module;
-                instrument_module_with_legacy_call_target_counters(&mut instrumented);
+                define_module_call_target_counters(&mut instrumented);
                 let shared_state = crate::module_type::build_shared_state_for_testing(
                     py,
                     instrumented,
@@ -16651,7 +16637,7 @@ def f(x, y):
             );
 
             let mut module = test_module(module_name_gen, vec![callee_function, caller_function]);
-            instrument_module_with_legacy_call_target_counters(&mut module);
+            define_module_call_target_counters(&mut module);
             let shared_state =
                 crate::module_type::build_shared_state_for_testing(py, module, module_name, "")
                     .expect("shared state should build");
@@ -17769,7 +17755,7 @@ class Point:
     ) {
         let blocks = [1usize as ObjPtr];
         let mut module = test_module(ModuleNameGen::new(0), vec![function]);
-        instrument_module_with_legacy_call_target_counters(&mut module);
+        define_module_call_target_counters(&mut module);
         let function = module.callable_defs[0].clone();
         let module_constants =
             crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
@@ -17828,7 +17814,7 @@ class Point:
             ret_term(none_expr()),
         );
         let mut module = test_module(ModuleNameGen::new(0), vec![function]);
-        instrument_module_with_legacy_call_target_counters(&mut module);
+        define_module_call_target_counters(&mut module);
         let shared_state = crate::module_type::build_shared_state_for_testing(
             py,
             module,
@@ -17905,7 +17891,7 @@ class Point:
         );
         let mut module = test_module(ModuleNameGen::new(0), vec![function]);
         module.module_constants = constants.module_constants;
-        instrument_module_with_legacy_call_target_counters(&mut module);
+        define_module_call_target_counters(&mut module);
         let shared_state = crate::module_type::build_shared_state_for_testing(
             py,
             module,
@@ -18204,7 +18190,7 @@ class Point:
                 type_table: Vec::new(),
             },
         );
-        instrument_module_with_legacy_call_target_counters(&mut module);
+        define_module_call_target_counters(&mut module);
 
         let shared_state = crate::module_type::build_shared_state_for_testing(
             py,
@@ -18418,7 +18404,7 @@ class Point:
                     type_table: Vec::new(),
                 },
             );
-            instrument_module_with_legacy_call_target_counters(&mut module);
+            define_module_call_target_counters(&mut module);
 
             let shared_state = crate::module_type::build_shared_state_for_testing(
                 py,
@@ -18722,7 +18708,7 @@ class Point:
             ret_term(none_expr()),
         );
         let mut module = test_module(ModuleNameGen::new(0), vec![function]);
-        instrument_module_with_legacy_call_target_counters(&mut module);
+        define_module_call_target_counters(&mut module);
         let function = module.callable_defs[0].clone();
         let module_constants =
             crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
@@ -18764,7 +18750,7 @@ class Point:
             ret_term(none_expr()),
         );
         let mut module = test_module(ModuleNameGen::new(0), vec![function]);
-        instrument_module_with_legacy_call_target_counters(&mut module);
+        define_module_call_target_counters(&mut module);
         let function = module.callable_defs[0].clone();
         let module_constants =
             crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
@@ -19101,7 +19087,7 @@ class Point:
             module_constants: constants.module_constants,
             counter_defs: Vec::new(),
         };
-        instrument_module_with_legacy_call_target_counters(&mut module);
+        define_module_call_target_counters(&mut module);
         let function = module.callable_defs[0].clone();
         let module_constants =
             crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
@@ -19165,7 +19151,7 @@ class Point:
             ])),
         );
         let mut module = test_module(ModuleNameGen::new(0), vec![function]);
-        instrument_module_with_legacy_call_target_counters(&mut module);
+        define_module_call_target_counters(&mut module);
         let function = module.callable_defs[0].clone();
         let module_constants =
             crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
@@ -19378,7 +19364,7 @@ class Point:
             );
             set_stack_slots(&mut function, &["value"]);
             let mut module = test_module(ModuleNameGen::new(0), vec![function]);
-            instrument_module_with_legacy_call_target_counters(&mut module);
+            define_module_call_target_counters(&mut module);
             let shared_state = crate::module_type::build_shared_state_for_testing(
                 py,
                 module,

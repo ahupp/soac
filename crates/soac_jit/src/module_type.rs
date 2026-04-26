@@ -1728,38 +1728,23 @@ impl SoacExtModule {
 mod test {
     use super::*;
     use pyo3::types::PyModule;
-    use soac_core::pass_tracker::NoopPassTracker;
     use soac_core::profile::COUNTER_DUMP_MAGIC;
-    use soac_instrument::{
-        CounterInstrumentationConfig, ExplicitCounterPlacement, InstrumentationConfig,
-        RefcountCounterMode, instrument_codegen_module_with_tracker,
-    };
+    use soac_instrument::{InstrumentationConfig, define_typed_module_counter_defs};
+    use soac_ir_typed::lower_codegen_module_to_typed;
     use soac_lowering::lower_python_to_blockpy_for_testing;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn instrument_module_with_legacy_block_entry_counters(
-        module: &mut BlockPyModule<CodegenModuleShape>,
-    ) {
-        let config = InstrumentationConfig {
-            trace: None,
-            counters: CounterInstrumentationConfig {
-                call_targets: false,
-                locality: true,
-                profiled_cold_blocks: true,
-                refcounts: RefcountCounterMode::Disabled,
-            },
-            explicit_counter_placement: ExplicitCounterPlacement::Codegen,
-            deopt_entry_counters: false,
-            specialization_runtime_logging: false,
-        };
-        let instrumented = instrument_codegen_module_with_tracker(
-            module.clone(),
-            &config,
-            &mut NoopPassTracker::new(),
-        )
-        .expect("legacy block-entry counter instrumentation should succeed");
-        *module = instrumented;
+    fn define_module_block_entry_counters(module: &mut BlockPyModule<CodegenModuleShape>) {
+        let config = InstrumentationConfig::from_env_config(
+            &SoacEnvConfig::default()
+                .with_specialization_mode(Some(SpecializationMode::Profile))
+                .with_profiled_cold_blocks_enabled(true),
+        );
+        let mut typed_for_counters = lower_codegen_module_to_typed(module.clone());
+        define_typed_module_counter_defs(&mut typed_for_counters, &config)
+            .expect("typed block-entry counter definitions should succeed");
+        module.counter_defs = typed_for_counters.counter_defs;
     }
 
     #[test]
@@ -1772,7 +1757,7 @@ def f():
         )
         .expect("transform should succeed")
         .codegen_module;
-        instrument_module_with_legacy_block_entry_counters(&mut lowered);
+        define_module_block_entry_counters(&mut lowered);
 
         let function = lowered
             .callable_defs
@@ -2040,7 +2025,7 @@ def f():
         )
         .expect("transform should succeed")
         .codegen_module;
-        instrument_module_with_legacy_block_entry_counters(&mut lowered);
+        define_module_block_entry_counters(&mut lowered);
 
         let shared_state = SharedModuleState {
             function_index_by_id: build_function_index_by_id(&lowered)

@@ -1801,7 +1801,6 @@ version = "0.1.0"
 dependencies = [
  "soac_config",
  "soac_core",
- "soac_ir_blockpy",
  "soac_ir_typed",
  "soac_lowering",
 ]

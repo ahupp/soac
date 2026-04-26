@@ -1,11 +1,14 @@
 use super::{define_typed_module_counter_defs, instrument_typed_module_with_tracker};
 use crate::InstrumentationConfig;
-use soac_config::{SoacEnvConfig, SpecializationMode};
+use soac_config::{ExecTraceConfig, SoacEnvConfig, SpecializationMode};
 use soac_core::block_py::{
-    BlockPyFunction, BlockPyModule, ChildVisitable, CounterSite, FunctionExecutionMode, Visit,
+    BlockPyFunction, BlockPyModule, ChildVisitable, CounterSite, FunctionExecutionMode, NameLike,
+    NameLocation, Visit,
 };
 use soac_core::pass_tracker::NoopPassTracker;
-use soac_ir_typed::{InstrTyped, TypedCodegenModuleShape, lower_codegen_module_to_typed};
+use soac_ir_typed::{
+    InstrTyped, TypedCall, TypedCodegenModuleShape, lower_codegen_module_to_typed,
+};
 use soac_lowering::lower_python_to_blockpy_for_testing;
 use std::collections::HashSet;
 
@@ -31,6 +34,83 @@ fn function_contains_increment_counter(
     let mut probe = IncrementCounterProbe { found: false };
     probe.visit_fn(function);
     probe.found
+}
+
+fn trace_enter_calls(
+    function: &BlockPyFunction<TypedCodegenModuleShape>,
+) -> Vec<&TypedCall<InstrTyped>> {
+    function
+        .blocks
+        .iter()
+        .flat_map(|block| block.body.iter())
+        .filter_map(|stmt| {
+            let InstrTyped::CallTyped(call) = stmt else {
+                return None;
+            };
+            match call.func.as_ref() {
+                InstrTyped::Load(load) if load.name.is_runtime_symbol("bb_trace_enter") => {
+                    Some(call)
+                }
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+fn expr_tree_contains_local_load(expr: &InstrTyped) -> bool {
+    struct LocalLoadProbe {
+        found: bool,
+    }
+
+    impl Visit<InstrTyped> for LocalLoadProbe {
+        fn visit_instr(&mut self, expr: &InstrTyped) {
+            self.found |= matches!(
+                expr,
+                InstrTyped::Load(load) if matches!(load.name.location, NameLocation::Local(_))
+            );
+            expr.visit_children(self);
+        }
+    }
+
+    let mut probe = LocalLoadProbe { found: false };
+    probe.visit_instr(expr);
+    probe.found
+}
+
+#[test]
+fn typed_exec_trace_instruments_matching_function_blocks() {
+    let source = "def f(x):\n    try:\n        return x + 1\n    except Exception:\n        return 0\n\ndef g(y):\n    return y + 2\n";
+    let typed = typed_module_for_test(source);
+    let mut config = InstrumentationConfig::from_env_config(&SoacEnvConfig::default());
+    config.trace = Some(ExecTraceConfig {
+        qualname_filter: Some("f".to_string()),
+        include_params: true,
+    });
+
+    let instrumented =
+        instrument_typed_module_with_tracker(typed, &config, &mut NoopPassTracker::new())
+            .expect("typed trace instrumentation should succeed");
+
+    let f = instrumented
+        .callable_defs
+        .iter()
+        .find(|function| function.names.qualname == "f")
+        .expect("missing f");
+    let g = instrumented
+        .callable_defs
+        .iter()
+        .find(|function| function.names.qualname == "g")
+        .expect("missing g");
+    let f_trace_calls = trace_enter_calls(f);
+    assert!(!f_trace_calls.is_empty(), "missing trace op in f");
+    assert!(
+        f_trace_calls.iter().any(|call| call
+            .args
+            .iter()
+            .any(|arg| expr_tree_contains_local_load(arg.expr()))),
+        "missing local-load param payload in trace calls"
+    );
+    assert!(trace_enter_calls(g).is_empty());
 }
 
 #[test]

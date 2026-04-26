@@ -9,10 +9,7 @@ use crate::codegen_cache::{
 use soac_config::SoacEnvConfig;
 use soac_core::block_py::{BlockPyModule, ModuleNameGen};
 use soac_core::pass_tracker::PassTracker;
-use soac_instrument::{
-    ExplicitCounterPlacement, InstrumentationConfig, define_typed_module_counter_defs,
-    instrument_codegen_module_with_tracker,
-};
+use soac_instrument::{InstrumentationConfig, define_typed_module_counter_defs};
 use soac_ir_blockpy::CodegenModuleShape;
 use soac_ir_typed::lower_codegen_module_to_typed;
 pub use soac_lowering::{LoweringError, Result};
@@ -165,20 +162,12 @@ fn finish_pre_optimization_module(
     })?;
 
     let instrumentation_config = InstrumentationConfig::from_env_config(env_config);
-    let bb_codegen =
-        if instrumentation_config.explicit_counter_placement == ExplicitCounterPlacement::Typed {
-            let mut typed_for_counters = lower_codegen_module_to_typed(bb_codegen.clone());
-            define_typed_module_counter_defs(&mut typed_for_counters, &instrumentation_config)
-                .map_err(anyhow::Error::msg)?;
-            let mut bb_codegen = bb_codegen;
-            bb_codegen.counter_defs = typed_for_counters.counter_defs;
-            bb_codegen
-        } else {
-            bb_codegen
-        };
-    instrument_codegen_module_with_tracker(bb_codegen, &instrumentation_config, pass_tracker)
-        .map_err(anyhow::Error::msg)
-        .map_err(Into::into)
+    let mut typed_for_counters = lower_codegen_module_to_typed(bb_codegen.clone());
+    define_typed_module_counter_defs(&mut typed_for_counters, &instrumentation_config)
+        .map_err(anyhow::Error::msg)?;
+    let mut bb_codegen = bb_codegen;
+    bb_codegen.counter_defs = typed_for_counters.counter_defs;
+    Ok(bb_codegen)
 }
 
 #[cfg(test)]
