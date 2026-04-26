@@ -12963,8 +12963,18 @@ def f(x):
         )
     }
 
-    unsafe fn build_runtime_refcount_smoke_wrapper()
-    -> unsafe extern "C" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void {
+    struct RuntimeRefcountSmokeWrapper {
+        _jit_module: JITModule,
+        compiled: unsafe extern "C" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void,
+    }
+
+    impl RuntimeRefcountSmokeWrapper {
+        unsafe fn call(&self, arg: *mut std::ffi::c_void) -> *mut std::ffi::c_void {
+            (self.compiled)(arg)
+        }
+    }
+
+    unsafe fn build_runtime_refcount_smoke_wrapper() -> RuntimeRefcountSmokeWrapper {
         let (_compile_session, mut jit_module, mut ctx, wrapper_id, _) =
             build_runtime_refcount_smoke_context();
 
@@ -12985,12 +12995,24 @@ def f(x):
         let code_ptr = jit_module.get_finalized_function(wrapper_id);
         let compiled: unsafe extern "C" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void =
             std::mem::transmute(code_ptr);
-        Box::leak(Box::new(jit_module));
-        compiled
+        RuntimeRefcountSmokeWrapper {
+            _jit_module: jit_module,
+            compiled,
+        }
     }
 
-    unsafe fn build_runtime_decref_wrapper()
-    -> unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) {
+    struct RuntimeDecrefWrapper {
+        _jit_module: JITModule,
+        compiled: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void),
+    }
+
+    impl RuntimeDecrefWrapper {
+        unsafe fn call(&self, tstate: *mut std::ffi::c_void, arg: *mut std::ffi::c_void) {
+            (self.compiled)(tstate, arg);
+        }
+    }
+
+    unsafe fn build_runtime_decref_wrapper() -> RuntimeDecrefWrapper {
         let compile_session = crate::session::CompileSession::new();
         let mut jit_module =
             new_jit_module(&compile_session).expect("test jit module should construct");
@@ -13054,14 +13076,29 @@ def f(x):
         let code_ptr = jit_module.get_finalized_function(wrapper_id);
         let compiled: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) =
             std::mem::transmute(code_ptr);
-        Box::leak(Box::new(jit_module));
-        compiled
+        RuntimeDecrefWrapper {
+            _jit_module: jit_module,
+            compiled,
+        }
     }
 
-    unsafe fn build_counted_runtime_incref_wrapper() -> (
-        unsafe extern "C" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void,
-        *const u64,
-    ) {
+    struct CountedRuntimeRefcountWrapper {
+        _jit_module: JITModule,
+        compiled: unsafe extern "C" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void,
+        counter_ptr: *const u64,
+    }
+
+    impl CountedRuntimeRefcountWrapper {
+        unsafe fn call(&self, arg: *mut std::ffi::c_void) -> *mut std::ffi::c_void {
+            (self.compiled)(arg)
+        }
+
+        fn counter_ptr(&self) -> *const u64 {
+            self.counter_ptr
+        }
+    }
+
+    unsafe fn build_counted_runtime_incref_wrapper() -> CountedRuntimeRefcountWrapper {
         let compile_session = crate::session::CompileSession::new();
         let mut jit_module =
             new_jit_module(&compile_session).expect("test jit module should construct");
@@ -13141,14 +13178,14 @@ def f(x):
         );
         let counter_ptr = counter_ptr.cast::<u64>();
 
-        Box::leak(Box::new(jit_module));
-        (compiled, counter_ptr)
+        CountedRuntimeRefcountWrapper {
+            _jit_module: jit_module,
+            compiled,
+            counter_ptr,
+        }
     }
 
-    unsafe fn build_counted_runtime_decref_wrapper() -> (
-        unsafe extern "C" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void,
-        *const u64,
-    ) {
+    unsafe fn build_counted_runtime_decref_wrapper() -> CountedRuntimeRefcountWrapper {
         let compile_session = crate::session::CompileSession::new();
         let mut jit_module =
             new_jit_module(&compile_session).expect("test jit module should construct");
@@ -13229,15 +13266,18 @@ def f(x):
         );
         let counter_ptr = counter_ptr.cast::<u64>();
 
-        Box::leak(Box::new(jit_module));
-        (compiled, counter_ptr)
+        CountedRuntimeRefcountWrapper {
+            _jit_module: jit_module,
+            compiled,
+            counter_ptr,
+        }
     }
 
     #[test]
     fn jit_can_call_runtime_support_clif_function() {
         unsafe {
             let wrapper = build_runtime_refcount_smoke_wrapper();
-            let result = wrapper(std::ptr::null_mut());
+            let result = wrapper.call(std::ptr::null_mut());
             assert!(
                 result.is_null(),
                 "runtime incref/decref smoke wrapper should preserve the null pointer"
@@ -13400,6 +13440,15 @@ def f(x):
         assert_eq!(len.function.signature.returns.len(), 1);
         assert_eq!(len.function.signature.returns[0].value_type, ir::types::I64);
 
+        let iter =
+            parsed_runtime_clif_function(direct_abi::SOAC_RUNTIME_BUILTIN_ITER_OBJECT_SYMBOL);
+        assert_eq!(iter.function.signature.params.len(), 2);
+        assert_eq!(iter.function.signature.returns.len(), 1);
+        assert_eq!(
+            iter.function.signature.returns[0].value_type,
+            ir::types::I64
+        );
+
         let pylong_as_i64 = parsed_runtime_clif_function(SOAC_RUNTIME_PYLONG_AS_I64_SYMBOL);
         assert_eq!(pylong_as_i64.function.signature.params.len(), 2);
         assert_eq!(pylong_as_i64.function.signature.returns.len(), 1);
@@ -13432,7 +13481,7 @@ def f(x):
                 );
                 assert!(!obj.is_null(), "PyCapsule_New should produce a test object");
                 let before = ffi::Py_REFCNT(obj);
-                let result = wrapper(obj.cast());
+                let result = wrapper.call(obj.cast());
                 let after = ffi::Py_REFCNT(obj);
                 assert_eq!(result, obj.cast(), "wrapper should return the same pointer");
                 assert_eq!(
@@ -13468,7 +13517,7 @@ def f(x):
                 );
 
                 let tstate = PyThreadState_GetUnchecked();
-                wrapper(tstate.cast(), capsule.cast());
+                wrapper.call(tstate.cast(), capsule.cast());
                 let after = ffi::Py_REFCNT(capsule);
 
                 assert!(
@@ -13483,7 +13532,8 @@ def f(x):
     fn jit_counted_runtime_incref_counter_tracks_only_applied_refcount_ops() {
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         unsafe {
-            let (wrapper, counter_ptr) = build_counted_runtime_incref_wrapper();
+            let wrapper = build_counted_runtime_incref_wrapper();
+            let counter_ptr = wrapper.counter_ptr();
             crate::initialize_test_python();
             Python::attach(|_| {
                 let obj = ffi::PyCapsule_New(
@@ -13497,7 +13547,7 @@ def f(x):
                     *counter_ptr, 0,
                     "counted incref helper should start with a zeroed scalar counter"
                 );
-                let result = wrapper(obj.cast());
+                let result = wrapper.call(obj.cast());
                 assert_eq!(
                     result,
                     obj.cast(),
@@ -13509,7 +13559,7 @@ def f(x):
                 );
 
                 let none = ffi::Py_None();
-                let none_result = wrapper(none.cast());
+                let none_result = wrapper.call(none.cast());
                 assert_eq!(none_result, none.cast(), "wrapper should preserve Py_None");
                 assert_eq!(
                     *counter_ptr, 1,
@@ -13526,7 +13576,8 @@ def f(x):
     fn jit_counted_runtime_decref_counter_tracks_only_applied_refcount_ops() {
         let _guard = crate::python_runtime_test_lock().lock().unwrap();
         unsafe {
-            let (wrapper, counter_ptr) = build_counted_runtime_decref_wrapper();
+            let wrapper = build_counted_runtime_decref_wrapper();
+            let counter_ptr = wrapper.counter_ptr();
             crate::initialize_test_python();
             Python::attach(|_| {
                 let obj = ffi::PyCapsule_New(
@@ -13541,7 +13592,7 @@ def f(x):
                     *counter_ptr, 0,
                     "counted decref helper should start with a zeroed scalar counter"
                 );
-                let result = wrapper(obj.cast());
+                let result = wrapper.call(obj.cast());
                 assert_eq!(
                     result,
                     obj.cast(),
@@ -13553,7 +13604,7 @@ def f(x):
                 );
 
                 let none = ffi::Py_None();
-                let none_result = wrapper(none.cast());
+                let none_result = wrapper.call(none.cast());
                 assert_eq!(none_result, none.cast(), "wrapper should preserve Py_None");
                 assert_eq!(
                     *counter_ptr, 1,

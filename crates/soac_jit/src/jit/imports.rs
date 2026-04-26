@@ -14,14 +14,16 @@ use super::symbols::reloc_type_ref_from_typed_attr_owner_ref;
 use super::symbols::{
     CpythonTypeSymbol, RelocTypeRef, SOAC_RUNTIME_DECREF_APPLIED_SYMBOL,
     SOAC_RUNTIME_DECREF_SYMBOL, SOAC_RUNTIME_INCREF_APPLIED_SYMBOL, SOAC_RUNTIME_INCREF_SYMBOL,
-    SOAC_RUNTIME_LOAD_GLOBAL_SYMBOL, SOAC_RUNTIME_PROBE_FIELD_INDEXED_SYMBOL,
-    SOAC_RUNTIME_PROBE_GLOBAL_INDEXED_SYMBOL, SOAC_RUNTIME_PYLONG_AS_I64_SATURATING_SYMBOL,
-    SOAC_RUNTIME_SET_RAISED_EXCEPTION_SYMBOL, SOAC_RUNTIME_STORE_FIELD_INDEXED_SYMBOL,
-    SOAC_RUNTIME_STORE_GLOBAL_INDEXED_SYMBOL, SOAC_RUNTIME_STORE_GLOBAL_SYMBOL,
-    SOAC_RUNTIME_TUPLE_NEW_SYMBOL, SOAC_RUNTIME_TUPLE_SET_ITEM_STOLEN_SYMBOL,
-    cpython_type_symbol_name, ensure_reloc_callable_symbol_registered,
-    ensure_reloc_type_symbol_registered, reloc_callable_ref_symbol_name, reloc_type_ref_for_type,
-    reloc_type_ref_symbol_name,
+    SOAC_RUNTIME_LOAD_GLOBAL_SYMBOL, SOAC_RUNTIME_PROBE_FIELD_INDEXED_INLINE_VALUES_SYMBOL,
+    SOAC_RUNTIME_PROBE_FIELD_INDEXED_SYMBOL, SOAC_RUNTIME_PROBE_GLOBAL_INDEXED_SYMBOL,
+    SOAC_RUNTIME_PYLONG_AS_I64_SATURATING_SYMBOL, SOAC_RUNTIME_SET_RAISED_EXCEPTION_SYMBOL,
+    SOAC_RUNTIME_STORE_FIELD_INDEXED_INLINE_VALUES_SYMBOL,
+    SOAC_RUNTIME_STORE_FIELD_INDEXED_INLINE_VALUES_TRUSTED_SYMBOL,
+    SOAC_RUNTIME_STORE_FIELD_INDEXED_SYMBOL, SOAC_RUNTIME_STORE_GLOBAL_INDEXED_SYMBOL,
+    SOAC_RUNTIME_STORE_GLOBAL_SYMBOL, SOAC_RUNTIME_TUPLE_NEW_SYMBOL,
+    SOAC_RUNTIME_TUPLE_SET_ITEM_STOLEN_SYMBOL, cpython_type_symbol_name,
+    ensure_reloc_callable_symbol_registered, ensure_reloc_type_symbol_registered,
+    reloc_callable_ref_symbol_name, reloc_type_ref_for_type, reloc_type_ref_symbol_name,
 };
 use crate::function_instantiation::SOAC_JIT_MAKE_FUNCTION_WITH_CLOSURE_SYMBOL;
 use cranelift_jit::JITModule;
@@ -167,6 +169,12 @@ pub(super) static SOAC_RUNTIME_PROBE_FIELD_INDEXED_IMPORT: ImportSpec = ImportSp
     &[SigType::Pointer, SigType::Pointer, SigType::I64],
     &[SigType::Pointer],
 );
+pub(super) static SOAC_RUNTIME_PROBE_FIELD_INDEXED_INLINE_VALUES_IMPORT: ImportSpec =
+    ImportSpec::local(
+        SOAC_RUNTIME_PROBE_FIELD_INDEXED_INLINE_VALUES_SYMBOL,
+        &[SigType::Pointer, SigType::Pointer, SigType::I64],
+        &[SigType::Pointer],
+    );
 pub(super) static SOAC_RUNTIME_STORE_FIELD_INDEXED_IMPORT: ImportSpec = ImportSpec::local(
     SOAC_RUNTIME_STORE_FIELD_INDEXED_SYMBOL,
     &[
@@ -178,6 +186,29 @@ pub(super) static SOAC_RUNTIME_STORE_FIELD_INDEXED_IMPORT: ImportSpec = ImportSp
     ],
     &[SigType::I32],
 );
+pub(super) static SOAC_RUNTIME_STORE_FIELD_INDEXED_INLINE_VALUES_IMPORT: ImportSpec =
+    ImportSpec::local(
+        SOAC_RUNTIME_STORE_FIELD_INDEXED_INLINE_VALUES_SYMBOL,
+        &[
+            SigType::Pointer,
+            SigType::Pointer,
+            SigType::Pointer,
+            SigType::I64,
+            SigType::Pointer,
+        ],
+        &[SigType::I32],
+    );
+pub(super) static SOAC_RUNTIME_STORE_FIELD_INDEXED_INLINE_VALUES_TRUSTED_IMPORT: ImportSpec =
+    ImportSpec::local(
+        SOAC_RUNTIME_STORE_FIELD_INDEXED_INLINE_VALUES_TRUSTED_SYMBOL,
+        &[
+            SigType::Pointer,
+            SigType::Pointer,
+            SigType::I64,
+            SigType::Pointer,
+        ],
+        &[SigType::I32],
+    );
 pub(super) static SOAC_RUNTIME_BUILTIN_ORD_I64_IMPORT: ImportSpec = ImportSpec::local(
     direct_abi::SOAC_RUNTIME_BUILTIN_ORD_I64_SYMBOL,
     &[SigType::Pointer, SigType::Pointer],
@@ -192,6 +223,11 @@ pub(super) static SOAC_RUNTIME_BUILTIN_LEN_I64_IMPORT: ImportSpec = ImportSpec::
     direct_abi::SOAC_RUNTIME_BUILTIN_LEN_I64_SYMBOL,
     &[SigType::Pointer, SigType::Pointer],
     &[SigType::I64],
+);
+pub(super) static SOAC_RUNTIME_BUILTIN_ITER_OBJECT_IMPORT: ImportSpec = ImportSpec::local(
+    direct_abi::SOAC_RUNTIME_BUILTIN_ITER_OBJECT_SYMBOL,
+    &[SigType::Pointer, SigType::Pointer],
+    &[SigType::Pointer],
 );
 pub(super) static SOAC_RUNTIME_PYLONG_AS_I64_SATURATING_IMPORT: ImportSpec = ImportSpec::local(
     SOAC_RUNTIME_PYLONG_AS_I64_SATURATING_SYMBOL,
@@ -436,10 +472,14 @@ static JIT_RUNTIME_IMPORT_SPECS: &[&ImportSpec] = &[
     &SOAC_RUNTIME_STORE_GLOBAL_IMPORT,
     &SOAC_RUNTIME_STORE_GLOBAL_INDEXED_IMPORT,
     &SOAC_RUNTIME_PROBE_FIELD_INDEXED_IMPORT,
+    &SOAC_RUNTIME_PROBE_FIELD_INDEXED_INLINE_VALUES_IMPORT,
     &SOAC_RUNTIME_STORE_FIELD_INDEXED_IMPORT,
+    &SOAC_RUNTIME_STORE_FIELD_INDEXED_INLINE_VALUES_IMPORT,
+    &SOAC_RUNTIME_STORE_FIELD_INDEXED_INLINE_VALUES_TRUSTED_IMPORT,
     &SOAC_RUNTIME_BUILTIN_ORD_I64_IMPORT,
     &SOAC_RUNTIME_BUILTIN_CHR_I64_IMPORT,
     &SOAC_RUNTIME_BUILTIN_LEN_I64_IMPORT,
+    &SOAC_RUNTIME_BUILTIN_ITER_OBJECT_IMPORT,
     &SOAC_RUNTIME_PYLONG_AS_I64_SATURATING_IMPORT,
     &DP_JIT_RAISE_I64_OVERFLOW_IMPORT,
     &DP_JIT_PY_CALL_POSITIONAL_THREE_IMPORT,

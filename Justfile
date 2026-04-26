@@ -540,7 +540,6 @@ run-and-view-speedscope loops="10000000" counters_dir="" output_prefix="work/log
     exit 1
   fi
   cd "$REPO_ROOT"
-  just _decide-optimizations-for-counters-dir "$COUNTERS_DIR"
   SOAC_WORK_DIR="$COUNTERS_DIR" \
   SOAC_OPT_MODE=apply \
     just perf-pystone-jit-warm "{{loops}}" "{{output_prefix}}"
@@ -771,8 +770,6 @@ perf-pystone-jit-specialized loops="10000000" output_prefix="work/logs/pystone_j
   SOAC_WORK_DIR="$counters_dir" \
   SOAC_OPT_MODE=profile \
     "$REPO_ROOT/.venv/bin/python" -c 'import os, sys; sys.path.insert(0, os.environ["BENCHMARK_SOURCE_DIR"]); from soac.import_hook import install; install(); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)' >/tmp/soac_perf_specialization_profile.out 2>&1
-
-  just _decide-optimizations-for-counters-dir "$counters_dir"
 
   SOAC_WORK_DIR="$counters_dir" \
   SOAC_OPT_MODE=apply \
@@ -1434,8 +1431,6 @@ _benchmark-run-specialized-perf result_dir perf_loops="10000000": ensure-cpython
     echo "counter profile not found at $COUNTERS_DIR/profile.bin; run 'just benchmark' first or pass result_dir=<dir>" >&2
     exit 1
   fi
-
-  just _decide-optimizations-for-counters-dir "$COUNTERS_DIR"
 
   OUTPUT_PREFIX="$RESULT_DIR/$(basename "$RESULT_DIR")_perf"
   SOAC_WORK_DIR="$COUNTERS_DIR" \

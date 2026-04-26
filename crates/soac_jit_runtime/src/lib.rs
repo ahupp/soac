@@ -186,6 +186,14 @@ struct RawPyThreadState {
     current_exception: *mut RawPyObject,
 }
 
+#[repr(C)]
+struct RawPyAsciiObject {
+    ob_base: RawPyObject,
+    length: isize,
+    hash: isize,
+    state: u32,
+}
+
 unsafe extern "C" {
     fn _Py_Dealloc(obj: *mut RawPyObject);
     fn PyErr_SetNone(exception: *mut c_void);
@@ -193,6 +201,7 @@ unsafe extern "C" {
     fn PyUnicode_FromOrdinal(ordinal: i32) -> *mut c_void;
     fn PyUnicode_GetLength(unicode: *mut c_void) -> isize;
     fn PyUnicode_ReadChar(unicode: *mut c_void, index: isize) -> u32;
+    fn PyObject_GetIter(obj: *mut c_void) -> *mut c_void;
     fn PyObject_Size(obj: *mut c_void) -> isize;
     fn PyTuple_New(size: isize) -> *mut c_void;
     fn PyLong_AsLongLong(obj: *mut c_void) -> i64;
@@ -212,12 +221,15 @@ unsafe extern "C" {
     static mut PyExc_TypeError: *mut c_void;
     static mut PyExc_ValueError: *mut c_void;
     static mut _PyDict_IndexedValueTombstone: c_void;
+    static mut PyUnicode_Type: c_void;
 }
 
 const PY_TPFLAGS_MANAGED_DICT: usize = 1 << 4;
 const PY_TPFLAGS_INLINE_VALUES: usize = 1 << 2;
 
 const MANAGED_DICT_OFFSET: isize = -3 * (core::mem::size_of::<*mut c_void>() as isize);
+const PY_UNICODE_STATE_COMPACT_MASK: u32 = 1 << 5;
+const PY_UNICODE_STATE_ASCII_MASK: u32 = 1 << 6;
 
 #[inline(always)]
 unsafe fn dict_unicode_entries(keys: *mut RawPyDictKeysObject) -> *mut RawPyDictUnicodeEntry {
@@ -244,6 +256,27 @@ unsafe fn dict_key_matches(actual: *mut RawPyObject, expected: *mut RawPyObject)
                 PyObject_RichCompareBool(actual.cast::<c_void>(), expected.cast::<c_void>(), PY_EQ)
                     == 1
             })
+}
+
+#[inline(always)]
+unsafe fn exact_compact_ascii_ord(obj: *mut c_void) -> Option<i64> {
+    let obj = obj.cast::<RawPyObject>();
+    if unsafe { (*obj).ob_type } != core::ptr::addr_of_mut!(PyUnicode_Type) {
+        return None;
+    }
+    let unicode = obj.cast::<RawPyAsciiObject>();
+    let state = unsafe { (*unicode).state };
+    if state & (PY_UNICODE_STATE_COMPACT_MASK | PY_UNICODE_STATE_ASCII_MASK)
+        != (PY_UNICODE_STATE_COMPACT_MASK | PY_UNICODE_STATE_ASCII_MASK)
+    {
+        return None;
+    }
+    if unsafe { (*unicode).length } != 1 {
+        unsafe { PyErr_SetNone(PyExc_TypeError) };
+        return Some(0);
+    }
+    let data = unsafe { unicode.add(1).cast::<u8>() };
+    Some(unsafe { *data }.into())
 }
 
 #[inline(always)]
@@ -421,6 +454,9 @@ pub unsafe extern "C" fn soac_runtime_builtin_ord_i64(
     obj: *mut c_void,
 ) -> i64 {
     debug_assert!(!obj.is_null());
+    if let Some(codepoint) = unsafe { exact_compact_ascii_ord(obj) } {
+        return codepoint;
+    }
     let length = unsafe { PyUnicode_GetLength(obj) };
     if length < 0 {
         return 0;
@@ -444,6 +480,15 @@ pub unsafe extern "C" fn soac_runtime_builtin_len_i64(
 ) -> i64 {
     debug_assert!(!obj.is_null());
     unsafe { PyObject_Size(obj) as i64 }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soac_runtime_builtin_iter_object(
+    _tstate: *mut c_void,
+    obj: *mut c_void,
+) -> *mut c_void {
+    debug_assert!(!obj.is_null());
+    unsafe { PyObject_GetIter(obj) }
 }
 
 #[unsafe(no_mangle)]
@@ -781,6 +826,33 @@ macro_rules! probe_field_value {
     }};
 }
 
+macro_rules! inline_values_for_unmaterialized_field {
+    ($obj:expr) => {{
+        let obj = $obj;
+        let obj_type = unsafe { (*obj).ob_type.cast::<RawPyTypeObject>() };
+        let required_flags = PY_TPFLAGS_INLINE_VALUES | PY_TPFLAGS_MANAGED_DICT;
+        if unsafe { (*obj_type).tp_flags } & required_flags != required_flags {
+            core::ptr::null_mut()
+        } else {
+            let dict_ptr = unsafe {
+                obj.cast::<u8>()
+                    .offset(MANAGED_DICT_OFFSET)
+                    .cast::<*mut RawPyObject>()
+            };
+            if unsafe { !(*dict_ptr).is_null() } {
+                core::ptr::null_mut()
+            } else {
+                let values = inline_values!(obj, obj_type);
+                if unsafe { (*values).valid } == 0 {
+                    core::ptr::null_mut()
+                } else {
+                    values
+                }
+            }
+        }
+    }};
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soac_runtime_probe_field_indexed(
     obj: *mut c_void,
@@ -794,6 +866,27 @@ pub unsafe extern "C" fn soac_runtime_probe_field_indexed(
     debug_assert!(index >= 0);
 
     probe_field_value!(obj, key, index).cast::<c_void>()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soac_runtime_probe_field_indexed_inline_values(
+    obj: *mut c_void,
+    key: *mut c_void,
+    index: isize,
+) -> *mut c_void {
+    let obj = obj.cast::<RawPyObject>();
+    let key = key.cast::<RawPyObject>();
+    debug_assert!(!obj.is_null());
+    debug_assert!(!key.is_null());
+    debug_assert!(index >= 0);
+
+    let values = inline_values_for_unmaterialized_field!(obj);
+    if values.is_null() {
+        return core::ptr::null_mut();
+    }
+    let obj_type = unsafe { (*obj).ob_type.cast::<RawPyTypeObject>() };
+    let keys = cached_keys!(obj_type);
+    probe_split_values!(keys, values, key, index).cast::<c_void>()
 }
 
 #[unsafe(no_mangle)]
@@ -863,6 +956,100 @@ pub unsafe extern "C" fn soac_runtime_store_field_indexed(
         }
         if !dict.is_null() {
             unsafe { (*dict).ma_used += 1 };
+        }
+    } else {
+        decref_raw_with_tstate!(tstate, old_value);
+    }
+    1
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soac_runtime_store_field_indexed_inline_values_trusted(
+    tstate: *mut c_void,
+    obj: *mut c_void,
+    index: isize,
+    value: *mut c_void,
+) -> i32 {
+    let tstate = tstate.cast::<RawPyThreadState>();
+    let obj = obj.cast::<RawPyObject>();
+    debug_assert!(!tstate.is_null());
+    debug_assert!(!obj.is_null());
+    debug_assert!(!value.is_null());
+    debug_assert!(index >= 0);
+
+    let values = inline_values_for_unmaterialized_field!(obj);
+    if values.is_null() || index < 0 || unsafe { index >= (*values).capacity.into() } {
+        return 0;
+    }
+
+    let old_value = unsafe { split_value(values, index) };
+    let value = value.cast::<RawPyObject>();
+    if old_value.is_null() {
+        let size = unsafe { (*values).size };
+        let capacity = unsafe { (*values).capacity };
+        if size >= capacity || index > u8::MAX as isize {
+            return 0;
+        }
+        unsafe { incref_impl(value) };
+        unsafe { set_split_value(values, index, value) };
+        if !unsafe { add_split_value_to_insertion_order(values, index) } {
+            return 0;
+        }
+    } else {
+        unsafe { incref_impl(value) };
+        unsafe { set_split_value(values, index, value) };
+        decref_raw_with_tstate!(tstate, old_value);
+    }
+    1
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soac_runtime_store_field_indexed_inline_values(
+    tstate: *mut c_void,
+    obj: *mut c_void,
+    key: *mut c_void,
+    index: isize,
+    value: *mut c_void,
+) -> i32 {
+    let tstate = tstate.cast::<RawPyThreadState>();
+    let obj = obj.cast::<RawPyObject>();
+    let key = key.cast::<RawPyObject>();
+    debug_assert!(!tstate.is_null());
+    debug_assert!(!obj.is_null());
+    debug_assert!(!key.is_null());
+    debug_assert!(!value.is_null());
+    debug_assert!(index >= 0);
+
+    let values = inline_values_for_unmaterialized_field!(obj);
+    if values.is_null() {
+        return 0;
+    }
+    let obj_type = unsafe { (*obj).ob_type.cast::<RawPyTypeObject>() };
+    let keys = cached_keys!(obj_type);
+    const DICT_KEYS_SPLIT: u8 = 2;
+    if keys.is_null()
+        || unsafe { (*keys).dk_kind } != DICT_KEYS_SPLIT
+        || unsafe { index >= (*values).capacity.into() }
+        || !unsafe { dict_key_matches(indexed_key(keys, index), key) }
+    {
+        return 0;
+    }
+
+    let old_value = unsafe { split_value(values, index) };
+    let value = value.cast::<RawPyObject>();
+    if old_value.is_null() {
+        let size = unsafe { (*values).size };
+        let capacity = unsafe { (*values).capacity };
+        if size >= capacity || index > u8::MAX as isize {
+            return 0;
+        }
+    }
+
+    unsafe { incref_impl(value) };
+    unsafe { set_split_value(values, index, value) };
+    if old_value.is_null() {
+        if !unsafe { add_split_value_to_insertion_order(values, index) } {
+            return 0;
         }
     } else {
         decref_raw_with_tstate!(tstate, old_value);

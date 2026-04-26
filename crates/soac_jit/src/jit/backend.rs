@@ -25,7 +25,14 @@ use soac_core::block_py::RuntimeFunctionId;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
+#[cfg(not(test))]
 const JIT_ARENA_BYTES: usize = 256 * 1024 * 1024;
+
+// Unit tests create many short-lived JIT modules in one process. A production-sized
+// arena churns enough virtual address space to make Cranelift's PC-relative
+// relocations to runtime/helper symbols exceed i32 range on some hosts.
+#[cfg(test)]
+const JIT_ARENA_BYTES: usize = 16 * 1024 * 1024;
 
 pub(super) fn new_jit_builder(env_config: &SoacEnvConfig) -> Result<JITBuilder, String> {
     let isa = CraneliftTargetConfig::runtime(env_config).build_isa()?;

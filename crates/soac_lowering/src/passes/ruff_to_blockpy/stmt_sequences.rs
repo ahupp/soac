@@ -303,6 +303,7 @@ fn expand_for_stmt(
     for_stmt: crate::block_py::StmtFor<InstrRuff>,
     iter_name: &str,
     tmp_name: &str,
+    sentinel_name: &str,
     assign_body: Vec<InstrRuff>,
 ) -> Vec<InstrRuff> {
     let iter_helper = if for_stmt.is_async { "aiter" } else { "iter" };
@@ -314,25 +315,6 @@ fn expand_for_stmt(
     .with_meta(crate::block_py::Meta::synthetic())
     .into();
     let iter_assign = synthetic_assign(synthetic_name_expr(&iter_name), iter_value);
-
-    let next_helper = if for_stmt.is_async { "anext" } else { "next" };
-    let next_call: InstrRuff = Call::new(
-        runtime_helper_expr(next_helper),
-        vec![CallArgPositional::Positional(synthetic_name_expr(
-            iter_name,
-        ))],
-        Vec::new(),
-    )
-    .with_meta(crate::block_py::Meta::synthetic())
-    .into();
-    let next_value = if for_stmt.is_async {
-        Await::new(next_call)
-            .with_meta(crate::block_py::Meta::synthetic())
-            .into()
-    } else {
-        next_call
-    };
-    let next_assign = synthetic_assign(synthetic_name_expr(tmp_name), next_value);
 
     let completed_name =
         (!for_stmt.orelse.is_empty()).then(|| name_gen.next_tmp_name("completed").to_string());
@@ -349,22 +331,58 @@ fn expand_for_stmt(
             .into(),
     );
 
-    let exception_name = if for_stmt.is_async {
-        "StopAsyncIteration"
+    let mut while_body = if for_stmt.is_async {
+        let next_call: InstrRuff = Call::new(
+            runtime_helper_expr("anext"),
+            vec![CallArgPositional::Positional(synthetic_name_expr(
+                iter_name,
+            ))],
+            Vec::new(),
+        )
+        .with_meta(crate::block_py::Meta::synthetic())
+        .into();
+        let next_value = Await::new(next_call)
+            .with_meta(crate::block_py::Meta::synthetic())
+            .into();
+        let next_assign = synthetic_assign(synthetic_name_expr(tmp_name), next_value);
+        let fetch_next = crate::block_py::StmtTry::new(
+            vec![next_assign],
+            vec![stop_iteration_handler_with_body(
+                "StopAsyncIteration",
+                stop_body,
+            )],
+            Vec::new(),
+            Vec::new(),
+            false,
+        )
+        .with_meta(crate::block_py::Meta::synthetic())
+        .into();
+        vec![fetch_next]
     } else {
-        "StopIteration"
+        let next_call: InstrRuff = Call::new(
+            runtime_helper_expr("next"),
+            vec![
+                CallArgPositional::Positional(synthetic_name_expr(iter_name)),
+                CallArgPositional::Positional(synthetic_name_expr(sentinel_name)),
+            ],
+            Vec::new(),
+        )
+        .with_meta(crate::block_py::Meta::synthetic())
+        .into();
+        let next_assign = synthetic_assign(synthetic_name_expr(tmp_name), next_call);
+        let exhausted = crate::block_py::StmtIf::new(
+            crate::passes::ast_to_instr::from_ast_expr(py_expr!(
+                "{tmp:id} is {sentinel:id}",
+                tmp = tmp_name,
+                sentinel = sentinel_name
+            )),
+            stop_body,
+            Vec::new(),
+        )
+        .with_meta(crate::block_py::Meta::synthetic())
+        .into();
+        vec![next_assign, exhausted]
     };
-    let fetch_next = crate::block_py::StmtTry::new(
-        vec![next_assign],
-        vec![stop_iteration_handler_with_body(exception_name, stop_body)],
-        Vec::new(),
-        Vec::new(),
-        false,
-    )
-    .with_meta(crate::block_py::Meta::synthetic())
-    .into();
-
-    let mut while_body = vec![fetch_next];
     while_body.extend(assign_body);
     while_body.extend(for_stmt.body);
 
@@ -377,6 +395,16 @@ fn expand_for_stmt(
     .into();
 
     let mut expanded = vec![iter_assign];
+    if !for_stmt.is_async {
+        let sentinel_value: InstrRuff =
+            Call::new(runtime_helper_expr("object"), Vec::new(), Vec::new())
+                .with_meta(crate::block_py::Meta::synthetic())
+                .into();
+        expanded.push(synthetic_assign(
+            synthetic_name_expr(sentinel_name),
+            sentinel_value,
+        ));
+    }
     if let Some(completed_name) = &completed_name {
         expanded.push(synthetic_assign(
             synthetic_name_expr(completed_name),
@@ -508,6 +536,7 @@ where
             StmtSequenceHeadPlan::For(for_stmt) => {
                 let iter_name = name_gen.next_tmp_name("iter");
                 let tmp_name = name_gen.next_tmp_name("tmp");
+                let sentinel_name = name_gen.next_tmp_name("sentinel");
                 let assign_body = build_for_target_assign_body(
                     *for_stmt.target.clone(),
                     crate::passes::ast_to_instr::from_ast_expr(py_expr!(
@@ -522,6 +551,7 @@ where
                     for_stmt,
                     iter_name.as_str(),
                     tmp_name.as_str(),
+                    sentinel_name.as_str(),
                     assign_body,
                 ));
                 expanded.extend_from_slice(&stmts[index + 1..]);

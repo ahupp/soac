@@ -8,6 +8,8 @@ use libc;
 use pyo3::ffi;
 use std::ffi::{CStr, c_char, c_void};
 use std::ptr;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 unsafe extern "C" {
     static mut PyFunction_Type: ffi::PyTypeObject;
@@ -43,6 +45,14 @@ unsafe extern "C" {
 }
 
 pub type ObjPtr = *mut c_void;
+
+#[repr(C)]
+struct RawPyRangeIterObject {
+    ob_base: ffi::PyObject,
+    start: libc::c_long,
+    step: libc::c_long,
+    len: libc::c_long,
+}
 
 unsafe fn is_cell_object(obj: *mut ffi::PyObject) -> bool {
     !obj.is_null() && ffi::Py_TYPE(obj) == std::ptr::addr_of_mut!(PyCell_Type)
@@ -131,6 +141,12 @@ unsafe extern "C" fn py_vectorcall_hook(
         );
         return ptr::null_mut();
     }
+    if let Some(result) = fast_builtin_next_range_iter(callable, args, nargsf, kwnames) {
+        return result;
+    }
+    if let Some(result) = fast_runtime_stop_iteration_match(callable, args, nargsf, kwnames) {
+        return result;
+    }
     ffi::_PyObject_VectorcallTstate(
         tstate as *mut ffi::PyThreadState,
         callable as *mut ffi::PyObject,
@@ -138,6 +154,129 @@ unsafe extern "C" fn py_vectorcall_hook(
         nargsf as usize,
         kwnames as *mut ffi::PyObject,
     ) as ObjPtr
+}
+
+unsafe fn cached_builtin_next() -> *mut ffi::PyObject {
+    static BUILTIN_NEXT: OnceLock<usize> = OnceLock::new();
+    *BUILTIN_NEXT.get_or_init(|| {
+        let builtins = ffi::PyEval_GetBuiltins();
+        if builtins.is_null() {
+            return 0;
+        }
+        let next = ffi::PyDict_GetItemString(builtins, c"next".as_ptr());
+        if next.is_null() {
+            if !ffi::PyErr_Occurred().is_null() {
+                ffi::PyErr_Clear();
+            }
+            return 0;
+        }
+        ffi::Py_INCREF(next);
+        next as usize
+    }) as *mut ffi::PyObject
+}
+
+unsafe fn fast_builtin_next_range_iter(
+    callable: ObjPtr,
+    args: ObjPtr,
+    nargsf: ObjPtr,
+    kwnames: ObjPtr,
+) -> Option<ObjPtr> {
+    if !kwnames.is_null() || args.is_null() {
+        return None;
+    }
+    let nargs = ffi::PyVectorcall_NARGS(nargsf as usize);
+    if !(nargs == 1 || nargs == 2) {
+        return None;
+    }
+    let next = cached_builtin_next();
+    if next.is_null() || callable as *mut ffi::PyObject != next {
+        return None;
+    }
+    let args = args as *const *mut ffi::PyObject;
+    let iter = *args;
+    if iter.is_null() || ffi::Py_TYPE(iter) != std::ptr::addr_of_mut!(ffi::PyRangeIter_Type) {
+        return None;
+    }
+
+    let range_iter = iter as *mut RawPyRangeIterObject;
+    if (*range_iter).len <= 0 {
+        if nargs == 2 {
+            let default = *args.add(1);
+            ffi::Py_INCREF(default);
+            return Some(default as ObjPtr);
+        }
+        ffi::PyErr_SetNone(ffi::PyExc_StopIteration);
+        return Some(ptr::null_mut());
+    }
+    let result = (*range_iter).start;
+    (*range_iter).start = result + (*range_iter).step;
+    (*range_iter).len -= 1;
+    Some(ffi::PyLong_FromLong(result) as ObjPtr)
+}
+
+unsafe fn cached_runtime_exception_matches() -> *mut ffi::PyObject {
+    static EXCEPTION_MATCHES: AtomicUsize = AtomicUsize::new(0);
+    let cached = EXCEPTION_MATCHES.load(Ordering::Acquire);
+    if cached != 0 {
+        return cached as *mut ffi::PyObject;
+    }
+
+    let modules = ffi::PyImport_GetModuleDict();
+    if modules.is_null() {
+        return ptr::null_mut();
+    }
+    let runtime = ffi::PyDict_GetItemString(modules, c"soac.runtime".as_ptr());
+    if runtime.is_null() {
+        if !ffi::PyErr_Occurred().is_null() {
+            ffi::PyErr_Clear();
+        }
+        return ptr::null_mut();
+    }
+    let function = ffi::PyObject_GetAttrString(runtime, c"exception_matches".as_ptr());
+    if function.is_null() {
+        if !ffi::PyErr_Occurred().is_null() {
+            ffi::PyErr_Clear();
+        }
+        return ptr::null_mut();
+    }
+
+    let raw = function as usize;
+    match EXCEPTION_MATCHES.compare_exchange(0, raw, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => function,
+        Err(existing) => {
+            ffi::Py_DECREF(function);
+            existing as *mut ffi::PyObject
+        }
+    }
+}
+
+unsafe fn fast_runtime_stop_iteration_match(
+    callable: ObjPtr,
+    args: ObjPtr,
+    nargsf: ObjPtr,
+    kwnames: ObjPtr,
+) -> Option<ObjPtr> {
+    if !kwnames.is_null() || args.is_null() {
+        return None;
+    }
+    let nargs = ffi::PyVectorcall_NARGS(nargsf as usize);
+    if nargs != 2 {
+        return None;
+    }
+    let exception_matches = cached_runtime_exception_matches();
+    if exception_matches.is_null() || callable as *mut ffi::PyObject != exception_matches {
+        return None;
+    }
+
+    let args = args as *const *mut ffi::PyObject;
+    let exc = *args;
+    let exc_type = *args.add(1);
+    if exc_type != ffi::PyExc_StopIteration {
+        return None;
+    }
+
+    let matches = ffi::PyErr_GivenExceptionMatches(exc, ffi::PyExc_StopIteration);
+    Some(ffi::PyBool_FromLong((matches != 0) as libc::c_long) as ObjPtr)
 }
 unsafe extern "C" fn enter_recursive_call_hook(_tstate: ObjPtr) -> i32 {
     ffi::Py_EnterRecursiveCall(b" while calling a Python object\0".as_ptr() as *const i8)
@@ -1466,6 +1605,10 @@ pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
     builder.symbol(
         "PyObject_RichCompare",
         python_capi_symbol(b"PyObject_RichCompare\0"),
+    );
+    builder.symbol(
+        "PyUnicode_Compare",
+        python_capi_symbol(b"PyUnicode_Compare\0"),
     );
     builder.symbol(
         "PySequence_Contains",

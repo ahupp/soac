@@ -39,6 +39,7 @@ soac_runtime_example_known_value_source
 soac_runtime_example_offset_known_value
 soac_runtime_builtin_ord_i64
 soac_runtime_builtin_len_i64
+soac_runtime_builtin_iter_object
 soac_runtime_builtin_chr_i64
 soac_runtime_pylong_as_i64
 soac_runtime_pylong_as_i64_saturating
@@ -48,6 +49,9 @@ soac_runtime_store_global_indexed
 soac_runtime_store_global
 soac_runtime_probe_field_indexed
 soac_runtime_store_field_indexed
+soac_runtime_probe_field_indexed_inline_values
+soac_runtime_store_field_indexed_inline_values
+soac_runtime_store_field_indexed_inline_values_trusted
 ```
 
 ## specialized_helpers.rs
@@ -108,10 +112,16 @@ dp_jit_get_arg_item
 dp_jit_get_arg_item_with_frame
 ```
 
+`dp_jit_py_vectorcall` also includes narrow fast paths for exact
+`builtins.next(range_iterator)` and
+`soac.runtime.exception_matches(exc, StopIteration)` calls before falling back
+to generic CPython vectorcall.
+
 Registered CPython-wrapper call targets:
 
 ```text
 PyObject_RichCompare
+PyUnicode_Compare
 PySequence_Contains
 PyLong_FromLongLong
 PyObject_Not
@@ -191,7 +201,6 @@ Top-level functions defined or re-exported by `soac.runtime`:
 _unsupported_frame_builtin
 _index
 IterRange
-range
 tuple_from_iter
 constructor_call
 __deepcopy__

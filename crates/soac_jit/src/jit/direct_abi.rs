@@ -10,6 +10,7 @@ use soac_ir_typed::PyExactType;
 pub(super) const SOAC_RUNTIME_BUILTIN_ORD_I64_SYMBOL: &str = "soac_runtime_builtin_ord_i64";
 pub(super) const SOAC_RUNTIME_BUILTIN_CHR_I64_SYMBOL: &str = "soac_runtime_builtin_chr_i64";
 pub(super) const SOAC_RUNTIME_BUILTIN_LEN_I64_SYMBOL: &str = "soac_runtime_builtin_len_i64";
+pub(super) const SOAC_RUNTIME_BUILTIN_ITER_OBJECT_SYMBOL: &str = "soac_runtime_builtin_iter_object";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) enum DirectTargetId {
@@ -22,6 +23,7 @@ pub(super) enum RuntimePrimitiveId {
     BuiltinOrdI64,
     BuiltinChrI64,
     BuiltinLenI64,
+    BuiltinIterObject,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -109,6 +111,7 @@ const ORD_PARAMS: &[ParamAbi] = &[ParamAbi::PyObject {
     ownership: ArgOwnership::BorrowedOk,
 }];
 const LEN_PARAMS: &[ParamAbi] = ORD_PARAMS;
+const ITER_PARAMS: &[ParamAbi] = ORD_PARAMS;
 const CHR_PARAMS: &[ParamAbi] = &[ParamAbi::I64 {
     py_long_coercion: Some(PyLongI64Coercion::Saturating),
 }];
@@ -152,19 +155,39 @@ pub(super) const BUILTIN_LEN_I64_DESC: DirectCallableDesc = DirectCallableDesc {
     cost: DirectCallCost::new(8, 4),
 };
 
+pub(super) const BUILTIN_ITER_OBJECT_DESC: DirectCallableDesc = DirectCallableDesc {
+    target: DirectTargetId::RuntimePrimitive(RuntimePrimitiveId::BuiltinIterObject),
+    entry: DirectEntry::RuntimeSymbol(SOAC_RUNTIME_BUILTIN_ITER_OBJECT_SYMBOL),
+    abi: DirectCallAbi {
+        hidden_args: TSTATE_HIDDEN_ARGS,
+        params: ITER_PARAMS,
+        result: ResultAbi::PyObject {
+            ownership: ValueOwnership::Owned,
+            exact_type: None,
+        },
+        error: ErrorAbi::CurrentException,
+    },
+    cost: DirectCallCost::new(8, 4),
+};
+
 pub(super) fn runtime_primitive_desc(primitive: RuntimePrimitiveId) -> &'static DirectCallableDesc {
     match primitive {
         RuntimePrimitiveId::BuiltinOrdI64 => &BUILTIN_ORD_I64_DESC,
         RuntimePrimitiveId::BuiltinChrI64 => &BUILTIN_CHR_I64_DESC,
         RuntimePrimitiveId::BuiltinLenI64 => &BUILTIN_LEN_I64_DESC,
+        RuntimePrimitiveId::BuiltinIterObject => &BUILTIN_ITER_OBJECT_DESC,
     }
 }
 
-pub(super) fn runtime_primitive_for_builtin_name(name: &str) -> Option<RuntimePrimitiveId> {
-    match name {
-        "ord" => Some(RuntimePrimitiveId::BuiltinOrdI64),
-        "chr" => Some(RuntimePrimitiveId::BuiltinChrI64),
-        "len" => Some(RuntimePrimitiveId::BuiltinLenI64),
+pub(super) fn runtime_primitive_for_builtin_name_and_arity(
+    name: &str,
+    arity: usize,
+) -> Option<RuntimePrimitiveId> {
+    match (name, arity) {
+        ("ord", 1) => Some(RuntimePrimitiveId::BuiltinOrdI64),
+        ("chr", 1) => Some(RuntimePrimitiveId::BuiltinChrI64),
+        ("len", 1) => Some(RuntimePrimitiveId::BuiltinLenI64),
+        ("iter", 1) => Some(RuntimePrimitiveId::BuiltinIterObject),
         _ => None,
     }
 }
@@ -175,8 +198,9 @@ mod tests {
     use super::{
         ArgOwnership, DirectEntry, ErrorAbi, HiddenArgAbi, ParamAbi, PyLongI64Coercion, ResultAbi,
         RuntimePrimitiveId, SOAC_RUNTIME_BUILTIN_CHR_I64_SYMBOL,
-        SOAC_RUNTIME_BUILTIN_LEN_I64_SYMBOL, SOAC_RUNTIME_BUILTIN_ORD_I64_SYMBOL,
-        runtime_primitive_desc, runtime_primitive_for_builtin_name,
+        SOAC_RUNTIME_BUILTIN_ITER_OBJECT_SYMBOL, SOAC_RUNTIME_BUILTIN_LEN_I64_SYMBOL,
+        SOAC_RUNTIME_BUILTIN_ORD_I64_SYMBOL, runtime_primitive_desc,
+        runtime_primitive_for_builtin_name_and_arity,
     };
     use soac_ir_typed::PyExactType;
 
@@ -241,19 +265,51 @@ mod tests {
     }
 
     #[test]
-    fn builtin_name_lookup_maps_ord_and_chr_to_runtime_primitives() {
+    fn iter_descriptor_accepts_borrowed_pyobject_and_returns_owned_pyobject() {
+        let desc = runtime_primitive_desc(RuntimePrimitiveId::BuiltinIterObject);
         assert_eq!(
-            runtime_primitive_for_builtin_name("ord"),
+            desc.entry,
+            DirectEntry::RuntimeSymbol(SOAC_RUNTIME_BUILTIN_ITER_OBJECT_SYMBOL)
+        );
+        assert_eq!(desc.abi.hidden_args, &[HiddenArgAbi::ThreadState]);
+        assert_eq!(
+            desc.abi.params,
+            &[ParamAbi::PyObject {
+                ownership: ArgOwnership::BorrowedOk
+            }]
+        );
+        assert_eq!(
+            desc.abi.result,
+            ResultAbi::PyObject {
+                ownership: ValueOwnership::Owned,
+                exact_type: None
+            }
+        );
+        assert_eq!(desc.abi.error, ErrorAbi::CurrentException);
+    }
+
+    #[test]
+    fn builtin_name_lookup_maps_static_builtins_to_runtime_primitives() {
+        assert_eq!(
+            runtime_primitive_for_builtin_name_and_arity("ord", 1),
             Some(RuntimePrimitiveId::BuiltinOrdI64)
         );
         assert_eq!(
-            runtime_primitive_for_builtin_name("chr"),
+            runtime_primitive_for_builtin_name_and_arity("chr", 1),
             Some(RuntimePrimitiveId::BuiltinChrI64)
         );
         assert_eq!(
-            runtime_primitive_for_builtin_name("len"),
+            runtime_primitive_for_builtin_name_and_arity("len", 1),
             Some(RuntimePrimitiveId::BuiltinLenI64)
         );
-        assert_eq!(runtime_primitive_for_builtin_name("sum"), None);
+        assert_eq!(
+            runtime_primitive_for_builtin_name_and_arity("iter", 1),
+            Some(RuntimePrimitiveId::BuiltinIterObject)
+        );
+        assert_eq!(
+            runtime_primitive_for_builtin_name_and_arity("range", 3),
+            None
+        );
+        assert_eq!(runtime_primitive_for_builtin_name_and_arity("sum", 1), None);
     }
 }

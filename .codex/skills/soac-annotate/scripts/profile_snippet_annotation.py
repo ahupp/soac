@@ -47,7 +47,7 @@ def main() -> int:
         raise RuntimeError(f"SOAC did not write profile counters at {profile_dump}")
 
     function_id = lookup_function_id(source_path, target_name)
-    optimization_decisions_v3 = decide_optimizations(profile_dump, counters_dir)
+    optimization_decisions_v3 = on_demand_optimization_note(profile_dump, counters_dir)
     optimization_plan_v3 = print_optimization_plans_v3(counters_dir)
     post_opt_v3 = print_post_opt_v3_definition(counters_dir)
     specializations = inspect_specializations(profile_dump)
@@ -292,17 +292,15 @@ def inspect_specializations(profile_dump: Path) -> str:
         return f"inspect_counters failed\n{err}\n"
 
 
-def decide_optimizations(profile_dump: Path, counters_dir: Path) -> str:
+def on_demand_optimization_note(profile_dump: Path, counters_dir: Path) -> str:
     module_root = counters_dir / "modules"
-    return run_inspector(
-        "decide_optimizations",
-        "--counters",
-        str(profile_dump),
-        "--module-root",
-        str(module_root),
-        "--out",
-        str(module_root),
-    ).stdout
+    return (
+        "optimization decisions are applied on demand by the typed-v3 runtime "
+        "pipeline in this checkout; no standalone decide_optimizations artifact "
+        "is generated.\n"
+        f"profile_dump: {profile_dump}\n"
+        f"module_root: {module_root}\n"
+    )
 
 
 def print_optimization_plans_v3(counters_dir: Path) -> str:
@@ -396,7 +394,7 @@ def run_inspector(
     *args: str,
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    package = "soac_opt" if bin_name == "decide_optimizations" else "soac_inspector"
+    package = "soac_inspector"
     command = [
         "cargo",
         "run",

@@ -278,13 +278,14 @@ use imports::{
     PYNUMBER_MULTIPLY_IMPORT, PYNUMBER_OR_IMPORT, PYNUMBER_SUBTRACT_IMPORT, PYNUMBER_XOR_IMPORT,
     PYOBJECT_RICHCOMPARE_IMPORT, PYUNICODE_COMPARE_IMPORT,
     SOAC_JIT_MAKE_FUNCTION_WITH_CLOSURE_IMPORT, SOAC_RUNTIME_BUILTIN_CHR_I64_IMPORT,
-    SOAC_RUNTIME_BUILTIN_LEN_I64_IMPORT, SOAC_RUNTIME_BUILTIN_ORD_I64_IMPORT,
-    SOAC_RUNTIME_LOAD_GLOBAL_IMPORT, SOAC_RUNTIME_LOAD_GLOBAL_SLOW_IMPORT,
-    SOAC_RUNTIME_PROBE_FIELD_INDEXED_IMPORT, SOAC_RUNTIME_PROBE_GLOBAL_INDEXED_IMPORT,
+    SOAC_RUNTIME_BUILTIN_ITER_OBJECT_IMPORT, SOAC_RUNTIME_BUILTIN_LEN_I64_IMPORT,
+    SOAC_RUNTIME_BUILTIN_ORD_I64_IMPORT, SOAC_RUNTIME_LOAD_GLOBAL_IMPORT,
+    SOAC_RUNTIME_LOAD_GLOBAL_SLOW_IMPORT, SOAC_RUNTIME_PROBE_GLOBAL_INDEXED_IMPORT,
     SOAC_RUNTIME_PYLONG_AS_I64_SATURATING_IMPORT, SOAC_RUNTIME_SET_RAISED_EXCEPTION_IMPORT,
-    SOAC_RUNTIME_STORE_FIELD_INDEXED_IMPORT, SOAC_RUNTIME_STORE_GLOBAL_IMPORT,
-    SOAC_RUNTIME_STORE_GLOBAL_INDEXED_IMPORT, SOAC_RUNTIME_TUPLE_NEW_IMPORT,
-    SOAC_RUNTIME_TUPLE_SET_ITEM_STOLEN_IMPORT, SigType, predeclare_specialization_type_imports,
+    SOAC_RUNTIME_STORE_FIELD_INDEXED_INLINE_VALUES_TRUSTED_IMPORT,
+    SOAC_RUNTIME_STORE_GLOBAL_IMPORT, SOAC_RUNTIME_STORE_GLOBAL_INDEXED_IMPORT,
+    SOAC_RUNTIME_TUPLE_NEW_IMPORT, SOAC_RUNTIME_TUPLE_SET_ITEM_STOLEN_IMPORT, SigType,
+    predeclare_specialization_type_imports,
 };
 #[cfg(test)]
 use imports::{SOAC_RUNTIME_DECREF_APPLIED_IMPORT, SOAC_RUNTIME_INCREF_APPLIED_IMPORT};
@@ -1328,8 +1329,7 @@ struct JitEmitCtx<'mc> {
     guard_miss_deopt_instr_ids: &'mc HashSet<InstrId>,
     guard_miss_resume_point: Option<LocalEnvResumePoint>,
     store_global_indexed_ref: ir::FuncRef,
-    probe_field_indexed_ref: ir::FuncRef,
-    store_field_indexed_ref: ir::FuncRef,
+    store_field_indexed_inline_values_trusted_ref: ir::FuncRef,
     load_runtime_obj_by_id_ref: ir::FuncRef,
     enter_recursive_ref: ir::FuncRef,
     direct_compile_function_env_ref: ir::FuncRef,
@@ -5674,6 +5674,131 @@ pub(super) fn emit_exact_type_version_match(
     fb.ins().band(type_matches, version_matches)
 }
 
+#[repr(C)]
+struct RawPyDictSplitValuesForJit {
+    capacity: u8,
+    size: u8,
+    embedded: u8,
+    valid: u8,
+    values: [*mut ffi::PyObject; 1],
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_trusted_inline_values_field_probe(
+    fb: &mut FunctionBuilder<'_>,
+    obj: ir::Value,
+    owner_type: ir::Value,
+    expected_index: u32,
+    hit_block: ir::Block,
+    miss_block: ir::Block,
+    emit_ctx: &JitEmitCtx<'_>,
+) -> Result<(), String> {
+    const MANAGED_DICT_OFFSET: i32 = -3 * (std::mem::size_of::<*mut ffi::PyObject>() as i32);
+    const SPLIT_VALUES_CAPACITY_OFFSET: i32 =
+        offset_of!(RawPyDictSplitValuesForJit, capacity) as i32;
+    const SPLIT_VALUES_VALID_OFFSET: i32 = offset_of!(RawPyDictSplitValuesForJit, valid) as i32;
+    const SPLIT_VALUES_VALUES_OFFSET: i32 = offset_of!(RawPyDictSplitValuesForJit, values) as i32;
+    const PYTYPE_TP_BASICSIZE_OFFSET: i32 = offset_of!(ffi::PyTypeObject, tp_basicsize) as i32;
+
+    let ptr_ty = emit_ctx.consts.ptr_ty;
+    let i64_ty = emit_ctx.consts.i64_ty;
+    let null_ptr = fb.ins().iconst(ptr_ty, 0);
+    let values_block = fb.create_block();
+    let valid_block = fb.create_block();
+    let in_capacity_block = fb.create_block();
+    let load_block = fb.create_block();
+    fb.append_block_param(values_block, ptr_ty);
+    fb.append_block_param(valid_block, ptr_ty);
+    fb.append_block_param(in_capacity_block, ptr_ty);
+    fb.append_block_param(load_block, ptr_ty);
+
+    let materialized_dict =
+        fb.ins()
+            .load(ptr_ty, ir::MemFlags::trusted(), obj, MANAGED_DICT_OFFSET);
+    let dict_is_null = fb
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, materialized_dict, null_ptr);
+    fb.ins().brif(
+        dict_is_null,
+        values_block,
+        &[ir::BlockArg::Value(obj)],
+        miss_block,
+        &[],
+    );
+
+    fb.switch_to_block(values_block);
+    let obj = fb.block_params(values_block)[0];
+    let basicsize = fb.ins().load(
+        i64_ty,
+        ir::MemFlags::trusted(),
+        owner_type,
+        PYTYPE_TP_BASICSIZE_OFFSET,
+    );
+    let values = fb.ins().iadd(obj, basicsize);
+    let valid = fb.ins().load(
+        ir::types::I8,
+        ir::MemFlags::trusted(),
+        values,
+        SPLIT_VALUES_VALID_OFFSET,
+    );
+    let values_are_valid = fb.ins().icmp_imm(ir::condcodes::IntCC::NotEqual, valid, 0);
+    fb.ins().brif(
+        values_are_valid,
+        valid_block,
+        &[ir::BlockArg::Value(values)],
+        miss_block,
+        &[],
+    );
+
+    fb.switch_to_block(valid_block);
+    let values = fb.block_params(valid_block)[0];
+    let capacity = fb.ins().load(
+        ir::types::I8,
+        ir::MemFlags::trusted(),
+        values,
+        SPLIT_VALUES_CAPACITY_OFFSET,
+    );
+    let capacity = fb.ins().uextend(i64_ty, capacity);
+    let expected_index_value = fb.ins().iconst(i64_ty, i64::from(expected_index));
+    let index_in_capacity = fb.ins().icmp(
+        ir::condcodes::IntCC::UnsignedLessThan,
+        expected_index_value,
+        capacity,
+    );
+    fb.ins().brif(
+        index_in_capacity,
+        in_capacity_block,
+        &[ir::BlockArg::Value(values)],
+        miss_block,
+        &[],
+    );
+
+    fb.switch_to_block(in_capacity_block);
+    let values = fb.block_params(in_capacity_block)[0];
+    let slot_offset = i64::from(SPLIT_VALUES_VALUES_OFFSET)
+        + i64::from(expected_index)
+            * i64::try_from(std::mem::size_of::<*mut ffi::PyObject>())
+                .map_err(|_| "pointer size does not fit i64".to_string())?;
+    let slot_offset = i32::try_from(slot_offset)
+        .map_err(|_| format!("indexed field offset {slot_offset} does not fit i32"))?;
+    let value = fb
+        .ins()
+        .load(ptr_ty, ir::MemFlags::trusted(), values, slot_offset);
+    let value_is_null = fb.ins().icmp(ir::condcodes::IntCC::Equal, value, null_ptr);
+    fb.ins().brif(
+        value_is_null,
+        miss_block,
+        &[],
+        load_block,
+        &[ir::BlockArg::Value(value)],
+    );
+
+    fb.switch_to_block(load_block);
+    let value = fb.block_params(load_block)[0];
+    fb.ins().jump(hit_block, &[ir::BlockArg::Value(value)]);
+    Ok(())
+}
+
 fn emit_exact_cpython_type_guard(
     fb: &mut FunctionBuilder<'_>,
     obj: ir::Value,
@@ -5700,7 +5825,6 @@ fn emit_exact_cpython_type_guard(
     fb.switch_to_block(ok_block);
     Ok(())
 }
-
 fn emit_exact_function_id_match_bool01(
     fb: &mut FunctionBuilder<'_>,
     callable: ir::Value,
@@ -7455,32 +7579,21 @@ fn emit_typed_indexed_getattr(
         } else {
             fb.create_block()
         };
-        let expected_index = fb.ins().iconst(
-            emit_ctx.consts.i64_ty,
-            i64::from(specialization.expected_index),
-        );
         let type_matches =
             emit_exact_type_version_match(fb, value, owner_type, specialization.type_version);
         fb.ins()
             .brif(type_matches, maybe_direct_block, &[], next_guard_block, &[]);
 
         fb.switch_to_block(maybe_direct_block);
-        let direct_inst = fb.ins().call(
-            emit_ctx.probe_field_indexed_ref,
-            &[value, attr, expected_index],
-        );
-        let direct_value = fb.inst_results(direct_inst)[0];
-        let null_ptr = fb.ins().iconst(ptr_ty, 0);
-        let direct_is_null = fb
-            .ins()
-            .icmp(ir::condcodes::IntCC::Equal, direct_value, null_ptr);
-        fb.ins().brif(
-            direct_is_null,
-            guard_miss_dispatch.branch_block(),
-            &[],
+        emit_trusted_inline_values_field_probe(
+            fb,
+            value,
+            owner_type,
+            specialization.expected_index,
             direct_block,
-            &[ir::BlockArg::Value(direct_value)],
-        );
+            guard_miss_dispatch.branch_block(),
+            emit_ctx,
+        )?;
 
         fb.switch_to_block(direct_block);
         let direct_value = fb.block_params(direct_block)[0];
@@ -7654,11 +7767,10 @@ fn emit_typed_indexed_setattr(
 
         fb.switch_to_block(maybe_direct_block);
         let direct_inst = fb.ins().call(
-            emit_ctx.store_field_indexed_ref,
+            emit_ctx.store_field_indexed_inline_values_trusted_ref,
             &[
                 emit_ctx.consts.thread_state_value,
                 value,
-                attr,
                 expected_index,
                 replacement,
             ],
@@ -10011,11 +10123,39 @@ fn direct_positional_call_args(
         .collect()
 }
 
+fn direct_simple_positional_call_args(
+    call: &soac_core::block_py::Call<InstrCodegen>,
+) -> Option<Vec<&InstrCodegen>> {
+    if !call.keywords.is_empty() {
+        return None;
+    }
+    call.args
+        .iter()
+        .map(|arg| match arg {
+            CallArgPositional::Positional(value) => Some(value),
+            CallArgPositional::Starred(_) => None,
+        })
+        .collect()
+}
+
 fn typed_direct_positional_call_args(
     call: &TypedCall<InstrTyped>,
     param_count: usize,
 ) -> Option<Vec<&InstrTyped>> {
     if !call.keywords.is_empty() || call.args.len() != param_count {
+        return None;
+    }
+    call.args
+        .iter()
+        .map(|arg| match arg {
+            CallArgPositional::Positional(value) => Some(value),
+            CallArgPositional::Starred(_) => None,
+        })
+        .collect()
+}
+
+fn typed_simple_positional_call_args(call: &TypedCall<InstrTyped>) -> Option<Vec<&InstrTyped>> {
+    if !call.keywords.is_empty() {
         return None;
     }
     call.args
@@ -10044,9 +10184,10 @@ fn static_runtime_primitive_desc_for_call(
     module_constants: &ModuleCodegenConstants,
 ) -> Option<&'static DirectCallableDesc> {
     let name = codegen_expr_static_runtime_name(call.func.as_ref(), module_constants)?;
-    let primitive = direct_abi::runtime_primitive_for_builtin_name(name)?;
+    let args = direct_simple_positional_call_args(call)?;
+    let primitive = direct_abi::runtime_primitive_for_builtin_name_and_arity(name, args.len())?;
     let desc = direct_abi::runtime_primitive_desc(primitive);
-    let _ = direct_positional_call_args(call, desc.abi.params.len())?;
+    debug_assert_eq!(args.len(), desc.abi.params.len());
     Some(desc)
 }
 
@@ -10055,9 +10196,10 @@ fn static_runtime_primitive_desc_for_typed_call(
     module_constants: &ModuleCodegenConstants,
 ) -> Option<&'static DirectCallableDesc> {
     let name = typed_expr_static_runtime_name(call.func.as_ref(), module_constants)?;
-    let primitive = direct_abi::runtime_primitive_for_builtin_name(name)?;
+    let args = typed_simple_positional_call_args(call)?;
+    let primitive = direct_abi::runtime_primitive_for_builtin_name_and_arity(name, args.len())?;
     let desc = direct_abi::runtime_primitive_desc(primitive);
-    let _ = typed_direct_positional_call_args(call, desc.abi.params.len())?;
+    debug_assert_eq!(args.len(), desc.abi.params.len());
     Some(desc)
 }
 
@@ -10071,6 +10213,9 @@ fn runtime_primitive_import_spec(desc: &DirectCallableDesc) -> &'static ImportSp
         }
         DirectEntry::RuntimeSymbol(direct_abi::SOAC_RUNTIME_BUILTIN_LEN_I64_SYMBOL) => {
             &SOAC_RUNTIME_BUILTIN_LEN_I64_IMPORT
+        }
+        DirectEntry::RuntimeSymbol(direct_abi::SOAC_RUNTIME_BUILTIN_ITER_OBJECT_SYMBOL) => {
+            &SOAC_RUNTIME_BUILTIN_ITER_OBJECT_IMPORT
         }
         DirectEntry::RuntimeSymbol(symbol) => {
             panic!("missing ImportSpec for runtime primitive symbol {symbol}")
@@ -16232,15 +16377,10 @@ fn build_cranelift_run_bb_specialized_function(
             &mut fb.func,
             &SOAC_RUNTIME_STORE_GLOBAL_INDEXED_IMPORT,
         );
-        let probe_field_indexed_ref = func_imports.get_or_panic(
+        let store_field_indexed_inline_values_trusted_ref = func_imports.get_or_panic(
             codegen_env,
             &mut fb.func,
-            &SOAC_RUNTIME_PROBE_FIELD_INDEXED_IMPORT,
-        );
-        let store_field_indexed_ref = func_imports.get_or_panic(
-            codegen_env,
-            &mut fb.func,
-            &SOAC_RUNTIME_STORE_FIELD_INDEXED_IMPORT,
+            &SOAC_RUNTIME_STORE_FIELD_INDEXED_INLINE_VALUES_TRUSTED_IMPORT,
         );
         let load_runtime_obj_by_id_ref = func_imports.get_or_panic(
             codegen_env,
@@ -16538,8 +16678,7 @@ fn build_cranelift_run_bb_specialized_function(
                 guard_miss_deopt_instr_ids: &guard_miss_deopt_instr_ids,
                 guard_miss_resume_point: None,
                 store_global_indexed_ref,
-                probe_field_indexed_ref,
-                store_field_indexed_ref,
+                store_field_indexed_inline_values_trusted_ref,
                 load_runtime_obj_by_id_ref,
                 enter_recursive_ref,
                 direct_compile_function_env_ref,

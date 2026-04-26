@@ -6,7 +6,7 @@ use crate::evidence_v3::{
 };
 use crate::passes::{
     CodegenModuleShape, InlineUnsupportedReason, InstrCodegen, bind_simple_direct_call_inline_args,
-    build_direct_call_inline_fragment_to_target,
+    build_direct_call_inline_fragment_to_target, try_allocate_codegen_stack_temp,
 };
 use crate::plan::{FunctionProfileEvidence, ProfileEvidenceStore};
 use crate::planner_v3::{
@@ -1394,7 +1394,8 @@ fn direct_call_inline_candidate_v3(
     if target.module != *current_module {
         return false;
     }
-    let Some((return_target, call)) = store_call_and_target_for_instr_id_v3(function, source)
+    let Some((return_target, call)) =
+        inline_call_and_return_target_for_instr_id_v3(function, source)
     else {
         return false;
     };
@@ -1416,20 +1417,30 @@ fn direct_call_inline_candidate_v3(
     .is_ok()
 }
 
-fn store_call_and_target_for_instr_id_v3(
+enum InlineCallReturnTargetV3 {
+    StoreTo(ResolvedName),
+    Discard,
+}
+
+fn inline_call_and_return_target_for_instr_id_v3(
     function: &BlockPyFunction<CodegenModuleShape>,
     source: InstrId,
-) -> Option<(ResolvedName, &Call<InstrCodegen>)> {
+) -> Option<(InlineCallReturnTargetV3, &Call<InstrCodegen>)> {
     for block in &function.blocks {
         for instr in &block.body {
-            let InstrCodegen::Store(store) = instr else {
-                continue;
-            };
-            let InstrCodegen::Call(call) = store.value.as_ref() else {
-                continue;
-            };
-            if call.try_semantic_instr_id() == Some(source) {
-                return Some((store.name.clone(), call));
+            match instr {
+                InstrCodegen::Store(store) => {
+                    let InstrCodegen::Call(call) = store.value.as_ref() else {
+                        continue;
+                    };
+                    if call.try_semantic_instr_id() == Some(source) {
+                        return Some((InlineCallReturnTargetV3::StoreTo(store.name.clone()), call));
+                    }
+                }
+                InstrCodegen::Call(call) if call.try_semantic_instr_id() == Some(source) => {
+                    return Some((InlineCallReturnTargetV3::Discard, call));
+                }
+                _ => {}
             }
         }
     }
@@ -1440,12 +1451,20 @@ fn direct_call_inline_body_buildable_v3(
     _module: &BlockPyModule<CodegenModuleShape>,
     current_module: &ModuleContentId,
     function: &BlockPyFunction<CodegenModuleShape>,
-    return_target: ResolvedName,
+    return_target: InlineCallReturnTargetV3,
     call: &Call<InstrCodegen>,
     target: &DirectCallTargetEntry,
 ) -> Result<(), InlineUnsupportedReason> {
     let mut caller = function.clone();
     let continuation = caller.name_gen.next_block_name();
+    let return_target = match return_target {
+        InlineCallReturnTargetV3::StoreTo(target) => target,
+        InlineCallReturnTargetV3::Discard => {
+            try_allocate_codegen_stack_temp(&mut caller, "inline_discard_result")
+                .map_err(|_| InlineUnsupportedReason::MissingCallerStorageLayout)?
+                .resolved_name()
+        }
+    };
     let direct_call = CallDirect::new(
         call.func.as_ref().clone(),
         target.function.function_id,
@@ -2016,6 +2035,30 @@ mod tests {
             &current_module,
             &caller,
             source,
+            &exact_target
+        ));
+
+        let effect_source = instr_id(10);
+        let mut effect_only_caller = function_with_blocks(vec![Block::new(
+            label(0),
+            vec![with_instr_id(
+                InstrCodegen::Call(Call::new(
+                    local("callee", 0),
+                    vec![CallArgPositional::Positional(local("x", 1))],
+                    Vec::new(),
+                )),
+                10,
+            )],
+            BlockTerm::Return(local("x", 1)),
+            Vec::<BlockParam>::new(),
+            None,
+        )]);
+        set_stack_slots(&mut effect_only_caller, &["callee", "x"]);
+        assert!(direct_call_inline_candidate_v3(
+            &module,
+            &current_module,
+            &effect_only_caller,
+            effect_source,
             &exact_target
         ));
 

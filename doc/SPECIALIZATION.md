@@ -20,23 +20,21 @@ the typed result. Runtime `verify`/`apply` and offline precompile both use raw
 profile evidence directly; the JIT should not run legacy BlockPy optimization
 rewrites or require serialized optimization-plan artifacts.
 
-Profiled ordinary-function direct calls from v3 planning are selected with
-validated argument plans and serialized target module
-identities. Call plans also carry the selected call-body policy: `DirectCall`
-for guarded direct-call lowering, or `Inline` when the planner selected the
-early BlockPy inline path as the lower-cost body alternative. `Inline` selection
-validates that the BlockPy inline-fragment builder can construct the selected
-body from the cached target module, and the v3 plan is the source of truth
-consumed by typed JIT planning. Constructor type metadata now points at a
-synthetic constructor-entry function id rather than the underlying `__init__`
-id. Those entry functions are normal JIT direct-call targets with an implicit
-leading type argument, so class calls can reuse the ordinary guarded direct-call
-target model. Type registration only attaches that metadata for safe default
-constructor shapes, so unsupported Python type-call cases stay generic and do
-not enter the synthetic target.
-Runtime-guarded receiver-method specializations are not represented in v3
-plan/emission data today; those call shapes stay on generic lowering unless a
-future plan format adds validated static guard inputs for them.
+Profiled ordinary-function and guarded receiver-method direct calls from v3
+planning are selected with validated argument plans and serialized target
+module identities. Call plans also carry the selected call-body policy:
+`DirectCall` for guarded direct-call lowering, or `Inline` when the planner
+selected the early BlockPy inline path as the lower-cost body alternative.
+`Inline` selection validates that the BlockPy inline-fragment builder can
+construct the selected body from the cached target module, and the v3 plan is
+the source of truth consumed by typed JIT planning. Method targets carry the
+lowered method name as static plan data. Constructor type metadata now points
+at a synthetic constructor-entry function id rather than the underlying
+`__init__` id. Those entry functions are normal JIT direct-call targets with
+an implicit leading type argument, so class calls can reuse the ordinary
+guarded direct-call target model. Type registration only attaches that
+metadata for safe default constructor shapes, so unsupported Python type-call
+cases stay generic and do not enter the synthetic target.
 Constant-attribute indexed-field load/store selections from `type_keys` are
 also emitted as mechanical v3 indexed-field decisions; JIT validation checks
 those emitted decisions against the selected plan and lowered
@@ -50,12 +48,14 @@ as `a < b`, add-then-compare-to-zero branches such as `a + b > 0`,
 value-producing add/sub/mul/bitwise returns such as `return a + b` or
 `return a & b`, store RHS expressions such as `c = a + b`, comparison
 branches against lowered integer module constants such as `c > 0`, and
-value-producing comparison returns such as `return a < b`: `operator_hot_shapes`
-exact-int evidence proves the operands, a lowered module constant load proves
-the integer constant where needed, the v3 planner emits hot checked-`i64`
-operation regions plus local generic Python fallback regions, materializes
-Python object results explicitly, and `emit_mechanical_plan_v3` refuses invalid
-plans before emitting steps.
+value-producing comparison returns such as `return a < b` or `c = a < b`:
+`operator_hot_shapes` exact-int evidence proves integer operands,
+exact-string evidence proves string comparison operands, a lowered module
+constant load proves the integer constant where needed, profiled indexed-global
+loads can feed exact-int operator regions and exact-string comparison regions,
+the v3 planner emits hot checked-`i64` or exact-unicode operation regions plus
+local generic Python fallback regions, materializes Python object results explicitly, and
+`emit_mechanical_plan_v3` refuses invalid plans before emitting steps.
 
 Do not expand a legacy family as the primary implementation path unless there is
 a specific reason; add the v3 catalog alternative, fact bridge, planner rule,
@@ -70,19 +70,25 @@ Current migration surface:
 - Live v3 codegen: exact-int direct-compare, compare-with-integer-constant,
   and add/compare branch slices with local generic fallback, exact-int
   add/sub/mul/bitwise return-shaped expression regions with explicit PythonLong
-  materialization, and exact-int comparison returns with explicit Python bool
-  materialization. Store RHS lowering can consume return-shaped expression
-  regions, so simple lowered code like `c = a + b; if c > 0: ...` can optimize
-  the add store and the later branch as separate v3 regions. Profiled ordinary
+  materialization, exact-int comparison returns with explicit Python bool
+  materialization, and exact-string comparison branches or return-shaped
+  expressions with exact-unicode guards and Python bool materialization when an
+  object result is demanded. Store RHS lowering can consume return-shaped
+  expression regions, so simple lowered code like `c = a + b; if c > 0: ...`
+  can optimize the add store and the later branch as separate v3 regions.
+  Profiled ordinary
   direct calls are selected by v3, emitted with serialized target identities and
   an explicit call-body policy, and embedded into `InstrTyped` during JIT
-  planning. Constructor calls are selected through the same direct-call
-  machinery when the profiled target is the synthetic constructor-entry function
-  and the call can be bound without refreshing defaults; the entry currently
-  preserves Python type-call semantics by only attaching type metadata for
-  classes that can use direct default allocation. Constant-string indexed fields
-  are selected by v3 from raw `type_keys`, emitted as mechanical indexed-field
-  decisions, and consumed as v3-owned typed attribute inputs.
+  planning. Guarded receiver-method calls are selected by v3 from the same
+  `call_hot_targets` input, embedded as typed method guards, and lowered through
+  the existing guarded direct method codegen shape. Constructor calls are
+  selected through the same direct-call machinery when the profiled target is
+  the synthetic constructor-entry function and the call can be bound without
+  refreshing defaults; the entry currently preserves Python type-call semantics
+  by only attaching type metadata for classes that can use direct default
+  allocation. Constant-string indexed fields are selected by v3 from raw
+  `type_keys`, emitted as mechanical indexed-field decisions, and consumed as
+  v3-owned typed attribute inputs.
   Indexed globals are selected by v3 from raw `module_keys` plus lowered
   `NameLocation::Global(slot)` load/store sites, emitted with explicit
   module-dict guard and original-global-access fallback effects, and consumed
@@ -309,6 +315,10 @@ apply/verify mode:
   expression may reuse the enclosing instruction/term boundary when a
   conservative evaluation-order scan proves that deopting there cannot replay
   an earlier side effect; otherwise they keep the local slow path.
+- Indexed-global loads selected as v3 exact-operator or exact-comparison region
+  inputs use the same module-dict guard, but a hot miss branches to that
+  region's local generic fallback rather than to an instruction-level load
+  fallback.
 - In `profile` mode, store guard misses or store failures still
   increment the fallback counter when enabled and execute the existing
   global store slow path.
@@ -472,6 +482,9 @@ their owner/type guard payload is not yet a static mechanical JIT input.
   plus raw profile evidence. The v3 planner makes the call-body decisions; typed
   planning applies those decisions to `InstrTyped`, and codegen mechanically
   emits the resulting typed shapes.
+- Inline-winning direct calls assign fresh caller instruction ids to cloned
+  callee operations and remap callee-owned operation plans, currently exact-list
+  `GetItem`/`SetItem`, before typed access-plan annotation.
 - JIT codegen has direct boolean lowering for typed direct-call guard tests, so
   those guards do not round-trip through Python truthiness. Replay/deopt support
   consumes the typed metadata selected by the plan rather than legacy codegen
@@ -482,8 +495,8 @@ their owner/type guard payload is not yet a static mechanical JIT input.
 - Current limitations:
   - keywords are excluded
   - starred / unpacked args are excluded
-  - method targets are excluded until their guard payloads are represented as
-    static v3 codegen inputs
+  - method targets require a constant lowered attribute name and resolvable
+    owner-type metadata
   - variadic target params are excluded
   - required keyword-only target params are excluded unless they have a
     default value
@@ -508,14 +521,20 @@ their owner/type guard payload is not yet a static mechanical JIT input.
 
 ## Direct Method Calls
 
-Direct method calls still use `call_hot_targets` evidence, but they are not a
-live optimizer-v3 codegen family today. The previous JIT-side runtime
-owner-attribute resolution path has been removed from the v3 flow. A future v3
-method-call family should reintroduce this only when the plan can carry the
-method name, owner type key, direct-entry argument plan, receiver
-type-version guard, callable relocation, and original-call fallback as a static
-validated codegen input. Until then, v3 planning leaves method calls generic and
-the v3 plan/emission data does not carry method-call plan entries.
+Direct method calls use `call_hot_targets` evidence for lowered calls whose
+callable is a constant-name `GetAttr`, such as `record.copy()`. When the hot
+target is a transformed function and the receiver plus positional arguments can
+bind through a validated direct-entry argument plan, v3 records the selected
+target, method name, and argument plan. During typed JIT planning, the JIT
+resolves owner type metadata for that function and method name, predeclares the
+owner type and owner-attribute callable relocation, and embeds typed method
+guards into the call site.
+
+Codegen then emits the guarded method path: evaluate the receiver, check the
+receiver type/version, direct-call the selected function with the receiver as
+implicit argument `0`, and fall back to the original generic method call on
+guard miss. The path does not currently inline method bodies or specialize
+keyword/starred method calls.
 
 
 ## Type Constructors
@@ -679,7 +698,8 @@ access goes through the CPython item APIs.
   `crates/soac_lowering/src/passes/trace/mod.rs`.
 - Shapes are packed exact-type tags defined in
   `crates/soac_opt/src/operator_specialization.rs`.
-- Today the only exact type tag is `ExactTypeTag::Int`.
+- Exact type tags currently include `ExactTypeTag::Int` and
+  `ExactTypeTag::Str`.
 - Unary operators, division, modulo, shifts, power, identity/contains tests,
   matmul, and in-place variants are not counted for this specialization and use
   generic lowering unless v3 grows explicit alternatives for them.
@@ -694,6 +714,11 @@ access goes through the CPython item APIs.
   - machine bitwise and/or/xor with PythonLong materialization when needed
   - direct integer comparisons with branch or Python bool materialization based
     on result demand
+- Operand inputs may be locals/cells, module constants where applicable, or
+  profiled indexed module-global loads. Hot indexed-global inputs borrow
+  directly from the guarded module-dict slot; local fallbacks reload the global
+  with the normal owned global-load path before running generic Python
+  operation lowering.
 - On type/compactness/overflow miss, codegen runs the local generic fallback
   region emitted from the original Python operation shape. When the fallback is
   replay-safe, guard-miss lowering can instead target a cold
@@ -716,7 +741,7 @@ access goes through the CPython item APIs.
   - specialization for more operators that are currently generic
 
 
-## Exact-Int Comparisons
+## Exact Comparisons
 
 ### Counted Input
 
@@ -727,11 +752,20 @@ access goes through the CPython item APIs.
 
 ### Codegen
 
-- Comparison specialization is emitted from v3 exact-int operator regions.
+- Comparison specialization is emitted from v3 operator regions.
 - If the profiled shape is exact `int`/`int`, comparisons such as
   `Eq`, `Ne`, `Lt`, `Le`, `Gt`, and `Ge` guard compact exact `PyLong` layout
   and emit a direct integer comparison instead of generic
   `PyObject_RichCompare` lowering.
+- If the profiled shape is exact `str`/`str`, the hot path guards both operands
+  against exact `PyUnicode_Type` and calls `PyUnicode_Compare`. In an
+  `I32Bool01` branch context this avoids allocation of the intermediate Python
+  bool and the follow-on truthiness helper; when an object result is demanded,
+  the scalar comparison result is materialized as the Python bool singleton.
+  Operand inputs may be locals/cells, module string constants, or profiled
+  indexed module-global loads. The hot indexed-global input borrows directly
+  from the guarded module-dict slot; the local fallback reloads the global with
+  the normal owned global-load path before running generic Python comparison.
 - When the comparison is consumed by `I32Bool01` demand, such as an
   `if` condition, the profiled exact-int path guards compact exact `PyLong`
   layout, unboxes both operands, emits a direct integer comparison, and
@@ -751,15 +785,19 @@ access goes through the CPython item APIs.
 ### Limitations / Soundness / Extensions
 
 - Current limitations:
-  - only exact `int`/`int`
+  - exact `int`/`int`, and exact `str`/`str` for branch-context
+    compare-to-bool plans or return-shaped Python bool results
   - non-compact `PyLong` values guard-miss instead of using bigint-specific
     fast-path code
-  - no string/bytes/tuple/list comparison specialization
+  - no bytes/tuple/list comparison specialization
 - Soundness boundary:
   - exact-shape guarded, otherwise deopt to the generic continuation or
     generic fallback
+  - exact-string comparisons require exact `PyUnicode_Type`, so subclasses and
+    non-string objects run the generic fallback before Python-visible dispatch
 - Natural extensions:
-  - exact `str` comparisons
+  - exact `str` comparisons in more expression shapes beyond v3 return-shaped
+    regions
   - exact `float` comparisons
   - container comparisons where CPython semantics are stable enough to
     encode directly
@@ -771,7 +809,8 @@ access goes through the CPython item APIs.
 
 - There is no profile counter for the first version.
 - Candidate calls are recognized statically when name binding has already
-  proven the callee load is a runtime-name constant for `ord` or `chr`.
+  proven the callee load is a runtime-name constant for `ord`, `chr`, `len`, or
+  `iter`.
 - Global-name loads are not candidates at codegen time. That avoids treating
   a shadowable module global as a builtin primitive.
 
@@ -784,6 +823,9 @@ access goes through the CPython item APIs.
 - `len(x)` uses the same scalar-returning runtime primitive shape via
   `soac_runtime_builtin_len_i64`: borrowed `PyObject*` input, `i64` result, and
   `PyThreadState.current_exception` error reporting.
+- `iter(x)` can emit a direct call to `soac_runtime_builtin_iter_object`, which
+  accepts a borrowed `PyObject*` and returns the owned result of
+  `PyObject_GetIter(x)`.
 - If the consumer demands a Python object, the `i64` result is boxed through
   the existing `emit_to_python_long` coercion path. If the consumer demands an
   `i64`, the scalar value is used directly.

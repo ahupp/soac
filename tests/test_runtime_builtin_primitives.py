@@ -81,6 +81,13 @@ def reuse_iterator(stop):
     iterator = iter(range(stop))
     return list(iterator), list(iterator)
 
+def iterator_type_name(stop):
+    return type(iter(range(stop))).__name__
+
+def range_type_name(stop):
+    value = range(stop)
+    return type(value).__module__, type(value).__name__
+
 def zero_step():
     return list(range(1, 3, 0))
 
@@ -114,6 +121,8 @@ def no_index():
         assert module.collect_step(5, 1, -2) == [5, 3]
         assert module.reuse_range(3) == ([0, 1, 2], [0, 1, 2])
         assert module.reuse_iterator(3) == ([0, 1, 2], [])
+        assert module.iterator_type_name(3) == "range_iterator"
+        assert module.range_type_name(3) == ("builtins", "range")
         assert module.collect_indexable() == [1, 3]
         with pytest.raises(ValueError):
             module.zero_step()
@@ -123,3 +132,36 @@ def no_index():
             module.bad_index()
         with pytest.raises(TypeError):
             module.no_index()
+
+
+def test_for_range_stop_iteration_match_preserves_loop_semantics(tmp_path):
+    source = """
+def total(n):
+    result = 0
+    for value in range(n):
+        result += value
+    return result
+
+def loop_else_complete(n):
+    result = []
+    for value in range(n):
+        result.append(value)
+    else:
+        result.append("done")
+    return result
+
+def loop_else_break(n):
+    result = []
+    for value in range(n):
+        if value == 2:
+            break
+        result.append(value)
+    else:
+        result.append("done")
+    return result
+"""
+
+    with soac_module(tmp_path, "runtime_stop_iteration_match", source) as module:
+        assert module.total(6) == 15
+        assert module.loop_else_complete(3) == [0, 1, 2, "done"]
+        assert module.loop_else_break(5) == [0, 1]

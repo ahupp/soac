@@ -38,8 +38,10 @@ list = _builtins.list
 dict = _builtins.dict
 set = _builtins.set
 slice = _builtins.slice
+range = _builtins.range
 type = _builtins.type
 int = _builtins.int
+object = _builtins.object
 classmethod = _builtins.classmethod
 ascii = _builtins.ascii
 repr = _builtins.repr
@@ -728,6 +730,8 @@ async def asynccontextmanager_exit(exit_fn, exc):
 # bootstrapping treat `__soac__.X` inside this module as ordinary module-global
 # references instead of installing duplicate bootstrap helper implementations.
 class IterRange:
+    __slots__ = ("current", "stop", "step")
+
     def __init__(self, start, stop, step, /):
         self.current = start
         self.stop = stop
@@ -747,35 +751,6 @@ class IterRange:
             raise StopIteration
         self.current = current + step
         return current
-
-
-class range:
-    def __init__(self, start=_MISSING, stop=_MISSING, step=_MISSING, /):
-        # BEHAVIOR_CHANGE: transformed builtin range resolves to a reusable
-        # Python class, not CPython's compact immutable range object. This is
-        # intentionally kept as a stress case for inlining and escape analysis.
-        if start is _MISSING:
-            raise TypeError("range expected at least 1 argument, got 0")
-        if stop is _MISSING:
-            stop = _index(start)
-            start = 0
-            step = 1
-        elif step is _MISSING:
-            start = _index(start)
-            stop = _index(stop)
-            step = 1
-        else:
-            start = _index(start)
-            stop = _index(stop)
-            step = _index(step)
-        if step == 0:
-            raise ValueError("range() arg 3 must not be zero")
-        self.start = start
-        self.stop = stop
-        self.step = step
-
-    def __iter__(self):
-        return IterRange(self.start, self.stop, self.step)
 
 
 class AsyncGenComplete(Exception):

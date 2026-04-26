@@ -116,6 +116,50 @@ optimization attempts made by Codex agents. Keep entries succinct: what
 changed or was tried, which jj change id carried it when landed, the
 benchmarked throughput delta, and the headline pre/post numbers.
 
+## 2026-04-27 - Land Cranelift/refcount/runtime-symbol cleanup bundle
+
+- jj change ids: `ylklnnkt`, `owkmsrwk`, `snnysky`, `noptkkun`, `kxsstyll`
+- summary: This main-bound bundle covers immortal checked-load INCREF elision,
+  the normal runtime/benchmark `speed_and_size` Cranelift default,
+  module-constant global-name DECREF removal, direct CPython C-API JIT symbol
+  resolution, and immortal materialized-`None` results.
+- throughput: `+8.01%` median in the recent compare run
+- pre-change benchmark: `work/bench/rnykzppzqqur_53c05fea3df4`
+  - apply, refcounts enabled, median: `247551 loops/s`
+  - total pystone code size: `55082 bytes`, `3335` machine blocks
+  - core pystone code size: `50862 bytes`
+- post-change benchmark: `work/bench/snvutwoqpspo_0a629666c917`
+  - apply, refcounts enabled, median: `267381 loops/s`
+  - total pystone code size: `54919 bytes`, `3272` machine blocks
+  - core pystone code size: `50691 bytes`
+- notes: The post result is a benchmark child for `kxsstyll`. The net code-size
+  change is small, but it removes `63` pystone machine blocks while improving
+  the production refcount-enabled median.
+
+## 2026-04-27 - Land constructor and method direct-call stack
+
+- jj change ids: `nqsvxtt`, `onuyyrr`, `lsuosns`, `otmuxol`, `vvkssuq`,
+  `rqqupmks`
+- summary: Constructor and method calls are now represented as v3 direct-call
+  targets, with class metadata carrying synthetic constructor entries. The final
+  constructor metadata shape filters unsupported classes at type-registration
+  time so the callsite does not pay the safety checks on every call.
+- throughput: `+5.59%` median versus the `kxsstyll` benchmark child; `+14.05%`
+  versus the earlier `rnykzppz` baseline used in the recent three-way compare
+- pre-change benchmark: `work/bench/snvutwoqpspo_0a629666c917`
+  - apply, refcounts enabled, median: `267381 loops/s`
+  - total pystone code size: `54919 bytes`, `3272` machine blocks
+  - direct-call counter hits: `1515002`
+- post-change benchmark: `work/bench/wntrurtxnxqq_d133b77d9209`
+  - apply, refcounts enabled, median: `282323 loops/s`
+  - total pystone code size: `57258 bytes`, `3394` machine blocks
+  - direct-call counter hits: `1717002`
+- notes: The post benchmark artifact is the recent constructor-metadata
+  benchmark child used to validate the stack that was later advanced to
+  `rqqupmks` on `main`. The direct-call counter increase is the clearest
+  structured signal for the pystone win; generated pystone code grew by
+  `2339 bytes`.
+
 ## 2026-04-21 - Fix v3 indexed-field receiver lowering
 
 - jj change id: `ltxokuuw`

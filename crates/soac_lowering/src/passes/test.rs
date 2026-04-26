@@ -3310,7 +3310,7 @@ def run(items):
         .expect("bb module should be available");
     let run = function_by_name(&bb_module, "run");
     assert!(
-        function_or_constants_use_text(&bb_module, run, "StopIteration"),
+        !function_or_constants_use_text(&bb_module, run, "StopIteration"),
         "{run:?}"
     );
     assert!(
@@ -3319,6 +3319,10 @@ def run(items):
     );
     assert!(
         function_or_constants_use_text(&bb_module, run, "iter"),
+        "{run:?}"
+    );
+    assert!(
+        function_or_constants_use_text(&bb_module, run, "object"),
         "{run:?}"
     );
     assert!(
