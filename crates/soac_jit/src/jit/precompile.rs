@@ -5,6 +5,7 @@ use super::direct_function::{
     declare_imported_direct_function,
 };
 use super::module_data::{
+    ModuleConstantAccess, ModuleConstantAccessTable,
     declare_module_constant_object_data_for_prefix, define_scalar_counter_storage_data,
     define_top_value_counter_storage_data, module_constant_object_symbol,
     module_constant_symbol_prefix_for_module_identity, persistent_function_id_for_module_function,
@@ -21,9 +22,9 @@ use super::typed_pipeline::{
     apply_profile_call_emission_plans_to_typed_function, build_typed_v3_jit_module_plan,
 };
 use super::{
-    BuildSpecializedFunctionOptions, ModuleConstantAccess, ModuleConstantAccessTable,
-    SpecializationProfile, build_cranelift_run_bb_specialized_function,
-    collect_typed_call_direct_targets, placeholder_module_constant_ptrs,
+    BuildSpecializedFunctionOptions, SpecializationProfile,
+    build_cranelift_run_bb_specialized_function, collect_typed_call_direct_targets,
+    placeholder_module_constant_ptrs,
 };
 use crate::config::{CraneliftTargetConfig, pre_optimization_module_cache_identity};
 use crate::counter::TopValueCounter;

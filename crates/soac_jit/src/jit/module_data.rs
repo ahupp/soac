@@ -10,6 +10,34 @@ use soac_core::block_py::{
     BlockPyModule, LocalFunctionId, ModuleContentId, ModuleShape, PersistentFunctionId,
     RuntimeFunctionId,
 };
+use std::sync::Arc;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum ModuleConstantAccess {
+    #[default]
+    SymbolAddress,
+    PointerSlot,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(super) struct ModuleConstantAccessTable {
+    entries: Option<Arc<[ModuleConstantAccess]>>,
+}
+
+impl ModuleConstantAccessTable {
+    pub(super) fn from_entries(entries: Vec<ModuleConstantAccess>) -> Self {
+        Self {
+            entries: Some(Arc::from(entries)),
+        }
+    }
+
+    pub(super) fn access(&self, constant_id: ModuleConstantId) -> ModuleConstantAccess {
+        self.entries
+            .as_ref()
+            .and_then(|entries| entries.get(constant_id.0).copied())
+            .unwrap_or_default()
+    }
+}
 
 fn module_constant_symbol_prefix<P: ModuleShape>(module: &BlockPyModule<P>) -> String {
     format!(

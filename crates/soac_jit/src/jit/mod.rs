@@ -183,9 +183,10 @@ use direct_function::{
 #[cfg(test)]
 use direct_function::{DirectCallIncompatibility, plan_direct_call_args_for_target};
 use module_data::{
-    declare_module_constant_object_data, declare_top_value_counter_storage_import,
-    declare_type_ptr_import, define_scalar_counter_storage_data,
-    define_top_value_counter_storage_data, top_value_counter_storage_symbol_for_shared_state,
+    ModuleConstantAccess, ModuleConstantAccessTable, declare_module_constant_object_data,
+    declare_top_value_counter_storage_import, declare_type_ptr_import,
+    define_scalar_counter_storage_data, define_top_value_counter_storage_data,
+    top_value_counter_storage_symbol_for_shared_state,
 };
 #[cfg(test)]
 use module_data::{
@@ -1248,33 +1249,6 @@ struct JitEmitConsts {
     empty_tuple_constant_id: ModuleConstantId,
     block_const: ir::Value,
     module_constant_accesses: ModuleConstantAccessTable,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum ModuleConstantAccess {
-    #[default]
-    SymbolAddress,
-    PointerSlot,
-}
-
-#[derive(Clone, Debug, Default)]
-struct ModuleConstantAccessTable {
-    entries: Option<Arc<[ModuleConstantAccess]>>,
-}
-
-impl ModuleConstantAccessTable {
-    fn from_entries(entries: Vec<ModuleConstantAccess>) -> Self {
-        Self {
-            entries: Some(Arc::from(entries)),
-        }
-    }
-
-    fn access(&self, constant_id: ModuleConstantId) -> ModuleConstantAccess {
-        self.entries
-            .as_ref()
-            .and_then(|entries| entries.get(constant_id.0).copied())
-            .unwrap_or_default()
-    }
 }
 
 #[derive(Clone)]
