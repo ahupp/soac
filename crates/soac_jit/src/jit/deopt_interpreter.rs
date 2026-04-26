@@ -1,6 +1,7 @@
+use super::runtime_context::FunctionRuntimeDataLayout;
 use super::{
-    FunctionRuntimeDataLayout, RuntimeFunctionEntryPlan, RuntimeJitDeoptCursor,
-    RuntimeJitDeoptInvocation, RuntimeJitDeoptLocals, specialized_helpers::ObjPtr,
+    RuntimeFunctionEntryPlan, RuntimeJitDeoptCursor, RuntimeJitDeoptInvocation,
+    RuntimeJitDeoptLocals, specialized_helpers::ObjPtr,
 };
 use crate::function_instantiation::{
     make_function_in_shared_state, make_function_kind_abi_tag, soac_jit_make_function_with_closure,

@@ -1,8 +1,7 @@
 use super::planning::{LocalRefKind, PlannedJitDeoptPointId, PlannedJitDeoptResumeFunction};
+use super::runtime_context::FunctionRuntimeDataLayout;
 use super::specialized_helpers::ObjPtr;
-use super::{
-    CodegenBlock, FunctionRuntimeDataLayout, blockpy_intrinsics, transient_local_needs_decref,
-};
+use super::{CodegenBlock, blockpy_intrinsics, transient_local_needs_decref};
 use crate::module_constants::ModuleConstantId;
 use pyo3::{Py, PyAny, ffi};
 use soac_core::block_py::{

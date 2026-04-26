@@ -8,11 +8,11 @@ use super::imports::{
 };
 use super::runtime_context::{
     FUNCTION_ENV_DEFAULT_DIRECT_CODE_PTR_OFFSET, PY_FUNCTION_JIT_EXTRA_FUNCTION_ENV_OFFSET,
+    load_function_env_obj, load_py_function_soac_metadata_obj,
 };
 use super::{
     RuntimeFunctionId, SoacEnvConfig, VectorcallEntryFn,
-    emit_take_current_raised_exception_or_trap, jitdump, load_function_env_obj,
-    load_py_function_soac_metadata_obj,
+    emit_take_current_raised_exception_or_trap, jitdump,
 };
 use cranelift_codegen::ir;
 use cranelift_codegen::ir::InstBuilder;
