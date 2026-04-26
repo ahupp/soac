@@ -1,3 +1,7 @@
+use super::{
+    PyFunction_Type, PyList_Type, PyLong_Type, PyMethod_Type, PyThreadState_GetUnchecked,
+    PyType_Type,
+};
 use crate::module_type::SharedModuleState;
 use pyo3::ffi;
 use soac_core::block_py::{BlockPyFunction, ModuleShape, RuntimeFunctionId};
@@ -5,6 +9,7 @@ use soac_core::profile::CounterDumpTypeKey;
 use soac_ir_typed::TypedAttrOwnerRef;
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::ffi::{CStr, CString};
 use std::sync::{Mutex, OnceLock};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -257,4 +262,249 @@ pub(super) fn reloc_callable_ref_symbol_name(callable_ref: &RelocCallableRef) ->
             symbol
         }
     }
+}
+
+pub(super) fn resolve_type_key_to_type(
+    type_key: &CounterDumpTypeKey,
+) -> Result<Option<*mut ffi::PyTypeObject>, String> {
+    if type_key.module_name.is_empty()
+        || type_key.qualname.is_empty()
+        || type_key.qualname.split('.').any(|part| part == "<locals>")
+    {
+        return Ok(None);
+    }
+    if unsafe { PyThreadState_GetUnchecked() }.is_null() {
+        return Ok(None);
+    }
+
+    let module_name = CString::new(type_key.module_name.as_str())
+        .map_err(|_| format!("type key module contains NUL: {:?}", type_key.module_name))?;
+    let modules = unsafe { ffi::PyImport_GetModuleDict() };
+    if modules.is_null() {
+        if unsafe { !ffi::PyErr_Occurred().is_null() } {
+            return Err("failed to read sys.modules while resolving type key".to_string());
+        }
+        return Ok(None);
+    }
+    let mut current = unsafe { ffi::PyDict_GetItemString(modules, module_name.as_ptr()) };
+    if current.is_null() {
+        return Ok(None);
+    }
+    unsafe { ffi::Py_INCREF(current) };
+
+    for part in type_key.qualname.split('.') {
+        if part.is_empty() {
+            unsafe { ffi::Py_DECREF(current) };
+            return Ok(None);
+        }
+        let part = CString::new(part)
+            .map_err(|_| format!("type key qualname contains NUL: {:?}", type_key.qualname))?;
+        let next = unsafe { ffi::PyObject_GetAttrString(current, part.as_ptr()) };
+        unsafe { ffi::Py_DECREF(current) };
+        if next.is_null() {
+            unsafe { ffi::PyErr_Clear() };
+            return Ok(None);
+        }
+        current = next;
+    }
+
+    if unsafe { ffi::PyType_Check(current) } == 0 {
+        unsafe { ffi::Py_DECREF(current) };
+        return Ok(None);
+    }
+    let owner_type = current as *mut ffi::PyTypeObject;
+    unsafe { ffi::Py_DECREF(current) };
+    Ok(Some(owner_type))
+}
+
+fn cpython_type_symbol_for_type(owner_type: *mut ffi::PyTypeObject) -> Option<CpythonTypeSymbol> {
+    match owner_type {
+        ptr if ptr == std::ptr::addr_of_mut!(PyFunction_Type) => Some(CpythonTypeSymbol::Function),
+        ptr if ptr == std::ptr::addr_of_mut!(PyMethod_Type) => Some(CpythonTypeSymbol::Method),
+        ptr if ptr == std::ptr::addr_of_mut!(PyType_Type) => Some(CpythonTypeSymbol::Type),
+        ptr if ptr == std::ptr::addr_of_mut!(PyLong_Type) => Some(CpythonTypeSymbol::Long),
+        ptr if ptr == std::ptr::addr_of_mut!(PyList_Type) => Some(CpythonTypeSymbol::List),
+        _ => None,
+    }
+}
+
+fn resolve_cpython_type_symbol(symbol: CpythonTypeSymbol) -> *mut ffi::PyTypeObject {
+    match symbol {
+        CpythonTypeSymbol::Function => std::ptr::addr_of_mut!(PyFunction_Type),
+        CpythonTypeSymbol::Method => std::ptr::addr_of_mut!(PyMethod_Type),
+        CpythonTypeSymbol::Type => std::ptr::addr_of_mut!(PyType_Type),
+        CpythonTypeSymbol::Long => std::ptr::addr_of_mut!(PyLong_Type),
+        CpythonTypeSymbol::List => std::ptr::addr_of_mut!(PyList_Type),
+    }
+}
+
+fn py_string_attr_owned(
+    obj: *mut ffi::PyObject,
+    attr_name: &CStr,
+) -> Result<Option<String>, String> {
+    let attr = unsafe { ffi::PyObject_GetAttrString(obj, attr_name.as_ptr()) };
+    if attr.is_null() {
+        unsafe { ffi::PyErr_Clear() };
+        return Ok(None);
+    }
+    if unsafe { ffi::PyUnicode_Check(attr) } == 0 {
+        unsafe { ffi::Py_DECREF(attr) };
+        return Ok(None);
+    }
+    let mut size = 0isize;
+    let data = unsafe { ffi::PyUnicode_AsUTF8AndSize(attr, &mut size) };
+    if data.is_null() {
+        unsafe { ffi::Py_DECREF(attr) };
+        return Err(format!(
+            "failed to read Python string attribute {} as UTF-8",
+            attr_name.to_string_lossy()
+        ));
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(data.cast::<u8>(), size as usize) };
+    let value = match std::str::from_utf8(bytes) {
+        Ok(value) => value.to_owned(),
+        Err(err) => {
+            unsafe { ffi::Py_DECREF(attr) };
+            return Err(format!(
+                "Python string attribute {} was not valid UTF-8: {err}",
+                attr_name.to_string_lossy()
+            ));
+        }
+    };
+    unsafe { ffi::Py_DECREF(attr) };
+    Ok(Some(value))
+}
+
+pub(super) fn type_key_for_type(
+    owner_type: *mut ffi::PyTypeObject,
+) -> Result<Option<CounterDumpTypeKey>, String> {
+    if owner_type.is_null() {
+        return Ok(None);
+    }
+    let owner_obj = owner_type.cast::<ffi::PyObject>();
+    let Some(module_name) = py_string_attr_owned(owner_obj, c"__module__")? else {
+        return Ok(None);
+    };
+    let Some(qualname) = py_string_attr_owned(owner_obj, c"__qualname__")? else {
+        return Ok(None);
+    };
+    if module_name.is_empty()
+        || qualname.is_empty()
+        || qualname.split('.').any(|part| part == "<locals>")
+    {
+        return Ok(None);
+    }
+    Ok(Some(CounterDumpTypeKey {
+        module_name,
+        qualname,
+    }))
+}
+
+pub(super) fn register_runtime_type_for_key(
+    type_key: &CounterDumpTypeKey,
+    owner_type: *mut ffi::PyTypeObject,
+) {
+    let mut registry = type_key_runtime_registry()
+        .lock()
+        .expect("type key runtime registry lock poisoned");
+    registry.insert(type_key.clone(), owner_type as usize);
+}
+
+fn lookup_runtime_type_for_key(type_key: &CounterDumpTypeKey) -> Option<*mut ffi::PyTypeObject> {
+    let registry = type_key_runtime_registry()
+        .lock()
+        .expect("type key runtime registry lock poisoned");
+    registry
+        .get(type_key)
+        .copied()
+        .map(|ptr| ptr as *mut ffi::PyTypeObject)
+}
+
+pub(super) fn reloc_type_ref_for_type(
+    owner_type: *mut ffi::PyTypeObject,
+) -> Result<Option<RelocTypeRef>, String> {
+    if let Some(symbol) = cpython_type_symbol_for_type(owner_type) {
+        return Ok(Some(RelocTypeRef::CpythonTypeSymbol(symbol)));
+    }
+    let Some(type_key) = type_key_for_type(owner_type)? else {
+        return Ok(None);
+    };
+    register_runtime_type_for_key(&type_key, owner_type);
+    Ok(Some(RelocTypeRef::TypeKey(type_key)))
+}
+
+pub(super) fn resolve_reloc_type_ref_to_type(
+    owner_type_ref: &RelocTypeRef,
+) -> Result<Option<*mut ffi::PyTypeObject>, String> {
+    match owner_type_ref {
+        RelocTypeRef::CpythonTypeSymbol(symbol) => Ok(Some(resolve_cpython_type_symbol(*symbol))),
+        RelocTypeRef::TypeKey(type_key) => {
+            if let Some(owner_type) = lookup_runtime_type_for_key(type_key) {
+                return Ok(Some(owner_type));
+            }
+            resolve_type_key_to_type(type_key)
+        }
+    }
+}
+
+pub(super) fn ensure_reloc_type_symbol_registered(
+    owner_type_ref: &RelocTypeRef,
+) -> Result<bool, String> {
+    match owner_type_ref {
+        RelocTypeRef::CpythonTypeSymbol(_) => Ok(true),
+        RelocTypeRef::TypeKey(_) => {
+            let symbol = reloc_type_ref_symbol_name(owner_type_ref);
+            if lookup_registered_jit_data_symbol(symbol.as_ref()).is_some() {
+                return Ok(true);
+            }
+            let Some(owner_type) = resolve_reloc_type_ref_to_type(owner_type_ref)? else {
+                return Ok(false);
+            };
+            register_jit_data_symbol(symbol.as_ref(), owner_type.cast::<u8>());
+            Ok(true)
+        }
+    }
+}
+
+#[cfg(test)]
+fn resolve_reloc_callable_ref_to_object(
+    callable_ref: &RelocCallableRef,
+) -> Result<Option<*mut ffi::PyObject>, String> {
+    match callable_ref {
+        RelocCallableRef::OwnerAttr {
+            owner_type_ref,
+            attr_name,
+        } => {
+            let Some(owner_type) = resolve_reloc_type_ref_to_type(owner_type_ref)? else {
+                return Ok(None);
+            };
+            let attr_name = CString::new(attr_name.as_str()).map_err(|_| {
+                format!("callable attr contains NUL and cannot be resolved: {attr_name:?}")
+            })?;
+            let dict = unsafe { (*owner_type).tp_dict };
+            if dict.is_null() {
+                return Ok(None);
+            }
+            let value = unsafe { ffi::PyDict_GetItemString(dict, attr_name.as_ptr()) };
+            if value.is_null() || unsafe { ffi::PyFunction_Check(value) } == 0 {
+                return Ok(None);
+            }
+            Ok(Some(value))
+        }
+    }
+}
+
+#[cfg(test)]
+pub(super) fn ensure_reloc_callable_symbol_registered(
+    callable_ref: &RelocCallableRef,
+) -> Result<bool, String> {
+    let symbol = reloc_callable_ref_symbol_name(callable_ref);
+    if lookup_registered_jit_data_symbol(symbol.as_str()).is_some() {
+        return Ok(true);
+    }
+    let Some(callable) = resolve_reloc_callable_ref_to_object(callable_ref)? else {
+        return Ok(false);
+    };
+    register_jit_data_symbol(symbol.as_str(), callable.cast::<u8>());
+    Ok(true)
 }

@@ -44,6 +44,7 @@ use soac_core::block_py::{
 use soac_ir_blockpy::{CodegenModuleShape, InstrCodegen, validate_codegen_instr_ids};
 mod tests {
     use super::super::direct_abi;
+    use super::super::symbols::resolve_reloc_type_ref_to_type;
     use super::super::typed_pipeline::{
         annotate_typed_attr_accesses, annotate_typed_exact_int_selections,
         annotate_typed_indexed_global_accesses,
@@ -80,10 +81,9 @@ mod tests {
         precompiled_direct_function_symbol_scope_for_persistent,
         prepare_specialized_typed_function, prime_field_index_layout,
         push_direct_function_module_identity, push_shared_module_symbol_identity,
-        reloc_type_ref_for_type, resolve_reloc_type_ref_to_type,
-        runtime_primitive_call_static_params_can_satisfy_abi, stable_cranelift_function_hash,
-        stable_cranelift_function_name, typed_local_load_direct_result_plan,
-        validate_direct_call_compatibility,
+        reloc_type_ref_for_type, runtime_primitive_call_static_params_can_satisfy_abi,
+        stable_cranelift_function_hash, stable_cranelift_function_name,
+        typed_local_load_direct_result_plan, validate_direct_call_compatibility,
     };
     use super::{
         AbruptKind, BinOp, BinOpKind, BlockArg, BlockEdge, BlockLabel, BlockParam, BlockParamRole,

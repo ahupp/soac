@@ -2,12 +2,8 @@ use super::codegen_env::{
     JitCodegenEnv, declare_import_fn, declare_local_fn, lower_static_signature,
 };
 use super::direct_abi;
-#[cfg(test)]
-use super::ensure_reloc_callable_symbol_registered;
 use super::intrinsics;
 use super::module_data::declare_type_ptr_import;
-#[cfg(test)]
-use super::symbols::reloc_callable_ref_symbol_name;
 use super::symbols::{
     CpythonTypeSymbol, RelocTypeRef, SOAC_RUNTIME_DECREF_APPLIED_SYMBOL,
     SOAC_RUNTIME_DECREF_SYMBOL, SOAC_RUNTIME_INCREF_APPLIED_SYMBOL, SOAC_RUNTIME_INCREF_SYMBOL,
@@ -16,13 +12,15 @@ use super::symbols::{
     SOAC_RUNTIME_SET_RAISED_EXCEPTION_SYMBOL, SOAC_RUNTIME_STORE_FIELD_INDEXED_SYMBOL,
     SOAC_RUNTIME_STORE_GLOBAL_INDEXED_SYMBOL, SOAC_RUNTIME_STORE_GLOBAL_SYMBOL,
     SOAC_RUNTIME_TUPLE_NEW_SYMBOL, SOAC_RUNTIME_TUPLE_SET_ITEM_STOLEN_SYMBOL,
-    cpython_type_symbol_name, reloc_type_ref_symbol_name,
+    cpython_type_symbol_name, ensure_reloc_type_symbol_registered, reloc_type_ref_symbol_name,
 };
 #[cfg(test)]
 use super::symbols::{RelocCallableRef, reloc_type_ref_from_typed_attr_owner_ref};
+#[cfg(test)]
+use super::symbols::{ensure_reloc_callable_symbol_registered, reloc_callable_ref_symbol_name};
 use super::{
-    SpecializationProfile, ensure_reloc_type_symbol_registered,
-    field_index_specialization_from_primed_opt_v3, prime_opt_v3_field_index_layouts,
+    SpecializationProfile, field_index_specialization_from_primed_opt_v3,
+    prime_opt_v3_field_index_layouts,
 };
 use crate::function_instantiation::SOAC_JIT_MAKE_FUNCTION_WITH_CLOSURE_SYMBOL;
 use cranelift_jit::JITModule;
