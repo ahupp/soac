@@ -71,17 +71,8 @@ pub struct TypedDirectMethodCallGuard {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-pub struct TypedDirectConstructorCallGuard {
-    pub function_id: RuntimeFunctionId,
-    pub owner_type_ref: TypedAttrOwnerRef,
-    pub type_version: u32,
-    pub arg_plan: TypedDirectCallArgPlan,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum TypedDirectCallableCallGuard {
     Function(TypedDirectFunctionCallGuard),
-    Constructor(TypedDirectConstructorCallGuard),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -89,7 +80,6 @@ pub enum TypedCallAccessPlan {
     Generic,
     GuardedCallable {
         function_guards: Vec<TypedDirectFunctionCallGuard>,
-        constructor_guards: Vec<TypedDirectConstructorCallGuard>,
     },
     GuardedMethod {
         method_name: String,
@@ -128,7 +118,6 @@ impl TypedCallEmissionPlans {
 pub enum TypedCallEmissionPlan {
     Callable {
         function_guards: Vec<TypedDirectFunctionCallGuard>,
-        constructor_guards: Vec<TypedDirectConstructorCallGuard>,
     },
     Method {
         method_name: String,
@@ -139,13 +128,9 @@ pub enum TypedCallEmissionPlan {
 impl TypedCallEmissionPlan {
     pub fn target_function_ids(&self) -> Vec<RuntimeFunctionId> {
         match self {
-            Self::Callable {
-                function_guards,
-                constructor_guards,
-            } => function_guards
+            Self::Callable { function_guards } => function_guards
                 .iter()
                 .map(|guard| guard.function_id)
-                .chain(constructor_guards.iter().map(|guard| guard.function_id))
                 .collect(),
             Self::Method { method_guards, .. } => method_guards
                 .iter()
@@ -156,10 +141,7 @@ impl TypedCallEmissionPlan {
 
     pub fn is_empty(&self) -> bool {
         match self {
-            Self::Callable {
-                function_guards,
-                constructor_guards,
-            } => function_guards.is_empty() && constructor_guards.is_empty(),
+            Self::Callable { function_guards } => function_guards.is_empty(),
             Self::Method { method_guards, .. } => method_guards.is_empty(),
         }
     }
@@ -435,14 +417,12 @@ pub struct TypedGuardedCallableCall<E: Instr> {
     pub args: Vec<CallArgPositional<E>>,
     pub keywords: Vec<CallArgKeyword<E>>,
     pub function_guards: Vec<TypedDirectFunctionCallGuard>,
-    pub constructor_guards: Vec<TypedDirectConstructorCallGuard>,
 }
 
 impl<E: Instr> TypedGuardedCallableCall<E> {
     pub fn from_typed_call(
         call: TypedCall<E>,
         function_guards: Vec<TypedDirectFunctionCallGuard>,
-        constructor_guards: Vec<TypedDirectConstructorCallGuard>,
     ) -> Self {
         Self {
             _meta: call._meta,
@@ -451,7 +431,6 @@ impl<E: Instr> TypedGuardedCallableCall<E> {
             args: call.args,
             keywords: call.keywords,
             function_guards,
-            constructor_guards,
         }
     }
 
@@ -464,7 +443,6 @@ impl<E: Instr> TypedGuardedCallableCall<E> {
             keywords: self.keywords,
             access: TypedCallAccessPlan::GuardedCallable {
                 function_guards: self.function_guards,
-                constructor_guards: self.constructor_guards,
             },
         }
     }
@@ -477,7 +455,6 @@ impl<E: Instr + std::fmt::Debug> std::fmt::Debug for TypedGuardedCallableCall<E>
             .field("args", &self.args)
             .field("keywords", &self.keywords)
             .field("function_guards", &self.function_guards)
-            .field("constructor_guards", &self.constructor_guards)
             .finish()
     }
 }
@@ -549,7 +526,6 @@ impl<E: Instr> Mappable<E> for TypedGuardedCallableCall<E> {
                 .map(|keyword| keyword.map_instr(|expr| map.map_instr(expr)))
                 .collect(),
             function_guards: self.function_guards,
-            constructor_guards: self.constructor_guards,
         }
     }
 
@@ -573,7 +549,6 @@ impl<E: Instr> Mappable<E> for TypedGuardedCallableCall<E> {
                 .map(|keyword| keyword.try_map_instr(|expr| map.try_map_instr(expr)))
                 .collect::<Result<Vec<_>, _>>()?,
             function_guards: self.function_guards,
-            constructor_guards: self.constructor_guards,
         })
     }
 }
@@ -889,10 +864,7 @@ where
         self.keywords.fmt_pretty(printer)?;
         std::fmt::Write::write_fmt(
             printer,
-            format_args!(
-                ", function_guards: {:?}, constructor_guards: {:?} }}",
-                self.function_guards, self.constructor_guards
-            ),
+            format_args!(", function_guards: {:?} }}", self.function_guards),
         )
     }
 }

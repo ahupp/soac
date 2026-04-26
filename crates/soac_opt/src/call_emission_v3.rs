@@ -134,7 +134,6 @@ pub fn typed_call_emission_plans_from_v3(
             .entry(*source)
             .or_insert_with(|| TypedCallEmissionPlan::Callable {
                 function_guards: Vec::new(),
-                constructor_guards: Vec::new(),
             });
         let TypedCallEmissionPlan::Callable {
             function_guards, ..

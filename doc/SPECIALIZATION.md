@@ -482,8 +482,8 @@ their owner/type guard payload is not yet a static mechanical JIT input.
   - variadic target params are excluded
   - required keyword-only target params are excluded unless they have a
     default value
-  - `__init__` targets are excluded from the ordinary function-call rewrite;
-    constructor specialization owns class-call semantics because the `self`
+  - class-call targets are not modeled as ordinary calls to `__init__`;
+    constructor semantics need an explicit entry function because the `self`
     object must come from the guarded constructor allocation path
 - Soundness boundary:
   - this is sound as long as the `FunctionId` metadata attached to
@@ -517,11 +517,11 @@ being migrated. A heap type's SOAC function id now names a synthetic
 so profile evidence no longer treats `__init__` itself as the class-call target.
 
 The synthetic entries are currently interpreted placeholders. Until their body
-and direct-call emission path exist, v3 planning declines these targets and
+and callable emission path exist, v3 planning declines these targets and
 constructor calls fall back to the original generic Python call path. The
 intended replacement is for the constructor-entry function to own allocation,
-the internal direct call to `__init__`, `dp_jit_finish_constructor_init`, and
-the generic fallback boundary.
+the internal call to `__init__`, `dp_jit_finish_constructor_init`, and the
+generic fallback boundary.
 
 Constructor initializer inlining and constructor scalar replacement should be
 represented directly in `InstrTyped` metadata or typed operation shape when

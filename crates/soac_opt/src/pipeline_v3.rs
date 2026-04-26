@@ -1214,16 +1214,14 @@ fn direct_call_requests_from_evidence_v3(
                 });
                 continue;
             }
-            let callee = if target_function.names.fn_name == "__init__" {
-                DirectCallCallee::Constructor
-            } else if let Some(method_name) = source_method_name.clone() {
+            let callee = if let Some(method_name) = source_method_name.clone() {
                 DirectCallCallee::Method { method_name }
             } else {
                 DirectCallCallee::Function
             };
             let implicit_positional_arg_count = match &callee {
                 DirectCallCallee::Function => 0,
-                DirectCallCallee::Method { .. } | DirectCallCallee::Constructor => 1,
+                DirectCallCallee::Method { .. } => 1,
             };
             let arg_plan = match direct_call_arg_plan_for_instr_id_v3(
                 function,
@@ -1272,9 +1270,6 @@ fn direct_call_requests_from_evidence_v3(
                     }
                     DirectCallCallee::Method { .. } => {
                         "profiled call_hot_targets selected this method with validated receiver-method arguments".to_string()
-                    }
-                    DirectCallCallee::Constructor => {
-                        "profiled call_hot_targets selected this constructor with validated constructor-call arguments".to_string()
                     }
                 },
             });
@@ -2030,7 +2025,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_call_requests_include_constructor_targets_with_allocated_self() {
+    fn direct_call_requests_decline_legacy_constructor_targets_without_entry_thunk() {
         let module_name_gen = ModuleNameGen::new(0);
         let source = instr_id(9);
         let call = with_instr_id(
@@ -2116,25 +2111,13 @@ mod tests {
             &mut identity_builder,
         );
 
-        assert!(diagnostics.is_empty(), "{diagnostics:?}");
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].source, source);
-        assert_eq!(
-            requests[0].arg_plan.sources,
-            vec![
-                DirectCallArgSource::Provided(0),
-                DirectCallArgSource::Provided(1),
-                DirectCallArgSource::DefaultSentinel,
-            ]
-        );
+        assert!(requests.is_empty(), "{requests:?}");
+        assert_eq!(diagnostics.len(), 1);
         assert!(
-            requests[0]
-                .body
-                .alternatives
-                .iter()
-                .any(|alternative| alternative.kind == CallBodyKind::DirectCall)
+            diagnostics[0]
+                .message
+                .contains("missing required argument value")
         );
-        assert!(requests[0].reason.contains("constructor"));
     }
 
     #[test]

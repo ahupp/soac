@@ -510,16 +510,9 @@ pub fn lower_typed_function_call_emission_plans(
                 unreachable!("checked call shape before replacing typed instruction")
             };
             match plan {
-                TypedCallEmissionPlan::Callable {
-                    function_guards,
-                    constructor_guards,
-                } => {
+                TypedCallEmissionPlan::Callable { function_guards } => {
                     *expr = InstrTyped::GuardedCallableCallTyped(
-                        TypedGuardedCallableCall::from_typed_call(
-                            call,
-                            function_guards.clone(),
-                            constructor_guards.clone(),
-                        ),
+                        TypedGuardedCallableCall::from_typed_call(call, function_guards.clone()),
                     );
                     self.count += 1;
                 }
@@ -578,16 +571,9 @@ pub fn lower_typed_function_call_access_plan_instrs(
                 unreachable!("checked call shape before replacing typed instruction")
             };
             match std::mem::replace(&mut call.access, TypedCallAccessPlan::Generic) {
-                TypedCallAccessPlan::GuardedCallable {
-                    function_guards,
-                    constructor_guards,
-                } => {
+                TypedCallAccessPlan::GuardedCallable { function_guards } => {
                     *expr = InstrTyped::GuardedCallableCallTyped(
-                        TypedGuardedCallableCall::from_typed_call(
-                            call,
-                            function_guards,
-                            constructor_guards,
-                        ),
+                        TypedGuardedCallableCall::from_typed_call(call, function_guards),
                     );
                 }
                 TypedCallAccessPlan::GuardedMethod {
@@ -1527,16 +1513,10 @@ pub fn validate_typed_module_call_access_plans(
 fn validate_typed_call_access_plan(call: &TypedCall<InstrTyped>) -> Result<(), String> {
     match &call.access {
         TypedCallAccessPlan::Generic => Ok(()),
-        TypedCallAccessPlan::GuardedCallable {
-            function_guards,
-            constructor_guards,
-        } => {
+        TypedCallAccessPlan::GuardedCallable { function_guards } => {
             validate_typed_call_simple_shape(call)?;
             for guard in function_guards {
                 validate_typed_direct_call_arg_plan(call, &guard.arg_plan, 0)?;
-            }
-            for guard in constructor_guards {
-                validate_typed_direct_call_arg_plan(call, &guard.arg_plan, 1)?;
             }
             Ok(())
         }
@@ -1604,10 +1584,6 @@ fn validate_typed_direct_callable_call(
         TypedDirectCallableCallGuard::Function(guard) => {
             validate_typed_direct_call_arg_sources(&guard.arg_plan, explicit_positional_arg_count)
         }
-        TypedDirectCallableCallGuard::Constructor(guard) => validate_typed_direct_call_arg_sources(
-            &guard.arg_plan,
-            explicit_positional_arg_count + 1,
-        ),
     }
 }
 
@@ -1778,8 +1754,8 @@ mod typed_codegen_tests {
     use crate::passes::infer_module_value_facts;
     use soac_core::block_py::{ChildVisitable, InstrId, InstrWithConstantNone, Visit, VisitMut};
     use soac_ir_typed::{
-        TypedAttrOwnerRef, TypedDirectConstructorCallGuard, TypedDirectFunctionCallGuard,
-        TypedDirectMethodCallGuard, lower_codegen_module_to_typed,
+        TypedAttrOwnerRef, TypedDirectFunctionCallGuard, TypedDirectMethodCallGuard,
+        lower_codegen_module_to_typed,
     };
     use std::collections::HashMap;
 
@@ -2392,7 +2368,6 @@ def caller(a, b):\n    return add(a, b)\n",
                         ],
                     },
                 }],
-                constructor_guards: Vec::new(),
             },
         );
 
@@ -2476,7 +2451,6 @@ def caller(a):\n    return add(a)\n",
                             sources: vec![TypedDirectCallArgSource::Provided(0)],
                         },
                     }],
-                    constructor_guards: Vec::new(),
                 },
             )]),
         };
@@ -2499,7 +2473,7 @@ def caller(a):\n    return add(a)\n",
     }
 
     #[test]
-    fn lowers_typed_call_emission_plan_with_function_and_constructor_guards() {
+    fn lowers_typed_call_emission_plan_with_multiple_function_guards() {
         let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
             "def caller(a):\n    return callable(a)\n",
         )
@@ -2508,7 +2482,7 @@ def caller(a):\n    return add(a)\n",
         let caller = typed_function_by_qualname_mut(&mut typed, "caller");
         let call_id = first_typed_call_instr_id(caller);
         let direct_target = RuntimeFunctionId::from_raw_parts(0, 7);
-        let constructor_target = RuntimeFunctionId::from_raw_parts(0, 8);
+        let other_direct_target = RuntimeFunctionId::from_raw_parts(0, 8);
         let arg_plan = TypedDirectCallArgPlan {
             sources: vec![TypedDirectCallArgSource::Provided(0)],
         };
@@ -2516,19 +2490,16 @@ def caller(a):\n    return add(a)\n",
             by_source: HashMap::from([(
                 call_id,
                 TypedCallEmissionPlan::Callable {
-                    function_guards: vec![TypedDirectFunctionCallGuard {
-                        function_id: direct_target,
-                        arg_plan: arg_plan.clone(),
-                    }],
-                    constructor_guards: vec![TypedDirectConstructorCallGuard {
-                        function_id: constructor_target,
-                        owner_type_ref: TypedAttrOwnerRef::TypeKey {
-                            module_name: "test".to_string(),
-                            qualname: "Box".to_string(),
+                    function_guards: vec![
+                        TypedDirectFunctionCallGuard {
+                            function_id: direct_target,
+                            arg_plan: arg_plan.clone(),
                         },
-                        type_version: 11,
-                        arg_plan,
-                    }],
+                        TypedDirectFunctionCallGuard {
+                            function_id: other_direct_target,
+                            arg_plan,
+                        },
+                    ],
                 },
             )]),
         };

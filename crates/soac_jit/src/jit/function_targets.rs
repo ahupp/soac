@@ -24,16 +24,8 @@ pub(super) fn collect_typed_call_direct_targets(
                 self.out.insert(call.function_id);
             }
             if let InstrTyped::GuardedCallableCallTyped(call) = expr {
-                self.out.extend(
-                    call.function_guards
-                        .iter()
-                        .map(|guard| guard.function_id)
-                        .chain(
-                            call.constructor_guards
-                                .iter()
-                                .map(|guard| guard.function_id),
-                        ),
-                );
+                self.out
+                    .extend(call.function_guards.iter().map(|guard| guard.function_id));
             }
             if let InstrTyped::GuardedMethodCallTyped(call) = expr {
                 self.out
@@ -42,9 +34,6 @@ pub(super) fn collect_typed_call_direct_targets(
             if let InstrTyped::DirectCallableCallTyped(call) = expr {
                 match &call.guard {
                     TypedDirectCallableCallGuard::Function(guard) => {
-                        self.out.insert(guard.function_id);
-                    }
-                    TypedDirectCallableCallGuard::Constructor(guard) => {
                         self.out.insert(guard.function_id);
                     }
                 }

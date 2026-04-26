@@ -149,12 +149,9 @@ use direct_abi::{
     ParamAbi, PyLongI64Coercion, ResultAbi,
 };
 use direct_function::{
-    DirectCallArgPlan, DirectCallArgSource, DirectCallEntryKind, DirectConstructorSpecialization,
-    DirectEdgeStats, DirectFunctionSpecialization, DirectMethodSpecialization,
-    declare_direct_function, direct_call_arg_plan_from_typed,
-    direct_constructor_specialization_from_typed_guard,
-    direct_constructor_specializations_from_typed_guards,
-    direct_function_specializations_from_typed_guards,
+    DirectCallArgPlan, DirectCallArgSource, DirectCallEntryKind, DirectEdgeStats,
+    DirectFunctionSpecialization, DirectMethodSpecialization, declare_direct_function,
+    direct_call_arg_plan_from_typed, direct_function_specializations_from_typed_guards,
     direct_method_specialization_from_typed_call, direct_method_specializations_from_typed_guards,
     make_direct_function_signature, record_profiled_direct_call_incompatibility,
     validate_direct_call_compatibility,
@@ -262,15 +259,13 @@ thread_local! {
 use imports::predeclare_typed_direct_call_imports;
 use imports::{
     DP_JIT_DECREF_IMPORT, DP_JIT_DEOPT_RESUME_IMPORT, DP_JIT_DIRECT_COMPILE_FUNCTION_ENV_IMPORT,
-    DP_JIT_ENTER_RECURSIVE_CALL_IMPORT, DP_JIT_FINISH_CONSTRUCTOR_INIT_IMPORT,
-    DP_JIT_INCREF_IMPORT, DP_JIT_IS_TRUE_IMPORT, DP_JIT_LOAD_CELL_IMPORT,
-    DP_JIT_LOAD_RUNTIME_OBJ_BY_ID_IMPORT, DP_JIT_MAKE_CELL_IMPORT,
+    DP_JIT_ENTER_RECURSIVE_CALL_IMPORT, DP_JIT_INCREF_IMPORT, DP_JIT_IS_TRUE_IMPORT,
+    DP_JIT_LOAD_CELL_IMPORT, DP_JIT_LOAD_RUNTIME_OBJ_BY_ID_IMPORT, DP_JIT_MAKE_CELL_IMPORT,
     DP_JIT_POP_HANDLED_EXCEPTION_IMPORT, DP_JIT_PUSH_HANDLED_EXCEPTION_IMPORT,
     DP_JIT_PY_CALL_OBJECT_IMPORT, DP_JIT_PY_CALL_POSITIONAL_THREE_IMPORT,
     DP_JIT_PY_CALL_WITH_KW_IMPORT, DP_JIT_PY_VECTORCALL_IMPORT, DP_JIT_PYOBJECT_GETATTR_IMPORT,
     DP_JIT_PYOBJECT_GETITEM_IMPORT, DP_JIT_PYOBJECT_SETATTR_IMPORT, DP_JIT_PYOBJECT_SETITEM_IMPORT,
-    DP_JIT_PYOBJECT_TO_I64_IMPORT, DP_JIT_PYTYPE_GENERIC_ALLOC_IMPORT,
-    DP_JIT_RAISE_FROM_EXC_IMPORT, DP_JIT_RAISE_I64_OVERFLOW_IMPORT,
+    DP_JIT_PYOBJECT_TO_I64_IMPORT, DP_JIT_RAISE_FROM_EXC_IMPORT, DP_JIT_RAISE_I64_OVERFLOW_IMPORT,
     DP_JIT_RAISE_SUPER_ARG_DELETED_IMPORT, DP_JIT_RAISE_UNBOUND_LOCAL_ERROR_IMPORT,
     DP_JIT_RECORD_TOP_VALUE_SAMPLE_IMPORT, DP_JIT_STORE_CELL_IMPORT, ImportSpec, ModuleFuncImports,
     PYLONG_FROM_LONGLONG_IMPORT, PYNUMBER_ADD_IMPORT, PYNUMBER_AND_IMPORT,
@@ -1237,8 +1232,6 @@ struct JitEmitCtx<'mc> {
     decref_ref: ir::FuncRef,
     py_call_positional_three_ref: ir::FuncRef,
     py_vectorcall_ref: ir::FuncRef,
-    pytype_generic_alloc_ref: ir::FuncRef,
-    finish_constructor_init_ref: ir::FuncRef,
     consts: JitEmitConsts,
     load_global_fast_ref: ir::FuncRef,
     probe_global_indexed_ref: ir::FuncRef,
@@ -6062,126 +6055,6 @@ fn emit_direct_call_resolved_with_arg_values(
     fb.block_params(call_ok_block)[0]
 }
 
-fn emit_direct_constructor_resolved_with_arg_values(
-    fb: &mut FunctionBuilder<'_>,
-    callable: ir::Value,
-    callable_is_borrowed: bool,
-    arg_values: Vec<ir::Value>,
-    arg_borrowed: Vec<bool>,
-    specialization: &DirectConstructorSpecialization,
-    target_function: &BlockPyFunction<impl ModuleShape>,
-    ctx: &JitEmitCtx<'_>,
-    codegen_env: &mut impl JitCodegenEnv,
-) -> ir::Value {
-    let ptr_ty = ctx.consts.ptr_ty;
-    let null_ptr = fb.ins().iconst(ptr_ty, 0);
-    let zero = fb.ins().iconst(ctx.consts.i64_ty, 0);
-    let alloc_inst = fb
-        .ins()
-        .call(ctx.pytype_generic_alloc_ref, &[callable, zero]);
-    let allocated = fb.inst_results(alloc_inst)[0];
-    if !callable_is_borrowed {
-        fb.ins()
-            .call(ctx.decref_ref, &[ctx.consts.thread_state_value, callable]);
-    }
-    let alloc_is_null = fb
-        .ins()
-        .icmp(ir::condcodes::IntCC::Equal, allocated, null_ptr);
-    let alloc_failed = fb.create_block();
-    let alloc_ok = fb.create_block();
-    fb.append_block_param(alloc_ok, ptr_ty);
-    fb.ins().brif(
-        alloc_is_null,
-        alloc_failed,
-        &[],
-        alloc_ok,
-        &[ir::BlockArg::Value(allocated)],
-    );
-
-    fb.switch_to_block(alloc_failed);
-    let mut owned_inputs = Vec::with_capacity(arg_values.len());
-    for (value, borrowed_arg) in arg_values.iter().copied().zip(arg_borrowed.iter().copied()) {
-        if !borrowed_arg {
-            owned_inputs.push(value);
-        }
-    }
-    emit_release_owned_inputs(fb, ctx, &owned_inputs);
-    fb.ins()
-        .jump(ctx.consts.step_null_block, &step_null_block_args(ctx));
-
-    fb.switch_to_block(alloc_ok);
-    let allocated = fb.block_params(alloc_ok)[0];
-    let mut provided_arg_values = Vec::with_capacity(arg_values.len() + 1);
-    let mut provided_arg_borrowed = Vec::with_capacity(arg_borrowed.len() + 1);
-    provided_arg_values.push(allocated);
-    provided_arg_borrowed.push(true);
-    provided_arg_values.extend(arg_values);
-    provided_arg_borrowed.extend(arg_borrowed);
-    let (init_arg_values, init_arg_borrowed) = emit_direct_call_args_from_plan(
-        fb,
-        &specialization.arg_plan,
-        provided_arg_values,
-        provided_arg_borrowed,
-        ptr_ty,
-    );
-    let init_callable =
-        emit_callable_ptr_value_for_ref(fb, codegen_env, ctx, &specialization.init_function_ref)
-            .unwrap_or_else(|err| panic!("failed to bind constructor callable symbol: {err}"))
-            .expect("constructor callable symbol should be available");
-    let init_result = emit_direct_call_resolved_raw_with_arg_values(
-        fb,
-        init_callable,
-        true,
-        init_arg_values,
-        init_arg_borrowed,
-        if specialization.arg_plan.requires_default_resolving_entry() {
-            DirectCallEntryKind::DefaultResolving
-        } else {
-            DirectCallEntryKind::Core
-        },
-        target_function,
-        ctx,
-        codegen_env,
-    );
-    let init_failed = fb
-        .ins()
-        .icmp(ir::condcodes::IntCC::Equal, init_result, null_ptr);
-    let init_fail_block = fb.create_block();
-    let init_ok_block = fb.create_block();
-    fb.append_block_param(init_ok_block, ptr_ty);
-    fb.ins().brif(
-        init_failed,
-        init_fail_block,
-        &[],
-        init_ok_block,
-        &[ir::BlockArg::Value(init_result)],
-    );
-
-    fb.switch_to_block(init_fail_block);
-    emit_release_owned_inputs(fb, ctx, &[allocated]);
-    fb.ins()
-        .jump(ctx.consts.step_null_block, &step_null_block_args(ctx));
-
-    fb.switch_to_block(init_ok_block);
-    let init_result = fb.block_params(init_ok_block)[0];
-    let finish_inst = fb
-        .ins()
-        .call(ctx.finish_constructor_init_ref, &[allocated, init_result]);
-    let result = fb.inst_results(finish_inst)[0];
-    let result_is_null = fb.ins().icmp(ir::condcodes::IntCC::Equal, result, null_ptr);
-    let result_ok_block = fb.create_block();
-    fb.append_block_param(result_ok_block, ptr_ty);
-    fb.ins().brif(
-        result_is_null,
-        ctx.consts.step_null_block,
-        &step_null_block_args(ctx),
-        result_ok_block,
-        &[ir::BlockArg::Value(result)],
-    );
-    fb.switch_to_block(result_ok_block);
-    fb.block_params(result_ok_block)[0]
-}
-
 fn emit_direct_call_args_from_plan(
     fb: &mut FunctionBuilder<'_>,
     arg_plan: &DirectCallArgPlan,
@@ -6347,87 +6220,6 @@ fn emit_typed_direct_call_resolved_with_arg_plan_from_local_env(
         } else {
             DirectCallEntryKind::Core
         },
-        target_function,
-        ctx,
-        codegen_env,
-    ))
-}
-
-fn emit_direct_constructor_resolved_with_args_from_local_env(
-    fb: &mut FunctionBuilder<'_>,
-    callable: ir::Value,
-    callable_is_borrowed: bool,
-    args: &[&InstrCodegen],
-    specialization: &DirectConstructorSpecialization,
-    target_function: &BlockPyFunction<impl ModuleShape>,
-    local_env: &mut LocalEnv,
-    ctx: &JitEmitCtx<'_>,
-    codegen_env: &mut impl JitCodegenEnv,
-    func_imports: &mut FuncBuildImports<'_>,
-) -> ir::Value {
-    let mut arg_values = Vec::with_capacity(args.len());
-    let mut arg_borrowed = Vec::with_capacity(args.len());
-    for arg in args {
-        let borrowed_arg =
-            codegen_expr_pyobject_input_is_borrowed_from_local_env(arg, local_env, ctx);
-        arg_borrowed.push(borrowed_arg);
-        arg_values.push(emit_codegen_expr_with_local_env(
-            fb,
-            arg,
-            local_env,
-            ctx,
-            borrowed_arg,
-            codegen_env,
-            func_imports,
-        ));
-    }
-    emit_direct_constructor_resolved_with_arg_values(
-        fb,
-        callable,
-        callable_is_borrowed,
-        arg_values,
-        arg_borrowed,
-        specialization,
-        target_function,
-        ctx,
-        codegen_env,
-    )
-}
-
-fn emit_typed_direct_constructor_resolved_with_args_from_local_env(
-    fb: &mut FunctionBuilder<'_>,
-    callable: ir::Value,
-    callable_is_borrowed: bool,
-    args: &[&InstrTyped],
-    specialization: &DirectConstructorSpecialization,
-    target_function: &BlockPyFunction<impl ModuleShape>,
-    local_env: &mut LocalEnv,
-    ctx: &JitEmitCtx<'_>,
-    codegen_env: &mut impl JitCodegenEnv,
-    func_imports: &mut FuncBuildImports<'_>,
-) -> Result<ir::Value, String> {
-    let mut arg_values = Vec::with_capacity(args.len());
-    let mut arg_borrowed = Vec::with_capacity(args.len());
-    for arg in args {
-        let (value, borrowed) = emit_typed_pyobject_input_with_local_env(
-            fb,
-            arg,
-            local_env,
-            ctx,
-            codegen_env,
-            func_imports,
-            "typed direct-constructor arg",
-        )?;
-        arg_values.push(value);
-        arg_borrowed.push(borrowed);
-    }
-    Ok(emit_direct_constructor_resolved_with_arg_values(
-        fb,
-        callable,
-        callable_is_borrowed,
-        arg_values,
-        arg_borrowed,
-        specialization,
         target_function,
         ctx,
         codegen_env,
@@ -8817,61 +8609,53 @@ fn emit_codegen_simple_call_with_local_env(
                 return Some(fb.block_params(result_block)[0]);
             }
         }
-        let (constructor_specializations, direct_specializations) = match typed_access {
-            Some(TypedCallAccessPlan::GuardedCallable {
-                function_guards,
-                constructor_guards,
-            }) => (
-                direct_constructor_specializations_from_typed_guards(constructor_guards),
-                direct_function_specializations_from_typed_guards(function_guards),
-            ),
-            Some(_) => (Vec::new(), Vec::new()),
-            _ => {
-                let constructor_specializations = Vec::new();
-                let direct_specializations = call_site_profiled_targets(call, profiled_targets)
-                    .map(|targets| {
-                        targets
-                            .iter()
-                            .copied()
-                            .filter_map(|function_id| {
-                                let Some(target_function) =
-                                    direct_call_target_function(emit_ctx, function_id)
-                                else {
-                                    emit_ctx
-                                        .direct_edge_stats
-                                        .record_profiled_missing_target_candidate();
-                                    return None;
-                                };
-                                if target_function.names.fn_name == "__init__" {
+        let direct_specializations = match typed_access {
+            Some(TypedCallAccessPlan::GuardedCallable { function_guards }) => {
+                direct_function_specializations_from_typed_guards(function_guards)
+            }
+            Some(_) => Vec::new(),
+            _ => call_site_profiled_targets(call, profiled_targets)
+                .map(|targets| {
+                    targets
+                        .iter()
+                        .copied()
+                        .filter_map(|function_id| {
+                            let Some(target_function) =
+                                direct_call_target_function(emit_ctx, function_id)
+                            else {
+                                emit_ctx
+                                    .direct_edge_stats
+                                    .record_profiled_missing_target_candidate();
+                                return None;
+                            };
+                            if target_function.names.fn_name == "__init__" {
+                                return None;
+                            }
+                            let arg_plan = match validate_direct_call_compatibility(
+                                target_function,
+                                emit_ctx.direct_call_functions,
+                                simple_args.len(),
+                                0,
+                                false,
+                                false,
+                            ) {
+                                Ok(arg_plan) => arg_plan,
+                                Err(incompatibility) => {
+                                    record_profiled_direct_call_incompatibility(
+                                        emit_ctx.direct_edge_stats,
+                                        incompatibility,
+                                    );
                                     return None;
                                 }
-                                let arg_plan = match validate_direct_call_compatibility(
-                                    target_function,
-                                    emit_ctx.direct_call_functions,
-                                    simple_args.len(),
-                                    0,
-                                    false,
-                                    false,
-                                ) {
-                                    Ok(arg_plan) => arg_plan,
-                                    Err(incompatibility) => {
-                                        record_profiled_direct_call_incompatibility(
-                                            emit_ctx.direct_edge_stats,
-                                            incompatibility,
-                                        );
-                                        return None;
-                                    }
-                                };
-                                Some(DirectFunctionSpecialization {
-                                    function_id,
-                                    arg_plan,
-                                })
+                            };
+                            Some(DirectFunctionSpecialization {
+                                function_id,
+                                arg_plan,
                             })
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                (constructor_specializations, direct_specializations)
-            }
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
         };
         let direct_method_specializations = match typed_access {
             Some(TypedCallAccessPlan::GuardedMethod {
@@ -9104,23 +8888,20 @@ fn emit_codegen_simple_call_with_local_env(
             codegen_env,
             func_imports,
         );
-        let should_emit_callee_id = call_target_counter.is_some()
-            || !constructor_specializations.is_empty()
-            || !direct_specializations.is_empty();
+        let should_emit_callee_id =
+            call_target_counter.is_some() || !direct_specializations.is_empty();
         let callee_id = should_emit_callee_id
             .then(|| emit_callee_function_id_checked(fb, callable, emit_ctx, codegen_env));
         if let Some(counter_id) = call_target_counter {
             let callee_id = callee_id.expect("callee id should exist for call target counter");
             emit_record_call_target_sample(fb, counter_id, callee_id, emit_ctx);
         }
-        if !constructor_specializations.is_empty() || !direct_specializations.is_empty() {
+        if !direct_specializations.is_empty() {
             let result_block = fb.create_block();
             fb.append_block_param(result_block, ptr_ty);
             let generic_block = fb.create_block();
             fb.set_cold_block(generic_block);
-            let direct_guard_miss_dispatch = if !constructor_specializations.is_empty() {
-                JitGuardMissDispatch::FallbackBlock(generic_block)
-            } else if let Some(site_instr_id) = site_instr_id {
+            let direct_guard_miss_dispatch = if let Some(site_instr_id) = site_instr_id {
                 let guard_miss_resume_point =
                     emit_ctx
                         .guard_miss_resume_point
@@ -9139,87 +8920,7 @@ fn emit_codegen_simple_call_with_local_env(
             } else {
                 JitGuardMissDispatch::FallbackBlock(generic_block)
             };
-            let mut direct_chain_start = None;
-            if !constructor_specializations.is_empty() {
-                let mut next_miss_block = fb.create_block();
-                for (index, specialization) in constructor_specializations.iter().enumerate() {
-                    let Some(expected_type) = emit_type_ptr_value_for_ref(
-                        fb,
-                        codegen_env,
-                        emit_ctx,
-                        &specialization.owner_type_ref,
-                    )
-                    .unwrap_or_else(|err| {
-                        panic!("failed to bind constructor type symbol: {err}");
-                    }) else {
-                        continue;
-                    };
-                    let type_match_block = fb.create_block();
-                    let direct_block = fb.create_block();
-                    let miss_block = if index + 1 == constructor_specializations.len() {
-                        if direct_specializations.is_empty() {
-                            generic_block
-                        } else {
-                            fb.create_block()
-                        }
-                    } else {
-                        fb.create_block()
-                    };
-                    let is_exact_type =
-                        fb.ins()
-                            .icmp(ir::condcodes::IntCC::Equal, callable, expected_type);
-                    fb.ins()
-                        .brif(is_exact_type, type_match_block, &[], miss_block, &[]);
-
-                    fb.switch_to_block(type_match_block);
-                    let type_version = fb.ins().load(
-                        ir::types::I32,
-                        ir::MemFlags::trusted(),
-                        callable,
-                        offset_of!(ffi::PyTypeObject, tp_version_tag) as i32,
-                    );
-                    let version_matches = fb.ins().icmp_imm(
-                        ir::condcodes::IntCC::Equal,
-                        type_version,
-                        specialization.type_version as i64,
-                    );
-                    fb.ins()
-                        .brif(version_matches, direct_block, &[], miss_block, &[]);
-
-                    fb.switch_to_block(direct_block);
-                    let target_function =
-                        direct_call_target_function(emit_ctx, specialization.function_id)
-                            .expect("direct constructor specialization target should exist");
-                    if let Some(counter_id) = direct_hit_counter_id {
-                        emit_increment_counter_ref(fb, counter_id, emit_ctx);
-                    }
-                    let direct_result = emit_direct_constructor_resolved_with_args_from_local_env(
-                        fb,
-                        callable,
-                        callable_is_borrowed,
-                        simple_args.as_slice(),
-                        specialization,
-                        target_function,
-                        local_env,
-                        emit_ctx,
-                        codegen_env,
-                        func_imports,
-                    );
-                    fb.ins()
-                        .jump(result_block, &[ir::BlockArg::Value(direct_result)]);
-                    if index + 1 != constructor_specializations.len() {
-                        fb.switch_to_block(miss_block);
-                    } else {
-                        next_miss_block = miss_block;
-                    }
-                }
-                direct_chain_start = Some(next_miss_block);
-            }
-
-            if !direct_specializations.is_empty() {
-                if let Some(start_block) = direct_chain_start {
-                    fb.switch_to_block(start_block);
-                }
+            {
                 let callee_id = callee_id.expect("callee id should exist for direct call guards");
                 let callable_type = fb.ins().load(
                     ptr_ty,
@@ -11208,19 +10909,15 @@ fn emit_typed_codegen_direct_callable_specialization_result_with_local_env(
     debug_assert_eq!(simple_args.len(), arg_refs.len());
 
     let site_instr_id = call.try_semantic_instr_id();
-    let (constructor_specializations, direct_specializations) = match &call.access {
-        TypedCallAccessPlan::GuardedCallable {
-            function_guards,
-            constructor_guards,
-        } => (
-            direct_constructor_specializations_from_typed_guards(constructor_guards),
-            direct_function_specializations_from_typed_guards(function_guards),
-        ),
-        TypedCallAccessPlan::Generic => (Vec::new(), Vec::new()),
+    let direct_specializations = match &call.access {
+        TypedCallAccessPlan::GuardedCallable { function_guards } => {
+            direct_function_specializations_from_typed_guards(function_guards)
+        }
+        TypedCallAccessPlan::Generic => Vec::new(),
         TypedCallAccessPlan::GuardedMethod { .. }
         | TypedCallAccessPlan::GuardedRuntimeProtocolMethod { .. } => return Ok(None),
     };
-    if constructor_specializations.is_empty() && direct_specializations.is_empty() {
+    if direct_specializations.is_empty() {
         return Ok(None);
     }
 
@@ -11229,7 +10926,6 @@ fn emit_typed_codegen_direct_callable_specialization_result_with_local_env(
         call.func.as_ref(),
         arg_refs.as_slice(),
         site_instr_id,
-        constructor_specializations.as_slice(),
         direct_specializations.as_slice(),
         local_env,
         emit_ctx,
@@ -11245,7 +10941,6 @@ fn emit_typed_prepared_direct_callable_specialization_result_with_local_env(
     func: &InstrTyped,
     arg_refs: &[&InstrTyped],
     site_instr_id: Option<InstrId>,
-    constructor_specializations: &[DirectConstructorSpecialization],
     direct_specializations: &[DirectFunctionSpecialization],
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
@@ -11253,7 +10948,7 @@ fn emit_typed_prepared_direct_callable_specialization_result_with_local_env(
     codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<Option<EmitResult>, String> {
-    if constructor_specializations.is_empty() && direct_specializations.is_empty() {
+    if direct_specializations.is_empty() {
         return Ok(None);
     }
 
@@ -11280,9 +10975,7 @@ fn emit_typed_prepared_direct_callable_specialization_result_with_local_env(
         func_imports,
         "typed direct-call callable",
     )?;
-    let should_emit_callee_id = call_target_counter.is_some()
-        || !constructor_specializations.is_empty()
-        || !direct_specializations.is_empty();
+    let should_emit_callee_id = call_target_counter.is_some() || !direct_specializations.is_empty();
     let callee_id = should_emit_callee_id
         .then(|| emit_callee_function_id_checked(fb, callable, emit_ctx, codegen_env));
     if let Some(counter_id) = call_target_counter {
@@ -11295,100 +10988,13 @@ fn emit_typed_prepared_direct_callable_specialization_result_with_local_env(
     fb.append_block_param(result_block, ptr_ty);
     let generic_block = fb.create_block();
     fb.set_cold_block(generic_block);
-    let direct_guard_miss_dispatch = if !constructor_specializations.is_empty() {
-        JitGuardMissDispatch::FallbackBlock(generic_block)
-    } else if let Some(site_instr_id) = site_instr_id {
+    let direct_guard_miss_dispatch = if let Some(site_instr_id) = site_instr_id {
         prepare_typed_guard_miss_dispatch_for_instr(emit_ctx, site_instr_id, &[func], generic_block)
     } else {
         JitGuardMissDispatch::FallbackBlock(generic_block)
     };
 
-    let mut direct_chain_start = None;
-    if !constructor_specializations.is_empty() {
-        let mut next_miss_block = fb.create_block();
-        for (index, specialization) in constructor_specializations.iter().enumerate() {
-            let Some(expected_type) = emit_type_ptr_value_for_ref(
-                fb,
-                codegen_env,
-                emit_ctx,
-                &specialization.owner_type_ref,
-            )
-            .unwrap_or_else(|err| {
-                panic!("failed to bind constructor type symbol: {err}");
-            }) else {
-                continue;
-            };
-            let type_match_block = fb.create_block();
-            let direct_block = fb.create_block();
-            let miss_block = if index + 1 == constructor_specializations.len() {
-                if direct_specializations.is_empty() {
-                    generic_block
-                } else {
-                    fb.create_block()
-                }
-            } else {
-                fb.create_block()
-            };
-            let is_exact_type = fb
-                .ins()
-                .icmp(ir::condcodes::IntCC::Equal, callable, expected_type);
-            fb.ins()
-                .brif(is_exact_type, type_match_block, &[], miss_block, &[]);
-
-            fb.switch_to_block(type_match_block);
-            let type_version = fb.ins().load(
-                ir::types::I32,
-                ir::MemFlags::trusted(),
-                callable,
-                offset_of!(ffi::PyTypeObject, tp_version_tag) as i32,
-            );
-            let version_matches = fb.ins().icmp_imm(
-                ir::condcodes::IntCC::Equal,
-                type_version,
-                specialization.type_version as i64,
-            );
-            fb.ins()
-                .brif(version_matches, direct_block, &[], miss_block, &[]);
-
-            fb.switch_to_block(direct_block);
-            let target_function = direct_call_target_function(emit_ctx, specialization.function_id)
-                .expect("direct constructor specialization target should exist");
-            emit_record_direct_call_target_sample(
-                fb,
-                site_instr_id,
-                specialization.function_id,
-                emit_ctx,
-            );
-            if let Some(counter_id) = direct_hit_counter_id {
-                emit_increment_counter_ref(fb, counter_id, emit_ctx);
-            }
-            let direct_result = emit_typed_direct_constructor_resolved_with_args_from_local_env(
-                fb,
-                callable,
-                callable_is_borrowed,
-                arg_refs,
-                specialization,
-                target_function,
-                local_env,
-                emit_ctx,
-                codegen_env,
-                func_imports,
-            )?;
-            fb.ins()
-                .jump(result_block, &[ir::BlockArg::Value(direct_result)]);
-            if index + 1 != constructor_specializations.len() {
-                fb.switch_to_block(miss_block);
-            } else {
-                next_miss_block = miss_block;
-            }
-        }
-        direct_chain_start = Some(next_miss_block);
-    }
-
-    if !direct_specializations.is_empty() {
-        if let Some(start_block) = direct_chain_start {
-            fb.switch_to_block(start_block);
-        }
+    {
         let callee_id = callee_id.expect("callee id should exist for direct call guards");
         let callable_type = fb.ins().load(
             ptr_ty,
@@ -11581,11 +11187,9 @@ fn emit_typed_codegen_guarded_callable_call_result_with_local_env(
         call.keywords.as_slice(),
         "typed guarded callable call",
     )?;
-    let constructor_specializations =
-        direct_constructor_specializations_from_typed_guards(call.constructor_guards.as_slice());
     let direct_specializations =
         direct_function_specializations_from_typed_guards(call.function_guards.as_slice());
-    if constructor_specializations.is_empty() && direct_specializations.is_empty() {
+    if direct_specializations.is_empty() {
         let result = emit_typed_generic_positional_call_result_with_local_env(
             fb,
             call.func.as_ref(),
@@ -11605,7 +11209,6 @@ fn emit_typed_codegen_guarded_callable_call_result_with_local_env(
         call.func.as_ref(),
         arg_refs.as_slice(),
         call.try_semantic_instr_id(),
-        constructor_specializations.as_slice(),
         direct_specializations.as_slice(),
         local_env,
         emit_ctx,
@@ -11881,67 +11484,33 @@ fn emit_typed_codegen_direct_callable_call_result_with_local_env(
         };
         arg_refs.push(arg);
     }
-    let result = match &call.guard {
-        TypedDirectCallableCallGuard::Function(guard) => {
-            let target_function = direct_call_target_function(emit_ctx, guard.function_id)
-                .ok_or_else(|| {
-                    format!(
-                        "typed direct callable call target {:?} is unavailable",
-                        guard.function_id
-                    )
-                })?;
-            emit_record_direct_call_target_sample(
-                fb,
-                call.try_semantic_instr_id(),
-                guard.function_id,
-                emit_ctx,
-            );
-            let arg_plan = direct_call_arg_plan_from_typed(&guard.arg_plan);
-            emit_typed_direct_call_resolved_with_arg_plan_from_local_env(
-                fb,
-                callable,
-                callable_is_borrowed,
-                arg_refs.as_slice(),
-                &arg_plan,
-                target_function,
-                local_env,
-                emit_ctx,
-                codegen_env,
-                func_imports,
-            )?
-        }
-        TypedDirectCallableCallGuard::Constructor(guard) => {
-            let specialization = direct_constructor_specialization_from_typed_guard(guard)
-                .ok_or_else(|| {
-                    "typed direct constructor call has invalid owner type ref".to_string()
-                })?;
-            let target_function = direct_call_target_function(emit_ctx, specialization.function_id)
-                .ok_or_else(|| {
-                    format!(
-                        "typed direct constructor call target {:?} is unavailable",
-                        specialization.function_id
-                    )
-                })?;
-            emit_record_direct_call_target_sample(
-                fb,
-                call.try_semantic_instr_id(),
-                specialization.function_id,
-                emit_ctx,
-            );
-            emit_typed_direct_constructor_resolved_with_args_from_local_env(
-                fb,
-                callable,
-                callable_is_borrowed,
-                arg_refs.as_slice(),
-                &specialization,
-                target_function,
-                local_env,
-                emit_ctx,
-                codegen_env,
-                func_imports,
-            )?
-        }
-    };
+    let TypedDirectCallableCallGuard::Function(guard) = &call.guard;
+    let target_function =
+        direct_call_target_function(emit_ctx, guard.function_id).ok_or_else(|| {
+            format!(
+                "typed direct callable call target {:?} is unavailable",
+                guard.function_id
+            )
+        })?;
+    emit_record_direct_call_target_sample(
+        fb,
+        call.try_semantic_instr_id(),
+        guard.function_id,
+        emit_ctx,
+    );
+    let arg_plan = direct_call_arg_plan_from_typed(&guard.arg_plan);
+    let result = emit_typed_direct_call_resolved_with_arg_plan_from_local_env(
+        fb,
+        callable,
+        callable_is_borrowed,
+        arg_refs.as_slice(),
+        &arg_plan,
+        target_function,
+        local_env,
+        emit_ctx,
+        codegen_env,
+        func_imports,
+    )?;
     Ok(emit_owned_pyobject_result_for_demand(
         fb,
         result,
@@ -16080,16 +15649,6 @@ fn build_cranelift_run_bb_specialized_function(
             &mut fb.func,
             &DP_JIT_DIRECT_COMPILE_FUNCTION_ENV_IMPORT,
         );
-        let pytype_generic_alloc_ref = func_imports.get_or_panic(
-            codegen_env,
-            &mut fb.func,
-            &DP_JIT_PYTYPE_GENERIC_ALLOC_IMPORT,
-        );
-        let finish_constructor_init_ref = func_imports.get_or_panic(
-            codegen_env,
-            &mut fb.func,
-            &DP_JIT_FINISH_CONSTRUCTOR_INIT_IMPORT,
-        );
         let load_global_fast_ref =
             func_imports.get_or_panic(codegen_env, &mut fb.func, &SOAC_RUNTIME_LOAD_GLOBAL_IMPORT);
         let probe_global_indexed_ref = func_imports.get_or_panic(
@@ -16391,8 +15950,6 @@ fn build_cranelift_run_bb_specialized_function(
                 decref_ref,
                 py_call_positional_three_ref,
                 py_vectorcall_ref,
-                pytype_generic_alloc_ref,
-                finish_constructor_init_ref,
                 consts: JitEmitConsts {
                     step_null_block: fast_step_null_block,
                     step_null_args: fast_step_null_args,

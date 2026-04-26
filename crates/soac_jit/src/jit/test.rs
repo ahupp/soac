@@ -4229,7 +4229,6 @@ def build(values):
                     sources: vec![soac_ir_typed::TypedDirectCallArgSource::Provided(0)],
                 },
             }],
-            constructor_guards: Vec::new(),
         };
 
         assert_eq!(

@@ -12,8 +12,8 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_module::FuncId;
 use soac_core::block_py::{BlockPyFunction, ModuleShape, ParamKind, RuntimeFunctionId};
 use soac_ir_typed::{
-    InstrTyped, TypedDirectCallArgPlan, TypedDirectCallArgSource, TypedDirectConstructorCallGuard,
-    TypedDirectFunctionCallGuard, TypedDirectMethodCall, TypedDirectMethodCallGuard,
+    InstrTyped, TypedDirectCallArgPlan, TypedDirectCallArgSource, TypedDirectFunctionCallGuard,
+    TypedDirectMethodCall, TypedDirectMethodCallGuard,
 };
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -52,15 +52,6 @@ pub(super) struct DirectMethodSpecialization {
 }
 
 #[derive(Clone)]
-pub(super) struct DirectConstructorSpecialization {
-    pub(super) function_id: RuntimeFunctionId,
-    pub(super) init_function_ref: RelocCallableRef,
-    pub(super) owner_type_ref: RelocTypeRef,
-    pub(super) type_version: u32,
-    pub(super) arg_plan: DirectCallArgPlan,
-}
-
-#[derive(Clone)]
 pub(super) struct DirectFunctionSpecialization {
     pub(super) function_id: RuntimeFunctionId,
     pub(super) arg_plan: DirectCallArgPlan,
@@ -89,31 +80,6 @@ pub(super) fn direct_function_specializations_from_typed_guards(
             arg_plan: direct_call_arg_plan_from_typed(&guard.arg_plan),
         })
         .collect()
-}
-
-pub(super) fn direct_constructor_specializations_from_typed_guards(
-    guards: &[TypedDirectConstructorCallGuard],
-) -> Vec<DirectConstructorSpecialization> {
-    guards
-        .iter()
-        .filter_map(direct_constructor_specialization_from_typed_guard)
-        .collect()
-}
-
-pub(super) fn direct_constructor_specialization_from_typed_guard(
-    guard: &TypedDirectConstructorCallGuard,
-) -> Option<DirectConstructorSpecialization> {
-    let owner_type_ref = reloc_type_ref_from_typed_attr_owner_ref(&guard.owner_type_ref)?;
-    Some(DirectConstructorSpecialization {
-        function_id: guard.function_id,
-        init_function_ref: RelocCallableRef::OwnerAttr {
-            owner_type_ref: owner_type_ref.clone(),
-            attr_name: "__init__".to_string(),
-        },
-        owner_type_ref,
-        type_version: guard.type_version,
-        arg_plan: direct_call_arg_plan_from_typed(&guard.arg_plan),
-    })
 }
 
 pub(super) fn direct_method_specializations_from_typed_guards(

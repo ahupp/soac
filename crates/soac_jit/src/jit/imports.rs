@@ -31,8 +31,7 @@ use soac_core::block_py::{BlockPyFunction, ChildVisitable, Visit};
 use soac_ir_typed::plan_v3::DirectCallCallee;
 #[cfg(test)]
 use soac_ir_typed::{
-    InstrTyped, TypedCodegenModuleShape, TypedDirectCallableCallGuard,
-    TypedDirectConstructorCallGuard, TypedDirectMethodCallGuard,
+    InstrTyped, TypedCodegenModuleShape, TypedDirectCallableCallGuard, TypedDirectMethodCallGuard,
 };
 use soac_opt::access_emission_v3::{
     indexed_field_layout_groups as opt_v3_indexed_field_layout_groups,
@@ -241,16 +240,6 @@ pub(super) static DP_JIT_PY_CALL_WITH_KW_IMPORT: ImportSpec = ImportSpec::new(
     &[SigType::Pointer, SigType::Pointer, SigType::Pointer],
     &[SigType::Pointer],
 );
-pub(super) static DP_JIT_PYTYPE_GENERIC_ALLOC_IMPORT: ImportSpec = ImportSpec::new(
-    "dp_jit_pytype_generic_alloc",
-    &[SigType::Pointer, SigType::I64],
-    &[SigType::Pointer],
-);
-pub(super) static DP_JIT_FINISH_CONSTRUCTOR_INIT_IMPORT: ImportSpec = ImportSpec::new(
-    "dp_jit_finish_constructor_init",
-    &[SigType::Pointer, SigType::Pointer],
-    &[SigType::Pointer],
-);
 static DP_JIT_LOAD_RUNTIME_OBJ_IMPORT: ImportSpec = ImportSpec::new(
     "dp_jit_load_runtime_obj",
     &[SigType::Pointer],
@@ -439,8 +428,6 @@ static JIT_RUNTIME_IMPORT_SPECS: &[&ImportSpec] = &[
     &DP_JIT_ENTER_RECURSIVE_CALL_IMPORT,
     &PY_THREAD_STATE_GET_UNCHECKED_IMPORT,
     &DP_JIT_PY_CALL_WITH_KW_IMPORT,
-    &DP_JIT_PYTYPE_GENERIC_ALLOC_IMPORT,
-    &DP_JIT_FINISH_CONSTRUCTOR_INIT_IMPORT,
     &DP_JIT_LOAD_RUNTIME_OBJ_IMPORT,
     &DP_JIT_LOAD_RUNTIME_OBJ_BY_ID_IMPORT,
     &DP_JIT_PYOBJECT_GETATTR_IMPORT,
@@ -604,26 +591,6 @@ pub(super) fn predeclare_specialization_type_imports(
             for plan in plans {
                 match &plan.callee {
                     DirectCallCallee::Function => {}
-                    DirectCallCallee::Constructor => {
-                        let owners =
-                            unsafe { crate::lookup_exact_owner_types_for_constructor(plan.target) }
-                                .map_err(|_| {
-                                    format!(
-                                        "failed to resolve owner types for constructor {}",
-                                        plan.target
-                                    )
-                                })?;
-                        for owner in owners {
-                            let Some(owner_type_ref) = reloc_type_ref_for_type(owner.owner_type)?
-                            else {
-                                continue;
-                            };
-                            callable_refs.insert(RelocCallableRef::OwnerAttr {
-                                owner_type_ref,
-                                attr_name: "__init__".to_string(),
-                            });
-                        }
-                    }
                     DirectCallCallee::Method { method_name } => {
                         let owners = unsafe {
                             crate::lookup_exact_owner_types_for_method(plan.target, method_name)
@@ -666,25 +633,6 @@ pub(super) fn predeclare_typed_direct_call_imports(
     }
 
     impl ImportCollector<'_> {
-        fn predeclare_constructor_guard(
-            &mut self,
-            guard: &TypedDirectConstructorCallGuard,
-        ) -> Result<(), String> {
-            let Some(owner_type_ref) =
-                reloc_type_ref_from_typed_attr_owner_ref(&guard.owner_type_ref)
-            else {
-                return Ok(());
-            };
-            predeclare_reloc_type_ref_import(self.jit_module, &owner_type_ref)?;
-            predeclare_reloc_callable_ref_import(
-                self.jit_module,
-                &RelocCallableRef::OwnerAttr {
-                    owner_type_ref,
-                    attr_name: "__init__".to_string(),
-                },
-            )
-        }
-
         fn predeclare_method_guard(
             &mut self,
             method_name: &str,
@@ -712,15 +660,7 @@ pub(super) fn predeclare_typed_direct_call_imports(
                 return;
             }
             let result = match expr {
-                InstrTyped::GuardedCallableCallTyped(call) => {
-                    for guard in &call.constructor_guards {
-                        if let Err(error) = self.predeclare_constructor_guard(guard) {
-                            self.error = Some(error);
-                            return;
-                        }
-                    }
-                    Ok(())
-                }
+                InstrTyped::GuardedCallableCallTyped(_) => Ok(()),
                 InstrTyped::GuardedMethodCallTyped(call) => {
                     for guard in &call.method_guards {
                         if let Err(error) =
@@ -734,9 +674,6 @@ pub(super) fn predeclare_typed_direct_call_imports(
                 }
                 InstrTyped::DirectCallableCallTyped(call) => match &call.guard {
                     TypedDirectCallableCallGuard::Function(_) => Ok(()),
-                    TypedDirectCallableCallGuard::Constructor(guard) => {
-                        self.predeclare_constructor_guard(guard)
-                    }
                 },
                 InstrTyped::DirectMethodCallTyped(call) => {
                     self.predeclare_method_guard(call.method_name.as_str(), &call.guard)

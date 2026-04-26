@@ -56,7 +56,6 @@ pub struct DirectCallSpecializationPlan {
 pub enum DirectCallCallee {
     Function,
     Method { method_name: String },
-    Constructor,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -910,14 +909,6 @@ fn validate_direct_call_plans(
                     ));
                 }
             }
-            DirectCallCallee::Constructor => {
-                if direct_call.body.kind == CallBodyKind::Inline {
-                    errors.push(format!(
-                        "function {} constructor direct-call target {} at {} cannot use inline call body",
-                        function.function.function, direct_call.target, direct_call.source
-                    ));
-                }
-            }
         }
         validate_call_body_plan(
             function,
@@ -1131,12 +1122,10 @@ fn validate_call_body_plan(
             ));
         }
         (CallBodyKind::Inline, Some(inline_target)) => {
-            if kind != "constructor-call" {
-                errors.push(format!(
-                    "function {} {kind} target {} at {} has unexpected explicit inline target {}",
-                    function.function.function, target, source, inline_target
-                ));
-            }
+            errors.push(format!(
+                "function {} {kind} target {} at {} has unexpected explicit inline target {}",
+                function.function.function, target, source, inline_target
+            ));
             if identity_tables.module(inline_target.module_id()).is_err() {
                 errors.push(format!(
                     "function {} {kind} target {} at {} has inline target {} referencing missing module id {}",
@@ -1148,14 +1137,7 @@ fn validate_call_body_plan(
                 ));
             }
         }
-        (CallBodyKind::Inline, None) => {
-            if kind == "constructor-call" {
-                errors.push(format!(
-                    "function {} constructor-call target {} at {} has inline call-body plan without runtime-iter inline target",
-                    function.function.function, target, source
-                ));
-            }
-        }
+        (CallBodyKind::Inline, None) => {}
         (CallBodyKind::DirectCall, None) => {}
     }
 }
