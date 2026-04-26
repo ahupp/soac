@@ -1934,7 +1934,7 @@ impl LocalEnv {
                     fb, name, value, ctx, borrowed,
                 ));
             }
-            if !borrowed {
+            if local_ref_kind_needs_incref_for_load(entry.ref_kind, borrowed) {
                 fb.ins().call(ctx.incref_ref, &[value]);
             }
             return Some(value);
@@ -1959,7 +1959,7 @@ impl LocalEnv {
                     fb, name, value, ctx, borrowed,
                 ));
             }
-            if !borrowed {
+            if local_ref_kind_needs_incref_for_load(entry.ref_kind, borrowed) {
                 fb.ins().call(ctx.incref_ref, &[value]);
             }
             return Some(value);
@@ -2002,13 +2002,16 @@ impl LocalEnv {
                     fb,
                     name,
                     value,
+                    value_ref_kind,
                     ptr_ty,
                     thread_state_value,
                     incref_ref,
                     decref_ref,
                 )
                 .expect("slot-backed local missing from stack slots");
-            fb.ins().call(decref_ref, &[thread_state_value, value]);
+            if local_ref_kind_needs_refcount_call(value_ref_kind) {
+                emit_decref_if_not_null(fb, ptr_ty, decref_ref, thread_state_value, value);
+            }
             self.entries.push(LocalEnvEntry {
                 location: Some(
                     previous_entry
@@ -2250,19 +2253,22 @@ fn bind_planned_local_env_at_block_entry(
                             fb,
                             binding.name.as_str(),
                             param_value,
+                            entry.entry_ref_kind,
                             ptr_ty,
                             thread_state_value,
                             incref_ref,
                             decref_ref,
                         )
                         .expect("runtime block param missing from stack slots");
-                    emit_decref_if_not_null(
-                        fb,
-                        ptr_ty,
-                        decref_ref,
-                        thread_state_value,
-                        param_value,
-                    );
+                    if local_ref_kind_needs_refcount_call(entry.entry_ref_kind) {
+                        emit_decref_if_not_null(
+                            fb,
+                            ptr_ty,
+                            decref_ref,
+                            thread_state_value,
+                            param_value,
+                        );
+                    }
                 }
             }
             PlannedLocalEnvEntrySource::StackSlotLoad => {
@@ -2303,6 +2309,14 @@ fn transient_local_needs_decref(ref_kind: LocalRefKind) -> bool {
         LocalRefKind::Owned | LocalRefKind::Unknown => true,
         LocalRefKind::Borrowed | LocalRefKind::Immortal | LocalRefKind::Unbound => false,
     }
+}
+
+fn local_ref_kind_needs_incref_for_load(ref_kind: LocalRefKind, borrowed: bool) -> bool {
+    !borrowed && local_ref_kind_needs_refcount_call(ref_kind)
+}
+
+fn local_ref_kind_needs_refcount_call(ref_kind: LocalRefKind) -> bool {
+    !matches!(ref_kind, LocalRefKind::Immortal)
 }
 
 fn local_ref_kind_needs_incref_for_forward(ref_kind: LocalRefKind, forwarded_count: usize) -> bool {
@@ -3151,6 +3165,7 @@ impl StackSlots {
         fb: &mut FunctionBuilder<'_>,
         name: &str,
         value: ir::Value,
+        value_ref_kind: LocalRefKind,
         ptr_ty: ir::Type,
         thread_state_value: ir::Value,
         incref_ref: ir::FuncRef,
@@ -3158,7 +3173,9 @@ impl StackSlots {
     ) -> Option<()> {
         let slot = self.slot_for_name(name)?;
         let previous = fb.ins().stack_load(ptr_ty, slot, 0);
-        emit_incref_if_not_null(fb, ptr_ty, incref_ref, value);
+        if local_ref_kind_needs_refcount_call(value_ref_kind) {
+            emit_incref_if_not_null(fb, ptr_ty, incref_ref, value);
+        }
         fb.ins().stack_store(value, slot, 0);
         emit_decref_if_not_null(fb, ptr_ty, decref_ref, thread_state_value, previous);
         Some(())
@@ -6733,17 +6750,18 @@ fn emit_exception_dispatch_slot_writes(
         .map(|(name, value)| (name.as_str(), value))
         .collect::<HashMap<_, _>>();
     for (target_name, source) in slot_writes {
-        let value = match source {
+        let (value, value_ref_kind) = match source {
             BlockArg::Name(source_name) => forwarded_locals_by_name
                 .get(source_name.as_str())
                 .copied()
+                .map(|value| (value, LocalRefKind::Owned))
                 .ok_or_else(|| {
                     format!(
                         "missing forwarded exception dispatch slot source {source_name} for target {target_name}"
                     )
                 })?,
-            BlockArg::CurrentException => dispatch_exc,
-            BlockArg::None => none_const,
+            BlockArg::CurrentException => (dispatch_exc, LocalRefKind::Owned),
+            BlockArg::None => (none_const, LocalRefKind::Immortal),
             BlockArg::AbruptKind(_) => {
                 unreachable!("validated exception edges should not use abrupt-kind args")
             }
@@ -6753,6 +6771,7 @@ fn emit_exception_dispatch_slot_writes(
                 fb,
                 target_name,
                 value,
+                value_ref_kind,
                 ptr_ty,
                 thread_state_value,
                 incref_ref,
@@ -16245,6 +16264,7 @@ fn build_cranelift_run_bb_specialized_function(
                             &mut fb,
                             param.name.as_str(),
                             selected_value,
+                            LocalRefKind::Owned,
                             ptr_ty,
                             thread_state_value,
                             incref_ref,

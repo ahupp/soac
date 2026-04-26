@@ -73,7 +73,8 @@ mod tests {
         apply_profile_typed_plans_to_typed_function, build_counted_runtime_refcount_helper,
         compile_cranelift_run_bb_specialized_cached, declare_direct_function,
         inline_runtime_support_calls, local_binding_facts_for_stored_value,
-        local_ref_kind_needs_incref_for_forward, module_constant_object_symbol,
+        local_ref_kind_needs_incref_for_forward, local_ref_kind_needs_incref_for_load,
+        local_ref_kind_needs_refcount_call, module_constant_object_symbol,
         module_constant_symbol_prefix_for_instance,
         module_constant_symbol_prefix_for_module_identity,
         module_constant_symbol_prefix_for_shared_state, new_jit_module,
@@ -5566,6 +5567,34 @@ def build(values):
             LocalRefKind::Immortal,
             0
         ));
+    }
+
+    #[test]
+    fn local_refcount_helpers_do_not_refcount_immortal_values() {
+        assert!(local_ref_kind_needs_incref_for_load(
+            LocalRefKind::Owned,
+            false
+        ));
+        assert!(local_ref_kind_needs_incref_for_load(
+            LocalRefKind::Borrowed,
+            false
+        ));
+        assert!(local_ref_kind_needs_incref_for_load(
+            LocalRefKind::Unknown,
+            false
+        ));
+        assert!(!local_ref_kind_needs_incref_for_load(
+            LocalRefKind::Immortal,
+            false
+        ));
+        assert!(!local_ref_kind_needs_incref_for_load(
+            LocalRefKind::Owned,
+            true
+        ));
+        assert!(local_ref_kind_needs_refcount_call(LocalRefKind::Owned));
+        assert!(local_ref_kind_needs_refcount_call(LocalRefKind::Borrowed));
+        assert!(local_ref_kind_needs_refcount_call(LocalRefKind::Unknown));
+        assert!(!local_ref_kind_needs_refcount_call(LocalRefKind::Immortal));
     }
 
     #[test]
