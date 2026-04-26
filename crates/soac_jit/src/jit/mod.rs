@@ -12,10 +12,9 @@ use soac_core::block_py as blockpy_intrinsics;
 use soac_core::block_py::{
     AbruptKind, Block, BlockArg, BlockEdge, BlockLabel, BlockParamRole, BlockPyFunction,
     BlockPyModule, BlockTerm, CallArgKeyword, CallArgPositional, CellLocation, ChildVisitable,
-    CounterDef, CounterId, CounterSite, Del, DeoptEntrySource, FunctionExecutionMode, FunctionKind,
-    HasSemanticInstrId, InstrId, InstrKey, InstrLocationMap, LocalLocation, ModuleShape,
-    NameLocation, ResolvedName, RuntimeFunctionId, RuntimeName, StorageLayout, Store, Visit,
-    current_instr_locations,
+    CounterDef, CounterId, Del, FunctionExecutionMode, FunctionKind, HasSemanticInstrId, InstrId,
+    InstrKey, InstrLocationMap, LocalLocation, ModuleShape, NameLocation, ResolvedName,
+    RuntimeFunctionId, RuntimeName, StorageLayout, Store, Visit, current_instr_locations,
 };
 use soac_core::profile::{CollectedTypeKeyLayout, CounterDumpTypeKey};
 use soac_ir_blockpy::{CodegenModuleShape, InstrCodegen};
@@ -144,7 +143,9 @@ pub(crate) use counters::CounterRef;
 #[cfg(test)]
 use counters::build_counted_runtime_refcount_helper;
 use counters::{
-    CountedRefcountHelpers, build_counted_runtime_refcount_helpers, emit_increment_counter_slot,
+    CountedRefcountHelpers, build_counted_runtime_refcount_helpers,
+    collect_deopt_entry_counter_ids_by_kind, collect_runtime_counter_ids_by_kind,
+    collect_runtime_counter_refs_by_kind_branch, emit_increment_counter_slot,
     emit_record_top_value_counter_slot, scalar_counter_slot_for_id, scalar_counter_slot_for_ref,
     top_value_counter_slot_for_id,
 };
@@ -5493,86 +5494,6 @@ fn typed_expr_const_i64(
         }),
         _ => None,
     }
-}
-
-fn collect_runtime_counter_ids_by_kind(
-    counter_defs: &[CounterDef],
-    function_id: RuntimeFunctionId,
-    kind: &str,
-) -> HashMap<InstrId, CounterId> {
-    counter_defs
-        .iter()
-        .filter_map(|counter| match &counter.site {
-            CounterSite::Runtime {
-                function_id: Some(counter_function_id),
-                instr_id: Some(instr_id),
-            } if counter.kind == kind && *counter_function_id == function_id => {
-                Some((*instr_id, counter.id))
-            }
-            _ => None,
-        })
-        .collect()
-}
-
-fn collect_runtime_counter_refs_by_kind_branch(
-    counter_defs: &[CounterDef],
-    function_id: RuntimeFunctionId,
-    kind: &str,
-    branch: &str,
-) -> HashMap<InstrId, CounterRef> {
-    counter_defs
-        .iter()
-        .filter_map(|counter| match &counter.site {
-            CounterSite::Runtime {
-                function_id: Some(counter_function_id),
-                instr_id: Some(instr_id),
-            } if counter.kind == kind && *counter_function_id == function_id => {
-                let branch_id = counter.branch_id(branch)?;
-                Some((*instr_id, CounterRef::branch(counter.id, branch_id)))
-            }
-            _ => None,
-        })
-        .collect()
-}
-
-fn deopt_entry_source_for_resume_point(point: LocalEnvResumePoint) -> DeoptEntrySource {
-    match point {
-        LocalEnvResumePoint::BlockEntry { block, .. } => {
-            DeoptEntrySource::BlockEntry { block_label: block }
-        }
-        LocalEnvResumePoint::BeforeInstr { key } => DeoptEntrySource::BeforeInstr {
-            instr_id: key.instr_id,
-        },
-        LocalEnvResumePoint::BeforeTerm { block, .. } => {
-            DeoptEntrySource::BeforeTerm { block_label: block }
-        }
-    }
-}
-
-fn collect_deopt_entry_counter_ids_by_kind(
-    counter_defs: &[CounterDef],
-    function_id: RuntimeFunctionId,
-    kind: &str,
-    deopt_resume_plan: &PlannedJitDeoptResumeFunction,
-) -> HashMap<usize, CounterId> {
-    counter_defs
-        .iter()
-        .filter_map(|counter| match &counter.site {
-            CounterSite::DeoptEntry {
-                function_id: counter_function_id,
-                source,
-            } if counter.kind == kind && *counter_function_id == function_id => {
-                let ordinal = deopt_resume_plan
-                    .deopt_points
-                    .iter()
-                    .find(|point| deopt_entry_source_for_resume_point(point.point) == *source)?
-                    .id
-                    .ordinal;
-                Some((ordinal, counter.id))
-            }
-            _ => None,
-        })
-        .collect()
 }
 
 fn type_ptr_data_id_for_ref(
