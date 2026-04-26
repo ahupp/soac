@@ -1554,14 +1554,29 @@ pub fn plan_jit_typed_function_locals_from_plans(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use soac_core::block_py::BlockTerm;
+    use super::{
+        BlockExcDispatchPlan, BlockParamFacts, LocalRefKind, ParamBindingFacts, ParamProvenance,
+        PlannedLocalBinding, PlannedLocalEnvEntrySource, PlannedLocalStorage,
+        PlannedStackSlotEntrySeed, PreparedJitTypedModulePlan, RuntimeBlockParamPlan,
+        plan_edge_transport, plan_jit_module_from_codegen, planned_drop_forwarded_local_names,
+        planned_jit_params_for_typed_function,
+        planned_local_env_entry_materializations_for_function,
+        planned_stack_slot_entry_seeds_for_typed_function, typed_block_index_for_label,
+        typed_block_indices_by_label, typed_exc_dispatch_plan,
+        validate_exception_dispatch_ownership_sinks,
+    };
+    use soac_core::block_py::{
+        BlockArg, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, LocalLocation,
+    };
+    use soac_ir_blockpy::CodegenModuleShape;
     use soac_lowering::lower_python_to_blockpy_for_testing;
     use soac_opt::passes::BlockLocalPlan;
     use soac_opt::passes::{
-        LocalEnvResumeBindingState, LocalEnvResumeValueSource, RefcountActionKind,
-        RefcountReleaseReason, infer_module_value_facts,
+        FunctionRefcountPlan, LocalEnvResumeBindingState, LocalEnvResumePoint,
+        LocalEnvResumeValueSource, RefcountActionKind, RefcountReleaseReason,
+        infer_module_value_facts,
     };
+    use std::collections::{HashMap, HashSet};
 
     fn lowered_function(
         source: &str,

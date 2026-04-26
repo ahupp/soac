@@ -1,4 +1,24 @@
-use super::*;
+use super::planning::{LocalRefKind, PlannedJitDeoptPointId, PlannedJitDeoptResumeFunction};
+use super::specialized_helpers::ObjPtr;
+use super::{
+    CodegenBlock, FunctionRuntimeDataLayout, blockpy_intrinsics, transient_local_needs_decref,
+};
+use crate::module_constants::ModuleConstantId;
+use pyo3::{Py, PyAny, ffi};
+use soac_core::block_py::{
+    BlockArg, BlockEdge, BlockLabel, BlockPyFunction, BlockTerm, CallArgKeyword, CallArgPositional,
+    CellLocation, InstrLocationMap, LocalLocation, NameLocation, ParamKind, RuntimeFunctionId,
+    StorageLayout, current_instr_locations,
+};
+use soac_ir_blockpy::{CodegenModuleShape, InstrCodegen};
+use soac_ir_typed::{InstrTyped, TypedCodegenModuleShape};
+use soac_opt::passes::{
+    LocalEnvResumeBinding, LocalEnvResumeBindingState, LocalEnvResumePoint,
+    LocalEnvResumeStatePrecision, LocalEnvResumeValueSource,
+};
+use std::collections::{HashMap, HashSet};
+use std::ffi::c_void;
+use std::sync::Arc;
 
 pub(super) struct RuntimeJitDeoptTable {
     pub(super) function_id: RuntimeFunctionId,

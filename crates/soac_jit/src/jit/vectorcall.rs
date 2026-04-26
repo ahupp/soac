@@ -1,4 +1,23 @@
-use super::*;
+use super::backend::{define_prepared_function, register_jit_signal_diagnostics};
+use super::codegen_env::{FuncBuildImports, JitCodegenEnv, declare_local_fn};
+use super::imports::{
+    DP_JIT_DECREF_IMPORT, DP_JIT_ENTER_RECURSIVE_CALL_IMPORT,
+    DP_JIT_VECTORCALL_BIND_DIRECT_ARGS_IMPORT, DP_JIT_VECTORCALL_COMPILE_FUNCTION_ENV_IMPORT,
+    ModuleFuncImports, PY_THREAD_STATE_GET_UNCHECKED_IMPORT,
+    SOAC_RUNTIME_SET_RAISED_EXCEPTION_IMPORT,
+};
+use super::runtime_context::{
+    FUNCTION_ENV_DEFAULT_DIRECT_CODE_PTR_OFFSET, PY_FUNCTION_JIT_EXTRA_FUNCTION_ENV_OFFSET,
+};
+use super::{
+    RuntimeFunctionId, SoacEnvConfig, VectorcallEntryFn,
+    emit_take_current_raised_exception_or_trap, jitdump, load_function_env_obj,
+    load_py_function_soac_metadata_obj,
+};
+use cranelift_codegen::ir;
+use cranelift_codegen::ir::InstBuilder;
+use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+use cranelift_jit::JITModule;
 
 pub(super) fn define_shared_vectorcall_trampoline(
     jit_module: &mut JITModule,

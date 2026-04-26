@@ -1,4 +1,11 @@
-use super::*;
+use super::{CpythonTypeSymbol, RelocCallableRef, RelocTypeRef};
+use crate::module_type::SharedModuleState;
+use pyo3::ffi;
+use soac_core::block_py::{BlockPyFunction, ModuleShape, RuntimeFunctionId};
+use soac_core::profile::CounterDumpTypeKey;
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
 static JIT_DATA_SYMBOLS: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
 static TYPE_KEY_RUNTIME_REGISTRY: OnceLock<Mutex<HashMap<CounterDumpTypeKey, usize>>> =

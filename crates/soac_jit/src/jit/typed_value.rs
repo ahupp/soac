@@ -399,7 +399,11 @@ impl EmitResult {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        EmitResult, IntFacts, IntRange, IntWidth, ResultDemand, SoacRepr, SoacValue, ValueOwnership,
+    };
+    use cranelift_codegen::ir;
+    use soac_ir_typed::PyObjFacts;
 
     fn value(index: u32) -> ir::Value {
         ir::Value::from_u32(index)

@@ -1,8 +1,44 @@
+use super::backend::{compile_prepared_function_bytes_with_isa, new_jit_builder};
+use super::codegen_env::JitCodegenEnv;
+use super::direct_function::{
+    build_default_resolving_direct_adapter, declare_direct_function,
+    declare_imported_direct_function,
+};
+use super::module_data::{
+    declare_module_constant_object_data_for_prefix, define_scalar_counter_storage_data,
+    define_top_value_counter_storage_data, module_constant_object_symbol,
+    module_constant_symbol_prefix_for_module_identity, persistent_function_id_for_module_function,
+    precompiled_direct_function_symbol_scope_for_persistent, scalar_counter_storage_symbol,
+    top_value_counter_storage_symbol,
+};
 use super::precompiled_object::{
     ElfSymbolBinding, ElfSymbolKind, ObjectDataDefinition, ObjectDataRelocation,
     ObjectFunctionDefinition, R_X86_64_64, write_precompiled_object,
 };
-use super::*;
+use super::runtime_support::compile_runtime_support_clif_for_object;
+use super::symbols::direct_function_backend_name;
+use super::typed_pipeline::{
+    apply_profile_call_emission_plans_to_typed_function, build_jit_module_plan,
+    build_typed_v3_jit_module_plan,
+};
+use super::{
+    BuildSpecializedFunctionOptions, ModuleConstantAccess, ModuleConstantAccessTable,
+    SpecializationProfile, build_cranelift_run_bb_specialized_function,
+    collect_typed_call_direct_targets, placeholder_module_constant_ptrs,
+    planned_optimization_inputs_for_precompile,
+};
+use crate::config::CraneliftTargetConfig;
+use crate::counter::TopValueCounter;
+use crate::module_constants::{ModuleCodegenConstants, ModuleConstantId};
+use crate::module_type::build_counter_storage_layout;
+use cranelift_jit::JITModule;
+use soac_core::block_py::{
+    BlockPyFunction, BlockPyModule, PersistentFunctionId, RuntimeFunctionId, RuntimeModuleId,
+};
+use soac_ir_blockpy::CodegenModuleShape;
+use soac_ir_typed::{TypedCodegenModuleShape, lower_codegen_function_to_typed};
+use soac_opt::passes::lower_typed_function_call_access_plan_instrs;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 

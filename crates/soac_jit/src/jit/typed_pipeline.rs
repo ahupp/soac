@@ -1,4 +1,38 @@
-use super::*;
+use super::imports::predeclare_typed_direct_call_imports;
+use super::planning::{
+    PlannedJitDeoptResumeModule, PlannedJitModuleLocals, PreparedJitTypedModulePlan,
+    plan_jit_module_from_codegen, plan_jit_typed_module,
+};
+use super::{
+    SpecializationProfile, annotate_typed_exact_int_selections_from_profile,
+    annotate_typed_exact_list_item_accesses_from_profile,
+    annotate_typed_indexed_field_accesses_from_profile,
+    annotate_typed_indexed_global_accesses_from_profile, annotate_typed_profiled_cold_blocks,
+    infer_jit_value_facts,
+};
+use crate::module_constants::ModuleCodegenConstants;
+use cranelift_jit::JITModule;
+use soac_config::SoacEnvConfig;
+use soac_core::block_py::{
+    BlockPyFunction, BlockPyModule, CallableScopeKind, ChildVisitable, HasSemanticInstrId,
+    RuntimeFunctionId, VisitMut,
+};
+use soac_instrument::{InstrumentationConfig, instrument_typed_module};
+use soac_ir_blockpy::CodegenModuleShape;
+use soac_ir_typed::{
+    FactStore, InstrTyped, TypedCallEmissionPlans, TypedCodegenModuleShape,
+    assign_missing_typed_function_instr_ids, lower_codegen_function_to_typed,
+    lower_codegen_module_to_typed,
+};
+use soac_opt::call_emission_v3::typed_call_emission_plans_from_v3;
+use soac_opt::passes::{
+    annotate_typed_module_value_facts, inline_typed_function_direct_call_stores,
+    lower_typed_function_call_access_plan_instrs, lower_typed_function_call_emission_plans,
+    lower_typed_if_tests_to_truthy, refresh_typed_function_value_facts,
+    validate_typed_function_value_facts,
+};
+use std::collections::HashMap;
+use std::sync::Arc;
 
 fn typed_call_emission_plans_for_profile_function(
     profile: &SpecializationProfile<'_>,

@@ -1,4 +1,8 @@
-use super::*;
+use super::imports::{ImportSpec, ModuleFuncImports, SigType, StaticSignature};
+use cranelift_codegen::ir;
+use cranelift_codegen::isa::{TargetFrontendConfig, TargetIsa};
+use cranelift_jit::JITModule;
+use cranelift_module::{DataId, FuncId, Linkage, Module};
 
 pub(super) struct FuncBuildImports<'a> {
     module_imports: &'a mut ModuleFuncImports,

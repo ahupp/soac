@@ -1,4 +1,17 @@
-use super::*;
+use super::codegen_env::{FuncBuildImports, JitCodegenEnv, declare_import_fn, declare_local_fn};
+use super::imports::{DP_JIT_RAISE_MISSING_REQUIRED_ARGUMENT_IMPORT, ModuleFuncImports};
+use super::runtime_context::FUNCTION_ENV_RUNTIME_OBJECTS_OFFSET;
+use super::symbols::{default_direct_function_symbol, direct_function_symbol};
+use super::{
+    DeclaredJitFunction, FunctionRuntimeDataLayout, block_arg_values,
+    emit_function_data_slot_borrowed, function_has_default_resolving_direct_entry,
+    param_runtime_default_slot,
+};
+use cranelift_codegen::ir;
+use cranelift_codegen::ir::InstBuilder;
+use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+use cranelift_module::FuncId;
+use soac_core::block_py::{BlockPyFunction, ModuleShape};
 
 pub(super) fn make_direct_function_signature(
     codegen_env: &impl JitCodegenEnv,

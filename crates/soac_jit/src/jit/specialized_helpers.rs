@@ -764,7 +764,7 @@ pub unsafe extern "C" fn dp_jit_pop_handled_exception(previous: ObjPtr) {
 
 #[cfg(test)]
 mod test_only_export_stubs {
-    use super::*;
+    use super::ObjPtr;
 
     macro_rules! panic_obj_export {
         ($name:ident($($arg:ident : $ty:ty),* $(,)?)) => {

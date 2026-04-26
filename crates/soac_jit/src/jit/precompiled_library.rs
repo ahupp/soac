@@ -1,8 +1,25 @@
-use super::*;
+use super::compiled::CompiledFunctionHandle;
+use super::deopt::RuntimeJitDeoptTable;
+use super::module_data::{
+    module_constant_object_symbol, module_constant_symbol_prefix_for_module_identity,
+    module_constant_symbol_prefix_for_shared_state,
+    precompiled_direct_function_symbol_scope_for_shared_state,
+};
+use super::planning::{PlannedJitDeoptResumeModule, plan_jit_module_from_codegen};
+use super::specialized_helpers;
+use super::symbols::{default_direct_function_symbol, direct_function_symbol};
+use super::{function_has_default_resolving_direct_entry, infer_jit_value_facts};
+use crate::module_constants::ModuleConstantId;
+use crate::module_type::SharedModuleState;
+use pyo3::ffi;
+use soac_core::block_py::BlockPyFunction;
+use soac_ir_blockpy::CodegenModuleShape;
 use std::ffi::{CStr, CString, c_void};
 use std::mem::MaybeUninit;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
+use tracing::info;
 
 static PRECOMPILED_LIBRARY: OnceLock<Result<Option<PrecompiledLibrary>, String>> = OnceLock::new();
 

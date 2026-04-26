@@ -1,8 +1,26 @@
+use super::backend::{compile_prepared_function_bytes_with_isa, define_prepared_function};
+use super::codegen_env::JitCodegenEnv;
 use super::precompiled_object::{ElfSymbolBinding, ObjectFunctionDefinition};
-use super::*;
+use super::symbols::{
+    SOAC_RUNTIME_DECREF_SYMBOL, SOAC_RUNTIME_INCREF_SYMBOL, SOAC_RUNTIME_LOAD_GLOBAL_SYMBOL,
+    SOAC_RUNTIME_PROBE_FIELD_INDEXED_SYMBOL, SOAC_RUNTIME_PROBE_GLOBAL_INDEXED_SYMBOL,
+    SOAC_RUNTIME_STORE_FIELD_INDEXED_SYMBOL, SOAC_RUNTIME_STORE_GLOBAL_INDEXED_SYMBOL,
+    SOAC_RUNTIME_STORE_GLOBAL_SYMBOL, SOAC_RUNTIME_TUPLE_NEW_SYMBOL,
+    SOAC_RUNTIME_TUPLE_SET_ITEM_STOLEN_SYMBOL,
+};
 use crate::SOAC_JIT_RUNTIME_CLIF;
 use cranelift_codegen::inline::{Inline, InlineCommand};
+use cranelift_codegen::ir;
+use cranelift_codegen::ir::InstBuilder;
+use cranelift_codegen::isa::TargetIsa;
+use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+use cranelift_jit::JITModule;
+use cranelift_module::{FuncId, Linkage};
 use cranelift_reader::parse_functions;
+use soac_config::SoacEnvConfig;
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 
 static RUNTIME_SUPPORT_LIBRARY: OnceLock<Result<RuntimeSupportLibrary, String>> = OnceLock::new();
 const RUNTIME_SUPPORT_INLINE_MAX_INSTS: usize = 128;

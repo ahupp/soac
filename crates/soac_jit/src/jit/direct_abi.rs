@@ -171,7 +171,14 @@ pub(super) fn runtime_primitive_for_builtin_name(name: &str) -> Option<RuntimePr
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::super::typed_value::ValueOwnership;
+    use super::{
+        ArgOwnership, DirectEntry, ErrorAbi, HiddenArgAbi, ParamAbi, PyLongI64Coercion, ResultAbi,
+        RuntimePrimitiveId, SOAC_RUNTIME_BUILTIN_CHR_I64_SYMBOL,
+        SOAC_RUNTIME_BUILTIN_LEN_I64_SYMBOL, SOAC_RUNTIME_BUILTIN_ORD_I64_SYMBOL,
+        runtime_primitive_desc, runtime_primitive_for_builtin_name,
+    };
+    use soac_ir_typed::PyExactType;
 
     #[test]
     fn ord_descriptor_accepts_borrowed_pyobject_and_returns_i64() {

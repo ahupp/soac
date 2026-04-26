@@ -1,4 +1,61 @@
-use super::*;
+use super::backend::{
+    CompiledFunctionArtifact, compile_prepared_function_bytes, define_compiled_function_bytes,
+    new_jit_module, record_jit_bb_map, register_jit_signal_diagnostics,
+};
+use super::codegen_env::JitCodegenEnv;
+use super::compiled::{
+    CompiledFunctionHandle, DirectFunctionCompileResult, JitCodegenStats, VectorcallEntryFn,
+};
+use super::deopt::RuntimeJitDeoptTable;
+use super::direct_function::{build_default_resolving_direct_adapter, declare_direct_function};
+use super::imports::{predeclare_jit_runtime_imports, predeclare_specialization_type_imports};
+use super::jitdump;
+use super::module_data::{
+    declare_module_constant_object_data_for_prefix, declare_scalar_counter_storage_import,
+    declare_top_value_counter_storage_import, define_scalar_counter_storage_data_for_symbol,
+    define_top_value_counter_storage_data_for_symbol,
+    direct_function_symbol_scope_for_shared_state, module_constant_symbol_prefix_for_instance,
+    module_constant_symbol_prefix_for_shared_state, scalar_counter_storage_symbol_for_instance,
+    scalar_counter_storage_symbol_for_shared_state, top_value_counter_storage_symbol_for_instance,
+    top_value_counter_storage_symbol_for_shared_state,
+};
+use super::specialized_helpers::ObjPtr;
+use super::symbols::{
+    direct_function_backend_name, direct_function_symbol_scope, register_jit_data_symbol,
+};
+use super::typed_pipeline::{
+    JitModulePlan, build_jit_module_plan, build_typed_v3_jit_module_plan,
+    collect_codegen_constants_for_module_name,
+    predeclare_planned_typed_function_imports_for_reservation,
+};
+use super::vectorcall::define_shared_vectorcall_trampoline;
+use super::{
+    BuildSpecializedFunctionOptions, CountedRefcountHelpers, DeclaredJitFunction,
+    PROCESS_JIT_COMPILE_DEPTH, PlannedOptimizationInputs, SpecializationProfile,
+    build_counted_runtime_refcount_helpers, build_cranelift_run_bb_specialized_function,
+    collect_call_direct_targets, collect_make_function_targets,
+    collect_planned_typed_call_direct_targets, is_synthetic_class_helper_function,
+    load_planned_optimization_inputs_for_runtime_state,
+};
+use crate::config::CraneliftTargetConfig;
+use crate::module_constants::ModuleCodegenConstants;
+use crate::module_type::{CounterRuntimeSlot, SharedModuleState, build_counter_storage_layout};
+use cranelift_codegen::ir;
+use cranelift_codegen::isa::{OwnedTargetIsa, TargetIsa};
+use cranelift_jit::JITModule;
+use cranelift_module::{DataId, FuncId, Linkage, Module};
+use pyo3::{Py, PyAny, Python, ffi};
+use soac_config::{RuntimeOptimizationPipeline, SoacEnvConfig};
+use soac_core::block_py::{
+    BlockPyFunction, BlockPyModule, CounterDef, FunctionExecutionMode, InstrId, RuntimeFunctionId,
+};
+use soac_ir_blockpy::CodegenModuleShape;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
+use tracing::{info, warn};
 
 struct CompiledJitFunction {
     function_id: RuntimeFunctionId,
@@ -2761,8 +2818,13 @@ impl From<DirectFunctionCompileResult> for DirectFunctionCompileAttempt {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use soac_core::block_py::{FunctionName, ModuleNameGen, Param, ParamKind, ParamSpec};
+    use super::{ProcessJitModule, ProcessJitState};
+    use crate::jit::{JitCodegenStats, RuntimeJitDeoptTable};
+    use soac_core::block_py::{
+        BlockPyFunction, FunctionKind, FunctionName, ModuleNameGen, Param, ParamKind, ParamSpec,
+    };
+    use soac_ir_blockpy::CodegenModuleShape;
+    use std::sync::Arc;
 
     fn test_function() -> BlockPyFunction<CodegenModuleShape> {
         let module_name_gen = ModuleNameGen::new(0);

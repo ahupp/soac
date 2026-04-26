@@ -1,16 +1,28 @@
+use super::codegen_env::JitCodegenEnv;
 use super::runtime_support::{inline_runtime_support_calls, load_runtime_support_clif};
+use super::signal_diagnostics;
 use super::specialized_helpers::register_specialized_jit_symbols;
 use super::symbols::{
     cpython_type_symbol_name, lookup_registered_jit_data_symbol, py_dealloc_symbol,
 };
-use super::*;
+use super::{
+    _PyDict_IndexedValueTombstone, CpythonTypeSymbol, PyFunction_Type, PyList_Type, PyLong_Type,
+    PyMethod_Type, PyType_Type,
+};
+use crate::config::CraneliftTargetConfig;
 use crate::function_instantiation::{
     SOAC_JIT_MAKE_FUNCTION_WITH_CLOSURE_SYMBOL, soac_jit_make_function_with_closure,
 };
 use cranelift_codegen::flowgraph::ControlFlowGraph;
+use cranelift_codegen::ir;
+use cranelift_codegen::isa::TargetIsa;
 use cranelift_control::ControlPlane;
 use cranelift_jit::{ArenaMemoryProvider, JITBuilder, JITModule};
-use cranelift_module::ModuleReloc;
+use cranelift_module::{FuncId, Module, ModuleReloc};
+use soac_config::SoacEnvConfig;
+use soac_core::block_py::RuntimeFunctionId;
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 
 const JIT_ARENA_BYTES: usize = 256 * 1024 * 1024;
 

@@ -1,4 +1,15 @@
-use super::*;
+use super::codegen_env::JitCodegenEnv;
+use super::symbols::{push_symbol_component_hex, register_jit_data_symbol};
+use crate::counter::TopValueCounter;
+use crate::module_constants::ModuleConstantId;
+use crate::module_type::SharedModuleState;
+use cranelift_jit::JITModule;
+use cranelift_module::{DataDescription, DataId, Linkage, Module};
+use pyo3::ffi;
+use soac_core::block_py::{
+    BlockPyModule, LocalFunctionId, ModuleContentId, ModuleShape, PersistentFunctionId,
+    RuntimeFunctionId,
+};
 
 fn module_constant_symbol_prefix<P: ModuleShape>(module: &BlockPyModule<P>) -> String {
     format!(

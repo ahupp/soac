@@ -1,4 +1,31 @@
-use super::*;
+use super::{
+    BlockPyEntryRuntimeContext, BuildSpecializedFunctionOptions, BuiltSpecializedFunction,
+    CpythonTypeSymbol, DeclaredJitFunction, FuncBuildImports, FunctionRuntimeDataLayout,
+    RuntimeFunctionEntryPlan, RuntimeJitDeoptContinuation, RuntimeJitDeoptCursor,
+    RuntimeJitDeoptInvocation, RuntimeJitDeoptRecord, RuntimeJitDeoptTable,
+    RuntimeJitDeoptUnsupportedReason, SOAC_RUNTIME_PROBE_GLOBAL_INDEXED_SYMBOL,
+    SOAC_RUNTIME_STORE_GLOBAL_INDEXED_SYMBOL, SpecializationProfile, StackSlots,
+    build_cranelift_run_bb_specialized_function, build_jit_module_plan,
+    build_typed_v3_jit_module_plan, codegen_expr_is_borrowable_from_local_env,
+    codegen_expr_static_can_satisfy_i64_demand, codegen_expr_static_i64_demand_facts,
+    collect_planned_typed_call_direct_targets, declare_local_fn,
+    declare_module_constant_object_data, declare_scalar_counter_storage_import,
+    declare_top_value_counter_storage_import, define_prepared_function,
+    define_scalar_counter_storage_data, define_scalar_counter_storage_data_for_symbol,
+    define_top_value_counter_storage_data, direct_function_symbol_scope_for_shared_state,
+    emit_decref_unforwarded_local_env, emit_deopt_resume_call, infer_jit_value_facts,
+    local_ref_kind_for_stack_mirror, lookup_registered_jit_data_symbol,
+    normalize_postopt_clif_for_inspection, parse_runtime_clif_functions,
+    placeholder_module_constant_ptrs, plan_jit_module_from_codegen,
+    planned_owned_pyobject_result_for_typed_expr, precompile_codegen_module_to_object_bytes,
+    predeclare_specialization_type_imports, predeclare_typed_direct_call_imports,
+    refresh_typed_function_value_facts, render_compiled_clif_and_vcode_disasm,
+    run_blockpy_function_from_entry, run_blockpy_function_from_vectorcall_entry,
+    runtime_jit_deopt_guard_operand_replay_safe, runtime_jit_typed_deopt_guard_operand_replay_safe,
+    scalar_counter_storage_symbol_for_instance, static_runtime_primitive_desc_for_call,
+    static_runtime_primitive_for_call, top_value_counter_storage_symbol_for_instance,
+    typed_expr_planned_pyobject_input_is_borrowed_from_local_env,
+};
 use soac_core::block_py::IncrementCounter;
 use soac_core::block_py::literal::{
     Literal, LiteralValue, NumberLiteral, NumberLiteralValue, StringLiteral,
@@ -16,16 +43,104 @@ use soac_core::block_py::{
 };
 use soac_ir_blockpy::{CodegenModuleShape, InstrCodegen, validate_codegen_instr_ids};
 mod tests {
-    use super::*;
+    use super::super::direct_abi;
+    use super::super::{
+        CodegenBlock, DP_JIT_DECREF_IMPORT, DP_JIT_DEOPT_RESUME_IMPORT, DP_JIT_INCREF_IMPORT,
+        DP_JIT_PY_CALL_POSITIONAL_THREE_IMPORT, DP_JIT_PY_VECTORCALL_IMPORT,
+        DP_JIT_PYOBJECT_SETATTR_IMPORT, DirectCallArgPlan, DirectCallArgSource,
+        DirectCallEmissionScope, DirectCallIncompatibility, FUNCTION_ENV_DEOPT_TABLE_PTR_OFFSET,
+        FieldIndexSpecialization, IntFacts, IntRange, JitDeoptExitRef, LocalEnv, LocalEnvEntry,
+        LocalEnvStorage, LocalRefKind, ModuleConstantId, ModuleFuncImports, ObjPtr,
+        OptV3ExactListItemAccessPlan, OptV3IndexedFieldAccessPlan, OptV3IndexedGlobalAccessPlan,
+        OptV3ResolvedIndexedFieldAccess, ParamBindingFacts, ParsedRuntimeClifFunction,
+        PlannedJitDeoptPointId, PrecompileModuleIndex, PrecompileModuleIndexEntry,
+        ProcessJitEngine, PyLong_Type, RelocTypeRef, ResolvedV3DirectCallPlan, ResultDemand,
+        SOAC_RUNTIME_DECREF_APPLIED_IMPORT, SOAC_RUNTIME_DECREF_SYMBOL,
+        SOAC_RUNTIME_INCREF_APPLIED_IMPORT, SOAC_RUNTIME_INCREF_SYMBOL,
+        SOAC_RUNTIME_PYLONG_AS_I64_SATURATING_SYMBOL, SOAC_RUNTIME_PYLONG_AS_I64_SYMBOL,
+        SOAC_RUNTIME_STORE_GLOBAL_IMPORT, SOAC_RUNTIME_STORE_GLOBAL_INDEXED_IMPORT,
+        SOAC_RUNTIME_TUPLE_NEW_IMPORT, SOAC_RUNTIME_TUPLE_SET_ITEM_STOLEN_IMPORT, ValueOwnership,
+        abrupt_kind_tag, annotate_typed_attr_accesses, annotate_typed_exact_int_selections,
+        annotate_typed_indexed_global_accesses,
+        apply_profile_typed_block_metadata_to_typed_function,
+        apply_profile_typed_guard_miss_policy_to_typed_function,
+        apply_profile_typed_plans_to_typed_function, build_counted_runtime_refcount_helper,
+        compile_cranelift_run_bb_specialized_cached, declare_direct_function,
+        existing_counter_dump_path, inline_runtime_support_calls,
+        local_binding_facts_for_stored_value, local_ref_kind_needs_incref_for_forward,
+        module_constant_object_symbol, module_constant_symbol_prefix_for_instance,
+        module_constant_symbol_prefix_for_module_identity,
+        module_constant_symbol_prefix_for_shared_state, new_jit_module,
+        owner_type_supports_field_layout_priming, persistent_function_id_for_module_function,
+        plan_direct_call_args_for_target,
+        planned_optimization_inputs_from_v3_artifacts_for_codegen_module,
+        precompiled_direct_function_symbol_scope_for_persistent,
+        prepare_specialized_typed_function, prime_field_index_layout,
+        push_direct_function_module_identity, push_shared_module_symbol_identity,
+        reloc_type_ref_for_type, resolve_reloc_type_ref_to_type,
+        runtime_primitive_call_static_params_can_satisfy_abi, stable_cranelift_function_hash,
+        stable_cranelift_function_name, typed_local_load_direct_result_plan,
+        validate_direct_call_compatibility,
+    };
+    use super::{
+        AbruptKind, BinOp, BinOpKind, BlockArg, BlockEdge, BlockLabel, BlockParam, BlockParamRole,
+        BlockPyEntryRuntimeContext, BlockPyFunction, BlockPyModule, BlockTerm,
+        BuildSpecializedFunctionOptions, BuiltSpecializedFunction, Call, CallArgKeyword,
+        CallArgPositional, CellLocation, CellRef, ChildVisitable, ClosureInit, ClosureSlot,
+        CodegenModuleShape, ConstantExpr, CounterDef, CounterSite, CpythonTypeSymbol,
+        DeclaredJitFunction, Del, DelItem, FuncBuildImports, FunctionExecutionMode, FunctionKind,
+        FunctionName, FunctionRuntimeDataLayout, GetAttr, GetItem, HasMeta, HasSemanticInstrId,
+        IncrementCounter, InstrCodegen, Literal, LiteralValue, Load, LocalFunctionId,
+        LocalLocation, MakeCell, Meta, ModuleNameGen, NameLike, NameLocation, NumberLiteral,
+        NumberLiteralValue, Param, ParamKind, ParamSpec, ResolvedName, RuntimeFunctionEntryPlan,
+        RuntimeFunctionId, RuntimeJitDeoptContinuation, RuntimeJitDeoptCursor,
+        RuntimeJitDeoptInvocation, RuntimeJitDeoptRecord, RuntimeJitDeoptTable,
+        RuntimeJitDeoptUnsupportedReason, RuntimeName, SerializedFunctionDebugName,
+        SerializedFunctionId, SerializedIdentityTables, SerializedModuleId,
+        SerializedModuleIdentity, SetAttr, SetItem, SpecializationProfile, StackSlots,
+        StorageLayout, Store, StringLiteral, Tuple, UnaryOp, UnaryOpKind, Visit, VisitMut,
+        WithMeta, build_cranelift_run_bb_specialized_function, build_jit_module_plan,
+        build_typed_v3_jit_module_plan, codegen_expr_is_borrowable_from_local_env,
+        codegen_expr_static_can_satisfy_i64_demand, codegen_expr_static_i64_demand_facts,
+        collect_planned_typed_call_direct_targets, declare_local_fn,
+        declare_module_constant_object_data, declare_scalar_counter_storage_import,
+        declare_top_value_counter_storage_import, define_prepared_function,
+        define_scalar_counter_storage_data, define_scalar_counter_storage_data_for_symbol,
+        define_top_value_counter_storage_data, direct_function_symbol_scope_for_shared_state,
+        emit_decref_unforwarded_local_env, emit_deopt_resume_call, infer_jit_value_facts,
+        local_ref_kind_for_stack_mirror, lookup_registered_jit_data_symbol,
+        normalize_postopt_clif_for_inspection, parse_runtime_clif_functions,
+        placeholder_module_constant_ptrs, plan_jit_module_from_codegen,
+        planned_owned_pyobject_result_for_typed_expr, precompile_codegen_module_to_object_bytes,
+        predeclare_specialization_type_imports, predeclare_typed_direct_call_imports,
+        refresh_typed_function_value_facts, render_compiled_clif_and_vcode_disasm,
+        run_blockpy_function_from_entry, run_blockpy_function_from_vectorcall_entry,
+        runtime_jit_deopt_guard_operand_replay_safe,
+        runtime_jit_typed_deopt_guard_operand_replay_safe,
+        scalar_counter_storage_symbol_for_instance, static_runtime_primitive_desc_for_call,
+        static_runtime_primitive_for_call, top_value_counter_storage_symbol_for_instance,
+        typed_expr_planned_pyobject_input_is_borrowed_from_local_env, validate_codegen_instr_ids,
+    };
+    use crate::config::SpecializationMode;
     use crate::jit::direct_abi::RuntimePrimitiveId;
+    use crate::module_type::{CounterRuntimeSlot, build_counter_storage_layout};
     use cranelift_codegen::cursor::Cursor;
+    use cranelift_codegen::ir;
+    use cranelift_codegen::ir::InstBuilder;
+    use cranelift_codegen::settings::Configurable;
+    use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+    use cranelift_jit::JITModule;
+    use cranelift_module::{DataId, FuncId, Module};
     use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyModule, PyModuleMethods, PyTuple};
     use pyo3::{Bound, Py, PyAny, PyErr, PyResult, Python, ffi};
     use ruff_python_ast as ast;
+    use soac_config::{RuntimeOptimizationPipeline, SoacEnvConfig};
+    use soac_core::block_py::{CounterId, CounterScope, InstrId, InstrKey};
     use soac_core::pass_tracker::NoopPassTracker;
     use soac_core::profile::{
-        CounterDumpKeyLayout, CounterDumpRecord, CounterDumpRow, CounterDumpTypeKey,
-        CounterDumpTypeKeyLayout, CounterDumpTypeTableEntry, write_counter_dump_records,
+        CollectedTypeKeyLayout, CounterDumpKeyLayout, CounterDumpRecord, CounterDumpRow,
+        CounterDumpTypeKey, CounterDumpTypeKeyLayout, CounterDumpTypeTableEntry,
+        write_counter_dump_records,
     };
     use soac_driver::codegen_cache::{
         CachedCodegenModuleMetadata, PythonModuleCacheSource, module_optimization_plan_v3_path,
@@ -49,16 +164,28 @@ mod tests {
         IndexedGlobalFallbackPlan, IndexedGlobalGuardKind, IndexedGlobalGuardPlan,
         IndexedGlobalSpecializationPlan, ModuleOptimizationPlanV3, ModulePlanIdentity,
     };
-    use soac_ir_typed::{TypedInstrExtra, TypedPlannedResult as PlannedResult};
+    use soac_ir_typed::{
+        InstrTyped, PyExactType, PyObjFacts, TypedAttrAccessPlan, TypedBlockLayoutHint,
+        TypedCodegenModuleShape, TypedDirectCallArgPlan, TypedDirectCallArgSource,
+        TypedExactIntPlanSource, TypedExactListItemPlanSource, TypedIndexedFieldPlanSource,
+        TypedIndexedGlobalPlanSource, TypedInstrExtra, TypedPlannedResult as PlannedResult,
+        ValueFacts, lower_codegen_function_to_typed,
+    };
     use soac_opt::alternatives_v3::AlternativeCatalog;
     use soac_opt::artifacts_v3::{ExactIntBranchV3Artifacts, write_optimization_artifacts_v3};
-    use soac_opt::passes::lower_typed_function_if_tests_to_truthy;
+    use soac_opt::passes::{
+        LocalEnvResumeBinding, LocalEnvResumeBindingState, LocalEnvResumePoint,
+        LocalEnvResumeStatePrecision, LocalEnvResumeValueSource,
+        annotate_typed_function_planned_results, annotate_typed_function_result_demands,
+        annotate_typed_function_value_facts, infer_module_value_facts,
+        lower_typed_function_call_access_plan_instrs, lower_typed_function_if_tests_to_truthy,
+    };
     use soac_opt::pipeline_v3::{
         plan_and_emit_function_exact_int_branches_v3_with_module_constants,
         plan_and_emit_module_v3_from_raw_evidence,
     };
     use soac_opt::plan::{FunctionProfileEvidence, ProfileEvidenceStore};
-    use std::collections::{HashMap, VecDeque};
+    use std::collections::{HashMap, HashSet, VecDeque};
     use std::ffi::c_void;
     use std::mem::size_of;
     use std::path::{Path, PathBuf};
