@@ -5855,10 +5855,10 @@ class Point:
     }
 
     #[test]
-    fn field_index_specialized_setattr_hits_apply_mode_first_insert() {
+    fn field_index_specialized_setattr_hits_apply_mode_insert_and_overwrite() {
         if crate::run_test_in_isolated_process_if_needed(
             module_path!(),
-            "field_index_specialized_setattr_hits_apply_mode_first_insert",
+            "field_index_specialized_setattr_hits_apply_mode_insert_and_overwrite",
         ) {
             return;
         }
@@ -6015,12 +6015,12 @@ def write_point(point, value):
             assert_eq!(
                 shared_state.counter_branch_value(hit_counter_id, hit_branch_id),
                 1,
-                "apply-mode SetAttr should take the indexed-store fast path"
+                "apply-mode SetAttr should take the indexed-store first-insert fast path"
             );
             assert_eq!(
                 shared_state.counter_branch_value(fallback_counter_id, fallback_branch_id),
                 0,
-                "apply-mode SetAttr should avoid the generic setattr fallback"
+                "apply-mode SetAttr first insert should avoid the generic setattr fallback"
             );
 
             let point_obj = unsafe { pyo3::Bound::from_borrowed_ptr(py, point) };
@@ -6039,6 +6039,52 @@ def write_point(point, value):
                 1_234_567
             );
 
+            let next_value = unsafe { ffi::PyLong_FromLong(7_654_321) };
+            assert!(
+                !next_value.is_null(),
+                "overwrite test value should allocate"
+            );
+            let overwrite_result = unsafe {
+                entry(
+                    std::ptr::addr_of_mut!(function_context).cast(),
+                    thread_state,
+                    point.cast(),
+                    next_value.cast(),
+                )
+            };
+            assert!(
+                !overwrite_result.is_null(),
+                "write_point should return the overwritten value"
+            );
+
+            assert_eq!(
+                shared_state.counter_branch_value(hit_counter_id, hit_branch_id),
+                2,
+                "apply-mode SetAttr should take the indexed-store overwrite fast path"
+            );
+            assert_eq!(
+                shared_state.counter_branch_value(fallback_counter_id, fallback_branch_id),
+                0,
+                "apply-mode SetAttr overwrite should avoid the generic setattr fallback"
+            );
+            let stored = point_obj
+                .getattr("x")
+                .expect("Point instance should expose overwritten x");
+            assert_eq!(
+                stored.extract::<i64>().expect("stored x should be an int"),
+                7_654_321
+            );
+            let overwrite_result_obj =
+                unsafe { pyo3::Bound::from_owned_ptr(py, overwrite_result.cast()) };
+            assert_eq!(
+                overwrite_result_obj
+                    .extract::<i64>()
+                    .expect("overwrite result should be an int"),
+                7_654_321
+            );
+
+            unsafe { ffi::Py_DECREF(value) };
+            unsafe { ffi::Py_DECREF(next_value) };
             unsafe { ffi::Py_DECREF(point) };
             modules
                 .del_item("field_type_test")

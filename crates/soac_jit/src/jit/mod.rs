@@ -466,7 +466,6 @@ fn emit_codegen_non_local_name_load(
                 &[globals_obj, name_obj, slot_index],
             );
             let value = fb.inst_results(value_inst)[0];
-            let value = emit_decref_owned_input_after_nullable_result(fb, ctx, value, name_obj);
             let value_ok_block = fb.create_block();
             fb.append_block_param(value_ok_block, ptr_ty);
             let value_is_null = fb.ins().icmp(ir::condcodes::IntCC::Equal, value, null_ptr);
@@ -602,8 +601,6 @@ fn emit_codegen_indexed_global_load(
     fb.ins().call(ctx.incref_ref, &[direct_value]);
     emit_optional_counter_increment_for_kind(fb, ctx, ctx.global_indexed_hit_counter_ids, instr_id);
     fb.ins()
-        .call(ctx.decref_ref, &[ctx.consts.thread_state_value, name_obj]);
-    fb.ins()
         .jump(result_block, &[ir::BlockArg::Value(direct_value)]);
 
     match guard_miss_dispatch {
@@ -620,8 +617,6 @@ fn emit_codegen_indexed_global_load(
                 &[globals_obj, name_obj, slot_index],
             );
             let fallback_value = fb.inst_results(fallback_inst)[0];
-            let fallback_value =
-                emit_decref_owned_input_after_nullable_result(fb, ctx, fallback_value, name_obj);
             fb.ins()
                 .jump(result_block, &[ir::BlockArg::Value(fallback_value)]);
         }
@@ -646,7 +641,6 @@ fn emit_codegen_indexed_global_load(
                 ctx,
                 local_env,
             );
-            emit_release_owned_inputs(fb, ctx, &[name_obj]);
             emit_deopt_result_return_or_step_null(fb, ctx, deopt_result);
         }
     }
@@ -3825,15 +3819,6 @@ fn emit_release_owned_inputs(
             &[ctx.consts.thread_state_value, *owned_input],
         );
     }
-}
-
-fn emit_decref_owned_input_after_nullable_result(
-    fb: &mut FunctionBuilder<'_>,
-    ctx: &JitEmitCtx<'_>,
-    result: ir::Value,
-    owned_input: ir::Value,
-) -> ir::Value {
-    emit_decref_owned_inputs_after_nullable_result(fb, ctx, result, &[owned_input])
 }
 
 fn emit_decref_owned_inputs_after_nullable_result(
