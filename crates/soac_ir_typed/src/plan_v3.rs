@@ -46,9 +46,17 @@ pub struct FunctionPlanIdentity {
 pub struct DirectCallSpecializationPlan {
     pub source: InstrId,
     pub target: SerializedFunctionId,
+    pub callee: DirectCallCallee,
     pub arg_plan: DirectCallArgPlan,
     pub body: CallBodyPlan,
     pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub enum DirectCallCallee {
+    Function,
+    Method { method_name: String },
+    Constructor,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -885,6 +893,31 @@ fn validate_direct_call_plans(
                 "function {} direct-call target {} at {} has empty reason",
                 function.function.function, direct_call.target, direct_call.source
             ));
+        }
+        match &direct_call.callee {
+            DirectCallCallee::Function => {}
+            DirectCallCallee::Method { method_name } => {
+                if method_name.is_empty() {
+                    errors.push(format!(
+                        "function {} direct-call target {} at {} has empty method name",
+                        function.function.function, direct_call.target, direct_call.source
+                    ));
+                }
+                if direct_call.body.kind == CallBodyKind::Inline {
+                    errors.push(format!(
+                        "function {} method direct-call target {} at {} cannot use inline call body",
+                        function.function.function, direct_call.target, direct_call.source
+                    ));
+                }
+            }
+            DirectCallCallee::Constructor => {
+                if direct_call.body.kind == CallBodyKind::Inline {
+                    errors.push(format!(
+                        "function {} constructor direct-call target {} at {} cannot use inline call body",
+                        function.function.function, direct_call.target, direct_call.source
+                    ));
+                }
+            }
         }
         validate_call_body_plan(
             function,
@@ -2317,6 +2350,7 @@ mod tests {
         let plan = module_with_direct_calls(vec![DirectCallSpecializationPlan {
             source: instr_id(7),
             target,
+            callee: DirectCallCallee::Function,
             arg_plan: DirectCallArgPlan {
                 sources: vec![DirectCallArgSource::Provided(0)],
             },
@@ -2333,6 +2367,7 @@ mod tests {
         let mut plan = module_with_direct_calls(vec![DirectCallSpecializationPlan {
             source: instr_id(7),
             target,
+            callee: DirectCallCallee::Function,
             arg_plan: DirectCallArgPlan {
                 sources: vec![DirectCallArgSource::Provided(0)],
             },
@@ -2354,6 +2389,7 @@ mod tests {
         let plan = module_with_direct_calls(vec![DirectCallSpecializationPlan {
             source: instr_id(7),
             target,
+            callee: DirectCallCallee::Function,
             arg_plan: DirectCallArgPlan {
                 sources: vec![DirectCallArgSource::Provided(0)],
             },
@@ -2370,6 +2406,7 @@ mod tests {
         let plan = module_with_direct_calls(vec![DirectCallSpecializationPlan {
             source: instr_id(7),
             target,
+            callee: DirectCallCallee::Function,
             arg_plan: DirectCallArgPlan {
                 sources: vec![
                     DirectCallArgSource::Provided(0),
@@ -2396,6 +2433,7 @@ mod tests {
         let plan = module_with_direct_calls(vec![DirectCallSpecializationPlan {
             source: instr_id(7),
             target,
+            callee: DirectCallCallee::Function,
             arg_plan: DirectCallArgPlan {
                 sources: vec![DirectCallArgSource::Provided(0)],
             },

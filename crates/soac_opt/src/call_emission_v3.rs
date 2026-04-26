@@ -1,6 +1,8 @@
 use crate::artifacts_v3::ExactIntBranchV3Artifacts;
 use soac_core::block_py::{InstrId, PersistentFunctionId, RuntimeFunctionId};
-use soac_ir_typed::plan_v3::{CallBodyKind, CallBodyPlan, DirectCallArgPlan, DirectCallArgSource};
+use soac_ir_typed::plan_v3::{
+    CallBodyKind, CallBodyPlan, DirectCallArgPlan, DirectCallArgSource, DirectCallCallee,
+};
 use soac_ir_typed::{
     TypedCallEmissionPlan, TypedCallEmissionPlans, TypedDirectCallArgPlan,
     TypedDirectCallArgSource, TypedDirectFunctionCallGuard,
@@ -11,6 +13,7 @@ use std::collections::HashMap;
 pub struct ResolvedV3DirectCallPlan {
     pub source: InstrId,
     pub target: RuntimeFunctionId,
+    pub callee: DirectCallCallee,
     pub arg_plan: TypedDirectCallArgPlan,
     pub body: CallBodyPlan,
     pub reason: String,
@@ -63,6 +66,7 @@ pub fn direct_calls_for_function_from_artifacts(
             plans.push(ResolvedV3DirectCallPlan {
                 source: direct_call.source,
                 target,
+                callee: direct_call.callee.clone(),
                 arg_plan: typed_direct_call_arg_plan_from_v3(&direct_call.arg_plan),
                 body: direct_call.body.clone(),
                 reason: direct_call.reason.clone(),

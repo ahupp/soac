@@ -625,7 +625,7 @@ static FUNCTION_OWNER_TYPE_REGISTRY: OnceLock<Result<FunctionOwnerTypeRegistry, 
     OnceLock::new();
 
 #[derive(Clone, Copy, Debug)]
-struct FunctionOwnerType {
+pub(crate) struct FunctionOwnerType {
     pub function_obj: *mut ffi::PyObject,
     pub owner_type: *mut ffi::PyTypeObject,
     pub type_version: u32,
@@ -1050,31 +1050,10 @@ unsafe fn lookup_exact_owner_types_for_function_object(
     Ok(out)
 }
 
-unsafe fn lookup_exact_owner_types_for_constructor_object(
-    function_obj: *mut ffi::PyObject,
-    owner_type_weakrefs: &[usize],
-) -> Result<Vec<ConstructorOwnerType>, ()> {
-    let owners = lookup_exact_owner_types_for_function_object(
-        function_obj,
-        "__init__",
-        owner_type_weakrefs,
-    )?;
-    let mut out = Vec::new();
-    for owner in owners {
-        out.push(ConstructorOwnerType {
-            init_function_obj: owner.function_obj,
-            owner_type: owner.owner_type,
-            type_version: owner.type_version,
-        });
-    }
-    out.sort_by_key(|entry| (entry.owner_type as usize, entry.init_function_obj as usize));
-    out.dedup_by_key(|entry| (entry.owner_type as usize, entry.init_function_obj as usize));
-    Ok(out)
-}
-
-pub unsafe fn lookup_exact_owner_types_for_constructor(
+unsafe fn lookup_exact_owner_types_for_registered_function(
     function_id: RuntimeFunctionId,
-) -> Result<Vec<ConstructorOwnerType>, ()> {
+    method_name: &str,
+) -> Result<Vec<FunctionOwnerType>, ()> {
     let Ok(registry) = function_owner_type_registry() else {
         return Ok(Vec::new());
     };
@@ -1116,12 +1095,13 @@ pub unsafe fn lookup_exact_owner_types_for_constructor(
         };
         let matches_function_id = matches!(registered_clif_function_id(function_obj)?, Some(registered) if registered == function_id);
         if matches_function_id {
-            let exact_owner_types = lookup_exact_owner_types_for_constructor_object(
+            let exact_owner_types = lookup_exact_owner_types_for_function_object(
                 function_obj,
+                method_name,
                 owner_type_weakrefs.as_slice(),
             )?;
             for owner in exact_owner_types {
-                if let Some(current_id) = registered_clif_function_id(owner.init_function_obj)? {
+                if let Some(current_id) = registered_clif_function_id(owner.function_obj)? {
                     if current_id == function_id {
                         out.push(owner);
                     }
@@ -1138,6 +1118,30 @@ pub unsafe fn lookup_exact_owner_types_for_constructor(
         ffi::Py_DECREF(function_obj);
         ffi::Py_DECREF(function_weakref as *mut ffi::PyObject);
     }
+    Ok(out)
+}
+
+pub(crate) unsafe fn lookup_exact_owner_types_for_method(
+    function_id: RuntimeFunctionId,
+    method_name: &str,
+) -> Result<Vec<FunctionOwnerType>, ()> {
+    lookup_exact_owner_types_for_registered_function(function_id, method_name)
+}
+
+pub unsafe fn lookup_exact_owner_types_for_constructor(
+    function_id: RuntimeFunctionId,
+) -> Result<Vec<ConstructorOwnerType>, ()> {
+    let owners = lookup_exact_owner_types_for_registered_function(function_id, "__init__")?;
+    let mut out = Vec::new();
+    for owner in owners {
+        out.push(ConstructorOwnerType {
+            init_function_obj: owner.function_obj,
+            owner_type: owner.owner_type,
+            type_version: owner.type_version,
+        });
+    }
+    out.sort_by_key(|entry| (entry.owner_type as usize, entry.init_function_obj as usize));
+    out.dedup_by_key(|entry| (entry.owner_type as usize, entry.init_function_obj as usize));
     Ok(out)
 }
 

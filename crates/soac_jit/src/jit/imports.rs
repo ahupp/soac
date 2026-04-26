@@ -28,6 +28,7 @@ use cranelift_jit::JITModule;
 use cranelift_module::{FuncId, Linkage};
 #[cfg(test)]
 use soac_core::block_py::{BlockPyFunction, ChildVisitable, Visit};
+use soac_ir_typed::plan_v3::DirectCallCallee;
 #[cfg(test)]
 use soac_ir_typed::{
     InstrTyped, TypedCodegenModuleShape, TypedDirectCallableCallGuard,
@@ -601,22 +602,49 @@ pub(super) fn predeclare_specialization_type_imports(
     for direct_calls in profile.opt_v3_emitted_direct_calls.values() {
         for plans in direct_calls.values() {
             for plan in plans {
-                let owners =
-                    unsafe { crate::lookup_exact_owner_types_for_constructor(plan.target) }
+                match &plan.callee {
+                    DirectCallCallee::Function => {}
+                    DirectCallCallee::Constructor => {
+                        let owners =
+                            unsafe { crate::lookup_exact_owner_types_for_constructor(plan.target) }
+                                .map_err(|_| {
+                                    format!(
+                                        "failed to resolve owner types for constructor {}",
+                                        plan.target
+                                    )
+                                })?;
+                        for owner in owners {
+                            let Some(owner_type_ref) = reloc_type_ref_for_type(owner.owner_type)?
+                            else {
+                                continue;
+                            };
+                            callable_refs.insert(RelocCallableRef::OwnerAttr {
+                                owner_type_ref,
+                                attr_name: "__init__".to_string(),
+                            });
+                        }
+                    }
+                    DirectCallCallee::Method { method_name } => {
+                        let owners = unsafe {
+                            crate::lookup_exact_owner_types_for_method(plan.target, method_name)
+                        }
                         .map_err(|_| {
                             format!(
-                                "failed to resolve owner types for constructor {}",
-                                plan.target
+                                "failed to resolve owner types for method {} target {}",
+                                method_name, plan.target
                             )
                         })?;
-                for owner in owners {
-                    let Some(owner_type_ref) = reloc_type_ref_for_type(owner.owner_type)? else {
-                        continue;
-                    };
-                    callable_refs.insert(RelocCallableRef::OwnerAttr {
-                        owner_type_ref,
-                        attr_name: "__init__".to_string(),
-                    });
+                        for owner in owners {
+                            let Some(owner_type_ref) = reloc_type_ref_for_type(owner.owner_type)?
+                            else {
+                                continue;
+                            };
+                            callable_refs.insert(RelocCallableRef::OwnerAttr {
+                                owner_type_ref,
+                                attr_name: method_name.clone(),
+                            });
+                        }
+                    }
                 }
             }
         }

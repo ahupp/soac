@@ -28,7 +28,7 @@ use soac_core::block_py::{
 };
 use soac_ir_typed::emit_v3::{MechanicalEmitError, emit_mechanical_plan_v3};
 use soac_ir_typed::plan_v3::{
-    DirectCallArgPlan, DirectCallArgSource, DirectCallSpecializationPlan,
+    DirectCallArgPlan, DirectCallArgSource, DirectCallCallee, DirectCallSpecializationPlan,
     EXACT_LIST_EXACT_INT_ITEM_SHAPE_TAG, ExactListItemAccessKind, ExactListItemShape,
     ExactListItemSpecializationPlan, FunctionOptimizationPlanV3, FunctionPlanIdentity,
     IndexedFieldAccessKind, IndexedFieldOwnerType, IndexedFieldSpecializationPlan,
@@ -1175,9 +1175,21 @@ fn direct_call_requests_from_evidence_v3(
         .collect::<Vec<_>>();
     entries.sort_by_key(|(source, _)| *source);
     for (source, targets) in entries {
-        if is_method_call_source_v3(lowered_module, function, source) {
-            continue;
-        }
+        let source_method_name = match method_call_name_for_instr_id_v3(
+            lowered_module,
+            function,
+            source,
+        ) {
+            Some(Some(method_name)) => Some(method_name),
+            Some(None) => {
+                diagnostics.push(PlanDiagnostic {
+                    source: Some(source),
+                    message: "v3 direct-call declined method source: lowered attribute name is not a constant string".to_string(),
+                });
+                continue;
+            }
+            None => None,
+        };
         let mut targets = targets;
         targets.sort();
         targets.dedup();
@@ -1202,8 +1214,17 @@ fn direct_call_requests_from_evidence_v3(
                 });
                 continue;
             }
-            let implicit_positional_arg_count =
-                usize::from(target_function.names.fn_name == "__init__");
+            let callee = if target_function.names.fn_name == "__init__" {
+                DirectCallCallee::Constructor
+            } else if let Some(method_name) = source_method_name.clone() {
+                DirectCallCallee::Method { method_name }
+            } else {
+                DirectCallCallee::Function
+            };
+            let implicit_positional_arg_count = match &callee {
+                DirectCallCallee::Function => 0,
+                DirectCallCallee::Method { .. } | DirectCallCallee::Constructor => 1,
+            };
             let arg_plan = match direct_call_arg_plan_for_instr_id_v3(
                 function,
                 source,
@@ -1233,18 +1254,28 @@ fn direct_call_requests_from_evidence_v3(
             requests.push(DirectCallPlanRequest {
                 source,
                 target: serialized_target,
+                callee: callee.clone(),
                 arg_plan,
-                body: CallBodyPlanRequest::with_inline_candidate(direct_call_inline_candidate_v3(
-                    lowered_module,
-                    &current_module,
-                    function,
-                    source,
-                    target_entry,
-                )),
-                reason: if target_function.names.fn_name == "__init__" {
-                    "profiled call_hot_targets selected this constructor with validated constructor-call arguments".to_string()
-                } else {
-                    "profiled call_hot_targets selected this function with validated ordinary-call arguments".to_string()
+                body: CallBodyPlanRequest::with_inline_candidate(
+                    matches!(callee, DirectCallCallee::Function)
+                        && direct_call_inline_candidate_v3(
+                            lowered_module,
+                            &current_module,
+                            function,
+                            source,
+                            target_entry,
+                        ),
+                ),
+                reason: match callee {
+                    DirectCallCallee::Function => {
+                        "profiled call_hot_targets selected this function with validated ordinary-call arguments".to_string()
+                    }
+                    DirectCallCallee::Method { .. } => {
+                        "profiled call_hot_targets selected this method with validated receiver-method arguments".to_string()
+                    }
+                    DirectCallCallee::Constructor => {
+                        "profiled call_hot_targets selected this constructor with validated constructor-call arguments".to_string()
+                    }
                 },
             });
             identity_builder
@@ -1252,14 +1283,6 @@ fn direct_call_requests_from_evidence_v3(
         }
     }
     (requests, diagnostics)
-}
-
-fn is_method_call_source_v3(
-    module: &BlockPyModule<CodegenModuleShape>,
-    function: &BlockPyFunction<CodegenModuleShape>,
-    source: InstrId,
-) -> bool {
-    method_call_name_for_instr_id_v3(module, function, source).is_some()
 }
 
 fn method_call_name_for_instr_id_v3(
@@ -1668,17 +1691,18 @@ mod tests {
     use crate::region_v3::{ExtractedValueId, extract_block_region_v3};
     use soac_core::block_py::literal::{LiteralValue, StringLiteral};
     use soac_core::block_py::{
-        BinOp, BinOpKind, Block, BlockLabel, BlockParam, BlockPyName, BlockTerm, FunctionName,
-        GetAttr, GetItem, InstrId, Load, LocalFunctionId, LocalLocation, Meta, ModuleNameGen,
-        NameLocation, Param, ParamSpec, ResolvedName, RuntimeFunctionId, SerializedFunctionId,
-        SerializedModuleId, SetAttr, SetItem, StorageLayout, Store, TermIf, WithMeta,
+        BinOp, BinOpKind, Block, BlockLabel, BlockParam, BlockPyName, BlockTerm, Call,
+        CallArgPositional, FunctionName, GetAttr, GetItem, InstrId, Load, LocalFunctionId,
+        LocalLocation, Meta, ModuleNameGen, NameLocation, Param, ParamSpec, ResolvedName,
+        RuntimeFunctionId, SerializedFunctionId, SerializedModuleId, SetAttr, SetItem,
+        StorageLayout, Store, TermIf, WithMeta,
     };
     use soac_core::profile::{
-        CounterDumpKeyLayout, CounterDumpRecord, CounterDumpTypeKey, CounterDumpTypeKeyLayout,
-        CounterDumpTypeTableEntry,
+        CounterDumpKeyLayout, CounterDumpRecord, CounterDumpRow, CounterDumpTypeKey,
+        CounterDumpTypeKeyLayout, CounterDumpTypeTableEntry,
     };
     use soac_ir_blockpy::InstrCodegen;
-    use soac_ir_typed::plan_v3::{RegionId, validate_module_plan_v3};
+    use soac_ir_typed::plan_v3::{CallBodyKind, RegionId, validate_module_plan_v3};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1769,10 +1793,19 @@ mod tests {
         blocks: Vec<Block<InstrCodegen>>,
     ) -> BlockPyFunction<CodegenModuleShape> {
         let name_gen = ModuleNameGen::new(0).next_function_name_gen();
+        function_with_name_gen(name_gen, "f", "f", blocks)
+    }
+
+    fn function_with_name_gen(
+        name_gen: soac_core::block_py::FunctionNameGen,
+        fn_name: &str,
+        qualname: &str,
+        blocks: Vec<Block<InstrCodegen>>,
+    ) -> BlockPyFunction<CodegenModuleShape> {
         BlockPyFunction {
             function_id: name_gen.function_id(),
             name_gen,
-            names: FunctionName::new("f", "f", "f", "f"),
+            names: FunctionName::new(fn_name, fn_name, qualname, qualname),
             kind: soac_core::block_py::FunctionKind::Function,
             execution_mode: Default::default(),
             params: ParamSpec::default(),
@@ -1843,6 +1876,30 @@ mod tests {
             "soac_opt-v3-pipeline-test-{}-{nanos}.bin",
             std::process::id()
         ))
+    }
+
+    fn row(
+        kind: &str,
+        function_id: RuntimeFunctionId,
+        instr_id: InstrId,
+        value: u64,
+        observed_value: Option<u64>,
+    ) -> CounterDumpRow {
+        CounterDumpRow {
+            counter_id: 0,
+            scope: "function".to_string(),
+            kind: kind.to_string(),
+            site_kind: kind.to_string(),
+            function_id: Some(function_id),
+            current_function_id: Some(function_id),
+            instr_id: Some(instr_id),
+            function_qualname: Some("f".to_string()),
+            block_label: Some("bb0".to_string()),
+            value,
+            branch_values: Vec::new(),
+            observed_value,
+            max_overcount: None,
+        }
     }
 
     fn evidence() -> FunctionProfileEvidence {
@@ -1970,6 +2027,222 @@ mod tests {
             source,
             &default_target
         ));
+    }
+
+    #[test]
+    fn direct_call_requests_include_constructor_targets_with_allocated_self() {
+        let module_name_gen = ModuleNameGen::new(0);
+        let source = instr_id(9);
+        let call = with_instr_id(
+            InstrCodegen::Call(Call::new(
+                local("Record", 0),
+                vec![CallArgPositional::Positional(local("value", 1))],
+                Vec::new(),
+            )),
+            9,
+        );
+        let mut caller = function_with_name_gen(
+            module_name_gen.next_function_name_gen(),
+            "caller",
+            "caller",
+            vec![Block::new(
+                label(0),
+                vec![InstrCodegen::Store(Store::new(
+                    local_name("result", 2),
+                    call,
+                ))],
+                BlockTerm::Return(local("result", 2)),
+                Vec::<BlockParam>::new(),
+                None,
+            )],
+        );
+        set_stack_slots(&mut caller, &["Record", "value", "result"]);
+        let mut init = function_with_name_gen(
+            module_name_gen.next_function_name_gen(),
+            "__init__",
+            "Record.__init__",
+            vec![Block::new(
+                label(0),
+                Vec::new(),
+                BlockTerm::Return(local("self", 0)),
+                Vec::<BlockParam>::new(),
+                None,
+            )],
+        );
+        init.params.params = vec![
+            any_param("self", false),
+            any_param("value", false),
+            any_param("defaulted", true),
+        ];
+        set_stack_slots(&mut init, &["self", "value", "defaulted"]);
+        let caller_id = caller.function_id;
+        let init_id = init.function_id;
+        let module = BlockPyModule {
+            module_name_gen,
+            global_names: Vec::new(),
+            callable_defs: vec![caller.clone(), init],
+            module_constants: Vec::new(),
+            counter_defs: Vec::new(),
+        };
+        let record = CounterDumpRecord {
+            source_hash: 0x99,
+            module_name: "pkg.mod".to_string(),
+            package_name: None,
+            rows: vec![row(
+                "call_hot_targets",
+                caller_id,
+                source,
+                1,
+                Some(init_id.to_packed_runtime_u64()),
+            )],
+            module_keys: Vec::new(),
+            type_keys: Vec::new(),
+            type_table: Vec::new(),
+        };
+        let path = unique_counter_path_v3();
+        fs::write(path.as_path(), record.encode().unwrap()).unwrap();
+        let evidence_store = ProfileEvidenceStore::from_counter_dump(path.as_path()).unwrap();
+        let _ = fs::remove_file(path);
+        let module_identity = module_identity();
+        let target_index = DirectCallTargetIndex::from_current_module(&module_identity, &module);
+        let mut identity_builder = OptimizationPlanV3IdentityBuilder::new(&module_identity);
+
+        let (requests, diagnostics) = direct_call_requests_from_evidence_v3(
+            &module,
+            &module_identity,
+            &caller,
+            &evidence_store,
+            &target_index,
+            &mut identity_builder,
+        );
+
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].source, source);
+        assert_eq!(
+            requests[0].arg_plan.sources,
+            vec![
+                DirectCallArgSource::Provided(0),
+                DirectCallArgSource::Provided(1),
+                DirectCallArgSource::DefaultSentinel,
+            ]
+        );
+        assert!(
+            requests[0]
+                .body
+                .alternatives
+                .iter()
+                .any(|alternative| alternative.kind == CallBodyKind::DirectCall)
+        );
+        assert!(requests[0].reason.contains("constructor"));
+    }
+
+    #[test]
+    fn direct_call_requests_include_method_targets_with_implicit_receiver() {
+        let module_name_gen = ModuleNameGen::new(0);
+        let source = instr_id(9);
+        let call = with_instr_id(
+            InstrCodegen::Call(Call::new(
+                InstrCodegen::GetAttr(GetAttr::new(local("record", 0), constant_name(0))),
+                Vec::new(),
+                Vec::new(),
+            )),
+            9,
+        );
+        let mut caller = function_with_name_gen(
+            module_name_gen.next_function_name_gen(),
+            "caller",
+            "caller",
+            vec![Block::new(
+                label(0),
+                vec![InstrCodegen::Store(Store::new(
+                    local_name("result", 1),
+                    call,
+                ))],
+                BlockTerm::Return(local("result", 1)),
+                Vec::<BlockParam>::new(),
+                None,
+            )],
+        );
+        set_stack_slots(&mut caller, &["record", "result"]);
+        let mut method = function_with_name_gen(
+            module_name_gen.next_function_name_gen(),
+            "copy",
+            "Record.copy",
+            vec![Block::new(
+                label(0),
+                Vec::new(),
+                BlockTerm::Return(local("self", 0)),
+                Vec::<BlockParam>::new(),
+                None,
+            )],
+        );
+        method.params.params = vec![any_param("self", false)];
+        set_stack_slots(&mut method, &["self"]);
+        let caller_id = caller.function_id;
+        let method_id = method.function_id;
+        let module = BlockPyModule {
+            module_name_gen,
+            global_names: Vec::new(),
+            callable_defs: vec![caller.clone(), method],
+            module_constants: vec![ConstantExpr::Literal(LiteralValue::new(StringLiteral {
+                value: "copy".to_string(),
+            }))],
+            counter_defs: Vec::new(),
+        };
+        let record = CounterDumpRecord {
+            source_hash: 0x99,
+            module_name: "pkg.mod".to_string(),
+            package_name: None,
+            rows: vec![row(
+                "call_hot_targets",
+                caller_id,
+                source,
+                1,
+                Some(method_id.to_packed_runtime_u64()),
+            )],
+            module_keys: Vec::new(),
+            type_keys: Vec::new(),
+            type_table: Vec::new(),
+        };
+        let path = unique_counter_path_v3();
+        fs::write(path.as_path(), record.encode().unwrap()).unwrap();
+        let evidence_store = ProfileEvidenceStore::from_counter_dump(path.as_path()).unwrap();
+        let _ = fs::remove_file(path);
+        let module_identity = module_identity();
+        let target_index = DirectCallTargetIndex::from_current_module(&module_identity, &module);
+        let mut identity_builder = OptimizationPlanV3IdentityBuilder::new(&module_identity);
+
+        let (requests, diagnostics) = direct_call_requests_from_evidence_v3(
+            &module,
+            &module_identity,
+            &caller,
+            &evidence_store,
+            &target_index,
+            &mut identity_builder,
+        );
+
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].source, source);
+        assert_eq!(
+            requests[0].callee,
+            DirectCallCallee::Method {
+                method_name: "copy".to_string()
+            }
+        );
+        assert_eq!(
+            requests[0].arg_plan.sources,
+            vec![DirectCallArgSource::Provided(0)]
+        );
+        assert!(
+            requests[0]
+                .body
+                .alternatives
+                .iter()
+                .all(|alternative| alternative.kind == CallBodyKind::DirectCall)
+        );
+        assert!(requests[0].reason.contains("method"));
     }
 
     #[test]

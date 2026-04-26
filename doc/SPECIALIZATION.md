@@ -20,17 +20,19 @@ the typed result. Runtime `verify`/`apply` and offline precompile both use raw
 profile evidence directly; the JIT should not run legacy BlockPy optimization
 rewrites or require serialized optimization-plan artifacts.
 
-Profiled ordinary-function direct calls from v3 planning are selected with
-validated argument plans and serialized target module identities. Call plans
-also carry the selected call-body policy: `DirectCall` for guarded direct-call
-lowering, or `Inline` when the planner selected the early BlockPy inline path as
-the lower-cost body alternative. `Inline` selection validates that the BlockPy
-inline-fragment builder can construct the selected body from the cached target
-module, and the v3 plan is the source of truth consumed by typed JIT planning.
-Runtime-guarded receiver-method and constructor call specializations are not
-represented in v3 plan/emission data today; those call shapes stay on generic
-lowering unless a future plan format adds validated static guard inputs for
-them.
+Profiled ordinary-function and simple constructor direct calls from v3 planning
+are selected with validated argument plans and serialized target module
+identities. Call plans also carry the selected call-body policy: `DirectCall`
+for guarded direct-call lowering, or `Inline` when the planner selected the
+early BlockPy inline path as the lower-cost body alternative. `Inline` selection
+validates that the BlockPy inline-fragment builder can construct the selected
+body from the cached target module, and the v3 plan is the source of truth
+consumed by typed JIT planning. Constructor targets are consumed as typed
+constructor-call guards after the JIT resolves the owner type and `__init__`
+callable relocation for the selected function. Runtime-guarded receiver-method
+specializations are not represented in v3 plan/emission data today; those call
+shapes stay on generic lowering unless a future plan format adds validated
+static guard inputs for them.
 Constant-attribute indexed-field load/store selections from `type_keys` are
 also emitted as mechanical v3 indexed-field decisions; JIT validation checks
 those emitted decisions against the selected plan and lowered
@@ -70,7 +72,10 @@ Current migration surface:
   the add store and the later branch as separate v3 regions. Profiled ordinary
   direct calls are selected by v3, emitted with serialized target identities and
   an explicit call-body policy, and embedded into `InstrTyped` during JIT
-  planning. Constant-string indexed fields are selected by v3 from raw
+  planning. Simple constructor calls are selected by v3 from the same
+  `call_hot_targets` input, embedded as typed constructor-call guards, and
+  lowered through the existing guarded constructor allocation/init codegen
+  shape. Constant-string indexed fields are selected by v3 from raw
   `type_keys`, emitted as mechanical
   indexed-field decisions, and consumed as v3-owned typed attribute inputs.
   Indexed globals are selected by v3 from raw `module_keys` plus lowered
@@ -470,8 +475,8 @@ their owner/type guard payload is not yet a static mechanical JIT input.
 - Current limitations:
   - keywords are excluded
   - starred / unpacked args are excluded
-  - constructor and method targets are excluded until their guard payloads are
-    represented as static v3 codegen inputs
+  - method targets are excluded until their guard payloads are represented as
+    static v3 codegen inputs
   - variadic target params are excluded
   - required keyword-only target params are excluded unless they have a
     default value
@@ -503,19 +508,25 @@ the v3 plan/emission data does not carry method-call plan entries.
 
 ## Type Constructors
 
-Constructor calls still reuse `call_hot_targets` evidence, but they are not a
-live optimizer-v3 codegen family today. The v3 plan/emission data does not carry
-constructor-call plan entries. A future constructor family needs a static plan
-payload for the owner type key, the `__init__` callable relocation, the
-direct-entry argument plan with implicit `self`, the callable type-version
-guard, and the original constructor fallback before codegen should emit a fast
-path.
+Constructor calls reuse `call_hot_targets` evidence. When the hot target is an
+`__init__` function and the call site can bind positionals through a validated
+direct-entry argument plan with an implicit `self`, v3 records the selected
+direct-call target and argument plan. During typed JIT planning, the JIT resolves
+owner type metadata for that initializer, predeclares the owner type and
+`__init__` callable relocation, and embeds typed constructor guards into the
+call site.
 
-Constructor allocation, initializer inlining, and constructor scalar
-replacement should be represented directly in `InstrTyped` metadata or typed
-operation shape when they return. The JIT should not compute an inline plan to
-decide whether to skip `__init__`; it should only lower the operation shape
-already selected by the v3 plan and embedded in the typed module.
+Codegen then emits the guarded constructor path: check the callable owner/type
+version, allocate through `dp_jit_pytype_generic_alloc`, direct-call the
+selected `__init__` with the allocated `self`, finish with
+`dp_jit_finish_constructor_init`, and fall back to the original generic
+constructor call on guard miss.
+
+Constructor initializer inlining and constructor scalar replacement should be
+represented directly in `InstrTyped` metadata or typed operation shape when
+they return. The JIT should not compute an inline plan to decide whether to skip
+`__init__`; it should only lower the operation shape already selected by the v3
+plan and embedded in the typed module.
 
 ## Operation Specializations
 
@@ -808,8 +819,8 @@ Some notable hot paths still use only generic lowering:
 - keyword calls
 - starred-argument calls
 - omitted-default profiled direct calls
-- most constructor calls outside the current simple default-constructor
-  subset
+- constructor calls with keywords, starred arguments, unresolved owner metadata,
+  or shapes outside the current guarded allocation/init path
 - most non-`int` operator shapes
 
 Those are the main expansion areas if we want the specialization system

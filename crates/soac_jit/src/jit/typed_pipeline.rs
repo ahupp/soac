@@ -12,15 +12,16 @@ use soac_core::block_py::{
 };
 use soac_ir_blockpy::CodegenModuleShape;
 use soac_ir_typed::plan_v3::{
-    ExactListItemAccessKind, IndexedFieldAccessKind as PlanV3IndexedFieldAccessKind,
+    DirectCallCallee, ExactListItemAccessKind,
+    IndexedFieldAccessKind as PlanV3IndexedFieldAccessKind,
     IndexedGlobalAccessKind as PlanV3IndexedGlobalAccessKind,
 };
 use soac_ir_typed::{
     FactStore, InstrTyped, TypedAttrAccessPlan, TypedCallEmissionPlan, TypedCallEmissionPlans,
-    TypedCodegenModuleShape, TypedDirectConstructorCallGuard, TypedExactIntBranchPlan,
-    TypedExactIntPlanSource, TypedExactIntReturnPlan, TypedExactIntScalarThreadPlan,
-    TypedExactListItemAccessPlan, TypedExactListItemPlanSource, TypedIndexedFieldPlanSource,
-    TypedIndexedGlobalAccessPlan, TypedIndexedGlobalPlanSource,
+    TypedCodegenModuleShape, TypedDirectConstructorCallGuard, TypedDirectMethodCallGuard,
+    TypedExactIntBranchPlan, TypedExactIntPlanSource, TypedExactIntReturnPlan,
+    TypedExactIntScalarThreadPlan, TypedExactListItemAccessPlan, TypedExactListItemPlanSource,
+    TypedIndexedFieldPlanSource, TypedIndexedGlobalAccessPlan, TypedIndexedGlobalPlanSource,
     assign_missing_typed_function_instr_ids,
 };
 use soac_opt::access_emission_v3::{
@@ -80,6 +81,43 @@ fn constructor_guards_for_v3_direct_call(
     Ok(guards)
 }
 
+fn method_guards_for_v3_direct_call(
+    plan: &ResolvedV3DirectCallPlan,
+    method_name: &str,
+) -> Result<Vec<TypedDirectMethodCallGuard>, String> {
+    let owners = unsafe { crate::lookup_exact_owner_types_for_method(plan.target, method_name) }
+        .map_err(|_| {
+            format!(
+                "failed to resolve owner types for method {} target {}",
+                method_name, plan.target
+            )
+        })?;
+    let mut guards = Vec::with_capacity(owners.len());
+    for owner in owners {
+        let Some(owner_type_ref) = super::symbols::reloc_type_ref_for_type(owner.owner_type)?
+        else {
+            continue;
+        };
+        if !super::symbols::ensure_reloc_callable_symbol_registered(
+            &super::symbols::RelocCallableRef::OwnerAttr {
+                owner_type_ref: owner_type_ref.clone(),
+                attr_name: method_name.to_string(),
+            },
+        )? {
+            continue;
+        }
+        guards.push(TypedDirectMethodCallGuard {
+            function_id: plan.target,
+            owner_type_ref: super::symbols::typed_attr_owner_ref_from_reloc_type_ref(
+                &owner_type_ref,
+            ),
+            type_version: owner.type_version,
+            arg_plan: plan.arg_plan.clone(),
+        });
+    }
+    Ok(guards)
+}
+
 fn insert_constructor_guards(
     emissions: &mut TypedCallEmissionPlans,
     source: InstrId,
@@ -108,6 +146,40 @@ fn insert_constructor_guards(
     Ok(())
 }
 
+fn insert_method_guards(
+    emissions: &mut TypedCallEmissionPlans,
+    source: InstrId,
+    method_name: String,
+    guards: Vec<TypedDirectMethodCallGuard>,
+) -> Result<(), String> {
+    if guards.is_empty() {
+        return Ok(());
+    }
+    let plan = emissions
+        .by_source
+        .entry(source)
+        .or_insert_with(|| TypedCallEmissionPlan::Method {
+            method_name: method_name.clone(),
+            method_guards: Vec::new(),
+        });
+    let TypedCallEmissionPlan::Method {
+        method_name: existing_name,
+        method_guards,
+    } = plan
+    else {
+        return Err(format!(
+            "method-call emission source {source:?} already has non-method plan"
+        ));
+    };
+    if existing_name != &method_name {
+        return Err(format!(
+            "method-call emission source {source:?} has conflicting method names {existing_name:?} and {method_name:?}"
+        ));
+    }
+    method_guards.extend(guards);
+    Ok(())
+}
+
 fn typed_call_emission_plans_for_profile_function(
     profile: &SpecializationProfile<'_>,
     function_id: RuntimeFunctionId,
@@ -117,25 +189,44 @@ fn typed_call_emission_plans_for_profile_function(
         HashMap::<InstrId, Vec<ResolvedV3DirectCallPlan>>::new();
     let mut constructor_guards_by_instr =
         HashMap::<InstrId, Vec<TypedDirectConstructorCallGuard>>::new();
+    let mut method_guards_by_instr =
+        HashMap::<InstrId, HashMap<String, Vec<TypedDirectMethodCallGuard>>>::new();
     for (source, plans) in opt_v3_direct_calls_by_instr {
         for plan in plans {
-            let constructor_guards = constructor_guards_for_v3_direct_call(&plan)?;
-            if constructor_guards.is_empty() {
-                ordinary_direct_calls_by_instr
-                    .entry(source)
-                    .or_default()
-                    .push(plan);
-            } else {
-                constructor_guards_by_instr
-                    .entry(source)
-                    .or_default()
-                    .extend(constructor_guards);
+            match &plan.callee {
+                DirectCallCallee::Function => {
+                    ordinary_direct_calls_by_instr
+                        .entry(source)
+                        .or_default()
+                        .push(plan);
+                }
+                DirectCallCallee::Constructor => {
+                    let constructor_guards = constructor_guards_for_v3_direct_call(&plan)?;
+                    constructor_guards_by_instr
+                        .entry(source)
+                        .or_default()
+                        .extend(constructor_guards);
+                }
+                DirectCallCallee::Method { method_name } => {
+                    let method_guards = method_guards_for_v3_direct_call(&plan, method_name)?;
+                    method_guards_by_instr
+                        .entry(source)
+                        .or_default()
+                        .entry(method_name.clone())
+                        .or_default()
+                        .extend(method_guards);
+                }
             }
         }
     }
     let mut emissions = typed_call_emission_plans_from_v3(&ordinary_direct_calls_by_instr)?;
     for (source, guards) in constructor_guards_by_instr {
         insert_constructor_guards(&mut emissions, source, guards)?;
+    }
+    for (source, guards_by_method) in method_guards_by_instr {
+        for (method_name, guards) in guards_by_method {
+            insert_method_guards(&mut emissions, source, method_name, guards)?;
+        }
     }
     Ok(emissions)
 }

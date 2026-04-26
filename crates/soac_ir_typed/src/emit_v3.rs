@@ -42,6 +42,7 @@ pub struct MechanicalRegionFunctionParamInput<'a> {
 pub struct MechanicalDirectCallEmission {
     pub source: InstrId,
     pub target: SerializedFunctionId,
+    pub callee: crate::plan_v3::DirectCallCallee,
     pub arg_plan: DirectCallArgPlan,
     pub body: CallBodyPlan,
     pub reason: String,
@@ -1518,6 +1519,7 @@ fn emit_direct_call(direct_call: &DirectCallSpecializationPlan) -> MechanicalDir
     MechanicalDirectCallEmission {
         source: direct_call.source,
         target: direct_call.target,
+        callee: direct_call.callee.clone(),
         arg_plan: direct_call.arg_plan.clone(),
         body: direct_call.body.clone(),
         reason: direct_call.reason.clone(),
@@ -2052,6 +2054,7 @@ mod tests {
             .push(DirectCallSpecializationPlan {
                 source,
                 target,
+                callee: crate::plan_v3::DirectCallCallee::Function,
                 arg_plan: DirectCallArgPlan {
                     sources: vec![DirectCallArgSource::Provided(0)],
                 },
@@ -2066,6 +2069,7 @@ mod tests {
             vec![MechanicalDirectCallEmission {
                 source,
                 target,
+                callee: crate::plan_v3::DirectCallCallee::Function,
                 arg_plan: DirectCallArgPlan {
                     sources: vec![DirectCallArgSource::Provided(0)],
                 },

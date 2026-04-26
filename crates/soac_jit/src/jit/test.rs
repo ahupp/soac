@@ -14809,6 +14809,7 @@ def f(x):
                     direct_calls: vec![DirectCallSpecializationPlan {
                         source,
                         target: serialized_callee,
+                        callee: soac_ir_typed::plan_v3::DirectCallCallee::Function,
                         arg_plan: PlanV3DirectCallArgPlan {
                             sources: vec![PlanV3DirectCallArgSource::Provided(0)],
                         },
@@ -14831,6 +14832,7 @@ def f(x):
                     direct_calls: vec![soac_ir_typed::emit_v3::MechanicalDirectCallEmission {
                         source,
                         target: serialized_callee,
+                        callee: soac_ir_typed::plan_v3::DirectCallCallee::Function,
                         arg_plan: PlanV3DirectCallArgPlan {
                             sources: vec![PlanV3DirectCallArgSource::Provided(0)],
                         },
@@ -14867,6 +14869,7 @@ def f(x):
             &ResolvedV3DirectCallPlan {
                 source,
                 target: callee_id,
+                callee: soac_ir_typed::plan_v3::DirectCallCallee::Function,
                 arg_plan: soac_ir_typed::TypedDirectCallArgPlan {
                     sources: vec![soac_ir_typed::TypedDirectCallArgSource::Provided(0)],
                 },
@@ -14935,6 +14938,7 @@ def f(x):
                     direct_calls: vec![DirectCallSpecializationPlan {
                         source,
                         target: serialized_callee,
+                        callee: soac_ir_typed::plan_v3::DirectCallCallee::Function,
                         arg_plan: PlanV3DirectCallArgPlan {
                             sources: vec![PlanV3DirectCallArgSource::Provided(0)],
                         },
@@ -14957,6 +14961,7 @@ def f(x):
                     direct_calls: vec![soac_ir_typed::emit_v3::MechanicalDirectCallEmission {
                         source,
                         target: serialized_callee,
+                        callee: soac_ir_typed::plan_v3::DirectCallCallee::Function,
                         arg_plan: PlanV3DirectCallArgPlan {
                             sources: vec![PlanV3DirectCallArgSource::Provided(0)],
                         },
@@ -14993,6 +14998,7 @@ def f(x):
             &ResolvedV3DirectCallPlan {
                 source,
                 target: callee_id,
+                callee: soac_ir_typed::plan_v3::DirectCallCallee::Function,
                 arg_plan: soac_ir_typed::TypedDirectCallArgPlan {
                     sources: vec![soac_ir_typed::TypedDirectCallArgSource::Provided(0)],
                 },
@@ -16053,6 +16059,7 @@ def read_point(point):
                     direct_calls: vec![DirectCallSpecializationPlan {
                         source,
                         target: serialized_callee,
+                        callee: soac_ir_typed::plan_v3::DirectCallCallee::Function,
                         arg_plan: PlanV3DirectCallArgPlan {
                             sources: vec![PlanV3DirectCallArgSource::Provided(0)],
                         },
@@ -16906,6 +16913,7 @@ def f(x, y):
                     vec![ResolvedV3DirectCallPlan {
                         source: call_instr_id,
                         target: callee_id,
+                        callee: soac_ir_typed::plan_v3::DirectCallCallee::Function,
                         arg_plan: TypedDirectCallArgPlan {
                             sources: vec![TypedDirectCallArgSource::Provided(0)],
                         },
@@ -18720,6 +18728,7 @@ class Point:
         let v3_plan = ResolvedV3DirectCallPlan {
             source: call_instr_id,
             target: callee_function.function_id,
+            callee: soac_ir_typed::plan_v3::DirectCallCallee::Function,
             arg_plan: TypedDirectCallArgPlan {
                 sources: vec![TypedDirectCallArgSource::Provided(0)],
             },

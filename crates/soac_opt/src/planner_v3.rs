@@ -10,12 +10,13 @@ use soac_core::block_py::{
 };
 use soac_ir_typed::plan_v3::{
     CallBodyKind, CallBodyPlan, ConversionKind, ConversionOwnership, ConversionPrecondition,
-    ConvertNode, Cost, DirectCallArgPlan, DirectCallSpecializationPlan, ExactListItemAccessKind,
-    ExactListItemFallbackKind, ExactListItemFallbackPlan, ExactListItemGuardKind,
-    ExactListItemGuardPlan, ExactListItemShape, ExactListItemSpecializationPlan, FailureMode,
-    FallbackReason, FallbackTarget, FunctionOptimizationPlanV3, FunctionOwnershipPlan,
-    FunctionPlanIdentity, IndexedFieldAccessKind, IndexedFieldFallbackKind,
-    IndexedFieldFallbackPlan, IndexedFieldGuardKind, IndexedFieldGuardPlan, IndexedFieldOwnerType,
+    ConvertNode, Cost, DirectCallArgPlan, DirectCallCallee, DirectCallSpecializationPlan,
+    ExactListItemAccessKind, ExactListItemFallbackKind, ExactListItemFallbackPlan,
+    ExactListItemGuardKind, ExactListItemGuardPlan, ExactListItemShape,
+    ExactListItemSpecializationPlan, FailureMode, FallbackReason, FallbackTarget,
+    FunctionOptimizationPlanV3, FunctionOwnershipPlan, FunctionPlanIdentity,
+    IndexedFieldAccessKind, IndexedFieldFallbackKind, IndexedFieldFallbackPlan,
+    IndexedFieldGuardKind, IndexedFieldGuardPlan, IndexedFieldOwnerType,
     IndexedFieldSpecializationPlan, IndexedGlobalAccessKind, IndexedGlobalFallbackKind,
     IndexedGlobalFallbackPlan, IndexedGlobalGuardKind, IndexedGlobalGuardPlan,
     IndexedGlobalSpecializationPlan, MaterializeKind, MaterializeNode, ModuleOptimizationPlanV3,
@@ -48,6 +49,7 @@ pub struct FunctionPlanRequest {
 pub struct DirectCallPlanRequest {
     pub source: InstrId,
     pub target: SerializedFunctionId,
+    pub callee: DirectCallCallee,
     pub arg_plan: DirectCallArgPlan,
     pub body: CallBodyPlanRequest,
     pub reason: String,
@@ -237,6 +239,7 @@ fn plan_direct_call_specializations_v3(
             plans.push(DirectCallSpecializationPlan {
                 source: request.source,
                 target: request.target,
+                callee: request.callee.clone(),
                 arg_plan: request.arg_plan.clone(),
                 body: choose_call_body_plan_v3(&request.body),
                 reason: request.reason.clone(),
@@ -1827,6 +1830,7 @@ mod tests {
             DirectCallPlanRequest {
                 source,
                 target,
+                callee: DirectCallCallee::Function,
                 arg_plan: DirectCallArgPlan {
                     sources: vec![soac_ir_typed::plan_v3::DirectCallArgSource::Provided(0)],
                 },
@@ -1836,6 +1840,7 @@ mod tests {
             DirectCallPlanRequest {
                 source,
                 target,
+                callee: DirectCallCallee::Function,
                 arg_plan: DirectCallArgPlan {
                     sources: vec![soac_ir_typed::plan_v3::DirectCallArgSource::Provided(0)],
                 },
@@ -1869,6 +1874,7 @@ mod tests {
         request.functions[0].direct_calls = vec![DirectCallPlanRequest {
             source,
             target,
+            callee: DirectCallCallee::Function,
             arg_plan: DirectCallArgPlan {
                 sources: vec![soac_ir_typed::plan_v3::DirectCallArgSource::Provided(0)],
             },
