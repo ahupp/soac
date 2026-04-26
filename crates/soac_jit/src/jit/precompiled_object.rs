@@ -369,8 +369,10 @@ pub(super) fn write_precompiled_object(
     for data in data_definitions {
         let section = if data.writable {
             ElfSectionIndex::Data
-        } else {
+        } else if data.relocations.is_empty() {
             ElfSectionIndex::Rodata
+        } else {
+            ElfSectionIndex::DataRelRo
         };
         let offset = object.append_data(section, data.bytes.as_slice(), data.align)?;
         let symbol_index = object.add_defined_symbol(
@@ -462,6 +464,7 @@ pub(super) fn write_precompiled_object(
 struct ElfObjectBuilder {
     text: Vec<u8>,
     data: Vec<u8>,
+    data_rel_ro: Vec<u8>,
     rodata: Vec<u8>,
     eh_frame: Vec<u8>,
     debug_info: Vec<u8>,
@@ -472,6 +475,7 @@ struct ElfObjectBuilder {
     global_symbols_by_name: HashMap<String, u32>,
     text_relocations: Vec<ElfRelocation>,
     data_relocations: Vec<ElfRelocation>,
+    data_rel_ro_relocations: Vec<ElfRelocation>,
     rodata_relocations: Vec<ElfRelocation>,
     eh_frame_relocations: Vec<ElfRelocation>,
     debug_info_relocations: Vec<ElfRelocation>,
@@ -492,6 +496,7 @@ impl ElfObjectBuilder {
     ) -> Result<u64, String> {
         let target = match section {
             ElfSectionIndex::Data => &mut self.data,
+            ElfSectionIndex::DataRelRo => &mut self.data_rel_ro,
             ElfSectionIndex::Rodata => &mut self.rodata,
             ElfSectionIndex::Text
             | ElfSectionIndex::EhFrame
@@ -557,6 +562,7 @@ impl ElfObjectBuilder {
             ElfSectionIndex::DebugStr => &mut self.debug_str,
             ElfSectionIndex::Text
             | ElfSectionIndex::Data
+            | ElfSectionIndex::DataRelRo
             | ElfSectionIndex::Rodata
             | ElfSectionIndex::Undefined => {
                 return Err(format!("cannot replace ELF section {section:?} bytes"));
@@ -578,6 +584,10 @@ impl ElfObjectBuilder {
         match section {
             ElfSectionIndex::Data => {
                 self.data_relocations.push(relocation);
+                Ok(())
+            }
+            ElfSectionIndex::DataRelRo => {
+                self.data_rel_ro_relocations.push(relocation);
                 Ok(())
             }
             ElfSectionIndex::Rodata => {
@@ -642,6 +652,16 @@ impl ElfObjectBuilder {
             );
             push_i64(&mut rela_data, relocation.addend);
         }
+        let mut rela_data_rel_ro =
+            Vec::with_capacity(self.data_rel_ro_relocations.len() * ELF64_RELA_SIZE);
+        for relocation in &self.data_rel_ro_relocations {
+            push_u64(&mut rela_data_rel_ro, relocation.offset);
+            push_u64(
+                &mut rela_data_rel_ro,
+                (u64::from(relocation.symbol_index) << 32) | u64::from(relocation.reloc_type),
+            );
+            push_i64(&mut rela_data_rel_ro, relocation.addend);
+        }
         let mut rela_rodata = Vec::with_capacity(self.rodata_relocations.len() * ELF64_RELA_SIZE);
         for relocation in &self.rodata_relocations {
             push_u64(&mut rela_rodata, relocation.offset);
@@ -685,6 +705,7 @@ impl ElfObjectBuilder {
         let mut shstrtab = Vec::from([0]);
         let text_name = push_string_table(&mut shstrtab, ".text")?;
         let data_name = push_string_table(&mut shstrtab, ".data")?;
+        let data_rel_ro_name = push_string_table(&mut shstrtab, ".data.rel.ro")?;
         let rodata_name = push_string_table(&mut shstrtab, ".rodata")?;
         let eh_frame_name = push_string_table(&mut shstrtab, ".eh_frame")?;
         let debug_info_name = push_string_table(&mut shstrtab, ".debug_info")?;
@@ -693,6 +714,7 @@ impl ElfObjectBuilder {
         let debug_str_name = push_string_table(&mut shstrtab, ".debug_str")?;
         let rela_text_name = push_string_table(&mut shstrtab, ".rela.text")?;
         let rela_data_name = push_string_table(&mut shstrtab, ".rela.data")?;
+        let rela_data_rel_ro_name = push_string_table(&mut shstrtab, ".rela.data.rel.ro")?;
         let rela_rodata_name = push_string_table(&mut shstrtab, ".rela.rodata")?;
         let rela_eh_frame_name = push_string_table(&mut shstrtab, ".rela.eh_frame")?;
         let rela_debug_info_name = push_string_table(&mut shstrtab, ".rela.debug_info")?;
@@ -705,6 +727,7 @@ impl ElfObjectBuilder {
         let mut file = vec![0; ELF64_EHDR_SIZE];
         let text_header = append_section_bytes(&mut file, self.text.as_slice(), 16)?;
         let data_header = append_section_bytes(&mut file, self.data.as_slice(), 8)?;
+        let data_rel_ro_header = append_section_bytes(&mut file, self.data_rel_ro.as_slice(), 8)?;
         let rodata_header = append_section_bytes(&mut file, self.rodata.as_slice(), 8)?;
         let eh_frame_header = append_section_bytes(&mut file, self.eh_frame.as_slice(), 8)?;
         let debug_info_header = append_section_bytes(&mut file, self.debug_info.as_slice(), 1)?;
@@ -713,6 +736,8 @@ impl ElfObjectBuilder {
         let debug_str_header = append_section_bytes(&mut file, self.debug_str.as_slice(), 1)?;
         let rela_text_header = append_section_bytes(&mut file, rela_text.as_slice(), 8)?;
         let rela_data_header = append_section_bytes(&mut file, rela_data.as_slice(), 8)?;
+        let rela_data_rel_ro_header =
+            append_section_bytes(&mut file, rela_data_rel_ro.as_slice(), 8)?;
         let rela_rodata_header = append_section_bytes(&mut file, rela_rodata.as_slice(), 8)?;
         let rela_eh_frame_header = append_section_bytes(&mut file, rela_eh_frame.as_slice(), 8)?;
         let rela_debug_info_header =
@@ -743,6 +768,17 @@ impl ElfObjectBuilder {
             SHT_PROGBITS,
             SHF_ALLOC | SHF_WRITE,
             data_header,
+            0,
+            0,
+            8,
+            0,
+        );
+        push_elf_section_header(
+            &mut section_headers,
+            data_rel_ro_name,
+            SHT_PROGBITS,
+            SHF_ALLOC | SHF_WRITE,
+            data_rel_ro_header,
             0,
             0,
             8,
@@ -833,6 +869,17 @@ impl ElfObjectBuilder {
             rela_data_header,
             ELF_SECTION_SYMTAB_INDEX,
             ELF_SECTION_DATA_INDEX,
+            8,
+            ELF64_RELA_SIZE as u64,
+        );
+        push_elf_section_header(
+            &mut section_headers,
+            rela_data_rel_ro_name,
+            SHT_RELA,
+            0,
+            rela_data_rel_ro_header,
+            ELF_SECTION_SYMTAB_INDEX,
+            ELF_SECTION_DATA_REL_RO_INDEX,
             8,
             ELF64_RELA_SIZE as u64,
         );
@@ -1051,6 +1098,7 @@ enum ElfSectionIndex {
     Undefined,
     Text,
     Data,
+    DataRelRo,
     Rodata,
     EhFrame,
     DebugInfo,
@@ -1065,6 +1113,7 @@ impl ElfSectionIndex {
             Self::Undefined => 0,
             Self::Text => ELF_SECTION_TEXT_INDEX as u16,
             Self::Data => ELF_SECTION_DATA_INDEX as u16,
+            Self::DataRelRo => ELF_SECTION_DATA_REL_RO_INDEX as u16,
             Self::Rodata => ELF_SECTION_RODATA_INDEX as u16,
             Self::EhFrame => ELF_SECTION_EH_FRAME_INDEX as u16,
             Self::DebugInfo => ELF_SECTION_DEBUG_INFO_INDEX as u16,
@@ -1133,18 +1182,19 @@ const ELF64_EHDR_SIZE: usize = 64;
 const ELF64_SHDR_SIZE: usize = 64;
 const ELF64_SYM_SIZE: usize = 24;
 const ELF64_RELA_SIZE: usize = 24;
-const ELF_SECTION_COUNT: usize = 19;
+const ELF_SECTION_COUNT: usize = 21;
 const ELF_SECTION_TEXT_INDEX: u32 = 1;
 const ELF_SECTION_DATA_INDEX: u32 = 2;
-const ELF_SECTION_RODATA_INDEX: u32 = 3;
-const ELF_SECTION_EH_FRAME_INDEX: u32 = 4;
-const ELF_SECTION_DEBUG_INFO_INDEX: u32 = 5;
-const ELF_SECTION_DEBUG_ABBREV_INDEX: u32 = 6;
-const ELF_SECTION_DEBUG_LINE_INDEX: u32 = 7;
-const ELF_SECTION_DEBUG_STR_INDEX: u32 = 8;
-const ELF_SECTION_SYMTAB_INDEX: u32 = 15;
-const ELF_SECTION_STRTAB_INDEX: u32 = 16;
-const ELF_SECTION_SHSTRTAB_INDEX: u16 = 17;
+const ELF_SECTION_DATA_REL_RO_INDEX: u32 = 3;
+const ELF_SECTION_RODATA_INDEX: u32 = 4;
+const ELF_SECTION_EH_FRAME_INDEX: u32 = 5;
+const ELF_SECTION_DEBUG_INFO_INDEX: u32 = 6;
+const ELF_SECTION_DEBUG_ABBREV_INDEX: u32 = 7;
+const ELF_SECTION_DEBUG_LINE_INDEX: u32 = 8;
+const ELF_SECTION_DEBUG_STR_INDEX: u32 = 9;
+const ELF_SECTION_SYMTAB_INDEX: u32 = 17;
+const ELF_SECTION_STRTAB_INDEX: u32 = 18;
+const ELF_SECTION_SHSTRTAB_INDEX: u16 = 19;
 const SHT_PROGBITS: u32 = 1;
 const SHT_SYMTAB: u32 = 2;
 const SHT_STRTAB: u32 = 3;

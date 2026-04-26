@@ -1062,7 +1062,7 @@ def add(a, b):
     }
 
     #[test]
-    fn precompile_codegen_module_emits_static_pylong_in_rodata() {
+    fn precompile_codegen_module_emits_static_pylong_in_data_rel_ro() {
         crate::initialize_test_python();
         let module_name = "precompile_static_int";
         let source_hash = 0x5678;
@@ -1101,14 +1101,21 @@ def get_value():
         assert!(
             object
                 .object
-                .windows(b".rela.rodata".len())
-                .any(|window| window == b".rela.rodata"),
-            "static PyLong object data should carry a relocation for PyLong_Type"
+                .windows(b".data.rel.ro".len())
+                .any(|window| window == b".data.rel.ro"),
+            "static PyLong object data should be writable only while dynamic relocations apply"
+        );
+        assert!(
+            object
+                .object
+                .windows(b".rela.data.rel.ro".len())
+                .any(|window| window == b".rela.data.rel.ro"),
+            "static PyLong object data should carry a RELRO relocation for PyLong_Type"
         );
     }
 
     #[test]
-    fn precompile_codegen_module_emits_static_big_pylong_in_rodata() {
+    fn precompile_codegen_module_emits_static_big_pylong_in_data_rel_ro() {
         crate::initialize_test_python();
         let module_name = "precompile_static_big_int";
         let source_hash = 0x6677;
@@ -1148,9 +1155,16 @@ def get_value():
         assert!(
             object
                 .object
-                .windows(b".rela.rodata".len())
-                .any(|window| window == b".rela.rodata"),
-            "static big PyLong object data should carry a relocation for PyLong_Type"
+                .windows(b".data.rel.ro".len())
+                .any(|window| window == b".data.rel.ro"),
+            "static big PyLong object data should be writable only while dynamic relocations apply"
+        );
+        assert!(
+            object
+                .object
+                .windows(b".rela.data.rel.ro".len())
+                .any(|window| window == b".rela.data.rel.ro"),
+            "static big PyLong object data should carry a RELRO relocation for PyLong_Type"
         );
     }
 
