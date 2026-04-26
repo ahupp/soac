@@ -343,7 +343,7 @@ impl SoacEnvConfig {
 impl Default for SoacEnvConfig {
     fn default() -> Self {
         Self {
-            cranelift_opt_level: "speed".to_string(),
+            cranelift_opt_level: "speed_and_size".to_string(),
             specialization_mode: None,
             soac_work_dir: None,
             profiled_cold_blocks_enabled: false,
@@ -415,7 +415,7 @@ fn parse_cranelift_opt_level(raw: &str) -> Result<String, String> {
 
 fn parse_optional_cranelift_opt_level(raw: Option<&str>) -> Result<String, String> {
     let Some(raw) = raw else {
-        return Ok("speed".to_string());
+        return Ok("speed_and_size".to_string());
     };
     parse_cranelift_opt_level(raw)
         .map_err(|err| invalid_env_value(SOAC_CRANELIFT_OPT_LEVEL_ENV, raw, err))
@@ -567,7 +567,7 @@ mod tests {
         let config = SoacEnvConfig::from_env().unwrap();
 
         assert_eq!(config.specialization_mode(), None);
-        assert_eq!(config.cranelift_opt_level(), "speed");
+        assert_eq!(config.cranelift_opt_level(), "speed_and_size");
         assert_eq!(config.compile_mode(), CompileMode::Lazy);
         assert_eq!(config.jit_compile_workers(), None);
         assert!(config.background_jit_enabled());

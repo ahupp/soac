@@ -167,6 +167,7 @@ unsafe extern "C" fn guard_method_type_version_hook(
     }
     ((*receiver_type).tp_version_tag == expected_version as u32) as i32
 }
+
 unsafe extern "C" fn py_call_with_kw_hook(
     callable: ObjPtr,
     args: ObjPtr,
@@ -1125,6 +1126,7 @@ pub unsafe extern "C" fn dp_jit_del_deref(cell: ObjPtr) -> ObjPtr {
 pub unsafe extern "C" fn dp_jit_del_deref_quietly(cell: ObjPtr) -> ObjPtr {
     del_deref_quietly_hook(cell)
 }
+
 #[cold]
 #[inline(never)]
 #[unsafe(no_mangle)]

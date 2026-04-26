@@ -1199,7 +1199,7 @@ benchmark benchmark_loops="1000000" verify_loops="100000" results_root="work/ben
   SPECIALIZED_RUNS="${BENCHMARK_SPECIALIZED_RUNS:-3}"
   RESULTS_ROOT="{{results_root}}"
   RESULT_MODE="{{result_mode}}"
-  CRANELIFT_OPT_LEVEL="${SOAC_CRANELIFT_OPT_LEVEL:-speed}"
+  CRANELIFT_OPT_LEVEL="${SOAC_CRANELIFT_OPT_LEVEL:-speed_and_size}"
   if [[ "$RESULTS_ROOT" != /* ]]; then
     RESULTS_ROOT="$REPO_ROOT/$RESULTS_ROOT"
   fi

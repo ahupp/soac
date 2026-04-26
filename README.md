@@ -285,7 +285,7 @@ typed variables must use recognized values. Boolean knobs accept `1`, `true`,
 
 - `SOAC_CRANELIFT_OPT_LEVEL=none|speed|speed_and_size`
   Override the Cranelift optimization level used by the process JIT.
-  Normal runtime and benchmark runs default to `speed`. The
+  Normal runtime and benchmark runs default to `speed_and_size`. The
   `just pytest`, `just test-all`, and `just run-cpython-tests` recipes default
   this to `none` unless the caller already set it, because correctness tests are
   latency-sensitive and should not spend cold-start time optimizing import-time

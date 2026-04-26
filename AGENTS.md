@@ -532,7 +532,7 @@ explicit ordinary
 - `SOAC_CRANELIFT_OPT_LEVEL`
   Optional Cranelift process-JIT optimization level override:
   `none`, `speed`, or `speed_and_size`. Normal runtime and benchmark
-  runs default to `speed`; `just pytest`, `just test-all`, and
+  runs default to `speed_and_size`; `just pytest`, `just test-all`, and
   `just run-cpython-tests` default to `none` unless the caller already set it,
   so correctness runs do not spend cold-start time optimizing import-time helper
   code.
