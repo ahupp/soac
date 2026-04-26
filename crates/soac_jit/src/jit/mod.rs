@@ -1,4 +1,3 @@
-use crate::config::{SpecializationMode, pre_optimization_module_cache_identity};
 use crate::function_instantiation::make_function_kind_abi_tag;
 use crate::module_constants::{ModuleCodegenConstants, ModuleConstantId};
 use crate::module_type::{CounterRuntimeSlot, SharedModuleState, build_counter_storage_layout};
@@ -15,12 +14,10 @@ use soac_core::block_py::{
     BlockPyModule, BlockTerm, CallArgKeyword, CallArgPositional, CellLocation, ChildVisitable,
     CounterDef, CounterId, CounterSite, Del, DeoptEntrySource, FunctionExecutionMode, FunctionKind,
     HasSemanticInstrId, InstrId, InstrKey, InstrLocationMap, LocalLocation, ModuleShape,
-    NameLocation, PersistentFunctionId, ResolvedName, RuntimeFunctionId, RuntimeModuleId,
-    RuntimeName, SerializedFunctionId, StorageLayout, Store, Visit, current_instr_locations,
+    NameLocation, ResolvedName, RuntimeFunctionId, RuntimeName, StorageLayout, Store, Visit,
+    current_instr_locations,
 };
-use soac_core::profile::{
-    CollectedTypeKeyLayout, CounterDumpTypeKey, read_block_entry_counts_from_file,
-};
+use soac_core::profile::{CollectedTypeKeyLayout, CounterDumpTypeKey};
 use soac_ir_blockpy::{CodegenModuleShape, InstrCodegen};
 use soac_ir_typed::emit_v3::{
     MechanicalCodegenConversion, MechanicalCodegenOperation, MechanicalCodegenStep,
@@ -30,19 +27,19 @@ use soac_ir_typed::emit_v3::{
     mechanical_region_function_param_inputs as opt_v3_mechanical_region_function_param_inputs,
 };
 use soac_ir_typed::plan_v3::{
-    CallBodyKind, IndexedFieldAccessKind as PlanV3IndexedFieldAccessKind,
-    IndexedGlobalAccessKind as PlanV3IndexedGlobalAccessKind, MaterializeKind, ModulePlanIdentity,
-    PlanNodeId, PlanValue, RegionId, RegionPlan, Rep, RichCompareOp,
+    IndexedFieldAccessKind as PlanV3IndexedFieldAccessKind,
+    IndexedGlobalAccessKind as PlanV3IndexedGlobalAccessKind, MaterializeKind, PlanNodeId,
+    PlanValue, RegionId, RegionPlan, Rep, RichCompareOp,
 };
 use soac_ir_typed::{
     FactStore, InstrTyped, PyExactType, PyObjFacts, RuntimeHelperId, TypedAttrAccessPlan,
     TypedBlock, TypedBlockLayoutHint, TypedCall, TypedCallAccessPlan, TypedCodegenModuleShape,
-    TypedDirectCallArgPlan, TypedDirectCallGuardTest, TypedDirectCallGuardTestKind,
-    TypedDirectCallableCall, TypedDirectCallableCallGuard, TypedDirectMethodCall,
-    TypedExactIntBranchPlan, TypedExactIntReturnPlan, TypedExactIntScalarThreadPlan, TypedGetAttr,
-    TypedGuardedCallableCall, TypedGuardedMethodCall, TypedIndexedFieldGuard,
-    TypedIndexedFieldPlanSource, TypedPlannedResult, TypedPyObjectOwnershipPlan, TypedSetAttr,
-    ValueFacts, lower_codegen_function_to_typed,
+    TypedDirectCallGuardTest, TypedDirectCallGuardTestKind, TypedDirectCallableCall,
+    TypedDirectCallableCallGuard, TypedDirectMethodCall, TypedExactIntBranchPlan,
+    TypedExactIntReturnPlan, TypedExactIntScalarThreadPlan, TypedGetAttr, TypedGuardedCallableCall,
+    TypedGuardedMethodCall, TypedIndexedFieldGuard, TypedIndexedFieldPlanSource,
+    TypedPlannedResult, TypedPyObjectOwnershipPlan, TypedSetAttr, ValueFacts,
+    lower_codegen_function_to_typed,
 };
 use soac_opt::access_emission_v3::{
     ExactListItemAccessPlan as OptV3ExactListItemAccessPlan,
@@ -50,20 +47,8 @@ use soac_opt::access_emission_v3::{
     IndexedFieldLayoutGroup as OptV3IndexedFieldLayoutGroup,
     IndexedFieldRuntimeAccessRequest as OptV3IndexedFieldRuntimeAccessRequest,
     IndexedGlobalAccessPlan as OptV3IndexedGlobalAccessPlan,
-    exact_list_items_for_function_from_artifacts as opt_v3_emitted_exact_list_items_for_function,
-    indexed_field_layout_groups as opt_v3_indexed_field_layout_groups,
-    indexed_fields_for_function_from_artifacts as opt_v3_emitted_indexed_fields_for_function,
-    indexed_globals_for_function_from_artifacts as opt_v3_emitted_indexed_globals_for_function,
-    prepare_indexed_field_accesses_for_codegen as opt_v3_prepare_indexed_field_accesses_for_codegen,
 };
-use soac_opt::alternatives_v3::AlternativeCatalog;
-use soac_opt::artifacts_v3::{
-    ExactIntBranchV3Artifacts, single_function_optimization_artifacts_v3,
-};
-use soac_opt::call_emission_v3::{
-    ResolvedV3DirectCallPlan, direct_call_targets as opt_v3_direct_call_targets,
-    direct_calls_for_function_from_artifacts as opt_v3_emitted_direct_calls_for_function,
-};
+use soac_opt::call_emission_v3::ResolvedV3DirectCallPlan;
 #[cfg(test)]
 use soac_opt::passes::infer_module_value_facts;
 use soac_opt::passes::{
@@ -74,8 +59,6 @@ use soac_opt::passes::{
     refresh_typed_function_value_facts, try_lower_typed_instr_to_codegen_legacy,
     validate_typed_function_call_access_plans, validate_typed_function_value_facts,
 };
-use soac_opt::pipeline_v3::plan_and_emit_module_v3_from_raw_evidence;
-use soac_opt::plan::ProfileEvidenceStore;
 use soac_opt::region_emission_v3::{
     ExactIntBranchSelection as OptV3ExactIntBranchSelection,
     ExactIntReturnSelection as OptV3ExactIntReturnSelection,
@@ -84,12 +67,10 @@ use soac_opt::region_emission_v3::{
     scalar_thread_inline_return_targets as opt_v3_scalar_thread_inline_return_targets,
     scalar_thread_unmaterialized_local_location as opt_v3_scalar_thread_unmaterialized_local_location,
 };
-use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::mem::offset_of;
-use std::path::Path;
 use std::sync::Arc;
 
 type CodegenBlock = Block<InstrCodegen>;
@@ -136,6 +117,7 @@ mod process;
 mod runtime_context;
 mod runtime_support;
 mod signal_diagnostics;
+mod specialization_profile;
 mod specialized_helpers;
 mod symbols;
 mod typed_pipeline;
@@ -250,6 +232,12 @@ pub use runtime_context::{ModuleJitContext, ModuleRuntimeContext};
 use runtime_support::inline_runtime_support_calls;
 #[cfg(test)]
 use runtime_support::{ParsedRuntimeClifFunction, parse_runtime_clif_functions};
+use specialization_profile::{
+    DirectCallEmissionScope, PlannedOptimizationInputs, SpecializationProfile,
+    load_planned_optimization_inputs_for_runtime_state,
+    planned_optimization_inputs_from_v3_artifacts,
+    planned_optimization_inputs_from_v3_artifacts_for_codegen_module,
+};
 pub use specialized_helpers::ObjPtr;
 use symbols::ensure_reloc_type_symbol_registered;
 use symbols::{
@@ -283,7 +271,6 @@ pub fn install_sigill_diagnostics() -> Result<(), String> {
 const MISSING_PYTHON_EXCEPTION_TRAP: ir::TrapCode = ir::TrapCode::unwrap_user(1);
 #[allow(dead_code)]
 const OPT_V3_FUSED_CONSUMER_TRAP: ir::TrapCode = ir::TrapCode::unwrap_user(2);
-const COLD_BLOCK_ENTRY_RATE_DENOMINATOR: u64 = 100;
 thread_local! {
     static PROCESS_JIT_COMPILE_DEPTH: Cell<usize> = const { Cell::new(0) };
 }
@@ -342,15 +329,6 @@ struct DeclaredJitFunction {
     default_func_id: Option<FuncId>,
     symbol: String,
     default_symbol: Option<String>,
-}
-
-fn env_config_for_session(
-    compile_session: Option<&crate::session::CompileSession>,
-) -> Result<Cow<'_, SoacEnvConfig>, String> {
-    match compile_session {
-        Some(session) => Ok(Cow::Borrowed(session.env_config()?)),
-        None => Ok(Cow::Owned(SoacEnvConfig::from_env()?)),
-    }
 }
 
 fn codegen_expr_is_borrowable_from_local_env(
@@ -5696,520 +5674,6 @@ fn collect_deopt_entry_counter_ids_by_kind(
         .collect()
 }
 
-#[derive(Clone)]
-struct SpecializationProfile<'a> {
-    module_name: Option<&'a str>,
-    counter_dump_path: Option<Cow<'a, Path>>,
-    direct_call_emission_scope: DirectCallEmissionScope,
-    opt_v3_emitted_direct_calls:
-        HashMap<RuntimeFunctionId, HashMap<InstrId, Vec<ResolvedV3DirectCallPlan>>>,
-    opt_v3_emitted_exact_list_items:
-        HashMap<RuntimeFunctionId, HashMap<InstrId, OptV3ExactListItemAccessPlan>>,
-    opt_v3_emitted_indexed_fields:
-        HashMap<RuntimeFunctionId, HashMap<InstrId, Vec<OptV3IndexedFieldAccessPlan>>>,
-    opt_v3_emitted_indexed_globals:
-        HashMap<RuntimeFunctionId, HashMap<InstrId, OptV3IndexedGlobalAccessPlan>>,
-    opt_v3_exact_int_branch_artifacts: HashMap<RuntimeFunctionId, Arc<ExactIntBranchV3Artifacts>>,
-    behavior_change_indexed_stores: bool,
-    profiled_cold_blocks: bool,
-    guard_miss_deopt: bool,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DirectCallEmissionScope {
-    AllDirectCallCandidates,
-}
-
-#[derive(Clone, Default)]
-struct PlannedOptimizationInputs {
-    opt_v3_emitted_direct_calls:
-        HashMap<RuntimeFunctionId, HashMap<InstrId, Vec<ResolvedV3DirectCallPlan>>>,
-    opt_v3_emitted_exact_list_items:
-        HashMap<RuntimeFunctionId, HashMap<InstrId, OptV3ExactListItemAccessPlan>>,
-    opt_v3_emitted_indexed_fields:
-        HashMap<RuntimeFunctionId, HashMap<InstrId, Vec<OptV3IndexedFieldAccessPlan>>>,
-    opt_v3_emitted_indexed_globals:
-        HashMap<RuntimeFunctionId, HashMap<InstrId, OptV3IndexedGlobalAccessPlan>>,
-    opt_v3_exact_int_branch_artifacts: HashMap<RuntimeFunctionId, Arc<ExactIntBranchV3Artifacts>>,
-}
-
-impl PlannedOptimizationInputs {
-    fn v3_direct_function_call_targets(
-        &self,
-        function_id: RuntimeFunctionId,
-    ) -> HashMap<InstrId, Vec<RuntimeFunctionId>> {
-        self.opt_v3_emitted_direct_calls
-            .get(&function_id)
-            .map(opt_v3_direct_call_targets)
-            .unwrap_or_default()
-    }
-
-    fn direct_call_targets_for_batch(
-        &self,
-        function_id: RuntimeFunctionId,
-    ) -> HashMap<InstrId, Vec<RuntimeFunctionId>> {
-        self.v3_direct_function_call_targets(function_id)
-    }
-}
-
-fn load_planned_optimization_inputs_for_runtime_state(
-    shared_state: Option<&SharedModuleState>,
-    compile_session: Option<&crate::session::CompileSession>,
-    env_config: &SoacEnvConfig,
-    specialization_mode: Option<SpecializationMode>,
-) -> Result<PlannedOptimizationInputs, String> {
-    if !matches!(
-        specialization_mode,
-        Some(SpecializationMode::Verify | SpecializationMode::Apply)
-    ) {
-        return Ok(PlannedOptimizationInputs::default());
-    }
-    let Some(shared_state) = shared_state else {
-        return Ok(PlannedOptimizationInputs::default());
-    };
-    planned_typed_v3_runtime_inputs_from_raw_evidence(shared_state, compile_session, env_config)
-}
-
-fn planned_typed_v3_runtime_inputs_from_raw_evidence(
-    shared_state: &SharedModuleState,
-    compile_session: Option<&crate::session::CompileSession>,
-    env_config: &SoacEnvConfig,
-) -> Result<PlannedOptimizationInputs, String> {
-    let Some(counter_dump_path) = env_config.counter_dump_input_path() else {
-        return Ok(PlannedOptimizationInputs::default());
-    };
-    if !counter_dump_path.exists() {
-        return Ok(PlannedOptimizationInputs::default());
-    }
-    let evidence_store = ProfileEvidenceStore::from_counter_dump(counter_dump_path.as_path())
-        .map_err(|err| err.to_string())?;
-    let artifacts = plan_and_emit_module_v3_from_raw_evidence(
-        &AlternativeCatalog::default_v3(),
-        ModulePlanIdentity {
-            module_name: shared_state.module_name.clone(),
-            source_hash: shared_state.source_hash,
-            cache_identity: pre_optimization_module_cache_identity(
-                env!("SOAC_BUILD_IDENTITY"),
-                shared_state.module_name == "soac.runtime",
-            ),
-        },
-        &shared_state.lowered_module,
-        &evidence_store,
-    )
-    .map_err(|err| err.to_string())?;
-    planned_optimization_inputs_from_v3_artifacts(&artifacts, shared_state, compile_session)
-}
-
-fn planned_optimization_inputs_from_v3_artifacts(
-    artifacts: &ExactIntBranchV3Artifacts,
-    shared_state: &SharedModuleState,
-    compile_session: Option<&crate::session::CompileSession>,
-) -> Result<PlannedOptimizationInputs, String> {
-    let mut inputs = PlannedOptimizationInputs::default();
-    for planned_function in &artifacts.plan.functions {
-        let local_function_id = planned_function.function.function.local_function_id();
-        let current_function_id = RuntimeFunctionId::new(
-            RuntimeModuleId::new(shared_state.module_id()),
-            local_function_id,
-        );
-        shared_state
-            .lookup_function(current_function_id)
-            .ok_or_else(|| {
-                format!(
-                    "optimization plan v3 for module {} references missing function id {} ({})",
-                    artifacts.plan.module.module_name,
-                    local_function_id,
-                    planned_function
-                        .function
-                        .debug_name
-                        .as_deref()
-                        .unwrap_or("<unknown>")
-                )
-            })?;
-        let Some(function_artifacts) =
-            opt_v3_single_function_artifacts(artifacts, planned_function.function.function)?
-        else {
-            continue;
-        };
-        if let Some(direct_calls) =
-            opt_v3_emitted_direct_calls_for_function(&function_artifacts, |target| {
-                resolve_opt_v3_runtime_function_target(shared_state, compile_session, target)
-            })?
-        {
-            inputs
-                .opt_v3_emitted_direct_calls
-                .insert(current_function_id, direct_calls);
-        }
-        if let Some(items) = opt_v3_emitted_exact_list_items_for_function(&function_artifacts)? {
-            inputs
-                .opt_v3_emitted_exact_list_items
-                .insert(current_function_id, items);
-        }
-        if let Some(indexed_fields) =
-            opt_v3_emitted_indexed_fields_for_function(&function_artifacts)?
-        {
-            inputs
-                .opt_v3_emitted_indexed_fields
-                .insert(current_function_id, indexed_fields);
-        }
-        if let Some(indexed_globals) =
-            opt_v3_emitted_indexed_globals_for_function(&function_artifacts)?
-        {
-            inputs
-                .opt_v3_emitted_indexed_globals
-                .insert(current_function_id, indexed_globals);
-        }
-        inputs
-            .opt_v3_exact_int_branch_artifacts
-            .insert(current_function_id, Arc::new(function_artifacts));
-    }
-    Ok(inputs)
-}
-
-fn planned_optimization_inputs_from_v3_artifacts_for_codegen_module(
-    artifacts: &ExactIntBranchV3Artifacts,
-    module: &BlockPyModule<CodegenModuleShape>,
-    module_name: &str,
-    source_hash: u64,
-    module_index: Option<&PrecompileModuleIndex>,
-) -> Result<PlannedOptimizationInputs, String> {
-    let mut inputs = PlannedOptimizationInputs::default();
-    let module_id = RuntimeModuleId::new(module.module_name_gen.module_id());
-    for planned_function in &artifacts.plan.functions {
-        let local_function_id = planned_function.function.function.local_function_id();
-        let current_function_id = RuntimeFunctionId::new(module_id, local_function_id);
-        module
-            .callable_defs
-            .iter()
-            .find(|function| function.function_id == current_function_id)
-            .ok_or_else(|| {
-                format!(
-                    "optimization plan v3 for module {} references missing function id {} ({})",
-                    artifacts.plan.module.module_name,
-                    local_function_id,
-                    planned_function
-                        .function
-                        .debug_name
-                        .as_deref()
-                        .unwrap_or("<unknown>")
-                )
-            })?;
-        let Some(function_artifacts) =
-            opt_v3_single_function_artifacts(artifacts, planned_function.function.function)?
-        else {
-            continue;
-        };
-        if let Some(direct_calls) =
-            opt_v3_emitted_direct_calls_for_function(&function_artifacts, |target| {
-                resolve_opt_v3_codegen_module_function_target(
-                    module_name,
-                    source_hash,
-                    module_id,
-                    module,
-                    module_index,
-                    target,
-                )
-            })?
-        {
-            inputs
-                .opt_v3_emitted_direct_calls
-                .insert(current_function_id, direct_calls);
-        }
-        if let Some(items) = opt_v3_emitted_exact_list_items_for_function(&function_artifacts)? {
-            inputs
-                .opt_v3_emitted_exact_list_items
-                .insert(current_function_id, items);
-        }
-        if let Some(indexed_fields) =
-            opt_v3_emitted_indexed_fields_for_function(&function_artifacts)?
-        {
-            inputs
-                .opt_v3_emitted_indexed_fields
-                .insert(current_function_id, indexed_fields);
-        }
-        if let Some(indexed_globals) =
-            opt_v3_emitted_indexed_globals_for_function(&function_artifacts)?
-        {
-            inputs
-                .opt_v3_emitted_indexed_globals
-                .insert(current_function_id, indexed_globals);
-        }
-        inputs
-            .opt_v3_exact_int_branch_artifacts
-            .insert(current_function_id, Arc::new(function_artifacts));
-    }
-    Ok(inputs)
-}
-
-fn resolve_opt_v3_runtime_function_target(
-    shared_state: &SharedModuleState,
-    compile_session: Option<&crate::session::CompileSession>,
-    target: PersistentFunctionId,
-) -> Result<Option<RuntimeFunctionId>, String> {
-    let target_shared_state_owner;
-    let target_shared_state = if target.module.module_name == shared_state.module_name
-        && target.module.source_hash == shared_state.source_hash
-    {
-        shared_state
-    } else {
-        let Some(compile_session) = compile_session else {
-            return Ok(None);
-        };
-        let Some(target_shared_state) = compile_session.shared_module_state_for_identity(
-            &target.module.module_name,
-            target.module.source_hash,
-        )?
-        else {
-            return Ok(None);
-        };
-        target_shared_state_owner = target_shared_state;
-        target_shared_state_owner.as_ref()
-    };
-    let function_id = RuntimeFunctionId::new(
-        RuntimeModuleId::new(target_shared_state.module_id()),
-        target.local,
-    );
-    Ok(target_shared_state
-        .lookup_function(function_id)
-        .map(|function| function.function_id))
-}
-
-fn resolve_opt_v3_codegen_module_function_target(
-    module_name: &str,
-    source_hash: u64,
-    module_id: RuntimeModuleId,
-    module: &BlockPyModule<CodegenModuleShape>,
-    module_index: Option<&PrecompileModuleIndex>,
-    target: PersistentFunctionId,
-) -> Result<Option<RuntimeFunctionId>, String> {
-    if target.module.module_name != module_name || target.module.source_hash != source_hash {
-        return Ok(
-            module_index.and_then(|module_index| module_index.function_id_for_target(&target))
-        );
-    }
-    let target_function_id = RuntimeFunctionId::new(module_id, target.local);
-    Ok(module
-        .callable_defs
-        .iter()
-        .any(|function| function.function_id == target_function_id)
-        .then_some(target_function_id))
-}
-
-fn opt_v3_single_function_artifacts(
-    artifacts: &ExactIntBranchV3Artifacts,
-    function: SerializedFunctionId,
-) -> Result<Option<ExactIntBranchV3Artifacts>, String> {
-    single_function_optimization_artifacts_v3(artifacts, function).map_err(|err| err.to_string())
-}
-
-fn planned_typed_v3_precompile_inputs_from_raw_evidence(
-    module_name: &str,
-    source_hash: u64,
-    cache_identity: &str,
-    module: &BlockPyModule<CodegenModuleShape>,
-    module_index: Option<&PrecompileModuleIndex>,
-    counter_dump_path: Option<&Path>,
-) -> Result<PlannedOptimizationInputs, String> {
-    let Some(counter_dump_path) = counter_dump_path.filter(|path| path.exists()) else {
-        return Ok(PlannedOptimizationInputs::default());
-    };
-    let evidence_store = ProfileEvidenceStore::from_counter_dump(counter_dump_path)
-        .map_err(|err| err.to_string())?;
-    let artifacts = plan_and_emit_module_v3_from_raw_evidence(
-        &AlternativeCatalog::default_v3(),
-        ModulePlanIdentity {
-            module_name: module_name.to_string(),
-            source_hash,
-            cache_identity: cache_identity.to_string(),
-        },
-        module,
-        &evidence_store,
-    )
-    .map_err(|err| err.to_string())?;
-    planned_optimization_inputs_from_v3_artifacts_for_codegen_module(
-        &artifacts,
-        module,
-        module_name,
-        source_hash,
-        module_index,
-    )
-}
-
-impl<'a> SpecializationProfile<'a> {
-    fn typed_specializations_embedded(&self) -> bool {
-        self.direct_call_emission_scope == DirectCallEmissionScope::AllDirectCallCandidates
-    }
-
-    fn from_runtime_state_with_session(
-        shared_state: Option<&'a SharedModuleState>,
-        compile_session: Option<&crate::session::CompileSession>,
-    ) -> Result<Self, String> {
-        let env_config = env_config_for_session(compile_session)?;
-        let specialization_mode = env_config.specialization_mode();
-        let planned_inputs = load_planned_optimization_inputs_for_runtime_state(
-            shared_state,
-            compile_session,
-            &env_config,
-            specialization_mode,
-        )?;
-        let counter_dump_path = env_config
-            .counter_dump_input_path()
-            .filter(|path| path.exists())
-            .map(Cow::Owned);
-        Ok(Self {
-            module_name: shared_state.map(|shared_state| shared_state.module_name.as_str()),
-            counter_dump_path,
-            direct_call_emission_scope: DirectCallEmissionScope::AllDirectCallCandidates,
-            opt_v3_emitted_direct_calls: planned_inputs.opt_v3_emitted_direct_calls,
-            opt_v3_emitted_exact_list_items: planned_inputs.opt_v3_emitted_exact_list_items,
-            opt_v3_emitted_indexed_fields: planned_inputs.opt_v3_emitted_indexed_fields,
-            opt_v3_emitted_indexed_globals: planned_inputs.opt_v3_emitted_indexed_globals,
-            opt_v3_exact_int_branch_artifacts: planned_inputs.opt_v3_exact_int_branch_artifacts,
-            behavior_change_indexed_stores: false,
-            profiled_cold_blocks: env_config.profiled_cold_blocks_enabled(),
-            guard_miss_deopt: false,
-        })
-    }
-
-    fn from_precompile(
-        env_config: &SoacEnvConfig,
-        module_name: &'a str,
-        source_hash: u64,
-        cache_identity: &str,
-        module: &BlockPyModule<CodegenModuleShape>,
-        module_index: Option<&PrecompileModuleIndex>,
-        counter_dump_path: Option<&'a Path>,
-    ) -> Result<Self, String> {
-        let planned_inputs = planned_typed_v3_precompile_inputs_from_raw_evidence(
-            module_name,
-            source_hash,
-            cache_identity,
-            module,
-            module_index,
-            counter_dump_path,
-        )?;
-        Ok(Self {
-            module_name: Some(module_name),
-            counter_dump_path: counter_dump_path.map(Cow::Borrowed),
-            direct_call_emission_scope: DirectCallEmissionScope::AllDirectCallCandidates,
-            opt_v3_emitted_direct_calls: planned_inputs.opt_v3_emitted_direct_calls,
-            opt_v3_emitted_exact_list_items: planned_inputs.opt_v3_emitted_exact_list_items,
-            opt_v3_emitted_indexed_fields: planned_inputs.opt_v3_emitted_indexed_fields,
-            opt_v3_emitted_indexed_globals: planned_inputs.opt_v3_emitted_indexed_globals,
-            opt_v3_exact_int_branch_artifacts: planned_inputs.opt_v3_exact_int_branch_artifacts,
-            behavior_change_indexed_stores: true,
-            profiled_cold_blocks: env_config.profiled_cold_blocks_enabled(),
-            guard_miss_deopt: true,
-        })
-    }
-
-    fn opt_v3_indexed_field_access_plans(&self) -> Vec<&OptV3IndexedFieldAccessPlan> {
-        self.opt_v3_emitted_indexed_fields
-            .values()
-            .flat_map(|accesses_by_instr| accesses_by_instr.values())
-            .flat_map(|accesses| accesses.iter())
-            .collect()
-    }
-
-    fn typed_call_emission_direct_calls(
-        &self,
-        function_id: RuntimeFunctionId,
-    ) -> HashMap<InstrId, Vec<ResolvedV3DirectCallPlan>> {
-        match self.direct_call_emission_scope {
-            DirectCallEmissionScope::AllDirectCallCandidates => self
-                .opt_v3_emitted_direct_calls
-                .get(&function_id)
-                .cloned()
-                .unwrap_or_default(),
-        }
-    }
-
-    fn typed_inline_direct_calls(
-        &self,
-        function_id: RuntimeFunctionId,
-    ) -> HashMap<InstrId, Vec<(RuntimeFunctionId, TypedDirectCallArgPlan)>> {
-        self.typed_inline_resolved_direct_calls(function_id)
-            .into_iter()
-            .map(|(source, plans)| {
-                (
-                    source,
-                    plans
-                        .into_iter()
-                        .map(|plan| (plan.target, plan.arg_plan))
-                        .collect(),
-                )
-            })
-            .collect()
-    }
-
-    fn typed_inline_resolved_direct_calls(
-        &self,
-        function_id: RuntimeFunctionId,
-    ) -> HashMap<InstrId, Vec<ResolvedV3DirectCallPlan>> {
-        if self.direct_call_emission_scope != DirectCallEmissionScope::AllDirectCallCandidates {
-            return HashMap::new();
-        }
-        self.opt_v3_emitted_direct_calls
-            .get(&function_id)
-            .map(|direct_calls| {
-                direct_calls
-                    .iter()
-                    .filter_map(|(source, plans)| {
-                        let inline_plans = plans
-                            .iter()
-                            .filter(|plan| plan.body.kind == CallBodyKind::Inline)
-                            .cloned()
-                            .collect::<Vec<_>>();
-                        (!inline_plans.is_empty()).then_some((*source, inline_plans))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    fn field_index_specialization_maps(
-        &self,
-        function_id: RuntimeFunctionId,
-    ) -> Result<
-        (
-            HashMap<String, Vec<FieldIndexSpecialization>>,
-            HashMap<InstrId, Vec<FieldIndexSpecialization>>,
-            HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>,
-        ),
-        String,
-    > {
-        let opt_v3_planned_fields = self.opt_v3_indexed_field_access_plans();
-        let opt_v3_layout_groups =
-            opt_v3_indexed_field_layout_groups(opt_v3_planned_fields.iter().copied());
-        prime_opt_v3_field_index_layouts(opt_v3_layout_groups.iter())?;
-        let opt_v3_by_instr = opt_v3_prepare_indexed_field_accesses_for_codegen(
-            self.opt_v3_emitted_indexed_fields.get(&function_id),
-            |request| field_index_specialization_from_opt_v3_for_function(function_id, request),
-        )?;
-        Ok((HashMap::new(), HashMap::new(), opt_v3_by_instr))
-    }
-
-    fn cold_block_labels(
-        &self,
-        function: &BlockPyFunction<impl ModuleShape>,
-    ) -> Result<HashSet<BlockLabel>, String> {
-        if !self.profiled_cold_blocks {
-            return Ok(HashSet::new());
-        }
-        let Some(module_name) = self.module_name else {
-            return Ok(HashSet::new());
-        };
-        let Some(path) = existing_counter_dump_path(self.counter_dump_path.as_deref()) else {
-            return Ok(HashSet::new());
-        };
-        collect_cold_block_labels_from_path(path, function, module_name)
-    }
-}
-
-fn existing_counter_dump_path(path: Option<&Path>) -> Option<&Path> {
-    path.filter(|path| path.exists())
-}
-
 fn type_ptr_data_id_for_ref(
     codegen_env: &mut impl JitCodegenEnv,
     ctx: &JitEmitCtx<'_>,
@@ -6524,35 +5988,6 @@ fn field_index_specialization_from_opt_v3_for_function(
         request.attr_name.as_str(),
         request.expected_index,
     )
-}
-
-fn collect_cold_block_labels_from_path(
-    path: &Path,
-    function: &BlockPyFunction<impl ModuleShape>,
-    module_name: &str,
-) -> Result<HashSet<BlockLabel>, String> {
-    let block_entry_counts =
-        read_block_entry_counts_from_file(path, module_name, function.function_id)?;
-    let entry_label = function.entry_block().label;
-    let Some(entry_count) = block_entry_counts.get(&entry_label).copied() else {
-        return Ok(HashSet::new());
-    };
-    if entry_count == 0 {
-        return Ok(HashSet::new());
-    }
-
-    Ok(function
-        .blocks
-        .iter()
-        .filter_map(|block| {
-            if block.label == entry_label {
-                return None;
-            }
-            let block_count = block_entry_counts.get(&block.label).copied()?;
-            (block_count.saturating_mul(COLD_BLOCK_ENTRY_RATE_DENOMINATOR) <= entry_count)
-                .then_some(block.label)
-        })
-        .collect())
 }
 
 pub(super) fn emit_exact_type_version_match(
