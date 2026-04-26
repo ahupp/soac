@@ -1,0 +1,97 @@
+site_name: SOAC
+site_description: Documentation for the SOAC Python JIT compiler.
+repo_url: https://github.com/openai/soac
+docs_dir: doc
+site_dir: work/docs-site
+strict: true
+
+theme:
+  name: material
+  features:
+    - content.code.copy
+    - content.code.select
+    - navigation.expand
+    - navigation.indexes
+    - navigation.sections
+    - navigation.top
+    - search.highlight
+    - search.suggest
+
+nav:
+  - Home: index.md
+  - Module Lifecycle: MODULE_LIFECYCLE.md
+  - Optimization:
+      - Overview: OPTIMIZATION.md
+      - Specialization: SPECIALIZATION.md
+      - Runtime Functions: RUNTIME_FUNCTIONS.md
+      - Performance Log: PERF_LOG.md
+  - Planning:
+      - TODO Index: todo/TODO.md
+      - Opt v3: todo/opt_v3.md
+      - Opt v2: todo/opt_v2.md
+      - Crate Decomposition: todo/crate_decomposition.md
+      - Component Coalescing: todo/component_coalescing.md
+      - Type IDs and Lazy Cross-Module Direct Calls: todo/type_ids_and_lazy_cross_module_direct_calls.md
+      - Result Demand Lowering: todo/result_demand_lowering.md
+      - Python Operator Resolution: todo/python_operator_resolution.md
+      - Predecoded Interpreter Plan: todo/predecoded_interpreter_plan.md
+      - Value Facts for SSA Locals: todo/value_facts_ssa_locals.md
+      - Typed Runtime Builtins: todo/typed_runtime_builtins.md
+      - Function Identity: todo/function_identity.md
+      - Length Specialization: todo/len_specialization.md
+      - Code Size: todo/codesize.md
+      - JIT Tracebacks from EH Frame: todo/jit_tracebacks_from_eh_frame.md
+      - Remove Committed Cache History: todo/remove_committed_cache_history.md
+      - Optimization Ideas:
+          - Background Compile and Cache: todo/opt/background_compile_and_cache.md
+          - Baseline Template JIT: todo/opt/baseline_template_jit.md
+          - Branch Predicate Lowering: todo/opt/branch_predicate_lowering.md
+          - Compile Runtime Stubs from IR: todo/opt/compile_runtime_stubs_from_ir.md
+          - Deopt to BlockPy Executor: todo/opt/deopt_to_blockpy_executor.md
+          - Escape Analysis for Python Temps: todo/opt/escape_analysis_for_python_temps.md
+          - Fact-Driven Typed Specializations: todo/opt/fact_driven_typed_specializations.md
+          - Guard and Refcount Elimination: todo/opt/guard_and_refcount_elimination.md
+          - Lazy Per-Function Lowering: todo/opt/lazy_per_function_lowering.md
+          - Per-Function Feedback Vectors: todo/opt/per_function_feedback_vectors.md
+          - Polymorphic Inline Caches: todo/opt/polymorphic_inline_caches.md
+          - Shape Transition Feedback: todo/opt/shape_transition_feedback.md
+          - Tiered Specialization Policy: todo/opt/tiered_specialization_policy.md
+          - Unboxed Numeric Values: todo/opt/unboxed_numeric_values.md
+      - Done-ish:
+          - Generator Fixathon: todo/doneish/GEN_FIXATHON.md
+          - Intrinsics: todo/doneish/Intrinsics.md
+          - Type Bundle: todo/doneish/TypeBundle.md
+          - Generators: todo/doneish/generators.md
+          - Global JIT Module: todo/doneish/global_jitmodule.md
+          - Restore Lazy Annotations: todo/doneish/restore_lazy_annotations.md
+          - Scope: todo/doneish/scope.md
+          - Traversal: todo/doneish/traversal.md
+  - Notes:
+      - Yield From: lols/yield_from.md
+      - Codex Quotes: lols/codex_quotes.md
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets:
+      check_paths: true
+      base_path:
+        - .
+        - doc
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true

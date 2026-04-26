@@ -181,6 +181,20 @@ artifact directory, and the setup recipe symlinks `vendor/cpython`, `work/`,
 temporary worktrees can reuse the already-fetched offline state and shared
 benchmark artifacts.
 
+## Documentation Site
+
+The Markdown files under `doc/` can be rendered as a local MkDocs Material
+site:
+
+```
+$ just docs-build
+$ just docs-serve
+```
+
+`docs-build` writes the generated site to ignored `work/docs-site/`.
+`docs-serve` serves it at `127.0.0.1:8001` by default; pass a dev address to
+override it, for example `just docs-serve 0.0.0.0:9000`.
+
 
 
 # Environment Variables

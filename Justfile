@@ -472,6 +472,18 @@ build-web-inspector-server: ensure-cpython ensure-shared-python
 
 build-web-inspector: build-web-inspector-server
 
+docs-build:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  cd "$REPO_ROOT"
+  uvx --from mkdocs --with mkdocs-material mkdocs build --strict
+
+docs-serve dev_addr="127.0.0.1:8001":
+  #!/usr/bin/env bash
+  set -euo pipefail
+  cd "$REPO_ROOT"
+  uvx --from mkdocs --with mkdocs-material mkdocs serve --dev-addr "{{dev_addr}}"
+
 history-metrics-report history_jsonl="work/logs/warloc_history.jsonl" daily_jsonl="work/logs/warloc_history_daily.jsonl" html_output="web/history_metrics.html" revset="..@": ensure-cpython
   #!/usr/bin/env bash
   export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
