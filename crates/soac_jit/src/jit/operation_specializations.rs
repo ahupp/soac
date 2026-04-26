@@ -2,14 +2,23 @@ use super::counters::{
     CounterRef, emit_record_top_value_counter_slot, top_value_counter_slot_for_id,
 };
 use super::intrinsics::{OperationEmitState, increment_counter_with_state};
-use super::symbols::{CpythonTypeSymbol, RelocTypeRef};
+use super::symbols::{
+    CpythonTypeSymbol, RelocTypeRef, reloc_type_ref_from_typed_attr_owner_ref,
+    typed_attr_owner_ref_from_reloc_type_ref,
+};
 use cranelift_codegen::ir;
 use cranelift_codegen::ir::InstBuilder;
 use pyo3::ffi;
-use soac_core::block_py::{CounterId, GetItem, HasSemanticInstrId, Instr, SetItem};
+use soac_core::block_py::{CounterId, GetItem, HasSemanticInstrId, Instr, InstrId, SetItem};
 use soac_ir_blockpy::InstrCodegen;
-use soac_ir_typed::TypedExactListItemAccessPlan;
-use soac_ir_typed::plan_v3::{EXACT_LIST_EXACT_INT_ITEM_SHAPE_TAG, ExactListItemAccessKind};
+use soac_ir_typed::plan_v3::{
+    EXACT_LIST_EXACT_INT_ITEM_SHAPE_TAG, ExactListItemAccessKind,
+    IndexedFieldAccessKind as PlanV3IndexedFieldAccessKind,
+};
+use soac_ir_typed::{
+    TypedExactListItemAccessPlan, TypedIndexedFieldGuard, TypedIndexedFieldPlanSource,
+};
+use soac_opt::access_emission_v3::ResolvedIndexedFieldAccess as OptV3ResolvedIndexedFieldAccessFromOpt;
 use std::mem::offset_of;
 
 const PYLONG_COMPACT_TAG_LIMIT: i64 = 2 << 3;
@@ -49,6 +58,124 @@ pub(super) fn lowering_plan_from_typed_exact_list_item(
     debug_assert_eq!(plan.access, expected_access);
     ExactListItemLoweringPlan {
         access: plan.access,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct FieldIndexSpecialization {
+    pub(super) expected_index: u32,
+    pub(super) owner_type_ref: RelocTypeRef,
+    pub(super) type_version: u32,
+}
+
+impl FieldIndexSpecialization {
+    pub(super) fn to_typed_guard(&self) -> TypedIndexedFieldGuard {
+        TypedIndexedFieldGuard {
+            expected_index: self.expected_index,
+            owner_type_ref: typed_attr_owner_ref_from_reloc_type_ref(&self.owner_type_ref),
+            type_version: self.type_version,
+        }
+    }
+}
+
+pub(super) type OptV3ResolvedIndexedFieldAccess =
+    OptV3ResolvedIndexedFieldAccessFromOpt<FieldIndexSpecialization>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct IndexedFieldLoweringPlan {
+    pub(super) source: TypedIndexedFieldPlanSource,
+    pub(super) access: PlanV3IndexedFieldAccessKind,
+    pub(super) specializations: Vec<FieldIndexSpecialization>,
+}
+
+impl IndexedFieldLoweringPlan {
+    pub(super) fn for_access(
+        instr_id: InstrId,
+        source: TypedIndexedFieldPlanSource,
+        guards: &[TypedIndexedFieldGuard],
+        expected_access: PlanV3IndexedFieldAccessKind,
+    ) -> Result<Option<Self>, String> {
+        match source {
+            TypedIndexedFieldPlanSource::OptimizationPlanV3 => {
+                Self::from_typed_guards(instr_id, source, guards, expected_access)
+            }
+        }
+    }
+
+    fn from_typed_guards(
+        instr_id: InstrId,
+        source: TypedIndexedFieldPlanSource,
+        guards: &[TypedIndexedFieldGuard],
+        expected_access: PlanV3IndexedFieldAccessKind,
+    ) -> Result<Option<Self>, String> {
+        if guards.is_empty() {
+            if source == TypedIndexedFieldPlanSource::OptimizationPlanV3 {
+                return Err(format!(
+                    "optimizer v3 indexed-field {:?} for {instr_id} lost all typed codegen guards",
+                    expected_access
+                ));
+            }
+            return Ok(None);
+        }
+
+        let mut specializations = Vec::with_capacity(guards.len());
+        for guard in guards {
+            let Some(specialization) = field_index_specialization_from_typed_guard(guard) else {
+                continue;
+            };
+            push_unique_specialization(&mut specializations, specialization);
+        }
+
+        if specializations.is_empty() {
+            if source == TypedIndexedFieldPlanSource::OptimizationPlanV3 {
+                return Err(format!(
+                    "optimizer v3 indexed-field {:?} for {instr_id} has no resolvable typed codegen guards",
+                    expected_access
+                ));
+            }
+            return Ok(None);
+        }
+
+        Ok(Some(Self {
+            source,
+            access: expected_access,
+            specializations,
+        }))
+    }
+
+    pub(super) fn require_type_ptr(
+        &self,
+        instr_id: InstrId,
+        specialization: &FieldIndexSpecialization,
+        owner_type: Option<ir::Value>,
+    ) -> Result<Option<ir::Value>, String> {
+        match owner_type {
+            Some(owner_type) => Ok(Some(owner_type)),
+            None if self.source == TypedIndexedFieldPlanSource::OptimizationPlanV3 => Err(format!(
+                "prevalidated optimizer v3 indexed-field {:?} for {instr_id} could not bind runtime owner type reference {:?}",
+                self.access, specialization.owner_type_ref
+            )),
+            None => Ok(None),
+        }
+    }
+}
+
+fn field_index_specialization_from_typed_guard(
+    guard: &TypedIndexedFieldGuard,
+) -> Option<FieldIndexSpecialization> {
+    Some(FieldIndexSpecialization {
+        expected_index: guard.expected_index,
+        owner_type_ref: reloc_type_ref_from_typed_attr_owner_ref(&guard.owner_type_ref)?,
+        type_version: guard.type_version,
+    })
+}
+
+fn push_unique_specialization(
+    specializations: &mut Vec<FieldIndexSpecialization>,
+    specialization: FieldIndexSpecialization,
+) {
+    if !specializations.contains(&specialization) {
+        specializations.push(specialization);
     }
 }
 

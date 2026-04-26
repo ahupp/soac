@@ -53,7 +53,6 @@ use soac_opt::access_emission_v3::{
     IndexedFieldLayoutGroup as OptV3IndexedFieldLayoutGroup,
     IndexedFieldRuntimeAccessRequest as OptV3IndexedFieldRuntimeAccessRequest,
     IndexedGlobalAccessPlan as OptV3IndexedGlobalAccessPlan,
-    ResolvedIndexedFieldAccess as OptV3ResolvedIndexedFieldAccessFromOpt,
     exact_list_items_for_function_from_artifacts as opt_v3_emitted_exact_list_items_for_function,
     indexed_field_layout_groups as opt_v3_indexed_field_layout_groups,
     indexed_fields_for_function_from_artifacts as opt_v3_emitted_indexed_fields_for_function,
@@ -214,6 +213,9 @@ use module_data::{
     precompiled_direct_function_symbol_scope_for_persistent, push_shared_module_symbol_identity,
     scalar_counter_storage_symbol_for_instance, top_value_counter_storage_symbol_for_instance,
 };
+use operation_specializations::{
+    FieldIndexSpecialization, IndexedFieldLoweringPlan, OptV3ResolvedIndexedFieldAccess,
+};
 #[cfg(test)]
 use planning::plan_typed_v3_jit_module_for_test;
 pub use planning::{
@@ -257,9 +259,8 @@ use runtime_support::{ParsedRuntimeClifFunction, parse_runtime_clif_functions};
 pub use specialized_helpers::ObjPtr;
 use symbols::{
     CpythonTypeSymbol, RelocCallableRef, RelocTypeRef, lookup_registered_jit_data_symbol,
-    register_jit_data_symbol, reloc_callable_ref_symbol_name,
-    reloc_type_ref_from_typed_attr_owner_ref, reloc_type_ref_symbol_name,
-    type_key_runtime_registry, typed_attr_owner_ref_from_reloc_type_ref,
+    register_jit_data_symbol, reloc_callable_ref_symbol_name, reloc_type_ref_symbol_name,
+    type_key_runtime_registry,
 };
 #[cfg(test)]
 use symbols::{
@@ -1819,115 +1820,6 @@ fn direct_call_target_function<'a>(
         .find(|function| function.function_id == function_id)
         .or_else(|| ctx.direct_call_target_functions.get(&function_id))
         .filter(|function| function.execution_mode() == FunctionExecutionMode::Jit)
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct FieldIndexSpecialization {
-    expected_index: u32,
-    owner_type_ref: RelocTypeRef,
-    type_version: u32,
-}
-
-impl FieldIndexSpecialization {
-    fn to_typed_guard(&self) -> TypedIndexedFieldGuard {
-        TypedIndexedFieldGuard {
-            expected_index: self.expected_index,
-            owner_type_ref: typed_attr_owner_ref_from_reloc_type_ref(&self.owner_type_ref),
-            type_version: self.type_version,
-        }
-    }
-}
-
-type OptV3ResolvedIndexedFieldAccess =
-    OptV3ResolvedIndexedFieldAccessFromOpt<FieldIndexSpecialization>;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct IndexedFieldLoweringPlan {
-    source: TypedIndexedFieldPlanSource,
-    access: PlanV3IndexedFieldAccessKind,
-    specializations: Vec<FieldIndexSpecialization>,
-}
-
-impl IndexedFieldLoweringPlan {
-    fn for_access(
-        instr_id: InstrId,
-        source: TypedIndexedFieldPlanSource,
-        guards: &[TypedIndexedFieldGuard],
-        expected_access: PlanV3IndexedFieldAccessKind,
-    ) -> Result<Option<Self>, String> {
-        match source {
-            TypedIndexedFieldPlanSource::OptimizationPlanV3 => {
-                Self::from_typed_guards(instr_id, source, guards, expected_access)
-            }
-        }
-    }
-
-    fn from_typed_guards(
-        instr_id: InstrId,
-        source: TypedIndexedFieldPlanSource,
-        guards: &[TypedIndexedFieldGuard],
-        expected_access: PlanV3IndexedFieldAccessKind,
-    ) -> Result<Option<Self>, String> {
-        if guards.is_empty() {
-            if source == TypedIndexedFieldPlanSource::OptimizationPlanV3 {
-                return Err(format!(
-                    "optimizer v3 indexed-field {:?} for {instr_id} lost all typed codegen guards",
-                    expected_access
-                ));
-            }
-            return Ok(None);
-        }
-
-        let mut specializations = Vec::with_capacity(guards.len());
-        for guard in guards {
-            let Some(specialization) = field_index_specialization_from_typed_guard(guard) else {
-                continue;
-            };
-            push_unique_specialization(&mut specializations, specialization);
-        }
-
-        if specializations.is_empty() {
-            if source == TypedIndexedFieldPlanSource::OptimizationPlanV3 {
-                return Err(format!(
-                    "optimizer v3 indexed-field {:?} for {instr_id} has no resolvable typed codegen guards",
-                    expected_access
-                ));
-            }
-            return Ok(None);
-        }
-
-        Ok(Some(Self {
-            source,
-            access: expected_access,
-            specializations,
-        }))
-    }
-
-    fn require_type_ptr(
-        &self,
-        instr_id: InstrId,
-        specialization: &FieldIndexSpecialization,
-        owner_type: Option<ir::Value>,
-    ) -> Result<Option<ir::Value>, String> {
-        match owner_type {
-            Some(owner_type) => Ok(Some(owner_type)),
-            None if self.source == TypedIndexedFieldPlanSource::OptimizationPlanV3 => Err(format!(
-                "prevalidated optimizer v3 indexed-field {:?} for {instr_id} could not bind runtime owner type reference {:?}",
-                self.access, specialization.owner_type_ref
-            )),
-            None => Ok(None),
-        }
-    }
-}
-
-fn field_index_specialization_from_typed_guard(
-    guard: &TypedIndexedFieldGuard,
-) -> Option<FieldIndexSpecialization> {
-    Some(FieldIndexSpecialization {
-        expected_index: guard.expected_index,
-        owner_type_ref: reloc_type_ref_from_typed_attr_owner_ref(&guard.owner_type_ref)?,
-        type_version: guard.type_version,
-    })
 }
 
 struct LocalEnvCodegenIntrinsicEmitState<'a, 'b, 'mc, 'c, 'd, Env: JitCodegenEnv> {
@@ -7470,15 +7362,6 @@ fn field_index_specialization_from_opt_v3_for_function(
         request.attr_name.as_str(),
         request.expected_index,
     )
-}
-
-fn push_unique_specialization(
-    specializations: &mut Vec<FieldIndexSpecialization>,
-    specialization: FieldIndexSpecialization,
-) {
-    if !specializations.contains(&specialization) {
-        specializations.push(specialization);
-    }
 }
 
 fn collect_cold_block_labels_from_path(
