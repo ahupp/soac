@@ -1,5 +1,41 @@
 # Overnight Performance Log
 
+## 2026-04-27 - Direct runtime primitive for range calls
+
+- baseline: `work/bench/qkzxlxtsvpuq_addfd7675506`
+  - specialized apply median: `566978 loops/s`
+  - specialized apply mean: `568132 loops/s`
+  - verify pass: `340618 loops/s`
+  - no-refcount diagnostic median: `736336 loops/s`
+  - latest summarized pystone code size: `65372 bytes`, `3862` machine blocks
+- observation: the deep profile still showed `py_vectorcall_hook` and range
+  construction in the hot path. The direct runtime primitive mechanism already
+  handled builtins like `ord`, `chr`, `len`, and `iter`, so `range` looked like
+  a plausible next fixed-arity builtin candidate.
+- attempted change: add direct runtime primitive descriptors for `range(stop)`,
+  `range(start, stop)`, and `range(start, stop, step)`, routing them through
+  narrow runtime helpers that call `PyObject_Vectorcall` on `PyRange_Type`.
+- rejected result: `work/bench/uxrpukyqykko_0e41e1b72d85`
+  - specialized apply median: `548850 loops/s` (`-3.20%`)
+  - specialized apply mean: `546829 loops/s` (`-3.75%`)
+  - verify pass: `322062 loops/s`
+  - no-refcount diagnostic median: `702990 loops/s` (`-4.53%`)
+  - latest summarized pystone code size: `65307 bytes`, `3847` machine blocks
+  - code-size delta: `-65 bytes`, `-15` machine blocks
+- reason rejected: the helper made generated code slightly smaller, but it still
+  performs generic `PyRange_Type` vectorcall allocation and does not address the
+  real steady-state cost of range iteration, iterator state, `__next__`, or
+  `StopIteration` handling. The production apply and verify regressions are too
+  large to keep for the small size reduction.
+- validation before rejection: `just fmt-rust soac_jit` passed; runtime crate
+  formatting and `cargo check --manifest-path
+  crates/soac_jit_runtime/Cargo.toml` passed; `cargo test -p soac_jit
+  direct_abi -- --nocapture` passed; `cargo check -p soac_jit --tests` passed;
+  `just pytest-fast tests/test_runtime_builtin_primitives.py -q` passed;
+  `just benchmark` produced the rejected result above. The experiment was then
+  reverted.
+- next baseline: `work/bench/qkzxlxtsvpuq_addfd7675506`
+
 ## 2026-04-27 - Inline guarded method direct-call stores
 
 - baseline: `work/bench/qkzxlxtsvpuq_addfd7675506`
