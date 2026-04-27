@@ -1,5 +1,36 @@
 # Overnight Performance Log
 
+## 2026-04-27 - Keep enabled refcount helpers out of caller inlining
+
+- baseline: `work/bench/qkzxlxtsvpuq_addfd7675506`
+  - specialized apply median: `566978 loops/s`
+  - specialized apply mean: `568132 loops/s`
+  - verify pass: `340618 loops/s`
+  - no-refcount diagnostic median: `736336 loops/s`
+  - latest summarized pystone code size: `65372 bytes`, `3862` machine blocks
+- observation: the mapped JIT profile still showed many hot blocks inside the
+  expanded refcount helper shapes. Keeping enabled refcount helpers as calls
+  looked like a possible I-cache/code-shape tradeoff, while still letting
+  refcount-disabled diagnostic mode inline no-op helpers.
+- attempted change: exclude `soac_runtime_incref` and `soac_runtime_decref`
+  from runtime-support inlining when normal refcount emission is enabled. The
+  disabled diagnostic mode still rewrites those helpers to no-op inline bodies.
+- rejected result: `work/bench/twppkzorkpqx_d993fa973e27`
+  - specialized apply median: `455738 loops/s` (`-19.62%`)
+  - specialized apply mean: `455137 loops/s` (`-19.89%`)
+  - verify pass: `337324 loops/s` (`-0.97%`)
+  - no-refcount diagnostic median: `745209 loops/s` (`+1.20%`)
+  - latest summarized pystone code size: `65372 bytes`, `3862` machine blocks
+  - code-size delta: `+0 bytes`, `+0` machine blocks
+- reason rejected: the extra call overhead on every emitted refcount operation
+  dominates. The summarized code size did not improve, and production apply
+  throughput collapsed.
+- validation before rejection: `just fmt-rust soac_jit` passed; `cargo test -p
+  soac_jit runtime_support_inliner -- --nocapture` passed; `cargo check -p
+  soac_jit --tests` passed; `just benchmark` produced the rejected result above.
+  The experiment was then reverted.
+- next baseline: `work/bench/qkzxlxtsvpuq_addfd7675506`
+
 ## 2026-04-27 - Inline non-null indexed field stores
 
 - baseline: `work/bench/qkzxlxtsvpuq_addfd7675506`
