@@ -1,5 +1,37 @@
 # Overnight Performance Log
 
+## 2026-04-27 - Favor existing inline field stores
+
+- baseline: `work/bench/moqnnqssmupy_c337b6282dc2`
+  - specialized apply median: `575641 loops/s`
+  - specialized apply mean: `574805 loops/s`
+  - verify pass: `327070 loops/s`
+  - no-refcount diagnostic median: `755874 loops/s`
+  - latest summarized pystone code size: `66581 bytes`, `3908` machine blocks
+- observation: `soac_runtime_store_field_indexed_inline_values_trusted` remained
+  one of the largest non-JIT symbols in the pystone profile. A low-risk helper
+  layout change looked preferable to the earlier rejected callsite inlining
+  attempt.
+- attempted change: reorder the trusted inline-values field-store helper so the
+  already-populated slot update path returns first, leaving first-insert
+  bookkeeping as the trailing path. Behavior and generated JIT code shape were
+  unchanged.
+- rejected result: `work/bench/llqkusrnwkyz_89f529b9e369`
+  - specialized apply median: `574496 loops/s` (`-0.20%`)
+  - specialized apply mean: `574946 loops/s` (`+0.02%`)
+  - verify pass: `330759 loops/s` (`+1.13%`)
+  - no-refcount diagnostic median: `746435 loops/s` (`-1.25%`)
+  - latest summarized pystone code size: `66581 bytes`, `3908` machine blocks
+  - code-size delta: `+0 bytes`, `+0` machine blocks
+- reason rejected: the production apply median was not better, the no-refcount
+  diagnostic regressed, and the mean improvement was too small to distinguish
+  from benchmark noise.
+- validation before rejection: `cargo fmt --manifest-path
+  crates/soac_jit_runtime/Cargo.toml` passed; `cargo check -p soac_jit
+  --tests` passed; `just benchmark` produced the rejected result above. The
+  experiment was then reverted.
+- next baseline: `work/bench/moqnnqssmupy_c337b6282dc2`
+
 ## 2026-04-27 - Inline nested direct-call results
 
 - baseline: `work/bench/moqnnqssmupy_c337b6282dc2`
