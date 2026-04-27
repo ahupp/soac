@@ -1,5 +1,37 @@
 # Overnight Performance Log
 
+## 2026-04-27 - Runtime guard-miss deopt for v3 plans
+
+- baseline: `work/bench/uxwoxrqpzwzw_acb20ab139b0`
+  - specialized apply median: `588058 loops/s`
+  - specialized apply mean: `586858 loops/s`
+  - verify pass: `335249 loops/s`
+  - no-refcount diagnostic median: `762813 loops/s`
+  - latest summarized pystone code size: `66689 bytes`, `3918` machine blocks
+- observation: verify/apply counters showed zero guard failures and zero deopt
+  calls, while generated pystone code still carries local guard-miss fallback
+  machinery for indexed globals, fields, and direct calls.
+- attempted change: enable the existing guard-miss deopt policy for ordinary
+  runtime typed-v3 plans, so replay-safe guard misses use the runtime deopt
+  resume path instead of local fallback bodies.
+- rejected result: `work/bench/tnsylqtyyrvk_e6b5f1c22221`
+  - specialized apply median: `555045 loops/s` (`-5.61%`)
+  - specialized apply mean: `560721 loops/s` (`-4.45%`)
+  - verify pass: `332042 loops/s` (`-0.96%`)
+  - no-refcount diagnostic median: `763370 loops/s` (`+0.07%`)
+  - latest summarized pystone code size: `66689 bytes`, `3918` machine blocks
+  - code-size delta: `+0 bytes`, `+0` machine blocks
+- reason rejected: the production refcount-enabled apply path regressed
+  substantially and the summarized pystone code size did not improve, so the
+  deopt policy change did not remove enough local fallback code to justify the
+  added guard-miss machinery.
+- validation before rejection: `just fmt-rust soac_jit` passed; `cargo test -p
+  soac_jit guard_miss_deopt -- --nocapture` passed; `cargo test -p soac_jit
+  runtime_typed_v3_pipeline -- --nocapture` passed; `cargo check -p soac_jit
+  --tests` passed; `just benchmark` produced the rejected result above. The
+  implementation was then reverted.
+- next baseline: `work/bench/uxwoxrqpzwzw_acb20ab139b0`
+
 ## 2026-04-27 - Delay indexed-field attr operand loads
 
 - baseline: `work/bench/uxwoxrqpzwzw_acb20ab139b0`
