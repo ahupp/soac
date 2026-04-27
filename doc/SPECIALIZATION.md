@@ -760,8 +760,10 @@ access goes through the CPython item APIs.
 - If the profiled shape is exact `str`/`str`, the hot path guards both operands
   against exact `PyUnicode_Type`. `I32Bool01` compare-to-bool lowering first
   handles pointer-equal operands and compact ASCII one-character operands
-  directly, then falls back to `PyUnicode_Compare` for the general exact-Unicode
-  case. This avoids allocation of the intermediate Python bool and the follow-on
+  directly. Longer compact ASCII operands call a SOAC runtime helper that
+  performs lexicographic byte comparison before the general exact-Unicode
+  fallback to `PyUnicode_Compare`. This avoids allocation of the intermediate
+  Python bool and the follow-on
   truthiness helper; when an object result is demanded, the scalar comparison
   result is materialized as the Python bool singleton. Operand inputs may be
   locals/cells, module string constants, or profiled indexed module-global

@@ -52,6 +52,7 @@ soac_runtime_store_field_indexed
 soac_runtime_probe_field_indexed_inline_values
 soac_runtime_store_field_indexed_inline_values
 soac_runtime_store_field_indexed_inline_values_trusted
+soac_runtime_compare_compact_ascii_unicode
 ```
 
 ## specialized_helpers.rs

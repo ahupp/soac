@@ -1,5 +1,40 @@
 # Overnight Performance Log
 
+## 2026-04-27 - Compact ASCII string compare runtime helper
+
+- baseline: `work/bench/moqnnqssmupy_c337b6282dc2`
+  - specialized apply median: `575641 loops/s`
+  - specialized apply mean: `574805 loops/s`
+  - verify pass: `327070 loops/s`
+  - no-refcount diagnostic median: `755874 loops/s`
+  - latest summarized pystone code size: `66581 bytes`, `3908` machine blocks
+- observation: after the one-character compact ASCII compare fast path,
+  generated pystone CLIF still had `PyUnicode_Compare` calls for longer exact
+  string comparisons in `Func2` and the `CharIndex` loop path. Those operands
+  are compact ASCII in the benchmark.
+- kept change: add `soac_runtime_compare_compact_ascii_unicode`, a raw runtime
+  helper that compares compact ASCII Unicode payload bytes lexicographically,
+  and have exact-string compare-to-bool codegen call it for longer compact
+  ASCII operands. Pointer-equal and one-character compact ASCII compares remain
+  inline; non-compact-ASCII exact Unicode still falls back to
+  `PyUnicode_Compare`.
+- result: `work/bench/rzksyulqnrst_fb9310152742`
+  - specialized apply median: `583069 loops/s` (`+1.29%`)
+  - specialized apply mean: `583539 loops/s` (`+1.52%`)
+  - verify pass: `337257 loops/s` (`+3.11%`)
+  - no-refcount diagnostic median: `740852 loops/s` (`-1.99%`)
+  - latest summarized pystone code size: `66689 bytes`, `3918` machine blocks
+  - code-size delta: `+108 bytes`, `+10` machine blocks
+- reason kept: the refcount-enabled production apply pass improved materially
+  with only a small generated-code-size increase. The no-refcount diagnostic
+  regressed, but the production result is the headline metric.
+- validation: `cargo fmt --manifest-path crates/soac_jit_runtime/Cargo.toml`
+  passed; `just fmt-rust soac_jit` passed; `cargo test -p soac_jit
+  specialized_jit_opt_v3_exact_str_branch_uses_unicode_compare -- --nocapture`
+  passed; `cargo check -p soac_jit --tests` passed; `just benchmark` produced
+  the kept result above.
+- next baseline: `work/bench/rzksyulqnrst_fb9310152742`
+
 ## 2026-04-27 - Favor existing inline field stores
 
 - baseline: `work/bench/moqnnqssmupy_c337b6282dc2`

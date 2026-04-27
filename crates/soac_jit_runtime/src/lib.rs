@@ -279,6 +279,47 @@ unsafe fn exact_compact_ascii_ord(obj: *mut c_void) -> Option<i64> {
     Some(unsafe { *data }.into())
 }
 
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soac_runtime_compare_compact_ascii_unicode(
+    lhs: *mut c_void,
+    rhs: *mut c_void,
+) -> i32 {
+    let lhs = lhs.cast::<RawPyAsciiObject>();
+    let rhs = rhs.cast::<RawPyAsciiObject>();
+    debug_assert!(!lhs.is_null());
+    debug_assert!(!rhs.is_null());
+    debug_assert!(
+        unsafe { (*lhs).state } & (PY_UNICODE_STATE_COMPACT_MASK | PY_UNICODE_STATE_ASCII_MASK)
+            == (PY_UNICODE_STATE_COMPACT_MASK | PY_UNICODE_STATE_ASCII_MASK)
+    );
+    debug_assert!(
+        unsafe { (*rhs).state } & (PY_UNICODE_STATE_COMPACT_MASK | PY_UNICODE_STATE_ASCII_MASK)
+            == (PY_UNICODE_STATE_COMPACT_MASK | PY_UNICODE_STATE_ASCII_MASK)
+    );
+
+    let lhs_len = unsafe { (*lhs).length } as usize;
+    let rhs_len = unsafe { (*rhs).length } as usize;
+    let lhs_data = unsafe { lhs.add(1).cast::<u8>() };
+    let rhs_data = unsafe { rhs.add(1).cast::<u8>() };
+    let min_len = if lhs_len < rhs_len { lhs_len } else { rhs_len };
+    let mut index = 0usize;
+    while index < min_len {
+        let lhs_byte = unsafe { *lhs_data.add(index) };
+        let rhs_byte = unsafe { *rhs_data.add(index) };
+        if lhs_byte != rhs_byte {
+            return if lhs_byte < rhs_byte { -1 } else { 1 };
+        }
+        index += 1;
+    }
+    if lhs_len == rhs_len {
+        0
+    } else if lhs_len < rhs_len {
+        -1
+    } else {
+        1
+    }
+}
+
 #[inline(always)]
 unsafe fn can_skip_incref(obj: *mut RawPyObject) -> bool {
     const PY_IMMORTAL_INITIAL_REFCNT: u32 = 3u32 << 30;

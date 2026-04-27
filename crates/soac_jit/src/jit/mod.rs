@@ -280,9 +280,10 @@ use imports::{
     PYOBJECT_RICHCOMPARE_IMPORT, PYUNICODE_COMPARE_IMPORT,
     SOAC_JIT_MAKE_FUNCTION_WITH_CLOSURE_IMPORT, SOAC_RUNTIME_BUILTIN_CHR_I64_IMPORT,
     SOAC_RUNTIME_BUILTIN_ITER_OBJECT_IMPORT, SOAC_RUNTIME_BUILTIN_LEN_I64_IMPORT,
-    SOAC_RUNTIME_BUILTIN_ORD_I64_IMPORT, SOAC_RUNTIME_LOAD_GLOBAL_IMPORT,
-    SOAC_RUNTIME_LOAD_GLOBAL_SLOW_IMPORT, SOAC_RUNTIME_PROBE_GLOBAL_INDEXED_IMPORT,
-    SOAC_RUNTIME_PYLONG_AS_I64_SATURATING_IMPORT, SOAC_RUNTIME_SET_RAISED_EXCEPTION_IMPORT,
+    SOAC_RUNTIME_BUILTIN_ORD_I64_IMPORT, SOAC_RUNTIME_COMPARE_COMPACT_ASCII_UNICODE_IMPORT,
+    SOAC_RUNTIME_LOAD_GLOBAL_IMPORT, SOAC_RUNTIME_LOAD_GLOBAL_SLOW_IMPORT,
+    SOAC_RUNTIME_PROBE_GLOBAL_INDEXED_IMPORT, SOAC_RUNTIME_PYLONG_AS_I64_SATURATING_IMPORT,
+    SOAC_RUNTIME_SET_RAISED_EXCEPTION_IMPORT,
     SOAC_RUNTIME_STORE_FIELD_INDEXED_INLINE_VALUES_TRUSTED_IMPORT,
     SOAC_RUNTIME_STORE_GLOBAL_IMPORT, SOAC_RUNTIME_STORE_GLOBAL_INDEXED_IMPORT,
     SOAC_RUNTIME_TUPLE_NEW_IMPORT, SOAC_RUNTIME_TUPLE_SET_ITEM_STOLEN_IMPORT, SigType,
@@ -14319,7 +14320,9 @@ fn emit_opt_v3_exact_unicode_compare_bool(
     let done_block = fb.create_block();
     let same_object_block = fb.create_block();
     let ascii_probe_block = fb.create_block();
-    let ascii_compare_block = fb.create_block();
+    let ascii_dispatch_block = fb.create_block();
+    let ascii_char_compare_block = fb.create_block();
+    let ascii_helper_compare_block = fb.create_block();
     let unicode_compare_block = fb.create_block();
     fb.append_block_param(done_block, emit_ctx.consts.i32_ty);
 
@@ -14383,16 +14386,24 @@ fn emit_opt_v3_exact_unicode_compare_bool(
         compact_ascii_mask,
     );
     let both_compact_ascii = fb.ins().band(lhs_is_compact_ascii, rhs_is_compact_ascii);
-    let can_compare_inline = fb.ins().band(both_len_one, both_compact_ascii);
     fb.ins().brif(
-        can_compare_inline,
-        ascii_compare_block,
+        both_compact_ascii,
+        ascii_dispatch_block,
         &[],
         unicode_compare_block,
         &[],
     );
 
-    fb.switch_to_block(ascii_compare_block);
+    fb.switch_to_block(ascii_dispatch_block);
+    fb.ins().brif(
+        both_len_one,
+        ascii_char_compare_block,
+        &[],
+        ascii_helper_compare_block,
+        &[],
+    );
+
+    fb.switch_to_block(ascii_char_compare_block);
     let lhs_char = fb.ins().load(
         ir::types::I8,
         ir::MemFlags::trusted(),
@@ -14411,6 +14422,23 @@ fn emit_opt_v3_exact_unicode_compare_bool(
     let char_result = emit_i32_bool01_from_condition(fb, emit_ctx, char_condition);
     fb.ins()
         .jump(done_block, &[ir::BlockArg::Value(char_result)]);
+
+    fb.switch_to_block(ascii_helper_compare_block);
+    let ascii_compare_ref = func_imports.get(
+        codegen_env,
+        &mut fb.func,
+        &SOAC_RUNTIME_COMPARE_COMPACT_ASCII_UNICODE_IMPORT,
+    )?;
+    let ascii_call = fb.ins().call(ascii_compare_ref, &[lhs, rhs]);
+    let ascii_compare_result = fb.inst_results(ascii_call)[0];
+    let ascii_result = emit_opt_v3_rich_compare_bool01_from_i32_compare_result(
+        fb,
+        emit_ctx,
+        op,
+        ascii_compare_result,
+    );
+    fb.ins()
+        .jump(done_block, &[ir::BlockArg::Value(ascii_result)]);
 
     fb.switch_to_block(unicode_compare_block);
     let compare_ref = func_imports.get(codegen_env, &mut fb.func, &PYUNICODE_COMPARE_IMPORT)?;

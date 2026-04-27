@@ -14886,6 +14886,15 @@ def f(x):
             count_load_results_of_type(&built.ctx.func, ir::types::I8) >= 2,
             "v3 exact-str branch should emit compact-ASCII character loads for the inline path"
         );
+        let ascii_compare = declared_user_names_for_symbols(
+            &built,
+            &[crate::jit::symbols::SOAC_RUNTIME_COMPARE_COMPACT_ASCII_UNICODE_SYMBOL],
+        );
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&built.ctx.func, &ascii_compare),
+            1,
+            "v3 exact-str branch should call the compact-ASCII runtime helper for longer strings"
+        );
         let generic_compare = import_user_names_for_symbols(&built, &["PyObject_RichCompareBool"]);
         assert_eq!(
             count_direct_calls_to_runtime_helpers(&built.ctx.func, &generic_compare),
