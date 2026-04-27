@@ -1,5 +1,36 @@
 # Overnight Performance Log
 
+## 2026-04-27 - Direct builtin next runtime primitive
+
+- baseline: `work/bench/uxwoxrqpzwzw_acb20ab139b0`
+  - specialized apply median: `588058 loops/s`
+  - specialized apply mean: `586858 loops/s`
+  - verify pass: `335249 loops/s`
+  - no-refcount diagnostic median: `762813 loops/s`
+  - latest summarized pystone code size: `66689 bytes`, `3918` machine blocks
+- observation: pystone still spends visible time in the vectorcall path around
+  builtin `next` and range iteration. A direct primitive could skip the generic
+  vectorcall-hook dispatch and use the existing range-iterator fast path
+  directly, while falling back to the real builtin `next` for generic semantics.
+- attempted change: add a `next(iterator)` runtime primitive to the direct-call
+  ABI, with a direct range-iterator fast path and generic builtin-next fallback.
+- rejected result: `work/bench/zlqkxutwrxqt_b09ad14d6715`
+  - specialized apply median: `568265 loops/s` (`-3.37%`)
+  - specialized apply mean: `568299 loops/s` (`-3.16%`)
+  - verify pass: `310316 loops/s` (`-7.44%`)
+  - no-refcount diagnostic median: `731046 loops/s` (`-4.16%`)
+  - latest summarized pystone code size: `66689 bytes`, `3918` machine blocks
+  - code-size delta: `+0 bytes`, `+0` machine blocks
+- reason rejected: the benchmark regressed and generated code size did not
+  change, so pystone's hot lowered loop shape did not benefit from this direct
+  primitive.
+- validation before rejection: `just fmt-rust soac_jit` passed; `cargo test -p
+  soac_jit runtime_builtin -- --nocapture` passed; `cargo test -p soac_jit
+  direct_abi -- --nocapture` passed; `cargo check -p soac_jit --tests` passed;
+  `just benchmark` produced the rejected result above. The implementation was
+  then reverted.
+- next baseline: `work/bench/uxwoxrqpzwzw_acb20ab139b0`
+
 ## 2026-04-27 - Typed constructor-entry direct-call placement
 
 - baseline: `work/bench/uxwoxrqpzwzw_acb20ab139b0`
