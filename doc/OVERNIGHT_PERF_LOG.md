@@ -1,5 +1,36 @@
 # Overnight Performance Log
 
+## 2026-04-27 - Probe StopIteration arg before cached function
+
+- baseline: `work/bench/uxwoxrqpzwzw_acb20ab139b0`
+  - specialized apply median: `588058 loops/s`
+  - specialized apply mean: `586858 loops/s`
+  - verify pass: `335249 loops/s`
+  - no-refcount diagnostic median: `762813 loops/s`
+  - latest summarized pystone code size: `66689 bytes`, `3918` machine blocks
+- observation: the vectorcall hook also tries a special
+  `soac.runtime.exception_matches(exc, StopIteration)` path. That probe loaded
+  the cached runtime function before checking whether the second argument was
+  actually `StopIteration`.
+- attempted change: check the second vectorcall argument for
+  `PyExc_StopIteration` before loading and comparing the cached
+  `soac.runtime.exception_matches` function, so unrelated two-argument
+  vectorcalls can reject the special path earlier.
+- rejected result: `work/bench/wywpnqoozvmm_32aa407e35c9`
+  - specialized apply median: `571941 loops/s` (`-2.74%`)
+  - specialized apply mean: `573908 loops/s` (`-2.21%`)
+  - verify pass: `341188 loops/s` (`+1.77%`)
+  - no-refcount diagnostic median: `761247 loops/s` (`-0.21%`)
+  - latest summarized pystone code size: `66689 bytes`, `3918` machine blocks
+  - code-size delta: `+0 bytes`, `+0` machine blocks
+- reason rejected: the refcount-enabled apply pass regressed materially. The
+  faster early rejection shape in verify did not translate to the production
+  specialized apply workload.
+- validation before rejection: `just fmt-rust soac_jit` passed; `cargo check -p
+  soac_jit --tests` passed; `just benchmark` produced the rejected result
+  above. The implementation was then reverted.
+- next baseline: `work/bench/uxwoxrqpzwzw_acb20ab139b0`
+
 ## 2026-04-27 - Probe range iterator before cached next lookup
 
 - baseline: `work/bench/uxwoxrqpzwzw_acb20ab139b0`
