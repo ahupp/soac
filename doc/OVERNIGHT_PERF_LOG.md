@@ -1,5 +1,34 @@
 # Overnight Performance Log
 
+## 2026-04-27 - Exact-int returns for borrowed-ok demand
+
+- baseline: `work/bench/uxwoxrqpzwzw_acb20ab139b0`
+  - specialized apply median: `588058 loops/s`
+  - specialized apply mean: `586858 loops/s`
+  - verify pass: `335249 loops/s`
+  - no-refcount diagnostic median: `762813 loops/s`
+  - latest summarized pystone code size: `66689 bytes`, `3918` machine blocks
+- observation: exact-int return codegen only accepted owned PyObject demand,
+  but many call and intrinsic inputs are marked borrowed-ok. The exact-int path
+  produces an owned Python object, which can satisfy borrowed-ok demand.
+- attempted change: allow typed exact-int return plans to run for any PyObject
+  demand, not only owned-demand expression sites.
+- rejected result: `work/bench/lupklolvzmmt_695f329221b7`
+  - specialized apply median: `553151 loops/s` (`-5.94%`)
+  - specialized apply mean: `561859 loops/s` (`-4.26%`)
+  - verify pass: `320093 loops/s` (`-4.52%`)
+  - no-refcount diagnostic median: `759865 loops/s` (`-0.39%`)
+  - latest summarized pystone code size: `66689 bytes`, `3918` machine blocks
+  - code-size delta: `+0 bytes`, `+0` machine blocks
+- reason rejected: the refcount-enabled apply path regressed and the
+  summarized generated code size did not change, so broadening this demand gate
+  did not expose a useful pystone hot path.
+- validation before rejection: `just fmt-rust soac_jit` passed; `cargo test -p
+  soac_jit exact_int -- --nocapture` passed; `cargo check -p soac_jit --tests`
+  passed; `just benchmark` produced the rejected result above. The
+  implementation was then reverted.
+- next baseline: `work/bench/uxwoxrqpzwzw_acb20ab139b0`
+
 ## 2026-04-27 - Effect-only indexed global store helper
 
 - baseline: `work/bench/uxwoxrqpzwzw_acb20ab139b0`
