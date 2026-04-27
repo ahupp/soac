@@ -130,7 +130,7 @@ struct JitDataDeclarationSnapshot {
 
 struct JitBatchPlan<'a> {
     root_function_id: RuntimeFunctionId,
-    env_config: &'a SoacEnvConfig,
+    env_config: SoacEnvConfig,
     batch_functions: Vec<ProcessJitBatchFunction<'a>>,
     function_indices_to_define: Vec<usize>,
     function_compile_inputs: HashMap<usize, ReservedJitFunctionCompileInputs>,
@@ -145,6 +145,222 @@ enum ReservedDirectFunctionBatch<'a> {
     Ready(Arc<CompiledFunctionHandle>),
     Compiling(Arc<ProcessJitCompileWaiter>),
     Reserved(JitBatchPlan<'a>),
+}
+
+struct JitBatchWorkQueue {
+    inner: Mutex<JitBatchWorkQueueInner>,
+}
+
+struct JitBatchWork {
+    queue: JitBatchWorkQueue,
+    assist_context: Option<Arc<JitBatchAssistContext>>,
+}
+
+struct JitBatchAssistContext {
+    session: Arc<crate::session::CompileSession>,
+    plan: Arc<JitBatchPlan<'static>>,
+    shared_state: Arc<crate::module_type::SharedModuleState>,
+    blocks: Vec<ObjPtr>,
+    module_constant_ptrs: Vec<*mut ffi::PyObject>,
+    dependencies: HashMap<RuntimeFunctionId, HashSet<RuntimeFunctionId>>,
+    index_by_function_id: HashMap<RuntimeFunctionId, usize>,
+}
+
+// Foreground assists run on the Python thread while background workers are compiling from the same
+// immutable plan. The raw pointers are the same opaque Python object/block identities already used
+// by DirectFunctionCompileInputs, whose Send/Sync safety is documented above.
+unsafe impl Send for JitBatchAssistContext {}
+unsafe impl Sync for JitBatchAssistContext {}
+
+struct JitBatchWorkQueueInner {
+    queued: VecDeque<usize>,
+    index_by_function_id: HashMap<RuntimeFunctionId, usize>,
+}
+
+impl JitBatchWorkQueue {
+    fn new(plan: &JitBatchPlan<'_>) -> Self {
+        let mut index_by_function_id =
+            HashMap::with_capacity(plan.function_indices_to_define.len());
+        for batch_function_index in &plan.function_indices_to_define {
+            let function_id = plan.batch_functions[*batch_function_index]
+                .function
+                .function_id;
+            index_by_function_id.insert(function_id, *batch_function_index);
+        }
+        Self {
+            inner: Mutex::new(JitBatchWorkQueueInner {
+                queued: VecDeque::from(plan.function_indices_to_define.clone()),
+                index_by_function_id,
+            }),
+        }
+    }
+
+    fn pop_front(&self) -> Result<Option<usize>, String> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| "process JIT background work queue lock poisoned".to_string())?;
+        Ok(inner.queued.pop_front())
+    }
+
+    fn promote_function(&self, function_id: RuntimeFunctionId) -> Result<bool, String> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| "process JIT background work queue lock poisoned".to_string())?;
+        let Some(batch_function_index) = inner.index_by_function_id.get(&function_id).copied()
+        else {
+            return Ok(false);
+        };
+        let Some(position) = inner
+            .queued
+            .iter()
+            .position(|queued_index| *queued_index == batch_function_index)
+        else {
+            return Ok(false);
+        };
+        if position != 0 {
+            inner.queued.remove(position);
+            inner.queued.push_front(batch_function_index);
+        }
+        Ok(true)
+    }
+
+    fn take_function_indices(&self, requested_indices: &[usize]) -> Result<Vec<usize>, String> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| "process JIT background work queue lock poisoned".to_string())?;
+        let mut claimed = Vec::new();
+        for requested_index in requested_indices {
+            if let Some(position) = inner
+                .queued
+                .iter()
+                .position(|queued_index| queued_index == requested_index)
+            {
+                if let Some(claimed_index) = inner.queued.remove(position) {
+                    claimed.push(claimed_index);
+                }
+            }
+        }
+        Ok(claimed)
+    }
+}
+
+impl JitBatchWork {
+    fn new(plan: &JitBatchPlan<'_>, assist_context: Option<Arc<JitBatchAssistContext>>) -> Self {
+        Self {
+            queue: JitBatchWorkQueue::new(plan),
+            assist_context,
+        }
+    }
+
+    fn pop_front(&self) -> Result<Option<usize>, String> {
+        self.queue.pop_front()
+    }
+
+    fn promote_function(&self, function_id: RuntimeFunctionId) -> Result<bool, String> {
+        self.queue.promote_function(function_id)
+    }
+
+    fn take_function_indices(&self, requested_indices: &[usize]) -> Result<Vec<usize>, String> {
+        self.queue.take_function_indices(requested_indices)
+    }
+
+    fn assist_context(&self) -> Option<Arc<JitBatchAssistContext>> {
+        self.assist_context.as_ref().map(Arc::clone)
+    }
+}
+
+impl JitBatchAssistContext {
+    fn new(
+        session: Arc<crate::session::CompileSession>,
+        plan: Arc<JitBatchPlan<'static>>,
+        shared_state: Arc<crate::module_type::SharedModuleState>,
+        blocks: Vec<ObjPtr>,
+        module_constant_ptrs: Vec<*mut ffi::PyObject>,
+        dependencies: HashMap<RuntimeFunctionId, HashSet<RuntimeFunctionId>>,
+    ) -> Self {
+        let mut index_by_function_id =
+            HashMap::with_capacity(plan.function_indices_to_define.len());
+        for batch_function_index in &plan.function_indices_to_define {
+            let function_id = plan.batch_functions[*batch_function_index]
+                .function
+                .function_id;
+            index_by_function_id.insert(function_id, *batch_function_index);
+        }
+        Self {
+            session,
+            plan,
+            shared_state,
+            blocks,
+            module_constant_ptrs,
+            dependencies,
+            index_by_function_id,
+        }
+    }
+
+    fn function_id_for_index(&self, batch_function_index: usize) -> RuntimeFunctionId {
+        self.plan.batch_functions[batch_function_index]
+            .function
+            .function_id
+    }
+
+    fn dependency_closure_order(&self, function_id: RuntimeFunctionId) -> Vec<RuntimeFunctionId> {
+        fn visit(
+            dependencies: &HashMap<RuntimeFunctionId, HashSet<RuntimeFunctionId>>,
+            function_id: RuntimeFunctionId,
+            seen: &mut HashSet<RuntimeFunctionId>,
+            out: &mut Vec<RuntimeFunctionId>,
+        ) {
+            if !seen.insert(function_id) {
+                return;
+            }
+            if let Some(deps) = dependencies.get(&function_id) {
+                for dep in deps {
+                    visit(dependencies, *dep, seen, out);
+                }
+            }
+            out.push(function_id);
+        }
+
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        visit(&self.dependencies, function_id, &mut seen, &mut out);
+        out
+    }
+
+    fn dependency_closure_indices(&self, function_id: RuntimeFunctionId) -> Vec<usize> {
+        self.dependency_closure_order(function_id)
+            .into_iter()
+            .filter_map(|function_id| self.index_by_function_id.get(&function_id).copied())
+            .collect()
+    }
+
+    fn compile_indices(
+        &self,
+        batch_function_indices: &[usize],
+    ) -> Result<Vec<CompiledJitFunction>, String> {
+        let inputs = DirectFunctionCompileInputs {
+            session: &self.session,
+            blocks: self.blocks.as_slice(),
+            module: &self.shared_state.lowered_module,
+            module_constants: &self.shared_state.codegen_constants,
+            counter_defs: &self.shared_state.lowered_module.counter_defs,
+            module_constant_ptrs: self.module_constant_ptrs.as_slice(),
+            direct_call_resolver: Some(self.shared_state.as_ref()),
+        };
+        let mut codegen_env = ReservedJitCodegenEnv {
+            isa: Arc::clone(&self.plan.isa),
+            declarations: &self.plan.module_declarations,
+        };
+        ProcessJitState::compile_reserved_direct_function_batch_indices(
+            &mut codegen_env,
+            &inputs,
+            self.plan.as_ref(),
+            batch_function_indices,
+        )
+    }
 }
 
 struct JitBatchCompileOutput {
@@ -497,6 +713,51 @@ impl ProcessJitBatchFunctionSource<'_> {
     }
 }
 
+impl<'a> ProcessJitBatchFunction<'a> {
+    fn into_static_owned(self) -> Result<ProcessJitBatchFunction<'static>, String> {
+        let source = match self.source {
+            ProcessJitBatchFunctionSource::ExplicitInputs => {
+                ProcessJitBatchFunctionSource::ExplicitInputs
+            }
+            ProcessJitBatchFunctionSource::OwnedSharedState(shared_state) => {
+                ProcessJitBatchFunctionSource::OwnedSharedState(shared_state)
+            }
+            ProcessJitBatchFunctionSource::BorrowedSharedState(_) => {
+                return Err(format!(
+                    "process JIT batch function {} id={} cannot be shared for foreground assist because it borrows module state",
+                    self.function.names.qualname, self.function.function_id
+                ));
+            }
+        };
+        Ok(ProcessJitBatchFunction {
+            function: self.function,
+            source,
+        })
+    }
+}
+
+impl<'a> JitBatchPlan<'a> {
+    fn into_static_owned(self) -> Result<JitBatchPlan<'static>, String> {
+        let batch_functions = self
+            .batch_functions
+            .into_iter()
+            .map(ProcessJitBatchFunction::into_static_owned)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(JitBatchPlan {
+            root_function_id: self.root_function_id,
+            env_config: self.env_config,
+            batch_functions,
+            function_indices_to_define: self.function_indices_to_define,
+            function_compile_inputs: self.function_compile_inputs,
+            compile_waiters: self.compile_waiters,
+            module_declarations: self.module_declarations,
+            isa: self.isa,
+            module_plans: self.module_plans,
+            predeclared: self.predeclared,
+        })
+    }
+}
+
 fn duration_micros(duration: Duration) -> u64 {
     u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
@@ -621,6 +882,7 @@ enum ProcessJitFunctionEntry {
         declared: DeclaredJitFunction,
         shape: ProcessJitFunctionShape,
         waiter: Arc<ProcessJitCompileWaiter>,
+        work: Option<Arc<JitBatchWork>>,
     },
     Ready {
         declared: DeclaredJitFunction,
@@ -678,6 +940,15 @@ impl ProcessJitFunctionEntry {
             Self::Declared { .. } | Self::Ready { .. } => None,
         }
     }
+
+    fn compile_work(&self) -> Option<Arc<JitBatchWork>> {
+        match self {
+            Self::Compiling {
+                work: Some(work), ..
+            } => Some(Arc::clone(work)),
+            Self::Compiling { work: None, .. } | Self::Declared { .. } | Self::Ready { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -710,6 +981,21 @@ impl ProcessJitCompileWaiter {
         }
     }
 
+    fn wait_timeout(&self, timeout: Duration) -> Result<Option<Result<(), String>>, String> {
+        let result = self
+            .result
+            .lock()
+            .map_err(|_| "process JIT compile waiter lock poisoned".to_string())?;
+        if let Some(result) = result.as_ref() {
+            return Ok(Some(result.clone()));
+        }
+        let (result, _) = self
+            .ready
+            .wait_timeout(result, timeout)
+            .map_err(|_| "process JIT compile waiter lock poisoned".to_string())?;
+        Ok(result.clone())
+    }
+
     fn finish(&self, result: Result<(), String>) {
         if let Ok(mut slot) = self.result.lock() {
             if slot.is_none() {
@@ -722,6 +1008,14 @@ impl ProcessJitCompileWaiter {
 
 fn wait_for_process_jit_compile(waiter: &ProcessJitCompileWaiter) -> Result<(), String> {
     Python::try_attach(|py| py.detach(|| waiter.wait())).unwrap_or_else(|| waiter.wait())
+}
+
+fn wait_for_process_jit_compile_timeout(
+    waiter: &ProcessJitCompileWaiter,
+    timeout: Duration,
+) -> Result<Option<Result<(), String>>, String> {
+    Python::try_attach(|py| py.detach(|| waiter.wait_timeout(timeout)))
+        .unwrap_or_else(|| waiter.wait_timeout(timeout))
 }
 
 impl ProcessJitModule {
@@ -907,6 +1201,68 @@ impl ProcessJitState {
             .flatten()
     }
 
+    fn promote_queued_direct_function_compile(
+        &self,
+        function: &BlockPyFunction<CodegenModuleShape>,
+    ) -> Result<bool, String> {
+        let Some(entry) = self.direct_functions.get(&function.function_id) else {
+            return Ok(false);
+        };
+        if entry.shape() != &ProcessJitFunctionShape::for_function(function) {
+            return Ok(false);
+        }
+        let Some(work) = entry.compile_work() else {
+            return Ok(false);
+        };
+        work.promote_function(function.function_id)
+    }
+
+    fn direct_function_compile_work(
+        &self,
+        function: &BlockPyFunction<CodegenModuleShape>,
+    ) -> Option<Arc<JitBatchWork>> {
+        let entry = self.direct_functions.get(&function.function_id)?;
+        (entry.shape() == &ProcessJitFunctionShape::for_function(function))
+            .then(|| entry.compile_work())
+            .flatten()
+    }
+
+    fn direct_function_dependency_waiter(
+        &self,
+        function_id: RuntimeFunctionId,
+    ) -> Option<Arc<ProcessJitCompileWaiter>> {
+        let entry = self.direct_functions.get(&function_id)?;
+        if entry.ready_entry().is_some() {
+            return None;
+        }
+        entry.compile_waiter()
+    }
+
+    fn attach_direct_function_work(&mut self, plan: &JitBatchPlan<'_>, work: &Arc<JitBatchWork>) {
+        for batch_function_index in &plan.function_indices_to_define {
+            let function_id = plan.batch_functions[*batch_function_index]
+                .function
+                .function_id;
+            let Some(waiter) = plan.compile_waiters.get(&function_id) else {
+                continue;
+            };
+            let Some(entry) = self.direct_functions.get_mut(&function_id) else {
+                continue;
+            };
+            let ProcessJitFunctionEntry::Compiling {
+                waiter: entry_waiter,
+                work: entry_work,
+                ..
+            } = entry
+            else {
+                continue;
+            };
+            if Arc::ptr_eq(waiter, entry_waiter) {
+                *entry_work = Some(Arc::clone(work));
+            }
+        }
+    }
+
     fn ready_direct_function(
         &self,
         function: &BlockPyFunction<CodegenModuleShape>,
@@ -968,6 +1324,7 @@ impl ProcessJitState {
                 declared,
                 shape,
                 waiter: entry_waiter,
+                ..
             } = entry
             else {
                 continue;
@@ -1159,6 +1516,7 @@ impl ProcessJitState {
                     declared: declared.clone(),
                     shape,
                     waiter,
+                    work: None,
                 },
             );
             predeclared.insert(function.function_id, declared);
@@ -1167,7 +1525,7 @@ impl ProcessJitState {
 
         Ok(ReservedDirectFunctionBatch::Reserved(JitBatchPlan {
             root_function_id: root_function.function_id,
-            env_config: inputs.session.env_config()?,
+            env_config: inputs.session.env_config()?.clone(),
             batch_functions,
             function_indices_to_define,
             function_compile_inputs,
@@ -1179,9 +1537,9 @@ impl ProcessJitState {
         }))
     }
 
-    fn compile_reserved_direct_function_batch_worker<'a>(
-        inputs: &DirectFunctionCompileInputs<'a>,
-        plan: &JitBatchPlan<'a>,
+    fn compile_reserved_direct_function_batch_worker<'inputs, 'plan>(
+        inputs: &DirectFunctionCompileInputs<'inputs>,
+        plan: &JitBatchPlan<'plan>,
         batch_function_indices: &[usize],
     ) -> Result<JitBatchWorkerOutput, String> {
         let worker_start = Instant::now();
@@ -1212,10 +1570,10 @@ impl ProcessJitState {
         })
     }
 
-    fn compile_reserved_direct_function_batch_indices<'a>(
+    fn compile_reserved_direct_function_batch_indices<'inputs, 'plan>(
         codegen_env: &mut impl JitCodegenEnv,
-        inputs: &DirectFunctionCompileInputs<'a>,
-        plan: &JitBatchPlan<'a>,
+        inputs: &DirectFunctionCompileInputs<'inputs>,
+        plan: &JitBatchPlan<'plan>,
         batch_function_indices: &[usize],
     ) -> Result<Vec<CompiledJitFunction>, String> {
         let mut compiled_functions = Vec::with_capacity(batch_function_indices.len());
@@ -1231,9 +1589,9 @@ impl ProcessJitState {
         Ok(compiled_functions)
     }
 
-    fn compile_reserved_direct_function_batch_worker_modules<'a>(
-        inputs: &DirectFunctionCompileInputs<'a>,
-        plan: &JitBatchPlan<'a>,
+    fn compile_reserved_direct_function_batch_worker_modules<'inputs, 'plan>(
+        inputs: &DirectFunctionCompileInputs<'inputs>,
+        plan: &JitBatchPlan<'plan>,
     ) -> Result<JitBatchCompileOutput, String> {
         let function_count = plan.function_indices_to_define.len();
         if function_count == 0 {
@@ -1242,7 +1600,7 @@ impl ProcessJitState {
                 worker_metrics: JitBatchWorkerMetrics::default(),
             });
         }
-        let worker_count = jit_batch_worker_count(function_count, plan.env_config);
+        let worker_count = jit_batch_worker_count(function_count, &plan.env_config);
         if worker_count <= 1 {
             let worker_output = Self::compile_reserved_direct_function_batch_worker(
                 inputs,
@@ -1290,10 +1648,10 @@ impl ProcessJitState {
         })
     }
 
-    fn compile_reserved_direct_function_index<'a>(
+    fn compile_reserved_direct_function_index<'inputs, 'plan>(
         codegen_env: &mut impl JitCodegenEnv,
-        inputs: &DirectFunctionCompileInputs<'a>,
-        plan: &JitBatchPlan<'a>,
+        inputs: &DirectFunctionCompileInputs<'inputs>,
+        plan: &JitBatchPlan<'plan>,
         batch_function_index: usize,
     ) -> Result<CompiledJitFunction, String> {
         let batch_function = &plan.batch_functions[batch_function_index];
@@ -1408,7 +1766,7 @@ impl ProcessJitState {
             direct_function_backend_name(function, batch_function.source.shared_state());
         let compiled = compile_prepared_function_bytes(
             codegen_env,
-            plan.env_config,
+            &plan.env_config,
             main_id,
             &mut ctx,
             function_name.as_str(),
@@ -1437,7 +1795,7 @@ impl ProcessJitState {
                 })?;
                 let compiled = compile_prepared_function_bytes(
                     codegen_env,
-                    plan.env_config,
+                    &plan.env_config,
                     default_adapter_id,
                     &mut default_ctx,
                     default_adapter_symbol.as_str(),
@@ -1868,6 +2226,102 @@ impl ProcessJitEngine {
         }
     }
 
+    fn promote_queued_direct_function_compile(
+        &self,
+        function: &BlockPyFunction<CodegenModuleShape>,
+    ) -> Result<bool, String> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "process JIT state lock poisoned".to_string())?;
+        state.promote_queued_direct_function_compile(function)
+    }
+
+    fn direct_function_compile_work(
+        &self,
+        function: &BlockPyFunction<CodegenModuleShape>,
+    ) -> Result<Option<Arc<JitBatchWork>>, String> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "process JIT state lock poisoned".to_string())?;
+        Ok(state.direct_function_compile_work(function))
+    }
+
+    fn direct_function_dependency_waiters(
+        &self,
+        dependency_ids: &[RuntimeFunctionId],
+        locally_claimed_ids: &HashSet<RuntimeFunctionId>,
+    ) -> Result<Vec<Arc<ProcessJitCompileWaiter>>, String> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "process JIT state lock poisoned".to_string())?;
+        Ok(dependency_ids
+            .iter()
+            .filter(|function_id| !locally_claimed_ids.contains(function_id))
+            .filter_map(|function_id| state.direct_function_dependency_waiter(*function_id))
+            .collect())
+    }
+
+    fn remove_globally_ready_functions(
+        &self,
+        function_ids: &mut HashSet<RuntimeFunctionId>,
+    ) -> Result<(), String> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "process JIT state lock poisoned".to_string())?;
+        function_ids.retain(|function_id| !state.is_direct_function_ready(*function_id));
+        Ok(())
+    }
+
+    fn assist_queued_direct_function_compile(
+        &self,
+        function: &BlockPyFunction<CodegenModuleShape>,
+    ) -> Result<bool, String> {
+        let Some(work) = self.direct_function_compile_work(function)? else {
+            return Ok(false);
+        };
+        let Some(context) = work.assist_context() else {
+            return Ok(false);
+        };
+        let requested_indices = context.dependency_closure_indices(function.function_id);
+        let Some(target_index) = context
+            .index_by_function_id
+            .get(&function.function_id)
+            .copied()
+        else {
+            return Ok(false);
+        };
+        let claimed_indices = work.take_function_indices(&requested_indices)?;
+        if !claimed_indices.contains(&target_index) {
+            return Ok(false);
+        }
+        let claimed_ids: HashSet<_> = claimed_indices
+            .iter()
+            .map(|index| context.function_id_for_index(*index))
+            .collect();
+        let dependency_ids = context.dependency_closure_order(function.function_id);
+        for waiter in self.direct_function_dependency_waiters(&dependency_ids, &claimed_ids)? {
+            wait_for_process_jit_compile(&waiter)?;
+        }
+        let compiled_functions = match context.compile_indices(&claimed_indices) {
+            Ok(compiled_functions) => compiled_functions,
+            Err(err) => {
+                self.fail_reserved_direct_function_batch(context.plan.as_ref(), &err);
+                return Err(err);
+            }
+        };
+        match self.commit_compiled_direct_function_group(&context.session, compiled_functions) {
+            Ok(()) => Ok(true),
+            Err(err) => {
+                self.fail_reserved_direct_function_batch(context.plan.as_ref(), &err);
+                Err(err)
+            }
+        }
+    }
+
     fn commit_compiled_direct_function_group(
         &self,
         session: &Arc<crate::session::CompileSession>,
@@ -1946,10 +2400,12 @@ impl ProcessJitEngine {
             .collect()
     }
 
-    fn compile_reserved_direct_function_batch_streaming_commit<'a>(
+    fn compile_reserved_direct_function_batch_streaming_commit<'inputs>(
         &self,
-        inputs: &DirectFunctionCompileInputs<'a>,
-        plan: &JitBatchPlan<'a>,
+        inputs: &DirectFunctionCompileInputs<'inputs>,
+        plan: Arc<JitBatchPlan<'static>>,
+        dependencies: HashMap<RuntimeFunctionId, HashSet<RuntimeFunctionId>>,
+        assist_context: Option<Arc<JitBatchAssistContext>>,
     ) -> Result<JitBatchStreamingCommitOutput, String> {
         let function_count = plan.function_indices_to_define.len();
         if function_count == 0 {
@@ -1959,17 +2415,21 @@ impl ProcessJitEngine {
                 worker_metrics: JitBatchWorkerMetrics::default(),
             });
         }
-        let worker_count = jit_batch_worker_count(function_count, plan.env_config);
-        let dependencies = Self::streaming_batch_direct_dependencies(plan)?;
+        let worker_count = jit_batch_worker_count(function_count, &plan.env_config);
         let mut remaining_function_ids: HashSet<_> = plan
             .function_indices_to_define
             .iter()
             .map(|index| plan.batch_functions[*index].function.function_id)
             .collect();
         let mut pending_functions = HashMap::new();
-        let work_queue = Arc::new(Mutex::new(VecDeque::from(
-            plan.function_indices_to_define.clone(),
-        )));
+        let work = Arc::new(JitBatchWork::new(plan.as_ref(), assist_context));
+        {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| "process JIT state lock poisoned".to_string())?;
+            state.attach_direct_function_work(plan.as_ref(), &work);
+        }
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel::<JitBatchWorkerMessage>();
 
@@ -1977,8 +2437,9 @@ impl ProcessJitEngine {
             let mut handles = Vec::with_capacity(worker_count);
             for _ in 0..worker_count {
                 let tx = tx.clone();
-                let work_queue = Arc::clone(&work_queue);
+                let work = Arc::clone(&work);
                 let stop = Arc::clone(&stop);
+                let plan = Arc::clone(&plan);
                 handles.push(scope.spawn(move || {
                     let _guard = ProcessJitCompileGuard::enter();
                     let worker_start = Instant::now();
@@ -1995,8 +2456,8 @@ impl ProcessJitEngine {
                         if stop.load(Ordering::Acquire) {
                             break;
                         }
-                        let batch_function_index = match work_queue.lock() {
-                            Ok(mut work_queue) => work_queue.pop_front(),
+                        let batch_function_index = match work.pop_front() {
+                            Ok(batch_function_index) => batch_function_index,
                             Err(_) => {
                                 stop.store(true, Ordering::Release);
                                 let _ = tx.send(JitBatchWorkerMessage::Compiled(Err(
@@ -2011,7 +2472,7 @@ impl ProcessJitEngine {
                         match ProcessJitState::compile_reserved_direct_function_index(
                             &mut codegen_env,
                             inputs,
-                            plan,
+                            plan.as_ref(),
                             batch_function_index,
                         ) {
                             Ok(compiled) => {
@@ -2051,6 +2512,13 @@ impl ProcessJitEngine {
                             continue;
                         }
                         pending_functions.insert(compiled.function_id, compiled);
+                        if let Err(err) =
+                            self.remove_globally_ready_functions(&mut remaining_function_ids)
+                        {
+                            stop.store(true, Ordering::Release);
+                            first_error = Some(err);
+                            continue;
+                        }
                         let ready_functions = Self::take_streaming_commit_ready_functions(
                             &mut pending_functions,
                             &remaining_function_ids,
@@ -2097,6 +2565,37 @@ impl ProcessJitEngine {
                     stop.store(true, Ordering::Release);
                     if first_error.is_none() {
                         first_error = Some("process JIT batch codegen worker panicked".to_string());
+                    }
+                }
+            }
+            if first_error.is_none()
+                && let Err(err) = self.remove_globally_ready_functions(&mut remaining_function_ids)
+            {
+                first_error = Some(err);
+            }
+            if first_error.is_none() && !pending_functions.is_empty() {
+                let ready_functions = Self::take_streaming_commit_ready_functions(
+                    &mut pending_functions,
+                    &remaining_function_ids,
+                    &dependencies,
+                );
+                if !ready_functions.is_empty() {
+                    let ready_function_ids: Vec<_> = ready_functions
+                        .iter()
+                        .map(|function| function.function_id)
+                        .collect();
+                    let commit_start = Instant::now();
+                    match self
+                        .commit_compiled_direct_function_group(inputs.session, ready_functions)
+                    {
+                        Ok(()) => {
+                            commit_elapsed += commit_start.elapsed();
+                            committed_function_count += ready_function_ids.len();
+                        }
+                        Err(err) => {
+                            commit_elapsed += commit_start.elapsed();
+                            first_error = Some(err);
+                        }
                     }
                 }
             }
@@ -2397,8 +2896,80 @@ impl ProcessJitEngine {
         }
         let batch_function_count = plan.batch_functions.len();
         let functions_to_define_count = plan.function_indices_to_define.len();
+        let dependencies = match Self::streaming_batch_direct_dependencies(&plan) {
+            Ok(dependencies) => dependencies,
+            Err(err) => {
+                emit_jit_batch_codegen_log(
+                    function,
+                    direct_call_resolver,
+                    "error",
+                    "dependency-analysis",
+                    Some(&err),
+                    batch_function_count,
+                    functions_to_define_count,
+                    Duration::ZERO,
+                    reservation_elapsed,
+                    Duration::ZERO,
+                    Duration::ZERO,
+                    total_start.elapsed(),
+                    JitBatchWorkerMetrics::default(),
+                );
+                self.fail_reserved_direct_function_batch(&plan, &err);
+                return Err(err);
+            }
+        };
+        let assist_shared_state = plan.batch_functions.iter().find_map(|batch_function| {
+            if let ProcessJitBatchFunctionSource::OwnedSharedState(shared_state) =
+                &batch_function.source
+            {
+                Some(Arc::clone(shared_state))
+            } else {
+                None
+            }
+        });
+        let compile_waiters_for_static_plan: Vec<_> =
+            plan.compile_waiters.values().map(Arc::clone).collect();
+        let plan = match plan.into_static_owned() {
+            Ok(plan) => Arc::new(plan),
+            Err(err) => {
+                emit_jit_batch_codegen_log(
+                    function,
+                    direct_call_resolver,
+                    "error",
+                    "foreground-assist",
+                    Some(&err),
+                    batch_function_count,
+                    functions_to_define_count,
+                    Duration::ZERO,
+                    reservation_elapsed,
+                    Duration::ZERO,
+                    Duration::ZERO,
+                    total_start.elapsed(),
+                    JitBatchWorkerMetrics::default(),
+                );
+                for waiter in compile_waiters_for_static_plan {
+                    waiter.finish(Err(err.clone()));
+                }
+                return Err(err);
+            }
+        };
+        let assist_context = assist_shared_state.map(|shared_state| {
+            Arc::new(JitBatchAssistContext::new(
+                Arc::clone(session),
+                Arc::clone(&plan),
+                shared_state,
+                blocks.to_vec(),
+                module_constant_ptrs.to_vec(),
+                dependencies.clone(),
+            ))
+        });
         let codegen_start = Instant::now();
-        match self.compile_reserved_direct_function_batch_streaming_commit(&inputs, &plan) {
+        match self.compile_reserved_direct_function_batch_streaming_commit(
+            &inputs,
+            Arc::clone(&plan),
+            dependencies,
+            assist_context,
+        ) {
             Ok(output) => {
                 let codegen_elapsed = codegen_start.elapsed();
                 emit_jit_batch_codegen_log(
@@ -2435,7 +3006,7 @@ impl ProcessJitEngine {
                     total_start.elapsed(),
                     JitBatchWorkerMetrics::default(),
                 );
-                self.fail_reserved_direct_function_batch(&plan, &err);
+                self.fail_reserved_direct_function_batch(plan.as_ref(), &err);
                 Err(err)
             }
         }
@@ -2472,7 +3043,19 @@ impl ProcessJitEngine {
             ) {
                 Ok(DirectFunctionCompileAttempt::Done(result)) => return Ok(result),
                 Ok(DirectFunctionCompileAttempt::Wait(waiter)) => {
-                    let wait_result = wait_for_process_jit_compile(&waiter);
+                    let wait_result = loop {
+                        if !self.assist_queued_direct_function_compile(function)? {
+                            self.promote_queued_direct_function_compile(function)?;
+                        }
+                        match wait_for_process_jit_compile_timeout(
+                            &waiter,
+                            Duration::from_millis(10),
+                        ) {
+                            Ok(Some(result)) => break result,
+                            Ok(None) => {}
+                            Err(err) => break Err(err),
+                        }
+                    };
                     if let Some(handle) = self.lookup_ready_direct_function(function)? {
                         return Ok(DirectFunctionCompileResult {
                             handle,
