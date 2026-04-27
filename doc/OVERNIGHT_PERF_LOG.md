@@ -1,5 +1,35 @@
 # Overnight Performance Log
 
+## 2026-04-27 - Typed constructor-entry direct-call placement
+
+- baseline: `work/bench/uxwoxrqpzwzw_acb20ab139b0`
+  - specialized apply median: `588058 loops/s`
+  - specialized apply mean: `586858 loops/s`
+  - verify pass: `335249 loops/s`
+  - no-refcount diagnostic median: `762813 loops/s`
+  - latest summarized pystone code size: `66689 bytes`, `3918` machine blocks
+- observation: the typed constructor-entry special case lived behind the
+  generic simple-call typed-input gate, but that gate rejects runtime helpers.
+  Constructor entries call the `constructor_call` runtime helper, so this looked
+  like it could prevent the existing direct allocation/init emitter from firing.
+- attempted change: check typed constructor-entry calls before the generic
+  simple-call typed-input gate rejects runtime helpers.
+- rejected result: `work/bench/tmqzswtxxznx_6ddff84394d0`
+  - specialized apply median: `569772 loops/s` (`-3.11%`)
+  - specialized apply mean: `572530 loops/s` (`-2.44%`)
+  - verify pass: `325309 loops/s` (`-2.96%`)
+  - no-refcount diagnostic median: `762170 loops/s` (`-0.08%`)
+  - latest summarized pystone code size: `66689 bytes`, `3918` machine blocks
+  - code-size delta: `+0 bytes`, `+0` machine blocks
+- reason rejected: the benchmark regressed and the summarized generated code
+  size did not change, so moving this check did not expose a useful pystone
+  constructor-entry path.
+- validation before rejection: `just fmt-rust soac_jit` passed; `cargo test -p
+  soac_jit constructor -- --nocapture` passed; `cargo check -p soac_jit
+  --tests` passed; `just benchmark` produced the rejected result above. The
+  implementation was then reverted.
+- next baseline: `work/bench/uxwoxrqpzwzw_acb20ab139b0`
+
 ## 2026-04-27 - Exact-int returns for borrowed-ok demand
 
 - baseline: `work/bench/uxwoxrqpzwzw_acb20ab139b0`
