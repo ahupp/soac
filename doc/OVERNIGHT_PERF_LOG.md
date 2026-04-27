@@ -1,5 +1,38 @@
 # Overnight Performance Log
 
+## 2026-04-27 - Inline trusted split insertion-order update
+
+- baseline: `work/bench/uxwoxrqpzwzw_acb20ab139b0`
+  - specialized apply median: `588058 loops/s`
+  - specialized apply mean: `586858 loops/s`
+  - verify pass: `335249 loops/s`
+  - no-refcount diagnostic median: `762813 loops/s`
+  - latest summarized pystone code size: `66689 bytes`, `3918` machine blocks
+- observation: the trusted indexed-field store runtime helper appears as one of
+  the larger non-generated pystone hotspots. In its first-insert path it checked
+  split-values capacity and index bounds, then called
+  `add_split_value_to_insertion_order`, which repeats the same capacity and
+  index checks before writing insertion order.
+- attempted change: write the insertion-order byte and increment split-values
+  size directly in the trusted helper after the existing first-insert checks,
+  avoiding the repeated helper checks.
+- rejected result: `work/bench/rupvlrqyvrzu_f74c61d2d1fd`
+  - specialized apply median: `562696 loops/s` (`-4.31%`)
+  - specialized apply mean: `560306 loops/s` (`-4.52%`)
+  - verify pass: `333839 loops/s` (`-0.42%`)
+  - no-refcount diagnostic median: `763839 loops/s` (`+0.13%`)
+  - latest summarized pystone code size: `66689 bytes`, `3918` machine blocks
+  - code-size delta: `+0 bytes`, `+0` machine blocks
+- reason rejected: the refcount-enabled production apply pass regressed
+  substantially. The no-refcount diagnostic was flat to slightly positive, so
+  the changed helper shape likely interacted poorly with the normal
+  refcount/dealloc path or branch layout.
+- validation before rejection: `cargo fmt --manifest-path
+  crates/soac_jit_runtime/Cargo.toml` passed; `cargo check -p soac_jit --tests`
+  passed; `just benchmark` produced the rejected result above. The
+  implementation was then reverted.
+- next baseline: `work/bench/uxwoxrqpzwzw_acb20ab139b0`
+
 ## 2026-04-27 - Probe StopIteration arg before cached function
 
 - baseline: `work/bench/uxwoxrqpzwzw_acb20ab139b0`
