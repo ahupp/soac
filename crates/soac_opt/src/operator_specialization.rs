@@ -2,6 +2,7 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ExactTypeTag {
     Int = 1,
+    Str = 2,
 }
 
 impl ExactTypeTag {
@@ -12,6 +13,7 @@ impl ExactTypeTag {
     pub const fn from_packed(value: u64) -> Option<Self> {
         match value as u8 {
             1 => Some(Self::Int),
+            2 => Some(Self::Str),
             _ => None,
         }
     }

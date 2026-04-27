@@ -66,9 +66,19 @@ impl AlternativeCatalog {
                     BinOpKind::Eq,
                     RichCompareOp::Eq,
                 ),
+                exact_str_compare(
+                    "binary.eq.exact_str.i32bool",
+                    BinOpKind::Eq,
+                    RichCompareOp::Eq,
+                ),
                 generic_rich_compare("binary.ne.py_richcompare", BinOpKind::Ne, RichCompareOp::Ne),
                 exact_compact_int_compare(
                     "binary.ne.exact_compact_int.i32bool",
+                    BinOpKind::Ne,
+                    RichCompareOp::Ne,
+                ),
+                exact_str_compare(
+                    "binary.ne.exact_str.i32bool",
                     BinOpKind::Ne,
                     RichCompareOp::Ne,
                 ),
@@ -78,9 +88,19 @@ impl AlternativeCatalog {
                     BinOpKind::Lt,
                     RichCompareOp::Lt,
                 ),
+                exact_str_compare(
+                    "binary.lt.exact_str.i32bool",
+                    BinOpKind::Lt,
+                    RichCompareOp::Lt,
+                ),
                 generic_rich_compare("binary.le.py_richcompare", BinOpKind::Le, RichCompareOp::Le),
                 exact_compact_int_compare(
                     "binary.le.exact_compact_int.i32bool",
+                    BinOpKind::Le,
+                    RichCompareOp::Le,
+                ),
+                exact_str_compare(
+                    "binary.le.exact_str.i32bool",
                     BinOpKind::Le,
                     RichCompareOp::Le,
                 ),
@@ -90,9 +110,19 @@ impl AlternativeCatalog {
                     BinOpKind::Gt,
                     RichCompareOp::Gt,
                 ),
+                exact_str_compare(
+                    "binary.gt.exact_str.i32bool",
+                    BinOpKind::Gt,
+                    RichCompareOp::Gt,
+                ),
                 generic_rich_compare("binary.ge.py_richcompare", BinOpKind::Ge, RichCompareOp::Ge),
                 exact_compact_int_compare(
                     "binary.ge.exact_compact_int.i32bool",
+                    BinOpKind::Ge,
+                    RichCompareOp::Ge,
+                ),
+                exact_str_compare(
+                    "binary.ge.exact_str.i32bool",
                     BinOpKind::Ge,
                     RichCompareOp::Ge,
                 ),
@@ -204,6 +234,7 @@ pub enum FactPredicate {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ValueFact {
     ExactCompactPyLong,
+    ExactPyUnicode,
     I64,
     Bool01,
     PythonObject,
@@ -247,6 +278,7 @@ impl GuardRequirement {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum GuardRequirementKind {
     ExactCompactPyLong,
+    ExactPyUnicode,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -586,6 +618,18 @@ fn validate_operation_emission(
                 alternative,
                 &[RepClass::PythonObject, RepClass::PythonObject],
                 Some(Rep::PyObjectOwned),
+                errors,
+            );
+        }
+        PlannedOp::PyObjectRichCompareBool { .. } => {
+            validate_catalog_operation_signature(
+                id,
+                alternative,
+                &[
+                    RepClass::Exact(Rep::PyObjectBorrowed),
+                    RepClass::Exact(Rep::PyObjectBorrowed),
+                ],
+                Some(Rep::I32Bool01),
                 errors,
             );
         }
@@ -1057,6 +1101,33 @@ fn exact_compact_int_compare(
     }
 }
 
+fn exact_str_compare(id: &'static str, binop: BinOpKind, op: RichCompareOp) -> LoweringAlternative {
+    LoweringAlternative {
+        id: AlternativeId::new(id),
+        op: SemanticOpKind::Binary { op: binop },
+        input_reps: vec![pyobject_input(0), pyobject_input(1)],
+        output_rep: Some(Rep::I32Bool01),
+        required_facts: exact_str_inputs(),
+        output_facts: vec![ValueFact::Bool01],
+        emission: AlternativeEmission::Operation(PlannedOp::PyObjectRichCompareBool { op }),
+        guards: exact_str_guards(),
+        failure_replay: FailureReplayPolicy::safe(
+            "exact unicode comparison cannot fail after input guards",
+        ),
+        failure: AlternativeFailure::CannotFail,
+        cost: Cost {
+            hot_path: 8,
+            miss_path: 75,
+            deopt: 0,
+            materialization: 0,
+            ownership: 0,
+            code_size: 4,
+            compile: 1,
+        },
+        rationale: "exact unicode comparison can skip allocating the intermediate Python bool in branch contexts",
+    }
+}
+
 fn python_truthiness() -> LoweringAlternative {
     LoweringAlternative {
         id: AlternativeId::new("truthiness.pyobject"),
@@ -1259,6 +1330,37 @@ fn exact_compact_int_guard(input: u32) -> GuardRequirement {
         ),
         miss: GuardMiss::LocalFallback {
             reason: "exact compact PyLong guard miss uses generic Python fallback",
+        },
+    }
+}
+
+fn exact_str_inputs() -> Vec<FactPredicate> {
+    vec![
+        FactPredicate::Input {
+            input: 0,
+            fact: ValueFact::ExactPyUnicode,
+        },
+        FactPredicate::Input {
+            input: 1,
+            fact: ValueFact::ExactPyUnicode,
+        },
+    ]
+}
+
+fn exact_str_guards() -> Vec<GuardRequirement> {
+    vec![exact_str_guard(0), exact_str_guard(1)]
+}
+
+fn exact_str_guard(input: u32) -> GuardRequirement {
+    GuardRequirement {
+        input,
+        kind: GuardRequirementKind::ExactPyUnicode,
+        description: "exact unicode specialization guard",
+        replay: FailureReplayPolicy::local_fallback(
+            "fallback region reuses original Python object operands",
+        ),
+        miss: GuardMiss::LocalFallback {
+            reason: "exact unicode guard miss uses generic Python fallback",
         },
     }
 }

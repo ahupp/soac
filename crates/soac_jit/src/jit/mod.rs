@@ -22,10 +22,10 @@ use soac_ir_blockpy::{
 };
 use soac_ir_typed::emit_v3::{
     MechanicalCodegenConversion, MechanicalCodegenOperation, MechanicalCodegenStep,
-    MechanicalExitKind, MechanicalRegionEmission,
+    MechanicalExitKind, MechanicalRegionEmission, MechanicalRegionInputSource,
     mechanical_codegen_step as opt_v3_mechanical_codegen_step,
     mechanical_convert_inputs_for_output as opt_v3_mechanical_convert_inputs_for_output,
-    mechanical_region_function_param_inputs as opt_v3_mechanical_region_function_param_inputs,
+    mechanical_region_inputs as opt_v3_mechanical_region_inputs,
 };
 use soac_ir_typed::plan_v3::{
     IndexedFieldAccessKind as PlanV3IndexedFieldAccessKind,
@@ -73,6 +73,7 @@ unsafe extern "C" {
     static mut PyType_Type: ffi::PyTypeObject;
     static mut PyLong_Type: ffi::PyTypeObject;
     static mut PyList_Type: ffi::PyTypeObject;
+    static mut PyUnicode_Type: ffi::PyTypeObject;
     static mut _PyDict_IndexedValueTombstone: i8;
     fn PyThreadState_GetUnchecked() -> *mut ffi::PyThreadState;
 }
@@ -275,15 +276,15 @@ use imports::{
     DP_JIT_RECORD_TOP_VALUE_SAMPLE_IMPORT, DP_JIT_STORE_CELL_IMPORT, ImportSpec, ModuleFuncImports,
     PYLONG_FROM_LONGLONG_IMPORT, PYNUMBER_ADD_IMPORT, PYNUMBER_AND_IMPORT,
     PYNUMBER_MULTIPLY_IMPORT, PYNUMBER_OR_IMPORT, PYNUMBER_SUBTRACT_IMPORT, PYNUMBER_XOR_IMPORT,
-    PYOBJECT_RICHCOMPARE_IMPORT, SOAC_JIT_MAKE_FUNCTION_WITH_CLOSURE_IMPORT,
-    SOAC_RUNTIME_BUILTIN_CHR_I64_IMPORT, SOAC_RUNTIME_BUILTIN_LEN_I64_IMPORT,
-    SOAC_RUNTIME_BUILTIN_ORD_I64_IMPORT, SOAC_RUNTIME_LOAD_GLOBAL_IMPORT,
-    SOAC_RUNTIME_LOAD_GLOBAL_SLOW_IMPORT, SOAC_RUNTIME_PROBE_FIELD_INDEXED_IMPORT,
-    SOAC_RUNTIME_PROBE_GLOBAL_INDEXED_IMPORT, SOAC_RUNTIME_PYLONG_AS_I64_SATURATING_IMPORT,
-    SOAC_RUNTIME_SET_RAISED_EXCEPTION_IMPORT, SOAC_RUNTIME_STORE_FIELD_INDEXED_IMPORT,
-    SOAC_RUNTIME_STORE_GLOBAL_IMPORT, SOAC_RUNTIME_STORE_GLOBAL_INDEXED_IMPORT,
-    SOAC_RUNTIME_TUPLE_NEW_IMPORT, SOAC_RUNTIME_TUPLE_SET_ITEM_STOLEN_IMPORT, SigType,
-    predeclare_specialization_type_imports,
+    PYOBJECT_RICHCOMPARE_IMPORT, PYUNICODE_COMPARE_IMPORT,
+    SOAC_JIT_MAKE_FUNCTION_WITH_CLOSURE_IMPORT, SOAC_RUNTIME_BUILTIN_CHR_I64_IMPORT,
+    SOAC_RUNTIME_BUILTIN_LEN_I64_IMPORT, SOAC_RUNTIME_BUILTIN_ORD_I64_IMPORT,
+    SOAC_RUNTIME_LOAD_GLOBAL_IMPORT, SOAC_RUNTIME_LOAD_GLOBAL_SLOW_IMPORT,
+    SOAC_RUNTIME_PROBE_FIELD_INDEXED_IMPORT, SOAC_RUNTIME_PROBE_GLOBAL_INDEXED_IMPORT,
+    SOAC_RUNTIME_PYLONG_AS_I64_SATURATING_IMPORT, SOAC_RUNTIME_SET_RAISED_EXCEPTION_IMPORT,
+    SOAC_RUNTIME_STORE_FIELD_INDEXED_IMPORT, SOAC_RUNTIME_STORE_GLOBAL_IMPORT,
+    SOAC_RUNTIME_STORE_GLOBAL_INDEXED_IMPORT, SOAC_RUNTIME_TUPLE_NEW_IMPORT,
+    SOAC_RUNTIME_TUPLE_SET_ITEM_STOLEN_IMPORT, SigType, predeclare_specialization_type_imports,
 };
 #[cfg(test)]
 use imports::{SOAC_RUNTIME_DECREF_APPLIED_IMPORT, SOAC_RUNTIME_INCREF_APPLIED_IMPORT};
@@ -679,6 +680,58 @@ fn emit_planned_indexed_global_load(
         local_env,
         ctx,
     )
+}
+
+fn emit_borrowed_planned_indexed_global_load(
+    fb: &mut FunctionBuilder<'_>,
+    globals_obj: ir::Value,
+    name: &str,
+    expected_index: u32,
+    instr_id: InstrId,
+    fallback_block: ir::Block,
+    ctx: &JitEmitCtx<'_>,
+) -> ir::Value {
+    let name_obj = emit_owned_module_constant(
+        fb,
+        ctx.module_constants.require_unicode_constant_id(name),
+        ctx,
+    );
+    let slot_index = fb.ins().iconst(ir::types::I64, i64::from(expected_index));
+    let ptr_ty = ctx.consts.ptr_ty;
+    let null_ptr = fb.ins().iconst(ptr_ty, 0);
+    let result_block = fb.create_block();
+    fb.append_block_param(result_block, ptr_ty);
+    let miss_block = fb.create_block();
+    fb.set_cold_block(miss_block);
+
+    let direct_inst = fb.ins().call(
+        ctx.probe_global_indexed_ref,
+        &[globals_obj, name_obj, slot_index],
+    );
+    let direct_value = fb.inst_results(direct_inst)[0];
+    let direct_is_null = fb
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, direct_value, null_ptr);
+    fb.ins().brif(
+        direct_is_null,
+        miss_block,
+        &[],
+        result_block,
+        &[ir::BlockArg::Value(direct_value)],
+    );
+
+    fb.switch_to_block(miss_block);
+    emit_optional_counter_increment_for_kind(
+        fb,
+        ctx,
+        ctx.global_indexed_fallback_counter_ids,
+        instr_id,
+    );
+    fb.ins().jump(fallback_block, &[]);
+
+    fb.switch_to_block(result_block);
+    emit_optional_counter_increment_for_kind(fb, ctx, ctx.global_indexed_hit_counter_ids, instr_id);
+    fb.block_params(result_block)[0]
 }
 
 fn codegen_expr_helper_name<'a>(
@@ -5621,6 +5674,33 @@ pub(super) fn emit_exact_type_version_match(
     fb.ins().band(type_matches, version_matches)
 }
 
+fn emit_exact_cpython_type_guard(
+    fb: &mut FunctionBuilder<'_>,
+    obj: ir::Value,
+    expected_type_ref: RelocTypeRef,
+    fallback_block: ir::Block,
+    ctx: &JitEmitCtx<'_>,
+    codegen_env: &mut impl JitCodegenEnv,
+) -> Result<(), String> {
+    let ptr_ty = fb.func.dfg.value_type(obj);
+    let expected_type = emit_type_ptr_value_for_ref(fb, codegen_env, ctx, &expected_type_ref)?
+        .ok_or_else(|| format!("missing type symbol for {expected_type_ref:?}"))?;
+    let actual_type = fb.ins().load(
+        ptr_ty,
+        ir::MemFlags::trusted(),
+        obj,
+        offset_of!(ffi::PyObject, ob_type) as i32,
+    );
+    let type_matches = fb
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, actual_type, expected_type);
+    let ok_block = fb.create_block();
+    fb.ins()
+        .brif(type_matches, ok_block, &[], fallback_block, &[]);
+    fb.switch_to_block(ok_block);
+    Ok(())
+}
+
 fn emit_exact_function_id_match_bool01(
     fb: &mut FunctionBuilder<'_>,
     callable: ir::Value,
@@ -7331,8 +7411,6 @@ fn emit_typed_indexed_getattr(
     push_owned_typed_input_cleanup(&mut owned_inputs, value, value_is_borrowed);
     push_owned_typed_input_cleanup(&mut owned_inputs, attr, attr_is_borrowed);
     let ptr_ty = emit_ctx.consts.ptr_ty;
-    let i64_ty = emit_ctx.consts.i64_ty;
-    let null_ptr = fb.ins().iconst(ptr_ty, 0);
     let hit_counter_id = emit_ctx
         .field_indexed_hit_counter_ids
         .get(&instr_id)
@@ -7377,9 +7455,10 @@ fn emit_typed_indexed_getattr(
         } else {
             fb.create_block()
         };
-        let expected_index = fb
-            .ins()
-            .iconst(i64_ty, i64::from(specialization.expected_index));
+        let expected_index = fb.ins().iconst(
+            emit_ctx.consts.i64_ty,
+            i64::from(specialization.expected_index),
+        );
         let type_matches =
             emit_exact_type_version_match(fb, value, owner_type, specialization.type_version);
         fb.ins()
@@ -7391,6 +7470,7 @@ fn emit_typed_indexed_getattr(
             &[value, attr, expected_index],
         );
         let direct_value = fb.inst_results(direct_inst)[0];
+        let null_ptr = fb.ins().iconst(ptr_ty, 0);
         let direct_is_null = fb
             .ins()
             .icmp(ir::condcodes::IntCC::Equal, direct_value, null_ptr);
@@ -12578,7 +12658,6 @@ fn emit_typed_codegen_stmt_result_with_local_env(
             func_imports,
         );
     }
-
     if let InstrTyped::Store(op) = expr {
         if let Some(result) = emit_typed_local_store_result_with_local_env(
             fb,
@@ -12999,6 +13078,7 @@ fn emit_opt_v3_exact_int_branch_selection(
         selection.hot_plan,
         local_env,
         emit_ctx,
+        Some(fallback_block),
         "exact-int branch hot region",
     )?;
     emit_opt_v3_mechanical_region_steps(
@@ -13022,6 +13102,7 @@ fn emit_opt_v3_exact_int_branch_selection(
         selection.fallback_plan,
         local_env,
         emit_ctx,
+        None,
         "exact-int branch fallback region",
     )?;
     emit_opt_v3_mechanical_region_steps(
@@ -13063,6 +13144,7 @@ fn emit_opt_v3_exact_int_return_selection(
         selection.hot_plan,
         local_env,
         emit_ctx,
+        Some(fallback_block),
         "exact-int return hot region",
     )?;
     emit_opt_v3_mechanical_region_steps(
@@ -13086,6 +13168,7 @@ fn emit_opt_v3_exact_int_return_selection(
         selection.fallback_plan,
         local_env,
         emit_ctx,
+        None,
         "exact-int return fallback region",
     )?;
     emit_opt_v3_mechanical_region_steps(
@@ -13115,25 +13198,71 @@ fn opt_v3_region_input_values(
     region: &RegionPlan,
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
+    local_fallback_block: Option<ir::Block>,
     context: &str,
 ) -> Result<HashMap<PlanValue, OptV3MechanicalValue>, String> {
     let mut values = HashMap::new();
-    for input in opt_v3_mechanical_region_function_param_inputs(region, context)? {
-        let value = local_env
-            .load_name(fb, input.name, emit_ctx, true)
-            .ok_or_else(|| {
-                format!(
-                    "optimizer v3 {context} input {:?} references unavailable local {:?}",
-                    input.value, input.name
+    for input in opt_v3_mechanical_region_inputs(region, context)? {
+        let value = match input.source {
+            MechanicalRegionInputSource::FunctionParam { name } => local_env
+                .load_name(fb, name, emit_ctx, true)
+                .ok_or_else(|| {
+                    format!(
+                        "optimizer v3 {context} input {:?} references unavailable local {:?}",
+                        input.value, name
+                    )
+                })?,
+            MechanicalRegionInputSource::ModuleConstant { index } => {
+                emit_owned_module_constant(fb, ModuleConstantId(index as usize), emit_ctx)
+            }
+            MechanicalRegionInputSource::IndexedGlobal {
+                source,
+                module_name: _,
+                name,
+                expected_index,
+            } if input.value.rep == Rep::PyObjectBorrowed => {
+                let fallback_block = local_fallback_block.ok_or_else(|| {
+                    format!(
+                        "optimizer v3 {context} borrowed indexed-global input {:?} needs a local fallback block",
+                        input.value
+                    )
+                })?;
+                emit_borrowed_planned_indexed_global_load(
+                    fb,
+                    emit_ctx.consts.block_const,
+                    name,
+                    expected_index,
+                    source,
+                    fallback_block,
+                    emit_ctx,
                 )
-            })?;
+            }
+            MechanicalRegionInputSource::IndexedGlobal {
+                source,
+                module_name: _,
+                name,
+                expected_index,
+            } if input.value.rep == Rep::PyObjectOwned => emit_planned_indexed_global_load(
+                fb,
+                emit_ctx.consts.block_const,
+                name,
+                expected_index,
+                source,
+                local_env,
+                emit_ctx,
+            ),
+            MechanicalRegionInputSource::IndexedGlobal { .. } => {
+                return Err(format!(
+                    "optimizer v3 {context} indexed-global input {:?} has unsupported rep {:?}",
+                    input.value, input.value.rep
+                ));
+            }
+        };
+        let owned = input.value.rep == Rep::PyObjectOwned;
         opt_v3_store_mechanical_value(
             &mut values,
             input.value,
-            OptV3MechanicalValue::PyObject {
-                value,
-                owned: false,
-            },
+            OptV3MechanicalValue::PyObject { value, owned },
         )?;
     }
     Ok(values)
@@ -13489,6 +13618,48 @@ fn emit_opt_v3_mechanical_operation(
                     owned: true,
                 },
             )
+        }
+        MechanicalCodegenOperation::PyObjectRichCompareBool { op } => {
+            let fallback_block = local_fallback_block.ok_or_else(|| {
+                format!(
+                    "optimizer v3 region {region:?} node {node:?} exact unicode compare needs a local fallback block"
+                )
+            })?;
+            let (lhs, lhs_owned) = opt_v3_pyobject_value(values, inputs[0])?;
+            let (rhs, rhs_owned) = opt_v3_pyobject_value(values, inputs[1])?;
+            if lhs_owned || rhs_owned {
+                return Err(format!(
+                    "optimizer v3 region {region:?} node {node:?} exact unicode compare expected borrowed inputs"
+                ));
+            }
+            emit_exact_cpython_type_guard(
+                fb,
+                lhs,
+                RelocTypeRef::CpythonTypeSymbol(CpythonTypeSymbol::Unicode),
+                fallback_block,
+                emit_ctx,
+                codegen_env,
+            )?;
+            emit_exact_cpython_type_guard(
+                fb,
+                rhs,
+                RelocTypeRef::CpythonTypeSymbol(CpythonTypeSymbol::Unicode),
+                fallback_block,
+                emit_ctx,
+                codegen_env,
+            )?;
+            let compare_ref =
+                func_imports.get(codegen_env, &mut fb.func, &PYUNICODE_COMPARE_IMPORT)?;
+            let call = fb.ins().call(compare_ref, &[lhs, rhs]);
+            let compare_result = fb.inst_results(call)[0];
+            let compare_zero = fb.ins().iconst(emit_ctx.consts.i32_ty, 0);
+            let cond = fb
+                .ins()
+                .icmp(opt_v3_rich_compare_intcc(op), compare_result, compare_zero);
+            let zero = fb.ins().iconst(emit_ctx.consts.i32_ty, 0);
+            let one = fb.ins().iconst(emit_ctx.consts.i32_ty, 1);
+            let result = fb.ins().select(cond, one, zero);
+            opt_v3_store_mechanical_value(values, output, OptV3MechanicalValue::I32Bool01(result))
         }
         MechanicalCodegenOperation::CheckedI64Add
         | MechanicalCodegenOperation::CheckedI64Sub
@@ -14315,6 +14486,7 @@ fn emit_opt_v3_scalar_threaded_store_branch(
         selection.producer.hot_plan,
         local_env,
         stmt_emit_ctx,
+        Some(producer_fallback_block),
         "scalar-thread producer hot region",
     )?;
     emit_opt_v3_mechanical_region_steps_until_value(
@@ -14400,6 +14572,7 @@ fn emit_opt_v3_scalar_threaded_store_branch(
         selection.producer.fallback_plan,
         &mut fallback_env,
         producer_fallback_emit_ctx,
+        None,
         "scalar-thread producer fallback region",
     )?;
     emit_opt_v3_mechanical_region_steps(
@@ -14454,6 +14627,7 @@ fn emit_opt_v3_scalar_threaded_store_branch(
         selection.consumer.fallback_plan,
         &mut fallback_env,
         consumer_fallback_emit_ctx,
+        None,
         "scalar-thread consumer fallback region",
     )?;
     emit_opt_v3_mechanical_region_steps(

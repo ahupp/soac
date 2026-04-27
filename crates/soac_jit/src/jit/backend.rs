@@ -8,7 +8,7 @@ use super::symbols::{
 };
 use super::{
     _PyDict_IndexedValueTombstone, PyFunction_Type, PyList_Type, PyLong_Type, PyMethod_Type,
-    PyType_Type,
+    PyType_Type, PyUnicode_Type,
 };
 use crate::config::CraneliftTargetConfig;
 use crate::function_instantiation::{
@@ -58,6 +58,10 @@ fn register_jit_builder_symbols(builder: &mut JITBuilder) {
     builder.symbol(
         cpython_type_symbol_name(CpythonTypeSymbol::List),
         std::ptr::addr_of_mut!(PyList_Type).cast::<u8>(),
+    );
+    builder.symbol(
+        cpython_type_symbol_name(CpythonTypeSymbol::Unicode),
+        std::ptr::addr_of_mut!(PyUnicode_Type).cast::<u8>(),
     );
     builder.symbol(
         "_PyDict_IndexedValueTombstone",

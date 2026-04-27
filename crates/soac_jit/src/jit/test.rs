@@ -14689,6 +14689,134 @@ def f(x):
     }
 
     #[test]
+    fn specialized_jit_opt_v3_exact_str_branch_uses_unicode_compare() {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "specialized_jit_opt_v3_exact_str_branch_uses_unicode_compare",
+        ) {
+            return;
+        }
+        let blocks = [1usize as ObjPtr, 2usize as ObjPtr, 3usize as ObjPtr];
+        let mut constants = TestConstantPool::default();
+        let mut function = test_function();
+        function.params = ParamSpec {
+            params: vec![
+                Param {
+                    name: "a".into(),
+                    kind: ParamKind::Any,
+                    has_default: false,
+                },
+                Param {
+                    name: "b".into(),
+                    kind: ParamKind::Any,
+                    has_default: false,
+                },
+            ],
+        };
+        let entry_label = function.name_gen.next_block_name();
+        let then_label = function.name_gen.next_block_name();
+        let else_label = function.name_gen.next_block_name();
+        let compare_instr_id = InstrId::new(2);
+        let entry = CodegenBlock {
+            label: entry_label,
+            body: vec![],
+            term: BlockTerm::IfTerm(soac_core::block_py::TermIf {
+                test: with_instr_id(
+                    op_expr(BinOp::new(
+                        BinOpKind::Gt,
+                        with_instr_id(name_expr(test_name("a")), InstrId::new(0)),
+                        with_instr_id(name_expr(test_local_name("b", 1)), InstrId::new(1)),
+                    )),
+                    compare_instr_id,
+                ),
+                then_label,
+                else_label,
+            }),
+            params: vec![],
+            exc_edge: None,
+            extra: Default::default(),
+        };
+        let then_block = CodegenBlock {
+            label: then_label,
+            body: vec![],
+            term: ret_term(constants.int_expr(1)),
+            params: vec![],
+            exc_edge: None,
+            extra: Default::default(),
+        };
+        let else_block = CodegenBlock {
+            label: else_label,
+            body: vec![],
+            term: ret_term(constants.int_expr(0)),
+            params: vec![],
+            exc_edge: None,
+            extra: Default::default(),
+        };
+        function.blocks = vec![entry, then_block, else_block];
+        set_stack_slots(&mut function, &["a", "b"]);
+
+        let mut module = test_module(ModuleNameGen::new(0), vec![function]);
+        module.module_constants = constants.module_constants;
+        let function = module.callable_defs[0].clone();
+        let module_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+        let exact_str_shape = soac_opt::operator_specialization::pack_binary_shape(
+            soac_opt::operator_specialization::ExactTypeTag::Str,
+            soac_opt::operator_specialization::ExactTypeTag::Str,
+        );
+        let mut evidence = FunctionProfileEvidence::default();
+        evidence
+            .operator_specializations
+            .insert(compare_instr_id, vec![exact_str_shape]);
+        let artifacts = plan_and_emit_function_exact_int_branches_v3_with_module_constants(
+            &AlternativeCatalog::default_v3(),
+            ModulePlanIdentity {
+                module_name: "test".to_string(),
+                source_hash: 0,
+                cache_identity: "test-cache".to_string(),
+            },
+            FunctionPlanIdentity {
+                function: SerializedFunctionId::new(
+                    SerializedModuleId::new(0),
+                    function.function_id.local_function_id(),
+                ),
+                debug_name: Some(function.names.qualname.clone()),
+            },
+            &function,
+            &evidence,
+            module.module_constants.as_slice(),
+        )
+        .unwrap();
+        assert_eq!(artifacts.emission.functions[0].regions.len(), 2);
+
+        let built = build_test_jit_function_with_constants_and_options(
+            &module,
+            &function,
+            &blocks,
+            &module_constants,
+            BuildSpecializedFunctionOptions {
+                planned_typed_function: Some(typed_function_with_exact_int_artifacts(
+                    &function, &artifacts,
+                )),
+                ..BuildSpecializedFunctionOptions::default()
+            },
+        );
+
+        let unicode_compare = import_user_names_for_symbols(&built, &["PyUnicode_Compare"]);
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&built.ctx.func, &unicode_compare),
+            1,
+            "v3 exact-str branch should emit the selected direct unicode comparison"
+        );
+        let generic_compare = import_user_names_for_symbols(&built, &["PyObject_RichCompareBool"]);
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&built.ctx.func, &generic_compare),
+            0,
+            "v3 exact-str branch should not call the generic rich-compare-bool helper"
+        );
+    }
+
+    #[test]
     fn planned_precompile_inputs_accept_in_memory_v3_module_artifact() {
         let function = test_function();
         let module = test_module(ModuleNameGen::new(0), vec![function]);

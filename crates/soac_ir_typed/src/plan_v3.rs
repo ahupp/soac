@@ -372,6 +372,15 @@ pub enum RegionInputSource {
         index: u32,
         name: Option<String>,
     },
+    ModuleConstant {
+        index: u32,
+    },
+    IndexedGlobal {
+        source: InstrId,
+        module_name: String,
+        name: String,
+        expected_index: u32,
+    },
     CapturedValue {
         from_region: RegionId,
         value: PlanValueId,
@@ -598,6 +607,7 @@ pub enum PlannedOp {
     PyNumberBitOr,
     PyNumberBitXor,
     PyObjectRichCompare { op: RichCompareOp },
+    PyObjectRichCompareBool { op: RichCompareOp },
     PyObjectIsTrue,
     CheckedI64Add,
     CheckedI64Sub,
@@ -1246,6 +1256,39 @@ fn validate_region_input_source(
                 ));
             }
         }
+        RegionInputSource::ModuleConstant { .. } => {
+            if !input.value.rep.is_python_object() {
+                errors.push(format!(
+                    "region {region:?} module-constant input {:?} has non-PyObject rep {:?}",
+                    input.value.id, input.value.rep
+                ));
+            }
+        }
+        RegionInputSource::IndexedGlobal {
+            source: _,
+            module_name,
+            name,
+            expected_index: _,
+        } => {
+            if module_name.is_empty() {
+                errors.push(format!(
+                    "region {region:?} indexed-global input {:?} has empty module name",
+                    input.value
+                ));
+            }
+            if name.is_empty() {
+                errors.push(format!(
+                    "region {region:?} indexed-global input {:?} has empty name",
+                    input.value
+                ));
+            }
+            if !input.value.rep.is_python_object() {
+                errors.push(format!(
+                    "region {region:?} indexed-global input {:?} has non-PyObject rep {:?}",
+                    input.value.id, input.value.rep
+                ));
+            }
+        }
         RegionInputSource::CapturedValue { from_region, value } => {
             if !region_ids.contains(from_region) {
                 errors.push(format!(
@@ -1800,7 +1843,8 @@ fn validate_operation_failure_semantics(
         PlannedOp::I64BitAnd
         | PlannedOp::I64BitOr
         | PlannedOp::I64BitXor
-        | PlannedOp::I64CompareToBool01 { .. } => {
+        | PlannedOp::I64CompareToBool01 { .. }
+        | PlannedOp::PyObjectRichCompareBool { .. } => {
             if operation.failure != FailureMode::CannotFail {
                 errors.push(format!(
                     "region {region:?} operation {:?} should be CannotFail after selected scalar inputs, got {:?}",
@@ -1885,6 +1929,22 @@ fn validate_operation(region: RegionId, operation: &OperationNode, errors: &mut 
                 operation,
                 Some(Rep::PyObjectOwned),
                 "PyObjectRichCompare",
+                errors,
+            );
+        }
+        PlannedOp::PyObjectRichCompareBool { .. } => {
+            validate_python_operation_inputs(
+                region,
+                operation,
+                2,
+                "PyObjectRichCompareBool",
+                errors,
+            );
+            validate_operation_output(
+                region,
+                operation,
+                Some(Rep::I32Bool01),
+                "PyObjectRichCompareBool",
                 errors,
             );
         }

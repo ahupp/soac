@@ -585,6 +585,9 @@ fn emit_exact_type_tag_for_value<'fb, E>(
     let py_long_type = state
         .emit_type_ptr_value(&RelocTypeRef::CpythonTypeSymbol(CpythonTypeSymbol::Long))
         .expect("PyLong_Type symbol should bind during JIT codegen");
+    let py_unicode_type = state
+        .emit_type_ptr_value(&RelocTypeRef::CpythonTypeSymbol(CpythonTypeSymbol::Unicode))
+        .expect("PyUnicode_Type symbol should bind during JIT codegen");
     let object_type = state.fb().ins().load(
         ptr_ty,
         ir::MemFlags::trusted(),
@@ -599,8 +602,18 @@ fn emit_exact_type_tag_for_value<'fb, E>(
         .fb()
         .ins()
         .iconst(i64_ty, ExactTypeTag::Int.packed() as i64);
+    let is_unicode =
+        state
+            .fb()
+            .ins()
+            .icmp(ir::condcodes::IntCC::Equal, object_type, py_unicode_type);
+    let exact_str_tag = state
+        .fb()
+        .ins()
+        .iconst(i64_ty, ExactTypeTag::Str.packed() as i64);
     let zero = state.fb().ins().iconst(i64_ty, 0);
-    state.fb().ins().select(is_long, exact_int_tag, zero)
+    let non_int_tag = state.fb().ins().select(is_unicode, exact_str_tag, zero);
+    state.fb().ins().select(is_long, exact_int_tag, non_int_tag)
 }
 
 fn emit_binary_operator_shape_from_values<'fb, E>(
@@ -907,6 +920,50 @@ fn emit_unary_op_with_arg_values<'fb, E>(
     }
 }
 
+fn emit_not_with_compact_long_fast_path<'fb, E>(
+    state: &mut impl OperationEmitState<'fb, E>,
+    arg: &E,
+    arg_values: &[(ir::Value, bool)],
+) -> ir::Value {
+    let [(value, borrowed)] = arg_values else {
+        panic!(
+            "unary not operation received unsupported arity {}",
+            arg_values.len()
+        );
+    };
+    let fallback_block = state.fb().create_block();
+    let result_block = state.fb().create_block();
+    let ptr_ty = state.ctx().consts.ptr_ty;
+    state.fb().append_block_param(result_block, ptr_ty);
+
+    let value_i64 = emit_guarded_compact_long_i64(state, *value, fallback_block);
+    let is_false = state
+        .fb()
+        .ins()
+        .icmp_imm(ir::condcodes::IntCC::Equal, value_i64, 0);
+    state.release_arg_values(arg_values);
+    let fast_result = state.emit_owned_bool_from_cond(is_false);
+    state
+        .fb()
+        .ins()
+        .jump(result_block, &[ir::BlockArg::Value(fast_result)]);
+
+    state.fb().switch_to_block(fallback_block);
+    let fallback_result = state.emit_owned_bool_from_pyobject_truthiness(
+        *value,
+        state.py_facts_for_arg(arg),
+        *borrowed,
+        true,
+    );
+    state
+        .fb()
+        .ins()
+        .jump(result_block, &[ir::BlockArg::Value(fallback_result)]);
+
+    state.fb().switch_to_block(result_block);
+    state.fb().block_params(result_block)[0]
+}
+
 fn emit_unary_op_with_arg_and_values<'fb, E>(
     kind: blockpy_intrinsics::UnaryOpKind,
     state: &mut impl OperationEmitState<'fb, E>,
@@ -914,7 +971,10 @@ fn emit_unary_op_with_arg_and_values<'fb, E>(
     arg_values: &[(ir::Value, bool)],
 ) -> ir::Value {
     match kind {
-        blockpy_intrinsics::UnaryOpKind::Not | blockpy_intrinsics::UnaryOpKind::Truth => {
+        blockpy_intrinsics::UnaryOpKind::Not => {
+            emit_not_with_compact_long_fast_path(state, arg, arg_values)
+        }
+        blockpy_intrinsics::UnaryOpKind::Truth => {
             let [(value, borrowed)] = arg_values else {
                 panic!(
                     "unary truth operation received unsupported arity {}",

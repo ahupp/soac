@@ -37,9 +37,13 @@ pub fn planner_facts_from_profile_evidence_v3(
         let Some(shapes) = evidence.operator_specializations.get(&source) else {
             continue;
         };
-        if has_exact_int_binary_shape(shapes) {
+        if has_exact_binary_shape(shapes, ExactTypeTag::Int) {
             facts.mark_exact_compact_int(left);
             facts.mark_exact_compact_int(right);
+        }
+        if has_exact_binary_shape(shapes, ExactTypeTag::Str) {
+            facts.mark_exact_str(left);
+            facts.mark_exact_str(right);
         }
     }
 
@@ -79,10 +83,10 @@ fn module_i64_constant(module_constants: &[ConstantExpr], index: u32) -> Option<
     value.as_i64()
 }
 
-fn has_exact_int_binary_shape(shapes: &[u64]) -> bool {
+fn has_exact_binary_shape(shapes: &[u64], exact_type: ExactTypeTag) -> bool {
     shapes
         .iter()
-        .any(|shape| unpack_binary_shape(*shape) == Some((ExactTypeTag::Int, ExactTypeTag::Int)))
+        .any(|shape| unpack_binary_shape(*shape) == Some((exact_type, exact_type)))
 }
 
 #[cfg(test)]
@@ -103,7 +107,8 @@ mod tests {
         SerializedIdentityTables, SerializedModuleId, SerializedModuleIdentity, TermIf, WithMeta,
     };
     use soac_ir_typed::plan_v3::{
-        FunctionPlanIdentity, ModulePlanIdentity, RegionId, validate_module_plan_v3,
+        FunctionPlanIdentity, ModulePlanIdentity, PlanNodeKind, PlannedOp, RegionId, RichCompareOp,
+        validate_module_plan_v3,
     };
 
     fn label(index: usize) -> BlockLabel {
@@ -194,6 +199,27 @@ mod tests {
         extract_block_region_v3(&block, RegionId(0)).unwrap()
     }
 
+    fn compare_region(op: BinOpKind) -> ExtractedRegion {
+        let test = binary(
+            op,
+            with_instr_id(local("a", 0), 0),
+            with_instr_id(local("b", 1), 1),
+            2,
+        );
+        let block = Block::new(
+            label(0),
+            Vec::new(),
+            BlockTerm::IfTerm(TermIf {
+                test,
+                then_label: label(1),
+                else_label: label(2),
+            }),
+            Vec::<BlockParam>::new(),
+            None,
+        );
+        extract_block_region_v3(&block, RegionId(0)).unwrap()
+    }
+
     fn int_constant(value: i64) -> ConstantExpr {
         ConstantExpr::Literal(LiteralValue::new(Literal::NumberLiteral(NumberLiteral {
             value: NumberLiteralValue::Int(IntLiteral::from_i64(value)),
@@ -263,6 +289,32 @@ mod tests {
         validate_module_plan_v3(&plan).unwrap();
         assert_eq!(plan.functions[0].regions.len(), 2);
         assert!(plan.functions[0].diagnostics.is_empty());
+    }
+
+    #[test]
+    fn exact_str_operator_evidence_enables_compare_bool_plan() {
+        let region = compare_region(BinOpKind::Gt);
+        let evidence =
+            evidence_with_add_shape(pack_binary_shape(ExactTypeTag::Str, ExactTypeTag::Str));
+        let facts = planner_facts_from_profile_evidence_v3(&region, &evidence, &hints());
+        let plan = plan_with(region, facts);
+
+        validate_module_plan_v3(&plan).unwrap();
+        assert_eq!(plan.functions[0].regions.len(), 2);
+        assert!(plan.functions[0].diagnostics.is_empty());
+        assert!(
+            plan.functions[0].regions[0]
+                .nodes
+                .iter()
+                .any(|node| matches!(
+                    &node.kind,
+                    PlanNodeKind::Operation(operation)
+                        if operation.op == (PlannedOp::PyObjectRichCompareBool {
+                            op: RichCompareOp::Gt,
+                        })
+                )),
+            "exact str branch evidence should select PyObject_RichCompareBool"
+        );
     }
 
     #[test]

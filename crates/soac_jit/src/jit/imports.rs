@@ -320,6 +320,16 @@ pub(super) static PYOBJECT_RICHCOMPARE_IMPORT: ImportSpec = ImportSpec::new(
     &[SigType::Pointer, SigType::Pointer, SigType::I32],
     &[SigType::Pointer],
 );
+pub(super) static PYOBJECT_RICHCOMPARE_BOOL_IMPORT: ImportSpec = ImportSpec::new(
+    "PyObject_RichCompareBool",
+    &[SigType::Pointer, SigType::Pointer, SigType::I32],
+    &[SigType::I32],
+);
+pub(super) static PYUNICODE_COMPARE_IMPORT: ImportSpec = ImportSpec::new(
+    "PyUnicode_Compare",
+    &[SigType::Pointer, SigType::Pointer],
+    &[SigType::I32],
+);
 pub(super) static PYLONG_FROM_LONGLONG_IMPORT: ImportSpec =
     ImportSpec::new("PyLong_FromLongLong", &[SigType::I64], &[SigType::Pointer]);
 pub(super) static DP_JIT_RECORD_TOP_VALUE_SAMPLE_IMPORT: ImportSpec = ImportSpec::new(
@@ -454,6 +464,8 @@ static JIT_RUNTIME_IMPORT_SPECS: &[&ImportSpec] = &[
     &PYNUMBER_OR_IMPORT,
     &PYNUMBER_XOR_IMPORT,
     &PYOBJECT_RICHCOMPARE_IMPORT,
+    &PYOBJECT_RICHCOMPARE_BOOL_IMPORT,
+    &PYUNICODE_COMPARE_IMPORT,
     &PYLONG_FROM_LONGLONG_IMPORT,
     &DP_JIT_RECORD_TOP_VALUE_SAMPLE_IMPORT,
     &DP_JIT_RAISE_UNBOUND_LOCAL_ERROR_IMPORT,
@@ -549,6 +561,7 @@ pub(super) fn predeclare_jit_runtime_imports(jit_module: &mut JITModule) -> Resu
         CpythonTypeSymbol::Type,
         CpythonTypeSymbol::Long,
         CpythonTypeSymbol::List,
+        CpythonTypeSymbol::Unicode,
     ] {
         let _ = declare_type_ptr_import(jit_module, cpython_type_symbol_name(symbol))?;
     }

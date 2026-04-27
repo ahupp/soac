@@ -148,6 +148,7 @@ pub struct ExtractedRegionPlanRequest {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PlannerFacts {
     exact_compact_int_values: HashSet<ExtractedValueId>,
+    exact_str_values: HashSet<ExtractedValueId>,
     i64_constants: HashMap<ExtractedValueId, i64>,
 }
 
@@ -156,12 +157,20 @@ impl PlannerFacts {
         self.exact_compact_int_values.insert(value);
     }
 
+    pub fn mark_exact_str(&mut self, value: ExtractedValueId) {
+        self.exact_str_values.insert(value);
+    }
+
     pub fn set_i64_constant(&mut self, value: ExtractedValueId, constant: i64) {
         self.i64_constants.insert(value, constant);
     }
 
     pub fn is_exact_compact_int(&self, value: ExtractedValueId) -> bool {
         self.exact_compact_int_values.contains(&value)
+    }
+
+    pub fn is_exact_str(&self, value: ExtractedValueId) -> bool {
+        self.exact_str_values.contains(&value)
     }
 
     pub fn i64_constant(&self, value: ExtractedValueId) -> Option<i64> {
@@ -195,6 +204,11 @@ pub fn plan_function_optimization_v3(
     let exact_list_items = plan_exact_list_item_specializations_v3(&request.exact_list_items);
     let indexed_fields = plan_indexed_field_specializations_v3(&request.indexed_fields);
     let indexed_globals = plan_indexed_global_specializations_v3(&request.indexed_globals);
+    let indexed_global_loads_by_source = indexed_globals
+        .iter()
+        .filter(|plan| plan.access == IndexedGlobalAccessKind::Load)
+        .map(|plan| (plan.source, plan.clone()))
+        .collect::<HashMap<_, _>>();
     let mut function = FunctionOptimizationPlanV3 {
         function: request.function,
         regions: Vec::new(),
@@ -210,7 +224,12 @@ pub fn plan_function_optimization_v3(
 
     for region_request in &region_requests {
         let region = &region_request.region;
-        match plan_compact_int_branch(catalog, region, &region_request.facts) {
+        match plan_compact_int_branch(
+            catalog,
+            region,
+            &region_request.facts,
+            &indexed_global_loads_by_source,
+        ) {
             Ok(Some(planned_regions)) => function.regions.extend(planned_regions),
             Ok(None) => function.diagnostics.push(PlanDiagnostic {
                 source: region.exit_source(),
@@ -433,20 +452,42 @@ fn plan_compact_int_branch(
     catalog: &AlternativeCatalog,
     region: &ExtractedRegion,
     facts: &PlannerFacts,
+    indexed_global_loads_by_source: &HashMap<InstrId, IndexedGlobalSpecializationPlan>,
 ) -> Result<Option<Vec<RegionPlan>>, String> {
-    if let Some(planned) = plan_compact_int_add_gt_zero_branch(catalog, region, facts)? {
+    if let Some(planned) =
+        plan_compact_int_add_gt_zero_branch(catalog, region, facts, indexed_global_loads_by_source)?
+    {
         return Ok(Some(planned));
     }
-    if let Some(planned) = plan_compact_int_compare_constant_branch(catalog, region, facts)? {
+    if let Some(planned) = plan_compact_int_compare_constant_branch(
+        catalog,
+        region,
+        facts,
+        indexed_global_loads_by_source,
+    )? {
         return Ok(Some(planned));
     }
-    if let Some(planned) = plan_compact_int_compare_branch(catalog, region, facts)? {
+    if let Some(planned) =
+        plan_compact_int_compare_branch(catalog, region, facts, indexed_global_loads_by_source)?
+    {
         return Ok(Some(planned));
     }
-    if let Some(planned) = plan_compact_int_compare_return(catalog, region, facts)? {
+    if let Some(planned) =
+        plan_compact_int_compare_return(catalog, region, facts, indexed_global_loads_by_source)?
+    {
         return Ok(Some(planned));
     }
-    plan_compact_int_binary_return(catalog, region, facts)
+    if let Some(planned) =
+        plan_exact_str_compare_branch(catalog, region, facts, indexed_global_loads_by_source)?
+    {
+        return Ok(Some(planned));
+    }
+    if let Some(planned) =
+        plan_exact_str_compare_return(catalog, region, facts, indexed_global_loads_by_source)?
+    {
+        return Ok(Some(planned));
+    }
+    plan_compact_int_binary_return(catalog, region, facts, indexed_global_loads_by_source)
 }
 
 fn plan_scalar_local_threads_v3(
@@ -454,6 +495,7 @@ fn plan_scalar_local_threads_v3(
     planned_regions: &[RegionPlan],
 ) -> Vec<ScalarLocalThreadPlan> {
     let mut threads = Vec::new();
+    let indexed_global_loads_by_source = HashMap::new();
     for producer_request in region_requests {
         let producer_region = &producer_request.region;
         if producer_region.block_body_len != 1 {
@@ -474,9 +516,11 @@ fn plan_scalar_local_threads_v3(
         {
             continue;
         }
-        let Some(producer_shape) =
-            match_compact_int_binary_return(producer_region, &producer_request.facts)
-        else {
+        let Some(producer_shape) = match_compact_int_binary_return(
+            producer_region,
+            &producer_request.facts,
+            &indexed_global_loads_by_source,
+        ) else {
             continue;
         };
         let Some(producer_value) = planned_i64_output(planned_regions, producer_region.id) else {
@@ -654,8 +698,11 @@ fn plan_compact_int_add_gt_zero_branch(
     catalog: &AlternativeCatalog,
     region: &ExtractedRegion,
     facts: &PlannerFacts,
+    indexed_global_loads_by_source: &HashMap<InstrId, IndexedGlobalSpecializationPlan>,
 ) -> Result<Option<Vec<RegionPlan>>, String> {
-    let Some(shape) = match_compact_int_add_gt_zero_branch(region, facts) else {
+    let Some(shape) =
+        match_compact_int_add_gt_zero_branch(region, facts, indexed_global_loads_by_source)
+    else {
         return Ok(None);
     };
     let add = required_alternative(catalog, "binary.add.exact_compact_int.i64")?;
@@ -675,6 +722,8 @@ fn plan_compact_int_add_gt_zero_branch(
     let sum_i64 = PlanValue::new(4, Rep::I64);
     let zero_i64 = PlanValue::new(5, Rep::I64);
     let condition = PlanValue::new(6, Rep::I32Bool01);
+    let fallback_a_obj = fallback_pyobject_input_value(0, &shape.left);
+    let fallback_b_obj = fallback_pyobject_input_value(1, &shape.right);
 
     let hot_region = RegionPlan {
         id: region.id,
@@ -682,8 +731,8 @@ fn plan_compact_int_add_gt_zero_branch(
             instr_id: shape.source.unwrap_or_else(|| InstrId::new(0)),
         },
         inputs: vec![
-            region_input(a_obj, 0, shape.left_name.clone()),
-            region_input(b_obj, 1, shape.right_name.clone()),
+            region_pyobject_input(a_obj, 0, shape.left.clone()),
+            region_pyobject_input(b_obj, 1, shape.right.clone()),
         ],
         nodes: vec![
             guard_node(add, 0, 0, a_obj, &failure_targets),
@@ -727,14 +776,14 @@ fn plan_compact_int_add_gt_zero_branch(
             reason: "generic fallback for compact-int add/compare branch".to_string(),
         },
         inputs: vec![
-            region_input(a_obj, 0, shape.left_name),
-            region_input(b_obj, 1, shape.right_name),
+            region_pyobject_input(fallback_a_obj, 0, shape.left),
+            region_pyobject_input(fallback_b_obj, 1, shape.right),
         ],
         nodes: vec![
             operation_node(
                 20,
                 generic_add,
-                vec![a_obj, b_obj],
+                vec![fallback_a_obj, fallback_b_obj],
                 Some(fallback_sum),
                 &failure_targets,
             )?,
@@ -791,8 +840,11 @@ fn plan_compact_int_compare_constant_branch(
     catalog: &AlternativeCatalog,
     region: &ExtractedRegion,
     facts: &PlannerFacts,
+    indexed_global_loads_by_source: &HashMap<InstrId, IndexedGlobalSpecializationPlan>,
 ) -> Result<Option<Vec<RegionPlan>>, String> {
-    let Some(shape) = match_compact_int_compare_constant_branch(region, facts) else {
+    let Some(shape) =
+        match_compact_int_compare_constant_branch(region, facts, indexed_global_loads_by_source)
+    else {
         return Ok(None);
     };
     let compare = required_alternative(catalog, shape.compare.exact_id)?;
@@ -807,6 +859,7 @@ fn plan_compact_int_compare_constant_branch(
     let value_i64 = PlanValue::new(1, Rep::I64);
     let constant_i64 = PlanValue::new(2, Rep::I64);
     let condition = PlanValue::new(3, Rep::I32Bool01);
+    let fallback_value_obj = fallback_pyobject_input_value(0, &shape.value);
     let guard_index = if shape.constant_on_left { 1 } else { 0 };
     let hot_operands = if shape.constant_on_left {
         vec![constant_i64, value_i64]
@@ -819,7 +872,7 @@ fn plan_compact_int_compare_constant_branch(
         source: RegionSource::Instr {
             instr_id: shape.source.unwrap_or_else(|| InstrId::new(0)),
         },
-        inputs: vec![region_input(value_obj, 0, shape.value_name.clone())],
+        inputs: vec![region_pyobject_input(value_obj, 0, shape.value.clone())],
         nodes: vec![
             guard_node(compare, guard_index, 0, value_obj, &failure_targets),
             unbox_node(1, value_obj, value_i64, 0, fallback_region_id),
@@ -847,16 +900,16 @@ fn plan_compact_int_compare_constant_branch(
     let fallback_compare = PlanValue::new(22, Rep::PyObjectOwned);
     let fallback_condition = PlanValue::new(23, Rep::I32Bool01);
     let fallback_operands = if shape.constant_on_left {
-        vec![fallback_constant_obj, value_obj]
+        vec![fallback_constant_obj, fallback_value_obj]
     } else {
-        vec![value_obj, fallback_constant_obj]
+        vec![fallback_value_obj, fallback_constant_obj]
     };
     let fallback_region = RegionPlan {
         id: fallback_region_id,
         source: RegionSource::Synthetic {
             reason: "generic fallback for compact-int comparison with constant branch".to_string(),
         },
-        inputs: vec![region_input(value_obj, 0, shape.value_name)],
+        inputs: vec![region_pyobject_input(fallback_value_obj, 0, shape.value)],
         nodes: vec![
             node(
                 20,
@@ -911,8 +964,11 @@ fn plan_compact_int_binary_return(
     catalog: &AlternativeCatalog,
     region: &ExtractedRegion,
     facts: &PlannerFacts,
+    indexed_global_loads_by_source: &HashMap<InstrId, IndexedGlobalSpecializationPlan>,
 ) -> Result<Option<Vec<RegionPlan>>, String> {
-    let Some(shape) = match_compact_int_binary_return(region, facts) else {
+    let Some(shape) =
+        match_compact_int_binary_return(region, facts, indexed_global_loads_by_source)
+    else {
         return Ok(None);
     };
     let operation = required_alternative(catalog, shape.operation.exact_id)?;
@@ -928,6 +984,8 @@ fn plan_compact_int_binary_return(
     let b_i64 = PlanValue::new(3, Rep::I64);
     let result_i64 = PlanValue::new(4, Rep::I64);
     let result_obj = PlanValue::new(5, Rep::PyObjectOwned);
+    let fallback_a_obj = fallback_pyobject_input_value(0, &shape.left);
+    let fallback_b_obj = fallback_pyobject_input_value(1, &shape.right);
 
     let hot_region = RegionPlan {
         id: region.id,
@@ -935,8 +993,8 @@ fn plan_compact_int_binary_return(
             instr_id: shape.source.unwrap_or_else(|| InstrId::new(0)),
         },
         inputs: vec![
-            region_input(a_obj, 0, shape.left_name.clone()),
-            region_input(b_obj, 1, shape.right_name.clone()),
+            region_pyobject_input(a_obj, 0, shape.left.clone()),
+            region_pyobject_input(b_obj, 1, shape.right.clone()),
         ],
         nodes: vec![
             guard_node(operation, 0, 0, a_obj, &failure_targets),
@@ -972,13 +1030,13 @@ fn plan_compact_int_binary_return(
             reason: "generic fallback for compact-int binary return".to_string(),
         },
         inputs: vec![
-            region_input(a_obj, 0, shape.left_name),
-            region_input(b_obj, 1, shape.right_name),
+            region_pyobject_input(fallback_a_obj, 0, shape.left),
+            region_pyobject_input(fallback_b_obj, 1, shape.right),
         ],
         nodes: vec![operation_node(
             20,
             generic_operation,
-            vec![a_obj, b_obj],
+            vec![fallback_a_obj, fallback_b_obj],
             Some(fallback_sum),
             &failure_targets,
         )?],
@@ -997,8 +1055,11 @@ fn plan_compact_int_compare_branch(
     catalog: &AlternativeCatalog,
     region: &ExtractedRegion,
     facts: &PlannerFacts,
+    indexed_global_loads_by_source: &HashMap<InstrId, IndexedGlobalSpecializationPlan>,
 ) -> Result<Option<Vec<RegionPlan>>, String> {
-    let Some(shape) = match_compact_int_compare_branch(region, facts) else {
+    let Some(shape) =
+        match_compact_int_compare_branch(region, facts, indexed_global_loads_by_source)
+    else {
         return Ok(None);
     };
     let compare = required_alternative(catalog, shape.compare.exact_id)?;
@@ -1014,6 +1075,8 @@ fn plan_compact_int_compare_branch(
     let a_i64 = PlanValue::new(2, Rep::I64);
     let b_i64 = PlanValue::new(3, Rep::I64);
     let condition = PlanValue::new(4, Rep::I32Bool01);
+    let fallback_a_obj = fallback_pyobject_input_value(0, &shape.left);
+    let fallback_b_obj = fallback_pyobject_input_value(1, &shape.right);
 
     let hot_region = RegionPlan {
         id: region.id,
@@ -1021,8 +1084,8 @@ fn plan_compact_int_compare_branch(
             instr_id: shape.source.unwrap_or_else(|| InstrId::new(0)),
         },
         inputs: vec![
-            region_input(a_obj, 0, shape.left_name.clone()),
-            region_input(b_obj, 1, shape.right_name.clone()),
+            region_pyobject_input(a_obj, 0, shape.left.clone()),
+            region_pyobject_input(b_obj, 1, shape.right.clone()),
         ],
         nodes: vec![
             guard_node(compare, 0, 0, a_obj, &failure_targets),
@@ -1055,14 +1118,114 @@ fn plan_compact_int_compare_branch(
             reason: "generic fallback for compact-int comparison branch".to_string(),
         },
         inputs: vec![
-            region_input(a_obj, 0, shape.left_name),
-            region_input(b_obj, 1, shape.right_name),
+            region_pyobject_input(fallback_a_obj, 0, shape.left),
+            region_pyobject_input(fallback_b_obj, 1, shape.right),
         ],
         nodes: vec![
             operation_node(
                 20,
                 generic_compare,
+                vec![fallback_a_obj, fallback_b_obj],
+                Some(fallback_compare),
+                &failure_targets,
+            )?,
+            node(
+                21,
+                PlanNodeKind::Convert(ConvertNode {
+                    input: fallback_compare,
+                    output: fallback_condition,
+                    kind: ConversionKind::TruthinessToI32Bool01,
+                    precondition: ConversionPrecondition::Infallible,
+                    failure: truthiness
+                        .instantiate_failure(&failure_targets)
+                        .map_err(|err| err.0)?,
+                    ownership: ConversionOwnership::ConsumeOwned,
+                }),
+            ),
+        ],
+        exits: vec![RegionExitPlan {
+            source: shape.source,
+            kind: RegionExitKind::Branch {
+                condition: fallback_condition,
+                then_target: RegionExitTarget::OriginalCfg,
+                else_target: RegionExitTarget::OriginalCfg,
+            },
+        }],
+    };
+
+    Ok(Some(vec![hot_region, fallback_region]))
+}
+
+fn plan_exact_str_compare_branch(
+    catalog: &AlternativeCatalog,
+    region: &ExtractedRegion,
+    facts: &PlannerFacts,
+    indexed_global_loads_by_source: &HashMap<InstrId, IndexedGlobalSpecializationPlan>,
+) -> Result<Option<Vec<RegionPlan>>, String> {
+    let Some(shape) = match_exact_str_compare_branch(region, facts, indexed_global_loads_by_source)
+    else {
+        return Ok(None);
+    };
+    let compare = required_alternative(catalog, shape.compare.exact_str_id)?;
+    let generic_compare = required_alternative(catalog, shape.compare.generic_id)?;
+    let truthiness = required_alternative(catalog, "truthiness.pyobject")?;
+
+    let fallback_region_id = RegionId(region.id.0 + 1);
+    let failure_targets =
+        FailureTargets::local_fallback(FallbackTarget::Region(fallback_region_id));
+
+    let a_obj = PlanValue::new(0, Rep::PyObjectBorrowed);
+    let b_obj = PlanValue::new(1, Rep::PyObjectBorrowed);
+    let condition = PlanValue::new(2, Rep::I32Bool01);
+    let fallback_a_obj = fallback_pyobject_input_value(0, &shape.left);
+    let fallback_b_obj = fallback_pyobject_input_value(1, &shape.right);
+
+    let hot_region = RegionPlan {
+        id: region.id,
+        source: RegionSource::Instr {
+            instr_id: shape.source.unwrap_or_else(|| InstrId::new(0)),
+        },
+        inputs: vec![
+            region_pyobject_input(a_obj, 0, shape.left.clone()),
+            region_pyobject_input(b_obj, 1, shape.right.clone()),
+        ],
+        nodes: vec![
+            guard_node(compare, 0, 0, a_obj, &failure_targets),
+            guard_node(compare, 1, 1, b_obj, &failure_targets),
+            operation_node(
+                2,
+                compare,
                 vec![a_obj, b_obj],
+                Some(condition),
+                &failure_targets,
+            )?,
+        ],
+        exits: vec![RegionExitPlan {
+            source: shape.source,
+            kind: RegionExitKind::Branch {
+                condition,
+                then_target: RegionExitTarget::OriginalCfg,
+                else_target: RegionExitTarget::OriginalCfg,
+            },
+        }],
+    };
+
+    let fallback_compare = PlanValue::new(20, Rep::PyObjectOwned);
+    let fallback_condition = PlanValue::new(21, Rep::I32Bool01);
+    let fallback_region = RegionPlan {
+        id: fallback_region_id,
+        source: RegionSource::Synthetic {
+            reason: "generic fallback for exact-str comparison branch".to_string(),
+        },
+        inputs: vec![
+            region_pyobject_input(fallback_a_obj, 0, shape.left),
+            region_pyobject_input(fallback_b_obj, 1, shape.right),
+        ],
+        nodes: vec![
+            operation_node(
+                20,
+                generic_compare,
+                vec![fallback_a_obj, fallback_b_obj],
                 Some(fallback_compare),
                 &failure_targets,
             )?,
@@ -1097,8 +1260,11 @@ fn plan_compact_int_compare_return(
     catalog: &AlternativeCatalog,
     region: &ExtractedRegion,
     facts: &PlannerFacts,
+    indexed_global_loads_by_source: &HashMap<InstrId, IndexedGlobalSpecializationPlan>,
 ) -> Result<Option<Vec<RegionPlan>>, String> {
-    let Some(shape) = match_compact_int_compare_return(region, facts) else {
+    let Some(shape) =
+        match_compact_int_compare_return(region, facts, indexed_global_loads_by_source)
+    else {
         return Ok(None);
     };
     let compare = required_alternative(catalog, shape.compare.exact_id)?;
@@ -1114,6 +1280,8 @@ fn plan_compact_int_compare_return(
     let b_i64 = PlanValue::new(3, Rep::I64);
     let condition = PlanValue::new(4, Rep::I32Bool01);
     let result_obj = PlanValue::new(5, Rep::PyObjectImmortal);
+    let fallback_a_obj = fallback_pyobject_input_value(0, &shape.left);
+    let fallback_b_obj = fallback_pyobject_input_value(1, &shape.right);
 
     let hot_region = RegionPlan {
         id: region.id,
@@ -1121,8 +1289,8 @@ fn plan_compact_int_compare_return(
             instr_id: shape.source.unwrap_or_else(|| InstrId::new(0)),
         },
         inputs: vec![
-            region_input(a_obj, 0, shape.left_name.clone()),
-            region_input(b_obj, 1, shape.right_name.clone()),
+            region_pyobject_input(a_obj, 0, shape.left.clone()),
+            region_pyobject_input(b_obj, 1, shape.right.clone()),
         ],
         nodes: vec![
             guard_node(compare, 0, 0, a_obj, &failure_targets),
@@ -1158,13 +1326,99 @@ fn plan_compact_int_compare_return(
             reason: "generic fallback for compact-int comparison return".to_string(),
         },
         inputs: vec![
-            region_input(a_obj, 0, shape.left_name),
-            region_input(b_obj, 1, shape.right_name),
+            region_pyobject_input(fallback_a_obj, 0, shape.left),
+            region_pyobject_input(fallback_b_obj, 1, shape.right),
         ],
         nodes: vec![operation_node(
             20,
             generic_compare,
-            vec![a_obj, b_obj],
+            vec![fallback_a_obj, fallback_b_obj],
+            Some(fallback_compare),
+            &failure_targets,
+        )?],
+        exits: vec![RegionExitPlan {
+            source: shape.source,
+            kind: RegionExitKind::Return {
+                value: fallback_compare,
+            },
+        }],
+    };
+
+    Ok(Some(vec![hot_region, fallback_region]))
+}
+
+fn plan_exact_str_compare_return(
+    catalog: &AlternativeCatalog,
+    region: &ExtractedRegion,
+    facts: &PlannerFacts,
+    indexed_global_loads_by_source: &HashMap<InstrId, IndexedGlobalSpecializationPlan>,
+) -> Result<Option<Vec<RegionPlan>>, String> {
+    let Some(shape) = match_exact_str_compare_return(region, facts, indexed_global_loads_by_source)
+    else {
+        return Ok(None);
+    };
+    let compare = required_alternative(catalog, shape.compare.exact_str_id)?;
+    let generic_compare = required_alternative(catalog, shape.compare.generic_id)?;
+
+    let fallback_region_id = RegionId(region.id.0 + 1);
+    let failure_targets =
+        FailureTargets::local_fallback(FallbackTarget::Region(fallback_region_id));
+
+    let a_obj = PlanValue::new(0, Rep::PyObjectBorrowed);
+    let b_obj = PlanValue::new(1, Rep::PyObjectBorrowed);
+    let condition = PlanValue::new(2, Rep::I32Bool01);
+    let result_obj = PlanValue::new(3, Rep::PyObjectImmortal);
+    let fallback_a_obj = fallback_pyobject_input_value(0, &shape.left);
+    let fallback_b_obj = fallback_pyobject_input_value(1, &shape.right);
+
+    let hot_region = RegionPlan {
+        id: region.id,
+        source: RegionSource::Instr {
+            instr_id: shape.source.unwrap_or_else(|| InstrId::new(0)),
+        },
+        inputs: vec![
+            region_pyobject_input(a_obj, 0, shape.left.clone()),
+            region_pyobject_input(b_obj, 1, shape.right.clone()),
+        ],
+        nodes: vec![
+            guard_node(compare, 0, 0, a_obj, &failure_targets),
+            guard_node(compare, 1, 1, b_obj, &failure_targets),
+            operation_node(
+                2,
+                compare,
+                vec![a_obj, b_obj],
+                Some(condition),
+                &failure_targets,
+            )?,
+            node(
+                3,
+                PlanNodeKind::Materialize(MaterializeNode {
+                    input: condition,
+                    output: result_obj,
+                    kind: MaterializeKind::PythonBool,
+                }),
+            ),
+        ],
+        exits: vec![RegionExitPlan {
+            source: shape.source,
+            kind: RegionExitKind::Return { value: result_obj },
+        }],
+    };
+
+    let fallback_compare = PlanValue::new(20, Rep::PyObjectOwned);
+    let fallback_region = RegionPlan {
+        id: fallback_region_id,
+        source: RegionSource::Synthetic {
+            reason: "generic fallback for exact-str comparison return".to_string(),
+        },
+        inputs: vec![
+            region_pyobject_input(fallback_a_obj, 0, shape.left),
+            region_pyobject_input(fallback_b_obj, 1, shape.right),
+        ],
+        nodes: vec![operation_node(
+            20,
+            generic_compare,
+            vec![fallback_a_obj, fallback_b_obj],
             Some(fallback_compare),
             &failure_targets,
         )?],
@@ -1191,22 +1445,30 @@ fn required_alternative<'a>(
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CompactIntBranchShape {
     source: Option<InstrId>,
-    left_name: String,
-    right_name: String,
+    left: PyObjectRegionInputSource,
+    right: PyObjectRegionInputSource,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CompactIntCompareBranchShape {
     source: Option<InstrId>,
-    left_name: String,
-    right_name: String,
+    left: PyObjectRegionInputSource,
+    right: PyObjectRegionInputSource,
+    compare: CompareAlternativeSpec,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExactStrCompareBranchShape {
+    source: Option<InstrId>,
+    left: PyObjectRegionInputSource,
+    right: PyObjectRegionInputSource,
     compare: CompareAlternativeSpec,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CompactIntCompareConstantBranchShape {
     source: Option<InstrId>,
-    value_name: String,
+    value: PyObjectRegionInputSource,
     constant: i64,
     constant_on_left: bool,
     compare: CompareAlternativeSpec,
@@ -1215,23 +1477,44 @@ struct CompactIntCompareConstantBranchShape {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CompactIntReturnShape {
     source: Option<InstrId>,
-    left_name: String,
-    right_name: String,
+    left: PyObjectRegionInputSource,
+    right: PyObjectRegionInputSource,
     operation: BinaryReturnAlternativeSpec,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CompactIntCompareReturnShape {
     source: Option<InstrId>,
-    left_name: String,
-    right_name: String,
+    left: PyObjectRegionInputSource,
+    right: PyObjectRegionInputSource,
     compare: CompareAlternativeSpec,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExactStrCompareReturnShape {
+    source: Option<InstrId>,
+    left: PyObjectRegionInputSource,
+    right: PyObjectRegionInputSource,
+    compare: CompareAlternativeSpec,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PyObjectRegionInputSource {
+    LocalName(String),
+    ModuleConstant(u32),
+    IndexedGlobal {
+        source: InstrId,
+        module_name: String,
+        name: String,
+        expected_index: u32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CompareAlternativeSpec {
     generic_id: &'static str,
     exact_id: &'static str,
+    exact_str_id: &'static str,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1243,6 +1526,7 @@ struct BinaryReturnAlternativeSpec {
 fn match_compact_int_add_gt_zero_branch(
     region: &ExtractedRegion,
     facts: &PlannerFacts,
+    indexed_global_loads_by_source: &HashMap<InstrId, IndexedGlobalSpecializationPlan>,
 ) -> Option<CompactIntBranchShape> {
     let ExtractedExit::Branch {
         condition, source, ..
@@ -1283,14 +1567,15 @@ fn match_compact_int_add_gt_zero_branch(
     }
     Some(CompactIntBranchShape {
         source,
-        left_name: region.loadable_name(left)?,
-        right_name: region.loadable_name(right)?,
+        left: region.pyobject_input_source(left, indexed_global_loads_by_source)?,
+        right: region.pyobject_input_source(right, indexed_global_loads_by_source)?,
     })
 }
 
 fn match_compact_int_binary_return(
     region: &ExtractedRegion,
     facts: &PlannerFacts,
+    indexed_global_loads_by_source: &HashMap<InstrId, IndexedGlobalSpecializationPlan>,
 ) -> Option<CompactIntReturnShape> {
     let ExtractedExit::Return { value, source } = region.exit else {
         return None;
@@ -1305,8 +1590,8 @@ fn match_compact_int_binary_return(
     }
     Some(CompactIntReturnShape {
         source,
-        left_name: region.loadable_name(left)?,
-        right_name: region.loadable_name(right)?,
+        left: region.pyobject_input_source(left, indexed_global_loads_by_source)?,
+        right: region.pyobject_input_source(right, indexed_global_loads_by_source)?,
         operation,
     })
 }
@@ -1314,6 +1599,7 @@ fn match_compact_int_binary_return(
 fn match_compact_int_compare_constant_branch(
     region: &ExtractedRegion,
     facts: &PlannerFacts,
+    indexed_global_loads_by_source: &HashMap<InstrId, IndexedGlobalSpecializationPlan>,
 ) -> Option<CompactIntCompareConstantBranchShape> {
     let ExtractedExit::Branch {
         condition, source, ..
@@ -1337,7 +1623,7 @@ fn match_compact_int_compare_constant_branch(
         if let Some(constant) = facts.i64_constant(right) {
             return Some(CompactIntCompareConstantBranchShape {
                 source,
-                value_name: region.loadable_name(left)?,
+                value: region.pyobject_input_source(left, indexed_global_loads_by_source)?,
                 constant,
                 constant_on_left: false,
                 compare,
@@ -1348,7 +1634,7 @@ fn match_compact_int_compare_constant_branch(
         if let Some(constant) = facts.i64_constant(left) {
             return Some(CompactIntCompareConstantBranchShape {
                 source,
-                value_name: region.loadable_name(right)?,
+                value: region.pyobject_input_source(right, indexed_global_loads_by_source)?,
                 constant,
                 constant_on_left: true,
                 compare,
@@ -1361,6 +1647,7 @@ fn match_compact_int_compare_constant_branch(
 fn match_compact_int_compare_branch(
     region: &ExtractedRegion,
     facts: &PlannerFacts,
+    indexed_global_loads_by_source: &HashMap<InstrId, IndexedGlobalSpecializationPlan>,
 ) -> Option<CompactIntCompareBranchShape> {
     let ExtractedExit::Branch {
         condition, source, ..
@@ -1385,8 +1672,42 @@ fn match_compact_int_compare_branch(
     }
     Some(CompactIntCompareBranchShape {
         source,
-        left_name: region.loadable_name(left)?,
-        right_name: region.loadable_name(right)?,
+        left: region.pyobject_input_source(left, indexed_global_loads_by_source)?,
+        right: region.pyobject_input_source(right, indexed_global_loads_by_source)?,
+        compare,
+    })
+}
+
+fn match_exact_str_compare_branch(
+    region: &ExtractedRegion,
+    facts: &PlannerFacts,
+    indexed_global_loads_by_source: &HashMap<InstrId, IndexedGlobalSpecializationPlan>,
+) -> Option<ExactStrCompareBranchShape> {
+    let ExtractedExit::Branch {
+        condition, source, ..
+    } = region.exit
+    else {
+        return None;
+    };
+    let truth = region.value(condition)?;
+    let ExtractedValueKind::Truthiness {
+        value: compare_value,
+    } = truth.kind
+    else {
+        return None;
+    };
+    let compare = region.value(compare_value)?;
+    let ExtractedValueKind::Binary { op, left, right } = compare.kind else {
+        return None;
+    };
+    let compare = compare_alternative_spec(op)?;
+    if !facts.is_exact_str(left) || !facts.is_exact_str(right) {
+        return None;
+    }
+    Some(ExactStrCompareBranchShape {
+        source,
+        left: region.pyobject_input_source(left, indexed_global_loads_by_source)?,
+        right: region.pyobject_input_source(right, indexed_global_loads_by_source)?,
         compare,
     })
 }
@@ -1394,6 +1715,7 @@ fn match_compact_int_compare_branch(
 fn match_compact_int_compare_return(
     region: &ExtractedRegion,
     facts: &PlannerFacts,
+    indexed_global_loads_by_source: &HashMap<InstrId, IndexedGlobalSpecializationPlan>,
 ) -> Option<CompactIntCompareReturnShape> {
     let ExtractedExit::Return { value, source } = region.exit else {
         return None;
@@ -1408,8 +1730,32 @@ fn match_compact_int_compare_return(
     }
     Some(CompactIntCompareReturnShape {
         source,
-        left_name: region.loadable_name(left)?,
-        right_name: region.loadable_name(right)?,
+        left: region.pyobject_input_source(left, indexed_global_loads_by_source)?,
+        right: region.pyobject_input_source(right, indexed_global_loads_by_source)?,
+        compare,
+    })
+}
+
+fn match_exact_str_compare_return(
+    region: &ExtractedRegion,
+    facts: &PlannerFacts,
+    indexed_global_loads_by_source: &HashMap<InstrId, IndexedGlobalSpecializationPlan>,
+) -> Option<ExactStrCompareReturnShape> {
+    let ExtractedExit::Return { value, source } = region.exit else {
+        return None;
+    };
+    let compare = region.value(value)?;
+    let ExtractedValueKind::Binary { op, left, right } = compare.kind else {
+        return None;
+    };
+    let compare = compare_alternative_spec(op)?;
+    if !facts.is_exact_str(left) || !facts.is_exact_str(right) {
+        return None;
+    }
+    Some(ExactStrCompareReturnShape {
+        source,
+        left: region.pyobject_input_source(left, indexed_global_loads_by_source)?,
+        right: region.pyobject_input_source(right, indexed_global_loads_by_source)?,
         compare,
     })
 }
@@ -1419,26 +1765,32 @@ fn compare_alternative_spec(op: BinOpKind) -> Option<CompareAlternativeSpec> {
         BinOpKind::Eq => CompareAlternativeSpec {
             generic_id: "binary.eq.py_richcompare",
             exact_id: "binary.eq.exact_compact_int.i32bool",
+            exact_str_id: "binary.eq.exact_str.i32bool",
         },
         BinOpKind::Ne => CompareAlternativeSpec {
             generic_id: "binary.ne.py_richcompare",
             exact_id: "binary.ne.exact_compact_int.i32bool",
+            exact_str_id: "binary.ne.exact_str.i32bool",
         },
         BinOpKind::Lt => CompareAlternativeSpec {
             generic_id: "binary.lt.py_richcompare",
             exact_id: "binary.lt.exact_compact_int.i32bool",
+            exact_str_id: "binary.lt.exact_str.i32bool",
         },
         BinOpKind::Le => CompareAlternativeSpec {
             generic_id: "binary.le.py_richcompare",
             exact_id: "binary.le.exact_compact_int.i32bool",
+            exact_str_id: "binary.le.exact_str.i32bool",
         },
         BinOpKind::Gt => CompareAlternativeSpec {
             generic_id: "binary.gt.py_richcompare",
             exact_id: "binary.gt.exact_compact_int.i32bool",
+            exact_str_id: "binary.gt.exact_str.i32bool",
         },
         BinOpKind::Ge => CompareAlternativeSpec {
             generic_id: "binary.ge.py_richcompare",
             exact_id: "binary.ge.exact_compact_int.i32bool",
+            exact_str_id: "binary.ge.exact_str.i32bool",
         },
         _ => return None,
     })
@@ -1477,7 +1829,11 @@ fn binary_return_alternative_spec(op: BinOpKind) -> Option<BinaryReturnAlternati
 trait ExtractedRegionExt {
     fn value(&self, value: ExtractedValueId) -> Option<&ExtractedValue>;
     fn load_name(&self, value: ExtractedValueId) -> Option<&ResolvedName>;
-    fn loadable_name(&self, value: ExtractedValueId) -> Option<String>;
+    fn pyobject_input_source(
+        &self,
+        value: ExtractedValueId,
+        indexed_global_loads_by_source: &HashMap<InstrId, IndexedGlobalSpecializationPlan>,
+    ) -> Option<PyObjectRegionInputSource>;
     fn exit_source(&self) -> Option<InstrId>;
 }
 
@@ -1493,14 +1849,34 @@ impl ExtractedRegionExt for ExtractedRegion {
         }
     }
 
-    fn loadable_name(&self, value: ExtractedValueId) -> Option<String> {
-        let name = self.load_name(value)?;
+    fn pyobject_input_source(
+        &self,
+        value: ExtractedValueId,
+        indexed_global_loads_by_source: &HashMap<InstrId, IndexedGlobalSpecializationPlan>,
+    ) -> Option<PyObjectRegionInputSource> {
+        let value = self.value(value)?;
+        let ExtractedValueKind::LoadName { name } = &value.kind else {
+            return None;
+        };
         match name.location {
-            NameLocation::Local(_) | NameLocation::Cell(_) => Some(name.id_str().to_string()),
-            NameLocation::GlobalName
-            | NameLocation::Global(_)
-            | NameLocation::RuntimeName(_)
-            | NameLocation::Constant(_) => None,
+            NameLocation::Local(_) | NameLocation::Cell(_) => Some(
+                PyObjectRegionInputSource::LocalName(name.id_str().to_string()),
+            ),
+            NameLocation::Constant(index) => Some(PyObjectRegionInputSource::ModuleConstant(index)),
+            NameLocation::Global(slot) => {
+                let source = value.source?;
+                let plan = indexed_global_loads_by_source.get(&source)?;
+                if plan.name != name.id_str() || plan.expected_index != slot.slot() {
+                    return None;
+                }
+                Some(PyObjectRegionInputSource::IndexedGlobal {
+                    source,
+                    module_name: plan.module_name.clone(),
+                    name: plan.name.clone(),
+                    expected_index: plan.expected_index,
+                })
+            }
+            NameLocation::GlobalName | NameLocation::RuntimeName(_) => None,
         }
     }
 
@@ -1511,14 +1887,42 @@ impl ExtractedRegionExt for ExtractedRegion {
     }
 }
 
-fn region_input(value: PlanValue, index: u32, name: String) -> RegionInput {
-    RegionInput {
-        value,
-        source: RegionInputSource::FunctionParam {
+fn region_pyobject_input(
+    value: PlanValue,
+    index: u32,
+    source: PyObjectRegionInputSource,
+) -> RegionInput {
+    let source = match source {
+        PyObjectRegionInputSource::LocalName(name) => RegionInputSource::FunctionParam {
             index,
             name: Some(name),
         },
-    }
+        PyObjectRegionInputSource::ModuleConstant(index) => {
+            RegionInputSource::ModuleConstant { index }
+        }
+        PyObjectRegionInputSource::IndexedGlobal {
+            source,
+            module_name,
+            name,
+            expected_index,
+        } => RegionInputSource::IndexedGlobal {
+            source,
+            module_name,
+            name,
+            expected_index,
+        },
+    };
+    RegionInput { value, source }
+}
+
+fn fallback_pyobject_input_value(id: u32, source: &PyObjectRegionInputSource) -> PlanValue {
+    let rep = match source {
+        PyObjectRegionInputSource::IndexedGlobal { .. } => Rep::PyObjectOwned,
+        PyObjectRegionInputSource::LocalName(_) | PyObjectRegionInputSource::ModuleConstant(_) => {
+            Rep::PyObjectBorrowed
+        }
+    };
+    PlanValue::new(id, rep)
 }
 
 fn node(id: u32, kind: PlanNodeKind) -> PlanNode {
@@ -1641,6 +2045,13 @@ mod tests {
         }))
     }
 
+    fn global(name: &str, slot: u32) -> InstrCodegen {
+        InstrCodegen::Load(Load::new(ResolvedName {
+            id: BlockPyName::new(name),
+            location: NameLocation::Global(soac_core::block_py::GlobalSlot(slot)),
+        }))
+    }
+
     fn binary(op: BinOpKind, left: InstrCodegen, right: InstrCodegen, id: u32) -> InstrCodegen {
         with_instr_id(InstrCodegen::BinOp(BinOp::new(op, left, right)), id)
     }
@@ -1735,6 +2146,27 @@ mod tests {
         extract_block_region_v3(&block, RegionId(0)).unwrap()
     }
 
+    fn compact_int_compare_branch_with_global_region(kind: BinOpKind) -> ExtractedRegion {
+        let test = binary(
+            kind,
+            with_instr_id(local("a", 0), 0),
+            with_instr_id(global("IntGlob", 7), 1),
+            2,
+        );
+        let block = Block::new(
+            label(0),
+            Vec::new(),
+            BlockTerm::IfTerm(TermIf {
+                test,
+                then_label: label(1),
+                else_label: label(2),
+            }),
+            Vec::<BlockParam>::new(),
+            None,
+        );
+        extract_block_region_v3(&block, RegionId(0)).unwrap()
+    }
+
     fn compact_int_compare_return_region(kind: BinOpKind) -> ExtractedRegion {
         let value = binary(
             kind,
@@ -1752,11 +2184,83 @@ mod tests {
         extract_block_region_v3(&block, RegionId(0)).unwrap()
     }
 
+    fn exact_str_compare_return_region(kind: BinOpKind) -> ExtractedRegion {
+        let value = binary(
+            kind,
+            with_instr_id(local("a", 0), 0),
+            with_instr_id(local("b", 1), 1),
+            2,
+        );
+        let block = Block::new(
+            label(0),
+            Vec::new(),
+            BlockTerm::Return(value),
+            Vec::<BlockParam>::new(),
+            None,
+        );
+        extract_block_region_v3(&block, RegionId(0)).unwrap()
+    }
+
+    fn exact_str_compare_return_with_constant_region(kind: BinOpKind) -> ExtractedRegion {
+        let value = binary(
+            kind,
+            with_instr_id(local("a", 0), 0),
+            with_instr_id(constant(7), 1),
+            2,
+        );
+        let block = Block::new(
+            label(0),
+            Vec::new(),
+            BlockTerm::Return(value),
+            Vec::<BlockParam>::new(),
+            None,
+        );
+        extract_block_region_v3(&block, RegionId(0)).unwrap()
+    }
+
+    fn exact_str_compare_branch_with_global_region(kind: BinOpKind) -> ExtractedRegion {
+        let test = binary(
+            kind,
+            with_instr_id(local("a", 0), 0),
+            with_instr_id(global("Char1Glob", 7), 1),
+            2,
+        );
+        let block = Block::new(
+            label(0),
+            Vec::new(),
+            BlockTerm::IfTerm(TermIf {
+                test,
+                then_label: label(1),
+                else_label: label(2),
+            }),
+            Vec::<BlockParam>::new(),
+            None,
+        );
+        extract_block_region_v3(&block, RegionId(0)).unwrap()
+    }
+
     fn compact_int_binary_return_region(kind: BinOpKind) -> ExtractedRegion {
         let value = binary(
             kind,
             with_instr_id(local("a", 0), 0),
             with_instr_id(local("b", 1), 1),
+            2,
+        );
+        let block = Block::new(
+            label(0),
+            Vec::new(),
+            BlockTerm::Return(value),
+            Vec::<BlockParam>::new(),
+            None,
+        );
+        extract_block_region_v3(&block, RegionId(0)).unwrap()
+    }
+
+    fn compact_int_binary_return_with_global_region(kind: BinOpKind) -> ExtractedRegion {
+        let value = binary(
+            kind,
+            with_instr_id(local("a", 0), 0),
+            with_instr_id(global("IntGlob", 7), 1),
             2,
         );
         let block = Block::new(
@@ -1782,6 +2286,13 @@ mod tests {
         facts.mark_exact_compact_int(ExtractedValueId(0));
         facts.mark_exact_compact_int(ExtractedValueId(1));
         facts.set_i64_constant(ExtractedValueId(1), 0);
+        facts
+    }
+
+    fn facts_for_exact_str_region() -> PlannerFacts {
+        let mut facts = PlannerFacts::default();
+        facts.mark_exact_str(ExtractedValueId(0));
+        facts.mark_exact_str(ExtractedValueId(1));
         facts
     }
 
@@ -1819,6 +2330,17 @@ mod tests {
                 indexed_globals: Vec::new(),
             }],
         }
+    }
+
+    fn add_test_indexed_global(request: &mut ModulePlanRequest, name: &str) {
+        request.functions[0].indexed_globals = vec![IndexedGlobalPlanRequest {
+            source: InstrId::new(1),
+            access: IndexedGlobalAccessKind::Load,
+            module_name: "pkg.mod".to_string(),
+            name: name.to_string(),
+            expected_index: 7,
+            reason: "test indexed global".to_string(),
+        }];
     }
 
     #[test]
@@ -2047,6 +2569,45 @@ mod tests {
     }
 
     #[test]
+    fn plans_compact_int_compare_branch_with_indexed_global_operand() {
+        let catalog = AlternativeCatalog::default_v3();
+        let mut request = module_request(
+            compact_int_compare_branch_with_global_region(BinOpKind::Lt),
+            facts_for_compact_region(),
+        );
+        add_test_indexed_global(&mut request, "IntGlob");
+        let plan = plan_module_optimization_v3(&catalog, request);
+
+        validate_module_plan_v3(&plan).unwrap();
+        let function = &plan.functions[0];
+        assert!(function.diagnostics.is_empty());
+        assert_eq!(function.regions.len(), 2);
+        assert_eq!(
+            function.regions[0].inputs[1].source,
+            RegionInputSource::IndexedGlobal {
+                source: InstrId::new(1),
+                module_name: "pkg.mod".to_string(),
+                name: "IntGlob".to_string(),
+                expected_index: 7,
+            }
+        );
+        assert_eq!(
+            function.regions[0].inputs[1].value.rep,
+            Rep::PyObjectBorrowed
+        );
+        assert_eq!(function.regions[1].inputs[1].value.rep, Rep::PyObjectOwned);
+        assert!(matches!(
+            function.regions[0].nodes[4].kind,
+            PlanNodeKind::Operation(OperationNode {
+                op: soac_ir_typed::plan_v3::PlannedOp::I64CompareToBool01 {
+                    op: RichCompareOp::Lt
+                },
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn plans_compact_int_compare_return() {
         let catalog = AlternativeCatalog::default_v3();
         let request = module_request(
@@ -2127,6 +2688,43 @@ mod tests {
             function.regions[1].nodes[0].kind,
             PlanNodeKind::Operation(OperationNode {
                 op: soac_ir_typed::plan_v3::PlannedOp::PyNumberAdd,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn plans_compact_int_add_return_with_indexed_global_operand() {
+        let catalog = AlternativeCatalog::default_v3();
+        let mut request = module_request(
+            compact_int_binary_return_with_global_region(BinOpKind::Add),
+            facts_for_compact_region(),
+        );
+        add_test_indexed_global(&mut request, "IntGlob");
+        let plan = plan_module_optimization_v3(&catalog, request);
+
+        validate_module_plan_v3(&plan).unwrap();
+        let function = &plan.functions[0];
+        assert!(function.diagnostics.is_empty());
+        assert_eq!(function.regions.len(), 2);
+        assert_eq!(
+            function.regions[0].inputs[1].source,
+            RegionInputSource::IndexedGlobal {
+                source: InstrId::new(1),
+                module_name: "pkg.mod".to_string(),
+                name: "IntGlob".to_string(),
+                expected_index: 7,
+            }
+        );
+        assert_eq!(
+            function.regions[0].inputs[1].value.rep,
+            Rep::PyObjectBorrowed
+        );
+        assert_eq!(function.regions[1].inputs[1].value.rep, Rep::PyObjectOwned);
+        assert!(matches!(
+            function.regions[0].nodes[4].kind,
+            PlanNodeKind::Operation(OperationNode {
+                op: soac_ir_typed::plan_v3::PlannedOp::CheckedI64Add,
                 ..
             })
         ));
@@ -2274,6 +2872,127 @@ mod tests {
             PlanNodeKind::Operation(OperationNode {
                 op: soac_ir_typed::plan_v3::PlannedOp::I64CompareToBool01 {
                     op: RichCompareOp::Gt
+                },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn plans_exact_str_compare_return_as_python_bool() {
+        let catalog = AlternativeCatalog::default_v3();
+        let request = module_request(
+            exact_str_compare_return_region(BinOpKind::Ge),
+            facts_for_exact_str_region(),
+        );
+        let plan = plan_module_optimization_v3(&catalog, request);
+
+        validate_module_plan_v3(&plan).unwrap();
+        let function = &plan.functions[0];
+        assert!(function.diagnostics.is_empty());
+        assert_eq!(function.regions.len(), 2);
+        assert!(matches!(
+            function.regions[0].nodes[2].kind,
+            PlanNodeKind::Operation(OperationNode {
+                op: soac_ir_typed::plan_v3::PlannedOp::PyObjectRichCompareBool {
+                    op: RichCompareOp::Ge
+                },
+                ..
+            })
+        ));
+        assert!(matches!(
+            function.regions[0].nodes[3].kind,
+            PlanNodeKind::Materialize(MaterializeNode {
+                kind: MaterializeKind::PythonBool,
+                ..
+            })
+        ));
+        assert!(matches!(
+            function.regions[1].nodes[0].kind,
+            PlanNodeKind::Operation(OperationNode {
+                op: soac_ir_typed::plan_v3::PlannedOp::PyObjectRichCompare {
+                    op: RichCompareOp::Ge
+                },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn plans_exact_str_compare_return_with_module_constant_operand() {
+        let catalog = AlternativeCatalog::default_v3();
+        let request = module_request(
+            exact_str_compare_return_with_constant_region(BinOpKind::Le),
+            facts_for_exact_str_region(),
+        );
+        let plan = plan_module_optimization_v3(&catalog, request);
+
+        validate_module_plan_v3(&plan).unwrap();
+        let function = &plan.functions[0];
+        assert!(function.diagnostics.is_empty());
+        assert_eq!(function.regions.len(), 2);
+        assert_eq!(
+            function.regions[0].inputs[0].source,
+            RegionInputSource::FunctionParam {
+                index: 0,
+                name: Some("a".to_string())
+            }
+        );
+        assert_eq!(
+            function.regions[0].inputs[1].source,
+            RegionInputSource::ModuleConstant { index: 7 }
+        );
+        assert!(matches!(
+            function.regions[0].nodes[2].kind,
+            PlanNodeKind::Operation(OperationNode {
+                op: soac_ir_typed::plan_v3::PlannedOp::PyObjectRichCompareBool {
+                    op: RichCompareOp::Le
+                },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn plans_exact_str_compare_branch_with_indexed_global_operand() {
+        let catalog = AlternativeCatalog::default_v3();
+        let mut request = module_request(
+            exact_str_compare_branch_with_global_region(BinOpKind::Eq),
+            facts_for_exact_str_region(),
+        );
+        request.functions[0].indexed_globals = vec![IndexedGlobalPlanRequest {
+            source: InstrId::new(1),
+            access: IndexedGlobalAccessKind::Load,
+            module_name: "pkg.mod".to_string(),
+            name: "Char1Glob".to_string(),
+            expected_index: 7,
+            reason: "test indexed global".to_string(),
+        }];
+        let plan = plan_module_optimization_v3(&catalog, request);
+
+        validate_module_plan_v3(&plan).unwrap();
+        let function = &plan.functions[0];
+        assert!(function.diagnostics.is_empty());
+        assert_eq!(function.regions.len(), 2);
+        assert_eq!(
+            function.regions[0].inputs[1].source,
+            RegionInputSource::IndexedGlobal {
+                source: InstrId::new(1),
+                module_name: "pkg.mod".to_string(),
+                name: "Char1Glob".to_string(),
+                expected_index: 7,
+            }
+        );
+        assert_eq!(
+            function.regions[0].inputs[1].value.rep,
+            Rep::PyObjectBorrowed
+        );
+        assert_eq!(function.regions[1].inputs[1].value.rep, Rep::PyObjectOwned);
+        assert!(matches!(
+            function.regions[0].nodes[2].kind,
+            PlanNodeKind::Operation(OperationNode {
+                op: soac_ir_typed::plan_v3::PlannedOp::PyObjectRichCompareBool {
+                    op: RichCompareOp::Eq
                 },
                 ..
             })

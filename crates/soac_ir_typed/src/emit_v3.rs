@@ -38,6 +38,28 @@ pub struct MechanicalRegionFunctionParamInput<'a> {
     pub name: &'a str,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MechanicalRegionInput<'a> {
+    pub value: PlanValue,
+    pub source: MechanicalRegionInputSource<'a>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MechanicalRegionInputSource<'a> {
+    FunctionParam {
+        name: &'a str,
+    },
+    ModuleConstant {
+        index: u32,
+    },
+    IndexedGlobal {
+        source: InstrId,
+        module_name: &'a str,
+        name: &'a str,
+        expected_index: u32,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct MechanicalDirectCallEmission {
     pub source: InstrId,
@@ -152,6 +174,7 @@ pub enum MechanicalOperation {
     PyNumberBitOr,
     PyNumberBitXor,
     PyObjectRichCompare { op: RichCompareOp },
+    PyObjectRichCompareBool { op: RichCompareOp },
     PyObjectIsTrue,
     CheckedI64Add,
     CheckedI64Sub,
@@ -210,6 +233,7 @@ pub enum MechanicalCodegenOperation {
     PyNumberBitOr,
     PyNumberBitXor,
     PyObjectRichCompare { op: RichCompareOp },
+    PyObjectRichCompareBool { op: RichCompareOp },
     CheckedI64Add,
     CheckedI64Sub,
     CheckedI64Mul,
@@ -229,6 +253,7 @@ impl From<&PlannedOp> for MechanicalOperation {
             PlannedOp::PyNumberBitOr => Self::PyNumberBitOr,
             PlannedOp::PyNumberBitXor => Self::PyNumberBitXor,
             PlannedOp::PyObjectRichCompare { op } => Self::PyObjectRichCompare { op: *op },
+            PlannedOp::PyObjectRichCompareBool { op } => Self::PyObjectRichCompareBool { op: *op },
             PlannedOp::PyObjectIsTrue => Self::PyObjectIsTrue,
             PlannedOp::CheckedI64Add => Self::CheckedI64Add,
             PlannedOp::CheckedI64Sub => Self::CheckedI64Sub,
@@ -336,6 +361,57 @@ pub fn mechanical_region_function_param_inputs<'a>(
         inputs.push(MechanicalRegionFunctionParamInput {
             value: input.value,
             name,
+        });
+    }
+    Ok(inputs)
+}
+
+pub fn mechanical_region_inputs<'a>(
+    region: &'a RegionPlan,
+    context: &str,
+) -> Result<Vec<MechanicalRegionInput<'a>>, String> {
+    let mut inputs = Vec::with_capacity(region.inputs.len());
+    for input in &region.inputs {
+        let source = match &input.source {
+            RegionInputSource::FunctionParam {
+                name: Some(name), ..
+            } if input.value.rep == Rep::PyObjectBorrowed => {
+                MechanicalRegionInputSource::FunctionParam { name }
+            }
+            RegionInputSource::ModuleConstant { index } => {
+                if input.value.rep != Rep::PyObjectBorrowed {
+                    return Err(format!(
+                        "prevalidated optimizer v3 {context} module-constant input {:?} has non-mechanical rep {:?}",
+                        input.value, input.value.rep
+                    ));
+                }
+                MechanicalRegionInputSource::ModuleConstant { index: *index }
+            }
+            RegionInputSource::IndexedGlobal {
+                source,
+                module_name,
+                name,
+                expected_index,
+            } if input.value.rep == Rep::PyObjectBorrowed
+                || input.value.rep == Rep::PyObjectOwned =>
+            {
+                MechanicalRegionInputSource::IndexedGlobal {
+                    source: *source,
+                    module_name,
+                    name,
+                    expected_index: *expected_index,
+                }
+            }
+            source => {
+                return Err(format!(
+                    "prevalidated optimizer v3 {context} input {:?} has non-mechanical source {source:?}",
+                    input.value
+                ));
+            }
+        };
+        inputs.push(MechanicalRegionInput {
+            value: input.value,
+            source,
         });
     }
     Ok(inputs)
@@ -599,6 +675,29 @@ fn mechanical_codegen_operation(
                 _ => unreachable!("matched Python object operation"),
             };
             Ok((op, inputs, output))
+        }
+        MechanicalOperation::PyObjectRichCompareBool { op } => {
+            if !inputs
+                .iter()
+                .all(|input| input.rep == Rep::PyObjectBorrowed)
+                || output.rep != Rep::I32Bool01
+            {
+                return Err(format!(
+                    "prevalidated optimizer v3 region {region:?} operation node {node:?} {operation:?} expects borrowed PyObject inputs and I32Bool01 output, got {:?}, {:?}",
+                    inputs.map(|input| input.rep),
+                    output.rep
+                ));
+            }
+            if !has_local_fallback || failure != &FailureMode::CannotFail {
+                return Err(format!(
+                    "prevalidated optimizer v3 region {region:?} operation node {node:?} {operation:?} expects a local fallback and cannot-fail operation after guards, got {failure:?}"
+                ));
+            }
+            Ok((
+                MechanicalCodegenOperation::PyObjectRichCompareBool { op: *op },
+                inputs,
+                output,
+            ))
         }
         MechanicalOperation::CheckedI64Add
         | MechanicalOperation::CheckedI64Sub
@@ -888,6 +987,11 @@ fn validate_region_inputs_supported_by_current_lowering_v3(
         match &input.source {
             RegionInputSource::FunctionParam { name: Some(_), .. }
                 if input.value.rep == Rep::PyObjectBorrowed => {}
+            RegionInputSource::ModuleConstant { .. }
+                if input.value.rep == Rep::PyObjectBorrowed => {}
+            RegionInputSource::IndexedGlobal { .. }
+                if input.value.rep == Rep::PyObjectBorrowed
+                    || input.value.rep == Rep::PyObjectOwned => {}
             RegionInputSource::FunctionParam { name: Some(_), .. } => {
                 return Err(format!(
                     "function {function} region {:?} input {:?} has rep {:?}; current mechanical lowering loads named inputs as borrowed PyObjects",
@@ -896,7 +1000,7 @@ fn validate_region_inputs_supported_by_current_lowering_v3(
             }
             source => {
                 return Err(format!(
-                    "function {function} region {:?} input {:?} has unsupported source {source:?}; current mechanical lowering only supports named function-param inputs",
+                    "function {function} region {:?} input {:?} has unsupported source {source:?}; current mechanical lowering only supports named function-param inputs, module constants, and indexed globals",
                     region.id, input.value.id
                 ));
             }
@@ -1142,6 +1246,24 @@ fn validate_operation_supported_by_current_lowering_v3(
             if !matches!(failure, FailureMode::Raise(_)) {
                 return Err(format!(
                     "function {function} region {region:?} operation node {node:?} {op:?} expects local Python raise failure, got {failure:?}"
+                ));
+            }
+            Ok(())
+        }
+        MechanicalOperation::PyObjectRichCompareBool { .. } => {
+            validate_supported_operation_signature_v3(
+                function,
+                region,
+                node,
+                op,
+                inputs,
+                output,
+                &[Rep::PyObjectBorrowed, Rep::PyObjectBorrowed],
+                Rep::I32Bool01,
+            )?;
+            if !has_local_fallback || failure != &FailureMode::CannotFail {
+                return Err(format!(
+                    "function {function} region {region:?} operation node {node:?} {op:?} expects a local fallback and cannot-fail operation after guards, got {failure:?}"
                 ));
             }
             Ok(())
@@ -1893,6 +2015,32 @@ mod tests {
         assert_eq!(
             inputs,
             vec![MechanicalRegionFunctionParamInput { value, name: "arg" }]
+        );
+    }
+
+    #[test]
+    fn prepares_region_module_constant_inputs() {
+        let value = PlanValue::new(0, Rep::PyObjectBorrowed);
+        let region = RegionPlan {
+            id: RegionId(0),
+            source: RegionSource::FunctionEntry,
+            inputs: vec![RegionInput {
+                value,
+                source: RegionInputSource::ModuleConstant { index: 3 },
+            }],
+            nodes: Vec::new(),
+            exits: Vec::new(),
+        };
+
+        let inputs = mechanical_region_inputs(&region, "test region")
+            .expect("constant input should prepare");
+
+        assert_eq!(
+            inputs,
+            vec![MechanicalRegionInput {
+                value,
+                source: MechanicalRegionInputSource::ModuleConstant { index: 3 }
+            }]
         );
     }
 
