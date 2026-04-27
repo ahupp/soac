@@ -1,5 +1,36 @@
 # Overnight Performance Log
 
+## 2026-04-27 - Probe range iterator before cached next lookup
+
+- baseline: `work/bench/uxwoxrqpzwzw_acb20ab139b0`
+  - specialized apply median: `588058 loops/s`
+  - specialized apply mean: `586858 loops/s`
+  - verify pass: `335249 loops/s`
+  - no-refcount diagnostic median: `762813 loops/s`
+  - latest summarized pystone code size: `66689 bytes`, `3918` machine blocks
+- observation: the vectorcall hook tries the `next(range_iterator)` fast path
+  before the generic vectorcall fallback. The fast-path probe loaded the cached
+  `builtins.next` object before checking whether the first argument was actually
+  an exact range iterator.
+- attempted change: check the first vectorcall argument for exact
+  `PyRangeIter_Type` before loading and comparing the cached `builtins.next`
+  object, so unrelated one- and two-argument vectorcalls can reject the fast
+  path earlier.
+- rejected result: `work/bench/otusktzwztuu_b6c60955d84b`
+  - specialized apply median: `571543 loops/s` (`-2.81%`)
+  - specialized apply mean: `576042 loops/s` (`-1.84%`)
+  - verify pass: `328403 loops/s` (`-2.04%`)
+  - no-refcount diagnostic median: `756105 loops/s` (`-0.88%`)
+  - latest summarized pystone code size: `66689 bytes`, `3918` machine blocks
+  - code-size delta: `+0 bytes`, `+0` machine blocks
+- reason rejected: the production apply pass regressed despite the simpler
+  early-reject shape. The saved cache load was not enough to offset the changed
+  branch/order behavior in the hot vectorcall helper.
+- validation before rejection: `just fmt-rust soac_jit` passed; `cargo check -p
+  soac_jit --tests` passed; `just benchmark` produced the rejected result
+  above. The implementation was then reverted.
+- next baseline: `work/bench/uxwoxrqpzwzw_acb20ab139b0`
+
 ## 2026-04-27 - Cached small ints in fast range next
 
 - baseline: `work/bench/uxwoxrqpzwzw_acb20ab139b0`
