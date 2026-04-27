@@ -128,7 +128,7 @@ def test_apply_mode_constructor_entry_failure_preserves_exception(
     assert result == ["Marker", "boom:7", True]
 
 
-def test_apply_mode_constructor_entry_custom_new_uses_generic_fallback(
+def test_apply_mode_constructor_entry_custom_new_stays_generic(
     tmp_path: Path,
 ) -> None:
     result, rows = _run_apply_module(
@@ -159,7 +159,7 @@ def test_apply_mode_constructor_entry_custom_new_uses_generic_fallback(
         for row in rows
         if row.get("target") == "soac_jit_direct_edges" and row.get("clif_direct_edges", 0) > 0
     ]
-    assert direct_edge_rows, rows
+    assert not direct_edge_rows, rows
     assert result == [["new:5", "init:5:6"], 5, 6]
 
 

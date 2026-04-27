@@ -261,8 +261,7 @@ thread_local! {
 #[cfg(test)]
 use imports::predeclare_typed_direct_call_imports;
 use imports::{
-    DP_JIT_CONSTRUCTOR_GENERIC_ALLOC_SUPPORTED_IMPORT, DP_JIT_DECREF_IMPORT,
-    DP_JIT_DEOPT_RESUME_IMPORT, DP_JIT_DIRECT_COMPILE_FUNCTION_ENV_IMPORT,
+    DP_JIT_DECREF_IMPORT, DP_JIT_DEOPT_RESUME_IMPORT, DP_JIT_DIRECT_COMPILE_FUNCTION_ENV_IMPORT,
     DP_JIT_ENTER_RECURSIVE_CALL_IMPORT, DP_JIT_FINISH_CONSTRUCTOR_INIT_IMPORT,
     DP_JIT_INCREF_IMPORT, DP_JIT_IS_TRUE_IMPORT, DP_JIT_LOAD_CELL_IMPORT,
     DP_JIT_LOAD_RUNTIME_OBJ_BY_ID_IMPORT, DP_JIT_MAKE_CELL_IMPORT,
@@ -1281,7 +1280,6 @@ struct JitEmitCtx<'mc> {
     load_runtime_obj_by_id_ref: ir::FuncRef,
     enter_recursive_ref: ir::FuncRef,
     direct_compile_function_env_ref: ir::FuncRef,
-    constructor_generic_alloc_supported_ref: ir::FuncRef,
     pytype_generic_alloc_ref: ir::FuncRef,
     finish_constructor_init_ref: ir::FuncRef,
     pyobject_getattr_ref: ir::FuncRef,
@@ -8332,7 +8330,7 @@ fn typed_expr_is_constructor_call(expr: &InstrTyped, emit_ctx: &JitEmitCtx<'_>) 
 }
 
 #[allow(clippy::too_many_arguments)]
-fn emit_constructor_entry_fast_or_generic_call_with_arg_values(
+fn emit_constructor_entry_direct_init_call_with_arg_values(
     fb: &mut FunctionBuilder<'_>,
     init_function: &BlockPyFunction<TypedCodegenModuleShape>,
     cls_value: ir::Value,
@@ -8347,24 +8345,6 @@ fn emit_constructor_entry_fast_or_generic_call_with_arg_values(
         .func_id;
     let ptr_ty = emit_ctx.consts.ptr_ty;
     let null_ptr = fb.ins().iconst(ptr_ty, 0);
-    let result_block = fb.create_block();
-    fb.append_block_param(result_block, ptr_ty);
-    let generic_block = fb.create_block();
-    fb.set_cold_block(generic_block);
-    let fast_block = fb.create_block();
-
-    let supported_inst = fb.ins().call(
-        emit_ctx.constructor_generic_alloc_supported_ref,
-        &[cls_value],
-    );
-    let supported = fb.inst_results(supported_inst)[0];
-    let supported = fb
-        .ins()
-        .icmp_imm(ir::condcodes::IntCC::NotEqual, supported, 0);
-    fb.ins()
-        .brif(supported, fast_block, &[], generic_block, &[]);
-
-    fb.switch_to_block(fast_block);
     let nitems = fb.ins().iconst(emit_ctx.consts.i64_ty, 0);
     let alloc_inst = fb
         .ins()
@@ -8458,44 +8438,7 @@ fn emit_constructor_entry_fast_or_generic_call_with_arg_values(
         &[ir::BlockArg::Value(fast_result)],
     );
     fb.switch_to_block(fast_ok_block);
-    let fast_result = fb.block_params(fast_ok_block)[0];
-    fb.ins()
-        .jump(result_block, &[ir::BlockArg::Value(fast_result)]);
-
-    fb.switch_to_block(generic_block);
-    emit_ctx
-        .direct_edge_stats
-        .record_guarded_generic_fallback_block();
-    let user_arg_borrowed = vec![true; user_arg_values.len()];
-    let (generic_result, ownership, _) = if user_arg_values.len() <= 3 {
-        emit_positional_call_three_result_with_arg_values(
-            fb,
-            cls_value,
-            true,
-            user_arg_values,
-            user_arg_borrowed,
-            emit_ctx,
-            ResultDemand::PYOBJECT_OWNED,
-        )
-        .expect_pyobject("constructor entry generic fallback")
-    } else {
-        emit_positional_vectorcall_result_with_arg_values(
-            fb,
-            cls_value,
-            true,
-            user_arg_values,
-            user_arg_borrowed,
-            emit_ctx,
-            ResultDemand::PYOBJECT_OWNED,
-        )
-        .expect_pyobject("constructor entry generic fallback")
-    };
-    debug_assert!(ownership.is_owned());
-    fb.ins()
-        .jump(result_block, &[ir::BlockArg::Value(generic_result)]);
-
-    fb.switch_to_block(result_block);
-    fb.block_params(result_block)[0]
+    fb.block_params(fast_ok_block)[0]
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8537,7 +8480,7 @@ fn emit_codegen_constructor_entry_call_with_local_env(
     );
     debug_assert!(arg_borrowed.iter().all(|is_borrowed| *is_borrowed));
     let cls_value = arg_values[0];
-    Some(emit_constructor_entry_fast_or_generic_call_with_arg_values(
+    Some(emit_constructor_entry_direct_init_call_with_arg_values(
         fb,
         init_function,
         cls_value,
@@ -8589,7 +8532,7 @@ fn emit_typed_constructor_entry_call_with_local_env(
     )?;
     debug_assert!(arg_borrowed.iter().all(|is_borrowed| *is_borrowed));
     let cls_value = arg_values[0];
-    let result = emit_constructor_entry_fast_or_generic_call_with_arg_values(
+    let result = emit_constructor_entry_direct_init_call_with_arg_values(
         fb,
         init_function,
         cls_value,
@@ -16084,11 +16027,6 @@ fn build_cranelift_run_bb_specialized_function(
             &mut fb.func,
             &DP_JIT_DIRECT_COMPILE_FUNCTION_ENV_IMPORT,
         );
-        let constructor_generic_alloc_supported_ref = func_imports.get_or_panic(
-            codegen_env,
-            &mut fb.func,
-            &DP_JIT_CONSTRUCTOR_GENERIC_ALLOC_SUPPORTED_IMPORT,
-        );
         let pytype_generic_alloc_ref = func_imports.get_or_panic(
             codegen_env,
             &mut fb.func,
@@ -16431,7 +16369,6 @@ fn build_cranelift_run_bb_specialized_function(
                 load_runtime_obj_by_id_ref,
                 enter_recursive_ref,
                 direct_compile_function_env_ref,
-                constructor_generic_alloc_supported_ref,
                 pytype_generic_alloc_ref,
                 finish_constructor_init_ref,
                 pyobject_getattr_ref,

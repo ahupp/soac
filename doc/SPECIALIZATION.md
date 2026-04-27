@@ -31,9 +31,9 @@ consumed by typed JIT planning. Constructor type metadata now points at a
 synthetic constructor-entry function id rather than the underlying `__init__`
 id. Those entry functions are normal JIT direct-call targets with an implicit
 leading type argument, so class calls can reuse the ordinary guarded direct-call
-target model. The entry JIT owns a guarded direct-allocation path for safe
-default constructor shapes and a generic `cls(...)` fallback for the remaining
-Python type-call cases.
+target model. Type registration only attaches that metadata for safe default
+constructor shapes, so unsupported Python type-call cases stay generic and do
+not enter the synthetic target.
 Runtime-guarded receiver-method specializations are not represented in v3
 plan/emission data today; those call shapes stay on generic lowering unless a
 future plan format adds validated static guard inputs for them.
@@ -79,10 +79,10 @@ Current migration surface:
   planning. Constructor calls are selected through the same direct-call
   machinery when the profiled target is the synthetic constructor-entry function
   and the call can be bound without refreshing defaults; the entry currently
-  preserves Python type-call semantics by guarding the direct allocation path
-  and falling back to ordinary class call semantics for unsupported type shapes.
-  Constant-string indexed fields are selected by v3 from raw `type_keys`, emitted as mechanical
-  indexed-field decisions, and consumed as v3-owned typed attribute inputs.
+  preserves Python type-call semantics by only attaching type metadata for
+  classes that can use direct default allocation. Constant-string indexed fields
+  are selected by v3 from raw `type_keys`, emitted as mechanical indexed-field
+  decisions, and consumed as v3-owned typed attribute inputs.
   Indexed globals are selected by v3 from raw `module_keys` plus lowered
   `NameLocation::Global(slot)` load/store sites, emitted with explicit
   module-dict guard and original-global-access fallback effects, and consumed
@@ -491,9 +491,10 @@ their owner/type guard payload is not yet a static mechanical JIT input.
     needs default sentinels, because type metadata does not yet observe later
     `__init__.__defaults__` / `__kwdefaults__` mutation
   - constructor-entry direct allocation currently requires simple positional
-    arguments and a safe default allocation shape; custom `__new__`, abstract
-    classes, custom metaclasses, non-generic allocation, keywords, and starred
-    arguments stay on the generic class-call path
+    arguments and constructor metadata attached to a safe default allocation
+    shape; custom `__new__`, abstract classes, custom metaclasses, non-generic
+    allocation, keywords, and starred arguments stay on the generic class-call
+    path
 - Soundness boundary:
   - this is sound as long as the `FunctionId` metadata attached to
     transformed Python functions stays correct
@@ -522,20 +523,22 @@ the v3 plan/emission data does not carry method-call plan entries.
 Constructor calls reuse `call_hot_targets` evidence, but the target identity is
 the heap type's synthetic `__soac_constructor_entry__` function, distinct from
 the `__init__` function id. These entry functions are present in the BlockPy
-module, type metadata stores a JIT environment for the entry, and profile
-evidence no longer treats `__init__` itself as the class-call target.
+module, and eligible type metadata stores a JIT environment for the entry. If
+the runtime type shape is not eligible for direct default allocation, SOAC
+leaves the heap type metadata empty so profile evidence keeps the class call
+generic.
 
 The synthetic entry is now a normal JIT function with an implicit leading type
 argument. Direct-call rewriting guards the callee as the exact heap type, loads
 the entry metadata from the type, prepends the type object to the direct-entry
 argument list, and falls back to the original generic class call on guard miss.
 The entry body still lowers from a simple `constructor_call(cls, *args, **kwargs)`
-IR shape, but JIT codegen recognizes that helper inside constructor entries. For
-safe default allocation shapes it calls `PyType_GenericAlloc`, calls the selected
-`__init__` through the ordinary direct-function ABI, and finishes with
-`dp_jit_finish_constructor_init`. If the runtime guard rejects the type shape,
-the entry calls `cls(*args)` so custom `__new__`, metaclasses, abstract classes,
-and non-generic allocation keep CPython-visible semantics.
+IR shape, but JIT codegen recognizes that helper inside constructor entries and
+emits `PyType_GenericAlloc`, an internal direct call to the selected `__init__`,
+and `dp_jit_finish_constructor_init`. The per-call allocation-shape check is not
+in the synthetic target; registration checks the realized `PyTypeObject` once
+and does not attach constructor metadata for custom `__new__`, metaclasses,
+abstract classes, or non-generic allocation.
 
 Constructor initializer inlining and constructor scalar replacement should be
 represented directly in `InstrTyped` metadata or typed operation shape when

@@ -1164,6 +1164,37 @@ unsafe fn type_is_defined_in_module(
     matches != 0
 }
 
+unsafe fn owner_type_supports_direct_constructor_entry(owner_type: *mut ffi::PyTypeObject) -> bool {
+    if owner_type.is_null() {
+        return false;
+    }
+    if ((*owner_type).tp_flags & ffi::Py_TPFLAGS_HEAPTYPE) == 0
+        || ((*owner_type).tp_flags & ffi::Py_TPFLAGS_IS_ABSTRACT) != 0
+    {
+        return false;
+    }
+    if ffi::Py_TYPE(owner_type as *mut ffi::PyObject) != ptr::addr_of_mut!(ffi::PyType_Type) {
+        return false;
+    }
+    let Some(owner_tp_alloc) = (*owner_type).tp_alloc else {
+        return false;
+    };
+    let generic_alloc: unsafe extern "C" fn(
+        *mut ffi::PyTypeObject,
+        ffi::Py_ssize_t,
+    ) -> *mut ffi::PyObject = ffi::PyType_GenericAlloc;
+    if !ptr::fn_addr_eq(owner_tp_alloc, generic_alloc) {
+        return false;
+    }
+    let Some(owner_tp_new) = (*owner_type).tp_new else {
+        return false;
+    };
+    let Some(base_object_tp_new) = ffi::PyBaseObject_Type.tp_new else {
+        return false;
+    };
+    ptr::fn_addr_eq(owner_tp_new, base_object_tp_new)
+}
+
 unsafe fn register_owner_types_from_type(
     owner_type: *mut ffi::PyTypeObject,
     module_name: *mut ffi::PyObject,
@@ -1219,7 +1250,9 @@ unsafe fn register_owner_types_from_type(
             )?;
         }
     }
-    if let Some(function_id) = constructor_function_id {
+    if let Some(function_id) = constructor_function_id
+        && owner_type_supports_direct_constructor_entry(owner_type)
+    {
         let mut metadata = ptr::null_mut();
         let mut metadata_destructor: Option<unsafe extern "C" fn(*mut c_void)> = None;
         if let Some(module_runtime) = module_runtime {
@@ -2668,6 +2701,45 @@ mod tests {
                     .expect("type function id lookup should succeed"),
                 Some(function_id),
                 "owner type registration should decode the attached constructor id"
+            );
+            ffi::Py_DECREF(init_function);
+        });
+    }
+
+    #[test]
+    fn owner_type_registration_skips_constructor_type_function_id_for_custom_new() {
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        initialize_test_python();
+        Python::attach(|py| unsafe {
+            let (module, cls) = make_test_module_with_source(
+                py,
+                "class C:\n    def __new__(cls, value):\n        return super().__new__(cls)\n    def __init__(self, value):\n        self.value = value\n",
+            );
+            let owner_type = cls.as_ptr() as *mut ffi::PyTypeObject;
+            let init_function = class_dict_function(owner_type, c"__init__");
+            let function_id = RuntimeFunctionId::from_raw_parts(10, 5);
+            assert_eq!(
+                PyFunction_SetSoacMetadata(
+                    init_function,
+                    function_id.to_packed_runtime_u64(),
+                    ptr::null_mut(),
+                    None,
+                ),
+                0,
+                "registering __init__ SOAC id should succeed"
+            );
+            register_function_owner_types_for_module(module.as_ptr())
+                .expect("owner type registration should succeed");
+            assert_eq!(
+                PyType_GetSoacFunctionId(cls.as_ptr()),
+                0,
+                "custom __new__ should keep constructor type metadata unset"
+            );
+            assert_eq!(
+                registered_clif_type_function_id(cls.as_ptr())
+                    .expect("type function id lookup should succeed"),
+                None,
+                "custom __new__ should not decode a constructor entry id"
             );
             ffi::Py_DECREF(init_function);
         });

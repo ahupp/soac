@@ -270,11 +270,6 @@ pub(super) static DP_JIT_PYOBJECT_SETITEM_IMPORT: ImportSpec = ImportSpec::new(
     &[SigType::Pointer, SigType::Pointer, SigType::Pointer],
     &[SigType::Pointer],
 );
-pub(super) static DP_JIT_CONSTRUCTOR_GENERIC_ALLOC_SUPPORTED_IMPORT: ImportSpec = ImportSpec::new(
-    "dp_jit_constructor_generic_alloc_supported",
-    &[SigType::Pointer],
-    &[SigType::I32],
-);
 pub(super) static DP_JIT_PYTYPE_GENERIC_ALLOC_IMPORT: ImportSpec = ImportSpec::new(
     "dp_jit_pytype_generic_alloc",
     &[SigType::Pointer, SigType::I64],
@@ -449,7 +444,6 @@ static JIT_RUNTIME_IMPORT_SPECS: &[&ImportSpec] = &[
     &DP_JIT_PYOBJECT_SETATTR_IMPORT,
     &DP_JIT_PYOBJECT_GETITEM_IMPORT,
     &DP_JIT_PYOBJECT_SETITEM_IMPORT,
-    &DP_JIT_CONSTRUCTOR_GENERIC_ALLOC_SUPPORTED_IMPORT,
     &DP_JIT_PYTYPE_GENERIC_ALLOC_IMPORT,
     &DP_JIT_FINISH_CONSTRUCTOR_INIT_IMPORT,
     &DP_JIT_PYOBJECT_TO_I64_IMPORT,
