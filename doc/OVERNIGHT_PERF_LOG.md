@@ -1,5 +1,37 @@
 # Overnight Performance Log
 
+## 2026-04-27 - Delay indexed-field attr operand loads
+
+- baseline: `work/bench/uxwoxrqpzwzw_acb20ab139b0`
+  - specialized apply median: `588058 loops/s`
+  - specialized apply mean: `586858 loops/s`
+  - verify pass: `335249 loops/s`
+  - no-refcount diagnostic median: `762813 loops/s`
+  - latest summarized pystone code size: `66689 bytes`, `3918` machine blocks
+- observation: indexed-field get/set plans have already validated the
+  attribute name, and verify counters showed pystone's hot field accesses
+  hitting indexed paths with zero fallback. The hot path therefore only needs
+  the receiver and replacement value; the attribute object is needed only by
+  generic fallback.
+- attempted change: move the typed `op.attr` input load from the indexed
+  get/set hot path into the fallback block, so indexed hits avoid loading and
+  cleaning up a compiler-created attribute constant.
+- rejected result: `work/bench/knpzzrvuunmu_fc470143a1b1`
+  - specialized apply median: `584929 loops/s` (`-0.53%`)
+  - specialized apply mean: `580525 loops/s` (`-1.08%`)
+  - verify pass: `329506 loops/s` (`-1.71%`)
+  - no-refcount diagnostic median: `752529 loops/s` (`-1.35%`)
+  - latest summarized pystone code size: `66689 bytes`, `3918` machine blocks
+  - code-size delta: `+0 bytes`, `+0` machine blocks
+- reason rejected: the refcount-enabled apply path regressed and there was no
+  code-size improvement, so moving the constant load into fallback did not pay
+  for the changed control-flow shape.
+- validation before rejection: `just fmt-rust soac_jit` passed; `cargo test -p
+  soac_jit indexed_field -- --nocapture` passed; `cargo check -p soac_jit
+  --tests` passed; `just benchmark` produced the rejected result above. The
+  implementation was then reverted.
+- next baseline: `work/bench/uxwoxrqpzwzw_acb20ab139b0`
+
 ## 2026-04-27 - Pass guarded owner type to trusted field store
 
 - baseline: `work/bench/uxwoxrqpzwzw_acb20ab139b0`
