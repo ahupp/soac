@@ -456,6 +456,7 @@ run-cpython-tests jobs="0" *args='': build-test-runtime ensure-cpython ensure-ve
 
     PYTHONDONTWRITEBYTECODE=1 \
     SOAC_CRANELIFT_OPT_LEVEL="${SOAC_CRANELIFT_OPT_LEVEL:-none}" \
+    SOAC_BACKGROUND_JIT="${SOAC_BACKGROUND_JIT:-0}" \
     PYTHONPATH="$PYTHONPATH_PREFIX${PYTHONPATH:+:$PYTHONPATH}" \
     "${TEST_CMD[@]}"
   )

@@ -312,9 +312,9 @@ typed variables must use recognized values. Boolean knobs accept `1`, `true`,
 
 - `SOAC_BACKGROUND_JIT=0`
   Disable import-time background JIT compilation. Background JIT is enabled by
-  default for normal runtime use; pytest recipes default it off so correctness
-  runs do not accumulate asynchronous compile work across many short-lived test
-  modules.
+  default for normal runtime use; pytest and CPython regression-test recipes
+  default it off so correctness runs do not accumulate asynchronous compile
+  work across many short-lived test modules.
 
 - `SOAC_JIT_EMIT_REFCOUNTS=0`
   Disable generated JIT INCREF/DECREF emission by inlining the SOAC runtime

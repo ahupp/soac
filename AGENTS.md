@@ -543,10 +543,11 @@ explicit ordinary
   single-worker compilation for before/after timing comparisons.
 - `SOAC_BACKGROUND_JIT`
   Import-time background JIT compilation is enabled by default for ordinary
-  runtime use. `just pytest`, `just pytest-fast`, and `just test-all` default it
-  to `0` so correctness runs do not accumulate asynchronous compile work across
-  many short-lived transformed modules. Set `SOAC_BACKGROUND_JIT=1` when a test
-  or repro specifically needs the background compiler.
+  runtime use. `just pytest`, `just pytest-fast`, `just test-all`, and
+  `just run-cpython-tests` default it to `0` so correctness runs do not
+  accumulate asynchronous compile work across many short-lived transformed
+  modules. Set `SOAC_BACKGROUND_JIT=1` when a test or repro specifically needs
+  the background compiler.
 - `SOAC_JIT_EMIT_REFCOUNTS`
   Refcount emission is enabled by default. Set to `0`, `false`, `no`, or `off`
   to inline generated JIT INCREF/DECREF helper calls as no-ops. This is an
