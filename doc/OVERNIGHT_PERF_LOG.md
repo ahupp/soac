@@ -1,5 +1,39 @@
 # Overnight Performance Log
 
+## 2026-04-27 - Pass guarded owner type to trusted field store
+
+- baseline: `work/bench/uxwoxrqpzwzw_acb20ab139b0`
+  - specialized apply median: `588058 loops/s`
+  - specialized apply mean: `586858 loops/s`
+  - verify pass: `335249 loops/s`
+  - no-refcount diagnostic median: `762813 loops/s`
+  - latest summarized pystone code size: `66689 bytes`, `3918` machine blocks
+- observation: verify/apply counters showed indexed field stores hitting the
+  optimized path, and
+  `soac_runtime_store_field_indexed_inline_values_trusted` remained a large
+  profile symbol. The JIT had already guarded the owner type before calling the
+  helper, but the helper still reloaded the object type and checked static type
+  flags on every store.
+- attempted change: pass the guarded owner type into the trusted inline-values
+  store helper and use that type to compute split values, avoiding the helper's
+  object-type reload and static flag check.
+- rejected result: `work/bench/ywvrowvqypqz_a76c4bcb18f7`
+  - specialized apply median: `577401 loops/s` (`-1.81%`)
+  - specialized apply mean: `579276 loops/s` (`-1.29%`)
+  - verify pass: `335330 loops/s` (`+0.02%`)
+  - no-refcount diagnostic median: `759688 loops/s` (`-0.41%`)
+  - latest summarized pystone code size: `66711 bytes`, `3918` machine blocks
+  - code-size delta: `+22 bytes`, `+0` machine blocks
+- reason rejected: the extra helper argument and changed helper layout did not
+  reduce counters or blocks and made the refcount-enabled apply path slower.
+- validation before rejection: `just fmt-rust soac_jit` passed; `cargo fmt
+  --manifest-path crates/soac_jit_runtime/Cargo.toml` passed; `cargo check
+  --manifest-path crates/soac_jit_runtime/Cargo.toml` passed; `cargo check -p
+  soac_jit --tests` passed; `cargo test -p soac_jit indexed_field --
+  --nocapture` passed; `just benchmark` produced the rejected result above. The
+  implementation was then reverted.
+- next baseline: `work/bench/uxwoxrqpzwzw_acb20ab139b0`
+
 ## 2026-04-27 - Compact-int facts for module constants
 
 - baseline: `work/bench/uxwoxrqpzwzw_acb20ab139b0`
