@@ -1,5 +1,38 @@
 # Overnight Performance Log
 
+## 2026-04-27 - Compact-int facts for module constants
+
+- baseline: `work/bench/uxwoxrqpzwzw_acb20ab139b0`
+  - specialized apply median: `588058 loops/s`
+  - specialized apply mean: `586858 loops/s`
+  - verify pass: `335249 loops/s`
+  - no-refcount diagnostic median: `762813 loops/s`
+  - latest summarized pystone code size: `66689 bytes`, `3918` machine blocks
+- observation: the deep profile still showed time in `PyNumber_Add` and
+  `PyNumber_Subtract`, while pystone's lowered code includes several
+  local-plus-module-int-constant operations. The existing v3 exact-int planner
+  already has compact-int alternatives, but module constants were recorded only
+  as `i64` facts, not as exact compact-int facts.
+- attempted change: mark module int constants that fit a single CPython long
+  digit as exact compact-int planner facts, so the existing exact-int region
+  planner can recognize compact local-plus-constant shapes without adding a
+  codegen special case.
+- rejected result: `work/bench/llnpwxzyvwpu_ad35d9d0ec62`
+  - specialized apply median: `569038 loops/s` (`-3.23%`)
+  - specialized apply mean: `571155 loops/s` (`-2.68%`)
+  - verify pass: `348108 loops/s` (`+3.84%`)
+  - no-refcount diagnostic median: `754760 loops/s` (`-1.06%`)
+  - latest summarized pystone code size: `66689 bytes`, `3918` machine blocks
+  - code-size delta: `+0 bytes`, `+0` machine blocks
+- reason rejected: the fact change did not alter pystone code size or
+  specialization counters, and the refcount-enabled apply median regressed
+  materially. The verify improvement is not enough to justify keeping it.
+- validation before rejection: `just fmt-rust soac_opt` passed; `cargo test -p
+  soac_opt evidence_v3 -- --nocapture` passed; `cargo check -p soac_jit
+  --tests` passed; `just benchmark` produced the rejected result above. The
+  implementation was then reverted.
+- next baseline: `work/bench/uxwoxrqpzwzw_acb20ab139b0`
+
 ## 2026-04-27 - Inline trusted split insertion-order update
 
 - baseline: `work/bench/uxwoxrqpzwzw_acb20ab139b0`
