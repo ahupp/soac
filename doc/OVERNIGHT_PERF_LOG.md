@@ -1,5 +1,39 @@
 # Overnight Performance Log
 
+## 2026-04-27 - Compact ASCII exact-string compare fast path
+
+- baseline: `work/bench/qkzxlxtsvpuq_addfd7675506`
+  - specialized apply median: `566978 loops/s`
+  - specialized apply mean: `568132 loops/s`
+  - verify pass: `340618 loops/s`
+  - no-refcount diagnostic median: `736336 loops/s`
+  - latest summarized pystone code size: `65372 bytes`, `3862` machine blocks
+- observation: the mapped profile still showed `PyUnicode_Compare`,
+  `PyObject_RichCompare`, and `memcmp` time even though exact-string comparison
+  was already selected by v3. Pystone has hot one-character ASCII comparisons
+  in `Func1`, `Func2`, and the `CharIndex <= Char2Glob` loop.
+- kept change: keep the existing v3 exact-Unicode compare plan and exact
+  `PyUnicode_Type` guards, but have compare-to-bool codegen first handle
+  pointer-equal operands and compact ASCII one-character operands directly. All
+  other exact-Unicode cases still call `PyUnicode_Compare`, and guard misses use
+  the existing local generic fallback.
+- result: `work/bench/moqnnqssmupy_c337b6282dc2`
+  - specialized apply median: `575641 loops/s` (`+1.53%`)
+  - specialized apply mean: `574805 loops/s` (`+1.17%`)
+  - verify pass: `327070 loops/s` (`-3.98%`)
+  - no-refcount diagnostic median: `755874 loops/s` (`+2.65%`)
+  - latest summarized pystone code size: `66581 bytes`, `3908` machine blocks
+  - code-size delta: `+1209 bytes`, `+46` machine blocks
+- reason kept: production apply throughput improved materially and the
+  no-refcount diagnostic improved as well. The tradeoff is a larger exact-string
+  compare shape and a slower verify pass, so future work should make the
+  compact-ASCII arm more selective if code size becomes the limiting metric.
+- validation: `just fmt-rust soac_jit` passed; `cargo test -p soac_jit
+  specialized_jit_opt_v3_exact_str_branch_uses_unicode_compare -- --nocapture`
+  passed; `cargo check -p soac_jit --tests` passed; `just benchmark` produced
+  the kept result above.
+- next baseline: `work/bench/moqnnqssmupy_c337b6282dc2`
+
 ## 2026-04-27 - Exact compact-int true division specialization
 
 - baseline: `work/bench/qkzxlxtsvpuq_addfd7675506`

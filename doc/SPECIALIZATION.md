@@ -758,14 +758,16 @@ access goes through the CPython item APIs.
   and emit a direct integer comparison instead of generic
   `PyObject_RichCompare` lowering.
 - If the profiled shape is exact `str`/`str`, the hot path guards both operands
-  against exact `PyUnicode_Type` and calls `PyUnicode_Compare`. In an
-  `I32Bool01` branch context this avoids allocation of the intermediate Python
-  bool and the follow-on truthiness helper; when an object result is demanded,
-  the scalar comparison result is materialized as the Python bool singleton.
-  Operand inputs may be locals/cells, module string constants, or profiled
-  indexed module-global loads. The hot indexed-global input borrows directly
-  from the guarded module-dict slot; the local fallback reloads the global with
-  the normal owned global-load path before running generic Python comparison.
+  against exact `PyUnicode_Type`. `I32Bool01` compare-to-bool lowering first
+  handles pointer-equal operands and compact ASCII one-character operands
+  directly, then falls back to `PyUnicode_Compare` for the general exact-Unicode
+  case. This avoids allocation of the intermediate Python bool and the follow-on
+  truthiness helper; when an object result is demanded, the scalar comparison
+  result is materialized as the Python bool singleton. Operand inputs may be
+  locals/cells, module string constants, or profiled indexed module-global
+  loads. The hot indexed-global input borrows directly from the guarded
+  module-dict slot; the local fallback reloads the global with the normal owned
+  global-load path before running generic Python comparison.
 - When the comparison is consumed by `I32Bool01` demand, such as an
   `if` condition, the profiled exact-int path guards compact exact `PyLong`
   layout, unboxes both operands, emits a direct integer comparison, and

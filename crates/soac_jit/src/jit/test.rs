@@ -7864,6 +7864,29 @@ def write_point(point, value):
             .sum()
     }
 
+    fn count_load_results_of_type(function: &ir::Function, ty: ir::Type) -> usize {
+        function
+            .layout
+            .blocks()
+            .map(|block| {
+                function
+                    .layout
+                    .block_insts(block)
+                    .filter(|inst| {
+                        if function.dfg.insts[*inst].opcode() != ir::Opcode::Load {
+                            return false;
+                        }
+                        function
+                            .dfg
+                            .inst_results(*inst)
+                            .first()
+                            .is_some_and(|result| function.dfg.value_type(*result) == ty)
+                    })
+                    .count()
+            })
+            .sum()
+    }
+
     fn count_symbolic_global_values(function: &ir::Function) -> usize {
         function
             .global_values
@@ -14857,7 +14880,11 @@ def f(x):
         assert_eq!(
             count_direct_calls_to_runtime_helpers(&built.ctx.func, &unicode_compare),
             1,
-            "v3 exact-str branch should emit the selected direct unicode comparison"
+            "v3 exact-str branch should keep the generic exact-unicode fallback comparison"
+        );
+        assert!(
+            count_load_results_of_type(&built.ctx.func, ir::types::I8) >= 2,
+            "v3 exact-str branch should emit compact-ASCII character loads for the inline path"
         );
         let generic_compare = import_user_names_for_symbols(&built, &["PyObject_RichCompareBool"]);
         assert_eq!(

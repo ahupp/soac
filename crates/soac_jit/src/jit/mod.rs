@@ -5713,6 +5713,14 @@ struct RawPyDictSplitValuesForJit {
     values: [*mut ffi::PyObject; 1],
 }
 
+#[repr(C)]
+struct RawPyASCIIObjectForJit {
+    ob_base: ffi::PyObject,
+    length: ffi::Py_ssize_t,
+    hash: ffi::Py_hash_t,
+    state: u32,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_trusted_inline_values_field_probe(
     fb: &mut FunctionBuilder<'_>,
@@ -13976,17 +13984,15 @@ fn emit_opt_v3_mechanical_operation(
                 emit_ctx,
                 codegen_env,
             )?;
-            let compare_ref =
-                func_imports.get(codegen_env, &mut fb.func, &PYUNICODE_COMPARE_IMPORT)?;
-            let call = fb.ins().call(compare_ref, &[lhs, rhs]);
-            let compare_result = fb.inst_results(call)[0];
-            let compare_zero = fb.ins().iconst(emit_ctx.consts.i32_ty, 0);
-            let cond = fb
-                .ins()
-                .icmp(opt_v3_rich_compare_intcc(op), compare_result, compare_zero);
-            let zero = fb.ins().iconst(emit_ctx.consts.i32_ty, 0);
-            let one = fb.ins().iconst(emit_ctx.consts.i32_ty, 1);
-            let result = fb.ins().select(cond, one, zero);
+            let result = emit_opt_v3_exact_unicode_compare_bool(
+                fb,
+                emit_ctx,
+                codegen_env,
+                func_imports,
+                lhs,
+                rhs,
+                op,
+            )?;
             opt_v3_store_mechanical_value(values, output, OptV3MechanicalValue::I32Bool01(result))
         }
         MechanicalCodegenOperation::CheckedI64Add
@@ -14268,6 +14274,155 @@ fn opt_v3_rich_compare_intcc(op: RichCompareOp) -> ir::condcodes::IntCC {
         RichCompareOp::Gt => ir::condcodes::IntCC::SignedGreaterThan,
         RichCompareOp::Ge => ir::condcodes::IntCC::SignedGreaterThanOrEqual,
     }
+}
+
+fn emit_i32_bool01_from_condition(
+    fb: &mut FunctionBuilder<'_>,
+    emit_ctx: &JitEmitCtx<'_>,
+    condition: ir::Value,
+) -> ir::Value {
+    let zero = fb.ins().iconst(emit_ctx.consts.i32_ty, 0);
+    let one = fb.ins().iconst(emit_ctx.consts.i32_ty, 1);
+    fb.ins().select(condition, one, zero)
+}
+
+fn emit_opt_v3_rich_compare_bool01_from_i32_compare_result(
+    fb: &mut FunctionBuilder<'_>,
+    emit_ctx: &JitEmitCtx<'_>,
+    op: RichCompareOp,
+    compare_result: ir::Value,
+) -> ir::Value {
+    let compare_zero = fb.ins().iconst(emit_ctx.consts.i32_ty, 0);
+    let condition = fb
+        .ins()
+        .icmp(opt_v3_rich_compare_intcc(op), compare_result, compare_zero);
+    emit_i32_bool01_from_condition(fb, emit_ctx, condition)
+}
+
+fn emit_opt_v3_exact_unicode_compare_bool(
+    fb: &mut FunctionBuilder<'_>,
+    emit_ctx: &JitEmitCtx<'_>,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+    lhs: ir::Value,
+    rhs: ir::Value,
+    op: RichCompareOp,
+) -> Result<ir::Value, String> {
+    const PY_UNICODE_STATE_COMPACT_MASK: i64 = 1 << 5;
+    const PY_UNICODE_STATE_ASCII_MASK: i64 = 1 << 6;
+    const PY_UNICODE_COMPACT_ASCII_MASK: i64 =
+        PY_UNICODE_STATE_COMPACT_MASK | PY_UNICODE_STATE_ASCII_MASK;
+    const PYASCII_LENGTH_OFFSET: i32 = offset_of!(RawPyASCIIObjectForJit, length) as i32;
+    const PYASCII_STATE_OFFSET: i32 = offset_of!(RawPyASCIIObjectForJit, state) as i32;
+    const PYASCII_DATA_OFFSET: i32 = std::mem::size_of::<RawPyASCIIObjectForJit>() as i32;
+
+    let done_block = fb.create_block();
+    let same_object_block = fb.create_block();
+    let ascii_probe_block = fb.create_block();
+    let ascii_compare_block = fb.create_block();
+    let unicode_compare_block = fb.create_block();
+    fb.append_block_param(done_block, emit_ctx.consts.i32_ty);
+
+    let same_object = fb.ins().icmp(ir::condcodes::IntCC::Equal, lhs, rhs);
+    fb.ins()
+        .brif(same_object, same_object_block, &[], ascii_probe_block, &[]);
+
+    fb.switch_to_block(same_object_block);
+    let equal_compare_result = fb.ins().iconst(emit_ctx.consts.i32_ty, 0);
+    let same_result = emit_opt_v3_rich_compare_bool01_from_i32_compare_result(
+        fb,
+        emit_ctx,
+        op,
+        equal_compare_result,
+    );
+    fb.ins()
+        .jump(done_block, &[ir::BlockArg::Value(same_result)]);
+
+    fb.switch_to_block(ascii_probe_block);
+    let lhs_len = fb.ins().load(
+        emit_ctx.consts.ptr_ty,
+        ir::MemFlags::trusted(),
+        lhs,
+        PYASCII_LENGTH_OFFSET,
+    );
+    let rhs_len = fb.ins().load(
+        emit_ctx.consts.ptr_ty,
+        ir::MemFlags::trusted(),
+        rhs,
+        PYASCII_LENGTH_OFFSET,
+    );
+    let lhs_len_one = fb.ins().icmp_imm(ir::condcodes::IntCC::Equal, lhs_len, 1);
+    let rhs_len_one = fb.ins().icmp_imm(ir::condcodes::IntCC::Equal, rhs_len, 1);
+    let both_len_one = fb.ins().band(lhs_len_one, rhs_len_one);
+
+    let lhs_state = fb.ins().load(
+        emit_ctx.consts.i32_ty,
+        ir::MemFlags::trusted(),
+        lhs,
+        PYASCII_STATE_OFFSET,
+    );
+    let rhs_state = fb.ins().load(
+        emit_ctx.consts.i32_ty,
+        ir::MemFlags::trusted(),
+        rhs,
+        PYASCII_STATE_OFFSET,
+    );
+    let compact_ascii_mask = fb
+        .ins()
+        .iconst(emit_ctx.consts.i32_ty, PY_UNICODE_COMPACT_ASCII_MASK);
+    let lhs_ascii_bits = fb.ins().band(lhs_state, compact_ascii_mask);
+    let rhs_ascii_bits = fb.ins().band(rhs_state, compact_ascii_mask);
+    let lhs_is_compact_ascii = fb.ins().icmp(
+        ir::condcodes::IntCC::Equal,
+        lhs_ascii_bits,
+        compact_ascii_mask,
+    );
+    let rhs_is_compact_ascii = fb.ins().icmp(
+        ir::condcodes::IntCC::Equal,
+        rhs_ascii_bits,
+        compact_ascii_mask,
+    );
+    let both_compact_ascii = fb.ins().band(lhs_is_compact_ascii, rhs_is_compact_ascii);
+    let can_compare_inline = fb.ins().band(both_len_one, both_compact_ascii);
+    fb.ins().brif(
+        can_compare_inline,
+        ascii_compare_block,
+        &[],
+        unicode_compare_block,
+        &[],
+    );
+
+    fb.switch_to_block(ascii_compare_block);
+    let lhs_char = fb.ins().load(
+        ir::types::I8,
+        ir::MemFlags::trusted(),
+        lhs,
+        PYASCII_DATA_OFFSET,
+    );
+    let rhs_char = fb.ins().load(
+        ir::types::I8,
+        ir::MemFlags::trusted(),
+        rhs,
+        PYASCII_DATA_OFFSET,
+    );
+    let char_condition = fb
+        .ins()
+        .icmp(opt_v3_rich_compare_intcc(op), lhs_char, rhs_char);
+    let char_result = emit_i32_bool01_from_condition(fb, emit_ctx, char_condition);
+    fb.ins()
+        .jump(done_block, &[ir::BlockArg::Value(char_result)]);
+
+    fb.switch_to_block(unicode_compare_block);
+    let compare_ref = func_imports.get(codegen_env, &mut fb.func, &PYUNICODE_COMPARE_IMPORT)?;
+    let call = fb.ins().call(compare_ref, &[lhs, rhs]);
+    let compare_result = fb.inst_results(call)[0];
+    let unicode_result =
+        emit_opt_v3_rich_compare_bool01_from_i32_compare_result(fb, emit_ctx, op, compare_result);
+    fb.ins()
+        .jump(done_block, &[ir::BlockArg::Value(unicode_result)]);
+
+    fb.switch_to_block(done_block);
+    Ok(fb.block_params(done_block)[0])
 }
 
 fn opt_v3_rich_compare_op_code(op: RichCompareOp) -> i32 {
