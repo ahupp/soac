@@ -1,5 +1,36 @@
 # Overnight Performance Log
 
+## 2026-04-27 - Effect-only indexed global store helper
+
+- baseline: `work/bench/uxwoxrqpzwzw_acb20ab139b0`
+  - specialized apply median: `588058 loops/s`
+  - specialized apply mean: `586858 loops/s`
+  - verify pass: `335249 loops/s`
+  - no-refcount diagnostic median: `762813 loops/s`
+  - latest summarized pystone code size: `66689 bytes`, `3918` machine blocks
+- observation: pystone has hot global assignments whose statement results are
+  discarded, while the existing indexed global-store helper returns an owned
+  stored value that effect-only code immediately decrefs.
+- attempted change: add a no-result indexed global-store helper and route
+  typed effect-only global stores with indexed plans through it, falling back to
+  the existing generic store helper on guard miss.
+- rejected result: `work/bench/osokoxrkktzp_bb928d1d8841`
+  - specialized apply median: `563073 loops/s` (`-4.25%`)
+  - specialized apply mean: `561238 loops/s` (`-4.37%`)
+  - verify pass: `344982 loops/s` (`+2.90%`)
+  - no-refcount diagnostic median: `757510 loops/s` (`-0.70%`)
+  - latest summarized pystone code size: `66357 bytes`, `3861` machine blocks
+  - code-size delta: `-332 bytes`, `-57` machine blocks
+- reason rejected: code size improved, but the refcount-enabled apply path
+  regressed substantially, so the branch/helper shape cost more than the
+  eliminated result ownership.
+- validation before rejection: `just fmt-rust soac_jit` passed; `cargo fmt
+  --manifest-path crates/soac_jit_runtime/Cargo.toml` passed; `cargo check -p
+  soac_jit --tests` passed; `cargo test -p soac_jit indexed_global_store --
+  --nocapture` passed; `just benchmark` produced the rejected result above.
+  The implementation was then reverted.
+- next baseline: `work/bench/uxwoxrqpzwzw_acb20ab139b0`
+
 ## 2026-04-27 - Runtime guard-miss deopt for v3 plans
 
 - baseline: `work/bench/uxwoxrqpzwzw_acb20ab139b0`
