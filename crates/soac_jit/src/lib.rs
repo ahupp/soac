@@ -1169,6 +1169,7 @@ unsafe fn register_owner_types_from_type(
     module_name: *mut ffi::PyObject,
     visited_types: &mut HashSet<usize>,
     shared_state: Option<&module_type::SharedModuleState>,
+    module_runtime: Option<&ModuleRuntimeContext>,
 ) -> Result<(), ()> {
     if owner_type.is_null() || !visited_types.insert(owner_type as usize) {
         return Ok(());
@@ -1187,6 +1188,7 @@ unsafe fn register_owner_types_from_type(
         return Ok(());
     }
     let mut constructor_function_id = None;
+    let mut constructor_init_function = ptr::null_mut();
     let mut pos: ffi::Py_ssize_t = 0;
     let mut key = ptr::null_mut();
     let mut value = ptr::null_mut();
@@ -1203,6 +1205,7 @@ unsafe fn register_owner_types_from_type(
                         ),
                         None => Some(init_function_id),
                     };
+                    constructor_init_function = value;
                 }
             }
             register_owner_type_for_function(value, owner_type)?;
@@ -1212,17 +1215,29 @@ unsafe fn register_owner_types_from_type(
                 module_name,
                 visited_types,
                 shared_state,
+                module_runtime,
             )?;
         }
     }
     if let Some(function_id) = constructor_function_id {
+        let mut metadata = ptr::null_mut();
+        let mut metadata_destructor: Option<unsafe extern "C" fn(*mut c_void)> = None;
+        if let Some(module_runtime) = module_runtime {
+            let owned_runtime = clone_module_runtime_context(module_runtime)?;
+            metadata =
+                make_clif_function_data(constructor_init_function, function_id, owned_runtime)?;
+            metadata_destructor = Some(free_clif_function_data);
+        }
         if PyType_SetSoacMetadata(
             owner_type as *mut ffi::PyObject,
             function_id.to_packed_runtime_u64(),
-            ptr::null_mut(),
-            None,
+            metadata,
+            metadata_destructor,
         ) != 0
         {
+            if !metadata.is_null() {
+                free_clif_function_data(metadata);
+            }
             return Err(());
         }
     }
@@ -1234,6 +1249,7 @@ unsafe fn register_function_owner_type_value(
     module_name: *mut ffi::PyObject,
     visited_types: &mut HashSet<usize>,
     shared_state: Option<&module_type::SharedModuleState>,
+    module_runtime: Option<&ModuleRuntimeContext>,
 ) -> Result<(), ()> {
     if ffi::PyType_Check(value) != 0 {
         register_owner_types_from_type(
@@ -1241,6 +1257,7 @@ unsafe fn register_function_owner_type_value(
             module_name,
             visited_types,
             shared_state,
+            module_runtime,
         )?;
     }
     Ok(())
@@ -1252,6 +1269,7 @@ unsafe fn register_function_owner_type_indexed_key(
     key: &str,
     visited_types: &mut HashSet<usize>,
     shared_state: Option<&module_type::SharedModuleState>,
+    module_runtime: Option<&ModuleRuntimeContext>,
 ) -> Result<(), ()> {
     let key_obj = ffi::PyUnicode_FromStringAndSize(
         key.as_ptr().cast::<c_char>(),
@@ -1276,8 +1294,13 @@ unsafe fn register_function_owner_type_indexed_key(
     if found == 0 {
         return Ok(());
     }
-    let result =
-        register_function_owner_type_value(value, module_name, visited_types, shared_state);
+    let result = register_function_owner_type_value(
+        value,
+        module_name,
+        visited_types,
+        shared_state,
+        module_runtime,
+    );
     ffi::Py_DECREF(value);
     result
 }
@@ -1287,6 +1310,7 @@ unsafe fn register_function_owner_types_for_globals(
     module_name: *mut ffi::PyObject,
     indexed_module_keys: &[String],
     shared_state: Option<&module_type::SharedModuleState>,
+    module_runtime: Option<&ModuleRuntimeContext>,
 ) -> Result<(), ()> {
     if globals.is_null() {
         if ffi::PyErr_Occurred().is_null() {
@@ -1309,7 +1333,13 @@ unsafe fn register_function_owner_types_for_globals(
     let mut key = ptr::null_mut();
     let mut value = ptr::null_mut();
     while ffi::PyDict_Next(globals, &mut pos, &mut key, &mut value) != 0 {
-        register_function_owner_type_value(value, module_name, &mut visited_types, shared_state)?;
+        register_function_owner_type_value(
+            value,
+            module_name,
+            &mut visited_types,
+            shared_state,
+            module_runtime,
+        )?;
     }
     for key in indexed_module_keys {
         register_function_owner_type_indexed_key(
@@ -1318,6 +1348,7 @@ unsafe fn register_function_owner_types_for_globals(
             key.as_str(),
             &mut visited_types,
             shared_state,
+            module_runtime,
         )?;
     }
     Ok(())
@@ -1339,7 +1370,7 @@ pub unsafe fn register_function_owner_types_for_module(
     } else {
         ffi::PyDict_GetItemString(globals, c"__name__".as_ptr())
     };
-    register_function_owner_types_for_globals(globals, module_name, &[], None)
+    register_function_owner_types_for_globals(globals, module_name, &[], None, None)
 }
 
 pub unsafe fn register_function_owner_types_for_module_keys(
@@ -1359,13 +1390,14 @@ pub unsafe fn register_function_owner_types_for_module_keys(
     } else {
         ffi::PyDict_GetItemString(globals, c"__name__".as_ptr())
     };
-    register_function_owner_types_for_globals(globals, module_name, indexed_module_keys, None)
+    register_function_owner_types_for_globals(globals, module_name, indexed_module_keys, None, None)
 }
 
 pub unsafe fn register_function_owner_types_for_module_keys_with_constructor_entries(
     module: *mut ffi::PyObject,
     indexed_module_keys: &[String],
     shared_state: &module_type::SharedModuleState,
+    module_runtime: &ModuleRuntimeContext,
 ) -> Result<(), ()> {
     if module.is_null() {
         ffi::PyErr_SetString(
@@ -1385,6 +1417,7 @@ pub unsafe fn register_function_owner_types_for_module_keys_with_constructor_ent
         module_name,
         indexed_module_keys,
         Some(shared_state),
+        Some(module_runtime),
     )
 }
 
@@ -1954,10 +1987,8 @@ pub(crate) unsafe extern "C" fn direct_compile_function_env(
     data_ptr: *mut c_void,
 ) -> *mut c_void {
     match panic::catch_unwind(AssertUnwindSafe(|| {
-        if callable.is_null()
-            || data_ptr.is_null()
-            || ffi::PyFunction_Check(callable as *mut ffi::PyObject) == 0
-        {
+        let _ = callable;
+        if data_ptr.is_null() {
             ffi::PyErr_SetString(
                 ffi::PyExc_RuntimeError,
                 b"invalid direct function env compile input\0".as_ptr() as *const i8,

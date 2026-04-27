@@ -97,7 +97,7 @@ def test_apply_mode_direct_call_failure_preserves_exception(tmp_path: Path) -> N
     assert result == ["Marker", "boom", True]
 
 
-def test_apply_mode_constructor_failure_preserves_exception_without_v3_constructor_fast_path(
+def test_apply_mode_constructor_entry_failure_preserves_exception(
     tmp_path: Path,
 ) -> None:
     result, rows = _run_apply_module(
@@ -124,8 +124,43 @@ def test_apply_mode_constructor_failure_preserves_exception_without_v3_construct
         for row in rows
         if row.get("target") == "soac_jit_direct_edges" and row.get("clif_direct_edges", 0) > 0
     ]
-    assert not direct_edge_rows, rows
+    assert direct_edge_rows, rows
     assert result == ["Marker", "boom:7", True]
+
+
+def test_apply_mode_constructor_entry_custom_new_uses_generic_fallback(
+    tmp_path: Path,
+) -> None:
+    result, rows = _run_apply_module(
+        tmp_path,
+        "direct_constructor_custom_new_fallback",
+        """
+        events = []
+
+        class Custom:
+            def __new__(cls, value):
+                events.append(f"new:{value}")
+                obj = object.__new__(cls)
+                obj.from_new = value + 1
+                return obj
+
+            def __init__(self, value):
+                events.append(f"init:{value}:{self.from_new}")
+                self.value = value
+
+        def run():
+            obj = Custom(5)
+            return [events, obj.value, obj.from_new]
+        """,
+    )
+
+    direct_edge_rows = [
+        row
+        for row in rows
+        if row.get("target") == "soac_jit_direct_edges" and row.get("clif_direct_edges", 0) > 0
+    ]
+    assert direct_edge_rows, rows
+    assert result == [["new:5", "init:5:6"], 5, 6]
 
 
 def test_apply_mode_direct_call_miss_uses_generic_fallback(tmp_path: Path) -> None:

@@ -1,14 +1,20 @@
 use soac_core::block_py::{BlockPyFunction, ChildVisitable, RuntimeFunctionId, Visit};
-use soac_ir_blockpy::{CodegenModuleShape, InstrCodegen};
+use soac_ir_blockpy::{
+    CodegenModuleShape, InstrCodegen, constructor_init_function_id_for_entry_function,
+};
 use soac_ir_typed::{InstrTyped, TypedCodegenModuleShape, TypedDirectCallableCallGuard};
 use std::collections::HashSet;
 
 use super::typed_pipeline::JitModulePlan;
 
 pub(super) fn collect_call_direct_targets(
-    _function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<CodegenModuleShape>,
 ) -> HashSet<RuntimeFunctionId> {
-    HashSet::new()
+    let mut out = HashSet::new();
+    if let Some(init_function_id) = constructor_init_function_id_for_entry_function(function) {
+        out.insert(init_function_id);
+    }
+    out
 }
 
 pub(super) fn collect_typed_call_direct_targets(
@@ -46,6 +52,9 @@ pub(super) fn collect_typed_call_direct_targets(
     }
 
     let mut out = HashSet::new();
+    if let Some(init_function_id) = constructor_init_function_id_for_entry_function(function) {
+        out.insert(init_function_id);
+    }
     let mut collector = CallDirectTargetCollector { out: &mut out };
     collector.visit_fn(function);
     out

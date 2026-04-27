@@ -1,9 +1,10 @@
 use crate::passes::ast_to_ast::body::Suite;
 use crate::template::py_stmt;
-use soac_core::block_py::{ChildVisitable, FunctionExecutionMode, PrettyPrint, Visit};
+use soac_core::block_py::{BlockTerm, ChildVisitable, FunctionExecutionMode, PrettyPrint, Visit};
 use soac_core::pass_tracker::{PassTracker, RecordingPassTracker};
 use soac_ir_blockpy::{
     constructor_entry_function_id_for_init, InstrCodegen, CONSTRUCTOR_ENTRY_FUNCTION_NAME,
+    CONSTRUCTOR_ENTRY_TYPE_PARAM_NAME,
 };
 
 #[derive(Clone)]
@@ -99,26 +100,31 @@ fn class_lowering_adds_constructor_entry_function() {
         .expect("lowered __init__ should exist");
     let constructor_entry_function_id =
         constructor_entry_function_id_for_init(&lowered, init_function.function_id)
-            .expect("constructor entry placeholder should be associated with __init__");
+            .expect("constructor entry should be associated with __init__");
     let constructor_entry = lowered
         .callable_defs
         .iter()
         .find(|function| function.function_id == constructor_entry_function_id)
-        .expect("constructor entry placeholder should exist");
+        .expect("constructor entry should exist");
 
     assert_ne!(constructor_entry.function_id, init_function.function_id);
     assert_eq!(
         constructor_entry.names.fn_name,
         CONSTRUCTOR_ENTRY_FUNCTION_NAME
     );
-    assert_eq!(
-        constructor_entry.execution_mode,
-        FunctionExecutionMode::Interpreted
-    );
+    assert_eq!(constructor_entry.execution_mode, FunctionExecutionMode::Jit);
     assert_eq!(
         constructor_entry.params.names(),
-        vec!["value".to_string(), "scale".to_string()]
+        vec![
+            CONSTRUCTOR_ENTRY_TYPE_PARAM_NAME.to_string(),
+            "value".to_string(),
+            "scale".to_string()
+        ]
     );
+    assert!(matches!(
+        constructor_entry.blocks[0].term,
+        BlockTerm::Return(InstrCodegen::Call(_))
+    ));
 }
 
 #[derive(Default)]

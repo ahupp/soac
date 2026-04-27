@@ -77,6 +77,10 @@ def tuple_from_iter(value):
     return _builtins.tuple(value)
 
 
+def constructor_call(cls, /, *args, **kwargs):
+    return cls(*args, **kwargs)
+
+
 def aiter(obj):
     try:
         aiter_fn = obj.__aiter__

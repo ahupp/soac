@@ -16,7 +16,10 @@ use soac_core::block_py::{
     InstrKey, InstrLocationMap, LocalLocation, ModuleShape, NameLocation, ResolvedName,
     RuntimeFunctionId, RuntimeName, StorageLayout, Store, Visit, current_instr_locations,
 };
-use soac_ir_blockpy::{CodegenModuleShape, InstrCodegen};
+use soac_ir_blockpy::{
+    CodegenModuleShape, InstrCodegen, constructor_init_function_id_for_entry_function,
+    is_constructor_entry_function,
+};
 use soac_ir_typed::emit_v3::{
     MechanicalCodegenConversion, MechanicalCodegenOperation, MechanicalCodegenStep,
     MechanicalExitKind, MechanicalRegionEmission,
@@ -258,14 +261,17 @@ thread_local! {
 #[cfg(test)]
 use imports::predeclare_typed_direct_call_imports;
 use imports::{
-    DP_JIT_DECREF_IMPORT, DP_JIT_DEOPT_RESUME_IMPORT, DP_JIT_DIRECT_COMPILE_FUNCTION_ENV_IMPORT,
-    DP_JIT_ENTER_RECURSIVE_CALL_IMPORT, DP_JIT_INCREF_IMPORT, DP_JIT_IS_TRUE_IMPORT,
-    DP_JIT_LOAD_CELL_IMPORT, DP_JIT_LOAD_RUNTIME_OBJ_BY_ID_IMPORT, DP_JIT_MAKE_CELL_IMPORT,
+    DP_JIT_CONSTRUCTOR_GENERIC_ALLOC_SUPPORTED_IMPORT, DP_JIT_DECREF_IMPORT,
+    DP_JIT_DEOPT_RESUME_IMPORT, DP_JIT_DIRECT_COMPILE_FUNCTION_ENV_IMPORT,
+    DP_JIT_ENTER_RECURSIVE_CALL_IMPORT, DP_JIT_FINISH_CONSTRUCTOR_INIT_IMPORT,
+    DP_JIT_INCREF_IMPORT, DP_JIT_IS_TRUE_IMPORT, DP_JIT_LOAD_CELL_IMPORT,
+    DP_JIT_LOAD_RUNTIME_OBJ_BY_ID_IMPORT, DP_JIT_MAKE_CELL_IMPORT,
     DP_JIT_POP_HANDLED_EXCEPTION_IMPORT, DP_JIT_PUSH_HANDLED_EXCEPTION_IMPORT,
     DP_JIT_PY_CALL_OBJECT_IMPORT, DP_JIT_PY_CALL_POSITIONAL_THREE_IMPORT,
     DP_JIT_PY_CALL_WITH_KW_IMPORT, DP_JIT_PY_VECTORCALL_IMPORT, DP_JIT_PYOBJECT_GETATTR_IMPORT,
     DP_JIT_PYOBJECT_GETITEM_IMPORT, DP_JIT_PYOBJECT_SETATTR_IMPORT, DP_JIT_PYOBJECT_SETITEM_IMPORT,
-    DP_JIT_PYOBJECT_TO_I64_IMPORT, DP_JIT_RAISE_FROM_EXC_IMPORT, DP_JIT_RAISE_I64_OVERFLOW_IMPORT,
+    DP_JIT_PYOBJECT_TO_I64_IMPORT, DP_JIT_PYTYPE_GENERIC_ALLOC_IMPORT,
+    DP_JIT_RAISE_FROM_EXC_IMPORT, DP_JIT_RAISE_I64_OVERFLOW_IMPORT,
     DP_JIT_RAISE_SUPER_ARG_DELETED_IMPORT, DP_JIT_RAISE_UNBOUND_LOCAL_ERROR_IMPORT,
     DP_JIT_RECORD_TOP_VALUE_SAMPLE_IMPORT, DP_JIT_STORE_CELL_IMPORT, ImportSpec, ModuleFuncImports,
     PYLONG_FROM_LONGLONG_IMPORT, PYNUMBER_ADD_IMPORT, PYNUMBER_AND_IMPORT,
@@ -972,12 +978,42 @@ fn emit_codegen_super_helper_call_with_local_env(
 fn emit_resolved_direct_function_metadata_and_env(
     fb: &mut FunctionBuilder<'_>,
     callable: ir::Value,
+    target_function: &BlockPyFunction<impl ModuleShape>,
     ctx: &JitEmitCtx<'_>,
 ) -> (ir::Value, ir::Value) {
+    #[repr(C)]
+    struct PyHeapTypeObjectSoacPrefix {
+        ht_type: ffi::PyTypeObject,
+        as_async: ffi::PyAsyncMethods,
+        as_number: ffi::PyNumberMethods,
+        as_mapping: ffi::PyMappingMethods,
+        as_sequence: ffi::PySequenceMethods,
+        as_buffer: ffi::PyBufferProcs,
+        ht_name: *mut ffi::PyObject,
+        ht_slots: *mut ffi::PyObject,
+        ht_qualname: *mut ffi::PyObject,
+        ht_cached_keys: *mut std::ffi::c_void,
+        ht_module: *mut ffi::PyObject,
+        ht_tpname: *mut i8,
+        ht_token: *mut std::ffi::c_void,
+        ht_soac_metadata: *mut std::ffi::c_void,
+        ht_soac_metadata_destructor: *mut std::ffi::c_void,
+        ht_soac_function_id: u64,
+    }
+
     let ptr_ty = ctx.consts.ptr_ty;
     let null_ptr = fb.ins().iconst(ptr_ty, 0);
 
-    let metadata = load_py_function_soac_metadata_obj(fb, ptr_ty, callable);
+    let metadata = if is_constructor_entry_function(target_function) {
+        fb.ins().load(
+            ptr_ty,
+            ir::MemFlags::trusted(),
+            callable,
+            offset_of!(PyHeapTypeObjectSoacPrefix, ht_soac_metadata) as i32,
+        )
+    } else {
+        load_py_function_soac_metadata_obj(fb, ptr_ty, callable)
+    };
     let metadata_is_null = fb
         .ins()
         .icmp(ir::condcodes::IntCC::Equal, metadata, null_ptr);
@@ -1245,6 +1281,9 @@ struct JitEmitCtx<'mc> {
     load_runtime_obj_by_id_ref: ir::FuncRef,
     enter_recursive_ref: ir::FuncRef,
     direct_compile_function_env_ref: ir::FuncRef,
+    constructor_generic_alloc_supported_ref: ir::FuncRef,
+    pytype_generic_alloc_ref: ir::FuncRef,
+    finish_constructor_init_ref: ir::FuncRef,
     pyobject_getattr_ref: ir::FuncRef,
     pyobject_setattr_ref: ir::FuncRef,
     pyobject_getitem_ref: ir::FuncRef,
@@ -5690,6 +5729,8 @@ fn emit_callee_function_id_checked(
     const PYFUNCTION_SOAC_FUNCTION_ID_OFFSET: i32 =
         offset_of!(PyFunctionObjectSoacPrefix, func_soac_function_id) as i32;
     const PYTYPE_TP_FLAGS_OFFSET: i32 = offset_of!(ffi::PyTypeObject, tp_flags) as i32;
+    const PYHEAPTYPE_SOAC_METADATA_OFFSET: i32 =
+        offset_of!(PyHeapTypeObjectSoacPrefix, ht_soac_metadata) as i32;
     const PYHEAPTYPE_SOAC_FUNCTION_ID_OFFSET: i32 =
         offset_of!(PyHeapTypeObjectSoacPrefix, ht_soac_function_id) as i32;
 
@@ -5801,6 +5842,23 @@ fn emit_callee_function_id_checked(
         .brif(is_heap_type, nonzero_type_id_block, &[], miss_block, &[]);
 
     fb.switch_to_block(nonzero_type_id_block);
+    let metadata = fb.ins().load(
+        ptr_ty,
+        ir::MemFlags::trusted(),
+        callable,
+        PYHEAPTYPE_SOAC_METADATA_OFFSET,
+    );
+    let metadata_is_null = fb.ins().icmp_imm(ir::condcodes::IntCC::Equal, metadata, 0);
+    let type_metadata_done_block = fb.create_block();
+    fb.ins().brif(
+        metadata_is_null,
+        miss_block,
+        &[],
+        type_metadata_done_block,
+        &[],
+    );
+
+    fb.switch_to_block(type_metadata_done_block);
     let packed = fb.ins().load(
         i64_ty,
         ir::MemFlags::trusted(),
@@ -5943,7 +6001,7 @@ fn emit_direct_call_resolved_raw_with_arg_values(
     ctx.direct_edge_stats.record_resolved_direct_edge();
 
     let (function_metadata, function_env) =
-        emit_resolved_direct_function_metadata_and_env(fb, callable, ctx);
+        emit_resolved_direct_function_metadata_and_env(fb, callable, target_function, ctx);
 
     let enter_inst = fb
         .ins()
@@ -6101,8 +6159,15 @@ fn emit_direct_call_resolved_with_arg_plan_from_local_env(
     func_imports: &mut FuncBuildImports<'_>,
 ) -> ir::Value {
     let ptr_ty = ctx.consts.ptr_ty;
-    let mut provided_arg_values: Vec<ir::Value> = Vec::with_capacity(args.len());
-    let mut provided_arg_borrowed: Vec<bool> = Vec::with_capacity(args.len());
+    let implicit_callable_arg = is_constructor_entry_function(target_function);
+    let mut provided_arg_values: Vec<ir::Value> =
+        Vec::with_capacity(args.len() + usize::from(implicit_callable_arg));
+    let mut provided_arg_borrowed: Vec<bool> =
+        Vec::with_capacity(args.len() + usize::from(implicit_callable_arg));
+    if implicit_callable_arg {
+        provided_arg_values.push(callable);
+        provided_arg_borrowed.push(true);
+    }
     for arg in args {
         let borrowed_arg =
             codegen_expr_pyobject_input_is_borrowed_from_local_env(arg, local_env, ctx);
@@ -6187,8 +6252,15 @@ fn emit_typed_direct_call_resolved_with_arg_plan_from_local_env(
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<ir::Value, String> {
     let ptr_ty = ctx.consts.ptr_ty;
-    let mut provided_arg_values: Vec<ir::Value> = Vec::with_capacity(args.len());
-    let mut provided_arg_borrowed: Vec<bool> = Vec::with_capacity(args.len());
+    let implicit_callable_arg = is_constructor_entry_function(target_function);
+    let mut provided_arg_values: Vec<ir::Value> =
+        Vec::with_capacity(args.len() + usize::from(implicit_callable_arg));
+    let mut provided_arg_borrowed: Vec<bool> =
+        Vec::with_capacity(args.len() + usize::from(implicit_callable_arg));
+    if implicit_callable_arg {
+        provided_arg_values.push(callable);
+        provided_arg_borrowed.push(true);
+    }
     for arg in args {
         let (value, borrowed) = emit_typed_pyobject_input_with_local_env(
             fb,
@@ -8237,6 +8309,303 @@ fn emit_typed_positional_call_result_with_arg_refs(
     )
 }
 
+fn current_constructor_entry_init_function<'a>(
+    emit_ctx: &'a JitEmitCtx<'_>,
+) -> Option<&'a BlockPyFunction<TypedCodegenModuleShape>> {
+    let current_function = emit_ctx
+        .module
+        .callable_defs
+        .iter()
+        .find(|function| function.function_id == emit_ctx.function_id)?;
+    let init_function_id = constructor_init_function_id_for_entry_function(current_function)?;
+    direct_call_target_function(emit_ctx, init_function_id)
+}
+
+fn codegen_expr_is_constructor_call(expr: &InstrCodegen, emit_ctx: &JitEmitCtx<'_>) -> bool {
+    codegen_expr_static_runtime_name(expr, emit_ctx.module_constants)
+        == Some(RuntimeName::ConstructorCall.name())
+}
+
+fn typed_expr_is_constructor_call(expr: &InstrTyped, emit_ctx: &JitEmitCtx<'_>) -> bool {
+    typed_expr_static_runtime_name(expr, emit_ctx.module_constants)
+        == Some(RuntimeName::ConstructorCall.name())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_constructor_entry_fast_or_generic_call_with_arg_values(
+    fb: &mut FunctionBuilder<'_>,
+    init_function: &BlockPyFunction<TypedCodegenModuleShape>,
+    cls_value: ir::Value,
+    user_arg_values: Vec<ir::Value>,
+    emit_ctx: &JitEmitCtx<'_>,
+    codegen_env: &mut impl JitCodegenEnv,
+) -> ir::Value {
+    let direct_func_id = emit_ctx
+        .direct_call_functions
+        .get(&init_function.function_id)
+        .expect("constructor init direct target should be predeclared")
+        .func_id;
+    let ptr_ty = emit_ctx.consts.ptr_ty;
+    let null_ptr = fb.ins().iconst(ptr_ty, 0);
+    let result_block = fb.create_block();
+    fb.append_block_param(result_block, ptr_ty);
+    let generic_block = fb.create_block();
+    fb.set_cold_block(generic_block);
+    let fast_block = fb.create_block();
+
+    let supported_inst = fb.ins().call(
+        emit_ctx.constructor_generic_alloc_supported_ref,
+        &[cls_value],
+    );
+    let supported = fb.inst_results(supported_inst)[0];
+    let supported = fb
+        .ins()
+        .icmp_imm(ir::condcodes::IntCC::NotEqual, supported, 0);
+    fb.ins()
+        .brif(supported, fast_block, &[], generic_block, &[]);
+
+    fb.switch_to_block(fast_block);
+    let nitems = fb.ins().iconst(emit_ctx.consts.i64_ty, 0);
+    let alloc_inst = fb
+        .ins()
+        .call(emit_ctx.pytype_generic_alloc_ref, &[cls_value, nitems]);
+    let allocated = fb.inst_results(alloc_inst)[0];
+    let allocated_is_null = fb
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, allocated, null_ptr);
+    let enter_block = fb.create_block();
+    fb.ins().brif(
+        allocated_is_null,
+        emit_ctx.consts.step_null_block,
+        &step_null_block_args(emit_ctx),
+        enter_block,
+        &[],
+    );
+
+    fb.switch_to_block(enter_block);
+    emit_ctx.direct_edge_stats.record_resolved_direct_edge();
+    let enter_inst = fb.ins().call(
+        emit_ctx.enter_recursive_ref,
+        &[emit_ctx.consts.thread_state_value],
+    );
+    let enter_status = fb.inst_results(enter_inst)[0];
+    let enter_failed = fb
+        .ins()
+        .icmp_imm(ir::condcodes::IntCC::NotEqual, enter_status, 0);
+    let init_call_block = fb.create_block();
+    let enter_failed_block = fb.create_block();
+    fb.set_cold_block(enter_failed_block);
+    fb.ins()
+        .brif(enter_failed, enter_failed_block, &[], init_call_block, &[]);
+
+    fb.switch_to_block(enter_failed_block);
+    emit_release_owned_inputs(fb, emit_ctx, &[allocated]);
+    fb.ins().jump(
+        emit_ctx.consts.step_null_block,
+        &step_null_block_args(emit_ctx),
+    );
+
+    fb.switch_to_block(init_call_block);
+    let func_ref = codegen_env
+        .codegen_declare_func_in_func(direct_func_id, &mut fb.func)
+        .expect("reserved constructor init function should be declared in codegen env");
+    let mut init_call_args = Vec::with_capacity(user_arg_values.len() + 3);
+    init_call_args.push(emit_ctx.consts.function_env_value);
+    init_call_args.push(emit_ctx.consts.thread_state_value);
+    init_call_args.push(allocated);
+    init_call_args.extend(user_arg_values.iter().copied());
+    let init_call_inst = fb.ins().call(func_ref, &init_call_args);
+    let init_result = fb.inst_results(init_call_inst)[0];
+    let init_result_is_null = fb
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, init_result, null_ptr);
+    let init_ok_block = fb.create_block();
+    fb.append_block_param(init_ok_block, ptr_ty);
+    let init_failed_block = fb.create_block();
+    fb.set_cold_block(init_failed_block);
+    fb.ins().brif(
+        init_result_is_null,
+        init_failed_block,
+        &[],
+        init_ok_block,
+        &[ir::BlockArg::Value(init_result)],
+    );
+
+    fb.switch_to_block(init_failed_block);
+    emit_release_owned_inputs(fb, emit_ctx, &[allocated]);
+    fb.ins().jump(
+        emit_ctx.consts.step_null_block,
+        &step_null_block_args(emit_ctx),
+    );
+
+    fb.switch_to_block(init_ok_block);
+    let init_result = fb.block_params(init_ok_block)[0];
+    let finish_inst = fb.ins().call(
+        emit_ctx.finish_constructor_init_ref,
+        &[allocated, init_result],
+    );
+    let fast_result = fb.inst_results(finish_inst)[0];
+    let fast_result_is_null = fb
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, fast_result, null_ptr);
+    let fast_ok_block = fb.create_block();
+    fb.append_block_param(fast_ok_block, ptr_ty);
+    fb.ins().brif(
+        fast_result_is_null,
+        emit_ctx.consts.step_null_block,
+        &step_null_block_args(emit_ctx),
+        fast_ok_block,
+        &[ir::BlockArg::Value(fast_result)],
+    );
+    fb.switch_to_block(fast_ok_block);
+    let fast_result = fb.block_params(fast_ok_block)[0];
+    fb.ins()
+        .jump(result_block, &[ir::BlockArg::Value(fast_result)]);
+
+    fb.switch_to_block(generic_block);
+    emit_ctx
+        .direct_edge_stats
+        .record_guarded_generic_fallback_block();
+    let user_arg_borrowed = vec![true; user_arg_values.len()];
+    let (generic_result, ownership, _) = if user_arg_values.len() <= 3 {
+        emit_positional_call_three_result_with_arg_values(
+            fb,
+            cls_value,
+            true,
+            user_arg_values,
+            user_arg_borrowed,
+            emit_ctx,
+            ResultDemand::PYOBJECT_OWNED,
+        )
+        .expect_pyobject("constructor entry generic fallback")
+    } else {
+        emit_positional_vectorcall_result_with_arg_values(
+            fb,
+            cls_value,
+            true,
+            user_arg_values,
+            user_arg_borrowed,
+            emit_ctx,
+            ResultDemand::PYOBJECT_OWNED,
+        )
+        .expect_pyobject("constructor entry generic fallback")
+    };
+    debug_assert!(ownership.is_owned());
+    fb.ins()
+        .jump(result_block, &[ir::BlockArg::Value(generic_result)]);
+
+    fb.switch_to_block(result_block);
+    fb.block_params(result_block)[0]
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_codegen_constructor_entry_call_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    call: &soac_core::block_py::Call<InstrCodegen>,
+    simple_args: &[&InstrCodegen],
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Option<ir::Value> {
+    if !codegen_expr_is_constructor_call(call.func.as_ref(), emit_ctx) {
+        return None;
+    }
+    let init_function = current_constructor_entry_init_function(emit_ctx)?;
+    if simple_args.len() != init_function.params.len() || simple_args.is_empty() {
+        return None;
+    }
+    if !emit_ctx
+        .direct_call_functions
+        .contains_key(&init_function.function_id)
+    {
+        return None;
+    }
+    if !simple_args
+        .iter()
+        .all(|arg| codegen_expr_pyobject_input_is_borrowed_from_local_env(arg, local_env, emit_ctx))
+    {
+        return None;
+    }
+    let (arg_values, arg_borrowed) = emit_positional_arg_values(
+        fb,
+        simple_args,
+        local_env,
+        emit_ctx,
+        codegen_env,
+        func_imports,
+    );
+    debug_assert!(arg_borrowed.iter().all(|is_borrowed| *is_borrowed));
+    let cls_value = arg_values[0];
+    Some(emit_constructor_entry_fast_or_generic_call_with_arg_values(
+        fb,
+        init_function,
+        cls_value,
+        arg_values[1..].to_vec(),
+        emit_ctx,
+        codegen_env,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_typed_constructor_entry_call_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    call: &TypedCall<InstrTyped>,
+    arg_refs: &[&InstrTyped],
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    demand: ResultDemand,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<Option<EmitResult>, String> {
+    if !typed_expr_is_constructor_call(call.func.as_ref(), emit_ctx) {
+        return Ok(None);
+    }
+    let Some(init_function) = current_constructor_entry_init_function(emit_ctx) else {
+        return Ok(None);
+    };
+    if arg_refs.len() != init_function.params.len() || arg_refs.is_empty() {
+        return Ok(None);
+    }
+    if !emit_ctx
+        .direct_call_functions
+        .contains_key(&init_function.function_id)
+    {
+        return Ok(None);
+    }
+    if !arg_refs
+        .iter()
+        .all(|arg| typed_expr_pyobject_input_is_borrowed_from_local_env(arg, local_env, emit_ctx))
+    {
+        return Ok(None);
+    }
+    let (arg_values, arg_borrowed) = emit_typed_positional_arg_values(
+        fb,
+        arg_refs,
+        local_env,
+        emit_ctx,
+        codegen_env,
+        func_imports,
+    )?;
+    debug_assert!(arg_borrowed.iter().all(|is_borrowed| *is_borrowed));
+    let cls_value = arg_values[0];
+    let result = emit_constructor_entry_fast_or_generic_call_with_arg_values(
+        fb,
+        init_function,
+        cls_value,
+        arg_values[1..].to_vec(),
+        emit_ctx,
+        codegen_env,
+    );
+    Ok(Some(emit_owned_pyobject_result_for_demand(
+        fb,
+        result,
+        PyObjFacts::unknown(),
+        emit_ctx,
+        demand,
+    )))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_codegen_simple_call_effect_only_with_local_env(
     fb: &mut FunctionBuilder<'_>,
@@ -8397,6 +8766,21 @@ fn emit_codegen_simple_call_with_local_env(
         fb.ins()
             .call(emit_ctx.incref_ref, &[emit_ctx.consts.block_const]);
         return Some(emit_ctx.consts.block_const);
+    }
+
+    if !has_unpack
+        && simple_keywords.is_empty()
+        && let Some(value) = emit_codegen_constructor_entry_call_with_local_env(
+            fb,
+            call,
+            simple_args.as_slice(),
+            local_env,
+            emit_ctx,
+            codegen_env,
+            func_imports,
+        )
+    {
+        return Some(value);
     }
 
     if !has_unpack
@@ -8631,11 +9015,13 @@ fn emit_codegen_simple_call_with_local_env(
                             if target_function.names.fn_name == "__init__" {
                                 return None;
                             }
+                            let implicit_positional_arg_count =
+                                usize::from(is_constructor_entry_function(target_function));
                             let arg_plan = match validate_direct_call_compatibility(
                                 target_function,
                                 emit_ctx.direct_call_functions,
                                 simple_args.len(),
-                                0,
+                                implicit_positional_arg_count,
                                 false,
                                 false,
                             ) {
@@ -8648,6 +9034,11 @@ fn emit_codegen_simple_call_with_local_env(
                                     return None;
                                 }
                             };
+                            if is_constructor_entry_function(target_function)
+                                && arg_plan.requires_default_resolving_entry()
+                            {
+                                return None;
+                            }
                             Some(DirectFunctionSpecialization {
                                 function_id,
                                 arg_plan,
@@ -8939,7 +9330,21 @@ fn emit_codegen_simple_call_with_local_env(
                 let callable_is_exact_function =
                     fb.ins()
                         .icmp(ir::condcodes::IntCC::Equal, callable_type, py_function_type);
+                let py_type_type = emit_type_ptr_value_for_ref(
+                    fb,
+                    codegen_env,
+                    emit_ctx,
+                    &RelocTypeRef::CpythonTypeSymbol(CpythonTypeSymbol::Type),
+                )
+                .unwrap_or_else(|err| panic!("failed to bind PyType_Type symbol: {err}"))
+                .expect("PyType_Type symbol should be available");
+                let callable_is_exact_type =
+                    fb.ins()
+                        .icmp(ir::condcodes::IntCC::Equal, callable_type, py_type_type);
                 for (index, specialization) in direct_specializations.iter().enumerate() {
+                    let target_function =
+                        direct_call_target_function(emit_ctx, specialization.function_id)
+                            .expect("direct specialization target should exist");
                     let direct_block = fb.create_block();
                     let miss_block = if index + 1 == direct_specializations.len() {
                         direct_guard_miss_dispatch.branch_block()
@@ -8951,13 +9356,15 @@ fn emit_codegen_simple_call_with_local_env(
                         callee_id,
                         specialization.function_id.to_packed_runtime_u64() as i64,
                     );
-                    let is_match = fb.ins().band(is_match, callable_is_exact_function);
+                    let callable_shape_matches = if is_constructor_entry_function(target_function) {
+                        callable_is_exact_type
+                    } else {
+                        callable_is_exact_function
+                    };
+                    let is_match = fb.ins().band(is_match, callable_shape_matches);
                     fb.ins().brif(is_match, direct_block, &[], miss_block, &[]);
 
                     fb.switch_to_block(direct_block);
-                    let target_function =
-                        direct_call_target_function(emit_ctx, specialization.function_id)
-                            .expect("direct specialization target should exist");
                     if let Some(counter_id) = direct_hit_counter_id {
                         emit_increment_counter_ref(fb, counter_id, emit_ctx);
                     }
@@ -10842,6 +11249,18 @@ fn emit_typed_codegen_simple_positional_call_result_with_local_env(
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<Option<EmitResult>, String> {
     let arg_refs = typed_simple_positional_args(call)?;
+    if let Some(result) = emit_typed_constructor_entry_call_with_local_env(
+        fb,
+        call,
+        arg_refs.as_slice(),
+        local_env,
+        emit_ctx,
+        demand,
+        codegen_env,
+        func_imports,
+    )? {
+        return Ok(Some(result));
+    }
     let (callable, callable_is_borrowed) = emit_typed_pyobject_input_with_local_env(
         fb,
         call.func.as_ref(),
@@ -11013,7 +11432,20 @@ fn emit_typed_prepared_direct_callable_specialization_result_with_local_env(
         let callable_is_exact_function =
             fb.ins()
                 .icmp(ir::condcodes::IntCC::Equal, callable_type, py_function_type);
+        let py_type_type = emit_type_ptr_value_for_ref(
+            fb,
+            codegen_env,
+            emit_ctx,
+            &RelocTypeRef::CpythonTypeSymbol(CpythonTypeSymbol::Type),
+        )
+        .unwrap_or_else(|err| panic!("failed to bind PyType_Type symbol: {err}"))
+        .expect("PyType_Type symbol should be available");
+        let callable_is_exact_type =
+            fb.ins()
+                .icmp(ir::condcodes::IntCC::Equal, callable_type, py_type_type);
         for (index, specialization) in direct_specializations.iter().enumerate() {
+            let target_function = direct_call_target_function(emit_ctx, specialization.function_id)
+                .expect("direct specialization target should exist");
             let direct_block = fb.create_block();
             let miss_block = if index + 1 == direct_specializations.len() {
                 direct_guard_miss_dispatch.branch_block()
@@ -11025,12 +11457,15 @@ fn emit_typed_prepared_direct_callable_specialization_result_with_local_env(
                 callee_id,
                 specialization.function_id.to_packed_runtime_u64() as i64,
             );
-            let is_match = fb.ins().band(is_match, callable_is_exact_function);
+            let callable_shape_matches = if is_constructor_entry_function(target_function) {
+                callable_is_exact_type
+            } else {
+                callable_is_exact_function
+            };
+            let is_match = fb.ins().band(is_match, callable_shape_matches);
             fb.ins().brif(is_match, direct_block, &[], miss_block, &[]);
 
             fb.switch_to_block(direct_block);
-            let target_function = direct_call_target_function(emit_ctx, specialization.function_id)
-                .expect("direct specialization target should exist");
             emit_record_direct_call_target_sample(
                 fb,
                 site_instr_id,
@@ -15649,6 +16084,21 @@ fn build_cranelift_run_bb_specialized_function(
             &mut fb.func,
             &DP_JIT_DIRECT_COMPILE_FUNCTION_ENV_IMPORT,
         );
+        let constructor_generic_alloc_supported_ref = func_imports.get_or_panic(
+            codegen_env,
+            &mut fb.func,
+            &DP_JIT_CONSTRUCTOR_GENERIC_ALLOC_SUPPORTED_IMPORT,
+        );
+        let pytype_generic_alloc_ref = func_imports.get_or_panic(
+            codegen_env,
+            &mut fb.func,
+            &DP_JIT_PYTYPE_GENERIC_ALLOC_IMPORT,
+        );
+        let finish_constructor_init_ref = func_imports.get_or_panic(
+            codegen_env,
+            &mut fb.func,
+            &DP_JIT_FINISH_CONSTRUCTOR_INIT_IMPORT,
+        );
         let load_global_fast_ref =
             func_imports.get_or_panic(codegen_env, &mut fb.func, &SOAC_RUNTIME_LOAD_GLOBAL_IMPORT);
         let probe_global_indexed_ref = func_imports.get_or_panic(
@@ -15981,6 +16431,9 @@ fn build_cranelift_run_bb_specialized_function(
                 load_runtime_obj_by_id_ref,
                 enter_recursive_ref,
                 direct_compile_function_env_ref,
+                constructor_generic_alloc_supported_ref,
+                pytype_generic_alloc_ref,
+                finish_constructor_init_ref,
                 pyobject_getattr_ref,
                 pyobject_setattr_ref,
                 pyobject_getitem_ref,

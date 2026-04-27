@@ -1516,7 +1516,7 @@ fn validate_typed_call_access_plan(call: &TypedCall<InstrTyped>) -> Result<(), S
         TypedCallAccessPlan::GuardedCallable { function_guards } => {
             validate_typed_call_simple_shape(call)?;
             for guard in function_guards {
-                validate_typed_direct_call_arg_plan(call, &guard.arg_plan, 0)?;
+                validate_typed_callable_direct_call_arg_plan(call, &guard.arg_plan)?;
             }
             Ok(())
         }
@@ -1583,6 +1583,12 @@ fn validate_typed_direct_callable_call(
     match &call.guard {
         TypedDirectCallableCallGuard::Function(guard) => {
             validate_typed_direct_call_arg_sources(&guard.arg_plan, explicit_positional_arg_count)
+                .or_else(|_| {
+                    validate_typed_direct_call_arg_sources(
+                        &guard.arg_plan,
+                        explicit_positional_arg_count + 1,
+                    )
+                })
         }
     }
 }
@@ -1623,6 +1629,23 @@ fn validate_typed_direct_call_arg_plan(
     let provided_positional_arg_count =
         implicit_positional_arg_count + explicit_positional_arg_count;
     validate_typed_direct_call_arg_sources(plan, provided_positional_arg_count)
+}
+
+fn validate_typed_callable_direct_call_arg_plan(
+    call: &TypedCall<InstrTyped>,
+    plan: &TypedDirectCallArgPlan,
+) -> Result<(), String> {
+    match validate_typed_direct_call_arg_plan(call, plan, 0) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            // Synthetic constructor entries are ordinary callable direct-call
+            // targets, but their first argument is the type object being called.
+            // Plan construction has the target metadata needed to decide when
+            // that implicit argument is legal; typed-plan validation only sees
+            // the already-lowered guard.
+            validate_typed_direct_call_arg_plan(call, plan, 1).map_err(|_| err)
+        }
+    }
 }
 
 fn validate_typed_direct_call_arg_sources(

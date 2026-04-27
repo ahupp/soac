@@ -21,8 +21,9 @@ pub use crate::instr_id::{
     validate_codegen_instr_ids,
 };
 pub use constructor_entries::{
-    CONSTRUCTOR_ENTRY_FUNCTION_NAME, constructor_entry_function_id_for_init,
-    ensure_constructor_entry_functions,
+    CONSTRUCTOR_ENTRY_FUNCTION_NAME, CONSTRUCTOR_ENTRY_TYPE_PARAM_NAME,
+    constructor_entry_function_id_for_init, constructor_init_function_id_for_entry_function,
+    ensure_constructor_entry_functions, is_constructor_entry_function,
 };
 
 /// Final lowered BlockPy form consumed by optimization, instrumentation, and JIT.

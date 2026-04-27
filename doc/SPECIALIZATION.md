@@ -29,9 +29,11 @@ validates that the BlockPy inline-fragment builder can construct the selected
 body from the cached target module, and the v3 plan is the source of truth
 consumed by typed JIT planning. Constructor type metadata now points at a
 synthetic constructor-entry function id rather than the underlying `__init__`
-id. Those entry functions are placeholders while constructor-thunk emission is
-being moved behind the ordinary direct-call target model, so constructor direct
-calls currently decline instead of using the old `__init__`-target fast path.
+id. Those entry functions are normal JIT direct-call targets with an implicit
+leading type argument, so class calls can reuse the ordinary guarded direct-call
+target model. The entry JIT owns a guarded direct-allocation path for safe
+default constructor shapes and a generic `cls(...)` fallback for the remaining
+Python type-call cases.
 Runtime-guarded receiver-method specializations are not represented in v3
 plan/emission data today; those call shapes stay on generic lowering unless a
 future plan format adds validated static guard inputs for them.
@@ -74,11 +76,12 @@ Current migration surface:
   the add store and the later branch as separate v3 regions. Profiled ordinary
   direct calls are selected by v3, emitted with serialized target identities and
   an explicit call-body policy, and embedded into `InstrTyped` during JIT
-  planning. Constructor calls are temporarily not selected: class/type SOAC
-  metadata records a synthetic constructor-entry function id, but those entries
-  are interpreted placeholders until the thunk body and direct-call emitter path
-  are implemented. Constant-string indexed fields are selected by v3 from raw
-  `type_keys`, emitted as mechanical
+  planning. Constructor calls are selected through the same direct-call
+  machinery when the profiled target is the synthetic constructor-entry function
+  and the call can be bound without refreshing defaults; the entry currently
+  preserves Python type-call semantics by guarding the direct allocation path
+  and falling back to ordinary class call semantics for unsupported type shapes.
+  Constant-string indexed fields are selected by v3 from raw `type_keys`, emitted as mechanical
   indexed-field decisions, and consumed as v3-owned typed attribute inputs.
   Indexed globals are selected by v3 from raw `module_keys` plus lowered
   `NameLocation::Global(slot)` load/store sites, emitted with explicit
@@ -417,12 +420,12 @@ constructed from the cached target module. The JIT loads the plan, lowers the
 cached pre-optimization module to `InstrTyped`, embeds the selected direct-call
 or inline shape in typed IR, then builds value facts, locals, refcount
 ownership, and deopt resume tables from the typed result. It does not build
-owner-attribute guard maps or rewrite method/constructor calls from profile
-evidence.
+owner-attribute guard maps or rewrite method calls from profile evidence.
 
 Current live v3 direct-call support covers ordinary function targets with
-validated positional/default argument plans. Runtime-guarded receiver-method
-and constructor plans are intentionally disabled for now; if such plans appear
+validated positional/default argument plans and synthetic constructor-entry
+targets whose argument plan does not require default refresh. Runtime-guarded
+receiver-method plans are intentionally disabled for now; if such plans appear
 in v3 plan/emission data, specialization-input preparation rejects them because
 their owner/type guard payload is not yet a static mechanical JIT input.
 
@@ -458,11 +461,13 @@ their owner/type guard payload is not yet a static mechanical JIT input.
   for the original call shape.
 - When no v3 plan owns the site, the original generic call remains in
   `InstrTyped`.
-- The rewrite only consumes profiled targets that match the ordinary direct-call
-  / typed inliner shape: positional-only-or-normal parameters, no keywords, no
+- The rewrite consumes profiled targets that match the ordinary direct-call /
+  typed inliner shape: positional-only-or-normal parameters, no keywords, no
   starred args, and positional inputs that can bind through the direct-entry
   argument plan. Omitted trailing/defaulted parameters are passed as default
   sentinels and resolved by the callee's default-resolving direct entry.
+  Constructor-entry targets currently require all user arguments to be explicit
+  because their type-stored metadata does not yet refresh `__init__` defaults.
 - In apply/verify mode, JIT module planning consumes the cached pre-opt module
   plus raw profile evidence. The v3 planner makes the call-body decisions; typed
   planning applies those decisions to `InstrTyped`, and codegen mechanically
@@ -482,9 +487,13 @@ their owner/type guard payload is not yet a static mechanical JIT input.
   - variadic target params are excluded
   - required keyword-only target params are excluded unless they have a
     default value
-  - class-call targets are not modeled as ordinary calls to `__init__`;
-    constructor semantics need an explicit entry function because the `self`
-    object must come from the guarded constructor allocation path
+  - constructor-entry targets are declined when the selected argument plan
+    needs default sentinels, because type metadata does not yet observe later
+    `__init__.__defaults__` / `__kwdefaults__` mutation
+  - constructor-entry direct allocation currently requires simple positional
+    arguments and a safe default allocation shape; custom `__new__`, abstract
+    classes, custom metaclasses, non-generic allocation, keywords, and starred
+    arguments stay on the generic class-call path
 - Soundness boundary:
   - this is sound as long as the `FunctionId` metadata attached to
     transformed Python functions stays correct
@@ -511,17 +520,22 @@ the v3 plan/emission data does not carry method-call plan entries.
 ## Type Constructors
 
 Constructor calls reuse `call_hot_targets` evidence, but the target identity is
-being migrated. A heap type's SOAC function id now names a synthetic
-`__soac_constructor_entry__` function for that class, distinct from the
-`__init__` function id. These entry functions are present in the BlockPy module
-so profile evidence no longer treats `__init__` itself as the class-call target.
+the heap type's synthetic `__soac_constructor_entry__` function, distinct from
+the `__init__` function id. These entry functions are present in the BlockPy
+module, type metadata stores a JIT environment for the entry, and profile
+evidence no longer treats `__init__` itself as the class-call target.
 
-The synthetic entries are currently interpreted placeholders. Until their body
-and callable emission path exist, v3 planning declines these targets and
-constructor calls fall back to the original generic Python call path. The
-intended replacement is for the constructor-entry function to own allocation,
-the internal call to `__init__`, `dp_jit_finish_constructor_init`, and the
-generic fallback boundary.
+The synthetic entry is now a normal JIT function with an implicit leading type
+argument. Direct-call rewriting guards the callee as the exact heap type, loads
+the entry metadata from the type, prepends the type object to the direct-entry
+argument list, and falls back to the original generic class call on guard miss.
+The entry body still lowers from a simple `constructor_call(cls, *args, **kwargs)`
+IR shape, but JIT codegen recognizes that helper inside constructor entries. For
+safe default allocation shapes it calls `PyType_GenericAlloc`, calls the selected
+`__init__` through the ordinary direct-function ABI, and finishes with
+`dp_jit_finish_constructor_init`. If the runtime guard rejects the type shape,
+the entry calls `cls(*args)` so custom `__new__`, metaclasses, abstract classes,
+and non-generic allocation keep CPython-visible semantics.
 
 Constructor initializer inlining and constructor scalar replacement should be
 represented directly in `InstrTyped` metadata or typed operation shape when
@@ -821,7 +835,7 @@ Some notable hot paths still use only generic lowering:
 - starred-argument calls
 - omitted-default profiled direct calls
 - constructor calls with keywords, starred arguments, unresolved owner metadata,
-  or shapes outside the current guarded allocation/init path
+  or argument plans that need default refresh
 - most non-`int` operator shapes
 
 Those are the main expansion areas if we want the specialization system

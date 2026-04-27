@@ -642,6 +642,7 @@ fn exec_module_inner(
                     module.as_ptr(),
                     &module_data.shared_state.lowered_module.global_names,
                     module_data.shared_state,
+                    &module_runtime,
                 )
             }
             .map_err(|_| {

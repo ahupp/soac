@@ -26,6 +26,7 @@ use soac_core::block_py::{
     ResolvedName, SerializedFunctionDebugName, SerializedFunctionId, SerializedIdentityTables,
     SerializedModuleId, SerializedModuleIdentity, Visit,
 };
+use soac_ir_blockpy::is_constructor_entry_function;
 use soac_ir_typed::emit_v3::{MechanicalEmitError, emit_mechanical_plan_v3};
 use soac_ir_typed::plan_v3::{
     DirectCallArgPlan, DirectCallArgSource, DirectCallCallee, DirectCallSpecializationPlan,
@@ -1220,7 +1221,9 @@ fn direct_call_requests_from_evidence_v3(
                 DirectCallCallee::Function
             };
             let implicit_positional_arg_count = match &callee {
-                DirectCallCallee::Function => 0,
+                DirectCallCallee::Function => {
+                    usize::from(is_constructor_entry_function(target_function))
+                }
                 DirectCallCallee::Method { .. } => 1,
             };
             let arg_plan = match direct_call_arg_plan_for_instr_id_v3(
@@ -1249,6 +1252,20 @@ fn direct_call_requests_from_evidence_v3(
                     continue;
                 }
             };
+            if is_constructor_entry_function(target_function)
+                && arg_plan
+                    .sources
+                    .iter()
+                    .any(|source| matches!(source, DirectCallArgSource::DefaultSentinel))
+            {
+                diagnostics.push(PlanDiagnostic {
+                    source: Some(source),
+                    message: format!(
+                        "v3 direct-call declined target {serialized_target}: constructor entries do not yet refresh default arguments"
+                    ),
+                });
+                continue;
+            }
             requests.push(DirectCallPlanRequest {
                 source,
                 target: serialized_target,

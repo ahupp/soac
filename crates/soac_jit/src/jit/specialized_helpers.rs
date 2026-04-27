@@ -1038,6 +1038,38 @@ pub unsafe extern "C" fn dp_jit_pyobject_setitem(
     pyobject_setitem_hook(obj, key, value)
 }
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn dp_jit_constructor_generic_alloc_supported(callable: ObjPtr) -> i32 {
+    if callable.is_null() || ffi::PyType_Check(callable as *mut ffi::PyObject) == 0 {
+        return 0;
+    }
+    let owner_type = callable as *mut ffi::PyTypeObject;
+    if ((*owner_type).tp_flags & ffi::Py_TPFLAGS_HEAPTYPE) == 0
+        || ((*owner_type).tp_flags & ffi::Py_TPFLAGS_IS_ABSTRACT) != 0
+    {
+        return 0;
+    }
+    if ffi::Py_TYPE(callable as *mut ffi::PyObject) != ptr::addr_of_mut!(ffi::PyType_Type) {
+        return 0;
+    }
+    let Some(owner_tp_alloc) = (*owner_type).tp_alloc else {
+        return 0;
+    };
+    let generic_alloc: unsafe extern "C" fn(
+        *mut ffi::PyTypeObject,
+        ffi::Py_ssize_t,
+    ) -> *mut ffi::PyObject = ffi::PyType_GenericAlloc;
+    if !ptr::fn_addr_eq(owner_tp_alloc, generic_alloc) {
+        return 0;
+    }
+    let Some(owner_tp_new) = (*owner_type).tp_new else {
+        return 0;
+    };
+    let Some(base_object_tp_new) = ffi::PyBaseObject_Type.tp_new else {
+        return 0;
+    };
+    ptr::fn_addr_eq(owner_tp_new, base_object_tp_new) as i32
+}
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn dp_jit_pytype_generic_alloc(callable: ObjPtr, nitems: i64) -> ObjPtr {
     if callable.is_null() {
         ffi::PyErr_SetString(
@@ -1373,6 +1405,10 @@ pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
     builder.symbol(
         "dp_jit_pyobject_setitem",
         dp_jit_pyobject_setitem as *const u8,
+    );
+    builder.symbol(
+        "dp_jit_constructor_generic_alloc_supported",
+        dp_jit_constructor_generic_alloc_supported as *const u8,
     );
     builder.symbol(
         "dp_jit_pytype_generic_alloc",
