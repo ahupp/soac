@@ -1,5 +1,41 @@
 # Overnight Performance Log
 
+## 2026-04-27 - Inline nested direct-call results
+
+- baseline: `work/bench/moqnnqssmupy_c337b6282dc2`
+  - specialized apply median: `575641 loops/s`
+  - specialized apply mean: `574805 loops/s`
+  - verify pass: `327070 loops/s`
+  - no-refcount diagnostic median: `755874 loops/s`
+  - latest summarized pystone code size: `66581 bytes`, `3908` machine blocks
+- observation: the current profile still showed `Func1` as a separate hot JIT
+  symbol and `Func2` still contained a profiled direct call to `Func1` inside a
+  branch condition. The existing inline path only handled store-shaped and
+  effect-only direct calls, so branch-condition result uses looked like the next
+  most valuable direct-call target.
+- attempted change: allow the v3 planner to mark leftmost nested ordinary
+  function calls as inline candidates when the same inline-fragment builder can
+  construct the target body, then hoist one selected nested typed call into a
+  temporary so the existing typed direct-call inliner can consume it. For branch
+  tests, the hoisted result temporary was cleaned on both branch edges.
+- rejected result: `work/bench/yvpwszyzrkxk_1f228f28c4fb`
+  - specialized apply median: `556251 loops/s` (`-3.37%`)
+  - specialized apply mean: `561157 loops/s` (`-2.37%`)
+  - verify pass: `335904 loops/s` (`+2.70%`)
+  - no-refcount diagnostic median: `741979 loops/s` (`-1.84%`)
+  - latest summarized pystone code size: `67597 bytes`, `3983` machine blocks
+  - code-size delta: `+1016 bytes`, `+75` machine blocks
+- reason rejected: the transform removed some call overhead, but the extra CFG,
+  temporaries, cleanup edges, and larger `Func2` body made the production apply
+  pass materially slower and larger.
+- validation before rejection: `just fmt-rust soac_opt` passed; `cargo test -p
+  soac_opt direct_call_inline_candidate_requires_buildable_inline_body --
+  --nocapture` passed; `cargo test -p soac_opt
+  inlines_leftmost_nested_typed_direct_call_in_branch_test -- --nocapture`
+  passed; `cargo check -p soac_jit --tests` passed; `just benchmark` produced
+  the rejected result above. The experiment was then reverted.
+- next baseline: `work/bench/moqnnqssmupy_c337b6282dc2`
+
 ## 2026-04-27 - Compact ASCII exact-string compare fast path
 
 - baseline: `work/bench/qkzxlxtsvpuq_addfd7675506`
