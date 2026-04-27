@@ -19,7 +19,7 @@ use soac_ir_typed::{
     TypedDirectMethodCall, TypedGuardedCallableCall, TypedGuardedMethodCall, TypedPlannedResult,
     TypedPyObjectOwnershipPlan, TypedResultDemand, TypedTruthy, ValueFacts,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub fn annotate_typed_module_value_facts(
     module: &mut BlockPyModule<TypedCodegenModuleShape>,
@@ -595,11 +595,20 @@ pub fn lower_typed_function_call_access_plan_instrs(
     rewriter.count
 }
 
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub struct TypedInlineInstrIdMapping {
+    pub callee: RuntimeFunctionId,
+    pub callee_instr_id: InstrId,
+    pub caller_instr_id: InstrId,
+}
+
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub struct TypedInlineRewriteStats {
     pub rewritten_stores: usize,
+    pub rewritten_effect_only_calls: usize,
     pub skipped_candidates: usize,
     pub skipped_exception_edges: usize,
+    pub instr_id_mappings: Vec<TypedInlineInstrIdMapping>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -630,6 +639,96 @@ struct TypedInlineDirectCallPlan {
     arg_plan: TypedDirectCallArgPlan,
 }
 
+struct TypedInlineInstrIdAllocator {
+    next_instr_index: u32,
+    used: HashSet<InstrId>,
+}
+
+impl TypedInlineInstrIdAllocator {
+    fn from_function(function: &BlockPyFunction<TypedCodegenModuleShape>) -> Self {
+        struct Collector {
+            next_instr_index: u32,
+            used: HashSet<InstrId>,
+        }
+
+        impl Visit<InstrTyped> for Collector {
+            fn visit_instr(&mut self, expr: &InstrTyped) {
+                if let Some(instr_id) = expr.try_semantic_instr_id() {
+                    self.used.insert(instr_id);
+                    self.next_instr_index = self.next_instr_index.max(
+                        instr_id
+                            .index()
+                            .checked_add(1)
+                            .expect("per-function instruction count should fit in u32"),
+                    );
+                }
+                expr.visit_children(self);
+            }
+        }
+
+        let mut collector = Collector {
+            next_instr_index: 0,
+            used: HashSet::new(),
+        };
+        collector.visit_fn(function);
+        Self {
+            next_instr_index: collector.next_instr_index,
+            used: collector.used,
+        }
+    }
+
+    fn alloc(&mut self) -> InstrId {
+        while self.used.contains(&InstrId::new(self.next_instr_index)) {
+            self.next_instr_index = self
+                .next_instr_index
+                .checked_add(1)
+                .expect("per-function instruction count should fit in u32");
+        }
+        let instr_id = InstrId::new(self.next_instr_index);
+        self.used.insert(instr_id);
+        self.next_instr_index = self
+            .next_instr_index
+            .checked_add(1)
+            .expect("per-function instruction count should fit in u32");
+        instr_id
+    }
+}
+
+struct TypedInlineInstrIdRemapper<'a> {
+    callee: RuntimeFunctionId,
+    allocator: &'a mut TypedInlineInstrIdAllocator,
+    mappings: Vec<TypedInlineInstrIdMapping>,
+}
+
+impl<'a> TypedInlineInstrIdRemapper<'a> {
+    fn new(callee: RuntimeFunctionId, allocator: &'a mut TypedInlineInstrIdAllocator) -> Self {
+        Self {
+            callee,
+            allocator,
+            mappings: Vec::new(),
+        }
+    }
+
+    fn remap_instr_id(&mut self, instr: InstrTyped) -> InstrTyped {
+        let Some(callee_instr_id) = instr.try_semantic_instr_id() else {
+            return instr;
+        };
+        let caller_instr_id = self.allocator.alloc();
+        let mut meta = instr.meta();
+        meta.instr_id = Some(caller_instr_id);
+        self.mappings.push(TypedInlineInstrIdMapping {
+            callee: self.callee,
+            callee_instr_id,
+            caller_instr_id,
+        });
+        instr.with_meta(meta)
+    }
+
+    fn finish(self) -> Vec<TypedInlineInstrIdMapping> {
+        self.mappings
+    }
+}
+
 pub fn inline_typed_function_direct_call_stores(
     function: &mut BlockPyFunction<TypedCodegenModuleShape>,
     module: &BlockPyModule<TypedCodegenModuleShape>,
@@ -641,6 +740,7 @@ pub fn inline_typed_function_direct_call_stores(
     }
 
     let mut stats = TypedInlineRewriteStats::default();
+    let mut instr_id_allocator = TypedInlineInstrIdAllocator::from_function(function);
     let original_blocks = std::mem::take(&mut function.blocks);
     let mut rewritten_blocks = Vec::with_capacity(original_blocks.len());
     for block in original_blocks {
@@ -650,10 +750,10 @@ pub fn inline_typed_function_direct_call_stores(
             external_callees,
             block,
             direct_calls_by_instr_id,
+            &mut instr_id_allocator,
             &mut stats,
         ) {
             TypedInlineBlockRewrite::Rewritten(blocks) => {
-                stats.rewritten_stores += 1;
                 rewritten_blocks.extend(blocks);
             }
             TypedInlineBlockRewrite::Unchanged(block) => rewritten_blocks.push(block),
@@ -670,9 +770,15 @@ enum TypedInlineBlockRewrite {
 
 struct TypedInlineStoreCandidate {
     instr_index: usize,
-    target: ResolvedName,
+    result: TypedInlineResult,
     call: TypedGuardedCallableCall<InstrTyped>,
     inline_plans: Vec<TypedInlineDirectCallPlan>,
+}
+
+#[derive(Clone)]
+enum TypedInlineResult {
+    StoreTo(ResolvedName),
+    EffectOnly,
 }
 
 fn build_typed_direct_call_inline_rewrite(
@@ -681,6 +787,7 @@ fn build_typed_direct_call_inline_rewrite(
     external_callees: &HashMap<RuntimeFunctionId, BlockPyFunction<TypedCodegenModuleShape>>,
     block: TypedBlock,
     direct_calls_by_instr_id: &HashMap<InstrId, Vec<(RuntimeFunctionId, TypedDirectCallArgPlan)>>,
+    instr_id_allocator: &mut TypedInlineInstrIdAllocator,
     stats: &mut TypedInlineRewriteStats,
 ) -> TypedInlineBlockRewrite {
     let original_block = block.clone();
@@ -721,6 +828,21 @@ fn build_typed_direct_call_inline_rewrite(
             return TypedInlineBlockRewrite::Unchanged(block);
         }
     };
+    let (return_target, discard_result) = match &candidate.result {
+        TypedInlineResult::StoreTo(target) => (target.clone(), None),
+        TypedInlineResult::EffectOnly => {
+            let result_temp = match try_allocate_typed_stack_temp(caller, "typed_inline_result") {
+                Ok(temp) => temp,
+                Err(_) => {
+                    stats.skipped_candidates += 1;
+                    caller.storage_layout = original_storage_layout;
+                    return TypedInlineBlockRewrite::Unchanged(block);
+                }
+            };
+            let return_target = result_temp.resolved_name();
+            (return_target.clone(), Some(return_target))
+        }
+    };
     let continuation_label = caller.name_gen.next_block_name();
     let generic_label = caller.name_gen.next_block_name();
     let cleanup_label = caller.name_gen.next_block_name();
@@ -732,6 +854,7 @@ fn build_typed_direct_call_inline_rewrite(
         .iter()
         .map(|_| caller.name_gen.next_block_name())
         .collect::<Vec<_>>();
+    let mut instr_id_mappings = Vec::new();
 
     let mut before = block.body;
     let after = before.split_off(candidate.instr_index + 1);
@@ -806,7 +929,8 @@ fn build_typed_direct_call_inline_rewrite(
             callee,
             cleanup_label,
             &bindings,
-            candidate.target.clone(),
+            return_target.clone(),
+            instr_id_allocator,
         ) else {
             stats.skipped_candidates += 1;
             caller.storage_layout = original_storage_layout;
@@ -815,15 +939,17 @@ fn build_typed_direct_call_inline_rewrite(
         if let Some(entry) = fragment.blocks.first_mut() {
             entry.label = hot_label;
         }
+        instr_id_mappings.extend(fragment.instr_id_mappings);
         blocks.extend(fragment.blocks);
     }
 
     blocks.push(Block::new_with_extra(
         generic_label,
         typed_generic_call_fallback_body(
-            &candidate.target,
+            &return_target,
             &callable_temp.resolved_name(),
             &arg_temps,
+            discard_result.as_ref(),
         ),
         BlockTerm::Jump(BlockEdge::new(continuation_label)),
         Vec::new(),
@@ -832,6 +958,9 @@ fn build_typed_direct_call_inline_rewrite(
     ));
 
     let mut cleanup_body = Vec::new();
+    if let Some(discard_result) = &discard_result {
+        append_typed_cleanup_del_to_body(&mut cleanup_body, discard_result);
+    }
     append_typed_cleanup_dels_to_body(&mut cleanup_body, &arg_temps);
     append_typed_cleanup_del_to_body(&mut cleanup_body, &callable_temp.resolved_name());
     blocks.push(Block::new_with_extra(
@@ -851,6 +980,11 @@ fn build_typed_direct_call_inline_rewrite(
         TypedBlockExtra::default(),
     ));
 
+    match candidate.result {
+        TypedInlineResult::StoreTo(_) => stats.rewritten_stores += 1,
+        TypedInlineResult::EffectOnly => stats.rewritten_effect_only_calls += 1,
+    }
+    stats.instr_id_mappings.extend(instr_id_mappings);
     TypedInlineBlockRewrite::Rewritten(blocks)
 }
 
@@ -865,37 +999,62 @@ fn find_typed_inline_candidate(
         .enumerate()
         .find_map(|(instr_index, instr)| {
             let InstrTyped::Store(store) = instr else {
+                if let InstrTyped::GuardedCallableCallTyped(call) = instr {
+                    return typed_inline_candidate_for_call(
+                        instr_index,
+                        TypedInlineResult::EffectOnly,
+                        call,
+                        caller_id,
+                        direct_calls_by_instr_id,
+                    );
+                }
                 return None;
             };
             let InstrTyped::GuardedCallableCallTyped(call) = store.value.as_ref() else {
                 return None;
             };
-            let instr_id = call.try_semantic_instr_id()?;
-            let plans = direct_calls_by_instr_id.get(&instr_id)?;
-            let inline_plans = plans
-                .iter()
-                .filter_map(|(target, arg_plan)| {
-                    if *target == caller_id
-                        || !call
-                            .function_guards
-                            .iter()
-                            .any(|guard| guard.function_id == *target)
-                    {
-                        return None;
-                    }
-                    Some(TypedInlineDirectCallPlan {
-                        target: *target,
-                        arg_plan: arg_plan.clone(),
-                    })
-                })
-                .collect::<Vec<_>>();
-            (!inline_plans.is_empty()).then_some(TypedInlineStoreCandidate {
+            typed_inline_candidate_for_call(
                 instr_index,
-                target: store.name.clone(),
-                call: call.clone(),
-                inline_plans,
+                TypedInlineResult::StoreTo(store.name.clone()),
+                call,
+                caller_id,
+                direct_calls_by_instr_id,
+            )
+        })
+}
+
+fn typed_inline_candidate_for_call(
+    instr_index: usize,
+    result: TypedInlineResult,
+    call: &TypedGuardedCallableCall<InstrTyped>,
+    caller_id: RuntimeFunctionId,
+    direct_calls_by_instr_id: &HashMap<InstrId, Vec<(RuntimeFunctionId, TypedDirectCallArgPlan)>>,
+) -> Option<TypedInlineStoreCandidate> {
+    let instr_id = call.try_semantic_instr_id()?;
+    let plans = direct_calls_by_instr_id.get(&instr_id)?;
+    let inline_plans = plans
+        .iter()
+        .filter_map(|(target, arg_plan)| {
+            if *target == caller_id
+                || !call
+                    .function_guards
+                    .iter()
+                    .any(|guard| guard.function_id == *target)
+            {
+                return None;
+            }
+            Some(TypedInlineDirectCallPlan {
+                target: *target,
+                arg_plan: arg_plan.clone(),
             })
         })
+        .collect::<Vec<_>>();
+    (!inline_plans.is_empty()).then_some(TypedInlineStoreCandidate {
+        instr_index,
+        result,
+        call: call.clone(),
+        inline_plans,
+    })
 }
 
 fn typed_inline_callee<'a>(
@@ -943,6 +1102,7 @@ fn typed_generic_call_fallback_body(
     target: &ResolvedName,
     callable_temp: &ResolvedName,
     arg_temps: &[TypedTempLocal],
+    discard_result: Option<&ResolvedName>,
 ) -> Vec<InstrTyped> {
     let mut body = vec![
         Store::new(
@@ -956,6 +1116,9 @@ fn typed_generic_call_fallback_body(
         .with_meta(Meta::synthetic())
         .into(),
     ];
+    if let Some(discard_result) = discard_result {
+        append_typed_cleanup_del_to_body(&mut body, discard_result);
+    }
     append_typed_cleanup_dels_to_body(&mut body, arg_temps);
     append_typed_cleanup_del_to_body(&mut body, callable_temp);
     body
@@ -1071,6 +1234,7 @@ fn build_typed_direct_call_inline_fragment_to_target(
     continuation: BlockLabel,
     value_bindings: &TypedInlineValueBindings,
     return_target: ResolvedName,
+    instr_id_allocator: &mut TypedInlineInstrIdAllocator,
 ) -> Result<TypedInlineFragment, TypedInlineUnsupportedReason> {
     if callee.blocks.len() == 1 {
         return build_single_block_typed_inline_fragment_to_target(
@@ -1079,6 +1243,7 @@ fn build_typed_direct_call_inline_fragment_to_target(
             continuation,
             value_bindings,
             return_target,
+            instr_id_allocator,
         );
     }
     build_multi_block_typed_inline_fragment_to_target(
@@ -1087,11 +1252,13 @@ fn build_typed_direct_call_inline_fragment_to_target(
         continuation,
         value_bindings,
         return_target,
+        instr_id_allocator,
     )
 }
 
 struct TypedInlineFragment {
     blocks: Vec<TypedBlock>,
+    instr_id_mappings: Vec<TypedInlineInstrIdMapping>,
 }
 
 fn build_single_block_typed_inline_fragment_to_target(
@@ -1100,6 +1267,7 @@ fn build_single_block_typed_inline_fragment_to_target(
     continuation: BlockLabel,
     value_bindings: &TypedInlineValueBindings,
     return_target: ResolvedName,
+    instr_id_allocator: &mut TypedInlineInstrIdAllocator,
 ) -> Result<TypedInlineFragment, TypedInlineUnsupportedReason> {
     let callee_layout = callee
         .storage_layout
@@ -1125,7 +1293,10 @@ fn build_single_block_typed_inline_fragment_to_target(
     };
 
     let locals = allocate_typed_inline_locals(caller, callee_layout, value_bindings)?;
-    let mut remapper = TypedInlineLocalRemapper::new(&locals, value_bindings);
+    let mut instr_id_remapper =
+        TypedInlineInstrIdRemapper::new(callee.function_id, instr_id_allocator);
+    let mut remapper =
+        TypedInlineLocalRemapper::new(&locals, value_bindings, &mut instr_id_remapper);
     let mut body = callee_block
         .body
         .iter()
@@ -1150,6 +1321,7 @@ fn build_single_block_typed_inline_fragment_to_target(
             None,
             TypedBlockExtra::default(),
         )],
+        instr_id_mappings: instr_id_remapper.finish(),
     })
 }
 
@@ -1159,6 +1331,7 @@ fn build_multi_block_typed_inline_fragment_to_target(
     continuation: BlockLabel,
     value_bindings: &TypedInlineValueBindings,
     return_target: ResolvedName,
+    instr_id_allocator: &mut TypedInlineInstrIdAllocator,
 ) -> Result<TypedInlineFragment, TypedInlineUnsupportedReason> {
     let callee_layout = callee
         .storage_layout
@@ -1187,7 +1360,10 @@ fn build_multi_block_typed_inline_fragment_to_target(
         .iter()
         .map(|block| (block.label, caller.name_gen.next_block_name()))
         .collect::<HashMap<_, _>>();
-    let mut remapper = TypedInlineLocalRemapper::new(&locals, value_bindings);
+    let mut instr_id_remapper =
+        TypedInlineInstrIdRemapper::new(callee.function_id, instr_id_allocator);
+    let mut remapper =
+        TypedInlineLocalRemapper::new(&locals, value_bindings, &mut instr_id_remapper);
     let mut blocks: Vec<TypedBlock> = Vec::with_capacity(callee.blocks.len());
     for callee_block in &callee.blocks {
         let label = typed_remapped_label(&label_map, callee_block.label)?;
@@ -1222,7 +1398,10 @@ fn build_multi_block_typed_inline_fragment_to_target(
             callee_block.extra.clone(),
         ));
     }
-    Ok(TypedInlineFragment { blocks })
+    Ok(TypedInlineFragment {
+        blocks,
+        instr_id_mappings: instr_id_remapper.finish(),
+    })
 }
 
 fn allocate_typed_inline_locals(
@@ -1291,25 +1470,30 @@ fn typed_remap_inline_term_labels(
     })
 }
 
-struct TypedInlineLocalRemapper<'locals, 'bindings> {
+struct TypedInlineLocalRemapper<'locals, 'bindings, 'remapper, 'allocator> {
     locals: &'locals HashMap<LocalLocation, TypedTempLocal>,
     value_bindings: &'bindings TypedInlineValueBindings,
+    instr_id_remapper: &'remapper mut TypedInlineInstrIdRemapper<'allocator>,
 }
 
-impl<'locals, 'bindings> TypedInlineLocalRemapper<'locals, 'bindings> {
+impl<'locals, 'bindings, 'remapper, 'allocator>
+    TypedInlineLocalRemapper<'locals, 'bindings, 'remapper, 'allocator>
+{
     fn new(
         locals: &'locals HashMap<LocalLocation, TypedTempLocal>,
         value_bindings: &'bindings TypedInlineValueBindings,
+        instr_id_remapper: &'remapper mut TypedInlineInstrIdRemapper<'allocator>,
     ) -> Self {
         Self {
             locals,
             value_bindings,
+            instr_id_remapper,
         }
     }
 }
 
 impl TryMapInstr<InstrTyped, InstrTyped, TypedInlineUnsupportedReason>
-    for TypedInlineLocalRemapper<'_, '_>
+    for TypedInlineLocalRemapper<'_, '_, '_, '_>
 {
     fn try_map_instr(
         &mut self,
@@ -1376,7 +1560,7 @@ impl TryMapInstr<InstrTyped, InstrTyped, TypedInlineUnsupportedReason>
                 InstrTyped::MakeFunctionWithClosure(op.try_map_children(self)?)
             }
         };
-        Ok(clear_typed_instr_id(mapped))
+        Ok(self.instr_id_remapper.remap_instr_id(mapped))
     }
 
     fn try_map_name(
@@ -1410,12 +1594,6 @@ fn clear_typed_instr_ids(mut instr: InstrTyped) -> InstrTyped {
     }
     Scrubber.visit_instr_mut(&mut instr);
     instr
-}
-
-fn clear_typed_instr_id(instr: InstrTyped) -> InstrTyped {
-    let mut meta = instr.meta();
-    meta.instr_id = None;
-    instr.with_meta(meta)
 }
 
 pub fn validate_typed_function_call_access_plans(

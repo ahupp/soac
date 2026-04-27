@@ -134,7 +134,8 @@ use counters::build_counted_runtime_refcount_helper;
 use counters::{
     CountedRefcountHelpers, build_counted_runtime_refcount_helpers,
     collect_deopt_entry_counter_ids_by_kind, collect_runtime_counter_ids_by_kind,
-    collect_runtime_counter_refs_by_kind_branch, emit_increment_counter_slot,
+    collect_runtime_counter_refs_by_kind_branch,
+    collect_runtime_counter_refs_by_kind_branch_source, emit_increment_counter_slot,
     emit_record_top_value_counter_slot, scalar_counter_slot_for_id, scalar_counter_slot_for_ref,
     top_value_counter_slot_for_id,
 };
@@ -1365,9 +1366,17 @@ struct JitEmitCtx<'mc> {
     getitem_shape_counter_ids: &'mc HashMap<InstrId, CounterId>,
     getitem_specialized_hit_counter_ids: &'mc HashMap<InstrId, CounterRef>,
     getitem_specialized_fallback_counter_ids: &'mc HashMap<InstrId, CounterRef>,
+    getitem_specialized_hit_counter_ids_by_source:
+        &'mc HashMap<(RuntimeFunctionId, InstrId), CounterRef>,
+    getitem_specialized_fallback_counter_ids_by_source:
+        &'mc HashMap<(RuntimeFunctionId, InstrId), CounterRef>,
     setitem_shape_counter_ids: &'mc HashMap<InstrId, CounterId>,
     setitem_specialized_hit_counter_ids: &'mc HashMap<InstrId, CounterRef>,
     setitem_specialized_fallback_counter_ids: &'mc HashMap<InstrId, CounterRef>,
+    setitem_specialized_hit_counter_ids_by_source:
+        &'mc HashMap<(RuntimeFunctionId, InstrId), CounterRef>,
+    setitem_specialized_fallback_counter_ids_by_source:
+        &'mc HashMap<(RuntimeFunctionId, InstrId), CounterRef>,
     branch_outcome_counter_ids: &'mc HashMap<InstrId, CounterId>,
     global_indexed_hit_counter_ids: &'mc HashMap<InstrId, CounterRef>,
     global_indexed_fallback_counter_ids: &'mc HashMap<InstrId, CounterRef>,
@@ -3555,6 +3564,27 @@ impl<'a, 'b, 'mc, 'c, 'd, Env: JitCodegenEnv> intrinsics::OperationEmitState<'b,
             arg_values.push((value, borrowed_arg || !ownership.is_owned()));
         }
         arg_values
+    }
+
+    fn can_emit_guarded_i64_index_arg(&self, arg: &InstrTyped) -> bool {
+        typed_expr_can_emit_guarded_i64_index(arg, self.local_env, self.ctx)
+    }
+
+    fn emit_guarded_i64_index_arg(
+        &mut self,
+        arg: &InstrTyped,
+        guard_miss_block: ir::Block,
+    ) -> Option<ir::Value> {
+        emit_typed_guarded_i64_index_with_local_env(
+            self.fb,
+            arg,
+            self.local_env,
+            self.ctx,
+            self.codegen_env,
+            self.func_imports,
+            guard_miss_block,
+        )
+        .unwrap_or_else(|err| panic!("{err}"))
     }
 
     fn emit_owned_bool_from_i32_result(&mut self, result: ir::Value) -> ir::Value {
@@ -10378,6 +10408,34 @@ fn typed_expr_can_satisfy_i64_demand(
     typed_expr_i64_demand_facts(expr, local_env, emit_ctx).is_some()
 }
 
+fn typed_expr_can_emit_guarded_i64_index(
+    expr: &InstrTyped,
+    local_env: &LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+) -> bool {
+    if typed_expr_const_i64(expr, emit_ctx.module_constants).is_some() {
+        return true;
+    }
+    match expr {
+        InstrTyped::Load(op) => {
+            (op.name.location.as_local().is_some() || op.name.location.as_constant().is_some())
+                && typed_expr_pyobject_input_is_borrowed_from_local_env(expr, local_env, emit_ctx)
+        }
+        InstrTyped::BinOp(op)
+            if matches!(
+                op.kind,
+                blockpy_intrinsics::BinOpKind::Add
+                    | blockpy_intrinsics::BinOpKind::Sub
+                    | blockpy_intrinsics::BinOpKind::Mul
+            ) =>
+        {
+            typed_expr_can_emit_guarded_i64_index(op.left.as_ref(), local_env, emit_ctx)
+                && typed_expr_can_emit_guarded_i64_index(op.right.as_ref(), local_env, emit_ctx)
+        }
+        _ => false,
+    }
+}
+
 fn codegen_expr_has_exact_int_pyobject_facts(
     expr: &InstrCodegen,
     local_env: &LocalEnv,
@@ -10790,6 +10848,131 @@ fn emit_typed_i64_binop_result_with_local_env(
         emit_ctx,
         demand,
     )))
+}
+
+fn emit_overflow_guarded_i64_binop(
+    fb: &mut FunctionBuilder<'_>,
+    kind: blockpy_intrinsics::BinOpKind,
+    lhs: ir::Value,
+    rhs: ir::Value,
+    emit_ctx: &JitEmitCtx<'_>,
+    guard_miss_block: ir::Block,
+) -> Option<ir::Value> {
+    let (raw_value, overflow) = match kind {
+        blockpy_intrinsics::BinOpKind::Add => fb.ins().sadd_overflow(lhs, rhs),
+        blockpy_intrinsics::BinOpKind::Sub => fb.ins().ssub_overflow(lhs, rhs),
+        blockpy_intrinsics::BinOpKind::Mul => fb.ins().smul_overflow(lhs, rhs),
+        _ => return None,
+    };
+    let value_ok_block = fb.create_block();
+    fb.append_block_param(value_ok_block, emit_ctx.consts.i64_ty);
+    fb.ins().brif(
+        overflow,
+        guard_miss_block,
+        &[],
+        value_ok_block,
+        &[ir::BlockArg::Value(raw_value)],
+    );
+
+    fb.switch_to_block(value_ok_block);
+    Some(fb.block_params(value_ok_block)[0])
+}
+
+fn emit_typed_guarded_i64_index_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    expr: &InstrTyped,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+    guard_miss_block: ir::Block,
+) -> Result<Option<ir::Value>, String> {
+    if let Some(const_value) = typed_expr_const_i64(expr, emit_ctx.module_constants) {
+        return Ok(Some(fb.ins().iconst(emit_ctx.consts.i64_ty, const_value)));
+    }
+
+    match expr {
+        InstrTyped::Load(op)
+            if op.name.location.as_local().is_some()
+                || op.name.location.as_constant().is_some() =>
+        {
+            if !typed_expr_pyobject_input_is_borrowed_from_local_env(expr, local_env, emit_ctx) {
+                return Ok(None);
+            }
+            let value = emit_typed_codegen_expr_value_with_local_env(
+                fb,
+                expr,
+                local_env,
+                emit_ctx,
+                true,
+                codegen_env,
+                func_imports,
+            )?;
+            let (value, ownership, _) = value.expect_pyobject("typed guarded item index load");
+            if ownership.is_owned() {
+                return Ok(None);
+            }
+            let mut intrinsic_state = LocalEnvCodegenIntrinsicEmitState {
+                fb,
+                local_env,
+                ctx: emit_ctx,
+                codegen_env,
+                func_imports,
+            };
+            Ok(Some(intrinsics::emit_v3_guarded_compact_long_i64(
+                &mut intrinsic_state,
+                value,
+                guard_miss_block,
+            )))
+        }
+        InstrTyped::BinOp(op)
+            if matches!(
+                op.kind,
+                blockpy_intrinsics::BinOpKind::Add
+                    | blockpy_intrinsics::BinOpKind::Sub
+                    | blockpy_intrinsics::BinOpKind::Mul
+            ) =>
+        {
+            if !typed_expr_can_emit_guarded_i64_index(op.left.as_ref(), local_env, emit_ctx)
+                || !typed_expr_can_emit_guarded_i64_index(op.right.as_ref(), local_env, emit_ctx)
+            {
+                return Ok(None);
+            }
+            let lhs = emit_typed_guarded_i64_index_with_local_env(
+                fb,
+                op.left.as_ref(),
+                local_env,
+                emit_ctx,
+                codegen_env,
+                func_imports,
+                guard_miss_block,
+            )?;
+            let Some(lhs) = lhs else {
+                return Ok(None);
+            };
+            let rhs = emit_typed_guarded_i64_index_with_local_env(
+                fb,
+                op.right.as_ref(),
+                local_env,
+                emit_ctx,
+                codegen_env,
+                func_imports,
+                guard_miss_block,
+            )?;
+            let Some(rhs) = rhs else {
+                return Ok(None);
+            };
+            Ok(emit_overflow_guarded_i64_binop(
+                fb,
+                op.kind,
+                lhs,
+                rhs,
+                emit_ctx,
+                guard_miss_block,
+            ))
+        }
+        _ => Ok(None),
+    }
 }
 
 fn emit_exact_pylong_as_i64_saturating_result_with_local_env(
@@ -15955,6 +16138,18 @@ fn build_cranelift_run_bb_specialized_function(
         "getitem_specialized",
         "fallback",
     );
+    let getitem_specialized_hit_counter_ids_by_source =
+        collect_runtime_counter_refs_by_kind_branch_source(
+            counter_defs,
+            "getitem_specialized",
+            "hit",
+        );
+    let getitem_specialized_fallback_counter_ids_by_source =
+        collect_runtime_counter_refs_by_kind_branch_source(
+            counter_defs,
+            "getitem_specialized",
+            "fallback",
+        );
     let setitem_shape_counter_ids = collect_runtime_counter_ids_by_kind(
         counter_defs,
         function.function_id,
@@ -15972,6 +16167,18 @@ fn build_cranelift_run_bb_specialized_function(
         "setitem_specialized",
         "fallback",
     );
+    let setitem_specialized_hit_counter_ids_by_source =
+        collect_runtime_counter_refs_by_kind_branch_source(
+            counter_defs,
+            "setitem_specialized",
+            "hit",
+        );
+    let setitem_specialized_fallback_counter_ids_by_source =
+        collect_runtime_counter_refs_by_kind_branch_source(
+            counter_defs,
+            "setitem_specialized",
+            "fallback",
+        );
     let global_indexed_hit_counter_ids = collect_runtime_counter_refs_by_kind_branch(
         counter_defs,
         function.function_id,
@@ -16036,8 +16243,12 @@ fn build_cranelift_run_bb_specialized_function(
         .chain(call_direct_fallback_counter_ids.values())
         .chain(getitem_specialized_hit_counter_ids.values())
         .chain(getitem_specialized_fallback_counter_ids.values())
+        .chain(getitem_specialized_hit_counter_ids_by_source.values())
+        .chain(getitem_specialized_fallback_counter_ids_by_source.values())
         .chain(setitem_specialized_hit_counter_ids.values())
         .chain(setitem_specialized_fallback_counter_ids.values())
+        .chain(setitem_specialized_hit_counter_ids_by_source.values())
+        .chain(setitem_specialized_fallback_counter_ids_by_source.values())
         .chain(global_indexed_hit_counter_ids.values())
         .chain(global_indexed_fallback_counter_ids.values())
         .chain(field_indexed_hit_counter_ids.values())
@@ -16713,9 +16924,17 @@ fn build_cranelift_run_bb_specialized_function(
                 getitem_shape_counter_ids: &getitem_shape_counter_ids,
                 getitem_specialized_hit_counter_ids: &getitem_specialized_hit_counter_ids,
                 getitem_specialized_fallback_counter_ids: &getitem_specialized_fallback_counter_ids,
+                getitem_specialized_hit_counter_ids_by_source:
+                    &getitem_specialized_hit_counter_ids_by_source,
+                getitem_specialized_fallback_counter_ids_by_source:
+                    &getitem_specialized_fallback_counter_ids_by_source,
                 setitem_shape_counter_ids: &setitem_shape_counter_ids,
                 setitem_specialized_hit_counter_ids: &setitem_specialized_hit_counter_ids,
                 setitem_specialized_fallback_counter_ids: &setitem_specialized_fallback_counter_ids,
+                setitem_specialized_hit_counter_ids_by_source:
+                    &setitem_specialized_hit_counter_ids_by_source,
+                setitem_specialized_fallback_counter_ids_by_source:
+                    &setitem_specialized_fallback_counter_ids_by_source,
                 global_indexed_hit_counter_ids: &global_indexed_hit_counter_ids,
                 global_indexed_fallback_counter_ids: &global_indexed_fallback_counter_ids,
                 field_indexed_hit_counter_ids: &field_indexed_hit_counter_ids,

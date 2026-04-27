@@ -973,10 +973,17 @@ pub enum TypedExactListItemPlanSource {
     OptimizationPlanV3,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TypedExactListItemCounterSource {
+    pub function_id: RuntimeFunctionId,
+    pub instr_id: InstrId,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TypedExactListItemAccessPlan {
     pub source: TypedExactListItemPlanSource,
     pub instr_id: InstrId,
+    pub counter_source: Option<TypedExactListItemCounterSource>,
     pub access: ExactListItemAccessKind,
     pub shape: ExactListItemShape,
     pub guard: ExactListItemGuardKind,

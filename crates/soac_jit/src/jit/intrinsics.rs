@@ -43,6 +43,16 @@ pub(super) trait OperationEmitState<'fb, E> {
     fn fb(&mut self) -> &mut FunctionBuilder<'fb>;
     fn import_func(&mut self, spec: &'static ImportSpec) -> ir::FuncRef;
     fn emit_arg_values(&mut self, args: &[&E]) -> Vec<(ir::Value, bool)>;
+    fn can_emit_guarded_i64_index_arg(&self, _arg: &E) -> bool {
+        false
+    }
+    fn emit_guarded_i64_index_arg(
+        &mut self,
+        _arg: &E,
+        _guard_miss_block: ir::Block,
+    ) -> Option<ir::Value> {
+        None
+    }
     fn release_arg_values(&mut self, arg_values: &[(ir::Value, bool)]) {
         let thread_state_value = self.ctx().consts.thread_state_value;
         let decref_ref = self.ctx().decref_ref;

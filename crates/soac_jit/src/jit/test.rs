@@ -17629,6 +17629,245 @@ class Point:
     }
 
     #[test]
+    fn runtime_typed_v3_inline_remaps_callee_exact_list_item_access_plans() {
+        let module_name = "runtime_typed_v3_inline_exact_list_item_plan_test";
+        let module_name_gen = ModuleNameGen::new(0);
+        let mut callee_function = test_function_in_module(&module_name_gen, "replace_first");
+        callee_function.params = ParamSpec {
+            params: vec![
+                test_param("items", ParamKind::Any, false),
+                test_param("index", ParamKind::Any, false),
+            ],
+        };
+        let callee_block_label = callee_function.name_gen.next_block_name();
+        let callee_setitem_instr_id = InstrId::new(0);
+        let callee_getitem_instr_id = InstrId::new(1);
+        callee_function.blocks = vec![CodegenBlock {
+            label: callee_block_label,
+            body: vec![with_instr_id(
+                op_expr(SetItem::new(
+                    name_expr(test_name("items")),
+                    name_expr(test_name("index")),
+                    none_expr(),
+                )),
+                callee_setitem_instr_id,
+            )],
+            term: ret_term(with_instr_id(
+                op_expr(GetItem::new(
+                    name_expr(test_name("items")),
+                    name_expr(test_name("index")),
+                )),
+                callee_getitem_instr_id,
+            )),
+            params: Vec::new(),
+            exc_edge: None,
+            extra: Default::default(),
+        }];
+        set_stack_slots(&mut callee_function, &["items", "index"]);
+
+        let mut caller_function = test_function_in_module(&module_name_gen, "caller");
+        caller_function.params = ParamSpec {
+            params: vec![
+                test_param("fn", ParamKind::Any, false),
+                test_param("items", ParamKind::Any, false),
+                test_param("index", ParamKind::Any, false),
+            ],
+        };
+        let caller_block_label = caller_function.name_gen.next_block_name();
+        let caller_call_instr_id = InstrId::new(10);
+        caller_function.blocks = vec![CodegenBlock {
+            label: caller_block_label,
+            body: vec![with_instr_id(
+                op_expr(Call::new(
+                    name_expr(test_local_name("fn", 0)),
+                    vec![
+                        CallArgPositional::Positional(name_expr(test_local_name("items", 1))),
+                        CallArgPositional::Positional(name_expr(test_local_name("index", 2))),
+                    ],
+                    Vec::<CallArgKeyword<InstrCodegen>>::new(),
+                )),
+                caller_call_instr_id,
+            )],
+            term: ret_term(none_expr()),
+            params: Vec::new(),
+            exc_edge: None,
+            extra: Default::default(),
+        }];
+        set_stack_slots(&mut caller_function, &["fn", "items", "index"]);
+
+        let callee_id = callee_function.function_id;
+        let caller_id = caller_function.function_id;
+        let module = test_module(module_name_gen, vec![callee_function, caller_function]);
+        let exact_list_item_plan = |source, access| OptV3ExactListItemAccessPlan {
+            source,
+            access,
+            shape: PlanV3ExactListItemShape::ExactListExactInt,
+            guard: PlanV3ExactListItemGuardKind::ExactListExactCompactIntInBounds,
+            fallback: PlanV3ExactListItemFallbackKind::OriginalItemAccess,
+        };
+        let profile = SpecializationProfile {
+            module_name: Some(module_name),
+            counter_dump_path: None,
+            direct_call_emission_scope: DirectCallEmissionScope::AllDirectCallCandidates,
+            opt_v3_emitted_direct_calls: HashMap::from([(
+                caller_id,
+                HashMap::from([(
+                    caller_call_instr_id,
+                    vec![ResolvedV3DirectCallPlan {
+                        source: caller_call_instr_id,
+                        target: callee_id,
+                        callee: soac_ir_typed::plan_v3::DirectCallCallee::Function,
+                        arg_plan: TypedDirectCallArgPlan {
+                            sources: vec![
+                                TypedDirectCallArgSource::Provided(0),
+                                TypedDirectCallArgSource::Provided(1),
+                            ],
+                        },
+                        body: CallBodyPlan {
+                            kind: CallBodyKind::Inline,
+                            cost: Cost::default(),
+                            inline_target: None,
+                            reason: "test inlines the effect-only call body".to_string(),
+                        },
+                        reason: "profiled direct call".to_string(),
+                    }],
+                )]),
+            )]),
+            opt_v3_emitted_exact_list_items: HashMap::from([(
+                callee_id,
+                HashMap::from([
+                    (
+                        callee_setitem_instr_id,
+                        exact_list_item_plan(
+                            callee_setitem_instr_id,
+                            PlanV3ExactListItemAccessKind::Set,
+                        ),
+                    ),
+                    (
+                        callee_getitem_instr_id,
+                        exact_list_item_plan(
+                            callee_getitem_instr_id,
+                            PlanV3ExactListItemAccessKind::Get,
+                        ),
+                    ),
+                ]),
+            )]),
+            opt_v3_emitted_indexed_fields: HashMap::new(),
+            opt_v3_emitted_indexed_globals: HashMap::new(),
+            opt_v3_exact_int_branch_artifacts: HashMap::new(),
+            behavior_change_indexed_stores: false,
+            profiled_cold_blocks: false,
+            guard_miss_deopt: false,
+        };
+
+        let module_plan =
+            build_typed_v3_jit_module_plan(&module, Some(&profile), &typed_v3_env_config())
+                .expect("typed-v3 module plan should inline and remap callee item plans");
+        let planned_caller = module_plan
+            .module
+            .callable_defs
+            .iter()
+            .find(|function| function.function_id == caller_id)
+            .expect("planned module should include caller");
+        assert_eq!(
+            count_typed_instrs(planned_caller, |expr| {
+                matches!(expr, InstrTyped::GuardedCallableCallTyped(_))
+            }),
+            0,
+            "inline-winning effect-only calls should be expanded into typed CFG"
+        );
+        assert_eq!(
+            planned_caller
+                .blocks
+                .iter()
+                .filter(|block| {
+                    matches!(
+                        &block.term,
+                        BlockTerm::IfTerm(term)
+                            if matches!(term.test, InstrTyped::DirectCallGuardTest(_))
+                    )
+                })
+                .count(),
+            1,
+            "the inlined call should keep a direct-call guard in the caller CFG"
+        );
+
+        let mut setitem_plans = Vec::new();
+        let mut getitem_plans = Vec::new();
+        struct Collector<'a> {
+            setitem_plans: &'a mut Vec<(
+                InstrId,
+                InstrId,
+                PlanV3ExactListItemAccessKind,
+                Option<(RuntimeFunctionId, InstrId)>,
+            )>,
+            getitem_plans: &'a mut Vec<(
+                InstrId,
+                InstrId,
+                PlanV3ExactListItemAccessKind,
+                Option<(RuntimeFunctionId, InstrId)>,
+            )>,
+        }
+        impl Visit<InstrTyped> for Collector<'_> {
+            fn visit_instr(&mut self, expr: &InstrTyped) {
+                match expr {
+                    InstrTyped::SetItem(op) => {
+                        if let Some(plan) = op.extra().exact_list_item_access_plan() {
+                            self.setitem_plans.push((
+                                op.semantic_instr_id(),
+                                plan.instr_id,
+                                plan.access,
+                                plan.counter_source
+                                    .map(|source| (source.function_id, source.instr_id)),
+                            ));
+                        }
+                    }
+                    InstrTyped::GetItem(op) => {
+                        if let Some(plan) = op.extra().exact_list_item_access_plan() {
+                            self.getitem_plans.push((
+                                op.semantic_instr_id(),
+                                plan.instr_id,
+                                plan.access,
+                                plan.counter_source
+                                    .map(|source| (source.function_id, source.instr_id)),
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+                expr.visit_children(self);
+            }
+        }
+        let mut collector = Collector {
+            setitem_plans: &mut setitem_plans,
+            getitem_plans: &mut getitem_plans,
+        };
+        collector.visit_fn(planned_caller);
+        assert_eq!(setitem_plans.len(), 1);
+        assert_eq!(getitem_plans.len(), 1);
+
+        let (remapped_setitem_instr_id, setitem_source, setitem_access, setitem_counter_source) =
+            &setitem_plans[0];
+        assert_ne!(*remapped_setitem_instr_id, callee_setitem_instr_id);
+        assert_eq!(*setitem_source, *remapped_setitem_instr_id);
+        assert_eq!(*setitem_access, PlanV3ExactListItemAccessKind::Set);
+        assert_eq!(
+            *setitem_counter_source,
+            Some((callee_id, callee_setitem_instr_id))
+        );
+
+        let (remapped_getitem_instr_id, getitem_source, getitem_access, getitem_counter_source) =
+            &getitem_plans[0];
+        assert_ne!(*remapped_getitem_instr_id, callee_getitem_instr_id);
+        assert_eq!(*getitem_source, *remapped_getitem_instr_id);
+        assert_eq!(*getitem_access, PlanV3ExactListItemAccessKind::Get);
+        assert_eq!(
+            *getitem_counter_source,
+            Some((callee_id, callee_getitem_instr_id))
+        );
+    }
+
+    #[test]
     fn runtime_typed_v3_module_plan_carries_exact_int_selection_shapes() {
         let module_name = "runtime_typed_v3_exact_int_plan_test";
         let module_name_gen = ModuleNameGen::new(0);

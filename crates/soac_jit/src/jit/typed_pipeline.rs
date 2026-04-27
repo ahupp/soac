@@ -20,8 +20,8 @@ use soac_ir_typed::{
     FactStore, InstrTyped, TypedAttrAccessPlan, TypedCallEmissionPlan, TypedCallEmissionPlans,
     TypedCodegenModuleShape, TypedDirectMethodCallGuard, TypedExactIntBranchPlan,
     TypedExactIntPlanSource, TypedExactIntReturnPlan, TypedExactIntScalarThreadPlan,
-    TypedExactListItemAccessPlan, TypedExactListItemPlanSource, TypedIndexedFieldPlanSource,
-    TypedIndexedGlobalAccessPlan, TypedIndexedGlobalPlanSource,
+    TypedExactListItemAccessPlan, TypedExactListItemCounterSource, TypedExactListItemPlanSource,
+    TypedIndexedFieldPlanSource, TypedIndexedGlobalAccessPlan, TypedIndexedGlobalPlanSource,
     assign_missing_typed_function_instr_ids,
 };
 use soac_opt::access_emission_v3::{
@@ -413,12 +413,20 @@ fn annotate_typed_indexed_global_accesses_from_profile(
     Ok(())
 }
 
+#[derive(Clone)]
+struct ProfileExactListItemAccessPlan {
+    plan: OptV3ExactListItemAccessPlan,
+    counter_source: Option<TypedExactListItemCounterSource>,
+}
+
 fn typed_exact_list_item_access_plan_from_opt_v3(
     plan: &OptV3ExactListItemAccessPlan,
+    counter_source: Option<TypedExactListItemCounterSource>,
 ) -> TypedExactListItemAccessPlan {
     TypedExactListItemAccessPlan {
         source: TypedExactListItemPlanSource::OptimizationPlanV3,
         instr_id: plan.source,
+        counter_source,
         access: plan.access,
         shape: plan.shape,
         guard: plan.guard,
@@ -428,10 +436,10 @@ fn typed_exact_list_item_access_plan_from_opt_v3(
 
 fn annotate_typed_exact_list_item_accesses(
     function: &mut BlockPyFunction<TypedCodegenModuleShape>,
-    exact_list_items_by_instr: &HashMap<InstrId, OptV3ExactListItemAccessPlan>,
+    exact_list_items_by_instr: &HashMap<InstrId, ProfileExactListItemAccessPlan>,
 ) -> Result<usize, String> {
     struct Annotator<'a> {
-        exact_list_items_by_instr: &'a HashMap<InstrId, OptV3ExactListItemAccessPlan>,
+        exact_list_items_by_instr: &'a HashMap<InstrId, ProfileExactListItemAccessPlan>,
         used: HashSet<InstrId>,
         count: usize,
         error: Option<String>,
@@ -444,15 +452,18 @@ fn annotate_typed_exact_list_item_accesses(
             expected_access: ExactListItemAccessKind,
         ) -> Option<TypedExactListItemAccessPlan> {
             let plan = self.exact_list_items_by_instr.get(&instr_id)?;
-            if plan.access != expected_access {
+            if plan.plan.access != expected_access {
                 self.error = Some(format!(
                     "optimizer v3 exact-list item plan for {instr_id} expected {:?}, but typed node requires {:?}",
-                    plan.access, expected_access
+                    plan.plan.access, expected_access
                 ));
                 return None;
             }
             self.used.insert(instr_id);
-            Some(typed_exact_list_item_access_plan_from_opt_v3(plan))
+            Some(typed_exact_list_item_access_plan_from_opt_v3(
+                &plan.plan,
+                plan.counter_source,
+            ))
         }
     }
 
@@ -513,14 +524,43 @@ fn annotate_typed_exact_list_item_accesses(
 fn annotate_typed_exact_list_item_accesses_from_profile(
     function: &mut BlockPyFunction<TypedCodegenModuleShape>,
     profile: &SpecializationProfile<'_>,
+    remapped_exact_list_items: Option<&HashMap<InstrId, ProfileExactListItemAccessPlan>>,
 ) -> Result<(), String> {
-    let Some(exact_list_items_by_instr) = profile
+    let mut exact_list_items_by_instr = profile
         .opt_v3_emitted_exact_list_items
         .get(&function.function_id)
-    else {
+        .map(|plans| {
+            plans
+                .iter()
+                .map(|(instr_id, plan)| {
+                    (
+                        *instr_id,
+                        ProfileExactListItemAccessPlan {
+                            plan: plan.clone(),
+                            counter_source: None,
+                        },
+                    )
+                })
+                .collect::<HashMap<_, _>>()
+        })
+        .unwrap_or_default();
+    if let Some(remapped_exact_list_items) = remapped_exact_list_items {
+        for (instr_id, plan) in remapped_exact_list_items {
+            if exact_list_items_by_instr
+                .insert(*instr_id, plan.clone())
+                .is_some()
+            {
+                return Err(format!(
+                    "remapped optimizer v3 exact-list item plan for {} collides with an existing caller plan",
+                    instr_id
+                ));
+            }
+        }
+    }
+    if exact_list_items_by_instr.is_empty() {
         return Ok(());
-    };
-    annotate_typed_exact_list_item_accesses(function, exact_list_items_by_instr)?;
+    }
+    annotate_typed_exact_list_item_accesses(function, &exact_list_items_by_instr)?;
     Ok(())
 }
 
@@ -754,10 +794,15 @@ fn annotate_typed_exact_int_selections_from_profile(
 fn apply_profile_access_and_scalar_plans_to_typed_function(
     function: &mut BlockPyFunction<TypedCodegenModuleShape>,
     profile: &SpecializationProfile<'_>,
+    remapped_exact_list_items: Option<&HashMap<InstrId, ProfileExactListItemAccessPlan>>,
 ) -> Result<(), String> {
     annotate_typed_indexed_field_accesses_from_profile(function, profile)?;
     annotate_typed_indexed_global_accesses_from_profile(function, profile)?;
-    annotate_typed_exact_list_item_accesses_from_profile(function, profile)?;
+    annotate_typed_exact_list_item_accesses_from_profile(
+        function,
+        profile,
+        remapped_exact_list_items,
+    )?;
     annotate_typed_exact_int_selections_from_profile(function, profile)?;
     Ok(())
 }
@@ -797,6 +842,49 @@ pub(super) fn apply_profile_typed_guard_miss_policy_to_typed_function(
     annotator.visit_fn_mut(function);
 }
 
+fn remap_inlined_exact_list_item_accesses(
+    caller_function_id: RuntimeFunctionId,
+    mappings: &[soac_opt::passes::TypedInlineInstrIdMapping],
+    profile: &SpecializationProfile<'_>,
+    remapped_exact_list_items: &mut HashMap<
+        RuntimeFunctionId,
+        HashMap<InstrId, ProfileExactListItemAccessPlan>,
+    >,
+) -> Result<usize, String> {
+    let mut count = 0;
+    for mapping in mappings {
+        let Some(callee_items) = profile.opt_v3_emitted_exact_list_items.get(&mapping.callee)
+        else {
+            continue;
+        };
+        let Some(plan) = callee_items.get(&mapping.callee_instr_id) else {
+            continue;
+        };
+        let mut remapped = plan.clone();
+        remapped.source = mapping.caller_instr_id;
+        let remapped = ProfileExactListItemAccessPlan {
+            plan: remapped,
+            counter_source: Some(TypedExactListItemCounterSource {
+                function_id: mapping.callee,
+                instr_id: mapping.callee_instr_id,
+            }),
+        };
+        if remapped_exact_list_items
+            .entry(caller_function_id)
+            .or_default()
+            .insert(mapping.caller_instr_id, remapped)
+            .is_some()
+        {
+            return Err(format!(
+                "inlined exact-list item plan for callee {} instruction {} collides at caller instruction {}",
+                mapping.callee, mapping.callee_instr_id, mapping.caller_instr_id
+            ));
+        }
+        count += 1;
+    }
+    Ok(count)
+}
+
 #[cfg(test)]
 pub(super) fn apply_profile_typed_plans_to_typed_function(
     function: &mut BlockPyFunction<TypedCodegenModuleShape>,
@@ -806,7 +894,7 @@ pub(super) fn apply_profile_typed_plans_to_typed_function(
         return Ok(());
     };
     apply_profile_call_emission_plans_to_typed_function(function, profile)?;
-    apply_profile_access_and_scalar_plans_to_typed_function(function, profile)?;
+    apply_profile_access_and_scalar_plans_to_typed_function(function, profile, None)?;
     apply_profile_typed_block_metadata_to_typed_function(function, profile)?;
     apply_profile_typed_guard_miss_policy_to_typed_function(function, profile);
     Ok(())
@@ -871,10 +959,13 @@ fn apply_typed_v3_module_rewrites(
 ) -> Result<(), String> {
     let callee_module = module.clone();
     let external_callees = HashMap::new();
+    let mut remapped_exact_list_items =
+        HashMap::<RuntimeFunctionId, HashMap<InstrId, ProfileExactListItemAccessPlan>>::new();
     for function in &mut module.callable_defs {
         apply_profile_call_emission_plans_to_typed_function(function, profile)?;
         let inline_direct_calls = profile.typed_inline_resolved_direct_calls(function.function_id);
         if !inline_direct_calls.is_empty() {
+            let caller_function_id = function.function_id;
             let inline_targets = profile.typed_inline_direct_calls(function.function_id);
             let stats = inline_typed_function_direct_call_stores(
                 function,
@@ -882,12 +973,24 @@ fn apply_typed_v3_module_rewrites(
                 &external_callees,
                 &inline_targets,
             );
-            if stats.rewritten_stores != 0 {
+            if !stats.instr_id_mappings.is_empty() {
+                remap_inlined_exact_list_item_accesses(
+                    caller_function_id,
+                    &stats.instr_id_mappings,
+                    profile,
+                    &mut remapped_exact_list_items,
+                )?;
+            }
+            if stats.rewritten_stores != 0 || stats.rewritten_effect_only_calls != 0 {
                 assign_missing_typed_function_instr_ids(function);
                 refresh_typed_function_value_facts(function);
             }
         }
-        apply_profile_access_and_scalar_plans_to_typed_function(function, profile)?;
+        apply_profile_access_and_scalar_plans_to_typed_function(
+            function,
+            profile,
+            remapped_exact_list_items.get(&function.function_id),
+        )?;
         apply_profile_typed_block_metadata_to_typed_function(function, profile)?;
         apply_profile_typed_guard_miss_policy_to_typed_function(function, profile);
     }

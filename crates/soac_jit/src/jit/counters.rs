@@ -268,6 +268,29 @@ pub(super) fn collect_runtime_counter_refs_by_kind_branch(
         .collect()
 }
 
+pub(super) fn collect_runtime_counter_refs_by_kind_branch_source(
+    counter_defs: &[CounterDef],
+    kind: &str,
+    branch: &str,
+) -> HashMap<(RuntimeFunctionId, InstrId), CounterRef> {
+    counter_defs
+        .iter()
+        .filter_map(|counter| match &counter.site {
+            CounterSite::Runtime {
+                function_id: Some(counter_function_id),
+                instr_id: Some(instr_id),
+            } if counter.kind == kind => {
+                let branch_id = counter.branch_id(branch)?;
+                Some((
+                    (*counter_function_id, *instr_id),
+                    CounterRef::branch(counter.id, branch_id),
+                ))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 fn deopt_entry_source_for_resume_point(point: LocalEnvResumePoint) -> DeoptEntrySource {
     match point {
         LocalEnvResumePoint::BlockEntry { block, .. } => {

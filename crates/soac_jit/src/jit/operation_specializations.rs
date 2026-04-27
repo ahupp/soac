@@ -10,7 +10,9 @@ use super::symbols::{
 use cranelift_codegen::ir;
 use cranelift_codegen::ir::InstBuilder;
 use pyo3::ffi;
-use soac_core::block_py::{CounterId, GetItem, HasSemanticInstrId, Instr, InstrId, SetItem};
+use soac_core::block_py::{
+    CounterId, GetItem, HasSemanticInstrId, Instr, InstrId, RuntimeFunctionId, SetItem,
+};
 use soac_core::profile::{CollectedTypeKeyLayout, CounterDumpTypeKey};
 use soac_ir_blockpy::InstrCodegen;
 use soac_ir_typed::plan_v3::{
@@ -54,6 +56,7 @@ struct RawPyLongObject {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct ExactListItemLoweringPlan {
     access: ExactListItemAccessKind,
+    counter_source: Option<(RuntimeFunctionId, InstrId)>,
 }
 
 impl ExactListItemLoweringPlan {
@@ -73,6 +76,9 @@ pub(super) fn lowering_plan_from_typed_exact_list_item(
     debug_assert_eq!(plan.access, expected_access);
     ExactListItemLoweringPlan {
         access: plan.access,
+        counter_source: plan
+            .counter_source
+            .map(|source| (source.function_id, source.instr_id)),
     }
 }
 
@@ -459,18 +465,52 @@ pub(super) fn emit_getitem_with_plan<'fb, E: Instr>(
         .getitem_shape_counter_ids
         .get(&instr_id)
         .copied();
-    let specialized_hit_counter_id = state
-        .ctx()
-        .getitem_specialized_hit_counter_ids
-        .get(&instr_id)
-        .copied();
-    let specialized_fallback_counter_id = state
-        .ctx()
-        .getitem_specialized_fallback_counter_ids
-        .get(&instr_id)
-        .copied();
+    let counter_source = lowering_plan.and_then(|plan| plan.counter_source);
+    let specialized_hit_counter_id = counter_source
+        .and_then(|source| {
+            state
+                .ctx()
+                .getitem_specialized_hit_counter_ids_by_source
+                .get(&source)
+                .copied()
+        })
+        .or_else(|| {
+            state
+                .ctx()
+                .getitem_specialized_hit_counter_ids
+                .get(&instr_id)
+                .copied()
+        });
+    let specialized_fallback_counter_id = counter_source
+        .and_then(|source| {
+            state
+                .ctx()
+                .getitem_specialized_fallback_counter_ids_by_source
+                .get(&source)
+                .copied()
+        })
+        .or_else(|| {
+            state
+                .ctx()
+                .getitem_specialized_fallback_counter_ids
+                .get(&instr_id)
+                .copied()
+        });
     if shape_counter_id.is_none() && lowering_plan.is_none() {
         return emit_generic_getitem_from_exprs(op, state);
+    }
+
+    if shape_counter_id.is_none()
+        && let Some(plan) = lowering_plan
+        && state.can_emit_guarded_i64_index_arg(op.index.as_ref())
+    {
+        return emit_exact_list_item_getitem_from_guarded_i64_index(
+            op,
+            state,
+            plan,
+            specialized_hit_counter_id,
+            specialized_fallback_counter_id,
+        );
     }
 
     let arg_values = state.emit_arg_values(&[op.value.as_ref(), op.index.as_ref()]);
@@ -512,18 +552,52 @@ pub(super) fn emit_setitem_with_plan<'fb, E: Instr>(
         .setitem_shape_counter_ids
         .get(&instr_id)
         .copied();
-    let specialized_hit_counter_id = state
-        .ctx()
-        .setitem_specialized_hit_counter_ids
-        .get(&instr_id)
-        .copied();
-    let specialized_fallback_counter_id = state
-        .ctx()
-        .setitem_specialized_fallback_counter_ids
-        .get(&instr_id)
-        .copied();
+    let counter_source = lowering_plan.and_then(|plan| plan.counter_source);
+    let specialized_hit_counter_id = counter_source
+        .and_then(|source| {
+            state
+                .ctx()
+                .setitem_specialized_hit_counter_ids_by_source
+                .get(&source)
+                .copied()
+        })
+        .or_else(|| {
+            state
+                .ctx()
+                .setitem_specialized_hit_counter_ids
+                .get(&instr_id)
+                .copied()
+        });
+    let specialized_fallback_counter_id = counter_source
+        .and_then(|source| {
+            state
+                .ctx()
+                .setitem_specialized_fallback_counter_ids_by_source
+                .get(&source)
+                .copied()
+        })
+        .or_else(|| {
+            state
+                .ctx()
+                .setitem_specialized_fallback_counter_ids
+                .get(&instr_id)
+                .copied()
+        });
     if shape_counter_id.is_none() && lowering_plan.is_none() {
         return emit_generic_setitem_from_exprs(op, state);
+    }
+
+    if shape_counter_id.is_none()
+        && let Some(plan) = lowering_plan
+        && state.can_emit_guarded_i64_index_arg(op.index.as_ref())
+    {
+        return emit_exact_list_item_setitem_from_guarded_i64_index(
+            op,
+            state,
+            plan,
+            specialized_hit_counter_id,
+            specialized_fallback_counter_id,
+        );
     }
 
     let arg_values = state.emit_arg_values(&[
@@ -941,6 +1015,113 @@ fn emit_exact_list_exact_compact_int_in_bounds_guard<'fb, E>(
     normalized_index
 }
 
+fn emit_exact_list_i64_index_in_bounds_guard<'fb, E>(
+    state: &mut impl OperationEmitState<'fb, E>,
+    plan: ExactListItemLoweringPlan,
+    expected_access: ExactListItemAccessKind,
+    obj: ir::Value,
+    raw_index: ir::Value,
+    list_type: ir::Value,
+    guard_miss_block: ir::Block,
+) -> ir::Value {
+    plan.expect_exact_list_exact_int(expected_access);
+
+    let ptr_ty = state.ctx().consts.ptr_ty;
+    let i64_ty = state.ctx().consts.i64_ty;
+
+    let obj_not_null_block = state.fb().create_block();
+    let obj_is_null = state
+        .fb()
+        .ins()
+        .icmp_imm(ir::condcodes::IntCC::Equal, obj, 0);
+    state
+        .fb()
+        .ins()
+        .brif(obj_is_null, guard_miss_block, &[], obj_not_null_block, &[]);
+
+    state.fb().switch_to_block(obj_not_null_block);
+    let obj_type = state.fb().ins().load(
+        ptr_ty,
+        ir::MemFlags::trusted(),
+        obj,
+        offset_of!(ffi::PyObject, ob_type) as i32,
+    );
+    let is_exact_list = state
+        .fb()
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, obj_type, list_type);
+    let index_block = state.fb().create_block();
+    state
+        .fb()
+        .ins()
+        .brif(is_exact_list, index_block, &[], guard_miss_block, &[]);
+
+    state.fb().switch_to_block(index_block);
+    let list_len = state.fb().ins().load(
+        i64_ty,
+        ir::MemFlags::trusted(),
+        obj,
+        offset_of!(ffi::PyListObject, ob_base) as i32
+            + offset_of!(ffi::PyVarObject, ob_size) as i32,
+    );
+    let negative_index_block = state.fb().create_block();
+    let nonnegative_index_block = state.fb().create_block();
+    let normalized_index_block = state.fb().create_block();
+    state
+        .fb()
+        .append_block_param(normalized_index_block, i64_ty);
+    let is_negative_index =
+        state
+            .fb()
+            .ins()
+            .icmp_imm(ir::condcodes::IntCC::SignedLessThan, raw_index, 0);
+    state.fb().ins().brif(
+        is_negative_index,
+        negative_index_block,
+        &[],
+        nonnegative_index_block,
+        &[],
+    );
+
+    state.fb().switch_to_block(negative_index_block);
+    let adjusted_index = state.fb().ins().iadd(raw_index, list_len);
+    state.fb().ins().jump(
+        normalized_index_block,
+        &[ir::BlockArg::Value(adjusted_index)],
+    );
+
+    state.fb().switch_to_block(nonnegative_index_block);
+    state
+        .fb()
+        .ins()
+        .jump(normalized_index_block, &[ir::BlockArg::Value(raw_index)]);
+
+    state.fb().switch_to_block(normalized_index_block);
+    let normalized_index = state.fb().block_params(normalized_index_block)[0];
+    let index_ge_zero = state.fb().ins().icmp_imm(
+        ir::condcodes::IntCC::SignedGreaterThanOrEqual,
+        normalized_index,
+        0,
+    );
+    let index_lt_len = state.fb().ins().icmp(
+        ir::condcodes::IntCC::SignedLessThan,
+        normalized_index,
+        list_len,
+    );
+    let index_in_bounds = state.fb().ins().band(index_ge_zero, index_lt_len);
+    let direct_access_block = state.fb().create_block();
+    state.fb().ins().brif(
+        index_in_bounds,
+        direct_access_block,
+        &[],
+        guard_miss_block,
+        &[],
+    );
+
+    state.fb().switch_to_block(direct_access_block);
+    normalized_index
+}
+
 fn emit_exact_list_exact_int_getitem<'fb, E>(
     state: &mut impl OperationEmitState<'fb, E>,
     arg_values: &[(ir::Value, bool)],
@@ -1008,6 +1189,78 @@ fn emit_exact_list_exact_int_getitem<'fb, E>(
     increment_counter_with_state(state, specialized_fallback_counter_id);
     let fallback_value = emit_generic_getitem_from_arg_values(state, arg_values);
     state.release_arg_values(arg_values);
+    state
+        .fb()
+        .ins()
+        .jump(result_block, &[ir::BlockArg::Value(fallback_value)]);
+
+    state.fb().switch_to_block(result_block);
+    let result = state.fb().block_params(result_block)[0];
+    state.finish_owned_result(result)
+}
+
+fn emit_exact_list_item_getitem_from_guarded_i64_index<'fb, E: Instr>(
+    op: &GetItem<E>,
+    state: &mut impl OperationEmitState<'fb, E>,
+    plan: ExactListItemLoweringPlan,
+    specialized_hit_counter_id: Option<CounterRef>,
+    specialized_fallback_counter_id: Option<CounterRef>,
+) -> ir::Value {
+    plan.expect_exact_list_exact_int(ExactListItemAccessKind::Get);
+    let Some(list_type) =
+        state.emit_type_ptr_value(&RelocTypeRef::CpythonTypeSymbol(CpythonTypeSymbol::List))
+    else {
+        return emit_generic_getitem_from_exprs(op, state);
+    };
+
+    let ptr_ty = state.ctx().consts.ptr_ty;
+    let incref_ref = state.ctx().incref_ref;
+
+    let obj_values = state.emit_arg_values(&[op.value.as_ref()]);
+    let result_block = state.fb().create_block();
+    state.fb().append_block_param(result_block, ptr_ty);
+    let fallback_block = state.fb().create_block();
+    state.fb().set_cold_block(fallback_block);
+
+    let obj = obj_values[0].0;
+    let raw_index = state
+        .emit_guarded_i64_index_arg(op.index.as_ref(), fallback_block)
+        .expect("guarded item index should emit after can_emit_guarded_i64_index_arg");
+    let normalized_index = emit_exact_list_i64_index_in_bounds_guard(
+        state,
+        plan,
+        ExactListItemAccessKind::Get,
+        obj,
+        raw_index,
+        list_type,
+        fallback_block,
+    );
+    increment_counter_with_state(state, specialized_hit_counter_id);
+    let items = state.fb().ins().load(
+        ptr_ty,
+        ir::MemFlags::trusted(),
+        obj,
+        offset_of!(ffi::PyListObject, ob_item) as i32,
+    );
+    let item_offset = state.fb().ins().ishl_imm(normalized_index, 3);
+    let item_addr = state.fb().ins().iadd(items, item_offset);
+    let item = state
+        .fb()
+        .ins()
+        .load(ptr_ty, ir::MemFlags::trusted(), item_addr, 0);
+    state.fb().ins().call(incref_ref, &[item]);
+    state.release_arg_values(&obj_values);
+    state
+        .fb()
+        .ins()
+        .jump(result_block, &[ir::BlockArg::Value(item)]);
+
+    state.fb().switch_to_block(fallback_block);
+    increment_counter_with_state(state, specialized_fallback_counter_id);
+    let key_values = state.emit_arg_values(&[op.index.as_ref()]);
+    let arg_values = [obj_values[0], key_values[0]];
+    let fallback_value = emit_generic_getitem_from_arg_values(state, &arg_values);
+    state.release_arg_values(&arg_values);
     state
         .fb()
         .ins()
@@ -1114,6 +1367,117 @@ fn emit_exact_list_exact_int_setitem<'fb, E>(
     increment_counter_with_state(state, specialized_fallback_counter_id);
     let fallback_value = emit_generic_setitem_from_arg_values(state, arg_values);
     state.release_arg_values(arg_values);
+    state
+        .fb()
+        .ins()
+        .jump(result_block, &[ir::BlockArg::Value(fallback_value)]);
+
+    state.fb().switch_to_block(result_block);
+    let result = state.fb().block_params(result_block)[0];
+    state.finish_owned_result(result)
+}
+
+fn emit_exact_list_item_setitem_from_guarded_i64_index<'fb, E: Instr>(
+    op: &SetItem<E>,
+    state: &mut impl OperationEmitState<'fb, E>,
+    plan: ExactListItemLoweringPlan,
+    specialized_hit_counter_id: Option<CounterRef>,
+    specialized_fallback_counter_id: Option<CounterRef>,
+) -> ir::Value {
+    plan.expect_exact_list_exact_int(ExactListItemAccessKind::Set);
+    let Some(list_type) =
+        state.emit_type_ptr_value(&RelocTypeRef::CpythonTypeSymbol(CpythonTypeSymbol::List))
+    else {
+        return emit_generic_setitem_from_exprs(op, state);
+    };
+
+    let ptr_ty = state.ctx().consts.ptr_ty;
+    let thread_state_value = state.ctx().consts.thread_state_value;
+    let incref_ref = state.ctx().incref_ref;
+    let decref_ref = state.ctx().decref_ref;
+
+    let obj_values = state.emit_arg_values(&[op.value.as_ref()]);
+    let result_block = state.fb().create_block();
+    state.fb().append_block_param(result_block, ptr_ty);
+    let fallback_block = state.fb().create_block();
+    state.fb().set_cold_block(fallback_block);
+
+    let obj = obj_values[0].0;
+    let raw_index = state
+        .emit_guarded_i64_index_arg(op.index.as_ref(), fallback_block)
+        .expect("guarded item index should emit after can_emit_guarded_i64_index_arg");
+    let normalized_index = emit_exact_list_i64_index_in_bounds_guard(
+        state,
+        plan,
+        ExactListItemAccessKind::Set,
+        obj,
+        raw_index,
+        list_type,
+        fallback_block,
+    );
+    let replacement_values = state.emit_arg_values(&[op.replacement.as_ref()]);
+    let replacement = replacement_values[0].0;
+    let replacement_is_null =
+        state
+            .fb()
+            .ins()
+            .icmp_imm(ir::condcodes::IntCC::Equal, replacement, 0);
+    let replacement_not_null_block = state.fb().create_block();
+    let replacement_null_block = state.fb().create_block();
+    state.fb().ins().brif(
+        replacement_is_null,
+        replacement_null_block,
+        &[],
+        replacement_not_null_block,
+        &[],
+    );
+
+    state.fb().switch_to_block(replacement_null_block);
+    state.release_arg_values(&obj_values);
+    state.release_arg_values(&replacement_values);
+    let step_null_block = state.ctx().consts.step_null_block;
+    let step_null_args = super::step_null_block_args(state.ctx());
+    state.fb().ins().jump(step_null_block, &step_null_args);
+
+    state.fb().switch_to_block(replacement_not_null_block);
+    increment_counter_with_state(state, specialized_hit_counter_id);
+    let items = state.fb().ins().load(
+        ptr_ty,
+        ir::MemFlags::trusted(),
+        obj,
+        offset_of!(ffi::PyListObject, ob_item) as i32,
+    );
+    let item_offset = state.fb().ins().ishl_imm(normalized_index, 3);
+    let item_addr = state.fb().ins().iadd(items, item_offset);
+    let old_item = state
+        .fb()
+        .ins()
+        .load(ptr_ty, ir::MemFlags::trusted(), item_addr, 0);
+    state.fb().ins().call(incref_ref, &[replacement]);
+    state
+        .fb()
+        .ins()
+        .store(ir::MemFlags::trusted(), replacement, item_addr, 0);
+    state
+        .fb()
+        .ins()
+        .call(decref_ref, &[thread_state_value, old_item]);
+    state.release_arg_values(&obj_values);
+    state.release_arg_values(&replacement_values);
+    let none = state.emit_owned_module_constant(state.ctx().consts.none_constant_id);
+    state.fb().ins().call(incref_ref, &[none]);
+    state
+        .fb()
+        .ins()
+        .jump(result_block, &[ir::BlockArg::Value(none)]);
+
+    state.fb().switch_to_block(fallback_block);
+    increment_counter_with_state(state, specialized_fallback_counter_id);
+    let key_values = state.emit_arg_values(&[op.index.as_ref()]);
+    let replacement_values = state.emit_arg_values(&[op.replacement.as_ref()]);
+    let arg_values = [obj_values[0], key_values[0], replacement_values[0]];
+    let fallback_value = emit_generic_setitem_from_arg_values(state, &arg_values);
+    state.release_arg_values(&arg_values);
     state
         .fb()
         .ins()
