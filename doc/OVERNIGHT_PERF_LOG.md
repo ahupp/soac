@@ -1,5 +1,37 @@
 # Overnight Performance Log
 
+## 2026-04-27 - Cached small ints in fast range next
+
+- baseline: `work/bench/uxwoxrqpzwzw_acb20ab139b0`
+  - specialized apply median: `588058 loops/s`
+  - specialized apply mean: `586858 loops/s`
+  - verify pass: `335249 loops/s`
+  - no-refcount diagnostic median: `762813 loops/s`
+  - latest summarized pystone code size: `66689 bytes`, `3918` machine blocks
+- observation: the deep profile still showed `PyLong_FromLong` under the
+  specialized `next(range_iterator)` vectorcall helper. CPython's
+  `PyLong_FromLong` returns immortal singleton objects for small ints, so the
+  helper looked like a possible place to avoid the C API call for small yielded
+  values.
+- attempted change: cache the singleton stride from `PyLong_FromLong(0)` and
+  `PyLong_FromLong(1)`, return the corresponding small-int singleton directly
+  for values in CPython's `[-5, 1025)` small-int range, and fall back to
+  `PyLong_FromLong` otherwise.
+- rejected result: `work/bench/vtotzyqmqnvk_4c31798317ea`
+  - specialized apply median: `564890 loops/s` (`-3.94%`)
+  - specialized apply mean: `562049 loops/s` (`-4.23%`)
+  - verify pass: `336659 loops/s` (`+0.42%`)
+  - no-refcount diagnostic median: `756262 loops/s` (`-0.86%`)
+  - latest summarized pystone code size: `66689 bytes`, `3918` machine blocks
+  - code-size delta: `+0 bytes`, `+0` machine blocks
+- reason rejected: the production apply pass regressed substantially. The
+  extra range check and cached-pointer arithmetic were worse than the existing
+  `PyLong_FromLong` path for this workload.
+- validation before rejection: `just fmt-rust soac_jit` passed; `cargo check -p
+  soac_jit --tests` passed; `just benchmark` produced the rejected result
+  above. The implementation was then reverted.
+- next baseline: `work/bench/uxwoxrqpzwzw_acb20ab139b0`
+
 ## 2026-04-27 - Use memcmp for compact ASCII string compares
 
 - baseline: `work/bench/rzksyulqnrst_fb9310152742`
