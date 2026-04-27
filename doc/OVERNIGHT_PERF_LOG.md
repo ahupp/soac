@@ -1,5 +1,41 @@
 # Overnight Performance Log
 
+## 2026-04-27 - Exact compact-int true division specialization
+
+- baseline: `work/bench/qkzxlxtsvpuq_addfd7675506`
+  - specialized apply median: `566978 loops/s`
+  - specialized apply mean: `568132 loops/s`
+  - verify pass: `340618 loops/s`
+  - no-refcount diagnostic median: `736336 loops/s`
+  - latest summarized pystone code size: `65372 bytes`, `3862` machine blocks
+- observation: Proc0 still had a true-division operation on exact compact int
+  values. A v3-planned checked `i64` to `f64` path looked like a possible way to
+  avoid generic `PyNumber_TrueDivide` on the profiled hot case while preserving
+  local fallback for zero divisors and values that are not exactly representable
+  as `f64`.
+- attempted change: add a v3 exact-int `TrueDiv` alternative that guards compact
+  exact `PyLong` operands, converts exactly representable integers to `f64`,
+  emits a machine `fdiv`, and materializes the result with `PyFloat_FromDouble`.
+  Generic `PyNumber_TrueDivide` remains the local fallback.
+- rejected result: `work/bench/plzplnxnnxqp_454ebf5880a5`
+  - specialized apply median: `554731 loops/s` (`-2.16%`)
+  - specialized apply mean: `557034 loops/s` (`-1.95%`)
+  - verify pass: `342227 loops/s` (`+0.47%`)
+  - no-refcount diagnostic median: `743656 loops/s` (`+0.99%`)
+  - latest summarized pystone code size: `65372 bytes`, `3862` machine blocks
+  - code-size delta: `+0 bytes`, `+0` machine blocks
+- reason rejected: the scalar floating-point path helped the no-refcount
+  diagnostic slightly, but the refcount-enabled production apply pass regressed
+  materially with no generated code-size improvement.
+- validation before rejection: `just fmt-rust soac_ir_typed soac_opt soac_jit`
+  passed; `cargo test -p soac_opt plans_compact_int_true_div_return --
+  --nocapture` passed; `cargo test -p soac_jit
+  specialized_jit_opt_v3_exact_int_true_div_return_artifact_emits_f64_path --
+  --nocapture` passed; `cargo check -p soac_jit --tests` passed; `just
+  benchmark` produced the rejected result above. The experiment was then
+  reverted.
+- next baseline: `work/bench/qkzxlxtsvpuq_addfd7675506`
+
 ## 2026-04-27 - Keep enabled refcount helpers out of caller inlining
 
 - baseline: `work/bench/qkzxlxtsvpuq_addfd7675506`
