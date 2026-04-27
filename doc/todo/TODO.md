@@ -37,6 +37,12 @@
    * Does it unlock other optimizations?
 
  * Minimize refcounting
+   * Follow up on the refcount/inline-ownership code-size theme: the compact refcount helper-body
+     experiment reduced tiny blocks but grew bytes by trading `sub`/`test` DECREFs for larger
+     `lea`/`cmp` sequences and per-site cold dealloc edges. Rework toward machine-pattern-friendly
+     DECREF emission or real shared cold dealloc outlining, and avoid storage-layout stack temps for
+     inline-only values by carrying them through guard hot/fallback edges as SSA/block params instead
+     of `typed_inline_arg` locals.
  * Code size/locality
    * Counters pass on block entry or perf / last-branch, annotate with cold/unlikely
    
