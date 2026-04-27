@@ -1,5 +1,42 @@
 # Overnight Performance Log
 
+## 2026-04-27 - Inline non-null indexed field stores
+
+- baseline: `work/bench/qkzxlxtsvpuq_addfd7675506`
+  - specialized apply median: `566978 loops/s`
+  - specialized apply mean: `568132 loops/s`
+  - verify pass: `340618 loops/s`
+  - no-refcount diagnostic median: `736336 loops/s`
+  - latest summarized pystone code size: `65372 bytes`, `3862` machine blocks
+- observation: `soac_runtime_store_field_indexed_inline_values_trusted` was a
+  top standalone profile symbol at about `5.68%`. Specialized indexed field
+  stores already know the owner type/version and field index, so the common
+  already-populated split-slot update looked like a candidate for direct JIT
+  emission.
+- attempted change: inline the non-null split-value update in the typed indexed
+  `SetAttr` path: verify no materialized dict, compute the inline values pointer,
+  check validity/capacity, load the old slot value, `INCREF` the replacement,
+  store it, and `DECREF` the old value. The existing trusted helper remains on a
+  cold path for first insertion, and normal generic setattr fallback remains on
+  layout miss.
+- rejected result: `work/bench/tvtwsqpuolsr_fa0397cb8d6b`
+  - specialized apply median: `566818 loops/s` (`-0.03%`)
+  - specialized apply mean: `570183 loops/s` (`+0.36%`)
+  - verify pass: `329895 loops/s` (`-3.15%`)
+  - no-refcount diagnostic median: `743108 loops/s` (`+0.92%`)
+  - latest summarized pystone code size: `67993 bytes`, `4025` machine blocks
+  - code-size delta: `+2621 bytes`, `+163` machine blocks
+- reason rejected: the production median was not materially positive, verify
+  regressed, and the inlined layout/refcount path grew hot pystone functions
+  substantially. The helper-call overhead does not justify duplicating the store
+  shape at current callsites.
+- validation before rejection: `just fmt-rust soac_jit` passed; `cargo test -p
+  soac_jit field_indexed_setattr_guard_miss_keeps_fallback_when_operands_are_replay_safe
+  -- --nocapture` passed; `cargo check -p soac_jit --tests` passed; `just
+  benchmark` produced the rejected result above. The experiment was then
+  reverted.
+- next baseline: `work/bench/qkzxlxtsvpuq_addfd7675506`
+
 ## 2026-04-27 - Guarded scalar index for generic getitem
 
 - baseline: `work/bench/qkzxlxtsvpuq_addfd7675506`
