@@ -1,5 +1,38 @@
 # Overnight Performance Log
 
+## 2026-04-27 - Inline guarded method direct-call stores
+
+- baseline: `work/bench/qkzxlxtsvpuq_addfd7675506`
+  - specialized apply median: `566978 loops/s`
+  - specialized apply mean: `568132 loops/s`
+  - verify pass: `340618 loops/s`
+  - no-refcount diagnostic median: `736336 loops/s`
+  - latest summarized pystone code size: `65372 bytes`, `3862` machine blocks
+- observation: the deep profile still showed hot `Record.copy` execution even
+  though method direct-call targets were already discovered. The typed inline
+  rewriter only handled guarded callable calls, so method calls could direct-call
+  but could not inline the target body into the caller.
+- attempted change: allow same-module method direct-call plans to select an
+  inline body, lower the typed inline guard as an exact receiver type/version
+  check, bind the receiver temp as `self`, and leave a generic method call on
+  the fallback edge.
+- rejected result: `work/bench/nswnkxpqnpxn_73b1924dd064`
+  - specialized apply median: `506102 loops/s` (`-10.74%`)
+  - specialized apply mean: `504145 loops/s` (`-11.26%`)
+  - verify pass: `311432 loops/s`
+  - no-refcount diagnostic median: `615548 loops/s` (`-16.40%`)
+  - latest summarized pystone code size: `65764 bytes`, `3876` machine blocks
+  - code-size delta: `+392 bytes`, `+14` machine blocks
+- reason rejected: the rewrite did remove some runtime direct-call/field/refcount
+  counter traffic, but it grew `Proc1` and made the production apply path much
+  slower. The current inline shape pays too much in receiver temps, guard/fallback
+  control flow, and duplicated inlined body code for the `Record.copy` call.
+- validation before rejection: Rust formatting passed; the focused `soac_opt`
+  and `soac_ir_typed` tests passed; `cargo check -p soac_jit --tests` passed;
+  `just benchmark` produced the rejected result above. The experiment was then
+  reverted.
+- next baseline: `work/bench/qkzxlxtsvpuq_addfd7675506`
+
 ## 2026-04-26 - Fast path compact-ASCII unicode getitem in helper
 
 - baseline: `work/bench/knlskolznnxw_e80c7a557ade`
