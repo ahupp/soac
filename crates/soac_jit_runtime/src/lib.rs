@@ -206,6 +206,7 @@ unsafe extern "C" {
     fn PyTuple_New(size: isize) -> *mut c_void;
     fn PyLong_AsLongLong(obj: *mut c_void) -> i64;
     fn PyLong_AsLongLongAndOverflow(obj: *mut c_void, overflow: *mut c_int) -> i64;
+    fn memcmp(lhs: *const c_void, rhs: *const c_void, n: usize) -> c_int;
     fn _PyDict_SetIndexedItem(dict: *mut c_void, index: isize, value: *mut c_void) -> i32;
     fn soac_runtime_load_global_slow(
         dict: *mut c_void,
@@ -302,14 +303,17 @@ pub unsafe extern "C" fn soac_runtime_compare_compact_ascii_unicode(
     let lhs_data = unsafe { lhs.add(1).cast::<u8>() };
     let rhs_data = unsafe { rhs.add(1).cast::<u8>() };
     let min_len = if lhs_len < rhs_len { lhs_len } else { rhs_len };
-    let mut index = 0usize;
-    while index < min_len {
-        let lhs_byte = unsafe { *lhs_data.add(index) };
-        let rhs_byte = unsafe { *rhs_data.add(index) };
-        if lhs_byte != rhs_byte {
-            return if lhs_byte < rhs_byte { -1 } else { 1 };
+    if min_len != 0 {
+        let compare = unsafe {
+            memcmp(
+                lhs_data.cast::<c_void>() as *const c_void,
+                rhs_data.cast::<c_void>() as *const c_void,
+                min_len,
+            )
+        };
+        if compare != 0 {
+            return compare;
         }
-        index += 1;
     }
     if lhs_len == rhs_len {
         0

@@ -1,5 +1,34 @@
 # Overnight Performance Log
 
+## 2026-04-27 - Use memcmp for compact ASCII string compares
+
+- baseline: `work/bench/rzksyulqnrst_fb9310152742`
+  - specialized apply median: `583069 loops/s`
+  - specialized apply mean: `583539 loops/s`
+  - verify pass: `337257 loops/s`
+  - no-refcount diagnostic median: `740852 loops/s`
+  - latest summarized pystone code size: `66689 bytes`, `3918` machine blocks
+- observation: after moving longer exact-string comparisons to the compact
+  ASCII runtime helper, the helper itself still showed up as a measurable
+  pystone profile symbol.
+- kept change: replace the helper's byte-at-a-time comparison loop with libc
+  `memcmp`, while keeping the same compact-ASCII preconditions and length
+  tie-break behavior.
+- result: `work/bench/uxwoxrqpzwzw_acb20ab139b0`
+  - specialized apply median: `588058 loops/s` (`+0.86%`)
+  - specialized apply mean: `586858 loops/s` (`+0.57%`)
+  - verify pass: `335249 loops/s` (`-0.60%`)
+  - no-refcount diagnostic median: `762813 loops/s` (`+2.96%`)
+  - latest summarized pystone code size: `66689 bytes`, `3918` machine blocks
+  - code-size delta: `+0 bytes`, `+0` machine blocks
+- reason kept: the refcount-enabled production apply median improved
+  materially without increasing generated code size. The verify pass regressed
+  slightly, but the optimization targets steady-state apply behavior.
+- validation: `cargo fmt --manifest-path crates/soac_jit_runtime/Cargo.toml`
+  passed; `cargo check -p soac_jit --tests` passed; `just benchmark` produced
+  the kept result above.
+- next baseline: `work/bench/uxwoxrqpzwzw_acb20ab139b0`
+
 ## 2026-04-27 - Compact ASCII string compare runtime helper
 
 - baseline: `work/bench/moqnnqssmupy_c337b6282dc2`
