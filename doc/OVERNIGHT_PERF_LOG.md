@@ -1,5 +1,41 @@
 # Overnight Performance Log
 
+## 2026-04-27 - Guarded scalar index for generic getitem
+
+- baseline: `work/bench/qkzxlxtsvpuq_addfd7675506`
+  - specialized apply median: `566978 loops/s`
+  - specialized apply mean: `568132 loops/s`
+  - verify pass: `340618 loops/s`
+  - no-refcount diagnostic median: `736336 loops/s`
+  - latest summarized pystone code size: `65372 bytes`, `3862` machine blocks
+- observation: the deep profile still showed generic `PyNumber_Add` cost, and
+  pystone has subscript index expressions such as `i + 1` feeding generic
+  getitem. The typed emitter already had a guarded I64 index path for exact-list
+  plans, so a narrower generic getitem experiment could avoid materializing the
+  index expression before the fallback.
+- attempted change: when a typed generic getitem has no shape counter or
+  exact-list plan, emit the object first, guard and scalarize an index expression
+  that the existing typed index analysis accepts, box only that scalar index for
+  `dp_jit_pyobject_getitem`, and keep the original generic index/getitem
+  sequence on the cold fallback edge.
+- rejected result: `work/bench/omlmmwmytllp_8b9a02b675d5`
+  - specialized apply median: `547483 loops/s` (`-3.44%`)
+  - specialized apply mean: `551342 loops/s` (`-2.96%`)
+  - verify pass: `328559 loops/s` (`-3.54%`)
+  - no-refcount diagnostic median: `745978 loops/s` (`+1.31%`)
+  - latest summarized pystone code size: `65948 bytes`, `3893` machine blocks
+  - code-size delta: `+576 bytes`, `+31` machine blocks
+- reason rejected: the scalar hot path removes some no-refcount cost, but the
+  production path pays for extra guards, fallback control flow, and boxed-key
+  materialization before the generic getitem call. The result regresses apply
+  and verify while increasing generated code size.
+- validation before rejection: `just fmt-rust soac_jit` passed; `cargo test -p
+  soac_jit typed_generic_getitem_with_scalarizable_index_emits_guarded_index_path
+  -- --nocapture` passed; `cargo check -p soac_jit --tests` passed; `just
+  benchmark` produced the rejected result above. The experiment was then
+  reverted.
+- next baseline: `work/bench/qkzxlxtsvpuq_addfd7675506`
+
 ## 2026-04-27 - Direct runtime primitive for range calls
 
 - baseline: `work/bench/qkzxlxtsvpuq_addfd7675506`
