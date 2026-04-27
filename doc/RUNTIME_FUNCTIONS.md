@@ -206,7 +206,6 @@ _clear_cell
 _mark_closed
 _normalize_throw_exc
 _current_throw_context
-float_from_literal
 complex_from_parts
 class_lookup_cell
 class_lookup_global

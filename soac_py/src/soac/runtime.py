@@ -200,13 +200,6 @@ def _normalize_throw_exc(typ, val=None, tb=None, *, where, throw_context=None):
 def _current_throw_context(owner):
     return _yieldfrom_cell_value(owner._throw_context_cell)
 
-
-# TODO: very questionable
-def float_from_literal(literal):
-    # Preserve CPython's literal parsing for values that Rust rounds differently.
-    return float(literal.replace("_", ""))
-
-
 def complex_from_parts(real, imag):
     return _builtins.complex(real, imag)
 
