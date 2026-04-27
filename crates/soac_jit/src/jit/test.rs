@@ -5,15 +5,16 @@ use super::{
     RuntimeJitDeoptContinuation, RuntimeJitDeoptCursor, RuntimeJitDeoptInvocation,
     RuntimeJitDeoptRecord, RuntimeJitDeoptTable, RuntimeJitDeoptUnsupportedReason,
     SOAC_RUNTIME_PROBE_GLOBAL_INDEXED_SYMBOL, SOAC_RUNTIME_STORE_GLOBAL_INDEXED_SYMBOL,
-    SpecializationProfile, StackSlots, build_cranelift_run_bb_specialized_function,
-    build_typed_v3_jit_module_plan, codegen_expr_is_borrowable_from_local_env,
-    codegen_expr_static_can_satisfy_i64_demand, codegen_expr_static_i64_demand_facts,
-    declare_local_fn, declare_module_constant_object_data, declare_scalar_counter_storage_import,
-    declare_top_value_counter_storage_import, define_prepared_function,
-    define_scalar_counter_storage_data, define_scalar_counter_storage_data_for_symbol,
-    define_top_value_counter_storage_data, direct_function_symbol_scope_for_shared_state,
-    emit_decref_unforwarded_local_env, emit_deopt_resume_call, infer_jit_value_facts,
-    local_ref_kind_for_stack_mirror, lookup_registered_jit_data_symbol,
+    SpecializationProfile, StackSlots, annotate_clif_instruction_purposes,
+    build_cranelift_run_bb_specialized_function, build_typed_v3_jit_module_plan,
+    codegen_expr_is_borrowable_from_local_env, codegen_expr_static_can_satisfy_i64_demand,
+    codegen_expr_static_i64_demand_facts, declare_local_fn, declare_module_constant_object_data,
+    declare_scalar_counter_storage_import, declare_top_value_counter_storage_import,
+    define_prepared_function, define_scalar_counter_storage_data,
+    define_scalar_counter_storage_data_for_symbol, define_top_value_counter_storage_data,
+    direct_function_symbol_scope_for_shared_state, emit_decref_unforwarded_local_env,
+    emit_deopt_resume_call, infer_jit_value_facts, local_ref_kind_for_stack_mirror,
+    lookup_registered_jit_data_symbol, nest_clif_blocks_by_nearest_dominator,
     normalize_postopt_clif_for_inspection, parse_runtime_clif_functions,
     placeholder_module_constant_ptrs, planned_owned_pyobject_result_for_typed_expr,
     precompile_codegen_module_to_object_bytes, predeclare_specialization_type_imports,
@@ -105,15 +106,16 @@ mod tests {
         SerializedFunctionId, SerializedIdentityTables, SerializedModuleId,
         SerializedModuleIdentity, SetAttr, SetItem, SpecializationProfile, StackSlots,
         StorageLayout, Store, StringLiteral, Tuple, UnaryOp, UnaryOpKind, Visit, VisitMut,
-        WithMeta, build_cranelift_run_bb_specialized_function, build_typed_v3_jit_module_plan,
-        codegen_expr_is_borrowable_from_local_env, codegen_expr_static_can_satisfy_i64_demand,
-        codegen_expr_static_i64_demand_facts, declare_local_fn,
-        declare_module_constant_object_data, declare_scalar_counter_storage_import,
-        declare_top_value_counter_storage_import, define_prepared_function,
-        define_scalar_counter_storage_data, define_scalar_counter_storage_data_for_symbol,
-        define_top_value_counter_storage_data, direct_function_symbol_scope_for_shared_state,
-        emit_decref_unforwarded_local_env, emit_deopt_resume_call, infer_jit_value_facts,
-        local_ref_kind_for_stack_mirror, lookup_registered_jit_data_symbol,
+        WithMeta, annotate_clif_instruction_purposes, build_cranelift_run_bb_specialized_function,
+        build_typed_v3_jit_module_plan, codegen_expr_is_borrowable_from_local_env,
+        codegen_expr_static_can_satisfy_i64_demand, codegen_expr_static_i64_demand_facts,
+        declare_local_fn, declare_module_constant_object_data,
+        declare_scalar_counter_storage_import, declare_top_value_counter_storage_import,
+        define_prepared_function, define_scalar_counter_storage_data,
+        define_scalar_counter_storage_data_for_symbol, define_top_value_counter_storage_data,
+        direct_function_symbol_scope_for_shared_state, emit_decref_unforwarded_local_env,
+        emit_deopt_resume_call, infer_jit_value_facts, local_ref_kind_for_stack_mirror,
+        lookup_registered_jit_data_symbol, nest_clif_blocks_by_nearest_dominator,
         normalize_postopt_clif_for_inspection, parse_runtime_clif_functions,
         placeholder_module_constant_ptrs, planned_owned_pyobject_result_for_typed_expr,
         precompile_codegen_module_to_object_bytes, predeclare_specialization_type_imports,
@@ -405,6 +407,93 @@ mod tests {
             .branch_destination(&function.dfg.jump_tables, &function.dfg.exception_tables);
         assert_eq!(destinations.len(), 1);
         destinations[0].args(&function.dfg.value_lists).collect()
+    }
+
+    fn clif_block_header_line(rendered: &str, block: ir::Block) -> (usize, &str) {
+        let token = block.to_string();
+        rendered
+            .lines()
+            .enumerate()
+            .find(|(_, line)| {
+                let trimmed = line.trim_start();
+                trimmed == format!("{token}:")
+                    || trimmed.starts_with(&format!("{token}("))
+                    || trimmed.starts_with(&format!("{token} "))
+            })
+            .unwrap_or_else(|| panic!("missing rendered header for {token}:\n{rendered}"))
+    }
+
+    fn clif_block_header_indent(rendered: &str, block: ir::Block) -> usize {
+        let (_, line) = clif_block_header_line(rendered, block);
+        line.len() - line.trim_start().len()
+    }
+
+    fn cranelift_instruction_count(function: &ir::Function) -> usize {
+        function
+            .layout
+            .blocks()
+            .map(|block| function.layout.block_insts(block).count())
+            .sum()
+    }
+
+    fn build_nested_dominator_render_function() -> (
+        ir::Function,
+        ir::Block,
+        ir::Block,
+        ir::Block,
+        ir::Block,
+        ir::Block,
+    ) {
+        let mut function = ir::Function::new();
+        function
+            .signature
+            .params
+            .push(ir::AbiParam::new(ir::types::I64));
+        function
+            .signature
+            .returns
+            .push(ir::AbiParam::new(ir::types::I64));
+        let entry;
+        let then_block;
+        let then_child;
+        let else_block;
+        let done;
+        let mut builder_ctx = FunctionBuilderContext::new();
+        {
+            let mut fb = FunctionBuilder::new(&mut function, &mut builder_ctx);
+            entry = fb.create_block();
+            then_block = fb.create_block();
+            then_child = fb.create_block();
+            else_block = fb.create_block();
+            done = fb.create_block();
+            fb.append_block_params_for_function_params(entry);
+            fb.append_block_param(done, ir::types::I64);
+
+            fb.switch_to_block(entry);
+            let entry_arg = fb.block_params(entry)[0];
+            let zero = fb.ins().iconst(ir::types::I64, 0);
+            let is_zero = fb.ins().icmp(ir::condcodes::IntCC::Equal, entry_arg, zero);
+            fb.ins().brif(is_zero, then_block, &[], else_block, &[]);
+
+            fb.switch_to_block(then_block);
+            fb.ins().jump(then_child, &[]);
+
+            fb.switch_to_block(then_child);
+            let one = fb.ins().iconst(ir::types::I64, 1);
+            fb.ins().jump(done, &[ir::BlockArg::Value(one)]);
+
+            fb.switch_to_block(else_block);
+            let two = fb.ins().iconst(ir::types::I64, 2);
+            fb.ins().jump(done, &[ir::BlockArg::Value(two)]);
+
+            fb.switch_to_block(done);
+            let result = fb.block_params(done)[0];
+            fb.ins().return_(&[result]);
+
+            fb.seal_all_blocks();
+            fb.finalize();
+        }
+        (function, entry, then_block, then_child, else_block, done)
     }
 
     fn build_noncritical_trivial_jump_function() -> (ir::Function, ir::Block, ir::Block) {
@@ -720,6 +809,58 @@ mod tests {
         function
     }
 
+    fn build_inlined_refcount_shape_function() -> ir::Function {
+        let mut function = ir::Function::new();
+        function
+            .signature
+            .params
+            .push(ir::AbiParam::new(ir::types::I64));
+        function
+            .signature
+            .returns
+            .push(ir::AbiParam::new(ir::types::I64));
+        let mut builder_ctx = FunctionBuilderContext::new();
+        {
+            let mut fb = FunctionBuilder::new(&mut function, &mut builder_ctx);
+            let entry = fb.create_block();
+            let immortal = fb.create_block();
+            let update = fb.create_block();
+            let done = fb.create_block();
+            fb.append_block_params_for_function_params(entry);
+            fb.append_block_param(done, ir::types::I64);
+
+            fb.switch_to_block(entry);
+            let obj = fb.block_params(entry)[0];
+            let refcnt = fb
+                .ins()
+                .load(ir::types::I32, ir::MemFlags::trusted(), obj, 0);
+            let immortal_threshold = fb.ins().iconst(ir::types::I32, -1_073_741_824);
+            let is_immortal = fb.ins().icmp(
+                ir::condcodes::IntCC::UnsignedGreaterThanOrEqual,
+                refcnt,
+                immortal_threshold,
+            );
+            fb.ins().brif(is_immortal, immortal, &[], update, &[]);
+
+            fb.switch_to_block(update);
+            let one = fb.ins().iconst(ir::types::I32, 1);
+            let incremented = fb.ins().iadd(refcnt, one);
+            fb.ins().store(ir::MemFlags::trusted(), incremented, obj, 0);
+            fb.ins().jump(done, &[ir::BlockArg::Value(obj)]);
+
+            fb.switch_to_block(immortal);
+            fb.ins().jump(done, &[ir::BlockArg::Value(obj)]);
+
+            fb.switch_to_block(done);
+            let result = fb.block_params(done)[0];
+            fb.ins().return_(&[result]);
+
+            fb.seal_all_blocks();
+            fb.finalize();
+        }
+        function
+    }
+
     #[test]
     fn normalize_trivial_jump_block_with_nop_before_terminator() {
         let (mut function, entry, target) = build_noncritical_trivial_jump_function();
@@ -813,6 +954,97 @@ mod tests {
         assert_eq!(stats.removed_blocks, 0);
         assert_eq!(stats.redirected_edges, 0);
         assert_eq!(function.layout.blocks().count(), 4);
+    }
+
+    #[test]
+    fn clif_inspection_renderer_nests_blocks_by_nearest_dominator() {
+        let (function, entry, then_block, then_child, else_block, done) =
+            build_nested_dominator_render_function();
+        let rendered =
+            nest_clif_blocks_by_nearest_dominator(&function, &function.display().to_string());
+
+        let (entry_line, _) = clif_block_header_line(&rendered, entry);
+        let (then_line, _) = clif_block_header_line(&rendered, then_block);
+        let (then_child_line, _) = clif_block_header_line(&rendered, then_child);
+        let (else_line, _) = clif_block_header_line(&rendered, else_block);
+        let (done_line, _) = clif_block_header_line(&rendered, done);
+
+        assert_eq!(clif_block_header_indent(&rendered, entry), 0);
+        assert_eq!(
+            clif_block_header_indent(&rendered, then_block),
+            4,
+            "then block should nest under entry:\n{rendered}"
+        );
+        assert_eq!(
+            clif_block_header_indent(&rendered, then_child),
+            8,
+            "then child should nest under its nearest dominator:\n{rendered}"
+        );
+        assert_eq!(
+            clif_block_header_indent(&rendered, else_block),
+            4,
+            "else block should nest under entry:\n{rendered}"
+        );
+        assert_eq!(
+            clif_block_header_indent(&rendered, done),
+            4,
+            "join block should nest under its immediate dominator:\n{rendered}"
+        );
+
+        assert!(entry_line < then_line);
+        assert!(then_line < then_child_line);
+        assert!(then_child_line < else_line);
+        assert!(else_line < done_line);
+    }
+
+    #[test]
+    fn clif_inspection_renderer_adds_purpose_for_every_instruction() {
+        let (function, _entry, _then_block, _then_child, _else_block, _done) =
+            build_nested_dominator_render_function();
+        let rendered = annotate_clif_instruction_purposes(
+            &function,
+            &function.display().to_string(),
+            &HashMap::new(),
+        );
+
+        assert_eq!(
+            rendered.matches("; purpose:").count(),
+            cranelift_instruction_count(&function),
+            "every rendered CLIF instruction should have one purpose comment:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("; purpose: control_flow | inferred | block transition opcode=brif"),
+            "branch purpose should be visible:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "; purpose: codegen_plumbing | inferred | scalar/address computation opcode=iconst"
+            ),
+            "scalar plumbing purpose should be visible:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn clif_inspection_renderer_marks_inlined_refcount_shape() {
+        let function = build_inlined_refcount_shape_function();
+        let rendered = annotate_clif_instruction_purposes(
+            &function,
+            &function.display().to_string(),
+            &HashMap::new(),
+        );
+
+        assert!(
+            rendered.contains(
+                "; purpose: refcount | inferred | inlined refcount helper/control-flow opcode=load"
+            ),
+            "refcount load/check block should be classified:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "; purpose: refcount | inferred | inlined refcount helper/control-flow opcode=store"
+            ),
+            "refcount update store should be classified:\n{rendered}"
+        );
     }
 
     #[test]

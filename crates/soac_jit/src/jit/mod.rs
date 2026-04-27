@@ -297,6 +297,8 @@ use inspection::{
     render_pre_inline_clif_for_inspection,
 };
 pub use inspection::{RenderedSpecializedClif, run_cranelift_smoke};
+#[cfg(test)]
+use inspection::{annotate_clif_instruction_purposes, nest_clif_blocks_by_nearest_dominator};
 
 struct BuiltSpecializedFunction {
     ctx: cranelift_codegen::Context,
