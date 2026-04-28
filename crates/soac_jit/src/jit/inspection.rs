@@ -12,10 +12,11 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::JITModule;
 use soac_config::SoacEnvConfig;
 use soac_core::block_py::{
-    BlockLabel, BlockPyFunction, BlockPyModule, ChildVisitable, HasSemanticInstrId, Visit,
+    BlockArg, BlockEdge, BlockLabel, BlockParam, BlockPyFunction, BlockPyModule, BlockTerm,
+    CallArgKeyword, CallArgPositional, ChildVisitable, HasSemanticInstrId, NameLike, Visit,
 };
 use soac_ir_blockpy::BlockPyModuleShape;
-use soac_ir_typed::{InstrTyped, TypedBlockPyModuleShape};
+use soac_ir_typed::{InstrTyped, TypedBlockPyModuleShape, TypedInstrExtra, ValueFacts};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone)]
@@ -520,16 +521,326 @@ fn instr_typed_variant_name(expr: &InstrTyped) -> &'static str {
     }
 }
 
-pub(super) fn render_instr_typed_preorder_extras(
+pub(super) fn render_instr_typed_program(
     function: &BlockPyFunction<TypedBlockPyModuleShape>,
 ) -> String {
-    struct ExtraRenderer<'a> {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "function {}({}):\n",
+        function.names.qualname,
+        function
+            .params
+            .params
+            .iter()
+            .map(|param| param.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
+    out.push_str(&format!("  function_id = {}\n", function.function_id));
+    out.push_str(&format!(
+        "  execution_mode = {:?}\n",
+        function.execution_mode
+    ));
+    for block in &function.blocks {
+        out.push_str(&format!(
+            "\n  {}({}):\n",
+            block.label,
+            render_typed_block_params(&block.params)
+        ));
+        for stmt in &block.body {
+            out.push_str("    ");
+            out.push_str(&render_typed_expr(stmt));
+            out.push('\n');
+        }
+        render_typed_term(&mut out, &block.term, "    ");
+        if let Some(edge) = &block.exc_edge {
+            out.push_str("    except ");
+            out.push_str(&render_typed_edge(edge));
+            out.push('\n');
+        }
+    }
+    out
+}
+
+fn render_typed_block_params(params: &[BlockParam]) -> String {
+    params
+        .iter()
+        .map(|param| format!("{}:{:?}", param.name, param.role))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn render_typed_term(out: &mut String, term: &BlockTerm<InstrTyped>, indent: &str) {
+    match term {
+        BlockTerm::Jump(edge) => {
+            out.push_str(indent);
+            out.push_str("jump ");
+            out.push_str(&render_typed_edge(edge));
+            out.push('\n');
+        }
+        BlockTerm::IfTerm(if_term) => {
+            out.push_str(indent);
+            out.push_str("if ");
+            out.push_str(&render_typed_expr(&if_term.test));
+            out.push_str(":\n");
+            out.push_str(indent);
+            out.push_str("  then jump ");
+            out.push_str(&if_term.then_label.to_string());
+            out.push('\n');
+            out.push_str(indent);
+            out.push_str("  else jump ");
+            out.push_str(&if_term.else_label.to_string());
+            out.push('\n');
+        }
+        BlockTerm::BranchTable(branch) => {
+            out.push_str(indent);
+            out.push_str("branch_table ");
+            out.push_str(&render_typed_expr(&branch.index));
+            out.push_str(" -> [");
+            out.push_str(
+                &branch
+                    .targets
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+            out.push_str("] default ");
+            out.push_str(&branch.default_label.to_string());
+            out.push('\n');
+        }
+        BlockTerm::Raise(raise) => {
+            out.push_str(indent);
+            match &raise.exc {
+                Some(exc) => {
+                    out.push_str("raise ");
+                    out.push_str(&render_typed_expr(exc));
+                }
+                None => out.push_str("raise"),
+            }
+            out.push('\n');
+        }
+        BlockTerm::Return(value) => {
+            out.push_str(indent);
+            out.push_str("return ");
+            out.push_str(&render_typed_expr(value));
+            out.push('\n');
+        }
+    }
+}
+
+fn render_typed_edge(edge: &BlockEdge) -> String {
+    if edge.args.is_empty() {
+        return edge.target.to_string();
+    }
+    format!(
+        "{}({})",
+        edge.target,
+        edge.args
+            .iter()
+            .map(render_typed_block_arg)
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+fn render_typed_block_arg(arg: &BlockArg) -> String {
+    match arg {
+        BlockArg::Name(name) => name.clone(),
+        BlockArg::None => "None".to_string(),
+        BlockArg::CurrentException => "CurrentException".to_string(),
+        BlockArg::AbruptKind(kind) => format!("AbruptKind::{kind:?}"),
+    }
+}
+
+fn render_typed_expr(expr: &InstrTyped) -> String {
+    match expr {
+        InstrTyped::Truthy(op) => render_call_like("Truthy", [render_typed_expr(&op.value)]),
+        InstrTyped::Load(op) => render_typed_name(&op.name),
+        InstrTyped::BinOp(op) => render_call_like(
+            "BinOp",
+            [
+                format!("{:?}", op.kind),
+                render_typed_expr(&op.left),
+                render_typed_expr(&op.right),
+            ],
+        ),
+        InstrTyped::Tuple(op) => render_call_like(
+            "Tuple",
+            op.values.iter().map(render_typed_expr).collect::<Vec<_>>(),
+        ),
+        InstrTyped::UnaryOp(op) => render_call_like(
+            "UnaryOp",
+            [format!("{:?}", op.kind), render_typed_expr(&op.operand)],
+        ),
+        InstrTyped::CalleeFunctionId(op) => {
+            render_call_like("CalleeFunctionId", [render_typed_expr(&op.value)])
+        }
+        InstrTyped::CallTyped(op) => {
+            let mut args = vec![render_typed_expr(&op.func)];
+            args.extend(render_typed_call_args(&op.args, &op.keywords));
+            args.extend(render_debug_annotation("access", &op.access));
+            render_call_like("Call", args)
+        }
+        InstrTyped::GuardedCallableCallTyped(op) => {
+            let mut args = vec![render_typed_expr(&op.func)];
+            args.extend(render_typed_call_args(&op.args, &op.keywords));
+            args.push(format!("guards={}", op.function_guards.len()));
+            render_call_like("GuardedCallableCall", args)
+        }
+        InstrTyped::GuardedMethodCallTyped(op) => {
+            let mut args = vec![render_typed_expr(&op.func)];
+            args.extend(render_typed_call_args(&op.args, &op.keywords));
+            args.push(format!("method={:?}", op.method_name));
+            args.push(format!("guards={}", op.method_guards.len()));
+            render_call_like("GuardedMethodCall", args)
+        }
+        InstrTyped::DirectCallableCallTyped(op) => {
+            let mut args = vec![render_typed_expr(&op.func)];
+            args.extend(op.args.iter().map(render_typed_positional_arg));
+            args.push(format!("guard={:?}", op.guard));
+            render_call_like("DirectCallableCall", args)
+        }
+        InstrTyped::DirectMethodCallTyped(op) => {
+            let mut args = vec![render_typed_expr(&op.receiver)];
+            args.extend(op.args.iter().map(render_typed_positional_arg));
+            args.push(format!("method={:?}", op.method_name));
+            args.push(format!("guard={:?}", op.guard));
+            render_call_like("DirectMethodCall", args)
+        }
+        InstrTyped::DirectCallGuardTest(op) => render_call_like(
+            "DirectCallGuardTest",
+            [render_typed_expr(&op.value), format!("kind={:?}", op.kind)],
+        ),
+        InstrTyped::CallDirect(op) => {
+            let mut args = vec![
+                format!("function_id={}", op.function_id),
+                render_typed_expr(&op.callable),
+            ];
+            args.extend(render_typed_call_args(&op.args, &op.keywords));
+            render_call_like("CallDirect", args)
+        }
+        InstrTyped::GetAttrTyped(op) => {
+            let mut args = vec![render_typed_expr(&op.value), render_typed_expr(&op.attr)];
+            args.extend(render_debug_annotation("access", &op.access));
+            render_call_like("GetAttr", args)
+        }
+        InstrTyped::SetAttrTyped(op) => {
+            let mut args = vec![
+                render_typed_expr(&op.value),
+                render_typed_expr(&op.attr),
+                render_typed_expr(&op.replacement),
+            ];
+            args.extend(render_debug_annotation("access", &op.access));
+            render_call_like("SetAttr", args)
+        }
+        InstrTyped::GetItem(op) => render_call_like(
+            "GetItem",
+            [render_typed_expr(&op.value), render_typed_expr(&op.index)],
+        ),
+        InstrTyped::SetItem(op) => render_call_like(
+            "SetItem",
+            [
+                render_typed_expr(&op.value),
+                render_typed_expr(&op.index),
+                render_typed_expr(&op.replacement),
+            ],
+        ),
+        InstrTyped::DelItem(op) => render_call_like(
+            "DelItem",
+            [render_typed_expr(&op.value), render_typed_expr(&op.index)],
+        ),
+        InstrTyped::Store(op) => render_call_like(
+            "Store",
+            [render_typed_name(&op.name), render_typed_expr(&op.value)],
+        ),
+        InstrTyped::Del(op) => render_call_like(
+            "Del",
+            [
+                render_typed_name(&op.name),
+                format!("quietly={}", op.quietly),
+            ],
+        ),
+        InstrTyped::MakeCell(op) => match &op.initial_value {
+            Some(value) => render_call_like("MakeCell", [render_typed_expr(value)]),
+            None => "MakeCell()".to_string(),
+        },
+        InstrTyped::IncrementCounter(op) => {
+            render_call_like("IncrementCounter", [format!("{:?}", op.counter_id)])
+        }
+        InstrTyped::CellRef(op) => render_call_like("CellRef", [format!("{:?}", op.location)]),
+        InstrTyped::MakeFunctionWithClosure(op) => render_call_like(
+            "MakeFunctionWithClosure",
+            [
+                format!("function_id={}", op.function_id),
+                format!("kind={:?}", op.kind),
+                render_typed_expr(&op.captures),
+                render_typed_expr(&op.param_defaults),
+                render_typed_expr(&op.annotate_fn),
+            ],
+        ),
+    }
+}
+
+fn render_typed_name(name: &soac_core::block_py::ResolvedName) -> String {
+    name.id_str().to_string()
+}
+
+fn render_call_like(name: &str, args: impl IntoIterator<Item = String>) -> String {
+    format!(
+        "{}({})",
+        name,
+        args.into_iter().collect::<Vec<_>>().join(", ")
+    )
+}
+
+fn render_debug_annotation<T: std::fmt::Debug>(name: &str, value: &T) -> Vec<String> {
+    let rendered = format!("{value:?}");
+    if rendered == "Generic" {
+        Vec::new()
+    } else {
+        vec![format!("{name}={rendered}")]
+    }
+}
+
+fn render_typed_call_args(
+    args: &[CallArgPositional<InstrTyped>],
+    keywords: &[CallArgKeyword<InstrTyped>],
+) -> Vec<String> {
+    let mut rendered = args
+        .iter()
+        .map(render_typed_positional_arg)
+        .collect::<Vec<_>>();
+    rendered.extend(keywords.iter().map(render_typed_keyword_arg));
+    rendered
+}
+
+fn render_typed_positional_arg(arg: &CallArgPositional<InstrTyped>) -> String {
+    match arg {
+        CallArgPositional::Positional(expr) => render_typed_expr(expr),
+        CallArgPositional::Starred(expr) => format!("*{}", render_typed_expr(expr)),
+    }
+}
+
+fn render_typed_keyword_arg(arg: &CallArgKeyword<InstrTyped>) -> String {
+    match arg {
+        CallArgKeyword::Named { arg, value } => {
+            format!("{}={}", arg.as_str(), render_typed_expr(value))
+        }
+        CallArgKeyword::Starred(value) => format!("**{}", render_typed_expr(value)),
+    }
+}
+
+pub(super) fn render_instr_typed_metadata_index(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+) -> String {
+    struct MetadataRenderer<'a> {
         out: &'a mut String,
         block_label: Option<BlockLabel>,
         ordinal: usize,
     }
 
-    impl Visit<InstrTyped> for ExtraRenderer<'_> {
+    impl Visit<InstrTyped> for MetadataRenderer<'_> {
         fn visit_instr(&mut self, expr: &InstrTyped) {
             let block_label = self
                 .block_label
@@ -539,34 +850,21 @@ pub(super) fn render_instr_typed_preorder_extras(
                 .try_semantic_instr_id()
                 .map(|instr_id| instr_id.to_string())
                 .unwrap_or_else(|| "<synthetic>".to_string());
-            match expr.typed_extra() {
-                Some(extra) => {
-                    self.out.push_str(&format!(
-                        "; typed_expr[{}] block={} instr_id={} kind={} extra={:?}\n",
-                        self.ordinal,
-                        block_label,
-                        instr_id,
-                        instr_typed_variant_name(expr),
-                        extra
-                    ));
-                }
-                None => {
-                    self.out.push_str(&format!(
-                        "; typed_expr[{}] block={} instr_id={} kind={} extra=<none>\n",
-                        self.ordinal,
-                        block_label,
-                        instr_id,
-                        instr_typed_variant_name(expr)
-                    ));
-                }
-            }
+            self.out.push_str(&format!(
+                "; [{}] {} {} {} {}\n",
+                self.ordinal,
+                block_label,
+                instr_id,
+                instr_typed_variant_name(expr),
+                render_typed_extra_summary(expr.typed_extra())
+            ));
             self.ordinal += 1;
             expr.visit_children(self);
         }
     }
 
     let mut out = String::new();
-    let mut renderer = ExtraRenderer {
+    let mut renderer = MetadataRenderer {
         out: &mut out,
         block_label: None,
         ordinal: 0,
@@ -576,6 +874,131 @@ pub(super) fn render_instr_typed_preorder_extras(
         renderer.visit_block(block);
     }
     out
+}
+
+fn render_typed_extra_summary(extra: Option<&TypedInstrExtra>) -> String {
+    let Some(extra) = extra else {
+        return "extra=<none>".to_string();
+    };
+    if *extra == TypedInstrExtra::default() {
+        return "extra=default".to_string();
+    }
+
+    let mut parts = Vec::new();
+    if let Some(result_facts) = extra.result_facts {
+        parts.push(format!("result={}", render_value_facts(result_facts)));
+    }
+    if let Some(demand) = extra.demand {
+        parts.push(format!("demand={demand:?}"));
+    }
+    if let Some(planned_result) = extra.planned_result {
+        parts.push(format!("planned={planned_result:?}"));
+    }
+    if let Some(plan) = &extra.indexed_global_access {
+        parts.push(format!(
+            "indexed_global={}.{}@{}",
+            plan.module_name, plan.name, plan.expected_index
+        ));
+    }
+    if extra.exact_list_item_access.is_some() {
+        parts.push("exact_list_item".to_string());
+    }
+    if extra.exact_int_branch.is_some() {
+        parts.push("exact_int_branch".to_string());
+    }
+    if extra.exact_int_return.is_some() {
+        parts.push("exact_int_return".to_string());
+    }
+    if extra.exact_int_scalar_thread.is_some() {
+        parts.push("exact_int_scalar_thread".to_string());
+    }
+    if extra.guard_miss_deopt {
+        parts.push("guard_miss_deopt".to_string());
+    }
+    if parts.is_empty() {
+        "extra=default".to_string()
+    } else {
+        parts.join(" ")
+    }
+}
+
+fn render_value_facts(facts: ValueFacts) -> String {
+    match facts {
+        ValueFacts::Bool(_) => "Bool".to_string(),
+        ValueFacts::I32(facts) => format!("I32(sentinel={:?})", facts.sentinel),
+        ValueFacts::I64(facts) => format!("I64(sentinel={:?})", facts.sentinel),
+        ValueFacts::PyObj(py) => {
+            let default = soac_ir_typed::PyObjFacts::unknown();
+            if py == default {
+                return "PyObj(unknown)".to_string();
+            }
+            format!(
+                "PyObj(ty={:?}, truth={:?}, none={:?}, ref={:?}, prov={:?}, callable={:?})",
+                py.ty, py.truthiness, py.none, py.refcount, py.provenance, py.callable
+            )
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{render_instr_typed_metadata_index, render_instr_typed_program, render_typed_expr};
+    use soac_core::block_py::{BlockPyName, Load, NameLocation, ResolvedName, Store};
+    use soac_ir_typed::{InstrTyped, lower_blockpy_function_to_typed};
+
+    #[test]
+    fn instr_typed_program_renderer_uses_expression_syntax() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            "def classify(n):\n    if n < 0:\n        return 'neg'\n    return 'pos'\n",
+        )
+        .expect("source should lower");
+        let function =
+            lower_blockpy_function_to_typed(lowered.blockpy_module.callable_defs[0].clone());
+
+        let rendered = render_instr_typed_program(&function);
+
+        assert!(rendered.contains("function classify(n):"), "{rendered}");
+        assert!(rendered.contains("if BinOp("), "{rendered}");
+        assert!(rendered.contains("return "), "{rendered}");
+        assert!(!rendered.contains("BlockPyFunction {"), "{rendered}");
+    }
+
+    #[test]
+    fn instr_typed_expr_renderer_keeps_nested_calls_readable() {
+        let expr = InstrTyped::Store(Store::new(
+            ResolvedName {
+                id: BlockPyName::new("x"),
+                location: NameLocation::local(0),
+            },
+            InstrTyped::GetAttrTyped(soac_ir_typed::TypedGetAttr::generic(
+                InstrTyped::Load(Load::new(ResolvedName {
+                    id: BlockPyName::new("y"),
+                    location: NameLocation::local(1),
+                })),
+                InstrTyped::Load(Load::new(ResolvedName {
+                    id: BlockPyName::new("z"),
+                    location: NameLocation::constant(0),
+                })),
+            )),
+        ));
+
+        assert_eq!(render_typed_expr(&expr), "Store(x, GetAttr(y, z))");
+    }
+
+    #[test]
+    fn instr_typed_metadata_renderer_is_compact_index() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            "def classify(n):\n    return n + 1\n",
+        )
+        .expect("source should lower");
+        let function =
+            lower_blockpy_function_to_typed(lowered.blockpy_module.callable_defs[0].clone());
+
+        let rendered = render_instr_typed_metadata_index(&function);
+
+        assert!(rendered.contains("; [0] "), "{rendered}");
+        assert!(!rendered.contains("TypedInstrExtra {"), "{rendered}");
+    }
 }
 
 fn parse_block_header_for_display(line: &str) -> Option<(&str, Vec<&str>)> {

@@ -296,7 +296,8 @@ use imports::{SOAC_RUNTIME_DECREF_APPLIED_IMPORT, SOAC_RUNTIME_INCREF_APPLIED_IM
 use inspection::{
     ClifBlockDisplayAnnotations, ClifFunctionDisplayAlias, ClifFunctionDisplayAliases,
     register_block_display_annotation, render_compiled_clif_and_vcode_disasm,
-    render_instr_typed_preorder_extras, render_pre_inline_clif_for_inspection,
+    render_instr_typed_metadata_index, render_instr_typed_program,
+    render_pre_inline_clif_for_inspection,
 };
 pub use inspection::{RenderedSpecializedClif, run_cranelift_smoke};
 #[cfg(test)]
@@ -17665,11 +17666,11 @@ pub unsafe fn render_instr_typed_for_codegen_with_runtime_state(
         "; function_id: {}\n\n",
         render_function.function_id
     ));
-    out.push_str("; ---- typed nodes and embedded extras, preorder ----\n");
-    out.push_str(&render_instr_typed_preorder_extras(&typed_function));
+    out.push_str("; ---- InstrTyped program ----\n");
+    out.push_str(&render_instr_typed_program(&typed_function));
     out.push('\n');
-    out.push_str("; ---- BlockPyFunction<TypedBlockPyModuleShape> debug ----\n");
-    out.push_str(&format!("{typed_function:#?}"));
+    out.push_str("; ---- typed metadata index, preorder ----\n");
+    out.push_str(&render_instr_typed_metadata_index(&typed_function));
     if !out.ends_with('\n') {
         out.push('\n');
     }
