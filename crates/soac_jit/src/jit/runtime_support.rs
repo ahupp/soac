@@ -471,15 +471,16 @@ fn remap_runtime_clif_extern_user_names(
     Ok(())
 }
 
-pub(super) fn load_runtime_support_clif(
+pub(super) fn load_runtime_support_clif_with_debug_symbols(
     jit_module: &mut JITModule,
     env_config: &SoacEnvConfig,
-) -> Result<(), String> {
+) -> Result<HashMap<u32, String>, String> {
     let library = runtime_support_library()?;
     let local_runtime_symbols = runtime_support_local_symbols(library);
     let mut import_func_ids = HashMap::new();
     let mut import_data_ids = HashMap::new();
     let mut local_func_ids = HashMap::new();
+    let mut debug_symbols = HashMap::new();
     for parsed in library.functions.iter().cloned() {
         if parsed
             .symbol
@@ -494,6 +495,7 @@ pub(super) fn load_runtime_support_clif(
             &parsed.function.signature,
             "runtime CLIF function",
         )?;
+        debug_symbols.insert(func_id.as_u32(), parsed.symbol.clone());
         let mut function = parsed.function;
         remap_runtime_clif_extern_user_names(
             jit_module,
@@ -506,6 +508,16 @@ pub(super) fn load_runtime_support_clif(
             &mut local_func_ids,
             &mut import_data_ids,
         )?;
+        for (symbol, func_id) in &local_func_ids {
+            debug_symbols
+                .entry(func_id.as_u32())
+                .or_insert_with(|| symbol.clone());
+        }
+        for (symbol, func_id) in &import_func_ids {
+            debug_symbols
+                .entry(func_id.as_u32())
+                .or_insert_with(|| symbol.clone());
+        }
         let mut ctx = jit_module.codegen_make_context();
         ctx.func = function;
         let _ = define_prepared_function(
@@ -518,7 +530,7 @@ pub(super) fn load_runtime_support_clif(
         )?;
         jit_module.codegen_clear_context(&mut ctx);
     }
-    Ok(())
+    Ok(debug_symbols)
 }
 
 pub(super) fn compile_runtime_support_clif_for_object(

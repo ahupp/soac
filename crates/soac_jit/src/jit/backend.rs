@@ -1,5 +1,7 @@
 use super::codegen_env::JitCodegenEnv;
-use super::runtime_support::{inline_runtime_support_calls, load_runtime_support_clif};
+use super::runtime_support::{
+    inline_runtime_support_calls, load_runtime_support_clif_with_debug_symbols,
+};
 use super::signal_diagnostics;
 use super::specialized_helpers::register_specialized_jit_symbols;
 use super::symbols::{
@@ -85,10 +87,17 @@ fn register_jit_builder_symbols(builder: &mut JITBuilder) {
 pub(super) fn new_jit_module(
     compile_session: &crate::session::CompileSession,
 ) -> Result<JITModule, String> {
+    new_jit_module_with_runtime_support_symbols(compile_session).map(|(jit_module, _)| jit_module)
+}
+
+pub(super) fn new_jit_module_with_runtime_support_symbols(
+    compile_session: &crate::session::CompileSession,
+) -> Result<(JITModule, HashMap<u32, String>), String> {
     let env_config = compile_session.env_config()?;
     let mut jit_module = JITModule::new(new_jit_builder(env_config)?);
-    load_runtime_support_clif(&mut jit_module, env_config)?;
-    Ok(jit_module)
+    let runtime_support_symbols =
+        load_runtime_support_clif_with_debug_symbols(&mut jit_module, env_config)?;
+    Ok((jit_module, runtime_support_symbols))
 }
 
 #[derive(Debug)]

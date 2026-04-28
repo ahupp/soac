@@ -34,6 +34,36 @@ pub(super) struct ClifBlockDisplayAnnotation {
 
 pub(super) type ClifBlockDisplayAnnotations = HashMap<String, ClifBlockDisplayAnnotation>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ClifFunctionDisplayKind {
+    RuntimeHelper,
+    DirectPython,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ClifFunctionDisplayAlias {
+    pub(super) display_name: String,
+    kind: ClifFunctionDisplayKind,
+}
+
+impl ClifFunctionDisplayAlias {
+    pub(super) fn runtime_helper(display_name: impl Into<String>) -> Self {
+        Self {
+            display_name: display_name.into(),
+            kind: ClifFunctionDisplayKind::RuntimeHelper,
+        }
+    }
+
+    pub(super) fn direct_python(qualname: impl Into<String>) -> Self {
+        Self {
+            display_name: qualname.into(),
+            kind: ClifFunctionDisplayKind::DirectPython,
+        }
+    }
+}
+
+pub(super) type ClifFunctionDisplayAliases = HashMap<u32, ClifFunctionDisplayAlias>;
+
 #[derive(Debug, Clone, Copy)]
 enum ClifInstructionPurposeConfidence {
     Exact,
@@ -83,9 +113,9 @@ impl ClifInstructionPurpose {
     }
 }
 
-fn rewrite_import_fn_aliases(
+pub(super) fn rewrite_clif_function_aliases(
     clif: &str,
-    import_id_to_symbol: &HashMap<u32, &'static str>,
+    function_aliases: &ClifFunctionDisplayAliases,
 ) -> String {
     let mut import_aliases: HashMap<String, String> = HashMap::new();
     for raw_line in clif.lines() {
@@ -112,10 +142,10 @@ fn rewrite_import_fn_aliases(
         let Ok(import_id) = import_id.parse::<u32>() else {
             continue;
         };
-        let Some(symbol) = import_id_to_symbol.get(&import_id) else {
+        let Some(function_alias) = function_aliases.get(&import_id) else {
             continue;
         };
-        import_aliases.insert(alias.to_string(), (*symbol).to_string());
+        import_aliases.insert(alias.to_string(), function_alias.display_name.clone());
     }
 
     let bytes = clif.as_bytes();
@@ -146,37 +176,56 @@ fn rewrite_import_fn_aliases(
     out
 }
 
-fn function_ref_symbol<'a>(
+#[derive(Debug, Clone)]
+struct ClifCallTarget {
+    display_name: String,
+    kind: Option<ClifFunctionDisplayKind>,
+}
+
+fn function_ref_target(
     func: &ir::Function,
-    import_id_to_symbol: &'a HashMap<u32, &'static str>,
+    function_aliases: &ClifFunctionDisplayAliases,
     func_ref: ir::FuncRef,
-) -> Option<String> {
+) -> Option<ClifCallTarget> {
     let ext_func = &func.dfg.ext_funcs[func_ref];
     let display_name = ext_func.name.display(Some(&func.params)).to_string();
     if let Some((_, import_id)) = display_name.split_once(':')
         && let Ok(import_id) = import_id.parse::<u32>()
-        && let Some(symbol) = import_id_to_symbol.get(&import_id)
+        && let Some(alias) = function_aliases.get(&import_id)
     {
-        return Some((*symbol).to_string());
+        return Some(ClifCallTarget {
+            display_name: alias.display_name.clone(),
+            kind: Some(alias.kind),
+        });
     }
-    Some(display_name)
+    Some(ClifCallTarget {
+        display_name,
+        kind: None,
+    })
 }
 
-fn call_instruction_symbol(
+fn call_instruction_target(
     func: &ir::Function,
-    import_id_to_symbol: &HashMap<u32, &'static str>,
+    function_aliases: &ClifFunctionDisplayAliases,
     inst: ir::Inst,
-) -> Option<String> {
+) -> Option<ClifCallTarget> {
     match &func.dfg.insts[inst] {
         ir::InstructionData::Call { func_ref, .. }
         | ir::InstructionData::TryCall { func_ref, .. } => {
-            function_ref_symbol(func, import_id_to_symbol, *func_ref)
+            function_ref_target(func, function_aliases, *func_ref)
         }
         _ => None,
     }
 }
 
-fn purpose_for_helper_call(symbol: &str) -> ClifInstructionPurpose {
+fn purpose_for_helper_call(target: &ClifCallTarget) -> ClifInstructionPurpose {
+    let symbol = target.display_name.as_str();
+    if target.kind == Some(ClifFunctionDisplayKind::DirectPython) {
+        return ClifInstructionPurpose::exact(
+            "direct_call",
+            format!("direct Python function call callee={symbol}"),
+        );
+    }
     if symbol.contains("incref") || symbol.contains("decref") {
         return ClifInstructionPurpose::exact(
             "refcount",
@@ -272,16 +321,19 @@ fn block_has_inlined_refcount_shape(func: &ir::Function, block: ir::Block) -> bo
 
 fn purpose_for_instruction(
     func: &ir::Function,
-    import_id_to_symbol: &HashMap<u32, &'static str>,
+    function_aliases: &ClifFunctionDisplayAliases,
     inst: ir::Inst,
     in_refcount_block: bool,
 ) -> ClifInstructionPurpose {
-    if let Some(symbol) = call_instruction_symbol(func, import_id_to_symbol, inst) {
-        let purpose = purpose_for_helper_call(symbol.as_str());
+    if let Some(target) = call_instruction_target(func, function_aliases, inst) {
+        let purpose = purpose_for_helper_call(&target);
         if in_refcount_block && purpose.primary == "runtime_helper" {
             return ClifInstructionPurpose::inferred(
                 "refcount",
-                format!("runtime helper reached from inlined refcount sequence helper={symbol}"),
+                format!(
+                    "runtime helper reached from inlined refcount sequence helper={}",
+                    target.display_name
+                ),
             );
         }
         return purpose;
@@ -352,7 +404,7 @@ fn purpose_for_instruction(
 
 fn collect_clif_instruction_purposes(
     func: &ir::Function,
-    import_id_to_symbol: &HashMap<u32, &'static str>,
+    function_aliases: &ClifFunctionDisplayAliases,
 ) -> Vec<ClifInstructionPurpose> {
     let mut purposes = Vec::with_capacity(func.dfg.num_insts());
     for block in func.layout.blocks() {
@@ -360,7 +412,7 @@ fn collect_clif_instruction_purposes(
         for inst in func.layout.block_insts(block) {
             purposes.push(purpose_for_instruction(
                 func,
-                import_id_to_symbol,
+                function_aliases,
                 inst,
                 in_refcount_block,
             ));
@@ -371,6 +423,10 @@ fn collect_clif_instruction_purposes(
 
 fn is_rendered_clif_instruction_line(line: &str) -> bool {
     let trimmed = line.trim_start();
+    let is_function_decl = trimmed.split_once(" = ").is_some_and(|(_, rest)| {
+        let rest = rest.strip_prefix("colocated ").unwrap_or(rest);
+        rest.starts_with('u') && rest.contains(" sig")
+    });
     if trimmed.is_empty()
         || trimmed.starts_with(';')
         || trimmed.starts_with("function ")
@@ -380,6 +436,7 @@ fn is_rendered_clif_instruction_line(line: &str) -> bool {
         || trimmed.starts_with("gv")
         || trimmed.starts_with("sig")
         || trimmed.starts_with("fn")
+        || is_function_decl
     {
         return false;
     }
@@ -399,9 +456,9 @@ fn clif_line_indent(line: &str) -> &str {
 pub(super) fn annotate_clif_instruction_purposes(
     func: &ir::Function,
     clif: &str,
-    import_id_to_symbol: &HashMap<u32, &'static str>,
+    function_aliases: &ClifFunctionDisplayAliases,
 ) -> String {
-    let purposes = collect_clif_instruction_purposes(func, import_id_to_symbol);
+    let purposes = collect_clif_instruction_purposes(func, function_aliases);
     let mut purpose_iter = purposes.into_iter();
     let mut out = String::with_capacity(clif.len() + (func.dfg.num_insts() * 48));
     for line in clif.lines() {
@@ -567,24 +624,35 @@ fn rewrite_block_header_annotations(
             let semantic_name = annotation
                 .map(|annotation| annotation.semantic_name.as_str())
                 .unwrap_or(token);
+            let has_semantic_name = annotation
+                .map(|annotation| annotation.semantic_name != token)
+                .unwrap_or(false);
+            if param_types.is_empty() && !has_semantic_name {
+                if chunk.ends_with('\n') {
+                    out.push('\n');
+                }
+                continue;
+            }
             let param_names = annotation.map(|annotation| annotation.param_names.as_slice());
             out.push_str(" ; block ");
             out.push_str(semantic_name);
-            out.push('(');
-            for (index, ty) in param_types.iter().enumerate() {
-                if index > 0 {
-                    out.push_str(", ");
+            if !param_types.is_empty() {
+                out.push('(');
+                for (index, ty) in param_types.iter().enumerate() {
+                    if index > 0 {
+                        out.push_str(", ");
+                    }
+                    let fallback_name = format!("param{index}");
+                    let param_name = param_names
+                        .and_then(|names| names.get(index))
+                        .map(String::as_str)
+                        .unwrap_or(fallback_name.as_str());
+                    out.push_str(param_name);
+                    out.push_str(": ");
+                    out.push_str(ty);
                 }
-                let fallback_name = format!("param{index}");
-                let param_name = param_names
-                    .and_then(|names| names.get(index))
-                    .map(String::as_str)
-                    .unwrap_or(fallback_name.as_str());
-                out.push_str(param_name);
-                out.push_str(": ");
-                out.push_str(ty);
+                out.push(')');
             }
-            out.push(')');
         }
         if chunk.ends_with('\n') {
             out.push('\n');
@@ -1012,7 +1080,7 @@ pub fn run_cranelift_smoke(module: &BlockPyModule<BlockPyModuleShape>) -> Result
 
 pub(super) fn render_pre_inline_clif_for_inspection(
     func: &ir::Function,
-    import_id_to_symbol: &HashMap<u32, &'static str>,
+    function_aliases: &ClifFunctionDisplayAliases,
     block_annotations: &ClifBlockDisplayAnnotations,
 ) -> String {
     let mut clif = String::new();
@@ -1022,9 +1090,9 @@ pub(super) fn render_pre_inline_clif_for_inspection(
     );
     clif.push_str("; instructions are annotated with inferred JIT emission purpose\n");
     let clif_display =
-        rewrite_import_fn_aliases(func.display().to_string().as_str(), import_id_to_symbol);
+        rewrite_clif_function_aliases(func.display().to_string().as_str(), function_aliases);
     let annotated = rewrite_block_header_annotations(&clif_display, block_annotations);
-    let annotated = annotate_clif_instruction_purposes(func, &annotated, import_id_to_symbol);
+    let annotated = annotate_clif_instruction_purposes(func, &annotated, function_aliases);
     clif.push_str(&nest_clif_blocks_by_nearest_dominator(func, &annotated));
     clif
 }
@@ -1033,7 +1101,7 @@ pub(super) fn render_compiled_clif_and_vcode_disasm(
     jit_module: &mut JITModule,
     env_config: &SoacEnvConfig,
     mut ctx: cranelift_codegen::Context,
-    import_id_to_symbol: &HashMap<u32, &'static str>,
+    function_aliases: &ClifFunctionDisplayAliases,
     block_annotations: &ClifBlockDisplayAnnotations,
 ) -> Result<(String, String, String), String> {
     prepare_cranelift_function_for_backend(
@@ -1059,13 +1127,12 @@ pub(super) fn render_compiled_clif_and_vcode_disasm(
     ));
     clif.push_str("; blocks are nested by nearest dominator for inspection\n");
     clif.push_str("; instructions are annotated with inferred JIT emission purpose\n");
-    let clif_display = rewrite_import_fn_aliases(
+    let clif_display = rewrite_clif_function_aliases(
         display_func.display().to_string().as_str(),
-        import_id_to_symbol,
+        function_aliases,
     );
     let annotated = rewrite_block_header_annotations(&clif_display, block_annotations);
-    let annotated =
-        annotate_clif_instruction_purposes(&display_func, &annotated, import_id_to_symbol);
+    let annotated = annotate_clif_instruction_purposes(&display_func, &annotated, function_aliases);
     clif.push_str(&nest_clif_blocks_by_nearest_dominator(
         &display_func,
         &annotated,

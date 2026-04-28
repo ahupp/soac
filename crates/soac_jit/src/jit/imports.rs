@@ -537,7 +537,6 @@ static JIT_RUNTIME_IMPORT_SPECS: &[&ImportSpec] = &[
 pub(super) struct ModuleFuncImports {
     func_ids_by_internal_id: Vec<Option<FuncId>>,
     import_id_to_symbol: HashMap<u32, &'static str>,
-    #[cfg(test)]
     func_id_to_symbol: HashMap<u32, &'static str>,
 }
 
@@ -546,7 +545,6 @@ impl ModuleFuncImports {
         Self {
             func_ids_by_internal_id: Vec::new(),
             import_id_to_symbol: HashMap::new(),
-            #[cfg(test)]
             func_id_to_symbol: HashMap::new(),
         }
     }
@@ -555,7 +553,6 @@ impl ModuleFuncImports {
         &self.import_id_to_symbol
     }
 
-    #[cfg(test)]
     pub(super) fn debug_declared_symbols(&self) -> &HashMap<u32, &'static str> {
         &self.func_id_to_symbol
     }
@@ -584,7 +581,6 @@ impl ModuleFuncImports {
             }
         };
         self.func_ids_by_internal_id[internal_id] = Some(func_id);
-        #[cfg(test)]
         self.func_id_to_symbol.insert(func_id.as_u32(), spec.symbol);
         if matches!(spec.linkage, Linkage::Import) {
             self.import_id_to_symbol

@@ -1,12 +1,13 @@
 use super::runtime_context::FunctionRuntimeDataLayout;
 use super::{
     BlockPyEntryRuntimeContext, BuildSpecializedFunctionOptions, BuiltSpecializedFunction,
-    CpythonTypeSymbol, DeclaredJitFunction, FuncBuildImports, RuntimeFunctionEntryPlan,
-    RuntimeJitDeoptContinuation, RuntimeJitDeoptCursor, RuntimeJitDeoptInvocation,
-    RuntimeJitDeoptRecord, RuntimeJitDeoptTable, RuntimeJitDeoptUnsupportedReason,
-    SOAC_RUNTIME_PROBE_GLOBAL_INDEXED_SYMBOL, SOAC_RUNTIME_STORE_GLOBAL_INDEXED_SYMBOL,
-    SpecializationProfile, StackSlots, annotate_clif_instruction_purposes,
-    build_cranelift_run_bb_specialized_function, codegen_expr_is_borrowable_from_local_env,
+    ClifFunctionDisplayAlias, ClifFunctionDisplayAliases, CpythonTypeSymbol, DeclaredJitFunction,
+    FuncBuildImports, RuntimeFunctionEntryPlan, RuntimeJitDeoptContinuation, RuntimeJitDeoptCursor,
+    RuntimeJitDeoptInvocation, RuntimeJitDeoptRecord, RuntimeJitDeoptTable,
+    RuntimeJitDeoptUnsupportedReason, SOAC_RUNTIME_PROBE_GLOBAL_INDEXED_SYMBOL,
+    SOAC_RUNTIME_STORE_GLOBAL_INDEXED_SYMBOL, SpecializationProfile, StackSlots,
+    annotate_clif_instruction_purposes, build_cranelift_run_bb_specialized_function,
+    clif_function_display_aliases, codegen_expr_is_borrowable_from_local_env,
     codegen_expr_static_can_satisfy_i64_demand, codegen_expr_static_i64_demand_facts,
     declare_local_fn, declare_module_constant_object_data, declare_scalar_counter_storage_import,
     declare_top_value_counter_storage_import, define_prepared_function,
@@ -19,10 +20,11 @@ use super::{
     planned_owned_pyobject_result_for_typed_expr, precompile_codegen_module_to_object_bytes,
     predeclare_specialization_type_imports, predeclare_typed_direct_call_imports,
     refresh_typed_function_value_facts, render_compiled_clif_and_vcode_disasm,
-    run_blockpy_function_from_entry, run_blockpy_function_from_vectorcall_entry,
-    runtime_jit_deopt_guard_operand_replay_safe, runtime_jit_typed_deopt_guard_operand_replay_safe,
-    scalar_counter_storage_symbol_for_instance, static_runtime_primitive_desc_for_call,
-    static_runtime_primitive_for_call, top_value_counter_storage_symbol_for_instance,
+    rewrite_clif_function_aliases, run_blockpy_function_from_entry,
+    run_blockpy_function_from_vectorcall_entry, runtime_jit_deopt_guard_operand_replay_safe,
+    runtime_jit_typed_deopt_guard_operand_replay_safe, scalar_counter_storage_symbol_for_instance,
+    static_runtime_primitive_desc_for_call, static_runtime_primitive_for_call,
+    top_value_counter_storage_symbol_for_instance,
     typed_expr_planned_pyobject_input_is_borrowed_from_local_env,
 };
 use soac_core::block_py::IncrementCounter;
@@ -58,14 +60,14 @@ mod tests {
         annotate_typed_indexed_global_accesses,
     };
     use super::super::{
-        BlockPyBlock, DP_JIT_DECREF_IMPORT, DP_JIT_DEOPT_RESUME_IMPORT, DP_JIT_INCREF_IMPORT,
-        DP_JIT_PY_CALL_POSITIONAL_THREE_IMPORT, DP_JIT_PY_VECTORCALL_IMPORT,
-        DP_JIT_PYOBJECT_SETATTR_IMPORT, DirectCallArgPlan, DirectCallArgSource,
-        DirectCallIncompatibility, FUNCTION_ENV_DEOPT_TABLE_PTR_OFFSET, IntFacts, IntRange,
-        JitDeoptExitRef, LocalEnv, LocalEnvEntry, LocalEnvStorage, LocalRefKind, ModuleConstantId,
-        ModuleFuncImports, ObjPtr, ParamBindingFacts, ParsedRuntimeClifFunction,
-        PlannedJitDeoptPointId, PrecompileModuleIndex, PrecompileModuleIndexEntry,
-        ProcessJitEngine, PyLong_Type, RelocTypeRef, ResultDemand,
+        BlockPyBlock, ClifBlockDisplayAnnotations, DP_JIT_DECREF_IMPORT,
+        DP_JIT_DEOPT_RESUME_IMPORT, DP_JIT_INCREF_IMPORT, DP_JIT_PY_CALL_POSITIONAL_THREE_IMPORT,
+        DP_JIT_PY_VECTORCALL_IMPORT, DP_JIT_PYOBJECT_SETATTR_IMPORT, DirectCallArgPlan,
+        DirectCallArgSource, DirectCallIncompatibility, FUNCTION_ENV_DEOPT_TABLE_PTR_OFFSET,
+        IntFacts, IntRange, JitDeoptExitRef, LocalEnv, LocalEnvEntry, LocalEnvStorage,
+        LocalRefKind, ModuleConstantId, ModuleFuncImports, ObjPtr, ParamBindingFacts,
+        ParsedRuntimeClifFunction, PlannedJitDeoptPointId, PrecompileModuleIndex,
+        PrecompileModuleIndexEntry, ProcessJitEngine, PyLong_Type, RelocTypeRef, ResultDemand,
         SOAC_RUNTIME_DECREF_APPLIED_IMPORT, SOAC_RUNTIME_DECREF_SYMBOL,
         SOAC_RUNTIME_INCREF_APPLIED_IMPORT, SOAC_RUNTIME_INCREF_SYMBOL,
         SOAC_RUNTIME_PYLONG_AS_I64_SATURATING_SYMBOL, SOAC_RUNTIME_PYLONG_AS_I64_SYMBOL,
@@ -84,41 +86,44 @@ mod tests {
         persistent_function_id_for_module_function, plan_direct_call_args_for_target,
         plan_typed_v3_jit_module_for_test, precompiled_direct_function_symbol_scope_for_persistent,
         prepare_specialized_typed_function, push_direct_function_module_identity,
-        push_shared_module_symbol_identity, runtime_primitive_call_static_params_can_satisfy_abi,
-        stable_cranelift_function_hash, stable_cranelift_function_name,
-        typed_local_load_direct_result_plan, validate_direct_call_compatibility,
+        push_shared_module_symbol_identity, render_pre_inline_clif_for_inspection,
+        runtime_primitive_call_static_params_can_satisfy_abi, stable_cranelift_function_hash,
+        stable_cranelift_function_name, typed_local_load_direct_result_plan,
+        validate_direct_call_compatibility,
     };
     use super::{
         AbruptKind, BinOp, BinOpKind, BlockArg, BlockEdge, BlockLabel, BlockParam, BlockParamRole,
         BlockPyEntryRuntimeContext, BlockPyFunction, BlockPyModule, BlockPyModuleShape, BlockTerm,
         BuildSpecializedFunctionOptions, BuiltSpecializedFunction, Call, CallArgKeyword,
-        CallArgPositional, CellLocation, CellRef, ChildVisitable, ClosureInit, ClosureSlot,
-        ConstantExpr, CounterDef, CounterSite, CpythonTypeSymbol, DeclaredJitFunction, Del,
-        DelItem, FuncBuildImports, FunctionExecutionMode, FunctionKind, FunctionName,
-        FunctionRuntimeDataLayout, GetAttr, GetItem, HasMeta, HasSemanticInstrId, IncrementCounter,
-        InstrBlockPy, Literal, LiteralValue, Load, LocalFunctionId, LocalLocation, MakeCell, Meta,
-        ModuleNameGen, NameLike, NameLocation, NumberLiteral, NumberLiteralValue, Param, ParamKind,
-        ParamSpec, ResolvedName, RuntimeFunctionEntryPlan, RuntimeFunctionId,
-        RuntimeJitDeoptContinuation, RuntimeJitDeoptCursor, RuntimeJitDeoptInvocation,
-        RuntimeJitDeoptRecord, RuntimeJitDeoptTable, RuntimeJitDeoptUnsupportedReason, RuntimeName,
+        CallArgPositional, CellLocation, CellRef, ChildVisitable, ClifFunctionDisplayAlias,
+        ClifFunctionDisplayAliases, ClosureInit, ClosureSlot, ConstantExpr, CounterDef,
+        CounterSite, CpythonTypeSymbol, DeclaredJitFunction, Del, DelItem, FuncBuildImports,
+        FunctionExecutionMode, FunctionKind, FunctionName, FunctionRuntimeDataLayout, GetAttr,
+        GetItem, HasMeta, HasSemanticInstrId, IncrementCounter, InstrBlockPy, Literal,
+        LiteralValue, Load, LocalFunctionId, LocalLocation, MakeCell, Meta, ModuleNameGen,
+        NameLike, NameLocation, NumberLiteral, NumberLiteralValue, Param, ParamKind, ParamSpec,
+        ResolvedName, RuntimeFunctionEntryPlan, RuntimeFunctionId, RuntimeJitDeoptContinuation,
+        RuntimeJitDeoptCursor, RuntimeJitDeoptInvocation, RuntimeJitDeoptRecord,
+        RuntimeJitDeoptTable, RuntimeJitDeoptUnsupportedReason, RuntimeName,
         SerializedFunctionDebugName, SerializedFunctionId, SerializedIdentityTables,
         SerializedModuleId, SerializedModuleIdentity, SetAttr, SetItem, SpecializationProfile,
         StackSlots, StorageLayout, Store, StringLiteral, Tuple, UnaryOp, UnaryOpKind, Visit,
         VisitMut, WithMeta, annotate_clif_instruction_purposes,
-        build_cranelift_run_bb_specialized_function, codegen_expr_is_borrowable_from_local_env,
-        codegen_expr_static_can_satisfy_i64_demand, codegen_expr_static_i64_demand_facts,
-        declare_local_fn, declare_module_constant_object_data,
-        declare_scalar_counter_storage_import, declare_top_value_counter_storage_import,
-        define_prepared_function, define_scalar_counter_storage_data,
-        define_scalar_counter_storage_data_for_symbol, define_top_value_counter_storage_data,
-        direct_function_symbol_scope_for_shared_state, emit_decref_unforwarded_local_env,
-        emit_deopt_resume_call, infer_jit_value_facts, local_ref_kind_for_stack_mirror,
-        lookup_registered_jit_data_symbol, nest_clif_blocks_by_nearest_dominator,
-        normalize_postopt_clif_for_inspection, optimize_blockpy, parse_runtime_clif_functions,
-        placeholder_module_constant_ptrs, planned_owned_pyobject_result_for_typed_expr,
-        precompile_codegen_module_to_object_bytes, predeclare_specialization_type_imports,
-        predeclare_typed_direct_call_imports, refresh_typed_function_value_facts,
-        render_compiled_clif_and_vcode_disasm, run_blockpy_function_from_entry,
+        build_cranelift_run_bb_specialized_function, clif_function_display_aliases,
+        codegen_expr_is_borrowable_from_local_env, codegen_expr_static_can_satisfy_i64_demand,
+        codegen_expr_static_i64_demand_facts, declare_local_fn,
+        declare_module_constant_object_data, declare_scalar_counter_storage_import,
+        declare_top_value_counter_storage_import, define_prepared_function,
+        define_scalar_counter_storage_data, define_scalar_counter_storage_data_for_symbol,
+        define_top_value_counter_storage_data, direct_function_symbol_scope_for_shared_state,
+        emit_decref_unforwarded_local_env, emit_deopt_resume_call, infer_jit_value_facts,
+        local_ref_kind_for_stack_mirror, lookup_registered_jit_data_symbol,
+        nest_clif_blocks_by_nearest_dominator, normalize_postopt_clif_for_inspection,
+        optimize_blockpy, parse_runtime_clif_functions, placeholder_module_constant_ptrs,
+        planned_owned_pyobject_result_for_typed_expr, precompile_codegen_module_to_object_bytes,
+        predeclare_specialization_type_imports, predeclare_typed_direct_call_imports,
+        refresh_typed_function_value_facts, render_compiled_clif_and_vcode_disasm,
+        rewrite_clif_function_aliases, run_blockpy_function_from_entry,
         run_blockpy_function_from_vectorcall_entry, runtime_jit_deopt_guard_operand_replay_safe,
         runtime_jit_typed_deopt_guard_operand_replay_safe,
         scalar_counter_storage_symbol_for_instance, static_runtime_primitive_desc_for_call,
@@ -432,6 +437,15 @@ mod tests {
             .blocks()
             .map(|block| function.layout.block_insts(block).count())
             .sum()
+    }
+
+    fn built_clif_function_aliases(built: &BuiltSpecializedFunction) -> ClifFunctionDisplayAliases {
+        clif_function_display_aliases(
+            &built.import_id_to_symbol,
+            &built.local_func_id_to_symbol,
+            &HashMap::new(),
+            &built.direct_func_id_to_qualname,
+        )
     }
 
     fn build_nested_dominator_render_function() -> (
@@ -859,6 +873,43 @@ mod tests {
         function
     }
 
+    fn build_direct_python_call_alias_function() -> ir::Function {
+        let mut function = ir::Function::new();
+        function
+            .signature
+            .params
+            .push(ir::AbiParam::new(ir::types::I64));
+        function
+            .signature
+            .returns
+            .push(ir::AbiParam::new(ir::types::I64));
+        let mut callee_sig = ir::Signature::new(cranelift_codegen::isa::CallConv::SystemV);
+        callee_sig.params.push(ir::AbiParam::new(ir::types::I64));
+        callee_sig.returns.push(ir::AbiParam::new(ir::types::I64));
+        let callee_sig = function.import_signature(callee_sig);
+        let callee_name = function.declare_imported_user_function(ir::UserExternalName::new(0, 42));
+        let callee = function.import_function(ir::ExtFuncData {
+            name: ir::ExternalName::user(callee_name),
+            signature: callee_sig,
+            colocated: true,
+            patchable: false,
+        });
+        let mut builder_ctx = FunctionBuilderContext::new();
+        {
+            let mut fb = FunctionBuilder::new(&mut function, &mut builder_ctx);
+            let entry = fb.create_block();
+            fb.append_block_params_for_function_params(entry);
+            fb.switch_to_block(entry);
+            let arg = fb.block_params(entry)[0];
+            let call = fb.ins().call(callee, &[arg]);
+            let result = fb.inst_results(call)[0];
+            fb.ins().return_(&[result]);
+            fb.seal_all_blocks();
+            fb.finalize();
+        }
+        function
+    }
+
     #[test]
     fn normalize_trivial_jump_block_with_nop_before_terminator() {
         let (mut function, entry, target) = build_noncritical_trivial_jump_function();
@@ -996,6 +1047,34 @@ mod tests {
     }
 
     #[test]
+    fn clif_inspection_renderer_omits_redundant_empty_block_comment() {
+        let (function, entry, then_block, _then_child, else_block, done) =
+            build_nested_dominator_render_function();
+        let rendered = render_pre_inline_clif_for_inspection(
+            &function,
+            &ClifFunctionDisplayAliases::new(),
+            &ClifBlockDisplayAnnotations::new(),
+        );
+
+        assert!(
+            !rendered.contains(&format!("{then_block}: ; block {then_block}()")),
+            "empty block headers should not repeat their own token:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains(&format!("{else_block}: ; block {else_block}()")),
+            "empty block headers should not repeat their own token:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("; block {entry}(param0: i64)")),
+            "block argument comments should still name entry block parameters:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("; block {done}(param0: i64)")),
+            "block argument comments should still name join block parameters:\n{rendered}"
+        );
+    }
+
+    #[test]
     fn clif_inspection_renderer_adds_purpose_for_every_instruction() {
         let (function, _entry, _then_block, _then_child, _else_block, _done) =
             build_nested_dominator_render_function();
@@ -1042,6 +1121,38 @@ mod tests {
                 "; purpose: refcount | inferred | inlined refcount helper/control-flow opcode=store"
             ),
             "refcount update store should be classified:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn clif_inspection_renderer_uses_qualname_for_direct_python_call_alias() {
+        let function = build_direct_python_call_alias_function();
+        let mut aliases = ClifFunctionDisplayAliases::new();
+        aliases.insert(
+            42,
+            ClifFunctionDisplayAlias::direct_python("pkg.mod.callee"),
+        );
+        let rewritten = rewrite_clif_function_aliases(&function.display().to_string(), &aliases);
+        let rendered = annotate_clif_instruction_purposes(&function, &rewritten, &aliases);
+
+        assert_eq!(
+            rendered.matches("; purpose:").count(),
+            cranelift_instruction_count(&function),
+            "alias-rewritten declarations should not consume instruction purposes:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("call pkg.mod.callee("),
+            "direct Python function call should be rendered with the qualname:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "; purpose: direct_call | exact | direct Python function call callee=pkg.mod.callee"
+            ),
+            "direct Python call purpose should name the qualname:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("py:direct:"),
+            "direct Python display should not expose backend FunctionId-scoped symbols:\n{rendered}"
         );
     }
 
@@ -5971,11 +6082,12 @@ def build(values):
                 BuildSpecializedFunctionOptions::default(),
             )
             .expect("specialized JIT build should succeed");
+            let function_aliases = built_clif_function_aliases(&built);
             let (clif, _cfg_dot, _vcode_disasm) = render_compiled_clif_and_vcode_disasm(
                 &mut jit_module,
                 &SoacEnvConfig::default(),
                 built.ctx,
-                &built.import_id_to_symbol,
+                &function_aliases,
                 &built.block_annotations,
             )
             .expect("specialized JIT CLIF render should succeed");
@@ -7497,11 +7609,12 @@ def write_point(point, value):
                 BuildSpecializedFunctionOptions::default(),
             )
             .expect("specialized JIT build should succeed");
+            let function_aliases = built_clif_function_aliases(&built);
             let (clif, _cfg_dot, _vcode_disasm) = render_compiled_clif_and_vcode_disasm(
                 &mut jit_module,
                 &SoacEnvConfig::default(),
                 built.ctx,
-                &built.import_id_to_symbol,
+                &function_aliases,
                 &built.block_annotations,
             )
             .expect("specialized JIT CLIF render should succeed");
@@ -7664,11 +7777,12 @@ def write_point(point, value):
                 "test",
             )
             .expect("runtime support helpers should inline");
+            let function_aliases = built_clif_function_aliases(&built);
             let (clif, _cfg_dot, _vcode_disasm) = render_compiled_clif_and_vcode_disasm(
                 &mut jit_module,
                 &SoacEnvConfig::default(),
                 built.ctx,
-                &built.import_id_to_symbol,
+                &function_aliases,
                 &built.block_annotations,
             )
             .expect("specialized JIT CLIF render should succeed");
@@ -20648,11 +20762,15 @@ class Point:
         );
 
         assert!(
-            rendered.contains(&format!(" cold: ; block {cold_label}(")),
+            rendered.contains(&format!(" cold: ; block {cold_label}")),
             "rarely visited block should be marked cold in rendered CLIF when enabled:\n{rendered}"
         );
         assert!(
-            !rendered.contains(&format!(" cold: ; block {hot_label}(")),
+            !rendered.contains(&format!(" cold: ; block {cold_label}(")),
+            "cold block without args should not render an empty argument list:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains(&format!(" cold: ; block {hot_label}")),
             "frequently visited block should stay hot in rendered CLIF:\n{rendered}"
         );
     }

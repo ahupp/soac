@@ -119,7 +119,9 @@ use backend::define_prepared_function;
 use backend::new_jit_module;
 #[cfg(test)]
 use backend::normalize_postopt_clif_for_inspection;
-use backend::{CompiledFunctionBytes, new_jit_builder};
+use backend::{
+    CompiledFunctionBytes, new_jit_builder, new_jit_module_with_runtime_support_symbols,
+};
 #[cfg(test)]
 use backend::{stable_cranelift_function_hash, stable_cranelift_function_name};
 #[cfg(test)]
@@ -292,13 +294,16 @@ use imports::{
 #[cfg(test)]
 use imports::{SOAC_RUNTIME_DECREF_APPLIED_IMPORT, SOAC_RUNTIME_INCREF_APPLIED_IMPORT};
 use inspection::{
-    ClifBlockDisplayAnnotations, register_block_display_annotation,
-    render_compiled_clif_and_vcode_disasm, render_instr_typed_preorder_extras,
-    render_pre_inline_clif_for_inspection,
+    ClifBlockDisplayAnnotations, ClifFunctionDisplayAlias, ClifFunctionDisplayAliases,
+    register_block_display_annotation, render_compiled_clif_and_vcode_disasm,
+    render_instr_typed_preorder_extras, render_pre_inline_clif_for_inspection,
 };
 pub use inspection::{RenderedSpecializedClif, run_cranelift_smoke};
 #[cfg(test)]
-use inspection::{annotate_clif_instruction_purposes, nest_clif_blocks_by_nearest_dominator};
+use inspection::{
+    annotate_clif_instruction_purposes, nest_clif_blocks_by_nearest_dominator,
+    rewrite_clif_function_aliases,
+};
 
 struct BuiltSpecializedFunction {
     ctx: cranelift_codegen::Context,
@@ -307,6 +312,8 @@ struct BuiltSpecializedFunction {
     default_adapter_id: Option<cranelift_module::FuncId>,
     default_adapter_symbol: Option<String>,
     import_id_to_symbol: HashMap<u32, &'static str>,
+    local_func_id_to_symbol: HashMap<u32, &'static str>,
+    direct_func_id_to_qualname: HashMap<u32, String>,
     #[cfg(test)]
     func_id_to_symbol: HashMap<u32, &'static str>,
     block_annotations: ClifBlockDisplayAnnotations,
@@ -318,6 +325,51 @@ struct DeclaredJitFunction {
     default_func_id: Option<FuncId>,
     symbol: String,
     default_symbol: Option<String>,
+}
+
+fn add_declared_direct_function_alias(
+    aliases: &mut HashMap<u32, String>,
+    declared: &DeclaredJitFunction,
+    qualname: &str,
+) {
+    aliases.insert(declared.func_id.as_u32(), qualname.to_string());
+    if let Some(default_func_id) = declared.default_func_id {
+        aliases.insert(default_func_id.as_u32(), format!("{qualname}:defaults"));
+    }
+}
+
+fn clif_function_display_aliases(
+    import_id_to_symbol: &HashMap<u32, &'static str>,
+    local_func_id_to_symbol: &HashMap<u32, &'static str>,
+    runtime_support_symbols: &HashMap<u32, String>,
+    direct_func_id_to_qualname: &HashMap<u32, String>,
+) -> ClifFunctionDisplayAliases {
+    let mut aliases = ClifFunctionDisplayAliases::new();
+    for (func_id, symbol) in import_id_to_symbol {
+        aliases.insert(
+            *func_id,
+            ClifFunctionDisplayAlias::runtime_helper((*symbol).to_string()),
+        );
+    }
+    for (func_id, symbol) in local_func_id_to_symbol {
+        aliases.insert(
+            *func_id,
+            ClifFunctionDisplayAlias::runtime_helper((*symbol).to_string()),
+        );
+    }
+    for (func_id, symbol) in runtime_support_symbols {
+        aliases.insert(
+            *func_id,
+            ClifFunctionDisplayAlias::runtime_helper(symbol.clone()),
+        );
+    }
+    for (func_id, qualname) in direct_func_id_to_qualname {
+        aliases.insert(
+            *func_id,
+            ClifFunctionDisplayAlias::direct_python(qualname.clone()),
+        );
+    }
+    aliases
 }
 
 fn codegen_expr_is_borrowable_from_local_env(
@@ -17480,6 +17532,34 @@ fn build_cranelift_run_bb_specialized_function(
         function,
     );
 
+    let mut direct_func_id_to_qualname = HashMap::new();
+    direct_func_id_to_qualname.insert(main_id.as_u32(), function.names.qualname.clone());
+    if let Some(default_adapter_id) = default_adapter_id {
+        direct_func_id_to_qualname.insert(
+            default_adapter_id.as_u32(),
+            format!("{}:defaults", function.names.qualname),
+        );
+    }
+    for (function_id, declared) in direct_call_functions {
+        let qualname = if *function_id == function.function_id {
+            Some(function.names.qualname.as_str())
+        } else {
+            module
+                .callable_defs
+                .iter()
+                .find(|candidate| candidate.function_id == *function_id)
+                .map(|candidate| candidate.names.qualname.as_str())
+                .or_else(|| {
+                    direct_call_target_functions
+                        .get(function_id)
+                        .map(|candidate| candidate.names.qualname.as_str())
+                })
+        };
+        if let Some(qualname) = qualname {
+            add_declared_direct_function_alias(&mut direct_func_id_to_qualname, declared, qualname);
+        }
+    }
+
     Ok(BuiltSpecializedFunction {
         ctx,
         main_id,
@@ -17487,6 +17567,8 @@ fn build_cranelift_run_bb_specialized_function(
         default_adapter_id,
         default_adapter_symbol,
         import_id_to_symbol: module_imports.debug_symbols().clone(),
+        local_func_id_to_symbol: module_imports.debug_declared_symbols().clone(),
+        direct_func_id_to_qualname,
         #[cfg(test)]
         func_id_to_symbol: module_imports.debug_declared_symbols().clone(),
         block_annotations,
@@ -17606,8 +17688,8 @@ pub unsafe fn render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
         return Err("specialized JIT run_bb requires at least one block".to_string());
     }
 
-    let builder = new_jit_builder(compile_session.env_config()?)?;
-    let mut jit_module = JITModule::new(builder);
+    let (mut jit_module, runtime_support_symbols) =
+        new_jit_module_with_runtime_support_symbols(compile_session)?;
     let specialization_profile = SpecializationProfile::from_runtime_state_with_session(
         runtime_state,
         Some(compile_session),
@@ -17734,26 +17816,35 @@ pub unsafe fn render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
         BuildSpecializedFunctionOptions::default(),
     )?;
     let mut out = String::new();
-    out.push_str("; import fn aliases (Cranelift display id -> symbol)\n");
-    let mut symbols: Vec<&'static str> = built.import_id_to_symbol.values().copied().collect();
+    let function_aliases = clif_function_display_aliases(
+        &built.import_id_to_symbol,
+        &built.local_func_id_to_symbol,
+        &runtime_support_symbols,
+        &built.direct_func_id_to_qualname,
+    );
+    out.push_str("; function aliases (Cranelift display id -> readable name)\n");
+    let mut symbols: Vec<String> = function_aliases
+        .values()
+        .map(|alias| alias.display_name.clone())
+        .collect();
     symbols.sort_unstable();
     symbols.dedup();
     for symbol in symbols {
         out.push_str("; ");
-        out.push_str(symbol);
+        out.push_str(&symbol);
         out.push('\n');
     }
     out.push('\n');
     let pre_inline_clif = render_pre_inline_clif_for_inspection(
         &built.ctx.func,
-        &built.import_id_to_symbol,
+        &function_aliases,
         &built.block_annotations,
     );
     let (compiled_clif, cfg_dot, vcode_disasm) = render_compiled_clif_and_vcode_disasm(
         &mut jit_module,
         compile_session.env_config()?,
         built.ctx,
-        &built.import_id_to_symbol,
+        &function_aliases,
         &built.block_annotations,
     )?;
     out.push_str(&compiled_clif);
