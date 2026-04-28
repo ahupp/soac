@@ -8,8 +8,8 @@ use pyo3::ffi;
 use soac_core::block_py::{
     BlockPyFunction, CellLocation, ChildVisitable, ModuleShape, ParamKind, ResolvedName, Visit,
 };
-use soac_ir_blockpy::{CodegenModuleShape, InstrCodegen};
-use soac_ir_typed::{InstrTyped, TypedCodegenModuleShape};
+use soac_ir_blockpy::{BlockPyModuleShape, InstrBlockPy};
+use soac_ir_typed::{InstrTyped, TypedBlockPyModuleShape};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::mem::{offset_of, size_of};
@@ -154,11 +154,11 @@ pub(crate) struct FunctionRuntimeDataLayout {
 }
 
 impl FunctionRuntimeDataLayout {
-    pub(crate) fn from_function(function: &BlockPyFunction<CodegenModuleShape>) -> Self {
+    pub(crate) fn from_function(function: &BlockPyFunction<BlockPyModuleShape>) -> Self {
         Self::from_parts(function, max_referenced_function_closure_slot(function))
     }
 
-    pub(crate) fn from_typed_function(function: &BlockPyFunction<TypedCodegenModuleShape>) -> Self {
+    pub(crate) fn from_typed_function(function: &BlockPyFunction<TypedBlockPyModuleShape>) -> Self {
         Self::from_parts(
             function,
             max_referenced_typed_function_closure_slot(function),
@@ -251,7 +251,7 @@ impl FunctionRuntimeDataLayout {
     }
 }
 
-fn max_referenced_function_closure_slot(function: &BlockPyFunction<CodegenModuleShape>) -> usize {
+fn max_referenced_function_closure_slot(function: &BlockPyFunction<BlockPyModuleShape>) -> usize {
     #[derive(Default)]
     struct Collector {
         max_slot_plus_one: usize,
@@ -274,13 +274,13 @@ fn max_referenced_function_closure_slot(function: &BlockPyFunction<CodegenModule
         }
     }
 
-    impl Visit<InstrCodegen> for Collector {
-        fn visit_instr(&mut self, expr: &InstrCodegen) {
+    impl Visit<InstrBlockPy> for Collector {
+        fn visit_instr(&mut self, expr: &InstrBlockPy) {
             match expr {
-                InstrCodegen::Load(op) => self.visit_name(&op.name),
-                InstrCodegen::Store(op) => self.visit_name(&op.name),
-                InstrCodegen::Del(op) => self.visit_name(&op.name),
-                InstrCodegen::CellRef(op) => self.visit_cell_location(op.location),
+                InstrBlockPy::Load(op) => self.visit_name(&op.name),
+                InstrBlockPy::Store(op) => self.visit_name(&op.name),
+                InstrBlockPy::Del(op) => self.visit_name(&op.name),
+                InstrBlockPy::CellRef(op) => self.visit_cell_location(op.location),
                 _ => {}
             }
             expr.visit_children(self);
@@ -293,7 +293,7 @@ fn max_referenced_function_closure_slot(function: &BlockPyFunction<CodegenModule
 }
 
 fn max_referenced_typed_function_closure_slot(
-    function: &BlockPyFunction<TypedCodegenModuleShape>,
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
 ) -> usize {
     #[derive(Default)]
     struct Collector {

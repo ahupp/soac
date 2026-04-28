@@ -17,7 +17,7 @@ use soac_core::block_py::{
     RuntimeFunctionId, RuntimeName, StorageLayout, Store, Visit, current_instr_locations,
 };
 use soac_ir_blockpy::{
-    CodegenModuleShape, InstrCodegen, constructor_init_function_id_for_entry_function,
+    BlockPyModuleShape, InstrBlockPy, constructor_init_function_id_for_entry_function,
     is_constructor_entry_function,
 };
 use soac_ir_typed::emit_v3::{
@@ -34,13 +34,13 @@ use soac_ir_typed::plan_v3::{
 };
 use soac_ir_typed::{
     FactStore, InstrTyped, PyExactType, PyObjFacts, RuntimeHelperId, TypedAttrAccessPlan,
-    TypedBlock, TypedBlockLayoutHint, TypedCall, TypedCallAccessPlan, TypedCodegenModuleShape,
+    TypedBlock, TypedBlockLayoutHint, TypedBlockPyModuleShape, TypedCall, TypedCallAccessPlan,
     TypedDirectCallGuardTest, TypedDirectCallGuardTestKind, TypedDirectCallableCall,
     TypedDirectCallableCallGuard, TypedDirectMethodCall, TypedExactIntBranchPlan,
     TypedExactIntReturnPlan, TypedExactIntScalarThreadPlan, TypedGetAttr, TypedGuardedCallableCall,
     TypedGuardedMethodCall, TypedIndexedFieldGuard, TypedIndexedFieldPlanSource,
     TypedPlannedResult, TypedPyObjectOwnershipPlan, TypedSetAttr, ValueFacts,
-    lower_codegen_function_to_typed,
+    lower_blockpy_function_to_typed,
 };
 #[cfg(test)]
 use soac_opt::passes::infer_module_value_facts;
@@ -65,7 +65,7 @@ use std::collections::{HashMap, HashSet};
 use std::mem::offset_of;
 use std::sync::Arc;
 
-type CodegenBlock = Block<InstrCodegen>;
+type BlockPyBlock = Block<InstrBlockPy>;
 
 unsafe extern "C" {
     static mut PyFunction_Type: ffi::PyTypeObject;
@@ -244,7 +244,7 @@ use typed_pipeline::{
     apply_profile_typed_guard_miss_policy_to_typed_function,
     apply_profile_typed_plans_to_typed_function,
 };
-use typed_pipeline::{build_typed_v3_jit_module_plan, collect_codegen_constants_for_module_name};
+use typed_pipeline::{collect_codegen_constants_for_module_name, optimize_blockpy};
 pub use typed_value::{
     EmitResult, IntFacts, IntRange, IntWidth, ResultDemand, SoacRepr, SoacValue, ValueOwnership,
 };
@@ -321,13 +321,13 @@ struct DeclaredJitFunction {
 }
 
 fn codegen_expr_is_borrowable_from_local_env(
-    expr: &InstrCodegen,
+    expr: &InstrBlockPy,
     local_env: &LocalEnv,
     stack_slots: &StackSlots,
     storage_layout: Option<&StorageLayout>,
 ) -> bool {
     match expr {
-        InstrCodegen::Load(op) => {
+        InstrBlockPy::Load(op) => {
             let Some(location) = op.name.local_location() else {
                 return false;
             };
@@ -345,7 +345,7 @@ fn codegen_expr_is_borrowable_from_local_env(
 }
 
 fn codegen_expr_pyobject_input_is_borrowed_from_local_env(
-    expr: &InstrCodegen,
+    expr: &InstrBlockPy,
     local_env: &LocalEnv,
     ctx: &JitEmitCtx<'_>,
 ) -> bool {
@@ -740,16 +740,16 @@ fn emit_borrowed_planned_indexed_global_load(
 }
 
 fn codegen_expr_helper_name<'a>(
-    expr: &'a InstrCodegen,
+    expr: &'a InstrBlockPy,
     module_constants: &'a ModuleCodegenConstants,
 ) -> Option<&'a str> {
     match expr {
-        InstrCodegen::Load(op)
+        InstrBlockPy::Load(op)
             if op.name.location.is_global() || op.name.location.is_runtime_name() =>
         {
             Some(op.name.id.as_str())
         }
-        InstrCodegen::Load(op) => op.name.location.as_constant().and_then(|index| {
+        InstrBlockPy::Load(op) => op.name.location.as_constant().and_then(|index| {
             module_constants.constant_runtime_name_value(ModuleConstantId(index as usize))
         }),
         _ => None,
@@ -757,12 +757,12 @@ fn codegen_expr_helper_name<'a>(
 }
 
 fn codegen_expr_static_runtime_name<'a>(
-    expr: &'a InstrCodegen,
+    expr: &'a InstrBlockPy,
     module_constants: &'a ModuleCodegenConstants,
 ) -> Option<&'a str> {
     match expr {
-        InstrCodegen::Load(op) if op.name.location.is_runtime_name() => Some(op.name.id.as_str()),
-        InstrCodegen::Load(op) => op.name.location.as_constant().and_then(|index| {
+        InstrBlockPy::Load(op) if op.name.location.is_runtime_name() => Some(op.name.id.as_str()),
+        InstrBlockPy::Load(op) => op.name.location.as_constant().and_then(|index| {
             module_constants.constant_runtime_name_value(ModuleConstantId(index as usize))
         }),
         _ => None,
@@ -783,7 +783,7 @@ fn typed_expr_static_runtime_name<'a>(
 }
 
 fn codegen_expr_runtime_helper(
-    expr: &InstrCodegen,
+    expr: &InstrBlockPy,
     ctx: &JitEmitCtx<'_>,
 ) -> Option<RuntimeHelperId> {
     ctx.value_facts_for_expr(expr)
@@ -828,11 +828,11 @@ struct SuperInstanceArg {
 
 fn emit_local_value_for_super_deleted_name_arg(
     fb: &mut FunctionBuilder<'_>,
-    expr: &InstrCodegen,
+    expr: &InstrBlockPy,
     local_env: &LocalEnv,
     ctx: &JitEmitCtx<'_>,
 ) -> Option<(ir::Value, ir::Value)> {
-    let InstrCodegen::Load(op) = expr else {
+    let InstrBlockPy::Load(op) = expr else {
         return None;
     };
     let location = op.name.local_location()?;
@@ -857,7 +857,7 @@ fn emit_local_value_for_super_deleted_name_arg(
 
 fn emit_super_instance_arg_with_local_env(
     fb: &mut FunctionBuilder<'_>,
-    instance_expr: &InstrCodegen,
+    instance_expr: &InstrBlockPy,
     local_env: &mut LocalEnv,
     ctx: &JitEmitCtx<'_>,
     codegen_env: &mut impl JitCodegenEnv,
@@ -892,10 +892,10 @@ fn emit_super_instance_arg_with_local_env(
 
 fn emit_codegen_super_helper_call_with_local_env(
     fb: &mut FunctionBuilder<'_>,
-    callable_expr: &InstrCodegen,
-    super_fn_expr: &InstrCodegen,
-    cls_expr: &InstrCodegen,
-    instance_expr: &InstrCodegen,
+    callable_expr: &InstrBlockPy,
+    super_fn_expr: &InstrBlockPy,
+    cls_expr: &InstrBlockPy,
+    instance_expr: &InstrBlockPy,
     local_env: &mut LocalEnv,
     ctx: &JitEmitCtx<'_>,
     codegen_env: &mut impl JitCodegenEnv,
@@ -1310,7 +1310,7 @@ struct JitEmitConsts {
 
 #[derive(Clone)]
 struct JitEmitCtx<'mc> {
-    module: &'mc BlockPyModule<TypedCodegenModuleShape>,
+    module: &'mc BlockPyModule<TypedBlockPyModuleShape>,
     function_id: RuntimeFunctionId,
     function_kind: FunctionKind,
     module_constants: &'mc ModuleCodegenConstants,
@@ -1359,7 +1359,7 @@ struct JitEmitCtx<'mc> {
     pop_handled_exception_ref: ir::FuncRef,
     direct_edge_stats: &'mc DirectEdgeStats,
     direct_call_target_functions:
-        &'mc HashMap<RuntimeFunctionId, BlockPyFunction<TypedCodegenModuleShape>>,
+        &'mc HashMap<RuntimeFunctionId, BlockPyFunction<TypedBlockPyModuleShape>>,
     direct_call_functions: &'mc HashMap<RuntimeFunctionId, DeclaredJitFunction>,
     call_target_counter_ids: &'mc HashMap<InstrId, CounterId>,
     call_direct_target_counter_ids: &'mc HashMap<InstrId, CounterId>,
@@ -1463,7 +1463,7 @@ fn prepare_optional_guard_miss_dispatch(
 }
 
 fn collect_typed_guard_miss_deopt_instr_ids(
-    function: &BlockPyFunction<TypedCodegenModuleShape>,
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
 ) -> HashSet<InstrId> {
     struct Collector {
         instr_ids: HashSet<InstrId>,
@@ -1702,7 +1702,7 @@ impl JitEmitCtx<'_> {
             .fact_for(InstrKey::new(self.function_id, instr_id))
     }
 
-    fn value_facts_for_expr(&self, expr: &InstrCodegen) -> Option<ValueFacts> {
+    fn value_facts_for_expr(&self, expr: &InstrBlockPy) -> Option<ValueFacts> {
         let instr_id = expr.try_semantic_instr_id()?;
         self.value_facts_for_instr_id(instr_id)
     }
@@ -1798,7 +1798,7 @@ impl JitEmitCtx<'_> {
     fn guard_miss_target_for_codegen_resume_point(
         &self,
         point: LocalEnvResumePoint,
-        pre_guard_operands: &[&InstrCodegen],
+        pre_guard_operands: &[&InstrBlockPy],
         fallback_block: ir::Block,
     ) -> Result<JitGuardMissTarget, RuntimeJitDeoptUnsupportedReason> {
         if pre_guard_operands
@@ -1851,14 +1851,14 @@ impl JitEmitCtx<'_> {
 }
 
 #[cfg(test)]
-fn infer_jit_value_facts(module: &BlockPyModule<CodegenModuleShape>) -> FactStore {
+fn infer_jit_value_facts(module: &BlockPyModule<BlockPyModuleShape>) -> FactStore {
     infer_module_value_facts(module)
 }
 
 fn direct_call_target_function<'a>(
     ctx: &'a JitEmitCtx<'_>,
     function_id: RuntimeFunctionId,
-) -> Option<&'a BlockPyFunction<TypedCodegenModuleShape>> {
+) -> Option<&'a BlockPyFunction<TypedBlockPyModuleShape>> {
     ctx.module
         .callable_defs
         .iter()
@@ -2430,7 +2430,7 @@ fn local_ref_kind_for_planned_local_state(state: LocalRefState) -> LocalRefKind 
 }
 
 fn planned_local_store_effect(
-    expr: &InstrCodegen,
+    expr: &InstrBlockPy,
     location: LocalLocation,
     ctx: &JitEmitCtx<'_>,
 ) -> Option<PlannedLocalStoreEffect> {
@@ -2479,7 +2479,7 @@ fn planned_local_store_effect_for_key(
     None
 }
 
-fn local_ref_kind_for_stored_value(value: &InstrCodegen, ctx: &JitEmitCtx<'_>) -> LocalRefKind {
+fn local_ref_kind_for_stored_value(value: &InstrBlockPy, ctx: &JitEmitCtx<'_>) -> LocalRefKind {
     match ctx
         .value_facts_for_expr(value)
         .and_then(ValueFacts::as_pyobj)
@@ -2490,11 +2490,11 @@ fn local_ref_kind_for_stored_value(value: &InstrCodegen, ctx: &JitEmitCtx<'_>) -
 }
 
 fn py_facts_for_codegen_expr_with_local_env(
-    expr: &InstrCodegen,
+    expr: &InstrBlockPy,
     local_env: &LocalEnv,
     ctx: &JitEmitCtx<'_>,
 ) -> Option<PyObjFacts> {
-    if let InstrCodegen::Load(op) = expr {
+    if let InstrBlockPy::Load(op) = expr {
         if let Some(py_facts) = local_env.py_facts_for_load(&op.name) {
             return Some(py_facts);
         }
@@ -2623,8 +2623,8 @@ fn local_locations_for_names(
 
 fn emit_local_store_with_local_env(
     fb: &mut FunctionBuilder<'_>,
-    expr: &InstrCodegen,
-    op: &Store<InstrCodegen>,
+    expr: &InstrBlockPy,
+    op: &Store<InstrBlockPy>,
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     codegen_env: &mut impl JitCodegenEnv,
@@ -2673,8 +2673,8 @@ fn emit_none_for_demand(
 
 fn emit_local_store_result_with_local_env(
     fb: &mut FunctionBuilder<'_>,
-    expr: &InstrCodegen,
-    op: &Store<InstrCodegen>,
+    expr: &InstrBlockPy,
+    op: &Store<InstrBlockPy>,
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     demand: ResultDemand,
@@ -2741,7 +2741,7 @@ fn emit_local_store_result_with_local_env(
     }
 
     let location = op.name.cell_location()?;
-    if !(location.is_owned() && matches!(op.value.as_ref(), InstrCodegen::MakeCell(_))) {
+    if !(location.is_owned() && matches!(op.value.as_ref(), InstrBlockPy::MakeCell(_))) {
         return None;
     }
     let layout = emit_ctx
@@ -3126,7 +3126,7 @@ fn emit_typed_cell_delete_result_with_local_env(
 
 fn emit_local_delete_with_local_env(
     fb: &mut FunctionBuilder<'_>,
-    op: &Del<InstrCodegen>,
+    op: &Del<InstrBlockPy>,
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
 ) -> Option<ir::Value> {
@@ -3147,7 +3147,7 @@ fn emit_local_delete_with_local_env(
 
 fn emit_local_delete_result_with_local_env(
     fb: &mut FunctionBuilder<'_>,
-    op: &Del<InstrCodegen>,
+    op: &Del<InstrBlockPy>,
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     demand: ResultDemand,
@@ -3378,7 +3378,7 @@ impl ExceptionStateSlots {
     }
 }
 
-impl<'a, 'b, 'mc, 'c, 'd, Env: JitCodegenEnv> intrinsics::OperationEmitState<'b, InstrCodegen>
+impl<'a, 'b, 'mc, 'c, 'd, Env: JitCodegenEnv> intrinsics::OperationEmitState<'b, InstrBlockPy>
     for LocalEnvCodegenIntrinsicEmitState<'a, 'b, 'mc, 'c, 'd, Env>
 {
     fn ctx(&self) -> &JitEmitCtx<'mc> {
@@ -3394,7 +3394,7 @@ impl<'a, 'b, 'mc, 'c, 'd, Env: JitCodegenEnv> intrinsics::OperationEmitState<'b,
             .get_or_panic(self.codegen_env, &mut self.fb.func, spec)
     }
 
-    fn emit_arg_values(&mut self, args: &[&InstrCodegen]) -> Vec<(ir::Value, bool)> {
+    fn emit_arg_values(&mut self, args: &[&InstrBlockPy]) -> Vec<(ir::Value, bool)> {
         let mut arg_values = Vec::with_capacity(args.len());
         for arg in args {
             let borrowed_arg = codegen_expr_pyobject_input_is_borrowed_from_local_env(
@@ -3480,7 +3480,7 @@ impl<'a, 'b, 'mc, 'c, 'd, Env: JitCodegenEnv> intrinsics::OperationEmitState<'b,
             })
     }
 
-    fn py_facts_for_arg(&self, arg: &InstrCodegen) -> PyObjFacts {
+    fn py_facts_for_arg(&self, arg: &InstrBlockPy) -> PyObjFacts {
         py_facts_for_codegen_expr_with_local_env(arg, self.local_env, self.ctx)
             .unwrap_or_else(PyObjFacts::unknown)
     }
@@ -3488,7 +3488,7 @@ impl<'a, 'b, 'mc, 'c, 'd, Env: JitCodegenEnv> intrinsics::OperationEmitState<'b,
     fn prepare_guard_miss_dispatch_for_instr(
         &mut self,
         instr_id: InstrId,
-        pre_guard_operands: &[&InstrCodegen],
+        pre_guard_operands: &[&InstrBlockPy],
         fallback_block: ir::Block,
     ) -> JitGuardMissDispatch {
         let guard_miss_resume_point =
@@ -4349,7 +4349,7 @@ fn emit_pack_current_values_tuple(
 
 fn emit_codegen_tuple_with_local_env(
     fb: &mut FunctionBuilder<'_>,
-    tuple: &blockpy_intrinsics::Tuple<InstrCodegen>,
+    tuple: &blockpy_intrinsics::Tuple<InstrBlockPy>,
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     codegen_env: &mut impl JitCodegenEnv,
@@ -4448,7 +4448,7 @@ fn emit_positional_vectorcall_with_local_env(
     fb: &mut FunctionBuilder<'_>,
     callable: ir::Value,
     callable_is_borrowed: bool,
-    args: &[&InstrCodegen],
+    args: &[&InstrBlockPy],
     local_env: &mut LocalEnv,
     ctx: &JitEmitCtx<'_>,
     codegen_env: &mut impl JitCodegenEnv,
@@ -4474,7 +4474,7 @@ fn emit_positional_vectorcall_result_with_local_env(
     fb: &mut FunctionBuilder<'_>,
     callable: ir::Value,
     callable_is_borrowed: bool,
-    args: &[&InstrCodegen],
+    args: &[&InstrBlockPy],
     local_env: &mut LocalEnv,
     ctx: &JitEmitCtx<'_>,
     codegen_env: &mut impl JitCodegenEnv,
@@ -4551,7 +4551,7 @@ fn emit_positional_call_three_with_local_env(
     fb: &mut FunctionBuilder<'_>,
     callable: ir::Value,
     callable_is_borrowed: bool,
-    args: &[&InstrCodegen],
+    args: &[&InstrBlockPy],
     local_env: &mut LocalEnv,
     ctx: &JitEmitCtx<'_>,
     codegen_env: &mut impl JitCodegenEnv,
@@ -4578,7 +4578,7 @@ fn emit_positional_call_three_result_with_local_env(
     fb: &mut FunctionBuilder<'_>,
     callable: ir::Value,
     callable_is_borrowed: bool,
-    args: &[&InstrCodegen],
+    args: &[&InstrBlockPy],
     local_env: &mut LocalEnv,
     ctx: &JitEmitCtx<'_>,
     codegen_env: &mut impl JitCodegenEnv,
@@ -4601,7 +4601,7 @@ fn emit_positional_call_three_result_with_local_env(
 
 fn emit_positional_arg_values(
     fb: &mut FunctionBuilder<'_>,
-    args: &[&InstrCodegen],
+    args: &[&InstrBlockPy],
     local_env: &mut LocalEnv,
     ctx: &JitEmitCtx<'_>,
     codegen_env: &mut impl JitCodegenEnv,
@@ -4862,8 +4862,8 @@ fn emit_keyword_call_with_local_env(
     fb: &mut FunctionBuilder<'_>,
     callable: ir::Value,
     callable_is_borrowed: bool,
-    args: &[&InstrCodegen],
-    keywords: &[(&str, &InstrCodegen)],
+    args: &[&InstrBlockPy],
+    keywords: &[(&str, &InstrBlockPy)],
     local_env: &mut LocalEnv,
     ctx: &JitEmitCtx<'_>,
     codegen_env: &mut impl JitCodegenEnv,
@@ -4891,8 +4891,8 @@ fn emit_keyword_call_result_with_local_env(
     fb: &mut FunctionBuilder<'_>,
     callable: ir::Value,
     callable_is_borrowed: bool,
-    args: &[&InstrCodegen],
-    keywords: &[(&str, &InstrCodegen)],
+    args: &[&InstrBlockPy],
+    keywords: &[(&str, &InstrBlockPy)],
     local_env: &mut LocalEnv,
     ctx: &JitEmitCtx<'_>,
     codegen_env: &mut impl JitCodegenEnv,
@@ -5064,8 +5064,8 @@ fn emit_unpack_call_with_local_env(
     fb: &mut FunctionBuilder<'_>,
     callable: ir::Value,
     callable_is_borrowed: bool,
-    args: &[CallArgPositional<InstrCodegen>],
-    keywords: &[CallArgKeyword<InstrCodegen>],
+    args: &[CallArgPositional<InstrBlockPy>],
+    keywords: &[CallArgKeyword<InstrBlockPy>],
     local_env: &mut LocalEnv,
     ctx: &JitEmitCtx<'_>,
     codegen_env: &mut impl JitCodegenEnv,
@@ -5093,8 +5093,8 @@ fn emit_unpack_call_result_with_local_env(
     fb: &mut FunctionBuilder<'_>,
     callable: ir::Value,
     callable_is_borrowed: bool,
-    args: &[CallArgPositional<InstrCodegen>],
-    keywords: &[CallArgKeyword<InstrCodegen>],
+    args: &[CallArgPositional<InstrBlockPy>],
+    keywords: &[CallArgKeyword<InstrBlockPy>],
     local_env: &mut LocalEnv,
     ctx: &JitEmitCtx<'_>,
     codegen_env: &mut impl JitCodegenEnv,
@@ -5575,7 +5575,7 @@ fn emit_owned_bool_from_pyobject_truthiness(
 }
 
 fn call_site_profiled_targets<'a>(
-    call: &blockpy_intrinsics::Call<InstrCodegen>,
+    call: &blockpy_intrinsics::Call<InstrBlockPy>,
     profiled_targets: Option<&'a [RuntimeFunctionId]>,
 ) -> Option<&'a [RuntimeFunctionId]> {
     let _ = call.try_semantic_instr_id()?;
@@ -5583,11 +5583,11 @@ fn call_site_profiled_targets<'a>(
 }
 
 fn codegen_expr_const_i64(
-    expr: &InstrCodegen,
+    expr: &InstrBlockPy,
     module_constants: &ModuleCodegenConstants,
 ) -> Option<i64> {
     match expr {
-        InstrCodegen::Load(op) => op.name.location.as_constant().and_then(|index| {
+        InstrBlockPy::Load(op) => op.name.location.as_constant().and_then(|index| {
             module_constants.constant_i64_value(ModuleConstantId(index as usize))
         }),
         _ => None,
@@ -6393,7 +6393,7 @@ fn emit_direct_call_resolved_with_arg_plan_from_local_env(
     fb: &mut FunctionBuilder<'_>,
     callable: ir::Value,
     callable_is_borrowed: bool,
-    args: &[&InstrCodegen],
+    args: &[&InstrBlockPy],
     arg_plan: &DirectCallArgPlan,
     target_function: &BlockPyFunction<impl ModuleShape>,
     local_env: &mut LocalEnv,
@@ -6545,7 +6545,7 @@ fn emit_direct_method_resolved_with_args_from_local_env(
     fb: &mut FunctionBuilder<'_>,
     receiver: ir::Value,
     receiver_is_borrowed: bool,
-    args: &[&InstrCodegen],
+    args: &[&InstrBlockPy],
     specialization: &DirectMethodSpecialization,
     target_function: &BlockPyFunction<impl ModuleShape>,
     local_env: &mut LocalEnv,
@@ -7344,7 +7344,7 @@ fn emit_truthy_from_pyobject_value(
 
 fn emit_codegen_expr_value_with_local_env(
     fb: &mut FunctionBuilder<'_>,
-    expr: &InstrCodegen,
+    expr: &InstrBlockPy,
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     borrowed: bool,
@@ -8361,8 +8361,8 @@ fn emit_typed_codegen_expr_value_with_local_env(
 }
 
 struct SimpleCallParts<'a> {
-    simple_args: Vec<&'a InstrCodegen>,
-    simple_keywords: Vec<(&'a str, &'a InstrCodegen)>,
+    simple_args: Vec<&'a InstrBlockPy>,
+    simple_keywords: Vec<(&'a str, &'a InstrBlockPy)>,
     has_unpack: bool,
 }
 
@@ -8372,9 +8372,9 @@ struct TypedSimpleCallParts<'a> {
     has_unpack: bool,
 }
 
-fn simple_call_parts(call: &soac_core::block_py::Call<InstrCodegen>) -> SimpleCallParts<'_> {
-    let mut simple_args: Vec<&InstrCodegen> = Vec::new();
-    let mut simple_keywords: Vec<(&str, &InstrCodegen)> = Vec::new();
+fn simple_call_parts(call: &soac_core::block_py::Call<InstrBlockPy>) -> SimpleCallParts<'_> {
+    let mut simple_args: Vec<&InstrBlockPy> = Vec::new();
+    let mut simple_keywords: Vec<(&str, &InstrBlockPy)> = Vec::new();
     let mut has_unpack = false;
     for arg in &call.args {
         match arg {
@@ -8542,7 +8542,7 @@ fn emit_typed_positional_call_result_with_arg_refs(
 
 fn current_constructor_entry_init_function<'a>(
     emit_ctx: &'a JitEmitCtx<'_>,
-) -> Option<&'a BlockPyFunction<TypedCodegenModuleShape>> {
+) -> Option<&'a BlockPyFunction<TypedBlockPyModuleShape>> {
     let current_function = emit_ctx
         .module
         .callable_defs
@@ -8552,7 +8552,7 @@ fn current_constructor_entry_init_function<'a>(
     direct_call_target_function(emit_ctx, init_function_id)
 }
 
-fn codegen_expr_is_constructor_call(expr: &InstrCodegen, emit_ctx: &JitEmitCtx<'_>) -> bool {
+fn blockpy_expr_is_constructor_call(expr: &InstrBlockPy, emit_ctx: &JitEmitCtx<'_>) -> bool {
     codegen_expr_static_runtime_name(expr, emit_ctx.module_constants)
         == Some(RuntimeName::ConstructorCall.name())
 }
@@ -8565,7 +8565,7 @@ fn typed_expr_is_constructor_call(expr: &InstrTyped, emit_ctx: &JitEmitCtx<'_>) 
 #[allow(clippy::too_many_arguments)]
 fn emit_constructor_entry_direct_init_call_with_arg_values(
     fb: &mut FunctionBuilder<'_>,
-    init_function: &BlockPyFunction<TypedCodegenModuleShape>,
+    init_function: &BlockPyFunction<TypedBlockPyModuleShape>,
     cls_value: ir::Value,
     user_arg_values: Vec<ir::Value>,
     emit_ctx: &JitEmitCtx<'_>,
@@ -8677,14 +8677,14 @@ fn emit_constructor_entry_direct_init_call_with_arg_values(
 #[allow(clippy::too_many_arguments)]
 fn emit_codegen_constructor_entry_call_with_local_env(
     fb: &mut FunctionBuilder<'_>,
-    call: &soac_core::block_py::Call<InstrCodegen>,
-    simple_args: &[&InstrCodegen],
+    call: &soac_core::block_py::Call<InstrBlockPy>,
+    simple_args: &[&InstrBlockPy],
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Option<ir::Value> {
-    if !codegen_expr_is_constructor_call(call.func.as_ref(), emit_ctx) {
+    if !blockpy_expr_is_constructor_call(call.func.as_ref(), emit_ctx) {
         return None;
     }
     let init_function = current_constructor_entry_init_function(emit_ctx)?;
@@ -8785,7 +8785,7 @@ fn emit_typed_constructor_entry_call_with_local_env(
 #[allow(clippy::too_many_arguments)]
 fn emit_codegen_simple_call_effect_only_with_local_env(
     fb: &mut FunctionBuilder<'_>,
-    call: &soac_core::block_py::Call<InstrCodegen>,
+    call: &soac_core::block_py::Call<InstrBlockPy>,
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     codegen_env: &mut impl JitCodegenEnv,
@@ -8919,7 +8919,7 @@ fn emit_codegen_simple_call_effect_only_with_local_env(
 
 fn emit_codegen_simple_call_with_local_env(
     fb: &mut FunctionBuilder<'_>,
-    call: &soac_core::block_py::Call<InstrCodegen>,
+    call: &soac_core::block_py::Call<InstrBlockPy>,
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     profiled_targets: Option<&[RuntimeFunctionId]>,
@@ -9013,7 +9013,7 @@ fn emit_codegen_simple_call_with_local_env(
         && let Some(helper_id) = codegen_expr_runtime_helper(call.func.as_ref(), emit_ctx)
     {
         if helper_id == RuntimeHelperId::CellRef && simple_args.len() == 1 {
-            let InstrCodegen::Load(cell_name) = simple_args[0] else {
+            let InstrBlockPy::Load(cell_name) = simple_args[0] else {
                 panic!(
                     "cell_ref should lower to a located load arg, got {:?}",
                     simple_args[0]
@@ -9233,7 +9233,7 @@ fn emit_codegen_simple_call_with_local_env(
             _ => Vec::new(),
         };
         if !direct_method_specializations.is_empty() {
-            let InstrCodegen::GetAttr(getattr) = call.func.as_ref() else {
+            let InstrBlockPy::GetAttr(getattr) = call.func.as_ref() else {
                 unreachable!("direct method specializations require GetAttr call target");
             };
             let receiver_is_borrowed = codegen_expr_pyobject_input_is_borrowed_from_local_env(
@@ -9677,7 +9677,7 @@ fn emit_codegen_simple_call_with_local_env(
 
 fn emit_codegen_make_function_with_closure_with_local_env(
     fb: &mut FunctionBuilder<'_>,
-    make_function: &soac_core::block_py::MakeFunctionWithClosure<InstrCodegen>,
+    make_function: &soac_core::block_py::MakeFunctionWithClosure<InstrBlockPy>,
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     codegen_env: &mut impl JitCodegenEnv,
@@ -9876,14 +9876,14 @@ fn emit_typed_codegen_make_function_with_closure_with_local_env(
 
 fn emit_codegen_expr_with_local_env(
     fb: &mut FunctionBuilder<'_>,
-    expr: &InstrCodegen,
+    expr: &InstrBlockPy,
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     borrowed: bool,
     codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> ir::Value {
-    if let InstrCodegen::Load(op) = expr {
+    if let InstrBlockPy::Load(op) = expr {
         return emit_resolved_name_load_with_local_env(
             fb,
             &op.name,
@@ -9893,14 +9893,14 @@ fn emit_codegen_expr_with_local_env(
             borrowed,
         );
     }
-    if let InstrCodegen::IncrementCounter(op) = expr {
+    if let InstrBlockPy::IncrementCounter(op) = expr {
         assert!(
             !borrowed,
             "increment_counter must not request a borrowed result"
         );
         return emit_increment_counter(fb, op.counter_id, emit_ctx);
     }
-    if let InstrCodegen::MakeFunctionWithClosure(op) = expr {
+    if let InstrBlockPy::MakeFunctionWithClosure(op) = expr {
         assert!(
             !borrowed,
             "MakeFunctionWithClosure must not request a borrowed result"
@@ -9914,7 +9914,7 @@ fn emit_codegen_expr_with_local_env(
             func_imports,
         );
     }
-    if let InstrCodegen::Tuple(op) = expr {
+    if let InstrBlockPy::Tuple(op) = expr {
         assert!(
             !borrowed,
             "tuple expression must not request a borrowed result"
@@ -9928,7 +9928,7 @@ fn emit_codegen_expr_with_local_env(
             func_imports,
         );
     }
-    if let InstrCodegen::CellRef(op) = expr {
+    if let InstrBlockPy::CellRef(op) = expr {
         assert!(
             !borrowed,
             "codegen operation expression must not use borrowed result"
@@ -9943,16 +9943,16 @@ fn emit_codegen_expr_with_local_env(
     }
     if matches!(
         expr,
-        InstrCodegen::BinOp(_)
-            | InstrCodegen::UnaryOp(_)
-            | InstrCodegen::GetAttr(_)
-            | InstrCodegen::SetAttr(_)
-            | InstrCodegen::GetItem(_)
-            | InstrCodegen::SetItem(_)
-            | InstrCodegen::DelItem(_)
-            | InstrCodegen::Store(_)
-            | InstrCodegen::Del(_)
-            | InstrCodegen::MakeCell(_)
+        InstrBlockPy::BinOp(_)
+            | InstrBlockPy::UnaryOp(_)
+            | InstrBlockPy::GetAttr(_)
+            | InstrBlockPy::SetAttr(_)
+            | InstrBlockPy::GetItem(_)
+            | InstrBlockPy::SetItem(_)
+            | InstrBlockPy::DelItem(_)
+            | InstrBlockPy::Store(_)
+            | InstrBlockPy::Del(_)
+            | InstrBlockPy::MakeCell(_)
     ) {
         assert!(
             !borrowed,
@@ -9969,7 +9969,7 @@ fn emit_codegen_expr_with_local_env(
             return value;
         }
     }
-    if let InstrCodegen::Store(op) = expr {
+    if let InstrBlockPy::Store(op) = expr {
         if let Some(value) = emit_local_store_with_local_env(
             fb,
             expr,
@@ -10021,12 +10021,12 @@ fn emit_codegen_expr_with_local_env(
             codegen_env,
             func_imports,
         };
-        return intrinsics::OperationEmitState::<InstrCodegen>::finish_owned_result(
+        return intrinsics::OperationEmitState::<InstrBlockPy>::finish_owned_result(
             &mut intrinsic_state,
             call_value,
         );
     }
-    if let InstrCodegen::Del(op) = expr {
+    if let InstrBlockPy::Del(op) = expr {
         if let Some(value) = emit_local_delete_with_local_env(fb, op, local_env, emit_ctx) {
             return value;
         }
@@ -10043,13 +10043,13 @@ fn emit_codegen_expr_with_local_env(
             codegen_env,
             func_imports,
         };
-        return intrinsics::emit_del_deref_raw_cell::<InstrCodegen>(
+        return intrinsics::emit_del_deref_raw_cell::<InstrBlockPy>(
             raw_cell,
             op.quietly,
             &mut intrinsic_state,
         );
     }
-    if let InstrCodegen::Call(call) = expr {
+    if let InstrBlockPy::Call(call) = expr {
         assert!(
             !borrowed,
             "codegen call expression must not use borrowed result"
@@ -10149,9 +10149,9 @@ fn emit_owned_pyobject_result_for_demand(
 }
 
 fn direct_positional_call_args(
-    call: &soac_core::block_py::Call<InstrCodegen>,
+    call: &soac_core::block_py::Call<InstrBlockPy>,
     param_count: usize,
-) -> Option<Vec<&InstrCodegen>> {
+) -> Option<Vec<&InstrBlockPy>> {
     if !call.keywords.is_empty() || call.args.len() != param_count {
         return None;
     }
@@ -10165,8 +10165,8 @@ fn direct_positional_call_args(
 }
 
 fn direct_simple_positional_call_args(
-    call: &soac_core::block_py::Call<InstrCodegen>,
-) -> Option<Vec<&InstrCodegen>> {
+    call: &soac_core::block_py::Call<InstrBlockPy>,
+) -> Option<Vec<&InstrBlockPy>> {
     if !call.keywords.is_empty() {
         return None;
     }
@@ -10210,7 +10210,7 @@ fn typed_simple_positional_call_args(call: &TypedCall<InstrTyped>) -> Option<Vec
 
 #[cfg(test)]
 fn static_runtime_primitive_for_call(
-    call: &soac_core::block_py::Call<InstrCodegen>,
+    call: &soac_core::block_py::Call<InstrBlockPy>,
     module_constants: &ModuleCodegenConstants,
 ) -> Option<direct_abi::RuntimePrimitiveId> {
     let desc = static_runtime_primitive_desc_for_call(call, module_constants)?;
@@ -10221,7 +10221,7 @@ fn static_runtime_primitive_for_call(
 }
 
 fn static_runtime_primitive_desc_for_call(
-    call: &soac_core::block_py::Call<InstrCodegen>,
+    call: &soac_core::block_py::Call<InstrBlockPy>,
     module_constants: &ModuleCodegenConstants,
 ) -> Option<&'static DirectCallableDesc> {
     let name = codegen_expr_static_runtime_name(call.func.as_ref(), module_constants)?;
@@ -10337,7 +10337,7 @@ fn i64_binop_result_facts(
 }
 
 fn codegen_expr_i64_demand_facts(
-    expr: &InstrCodegen,
+    expr: &InstrBlockPy,
     local_env: &LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
 ) -> Option<IntFacts> {
@@ -10345,7 +10345,7 @@ fn codegen_expr_i64_demand_facts(
         return Some(IntFacts::i64_known(value));
     }
     match expr {
-        InstrCodegen::Call(call) => {
+        InstrBlockPy::Call(call) => {
             let Some(desc) =
                 static_runtime_primitive_desc_for_call(call, emit_ctx.module_constants)
             else {
@@ -10358,7 +10358,7 @@ fn codegen_expr_i64_demand_facts(
             }
             Some(runtime_primitive_i64_result_facts(desc))
         }
-        InstrCodegen::BinOp(op) => {
+        InstrBlockPy::BinOp(op) => {
             let lhs_facts = codegen_expr_i64_demand_facts(op.left.as_ref(), local_env, emit_ctx)?;
             let rhs_facts = codegen_expr_i64_demand_facts(op.right.as_ref(), local_env, emit_ctx)?;
             i64_binop_result_facts(op.kind, lhs_facts, rhs_facts)
@@ -10404,7 +10404,7 @@ fn typed_expr_i64_demand_facts(
 }
 
 fn codegen_expr_can_satisfy_i64_demand(
-    expr: &InstrCodegen,
+    expr: &InstrBlockPy,
     local_env: &LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
 ) -> bool {
@@ -10448,14 +10448,14 @@ fn typed_expr_can_emit_guarded_i64_index(
 }
 
 fn codegen_expr_has_exact_int_pyobject_facts(
-    expr: &InstrCodegen,
+    expr: &InstrBlockPy,
     local_env: &LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
 ) -> bool {
     if !matches!(emit_ctx.function_kind, FunctionKind::Function) {
         return false;
     }
-    if let InstrCodegen::Load(op) = expr {
+    if let InstrBlockPy::Load(op) = expr {
         if local_env
             .py_facts_for_load(&op.name)
             .is_some_and(|py_facts| py_facts.is_exact_type(PyExactType::Int))
@@ -10505,7 +10505,7 @@ fn typed_expr_has_exact_int_pyobject_facts(
 }
 
 fn codegen_expr_can_satisfy_param_abi(
-    expr: &InstrCodegen,
+    expr: &InstrBlockPy,
     param: ParamAbi,
     local_env: &LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
@@ -10539,7 +10539,7 @@ fn typed_expr_can_satisfy_param_abi(
 }
 
 fn runtime_primitive_call_params_can_satisfy_abi(
-    call: &soac_core::block_py::Call<InstrCodegen>,
+    call: &soac_core::block_py::Call<InstrBlockPy>,
     desc: &DirectCallableDesc,
     local_env: &LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
@@ -10574,7 +10574,7 @@ fn runtime_primitive_typed_call_params_can_satisfy_abi(
 
 #[cfg(test)]
 fn codegen_expr_static_can_satisfy_i64_demand(
-    expr: &InstrCodegen,
+    expr: &InstrBlockPy,
     module_constants: &ModuleCodegenConstants,
 ) -> bool {
     codegen_expr_static_i64_demand_facts(expr, module_constants).is_some()
@@ -10582,14 +10582,14 @@ fn codegen_expr_static_can_satisfy_i64_demand(
 
 #[cfg(test)]
 fn codegen_expr_static_i64_demand_facts(
-    expr: &InstrCodegen,
+    expr: &InstrBlockPy,
     module_constants: &ModuleCodegenConstants,
 ) -> Option<IntFacts> {
     if let Some(value) = codegen_expr_const_i64(expr, module_constants) {
         return Some(IntFacts::i64_known(value));
     }
     match expr {
-        InstrCodegen::Call(call) => {
+        InstrBlockPy::Call(call) => {
             let Some(desc) = static_runtime_primitive_desc_for_call(call, module_constants) else {
                 return None;
             };
@@ -10604,7 +10604,7 @@ fn codegen_expr_static_i64_demand_facts(
             }
             Some(runtime_primitive_i64_result_facts(desc))
         }
-        InstrCodegen::BinOp(op) => {
+        InstrBlockPy::BinOp(op) => {
             let lhs_facts =
                 codegen_expr_static_i64_demand_facts(op.left.as_ref(), module_constants)?;
             let rhs_facts =
@@ -10617,7 +10617,7 @@ fn codegen_expr_static_i64_demand_facts(
 
 #[cfg(test)]
 fn runtime_primitive_call_static_params_can_satisfy_abi(
-    call: &soac_core::block_py::Call<InstrCodegen>,
+    call: &soac_core::block_py::Call<InstrBlockPy>,
     desc: &DirectCallableDesc,
     module_constants: &ModuleCodegenConstants,
 ) -> bool {
@@ -10737,7 +10737,7 @@ fn emit_checked_i64_overflow_result(
 
 fn emit_i64_binop_result_with_local_env(
     fb: &mut FunctionBuilder<'_>,
-    op: &blockpy_intrinsics::BinOp<InstrCodegen>,
+    op: &blockpy_intrinsics::BinOp<InstrBlockPy>,
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     demand: ResultDemand,
@@ -10988,7 +10988,7 @@ fn emit_typed_guarded_i64_index_with_local_env(
 
 fn emit_exact_pylong_as_i64_saturating_result_with_local_env(
     fb: &mut FunctionBuilder<'_>,
-    expr: &InstrCodegen,
+    expr: &InstrBlockPy,
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     demand: ResultDemand,
@@ -11099,7 +11099,7 @@ fn emit_runtime_primitive_hidden_args(
 
 fn emit_runtime_primitive_param_value_with_local_env(
     fb: &mut FunctionBuilder<'_>,
-    expr: &InstrCodegen,
+    expr: &InstrBlockPy,
     param: ParamAbi,
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
@@ -11304,7 +11304,7 @@ fn emit_runtime_primitive_result_for_demand(
 
 fn emit_runtime_builtin_primitive_desc_call_result_with_local_env(
     fb: &mut FunctionBuilder<'_>,
-    call: &soac_core::block_py::Call<InstrCodegen>,
+    call: &soac_core::block_py::Call<InstrBlockPy>,
     desc: &DirectCallableDesc,
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
@@ -11396,7 +11396,7 @@ fn emit_runtime_builtin_primitive_typed_desc_call_result_with_local_env(
 
 fn emit_runtime_builtin_primitive_call_result_with_local_env(
     fb: &mut FunctionBuilder<'_>,
-    call: &soac_core::block_py::Call<InstrCodegen>,
+    call: &soac_core::block_py::Call<InstrBlockPy>,
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     demand: ResultDemand,
@@ -11459,7 +11459,7 @@ fn emit_runtime_builtin_primitive_typed_call_result_with_local_env(
 
 fn emit_codegen_call_result_with_local_env(
     fb: &mut FunctionBuilder<'_>,
-    call: &soac_core::block_py::Call<InstrCodegen>,
+    call: &soac_core::block_py::Call<InstrBlockPy>,
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     demand: ResultDemand,
@@ -12380,7 +12380,7 @@ fn emit_typed_codegen_direct_method_call_result_with_local_env(
 
 fn emit_codegen_stmt_result_with_local_env(
     fb: &mut FunctionBuilder<'_>,
-    expr: &InstrCodegen,
+    expr: &InstrBlockPy,
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     demand: ResultDemand,
@@ -12400,7 +12400,7 @@ fn emit_codegen_stmt_result_with_local_env(
         ));
     }
     match expr {
-        InstrCodegen::Store(op) => {
+        InstrBlockPy::Store(op) => {
             if let Some(result) = emit_local_store_result_with_local_env(
                 fb,
                 expr,
@@ -12414,14 +12414,14 @@ fn emit_codegen_stmt_result_with_local_env(
                 return Ok(result);
             }
         }
-        InstrCodegen::Del(op) => {
+        InstrBlockPy::Del(op) => {
             if let Some(result) =
                 emit_local_delete_result_with_local_env(fb, op, local_env, emit_ctx, demand)
             {
                 return Ok(result);
             }
         }
-        InstrCodegen::BinOp(op) => {
+        InstrBlockPy::BinOp(op) => {
             if let Some(result) = emit_i64_binop_result_with_local_env(
                 fb,
                 op,
@@ -12434,7 +12434,7 @@ fn emit_codegen_stmt_result_with_local_env(
                 return Ok(result);
             }
         }
-        InstrCodegen::Call(call) => {
+        InstrBlockPy::Call(call) => {
             if let Some(result) = emit_codegen_call_result_with_local_env(
                 fb,
                 call,
@@ -12603,14 +12603,14 @@ fn emit_typed_codegen_expr_with_local_env(
 
 fn emit_codegen_stmt_with_local_env(
     fb: &mut FunctionBuilder<'_>,
-    expr: &InstrCodegen,
+    expr: &InstrBlockPy,
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> ir::Value {
     match expr {
-        InstrCodegen::Store(op) => {
+        InstrBlockPy::Store(op) => {
             if let Some(value) = emit_local_store_with_local_env(
                 fb,
                 expr,
@@ -12623,7 +12623,7 @@ fn emit_codegen_stmt_with_local_env(
                 return value;
             }
         }
-        InstrCodegen::Del(op) => {
+        InstrBlockPy::Del(op) => {
             if let Some(value) = emit_local_delete_with_local_env(fb, op, local_env, emit_ctx) {
                 return value;
             }
@@ -14685,7 +14685,7 @@ fn emit_typed_codegen_ops(
 
 #[allow(dead_code)]
 fn codegen_block_has_predecessor(
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
     target: BlockLabel,
 ) -> usize {
     function
@@ -14805,7 +14805,7 @@ fn emit_opt_v3_scalar_thread_inline_return_arm(
     fb: &mut FunctionBuilder<'_>,
     branch_block: ir::Block,
     target_label: BlockLabel,
-    target_term: &BlockTerm<InstrCodegen>,
+    target_term: &BlockTerm<InstrBlockPy>,
     unmaterialized_location: Option<LocalLocation>,
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
@@ -14879,8 +14879,8 @@ fn emit_opt_v3_scalar_threaded_store_branch(
     fb: &mut FunctionBuilder<'_>,
     source_label: BlockLabel,
     typed_block: &TypedBlock,
-    typed_function: &BlockPyFunction<TypedCodegenModuleShape>,
-    function: &BlockPyFunction<CodegenModuleShape>,
+    typed_function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
     jit_local_plan: &PlannedJitFunctionLocals,
     exec_blocks: &[ir::Block],
     block_indices_by_label: &HashMap<BlockLabel, usize>,
@@ -15824,7 +15824,7 @@ fn emit_typed_codegen_term(
     fb: &mut FunctionBuilder<'_>,
     source_label: BlockLabel,
     term: &BlockTerm<InstrTyped>,
-    function: &BlockPyFunction<TypedCodegenModuleShape>,
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
     exec_blocks: &[ir::Block],
     block_indices_by_label: &HashMap<BlockLabel, usize>,
     jump_edge_transports: &[Option<EdgeTransportPlan>],
@@ -16113,13 +16113,13 @@ fn emit_typed_codegen_term(
 struct BuildSpecializedFunctionOptions {
     module_constant_accesses: ModuleConstantAccessTable,
     counted_refcount_helpers: Option<CountedRefcountHelpers>,
-    planned_typed_function: Option<BlockPyFunction<TypedCodegenModuleShape>>,
+    planned_typed_function: Option<BlockPyFunction<TypedBlockPyModuleShape>>,
     external_direct_call_target_functions:
-        HashMap<RuntimeFunctionId, BlockPyFunction<TypedCodegenModuleShape>>,
+        HashMap<RuntimeFunctionId, BlockPyFunction<TypedBlockPyModuleShape>>,
 }
 
 struct PreparedSpecializedTypedFunction {
-    typed_function: BlockPyFunction<TypedCodegenModuleShape>,
+    typed_function: BlockPyFunction<TypedBlockPyModuleShape>,
 }
 
 fn block_edge_shape(edge: Option<&BlockEdge>) -> Option<(BlockLabel, usize)> {
@@ -16154,8 +16154,8 @@ fn block_term_shape<I: soac_core::block_py::Instr>(
 }
 
 fn validate_typed_function_preserves_codegen_cfg(
-    function: &BlockPyFunction<TypedCodegenModuleShape>,
-    typed_function: &BlockPyFunction<TypedCodegenModuleShape>,
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    typed_function: &BlockPyFunction<TypedBlockPyModuleShape>,
 ) -> Result<(), String> {
     if typed_function.blocks.len() != function.blocks.len() {
         return Err(format!(
@@ -16201,7 +16201,7 @@ fn validate_typed_function_preserves_codegen_cfg(
 }
 
 fn annotate_typed_profiled_cold_blocks(
-    typed_function: &mut BlockPyFunction<TypedCodegenModuleShape>,
+    typed_function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
     profile: &SpecializationProfile<'_>,
 ) -> Result<(), String> {
     let cold_block_labels = profile.cold_block_labels(typed_function)?;
@@ -16217,8 +16217,8 @@ fn annotate_typed_profiled_cold_blocks(
 }
 
 fn prepare_specialized_typed_function(
-    function: &BlockPyFunction<TypedCodegenModuleShape>,
-    planned_typed_function: Option<&BlockPyFunction<TypedCodegenModuleShape>>,
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    planned_typed_function: Option<&BlockPyFunction<TypedBlockPyModuleShape>>,
     value_facts: &FactStore,
 ) -> Result<PreparedSpecializedTypedFunction, String> {
     let mut typed_function = planned_typed_function
@@ -16239,9 +16239,9 @@ fn prepare_specialized_typed_function(
 fn build_cranelift_run_bb_specialized_function(
     codegen_env: &mut impl JitCodegenEnv,
     blocks: &[ObjPtr],
-    module: &BlockPyModule<TypedCodegenModuleShape>,
-    function: &BlockPyFunction<TypedCodegenModuleShape>,
-    legacy_scalar_thread_function: Option<&BlockPyFunction<CodegenModuleShape>>,
+    module: &BlockPyModule<TypedBlockPyModuleShape>,
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    legacy_scalar_thread_function: Option<&BlockPyFunction<BlockPyModuleShape>>,
     value_facts: &FactStore,
     jit_local_plan: &PlannedJitFunctionLocals,
     jit_deopt_resume_plan: &PlannedJitDeoptResumeFunction,
@@ -16498,7 +16498,7 @@ fn build_cranelift_run_bb_specialized_function(
         };
         direct_call_target_functions.insert(
             function_id,
-            lower_codegen_function_to_typed(target_function),
+            lower_blockpy_function_to_typed(target_function),
         );
     }
     let ptr_ty = codegen_env.codegen_target_config().pointer_type();
@@ -17495,8 +17495,8 @@ fn build_cranelift_run_bb_specialized_function(
 
 pub unsafe fn render_cranelift_run_bb_specialized_with_cfg(
     blocks: &[ObjPtr],
-    module: &BlockPyModule<CodegenModuleShape>,
-    function: &soac_core::block_py::BlockPyFunction<CodegenModuleShape>,
+    module: &BlockPyModule<BlockPyModuleShape>,
+    function: &soac_core::block_py::BlockPyFunction<BlockPyModuleShape>,
     module_constants: &ModuleCodegenConstants,
 ) -> Result<RenderedSpecializedClif, String> {
     unsafe {
@@ -17515,8 +17515,8 @@ pub unsafe fn render_cranelift_run_bb_specialized_with_cfg(
 
 pub unsafe fn render_instr_typed_for_codegen_with_runtime_state(
     compile_session: &crate::session::CompileSession,
-    module: &BlockPyModule<CodegenModuleShape>,
-    function: &soac_core::block_py::BlockPyFunction<CodegenModuleShape>,
+    module: &BlockPyModule<BlockPyModuleShape>,
+    function: &soac_core::block_py::BlockPyFunction<BlockPyModuleShape>,
     runtime_state: Option<&SharedModuleState>,
 ) -> Result<String, String> {
     let builder = new_jit_builder(compile_session.env_config()?)?;
@@ -17526,7 +17526,7 @@ pub unsafe fn render_instr_typed_for_codegen_with_runtime_state(
         Some(compile_session),
     )?;
     predeclare_specialization_type_imports(&mut jit_module, &specialization_profile)?;
-    let jit_module_plan = build_typed_v3_jit_module_plan(
+    let jit_module_plan = optimize_blockpy(
         module,
         Some(&specialization_profile),
         compile_session.env_config()?,
@@ -17566,7 +17566,7 @@ pub unsafe fn render_instr_typed_for_codegen_with_runtime_state(
         };
         direct_call_target_functions.insert(
             function_id,
-            lower_codegen_function_to_typed(target_function),
+            lower_blockpy_function_to_typed(target_function),
         );
     }
 
@@ -17586,7 +17586,7 @@ pub unsafe fn render_instr_typed_for_codegen_with_runtime_state(
     out.push_str("; ---- typed nodes and embedded extras, preorder ----\n");
     out.push_str(&render_instr_typed_preorder_extras(&typed_function));
     out.push('\n');
-    out.push_str("; ---- BlockPyFunction<TypedCodegenModuleShape> debug ----\n");
+    out.push_str("; ---- BlockPyFunction<TypedBlockPyModuleShape> debug ----\n");
     out.push_str(&format!("{typed_function:#?}"));
     if !out.ends_with('\n') {
         out.push('\n');
@@ -17597,8 +17597,8 @@ pub unsafe fn render_instr_typed_for_codegen_with_runtime_state(
 pub unsafe fn render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
     compile_session: &crate::session::CompileSession,
     blocks: &[ObjPtr],
-    module: &BlockPyModule<CodegenModuleShape>,
-    function: &soac_core::block_py::BlockPyFunction<CodegenModuleShape>,
+    module: &BlockPyModule<BlockPyModuleShape>,
+    function: &soac_core::block_py::BlockPyFunction<BlockPyModuleShape>,
     module_constants: &ModuleCodegenConstants,
     runtime_state: Option<&SharedModuleState>,
 ) -> Result<RenderedSpecializedClif, String> {
@@ -17613,7 +17613,7 @@ pub unsafe fn render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
         Some(compile_session),
     )?;
     predeclare_specialization_type_imports(&mut jit_module, &specialization_profile)?;
-    let jit_module_plan = build_typed_v3_jit_module_plan(
+    let jit_module_plan = optimize_blockpy(
         module,
         Some(&specialization_profile),
         compile_session.env_config()?,
@@ -17768,8 +17768,8 @@ pub unsafe fn render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
 pub(crate) unsafe fn compile_cranelift_run_bb_specialized_cached(
     compile_session: &Arc<crate::session::CompileSession>,
     blocks: &[ObjPtr],
-    module: &BlockPyModule<CodegenModuleShape>,
-    function: &soac_core::block_py::BlockPyFunction<CodegenModuleShape>,
+    module: &BlockPyModule<BlockPyModuleShape>,
+    function: &soac_core::block_py::BlockPyFunction<BlockPyModuleShape>,
     module_constants: &ModuleCodegenConstants,
     counter_defs: &[CounterDef],
     module_constant_ptrs: &[*mut ffi::PyObject],

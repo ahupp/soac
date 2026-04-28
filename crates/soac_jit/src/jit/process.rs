@@ -28,7 +28,7 @@ use super::symbols::{
     direct_function_backend_name, direct_function_symbol_scope, register_jit_data_symbol,
 };
 use super::typed_pipeline::{
-    JitModulePlan, build_typed_v3_jit_module_plan, collect_codegen_constants_for_module_name,
+    JitModulePlan, collect_codegen_constants_for_module_name, optimize_blockpy,
 };
 use super::vectorcall::define_shared_vectorcall_trampoline;
 use super::{
@@ -49,7 +49,7 @@ use soac_config::SoacEnvConfig;
 use soac_core::block_py::{
     BlockPyFunction, BlockPyModule, CounterDef, FunctionExecutionMode, InstrId, RuntimeFunctionId,
 };
-use soac_ir_blockpy::CodegenModuleShape;
+use soac_ir_blockpy::BlockPyModuleShape;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -74,7 +74,7 @@ struct CompiledJitFunction {
 struct DirectFunctionCompileInputs<'a> {
     session: &'a Arc<crate::session::CompileSession>,
     blocks: &'a [ObjPtr],
-    module: &'a BlockPyModule<CodegenModuleShape>,
+    module: &'a BlockPyModule<BlockPyModuleShape>,
     module_constants: &'a ModuleCodegenConstants,
     counter_defs: &'a [CounterDef],
     module_constant_ptrs: &'a [*mut ffi::PyObject],
@@ -469,13 +469,9 @@ impl JitBatchPlan<'_> {
                     Some(shared_state),
                     Some(inputs.session.as_ref()),
                 )?;
-                build_typed_v3_jit_module_plan(
-                    &shared_state.lowered_module,
-                    Some(&profile),
-                    env_config,
-                )?
+                optimize_blockpy(&shared_state.lowered_module, Some(&profile), env_config)?
             } else {
-                build_typed_v3_jit_module_plan(inputs.module, None, env_config)?
+                optimize_blockpy(inputs.module, None, env_config)?
             };
             self.module_plans.insert(binding_key, module_plan);
         }
@@ -692,7 +688,7 @@ impl JitModuleDeclarationSnapshot {
 
 #[derive(Clone)]
 struct ProcessJitBatchFunction<'a> {
-    function: BlockPyFunction<CodegenModuleShape>,
+    function: BlockPyFunction<BlockPyModuleShape>,
     source: ProcessJitBatchFunctionSource<'a>,
 }
 
@@ -764,7 +760,7 @@ fn duration_micros(duration: Duration) -> u64 {
 
 #[allow(clippy::too_many_arguments)]
 fn emit_jit_batch_codegen_log(
-    root_function: &BlockPyFunction<CodegenModuleShape>,
+    root_function: &BlockPyFunction<BlockPyModuleShape>,
     direct_call_resolver: Option<&crate::module_type::SharedModuleState>,
     status: &str,
     failed_phase: &str,
@@ -898,7 +894,7 @@ struct ProcessJitFunctionShape {
 }
 
 impl ProcessJitFunctionShape {
-    fn for_function(function: &BlockPyFunction<CodegenModuleShape>) -> Self {
+    fn for_function(function: &BlockPyFunction<BlockPyModuleShape>) -> Self {
         Self {
             qualname: function.names.qualname.clone(),
             param_count: function.params.len(),
@@ -1086,7 +1082,7 @@ impl ProcessJitState {
     fn ensure_local_scalar_counter_storage(
         &mut self,
         jit_module: &mut JITModule,
-        module: &BlockPyModule<CodegenModuleShape>,
+        module: &BlockPyModule<BlockPyModuleShape>,
         scalar_counter_count: usize,
         instance_key: usize,
     ) -> Result<Option<DataId>, String> {
@@ -1121,7 +1117,7 @@ impl ProcessJitState {
     fn ensure_local_top_value_counter_storage(
         &mut self,
         jit_module: &mut JITModule,
-        module: &BlockPyModule<CodegenModuleShape>,
+        module: &BlockPyModule<BlockPyModuleShape>,
         top_value_counter_count: usize,
         instance_key: usize,
     ) -> Result<Option<DataId>, String> {
@@ -1156,7 +1152,7 @@ impl ProcessJitState {
     fn declare_direct_function(
         &mut self,
         jit_module: &mut JITModule,
-        function: &BlockPyFunction<CodegenModuleShape>,
+        function: &BlockPyFunction<BlockPyModuleShape>,
         symbol_scope: Option<&str>,
     ) -> Result<DeclaredJitFunction, String> {
         let shape = ProcessJitFunctionShape::for_function(function);
@@ -1193,7 +1189,7 @@ impl ProcessJitState {
 
     fn direct_function_compile_waiter(
         &self,
-        function: &BlockPyFunction<CodegenModuleShape>,
+        function: &BlockPyFunction<BlockPyModuleShape>,
     ) -> Option<Arc<ProcessJitCompileWaiter>> {
         let entry = self.direct_functions.get(&function.function_id)?;
         (entry.shape() == &ProcessJitFunctionShape::for_function(function))
@@ -1203,7 +1199,7 @@ impl ProcessJitState {
 
     fn promote_queued_direct_function_compile(
         &self,
-        function: &BlockPyFunction<CodegenModuleShape>,
+        function: &BlockPyFunction<BlockPyModuleShape>,
     ) -> Result<bool, String> {
         let Some(entry) = self.direct_functions.get(&function.function_id) else {
             return Ok(false);
@@ -1219,7 +1215,7 @@ impl ProcessJitState {
 
     fn direct_function_compile_work(
         &self,
-        function: &BlockPyFunction<CodegenModuleShape>,
+        function: &BlockPyFunction<BlockPyModuleShape>,
     ) -> Option<Arc<JitBatchWork>> {
         let entry = self.direct_functions.get(&function.function_id)?;
         (entry.shape() == &ProcessJitFunctionShape::for_function(function))
@@ -1265,7 +1261,7 @@ impl ProcessJitState {
 
     fn ready_direct_function(
         &self,
-        function: &BlockPyFunction<CodegenModuleShape>,
+        function: &BlockPyFunction<BlockPyModuleShape>,
     ) -> Option<Arc<CompiledFunctionHandle>> {
         let entry = self.direct_functions.get(&function.function_id)?;
         (entry.shape() == &ProcessJitFunctionShape::for_function(function))
@@ -1422,7 +1418,7 @@ impl ProcessJitState {
 
         let (counter_slots_by_id, scalar_counter_count, top_value_count) =
             build_counter_storage_layout(inputs.counter_defs)?;
-        let instance_key = inputs.module as *const BlockPyModule<CodegenModuleShape> as usize;
+        let instance_key = inputs.module as *const BlockPyModule<BlockPyModuleShape> as usize;
         let scalar_counter_data_id = self.ensure_local_scalar_counter_storage(
             jit_module,
             inputs.module,
@@ -1473,7 +1469,7 @@ impl ProcessJitState {
         &mut self,
         jit_module: &mut JITModule,
         inputs: &DirectFunctionCompileInputs<'a>,
-        root_function: &BlockPyFunction<CodegenModuleShape>,
+        root_function: &BlockPyFunction<BlockPyModuleShape>,
         batch_functions: Vec<ProcessJitBatchFunction<'a>>,
     ) -> Result<ReservedDirectFunctionBatch<'a>, String> {
         if let Some(compiled_handle) = self.ready_direct_function(root_function) {
@@ -1843,7 +1839,7 @@ impl ProcessJitState {
         &mut self,
         jit_module: &mut JITModule,
         session: &Arc<crate::session::CompileSession>,
-        root_function: &BlockPyFunction<CodegenModuleShape>,
+        root_function: &BlockPyFunction<BlockPyModuleShape>,
         compiled_functions: Vec<CompiledJitFunction>,
     ) -> Result<DirectFunctionCompileResult, String> {
         let mut root_handle = None;
@@ -2029,7 +2025,7 @@ impl Drop for ProcessJitCompileGuard {
 
 fn collect_process_jit_batch_functions<'a>(
     session: &Arc<crate::session::CompileSession>,
-    root: &BlockPyFunction<CodegenModuleShape>,
+    root: &BlockPyFunction<BlockPyModuleShape>,
     direct_call_resolver: Option<&'a crate::module_type::SharedModuleState>,
 ) -> Result<Vec<ProcessJitBatchFunction<'a>>, String> {
     let mut out = Vec::new();
@@ -2185,7 +2181,7 @@ impl ProcessJitEngine {
 
     fn lookup_ready_direct_function(
         &self,
-        function: &BlockPyFunction<CodegenModuleShape>,
+        function: &BlockPyFunction<BlockPyModuleShape>,
     ) -> Result<Option<Arc<CompiledFunctionHandle>>, String> {
         let state = self
             .state
@@ -2196,7 +2192,7 @@ impl ProcessJitEngine {
 
     fn direct_function_needs_compile(
         &self,
-        function: &BlockPyFunction<CodegenModuleShape>,
+        function: &BlockPyFunction<BlockPyModuleShape>,
     ) -> Result<bool, String> {
         if function.execution_mode() != FunctionExecutionMode::Jit {
             return Ok(false);
@@ -2228,7 +2224,7 @@ impl ProcessJitEngine {
 
     fn promote_queued_direct_function_compile(
         &self,
-        function: &BlockPyFunction<CodegenModuleShape>,
+        function: &BlockPyFunction<BlockPyModuleShape>,
     ) -> Result<bool, String> {
         let state = self
             .state
@@ -2239,7 +2235,7 @@ impl ProcessJitEngine {
 
     fn direct_function_compile_work(
         &self,
-        function: &BlockPyFunction<CodegenModuleShape>,
+        function: &BlockPyFunction<BlockPyModuleShape>,
     ) -> Result<Option<Arc<JitBatchWork>>, String> {
         let state = self
             .state
@@ -2278,7 +2274,7 @@ impl ProcessJitEngine {
 
     fn assist_queued_direct_function_compile(
         &self,
-        function: &BlockPyFunction<CodegenModuleShape>,
+        function: &BlockPyFunction<BlockPyModuleShape>,
     ) -> Result<bool, String> {
         let Some(work) = self.direct_function_compile_work(function)? else {
             return Ok(false);
@@ -2761,8 +2757,8 @@ impl ProcessJitEngine {
         &self,
         session: &Arc<crate::session::CompileSession>,
         blocks: &[ObjPtr],
-        module: &'a BlockPyModule<CodegenModuleShape>,
-        function: &BlockPyFunction<CodegenModuleShape>,
+        module: &'a BlockPyModule<BlockPyModuleShape>,
+        function: &BlockPyFunction<BlockPyModuleShape>,
         module_constants: &'a ModuleCodegenConstants,
         counter_defs: &'a [CounterDef],
         module_constant_ptrs: &[*mut ffi::PyObject],
@@ -3016,8 +3012,8 @@ impl ProcessJitEngine {
         &self,
         session: &Arc<crate::session::CompileSession>,
         blocks: &[ObjPtr],
-        module: &BlockPyModule<CodegenModuleShape>,
-        function: &BlockPyFunction<CodegenModuleShape>,
+        module: &BlockPyModule<BlockPyModuleShape>,
+        function: &BlockPyFunction<BlockPyModuleShape>,
         module_constants: &ModuleCodegenConstants,
         counter_defs: &[CounterDef],
         module_constant_ptrs: &[*mut ffi::PyObject],
@@ -3082,8 +3078,8 @@ impl ProcessJitEngine {
         &self,
         session: &Arc<crate::session::CompileSession>,
         blocks: &[ObjPtr],
-        module: &BlockPyModule<CodegenModuleShape>,
-        function: &BlockPyFunction<CodegenModuleShape>,
+        module: &BlockPyModule<BlockPyModuleShape>,
+        function: &BlockPyFunction<BlockPyModuleShape>,
         module_constants: &ModuleCodegenConstants,
         counter_defs: &[CounterDef],
         module_constant_ptrs: &[*mut ffi::PyObject],
@@ -3134,8 +3130,8 @@ impl ProcessJitEngine {
         &self,
         session: &Arc<crate::session::CompileSession>,
         blocks: &[ObjPtr],
-        module: &'a BlockPyModule<CodegenModuleShape>,
-        function: &BlockPyFunction<CodegenModuleShape>,
+        module: &'a BlockPyModule<BlockPyModuleShape>,
+        function: &BlockPyFunction<BlockPyModuleShape>,
         module_constants: &'a ModuleCodegenConstants,
         counter_defs: &'a [CounterDef],
         module_constant_ptrs: &[*mut ffi::PyObject],
@@ -3395,10 +3391,10 @@ mod tests {
     use soac_core::block_py::{
         BlockPyFunction, FunctionKind, FunctionName, ModuleNameGen, Param, ParamKind, ParamSpec,
     };
-    use soac_ir_blockpy::CodegenModuleShape;
+    use soac_ir_blockpy::BlockPyModuleShape;
     use std::sync::Arc;
 
-    fn test_function() -> BlockPyFunction<CodegenModuleShape> {
+    fn test_function() -> BlockPyFunction<BlockPyModuleShape> {
         let module_name_gen = ModuleNameGen::new(0);
         let name_gen = module_name_gen.next_function_name_gen();
         BlockPyFunction {

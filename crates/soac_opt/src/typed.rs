@@ -10,19 +10,20 @@ use soac_core::block_py::{
     ResolvedName, RuntimeFunctionId, RuntimeName, SetAttr, Store, TermIf, TryMapInstr,
     TryMapModule, TryMapTerm, Visit, VisitMut, WithMeta,
 };
-use soac_ir_blockpy::{CodegenModuleShape, InstrCodegen};
+use soac_ir_blockpy::{BlockPyModuleShape, InstrBlockPy};
 use soac_ir_typed::{
-    BoolFacts, FactStore, InstrTyped, PyObjFacts, TypedBlock, TypedBlockExtra, TypedCall,
-    TypedCallAccessPlan, TypedCallEmissionPlan, TypedCallEmissionPlans, TypedCodegenModuleShape,
-    TypedDirectCallArgPlan, TypedDirectCallArgSource, TypedDirectCallGuardTest,
-    TypedDirectCallGuardTestKind, TypedDirectCallableCall, TypedDirectCallableCallGuard,
-    TypedDirectMethodCall, TypedGuardedCallableCall, TypedGuardedMethodCall, TypedPlannedResult,
-    TypedPyObjectOwnershipPlan, TypedResultDemand, TypedTruthy, ValueFacts,
+    BoolFacts, FactStore, InstrTyped, PyObjFacts, TypedBlock, TypedBlockExtra,
+    TypedBlockPyModuleShape, TypedCall, TypedCallAccessPlan, TypedCallEmissionPlan,
+    TypedCallEmissionPlans, TypedDirectCallArgPlan, TypedDirectCallArgSource,
+    TypedDirectCallGuardTest, TypedDirectCallGuardTestKind, TypedDirectCallableCall,
+    TypedDirectCallableCallGuard, TypedDirectMethodCall, TypedGuardedCallableCall,
+    TypedGuardedMethodCall, TypedPlannedResult, TypedPyObjectOwnershipPlan, TypedResultDemand,
+    TypedTruthy, ValueFacts,
 };
 use std::collections::{HashMap, HashSet};
 
 pub fn annotate_typed_module_value_facts(
-    module: &mut BlockPyModule<TypedCodegenModuleShape>,
+    module: &mut BlockPyModule<TypedBlockPyModuleShape>,
     facts: &FactStore,
 ) -> usize {
     module
@@ -33,7 +34,7 @@ pub fn annotate_typed_module_value_facts(
 }
 
 pub fn annotate_typed_function_value_facts(
-    function: &mut BlockPyFunction<TypedCodegenModuleShape>,
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
     facts: &FactStore,
 ) -> usize {
     struct Annotator<'a> {
@@ -224,7 +225,7 @@ fn annotate_typed_child_demands(expr: &mut InstrTyped) -> usize {
 
 #[allow(dead_code)]
 pub fn annotate_typed_module_result_demands(
-    module: &mut BlockPyModule<TypedCodegenModuleShape>,
+    module: &mut BlockPyModule<TypedBlockPyModuleShape>,
 ) -> usize {
     module
         .callable_defs
@@ -234,7 +235,7 @@ pub fn annotate_typed_module_result_demands(
 }
 
 pub fn annotate_typed_function_result_demands(
-    function: &mut BlockPyFunction<TypedCodegenModuleShape>,
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
 ) -> usize {
     let mut changed = 0;
     for block in &mut function.blocks {
@@ -269,7 +270,7 @@ pub fn annotate_typed_function_result_demands(
 
 #[allow(dead_code)]
 pub fn annotate_typed_module_planned_results(
-    module: &mut BlockPyModule<TypedCodegenModuleShape>,
+    module: &mut BlockPyModule<TypedBlockPyModuleShape>,
 ) -> usize {
     module
         .callable_defs
@@ -279,7 +280,7 @@ pub fn annotate_typed_module_planned_results(
 }
 
 pub fn annotate_typed_function_planned_results(
-    function: &mut BlockPyFunction<TypedCodegenModuleShape>,
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
 ) -> usize {
     struct Annotator {
         changed: usize,
@@ -325,7 +326,7 @@ fn typed_instr_is_local_load(expr: &InstrTyped) -> bool {
 }
 
 pub fn refresh_typed_function_value_facts(
-    function: &mut BlockPyFunction<TypedCodegenModuleShape>,
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
 ) -> usize {
     struct Refresher {
         changed: usize,
@@ -406,10 +407,10 @@ fn infer_typed_call_result_facts(
 }
 
 pub fn validate_typed_function_value_facts(
-    function: &BlockPyFunction<TypedCodegenModuleShape>,
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
 ) -> Result<(), String> {
     struct Validator<'a> {
-        function: &'a BlockPyFunction<TypedCodegenModuleShape>,
+        function: &'a BlockPyFunction<TypedBlockPyModuleShape>,
         errors: Vec<String>,
     }
 
@@ -442,8 +443,8 @@ pub fn validate_typed_function_value_facts(
 }
 
 pub fn lower_typed_function_if_tests_to_truthy(
-    mut function: BlockPyFunction<TypedCodegenModuleShape>,
-) -> BlockPyFunction<TypedCodegenModuleShape> {
+    mut function: BlockPyFunction<TypedBlockPyModuleShape>,
+) -> BlockPyFunction<TypedBlockPyModuleShape> {
     for block in &mut function.blocks {
         if let BlockTerm::IfTerm(if_term) = &mut block.term {
             if matches!(if_term.test, InstrTyped::Truthy(_)) {
@@ -462,8 +463,8 @@ pub fn lower_typed_function_if_tests_to_truthy(
 }
 
 pub fn lower_typed_if_tests_to_truthy(
-    mut module: BlockPyModule<TypedCodegenModuleShape>,
-) -> BlockPyModule<TypedCodegenModuleShape> {
+    mut module: BlockPyModule<TypedBlockPyModuleShape>,
+) -> BlockPyModule<TypedBlockPyModuleShape> {
     module.callable_defs = module
         .callable_defs
         .into_iter()
@@ -473,7 +474,7 @@ pub fn lower_typed_if_tests_to_truthy(
 }
 
 pub fn lower_typed_function_call_emission_plans(
-    function: &mut BlockPyFunction<TypedCodegenModuleShape>,
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
     plans: &TypedCallEmissionPlans,
 ) -> Result<usize, String> {
     if plans.is_empty() {
@@ -546,7 +547,7 @@ pub fn lower_typed_function_call_emission_plans(
 }
 
 pub fn lower_typed_function_call_access_plan_instrs(
-    function: &mut BlockPyFunction<TypedCodegenModuleShape>,
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
 ) -> usize {
     struct Rewriter {
         count: usize,
@@ -645,7 +646,7 @@ struct TypedInlineInstrIdAllocator {
 }
 
 impl TypedInlineInstrIdAllocator {
-    fn from_function(function: &BlockPyFunction<TypedCodegenModuleShape>) -> Self {
+    fn from_function(function: &BlockPyFunction<TypedBlockPyModuleShape>) -> Self {
         struct Collector {
             next_instr_index: u32,
             used: HashSet<InstrId>,
@@ -730,9 +731,9 @@ impl<'a> TypedInlineInstrIdRemapper<'a> {
 }
 
 pub fn inline_typed_function_direct_call_stores(
-    function: &mut BlockPyFunction<TypedCodegenModuleShape>,
-    module: &BlockPyModule<TypedCodegenModuleShape>,
-    external_callees: &HashMap<RuntimeFunctionId, BlockPyFunction<TypedCodegenModuleShape>>,
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+    module: &BlockPyModule<TypedBlockPyModuleShape>,
+    external_callees: &HashMap<RuntimeFunctionId, BlockPyFunction<TypedBlockPyModuleShape>>,
     direct_calls_by_instr_id: &HashMap<InstrId, Vec<(RuntimeFunctionId, TypedDirectCallArgPlan)>>,
 ) -> TypedInlineRewriteStats {
     if direct_calls_by_instr_id.is_empty() {
@@ -782,9 +783,9 @@ enum TypedInlineResult {
 }
 
 fn build_typed_direct_call_inline_rewrite(
-    caller: &mut BlockPyFunction<TypedCodegenModuleShape>,
-    module: &BlockPyModule<TypedCodegenModuleShape>,
-    external_callees: &HashMap<RuntimeFunctionId, BlockPyFunction<TypedCodegenModuleShape>>,
+    caller: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+    module: &BlockPyModule<TypedBlockPyModuleShape>,
+    external_callees: &HashMap<RuntimeFunctionId, BlockPyFunction<TypedBlockPyModuleShape>>,
     block: TypedBlock,
     direct_calls_by_instr_id: &HashMap<InstrId, Vec<(RuntimeFunctionId, TypedDirectCallArgPlan)>>,
     instr_id_allocator: &mut TypedInlineInstrIdAllocator,
@@ -1058,10 +1059,10 @@ fn typed_inline_candidate_for_call(
 }
 
 fn typed_inline_callee<'a>(
-    module: &'a BlockPyModule<TypedCodegenModuleShape>,
-    external_callees: &'a HashMap<RuntimeFunctionId, BlockPyFunction<TypedCodegenModuleShape>>,
+    module: &'a BlockPyModule<TypedBlockPyModuleShape>,
+    external_callees: &'a HashMap<RuntimeFunctionId, BlockPyFunction<TypedBlockPyModuleShape>>,
     function_id: RuntimeFunctionId,
-) -> Option<&'a BlockPyFunction<TypedCodegenModuleShape>> {
+) -> Option<&'a BlockPyFunction<TypedBlockPyModuleShape>> {
     module
         .callable_defs
         .iter()
@@ -1165,7 +1166,7 @@ impl TypedTempLocal {
 }
 
 fn try_allocate_typed_stack_temp(
-    function: &mut BlockPyFunction<TypedCodegenModuleShape>,
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
     prefix: &str,
 ) -> Result<TypedTempLocal, TypedInlineUnsupportedReason> {
     let name = function.name_gen.next_tmp_name(prefix).as_str().to_string();
@@ -1184,7 +1185,7 @@ fn try_allocate_typed_stack_temp(
 type TypedInlineValueBindings = HashMap<LocalLocation, InstrTyped>;
 
 fn bind_typed_direct_call_inline_args(
-    callee: &BlockPyFunction<TypedCodegenModuleShape>,
+    callee: &BlockPyFunction<TypedBlockPyModuleShape>,
     arg_plan: &TypedDirectCallArgPlan,
     arg_temps: &[TypedTempLocal],
 ) -> Result<TypedInlineValueBindings, TypedInlineUnsupportedReason> {
@@ -1209,7 +1210,7 @@ fn bind_typed_direct_call_inline_args(
 }
 
 fn typed_parameter_local_location(
-    function: &BlockPyFunction<TypedCodegenModuleShape>,
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
     name: &str,
 ) -> Result<LocalLocation, TypedInlineUnsupportedReason> {
     let layout = function
@@ -1229,8 +1230,8 @@ fn typed_parameter_local_location(
 }
 
 fn build_typed_direct_call_inline_fragment_to_target(
-    caller: &mut BlockPyFunction<TypedCodegenModuleShape>,
-    callee: &BlockPyFunction<TypedCodegenModuleShape>,
+    caller: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+    callee: &BlockPyFunction<TypedBlockPyModuleShape>,
     continuation: BlockLabel,
     value_bindings: &TypedInlineValueBindings,
     return_target: ResolvedName,
@@ -1262,8 +1263,8 @@ struct TypedInlineFragment {
 }
 
 fn build_single_block_typed_inline_fragment_to_target(
-    caller: &mut BlockPyFunction<TypedCodegenModuleShape>,
-    callee: &BlockPyFunction<TypedCodegenModuleShape>,
+    caller: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+    callee: &BlockPyFunction<TypedBlockPyModuleShape>,
     continuation: BlockLabel,
     value_bindings: &TypedInlineValueBindings,
     return_target: ResolvedName,
@@ -1326,8 +1327,8 @@ fn build_single_block_typed_inline_fragment_to_target(
 }
 
 fn build_multi_block_typed_inline_fragment_to_target(
-    caller: &mut BlockPyFunction<TypedCodegenModuleShape>,
-    callee: &BlockPyFunction<TypedCodegenModuleShape>,
+    caller: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+    callee: &BlockPyFunction<TypedBlockPyModuleShape>,
     continuation: BlockLabel,
     value_bindings: &TypedInlineValueBindings,
     return_target: ResolvedName,
@@ -1405,7 +1406,7 @@ fn build_multi_block_typed_inline_fragment_to_target(
 }
 
 fn allocate_typed_inline_locals(
-    caller: &mut BlockPyFunction<TypedCodegenModuleShape>,
+    caller: &mut BlockPyFunction<TypedBlockPyModuleShape>,
     callee_layout: &soac_core::block_py::StorageLayout,
     value_bindings: &TypedInlineValueBindings,
 ) -> Result<HashMap<LocalLocation, TypedTempLocal>, TypedInlineUnsupportedReason> {
@@ -1597,7 +1598,7 @@ fn clear_typed_instr_ids(mut instr: InstrTyped) -> InstrTyped {
 }
 
 pub fn validate_typed_function_call_access_plans(
-    function: &BlockPyFunction<TypedCodegenModuleShape>,
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
 ) -> Result<(), String> {
     struct Validator {
         function_id: RuntimeFunctionId,
@@ -1680,7 +1681,7 @@ pub fn validate_typed_function_call_access_plans(
 }
 
 pub fn validate_typed_module_call_access_plans(
-    module: &BlockPyModule<TypedCodegenModuleShape>,
+    module: &BlockPyModule<TypedBlockPyModuleShape>,
 ) -> Result<(), String> {
     for function in &module.callable_defs {
         validate_typed_function_call_access_plans(function)?;
@@ -1845,20 +1846,20 @@ fn validate_typed_direct_call_arg_sources(
     Ok(())
 }
 
-struct TypedToCodegen;
+struct TypedToBlockPy;
 
-impl TryMapInstr<InstrTyped, InstrCodegen, String> for TypedToCodegen {
-    fn try_map_instr(&mut self, instr: InstrTyped) -> Result<InstrCodegen, String> {
+impl TryMapInstr<InstrTyped, InstrBlockPy, String> for TypedToBlockPy {
+    fn try_map_instr(&mut self, instr: InstrTyped) -> Result<InstrBlockPy, String> {
         Ok(match instr {
             InstrTyped::Truthy(_) => {
                 return Err(
                     "typed truthiness instruction requires typed codegen emission".to_string(),
                 );
             }
-            InstrTyped::Load(op) => InstrCodegen::Load(op.try_map_children(self)?),
-            InstrTyped::BinOp(op) => InstrCodegen::BinOp(op.try_map_children(self)?),
-            InstrTyped::Tuple(op) => InstrCodegen::Tuple(op.try_map_children(self)?),
-            InstrTyped::UnaryOp(op) => InstrCodegen::UnaryOp(op.try_map_children(self)?),
+            InstrTyped::Load(op) => InstrBlockPy::Load(op.try_map_children(self)?),
+            InstrTyped::BinOp(op) => InstrBlockPy::BinOp(op.try_map_children(self)?),
+            InstrTyped::Tuple(op) => InstrBlockPy::Tuple(op.try_map_children(self)?),
+            InstrTyped::UnaryOp(op) => InstrBlockPy::UnaryOp(op.try_map_children(self)?),
             InstrTyped::CalleeFunctionId(_) => {
                 return Err("typed callee function id requires typed codegen emission".to_string());
             }
@@ -1870,7 +1871,7 @@ impl TryMapInstr<InstrTyped, InstrCodegen, String> for TypedToCodegen {
                 }
             },
             InstrTyped::CallTyped(op) => {
-                InstrCodegen::Call(op.try_map_children(self)?.into_legacy())
+                InstrBlockPy::Call(op.try_map_children(self)?.into_legacy())
             }
             InstrTyped::GuardedCallableCallTyped(_) => {
                 return Err(
@@ -1892,21 +1893,21 @@ impl TryMapInstr<InstrTyped, InstrCodegen, String> for TypedToCodegen {
                 return Err("typed direct call requires typed codegen emission".to_string());
             }
             InstrTyped::GetAttrTyped(op) => {
-                InstrCodegen::GetAttr(op.try_map_children(self)?.into_legacy())
+                InstrBlockPy::GetAttr(op.try_map_children(self)?.into_legacy())
             }
             InstrTyped::SetAttrTyped(op) => {
-                InstrCodegen::SetAttr(op.try_map_children(self)?.into_legacy())
+                InstrBlockPy::SetAttr(op.try_map_children(self)?.into_legacy())
             }
-            InstrTyped::GetItem(op) => InstrCodegen::GetItem(op.try_map_children(self)?),
-            InstrTyped::SetItem(op) => InstrCodegen::SetItem(op.try_map_children(self)?),
-            InstrTyped::DelItem(op) => InstrCodegen::DelItem(op.try_map_children(self)?),
-            InstrTyped::Store(op) => InstrCodegen::Store(op.try_map_children(self)?),
-            InstrTyped::Del(op) => InstrCodegen::Del(op.try_map_children(self)?),
-            InstrTyped::MakeCell(op) => InstrCodegen::MakeCell(op.try_map_children(self)?),
-            InstrTyped::IncrementCounter(op) => InstrCodegen::IncrementCounter(op),
-            InstrTyped::CellRef(op) => InstrCodegen::CellRef(op),
+            InstrTyped::GetItem(op) => InstrBlockPy::GetItem(op.try_map_children(self)?),
+            InstrTyped::SetItem(op) => InstrBlockPy::SetItem(op.try_map_children(self)?),
+            InstrTyped::DelItem(op) => InstrBlockPy::DelItem(op.try_map_children(self)?),
+            InstrTyped::Store(op) => InstrBlockPy::Store(op.try_map_children(self)?),
+            InstrTyped::Del(op) => InstrBlockPy::Del(op.try_map_children(self)?),
+            InstrTyped::MakeCell(op) => InstrBlockPy::MakeCell(op.try_map_children(self)?),
+            InstrTyped::IncrementCounter(op) => InstrBlockPy::IncrementCounter(op),
+            InstrTyped::CellRef(op) => InstrBlockPy::CellRef(op),
             InstrTyped::MakeFunctionWithClosure(op) => {
-                InstrCodegen::MakeFunctionWithClosure(op.try_map_children(self)?)
+                InstrBlockPy::MakeFunctionWithClosure(op.try_map_children(self)?)
             }
         })
     }
@@ -1917,9 +1918,9 @@ impl TryMapInstr<InstrTyped, InstrCodegen, String> for TypedToCodegen {
 }
 
 #[track_caller]
-pub fn try_lower_typed_instr_to_codegen_legacy(instr: InstrTyped) -> Result<InstrCodegen, String> {
+pub fn try_lower_typed_instr_to_codegen_legacy(instr: InstrTyped) -> Result<InstrBlockPy, String> {
     let caller = std::panic::Location::caller();
-    TypedToCodegen.try_map_instr(instr).map_err(|err| {
+    TypedToBlockPy.try_map_instr(instr).map_err(|err| {
         format!(
             "{err} [typed_to_codegen_legacy caller={}:{}]",
             caller.file(),
@@ -1931,9 +1932,9 @@ pub fn try_lower_typed_instr_to_codegen_legacy(instr: InstrTyped) -> Result<Inst
 #[track_caller]
 pub fn try_lower_typed_term_to_codegen_legacy(
     term: BlockTerm<InstrTyped>,
-) -> Result<BlockTerm<InstrCodegen>, String> {
+) -> Result<BlockTerm<InstrBlockPy>, String> {
     let caller = std::panic::Location::caller();
-    TypedToCodegen.try_map_term(term).map_err(|err| {
+    TypedToBlockPy.try_map_term(term).map_err(|err| {
         format!(
             "{err} [typed_to_codegen_legacy caller={}:{}]",
             caller.file(),
@@ -1943,10 +1944,10 @@ pub fn try_lower_typed_term_to_codegen_legacy(
 }
 
 pub fn try_lower_typed_module_to_codegen_legacy(
-    module: BlockPyModule<TypedCodegenModuleShape>,
-) -> Result<BlockPyModule<CodegenModuleShape>, String> {
+    module: BlockPyModule<TypedBlockPyModuleShape>,
+) -> Result<BlockPyModule<BlockPyModuleShape>, String> {
     validate_typed_module_call_access_plans(&module)?;
-    TypedToCodegen.try_map_module(module)
+    TypedToBlockPy.try_map_module(module)
 }
 
 #[cfg(test)]
@@ -1956,7 +1957,7 @@ mod typed_codegen_tests {
     use soac_core::block_py::{ChildVisitable, InstrId, InstrWithConstantNone, Visit, VisitMut};
     use soac_ir_typed::{
         TypedAttrOwnerRef, TypedDirectFunctionCallGuard, TypedDirectMethodCallGuard,
-        lower_codegen_module_to_typed,
+        lower_blockpy_module_to_typed,
     };
     use std::collections::HashMap;
 
@@ -2088,26 +2089,26 @@ mod typed_codegen_tests {
     }
 
     #[derive(Default, Eq, PartialEq, Debug)]
-    struct CodegenInstrCounter {
+    struct BlockPyInstrCounter {
         total: usize,
         binops: usize,
         calls: usize,
     }
 
-    impl Visit<InstrCodegen> for CodegenInstrCounter {
-        fn visit_instr(&mut self, expr: &InstrCodegen) {
+    impl Visit<InstrBlockPy> for BlockPyInstrCounter {
+        fn visit_instr(&mut self, expr: &InstrBlockPy) {
             self.total += 1;
             match expr {
-                InstrCodegen::BinOp(_) => self.binops += 1,
-                InstrCodegen::Call(_) => self.calls += 1,
+                InstrBlockPy::BinOp(_) => self.binops += 1,
+                InstrBlockPy::Call(_) => self.calls += 1,
                 _ => {}
             }
             expr.visit_children(self);
         }
     }
 
-    fn count_codegen_instrs(module: &BlockPyModule<CodegenModuleShape>) -> CodegenInstrCounter {
-        let mut counter = CodegenInstrCounter::default();
+    fn count_blockpy_instrs(module: &BlockPyModule<BlockPyModuleShape>) -> BlockPyInstrCounter {
+        let mut counter = BlockPyInstrCounter::default();
         for function in &module.callable_defs {
             for block in &function.blocks {
                 for instr in &block.body {
@@ -2146,7 +2147,7 @@ mod typed_codegen_tests {
     }
 
     fn count_typed_extra_facts(
-        module: &BlockPyModule<TypedCodegenModuleShape>,
+        module: &BlockPyModule<TypedBlockPyModuleShape>,
     ) -> TypedExtraFactCounter {
         let mut counter = TypedExtraFactCounter::default();
         for function in &module.callable_defs {
@@ -2156,9 +2157,9 @@ mod typed_codegen_tests {
     }
 
     fn typed_function_by_qualname_mut<'a>(
-        module: &'a mut BlockPyModule<TypedCodegenModuleShape>,
+        module: &'a mut BlockPyModule<TypedBlockPyModuleShape>,
         qualname: &str,
-    ) -> &'a mut BlockPyFunction<TypedCodegenModuleShape> {
+    ) -> &'a mut BlockPyFunction<TypedBlockPyModuleShape> {
         module
             .callable_defs
             .iter_mut()
@@ -2166,8 +2167,8 @@ mod typed_codegen_tests {
             .unwrap_or_else(|| panic!("missing typed function {qualname}"))
     }
 
-    fn codegen_function_id_by_qualname(
-        module: &BlockPyModule<CodegenModuleShape>,
+    fn blockpy_function_id_by_qualname(
+        module: &BlockPyModule<BlockPyModuleShape>,
         qualname: &str,
     ) -> RuntimeFunctionId {
         module
@@ -2179,7 +2180,7 @@ mod typed_codegen_tests {
     }
 
     fn replace_first_typed_call_access(
-        function: &mut BlockPyFunction<TypedCodegenModuleShape>,
+        function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
         access: TypedCallAccessPlan,
     ) {
         struct Replacer {
@@ -2209,7 +2210,7 @@ mod typed_codegen_tests {
         );
     }
 
-    fn first_typed_call_instr_id(function: &BlockPyFunction<TypedCodegenModuleShape>) -> InstrId {
+    fn first_typed_call_instr_id(function: &BlockPyFunction<TypedBlockPyModuleShape>) -> InstrId {
         struct Finder {
             instr_id: Option<InstrId>,
         }
@@ -2238,10 +2239,10 @@ mod typed_codegen_tests {
         let lowered =
             soac_lowering::lower_python_to_blockpy_for_testing("def f(a, b):\n    return a + b\n")
                 .expect("source should lower");
-        let function_count = lowered.codegen_module.callable_defs.len();
-        let global_names = lowered.codegen_module.global_names.clone();
+        let function_count = lowered.blockpy_module.callable_defs.len();
+        let global_names = lowered.blockpy_module.global_names.clone();
 
-        let typed = lower_codegen_module_to_typed(lowered.codegen_module);
+        let typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
 
         assert_eq!(typed.callable_defs.len(), function_count);
         assert_eq!(typed.global_names, global_names);
@@ -2269,7 +2270,7 @@ mod typed_codegen_tests {
             soac_lowering::lower_python_to_blockpy_for_testing("def f():\n    return None\n")
                 .expect("source should lower");
 
-        let typed = lower_codegen_module_to_typed(lowered.codegen_module);
+        let typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
         let counter = count_typed_extra_facts(&typed);
 
         assert!(counter.extras > 0);
@@ -2281,8 +2282,8 @@ mod typed_codegen_tests {
         let lowered =
             soac_lowering::lower_python_to_blockpy_for_testing("def f():\n    return None\n")
                 .expect("source should lower");
-        let facts = infer_module_value_facts(&lowered.codegen_module);
-        let mut typed = lower_codegen_module_to_typed(lowered.codegen_module);
+        let facts = infer_module_value_facts(&lowered.blockpy_module);
+        let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
 
         let changed = annotate_typed_module_value_facts(&mut typed, &facts);
         let counter = count_typed_extra_facts(&typed);
@@ -2297,8 +2298,8 @@ mod typed_codegen_tests {
         let lowered =
             soac_lowering::lower_python_to_blockpy_for_testing("def f():\n    return None\n")
                 .expect("source should lower");
-        let facts = infer_module_value_facts(&lowered.codegen_module);
-        let mut typed = lower_codegen_module_to_typed(lowered.codegen_module);
+        let facts = infer_module_value_facts(&lowered.blockpy_module);
+        let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
 
         let function = typed_function_by_qualname_mut(&mut typed, "f");
         assert!(
@@ -2317,8 +2318,8 @@ mod typed_codegen_tests {
             "def f(value):\n    if value:\n        return None\n    return None\n",
         )
         .expect("source should lower");
-        let facts = infer_module_value_facts(&lowered.codegen_module);
-        let mut typed = lower_codegen_module_to_typed(lowered.codegen_module);
+        let facts = infer_module_value_facts(&lowered.blockpy_module);
+        let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
         let function = typed_function_by_qualname_mut(&mut typed, "f");
 
         annotate_typed_function_value_facts(function, &facts);
@@ -2352,8 +2353,8 @@ mod typed_codegen_tests {
         let lowered =
             soac_lowering::lower_python_to_blockpy_for_testing("def f():\n    return 1 + 2\n")
                 .expect("source should lower");
-        let facts = infer_module_value_facts(&lowered.codegen_module);
-        let mut typed = lower_codegen_module_to_typed(lowered.codegen_module);
+        let facts = infer_module_value_facts(&lowered.blockpy_module);
+        let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
         let function = typed_function_by_qualname_mut(&mut typed, "f");
 
         annotate_typed_function_value_facts(function, &facts);
@@ -2380,7 +2381,7 @@ mod typed_codegen_tests {
         )
         .expect("source should lower");
 
-        let typed = lower_codegen_module_to_typed(lowered.codegen_module);
+        let typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
 
         let mut counter = TypedInstrCounter::default();
         for function in &typed.callable_defs {
@@ -2413,7 +2414,7 @@ def outer(seq, value):
         )
         .expect("source should lower");
 
-        let typed = lower_codegen_module_to_typed(lowered.codegen_module);
+        let typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
 
         let mut counter = TypedInstrCounter::default();
         for function in &typed.callable_defs {
@@ -2465,13 +2466,13 @@ def outer(seq, value):
             "def f(a, b):\n    return g(a + b)\n",
         )
         .expect("source should lower");
-        let original_counts = count_codegen_instrs(&lowered.codegen_module);
+        let original_counts = count_blockpy_instrs(&lowered.blockpy_module);
 
-        let typed = lower_codegen_module_to_typed(lowered.codegen_module);
+        let typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
         let round_tripped = try_lower_typed_module_to_codegen_legacy(typed)
             .expect("legacy typed module should map");
 
-        assert_eq!(count_codegen_instrs(&round_tripped), original_counts);
+        assert_eq!(count_blockpy_instrs(&round_tripped), original_counts);
         assert!(original_counts.binops > 0);
         assert!(original_counts.calls > 0);
     }
@@ -2482,7 +2483,7 @@ def outer(seq, value):
             "def f(x):\n    if x:\n        return 1\n    return 0\n",
         )
         .expect("source should lower");
-        let typed = lower_codegen_module_to_typed(lowered.codegen_module);
+        let typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
 
         let typed = lower_typed_if_tests_to_truthy(typed);
 
@@ -2523,8 +2524,8 @@ def caller(it):\n    return it.__next__()\n",
         )
         .expect("source should lower");
         let next_id =
-            codegen_function_id_by_qualname(&lowered.codegen_module, "IterRange.__next__");
-        let mut typed = lower_codegen_module_to_typed(lowered.codegen_module);
+            blockpy_function_id_by_qualname(&lowered.blockpy_module, "IterRange.__next__");
+        let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
         let caller = typed_function_by_qualname_mut(&mut typed, "caller");
         replace_first_typed_call_access(
             caller,
@@ -2554,8 +2555,8 @@ def caller(it):\n    return it.__next__()\n",
 def caller(a, b):\n    return add(a, b)\n",
         )
         .expect("source should lower");
-        let add_id = codegen_function_id_by_qualname(&lowered.codegen_module, "add");
-        let mut typed = lower_codegen_module_to_typed(lowered.codegen_module);
+        let add_id = blockpy_function_id_by_qualname(&lowered.blockpy_module, "add");
+        let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
         let caller = typed_function_by_qualname_mut(&mut typed, "caller");
         replace_first_typed_call_access(
             caller,
@@ -2595,8 +2596,8 @@ def caller(it):\n    return it.__next__()\n",
         )
         .expect("source should lower");
         let next_id =
-            codegen_function_id_by_qualname(&lowered.codegen_module, "IterRange.__next__");
-        let mut typed = lower_codegen_module_to_typed(lowered.codegen_module);
+            blockpy_function_id_by_qualname(&lowered.blockpy_module, "IterRange.__next__");
+        let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
         let caller = typed_function_by_qualname_mut(&mut typed, "caller");
         replace_first_typed_call_access(
             caller,
@@ -2638,8 +2639,8 @@ def caller(it):\n    return it.__next__()\n",
 def caller(a):\n    return add(a)\n",
         )
         .expect("source should lower");
-        let add_id = codegen_function_id_by_qualname(&lowered.codegen_module, "add");
-        let mut typed = lower_codegen_module_to_typed(lowered.codegen_module);
+        let add_id = blockpy_function_id_by_qualname(&lowered.blockpy_module, "add");
+        let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
         let caller = typed_function_by_qualname_mut(&mut typed, "caller");
         let call_id = first_typed_call_instr_id(caller);
         let plans = TypedCallEmissionPlans {
@@ -2679,7 +2680,7 @@ def caller(a):\n    return add(a)\n",
             "def caller(a):\n    return callable(a)\n",
         )
         .expect("source should lower");
-        let mut typed = lower_codegen_module_to_typed(lowered.codegen_module);
+        let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
         let caller = typed_function_by_qualname_mut(&mut typed, "caller");
         let call_id = first_typed_call_instr_id(caller);
         let direct_target = RuntimeFunctionId::from_raw_parts(0, 7);
@@ -2721,7 +2722,7 @@ def caller(a):\n    return add(a)\n",
             "def caller(box):\n    return box.get(1)\n",
         )
         .expect("source should lower");
-        let mut typed = lower_codegen_module_to_typed(lowered.codegen_module);
+        let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
         let caller = typed_function_by_qualname_mut(&mut typed, "caller");
         let call_id = first_typed_call_instr_id(caller);
         let target = RuntimeFunctionId::from_raw_parts(0, 9);
@@ -2768,7 +2769,7 @@ def caller(a):\n    return add(a)\n",
             "def caller(box):\n    return box.get(1)\n",
         )
         .expect("source should lower");
-        let mut typed = lower_codegen_module_to_typed(lowered.codegen_module);
+        let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
         let caller = typed_function_by_qualname_mut(&mut typed, "caller");
         let call_id = first_typed_call_instr_id(caller);
         let plans = TypedCallEmissionPlans {
@@ -2798,8 +2799,8 @@ def caller(a):\n    return add(a)\n",
             "def caller(fn):\n    return fn()\n",
         )
         .expect("source should lower");
-        let caller_id = codegen_function_id_by_qualname(&lowered.codegen_module, "caller");
-        let mut typed = lower_codegen_module_to_typed(lowered.codegen_module);
+        let caller_id = blockpy_function_id_by_qualname(&lowered.blockpy_module, "caller");
+        let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
         let caller = typed_function_by_qualname_mut(&mut typed, "caller");
         replace_first_typed_call_access(
             caller,

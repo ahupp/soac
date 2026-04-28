@@ -10,15 +10,15 @@ use soac_core::block_py::{
     BlockPyFunction, BlockPyModule, BlockTerm, CallableScopeKind, ChildVisitable,
     HasSemanticInstrId, InstrId, RuntimeFunctionId, VisitMut,
 };
-use soac_ir_blockpy::CodegenModuleShape;
+use soac_ir_blockpy::BlockPyModuleShape;
 use soac_ir_typed::plan_v3::{
     DirectCallCallee, ExactListItemAccessKind,
     IndexedFieldAccessKind as PlanV3IndexedFieldAccessKind,
     IndexedGlobalAccessKind as PlanV3IndexedGlobalAccessKind,
 };
 use soac_ir_typed::{
-    FactStore, InstrTyped, TypedAttrAccessPlan, TypedCallEmissionPlan, TypedCallEmissionPlans,
-    TypedCodegenModuleShape, TypedDirectMethodCallGuard, TypedExactIntBranchPlan,
+    FactStore, InstrTyped, TypedAttrAccessPlan, TypedBlockPyModuleShape, TypedCallEmissionPlan,
+    TypedCallEmissionPlans, TypedDirectMethodCallGuard, TypedExactIntBranchPlan,
     TypedExactIntPlanSource, TypedExactIntReturnPlan, TypedExactIntScalarThreadPlan,
     TypedExactListItemAccessPlan, TypedExactListItemCounterSource, TypedExactListItemPlanSource,
     TypedIndexedFieldPlanSource, TypedIndexedGlobalAccessPlan, TypedIndexedGlobalPlanSource,
@@ -156,7 +156,7 @@ fn typed_call_emission_plans_for_profile_function(
 }
 
 pub(super) fn apply_profile_call_emission_plans_to_typed_function(
-    function: &mut BlockPyFunction<TypedCodegenModuleShape>,
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
     profile: &SpecializationProfile<'_>,
 ) -> Result<(), String> {
     let call_emissions =
@@ -166,7 +166,7 @@ pub(super) fn apply_profile_call_emission_plans_to_typed_function(
 }
 
 pub(super) fn annotate_typed_attr_accesses(
-    function: &mut BlockPyFunction<TypedCodegenModuleShape>,
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
     opt_v3_indexed_fields_by_instr: &HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>,
     specialize_stores: bool,
 ) -> Result<usize, String> {
@@ -268,7 +268,7 @@ pub(super) fn annotate_typed_attr_accesses(
 }
 
 fn annotate_typed_indexed_field_accesses_from_profile(
-    function: &mut BlockPyFunction<TypedCodegenModuleShape>,
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
     profile: &SpecializationProfile<'_>,
 ) -> Result<(), String> {
     let (_, _, opt_v3_indexed_fields_by_instr) =
@@ -303,7 +303,7 @@ fn typed_indexed_global_access_plan_from_opt_v3(
 }
 
 pub(super) fn annotate_typed_indexed_global_accesses(
-    function: &mut BlockPyFunction<TypedCodegenModuleShape>,
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
     indexed_globals_by_instr: &HashMap<InstrId, OptV3IndexedGlobalAccessPlan>,
 ) -> Result<usize, String> {
     struct Annotator<'a> {
@@ -400,7 +400,7 @@ pub(super) fn annotate_typed_indexed_global_accesses(
 }
 
 fn annotate_typed_indexed_global_accesses_from_profile(
-    function: &mut BlockPyFunction<TypedCodegenModuleShape>,
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
     profile: &SpecializationProfile<'_>,
 ) -> Result<(), String> {
     let Some(indexed_globals_by_instr) = profile
@@ -435,7 +435,7 @@ fn typed_exact_list_item_access_plan_from_opt_v3(
 }
 
 fn annotate_typed_exact_list_item_accesses(
-    function: &mut BlockPyFunction<TypedCodegenModuleShape>,
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
     exact_list_items_by_instr: &HashMap<InstrId, ProfileExactListItemAccessPlan>,
 ) -> Result<usize, String> {
     struct Annotator<'a> {
@@ -522,7 +522,7 @@ fn annotate_typed_exact_list_item_accesses(
 }
 
 fn annotate_typed_exact_list_item_accesses_from_profile(
-    function: &mut BlockPyFunction<TypedCodegenModuleShape>,
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
     profile: &SpecializationProfile<'_>,
     remapped_exact_list_items: Option<&HashMap<InstrId, ProfileExactListItemAccessPlan>>,
 ) -> Result<(), String> {
@@ -616,7 +616,7 @@ fn typed_exact_int_scalar_thread_plan_from_opt_v3(
 }
 
 pub(super) fn annotate_typed_exact_int_selections(
-    function: &mut BlockPyFunction<TypedCodegenModuleShape>,
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
     artifacts: &ExactIntBranchV3Artifacts,
 ) -> Result<usize, String> {
     struct Annotator<'a> {
@@ -778,7 +778,7 @@ pub(super) fn annotate_typed_exact_int_selections(
 }
 
 fn annotate_typed_exact_int_selections_from_profile(
-    function: &mut BlockPyFunction<TypedCodegenModuleShape>,
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
     profile: &SpecializationProfile<'_>,
 ) -> Result<(), String> {
     let Some(artifacts) = profile
@@ -792,7 +792,7 @@ fn annotate_typed_exact_int_selections_from_profile(
 }
 
 fn apply_profile_access_and_scalar_plans_to_typed_function(
-    function: &mut BlockPyFunction<TypedCodegenModuleShape>,
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
     profile: &SpecializationProfile<'_>,
     remapped_exact_list_items: Option<&HashMap<InstrId, ProfileExactListItemAccessPlan>>,
 ) -> Result<(), String> {
@@ -808,7 +808,7 @@ fn apply_profile_access_and_scalar_plans_to_typed_function(
 }
 
 pub(super) fn apply_profile_typed_block_metadata_to_typed_function(
-    function: &mut BlockPyFunction<TypedCodegenModuleShape>,
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
     profile: &SpecializationProfile<'_>,
 ) -> Result<(), String> {
     annotate_typed_profiled_cold_blocks(function, profile)?;
@@ -816,7 +816,7 @@ pub(super) fn apply_profile_typed_block_metadata_to_typed_function(
 }
 
 pub(super) fn apply_profile_typed_guard_miss_policy_to_typed_function(
-    function: &mut BlockPyFunction<TypedCodegenModuleShape>,
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
     profile: &SpecializationProfile<'_>,
 ) {
     let enabled =
@@ -887,7 +887,7 @@ fn remap_inlined_exact_list_item_accesses(
 
 #[cfg(test)]
 pub(super) fn apply_profile_typed_plans_to_typed_function(
-    function: &mut BlockPyFunction<TypedCodegenModuleShape>,
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
     profile: Option<&SpecializationProfile<'_>>,
 ) -> Result<(), String> {
     let Some(profile) = profile else {
@@ -901,7 +901,7 @@ pub(super) fn apply_profile_typed_plans_to_typed_function(
 }
 
 pub(crate) struct JitModulePlan {
-    pub(super) module: Arc<BlockPyModule<TypedCodegenModuleShape>>,
+    pub(super) module: Arc<BlockPyModule<TypedBlockPyModuleShape>>,
     pub(super) value_facts: FactStore,
     pub(super) locals: PlannedJitModuleLocals,
     pub(super) deopt_resume: PlannedJitDeoptResumeModule,
@@ -909,7 +909,7 @@ pub(crate) struct JitModulePlan {
 
 pub(super) fn collect_codegen_constants_for_module_name(
     module_name: &str,
-    module: &BlockPyModule<TypedCodegenModuleShape>,
+    module: &BlockPyModule<TypedBlockPyModuleShape>,
 ) -> ModuleCodegenConstants {
     if module_name == "soac.runtime" {
         ModuleCodegenConstants::collect_from_typed_runtime_module(module)
@@ -932,8 +932,8 @@ fn build_jit_module_plan_from_prepared_typed_module(
     }))
 }
 
-pub(super) fn build_typed_v3_jit_module_plan(
-    module: &BlockPyModule<CodegenModuleShape>,
+pub(super) fn optimize_blockpy(
+    module: &BlockPyModule<BlockPyModuleShape>,
     profile: Option<&SpecializationProfile<'_>>,
     env_config: &SoacEnvConfig,
 ) -> Result<Arc<JitModulePlan>, String> {
@@ -954,7 +954,7 @@ pub(super) fn build_typed_v3_jit_module_plan(
 }
 
 fn apply_typed_v3_module_rewrites(
-    module: &mut BlockPyModule<TypedCodegenModuleShape>,
+    module: &mut BlockPyModule<TypedBlockPyModuleShape>,
     profile: &SpecializationProfile<'_>,
 ) -> Result<(), String> {
     let callee_module = module.clone();

@@ -4,14 +4,14 @@ use soac_core::block_py::{
     RuntimeModuleId, VisitMut, walk_expr_mut, walk_module_mut,
 };
 use soac_core::pass_tracker::PassTracker;
-use soac_ir_blockpy::{CodegenModuleShape, InstrCodegen};
+use soac_ir_blockpy::{BlockPyModuleShape, InstrBlockPy};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
-const CODEGEN_MODULE_CACHE_MAGIC: &[u8] = b"SOAC_BLOCKPY_CODEGEN_CACHE\0";
-const CODEGEN_MODULE_CACHE_FORMAT_VERSION: u32 = 6;
+const BLOCKPY_MODULE_CACHE_MAGIC: &[u8] = b"SOAC_BLOCKPY_CODEGEN_CACHE\0";
+const BLOCKPY_MODULE_CACHE_FORMAT_VERSION: u32 = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum PythonModuleCacheSource {
@@ -20,7 +20,7 @@ pub enum PythonModuleCacheSource {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-pub struct CachedCodegenModuleMetadata {
+pub struct CachedBlockPyModuleMetadata {
     pub source: PythonModuleCacheSource,
     pub module_name: String,
     pub source_hash: u64,
@@ -29,7 +29,7 @@ pub struct CachedCodegenModuleMetadata {
 
 pub(crate) struct PreOptimizationCacheTarget {
     pub(crate) path: PathBuf,
-    pub(crate) metadata: CachedCodegenModuleMetadata,
+    pub(crate) metadata: CachedBlockPyModuleMetadata,
 }
 
 pub fn hash_module_source(source: &str) -> u64 {
@@ -57,8 +57,8 @@ pub fn pre_optimization_module_cache_metadata(
     source_hash: u64,
     build_identity: &str,
     runtime_names_as_globals: bool,
-) -> CachedCodegenModuleMetadata {
-    CachedCodegenModuleMetadata {
+) -> CachedBlockPyModuleMetadata {
+    CachedBlockPyModuleMetadata {
         source,
         module_name: module_name.to_string(),
         source_hash,
@@ -77,13 +77,13 @@ pub fn pre_optimization_module_cache_path(
     _build_identity: &str,
     _runtime_names_as_globals: bool,
 ) -> std::result::Result<PathBuf, String> {
-    codegen_module_cache_path(cache_root, source, module_name).map_err(|err| err.to_string())
+    blockpy_module_cache_path(cache_root, source, module_name).map_err(|err| err.to_string())
 }
 
 #[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-pub struct CachedCodegenModule {
-    pub metadata: CachedCodegenModuleMetadata,
-    pub module: BlockPyModule<CodegenModuleShape>,
+pub struct CachedBlockPyModule {
+    pub metadata: CachedBlockPyModuleMetadata,
+    pub module: BlockPyModule<BlockPyModuleShape>,
 }
 
 impl PythonModuleCacheSource {
@@ -95,7 +95,7 @@ impl PythonModuleCacheSource {
     }
 }
 
-pub fn codegen_module_cache_path(
+pub fn blockpy_module_cache_path(
     cache_root: impl AsRef<Path>,
     source: PythonModuleCacheSource,
     module_name: &str,
@@ -136,14 +136,14 @@ fn collect_cached_module_paths(path: &Path, out: &mut Vec<PathBuf>) -> Result<()
     Ok(())
 }
 
-pub fn codegen_module_cache_key(source_hash: u64, build_identity: &str) -> String {
+pub fn blockpy_module_cache_key(source_hash: u64, build_identity: &str) -> String {
     format!("{source_hash:016x}-{:016x}", stable_hash(build_identity))
 }
 
-pub fn store_codegen_module_cache(
+pub fn store_blockpy_module_cache(
     path: impl AsRef<Path>,
-    metadata: &CachedCodegenModuleMetadata,
-    module: &BlockPyModule<CodegenModuleShape>,
+    metadata: &CachedBlockPyModuleMetadata,
+    module: &BlockPyModule<BlockPyModuleShape>,
 ) -> Result<()> {
     let path = path.as_ref();
     if let Some(parent) = non_empty_parent(path) {
@@ -151,22 +151,22 @@ pub fn store_codegen_module_cache(
             .with_context(|| format!("create BlockPy cache dir {}", parent.display()))?;
     }
 
-    let cache = CachedCodegenModule {
+    let cache = CachedBlockPyModule {
         metadata: metadata.clone(),
         module: module.clone(),
     };
     let archive = rkyv::to_bytes::<rkyv::rancor::Error>(&cache)
-        .map_err(|err| anyhow!("serialize BlockPy codegen module cache: {err}"))?;
+        .map_err(|err| anyhow!("serialize BlockPy module cache: {err}"))?;
     let temp_path = temp_cache_path(path);
 
     {
         let mut temp_file = File::create(&temp_path)
             .with_context(|| format!("create temporary BlockPy cache {}", temp_path.display()))?;
         temp_file
-            .write_all(CODEGEN_MODULE_CACHE_MAGIC)
+            .write_all(BLOCKPY_MODULE_CACHE_MAGIC)
             .with_context(|| format!("write BlockPy cache header {}", temp_path.display()))?;
         temp_file
-            .write_all(&CODEGEN_MODULE_CACHE_FORMAT_VERSION.to_le_bytes())
+            .write_all(&BLOCKPY_MODULE_CACHE_FORMAT_VERSION.to_le_bytes())
             .with_context(|| format!("write BlockPy cache version {}", temp_path.display()))?;
         temp_file
             .write_all(archive.as_ref())
@@ -183,17 +183,17 @@ pub fn store_codegen_module_cache(
     Ok(())
 }
 
-pub fn load_codegen_module_cache(path: impl AsRef<Path>) -> Result<CachedCodegenModule> {
+pub fn load_blockpy_module_cache(path: impl AsRef<Path>) -> Result<CachedBlockPyModule> {
     let path = path.as_ref();
     let bytes = fs::read(path).with_context(|| format!("read BlockPy cache {}", path.display()))?;
     let archive = archive_bytes_from_cache_file(&bytes)
         .with_context(|| format!("decode BlockPy cache header {}", path.display()))?;
     let archive = aligned_archive_bytes(archive);
 
-    let mut cache = rkyv::from_bytes::<CachedCodegenModule, rkyv::rancor::Error>(archive.as_ref())
-        .map_err(|err| anyhow!("deserialize BlockPy codegen module cache: {err}"))?;
+    let mut cache = rkyv::from_bytes::<CachedBlockPyModule, rkyv::rancor::Error>(archive.as_ref())
+        .map_err(|err| anyhow!("deserialize BlockPy module cache: {err}"))?;
 
-    rehydrate_codegen_module_generators(&mut cache.module);
+    rehydrate_blockpy_module_generators(&mut cache.module);
     Ok(cache)
 }
 
@@ -201,10 +201,9 @@ pub(crate) fn try_load_pre_optimization_cache(
     cache_target: &PreOptimizationCacheTarget,
     module_name_gen: ModuleNameGen,
     pass_tracker: &mut impl PassTracker,
-) -> Option<BlockPyModule<CodegenModuleShape>> {
+) -> Option<BlockPyModule<BlockPyModuleShape>> {
     let cache_path = &cache_target.path;
-    let cache_exists =
-        pass_tracker.record_timing("bb_codegen_cache_lookup", || cache_path.is_file());
+    let cache_exists = pass_tracker.record_timing("blockpy_cache_lookup", || cache_path.is_file());
     if !cache_exists {
         info!(
             target: "soac_blockpy_module_cache",
@@ -216,12 +215,12 @@ pub(crate) fn try_load_pre_optimization_cache(
         return None;
     }
 
-    let loaded = pass_tracker.record_timing("bb_codegen_cache_load", || {
-        load_codegen_module_cache(cache_path)
+    let loaded = pass_tracker.record_timing("blockpy_cache_load", || {
+        load_blockpy_module_cache(cache_path)
     });
     match loaded {
         Ok(mut cache) => {
-            let metadata_mismatch = match validate_codegen_module_cache_metadata(
+            let metadata_mismatch = match validate_blockpy_module_cache_metadata(
                 &cache.metadata,
                 &cache_target.metadata,
             ) {
@@ -240,7 +239,7 @@ pub(crate) fn try_load_pre_optimization_cache(
                 return None;
             }
 
-            remap_cached_codegen_module_function_ids(&mut cache, module_name_gen);
+            remap_cached_blockpy_module_function_ids(&mut cache, module_name_gen);
             info!(
                 target: "soac_blockpy_module_cache",
                 event = "soac.blockpy_module_cache",
@@ -248,11 +247,11 @@ pub(crate) fn try_load_pre_optimization_cache(
                 path = %cache_path.display(),
                 "blockpy_module_cache_hit",
             );
-            let CachedCodegenModule {
+            let CachedBlockPyModule {
                 metadata: _,
                 module,
             } = cache;
-            Some(pass_tracker.run_pass("bb_codegen", || module))
+            Some(pass_tracker.run_pass("blockpy", || module))
         }
         Err(err) => {
             warn!(
@@ -270,12 +269,12 @@ pub(crate) fn try_load_pre_optimization_cache(
 
 pub(crate) fn store_pre_optimization_cache(
     cache_target: &PreOptimizationCacheTarget,
-    module: &BlockPyModule<CodegenModuleShape>,
+    module: &BlockPyModule<BlockPyModuleShape>,
     pass_tracker: &mut impl PassTracker,
 ) {
     let cache_path = &cache_target.path;
-    let stored = pass_tracker.record_timing("bb_codegen_cache_store", || {
-        store_codegen_module_cache(cache_path, &cache_target.metadata, module)
+    let stored = pass_tracker.record_timing("blockpy_cache_store", || {
+        store_blockpy_module_cache(cache_path, &cache_target.metadata, module)
     });
     match stored {
         Ok(()) => {
@@ -298,9 +297,9 @@ pub(crate) fn store_pre_optimization_cache(
     }
 }
 
-pub fn validate_codegen_module_cache_metadata(
-    loaded: &CachedCodegenModuleMetadata,
-    expected: &CachedCodegenModuleMetadata,
+pub fn validate_blockpy_module_cache_metadata(
+    loaded: &CachedBlockPyModuleMetadata,
+    expected: &CachedBlockPyModuleMetadata,
 ) -> Result<()> {
     if loaded == expected {
         return Ok(());
@@ -318,18 +317,18 @@ pub fn validate_codegen_module_cache_metadata(
     )
 }
 
-pub fn rehydrate_codegen_module_generators(module: &mut BlockPyModule<CodegenModuleShape>) {
+pub fn rehydrate_blockpy_module_generators(module: &mut BlockPyModule<BlockPyModuleShape>) {
     module.module_name_gen = recovered_module_name_gen(module);
     for function in &mut module.callable_defs {
         function.name_gen = recovered_function_name_gen(function);
     }
 }
 
-pub fn remap_codegen_module_function_ids(
-    module: &mut BlockPyModule<CodegenModuleShape>,
+pub fn remap_blockpy_module_function_ids(
+    module: &mut BlockPyModule<BlockPyModuleShape>,
     module_name_gen: ModuleNameGen,
 ) {
-    remap_codegen_module_function_ids_with_remapper(
+    remap_blockpy_module_function_ids_with_remapper(
         module,
         FunctionIdRemapper {
             new_module_id: module_name_gen.runtime_module_id(),
@@ -337,18 +336,18 @@ pub fn remap_codegen_module_function_ids(
     );
 }
 
-pub fn remap_cached_codegen_module_function_ids(
-    cache: &mut CachedCodegenModule,
+pub fn remap_cached_blockpy_module_function_ids(
+    cache: &mut CachedBlockPyModule,
     module_name_gen: ModuleNameGen,
 ) {
     let remapper = FunctionIdRemapper {
         new_module_id: module_name_gen.runtime_module_id(),
     };
-    remap_codegen_module_function_ids_with_remapper(&mut cache.module, remapper);
+    remap_blockpy_module_function_ids_with_remapper(&mut cache.module, remapper);
 }
 
-fn remap_codegen_module_function_ids_with_remapper(
-    module: &mut BlockPyModule<CodegenModuleShape>,
+fn remap_blockpy_module_function_ids_with_remapper(
+    module: &mut BlockPyModule<BlockPyModuleShape>,
     mut remapper: FunctionIdRemapper,
 ) {
     walk_module_mut(&mut remapper, module);
@@ -390,30 +389,30 @@ impl FunctionIdRemapper {
     }
 }
 
-impl VisitMut<InstrCodegen> for FunctionIdRemapper {
-    fn visit_instr_mut(&mut self, expr: &mut InstrCodegen)
+impl VisitMut<InstrBlockPy> for FunctionIdRemapper {
+    fn visit_instr_mut(&mut self, expr: &mut InstrBlockPy)
     where
-        InstrCodegen: soac_core::block_py::ChildVisitable<InstrCodegen>,
+        InstrBlockPy: soac_core::block_py::ChildVisitable<InstrBlockPy>,
     {
         match expr {
-            InstrCodegen::MakeFunctionWithClosure(op) => {
+            InstrBlockPy::MakeFunctionWithClosure(op) => {
                 op.set_function_id(self.remap(op.function_id()));
             }
-            InstrCodegen::BinOp(_)
-            | InstrCodegen::UnaryOp(_)
-            | InstrCodegen::Tuple(_)
-            | InstrCodegen::Call(_)
-            | InstrCodegen::GetAttr(_)
-            | InstrCodegen::SetAttr(_)
-            | InstrCodegen::GetItem(_)
-            | InstrCodegen::SetItem(_)
-            | InstrCodegen::DelItem(_)
-            | InstrCodegen::Load(_)
-            | InstrCodegen::Store(_)
-            | InstrCodegen::Del(_)
-            | InstrCodegen::MakeCell(_)
-            | InstrCodegen::IncrementCounter(_)
-            | InstrCodegen::CellRef(_) => {}
+            InstrBlockPy::BinOp(_)
+            | InstrBlockPy::UnaryOp(_)
+            | InstrBlockPy::Tuple(_)
+            | InstrBlockPy::Call(_)
+            | InstrBlockPy::GetAttr(_)
+            | InstrBlockPy::SetAttr(_)
+            | InstrBlockPy::GetItem(_)
+            | InstrBlockPy::SetItem(_)
+            | InstrBlockPy::DelItem(_)
+            | InstrBlockPy::Load(_)
+            | InstrBlockPy::Store(_)
+            | InstrBlockPy::Del(_)
+            | InstrBlockPy::MakeCell(_)
+            | InstrBlockPy::IncrementCounter(_)
+            | InstrBlockPy::CellRef(_) => {}
         }
         walk_expr_mut(self, expr);
     }
@@ -421,19 +420,19 @@ impl VisitMut<InstrCodegen> for FunctionIdRemapper {
 
 fn archive_bytes_from_cache_file(bytes: &[u8]) -> Result<&[u8]> {
     let rest = bytes
-        .strip_prefix(CODEGEN_MODULE_CACHE_MAGIC)
-        .ok_or_else(|| anyhow!("invalid BlockPy codegen cache magic"))?;
+        .strip_prefix(BLOCKPY_MODULE_CACHE_MAGIC)
+        .ok_or_else(|| anyhow!("invalid BlockPy cache magic"))?;
     let (version_bytes, archive) = rest
         .split_at_checked(std::mem::size_of::<u32>())
-        .ok_or_else(|| anyhow!("BlockPy codegen cache is truncated"))?;
+        .ok_or_else(|| anyhow!("BlockPy cache is truncated"))?;
     let version = u32::from_le_bytes(
         version_bytes
             .try_into()
             .expect("split_at_checked returned exactly four version bytes"),
     );
-    if version != CODEGEN_MODULE_CACHE_FORMAT_VERSION {
+    if version != BLOCKPY_MODULE_CACHE_FORMAT_VERSION {
         return Err(anyhow!(
-            "unsupported BlockPy codegen cache version {version}; expected {CODEGEN_MODULE_CACHE_FORMAT_VERSION}"
+            "unsupported BlockPy cache version {version}; expected {BLOCKPY_MODULE_CACHE_FORMAT_VERSION}"
         ));
     }
     Ok(archive)
@@ -477,7 +476,7 @@ fn stable_hash(text: &str) -> u64 {
     hash
 }
 
-fn recovered_module_name_gen(module: &BlockPyModule<CodegenModuleShape>) -> ModuleNameGen {
+fn recovered_module_name_gen(module: &BlockPyModule<BlockPyModuleShape>) -> ModuleNameGen {
     let module_id = module
         .callable_defs
         .first()
@@ -500,7 +499,7 @@ fn recovered_module_name_gen(module: &BlockPyModule<CodegenModuleShape>) -> Modu
     ModuleNameGen::recovered(module_id, next_function_id)
 }
 
-fn recovered_function_name_gen(function: &BlockPyFunction<CodegenModuleShape>) -> FunctionNameGen {
+fn recovered_function_name_gen(function: &BlockPyFunction<BlockPyModuleShape>) -> FunctionNameGen {
     let next_block_id = function
         .blocks
         .iter()
@@ -525,7 +524,7 @@ fn temp_cache_path(path: &Path) -> PathBuf {
     let file_name = path
         .file_name()
         .map(|name| name.to_string_lossy())
-        .unwrap_or_else(|| "blockpy-codegen-cache".into());
+        .unwrap_or_else(|| "blockpy-cache".into());
     let temp_file_name = format!("{file_name}.tmp.{}", std::process::id());
 
     let mut temp_path = path.to_owned();
@@ -536,15 +535,15 @@ fn temp_cache_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod test {
     use super::{
-        CachedCodegenModuleMetadata, PythonModuleCacheSource, codegen_module_cache_key,
-        codegen_module_cache_path, load_codegen_module_cache, remap_codegen_module_function_ids,
-        store_codegen_module_cache, validate_codegen_module_cache_metadata,
+        CachedBlockPyModuleMetadata, PythonModuleCacheSource, blockpy_module_cache_key,
+        blockpy_module_cache_path, load_blockpy_module_cache, remap_blockpy_module_function_ids,
+        store_blockpy_module_cache, validate_blockpy_module_cache_metadata,
     };
     use soac_core::block_py::{
         BlockPyModule, ChildVisitable, HasSemanticInstrId, ModuleNameGen, RuntimeFunctionId, Visit,
         walk_block, walk_expr,
     };
-    use soac_ir_blockpy::{CodegenModuleShape, InstrCodegen};
+    use soac_ir_blockpy::{BlockPyModuleShape, InstrBlockPy};
     use soac_lowering::lower_python_to_blockpy_for_testing;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -571,10 +570,10 @@ mod test {
         instr_ids: Vec<u32>,
     }
 
-    impl Visit<InstrCodegen> for InstrIdCollector {
-        fn visit_instr(&mut self, expr: &InstrCodegen)
+    impl Visit<InstrBlockPy> for InstrIdCollector {
+        fn visit_instr(&mut self, expr: &InstrBlockPy)
         where
-            InstrCodegen: ChildVisitable<InstrCodegen>,
+            InstrBlockPy: ChildVisitable<InstrBlockPy>,
         {
             let instr_id = expr.semantic_instr_id();
             self.instr_ids.push(instr_id.index());
@@ -583,18 +582,18 @@ mod test {
     }
 
     fn collect_make_function_with_closure_ids(
-        module: &BlockPyModule<CodegenModuleShape>,
+        module: &BlockPyModule<BlockPyModuleShape>,
     ) -> Vec<RuntimeFunctionId> {
         struct Collector {
             function_ids: Vec<RuntimeFunctionId>,
         }
 
-        impl Visit<InstrCodegen> for Collector {
-            fn visit_instr(&mut self, expr: &InstrCodegen)
+        impl Visit<InstrBlockPy> for Collector {
+            fn visit_instr(&mut self, expr: &InstrBlockPy)
             where
-                InstrCodegen: ChildVisitable<InstrCodegen>,
+                InstrBlockPy: ChildVisitable<InstrBlockPy>,
             {
-                if let InstrCodegen::MakeFunctionWithClosure(op) = expr {
+                if let InstrBlockPy::MakeFunctionWithClosure(op) = expr {
                     self.function_ids.push(op.function_id());
                 }
                 walk_expr(self, expr);
@@ -613,7 +612,7 @@ mod test {
     }
 
     #[test]
-    fn round_trips_codegen_module_cache_without_rendering() {
+    fn round_trips_blockpy_module_cache_without_rendering() {
         let module = lower_python_to_blockpy_for_testing(
             r#"
 def f(x):
@@ -626,16 +625,16 @@ def g(y):
 "#,
         )
         .expect("transform should succeed")
-        .codegen_module;
+        .blockpy_module;
         let before = summarize_module(&module);
 
         let path = unique_cache_path();
         let _ = std::fs::remove_file(&path);
         let metadata = test_metadata("pkg.mod", 0x1234, "build-a");
-        store_codegen_module_cache(&path, &metadata, &module).expect("store codegen cache");
+        store_blockpy_module_cache(&path, &metadata, &module).expect("store blockpy cache");
 
-        let loaded_cache = load_codegen_module_cache(&path).expect("load codegen cache");
-        validate_codegen_module_cache_metadata(&loaded_cache.metadata, &metadata)
+        let loaded_cache = load_blockpy_module_cache(&path).expect("load blockpy cache");
+        validate_blockpy_module_cache_metadata(&loaded_cache.metadata, &metadata)
             .expect("metadata should round-trip");
         let loaded = loaded_cache.module;
         let _ = std::fs::remove_file(&path);
@@ -676,17 +675,17 @@ def g(y):
         let root = PathBuf::from("/cache/root");
 
         assert_eq!(
-            codegen_module_cache_path(&root, PythonModuleCacheSource::Project, "pkg.submod")
+            blockpy_module_cache_path(&root, PythonModuleCacheSource::Project, "pkg.submod")
                 .expect("project cache path"),
             PathBuf::from("/cache/root/project/pkg/submod/mod.blockpy")
         );
         assert_eq!(
-            codegen_module_cache_path(&root, PythonModuleCacheSource::PythonStdlib, "typing")
+            blockpy_module_cache_path(&root, PythonModuleCacheSource::PythonStdlib, "typing")
                 .expect("stdlib cache path"),
             PathBuf::from("/cache/root/python-stdlib/typing/mod.blockpy")
         );
         assert!(
-            codegen_module_cache_path(&root, PythonModuleCacheSource::PythonStdlib, "../escape")
+            blockpy_module_cache_path(&root, PythonModuleCacheSource::PythonStdlib, "../escape")
                 .is_err()
         );
     }
@@ -694,21 +693,21 @@ def g(y):
     #[test]
     fn cache_key_combines_source_hash_and_build_identity_hash() {
         assert_eq!(
-            codegen_module_cache_key(0x1234, "build-a"),
+            blockpy_module_cache_key(0x1234, "build-a"),
             "0000000000001234-09e267510d26cc71"
         );
         assert_ne!(
-            codegen_module_cache_key(0x1234, "build-a"),
-            codegen_module_cache_key(0x1234, "build-b")
+            blockpy_module_cache_key(0x1234, "build-a"),
+            blockpy_module_cache_key(0x1234, "build-b")
         );
         assert_ne!(
-            codegen_module_cache_key(0x1234, "build-a"),
-            codegen_module_cache_key(0x5678, "build-a")
+            blockpy_module_cache_key(0x1234, "build-a"),
+            blockpy_module_cache_key(0x5678, "build-a")
         );
     }
 
     #[test]
-    fn remaps_cached_codegen_module_to_fresh_module_id() {
+    fn remaps_cached_blockpy_module_to_fresh_module_id() {
         let mut module = lower_python_to_blockpy_for_testing(
             r#"
 def outer():
@@ -718,9 +717,9 @@ def outer():
 "#,
         )
         .expect("transform should succeed")
-        .codegen_module;
+        .blockpy_module;
 
-        remap_codegen_module_function_ids(&mut module, ModuleNameGen::new(99));
+        remap_blockpy_module_function_ids(&mut module, ModuleNameGen::new(99));
 
         assert_eq!(module.module_name_gen.module_id(), 99);
         for function in &module.callable_defs {
@@ -750,7 +749,7 @@ def outer():
         );
     }
 
-    fn summarize_module(module: &BlockPyModule<CodegenModuleShape>) -> ModuleSummary {
+    fn summarize_module(module: &BlockPyModule<BlockPyModuleShape>) -> ModuleSummary {
         ModuleSummary {
             global_names: module.global_names.clone(),
             module_constants_len: module.module_constants.len(),
@@ -764,7 +763,7 @@ def outer():
     }
 
     fn summarize_function(
-        function: &soac_core::block_py::BlockPyFunction<CodegenModuleShape>,
+        function: &soac_core::block_py::BlockPyFunction<BlockPyModuleShape>,
     ) -> FunctionSummary {
         FunctionSummary {
             function_id: function.function_id,
@@ -784,7 +783,7 @@ def outer():
         }
     }
 
-    fn instr_ids(function: &soac_core::block_py::BlockPyFunction<CodegenModuleShape>) -> Vec<u32> {
+    fn instr_ids(function: &soac_core::block_py::BlockPyFunction<BlockPyModuleShape>) -> Vec<u32> {
         let mut collector = InstrIdCollector {
             instr_ids: Vec::new(),
         };
@@ -800,7 +799,7 @@ def outer():
             .expect("system time should be after unix epoch")
             .as_nanos();
         std::env::temp_dir().join(format!(
-            "soac-blockpy-codegen-cache-test-{}-{unique}.rkyv",
+            "soac-blockpy-cache-test-{}-{unique}.rkyv",
             std::process::id()
         ))
     }
@@ -809,8 +808,8 @@ def outer():
         module_name: &str,
         source_hash: u64,
         cache_identity: &str,
-    ) -> CachedCodegenModuleMetadata {
-        CachedCodegenModuleMetadata {
+    ) -> CachedBlockPyModuleMetadata {
+        CachedBlockPyModuleMetadata {
             source: PythonModuleCacheSource::Project,
             module_name: module_name.to_string(),
             source_hash,

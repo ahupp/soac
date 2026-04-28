@@ -144,7 +144,7 @@ class IterRange:
 "#,
         )
         .expect("transform should succeed")
-        .codegen_module;
+        .blockpy_module;
         let function = module
             .callable_defs
             .iter()
@@ -175,7 +175,7 @@ class Box:
 "#,
         )
         .expect("transform should succeed")
-        .codegen_module;
+        .blockpy_module;
         let function = module
             .callable_defs
             .iter()

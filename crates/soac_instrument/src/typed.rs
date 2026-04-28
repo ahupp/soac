@@ -12,37 +12,37 @@ use soac_core::block_py::{
     WithMeta,
 };
 use soac_core::pass_tracker::{NoopPassTracker, PassTracker};
-use soac_ir_typed::{InstrTyped, TypedCall, TypedCodegenModuleShape};
+use soac_ir_typed::{InstrTyped, TypedBlockPyModuleShape, TypedCall};
 use std::collections::HashMap;
 
 fn functions_with_counter_instrumentation_mut(
-    functions: &mut [BlockPyFunction<TypedCodegenModuleShape>],
-) -> impl Iterator<Item = &mut BlockPyFunction<TypedCodegenModuleShape>> {
+    functions: &mut [BlockPyFunction<TypedBlockPyModuleShape>],
+) -> impl Iterator<Item = &mut BlockPyFunction<TypedBlockPyModuleShape>> {
     functions
         .iter_mut()
         .filter(|function| function.execution_mode() == FunctionExecutionMode::Jit)
 }
 
 fn functions_with_counter_instrumentation(
-    functions: &[BlockPyFunction<TypedCodegenModuleShape>],
-) -> impl Iterator<Item = &BlockPyFunction<TypedCodegenModuleShape>> {
+    functions: &[BlockPyFunction<TypedBlockPyModuleShape>],
+) -> impl Iterator<Item = &BlockPyFunction<TypedBlockPyModuleShape>> {
     functions
         .iter()
         .filter(|function| function.execution_mode() == FunctionExecutionMode::Jit)
 }
 
 pub fn instrument_typed_module(
-    module: BlockPyModule<TypedCodegenModuleShape>,
+    module: BlockPyModule<TypedBlockPyModuleShape>,
     config: &InstrumentationConfig,
-) -> Result<BlockPyModule<TypedCodegenModuleShape>, String> {
+) -> Result<BlockPyModule<TypedBlockPyModuleShape>, String> {
     instrument_typed_module_with_tracker(module, config, &mut NoopPassTracker::new())
 }
 
 pub fn instrument_typed_module_with_tracker(
-    module: BlockPyModule<TypedCodegenModuleShape>,
+    module: BlockPyModule<TypedBlockPyModuleShape>,
     config: &InstrumentationConfig,
     pass_tracker: &mut impl PassTracker,
-) -> Result<BlockPyModule<TypedCodegenModuleShape>, String> {
+) -> Result<BlockPyModule<TypedBlockPyModuleShape>, String> {
     let traced = if let Some(trace_config) = config.trace.as_ref() {
         pass_tracker.record_timing("typed_trace", || {
             let mut traced = module;
@@ -67,7 +67,7 @@ pub fn instrument_typed_module_with_tracker(
 }
 
 pub fn define_typed_module_counter_defs(
-    module: &mut BlockPyModule<TypedCodegenModuleShape>,
+    module: &mut BlockPyModule<TypedBlockPyModuleShape>,
     config: &InstrumentationConfig,
 ) -> Result<(), String> {
     if config.counters.call_targets {
@@ -85,7 +85,7 @@ pub fn define_typed_module_counter_defs(
     Ok(())
 }
 
-fn define_module_block_entry_counters(module: &mut BlockPyModule<TypedCodegenModuleShape>) {
+fn define_module_block_entry_counters(module: &mut BlockPyModule<TypedBlockPyModuleShape>) {
     let mut counters = CounterBuilder::new(&mut module.counter_defs);
     for function in functions_with_counter_instrumentation(&module.callable_defs) {
         for block in &function.blocks {
@@ -95,7 +95,7 @@ fn define_module_block_entry_counters(module: &mut BlockPyModule<TypedCodegenMod
 }
 
 fn define_module_refcount_counters(
-    module: &mut BlockPyModule<TypedCodegenModuleShape>,
+    module: &mut BlockPyModule<TypedBlockPyModuleShape>,
     scope: CounterScope,
 ) -> Result<(), String> {
     let mut counters = CounterBuilder::new(&mut module.counter_defs);
@@ -105,7 +105,7 @@ fn define_module_refcount_counters(
     define_refcount_counters(&mut counters, scope, function_ids)
 }
 
-fn define_module_locality_counters(module: &mut BlockPyModule<TypedCodegenModuleShape>) {
+fn define_module_locality_counters(module: &mut BlockPyModule<TypedBlockPyModuleShape>) {
     let mut counters = CounterBuilder::new(&mut module.counter_defs);
     for function in functions_with_counter_instrumentation(&module.callable_defs) {
         for block in &function.blocks {
@@ -118,7 +118,7 @@ fn define_module_locality_counters(module: &mut BlockPyModule<TypedCodegenModule
     }
 }
 
-fn define_module_call_target_counters(module: &mut BlockPyModule<TypedCodegenModuleShape>) {
+fn define_module_call_target_counters(module: &mut BlockPyModule<TypedBlockPyModuleShape>) {
     fn is_operator_specialization_candidate(expr: &InstrTyped) -> bool {
         match expr {
             InstrTyped::BinOp(op) => is_operator_specialization_binop_kind(op.kind),
@@ -220,7 +220,7 @@ fn define_module_call_target_counters(module: &mut BlockPyModule<TypedCodegenMod
 }
 
 pub(crate) fn instrument_typed_module_with_block_entry_counters(
-    module: &mut BlockPyModule<TypedCodegenModuleShape>,
+    module: &mut BlockPyModule<TypedBlockPyModuleShape>,
 ) {
     let BlockPyModule {
         callable_defs,
@@ -243,7 +243,7 @@ pub(crate) fn instrument_typed_module_with_block_entry_counters(
 }
 
 pub(crate) fn instrument_typed_module_for_trace(
-    module: &mut BlockPyModule<TypedCodegenModuleShape>,
+    module: &mut BlockPyModule<TypedBlockPyModuleShape>,
     config: &ExecTraceConfig,
 ) {
     let global_names = module.global_names.clone();
@@ -290,7 +290,7 @@ struct PreparedTraceNameLocator {
 }
 
 impl PreparedTraceNameLocator {
-    fn new(function: &BlockPyFunction<TypedCodegenModuleShape>, global_names: &[String]) -> Self {
+    fn new(function: &BlockPyFunction<TypedBlockPyModuleShape>, global_names: &[String]) -> Self {
         let mut local_slots = function
             .storage_layout
             .as_ref()

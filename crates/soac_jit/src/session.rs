@@ -2,7 +2,7 @@ use crate::jit::ProcessJitEngine;
 use crate::module_type::SharedModuleState;
 use soac_config::SoacEnvConfig;
 use soac_core::block_py::{BlockPyFunction, ModuleNameGen, RuntimeFunctionId};
-use soac_ir_blockpy::CodegenModuleShape;
+use soac_ir_blockpy::BlockPyModuleShape;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -163,7 +163,7 @@ impl CompileSession {
     pub fn lookup_shared_function(
         &self,
         function_id: RuntimeFunctionId,
-    ) -> Result<Option<(Arc<SharedModuleState>, BlockPyFunction<CodegenModuleShape>)>, String> {
+    ) -> Result<Option<(Arc<SharedModuleState>, BlockPyFunction<BlockPyModuleShape>)>, String> {
         if function_id == RuntimeFunctionId::global() {
             return Ok(None);
         }

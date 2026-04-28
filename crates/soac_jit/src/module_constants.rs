@@ -5,8 +5,8 @@ use soac_core::block_py::{
     AbruptKind, BlockArg, BlockPyFunction, BlockPyModule, BlockTerm, CallArgKeyword,
     ChildVisitable, ConstantExpr, NameLike, ParamDefaultSource, RuntimeName,
 };
-use soac_ir_blockpy::{CodegenModuleShape, InstrCodegen};
-use soac_ir_typed::{InstrTyped, TypedCodegenModuleShape};
+use soac_ir_blockpy::{BlockPyModuleShape, InstrBlockPy};
+use soac_ir_typed::{InstrTyped, TypedBlockPyModuleShape};
 use std::collections::HashMap;
 
 mod materialization;
@@ -51,26 +51,26 @@ pub struct ModuleCodegenConstants {
 }
 
 impl ModuleCodegenConstants {
-    pub fn collect_from_module(module: &BlockPyModule<CodegenModuleShape>) -> Self {
+    pub fn collect_from_module(module: &BlockPyModule<BlockPyModuleShape>) -> Self {
         Self::collect_from_module_with_runtime_prelude(module, true)
     }
 
-    pub fn collect_from_runtime_module(module: &BlockPyModule<CodegenModuleShape>) -> Self {
+    pub fn collect_from_runtime_module(module: &BlockPyModule<BlockPyModuleShape>) -> Self {
         Self::collect_from_module_with_runtime_prelude(module, true)
     }
 
-    pub fn collect_from_typed_module(module: &BlockPyModule<TypedCodegenModuleShape>) -> Self {
+    pub fn collect_from_typed_module(module: &BlockPyModule<TypedBlockPyModuleShape>) -> Self {
         Self::collect_from_typed_module_with_runtime_prelude(module, true)
     }
 
     pub fn collect_from_typed_runtime_module(
-        module: &BlockPyModule<TypedCodegenModuleShape>,
+        module: &BlockPyModule<TypedBlockPyModuleShape>,
     ) -> Self {
         Self::collect_from_typed_module_with_runtime_prelude(module, true)
     }
 
     fn collect_from_module_with_runtime_prelude(
-        module: &BlockPyModule<CodegenModuleShape>,
+        module: &BlockPyModule<BlockPyModuleShape>,
         include_runtime_name_prelude: bool,
     ) -> Self {
         let mut collector = ModuleConstantCollector::default();
@@ -92,7 +92,7 @@ impl ModuleCodegenConstants {
     }
 
     fn collect_from_typed_module_with_runtime_prelude(
-        module: &BlockPyModule<TypedCodegenModuleShape>,
+        module: &BlockPyModule<TypedBlockPyModuleShape>,
         include_runtime_name_prelude: bool,
     ) -> Self {
         let mut collector = ModuleConstantCollector::default();
@@ -114,7 +114,7 @@ impl ModuleCodegenConstants {
     }
 
     pub fn collect_from_functions<'a>(
-        functions: impl IntoIterator<Item = &'a BlockPyFunction<CodegenModuleShape>>,
+        functions: impl IntoIterator<Item = &'a BlockPyFunction<BlockPyModuleShape>>,
     ) -> Self {
         let mut collector = ModuleConstantCollector::default();
         for name in ALWAYS_REQUIRED_UNICODE_CONSTANTS {
@@ -130,7 +130,7 @@ impl ModuleCodegenConstants {
     }
 
     pub fn collect_from_typed_functions<'a>(
-        functions: impl IntoIterator<Item = &'a BlockPyFunction<TypedCodegenModuleShape>>,
+        functions: impl IntoIterator<Item = &'a BlockPyFunction<TypedBlockPyModuleShape>>,
     ) -> Self {
         let mut collector = ModuleConstantCollector::default();
         for name in ALWAYS_REQUIRED_UNICODE_CONSTANTS {
@@ -395,7 +395,7 @@ fn should_include_in_locals_snapshot(name: &str) -> bool {
 }
 
 impl ModuleConstantCollector {
-    fn collect_function(&mut self, function: &BlockPyFunction<CodegenModuleShape>) {
+    fn collect_function(&mut self, function: &BlockPyFunction<BlockPyModuleShape>) {
         if let Some(storage_layout) = function.storage_layout() {
             for name in storage_layout.stack_slots() {
                 if should_include_in_locals_snapshot(name) {
@@ -431,7 +431,7 @@ impl ModuleConstantCollector {
         }
     }
 
-    fn collect_typed_function(&mut self, function: &BlockPyFunction<TypedCodegenModuleShape>) {
+    fn collect_typed_function(&mut self, function: &BlockPyFunction<TypedBlockPyModuleShape>) {
         if let Some(storage_layout) = function.storage_layout() {
             for name in storage_layout.stack_slots() {
                 if should_include_in_locals_snapshot(name) {
@@ -467,7 +467,7 @@ impl ModuleConstantCollector {
         }
     }
 
-    fn collect_stmt(&mut self, stmt: &InstrCodegen) {
+    fn collect_stmt(&mut self, stmt: &InstrBlockPy) {
         self.collect_expr(stmt);
     }
 
@@ -475,7 +475,7 @@ impl ModuleConstantCollector {
         self.collect_typed_expr(stmt);
     }
 
-    fn collect_term(&mut self, term: &BlockTerm<InstrCodegen>) {
+    fn collect_term(&mut self, term: &BlockTerm<InstrBlockPy>) {
         match term {
             BlockTerm::Jump(edge) => self.collect_block_args(&edge.args),
             BlockTerm::IfTerm(if_term) => self.collect_expr(&if_term.test),
@@ -513,10 +513,10 @@ impl ModuleConstantCollector {
         }
     }
 
-    fn collect_expr(&mut self, expr: &InstrCodegen) {
+    fn collect_expr(&mut self, expr: &InstrBlockPy) {
         match expr {
-            InstrCodegen::IncrementCounter(_) => {}
-            InstrCodegen::Call(call) => {
+            InstrBlockPy::IncrementCounter(_) => {}
+            InstrBlockPy::Call(call) => {
                 if let Some(const_bytes) = self.string_constant_bytes_for_specialized_codegen(expr)
                 {
                     self.constants.intern_unicode_bytes(const_bytes.as_slice());
@@ -532,7 +532,7 @@ impl ModuleConstantCollector {
                     self.collect_expr(keyword.expr());
                 }
             }
-            InstrCodegen::GetAttr(op) => {
+            InstrBlockPy::GetAttr(op) => {
                 if let Some(attr_bytes) =
                     self.string_constant_bytes_for_specialized_codegen(op.attr.as_ref())
                 {
@@ -540,7 +540,7 @@ impl ModuleConstantCollector {
                 }
                 op.visit_children(self);
             }
-            InstrCodegen::SetAttr(op) => {
+            InstrBlockPy::SetAttr(op) => {
                 if let Some(attr_bytes) =
                     self.string_constant_bytes_for_specialized_codegen(op.attr.as_ref())
                 {
@@ -548,13 +548,13 @@ impl ModuleConstantCollector {
                 }
                 op.visit_children(self);
             }
-            InstrCodegen::Load(op)
+            InstrBlockPy::Load(op)
                 if op.name.location.is_global() || op.name.location.is_runtime_name() =>
             {
                 self.constants
                     .intern_unicode_bytes(op.name.id_str().as_bytes());
             }
-            InstrCodegen::Load(op) if op.name.local_location().is_some() => {
+            InstrBlockPy::Load(op) if op.name.local_location().is_some() => {
                 self.constants
                     .intern_unicode_bytes(op.name.id_str().as_bytes());
                 if op.name.id_str().starts_with("_dp_try_abrupt_kind_") {
@@ -562,42 +562,42 @@ impl ModuleConstantCollector {
                         .intern_int(abrupt_kind_tag(AbruptKind::Fallthrough));
                 }
             }
-            InstrCodegen::Load(_) => {}
-            InstrCodegen::Store(op) if op.name.location.is_global() => {
+            InstrBlockPy::Load(_) => {}
+            InstrBlockPy::Store(op) if op.name.location.is_global() => {
                 self.constants
                     .intern_unicode_bytes(op.name.id_str().as_bytes());
                 op.visit_children(self);
             }
-            InstrCodegen::Store(op) => {
+            InstrBlockPy::Store(op) => {
                 op.visit_children(self);
             }
-            InstrCodegen::Del(op) if op.name.location.is_global() => {
+            InstrBlockPy::Del(op) if op.name.location.is_global() => {
                 self.constants
                     .intern_unicode_bytes(op.name.id_str().as_bytes());
             }
-            InstrCodegen::BinOp(op) => op.visit_children(self),
-            InstrCodegen::UnaryOp(op) => {
+            InstrBlockPy::BinOp(op) => op.visit_children(self),
+            InstrBlockPy::UnaryOp(op) => {
                 op.visit_children(self);
             }
-            InstrCodegen::GetItem(op) => {
+            InstrBlockPy::GetItem(op) => {
                 op.visit_children(self);
             }
-            InstrCodegen::SetItem(op) => {
+            InstrBlockPy::SetItem(op) => {
                 op.visit_children(self);
             }
-            InstrCodegen::DelItem(op) => {
+            InstrBlockPy::DelItem(op) => {
                 op.visit_children(self);
             }
-            InstrCodegen::Tuple(op) => {
+            InstrBlockPy::Tuple(op) => {
                 op.visit_children(self);
             }
-            InstrCodegen::MakeCell(op) => {
+            InstrBlockPy::MakeCell(op) => {
                 op.visit_children(self);
             }
-            InstrCodegen::MakeFunctionWithClosure(op) => {
+            InstrBlockPy::MakeFunctionWithClosure(op) => {
                 op.visit_children(self);
             }
-            InstrCodegen::Del(_) | InstrCodegen::CellRef(_) => {}
+            InstrBlockPy::Del(_) | InstrBlockPy::CellRef(_) => {}
         }
     }
 
@@ -709,10 +709,10 @@ impl ModuleConstantCollector {
 
     fn string_constant_bytes_for_specialized_codegen(
         &self,
-        expr: &InstrCodegen,
+        expr: &InstrBlockPy,
     ) -> Option<Vec<u8>> {
         match expr {
-            InstrCodegen::Load(op) => op.name.location.as_constant().and_then(|index| {
+            InstrBlockPy::Load(op) => op.name.location.as_constant().and_then(|index| {
                 self.constants
                     .constant_string_bytes_value(ModuleConstantId(index as usize))
                     .map(ToOwned::to_owned)
@@ -736,8 +736,8 @@ impl ModuleConstantCollector {
     }
 }
 
-impl soac_core::block_py::Visit<InstrCodegen> for ModuleConstantCollector {
-    fn visit_instr(&mut self, expr: &InstrCodegen) {
+impl soac_core::block_py::Visit<InstrBlockPy> for ModuleConstantCollector {
+    fn visit_instr(&mut self, expr: &InstrBlockPy) {
         self.collect_expr(expr);
     }
 }

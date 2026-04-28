@@ -455,8 +455,8 @@ explicit ordinary
   unspecialized/no-counter mode and should not read or write counter
   dumps. `profile` writes raw evidence to `profile.bin`. Runtime
   `verify`/`apply` and offline precompile use the typed v3 path directly: they
-  use the cached pre-optimization `mod.blockpy`, lower `CodegenModuleShape` to
-  `TypedCodegenModuleShape`, and apply v3 decisions from raw `profile.bin`
+  use the cached pre-optimization `mod.blockpy`, lower `BlockPyModuleShape` to
+  `TypedBlockPyModuleShape`, and apply v3 decisions from raw `profile.bin`
   evidence during typed JIT planning. There is no serialized optimization-plan
   artifact between profiling and codegen, and there is no fallback to legacy
   `mod.opt`.

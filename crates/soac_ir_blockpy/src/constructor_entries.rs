@@ -1,4 +1,4 @@
-use crate::{CodegenModuleShape, InstrCodegen, assign_missing_codegen_function_instr_ids};
+use crate::{BlockPyModuleShape, InstrBlockPy, assign_missing_blockpy_function_instr_ids};
 use soac_core::block_py::{
     Block, BlockPyFunction, BlockPyModule, BlockTerm, Call, CallArgKeyword, CallArgPositional,
     CallableScopeInfo, FunctionExecutionMode, FunctionKind, FunctionName, KeywordName, Load,
@@ -22,7 +22,7 @@ fn constructor_entry_qualname_for_init(
 }
 
 pub fn constructor_entry_function_id_for_init(
-    module: &BlockPyModule<CodegenModuleShape>,
+    module: &BlockPyModule<BlockPyModuleShape>,
     init_function_id: RuntimeFunctionId,
 ) -> Option<RuntimeFunctionId> {
     let init_function = module
@@ -67,7 +67,7 @@ fn constructor_entry_bind_name(init_function_id: RuntimeFunctionId) -> String {
     )
 }
 
-fn constructor_entry_params(init_function: &BlockPyFunction<CodegenModuleShape>) -> ParamSpec {
+fn constructor_entry_params(init_function: &BlockPyFunction<BlockPyModuleShape>) -> ParamSpec {
     let mut params = Vec::with_capacity(init_function.params.len());
     params.push(Param {
         name: CONSTRUCTOR_ENTRY_TYPE_PARAM_NAME.to_string(),
@@ -99,14 +99,14 @@ fn runtime_name(name: RuntimeName) -> ResolvedName {
     }
 }
 
-fn constructor_entry_term(params: &ParamSpec) -> BlockTerm<InstrCodegen> {
-    let callable: InstrCodegen =
-        Load::<InstrCodegen>::new(runtime_name(RuntimeName::ConstructorCall)).into();
+fn constructor_entry_term(params: &ParamSpec) -> BlockTerm<InstrBlockPy> {
+    let callable: InstrBlockPy =
+        Load::<InstrBlockPy>::new(runtime_name(RuntimeName::ConstructorCall)).into();
     let mut positional_args = Vec::new();
     let mut keyword_args = Vec::new();
     for (slot, param) in params.params.iter().enumerate() {
-        let value: InstrCodegen =
-            Load::<InstrCodegen>::new(local_name(param.name.clone(), slot as u32)).into();
+        let value: InstrBlockPy =
+            Load::<InstrBlockPy>::new(local_name(param.name.clone(), slot as u32)).into();
         match param.kind {
             ParamKind::Any | ParamKind::PosOnly => {
                 positional_args.push(CallArgPositional::Positional(value));
@@ -129,7 +129,7 @@ fn constructor_entry_term(params: &ParamSpec) -> BlockTerm<InstrCodegen> {
 }
 
 fn constructor_entry_storage_layout(
-    init_function: &BlockPyFunction<CodegenModuleShape>,
+    init_function: &BlockPyFunction<BlockPyModuleShape>,
     params: &ParamSpec,
 ) -> StorageLayout {
     let mut layout = StorageLayout::default();
@@ -141,10 +141,10 @@ fn constructor_entry_storage_layout(
 }
 
 fn build_constructor_entry_function(
-    module: &BlockPyModule<CodegenModuleShape>,
-    init_function: &BlockPyFunction<CodegenModuleShape>,
+    module: &BlockPyModule<BlockPyModuleShape>,
+    init_function: &BlockPyFunction<BlockPyModuleShape>,
     class_qualname: &str,
-) -> BlockPyFunction<CodegenModuleShape> {
+) -> BlockPyFunction<BlockPyModuleShape> {
     let name_gen = module.module_name_gen.next_function_name_gen();
     let function_id = name_gen.function_id();
     let label = name_gen.next_block_name();
@@ -179,7 +179,7 @@ fn build_constructor_entry_function(
     }
 }
 
-pub fn ensure_constructor_entry_functions(module: &mut BlockPyModule<CodegenModuleShape>) -> usize {
+pub fn ensure_constructor_entry_functions(module: &mut BlockPyModule<BlockPyModuleShape>) -> usize {
     let mut existing_qualnames = module
         .callable_defs
         .iter()
@@ -206,7 +206,7 @@ pub fn ensure_constructor_entry_functions(module: &mut BlockPyModule<CodegenModu
         }
         let mut constructor_entry =
             build_constructor_entry_function(module, &init_function, &class_qualname);
-        assign_missing_codegen_function_instr_ids(&mut constructor_entry);
+        assign_missing_blockpy_function_instr_ids(&mut constructor_entry);
         module.callable_defs.push(constructor_entry);
         inserted += 1;
     }

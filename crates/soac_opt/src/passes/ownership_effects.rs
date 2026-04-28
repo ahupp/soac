@@ -6,13 +6,13 @@
 //! operations once representation choices such as SSA block params, stack-slot
 //! mirrors, borrowed helper results, and immortal constants are known.
 
-use crate::passes::{CodegenModuleShape, InstrCodegen};
+use crate::passes::{BlockPyModuleShape, InstrBlockPy};
 use soac_core::block_py::{
     Block, BlockArg, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, CellLocation,
     ChildVisitable, HasSemanticInstrId, InstrKey, LocalLocation, RuntimeFunctionId, Visit,
 };
 use soac_ir_typed::{
-    FactStore, InstrTyped, PyObjFacts, TypedBlock, TypedCodegenModuleShape, ValueFacts,
+    FactStore, InstrTyped, PyObjFacts, TypedBlock, TypedBlockPyModuleShape, ValueFacts,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -153,7 +153,7 @@ impl RefcountSite {
 }
 
 pub fn plan_ownership_effects(
-    module: &BlockPyModule<CodegenModuleShape>,
+    module: &BlockPyModule<BlockPyModuleShape>,
     facts: &FactStore,
 ) -> RefcountPlan {
     let functions = module
@@ -170,7 +170,7 @@ pub fn plan_ownership_effects(
 }
 
 pub fn validate_ownership_effects(
-    module: &BlockPyModule<CodegenModuleShape>,
+    module: &BlockPyModule<BlockPyModuleShape>,
     facts: &FactStore,
     plan: &RefcountPlan,
 ) -> Result<(), String> {
@@ -201,7 +201,7 @@ pub fn validate_ownership_effects(
 }
 
 pub fn plan_typed_ownership_effects(
-    module: &BlockPyModule<TypedCodegenModuleShape>,
+    module: &BlockPyModule<TypedBlockPyModuleShape>,
     facts: &FactStore,
 ) -> RefcountPlan {
     let functions = module
@@ -218,7 +218,7 @@ pub fn plan_typed_ownership_effects(
 }
 
 pub fn validate_typed_ownership_effects(
-    module: &BlockPyModule<TypedCodegenModuleShape>,
+    module: &BlockPyModule<TypedBlockPyModuleShape>,
     facts: &FactStore,
     plan: &RefcountPlan,
 ) -> Result<(), String> {
@@ -249,7 +249,7 @@ pub fn validate_typed_ownership_effects(
 }
 
 fn validate_function_refcount_plan(
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
     facts: &FactStore,
     plan: &RefcountPlan,
     errors: &mut Vec<String>,
@@ -341,7 +341,7 @@ fn validate_function_refcount_plan(
 }
 
 fn validate_typed_function_refcount_plan(
-    function: &BlockPyFunction<TypedCodegenModuleShape>,
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
     facts: &FactStore,
     plan: &RefcountPlan,
     errors: &mut Vec<String>,
@@ -433,7 +433,7 @@ fn validate_typed_function_refcount_plan(
 }
 
 fn plan_function_refcounts(
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
     facts: &FactStore,
 ) -> FunctionRefcountPlan {
     let Some(storage_layout) = function.storage_layout().as_ref() else {
@@ -494,7 +494,7 @@ fn plan_function_refcounts(
 }
 
 fn plan_typed_function_refcounts(
-    function: &BlockPyFunction<TypedCodegenModuleShape>,
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
     facts: &FactStore,
 ) -> FunctionRefcountPlan {
     let Some(storage_layout) = function.storage_layout().as_ref() else {
@@ -555,7 +555,7 @@ fn plan_typed_function_refcounts(
 }
 
 pub fn compute_function_local_live_ins(
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
 ) -> HashMap<BlockLabel, HashSet<LocalLocation>> {
     let Some(storage_layout) = function.storage_layout().as_ref() else {
         return HashMap::new();
@@ -580,7 +580,7 @@ pub fn compute_function_local_live_ins(
 }
 
 pub fn compute_function_local_must_bound_ins(
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
 ) -> HashMap<BlockLabel, HashSet<LocalLocation>> {
     let Some(storage_layout) = function.storage_layout().as_ref() else {
         return HashMap::new();
@@ -605,7 +605,7 @@ pub fn compute_function_local_must_bound_ins(
 }
 
 pub fn compute_typed_function_local_live_ins(
-    function: &BlockPyFunction<TypedCodegenModuleShape>,
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
 ) -> HashMap<BlockLabel, HashSet<LocalLocation>> {
     let Some(storage_layout) = function.storage_layout().as_ref() else {
         return HashMap::new();
@@ -630,7 +630,7 @@ pub fn compute_typed_function_local_live_ins(
 }
 
 pub fn compute_typed_function_local_must_bound_ins(
-    function: &BlockPyFunction<TypedCodegenModuleShape>,
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
 ) -> HashMap<BlockLabel, HashSet<LocalLocation>> {
     let Some(storage_layout) = function.storage_layout().as_ref() else {
         return HashMap::new();
@@ -655,8 +655,8 @@ pub fn compute_typed_function_local_must_bound_ins(
 }
 
 fn plan_block_refcounts(
-    function: &BlockPyFunction<CodegenModuleShape>,
-    block: &Block<InstrCodegen>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
+    block: &Block<InstrBlockPy>,
     facts: &FactStore,
     locals: &HashMap<LocalLocation, RefcountLocal>,
     location_by_name: &HashMap<String, LocalLocation>,
@@ -683,7 +683,7 @@ fn plan_block_refcounts(
 
     for instr in &block.body {
         match instr {
-            InstrCodegen::Store(op) => {
+            InstrBlockPy::Store(op) => {
                 let Some(location) = store_binding_location(op, owned_cell_locations) else {
                     continue;
                 };
@@ -705,7 +705,7 @@ fn plan_block_refcounts(
                 });
                 env.insert(location, new_state);
             }
-            InstrCodegen::Del(op) => {
+            InstrBlockPy::Del(op) => {
                 let Some(location) = op.name.local_location() else {
                     continue;
                 };
@@ -862,7 +862,7 @@ fn plan_block_refcounts(
 
 #[allow(clippy::too_many_arguments)]
 fn plan_typed_block_refcounts(
-    function: &BlockPyFunction<TypedCodegenModuleShape>,
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
     block: &TypedBlock,
     facts: &FactStore,
     locals: &HashMap<LocalLocation, RefcountLocal>,
@@ -1069,8 +1069,8 @@ fn plan_typed_block_refcounts(
 
 #[allow(clippy::too_many_arguments)]
 fn validate_block_refcount_plan(
-    function: &BlockPyFunction<CodegenModuleShape>,
-    block: &Block<InstrCodegen>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
+    block: &Block<InstrBlockPy>,
     block_plan: &BlockRefcountPlan,
     facts: &FactStore,
     locals: &HashMap<LocalLocation, RefcountLocal>,
@@ -1113,7 +1113,7 @@ fn validate_block_refcount_plan(
 
     for instr in &block.body {
         match instr {
-            InstrCodegen::Store(op) => {
+            InstrBlockPy::Store(op) => {
                 let site = RefcountSite::Instr(instr.semantic_instr_key(function.function_id));
                 let actions = actions_by_site.remove(&site).unwrap_or_default();
                 let Some(location) = store_binding_location(op, owned_cell_locations) else {
@@ -1158,7 +1158,7 @@ fn validate_block_refcount_plan(
                 );
                 env.insert(location, new_state);
             }
-            InstrCodegen::Del(op) => {
+            InstrBlockPy::Del(op) => {
                 let site = RefcountSite::Instr(instr.semantic_instr_key(function.function_id));
                 let actions = actions_by_site.remove(&site).unwrap_or_default();
                 let Some(location) = op.name.local_location() else {
@@ -1364,7 +1364,7 @@ fn validate_block_refcount_plan(
 
 #[allow(clippy::too_many_arguments)]
 fn validate_typed_block_refcount_plan(
-    function: &BlockPyFunction<TypedCodegenModuleShape>,
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
     block: &TypedBlock,
     block_plan: &BlockRefcountPlan,
     facts: &FactStore,
@@ -1398,8 +1398,8 @@ fn validate_typed_block_refcount_plan(
 }
 
 fn initial_block_env(
-    function: &BlockPyFunction<CodegenModuleShape>,
-    block: &Block<InstrCodegen>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
+    block: &Block<InstrBlockPy>,
     facts: &FactStore,
     locals: &HashMap<LocalLocation, RefcountLocal>,
     location_by_name: &HashMap<String, LocalLocation>,
@@ -1443,7 +1443,7 @@ fn initial_block_env(
 
 fn state_for_expr(
     function_id: RuntimeFunctionId,
-    expr: &InstrCodegen,
+    expr: &InstrBlockPy,
     facts: &FactStore,
 ) -> LocalRefState {
     match facts.fact_for(expr.semantic_instr_key(function_id)) {
@@ -1453,7 +1453,7 @@ fn state_for_expr(
 }
 
 fn initial_typed_block_env(
-    function: &BlockPyFunction<TypedCodegenModuleShape>,
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
     block: &TypedBlock,
     facts: &FactStore,
     locals: &HashMap<LocalLocation, RefcountLocal>,
@@ -1670,7 +1670,7 @@ impl LocalBitSet {
 }
 
 fn compute_local_liveness(
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
     location_by_name: &HashMap<String, LocalLocation>,
 ) -> LocalLiveness {
     let owned_cell_locations = owned_cell_locations(function, location_by_name);
@@ -1732,7 +1732,7 @@ fn compute_local_liveness(
 }
 
 fn compute_local_must_bound(
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
     location_by_name: &HashMap<String, LocalLocation>,
 ) -> LocalMustBound {
     let owned_cell_locations = owned_cell_locations(function, location_by_name);
@@ -1854,7 +1854,7 @@ fn compute_local_must_bound(
 }
 
 fn compute_typed_local_liveness(
-    function: &BlockPyFunction<TypedCodegenModuleShape>,
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
     location_by_name: &HashMap<String, LocalLocation>,
 ) -> LocalLiveness {
     let owned_cell_locations = typed_owned_cell_locations(function, location_by_name);
@@ -1916,7 +1916,7 @@ fn compute_typed_local_liveness(
 }
 
 fn compute_typed_local_must_bound(
-    function: &BlockPyFunction<TypedCodegenModuleShape>,
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
     location_by_name: &HashMap<String, LocalLocation>,
 ) -> LocalMustBound {
     let owned_cell_locations = typed_owned_cell_locations(function, location_by_name);
@@ -2042,8 +2042,8 @@ fn compute_typed_local_must_bound(
 }
 
 fn transfer_must_bound_through_block(
-    function: &BlockPyFunction<CodegenModuleShape>,
-    block: &Block<InstrCodegen>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
+    block: &Block<InstrBlockPy>,
     must_bound_in: &LocalBitSet,
     owned_cell_locations: &HashMap<u32, LocalLocation>,
 ) -> LocalBitSet {
@@ -2064,12 +2064,12 @@ fn transfer_must_bound_through_block(
     }
     for instr in &block.body {
         match instr {
-            InstrCodegen::Store(op) => {
+            InstrBlockPy::Store(op) => {
                 if let Some(location) = store_binding_location(op, owned_cell_locations) {
                     must_bound.insert(location);
                 }
             }
-            InstrCodegen::Del(op) => {
+            InstrBlockPy::Del(op) => {
                 if let Some(location) = op.name.local_location() {
                     must_bound.remove(location);
                 }
@@ -2081,7 +2081,7 @@ fn transfer_must_bound_through_block(
 }
 
 fn transfer_typed_must_bound_through_block(
-    function: &BlockPyFunction<TypedCodegenModuleShape>,
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
     block: &TypedBlock,
     must_bound_in: &LocalBitSet,
     owned_cell_locations: &HashMap<u32, LocalLocation>,
@@ -2120,7 +2120,7 @@ fn transfer_typed_must_bound_through_block(
 }
 
 fn block_local_effects(
-    block: &Block<InstrCodegen>,
+    block: &Block<InstrBlockPy>,
     location_by_name: &HashMap<String, LocalLocation>,
     owned_cell_locations: &HashMap<u32, LocalLocation>,
 ) -> BlockLocalEffects {
@@ -2140,12 +2140,12 @@ fn block_local_effects(
             &mut effects.uses,
         );
         match instr {
-            InstrCodegen::Store(op) => {
+            InstrBlockPy::Store(op) => {
                 if let Some(location) = op.name.local_location() {
                     effects.defs.insert(location);
                 }
             }
-            InstrCodegen::Del(op) => {
+            InstrBlockPy::Del(op) => {
                 if let Some(location) = op.name.local_location() {
                     effects.defs.insert(location);
                 }
@@ -2210,7 +2210,7 @@ fn typed_block_local_effects(
 }
 
 fn owned_cell_locations(
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
     location_by_name: &HashMap<String, LocalLocation>,
 ) -> HashMap<u32, LocalLocation> {
     let Some(storage_layout) = function.storage_layout().as_ref() else {
@@ -2230,7 +2230,7 @@ fn owned_cell_locations(
 }
 
 fn typed_owned_cell_locations(
-    function: &BlockPyFunction<TypedCodegenModuleShape>,
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
     location_by_name: &HashMap<String, LocalLocation>,
 ) -> HashMap<u32, LocalLocation> {
     let Some(storage_layout) = function.storage_layout().as_ref() else {
@@ -2250,14 +2250,14 @@ fn typed_owned_cell_locations(
 }
 
 fn store_binding_location(
-    op: &soac_core::block_py::Store<InstrCodegen>,
+    op: &soac_core::block_py::Store<InstrBlockPy>,
     owned_cell_locations: &HashMap<u32, LocalLocation>,
 ) -> Option<LocalLocation> {
     op.name.local_location().or_else(|| {
         let CellLocation::Owned(slot) = op.name.cell_location()? else {
             return None;
         };
-        matches!(op.value.as_ref(), InstrCodegen::MakeCell(_))
+        matches!(op.value.as_ref(), InstrBlockPy::MakeCell(_))
             .then(|| owned_cell_locations.get(&slot).copied())
             .flatten()
     })
@@ -2301,7 +2301,7 @@ fn mark_cell_use(
 }
 
 fn collect_local_reads(
-    expr: &InstrCodegen,
+    expr: &InstrBlockPy,
     defs: &HashSet<LocalLocation>,
     location_by_name: &HashMap<String, LocalLocation>,
     owned_cell_locations: &HashMap<u32, LocalLocation>,
@@ -2314,13 +2314,13 @@ fn collect_local_reads(
         uses: &'a mut HashSet<LocalLocation>,
     }
 
-    impl Visit<InstrCodegen> for LocalReadCollector<'_> {
-        fn visit_instr(&mut self, expr: &InstrCodegen)
+    impl Visit<InstrBlockPy> for LocalReadCollector<'_> {
+        fn visit_instr(&mut self, expr: &InstrBlockPy)
         where
-            InstrCodegen: ChildVisitable<InstrCodegen>,
+            InstrBlockPy: ChildVisitable<InstrBlockPy>,
         {
             match expr {
-                InstrCodegen::Load(op) => {
+                InstrBlockPy::Load(op) => {
                     if let Some(location) = op.name.local_location() {
                         mark_local_use(location, self.defs, self.uses);
                     }
@@ -2333,7 +2333,7 @@ fn collect_local_reads(
                         );
                     }
                 }
-                InstrCodegen::Store(op) => {
+                InstrBlockPy::Store(op) => {
                     if let Some(cell_location) = op.name.cell_location() {
                         mark_cell_use(
                             cell_location,
@@ -2343,7 +2343,7 @@ fn collect_local_reads(
                         );
                     }
                 }
-                InstrCodegen::Del(op) => {
+                InstrBlockPy::Del(op) => {
                     if let Some(location) = op.name.local_location() {
                         mark_local_use(location, self.defs, self.uses);
                     }
@@ -2356,7 +2356,7 @@ fn collect_local_reads(
                         );
                     }
                 }
-                InstrCodegen::CellRef(op) => {
+                InstrBlockPy::CellRef(op) => {
                     mark_cell_use(op.location, self.defs, self.owned_cell_locations, self.uses)
                 }
                 _ => {}
@@ -2383,7 +2383,7 @@ fn collect_local_reads(
 }
 
 fn collect_term_local_reads(
-    term: &BlockTerm<InstrCodegen>,
+    term: &BlockTerm<InstrBlockPy>,
     defs: &HashSet<LocalLocation>,
     location_by_name: &HashMap<String, LocalLocation>,
     owned_cell_locations: &HashMap<u32, LocalLocation>,
@@ -2396,10 +2396,10 @@ fn collect_term_local_reads(
         uses: &'a mut HashSet<LocalLocation>,
     }
 
-    impl Visit<InstrCodegen> for TermReadCollector<'_> {
-        fn visit_instr(&mut self, expr: &InstrCodegen)
+    impl Visit<InstrBlockPy> for TermReadCollector<'_> {
+        fn visit_instr(&mut self, expr: &InstrBlockPy)
         where
-            InstrCodegen: ChildVisitable<InstrCodegen>,
+            InstrBlockPy: ChildVisitable<InstrBlockPy>,
         {
             collect_local_reads(
                 expr,
@@ -2428,7 +2428,7 @@ fn collect_term_local_reads(
     .visit_term(term);
 }
 
-fn block_successors(block: &Block<InstrCodegen>) -> Vec<BlockLabel> {
+fn block_successors(block: &Block<InstrBlockPy>) -> Vec<BlockLabel> {
     let mut successors = Vec::new();
     if let Some(edge) = &block.exc_edge {
         successors.push(edge.target);
@@ -2724,7 +2724,7 @@ fn push_release_action(
 }
 
 fn validate_no_refcount_actions(
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
     block_label: BlockLabel,
     site: &RefcountSite,
     actions: Vec<RefcountActionKind>,
@@ -2740,7 +2740,7 @@ fn validate_no_refcount_actions(
 }
 
 fn validate_exact_refcount_action(
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
     block_label: BlockLabel,
     site: &RefcountSite,
     actions: Vec<RefcountActionKind>,
@@ -2765,7 +2765,7 @@ fn validate_exact_refcount_action(
 
 #[allow(clippy::too_many_arguments)]
 fn validate_release_actions(
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
     block_label: BlockLabel,
     term_actions: &mut Vec<RefcountActionKind>,
     env: &HashMap<LocalLocation, LocalRefState>,
@@ -2823,7 +2823,7 @@ mod tests {
     fn refcount_actions_for_function(
         source: &str,
     ) -> (
-        BlockPyFunction<crate::passes::CodegenModuleShape>,
+        BlockPyFunction<crate::passes::BlockPyModuleShape>,
         Vec<RefcountActionKind>,
     ) {
         refcount_actions_for_named_function(source, "f")
@@ -2833,12 +2833,12 @@ mod tests {
         source: &str,
         qualname: &str,
     ) -> (
-        BlockPyFunction<crate::passes::CodegenModuleShape>,
+        BlockPyFunction<crate::passes::BlockPyModuleShape>,
         Vec<RefcountActionKind>,
     ) {
         let lowered = lower_python_to_blockpy_for_testing(source)
             .expect("transform should succeed")
-            .codegen_module;
+            .blockpy_module;
         let function = lowered
             .callable_defs
             .iter()
@@ -3130,7 +3130,7 @@ def f(flag):
 "#,
         )
         .expect("transform should succeed")
-        .codegen_module;
+        .blockpy_module;
         let mut function = lowered
             .callable_defs
             .iter()
@@ -3186,7 +3186,7 @@ def f(flag):
 "#,
         )
         .expect("transform should succeed")
-        .codegen_module;
+        .blockpy_module;
         let facts = infer_module_value_facts(&lowered);
         let plan = plan_ownership_effects(&lowered, &facts);
 
@@ -3203,7 +3203,7 @@ def f():
 "#,
         )
         .expect("transform should succeed")
-        .codegen_module;
+        .blockpy_module;
         let facts = infer_module_value_facts(&lowered);
         let mut plan = plan_ownership_effects(&lowered, &facts);
         let function = lowered

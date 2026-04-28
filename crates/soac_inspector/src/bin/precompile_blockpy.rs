@@ -1,12 +1,12 @@
 use soac_config::SoacEnvConfig;
 use soac_core::block_py::{BlockPyModule, ModuleNameGen, RuntimeFunctionId};
 use soac_core::profile::{CounterDumpFile, CounterDumpRecordView, CounterDumpRowView};
-use soac_driver::codegen_cache::{
-    CachedCodegenModuleMetadata, PythonModuleCacheSource, codegen_module_cache_path,
-    hash_module_source, load_codegen_module_cache, remap_cached_codegen_module_function_ids,
-    validate_codegen_module_cache_metadata,
+use soac_driver::blockpy_cache::{
+    CachedBlockPyModuleMetadata, PythonModuleCacheSource, blockpy_module_cache_path,
+    hash_module_source, load_blockpy_module_cache, remap_cached_blockpy_module_function_ids,
+    validate_blockpy_module_cache_metadata,
 };
-use soac_ir_blockpy::CodegenModuleShape;
+use soac_ir_blockpy::BlockPyModuleShape;
 use soac_jit::{
     PrecompileModuleIndex, PrecompileModuleIndexEntry, precompile_codegen_module_to_object_file,
 };
@@ -48,8 +48,8 @@ struct CompiledModuleObject {
 #[derive(Debug)]
 struct LoadedModule {
     module_ref: CounterModuleRef,
-    metadata: CachedCodegenModuleMetadata,
-    module: BlockPyModule<CodegenModuleShape>,
+    metadata: CachedBlockPyModuleMetadata,
+    module: BlockPyModule<BlockPyModuleShape>,
 }
 
 fn main() {
@@ -128,10 +128,10 @@ fn run_with_args(args: impl IntoIterator<Item = OsString>) -> Result<(), String>
             &module_ref,
             args.build_identity.as_deref(),
         )?;
-        let mut cache = load_codegen_module_cache(cache_path.as_path())
+        let mut cache = load_blockpy_module_cache(cache_path.as_path())
             .map_err(|err| format!("failed to load {}: {err}", cache_path.display()))?;
         if let Some(module_id) = module_ref.module_id {
-            remap_cached_codegen_module_function_ids(&mut cache, ModuleNameGen::new(module_id));
+            remap_cached_blockpy_module_function_ids(&mut cache, ModuleNameGen::new(module_id));
         }
         let metadata = cache.metadata.clone();
         loaded_modules.push(LoadedModule {
@@ -370,7 +370,7 @@ fn module_cache_metadata_for_source(
     source: PythonModuleCacheSource,
     module_ref: &CounterModuleRef,
     build_identity: &str,
-) -> CachedCodegenModuleMetadata {
+) -> CachedBlockPyModuleMetadata {
     soac_jit::config::pre_optimization_module_cache_metadata(
         source,
         module_ref.module_name.as_str(),
@@ -393,16 +393,16 @@ fn matching_module_cache_paths(
         PythonModuleCacheSource::Project,
         PythonModuleCacheSource::PythonStdlib,
     ] {
-        let path = codegen_module_cache_path(cache_root, source, module_ref.module_name.as_str())
+        let path = blockpy_module_cache_path(cache_root, source, module_ref.module_name.as_str())
             .map_err(|err| err.to_string())?;
         if !path.exists() {
             continue;
         }
-        let cache = load_codegen_module_cache(path.as_path())
+        let cache = load_blockpy_module_cache(path.as_path())
             .map_err(|err| format!("failed to load {}: {err}", path.display()))?;
         for identity in &identities {
             let expected = module_cache_metadata_for_source(source, module_ref, identity.as_str());
-            if validate_codegen_module_cache_metadata(&cache.metadata, &expected).is_ok() {
+            if validate_blockpy_module_cache_metadata(&cache.metadata, &expected).is_ok() {
                 matches.push(path.clone());
                 break;
             }
@@ -548,18 +548,18 @@ mod test {
     use super::*;
     use soac_core::pass_tracker::RecordingPassTracker;
     use soac_core::profile::{CounterDumpRecord, CounterDumpRow, parse_counter_dump_records};
-    use soac_driver::codegen_cache::store_codegen_module_cache;
-    use soac_driver::{CodegenPreparationOptions, prepare_codegen_module};
+    use soac_driver::blockpy_cache::store_blockpy_module_cache;
+    use soac_driver::{SourceToBlockPyOptions, source_to_blockpy};
     use std::process::Stdio;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn prepare_for_test(
         source: &str,
         module_id: u32,
-        options: CodegenPreparationOptions,
-    ) -> BlockPyModule<CodegenModuleShape> {
+        options: SourceToBlockPyOptions,
+    ) -> BlockPyModule<BlockPyModuleShape> {
         let mut pass_tracker = RecordingPassTracker::new();
-        prepare_codegen_module(
+        source_to_blockpy(
             source,
             ModuleNameGen::new(module_id),
             options,
@@ -576,11 +576,11 @@ mod test {
         cache_source: PythonModuleCacheSource,
         module_name: &str,
         runtime_names_as_globals: bool,
-    ) -> BlockPyModule<CodegenModuleShape> {
+    ) -> BlockPyModule<BlockPyModuleShape> {
         prepare_for_test(
             source,
             module_id,
-            CodegenPreparationOptions::default()
+            SourceToBlockPyOptions::default()
                 .with_runtime_names_as_globals(runtime_names_as_globals)
                 .with_pre_optimization_cache(
                     cache_root.to_path_buf(),
@@ -666,7 +666,7 @@ mod test {
     fn cache_resolution_rejects_ambiguous_source_subtrees() {
         let root = unique_temp_dir();
         let source = "def f():\n    return 1\n";
-        let lowered = prepare_for_test(source, 7, CodegenPreparationOptions::default());
+        let lowered = prepare_for_test(source, 7, SourceToBlockPyOptions::default());
         let module_ref = CounterModuleRef {
             module_name: "pkg.mod".to_string(),
             source_hash: hash_module_source(source),
@@ -677,9 +677,9 @@ mod test {
             PythonModuleCacheSource::PythonStdlib,
         ] {
             let path =
-                codegen_module_cache_path(root.as_path(), source, module_ref.module_name.as_str())
+                blockpy_module_cache_path(root.as_path(), source, module_ref.module_name.as_str())
                     .unwrap();
-            store_codegen_module_cache(
+            store_blockpy_module_cache(
                 path.as_path(),
                 &module_cache_metadata_for_source(source, &module_ref, SOAC_BUILD_IDENTITY),
                 &lowered,
@@ -697,7 +697,7 @@ mod test {
     fn cache_resolution_ignores_stale_metadata() {
         let root = unique_temp_dir();
         let source = "def f():\n    return 1\n";
-        let lowered = prepare_for_test(source, 7, CodegenPreparationOptions::default());
+        let lowered = prepare_for_test(source, 7, SourceToBlockPyOptions::default());
         let module_ref = CounterModuleRef {
             module_name: "pkg.mod".to_string(),
             source_hash: hash_module_source(source),
@@ -707,13 +707,13 @@ mod test {
             source_hash: 0x1234,
             ..module_ref.clone()
         };
-        let path = codegen_module_cache_path(
+        let path = blockpy_module_cache_path(
             root.as_path(),
             PythonModuleCacheSource::Project,
             module_ref.module_name.as_str(),
         )
         .unwrap();
-        store_codegen_module_cache(
+        store_blockpy_module_cache(
             path.as_path(),
             &module_cache_metadata_for_source(
                 PythonModuleCacheSource::Project,

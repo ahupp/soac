@@ -1,7 +1,7 @@
-pub mod codegen_cache;
+pub mod blockpy_cache;
 pub mod typed_runtime;
 
-use crate::codegen_cache::{
+use crate::blockpy_cache::{
     PreOptimizationCacheTarget, PythonModuleCacheSource, hash_module_source,
     pre_optimization_module_cache_metadata, pre_optimization_module_cache_path,
     store_pre_optimization_cache, try_load_pre_optimization_cache,
@@ -10,13 +10,13 @@ use soac_config::SoacEnvConfig;
 use soac_core::block_py::{BlockPyModule, ModuleNameGen};
 use soac_core::pass_tracker::PassTracker;
 use soac_instrument::{InstrumentationConfig, define_typed_module_counter_defs};
-use soac_ir_blockpy::CodegenModuleShape;
-use soac_ir_typed::lower_codegen_module_to_typed;
+use soac_ir_blockpy::BlockPyModuleShape;
+use soac_ir_typed::lower_blockpy_module_to_typed;
 pub use soac_lowering::{LoweringError, Result};
 use std::path::PathBuf;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct CodegenPreparationOptions {
+pub struct SourceToBlockPyOptions {
     pub lowering: soac_lowering::LoweringOptions,
     pub pre_optimization_cache: Option<PreOptimizationCacheRequest>,
 }
@@ -69,7 +69,7 @@ impl PreOptimizationCacheRequest {
     }
 }
 
-impl CodegenPreparationOptions {
+impl SourceToBlockPyOptions {
     pub fn with_runtime_names_as_globals(mut self, runtime_names_as_globals: bool) -> Self {
         self.lowering.runtime_names_as_globals = runtime_names_as_globals;
         self
@@ -92,7 +92,7 @@ impl CodegenPreparationOptions {
     }
 }
 
-impl From<soac_lowering::LoweringOptions> for CodegenPreparationOptions {
+impl From<soac_lowering::LoweringOptions> for SourceToBlockPyOptions {
     fn from(lowering: soac_lowering::LoweringOptions) -> Self {
         Self {
             lowering,
@@ -101,13 +101,13 @@ impl From<soac_lowering::LoweringOptions> for CodegenPreparationOptions {
     }
 }
 
-pub fn prepare_codegen_module(
+pub fn source_to_blockpy(
     source: &str,
     module_name_gen: ModuleNameGen,
-    options: CodegenPreparationOptions,
+    options: SourceToBlockPyOptions,
     env_config: &SoacEnvConfig,
     pass_tracker: &mut impl PassTracker,
-) -> soac_lowering::Result<BlockPyModule<CodegenModuleShape>> {
+) -> soac_lowering::Result<BlockPyModule<BlockPyModuleShape>> {
     let pre_optimization =
         load_or_lower_pre_optimization_module(source, module_name_gen, pass_tracker, options)?;
     finish_pre_optimization_module(pre_optimization, pass_tracker, env_config)
@@ -117,8 +117,8 @@ fn load_or_lower_pre_optimization_module(
     source: &str,
     module_name_gen: ModuleNameGen,
     pass_tracker: &mut impl PassTracker,
-    options: CodegenPreparationOptions,
-) -> soac_lowering::Result<BlockPyModule<CodegenModuleShape>> {
+    options: SourceToBlockPyOptions,
+) -> soac_lowering::Result<BlockPyModule<BlockPyModuleShape>> {
     let cache_target = options
         .pre_optimization_cache
         .as_ref()
@@ -138,7 +138,7 @@ fn load_or_lower_pre_optimization_module(
         }
     }
 
-    let module = soac_lowering::lower_source_to_codegen_module_with_tracker(
+    let module = soac_lowering::lower_source_to_blockpy_module_with_tracker(
         source,
         module_name_gen,
         pass_tracker,
@@ -153,37 +153,37 @@ fn load_or_lower_pre_optimization_module(
 }
 
 fn finish_pre_optimization_module(
-    mut bb_codegen: BlockPyModule<CodegenModuleShape>,
+    mut blockpy: BlockPyModule<BlockPyModuleShape>,
     pass_tracker: &mut impl PassTracker,
     env_config: &SoacEnvConfig,
-) -> soac_lowering::Result<BlockPyModule<CodegenModuleShape>> {
-    soac_ir_blockpy::ensure_constructor_entry_functions(&mut bb_codegen);
+) -> soac_lowering::Result<BlockPyModule<BlockPyModuleShape>> {
+    soac_ir_blockpy::ensure_constructor_entry_functions(&mut blockpy);
 
-    pass_tracker.record_timing("validate_codegen_instr_ids", || {
-        soac_ir_blockpy::validate_codegen_instr_ids(&bb_codegen).map_err(anyhow::Error::msg)
+    pass_tracker.record_timing("validate_blockpy_instr_ids", || {
+        soac_ir_blockpy::validate_blockpy_instr_ids(&blockpy).map_err(anyhow::Error::msg)
     })?;
 
     let instrumentation_config = InstrumentationConfig::from_env_config(env_config);
-    let mut typed_for_counters = lower_codegen_module_to_typed(bb_codegen.clone());
+    let mut typed_for_counters = lower_blockpy_module_to_typed(blockpy.clone());
     define_typed_module_counter_defs(&mut typed_for_counters, &instrumentation_config)
         .map_err(anyhow::Error::msg)?;
-    bb_codegen.counter_defs = typed_for_counters.counter_defs;
-    Ok(bb_codegen)
+    blockpy.counter_defs = typed_for_counters.counter_defs;
+    Ok(blockpy)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codegen_cache::{
-        CachedCodegenModuleMetadata, PythonModuleCacheSource, load_codegen_module_cache,
-        store_codegen_module_cache,
+    use crate::blockpy_cache::{
+        CachedBlockPyModuleMetadata, PythonModuleCacheSource, load_blockpy_module_cache,
+        store_blockpy_module_cache,
     };
     use soac_config::{SoacEnvConfig, SoacLogConfig, SpecializationMode};
     use soac_core::block_py::{
         ChildVisitable, CounterScope, CounterSite, FunctionExecutionMode, ModuleNameGen, Visit,
     };
     use soac_core::pass_tracker::RecordingPassTracker;
-    use soac_ir_blockpy::InstrCodegen;
+    use soac_ir_blockpy::InstrBlockPy;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -198,12 +198,12 @@ mod tests {
     fn prepare_for_test(
         source: &str,
         config: &SoacEnvConfig,
-    ) -> soac_lowering::Result<BlockPyModule<CodegenModuleShape>> {
+    ) -> soac_lowering::Result<BlockPyModule<BlockPyModuleShape>> {
         let mut pass_tracker = RecordingPassTracker::new();
-        prepare_codegen_module(
+        source_to_blockpy(
             source,
             ModuleNameGen::new(0),
-            CodegenPreparationOptions::default(),
+            SourceToBlockPyOptions::default(),
             config,
             &mut pass_tracker,
         )
@@ -211,12 +211,12 @@ mod tests {
 
     fn prepare_recorded_for_test(
         source: &str,
-    ) -> soac_lowering::Result<(BlockPyModule<CodegenModuleShape>, RecordingPassTracker)> {
+    ) -> soac_lowering::Result<(BlockPyModule<BlockPyModuleShape>, RecordingPassTracker)> {
         let mut pass_tracker = RecordingPassTracker::new();
-        let module = prepare_codegen_module(
+        let module = source_to_blockpy(
             source,
             ModuleNameGen::new(0),
-            CodegenPreparationOptions::default(),
+            SourceToBlockPyOptions::default(),
             &SoacEnvConfig::default(),
             &mut pass_tracker,
         )?;
@@ -241,15 +241,15 @@ mod tests {
             soac_lowering::LoweringOptions::default(),
         )
         .expect("initial lowering should succeed")
-        .codegen_module;
-        store_codegen_module_cache(cache_path.as_path(), &stale_metadata, &stale_module)
+        .blockpy_module;
+        store_blockpy_module_cache(cache_path.as_path(), &stale_metadata, &stale_module)
             .expect("stale cache should be writable");
 
         let mut pass_tracker = RecordingPassTracker::new();
-        if let Err(err) = prepare_codegen_module(
+        if let Err(err) = source_to_blockpy(
             source,
             ModuleNameGen::new(2),
-            CodegenPreparationOptions::default().with_pre_optimization_cache(
+            SourceToBlockPyOptions::default().with_pre_optimization_cache(
                 cache_root,
                 PythonModuleCacheSource::Project,
                 module_name,
@@ -263,13 +263,13 @@ mod tests {
             );
         }
 
-        let replaced = load_codegen_module_cache(cache_path.as_path())
+        let replaced = load_blockpy_module_cache(cache_path.as_path())
             .expect("rebuilt cache should be readable");
         assert_eq!(replaced.metadata, expected_metadata);
     }
 
     #[test]
-    fn pre_optimization_lowering_does_not_compute_or_store_prepared_codegen_facts() {
+    fn pre_optimization_lowering_does_not_compute_or_store_prepared_blockpy_facts() {
         let source = "def callee(x):\n    return x\n\ndef caller(x):\n    return callee(x)\n";
         let (_lowered, pass_tracker) =
             prepare_recorded_for_test(source).expect("transform should succeed");
@@ -282,11 +282,11 @@ mod tests {
         for removed_pass in ["escape_summary", "inline_plan"] {
             assert!(
                 !pass_names.contains(&removed_pass),
-                "pre-optimization lowering should not compute {removed_pass} for cached prepared codegen"
+                "pre-optimization lowering should not compute {removed_pass} for cached prepared BlockPy"
             );
         }
         for removed_timing in [
-            "prepared_codegen_cache_use",
+            "prepared_blockpy_cache_use",
             "value_facts",
             "ownership_effects",
             "validate_ownership_effects",
@@ -297,7 +297,7 @@ mod tests {
         ] {
             assert!(
                 !timing_names.iter().any(|name| name == removed_timing),
-                "pre-optimization lowering should not compute {removed_timing} for cached prepared codegen"
+                "pre-optimization lowering should not compute {removed_timing} for cached prepared BlockPy"
             );
         }
         assert!(
@@ -306,7 +306,7 @@ mod tests {
                 "inline_candidate_plan"
                     | "scalar_replace_constructor_allocations"
                     | "inline_direct_call_stores"
-                    | "validate_codegen_instr_ids_after_inline"
+                    | "validate_blockpy_instr_ids_after_inline"
             )),
             "pre-optimization lowering should not mutate the lowered module with inline cleanup"
         );
@@ -381,14 +381,14 @@ mod tests {
     }
 
     #[test]
-    fn profiled_cold_blocks_define_typed_counters_without_codegen_increment_instrs() {
+    fn profiled_cold_blocks_define_typed_counters_without_blockpy_increment_instrs() {
         struct IncrementCounterProbe {
             found: bool,
         }
 
-        impl Visit<InstrCodegen> for IncrementCounterProbe {
-            fn visit_instr(&mut self, expr: &InstrCodegen) {
-                self.found |= matches!(expr, InstrCodegen::IncrementCounter(_));
+        impl Visit<InstrBlockPy> for IncrementCounterProbe {
+            fn visit_instr(&mut self, expr: &InstrBlockPy) {
+                self.found |= matches!(expr, InstrBlockPy::IncrementCounter(_));
                 expr.visit_children(self);
             }
         }
@@ -419,7 +419,7 @@ mod tests {
         }
         assert!(
             !probe.found,
-            "lowering should not insert explicit counter instructions into Codegen IR"
+            "lowering should not insert explicit counter instructions into BlockPy IR"
         );
     }
 
@@ -503,7 +503,7 @@ mod tests {
         module_name: &str,
         source: &str,
         build_identity: &str,
-    ) -> CachedCodegenModuleMetadata {
+    ) -> CachedBlockPyModuleMetadata {
         pre_optimization_module_cache_metadata(
             PythonModuleCacheSource::Project,
             module_name,

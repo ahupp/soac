@@ -26,7 +26,7 @@ high-churn implementation code so common edits rebuild less of the workspace.
 - `soac-blockpy` mixes IR, lowering, passes, env config, logging setup, cache code, fixtures, and
   renderer/test support.
 - `soac_jit` depends on the whole `soac-blockpy` crate instead of only the IR it consumes.
-- `crates/soac_jit/src/jit/mod.rs` is a large monolithic codegen module, which makes crate boundaries hard
+- `crates/soac_jit/src/jit/mod.rs` is a large monolithic blockpy module, which makes crate boundaries hard
   to see.
 - `crates/soac_jit/src/jit/test.rs` is large enough that `soac_jit` test builds have a high fixed cost.
 - `soac_inspector` pulls together inspection logic and the web stack, so non-web inspection work can
@@ -63,7 +63,7 @@ Own typed environment parsing and process logging setup.
 Completed: extracted into the `soac_config` workspace crate. Direct runtime and entrypoint
 consumers now import config and logging from `soac_config`; no `soac-blockpy` compatibility
 re-export remains. BlockPy cache metadata/path helpers now live with the cache format in
-`soac_driver::codegen_cache`.
+`soac_driver::blockpy_cache`.
 
 Contents:
 
@@ -103,7 +103,7 @@ implementation there. `soac-blockpy` now has a thin library facade that re-expor
 Contents:
 
 - remaining BlockPy facade payloads and pretty/validation helpers
-- pure parse-to-`BlockPyModule<CodegenModuleShape>` entrypoints
+- pure parse-to-`BlockPyModule<BlockPyModuleShape>` entrypoints
 - pass tracker
 - transformation passes
 - template and transformer support

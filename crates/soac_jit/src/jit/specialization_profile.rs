@@ -11,7 +11,7 @@ use soac_core::block_py::{
     RuntimeFunctionId, RuntimeModuleId, SerializedFunctionId,
 };
 use soac_core::profile::read_block_entry_counts_from_file;
-use soac_ir_blockpy::CodegenModuleShape;
+use soac_ir_blockpy::BlockPyModuleShape;
 use soac_ir_typed::TypedDirectCallArgPlan;
 use soac_ir_typed::plan_v3::{CallBodyKind, ModulePlanIdentity};
 use soac_opt::access_emission_v3::{
@@ -222,9 +222,9 @@ pub(super) fn planned_optimization_inputs_from_v3_artifacts(
     Ok(inputs)
 }
 
-pub(super) fn planned_optimization_inputs_from_v3_artifacts_for_codegen_module(
+pub(super) fn planned_optimization_inputs_from_v3_artifacts_for_blockpy_module(
     artifacts: &ExactIntBranchV3Artifacts,
-    module: &BlockPyModule<CodegenModuleShape>,
+    module: &BlockPyModule<BlockPyModuleShape>,
     module_name: &str,
     source_hash: u64,
     module_index: Option<&PrecompileModuleIndex>,
@@ -334,7 +334,7 @@ fn resolve_opt_v3_codegen_module_function_target(
     module_name: &str,
     source_hash: u64,
     module_id: RuntimeModuleId,
-    module: &BlockPyModule<CodegenModuleShape>,
+    module: &BlockPyModule<BlockPyModuleShape>,
     module_index: Option<&PrecompileModuleIndex>,
     target: PersistentFunctionId,
 ) -> Result<Option<RuntimeFunctionId>, String> {
@@ -362,7 +362,7 @@ fn planned_typed_v3_precompile_inputs_from_raw_evidence(
     module_name: &str,
     source_hash: u64,
     cache_identity: &str,
-    module: &BlockPyModule<CodegenModuleShape>,
+    module: &BlockPyModule<BlockPyModuleShape>,
     module_index: Option<&PrecompileModuleIndex>,
     counter_dump_path: Option<&Path>,
 ) -> Result<PlannedOptimizationInputs, String> {
@@ -382,7 +382,7 @@ fn planned_typed_v3_precompile_inputs_from_raw_evidence(
         &evidence_store,
     )
     .map_err(|err| err.to_string())?;
-    planned_optimization_inputs_from_v3_artifacts_for_codegen_module(
+    planned_optimization_inputs_from_v3_artifacts_for_blockpy_module(
         &artifacts,
         module,
         module_name,
@@ -432,7 +432,7 @@ impl<'a> SpecializationProfile<'a> {
         module_name: &'a str,
         source_hash: u64,
         cache_identity: &str,
-        module: &BlockPyModule<CodegenModuleShape>,
+        module: &BlockPyModule<BlockPyModuleShape>,
         module_index: Option<&PrecompileModuleIndex>,
         counter_dump_path: Option<&'a Path>,
     ) -> Result<Self, String> {

@@ -5,7 +5,7 @@ use crate::evidence_v3::{
     planner_facts_from_profile_evidence_v3,
 };
 use crate::passes::{
-    CodegenModuleShape, InlineUnsupportedReason, InstrCodegen, bind_simple_direct_call_inline_args,
+    BlockPyModuleShape, InlineUnsupportedReason, InstrBlockPy, bind_simple_direct_call_inline_args,
     build_direct_call_inline_fragment_to_target, try_allocate_codegen_stack_temp,
 };
 use crate::plan::{FunctionProfileEvidence, ProfileEvidenceStore};
@@ -62,20 +62,20 @@ pub struct DirectCallTargetIndex {
 #[derive(Clone, Debug)]
 struct DirectCallTargetEntry {
     module: ModuleContentId,
-    function: BlockPyFunction<CodegenModuleShape>,
+    function: BlockPyFunction<BlockPyModuleShape>,
 }
 
 #[derive(Clone, Debug)]
 pub struct ModuleOptimizationInput<'a> {
     pub identity: ModulePlanIdentity,
-    pub module: &'a BlockPyModule<CodegenModuleShape>,
+    pub module: &'a BlockPyModule<BlockPyModuleShape>,
     pub strict: bool,
 }
 
 impl<'a> ModuleOptimizationInput<'a> {
     pub fn new(
         identity: ModulePlanIdentity,
-        module: &'a BlockPyModule<CodegenModuleShape>,
+        module: &'a BlockPyModule<BlockPyModuleShape>,
         strict: bool,
     ) -> Self {
         Self {
@@ -101,7 +101,7 @@ pub struct OptimizeModulesV3Output {
 impl DirectCallTargetIndex {
     fn from_current_module(
         identity: &ModulePlanIdentity,
-        module: &BlockPyModule<CodegenModuleShape>,
+        module: &BlockPyModule<BlockPyModuleShape>,
     ) -> Self {
         let mut index = Self::default();
         index.insert_module(identity, module);
@@ -119,7 +119,7 @@ impl DirectCallTargetIndex {
     fn insert_module(
         &mut self,
         identity: &ModulePlanIdentity,
-        module: &BlockPyModule<CodegenModuleShape>,
+        module: &BlockPyModule<BlockPyModuleShape>,
     ) {
         let content_id = ModuleContentId::new(identity.module_name.clone(), identity.source_hash);
         for function in &module.callable_defs {
@@ -219,7 +219,7 @@ pub fn plan_and_emit_function_exact_int_branches_v3(
     catalog: &AlternativeCatalog,
     module: ModulePlanIdentity,
     function: FunctionPlanIdentity,
-    lowered_function: &BlockPyFunction<CodegenModuleShape>,
+    lowered_function: &BlockPyFunction<BlockPyModuleShape>,
     evidence: &FunctionProfileEvidence,
     hints_by_region: &HashMap<RegionId, PlannerFactHints>,
 ) -> Result<ExactIntBranchV3Artifacts, ExactIntBranchV3Error> {
@@ -238,7 +238,7 @@ pub fn plan_and_emit_function_exact_int_branches_v3_with_module_constants(
     catalog: &AlternativeCatalog,
     module: ModulePlanIdentity,
     function: FunctionPlanIdentity,
-    lowered_function: &BlockPyFunction<CodegenModuleShape>,
+    lowered_function: &BlockPyFunction<BlockPyModuleShape>,
     evidence: &FunctionProfileEvidence,
     module_constants: &[ConstantExpr],
 ) -> Result<ExactIntBranchV3Artifacts, ExactIntBranchV3Error> {
@@ -266,7 +266,7 @@ pub fn plan_and_emit_function_exact_int_branches_v3_with_module_constants(
 pub fn plan_and_emit_module_v3_from_raw_evidence(
     catalog: &AlternativeCatalog,
     module_identity: ModulePlanIdentity,
-    lowered_module: &BlockPyModule<CodegenModuleShape>,
+    lowered_module: &BlockPyModule<BlockPyModuleShape>,
     evidence_store: &ProfileEvidenceStore,
 ) -> Result<ExactIntBranchV3Artifacts, ExactIntBranchV3Error> {
     let target_index = DirectCallTargetIndex::from_current_module(&module_identity, lowered_module);
@@ -282,7 +282,7 @@ pub fn plan_and_emit_module_v3_from_raw_evidence(
 fn plan_and_emit_module_v3_from_raw_evidence_with_target_index(
     catalog: &AlternativeCatalog,
     module_identity: &ModulePlanIdentity,
-    lowered_module: &BlockPyModule<CodegenModuleShape>,
+    lowered_module: &BlockPyModule<BlockPyModuleShape>,
     evidence_store: &ProfileEvidenceStore,
     target_index: &DirectCallTargetIndex,
 ) -> Result<ExactIntBranchV3Artifacts, ExactIntBranchV3Error> {
@@ -418,7 +418,7 @@ pub fn plan_and_emit_extracted_exact_int_branches_v3(
 
 fn validate_module_plan_v3_against_lowered_module(
     plan: &ModuleOptimizationPlanV3,
-    lowered_module: &BlockPyModule<CodegenModuleShape>,
+    lowered_module: &BlockPyModule<BlockPyModuleShape>,
 ) -> Result<(), MechanicalEmitError> {
     for planned_function in &plan.functions {
         let local_function_id = planned_function.function.function.local_function_id();
@@ -447,8 +447,8 @@ fn validate_module_plan_v3_against_lowered_module(
 fn validate_function_plan_v3_against_lowered_function(
     plan: &ModuleOptimizationPlanV3,
     planned_function: &FunctionOptimizationPlanV3,
-    lowered_module: &BlockPyModule<CodegenModuleShape>,
-    lowered_function: &BlockPyFunction<CodegenModuleShape>,
+    lowered_module: &BlockPyModule<BlockPyModuleShape>,
+    lowered_function: &BlockPyFunction<BlockPyModuleShape>,
 ) -> Result<(), MechanicalEmitError> {
     if !planned_function.direct_calls.is_empty() {
         let lowered_calls = lowered_calls_by_instr_v3(lowered_module, lowered_function)?;
@@ -513,28 +513,28 @@ struct LoweredCallAccessV3 {
 }
 
 fn lowered_calls_by_instr_v3(
-    module: &BlockPyModule<CodegenModuleShape>,
-    function: &BlockPyFunction<CodegenModuleShape>,
+    module: &BlockPyModule<BlockPyModuleShape>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
 ) -> Result<HashMap<InstrId, LoweredCallAccessV3>, MechanicalEmitError> {
     struct Collector<'a> {
-        module: &'a BlockPyModule<CodegenModuleShape>,
+        module: &'a BlockPyModule<BlockPyModuleShape>,
         calls: HashMap<InstrId, LoweredCallAccessV3>,
         error: Option<MechanicalEmitError>,
     }
 
-    impl Visit<InstrCodegen> for Collector<'_> {
-        fn visit_instr(&mut self, expr: &InstrCodegen)
+    impl Visit<InstrBlockPy> for Collector<'_> {
+        fn visit_instr(&mut self, expr: &InstrBlockPy)
         where
-            InstrCodegen: ChildVisitable<InstrCodegen>,
+            InstrBlockPy: ChildVisitable<InstrBlockPy>,
         {
             if self.error.is_some() {
                 return;
             }
-            if let InstrCodegen::Call(call) = expr
+            if let InstrBlockPy::Call(call) = expr
                 && let Some(source) = call.try_semantic_instr_id()
             {
                 let method_name = match call.func.as_ref() {
-                    InstrCodegen::GetAttr(getattr) => {
+                    InstrBlockPy::GetAttr(getattr) => {
                         let Some(method_name) =
                             codegen_constant_string_value_v3(self.module, getattr.attr.as_ref())
                         else {
@@ -569,7 +569,7 @@ fn lowered_calls_by_instr_v3(
 fn validate_direct_call_plan_against_lowered_function(
     plan: &DirectCallSpecializationPlan,
     planned_function: &FunctionOptimizationPlanV3,
-    lowered_function: &BlockPyFunction<CodegenModuleShape>,
+    lowered_function: &BlockPyFunction<BlockPyModuleShape>,
     lowered_calls: &HashMap<InstrId, LoweredCallAccessV3>,
 ) -> Result<(), MechanicalEmitError> {
     if !lowered_calls.contains_key(&plan.source) {
@@ -588,17 +588,17 @@ struct LoweredFieldAccessV3 {
 }
 
 fn lowered_field_accesses_by_instr_v3(
-    module: &BlockPyModule<CodegenModuleShape>,
-    function: &BlockPyFunction<CodegenModuleShape>,
+    module: &BlockPyModule<BlockPyModuleShape>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
 ) -> Result<HashMap<InstrId, LoweredFieldAccessV3>, MechanicalEmitError> {
     struct Collector<'a> {
-        module: &'a BlockPyModule<CodegenModuleShape>,
+        module: &'a BlockPyModule<BlockPyModuleShape>,
         accesses: HashMap<InstrId, LoweredFieldAccessV3>,
         error: Option<MechanicalEmitError>,
     }
 
     impl Collector<'_> {
-        fn attr_name_for_source(&mut self, source: InstrId, attr: &InstrCodegen) -> Option<String> {
+        fn attr_name_for_source(&mut self, source: InstrId, attr: &InstrBlockPy) -> Option<String> {
             match codegen_constant_string_value_v3(self.module, attr) {
                 Some(attr_name) => Some(attr_name.to_string()),
                 None => {
@@ -611,16 +611,16 @@ fn lowered_field_accesses_by_instr_v3(
         }
     }
 
-    impl Visit<InstrCodegen> for Collector<'_> {
-        fn visit_instr(&mut self, expr: &InstrCodegen)
+    impl Visit<InstrBlockPy> for Collector<'_> {
+        fn visit_instr(&mut self, expr: &InstrBlockPy)
         where
-            InstrCodegen: ChildVisitable<InstrCodegen>,
+            InstrBlockPy: ChildVisitable<InstrBlockPy>,
         {
             if self.error.is_some() {
                 return;
             }
             match expr {
-                InstrCodegen::GetAttr(op) => {
+                InstrBlockPy::GetAttr(op) => {
                     let source = op.semantic_instr_id();
                     if let Some(attr_name) = self.attr_name_for_source(source, op.attr.as_ref()) {
                         self.accesses.insert(
@@ -632,7 +632,7 @@ fn lowered_field_accesses_by_instr_v3(
                         );
                     }
                 }
-                InstrCodegen::SetAttr(op) => {
+                InstrBlockPy::SetAttr(op) => {
                     let source = op.semantic_instr_id();
                     if let Some(attr_name) = self.attr_name_for_source(source, op.attr.as_ref()) {
                         self.accesses.insert(
@@ -665,7 +665,7 @@ fn lowered_field_accesses_by_instr_v3(
 fn validate_indexed_field_plan_against_lowered_function(
     plan: &IndexedFieldSpecializationPlan,
     planned_function: &FunctionOptimizationPlanV3,
-    lowered_function: &BlockPyFunction<CodegenModuleShape>,
+    lowered_function: &BlockPyFunction<BlockPyModuleShape>,
     lowered_accesses: &HashMap<InstrId, LoweredFieldAccessV3>,
 ) -> Result<(), MechanicalEmitError> {
     let Some(lowered) = lowered_accesses.get(&plan.source) else {
@@ -699,19 +699,19 @@ struct LoweredItemAccessV3 {
 }
 
 fn lowered_item_accesses_by_instr_v3(
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
 ) -> HashMap<InstrId, LoweredItemAccessV3> {
     struct Collector {
         accesses: HashMap<InstrId, LoweredItemAccessV3>,
     }
 
-    impl Visit<InstrCodegen> for Collector {
-        fn visit_instr(&mut self, expr: &InstrCodegen)
+    impl Visit<InstrBlockPy> for Collector {
+        fn visit_instr(&mut self, expr: &InstrBlockPy)
         where
-            InstrCodegen: ChildVisitable<InstrCodegen>,
+            InstrBlockPy: ChildVisitable<InstrBlockPy>,
         {
             match expr {
-                InstrCodegen::GetItem(op) => {
+                InstrBlockPy::GetItem(op) => {
                     self.accesses.insert(
                         op.semantic_instr_id(),
                         LoweredItemAccessV3 {
@@ -719,7 +719,7 @@ fn lowered_item_accesses_by_instr_v3(
                         },
                     );
                 }
-                InstrCodegen::SetItem(op) => {
+                InstrBlockPy::SetItem(op) => {
                     self.accesses.insert(
                         op.semantic_instr_id(),
                         LoweredItemAccessV3 {
@@ -743,7 +743,7 @@ fn lowered_item_accesses_by_instr_v3(
 fn validate_exact_list_item_plan_against_lowered_function(
     plan: &ExactListItemSpecializationPlan,
     planned_function: &FunctionOptimizationPlanV3,
-    lowered_function: &BlockPyFunction<CodegenModuleShape>,
+    lowered_function: &BlockPyFunction<BlockPyModuleShape>,
     lowered_accesses: &HashMap<InstrId, LoweredItemAccessV3>,
 ) -> Result<(), MechanicalEmitError> {
     let Some(lowered) = lowered_accesses.get(&plan.source) else {
@@ -779,19 +779,19 @@ struct LoweredGlobalAccessV3 {
 }
 
 fn lowered_global_accesses_by_instr_v3(
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
 ) -> HashMap<InstrId, LoweredGlobalAccessV3> {
     struct Collector {
         accesses: HashMap<InstrId, LoweredGlobalAccessV3>,
     }
 
-    impl Visit<InstrCodegen> for Collector {
-        fn visit_instr(&mut self, expr: &InstrCodegen)
+    impl Visit<InstrBlockPy> for Collector {
+        fn visit_instr(&mut self, expr: &InstrBlockPy)
         where
-            InstrCodegen: ChildVisitable<InstrCodegen>,
+            InstrBlockPy: ChildVisitable<InstrBlockPy>,
         {
             match expr {
-                InstrCodegen::Load(op) => {
+                InstrBlockPy::Load(op) => {
                     if let NameLocation::Global(slot) = op.name.location {
                         let Some(source) = op.try_semantic_instr_id() else {
                             expr.visit_children(self);
@@ -807,7 +807,7 @@ fn lowered_global_accesses_by_instr_v3(
                         );
                     }
                 }
-                InstrCodegen::Store(op) => {
+                InstrBlockPy::Store(op) => {
                     if let NameLocation::Global(slot) = op.name.location {
                         let Some(source) = op.try_semantic_instr_id() else {
                             expr.visit_children(self);
@@ -839,7 +839,7 @@ fn lowered_global_accesses_by_instr_v3(
 fn validate_indexed_global_plan_against_lowered_function(
     plan: &IndexedGlobalSpecializationPlan,
     planned_function: &FunctionOptimizationPlanV3,
-    lowered_function: &BlockPyFunction<CodegenModuleShape>,
+    lowered_function: &BlockPyFunction<BlockPyModuleShape>,
     lowered_accesses: &HashMap<InstrId, LoweredGlobalAccessV3>,
 ) -> Result<(), MechanicalEmitError> {
     let Some(lowered) = lowered_accesses.get(&plan.source) else {
@@ -875,7 +875,7 @@ fn validate_indexed_global_plan_against_lowered_function(
 }
 
 fn function_plan_identity_v3(
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
 ) -> FunctionPlanIdentity {
     FunctionPlanIdentity {
         function: SerializedFunctionId::new(
@@ -887,7 +887,7 @@ fn function_plan_identity_v3(
 }
 
 fn exact_list_item_requests_from_profile_evidence_v3(
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
     evidence: &FunctionProfileEvidence,
 ) -> (Vec<ExactListItemPlanRequest>, Vec<PlanDiagnostic>) {
     struct Collector<'a> {
@@ -931,13 +931,13 @@ fn exact_list_item_requests_from_profile_evidence_v3(
         }
     }
 
-    impl Visit<InstrCodegen> for Collector<'_> {
-        fn visit_instr(&mut self, expr: &InstrCodegen)
+    impl Visit<InstrBlockPy> for Collector<'_> {
+        fn visit_instr(&mut self, expr: &InstrBlockPy)
         where
-            InstrCodegen: ChildVisitable<InstrCodegen>,
+            InstrBlockPy: ChildVisitable<InstrBlockPy>,
         {
             match expr {
-                InstrCodegen::GetItem(op) => {
+                InstrBlockPy::GetItem(op) => {
                     self.collect_item(
                         op.semantic_instr_id(),
                         ExactListItemAccessKind::Get,
@@ -945,7 +945,7 @@ fn exact_list_item_requests_from_profile_evidence_v3(
                         "getitem_hot_shapes",
                     );
                 }
-                InstrCodegen::SetItem(op) => {
+                InstrBlockPy::SetItem(op) => {
                     self.collect_item(
                         op.semantic_instr_id(),
                         ExactListItemAccessKind::Set,
@@ -970,7 +970,7 @@ fn exact_list_item_requests_from_profile_evidence_v3(
 
 fn indexed_global_requests_from_module_key_evidence_v3(
     module_name: &str,
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
     evidence_store: &ProfileEvidenceStore,
 ) -> Vec<IndexedGlobalPlanRequest> {
     struct Collector<'a> {
@@ -1011,20 +1011,20 @@ fn indexed_global_requests_from_module_key_evidence_v3(
         }
     }
 
-    impl Visit<InstrCodegen> for Collector<'_> {
-        fn visit_instr(&mut self, expr: &InstrCodegen)
+    impl Visit<InstrBlockPy> for Collector<'_> {
+        fn visit_instr(&mut self, expr: &InstrBlockPy)
         where
-            InstrCodegen: ChildVisitable<InstrCodegen>,
+            InstrBlockPy: ChildVisitable<InstrBlockPy>,
         {
             match expr {
-                InstrCodegen::Load(op) => {
+                InstrBlockPy::Load(op) => {
                     let Some(source) = op.try_semantic_instr_id() else {
                         expr.visit_children(self);
                         return;
                     };
                     self.collect_name(source, IndexedGlobalAccessKind::Load, &op.name);
                 }
-                InstrCodegen::Store(op) => {
+                InstrBlockPy::Store(op) => {
                     let Some(source) = op.try_semantic_instr_id() else {
                         expr.visit_children(self);
                         return;
@@ -1047,12 +1047,12 @@ fn indexed_global_requests_from_module_key_evidence_v3(
 }
 
 fn indexed_field_requests_from_type_key_evidence_v3(
-    function: &BlockPyFunction<CodegenModuleShape>,
-    lowered_module: &BlockPyModule<CodegenModuleShape>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
+    lowered_module: &BlockPyModule<BlockPyModuleShape>,
     evidence_store: &ProfileEvidenceStore,
 ) -> Vec<IndexedFieldPlanRequest> {
     struct Collector<'a> {
-        lowered_module: &'a BlockPyModule<CodegenModuleShape>,
+        lowered_module: &'a BlockPyModule<BlockPyModuleShape>,
         evidence_store: &'a ProfileEvidenceStore,
         requests: Vec<IndexedFieldPlanRequest>,
     }
@@ -1062,7 +1062,7 @@ fn indexed_field_requests_from_type_key_evidence_v3(
             &mut self,
             source: InstrId,
             access: IndexedFieldAccessKind,
-            attr_expr: &InstrCodegen,
+            attr_expr: &InstrBlockPy,
         ) {
             let Some(attr_name) = codegen_constant_string_value_v3(self.lowered_module, attr_expr)
             else {
@@ -1090,20 +1090,20 @@ fn indexed_field_requests_from_type_key_evidence_v3(
         }
     }
 
-    impl Visit<InstrCodegen> for Collector<'_> {
-        fn visit_instr(&mut self, expr: &InstrCodegen)
+    impl Visit<InstrBlockPy> for Collector<'_> {
+        fn visit_instr(&mut self, expr: &InstrBlockPy)
         where
-            InstrCodegen: ChildVisitable<InstrCodegen>,
+            InstrBlockPy: ChildVisitable<InstrBlockPy>,
         {
             match expr {
-                InstrCodegen::GetAttr(op) => {
+                InstrBlockPy::GetAttr(op) => {
                     self.collect_attr(
                         op.semantic_instr_id(),
                         IndexedFieldAccessKind::Load,
                         op.attr.as_ref(),
                     );
                 }
-                InstrCodegen::SetAttr(op) => {
+                InstrBlockPy::SetAttr(op) => {
                     self.collect_attr(
                         op.semantic_instr_id(),
                         IndexedFieldAccessKind::Store,
@@ -1126,10 +1126,10 @@ fn indexed_field_requests_from_type_key_evidence_v3(
 }
 
 fn codegen_constant_string_value_v3<'a>(
-    module: &'a BlockPyModule<CodegenModuleShape>,
-    expr: &InstrCodegen,
+    module: &'a BlockPyModule<BlockPyModuleShape>,
+    expr: &InstrBlockPy,
 ) -> Option<&'a str> {
-    let InstrCodegen::Load(load) = expr else {
+    let InstrBlockPy::Load(load) = expr else {
         return None;
     };
     let NameLocation::Constant(constant_index) = load.name.location else {
@@ -1139,7 +1139,7 @@ fn codegen_constant_string_value_v3<'a>(
 }
 
 fn module_constant_string_value_v3(
-    module: &BlockPyModule<CodegenModuleShape>,
+    module: &BlockPyModule<BlockPyModuleShape>,
     constant_index: u32,
 ) -> Option<&str> {
     let ConstantExpr::Literal(literal) = module.module_constants.get(constant_index as usize)?
@@ -1153,9 +1153,9 @@ fn module_constant_string_value_v3(
 }
 
 fn direct_call_requests_from_evidence_v3(
-    lowered_module: &BlockPyModule<CodegenModuleShape>,
+    lowered_module: &BlockPyModule<BlockPyModuleShape>,
     module_identity: &ModulePlanIdentity,
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
     evidence_store: &ProfileEvidenceStore,
     target_index: &DirectCallTargetIndex,
     identity_builder: &mut OptimizationPlanV3IdentityBuilder,
@@ -1298,27 +1298,27 @@ fn direct_call_requests_from_evidence_v3(
 }
 
 fn method_call_name_for_instr_id_v3(
-    module: &BlockPyModule<CodegenModuleShape>,
-    function: &BlockPyFunction<CodegenModuleShape>,
+    module: &BlockPyModule<BlockPyModuleShape>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
     source: InstrId,
 ) -> Option<Option<String>> {
     struct Finder<'a> {
-        module: &'a BlockPyModule<CodegenModuleShape>,
+        module: &'a BlockPyModule<BlockPyModuleShape>,
         source: InstrId,
         result: Option<Option<String>>,
     }
 
-    impl Visit<InstrCodegen> for Finder<'_> {
-        fn visit_instr(&mut self, expr: &InstrCodegen)
+    impl Visit<InstrBlockPy> for Finder<'_> {
+        fn visit_instr(&mut self, expr: &InstrBlockPy)
         where
-            InstrCodegen: ChildVisitable<InstrCodegen>,
+            InstrBlockPy: ChildVisitable<InstrBlockPy>,
         {
             if self.result.is_some() {
                 return;
             }
-            if let InstrCodegen::Call(call) = expr
+            if let InstrBlockPy::Call(call) = expr
                 && call.try_semantic_instr_id() == Some(self.source)
-                && let InstrCodegen::GetAttr(getattr) = call.func.as_ref()
+                && let InstrBlockPy::GetAttr(getattr) = call.func.as_ref()
             {
                 self.result = Some(
                     codegen_constant_string_value_v3(self.module, getattr.attr.as_ref())
@@ -1340,27 +1340,27 @@ fn method_call_name_for_instr_id_v3(
 }
 
 fn direct_call_arg_plan_for_instr_id_v3(
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
     source: InstrId,
-    target_function: &BlockPyFunction<CodegenModuleShape>,
+    target_function: &BlockPyFunction<BlockPyModuleShape>,
     implicit_positional_arg_count: usize,
 ) -> Option<std::result::Result<DirectCallArgPlan, String>> {
     struct Finder<'a> {
         source: InstrId,
-        target_function: &'a BlockPyFunction<CodegenModuleShape>,
+        target_function: &'a BlockPyFunction<BlockPyModuleShape>,
         implicit_positional_arg_count: usize,
         result: Option<std::result::Result<DirectCallArgPlan, String>>,
     }
 
-    impl Visit<InstrCodegen> for Finder<'_> {
-        fn visit_instr(&mut self, expr: &InstrCodegen)
+    impl Visit<InstrBlockPy> for Finder<'_> {
+        fn visit_instr(&mut self, expr: &InstrBlockPy)
         where
-            InstrCodegen: ChildVisitable<InstrCodegen>,
+            InstrBlockPy: ChildVisitable<InstrBlockPy>,
         {
             if self.result.is_some() {
                 return;
             }
-            if let InstrCodegen::Call(call) = expr
+            if let InstrBlockPy::Call(call) = expr
                 && call.try_semantic_instr_id() == Some(self.source)
             {
                 self.result = Some(direct_call_arg_plan_from_call_v3(
@@ -1385,9 +1385,9 @@ fn direct_call_arg_plan_for_instr_id_v3(
 }
 
 fn direct_call_inline_candidate_v3(
-    module: &BlockPyModule<CodegenModuleShape>,
+    module: &BlockPyModule<BlockPyModuleShape>,
     current_module: &ModuleContentId,
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
     source: InstrId,
     target: &DirectCallTargetEntry,
 ) -> bool {
@@ -1423,21 +1423,21 @@ enum InlineCallReturnTargetV3 {
 }
 
 fn inline_call_and_return_target_for_instr_id_v3(
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
     source: InstrId,
-) -> Option<(InlineCallReturnTargetV3, &Call<InstrCodegen>)> {
+) -> Option<(InlineCallReturnTargetV3, &Call<InstrBlockPy>)> {
     for block in &function.blocks {
         for instr in &block.body {
             match instr {
-                InstrCodegen::Store(store) => {
-                    let InstrCodegen::Call(call) = store.value.as_ref() else {
+                InstrBlockPy::Store(store) => {
+                    let InstrBlockPy::Call(call) = store.value.as_ref() else {
                         continue;
                     };
                     if call.try_semantic_instr_id() == Some(source) {
                         return Some((InlineCallReturnTargetV3::StoreTo(store.name.clone()), call));
                     }
                 }
-                InstrCodegen::Call(call) if call.try_semantic_instr_id() == Some(source) => {
+                InstrBlockPy::Call(call) if call.try_semantic_instr_id() == Some(source) => {
                     return Some((InlineCallReturnTargetV3::Discard, call));
                 }
                 _ => {}
@@ -1448,11 +1448,11 @@ fn inline_call_and_return_target_for_instr_id_v3(
 }
 
 fn direct_call_inline_body_buildable_v3(
-    _module: &BlockPyModule<CodegenModuleShape>,
+    _module: &BlockPyModule<BlockPyModuleShape>,
     current_module: &ModuleContentId,
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
     return_target: InlineCallReturnTargetV3,
-    call: &Call<InstrCodegen>,
+    call: &Call<InstrBlockPy>,
     target: &DirectCallTargetEntry,
 ) -> Result<(), InlineUnsupportedReason> {
     let mut caller = function.clone();
@@ -1488,8 +1488,8 @@ fn direct_call_inline_body_buildable_v3(
 }
 
 fn call_inline_signature_candidate_v3(
-    call: &Call<InstrCodegen>,
-    target_function: &BlockPyFunction<CodegenModuleShape>,
+    call: &Call<InstrBlockPy>,
+    target_function: &BlockPyFunction<BlockPyModuleShape>,
     implicit_positional_arg_count: usize,
 ) -> bool {
     if !call.keywords.is_empty()
@@ -1547,8 +1547,8 @@ fn call_inline_signature_candidate_v3(
 }
 
 fn direct_call_arg_plan_from_call_v3(
-    call: &Call<InstrCodegen>,
-    target_function: &BlockPyFunction<CodegenModuleShape>,
+    call: &Call<InstrBlockPy>,
+    target_function: &BlockPyFunction<BlockPyModuleShape>,
     implicit_positional_arg_count: usize,
 ) -> std::result::Result<DirectCallArgPlan, String> {
     if call
@@ -1658,7 +1658,7 @@ pub fn optimize_modules_v3_from_raw_evidence<'a>(
 pub fn optimize_module_v3_from_raw_evidence(
     evidence_store: &ProfileEvidenceStore,
     module_identity: ModulePlanIdentity,
-    module: &BlockPyModule<CodegenModuleShape>,
+    module: &BlockPyModule<BlockPyModuleShape>,
     strict: bool,
 ) -> Result<Option<PlannedModuleV3>> {
     let target_index = DirectCallTargetIndex::from_current_module(&module_identity, module);
@@ -1674,7 +1674,7 @@ pub fn optimize_module_v3_from_raw_evidence(
 fn optimize_module_v3_from_raw_evidence_with_target_index(
     evidence_store: &ProfileEvidenceStore,
     module_identity: &ModulePlanIdentity,
-    module: &BlockPyModule<CodegenModuleShape>,
+    module: &BlockPyModule<BlockPyModuleShape>,
     strict: bool,
     target_index: &DirectCallTargetIndex,
 ) -> Result<Option<PlannedModuleV3>> {
@@ -1732,7 +1732,7 @@ mod tests {
         CounterDumpKeyLayout, CounterDumpRecord, CounterDumpRow, CounterDumpTypeKey,
         CounterDumpTypeKeyLayout, CounterDumpTypeTableEntry,
     };
-    use soac_ir_blockpy::InstrCodegen;
+    use soac_ir_blockpy::InstrBlockPy;
     use soac_ir_typed::plan_v3::{CallBodyKind, RegionId, validate_module_plan_v3};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1745,7 +1745,7 @@ mod tests {
         InstrId::new(index)
     }
 
-    fn with_instr_id(instr: InstrCodegen, index: u32) -> InstrCodegen {
+    fn with_instr_id(instr: InstrBlockPy, index: u32) -> InstrBlockPy {
         instr.with_meta(Meta {
             instr_id: Some(instr_id(index)),
             ..Meta::synthetic()
@@ -1759,12 +1759,12 @@ mod tests {
         }
     }
 
-    fn local(name: &str, slot: u32) -> InstrCodegen {
-        InstrCodegen::Load(Load::new(local_name(name, slot)))
+    fn local(name: &str, slot: u32) -> InstrBlockPy {
+        InstrBlockPy::Load(Load::new(local_name(name, slot)))
     }
 
-    fn constant_name(index: u32) -> InstrCodegen {
-        InstrCodegen::Load(Load::new(ResolvedName {
+    fn constant_name(index: u32) -> InstrBlockPy {
+        InstrBlockPy::Load(Load::new(ResolvedName {
             id: BlockPyName::new(format!("<const {index}>")),
             location: NameLocation::Constant(index),
         }))
@@ -1777,11 +1777,11 @@ mod tests {
         }
     }
 
-    fn binary(op: BinOpKind, left: InstrCodegen, right: InstrCodegen, id: u32) -> InstrCodegen {
-        with_instr_id(InstrCodegen::BinOp(BinOp::new(op, left, right)), id)
+    fn binary(op: BinOpKind, left: InstrBlockPy, right: InstrBlockPy, id: u32) -> InstrBlockPy {
+        with_instr_id(InstrBlockPy::BinOp(BinOp::new(op, left, right)), id)
     }
 
-    fn branch_block() -> Block<InstrCodegen> {
+    fn branch_block() -> Block<InstrBlockPy> {
         let add = binary(
             BinOpKind::Add,
             with_instr_id(local("a", 0), 0),
@@ -1821,8 +1821,8 @@ mod tests {
     }
 
     fn function_with_blocks(
-        blocks: Vec<Block<InstrCodegen>>,
-    ) -> BlockPyFunction<CodegenModuleShape> {
+        blocks: Vec<Block<InstrBlockPy>>,
+    ) -> BlockPyFunction<BlockPyModuleShape> {
         let name_gen = ModuleNameGen::new(0).next_function_name_gen();
         function_with_name_gen(name_gen, "f", "f", blocks)
     }
@@ -1831,8 +1831,8 @@ mod tests {
         name_gen: soac_core::block_py::FunctionNameGen,
         fn_name: &str,
         qualname: &str,
-        blocks: Vec<Block<InstrCodegen>>,
-    ) -> BlockPyFunction<CodegenModuleShape> {
+        blocks: Vec<Block<InstrBlockPy>>,
+    ) -> BlockPyFunction<BlockPyModuleShape> {
         BlockPyFunction {
             function_id: name_gen.function_id(),
             name_gen,
@@ -1849,7 +1849,7 @@ mod tests {
 
     fn module_with_constants(
         module_constants: Vec<ConstantExpr>,
-    ) -> BlockPyModule<CodegenModuleShape> {
+    ) -> BlockPyModule<BlockPyModuleShape> {
         BlockPyModule {
             module_name_gen: ModuleNameGen::new(0),
             global_names: Vec::new(),
@@ -1859,7 +1859,7 @@ mod tests {
         }
     }
 
-    fn set_stack_slots(function: &mut BlockPyFunction<CodegenModuleShape>, names: &[&str]) {
+    fn set_stack_slots(function: &mut BlockPyFunction<BlockPyModuleShape>, names: &[&str]) {
         function
             .storage_layout
             .get_or_insert_with(StorageLayout::default)
@@ -1874,7 +1874,7 @@ mod tests {
         }
     }
 
-    fn simple_arg_return_callee(params: &[(&str, bool)]) -> BlockPyFunction<CodegenModuleShape> {
+    fn simple_arg_return_callee(params: &[(&str, bool)]) -> BlockPyFunction<BlockPyModuleShape> {
         let mut function = function_with_blocks(vec![Block::new(
             label(0),
             Vec::new(),
@@ -1893,7 +1893,7 @@ mod tests {
 
     fn direct_call_target_entry(
         module: ModuleContentId,
-        function: BlockPyFunction<CodegenModuleShape>,
+        function: BlockPyFunction<BlockPyModuleShape>,
     ) -> DirectCallTargetEntry {
         DirectCallTargetEntry { module, function }
     }
@@ -2004,7 +2004,7 @@ mod tests {
         let source = instr_id(9);
         let current_module = ModuleContentId::new("pkg.mod", 0x99);
         let call = with_instr_id(
-            InstrCodegen::Call(Call::new(
+            InstrBlockPy::Call(Call::new(
                 local("callee", 0),
                 vec![CallArgPositional::Positional(local("x", 1))],
                 Vec::new(),
@@ -2013,7 +2013,7 @@ mod tests {
         );
         let mut caller = function_with_blocks(vec![Block::new(
             label(0),
-            vec![InstrCodegen::Store(Store::new(
+            vec![InstrBlockPy::Store(Store::new(
                 local_name("result", 2),
                 call,
             ))],
@@ -2042,7 +2042,7 @@ mod tests {
         let mut effect_only_caller = function_with_blocks(vec![Block::new(
             label(0),
             vec![with_instr_id(
-                InstrCodegen::Call(Call::new(
+                InstrBlockPy::Call(Call::new(
                     local("callee", 0),
                     vec![CallArgPositional::Positional(local("x", 1))],
                     Vec::new(),
@@ -2089,7 +2089,7 @@ mod tests {
         let module_name_gen = ModuleNameGen::new(0);
         let source = instr_id(9);
         let call = with_instr_id(
-            InstrCodegen::Call(Call::new(
+            InstrBlockPy::Call(Call::new(
                 local("Record", 0),
                 vec![CallArgPositional::Positional(local("value", 1))],
                 Vec::new(),
@@ -2102,7 +2102,7 @@ mod tests {
             "caller",
             vec![Block::new(
                 label(0),
-                vec![InstrCodegen::Store(Store::new(
+                vec![InstrBlockPy::Store(Store::new(
                     local_name("result", 2),
                     call,
                 ))],
@@ -2185,8 +2185,8 @@ mod tests {
         let module_name_gen = ModuleNameGen::new(0);
         let source = instr_id(9);
         let call = with_instr_id(
-            InstrCodegen::Call(Call::new(
-                InstrCodegen::GetAttr(GetAttr::new(local("record", 0), constant_name(0))),
+            InstrBlockPy::Call(Call::new(
+                InstrBlockPy::GetAttr(GetAttr::new(local("record", 0), constant_name(0))),
                 Vec::new(),
                 Vec::new(),
             )),
@@ -2198,7 +2198,7 @@ mod tests {
             "caller",
             vec![Block::new(
                 label(0),
-                vec![InstrCodegen::Store(Store::new(
+                vec![InstrBlockPy::Store(Store::new(
                     local_name("result", 1),
                     call,
                 ))],
@@ -2295,12 +2295,12 @@ mod tests {
         let block = Block::new(
             label(0),
             vec![
-                InstrCodegen::GetItem(GetItem::new(local("items", 0), local("index", 1)))
+                InstrBlockPy::GetItem(GetItem::new(local("items", 0), local("index", 1)))
                     .with_meta(Meta {
                         instr_id: Some(get_source),
                         ..Meta::synthetic()
                     }),
-                InstrCodegen::SetItem(SetItem::new(
+                InstrBlockPy::SetItem(SetItem::new(
                     local("items", 0),
                     local("index", 1),
                     local("value", 2),
@@ -2344,12 +2344,12 @@ mod tests {
         let block = Block::new(
             label(0),
             vec![
-                InstrCodegen::GetAttr(GetAttr::new(local("record", 0), attr_name.clone()))
+                InstrBlockPy::GetAttr(GetAttr::new(local("record", 0), attr_name.clone()))
                     .with_meta(Meta {
                         instr_id: Some(get_source),
                         ..Meta::synthetic()
                     }),
-                InstrCodegen::SetAttr(SetAttr::new(
+                InstrBlockPy::SetAttr(SetAttr::new(
                     local("record", 0),
                     attr_name,
                     local("value", 1),
@@ -2421,16 +2421,16 @@ mod tests {
         let block = Block::new(
             label(0),
             vec![
-                InstrCodegen::Load(Load::new(global_name("counter", 1))).with_meta(Meta {
+                InstrBlockPy::Load(Load::new(global_name("counter", 1))).with_meta(Meta {
                     instr_id: Some(load_source),
                     ..Meta::synthetic()
                 }),
-                InstrCodegen::Store(Store::new(global_name("counter", 1), local("value", 0)))
+                InstrBlockPy::Store(Store::new(global_name("counter", 1), local("value", 0)))
                     .with_meta(Meta {
                         instr_id: Some(store_source),
                         ..Meta::synthetic()
                     }),
-                InstrCodegen::Load(Load::new(global_name("other", 2))).with_meta(Meta {
+                InstrBlockPy::Load(Load::new(global_name("other", 2))).with_meta(Meta {
                     instr_id: Some(InstrId::new(11)),
                     ..Meta::synthetic()
                 }),

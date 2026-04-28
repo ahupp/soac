@@ -1,7 +1,7 @@
 use soac_core::block_py::RuntimeFunctionId;
 use soac_inspector::{
-    JitClifRenderOptions, lower_source_to_codegen_module,
-    lower_source_to_codegen_module_with_module_id, profile_module_identity_from_env,
+    JitClifRenderOptions, lower_source_to_blockpy_module,
+    lower_source_to_blockpy_module_with_module_id, profile_module_identity_from_env,
     render_instr_typed_for_module_with_options,
 };
 use std::fs;
@@ -109,9 +109,9 @@ fn main() -> Result<(), String> {
         })
         .unwrap_or(args.function_id);
     let module = if let Some(module_id) = profile_module_id {
-        lower_source_to_codegen_module_with_module_id(&source, module_id)?
+        lower_source_to_blockpy_module_with_module_id(&source, module_id)?
     } else {
-        lower_source_to_codegen_module(&source)?
+        lower_source_to_blockpy_module(&source)?
     };
 
     let rendered = render_instr_typed_for_module_with_options(

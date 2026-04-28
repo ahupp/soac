@@ -3,8 +3,8 @@ use cranelift_codegen::settings;
 use cranelift_codegen::settings::Configurable;
 use soac_config::SoacEnvConfig;
 pub(crate) use soac_config::SpecializationMode;
-pub use soac_driver::codegen_cache::CachedCodegenModuleMetadata;
-use soac_driver::codegen_cache::{
+pub use soac_driver::blockpy_cache::CachedBlockPyModuleMetadata;
+use soac_driver::blockpy_cache::{
     pre_optimization_module_cache_identity as blockpy_pre_optimization_module_cache_identity,
     pre_optimization_module_cache_metadata as blockpy_pre_optimization_module_cache_metadata,
     pre_optimization_module_cache_path as blockpy_pre_optimization_module_cache_path,
@@ -110,7 +110,7 @@ pub fn pre_optimization_module_cache_metadata(
     source_hash: u64,
     build_identity: &str,
     runtime_names_as_globals: bool,
-) -> CachedCodegenModuleMetadata {
+) -> CachedBlockPyModuleMetadata {
     blockpy_pre_optimization_module_cache_metadata(
         source,
         module_name,
@@ -125,4 +125,4 @@ pub(crate) fn precompiled_library_path() -> Result<Option<PathBuf>, String> {
         .precompiled_library_path()
         .map(Path::to_path_buf))
 }
-pub use soac_driver::codegen_cache::PythonModuleCacheSource;
+pub use soac_driver::blockpy_cache::PythonModuleCacheSource;

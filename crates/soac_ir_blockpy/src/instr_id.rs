@@ -1,4 +1,4 @@
-use crate::{CodegenModuleShape, InstrCodegen};
+use crate::{BlockPyModuleShape, InstrBlockPy};
 use soac_core::block_py::{
     BlockPyFunction, BlockPyModule, ChildVisitable, HasMeta, HasSemanticInstrId, Instr, InstrId,
     InstrKey, Visit, VisitMut, WithMeta, walk_expr, walk_expr_mut,
@@ -24,17 +24,17 @@ impl BlockInstrIdAssigner {
     }
 }
 
-impl VisitMut<InstrCodegen> for BlockInstrIdAssigner {
-    fn visit_instr_mut(&mut self, expr: &mut InstrCodegen)
+impl VisitMut<InstrBlockPy> for BlockInstrIdAssigner {
+    fn visit_instr_mut(&mut self, expr: &mut InstrBlockPy)
     where
-        InstrCodegen: ChildVisitable<InstrCodegen>,
+        InstrBlockPy: ChildVisitable<InstrBlockPy>,
     {
         self.assign(expr);
         walk_expr_mut(self, expr);
     }
 }
 
-pub fn reassign_codegen_function_instr_ids(function: &mut BlockPyFunction<CodegenModuleShape>) {
+pub fn reassign_blockpy_function_instr_ids(function: &mut BlockPyFunction<BlockPyModuleShape>) {
     let mut assigner = BlockInstrIdAssigner {
         next_instr_index: 0,
     };
@@ -72,18 +72,18 @@ impl MissingBlockInstrIdAssigner<'_> {
     }
 }
 
-impl VisitMut<InstrCodegen> for MissingBlockInstrIdAssigner<'_> {
-    fn visit_instr_mut(&mut self, expr: &mut InstrCodegen)
+impl VisitMut<InstrBlockPy> for MissingBlockInstrIdAssigner<'_> {
+    fn visit_instr_mut(&mut self, expr: &mut InstrBlockPy)
     where
-        InstrCodegen: ChildVisitable<InstrCodegen>,
+        InstrBlockPy: ChildVisitable<InstrBlockPy>,
     {
         self.assign(expr);
         walk_expr_mut(self, expr);
     }
 }
 
-pub fn assign_missing_codegen_function_instr_ids(
-    function: &mut BlockPyFunction<CodegenModuleShape>,
+pub fn assign_missing_blockpy_function_instr_ids(
+    function: &mut BlockPyFunction<BlockPyModuleShape>,
 ) {
     let mut next_instr_index = 0;
     let mut used = HashSet::new();
@@ -93,10 +93,10 @@ pub fn assign_missing_codegen_function_instr_ids(
             used: &'a mut HashSet<InstrId>,
         }
 
-        impl Visit<InstrCodegen> for MaxIdCollector<'_> {
-            fn visit_instr(&mut self, expr: &InstrCodegen)
+        impl Visit<InstrBlockPy> for MaxIdCollector<'_> {
+            fn visit_instr(&mut self, expr: &InstrBlockPy)
             where
-                InstrCodegen: ChildVisitable<InstrCodegen>,
+                InstrBlockPy: ChildVisitable<InstrBlockPy>,
             {
                 if let Some(instr_id) = expr.try_semantic_instr_id() {
                     self.used.insert(instr_id);
@@ -127,30 +127,30 @@ pub fn assign_missing_codegen_function_instr_ids(
     }
 }
 
-pub fn reassign_codegen_module_instr_ids(module: &mut BlockPyModule<CodegenModuleShape>) {
+pub fn reassign_blockpy_module_instr_ids(module: &mut BlockPyModule<BlockPyModuleShape>) {
     for function in &mut module.callable_defs {
-        reassign_codegen_function_instr_ids(function);
+        reassign_blockpy_function_instr_ids(function);
     }
 }
 
-pub fn assign_codegen_module_instr_ids(
-    mut module: BlockPyModule<CodegenModuleShape>,
-) -> BlockPyModule<CodegenModuleShape> {
+pub fn assign_blockpy_module_instr_ids(
+    mut module: BlockPyModule<BlockPyModuleShape>,
+) -> BlockPyModule<BlockPyModuleShape> {
     for function in &mut module.callable_defs {
-        reassign_codegen_function_instr_ids(function);
+        reassign_blockpy_function_instr_ids(function);
     }
     module
 }
 
-struct CodegenInstrIdValidator<'a> {
-    function: &'a BlockPyFunction<CodegenModuleShape>,
+struct BlockPyInstrIdValidator<'a> {
+    function: &'a BlockPyFunction<BlockPyModuleShape>,
     seen: HashSet<InstrKey>,
     errors: Vec<String>,
 }
 
-impl<'a> CodegenInstrIdValidator<'a> {
+impl<'a> BlockPyInstrIdValidator<'a> {
     fn validate_function(
-        function: &'a BlockPyFunction<CodegenModuleShape>,
+        function: &'a BlockPyFunction<BlockPyModuleShape>,
     ) -> Result<(), Vec<String>> {
         let mut validator = Self {
             function,
@@ -166,18 +166,18 @@ impl<'a> CodegenInstrIdValidator<'a> {
     }
 }
 
-impl Visit<InstrCodegen> for CodegenInstrIdValidator<'_> {
-    fn visit_instr(&mut self, expr: &InstrCodegen)
+impl Visit<InstrBlockPy> for BlockPyInstrIdValidator<'_> {
+    fn visit_instr(&mut self, expr: &InstrBlockPy)
     where
-        InstrCodegen: ChildVisitable<InstrCodegen>,
+        InstrBlockPy: ChildVisitable<InstrBlockPy>,
     {
         let Some(instr_id) = expr.try_semantic_instr_id() else {
-            if matches!(expr, InstrCodegen::IncrementCounter(_)) {
+            if matches!(expr, InstrBlockPy::IncrementCounter(_)) {
                 walk_expr(self, expr);
                 return;
             }
             self.errors.push(format!(
-                "missing codegen instruction id in function {} ({})",
+                "missing BlockPy instruction id in function {} ({})",
                 self.function.names.qualname, self.function.function_id
             ));
             walk_expr(self, expr);
@@ -187,7 +187,7 @@ impl Visit<InstrCodegen> for CodegenInstrIdValidator<'_> {
         let key = InstrKey::new(self.function.function_id, instr_id);
         if !self.seen.insert(key) {
             self.errors.push(format!(
-                "duplicate codegen instruction id {} in function {}",
+                "duplicate BlockPy instruction id {} in function {}",
                 key, self.function.names.qualname
             ));
         }
@@ -196,12 +196,12 @@ impl Visit<InstrCodegen> for CodegenInstrIdValidator<'_> {
     }
 }
 
-pub fn validate_codegen_instr_ids(
-    module: &BlockPyModule<CodegenModuleShape>,
+pub fn validate_blockpy_instr_ids(
+    module: &BlockPyModule<BlockPyModuleShape>,
 ) -> Result<(), String> {
     let mut errors = Vec::new();
     for function in &module.callable_defs {
-        if let Err(function_errors) = CodegenInstrIdValidator::validate_function(function) {
+        if let Err(function_errors) = BlockPyInstrIdValidator::validate_function(function) {
             errors.extend(function_errors);
         }
     }

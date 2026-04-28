@@ -5,8 +5,8 @@ use soac_core::block_py::{
     LocalLocation, RuntimeFunctionId, current_instr_locations,
 };
 #[cfg(test)]
-use soac_ir_blockpy::CodegenModuleShape;
-use soac_ir_typed::{FactStore, TypedBlock, TypedCodegenModuleShape};
+use soac_ir_blockpy::BlockPyModuleShape;
+use soac_ir_typed::{FactStore, TypedBlock, TypedBlockPyModuleShape};
 pub use soac_opt::passes::{
     BlockParamFacts, FunctionLocalPlan, LocalRefKind, ParamBindingFacts, ParamProvenance,
     PlannedLocalBinding, PlannedLocalStorage, render_planned_local_binding,
@@ -25,7 +25,7 @@ use std::fmt::Write;
 
 #[derive(Clone, Debug)]
 pub struct PreparedJitTypedModulePlan {
-    pub module: BlockPyModule<TypedCodegenModuleShape>,
+    pub module: BlockPyModule<TypedBlockPyModuleShape>,
     pub value_facts: FactStore,
     pub local_env_plan: LocalEnvModulePlan,
     pub local_env_resume_plan: LocalEnvResumeModulePlan,
@@ -40,7 +40,7 @@ fn can_release_via_stack_slot_fallback(name: &str) -> bool {
 }
 
 fn typed_block_indices_by_label(
-    function: &BlockPyFunction<TypedCodegenModuleShape>,
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
 ) -> HashMap<BlockLabel, usize> {
     function
         .blocks
@@ -51,7 +51,7 @@ fn typed_block_indices_by_label(
 }
 
 fn typed_block_index_for_label(
-    function: &BlockPyFunction<TypedCodegenModuleShape>,
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
     block_indices_by_label: &HashMap<BlockLabel, usize>,
     label: BlockLabel,
 ) -> usize {
@@ -157,7 +157,7 @@ impl PlannedJitModuleLocals {
 
     pub fn validate_for_typed_module(
         &self,
-        module: &BlockPyModule<TypedCodegenModuleShape>,
+        module: &BlockPyModule<TypedBlockPyModuleShape>,
     ) -> Result<(), String> {
         let expected_function_ids = module
             .callable_defs
@@ -213,7 +213,7 @@ impl PlannedJitDeoptResumeFunction {
 
     pub fn validate_for_typed_function(
         &self,
-        function: &BlockPyFunction<TypedCodegenModuleShape>,
+        function: &BlockPyFunction<TypedBlockPyModuleShape>,
     ) -> Result<(), String> {
         let mut errors = Vec::new();
         let instr_locations = current_instr_locations(function);
@@ -328,7 +328,7 @@ impl PlannedJitDeoptResumeModule {
 
     pub fn validate_for_typed_module(
         &self,
-        module: &BlockPyModule<TypedCodegenModuleShape>,
+        module: &BlockPyModule<TypedBlockPyModuleShape>,
     ) -> Result<(), String> {
         let expected_function_ids = module
             .callable_defs
@@ -442,7 +442,7 @@ impl PlannedJitFunctionLocals {
 
     pub fn validate_for_typed_function(
         &self,
-        function: &BlockPyFunction<TypedCodegenModuleShape>,
+        function: &BlockPyFunction<TypedBlockPyModuleShape>,
     ) -> Result<(), String> {
         let block_count = function.blocks.len();
         let block_indices_by_label = typed_block_indices_by_label(function);
@@ -749,7 +749,7 @@ fn validate_entry_materializations_for_block<P: soac_core::block_py::ModuleShape
 }
 
 pub fn plan_jit_typed_module_locals_from_passes(
-    module: &BlockPyModule<TypedCodegenModuleShape>,
+    module: &BlockPyModule<TypedBlockPyModuleShape>,
     facts: &FactStore,
     local_env_plan: &LocalEnvModulePlan,
     refcount_plan: &RefcountPlan,
@@ -790,7 +790,7 @@ pub fn plan_jit_typed_module_locals_from_passes(
 }
 
 pub fn plan_jit_typed_deopt_resume_module_from_passes(
-    module: &BlockPyModule<TypedCodegenModuleShape>,
+    module: &BlockPyModule<TypedBlockPyModuleShape>,
     facts: &FactStore,
     local_env_plan: &LocalEnvModulePlan,
     resume_plan: &LocalEnvResumeModulePlan,
@@ -832,7 +832,7 @@ pub fn plan_jit_typed_deopt_resume_module_from_passes(
 }
 
 pub fn plan_jit_typed_module(
-    module: BlockPyModule<TypedCodegenModuleShape>,
+    module: BlockPyModule<TypedBlockPyModuleShape>,
     value_facts: FactStore,
 ) -> Result<PreparedJitTypedModulePlan, String> {
     let local_env_plan = plan_typed_local_env_module(&module, &value_facts);
@@ -863,7 +863,7 @@ pub fn plan_jit_typed_module(
 
 #[cfg(test)]
 pub(super) fn plan_typed_v3_jit_module_for_test(
-    module: &BlockPyModule<CodegenModuleShape>,
+    module: &BlockPyModule<BlockPyModuleShape>,
     _value_facts: FactStore,
 ) -> Result<PreparedJitTypedModulePlan, String> {
     let prepared = soac_driver::typed_runtime::prepare_typed_v3_runtime_module(
@@ -899,7 +899,7 @@ fn planned_deopt_points_from_resume_plan(
 }
 
 pub fn render_jit_deopt_resume_module(
-    module: &BlockPyModule<TypedCodegenModuleShape>,
+    module: &BlockPyModule<TypedBlockPyModuleShape>,
     plan: &PlannedJitDeoptResumeModule,
 ) -> Result<String, String> {
     plan.validate_for_typed_module(module)?;
@@ -920,7 +920,7 @@ pub fn render_jit_deopt_resume_module(
 }
 
 pub fn render_jit_deopt_resume_function(
-    function: &BlockPyFunction<TypedCodegenModuleShape>,
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
     plan: &PlannedJitDeoptResumeFunction,
 ) -> Result<String, String> {
     plan.validate_for_typed_function(function)?;
@@ -985,7 +985,7 @@ fn render_jit_deopt_point(point: LocalEnvResumePoint) -> String {
 }
 
 pub fn render_jit_module_locals(
-    module: &BlockPyModule<TypedCodegenModuleShape>,
+    module: &BlockPyModule<TypedBlockPyModuleShape>,
     plan: &PlannedJitModuleLocals,
 ) -> Result<String, String> {
     plan.validate_for_typed_module(module)?;
@@ -1006,7 +1006,7 @@ pub fn render_jit_module_locals(
 }
 
 pub fn render_jit_function_locals(
-    function: &BlockPyFunction<TypedCodegenModuleShape>,
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
     plan: &PlannedJitFunctionLocals,
 ) -> Result<String, String> {
     plan.validate_for_typed_function(function)?;
@@ -1168,7 +1168,7 @@ pub fn local_ref_kind_for_stack_mirror(ref_kind: LocalRefKind) -> LocalRefKind {
 }
 
 pub fn planned_jit_params_for_typed_function(
-    function: &BlockPyFunction<TypedCodegenModuleShape>,
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
     local_plan: &FunctionLocalPlan,
 ) -> Result<Vec<Vec<RuntimeBlockParamPlan>>, String> {
     function
@@ -1221,7 +1221,7 @@ pub fn planned_jit_params_for_typed_function(
 }
 
 pub fn planned_stack_slot_entry_seeds_for_typed_function(
-    function: &BlockPyFunction<TypedCodegenModuleShape>,
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
     local_plan: &FunctionLocalPlan,
 ) -> Vec<Vec<PlannedStackSlotEntrySeed>> {
     let live_ins = compute_typed_function_local_live_ins(function);
@@ -1371,7 +1371,7 @@ pub fn plan_edge_transport(
 }
 
 pub fn planned_implicit_target_transports_for_typed_function(
-    function: &BlockPyFunction<TypedCodegenModuleShape>,
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
     runtime_block_params: &[Vec<RuntimeBlockParamPlan>],
 ) -> Vec<EdgeTransportPlan> {
     let no_slot_writes = HashSet::new();
@@ -1391,7 +1391,7 @@ pub fn planned_implicit_target_transports_for_typed_function(
 }
 
 pub fn planned_jump_edge_transports_for_typed_function(
-    function: &BlockPyFunction<TypedCodegenModuleShape>,
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
     runtime_block_params: &[Vec<RuntimeBlockParamPlan>],
 ) -> Vec<Option<EdgeTransportPlan>> {
     let no_slot_writes = HashSet::new();
@@ -1417,7 +1417,7 @@ pub fn planned_jump_edge_transports_for_typed_function(
 }
 
 pub fn typed_exc_dispatch_plan(
-    function: &BlockPyFunction<TypedCodegenModuleShape>,
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
     block: &TypedBlock,
     runtime_target_params: &[RuntimeBlockParamPlan],
     refcount_plan: &FunctionRefcountPlan,
@@ -1507,7 +1507,7 @@ fn planned_drop_forwarded_local_names(
 }
 
 pub fn plan_jit_typed_function_locals_from_plans(
-    function: &BlockPyFunction<TypedCodegenModuleShape>,
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
     local_plan: FunctionLocalPlan,
     refcount_plan: FunctionRefcountPlan,
 ) -> Result<PlannedJitFunctionLocals, String> {
@@ -1570,7 +1570,7 @@ mod tests {
     use soac_core::block_py::{
         BlockArg, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, LocalLocation,
     };
-    use soac_ir_blockpy::CodegenModuleShape;
+    use soac_ir_blockpy::BlockPyModuleShape;
     use soac_lowering::lower_python_to_blockpy_for_testing;
     use soac_opt::passes::BlockLocalPlan;
     use soac_opt::passes::{
@@ -1584,12 +1584,12 @@ mod tests {
         source: &str,
         qualname: &str,
     ) -> (
-        soac_core::block_py::BlockPyModule<CodegenModuleShape>,
+        soac_core::block_py::BlockPyModule<BlockPyModuleShape>,
         usize,
     ) {
         let lowered = lower_python_to_blockpy_for_testing(source)
             .expect("transform should succeed")
-            .codegen_module;
+            .blockpy_module;
         let function_index = lowered
             .callable_defs
             .iter()
@@ -1598,8 +1598,8 @@ mod tests {
         (lowered, function_index)
     }
 
-    fn plan_typed_module_from_codegen_module(
-        module: &BlockPyModule<CodegenModuleShape>,
+    fn plan_typed_module_from_blockpy_module(
+        module: &BlockPyModule<BlockPyModuleShape>,
     ) -> PreparedJitTypedModulePlan {
         let facts = infer_module_value_facts(module);
         plan_typed_v3_jit_module_for_test(module, facts)
@@ -1610,9 +1610,9 @@ mod tests {
         source: &str,
         qualname: &str,
     ) -> (PreparedJitTypedModulePlan, usize) {
-        let (lowered, codegen_function_index) = lowered_function(source, qualname);
-        let function_id = lowered.callable_defs[codegen_function_index].function_id;
-        let prepared = plan_typed_module_from_codegen_module(&lowered);
+        let (lowered, blockpy_function_index) = lowered_function(source, qualname);
+        let function_id = lowered.callable_defs[blockpy_function_index].function_id;
+        let prepared = plan_typed_module_from_blockpy_module(&lowered);
         let typed_function_index = prepared
             .module
             .callable_defs
@@ -1630,7 +1630,7 @@ mod tests {
             .unwrap_or_else(|| panic!("missing planned local binding {name}"))
     }
 
-    fn sparsely_relabel_function_blocks(function: &mut BlockPyFunction<CodegenModuleShape>) {
+    fn sparsely_relabel_function_blocks(function: &mut BlockPyFunction<BlockPyModuleShape>) {
         let relabel = function
             .blocks
             .iter()
@@ -2074,7 +2074,7 @@ def f():
     }
 
     #[test]
-    fn planned_jit_function_locals_collects_codegen_local_state() {
+    fn planned_jit_function_locals_collects_blockpy_local_state() {
         let (prepared, function_index) = prepared_typed_function(
             r#"
 def f(flag):
@@ -2243,8 +2243,8 @@ def g(flag):
 "#,
         )
         .expect("lowering should succeed")
-        .codegen_module;
-        let prepared = plan_typed_module_from_codegen_module(&lowered);
+        .blockpy_module;
+        let prepared = plan_typed_module_from_blockpy_module(&lowered);
         let plan = &prepared.locals;
         plan.validate_for_typed_module(&prepared.module)
             .expect("module-level function plan should validate");
@@ -2272,8 +2272,8 @@ def f(flag):
 "#,
         )
         .expect("lowering should succeed")
-        .codegen_module;
-        let prepared = plan_typed_module_from_codegen_module(&lowered);
+        .blockpy_module;
+        let prepared = plan_typed_module_from_blockpy_module(&lowered);
 
         prepared
             .locals
@@ -2305,7 +2305,7 @@ def f(flag):
         );
         sparsely_relabel_function_blocks(&mut lowered.callable_defs[function_index]);
         let function_id = lowered.callable_defs[function_index].function_id;
-        let prepared = plan_typed_module_from_codegen_module(&lowered);
+        let prepared = plan_typed_module_from_blockpy_module(&lowered);
         let function = prepared
             .module
             .callable_defs
@@ -2332,8 +2332,8 @@ def f():
 "#,
         )
         .expect("lowering should succeed")
-        .codegen_module;
-        let prepared = plan_typed_module_from_codegen_module(&lowered);
+        .blockpy_module;
+        let prepared = plan_typed_module_from_blockpy_module(&lowered);
         let plan = &prepared.deopt_resume;
         plan.validate_for_typed_module(&prepared.module)
             .expect("JIT deopt resume plan should validate");

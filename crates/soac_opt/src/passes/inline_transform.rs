@@ -1,4 +1,4 @@
-use crate::passes::{CodegenModuleShape, InstrCodegen, try_allocate_codegen_stack_temp};
+use crate::passes::{BlockPyModuleShape, InstrBlockPy, try_allocate_codegen_stack_temp};
 use soac_core::block_py::{
     Block, BlockArg, BlockEdge, BlockLabel, BlockPyFunction, BlockTerm, CallArgPositional,
     CallDirect, ConstantExpr, HasMeta, LocalLocation, MapInstr, Mappable, NameLocation, ParamKind,
@@ -9,7 +9,7 @@ use std::collections::HashMap;
 #[derive(Debug, Clone)]
 pub struct InlineFragment {
     pub entry_label: BlockLabel,
-    pub blocks: Vec<Block<InstrCodegen>>,
+    pub blocks: Vec<Block<InstrBlockPy>>,
     pub locals: HashMap<LocalLocation, InlineLocal>,
     pub return_local: Option<InlineLocal>,
 }
@@ -20,7 +20,7 @@ pub struct InlineLocal {
     pub location: LocalLocation,
 }
 
-pub type InlineValueBindings = HashMap<LocalLocation, InstrCodegen>;
+pub type InlineValueBindings = HashMap<LocalLocation, InstrBlockPy>;
 
 const MAX_INLINE_DIRECT_CALL_BLOCKS: usize = 16;
 
@@ -48,8 +48,8 @@ pub enum InlineUnsupportedReason {
 }
 
 pub fn bind_simple_direct_call_inline_args(
-    callee: &BlockPyFunction<CodegenModuleShape>,
-    call: &CallDirect<InstrCodegen>,
+    callee: &BlockPyFunction<BlockPyModuleShape>,
+    call: &CallDirect<InstrBlockPy>,
 ) -> Result<InlineValueBindings, InlineUnsupportedReason> {
     if !call.keywords.is_empty() {
         return Err(InlineUnsupportedReason::KeywordArguments);
@@ -76,9 +76,9 @@ pub fn bind_simple_direct_call_inline_args(
 }
 
 pub fn bind_simple_direct_method_inline_args(
-    callee: &BlockPyFunction<CodegenModuleShape>,
-    receiver: InstrCodegen,
-    args: &[CallArgPositional<InstrCodegen>],
+    callee: &BlockPyFunction<BlockPyModuleShape>,
+    receiver: InstrBlockPy,
+    args: &[CallArgPositional<InstrBlockPy>],
 ) -> Result<InlineValueBindings, InlineUnsupportedReason> {
     if args
         .iter()
@@ -99,8 +99,8 @@ pub fn bind_simple_direct_method_inline_args(
 }
 
 fn bind_simple_direct_call_inline_values(
-    callee: &BlockPyFunction<CodegenModuleShape>,
-    values: Vec<InstrCodegen>,
+    callee: &BlockPyFunction<BlockPyModuleShape>,
+    values: Vec<InstrBlockPy>,
 ) -> Result<InlineValueBindings, InlineUnsupportedReason> {
     let supported_params = callee
         .params
@@ -131,8 +131,8 @@ fn bind_simple_direct_call_inline_values(
 }
 
 pub fn build_single_block_inline_fragment(
-    caller: &mut BlockPyFunction<CodegenModuleShape>,
-    callee: &BlockPyFunction<CodegenModuleShape>,
+    caller: &mut BlockPyFunction<BlockPyModuleShape>,
+    callee: &BlockPyFunction<BlockPyModuleShape>,
     continuation: BlockLabel,
 ) -> Result<InlineFragment, InlineUnsupportedReason> {
     build_single_block_inline_fragment_with_bindings(
@@ -144,8 +144,8 @@ pub fn build_single_block_inline_fragment(
 }
 
 pub fn build_single_block_inline_fragment_with_bindings(
-    caller: &mut BlockPyFunction<CodegenModuleShape>,
-    callee: &BlockPyFunction<CodegenModuleShape>,
+    caller: &mut BlockPyFunction<BlockPyModuleShape>,
+    callee: &BlockPyFunction<BlockPyModuleShape>,
     continuation: BlockLabel,
     value_bindings: &InlineValueBindings,
 ) -> Result<InlineFragment, InlineUnsupportedReason> {
@@ -160,8 +160,8 @@ pub fn build_single_block_inline_fragment_with_bindings(
 }
 
 pub fn build_single_block_inline_fragment_to_target(
-    caller: &mut BlockPyFunction<CodegenModuleShape>,
-    callee: &BlockPyFunction<CodegenModuleShape>,
+    caller: &mut BlockPyFunction<BlockPyModuleShape>,
+    callee: &BlockPyFunction<BlockPyModuleShape>,
     continuation: BlockLabel,
     value_bindings: &InlineValueBindings,
     return_target: ResolvedName,
@@ -177,8 +177,8 @@ pub fn build_single_block_inline_fragment_to_target(
 }
 
 pub fn build_direct_call_inline_fragment_to_target(
-    caller: &mut BlockPyFunction<CodegenModuleShape>,
-    callee: &BlockPyFunction<CodegenModuleShape>,
+    caller: &mut BlockPyFunction<BlockPyModuleShape>,
+    callee: &BlockPyFunction<BlockPyModuleShape>,
     continuation: BlockLabel,
     value_bindings: &InlineValueBindings,
     return_target: ResolvedName,
@@ -202,9 +202,9 @@ pub fn build_direct_call_inline_fragment_to_target(
 }
 
 pub fn build_cross_module_direct_call_inline_fragment_to_target(
-    caller: &mut BlockPyFunction<CodegenModuleShape>,
+    caller: &mut BlockPyFunction<BlockPyModuleShape>,
     caller_constants: &mut Vec<ConstantExpr>,
-    callee: &BlockPyFunction<CodegenModuleShape>,
+    callee: &BlockPyFunction<BlockPyModuleShape>,
     callee_constants: &[ConstantExpr],
     continuation: BlockLabel,
     value_bindings: &InlineValueBindings,
@@ -237,11 +237,11 @@ pub fn build_cross_module_direct_call_inline_fragment_to_target(
 }
 
 pub fn build_direct_method_inline_fragment_to_target(
-    caller: &mut BlockPyFunction<CodegenModuleShape>,
-    callee: &BlockPyFunction<CodegenModuleShape>,
+    caller: &mut BlockPyFunction<BlockPyModuleShape>,
+    callee: &BlockPyFunction<BlockPyModuleShape>,
     continuation: BlockLabel,
-    receiver: InstrCodegen,
-    args: &[CallArgPositional<InstrCodegen>],
+    receiver: InstrBlockPy,
+    args: &[CallArgPositional<InstrBlockPy>],
     return_target: ResolvedName,
 ) -> Result<InlineFragment, InlineUnsupportedReason> {
     let bindings = bind_simple_direct_method_inline_args(callee, receiver, args)?;
@@ -255,13 +255,13 @@ pub fn build_direct_method_inline_fragment_to_target(
 }
 
 pub fn build_cross_module_direct_method_inline_fragment_to_target(
-    caller: &mut BlockPyFunction<CodegenModuleShape>,
+    caller: &mut BlockPyFunction<BlockPyModuleShape>,
     caller_constants: &mut Vec<ConstantExpr>,
-    callee: &BlockPyFunction<CodegenModuleShape>,
+    callee: &BlockPyFunction<BlockPyModuleShape>,
     callee_constants: &[ConstantExpr],
     continuation: BlockLabel,
-    receiver: InstrCodegen,
-    args: &[CallArgPositional<InstrCodegen>],
+    receiver: InstrBlockPy,
+    args: &[CallArgPositional<InstrBlockPy>],
     return_target: ResolvedName,
 ) -> Result<InlineFragment, InlineUnsupportedReason> {
     let bindings = bind_simple_direct_method_inline_args(callee, receiver, args)?;
@@ -277,8 +277,8 @@ pub fn build_cross_module_direct_method_inline_fragment_to_target(
 }
 
 fn build_multi_block_inline_fragment_to_target(
-    caller: &mut BlockPyFunction<CodegenModuleShape>,
-    callee: &BlockPyFunction<CodegenModuleShape>,
+    caller: &mut BlockPyFunction<BlockPyModuleShape>,
+    callee: &BlockPyFunction<BlockPyModuleShape>,
     continuation: BlockLabel,
     value_bindings: &InlineValueBindings,
     return_target: ResolvedName,
@@ -294,8 +294,8 @@ fn build_multi_block_inline_fragment_to_target(
 }
 
 fn build_multi_block_inline_fragment_to_target_impl(
-    caller: &mut BlockPyFunction<CodegenModuleShape>,
-    callee: &BlockPyFunction<CodegenModuleShape>,
+    caller: &mut BlockPyFunction<BlockPyModuleShape>,
+    callee: &BlockPyFunction<BlockPyModuleShape>,
     continuation: BlockLabel,
     value_bindings: &InlineValueBindings,
     return_target: ResolvedName,
@@ -355,7 +355,7 @@ fn build_multi_block_inline_fragment_to_target_impl(
             .cloned()
             // Inlined profiling counters belong to the callee's counter
             // layout; the caller does not have storage for those ids.
-            .filter(|instr| !matches!(instr, InstrCodegen::IncrementCounter(_)))
+            .filter(|instr| !matches!(instr, InstrBlockPy::IncrementCounter(_)))
             .map(|instr| remapper.try_map_instr(instr))
             .collect::<Result<Vec<_>, _>>()?;
         let term = match &callee_block.term {
@@ -382,7 +382,7 @@ fn build_multi_block_inline_fragment_to_target_impl(
     })
 }
 
-fn term_has_jump_args(term: &BlockTerm<InstrCodegen>) -> bool {
+fn term_has_jump_args(term: &BlockTerm<InstrBlockPy>) -> bool {
     match term {
         BlockTerm::Jump(edge) => !edge.args.is_empty(),
         BlockTerm::IfTerm(_)
@@ -403,9 +403,9 @@ fn remapped_label(
 }
 
 fn remap_inline_term_labels(
-    term: BlockTerm<InstrCodegen>,
+    term: BlockTerm<InstrBlockPy>,
     label_map: &HashMap<BlockLabel, BlockLabel>,
-) -> Result<BlockTerm<InstrCodegen>, InlineUnsupportedReason> {
+) -> Result<BlockTerm<InstrBlockPy>, InlineUnsupportedReason> {
     Ok(match term {
         BlockTerm::Jump(edge) => {
             BlockTerm::Jump(BlockEdge::new(remapped_label(label_map, edge.target)?))
@@ -428,8 +428,8 @@ fn remap_inline_term_labels(
 }
 
 fn build_single_block_inline_fragment_with_constant_scope(
-    caller: &mut BlockPyFunction<CodegenModuleShape>,
-    callee: &BlockPyFunction<CodegenModuleShape>,
+    caller: &mut BlockPyFunction<BlockPyModuleShape>,
+    callee: &BlockPyFunction<BlockPyModuleShape>,
     continuation: BlockLabel,
     value_bindings: &InlineValueBindings,
     return_placement: InlineReturnPlacement,
@@ -490,7 +490,7 @@ fn build_single_block_inline_fragment_with_constant_scope(
         .cloned()
         // Inlined profiling counters belong to the callee's counter layout;
         // the caller does not have storage for those ids.
-        .filter(|instr| !matches!(instr, InstrCodegen::IncrementCounter(_)))
+        .filter(|instr| !matches!(instr, InstrBlockPy::IncrementCounter(_)))
         .map(|instr| remapper.try_map_instr(instr))
         .collect::<Result<Vec<_>, _>>()?;
     let return_value = remapper.try_map_instr(return_value.clone())?;
@@ -524,7 +524,7 @@ enum InlineReturnPlacement {
 }
 
 fn allocate_inline_local(
-    caller: &mut BlockPyFunction<CodegenModuleShape>,
+    caller: &mut BlockPyFunction<BlockPyModuleShape>,
 ) -> Result<InlineLocal, InlineUnsupportedReason> {
     let temp = try_allocate_codegen_stack_temp(caller, "inline")
         .map_err(|_| InlineUnsupportedReason::MissingCallerStorageLayout)?;
@@ -535,7 +535,7 @@ fn allocate_inline_local(
 }
 
 fn parameter_local_location(
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
     name: &str,
 ) -> Result<LocalLocation, InlineUnsupportedReason> {
     let layout = function
@@ -646,55 +646,55 @@ impl<'a> InlineConstantRemapper<'a> {
     }
 }
 
-impl TryMapInstr<InstrCodegen, InstrCodegen, InlineUnsupportedReason>
+impl TryMapInstr<InstrBlockPy, InstrBlockPy, InlineUnsupportedReason>
     for InlineLocalRemapper<'_, '_, '_, '_>
 {
     fn try_map_instr(
         &mut self,
-        instr: InstrCodegen,
-    ) -> Result<InstrCodegen, InlineUnsupportedReason> {
+        instr: InstrBlockPy,
+    ) -> Result<InstrBlockPy, InlineUnsupportedReason> {
         let mapped = match instr {
-            InstrCodegen::BinOp(op) => InstrCodegen::BinOp(op.try_map_children(self)?),
-            InstrCodegen::UnaryOp(op) => InstrCodegen::UnaryOp(op.try_map_children(self)?),
-            InstrCodegen::Tuple(op) => InstrCodegen::Tuple(op.try_map_children(self)?),
-            InstrCodegen::Call(op) => InstrCodegen::Call(op.try_map_children(self)?),
-            InstrCodegen::GetAttr(op) => InstrCodegen::GetAttr(op.try_map_children(self)?),
-            InstrCodegen::SetAttr(op) => InstrCodegen::SetAttr(op.try_map_children(self)?),
-            InstrCodegen::GetItem(op) => InstrCodegen::GetItem(op.try_map_children(self)?),
-            InstrCodegen::SetItem(op) => InstrCodegen::SetItem(op.try_map_children(self)?),
-            InstrCodegen::DelItem(op) => InstrCodegen::DelItem(op.try_map_children(self)?),
-            InstrCodegen::Load(op) => {
+            InstrBlockPy::BinOp(op) => InstrBlockPy::BinOp(op.try_map_children(self)?),
+            InstrBlockPy::UnaryOp(op) => InstrBlockPy::UnaryOp(op.try_map_children(self)?),
+            InstrBlockPy::Tuple(op) => InstrBlockPy::Tuple(op.try_map_children(self)?),
+            InstrBlockPy::Call(op) => InstrBlockPy::Call(op.try_map_children(self)?),
+            InstrBlockPy::GetAttr(op) => InstrBlockPy::GetAttr(op.try_map_children(self)?),
+            InstrBlockPy::SetAttr(op) => InstrBlockPy::SetAttr(op.try_map_children(self)?),
+            InstrBlockPy::GetItem(op) => InstrBlockPy::GetItem(op.try_map_children(self)?),
+            InstrBlockPy::SetItem(op) => InstrBlockPy::SetItem(op.try_map_children(self)?),
+            InstrBlockPy::DelItem(op) => InstrBlockPy::DelItem(op.try_map_children(self)?),
+            InstrBlockPy::Load(op) => {
                 if let Some(location) = op.name.local_location() {
                     if let Some(value) = self.value_bindings.get(&location) {
-                        return Ok(clear_codegen_instr_ids(value.clone()));
+                        return Ok(clear_blockpy_instr_ids(value.clone()));
                     }
                 }
-                InstrCodegen::Load(op.try_map_children(self)?)
+                InstrBlockPy::Load(op.try_map_children(self)?)
             }
-            InstrCodegen::Store(op) => {
+            InstrBlockPy::Store(op) => {
                 if let Some(location) = op.name.local_location() {
                     if self.value_bindings.contains_key(&location) {
                         return Err(InlineUnsupportedReason::RebindsBoundLocal(location));
                     }
                 }
-                InstrCodegen::Store(op.try_map_children(self)?)
+                InstrBlockPy::Store(op.try_map_children(self)?)
             }
-            InstrCodegen::Del(op) => {
+            InstrBlockPy::Del(op) => {
                 if let Some(location) = op.name.local_location() {
                     if self.value_bindings.contains_key(&location) {
                         return Err(InlineUnsupportedReason::RebindsBoundLocal(location));
                     }
                 }
-                InstrCodegen::Del(op.try_map_children(self)?)
+                InstrBlockPy::Del(op.try_map_children(self)?)
             }
-            InstrCodegen::MakeCell(op) => InstrCodegen::MakeCell(op.try_map_children(self)?),
-            InstrCodegen::IncrementCounter(op) => InstrCodegen::IncrementCounter(op),
-            InstrCodegen::CellRef(op) => InstrCodegen::CellRef(op),
-            InstrCodegen::MakeFunctionWithClosure(op) => {
-                InstrCodegen::MakeFunctionWithClosure(op.try_map_children(self)?)
+            InstrBlockPy::MakeCell(op) => InstrBlockPy::MakeCell(op.try_map_children(self)?),
+            InstrBlockPy::IncrementCounter(op) => InstrBlockPy::IncrementCounter(op),
+            InstrBlockPy::CellRef(op) => InstrBlockPy::CellRef(op),
+            InstrBlockPy::MakeFunctionWithClosure(op) => {
+                InstrBlockPy::MakeFunctionWithClosure(op.try_map_children(self)?)
             }
         };
-        Ok(clear_codegen_instr_id(mapped))
+        Ok(clear_blockpy_instr_id(mapped))
     }
 
     fn try_map_name(
@@ -727,11 +727,11 @@ impl TryMapInstr<InstrCodegen, InstrCodegen, InlineUnsupportedReason>
     }
 }
 
-fn clear_codegen_instr_ids(instr: InstrCodegen) -> InstrCodegen {
+fn clear_blockpy_instr_ids(instr: InstrBlockPy) -> InstrBlockPy {
     InstrIdScrubber.map_instr(instr)
 }
 
-fn clear_codegen_instr_id(instr: InstrCodegen) -> InstrCodegen {
+fn clear_blockpy_instr_id(instr: InstrBlockPy) -> InstrBlockPy {
     let mut meta = instr.meta();
     meta.instr_id = None;
     instr.with_meta(meta)
@@ -739,29 +739,29 @@ fn clear_codegen_instr_id(instr: InstrCodegen) -> InstrCodegen {
 
 struct InstrIdScrubber;
 
-impl MapInstr<InstrCodegen, InstrCodegen> for InstrIdScrubber {
-    fn map_instr(&mut self, instr: InstrCodegen) -> InstrCodegen {
+impl MapInstr<InstrBlockPy, InstrBlockPy> for InstrIdScrubber {
+    fn map_instr(&mut self, instr: InstrBlockPy) -> InstrBlockPy {
         let mapped = match instr {
-            InstrCodegen::BinOp(op) => InstrCodegen::BinOp(op.map_children(self)),
-            InstrCodegen::UnaryOp(op) => InstrCodegen::UnaryOp(op.map_children(self)),
-            InstrCodegen::Tuple(op) => InstrCodegen::Tuple(op.map_children(self)),
-            InstrCodegen::Call(op) => InstrCodegen::Call(op.map_children(self)),
-            InstrCodegen::GetAttr(op) => InstrCodegen::GetAttr(op.map_children(self)),
-            InstrCodegen::SetAttr(op) => InstrCodegen::SetAttr(op.map_children(self)),
-            InstrCodegen::GetItem(op) => InstrCodegen::GetItem(op.map_children(self)),
-            InstrCodegen::SetItem(op) => InstrCodegen::SetItem(op.map_children(self)),
-            InstrCodegen::DelItem(op) => InstrCodegen::DelItem(op.map_children(self)),
-            InstrCodegen::Load(op) => InstrCodegen::Load(op.map_children(self)),
-            InstrCodegen::Store(op) => InstrCodegen::Store(op.map_children(self)),
-            InstrCodegen::Del(op) => InstrCodegen::Del(op.map_children(self)),
-            InstrCodegen::MakeCell(op) => InstrCodegen::MakeCell(op.map_children(self)),
-            InstrCodegen::IncrementCounter(op) => InstrCodegen::IncrementCounter(op),
-            InstrCodegen::CellRef(op) => InstrCodegen::CellRef(op),
-            InstrCodegen::MakeFunctionWithClosure(op) => {
-                InstrCodegen::MakeFunctionWithClosure(op.map_children(self))
+            InstrBlockPy::BinOp(op) => InstrBlockPy::BinOp(op.map_children(self)),
+            InstrBlockPy::UnaryOp(op) => InstrBlockPy::UnaryOp(op.map_children(self)),
+            InstrBlockPy::Tuple(op) => InstrBlockPy::Tuple(op.map_children(self)),
+            InstrBlockPy::Call(op) => InstrBlockPy::Call(op.map_children(self)),
+            InstrBlockPy::GetAttr(op) => InstrBlockPy::GetAttr(op.map_children(self)),
+            InstrBlockPy::SetAttr(op) => InstrBlockPy::SetAttr(op.map_children(self)),
+            InstrBlockPy::GetItem(op) => InstrBlockPy::GetItem(op.map_children(self)),
+            InstrBlockPy::SetItem(op) => InstrBlockPy::SetItem(op.map_children(self)),
+            InstrBlockPy::DelItem(op) => InstrBlockPy::DelItem(op.map_children(self)),
+            InstrBlockPy::Load(op) => InstrBlockPy::Load(op.map_children(self)),
+            InstrBlockPy::Store(op) => InstrBlockPy::Store(op.map_children(self)),
+            InstrBlockPy::Del(op) => InstrBlockPy::Del(op.map_children(self)),
+            InstrBlockPy::MakeCell(op) => InstrBlockPy::MakeCell(op.map_children(self)),
+            InstrBlockPy::IncrementCounter(op) => InstrBlockPy::IncrementCounter(op),
+            InstrBlockPy::CellRef(op) => InstrBlockPy::CellRef(op),
+            InstrBlockPy::MakeFunctionWithClosure(op) => {
+                InstrBlockPy::MakeFunctionWithClosure(op.map_children(self))
             }
         };
-        clear_codegen_instr_id(mapped)
+        clear_blockpy_instr_id(mapped)
     }
 
     fn map_name(&mut self, name: ResolvedName) -> ResolvedName {

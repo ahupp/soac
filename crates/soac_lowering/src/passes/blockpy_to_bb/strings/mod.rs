@@ -1,15 +1,15 @@
 use crate::block_py::{
-    BlockPyFunction, BlockPyModule, ConstantExpr, HasMeta, InstrCodegen, InstrResolved,
+    BlockPyFunction, BlockPyModule, ConstantExpr, HasMeta, InstrBlockPy, InstrResolved,
     LiteralValue, Load, MapFunction, MapInstr, Mappable, NameLocation, ResolvedName, WithMeta,
 };
 use crate::passes::ResolvedStorageModuleShape;
-use soac_ir_blockpy::CodegenModuleShape;
+use soac_ir_blockpy::BlockPyModuleShape;
 use soac_macros::match_default;
 
 pub(crate) fn hoist_module_constants(
     module: &BlockPyModule<ResolvedStorageModuleShape>,
-) -> BlockPyModule<CodegenModuleShape> {
-    let mut normalizer = CodegenExprNormalizer::default();
+) -> BlockPyModule<BlockPyModuleShape> {
+    let mut normalizer = BlockPyExprNormalizer::default();
     let module = module.clone();
     let mut module_constants = module
         .module_constants
@@ -20,7 +20,7 @@ pub(crate) fn hoist_module_constants(
         .callable_defs
         .into_iter()
         .map(|function| normalizer.map_fn(function))
-        .collect::<Vec<BlockPyFunction<CodegenModuleShape>>>();
+        .collect::<Vec<BlockPyFunction<BlockPyModuleShape>>>();
     module_constants.extend(normalizer.module_constants);
     BlockPyModule {
         module_name_gen: module.module_name_gen,
@@ -32,11 +32,11 @@ pub(crate) fn hoist_module_constants(
 }
 
 #[derive(Default)]
-struct CodegenExprNormalizer {
+struct BlockPyExprNormalizer {
     module_constants: Vec<ConstantExpr>,
 }
 
-impl CodegenExprNormalizer {
+impl BlockPyExprNormalizer {
     fn push_module_constant(&mut self, literal: LiteralValue) -> u32 {
         let index = u32::try_from(self.module_constants.len())
             .expect("module constant count should fit in u32");
@@ -57,8 +57,8 @@ fn resolved_module_constant_to_constant_expr(expr: InstrResolved) -> ConstantExp
     }
 }
 
-impl MapInstr<InstrResolved, InstrCodegen> for CodegenExprNormalizer {
-    fn map_instr(&mut self, expr: InstrResolved) -> InstrCodegen {
+impl MapInstr<InstrResolved, InstrBlockPy> for BlockPyExprNormalizer {
+    fn map_instr(&mut self, expr: InstrResolved) -> InstrBlockPy {
         match_default!(expr: crate::passes::InstrResolved {
             InstrResolved::Literal(literal) => {
                 let meta = literal.meta();

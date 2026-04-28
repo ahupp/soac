@@ -1,4 +1,4 @@
-use crate::passes::{CodegenModuleShape, InstrCodegen};
+use crate::passes::{BlockPyModuleShape, InstrBlockPy};
 use soac_core::block_py::PrettyPrint;
 use soac_core::block_py::literal::Literal;
 use soac_core::block_py::{
@@ -151,7 +151,7 @@ pub enum ConstructorFieldValue {
     Other,
 }
 
-pub fn summarize_module_escapes(module: &BlockPyModule<CodegenModuleShape>) -> EscapeSummaryModule {
+pub fn summarize_module_escapes(module: &BlockPyModule<BlockPyModuleShape>) -> EscapeSummaryModule {
     let functions = module
         .callable_defs
         .iter()
@@ -171,8 +171,8 @@ pub fn summarize_module_escapes(module: &BlockPyModule<CodegenModuleShape>) -> E
 }
 
 fn summarize_non_escaping_constructor(
-    module: &BlockPyModule<CodegenModuleShape>,
-    function: &BlockPyFunction<CodegenModuleShape>,
+    module: &BlockPyModule<BlockPyModuleShape>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
 ) -> Option<NonEscapingConstructorSummary> {
     summarize_constructor_with_mode(module, function, ConstructorSummaryMode::NonEscaping).map(
         |summary| NonEscapingConstructorSummary {
@@ -184,8 +184,8 @@ fn summarize_non_escaping_constructor(
 }
 
 fn summarize_straightline_field_initializer(
-    module: &BlockPyModule<CodegenModuleShape>,
-    function: &BlockPyFunction<CodegenModuleShape>,
+    module: &BlockPyModule<BlockPyModuleShape>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
 ) -> Option<FieldInitializerConstructorSummary> {
     summarize_constructor_with_mode(
         module,
@@ -200,8 +200,8 @@ fn summarize_straightline_field_initializer(
 }
 
 pub fn straightline_field_initializer_rejection_reason(
-    module: &BlockPyModule<CodegenModuleShape>,
-    function: &BlockPyFunction<CodegenModuleShape>,
+    module: &BlockPyModule<BlockPyModuleShape>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
 ) -> Option<String> {
     summarize_constructor_with_mode_result(
         module,
@@ -212,16 +212,16 @@ pub fn straightline_field_initializer_rejection_reason(
 }
 
 fn summarize_constructor_with_mode(
-    module: &BlockPyModule<CodegenModuleShape>,
-    function: &BlockPyFunction<CodegenModuleShape>,
+    module: &BlockPyModule<BlockPyModuleShape>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
     mode: ConstructorSummaryMode,
 ) -> Option<ConstructorSummary> {
     summarize_constructor_with_mode_result(module, function, mode).ok()
 }
 
 fn summarize_constructor_with_mode_result(
-    module: &BlockPyModule<CodegenModuleShape>,
-    function: &BlockPyFunction<CodegenModuleShape>,
+    module: &BlockPyModule<BlockPyModuleShape>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
     mode: ConstructorSummaryMode,
 ) -> Result<ConstructorSummary, String> {
     if !function.names.qualname.ends_with(".__init__") {
@@ -266,8 +266,8 @@ enum ConstructorSummaryMode {
 }
 
 struct ConstructorBuilder<'a> {
-    module: &'a BlockPyModule<CodegenModuleShape>,
-    function: &'a BlockPyFunction<CodegenModuleShape>,
+    module: &'a BlockPyModule<BlockPyModuleShape>,
+    function: &'a BlockPyFunction<BlockPyModuleShape>,
     mode: ConstructorSummaryMode,
     self_name: String,
     self_location: Option<LocalLocation>,
@@ -315,9 +315,9 @@ impl ConstructorBuilder<'_> {
         }
     }
 
-    fn scan_instr(&mut self, instr: &InstrCodegen) {
+    fn scan_instr(&mut self, instr: &InstrBlockPy) {
         match instr {
-            InstrCodegen::Store(store) => {
+            InstrBlockPy::Store(store) => {
                 let Some(location) = store.name.location.as_local() else {
                     if self.instr_uses_self_or_alias(&store.value) {
                         self.reject("self used in non-local store value");
@@ -337,7 +337,7 @@ impl ConstructorBuilder<'_> {
                     }
                 }
             }
-            InstrCodegen::Del(del) => {
+            InstrBlockPy::Del(del) => {
                 if let Some(location) = del.name.location.as_local() {
                     self.aliases.remove(&location);
                 }
@@ -345,7 +345,7 @@ impl ConstructorBuilder<'_> {
                     self.reject("deleted self");
                 }
             }
-            InstrCodegen::SetAttr(setattr) if self.is_self_alias(&setattr.value) => {
+            InstrBlockPy::SetAttr(setattr) if self.is_self_alias(&setattr.value) => {
                 if self.instr_uses_self_or_alias(&setattr.attr)
                     || self.instr_uses_self_or_alias(&setattr.replacement)
                 {
@@ -374,7 +374,7 @@ impl ConstructorBuilder<'_> {
         }
     }
 
-    fn scan_term(&mut self, term: &BlockTerm<InstrCodegen>) {
+    fn scan_term(&mut self, term: &BlockTerm<InstrBlockPy>) {
         if self.mode == ConstructorSummaryMode::StraightlineFieldInitializer {
             match term {
                 BlockTerm::Return(value) if self.is_runtime_none(value) => return,
@@ -425,12 +425,12 @@ impl ConstructorBuilder<'_> {
         }
     }
 
-    fn is_self_alias(&mut self, instr: &InstrCodegen) -> bool {
+    fn is_self_alias(&mut self, instr: &InstrBlockPy) -> bool {
         matches!(self.value_alias(instr), Some(ValueAlias::SelfObject))
     }
 
-    fn value_alias(&mut self, instr: &InstrCodegen) -> Option<ValueAlias> {
-        let InstrCodegen::Load(load) = instr else {
+    fn value_alias(&mut self, instr: &InstrBlockPy) -> Option<ValueAlias> {
+        let InstrBlockPy::Load(load) = instr else {
             return None;
         };
         if load.name.id_str() == self.self_name {
@@ -471,8 +471,8 @@ impl ConstructorBuilder<'_> {
         }
     }
 
-    fn constant_string(&self, instr: &InstrCodegen) -> Option<String> {
-        let InstrCodegen::Load(load) = instr else {
+    fn constant_string(&self, instr: &InstrBlockPy) -> Option<String> {
+        let InstrBlockPy::Load(load) = instr else {
             return None;
         };
         let constant_index = load.name.location.as_constant()? as usize;
@@ -485,8 +485,8 @@ impl ConstructorBuilder<'_> {
         }
     }
 
-    fn is_runtime_none(&self, instr: &InstrCodegen) -> bool {
-        let InstrCodegen::Load(load) = instr else {
+    fn is_runtime_none(&self, instr: &InstrBlockPy) -> bool {
+        let InstrBlockPy::Load(load) = instr else {
             return false;
         };
         if load.name.id_str() == "NONE"
@@ -509,7 +509,7 @@ impl ConstructorBuilder<'_> {
         )
     }
 
-    fn field_value(&self, instr: &InstrCodegen) -> ConstructorFieldValue {
+    fn field_value(&self, instr: &InstrBlockPy) -> ConstructorFieldValue {
         match self.value_alias_readonly(instr) {
             Some(ValueAlias::Param {
                 name,
@@ -530,8 +530,8 @@ impl ConstructorBuilder<'_> {
         }
     }
 
-    fn value_alias_readonly(&self, instr: &InstrCodegen) -> Option<ValueAlias> {
-        let InstrCodegen::Load(load) = instr else {
+    fn value_alias_readonly(&self, instr: &InstrBlockPy) -> Option<ValueAlias> {
+        let InstrBlockPy::Load(load) = instr else {
             return None;
         };
         if let Some(location) = load.name.location.as_local() {
@@ -561,13 +561,13 @@ impl ConstructorBuilder<'_> {
         }
     }
 
-    fn instr_uses_self_or_alias(&self, instr: &InstrCodegen) -> bool {
+    fn instr_uses_self_or_alias(&self, instr: &InstrBlockPy) -> bool {
         instr_uses_self(instr, self.self_name.as_str()) || self.instr_uses_self_alias(instr)
     }
 
-    fn instr_uses_self_alias(&self, instr: &InstrCodegen) -> bool {
+    fn instr_uses_self_alias(&self, instr: &InstrBlockPy) -> bool {
         instr_any(instr, |child| match child {
-            InstrCodegen::Load(load) => load
+            InstrBlockPy::Load(load) => load
                 .name
                 .location
                 .as_local()
@@ -578,9 +578,9 @@ impl ConstructorBuilder<'_> {
     }
 }
 
-fn instr_uses_self(instr: &InstrCodegen, self_name: &str) -> bool {
+fn instr_uses_self(instr: &InstrBlockPy, self_name: &str) -> bool {
     instr_any(instr, |child| match child {
-        InstrCodegen::Load(load) => load.name.id_str() == self_name,
+        InstrBlockPy::Load(load) => load.name.id_str() == self_name,
         _ => false,
     })
 }
@@ -595,13 +595,13 @@ mod tests {
         lower_python_to_blockpy_with_tracker_and_options,
     };
 
-    fn lowered(source: &str) -> BlockPyModule<CodegenModuleShape> {
+    fn lowered(source: &str) -> BlockPyModule<BlockPyModuleShape> {
         lower_python_to_blockpy_for_testing(source)
             .expect("transform should succeed")
-            .codegen_module
+            .blockpy_module
     }
 
-    fn lowered_with_runtime_names_as_globals(source: &str) -> BlockPyModule<CodegenModuleShape> {
+    fn lowered_with_runtime_names_as_globals(source: &str) -> BlockPyModule<BlockPyModuleShape> {
         lower_python_to_blockpy_with_tracker_and_options(
             source,
             ModuleNameGen::new(0),
@@ -611,13 +611,13 @@ mod tests {
             },
         )
         .expect("transform should succeed")
-        .codegen_module
+        .blockpy_module
     }
 
     fn function_by_qualname<'a>(
-        module: &'a BlockPyModule<CodegenModuleShape>,
+        module: &'a BlockPyModule<BlockPyModuleShape>,
         qualname: &str,
-    ) -> &'a BlockPyFunction<CodegenModuleShape> {
+    ) -> &'a BlockPyFunction<BlockPyModuleShape> {
         module
             .callable_defs
             .iter()

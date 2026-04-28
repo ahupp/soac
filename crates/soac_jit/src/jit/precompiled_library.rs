@@ -9,12 +9,12 @@ use super::module_data::{
 use super::planning::PlannedJitDeoptResumeModule;
 use super::specialized_helpers;
 use super::symbols::{default_direct_function_symbol, direct_function_symbol};
-use super::typed_pipeline::build_typed_v3_jit_module_plan;
+use super::typed_pipeline::optimize_blockpy;
 use crate::module_constants::ModuleConstantId;
 use crate::module_type::SharedModuleState;
 use pyo3::ffi;
 use soac_core::block_py::BlockPyFunction;
-use soac_ir_blockpy::CodegenModuleShape;
+use soac_ir_blockpy::BlockPyModuleShape;
 use std::ffi::{CStr, CString, c_void};
 use std::mem::MaybeUninit;
 use std::os::unix::ffi::OsStrExt;
@@ -203,7 +203,7 @@ impl PrecompiledLibrary {
 pub(crate) fn lookup_precompiled_direct_function_handle(
     session: &Arc<crate::session::CompileSession>,
     shared_state: &SharedModuleState,
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
 ) -> Result<Option<Arc<CompiledFunctionHandle>>, String> {
     let Some(library) = precompiled_library()? else {
         return Ok(None);
@@ -310,7 +310,7 @@ fn build_precompiled_module_runtime(
 ) -> Result<Arc<PrecompiledModuleRuntime>, String> {
     patch_precompiled_module_constant_slots(library, shared_state)?;
     let deopt_resume_plan =
-        build_typed_v3_jit_module_plan(&shared_state.lowered_module, None, session.env_config()?)?
+        optimize_blockpy(&shared_state.lowered_module, None, session.env_config()?)?
             .deopt_resume
             .clone();
     let module_constant_ptrs = shared_state

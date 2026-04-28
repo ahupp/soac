@@ -9,12 +9,12 @@ use crate::passes::ownership_effects::{
     compute_function_local_live_ins, compute_function_local_must_bound_ins,
     compute_typed_function_local_live_ins, compute_typed_function_local_must_bound_ins,
 };
-use crate::passes::{CodegenModuleShape, InstrCodegen};
+use crate::passes::{BlockPyModuleShape, InstrBlockPy};
 use soac_core::block_py::{
     BlockLabel, BlockPyFunction, BlockPyModule, HasSemanticInstrId, InstrKey, InstrLocationMap,
     LocalLocation, RuntimeFunctionId, current_instr_locations,
 };
-use soac_ir_typed::{FactStore, InstrTyped, PyObjFacts, TypedCodegenModuleShape};
+use soac_ir_typed::{FactStore, InstrTyped, PyObjFacts, TypedBlockPyModuleShape};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
@@ -132,7 +132,7 @@ impl LocalEnvModulePlan {
 
     pub fn validate_for_module(
         &self,
-        module: &BlockPyModule<CodegenModuleShape>,
+        module: &BlockPyModule<BlockPyModuleShape>,
         facts: &FactStore,
     ) -> Result<(), String> {
         validate_local_env_module_plan(module, facts, self)
@@ -342,7 +342,7 @@ impl LocalEnvResumeModulePlan {
 
     pub fn validate_for_module(
         &self,
-        module: &BlockPyModule<CodegenModuleShape>,
+        module: &BlockPyModule<BlockPyModuleShape>,
         local_env_plan: &LocalEnvModulePlan,
         facts: &FactStore,
     ) -> Result<(), String> {
@@ -351,7 +351,7 @@ impl LocalEnvResumeModulePlan {
 }
 
 pub fn plan_local_env_module(
-    module: &BlockPyModule<CodegenModuleShape>,
+    module: &BlockPyModule<BlockPyModuleShape>,
     facts: &FactStore,
 ) -> LocalEnvModulePlan {
     let functions = module
@@ -363,7 +363,7 @@ pub fn plan_local_env_module(
 }
 
 pub fn plan_local_env_resume_module(
-    module: &BlockPyModule<CodegenModuleShape>,
+    module: &BlockPyModule<BlockPyModuleShape>,
     local_env_plan: &LocalEnvModulePlan,
     facts: &FactStore,
 ) -> LocalEnvResumeModulePlan {
@@ -382,7 +382,7 @@ pub fn plan_local_env_resume_module(
 }
 
 pub fn plan_typed_local_env_module(
-    module: &BlockPyModule<TypedCodegenModuleShape>,
+    module: &BlockPyModule<TypedBlockPyModuleShape>,
     facts: &FactStore,
 ) -> LocalEnvModulePlan {
     let functions = module
@@ -399,7 +399,7 @@ pub fn plan_typed_local_env_module(
 }
 
 pub fn plan_typed_local_env_resume_module(
-    module: &BlockPyModule<TypedCodegenModuleShape>,
+    module: &BlockPyModule<TypedBlockPyModuleShape>,
     local_env_plan: &LocalEnvModulePlan,
     facts: &FactStore,
 ) -> LocalEnvResumeModulePlan {
@@ -418,7 +418,7 @@ pub fn plan_typed_local_env_resume_module(
 }
 
 pub fn plan_function_local_env_resume(
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
     local_env_plan: &FunctionLocalPlan,
     facts: &FactStore,
 ) -> FunctionLocalEnvResumePlan {
@@ -467,7 +467,7 @@ pub fn plan_function_local_env_resume(
 }
 
 pub fn plan_typed_function_local_env_resume(
-    function: &BlockPyFunction<TypedCodegenModuleShape>,
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
     local_env_plan: &FunctionLocalPlan,
     facts: &FactStore,
 ) -> FunctionLocalEnvResumePlan {
@@ -516,7 +516,7 @@ pub fn plan_typed_function_local_env_resume(
 }
 
 pub fn validate_local_env_module_plan(
-    module: &BlockPyModule<CodegenModuleShape>,
+    module: &BlockPyModule<BlockPyModuleShape>,
     facts: &FactStore,
     plan: &LocalEnvModulePlan,
 ) -> Result<(), String> {
@@ -554,7 +554,7 @@ pub fn validate_local_env_module_plan(
 }
 
 pub fn validate_local_env_resume_module_plan(
-    module: &BlockPyModule<CodegenModuleShape>,
+    module: &BlockPyModule<BlockPyModuleShape>,
     local_env_plan: &LocalEnvModulePlan,
     facts: &FactStore,
     resume_plan: &LocalEnvResumeModulePlan,
@@ -596,7 +596,7 @@ pub fn validate_local_env_resume_module_plan(
 }
 
 pub fn validate_typed_local_env_module_plan(
-    module: &BlockPyModule<TypedCodegenModuleShape>,
+    module: &BlockPyModule<TypedBlockPyModuleShape>,
     facts: &FactStore,
     plan: &LocalEnvModulePlan,
 ) -> Result<(), String> {
@@ -640,7 +640,7 @@ pub fn validate_typed_local_env_module_plan(
 }
 
 pub fn validate_typed_local_env_resume_module_plan(
-    module: &BlockPyModule<TypedCodegenModuleShape>,
+    module: &BlockPyModule<TypedBlockPyModuleShape>,
     local_env_plan: &LocalEnvModulePlan,
     facts: &FactStore,
     resume_plan: &LocalEnvResumeModulePlan,
@@ -682,7 +682,7 @@ pub fn validate_typed_local_env_resume_module_plan(
 }
 
 pub fn plan_function_locals(
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
     facts: &FactStore,
 ) -> FunctionLocalPlan {
     let Some(storage_layout) = function.storage_layout().as_ref() else {
@@ -795,7 +795,7 @@ pub fn plan_function_locals(
 }
 
 pub fn plan_typed_function_locals(
-    function: &BlockPyFunction<TypedCodegenModuleShape>,
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
     facts: &FactStore,
 ) -> FunctionLocalPlan {
     let Some(storage_layout) = function.storage_layout().as_ref() else {
@@ -908,7 +908,7 @@ pub fn plan_typed_function_locals(
 }
 
 pub fn render_local_env_module_plan(
-    module: &BlockPyModule<CodegenModuleShape>,
+    module: &BlockPyModule<BlockPyModuleShape>,
     facts: &FactStore,
     plan: &LocalEnvModulePlan,
 ) -> Result<String, String> {
@@ -930,7 +930,7 @@ pub fn render_local_env_module_plan(
 }
 
 pub fn render_local_env_resume_module_plan(
-    module: &BlockPyModule<CodegenModuleShape>,
+    module: &BlockPyModule<BlockPyModuleShape>,
     local_env_plan: &LocalEnvModulePlan,
     facts: &FactStore,
     resume_plan: &LocalEnvResumeModulePlan,
@@ -956,7 +956,7 @@ pub fn render_local_env_resume_module_plan(
 }
 
 pub fn render_local_env_resume_function_plan(
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
     plan: &FunctionLocalEnvResumePlan,
 ) -> Result<String, String> {
     let mut out = String::new();
@@ -988,7 +988,7 @@ pub fn render_local_env_resume_function_plan(
 }
 
 pub fn render_local_env_function_plan(
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
     plan: &FunctionLocalPlan,
 ) -> Result<String, String> {
     let mut out = String::new();
@@ -1095,12 +1095,12 @@ fn resume_value_source_for_planned_local(
 
 fn transfer_resume_local_state(
     function_id: RuntimeFunctionId,
-    instr: &InstrCodegen,
+    instr: &InstrBlockPy,
     facts: &FactStore,
     locals: &mut [LocalEnvResumeBinding],
 ) {
     match instr {
-        InstrCodegen::Store(op) => {
+        InstrBlockPy::Store(op) => {
             let Some(location) = op.name.local_location() else {
                 return;
             };
@@ -1123,7 +1123,7 @@ fn transfer_resume_local_state(
                 binding.value = py_facts;
             }
         }
-        InstrCodegen::Del(op) => {
+        InstrBlockPy::Del(op) => {
             let Some(location) = op.name.local_location() else {
                 return;
             };
@@ -1204,7 +1204,7 @@ fn local_ref_kind_for_resume_value(facts: Option<PyObjFacts>) -> LocalRefKind {
 }
 
 fn validate_function_local_plan(
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
     facts: &FactStore,
     plan: &FunctionLocalPlan,
     errors: &mut Vec<String>,
@@ -1219,7 +1219,7 @@ fn validate_function_local_plan(
 }
 
 fn local_ref_kind_for_block_entry(
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
     is_entry_block: bool,
     name: &str,
     is_explicit_block_param: bool,
@@ -1244,7 +1244,7 @@ fn local_ref_kind_for_block_entry(
 }
 
 fn local_ref_kind_for_typed_block_entry(
-    function: &BlockPyFunction<TypedCodegenModuleShape>,
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
     is_entry_block: bool,
     name: &str,
     is_explicit_block_param: bool,
@@ -1290,7 +1290,7 @@ def f(flag):
 "#,
         )
         .expect("transform should succeed")
-        .codegen_module;
+        .blockpy_module;
         let facts = infer_module_value_facts(&lowered);
         let plan = plan_local_env_module(&lowered, &facts);
 
@@ -1325,7 +1325,7 @@ def f():
 "#,
         )
         .expect("transform should succeed")
-        .codegen_module;
+        .blockpy_module;
         let facts = infer_module_value_facts(&lowered);
         let function = lowered
             .callable_defs
@@ -1376,7 +1376,7 @@ def choose(flag, x):
 "#,
         )
         .expect("transform should succeed")
-        .codegen_module;
+        .blockpy_module;
         let facts = infer_module_value_facts(&lowered);
         let local_plan = plan_local_env_module(&lowered, &facts);
         let resume_plan = plan_local_env_resume_module(&lowered, &local_plan, &facts);
@@ -1427,7 +1427,7 @@ def f():
 "#,
         )
         .expect("transform should succeed")
-        .codegen_module;
+        .blockpy_module;
         let facts = infer_module_value_facts(&lowered);
         let local_plan = plan_local_env_module(&lowered, &facts);
         let resume_plan = plan_local_env_resume_module(&lowered, &local_plan, &facts);

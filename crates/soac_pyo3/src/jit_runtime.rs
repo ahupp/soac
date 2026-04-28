@@ -7,9 +7,9 @@ use soac_core::block_py::{
     BlockPyFunction, BlockPyModule, FunctionExecutionMode, RuntimeFunctionId,
 };
 use soac_core::pass_tracker::RecordingPassTracker;
-use soac_driver::codegen_cache::{PythonModuleCacheSource, hash_module_source};
-use soac_driver::{CodegenPreparationOptions, PreOptimizationCacheRequest, prepare_codegen_module};
-use soac_ir_blockpy::CodegenModuleShape;
+use soac_driver::blockpy_cache::{PythonModuleCacheSource, hash_module_source};
+use soac_driver::{PreOptimizationCacheRequest, SourceToBlockPyOptions, source_to_blockpy};
+use soac_ir_blockpy::BlockPyModuleShape;
 use soac_jit::module_type::{ModuleInfo, SoacExtModule};
 use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
@@ -323,12 +323,12 @@ fn collect_original_code_objects(
     Ok(())
 }
 
-fn is_synthetic_class_helper(function: &BlockPyFunction<CodegenModuleShape>) -> bool {
+fn is_synthetic_class_helper(function: &BlockPyFunction<BlockPyModuleShape>) -> bool {
     function.names.bind_name.starts_with("_dp_class_ns_")
         || function.names.bind_name.starts_with("_dp_define_class_")
 }
 
-fn original_code_lookup_key(function: &BlockPyFunction<CodegenModuleShape>) -> Option<&str> {
+fn original_code_lookup_key(function: &BlockPyFunction<BlockPyModuleShape>) -> Option<&str> {
     if function.execution_mode() == FunctionExecutionMode::Interpreted {
         return None;
     }
@@ -345,7 +345,7 @@ fn original_code_lookup_key(function: &BlockPyFunction<CodegenModuleShape>) -> O
 fn match_original_code_to_functions(
     py: Python<'_>,
     module_code: &Bound<'_, PyAny>,
-    lowered_module: &BlockPyModule<CodegenModuleShape>,
+    lowered_module: &BlockPyModule<BlockPyModuleShape>,
 ) -> PyResult<OriginalCodeMap> {
     let code_type = PyModule::import(py, "types")?.getattr("CodeType")?;
     let mut code_by_qualname = HashMap::new();
@@ -400,9 +400,9 @@ fn resolve_module_package(module_globals: &Bound<'_, PyAny>, operation: &str) ->
 }
 
 fn lookup_module_init_function(
-    module: &BlockPyModule<CodegenModuleShape>,
+    module: &BlockPyModule<BlockPyModuleShape>,
     module_name: &str,
-) -> PyResult<BlockPyFunction<CodegenModuleShape>> {
+) -> PyResult<BlockPyFunction<BlockPyModuleShape>> {
     module
         .callable_defs
         .iter()
@@ -460,7 +460,7 @@ fn create_module(py: Python<'_>, path: &str, spec: Py<PyAny>) -> PyResult<Py<PyA
     let pre_optimization_cache =
         pre_optimization_module_cache(session.as_ref(), module_name.as_str(), module_cache_source)?;
     let env_config = session.env_config().map_err(PyRuntimeError::new_err)?;
-    let preparation_options = CodegenPreparationOptions {
+    let preparation_options = SourceToBlockPyOptions {
         lowering: soac_lowering::LoweringOptions {
             runtime_names_as_globals,
         },
@@ -468,8 +468,8 @@ fn create_module(py: Python<'_>, path: &str, spec: Py<PyAny>) -> PyResult<Py<PyA
     };
     let mut pass_tracker = RecordingPassTracker::new();
     let lowering_start = Instant::now();
-    let codegen_module = time_phase(&mut create_timings, "lower_blockpy", || {
-        prepare_codegen_module(
+    let blockpy_module = time_phase(&mut create_timings, "lower_blockpy", || {
+        source_to_blockpy(
             &source,
             session.module_name_gen(),
             preparation_options,
@@ -486,15 +486,15 @@ fn create_module(py: Python<'_>, path: &str, spec: Py<PyAny>) -> PyResult<Py<PyA
             elapsed: timing.elapsed,
         })
         .collect();
-    let function_count = codegen_module.callable_defs.len();
-    let counter_count = codegen_module.counter_defs.len();
-    let global_name_count = codegen_module.global_names.len();
+    let function_count = blockpy_module.callable_defs.len();
+    let counter_count = blockpy_module.counter_defs.len();
+    let global_name_count = blockpy_module.global_names.len();
     let module_code = time_phase(&mut create_timings, "compile_original_code", || {
         compile_original_module_code(py, &source, path)
     })?;
     let original_code_by_function_id =
         time_phase(&mut create_timings, "match_original_code", || {
-            match_original_code_to_functions(py, module_code.bind(py), &codegen_module)
+            match_original_code_to_functions(py, module_code.bind(py), &blockpy_module)
         })?;
     let original_code_count = original_code_by_function_id.len();
     let module = time_phase(&mut create_timings, "soac_ext_module_create", || {
@@ -502,7 +502,7 @@ fn create_module(py: Python<'_>, path: &str, spec: Py<PyAny>) -> PyResult<Py<PyA
             py,
             spec.as_any(),
             &session,
-            codegen_module,
+            blockpy_module,
             module_info,
             original_code_by_function_id,
         )

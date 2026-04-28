@@ -18,7 +18,7 @@ use soac_core::profile::{
     CounterDumpTypeKey, CounterDumpTypeKeyLayout, CounterDumpTypeTableEntry,
 };
 use soac_instrument::InstrumentationConfig;
-use soac_ir_blockpy::CodegenModuleShape;
+use soac_ir_blockpy::BlockPyModuleShape;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, c_int, c_void};
 use std::fs::{OpenOptions, create_dir_all};
@@ -51,7 +51,7 @@ pub struct ModuleInfo {
 }
 
 pub struct SharedModuleState {
-    pub lowered_module: BlockPyModule<CodegenModuleShape>,
+    pub lowered_module: BlockPyModule<BlockPyModuleShape>,
     pub module_name: String,
     pub package_name: String,
     pub source_hash: u64,
@@ -152,7 +152,7 @@ impl SharedModuleState {
     pub fn lookup_function(
         &self,
         function_id: RuntimeFunctionId,
-    ) -> Option<&BlockPyFunction<CodegenModuleShape>> {
+    ) -> Option<&BlockPyFunction<BlockPyModuleShape>> {
         let function_index = self.function_index_by_id.get(&function_id).copied()?;
         let function = self.lowered_module.callable_defs.get(function_index)?;
         assert_eq!(function.function_id, function_id);
@@ -182,7 +182,7 @@ impl SharedModuleState {
         &self,
         compile_session: &crate::session::CompileSession,
         function_id: RuntimeFunctionId,
-    ) -> Result<Option<BlockPyFunction<CodegenModuleShape>>, String> {
+    ) -> Result<Option<BlockPyFunction<BlockPyModuleShape>>, String> {
         if function_id == RuntimeFunctionId::global() {
             return Ok(None);
         }
@@ -369,7 +369,7 @@ impl SharedModuleState {
 
     pub(crate) fn append_jit_codegen_log(
         &self,
-        function: &BlockPyFunction<CodegenModuleShape>,
+        function: &BlockPyFunction<BlockPyModuleShape>,
         entry_kind: &str,
         elapsed: Duration,
         status: &str,
@@ -835,7 +835,7 @@ pub(crate) fn build_module_constant_objects(
 
 pub fn build_shared_state_for_inspection(
     py: Python<'_>,
-    lowered_module: BlockPyModule<CodegenModuleShape>,
+    lowered_module: BlockPyModule<BlockPyModuleShape>,
     module_name: &str,
     package_name: &str,
 ) -> PyResult<Arc<SharedModuleState>> {
@@ -850,7 +850,7 @@ pub fn build_shared_state_for_inspection(
 
 pub fn build_shared_state_for_inspection_with_source_hash(
     py: Python<'_>,
-    lowered_module: BlockPyModule<CodegenModuleShape>,
+    lowered_module: BlockPyModule<BlockPyModuleShape>,
     module_name: &str,
     package_name: &str,
     source_hash: u64,
@@ -867,7 +867,7 @@ pub fn build_shared_state_for_inspection_with_source_hash(
 
 pub fn build_shared_state_for_inspection_with_placeholder_constants(
     py: Python<'_>,
-    lowered_module: BlockPyModule<CodegenModuleShape>,
+    lowered_module: BlockPyModule<BlockPyModuleShape>,
     module_name: &str,
     package_name: &str,
 ) -> PyResult<Arc<SharedModuleState>> {
@@ -902,7 +902,7 @@ pub fn build_shared_state_for_inspection_with_placeholder_constants(
 
 pub fn build_shared_state_for_inspection_with_placeholder_constants_and_source_hash(
     py: Python<'_>,
-    lowered_module: BlockPyModule<CodegenModuleShape>,
+    lowered_module: BlockPyModule<BlockPyModuleShape>,
     module_name: &str,
     package_name: &str,
     source_hash: u64,
@@ -939,7 +939,7 @@ pub fn build_shared_state_for_inspection_with_placeholder_constants_and_source_h
 #[cfg(test)]
 pub(crate) fn build_shared_state_for_testing_with_original_code(
     py: Python<'_>,
-    lowered_module: BlockPyModule<CodegenModuleShape>,
+    lowered_module: BlockPyModule<BlockPyModuleShape>,
     module_name: &str,
     package_name: &str,
     original_code_by_function_id: HashMap<RuntimeFunctionId, Py<PyAny>>,
@@ -955,7 +955,7 @@ pub(crate) fn build_shared_state_for_testing_with_original_code(
 
 fn build_shared_state_for_inspection_with_original_code(
     py: Python<'_>,
-    lowered_module: BlockPyModule<CodegenModuleShape>,
+    lowered_module: BlockPyModule<BlockPyModuleShape>,
     module_name: &str,
     package_name: &str,
     original_code_by_function_id: HashMap<RuntimeFunctionId, Py<PyAny>>,
@@ -972,7 +972,7 @@ fn build_shared_state_for_inspection_with_original_code(
 
 fn build_shared_state_for_inspection_with_original_code_and_source_hash(
     py: Python<'_>,
-    lowered_module: BlockPyModule<CodegenModuleShape>,
+    lowered_module: BlockPyModule<BlockPyModuleShape>,
     module_name: &str,
     package_name: &str,
     source_hash: u64,
@@ -1009,7 +1009,7 @@ fn build_shared_state_for_inspection_with_original_code_and_source_hash(
 #[cfg(test)]
 pub(crate) fn build_shared_state_for_testing(
     py: Python<'_>,
-    lowered_module: BlockPyModule<CodegenModuleShape>,
+    lowered_module: BlockPyModule<BlockPyModuleShape>,
     module_name: &str,
     package_name: &str,
 ) -> PyResult<Arc<SharedModuleState>> {
@@ -1017,7 +1017,7 @@ pub(crate) fn build_shared_state_for_testing(
 }
 
 fn build_function_index_by_id(
-    module: &BlockPyModule<CodegenModuleShape>,
+    module: &BlockPyModule<BlockPyModuleShape>,
 ) -> PyResult<HashMap<RuntimeFunctionId, usize>> {
     let mut function_index_by_id = HashMap::with_capacity(module.callable_defs.len());
     for (function_index, function) in module.callable_defs.iter().enumerate() {
@@ -1045,7 +1045,7 @@ impl SoacExtModuleState {
         &mut self,
         py: Python<'_>,
         compile_session: &Arc<crate::session::CompileSession>,
-        lowered_module: BlockPyModule<CodegenModuleShape>,
+        lowered_module: BlockPyModule<BlockPyModuleShape>,
         original_code_by_function_id: HashMap<RuntimeFunctionId, Py<PyAny>>,
         module_name: String,
         package_name: String,
@@ -1151,7 +1151,7 @@ fn specialization_mode_records_counters() -> bool {
 
 fn append_jit_codegen_log(
     module_state: &SharedModuleState,
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
     entry_kind: &str,
     elapsed: Duration,
     status: &str,
@@ -1670,7 +1670,7 @@ impl SoacExtModule {
         py: Python<'_>,
         spec: &Bound<'_, PyAny>,
         compile_session: &Arc<crate::session::CompileSession>,
-        mut lowered_module: BlockPyModule<CodegenModuleShape>,
+        mut lowered_module: BlockPyModule<BlockPyModuleShape>,
         mut module_info: ModuleInfo,
         original_code_by_function_id: HashMap<RuntimeFunctionId, Py<PyAny>>,
     ) -> PyResult<Py<PyAny>> {
@@ -1730,18 +1730,18 @@ mod test {
     use pyo3::types::PyModule;
     use soac_core::profile::COUNTER_DUMP_MAGIC;
     use soac_instrument::{InstrumentationConfig, define_typed_module_counter_defs};
-    use soac_ir_typed::lower_codegen_module_to_typed;
+    use soac_ir_typed::lower_blockpy_module_to_typed;
     use soac_lowering::lower_python_to_blockpy_for_testing;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn define_module_block_entry_counters(module: &mut BlockPyModule<CodegenModuleShape>) {
+    fn define_module_block_entry_counters(module: &mut BlockPyModule<BlockPyModuleShape>) {
         let config = InstrumentationConfig::from_env_config(
             &SoacEnvConfig::default()
                 .with_specialization_mode(Some(SpecializationMode::Profile))
                 .with_profiled_cold_blocks_enabled(true),
         );
-        let mut typed_for_counters = lower_codegen_module_to_typed(module.clone());
+        let mut typed_for_counters = lower_blockpy_module_to_typed(module.clone());
         define_typed_module_counter_defs(&mut typed_for_counters, &config)
             .expect("typed block-entry counter definitions should succeed");
         module.counter_defs = typed_for_counters.counter_defs;
@@ -1756,7 +1756,7 @@ def f():
 "#,
         )
         .expect("transform should succeed")
-        .codegen_module;
+        .blockpy_module;
         define_module_block_entry_counters(&mut lowered);
 
         let function = lowered
@@ -1819,7 +1819,7 @@ def f(x):
 "#,
         )
         .expect("transform should succeed")
-        .codegen_module;
+        .blockpy_module;
 
         let function = lowered
             .callable_defs
@@ -2024,7 +2024,7 @@ def f():
 "#,
         )
         .expect("transform should succeed")
-        .codegen_module;
+        .blockpy_module;
         define_module_block_entry_counters(&mut lowered);
 
         let shared_state = SharedModuleState {

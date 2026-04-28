@@ -16,7 +16,7 @@ use ruff_python_ast::{self as ast, Stmt};
 use ruff_python_parser::{parse_module, ParseError};
 use soac_core::block_py::{BlockPyModule, ModuleNameGen, PrettyPrint, PrettyPrinter};
 use soac_core::pass_tracker::{PassTracker, RecordingPassTracker};
-use soac_ir_blockpy::CodegenModuleShape;
+use soac_ir_blockpy::BlockPyModuleShape;
 use std::time::{Duration, Instant};
 
 #[derive(Debug)]
@@ -59,7 +59,7 @@ impl From<AnyhowError> for LoweringError {
 
 pub struct LoweringResult<P = RecordingPassTracker> {
     pub total_time: Duration,
-    pub codegen_module: BlockPyModule<CodegenModuleShape>,
+    pub blockpy_module: BlockPyModule<BlockPyModuleShape>,
     pub pass_tracker: P,
 }
 
@@ -105,7 +105,7 @@ where
 {
     let total_start = Instant::now();
 
-    let codegen_module = lower_source_to_codegen_module_with_tracker(
+    let blockpy_module = lower_source_to_blockpy_module_with_tracker(
         source,
         module_name_gen,
         &mut pass_tracker,
@@ -114,7 +114,7 @@ where
 
     Ok(LoweringResult {
         total_time: total_start.elapsed(),
-        codegen_module,
+        blockpy_module,
         pass_tracker,
     })
 }
@@ -164,12 +164,12 @@ fn rewrite_ast_to_ast_module(context: &Context, mut module: Suite) -> AstToAstPa
     }
 }
 
-pub fn lower_source_to_codegen_module_with_tracker(
+pub fn lower_source_to_blockpy_module_with_tracker(
     source: &str,
     module_name_gen: ModuleNameGen,
     pass_tracker: &mut impl PassTracker,
     options: LoweringOptions,
-) -> Result<BlockPyModule<CodegenModuleShape>> {
+) -> Result<BlockPyModule<BlockPyModuleShape>> {
     crate::namegen::reset_namegen_state();
     let module =
         pass_tracker.record_timing("parse", || -> std::result::Result<_, ParseError> {
@@ -291,18 +291,18 @@ pub fn lower_source_to_codegen_module_with_tracker(
                 &global_index,
             )
         });
-    let bb_codegen: BlockPyModule<CodegenModuleShape> = pass_tracker.run_pass("bb_codegen", || {
-        let mut bb_codegen: BlockPyModule<CodegenModuleShape> =
+    let blockpy: BlockPyModule<BlockPyModuleShape> = pass_tracker.run_pass("blockpy", || {
+        let mut blockpy: BlockPyModule<BlockPyModuleShape> =
             crate::passes::blockpy_to_bb::strings::hoist_module_constants(&bb_prepared);
-        soac_ir_blockpy::ensure_constructor_entry_functions(&mut bb_codegen);
-        crate::block_py::cfg::relabel_dense_bb_module(&mut bb_codegen);
-        soac_ir_blockpy::assign_codegen_module_instr_ids(bb_codegen)
+        soac_ir_blockpy::ensure_constructor_entry_functions(&mut blockpy);
+        crate::block_py::cfg::relabel_dense_bb_module(&mut blockpy);
+        soac_ir_blockpy::assign_blockpy_module_instr_ids(blockpy)
     });
     pass_tracker.record_timing("validate", || {
-        crate::block_py::validate::validate_codegen_module(&bb_codegen).map_err(anyhow::Error::msg)
+        crate::block_py::validate::validate_blockpy_module(&blockpy).map_err(anyhow::Error::msg)
     })?;
 
-    Ok(bb_codegen)
+    Ok(blockpy)
 }
 
 pub(crate) fn wrap_module_init(semantic_state: &mut SemanticAstState, module: &mut Suite) {

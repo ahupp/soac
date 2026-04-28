@@ -20,7 +20,7 @@ use super::precompiled_object::{
 use super::runtime_support::compile_runtime_support_clif_for_object;
 use super::symbols::direct_function_backend_name;
 use super::typed_pipeline::{
-    apply_profile_call_emission_plans_to_typed_function, build_typed_v3_jit_module_plan,
+    apply_profile_call_emission_plans_to_typed_function, optimize_blockpy,
 };
 use super::{
     BuildSpecializedFunctionOptions, SpecializationProfile,
@@ -34,8 +34,8 @@ use cranelift_jit::JITModule;
 use soac_core::block_py::{
     BlockPyFunction, BlockPyModule, PersistentFunctionId, RuntimeFunctionId, RuntimeModuleId,
 };
-use soac_ir_blockpy::CodegenModuleShape;
-use soac_ir_typed::{TypedCodegenModuleShape, lower_codegen_function_to_typed};
+use soac_ir_blockpy::BlockPyModuleShape;
+use soac_ir_typed::{TypedBlockPyModuleShape, lower_blockpy_function_to_typed};
 use soac_opt::passes::lower_typed_function_call_access_plan_instrs;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -53,7 +53,7 @@ pub struct PrecompileObjectSummary {
 pub struct PrecompileModuleIndexEntry<'a> {
     pub module_name: &'a str,
     pub source_hash: u64,
-    pub module: &'a BlockPyModule<CodegenModuleShape>,
+    pub module: &'a BlockPyModule<BlockPyModuleShape>,
 }
 
 #[derive(Debug, Clone)]
@@ -61,7 +61,7 @@ struct PrecompileIndexedFunction {
     module_name: String,
     source_hash: u64,
     persistent_id: PersistentFunctionId,
-    function: BlockPyFunction<CodegenModuleShape>,
+    function: BlockPyFunction<BlockPyModuleShape>,
 }
 
 #[derive(Debug, Clone)]
@@ -152,10 +152,10 @@ impl PrecompileModuleIndex {
 }
 
 fn precompile_external_direct_call_target_functions(
-    module: &BlockPyModule<TypedCodegenModuleShape>,
+    module: &BlockPyModule<TypedBlockPyModuleShape>,
     profile: &SpecializationProfile<'_>,
     module_index: Option<&PrecompileModuleIndex>,
-) -> Result<HashMap<RuntimeFunctionId, BlockPyFunction<TypedCodegenModuleShape>>, String> {
+) -> Result<HashMap<RuntimeFunctionId, BlockPyFunction<TypedBlockPyModuleShape>>, String> {
     let Some(module_index) = module_index else {
         return Ok(HashMap::new());
     };
@@ -174,7 +174,7 @@ fn precompile_external_direct_call_target_functions(
             module_index.function(function_id).map(|target| {
                 (
                     function_id,
-                    lower_codegen_function_to_typed(target.function.clone()),
+                    lower_blockpy_function_to_typed(target.function.clone()),
                 )
             })
         })
@@ -184,7 +184,7 @@ fn precompile_external_direct_call_target_functions(
 pub fn precompile_codegen_module_to_object_file(
     module_name: &str,
     source_hash: u64,
-    module: &BlockPyModule<CodegenModuleShape>,
+    module: &BlockPyModule<BlockPyModuleShape>,
     counter_dump_path: Option<&Path>,
     cache_identity: Option<&str>,
     module_index: Option<&PrecompileModuleIndex>,
@@ -238,7 +238,7 @@ pub(super) struct PrecompiledObjectBytes {
 pub(super) fn precompile_codegen_module_to_object_bytes(
     module_name: &str,
     source_hash: u64,
-    module: &BlockPyModule<CodegenModuleShape>,
+    module: &BlockPyModule<BlockPyModuleShape>,
     counter_dump_path: Option<&Path>,
     cache_identity: Option<&str>,
     module_index: Option<&PrecompileModuleIndex>,
@@ -381,8 +381,7 @@ pub(super) fn precompile_codegen_module_to_object_bytes(
         module_index,
         counter_dump_path,
     )?;
-    let jit_module_plan =
-        build_typed_v3_jit_module_plan(module, Some(&specialization_profile), env_config)?;
+    let jit_module_plan = optimize_blockpy(module, Some(&specialization_profile), env_config)?;
     let planned_module = jit_module_plan.module.as_ref();
     let external_direct_call_target_functions = precompile_external_direct_call_target_functions(
         planned_module,

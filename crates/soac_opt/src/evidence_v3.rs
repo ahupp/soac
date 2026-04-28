@@ -120,24 +120,24 @@ mod tests {
     }
 
     fn with_instr_id(
-        instr: soac_ir_blockpy::InstrCodegen,
+        instr: soac_ir_blockpy::InstrBlockPy,
         index: u32,
-    ) -> soac_ir_blockpy::InstrCodegen {
+    ) -> soac_ir_blockpy::InstrBlockPy {
         instr.with_meta(Meta {
             instr_id: Some(instr_id(index)),
             ..Meta::synthetic()
         })
     }
 
-    fn local(name: &str, slot: u32) -> soac_ir_blockpy::InstrCodegen {
-        soac_ir_blockpy::InstrCodegen::Load(Load::new(ResolvedName {
+    fn local(name: &str, slot: u32) -> soac_ir_blockpy::InstrBlockPy {
+        soac_ir_blockpy::InstrBlockPy::Load(Load::new(ResolvedName {
             id: BlockPyName::new(name),
             location: NameLocation::Local(LocalLocation(slot)),
         }))
     }
 
-    fn constant(index: u32) -> soac_ir_blockpy::InstrCodegen {
-        soac_ir_blockpy::InstrCodegen::Load(Load::new(ResolvedName {
+    fn constant(index: u32) -> soac_ir_blockpy::InstrBlockPy {
+        soac_ir_blockpy::InstrBlockPy::Load(Load::new(ResolvedName {
             id: BlockPyName::new("__dp_constant"),
             location: NameLocation::Constant(index),
         }))
@@ -145,12 +145,12 @@ mod tests {
 
     fn binary(
         op: BinOpKind,
-        left: soac_ir_blockpy::InstrCodegen,
-        right: soac_ir_blockpy::InstrCodegen,
+        left: soac_ir_blockpy::InstrBlockPy,
+        right: soac_ir_blockpy::InstrBlockPy,
         id: u32,
-    ) -> soac_ir_blockpy::InstrCodegen {
+    ) -> soac_ir_blockpy::InstrBlockPy {
         with_instr_id(
-            soac_ir_blockpy::InstrCodegen::BinOp(BinOp::new(op, left, right)),
+            soac_ir_blockpy::InstrBlockPy::BinOp(BinOp::new(op, left, right)),
             id,
         )
     }

@@ -1,13 +1,13 @@
 use super::lower_try_jump_exception_flow;
 use crate::block_py::{
     validate_module, AbruptKind, BindingKind, BlockArg, BlockEdge, BlockLabel, BlockParam,
-    BlockParamRole, BlockTerm, CellBindingKind, CodegenBlock, InstrCodegen, InstrResolved,
+    BlockParamRole, BlockPyBlock, BlockTerm, CellBindingKind, InstrBlockPy, InstrResolved,
     InstrWithConstantNone, Literal, NameLocation, NumberLiteral, NumberLiteralValue,
     ResolvedStorageBlock, StorageLayout,
 };
 use crate::lower_python_to_blockpy_for_testing;
 use crate::pass_tracker::LoweringPassTrackerInternalExt;
-use soac_ir_blockpy::CodegenModuleShape;
+use soac_ir_blockpy::BlockPyModuleShape;
 
 fn tracked_name_binding_module(
     source: &str,
@@ -20,12 +20,12 @@ fn tracked_name_binding_module(
         .clone()
 }
 
-fn tracked_codegen_module(source: &str) -> crate::block_py::BlockPyModule<CodegenModuleShape> {
+fn tracked_blockpy_module(source: &str) -> crate::block_py::BlockPyModule<BlockPyModuleShape> {
     let name_binding = tracked_name_binding_module(source);
     let lowered = lower_try_jump_exception_flow(&name_binding);
     let mut codegen = crate::passes::blockpy_to_bb::strings::hoist_module_constants(&lowered);
     crate::block_py::cfg::relabel_dense_bb_module(&mut codegen);
-    soac_ir_blockpy::assign_codegen_module_instr_ids(codegen)
+    soac_ir_blockpy::assign_blockpy_module_instr_ids(codegen)
 }
 
 fn is_return_of_number_constant(term: &BlockTerm<InstrResolved>) -> bool {
@@ -117,7 +117,7 @@ fn rejects_try_jump_with_unknown_label() {
 def f():
     return 1
 "#;
-    let mut module = tracked_codegen_module(source);
+    let mut module = tracked_blockpy_module(source);
     let function = module
         .callable_defs
         .first_mut()
@@ -139,7 +139,7 @@ def f(x):
         return 1
     return 2
 "#;
-    let mut module = tracked_codegen_module(source);
+    let mut module = tracked_blockpy_module(source);
     let function = module
         .callable_defs
         .first_mut()
@@ -160,7 +160,7 @@ fn rejects_exception_edge_with_wrong_arg_arity() {
 def f():
     return 1
 "#;
-    let mut module = tracked_codegen_module(source);
+    let mut module = tracked_blockpy_module(source);
     let function = module
         .callable_defs
         .first_mut()
@@ -183,7 +183,7 @@ fn rejects_exception_edge_with_abrupt_kind_arg() {
 def f():
     return 1
 "#;
-    let mut module = tracked_codegen_module(source);
+    let mut module = tracked_blockpy_module(source);
     let function = module
         .callable_defs
         .first_mut()
@@ -210,17 +210,17 @@ fn rejects_jump_that_implicitly_drops_renamed_exception_param() {
 def f():
     return 1
 "#;
-    let mut module = tracked_codegen_module(source);
+    let mut module = tracked_blockpy_module(source);
     let function = module
         .callable_defs
         .first_mut()
         .expect("must contain function");
     function.blocks[0].set_exception_param("_dp_yield_from_exc");
     let target = BlockLabel::from_index(function.blocks.len());
-    function.blocks.push(CodegenBlock {
+    function.blocks.push(BlockPyBlock {
         label: target,
         body: vec![],
-        term: BlockTerm::<InstrCodegen>::Return(InstrCodegen::constant_none()),
+        term: BlockTerm::<InstrBlockPy>::Return(InstrBlockPy::constant_none()),
         params: vec![BlockParam {
             name: "_dp_try_exc".to_string(),
             role: BlockParamRole::Exception,
@@ -247,7 +247,7 @@ fn rejects_semantic_cell_binding_storage_drift_from_storage_layout() {
 def f():
     return 1
 "#;
-    let mut module = tracked_codegen_module(source);
+    let mut module = tracked_blockpy_module(source);
     let function = module
         .callable_defs
         .first_mut()

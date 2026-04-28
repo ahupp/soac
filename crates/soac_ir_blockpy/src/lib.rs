@@ -16,9 +16,9 @@ use crate::block_py::{
 use soac_macros::{DelegateMatchDefault, enum_broadcast};
 
 pub use crate::instr_id::{
-    assign_codegen_module_instr_ids, assign_missing_codegen_function_instr_ids,
-    reassign_codegen_function_instr_ids, reassign_codegen_module_instr_ids,
-    validate_codegen_instr_ids,
+    assign_blockpy_module_instr_ids, assign_missing_blockpy_function_instr_ids,
+    reassign_blockpy_function_instr_ids, reassign_blockpy_module_instr_ids,
+    validate_blockpy_instr_ids,
 };
 pub use constructor_entries::{
     CONSTRUCTOR_ENTRY_FUNCTION_NAME, CONSTRUCTOR_ENTRY_TYPE_PARAM_NAME,
@@ -29,7 +29,7 @@ pub use constructor_entries::{
 /// Final lowered BlockPy form consumed by optimization, instrumentation, and JIT.
 ///
 /// Compared with resolved-storage BlockPy, module constants have been hoisted
-/// into the module constant table and codegen-facing operations such as
+/// into the module constant table and BlockPy-only operations such as
 /// explicit counter increments can appear.
 #[derive(
     Clone,
@@ -48,7 +48,7 @@ pub use constructor_entries::{
     __C: rkyv::validation::ArchiveContext,
 )))]
 #[enum_broadcast(HasMeta, WithMeta, ChildVisitable, Mappable, PrettyPrint, Debug)]
-pub enum InstrCodegen {
+pub enum InstrBlockPy {
     BinOp(#[rkyv(omit_bounds)] BinOp<Self>),
     UnaryOp(#[rkyv(omit_bounds)] UnaryOp<Self>),
     Tuple(#[rkyv(omit_bounds)] Tuple<Self>),
@@ -67,28 +67,28 @@ pub enum InstrCodegen {
     MakeFunctionWithClosure(#[rkyv(omit_bounds)] MakeFunctionWithClosure<Self>),
 }
 
-impl Instr for InstrCodegen {
+impl Instr for InstrBlockPy {
     type Name = ResolvedName;
     type Extra = ();
 }
 
-impl InstrWithConstantNone for InstrCodegen {
+impl InstrWithConstantNone for InstrBlockPy {
     fn constant_none() -> Self {
         Load::new(ResolvedName::runtime_name("NONE")).into()
     }
 }
 
-/// Module shape for final codegen-ready BlockPy.
+/// Module shape for final pre-typed BlockPy.
 #[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-pub struct CodegenModuleShape;
+pub struct BlockPyModuleShape;
 
-impl ModuleShape for CodegenModuleShape {
-    type Instr = InstrCodegen;
+impl ModuleShape for BlockPyModuleShape {
+    type Instr = InstrBlockPy;
     type ModuleConstant = ConstantExpr;
     type BlockExtra = ();
 }
 
-impl BlockPyFormat for CodegenModuleShape {
+impl BlockPyFormat for BlockPyModuleShape {
     fn block_metadata_lines(block: &Block<Self::Instr, Self::BlockExtra>) -> Vec<String> {
         let mut lines = Vec::new();
         if !block.params.is_empty() {

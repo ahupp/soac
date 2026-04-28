@@ -3,7 +3,7 @@ use crate::template::py_stmt;
 use soac_core::block_py::{BlockTerm, ChildVisitable, FunctionExecutionMode, PrettyPrint, Visit};
 use soac_core::pass_tracker::{PassTracker, RecordingPassTracker};
 use soac_ir_blockpy::{
-    constructor_entry_function_id_for_init, InstrCodegen, CONSTRUCTOR_ENTRY_FUNCTION_NAME,
+    constructor_entry_function_id_for_init, InstrBlockPy, CONSTRUCTOR_ENTRY_FUNCTION_NAME,
     CONSTRUCTOR_ENTRY_TYPE_PARAM_NAME,
 };
 
@@ -69,7 +69,7 @@ fn pure_lowering_does_not_insert_counters() {
         "def f(x):\n    if x:\n        return 1\n    return 0\n",
     )
     .expect("lowering should succeed")
-    .codegen_module;
+    .blockpy_module;
 
     assert!(lowered.counter_defs.is_empty());
 
@@ -91,7 +91,7 @@ fn class_lowering_adds_constructor_entry_function() {
         "class C:\n    def __init__(self, value, *, scale=1):\n        self.value = value * scale\n",
     )
     .expect("lowering should succeed")
-    .codegen_module;
+    .blockpy_module;
 
     let init_function = lowered
         .callable_defs
@@ -123,7 +123,7 @@ fn class_lowering_adds_constructor_entry_function() {
     );
     assert!(matches!(
         constructor_entry.blocks[0].term,
-        BlockTerm::Return(InstrCodegen::Call(_))
+        BlockTerm::Return(InstrBlockPy::Call(_))
     ));
 }
 
@@ -132,9 +132,9 @@ struct IncrementCounterProbe {
     increment_counters: usize,
 }
 
-impl Visit<InstrCodegen> for IncrementCounterProbe {
-    fn visit_instr(&mut self, expr: &InstrCodegen) {
-        if matches!(expr, InstrCodegen::IncrementCounter(_)) {
+impl Visit<InstrBlockPy> for IncrementCounterProbe {
+    fn visit_instr(&mut self, expr: &InstrBlockPy) {
+        if matches!(expr, InstrBlockPy::IncrementCounter(_)) {
             self.increment_counters += 1;
         }
         expr.visit_children(self);

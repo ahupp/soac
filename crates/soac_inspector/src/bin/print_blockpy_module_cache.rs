@@ -1,5 +1,5 @@
 use soac_core::block_py::blockpy_module_to_string;
-use soac_driver::codegen_cache::load_codegen_module_cache;
+use soac_driver::blockpy_cache::load_blockpy_module_cache;
 use std::path::PathBuf;
 
 struct Args {
@@ -30,12 +30,12 @@ fn parse_args() -> Result<Args, String> {
 }
 
 fn print_usage() {
-    eprintln!("usage: print_codegen_module_cache <mod.blockpy>");
+    eprintln!("usage: print_blockpy_module_cache <mod.blockpy>");
 }
 
 fn main() -> Result<(), String> {
     let args = parse_args().inspect_err(|_| print_usage())?;
-    let cache = load_codegen_module_cache(args.path.as_path()).map_err(|err| err.to_string())?;
+    let cache = load_blockpy_module_cache(args.path.as_path()).map_err(|err| err.to_string())?;
     println!(
         "# metadata source={:?} module={} source_hash=0x{:016x} cache_identity={}",
         cache.metadata.source,

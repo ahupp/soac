@@ -465,7 +465,7 @@ their owner/type guard payload is not yet a static mechanical JIT input.
 ### Explicit Typed Representation
 
 - Direct-call specialization is represented on `InstrTyped`, not on
-  `InstrCodegen`. The typed rewrite evaluates the callable and arguments once,
+  `InstrBlockPy`. The typed rewrite evaluates the callable and arguments once,
   emits typed guard tests for hot targets, emits typed direct-call or inline
   bodies for selected hot arms, and leaves an explicit generic typed fallback
   for the original call shape.

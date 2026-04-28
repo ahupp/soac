@@ -13,7 +13,7 @@ The boundary should be:
 BlockPy passes decide names, globals, control flow, stable semantic instruction
 identity, and explicit Python ownership/refcount operations.
 
-Value facts analyze codegen-shaped BlockPy as a read-only sidecar.
+Value facts analyze BlockPy as a read-only sidecar.
 
 Refcount lowering consumes value facts and rewrites implicit Python ownership
 effects into explicit transfers, increfs, decrefs, and cleanup requirements.
@@ -30,7 +30,7 @@ The intended order is:
 name_binding
 -> global_index
 -> bb_prepared
--> bb_codegen
+-> blockpy
    - normalize strings
    - dense block labels
    - stable semantic instruction ids
@@ -74,12 +74,12 @@ pub struct IdentifiedInstr<I> {
 
 The migration path is:
 
-1. Add `InstrKey` and validate ID presence/uniqueness for semantic codegen IR.
-2. Rename `InstrCodegen` to `InstrCodegenOp`.
-3. Add `IdentifiedInstr<InstrCodegenOp>`.
-4. Add an unidentified codegen module shape before ID assignment.
-5. Make `assign_module_instr_ids` consume unidentified codegen IR and produce
-   identified codegen IR.
+1. Add `InstrKey` and validate ID presence/uniqueness for semantic BlockPy IR.
+2. Keep `InstrBlockPy` as the final BlockPy instruction enum.
+3. Add `IdentifiedInstr<InstrBlockPy>`.
+4. Add an unidentified blockpy module shape before ID assignment.
+5. Make `assign_module_instr_ids` consume unidentified BlockPy IR and produce
+   identified BlockPy IR.
 6. Update JIT, counters, facts, and dumps to read IDs from the wrapper instead
    of `Meta::instr_id`.
 7. Keep synthetic instrumentation tied to the semantic site IDs it observes.
@@ -139,7 +139,7 @@ TODO: Replace stringly typed runtime singleton names like `NONE`/`TRUE`/`FALSE` 
 
 Python ownership should become explicit before the JIT, but BlockPy should not
 insert physical `INCREF`/`DECREF` calls. The ownership-effects pass should
-consume codegen-shaped BlockPy plus `FactStore` and produce a representation
+consume BlockPy plus `FactStore` and produce a representation
 where ownership is carried by IR values and release/transfer obligations are
 explicit:
 
@@ -374,7 +374,7 @@ exceptional path.
 
 ## Implementation Order
 
-1. Stabilize instruction identity with `InstrKey` and codegen-ID validation.
+1. Stabilize instruction identity with `InstrKey` and blockpy-ID validation.
 2. Clarify synthetic instrumentation semantics around semantic site IDs.
 3. Add a static `FactStore` sidecar and minimal fact types.
 4. Infer non-CFG local facts for literals, `None`, booleans, runtime constants,
@@ -396,22 +396,22 @@ exceptional path.
 Started:
 
 - `InstrKey` exists as `(FunctionId, InstrId)`.
-- Codegen-shaped semantic instructions are validated for ID presence and
+- BlockPy-shaped semantic instructions are validated for ID presence and
   uniqueness immediately after ID assignment.
 - `CounterSite::Runtime` treats `instr_id` as the semantic site being observed;
   synthetic instrumentation instructions may still have no semantic ID.
-- The codegen instruction enum has been split by name into `InstrCodegenOp`,
-  with `InstrCodegen` retained as a compatibility alias. The next step is to
+- The final BlockPy instruction enum has been named `InstrBlockPy`,
+  with `InstrBlockPy` retained as a compatibility alias. The next step is to
   replace the alias with an identified wrapper.
-- Normalized codegen IR uses `CodegenModuleShape` before and after ID assignment.
+- Final BlockPy IR uses `BlockPyModuleShape` before and after ID assignment.
   `assign_module_instr_ids` fills semantic instruction IDs, and validation
   enforces the post-ID invariant immediately afterward.
 - `constant_none` has been split out of the base `Instr` trait so future
-  identified codegen instructions are not required to synthesize fake semantic
+  identified BlockPy instructions are not required to synthesize fake semantic
   IDs.
 - A nominal `IdentifiedInstr<I>` wrapper exists, but is not wired into
-  `CodegenModuleShape` yet. The remaining mechanical step is to make
-  `InstrCodegenOp` generic over its child instruction type instead of being
+  `BlockPyModuleShape` yet. The remaining mechanical step is to make
+  `InstrBlockPy` generic over its child instruction type instead of being
   self-recursive.
 - A first `FactStore` sidecar exists and records expression facts keyed by
   `InstrKey`. Initial inference covers runtime `None`/bool singletons, module
@@ -461,13 +461,13 @@ Started:
   bindings from the storage layout, annotates them with available `EnvFacts`,
   and classifies known immortal locals without changing generated code.
 - JIT specialization and counter lookup paths now require semantic instruction
-  IDs for semantic codegen operations instead of silently disabling the
+  IDs for semantic BlockPy operations instead of silently disabling the
   optimization when an ID is missing. Synthetic test builders fill missing IDs
   explicitly, and value-fact inference ignores ID-less synthetic trace/counter
   instrumentation rather than assigning fake semantic identities.
 - A first BlockPy ownership-effects sidecar exists and is computed after
   `value_facts` in the lowering driver. It records local rebind, delete, and
-  cleanup ownership effects from codegen-shaped BlockPy, including explicit
+  cleanup ownership effects from BlockPy, including explicit
   local deletes and immortal local facts. The Rust types still use the
   transitional `RefcountPlan` names internally, but the pass entrypoint and
   timing label are now `ownership_effects`.

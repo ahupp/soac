@@ -14,8 +14,8 @@ use soac_config::SoacEnvConfig;
 use soac_core::block_py::{
     BlockLabel, BlockPyFunction, BlockPyModule, ChildVisitable, HasSemanticInstrId, Visit,
 };
-use soac_ir_blockpy::CodegenModuleShape;
-use soac_ir_typed::{InstrTyped, TypedCodegenModuleShape};
+use soac_ir_blockpy::BlockPyModuleShape;
+use soac_ir_typed::{InstrTyped, TypedBlockPyModuleShape};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone)]
@@ -464,7 +464,7 @@ fn instr_typed_variant_name(expr: &InstrTyped) -> &'static str {
 }
 
 pub(super) fn render_instr_typed_preorder_extras(
-    function: &BlockPyFunction<TypedCodegenModuleShape>,
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
 ) -> String {
     struct ExtraRenderer<'a> {
         out: &'a mut String,
@@ -957,7 +957,7 @@ pub(super) fn nest_clif_blocks_by_nearest_dominator(func: &ir::Function, clif: &
     out
 }
 
-pub fn run_cranelift_smoke(module: &BlockPyModule<CodegenModuleShape>) -> Result<(), String> {
+pub fn run_cranelift_smoke(module: &BlockPyModule<BlockPyModuleShape>) -> Result<(), String> {
     let function_count = module.callable_defs.len() as i64;
     let block_count = module
         .callable_defs

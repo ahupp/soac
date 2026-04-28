@@ -18,15 +18,15 @@ use soac_core::block_py::{
     RuntimeName, UnaryOp, UnaryOpKind,
 };
 use soac_core::block_py::{BlockPyFunction, FunctionKind};
-use soac_ir_blockpy::{CodegenModuleShape, InstrCodegen};
+use soac_ir_blockpy::{BlockPyModuleShape, InstrBlockPy};
 use std::ffi::{c_int, c_void};
 use std::ptr;
 use std::sync::Arc;
 
 fn block_for_label<'a>(
-    function: &'a BlockPyFunction<CodegenModuleShape>,
+    function: &'a BlockPyFunction<BlockPyModuleShape>,
     label: BlockLabel,
-) -> Option<&'a Block<InstrCodegen>> {
+) -> Option<&'a Block<InstrBlockPy>> {
     if let Some(block) = function.blocks.get(label.index())
         && block.label == label
     {
@@ -66,7 +66,7 @@ pub(super) fn execute_deopt_invocation(
 #[cold]
 #[allow(dead_code)]
 pub(crate) unsafe fn run_blockpy_function_from_entry(
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
     context: BlockPyEntryRuntimeContext<'_>,
     positional_args: &[ObjPtr],
 ) -> Result<ObjPtr, String> {
@@ -84,7 +84,7 @@ pub(crate) unsafe fn run_blockpy_function_from_entry(
 #[cold]
 #[allow(dead_code)]
 pub(crate) unsafe fn run_blockpy_function_from_vectorcall_entry(
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
     context: BlockPyEntryRuntimeContext<'_>,
     args: *const ObjPtr,
     nargsf: usize,
@@ -151,7 +151,7 @@ impl<'a> BlockPyEntryRuntimeContext<'a> {
 
 #[allow(dead_code)]
 struct BlockPyEntryFrameSource<'a> {
-    function: &'a BlockPyFunction<CodegenModuleShape>,
+    function: &'a BlockPyFunction<BlockPyModuleShape>,
     context: BlockPyEntryRuntimeContext<'a>,
 }
 
@@ -171,7 +171,7 @@ impl<'inv, 'data> BlockPyFrameSource<'inv, 'data> {
         }
     }
 
-    fn function(&self) -> &'inv BlockPyFunction<CodegenModuleShape> {
+    fn function(&self) -> &'inv BlockPyFunction<BlockPyModuleShape> {
         match self {
             Self::Deopt(invocation) => invocation.function(),
             Self::Entry(entry) => entry.function,
@@ -896,35 +896,35 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
     }
 
     #[cold]
-    unsafe fn execute_expr_owned(&mut self, expr: &InstrCodegen) -> Result<ObjPtr, String> {
+    unsafe fn execute_expr_owned(&mut self, expr: &InstrBlockPy) -> Result<ObjPtr, String> {
         match expr {
-            InstrCodegen::Load(load) => unsafe {
+            InstrBlockPy::Load(load) => unsafe {
                 self.execute_load_owned(load.name.id.as_str(), load.name.location)
             },
-            InstrCodegen::BinOp(binop) => unsafe { self.execute_binop_owned(binop) },
-            InstrCodegen::UnaryOp(unary) => unsafe { self.execute_unary_op_owned(unary) },
-            InstrCodegen::GetAttr(getattr) => unsafe { self.execute_getattr_owned(getattr) },
-            InstrCodegen::GetItem(getitem) => unsafe { self.execute_getitem_owned(getitem) },
-            InstrCodegen::SetAttr(setattr) => unsafe { self.execute_setattr_owned(setattr) },
-            InstrCodegen::SetItem(setitem) => unsafe { self.execute_setitem_owned(setitem) },
-            InstrCodegen::DelItem(delitem) => unsafe { self.execute_delitem_owned(delitem) },
-            InstrCodegen::Tuple(tuple) => unsafe { self.execute_tuple_owned(tuple) },
-            InstrCodegen::Call(call) => unsafe { self.execute_call_owned(call) },
-            InstrCodegen::Store(store) => unsafe { self.execute_store_owned(store) },
-            InstrCodegen::Del(del) => unsafe { self.execute_del_owned(del) },
-            InstrCodegen::IncrementCounter(_) => Ok(owned_none()),
-            InstrCodegen::MakeCell(make_cell) => unsafe { self.execute_make_cell_owned(make_cell) },
-            InstrCodegen::MakeFunctionWithClosure(make_function) => unsafe {
+            InstrBlockPy::BinOp(binop) => unsafe { self.execute_binop_owned(binop) },
+            InstrBlockPy::UnaryOp(unary) => unsafe { self.execute_unary_op_owned(unary) },
+            InstrBlockPy::GetAttr(getattr) => unsafe { self.execute_getattr_owned(getattr) },
+            InstrBlockPy::GetItem(getitem) => unsafe { self.execute_getitem_owned(getitem) },
+            InstrBlockPy::SetAttr(setattr) => unsafe { self.execute_setattr_owned(setattr) },
+            InstrBlockPy::SetItem(setitem) => unsafe { self.execute_setitem_owned(setitem) },
+            InstrBlockPy::DelItem(delitem) => unsafe { self.execute_delitem_owned(delitem) },
+            InstrBlockPy::Tuple(tuple) => unsafe { self.execute_tuple_owned(tuple) },
+            InstrBlockPy::Call(call) => unsafe { self.execute_call_owned(call) },
+            InstrBlockPy::Store(store) => unsafe { self.execute_store_owned(store) },
+            InstrBlockPy::Del(del) => unsafe { self.execute_del_owned(del) },
+            InstrBlockPy::IncrementCounter(_) => Ok(owned_none()),
+            InstrBlockPy::MakeCell(make_cell) => unsafe { self.execute_make_cell_owned(make_cell) },
+            InstrBlockPy::MakeFunctionWithClosure(make_function) => unsafe {
                 self.execute_make_function_with_closure_owned(make_function)
             },
-            InstrCodegen::CellRef(cell_ref) => unsafe { self.execute_cell_ref_owned(cell_ref) },
+            InstrBlockPy::CellRef(cell_ref) => unsafe { self.execute_cell_ref_owned(cell_ref) },
         }
     }
 
     #[cold]
     unsafe fn execute_make_cell_owned(
         &mut self,
-        make_cell: &soac_core::block_py::MakeCell<InstrCodegen>,
+        make_cell: &soac_core::block_py::MakeCell<InstrBlockPy>,
     ) -> Result<ObjPtr, String> {
         let Some(initial_value_expr) = make_cell.initial_value.as_ref() else {
             let cell = unsafe { PyCell_New(ptr::null_mut()) };
@@ -944,7 +944,7 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
     #[cold]
     unsafe fn execute_make_function_with_closure_owned(
         &mut self,
-        make_function: &soac_core::block_py::MakeFunctionWithClosure<InstrCodegen>,
+        make_function: &soac_core::block_py::MakeFunctionWithClosure<InstrBlockPy>,
     ) -> Result<ObjPtr, String> {
         let captures = unsafe { self.execute_expr_owned(make_function.captures.as_ref())? };
         if captures.is_null() {
@@ -1009,7 +1009,7 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
     #[cold]
     unsafe fn execute_entry_make_function_with_closure(
         &self,
-        make_function: &soac_core::block_py::MakeFunctionWithClosure<InstrCodegen>,
+        make_function: &soac_core::block_py::MakeFunctionWithClosure<InstrBlockPy>,
         captures: ObjPtr,
         param_defaults: ObjPtr,
         annotate_fn: ObjPtr,
@@ -1150,7 +1150,7 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
     #[cold]
     unsafe fn execute_binop_owned(
         &mut self,
-        binop: &BinOp<InstrCodegen>,
+        binop: &BinOp<InstrBlockPy>,
     ) -> Result<ObjPtr, String> {
         let left = unsafe { self.execute_expr_owned(&binop.left)? };
         if left.is_null() {
@@ -1174,7 +1174,7 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
     #[cold]
     unsafe fn execute_unary_op_owned(
         &mut self,
-        unary: &UnaryOp<InstrCodegen>,
+        unary: &UnaryOp<InstrBlockPy>,
     ) -> Result<ObjPtr, String> {
         let operand = unsafe { self.execute_expr_owned(&unary.operand)? };
         if operand.is_null() {
@@ -1190,7 +1190,7 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
     #[cold]
     unsafe fn execute_getattr_owned(
         &mut self,
-        getattr: &soac_core::block_py::GetAttr<InstrCodegen>,
+        getattr: &soac_core::block_py::GetAttr<InstrBlockPy>,
     ) -> Result<ObjPtr, String> {
         let value = unsafe { self.execute_expr_owned(&getattr.value)? };
         if value.is_null() {
@@ -1216,7 +1216,7 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
     #[cold]
     unsafe fn execute_getitem_owned(
         &mut self,
-        getitem: &soac_core::block_py::GetItem<InstrCodegen>,
+        getitem: &soac_core::block_py::GetItem<InstrBlockPy>,
     ) -> Result<ObjPtr, String> {
         let value = unsafe { self.execute_expr_owned(&getitem.value)? };
         if value.is_null() {
@@ -1242,7 +1242,7 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
     #[cold]
     unsafe fn execute_setattr_owned(
         &mut self,
-        setattr: &soac_core::block_py::SetAttr<InstrCodegen>,
+        setattr: &soac_core::block_py::SetAttr<InstrBlockPy>,
     ) -> Result<ObjPtr, String> {
         let value = unsafe { self.execute_expr_owned(&setattr.value)? };
         if value.is_null() {
@@ -1284,7 +1284,7 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
     #[cold]
     unsafe fn execute_setitem_owned(
         &mut self,
-        setitem: &soac_core::block_py::SetItem<InstrCodegen>,
+        setitem: &soac_core::block_py::SetItem<InstrBlockPy>,
     ) -> Result<ObjPtr, String> {
         let value = unsafe { self.execute_expr_owned(&setitem.value)? };
         if value.is_null() {
@@ -1326,7 +1326,7 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
     #[cold]
     unsafe fn execute_delitem_owned(
         &mut self,
-        delitem: &soac_core::block_py::DelItem<InstrCodegen>,
+        delitem: &soac_core::block_py::DelItem<InstrBlockPy>,
     ) -> Result<ObjPtr, String> {
         let value = unsafe { self.execute_expr_owned(&delitem.value)? };
         if value.is_null() {
@@ -1355,7 +1355,7 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
     #[cold]
     unsafe fn execute_call_owned(
         &mut self,
-        call: &soac_core::block_py::Call<InstrCodegen>,
+        call: &soac_core::block_py::Call<InstrBlockPy>,
     ) -> Result<ObjPtr, String> {
         unsafe { self.execute_call_parts_owned(&call.func, &call.args, &call.keywords) }
     }
@@ -1363,7 +1363,7 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
     #[cold]
     unsafe fn execute_tuple_owned(
         &mut self,
-        tuple_expr: &soac_core::block_py::Tuple<InstrCodegen>,
+        tuple_expr: &soac_core::block_py::Tuple<InstrBlockPy>,
     ) -> Result<ObjPtr, String> {
         let tuple_len = match ffi::Py_ssize_t::try_from(tuple_expr.values.len()) {
             Ok(tuple_len) => tuple_len,
@@ -1401,9 +1401,9 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
     #[cold]
     unsafe fn execute_call_parts_owned(
         &mut self,
-        callable_expr: &InstrCodegen,
-        positional_args: &[CallArgPositional<InstrCodegen>],
-        keyword_args: &[CallArgKeyword<InstrCodegen>],
+        callable_expr: &InstrBlockPy,
+        positional_args: &[CallArgPositional<InstrBlockPy>],
+        keyword_args: &[CallArgKeyword<InstrBlockPy>],
     ) -> Result<ObjPtr, String> {
         if positional_args.is_empty()
             && keyword_args.is_empty()
@@ -1690,7 +1690,7 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
     #[cold]
     unsafe fn execute_raise_term_owned(
         &mut self,
-        raise: &soac_core::block_py::TermRaise<InstrCodegen>,
+        raise: &soac_core::block_py::TermRaise<InstrBlockPy>,
     ) -> Result<ObjPtr, String> {
         let Some(exc_expr) = &raise.exc else {
             let exc = unsafe { self.current_exception_arg_owned() };
@@ -1786,7 +1786,7 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
     #[cold]
     unsafe fn execute_del_owned(
         &mut self,
-        del: &soac_core::block_py::Del<InstrCodegen>,
+        del: &soac_core::block_py::Del<InstrBlockPy>,
     ) -> Result<ObjPtr, String> {
         match del.name.location {
             NameLocation::Local(location) => unsafe {
@@ -1898,7 +1898,7 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
     #[cold]
     unsafe fn execute_store_owned(
         &mut self,
-        store: &soac_core::block_py::Store<InstrCodegen>,
+        store: &soac_core::block_py::Store<InstrBlockPy>,
     ) -> Result<ObjPtr, String> {
         match store.name.location {
             NameLocation::Local(location) => unsafe {
@@ -1930,7 +1930,7 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
         &mut self,
         name: &str,
         location: LocalLocation,
-        value_expr: &InstrCodegen,
+        value_expr: &InstrBlockPy,
     ) -> Result<ObjPtr, String> {
         let value = unsafe { self.execute_expr_owned(value_expr)? };
         if value.is_null() {
@@ -1962,7 +1962,7 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
         &mut self,
         name: &str,
         location: CellLocation,
-        value_expr: &InstrCodegen,
+        value_expr: &InstrBlockPy,
     ) -> Result<ObjPtr, String> {
         let value = unsafe { self.execute_expr_owned(value_expr)? };
         if value.is_null() {
@@ -1995,7 +1995,7 @@ impl<'inv, 'data> BlockPyDeoptFrame<'inv, 'data> {
     unsafe fn execute_global_store_owned(
         &mut self,
         name: &str,
-        value_expr: &InstrCodegen,
+        value_expr: &InstrBlockPy,
     ) -> Result<ObjPtr, String> {
         let globals_obj = self.source.globals_obj();
         if globals_obj.is_null() {
@@ -2157,10 +2157,10 @@ unsafe fn set_raise_exception_owned(exc: ObjPtr) {
     }
 }
 
-fn is_runtime_name_load(expr: &InstrCodegen, runtime_name: RuntimeName) -> bool {
+fn is_runtime_name_load(expr: &InstrBlockPy, runtime_name: RuntimeName) -> bool {
     matches!(
         expr,
-        InstrCodegen::Load(load) if load.name.runtime_name_id() == Some(runtime_name)
+        InstrBlockPy::Load(load) if load.name.runtime_name_id() == Some(runtime_name)
     )
 }
 

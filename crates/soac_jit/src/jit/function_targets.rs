@@ -1,14 +1,14 @@
 use soac_core::block_py::{BlockPyFunction, ChildVisitable, RuntimeFunctionId, Visit};
 use soac_ir_blockpy::{
-    CodegenModuleShape, InstrCodegen, constructor_init_function_id_for_entry_function,
+    BlockPyModuleShape, InstrBlockPy, constructor_init_function_id_for_entry_function,
 };
-use soac_ir_typed::{InstrTyped, TypedCodegenModuleShape, TypedDirectCallableCallGuard};
+use soac_ir_typed::{InstrTyped, TypedBlockPyModuleShape, TypedDirectCallableCallGuard};
 use std::collections::HashSet;
 
 use super::typed_pipeline::JitModulePlan;
 
 pub(super) fn collect_call_direct_targets(
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
 ) -> HashSet<RuntimeFunctionId> {
     let mut out = HashSet::new();
     if let Some(init_function_id) = constructor_init_function_id_for_entry_function(function) {
@@ -18,7 +18,7 @@ pub(super) fn collect_call_direct_targets(
 }
 
 pub(super) fn collect_typed_call_direct_targets(
-    function: &BlockPyFunction<TypedCodegenModuleShape>,
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
 ) -> HashSet<RuntimeFunctionId> {
     struct CallDirectTargetCollector<'a> {
         out: &'a mut HashSet<RuntimeFunctionId>,
@@ -76,15 +76,15 @@ pub(super) fn collect_planned_typed_call_direct_targets(
 }
 
 pub(super) fn collect_make_function_targets(
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
 ) -> HashSet<RuntimeFunctionId> {
     struct MakeFunctionTargetCollector<'a> {
         out: &'a mut HashSet<RuntimeFunctionId>,
     }
 
-    impl Visit<InstrCodegen> for MakeFunctionTargetCollector<'_> {
-        fn visit_instr(&mut self, expr: &InstrCodegen) {
-            if let InstrCodegen::MakeFunctionWithClosure(op) = expr {
+    impl Visit<InstrBlockPy> for MakeFunctionTargetCollector<'_> {
+        fn visit_instr(&mut self, expr: &InstrBlockPy) {
+            if let InstrBlockPy::MakeFunctionWithClosure(op) = expr {
                 self.out.insert(op.function_id());
             }
             expr.visit_children(self);
@@ -98,7 +98,7 @@ pub(super) fn collect_make_function_targets(
 }
 
 pub(crate) fn is_synthetic_class_helper_function(
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
 ) -> bool {
     function.names.bind_name.starts_with("_dp_class_ns_")
         || function.names.bind_name.starts_with("_dp_define_class_")

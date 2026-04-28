@@ -323,7 +323,7 @@ def read():
         "create_module.source_read",
         "create_module.lower_blockpy",
         "blockpy.parse",
-        "blockpy.bb_codegen",
+        "blockpy.blockpy",
         "exec_module.call_module_init",
         "exec_module.register_function_owner_types",
     ]:

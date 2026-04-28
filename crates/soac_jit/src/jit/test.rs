@@ -6,24 +6,23 @@ use super::{
     RuntimeJitDeoptRecord, RuntimeJitDeoptTable, RuntimeJitDeoptUnsupportedReason,
     SOAC_RUNTIME_PROBE_GLOBAL_INDEXED_SYMBOL, SOAC_RUNTIME_STORE_GLOBAL_INDEXED_SYMBOL,
     SpecializationProfile, StackSlots, annotate_clif_instruction_purposes,
-    build_cranelift_run_bb_specialized_function, build_typed_v3_jit_module_plan,
-    codegen_expr_is_borrowable_from_local_env, codegen_expr_static_can_satisfy_i64_demand,
-    codegen_expr_static_i64_demand_facts, declare_local_fn, declare_module_constant_object_data,
-    declare_scalar_counter_storage_import, declare_top_value_counter_storage_import,
-    define_prepared_function, define_scalar_counter_storage_data,
-    define_scalar_counter_storage_data_for_symbol, define_top_value_counter_storage_data,
-    direct_function_symbol_scope_for_shared_state, emit_decref_unforwarded_local_env,
-    emit_deopt_resume_call, infer_jit_value_facts, local_ref_kind_for_stack_mirror,
-    lookup_registered_jit_data_symbol, nest_clif_blocks_by_nearest_dominator,
-    normalize_postopt_clif_for_inspection, parse_runtime_clif_functions,
-    placeholder_module_constant_ptrs, planned_owned_pyobject_result_for_typed_expr,
-    precompile_codegen_module_to_object_bytes, predeclare_specialization_type_imports,
-    predeclare_typed_direct_call_imports, refresh_typed_function_value_facts,
-    render_compiled_clif_and_vcode_disasm, run_blockpy_function_from_entry,
-    run_blockpy_function_from_vectorcall_entry, runtime_jit_deopt_guard_operand_replay_safe,
-    runtime_jit_typed_deopt_guard_operand_replay_safe, scalar_counter_storage_symbol_for_instance,
-    static_runtime_primitive_desc_for_call, static_runtime_primitive_for_call,
-    top_value_counter_storage_symbol_for_instance,
+    build_cranelift_run_bb_specialized_function, codegen_expr_is_borrowable_from_local_env,
+    codegen_expr_static_can_satisfy_i64_demand, codegen_expr_static_i64_demand_facts,
+    declare_local_fn, declare_module_constant_object_data, declare_scalar_counter_storage_import,
+    declare_top_value_counter_storage_import, define_prepared_function,
+    define_scalar_counter_storage_data, define_scalar_counter_storage_data_for_symbol,
+    define_top_value_counter_storage_data, direct_function_symbol_scope_for_shared_state,
+    emit_decref_unforwarded_local_env, emit_deopt_resume_call, infer_jit_value_facts,
+    local_ref_kind_for_stack_mirror, lookup_registered_jit_data_symbol,
+    nest_clif_blocks_by_nearest_dominator, normalize_postopt_clif_for_inspection, optimize_blockpy,
+    parse_runtime_clif_functions, placeholder_module_constant_ptrs,
+    planned_owned_pyobject_result_for_typed_expr, precompile_codegen_module_to_object_bytes,
+    predeclare_specialization_type_imports, predeclare_typed_direct_call_imports,
+    refresh_typed_function_value_facts, render_compiled_clif_and_vcode_disasm,
+    run_blockpy_function_from_entry, run_blockpy_function_from_vectorcall_entry,
+    runtime_jit_deopt_guard_operand_replay_safe, runtime_jit_typed_deopt_guard_operand_replay_safe,
+    scalar_counter_storage_symbol_for_instance, static_runtime_primitive_desc_for_call,
+    static_runtime_primitive_for_call, top_value_counter_storage_symbol_for_instance,
     typed_expr_planned_pyobject_input_is_borrowed_from_local_env,
 };
 use soac_core::block_py::IncrementCounter;
@@ -41,7 +40,7 @@ use soac_core::block_py::{
     SerializedIdentityTables, SerializedModuleId, SerializedModuleIdentity, SetAttr, SetItem,
     StorageLayout, Store, Tuple, UnaryOp, UnaryOpKind, Visit, VisitMut, WithMeta,
 };
-use soac_ir_blockpy::{CodegenModuleShape, InstrCodegen, validate_codegen_instr_ids};
+use soac_ir_blockpy::{BlockPyModuleShape, InstrBlockPy, validate_blockpy_instr_ids};
 mod tests {
     use super::super::direct_abi;
     use super::super::function_targets::collect_planned_typed_call_direct_targets;
@@ -51,7 +50,7 @@ mod tests {
     };
     use super::super::specialization_profile::{
         DirectCallEmissionScope, planned_optimization_inputs_from_v3_artifacts,
-        planned_optimization_inputs_from_v3_artifacts_for_codegen_module,
+        planned_optimization_inputs_from_v3_artifacts_for_blockpy_module,
     };
     use super::super::symbols::{reloc_type_ref_for_type, resolve_reloc_type_ref_to_type};
     use super::super::typed_pipeline::{
@@ -59,7 +58,7 @@ mod tests {
         annotate_typed_indexed_global_accesses,
     };
     use super::super::{
-        CodegenBlock, DP_JIT_DECREF_IMPORT, DP_JIT_DEOPT_RESUME_IMPORT, DP_JIT_INCREF_IMPORT,
+        BlockPyBlock, DP_JIT_DECREF_IMPORT, DP_JIT_DEOPT_RESUME_IMPORT, DP_JIT_INCREF_IMPORT,
         DP_JIT_PY_CALL_POSITIONAL_THREE_IMPORT, DP_JIT_PY_VECTORCALL_IMPORT,
         DP_JIT_PYOBJECT_SETATTR_IMPORT, DirectCallArgPlan, DirectCallArgSource,
         DirectCallIncompatibility, FUNCTION_ENV_DEOPT_TABLE_PTR_OFFSET, IntFacts, IntRange,
@@ -91,23 +90,22 @@ mod tests {
     };
     use super::{
         AbruptKind, BinOp, BinOpKind, BlockArg, BlockEdge, BlockLabel, BlockParam, BlockParamRole,
-        BlockPyEntryRuntimeContext, BlockPyFunction, BlockPyModule, BlockTerm,
+        BlockPyEntryRuntimeContext, BlockPyFunction, BlockPyModule, BlockPyModuleShape, BlockTerm,
         BuildSpecializedFunctionOptions, BuiltSpecializedFunction, Call, CallArgKeyword,
         CallArgPositional, CellLocation, CellRef, ChildVisitable, ClosureInit, ClosureSlot,
-        CodegenModuleShape, ConstantExpr, CounterDef, CounterSite, CpythonTypeSymbol,
-        DeclaredJitFunction, Del, DelItem, FuncBuildImports, FunctionExecutionMode, FunctionKind,
-        FunctionName, FunctionRuntimeDataLayout, GetAttr, GetItem, HasMeta, HasSemanticInstrId,
-        IncrementCounter, InstrCodegen, Literal, LiteralValue, Load, LocalFunctionId,
-        LocalLocation, MakeCell, Meta, ModuleNameGen, NameLike, NameLocation, NumberLiteral,
-        NumberLiteralValue, Param, ParamKind, ParamSpec, ResolvedName, RuntimeFunctionEntryPlan,
-        RuntimeFunctionId, RuntimeJitDeoptContinuation, RuntimeJitDeoptCursor,
-        RuntimeJitDeoptInvocation, RuntimeJitDeoptRecord, RuntimeJitDeoptTable,
-        RuntimeJitDeoptUnsupportedReason, RuntimeName, SerializedFunctionDebugName,
-        SerializedFunctionId, SerializedIdentityTables, SerializedModuleId,
-        SerializedModuleIdentity, SetAttr, SetItem, SpecializationProfile, StackSlots,
-        StorageLayout, Store, StringLiteral, Tuple, UnaryOp, UnaryOpKind, Visit, VisitMut,
-        WithMeta, annotate_clif_instruction_purposes, build_cranelift_run_bb_specialized_function,
-        build_typed_v3_jit_module_plan, codegen_expr_is_borrowable_from_local_env,
+        ConstantExpr, CounterDef, CounterSite, CpythonTypeSymbol, DeclaredJitFunction, Del,
+        DelItem, FuncBuildImports, FunctionExecutionMode, FunctionKind, FunctionName,
+        FunctionRuntimeDataLayout, GetAttr, GetItem, HasMeta, HasSemanticInstrId, IncrementCounter,
+        InstrBlockPy, Literal, LiteralValue, Load, LocalFunctionId, LocalLocation, MakeCell, Meta,
+        ModuleNameGen, NameLike, NameLocation, NumberLiteral, NumberLiteralValue, Param, ParamKind,
+        ParamSpec, ResolvedName, RuntimeFunctionEntryPlan, RuntimeFunctionId,
+        RuntimeJitDeoptContinuation, RuntimeJitDeoptCursor, RuntimeJitDeoptInvocation,
+        RuntimeJitDeoptRecord, RuntimeJitDeoptTable, RuntimeJitDeoptUnsupportedReason, RuntimeName,
+        SerializedFunctionDebugName, SerializedFunctionId, SerializedIdentityTables,
+        SerializedModuleId, SerializedModuleIdentity, SetAttr, SetItem, SpecializationProfile,
+        StackSlots, StorageLayout, Store, StringLiteral, Tuple, UnaryOp, UnaryOpKind, Visit,
+        VisitMut, WithMeta, annotate_clif_instruction_purposes,
+        build_cranelift_run_bb_specialized_function, codegen_expr_is_borrowable_from_local_env,
         codegen_expr_static_can_satisfy_i64_demand, codegen_expr_static_i64_demand_facts,
         declare_local_fn, declare_module_constant_object_data,
         declare_scalar_counter_storage_import, declare_top_value_counter_storage_import,
@@ -116,7 +114,7 @@ mod tests {
         direct_function_symbol_scope_for_shared_state, emit_decref_unforwarded_local_env,
         emit_deopt_resume_call, infer_jit_value_facts, local_ref_kind_for_stack_mirror,
         lookup_registered_jit_data_symbol, nest_clif_blocks_by_nearest_dominator,
-        normalize_postopt_clif_for_inspection, parse_runtime_clif_functions,
+        normalize_postopt_clif_for_inspection, optimize_blockpy, parse_runtime_clif_functions,
         placeholder_module_constant_ptrs, planned_owned_pyobject_result_for_typed_expr,
         precompile_codegen_module_to_object_bytes, predeclare_specialization_type_imports,
         predeclare_typed_direct_call_imports, refresh_typed_function_value_facts,
@@ -125,7 +123,7 @@ mod tests {
         runtime_jit_typed_deopt_guard_operand_replay_safe,
         scalar_counter_storage_symbol_for_instance, static_runtime_primitive_desc_for_call,
         static_runtime_primitive_for_call, top_value_counter_storage_symbol_for_instance,
-        typed_expr_planned_pyobject_input_is_borrowed_from_local_env, validate_codegen_instr_ids,
+        typed_expr_planned_pyobject_input_is_borrowed_from_local_env, validate_blockpy_instr_ids,
     };
     use crate::jit::direct_abi::RuntimePrimitiveId;
     use crate::module_type::{CounterRuntimeSlot, build_counter_storage_layout};
@@ -146,7 +144,7 @@ mod tests {
         CounterDumpTypeKey, CounterDumpTypeKeyLayout, CounterDumpTypeTableEntry,
         write_counter_dump_records,
     };
-    use soac_driver::codegen_cache::pre_optimization_module_cache_identity;
+    use soac_driver::blockpy_cache::pre_optimization_module_cache_identity;
     use soac_instrument::{InstrumentationConfig, define_typed_module_counter_defs};
     use soac_ir_typed::emit_v3::{MechanicalIndexedFieldGuard, MechanicalModuleEmission};
     use soac_ir_typed::plan_v3::{
@@ -164,10 +162,10 @@ mod tests {
     };
     use soac_ir_typed::{
         InstrTyped, PyExactType, PyObjFacts, TypedAttrAccessPlan, TypedBlockLayoutHint,
-        TypedCodegenModuleShape, TypedDirectCallArgPlan, TypedDirectCallArgSource,
+        TypedBlockPyModuleShape, TypedDirectCallArgPlan, TypedDirectCallArgSource,
         TypedExactIntPlanSource, TypedExactListItemPlanSource, TypedIndexedFieldPlanSource,
         TypedIndexedGlobalPlanSource, TypedInstrExtra, TypedPlannedResult as PlannedResult,
-        ValueFacts, lower_codegen_function_to_typed, lower_codegen_module_to_typed,
+        ValueFacts, lower_blockpy_function_to_typed, lower_blockpy_module_to_typed,
     };
     use soac_opt::access_emission_v3::{
         ExactListItemAccessPlan as OptV3ExactListItemAccessPlan,
@@ -201,7 +199,7 @@ mod tests {
     }
 
     fn define_module_counter_defs_for_profile(
-        module: &mut BlockPyModule<CodegenModuleShape>,
+        module: &mut BlockPyModule<BlockPyModuleShape>,
         call_targets: bool,
         block_entry: bool,
     ) {
@@ -213,17 +211,17 @@ mod tests {
         config.counters.call_targets = call_targets;
         config.counters.locality = block_entry;
         config.counters.profiled_cold_blocks = block_entry;
-        let mut typed_for_counters = lower_codegen_module_to_typed(module.clone());
+        let mut typed_for_counters = lower_blockpy_module_to_typed(module.clone());
         define_typed_module_counter_defs(&mut typed_for_counters, &config)
             .expect("typed counter definitions should succeed");
         module.counter_defs = typed_for_counters.counter_defs;
     }
 
-    fn define_module_call_target_counters(module: &mut BlockPyModule<CodegenModuleShape>) {
+    fn define_module_call_target_counters(module: &mut BlockPyModule<BlockPyModuleShape>) {
         define_module_counter_defs_for_profile(module, true, false);
     }
 
-    fn define_module_block_entry_counters(module: &mut BlockPyModule<CodegenModuleShape>) {
+    fn define_module_block_entry_counters(module: &mut BlockPyModule<BlockPyModuleShape>) {
         define_module_counter_defs_for_profile(module, false, true);
     }
 
@@ -1095,7 +1093,7 @@ def f():
 "#,
             )
             .expect("lowering should succeed")
-            .codegen_module;
+            .blockpy_module;
             let first = crate::module_type::build_shared_state_for_testing(
                 py,
                 lowered.clone(),
@@ -1218,7 +1216,7 @@ def add(a, b):
 "#,
         )
         .expect("lowering precompile smoke source should succeed")
-        .codegen_module;
+        .blockpy_module;
 
         let object = precompile_codegen_module_to_object_bytes(
             "precompile_smoke",
@@ -1288,7 +1286,7 @@ def get_value():
 "#,
         )
         .expect("lowering precompile static int source should succeed")
-        .codegen_module;
+        .blockpy_module;
         let module_constants =
             crate::module_constants::ModuleCodegenConstants::collect_from_module(&lowered);
         let constant_id = module_constants.require_int_constant_id(12345);
@@ -1341,7 +1339,7 @@ def get_value():
 "#,
         )
         .expect("lowering precompile static big int source should succeed")
-        .codegen_module;
+        .blockpy_module;
         let module_constants =
             crate::module_constants::ModuleCodegenConstants::collect_from_module(&lowered);
         let constant_id =
@@ -1394,7 +1392,7 @@ def get_value():
 "#,
         )
         .expect("lowering precompile static ASCII source should succeed")
-        .codegen_module;
+        .blockpy_module;
         let module_constants =
             crate::module_constants::ModuleCodegenConstants::collect_from_module(&lowered);
         let constant_id = module_constants.require_unicode_constant_id("ascii-value");
@@ -1440,7 +1438,7 @@ def get_value():
 "#,
         )
         .expect("lowering precompile static non-ASCII source should succeed")
-        .codegen_module;
+        .blockpy_module;
         let module_constants =
             crate::module_constants::ModuleCodegenConstants::collect_from_module(&lowered);
         let constant_id = module_constants.require_unicode_constant_id("caf\u{e9} \u{1f40d}");
@@ -1486,7 +1484,7 @@ def add(left, right):
 "#,
             )
             .expect("lowering entry interpreter smoke source should succeed")
-            .codegen_module;
+            .blockpy_module;
             let shared_state =
                 crate::module_type::build_shared_state_for_testing(py, lowered, "entry_test", "")
                     .expect("shared state should build for entry interpreter smoke test");
@@ -1552,7 +1550,7 @@ def needs_arg(value):
 "#,
             )
             .expect("lowering entry interpreter missing-arg source should succeed")
-            .codegen_module;
+            .blockpy_module;
             let shared_state =
                 crate::module_type::build_shared_state_for_testing(py, lowered, "entry_test", "")
                     .expect("shared state should build for entry interpreter missing-arg test");
@@ -1599,7 +1597,7 @@ def add_default(left, right=9):
 "#,
             )
             .expect("lowering entry interpreter default source should succeed")
-            .codegen_module;
+            .blockpy_module;
             let shared_state =
                 crate::module_type::build_shared_state_for_testing(py, lowered, "entry_test", "")
                     .expect("shared state should build for entry interpreter default test");
@@ -1658,7 +1656,7 @@ def add_default(left, right=9):
     ) -> Result<ObjPtr, String> {
         let lowered = soac_lowering::lower_python_to_blockpy_for_testing(source)
             .map_err(|err| format!("lowering entry interpreter source failed: {err}"))?
-            .codegen_module;
+            .blockpy_module;
         let module_code = compile_original_module_code_for_test(py, source)
             .map_err(|err| format!("compiling original entry interpreter source failed: {err}"))?;
         let original_code_by_function_id =
@@ -1808,14 +1806,14 @@ def add_default(left, right=9):
     }
 
     fn is_synthetic_class_helper_for_original_code(
-        function: &BlockPyFunction<CodegenModuleShape>,
+        function: &BlockPyFunction<BlockPyModuleShape>,
     ) -> bool {
         function.names.bind_name.starts_with("_dp_class_ns_")
             || function.names.bind_name.starts_with("_dp_define_class_")
     }
 
     fn original_code_lookup_key_for_test(
-        function: &BlockPyFunction<CodegenModuleShape>,
+        function: &BlockPyFunction<BlockPyModuleShape>,
     ) -> Option<&str> {
         if function.execution_mode() == FunctionExecutionMode::Interpreted {
             return None;
@@ -1833,7 +1831,7 @@ def add_default(left, right=9):
     fn match_original_code_to_functions_for_test(
         py: Python<'_>,
         module_code: &Bound<'_, PyAny>,
-        lowered_module: &BlockPyModule<CodegenModuleShape>,
+        lowered_module: &BlockPyModule<BlockPyModuleShape>,
     ) -> PyResult<OriginalCodeMap> {
         let code_type = PyModule::import(py, "types")?.getattr("CodeType")?;
         let mut code_by_qualname = HashMap::new();
@@ -1861,7 +1859,7 @@ def add_default(left, right=9):
     ) -> Bound<'py, PyDict> {
         let lowered = soac_lowering::lower_python_to_blockpy_for_testing(source)
             .expect("lowering module init source should succeed")
-            .codegen_module;
+            .blockpy_module;
         let module_code = compile_original_module_code_for_test(py, source)
             .expect("original module source should compile for entry test");
         let original_code_by_function_id =
@@ -1938,7 +1936,7 @@ def add_default(left, right=9):
 "#,
             )
             .expect("lowering registered entry source should succeed")
-            .codegen_module;
+            .blockpy_module;
             let shared_state =
                 crate::module_type::build_shared_state_for_testing(py, lowered, "entry_test", "")
                     .expect("shared state should build for registered entry test");
@@ -2521,7 +2519,7 @@ def shaped(a, /, b, *args, c, **kwargs):
 "#,
             )
             .expect("lowering vectorcall entry source should succeed")
-            .codegen_module;
+            .blockpy_module;
             let shared_state =
                 crate::module_type::build_shared_state_for_testing(py, lowered, "entry_test", "")
                     .expect("shared state should build for vectorcall entry test");
@@ -2607,7 +2605,7 @@ def add_kw_default(value, *, scale=9):
 "#,
             )
             .expect("lowering keyword-default entry source should succeed")
-            .codegen_module;
+            .blockpy_module;
             let shared_state =
                 crate::module_type::build_shared_state_for_testing(py, lowered, "entry_test", "")
                     .expect("shared state should build for keyword-default entry test");
@@ -2675,7 +2673,7 @@ def takes_one(value):
 "#,
             )
             .expect("lowering duplicate vectorcall entry source should succeed")
-            .codegen_module;
+            .blockpy_module;
             let shared_state =
                 crate::module_type::build_shared_state_for_testing(py, lowered, "entry_test", "")
                     .expect("shared state should build for duplicate vectorcall entry test");
@@ -3384,7 +3382,7 @@ def build(values):
         )
     }
 
-    fn none_expr() -> InstrCodegen {
+    fn none_expr() -> InstrBlockPy {
         Load::new(test_runtime_name("NONE")).into()
     }
 
@@ -3394,39 +3392,39 @@ def build(values):
     }
 
     impl TestConstantPool {
-        fn push_literal(&mut self, literal: ConstantExpr) -> InstrCodegen {
+        fn push_literal(&mut self, literal: ConstantExpr) -> InstrBlockPy {
             let index = u32::try_from(self.module_constants.len())
                 .expect("test module constant count should fit in u32");
             self.module_constants.push(literal);
             Load::new(test_constant_name(index)).into()
         }
 
-        fn int_expr(&mut self, value: i64) -> InstrCodegen {
+        fn int_expr(&mut self, value: i64) -> InstrBlockPy {
             self.push_literal(int_literal(value))
         }
 
-        fn string_expr(&mut self, value: &str) -> InstrCodegen {
+        fn string_expr(&mut self, value: &str) -> InstrBlockPy {
             self.push_literal(string_literal(value))
         }
     }
 
-    fn name_expr(name: ResolvedName) -> InstrCodegen {
+    fn name_expr(name: ResolvedName) -> InstrBlockPy {
         Load::new(name).into()
     }
 
-    fn op_expr(operation: impl Into<InstrCodegen>) -> InstrCodegen {
+    fn op_expr(operation: impl Into<InstrBlockPy>) -> InstrBlockPy {
         operation.into()
     }
 
-    fn tuple_expr(values: Vec<InstrCodegen>) -> InstrCodegen {
+    fn tuple_expr(values: Vec<InstrBlockPy>) -> InstrBlockPy {
         Tuple::new(values).into()
     }
 
-    fn expr_stmt(expr: InstrCodegen) -> InstrCodegen {
+    fn expr_stmt(expr: InstrBlockPy) -> InstrBlockPy {
         expr
     }
 
-    fn with_instr_id(expr: InstrCodegen, instr_id: InstrId) -> InstrCodegen {
+    fn with_instr_id(expr: InstrBlockPy, instr_id: InstrId) -> InstrBlockPy {
         expr.with_meta(Meta {
             instr_id: Some(instr_id),
             ..Meta::synthetic()
@@ -3437,10 +3435,10 @@ def build(values):
         used: std::collections::HashSet<u32>,
     }
 
-    impl Visit<InstrCodegen> for ExplicitTestInstrIdCollector {
-        fn visit_instr(&mut self, expr: &InstrCodegen)
+    impl Visit<InstrBlockPy> for ExplicitTestInstrIdCollector {
+        fn visit_instr(&mut self, expr: &InstrBlockPy)
         where
-            InstrCodegen: ChildVisitable<InstrCodegen>,
+            InstrBlockPy: ChildVisitable<InstrBlockPy>,
         {
             if let Some(instr_id) = expr.try_semantic_instr_id() {
                 self.used.insert(instr_id.index());
@@ -3454,10 +3452,10 @@ def build(values):
         used: std::collections::HashSet<u32>,
     }
 
-    impl VisitMut<InstrCodegen> for MissingTestInstrIdAssigner {
-        fn visit_instr_mut(&mut self, expr: &mut InstrCodegen)
+    impl VisitMut<InstrBlockPy> for MissingTestInstrIdAssigner {
+        fn visit_instr_mut(&mut self, expr: &mut InstrBlockPy)
         where
-            InstrCodegen: ChildVisitable<InstrCodegen>,
+            InstrBlockPy: ChildVisitable<InstrBlockPy>,
         {
             if expr.try_semantic_instr_id().is_none() {
                 while self.used.contains(&self.next_instr_index) {
@@ -3480,7 +3478,7 @@ def build(values):
         }
     }
 
-    fn assign_missing_test_instr_ids(function: &mut BlockPyFunction<CodegenModuleShape>) {
+    fn assign_missing_test_instr_ids(function: &mut BlockPyFunction<BlockPyModuleShape>) {
         let mut collector = ExplicitTestInstrIdCollector {
             used: std::collections::HashSet::new(),
         };
@@ -3495,11 +3493,11 @@ def build(values):
         }
     }
 
-    fn assign_missing_test_module_instr_ids(module: &mut BlockPyModule<CodegenModuleShape>) {
+    fn assign_missing_test_module_instr_ids(module: &mut BlockPyModule<BlockPyModuleShape>) {
         for function in &mut module.callable_defs {
             assign_missing_test_instr_ids(function);
         }
-        validate_codegen_instr_ids(module)
+        validate_blockpy_instr_ids(module)
             .expect("JIT test modules should carry semantic instruction ids");
     }
 
@@ -3525,7 +3523,7 @@ def build(values):
     }
 
     fn count_typed_instrs(
-        function: &BlockPyFunction<TypedCodegenModuleShape>,
+        function: &BlockPyFunction<TypedBlockPyModuleShape>,
         mut predicate: impl FnMut(&InstrTyped) -> bool,
     ) -> usize {
         struct Counter<'a, P> {
@@ -3589,7 +3587,7 @@ def build(values):
         source_hash: u64,
         cache_identity: &str,
         serialized_module_id: u32,
-        function: &BlockPyFunction<CodegenModuleShape>,
+        function: &BlockPyFunction<BlockPyModuleShape>,
     ) -> ExactIntBranchV3Artifacts {
         let serialized_function =
             test_serialized_function_id(serialized_module_id, function.function_id);
@@ -3717,24 +3715,24 @@ def build(values):
         out
     }
 
-    fn assign_stmt(target: ResolvedName, value: InstrCodegen) -> InstrCodegen {
+    fn assign_stmt(target: ResolvedName, value: InstrBlockPy) -> InstrBlockPy {
         expr_stmt(op_expr(Store::new(target, value)))
     }
 
-    fn ret_term(value: InstrCodegen) -> BlockTerm<InstrCodegen> {
+    fn ret_term(value: InstrBlockPy) -> BlockTerm<InstrBlockPy> {
         BlockTerm::Return(value)
     }
 
-    fn raise_term() -> BlockTerm<InstrCodegen> {
+    fn raise_term() -> BlockTerm<InstrBlockPy> {
         BlockTerm::Raise(soac_core::block_py::TermRaise { exc: None })
     }
 
     fn test_source_block(
-        function: &BlockPyFunction<CodegenModuleShape>,
-        ops: Vec<InstrCodegen>,
-        term: BlockTerm<InstrCodegen>,
-    ) -> CodegenBlock {
-        CodegenBlock {
+        function: &BlockPyFunction<BlockPyModuleShape>,
+        ops: Vec<InstrBlockPy>,
+        term: BlockTerm<InstrBlockPy>,
+    ) -> BlockPyBlock {
+        BlockPyBlock {
             label: function.name_gen.next_block_name(),
             body: ops,
             term,
@@ -3744,7 +3742,7 @@ def build(values):
         }
     }
 
-    fn test_function() -> BlockPyFunction<CodegenModuleShape> {
+    fn test_function() -> BlockPyFunction<BlockPyModuleShape> {
         let module_name_gen = ModuleNameGen::new(0);
         test_function_in_module(&module_name_gen, "test")
     }
@@ -3752,7 +3750,7 @@ def build(values):
     fn test_function_in_module(
         module_name_gen: &ModuleNameGen,
         name: &str,
-    ) -> BlockPyFunction<CodegenModuleShape> {
+    ) -> BlockPyFunction<BlockPyModuleShape> {
         let name_gen = module_name_gen.next_function_name_gen();
         BlockPyFunction {
             function_id: name_gen.function_id(),
@@ -3770,8 +3768,8 @@ def build(values):
 
     fn test_module(
         module_name_gen: ModuleNameGen,
-        callable_defs: Vec<BlockPyFunction<CodegenModuleShape>>,
-    ) -> BlockPyModule<CodegenModuleShape> {
+        callable_defs: Vec<BlockPyFunction<BlockPyModuleShape>>,
+    ) -> BlockPyModule<BlockPyModuleShape> {
         let mut module = BlockPyModule {
             module_name_gen,
             global_names: Vec::new(),
@@ -3784,15 +3782,15 @@ def build(values):
     }
 
     fn with_test_blocks(
-        mut function: BlockPyFunction<CodegenModuleShape>,
-        blocks: Vec<CodegenBlock>,
-    ) -> BlockPyFunction<CodegenModuleShape> {
+        mut function: BlockPyFunction<BlockPyModuleShape>,
+        blocks: Vec<BlockPyBlock>,
+    ) -> BlockPyFunction<BlockPyModuleShape> {
         function.blocks = blocks;
         assign_missing_test_instr_ids(&mut function);
         function
     }
 
-    fn set_stack_slots(function: &mut BlockPyFunction<CodegenModuleShape>, names: &[&str]) {
+    fn set_stack_slots(function: &mut BlockPyFunction<BlockPyModuleShape>, names: &[&str]) {
         function
             .storage_layout
             .get_or_insert_with(StorageLayout::default)
@@ -3800,20 +3798,20 @@ def build(values):
     }
 
     fn typed_function_with_exact_int_artifacts(
-        function: &BlockPyFunction<CodegenModuleShape>,
+        function: &BlockPyFunction<BlockPyModuleShape>,
         artifacts: &ExactIntBranchV3Artifacts,
-    ) -> BlockPyFunction<TypedCodegenModuleShape> {
-        let mut typed_function = lower_codegen_function_to_typed(function.clone());
+    ) -> BlockPyFunction<TypedBlockPyModuleShape> {
+        let mut typed_function = lower_blockpy_function_to_typed(function.clone());
         annotate_typed_exact_int_selections(&mut typed_function, artifacts)
             .expect("exact-int v3 artifacts should annotate the typed test function");
         typed_function
     }
 
     fn with_single_test_block(
-        function: BlockPyFunction<CodegenModuleShape>,
-        ops: Vec<InstrCodegen>,
-        term: BlockTerm<InstrCodegen>,
-    ) -> BlockPyFunction<CodegenModuleShape> {
+        function: BlockPyFunction<BlockPyModuleShape>,
+        ops: Vec<InstrBlockPy>,
+        term: BlockTerm<InstrBlockPy>,
+    ) -> BlockPyFunction<BlockPyModuleShape> {
         let block = test_source_block(&function, ops, term);
         with_test_blocks(function, vec![block])
     }
@@ -3821,8 +3819,8 @@ def build(values):
     fn build_test_cranelift_run_bb_specialized_function(
         jit_module: &mut JITModule,
         blocks: &[ObjPtr],
-        module: &BlockPyModule<CodegenModuleShape>,
-        function: &BlockPyFunction<CodegenModuleShape>,
+        module: &BlockPyModule<BlockPyModuleShape>,
+        function: &BlockPyFunction<BlockPyModuleShape>,
         module_constants: &crate::module_constants::ModuleCodegenConstants,
         counter_defs: &[CounterDef],
         module_constant_object_data_ids: &[DataId],
@@ -3835,7 +3833,7 @@ def build(values):
         predeclared_direct_functions: Option<&HashMap<RuntimeFunctionId, DeclaredJitFunction>>,
         options: BuildSpecializedFunctionOptions,
     ) -> Result<BuiltSpecializedFunction, String> {
-        let jit_module_plan = build_typed_v3_jit_module_plan(module, None, &typed_v3_env_config())?;
+        let jit_module_plan = optimize_blockpy(module, None, &typed_v3_env_config())?;
         let planned_module = jit_module_plan.module.as_ref();
         let planned_function = planned_module
             .callable_defs
@@ -3923,8 +3921,8 @@ def build(values):
 
     fn build_test_specialized_function(
         blocks: &[ObjPtr],
-        module: &BlockPyModule<CodegenModuleShape>,
-        function: &BlockPyFunction<CodegenModuleShape>,
+        module: &BlockPyModule<BlockPyModuleShape>,
+        function: &BlockPyFunction<BlockPyModuleShape>,
         module_constants: &crate::module_constants::ModuleCodegenConstants,
     ) -> BuiltSpecializedFunction {
         let compile_session = crate::session::CompileSession::new();
@@ -3963,7 +3961,7 @@ def build(values):
         let entry_label = function.name_gen.next_block_name();
         let then_label = function.name_gen.next_block_name();
         let else_label = function.name_gen.next_block_name();
-        let entry = CodegenBlock {
+        let entry = BlockPyBlock {
             label: entry_label,
             body: vec![],
             term: BlockTerm::IfTerm(soac_core::block_py::TermIf {
@@ -3975,7 +3973,7 @@ def build(values):
             exc_edge: None,
             extra: Default::default(),
         };
-        let then_block = CodegenBlock {
+        let then_block = BlockPyBlock {
             label: then_label,
             body: vec![],
             term: ret_term(constants.int_expr(1)),
@@ -3983,7 +3981,7 @@ def build(values):
             exc_edge: None,
             extra: Default::default(),
         };
-        let else_block = CodegenBlock {
+        let else_block = BlockPyBlock {
             label: else_label,
             body: vec![],
             term: ret_term(constants.int_expr(0)),
@@ -4038,7 +4036,7 @@ def build(values):
         let entry_label = function.name_gen.next_block_name();
         let case_label = function.name_gen.next_block_name();
         let default_label = function.name_gen.next_block_name();
-        let entry = CodegenBlock {
+        let entry = BlockPyBlock {
             label: entry_label,
             body: vec![],
             term: BlockTerm::BranchTable(soac_core::block_py::TermBranchTable {
@@ -4050,7 +4048,7 @@ def build(values):
             exc_edge: None,
             extra: Default::default(),
         };
-        let case_block = CodegenBlock {
+        let case_block = BlockPyBlock {
             label: case_label,
             body: vec![],
             term: ret_term(constants.int_expr(1)),
@@ -4058,7 +4056,7 @@ def build(values):
             exc_edge: None,
             extra: Default::default(),
         };
-        let default_block = CodegenBlock {
+        let default_block = BlockPyBlock {
             label: default_label,
             body: vec![],
             term: ret_term(constants.int_expr(2)),
@@ -4176,22 +4174,22 @@ def build(values):
     }
 
     fn annotate_test_result_demands(
-        mut function: BlockPyFunction<TypedCodegenModuleShape>,
-    ) -> BlockPyFunction<TypedCodegenModuleShape> {
+        mut function: BlockPyFunction<TypedBlockPyModuleShape>,
+    ) -> BlockPyFunction<TypedBlockPyModuleShape> {
         annotate_typed_function_result_demands(&mut function);
         function
     }
 
     fn annotate_test_result_demands_and_plans(
-        mut function: BlockPyFunction<TypedCodegenModuleShape>,
-    ) -> BlockPyFunction<TypedCodegenModuleShape> {
+        mut function: BlockPyFunction<TypedBlockPyModuleShape>,
+    ) -> BlockPyFunction<TypedBlockPyModuleShape> {
         annotate_typed_function_result_demands(&mut function);
         annotate_typed_function_planned_results(&mut function);
         function
     }
 
     fn typed_demand_for_instr_id(
-        function: &BlockPyFunction<TypedCodegenModuleShape>,
+        function: &BlockPyFunction<TypedBlockPyModuleShape>,
         instr_id: InstrId,
     ) -> Option<ResultDemand> {
         struct Finder {
@@ -4217,7 +4215,7 @@ def build(values):
     }
 
     fn typed_planned_result_for_instr_id(
-        function: &BlockPyFunction<TypedCodegenModuleShape>,
+        function: &BlockPyFunction<TypedBlockPyModuleShape>,
         instr_id: InstrId,
     ) -> Option<PlannedResult> {
         struct Finder {
@@ -4254,7 +4252,7 @@ def build(values):
             ret_term(constants.int_expr(2)),
         );
         let typed_function =
-            lower_typed_function_if_tests_to_truthy(lower_codegen_function_to_typed(function));
+            lower_typed_function_if_tests_to_truthy(lower_blockpy_function_to_typed(function));
         let typed_function = annotate_test_result_demands(typed_function);
 
         assert_eq!(
@@ -4273,7 +4271,7 @@ def build(values):
             ret_term(constants.int_expr(2)),
         );
         let typed_function =
-            lower_typed_function_if_tests_to_truthy(lower_codegen_function_to_typed(function));
+            lower_typed_function_if_tests_to_truthy(lower_blockpy_function_to_typed(function));
         let typed_function = annotate_test_result_demands_and_plans(typed_function);
 
         assert_eq!(
@@ -4292,11 +4290,11 @@ def build(values):
                 name_expr(test_name("x")),
                 arg_instr_id,
             ))],
-            Vec::<CallArgKeyword<InstrCodegen>>::new(),
+            Vec::<CallArgKeyword<InstrBlockPy>>::new(),
         ));
         let function =
             with_single_test_block(test_function(), vec![call], ret_term(constants.int_expr(1)));
-        let typed_function = lower_codegen_function_to_typed(function);
+        let typed_function = lower_blockpy_function_to_typed(function);
         let typed_function = annotate_test_result_demands_and_plans(typed_function);
 
         assert_eq!(
@@ -4315,7 +4313,7 @@ def build(values):
         );
         let module = test_module(ModuleNameGen::new(0), vec![function]);
         let facts = infer_module_value_facts(&module);
-        let mut typed_function = lower_codegen_function_to_typed(module.callable_defs[0].clone());
+        let mut typed_function = lower_blockpy_function_to_typed(module.callable_defs[0].clone());
         annotate_typed_function_value_facts(&mut typed_function, &facts);
         refresh_typed_function_value_facts(&mut typed_function);
         let typed_function = annotate_test_result_demands_and_plans(typed_function);
@@ -4341,7 +4339,7 @@ def build(values):
         let mut module = test_module(ModuleNameGen::new(0), vec![function]);
         module.module_constants = constants.module_constants;
         let facts = infer_module_value_facts(&module);
-        let mut typed_function = lower_codegen_function_to_typed(module.callable_defs[0].clone());
+        let mut typed_function = lower_blockpy_function_to_typed(module.callable_defs[0].clone());
         annotate_typed_function_value_facts(&mut typed_function, &facts);
         refresh_typed_function_value_facts(&mut typed_function);
         let typed_function = annotate_test_result_demands_and_plans(typed_function);
@@ -4370,7 +4368,7 @@ def build(values):
             ret_term(constants.int_expr(2)),
         );
         let typed_function =
-            lower_typed_function_if_tests_to_truthy(lower_codegen_function_to_typed(function));
+            lower_typed_function_if_tests_to_truthy(lower_blockpy_function_to_typed(function));
         let typed_function = annotate_test_result_demands(typed_function);
 
         assert_eq!(
@@ -4406,7 +4404,7 @@ def build(values):
         );
         let function =
             with_single_test_block(test_function(), vec![call], ret_term(constants.int_expr(3)));
-        let typed_function = lower_codegen_function_to_typed(function);
+        let typed_function = lower_blockpy_function_to_typed(function);
         let typed_function = annotate_test_result_demands(typed_function);
 
         assert_eq!(
@@ -4440,13 +4438,13 @@ def build(values):
                     constants.int_expr(1),
                     positional_instr_id,
                 ))],
-                Vec::<CallArgKeyword<InstrCodegen>>::new(),
+                Vec::<CallArgKeyword<InstrBlockPy>>::new(),
             )),
             call_instr_id,
         );
         let function =
             with_single_test_block(test_function(), vec![call], ret_term(constants.int_expr(2)));
-        let mut typed_function = lower_codegen_function_to_typed(function);
+        let mut typed_function = lower_blockpy_function_to_typed(function);
         let first_instr = typed_function.blocks[0]
             .body
             .first_mut()
@@ -4551,7 +4549,7 @@ def build(values):
         let module_constants =
             crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
         let arg = name_expr(test_name("x"));
-        let ord_call = InstrCodegen::Call(Call::new(
+        let ord_call = InstrBlockPy::Call(Call::new(
             name_expr(test_constant_name(0)),
             vec![CallArgPositional::Positional(arg)],
             vec![],
@@ -4645,7 +4643,7 @@ def build(values):
                 vec![],
             );
             let mut function = test_function();
-            let block = CodegenBlock {
+            let block = BlockPyBlock {
                 label: function.name_gen.next_block_name(),
                 body: vec![],
                 term: ret_term(op_expr(chr_call)),
@@ -4721,12 +4719,12 @@ def build(values):
         let call = op_expr(Call::new(
             name_expr(test_runtime_name("callable")),
             vec![CallArgPositional::Positional(constants.int_expr(1))],
-            Vec::<CallArgKeyword<InstrCodegen>>::new(),
+            Vec::<CallArgKeyword<InstrBlockPy>>::new(),
         ));
         let function =
             with_single_test_block(test_function(), vec![call], ret_term(constants.int_expr(2)));
         let typed_function =
-            annotate_test_result_demands(lower_codegen_function_to_typed(function));
+            annotate_test_result_demands(lower_blockpy_function_to_typed(function));
         let Some(InstrTyped::CallTyped(call)) = typed_function.blocks[0].body.first() else {
             panic!("test call should lower to typed call");
         };
@@ -4761,7 +4759,7 @@ def build(values):
             vec![binop],
             ret_term(constants.int_expr(3)),
         );
-        let typed_function = lower_codegen_function_to_typed(function);
+        let typed_function = lower_blockpy_function_to_typed(function);
         let typed_function = annotate_test_result_demands(typed_function);
 
         assert_eq!(
@@ -4786,7 +4784,7 @@ def build(values):
         let then_label = function.name_gen.next_block_name();
         let else_label = function.name_gen.next_block_name();
         let test_instr_id = InstrId::new(0);
-        let entry = CodegenBlock {
+        let entry = BlockPyBlock {
             label: entry_label,
             body: vec![],
             term: BlockTerm::IfTerm(soac_core::block_py::TermIf {
@@ -4798,7 +4796,7 @@ def build(values):
             exc_edge: None,
             extra: Default::default(),
         };
-        let then_block = CodegenBlock {
+        let then_block = BlockPyBlock {
             label: then_label,
             body: vec![],
             term: ret_term(constants.int_expr(1)),
@@ -4806,7 +4804,7 @@ def build(values):
             exc_edge: None,
             extra: Default::default(),
         };
-        let else_block = CodegenBlock {
+        let else_block = BlockPyBlock {
             label: else_label,
             body: vec![],
             term: ret_term(constants.int_expr(2)),
@@ -4816,7 +4814,7 @@ def build(values):
         };
         let function = with_test_blocks(function, vec![entry, then_block, else_block]);
         let typed_function =
-            lower_typed_function_if_tests_to_truthy(lower_codegen_function_to_typed(function));
+            lower_typed_function_if_tests_to_truthy(lower_blockpy_function_to_typed(function));
         let typed_function = annotate_test_result_demands(typed_function);
 
         assert_eq!(
@@ -4833,7 +4831,7 @@ def build(values):
         let case_label = function.name_gen.next_block_name();
         let default_label = function.name_gen.next_block_name();
         let index_instr_id = InstrId::new(0);
-        let entry = CodegenBlock {
+        let entry = BlockPyBlock {
             label: entry_label,
             body: vec![],
             term: BlockTerm::BranchTable(soac_core::block_py::TermBranchTable {
@@ -4845,7 +4843,7 @@ def build(values):
             exc_edge: None,
             extra: Default::default(),
         };
-        let case_block = CodegenBlock {
+        let case_block = BlockPyBlock {
             label: case_label,
             body: vec![],
             term: ret_term(constants.int_expr(1)),
@@ -4853,7 +4851,7 @@ def build(values):
             exc_edge: None,
             extra: Default::default(),
         };
-        let default_block = CodegenBlock {
+        let default_block = BlockPyBlock {
             label: default_label,
             body: vec![],
             term: ret_term(constants.int_expr(2)),
@@ -4862,7 +4860,7 @@ def build(values):
             extra: Default::default(),
         };
         let function = with_test_blocks(function, vec![entry, case_block, default_block]);
-        let typed_function = lower_codegen_function_to_typed(function);
+        let typed_function = lower_blockpy_function_to_typed(function);
         let typed_function = annotate_test_result_demands(typed_function);
 
         assert_eq!(
@@ -4880,7 +4878,7 @@ def build(values):
             vec![],
             ret_term(with_instr_id(constants.int_expr(2), return_instr_id)),
         );
-        let typed_function = lower_codegen_function_to_typed(function);
+        let typed_function = lower_blockpy_function_to_typed(function);
         let typed_function = annotate_test_result_demands(typed_function);
 
         assert_eq!(
@@ -4900,7 +4898,7 @@ def build(values):
                 exc: Some(with_instr_id(constants.int_expr(2), raise_instr_id)),
             }),
         );
-        let typed_function = lower_codegen_function_to_typed(function);
+        let typed_function = lower_blockpy_function_to_typed(function);
         let typed_function = annotate_test_result_demands(typed_function);
 
         assert_eq!(
@@ -5852,14 +5850,14 @@ def build(values):
     }
 
     fn render_test_jit_function(
-        function: &BlockPyFunction<CodegenModuleShape>,
+        function: &BlockPyFunction<BlockPyModuleShape>,
         blocks: &[ObjPtr],
     ) -> String {
         render_test_jit_function_with_module_constants(function, blocks, Vec::new())
     }
 
     fn render_test_jit_function_with_module_constants(
-        function: &BlockPyFunction<CodegenModuleShape>,
+        function: &BlockPyFunction<BlockPyModuleShape>,
         blocks: &[ObjPtr],
         module_constants: Vec<ConstantExpr>,
     ) -> String {
@@ -5872,7 +5870,7 @@ def build(values):
     }
 
     fn render_test_jit_function_with_block_entry_counts(
-        function: &BlockPyFunction<CodegenModuleShape>,
+        function: &BlockPyFunction<BlockPyModuleShape>,
         blocks: &[ObjPtr],
         module_constants: Vec<ConstantExpr>,
         block_entry_counts: &[(BlockLabel, u64)],
@@ -6155,7 +6153,7 @@ def write_point(point, value):
 "#,
             )
             .expect("lowering should succeed")
-            .codegen_module;
+            .blockpy_module;
             define_module_call_target_counters(&mut lowered);
             let function = lowered
                 .callable_defs
@@ -6168,7 +6166,7 @@ def write_point(point, value):
                 .iter()
                 .flat_map(|block| block.body.iter())
                 .find_map(|expr| match expr {
-                    InstrCodegen::SetAttr(_) => Some(expr.semantic_instr_id()),
+                    InstrBlockPy::SetAttr(_) => Some(expr.semantic_instr_id()),
                     _ => None,
                 })
                 .expect("write_point should contain a SetAttr");
@@ -6439,7 +6437,7 @@ class Record:
 "#,
             )
             .expect("lowering should succeed")
-            .codegen_module;
+            .blockpy_module;
             define_module_call_target_counters(&mut lowered);
             let function = lowered
                 .callable_defs
@@ -6452,7 +6450,7 @@ class Record:
                 .iter()
                 .flat_map(|block| block.body.iter())
                 .filter_map(|expr| match expr {
-                    InstrCodegen::SetAttr(_) => Some(expr.semantic_instr_id()),
+                    InstrBlockPy::SetAttr(_) => Some(expr.semantic_instr_id()),
                     _ => None,
                 })
                 .collect::<Vec<_>>();
@@ -6604,18 +6602,18 @@ class Record:
         }
     }
 
-    fn first_getattr_instr_id(function: &BlockPyFunction<CodegenModuleShape>) -> InstrId {
+    fn first_getattr_instr_id(function: &BlockPyFunction<BlockPyModuleShape>) -> InstrId {
         struct GetAttrFinder {
             instr_id: Option<InstrId>,
         }
 
-        impl Visit<InstrCodegen> for GetAttrFinder {
-            fn visit_instr(&mut self, expr: &InstrCodegen)
+        impl Visit<InstrBlockPy> for GetAttrFinder {
+            fn visit_instr(&mut self, expr: &InstrBlockPy)
             where
-                InstrCodegen: ChildVisitable<InstrCodegen>,
+                InstrBlockPy: ChildVisitable<InstrBlockPy>,
             {
                 if self.instr_id.is_none()
-                    && let InstrCodegen::GetAttr(_) = expr
+                    && let InstrBlockPy::GetAttr(_) = expr
                 {
                     self.instr_id = Some(expr.semantic_instr_id());
                 }
@@ -6703,7 +6701,7 @@ def read_point(point):
 "#,
             )
             .expect("lowering should succeed")
-            .codegen_module;
+            .blockpy_module;
             define_module_call_target_counters(&mut lowered);
             let function = lowered
                 .callable_defs
@@ -6870,7 +6868,7 @@ class Point:
 
         let mut lowered = soac_lowering::lower_python_to_blockpy_for_testing(source)
             .expect("lowering should succeed")
-            .codegen_module;
+            .blockpy_module;
         define_module_call_target_counters(&mut lowered);
         let shared_state =
             crate::module_type::build_shared_state_for_testing(py, lowered, "counter_test", "")
@@ -7144,7 +7142,7 @@ def read_point(point):
 "#,
             )
             .expect("lowering should succeed")
-            .codegen_module;
+            .blockpy_module;
             define_module_call_target_counters(&mut lowered);
             let function = lowered
                 .callable_defs
@@ -7336,7 +7334,7 @@ def write_point(point, value):
 "#,
             )
             .expect("lowering should succeed")
-            .codegen_module;
+            .blockpy_module;
             define_module_call_target_counters(&mut lowered);
             let function = lowered
                 .callable_defs
@@ -7462,8 +7460,8 @@ def write_point(point, value):
     }
 
     fn render_test_jit_function_with_constants(
-        module: &BlockPyModule<CodegenModuleShape>,
-        function: &BlockPyFunction<CodegenModuleShape>,
+        module: &BlockPyModule<BlockPyModuleShape>,
+        function: &BlockPyFunction<BlockPyModuleShape>,
         blocks: &[ObjPtr],
         module_constants: &crate::module_constants::ModuleCodegenConstants,
     ) -> String {
@@ -7513,7 +7511,7 @@ def write_point(point, value):
 
     fn define_test_counter_storage(
         jit_module: &mut JITModule,
-        module: &BlockPyModule<CodegenModuleShape>,
+        module: &BlockPyModule<BlockPyModuleShape>,
         counter_defs: &[CounterDef],
     ) -> (Box<[CounterRuntimeSlot]>, Option<DataId>, Option<DataId>) {
         let (counter_slots_by_id, scalar_counter_count, top_value_counter_count) =
@@ -7565,8 +7563,8 @@ def write_point(point, value):
     }
 
     fn build_test_jit_function_with_constants(
-        module: &BlockPyModule<CodegenModuleShape>,
-        function: &BlockPyFunction<CodegenModuleShape>,
+        module: &BlockPyModule<BlockPyModuleShape>,
+        function: &BlockPyFunction<BlockPyModuleShape>,
         blocks: &[ObjPtr],
         module_constants: &crate::module_constants::ModuleCodegenConstants,
     ) -> BuiltSpecializedFunction {
@@ -7580,8 +7578,8 @@ def write_point(point, value):
     }
 
     fn build_test_jit_function_with_constants_and_options(
-        module: &BlockPyModule<CodegenModuleShape>,
-        function: &BlockPyFunction<CodegenModuleShape>,
+        module: &BlockPyModule<BlockPyModuleShape>,
+        function: &BlockPyFunction<BlockPyModuleShape>,
         blocks: &[ObjPtr],
         module_constants: &crate::module_constants::ModuleCodegenConstants,
         options: BuildSpecializedFunctionOptions,
@@ -7622,8 +7620,8 @@ def write_point(point, value):
     }
 
     fn render_test_jit_function_with_constants_and_runtime_inline(
-        module: &BlockPyModule<CodegenModuleShape>,
-        function: &BlockPyFunction<CodegenModuleShape>,
+        module: &BlockPyModule<BlockPyModuleShape>,
+        function: &BlockPyFunction<BlockPyModuleShape>,
         blocks: &[ObjPtr],
         module_constants: &crate::module_constants::ModuleCodegenConstants,
     ) -> String {
@@ -7679,7 +7677,7 @@ def write_point(point, value):
     }
 
     fn render_test_jit_function_with_runtime_inline(
-        function: &BlockPyFunction<CodegenModuleShape>,
+        function: &BlockPyFunction<BlockPyModuleShape>,
         blocks: &[ObjPtr],
         module_constants: Vec<ConstantExpr>,
     ) -> String {
@@ -8237,7 +8235,7 @@ def f(x):
 "#,
         )
         .expect("lowering should succeed")
-        .codegen_module;
+        .blockpy_module;
         let function = lowered
             .callable_defs
             .iter()
@@ -8359,7 +8357,7 @@ def f(x):
             ret_term(op_expr(Call::new(
                 name_expr(test_constant_name(0)),
                 vec![CallArgPositional::Starred(name_expr(test_constant_name(1)))],
-                Vec::<CallArgKeyword<InstrCodegen>>::new(),
+                Vec::<CallArgKeyword<InstrBlockPy>>::new(),
             ))),
         );
         let module = test_module(ModuleNameGen::new(0), vec![function]);
@@ -8398,7 +8396,7 @@ def f(x):
             vec![],
             ret_term(op_expr(Call::new(
                 name_expr(test_constant_name(0)),
-                Vec::<CallArgPositional<InstrCodegen>>::new(),
+                Vec::<CallArgPositional<InstrBlockPy>>::new(),
                 vec![CallArgKeyword::Starred(name_expr(test_constant_name(1)))],
             ))),
         );
@@ -8639,7 +8637,7 @@ def f(x):
             "plain local loads should be replay-safe guard operands"
         );
         assert!(
-            !runtime_jit_deopt_guard_operand_replay_safe(&InstrCodegen::Tuple(Tuple::new(vec![
+            !runtime_jit_deopt_guard_operand_replay_safe(&InstrBlockPy::Tuple(Tuple::new(vec![
                 name_expr(test_name("x")),
             ]))),
             "guard miss deopt should reject operands that could repeat side effects"
@@ -9037,7 +9035,7 @@ def f(x):
                 vec![CallArgPositional::Positional(name_expr(
                     test_constant_name(1),
                 ))],
-                Vec::<CallArgKeyword<InstrCodegen>>::new(),
+                Vec::<CallArgKeyword<InstrBlockPy>>::new(),
             ))],
             ret_term(none_expr()),
         );
@@ -9764,7 +9762,7 @@ def f(x):
                     vec![CallArgPositional::Positional(name_expr(
                         test_constant_name(1),
                     ))],
-                    Vec::<CallArgKeyword<InstrCodegen>>::new(),
+                    Vec::<CallArgKeyword<InstrBlockPy>>::new(),
                 ))],
                 ret_term(none_expr()),
             );
@@ -11349,7 +11347,7 @@ def f(x):
                     vec![CallArgPositional::Positional(name_expr(
                         test_constant_name(1),
                     ))],
-                    Vec::<CallArgKeyword<InstrCodegen>>::new(),
+                    Vec::<CallArgKeyword<InstrBlockPy>>::new(),
                 ))),
             );
             let function_id = function.function_id;
@@ -11427,7 +11425,7 @@ def f(x):
                 ret_term(op_expr(Call::new(
                     name_expr(test_constant_name(0)),
                     vec![CallArgPositional::Starred(name_expr(test_constant_name(1)))],
-                    Vec::<CallArgKeyword<InstrCodegen>>::new(),
+                    Vec::<CallArgKeyword<InstrBlockPy>>::new(),
                 ))),
             );
             let function_id = function.function_id;
@@ -11514,7 +11512,7 @@ def f(x):
                 vec![],
                 ret_term(op_expr(Call::new(
                     name_expr(test_constant_name(0)),
-                    Vec::<CallArgPositional<InstrCodegen>>::new(),
+                    Vec::<CallArgPositional<InstrBlockPy>>::new(),
                     vec![CallArgKeyword::Named {
                         arg: "x".into(),
                         value: name_expr(test_constant_name(1)),
@@ -11615,7 +11613,7 @@ def f(x):
                 vec![],
                 ret_term(op_expr(Call::new(
                     name_expr(test_constant_name(0)),
-                    Vec::<CallArgPositional<InstrCodegen>>::new(),
+                    Vec::<CallArgPositional<InstrBlockPy>>::new(),
                     vec![CallArgKeyword::Starred(name_expr(test_constant_name(1)))],
                 ))),
             );
@@ -11723,7 +11721,7 @@ def f(x):
                 vec![],
                 ret_term(op_expr(Call::new(
                     name_expr(test_constant_name(0)),
-                    Vec::<CallArgPositional<InstrCodegen>>::new(),
+                    Vec::<CallArgPositional<InstrBlockPy>>::new(),
                     vec![
                         CallArgKeyword::Starred(name_expr(test_constant_name(1))),
                         CallArgKeyword::Named {
@@ -13894,7 +13892,7 @@ def f():
 "#,
                 )
                 .expect("lowering should succeed")
-                .codegen_module;
+                .blockpy_module;
                 define_module_block_entry_counters(&mut lowered);
 
                 let function = lowered
@@ -14093,7 +14091,7 @@ def f():
 "#,
         )
         .expect("lowering try/except test source should succeed")
-        .codegen_module;
+        .blockpy_module;
 
         let codegen_constants =
             crate::module_constants::ModuleCodegenConstants::collect_from_module(&lowered);
@@ -14140,7 +14138,7 @@ def f(mode):
 "#,
         )
         .expect("lowering try/except/else/finally source should succeed")
-        .codegen_module;
+        .blockpy_module;
 
         let codegen_constants =
             crate::module_constants::ModuleCodegenConstants::collect_from_module(&lowered);
@@ -14177,7 +14175,7 @@ def write_and_read(path: Path) -> str:
 "#,
         )
         .expect("lowering method_named_open source should succeed")
-        .codegen_module;
+        .blockpy_module;
 
         let codegen_constants =
             crate::module_constants::ModuleCodegenConstants::collect_from_module(&lowered);
@@ -14207,7 +14205,7 @@ def run():
 "#,
         )
         .expect("lowering except star source should succeed")
-        .codegen_module;
+        .blockpy_module;
 
         let codegen_constants =
             crate::module_constants::ModuleCodegenConstants::collect_from_module(&lowered);
@@ -14223,11 +14221,11 @@ def run():
 
     fn assert_exception_dispatch_forwards_live_local(
         source: &str,
-        source_block_matches: impl Fn(&CodegenBlock) -> bool,
+        source_block_matches: impl Fn(&BlockPyBlock) -> bool,
     ) {
         let lowered = soac_lowering::lower_python_to_blockpy_for_testing(source)
             .expect("lowering try/except local-forwarding test source should succeed")
-            .codegen_module;
+            .blockpy_module;
 
         let codegen_constants =
             crate::module_constants::ModuleCodegenConstants::collect_from_module(&lowered);
@@ -14291,7 +14289,7 @@ def f(x):
                     && block
                         .body
                         .iter()
-                        .any(|instr| matches!(instr, InstrCodegen::Call(_)))
+                        .any(|instr| matches!(instr, InstrBlockPy::Call(_)))
             },
         );
     }
@@ -14385,7 +14383,7 @@ def f(x):
         let else_label = function.name_gen.next_block_name();
         let add_instr_id = InstrId::new(2);
         let compare_instr_id = InstrId::new(4);
-        let entry = CodegenBlock {
+        let entry = BlockPyBlock {
             label: entry_label,
             body: vec![],
             term: BlockTerm::IfTerm(soac_core::block_py::TermIf {
@@ -14411,7 +14409,7 @@ def f(x):
             exc_edge: None,
             extra: Default::default(),
         };
-        let then_block = CodegenBlock {
+        let then_block = BlockPyBlock {
             label: then_label,
             body: vec![],
             term: ret_term(constants.int_expr(1)),
@@ -14419,7 +14417,7 @@ def f(x):
             exc_edge: None,
             extra: Default::default(),
         };
-        let else_block = CodegenBlock {
+        let else_block = BlockPyBlock {
             label: else_label,
             body: vec![],
             term: ret_term(constants.int_expr(0)),
@@ -14536,7 +14534,7 @@ def f(x):
         let add_instr_id = InstrId::new(1);
         let compare_instr_id = InstrId::new(2);
         let c_name = test_local_name("c", 2);
-        let entry = CodegenBlock {
+        let entry = BlockPyBlock {
             label: entry_label,
             body: vec![with_instr_id(
                 op_expr(Store::new(
@@ -14557,7 +14555,7 @@ def f(x):
             exc_edge: None,
             extra: Default::default(),
         };
-        let test_block = CodegenBlock {
+        let test_block = BlockPyBlock {
             label: test_label,
             body: vec![],
             term: BlockTerm::IfTerm(soac_core::block_py::TermIf {
@@ -14576,7 +14574,7 @@ def f(x):
             exc_edge: None,
             extra: Default::default(),
         };
-        let then_block = CodegenBlock {
+        let then_block = BlockPyBlock {
             label: then_label,
             body: vec![],
             term: ret_term(name_expr(test_runtime_name("TRUE"))),
@@ -14584,7 +14582,7 @@ def f(x):
             exc_edge: None,
             extra: Default::default(),
         };
-        let else_block = CodegenBlock {
+        let else_block = BlockPyBlock {
             label: else_label,
             body: vec![],
             term: ret_term(none_expr()),
@@ -14711,7 +14709,7 @@ def f(x):
             };
             let block_label = function.name_gen.next_block_name();
             let op_instr_id = InstrId::new(2);
-            function.blocks = vec![CodegenBlock {
+            function.blocks = vec![BlockPyBlock {
                 label: block_label,
                 body: vec![],
                 term: ret_term(with_instr_id(
@@ -14820,7 +14818,7 @@ def f(x):
             };
             let block_label = function.name_gen.next_block_name();
             let op_instr_id = InstrId::new(2);
-            function.blocks = vec![CodegenBlock {
+            function.blocks = vec![BlockPyBlock {
                 label: block_label,
                 body: vec![],
                 term: ret_term(with_instr_id(
@@ -14923,7 +14921,7 @@ def f(x):
         };
         let block_label = function.name_gen.next_block_name();
         let compare_instr_id = InstrId::new(2);
-        function.blocks = vec![CodegenBlock {
+        function.blocks = vec![BlockPyBlock {
             label: block_label,
             body: vec![],
             term: ret_term(with_instr_id(
@@ -15023,7 +15021,7 @@ def f(x):
         let then_label = function.name_gen.next_block_name();
         let else_label = function.name_gen.next_block_name();
         let compare_instr_id = InstrId::new(2);
-        let entry = CodegenBlock {
+        let entry = BlockPyBlock {
             label: entry_label,
             body: vec![],
             term: BlockTerm::IfTerm(soac_core::block_py::TermIf {
@@ -15042,7 +15040,7 @@ def f(x):
             exc_edge: None,
             extra: Default::default(),
         };
-        let then_block = CodegenBlock {
+        let then_block = BlockPyBlock {
             label: then_label,
             body: vec![],
             term: ret_term(constants.int_expr(1)),
@@ -15050,7 +15048,7 @@ def f(x):
             exc_edge: None,
             extra: Default::default(),
         };
-        let else_block = CodegenBlock {
+        let else_block = BlockPyBlock {
             label: else_label,
             body: vec![],
             term: ret_term(constants.int_expr(0)),
@@ -15192,14 +15190,14 @@ def f(x):
             },
         };
 
-        let inputs = planned_optimization_inputs_from_v3_artifacts_for_codegen_module(
+        let inputs = planned_optimization_inputs_from_v3_artifacts_for_blockpy_module(
             &artifacts,
             &module,
             artifacts.plan.module.module_name.as_str(),
             artifacts.plan.module.source_hash,
             None,
         )
-        .expect("in-memory v3 module artifact should map onto the current codegen module");
+        .expect("in-memory v3 module artifact should map onto the current blockpy module");
         let function_artifacts = inputs
             .opt_v3_exact_int_branch_artifacts
             .get(&function.function_id)
@@ -15294,7 +15292,7 @@ def f(x):
             },
         };
 
-        let planned_inputs = planned_optimization_inputs_from_v3_artifacts_for_codegen_module(
+        let planned_inputs = planned_optimization_inputs_from_v3_artifacts_for_blockpy_module(
             &artifacts,
             &module,
             artifacts.plan.module.module_name.as_str(),
@@ -15423,7 +15421,7 @@ def f(x):
             },
         };
 
-        let planned_inputs = planned_optimization_inputs_from_v3_artifacts_for_codegen_module(
+        let planned_inputs = planned_optimization_inputs_from_v3_artifacts_for_blockpy_module(
             &artifacts,
             &caller_module,
             caller_module_name,
@@ -15477,7 +15475,7 @@ def f(x):
         let block_label = caller.name_gen.next_block_name();
         let load_source = InstrId::new(11);
         let store_source = InstrId::new(13);
-        caller.blocks = vec![CodegenBlock {
+        caller.blocks = vec![BlockPyBlock {
             label: block_label,
             body: vec![with_instr_id(
                 op_expr(SetAttr::new(
@@ -15618,7 +15616,7 @@ def f(x):
             },
         };
 
-        let planned_inputs = planned_optimization_inputs_from_v3_artifacts_for_codegen_module(
+        let planned_inputs = planned_optimization_inputs_from_v3_artifacts_for_blockpy_module(
             &artifacts,
             &module,
             artifacts.plan.module.module_name.as_str(),
@@ -15786,7 +15784,7 @@ def f(x):
             },
         };
 
-        let planned_inputs = planned_optimization_inputs_from_v3_artifacts_for_codegen_module(
+        let planned_inputs = planned_optimization_inputs_from_v3_artifacts_for_blockpy_module(
             &artifacts,
             &module,
             artifacts.plan.module.module_name.as_str(),
@@ -15835,7 +15833,7 @@ def f(x):
         module_name_gen: &ModuleNameGen,
         load_source: InstrId,
         store_source: InstrId,
-    ) -> BlockPyFunction<CodegenModuleShape> {
+    ) -> BlockPyFunction<BlockPyModuleShape> {
         with_single_test_block(
             test_function_in_module(module_name_gen, "global_user"),
             vec![
@@ -15876,7 +15874,7 @@ def f(x):
     }
 
     fn first_indexed_global_access_source(
-        function: &BlockPyFunction<CodegenModuleShape>,
+        function: &BlockPyFunction<BlockPyModuleShape>,
         access: IndexedGlobalAccessKind,
         name: &str,
     ) -> InstrId {
@@ -15886,21 +15884,21 @@ def f(x):
             source: Option<InstrId>,
         }
 
-        impl Visit<InstrCodegen> for Finder<'_> {
-            fn visit_instr(&mut self, expr: &InstrCodegen)
+        impl Visit<InstrBlockPy> for Finder<'_> {
+            fn visit_instr(&mut self, expr: &InstrBlockPy)
             where
-                InstrCodegen: ChildVisitable<InstrCodegen>,
+                InstrBlockPy: ChildVisitable<InstrBlockPy>,
             {
                 if self.source.is_none() {
                     match expr {
-                        InstrCodegen::Load(op)
+                        InstrBlockPy::Load(op)
                             if self.access == IndexedGlobalAccessKind::Load
                                 && op.name.id_str() == self.name
                                 && matches!(op.name.location, NameLocation::Global(_)) =>
                         {
                             self.source = Some(op.semantic_instr_id());
                         }
-                        InstrCodegen::Store(op)
+                        InstrBlockPy::Store(op)
                             if self.access == IndexedGlobalAccessKind::Store
                                 && op.name.id_str() == self.name
                                 && matches!(op.name.location, NameLocation::Global(_)) =>
@@ -15929,12 +15927,12 @@ def f(x):
     }
 
     fn typed_function_with_indexed_global_access_plan(
-        function: &BlockPyFunction<CodegenModuleShape>,
+        function: &BlockPyFunction<BlockPyModuleShape>,
         access: IndexedGlobalAccessKind,
         name: &str,
-    ) -> BlockPyFunction<TypedCodegenModuleShape> {
+    ) -> BlockPyFunction<TypedBlockPyModuleShape> {
         let source = first_indexed_global_access_source(function, access, name);
-        let mut typed_function = lower_codegen_function_to_typed(function.clone());
+        let mut typed_function = lower_blockpy_function_to_typed(function.clone());
         annotate_typed_indexed_global_accesses(
             &mut typed_function,
             &HashMap::from([(
@@ -15947,10 +15945,10 @@ def f(x):
     }
 
     fn typed_function_with_deopting_indexed_global_access_plan(
-        function: &BlockPyFunction<CodegenModuleShape>,
+        function: &BlockPyFunction<BlockPyModuleShape>,
         access: IndexedGlobalAccessKind,
         name: &str,
-    ) -> BlockPyFunction<TypedCodegenModuleShape> {
+    ) -> BlockPyFunction<TypedBlockPyModuleShape> {
         let source = first_indexed_global_access_source(function, access, name);
         let mut typed_function =
             typed_function_with_indexed_global_access_plan(function, access, name);
@@ -15995,7 +15993,7 @@ def f(x):
         let module_constants =
             crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
         let blocks = [1usize as ObjPtr];
-        let mut typed_function = lower_codegen_function_to_typed(function.clone());
+        let mut typed_function = lower_blockpy_function_to_typed(function.clone());
         annotate_typed_indexed_global_accesses(
             &mut typed_function,
             &HashMap::from([
@@ -16137,7 +16135,7 @@ def read_point(point):
 "#,
             )
             .expect("lowering should succeed")
-            .codegen_module;
+            .blockpy_module;
             let module_name = "counter_test";
             let shared_state =
                 crate::module_type::build_shared_state_for_testing(py, lowered, module_name, "")
@@ -16152,13 +16150,13 @@ def read_point(point):
             struct GetAttrFinder {
                 instr_id: Option<InstrId>,
             }
-            impl Visit<InstrCodegen> for GetAttrFinder {
-                fn visit_instr(&mut self, expr: &InstrCodegen)
+            impl Visit<InstrBlockPy> for GetAttrFinder {
+                fn visit_instr(&mut self, expr: &InstrBlockPy)
                 where
-                    InstrCodegen: ChildVisitable<InstrCodegen>,
+                    InstrBlockPy: ChildVisitable<InstrBlockPy>,
                 {
                     if self.instr_id.is_none()
-                        && let InstrCodegen::GetAttr(_) = expr
+                        && let InstrBlockPy::GetAttr(_) = expr
                     {
                         self.instr_id = Some(expr.semantic_instr_id());
                     }
@@ -16226,7 +16224,7 @@ def read_point(point):
                 },
             );
             let profile = test_profile_from_v3_artifacts(shared_state.as_ref(), &artifacts);
-            let mut typed_function = lower_codegen_function_to_typed(function.clone());
+            let mut typed_function = lower_blockpy_function_to_typed(function.clone());
             apply_profile_typed_plans_to_typed_function(&mut typed_function, Some(&profile))
                 .expect("v3 indexed-field input should resolve to typed guards");
             let BlockTerm::Return(InstrTyped::GetAttrTyped(getattr)) =
@@ -16265,7 +16263,7 @@ def read_point(point):
             };
             let block_label = function.name_gen.next_block_name();
             let getattr_instr_id = InstrId::new(1);
-            function.blocks = vec![CodegenBlock {
+            function.blocks = vec![BlockPyBlock {
                 label: block_label,
                 body: vec![],
                 term: ret_term(with_instr_id(
@@ -16314,7 +16312,7 @@ def read_point(point):
                 guard_miss_deopt: false,
             };
 
-            let mut typed_function = lower_codegen_function_to_typed(function);
+            let mut typed_function = lower_blockpy_function_to_typed(function);
             apply_profile_typed_plans_to_typed_function(&mut typed_function, Some(&profile))
                 .expect("unresolvable v3 indexed-field owner should keep local fallback");
             let BlockTerm::Return(InstrTyped::GetAttrTyped(getattr)) =
@@ -16351,7 +16349,7 @@ def read_point(point):
         };
         let block_label = function.name_gen.next_block_name();
         let setattr_instr_id = InstrId::new(1);
-        function.blocks = vec![CodegenBlock {
+        function.blocks = vec![BlockPyBlock {
             label: block_label,
             body: vec![with_instr_id(
                 op_expr(SetAttr::new(
@@ -16369,7 +16367,7 @@ def read_point(point):
         set_stack_slots(&mut function, &["obj", "value"]);
 
         let mut typed_function =
-            lower_typed_function_if_tests_to_truthy(lower_codegen_function_to_typed(function));
+            lower_typed_function_if_tests_to_truthy(lower_blockpy_function_to_typed(function));
         let opt_v3_indexed_fields_by_instr = HashMap::from([(
             setattr_instr_id,
             vec![OptV3ResolvedIndexedFieldAccess {
@@ -16420,7 +16418,7 @@ def read_point(point):
         };
         let block_label = function.name_gen.next_block_name();
         let getattr_instr_id = InstrId::new(1);
-        function.blocks = vec![CodegenBlock {
+        function.blocks = vec![BlockPyBlock {
             label: block_label,
             body: vec![],
             term: ret_term(with_instr_id(
@@ -16437,7 +16435,7 @@ def read_point(point):
         set_stack_slots(&mut function, &["obj"]);
 
         let mut typed_function =
-            lower_typed_function_if_tests_to_truthy(lower_codegen_function_to_typed(function));
+            lower_typed_function_if_tests_to_truthy(lower_blockpy_function_to_typed(function));
         let opt_v3_indexed_fields_by_instr = HashMap::from([(
             getattr_instr_id,
             vec![OptV3ResolvedIndexedFieldAccess {
@@ -16535,7 +16533,7 @@ def read_point(point):
             },
         };
 
-        let err = match planned_optimization_inputs_from_v3_artifacts_for_codegen_module(
+        let err = match planned_optimization_inputs_from_v3_artifacts_for_blockpy_module(
             &artifacts,
             &module,
             artifacts.plan.module.module_name.as_str(),
@@ -16627,7 +16625,7 @@ def read_point(point):
             },
         };
 
-        let err = match planned_optimization_inputs_from_v3_artifacts_for_codegen_module(
+        let err = match planned_optimization_inputs_from_v3_artifacts_for_blockpy_module(
             &artifacts,
             &module,
             artifacts.plan.module.module_name.as_str(),
@@ -16717,7 +16715,7 @@ def f():
 "#;
                 let mut baseline = soac_lowering::lower_python_to_blockpy_for_testing(source)
                     .expect("lowering should succeed")
-                    .codegen_module;
+                    .blockpy_module;
                 let baseline_function = baseline
                     .callable_defs
                     .iter()
@@ -16827,7 +16825,7 @@ def f(x, y):
 "#;
                 let baseline = soac_lowering::lower_python_to_blockpy_for_testing(source)
                     .expect("lowering should succeed")
-                    .codegen_module;
+                    .blockpy_module;
                 let baseline_function = baseline
                     .callable_defs
                     .iter()
@@ -16849,7 +16847,7 @@ def f(x, y):
 
                 let mut instrumented = soac_lowering::lower_python_to_blockpy_for_testing(source)
                     .expect("lowering should succeed")
-                    .codegen_module;
+                    .blockpy_module;
                 define_module_call_target_counters(&mut instrumented);
                 let shared_state = crate::module_type::build_shared_state_for_testing(
                     py,
@@ -17043,12 +17041,9 @@ def f(x, y):
             assert!(!profile.behavior_change_indexed_stores);
             assert!(!profile.guard_miss_deopt);
 
-            let module_plan = build_typed_v3_jit_module_plan(
-                &shared_state.lowered_module,
-                None,
-                &typed_v3_env_config(),
-            )
-            .expect("typed-v3 runtime should lower CodegenModuleShape to typed JIT");
+            let module_plan =
+                optimize_blockpy(&shared_state.lowered_module, None, &typed_v3_env_config())
+                    .expect("typed-v3 runtime should lower BlockPyModuleShape to typed JIT");
             assert_eq!(module_plan.module.callable_defs.len(), 1);
             assert_eq!(
                 module_plan.module.module_name_gen.module_id(),
@@ -17104,7 +17099,7 @@ def f(x, y):
             let call_instr_id = InstrId::new(1);
             caller_function = with_test_blocks(
                 caller_function,
-                vec![CodegenBlock {
+                vec![BlockPyBlock {
                     label: caller_block_label,
                     body: vec![assign_stmt(
                         test_local_name("y", 2),
@@ -17114,7 +17109,7 @@ def f(x, y):
                                 vec![CallArgPositional::Positional(name_expr(test_local_name(
                                     "x", 1,
                                 )))],
-                                Vec::<CallArgKeyword<InstrCodegen>>::new(),
+                                Vec::<CallArgKeyword<InstrBlockPy>>::new(),
                             )),
                             call_instr_id,
                         ),
@@ -17201,7 +17196,7 @@ def f(x, y):
                 "the raw v3 planner can still record that inline won the body cost model"
             );
 
-            let module_plan = build_typed_v3_jit_module_plan(
+            let module_plan = optimize_blockpy(
                 &shared_state.lowered_module,
                 Some(&profile),
                 &typed_v3_env_config(),
@@ -17259,7 +17254,7 @@ def f(x, y):
                 .find(|function| function.function_id == caller_id)
                 .expect("shared state should include original caller");
             let mut reservation_typed_caller =
-                lower_codegen_function_to_typed(original_caller.clone());
+                lower_blockpy_function_to_typed(original_caller.clone());
             apply_profile_typed_plans_to_typed_function(
                 &mut reservation_typed_caller,
                 Some(&profile),
@@ -17322,7 +17317,7 @@ def f(x, y):
         let call_instr_id = InstrId::new(1);
         caller_function = with_test_blocks(
             caller_function,
-            vec![CodegenBlock {
+            vec![BlockPyBlock {
                 label: caller_block_label,
                 body: vec![assign_stmt(
                     test_local_name("y", 2),
@@ -17332,7 +17327,7 @@ def f(x, y):
                             vec![CallArgPositional::Positional(name_expr(test_local_name(
                                 "x", 1,
                             )))],
-                            Vec::<CallArgKeyword<InstrCodegen>>::new(),
+                            Vec::<CallArgKeyword<InstrBlockPy>>::new(),
                         )),
                         call_instr_id,
                     ),
@@ -17382,9 +17377,8 @@ def f(x, y):
             guard_miss_deopt: false,
         };
 
-        let module_plan =
-            build_typed_v3_jit_module_plan(&module, Some(&profile), &typed_v3_env_config())
-                .expect("typed-v3 module plan should lower non-inline direct calls");
+        let module_plan = optimize_blockpy(&module, Some(&profile), &typed_v3_env_config())
+            .expect("typed-v3 module plan should lower non-inline direct calls");
         let planned_caller = module_plan
             .module
             .callable_defs
@@ -17443,7 +17437,7 @@ def f(x, y):
             let load_instr_id = InstrId::new(0);
             function = with_test_blocks(
                 function,
-                vec![CodegenBlock {
+                vec![BlockPyBlock {
                     label: block_label,
                     body: Vec::new(),
                     term: ret_term(with_instr_id(
@@ -17547,7 +17541,7 @@ class Point:
             let block_label = function.name_gen.next_block_name();
             let setattr_instr_id = InstrId::new(0);
             let getattr_instr_id = InstrId::new(1);
-            function.blocks = vec![CodegenBlock {
+            function.blocks = vec![BlockPyBlock {
                 label: block_label,
                 body: vec![with_instr_id(
                     op_expr(SetAttr::new(
@@ -17623,9 +17617,8 @@ class Point:
                 guard_miss_deopt: false,
             };
 
-            let module_plan =
-                build_typed_v3_jit_module_plan(&module, Some(&profile), &typed_v3_env_config())
-                    .expect("typed-v3 module plan should attach indexed-field access plans");
+            let module_plan = optimize_blockpy(&module, Some(&profile), &typed_v3_env_config())
+                .expect("typed-v3 module plan should attach indexed-field access plans");
             let planned_function = module_plan
                 .module
                 .callable_defs
@@ -17668,7 +17661,7 @@ class Point:
         let block_label = function.name_gen.next_block_name();
         let store_instr_id = InstrId::new(0);
         let load_instr_id = InstrId::new(1);
-        function.blocks = vec![CodegenBlock {
+        function.blocks = vec![BlockPyBlock {
             label: block_label,
             body: vec![with_instr_id(
                 assign_stmt(test_global_name("counter"), none_expr()),
@@ -17721,9 +17714,8 @@ class Point:
             guard_miss_deopt: false,
         };
 
-        let module_plan =
-            build_typed_v3_jit_module_plan(&module, Some(&profile), &typed_v3_env_config())
-                .expect("typed-v3 module plan should attach indexed-global access plans");
+        let module_plan = optimize_blockpy(&module, Some(&profile), &typed_v3_env_config())
+            .expect("typed-v3 module plan should attach indexed-global access plans");
         let planned_function = module_plan
             .module
             .callable_defs
@@ -17799,7 +17791,7 @@ class Point:
         let block_label = function.name_gen.next_block_name();
         let setitem_instr_id = InstrId::new(0);
         let getitem_instr_id = InstrId::new(1);
-        function.blocks = vec![CodegenBlock {
+        function.blocks = vec![BlockPyBlock {
             label: block_label,
             body: vec![with_instr_id(
                 op_expr(SetItem::new(
@@ -17857,9 +17849,8 @@ class Point:
             guard_miss_deopt: false,
         };
 
-        let module_plan =
-            build_typed_v3_jit_module_plan(&module, Some(&profile), &typed_v3_env_config())
-                .expect("typed-v3 module plan should attach exact-list item access plans");
+        let module_plan = optimize_blockpy(&module, Some(&profile), &typed_v3_env_config())
+            .expect("typed-v3 module plan should attach exact-list item access plans");
         let planned_function = module_plan
             .module
             .callable_defs
@@ -17910,7 +17901,7 @@ class Point:
         let callee_block_label = callee_function.name_gen.next_block_name();
         let callee_setitem_instr_id = InstrId::new(0);
         let callee_getitem_instr_id = InstrId::new(1);
-        callee_function.blocks = vec![CodegenBlock {
+        callee_function.blocks = vec![BlockPyBlock {
             label: callee_block_label,
             body: vec![with_instr_id(
                 op_expr(SetItem::new(
@@ -17943,7 +17934,7 @@ class Point:
         };
         let caller_block_label = caller_function.name_gen.next_block_name();
         let caller_call_instr_id = InstrId::new(10);
-        caller_function.blocks = vec![CodegenBlock {
+        caller_function.blocks = vec![BlockPyBlock {
             label: caller_block_label,
             body: vec![with_instr_id(
                 op_expr(Call::new(
@@ -17952,7 +17943,7 @@ class Point:
                         CallArgPositional::Positional(name_expr(test_local_name("items", 1))),
                         CallArgPositional::Positional(name_expr(test_local_name("index", 2))),
                     ],
-                    Vec::<CallArgKeyword<InstrCodegen>>::new(),
+                    Vec::<CallArgKeyword<InstrBlockPy>>::new(),
                 )),
                 caller_call_instr_id,
             )],
@@ -18028,9 +18019,8 @@ class Point:
             guard_miss_deopt: false,
         };
 
-        let module_plan =
-            build_typed_v3_jit_module_plan(&module, Some(&profile), &typed_v3_env_config())
-                .expect("typed-v3 module plan should inline and remap callee item plans");
+        let module_plan = optimize_blockpy(&module, Some(&profile), &typed_v3_env_config())
+            .expect("typed-v3 module plan should inline and remap callee item plans");
         let planned_caller = module_plan
             .module
             .callable_defs
@@ -18154,7 +18144,7 @@ class Point:
         let return_add_instr_id = InstrId::new(7);
         let mut constants = TestConstantPool::default();
         function.blocks = vec![
-            CodegenBlock {
+            BlockPyBlock {
                 label: entry_label,
                 body: Vec::new(),
                 term: BlockTerm::IfTerm(soac_core::block_py::TermIf {
@@ -18183,7 +18173,7 @@ class Point:
                 exc_edge: None,
                 extra: Default::default(),
             },
-            CodegenBlock {
+            BlockPyBlock {
                 label: then_label,
                 body: Vec::new(),
                 term: ret_term(with_instr_id(
@@ -18198,7 +18188,7 @@ class Point:
                 exc_edge: None,
                 extra: Default::default(),
             },
-            CodegenBlock {
+            BlockPyBlock {
                 label: else_label,
                 body: Vec::new(),
                 term: ret_term(constants.int_expr(0)),
@@ -18259,9 +18249,8 @@ class Point:
             guard_miss_deopt: false,
         };
 
-        let module_plan =
-            build_typed_v3_jit_module_plan(&module, Some(&profile), &typed_v3_env_config())
-                .expect("typed-v3 module plan should attach exact-int selections");
+        let module_plan = optimize_blockpy(&module, Some(&profile), &typed_v3_env_config())
+            .expect("typed-v3 module plan should attach exact-int selections");
         let planned_function = module_plan
             .module
             .callable_defs
@@ -18335,7 +18324,7 @@ class Point:
         let c_name = test_local_name("c", 2);
         let mut constants = TestConstantPool::default();
         function.blocks = vec![
-            CodegenBlock {
+            BlockPyBlock {
                 label: entry_label,
                 body: vec![with_instr_id(
                     op_expr(Store::new(
@@ -18356,7 +18345,7 @@ class Point:
                 exc_edge: None,
                 extra: Default::default(),
             },
-            CodegenBlock {
+            BlockPyBlock {
                 label: test_label,
                 body: Vec::new(),
                 term: BlockTerm::IfTerm(soac_core::block_py::TermIf {
@@ -18375,7 +18364,7 @@ class Point:
                 exc_edge: None,
                 extra: Default::default(),
             },
-            CodegenBlock {
+            BlockPyBlock {
                 label: then_label,
                 body: Vec::new(),
                 term: ret_term(name_expr(test_runtime_name("TRUE"))),
@@ -18383,7 +18372,7 @@ class Point:
                 exc_edge: None,
                 extra: Default::default(),
             },
-            CodegenBlock {
+            BlockPyBlock {
                 label: else_label,
                 body: Vec::new(),
                 term: ret_term(none_expr()),
@@ -18445,9 +18434,8 @@ class Point:
             guard_miss_deopt: false,
         };
 
-        let module_plan =
-            build_typed_v3_jit_module_plan(&module, Some(&profile), &typed_v3_env_config())
-                .expect("typed-v3 module plan should attach scalar-thread selection");
+        let module_plan = optimize_blockpy(&module, Some(&profile), &typed_v3_env_config())
+            .expect("typed-v3 module plan should attach scalar-thread selection");
         let planned_function = module_plan
             .module
             .callable_defs
@@ -18527,7 +18515,7 @@ class Point:
     }
 
     fn assert_indexed_global_guard_miss_targets_cold_deopt_stub(
-        function: BlockPyFunction<CodegenModuleShape>,
+        function: BlockPyFunction<BlockPyModuleShape>,
         case_name: &str,
     ) {
         let blocks = [1usize as ObjPtr];
@@ -18892,8 +18880,8 @@ class Point:
         } else {
             op_expr(Call::new(
                 name_expr(test_runtime_name("list")),
-                Vec::<CallArgPositional<InstrCodegen>>::new(),
-                Vec::<CallArgKeyword<InstrCodegen>>::new(),
+                Vec::<CallArgPositional<InstrBlockPy>>::new(),
+                Vec::<CallArgKeyword<InstrBlockPy>>::new(),
             ))
         };
         let caller_params = if callable_replay_safe {
@@ -18914,14 +18902,14 @@ class Point:
             kind: soac_core::block_py::FunctionKind::Function,
             execution_mode: Default::default(),
             params: caller_params,
-            blocks: vec![CodegenBlock {
+            blocks: vec![BlockPyBlock {
                 label: BlockLabel::from_index(0),
                 body: vec![],
                 term: ret_term(with_instr_id(
                     op_expr(Call::new(
                         callable_expr,
-                        Vec::<CallArgPositional<InstrCodegen>>::new(),
-                        Vec::<CallArgKeyword<InstrCodegen>>::new(),
+                        Vec::<CallArgPositional<InstrBlockPy>>::new(),
+                        Vec::<CallArgKeyword<InstrBlockPy>>::new(),
                     )),
                     call_instr_id,
                 )),
@@ -19130,14 +19118,14 @@ class Point:
                         has_default: false,
                     }],
                 },
-                blocks: vec![CodegenBlock {
+                blocks: vec![BlockPyBlock {
                     label: BlockLabel::from_index(0),
                     body: vec![],
                     term: ret_term(with_instr_id(
                         op_expr(Call::new(
                             name_expr(test_name("fn")),
-                            Vec::<CallArgPositional<InstrCodegen>>::new(),
-                            Vec::<CallArgKeyword<InstrCodegen>>::new(),
+                            Vec::<CallArgPositional<InstrBlockPy>>::new(),
+                            Vec::<CallArgKeyword<InstrBlockPy>>::new(),
                         )),
                         call_instr_id,
                     )),
@@ -19384,7 +19372,7 @@ class Point:
         let call_instr_id = InstrId::new(1);
         caller_function = with_test_blocks(
             caller_function,
-            vec![CodegenBlock {
+            vec![BlockPyBlock {
                 label: caller_block_label,
                 body: vec![assign_stmt(
                     test_local_name("y", 2),
@@ -19394,7 +19382,7 @@ class Point:
                             vec![CallArgPositional::Positional(name_expr(test_local_name(
                                 "x", 1,
                             )))],
-                            Vec::<CallArgKeyword<InstrCodegen>>::new(),
+                            Vec::<CallArgKeyword<InstrBlockPy>>::new(),
                         )),
                         call_instr_id,
                     ),
@@ -19441,7 +19429,7 @@ class Point:
             profiled_cold_blocks: false,
             guard_miss_deopt: false,
         };
-        let plan = build_typed_v3_jit_module_plan(&module, Some(&profile), &typed_v3_env_config())
+        let plan = optimize_blockpy(&module, Some(&profile), &typed_v3_env_config())
             .expect("v3-profiled JIT module plan should build from the pre-opt module");
         let planned_caller = plan
             .module
@@ -19520,8 +19508,8 @@ class Point:
             vec![tuple_expr(vec![
                 op_expr(Call::new(
                     none_expr(),
-                    Vec::<CallArgPositional<InstrCodegen>>::new(),
-                    Vec::<CallArgKeyword<InstrCodegen>>::new(),
+                    Vec::<CallArgPositional<InstrBlockPy>>::new(),
+                    Vec::<CallArgKeyword<InstrBlockPy>>::new(),
                 )),
                 op_expr(Load::new(test_global_name("x"))),
             ])],
@@ -19922,8 +19910,8 @@ class Point:
             ret_term(tuple_expr(vec![
                 op_expr(Call::new(
                     none_expr(),
-                    Vec::<CallArgPositional<InstrCodegen>>::new(),
-                    Vec::<CallArgKeyword<InstrCodegen>>::new(),
+                    Vec::<CallArgPositional<InstrBlockPy>>::new(),
+                    Vec::<CallArgKeyword<InstrBlockPy>>::new(),
                 )),
                 op_expr(Load::new(test_global_name("x"))),
             ])),
@@ -20563,7 +20551,7 @@ class Point:
         let hot_label = function.name_gen.next_block_name();
         let cold_label = function.name_gen.next_block_name();
         function.blocks = vec![
-            CodegenBlock {
+            BlockPyBlock {
                 label: entry_label,
                 body: vec![],
                 term: BlockTerm::IfTerm(soac_core::block_py::TermIf {
@@ -20575,7 +20563,7 @@ class Point:
                 exc_edge: None,
                 extra: Default::default(),
             },
-            CodegenBlock {
+            BlockPyBlock {
                 label: hot_label,
                 body: vec![],
                 term: ret_term(none_expr()),
@@ -20583,7 +20571,7 @@ class Point:
                 exc_edge: None,
                 extra: Default::default(),
             },
-            CodegenBlock {
+            BlockPyBlock {
                 label: cold_label,
                 body: vec![],
                 term: ret_term(none_expr()),
@@ -20620,7 +20608,7 @@ class Point:
         let hot_label = function.name_gen.next_block_name();
         let cold_label = function.name_gen.next_block_name();
         function.blocks = vec![
-            CodegenBlock {
+            BlockPyBlock {
                 label: entry_label,
                 body: vec![],
                 term: BlockTerm::IfTerm(soac_core::block_py::TermIf {
@@ -20632,7 +20620,7 @@ class Point:
                 exc_edge: None,
                 extra: Default::default(),
             },
-            CodegenBlock {
+            BlockPyBlock {
                 label: hot_label,
                 body: vec![],
                 term: ret_term(none_expr()),
@@ -20640,7 +20628,7 @@ class Point:
                 exc_edge: None,
                 extra: Default::default(),
             },
-            CodegenBlock {
+            BlockPyBlock {
                 label: cold_label,
                 body: vec![],
                 term: ret_term(none_expr()),
@@ -20676,7 +20664,7 @@ class Point:
         let hot_label = function.name_gen.next_block_name();
         let cold_label = function.name_gen.next_block_name();
         function.blocks = vec![
-            CodegenBlock {
+            BlockPyBlock {
                 label: entry_label,
                 body: vec![],
                 term: BlockTerm::IfTerm(soac_core::block_py::TermIf {
@@ -20688,7 +20676,7 @@ class Point:
                 exc_edge: None,
                 extra: Default::default(),
             },
-            CodegenBlock {
+            BlockPyBlock {
                 label: hot_label,
                 body: vec![],
                 term: ret_term(none_expr()),
@@ -20696,7 +20684,7 @@ class Point:
                 exc_edge: None,
                 extra: Default::default(),
             },
-            CodegenBlock {
+            BlockPyBlock {
                 label: cold_label,
                 body: vec![],
                 term: ret_term(none_expr()),
@@ -20742,7 +20730,7 @@ class Point:
         );
         let module = test_module(ModuleNameGen::new(0), vec![function.clone()]);
         let facts = infer_jit_value_facts(&module);
-        let mut typed_function = lower_codegen_function_to_typed(function);
+        let mut typed_function = lower_blockpy_function_to_typed(function);
         let profile = SpecializationProfile {
             module_name: Some(module_name),
             counter_dump_path: Some(std::borrow::Cow::Owned(profile_path)),

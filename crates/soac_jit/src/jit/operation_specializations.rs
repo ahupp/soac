@@ -14,7 +14,7 @@ use soac_core::block_py::{
     CounterId, GetItem, HasSemanticInstrId, Instr, InstrId, RuntimeFunctionId, SetItem,
 };
 use soac_core::profile::{CollectedTypeKeyLayout, CounterDumpTypeKey};
-use soac_ir_blockpy::InstrCodegen;
+use soac_ir_blockpy::InstrBlockPy;
 use soac_ir_typed::plan_v3::{
     EXACT_LIST_EXACT_INT_ITEM_SHAPE_TAG, ExactListItemAccessKind,
     IndexedFieldAccessKind as PlanV3IndexedFieldAccessKind,
@@ -448,8 +448,8 @@ fn push_unique_specialization(
 }
 
 pub(super) fn emit_getitem<'fb>(
-    op: &GetItem<InstrCodegen>,
-    state: &mut impl OperationEmitState<'fb, InstrCodegen>,
+    op: &GetItem<InstrBlockPy>,
+    state: &mut impl OperationEmitState<'fb, InstrBlockPy>,
 ) -> ir::Value {
     emit_getitem_with_plan(op, state, None)
 }
@@ -535,8 +535,8 @@ pub(super) fn emit_getitem_with_plan<'fb, E: Instr>(
 }
 
 pub(super) fn emit_setitem<'fb>(
-    op: &SetItem<InstrCodegen>,
-    state: &mut impl OperationEmitState<'fb, InstrCodegen>,
+    op: &SetItem<InstrBlockPy>,
+    state: &mut impl OperationEmitState<'fb, InstrBlockPy>,
 ) -> ir::Value {
     emit_setitem_with_plan(op, state, None)
 }

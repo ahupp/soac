@@ -2,7 +2,7 @@ use soac_core::block_py::{
     BinOpKind, Block, BlockLabel, BlockPyFunction, BlockTerm, HasSemanticInstrId, InstrId, Load,
     ResolvedName, TermIf, UnaryOpKind,
 };
-use soac_ir_blockpy::{CodegenModuleShape, InstrCodegen};
+use soac_ir_blockpy::{BlockPyModuleShape, InstrBlockPy};
 use soac_ir_typed::plan_v3::RegionId;
 use std::fmt;
 
@@ -108,7 +108,7 @@ impl fmt::Display for RegionExtractionError {
 impl std::error::Error for RegionExtractionError {}
 
 pub fn extract_function_regions_v3(
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
 ) -> Vec<RegionExtractionAttempt> {
     let mut attempts = Vec::new();
     let mut next_region_id = 0;
@@ -135,7 +135,7 @@ pub fn extract_function_regions_v3(
 }
 
 pub fn extract_block_region_v3(
-    block: &Block<InstrCodegen>,
+    block: &Block<InstrBlockPy>,
     id: RegionId,
 ) -> Result<ExtractedRegion, RegionExtractionError> {
     if !block.body.is_empty() {
@@ -158,15 +158,15 @@ fn next_primary_region_id(next: &mut u32) -> RegionId {
 }
 
 fn extract_block_body_instr_region_v3(
-    block: &Block<InstrCodegen>,
-    instr: &InstrCodegen,
+    block: &Block<InstrBlockPy>,
+    instr: &InstrBlockPy,
     id: RegionId,
 ) -> Result<ExtractedRegion, RegionExtractionError> {
     if block.exc_edge.is_some() {
         return Err(RegionExtractionError::BlockHasExceptionEdge { block: block.label });
     }
 
-    let InstrCodegen::Store(store) = instr else {
+    let InstrBlockPy::Store(store) = instr else {
         return Err(unsupported_instr_error(instr));
     };
     let mut builder = RegionBuilder::new(id, block.label);
@@ -188,43 +188,43 @@ fn extract_block_body_instr_region_v3(
     })
 }
 
-fn block_jump_continuation(block: &Block<InstrCodegen>) -> Option<BlockLabel> {
+fn block_jump_continuation(block: &Block<InstrBlockPy>) -> Option<BlockLabel> {
     match &block.term {
         BlockTerm::Jump(edge) if edge.args.is_empty() => Some(edge.target),
         _ => None,
     }
 }
 
-fn unsupported_instr_error(instr: &InstrCodegen) -> RegionExtractionError {
+fn unsupported_instr_error(instr: &InstrBlockPy) -> RegionExtractionError {
     RegionExtractionError::UnsupportedInstr {
         source: instr.try_semantic_instr_id(),
         kind: instr_codegen_kind(instr),
     }
 }
 
-fn instr_codegen_kind(instr: &InstrCodegen) -> &'static str {
+fn instr_codegen_kind(instr: &InstrBlockPy) -> &'static str {
     match instr {
-        InstrCodegen::BinOp(_) => "BinOp",
-        InstrCodegen::UnaryOp(_) => "UnaryOp",
-        InstrCodegen::Tuple(_) => "Tuple",
-        InstrCodegen::Call(_) => "Call",
-        InstrCodegen::GetAttr(_) => "GetAttr",
-        InstrCodegen::SetAttr(_) => "SetAttr",
-        InstrCodegen::GetItem(_) => "GetItem",
-        InstrCodegen::SetItem(_) => "SetItem",
-        InstrCodegen::DelItem(_) => "DelItem",
-        InstrCodegen::Load(_) => "Load",
-        InstrCodegen::Store(_) => "Store",
-        InstrCodegen::Del(_) => "Del",
-        InstrCodegen::MakeCell(_) => "MakeCell",
-        InstrCodegen::IncrementCounter(_) => "IncrementCounter",
-        InstrCodegen::CellRef(_) => "CellRef",
-        InstrCodegen::MakeFunctionWithClosure(_) => "MakeFunctionWithClosure",
+        InstrBlockPy::BinOp(_) => "BinOp",
+        InstrBlockPy::UnaryOp(_) => "UnaryOp",
+        InstrBlockPy::Tuple(_) => "Tuple",
+        InstrBlockPy::Call(_) => "Call",
+        InstrBlockPy::GetAttr(_) => "GetAttr",
+        InstrBlockPy::SetAttr(_) => "SetAttr",
+        InstrBlockPy::GetItem(_) => "GetItem",
+        InstrBlockPy::SetItem(_) => "SetItem",
+        InstrBlockPy::DelItem(_) => "DelItem",
+        InstrBlockPy::Load(_) => "Load",
+        InstrBlockPy::Store(_) => "Store",
+        InstrBlockPy::Del(_) => "Del",
+        InstrBlockPy::MakeCell(_) => "MakeCell",
+        InstrBlockPy::IncrementCounter(_) => "IncrementCounter",
+        InstrBlockPy::CellRef(_) => "CellRef",
+        InstrBlockPy::MakeFunctionWithClosure(_) => "MakeFunctionWithClosure",
     }
 }
 
 fn extract_block_term_region_v3(
-    block: &Block<InstrCodegen>,
+    block: &Block<InstrBlockPy>,
     id: RegionId,
 ) -> Result<ExtractedRegion, RegionExtractionError> {
     if block.exc_edge.is_some() {
@@ -285,7 +285,7 @@ impl RegionBuilder {
 
     fn extract_if_term(
         &mut self,
-        term: &TermIf<InstrCodegen>,
+        term: &TermIf<InstrBlockPy>,
     ) -> Result<ExtractedExit, RegionExtractionError> {
         let test = self.linearize_instr(&term.test)?;
         let condition = self.push(
@@ -302,13 +302,13 @@ impl RegionBuilder {
 
     fn linearize_instr(
         &mut self,
-        instr: &InstrCodegen,
+        instr: &InstrBlockPy,
     ) -> Result<ExtractedValueId, RegionExtractionError> {
         match instr {
-            InstrCodegen::Load(load) => {
+            InstrBlockPy::Load(load) => {
                 Ok(self.linearize_load(load, instr.try_semantic_instr_id()))
             }
-            InstrCodegen::BinOp(op) => {
+            InstrBlockPy::BinOp(op) => {
                 let left = self.linearize_instr(&op.left)?;
                 let right = self.linearize_instr(&op.right)?;
                 Ok(self.push(
@@ -320,66 +320,66 @@ impl RegionBuilder {
                     },
                 ))
             }
-            InstrCodegen::UnaryOp(op) if op.kind == UnaryOpKind::Truth => {
+            InstrBlockPy::UnaryOp(op) if op.kind == UnaryOpKind::Truth => {
                 let value = self.linearize_instr(&op.operand)?;
                 Ok(self.push(
                     instr.try_semantic_instr_id(),
                     ExtractedValueKind::Truthiness { value },
                 ))
             }
-            InstrCodegen::Tuple(_) => Err(RegionExtractionError::UnsupportedInstr {
+            InstrBlockPy::Tuple(_) => Err(RegionExtractionError::UnsupportedInstr {
                 source: instr.try_semantic_instr_id(),
                 kind: "Tuple",
             }),
-            InstrCodegen::UnaryOp(_) => Err(RegionExtractionError::UnsupportedInstr {
+            InstrBlockPy::UnaryOp(_) => Err(RegionExtractionError::UnsupportedInstr {
                 source: instr.try_semantic_instr_id(),
                 kind: "UnaryOp",
             }),
-            InstrCodegen::Call(_) => Err(RegionExtractionError::UnsupportedInstr {
+            InstrBlockPy::Call(_) => Err(RegionExtractionError::UnsupportedInstr {
                 source: instr.try_semantic_instr_id(),
                 kind: "Call",
             }),
-            InstrCodegen::GetAttr(_) => Err(RegionExtractionError::UnsupportedInstr {
+            InstrBlockPy::GetAttr(_) => Err(RegionExtractionError::UnsupportedInstr {
                 source: instr.try_semantic_instr_id(),
                 kind: "GetAttr",
             }),
-            InstrCodegen::SetAttr(_) => Err(RegionExtractionError::UnsupportedInstr {
+            InstrBlockPy::SetAttr(_) => Err(RegionExtractionError::UnsupportedInstr {
                 source: instr.try_semantic_instr_id(),
                 kind: "SetAttr",
             }),
-            InstrCodegen::GetItem(_) => Err(RegionExtractionError::UnsupportedInstr {
+            InstrBlockPy::GetItem(_) => Err(RegionExtractionError::UnsupportedInstr {
                 source: instr.try_semantic_instr_id(),
                 kind: "GetItem",
             }),
-            InstrCodegen::SetItem(_) => Err(RegionExtractionError::UnsupportedInstr {
+            InstrBlockPy::SetItem(_) => Err(RegionExtractionError::UnsupportedInstr {
                 source: instr.try_semantic_instr_id(),
                 kind: "SetItem",
             }),
-            InstrCodegen::DelItem(_) => Err(RegionExtractionError::UnsupportedInstr {
+            InstrBlockPy::DelItem(_) => Err(RegionExtractionError::UnsupportedInstr {
                 source: instr.try_semantic_instr_id(),
                 kind: "DelItem",
             }),
-            InstrCodegen::Store(_) => Err(RegionExtractionError::UnsupportedInstr {
+            InstrBlockPy::Store(_) => Err(RegionExtractionError::UnsupportedInstr {
                 source: instr.try_semantic_instr_id(),
                 kind: "Store",
             }),
-            InstrCodegen::Del(_) => Err(RegionExtractionError::UnsupportedInstr {
+            InstrBlockPy::Del(_) => Err(RegionExtractionError::UnsupportedInstr {
                 source: instr.try_semantic_instr_id(),
                 kind: "Del",
             }),
-            InstrCodegen::MakeCell(_) => Err(RegionExtractionError::UnsupportedInstr {
+            InstrBlockPy::MakeCell(_) => Err(RegionExtractionError::UnsupportedInstr {
                 source: instr.try_semantic_instr_id(),
                 kind: "MakeCell",
             }),
-            InstrCodegen::IncrementCounter(_) => Err(RegionExtractionError::UnsupportedInstr {
+            InstrBlockPy::IncrementCounter(_) => Err(RegionExtractionError::UnsupportedInstr {
                 source: instr.try_semantic_instr_id(),
                 kind: "IncrementCounter",
             }),
-            InstrCodegen::CellRef(_) => Err(RegionExtractionError::UnsupportedInstr {
+            InstrBlockPy::CellRef(_) => Err(RegionExtractionError::UnsupportedInstr {
                 source: instr.try_semantic_instr_id(),
                 kind: "CellRef",
             }),
-            InstrCodegen::MakeFunctionWithClosure(_) => {
+            InstrBlockPy::MakeFunctionWithClosure(_) => {
                 Err(RegionExtractionError::UnsupportedInstr {
                     source: instr.try_semantic_instr_id(),
                     kind: "MakeFunctionWithClosure",
@@ -390,7 +390,7 @@ impl RegionBuilder {
 
     fn linearize_load(
         &mut self,
-        load: &Load<InstrCodegen>,
+        load: &Load<InstrBlockPy>,
         source: Option<InstrId>,
     ) -> ExtractedValueId {
         self.push(
@@ -440,29 +440,29 @@ mod tests {
         InstrId::new(index)
     }
 
-    fn with_instr_id(instr: InstrCodegen, index: u32) -> InstrCodegen {
+    fn with_instr_id(instr: InstrBlockPy, index: u32) -> InstrBlockPy {
         with_instr_id_in_label(instr, label(0), index)
     }
 
-    fn with_instr_id_in_label(instr: InstrCodegen, block: BlockLabel, index: u32) -> InstrCodegen {
+    fn with_instr_id_in_label(instr: InstrBlockPy, block: BlockLabel, index: u32) -> InstrBlockPy {
         instr.with_meta(Meta {
             instr_id: Some(instr_id_in_label(block, index)),
             ..Meta::synthetic()
         })
     }
 
-    fn local(name: &str, slot: u32) -> InstrCodegen {
-        InstrCodegen::Load(Load::new(ResolvedName {
+    fn local(name: &str, slot: u32) -> InstrBlockPy {
+        InstrBlockPy::Load(Load::new(ResolvedName {
             id: BlockPyName::new(name),
             location: NameLocation::Local(LocalLocation(slot)),
         }))
     }
 
-    fn binary(op: BinOpKind, left: InstrCodegen, right: InstrCodegen, id: u32) -> InstrCodegen {
-        with_instr_id(InstrCodegen::BinOp(BinOp::new(op, left, right)), id)
+    fn binary(op: BinOpKind, left: InstrBlockPy, right: InstrBlockPy, id: u32) -> InstrBlockPy {
+        with_instr_id(InstrBlockPy::BinOp(BinOp::new(op, left, right)), id)
     }
 
-    fn branch_block(test: InstrCodegen) -> Block<InstrCodegen> {
+    fn branch_block(test: InstrBlockPy) -> Block<InstrBlockPy> {
         Block::new(
             label(0),
             Vec::new(),
@@ -476,7 +476,7 @@ mod tests {
         )
     }
 
-    fn test_function(blocks: Vec<Block<InstrCodegen>>) -> BlockPyFunction<CodegenModuleShape> {
+    fn test_function(blocks: Vec<Block<InstrBlockPy>>) -> BlockPyFunction<BlockPyModuleShape> {
         let name_gen = ModuleNameGen::new(0).next_function_name_gen();
         BlockPyFunction {
             function_id: name_gen.function_id(),
@@ -592,7 +592,7 @@ mod tests {
         let entry = Block::new(
             label(0),
             vec![with_instr_id(
-                InstrCodegen::Store(Store::new(c.clone(), add)),
+                InstrBlockPy::Store(Store::new(c.clone(), add)),
                 3,
             )],
             BlockTerm::Jump(BlockEdge::new(label(1))),
@@ -601,9 +601,9 @@ mod tests {
         );
         let test_label = label(1);
         let compare = with_instr_id_in_label(
-            InstrCodegen::BinOp(BinOp::new(
+            InstrBlockPy::BinOp(BinOp::new(
                 BinOpKind::Gt,
-                with_instr_id_in_label(InstrCodegen::Load(Load::new(c.clone())), test_label, 4),
+                with_instr_id_in_label(InstrBlockPy::Load(Load::new(c.clone())), test_label, 4),
                 with_instr_id_in_label(local("zero", 3), test_label, 5),
             )),
             test_label,
@@ -670,7 +670,7 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_expression_kinds() {
-        let tuple = with_instr_id(InstrCodegen::Tuple(Tuple::new(Vec::new())), 0);
+        let tuple = with_instr_id(InstrBlockPy::Tuple(Tuple::new(Vec::new())), 0);
         let err = extract_block_region_v3(&branch_block(tuple), RegionId(0)).unwrap_err();
         assert_eq!(
             err,
@@ -700,7 +700,7 @@ mod tests {
     #[test]
     fn extracts_explicit_truth_unary_before_branch_truthiness() {
         let truth = with_instr_id(
-            InstrCodegen::UnaryOp(UnaryOp::new(
+            InstrBlockPy::UnaryOp(UnaryOp::new(
                 UnaryOpKind::Truth,
                 with_instr_id(local("value", 0), 0),
             )),

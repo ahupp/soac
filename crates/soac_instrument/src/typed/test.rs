@@ -7,18 +7,18 @@ use soac_core::block_py::{
 };
 use soac_core::pass_tracker::NoopPassTracker;
 use soac_ir_typed::{
-    InstrTyped, TypedCall, TypedCodegenModuleShape, lower_codegen_module_to_typed,
+    InstrTyped, TypedBlockPyModuleShape, TypedCall, lower_blockpy_module_to_typed,
 };
 use soac_lowering::lower_python_to_blockpy_for_testing;
 use std::collections::HashSet;
 
-fn typed_module_for_test(source: &str) -> BlockPyModule<TypedCodegenModuleShape> {
+fn typed_module_for_test(source: &str) -> BlockPyModule<TypedBlockPyModuleShape> {
     let lowered = lower_python_to_blockpy_for_testing(source).expect("transform should succeed");
-    lower_codegen_module_to_typed(lowered.codegen_module)
+    lower_blockpy_module_to_typed(lowered.blockpy_module)
 }
 
 fn function_contains_increment_counter(
-    function: &BlockPyFunction<TypedCodegenModuleShape>,
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
 ) -> bool {
     struct IncrementCounterProbe {
         found: bool,
@@ -37,7 +37,7 @@ fn function_contains_increment_counter(
 }
 
 fn trace_enter_calls(
-    function: &BlockPyFunction<TypedCodegenModuleShape>,
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
 ) -> Vec<&TypedCall<InstrTyped>> {
     function
         .blocks

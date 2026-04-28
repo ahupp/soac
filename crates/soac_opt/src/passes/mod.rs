@@ -7,8 +7,8 @@ pub(crate) mod value_facts;
 
 use soac_core::block_py::{BlockPyFunction, LocalLocation, NameLocation, ResolvedName};
 pub use soac_ir_blockpy::{
-    CodegenModuleShape, InstrCodegen, assign_missing_codegen_function_instr_ids,
-    reassign_codegen_function_instr_ids, validate_codegen_instr_ids,
+    BlockPyModuleShape, InstrBlockPy, assign_missing_blockpy_function_instr_ids,
+    reassign_blockpy_function_instr_ids, validate_blockpy_instr_ids,
 };
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -32,7 +32,7 @@ pub enum CodegenTempAllocationError {
 }
 
 pub fn try_allocate_codegen_stack_temp(
-    function: &mut BlockPyFunction<CodegenModuleShape>,
+    function: &mut BlockPyFunction<BlockPyModuleShape>,
     prefix: &str,
 ) -> Result<CodegenTempLocal, CodegenTempAllocationError> {
     let name = function.name_gen.next_tmp_name(prefix).as_str().to_string();
@@ -49,7 +49,7 @@ pub fn try_allocate_codegen_stack_temp(
 }
 
 pub fn allocate_codegen_stack_temp(
-    function: &mut BlockPyFunction<CodegenModuleShape>,
+    function: &mut BlockPyFunction<BlockPyModuleShape>,
     prefix: &str,
 ) -> CodegenTempLocal {
     try_allocate_codegen_stack_temp(function, prefix)

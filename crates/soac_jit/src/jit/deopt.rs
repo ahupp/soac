@@ -1,7 +1,7 @@
 use super::planning::{LocalRefKind, PlannedJitDeoptPointId, PlannedJitDeoptResumeFunction};
 use super::runtime_context::FunctionRuntimeDataLayout;
 use super::specialized_helpers::ObjPtr;
-use super::{CodegenBlock, blockpy_intrinsics, transient_local_needs_decref};
+use super::{BlockPyBlock, blockpy_intrinsics, transient_local_needs_decref};
 use crate::module_constants::ModuleConstantId;
 use pyo3::{Py, PyAny, ffi};
 use soac_core::block_py::{
@@ -9,8 +9,8 @@ use soac_core::block_py::{
     CellLocation, InstrLocationMap, LocalLocation, NameLocation, ParamKind, RuntimeFunctionId,
     StorageLayout, current_instr_locations,
 };
-use soac_ir_blockpy::{CodegenModuleShape, InstrCodegen};
-use soac_ir_typed::{InstrTyped, TypedCodegenModuleShape};
+use soac_ir_blockpy::{BlockPyModuleShape, InstrBlockPy};
+use soac_ir_typed::{InstrTyped, TypedBlockPyModuleShape};
 use soac_opt::passes::{
     LocalEnvResumeBinding, LocalEnvResumeBindingState, LocalEnvResumePoint,
     LocalEnvResumeStatePrecision, LocalEnvResumeValueSource,
@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 pub(super) struct RuntimeJitDeoptTable {
     pub(super) function_id: RuntimeFunctionId,
-    pub(super) function: Box<BlockPyFunction<CodegenModuleShape>>,
+    pub(super) function: Box<BlockPyFunction<BlockPyModuleShape>>,
     pub(super) module_constant_ptrs: Vec<ObjPtr>,
     #[cfg(not(test))]
     _module_constant_owners: Option<Arc<Vec<Py<PyAny>>>>,
@@ -147,7 +147,7 @@ impl RuntimeJitDeoptContinuation {
 
 impl RuntimeFunctionEntryPlan {
     pub(crate) fn from_function(
-        function: &BlockPyFunction<CodegenModuleShape>,
+        function: &BlockPyFunction<BlockPyModuleShape>,
     ) -> Result<Self, String> {
         let layout = function.storage_layout.as_ref().ok_or_else(|| {
             format!(
@@ -379,7 +379,7 @@ impl RuntimeJitDeoptRecord {
 
 impl RuntimeJitDeoptTable {
     pub(super) fn from_plan(
-        function: &BlockPyFunction<CodegenModuleShape>,
+        function: &BlockPyFunction<BlockPyModuleShape>,
         plan: &PlannedJitDeoptResumeFunction,
         module_constant_ptrs: &[*mut ffi::PyObject],
     ) -> Result<Self, String> {
@@ -387,7 +387,7 @@ impl RuntimeJitDeoptTable {
     }
 
     pub(super) fn from_plan_with_owned_constants(
-        function: &BlockPyFunction<CodegenModuleShape>,
+        function: &BlockPyFunction<BlockPyModuleShape>,
         plan: &PlannedJitDeoptResumeFunction,
         module_constant_ptrs: &[*mut ffi::PyObject],
         #[cfg_attr(test, allow(unused_variables))] module_constant_owners: Option<
@@ -469,7 +469,7 @@ impl RuntimeJitDeoptTable {
         self.function_id
     }
 
-    fn function(&self) -> &BlockPyFunction<CodegenModuleShape> {
+    fn function(&self) -> &BlockPyFunction<BlockPyModuleShape> {
         self.function.as_ref()
     }
 
@@ -520,7 +520,7 @@ impl RuntimeJitDeoptTable {
 }
 
 fn runtime_jit_deopt_continuation_for_point(
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
     instr_locations: &InstrLocationMap,
     point: LocalEnvResumePoint,
 ) -> RuntimeJitDeoptContinuation {
@@ -615,7 +615,7 @@ fn runtime_jit_deopt_continuation_for_point(
 }
 
 pub(super) fn runtime_jit_typed_deopt_continuation_for_point(
-    function: &BlockPyFunction<TypedCodegenModuleShape>,
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
     instr_locations: &InstrLocationMap,
     point: LocalEnvResumePoint,
 ) -> RuntimeJitDeoptContinuation {
@@ -683,10 +683,10 @@ pub(super) fn runtime_jit_typed_deopt_continuation_for_point(
     }
 }
 
-pub(super) fn runtime_jit_deopt_guard_operand_replay_safe(expr: &InstrCodegen) -> bool {
+pub(super) fn runtime_jit_deopt_guard_operand_replay_safe(expr: &InstrBlockPy) -> bool {
     matches!(
         expr,
-        InstrCodegen::Load(load)
+        InstrBlockPy::Load(load)
             if matches!(
                 load.name.location,
                 NameLocation::Local(_) | NameLocation::Cell(_) | NameLocation::Constant(_)
@@ -967,8 +967,8 @@ fn mark_replay_unsafe_effect(saw_replay_unsafe_effect: &mut bool) -> bool {
 }
 
 fn runtime_jit_deopt_block_tail_supported(
-    function: &BlockPyFunction<CodegenModuleShape>,
-    block: &CodegenBlock,
+    function: &BlockPyFunction<BlockPyModuleShape>,
+    block: &BlockPyBlock,
     start_body_index: usize,
 ) -> bool {
     let Some(body_tail) = block.body.get(start_body_index..) else {
@@ -991,7 +991,7 @@ struct RuntimeJitDeoptSupportCtx<'a> {
 }
 
 impl<'a> RuntimeJitDeoptSupportCtx<'a> {
-    fn new(function: &'a BlockPyFunction<CodegenModuleShape>) -> Self {
+    fn new(function: &'a BlockPyFunction<BlockPyModuleShape>) -> Self {
         RuntimeJitDeoptSupportCtx {
             storage_layout: function.storage_layout.as_ref(),
             runtime_layout: FunctionRuntimeDataLayout::from_function(function),
@@ -1010,11 +1010,11 @@ impl<'a> RuntimeJitDeoptSupportCtx<'a> {
 }
 
 fn runtime_jit_deopt_expr_supported(
-    expr: &InstrCodegen,
+    expr: &InstrBlockPy,
     support: &RuntimeJitDeoptSupportCtx<'_>,
 ) -> bool {
     match expr {
-        InstrCodegen::Load(load) => match load.name.location {
+        InstrBlockPy::Load(load) => match load.name.location {
             NameLocation::Cell(CellLocation::Owned(slot)) => support.owned_cell_supported(slot),
             NameLocation::Cell(CellLocation::Closure(slot))
             | NameLocation::Cell(CellLocation::CapturedSource(slot)) => {
@@ -1022,61 +1022,61 @@ fn runtime_jit_deopt_expr_supported(
             }
             _ => true,
         },
-        InstrCodegen::BinOp(binop) => {
+        InstrBlockPy::BinOp(binop) => {
             runtime_jit_deopt_binop_supported(binop.kind)
                 && runtime_jit_deopt_expr_supported(&binop.left, support)
                 && runtime_jit_deopt_expr_supported(&binop.right, support)
         }
-        InstrCodegen::UnaryOp(unary) => runtime_jit_deopt_expr_supported(&unary.operand, support),
-        InstrCodegen::Tuple(tuple) => tuple
+        InstrBlockPy::UnaryOp(unary) => runtime_jit_deopt_expr_supported(&unary.operand, support),
+        InstrBlockPy::Tuple(tuple) => tuple
             .values
             .iter()
             .all(|value| runtime_jit_deopt_expr_supported(value, support)),
-        InstrCodegen::GetAttr(getattr) => {
+        InstrBlockPy::GetAttr(getattr) => {
             runtime_jit_deopt_expr_supported(&getattr.value, support)
                 && runtime_jit_deopt_expr_supported(&getattr.attr, support)
         }
-        InstrCodegen::GetItem(getitem) => {
+        InstrBlockPy::GetItem(getitem) => {
             runtime_jit_deopt_expr_supported(&getitem.value, support)
                 && runtime_jit_deopt_expr_supported(&getitem.index, support)
         }
-        InstrCodegen::SetAttr(setattr) => {
+        InstrBlockPy::SetAttr(setattr) => {
             runtime_jit_deopt_expr_supported(&setattr.value, support)
                 && runtime_jit_deopt_expr_supported(&setattr.attr, support)
                 && runtime_jit_deopt_expr_supported(&setattr.replacement, support)
         }
-        InstrCodegen::SetItem(setitem) => {
+        InstrBlockPy::SetItem(setitem) => {
             runtime_jit_deopt_expr_supported(&setitem.value, support)
                 && runtime_jit_deopt_expr_supported(&setitem.index, support)
                 && runtime_jit_deopt_expr_supported(&setitem.replacement, support)
         }
-        InstrCodegen::DelItem(delitem) => {
+        InstrBlockPy::DelItem(delitem) => {
             runtime_jit_deopt_expr_supported(&delitem.value, support)
                 && runtime_jit_deopt_expr_supported(&delitem.index, support)
         }
-        InstrCodegen::Call(call) => {
+        InstrBlockPy::Call(call) => {
             runtime_jit_deopt_call_parts_supported(&call.func, &call.args, &call.keywords, support)
         }
-        InstrCodegen::Store(store) => {
+        InstrBlockPy::Store(store) => {
             runtime_jit_deopt_name_location_supported(store.name.location, support)
                 && runtime_jit_deopt_expr_supported(&store.value, support)
         }
-        InstrCodegen::Del(del) => {
+        InstrBlockPy::Del(del) => {
             runtime_jit_deopt_name_location_supported(del.name.location, support)
         }
-        InstrCodegen::IncrementCounter(_) => true,
-        InstrCodegen::MakeCell(make_cell) => make_cell
+        InstrBlockPy::IncrementCounter(_) => true,
+        InstrBlockPy::MakeCell(make_cell) => make_cell
             .initial_value
             .as_ref()
             .map_or(true, |initial_value| {
                 runtime_jit_deopt_expr_supported(initial_value, support)
             }),
-        InstrCodegen::MakeFunctionWithClosure(make_function) => {
+        InstrBlockPy::MakeFunctionWithClosure(make_function) => {
             runtime_jit_deopt_expr_supported(&make_function.captures, support)
                 && runtime_jit_deopt_expr_supported(&make_function.param_defaults, support)
                 && runtime_jit_deopt_expr_supported(&make_function.annotate_fn, support)
         }
-        InstrCodegen::CellRef(cell_ref) => match cell_ref.location {
+        InstrBlockPy::CellRef(cell_ref) => match cell_ref.location {
             CellLocation::Owned(slot) => support.owned_cell_supported(slot),
             CellLocation::Closure(slot) | CellLocation::CapturedSource(slot) => {
                 support.closure_cell_supported(slot)
@@ -1100,9 +1100,9 @@ fn runtime_jit_deopt_name_location_supported(
 }
 
 fn runtime_jit_deopt_call_parts_supported(
-    callable: &InstrCodegen,
-    args: &[CallArgPositional<InstrCodegen>],
-    keywords: &[CallArgKeyword<InstrCodegen>],
+    callable: &InstrBlockPy,
+    args: &[CallArgPositional<InstrBlockPy>],
+    keywords: &[CallArgKeyword<InstrBlockPy>],
     support: &RuntimeJitDeoptSupportCtx<'_>,
 ) -> bool {
     runtime_jit_deopt_expr_supported(callable, support)
@@ -1157,7 +1157,7 @@ fn runtime_jit_deopt_binop_supported(kind: blockpy_intrinsics::BinOpKind) -> boo
 }
 
 fn runtime_jit_deopt_term_supported(
-    term: &BlockTerm<InstrCodegen>,
+    term: &BlockTerm<InstrBlockPy>,
     support: &RuntimeJitDeoptSupportCtx<'_>,
 ) -> bool {
     match term {
@@ -1227,7 +1227,7 @@ impl RuntimeJitDeoptInvocation<'_> {
         self.record
     }
 
-    pub(super) fn function(&self) -> &BlockPyFunction<CodegenModuleShape> {
+    pub(super) fn function(&self) -> &BlockPyFunction<BlockPyModuleShape> {
         self.table.function()
     }
 

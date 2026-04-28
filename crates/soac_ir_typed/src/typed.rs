@@ -18,7 +18,7 @@ use soac_core::block_py::{
     define_instr, define_ruff_instr,
 };
 #[allow(unused_imports)]
-use soac_ir_blockpy::{CodegenModuleShape, InstrCodegen};
+use soac_ir_blockpy::{BlockPyModuleShape, InstrBlockPy};
 use soac_macros::{DelegateMatchDefault, enum_broadcast};
 use std::collections::{HashMap, HashSet};
 
@@ -1460,33 +1460,33 @@ impl InstrWithConstantNone for InstrTyped {
     }
 }
 
-struct CodegenToTyped;
+struct BlockPyToTyped;
 
-impl MapInstr<InstrCodegen, InstrTyped> for CodegenToTyped {
-    fn map_instr(&mut self, instr: InstrCodegen) -> InstrTyped {
+impl MapInstr<InstrBlockPy, InstrTyped> for BlockPyToTyped {
+    fn map_instr(&mut self, instr: InstrBlockPy) -> InstrTyped {
         match instr {
-            InstrCodegen::BinOp(op) => InstrTyped::BinOp(op.map_children(self)),
-            InstrCodegen::Tuple(op) => InstrTyped::Tuple(op.map_children(self)),
-            InstrCodegen::UnaryOp(op) => InstrTyped::UnaryOp(op.map_children(self)),
-            InstrCodegen::Call(op) => {
+            InstrBlockPy::BinOp(op) => InstrTyped::BinOp(op.map_children(self)),
+            InstrBlockPy::Tuple(op) => InstrTyped::Tuple(op.map_children(self)),
+            InstrBlockPy::UnaryOp(op) => InstrTyped::UnaryOp(op.map_children(self)),
+            InstrBlockPy::Call(op) => {
                 InstrTyped::CallTyped(TypedCall::from_legacy(op.map_children(self)))
             }
-            InstrCodegen::GetAttr(op) => {
+            InstrBlockPy::GetAttr(op) => {
                 InstrTyped::GetAttrTyped(TypedGetAttr::from_legacy(op.map_children(self)))
             }
-            InstrCodegen::SetAttr(op) => {
+            InstrBlockPy::SetAttr(op) => {
                 InstrTyped::SetAttrTyped(TypedSetAttr::from_legacy(op.map_children(self)))
             }
-            InstrCodegen::GetItem(op) => InstrTyped::GetItem(op.map_children(self)),
-            InstrCodegen::SetItem(op) => InstrTyped::SetItem(op.map_children(self)),
-            InstrCodegen::DelItem(op) => InstrTyped::DelItem(op.map_children(self)),
-            InstrCodegen::Load(op) => InstrTyped::Load(op.map_children(self)),
-            InstrCodegen::Store(op) => InstrTyped::Store(op.map_children(self)),
-            InstrCodegen::Del(op) => InstrTyped::Del(op.map_children(self)),
-            InstrCodegen::MakeCell(op) => InstrTyped::MakeCell(op.map_children(self)),
-            InstrCodegen::IncrementCounter(op) => InstrTyped::IncrementCounter(op),
-            InstrCodegen::CellRef(op) => InstrTyped::CellRef(op),
-            InstrCodegen::MakeFunctionWithClosure(op) => {
+            InstrBlockPy::GetItem(op) => InstrTyped::GetItem(op.map_children(self)),
+            InstrBlockPy::SetItem(op) => InstrTyped::SetItem(op.map_children(self)),
+            InstrBlockPy::DelItem(op) => InstrTyped::DelItem(op.map_children(self)),
+            InstrBlockPy::Load(op) => InstrTyped::Load(op.map_children(self)),
+            InstrBlockPy::Store(op) => InstrTyped::Store(op.map_children(self)),
+            InstrBlockPy::Del(op) => InstrTyped::Del(op.map_children(self)),
+            InstrBlockPy::MakeCell(op) => InstrTyped::MakeCell(op.map_children(self)),
+            InstrBlockPy::IncrementCounter(op) => InstrTyped::IncrementCounter(op),
+            InstrBlockPy::CellRef(op) => InstrTyped::CellRef(op),
+            InstrBlockPy::MakeFunctionWithClosure(op) => {
                 InstrTyped::MakeFunctionWithClosure(op.map_children(self))
             }
         }
@@ -1497,22 +1497,22 @@ impl MapInstr<InstrCodegen, InstrTyped> for CodegenToTyped {
     }
 }
 
-pub fn lower_codegen_module_to_typed(
-    module: BlockPyModule<CodegenModuleShape>,
-) -> BlockPyModule<TypedCodegenModuleShape> {
-    CodegenToTyped.map_module(module)
+pub fn lower_blockpy_module_to_typed(
+    module: BlockPyModule<BlockPyModuleShape>,
+) -> BlockPyModule<TypedBlockPyModuleShape> {
+    BlockPyToTyped.map_module(module)
 }
 
-pub fn lower_codegen_function_to_typed(
-    function: BlockPyFunction<CodegenModuleShape>,
-) -> BlockPyFunction<TypedCodegenModuleShape> {
-    CodegenToTyped.map_fn(function)
+pub fn lower_blockpy_function_to_typed(
+    function: BlockPyFunction<BlockPyModuleShape>,
+) -> BlockPyFunction<TypedBlockPyModuleShape> {
+    BlockPyToTyped.map_fn(function)
 }
 
 #[derive(Debug, Clone)]
-pub struct TypedCodegenModuleShape;
+pub struct TypedBlockPyModuleShape;
 
-impl ModuleShape for TypedCodegenModuleShape {
+impl ModuleShape for TypedBlockPyModuleShape {
     type Instr = InstrTyped;
     type ModuleConstant = ConstantExpr;
     type BlockExtra = TypedBlockExtra;

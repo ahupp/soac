@@ -384,7 +384,7 @@ impl ScopeExprNode for InstrResolved {
     fn walk_root_cell_ref_logical_names(&self, _f: &mut impl FnMut(&str)) {}
 }
 
-impl ScopeExprNode for super::InstrCodegen {
+impl ScopeExprNode for super::InstrBlockPy {
     fn root_name_id(&self) -> Option<&str> {
         match self {
             Self::Call(call) => call.func.as_ref().root_name_id(),

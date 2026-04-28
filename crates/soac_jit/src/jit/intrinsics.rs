@@ -17,7 +17,7 @@ use pyo3::ffi;
 use soac_core::block_py::{
     HasSemanticInstrId, Instr, InstrId, NameLike, NameLocation, ResolvedName,
 };
-use soac_ir_blockpy::InstrCodegen;
+use soac_ir_blockpy::InstrBlockPy;
 use soac_ir_typed::{InstrTyped, PyObjFacts};
 use soac_opt::operator_specialization::{BINARY_RHS_TAG_SHIFT, ExactTypeTag};
 use std::mem::offset_of;
@@ -545,7 +545,7 @@ fn emit_counted_getattr_fallback<'fb, E: Instr>(
 }
 
 fn emit_setattr_fallback<'fb>(
-    state: &mut impl OperationEmitState<'fb, InstrCodegen>,
+    state: &mut impl OperationEmitState<'fb, InstrBlockPy>,
     instr_id: Option<soac_core::block_py::InstrId>,
     arg_values: &[(ir::Value, bool)],
 ) -> ir::Value {
@@ -1039,8 +1039,8 @@ pub(super) fn increment_counter_with_state<'fb, E>(
 }
 
 fn emit_load<'fb>(
-    op: &blockpy_intrinsics::Load<InstrCodegen>,
-    state: &mut impl OperationEmitState<'fb, InstrCodegen>,
+    op: &blockpy_intrinsics::Load<InstrBlockPy>,
+    state: &mut impl OperationEmitState<'fb, InstrBlockPy>,
 ) -> ir::Value {
     let func_ref = match op.name.location {
         NameLocation::Global(_) => state.import_func(&SOAC_RUNTIME_LOAD_GLOBAL_IMPORT),
@@ -1361,22 +1361,22 @@ pub(super) fn emit_del_deref_raw_cell<'fb, E>(
 }
 
 pub(super) fn emit_operation<'fb>(
-    operation: &InstrCodegen,
-    state: &mut impl OperationEmitState<'fb, InstrCodegen>,
+    operation: &InstrBlockPy,
+    state: &mut impl OperationEmitState<'fb, InstrBlockPy>,
 ) -> Option<ir::Value> {
     match operation {
-        InstrCodegen::Tuple(_) => None,
-        InstrCodegen::Call(_) => None,
-        InstrCodegen::BinOp(op) => Some(emit_counted_binop(op, state)),
-        InstrCodegen::UnaryOp(op) => Some(emit_unary_op(op.kind, state, &[op.operand.as_ref()])),
-        InstrCodegen::GetAttr(op) => {
+        InstrBlockPy::Tuple(_) => None,
+        InstrBlockPy::Call(_) => None,
+        InstrBlockPy::BinOp(op) => Some(emit_counted_binop(op, state)),
+        InstrBlockPy::UnaryOp(op) => Some(emit_unary_op(op.kind, state, &[op.operand.as_ref()])),
+        InstrBlockPy::GetAttr(op) => {
             let instr_id = Some(op.semantic_instr_id());
             let arg_values = state.emit_arg_values(&[op.value.as_ref(), op.attr.as_ref()]);
             let result = emit_counted_getattr_fallback(state, instr_id, &arg_values);
             state.release_arg_values(&arg_values);
             Some(state.finish_owned_result(result))
         }
-        InstrCodegen::SetAttr(op) => {
+        InstrBlockPy::SetAttr(op) => {
             let instr_id = Some(op.semantic_instr_id());
             let arg_values = state.emit_arg_values(&[
                 op.value.as_ref(),
@@ -1387,22 +1387,22 @@ pub(super) fn emit_operation<'fb>(
             state.release_arg_values(&arg_values);
             Some(state.finish_owned_result(result))
         }
-        InstrCodegen::GetItem(op) => Some(operation_specializations::emit_getitem(op, state)),
-        InstrCodegen::SetItem(op) => Some(operation_specializations::emit_setitem(op, state)),
-        InstrCodegen::DelItem(op) => Some(emit_positional_owned_call(
+        InstrBlockPy::GetItem(op) => Some(operation_specializations::emit_getitem(op, state)),
+        InstrBlockPy::SetItem(op) => Some(operation_specializations::emit_setitem(op, state)),
+        InstrBlockPy::DelItem(op) => Some(emit_positional_owned_call(
             &DP_JIT_PYOBJECT_DELITEM_IMPORT,
             state,
             &[op.value.as_ref(), op.index.as_ref()],
         )),
-        InstrCodegen::Load(op) => (op.name.location.is_global()
+        InstrBlockPy::Load(op) => (op.name.location.is_global()
             || op.name.location.is_runtime_name())
         .then(|| emit_load(op, state)),
-        InstrCodegen::MakeCell(op) => Some(emit_make_cell(state, op.initial_value.as_deref())),
-        InstrCodegen::IncrementCounter(_) => None,
-        InstrCodegen::CellRef(_) => None,
-        InstrCodegen::MakeFunctionWithClosure(_) => None,
-        InstrCodegen::Store(op) => op.name.location.is_global().then(|| emit_store(op, state)),
-        InstrCodegen::Del(op) => op.name.location.is_global().then(|| emit_del(op, state)),
+        InstrBlockPy::MakeCell(op) => Some(emit_make_cell(state, op.initial_value.as_deref())),
+        InstrBlockPy::IncrementCounter(_) => None,
+        InstrBlockPy::CellRef(_) => None,
+        InstrBlockPy::MakeFunctionWithClosure(_) => None,
+        InstrBlockPy::Store(op) => op.name.location.is_global().then(|| emit_store(op, state)),
+        InstrBlockPy::Del(op) => op.name.location.is_global().then(|| emit_del(op, state)),
     }
 }
 

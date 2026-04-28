@@ -1,6 +1,6 @@
 use super::hoist_module_constants;
 use crate::{
-    block_py::{ChildVisitable, ConstantExpr, InstrCodegen, Literal, NameLike},
+    block_py::{ChildVisitable, ConstantExpr, InstrBlockPy, Literal, NameLike},
     lower_python_to_blockpy_for_testing,
     pass_tracker::LoweringPassTrackerInternalExt,
     passes::blockpy_to_bb::exception_pass::lower_try_jump_exception_flow,
@@ -30,7 +30,7 @@ fn module_constants_contain_string(exprs: &[ConstantExpr]) -> bool {
 fn lowered_string_values(source: &str) -> Vec<String> {
     let module = lower_python_to_blockpy_for_testing(source)
         .expect("transform should succeed")
-        .codegen_module;
+        .blockpy_module;
     let mut values = Vec::new();
     for constant in &module.module_constants {
         if let ConstantExpr::Literal(literal) = constant {
@@ -42,71 +42,71 @@ fn lowered_string_values(source: &str) -> Vec<String> {
     values
 }
 
-fn collect_helper_like_names_in_expr(out: &mut Vec<String>, expr: &InstrCodegen) {
+fn collect_helper_like_names_in_expr(out: &mut Vec<String>, expr: &InstrBlockPy) {
     struct HelperNameVisitor<'a> {
         out: &'a mut Vec<String>,
     }
 
-    impl crate::block_py::Visit<InstrCodegen> for HelperNameVisitor<'_> {
-        fn visit_instr(&mut self, expr: &InstrCodegen) {
+    impl crate::block_py::Visit<InstrBlockPy> for HelperNameVisitor<'_> {
+        fn visit_instr(&mut self, expr: &InstrBlockPy) {
             collect_helper_like_names_in_expr(self.out, expr);
         }
     }
 
     match expr {
-        InstrCodegen::GetAttr(operation) => {
+        InstrBlockPy::GetAttr(operation) => {
             out.push("__dp_getattr".to_string());
             operation.visit_children(&mut HelperNameVisitor { out });
         }
-        InstrCodegen::SetAttr(operation) => {
+        InstrBlockPy::SetAttr(operation) => {
             out.push("__dp_setattr".to_string());
             operation.visit_children(&mut HelperNameVisitor { out });
         }
-        InstrCodegen::GetItem(operation) => {
+        InstrBlockPy::GetItem(operation) => {
             out.push("__dp_getitem".to_string());
             operation.visit_children(&mut HelperNameVisitor { out });
         }
-        InstrCodegen::SetItem(operation) => {
+        InstrBlockPy::SetItem(operation) => {
             out.push("__dp_setitem".to_string());
             operation.visit_children(&mut HelperNameVisitor { out });
         }
-        InstrCodegen::Call(operation) => {
-            if let InstrCodegen::Load(op) = &*operation.func {
+        InstrBlockPy::Call(operation) => {
+            if let InstrBlockPy::Load(op) = &*operation.func {
                 out.push(op.name.id_str().to_string());
             }
             operation.visit_children(&mut HelperNameVisitor { out });
         }
-        InstrCodegen::BinOp(operation) => {
+        InstrBlockPy::BinOp(operation) => {
             operation.visit_children(&mut HelperNameVisitor { out });
         }
-        InstrCodegen::UnaryOp(operation) => {
+        InstrBlockPy::UnaryOp(operation) => {
             operation.visit_children(&mut HelperNameVisitor { out });
         }
-        InstrCodegen::Tuple(operation) => {
+        InstrBlockPy::Tuple(operation) => {
             operation.visit_children(&mut HelperNameVisitor { out });
         }
-        InstrCodegen::Load(operation) => {
+        InstrBlockPy::Load(operation) => {
             operation.visit_children(&mut HelperNameVisitor { out });
         }
-        InstrCodegen::Store(operation) => {
+        InstrBlockPy::Store(operation) => {
             operation.visit_children(&mut HelperNameVisitor { out });
         }
-        InstrCodegen::Del(operation) => {
+        InstrBlockPy::Del(operation) => {
             operation.visit_children(&mut HelperNameVisitor { out });
         }
-        InstrCodegen::MakeCell(operation) => {
+        InstrBlockPy::MakeCell(operation) => {
             operation.visit_children(&mut HelperNameVisitor { out });
         }
-        InstrCodegen::IncrementCounter(operation) => {
+        InstrBlockPy::IncrementCounter(operation) => {
             operation.visit_children(&mut HelperNameVisitor { out });
         }
-        InstrCodegen::CellRef(operation) => {
+        InstrBlockPy::CellRef(operation) => {
             operation.visit_children(&mut HelperNameVisitor { out });
         }
-        InstrCodegen::MakeFunctionWithClosure(operation) => {
+        InstrBlockPy::MakeFunctionWithClosure(operation) => {
             operation.visit_children(&mut HelperNameVisitor { out });
         }
-        InstrCodegen::DelItem(operation) => {
+        InstrBlockPy::DelItem(operation) => {
             operation.visit_children(&mut HelperNameVisitor { out });
         }
     }

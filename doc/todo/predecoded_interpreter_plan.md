@@ -1,8 +1,8 @@
 # Predecoded Interpreter Plan
 
 The entry/deopt interpreter currently executes directly from the rich
-`BlockPyFunction<CodegenModuleShape>` tree. `execute_from_cursor` walks the
-function blocks and `execute_expr_owned` repeatedly matches on `InstrCodegen`,
+`BlockPyFunction<BlockPyModuleShape>` tree. `execute_from_cursor` walks the
+function blocks and `execute_expr_owned` repeatedly matches on `InstrBlockPy`,
 then digs through nested payloads such as names, locations, call arguments,
 block labels, and edge args.
 
@@ -44,7 +44,7 @@ The important properties:
 - Store jump targets as target block indexes and pre-resolved target local
   slots.
 - Store call arguments as preclassified ranges/shapes instead of walking
-  nested `CallArg*<InstrCodegen>` trees on every execution.
+  nested `CallArg*<InstrBlockPy>` trees on every execution.
 - Include a map from `RuntimeJitDeoptCursor` to compact block/op offsets so
   deopt can resume directly at the planned location.
 

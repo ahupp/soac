@@ -17,7 +17,7 @@ mod transformer;
 
 pub use crate::driver::{
     lower_python_to_blockpy_for_testing, lower_python_to_blockpy_with_tracker_and_options,
-    lower_source_to_codegen_module_with_tracker, LoweringError, LoweringOptions, LoweringResult,
+    lower_source_to_blockpy_module_with_tracker, LoweringError, LoweringOptions, LoweringResult,
     Result,
 };
 

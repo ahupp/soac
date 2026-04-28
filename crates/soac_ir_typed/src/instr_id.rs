@@ -1,4 +1,4 @@
-use crate::{InstrTyped, TypedCodegenModuleShape};
+use crate::{InstrTyped, TypedBlockPyModuleShape};
 use soac_core::block_py::{
     BlockPyFunction, ChildVisitable, HasMeta, HasSemanticInstrId, InstrId, Visit, VisitMut,
     WithMeta,
@@ -41,7 +41,7 @@ impl VisitMut<InstrTyped> for MissingTypedBlockInstrIdAssigner<'_> {
 }
 
 pub fn assign_missing_typed_function_instr_ids(
-    function: &mut BlockPyFunction<TypedCodegenModuleShape>,
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
 ) {
     let mut next_instr_index = 0;
     let mut used = HashSet::new();

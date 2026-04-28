@@ -14,8 +14,8 @@ mod typed;
 pub use instr_id::assign_missing_typed_function_instr_ids;
 pub use typed::{
     InstrTyped, TypedAttrAccessPlan, TypedAttrOwnerRef, TypedBlock, TypedBlockExtra,
-    TypedBlockLayoutHint, TypedCall, TypedCallAccessPlan, TypedCallEmissionPlan,
-    TypedCallEmissionPlans, TypedCodegenModuleShape, TypedDirectCallArgPlan,
+    TypedBlockLayoutHint, TypedBlockPyModuleShape, TypedCall, TypedCallAccessPlan,
+    TypedCallEmissionPlan, TypedCallEmissionPlans, TypedDirectCallArgPlan,
     TypedDirectCallArgSource, TypedDirectCallGuardTest, TypedDirectCallGuardTestKind,
     TypedDirectCallableCall, TypedDirectCallableCallGuard, TypedDirectFunctionCallGuard,
     TypedDirectMethodCall, TypedDirectMethodCallGuard, TypedExactIntBranchPlan,
@@ -24,7 +24,7 @@ pub use typed::{
     TypedGetAttr, TypedGuardedCallableCall, TypedGuardedMethodCall, TypedIndexedFieldGuard,
     TypedIndexedFieldPlanSource, TypedIndexedGlobalAccessPlan, TypedIndexedGlobalPlanSource,
     TypedInstrExtra, TypedPlannedResult, TypedPyObjectOwnershipPlan, TypedResultDemand,
-    TypedSetAttr, TypedTruthy, lower_codegen_function_to_typed, lower_codegen_module_to_typed,
+    TypedSetAttr, TypedTruthy, lower_blockpy_function_to_typed, lower_blockpy_module_to_typed,
 };
 pub use value_facts::{
     BoolFacts, BoolSingletonFact, CallableFact, EnvFacts, FactStore, I32Facts, I64Facts, NoneFact,

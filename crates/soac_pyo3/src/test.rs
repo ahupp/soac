@@ -2,7 +2,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyModule;
 use soac_config::SoacEnvConfig;
 use soac_core::block_py::FunctionKind;
-use soac_driver::codegen_cache::hash_module_source;
+use soac_driver::blockpy_cache::hash_module_source;
 use soac_jit::{module_type::indexed_module_info, plan_jit_typed_module};
 use std::any::Any;
 use std::collections::HashSet;
@@ -35,7 +35,7 @@ fn parse_and_lower_runtime_style(source: &str) -> Result<soac_lowering::Lowering
 }
 
 fn validate_bb_module_for_jit(
-    bb_module: &soac_core::block_py::BlockPyModule<soac_ir_blockpy::CodegenModuleShape>,
+    bb_module: &soac_core::block_py::BlockPyModule<soac_ir_blockpy::BlockPyModuleShape>,
 ) -> Result<(), String> {
     for function in &bb_module.callable_defs {
         match function.lowered_kind() {
@@ -49,7 +49,7 @@ fn validate_bb_module_for_jit(
 }
 
 fn run_cranelift_jit_preflight(result: &soac_lowering::LoweringResult) -> Result<(), String> {
-    soac_jit::run_cranelift_smoke(&result.codegen_module)
+    soac_jit::run_cranelift_smoke(&result.blockpy_module)
 }
 
 fn python_runtime_test_lock() -> &'static Mutex<()> {
@@ -91,7 +91,7 @@ def outer(scale):
     return inner
     "#;
     let result = parse_and_lower(source).expect("lowering should succeed");
-    let normalized = result.codegen_module.clone();
+    let normalized = result.blockpy_module.clone();
     let inner_function = normalized
         .callable_defs
         .iter()
@@ -155,7 +155,7 @@ class C:
         return self.x
     "#;
     let result = parse_and_lower(source).expect("lowering should succeed");
-    let bb_module = &result.codegen_module;
+    let bb_module = &result.blockpy_module;
     validate_bb_module_for_jit(bb_module).expect("validator should accept lowered class defs");
 }
 
@@ -166,7 +166,7 @@ async def run():
     return 1
     "#;
     let result = parse_and_lower(source).expect("lowering should succeed");
-    let bb_module = &result.codegen_module;
+    let bb_module = &result.blockpy_module;
     validate_bb_module_for_jit(bb_module).expect("validator should accept coroutine lowering");
 }
 
@@ -177,7 +177,7 @@ async def run():
     yield 1
     "#;
     let result = parse_and_lower(source).expect("lowering should succeed");
-    let bb_module = &result.codegen_module;
+    let bb_module = &result.blockpy_module;
     validate_bb_module_for_jit(bb_module)
         .expect("validator should accept async generator lowering");
 }
@@ -192,7 +192,7 @@ def f():
         return 2
     "#;
     let result = parse_and_lower(source).expect("lowering should succeed");
-    let bb_module = &result.codegen_module;
+    let bb_module = &result.blockpy_module;
     validate_bb_module_for_jit(bb_module).expect("validator should accept lowered try blocks");
 }
 
@@ -203,7 +203,7 @@ def f(x):
     return x
     "#;
     let result = parse_and_lower(source).expect("lowering should succeed");
-    let bb_module = &result.codegen_module;
+    let bb_module = &result.blockpy_module;
     validate_bb_module_for_jit(bb_module).expect("validator should allow module");
     run_cranelift_jit_preflight(&result).expect("cranelift preflight should run");
 }
@@ -306,7 +306,7 @@ def exercise():
     return gen
     "#;
     let result = parse_and_lower_runtime_style(source).expect("lowering should succeed");
-    let normalized = result.codegen_module.clone();
+    let normalized = result.blockpy_module.clone();
     let gen_function = normalized
         .callable_defs
         .iter()

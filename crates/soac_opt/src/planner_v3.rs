@@ -2008,7 +2008,7 @@ mod tests {
         ParamSpec, SerializedFunctionId, SerializedIdentityTables, SerializedModuleId,
         SerializedModuleIdentity, Store, TermIf, WithMeta,
     };
-    use soac_ir_blockpy::{CodegenModuleShape, InstrCodegen};
+    use soac_ir_blockpy::{BlockPyModuleShape, InstrBlockPy};
     use soac_ir_typed::plan_v3::RichCompareOp;
     use soac_ir_typed::plan_v3::validate_module_plan_v3;
 
@@ -2020,53 +2020,53 @@ mod tests {
         InstrId::new(index)
     }
 
-    fn with_instr_id(instr: InstrCodegen, index: u32) -> InstrCodegen {
+    fn with_instr_id(instr: InstrBlockPy, index: u32) -> InstrBlockPy {
         with_instr_id_in_label(instr, label(0), index)
     }
 
-    fn with_instr_id_in_label(instr: InstrCodegen, block: BlockLabel, index: u32) -> InstrCodegen {
+    fn with_instr_id_in_label(instr: InstrBlockPy, block: BlockLabel, index: u32) -> InstrBlockPy {
         instr.with_meta(Meta {
             instr_id: Some(instr_id_in_label(block, index)),
             ..Meta::synthetic()
         })
     }
 
-    fn local(name: &str, slot: u32) -> InstrCodegen {
-        InstrCodegen::Load(Load::new(ResolvedName {
+    fn local(name: &str, slot: u32) -> InstrBlockPy {
+        InstrBlockPy::Load(Load::new(ResolvedName {
             id: BlockPyName::new(name),
             location: NameLocation::Local(LocalLocation(slot)),
         }))
     }
 
-    fn constant(slot: u32) -> InstrCodegen {
-        InstrCodegen::Load(Load::new(ResolvedName {
+    fn constant(slot: u32) -> InstrBlockPy {
+        InstrBlockPy::Load(Load::new(ResolvedName {
             id: BlockPyName::new("__dp_constant"),
             location: NameLocation::Constant(slot),
         }))
     }
 
-    fn global(name: &str, slot: u32) -> InstrCodegen {
-        InstrCodegen::Load(Load::new(ResolvedName {
+    fn global(name: &str, slot: u32) -> InstrBlockPy {
+        InstrBlockPy::Load(Load::new(ResolvedName {
             id: BlockPyName::new(name),
             location: NameLocation::Global(soac_core::block_py::GlobalSlot(slot)),
         }))
     }
 
-    fn binary(op: BinOpKind, left: InstrCodegen, right: InstrCodegen, id: u32) -> InstrCodegen {
-        with_instr_id(InstrCodegen::BinOp(BinOp::new(op, left, right)), id)
+    fn binary(op: BinOpKind, left: InstrBlockPy, right: InstrBlockPy, id: u32) -> InstrBlockPy {
+        with_instr_id(InstrBlockPy::BinOp(BinOp::new(op, left, right)), id)
     }
 
     fn binary_in_label(
         op: BinOpKind,
-        left: InstrCodegen,
-        right: InstrCodegen,
+        left: InstrBlockPy,
+        right: InstrBlockPy,
         block: BlockLabel,
         id: u32,
-    ) -> InstrCodegen {
-        with_instr_id_in_label(InstrCodegen::BinOp(BinOp::new(op, left, right)), block, id)
+    ) -> InstrBlockPy {
+        with_instr_id_in_label(InstrBlockPy::BinOp(BinOp::new(op, left, right)), block, id)
     }
 
-    fn test_function(blocks: Vec<Block<InstrCodegen>>) -> BlockPyFunction<CodegenModuleShape> {
+    fn test_function(blocks: Vec<Block<InstrBlockPy>>) -> BlockPyFunction<BlockPyModuleShape> {
         let name_gen = ModuleNameGen::new(0).next_function_name_gen();
         BlockPyFunction {
             function_id: name_gen.function_id(),
@@ -3015,7 +3015,7 @@ mod tests {
         let entry = Block::new(
             label(0),
             vec![with_instr_id(
-                InstrCodegen::Store(Store::new(c.clone(), add)),
+                InstrBlockPy::Store(Store::new(c.clone(), add)),
                 3,
             )],
             BlockTerm::Jump(BlockEdge::new(label(1))),
@@ -3025,7 +3025,7 @@ mod tests {
         let test_label = label(1);
         let compare = binary_in_label(
             BinOpKind::Gt,
-            with_instr_id_in_label(InstrCodegen::Load(Load::new(c)), test_label, 4),
+            with_instr_id_in_label(InstrBlockPy::Load(Load::new(c)), test_label, 4),
             with_instr_id_in_label(constant(0), test_label, 5),
             test_label,
             6,

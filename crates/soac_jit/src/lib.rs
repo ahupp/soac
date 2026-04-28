@@ -31,7 +31,7 @@ pub(crate) fn python_runtime_test_lock() -> &'static Mutex<()> {
 use pyo3::ffi;
 use pyo3::prelude::*;
 use soac_core::block_py::{FunctionExecutionMode, FunctionKind, ParamKind, RuntimeFunctionId};
-use soac_ir_blockpy::CodegenModuleShape;
+use soac_ir_blockpy::BlockPyModuleShape;
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
 use std::any::Any;
 use std::ffi::{CString, c_char, c_void};
@@ -330,7 +330,7 @@ struct DirectArgBindingPlan {
 }
 
 impl DirectArgBindingPlan {
-    fn from_function(function: &soac_core::block_py::BlockPyFunction<CodegenModuleShape>) -> Self {
+    fn from_function(function: &soac_core::block_py::BlockPyFunction<BlockPyModuleShape>) -> Self {
         let runtime_data_layout = jit::FunctionRuntimeDataLayout::from_function(function);
         let positional_param_indices = function
             .params
@@ -553,7 +553,7 @@ impl Drop for FunctionEnv {
 }
 
 impl PyFunctionJitExtra {
-    fn function(&self) -> Result<&soac_core::block_py::BlockPyFunction<CodegenModuleShape>, ()> {
+    fn function(&self) -> Result<&soac_core::block_py::BlockPyFunction<BlockPyModuleShape>, ()> {
         self.module_state
             .lookup_function(self.function_id)
             .ok_or_else(|| unsafe {
@@ -2226,7 +2226,7 @@ fn entry_interpreter_vectorcall_for_tests_enabled() -> bool {
 }
 
 fn entry_interpreter_vectorcall_requested(
-    function: &soac_core::block_py::BlockPyFunction<CodegenModuleShape>,
+    function: &soac_core::block_py::BlockPyFunction<BlockPyModuleShape>,
 ) -> bool {
     function.execution_mode() == FunctionExecutionMode::Interpreted
         || (entry_interpreter_vectorcall_for_tests_enabled()

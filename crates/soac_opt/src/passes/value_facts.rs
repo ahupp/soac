@@ -1,4 +1,4 @@
-use crate::passes::{CodegenModuleShape, InstrCodegen};
+use crate::passes::{BlockPyModuleShape, InstrBlockPy};
 use soac_core::block_py::literal::{Literal, NumberLiteralValue};
 use soac_core::block_py::{
     BinOpKind, Block, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, ChildVisitable,
@@ -14,15 +14,15 @@ use soac_ir_typed::value_facts::{
 use std::collections::HashMap;
 
 struct FunctionFactInferer<'a> {
-    function: &'a BlockPyFunction<CodegenModuleShape>,
+    function: &'a BlockPyFunction<BlockPyModuleShape>,
     module_constant_facts: &'a [ValueFacts],
     store: FactStore,
 }
 
 impl FunctionFactInferer<'_> {
-    fn infer_expr_facts(&self, expr: &InstrCodegen) -> ValueFacts {
+    fn infer_expr_facts(&self, expr: &InstrBlockPy) -> ValueFacts {
         match expr {
-            InstrCodegen::Load(op) => {
+            InstrBlockPy::Load(op) => {
                 infer_runtime_name_load_facts(&op.name).unwrap_or_else(|| {
                     op.name
                         .location
@@ -31,7 +31,7 @@ impl FunctionFactInferer<'_> {
                         .unwrap_or_else(ValueFacts::unknown_pyobj)
                 })
             }
-            InstrCodegen::Call(op) => {
+            InstrBlockPy::Call(op) => {
                 if op.keywords.is_empty()
                     && op.args.iter().all(|arg| {
                         matches!(arg, soac_core::block_py::CallArgPositional::Positional(_))
@@ -45,40 +45,40 @@ impl FunctionFactInferer<'_> {
                     ValueFacts::unknown_pyobj()
                 }
             }
-            InstrCodegen::BinOp(op) => infer_binop_result_facts(
+            InstrBlockPy::BinOp(op) => infer_binop_result_facts(
                 op.kind,
                 self.infer_expr_facts(&op.left),
                 self.infer_expr_facts(&op.right),
             )
             .unwrap_or_else(ValueFacts::unknown_pyobj),
-            InstrCodegen::UnaryOp(op) => {
+            InstrBlockPy::UnaryOp(op) => {
                 infer_unary_result_facts(op.kind, self.infer_expr_facts(&op.operand))
                     .unwrap_or_else(ValueFacts::unknown_pyobj)
             }
-            InstrCodegen::SetAttr(_)
-            | InstrCodegen::SetItem(_)
-            | InstrCodegen::DelItem(_)
-            | InstrCodegen::Del(_) => ValueFacts::PyObj(PyObjFacts::none_singleton()),
-            InstrCodegen::Tuple(_) => ValueFacts::PyObj(PyObjFacts::known_not_none()),
+            InstrBlockPy::SetAttr(_)
+            | InstrBlockPy::SetItem(_)
+            | InstrBlockPy::DelItem(_)
+            | InstrBlockPy::Del(_) => ValueFacts::PyObj(PyObjFacts::none_singleton()),
+            InstrBlockPy::Tuple(_) => ValueFacts::PyObj(PyObjFacts::known_not_none()),
             _ => ValueFacts::unknown_pyobj(),
         }
     }
 
-    fn infer_expr_facts_in_env(&self, expr: &InstrCodegen, env: &EnvFacts) -> ValueFacts {
+    fn infer_expr_facts_in_env(&self, expr: &InstrBlockPy, env: &EnvFacts) -> ValueFacts {
         match expr {
-            InstrCodegen::Load(op) => op
+            InstrBlockPy::Load(op) => op
                 .name
                 .local_location()
                 .and_then(|location| env.local_pyobj_fact(location))
                 .map(ValueFacts::PyObj)
                 .unwrap_or_else(|| self.infer_expr_facts(expr)),
-            InstrCodegen::BinOp(op) => infer_binop_result_facts(
+            InstrBlockPy::BinOp(op) => infer_binop_result_facts(
                 op.kind,
                 self.infer_expr_facts_in_env(&op.left, env),
                 self.infer_expr_facts_in_env(&op.right, env),
             )
             .unwrap_or_else(ValueFacts::unknown_pyobj),
-            InstrCodegen::UnaryOp(op) => {
+            InstrBlockPy::UnaryOp(op) => {
                 infer_unary_result_facts(op.kind, self.infer_expr_facts_in_env(&op.operand, env))
                     .unwrap_or_else(ValueFacts::unknown_pyobj)
             }
@@ -86,7 +86,7 @@ impl FunctionFactInferer<'_> {
         }
     }
 
-    fn transfer_block_env(&self, block: &Block<InstrCodegen>, entry: &EnvFacts) -> EnvFacts {
+    fn transfer_block_env(&self, block: &Block<InstrBlockPy>, entry: &EnvFacts) -> EnvFacts {
         let mut env = entry.clone();
         for instr in &block.body {
             self.transfer_instr_env(instr, &mut env);
@@ -94,9 +94,9 @@ impl FunctionFactInferer<'_> {
         env
     }
 
-    fn transfer_instr_env(&self, instr: &InstrCodegen, env: &mut EnvFacts) {
+    fn transfer_instr_env(&self, instr: &InstrBlockPy, env: &mut EnvFacts) {
         match instr {
-            InstrCodegen::Store(op) => {
+            InstrBlockPy::Store(op) => {
                 let Some(location) = op.name.local_location() else {
                     return;
                 };
@@ -105,7 +105,7 @@ impl FunctionFactInferer<'_> {
                     None => env.remove_local_pyobj_fact(location),
                 }
             }
-            InstrCodegen::Del(op) => {
+            InstrBlockPy::Del(op) => {
                 if let Some(location) = op.name.local_location() {
                     env.remove_local_pyobj_fact(location);
                 }
@@ -116,7 +116,7 @@ impl FunctionFactInferer<'_> {
 
     fn successor_envs(
         &self,
-        block: &Block<InstrCodegen>,
+        block: &Block<InstrBlockPy>,
         exit: &EnvFacts,
     ) -> Vec<(BlockLabel, EnvFacts)> {
         match &block.term {
@@ -144,7 +144,7 @@ impl FunctionFactInferer<'_> {
 
     fn infer_if_edge_facts(
         &self,
-        if_term: &soac_core::block_py::TermIf<InstrCodegen>,
+        if_term: &soac_core::block_py::TermIf<InstrBlockPy>,
         exit: &EnvFacts,
     ) -> (EnvFacts, EnvFacts) {
         let Some((location, then_fact, else_fact)) = self.infer_branch_local_fact(&if_term.test)
@@ -195,13 +195,13 @@ impl FunctionFactInferer<'_> {
 
     fn infer_branch_local_fact(
         &self,
-        test: &InstrCodegen,
+        test: &InstrBlockPy,
     ) -> Option<(LocalLocation, Option<PyObjFacts>, Option<PyObjFacts>)> {
         match test {
-            InstrCodegen::BinOp(op) if op.kind == BinOpKind::Is => {
+            InstrBlockPy::BinOp(op) if op.kind == BinOpKind::Is => {
                 infer_local_is_singleton_comparison(&op.left, &op.right, self)
             }
-            InstrCodegen::UnaryOp(op) if op.kind == UnaryOpKind::Not => self
+            InstrBlockPy::UnaryOp(op) if op.kind == UnaryOpKind::Not => self
                 .infer_branch_local_fact(&op.operand)
                 .map(|(location, then_fact, else_fact)| (location, else_fact, then_fact)),
             _ => None,
@@ -209,10 +209,10 @@ impl FunctionFactInferer<'_> {
     }
 }
 
-impl Visit<InstrCodegen> for FunctionFactInferer<'_> {
-    fn visit_instr(&mut self, expr: &InstrCodegen)
+impl Visit<InstrBlockPy> for FunctionFactInferer<'_> {
+    fn visit_instr(&mut self, expr: &InstrBlockPy)
     where
-        InstrCodegen: ChildVisitable<InstrCodegen>,
+        InstrBlockPy: ChildVisitable<InstrBlockPy>,
     {
         // Synthetic trace/counter instrumentation is inserted after semantic ID
         // assignment. It should not receive fake expression facts of its own.
@@ -226,7 +226,7 @@ impl Visit<InstrCodegen> for FunctionFactInferer<'_> {
 }
 
 fn infer_function_value_facts(
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
     module_constant_facts: &[ValueFacts],
 ) -> FactStore {
     let mut inferer = FunctionFactInferer {
@@ -252,8 +252,8 @@ fn infer_function_value_facts(
 }
 
 fn infer_local_is_singleton_comparison(
-    left: &InstrCodegen,
-    right: &InstrCodegen,
+    left: &InstrBlockPy,
+    right: &InstrBlockPy,
     inferer: &FunctionFactInferer<'_>,
 ) -> Option<(LocalLocation, Option<PyObjFacts>, Option<PyObjFacts>)> {
     if let Some((then_fact, else_fact)) = expr_singleton_branch_facts(right, inferer) {
@@ -266,7 +266,7 @@ fn infer_local_is_singleton_comparison(
 }
 
 fn expr_singleton_branch_facts(
-    expr: &InstrCodegen,
+    expr: &InstrBlockPy,
     inferer: &FunctionFactInferer<'_>,
 ) -> Option<(Option<PyObjFacts>, Option<PyObjFacts>)> {
     match inferer.infer_expr_facts(expr) {
@@ -286,9 +286,9 @@ fn expr_singleton_branch_facts(
     }
 }
 
-fn local_load_location(expr: &InstrCodegen) -> Option<LocalLocation> {
+fn local_load_location(expr: &InstrBlockPy) -> Option<LocalLocation> {
     match expr {
-        InstrCodegen::Load(op) => op.name.local_location(),
+        InstrBlockPy::Load(op) => op.name.local_location(),
         _ => None,
     }
 }
@@ -448,7 +448,7 @@ const fn truthiness(is_truthy: bool) -> TruthinessFact {
     }
 }
 
-pub fn infer_module_value_facts(module: &BlockPyModule<CodegenModuleShape>) -> FactStore {
+pub fn infer_module_value_facts(module: &BlockPyModule<BlockPyModuleShape>) -> FactStore {
     let mut store = FactStore::default();
     let module_constant_facts = module
         .module_constants
@@ -474,7 +474,7 @@ mod test {
         RefcountFact, RuntimeHelperId, ThrowSpec, ValueFacts, infer_module_value_facts,
     };
     use soac_core::block_py::{BlockTerm, ChildVisitable, HasSemanticInstrId, Visit};
-    use soac_ir_blockpy::InstrCodegen;
+    use soac_ir_blockpy::InstrBlockPy;
     use soac_lowering::lower_python_to_blockpy_for_testing;
 
     struct ReturnExprFinder {
@@ -482,10 +482,10 @@ mod test {
         function_id: soac_core::block_py::RuntimeFunctionId,
     }
 
-    impl Visit<InstrCodegen> for ReturnExprFinder {
-        fn visit_return_term(&mut self, value: &InstrCodegen)
+    impl Visit<InstrBlockPy> for ReturnExprFinder {
+        fn visit_return_term(&mut self, value: &InstrBlockPy)
         where
-            InstrCodegen: ChildVisitable<InstrCodegen>,
+            InstrBlockPy: ChildVisitable<InstrBlockPy>,
         {
             self.key = Some(value.semantic_instr_key(self.function_id));
             self.visit_instr(value);
@@ -495,13 +495,13 @@ mod test {
     struct FirstMatchingInstrFinder {
         key: Option<soac_core::block_py::InstrKey>,
         function_id: soac_core::block_py::RuntimeFunctionId,
-        matches: fn(&InstrCodegen) -> bool,
+        matches: fn(&InstrBlockPy) -> bool,
     }
 
-    impl Visit<InstrCodegen> for FirstMatchingInstrFinder {
-        fn visit_instr(&mut self, expr: &InstrCodegen)
+    impl Visit<InstrBlockPy> for FirstMatchingInstrFinder {
+        fn visit_instr(&mut self, expr: &InstrBlockPy)
         where
-            InstrCodegen: ChildVisitable<InstrCodegen>,
+            InstrBlockPy: ChildVisitable<InstrBlockPy>,
         {
             if self.key.is_none() && (self.matches)(expr) {
                 self.key = Some(expr.semantic_instr_key(self.function_id));
@@ -521,7 +521,7 @@ def f():
             .as_str(),
         )
         .expect("transform should succeed")
-        .codegen_module;
+        .blockpy_module;
         let function = lowered
             .callable_defs
             .iter()
@@ -543,7 +543,7 @@ def f():
 
     fn first_matching_instr_py_facts(
         function_body: &str,
-        matches: fn(&InstrCodegen) -> bool,
+        matches: fn(&InstrBlockPy) -> bool,
     ) -> PyObjFacts {
         let lowered = lower_python_to_blockpy_for_testing(
             format!(
@@ -555,7 +555,7 @@ def f(obj, key, value):
             .as_str(),
         )
         .expect("transform should succeed")
-        .codegen_module;
+        .blockpy_module;
         let function = lowered
             .callable_defs
             .iter()
@@ -594,7 +594,7 @@ def f(x, flag):
             .as_str(),
         )
         .expect("transform should succeed")
-        .codegen_module;
+        .blockpy_module;
         let function = lowered
             .callable_defs
             .iter()
@@ -676,19 +676,19 @@ def f(x, flag):
         for (source, matches) in [
             (
                 "    obj.attr = value",
-                (|expr| matches!(expr, InstrCodegen::SetAttr(_))) as fn(&InstrCodegen) -> bool,
+                (|expr| matches!(expr, InstrBlockPy::SetAttr(_))) as fn(&InstrBlockPy) -> bool,
             ),
             (
                 "    obj[key] = value",
-                (|expr| matches!(expr, InstrCodegen::SetItem(_))) as fn(&InstrCodegen) -> bool,
+                (|expr| matches!(expr, InstrBlockPy::SetItem(_))) as fn(&InstrBlockPy) -> bool,
             ),
             (
                 "    del obj[key]",
-                (|expr| matches!(expr, InstrCodegen::DelItem(_))) as fn(&InstrCodegen) -> bool,
+                (|expr| matches!(expr, InstrBlockPy::DelItem(_))) as fn(&InstrBlockPy) -> bool,
             ),
             (
                 "    del value",
-                (|expr| matches!(expr, InstrCodegen::Del(_))) as fn(&InstrCodegen) -> bool,
+                (|expr| matches!(expr, InstrBlockPy::Del(_))) as fn(&InstrBlockPy) -> bool,
             ),
         ] {
             let py_facts = first_matching_instr_py_facts(source, matches);

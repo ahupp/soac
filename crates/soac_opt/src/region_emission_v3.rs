@@ -3,7 +3,7 @@ use soac_core::block_py::{
     BlockArg, BlockLabel, BlockPyFunction, BlockTerm, ChildVisitable, InstrId, LocalLocation,
     NameLike, ResolvedName, Visit,
 };
-use soac_ir_blockpy::{CodegenModuleShape, InstrCodegen};
+use soac_ir_blockpy::{BlockPyModuleShape, InstrBlockPy};
 use soac_ir_typed::InstrTyped;
 use soac_ir_typed::emit_v3::{MechanicalExitKind, MechanicalRegionEmission, MechanicalStepOp};
 use soac_ir_typed::plan_v3::{
@@ -39,9 +39,9 @@ pub struct ScalarThreadSelection<'a> {
 #[derive(Clone, Copy)]
 pub struct ScalarThreadInlineReturnTargets<'a> {
     pub then_label: BlockLabel,
-    pub then_term: &'a BlockTerm<InstrCodegen>,
+    pub then_term: &'a BlockTerm<InstrBlockPy>,
     pub else_label: BlockLabel,
-    pub else_term: &'a BlockTerm<InstrCodegen>,
+    pub else_term: &'a BlockTerm<InstrBlockPy>,
 }
 
 pub fn exact_int_branch_selection_for_source(
@@ -220,7 +220,7 @@ pub fn scalar_thread_unmaterialized_local_location(
 }
 
 pub fn scalar_thread_inline_return_targets<'a>(
-    function: &'a BlockPyFunction<CodegenModuleShape>,
+    function: &'a BlockPyFunction<BlockPyModuleShape>,
     block_indices_by_label: &HashMap<BlockLabel, usize>,
     if_term: &soac_core::block_py::TermIf<InstrTyped>,
     local_name: &ResolvedName,
@@ -266,11 +266,11 @@ fn scalar_thread_matches_local(thread: &ScalarLocalThreadPlan, local_name: &Reso
 }
 
 fn scalar_thread_inline_return_target<'a>(
-    function: &'a BlockPyFunction<CodegenModuleShape>,
+    function: &'a BlockPyFunction<BlockPyModuleShape>,
     block_indices_by_label: &HashMap<BlockLabel, usize>,
     target: BlockLabel,
     local_name: &ResolvedName,
-) -> Result<Option<&'a BlockTerm<InstrCodegen>>, String> {
+) -> Result<Option<&'a BlockTerm<InstrBlockPy>>, String> {
     if block_predecessor_count(function, target) != 1 {
         return Ok(None);
     }
@@ -290,18 +290,18 @@ fn scalar_thread_inline_return_target<'a>(
     Ok(Some(&target_block.term))
 }
 
-fn term_references_local(term: &BlockTerm<InstrCodegen>, local_name: &ResolvedName) -> bool {
+fn term_references_local(term: &BlockTerm<InstrBlockPy>, local_name: &ResolvedName) -> bool {
     struct LocalRefFinder<'a> {
         local_name: &'a ResolvedName,
         found: bool,
     }
 
-    impl Visit<InstrCodegen> for LocalRefFinder<'_> {
-        fn visit_instr(&mut self, expr: &InstrCodegen)
+    impl Visit<InstrBlockPy> for LocalRefFinder<'_> {
+        fn visit_instr(&mut self, expr: &InstrBlockPy)
         where
-            InstrCodegen: ChildVisitable<InstrCodegen>,
+            InstrBlockPy: ChildVisitable<InstrBlockPy>,
         {
-            if let InstrCodegen::Load(load) = expr
+            if let InstrBlockPy::Load(load) = expr
                 && same_resolved_local_name(&load.name, self.local_name)
             {
                 self.found = true;
@@ -332,7 +332,7 @@ fn same_resolved_local_name(left: &ResolvedName, right: &ResolvedName) -> bool {
 }
 
 fn block_predecessor_count(
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
     target: BlockLabel,
 ) -> usize {
     function

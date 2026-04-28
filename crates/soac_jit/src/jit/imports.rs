@@ -34,7 +34,7 @@ use soac_core::block_py::{BlockPyFunction, ChildVisitable, Visit};
 use soac_ir_typed::plan_v3::DirectCallCallee;
 #[cfg(test)]
 use soac_ir_typed::{
-    InstrTyped, TypedCodegenModuleShape, TypedDirectCallableCallGuard, TypedDirectMethodCallGuard,
+    InstrTyped, TypedBlockPyModuleShape, TypedDirectCallableCallGuard, TypedDirectMethodCallGuard,
 };
 use soac_opt::access_emission_v3::{
     indexed_field_layout_groups as opt_v3_indexed_field_layout_groups,
@@ -697,7 +697,7 @@ pub(super) fn predeclare_specialization_type_imports(
 #[cfg(test)]
 pub(super) fn predeclare_typed_direct_call_imports(
     jit_module: &mut JITModule,
-    function: &BlockPyFunction<TypedCodegenModuleShape>,
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
 ) -> Result<(), String> {
     struct ImportCollector<'a> {
         jit_module: &'a mut JITModule,

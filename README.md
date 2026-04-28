@@ -365,7 +365,7 @@ typed variables must use recognized values. Boolean knobs accept `1`, `true`,
 
 - Runtime optimization uses the typed v3 path. `verify` and `apply` build the
   JIT module by lowering the cached pre-optimization BlockPy module to
-  `TypedCodegenModuleShape`, then applying v3 decisions from raw
+  `TypedBlockPyModuleShape`, then applying v3 decisions from raw
   `profile.bin` evidence during typed JIT planning. Precompile uses the same
   raw profile evidence and cached pre-optimization BlockPy modules; there is no
   serialized optimization-plan artifact between profiling and codegen.

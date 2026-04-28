@@ -10,7 +10,7 @@ use pyo3::types::{PyAny, PyDict, PyFunction, PyModule, PyString, PyTuple};
 use soac_core::block_py::{
     BlockPyFunction, FunctionExecutionMode, FunctionKind, ParamKind, RuntimeFunctionId,
 };
-use soac_ir_blockpy::CodegenModuleShape;
+use soac_ir_blockpy::BlockPyModuleShape;
 use std::ffi::{CString, c_void};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
@@ -316,7 +316,7 @@ fn normalize_class_cell_capture<'py>(
 
 fn split_param_defaults<'py>(
     py: Python<'py>,
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
     param_defaults: &Bound<'py, PyAny>,
 ) -> PyResult<(Option<Bound<'py, PyTuple>>, Option<Bound<'py, PyDict>>)> {
     let defaults = param_defaults.cast::<PyTuple>().map_err(|_| {
@@ -399,7 +399,7 @@ fn make_lazy_clif_entry<'py>(
 fn build_closure_shaped_entry<'py>(
     py: Python<'py>,
     dp: &Bound<'py, PyModule>,
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
     module_globals: &Bound<'py, PyAny>,
     qualname: &str,
     captured_names: &[String],
@@ -499,7 +499,7 @@ pub fn instantiate_bb_function(
     py: Python<'_>,
     dp: &Bound<'_, PyModule>,
     module_name: &str,
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
     captures: &Bound<'_, PyAny>,
     param_defaults: &Bound<'_, PyAny>,
     module_globals: &Bound<'_, PyAny>,
@@ -568,7 +568,7 @@ pub fn instantiate_bb_function(
 fn instantiate_closure_backed_entry<'py>(
     py: Python<'py>,
     dp: &Bound<'py, PyModule>,
-    function: &BlockPyFunction<CodegenModuleShape>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
     captures: &Bound<'py, PyAny>,
     module_globals: &Bound<'py, PyAny>,
     module_runtime: &ModuleRuntimeContext,
@@ -658,7 +658,7 @@ fn mark_coroutine_function(py: Python<'_>, func: &Bound<'_, PyAny>) -> PyResult<
 fn lookup_shared_function(
     compile_session: &Arc<CompileSession>,
     function_id: RuntimeFunctionId,
-) -> PyResult<(Arc<SharedModuleState>, BlockPyFunction<CodegenModuleShape>)> {
+) -> PyResult<(Arc<SharedModuleState>, BlockPyFunction<BlockPyModuleShape>)> {
     compile_session
         .lookup_shared_function(function_id)
         .map_err(PyRuntimeError::new_err)?
@@ -673,7 +673,7 @@ fn instantiate_shared_function(
     py: Python<'_>,
     compile_session: Arc<CompileSession>,
     shared_state: Arc<SharedModuleState>,
-    function: BlockPyFunction<CodegenModuleShape>,
+    function: BlockPyFunction<BlockPyModuleShape>,
     expected_kind: FunctionKind,
     captures: &Bound<'_, PyAny>,
     param_defaults: &Bound<'_, PyAny>,

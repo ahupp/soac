@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use soac_config::SoacEnvConfig;
 use soac_core::block_py::{BlockPyFunction, BlockPyModule, ModuleNameGen, RuntimeFunctionId};
 use soac_core::pass_tracker::RecordingPassTracker;
-use soac_ir_blockpy::CodegenModuleShape;
+use soac_ir_blockpy::BlockPyModuleShape;
 use soac_jit::module_constants::ModuleCodegenConstants;
 use soac_jit::module_type::{
     build_shared_state_for_inspection_with_placeholder_constants_and_source_hash,
@@ -37,7 +37,7 @@ use soac_core::profile::CounterDumpFile;
 static NEXT_WEB_MODULE_ID: AtomicU64 = AtomicU64::new(1);
 
 fn plan_typed_jit_module_for_inspector(
-    module: &BlockPyModule<CodegenModuleShape>,
+    module: &BlockPyModule<BlockPyModuleShape>,
 ) -> Result<PreparedJitTypedModulePlan, String> {
     let prepared = soac_driver::typed_runtime::prepare_typed_v3_runtime_module(
         module,
@@ -214,7 +214,7 @@ fn lower_source_recorded(source: &str) -> Result<soac_lowering::LoweringResult, 
         .map_err(|err| ApiError::internal(err.to_string()))
 }
 
-fn inspector_function_payload(function: &BlockPyFunction<CodegenModuleShape>) -> Value {
+fn inspector_function_payload(function: &BlockPyFunction<BlockPyModuleShape>) -> Value {
     json!({
         "functionId": function.function_id.to_packed_runtime_u64().to_string(),
         "qualname": function.names.qualname,
@@ -242,10 +242,10 @@ fn render_inspector_payload(source: &str, output: &soac_lowering::LoweringResult
             "text": text,
         }));
     }
-    let facts = infer_module_value_facts(&output.codegen_module);
-    let local_env_plan = plan_local_env_module(&output.codegen_module, &facts);
+    let facts = infer_module_value_facts(&output.blockpy_module);
+    let local_env_plan = plan_local_env_module(&output.blockpy_module, &facts);
     let local_env_plan_text =
-        render_local_env_module_plan(&output.codegen_module, &facts, &local_env_plan)
+        render_local_env_module_plan(&output.blockpy_module, &facts, &local_env_plan)
             .unwrap_or_else(|err| format!("; failed to render local_env_plan: {err}"));
     steps.push(json!({
         "key": "local_env_plan",
@@ -254,9 +254,9 @@ fn render_inspector_payload(source: &str, output: &soac_lowering::LoweringResult
     }));
     let local_env_resume_plan_text = (|| {
         let resume_plan =
-            plan_local_env_resume_module(&output.codegen_module, &local_env_plan, &facts);
+            plan_local_env_resume_module(&output.blockpy_module, &local_env_plan, &facts);
         render_local_env_resume_module_plan(
-            &output.codegen_module,
+            &output.blockpy_module,
             &local_env_plan,
             &facts,
             &resume_plan,
@@ -269,7 +269,7 @@ fn render_inspector_payload(source: &str, output: &soac_lowering::LoweringResult
         "text": local_env_resume_plan_text,
     }));
     let jit_deopt_resume_plan_text = (|| {
-        let prepared = plan_typed_jit_module_for_inspector(&output.codegen_module)?;
+        let prepared = plan_typed_jit_module_for_inspector(&output.blockpy_module)?;
         render_jit_deopt_resume_module(&prepared.module, &prepared.deopt_resume)
     })()
     .unwrap_or_else(|err| format!("; failed to render jit_deopt_resume_plan: {err}"));
@@ -279,7 +279,7 @@ fn render_inspector_payload(source: &str, output: &soac_lowering::LoweringResult
         "text": jit_deopt_resume_plan_text,
     }));
     let jit_local_plan_text = (|| {
-        let prepared = plan_typed_jit_module_for_inspector(&output.codegen_module)?;
+        let prepared = plan_typed_jit_module_for_inspector(&output.blockpy_module)?;
         render_jit_module_locals(&prepared.module, &prepared.locals)
     })()
     .unwrap_or_else(|err| format!("; failed to render jit_local_plan: {err}"));
@@ -291,7 +291,7 @@ fn render_inspector_payload(source: &str, output: &soac_lowering::LoweringResult
     json!({
         "steps": steps,
         "functions": output
-            .codegen_module
+            .blockpy_module
             .callable_defs
             .iter()
             .map(inspector_function_payload)
@@ -299,17 +299,17 @@ fn render_inspector_payload(source: &str, output: &soac_lowering::LoweringResult
     })
 }
 
-pub fn lower_source_to_codegen_module(
+pub fn lower_source_to_blockpy_module(
     source: &str,
-) -> Result<BlockPyModule<CodegenModuleShape>, String> {
+) -> Result<BlockPyModule<BlockPyModuleShape>, String> {
     let output = lower_source_recorded(source).map_err(|err| err.error)?;
-    Ok(output.codegen_module)
+    Ok(output.blockpy_module)
 }
 
-pub fn lower_source_to_codegen_module_with_module_id(
+pub fn lower_source_to_blockpy_module_with_module_id(
     source: &str,
     module_id: u32,
-) -> Result<BlockPyModule<CodegenModuleShape>, String> {
+) -> Result<BlockPyModule<BlockPyModuleShape>, String> {
     let output = soac_lowering::lower_python_to_blockpy_with_tracker_and_options(
         source,
         ModuleNameGen::new(module_id),
@@ -317,7 +317,7 @@ pub fn lower_source_to_codegen_module_with_module_id(
         soac_lowering::LoweringOptions::default(),
     )
     .map_err(|err| err.to_string())?;
-    Ok(output.codegen_module)
+    Ok(output.blockpy_module)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -377,7 +377,7 @@ fn inspect_pipeline_payload(source: &str) -> Result<Value, ApiError> {
 
 pub fn jit_debug_plan(
     module_name: &str,
-    module: &BlockPyModule<CodegenModuleShape>,
+    module: &BlockPyModule<BlockPyModuleShape>,
     function_id: RuntimeFunctionId,
 ) -> Result<String, String> {
     let facts = infer_module_value_facts(module);
@@ -426,7 +426,7 @@ pub fn jit_debug_plan(
 pub fn render_jit_clif_for_module(
     repo_root: &Path,
     module_name: &str,
-    module: &BlockPyModule<CodegenModuleShape>,
+    module: &BlockPyModule<BlockPyModuleShape>,
     function_id: RuntimeFunctionId,
 ) -> Result<JitClifResponse, String> {
     render_jit_clif_for_module_with_options(
@@ -504,7 +504,7 @@ fn register_function_owner_types_for_rendered_module(
 
 fn lower_soac_runtime_for_render_state(
     repo_root: &Path,
-) -> Result<(BlockPyModule<CodegenModuleShape>, u64), String> {
+) -> Result<(BlockPyModule<BlockPyModuleShape>, u64), String> {
     let source_path = repo_root
         .join("soac_py")
         .join("src")
@@ -515,9 +515,9 @@ fn lower_soac_runtime_for_render_state(
     let profile_identity = profile_module_identity_from_env("soac.runtime")?;
     let module = match profile_identity {
         Some(identity) => {
-            lower_source_to_codegen_module_with_module_id(&source, identity.module_id)
+            lower_source_to_blockpy_module_with_module_id(&source, identity.module_id)
         }
-        None => lower_source_to_codegen_module(&source),
+        None => lower_source_to_blockpy_module(&source),
     }?;
     Ok((
         module,
@@ -528,9 +528,9 @@ fn lower_soac_runtime_for_render_state(
 }
 
 fn corresponding_runtime_function<'a>(
-    module: &'a BlockPyModule<CodegenModuleShape>,
-    requested_function: &BlockPyFunction<CodegenModuleShape>,
-) -> Option<&'a BlockPyFunction<CodegenModuleShape>> {
+    module: &'a BlockPyModule<BlockPyModuleShape>,
+    requested_function: &BlockPyFunction<BlockPyModuleShape>,
+) -> Option<&'a BlockPyFunction<BlockPyModuleShape>> {
     module
         .callable_defs
         .iter()
@@ -549,7 +549,7 @@ fn corresponding_runtime_function<'a>(
 pub fn render_jit_clif_for_module_with_options(
     repo_root: &Path,
     module_name: &str,
-    module: &BlockPyModule<CodegenModuleShape>,
+    module: &BlockPyModule<BlockPyModuleShape>,
     function_id: RuntimeFunctionId,
     options: JitClifRenderOptions,
 ) -> Result<JitClifResponse, String> {
@@ -708,7 +708,7 @@ pub fn render_jit_clif_for_module_with_options(
 pub fn render_instr_typed_for_module_with_options(
     repo_root: &Path,
     module_name: &str,
-    module: &BlockPyModule<CodegenModuleShape>,
+    module: &BlockPyModule<BlockPyModuleShape>,
     function_id: RuntimeFunctionId,
     options: JitClifRenderOptions,
 ) -> Result<InstrTypedRenderResponse, String> {
@@ -867,7 +867,7 @@ fn render_jit_clif(
     entry_label: &str,
 ) -> Result<JitClifResponse, ApiError> {
     let module_name = next_web_module_name();
-    let module = lower_source_to_codegen_module(source).map_err(ApiError::internal)?;
+    let module = lower_source_to_blockpy_module(source).map_err(ApiError::internal)?;
     let mut rendered =
         render_jit_clif_for_module(repo_root, module_name.as_str(), &module, function_id)
             .map_err(ApiError::internal)?;
