@@ -124,7 +124,7 @@ planner lives in `soac-opt`.
 - `soac_inspector`
   Starts the local web inspector server. It serves the interactive pass,
   BlockPy, CLIF, and typed-instruction views, binding to `HOST`/`PORT` or
-  `127.0.0.1:8000` by default.
+  `0.0.0.0:8000` by default.
 
 - `list_jit_functions`
   Prints the packed runtime function ID and qualified name for each lowered JIT
