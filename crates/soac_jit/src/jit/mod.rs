@@ -473,12 +473,25 @@ fn typed_expr_planned_pyobject_input_is_borrowed_from_local_env(
         return Some(false);
     };
     Some(match ownership {
-        TypedPyObjectOwnershipPlan::BorrowedLocal => {
-            typed_expr_is_borrowable_from_local_env(expr, local_env, stack_slots, storage_layout)
+        TypedPyObjectOwnershipPlan::BorrowedLocal { location } => {
+            typed_expr_local_load_location(expr) == Some(location)
+                && typed_expr_is_borrowable_from_local_env(
+                    expr,
+                    local_env,
+                    stack_slots,
+                    storage_layout,
+                )
         }
         TypedPyObjectOwnershipPlan::Immortal => true,
         TypedPyObjectOwnershipPlan::Owned => false,
     })
+}
+
+fn typed_expr_local_load_location(expr: &InstrTyped) -> Option<LocalLocation> {
+    match expr {
+        InstrTyped::Load(op) => op.name.local_location(),
+        _ => None,
+    }
 }
 
 fn local_name_for_location<'a>(
@@ -2325,6 +2338,139 @@ impl LocalEnv {
         Ok(())
     }
 
+    fn move_location_to_location(
+        &mut self,
+        fb: &mut FunctionBuilder<'_>,
+        source_location: LocalLocation,
+        source_name: &str,
+        target_location: LocalLocation,
+        target_name: &str,
+        py_facts: Option<PyObjFacts>,
+        allow_local_only_slot_backed_store: bool,
+        source_cleanup_root_previous_state: CleanupRootSlotState,
+        target_cleanup_root_previous_state: CleanupRootSlotState,
+        stack_slots: &StackSlots,
+        ptr_ty: ir::Type,
+        thread_state_value: ir::Value,
+        decref_ref: ir::FuncRef,
+    ) -> bool {
+        if source_location == target_location || source_name == target_name {
+            return false;
+        }
+        let Some(source_index) = self
+            .entry_index_for_location(source_location)
+            .or_else(|| self.entry_index_for_name(source_name))
+        else {
+            return false;
+        };
+        if self
+            .entry_index_for_location(target_location)
+            .or_else(|| self.entry_index_for_name(target_name))
+            == Some(source_index)
+        {
+            return false;
+        }
+        let source_entry = &self.entries[source_index];
+        if source_entry.binding_facts.requires_checked_local_load() {
+            return false;
+        }
+        let is_cleanup_root = stack_slots.has_cleanup_root_name(target_name);
+        let target_index = self
+            .entry_index_for_location(target_location)
+            .or_else(|| self.entry_index_for_name(target_name));
+        let target_storage = target_index.map(|index| self.entries[index].storage);
+        let should_mirror_stack_slot = stack_slots.has_name(target_name)
+            && (is_cleanup_root
+                || match target_storage {
+                    Some(LocalEnvStorage::LocalOnly) => false,
+                    Some(LocalEnvStorage::StackMirror) => true,
+                    None => !allow_local_only_slot_backed_store,
+                });
+        let should_clear_source_stack_slot = match source_entry.storage {
+            LocalEnvStorage::LocalOnly => {
+                if !transient_local_needs_decref(source_entry.ref_kind) {
+                    return false;
+                }
+                false
+            }
+            LocalEnvStorage::StackMirror => {
+                if !should_mirror_stack_slot
+                    || source_entry.ref_kind != LocalRefKind::Borrowed
+                    || !source_cleanup_root_previous_state.may_hold_owned_reference()
+                    || !stack_slots.has_name(source_name)
+                {
+                    return false;
+                }
+                true
+            }
+        };
+
+        let source_entry = self.entries.remove(source_index);
+        let previous_entry = self
+            .entry_index_for_location(target_location)
+            .or_else(|| self.entry_index_for_name(target_name))
+            .map(|index| self.entries.remove(index));
+        let target_storage = if should_mirror_stack_slot {
+            stack_slots
+                .replace_moved_owned_value_with_previous_state(
+                    fb,
+                    target_name,
+                    source_entry.value,
+                    target_cleanup_root_previous_state,
+                    ptr_ty,
+                    thread_state_value,
+                    decref_ref,
+                )
+                .expect("moved generated-temp target missing from stack slots");
+            LocalEnvStorage::StackMirror
+        } else {
+            LocalEnvStorage::LocalOnly
+        };
+        if should_clear_source_stack_slot {
+            stack_slots
+                .clear_moved_value(fb, source_name, ptr_ty)
+                .expect("moved generated-temp source missing from stack slots");
+        }
+        let target_ref_kind = match target_storage {
+            LocalEnvStorage::LocalOnly => source_entry.ref_kind,
+            LocalEnvStorage::StackMirror => local_ref_kind_for_stack_mirror(LocalRefKind::Owned),
+        };
+        let target_binding_ref_kind = match target_storage {
+            LocalEnvStorage::LocalOnly => source_entry.ref_kind,
+            LocalEnvStorage::StackMirror => LocalRefKind::Owned,
+        };
+        let null_ptr = fb.ins().iconst(ptr_ty, 0);
+        self.entries.push(LocalEnvEntry {
+            location: Some(target_location),
+            name: target_name.to_string(),
+            aliases: previous_entry
+                .as_ref()
+                .map(|entry| entry.aliases.clone())
+                .unwrap_or_default(),
+            value: source_entry.value,
+            ref_kind: target_ref_kind,
+            storage: target_storage,
+            binding_facts: local_binding_facts_for_stored_value(target_binding_ref_kind),
+            py_facts,
+        });
+        self.entries.push(LocalEnvEntry {
+            location: Some(source_location),
+            name: source_name.to_string(),
+            aliases: source_entry.aliases,
+            value: null_ptr,
+            ref_kind: LocalRefKind::Unbound,
+            storage: source_entry.storage,
+            binding_facts: local_binding_facts_for_stored_value(LocalRefKind::Unbound),
+            py_facts: None,
+        });
+        if let Some(previous) = previous_entry {
+            if transient_local_needs_decref(previous.ref_kind) {
+                emit_decref_if_not_null(fb, ptr_ty, decref_ref, thread_state_value, previous.value);
+            }
+        }
+        true
+    }
+
     fn remove_location_or_name(
         &mut self,
         location: LocalLocation,
@@ -2701,8 +2847,10 @@ fn typed_local_load_direct_result_plan(
                 }) => ValueOwnership::Immortal,
                 _ if facts.is_immortal() => ValueOwnership::Immortal,
                 Some(TypedPlannedResult::PyObject {
-                    ownership: TypedPyObjectOwnershipPlan::BorrowedLocal,
-                }) if borrowed_ok => ValueOwnership::Borrowed,
+                    ownership: TypedPyObjectOwnershipPlan::BorrowedLocal { location },
+                }) if borrowed_ok && typed_expr_local_load_location(expr) == Some(location) => {
+                    ValueOwnership::Borrowed
+                }
                 _ => return None,
             };
             Some((ownership, facts))
@@ -3544,6 +3692,27 @@ impl StackSlots {
         Some(())
     }
 
+    fn replace_moved_owned_value_with_previous_state(
+        &self,
+        fb: &mut FunctionBuilder<'_>,
+        name: &str,
+        value: ir::Value,
+        previous_state: CleanupRootSlotState,
+        ptr_ty: ir::Type,
+        thread_state_value: ir::Value,
+        decref_ref: ir::FuncRef,
+    ) -> Option<()> {
+        let slot = self.slot_for_name(name)?;
+        let previous = previous_state
+            .may_hold_owned_reference()
+            .then(|| fb.ins().stack_load(ptr_ty, slot, 0));
+        fb.ins().stack_store(value, slot, 0);
+        if let Some(previous) = previous {
+            emit_decref_if_not_null(fb, ptr_ty, decref_ref, thread_state_value, previous);
+        }
+        Some(())
+    }
+
     fn clear_value(
         &self,
         fb: &mut FunctionBuilder<'_>,
@@ -3580,6 +3749,18 @@ impl StackSlots {
         if let Some(previous) = previous {
             emit_decref_if_not_null(fb, ptr_ty, decref_ref, thread_state_value, previous);
         }
+        Some(())
+    }
+
+    fn clear_moved_value(
+        &self,
+        fb: &mut FunctionBuilder<'_>,
+        name: &str,
+        ptr_ty: ir::Type,
+    ) -> Option<()> {
+        let slot = self.slot_for_name(name)?;
+        let null_ptr = fb.ins().iconst(ptr_ty, 0);
+        fb.ins().stack_store(null_ptr, slot, 0);
         Some(())
     }
 
@@ -15057,7 +15238,7 @@ fn emit_typed_codegen_ops(
     fb: &mut FunctionBuilder<'_>,
     ops: &[InstrTyped],
     local_env: &mut LocalEnv,
-    _stack_slots: &StackSlots,
+    stack_slots: &StackSlots,
     emit_ctx: &JitEmitCtx<'_>,
     cleanup_null_block: ir::Block,
     pending_local_failure_cleanups: &mut Vec<PendingLocalFailureCleanup>,
@@ -15065,10 +15246,56 @@ fn emit_typed_codegen_ops(
     codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<(), String> {
-    for expr in ops {
+    let mut index = 0;
+    while index < ops.len() {
+        let expr = &ops[index];
         let instr_id = expr.try_semantic_instr_id();
         if let Some(instr_id) = instr_id {
             emit_ctx.require_deopt_point_before_instr_id(instr_id)?;
+        }
+        if let (InstrTyped::Store(store), Some(InstrTyped::Del(delete)), InstrTyped::Load(source)) =
+            (expr, ops.get(index + 1), store_value_expr(expr))
+            && let (Some(target_location), Some(source_location), Some(delete_location)) = (
+                store.name.local_location(),
+                source.name.local_location(),
+                delete.name.local_location(),
+            )
+            && source_location == delete_location
+            && source.name.id.as_str() == delete.name.id.as_str()
+            && is_generated_transfer_temp_name(source.name.id.as_str())
+        {
+            let value_py_facts = if matches!(emit_ctx.function_kind, FunctionKind::Function) {
+                py_facts_for_typed_expr_with_local_env(store.value.as_ref(), local_env)
+            } else {
+                None
+            };
+            let store_key = expr.semantic_instr_key(emit_ctx.function_id);
+            if local_env.move_location_to_location(
+                fb,
+                source_location,
+                source.name.id.as_str(),
+                target_location,
+                store.name.id.as_str(),
+                value_py_facts,
+                emit_ctx.allow_local_only_slot_backed_stores,
+                planned_cleanup_root_previous_state_for_key(
+                    store_key,
+                    source.name.id.as_str(),
+                    emit_ctx,
+                ),
+                planned_cleanup_root_previous_state_for_key(
+                    store_key,
+                    store.name.id.as_str(),
+                    emit_ctx,
+                ),
+                stack_slots,
+                emit_ctx.consts.ptr_ty,
+                emit_ctx.consts.thread_state_value,
+                emit_ctx.decref_ref,
+            ) {
+                index += 2;
+                continue;
+            }
         }
         let stmt_emit_ctx = local_failure_cleanup_emit_ctx(
             fb,
@@ -15097,8 +15324,20 @@ fn emit_typed_codegen_ops(
             func_imports,
         )?;
         discard_emit_result(fb, result, emit_ctx)?;
+        index += 1;
     }
     Ok(())
+}
+
+fn store_value_expr(expr: &InstrTyped) -> &InstrTyped {
+    let InstrTyped::Store(store) = expr else {
+        return expr;
+    };
+    store.value.as_ref()
+}
+
+fn is_generated_transfer_temp_name(name: &str) -> bool {
+    name.starts_with("_dp_tmp_") || name.starts_with("_dp_typed_inline_")
 }
 
 #[allow(dead_code)]
@@ -16395,26 +16634,26 @@ fn emit_typed_codegen_term(
             // the term would replay that prework.
             let demand = exc_expr
                 .result_demand()
-                .unwrap_or(ResultDemand::PYOBJECT_OWNED);
+                .unwrap_or(ResultDemand::PYOBJECT_BORROWED_OK);
             let result = match demand {
-                ResultDemand::PyObject { borrowed_ok: false } => {
-                    emit_typed_codegen_stmt_result_with_local_env(
-                        fb,
-                        exc_expr,
-                        local_env,
-                        emit_ctx,
-                        demand,
-                        codegen_env,
-                        func_imports,
-                    )?
-                }
+                ResultDemand::PyObject { .. } => emit_typed_codegen_stmt_result_with_local_env(
+                    fb,
+                    exc_expr,
+                    local_env,
+                    emit_ctx,
+                    demand,
+                    codegen_env,
+                    func_imports,
+                )?,
                 other => {
                     return Err(format!(
-                        "typed raise exception requires owned PyObject demand, got {other:?}"
+                        "typed raise exception requires PyObject demand, got {other:?}"
                     ));
                 }
             };
             let (exc_value, ownership, _) = result.expect_pyobject("typed raise exception");
+            let (exc_value, ownership) =
+                emit_promote_pyobject_to_owned_boundary(fb, exc_value, ownership, emit_ctx);
             if !ownership.can_satisfy_pyobject_demand(ResultDemand::PYOBJECT_OWNED) {
                 return Err(format!(
                     "typed raise exception produced {ownership:?}, but raise requires owned PyObject"
@@ -17441,6 +17680,7 @@ fn build_cranelift_run_bb_specialized_function(
                     ptr_ty,
                     &options.module_constant_accesses,
                 ),
+                BlockParamRole::Value => null_ptr,
                 BlockParamRole::Exception => null_ptr,
             };
             entry_param_values.insert(block_param.name.as_str(), value);

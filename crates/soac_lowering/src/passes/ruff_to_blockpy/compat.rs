@@ -4,41 +4,100 @@ use crate::block_py::{
 };
 use crate::passes::ast_to_ast::context::Context;
 use crate::passes::ruff_to_blockpy::expr_lowering::{
-    try_lower_branching_expr_direct, try_lower_if_expr_direct, try_lower_if_expr_return_direct,
-    AstSetupExprLowerer,
+    try_lower_boolop_raise_direct, try_lower_boolop_return_direct,
+    try_lower_branching_expr_branch_direct, try_lower_branching_expr_direct,
+    try_lower_if_expr_branch_direct, try_lower_if_expr_direct, try_lower_if_expr_raise_direct,
+    try_lower_if_expr_return_direct, AstSetupExprLowerer, ScopedSetupExprLowerer,
 };
 use crate::passes::ruff_to_blockpy::stmt_sequences::lower_stmts_to_blockpy_stmts_with_context;
 use crate::passes::InstrRuff;
 
 fn try_lower_direct_expr<E>(
+    context: &Context,
     name_gen: &FunctionNameGen,
     expr: InstrRuff,
 ) -> Option<Result<LoweredExpr<E, InstrRuff>, String>>
 where
     E: RuffToBlockPyExpr + InstrWithConstantNone,
 {
+    let lowerer = ScopedSetupExprLowerer::new(context.current_value_forwarding_locals());
     match expr {
         InstrRuff::ExprIf(if_expr) => {
-            try_lower_if_expr_direct::<_, E>(&AstSetupExprLowerer, name_gen, if_expr, None)
+            try_lower_if_expr_direct::<_, E>(&lowerer, name_gen, if_expr, None)
         }
-        other => {
-            try_lower_branching_expr_direct::<_, E>(&AstSetupExprLowerer, name_gen, other, None)
-        }
+        other => try_lower_branching_expr_direct::<_, E>(&lowerer, name_gen, other, None),
     }
 }
 
 fn try_lower_direct_return_expr<E>(
+    context: &Context,
     name_gen: &FunctionNameGen,
     expr: InstrRuff,
 ) -> Option<Result<InlineFragment<E>, String>>
 where
     E: RuffToBlockPyExpr + InstrWithConstantNone,
 {
+    let lowerer = ScopedSetupExprLowerer::new(context.current_value_forwarding_locals());
     match expr {
         InstrRuff::ExprIf(if_expr) => {
-            try_lower_if_expr_return_direct::<_, E>(&AstSetupExprLowerer, name_gen, if_expr, None)
+            try_lower_if_expr_return_direct::<_, E>(&lowerer, name_gen, if_expr, None)
+        }
+        InstrRuff::ExprBoolOp(bool_op) => {
+            try_lower_boolop_return_direct::<_, E>(&lowerer, name_gen, bool_op, None)
         }
         _ => None,
+    }
+}
+
+fn try_lower_direct_raise_expr<E>(
+    context: &Context,
+    name_gen: &FunctionNameGen,
+    expr: InstrRuff,
+) -> Option<Result<InlineFragment<E>, String>>
+where
+    E: RuffToBlockPyExpr + InstrWithConstantNone,
+{
+    let lowerer = ScopedSetupExprLowerer::new(context.current_value_forwarding_locals());
+    match expr {
+        InstrRuff::ExprIf(if_expr) => {
+            try_lower_if_expr_raise_direct::<_, E>(&lowerer, name_gen, if_expr, None)
+        }
+        InstrRuff::ExprBoolOp(bool_op) => {
+            try_lower_boolop_raise_direct::<_, E>(&lowerer, name_gen, bool_op, None)
+        }
+        _ => None,
+    }
+}
+
+fn try_lower_direct_branch_expr<E>(
+    name_gen: &FunctionNameGen,
+    expr: InstrRuff,
+    then_label: BlockLabel,
+    else_label: BlockLabel,
+) -> Option<Result<InlineFragment<E>, String>>
+where
+    E: RuffToBlockPyExpr + InstrWithConstantNone,
+{
+    match expr {
+        InstrRuff::UnaryOp(unary) if unary.kind == crate::block_py::UnaryOpKind::Not => {
+            try_lower_direct_branch_expr(name_gen, *unary.operand, else_label, then_label)
+        }
+        InstrRuff::ExprIf(if_expr) => try_lower_if_expr_branch_direct::<_, E>(
+            &AstSetupExprLowerer,
+            name_gen,
+            if_expr,
+            then_label,
+            else_label,
+            None,
+        ),
+        other => try_lower_branching_expr_branch_direct::<_, E>(
+            &AstSetupExprLowerer,
+            name_gen,
+            other,
+            then_label,
+            else_label,
+            None,
+        ),
     }
 }
 
@@ -257,7 +316,7 @@ where
 {
     let mut out = lower_stmts_to_blockpy_stmts_with_context::<E>(context, &linear, name_gen)?;
     if let Some(expr) = value.clone() {
-        let lowered_terminal = try_lower_direct_return_expr::<E>(name_gen, expr.clone());
+        let lowered_terminal = try_lower_direct_return_expr::<E>(context, name_gen, expr.clone());
         if let Some(Ok(fragment)) = lowered_terminal {
             let setup_entry = emit_inline_fragment_with_exc_target_and_expr(
                 blocks,
@@ -278,7 +337,7 @@ where
             };
             return Ok(fragment_entry.unwrap_or(setup_entry).label());
         }
-        let lowered_direct = try_lower_direct_expr::<E>(name_gen, expr);
+        let lowered_direct = try_lower_direct_expr::<E>(context, name_gen, expr);
         if let Some(Ok(lowered)) = lowered_direct {
             let dispatch_label = name_gen.next_block_name();
             let setup_entry = emit_inline_fragment_with_exc_target_and_expr(
@@ -313,8 +372,8 @@ where
     }
     let value = value
         .map(|expr| {
-            crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_setup(
-                expr, &mut out, None,
+            crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_context(
+                context, expr, &mut out, None,
             )
         })
         .transpose()?;
@@ -342,7 +401,28 @@ where
 {
     let mut out = lower_stmts_to_blockpy_stmts_with_context::<E>(context, &linear, name_gen)?;
     if let Some(expr) = exc.exc.clone() {
-        let lowered_direct = try_lower_direct_expr::<E>(name_gen, expr);
+        let lowered_terminal = try_lower_direct_raise_expr::<E>(context, name_gen, expr.clone());
+        if let Some(Ok(fragment)) = lowered_terminal {
+            let setup_entry = emit_inline_fragment_with_exc_target_and_expr(
+                blocks,
+                fragment,
+                BlockLabel::fallthrough(),
+                exc_target,
+            );
+            let fragment_entry = if out.is_empty() {
+                None
+            } else {
+                Some(emit_lowered_builder_fragment_with_exc_target_and_expr(
+                    blocks,
+                    out,
+                    BlockTerm::Jump(BlockEdge::new(BlockLabel::fallthrough())),
+                    setup_entry.label(),
+                    exc_target,
+                ))
+            };
+            return Ok(fragment_entry.unwrap_or(setup_entry).label());
+        }
+        let lowered_direct = try_lower_direct_expr::<E>(context, name_gen, expr);
         if let Some(Ok(lowered)) = lowered_direct {
             let dispatch_label = name_gen.next_block_name();
             let setup_entry = emit_inline_fragment_with_exc_target_and_expr(
@@ -381,8 +461,8 @@ where
         exc: exc
             .exc
             .map(|expr| {
-                crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_setup(
-                    expr, &mut out, None,
+                crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_context(
+                    context, expr, &mut out, None,
                 )
             })
             .transpose()?,
@@ -411,7 +491,36 @@ pub(crate) fn emit_if_branch_block_with_expr_setup_and_expr<E>(
 where
     E: RuffToBlockPyExpr,
 {
-    let lowered_direct = try_lower_direct_expr::<E>(name_gen, test.clone());
+    let lowered_direct_branch = try_lower_direct_branch_expr::<E>(
+        name_gen,
+        test.clone(),
+        then_label.clone(),
+        else_label.clone(),
+    );
+    if let Some(lowered_direct_branch) = lowered_direct_branch {
+        let fragment = lowered_direct_branch?;
+        let setup_entry = emit_inline_fragment_with_exc_target_and_expr(
+            blocks,
+            fragment,
+            BlockLabel::fallthrough(),
+            exc_target,
+        );
+        if !body.is_empty() {
+            let lowered_body =
+                lower_stmts_to_blockpy_stmts_with_context::<E>(context, &body, name_gen)?;
+            return Ok(emit_lowered_builder_fragment_with_exc_target_and_expr(
+                blocks,
+                lowered_body,
+                BlockTerm::Jump(BlockEdge::new(BlockLabel::fallthrough())),
+                setup_entry.label(),
+                exc_target,
+            )
+            .label());
+        }
+        return Ok(setup_entry.label());
+    }
+
+    let lowered_direct = try_lower_direct_expr::<E>(context, name_gen, test.clone());
     if let Some(Ok(lowered)) = lowered_direct {
         let dispatch_label = name_gen.next_block_name();
         let setup_entry = emit_inline_fragment_with_exc_target_and_expr(
@@ -450,8 +559,8 @@ where
     }
 
     let mut out = lower_stmts_to_blockpy_stmts_with_context::<E>(context, &body, name_gen)?;
-    let lowered_test = crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_setup(
-        test, &mut out, None,
+    let lowered_test = crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_context(
+        context, test, &mut out, None,
     )?;
     let if_term = BlockTerm::IfTerm(TermIf {
         test: lowered_test,
@@ -483,13 +592,18 @@ pub(crate) fn emit_simple_while_blocks_with_expr_setup_and_expr<E>(
 where
     E: RuffToBlockPyExpr,
 {
-    let lowered_direct = try_lower_direct_expr::<E>(name_gen, test.clone());
-    if let Some(Ok(lowered)) = lowered_direct {
-        let dispatch_label = name_gen.next_block_name();
+    let lowered_direct_branch = try_lower_direct_branch_expr::<E>(
+        name_gen,
+        test.clone(),
+        body_entry.clone(),
+        cond_false_entry.clone(),
+    );
+    if let Some(lowered_direct_branch) = lowered_direct_branch {
+        let fragment = lowered_direct_branch?;
         let setup_entry = emit_inline_fragment_with_exc_target_and_expr(
             blocks,
-            lowered.setup,
-            dispatch_label.clone(),
+            fragment,
+            BlockLabel::fallthrough(),
             exc_target,
         );
         if setup_entry.label() != test_label {
@@ -504,49 +618,72 @@ where
                 exc_target,
             ));
         }
-        blocks.push(with_exc_meta(
-            Block::new(
-                dispatch_label,
-                Vec::new(),
-                BlockTerm::IfTerm(TermIf {
-                    test: E::from_lowered_expr(lowered.value),
-                    then_label: body_entry,
-                    else_label: cond_false_entry,
-                }),
-                Vec::new(),
-                None,
-            ),
-            exc_target,
-        ));
     } else {
-        let mut out = lower_stmts_to_blockpy_stmts_with_context::<E>(context, &[], name_gen)?;
-        let lowered_test =
-            crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_setup(
-                test, &mut out, None,
-            )?;
-        let if_term = BlockTerm::IfTerm(TermIf {
-            test: lowered_test,
-            then_label: body_entry,
-            else_label: cond_false_entry,
-        });
-        let emitted_test_entry = emit_lowered_builder_fragment_with_exc_target_and_expr(
-            blocks,
-            out,
-            if_term,
-            BlockLabel::fallthrough(),
-            exc_target,
-        );
-        if emitted_test_entry.label() != test_label {
+        let lowered_direct = try_lower_direct_expr::<E>(context, name_gen, test.clone());
+        if let Some(Ok(lowered)) = lowered_direct {
+            let dispatch_label = name_gen.next_block_name();
+            let setup_entry = emit_inline_fragment_with_exc_target_and_expr(
+                blocks,
+                lowered.setup,
+                dispatch_label.clone(),
+                exc_target,
+            );
+            if setup_entry.label() != test_label {
+                blocks.push(with_exc_meta(
+                    Block::new(
+                        test_label.clone(),
+                        Vec::new(),
+                        BlockTerm::Jump(BlockEdge::new(setup_entry.label())),
+                        Vec::new(),
+                        None,
+                    ),
+                    exc_target,
+                ));
+            }
             blocks.push(with_exc_meta(
                 Block::new(
-                    test_label.clone(),
+                    dispatch_label,
                     Vec::new(),
-                    BlockTerm::Jump(BlockEdge::new(emitted_test_entry.label())),
+                    BlockTerm::IfTerm(TermIf {
+                        test: E::from_lowered_expr(lowered.value),
+                        then_label: body_entry,
+                        else_label: cond_false_entry,
+                    }),
                     Vec::new(),
                     None,
                 ),
                 exc_target,
             ));
+        } else {
+            let mut out = lower_stmts_to_blockpy_stmts_with_context::<E>(context, &[], name_gen)?;
+            let lowered_test =
+                crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_context(
+                    context, test, &mut out, None,
+                )?;
+            let if_term = BlockTerm::IfTerm(TermIf {
+                test: lowered_test,
+                then_label: body_entry,
+                else_label: cond_false_entry,
+            });
+            let emitted_test_entry = emit_lowered_builder_fragment_with_exc_target_and_expr(
+                blocks,
+                out,
+                if_term,
+                BlockLabel::fallthrough(),
+                exc_target,
+            );
+            if emitted_test_entry.label() != test_label {
+                blocks.push(with_exc_meta(
+                    Block::new(
+                        test_label.clone(),
+                        Vec::new(),
+                        BlockTerm::Jump(BlockEdge::new(emitted_test_entry.label())),
+                        Vec::new(),
+                        None,
+                    ),
+                    exc_target,
+                ));
+            }
         }
     }
     if let Some(linear_label) = linear_label {

@@ -1,8 +1,8 @@
 use super::*;
 
 use crate::block_py::{
-    instr_any, BlockEdge, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, FunctionKind,
-    InstrWithAwaitAndYield, ModuleShape, NameLike, ScopeExprNode, TermRaise,
+    instr_any, BlockEdge, BlockLabel, BlockParamRole, BlockPyFunction, BlockPyModule, BlockTerm,
+    FunctionKind, InstrWithAwaitAndYield, ModuleShape, NameLike, ScopeExprNode, TermRaise,
 };
 use crate::lower_python_to_blockpy_for_testing;
 use crate::pass_tracker::LoweringPassTrackerInternalExt;
@@ -156,6 +156,30 @@ def f(x, ys):
 }
 
 #[test]
+fn for_loop_simple_target_does_not_self_store_generated_next_temp() {
+    let blockpy = wrapped_core_blockpy_with_await_and_yield(
+        r#"
+def f(xs):
+    for item in xs:
+        sink(item)
+"#,
+    );
+    let function = function_by_name(&blockpy, "f");
+
+    assert!(
+        blocks_store_to_prefix(&function.blocks, "_dp_tmp_"),
+        "for lowering should still hold the next() result in a cleanup-visible temp: {:#?}",
+        function.blocks
+    );
+    assert!(
+        !blocks_self_store_to_prefix(&function.blocks, "_dp_tmp_"),
+        "for lowering should not re-store the generated temp into itself: {:#?}",
+        function.blocks
+    );
+    assert_all_block_targets_present(&function.blocks);
+}
+
+#[test]
 fn lowers_async_for_structurally() {
     let blockpy = wrapped_core_blockpy_with_await_and_yield(
         r#"
@@ -249,6 +273,44 @@ def gen():
     assert!(matches!(
         plan_instr_sequence_head(&test_context(), &instr_stmt(stmt.clone())),
         StmtSequenceHeadPlan::Linear(_)
+    ));
+}
+
+#[test]
+fn stmt_sequence_head_plan_expands_simple_assign_if_expr() {
+    let module = ruff_python_parser::parse_module(
+        r#"
+def f():
+    result = value if cond else other
+"#,
+    )
+    .unwrap()
+    .into_syntax()
+    .body;
+    let ast::Stmt::FunctionDef(func) = &module[0] else {
+        panic!("expected function def");
+    };
+    let stmt = &func.body[0];
+
+    let StmtSequenceHeadPlan::Expanded(expanded) =
+        plan_instr_sequence_head(&test_context(), &instr_stmt(stmt.clone()))
+    else {
+        panic!("expected simple conditional assignment to expand");
+    };
+    let [InstrRuff::StmtIf(if_stmt)] = expanded.as_slice() else {
+        panic!("conditional assignment should expand to an if statement: {expanded:#?}");
+    };
+    assert_eq!(if_stmt.body.len(), 1);
+    assert_eq!(if_stmt.orelse.len(), 1);
+    assert!(matches!(
+        if_stmt.body[0],
+        InstrRuff::StmtAssign(ref assign)
+            if matches!(assign.targets.as_slice(), [InstrRuff::ExprName(name)] if name.id.as_str() == "result")
+    ));
+    assert!(matches!(
+        if_stmt.orelse[0],
+        InstrRuff::StmtAssign(ref assign)
+            if matches!(assign.targets.as_slice(), [InstrRuff::ExprName(name)] if name.id.as_str() == "result")
     ));
 }
 
@@ -719,18 +781,10 @@ fn if_stmt_helper_lowers_if_expr_test_via_inline_fragment() {
         blocks.iter().any(|block| block.label == entry),
         "{blocks:#?}"
     );
-    let setup_label = blocks
-        .iter()
-        .find_map(|block| match &block.term {
-            BlockTerm::Jump(BlockEdge { target, args })
-                if block.label == entry && args.is_empty() =>
-            {
-                Some(*target)
-            }
-            _ => None,
-        })
-        .expect("entry should be a linear prefix jump into the lowered setup");
-    assert_eq!(blocks.len(), 5);
+    assert!(
+        !blocks_store_to_prefix(&blocks, "_dp_tmp_"),
+        "branch-only if-expression lowering should not materialize a selected-value temp: {blocks:#?}"
+    );
     let if_labels = blocks
         .iter()
         .filter_map(|block| match block.term {
@@ -738,11 +792,7 @@ fn if_stmt_helper_lowers_if_expr_test_via_inline_fragment() {
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(if_labels.len(), 2, "{blocks:#?}");
-    let dispatch_label = *if_labels
-        .iter()
-        .find(|&&label| label != setup_label)
-        .expect("dispatch if block should exist");
+    assert_eq!(if_labels.len(), 3, "{blocks:#?}");
     let jump_targets = blocks
         .iter()
         .filter_map(|block| match &block.term {
@@ -750,16 +800,10 @@ fn if_stmt_helper_lowers_if_expr_test_via_inline_fragment() {
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(
+    assert!(
         jump_targets
             .iter()
-            .filter(|&&target| target == dispatch_label)
-            .count(),
-        2,
-        "{blocks:#?}"
-    );
-    assert!(
-        jump_targets.iter().any(|&target| target == setup_label),
+            .any(|&target| if_labels.contains(&target)),
         "{blocks:#?}"
     );
 }
@@ -789,46 +833,51 @@ fn if_stmt_helper_lowers_boolop_test_via_inline_fragment() {
         blocks.iter().any(|block| block.label == entry),
         "{blocks:#?}"
     );
-    assert_eq!(blocks.len(), 4);
-    let setup_label = blocks
+    assert!(
+        !blocks_store_to_prefix(&blocks, "_dp_target_"),
+        "branch-only boolop lowering should not materialize a selected-value temp: {blocks:#?}"
+    );
+    let if_count = blocks
         .iter()
-        .find_map(|block| match &block.term {
-            BlockTerm::Jump(BlockEdge { target, args })
-                if block.label == entry && args.is_empty() =>
-            {
-                Some(*target)
-            }
-            _ => None,
-        })
-        .expect("entry should jump to the first short-circuit test block");
+        .filter(|block| matches!(block.term, BlockTerm::IfTerm(_)))
+        .count();
+    assert_eq!(if_count, 2, "{blocks:#?}");
+}
+
+#[test]
+fn if_stmt_helper_lowers_not_boolop_test_via_inline_fragment() {
+    let mut blocks = Vec::new();
+    let context = Context::new("");
+    let name_gen = test_name_gen();
+
+    let entry = lower_if_stmt_sequence(
+        &context,
+        &mut blocks,
+        &name_gen,
+        vec![instr_stmt(py_stmt!("prefix = 0"))],
+        instr_expr(py_expr!("not (left and right)")),
+        &vec![instr_stmt(py_stmt!("x = 1"))],
+        &vec![instr_stmt(py_stmt!("x = 2"))],
+        label(99),
+        &RegionTargets::new(label(99), None),
+        &mut |_stmts: &[InstrRuff], _targets: RegionTargets, _blocks: &mut Vec<TestBlock>| {
+            label(200)
+        },
+    );
+
     assert!(
-        blocks
-            .iter()
-            .find(|block| block.label == setup_label)
-            .is_some_and(|block| matches!(block.term, BlockTerm::IfTerm(_))),
+        blocks.iter().any(|block| block.label == entry),
         "{blocks:#?}"
     );
-    let second_if_label = blocks
+    assert!(
+        !blocks_store_to_prefix(&blocks, "_dp_target_"),
+        "branch-only not-boolop lowering should not materialize a selected-value temp: {blocks:#?}"
+    );
+    let if_count = blocks
         .iter()
-        .find(|block| block.label != setup_label && matches!(block.term, BlockTerm::IfTerm(_)))
-        .map(|block| block.label)
-        .expect("second if block should exist");
-    assert!(
-        blocks.iter().any(|block| matches!(
-            block.term,
-            BlockTerm::Jump(BlockEdge { target, ref args })
-                if target == second_if_label && args.is_empty()
-        )),
-        "{blocks:#?}"
-    );
-    assert!(
-        blocks.iter().any(|block| matches!(
-            block.term,
-            BlockTerm::Jump(BlockEdge { target, ref args })
-                if target == setup_label && args.is_empty()
-        )),
-        "{blocks:#?}"
-    );
+        .filter(|block| matches!(block.term, BlockTerm::IfTerm(_)))
+        .count();
+    assert_eq!(if_count, 2, "{blocks:#?}");
 }
 
 #[test]
@@ -856,7 +905,6 @@ fn if_stmt_helper_lowers_compare_chain_test_via_inline_fragment() {
         blocks.iter().any(|block| block.label == entry),
         "{blocks:#?}"
     );
-    assert_eq!(blocks.len(), 4);
     let setup_label = blocks
         .iter()
         .find_map(|block| match &block.term {
@@ -875,6 +923,10 @@ fn if_stmt_helper_lowers_compare_chain_test_via_inline_fragment() {
             .is_some_and(|block| matches!(block.term, BlockTerm::IfTerm(_))),
         "{blocks:#?}"
     );
+    assert!(
+        !blocks_store_to_prefix(&blocks, "_dp_target_"),
+        "branch-only compare-chain lowering should not materialize a selected-value temp: {blocks:#?}"
+    );
     let second_if_label = blocks
         .iter()
         .find(|block| block.label != setup_label && matches!(block.term, BlockTerm::IfTerm(_)))
@@ -882,9 +934,8 @@ fn if_stmt_helper_lowers_compare_chain_test_via_inline_fragment() {
         .expect("second if block should exist");
     assert!(
         blocks.iter().any(|block| matches!(
-            block.term,
-            BlockTerm::Jump(BlockEdge { target, ref args })
-                if target == second_if_label && args.is_empty()
+            &block.term,
+            BlockTerm::IfTerm(if_term) if block.label == setup_label && if_term.then_label == second_if_label
         )),
         "{blocks:#?}"
     );
@@ -1071,6 +1122,47 @@ fn blocks_store_to_prefix(blocks: &[TestBlock], prefix: &str) -> bool {
     })
 }
 
+fn blocks_self_store_to_prefix(blocks: &[TestBlock], prefix: &str) -> bool {
+    blocks.iter().any(|block| {
+        block.body.iter().any(|stmt| {
+            matches!(
+                stmt,
+                InstrWithAwaitAndYield::Store(store)
+                    if store.name.id_str().starts_with(prefix)
+                        && matches!(
+                            store.value.as_ref(),
+                            InstrWithAwaitAndYield::Load(load)
+                                if load.name.id_str() == store.name.id_str()
+                        )
+            )
+        })
+    })
+}
+
+fn blocks_store_to_name(blocks: &[TestBlock], name: &str) -> usize {
+    blocks
+        .iter()
+        .map(|block| {
+            block
+                .body
+                .iter()
+                .filter(|stmt| {
+                    matches!(
+                        stmt,
+                        InstrWithAwaitAndYield::Store(store) if store.name.id_str() == name
+                    )
+                })
+                .count()
+        })
+        .sum()
+}
+
+fn blocks_have_param_role(blocks: &[TestBlock], role: BlockParamRole) -> bool {
+    blocks
+        .iter()
+        .any(|block| block.params.iter().any(|param| param.role == role))
+}
+
 fn return_load_names(blocks: &[TestBlock]) -> Vec<String> {
     blocks
         .iter()
@@ -1081,6 +1173,398 @@ fn return_load_names(blocks: &[TestBlock]) -> Vec<String> {
             _ => None,
         })
         .collect()
+}
+
+#[test]
+fn sequence_lowering_assign_boolop_local_or_global_without_selected_target_slot() {
+    let blockpy = wrapped_core_blockpy_with_await_and_yield(
+        r#"
+BoolGlob = False
+
+def f(BoolLoc):
+    BoolLoc = BoolLoc or BoolGlob
+    return BoolLoc
+"#,
+    );
+    let function = function_by_name(&blockpy, "f");
+
+    assert!(
+        !blocks_store_to_prefix(&function.blocks, "_dp_target_"),
+        "direct boolop assignment should not materialize a selected-value target: {:#?}",
+        function.blocks
+    );
+    assert!(
+        !blocks_have_param_role(&function.blocks, BlockParamRole::Value),
+        "direct boolop assignment should store into the real target instead of a value carrier: {:#?}",
+        function.blocks
+    );
+    assert!(
+        blocks_store_to_name(&function.blocks, "BoolLoc") >= 2,
+        "selected and final arms should store directly into BoolLoc: {:#?}",
+        function.blocks
+    );
+    assert_all_block_targets_present(&function.blocks);
+}
+
+#[test]
+fn sequence_lowering_returns_boolop_local_or_global_without_selected_target_slot() {
+    let blockpy = wrapped_core_blockpy_with_await_and_yield(
+        r#"
+BoolGlob = False
+
+def f(BoolLoc):
+    return BoolLoc or BoolGlob
+"#,
+    );
+    let function = function_by_name(&blockpy, "f");
+
+    assert!(
+        !blocks_store_to_prefix(&function.blocks, "_dp_target_"),
+        "direct boolop return should not materialize a selected-value target: {:#?}",
+        function.blocks
+    );
+    assert!(
+        !blocks_have_param_role(&function.blocks, BlockParamRole::Value),
+        "direct boolop return should not need a value carrier: {:#?}",
+        function.blocks
+    );
+    let return_names = return_load_names(&function.blocks);
+    assert!(
+        return_names.iter().any(|name| name == "BoolLoc"),
+        "{:#?}",
+        function.blocks
+    );
+    assert!(
+        return_names.iter().any(|name| name == "BoolGlob"),
+        "{:#?}",
+        function.blocks
+    );
+    assert_all_block_targets_present(&function.blocks);
+}
+
+#[test]
+fn sequence_lowering_passes_boolop_value_arg_without_selected_target_slot() {
+    let blockpy = wrapped_core_blockpy_with_await_and_yield(
+        r#"
+def f(left, right, sink):
+    return sink(left and right)
+"#,
+    );
+    let function = function_by_name(&blockpy, "f");
+
+    assert!(
+        !blocks_store_to_prefix(&function.blocks, "_dp_target_"),
+        "nested boolop value should use a value block param instead of a selected-value target: {:#?}",
+        function.blocks
+    );
+    assert!(
+        blocks_have_param_role(&function.blocks, BlockParamRole::Value),
+        "nested boolop value should introduce an explicit value carrier block param: {:#?}",
+        function.blocks
+    );
+    assert_all_block_targets_present(&function.blocks);
+}
+
+#[test]
+fn sequence_lowering_passes_boolop_value_arg_with_final_global_without_selected_target_slot() {
+    let blockpy = wrapped_core_blockpy_with_await_and_yield(
+        r#"
+BoolGlob = False
+
+def f(left, sink):
+    return sink(left or BoolGlob)
+"#,
+    );
+    let function = function_by_name(&blockpy, "f");
+
+    assert!(
+        !blocks_store_to_prefix(&function.blocks, "_dp_target_"),
+        "nested boolop value should not initialize a selected-value target before testing left: {:#?}",
+        function.blocks
+    );
+    assert!(
+        blocks_have_param_role(&function.blocks, BlockParamRole::Value),
+        "nested boolop value with final global should still join through a value block param: {:#?}",
+        function.blocks
+    );
+    assert!(
+        blocks_store_to_prefix(&function.blocks, "_dp_value_"),
+        "only the non-forwardable final global path should materialize the value carrier: {:#?}",
+        function.blocks
+    );
+    assert_all_block_targets_present(&function.blocks);
+}
+
+#[test]
+fn sequence_lowering_raises_boolop_locals_without_selected_target_slot() {
+    let blockpy = wrapped_core_blockpy_with_await_and_yield(
+        r#"
+def f(exc, fallback):
+    raise exc or fallback
+"#,
+    );
+    let function = function_by_name(&blockpy, "f");
+
+    assert!(
+        !blocks_store_to_prefix(&function.blocks, "_dp_target_"),
+        "direct boolop raise should not materialize a selected-value target: {:#?}",
+        function.blocks
+    );
+    assert!(
+        !blocks_have_param_role(&function.blocks, BlockParamRole::Value),
+        "direct boolop raise should not need a value carrier: {:#?}",
+        function.blocks
+    );
+    assert!(
+        function
+            .blocks
+            .iter()
+            .filter(|block| matches!(block.term, BlockTerm::Raise(TermRaise { exc: Some(_) })))
+            .count()
+            >= 2,
+        "{:#?}",
+        function.blocks
+    );
+    assert_all_block_targets_present(&function.blocks);
+}
+
+#[test]
+fn sequence_lowering_expands_assign_if_expr_without_synthetic_temp_slot() {
+    let blockpy = wrapped_core_blockpy_with_await_and_yield(
+        r#"
+def f(cond, value, other):
+    result = value if cond else other
+    return result
+"#,
+    );
+    let function = function_by_name(&blockpy, "f");
+
+    assert!(
+        !blocks_store_to_prefix(&function.blocks, "_dp_tmp_"),
+        "simple conditional assignment should not materialize a selected-value temp: {:#?}",
+        function.blocks
+    );
+    assert_eq!(
+        blocks_store_to_name(&function.blocks, "result"),
+        2,
+        "selected arms should store directly into the real target: {:#?}",
+        function.blocks
+    );
+    assert!(
+        function
+            .blocks
+            .iter()
+            .any(|block| matches!(block.term, BlockTerm::IfTerm(_))),
+        "{:#?}",
+        function.blocks
+    );
+    assert_all_block_targets_present(&function.blocks);
+}
+
+#[test]
+fn sequence_lowering_lowers_simple_attribute_target_without_object_temp_slot() {
+    let blockpy = wrapped_core_blockpy_with_await_and_yield(
+        r#"
+def f(obj, value):
+    obj.field = value
+"#,
+    );
+    let function = function_by_name(&blockpy, "f");
+
+    assert!(
+        !blocks_store_to_prefix(&function.blocks, "_dp_assign_obj_"),
+        "simple local attribute receivers should stay borrowed instead of using an owned target-object temp: {:#?}",
+        function.blocks
+    );
+    assert!(
+        !blocks_store_to_prefix(&function.blocks, "_dp_assign_value_"),
+        "simple local attribute assignment RHS values should stay borrowed instead of using an owned RHS temp: {:#?}",
+        function.blocks
+    );
+    assert!(
+        function_instr_any(function, |instr| matches!(
+            instr,
+            InstrWithAwaitAndYield::SetAttr(_)
+        )),
+        "{:#?}",
+        function.blocks
+    );
+    assert_all_block_targets_present(&function.blocks);
+}
+
+#[test]
+fn sequence_lowering_lowers_simple_subscript_target_without_object_or_index_temp_slots() {
+    let blockpy = wrapped_core_blockpy_with_await_and_yield(
+        r#"
+def f(obj, idx, value):
+    obj[idx] = value
+"#,
+    );
+    let function = function_by_name(&blockpy, "f");
+
+    assert!(
+        !blocks_store_to_prefix(&function.blocks, "_dp_assign_obj_"),
+        "simple local subscript receivers should stay borrowed instead of using an owned target-object temp: {:#?}",
+        function.blocks
+    );
+    assert!(
+        !blocks_store_to_prefix(&function.blocks, "_dp_assign_index_"),
+        "simple local subscript indexes should stay borrowed instead of using an owned target-index temp: {:#?}",
+        function.blocks
+    );
+    assert!(
+        !blocks_store_to_prefix(&function.blocks, "_dp_assign_value_"),
+        "simple local subscript assignment RHS values should stay borrowed instead of using an owned RHS temp: {:#?}",
+        function.blocks
+    );
+    assert!(
+        function_instr_any(function, |instr| matches!(
+            instr,
+            InstrWithAwaitAndYield::SetItem(_)
+        )),
+        "{:#?}",
+        function.blocks
+    );
+    assert_all_block_targets_present(&function.blocks);
+}
+
+#[test]
+fn sequence_lowering_lowers_simple_subscript_target_without_rhs_temp_for_local_index() {
+    let blockpy = wrapped_core_blockpy_with_await_and_yield(
+        r#"
+def f(obj, value):
+    idx = 0
+    obj[idx] = value
+"#,
+    );
+    let function = function_by_name(&blockpy, "f");
+
+    assert!(
+        !blocks_store_to_prefix(&function.blocks, "_dp_assign_value_"),
+        "subscript RHS values should stay borrowed when the object and RHS are no-raise locals and the index is a simple local load: {:#?}",
+        function.blocks
+    );
+    assert_all_block_targets_present(&function.blocks);
+}
+
+#[test]
+fn sequence_lowering_keeps_assignment_value_temp_for_effectful_subscript_index() {
+    let blockpy = wrapped_core_blockpy_with_await_and_yield(
+        r#"
+def f(obj, value, g):
+    obj[g()] = value
+"#,
+    );
+    let function = function_by_name(&blockpy, "f");
+
+    assert!(
+        blocks_store_to_prefix(&function.blocks, "_dp_assign_value_"),
+        "RHS temps must stay when a subscript index may have side effects before the target update: {:#?}",
+        function.blocks
+    );
+    assert_all_block_targets_present(&function.blocks);
+}
+
+#[test]
+fn sequence_lowering_keeps_assignment_value_temp_when_rhs_param_can_be_deleted() {
+    let blockpy = wrapped_core_blockpy_with_await_and_yield(
+        r#"
+def f(obj, value):
+    del value
+    obj.field = value
+"#,
+    );
+    let function = function_by_name(&blockpy, "f");
+
+    assert!(
+        blocks_store_to_prefix(&function.blocks, "_dp_assign_value_"),
+        "RHS temps must stay when a parameter can be deleted before the assignment: {:#?}",
+        function.blocks
+    );
+    assert_all_block_targets_present(&function.blocks);
+}
+
+#[test]
+fn sequence_stmt_expr_lowers_if_expr_effect_only_without_synthetic_temp_slot() {
+    let blockpy = wrapped_core_blockpy_with_await_and_yield(
+        r#"
+def f(cond, value, other):
+    value if cond else other
+    return None
+"#,
+    );
+    let function = function_by_name(&blockpy, "f");
+
+    assert!(
+        !blocks_store_to_prefix(&function.blocks, "_dp_tmp_"),
+        "effect-only conditional expression should not materialize a selected-value temp: {:#?}",
+        function.blocks
+    );
+    assert!(
+        function
+            .blocks
+            .iter()
+            .any(|block| matches!(block.term, BlockTerm::IfTerm(_))),
+        "{:#?}",
+        function.blocks
+    );
+    assert_all_block_targets_present(&function.blocks);
+}
+
+#[test]
+fn sequence_stmt_expr_lowers_boolop_effect_only_without_selected_target_slot() {
+    let blockpy = wrapped_core_blockpy_with_await_and_yield(
+        r#"
+def f(left, right, fallback):
+    left and right
+    left or fallback
+    not (left and right)
+    return None
+"#,
+    );
+    let function = function_by_name(&blockpy, "f");
+
+    assert!(
+        !blocks_store_to_prefix(&function.blocks, "_dp_target_"),
+        "effect-only boolops should not materialize a selected-value target: {:#?}",
+        function.blocks
+    );
+    assert!(
+        function
+            .blocks
+            .iter()
+            .filter(|block| matches!(block.term, BlockTerm::IfTerm(_)))
+            .count()
+            >= 2,
+        "{:#?}",
+        function.blocks
+    );
+    assert_all_block_targets_present(&function.blocks);
+}
+
+#[test]
+fn sequence_stmt_expr_lowers_compare_chain_effect_only_without_selected_target_slot() {
+    let blockpy = wrapped_core_blockpy_with_await_and_yield(
+        r#"
+def f(a, b, c):
+    a < b < c
+    a < b < c < a
+    return None
+"#,
+    );
+    let function = function_by_name(&blockpy, "f");
+
+    assert!(
+        !blocks_store_to_prefix(&function.blocks, "_dp_target_"),
+        "effect-only compare chains should not materialize a selected-value target: {:#?}",
+        function.blocks
+    );
+    assert!(
+        blocks_store_to_prefix(&function.blocks, "_dp_compare_"),
+        "compare chains still need one evaluated comparator carrier before the final comparison: {:#?}",
+        function.blocks
+    );
+    assert_all_block_targets_present(&function.blocks);
 }
 
 #[test]
@@ -1175,6 +1659,10 @@ fn sequence_raise_helper_keeps_direct_if_expr_setup_reachable_after_linear_prefi
     assert!(blocks
         .iter()
         .any(|block| matches!(block.term, BlockTerm::Raise(TermRaise { exc: Some(_) }))));
+    assert!(
+        !blocks_store_to_prefix(&blocks, "_dp_tmp_"),
+        "direct raise should not materialize a conditional expression temp: {blocks:#?}"
+    );
     assert_all_block_targets_present(&blocks);
 }
 
@@ -1509,6 +1997,10 @@ fn while_stmt_helper_lowers_boolop_test_via_inline_fragment() {
         blocks.iter().any(|block| block.label == linear_label),
         "{blocks:#?}"
     );
+    assert!(
+        !blocks_store_to_prefix(&blocks, "_dp_target_"),
+        "branch-only while boolop lowering should not materialize a selected-value temp: {blocks:#?}"
+    );
     assert!(blocks
         .iter()
         .any(|block| block.label != test_label && block.label != linear_label));
@@ -1580,6 +2072,10 @@ fn while_stmt_helper_lowers_compare_chain_test_via_inline_fragment() {
     assert!(
         blocks.iter().any(|block| block.label == linear_label),
         "{blocks:#?}"
+    );
+    assert!(
+        !blocks_store_to_prefix(&blocks, "_dp_target_"),
+        "branch-only while compare-chain lowering should not materialize a selected-value temp: {blocks:#?}"
     );
     assert!(blocks
         .iter()

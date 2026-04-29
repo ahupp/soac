@@ -112,7 +112,8 @@ where
     } = if_stmt;
     let bridge = StructuredLoweringBridge::new();
     let Some(test_setup) = bridge.try_lower_inline_value(name_gen, |structured| {
-        crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_setup(
+        crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_context(
+            context,
             crate::passes::ast_to_instr::from_ast_expr(*test.clone()),
             structured,
             loop_ctx,
@@ -174,7 +175,8 @@ where
 {
     let bridge = StructuredLoweringBridge::new();
     let Some(test_setup) = bridge.try_lower_inline_value(name_gen, |structured| {
-        crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_setup(
+        crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_context(
+            context,
             (*if_stmt.test).clone(),
             structured,
             loop_ctx,

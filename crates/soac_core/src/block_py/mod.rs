@@ -870,6 +870,7 @@ impl<I: Instr, E> Block<I, E> {
 
     pub fn bb_params(&self) -> impl Iterator<Item = &BlockParam> {
         [
+            BlockParamRole::Value,
             BlockParamRole::Exception,
             BlockParamRole::AbruptKind,
             BlockParamRole::AbruptPayload,
@@ -1350,6 +1351,7 @@ pub enum AbruptKind {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum BlockParamRole {
+    Value,
     Exception,
     AbruptKind,
     AbruptPayload,

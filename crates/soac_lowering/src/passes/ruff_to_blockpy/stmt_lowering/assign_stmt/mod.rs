@@ -1,6 +1,9 @@
 use super::*;
 use crate::block_py::{Del, HasMeta, Meta, Store, WithMeta};
 use crate::passes::ast_to_ast::expr_utils::make_tuple;
+use crate::passes::ruff_to_blockpy::expr_lowering::{
+    try_lower_boolop_assign_direct, ScopedSetupExprLowerer,
+};
 use crate::passes::InstrRuff;
 
 fn rhs_temp_name(name: &str) -> ast::name::Name {
@@ -36,11 +39,13 @@ fn delete_temp<E: RuffToBlockPyExpr>(out: &mut BlockPyStmtBuilder<E>, name: Stri
 }
 
 pub(super) fn lower_target_object_with_setup<E: RuffToBlockPyExpr>(
+    context: &Context,
     target_value: InstrRuff,
     out: &mut BlockPyStmtBuilder<E>,
     loop_ctx: Option<&LoopContext>,
 ) -> Result<E, String> {
-    crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_setup(
+    crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_context(
+        context,
         target_value,
         out,
         loop_ctx,
@@ -76,41 +81,71 @@ where
         ),
         InstrRuff::ExprSubscript(target) => {
             let meta = target.meta();
-            let object_value = lower_target_object_with_setup(*target.value, out, loop_ctx)?;
-            let object_temp_name = context.fresh("assign_obj");
-            let object_temp = bind_temp(out, object_temp_name.clone(), object_value);
+            let can_forward_object =
+                is_forwardable_assignment_target_component(context, target.value.as_ref());
+            let can_forward_index =
+                is_forwardable_assignment_target_component(context, target.slice.as_ref());
+            let object_value =
+                lower_target_object_with_setup(context, *target.value, out, loop_ctx)?;
+            let (object, object_temp_name) = if can_forward_object {
+                (object_value, None)
+            } else {
+                let object_temp_name = context.fresh("assign_obj");
+                (
+                    bind_temp(out, object_temp_name.clone(), object_value),
+                    Some(object_temp_name),
+                )
+            };
             let index_value =
-                crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_setup(
+                crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_context(
+                    context,
                     *target.slice,
                     out,
                     loop_ctx,
                 )?;
-            let index_temp_name = context.fresh("assign_index");
-            let index_temp = bind_temp(out, index_temp_name.clone(), index_value);
-            out.push_stmt(E::set_item(
-                meta.node_index,
-                meta.range,
-                object_temp,
-                index_temp,
-                rhs,
-            ));
-            delete_temp(out, index_temp_name);
-            delete_temp(out, object_temp_name);
+            let (index, index_temp_name) = if can_forward_index {
+                (index_value, None)
+            } else {
+                let index_temp_name = context.fresh("assign_index");
+                (
+                    bind_temp(out, index_temp_name.clone(), index_value),
+                    Some(index_temp_name),
+                )
+            };
+            out.push_stmt(E::set_item(meta.node_index, meta.range, object, index, rhs));
+            if let Some(name) = index_temp_name {
+                delete_temp(out, name);
+            }
+            if let Some(name) = object_temp_name {
+                delete_temp(out, name);
+            }
             Ok(())
         }
         InstrRuff::ExprAttribute(target) => {
             let meta = target.meta();
-            let object_value = lower_target_object_with_setup(*target.value, out, loop_ctx)?;
-            let object_temp_name = context.fresh("assign_obj");
-            let object_temp = bind_temp(out, object_temp_name.clone(), object_value);
+            let can_forward_object =
+                is_forwardable_assignment_target_component(context, target.value.as_ref());
+            let object_value =
+                lower_target_object_with_setup(context, *target.value, out, loop_ctx)?;
+            let (object, object_temp_name) = if can_forward_object {
+                (object_value, None)
+            } else {
+                let object_temp_name = context.fresh("assign_obj");
+                (
+                    bind_temp(out, object_temp_name.clone(), object_value),
+                    Some(object_temp_name),
+                )
+            };
             out.push_stmt(E::set_attr(
                 meta.node_index,
                 meta.range,
-                object_temp,
+                object,
                 target.attr.to_string(),
                 rhs,
             ));
-            delete_temp(out, object_temp_name);
+            if let Some(name) = object_temp_name {
+                delete_temp(out, name);
+            }
             Ok(())
         }
         InstrRuff::ExprName(name) => {
@@ -121,6 +156,45 @@ where
         other => Err(format!(
             "unsupported assignment target reached BlockPy conversion: {other:?}"
         )),
+    }
+}
+
+fn is_forwardable_assignment_target_component(context: &Context, value: &InstrRuff) -> bool {
+    let InstrRuff::ExprName(name) = value else {
+        return false;
+    };
+    context
+        .current_value_forwarding_locals()
+        .contains(name.id.as_str())
+}
+
+fn is_no_raise_assignment_component(context: &Context, value: &InstrRuff) -> bool {
+    let InstrRuff::ExprName(name) = value else {
+        return false;
+    };
+    context.current_no_raise_locals().contains(name.id.as_str())
+}
+
+fn can_forward_assignment_rhs_without_temp(
+    context: &Context,
+    targets: &[InstrRuff],
+    value: &InstrRuff,
+) -> bool {
+    let [target] = targets else {
+        return false;
+    };
+    if !is_no_raise_assignment_component(context, value) {
+        return false;
+    }
+    match target {
+        InstrRuff::ExprAttribute(target) => {
+            is_no_raise_assignment_component(context, target.value.as_ref())
+        }
+        InstrRuff::ExprSubscript(target) => {
+            is_no_raise_assignment_component(context, target.value.as_ref())
+                && is_forwardable_assignment_target_component(context, target.slice.as_ref())
+        }
+        _ => false,
     }
 }
 
@@ -227,13 +301,32 @@ pub(crate) fn lower_assign_instr_into<E>(
 where
     E: RuffToBlockPyExpr,
 {
-    let mut value = crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_setup(
+    if let [InstrRuff::ExprName(target)] = stmt.targets.as_slice() {
+        if let InstrRuff::ExprBoolOp(bool_op) = (*stmt.value).clone() {
+            let lowerer = ScopedSetupExprLowerer::new(context.current_value_forwarding_locals());
+            if let Some(lowered) = try_lower_boolop_assign_direct::<_, E>(
+                &lowerer,
+                out.name_gen(),
+                target.id.as_str(),
+                bool_op,
+                loop_ctx,
+            ) {
+                out.append_fragment(lowered?);
+                return Ok(());
+            }
+        }
+    }
+
+    let mut value = crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_context(
+        context,
         (*stmt.value).clone(),
         out,
         loop_ctx,
     )?;
 
-    let value_temp_name = should_bind_assignment_value(&stmt.targets).then(|| {
+    let should_bind_value = should_bind_assignment_value(&stmt.targets)
+        && !can_forward_assignment_rhs_without_temp(context, &stmt.targets, stmt.value.as_ref());
+    let value_temp_name = should_bind_value.then(|| {
         let name = context.fresh("assign_value");
         value = bind_temp(out, name.clone(), value.clone());
         name
@@ -263,9 +356,7 @@ pub(crate) fn build_for_target_assign_body(
         }))
     };
     vec![
-        crate::block_py::StmtAssign::new(vec![tmp_name_expr(ast::ExprContext::Store)], rhs).into(),
-        crate::block_py::StmtAssign::new(vec![target], tmp_name_expr(ast::ExprContext::Load))
-            .into(),
+        crate::block_py::StmtAssign::new(vec![target], rhs).into(),
         crate::block_py::StmtDelete::new(vec![tmp_name_expr(ast::ExprContext::Del)]).into(),
     ]
 }

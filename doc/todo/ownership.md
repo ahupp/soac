@@ -33,10 +33,11 @@ SSA join for a later truthiness test or a return boundary.
 - A borrowed SSA value is promoted with an explicit INCREF only when it crosses
   an ownership boundary: return, raise, store into a slot/container/global/cell,
   or a helper that steals or retains a reference.
-- Phase 1 should avoid borrowed block params. If a value crosses a block edge,
-  either reload it from the supporting slot in the successor or promote once at
-  the boundary. A later phase can add validated borrowed phi/block-param
-  support.
+- Phase 1 should avoid treating arbitrary block params as borrowed support
+  roots. If a selected value crosses a block edge, it may use an explicit value
+  block param, but the source must either be a validated local/root value or an
+  owned carrier materialized on that predecessor. A later phase can add
+  validated borrowed phi/block-param support for broader cases.
 
 ## Minimal cases to keep
 
@@ -247,26 +248,205 @@ inside each arm.
    releases only owned inputs, so borrowed local and immortal operands do not
    get DECREF scaffolding.
 
-3. Done for return terms: split "producer ownership" from the return ownership
-   boundary. A returned local load can produce `BorrowedLocal`; codegen promotes
-   borrowed values exactly at the return boundary before local cleanup releases
-   the frame-owned slot. Stores remain conservative for now.
+3. Done for return and raise terms: split "producer ownership" from the
+   terminal ownership boundary. A returned or raised local load can produce
+   `BorrowedLocal`; codegen promotes borrowed values exactly at the return/raise
+   boundary before local cleanup releases the frame-owned slot. Stores remain
+   conservative for now.
 
-4. In progress: replace synthetic boolean/conditional temp ownership with
-   explicit join handling. Direct-return conditional expressions now lower to
-   arm-local return blocks, so `return x if flag else y` no longer materializes
-   `_dp_tmp_*`. Boolean value expressions still need a representation that
-   preserves the selected operand object across the truthiness branch without
-   reloading from a possibly mutated support slot. Later: represent a
-   borrowed-supported block value and validate the support root on all
-   predecessors.
+4. Done for local-selected boolean and conditional expressions: replace
+   synthetic boolean/conditional temp ownership with
+   explicit join handling. Direct-return and direct-raise conditional
+   expressions now lower to arm-local terminal blocks, so `return x if flag else
+   y` and `raise x if flag else y` no longer materialize `_dp_tmp_*`. Simple
+   name assignments from conditional expressions expand to arm-local stores, so
+   `z = x if flag else y` stores directly into `z` instead of selecting through
+   `_dp_tmp_*`. Branch-test boolean and conditional expressions now lower
+   directly to control flow, so `if x and y` and `if x if flag else y` no longer
+   materialize `_dp_target_*` or `_dp_tmp_*` when only truthiness is needed.
+   Effect-only conditional, boolean, and compare-chain expression statements now
+   lower directly to control flow as well, so discarded selected values are not
+   stored only to be DECREFed. Unary `not` over those branchable expressions
+   also uses direct truthiness lowering instead of forcing the operand through a
+   selected-value temp.
+   Value-producing boolean expressions now use direct terminal/store lowering
+   when every non-final selected operand is a forwardable local. `return x or g`
+   and `raise x or y` return/raise the selected local directly and evaluate the
+   final operand only in the final terminal block. `z = x or g` stores selected
+   locals directly into `z` and stores the final operand directly into `z`.
+   Nested boolean value consumers such as `sink(x or g)` use a `Value` block
+   param when every non-final selected operand is a forwardable local: selected
+   local predecessors forward the local, while a non-forwardable final operand
+   materializes only a final-path `_dp_value_*` carrier.
 
-5. Extend `TypedPyObjectOwnershipPlan::BorrowedLocal` to carry support-root
-   provenance before allowing borrowed values to cross block edges. The planner
-   should validate that the supporting slot is not overwritten or deleted before
-   the final use.
+   Remaining conservative cases: if a non-final selected operand is not a
+   forwardable local (for example a global, attribute, call result, or cell
+   load), lowering still uses the old owned selected-value temp. There is no
+   validated support root for borrowing that selected object across the
+   truthiness branch. Nested conditional-expression value consumers such as
+   `sink(x if flag else y)` also keep the older `_dp_tmp_*` lowering for now; a
+   direct `Value` block-param prototype was correctness-safe after requiring a
+   forwardable arm, but it had no pystone code-size win and regressed the
+   refcount-enabled apply benchmark in repeated runs. Same-local assignments
+   such as `x = x or g` still emit
+   `Store(x, x)` on the selected path to preserve the originally selected object
+   if truthiness can observably mutate the frame local. A codegen same-root
+   store no-op was prototyped, but the pystone refcount-enabled apply benchmark
+   regressed despite a small code-size win, so that conversion is not kept in
+   the benchmark-neutral borrowed-local base.
+
+5. Done for local loads: `TypedPyObjectOwnershipPlan::BorrowedLocal` carries
+   the supporting `LocalLocation`, and codegen only honors the borrowed plan
+   when the planned location matches the actual local load. Before allowing
+   borrowed values to cross block edges, the planner still needs to validate
+   that the supporting slot is not overwritten or deleted before the final use.
 
 6. Keep stores conservative. Real local assignment still writes an owned slot.
    The optimization is to avoid taking ownership for reads that are only
    consumed by non-retaining operations, and to avoid synthetic temp stores that
    are only standing in for SSA joins.
+
+7. Done for typed module-constant fact recovery: after typed rewrites and
+   inlining, `refresh_typed_function_value_facts` now reconstructs
+   `ModuleConstant` provenance and immortal-refcount facts for typed constant
+   loads instead of preserving a stale `unknown` PyObject fact. In pystone this
+   moved 20 load sites from owned/unknown to immortal and reduced the
+   borrowed-ok nonlocal owned-load bucket from 22 to 6. The runtime
+   `runtime_incref` / `runtime_decref` counters did not change because module
+   constants are loaded directly, but the typed ownership metadata no longer
+   reports false owned requirements for those values.
+
+8. Audited but not kept: a `BorrowedGlobalsDict` plan for `globals()` results
+   passed directly as call arguments correctly converted four pystone
+   class/module-initialization call results to borrowed current-globals values,
+   but it produced no pystone code-size or block-count change and the
+   refcount-enabled benchmark signal was noise-negative. Those sites are
+   startup-only and not part of the dominant Proc0 refcount volume, so the extra
+   ownership variant is not part of the current base.
+
+9. Remaining pystone owned values are not currently safe borrowed conversions:
+   borrowed-ok indexed global loads still need an owned result unless a
+   surrounding v3 mechanical region proves a non-retaining hot path and owns the
+   fallback/deopt shape; generic indexed-global loads do not have a stable
+   support root because the module dict can be mutated before a reentrant
+   consumer finishes. Borrowed-ok `GetItem`, `GetAttr`, `BinOp`, `Tuple`, and
+   call results are produced values, not local-slot aliases. Exact-list item
+   loads could become borrowed only with an item-type/no-reentrant proof or a
+   split hot/fallback region like the existing v3 mechanical borrowed indexed
+   global path.
+
+10. Done for simple assignment target components and no-raise parameter RHS
+    values: simple local target receiver/index operands flow directly into
+    `SetAttr`/`SetItem` as borrowed local loads, removing `_dp_assign_obj_*` and
+    `_dp_assign_index_*` owned slots for shapes such as `self.x = value` and
+    `obj[i] = value`. The RHS also flows directly when there is one
+    attribute/subscript target, the RHS and receiver are non-deleted function
+    parameters, and a subscript index is a simple local load. This keeps
+    CPython-visible order intact for the optimized case because the moved RHS
+    and receiver loads cannot raise or have side effects, and the local index
+    load cannot introduce side effects before the target update.
+
+    Pystone `Record.__init__` now renders as direct `SetAttr(self, ..., Param)`
+    operations with no `_dp_assign_obj_*` or `_dp_assign_value_*` stores. Its
+    pre-inline refcount helper calls dropped from 116 to 66 after receiver
+    forwarding, and then to 21 after no-raise RHS forwarding. The no-raise RHS
+    benchmark `work/bench/nqtkkqssorqv_b6a9e4f37880` reduced verify counters
+    from `runtime_incref=5,139,016` / `runtime_decref=6,345,198` to
+    `runtime_incref=5,038,016` / `runtime_decref=6,244,198` versus
+    `work/bench/nqtkkqssorqv_2c875f38f98f`, and moved pystone total code size
+    from 64,657 to 64,505 bytes.
+
+    The local-index subscript extension hit pystone `Proc8` / inlined `Proc8`
+    shapes such as `Array1Par[IntLoc] = IntParI2`, moving total code size from
+    64,505 to 64,103 bytes in `work/bench/nqtkkqssorqv_46891c667b41`. Runtime
+    refcount counters did not change in that add-on because the removed slot was
+    not a counted dynamic refcount site, but the emitted cleanup/code-size shape
+    improved.
+
+    Remaining conservative case: general RHS temps stay. Removing them would
+    require either a SetAttr/SetItem operation whose child evaluation order
+    explicitly models assignment RHS-before-target semantics, or a broader
+    definite-bound/no-raise proof for the RHS and target loads. A plain
+    tree-shaped `SetAttr(obj, attr, rhs)` evaluates the receiver before
+    replacement in current BlockPy child order, so blindly removing
+    `_dp_assign_value_*` would change observable `UnboundLocalError`/side-effect
+    ordering.
+
+11. Done for for-loop generated next-value temps: loop lowering still stores
+    `next(iter, sentinel)` into a cleanup-visible `_dp_tmp_*` slot before
+    assigning the target and deleting the temp, but it no longer emits the
+    redundant generated self-store `_dp_tmp_* = _dp_tmp_*` before assigning the
+    real loop target. This removes an owned reload/re-store of a compiler temp
+    while preserving the existing cleanup path if target assignment raises. In
+    pystone `Proc0`, the rendered specialized typed form no longer has
+    `Store(_dp_tmp_1_8_1, _dp_tmp_1_8_1)` or
+    `Store(_dp_tmp_1_8_4, _dp_tmp_1_8_4)`, and the inlined `Proc8` loop loses
+    the analogous typed-inline self-store.
+
+12. Done for adjacent generated-temp transfer into another local: typed codegen
+    now recognizes `Store(target, _dp_tmp_*); Del(_dp_tmp_*)` and transfers the
+    generated temp's ownership into the target binding instead of emitting an
+    owned load followed by deleting the temp. The conservative shape is limited
+    to compiler-generated `_dp_tmp_*` / `_dp_typed_inline_*` source names, so it
+    does not rewrite user-visible `x = y; del y`.
+
+    This matters for pystone's loop targets. In `Proc0` blocks `bb17` and
+    `bb24`, the old shape was `INCREF tmp; stack_store tmp -> i; DECREF old_i;
+    DECREF tmp`; the new shape is just `stack_store tmp -> i; DECREF old_i`.
+    The same transfer handles stack-mirrored locals by treating the stack slot
+    as the owner and the local-env value as borrowed from that slot.
+
+    The benchmark `work/bench/nqtkkqssorqv_5473a00dca0a` reduced verify
+    counters from `runtime_incref=4,840,015` / `runtime_decref=6,046,197` in
+    `work/bench/nqtkkqssorqv_8effde18c609` to
+    `runtime_incref=4,642,014` / `runtime_decref=5,848,196`, another 198,001
+    fewer INCREFs and DECREFs. The refcount-enabled apply median moved from
+    621,877 to 632,619 loops/s. The production refcount-enabled apply JIT code
+    process also shrank from 135,742 bytes / 8,899 machine blocks to 134,747
+    bytes / 8,859 blocks; the benchmark summary's "latest process" code-size
+    line is the no-refcount diagnostic run, which moved in the opposite
+    direction and is not the production size.
+
+13. Remaining pystone refcount volume after the generated-temp transfer is
+    concentrated in real produced-value cleanup, not in missed borrowed local
+    loads. The benchmark `work/bench/nqtkkqssorqv_5473a00dca0a` reports
+    `runtime_incref=4,642,014` / `runtime_decref=5,848,196`; by dynamic
+    function total the largest buckets are `Proc0` at 5,035,975 calls,
+    `Proc1` at 2,323,000, `Proc3` at 1,313,000, `Record.copy` at 606,000, and
+    `Record.__init__` / the constructor entry at 808,008 combined.
+
+    The largest static code-size bucket is still cold cleanup scaffolding:
+    pre-inline `Proc0` has 740 static `soac_runtime_decref` calls versus 62
+    `soac_runtime_incref` calls. That is mostly code-size pressure rather than
+    the measured steady-state counter volume.
+
+    A benchmarked steady-state target was stack-style attribute stores. Typed
+    pystone still has shapes like `Store(_dp_assign_value_30, GetAttr(...))`,
+    `SetAttr(..., _dp_assign_value_30)`, `Del(_dp_assign_value_30)`. CPython's
+    bytecode stack naturally lets `STORE_ATTR` consume the owned stack value;
+    SOAC's indexed-field store helper instead `INCREF`s the replacement and the
+    following generated-temp `Del` then `DECREF`s it.
+
+    That direct stealing-store prototype was not kept. The first benchmark,
+    `work/bench/nqtkkqssorqv_fb961b404c1b`, reduced verify counters to
+    `runtime_incref=4,642,014` / `runtime_decref=5,545,196`, removing 303,000
+    counted DECREFs concentrated in `Proc1`. However, production
+    refcount-enabled code size grew from 134,747 bytes / 8,859 machine blocks
+    to 135,605 bytes / 8,962 blocks, and the apply median dropped from 632,619
+    to 626,165 loops/s. After a no-refcount diagnostic fix in
+    `work/bench/nqtkkqssorqv_3955033317b5`, the production apply median was
+    still only 619,783 loops/s with the same larger code size. That makes the
+    local peephole a poor base even though the counter direction was right.
+
+    The likely missing shape is not "steal more locally" but "make produced
+    value lifetimes stack-like before codegen": assignment RHS temps should be
+    explicit owned SSA stack values whose consumer can take ownership without
+    introducing a separate helper call, fallback island, or local cleanup
+    exception. Otherwise the win in counted DECREFs is offset by larger control
+    flow and helper plumbing.
+
+    Remaining borrowed-load work is less direct: indexed `GetAttr` fast hits
+    still `INCREF` their field result even when the consumer is borrowed-ok, but
+    the fallback path currently returns an owned result through the same merge.
+    Making that borrowed on the hot path needs either a split hot/fallback
+    ownership result or deopt-only misses for the borrowed-result mode.

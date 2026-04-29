@@ -10,6 +10,9 @@ runtime reference material for SOAC.
 - [Optimization](OPTIMIZATION.md) summarizes the optimization architecture.
 - [Specialization](SPECIALIZATION.md) documents profile input, emitted
   specialization shapes, limitations, and soundness boundaries.
+- [Special Names](SPECIAL_NAMES.md) inventories compiler/runtime-reserved names
+  and documents where generated-name prefix checks are still part of a narrow
+  implementation contract.
 - [Runtime Functions](RUNTIME_FUNCTIONS.md) inventories runtime helper
   functions used by generated code.
 - [Performance Log](PERF_LOG.md) records finalized performance changes.

@@ -259,7 +259,7 @@ pub fn annotate_typed_function_result_demands(
             }
             BlockTerm::Raise(raise_stmt) => {
                 if let Some(exc) = raise_stmt.exc.as_mut() {
-                    changed += set_typed_instr_demand(exc, TypedResultDemand::PYOBJECT_OWNED);
+                    changed += set_typed_instr_demand(exc, TypedResultDemand::PYOBJECT_BORROWED_OK);
                     changed += annotate_typed_child_demands(exc);
                 }
             }
@@ -310,8 +310,12 @@ fn plan_typed_instr_result(expr: &InstrTyped) -> Option<TypedPlannedResult> {
         TypedResultDemand::PyObject { borrowed_ok } => {
             let ownership = match expr.result_facts().and_then(ValueFacts::as_pyobj) {
                 Some(py_facts) if py_facts.is_immortal() => TypedPyObjectOwnershipPlan::Immortal,
-                _ if borrowed_ok && typed_instr_is_local_load(expr) => {
-                    TypedPyObjectOwnershipPlan::BorrowedLocal
+                _ if borrowed_ok => {
+                    if let Some(location) = typed_instr_local_load_location(expr) {
+                        TypedPyObjectOwnershipPlan::BorrowedLocal { location }
+                    } else {
+                        TypedPyObjectOwnershipPlan::Owned
+                    }
                 }
                 _ => TypedPyObjectOwnershipPlan::Owned,
             };
@@ -322,8 +326,11 @@ fn plan_typed_instr_result(expr: &InstrTyped) -> Option<TypedPlannedResult> {
     })
 }
 
-fn typed_instr_is_local_load(expr: &InstrTyped) -> bool {
-    matches!(expr, InstrTyped::Load(op) if op.name.local_location().is_some())
+fn typed_instr_local_load_location(expr: &InstrTyped) -> Option<LocalLocation> {
+    match expr {
+        InstrTyped::Load(op) => op.name.local_location(),
+        _ => None,
+    }
 }
 
 pub fn refresh_typed_function_value_facts(
@@ -353,10 +360,7 @@ pub fn refresh_typed_function_value_facts(
 fn infer_typed_instr_result_facts(expr: &InstrTyped) -> Option<ValueFacts> {
     match expr {
         InstrTyped::Truthy(_) => Some(ValueFacts::Bool(BoolFacts)),
-        InstrTyped::Load(op) => op
-            .extra()
-            .result_facts()
-            .or(Some(ValueFacts::unknown_pyobj())),
+        InstrTyped::Load(op) => Some(typed_load_result_facts(op)),
         InstrTyped::BinOp(op) => value_facts::infer_binop_result_facts(
             op.kind,
             op.left.result_facts()?,
@@ -388,6 +392,22 @@ fn infer_typed_instr_result_facts(expr: &InstrTyped) -> Option<ValueFacts> {
         | InstrTyped::Del(_) => Some(ValueFacts::PyObj(PyObjFacts::none_singleton())),
         _ => expr.typed_extra().map(|_| ValueFacts::unknown_pyobj()),
     }
+}
+
+fn typed_load_result_facts(op: &Load<InstrTyped>) -> ValueFacts {
+    if let Some(index) = op.name.location.as_constant() {
+        let py_facts = op
+            .extra()
+            .result_facts()
+            .and_then(ValueFacts::as_pyobj)
+            .unwrap_or_else(PyObjFacts::unknown)
+            .with_module_constant(index)
+            .with_immortal_refcount();
+        return ValueFacts::PyObj(py_facts);
+    }
+    op.extra()
+        .result_facts()
+        .unwrap_or_else(ValueFacts::unknown_pyobj)
 }
 
 fn infer_typed_call_result_facts(
@@ -2373,6 +2393,71 @@ mod typed_codegen_tests {
         assert!(refresh_typed_function_value_facts(function) > 0);
         validate_typed_function_value_facts(function)
             .expect("refreshed typed function should validate");
+    }
+
+    #[test]
+    fn refresh_typed_function_value_facts_recovers_module_constant_immortal_facts() {
+        struct FirstConstantLoadFactForcer {
+            forced: bool,
+        }
+
+        impl VisitMut<InstrTyped> for FirstConstantLoadFactForcer {
+            fn visit_instr_mut(&mut self, expr: &mut InstrTyped) {
+                if !self.forced {
+                    if let InstrTyped::Load(op) = expr
+                        && op.name.location.as_constant().is_some()
+                    {
+                        self.forced = op
+                            .extra_mut()
+                            .refine_result_facts(ValueFacts::unknown_pyobj());
+                        return;
+                    }
+                }
+                expr.visit_children_mut(self);
+            }
+        }
+
+        struct FirstConstantLoadFacts {
+            facts: Option<ValueFacts>,
+        }
+
+        impl Visit<InstrTyped> for FirstConstantLoadFacts {
+            fn visit_instr(&mut self, expr: &InstrTyped) {
+                if self.facts.is_none()
+                    && let InstrTyped::Load(op) = expr
+                    && op.name.location.as_constant().is_some()
+                {
+                    self.facts = op.extra().result_facts();
+                    return;
+                }
+                expr.visit_children(self);
+            }
+        }
+
+        let lowered =
+            soac_lowering::lower_python_to_blockpy_for_testing("def f():\n    return 'field'\n")
+                .expect("source should lower");
+        let facts = infer_module_value_facts(&lowered.blockpy_module);
+        let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
+        let function = typed_function_by_qualname_mut(&mut typed, "f");
+
+        annotate_typed_function_value_facts(function, &facts);
+        let mut forcer = FirstConstantLoadFactForcer { forced: false };
+        forcer.visit_fn_mut(function);
+        assert!(
+            forcer.forced,
+            "test function should contain an annotated module-constant load"
+        );
+
+        let mut before = FirstConstantLoadFacts { facts: None };
+        before.visit_fn(function);
+        assert!(matches!(before.facts, Some(ValueFacts::PyObj(py)) if !py.is_immortal()));
+
+        assert!(refresh_typed_function_value_facts(function) > 0);
+
+        let mut after = FirstConstantLoadFacts { facts: None };
+        after.visit_fn(function);
+        assert!(matches!(after.facts, Some(ValueFacts::PyObj(py)) if py.is_immortal()));
     }
 
     #[test]

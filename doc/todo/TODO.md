@@ -12,6 +12,8 @@
  * Remove global state use in `reset_lowering_state`.
  * Audit `panic!` and `unreachable!` usage.
  * Audit remaining uses of the `blockpy`/`block_py` name for consistency after IR crate extraction.
+ * Audit all compiler/runtime special names and fill out `doc/SPECIAL_NAMES.md`, including each name's producer,
+   consumer contract, collision/visibility story, and whether any prefix checks should become structured IR facts.
  * Revisit effect-only setitem lowering as a general result-demand/runtime-helper design instead of exact-list codegen special cases.
  * Track slow CPython fast-suite cases that pass with longer timeouts, including `test_dataclasses` and `test_bytes -m test_count`.
  * If Python blocks on a queued background function compilation, steal the queued job and run it

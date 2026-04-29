@@ -22,7 +22,8 @@ where
                 context.fresh("augassign_value"),
                 E::from_lowered_expr(InstrRuff::ExprName(load_name)),
             );
-            let rhs = crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_setup(
+            let rhs = crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_context(
+                context,
                 (*stmt.value).clone(),
                 out,
                 loop_ctx,
@@ -47,7 +48,7 @@ where
         InstrRuff::ExprAttribute(target) => {
             let target_meta = target.meta();
             let object_value =
-                lower_target_object_with_setup((*target.value).clone(), out, loop_ctx)?;
+                lower_target_object_with_setup(context, (*target.value).clone(), out, loop_ctx)?;
             let object_temp = bind_temp(out, context.fresh("augassign_obj"), object_value);
             let current_value = bind_temp(
                 out,
@@ -59,7 +60,8 @@ where
                     target.attr.to_string(),
                 ),
             );
-            let rhs = crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_setup(
+            let rhs = crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_context(
+                context,
                 (*stmt.value).clone(),
                 out,
                 loop_ctx,
@@ -83,10 +85,11 @@ where
         InstrRuff::ExprSubscript(target) => {
             let target_meta = target.meta();
             let object_value =
-                lower_target_object_with_setup((*target.value).clone(), out, loop_ctx)?;
+                lower_target_object_with_setup(context, (*target.value).clone(), out, loop_ctx)?;
             let object_temp = bind_temp(out, context.fresh("augassign_obj"), object_value);
             let index_value =
-                crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_setup(
+                crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_context(
+                    context,
                     (*target.slice).clone(),
                     out,
                     loop_ctx,
@@ -102,7 +105,8 @@ where
                     index_temp.clone(),
                 ),
             );
-            let rhs = crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_setup(
+            let rhs = crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_context(
+                context,
                 (*stmt.value).clone(),
                 out,
                 loop_ctx,

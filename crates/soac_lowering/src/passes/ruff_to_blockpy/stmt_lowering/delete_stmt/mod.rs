@@ -15,10 +15,12 @@ where
     match target {
         InstrRuff::ExprSubscript(target) => {
             let meta = target.meta();
-            let object_value = lower_target_object_with_setup(*target.value, out, loop_ctx)?;
+            let object_value =
+                lower_target_object_with_setup(context, *target.value, out, loop_ctx)?;
             let object_temp = bind_temp(out, context.fresh("delete_obj"), object_value);
             let index_value =
-                crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_setup(
+                crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_context(
+                    context,
                     *target.slice,
                     out,
                     loop_ctx,
@@ -34,7 +36,8 @@ where
         }
         InstrRuff::ExprAttribute(target) => {
             let target_meta = target.meta();
-            let object_value = lower_target_object_with_setup(*target.value, out, loop_ctx)?;
+            let object_value =
+                lower_target_object_with_setup(context, *target.value, out, loop_ctx)?;
             let object_temp = bind_temp(out, context.fresh("delete_obj"), object_value);
             let attr_expr: E = E::from_lowered_expr(crate::passes::ast_to_instr::from_ast_expr(
                 Expr::from(py_expr!("{attr:literal}", attr = target.attr.as_str())),

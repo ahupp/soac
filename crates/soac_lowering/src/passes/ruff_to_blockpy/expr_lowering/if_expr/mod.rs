@@ -1,5 +1,5 @@
 use super::{BlockPySetupExprLowerer, RuffToBlockPyExpr};
-use crate::block_py::{BlockTerm, Meta, Store, TermIf, WithMeta};
+use crate::block_py::{BlockTerm, Meta, Store, TermIf, TermRaise, WithMeta};
 use crate::passes::ruff_to_blockpy::expr_lowering::fresh_setup_name;
 use crate::passes::ruff_to_blockpy::{InlineFragment, LoopContext, LoweredExpr};
 use crate::passes::InstrRuff;
@@ -171,6 +171,164 @@ where
     let setup_entry = deps.remove(setup_entry_index);
 
     Some(Ok(InlineFragment::new(setup_entry, deps)))
+}
+
+pub(crate) fn try_lower_if_expr_raise_direct<L, E>(
+    lowerer: &L,
+    name_gen: &crate::block_py::FunctionNameGen,
+    if_expr: crate::block_py::ExprIf<InstrRuff>,
+    loop_ctx: Option<&LoopContext>,
+) -> Option<Result<InlineFragment<E>, String>>
+where
+    L: BlockPySetupExprLowerer + ?Sized,
+    E: RuffToBlockPyExpr,
+{
+    let crate::block_py::ExprIf {
+        test, body, orelse, ..
+    } = if_expr;
+    let bridge = crate::passes::ruff_to_blockpy::stmt_lowering::StructuredLoweringBridge::new();
+    let Some(test_setup) = bridge.try_lower_inline_value::<E, InstrRuff>(name_gen, |structured| {
+        lowerer.lower_expr_instr_into(*test.clone(), structured, loop_ctx)
+    }) else {
+        return None;
+    };
+    let (mut entry, test) = match test_setup {
+        Ok(value) => value,
+        Err(err) => return Some(Err(err)),
+    };
+
+    let Some(body_setup) = bridge.try_lower_inline_value::<E, InstrRuff>(name_gen, |structured| {
+        lowerer.lower_expr_instr_into(*body.clone(), structured, loop_ctx)
+    }) else {
+        return None;
+    };
+    let (mut body_entry, body_value) = match body_setup {
+        Ok(value) => value,
+        Err(err) => return Some(Err(err)),
+    };
+    body_entry.set_term(BlockTerm::Raise(TermRaise {
+        exc: Some(E::from_lowered_expr(body_value)),
+    }));
+
+    let Some(orelse_setup) = bridge
+        .try_lower_inline_value::<E, InstrRuff>(name_gen, |structured| {
+            lowerer.lower_expr_instr_into(*orelse.clone(), structured, loop_ctx)
+        })
+    else {
+        return None;
+    };
+    let (mut orelse_entry, orelse_value) = match orelse_setup {
+        Ok(value) => value,
+        Err(err) => return Some(Err(err)),
+    };
+    orelse_entry.set_term(BlockTerm::Raise(TermRaise {
+        exc: Some(E::from_lowered_expr(orelse_value)),
+    }));
+
+    let then_label = body_entry.entry_ref().label();
+    let else_label = orelse_entry.entry_ref().label();
+    entry.set_term(BlockTerm::IfTerm(TermIf {
+        test: E::from_lowered_expr(test),
+        then_label,
+        else_label,
+    }));
+
+    let (setup_entry_ref, mut deps) = entry.finish_blocks();
+    let (_, mut body_blocks) = body_entry.finish_blocks();
+    let (_, mut orelse_blocks) = orelse_entry.finish_blocks();
+    deps.append(&mut body_blocks);
+    deps.append(&mut orelse_blocks);
+    let setup_entry_index = deps
+        .iter()
+        .position(|block| block.label == setup_entry_ref.label())
+        .expect("if-expression raise setup entry label should be present in assembled blocks");
+    let setup_entry = deps.remove(setup_entry_index);
+
+    Some(Ok(InlineFragment::new(setup_entry, deps)))
+}
+
+pub(crate) fn try_lower_if_expr_branch_direct<L, E>(
+    lowerer: &L,
+    name_gen: &crate::block_py::FunctionNameGen,
+    if_expr: crate::block_py::ExprIf<InstrRuff>,
+    then_label: crate::block_py::BlockLabel,
+    else_label: crate::block_py::BlockLabel,
+    loop_ctx: Option<&LoopContext>,
+) -> Option<Result<InlineFragment<E>, String>>
+where
+    L: BlockPySetupExprLowerer + ?Sized,
+    E: RuffToBlockPyExpr,
+{
+    let crate::block_py::ExprIf {
+        test, body, orelse, ..
+    } = if_expr;
+    let bridge = crate::passes::ruff_to_blockpy::stmt_lowering::StructuredLoweringBridge::new();
+    let Some(test_setup) = bridge.try_lower_inline_value::<E, InstrRuff>(name_gen, |structured| {
+        lowerer.lower_expr_instr_into(*test.clone(), structured, loop_ctx)
+    }) else {
+        return None;
+    };
+    let (mut entry, test) = match test_setup {
+        Ok(value) => value,
+        Err(err) => return Some(Err(err)),
+    };
+
+    let Some(body_setup) = bridge.try_lower_inline_value::<E, InstrRuff>(name_gen, |structured| {
+        lowerer.lower_expr_instr_into(*body.clone(), structured, loop_ctx)
+    }) else {
+        return None;
+    };
+    let (mut body_entry, body_value) = match body_setup {
+        Ok(value) => value,
+        Err(err) => return Some(Err(err)),
+    };
+    body_entry.set_term(BlockTerm::IfTerm(TermIf {
+        test: E::from_lowered_expr(body_value),
+        then_label: then_label.clone(),
+        else_label: else_label.clone(),
+    }));
+
+    let Some(orelse_setup) = bridge
+        .try_lower_inline_value::<E, InstrRuff>(name_gen, |structured| {
+            lowerer.lower_expr_instr_into(*orelse.clone(), structured, loop_ctx)
+        })
+    else {
+        return None;
+    };
+    let (mut orelse_entry, orelse_value) = match orelse_setup {
+        Ok(value) => value,
+        Err(err) => return Some(Err(err)),
+    };
+    orelse_entry.set_term(BlockTerm::IfTerm(TermIf {
+        test: E::from_lowered_expr(orelse_value),
+        then_label: then_label.clone(),
+        else_label: else_label.clone(),
+    }));
+
+    let body_label = body_entry.entry_ref().label();
+    let orelse_label = orelse_entry.entry_ref().label();
+    entry.set_term(BlockTerm::IfTerm(TermIf {
+        test: E::from_lowered_expr(test),
+        then_label: body_label,
+        else_label: orelse_label,
+    }));
+
+    let (setup_entry_ref, mut deps) = entry.finish_blocks();
+    let (_, mut body_blocks) = body_entry.finish_blocks();
+    let (_, mut orelse_blocks) = orelse_entry.finish_blocks();
+    deps.append(&mut body_blocks);
+    deps.append(&mut orelse_blocks);
+    let setup_entry_index = deps
+        .iter()
+        .position(|block| block.label == setup_entry_ref.label())
+        .expect("if-expression branch setup entry label should be present in assembled blocks");
+    let setup_entry = deps.remove(setup_entry_index);
+
+    Some(Ok(InlineFragment::new_with_external_targets(
+        setup_entry,
+        deps,
+        &[then_label, else_label],
+    )))
 }
 
 pub(super) fn lower_if_expr_into<L, E>(

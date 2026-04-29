@@ -4474,7 +4474,7 @@ def build(values):
 
         assert_eq!(
             typed_planned_result_for_instr_id(&typed_function, arg_instr_id),
-            Some(PlannedResult::PYOBJECT_BORROWED_LOCAL)
+            Some(PlannedResult::pyobject_borrowed_local(LocalLocation(0)))
         );
     }
 
@@ -4535,7 +4535,7 @@ def build(values):
         );
         assert_eq!(
             truthy.value().planned_result(),
-            Some(PlannedResult::PYOBJECT_BORROWED_LOCAL)
+            Some(PlannedResult::pyobject_borrowed_local(LocalLocation(0)))
         );
     }
 
@@ -5141,12 +5141,12 @@ def build(values):
         );
         assert_eq!(
             typed_planned_result_for_instr_id(&typed_function, return_instr_id),
-            Some(PlannedResult::PYOBJECT_BORROWED_LOCAL)
+            Some(PlannedResult::pyobject_borrowed_local(LocalLocation(0)))
         );
     }
 
     #[test]
-    fn typed_result_demand_extra_marks_raise_values_pyobject_owned() {
+    fn typed_result_demand_extra_marks_raise_values_pyobject_borrowed_ok() {
         let mut constants = TestConstantPool::default();
         let raise_instr_id = InstrId::new(0);
         let function = with_single_test_block(
@@ -5161,7 +5161,31 @@ def build(values):
 
         assert_eq!(
             typed_demand_for_instr_id(&typed_function, raise_instr_id),
-            Some(ResultDemand::PYOBJECT_OWNED)
+            Some(ResultDemand::PYOBJECT_BORROWED_OK)
+        );
+    }
+
+    #[test]
+    fn typed_planned_result_extra_keeps_raise_local_borrowed() {
+        let raise_instr_id = InstrId::new(0);
+        let mut function = with_single_test_block(
+            test_function(),
+            vec![],
+            BlockTerm::Raise(soac_core::block_py::TermRaise {
+                exc: Some(with_instr_id(name_expr(test_name("x")), raise_instr_id)),
+            }),
+        );
+        set_stack_slots(&mut function, &["x"]);
+        let typed_function = lower_blockpy_function_to_typed(function);
+        let typed_function = annotate_test_result_demands_and_plans(typed_function);
+
+        assert_eq!(
+            typed_demand_for_instr_id(&typed_function, raise_instr_id),
+            Some(ResultDemand::PYOBJECT_BORROWED_OK)
+        );
+        assert_eq!(
+            typed_planned_result_for_instr_id(&typed_function, raise_instr_id),
+            Some(PlannedResult::pyobject_borrowed_local(LocalLocation(0)))
         );
     }
 
@@ -5381,6 +5405,8 @@ def build(values):
 
         let mut refcount_signature = jit_module.make_signature();
         refcount_signature.params.push(ir::AbiParam::new(ptr_ty));
+        refcount_signature.params.push(ir::AbiParam::new(ptr_ty));
+        refcount_signature.params.push(ir::AbiParam::new(ptr_ty));
 
         let mut wrapper_signature = jit_module.make_signature();
         wrapper_signature.params.push(ir::AbiParam::new(ptr_ty));
@@ -5590,7 +5616,7 @@ def build(values):
             cleanup_root_names: HashSet::new(),
         };
         let mut extra = TypedInstrExtra::default();
-        extra.set_planned_result(PlannedResult::PYOBJECT_BORROWED_LOCAL);
+        extra.set_planned_result(PlannedResult::pyobject_borrowed_local(LocalLocation(0)));
         let expr = InstrTyped::Load(Load::<InstrTyped>::new(test_name("x")).with_extra(extra));
 
         assert_eq!(
@@ -5606,6 +5632,20 @@ def build(values):
             typed_expr_planned_pyobject_input_is_borrowed_from_local_env(
                 &expr,
                 &LocalEnv::default(),
+                &stack_slots,
+                None,
+            ),
+            Some(false)
+        );
+        let mut mismatched_extra = TypedInstrExtra::default();
+        mismatched_extra
+            .set_planned_result(PlannedResult::pyobject_borrowed_local(LocalLocation(1)));
+        let mismatched_expr =
+            InstrTyped::Load(Load::<InstrTyped>::new(test_name("x")).with_extra(mismatched_extra));
+        assert_eq!(
+            typed_expr_planned_pyobject_input_is_borrowed_from_local_env(
+                &mismatched_expr,
+                &env,
                 &stack_slots,
                 None,
             ),
@@ -5678,7 +5718,7 @@ def build(values):
         };
 
         let mut borrowed_extra = TypedInstrExtra::default();
-        borrowed_extra.set_planned_result(PlannedResult::PYOBJECT_BORROWED_LOCAL);
+        borrowed_extra.set_planned_result(PlannedResult::pyobject_borrowed_local(LocalLocation(0)));
         let borrowed_expr =
             InstrTyped::Load(Load::<InstrTyped>::new(test_name("x")).with_extra(borrowed_extra));
         assert_eq!(
@@ -5690,6 +5730,21 @@ def build(values):
                 ResultDemand::PYOBJECT_BORROWED_OK,
             ),
             Some((ValueOwnership::Borrowed, PyObjFacts::unknown()))
+        );
+        let mut mismatched_extra = TypedInstrExtra::default();
+        mismatched_extra
+            .set_planned_result(PlannedResult::pyobject_borrowed_local(LocalLocation(1)));
+        let mismatched_expr =
+            InstrTyped::Load(Load::<InstrTyped>::new(test_name("x")).with_extra(mismatched_extra));
+        assert_eq!(
+            typed_local_load_direct_result_plan(
+                &mismatched_expr,
+                &env,
+                &stack_slots,
+                None,
+                ResultDemand::PYOBJECT_BORROWED_OK,
+            ),
+            None
         );
         assert_eq!(
             typed_local_load_direct_result_plan(
@@ -6114,6 +6169,233 @@ def build(values):
         assert!(
             !rendered.contains("stack_store") && !rendered.contains("stack_load"),
             "deleting a local-only slot-backed binding should not touch the stack slot:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn local_env_move_local_only_generated_temp_transfers_source_ownership() {
+        let compile_session = crate::session::CompileSession::new();
+        let mut jit_module =
+            new_jit_module(&compile_session).expect("test jit module should construct");
+        let ptr_ty = jit_module.target_config().pointer_type();
+
+        let mut refcount_signature = jit_module.make_signature();
+        refcount_signature.params.push(ir::AbiParam::new(ptr_ty));
+
+        let mut wrapper_signature = jit_module.make_signature();
+        wrapper_signature.params.push(ir::AbiParam::new(ptr_ty));
+        wrapper_signature.params.push(ir::AbiParam::new(ptr_ty));
+        wrapper_signature.returns.push(ir::AbiParam::new(ptr_ty));
+
+        let wrapper_id = declare_local_fn(
+            &mut jit_module,
+            "local_env_move_local_only_test",
+            &wrapper_signature,
+        )
+        .expect("wrapper function should declare");
+        let decref_id = declare_local_fn(
+            &mut jit_module,
+            "local_env_move_local_only_test_decref",
+            &refcount_signature,
+        )
+        .expect("decref helper should declare");
+
+        let mut ctx = jit_module.make_context();
+        ctx.func.name = ir::UserFuncName::user(0, wrapper_id.as_u32());
+        ctx.func.signature = wrapper_signature;
+
+        let mut env = LocalEnv::default();
+        let mut builder_ctx = FunctionBuilderContext::new();
+        {
+            let mut fb = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
+            let entry = fb.create_block();
+            fb.append_block_params_for_function_params(entry);
+            fb.switch_to_block(entry);
+            fb.seal_block(entry);
+
+            let old_target = fb.block_params(entry)[0];
+            let temp_value = fb.block_params(entry)[1];
+            let null_tstate = fb.ins().iconst(ptr_ty, 0);
+            let decref_ref = jit_module.declare_func_in_func(decref_id, &mut fb.func);
+            let stack_slots = StackSlots::new(&mut fb, &[], &HashSet::new());
+            env.bind_entry_location_with_aliases(
+                LocalLocation(0),
+                "target",
+                Vec::new(),
+                old_target,
+                LocalRefKind::Owned,
+                LocalEnvStorage::LocalOnly,
+                ParamBindingFacts::DefinitelyBound,
+                None,
+            );
+            env.bind_entry_location_with_aliases(
+                LocalLocation(1),
+                "_dp_tmp_1",
+                Vec::new(),
+                temp_value,
+                LocalRefKind::Owned,
+                LocalEnvStorage::LocalOnly,
+                ParamBindingFacts::DefinitelyBound,
+                None,
+            );
+
+            assert!(env.move_location_to_location(
+                &mut fb,
+                LocalLocation(1),
+                "_dp_tmp_1",
+                LocalLocation(0),
+                "target",
+                None,
+                true,
+                CleanupRootSlotState::MaybeOwnedReference,
+                CleanupRootSlotState::MaybeOwnedReference,
+                &stack_slots,
+                ptr_ty,
+                null_tstate,
+                decref_ref,
+            ));
+            fb.ins().return_(&[temp_value]);
+            fb.seal_all_blocks();
+            fb.finalize();
+        }
+
+        let rendered = ctx.func.display().to_string();
+        let target = env
+            .entries
+            .iter()
+            .find(|entry| entry.name == "target")
+            .expect("target entry should remain");
+        assert_eq!(target.location, Some(LocalLocation(0)));
+        assert_eq!(target.ref_kind, LocalRefKind::Owned);
+        assert_eq!(target.storage, LocalEnvStorage::LocalOnly);
+        let temp = env
+            .entries
+            .iter()
+            .find(|entry| entry.name == "_dp_tmp_1")
+            .expect("source temp should remain as an unbound local");
+        assert_eq!(temp.location, Some(LocalLocation(1)));
+        assert_eq!(temp.ref_kind, LocalRefKind::Unbound);
+        assert_eq!(rendered.matches("call").count(), 1, "{rendered}");
+    }
+
+    #[test]
+    fn local_env_move_stack_mirror_generated_temp_transfers_slot_ownership() {
+        let compile_session = crate::session::CompileSession::new();
+        let mut jit_module =
+            new_jit_module(&compile_session).expect("test jit module should construct");
+        let ptr_ty = jit_module.target_config().pointer_type();
+
+        let mut refcount_signature = jit_module.make_signature();
+        refcount_signature.params.push(ir::AbiParam::new(ptr_ty));
+        refcount_signature.params.push(ir::AbiParam::new(ptr_ty));
+
+        let mut wrapper_signature = jit_module.make_signature();
+        wrapper_signature.params.push(ir::AbiParam::new(ptr_ty));
+        wrapper_signature.params.push(ir::AbiParam::new(ptr_ty));
+        wrapper_signature.returns.push(ir::AbiParam::new(ptr_ty));
+
+        let wrapper_id = declare_local_fn(
+            &mut jit_module,
+            "local_env_move_stack_mirror_test",
+            &wrapper_signature,
+        )
+        .expect("wrapper function should declare");
+        let decref_id = declare_local_fn(
+            &mut jit_module,
+            "local_env_move_stack_mirror_test_decref",
+            &refcount_signature,
+        )
+        .expect("decref helper should declare");
+
+        let mut ctx = jit_module.make_context();
+        ctx.func.name = ir::UserFuncName::user(0, wrapper_id.as_u32());
+        ctx.func.signature = wrapper_signature;
+
+        let mut env = LocalEnv::default();
+        let mut builder_ctx = FunctionBuilderContext::new();
+        {
+            let mut fb = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
+            let entry = fb.create_block();
+            fb.append_block_params_for_function_params(entry);
+            fb.switch_to_block(entry);
+            fb.seal_block(entry);
+
+            let old_target = fb.block_params(entry)[0];
+            let temp_value = fb.block_params(entry)[1];
+            let null_tstate = fb.ins().iconst(ptr_ty, 0);
+            let decref_ref = jit_module.declare_func_in_func(decref_id, &mut fb.func);
+            let slot_names = vec!["target".to_string(), "_dp_tmp_1".to_string()];
+            let cleanup_root_names = HashSet::from(["target".to_string(), "_dp_tmp_1".to_string()]);
+            let stack_slots = StackSlots::new(&mut fb, &slot_names, &cleanup_root_names);
+            fb.ins()
+                .stack_store(old_target, stack_slots.slot_for_name("target").unwrap(), 0);
+            fb.ins().stack_store(
+                temp_value,
+                stack_slots.slot_for_name("_dp_tmp_1").unwrap(),
+                0,
+            );
+            env.bind_entry_location_with_aliases(
+                LocalLocation(0),
+                "target",
+                Vec::new(),
+                old_target,
+                LocalRefKind::Borrowed,
+                LocalEnvStorage::StackMirror,
+                ParamBindingFacts::DefinitelyBound,
+                None,
+            );
+            env.bind_entry_location_with_aliases(
+                LocalLocation(1),
+                "_dp_tmp_1",
+                Vec::new(),
+                temp_value,
+                LocalRefKind::Borrowed,
+                LocalEnvStorage::StackMirror,
+                ParamBindingFacts::DefinitelyBound,
+                None,
+            );
+
+            assert!(env.move_location_to_location(
+                &mut fb,
+                LocalLocation(1),
+                "_dp_tmp_1",
+                LocalLocation(0),
+                "target",
+                None,
+                true,
+                CleanupRootSlotState::MaybeOwnedReference,
+                CleanupRootSlotState::MaybeOwnedReference,
+                &stack_slots,
+                ptr_ty,
+                null_tstate,
+                decref_ref,
+            ));
+            fb.ins().return_(&[temp_value]);
+            fb.seal_all_blocks();
+            fb.finalize();
+        }
+
+        let rendered = ctx.func.display().to_string();
+        let target = env
+            .entries
+            .iter()
+            .find(|entry| entry.name == "target")
+            .expect("target entry should remain");
+        assert_eq!(target.location, Some(LocalLocation(0)));
+        assert_eq!(target.ref_kind, LocalRefKind::Borrowed);
+        assert_eq!(target.storage, LocalEnvStorage::StackMirror);
+        let temp = env
+            .entries
+            .iter()
+            .find(|entry| entry.name == "_dp_tmp_1")
+            .expect("source temp should remain as an unbound local");
+        assert_eq!(temp.location, Some(LocalLocation(1)));
+        assert_eq!(temp.ref_kind, LocalRefKind::Unbound);
+        assert_eq!(temp.storage, LocalEnvStorage::StackMirror);
+        assert_eq!(
+            rendered.matches("call").count(),
+            1,
+            "only the overwritten target slot should be decrefed: {rendered}"
         );
     }
 

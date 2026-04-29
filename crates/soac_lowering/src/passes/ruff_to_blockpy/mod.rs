@@ -1,10 +1,10 @@
 use crate::block_py::cfg::{
     fold_jumps_to_trivial_return_blockpy, prune_unreachable_blockpy_blocks,
 };
-use crate::block_py::ParamSpec;
 use crate::block_py::{
-    Block, BlockBuilder, BlockEdge, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm,
-    CallableScopeInfo, FunctionExecutionMode, FunctionKind, FunctionName, FunctionNameGen, Instr,
+    BindingKind, BindingPurpose, BindingTarget, Block, BlockBuilder, BlockEdge, BlockLabel,
+    BlockPyFunction, BlockPyModule, BlockTerm, CallableScopeInfo, FunctionExecutionMode,
+    FunctionKind, FunctionName, FunctionNameGen, Instr, ParamSpec, ScopeExprNode,
 };
 use crate::namegen::fresh_name;
 use crate::passes::ast_to_ast::context::Context;
@@ -14,7 +14,7 @@ use crate::ruff_ast::ruff_ast_to_string;
 use crate::template::is_simple;
 use crate::template::{py_expr, py_stmt};
 use ruff_python_ast::{self as ast, Expr, Stmt};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 mod bb_shape;
 mod compat;
 pub(crate) mod expr_lowering;
@@ -269,12 +269,20 @@ pub(crate) struct InlineFragment<I: Instr> {
 
 impl<I: Instr> InlineFragment<I> {
     pub(crate) fn new(entry: Block<I>, deps: Vec<Block<I>>) -> Self {
+        Self::new_with_external_targets(entry, deps, &[])
+    }
+
+    pub(crate) fn new_with_external_targets(
+        entry: Block<I>,
+        deps: Vec<Block<I>>,
+        external_targets: &[BlockLabel],
+    ) -> Self {
         let fragment = Self { entry, deps };
-        fragment.assert_well_formed();
+        fragment.assert_well_formed(external_targets);
         fragment
     }
 
-    fn assert_well_formed(&self) {
+    fn assert_well_formed(&self, external_targets: &[BlockLabel]) {
         use std::collections::HashSet;
 
         assert!(
@@ -316,6 +324,7 @@ impl<I: Instr> InlineFragment<I> {
 
         fn assert_target_present(
             labels: &HashSet<BlockLabel>,
+            external_targets: &[BlockLabel],
             block_summaries: &[String],
             source: BlockLabel,
             target: BlockLabel,
@@ -324,7 +333,9 @@ impl<I: Instr> InlineFragment<I> {
             let mut sorted_labels = labels.iter().copied().collect::<Vec<_>>();
             sorted_labels.sort();
             assert!(
-                target.is_fallthrough() || labels.contains(&target),
+                target.is_fallthrough()
+                    || labels.contains(&target)
+                    || external_targets.contains(&target),
                 "inline fragment block {} has {} target {} outside fragment; labels={:?}; blocks={:?}",
                 source,
                 kind,
@@ -339,6 +350,7 @@ impl<I: Instr> InlineFragment<I> {
                 BlockTerm::Jump(edge) => {
                     assert_target_present(
                         &labels,
+                        external_targets,
                         &block_summaries,
                         block.label,
                         edge.target,
@@ -348,6 +360,7 @@ impl<I: Instr> InlineFragment<I> {
                 BlockTerm::IfTerm(if_term) => {
                     assert_target_present(
                         &labels,
+                        external_targets,
                         &block_summaries,
                         block.label,
                         if_term.then_label,
@@ -355,6 +368,7 @@ impl<I: Instr> InlineFragment<I> {
                     );
                     assert_target_present(
                         &labels,
+                        external_targets,
                         &block_summaries,
                         block.label,
                         if_term.else_label,
@@ -365,6 +379,7 @@ impl<I: Instr> InlineFragment<I> {
                     for target in &branch.targets {
                         assert_target_present(
                             &labels,
+                            external_targets,
                             &block_summaries,
                             block.label,
                             *target,
@@ -373,6 +388,7 @@ impl<I: Instr> InlineFragment<I> {
                     }
                     assert_target_present(
                         &labels,
+                        external_targets,
                         &block_summaries,
                         block.label,
                         branch.default_label,
@@ -384,6 +400,7 @@ impl<I: Instr> InlineFragment<I> {
             if let Some(edge) = &block.exc_edge {
                 assert_target_present(
                     &labels,
+                    external_targets,
                     &block_summaries,
                     block.label,
                     edge.target,
@@ -485,6 +502,18 @@ pub(crate) fn build_core_blockpy_callable_def_from_runtime_input(
     let function_id = name_gen.function_id();
     let execution_mode = default_execution_mode_for_function(&names);
     let mut blocks = Vec::new();
+    let value_forwarding_locals = if matches!(blockpy_kind, FunctionKind::Function) {
+        value_forwarding_local_names(&params, scope)
+    } else {
+        HashSet::new()
+    };
+    let no_raise_locals = if matches!(blockpy_kind, FunctionKind::Function) {
+        no_raise_parameter_local_names(&params, scope, runtime_input_body)
+    } else {
+        HashSet::new()
+    };
+    context.push_value_forwarding_locals(value_forwarding_locals);
+    context.push_no_raise_locals(no_raise_locals);
     let entry_label = lower_stmt_sequence_with_state::<crate::block_py::InstrWithAwaitAndYield>(
         context,
         runtime_input_body,
@@ -492,6 +521,8 @@ pub(crate) fn build_core_blockpy_callable_def_from_runtime_input(
         &mut blocks,
         &name_gen,
     );
+    context.pop_no_raise_locals();
+    context.pop_value_forwarding_locals();
     move_entry_block_to_front(&mut blocks, entry_label.clone());
     let needs_end_block = entry_label == end_label
         || blocks
@@ -529,6 +560,36 @@ pub(crate) fn build_core_blockpy_callable_def_from_runtime_input(
         storage_layout: None,
         scope: scope.clone(),
     }
+}
+
+fn value_forwarding_local_names(params: &ParamSpec, scope: &CallableScopeInfo) -> HashSet<String> {
+    let mut names = params.names().into_iter().collect::<HashSet<_>>();
+    names.extend(scope.local_defs.iter().cloned());
+    names.retain(|name| {
+        scope.resolved_load_binding_kind(name) == BindingKind::Local
+            && scope.binding_target_for_name(name, BindingPurpose::Load) == BindingTarget::Local
+    });
+    names
+}
+
+fn no_raise_parameter_local_names(
+    params: &ParamSpec,
+    scope: &CallableScopeInfo,
+    body: &[InstrRuff],
+) -> HashSet<String> {
+    let mut names = params.names().into_iter().collect::<HashSet<_>>();
+    let mut deleted = HashSet::new();
+    for stmt in body {
+        stmt.walk_root_deleted_names(&mut |name| {
+            deleted.insert(name.to_string());
+        });
+    }
+    names.retain(|name| {
+        !deleted.contains(name.as_str())
+            && scope.resolved_load_binding_kind(name) == BindingKind::Local
+            && scope.binding_target_for_name(name, BindingPurpose::Load) == BindingTarget::Local
+    });
+    names
 }
 
 fn default_execution_mode_for_function(names: &FunctionName) -> FunctionExecutionMode {

@@ -40,6 +40,8 @@ impl ScopeFrame {
 pub(crate) struct Context {
     pub source: String,
     scope_stack: RefCell<Vec<ScopeFrame>>,
+    value_forwarding_local_stack: RefCell<Vec<HashSet<String>>>,
+    no_raise_local_stack: RefCell<Vec<HashSet<String>>>,
 }
 
 impl Context {
@@ -47,6 +49,8 @@ impl Context {
         Self {
             source: source.to_string(),
             scope_stack: RefCell::new(vec![ScopeFrame::module()]),
+            value_forwarding_local_stack: RefCell::new(vec![HashSet::new()]),
+            no_raise_local_stack: RefCell::new(vec![HashSet::new()]),
         }
     }
 
@@ -76,5 +80,37 @@ impl Context {
             .last()
             .cloned()
             .unwrap_or_else(ScopeFrame::module)
+    }
+
+    pub(crate) fn push_value_forwarding_locals(&self, names: HashSet<String>) {
+        self.value_forwarding_local_stack.borrow_mut().push(names);
+    }
+
+    pub(crate) fn pop_value_forwarding_locals(&self) {
+        self.value_forwarding_local_stack.borrow_mut().pop();
+    }
+
+    pub(crate) fn current_value_forwarding_locals(&self) -> HashSet<String> {
+        self.value_forwarding_local_stack
+            .borrow()
+            .last()
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn push_no_raise_locals(&self, names: HashSet<String>) {
+        self.no_raise_local_stack.borrow_mut().push(names);
+    }
+
+    pub(crate) fn pop_no_raise_locals(&self) {
+        self.no_raise_local_stack.borrow_mut().pop();
+    }
+
+    pub(crate) fn current_no_raise_locals(&self) -> HashSet<String> {
+        self.no_raise_local_stack
+            .borrow()
+            .last()
+            .cloned()
+            .unwrap_or_default()
     }
 }

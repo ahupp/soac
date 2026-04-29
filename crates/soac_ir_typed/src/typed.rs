@@ -12,10 +12,10 @@ use soac_core::block_py::{
     BinOp, Block, BlockPyFunction, BlockPyModule, Call, CallArgKeyword, CallArgPositional,
     CallDirect, CalleeFunctionId, CellRef, ChildVisitable, ConstantExpr, Del, DelItem, GetAttr,
     GetItem, HasMeta, HasSemanticInstrId, IncrementCounter, Instr, InstrId, InstrWithConstantNone,
-    Load, MakeCell, MakeFunctionWithClosure, MapFunction, MapInstr, MapModule, Mappable, Meta,
-    ModuleShape, NameLike, PrettyPrint, PrettyPrinter, ResolvedName, RuntimeFunctionId,
-    RuntimeName, SetAttr, SetItem, Store, TryMapInstr, Tuple, UnaryOp, Visit, VisitMut, WithMeta,
-    define_instr, define_ruff_instr,
+    Load, LocalLocation, MakeCell, MakeFunctionWithClosure, MapFunction, MapInstr, MapModule,
+    Mappable, Meta, ModuleShape, NameLike, PrettyPrint, PrettyPrinter, ResolvedName,
+    RuntimeFunctionId, RuntimeName, SetAttr, SetItem, Store, TryMapInstr, Tuple, UnaryOp, Visit,
+    VisitMut, WithMeta, define_instr, define_ruff_instr,
 };
 #[allow(unused_imports)]
 use soac_ir_blockpy::{BlockPyModuleShape, InstrBlockPy};
@@ -1174,7 +1174,7 @@ impl TypedResultDemand {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TypedPyObjectOwnershipPlan {
     Owned,
-    BorrowedLocal,
+    BorrowedLocal { location: LocalLocation },
     Immortal,
 }
 
@@ -1192,14 +1192,17 @@ impl TypedPlannedResult {
     pub const PYOBJECT_OWNED: Self = Self::PyObject {
         ownership: TypedPyObjectOwnershipPlan::Owned,
     };
-    pub const PYOBJECT_BORROWED_LOCAL: Self = Self::PyObject {
-        ownership: TypedPyObjectOwnershipPlan::BorrowedLocal,
-    };
     pub const PYOBJECT_IMMORTAL: Self = Self::PyObject {
         ownership: TypedPyObjectOwnershipPlan::Immortal,
     };
     pub const I32_BOOL01: Self = Self::I32Bool01;
     pub const I64_VALUE: Self = Self::I64;
+
+    pub const fn pyobject_borrowed_local(location: LocalLocation) -> Self {
+        Self::PyObject {
+            ownership: TypedPyObjectOwnershipPlan::BorrowedLocal { location },
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

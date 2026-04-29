@@ -1,5 +1,5 @@
 use super::*;
-use crate::block_py::{BlockTerm, Expr, HasMeta, TermRaise};
+use crate::block_py::{BlockTerm, Expr, HasMeta, TermRaise, WithMeta};
 use crate::passes::ast_to_ast::ast_rewrite::Rewrite;
 use crate::passes::ast_to_ast::context::Context;
 use crate::passes::InstrRuff;
@@ -296,6 +296,9 @@ fn plan_simplified_instr_head_for_blockpy(
         .into_iter()
         .next()
         .expect("single simplified instr should exist");
+    if let Some(expanded) = expand_simple_assign_if_expr_for_blockpy(&simplified) {
+        return StmtSequenceHeadPlan::Expanded(expanded);
+    }
     match simplified {
         InstrRuff::StmtExpr(_)
         | InstrRuff::StmtPass(_)
@@ -318,6 +321,38 @@ fn plan_simplified_instr_head_for_blockpy(
         InstrRuff::StmtContinue(_) => StmtSequenceHeadPlan::Continue,
         _ => StmtSequenceHeadPlan::Unsupported,
     }
+}
+
+fn expand_simple_assign_if_expr_for_blockpy(stmt: &InstrRuff) -> Option<Vec<InstrRuff>> {
+    let InstrRuff::StmtAssign(assign) = stmt else {
+        return None;
+    };
+    let [target] = assign.targets.as_slice() else {
+        return None;
+    };
+    if !matches!(target, InstrRuff::ExprName(_)) {
+        return None;
+    }
+    let InstrRuff::ExprIf(if_expr) = assign.value.as_ref() else {
+        return None;
+    };
+
+    let then_assign =
+        crate::block_py::StmtAssign::new(vec![target.clone()], (*if_expr.body).clone())
+            .with_meta(assign.meta().clone())
+            .into();
+    let else_assign =
+        crate::block_py::StmtAssign::new(vec![target.clone()], (*if_expr.orelse).clone())
+            .with_meta(assign.meta().clone())
+            .into();
+    let expanded_if = crate::block_py::StmtIf::new(
+        (*if_expr.test).clone(),
+        vec![then_assign],
+        vec![else_assign],
+    )
+    .with_meta(if_expr.meta().clone())
+    .into();
+    Some(vec![expanded_if])
 }
 
 pub(crate) fn plan_instr_head_for_blockpy(
@@ -361,11 +396,24 @@ where
     match stmt {
         InstrRuff::StmtGlobal(_) | InstrRuff::StmtNonlocal(_) | InstrRuff::StmtPass(_) => Ok(()),
         InstrRuff::StmtExpr(stmt) => {
-            let value = crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_setup(
-                (*stmt.value).clone(),
-                out,
-                loop_ctx,
-            )?;
+            if let Some(lowered) =
+                crate::passes::ruff_to_blockpy::expr_lowering::try_lower_effect_only_expr_direct_with_context(
+                    context,
+                    (*stmt.value).clone(),
+                    out.name_gen(),
+                    loop_ctx,
+                )
+            {
+                out.append_fragment(lowered?);
+                return Ok(());
+            }
+            let value =
+                crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_context(
+                    context,
+                    (*stmt.value).clone(),
+                    out,
+                    loop_ctx,
+                )?;
             out.push_stmt(value);
             Ok(())
         }
@@ -409,11 +457,13 @@ where
             }
         }
         InstrRuff::StmtReturn(stmt) => {
-            let value = crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_setup(
-                (*stmt.value).clone(),
-                out,
-                loop_ctx,
-            )?;
+            let value =
+                crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_context(
+                    context,
+                    (*stmt.value).clone(),
+                    out,
+                    loop_ctx,
+                )?;
             out.set_term(BlockTerm::Return(value));
             Ok(())
         }
@@ -428,7 +478,8 @@ where
                 .exc
                 .as_ref()
                 .map(|exc| {
-                    crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_setup(
+                    crate::passes::ruff_to_blockpy::expr_lowering::lower_expr_into_with_context(
+                        context,
                         (**exc).clone(),
                         out,
                         loop_ctx,
