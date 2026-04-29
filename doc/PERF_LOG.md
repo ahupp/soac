@@ -1306,3 +1306,26 @@ benchmarked throughput delta, and the headline pre/post numbers.
   - specialized pass, 1M loops x3: `95203`, `96496`, `96721 loops/s`
   - no-refcount diagnostic, 1M loops x3: `173418`, `164855`, `155884 loops/s`
   - pystone JIT code bytes: `64879`
+
+## 2026-04-29 - Track cleanup-root slot state for refcount cleanup
+
+- jj change id: `wywwtlrs`
+- summary: cleanup roots now carry planned physical stack-slot state through
+  JIT local planning, so first materializations and proven-empty overwrites skip
+  conservative previous-slot DECREF scaffolding. Normal returns with identical
+  cleanup-root state share one exit cleanup block.
+- throughput: `+5.35%` specialized pystone median; no-refcount diagnostic
+  `-0.93%`
+- pre-change benchmark: `work/bench/tlwwozxkzrmn_ca6570685879`
+  - apply, refcounts enabled, median: `569875 loops/s`
+  - no-refcount diagnostic median: `760332 loops/s`
+  - total pystone code size: `66689 bytes`, `3918` machine blocks
+  - core pystone code size: `63343 bytes`
+- post-change benchmark: `work/bench/wywwtlrsvrxn`
+  - apply, refcounts enabled, median: `600370 loops/s`
+  - no-refcount diagnostic median: `753238 loops/s`
+  - total pystone code size: `65169 bytes`, `3918` machine blocks
+  - core pystone code size: `61913 bytes`
+- notes: verify counters are unchanged, including `runtime_decref=8163218` and
+  `runtime_incref=6957036`; the win comes from emitted cleanup shape rather
+  than a changed number of executed refcount operations.

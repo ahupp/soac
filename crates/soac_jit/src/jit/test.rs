@@ -1,9 +1,9 @@
 use super::runtime_context::FunctionRuntimeDataLayout;
 use super::{
     BlockPyEntryRuntimeContext, BuildSpecializedFunctionOptions, BuiltSpecializedFunction,
-    ClifFunctionDisplayAlias, ClifFunctionDisplayAliases, CpythonTypeSymbol, DeclaredJitFunction,
-    FuncBuildImports, RuntimeFunctionEntryPlan, RuntimeJitDeoptContinuation, RuntimeJitDeoptCursor,
-    RuntimeJitDeoptInvocation, RuntimeJitDeoptRecord, RuntimeJitDeoptTable,
+    CleanupRootSlotState, ClifFunctionDisplayAlias, ClifFunctionDisplayAliases, CpythonTypeSymbol,
+    DeclaredJitFunction, FuncBuildImports, RuntimeFunctionEntryPlan, RuntimeJitDeoptContinuation,
+    RuntimeJitDeoptCursor, RuntimeJitDeoptInvocation, RuntimeJitDeoptRecord, RuntimeJitDeoptTable,
     RuntimeJitDeoptUnsupportedReason, SOAC_RUNTIME_PROBE_GLOBAL_INDEXED_SYMBOL,
     SOAC_RUNTIME_STORE_GLOBAL_INDEXED_SYMBOL, SpecializationProfile, StackSlots,
     annotate_clif_instruction_purposes, build_cranelift_run_bb_specialized_function,
@@ -78,9 +78,9 @@ mod tests {
         apply_profile_typed_plans_to_typed_function, build_counted_runtime_refcount_helper,
         compile_cranelift_run_bb_specialized_cached, declare_direct_function,
         inline_runtime_support_calls, local_binding_facts_for_stored_value,
-        local_ref_kind_needs_incref_for_forward, local_ref_kind_needs_incref_for_load,
-        local_ref_kind_needs_refcount_call, module_constant_object_symbol,
-        module_constant_symbol_prefix_for_instance,
+        local_env_entry_needs_incref_for_forward, local_ref_kind_needs_incref_for_forward,
+        local_ref_kind_needs_incref_for_load, local_ref_kind_needs_refcount_call,
+        module_constant_object_symbol, module_constant_symbol_prefix_for_instance,
         module_constant_symbol_prefix_for_module_identity,
         module_constant_symbol_prefix_for_shared_state, new_jit_module,
         persistent_function_id_for_module_function, plan_direct_call_args_for_target,
@@ -95,16 +95,16 @@ mod tests {
         AbruptKind, BinOp, BinOpKind, BlockArg, BlockEdge, BlockLabel, BlockParam, BlockParamRole,
         BlockPyEntryRuntimeContext, BlockPyFunction, BlockPyModule, BlockPyModuleShape, BlockTerm,
         BuildSpecializedFunctionOptions, BuiltSpecializedFunction, Call, CallArgKeyword,
-        CallArgPositional, CellLocation, CellRef, ChildVisitable, ClifFunctionDisplayAlias,
-        ClifFunctionDisplayAliases, ClosureInit, ClosureSlot, ConstantExpr, CounterDef,
-        CounterSite, CpythonTypeSymbol, DeclaredJitFunction, Del, DelItem, FuncBuildImports,
-        FunctionExecutionMode, FunctionKind, FunctionName, FunctionRuntimeDataLayout, GetAttr,
-        GetItem, HasMeta, HasSemanticInstrId, IncrementCounter, InstrBlockPy, Literal,
-        LiteralValue, Load, LocalFunctionId, LocalLocation, MakeCell, Meta, ModuleNameGen,
-        NameLike, NameLocation, NumberLiteral, NumberLiteralValue, Param, ParamKind, ParamSpec,
-        ResolvedName, RuntimeFunctionEntryPlan, RuntimeFunctionId, RuntimeJitDeoptContinuation,
-        RuntimeJitDeoptCursor, RuntimeJitDeoptInvocation, RuntimeJitDeoptRecord,
-        RuntimeJitDeoptTable, RuntimeJitDeoptUnsupportedReason, RuntimeName,
+        CallArgPositional, CellLocation, CellRef, ChildVisitable, CleanupRootSlotState,
+        ClifFunctionDisplayAlias, ClifFunctionDisplayAliases, ClosureInit, ClosureSlot,
+        ConstantExpr, CounterDef, CounterSite, CpythonTypeSymbol, DeclaredJitFunction, Del,
+        DelItem, FuncBuildImports, FunctionExecutionMode, FunctionKind, FunctionName,
+        FunctionRuntimeDataLayout, GetAttr, GetItem, HasMeta, HasSemanticInstrId, IncrementCounter,
+        InstrBlockPy, Literal, LiteralValue, Load, LocalFunctionId, LocalLocation, MakeCell, Meta,
+        ModuleNameGen, NameLike, NameLocation, NumberLiteral, NumberLiteralValue, Param, ParamKind,
+        ParamSpec, ResolvedName, RuntimeFunctionEntryPlan, RuntimeFunctionId,
+        RuntimeJitDeoptContinuation, RuntimeJitDeoptCursor, RuntimeJitDeoptInvocation,
+        RuntimeJitDeoptRecord, RuntimeJitDeoptTable, RuntimeJitDeoptUnsupportedReason, RuntimeName,
         SerializedFunctionDebugName, SerializedFunctionId, SerializedIdentityTables,
         SerializedModuleId, SerializedModuleIdentity, SetAttr, SetItem, SpecializationProfile,
         StackSlots, StorageLayout, Store, StringLiteral, Tuple, UnaryOp, UnaryOpKind, Visit,
@@ -5378,6 +5378,7 @@ def build(values):
         let stack_slots = StackSlots {
             names: Vec::new(),
             slots: Vec::new(),
+            cleanup_root_names: HashSet::new(),
         };
 
         assert!(codegen_expr_is_borrowable_from_local_env(
@@ -5405,6 +5406,7 @@ def build(values):
         let stack_slots = StackSlots {
             names: Vec::new(),
             slots: Vec::new(),
+            cleanup_root_names: HashSet::new(),
         };
         let storage_layout = StorageLayout {
             freevars: Vec::new(),
@@ -5438,6 +5440,7 @@ def build(values):
         let stack_slots = StackSlots {
             names: Vec::new(),
             slots: Vec::new(),
+            cleanup_root_names: HashSet::new(),
         };
         let mut extra = TypedInstrExtra::default();
         extra.set_planned_result(PlannedResult::PYOBJECT_BORROWED_LOCAL);
@@ -5524,6 +5527,7 @@ def build(values):
         let stack_slots = StackSlots {
             names: Vec::new(),
             slots: Vec::new(),
+            cleanup_root_names: HashSet::new(),
         };
 
         let mut borrowed_extra = TypedInstrExtra::default();
@@ -5658,6 +5662,7 @@ def build(values):
                     .iter()
                     .map(|name| (*name).to_string())
                     .collect::<Vec<_>>(),
+                &HashSet::new(),
             );
 
             env.store_location(
@@ -5668,6 +5673,7 @@ def build(values):
                 LocalRefKind::Owned,
                 None,
                 true,
+                CleanupRootSlotState::MaybeOwnedReference,
                 &stack_slots,
                 ptr_ty,
                 null_tstate,
@@ -5686,6 +5692,32 @@ def build(values):
     fn local_env_first_store_test_state(
         stack_slot_names: &[&str],
         allow_local_only_slot_backed_store: bool,
+    ) -> (LocalEnv, String) {
+        local_env_first_store_test_state_with_cleanup_roots(
+            stack_slot_names,
+            &[],
+            allow_local_only_slot_backed_store,
+        )
+    }
+
+    fn local_env_first_store_test_state_with_cleanup_roots(
+        stack_slot_names: &[&str],
+        cleanup_root_names: &[&str],
+        allow_local_only_slot_backed_store: bool,
+    ) -> (LocalEnv, String) {
+        local_env_first_store_test_state_with_cleanup_roots_and_previous_state(
+            stack_slot_names,
+            cleanup_root_names,
+            allow_local_only_slot_backed_store,
+            CleanupRootSlotState::MaybeOwnedReference,
+        )
+    }
+
+    fn local_env_first_store_test_state_with_cleanup_roots_and_previous_state(
+        stack_slot_names: &[&str],
+        cleanup_root_names: &[&str],
+        allow_local_only_slot_backed_store: bool,
+        cleanup_root_previous_state: CleanupRootSlotState,
     ) -> (LocalEnv, String) {
         let compile_session = crate::session::CompileSession::new();
         let mut jit_module =
@@ -5741,6 +5773,10 @@ def build(values):
                     .iter()
                     .map(|name| (*name).to_string())
                     .collect::<Vec<_>>(),
+                &cleanup_root_names
+                    .iter()
+                    .map(|name| (*name).to_string())
+                    .collect::<HashSet<_>>(),
             );
 
             env.store_location(
@@ -5751,6 +5787,7 @@ def build(values):
                 LocalRefKind::Owned,
                 None,
                 allow_local_only_slot_backed_store,
+                cleanup_root_previous_state,
                 &stack_slots,
                 ptr_ty,
                 null_tstate,
@@ -5800,8 +5837,44 @@ def build(values):
         assert_eq!(env.entries.len(), 1, "{rendered}");
         assert_eq!(env.entries[0].storage, LocalEnvStorage::LocalOnly);
         assert!(
-            !rendered.contains("stack_store"),
-            "first store should avoid stack-slot mirroring when local-only is allowed:\n{rendered}"
+            !matches!(env.entries[0].storage, LocalEnvStorage::StackMirror),
+            "first store should stay LocalEnv-owned when local-only is allowed:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn local_env_first_store_roots_cleanup_local_even_when_local_only_is_allowed() {
+        let (env, rendered) =
+            local_env_first_store_test_state_with_cleanup_roots(&["x"], &["x"], true);
+
+        assert_eq!(env.entries.len(), 1, "{rendered}");
+        assert_eq!(env.entries[0].storage, LocalEnvStorage::StackMirror);
+        assert_eq!(env.entries[0].ref_kind, LocalRefKind::Borrowed);
+        assert!(
+            rendered.contains("stack_store"),
+            "cleanup-root stores should transfer ownership into the frame root:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn local_env_cleanup_root_first_store_skips_empty_previous_slot_decref() {
+        let (env, rendered) =
+            local_env_first_store_test_state_with_cleanup_roots_and_previous_state(
+                &["x"],
+                &["x"],
+                true,
+                CleanupRootSlotState::NoOwnedReference,
+            );
+
+        assert_eq!(env.entries.len(), 1, "{rendered}");
+        assert_eq!(env.entries[0].storage, LocalEnvStorage::StackMirror);
+        assert!(
+            rendered.contains("stack_store"),
+            "cleanup-root first store should still materialize the frame root:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("stack_load"),
+            "empty cleanup-root first store should not load a previous slot value:\n{rendered}"
         );
     }
 
@@ -5859,7 +5932,7 @@ def build(values):
             let value = fb.block_params(entry)[0];
             let null_tstate = fb.ins().iconst(ptr_ty, 0);
             let decref_ref = jit_module.declare_func_in_func(decref_id, &mut fb.func);
-            let stack_slots = StackSlots::new(&mut fb, &["x".to_string()]);
+            let stack_slots = StackSlots::new(&mut fb, &["x".to_string()], &HashSet::new());
             env.bind_entry_location_with_aliases(
                 LocalLocation(0),
                 "x",
@@ -5876,6 +5949,7 @@ def build(values):
                 LocalLocation(0),
                 "x",
                 &stack_slots,
+                CleanupRootSlotState::MaybeOwnedReference,
                 ptr_ty,
                 null_tstate,
                 decref_ref,
@@ -5914,6 +5988,30 @@ def build(values):
             LocalRefKind::Immortal,
             0
         ));
+    }
+
+    #[test]
+    fn cleanup_root_forwarding_keeps_stack_mirror_alias_borrowed() {
+        let entry = LocalEnvEntry {
+            location: Some(LocalLocation(0)),
+            name: "x".to_string(),
+            aliases: Vec::new(),
+            value: ir::Value::from_u32(1),
+            ref_kind: LocalRefKind::Borrowed,
+            storage: LocalEnvStorage::StackMirror,
+            binding_facts: local_binding_facts_for_stored_value(LocalRefKind::Borrowed),
+            py_facts: None,
+        };
+        let stack_slots = StackSlots {
+            names: vec!["x".to_string()],
+            slots: Vec::new(),
+            cleanup_root_names: HashSet::from(["x".to_string()]),
+        };
+
+        assert!(
+            !local_env_entry_needs_incref_for_forward(&entry, 0, &stack_slots),
+            "cleanup-root aliases should forward as borrowed values backed by the root slot"
+        );
     }
 
     #[test]

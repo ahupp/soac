@@ -186,8 +186,9 @@ use operation_specializations::IndexedFieldLoweringPlan;
 #[cfg(test)]
 use planning::plan_typed_v3_jit_module_for_test;
 pub use planning::{
-    BlockExcDispatchPlan, BlockParamFacts, EdgeTransportPlan, FunctionLocalPlan, LocalRefKind,
-    ParamBindingFacts, ParamProvenance, PlannedJitDeoptPoint, PlannedJitDeoptPointId,
+    BlockExcDispatchPlan, BlockParamFacts, CleanupRootSlotState, EdgeTransportPlan,
+    FunctionLocalPlan, LocalRefKind, ParamBindingFacts, ParamProvenance,
+    PlannedCleanupRootSlotStates, PlannedJitDeoptPoint, PlannedJitDeoptPointId,
     PlannedJitDeoptResumeFunction, PlannedJitDeoptResumeModule, PlannedJitFunctionLocals,
     PlannedJitModuleLocals, PlannedLocalEnvEntryMaterialization, PlannedLocalEnvEntrySource,
     PlannedLocalStorage, PlannedStackSlotEntrySeed, PreparedJitTypedModulePlan,
@@ -1370,6 +1371,8 @@ struct JitEmitCtx<'mc> {
     value_facts: &'mc FactStore,
     deopt_resume_plan: &'mc PlannedJitDeoptResumeFunction,
     refcount_plan: &'mc FunctionRefcountPlan,
+    cleanup_root_slot_states: &'mc PlannedCleanupRootSlotStates,
+    return_cleanup_blocks_by_label: &'mc HashMap<BlockLabel, ir::Block>,
     instr_locations: &'mc InstrLocationMap,
     counter_slots_by_id: &'mc [CounterRuntimeSlot],
     storage_layout: Option<StorageLayout>,
@@ -1955,6 +1958,8 @@ struct LocalEnv {
 struct LocalFailureCleanupValue {
     key: LocalFailureCleanupValueKey,
     value: ir::Value,
+    name: String,
+    ref_kind: LocalRefKind,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -1972,6 +1977,8 @@ impl LocalFailureCleanupValue {
         Self {
             key,
             value: entry.value,
+            name: entry.name.clone(),
+            ref_kind: entry.ref_kind,
         }
     }
 }
@@ -2118,6 +2125,7 @@ impl LocalEnv {
         value_ref_kind: LocalRefKind,
         py_facts: Option<PyObjFacts>,
         allow_local_only_slot_backed_store: bool,
+        cleanup_root_previous_state: CleanupRootSlotState,
         stack_slots: &StackSlots,
         ptr_ty: ir::Type,
         thread_state_value: ir::Value,
@@ -2132,27 +2140,45 @@ impl LocalEnv {
         } else {
             None
         };
+        let is_cleanup_root = stack_slots.has_cleanup_root_name(name);
         let should_mirror_stack_slot = stack_slots.has_name(name)
-            && match previous_entry.as_ref().map(|entry| entry.storage) {
-                Some(LocalEnvStorage::LocalOnly) => false,
-                Some(LocalEnvStorage::StackMirror) => true,
-                None => !allow_local_only_slot_backed_store,
-            };
+            && (is_cleanup_root
+                || match previous_entry.as_ref().map(|entry| entry.storage) {
+                    Some(LocalEnvStorage::LocalOnly) => false,
+                    Some(LocalEnvStorage::StackMirror) => true,
+                    None => !allow_local_only_slot_backed_store,
+                });
         if should_mirror_stack_slot {
-            stack_slots
-                .replace_cloned_value(
-                    fb,
-                    name,
-                    value,
-                    value_ref_kind,
-                    ptr_ty,
-                    thread_state_value,
-                    incref_ref,
-                    decref_ref,
-                )
-                .expect("slot-backed local missing from stack slots");
-            if local_ref_kind_needs_refcount_call(value_ref_kind) {
-                emit_decref_if_not_null(fb, ptr_ty, decref_ref, thread_state_value, value);
+            if is_cleanup_root {
+                stack_slots
+                    .replace_transferred_value_with_previous_state(
+                        fb,
+                        name,
+                        value,
+                        value_ref_kind,
+                        cleanup_root_previous_state,
+                        ptr_ty,
+                        thread_state_value,
+                        incref_ref,
+                        decref_ref,
+                    )
+                    .expect("cleanup-root local missing from stack slots");
+            } else {
+                stack_slots
+                    .replace_cloned_value(
+                        fb,
+                        name,
+                        value,
+                        value_ref_kind,
+                        ptr_ty,
+                        thread_state_value,
+                        incref_ref,
+                        decref_ref,
+                    )
+                    .expect("slot-backed local missing from stack slots");
+                if local_ref_kind_needs_refcount_call(value_ref_kind) {
+                    emit_decref_if_not_null(fb, ptr_ty, decref_ref, thread_state_value, value);
+                }
             }
             self.entries.push(LocalEnvEntry {
                 location: Some(
@@ -2173,6 +2199,11 @@ impl LocalEnv {
                 py_facts,
             });
         } else {
+            if previous_entry.is_none() && stack_slots.has_name(name) {
+                stack_slots
+                    .clear_value(fb, name, ptr_ty, thread_state_value, decref_ref)
+                    .expect("slot-backed local missing from stack slots");
+            }
             self.entries.push(LocalEnvEntry {
                 location: Some(location),
                 name: name.to_string(),
@@ -2231,6 +2262,7 @@ impl LocalEnv {
         location: LocalLocation,
         name: &str,
         stack_slots: &StackSlots,
+        cleanup_root_previous_state: CleanupRootSlotState,
         ptr_ty: ir::Type,
         thread_state_value: ir::Value,
         decref_ref: ir::FuncRef,
@@ -2254,7 +2286,18 @@ impl LocalEnv {
             .unwrap_or(had_stack_slot);
         if should_clear_stack_slot {
             stack_slots
-                .clear_value(fb, name, ptr_ty, thread_state_value, decref_ref)
+                .clear_value_with_previous_state(
+                    fb,
+                    name,
+                    if stack_slots.has_cleanup_root_name(name) {
+                        cleanup_root_previous_state
+                    } else {
+                        CleanupRootSlotState::MaybeOwnedReference
+                    },
+                    ptr_ty,
+                    thread_state_value,
+                    decref_ref,
+                )
                 .expect("slot-backed delete target missing from stack slots");
         }
         let null_ptr = fb.ins().iconst(ptr_ty, 0);
@@ -2375,9 +2418,12 @@ fn bind_planned_local_env_at_block_entry(
                                 param_index, binding.name
                             )
                         })?;
-                let entry_storage = match binding.storage {
-                    PlannedLocalStorage::BlockParam => LocalEnvStorage::LocalOnly,
-                    PlannedLocalStorage::StackSlot => LocalEnvStorage::StackMirror,
+                let entry_storage = if binding.storage == PlannedLocalStorage::StackSlot
+                    || stack_slots.has_cleanup_root_name(binding.name.as_str())
+                {
+                    LocalEnvStorage::StackMirror
+                } else {
+                    LocalEnvStorage::LocalOnly
                 };
                 local_env.bind_entry_location_with_aliases(
                     binding.location,
@@ -2389,7 +2435,7 @@ fn bind_planned_local_env_at_block_entry(
                     binding.param_facts.binding,
                     entry_py_facts,
                 );
-                if entry_storage == LocalEnvStorage::StackMirror {
+                if binding.storage == PlannedLocalStorage::StackSlot {
                     stack_slots
                         .replace_cloned_value(
                             fb,
@@ -2461,6 +2507,10 @@ fn local_ref_kind_needs_refcount_call(ref_kind: LocalRefKind) -> bool {
     !matches!(ref_kind, LocalRefKind::Immortal)
 }
 
+fn local_ref_kind_needs_incref_for_stack_slot_transfer(ref_kind: LocalRefKind) -> bool {
+    matches!(ref_kind, LocalRefKind::Borrowed)
+}
+
 fn local_ref_kind_needs_incref_for_forward(ref_kind: LocalRefKind, forwarded_count: usize) -> bool {
     match ref_kind {
         LocalRefKind::Owned | LocalRefKind::Unknown => forwarded_count > 0,
@@ -2469,9 +2519,44 @@ fn local_ref_kind_needs_incref_for_forward(ref_kind: LocalRefKind, forwarded_cou
     }
 }
 
+fn local_env_entry_needs_incref_for_forward(
+    entry: &LocalEnvEntry,
+    forwarded_count: usize,
+    stack_slots: &StackSlots,
+) -> bool {
+    if entry.storage == LocalEnvStorage::StackMirror
+        && stack_slots.has_cleanup_root_name(entry.name.as_str())
+    {
+        return false;
+    }
+    local_ref_kind_needs_incref_for_forward(entry.ref_kind, forwarded_count)
+}
+
 enum PlannedLocalStoreEffect {
     Rebind(LocalRefKind),
     Delete,
+}
+
+fn planned_cleanup_root_previous_state_for_key(
+    instr_key: InstrKey,
+    name: &str,
+    ctx: &JitEmitCtx<'_>,
+) -> CleanupRootSlotState {
+    if ctx.stack_slots.has_cleanup_root_name(name) {
+        ctx.cleanup_root_slot_states
+            .previous_state_for_instr(instr_key, name)
+    } else {
+        CleanupRootSlotState::MaybeOwnedReference
+    }
+}
+
+fn cleanup_root_state_key(states: &HashMap<String, CleanupRootSlotState>) -> Vec<String> {
+    let mut key = states
+        .iter()
+        .filter_map(|(name, state)| state.may_hold_owned_reference().then_some(name.clone()))
+        .collect::<Vec<_>>();
+    key.sort();
+    key
 }
 
 fn local_ref_kind_for_planned_local_state(state: LocalRefState) -> LocalRefKind {
@@ -2750,6 +2835,11 @@ fn emit_local_store_result_with_local_env(
                     location,
                     name,
                     &emit_ctx.stack_slots,
+                    planned_cleanup_root_previous_state_for_key(
+                        expr.semantic_instr_key(emit_ctx.function_id),
+                        name,
+                        emit_ctx,
+                    ),
                     emit_ctx.consts.ptr_ty,
                     emit_ctx.consts.thread_state_value,
                     emit_ctx.decref_ref,
@@ -2784,6 +2874,11 @@ fn emit_local_store_result_with_local_env(
             value_ref_kind,
             value_py_facts,
             emit_ctx.allow_local_only_slot_backed_stores,
+            planned_cleanup_root_previous_state_for_key(
+                expr.semantic_instr_key(emit_ctx.function_id),
+                name,
+                emit_ctx,
+            ),
             &emit_ctx.stack_slots,
             emit_ctx.consts.ptr_ty,
             emit_ctx.consts.thread_state_value,
@@ -2845,6 +2940,11 @@ fn emit_local_store_result_with_local_env(
             value_ref_kind,
             value_py_facts,
             emit_ctx.allow_local_only_slot_backed_stores,
+            planned_cleanup_root_previous_state_for_key(
+                expr.semantic_instr_key(emit_ctx.function_id),
+                backing_name,
+                emit_ctx,
+            ),
             &emit_ctx.stack_slots,
             emit_ctx.consts.ptr_ty,
             emit_ctx.consts.thread_state_value,
@@ -2894,6 +2994,11 @@ fn emit_typed_local_store_result_with_local_env(
                 location,
                 name,
                 &emit_ctx.stack_slots,
+                planned_cleanup_root_previous_state_for_key(
+                    expr.semantic_instr_key(emit_ctx.function_id),
+                    name,
+                    emit_ctx,
+                ),
                 emit_ctx.consts.ptr_ty,
                 emit_ctx.consts.thread_state_value,
                 emit_ctx.decref_ref,
@@ -2948,6 +3053,11 @@ fn emit_typed_local_store_result_with_local_env(
         value_ref_kind,
         Some(value_py_facts),
         emit_ctx.allow_local_only_slot_backed_stores,
+        planned_cleanup_root_previous_state_for_key(
+            expr.semantic_instr_key(emit_ctx.function_id),
+            name,
+            emit_ctx,
+        ),
         &emit_ctx.stack_slots,
         emit_ctx.consts.ptr_ty,
         emit_ctx.consts.thread_state_value,
@@ -3029,6 +3139,11 @@ fn emit_typed_owned_cell_makecell_store_result_with_local_env(
             value_ref_kind,
             Some(value_py_facts),
             emit_ctx.allow_local_only_slot_backed_stores,
+            planned_cleanup_root_previous_state_for_key(
+                expr.semantic_instr_key(emit_ctx.function_id),
+                backing_name,
+                emit_ctx,
+            ),
             &emit_ctx.stack_slots,
             emit_ctx.consts.ptr_ty,
             emit_ctx.consts.thread_state_value,
@@ -3130,6 +3245,11 @@ fn emit_typed_local_delete_result_with_local_env(
             location,
             name,
             &emit_ctx.stack_slots,
+            planned_cleanup_root_previous_state_for_key(
+                op.semantic_instr_key(emit_ctx.function_id),
+                name,
+                emit_ctx,
+            ),
             emit_ctx.consts.ptr_ty,
             emit_ctx.consts.thread_state_value,
             emit_ctx.decref_ref,
@@ -3217,6 +3337,11 @@ fn emit_local_delete_result_with_local_env(
             location,
             name,
             &emit_ctx.stack_slots,
+            planned_cleanup_root_previous_state_for_key(
+                op.semantic_instr_key(emit_ctx.function_id),
+                name,
+                emit_ctx,
+            ),
             emit_ctx.consts.ptr_ty,
             emit_ctx.consts.thread_state_value,
             emit_ctx.decref_ref,
@@ -3229,10 +3354,15 @@ fn emit_local_delete_result_with_local_env(
 struct StackSlots {
     names: Vec<String>,
     slots: Vec<ir::StackSlot>,
+    cleanup_root_names: HashSet<String>,
 }
 
 impl StackSlots {
-    fn new(fb: &mut FunctionBuilder<'_>, slot_names: &[String]) -> Self {
+    fn new(
+        fb: &mut FunctionBuilder<'_>,
+        slot_names: &[String],
+        cleanup_root_names: &HashSet<String>,
+    ) -> Self {
         let mut slots = Vec::with_capacity(slot_names.len());
         for _ in slot_names {
             slots.push(fb.create_sized_stack_slot(ir::StackSlotData::new(
@@ -3241,9 +3371,18 @@ impl StackSlots {
                 0,
             )));
         }
+        let slot_name_set = slot_names
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
         Self {
             names: slot_names.to_vec(),
             slots,
+            cleanup_root_names: cleanup_root_names
+                .iter()
+                .filter(|name| slot_name_set.contains(name.as_str()))
+                .cloned()
+                .collect(),
         }
     }
 
@@ -3275,6 +3414,10 @@ impl StackSlots {
 
     fn has_name(&self, name: &str) -> bool {
         self.slot_for_name(name).is_some()
+    }
+
+    fn has_cleanup_root_name(&self, name: &str) -> bool {
+        self.cleanup_root_names.contains(name)
     }
 
     fn initialize_all(
@@ -3312,13 +3455,92 @@ impl StackSlots {
         incref_ref: ir::FuncRef,
         decref_ref: ir::FuncRef,
     ) -> Option<()> {
+        self.replace_cloned_value_with_previous_state(
+            fb,
+            name,
+            value,
+            value_ref_kind,
+            CleanupRootSlotState::MaybeOwnedReference,
+            ptr_ty,
+            thread_state_value,
+            incref_ref,
+            decref_ref,
+        )
+    }
+
+    fn replace_cloned_value_with_previous_state(
+        &self,
+        fb: &mut FunctionBuilder<'_>,
+        name: &str,
+        value: ir::Value,
+        value_ref_kind: LocalRefKind,
+        previous_state: CleanupRootSlotState,
+        ptr_ty: ir::Type,
+        thread_state_value: ir::Value,
+        incref_ref: ir::FuncRef,
+        decref_ref: ir::FuncRef,
+    ) -> Option<()> {
         let slot = self.slot_for_name(name)?;
-        let previous = fb.ins().stack_load(ptr_ty, slot, 0);
+        let previous = previous_state
+            .may_hold_owned_reference()
+            .then(|| fb.ins().stack_load(ptr_ty, slot, 0));
         if local_ref_kind_needs_refcount_call(value_ref_kind) {
             emit_incref_if_not_null(fb, ptr_ty, incref_ref, value);
         }
         fb.ins().stack_store(value, slot, 0);
-        emit_decref_if_not_null(fb, ptr_ty, decref_ref, thread_state_value, previous);
+        if let Some(previous) = previous {
+            emit_decref_if_not_null(fb, ptr_ty, decref_ref, thread_state_value, previous);
+        }
+        Some(())
+    }
+
+    fn replace_transferred_value(
+        &self,
+        fb: &mut FunctionBuilder<'_>,
+        name: &str,
+        value: ir::Value,
+        value_ref_kind: LocalRefKind,
+        ptr_ty: ir::Type,
+        thread_state_value: ir::Value,
+        incref_ref: ir::FuncRef,
+        decref_ref: ir::FuncRef,
+    ) -> Option<()> {
+        self.replace_transferred_value_with_previous_state(
+            fb,
+            name,
+            value,
+            value_ref_kind,
+            CleanupRootSlotState::MaybeOwnedReference,
+            ptr_ty,
+            thread_state_value,
+            incref_ref,
+            decref_ref,
+        )
+    }
+
+    fn replace_transferred_value_with_previous_state(
+        &self,
+        fb: &mut FunctionBuilder<'_>,
+        name: &str,
+        value: ir::Value,
+        value_ref_kind: LocalRefKind,
+        previous_state: CleanupRootSlotState,
+        ptr_ty: ir::Type,
+        thread_state_value: ir::Value,
+        incref_ref: ir::FuncRef,
+        decref_ref: ir::FuncRef,
+    ) -> Option<()> {
+        let slot = self.slot_for_name(name)?;
+        let previous = previous_state
+            .may_hold_owned_reference()
+            .then(|| fb.ins().stack_load(ptr_ty, slot, 0));
+        if local_ref_kind_needs_incref_for_stack_slot_transfer(value_ref_kind) {
+            emit_incref_if_not_null(fb, ptr_ty, incref_ref, value);
+        }
+        fb.ins().stack_store(value, slot, 0);
+        if let Some(previous) = previous {
+            emit_decref_if_not_null(fb, ptr_ty, decref_ref, thread_state_value, previous);
+        }
         Some(())
     }
 
@@ -3330,22 +3552,55 @@ impl StackSlots {
         thread_state_value: ir::Value,
         decref_ref: ir::FuncRef,
     ) -> Option<()> {
+        self.clear_value_with_previous_state(
+            fb,
+            name,
+            CleanupRootSlotState::MaybeOwnedReference,
+            ptr_ty,
+            thread_state_value,
+            decref_ref,
+        )
+    }
+
+    fn clear_value_with_previous_state(
+        &self,
+        fb: &mut FunctionBuilder<'_>,
+        name: &str,
+        previous_state: CleanupRootSlotState,
+        ptr_ty: ir::Type,
+        thread_state_value: ir::Value,
+        decref_ref: ir::FuncRef,
+    ) -> Option<()> {
         let slot = self.slot_for_name(name)?;
-        let previous = fb.ins().stack_load(ptr_ty, slot, 0);
+        let previous = previous_state
+            .may_hold_owned_reference()
+            .then(|| fb.ins().stack_load(ptr_ty, slot, 0));
         let null_ptr = fb.ins().iconst(ptr_ty, 0);
         fb.ins().stack_store(null_ptr, slot, 0);
-        emit_decref_if_not_null(fb, ptr_ty, decref_ref, thread_state_value, previous);
+        if let Some(previous) = previous {
+            emit_decref_if_not_null(fb, ptr_ty, decref_ref, thread_state_value, previous);
+        }
         Some(())
     }
 
-    fn decref_all(
+    fn decref_all_with_cleanup_root_states(
         &self,
         fb: &mut FunctionBuilder<'_>,
         ptr_ty: ir::Type,
         thread_state_value: ir::Value,
         decref_ref: ir::FuncRef,
+        cleanup_root_states: &HashMap<String, CleanupRootSlotState>,
     ) {
-        for slot in &self.slots {
+        for (name, slot) in self.names.iter().zip(self.slots.iter()) {
+            if self.cleanup_root_names.contains(name)
+                && !cleanup_root_states
+                    .get(name)
+                    .copied()
+                    .unwrap_or(CleanupRootSlotState::MaybeOwnedReference)
+                    .may_hold_owned_reference()
+            {
+                continue;
+            }
             let value = fb.ins().stack_load(ptr_ty, *slot, 0);
             emit_decref_if_not_null(fb, ptr_ty, decref_ref, thread_state_value, value);
         }
@@ -3799,7 +4054,7 @@ fn emit_forwarded_block_arg_source_value(
         let entry = &local_env.entries[value_index];
         let value = entry.value;
         let forwarded_count = forwarded_local_counts.entry(value_index).or_insert(0usize);
-        if local_ref_kind_needs_incref_for_forward(entry.ref_kind, *forwarded_count) {
+        if local_env_entry_needs_incref_for_forward(entry, *forwarded_count, &ctx.stack_slots) {
             emit_incref_if_not_null(fb, ctx.consts.ptr_ty, ctx.incref_ref, value);
         }
         *forwarded_count += 1;
@@ -3807,7 +4062,9 @@ fn emit_forwarded_block_arg_source_value(
     }
     if let Some(slot) = ctx.stack_slots.slot_for_block_arg_name(source_name) {
         let value = fb.ins().stack_load(ctx.consts.ptr_ty, slot, 0);
-        emit_incref_if_not_null(fb, ctx.consts.ptr_ty, ctx.incref_ref, value);
+        if !ctx.stack_slots.has_cleanup_root_name(source_name) {
+            emit_incref_if_not_null(fb, ctx.consts.ptr_ty, ctx.incref_ref, value);
+        }
         return Ok((value, None));
     }
     Err(LocalEnvEdgePrepError::MissingSourceBinding {
@@ -3917,7 +4174,34 @@ fn block_arg_values(values: &[ir::Value]) -> Vec<ir::BlockArg> {
 struct PendingLocalFailureCleanup {
     block: ir::Block,
     cleanup_arg_count: usize,
+    cleanup_actions: Vec<PendingLocalFailureCleanupAction>,
     continuation: PendingLocalFailureContinuation,
+}
+
+#[derive(Clone)]
+enum PendingLocalFailureCleanupAction {
+    Decref,
+    RetireFrameRoot {
+        name: String,
+        ref_kind: LocalRefKind,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum PendingLocalFailureCleanupActionKey {
+    Decref,
+    RetireFrameRoot { name: String },
+}
+
+impl PendingLocalFailureCleanupAction {
+    fn key(&self) -> PendingLocalFailureCleanupActionKey {
+        match self {
+            Self::Decref => PendingLocalFailureCleanupActionKey::Decref,
+            Self::RetireFrameRoot { name, .. } => {
+                PendingLocalFailureCleanupActionKey::RetireFrameRoot { name: name.clone() }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -3930,6 +4214,7 @@ enum PendingLocalFailureContinuation {
 enum LocalFailureCleanupKey {
     Exact {
         cleanup_values: Vec<ir::Value>,
+        cleanup_actions: Vec<PendingLocalFailureCleanupActionKey>,
         forwarded_values: Vec<ir::Value>,
         continuation: PendingLocalFailureContinuation,
     },
@@ -3942,6 +4227,7 @@ enum LocalFailureCleanupKey {
 impl LocalFailureCleanupKey {
     fn new(
         cleanup_values: &[LocalFailureCleanupValue],
+        cleanup_actions: &[PendingLocalFailureCleanupAction],
         forwarded_values: &[ir::Value],
         continuation: PendingLocalFailureContinuation,
     ) -> LocalFailureCleanupKey {
@@ -3961,6 +4247,10 @@ impl LocalFailureCleanupKey {
                 cleanup_values: cleanup_values
                     .iter()
                     .map(|cleanup_value| cleanup_value.value)
+                    .collect(),
+                cleanup_actions: cleanup_actions
+                    .iter()
+                    .map(PendingLocalFailureCleanupAction::key)
                     .collect(),
                 forwarded_values: forwarded_values.to_vec(),
                 continuation,
@@ -6832,7 +7122,7 @@ where
             let entry = &local_env.entries[value_index];
             let value = entry.value;
             let forwarded_count = forwarded_local_counts.entry(value_index).or_insert(0usize);
-            if local_ref_kind_needs_incref_for_forward(entry.ref_kind, *forwarded_count) {
+            if local_env_entry_needs_incref_for_forward(entry, *forwarded_count, &ctx.stack_slots) {
                 emit_incref_if_not_null(fb, ptr_ty, incref_ref, value);
             }
             *forwarded_count += 1;
@@ -6885,6 +7175,7 @@ fn emit_exception_dispatch_slot_writes(
     forwarded_local_values: &[ir::Value],
     dispatch_exc: ir::Value,
     stack_slots: &StackSlots,
+    cleanup_root_previous_states: &HashMap<String, CleanupRootSlotState>,
     ptr_ty: ir::Type,
     thread_state_value: ir::Value,
     none_const: ir::Value,
@@ -6914,11 +7205,15 @@ fn emit_exception_dispatch_slot_writes(
             }
         };
         stack_slots
-            .replace_cloned_value(
+            .replace_cloned_value_with_previous_state(
                 fb,
                 target_name,
                 value,
                 value_ref_kind,
+                cleanup_root_previous_states
+                    .get(target_name)
+                    .copied()
+                    .unwrap_or(CleanupRootSlotState::MaybeOwnedReference),
                 ptr_ty,
                 thread_state_value,
                 incref_ref,
@@ -7168,6 +7463,15 @@ fn emit_planned_local_releases_for_reason_with_local_env_excluding(
     let Some(block_plan) = emit_ctx.refcount_plan.block(source_label) else {
         return Ok(());
     };
+    let is_non_exit_release_reason = matches!(
+        reason,
+        RefcountReleaseReason::Jump { .. }
+            | RefcountReleaseReason::IfThen { .. }
+            | RefcountReleaseReason::IfElse { .. }
+            | RefcountReleaseReason::BranchCase { .. }
+            | RefcountReleaseReason::BranchDefault { .. }
+            | RefcountReleaseReason::ExceptionEdge { .. }
+    );
     for action in &block_plan.actions {
         let RefcountActionKind::ReleaseLocal {
             local,
@@ -7218,6 +7522,37 @@ fn emit_planned_local_releases_for_reason_with_local_env_excluding(
             continue;
         }
         let removed = local_env.remove_location_or_name(local.location, &local.name);
+        let is_cleanup_root = emit_ctx
+            .stack_slots
+            .has_cleanup_root_name(local.name.as_str());
+        let retire_to_frame_root = is_non_exit_release_reason && is_cleanup_root;
+        if retire_to_frame_root {
+            match removed.as_ref().map(|entry| entry.storage) {
+                Some(LocalEnvStorage::LocalOnly) => {
+                    let previous = removed.as_ref().expect("checked above");
+                    emit_ctx
+                        .stack_slots
+                        .replace_transferred_value(
+                            fb,
+                            local.name.as_str(),
+                            previous.value,
+                            previous.ref_kind,
+                            emit_ctx.consts.ptr_ty,
+                            emit_ctx.consts.thread_state_value,
+                            emit_ctx.incref_ref,
+                            emit_ctx.decref_ref,
+                        )
+                        .ok_or_else(|| {
+                            format!(
+                                "refcount plan release for block {source_label} references missing stack slot {:?}",
+                                local.name
+                            )
+                        })?;
+                }
+                Some(LocalEnvStorage::StackMirror) | None => {}
+            }
+            continue;
+        }
         if let Some(previous) = removed.as_ref()
             && transient_local_needs_decref(previous.ref_kind)
         {
@@ -7229,11 +7564,12 @@ fn emit_planned_local_releases_for_reason_with_local_env_excluding(
                 previous.value,
             );
         }
-        if removed
-            .as_ref()
-            .is_some_and(|entry| entry.storage == LocalEnvStorage::StackMirror)
-            || removed.is_none()
-        {
+        let should_clear_stack_slot = !is_cleanup_root
+            && (removed
+                .as_ref()
+                .is_some_and(|entry| entry.storage == LocalEnvStorage::StackMirror)
+                || removed.is_none());
+        if should_clear_stack_slot {
             emit_ctx
                 .stack_slots
                 .clear_value(
@@ -14648,6 +14984,23 @@ fn local_failure_cleanup_emit_ctx<'mc>(
     if cleanup_entries.is_empty() && forwarded_values.is_empty() {
         return Ok(None);
     }
+    let cleanup_actions = cleanup_entries
+        .iter()
+        .map(|entry| {
+            if matches!(
+                continuation,
+                PendingLocalFailureContinuation::ExceptionDispatch(_)
+            ) && emit_ctx.stack_slots.has_name(entry.name.as_str())
+            {
+                PendingLocalFailureCleanupAction::RetireFrameRoot {
+                    name: entry.name.clone(),
+                    ref_kind: entry.ref_kind,
+                }
+            } else {
+                PendingLocalFailureCleanupAction::Decref
+            }
+        })
+        .collect::<Vec<_>>();
     if cleanup_entries.is_empty() {
         return Ok(Some(emit_ctx.with_step_null_target(
             emit_ctx.consts.step_null_block,
@@ -14659,6 +15012,7 @@ fn local_failure_cleanup_emit_ctx<'mc>(
     let forwarded_arg_count = forwarded_values.len();
     let key = LocalFailureCleanupKey::new(
         cleanup_entries.as_slice(),
+        cleanup_actions.as_slice(),
         forwarded_values.as_slice(),
         continuation,
     );
@@ -14676,6 +15030,7 @@ fn local_failure_cleanup_emit_ctx<'mc>(
         pending_local_failure_cleanups.push(PendingLocalFailureCleanup {
             block: cleanup_block,
             cleanup_arg_count,
+            cleanup_actions,
             continuation,
         });
         local_failure_cleanup_blocks.insert(key, cleanup_block);
@@ -15173,6 +15528,7 @@ fn emit_opt_v3_scalar_threaded_store_branch(
         LocalRefKind::Owned,
         Some(PyObjFacts::unknown()),
         emit_ctx.allow_local_only_slot_backed_stores,
+        CleanupRootSlotState::MaybeOwnedReference,
         &emit_ctx.stack_slots,
         emit_ctx.consts.ptr_ty,
         emit_ctx.consts.thread_state_value,
@@ -15257,6 +15613,7 @@ fn emit_opt_v3_scalar_threaded_store_branch(
         LocalRefKind::Owned,
         Some(PyObjFacts::unknown()),
         emit_ctx.allow_local_only_slot_backed_stores,
+        CleanupRootSlotState::MaybeOwnedReference,
         &emit_ctx.stack_slots,
         emit_ctx.consts.ptr_ty,
         emit_ctx.consts.thread_state_value,
@@ -15588,7 +15945,13 @@ fn emit_codegen_return_pyobject_with_unmaterialized_locals(
         emit_ctx.decref_ref,
     );
     emit_pop_handled_exception_if_leaving(fb, current_exception_name, None, emit_ctx);
-    fb.ins().return_(&[ret_value]);
+    let cleanup_block = emit_ctx
+        .return_cleanup_blocks_by_label
+        .get(&source_label)
+        .copied()
+        .unwrap_or_else(|| panic!("missing return cleanup block for {source_label}"));
+    fb.ins()
+        .jump(cleanup_block, &[ir::BlockArg::Value(ret_value)]);
     Ok(())
 }
 
@@ -16660,9 +17023,39 @@ fn build_cranelift_run_bb_specialized_function(
         let raise_exc_direct_block = fb.create_block();
         fb.set_cold_block(step_null_block);
         fb.set_cold_block(raise_exc_direct_block);
+        let mut return_cleanup_blocks_by_key = HashMap::<Vec<String>, ir::Block>::new();
+        let mut return_cleanup_blocks_by_label = HashMap::<BlockLabel, ir::Block>::new();
+        let mut return_cleanup_block_states = Vec::<(
+            ir::Block,
+            Vec<String>,
+            HashMap<String, CleanupRootSlotState>,
+        )>::new();
+        for block in &function.blocks {
+            if !matches!(block.term, BlockTerm::Return(_)) {
+                continue;
+            }
+            let states = jit_local_plan
+                .cleanup_root_slot_states
+                .exit_state_for_block(block.label);
+            let key = cleanup_root_state_key(&states);
+            let cleanup_block = if let Some(cleanup_block) = return_cleanup_blocks_by_key.get(&key)
+            {
+                *cleanup_block
+            } else {
+                let cleanup_block = fb.create_block();
+                return_cleanup_blocks_by_key.insert(key.clone(), cleanup_block);
+                return_cleanup_block_states.push((cleanup_block, key.clone(), states));
+                cleanup_block
+            };
+            return_cleanup_blocks_by_label.insert(block.label, cleanup_block);
+        }
         let required_stack_slot_names =
             jit_local_plan.required_stack_slot_names_for_function(function);
-        let stack_slots = StackSlots::new(&mut fb, &required_stack_slot_names);
+        let stack_slots = StackSlots::new(
+            &mut fb,
+            &required_stack_slot_names,
+            &jit_local_plan.cleanup_root_names,
+        );
         let exception_state_slots = ExceptionStateSlots::new(&mut fb, function);
 
         register_block_display_annotation(
@@ -16732,6 +17125,19 @@ fn build_cranelift_run_bb_specialized_function(
             "raise_exc_direct",
             vec!["args".into(), "exc".into()],
         );
+        for (cleanup_block, key, _) in &return_cleanup_block_states {
+            let label = if key.is_empty() {
+                "cleanup_return::no_roots".to_string()
+            } else {
+                format!("cleanup_return::{}", key.join(","))
+            };
+            register_block_display_annotation(
+                &mut block_annotations,
+                *cleanup_block,
+                label,
+                vec!["ret".into()],
+            );
+        }
 
         fb.append_block_params_for_function_params(entry_block);
         for (index, block) in exec_blocks.iter().enumerate() {
@@ -16742,6 +17148,9 @@ fn build_cranelift_run_bb_specialized_function(
         fb.append_block_param(step_null_block, ptr_ty); // args
         fb.append_block_param(raise_exc_direct_block, ptr_ty); // args
         fb.append_block_param(raise_exc_direct_block, ptr_ty); // exc
+        for (cleanup_block, _, _) in &return_cleanup_block_states {
+            fb.append_block_param(*cleanup_block, ptr_ty); // ret
+        }
         if let Some((_, cleanup)) = shared_null_cleanup {
             fb.append_block_param(cleanup, ptr_ty); // error
         }
@@ -16946,34 +17355,46 @@ fn build_cranelift_run_bb_specialized_function(
         for (param, value) in function.params.iter().zip(direct_entry_args.iter()) {
             let needs_runtime_arg = entry_runtime_param_names.contains(param.name.as_str());
             let needs_stack_seed = entry_stack_seed_param_names.contains(param.name.as_str());
-            let needs_owned_value = needs_runtime_arg || needs_stack_seed;
-            let selected_value = if needs_owned_value {
-                emit_incref_if_not_null(&mut fb, ptr_ty, incref_ref, *value);
-                Some(*value)
-            } else {
-                None
-            };
+            let needs_cleanup_root = stack_slots.has_cleanup_root_name(param.name.as_str());
 
-            if let Some(selected_value) = selected_value {
-                if needs_stack_seed && !needs_runtime_arg {
-                    stack_slots
-                        .replace_cloned_value(
-                            &mut fb,
-                            param.name.as_str(),
-                            selected_value,
-                            LocalRefKind::Owned,
-                            ptr_ty,
-                            thread_state_value,
-                            incref_ref,
-                            decref_ref,
-                        )
-                        .expect("entry slot missing from stack slots");
-                    fb.ins()
-                        .call(decref_ref, &[thread_state_value, selected_value]);
+            if needs_cleanup_root {
+                stack_slots
+                    .replace_cloned_value_with_previous_state(
+                        &mut fb,
+                        param.name.as_str(),
+                        *value,
+                        LocalRefKind::Borrowed,
+                        CleanupRootSlotState::NoOwnedReference,
+                        ptr_ty,
+                        thread_state_value,
+                        incref_ref,
+                        decref_ref,
+                    )
+                    .expect("entry cleanup-root slot missing from stack slots");
+            }
+
+            if needs_stack_seed && !needs_runtime_arg && !needs_cleanup_root {
+                emit_incref_if_not_null(&mut fb, ptr_ty, incref_ref, *value);
+                stack_slots
+                    .replace_cloned_value(
+                        &mut fb,
+                        param.name.as_str(),
+                        *value,
+                        LocalRefKind::Owned,
+                        ptr_ty,
+                        thread_state_value,
+                        incref_ref,
+                        decref_ref,
+                    )
+                    .expect("entry slot missing from stack slots");
+                fb.ins().call(decref_ref, &[thread_state_value, *value]);
+            }
+
+            if needs_runtime_arg {
+                if !needs_cleanup_root {
+                    emit_incref_if_not_null(&mut fb, ptr_ty, incref_ref, *value);
                 }
-                if needs_runtime_arg {
-                    entry_param_values.insert(param.name.as_str(), selected_value);
-                }
+                entry_param_values.insert(param.name.as_str(), *value);
             }
         }
         for block_param in function.blocks[0].bb_params() {
@@ -17042,6 +17463,9 @@ fn build_cranelift_run_bb_specialized_function(
         let mut exception_dispatch_blocks: Vec<Option<ir::Block>> = vec![None; exec_blocks.len()];
         let mut pending_local_failure_cleanups = Vec::new();
         let mut local_failure_cleanup_blocks = HashMap::new();
+        let empty_cleanup_root_state = HashMap::new();
+        let cleanup_root_union_exit_state =
+            jit_local_plan.cleanup_root_slot_states.union_exit_states();
         for (index, maybe_dispatch) in exc_dispatches.iter().enumerate() {
             if let Some(dispatch_plan) = maybe_dispatch {
                 let dispatch_block = fb.create_block();
@@ -17093,6 +17517,8 @@ fn build_cranelift_run_bb_specialized_function(
                 value_facts,
                 deopt_resume_plan: jit_deopt_resume_plan,
                 refcount_plan,
+                cleanup_root_slot_states: &jit_local_plan.cleanup_root_slot_states,
+                return_cleanup_blocks_by_label: &return_cleanup_blocks_by_label,
                 instr_locations: &instr_locations,
                 counter_slots_by_id,
                 storage_layout: function.storage_layout().clone(),
@@ -17323,6 +17749,11 @@ fn build_cranelift_run_bb_specialized_function(
                 &forwarded_local_values,
                 dispatch_exc,
                 &stack_slots,
+                jit_local_plan
+                    .cleanup_root_slot_states
+                    .block_exit_states
+                    .get(&function.blocks[index].label)
+                    .unwrap_or(&empty_cleanup_root_state),
                 ptr_ty,
                 thread_state_value,
                 slot_write_none_const,
@@ -17397,12 +17828,53 @@ fn build_cranelift_run_bb_specialized_function(
                 .jump(exec_blocks[dispatch_plan.target_index], &target_jump_args);
         }
 
+        for (cleanup_block, _, cleanup_root_states) in &return_cleanup_block_states {
+            fb.switch_to_block(*cleanup_block);
+            let ret_value = fb.block_params(*cleanup_block)[0];
+            stack_slots.decref_all_with_cleanup_root_states(
+                &mut fb,
+                ptr_ty,
+                thread_state_value,
+                decref_ref,
+                cleanup_root_states,
+            );
+            fb.ins().return_(&[ret_value]);
+        }
+
         for cleanup in &pending_local_failure_cleanups {
             fb.switch_to_block(cleanup.block);
             let cleanup_params = fb.block_params(cleanup.block).to_vec();
             let cleanup_values = &cleanup_params[..cleanup.cleanup_arg_count];
-            for &value in cleanup_values {
-                emit_decref_if_not_null(&mut fb, ptr_ty, decref_ref, thread_state_value, value);
+            for (&value, action) in cleanup_values.iter().zip(&cleanup.cleanup_actions) {
+                match action {
+                    PendingLocalFailureCleanupAction::Decref => {
+                        emit_decref_if_not_null(
+                            &mut fb,
+                            ptr_ty,
+                            decref_ref,
+                            thread_state_value,
+                            value,
+                        );
+                    }
+                    PendingLocalFailureCleanupAction::RetireFrameRoot { name, ref_kind } => {
+                        stack_slots
+                            .replace_transferred_value(
+                                &mut fb,
+                                name.as_str(),
+                                value,
+                                *ref_kind,
+                                ptr_ty,
+                                thread_state_value,
+                                incref_ref,
+                                decref_ref,
+                            )
+                            .ok_or_else(|| {
+                                format!(
+                                    "failure cleanup references missing frame-root slot {name:?}"
+                                )
+                            })?;
+                    }
+                }
             }
             match cleanup.continuation {
                 PendingLocalFailureContinuation::CleanupNull(cleanup_null_block) => {
@@ -17438,7 +17910,13 @@ fn build_cranelift_run_bb_specialized_function(
         if let Some((_, cleanup)) = shared_null_cleanup {
             fb.switch_to_block(cleanup);
             let error_value = fb.block_params(cleanup)[0];
-            stack_slots.decref_all(&mut fb, ptr_ty, thread_state_value, decref_ref);
+            stack_slots.decref_all_with_cleanup_root_states(
+                &mut fb,
+                ptr_ty,
+                thread_state_value,
+                decref_ref,
+                &cleanup_root_union_exit_state,
+            );
             fb.ins()
                 .call(set_raised_exception_ref, &[thread_state_value, error_value]);
             let null_ptr = fb.ins().iconst(ptr_ty, 0);
@@ -17476,7 +17954,13 @@ fn build_cranelift_run_bb_specialized_function(
                     fb.switch_to_block(done_block);
                 }
             }
-            stack_slots.decref_all(&mut fb, ptr_ty, thread_state_value, decref_ref);
+            stack_slots.decref_all_with_cleanup_root_states(
+                &mut fb,
+                ptr_ty,
+                thread_state_value,
+                decref_ref,
+                &cleanup_root_union_exit_state,
+            );
             fb.ins()
                 .call(set_raised_exception_ref, &[thread_state_value, error_value]);
             let null_ptr = fb.ins().iconst(ptr_ty, 0);
@@ -17487,7 +17971,13 @@ fn build_cranelift_run_bb_specialized_function(
         let step_null_args = fb.block_params(step_null_block)[0];
         let error_value =
             emit_take_current_raised_exception_or_trap(&mut fb, ptr_ty, thread_state_value);
-        stack_slots.decref_all(&mut fb, ptr_ty, thread_state_value, decref_ref);
+        stack_slots.decref_all_with_cleanup_root_states(
+            &mut fb,
+            ptr_ty,
+            thread_state_value,
+            decref_ref,
+            &cleanup_root_union_exit_state,
+        );
         fb.ins()
             .call(decref_ref, &[thread_state_value, step_null_args]);
         fb.ins()
@@ -17520,7 +18010,13 @@ fn build_cranelift_run_bb_specialized_function(
         fb.ins().jump(red_done_block, &[]);
         fb.switch_to_block(red_done_block);
         fb.ins().call(decref_ref, &[thread_state_value, red_args]);
-        stack_slots.decref_all(&mut fb, ptr_ty, thread_state_value, decref_ref);
+        stack_slots.decref_all_with_cleanup_root_states(
+            &mut fb,
+            ptr_ty,
+            thread_state_value,
+            decref_ref,
+            &cleanup_root_union_exit_state,
+        );
         fb.ins().return_(&[red_null]);
 
         fb.seal_all_blocks();

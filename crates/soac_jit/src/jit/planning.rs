@@ -1,8 +1,8 @@
 #[cfg(test)]
 use soac_config::SoacEnvConfig;
 use soac_core::block_py::{
-    BlockArg, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, InstrLocationMap,
-    LocalLocation, RuntimeFunctionId, current_instr_locations,
+    BlockArg, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, HasSemanticInstrId, InstrKey,
+    InstrLocationMap, LocalLocation, RuntimeFunctionId, current_instr_locations,
 };
 #[cfg(test)]
 use soac_ir_blockpy::BlockPyModuleShape;
@@ -13,10 +13,10 @@ pub use soac_opt::passes::{
 };
 use soac_opt::passes::{
     FunctionLocalEnvResumePlan, FunctionRefcountPlan, LocalEnvModulePlan, LocalEnvResumeEntry,
-    LocalEnvResumeModulePlan, LocalEnvResumePoint, LocalEnvResumeStatePrecision,
-    RefcountActionKind, RefcountPlan, RefcountReleaseReason, compute_typed_function_local_live_ins,
-    compute_typed_function_local_must_bound_ins, plan_typed_local_env_module,
-    plan_typed_local_env_resume_module, plan_typed_ownership_effects,
+    LocalEnvResumeModulePlan, LocalEnvResumePoint, LocalEnvResumeStatePrecision, LocalRefState,
+    RefcountActionKind, RefcountPlan, RefcountReleaseReason, RefcountSite,
+    compute_typed_function_local_live_ins, compute_typed_function_local_must_bound_ins,
+    plan_typed_local_env_module, plan_typed_local_env_resume_module, plan_typed_ownership_effects,
     validate_typed_local_env_module_plan, validate_typed_local_env_resume_module_plan,
     validate_typed_ownership_effects,
 };
@@ -37,6 +37,10 @@ fn can_release_via_stack_slot_fallback(name: &str) -> bool {
     name.starts_with("_dp_try_exc_")
         || name.starts_with("_dp_try_abrupt_kind_")
         || name.starts_with("_dp_try_abrupt_payload_")
+}
+
+fn can_use_cleanup_root(name: &str) -> bool {
+    !name.starts_with("_dp_") && !can_release_via_stack_slot_fallback(name)
 }
 
 fn typed_block_indices_by_label(
@@ -107,10 +111,60 @@ pub struct PlannedLocalEnvEntryMaterialization {
     pub entry_ref_kind: LocalRefKind,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CleanupRootSlotState {
+    NoOwnedReference,
+    MaybeOwnedReference,
+}
+
+impl CleanupRootSlotState {
+    pub const fn may_hold_owned_reference(self) -> bool {
+        matches!(self, Self::MaybeOwnedReference)
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PlannedCleanupRootSlotStates {
+    pub block_entry_states: HashMap<BlockLabel, HashMap<String, CleanupRootSlotState>>,
+    pub block_exit_states: HashMap<BlockLabel, HashMap<String, CleanupRootSlotState>>,
+    pub instr_previous_states: HashMap<InstrKey, HashMap<String, CleanupRootSlotState>>,
+}
+
+impl PlannedCleanupRootSlotStates {
+    pub fn previous_state_for_instr(
+        &self,
+        instr_key: InstrKey,
+        name: &str,
+    ) -> CleanupRootSlotState {
+        self.instr_previous_states
+            .get(&instr_key)
+            .and_then(|states| states.get(name))
+            .copied()
+            .unwrap_or(CleanupRootSlotState::MaybeOwnedReference)
+    }
+
+    pub fn exit_state_for_block(&self, label: BlockLabel) -> HashMap<String, CleanupRootSlotState> {
+        self.block_exit_states
+            .get(&label)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn union_exit_states(&self) -> HashMap<String, CleanupRootSlotState> {
+        let mut union = HashMap::new();
+        for states in self.block_exit_states.values() {
+            merge_cleanup_root_slot_state_maps(&mut union, states);
+        }
+        union
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PlannedJitFunctionLocals {
     pub local_plan: FunctionLocalPlan,
     pub refcount_plan: FunctionRefcountPlan,
+    pub cleanup_root_names: HashSet<String>,
+    pub cleanup_root_slot_states: PlannedCleanupRootSlotStates,
     pub runtime_block_params: Vec<Vec<RuntimeBlockParamPlan>>,
     pub implicit_target_transports: Vec<EdgeTransportPlan>,
     pub jump_edge_transports: Vec<Option<EdgeTransportPlan>>,
@@ -373,6 +427,10 @@ impl PlannedJitDeoptResumeModule {
 }
 
 impl PlannedJitFunctionLocals {
+    pub fn is_cleanup_root_name(&self, name: &str) -> bool {
+        self.cleanup_root_names.contains(name)
+    }
+
     pub fn required_stack_slot_names_for_function(
         &self,
         function: &BlockPyFunction<impl soac_core::block_py::ModuleShape>,
@@ -402,19 +460,24 @@ impl PlannedJitFunctionLocals {
             }
         }
 
+        required.extend(self.cleanup_root_names.iter().cloned());
         for block_plan in self.refcount_plan.blocks.values() {
             for action in &block_plan.actions {
-                if let RefcountActionKind::ReleaseLocal { local, reason, .. } = &action.kind {
-                    match reason {
-                        RefcountReleaseReason::Return | RefcountReleaseReason::Raise => {}
-                        RefcountReleaseReason::Jump { .. }
-                        | RefcountReleaseReason::IfThen { .. }
-                        | RefcountReleaseReason::IfElse { .. }
-                        | RefcountReleaseReason::BranchCase { .. }
-                        | RefcountReleaseReason::BranchDefault { .. }
-                        | RefcountReleaseReason::ExceptionEdge { .. } => {
-                            required.insert(local.name.clone());
-                        }
+                let RefcountActionKind::ReleaseLocal { local, reason, .. } = &action.kind else {
+                    continue;
+                };
+                if !can_release_via_stack_slot_fallback(local.name.as_str()) {
+                    continue;
+                }
+                match reason {
+                    RefcountReleaseReason::Return | RefcountReleaseReason::Raise => {}
+                    RefcountReleaseReason::Jump { .. }
+                    | RefcountReleaseReason::IfThen { .. }
+                    | RefcountReleaseReason::IfElse { .. }
+                    | RefcountReleaseReason::BranchCase { .. }
+                    | RefcountReleaseReason::BranchDefault { .. }
+                    | RefcountReleaseReason::ExceptionEdge { .. } => {
+                        required.insert(local.name.clone());
                     }
                 }
             }
@@ -452,6 +515,8 @@ impl PlannedJitFunctionLocals {
             || self.stack_slot_entry_seeds.len() != block_count
             || self.entry_materializations.len() != block_count
             || self.exc_dispatches.len() != block_count
+            || self.cleanup_root_slot_states.block_entry_states.len() != block_count
+            || self.cleanup_root_slot_states.block_exit_states.len() != block_count
         {
             return Err(format!(
                 "planned JIT local state for function {} ({}) has inconsistent block counts",
@@ -496,6 +561,20 @@ impl PlannedJitFunctionLocals {
                     }
                 }
             }
+            if !self
+                .cleanup_root_slot_states
+                .block_entry_states
+                .contains_key(&block.label)
+                || !self
+                    .cleanup_root_slot_states
+                    .block_exit_states
+                    .contains_key(&block.label)
+            {
+                return Err(format!(
+                    "cleanup-root slot state for function {} ({}) is missing block {}",
+                    function.function_id, function.names.qualname, block.label
+                ));
+            }
             for seed in &self.stack_slot_entry_seeds[index] {
                 if seed.binding.storage != PlannedLocalStorage::StackSlot {
                     return Err(format!(
@@ -514,6 +593,7 @@ impl PlannedJitFunctionLocals {
                 &self.runtime_block_params[index],
                 &self.stack_slot_entry_seeds[index],
                 &self.entry_materializations[index],
+                &self.cleanup_root_names,
             )?;
 
             let expected_jump = matches!(block.term, BlockTerm::Jump(_));
@@ -694,6 +774,7 @@ fn validate_entry_materializations_for_block<P: soac_core::block_py::ModuleShape
     runtime_params: &[RuntimeBlockParamPlan],
     stack_slot_entry_seeds: &[PlannedStackSlotEntrySeed],
     entry_materializations: &[PlannedLocalEnvEntryMaterialization],
+    cleanup_root_names: &HashSet<String>,
 ) -> Result<(), String> {
     let expected_count = runtime_params.len() + stack_slot_entry_seeds.len();
     if entry_materializations.len() != expected_count {
@@ -711,6 +792,9 @@ fn validate_entry_materializations_for_block<P: soac_core::block_py::ModuleShape
             unreachable!("count checked above");
         };
         let expected_entry_ref_kind = match param.binding.storage {
+            PlannedLocalStorage::BlockParam if cleanup_root_names.contains(&param.binding.name) => {
+                local_ref_kind_for_stack_mirror(param.binding.param_facts.ownership)
+            }
             PlannedLocalStorage::BlockParam => param.binding.param_facts.ownership,
             PlannedLocalStorage::StackSlot => {
                 local_ref_kind_for_stack_mirror(param.binding.param_facts.ownership)
@@ -1023,6 +1107,10 @@ pub fn render_jit_function_locals(
         plan.required_stack_slot_names_for_function(function)
     )
     .expect("writing to String should not fail");
+    let mut cleanup_root_names = plan.cleanup_root_names.iter().collect::<Vec<_>>();
+    cleanup_root_names.sort();
+    writeln!(out, "  cleanup_roots={cleanup_root_names:?}")
+        .expect("writing to String should not fail");
     for (index, block) in function.blocks.iter().enumerate() {
         writeln!(out, "  block {}:", block.label).expect("writing to String should not fail");
         if let Some(local_plan) = plan.local_plan.block(block.label) {
@@ -1170,7 +1258,9 @@ pub fn local_ref_kind_for_stack_mirror(ref_kind: LocalRefKind) -> LocalRefKind {
 pub fn planned_jit_params_for_typed_function(
     function: &BlockPyFunction<TypedBlockPyModuleShape>,
     local_plan: &FunctionLocalPlan,
+    cleanup_root_names: &HashSet<String>,
 ) -> Result<Vec<Vec<RuntimeBlockParamPlan>>, String> {
+    let live_ins = compute_typed_function_local_live_ins(function);
     function
         .blocks
         .iter()
@@ -1180,7 +1270,6 @@ pub fn planned_jit_params_for_typed_function(
             let block_plan = local_plan.block(block.label);
             for name in block.bb_param_names() {
                 let arg_name = name.to_string();
-                seen_names.insert(arg_name.clone());
                 let Some(binding) = block_plan
                     .and_then(|plan| plan.binding_for_block_arg_name(arg_name.as_str()).cloned())
                 else {
@@ -1189,6 +1278,14 @@ pub fn planned_jit_params_for_typed_function(
                         function.function_id, function.names.qualname, block.label, arg_name
                     ));
                 };
+                if cleanup_root_names.contains(&binding.name)
+                    && !live_ins
+                        .get(&block.label)
+                        .is_some_and(|live| live.contains(&binding.location))
+                {
+                    continue;
+                }
+                seen_names.insert(arg_name.clone());
                 let entry_aliases = if arg_name == binding.name {
                     Vec::new()
                 } else {
@@ -1203,6 +1300,13 @@ pub fn planned_jit_params_for_typed_function(
             if let Some(block_plan) = block_plan {
                 for binding in &block_plan.entry_locals {
                     if binding.storage != PlannedLocalStorage::BlockParam {
+                        continue;
+                    }
+                    if cleanup_root_names.contains(&binding.name)
+                        && !live_ins
+                            .get(&block.label)
+                            .is_some_and(|live| live.contains(&binding.location))
+                    {
                         continue;
                     }
                     if !seen_names.insert(binding.name.clone()) {
@@ -1265,9 +1369,294 @@ pub fn planned_stack_slot_entry_seeds_for_typed_function(
         .collect()
 }
 
+pub fn planned_cleanup_root_names_for_refcount_plan(
+    refcount_plan: &FunctionRefcountPlan,
+) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for block_plan in refcount_plan.blocks.values() {
+        for action in &block_plan.actions {
+            let RefcountActionKind::ReleaseLocal { local, reason, .. } = &action.kind else {
+                continue;
+            };
+            match reason {
+                RefcountReleaseReason::Return | RefcountReleaseReason::Raise => {}
+                RefcountReleaseReason::Jump { .. }
+                | RefcountReleaseReason::IfThen { .. }
+                | RefcountReleaseReason::IfElse { .. }
+                | RefcountReleaseReason::BranchCase { .. }
+                | RefcountReleaseReason::BranchDefault { .. }
+                | RefcountReleaseReason::ExceptionEdge { .. } => {
+                    if can_use_cleanup_root(local.name.as_str()) {
+                        names.insert(local.name.clone());
+                    }
+                }
+            }
+        }
+    }
+    names
+}
+
+fn cleanup_root_slot_state_for_local_ref_state(state: LocalRefState) -> CleanupRootSlotState {
+    if state.needs_decref() {
+        CleanupRootSlotState::MaybeOwnedReference
+    } else {
+        CleanupRootSlotState::NoOwnedReference
+    }
+}
+
+fn empty_cleanup_root_slot_state_map(
+    cleanup_root_names: &HashSet<String>,
+) -> HashMap<String, CleanupRootSlotState> {
+    cleanup_root_names
+        .iter()
+        .map(|name| (name.clone(), CleanupRootSlotState::NoOwnedReference))
+        .collect()
+}
+
+fn merge_cleanup_root_slot_state_maps(
+    target: &mut HashMap<String, CleanupRootSlotState>,
+    incoming: &HashMap<String, CleanupRootSlotState>,
+) -> bool {
+    let mut changed = false;
+    for (name, incoming_state) in incoming {
+        let target_state = target
+            .entry(name.clone())
+            .or_insert(CleanupRootSlotState::NoOwnedReference);
+        if *target_state == CleanupRootSlotState::NoOwnedReference
+            && *incoming_state == CleanupRootSlotState::MaybeOwnedReference
+        {
+            *target_state = CleanupRootSlotState::MaybeOwnedReference;
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn cleanup_root_slot_state_after_dispatch_write(source: &BlockArg) -> CleanupRootSlotState {
+    match source {
+        BlockArg::None | BlockArg::AbruptKind(_) => CleanupRootSlotState::NoOwnedReference,
+        BlockArg::Name(_) | BlockArg::CurrentException => CleanupRootSlotState::MaybeOwnedReference,
+    }
+}
+
+fn apply_exception_dispatch_writes_to_cleanup_root_slot_state(
+    mut state: HashMap<String, CleanupRootSlotState>,
+    dispatch: &BlockExcDispatchPlan,
+    cleanup_root_names: &HashSet<String>,
+) -> HashMap<String, CleanupRootSlotState> {
+    for (target_name, source) in &dispatch.slot_writes {
+        if cleanup_root_names.contains(target_name) {
+            state.insert(
+                target_name.clone(),
+                cleanup_root_slot_state_after_dispatch_write(source),
+            );
+        }
+    }
+    state
+}
+
+fn cleanup_root_slot_successors_for_block<'a>(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    block_indices_by_label: &HashMap<BlockLabel, usize>,
+    source_index: usize,
+    exc_dispatches: &'a [Option<BlockExcDispatchPlan>],
+) -> Vec<(usize, Option<&'a BlockExcDispatchPlan>)> {
+    let block = &function.blocks[source_index];
+    let mut successors = Vec::new();
+    if let Some(dispatch) = exc_dispatches[source_index].as_ref() {
+        successors.push((dispatch.target_index, Some(dispatch)));
+    }
+    match &block.term {
+        BlockTerm::Jump(edge) => {
+            successors.push((
+                typed_block_index_for_label(function, block_indices_by_label, edge.target),
+                None,
+            ));
+        }
+        BlockTerm::IfTerm(if_term) => {
+            successors.push((
+                typed_block_index_for_label(function, block_indices_by_label, if_term.then_label),
+                None,
+            ));
+            successors.push((
+                typed_block_index_for_label(function, block_indices_by_label, if_term.else_label),
+                None,
+            ));
+        }
+        BlockTerm::BranchTable(branch) => {
+            for target in &branch.targets {
+                successors.push((
+                    typed_block_index_for_label(function, block_indices_by_label, *target),
+                    None,
+                ));
+            }
+            successors.push((
+                typed_block_index_for_label(function, block_indices_by_label, branch.default_label),
+                None,
+            ));
+        }
+        BlockTerm::Raise(_) | BlockTerm::Return(_) => {}
+    }
+    successors
+}
+
+fn transfer_cleanup_root_slot_state_for_block(
+    function_id: RuntimeFunctionId,
+    block: &TypedBlock,
+    refcount_plan: &FunctionRefcountPlan,
+    cleanup_root_names: &HashSet<String>,
+    entry_state: &HashMap<String, CleanupRootSlotState>,
+    previous_states: Option<&mut HashMap<InstrKey, HashMap<String, CleanupRootSlotState>>>,
+) -> HashMap<String, CleanupRootSlotState> {
+    let mut state = entry_state.clone();
+    let mut previous_states = previous_states;
+    let Some(block_plan) = refcount_plan.block(block.label) else {
+        return state;
+    };
+    let mut actions_by_instr = HashMap::<InstrKey, Vec<&RefcountActionKind>>::new();
+    for action in &block_plan.actions {
+        let RefcountSite::Instr(instr_key) = &action.site else {
+            continue;
+        };
+        actions_by_instr
+            .entry(*instr_key)
+            .or_default()
+            .push(&action.kind);
+    }
+
+    for instr in &block.body {
+        let Some(instr_id) = instr.try_semantic_instr_id() else {
+            continue;
+        };
+        let instr_key = InstrKey::new(function_id, instr_id);
+        let Some(actions) = actions_by_instr.get(&instr_key) else {
+            continue;
+        };
+        for action in actions {
+            match action {
+                RefcountActionKind::RebindLocal {
+                    local, new_state, ..
+                } if cleanup_root_names.contains(&local.name) => {
+                    let previous_state = state
+                        .get(&local.name)
+                        .copied()
+                        .unwrap_or(CleanupRootSlotState::NoOwnedReference);
+                    if let Some(previous_states) = previous_states.as_mut() {
+                        previous_states
+                            .entry(instr_key)
+                            .or_default()
+                            .entry(local.name.clone())
+                            .or_insert(previous_state);
+                    }
+                    state.insert(
+                        local.name.clone(),
+                        cleanup_root_slot_state_for_local_ref_state(*new_state),
+                    );
+                }
+                RefcountActionKind::DeleteLocal { local, .. }
+                    if cleanup_root_names.contains(&local.name) =>
+                {
+                    let previous_state = state
+                        .get(&local.name)
+                        .copied()
+                        .unwrap_or(CleanupRootSlotState::NoOwnedReference);
+                    if let Some(previous_states) = previous_states.as_mut() {
+                        previous_states
+                            .entry(instr_key)
+                            .or_default()
+                            .entry(local.name.clone())
+                            .or_insert(previous_state);
+                    }
+                    state.insert(local.name.clone(), CleanupRootSlotState::NoOwnedReference);
+                }
+                _ => {}
+            }
+        }
+    }
+    state
+}
+
+pub fn planned_cleanup_root_slot_states_for_typed_function(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    refcount_plan: &FunctionRefcountPlan,
+    cleanup_root_names: &HashSet<String>,
+    exc_dispatches: &[Option<BlockExcDispatchPlan>],
+) -> PlannedCleanupRootSlotStates {
+    let block_count = function.blocks.len();
+    let block_indices_by_label = typed_block_indices_by_label(function);
+    let mut entry_states = vec![empty_cleanup_root_slot_state_map(cleanup_root_names); block_count];
+    if let Some(entry_state) = entry_states.first_mut() {
+        for param in function.params.iter() {
+            if cleanup_root_names.contains(&param.name) {
+                entry_state.insert(
+                    param.name.clone(),
+                    CleanupRootSlotState::MaybeOwnedReference,
+                );
+            }
+        }
+    }
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (source_index, block) in function.blocks.iter().enumerate() {
+            let exit_state = transfer_cleanup_root_slot_state_for_block(
+                function.function_id,
+                block,
+                refcount_plan,
+                cleanup_root_names,
+                &entry_states[source_index],
+                None,
+            );
+            for (target_index, maybe_dispatch) in cleanup_root_slot_successors_for_block(
+                function,
+                &block_indices_by_label,
+                source_index,
+                exc_dispatches,
+            ) {
+                let incoming = if let Some(dispatch) = maybe_dispatch {
+                    apply_exception_dispatch_writes_to_cleanup_root_slot_state(
+                        exit_state.clone(),
+                        dispatch,
+                        cleanup_root_names,
+                    )
+                } else {
+                    exit_state.clone()
+                };
+                changed |=
+                    merge_cleanup_root_slot_state_maps(&mut entry_states[target_index], &incoming);
+            }
+        }
+    }
+
+    let mut block_entry_states = HashMap::new();
+    let mut block_exit_states = HashMap::new();
+    let mut instr_previous_states = HashMap::new();
+    for (index, block) in function.blocks.iter().enumerate() {
+        let entry_state = entry_states[index].clone();
+        let exit_state = transfer_cleanup_root_slot_state_for_block(
+            function.function_id,
+            block,
+            refcount_plan,
+            cleanup_root_names,
+            &entry_state,
+            Some(&mut instr_previous_states),
+        );
+        block_entry_states.insert(block.label, entry_state);
+        block_exit_states.insert(block.label, exit_state);
+    }
+
+    PlannedCleanupRootSlotStates {
+        block_entry_states,
+        block_exit_states,
+        instr_previous_states,
+    }
+}
+
 pub fn planned_local_env_entry_materializations_for_function(
     runtime_block_params: &[Vec<RuntimeBlockParamPlan>],
     stack_slot_entry_seeds: &[Vec<PlannedStackSlotEntrySeed>],
+    cleanup_root_names: &HashSet<String>,
 ) -> Result<Vec<Vec<PlannedLocalEnvEntryMaterialization>>, String> {
     if runtime_block_params.len() != stack_slot_entry_seeds.len() {
         return Err(format!(
@@ -1283,6 +1672,11 @@ pub fn planned_local_env_entry_materializations_for_function(
             let mut entries = Vec::with_capacity(params.len() + seeds.len());
             entries.extend(params.iter().enumerate().map(|(param_index, param)| {
                 let entry_ref_kind = match param.binding.storage {
+                    PlannedLocalStorage::BlockParam
+                        if cleanup_root_names.contains(&param.binding.name) =>
+                    {
+                        local_ref_kind_for_stack_mirror(param.binding.param_facts.ownership)
+                    }
                     PlannedLocalStorage::BlockParam => param.binding.param_facts.ownership,
                     PlannedLocalStorage::StackSlot => {
                         local_ref_kind_for_stack_mirror(param.binding.param_facts.ownership)
@@ -1421,6 +1815,7 @@ pub fn typed_exc_dispatch_plan(
     block: &TypedBlock,
     runtime_target_params: &[RuntimeBlockParamPlan],
     refcount_plan: &FunctionRefcountPlan,
+    cleanup_root_names: &HashSet<String>,
 ) -> Option<BlockExcDispatchPlan> {
     let exc_edge = block.exc_edge.as_ref()?;
     let block_indices_by_label = typed_block_indices_by_label(function);
@@ -1463,6 +1858,7 @@ pub fn typed_exc_dispatch_plan(
             };
             if action_reason != &release_reason
                 || can_release_via_stack_slot_fallback(local.name.as_str())
+                || cleanup_root_names.contains(&local.name)
                 || forwarded_local_names.iter().any(|name| name == &local.name)
             {
                 continue;
@@ -1512,7 +1908,9 @@ pub fn plan_jit_typed_function_locals_from_plans(
     refcount_plan: FunctionRefcountPlan,
 ) -> Result<PlannedJitFunctionLocals, String> {
     let block_indices_by_label = typed_block_indices_by_label(function);
-    let runtime_block_params = planned_jit_params_for_typed_function(function, &local_plan)?;
+    let cleanup_root_names = planned_cleanup_root_names_for_refcount_plan(&refcount_plan);
+    let runtime_block_params =
+        planned_jit_params_for_typed_function(function, &local_plan, &cleanup_root_names)?;
     let implicit_target_transports =
         planned_implicit_target_transports_for_typed_function(function, &runtime_block_params);
     let jump_edge_transports =
@@ -1522,6 +1920,7 @@ pub fn plan_jit_typed_function_locals_from_plans(
     let entry_materializations = planned_local_env_entry_materializations_for_function(
         &runtime_block_params,
         &stack_slot_entry_seeds,
+        &cleanup_root_names,
     )?;
     let exc_dispatches = function
         .blocks
@@ -1536,13 +1935,27 @@ pub fn plan_jit_typed_function_locals_from_plans(
                     runtime_block_params[target_index].as_slice()
                 })
                 .unwrap_or(&[]);
-            typed_exc_dispatch_plan(function, block, runtime_target_params, &refcount_plan)
+            typed_exc_dispatch_plan(
+                function,
+                block,
+                runtime_target_params,
+                &refcount_plan,
+                &cleanup_root_names,
+            )
         })
         .collect::<Vec<_>>();
+    let cleanup_root_slot_states = planned_cleanup_root_slot_states_for_typed_function(
+        function,
+        &refcount_plan,
+        &cleanup_root_names,
+        &exc_dispatches,
+    );
 
     let plan = PlannedJitFunctionLocals {
         local_plan,
         refcount_plan,
+        cleanup_root_names,
+        cleanup_root_slot_states,
         runtime_block_params,
         implicit_target_transports,
         jump_edge_transports,
@@ -1557,10 +1970,11 @@ pub fn plan_jit_typed_function_locals_from_plans(
 #[cfg(test)]
 mod tests {
     use super::{
-        BlockExcDispatchPlan, BlockParamFacts, LocalRefKind, ParamBindingFacts, ParamProvenance,
-        PlannedLocalBinding, PlannedLocalEnvEntrySource, PlannedLocalStorage,
-        PlannedStackSlotEntrySeed, PreparedJitTypedModulePlan, RuntimeBlockParamPlan,
-        plan_edge_transport, plan_typed_v3_jit_module_for_test, planned_drop_forwarded_local_names,
+        BlockExcDispatchPlan, BlockParamFacts, CleanupRootSlotState, LocalRefKind,
+        ParamBindingFacts, ParamProvenance, PlannedLocalBinding, PlannedLocalEnvEntrySource,
+        PlannedLocalStorage, PlannedStackSlotEntrySeed, PreparedJitTypedModulePlan,
+        RuntimeBlockParamPlan, plan_edge_transport, plan_typed_v3_jit_module_for_test,
+        planned_cleanup_root_names_for_refcount_plan, planned_drop_forwarded_local_names,
         planned_jit_params_for_typed_function,
         planned_local_env_entry_materializations_for_function,
         planned_stack_slot_entry_seeds_for_typed_function, typed_block_index_for_label,
@@ -1779,7 +2193,7 @@ def f(flag):
             .local_env_plan
             .function(function.function_id)
             .expect("missing typed local plan");
-        let runtime_params = planned_jit_params_for_typed_function(function, plan)
+        let runtime_params = planned_jit_params_for_typed_function(function, plan, &HashSet::new())
             .expect("runtime params should bind");
         let block_indices_by_label = typed_block_indices_by_label(function);
 
@@ -1820,7 +2234,7 @@ def f(flag):
             .local_env_plan
             .function(function.function_id)
             .expect("missing typed local plan");
-        let runtime_params = planned_jit_params_for_typed_function(function, plan)
+        let runtime_params = planned_jit_params_for_typed_function(function, plan, &HashSet::new())
             .expect("runtime params should bind");
         let block_indices_by_label = typed_block_indices_by_label(function);
         let then_params = &runtime_params
@@ -1856,7 +2270,7 @@ def f():
             .function(function.function_id)
             .expect("missing typed local plan");
 
-        let runtime_params = planned_jit_params_for_typed_function(function, plan)
+        let runtime_params = planned_jit_params_for_typed_function(function, plan, &HashSet::new())
             .expect("runtime params should bind");
         let handler_params = runtime_params
             .iter()
@@ -1883,7 +2297,7 @@ def f():
     }
 
     #[test]
-    fn must_bound_cleanup_locals_travel_as_block_params() {
+    fn must_bound_cleanup_root_locals_do_not_travel_as_block_params() {
         let (prepared, function_index) = prepared_typed_function(
             r#"
 def f(flag):
@@ -1908,32 +2322,72 @@ def f(flag):
             .local_env_plan
             .function(function.function_id)
             .expect("missing typed local plan");
-        let runtime_params = planned_jit_params_for_typed_function(function, plan)
-            .expect("runtime params should bind");
+        let cleanup_root_names = HashSet::from(["x".to_string()]);
+        let runtime_params =
+            planned_jit_params_for_typed_function(function, plan, &cleanup_root_names)
+                .expect("runtime params should bind");
         let seeds = planned_stack_slot_entry_seeds_for_typed_function(function, plan);
         let block_indices_by_label = typed_block_indices_by_label(function);
         let else_index =
             typed_block_index_for_label(function, &block_indices_by_label, if_term.else_label);
 
         let else_params = &runtime_params[else_index];
-        let x = else_params
-            .iter()
-            .find(|param| param.binding.name == "x")
-            .expect("expected runtime cleanup param for x");
-        assert_eq!(x.binding.storage, PlannedLocalStorage::BlockParam);
-        assert_eq!(
-            x.binding.param_facts.binding,
-            ParamBindingFacts::DefinitelyBound
-        );
-        assert_eq!(
-            x.binding.param_facts.provenance,
-            ParamProvenance::ForwardedLocal(x.binding.location)
+        assert!(
+            else_params.iter().all(|param| param.binding.name != "x"),
+            "cleanup-root-only local should be kept in the frame root instead of a runtime param: {else_params:#?}"
         );
         assert!(
             seeds[else_index]
                 .iter()
                 .all(|seed| seed.binding.name != "x"),
             "cleanup-only locals should not require stack-slot entry seeds"
+        );
+    }
+
+    #[test]
+    fn cleanup_root_slot_state_tracks_empty_first_store_and_later_overwrite() {
+        let (prepared, function_index) = prepared_typed_function(
+            r#"
+def f(flag):
+    x = []
+    if flag:
+        pass
+    x = []
+    return None
+"#,
+            "f",
+        );
+        let function = &prepared.module.callable_defs[function_index];
+        let plan = prepared
+            .locals
+            .function(function.function_id)
+            .expect("missing JIT local plan");
+
+        assert!(
+            plan.cleanup_root_names.contains("x"),
+            "expected edge-retired local x to be a cleanup root: {:?}",
+            plan.cleanup_root_names
+        );
+        let previous_states = plan
+            .cleanup_root_slot_states
+            .instr_previous_states
+            .values()
+            .filter_map(|states| states.get("x").copied())
+            .collect::<Vec<_>>();
+        assert!(
+            previous_states.contains(&CleanupRootSlotState::NoOwnedReference),
+            "first cleanup-root store should know the slot starts empty: {previous_states:?}"
+        );
+        assert!(
+            previous_states.contains(&CleanupRootSlotState::MaybeOwnedReference),
+            "cleanup-root overwrite should preserve the previous-slot cleanup obligation: {previous_states:?}"
+        );
+        assert!(
+            plan.cleanup_root_slot_states
+                .block_exit_states
+                .values()
+                .any(|states| states.get("x") == Some(&CleanupRootSlotState::MaybeOwnedReference)),
+            "at least one exit should still sweep the final x root"
         );
     }
 
@@ -1954,7 +2408,7 @@ def f(flag):
             .function(function.function_id)
             .expect("missing typed local plan");
         let entry_label = function.entry_block().label;
-        let runtime_params = planned_jit_params_for_typed_function(function, plan)
+        let runtime_params = planned_jit_params_for_typed_function(function, plan, &HashSet::new())
             .expect("runtime params should bind");
 
         let non_entry_x_bindings = function
@@ -2011,7 +2465,7 @@ def f(flag):
             .local_env_plan
             .function(function.function_id)
             .expect("missing typed local plan");
-        let runtime_params = planned_jit_params_for_typed_function(function, plan)
+        let runtime_params = planned_jit_params_for_typed_function(function, plan, &HashSet::new())
             .expect("runtime params should bind");
         let seeds = planned_stack_slot_entry_seeds_for_typed_function(function, plan);
         let entry_label = function.entry_block().label;
@@ -2101,6 +2555,11 @@ def f(flag):
         assert_eq!(plan.stack_slot_entry_seeds.len(), function.blocks.len());
         assert_eq!(plan.entry_materializations.len(), function.blocks.len());
         assert_eq!(plan.exc_dispatches.len(), function.blocks.len());
+        assert!(
+            plan.cleanup_root_names.contains("x"),
+            "expected edge-released local x to be planned as a cleanup root: {:?}",
+            plan.cleanup_root_names
+        );
         let materialization_count = plan
             .entry_materializations
             .iter()
@@ -2140,6 +2599,10 @@ def f(flag):
             "expected refcount releases to be represented in the pre-codegen plan"
         );
         let required_stack_slot_names = plan.required_stack_slot_names_for_function(function);
+        assert!(
+            required_stack_slot_names.iter().any(|name| name == "x"),
+            "expected edge-retired local x to require a cleanup-root slot: {required_stack_slot_names:?}"
+        );
         assert!(
             required_stack_slot_names
                 .iter()
@@ -2203,6 +2666,7 @@ def f(flag):
         let entries = planned_local_env_entry_materializations_for_function(
             &runtime_params,
             &stack_slot_entry_seeds,
+            &HashSet::new(),
         )
         .expect("entry materialization planning should succeed");
 
@@ -2227,6 +2691,36 @@ def f(flag):
             PlannedLocalEnvEntrySource::StackSlotLoad
         );
         assert_eq!(entries[0][2].entry_ref_kind, LocalRefKind::Borrowed);
+    }
+
+    #[test]
+    fn planned_local_env_entry_materializations_borrow_cleanup_root_block_params() {
+        let block_binding = PlannedLocalBinding {
+            name: "x".to_string(),
+            location: LocalLocation(0),
+            storage: PlannedLocalStorage::BlockParam,
+            param_facts: BlockParamFacts {
+                value: None,
+                binding: ParamBindingFacts::DefinitelyBound,
+                provenance: ParamProvenance::ForwardedLocal(LocalLocation(0)),
+                ownership: LocalRefKind::Owned,
+            },
+        };
+        let runtime_params = vec![vec![RuntimeBlockParamPlan {
+            arg_name: "x".to_string(),
+            binding: block_binding,
+            entry_aliases: Vec::new(),
+        }]];
+        let cleanup_root_names = HashSet::from(["x".to_string()]);
+
+        let entries = planned_local_env_entry_materializations_for_function(
+            &runtime_params,
+            &[Vec::new()],
+            &cleanup_root_names,
+        )
+        .expect("entry materialization planning should succeed");
+
+        assert_eq!(entries[0][0].entry_ref_kind, LocalRefKind::Borrowed);
     }
 
     #[test]
@@ -2412,8 +2906,9 @@ def f():
             .local_env_plan
             .function(function.function_id)
             .expect("missing typed local plan");
-        let runtime_params = planned_jit_params_for_typed_function(function, local_plan)
-            .expect("runtime params should bind");
+        let runtime_params =
+            planned_jit_params_for_typed_function(function, local_plan, &HashSet::new())
+                .expect("runtime params should bind");
         let source_block = function
             .blocks
             .iter()
@@ -2428,6 +2923,7 @@ def f():
             source_block,
             &runtime_target_params,
             &FunctionRefcountPlan::default(),
+            &HashSet::new(),
         )
         .expect("expected exception dispatch plan");
 
@@ -2441,7 +2937,7 @@ def f():
     }
 
     #[test]
-    fn exc_dispatch_plan_carries_ordinary_exception_cleanup_locals_as_target_args() {
+    fn exc_dispatch_plan_leaves_cleanup_root_locals_in_frame_roots() {
         let (prepared, function_index) = prepared_typed_function(
             r#"
 def f():
@@ -2464,8 +2960,10 @@ def f():
             .function(function.function_id)
             .expect("missing JIT local plan")
             .refcount_plan;
-        let runtime_params = planned_jit_params_for_typed_function(function, local_plan)
-            .expect("runtime params should bind");
+        let cleanup_root_names = planned_cleanup_root_names_for_refcount_plan(refcount_plan);
+        let runtime_params =
+            planned_jit_params_for_typed_function(function, local_plan, &cleanup_root_names)
+                .expect("runtime params should bind");
 
         let dispatches = function
             .blocks
@@ -2484,20 +2982,25 @@ def f():
                         runtime_params[target_index].as_slice()
                     })
                     .unwrap_or(&[]);
-                typed_exc_dispatch_plan(function, block, runtime_target_params, refcount_plan)
+                typed_exc_dispatch_plan(
+                    function,
+                    block,
+                    runtime_target_params,
+                    refcount_plan,
+                    &cleanup_root_names,
+                )
             })
             .collect::<Vec<_>>();
 
         assert!(
-            dispatches
+            dispatches.iter().all(|dispatch| !dispatch
+                .forwarded_local_names
                 .iter()
-                .any(|dispatch| dispatch.release_local_names.is_empty()
-                    && dispatch
-                        .forwarded_local_names
-                        .iter()
-                        .any(|name| name == "x")
-                    && dispatch.target_args.iter().any(|(name, _)| name == "x")),
-            "exception dispatch should carry ordinary cleanup locals as target args: {dispatches:#?}"
+                .any(|name| name == "x")
+                && !dispatch.release_local_names.iter().any(|name| name == "x")
+                && !dispatch.target_args.iter().any(|(name, _)| name == "x")),
+            "root-backed exception cleanup locals should stay in cleanup roots instead of \
+             being forwarded through dispatch: {dispatches:#?}"
         );
     }
 
