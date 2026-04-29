@@ -252,10 +252,14 @@ inside each arm.
    borrowed values exactly at the return boundary before local cleanup releases
    the frame-owned slot. Stores remain conservative for now.
 
-4. Replace synthetic boolean/conditional temp ownership with explicit join
-   handling. Initial safe version: promote once in each returning arm. Later:
-   represent a borrowed-supported block value and validate the support root on
-   all predecessors.
+4. In progress: replace synthetic boolean/conditional temp ownership with
+   explicit join handling. Direct-return conditional expressions now lower to
+   arm-local return blocks, so `return x if flag else y` no longer materializes
+   `_dp_tmp_*`. Boolean value expressions still need a representation that
+   preserves the selected operand object across the truthiness branch without
+   reloading from a possibly mutated support slot. Later: represent a
+   borrowed-supported block value and validate the support root on all
+   predecessors.
 
 5. Extend `TypedPyObjectOwnershipPlan::BorrowedLocal` to carry support-root
    provenance before allowing borrowed values to cross block edges. The planner

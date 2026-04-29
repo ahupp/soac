@@ -215,7 +215,7 @@ pub(crate) struct AstSetupExprLowerer;
 impl BlockPySetupExprLowerer for AstSetupExprLowerer {}
 
 pub(crate) use boolop_compare::try_lower_branching_expr_direct;
-pub(crate) use if_expr::try_lower_if_expr_direct;
+pub(crate) use if_expr::{try_lower_if_expr_direct, try_lower_if_expr_return_direct};
 
 pub(crate) fn lower_expr_head_ast_for_blockpy(expr: InstrRuff) -> InstrRuff {
     expr

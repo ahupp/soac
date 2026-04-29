@@ -4,7 +4,8 @@ use crate::block_py::{
 };
 use crate::passes::ast_to_ast::context::Context;
 use crate::passes::ruff_to_blockpy::expr_lowering::{
-    try_lower_branching_expr_direct, try_lower_if_expr_direct, AstSetupExprLowerer,
+    try_lower_branching_expr_direct, try_lower_if_expr_direct, try_lower_if_expr_return_direct,
+    AstSetupExprLowerer,
 };
 use crate::passes::ruff_to_blockpy::stmt_sequences::lower_stmts_to_blockpy_stmts_with_context;
 use crate::passes::InstrRuff;
@@ -23,6 +24,21 @@ where
         other => {
             try_lower_branching_expr_direct::<_, E>(&AstSetupExprLowerer, name_gen, other, None)
         }
+    }
+}
+
+fn try_lower_direct_return_expr<E>(
+    name_gen: &FunctionNameGen,
+    expr: InstrRuff,
+) -> Option<Result<InlineFragment<E>, String>>
+where
+    E: RuffToBlockPyExpr + InstrWithConstantNone,
+{
+    match expr {
+        InstrRuff::ExprIf(if_expr) => {
+            try_lower_if_expr_return_direct::<_, E>(&AstSetupExprLowerer, name_gen, if_expr, None)
+        }
+        _ => None,
     }
 }
 
@@ -241,6 +257,27 @@ where
 {
     let mut out = lower_stmts_to_blockpy_stmts_with_context::<E>(context, &linear, name_gen)?;
     if let Some(expr) = value.clone() {
+        let lowered_terminal = try_lower_direct_return_expr::<E>(name_gen, expr.clone());
+        if let Some(Ok(fragment)) = lowered_terminal {
+            let setup_entry = emit_inline_fragment_with_exc_target_and_expr(
+                blocks,
+                fragment,
+                BlockLabel::fallthrough(),
+                exc_target,
+            );
+            let fragment_entry = if out.is_empty() {
+                None
+            } else {
+                Some(emit_lowered_builder_fragment_with_exc_target_and_expr(
+                    blocks,
+                    out,
+                    BlockTerm::Jump(BlockEdge::new(BlockLabel::fallthrough())),
+                    setup_entry.label(),
+                    exc_target,
+                ))
+            };
+            return Ok(fragment_entry.unwrap_or(setup_entry).label());
+        }
         let lowered_direct = try_lower_direct_expr::<E>(name_gen, expr);
         if let Some(Ok(lowered)) = lowered_direct {
             let dispatch_label = name_gen.next_block_name();

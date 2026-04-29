@@ -1060,6 +1060,64 @@ fn assert_all_block_targets_present<E: Instr>(blocks: &[Block<E>]) {
     }
 }
 
+fn blocks_store_to_prefix(blocks: &[TestBlock], prefix: &str) -> bool {
+    blocks.iter().any(|block| {
+        block.body.iter().any(|stmt| {
+            matches!(
+                stmt,
+                InstrWithAwaitAndYield::Store(store) if store.name.id_str().starts_with(prefix)
+            )
+        })
+    })
+}
+
+fn return_load_names(blocks: &[TestBlock]) -> Vec<String> {
+    blocks
+        .iter()
+        .filter_map(|block| match &block.term {
+            BlockTerm::Return(InstrWithAwaitAndYield::Load(load)) => {
+                Some(load.name.id_str().to_string())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn sequence_return_helper_lowers_if_expr_without_synthetic_temp_slot() {
+    let mut blocks = Vec::new();
+    let context = Context::new("");
+    let name_gen = test_name_gen();
+    let entry = emit_sequence_return_block_with_expr_setup_and_expr::<InstrWithAwaitAndYield>(
+        &context,
+        &mut blocks,
+        &name_gen,
+        vec![],
+        Some(instr_expr(py_expr!("value if cond else other"))),
+        None,
+    )
+    .expect("sequence return helper should lower");
+
+    assert!(
+        blocks.iter().any(|block| block.label == entry),
+        "{blocks:#?}"
+    );
+    assert!(
+        !blocks_store_to_prefix(&blocks, "_dp_tmp_"),
+        "direct return should not materialize a conditional expression temp: {blocks:#?}"
+    );
+    let return_names = return_load_names(&blocks);
+    assert!(
+        return_names.iter().any(|name| name == "value"),
+        "{blocks:#?}"
+    );
+    assert!(
+        return_names.iter().any(|name| name == "other"),
+        "{blocks:#?}"
+    );
+    assert_all_block_targets_present(&blocks);
+}
+
 #[test]
 fn sequence_return_helper_keeps_direct_if_expr_setup_reachable_after_linear_prefix() {
     let mut blocks = Vec::new();
@@ -1083,6 +1141,10 @@ fn sequence_return_helper_keeps_direct_if_expr_setup_reachable_after_linear_pref
     assert!(blocks
         .iter()
         .any(|block| matches!(block.term, BlockTerm::Return(_))));
+    assert!(
+        !blocks_store_to_prefix(&blocks, "_dp_tmp_"),
+        "direct return should not materialize a conditional expression temp: {blocks:#?}"
+    );
     assert_all_block_targets_present(&blocks);
 }
 
