@@ -5106,7 +5106,7 @@ def build(values):
     }
 
     #[test]
-    fn typed_result_demand_extra_marks_return_values_pyobject_owned() {
+    fn typed_result_demand_extra_marks_return_values_pyobject_borrowed_ok() {
         let mut constants = TestConstantPool::default();
         let return_instr_id = InstrId::new(0);
         let function = with_single_test_block(
@@ -5119,7 +5119,29 @@ def build(values):
 
         assert_eq!(
             typed_demand_for_instr_id(&typed_function, return_instr_id),
-            Some(ResultDemand::PYOBJECT_OWNED)
+            Some(ResultDemand::PYOBJECT_BORROWED_OK)
+        );
+    }
+
+    #[test]
+    fn typed_planned_result_extra_keeps_return_local_borrowed() {
+        let return_instr_id = InstrId::new(0);
+        let mut function = with_single_test_block(
+            test_function(),
+            vec![],
+            ret_term(with_instr_id(name_expr(test_name("x")), return_instr_id)),
+        );
+        set_stack_slots(&mut function, &["x"]);
+        let typed_function = lower_blockpy_function_to_typed(function);
+        let typed_function = annotate_test_result_demands_and_plans(typed_function);
+
+        assert_eq!(
+            typed_demand_for_instr_id(&typed_function, return_instr_id),
+            Some(ResultDemand::PYOBJECT_BORROWED_OK)
+        );
+        assert_eq!(
+            typed_planned_result_for_instr_id(&typed_function, return_instr_id),
+            Some(PlannedResult::PYOBJECT_BORROWED_LOCAL)
         );
     }
 

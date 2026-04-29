@@ -10534,6 +10534,19 @@ fn emit_owned_pyobject_result_for_demand(
     }
 }
 
+fn emit_promote_pyobject_to_owned_boundary(
+    fb: &mut FunctionBuilder<'_>,
+    value: ir::Value,
+    ownership: ValueOwnership,
+    emit_ctx: &JitEmitCtx<'_>,
+) -> (ir::Value, ValueOwnership) {
+    if matches!(ownership, ValueOwnership::Borrowed) {
+        fb.ins().call(emit_ctx.incref_ref, &[value]);
+        return (value, ValueOwnership::Owned);
+    }
+    (value, ownership)
+}
+
 fn direct_positional_call_args(
     call: &soac_core::block_py::Call<InstrBlockPy>,
     param_count: usize,
@@ -16320,9 +16333,9 @@ fn emit_typed_codegen_term(
         let emit_ctx = term_emit_ctx.as_ref().unwrap_or(emit_ctx);
         let demand = value
             .result_demand()
-            .unwrap_or(ResultDemand::PYOBJECT_OWNED);
+            .unwrap_or(ResultDemand::PYOBJECT_BORROWED_OK);
         let result = match demand {
-            ResultDemand::PyObject { borrowed_ok: false } => {
+            ResultDemand::PyObject { .. } => {
                 if let Some(ret_value) = emit_typed_exact_int_return_pyobject(
                     fb,
                     value,
@@ -16352,11 +16365,13 @@ fn emit_typed_codegen_term(
             }
             other => {
                 return Err(format!(
-                    "typed return value requires owned PyObject demand, got {other:?}"
+                    "typed return value requires PyObject demand, got {other:?}"
                 ));
             }
         };
         let (ret_value, ownership, _) = result.expect_pyobject("typed return value");
+        let (ret_value, ownership) =
+            emit_promote_pyobject_to_owned_boundary(fb, ret_value, ownership, emit_ctx);
         if !ownership.can_satisfy_pyobject_demand(ResultDemand::PYOBJECT_OWNED) {
             return Err(format!(
                 "typed return value produced {ownership:?}, but return requires owned PyObject"

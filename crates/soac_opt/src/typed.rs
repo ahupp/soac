@@ -254,7 +254,7 @@ pub fn annotate_typed_function_result_demands(
                 changed += annotate_typed_child_demands(&mut branch.index);
             }
             BlockTerm::Return(value) => {
-                changed += set_typed_instr_demand(value, TypedResultDemand::PYOBJECT_OWNED);
+                changed += set_typed_instr_demand(value, TypedResultDemand::PYOBJECT_BORROWED_OK);
                 changed += annotate_typed_child_demands(value);
             }
             BlockTerm::Raise(raise_stmt) => {

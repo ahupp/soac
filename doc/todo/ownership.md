@@ -247,10 +247,10 @@ inside each arm.
    releases only owned inputs, so borrowed local and immortal operands do not
    get DECREF scaffolding.
 
-3. Split "producer ownership" from "consumer ownership boundary". A local load
-   should be allowed to produce `BorrowedLocal` even if the enclosing return or
-   store ultimately needs an owned value. The promotion belongs at the return or
-   store boundary.
+3. Done for return terms: split "producer ownership" from the return ownership
+   boundary. A returned local load can produce `BorrowedLocal`; codegen promotes
+   borrowed values exactly at the return boundary before local cleanup releases
+   the frame-owned slot. Stores remain conservative for now.
 
 4. Replace synthetic boolean/conditional temp ownership with explicit join
    handling. Initial safe version: promote once in each returning arm. Later:
