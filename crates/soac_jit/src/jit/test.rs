@@ -4119,6 +4119,70 @@ def build(values):
     }
 
     #[test]
+    fn specialized_jit_truthy_local_operand_uses_borrowed_plan_without_incref() {
+        let mut constants = TestConstantPool::default();
+        let mut function = test_function();
+        function.params = ParamSpec {
+            params: vec![Param {
+                name: "x".into(),
+                kind: ParamKind::Any,
+                has_default: false,
+            }],
+        };
+        let entry_label = function.name_gen.next_block_name();
+        let then_label = function.name_gen.next_block_name();
+        let else_label = function.name_gen.next_block_name();
+        let entry = BlockPyBlock {
+            label: entry_label,
+            body: vec![],
+            term: BlockTerm::IfTerm(soac_core::block_py::TermIf {
+                test: name_expr(test_name("x")),
+                then_label,
+                else_label,
+            }),
+            params: vec![],
+            exc_edge: None,
+            extra: Default::default(),
+        };
+        let then_block = BlockPyBlock {
+            label: then_label,
+            body: vec![],
+            term: ret_term(constants.int_expr(1)),
+            params: vec![],
+            exc_edge: None,
+            extra: Default::default(),
+        };
+        let else_block = BlockPyBlock {
+            label: else_label,
+            body: vec![],
+            term: ret_term(constants.int_expr(0)),
+            params: vec![],
+            exc_edge: None,
+            extra: Default::default(),
+        };
+        let mut function = with_test_blocks(function, vec![entry, then_block, else_block]);
+        set_stack_slots(&mut function, &["x"]);
+        let mut module = test_module(ModuleNameGen::new(0), vec![function]);
+        module.module_constants = constants.module_constants;
+        let function = module.callable_defs[0].clone();
+        let module_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+        let built = build_test_specialized_function(
+            &[1usize as ObjPtr, 2usize as ObjPtr, 3usize as ObjPtr],
+            &module,
+            &function,
+            &module_constants,
+        );
+
+        let incref_helpers = import_user_names_for_symbols(&built, &[SOAC_RUNTIME_INCREF_SYMBOL]);
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&built.ctx.func, &incref_helpers),
+            0,
+            "borrowed local truthiness should not INCREF the local-load operand"
+        );
+    }
+
+    #[test]
     fn specialized_jit_raise_terms_compile_via_typed_exception_expr() {
         let mut constants = TestConstantPool::default();
         let function = test_function();
@@ -4410,6 +4474,67 @@ def build(values):
 
         assert_eq!(
             typed_planned_result_for_instr_id(&typed_function, arg_instr_id),
+            Some(PlannedResult::PYOBJECT_BORROWED_LOCAL)
+        );
+    }
+
+    #[test]
+    fn typed_planned_result_extra_marks_truthy_local_operand_borrowed_local() {
+        let mut constants = TestConstantPool::default();
+        let function = test_function();
+        let entry_label = function.name_gen.next_block_name();
+        let then_label = function.name_gen.next_block_name();
+        let else_label = function.name_gen.next_block_name();
+        let entry = BlockPyBlock {
+            label: entry_label,
+            body: vec![],
+            term: BlockTerm::IfTerm(soac_core::block_py::TermIf {
+                test: name_expr(test_name("x")),
+                then_label,
+                else_label,
+            }),
+            params: vec![],
+            exc_edge: None,
+            extra: Default::default(),
+        };
+        let then_block = BlockPyBlock {
+            label: then_label,
+            body: vec![],
+            term: ret_term(constants.int_expr(1)),
+            params: vec![],
+            exc_edge: None,
+            extra: Default::default(),
+        };
+        let else_block = BlockPyBlock {
+            label: else_label,
+            body: vec![],
+            term: ret_term(constants.int_expr(0)),
+            params: vec![],
+            exc_edge: None,
+            extra: Default::default(),
+        };
+        let function = with_test_blocks(function, vec![entry, then_block, else_block]);
+        let typed_function =
+            lower_typed_function_if_tests_to_truthy(lower_blockpy_function_to_typed(function));
+        let typed_function = annotate_test_result_demands_and_plans(typed_function);
+
+        let BlockTerm::IfTerm(if_term) = &typed_function.blocks[0].term else {
+            panic!("entry block should end in an if term");
+        };
+        let InstrTyped::Truthy(truthy) = &if_term.test else {
+            panic!("if test should lower to typed truthiness");
+        };
+        assert_eq!(if_term.test.result_demand(), Some(ResultDemand::I32_BOOL01));
+        assert_eq!(
+            if_term.test.planned_result(),
+            Some(PlannedResult::I32_BOOL01)
+        );
+        assert_eq!(
+            truthy.value().result_demand(),
+            Some(ResultDemand::PYOBJECT_BORROWED_OK)
+        );
+        assert_eq!(
+            truthy.value().planned_result(),
             Some(PlannedResult::PYOBJECT_BORROWED_LOCAL)
         );
     }

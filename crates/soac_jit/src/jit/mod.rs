@@ -7650,13 +7650,13 @@ fn emit_planned_stack_slot_releases_for_reason_from_parts(
     Ok(())
 }
 
-fn emit_truthy_from_owned_value(
+fn emit_truthy_from_value(
     fb: &mut FunctionBuilder<'_>,
-    owned_value: SoacValue,
+    input_value: SoacValue,
     is_true_ref: ir::FuncRef,
     ctx: &JitEmitCtx<'_>,
 ) -> SoacValue {
-    match owned_value {
+    match input_value {
         SoacValue::I32 { value, facts } if facts.is_i32_bool01() => SoacValue::i32(value, facts),
         SoacValue::I32 { value, .. } => emit_i32_bool01_from_i32_result(fb, value, ctx),
         SoacValue::I64 { value, .. } => {
@@ -8479,22 +8479,19 @@ fn emit_typed_codegen_expr_value_with_local_env(
     }
 
     if let InstrTyped::Truthy(op) = expr {
+        let borrowed =
+            typed_expr_pyobject_input_is_borrowed_from_local_env(op.value(), local_env, emit_ctx);
         let value = emit_typed_codegen_expr_value_with_local_env(
             fb,
             op.value(),
             local_env,
             emit_ctx,
-            false,
+            borrowed,
             codegen_env,
             func_imports,
         )?;
         let is_true_ref = func_imports.get(codegen_env, &mut fb.func, &DP_JIT_IS_TRUE_IMPORT)?;
-        return Ok(emit_truthy_from_owned_value(
-            fb,
-            value,
-            is_true_ref,
-            emit_ctx,
-        ));
+        return Ok(emit_truthy_from_value(fb, value, is_true_ref, emit_ctx));
     }
 
     if matches!(expr, InstrTyped::BinOp(_) | InstrTyped::UnaryOp(_)) {
@@ -14893,7 +14890,7 @@ fn emit_typed_codegen_i32_bool01_result_with_local_env(
         codegen_env,
         func_imports,
     )?;
-    let truth = emit_truthy_from_owned_value(fb, value, is_true_ref, emit_ctx);
+    let truth = emit_truthy_from_value(fb, value, is_true_ref, emit_ctx);
     let truth_i32 = truth.expect_i32_bool01("typed I32Bool01 demand");
     Ok(EmitResult::i32(truth_i32, IntFacts::i32_bool01()))
 }

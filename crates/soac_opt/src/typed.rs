@@ -116,6 +116,7 @@ fn annotate_typed_child_demands(expr: &mut InstrTyped) -> usize {
             annotate_pyobject_borrowed_input_demand(op.left.as_mut())
                 + annotate_pyobject_borrowed_input_demand(op.right.as_mut())
         }
+        InstrTyped::Truthy(op) => annotate_pyobject_borrowed_input_demand(op.value.as_mut()),
         InstrTyped::UnaryOp(op) => annotate_pyobject_borrowed_input_demand(op.operand.as_mut()),
         InstrTyped::Tuple(op) => op
             .values
