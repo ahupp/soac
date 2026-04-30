@@ -390,13 +390,14 @@ fn codegen_expr_is_borrowable_from_local_env(
             let Some(location) = op.name.local_location() else {
                 return false;
             };
-            if local_env.entry_index_for_location(location).is_some() {
-                return true;
+            if let Some(index) = local_env.entry_index_for_location(location) {
+                return local_env.entries[index].is_pyobject_binding();
             }
             storage_layout
                 .and_then(|layout| layout.stack_slots().get(location.slot() as usize))
-                .is_some_and(|name| {
-                    local_env.entry_index_for_name(name).is_some() || stack_slots.has_name(name)
+                .is_some_and(|name| match local_env.entry_index_for_name(name) {
+                    Some(index) => local_env.entries[index].is_pyobject_binding(),
+                    None => stack_slots.has_name(name),
                 })
         }
         _ => false,
@@ -427,13 +428,14 @@ fn typed_expr_is_borrowable_from_local_env(
             let Some(location) = op.name.local_location() else {
                 return false;
             };
-            if local_env.entry_index_for_location(location).is_some() {
-                return true;
+            if let Some(index) = local_env.entry_index_for_location(location) {
+                return local_env.entries[index].is_pyobject_binding();
             }
             storage_layout
                 .and_then(|layout| layout.stack_slots().get(location.slot() as usize))
-                .is_some_and(|name| {
-                    local_env.entry_index_for_name(name).is_some() || stack_slots.has_name(name)
+                .is_some_and(|name| match local_env.entry_index_for_name(name) {
+                    Some(index) => local_env.entries[index].is_pyobject_binding(),
+                    None => stack_slots.has_name(name),
                 })
         }
         _ => false,
@@ -1984,6 +1986,10 @@ enum LocalBindingValue {
         ref_kind: LocalRefKind,
         py_facts: Option<PyObjFacts>,
     },
+    ExactI64 {
+        value: ir::Value,
+        facts: IntFacts,
+    },
     Unbound {
         value: ir::Value,
     },
@@ -2005,15 +2011,23 @@ impl LocalBindingValue {
         Self::Unbound { value }
     }
 
+    fn exact_i64(value: ir::Value, facts: IntFacts) -> Self {
+        debug_assert_eq!(facts.width, IntWidth::I64);
+        Self::ExactI64 { value, facts }
+    }
+
     const fn value(self) -> ir::Value {
         match self {
-            Self::PyObject { value, .. } | Self::Unbound { value } => value,
+            Self::PyObject { value, .. }
+            | Self::ExactI64 { value, .. }
+            | Self::Unbound { value } => value,
         }
     }
 
     const fn ref_kind(self) -> LocalRefKind {
         match self {
             Self::PyObject { ref_kind, .. } => ref_kind,
+            Self::ExactI64 { .. } => LocalRefKind::Immortal,
             Self::Unbound { .. } => LocalRefKind::Unbound,
         }
     }
@@ -2021,8 +2035,20 @@ impl LocalBindingValue {
     const fn py_facts(self) -> Option<PyObjFacts> {
         match self {
             Self::PyObject { py_facts, .. } => py_facts,
+            Self::ExactI64 { .. } => None,
             Self::Unbound { .. } => None,
         }
+    }
+
+    const fn i64_facts(self) -> Option<IntFacts> {
+        match self {
+            Self::ExactI64 { facts, .. } => Some(facts),
+            Self::PyObject { .. } | Self::Unbound { .. } => None,
+        }
+    }
+
+    const fn is_pyobject(self) -> bool {
+        matches!(self, Self::PyObject { .. })
     }
 }
 
@@ -2065,6 +2091,24 @@ impl LocalEnvEntry {
         )
     }
 
+    fn exact_i64(
+        location: Option<LocalLocation>,
+        name: String,
+        aliases: Vec<String>,
+        value: ir::Value,
+        facts: IntFacts,
+        storage: LocalEnvStorage,
+    ) -> Self {
+        Self::new(
+            location,
+            name,
+            aliases,
+            LocalBindingValue::exact_i64(value, facts),
+            storage,
+            ParamBindingFacts::DefinitelyBound,
+        )
+    }
+
     const fn value(&self) -> ir::Value {
         self.binding.value()
     }
@@ -2075,6 +2119,14 @@ impl LocalEnvEntry {
 
     const fn py_facts(&self) -> Option<PyObjFacts> {
         self.binding.py_facts()
+    }
+
+    const fn i64_facts(&self) -> Option<IntFacts> {
+        self.binding.i64_facts()
+    }
+
+    const fn is_pyobject_binding(&self) -> bool {
+        self.binding.is_pyobject()
     }
 }
 
@@ -2187,6 +2239,30 @@ impl LocalEnv {
             .and_then(|index| self.entries[index].py_facts())
     }
 
+    fn i64_facts_for_load(&self, name: &ResolvedName) -> Option<IntFacts> {
+        name.local_location()
+            .and_then(|location| {
+                self.entry_index_for_location(location)
+                    .or_else(|| self.entry_index_for_name(name.id.as_str()))
+            })
+            .or_else(|| self.entry_index_for_name(name.id.as_str()))
+            .and_then(|index| self.entries[index].i64_facts())
+    }
+
+    fn scalar_i64_value_for_load(&self, name: &ResolvedName) -> Option<(ir::Value, IntFacts)> {
+        name.local_location()
+            .and_then(|location| {
+                self.entry_index_for_location(location)
+                    .or_else(|| self.entry_index_for_name(name.id.as_str()))
+            })
+            .or_else(|| self.entry_index_for_name(name.id.as_str()))
+            .and_then(|index| {
+                self.entries[index]
+                    .i64_facts()
+                    .map(|facts| (self.entries[index].value(), facts))
+            })
+    }
+
     fn load_location(
         &self,
         fb: &mut FunctionBuilder<'_>,
@@ -2200,6 +2276,24 @@ impl LocalEnv {
             .or_else(|| self.entry_index_for_name(name))
         {
             let entry = &self.entries[index];
+            if let Some(facts) = entry.i64_facts() {
+                debug_assert!(
+                    !borrowed,
+                    "scalar local cannot be loaded as a borrowed PyObject"
+                );
+                let result = emit_soac_value_result_for_demand(
+                    fb,
+                    SoacValue::i64(entry.value(), facts),
+                    ctx,
+                    ResultDemand::PYOBJECT_OWNED,
+                    None,
+                );
+                let (value, ownership, _) = result.expect_pyobject("scalar local materialization");
+                debug_assert!(
+                    ownership.is_owned() || matches!(ownership, ValueOwnership::Immortal)
+                );
+                return Some(value);
+            }
             let value = entry.value();
             if entry.binding_facts.requires_checked_local_load()
                 || entry.ref_kind() == LocalRefKind::Unbound
@@ -2230,6 +2324,24 @@ impl LocalEnv {
     ) -> Option<ir::Value> {
         if let Some(index) = self.entry_index_for_name(name) {
             let entry = &self.entries[index];
+            if let Some(facts) = entry.i64_facts() {
+                debug_assert!(
+                    !borrowed,
+                    "scalar local cannot be loaded as a borrowed PyObject"
+                );
+                let result = emit_soac_value_result_for_demand(
+                    fb,
+                    SoacValue::i64(entry.value(), facts),
+                    ctx,
+                    ResultDemand::PYOBJECT_OWNED,
+                    None,
+                );
+                let (value, ownership, _) = result.expect_pyobject("scalar local materialization");
+                debug_assert!(
+                    ownership.is_owned() || matches!(ownership, ValueOwnership::Immortal)
+                );
+                return Some(value);
+            }
             let value = entry.value();
             if entry.binding_facts.requires_checked_local_load()
                 || entry.ref_kind() == LocalRefKind::Unbound
@@ -2249,6 +2361,69 @@ impl LocalEnv {
             return Some(value);
         }
         None
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn store_i64_location(
+        &mut self,
+        fb: &mut FunctionBuilder<'_>,
+        location: LocalLocation,
+        name: &str,
+        value: ir::Value,
+        facts: IntFacts,
+        cleanup_root_previous_state: CleanupRootSlotState,
+        stack_slots: &StackSlots,
+        refcount_location_counters: Option<RefcountDecrefLocationCounterParts<'_>>,
+        ptr_ty: ir::Type,
+        thread_state_value: ir::Value,
+        decref_ref: ir::FuncRef,
+    ) {
+        let previous_entry = if let Some(existing_index) = self
+            .entry_index_for_location(location)
+            .or_else(|| self.entry_index_for_name(name))
+        {
+            Some(self.entries.remove(existing_index))
+        } else {
+            None
+        };
+        let previous_had_stack_mirror = previous_entry
+            .as_ref()
+            .is_some_and(|entry| entry.storage == LocalEnvStorage::StackMirror);
+        if stack_slots.has_name(name) && (previous_entry.is_none() || previous_had_stack_mirror) {
+            let previous_state = if stack_slots.has_cleanup_root_name(name) {
+                cleanup_root_previous_state
+            } else {
+                CleanupRootSlotState::MaybeOwnedReference
+            };
+            stack_slots
+                .clear_value_with_previous_state_counted(
+                    fb,
+                    name,
+                    previous_state,
+                    ptr_ty,
+                    thread_state_value,
+                    decref_ref,
+                    refcount_location_counters,
+                )
+                .expect("slot-backed scalar local missing from stack slots");
+        }
+        self.entries.push(LocalEnvEntry::exact_i64(
+            Some(location),
+            name.to_string(),
+            previous_entry
+                .as_ref()
+                .map(|entry| entry.aliases.clone())
+                .unwrap_or_default(),
+            value,
+            facts,
+            LocalEnvStorage::LocalOnly,
+        ));
+        if let Some(previous) = previous_entry
+            && previous.storage == LocalEnvStorage::LocalOnly
+            && transient_local_needs_decref(previous.ref_kind())
+        {
+            emit_decref_if_not_null(fb, ptr_ty, decref_ref, thread_state_value, previous.value());
+        }
     }
 
     fn store_location(
@@ -2828,12 +3003,40 @@ fn local_env_entry_needs_incref_for_forward(
     forwarded_count: usize,
     stack_slots: &StackSlots,
 ) -> bool {
+    if !entry.is_pyobject_binding() {
+        return false;
+    }
     if entry.storage == LocalEnvStorage::StackMirror
         && stack_slots.has_cleanup_root_name(entry.name.as_str())
     {
         return false;
     }
     local_ref_kind_needs_incref_for_forward(entry.ref_kind(), forwarded_count)
+}
+
+fn emit_local_env_entry_pyobject_for_forward(
+    fb: &mut FunctionBuilder<'_>,
+    entry: &LocalEnvEntry,
+    ctx: &JitEmitCtx<'_>,
+    forwarded_count: usize,
+) -> ir::Value {
+    if let Some(facts) = entry.i64_facts() {
+        let result = emit_soac_value_result_for_demand(
+            fb,
+            SoacValue::i64(entry.value(), facts),
+            ctx,
+            ResultDemand::PYOBJECT_OWNED,
+            None,
+        );
+        let (value, ownership, _) = result.expect_pyobject("forwarded scalar local");
+        debug_assert!(ownership.is_owned() || matches!(ownership, ValueOwnership::Immortal));
+        return value;
+    }
+    let value = entry.value();
+    if local_env_entry_needs_incref_for_forward(entry, forwarded_count, &ctx.stack_slots) {
+        emit_incref_if_not_null(fb, ctx.consts.ptr_ty, ctx.incref_ref, value);
+    }
+    value
 }
 
 enum PlannedLocalStoreEffect {
@@ -3333,6 +3536,38 @@ fn emit_typed_local_store_result_with_local_env(
     } else {
         op.value.result_demand().unwrap_or(store_value_demand)
     };
+    if !planned_borrowed_store
+        && typed_expr_i64_demand_facts(op.value.as_ref(), local_env, emit_ctx).is_some()
+    {
+        let value_result = emit_typed_codegen_stmt_result_with_local_env(
+            fb,
+            &op.value,
+            local_env,
+            emit_ctx,
+            ResultDemand::I64_VALUE,
+            codegen_env,
+            func_imports,
+        )?;
+        let (value, i64_facts) = value_result.expect_i64("typed local scalar store RHS");
+        local_env.store_i64_location(
+            fb,
+            location,
+            name,
+            value,
+            i64_facts,
+            planned_cleanup_root_previous_state_for_key(
+                expr.semantic_instr_key(emit_ctx.function_id),
+                name,
+                emit_ctx,
+            ),
+            &emit_ctx.stack_slots,
+            Some(refcount_decref_location_counter_parts(emit_ctx)),
+            emit_ctx.consts.ptr_ty,
+            emit_ctx.consts.thread_state_value,
+            emit_ctx.decref_ref,
+        );
+        return Ok(Some(emit_none_for_demand(fb, emit_ctx, demand)));
+    }
     let value_result = match value_demand {
         ResultDemand::PyObject { .. } => emit_typed_codegen_stmt_result_with_local_env(
             fb,
@@ -4341,7 +4576,7 @@ impl<'a, 'b, 'mc, 'c, 'd, Env: JitCodegenEnv> intrinsics::OperationEmitState<'b,
                 &*self.local_env,
                 self.ctx,
             );
-            let value = emit_typed_codegen_expr_value_with_local_env(
+            let (value, ownership, _) = emit_typed_pyobject_value_with_local_env(
                 self.fb,
                 arg,
                 &mut *self.local_env,
@@ -4349,10 +4584,10 @@ impl<'a, 'b, 'mc, 'c, 'd, Env: JitCodegenEnv> intrinsics::OperationEmitState<'b,
                 borrowed_arg,
                 self.codegen_env,
                 self.func_imports,
+                "typed intrinsic PyObject argument",
             )
             .unwrap_or_else(|err| panic!("{err}"));
-            let (value, ownership, _) = value.expect_pyobject("typed intrinsic PyObject argument");
-            arg_values.push((value, borrowed_arg || !ownership.is_owned()));
+            arg_values.push((value, !ownership.is_owned()));
         }
         arg_values
     }
@@ -4532,11 +4767,8 @@ fn emit_forwarded_block_arg_source_value(
 ) -> Result<(ir::Value, Option<usize>), LocalEnvEdgePrepError> {
     if let Some(value_index) = local_env.entry_index_for_block_arg_name(source_name) {
         let entry = &local_env.entries[value_index];
-        let value = entry.value();
         let forwarded_count = forwarded_local_counts.entry(value_index).or_insert(0usize);
-        if local_env_entry_needs_incref_for_forward(entry, *forwarded_count, &ctx.stack_slots) {
-            emit_incref_if_not_null(fb, ctx.consts.ptr_ty, ctx.incref_ref, value);
-        }
+        let value = emit_local_env_entry_pyobject_for_forward(fb, entry, ctx, *forwarded_count);
         *forwarded_count += 1;
         return Ok((value, Some(value_index)));
     }
@@ -5878,17 +6110,46 @@ fn emit_typed_pyobject_arg_value_with_local_env(
     codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<(ir::Value, bool), String> {
+    let borrowed = typed_expr_pyobject_input_is_borrowed_from_local_env(expr, local_env, ctx);
+    let (value, ownership, _) = emit_typed_pyobject_value_with_local_env(
+        fb,
+        expr,
+        local_env,
+        ctx,
+        borrowed,
+        codegen_env,
+        func_imports,
+        "typed PyObject call argument",
+    )?;
+    Ok((value, !ownership.is_owned()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_typed_pyobject_value_with_local_env(
+    fb: &mut FunctionBuilder<'_>,
+    expr: &InstrTyped,
+    local_env: &mut LocalEnv,
+    ctx: &JitEmitCtx<'_>,
+    borrowed: bool,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+    site: &str,
+) -> Result<(ir::Value, ValueOwnership, PyObjFacts), String> {
     let value = emit_typed_codegen_expr_value_with_local_env(
         fb,
         expr,
         local_env,
         ctx,
-        typed_expr_pyobject_input_is_borrowed_from_local_env(expr, local_env, ctx),
+        borrowed,
         codegen_env,
         func_imports,
     )?;
-    let (value, ownership, _) = value.expect_pyobject("typed PyObject call argument");
-    Ok((value, !ownership.is_owned()))
+    let demand = if borrowed {
+        ResultDemand::PYOBJECT_BORROWED_OK
+    } else {
+        ResultDemand::PYOBJECT_OWNED
+    };
+    Ok(emit_soac_value_result_for_demand(fb, value, ctx, demand, None).expect_pyobject(site))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7363,7 +7624,7 @@ fn emit_typed_pyobject_input_with_local_env(
     site: &str,
 ) -> Result<(ir::Value, bool), String> {
     let borrowed = typed_expr_pyobject_input_is_borrowed_from_local_env(expr, local_env, ctx);
-    let value = emit_typed_codegen_expr_value_with_local_env(
+    let (value, ownership, _) = emit_typed_pyobject_value_with_local_env(
         fb,
         expr,
         local_env,
@@ -7371,9 +7632,9 @@ fn emit_typed_pyobject_input_with_local_env(
         borrowed,
         codegen_env,
         func_imports,
+        site,
     )?;
-    let (value, ownership, _) = value.expect_pyobject(site);
-    Ok((value, borrowed || !ownership.is_owned()))
+    Ok((value, !ownership.is_owned()))
 }
 
 fn push_owned_typed_input_cleanup(
@@ -7681,11 +7942,8 @@ where
     for source_name in source_names {
         if let Some(value_index) = local_env.entry_index_for_block_arg_name(source_name) {
             let entry = &local_env.entries[value_index];
-            let value = entry.value();
             let forwarded_count = forwarded_local_counts.entry(value_index).or_insert(0usize);
-            if local_env_entry_needs_incref_for_forward(entry, *forwarded_count, &ctx.stack_slots) {
-                emit_incref_if_not_null(fb, ptr_ty, incref_ref, value);
-            }
+            let value = emit_local_env_entry_pyobject_for_forward(fb, entry, ctx, *forwarded_count);
             *forwarded_count += 1;
             if let Some(location) = entry.location {
                 forwarded_local_locations.insert(location);
@@ -8893,6 +9151,9 @@ fn emit_typed_codegen_expr_value_with_local_env(
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<SoacValue, String> {
     if let InstrTyped::Load(op) = expr {
+        if let Some((value, facts)) = local_env.scalar_i64_value_for_load(&op.name) {
+            return Ok(SoacValue::i64(value, facts));
+        }
         let facts = op
             .extra()
             .result_facts()
@@ -11442,6 +11703,11 @@ fn typed_expr_i64_demand_facts(
     if let Some(value) = typed_expr_const_i64(expr, emit_ctx.module_constants) {
         return Some(IntFacts::i64_known(value));
     }
+    if let InstrTyped::Load(op) = expr
+        && let Some(facts) = local_env.i64_facts_for_load(&op.name)
+    {
+        return Some(facts);
+    }
     match expr {
         InstrTyped::CallTyped(call) => {
             let Some(desc) =
@@ -12097,6 +12363,11 @@ fn emit_typed_exact_pylong_as_i64_saturating_result_with_local_env(
         codegen_env,
         func_imports,
     )?;
+    if let Some((value, facts)) = value.as_i64() {
+        return Ok(emit_i64_result_for_demand(
+            fb, value, facts, emit_ctx, demand,
+        ));
+    }
     let (value, ownership, _) = value.expect_pyobject("typed runtime primitive exact-int param");
     let pylong_as_i64_saturating_ref = func_imports.get_or_panic(
         codegen_env,
@@ -12224,17 +12495,18 @@ fn emit_runtime_primitive_typed_param_value_with_local_env(
         ParamAbi::PyObject {
             ownership: ArgOwnership::BorrowedOk,
         } => {
-            let value = emit_typed_codegen_expr_value_with_local_env(
+            let borrowed =
+                typed_expr_pyobject_input_is_borrowed_from_local_env(expr, local_env, emit_ctx);
+            let (value, ownership, _) = emit_typed_pyobject_value_with_local_env(
                 fb,
                 expr,
                 local_env,
                 emit_ctx,
-                typed_expr_pyobject_input_is_borrowed_from_local_env(expr, local_env, emit_ctx),
+                borrowed,
                 codegen_env,
                 func_imports,
+                "typed runtime primitive PyObject param",
             )?;
-            let (value, ownership, _) =
-                value.expect_pyobject("typed runtime primitive PyObject param");
             let owned_after_call = if ownership.is_owned() {
                 Some(value)
             } else {
@@ -13554,7 +13826,7 @@ fn emit_typed_direct_call_guard_test_value_with_local_env(
         local_env,
         emit_ctx,
     );
-    let value = emit_typed_codegen_expr_value_with_local_env(
+    let (raw_value, ownership, facts) = emit_typed_pyobject_value_with_local_env(
         fb,
         op.value.as_ref(),
         local_env,
@@ -13562,8 +13834,8 @@ fn emit_typed_direct_call_guard_test_value_with_local_env(
         value_is_borrowed,
         codegen_env,
         func_imports,
+        "typed direct-call guard input",
     )?;
-    let (raw_value, ownership, facts) = value.expect_pyobject("typed direct-call guard input");
 
     let guard = match &op.kind {
         TypedDirectCallGuardTestKind::RuntimeFunctionId { function_id } => {
@@ -13629,6 +13901,12 @@ fn emit_typed_codegen_expr_with_local_env(
             value: truth_i32,
             facts,
         } if facts.is_i32_bool01() => {
+            if borrowed {
+                return Err(
+                    "typed scalar bool materialization cannot satisfy a borrowed PyObject load"
+                        .to_string(),
+                );
+            }
             let is_true = fb
                 .ins()
                 .icmp_imm(ir::condcodes::IntCC::NotEqual, truth_i32, 0);
@@ -13641,10 +13919,22 @@ fn emit_typed_codegen_expr_with_local_env(
             bool_value
         }
         SoacValue::I32 { .. } | SoacValue::I64 { .. } => {
-            return Err(format!(
-                "typed expression produced {:?} without a PyObject materializer",
-                value.repr()
-            ));
+            if borrowed {
+                return Err(format!(
+                    "typed scalar {:?} materialization cannot satisfy a borrowed PyObject load",
+                    value.repr()
+                ));
+            }
+            let result = emit_soac_value_as_pyobject_for_demand(
+                fb,
+                value,
+                emit_ctx,
+                ResultDemand::PYOBJECT_OWNED,
+            );
+            let (value, ownership, _) =
+                result.expect_pyobject("typed scalar expression materialization");
+            debug_assert!(ownership.is_owned() || matches!(ownership, ValueOwnership::Immortal));
+            value
         }
     })
 }
@@ -14203,6 +14493,17 @@ fn emit_typed_local_load_result_with_local_env(
     emit_ctx: &JitEmitCtx<'_>,
     demand: ResultDemand,
 ) -> Option<EmitResult> {
+    if let InstrTyped::Load(op) = expr
+        && let Some((value, facts)) = local_env.scalar_i64_value_for_load(&op.name)
+    {
+        return Some(emit_soac_value_result_for_demand(
+            fb,
+            SoacValue::i64(value, facts),
+            emit_ctx,
+            demand,
+            None,
+        ));
+    }
     let (ownership, facts) = typed_local_load_direct_result_plan(
         expr,
         local_env,
@@ -15576,6 +15877,9 @@ fn emit_typed_codegen_i64_index_result_with_local_env(
         codegen_env,
         func_imports,
     )?;
+    if let Some((index_i64, facts)) = index_value.as_i64() {
+        return Ok(EmitResult::i64(index_i64, facts));
+    }
     let (index_obj, ownership, facts) = index_value.expect_pyobject("typed branch-table index");
     let index_i64_inst = fb.ins().call(pyobject_to_i64_ref, &[index_obj]);
     let index_i64 = fb.inst_results(index_i64_inst)[0];

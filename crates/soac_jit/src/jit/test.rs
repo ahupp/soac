@@ -88,8 +88,8 @@ mod tests {
         prepare_specialized_typed_function, push_direct_function_module_identity,
         push_shared_module_symbol_identity, render_pre_inline_clif_for_inspection,
         runtime_primitive_call_static_params_can_satisfy_abi, stable_cranelift_function_hash,
-        stable_cranelift_function_name, typed_local_load_direct_result_plan,
-        validate_direct_call_compatibility,
+        stable_cranelift_function_name, typed_expr_is_borrowable_from_local_env,
+        typed_local_load_direct_result_plan, validate_direct_call_compatibility,
     };
     use super::{
         AbruptKind, BinOp, BinOpKind, BlockArg, BlockEdge, BlockLabel, BlockParam, BlockParamRole,
@@ -219,6 +219,22 @@ mod tests {
             storage,
             local_binding_facts_for_stored_value(ref_kind),
             None,
+        )
+    }
+
+    fn local_env_i64_entry(
+        location: Option<LocalLocation>,
+        name: &str,
+        value: ir::Value,
+        facts: IntFacts,
+    ) -> LocalEnvEntry {
+        LocalEnvEntry::exact_i64(
+            location,
+            name.to_string(),
+            Vec::new(),
+            value,
+            facts,
+            LocalEnvStorage::LocalOnly,
         )
     }
 
@@ -5581,6 +5597,46 @@ def build(values):
             &env,
             &stack_slots,
             Some(&storage_layout),
+        ));
+    }
+
+    #[test]
+    fn local_env_scalar_i64_bindings_are_not_pyobject_borrowable() {
+        let facts = IntFacts::i64_known(42);
+        let name = test_name("x");
+        let env = LocalEnv {
+            entries: vec![local_env_i64_entry(
+                Some(LocalLocation(0)),
+                "x",
+                ir::Value::from_u32(1),
+                facts,
+            )],
+        };
+        let stack_slots = StackSlots {
+            names: vec!["x".to_string()],
+            storage_layout_indices: vec![0],
+            slots: Vec::new(),
+            cleanup_root_names: HashSet::new(),
+        };
+        let storage_layout = StorageLayout {
+            freevars: Vec::new(),
+            cellvars: Vec::new(),
+            runtime_cells: Vec::new(),
+            stack_slots: vec!["x".to_string()],
+        };
+        let expr = InstrTyped::Load(Load::<InstrTyped>::new(name.clone()));
+
+        assert_eq!(env.i64_facts_for_load(&name), Some(facts));
+        assert!(!typed_expr_is_borrowable_from_local_env(
+            &expr,
+            &env,
+            &stack_slots,
+            Some(&storage_layout),
+        ));
+        assert!(!local_env_entry_needs_incref_for_forward(
+            &env.entries[0],
+            0,
+            &stack_slots,
         ));
     }
 

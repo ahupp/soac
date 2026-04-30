@@ -149,6 +149,12 @@ Consumers state their demand. Integer arithmetic and comparisons can demand
    RHS. Exact-int RHS values should bind as `ExactI64`; PyObject RHS values keep
    existing ownership behavior.
 
+   Progress: Local stores whose RHS can satisfy an `I64` demand now bind as
+   `ExactI64`. Scalar local loads satisfy `I64` consumers directly and
+   materialize to an owned PyObject at Python boundaries or block-arg
+   forwarding. CFG joins still materialize through existing PyObject block
+   params, so loop-carried scalar locals are not preserved yet.
+
 6. Change local `Load(local)` to return the current local representation. A
    scalar local load should produce `SoacValue::I64` for consumers that can use
    it, and materialize only when a PyObject demand reaches the load.
