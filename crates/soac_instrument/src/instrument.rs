@@ -3,6 +3,8 @@ use soac_core::block_py::{
     CounterId, CounterScope, CounterSite, InstrId, RuntimeFunctionId,
 };
 
+pub const RUNTIME_DECREF_LOCATION_COUNTER_KIND: &str = "runtime_decref_location";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CounterHandle {
     id: CounterId,

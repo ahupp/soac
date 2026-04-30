@@ -7,12 +7,25 @@ use crate::blockpy_cache::{
     store_pre_optimization_cache, try_load_pre_optimization_cache,
 };
 use soac_config::SoacEnvConfig;
-use soac_core::block_py::{BlockPyModule, ModuleNameGen};
+use soac_core::block_py::{
+    BlockPyFunction, BlockPyModule, CounterScope as BlockPyCounterScope,
+    CounterSite as BlockPyCounterSite, FunctionExecutionMode as BlockPyFunctionExecutionMode,
+    ModuleNameGen,
+};
 use soac_core::pass_tracker::PassTracker;
-use soac_instrument::{InstrumentationConfig, define_typed_module_counter_defs};
+use soac_instrument::{
+    CounterBuilder, InstrumentationConfig, RUNTIME_DECREF_LOCATION_COUNTER_KIND,
+    define_typed_module_counter_defs,
+};
 use soac_ir_blockpy::BlockPyModuleShape;
-use soac_ir_typed::lower_blockpy_module_to_typed;
+use soac_ir_typed::{TypedBlockPyModuleShape, lower_blockpy_module_to_typed};
 pub use soac_lowering::{LoweringError, Result};
+use soac_opt::passes::{
+    REFCOUNT_STACK_SLOT_DECREF_PURPOSES, RefcountActionKind, RefcountPlan,
+    infer_module_value_facts, plan_typed_ownership_effects, refcount_release_location_branch_name,
+    refcount_stack_slot_location_branch_name,
+};
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -167,8 +180,86 @@ fn finish_pre_optimization_module(
     let mut typed_for_counters = lower_blockpy_module_to_typed(blockpy.clone());
     define_typed_module_counter_defs(&mut typed_for_counters, &instrumentation_config)
         .map_err(anyhow::Error::msg)?;
+    if matches!(
+        instrumentation_config.counters.refcounts.scope(),
+        Some(BlockPyCounterScope::Function)
+    ) {
+        let value_facts = pass_tracker.record_timing("value_facts_for_refcount_counters", || {
+            infer_module_value_facts(&blockpy)
+        });
+        let refcount_plan = pass_tracker
+            .record_timing("ownership_effects_for_refcount_counters", || {
+                plan_typed_ownership_effects(&typed_for_counters, &value_facts)
+            });
+        define_refcount_release_location_counter_defs(&mut typed_for_counters, &refcount_plan);
+    }
     blockpy.counter_defs = typed_for_counters.counter_defs;
     Ok(blockpy)
+}
+
+fn define_refcount_release_location_counter_defs(
+    module: &mut BlockPyModule<TypedBlockPyModuleShape>,
+    refcount_plan: &RefcountPlan,
+) {
+    let mut counters = CounterBuilder::new(&mut module.counter_defs);
+    for function in module
+        .callable_defs
+        .iter()
+        .filter(|function| function.execution_mode() == BlockPyFunctionExecutionMode::Jit)
+    {
+        let branches = refcount_release_location_branches_for_function(function, refcount_plan);
+        if branches.is_empty() {
+            continue;
+        }
+        counters.define_branch_counter_if_missing(
+            BlockPyCounterScope::Function,
+            RUNTIME_DECREF_LOCATION_COUNTER_KIND,
+            BlockPyCounterSite::Runtime {
+                function_id: Some(function.function_id),
+                instr_id: None,
+            },
+            branches,
+        );
+    }
+}
+
+fn refcount_release_location_branches_for_function(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    refcount_plan: &RefcountPlan,
+) -> BTreeSet<String> {
+    let mut branches = BTreeSet::new();
+    if let Some(storage_layout) = function.storage_layout().as_ref() {
+        for (slot_index, name) in storage_layout.stack_slots().iter().enumerate() {
+            for purpose in REFCOUNT_STACK_SLOT_DECREF_PURPOSES {
+                branches.insert(refcount_stack_slot_location_branch_name(
+                    purpose, slot_index, name,
+                ));
+            }
+        }
+    }
+    if let Some(function_plan) = refcount_plan.function(function.function_id) {
+        for block_plan in function_plan.blocks.values() {
+            for action in &block_plan.actions {
+                let RefcountActionKind::ReleaseLocal {
+                    local,
+                    state,
+                    reason,
+                } = &action.kind
+                else {
+                    continue;
+                };
+                if !state.needs_decref() {
+                    continue;
+                }
+                branches.insert(refcount_release_location_branch_name(
+                    block_plan.label,
+                    local,
+                    reason,
+                ));
+            }
+        }
+    }
+    branches
 }
 
 #[cfg(test)]
@@ -456,6 +547,34 @@ mod tests {
                         } if jit_function_ids.contains(function_id)
                     )
             }));
+            let location_counters = lowered
+                .counter_defs
+                .iter()
+                .filter(|counter| counter.kind == RUNTIME_DECREF_LOCATION_COUNTER_KIND)
+                .collect::<Vec<_>>();
+            assert!(
+                location_counters
+                    .iter()
+                    .any(|counter| !counter.branches.is_empty()),
+                "verify lowering should define branch counters for refcount release locations"
+            );
+            assert!(
+                location_counters
+                    .iter()
+                    .flat_map(|counter| counter.branches.iter())
+                    .any(|branch| branch.name.starts_with("purpose=stack_exit_sweep;")),
+                "verify lowering should define stack-slot DECREF attribution branches"
+            );
+            assert!(location_counters.iter().all(|counter| {
+                counter.scope == CounterScope::Function
+                    && matches!(
+                        &counter.site,
+                        CounterSite::Runtime {
+                            function_id: Some(function_id),
+                            instr_id: None,
+                        } if jit_function_ids.contains(function_id)
+                    )
+            }));
         }
 
         for mode in [SpecializationMode::Profile, SpecializationMode::Apply] {
@@ -467,7 +586,8 @@ mod tests {
                     .counter_defs
                     .iter()
                     .all(|counter| counter.kind != "runtime_incref"
-                        && counter.kind != "runtime_decref"),
+                        && counter.kind != "runtime_decref"
+                        && counter.kind != RUNTIME_DECREF_LOCATION_COUNTER_KIND),
                 "{mode:?} lowering should not add refcount counters"
             );
         }

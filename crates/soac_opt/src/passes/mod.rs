@@ -99,11 +99,15 @@ pub use local_env_plan::{
     validate_typed_local_env_resume_module_plan,
 };
 pub use ownership_effects::{
-    BlockRefcountPlan, FunctionRefcountPlan, LocalRefState, RefcountAction, RefcountActionKind,
+    BlockRefcountPlan, FunctionRefcountPlan, LocalRefState, REFCOUNT_STACK_SLOT_CLEAR_PREVIOUS,
+    REFCOUNT_STACK_SLOT_DECREF_PURPOSES, REFCOUNT_STACK_SLOT_EXIT_SWEEP,
+    REFCOUNT_STACK_SLOT_REPLACE_CLONED_PREVIOUS, REFCOUNT_STACK_SLOT_REPLACE_MOVED_PREVIOUS,
+    REFCOUNT_STACK_SLOT_REPLACE_TRANSFERRED_PREVIOUS, RefcountAction, RefcountActionKind,
     RefcountLocal, RefcountPlan, RefcountReleaseReason, RefcountSite,
     compute_function_local_live_ins, compute_function_local_must_bound_ins,
     compute_typed_function_local_live_ins, compute_typed_function_local_must_bound_ins,
-    plan_ownership_effects, plan_typed_ownership_effects, validate_ownership_effects,
-    validate_typed_ownership_effects,
+    plan_ownership_effects, plan_typed_ownership_effects, refcount_release_location_branch_name,
+    refcount_release_reason_label, refcount_stack_slot_location_branch_name,
+    validate_ownership_effects, validate_typed_ownership_effects,
 };
 pub use value_facts::infer_module_value_facts;

@@ -56,6 +56,55 @@ pub enum RefcountReleaseReason {
     ExceptionEdge { target: BlockLabel },
 }
 
+pub fn refcount_release_reason_label(reason: &RefcountReleaseReason) -> String {
+    match reason {
+        RefcountReleaseReason::Return => "return".to_string(),
+        RefcountReleaseReason::Raise => "raise".to_string(),
+        RefcountReleaseReason::Jump { target } => format!("jump->{target}"),
+        RefcountReleaseReason::IfThen { target } => format!("if_then->{target}"),
+        RefcountReleaseReason::IfElse { target } => format!("if_else->{target}"),
+        RefcountReleaseReason::BranchCase { target } => format!("branch_case->{target}"),
+        RefcountReleaseReason::BranchDefault { target } => format!("branch_default->{target}"),
+        RefcountReleaseReason::ExceptionEdge { target } => format!("exception_edge->{target}"),
+    }
+}
+
+pub fn refcount_release_location_branch_name(
+    source_label: BlockLabel,
+    local: &RefcountLocal,
+    reason: &RefcountReleaseReason,
+) -> String {
+    format!(
+        "source={source_label};reason={};slot={};name={}",
+        refcount_release_reason_label(reason),
+        local.location.slot(),
+        local.name
+    )
+}
+
+pub const REFCOUNT_STACK_SLOT_REPLACE_CLONED_PREVIOUS: &str = "stack_replace_cloned_previous";
+pub const REFCOUNT_STACK_SLOT_REPLACE_TRANSFERRED_PREVIOUS: &str =
+    "stack_replace_transferred_previous";
+pub const REFCOUNT_STACK_SLOT_REPLACE_MOVED_PREVIOUS: &str = "stack_replace_moved_previous";
+pub const REFCOUNT_STACK_SLOT_CLEAR_PREVIOUS: &str = "stack_clear_previous";
+pub const REFCOUNT_STACK_SLOT_EXIT_SWEEP: &str = "stack_exit_sweep";
+
+pub const REFCOUNT_STACK_SLOT_DECREF_PURPOSES: &[&str] = &[
+    REFCOUNT_STACK_SLOT_REPLACE_CLONED_PREVIOUS,
+    REFCOUNT_STACK_SLOT_REPLACE_TRANSFERRED_PREVIOUS,
+    REFCOUNT_STACK_SLOT_REPLACE_MOVED_PREVIOUS,
+    REFCOUNT_STACK_SLOT_CLEAR_PREVIOUS,
+    REFCOUNT_STACK_SLOT_EXIT_SWEEP,
+];
+
+pub fn refcount_stack_slot_location_branch_name(
+    purpose: &str,
+    slot_index: usize,
+    name: &str,
+) -> String {
+    format!("purpose={purpose};slot={slot_index};name={name}")
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum RefcountActionKind {
     RebindLocal {

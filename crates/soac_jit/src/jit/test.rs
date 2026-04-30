@@ -5550,6 +5550,7 @@ def build(values):
         };
         let stack_slots = StackSlots {
             names: Vec::new(),
+            storage_layout_indices: Vec::new(),
             slots: Vec::new(),
             cleanup_root_names: HashSet::new(),
         };
@@ -5578,6 +5579,7 @@ def build(values):
         };
         let stack_slots = StackSlots {
             names: Vec::new(),
+            storage_layout_indices: Vec::new(),
             slots: Vec::new(),
             cleanup_root_names: HashSet::new(),
         };
@@ -5612,6 +5614,7 @@ def build(values):
         };
         let stack_slots = StackSlots {
             names: Vec::new(),
+            storage_layout_indices: Vec::new(),
             slots: Vec::new(),
             cleanup_root_names: HashSet::new(),
         };
@@ -5713,6 +5716,7 @@ def build(values):
         };
         let stack_slots = StackSlots {
             names: Vec::new(),
+            storage_layout_indices: Vec::new(),
             slots: Vec::new(),
             cleanup_root_names: HashSet::new(),
         };
@@ -5865,6 +5869,7 @@ def build(values):
                     .map(|name| (*name).to_string())
                     .collect::<Vec<_>>(),
                 &HashSet::new(),
+                None,
             );
 
             env.store_location(
@@ -5877,6 +5882,7 @@ def build(values):
                 true,
                 CleanupRootSlotState::MaybeOwnedReference,
                 &stack_slots,
+                None,
                 ptr_ty,
                 null_tstate,
                 incref_ref,
@@ -5979,6 +5985,7 @@ def build(values):
                     .iter()
                     .map(|name| (*name).to_string())
                     .collect::<HashSet<_>>(),
+                None,
             );
 
             env.store_location(
@@ -5991,6 +5998,7 @@ def build(values):
                 allow_local_only_slot_backed_store,
                 cleanup_root_previous_state,
                 &stack_slots,
+                None,
                 ptr_ty,
                 null_tstate,
                 incref_ref,
@@ -6134,7 +6142,7 @@ def build(values):
             let value = fb.block_params(entry)[0];
             let null_tstate = fb.ins().iconst(ptr_ty, 0);
             let decref_ref = jit_module.declare_func_in_func(decref_id, &mut fb.func);
-            let stack_slots = StackSlots::new(&mut fb, &["x".to_string()], &HashSet::new());
+            let stack_slots = StackSlots::new(&mut fb, &["x".to_string()], &HashSet::new(), None);
             env.bind_entry_location_with_aliases(
                 LocalLocation(0),
                 "x",
@@ -6152,6 +6160,7 @@ def build(values):
                 "x",
                 &stack_slots,
                 CleanupRootSlotState::MaybeOwnedReference,
+                None,
                 ptr_ty,
                 null_tstate,
                 decref_ref,
@@ -6217,7 +6226,7 @@ def build(values):
             let temp_value = fb.block_params(entry)[1];
             let null_tstate = fb.ins().iconst(ptr_ty, 0);
             let decref_ref = jit_module.declare_func_in_func(decref_id, &mut fb.func);
-            let stack_slots = StackSlots::new(&mut fb, &[], &HashSet::new());
+            let stack_slots = StackSlots::new(&mut fb, &[], &HashSet::new(), None);
             env.bind_entry_location_with_aliases(
                 LocalLocation(0),
                 "target",
@@ -6250,6 +6259,7 @@ def build(values):
                 CleanupRootSlotState::MaybeOwnedReference,
                 CleanupRootSlotState::MaybeOwnedReference,
                 &stack_slots,
+                None,
                 ptr_ty,
                 null_tstate,
                 decref_ref,
@@ -6326,7 +6336,7 @@ def build(values):
             let decref_ref = jit_module.declare_func_in_func(decref_id, &mut fb.func);
             let slot_names = vec!["target".to_string(), "_dp_tmp_1".to_string()];
             let cleanup_root_names = HashSet::from(["target".to_string(), "_dp_tmp_1".to_string()]);
-            let stack_slots = StackSlots::new(&mut fb, &slot_names, &cleanup_root_names);
+            let stack_slots = StackSlots::new(&mut fb, &slot_names, &cleanup_root_names, None);
             fb.ins()
                 .stack_store(old_target, stack_slots.slot_for_name("target").unwrap(), 0);
             fb.ins().stack_store(
@@ -6366,6 +6376,7 @@ def build(values):
                 CleanupRootSlotState::MaybeOwnedReference,
                 CleanupRootSlotState::MaybeOwnedReference,
                 &stack_slots,
+                None,
                 ptr_ty,
                 null_tstate,
                 decref_ref,
@@ -6433,6 +6444,7 @@ def build(values):
         };
         let stack_slots = StackSlots {
             names: vec!["x".to_string()],
+            storage_layout_indices: vec![0],
             slots: Vec::new(),
             cleanup_root_names: HashSet::from(["x".to_string()]),
         };

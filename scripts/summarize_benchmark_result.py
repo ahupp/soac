@@ -21,6 +21,7 @@ RUNTIME_FALLBACK_KINDS = {
     "call_direct_fallback",
 }
 DEOPT_CALL_KIND = "deopt_entry_guard_miss"
+REFCOUNT_LOCATION_KIND = "runtime_decref_location"
 
 
 def parse_args() -> argparse.Namespace:
@@ -267,6 +268,7 @@ def parse_specialization_counter_dump_stats(counter_dump_path: Path) -> dict[str
         return None
 
     by_kind: dict[str, int] = defaultdict(int)
+    refcount_locations: dict[str, int] = defaultdict(int)
     for record in records:
         for row in record.get("rows", []):
             kind = str(row.get("kind") or "")
@@ -277,6 +279,25 @@ def parse_specialization_counter_dump_stats(counter_dump_path: Path) -> dict[str
             if value <= 0:
                 continue
             by_kind[kind] += value
+            if kind == REFCOUNT_LOCATION_KIND:
+                branches = row.get("branches")
+                if isinstance(branches, dict):
+                    branch_items = branches.items()
+                else:
+                    branch_items = (
+                        (branch_value.get("branch"), branch_value.get("value"))
+                        for branch_value in row.get("branch_values", [])
+                    )
+                for branch, branch_count in branch_items:
+                    branch = str(branch or "")
+                    if not branch:
+                        continue
+                    try:
+                        branch_count = int(branch_count or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    if branch_count > 0:
+                        refcount_locations[branch] += branch_count
 
     guard_failures = by_kind.get(DEOPT_CALL_KIND, 0) + sum(
         by_kind.get(kind, 0) for kind in RUNTIME_FALLBACK_KINDS
@@ -285,6 +306,12 @@ def parse_specialization_counter_dump_stats(counter_dump_path: Path) -> dict[str
         "deopt_calls": by_kind.get(DEOPT_CALL_KIND, 0),
         "guard_failures": guard_failures,
         "by_kind": dict(sorted(by_kind.items())),
+        "top_refcount_decref_locations": [
+            {"location": branch, "value": value}
+            for branch, value in sorted(
+                refcount_locations.items(), key=lambda item: (-item[1], item[0])
+            )[:20]
+        ],
         "source": str(counter_dump_path),
     }
 
@@ -339,6 +366,11 @@ def format_summary(summary: dict[str, Any]) -> str:
         lines.append("specialization counters by kind:")
         for kind, value in by_kind.items():
             lines.append(f"  {kind}: {value}")
+    top_refcount_locations = runtime_stats.get("top_refcount_decref_locations") or []
+    if top_refcount_locations:
+        lines.append("top runtime_decref_location branches:")
+        for entry in top_refcount_locations:
+            lines.append(f"  {entry['value']}: {entry['location']}")
 
     if code_size is None:
         lines.append("latest pystone jit code size: n/a")

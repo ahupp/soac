@@ -16,6 +16,7 @@ use soac_core::block_py::{
     InstrKey, InstrLocationMap, LocalLocation, ModuleShape, NameLocation, ResolvedName,
     RuntimeFunctionId, RuntimeName, StorageLayout, Store, Visit, current_instr_locations,
 };
+use soac_instrument::RUNTIME_DECREF_LOCATION_COUNTER_KIND;
 use soac_ir_blockpy::{
     BlockPyModuleShape, InstrBlockPy, constructor_init_function_id_for_entry_function,
     is_constructor_entry_function,
@@ -46,11 +47,15 @@ use soac_ir_typed::{
 use soac_opt::passes::infer_module_value_facts;
 use soac_opt::passes::{
     FunctionRefcountPlan, LocalEnvResumeBinding, LocalEnvResumePoint, LocalEnvResumeValueSource,
-    LocalRefState, RefcountActionKind, RefcountReleaseReason, RefcountSite,
-    annotate_typed_function_planned_results, annotate_typed_function_result_demands,
-    annotate_typed_function_value_facts, lower_typed_function_call_access_plan_instrs,
-    refresh_typed_function_value_facts, try_lower_typed_instr_to_codegen_legacy,
-    validate_typed_function_call_access_plans, validate_typed_function_value_facts,
+    LocalRefState, REFCOUNT_STACK_SLOT_CLEAR_PREVIOUS, REFCOUNT_STACK_SLOT_EXIT_SWEEP,
+    REFCOUNT_STACK_SLOT_REPLACE_CLONED_PREVIOUS, REFCOUNT_STACK_SLOT_REPLACE_MOVED_PREVIOUS,
+    REFCOUNT_STACK_SLOT_REPLACE_TRANSFERRED_PREVIOUS, RefcountActionKind, RefcountLocal,
+    RefcountReleaseReason, RefcountSite, annotate_typed_function_planned_results,
+    annotate_typed_function_result_demands, annotate_typed_function_value_facts,
+    lower_typed_function_call_access_plan_instrs, refcount_release_location_branch_name,
+    refcount_stack_slot_location_branch_name, refresh_typed_function_value_facts,
+    try_lower_typed_instr_to_codegen_legacy, validate_typed_function_call_access_plans,
+    validate_typed_function_value_facts,
 };
 use soac_opt::region_emission_v3::{
     ExactIntBranchSelection as OptV3ExactIntBranchSelection,
@@ -135,8 +140,8 @@ pub(crate) use counters::CounterRef;
 use counters::build_counted_runtime_refcount_helper;
 use counters::{
     CountedRefcountHelpers, build_counted_runtime_refcount_helpers,
-    collect_deopt_entry_counter_ids_by_kind, collect_runtime_counter_ids_by_kind,
-    collect_runtime_counter_refs_by_kind_branch,
+    collect_deopt_entry_counter_ids_by_kind, collect_runtime_branch_counter_refs_by_kind,
+    collect_runtime_counter_ids_by_kind, collect_runtime_counter_refs_by_kind_branch,
     collect_runtime_counter_refs_by_kind_branch_source, emit_increment_counter_slot,
     emit_record_top_value_counter_slot, scalar_counter_slot_for_id, scalar_counter_slot_for_ref,
     top_value_counter_slot_for_id,
@@ -1457,10 +1462,28 @@ struct JitEmitCtx<'mc> {
     field_generic_getattr_counter_ids: &'mc HashMap<InstrId, CounterRef>,
     field_generic_setattr_counter_ids: &'mc HashMap<InstrId, CounterRef>,
     deopt_entry_guard_miss_counter_ids: &'mc HashMap<usize, CounterId>,
+    refcount_decref_location_counter_refs: &'mc HashMap<String, CounterRef>,
     allow_local_only_slot_backed_stores: bool,
     exception_forwarded_local_names: Option<&'mc [String]>,
     type_ptr_data_ids: RefCell<HashMap<RelocTypeRef, DataId>>,
     callable_ptr_data_ids: RefCell<HashMap<RelocCallableRef, DataId>>,
+}
+
+#[derive(Clone, Copy)]
+struct RefcountDecrefLocationCounterParts<'a> {
+    counter_refs: &'a HashMap<String, CounterRef>,
+    counter_slots_by_id: &'a [CounterRuntimeSlot],
+    scalar_counter_base_value: Option<ir::Value>,
+}
+
+fn refcount_decref_location_counter_parts<'mc>(
+    ctx: &JitEmitCtx<'mc>,
+) -> RefcountDecrefLocationCounterParts<'mc> {
+    RefcountDecrefLocationCounterParts {
+        counter_refs: ctx.refcount_decref_location_counter_refs,
+        counter_slots_by_id: ctx.counter_slots_by_id,
+        scalar_counter_base_value: ctx.consts.scalar_counter_base_value,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2140,6 +2163,7 @@ impl LocalEnv {
         allow_local_only_slot_backed_store: bool,
         cleanup_root_previous_state: CleanupRootSlotState,
         stack_slots: &StackSlots,
+        refcount_location_counters: Option<RefcountDecrefLocationCounterParts<'_>>,
         ptr_ty: ir::Type,
         thread_state_value: ir::Value,
         incref_ref: ir::FuncRef,
@@ -2164,7 +2188,7 @@ impl LocalEnv {
         if should_mirror_stack_slot {
             if is_cleanup_root {
                 stack_slots
-                    .replace_transferred_value_with_previous_state(
+                    .replace_transferred_value_with_previous_state_counted(
                         fb,
                         name,
                         value,
@@ -2174,11 +2198,12 @@ impl LocalEnv {
                         thread_state_value,
                         incref_ref,
                         decref_ref,
+                        refcount_location_counters,
                     )
                     .expect("cleanup-root local missing from stack slots");
             } else {
                 stack_slots
-                    .replace_cloned_value(
+                    .replace_cloned_value_counted(
                         fb,
                         name,
                         value,
@@ -2187,6 +2212,7 @@ impl LocalEnv {
                         thread_state_value,
                         incref_ref,
                         decref_ref,
+                        refcount_location_counters,
                     )
                     .expect("slot-backed local missing from stack slots");
                 if local_ref_kind_needs_refcount_call(value_ref_kind) {
@@ -2214,7 +2240,14 @@ impl LocalEnv {
         } else {
             if previous_entry.is_none() && stack_slots.has_name(name) {
                 stack_slots
-                    .clear_value(fb, name, ptr_ty, thread_state_value, decref_ref)
+                    .clear_value_counted(
+                        fb,
+                        name,
+                        ptr_ty,
+                        thread_state_value,
+                        decref_ref,
+                        refcount_location_counters,
+                    )
                     .expect("slot-backed local missing from stack slots");
             }
             self.entries.push(LocalEnvEntry {
@@ -2276,6 +2309,7 @@ impl LocalEnv {
         name: &str,
         stack_slots: &StackSlots,
         cleanup_root_previous_state: CleanupRootSlotState,
+        refcount_location_counters: Option<RefcountDecrefLocationCounterParts<'_>>,
         ptr_ty: ir::Type,
         thread_state_value: ir::Value,
         decref_ref: ir::FuncRef,
@@ -2299,7 +2333,7 @@ impl LocalEnv {
             .unwrap_or(had_stack_slot);
         if should_clear_stack_slot {
             stack_slots
-                .clear_value_with_previous_state(
+                .clear_value_with_previous_state_counted(
                     fb,
                     name,
                     if stack_slots.has_cleanup_root_name(name) {
@@ -2310,6 +2344,7 @@ impl LocalEnv {
                     ptr_ty,
                     thread_state_value,
                     decref_ref,
+                    refcount_location_counters,
                 )
                 .expect("slot-backed delete target missing from stack slots");
         }
@@ -2350,6 +2385,7 @@ impl LocalEnv {
         source_cleanup_root_previous_state: CleanupRootSlotState,
         target_cleanup_root_previous_state: CleanupRootSlotState,
         stack_slots: &StackSlots,
+        refcount_location_counters: Option<RefcountDecrefLocationCounterParts<'_>>,
         ptr_ty: ir::Type,
         thread_state_value: ir::Value,
         decref_ref: ir::FuncRef,
@@ -2412,7 +2448,7 @@ impl LocalEnv {
             .map(|index| self.entries.remove(index));
         let target_storage = if should_mirror_stack_slot {
             stack_slots
-                .replace_moved_owned_value_with_previous_state(
+                .replace_moved_owned_value_with_previous_state_counted(
                     fb,
                     target_name,
                     source_entry.value,
@@ -2420,6 +2456,7 @@ impl LocalEnv {
                     ptr_ty,
                     thread_state_value,
                     decref_ref,
+                    refcount_location_counters,
                 )
                 .expect("moved generated-temp target missing from stack slots");
             LocalEnvStorage::StackMirror
@@ -2539,6 +2576,7 @@ fn bind_planned_local_env_at_block_entry(
     block_param_values: &[ir::Value],
     local_env: &mut LocalEnv,
     stack_slots: &StackSlots,
+    refcount_location_counters: Option<RefcountDecrefLocationCounterParts<'_>>,
     ptr_ty: ir::Type,
     thread_state_value: ir::Value,
     incref_ref: ir::FuncRef,
@@ -2583,7 +2621,7 @@ fn bind_planned_local_env_at_block_entry(
                 );
                 if binding.storage == PlannedLocalStorage::StackSlot {
                     stack_slots
-                        .replace_cloned_value(
+                        .replace_cloned_value_counted(
                             fb,
                             binding.name.as_str(),
                             param_value,
@@ -2592,6 +2630,7 @@ fn bind_planned_local_env_at_block_entry(
                             thread_state_value,
                             incref_ref,
                             decref_ref,
+                            refcount_location_counters,
                         )
                         .expect("runtime block param missing from stack slots");
                     if local_ref_kind_needs_refcount_call(entry.entry_ref_kind) {
@@ -2988,6 +3027,7 @@ fn emit_local_store_result_with_local_env(
                         name,
                         emit_ctx,
                     ),
+                    Some(refcount_decref_location_counter_parts(emit_ctx)),
                     emit_ctx.consts.ptr_ty,
                     emit_ctx.consts.thread_state_value,
                     emit_ctx.decref_ref,
@@ -3028,6 +3068,7 @@ fn emit_local_store_result_with_local_env(
                 emit_ctx,
             ),
             &emit_ctx.stack_slots,
+            Some(refcount_decref_location_counter_parts(emit_ctx)),
             emit_ctx.consts.ptr_ty,
             emit_ctx.consts.thread_state_value,
             emit_ctx.incref_ref,
@@ -3094,6 +3135,7 @@ fn emit_local_store_result_with_local_env(
                 emit_ctx,
             ),
             &emit_ctx.stack_slots,
+            Some(refcount_decref_location_counter_parts(emit_ctx)),
             emit_ctx.consts.ptr_ty,
             emit_ctx.consts.thread_state_value,
             emit_ctx.incref_ref,
@@ -3147,6 +3189,7 @@ fn emit_typed_local_store_result_with_local_env(
                     name,
                     emit_ctx,
                 ),
+                Some(refcount_decref_location_counter_parts(emit_ctx)),
                 emit_ctx.consts.ptr_ty,
                 emit_ctx.consts.thread_state_value,
                 emit_ctx.decref_ref,
@@ -3207,6 +3250,7 @@ fn emit_typed_local_store_result_with_local_env(
             emit_ctx,
         ),
         &emit_ctx.stack_slots,
+        Some(refcount_decref_location_counter_parts(emit_ctx)),
         emit_ctx.consts.ptr_ty,
         emit_ctx.consts.thread_state_value,
         emit_ctx.incref_ref,
@@ -3293,6 +3337,7 @@ fn emit_typed_owned_cell_makecell_store_result_with_local_env(
                 emit_ctx,
             ),
             &emit_ctx.stack_slots,
+            Some(refcount_decref_location_counter_parts(emit_ctx)),
             emit_ctx.consts.ptr_ty,
             emit_ctx.consts.thread_state_value,
             emit_ctx.incref_ref,
@@ -3398,6 +3443,7 @@ fn emit_typed_local_delete_result_with_local_env(
                 name,
                 emit_ctx,
             ),
+            Some(refcount_decref_location_counter_parts(emit_ctx)),
             emit_ctx.consts.ptr_ty,
             emit_ctx.consts.thread_state_value,
             emit_ctx.decref_ref,
@@ -3490,6 +3536,7 @@ fn emit_local_delete_result_with_local_env(
                 name,
                 emit_ctx,
             ),
+            Some(refcount_decref_location_counter_parts(emit_ctx)),
             emit_ctx.consts.ptr_ty,
             emit_ctx.consts.thread_state_value,
             emit_ctx.decref_ref,
@@ -3501,6 +3548,7 @@ fn emit_local_delete_result_with_local_env(
 #[derive(Clone)]
 struct StackSlots {
     names: Vec<String>,
+    storage_layout_indices: Vec<usize>,
     slots: Vec<ir::StackSlot>,
     cleanup_root_names: HashSet<String>,
 }
@@ -3510,6 +3558,7 @@ impl StackSlots {
         fb: &mut FunctionBuilder<'_>,
         slot_names: &[String],
         cleanup_root_names: &HashSet<String>,
+        storage_layout: Option<&StorageLayout>,
     ) -> Self {
         let mut slots = Vec::with_capacity(slot_names.len());
         for _ in slot_names {
@@ -3523,8 +3572,29 @@ impl StackSlots {
             .iter()
             .map(String::as_str)
             .collect::<HashSet<_>>();
+        let storage_layout_index_by_name = storage_layout
+            .map(|layout| {
+                layout
+                    .stack_slots()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, name)| (name.as_str(), index))
+                    .collect::<HashMap<_, _>>()
+            })
+            .unwrap_or_default();
+        let storage_layout_indices = slot_names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                storage_layout_index_by_name
+                    .get(name.as_str())
+                    .copied()
+                    .unwrap_or(index)
+            })
+            .collect();
         Self {
             names: slot_names.to_vec(),
+            storage_layout_indices,
             slots,
             cleanup_root_names: cleanup_root_names
                 .iter()
@@ -3535,10 +3605,16 @@ impl StackSlots {
     }
 
     fn slot_for_name(&self, name: &str) -> Option<ir::StackSlot> {
-        self.names
-            .iter()
-            .position(|candidate| candidate == name)
+        self.slot_index_for_name(name)
             .map(|index| self.slots[index])
+    }
+
+    fn slot_index_for_name(&self, name: &str) -> Option<usize> {
+        self.names.iter().position(|candidate| candidate == name)
+    }
+
+    fn storage_layout_index_for_slot_index(&self, slot_index: usize) -> usize {
+        self.storage_layout_indices[slot_index]
     }
 
     fn slot_for_block_arg_name(&self, name: &str) -> Option<ir::StackSlot> {
@@ -3592,7 +3668,7 @@ impl StackSlots {
             .any(|name| is_try_abrupt_kind_name(name.as_str()))
     }
 
-    fn replace_cloned_value(
+    fn replace_cloned_value_counted(
         &self,
         fb: &mut FunctionBuilder<'_>,
         name: &str,
@@ -3602,8 +3678,9 @@ impl StackSlots {
         thread_state_value: ir::Value,
         incref_ref: ir::FuncRef,
         decref_ref: ir::FuncRef,
+        counter_parts: Option<RefcountDecrefLocationCounterParts<'_>>,
     ) -> Option<()> {
-        self.replace_cloned_value_with_previous_state(
+        self.replace_cloned_value_with_previous_state_counted(
             fb,
             name,
             value,
@@ -3613,10 +3690,11 @@ impl StackSlots {
             thread_state_value,
             incref_ref,
             decref_ref,
+            counter_parts,
         )
     }
 
-    fn replace_cloned_value_with_previous_state(
+    fn replace_cloned_value_with_previous_state_counted(
         &self,
         fb: &mut FunctionBuilder<'_>,
         name: &str,
@@ -3627,8 +3705,10 @@ impl StackSlots {
         thread_state_value: ir::Value,
         incref_ref: ir::FuncRef,
         decref_ref: ir::FuncRef,
+        counter_parts: Option<RefcountDecrefLocationCounterParts<'_>>,
     ) -> Option<()> {
-        let slot = self.slot_for_name(name)?;
+        let slot_index = self.slot_index_for_name(name)?;
+        let slot = self.slots[slot_index];
         let previous = previous_state
             .may_hold_owned_reference()
             .then(|| fb.ins().stack_load(ptr_ty, slot, 0));
@@ -3637,6 +3717,15 @@ impl StackSlots {
         }
         fb.ins().stack_store(value, slot, 0);
         if let Some(previous) = previous {
+            if let Some(counter_parts) = counter_parts {
+                emit_refcount_stack_slot_decref_location_counter(
+                    fb,
+                    REFCOUNT_STACK_SLOT_REPLACE_CLONED_PREVIOUS,
+                    self.storage_layout_index_for_slot_index(slot_index),
+                    name,
+                    counter_parts,
+                );
+            }
             emit_decref_if_not_null(fb, ptr_ty, decref_ref, thread_state_value, previous);
         }
         Some(())
@@ -3653,7 +3742,32 @@ impl StackSlots {
         incref_ref: ir::FuncRef,
         decref_ref: ir::FuncRef,
     ) -> Option<()> {
-        self.replace_transferred_value_with_previous_state(
+        self.replace_transferred_value_counted(
+            fb,
+            name,
+            value,
+            value_ref_kind,
+            ptr_ty,
+            thread_state_value,
+            incref_ref,
+            decref_ref,
+            None,
+        )
+    }
+
+    fn replace_transferred_value_counted(
+        &self,
+        fb: &mut FunctionBuilder<'_>,
+        name: &str,
+        value: ir::Value,
+        value_ref_kind: LocalRefKind,
+        ptr_ty: ir::Type,
+        thread_state_value: ir::Value,
+        incref_ref: ir::FuncRef,
+        decref_ref: ir::FuncRef,
+        counter_parts: Option<RefcountDecrefLocationCounterParts<'_>>,
+    ) -> Option<()> {
+        self.replace_transferred_value_with_previous_state_counted(
             fb,
             name,
             value,
@@ -3663,10 +3777,11 @@ impl StackSlots {
             thread_state_value,
             incref_ref,
             decref_ref,
+            counter_parts,
         )
     }
 
-    fn replace_transferred_value_with_previous_state(
+    fn replace_transferred_value_with_previous_state_counted(
         &self,
         fb: &mut FunctionBuilder<'_>,
         name: &str,
@@ -3677,8 +3792,10 @@ impl StackSlots {
         thread_state_value: ir::Value,
         incref_ref: ir::FuncRef,
         decref_ref: ir::FuncRef,
+        counter_parts: Option<RefcountDecrefLocationCounterParts<'_>>,
     ) -> Option<()> {
-        let slot = self.slot_for_name(name)?;
+        let slot_index = self.slot_index_for_name(name)?;
+        let slot = self.slots[slot_index];
         let previous = previous_state
             .may_hold_owned_reference()
             .then(|| fb.ins().stack_load(ptr_ty, slot, 0));
@@ -3687,12 +3804,21 @@ impl StackSlots {
         }
         fb.ins().stack_store(value, slot, 0);
         if let Some(previous) = previous {
+            if let Some(counter_parts) = counter_parts {
+                emit_refcount_stack_slot_decref_location_counter(
+                    fb,
+                    REFCOUNT_STACK_SLOT_REPLACE_TRANSFERRED_PREVIOUS,
+                    self.storage_layout_index_for_slot_index(slot_index),
+                    name,
+                    counter_parts,
+                );
+            }
             emit_decref_if_not_null(fb, ptr_ty, decref_ref, thread_state_value, previous);
         }
         Some(())
     }
 
-    fn replace_moved_owned_value_with_previous_state(
+    fn replace_moved_owned_value_with_previous_state_counted(
         &self,
         fb: &mut FunctionBuilder<'_>,
         name: &str,
@@ -3701,13 +3827,24 @@ impl StackSlots {
         ptr_ty: ir::Type,
         thread_state_value: ir::Value,
         decref_ref: ir::FuncRef,
+        counter_parts: Option<RefcountDecrefLocationCounterParts<'_>>,
     ) -> Option<()> {
-        let slot = self.slot_for_name(name)?;
+        let slot_index = self.slot_index_for_name(name)?;
+        let slot = self.slots[slot_index];
         let previous = previous_state
             .may_hold_owned_reference()
             .then(|| fb.ins().stack_load(ptr_ty, slot, 0));
         fb.ins().stack_store(value, slot, 0);
         if let Some(previous) = previous {
+            if let Some(counter_parts) = counter_parts {
+                emit_refcount_stack_slot_decref_location_counter(
+                    fb,
+                    REFCOUNT_STACK_SLOT_REPLACE_MOVED_PREVIOUS,
+                    self.storage_layout_index_for_slot_index(slot_index),
+                    name,
+                    counter_parts,
+                );
+            }
             emit_decref_if_not_null(fb, ptr_ty, decref_ref, thread_state_value, previous);
         }
         Some(())
@@ -3721,17 +3858,30 @@ impl StackSlots {
         thread_state_value: ir::Value,
         decref_ref: ir::FuncRef,
     ) -> Option<()> {
-        self.clear_value_with_previous_state(
+        self.clear_value_counted(fb, name, ptr_ty, thread_state_value, decref_ref, None)
+    }
+
+    fn clear_value_counted(
+        &self,
+        fb: &mut FunctionBuilder<'_>,
+        name: &str,
+        ptr_ty: ir::Type,
+        thread_state_value: ir::Value,
+        decref_ref: ir::FuncRef,
+        counter_parts: Option<RefcountDecrefLocationCounterParts<'_>>,
+    ) -> Option<()> {
+        self.clear_value_with_previous_state_counted(
             fb,
             name,
             CleanupRootSlotState::MaybeOwnedReference,
             ptr_ty,
             thread_state_value,
             decref_ref,
+            counter_parts,
         )
     }
 
-    fn clear_value_with_previous_state(
+    fn clear_value_with_previous_state_counted(
         &self,
         fb: &mut FunctionBuilder<'_>,
         name: &str,
@@ -3739,14 +3889,25 @@ impl StackSlots {
         ptr_ty: ir::Type,
         thread_state_value: ir::Value,
         decref_ref: ir::FuncRef,
+        counter_parts: Option<RefcountDecrefLocationCounterParts<'_>>,
     ) -> Option<()> {
-        let slot = self.slot_for_name(name)?;
+        let slot_index = self.slot_index_for_name(name)?;
+        let slot = self.slots[slot_index];
         let previous = previous_state
             .may_hold_owned_reference()
             .then(|| fb.ins().stack_load(ptr_ty, slot, 0));
         let null_ptr = fb.ins().iconst(ptr_ty, 0);
         fb.ins().stack_store(null_ptr, slot, 0);
         if let Some(previous) = previous {
+            if let Some(counter_parts) = counter_parts {
+                emit_refcount_stack_slot_decref_location_counter(
+                    fb,
+                    REFCOUNT_STACK_SLOT_CLEAR_PREVIOUS,
+                    self.storage_layout_index_for_slot_index(slot_index),
+                    name,
+                    counter_parts,
+                );
+            }
             emit_decref_if_not_null(fb, ptr_ty, decref_ref, thread_state_value, previous);
         }
         Some(())
@@ -3764,15 +3925,16 @@ impl StackSlots {
         Some(())
     }
 
-    fn decref_all_with_cleanup_root_states(
+    fn decref_all_with_cleanup_root_states_counted(
         &self,
         fb: &mut FunctionBuilder<'_>,
         ptr_ty: ir::Type,
         thread_state_value: ir::Value,
         decref_ref: ir::FuncRef,
         cleanup_root_states: &HashMap<String, CleanupRootSlotState>,
+        counter_parts: Option<RefcountDecrefLocationCounterParts<'_>>,
     ) {
-        for (name, slot) in self.names.iter().zip(self.slots.iter()) {
+        for (slot_index, (name, slot)) in self.names.iter().zip(self.slots.iter()).enumerate() {
             if self.cleanup_root_names.contains(name)
                 && !cleanup_root_states
                     .get(name)
@@ -3783,6 +3945,15 @@ impl StackSlots {
                 continue;
             }
             let value = fb.ins().stack_load(ptr_ty, *slot, 0);
+            if let Some(counter_parts) = counter_parts {
+                emit_refcount_stack_slot_decref_location_counter(
+                    fb,
+                    REFCOUNT_STACK_SLOT_EXIT_SWEEP,
+                    self.storage_layout_index_for_slot_index(slot_index),
+                    name,
+                    counter_parts,
+                );
+            }
             emit_decref_if_not_null(fb, ptr_ty, decref_ref, thread_state_value, value);
         }
     }
@@ -4667,6 +4838,87 @@ fn emit_increment_counter_ref(
         )
     });
     emit_increment_counter_slot(fb, scalar_counter_base_value, counter_slot);
+}
+
+fn emit_increment_counter_ref_from_parts(
+    fb: &mut FunctionBuilder<'_>,
+    counter_ref: CounterRef,
+    counter_slots_by_id: &[CounterRuntimeSlot],
+    scalar_counter_base_value: Option<ir::Value>,
+) {
+    let counter_slot = scalar_counter_slot_for_ref(counter_slots_by_id, counter_ref)
+        .unwrap_or_else(|err| panic!("{err}"));
+    let scalar_counter_base_value = scalar_counter_base_value.unwrap_or_else(|| {
+        panic!(
+            "missing scalar counter base for counter id {}",
+            counter_ref.counter_id.0
+        )
+    });
+    emit_increment_counter_slot(fb, scalar_counter_base_value, counter_slot);
+}
+
+fn emit_refcount_decref_location_counter_from_parts(
+    fb: &mut FunctionBuilder<'_>,
+    source_label: BlockLabel,
+    local: &RefcountLocal,
+    reason: &RefcountReleaseReason,
+    counter_refs: &HashMap<String, CounterRef>,
+    counter_slots_by_id: &[CounterRuntimeSlot],
+    scalar_counter_base_value: Option<ir::Value>,
+) {
+    let branch_name = refcount_release_location_branch_name(source_label, local, reason);
+    if let Some(counter_ref) = counter_refs.get(branch_name.as_str()).copied() {
+        emit_increment_counter_ref_from_parts(
+            fb,
+            counter_ref,
+            counter_slots_by_id,
+            scalar_counter_base_value,
+        );
+    }
+}
+
+fn emit_refcount_decref_location_counter_branch_from_parts(
+    fb: &mut FunctionBuilder<'_>,
+    branch_name: &str,
+    parts: RefcountDecrefLocationCounterParts<'_>,
+) {
+    if let Some(counter_ref) = parts.counter_refs.get(branch_name).copied() {
+        emit_increment_counter_ref_from_parts(
+            fb,
+            counter_ref,
+            parts.counter_slots_by_id,
+            parts.scalar_counter_base_value,
+        );
+    }
+}
+
+fn emit_refcount_stack_slot_decref_location_counter(
+    fb: &mut FunctionBuilder<'_>,
+    purpose: &str,
+    slot_index: usize,
+    name: &str,
+    parts: RefcountDecrefLocationCounterParts<'_>,
+) {
+    let branch_name = refcount_stack_slot_location_branch_name(purpose, slot_index, name);
+    emit_refcount_decref_location_counter_branch_from_parts(fb, branch_name.as_str(), parts);
+}
+
+fn emit_refcount_decref_location_counter(
+    fb: &mut FunctionBuilder<'_>,
+    source_label: BlockLabel,
+    local: &RefcountLocal,
+    reason: &RefcountReleaseReason,
+    ctx: &JitEmitCtx<'_>,
+) {
+    emit_refcount_decref_location_counter_from_parts(
+        fb,
+        source_label,
+        local,
+        reason,
+        ctx.refcount_decref_location_counter_refs,
+        ctx.counter_slots_by_id,
+        ctx.consts.scalar_counter_base_value,
+    );
 }
 
 fn emit_raw_cell_object_for_name_with_local_env(
@@ -7357,6 +7609,7 @@ fn emit_exception_dispatch_slot_writes(
     dispatch_exc: ir::Value,
     stack_slots: &StackSlots,
     cleanup_root_previous_states: &HashMap<String, CleanupRootSlotState>,
+    refcount_location_counters: Option<RefcountDecrefLocationCounterParts<'_>>,
     ptr_ty: ir::Type,
     thread_state_value: ir::Value,
     none_const: ir::Value,
@@ -7386,7 +7639,7 @@ fn emit_exception_dispatch_slot_writes(
             }
         };
         stack_slots
-            .replace_cloned_value_with_previous_state(
+            .replace_cloned_value_with_previous_state_counted(
                 fb,
                 target_name,
                 value,
@@ -7399,6 +7652,7 @@ fn emit_exception_dispatch_slot_writes(
                 thread_state_value,
                 incref_ref,
                 decref_ref,
+                refcount_location_counters,
             )
             .expect("exception dispatch slot target missing from stack slots");
     }
@@ -7524,12 +7778,13 @@ fn emit_pop_handled_exception(
     fb.switch_to_block(pop_block);
     let previous = fb.ins().stack_load(ctx.consts.ptr_ty, previous_slot, 0);
     fb.ins().call(ctx.pop_handled_exception_ref, &[previous]);
-    let _ = ctx.stack_slots.clear_value(
+    let _ = ctx.stack_slots.clear_value_counted(
         fb,
         exception_name,
         ctx.consts.ptr_ty,
         ctx.consts.thread_state_value,
         ctx.decref_ref,
+        Some(refcount_decref_location_counter_parts(ctx)),
     );
     let null_ptr = fb.ins().iconst(ctx.consts.ptr_ty, 0);
     fb.ins().stack_store(null_ptr, previous_slot, 0);
@@ -7711,6 +7966,13 @@ fn emit_planned_local_releases_for_reason_with_local_env_excluding(
             match removed.as_ref().map(|entry| entry.storage) {
                 Some(LocalEnvStorage::LocalOnly) => {
                     let previous = removed.as_ref().expect("checked above");
+                    emit_refcount_decref_location_counter(
+                        fb,
+                        source_label,
+                        local,
+                        reason,
+                        emit_ctx,
+                    );
                     emit_ctx
                         .stack_slots
                         .replace_transferred_value(
@@ -7737,6 +7999,7 @@ fn emit_planned_local_releases_for_reason_with_local_env_excluding(
         if let Some(previous) = removed.as_ref()
             && transient_local_needs_decref(previous.ref_kind)
         {
+            emit_refcount_decref_location_counter(fb, source_label, local, reason, emit_ctx);
             emit_decref_if_not_null(
                 fb,
                 emit_ctx.consts.ptr_ty,
@@ -7751,6 +8014,7 @@ fn emit_planned_local_releases_for_reason_with_local_env_excluding(
                 .is_some_and(|entry| entry.storage == LocalEnvStorage::StackMirror)
                 || removed.is_none());
         if should_clear_stack_slot {
+            emit_refcount_decref_location_counter(fb, source_label, local, reason, emit_ctx);
             emit_ctx
                 .stack_slots
                 .clear_value(
@@ -7779,6 +8043,9 @@ fn emit_planned_stack_slot_releases_for_reason_from_parts(
     forwarded_locations: &HashSet<LocalLocation>,
     refcount_plan: &FunctionRefcountPlan,
     stack_slots: &StackSlots,
+    refcount_decref_location_counter_refs: &HashMap<String, CounterRef>,
+    counter_slots_by_id: &[CounterRuntimeSlot],
+    scalar_counter_base_value: Option<ir::Value>,
     ptr_ty: ir::Type,
     thread_state_value: ir::Value,
     decref_ref: ir::FuncRef,
@@ -7819,6 +8086,15 @@ fn emit_planned_stack_slot_releases_for_reason_from_parts(
         if !can_release_via_stack_slot_fallback(local.name.as_str()) {
             continue;
         }
+        emit_refcount_decref_location_counter_from_parts(
+            fb,
+            source_label,
+            local,
+            reason,
+            refcount_decref_location_counter_refs,
+            counter_slots_by_id,
+            scalar_counter_base_value,
+        );
         stack_slots
             .clear_value(fb, local.name.as_str(), ptr_ty, thread_state_value, decref_ref)
             .ok_or_else(|| {
@@ -15289,6 +15565,7 @@ fn emit_typed_codegen_ops(
                     emit_ctx,
                 ),
                 stack_slots,
+                Some(refcount_decref_location_counter_parts(emit_ctx)),
                 emit_ctx.consts.ptr_ty,
                 emit_ctx.consts.thread_state_value,
                 emit_ctx.decref_ref,
@@ -15779,6 +16056,9 @@ fn emit_opt_v3_scalar_threaded_store_branch(
         emit_ctx.allow_local_only_slot_backed_stores,
         CleanupRootSlotState::MaybeOwnedReference,
         &emit_ctx.stack_slots,
+        Some(refcount_decref_location_counter_parts(
+            producer_fallback_emit_ctx,
+        )),
         emit_ctx.consts.ptr_ty,
         emit_ctx.consts.thread_state_value,
         emit_ctx.incref_ref,
@@ -15864,6 +16144,7 @@ fn emit_opt_v3_scalar_threaded_store_branch(
         emit_ctx.allow_local_only_slot_backed_stores,
         CleanupRootSlotState::MaybeOwnedReference,
         &emit_ctx.stack_slots,
+        Some(refcount_decref_location_counter_parts(emit_ctx)),
         emit_ctx.consts.ptr_ty,
         emit_ctx.consts.thread_state_value,
         emit_ctx.incref_ref,
@@ -15909,6 +16190,7 @@ fn emit_opt_v3_scalar_threaded_store_branch(
         &consumer_arg_values,
         &mut consumer_env,
         &emit_ctx.stack_slots,
+        Some(refcount_decref_location_counter_parts(emit_ctx)),
         emit_ctx.consts.ptr_ty,
         emit_ctx.consts.thread_state_value,
         emit_ctx.incref_ref,
@@ -17075,6 +17357,11 @@ fn build_cranelift_run_bb_specialized_function(
     );
     let branch_outcome_counter_ids =
         collect_runtime_counter_ids_by_kind(counter_defs, function.function_id, "branch_outcomes");
+    let refcount_decref_location_counter_refs = collect_runtime_branch_counter_refs_by_kind(
+        counter_defs,
+        function.function_id,
+        RUNTIME_DECREF_LOCATION_COUNTER_KIND,
+    );
     for counter_id in call_target_counter_ids
         .values()
         .chain(call_direct_target_counter_ids.values())
@@ -17107,6 +17394,7 @@ fn build_cranelift_run_bb_specialized_function(
         .chain(field_indexed_fallback_counter_ids.values())
         .chain(field_generic_getattr_counter_ids.values())
         .chain(field_generic_setattr_counter_ids.values())
+        .chain(refcount_decref_location_counter_refs.values())
     {
         scalar_counter_slot_for_ref(counter_slots_by_id, *counter_ref).map_err(|err| {
             format!(
@@ -17306,6 +17594,7 @@ fn build_cranelift_run_bb_specialized_function(
             &mut fb,
             &required_stack_slot_names,
             &jit_local_plan.cleanup_root_names,
+            function.storage_layout().as_ref(),
         );
         let exception_state_slots = ExceptionStateSlots::new(&mut fb, function);
 
@@ -17610,7 +17899,7 @@ fn build_cranelift_run_bb_specialized_function(
 
             if needs_cleanup_root {
                 stack_slots
-                    .replace_cloned_value_with_previous_state(
+                    .replace_cloned_value_with_previous_state_counted(
                         &mut fb,
                         param.name.as_str(),
                         *value,
@@ -17620,6 +17909,11 @@ fn build_cranelift_run_bb_specialized_function(
                         thread_state_value,
                         incref_ref,
                         decref_ref,
+                        Some(RefcountDecrefLocationCounterParts {
+                            counter_refs: &refcount_decref_location_counter_refs,
+                            counter_slots_by_id,
+                            scalar_counter_base_value,
+                        }),
                     )
                     .expect("entry cleanup-root slot missing from stack slots");
             }
@@ -17627,7 +17921,7 @@ fn build_cranelift_run_bb_specialized_function(
             if needs_stack_seed && !needs_runtime_arg && !needs_cleanup_root {
                 emit_incref_if_not_null(&mut fb, ptr_ty, incref_ref, *value);
                 stack_slots
-                    .replace_cloned_value(
+                    .replace_cloned_value_counted(
                         &mut fb,
                         param.name.as_str(),
                         *value,
@@ -17636,6 +17930,11 @@ fn build_cranelift_run_bb_specialized_function(
                         thread_state_value,
                         incref_ref,
                         decref_ref,
+                        Some(RefcountDecrefLocationCounterParts {
+                            counter_refs: &refcount_decref_location_counter_refs,
+                            counter_slots_by_id,
+                            scalar_counter_base_value,
+                        }),
                     )
                     .expect("entry slot missing from stack slots");
                 fb.ins().call(decref_ref, &[thread_state_value, *value]);
@@ -17751,6 +18050,11 @@ fn build_cranelift_run_bb_specialized_function(
                 &block_param_values,
                 &mut local_env,
                 &stack_slots,
+                Some(RefcountDecrefLocationCounterParts {
+                    counter_refs: &refcount_decref_location_counter_refs,
+                    counter_slots_by_id,
+                    scalar_counter_base_value,
+                }),
                 ptr_ty,
                 thread_state_value,
                 incref_ref,
@@ -17859,6 +18163,7 @@ fn build_cranelift_run_bb_specialized_function(
                 field_generic_setattr_counter_ids: &field_generic_setattr_counter_ids,
                 deopt_entry_guard_miss_counter_ids: &deopt_entry_guard_miss_counter_ids,
                 branch_outcome_counter_ids: &branch_outcome_counter_ids,
+                refcount_decref_location_counter_refs: &refcount_decref_location_counter_refs,
                 allow_local_only_slot_backed_stores: true,
                 exception_forwarded_local_names: exc_dispatches[index]
                     .as_ref()
@@ -18006,6 +18311,11 @@ fn build_cranelift_run_bb_specialized_function(
                     .block_exit_states
                     .get(&function.blocks[index].label)
                     .unwrap_or(&empty_cleanup_root_state),
+                Some(RefcountDecrefLocationCounterParts {
+                    counter_refs: &refcount_decref_location_counter_refs,
+                    counter_slots_by_id,
+                    scalar_counter_base_value,
+                }),
                 ptr_ty,
                 thread_state_value,
                 slot_write_none_const,
@@ -18040,6 +18350,9 @@ fn build_cranelift_run_bb_specialized_function(
                 &forwarded_locations,
                 refcount_plan,
                 &stack_slots,
+                &refcount_decref_location_counter_refs,
+                counter_slots_by_id,
+                scalar_counter_base_value,
                 ptr_ty,
                 thread_state_value,
                 decref_ref,
@@ -18083,12 +18396,17 @@ fn build_cranelift_run_bb_specialized_function(
         for (cleanup_block, _, cleanup_root_states) in &return_cleanup_block_states {
             fb.switch_to_block(*cleanup_block);
             let ret_value = fb.block_params(*cleanup_block)[0];
-            stack_slots.decref_all_with_cleanup_root_states(
+            stack_slots.decref_all_with_cleanup_root_states_counted(
                 &mut fb,
                 ptr_ty,
                 thread_state_value,
                 decref_ref,
                 cleanup_root_states,
+                Some(RefcountDecrefLocationCounterParts {
+                    counter_refs: &refcount_decref_location_counter_refs,
+                    counter_slots_by_id,
+                    scalar_counter_base_value,
+                }),
             );
             fb.ins().return_(&[ret_value]);
         }
@@ -18110,7 +18428,7 @@ fn build_cranelift_run_bb_specialized_function(
                     }
                     PendingLocalFailureCleanupAction::RetireFrameRoot { name, ref_kind } => {
                         stack_slots
-                            .replace_transferred_value(
+                            .replace_transferred_value_counted(
                                 &mut fb,
                                 name.as_str(),
                                 value,
@@ -18119,6 +18437,11 @@ fn build_cranelift_run_bb_specialized_function(
                                 thread_state_value,
                                 incref_ref,
                                 decref_ref,
+                                Some(RefcountDecrefLocationCounterParts {
+                                    counter_refs: &refcount_decref_location_counter_refs,
+                                    counter_slots_by_id,
+                                    scalar_counter_base_value,
+                                }),
                             )
                             .ok_or_else(|| {
                                 format!(
@@ -18162,12 +18485,17 @@ fn build_cranelift_run_bb_specialized_function(
         if let Some((_, cleanup)) = shared_null_cleanup {
             fb.switch_to_block(cleanup);
             let error_value = fb.block_params(cleanup)[0];
-            stack_slots.decref_all_with_cleanup_root_states(
+            stack_slots.decref_all_with_cleanup_root_states_counted(
                 &mut fb,
                 ptr_ty,
                 thread_state_value,
                 decref_ref,
                 &cleanup_root_union_exit_state,
+                Some(RefcountDecrefLocationCounterParts {
+                    counter_refs: &refcount_decref_location_counter_refs,
+                    counter_slots_by_id,
+                    scalar_counter_base_value,
+                }),
             );
             fb.ins()
                 .call(set_raised_exception_ref, &[thread_state_value, error_value]);
@@ -18206,12 +18534,17 @@ fn build_cranelift_run_bb_specialized_function(
                     fb.switch_to_block(done_block);
                 }
             }
-            stack_slots.decref_all_with_cleanup_root_states(
+            stack_slots.decref_all_with_cleanup_root_states_counted(
                 &mut fb,
                 ptr_ty,
                 thread_state_value,
                 decref_ref,
                 &cleanup_root_union_exit_state,
+                Some(RefcountDecrefLocationCounterParts {
+                    counter_refs: &refcount_decref_location_counter_refs,
+                    counter_slots_by_id,
+                    scalar_counter_base_value,
+                }),
             );
             fb.ins()
                 .call(set_raised_exception_ref, &[thread_state_value, error_value]);
@@ -18223,12 +18556,17 @@ fn build_cranelift_run_bb_specialized_function(
         let step_null_args = fb.block_params(step_null_block)[0];
         let error_value =
             emit_take_current_raised_exception_or_trap(&mut fb, ptr_ty, thread_state_value);
-        stack_slots.decref_all_with_cleanup_root_states(
+        stack_slots.decref_all_with_cleanup_root_states_counted(
             &mut fb,
             ptr_ty,
             thread_state_value,
             decref_ref,
             &cleanup_root_union_exit_state,
+            Some(RefcountDecrefLocationCounterParts {
+                counter_refs: &refcount_decref_location_counter_refs,
+                counter_slots_by_id,
+                scalar_counter_base_value,
+            }),
         );
         fb.ins()
             .call(decref_ref, &[thread_state_value, step_null_args]);
@@ -18262,12 +18600,17 @@ fn build_cranelift_run_bb_specialized_function(
         fb.ins().jump(red_done_block, &[]);
         fb.switch_to_block(red_done_block);
         fb.ins().call(decref_ref, &[thread_state_value, red_args]);
-        stack_slots.decref_all_with_cleanup_root_states(
+        stack_slots.decref_all_with_cleanup_root_states_counted(
             &mut fb,
             ptr_ty,
             thread_state_value,
             decref_ref,
             &cleanup_root_union_exit_state,
+            Some(RefcountDecrefLocationCounterParts {
+                counter_refs: &refcount_decref_location_counter_refs,
+                counter_slots_by_id,
+                scalar_counter_base_value,
+            }),
         );
         fb.ins().return_(&[red_null]);
 
