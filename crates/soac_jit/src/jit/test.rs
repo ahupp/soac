@@ -203,6 +203,25 @@ mod tests {
         SoacEnvConfig::default()
     }
 
+    fn local_env_entry(
+        location: Option<LocalLocation>,
+        name: &str,
+        value: ir::Value,
+        ref_kind: LocalRefKind,
+        storage: LocalEnvStorage,
+    ) -> LocalEnvEntry {
+        LocalEnvEntry::pyobject(
+            location,
+            name.to_string(),
+            Vec::new(),
+            value,
+            ref_kind,
+            storage,
+            local_binding_facts_for_stored_value(ref_kind),
+            None,
+        )
+    }
+
     fn define_module_counter_defs_for_profile(
         module: &mut BlockPyModule<BlockPyModuleShape>,
         call_targets: bool,
@@ -5305,36 +5324,27 @@ def build(values):
         let immortal_local = ir::Value::from_u32(3);
         let env = LocalEnv {
             entries: vec![
-                LocalEnvEntry {
-                    location: Some(LocalLocation(0)),
-                    name: "local".to_string(),
-                    aliases: Vec::new(),
-                    value: owned_local,
-                    ref_kind: LocalRefKind::Owned,
-                    storage: LocalEnvStorage::LocalOnly,
-                    binding_facts: local_binding_facts_for_stored_value(LocalRefKind::Owned),
-                    py_facts: None,
-                },
-                LocalEnvEntry {
-                    location: Some(LocalLocation(1)),
-                    name: "mirror".to_string(),
-                    aliases: Vec::new(),
-                    value: owned_mirror,
-                    ref_kind: LocalRefKind::Owned,
-                    storage: LocalEnvStorage::StackMirror,
-                    binding_facts: local_binding_facts_for_stored_value(LocalRefKind::Owned),
-                    py_facts: None,
-                },
-                LocalEnvEntry {
-                    location: Some(LocalLocation(2)),
-                    name: "immortal".to_string(),
-                    aliases: Vec::new(),
-                    value: immortal_local,
-                    ref_kind: LocalRefKind::Immortal,
-                    storage: LocalEnvStorage::LocalOnly,
-                    binding_facts: local_binding_facts_for_stored_value(LocalRefKind::Immortal),
-                    py_facts: None,
-                },
+                local_env_entry(
+                    Some(LocalLocation(0)),
+                    "local",
+                    owned_local,
+                    LocalRefKind::Owned,
+                    LocalEnvStorage::LocalOnly,
+                ),
+                local_env_entry(
+                    Some(LocalLocation(1)),
+                    "mirror",
+                    owned_mirror,
+                    LocalRefKind::Owned,
+                    LocalEnvStorage::StackMirror,
+                ),
+                local_env_entry(
+                    Some(LocalLocation(2)),
+                    "immortal",
+                    immortal_local,
+                    LocalRefKind::Immortal,
+                    LocalEnvStorage::LocalOnly,
+                ),
             ],
         };
 
@@ -5345,46 +5355,34 @@ def build(values):
     fn local_env_semantic_cleanup_names_excluding_only_reports_unforwarded_locations() {
         let env = LocalEnv {
             entries: vec![
-                LocalEnvEntry {
-                    location: Some(LocalLocation(0)),
-                    name: "x".to_string(),
-                    aliases: Vec::new(),
-                    value: ir::Value::from_u32(1),
-                    ref_kind: LocalRefKind::Owned,
-                    storage: LocalEnvStorage::LocalOnly,
-                    binding_facts: local_binding_facts_for_stored_value(LocalRefKind::Owned),
-                    py_facts: None,
-                },
-                LocalEnvEntry {
-                    location: Some(LocalLocation(1)),
-                    name: "y".to_string(),
-                    aliases: Vec::new(),
-                    value: ir::Value::from_u32(2),
-                    ref_kind: LocalRefKind::Owned,
-                    storage: LocalEnvStorage::LocalOnly,
-                    binding_facts: local_binding_facts_for_stored_value(LocalRefKind::Owned),
-                    py_facts: None,
-                },
-                LocalEnvEntry {
-                    location: Some(LocalLocation(2)),
-                    name: "tmp".to_string(),
-                    aliases: Vec::new(),
-                    value: ir::Value::from_u32(3),
-                    ref_kind: LocalRefKind::Borrowed,
-                    storage: LocalEnvStorage::LocalOnly,
-                    binding_facts: local_binding_facts_for_stored_value(LocalRefKind::Borrowed),
-                    py_facts: None,
-                },
-                LocalEnvEntry {
-                    location: Some(LocalLocation(3)),
-                    name: "immortal".to_string(),
-                    aliases: Vec::new(),
-                    value: ir::Value::from_u32(4),
-                    ref_kind: LocalRefKind::Immortal,
-                    storage: LocalEnvStorage::LocalOnly,
-                    binding_facts: local_binding_facts_for_stored_value(LocalRefKind::Immortal),
-                    py_facts: None,
-                },
+                local_env_entry(
+                    Some(LocalLocation(0)),
+                    "x",
+                    ir::Value::from_u32(1),
+                    LocalRefKind::Owned,
+                    LocalEnvStorage::LocalOnly,
+                ),
+                local_env_entry(
+                    Some(LocalLocation(1)),
+                    "y",
+                    ir::Value::from_u32(2),
+                    LocalRefKind::Owned,
+                    LocalEnvStorage::LocalOnly,
+                ),
+                local_env_entry(
+                    Some(LocalLocation(2)),
+                    "tmp",
+                    ir::Value::from_u32(3),
+                    LocalRefKind::Borrowed,
+                    LocalEnvStorage::LocalOnly,
+                ),
+                local_env_entry(
+                    Some(LocalLocation(3)),
+                    "immortal",
+                    ir::Value::from_u32(4),
+                    LocalRefKind::Immortal,
+                    LocalEnvStorage::LocalOnly,
+                ),
             ],
         };
         let forwarded = HashSet::from([LocalLocation(1)]);
@@ -5439,16 +5437,13 @@ def build(values):
             let null_tstate = fb.ins().iconst(ptr_ty, 0);
             let decref_ref = jit_module.declare_func_in_func(decref_id, &mut fb.func);
             let env = LocalEnv {
-                entries: vec![LocalEnvEntry {
-                    location: Some(LocalLocation(0)),
-                    name: "x".to_string(),
-                    aliases: Vec::new(),
-                    value: fb.block_params(entry)[0],
-                    ref_kind: LocalRefKind::Owned,
-                    storage: LocalEnvStorage::LocalOnly,
-                    binding_facts: local_binding_facts_for_stored_value(LocalRefKind::Owned),
-                    py_facts: None,
-                }],
+                entries: vec![local_env_entry(
+                    Some(LocalLocation(0)),
+                    "x",
+                    fb.block_params(entry)[0],
+                    LocalRefKind::Owned,
+                    LocalEnvStorage::LocalOnly,
+                )],
             };
             let forwarded = HashSet::new();
             emit_decref_unforwarded_local_env(
@@ -5508,16 +5503,13 @@ def build(values):
             let null_tstate = fb.ins().iconst(ptr_ty, 0);
             let decref_ref = jit_module.declare_func_in_func(decref_id, &mut fb.func);
             let env = LocalEnv {
-                entries: vec![LocalEnvEntry {
-                    location: Some(LocalLocation(0)),
-                    name: "x".to_string(),
-                    aliases: Vec::new(),
-                    value: fb.block_params(entry)[0],
-                    ref_kind: LocalRefKind::Owned,
-                    storage: LocalEnvStorage::LocalOnly,
-                    binding_facts: local_binding_facts_for_stored_value(LocalRefKind::Owned),
-                    py_facts: None,
-                }],
+                entries: vec![local_env_entry(
+                    Some(LocalLocation(0)),
+                    "x",
+                    fb.block_params(entry)[0],
+                    LocalRefKind::Owned,
+                    LocalEnvStorage::LocalOnly,
+                )],
             };
             let forwarded = HashSet::from([LocalLocation(0)]);
             emit_decref_unforwarded_local_env(
@@ -5537,16 +5529,13 @@ def build(values):
     #[test]
     fn local_env_borrowability_uses_location_entries() {
         let env = LocalEnv {
-            entries: vec![LocalEnvEntry {
-                location: Some(LocalLocation(0)),
-                name: "x".to_string(),
-                aliases: Vec::new(),
-                value: ir::Value::from_u32(1),
-                ref_kind: LocalRefKind::Owned,
-                storage: LocalEnvStorage::LocalOnly,
-                binding_facts: local_binding_facts_for_stored_value(LocalRefKind::Owned),
-                py_facts: None,
-            }],
+            entries: vec![local_env_entry(
+                Some(LocalLocation(0)),
+                "x",
+                ir::Value::from_u32(1),
+                LocalRefKind::Owned,
+                LocalEnvStorage::LocalOnly,
+            )],
         };
         let stack_slots = StackSlots {
             names: Vec::new(),
@@ -5566,16 +5555,13 @@ def build(values):
     #[test]
     fn local_env_borrowability_uses_storage_layout_name_entries() {
         let env = LocalEnv {
-            entries: vec![LocalEnvEntry {
-                location: Some(LocalLocation(9)),
-                name: "x".to_string(),
-                aliases: Vec::new(),
-                value: ir::Value::from_u32(1),
-                ref_kind: LocalRefKind::Owned,
-                storage: LocalEnvStorage::LocalOnly,
-                binding_facts: local_binding_facts_for_stored_value(LocalRefKind::Owned),
-                py_facts: None,
-            }],
+            entries: vec![local_env_entry(
+                Some(LocalLocation(9)),
+                "x",
+                ir::Value::from_u32(1),
+                LocalRefKind::Owned,
+                LocalEnvStorage::LocalOnly,
+            )],
         };
         let stack_slots = StackSlots {
             names: Vec::new(),
@@ -5601,16 +5587,13 @@ def build(values):
     #[test]
     fn typed_planned_borrowed_local_input_still_requires_local_env_borrowability() {
         let env = LocalEnv {
-            entries: vec![LocalEnvEntry {
-                location: Some(LocalLocation(0)),
-                name: "x".to_string(),
-                aliases: Vec::new(),
-                value: ir::Value::from_u32(1),
-                ref_kind: LocalRefKind::Owned,
-                storage: LocalEnvStorage::LocalOnly,
-                binding_facts: local_binding_facts_for_stored_value(LocalRefKind::Owned),
-                py_facts: None,
-            }],
+            entries: vec![local_env_entry(
+                Some(LocalLocation(0)),
+                "x",
+                ir::Value::from_u32(1),
+                LocalRefKind::Owned,
+                LocalEnvStorage::LocalOnly,
+            )],
         };
         let stack_slots = StackSlots {
             names: Vec::new(),
@@ -5703,16 +5686,13 @@ def build(values):
     #[test]
     fn typed_local_load_result_plan_uses_borrowed_and_immortal_plans() {
         let env = LocalEnv {
-            entries: vec![LocalEnvEntry {
-                location: Some(LocalLocation(0)),
-                name: "x".to_string(),
-                aliases: Vec::new(),
-                value: ir::Value::from_u32(1),
-                ref_kind: LocalRefKind::Owned,
-                storage: LocalEnvStorage::LocalOnly,
-                binding_facts: local_binding_facts_for_stored_value(LocalRefKind::Owned),
-                py_facts: None,
-            }],
+            entries: vec![local_env_entry(
+                Some(LocalLocation(0)),
+                "x",
+                ir::Value::from_u32(1),
+                LocalRefKind::Owned,
+                LocalEnvStorage::LocalOnly,
+            )],
         };
         let stack_slots = StackSlots {
             names: Vec::new(),
@@ -5852,16 +5832,13 @@ def build(values):
             let null_tstate = fb.ins().iconst(ptr_ty, 0);
             let incref_ref = jit_module.declare_func_in_func(incref_id, &mut fb.func);
             let decref_ref = jit_module.declare_func_in_func(decref_id, &mut fb.func);
-            env.entries.push(LocalEnvEntry {
-                location: Some(LocalLocation(0)),
-                name: "x".to_string(),
-                aliases: Vec::new(),
-                value: old_value,
-                ref_kind: LocalRefKind::Owned,
-                storage: initial_storage,
-                binding_facts: local_binding_facts_for_stored_value(LocalRefKind::Owned),
-                py_facts: None,
-            });
+            env.entries.push(local_env_entry(
+                Some(LocalLocation(0)),
+                "x",
+                old_value,
+                LocalRefKind::Owned,
+                initial_storage,
+            ));
             let stack_slots = StackSlots::new(
                 &mut fb,
                 &stack_slot_names
@@ -6080,7 +6057,7 @@ def build(values):
         assert_eq!(env.entries.len(), 1, "{rendered}");
         assert_eq!(env.entries[0].location, Some(LocalLocation(0)));
         assert_eq!(env.entries[0].name, "x");
-        assert_eq!(env.entries[0].ref_kind, LocalRefKind::Owned);
+        assert_eq!(env.entries[0].ref_kind(), LocalRefKind::Owned);
         assert_eq!(env.entries[0].storage, LocalEnvStorage::LocalOnly);
         assert!(
             rendered.contains("call"),
@@ -6119,7 +6096,7 @@ def build(values):
 
         assert_eq!(env.entries.len(), 1, "{rendered}");
         assert_eq!(env.entries[0].storage, LocalEnvStorage::StackMirror);
-        assert_eq!(env.entries[0].ref_kind, LocalRefKind::Borrowed);
+        assert_eq!(env.entries[0].ref_kind(), LocalRefKind::Borrowed);
         assert!(
             rendered.contains("stack_store"),
             "cleanup-root stores should transfer ownership into the frame root:\n{rendered}"
@@ -6265,7 +6242,7 @@ def build(values):
         let rendered = ctx.func.display().to_string();
         assert_eq!(env.entries.len(), 1, "{rendered}");
         assert_eq!(env.entries[0].storage, LocalEnvStorage::LocalOnly);
-        assert_eq!(env.entries[0].ref_kind, LocalRefKind::Unbound);
+        assert_eq!(env.entries[0].ref_kind(), LocalRefKind::Unbound);
         assert!(
             !rendered.contains("stack_store") && !rendered.contains("stack_load"),
             "deleting a local-only slot-backed binding should not touch the stack slot:\n{rendered}"
@@ -6367,7 +6344,7 @@ def build(values):
             .find(|entry| entry.name == "target")
             .expect("target entry should remain");
         assert_eq!(target.location, Some(LocalLocation(0)));
-        assert_eq!(target.ref_kind, LocalRefKind::Owned);
+        assert_eq!(target.ref_kind(), LocalRefKind::Owned);
         assert_eq!(target.storage, LocalEnvStorage::LocalOnly);
         let temp = env
             .entries
@@ -6375,7 +6352,7 @@ def build(values):
             .find(|entry| entry.name == "_dp_tmp_1")
             .expect("source temp should remain as an unbound local");
         assert_eq!(temp.location, Some(LocalLocation(1)));
-        assert_eq!(temp.ref_kind, LocalRefKind::Unbound);
+        assert_eq!(temp.ref_kind(), LocalRefKind::Unbound);
         assert_eq!(rendered.matches("call").count(), 1, "{rendered}");
     }
 
@@ -6484,7 +6461,7 @@ def build(values):
             .find(|entry| entry.name == "target")
             .expect("target entry should remain");
         assert_eq!(target.location, Some(LocalLocation(0)));
-        assert_eq!(target.ref_kind, LocalRefKind::Borrowed);
+        assert_eq!(target.ref_kind(), LocalRefKind::Borrowed);
         assert_eq!(target.storage, LocalEnvStorage::StackMirror);
         let temp = env
             .entries
@@ -6492,7 +6469,7 @@ def build(values):
             .find(|entry| entry.name == "_dp_tmp_1")
             .expect("source temp should remain as an unbound local");
         assert_eq!(temp.location, Some(LocalLocation(1)));
-        assert_eq!(temp.ref_kind, LocalRefKind::Unbound);
+        assert_eq!(temp.ref_kind(), LocalRefKind::Unbound);
         assert_eq!(temp.storage, LocalEnvStorage::StackMirror);
         assert_eq!(
             rendered.matches("call").count(),
@@ -6523,16 +6500,13 @@ def build(values):
 
     #[test]
     fn cleanup_root_forwarding_keeps_stack_mirror_alias_borrowed() {
-        let entry = LocalEnvEntry {
-            location: Some(LocalLocation(0)),
-            name: "x".to_string(),
-            aliases: Vec::new(),
-            value: ir::Value::from_u32(1),
-            ref_kind: LocalRefKind::Borrowed,
-            storage: LocalEnvStorage::StackMirror,
-            binding_facts: local_binding_facts_for_stored_value(LocalRefKind::Borrowed),
-            py_facts: None,
-        };
+        let entry = local_env_entry(
+            Some(LocalLocation(0)),
+            "x",
+            ir::Value::from_u32(1),
+            LocalRefKind::Borrowed,
+            LocalEnvStorage::StackMirror,
+        );
         let stack_slots = StackSlots {
             names: vec!["x".to_string()],
             storage_layout_indices: vec![0],

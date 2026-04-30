@@ -140,6 +140,11 @@ Consumers state their demand. Integer arithmetic and comparisons can demand
    `LocalBindingValue`. Keep stack-slot mirror state separate from the current
    value representation.
 
+   Progress: `LocalEnvEntry` now stores a `LocalBindingValue` with existing
+   PyObject and unbound variants. This is still behavior-preserving; scalar
+   bindings are not introduced yet, but LocalEnv no longer exposes raw value,
+   ref-kind, and PyObject fact fields as separate storage.
+
 5. Change local `Store(local, rhs)` to store the natural representation of the
    RHS. Exact-int RHS values should bind as `ExactI64`; PyObject RHS values keep
    existing ownership behavior.

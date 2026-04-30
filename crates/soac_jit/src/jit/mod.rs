@@ -917,7 +917,7 @@ fn emit_local_value_for_super_deleted_name_arg(
         .entry_index_for_location(location)
         .or_else(|| local_env.entry_index_for_name(name))
     {
-        local_env.entries[index].value
+        local_env.entries[index].value()
     } else {
         let slot = ctx.stack_slots.slot_for_block_arg_name(name)?;
         fb.ins().stack_load(ctx.consts.ptr_ty, slot, 0)
@@ -1761,7 +1761,7 @@ fn emit_deopt_live_value_for_binding(
         .entry_index_for_location(binding.location)
         .or_else(|| local_env.entry_index_for_name(binding.name.as_str()))
     {
-        return Ok(local_env.entries[index].value);
+        return Ok(local_env.entries[index].value());
     }
     if let Some(slot) = ctx
         .stack_slots
@@ -1972,11 +1972,110 @@ struct LocalEnvEntry {
     location: Option<LocalLocation>,
     name: String,
     aliases: Vec<String>,
-    value: ir::Value,
-    ref_kind: LocalRefKind,
+    binding: LocalBindingValue,
     storage: LocalEnvStorage,
     binding_facts: ParamBindingFacts,
-    py_facts: Option<PyObjFacts>,
+}
+
+#[derive(Clone, Copy)]
+enum LocalBindingValue {
+    PyObject {
+        value: ir::Value,
+        ref_kind: LocalRefKind,
+        py_facts: Option<PyObjFacts>,
+    },
+    Unbound {
+        value: ir::Value,
+    },
+}
+
+impl LocalBindingValue {
+    fn pyobject(value: ir::Value, ref_kind: LocalRefKind, py_facts: Option<PyObjFacts>) -> Self {
+        if matches!(ref_kind, LocalRefKind::Unbound) {
+            return Self::unbound(value);
+        }
+        Self::PyObject {
+            value,
+            ref_kind,
+            py_facts,
+        }
+    }
+
+    const fn unbound(value: ir::Value) -> Self {
+        Self::Unbound { value }
+    }
+
+    const fn value(self) -> ir::Value {
+        match self {
+            Self::PyObject { value, .. } | Self::Unbound { value } => value,
+        }
+    }
+
+    const fn ref_kind(self) -> LocalRefKind {
+        match self {
+            Self::PyObject { ref_kind, .. } => ref_kind,
+            Self::Unbound { .. } => LocalRefKind::Unbound,
+        }
+    }
+
+    const fn py_facts(self) -> Option<PyObjFacts> {
+        match self {
+            Self::PyObject { py_facts, .. } => py_facts,
+            Self::Unbound { .. } => None,
+        }
+    }
+}
+
+impl LocalEnvEntry {
+    fn new(
+        location: Option<LocalLocation>,
+        name: String,
+        aliases: Vec<String>,
+        binding: LocalBindingValue,
+        storage: LocalEnvStorage,
+        binding_facts: ParamBindingFacts,
+    ) -> Self {
+        Self {
+            location,
+            name,
+            aliases,
+            binding,
+            storage,
+            binding_facts,
+        }
+    }
+
+    fn pyobject(
+        location: Option<LocalLocation>,
+        name: String,
+        aliases: Vec<String>,
+        value: ir::Value,
+        ref_kind: LocalRefKind,
+        storage: LocalEnvStorage,
+        binding_facts: ParamBindingFacts,
+        py_facts: Option<PyObjFacts>,
+    ) -> Self {
+        Self::new(
+            location,
+            name,
+            aliases,
+            LocalBindingValue::pyobject(value, ref_kind, py_facts),
+            storage,
+            binding_facts,
+        )
+    }
+
+    const fn value(&self) -> ir::Value {
+        self.binding.value()
+    }
+
+    const fn ref_kind(&self) -> LocalRefKind {
+        self.binding.ref_kind()
+    }
+
+    const fn py_facts(&self) -> Option<PyObjFacts> {
+        self.binding.py_facts()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2012,9 +2111,9 @@ impl LocalFailureCleanupValue {
             .unwrap_or_else(|| LocalFailureCleanupValueKey::Name(entry.name.clone()));
         Self {
             key,
-            value: entry.value,
+            value: entry.value(),
             name: entry.name.clone(),
-            ref_kind: entry.ref_kind,
+            ref_kind: entry.ref_kind(),
         }
     }
 }
@@ -2035,16 +2134,16 @@ impl LocalEnv {
             self.entry_index_for_location(location).is_none(),
             "block-entry LocalEnv location should be bound once"
         );
-        self.entries.push(LocalEnvEntry {
-            location: Some(location),
-            name: name.to_string(),
+        self.entries.push(LocalEnvEntry::pyobject(
+            Some(location),
+            name.to_string(),
             aliases,
             value,
             ref_kind,
             storage,
             binding_facts,
             py_facts,
-        });
+        ));
     }
 
     fn entry_index_for_location(&self, location: LocalLocation) -> Option<usize> {
@@ -2085,7 +2184,7 @@ impl LocalEnv {
                     .or_else(|| self.entry_index_for_name(name.id.as_str()))
             })
             .or_else(|| self.entry_index_for_name(name.id.as_str()))
-            .and_then(|index| self.entries[index].py_facts)
+            .and_then(|index| self.entries[index].py_facts())
     }
 
     fn load_location(
@@ -2101,20 +2200,20 @@ impl LocalEnv {
             .or_else(|| self.entry_index_for_name(name))
         {
             let entry = &self.entries[index];
-            let value = entry.value;
+            let value = entry.value();
             if entry.binding_facts.requires_checked_local_load()
-                || entry.ref_kind == LocalRefKind::Unbound
+                || entry.ref_kind() == LocalRefKind::Unbound
             {
                 return Some(emit_checked_local_value_or_unbound(
                     fb,
                     name,
                     value,
-                    entry.ref_kind,
+                    entry.ref_kind(),
                     ctx,
                     borrowed,
                 ));
             }
-            if local_ref_kind_needs_incref_for_load(entry.ref_kind, borrowed) {
+            if local_ref_kind_needs_incref_for_load(entry.ref_kind(), borrowed) {
                 fb.ins().call(ctx.incref_ref, &[value]);
             }
             return Some(value);
@@ -2131,20 +2230,20 @@ impl LocalEnv {
     ) -> Option<ir::Value> {
         if let Some(index) = self.entry_index_for_name(name) {
             let entry = &self.entries[index];
-            let value = entry.value;
+            let value = entry.value();
             if entry.binding_facts.requires_checked_local_load()
-                || entry.ref_kind == LocalRefKind::Unbound
+                || entry.ref_kind() == LocalRefKind::Unbound
             {
                 return Some(emit_checked_local_value_or_unbound(
                     fb,
                     name,
                     value,
-                    entry.ref_kind,
+                    entry.ref_kind(),
                     ctx,
                     borrowed,
                 ));
             }
-            if local_ref_kind_needs_incref_for_load(entry.ref_kind, borrowed) {
+            if local_ref_kind_needs_incref_for_load(entry.ref_kind(), borrowed) {
                 fb.ins().call(ctx.incref_ref, &[value]);
             }
             return Some(value);
@@ -2219,24 +2318,24 @@ impl LocalEnv {
                     emit_decref_if_not_null(fb, ptr_ty, decref_ref, thread_state_value, value);
                 }
             }
-            self.entries.push(LocalEnvEntry {
-                location: Some(
+            self.entries.push(LocalEnvEntry::pyobject(
+                Some(
                     previous_entry
                         .as_ref()
                         .and_then(|entry| entry.location)
                         .unwrap_or(location),
                 ),
-                name: name.to_string(),
-                aliases: previous_entry
+                name.to_string(),
+                previous_entry
                     .as_ref()
                     .map(|entry| entry.aliases.clone())
                     .unwrap_or_default(),
                 value,
-                ref_kind: local_ref_kind_for_stack_mirror(value_ref_kind),
-                storage: LocalEnvStorage::StackMirror,
-                binding_facts: local_binding_facts_for_stored_value(value_ref_kind),
+                local_ref_kind_for_stack_mirror(value_ref_kind),
+                LocalEnvStorage::StackMirror,
+                local_binding_facts_for_stored_value(value_ref_kind),
                 py_facts,
-            });
+            ));
         } else {
             if previous_entry.is_none() && stack_slots.has_name(name) {
                 stack_slots
@@ -2250,23 +2349,29 @@ impl LocalEnv {
                     )
                     .expect("slot-backed local missing from stack slots");
             }
-            self.entries.push(LocalEnvEntry {
-                location: Some(location),
-                name: name.to_string(),
-                aliases: previous_entry
+            self.entries.push(LocalEnvEntry::pyobject(
+                Some(location),
+                name.to_string(),
+                previous_entry
                     .as_ref()
                     .map(|entry| entry.aliases.clone())
                     .unwrap_or_default(),
                 value,
-                ref_kind: value_ref_kind,
-                storage: LocalEnvStorage::LocalOnly,
-                binding_facts: local_binding_facts_for_stored_value(value_ref_kind),
+                value_ref_kind,
+                LocalEnvStorage::LocalOnly,
+                local_binding_facts_for_stored_value(value_ref_kind),
                 py_facts,
-            });
+            ));
         }
         if let Some(previous) = previous_entry {
-            if transient_local_needs_decref(previous.ref_kind) {
-                emit_decref_if_not_null(fb, ptr_ty, decref_ref, thread_state_value, previous.value);
+            if transient_local_needs_decref(previous.ref_kind()) {
+                emit_decref_if_not_null(
+                    fb,
+                    ptr_ty,
+                    decref_ref,
+                    thread_state_value,
+                    previous.value(),
+                );
             }
         }
     }
@@ -2285,19 +2390,25 @@ impl LocalEnv {
         let previous_entry = self
             .entry_index_for_name(name)
             .map(|existing_index| self.entries.remove(existing_index));
-        self.entries.push(LocalEnvEntry {
-            location: None,
-            name: name.to_string(),
-            aliases: Vec::new(),
+        self.entries.push(LocalEnvEntry::pyobject(
+            None,
+            name.to_string(),
+            Vec::new(),
             value,
-            ref_kind: value_ref_kind,
-            storage: LocalEnvStorage::LocalOnly,
-            binding_facts: local_binding_facts_for_stored_value(value_ref_kind),
+            value_ref_kind,
+            LocalEnvStorage::LocalOnly,
+            local_binding_facts_for_stored_value(value_ref_kind),
             py_facts,
-        });
+        ));
         if let Some(previous) = previous_entry {
-            if transient_local_needs_decref(previous.ref_kind) {
-                emit_decref_if_not_null(fb, ptr_ty, decref_ref, thread_state_value, previous.value);
+            if transient_local_needs_decref(previous.ref_kind()) {
+                emit_decref_if_not_null(
+                    fb,
+                    ptr_ty,
+                    decref_ref,
+                    thread_state_value,
+                    previous.value(),
+                );
             }
         }
     }
@@ -2320,8 +2431,14 @@ impl LocalEnv {
             .or_else(|| self.entry_index_for_name(name))
         {
             let previous = self.entries.remove(index);
-            if transient_local_needs_decref(previous.ref_kind) {
-                emit_decref_if_not_null(fb, ptr_ty, decref_ref, thread_state_value, previous.value);
+            if transient_local_needs_decref(previous.ref_kind()) {
+                emit_decref_if_not_null(
+                    fb,
+                    ptr_ty,
+                    decref_ref,
+                    thread_state_value,
+                    previous.value(),
+                );
             }
             Some(previous)
         } else {
@@ -2354,22 +2471,20 @@ impl LocalEnv {
         } else {
             LocalEnvStorage::LocalOnly
         };
-        self.entries.push(LocalEnvEntry {
-            location: removed_entry
+        self.entries.push(LocalEnvEntry::new(
+            removed_entry
                 .as_ref()
                 .and_then(|entry| entry.location)
                 .or(Some(location)),
-            name: name.to_string(),
-            aliases: removed_entry
+            name.to_string(),
+            removed_entry
                 .as_ref()
                 .map(|entry| entry.aliases.clone())
                 .unwrap_or_default(),
-            value: null_ptr,
-            ref_kind: LocalRefKind::Unbound,
-            storage: unbound_storage,
-            binding_facts: local_binding_facts_for_stored_value(LocalRefKind::Unbound),
-            py_facts: None,
-        });
+            LocalBindingValue::unbound(null_ptr),
+            unbound_storage,
+            local_binding_facts_for_stored_value(LocalRefKind::Unbound),
+        ));
         Ok(())
     }
 
@@ -2424,14 +2539,14 @@ impl LocalEnv {
                 });
         let should_clear_source_stack_slot = match source_entry.storage {
             LocalEnvStorage::LocalOnly => {
-                if !transient_local_needs_decref(source_entry.ref_kind) {
+                if !transient_local_needs_decref(source_entry.ref_kind()) {
                     return false;
                 }
                 false
             }
             LocalEnvStorage::StackMirror => {
                 if !should_mirror_stack_slot
-                    || source_entry.ref_kind != LocalRefKind::Borrowed
+                    || source_entry.ref_kind() != LocalRefKind::Borrowed
                     || !source_cleanup_root_previous_state.may_hold_owned_reference()
                     || !stack_slots.has_name(source_name)
                 {
@@ -2451,7 +2566,7 @@ impl LocalEnv {
                 .replace_moved_owned_value_with_previous_state_counted(
                     fb,
                     target_name,
-                    source_entry.value,
+                    source_entry.value(),
                     target_cleanup_root_previous_state,
                     ptr_ty,
                     thread_state_value,
@@ -2469,40 +2584,44 @@ impl LocalEnv {
                 .expect("moved generated-temp source missing from stack slots");
         }
         let target_ref_kind = match target_storage {
-            LocalEnvStorage::LocalOnly => source_entry.ref_kind,
+            LocalEnvStorage::LocalOnly => source_entry.ref_kind(),
             LocalEnvStorage::StackMirror => local_ref_kind_for_stack_mirror(LocalRefKind::Owned),
         };
         let target_binding_ref_kind = match target_storage {
-            LocalEnvStorage::LocalOnly => source_entry.ref_kind,
+            LocalEnvStorage::LocalOnly => source_entry.ref_kind(),
             LocalEnvStorage::StackMirror => LocalRefKind::Owned,
         };
         let null_ptr = fb.ins().iconst(ptr_ty, 0);
-        self.entries.push(LocalEnvEntry {
-            location: Some(target_location),
-            name: target_name.to_string(),
-            aliases: previous_entry
+        self.entries.push(LocalEnvEntry::pyobject(
+            Some(target_location),
+            target_name.to_string(),
+            previous_entry
                 .as_ref()
                 .map(|entry| entry.aliases.clone())
                 .unwrap_or_default(),
-            value: source_entry.value,
-            ref_kind: target_ref_kind,
-            storage: target_storage,
-            binding_facts: local_binding_facts_for_stored_value(target_binding_ref_kind),
+            source_entry.value(),
+            target_ref_kind,
+            target_storage,
+            local_binding_facts_for_stored_value(target_binding_ref_kind),
             py_facts,
-        });
-        self.entries.push(LocalEnvEntry {
-            location: Some(source_location),
-            name: source_name.to_string(),
-            aliases: source_entry.aliases,
-            value: null_ptr,
-            ref_kind: LocalRefKind::Unbound,
-            storage: source_entry.storage,
-            binding_facts: local_binding_facts_for_stored_value(LocalRefKind::Unbound),
-            py_facts: None,
-        });
+        ));
+        self.entries.push(LocalEnvEntry::new(
+            Some(source_location),
+            source_name.to_string(),
+            source_entry.aliases,
+            LocalBindingValue::unbound(null_ptr),
+            source_entry.storage,
+            local_binding_facts_for_stored_value(LocalRefKind::Unbound),
+        ));
         if let Some(previous) = previous_entry {
-            if transient_local_needs_decref(previous.ref_kind) {
-                emit_decref_if_not_null(fb, ptr_ty, decref_ref, thread_state_value, previous.value);
+            if transient_local_needs_decref(previous.ref_kind()) {
+                emit_decref_if_not_null(
+                    fb,
+                    ptr_ty,
+                    decref_ref,
+                    thread_state_value,
+                    previous.value(),
+                );
             }
         }
         true
@@ -2524,9 +2643,9 @@ impl LocalEnv {
             .iter()
             .filter(|entry| {
                 entry.storage == LocalEnvStorage::LocalOnly
-                    && transient_local_needs_decref(entry.ref_kind)
+                    && transient_local_needs_decref(entry.ref_kind())
             })
-            .map(|entry| entry.value)
+            .map(|entry| entry.value())
             .collect()
     }
 
@@ -2541,7 +2660,7 @@ impl LocalEnv {
                     .location
                     .is_some_and(|location| forwarded_locations.contains(&location))
                     && entry.storage == LocalEnvStorage::LocalOnly
-                    && transient_local_needs_decref(entry.ref_kind)
+                    && transient_local_needs_decref(entry.ref_kind())
             })
             .map(LocalFailureCleanupValue::from_local_env_entry)
             .collect()
@@ -2560,8 +2679,8 @@ impl LocalEnv {
                     && !entry
                         .location
                         .is_some_and(|location| forwarded_locations.contains(&location))
-                    && !preserved_values.contains(&entry.value)
-                    && transient_local_needs_decref(entry.ref_kind)
+                    && !preserved_values.contains(&entry.value())
+                    && transient_local_needs_decref(entry.ref_kind())
             })
             .map(|entry| entry.name.clone())
             .collect()
@@ -2714,7 +2833,7 @@ fn local_env_entry_needs_incref_for_forward(
     {
         return false;
     }
-    local_ref_kind_needs_incref_for_forward(entry.ref_kind, forwarded_count)
+    local_ref_kind_needs_incref_for_forward(entry.ref_kind(), forwarded_count)
 }
 
 enum PlannedLocalStoreEffect {
@@ -4413,7 +4532,7 @@ fn emit_forwarded_block_arg_source_value(
 ) -> Result<(ir::Value, Option<usize>), LocalEnvEdgePrepError> {
     if let Some(value_index) = local_env.entry_index_for_block_arg_name(source_name) {
         let entry = &local_env.entries[value_index];
-        let value = entry.value;
+        let value = entry.value();
         let forwarded_count = forwarded_local_counts.entry(value_index).or_insert(0usize);
         if local_env_entry_needs_incref_for_forward(entry, *forwarded_count, &ctx.stack_slots) {
             emit_incref_if_not_null(fb, ctx.consts.ptr_ty, ctx.incref_ref, value);
@@ -7534,12 +7653,12 @@ fn emit_decref_unforwarded_local_env(
         {
             continue;
         }
-        if preserved_values.contains(&entry.value) {
+        if preserved_values.contains(&entry.value()) {
             continue;
         }
-        if transient_local_needs_decref(entry.ref_kind) {
+        if transient_local_needs_decref(entry.ref_kind()) {
             fb.ins()
-                .call(decref_ref, &[thread_state_value, entry.value]);
+                .call(decref_ref, &[thread_state_value, entry.value()]);
         }
     }
 }
@@ -7562,7 +7681,7 @@ where
     for source_name in source_names {
         if let Some(value_index) = local_env.entry_index_for_block_arg_name(source_name) {
             let entry = &local_env.entries[value_index];
-            let value = entry.value;
+            let value = entry.value();
             let forwarded_count = forwarded_local_counts.entry(value_index).or_insert(0usize);
             if local_env_entry_needs_incref_for_forward(entry, *forwarded_count, &ctx.stack_slots) {
                 emit_incref_if_not_null(fb, ptr_ty, incref_ref, value);
@@ -7952,7 +8071,7 @@ fn emit_planned_local_releases_for_reason_with_local_env_excluding(
                     emit_ctx
                         .consts
                         .step_null_args
-                        .contains(&local_env.entries[index].value)
+                        .contains(&local_env.entries[index].value())
                 })
         {
             continue;
@@ -7987,8 +8106,8 @@ fn emit_planned_local_releases_for_reason_with_local_env_excluding(
                         .replace_transferred_value(
                             fb,
                             local.name.as_str(),
-                            previous.value,
-                            previous.ref_kind,
+                            previous.value(),
+                            previous.ref_kind(),
                             emit_ctx.consts.ptr_ty,
                             emit_ctx.consts.thread_state_value,
                             emit_ctx.incref_ref,
@@ -8006,7 +8125,7 @@ fn emit_planned_local_releases_for_reason_with_local_env_excluding(
             continue;
         }
         if let Some(previous) = removed.as_ref()
-            && transient_local_needs_decref(previous.ref_kind)
+            && transient_local_needs_decref(previous.ref_kind())
         {
             emit_refcount_decref_location_counter(fb, source_label, local, reason, emit_ctx);
             emit_decref_if_not_null(
@@ -8014,7 +8133,7 @@ fn emit_planned_local_releases_for_reason_with_local_env_excluding(
                 emit_ctx.consts.ptr_ty,
                 emit_ctx.decref_ref,
                 emit_ctx.consts.thread_state_value,
-                previous.value,
+                previous.value(),
             );
         }
         let should_clear_stack_slot = !is_cleanup_root
