@@ -18,6 +18,9 @@
  * Track slow CPython fast-suite cases that pass with longer timeouts, including `test_dataclasses` and `test_bytes -m test_count`.
  * If Python blocks on a queued background function compilation, steal the queued job and run it
    synchronously; if it is already running, wait for it to complete.
+ * Implement `doc/todo/typed_local_values.md`: make typed codegen carry explicit
+   SOAC value representations through locals so exact-int scalar locals do not
+   need PyObject materialization or cleanup-root traffic until a Python boundary.
 
 
 ## Perf-to-investigate

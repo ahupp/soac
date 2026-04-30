@@ -293,19 +293,7 @@ impl ValueOwnership {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EmitResult {
     NoValue,
-    PyObject {
-        value: ir::Value,
-        ownership: ValueOwnership,
-        facts: PyObjFacts,
-    },
-    I32 {
-        value: ir::Value,
-        facts: IntFacts,
-    },
-    I64 {
-        value: ir::Value,
-        facts: IntFacts,
-    },
+    Value(SoacValue),
 }
 
 impl EmitResult {
@@ -314,11 +302,7 @@ impl EmitResult {
     }
 
     pub fn pyobject(value: ir::Value, ownership: ValueOwnership, facts: PyObjFacts) -> Self {
-        Self::PyObject {
-            value,
-            ownership,
-            facts,
-        }
+        Self::Value(SoacValue::pyobject_with_ownership(value, ownership, facts))
     }
 
     pub fn owned_pyobject(value: ir::Value, facts: PyObjFacts) -> Self {
@@ -335,40 +319,43 @@ impl EmitResult {
 
     pub fn i32(value: ir::Value, facts: IntFacts) -> Self {
         assert_eq!(facts.width, IntWidth::I32, "I32 EmitResult needs I32 facts");
-        Self::I32 { value, facts }
+        Self::Value(SoacValue::i32(value, facts))
     }
 
     pub fn i64(value: ir::Value, facts: IntFacts) -> Self {
         assert_eq!(facts.width, IntWidth::I64, "I64 EmitResult needs I64 facts");
-        Self::I64 { value, facts }
+        Self::Value(SoacValue::i64(value, facts))
     }
 
     pub const fn has_value(self) -> bool {
-        !matches!(self, Self::NoValue)
+        matches!(self, Self::Value(_))
+    }
+
+    pub const fn value(self) -> Option<SoacValue> {
+        match self {
+            Self::NoValue => None,
+            Self::Value(value) => Some(value),
+        }
     }
 
     pub const fn as_pyobject(self) -> Option<(ir::Value, ValueOwnership, PyObjFacts)> {
         match self {
-            Self::PyObject {
-                value,
-                ownership,
-                facts,
-            } => Some((value, ownership, facts)),
-            Self::NoValue | Self::I32 { .. } | Self::I64 { .. } => None,
+            Self::NoValue => None,
+            Self::Value(value) => value.as_pyobject(),
         }
     }
 
     pub const fn as_i32(self) -> Option<(ir::Value, IntFacts)> {
         match self {
-            Self::I32 { value, facts } => Some((value, facts)),
-            Self::NoValue | Self::PyObject { .. } | Self::I64 { .. } => None,
+            Self::NoValue => None,
+            Self::Value(value) => value.as_i32(),
         }
     }
 
     pub const fn as_i64(self) -> Option<(ir::Value, IntFacts)> {
         match self {
-            Self::I64 { value, facts } => Some((value, facts)),
-            Self::NoValue | Self::PyObject { .. } | Self::I32 { .. } => None,
+            Self::NoValue => None,
+            Self::Value(value) => value.as_i64(),
         }
     }
 

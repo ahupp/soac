@@ -10943,11 +10943,11 @@ fn discard_emit_result(
     result: EmitResult,
     emit_ctx: &JitEmitCtx<'_>,
 ) -> Result<(), String> {
-    match result {
-        EmitResult::NoValue | EmitResult::I32 { .. } | EmitResult::I64 { .. } => Ok(()),
-        EmitResult::PyObject {
+    match result.value() {
+        None | Some(SoacValue::I32 { .. } | SoacValue::I64 { .. }) => Ok(()),
+        Some(SoacValue::PyObject {
             value, ownership, ..
-        } => {
+        }) => {
             if ownership.is_owned() {
                 fb.ins().call(
                     emit_ctx.decref_ref,
@@ -10982,11 +10982,7 @@ fn emit_owned_pyobject_result_for_demand(
             } else {
                 ValueOwnership::Owned
             };
-            EmitResult::PyObject {
-                value,
-                ownership,
-                facts,
-            }
+            EmitResult::pyobject(value, ownership, facts)
         }
         ResultDemand::I32Bool01 => {
             panic!("owned PyObject result helper cannot satisfy I32Bool01 demand")
@@ -13705,11 +13701,7 @@ fn emit_typed_codegen_stmt_result_with_local_env(
                         "typed tuple statement result produced {ownership:?}, but demand is {demand:?}"
                     ));
                 }
-                EmitResult::PyObject {
-                    value,
-                    ownership,
-                    facts,
-                }
+                EmitResult::pyobject(value, ownership, facts)
             }
             ResultDemand::I32Bool01 | ResultDemand::I64 | ResultDemand::I64Index => {
                 panic!("typed tuple cannot satisfy non-PyObject demand {demand:?}")
@@ -13825,11 +13817,7 @@ fn emit_typed_codegen_stmt_result_with_local_env(
                         "typed getattr statement result produced {ownership:?}, but demand is {demand:?}"
                     ));
                 }
-                EmitResult::PyObject {
-                    value,
-                    ownership,
-                    facts,
-                }
+                EmitResult::pyobject(value, ownership, facts)
             }
             ResultDemand::I32Bool01 | ResultDemand::I64 | ResultDemand::I64Index => {
                 panic!("typed getattr cannot satisfy non-PyObject demand {demand:?}")
@@ -14013,11 +14001,7 @@ fn emit_typed_codegen_stmt_result_with_local_env(
             ResultDemand::PyObject { .. } => {
                 let (ownership, facts) =
                     planned_owned_pyobject_result_for_typed_expr(expr, local_env);
-                EmitResult::PyObject {
-                    value,
-                    ownership,
-                    facts,
-                }
+                EmitResult::pyobject(value, ownership, facts)
             }
             ResultDemand::I32Bool01 => unreachable!("I32Bool01 handled before PyObject emission"),
             ResultDemand::I64 => unreachable!("I64 is not a generic PyObject statement demand"),
@@ -14064,11 +14048,7 @@ fn emit_typed_local_load_result_with_local_env(
     );
     Some(match demand {
         ResultDemand::EffectOnly => EmitResult::no_value(),
-        ResultDemand::PyObject { .. } => EmitResult::PyObject {
-            value,
-            ownership,
-            facts,
-        },
+        ResultDemand::PyObject { .. } => EmitResult::pyobject(value, ownership, facts),
         ResultDemand::I32Bool01 | ResultDemand::I64 | ResultDemand::I64Index => unreachable!(
             "typed local load borrowed result plan does not satisfy non-PyObject demands"
         ),
@@ -14256,11 +14236,11 @@ fn emit_typed_exact_int_expr_pyobject_result(
     }
     let facts =
         py_facts_for_typed_expr_with_local_env(expr, local_env).unwrap_or_else(PyObjFacts::unknown);
-    Ok(Some(EmitResult::PyObject {
-        value: result.value,
-        ownership: result.ownership,
+    Ok(Some(EmitResult::pyobject(
+        result.value,
+        result.ownership,
         facts,
-    }))
+    )))
 }
 
 fn emit_opt_v3_exact_int_branch_selection(
