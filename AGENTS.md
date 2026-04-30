@@ -49,34 +49,41 @@ because it should affect engineering decisions:
    shape, not rediscover semantic decisions that could have been
    validated earlier.
 
-5. Keep payload nodes context-free.  Nested IR payloads like names and
+5. Avoid hyper-specific optimization pattern matches. If an
+   optimization only recognizes one exact block or statement shape,
+   prefer expressing the semantic property being optimized as a plan or
+   typed IR sidecar, then let codegen consume that decision
+   mechanically. Shape-specific recognizers are acceptable only as
+   temporary scaffolding with focused tests and a TODO to replace them.
+
+6. Keep payload nodes context-free.  Nested IR payloads like names and
    literals should represent only the payload itself; operation kind
    and source metadata belong on the enclosing IR node such as
    `Load`/`Store`/`Del` or `LiteralValue`, not duplicated inside the
    payload.
 
-6. Lower source names in stages. A raw AST `ExprName` may only lower
+7. Lower source names in stages. A raw AST `ExprName` may only lower
    directly to `UnresolvedName`. `LocatedName` must only come from an
    explicit name-binding or other explicit location decision, never
    from a blind default location.
 
-7. Avoid global mutable state; if needed there should be a single
+8. Avoid global mutable state; if needed there should be a single
    global structure and then all consumers take that structure rather
    than directly accessing the global.
 
-8. Keep SOAC metadata explicit across CPython callback boundaries.
+9. Keep SOAC metadata explicit across CPython callback boundaries.
    Do not smuggle compiler/runtime state through temporary Python
    attributes or thread-local context just to reach a fixed-signature
    CPython hook; prefer an explicit post-create/post-callback init step
    or a clearly-owned Rust state object.
 
-9. Keep `soac_jit_runtime` visibly raw and ABI-shaped. It is the very-hot
+10. Keep `soac_jit_runtime` visibly raw and ABI-shaped. It is the very-hot
    local runtime layer that gets inlined into generated code: avoid PyO3
    wrapper types there, name hand-written CPython layout mirrors with a
    `RawPy*` prefix, and keep casts clustered at ABI boundaries so direct
    layout access remains obvious in review.
 
-10. Treat generator and coroutine closure bindings like ordinary closure
+11. Treat generator and coroutine closure bindings like ordinary closure
    bindings. If a cleanup, ownership, or specialization path is unsound for
    generator runtime cells, make the ownership state explicit or use a more
    precise key; do not add broad generator/module exclusions that hide the
