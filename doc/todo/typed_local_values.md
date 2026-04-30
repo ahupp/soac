@@ -173,6 +173,11 @@ Consumers state their demand. Integer arithmetic and comparisons can demand
    by resumed Python/interpreter state. Scalars not needed by the boundary do
    not become cleanup roots.
 
+   Progress: guard-miss deopt live-value buffers now materialize scalar
+   `ExactI64` LocalEnv entries into owned `PyLong` values only for locals that
+   appear in the planned resume entry. Scalars outside the resume entry remain
+   SSA-only.
+
 9. Delete the narrow scalar-thread store/branch special case once generic typed
    locals cover the same behavior.
 

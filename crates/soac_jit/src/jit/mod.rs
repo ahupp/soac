@@ -1764,7 +1764,20 @@ fn emit_deopt_live_value_for_binding(
         .entry_index_for_location(binding.location)
         .or_else(|| local_env.entry_index_for_name(binding.name.as_str()))
     {
-        return Ok(local_env.entries[index].value());
+        let entry = &local_env.entries[index];
+        if let Some(facts) = entry.i64_facts() {
+            let result = emit_soac_value_result_for_demand(
+                fb,
+                SoacValue::i64(entry.value(), facts),
+                ctx,
+                ResultDemand::PYOBJECT_OWNED,
+                None,
+            );
+            let (value, ownership, _) = result.expect_pyobject("scalar deopt live value");
+            debug_assert!(ownership.is_owned() || matches!(ownership, ValueOwnership::Immortal));
+            return Ok(value);
+        }
+        return Ok(entry.value());
     }
     if let Some(slot) = ctx
         .stack_slots

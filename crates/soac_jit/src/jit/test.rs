@@ -20663,6 +20663,12 @@ class Point:
             value_is_iconst_imm(&built.ctx.func, deopt_args[5], 1),
             "guard-miss deopt should pass one live local value for x"
         );
+        let materialize_helpers = import_user_names_for_symbols(&built, &["PyLong_FromLongLong"]);
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&built.ctx.func, &materialize_helpers),
+            1,
+            "guard-miss deopt should materialize scalar live local x exactly at the resume boundary"
+        );
     }
 
     #[test]
