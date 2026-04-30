@@ -39,6 +39,10 @@ fn can_release_via_stack_slot_fallback(name: &str) -> bool {
         || name.starts_with("_dp_try_abrupt_payload_")
 }
 
+fn is_try_abrupt_kind_slot(name: &str) -> bool {
+    name.starts_with("_dp_try_abrupt_kind_")
+}
+
 fn can_use_cleanup_root(name: &str) -> bool {
     !name.starts_with("_dp_") && !can_release_via_stack_slot_fallback(name)
 }
@@ -435,72 +439,14 @@ impl PlannedJitFunctionLocals {
         &self,
         function: &BlockPyFunction<impl soac_core::block_py::ModuleShape>,
     ) -> Vec<String> {
-        let mut required = HashSet::new();
-
-        for params in &self.runtime_block_params {
-            for param in params {
-                if param.binding.storage == PlannedLocalStorage::StackSlot {
-                    required.insert(param.binding.name.clone());
-                }
-            }
-        }
-
-        for seeds in &self.stack_slot_entry_seeds {
-            for seed in seeds {
-                required.insert(seed.binding.name.clone());
-            }
-        }
-
-        for dispatch in self.exc_dispatches.iter().flatten() {
-            for (target_name, _) in &dispatch.slot_writes {
-                required.insert(target_name.clone());
-            }
-            for source_name in &dispatch.forwarded_local_names {
-                required.insert(source_name.clone());
-            }
-        }
-
-        required.extend(self.cleanup_root_names.iter().cloned());
-        for block_plan in self.refcount_plan.blocks.values() {
-            for action in &block_plan.actions {
-                let RefcountActionKind::ReleaseLocal { local, reason, .. } = &action.kind else {
-                    continue;
-                };
-                if !can_release_via_stack_slot_fallback(local.name.as_str()) {
-                    continue;
-                }
-                match reason {
-                    RefcountReleaseReason::Return | RefcountReleaseReason::Raise => {}
-                    RefcountReleaseReason::Jump { .. }
-                    | RefcountReleaseReason::IfThen { .. }
-                    | RefcountReleaseReason::IfElse { .. }
-                    | RefcountReleaseReason::BranchCase { .. }
-                    | RefcountReleaseReason::BranchDefault { .. }
-                    | RefcountReleaseReason::ExceptionEdge { .. } => {
-                        required.insert(local.name.clone());
-                    }
-                }
-            }
-        }
-
-        for block in &function.blocks {
-            if let Some(exception_name) = block.exception_param() {
-                required.insert(exception_name.to_string());
-            }
-        }
-
-        function
-            .storage_layout()
-            .as_ref()
-            .map(|layout| {
-                layout
-                    .stack_slots()
-                    .iter()
-                    .filter(|name| required.contains(*name))
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default()
+        required_stack_slot_names_for_function_parts(
+            function,
+            &self.runtime_block_params,
+            &self.stack_slot_entry_seeds,
+            &self.exc_dispatches,
+            &self.cleanup_root_names,
+            &self.refcount_plan,
+        )
     }
 
     pub fn validate_for_typed_function(
@@ -650,6 +596,82 @@ impl PlannedJitFunctionLocals {
 
         Ok(())
     }
+}
+
+fn required_stack_slot_names_for_function_parts(
+    function: &BlockPyFunction<impl soac_core::block_py::ModuleShape>,
+    runtime_block_params: &[Vec<RuntimeBlockParamPlan>],
+    stack_slot_entry_seeds: &[Vec<PlannedStackSlotEntrySeed>],
+    exc_dispatches: &[Option<BlockExcDispatchPlan>],
+    cleanup_root_names: &HashSet<String>,
+    refcount_plan: &FunctionRefcountPlan,
+) -> Vec<String> {
+    let mut required = HashSet::new();
+
+    for params in runtime_block_params {
+        for param in params {
+            if param.binding.storage == PlannedLocalStorage::StackSlot {
+                required.insert(param.binding.name.clone());
+            }
+        }
+    }
+
+    for seeds in stack_slot_entry_seeds {
+        for seed in seeds {
+            required.insert(seed.binding.name.clone());
+        }
+    }
+
+    for dispatch in exc_dispatches.iter().flatten() {
+        for (target_name, _) in &dispatch.slot_writes {
+            required.insert(target_name.clone());
+        }
+        for source_name in &dispatch.forwarded_local_names {
+            required.insert(source_name.clone());
+        }
+    }
+
+    required.extend(cleanup_root_names.iter().cloned());
+    for block_plan in refcount_plan.blocks.values() {
+        for action in &block_plan.actions {
+            let RefcountActionKind::ReleaseLocal { local, reason, .. } = &action.kind else {
+                continue;
+            };
+            if !can_release_via_stack_slot_fallback(local.name.as_str()) {
+                continue;
+            }
+            match reason {
+                RefcountReleaseReason::Return | RefcountReleaseReason::Raise => {}
+                RefcountReleaseReason::Jump { .. }
+                | RefcountReleaseReason::IfThen { .. }
+                | RefcountReleaseReason::IfElse { .. }
+                | RefcountReleaseReason::BranchCase { .. }
+                | RefcountReleaseReason::BranchDefault { .. }
+                | RefcountReleaseReason::ExceptionEdge { .. } => {
+                    required.insert(local.name.clone());
+                }
+            }
+        }
+    }
+
+    for block in &function.blocks {
+        if let Some(exception_name) = block.exception_param() {
+            required.insert(exception_name.to_string());
+        }
+    }
+
+    function
+        .storage_layout()
+        .as_ref()
+        .map(|layout| {
+            layout
+                .stack_slots()
+                .iter()
+                .filter(|name| required.contains(*name))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn validate_exception_dispatch_ownership_sinks<P: soac_core::block_py::ModuleShape>(
@@ -1405,9 +1427,9 @@ fn cleanup_root_slot_state_for_local_ref_state(state: LocalRefState) -> CleanupR
 }
 
 fn empty_cleanup_root_slot_state_map(
-    cleanup_root_names: &HashSet<String>,
+    tracked_slot_names: &HashSet<String>,
 ) -> HashMap<String, CleanupRootSlotState> {
-    cleanup_root_names
+    tracked_slot_names
         .iter()
         .map(|name| (name.clone(), CleanupRootSlotState::NoOwnedReference))
         .collect()
@@ -1442,10 +1464,10 @@ fn cleanup_root_slot_state_after_dispatch_write(source: &BlockArg) -> CleanupRoo
 fn apply_exception_dispatch_writes_to_cleanup_root_slot_state(
     mut state: HashMap<String, CleanupRootSlotState>,
     dispatch: &BlockExcDispatchPlan,
-    cleanup_root_names: &HashSet<String>,
+    tracked_slot_names: &HashSet<String>,
 ) -> HashMap<String, CleanupRootSlotState> {
     for (target_name, source) in &dispatch.slot_writes {
-        if cleanup_root_names.contains(target_name) {
+        if tracked_slot_names.contains(target_name) {
             state.insert(
                 target_name.clone(),
                 cleanup_root_slot_state_after_dispatch_write(source),
@@ -1504,7 +1526,7 @@ fn transfer_cleanup_root_slot_state_for_block(
     function_id: RuntimeFunctionId,
     block: &TypedBlock,
     refcount_plan: &FunctionRefcountPlan,
-    cleanup_root_names: &HashSet<String>,
+    tracked_slot_names: &HashSet<String>,
     entry_state: &HashMap<String, CleanupRootSlotState>,
     previous_states: Option<&mut HashMap<InstrKey, HashMap<String, CleanupRootSlotState>>>,
 ) -> HashMap<String, CleanupRootSlotState> {
@@ -1536,7 +1558,7 @@ fn transfer_cleanup_root_slot_state_for_block(
             match action {
                 RefcountActionKind::RebindLocal {
                     local, new_state, ..
-                } if cleanup_root_names.contains(&local.name) => {
+                } if tracked_slot_names.contains(&local.name) => {
                     let previous_state = state
                         .get(&local.name)
                         .copied()
@@ -1554,7 +1576,7 @@ fn transfer_cleanup_root_slot_state_for_block(
                     );
                 }
                 RefcountActionKind::DeleteLocal { local, .. }
-                    if cleanup_root_names.contains(&local.name) =>
+                    if tracked_slot_names.contains(&local.name) =>
                 {
                     let previous_state = state
                         .get(&local.name)
@@ -1579,19 +1601,24 @@ fn transfer_cleanup_root_slot_state_for_block(
 pub fn planned_cleanup_root_slot_states_for_typed_function(
     function: &BlockPyFunction<TypedBlockPyModuleShape>,
     refcount_plan: &FunctionRefcountPlan,
-    cleanup_root_names: &HashSet<String>,
+    tracked_slot_names: &HashSet<String>,
     exc_dispatches: &[Option<BlockExcDispatchPlan>],
 ) -> PlannedCleanupRootSlotStates {
     let block_count = function.blocks.len();
     let block_indices_by_label = typed_block_indices_by_label(function);
-    let mut entry_states = vec![empty_cleanup_root_slot_state_map(cleanup_root_names); block_count];
+    let mut entry_states = vec![empty_cleanup_root_slot_state_map(tracked_slot_names); block_count];
     if let Some(entry_state) = entry_states.first_mut() {
         for param in function.params.iter() {
-            if cleanup_root_names.contains(&param.name) {
+            if tracked_slot_names.contains(&param.name) {
                 entry_state.insert(
                     param.name.clone(),
                     CleanupRootSlotState::MaybeOwnedReference,
                 );
+            }
+        }
+        for name in tracked_slot_names {
+            if is_try_abrupt_kind_slot(name) {
+                entry_state.insert(name.clone(), CleanupRootSlotState::MaybeOwnedReference);
             }
         }
     }
@@ -1604,7 +1631,7 @@ pub fn planned_cleanup_root_slot_states_for_typed_function(
                 function.function_id,
                 block,
                 refcount_plan,
-                cleanup_root_names,
+                tracked_slot_names,
                 &entry_states[source_index],
                 None,
             );
@@ -1618,7 +1645,7 @@ pub fn planned_cleanup_root_slot_states_for_typed_function(
                     apply_exception_dispatch_writes_to_cleanup_root_slot_state(
                         exit_state.clone(),
                         dispatch,
-                        cleanup_root_names,
+                        tracked_slot_names,
                     )
                 } else {
                     exit_state.clone()
@@ -1638,7 +1665,7 @@ pub fn planned_cleanup_root_slot_states_for_typed_function(
             function.function_id,
             block,
             refcount_plan,
-            cleanup_root_names,
+            tracked_slot_names,
             &entry_state,
             Some(&mut instr_previous_states),
         );
@@ -1944,10 +1971,20 @@ pub fn plan_jit_typed_function_locals_from_plans(
             )
         })
         .collect::<Vec<_>>();
+    let tracked_stack_slot_names = required_stack_slot_names_for_function_parts(
+        function,
+        &runtime_block_params,
+        &stack_slot_entry_seeds,
+        &exc_dispatches,
+        &cleanup_root_names,
+        &refcount_plan,
+    )
+    .into_iter()
+    .collect::<HashSet<_>>();
     let cleanup_root_slot_states = planned_cleanup_root_slot_states_for_typed_function(
         function,
         &refcount_plan,
-        &cleanup_root_names,
+        &tracked_stack_slot_names,
         &exc_dispatches,
     );
 
@@ -1989,7 +2026,7 @@ mod tests {
     use soac_opt::passes::BlockLocalPlan;
     use soac_opt::passes::{
         FunctionRefcountPlan, LocalEnvResumeBindingState, LocalEnvResumePoint,
-        LocalEnvResumeValueSource, RefcountActionKind, RefcountReleaseReason,
+        LocalEnvResumeValueSource, LocalRefState, RefcountActionKind, RefcountReleaseReason,
         infer_module_value_facts,
     };
     use std::collections::{HashMap, HashSet};
@@ -2389,6 +2426,86 @@ def f(flag):
                 .any(|states| states.get("x") == Some(&CleanupRootSlotState::MaybeOwnedReference)),
             "at least one exit should still sweep the final x root"
         );
+    }
+
+    #[test]
+    fn cleanup_root_slot_state_treats_safe_local_alias_stores_as_borrowed() {
+        let (prepared, function_index) = prepared_typed_function(
+            r#"
+def f(a, b):
+    c = a
+    d = c
+    if d != b:
+        return 1
+    return 2
+"#,
+            "f",
+        );
+        let function = &prepared.module.callable_defs[function_index];
+        let plan = prepared
+            .locals
+            .function(function.function_id)
+            .expect("missing JIT local plan");
+
+        for name in ["a", "b", "c", "d"] {
+            assert!(
+                plan.cleanup_root_names.contains(name),
+                "expected {name} to remain a cleanup root name: {:?}",
+                plan.cleanup_root_names
+            );
+        }
+
+        let borrowed_rebinds = plan
+            .refcount_plan
+            .blocks
+            .values()
+            .flat_map(|block| block.actions.iter())
+            .filter(|action| {
+                matches!(
+                    &action.kind,
+                    RefcountActionKind::RebindLocal {
+                        local,
+                        new_state: LocalRefState::Borrowed,
+                        ..
+                    } if local.name == "c" || local.name == "d"
+                )
+            })
+            .count();
+        assert_eq!(
+            borrowed_rebinds, 2,
+            "both local aliases should be planned as borrowed rebinds"
+        );
+
+        for block in &function.blocks {
+            if !matches!(block.term, BlockTerm::Return(_)) {
+                continue;
+            }
+            let states = plan
+                .cleanup_root_slot_states
+                .block_exit_states
+                .get(&block.label)
+                .unwrap_or_else(|| panic!("missing exit state for {}", block.label));
+            assert_eq!(
+                states.get("a"),
+                Some(&CleanupRootSlotState::MaybeOwnedReference),
+                "source parameter a should still own the borrowed alias value"
+            );
+            assert_eq!(
+                states.get("b"),
+                Some(&CleanupRootSlotState::MaybeOwnedReference),
+                "unaliased parameter b should still be cleaned up"
+            );
+            assert_eq!(
+                states.get("c"),
+                Some(&CleanupRootSlotState::NoOwnedReference),
+                "borrowed alias c should not be exit-swept"
+            );
+            assert_eq!(
+                states.get("d"),
+                Some(&CleanupRootSlotState::NoOwnedReference),
+                "borrowed alias d should not be exit-swept"
+            );
+        }
     }
 
     #[test]

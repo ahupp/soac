@@ -6013,6 +6013,66 @@ def build(values):
         (env, rendered)
     }
 
+    fn stack_exit_sweep_test_clif(
+        cleanup_root_states: HashMap<String, CleanupRootSlotState>,
+    ) -> String {
+        let compile_session = crate::session::CompileSession::new();
+        let mut jit_module =
+            new_jit_module(&compile_session).expect("test jit module should construct");
+        let ptr_ty = jit_module.target_config().pointer_type();
+
+        let mut decref_signature = jit_module.make_signature();
+        decref_signature.params.push(ir::AbiParam::new(ptr_ty));
+        decref_signature.params.push(ir::AbiParam::new(ptr_ty));
+
+        let mut wrapper_signature = jit_module.make_signature();
+        wrapper_signature.params.push(ir::AbiParam::new(ptr_ty));
+
+        let wrapper_id =
+            declare_local_fn(&mut jit_module, "stack_exit_sweep_test", &wrapper_signature)
+                .expect("wrapper function should declare");
+        let decref_id = declare_local_fn(
+            &mut jit_module,
+            "stack_exit_sweep_test_decref",
+            &decref_signature,
+        )
+        .expect("decref helper should declare");
+
+        let mut ctx = jit_module.make_context();
+        ctx.func.name = ir::UserFuncName::user(0, wrapper_id.as_u32());
+        ctx.func.signature = wrapper_signature;
+
+        let mut builder_ctx = FunctionBuilderContext::new();
+        {
+            let mut fb = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
+            let entry = fb.create_block();
+            fb.append_block_params_for_function_params(entry);
+            fb.switch_to_block(entry);
+            fb.seal_block(entry);
+
+            let value = fb.block_params(entry)[0];
+            let thread_state = fb.ins().iconst(ptr_ty, 0);
+            let decref_ref = jit_module.declare_func_in_func(decref_id, &mut fb.func);
+            let stack_slots = StackSlots::new(&mut fb, &["x".to_string()], &HashSet::new(), None);
+            fb.ins()
+                .stack_store(value, stack_slots.slot_for_name("x").unwrap(), 0);
+
+            stack_slots.decref_all_with_cleanup_root_states_counted(
+                &mut fb,
+                ptr_ty,
+                thread_state,
+                decref_ref,
+                &cleanup_root_states,
+                None,
+            );
+            fb.ins().return_(&[]);
+            fb.seal_all_blocks();
+            fb.finalize();
+        }
+
+        ctx.func.display().to_string()
+    }
+
     #[test]
     fn local_env_store_keeps_new_local_binding_after_rebind() {
         let (env, rendered) = local_env_store_test_state(&[], LocalEnvStorage::LocalOnly);
@@ -6085,6 +6145,37 @@ def build(values):
         assert!(
             !rendered.contains("stack_load"),
             "empty cleanup-root first store should not load a previous slot value:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn stack_exit_sweep_skips_tracked_non_cleanup_slot_known_empty() {
+        let rendered = stack_exit_sweep_test_clif(HashMap::from([(
+            "x".to_string(),
+            CleanupRootSlotState::NoOwnedReference,
+        )]));
+
+        assert!(
+            !rendered.contains("stack_load"),
+            "known-empty non-cleanup slot should not be swept on exit:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("call"),
+            "known-empty non-cleanup slot should not emit a DECREF call:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn stack_exit_sweep_keeps_untracked_non_cleanup_slot_conservative() {
+        let rendered = stack_exit_sweep_test_clif(HashMap::new());
+
+        assert!(
+            rendered.contains("stack_load"),
+            "untracked non-cleanup slot should still be loaded for conservative exit cleanup:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("call"),
+            "untracked non-cleanup slot should still emit conservative exit cleanup:\n{rendered}"
         );
     }
 

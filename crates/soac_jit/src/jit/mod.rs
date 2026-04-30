@@ -2747,6 +2747,7 @@ fn cleanup_root_state_key(states: &HashMap<String, CleanupRootSlotState>) -> Vec
 fn local_ref_kind_for_planned_local_state(state: LocalRefState) -> LocalRefKind {
     match state {
         LocalRefState::Unbound => LocalRefKind::Unbound,
+        LocalRefState::Borrowed => LocalRefKind::Borrowed,
         LocalRefState::Owned => LocalRefKind::Owned,
         LocalRefState::Immortal => LocalRefKind::Immortal,
     }
@@ -3198,25 +3199,34 @@ fn emit_typed_local_store_result_with_local_env(
         return Ok(Some(emit_none_for_demand(fb, emit_ctx, demand)));
     }
 
-    let value_demand = op
-        .value
-        .result_demand()
-        .unwrap_or(ResultDemand::PYOBJECT_OWNED);
+    let planned_store_effect = planned_typed_local_store_effect(expr, location, emit_ctx);
+    let planned_borrowed_store = matches!(
+        planned_store_effect.as_ref(),
+        Some(PlannedLocalStoreEffect::Rebind(LocalRefKind::Borrowed))
+    );
+    let store_value_demand = if planned_borrowed_store {
+        ResultDemand::PYOBJECT_BORROWED_OK
+    } else {
+        ResultDemand::PYOBJECT_OWNED
+    };
+    let value_demand = if planned_borrowed_store {
+        store_value_demand
+    } else {
+        op.value.result_demand().unwrap_or(store_value_demand)
+    };
     let value_result = match value_demand {
-        ResultDemand::PyObject { borrowed_ok: false } => {
-            emit_typed_codegen_stmt_result_with_local_env(
-                fb,
-                &op.value,
-                local_env,
-                emit_ctx,
-                value_demand,
-                codegen_env,
-                func_imports,
-            )?
-        }
+        ResultDemand::PyObject { .. } => emit_typed_codegen_stmt_result_with_local_env(
+            fb,
+            &op.value,
+            local_env,
+            emit_ctx,
+            value_demand,
+            codegen_env,
+            func_imports,
+        )?,
         other => {
             return Err(format!(
-                "typed local store RHS requires owned PyObject demand, got {other:?}"
+                "typed local store RHS requires PyObject demand, got {other:?}"
             ));
         }
     };
@@ -3226,12 +3236,12 @@ fn emit_typed_local_store_result_with_local_env(
     } else {
         value_py_facts
     };
-    if !ownership.can_satisfy_pyobject_demand(ResultDemand::PYOBJECT_OWNED) {
+    if !ownership.can_satisfy_pyobject_demand(store_value_demand) {
         return Err(format!(
-            "typed local store RHS produced {ownership:?}, but store requires owned PyObject"
+            "typed local store RHS produced {ownership:?}, but store requires {store_value_demand:?}"
         ));
     }
-    let value_ref_kind = match planned_typed_local_store_effect(expr, location, emit_ctx) {
+    let value_ref_kind = match planned_store_effect {
         Some(PlannedLocalStoreEffect::Rebind(ref_kind)) => ref_kind,
         Some(PlannedLocalStoreEffect::Delete) => unreachable!(),
         None => local_ref_kind_for_typed_stored_value(&op.value, ownership),
@@ -3935,12 +3945,11 @@ impl StackSlots {
         counter_parts: Option<RefcountDecrefLocationCounterParts<'_>>,
     ) {
         for (slot_index, (name, slot)) in self.names.iter().zip(self.slots.iter()).enumerate() {
-            if self.cleanup_root_names.contains(name)
-                && !cleanup_root_states
-                    .get(name)
-                    .copied()
-                    .unwrap_or(CleanupRootSlotState::MaybeOwnedReference)
-                    .may_hold_owned_reference()
+            if !cleanup_root_states
+                .get(name)
+                .copied()
+                .unwrap_or(CleanupRootSlotState::MaybeOwnedReference)
+                .may_hold_owned_reference()
             {
                 continue;
             }

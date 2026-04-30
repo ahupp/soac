@@ -19,6 +19,7 @@ use std::collections::{HashMap, HashSet};
 #[derive(Clone, Copy, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum LocalRefState {
     Unbound,
+    Borrowed,
     Owned,
     Immortal,
 }
@@ -935,9 +936,10 @@ fn plan_typed_block_refcounts(
         must_bound_on_entry,
         is_entry_block,
     );
+    let mut borrow_owners = HashMap::<LocalLocation, LocalLocation>::new();
     let mut actions = Vec::new();
 
-    for instr in &block.body {
+    for (instr_index, instr) in block.body.iter().enumerate() {
         match instr {
             InstrTyped::Store(op) => {
                 let Some(location) = typed_store_binding_location(op, owned_cell_locations) else {
@@ -950,7 +952,25 @@ fn plan_typed_block_refcounts(
                     .get(&location)
                     .copied()
                     .unwrap_or(LocalRefState::Unbound);
-                let new_state = state_for_typed_expr(function.function_id, &op.value, facts);
+                let borrow_owner = typed_local_store_borrow_owner(
+                    function,
+                    block,
+                    instr_index,
+                    location,
+                    &op.value,
+                    &env,
+                    &borrow_owners,
+                    locals,
+                    owned_cell_locations,
+                    target_params,
+                    local_liveness,
+                    location_by_name,
+                );
+                let new_state = if borrow_owner.is_some() {
+                    LocalRefState::Borrowed
+                } else {
+                    state_for_typed_expr(function.function_id, &op.value, facts)
+                };
                 actions.push(RefcountAction {
                     site: RefcountSite::Instr(instr.semantic_instr_key(function.function_id)),
                     kind: RefcountActionKind::RebindLocal {
@@ -960,6 +980,11 @@ fn plan_typed_block_refcounts(
                     },
                 });
                 env.insert(location, new_state);
+                if let Some(owner) = borrow_owner {
+                    borrow_owners.insert(location, owner);
+                } else {
+                    borrow_owners.remove(&location);
+                }
             }
             InstrTyped::Del(op) => {
                 let Some(location) = op.name.local_location() else {
@@ -977,6 +1002,7 @@ fn plan_typed_block_refcounts(
                     kind: RefcountActionKind::DeleteLocal { local, old_state },
                 });
                 env.insert(location, LocalRefState::Unbound);
+                borrow_owners.remove(&location);
             }
             _ => {}
         }
@@ -1114,6 +1140,236 @@ fn plan_typed_block_refcounts(
         label: block.label,
         actions,
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn typed_local_store_borrow_owner(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    block: &TypedBlock,
+    instr_index: usize,
+    target_location: LocalLocation,
+    value: &InstrTyped,
+    env: &HashMap<LocalLocation, LocalRefState>,
+    borrow_owners: &HashMap<LocalLocation, LocalLocation>,
+    locals: &HashMap<LocalLocation, RefcountLocal>,
+    owned_cell_locations: &HashMap<u32, LocalLocation>,
+    target_params: &HashMap<BlockLabel, Vec<String>>,
+    local_liveness: &LocalLiveness,
+    location_by_name: &HashMap<String, LocalLocation>,
+) -> Option<LocalLocation> {
+    if locals
+        .get(&target_location)
+        .is_none_or(|local| local.name.starts_with("_dp_"))
+    {
+        return None;
+    }
+    let source_location = typed_local_load_location(value)?;
+    if source_location == target_location {
+        return None;
+    }
+    let source_state = env
+        .get(&source_location)
+        .copied()
+        .unwrap_or(LocalRefState::Unbound);
+    let owner_location = match source_state {
+        LocalRefState::Owned => source_location,
+        LocalRefState::Borrowed => *borrow_owners.get(&source_location)?,
+        LocalRefState::Immortal | LocalRefState::Unbound => return None,
+    };
+    if !owner_can_back_borrowed_local(owner_location, env, locals) {
+        return None;
+    }
+    if typed_later_instrs_can_invalidate_borrow(
+        &block.body[instr_index + 1..],
+        target_location,
+        owner_location,
+        owned_cell_locations,
+    ) {
+        return None;
+    }
+    for preserved in
+        typed_successor_preserved_locations(block, target_params, local_liveness, location_by_name)
+    {
+        if !preserved.contains(&target_location) {
+            continue;
+        }
+        if preserved.contains(&owner_location)
+            && !owner_can_be_shared_across_successor(function, owner_location, owned_cell_locations)
+        {
+            return None;
+        }
+        if !owner_can_survive_unforwarded_edge(owner_location, env, locals) {
+            return None;
+        }
+    }
+    Some(owner_location)
+}
+
+fn typed_local_load_location(value: &InstrTyped) -> Option<LocalLocation> {
+    let InstrTyped::Load(load) = value else {
+        return None;
+    };
+    load.name.local_location()
+}
+
+fn owner_can_back_borrowed_local(
+    owner_location: LocalLocation,
+    env: &HashMap<LocalLocation, LocalRefState>,
+    locals: &HashMap<LocalLocation, RefcountLocal>,
+) -> bool {
+    match env
+        .get(&owner_location)
+        .copied()
+        .unwrap_or(LocalRefState::Unbound)
+    {
+        LocalRefState::Owned => locals
+            .get(&owner_location)
+            .is_some_and(|local| !local.name.starts_with("_dp_")),
+        LocalRefState::Immortal => true,
+        LocalRefState::Borrowed | LocalRefState::Unbound => false,
+    }
+}
+
+fn owner_can_survive_unforwarded_edge(
+    owner_location: LocalLocation,
+    env: &HashMap<LocalLocation, LocalRefState>,
+    locals: &HashMap<LocalLocation, RefcountLocal>,
+) -> bool {
+    match env
+        .get(&owner_location)
+        .copied()
+        .unwrap_or(LocalRefState::Unbound)
+    {
+        LocalRefState::Owned => locals
+            .get(&owner_location)
+            .is_some_and(|local| !local.name.starts_with("_dp_")),
+        LocalRefState::Immortal => true,
+        LocalRefState::Borrowed | LocalRefState::Unbound => false,
+    }
+}
+
+fn typed_later_instrs_can_invalidate_borrow(
+    later_instrs: &[InstrTyped],
+    target_location: LocalLocation,
+    owner_location: LocalLocation,
+    owned_cell_locations: &HashMap<u32, LocalLocation>,
+) -> bool {
+    for instr in later_instrs {
+        if typed_instr_rebinds_or_deletes_location(instr, target_location, owned_cell_locations) {
+            return false;
+        }
+        if typed_instr_rebinds_or_deletes_location(instr, owner_location, owned_cell_locations) {
+            return true;
+        }
+    }
+    false
+}
+
+fn owner_can_be_shared_across_successor(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    owner_location: LocalLocation,
+    owned_cell_locations: &HashMap<u32, LocalLocation>,
+) -> bool {
+    let Some(storage_layout) = function.storage_layout().as_ref() else {
+        return false;
+    };
+    let Some(owner_name) = storage_layout
+        .stack_slots()
+        .get(usize::try_from(owner_location.slot()).expect("local slot should fit usize"))
+    else {
+        return false;
+    };
+    if !function
+        .params
+        .iter()
+        .any(|param| param.name == owner_name.as_str())
+    {
+        return false;
+    }
+    function.blocks.iter().all(|block| {
+        block.body.iter().all(|instr| {
+            !typed_instr_rebinds_or_deletes_location(instr, owner_location, owned_cell_locations)
+        })
+    })
+}
+
+fn typed_instr_rebinds_or_deletes_location(
+    instr: &InstrTyped,
+    location: LocalLocation,
+    owned_cell_locations: &HashMap<u32, LocalLocation>,
+) -> bool {
+    match instr {
+        InstrTyped::Store(op) => typed_store_binding_location(op, owned_cell_locations)
+            .is_some_and(|stored_location| stored_location == location),
+        InstrTyped::Del(op) => op
+            .name
+            .local_location()
+            .is_some_and(|deleted_location| deleted_location == location),
+        _ => false,
+    }
+}
+
+fn typed_successor_preserved_locations(
+    block: &TypedBlock,
+    target_params: &HashMap<BlockLabel, Vec<String>>,
+    local_liveness: &LocalLiveness,
+    location_by_name: &HashMap<String, LocalLocation>,
+) -> Vec<HashSet<LocalLocation>> {
+    let mut successors = Vec::new();
+    if let Some(edge) = &block.exc_edge {
+        successors.push(preserved_locations(
+            edge.target,
+            Some(&edge.args),
+            local_liveness,
+            target_params,
+            location_by_name,
+        ));
+    }
+    match &block.term {
+        BlockTerm::Jump(edge) => successors.push(preserved_locations(
+            edge.target,
+            Some(&edge.args),
+            local_liveness,
+            target_params,
+            location_by_name,
+        )),
+        BlockTerm::IfTerm(if_term) => {
+            successors.push(preserved_locations(
+                if_term.then_label,
+                None,
+                local_liveness,
+                target_params,
+                location_by_name,
+            ));
+            successors.push(preserved_locations(
+                if_term.else_label,
+                None,
+                local_liveness,
+                target_params,
+                location_by_name,
+            ));
+        }
+        BlockTerm::BranchTable(branch) => {
+            for target in &branch.targets {
+                successors.push(preserved_locations(
+                    *target,
+                    None,
+                    local_liveness,
+                    target_params,
+                    location_by_name,
+                ));
+            }
+            successors.push(preserved_locations(
+                branch.default_label,
+                None,
+                local_liveness,
+                target_params,
+                location_by_name,
+            ));
+        }
+        BlockTerm::Raise(_) | BlockTerm::Return(_) => {}
+    }
+    successors
 }
 
 #[allow(clippy::too_many_arguments)]
