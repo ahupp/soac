@@ -197,7 +197,8 @@ pub use planning::{
     PlannedJitDeoptResumeFunction, PlannedJitDeoptResumeModule, PlannedJitFunctionLocals,
     PlannedJitModuleLocals, PlannedLocalEnvEntryMaterialization, PlannedLocalEnvEntrySource,
     PlannedLocalStorage, PlannedStackSlotEntrySeed, PreparedJitTypedModulePlan,
-    RuntimeBlockParamPlan, local_ref_kind_for_stack_mirror, plan_jit_typed_module,
+    RuntimeBlockArgPlan, RuntimeBlockParamPlan, RuntimeBlockParamRepr,
+    local_ref_kind_for_stack_mirror, plan_jit_typed_module,
     planned_implicit_target_transports_for_typed_function, planned_jit_params_for_typed_function,
     planned_jump_edge_transports_for_typed_function,
     planned_local_env_entry_materializations_for_function,
@@ -2198,6 +2199,29 @@ impl LocalEnv {
         ));
     }
 
+    fn bind_entry_location_i64_with_aliases(
+        &mut self,
+        location: LocalLocation,
+        name: &str,
+        aliases: Vec<String>,
+        value: ir::Value,
+        facts: IntFacts,
+        storage: LocalEnvStorage,
+    ) {
+        debug_assert!(
+            self.entry_index_for_location(location).is_none(),
+            "block-entry LocalEnv location should be bound once"
+        );
+        self.entries.push(LocalEnvEntry::exact_i64(
+            Some(location),
+            name.to_string(),
+            aliases,
+            value,
+            facts,
+            storage,
+        ));
+    }
+
     fn entry_index_for_location(&self, location: LocalLocation) -> Option<usize> {
         self.entries
             .iter()
@@ -2896,6 +2920,18 @@ fn bind_planned_local_env_at_block_entry(
                                 param_index, binding.name
                             )
                         })?;
+                if entry.repr == RuntimeBlockParamRepr::ExactI64 {
+                    debug_assert_eq!(binding.storage, PlannedLocalStorage::BlockParam);
+                    local_env.bind_entry_location_i64_with_aliases(
+                        binding.location,
+                        binding.name.as_str(),
+                        entry.entry_aliases.clone(),
+                        param_value,
+                        IntFacts::i64_unknown(),
+                        LocalEnvStorage::LocalOnly,
+                    );
+                    continue;
+                }
                 let entry_storage = if binding.storage == PlannedLocalStorage::StackSlot
                     || stack_slots.has_cleanup_root_name(binding.name.as_str())
                 {
@@ -4733,9 +4769,19 @@ fn local_binding_facts_for_stored_value(ref_kind: LocalRefKind) -> ParamBindingF
     ParamBindingFacts::DefinitelyBound
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 enum LocalEnvEdgePrepError {
-    MissingSourceBinding { source_name: String },
+    MissingSourceBinding {
+        source_name: String,
+    },
+    ExpectedScalarSource {
+        source_name: String,
+        target_name: String,
+    },
+    UnsupportedScalarConstantArg {
+        target_name: String,
+        source: BlockArg,
+    },
     UnsupportedCurrentExceptionArg,
 }
 
@@ -4746,6 +4792,24 @@ impl std::fmt::Display for LocalEnvEdgePrepError {
                 write!(
                     f,
                     "missing LocalEnv binding for block-arg source {source_name}"
+                )
+            }
+            Self::ExpectedScalarSource {
+                source_name,
+                target_name,
+            } => {
+                write!(
+                    f,
+                    "block arg {target_name} expected scalar i64 source {source_name}"
+                )
+            }
+            Self::UnsupportedScalarConstantArg {
+                target_name,
+                source,
+            } => {
+                write!(
+                    f,
+                    "block arg {target_name} expected scalar i64 but source {source:?} is not scalar"
                 )
             }
             Self::UnsupportedCurrentExceptionArg => {
@@ -4782,6 +4846,31 @@ fn emit_forwarded_block_arg_source_value(
     Err(LocalEnvEdgePrepError::MissingSourceBinding {
         source_name: source_name.to_string(),
     })
+}
+
+fn emit_forwarded_block_arg_source_i64_value(
+    source_name: &str,
+    target_name: &str,
+    local_env: &LocalEnv,
+    forwarded_locations: &mut HashSet<LocalLocation>,
+) -> Result<ir::Value, LocalEnvEdgePrepError> {
+    let Some(value_index) = local_env.entry_index_for_block_arg_name(source_name) else {
+        return Err(LocalEnvEdgePrepError::ExpectedScalarSource {
+            source_name: source_name.to_string(),
+            target_name: target_name.to_string(),
+        });
+    };
+    let entry = &local_env.entries[value_index];
+    if entry.i64_facts().is_none() {
+        return Err(LocalEnvEdgePrepError::ExpectedScalarSource {
+            source_name: source_name.to_string(),
+            target_name: target_name.to_string(),
+        });
+    }
+    if let Some(location) = entry.location {
+        forwarded_locations.insert(location);
+    }
+    Ok(entry.value())
 }
 
 fn emit_checked_local_value_or_unbound(
@@ -7843,7 +7932,7 @@ fn abrupt_kind_tag(kind: AbruptKind) -> i64 {
 
 fn emit_planned_target_args_codegen_from_local_env(
     fb: &mut FunctionBuilder<'_>,
-    target_args: &[(String, BlockArg)],
+    target_args: &[RuntimeBlockArgPlan],
     local_env: &LocalEnv,
     ctx: &JitEmitCtx<'_>,
     _codegen_env: &mut impl JitCodegenEnv,
@@ -7852,9 +7941,17 @@ fn emit_planned_target_args_codegen_from_local_env(
     let mut args = Vec::with_capacity(target_args.len());
     let mut forwarded_locations = HashSet::new();
     let mut forwarded_local_counts = HashMap::new();
-    for (_, explicit_arg) in target_args {
-        let value = match explicit_arg {
-            BlockArg::Name(source_name) => {
+    for target_arg in target_args {
+        let value = match (&target_arg.source, target_arg.repr) {
+            (BlockArg::Name(source_name), RuntimeBlockParamRepr::ExactI64) => {
+                emit_forwarded_block_arg_source_i64_value(
+                    source_name,
+                    target_arg.target_name.as_str(),
+                    local_env,
+                    &mut forwarded_locations,
+                )?
+            }
+            (BlockArg::Name(source_name), RuntimeBlockParamRepr::PyObject) => {
                 let (value, maybe_index) = emit_forwarded_block_arg_source_value(
                     fb,
                     source_name,
@@ -7869,20 +7966,28 @@ fn emit_planned_target_args_codegen_from_local_env(
                 }
                 value
             }
-            BlockArg::None => {
+            (BlockArg::None, RuntimeBlockParamRepr::PyObject) => {
                 let none_const = emit_none_const(fb, ctx);
                 fb.ins().call(ctx.incref_ref, &[none_const]);
                 none_const
             }
-            BlockArg::CurrentException => {
+            (BlockArg::CurrentException, RuntimeBlockParamRepr::PyObject) => {
                 return Err(LocalEnvEdgePrepError::UnsupportedCurrentExceptionArg);
             }
-            BlockArg::AbruptKind(kind) => emit_owned_module_constant(
-                fb,
-                ctx.module_constants
-                    .require_int_constant_id(abrupt_kind_tag(*kind)),
-                ctx,
-            ),
+            (BlockArg::AbruptKind(kind), RuntimeBlockParamRepr::PyObject) => {
+                emit_owned_module_constant(
+                    fb,
+                    ctx.module_constants
+                        .require_int_constant_id(abrupt_kind_tag(*kind)),
+                    ctx,
+                )
+            }
+            (source, RuntimeBlockParamRepr::ExactI64) => {
+                return Err(LocalEnvEdgePrepError::UnsupportedScalarConstantArg {
+                    target_name: target_arg.target_name.clone(),
+                    source: source.clone(),
+                });
+            }
         };
         args.push(ir::BlockArg::Value(value));
     }
@@ -8073,7 +8178,7 @@ fn emit_exception_dispatch_forwarded_decrefs(
 #[allow(clippy::too_many_arguments)]
 fn emit_exception_dispatch_target_args(
     fb: &mut FunctionBuilder<'_>,
-    target_args: &[(String, BlockArg)],
+    target_args: &[RuntimeBlockArgPlan],
     forwarded_local_names: &[String],
     forwarded_local_values: &[ir::Value],
     dispatch_exc: ir::Value,
@@ -8094,15 +8199,22 @@ fn emit_exception_dispatch_target_args(
         .collect::<HashMap<_, _>>();
     let mut forwarded_local_counts = HashMap::new();
     let mut args = Vec::with_capacity(target_args.len());
-    for (target_name, source) in target_args {
-        let value = match source {
+    for target_arg in target_args {
+        if target_arg.repr != RuntimeBlockParamRepr::PyObject {
+            return Err(format!(
+                "exception dispatch target arg {} unexpectedly uses {:?}",
+                target_arg.target_name, target_arg.repr
+            ));
+        }
+        let value = match &target_arg.source {
             BlockArg::Name(source_name) => {
                 let value = forwarded_locals_by_name
                     .get(source_name.as_str())
                     .copied()
                     .ok_or_else(|| {
                         format!(
-                            "missing forwarded exception dispatch block-param source {source_name} for target {target_name}"
+                            "missing forwarded exception dispatch block-param source {source_name} for target {}",
+                            target_arg.target_name
                         )
                     })?;
                 let forwarded_count = forwarded_local_counts
@@ -18153,8 +18265,12 @@ fn build_cranelift_run_bb_specialized_function(
 
         fb.append_block_params_for_function_params(entry_block);
         for (index, block) in exec_blocks.iter().enumerate() {
-            for _ in &runtime_block_params[index] {
-                fb.append_block_param(*block, ptr_ty);
+            for param in &runtime_block_params[index] {
+                let param_ty = match param.repr {
+                    RuntimeBlockParamRepr::PyObject => ptr_ty,
+                    RuntimeBlockParamRepr::ExactI64 => i64_ty,
+                };
+                fb.append_block_param(*block, param_ty);
             }
         }
         fb.append_block_param(step_null_block, ptr_ty); // args
@@ -18469,6 +18585,12 @@ fn build_cranelift_run_bb_specialized_function(
         let entry_jump_args = runtime_block_params[0]
             .iter()
             .map(|param| {
+                if param.repr != RuntimeBlockParamRepr::PyObject {
+                    return Err(format!(
+                        "entry runtime block param {} ({}) unexpectedly uses {:?}",
+                        param.arg_name, param.binding.name, param.repr
+                    ));
+                }
                 entry_param_values
                     .get(param.binding.name.as_str())
                     .copied()

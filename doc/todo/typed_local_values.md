@@ -163,6 +163,12 @@ Consumers state their demand. Integer arithmetic and comparisons can demand
    `ExactI64`, keep the target local scalar. If representations differ,
    materialize scalar predecessors and join as `PyObject`.
 
+   Progress: runtime block params and edge transports now carry an explicit
+   `PyObject`/`ExactI64` representation. A conservative typed-local
+   representation analysis preserves scalar locals across normal CFG edges when
+   all incoming sources are scalar-compatible, while exception edges and mixed
+   joins stay PyObject-backed.
+
 8. Handle guard/deopt/failure boundaries by materializing only locals required
    by resumed Python/interpreter state. Scalars not needed by the boundary do
    not become cleanup roots.

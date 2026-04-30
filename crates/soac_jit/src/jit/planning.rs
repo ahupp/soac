@@ -1,12 +1,13 @@
 #[cfg(test)]
 use soac_config::SoacEnvConfig;
 use soac_core::block_py::{
-    BlockArg, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, HasSemanticInstrId, InstrKey,
-    InstrLocationMap, LocalLocation, RuntimeFunctionId, current_instr_locations,
+    BinOpKind, BlockArg, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, ConstantExpr,
+    HasSemanticInstrId, InstrKey, InstrLocationMap, Literal, LocalLocation, NumberLiteralValue,
+    RuntimeFunctionId, current_instr_locations,
 };
 #[cfg(test)]
 use soac_ir_blockpy::BlockPyModuleShape;
-use soac_ir_typed::{FactStore, TypedBlock, TypedBlockPyModuleShape};
+use soac_ir_typed::{FactStore, InstrTyped, TypedBlock, TypedBlockPyModuleShape, ValueFacts};
 pub use soac_opt::passes::{
     BlockParamFacts, FunctionLocalPlan, LocalRefKind, ParamBindingFacts, ParamProvenance,
     PlannedLocalBinding, PlannedLocalStorage, render_planned_local_binding,
@@ -75,7 +76,7 @@ fn typed_block_index_for_label(
 pub struct BlockExcDispatchPlan {
     pub target_index: usize,
     pub slot_writes: Vec<(String, BlockArg)>,
-    pub target_args: Vec<(String, BlockArg)>,
+    pub target_args: Vec<RuntimeBlockArgPlan>,
     pub forwarded_local_names: Vec<String>,
     pub release_local_names: Vec<String>,
     pub drop_forwarded_local_names: Vec<String>,
@@ -84,8 +85,21 @@ pub struct BlockExcDispatchPlan {
 #[derive(Clone, Debug)]
 pub struct EdgeTransportPlan {
     pub slot_writes: Vec<(String, BlockArg)>,
-    pub target_args: Vec<(String, BlockArg)>,
+    pub target_args: Vec<RuntimeBlockArgPlan>,
     pub forwarded_local_names: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeBlockParamRepr {
+    PyObject,
+    ExactI64,
+}
+
+#[derive(Clone, Debug)]
+pub struct RuntimeBlockArgPlan {
+    pub target_name: String,
+    pub source: BlockArg,
+    pub repr: RuntimeBlockParamRepr,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -93,6 +107,7 @@ pub struct RuntimeBlockParamPlan {
     pub arg_name: String,
     pub binding: PlannedLocalBinding,
     pub entry_aliases: Vec<String>,
+    pub repr: RuntimeBlockParamRepr,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -113,6 +128,7 @@ pub struct PlannedLocalEnvEntryMaterialization {
     pub entry_aliases: Vec<String>,
     pub source: PlannedLocalEnvEntrySource,
     pub entry_ref_kind: LocalRefKind,
+    pub repr: RuntimeBlockParamRepr,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -694,7 +710,7 @@ fn validate_exception_dispatch_ownership_sinks<P: soac_core::block_py::ModuleSha
             dispatch.forwarded_local_names
         ));
     }
-    let target_source_names = named_block_arg_sources(&dispatch.target_args);
+    let target_source_names = runtime_block_arg_sources(&dispatch.target_args);
     let slot_write_source_names = named_block_arg_sources(&dispatch.slot_writes);
     let release_names = dispatch
         .release_local_names
@@ -789,6 +805,15 @@ fn named_block_arg_sources(args: &[(String, BlockArg)]) -> HashSet<&str> {
         .collect()
 }
 
+fn runtime_block_arg_sources(args: &[RuntimeBlockArgPlan]) -> HashSet<&str> {
+    args.iter()
+        .filter_map(|arg| match &arg.source {
+            BlockArg::Name(name) => Some(name.as_str()),
+            BlockArg::CurrentException | BlockArg::None | BlockArg::AbruptKind(_) => None,
+        })
+        .collect()
+}
+
 fn validate_entry_materializations_for_block<P: soac_core::block_py::ModuleShape>(
     function: &BlockPyFunction<P>,
     block_label: BlockLabel,
@@ -826,6 +851,7 @@ fn validate_entry_materializations_for_block<P: soac_core::block_py::ModuleShape
             || entry.binding != param.binding
             || entry.entry_aliases != param.entry_aliases
             || entry.entry_ref_kind != expected_entry_ref_kind
+            || entry.repr != param.repr
         {
             return Err(format!(
                 "runtime-param entry materialization mismatch for function {} ({}) block {} \
@@ -843,6 +869,7 @@ fn validate_entry_materializations_for_block<P: soac_core::block_py::ModuleShape
             || entry.binding != seed.binding
             || !entry.entry_aliases.is_empty()
             || entry.entry_ref_kind != seed.entry_ref_kind
+            || entry.repr != RuntimeBlockParamRepr::PyObject
         {
             return Err(format!(
                 "stack-slot entry materialization mismatch for function {} ({}) block {} \
@@ -881,6 +908,7 @@ pub fn plan_jit_typed_module_locals_from_passes(
             function,
             local_plan,
             function_refcount_plan,
+            &module.module_constants,
         )?;
         if functions
             .insert(function.function_id, function_plan)
@@ -1158,9 +1186,11 @@ pub fn render_jit_function_locals(
                 "      {} <- {} aliases={:?}",
                 param.arg_name,
                 render_planned_local_binding(&param.binding),
-                param.entry_aliases
+                param.entry_aliases,
             )
             .expect("writing to String should not fail");
+            writeln!(out, "        repr={:?}", param.repr)
+                .expect("writing to String should not fail");
         }
         if !plan.stack_slot_entry_seeds[index].is_empty() {
             writeln!(out, "    stack_slot_entry_seeds:")
@@ -1190,7 +1220,7 @@ pub fn render_jit_function_locals(
             writeln!(
                 out,
                 "      target_args=[{}]",
-                render_named_block_args(&dispatch.target_args)
+                render_runtime_block_args(&dispatch.target_args)
             )
             .expect("writing to String should not fail");
             writeln!(
@@ -1224,10 +1254,11 @@ pub fn render_jit_function_locals(
 
 fn render_local_env_entry_materialization(entry: &PlannedLocalEnvEntryMaterialization) -> String {
     format!(
-        "{} source={:?} entry_ref_kind={:?} aliases={:?}",
+        "{} source={:?} entry_ref_kind={:?} repr={:?} aliases={:?}",
         render_planned_local_binding(&entry.binding),
         entry.source,
         entry.entry_ref_kind,
+        entry.repr,
         entry.entry_aliases
     )
 }
@@ -1243,7 +1274,7 @@ fn render_edge_transport(out: &mut String, label: &str, transport: &EdgeTranspor
     writeln!(
         out,
         "      target_args=[{}]",
-        render_named_block_args(&transport.target_args)
+        render_runtime_block_args(&transport.target_args)
     )
     .expect("writing to String should not fail");
     writeln!(
@@ -1263,6 +1294,13 @@ fn render_edge_transport(out: &mut String, label: &str, transport: &EdgeTranspor
 fn render_named_block_args(args: &[(String, BlockArg)]) -> String {
     args.iter()
         .map(|(name, arg)| format!("{name}={arg:?}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn render_runtime_block_args(args: &[RuntimeBlockArgPlan]) -> String {
+    args.iter()
+        .map(|arg| format!("{}={:?}:{:?}", arg.target_name, arg.source, arg.repr))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -1317,6 +1355,7 @@ pub fn planned_jit_params_for_typed_function(
                     arg_name,
                     entry_aliases,
                     binding,
+                    repr: RuntimeBlockParamRepr::PyObject,
                 });
             }
             if let Some(block_plan) = block_plan {
@@ -1338,12 +1377,348 @@ pub fn planned_jit_params_for_typed_function(
                         arg_name: binding.name.clone(),
                         binding: binding.clone(),
                         entry_aliases: Vec::new(),
+                        repr: RuntimeBlockParamRepr::PyObject,
                     });
                 }
             }
             Ok(params)
         })
         .collect()
+}
+
+fn typed_module_constant_i64_value(module_constants: &[ConstantExpr], index: u32) -> Option<i64> {
+    let constant = module_constants.get(index as usize)?;
+    let ConstantExpr::Literal(value) = constant else {
+        return None;
+    };
+    let Literal::NumberLiteral(number) = value.as_literal() else {
+        return None;
+    };
+    let NumberLiteralValue::Int(value) = &number.value else {
+        return None;
+    };
+    value.as_i64()
+}
+
+fn typed_expr_planned_const_i64(
+    expr: &InstrTyped,
+    module_constants: &[ConstantExpr],
+) -> Option<i64> {
+    match expr {
+        InstrTyped::Load(op) => op
+            .name
+            .location
+            .as_constant()
+            .and_then(|index| typed_module_constant_i64_value(module_constants, index)),
+        _ => None,
+    }
+}
+
+const fn typed_i64_binop_kind_supported(kind: BinOpKind) -> bool {
+    matches!(kind, BinOpKind::Add | BinOpKind::Sub | BinOpKind::Mul)
+}
+
+fn typed_expr_can_satisfy_planned_i64(
+    expr: &InstrTyped,
+    local_reprs: &HashMap<LocalLocation, RuntimeBlockParamRepr>,
+    module_constants: &[ConstantExpr],
+) -> bool {
+    if typed_expr_planned_const_i64(expr, module_constants).is_some() {
+        return true;
+    }
+    match expr {
+        InstrTyped::Load(op) => op.name.local_location().is_some_and(|location| {
+            local_reprs.get(&location) == Some(&RuntimeBlockParamRepr::ExactI64)
+        }),
+        InstrTyped::BinOp(op) if typed_i64_binop_kind_supported(op.kind) => {
+            typed_expr_can_satisfy_planned_i64(op.left.as_ref(), local_reprs, module_constants)
+                && typed_expr_can_satisfy_planned_i64(
+                    op.right.as_ref(),
+                    local_reprs,
+                    module_constants,
+                )
+        }
+        _ => matches!(expr.result_facts(), Some(ValueFacts::I64(_))),
+    }
+}
+
+fn local_locations_by_name(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+) -> HashMap<String, LocalLocation> {
+    function
+        .storage_layout()
+        .as_ref()
+        .map(|layout| {
+            layout
+                .stack_slots()
+                .iter()
+                .enumerate()
+                .map(|(slot, name)| {
+                    (
+                        name.clone(),
+                        LocalLocation(
+                            u32::try_from(slot)
+                                .expect("storage layout slot index should fit in u32"),
+                        ),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn transfer_runtime_local_reprs_for_typed_block(
+    block: &TypedBlock,
+    entry_reprs: &HashMap<LocalLocation, RuntimeBlockParamRepr>,
+    module_constants: &[ConstantExpr],
+) -> HashMap<LocalLocation, RuntimeBlockParamRepr> {
+    let mut reprs = entry_reprs.clone();
+    for instr in &block.body {
+        match instr {
+            InstrTyped::Store(op) => {
+                let Some(location) = op.name.local_location() else {
+                    continue;
+                };
+                let repr = if typed_expr_can_satisfy_planned_i64(
+                    op.value.as_ref(),
+                    &reprs,
+                    module_constants,
+                ) {
+                    RuntimeBlockParamRepr::ExactI64
+                } else {
+                    RuntimeBlockParamRepr::PyObject
+                };
+                reprs.insert(location, repr);
+            }
+            InstrTyped::Del(op) => {
+                if let Some(location) = op.name.local_location() {
+                    reprs.insert(location, RuntimeBlockParamRepr::PyObject);
+                }
+            }
+            _ => {}
+        }
+    }
+    reprs
+}
+
+fn runtime_block_param_allows_scalar(param: &RuntimeBlockParamPlan) -> bool {
+    param.binding.storage == PlannedLocalStorage::BlockParam
+        && param.binding.param_facts.binding == ParamBindingFacts::DefinitelyBound
+}
+
+fn block_arg_planned_repr(
+    source: &BlockArg,
+    source_reprs: &HashMap<LocalLocation, RuntimeBlockParamRepr>,
+    local_locations_by_name: &HashMap<String, LocalLocation>,
+) -> Option<RuntimeBlockParamRepr> {
+    let BlockArg::Name(source_name) = source else {
+        return Some(RuntimeBlockParamRepr::PyObject);
+    };
+    let Some(location) = local_locations_by_name.get(source_name) else {
+        return Some(RuntimeBlockParamRepr::PyObject);
+    };
+    source_reprs.get(location).copied()
+}
+
+fn merge_runtime_local_repr(
+    target_reprs: &mut HashMap<LocalLocation, RuntimeBlockParamRepr>,
+    location: LocalLocation,
+    incoming: RuntimeBlockParamRepr,
+) -> bool {
+    match target_reprs.get_mut(&location) {
+        None => {
+            target_reprs.insert(location, incoming);
+            true
+        }
+        Some(existing) if *existing == incoming || *existing == RuntimeBlockParamRepr::PyObject => {
+            false
+        }
+        Some(existing) => {
+            *existing = RuntimeBlockParamRepr::PyObject;
+            true
+        }
+    }
+}
+
+fn merge_runtime_block_param_edge_reprs(
+    target_reprs: &mut HashMap<LocalLocation, RuntimeBlockParamRepr>,
+    runtime_target_params: &[RuntimeBlockParamPlan],
+    full_target_param_names: &[String],
+    explicit_args: &[BlockArg],
+    source_reprs: &HashMap<LocalLocation, RuntimeBlockParamRepr>,
+    local_locations_by_name: &HashMap<String, LocalLocation>,
+) -> bool {
+    let explicit_args_by_name = full_target_param_names
+        .iter()
+        .zip(explicit_args.iter())
+        .map(|(name, arg)| (name.as_str(), arg))
+        .collect::<HashMap<_, _>>();
+    let mut changed = false;
+    for param in runtime_target_params {
+        let source = explicit_args_by_name
+            .get(param.arg_name.as_str())
+            .copied()
+            .cloned()
+            .unwrap_or_else(|| BlockArg::Name(param.arg_name.clone()));
+        let Some(source_repr) =
+            block_arg_planned_repr(&source, source_reprs, local_locations_by_name)
+        else {
+            continue;
+        };
+        let incoming = if runtime_block_param_allows_scalar(param) {
+            source_repr
+        } else {
+            RuntimeBlockParamRepr::PyObject
+        };
+        changed |= merge_runtime_local_repr(target_reprs, param.binding.location, incoming);
+    }
+    changed
+}
+
+fn merge_runtime_block_param_pyobject_edge_reprs(
+    target_reprs: &mut HashMap<LocalLocation, RuntimeBlockParamRepr>,
+    runtime_target_params: &[RuntimeBlockParamPlan],
+) -> bool {
+    let mut changed = false;
+    for param in runtime_target_params {
+        changed |= merge_runtime_local_repr(
+            target_reprs,
+            param.binding.location,
+            RuntimeBlockParamRepr::PyObject,
+        );
+    }
+    changed
+}
+
+fn runtime_block_param_reprs_known(
+    runtime_params: &[RuntimeBlockParamPlan],
+    entry_reprs: &HashMap<LocalLocation, RuntimeBlockParamRepr>,
+) -> bool {
+    runtime_params
+        .iter()
+        .all(|param| entry_reprs.contains_key(&param.binding.location))
+}
+
+fn planned_runtime_block_param_reprs_for_typed_function(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    runtime_block_params: &[Vec<RuntimeBlockParamPlan>],
+    module_constants: &[ConstantExpr],
+) -> Vec<Vec<RuntimeBlockParamRepr>> {
+    let block_indices_by_label = typed_block_indices_by_label(function);
+    let local_locations_by_name = local_locations_by_name(function);
+    let mut entry_reprs =
+        vec![HashMap::<LocalLocation, RuntimeBlockParamRepr>::new(); function.blocks.len()];
+    if let Some(entry_reprs) = entry_reprs.first_mut() {
+        for location in local_locations_by_name.values().copied() {
+            entry_reprs.insert(location, RuntimeBlockParamRepr::PyObject);
+        }
+    }
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (source_index, block) in function.blocks.iter().enumerate() {
+            if !runtime_block_param_reprs_known(
+                &runtime_block_params[source_index],
+                &entry_reprs[source_index],
+            ) {
+                continue;
+            }
+            let exit_reprs = transfer_runtime_local_reprs_for_typed_block(
+                block,
+                &entry_reprs[source_index],
+                module_constants,
+            );
+            if let Some(exc_edge) = block.exc_edge.as_ref() {
+                let target_index =
+                    typed_block_index_for_label(function, &block_indices_by_label, exc_edge.target);
+                changed |= merge_runtime_block_param_pyobject_edge_reprs(
+                    &mut entry_reprs[target_index],
+                    &runtime_block_params[target_index],
+                );
+            }
+            match &block.term {
+                BlockTerm::Jump(edge) => {
+                    let target_index =
+                        typed_block_index_for_label(function, &block_indices_by_label, edge.target);
+                    changed |= merge_runtime_block_param_edge_reprs(
+                        &mut entry_reprs[target_index],
+                        &runtime_block_params[target_index],
+                        &function.blocks[target_index].param_name_vec(),
+                        &edge.args,
+                        &exit_reprs,
+                        &local_locations_by_name,
+                    );
+                }
+                BlockTerm::IfTerm(if_term) => {
+                    for target in [if_term.then_label, if_term.else_label] {
+                        let target_index =
+                            typed_block_index_for_label(function, &block_indices_by_label, target);
+                        changed |= merge_runtime_block_param_edge_reprs(
+                            &mut entry_reprs[target_index],
+                            &runtime_block_params[target_index],
+                            &function.blocks[target_index].param_name_vec(),
+                            &[],
+                            &exit_reprs,
+                            &local_locations_by_name,
+                        );
+                    }
+                }
+                BlockTerm::BranchTable(branch) => {
+                    for target in branch
+                        .targets
+                        .iter()
+                        .copied()
+                        .chain(std::iter::once(branch.default_label))
+                    {
+                        let target_index =
+                            typed_block_index_for_label(function, &block_indices_by_label, target);
+                        changed |= merge_runtime_block_param_edge_reprs(
+                            &mut entry_reprs[target_index],
+                            &runtime_block_params[target_index],
+                            &function.blocks[target_index].param_name_vec(),
+                            &[],
+                            &exit_reprs,
+                            &local_locations_by_name,
+                        );
+                    }
+                }
+                BlockTerm::Raise(_) | BlockTerm::Return(_) => {}
+            }
+        }
+    }
+
+    runtime_block_params
+        .iter()
+        .enumerate()
+        .map(|(block_index, params)| {
+            params
+                .iter()
+                .map(|param| {
+                    let repr = entry_reprs[block_index]
+                        .get(&param.binding.location)
+                        .copied()
+                        .unwrap_or(RuntimeBlockParamRepr::PyObject);
+                    if runtime_block_param_allows_scalar(param) {
+                        repr
+                    } else {
+                        RuntimeBlockParamRepr::PyObject
+                    }
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn apply_runtime_block_param_reprs(
+    runtime_block_params: &mut [Vec<RuntimeBlockParamPlan>],
+    reprs: Vec<Vec<RuntimeBlockParamRepr>>,
+) {
+    for (params, reprs) in runtime_block_params.iter_mut().zip(reprs) {
+        for (param, repr) in params.iter_mut().zip(reprs) {
+            param.repr = repr;
+        }
+    }
 }
 
 pub fn planned_stack_slot_entry_seeds_for_typed_function(
@@ -1714,6 +2089,7 @@ pub fn planned_local_env_entry_materializations_for_function(
                     entry_aliases: param.entry_aliases.clone(),
                     source: PlannedLocalEnvEntrySource::BlockParam { param_index },
                     entry_ref_kind,
+                    repr: param.repr,
                 }
             }));
             entries.extend(
@@ -1724,6 +2100,7 @@ pub fn planned_local_env_entry_materializations_for_function(
                         entry_aliases: Vec::new(),
                         source: PlannedLocalEnvEntrySource::StackSlotLoad,
                         entry_ref_kind: seed.entry_ref_kind,
+                        repr: RuntimeBlockParamRepr::PyObject,
                     }),
             );
             entries
@@ -1759,13 +2136,15 @@ pub fn plan_edge_transport(
         .iter()
         .map(|param| {
             let name = param.arg_name.clone();
-            (
-                name.clone(),
-                explicit_args_by_name
-                    .get(name.as_str())
-                    .map(|arg| (*arg).clone())
-                    .unwrap_or_else(|| BlockArg::Name(name.clone())),
-            )
+            let source = explicit_args_by_name
+                .get(name.as_str())
+                .map(|arg| (*arg).clone())
+                .unwrap_or_else(|| BlockArg::Name(name.clone()));
+            RuntimeBlockArgPlan {
+                target_name: name,
+                source,
+                repr: param.repr,
+            }
         })
         .collect::<Vec<_>>();
     let mut forwarded_local_names = Vec::new();
@@ -1781,8 +2160,8 @@ pub fn plan_edge_transport(
     for (_, arg) in slot_writes.iter() {
         record_forwarded_name(arg);
     }
-    for (_, arg) in target_args.iter() {
-        record_forwarded_name(arg);
+    for arg in target_args.iter() {
+        record_forwarded_name(&arg.source);
     }
     EdgeTransportPlan {
         slot_writes,
@@ -1911,10 +2290,10 @@ pub fn typed_exc_dispatch_plan(
 
 fn planned_drop_forwarded_local_names(
     forwarded_local_names: &[String],
-    target_args: &[(String, BlockArg)],
+    target_args: &[RuntimeBlockArgPlan],
     release_local_names: &[String],
 ) -> Vec<String> {
-    let target_arg_source_names = named_block_arg_sources(target_args);
+    let target_arg_source_names = runtime_block_arg_sources(target_args);
     let release_name_set = release_local_names
         .iter()
         .map(String::as_str)
@@ -1933,11 +2312,18 @@ pub fn plan_jit_typed_function_locals_from_plans(
     function: &BlockPyFunction<TypedBlockPyModuleShape>,
     local_plan: FunctionLocalPlan,
     refcount_plan: FunctionRefcountPlan,
+    module_constants: &[ConstantExpr],
 ) -> Result<PlannedJitFunctionLocals, String> {
     let block_indices_by_label = typed_block_indices_by_label(function);
     let cleanup_root_names = planned_cleanup_root_names_for_refcount_plan(&refcount_plan);
-    let runtime_block_params =
+    let mut runtime_block_params =
         planned_jit_params_for_typed_function(function, &local_plan, &cleanup_root_names)?;
+    let runtime_block_param_reprs = planned_runtime_block_param_reprs_for_typed_function(
+        function,
+        &runtime_block_params,
+        module_constants,
+    );
+    apply_runtime_block_param_reprs(&mut runtime_block_params, runtime_block_param_reprs);
     let implicit_target_transports =
         planned_implicit_target_transports_for_typed_function(function, &runtime_block_params);
     let jump_edge_transports =
@@ -2010,9 +2396,9 @@ mod tests {
         BlockExcDispatchPlan, BlockParamFacts, CleanupRootSlotState, LocalRefKind,
         ParamBindingFacts, ParamProvenance, PlannedLocalBinding, PlannedLocalEnvEntrySource,
         PlannedLocalStorage, PlannedStackSlotEntrySeed, PreparedJitTypedModulePlan,
-        RuntimeBlockParamPlan, plan_edge_transport, plan_typed_v3_jit_module_for_test,
-        planned_cleanup_root_names_for_refcount_plan, planned_drop_forwarded_local_names,
-        planned_jit_params_for_typed_function,
+        RuntimeBlockArgPlan, RuntimeBlockParamPlan, RuntimeBlockParamRepr, plan_edge_transport,
+        plan_typed_v3_jit_module_for_test, planned_cleanup_root_names_for_refcount_plan,
+        planned_drop_forwarded_local_names, planned_jit_params_for_typed_function,
         planned_local_env_entry_materializations_for_function,
         planned_stack_slot_entry_seeds_for_typed_function, typed_block_index_for_label,
         typed_block_indices_by_label, typed_exc_dispatch_plan,
@@ -2768,11 +3154,13 @@ def f(flag):
                 arg_name: "x".to_string(),
                 binding: block_binding.clone(),
                 entry_aliases: vec!["x_alias".to_string()],
+                repr: RuntimeBlockParamRepr::PyObject,
             },
             RuntimeBlockParamPlan {
                 arg_name: "z".to_string(),
                 binding: stack_runtime_binding.clone(),
                 entry_aliases: Vec::new(),
+                repr: RuntimeBlockParamRepr::PyObject,
             },
         ]];
         let stack_slot_entry_seeds = vec![vec![PlannedStackSlotEntrySeed {
@@ -2827,6 +3215,7 @@ def f(flag):
             arg_name: "x".to_string(),
             binding: block_binding,
             entry_aliases: Vec::new(),
+            repr: RuntimeBlockParamRepr::PyObject,
         }]];
         let cleanup_root_names = HashSet::from(["x".to_string()]);
 
@@ -3115,7 +3504,10 @@ def f():
                 .iter()
                 .any(|name| name == "x")
                 && !dispatch.release_local_names.iter().any(|name| name == "x")
-                && !dispatch.target_args.iter().any(|(name, _)| name == "x")),
+                && !dispatch
+                    .target_args
+                    .iter()
+                    .any(|arg| arg.target_name == "x")),
             "root-backed exception cleanup locals should stay in cleanup roots instead of \
              being forwarded through dispatch: {dispatches:#?}"
         );
@@ -3138,10 +3530,11 @@ def f():
                 "slot_target".to_string(),
                 BlockArg::Name("slot_only".to_string()),
             )],
-            target_args: vec![(
-                "target_param".to_string(),
-                BlockArg::Name("to_target".to_string()),
-            )],
+            target_args: vec![RuntimeBlockArgPlan {
+                target_name: "target_param".to_string(),
+                source: BlockArg::Name("to_target".to_string()),
+                repr: RuntimeBlockParamRepr::PyObject,
+            }],
             forwarded_local_names: vec![
                 "slot_only".to_string(),
                 "to_target".to_string(),
@@ -3186,15 +3579,63 @@ def f():
             "released".to_string(),
             "unused".to_string(),
         ];
-        let target_args = vec![(
-            "target_param".to_string(),
-            BlockArg::Name("to_target".to_string()),
-        )];
+        let target_args = vec![RuntimeBlockArgPlan {
+            target_name: "target_param".to_string(),
+            source: BlockArg::Name("to_target".to_string()),
+            repr: RuntimeBlockParamRepr::PyObject,
+        }];
         let release_names = vec!["released".to_string()];
 
         assert_eq!(
             planned_drop_forwarded_local_names(&forwarded, &target_args, &release_names),
             vec!["slot_only".to_string(), "unused".to_string()]
+        );
+    }
+
+    #[test]
+    fn runtime_block_param_reprs_preserve_loop_carried_scalar_local() {
+        let (prepared, function_index) = prepared_typed_function(
+            r#"
+def count(n):
+    i = 0
+    while i < n:
+        i = i + 1
+    return i
+"#,
+            "count",
+        );
+        let function = &prepared.module.callable_defs[function_index];
+        let plan = prepared
+            .locals
+            .function(function.function_id)
+            .expect("missing JIT local plan");
+
+        let scalar_i_params = plan
+            .runtime_block_params
+            .iter()
+            .enumerate()
+            .flat_map(|(block_index, params)| params.iter().map(move |param| (block_index, param)))
+            .filter(|(_, param)| {
+                param.binding.name == "i" && param.repr == RuntimeBlockParamRepr::ExactI64
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !scalar_i_params.is_empty(),
+            "expected loop-carried i to use an ExactI64 runtime block param: {:#?}",
+            plan.runtime_block_params
+        );
+
+        let scalar_i_target_args = plan
+            .implicit_target_transports
+            .iter()
+            .chain(plan.jump_edge_transports.iter().flatten())
+            .flat_map(|transport| transport.target_args.iter())
+            .filter(|arg| arg.target_name == "i" && arg.repr == RuntimeBlockParamRepr::ExactI64)
+            .count();
+        assert!(
+            scalar_i_target_args > 0,
+            "expected an edge transport to carry i as ExactI64: {:#?}",
+            plan.jump_edge_transports
         );
     }
 
@@ -3214,6 +3655,7 @@ def f():
                 },
             },
             entry_aliases: vec!["x".to_string()],
+            repr: RuntimeBlockParamRepr::PyObject,
         }];
         let stack_slot_names = HashSet::from(["slot_only".to_string(), "bound_x".to_string()]);
         let transport = plan_edge_transport(
@@ -3233,8 +3675,12 @@ def f():
             other => panic!("expected slot write source to be a forwarded name, got {other:?}"),
         }
         assert_eq!(transport.target_args.len(), 1);
-        assert_eq!(transport.target_args[0].0, "x");
-        match &transport.target_args[0].1 {
+        assert_eq!(transport.target_args[0].target_name, "x");
+        assert_eq!(
+            transport.target_args[0].repr,
+            RuntimeBlockParamRepr::PyObject
+        );
+        match &transport.target_args[0].source {
             BlockArg::Name(name) => assert_eq!(name, "source_x"),
             other => panic!("expected target arg source to be a forwarded name, got {other:?}"),
         }
@@ -3260,6 +3706,7 @@ def f():
                 },
             },
             entry_aliases: vec!["x".to_string()],
+            repr: RuntimeBlockParamRepr::PyObject,
         }];
         let transport = plan_edge_transport(
             &["x".to_string()],
@@ -3270,8 +3717,12 @@ def f():
 
         assert!(transport.slot_writes.is_empty());
         assert_eq!(transport.target_args.len(), 1);
-        assert_eq!(transport.target_args[0].0, "x");
-        match &transport.target_args[0].1 {
+        assert_eq!(transport.target_args[0].target_name, "x");
+        assert_eq!(
+            transport.target_args[0].repr,
+            RuntimeBlockParamRepr::PyObject
+        );
+        match &transport.target_args[0].source {
             BlockArg::Name(name) => assert_eq!(name, "x"),
             other => panic!("expected implicit forwarded name, got {other:?}"),
         }
