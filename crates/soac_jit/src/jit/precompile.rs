@@ -443,10 +443,6 @@ pub(super) fn precompile_codegen_module_to_object_bytes(
             placeholder_blocks.as_slice(),
             planned_module,
             function,
-            module
-                .callable_defs
-                .iter()
-                .find(|candidate| candidate.function_id == function.function_id),
             &jit_module_plan.value_facts,
             jit_local_plan,
             jit_deopt_resume_plan,

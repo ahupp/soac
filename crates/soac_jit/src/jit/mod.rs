@@ -25,23 +25,21 @@ use soac_ir_typed::emit_v3::{
     MechanicalCodegenConversion, MechanicalCodegenOperation, MechanicalCodegenStep,
     MechanicalExitKind, MechanicalRegionEmission, MechanicalRegionInputSource,
     mechanical_codegen_step as opt_v3_mechanical_codegen_step,
-    mechanical_convert_inputs_for_output as opt_v3_mechanical_convert_inputs_for_output,
     mechanical_region_inputs as opt_v3_mechanical_region_inputs,
 };
 use soac_ir_typed::plan_v3::{
-    IndexedFieldAccessKind as PlanV3IndexedFieldAccessKind,
+    ConversionKind, IndexedFieldAccessKind as PlanV3IndexedFieldAccessKind,
     IndexedGlobalAccessKind as PlanV3IndexedGlobalAccessKind, MaterializeKind, PlanNodeId,
-    PlanValue, RegionId, RegionPlan, Rep, RichCompareOp,
+    PlanNodeKind, PlanValue, RegionId, RegionPlan, Rep, RichCompareOp,
 };
 use soac_ir_typed::{
     FactStore, InstrTyped, PyExactType, PyObjFacts, RuntimeHelperId, TypedAttrAccessPlan,
-    TypedBlock, TypedBlockLayoutHint, TypedBlockPyModuleShape, TypedCall, TypedCallAccessPlan,
+    TypedBlockLayoutHint, TypedBlockPyModuleShape, TypedCall, TypedCallAccessPlan,
     TypedDirectCallGuardTest, TypedDirectCallGuardTestKind, TypedDirectCallableCall,
     TypedDirectCallableCallGuard, TypedDirectMethodCall, TypedExactIntBranchPlan,
-    TypedExactIntReturnPlan, TypedExactIntScalarThreadPlan, TypedGetAttr, TypedGuardedCallableCall,
-    TypedGuardedMethodCall, TypedIndexedFieldGuard, TypedIndexedFieldPlanSource,
-    TypedPlannedResult, TypedPyObjectOwnershipPlan, TypedSetAttr, ValueFacts,
-    lower_blockpy_function_to_typed,
+    TypedExactIntReturnPlan, TypedGetAttr, TypedGuardedCallableCall, TypedGuardedMethodCall,
+    TypedIndexedFieldGuard, TypedIndexedFieldPlanSource, TypedPlannedResult,
+    TypedPyObjectOwnershipPlan, TypedSetAttr, ValueFacts, lower_blockpy_function_to_typed,
 };
 #[cfg(test)]
 use soac_opt::passes::infer_module_value_facts;
@@ -60,10 +58,6 @@ use soac_opt::passes::{
 use soac_opt::region_emission_v3::{
     ExactIntBranchSelection as OptV3ExactIntBranchSelection,
     ExactIntReturnSelection as OptV3ExactIntReturnSelection,
-    ScalarThreadInlineReturnTargets as OptV3ScalarThreadInlineReturnTargets,
-    ScalarThreadSelection as OptV3ScalarThreadSelection,
-    scalar_thread_inline_return_targets as opt_v3_scalar_thread_inline_return_targets,
-    scalar_thread_unmaterialized_local_location as opt_v3_scalar_thread_unmaterialized_local_location,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -263,8 +257,6 @@ pub fn install_sigill_diagnostics() -> Result<(), String> {
 }
 
 const MISSING_PYTHON_EXCEPTION_TRAP: ir::TrapCode = ir::TrapCode::unwrap_user(1);
-#[allow(dead_code)]
-const OPT_V3_FUSED_CONSUMER_TRAP: ir::TrapCode = ir::TrapCode::unwrap_user(2);
 thread_local! {
     static PROCESS_JIT_COMPILE_DEPTH: Cell<usize> = const { Cell::new(0) };
 }
@@ -2300,6 +2292,14 @@ impl LocalEnv {
             })
     }
 
+    fn scalar_i64_value_for_name(&self, name: &str) -> Option<(ir::Value, IntFacts)> {
+        self.entry_index_for_name(name).and_then(|index| {
+            self.entries[index]
+                .i64_facts()
+                .map(|facts| (self.entries[index].value(), facts))
+        })
+    }
+
     fn load_location(
         &self,
         fb: &mut FunctionBuilder<'_>,
@@ -2432,17 +2432,19 @@ impl LocalEnv {
             } else {
                 CleanupRootSlotState::MaybeOwnedReference
             };
-            stack_slots
-                .clear_value_with_previous_state_counted(
-                    fb,
-                    name,
-                    previous_state,
-                    ptr_ty,
-                    thread_state_value,
-                    decref_ref,
-                    refcount_location_counters,
-                )
-                .expect("slot-backed scalar local missing from stack slots");
+            if previous_state.may_hold_owned_reference() {
+                stack_slots
+                    .clear_value_with_previous_state_counted(
+                        fb,
+                        name,
+                        previous_state,
+                        ptr_ty,
+                        thread_state_value,
+                        decref_ref,
+                        refcount_location_counters,
+                    )
+                    .expect("slot-backed scalar local missing from stack slots");
+            }
         }
         self.entries.push(LocalEnvEntry::exact_i64(
             Some(location),
@@ -3086,6 +3088,31 @@ fn emit_local_env_entry_pyobject_for_forward(
         emit_incref_if_not_null(fb, ctx.consts.ptr_ty, ctx.incref_ref, value);
     }
     value
+}
+
+fn emit_local_env_entry_pyobject_for_frame_root_transfer(
+    fb: &mut FunctionBuilder<'_>,
+    entry: &LocalEnvEntry,
+    ctx: &JitEmitCtx<'_>,
+) -> (ir::Value, LocalRefKind) {
+    if let Some(facts) = entry.i64_facts() {
+        let result = emit_soac_value_result_for_demand(
+            fb,
+            SoacValue::i64(entry.value(), facts),
+            ctx,
+            ResultDemand::PYOBJECT_OWNED,
+            None,
+        );
+        let (value, ownership, _) = result.expect_pyobject("scalar cleanup-root materialization");
+        debug_assert!(ownership.is_owned() || matches!(ownership, ValueOwnership::Immortal));
+        let ref_kind = if matches!(ownership, ValueOwnership::Immortal) {
+            LocalRefKind::Immortal
+        } else {
+            LocalRefKind::Owned
+        };
+        return (value, ref_kind);
+    }
+    (entry.value(), entry.ref_kind())
 }
 
 enum PlannedLocalStoreEffect {
@@ -8477,6 +8504,13 @@ fn emit_planned_local_releases_for_reason_with_local_env_excluding(
             match removed.as_ref().map(|entry| entry.storage) {
                 Some(LocalEnvStorage::LocalOnly) => {
                     let previous = removed.as_ref().expect("checked above");
+                    if previous.i64_facts().is_some() {
+                        continue;
+                    }
+                    let (root_value, root_ref_kind) =
+                        emit_local_env_entry_pyobject_for_frame_root_transfer(
+                            fb, previous, emit_ctx,
+                        );
                     emit_refcount_decref_location_counter(
                         fb,
                         source_label,
@@ -8489,8 +8523,8 @@ fn emit_planned_local_releases_for_reason_with_local_env_excluding(
                         .replace_transferred_value(
                             fb,
                             local.name.as_str(),
-                            previous.value(),
-                            previous.ref_kind(),
+                            root_value,
+                            root_ref_kind,
                             emit_ctx.consts.ptr_ty,
                             emit_ctx.consts.thread_state_value,
                             emit_ctx.incref_ref,
@@ -14663,6 +14697,12 @@ enum OptV3MechanicalValue {
     I32Bool01(ir::Value),
 }
 
+struct OptV3RegionInputValues {
+    values: HashMap<PlanValue, OptV3MechanicalValue>,
+    preseeded_scalars: HashSet<PlanValue>,
+    preseeded_convert_inputs: HashSet<PlanValue>,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct OptV3PyObjectResult {
     value: ir::Value,
@@ -14735,7 +14775,7 @@ impl OptV3MechanicalValue {
             (self, rep),
             (
                 Self::PyObject { owned: true, .. },
-                Rep::PyObjectOwned | Rep::PyObjectImmortal
+                Rep::PyObjectOwned | Rep::PyObjectBorrowed | Rep::PyObjectImmortal
             ) | (
                 Self::PyObject { owned: false, .. },
                 Rep::PyObjectBorrowed | Rep::PyObjectImmortal
@@ -14869,7 +14909,9 @@ fn emit_opt_v3_exact_int_branch_selection(
     emit_opt_v3_mechanical_region_steps(
         fb,
         selection.hot_region,
-        &mut hot_values,
+        &mut hot_values.values,
+        &hot_values.preseeded_scalars,
+        &hot_values.preseeded_convert_inputs,
         Some(fallback_block),
         local_env,
         emit_ctx,
@@ -14877,7 +14919,8 @@ fn emit_opt_v3_exact_int_branch_selection(
         func_imports,
     )?;
     let hot_condition =
-        opt_v3_region_branch_condition(selection.hot_region, &hot_values, test_instr_id)?;
+        opt_v3_region_branch_condition(selection.hot_region, &hot_values.values, test_instr_id)?;
+    emit_opt_v3_release_owned_values_except(fb, &hot_values.values, None, emit_ctx);
     fb.ins()
         .jump(result_block, &[ir::BlockArg::Value(hot_condition)]);
 
@@ -14893,15 +14936,21 @@ fn emit_opt_v3_exact_int_branch_selection(
     emit_opt_v3_mechanical_region_steps(
         fb,
         selection.fallback_region,
-        &mut fallback_values,
+        &mut fallback_values.values,
+        &fallback_values.preseeded_scalars,
+        &fallback_values.preseeded_convert_inputs,
         None,
         local_env,
         emit_ctx,
         codegen_env,
         func_imports,
     )?;
-    let fallback_condition =
-        opt_v3_region_branch_condition(selection.fallback_region, &fallback_values, test_instr_id)?;
+    let fallback_condition = opt_v3_region_branch_condition(
+        selection.fallback_region,
+        &fallback_values.values,
+        test_instr_id,
+    )?;
+    emit_opt_v3_release_owned_values_except(fb, &fallback_values.values, None, emit_ctx);
     fb.ins()
         .jump(result_block, &[ir::BlockArg::Value(fallback_condition)]);
 
@@ -14935,7 +14984,9 @@ fn emit_opt_v3_exact_int_return_selection(
     emit_opt_v3_mechanical_region_steps(
         fb,
         selection.hot_region,
-        &mut hot_values,
+        &mut hot_values.values,
+        &hot_values.preseeded_scalars,
+        &hot_values.preseeded_convert_inputs,
         Some(fallback_block),
         local_env,
         emit_ctx,
@@ -14943,7 +14994,13 @@ fn emit_opt_v3_exact_int_return_selection(
         func_imports,
     )?;
     let hot_result =
-        opt_v3_region_return_pyobject(selection.hot_region, &hot_values, value_instr_id)?;
+        opt_v3_region_return_pyobject(selection.hot_region, &hot_values.values, value_instr_id)?;
+    emit_opt_v3_release_owned_values_except(
+        fb,
+        &hot_values.values,
+        Some(hot_result.value),
+        emit_ctx,
+    );
     fb.ins()
         .jump(result_block, &[ir::BlockArg::Value(hot_result.value)]);
 
@@ -14959,15 +15016,26 @@ fn emit_opt_v3_exact_int_return_selection(
     emit_opt_v3_mechanical_region_steps(
         fb,
         selection.fallback_region,
-        &mut fallback_values,
+        &mut fallback_values.values,
+        &fallback_values.preseeded_scalars,
+        &fallback_values.preseeded_convert_inputs,
         None,
         local_env,
         emit_ctx,
         codegen_env,
         func_imports,
     )?;
-    let fallback_result =
-        opt_v3_region_return_pyobject(selection.fallback_region, &fallback_values, value_instr_id)?;
+    let fallback_result = opt_v3_region_return_pyobject(
+        selection.fallback_region,
+        &fallback_values.values,
+        value_instr_id,
+    )?;
+    emit_opt_v3_release_owned_values_except(
+        fb,
+        &fallback_values.values,
+        Some(fallback_result.value),
+        emit_ctx,
+    );
     fb.ins()
         .jump(result_block, &[ir::BlockArg::Value(fallback_result.value)]);
 
@@ -14978,6 +15046,24 @@ fn emit_opt_v3_exact_int_return_selection(
     })
 }
 
+fn emit_opt_v3_release_owned_values_except(
+    fb: &mut FunctionBuilder<'_>,
+    values: &HashMap<PlanValue, OptV3MechanicalValue>,
+    keep_value: Option<ir::Value>,
+    emit_ctx: &JitEmitCtx<'_>,
+) {
+    let mut released = HashSet::new();
+    for value in values.values().copied() {
+        let OptV3MechanicalValue::PyObject { value, owned: true } = value else {
+            continue;
+        };
+        if keep_value == Some(value) || !released.insert(value) {
+            continue;
+        }
+        emit_release_owned_pyobject(fb, value, None, emit_ctx);
+    }
+}
+
 fn opt_v3_region_input_values(
     fb: &mut FunctionBuilder<'_>,
     region: &RegionPlan,
@@ -14985,20 +15071,81 @@ fn opt_v3_region_input_values(
     emit_ctx: &JitEmitCtx<'_>,
     local_fallback_block: Option<ir::Block>,
     context: &str,
-) -> Result<HashMap<PlanValue, OptV3MechanicalValue>, String> {
+) -> Result<OptV3RegionInputValues, String> {
     let mut values = HashMap::new();
+    let mut preseeded_scalars = HashSet::new();
+    let mut preseeded_convert_inputs = HashSet::new();
     for input in opt_v3_mechanical_region_inputs(region, context)? {
         let value = match input.source {
-            MechanicalRegionInputSource::FunctionParam { name } => local_env
-                .load_name(fb, name, emit_ctx, true)
-                .ok_or_else(|| {
+            MechanicalRegionInputSource::FunctionParam { name } if input.value.rep == Rep::I64 => {
+                let (value, _) = local_env.scalar_i64_value_for_name(name).ok_or_else(|| {
                     format!(
-                        "optimizer v3 {context} input {:?} references unavailable local {:?}",
+                        "optimizer v3 {context} input {:?} references unavailable scalar local {:?}",
                         input.value, name
                     )
-                })?,
+                })?;
+                OptV3MechanicalValue::I64(value)
+            }
+            MechanicalRegionInputSource::FunctionParam { name }
+                if input.value.rep == Rep::PyObjectBorrowed =>
+            {
+                if let Some((value, facts)) = local_env.scalar_i64_value_for_name(name) {
+                    let outputs = opt_v3_i64_convert_outputs_for_input(region, input.value);
+                    if !outputs.is_empty() {
+                        preseeded_convert_inputs.insert(input.value);
+                        for output in outputs {
+                            opt_v3_store_mechanical_value(
+                                &mut values,
+                                output,
+                                OptV3MechanicalValue::I64(value),
+                            )?;
+                            preseeded_scalars.insert(output);
+                        }
+                        continue;
+                    }
+                    let result = emit_soac_value_result_for_demand(
+                        fb,
+                        SoacValue::i64(value, facts),
+                        emit_ctx,
+                        ResultDemand::PYOBJECT_OWNED,
+                        None,
+                    );
+                    let (value, ownership, _) =
+                        result.expect_pyobject("scalar opt-v3 PyObject input materialization");
+                    OptV3MechanicalValue::PyObject {
+                        value,
+                        owned: ownership.is_owned(),
+                    }
+                } else {
+                    let value = local_env
+                        .load_name(fb, name, emit_ctx, true)
+                        .ok_or_else(|| {
+                            format!(
+                                "optimizer v3 {context} input {:?} references unavailable local {:?}",
+                                input.value, name
+                            )
+                        })?;
+                    OptV3MechanicalValue::PyObject {
+                        value,
+                        owned: false,
+                    }
+                }
+            }
+            MechanicalRegionInputSource::FunctionParam { name } => {
+                return Err(format!(
+                    "optimizer v3 {context} function-param input {:?} for {name:?} has unsupported rep {:?}",
+                    input.value, input.value.rep
+                ));
+            }
             MechanicalRegionInputSource::ModuleConstant { index } => {
-                emit_owned_module_constant(fb, ModuleConstantId(index as usize), emit_ctx)
+                OptV3MechanicalValue::PyObject {
+                    value: emit_owned_module_constant(
+                        fb,
+                        ModuleConstantId(index as usize),
+                        emit_ctx,
+                    ),
+                    owned: input.value.rep == Rep::PyObjectOwned,
+                }
             }
             MechanicalRegionInputSource::IndexedGlobal {
                 source,
@@ -15012,30 +15159,36 @@ fn opt_v3_region_input_values(
                         input.value
                     )
                 })?;
-                emit_borrowed_planned_indexed_global_load(
-                    fb,
-                    emit_ctx.consts.block_const,
-                    name,
-                    expected_index,
-                    source,
-                    fallback_block,
-                    emit_ctx,
-                )
+                OptV3MechanicalValue::PyObject {
+                    value: emit_borrowed_planned_indexed_global_load(
+                        fb,
+                        emit_ctx.consts.block_const,
+                        name,
+                        expected_index,
+                        source,
+                        fallback_block,
+                        emit_ctx,
+                    ),
+                    owned: false,
+                }
             }
             MechanicalRegionInputSource::IndexedGlobal {
                 source,
                 module_name: _,
                 name,
                 expected_index,
-            } if input.value.rep == Rep::PyObjectOwned => emit_planned_indexed_global_load(
-                fb,
-                emit_ctx.consts.block_const,
-                name,
-                expected_index,
-                source,
-                local_env,
-                emit_ctx,
-            ),
+            } if input.value.rep == Rep::PyObjectOwned => OptV3MechanicalValue::PyObject {
+                value: emit_planned_indexed_global_load(
+                    fb,
+                    emit_ctx.consts.block_const,
+                    name,
+                    expected_index,
+                    source,
+                    local_env,
+                    emit_ctx,
+                ),
+                owned: true,
+            },
             MechanicalRegionInputSource::IndexedGlobal { .. } => {
                 return Err(format!(
                     "optimizer v3 {context} indexed-global input {:?} has unsupported rep {:?}",
@@ -15043,14 +15196,30 @@ fn opt_v3_region_input_values(
                 ));
             }
         };
-        let owned = input.value.rep == Rep::PyObjectOwned;
-        opt_v3_store_mechanical_value(
-            &mut values,
-            input.value,
-            OptV3MechanicalValue::PyObject { value, owned },
-        )?;
+        opt_v3_store_mechanical_value(&mut values, input.value, value)?;
     }
-    Ok(values)
+    Ok(OptV3RegionInputValues {
+        values,
+        preseeded_scalars,
+        preseeded_convert_inputs,
+    })
+}
+
+fn opt_v3_i64_convert_outputs_for_input(region: &RegionPlan, input: PlanValue) -> Vec<PlanValue> {
+    region
+        .nodes
+        .iter()
+        .filter_map(|node| match &node.kind {
+            PlanNodeKind::Convert(convert)
+                if convert.kind == ConversionKind::FromPythonLongCompactToI64
+                    && convert.input == input
+                    && convert.output.rep == Rep::I64 =>
+            {
+                Some(convert.output)
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -15058,110 +15227,21 @@ fn emit_opt_v3_mechanical_region_steps(
     fb: &mut FunctionBuilder<'_>,
     region: &MechanicalRegionEmission,
     values: &mut HashMap<PlanValue, OptV3MechanicalValue>,
+    preseeded_scalars: &HashSet<PlanValue>,
+    preseeded_convert_inputs: &HashSet<PlanValue>,
     local_fallback_block: Option<ir::Block>,
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<(), String> {
-    emit_opt_v3_mechanical_region_steps_controlled(
-        fb,
-        region,
-        values,
-        local_fallback_block,
-        local_env,
-        emit_ctx,
-        codegen_env,
-        func_imports,
-        None,
-        None,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
-fn emit_opt_v3_mechanical_region_steps_until_value(
-    fb: &mut FunctionBuilder<'_>,
-    region: &MechanicalRegionEmission,
-    values: &mut HashMap<PlanValue, OptV3MechanicalValue>,
-    local_fallback_block: Option<ir::Block>,
-    local_env: &mut LocalEnv,
-    emit_ctx: &JitEmitCtx<'_>,
-    codegen_env: &mut impl JitCodegenEnv,
-    func_imports: &mut FuncBuildImports<'_>,
-    stop_after_value: PlanValue,
-) -> Result<(), String> {
-    emit_opt_v3_mechanical_region_steps_controlled(
-        fb,
-        region,
-        values,
-        local_fallback_block,
-        local_env,
-        emit_ctx,
-        codegen_env,
-        func_imports,
-        Some(stop_after_value),
-        None,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
-fn emit_opt_v3_mechanical_region_steps_with_preseeded_scalar(
-    fb: &mut FunctionBuilder<'_>,
-    region: &MechanicalRegionEmission,
-    values: &mut HashMap<PlanValue, OptV3MechanicalValue>,
-    local_fallback_block: Option<ir::Block>,
-    local_env: &mut LocalEnv,
-    emit_ctx: &JitEmitCtx<'_>,
-    codegen_env: &mut impl JitCodegenEnv,
-    func_imports: &mut FuncBuildImports<'_>,
-    preseeded_scalar: PlanValue,
-) -> Result<(), String> {
-    emit_opt_v3_mechanical_region_steps_controlled(
-        fb,
-        region,
-        values,
-        local_fallback_block,
-        local_env,
-        emit_ctx,
-        codegen_env,
-        func_imports,
-        None,
-        Some(preseeded_scalar),
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn emit_opt_v3_mechanical_region_steps_controlled(
-    fb: &mut FunctionBuilder<'_>,
-    region: &MechanicalRegionEmission,
-    values: &mut HashMap<PlanValue, OptV3MechanicalValue>,
-    local_fallback_block: Option<ir::Block>,
-    local_env: &mut LocalEnv,
-    emit_ctx: &JitEmitCtx<'_>,
-    codegen_env: &mut impl JitCodegenEnv,
-    func_imports: &mut FuncBuildImports<'_>,
-    stop_after_value: Option<PlanValue>,
-    preseeded_scalar: Option<PlanValue>,
-) -> Result<(), String> {
-    if let Some(value) = stop_after_value
-        && values.contains_key(&value)
-    {
-        return Ok(());
-    }
-    let preseeded_convert_inputs = if let Some(preseeded_scalar) = preseeded_scalar {
-        opt_v3_mechanical_convert_inputs_for_output(region, preseeded_scalar)
-    } else {
-        HashSet::new()
-    };
     for step in &region.steps {
         match opt_v3_mechanical_codegen_step(
             region.region,
             step,
             local_fallback_block.is_some(),
-            preseeded_scalar,
-            &preseeded_convert_inputs,
+            preseeded_scalars,
+            preseeded_convert_inputs,
         )? {
             MechanicalCodegenStep::Input { output } => {
                 if preseeded_convert_inputs.contains(&output) {
@@ -15240,17 +15320,6 @@ fn emit_opt_v3_mechanical_region_steps_controlled(
                 )?;
             }
         }
-        if let Some(value) = stop_after_value
-            && values.contains_key(&value)
-        {
-            return Ok(());
-        }
-    }
-    if let Some(value) = stop_after_value {
-        return Err(format!(
-            "optimizer v3 region {:?} did not produce requested stop value {:?}",
-            region.region, value.id
-        ));
     }
     Ok(())
 }
@@ -16212,607 +16281,6 @@ fn store_value_expr(expr: &InstrTyped) -> &InstrTyped {
 
 fn is_generated_transfer_temp_name(name: &str) -> bool {
     name.starts_with("_dp_tmp_") || name.starts_with("_dp_typed_inline_")
-}
-
-#[allow(dead_code)]
-fn codegen_block_has_predecessor(
-    function: &BlockPyFunction<BlockPyModuleShape>,
-    target: BlockLabel,
-) -> usize {
-    function
-        .blocks
-        .iter()
-        .filter(|block| match &block.term {
-            BlockTerm::Jump(edge) => edge.target == target,
-            BlockTerm::IfTerm(if_term) => {
-                if_term.then_label == target || if_term.else_label == target
-            }
-            BlockTerm::BranchTable(branch) => {
-                branch.default_label == target || branch.targets.contains(&target)
-            }
-            BlockTerm::Raise(_) | BlockTerm::Return(_) => false,
-        })
-        .count()
-}
-
-#[allow(dead_code)]
-fn cranelift_value_args(args: &[ir::BlockArg]) -> Result<Vec<ir::Value>, String> {
-    args.iter()
-        .map(|arg| match arg {
-            ir::BlockArg::Value(value) => Ok(*value),
-            other => Err(format!(
-                "optimizer v3 scalar-thread jump expected value block arg, got {other:?}"
-            )),
-        })
-        .collect()
-}
-
-#[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
-fn emit_opt_v3_scalar_thread_inline_return_branch(
-    fb: &mut FunctionBuilder<'_>,
-    source_label: BlockLabel,
-    test_instr_id: Option<InstrId>,
-    truth_i32: ir::Value,
-    unmaterialized_location: Option<LocalLocation>,
-    targets: OptV3ScalarThreadInlineReturnTargets<'_>,
-    local_env: &mut LocalEnv,
-    emit_ctx: &JitEmitCtx<'_>,
-    codegen_env: &mut impl JitCodegenEnv,
-    func_imports: &mut FuncBuildImports<'_>,
-) -> Result<(), String> {
-    if let Some(test_instr_id) = test_instr_id
-        && let Some(counter_id) = emit_ctx
-            .branch_outcome_counter_ids
-            .get(&test_instr_id)
-            .copied()
-    {
-        emit_record_branch_outcome_sample(fb, counter_id, truth_i32, emit_ctx);
-    }
-
-    let prefer_true = true;
-    let hot_cond = if prefer_true {
-        fb.ins()
-            .icmp_imm(ir::condcodes::IntCC::NotEqual, truth_i32, 0)
-    } else {
-        fb.ins().icmp_imm(ir::condcodes::IntCC::Equal, truth_i32, 0)
-    };
-    let hot_branch = fb.create_block();
-    let cold_branch = fb.create_block();
-    fb.ins().brif(hot_cond, hot_branch, &[], cold_branch, &[]);
-
-    let (hot_label, hot_term, cold_label, cold_term) = if prefer_true {
-        (
-            targets.then_label,
-            targets.then_term,
-            targets.else_label,
-            targets.else_term,
-        )
-    } else {
-        (
-            targets.else_label,
-            targets.else_term,
-            targets.then_label,
-            targets.then_term,
-        )
-    };
-
-    let mut hot_local_env = local_env.clone();
-    emit_opt_v3_scalar_thread_inline_return_arm(
-        fb,
-        hot_branch,
-        hot_label,
-        hot_term,
-        unmaterialized_location,
-        &mut hot_local_env,
-        emit_ctx,
-        codegen_env,
-        func_imports,
-    )
-    .map_err(|err| {
-        format!("optimizer v3 scalar-thread inline return from block {source_label}: {err}")
-    })?;
-
-    let mut cold_local_env = local_env.clone();
-    emit_opt_v3_scalar_thread_inline_return_arm(
-        fb,
-        cold_branch,
-        cold_label,
-        cold_term,
-        unmaterialized_location,
-        &mut cold_local_env,
-        emit_ctx,
-        codegen_env,
-        func_imports,
-    )
-    .map_err(|err| {
-        format!("optimizer v3 scalar-thread inline return from block {source_label}: {err}")
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
-fn emit_opt_v3_scalar_thread_inline_return_arm(
-    fb: &mut FunctionBuilder<'_>,
-    branch_block: ir::Block,
-    target_label: BlockLabel,
-    target_term: &BlockTerm<InstrBlockPy>,
-    unmaterialized_location: Option<LocalLocation>,
-    local_env: &mut LocalEnv,
-    emit_ctx: &JitEmitCtx<'_>,
-    codegen_env: &mut impl JitCodegenEnv,
-    func_imports: &mut FuncBuildImports<'_>,
-) -> Result<(), String> {
-    fb.switch_to_block(branch_block);
-    let BlockTerm::Return(value) = target_term else {
-        return Err(format!(
-            "target block {target_label} is no longer a return block"
-        ));
-    };
-    let ret_value = emit_codegen_expr_with_local_env(
-        fb,
-        value,
-        local_env,
-        emit_ctx,
-        false,
-        codegen_env,
-        func_imports,
-    );
-    let unmaterialized_locations = unmaterialized_location.into_iter().collect::<HashSet<_>>();
-    emit_codegen_return_pyobject_with_unmaterialized_locals(
-        fb,
-        target_label,
-        ret_value,
-        local_env,
-        emit_ctx,
-        None,
-        &unmaterialized_locations,
-    )
-}
-
-fn typed_exact_int_scalar_thread_selection(
-    plan: &TypedExactIntScalarThreadPlan,
-    producer_source: InstrId,
-    consumer_source: InstrId,
-) -> Result<Option<OptV3ScalarThreadSelection<'_>>, String> {
-    if plan.producer_instr_id != producer_source || plan.consumer_instr_id != consumer_source {
-        return Ok(None);
-    }
-    if !matches!(
-        plan.thread.materialization,
-        soac_ir_typed::plan_v3::ScalarThreadMaterialization::DeferredUntilPythonObjectUse { .. }
-    ) {
-        return Err(format!(
-            "optimizer v3 scalar thread for local {} has materialization unsupported by current mechanical lowering: {:?}",
-            plan.thread.local.name, plan.thread.materialization
-        ));
-    }
-    Ok(Some(OptV3ScalarThreadSelection {
-        thread: &plan.thread,
-        producer: OptV3ExactIntReturnSelection {
-            hot_plan: &plan.producer_hot_plan,
-            hot_region: &plan.producer_hot_region,
-            fallback_plan: &plan.producer_fallback_plan,
-            fallback_region: &plan.producer_fallback_region,
-        },
-        consumer: OptV3ExactIntBranchSelection {
-            hot_plan: &plan.consumer_hot_plan,
-            hot_region: &plan.consumer_hot_region,
-            fallback_plan: &plan.consumer_fallback_plan,
-            fallback_region: &plan.consumer_fallback_region,
-        },
-    }))
-}
-
-#[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
-fn emit_opt_v3_scalar_threaded_store_branch(
-    fb: &mut FunctionBuilder<'_>,
-    source_label: BlockLabel,
-    typed_block: &TypedBlock,
-    typed_function: &BlockPyFunction<TypedBlockPyModuleShape>,
-    function: &BlockPyFunction<BlockPyModuleShape>,
-    jit_local_plan: &PlannedJitFunctionLocals,
-    exec_blocks: &[ir::Block],
-    block_indices_by_label: &HashMap<BlockLabel, usize>,
-    jump_edge_transports: &[Option<EdgeTransportPlan>],
-    implicit_target_transports: &[EdgeTransportPlan],
-    local_env: &mut LocalEnv,
-    emit_ctx: &JitEmitCtx<'_>,
-    cleanup_null_block: ir::Block,
-    pending_local_failure_cleanups: &mut Vec<PendingLocalFailureCleanup>,
-    local_failure_cleanup_blocks: &mut HashMap<LocalFailureCleanupKey, ir::Block>,
-    codegen_env: &mut impl JitCodegenEnv,
-    func_imports: &mut FuncBuildImports<'_>,
-    current_exception_name: Option<&str>,
-) -> Result<Option<Vec<BlockLabel>>, String> {
-    let [store_expr] = typed_block.body.as_slice() else {
-        return Ok(None);
-    };
-    let InstrTyped::Store(store) = store_expr else {
-        return Ok(None);
-    };
-    let Some(location) = store.name.local_location() else {
-        return Ok(None);
-    };
-    let BlockTerm::Jump(edge) = &typed_block.term else {
-        return Ok(None);
-    };
-    if !edge.args.is_empty() {
-        return Ok(None);
-    }
-    if codegen_block_has_predecessor(function, edge.target) != 1 {
-        return Ok(None);
-    }
-    if current_exception_name.is_some() || block_exception_name(function, edge.target).is_some() {
-        return Ok(None);
-    }
-
-    let consumer_index =
-        codegen_block_index_for_label(function, block_indices_by_label, edge.target)?;
-    let consumer_block = &typed_function.blocks[consumer_index];
-    if !consumer_block.body.is_empty() {
-        return Ok(None);
-    }
-    let BlockTerm::IfTerm(if_term) = &consumer_block.term else {
-        return Ok(None);
-    };
-    let Some(producer_source) = store.value.try_semantic_instr_id() else {
-        return Ok(None);
-    };
-    let Some(consumer_source) = if_term.test.try_semantic_instr_id() else {
-        return Ok(None);
-    };
-    let Some(plan) = store.extra().exact_int_scalar_thread_plan() else {
-        return Ok(None);
-    };
-    let Some(selection) =
-        typed_exact_int_scalar_thread_selection(plan, producer_source, consumer_source)?
-    else {
-        return Ok(None);
-    };
-
-    if let Some(store_instr_id) = store_expr.try_semantic_instr_id() {
-        emit_ctx.require_deopt_point_before_instr_id(store_instr_id)?;
-    }
-    emit_ctx.require_deopt_point_before_term(source_label)?;
-    emit_ctx.require_deopt_point_at_block_entry(edge.target)?;
-    emit_ctx.require_deopt_point_before_term(edge.target)?;
-
-    let source_index =
-        codegen_block_index_for_label(function, block_indices_by_label, source_label)?;
-    let source_jump_transport = jump_edge_transports[source_index]
-        .as_ref()
-        .expect("jump term should have a planned edge transport");
-    let layout = emit_ctx
-        .storage_layout
-        .as_ref()
-        .expect("Store local slot should have storage layout during typed codegen");
-    let local_name = local_name_for_location(layout, location);
-    let local_already_bound = local_env
-        .entry_index_for_location(location)
-        .or_else(|| local_env.entry_index_for_name(local_name))
-        .is_some();
-    let inline_return_targets = if !local_already_bound && emit_ctx.stack_slots.has_name(local_name)
-    {
-        opt_v3_scalar_thread_inline_return_targets(
-            function,
-            block_indices_by_label,
-            if_term,
-            &store.name,
-        )?
-    } else {
-        None
-    };
-    let result_block = if inline_return_targets.is_none() {
-        let block = fb.create_block();
-        fb.append_block_param(block, emit_ctx.consts.i32_ty);
-        fb.append_block_param(block, emit_ctx.consts.ptr_ty);
-        Some(block)
-    } else {
-        None
-    };
-    let producer_fallback_block = fb.create_block();
-    fb.set_cold_block(producer_fallback_block);
-
-    let stmt_emit_ctx = local_failure_cleanup_emit_ctx(
-        fb,
-        emit_ctx,
-        local_env,
-        cleanup_null_block,
-        pending_local_failure_cleanups,
-        local_failure_cleanup_blocks,
-    )?;
-    let stmt_emit_ctx = stmt_emit_ctx.as_ref().unwrap_or(emit_ctx);
-
-    let mut hot_values = opt_v3_region_input_values(
-        fb,
-        selection.producer.hot_plan,
-        local_env,
-        stmt_emit_ctx,
-        Some(producer_fallback_block),
-        "scalar-thread producer hot region",
-    )?;
-    emit_opt_v3_mechanical_region_steps_until_value(
-        fb,
-        selection.producer.hot_region,
-        &mut hot_values,
-        Some(producer_fallback_block),
-        local_env,
-        stmt_emit_ctx,
-        codegen_env,
-        func_imports,
-        selection.thread.producer.value,
-    )?;
-    let threaded_i64 = opt_v3_i64_value(&hot_values, selection.thread.producer.value)?;
-    let mut consumer_hot_values = HashMap::new();
-    opt_v3_store_mechanical_value(
-        &mut consumer_hot_values,
-        selection.thread.consumer.value,
-        OptV3MechanicalValue::I64(threaded_i64),
-    )?;
-    emit_opt_v3_mechanical_region_steps_with_preseeded_scalar(
-        fb,
-        selection.consumer.hot_region,
-        &mut consumer_hot_values,
-        None,
-        local_env,
-        stmt_emit_ctx,
-        codegen_env,
-        func_imports,
-        selection.thread.consumer.value,
-    )?;
-    let hot_condition = opt_v3_region_branch_condition(
-        selection.consumer.hot_region,
-        &consumer_hot_values,
-        consumer_source,
-    )?;
-    if let Some(inline_return_targets) = inline_return_targets {
-        let mut hot_return_env = local_env.clone();
-        emit_opt_v3_scalar_thread_inline_return_branch(
-            fb,
-            edge.target,
-            Some(consumer_source),
-            hot_condition,
-            opt_v3_scalar_thread_unmaterialized_local_location(selection.thread)?,
-            inline_return_targets,
-            &mut hot_return_env,
-            stmt_emit_ctx,
-            codegen_env,
-            func_imports,
-        )?;
-    } else {
-        let result_block =
-            result_block.expect("non-inline scalar thread path should have a result block");
-        let hot_c = emit_checked_owned_pyobject_call_with_cleanup(
-            fb,
-            stmt_emit_ctx,
-            stmt_emit_ctx.py_long_from_i64_ref,
-            &[threaded_i64],
-            &[],
-        );
-        fb.ins().jump(
-            result_block,
-            &[
-                ir::BlockArg::Value(hot_condition),
-                ir::BlockArg::Value(hot_c),
-            ],
-        );
-    }
-
-    fb.switch_to_block(producer_fallback_block);
-    let mut fallback_env = local_env.clone();
-    let producer_fallback_emit_ctx = local_failure_cleanup_emit_ctx(
-        fb,
-        emit_ctx,
-        &fallback_env,
-        cleanup_null_block,
-        pending_local_failure_cleanups,
-        local_failure_cleanup_blocks,
-    )?;
-    let producer_fallback_emit_ctx = producer_fallback_emit_ctx.as_ref().unwrap_or(emit_ctx);
-    let mut producer_fallback_values = opt_v3_region_input_values(
-        fb,
-        selection.producer.fallback_plan,
-        &mut fallback_env,
-        producer_fallback_emit_ctx,
-        None,
-        "scalar-thread producer fallback region",
-    )?;
-    emit_opt_v3_mechanical_region_steps(
-        fb,
-        selection.producer.fallback_region,
-        &mut producer_fallback_values,
-        None,
-        &mut fallback_env,
-        producer_fallback_emit_ctx,
-        codegen_env,
-        func_imports,
-    )?;
-    let fallback_c_result = opt_v3_region_return_pyobject(
-        selection.producer.fallback_region,
-        &producer_fallback_values,
-        producer_source,
-    )?;
-    if !fallback_c_result
-        .ownership
-        .can_satisfy_pyobject_demand(ResultDemand::PYOBJECT_OWNED)
-    {
-        return Err(format!(
-            "optimizer v3 scalar-thread fallback producer for {producer_source} produced {:?}, expected owned PyObject",
-            fallback_c_result.ownership
-        ));
-    }
-    fallback_env.store_location(
-        fb,
-        location,
-        local_name,
-        fallback_c_result.value,
-        LocalRefKind::Owned,
-        Some(PyObjFacts::unknown()),
-        emit_ctx.allow_local_only_slot_backed_stores,
-        CleanupRootSlotState::MaybeOwnedReference,
-        &emit_ctx.stack_slots,
-        Some(refcount_decref_location_counter_parts(
-            producer_fallback_emit_ctx,
-        )),
-        emit_ctx.consts.ptr_ty,
-        emit_ctx.consts.thread_state_value,
-        emit_ctx.incref_ref,
-        emit_ctx.decref_ref,
-    );
-    let consumer_fallback_emit_ctx = local_failure_cleanup_emit_ctx(
-        fb,
-        emit_ctx,
-        &fallback_env,
-        cleanup_null_block,
-        pending_local_failure_cleanups,
-        local_failure_cleanup_blocks,
-    )?;
-    let consumer_fallback_emit_ctx = consumer_fallback_emit_ctx.as_ref().unwrap_or(emit_ctx);
-    let mut consumer_fallback_values = opt_v3_region_input_values(
-        fb,
-        selection.consumer.fallback_plan,
-        &mut fallback_env,
-        consumer_fallback_emit_ctx,
-        None,
-        "scalar-thread consumer fallback region",
-    )?;
-    emit_opt_v3_mechanical_region_steps(
-        fb,
-        selection.consumer.fallback_region,
-        &mut consumer_fallback_values,
-        None,
-        &mut fallback_env,
-        consumer_fallback_emit_ctx,
-        codegen_env,
-        func_imports,
-    )?;
-    let fallback_condition = opt_v3_region_branch_condition(
-        selection.consumer.fallback_region,
-        &consumer_fallback_values,
-        consumer_source,
-    )?;
-    if let Some(inline_return_targets) = inline_return_targets {
-        emit_opt_v3_scalar_thread_inline_return_branch(
-            fb,
-            edge.target,
-            Some(consumer_source),
-            fallback_condition,
-            None,
-            inline_return_targets,
-            &mut fallback_env,
-            consumer_fallback_emit_ctx,
-            codegen_env,
-            func_imports,
-        )?;
-        return Ok(Some(vec![
-            edge.target,
-            if_term.then_label,
-            if_term.else_label,
-        ]));
-    }
-    let fallback_c = fallback_env
-        .load_location(fb, location, local_name, consumer_fallback_emit_ctx, true)
-        .ok_or_else(|| {
-            format!("optimizer v3 scalar-thread fallback lost materialized local {local_name}")
-        })?;
-    let result_block =
-        result_block.expect("non-inline scalar thread path should have result block");
-    fb.ins().jump(
-        result_block,
-        &[
-            ir::BlockArg::Value(fallback_condition),
-            ir::BlockArg::Value(fallback_c),
-        ],
-    );
-
-    fb.switch_to_block(result_block);
-    let result_params = fb.block_params(result_block).to_vec();
-    let condition = result_params[0];
-    let c_value = result_params[1];
-    local_env.store_location(
-        fb,
-        location,
-        local_name,
-        c_value,
-        LocalRefKind::Owned,
-        Some(PyObjFacts::unknown()),
-        emit_ctx.allow_local_only_slot_backed_stores,
-        CleanupRootSlotState::MaybeOwnedReference,
-        &emit_ctx.stack_slots,
-        Some(refcount_decref_location_counter_parts(emit_ctx)),
-        emit_ctx.consts.ptr_ty,
-        emit_ctx.consts.thread_state_value,
-        emit_ctx.incref_ref,
-        emit_ctx.decref_ref,
-    );
-    let (prepared_args, forwarded_locations) = emit_planned_target_args_codegen_from_local_env(
-        fb,
-        &source_jump_transport.target_args,
-        local_env,
-        emit_ctx,
-        codegen_env,
-        func_imports,
-    )
-    .map_err(|err| {
-        format!(
-            "missing local mapping for fused optimizer v3 scalar-thread jump from block {source_label}: {err}"
-        )
-    })?;
-    emit_planned_local_releases_for_reason_with_local_env(
-        fb,
-        source_label,
-        &RefcountReleaseReason::Jump {
-            target: edge.target,
-        },
-        local_env,
-        &forwarded_locations,
-        emit_ctx,
-    )?;
-    emit_decref_unforwarded_local_env(
-        fb,
-        local_env,
-        &forwarded_locations,
-        &[],
-        emit_ctx.consts.thread_state_value,
-        emit_ctx.decref_ref,
-    );
-    let consumer_arg_values = cranelift_value_args(&prepared_args)?;
-    let mut consumer_env = LocalEnv::default();
-    bind_planned_local_env_at_block_entry(
-        fb,
-        jit_local_plan,
-        consumer_index,
-        &consumer_arg_values,
-        &mut consumer_env,
-        &emit_ctx.stack_slots,
-        Some(refcount_decref_location_counter_parts(emit_ctx)),
-        emit_ctx.consts.ptr_ty,
-        emit_ctx.consts.thread_state_value,
-        emit_ctx.incref_ref,
-        emit_ctx.decref_ref,
-        matches!(function.kind, FunctionKind::Function),
-    )?;
-    emit_codegen_if_truth_i32(
-        fb,
-        edge.target,
-        Some(consumer_source),
-        condition,
-        if_term.then_label,
-        if_term.else_label,
-        IfTruthInstrumentation::default(),
-        None,
-        function,
-        exec_blocks,
-        block_indices_by_label,
-        implicit_target_transports,
-        &mut consumer_env,
-        emit_ctx,
-        codegen_env,
-        func_imports,
-    )?;
-    Ok(Some(vec![edge.target]))
 }
 
 #[derive(Clone, Copy, Default)]
@@ -17787,7 +17255,6 @@ fn build_cranelift_run_bb_specialized_function(
     blocks: &[ObjPtr],
     module: &BlockPyModule<TypedBlockPyModuleShape>,
     function: &BlockPyFunction<TypedBlockPyModuleShape>,
-    legacy_scalar_thread_function: Option<&BlockPyFunction<BlockPyModuleShape>>,
     value_facts: &FactStore,
     jit_local_plan: &PlannedJitFunctionLocals,
     jit_deopt_resume_plan: &PlannedJitDeoptResumeFunction,
@@ -18640,14 +18107,9 @@ fn build_cranelift_run_bb_specialized_function(
             }
         }
 
-        let mut opt_v3_fused_scalar_thread_consumers = HashSet::<BlockLabel>::new();
         for (index, block) in exec_blocks.iter().enumerate() {
             fb.switch_to_block(*block);
             let codegen_block = &function.blocks[index];
-            if opt_v3_fused_scalar_thread_consumers.contains(&codegen_block.label) {
-                fb.ins().trap(OPT_V3_FUSED_CONSUMER_TRAP);
-                continue;
-            }
             let mut local_env = LocalEnv::default();
             let block_param_values = fb.block_params(*block).to_vec();
             bind_planned_local_env_at_block_entry(
@@ -18786,32 +18248,6 @@ fn build_cranelift_run_bb_specialized_function(
             );
             emit_ctx.require_deopt_point_at_block_entry(codegen_block.label)?;
             let _block_refcount_plan = emit_ctx.refcount_plan.block(codegen_block.label);
-
-            if let Some(legacy_scalar_thread_function) = legacy_scalar_thread_function {
-                if let Some(fused_labels) = emit_opt_v3_scalar_threaded_store_branch(
-                    &mut fb,
-                    codegen_block.label,
-                    &typed_function.blocks[index],
-                    &typed_function,
-                    legacy_scalar_thread_function,
-                    jit_local_plan,
-                    &exec_blocks,
-                    &block_indices_by_label,
-                    jump_edge_transports,
-                    implicit_target_transports,
-                    &mut local_env,
-                    &emit_ctx,
-                    cleanup_null_blocks[index],
-                    &mut pending_local_failure_cleanups,
-                    &mut local_failure_cleanup_blocks,
-                    codegen_env,
-                    &mut func_imports,
-                    codegen_block.exception_param(),
-                )? {
-                    opt_v3_fused_scalar_thread_consumers.extend(fused_labels);
-                    continue;
-                }
-            }
 
             emit_typed_codegen_ops(
                 &mut fb,
@@ -19498,7 +18934,6 @@ pub unsafe fn render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
         render_blocks,
         render_module,
         render_function,
-        Some(function),
         &jit_module_plan.value_facts,
         jit_local_plan,
         jit_deopt_resume_plan,

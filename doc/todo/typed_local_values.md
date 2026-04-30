@@ -178,8 +178,10 @@ Consumers state their demand. Integer arithmetic and comparisons can demand
    appear in the planned resume entry. Scalars outside the resume entry remain
    SSA-only.
 
-9. Delete the narrow scalar-thread store/branch special case once generic typed
-   locals cover the same behavior.
+9. Done: delete the narrow scalar-thread store/branch special case once generic
+   typed locals cover the same behavior. The generic path now carries scalar
+   locals through runtime block params and pre-seeds matching mechanical i64
+   conversion outputs from `LocalEnv` scalar bindings.
 
 10. Add structured tests for scalar store/load, scalar loop-carried locals,
     materialization at return/call/attr/global/cell boundaries, mixed joins, and

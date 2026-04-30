@@ -67,9 +67,7 @@ Implemented:
 
 - `soac_opt::plan_v3`: full plan schema, conversion
   signatures, operation signatures, replay-safety validation, and structural
-  validation. Function plans also carry validated `scalar_threads` sidecars
-  that name cross-region scalar-local rewrites without asking codegen to
-  rediscover them.
+  validation.
 - `soac_opt::alternatives_v3`: default catalog entries for
   generic Python add/sub/mul/bitwise/all-rich-compare, exact compact-int
   add/sub/mul/bitwise/all-rich-compare, truthiness, and materialization.
@@ -82,10 +80,9 @@ Implemented:
   `return a + b`/`return a - b`/`return a * b` arithmetic returns,
   `return a & b`/`return a | b`/`return a ^ b` bitwise returns, and
   `return a < b` comparison returns, producing hot and local-fallback
-  `RegionPlan`s. It also records a scalar-thread sidecar when a compact-int
-  store RHS feeds the immediately following local comparison, ordinary profiled
-  direct-call selections from `call_hot_targets`, including cross-module targets
-  present in the cached module set, and guarded receiver-method selections from
+  `RegionPlan`s. It also records ordinary profiled direct-call selections from
+  `call_hot_targets`, including cross-module targets present in the cached
+  module set, and guarded receiver-method selections from
   `Call(GetAttr(receiver, method), ...)` profile evidence. Constant-attribute
   indexed-field selections are planned from raw `type_keys` layout evidence and
   lowered `GetAttr`/`SetAttr` sites. Exact-list item selections are planned from
@@ -139,18 +136,13 @@ Implemented:
   artifacts by interpreting the mechanical hot region and its local generic
   fallback. Unsupported or absent v3 regions continue through the existing
   lowering path.
-- JIT term lowering consumes the initial scalar-thread sidecar for the
-  conservative adjacent shape: a planned store-RHS region with no visible
-  side effects before the store, followed immediately by an empty comparison
-  block that reloads the same local. On the fast path this lets the stored
-  value remain as an unboxed scalar until a Python object is required; guard
-  misses or overflow still enter the local fallback region that performs the
-  original store before branching.
+- JIT term lowering no longer consumes a scalar-thread sidecar. Generic typed
+  locals carry unboxed scalar values through runtime block params, and
+  mechanical exact-int regions pre-seed matching i64 conversion outputs from
+  scalar `LocalEnv` bindings when a later branch reloads that local.
 
 Partially migrated families are also intentionally visible:
 
-- scalar-threading is only implemented for the adjacent, no-exception,
-  store-RHS-to-empty-compare shape;
 - profiled ordinary-function direct calls are represented as v3 plan selections
   plus mechanical direct-call emissions with validated argument plans.
   Cross-module targets are represented through serialized module identities and
@@ -190,12 +182,9 @@ Partially migrated families are also intentionally visible:
 Remaining scalar cleanup:
 
 - The compact-int region-step emitter is mechanical once a v3 region is
-  selected, but scalar threading still has a `soac_jit` recognizer for the
-  adjacent store-RHS -> empty compare block -> simple return shape. A cleaner
-  follow-up is to make the scalar-thread emission plan name the fused block
-  shape, consumed labels, unmaterialized-local cleanup, and inline-return
-  targets explicitly, so JIT block lowering executes a selected fusion template
-  instead of rediscovering that control-flow shape.
+  selected. The previous adjacent store-RHS -> empty compare scalar-thread
+  recognizer has been deleted; remaining scalar cleanup should build on the
+  generic typed-local path rather than reintroducing code-shape fusions.
 
 Branch locality and cold block hints remain layout metadata for now, not v3
 semantic plan targets.
@@ -208,31 +197,16 @@ Current integration target:
 - Continue deleting legacy optimization-plan code now that runtime consumption
   and normal offline generation are v3-only.
 
-Scalar-thread generalization notes:
+Typed-local scalar notes:
 
-- Treat scalar value threading as a generic rewrite over planned values and
-  local state, not as a special case in codegen. A producer region exposes a
-  value in a cheaper representation, a later consumer requests that semantic
-  value, and validation proves that every intervening path either keeps the
-  scalar available or materializes the Python object before it can be observed.
-- The next generalization is beyond the current adjacent-block shape: allow a
-  single-predecessor continuation path with intervening non-consuming nodes,
-  then allow exception-bearing or cleanup-bearing paths only after the plan
-  records where the local must be materialized before visible side effects,
-  destructor-observable refcount changes, or deopt replay.
-- The scalar-thread plan should name the producer value, consumer use, local
-  slot, dominance/path condition, materialization point, and fallback region.
-  Validation should reject duplicate consumers, ambiguous local writes, missing
-  materialization before Python-object use, or a fallback path that would skip
-  the original store.
-- Costing should remain ordinary v3 costing: the rewrite saves unbox/box/load
-  work on the hot path, but adds validation and materialization obligations.
-  If those obligations are not explicit and cheap enough, the alternative
-  should decline rather than relying on codegen cleanup.
-- Regression tests for further scalar-threading should assert structured plan
-  and JIT input facts, not rendered CLIF text: producer and consumer refs,
-  fallback region, materialization reason, and that direct lowering can still
-  execute the original Python store on any miss path.
+- Treat scalar value propagation as a generic typed-local dataflow property,
+  not as a special case in codegen. Producers bind locals in `LocalEnv` with a
+  concrete representation, edge planning carries that representation through
+  runtime block params, and boundary operations request explicit conversion
+  only when a Python object is actually required.
+- Regression tests for further scalar propagation should assert structured
+  typed-local facts, runtime block-param representations, and selected v3
+  branch/return plans, not rendered CLIF text or one-off code shapes.
 
 
 ## Isolated Model
@@ -526,12 +500,10 @@ The selected plan must make the safety boundary explicit:
 - validation rejects missing producer/consumer values, mismatched reps,
   duplicate consumers, unknown fallback regions, and missing reasons.
 
-Live lowering needs one more piece before it may skip the current
-`PyLong_FromLongLong` in `c = a + b`: the JIT local environment must be able to
-represent path-aware scalar locals, or split the hot and local-fallback paths so
-cleanup and later Python-object uses see the right ownership state. Until then,
-the scalar thread is useful planner data and diagnostics, not a license for
-codegen to silently elide local materialization.
+Live lowering now handles this through typed locals rather than a scalar-thread
+plan: the producer binds `c` as an unboxed scalar on the hot path, edge planning
+carries that representation as an `ExactI64` runtime block param, and the later
+exact-int region pre-seeds the matching local unbox output from `LocalEnv`.
 
 
 ## Optimization Plan Data Structure
@@ -549,7 +521,6 @@ struct ModuleOptimizationPlanV3 {
 struct FunctionOptimizationPlanV3 {
     function: FunctionIdentity,
     regions: Vec<RegionPlan>,
-    scalar_threads: Vec<ScalarLocalThreadPlan>,
     direct_calls: Vec<DirectCallSpecializationPlan>,
     exact_list_items: Vec<ExactListItemSpecializationPlan>,
     indexed_fields: Vec<IndexedFieldSpecializationPlan>,

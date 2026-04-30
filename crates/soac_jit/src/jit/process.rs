@@ -1726,7 +1726,6 @@ impl ProcessJitState {
             function_blocks,
             function_module,
             function,
-            Some(original_function),
             &function_module_plan.value_facts,
             function_jit_local_plan,
             function_jit_deopt_resume_plan,

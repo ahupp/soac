@@ -909,9 +909,6 @@ fn render_typed_extra_summary(extra: Option<&TypedInstrExtra>) -> String {
     if extra.exact_int_return.is_some() {
         parts.push("exact_int_return".to_string());
     }
-    if extra.exact_int_scalar_thread.is_some() {
-        parts.push("exact_int_scalar_thread".to_string());
-    }
     if extra.guard_miss_deopt {
         parts.push("guard_miss_deopt".to_string());
     }

@@ -1725,7 +1725,6 @@ mod tests {
                     debug_name: Some("f".to_string()),
                 },
                 regions: vec![hot_region, fallback_region],
-                scalar_threads: Vec::new(),
                 direct_calls: Vec::new(),
                 exact_list_items: Vec::new(),
                 indexed_fields: Vec::new(),

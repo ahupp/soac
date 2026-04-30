@@ -3760,7 +3760,6 @@ def build(values):
                         debug_name: Some(function.names.qualname.clone()),
                     },
                     regions: Vec::new(),
-                    scalar_threads: Vec::new(),
                     direct_calls: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
@@ -3779,7 +3778,6 @@ def build(values):
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
                     indexed_globals: Vec::new(),
-                    scalar_threads: Vec::new(),
                     regions: Vec::new(),
                 }],
             },
@@ -4047,7 +4045,6 @@ def build(values):
             blocks,
             planned_module,
             planned_function,
-            Some(function),
             &jit_module_plan.value_facts,
             jit_local_plan,
             jit_deopt_resume_plan,
@@ -15403,11 +15400,6 @@ def f(x):
         )
         .unwrap();
         assert_eq!(artifacts.emission.functions[0].regions.len(), 4);
-        assert_eq!(
-            artifacts.plan.functions[0].scalar_threads.len(),
-            1,
-            "v3 add-store/compare should plan one scalar thread for c"
-        );
 
         let built = build_test_jit_function_with_constants_and_options(
             &module,
@@ -15435,12 +15427,6 @@ def f(x):
             count_direct_calls_to_runtime_helpers(&built.ctx.func, &generic_helpers),
             3,
             "v3 add-store/compare should keep one generic local fallback for add and one for compare truthiness"
-        );
-        let materialize_helpers = import_user_names_for_symbols(&built, &["PyLong_FromLongLong"]);
-        assert_eq!(
-            count_direct_calls_to_runtime_helpers(&built.ctx.func, &materialize_helpers),
-            1,
-            "v3 scalar-thread hot path should not materialize c when both branch targets return without reading it"
         );
     }
 
@@ -15939,7 +15925,6 @@ def f(x):
                         debug_name: Some(function.names.qualname.clone()),
                     },
                     regions: Vec::new(),
-                    scalar_threads: Vec::new(),
                     direct_calls: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
@@ -15958,7 +15943,6 @@ def f(x):
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
                     indexed_globals: Vec::new(),
-                    scalar_threads: Vec::new(),
                     regions: Vec::new(),
                 }],
             },
@@ -16023,7 +16007,6 @@ def f(x):
                         debug_name: Some("caller".to_string()),
                     },
                     regions: Vec::new(),
-                    scalar_threads: Vec::new(),
                     direct_calls: vec![DirectCallSpecializationPlan {
                         source,
                         target: serialized_callee,
@@ -16060,7 +16043,6 @@ def f(x):
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
                     indexed_globals: Vec::new(),
-                    scalar_threads: Vec::new(),
                     regions: Vec::new(),
                 }],
             },
@@ -16152,7 +16134,6 @@ def f(x):
                         debug_name: Some("caller".to_string()),
                     },
                     regions: Vec::new(),
-                    scalar_threads: Vec::new(),
                     direct_calls: vec![DirectCallSpecializationPlan {
                         source,
                         target: serialized_callee,
@@ -16189,7 +16170,6 @@ def f(x):
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
                     indexed_globals: Vec::new(),
-                    scalar_threads: Vec::new(),
                     regions: Vec::new(),
                 }],
             },
@@ -16303,7 +16283,6 @@ def f(x):
                         debug_name: Some("caller".to_string()),
                     },
                     regions: Vec::new(),
-                    scalar_threads: Vec::new(),
                     direct_calls: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: vec![
@@ -16384,7 +16363,6 @@ def f(x):
                         },
                     ],
                     indexed_globals: Vec::new(),
-                    scalar_threads: Vec::new(),
                     regions: Vec::new(),
                 }],
             },
@@ -16487,7 +16465,6 @@ def f(x):
                         debug_name: Some("caller".to_string()),
                     },
                     regions: Vec::new(),
-                    scalar_threads: Vec::new(),
                     direct_calls: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
@@ -16552,7 +16529,6 @@ def f(x):
                                 .to_string(),
                         },
                     ],
-                    scalar_threads: Vec::new(),
                     regions: Vec::new(),
                 }],
             },
@@ -17273,7 +17249,6 @@ def read_point(point):
                         debug_name: Some("caller".to_string()),
                     },
                     regions: Vec::new(),
-                    scalar_threads: Vec::new(),
                     direct_calls: vec![DirectCallSpecializationPlan {
                         source,
                         target: serialized_callee,
@@ -17301,7 +17276,6 @@ def read_point(point):
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
                     indexed_globals: Vec::new(),
-                    scalar_threads: Vec::new(),
                     regions: Vec::new(),
                 }],
             },
@@ -17361,7 +17335,6 @@ def read_point(point):
                         debug_name: Some("caller".to_string()),
                     },
                     regions: Vec::new(),
-                    scalar_threads: Vec::new(),
                     direct_calls: Vec::new(),
                     exact_list_items: Vec::new(),
                     indexed_fields: vec![IndexedFieldSpecializationPlan {
@@ -17393,7 +17366,6 @@ def read_point(point):
                     exact_list_items: Vec::new(),
                     indexed_fields: Vec::new(),
                     indexed_globals: Vec::new(),
-                    scalar_threads: Vec::new(),
                     regions: Vec::new(),
                 }],
             },
@@ -19078,8 +19050,8 @@ class Point:
     }
 
     #[test]
-    fn runtime_typed_v3_module_plan_carries_exact_int_scalar_thread_shape() {
-        let module_name = "runtime_typed_v3_exact_int_scalar_thread_test";
+    fn runtime_typed_v3_module_plan_carries_exact_int_branch_after_scalar_store() {
+        let module_name = "runtime_typed_v3_exact_int_scalar_branch_test";
         let module_name_gen = ModuleNameGen::new(0);
         let mut function = test_function_in_module(&module_name_gen, "store_then_compare");
         function.params = ParamSpec {
@@ -19189,8 +19161,7 @@ class Point:
             &evidence,
             module.module_constants.as_slice(),
         )
-        .expect("exact-int v3 artifacts should plan scalar thread");
-        assert_eq!(artifacts.plan.functions[0].scalar_threads.len(), 1);
+        .expect("exact-int v3 artifacts should plan store and branch regions");
         let profile = SpecializationProfile {
             module_name: Some(module_name),
             counter_dump_path: None,
@@ -19209,7 +19180,7 @@ class Point:
         };
 
         let module_plan = optimize_blockpy(&module, Some(&profile), &typed_v3_env_config())
-            .expect("typed-v3 module plan should attach scalar-thread selection");
+            .expect("typed-v3 module plan should attach exact-int branch selection");
         let planned_function = module_plan
             .module
             .callable_defs
@@ -19219,25 +19190,31 @@ class Point:
         let InstrTyped::Store(store) = &planned_function.blocks[0].body[0] else {
             panic!("entry block should keep a typed producer store");
         };
-        let scalar_thread_plan = store
-            .extra()
-            .exact_int_scalar_thread_plan()
-            .expect("typed-v3 module plan should carry exact-int scalar-thread selection");
+        assert_eq!(store_instr_id, store.try_semantic_instr_id().unwrap());
+        let return_plan = store
+            .value
+            .typed_extra()
+            .and_then(|extra| extra.exact_int_return_plan())
+            .expect("typed-v3 module plan should carry exact-int producer selection");
         assert_eq!(
-            scalar_thread_plan.source,
+            return_plan.source,
             TypedExactIntPlanSource::OptimizationPlanV3
         );
-        assert_eq!(scalar_thread_plan.store_instr_id, store_instr_id);
-        assert_eq!(scalar_thread_plan.producer_instr_id, add_instr_id);
-        assert_eq!(scalar_thread_plan.consumer_instr_id, compare_instr_id);
+        assert_eq!(return_plan.instr_id, add_instr_id);
+        let BlockTerm::IfTerm(if_term) = &planned_function.blocks[1].term else {
+            panic!("test block should keep a typed conditional branch");
+        };
+        let branch_plan = if_term
+            .test
+            .typed_extra()
+            .and_then(|extra| extra.exact_int_branch_plan())
+            .expect("typed-v3 module plan should carry exact-int branch selection");
         assert_eq!(
-            scalar_thread_plan.producer_hot_plan.id,
-            scalar_thread_plan.producer_hot_region.region
+            branch_plan.source,
+            TypedExactIntPlanSource::OptimizationPlanV3
         );
-        assert_eq!(
-            scalar_thread_plan.consumer_hot_plan.id,
-            scalar_thread_plan.consumer_hot_region.region
-        );
+        assert_eq!(branch_plan.instr_id, compare_instr_id);
+        assert_eq!(branch_plan.hot_plan.id, branch_plan.hot_region.region);
     }
 
     #[test]

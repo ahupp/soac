@@ -16,6 +16,10 @@
    consumer contract, collision/visibility story, and whether any prefix checks should become structured IR facts.
  * Revisit effect-only setitem lowering as a general result-demand/runtime-helper design instead of exact-list codegen special cases.
  * Track slow CPython fast-suite cases that pass with longer timeouts, including `test_dataclasses` and `test_bytes -m test_count`.
+ * Submit an upstream Cranelift patch to make `cranelift-jit`'s x86 PC-relative
+   relocation panic descriptive: use checked target-address arithmetic and report
+   relocation kind, target, callsite, delta, base, and addend when a JIT helper
+   or runtime symbol is more than 2GiB away.
  * If Python blocks on a queued background function compilation, steal the queued job and run it
    synchronously; if it is already running, wait for it to complete.
  * Implement `doc/todo/typed_local_values.md`: make typed codegen carry explicit

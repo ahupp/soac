@@ -7,8 +7,7 @@ use crate::plan_v3::{
     IndexedGlobalGuardPlan, IndexedGlobalSpecializationPlan, MaterializeKind,
     ModuleOptimizationPlanV3, OperationNode, PlanNodeId, PlanNodeKind, PlanValidationError,
     PlanValue, PlannedConstant, PlannedOp, RegionExitKind, RegionExitTarget, RegionId,
-    RegionInputSource, RegionPlan, Rep, RichCompareOp, ScalarLocalThreadPlan,
-    validate_module_plan_v3,
+    RegionInputSource, RegionPlan, Rep, RichCompareOp, validate_module_plan_v3,
 };
 use soac_core::block_py::{InstrId, SerializedFunctionId};
 use std::collections::{HashMap, HashSet};
@@ -28,7 +27,6 @@ pub struct MechanicalFunctionEmission {
     pub exact_list_items: Vec<MechanicalExactListItemEmission>,
     pub indexed_fields: Vec<MechanicalIndexedFieldEmission>,
     pub indexed_globals: Vec<MechanicalIndexedGlobalEmission>,
-    pub scalar_threads: Vec<ScalarLocalThreadPlan>,
     pub regions: Vec<MechanicalRegionEmission>,
 }
 
@@ -421,7 +419,7 @@ pub fn mechanical_codegen_step(
     region: RegionId,
     step: &MechanicalStep,
     has_local_fallback: bool,
-    preseeded_scalar: Option<PlanValue>,
+    preseeded_scalars: &HashSet<PlanValue>,
     preseeded_convert_inputs: &HashSet<PlanValue>,
 ) -> Result<MechanicalCodegenStep, String> {
     match &step.op {
@@ -491,7 +489,7 @@ pub fn mechanical_codegen_step(
             output,
             failure,
         } => {
-            if preseeded_scalar == Some(*output) {
+            if preseeded_scalars.contains(output) {
                 return Ok(MechanicalCodegenStep::PreseededConvert { output: *output });
             }
             let kind = mechanical_codegen_conversion(
@@ -554,24 +552,6 @@ pub fn mechanical_codegen_step(
             step.node, step.op
         )),
     }
-}
-
-pub fn mechanical_convert_inputs_for_output(
-    region: &MechanicalRegionEmission,
-    output: PlanValue,
-) -> HashSet<PlanValue> {
-    region
-        .steps
-        .iter()
-        .filter_map(|step| match &step.op {
-            MechanicalStepOp::Convert {
-                input,
-                output: step_output,
-                ..
-            } if *step_output == output => Some(*input),
-            _ => None,
-        })
-        .collect()
 }
 
 fn mechanical_codegen_conversion(
@@ -860,7 +840,6 @@ fn emit_function(
             .iter()
             .map(emit_indexed_global)
             .collect(),
-        scalar_threads: function.scalar_threads.clone(),
         regions: function.regions.iter().map(emit_region).collect(),
     }
 }
@@ -969,13 +948,6 @@ fn validate_function_mechanical_lowering_shape_v3(
             emitted_region,
         )?;
     }
-    for thread in &planned_function.scalar_threads {
-        validate_scalar_thread_mechanical_lowering_shape_v3(
-            emitted_function.function,
-            thread,
-            &emitted_regions,
-        )?;
-    }
     Ok(())
 }
 
@@ -986,7 +958,7 @@ fn validate_region_inputs_supported_by_current_lowering_v3(
     for input in &region.inputs {
         match &input.source {
             RegionInputSource::FunctionParam { name: Some(_), .. }
-                if input.value.rep == Rep::PyObjectBorrowed => {}
+                if input.value.rep == Rep::PyObjectBorrowed || input.value.rep == Rep::I64 => {}
             RegionInputSource::ModuleConstant { .. }
                 if input.value.rep == Rep::PyObjectBorrowed => {}
             RegionInputSource::IndexedGlobal { .. }
@@ -1435,48 +1407,6 @@ fn validate_materialize_supported_by_current_lowering_v3(
     Ok(())
 }
 
-fn validate_scalar_thread_mechanical_lowering_shape_v3(
-    function: SerializedFunctionId,
-    thread: &ScalarLocalThreadPlan,
-    emitted_regions: &HashMap<RegionId, &MechanicalRegionEmission>,
-) -> Result<(), String> {
-    let producer = emitted_regions.get(&thread.producer.region).ok_or_else(|| {
-        format!(
-            "function {function} scalar thread for local {} references missing producer region {:?}",
-            thread.local.name, thread.producer.region
-        )
-    })?;
-    let consumer = emitted_regions.get(&thread.consumer.region).ok_or_else(|| {
-        format!(
-            "function {function} scalar thread for local {} references missing consumer region {:?}",
-            thread.local.name, thread.consumer.region
-        )
-    })?;
-    if !has_single_return_exit_v3(producer) {
-        return Err(format!(
-            "function {function} scalar thread for local {} producer region {:?} is not a single-return region",
-            thread.local.name, thread.producer.region
-        ));
-    }
-    if !has_single_original_cfg_branch_exit_v3(consumer) {
-        return Err(format!(
-            "function {function} scalar thread for local {} consumer region {:?} is not a single OriginalCfg branch region",
-            thread.local.name, thread.consumer.region
-        ));
-    }
-    let producer_fallbacks = local_fallback_region_targets_v3(producer)?;
-    let expected_fallback = match &thread.fallback {
-        crate::plan_v3::ScalarThreadFallback::LocalFallbackRegion { region, .. } => *region,
-    };
-    if producer_fallbacks.len() != 1 || !producer_fallbacks.contains(&expected_fallback) {
-        return Err(format!(
-            "function {function} scalar thread for local {} has fallback {:?}, but producer region {:?} uses {:?}",
-            thread.local.name, expected_fallback, thread.producer.region, producer_fallbacks
-        ));
-    }
-    Ok(())
-}
-
 fn require_matching_fallback_exit_v3(
     function: SerializedFunctionId,
     hot_region: &MechanicalRegionEmission,
@@ -1915,7 +1845,6 @@ mod tests {
                         }],
                     },
                 ],
-                scalar_threads: Vec::new(),
                 direct_calls: Vec::new(),
                 exact_list_items: Vec::new(),
                 indexed_fields: Vec::new(),
@@ -1965,9 +1894,14 @@ mod tests {
         let emission = emit_mechanical_plan_v3(&test_plan(true)).unwrap();
         let region = &emission.functions[0].regions[0];
 
-        let step =
-            mechanical_codegen_step(region.region, &region.steps[2], true, None, &HashSet::new())
-                .expect("checked i64 add should prepare for current codegen");
+        let step = mechanical_codegen_step(
+            region.region,
+            &region.steps[2],
+            true,
+            &HashSet::new(),
+            &HashSet::new(),
+        )
+        .expect("checked i64 add should prepare for current codegen");
 
         assert!(matches!(
             step,
@@ -1985,7 +1919,7 @@ mod tests {
             region.region,
             &region.steps[2],
             false,
-            None,
+            &HashSet::new(),
             &HashSet::new(),
         )
         .expect_err("checked i64 add without local fallback should be rejected before JIT");

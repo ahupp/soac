@@ -111,6 +111,12 @@ pub struct RuntimeBlockParamPlan {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct PlannedRuntimeLocalReprs {
+    block_entry_reprs: Vec<HashMap<LocalLocation, RuntimeBlockParamRepr>>,
+    block_param_reprs: Vec<Vec<RuntimeBlockParamRepr>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlannedStackSlotEntrySeed {
     pub binding: PlannedLocalBinding,
     pub entry_ref_kind: LocalRefKind,
@@ -1501,6 +1507,42 @@ fn transfer_runtime_local_reprs_for_typed_block(
     reprs
 }
 
+fn typed_store_runtime_local_repr(
+    instr: &InstrTyped,
+    local_reprs: &HashMap<LocalLocation, RuntimeBlockParamRepr>,
+    module_constants: &[ConstantExpr],
+) -> Option<(LocalLocation, RuntimeBlockParamRepr)> {
+    let InstrTyped::Store(op) = instr else {
+        return None;
+    };
+    let location = op.name.local_location()?;
+    let repr =
+        if typed_expr_can_satisfy_planned_i64(op.value.as_ref(), local_reprs, module_constants) {
+            RuntimeBlockParamRepr::ExactI64
+        } else {
+            RuntimeBlockParamRepr::PyObject
+        };
+    Some((location, repr))
+}
+
+fn transfer_runtime_local_repr_for_instr(
+    instr: &InstrTyped,
+    local_reprs: &mut HashMap<LocalLocation, RuntimeBlockParamRepr>,
+    module_constants: &[ConstantExpr],
+) {
+    if let Some((location, repr)) =
+        typed_store_runtime_local_repr(instr, local_reprs, module_constants)
+    {
+        local_reprs.insert(location, repr);
+        return;
+    }
+    if let InstrTyped::Del(op) = instr
+        && let Some(location) = op.name.local_location()
+    {
+        local_reprs.insert(location, RuntimeBlockParamRepr::PyObject);
+    }
+}
+
 fn runtime_block_param_allows_scalar(param: &RuntimeBlockParamPlan) -> bool {
     param.binding.storage == PlannedLocalStorage::BlockParam
         && param.binding.param_facts.binding == ParamBindingFacts::DefinitelyBound
@@ -1603,7 +1645,7 @@ fn planned_runtime_block_param_reprs_for_typed_function(
     function: &BlockPyFunction<TypedBlockPyModuleShape>,
     runtime_block_params: &[Vec<RuntimeBlockParamPlan>],
     module_constants: &[ConstantExpr],
-) -> Vec<Vec<RuntimeBlockParamRepr>> {
+) -> PlannedRuntimeLocalReprs {
     let block_indices_by_label = typed_block_indices_by_label(function);
     let local_locations_by_name = local_locations_by_name(function);
     let mut entry_reprs =
@@ -1688,7 +1730,7 @@ fn planned_runtime_block_param_reprs_for_typed_function(
         }
     }
 
-    runtime_block_params
+    let block_param_reprs = runtime_block_params
         .iter()
         .enumerate()
         .map(|(block_index, params)| {
@@ -1707,7 +1749,11 @@ fn planned_runtime_block_param_reprs_for_typed_function(
                 })
                 .collect()
         })
-        .collect()
+        .collect();
+    PlannedRuntimeLocalReprs {
+        block_entry_reprs: entry_reprs,
+        block_param_reprs,
+    }
 }
 
 fn apply_runtime_block_param_reprs(
@@ -1903,9 +1949,12 @@ fn transfer_cleanup_root_slot_state_for_block(
     refcount_plan: &FunctionRefcountPlan,
     tracked_slot_names: &HashSet<String>,
     entry_state: &HashMap<String, CleanupRootSlotState>,
+    entry_runtime_reprs: &HashMap<LocalLocation, RuntimeBlockParamRepr>,
+    module_constants: &[ConstantExpr],
     previous_states: Option<&mut HashMap<InstrKey, HashMap<String, CleanupRootSlotState>>>,
 ) -> HashMap<String, CleanupRootSlotState> {
     let mut state = entry_state.clone();
+    let mut runtime_reprs = entry_runtime_reprs.clone();
     let mut previous_states = previous_states;
     let Some(block_plan) = refcount_plan.block(block.label) else {
         return state;
@@ -1922,11 +1971,14 @@ fn transfer_cleanup_root_slot_state_for_block(
     }
 
     for instr in &block.body {
+        let store_repr = typed_store_runtime_local_repr(instr, &runtime_reprs, module_constants);
         let Some(instr_id) = instr.try_semantic_instr_id() else {
+            transfer_runtime_local_repr_for_instr(instr, &mut runtime_reprs, module_constants);
             continue;
         };
         let instr_key = InstrKey::new(function_id, instr_id);
         let Some(actions) = actions_by_instr.get(&instr_key) else {
+            transfer_runtime_local_repr_for_instr(instr, &mut runtime_reprs, module_constants);
             continue;
         };
         for action in actions {
@@ -1945,10 +1997,15 @@ fn transfer_cleanup_root_slot_state_for_block(
                             .entry(local.name.clone())
                             .or_insert(previous_state);
                     }
-                    state.insert(
-                        local.name.clone(),
-                        cleanup_root_slot_state_for_local_ref_state(*new_state),
-                    );
+                    let new_slot_state = match store_repr {
+                        Some((location, RuntimeBlockParamRepr::ExactI64))
+                            if location == local.location =>
+                        {
+                            CleanupRootSlotState::NoOwnedReference
+                        }
+                        _ => cleanup_root_slot_state_for_local_ref_state(*new_state),
+                    };
+                    state.insert(local.name.clone(), new_slot_state);
                 }
                 RefcountActionKind::DeleteLocal { local, .. }
                     if tracked_slot_names.contains(&local.name) =>
@@ -1969,6 +2026,7 @@ fn transfer_cleanup_root_slot_state_for_block(
                 _ => {}
             }
         }
+        transfer_runtime_local_repr_for_instr(instr, &mut runtime_reprs, module_constants);
     }
     state
 }
@@ -1978,6 +2036,8 @@ pub fn planned_cleanup_root_slot_states_for_typed_function(
     refcount_plan: &FunctionRefcountPlan,
     tracked_slot_names: &HashSet<String>,
     exc_dispatches: &[Option<BlockExcDispatchPlan>],
+    runtime_entry_reprs: &[HashMap<LocalLocation, RuntimeBlockParamRepr>],
+    module_constants: &[ConstantExpr],
 ) -> PlannedCleanupRootSlotStates {
     let block_count = function.blocks.len();
     let block_indices_by_label = typed_block_indices_by_label(function);
@@ -2008,6 +2068,8 @@ pub fn planned_cleanup_root_slot_states_for_typed_function(
                 refcount_plan,
                 tracked_slot_names,
                 &entry_states[source_index],
+                &runtime_entry_reprs[source_index],
+                module_constants,
                 None,
             );
             for (target_index, maybe_dispatch) in cleanup_root_slot_successors_for_block(
@@ -2042,6 +2104,8 @@ pub fn planned_cleanup_root_slot_states_for_typed_function(
             refcount_plan,
             tracked_slot_names,
             &entry_state,
+            &runtime_entry_reprs[index],
+            module_constants,
             Some(&mut instr_previous_states),
         );
         block_entry_states.insert(block.label, entry_state);
@@ -2318,12 +2382,15 @@ pub fn plan_jit_typed_function_locals_from_plans(
     let cleanup_root_names = planned_cleanup_root_names_for_refcount_plan(&refcount_plan);
     let mut runtime_block_params =
         planned_jit_params_for_typed_function(function, &local_plan, &cleanup_root_names)?;
-    let runtime_block_param_reprs = planned_runtime_block_param_reprs_for_typed_function(
+    let runtime_local_reprs = planned_runtime_block_param_reprs_for_typed_function(
         function,
         &runtime_block_params,
         module_constants,
     );
-    apply_runtime_block_param_reprs(&mut runtime_block_params, runtime_block_param_reprs);
+    apply_runtime_block_param_reprs(
+        &mut runtime_block_params,
+        runtime_local_reprs.block_param_reprs,
+    );
     let implicit_target_transports =
         planned_implicit_target_transports_for_typed_function(function, &runtime_block_params);
     let jump_edge_transports =
@@ -2372,6 +2439,8 @@ pub fn plan_jit_typed_function_locals_from_plans(
         &refcount_plan,
         &tracked_stack_slot_names,
         &exc_dispatches,
+        &runtime_local_reprs.block_entry_reprs,
+        module_constants,
     );
 
     let plan = PlannedJitFunctionLocals {
@@ -2892,6 +2961,66 @@ def f(a, b):
                 "borrowed alias d should not be exit-swept"
             );
         }
+    }
+
+    #[test]
+    fn cleanup_root_slot_state_keeps_scalar_stores_empty() {
+        let (prepared, function_index) = prepared_typed_function(
+            r#"
+Ident1 = 1
+
+def helper(value):
+    if value:
+        return Ident1
+    return 0
+
+def f(seq):
+    IntLoc = 1
+    while IntLoc <= 1:
+        if helper(seq[IntLoc]) == Ident1:
+            CharLoc = "A"
+            IntLoc = IntLoc + 1
+    if CharLoc == "X":
+        return 1
+    return 0
+"#,
+            "f",
+        );
+        let function = &prepared.module.callable_defs[function_index];
+        let plan = prepared
+            .locals
+            .function(function.function_id)
+            .expect("missing JIT local plan");
+
+        assert!(
+            plan.cleanup_root_names.contains("IntLoc"),
+            "expected edge-retired scalar IntLoc to remain a cleanup root: {:?}",
+            plan.cleanup_root_names
+        );
+        let previous_states = plan
+            .cleanup_root_slot_states
+            .instr_previous_states
+            .values()
+            .filter_map(|states| states.get("IntLoc").copied())
+            .collect::<Vec<_>>();
+        assert!(
+            !previous_states.is_empty(),
+            "expected scalar stores to record previous cleanup-root slot state"
+        );
+        assert!(
+            previous_states
+                .iter()
+                .all(|state| *state == CleanupRootSlotState::NoOwnedReference),
+            "scalar stores should keep the root slot known empty: {previous_states:?}"
+        );
+        assert!(
+            plan.cleanup_root_slot_states
+                .block_exit_states
+                .values()
+                .all(|states| states.get("IntLoc") == Some(&CleanupRootSlotState::NoOwnedReference)),
+            "scalar cleanup root IntLoc should not require exit sweeping: {:?}",
+            plan.cleanup_root_slot_states.block_exit_states
+        );
     }
 
     #[test]

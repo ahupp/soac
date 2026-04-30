@@ -19,9 +19,9 @@ use soac_ir_typed::plan_v3::{
 use soac_ir_typed::{
     FactStore, InstrTyped, TypedAttrAccessPlan, TypedBlockPyModuleShape, TypedCallEmissionPlan,
     TypedCallEmissionPlans, TypedDirectMethodCallGuard, TypedExactIntBranchPlan,
-    TypedExactIntPlanSource, TypedExactIntReturnPlan, TypedExactIntScalarThreadPlan,
-    TypedExactListItemAccessPlan, TypedExactListItemCounterSource, TypedExactListItemPlanSource,
-    TypedIndexedFieldPlanSource, TypedIndexedGlobalAccessPlan, TypedIndexedGlobalPlanSource,
+    TypedExactIntPlanSource, TypedExactIntReturnPlan, TypedExactListItemAccessPlan,
+    TypedExactListItemCounterSource, TypedExactListItemPlanSource, TypedIndexedFieldPlanSource,
+    TypedIndexedGlobalAccessPlan, TypedIndexedGlobalPlanSource,
     assign_missing_typed_function_instr_ids,
 };
 use soac_opt::access_emission_v3::{
@@ -37,10 +37,8 @@ use soac_opt::passes::{
 use soac_opt::region_emission_v3::{
     ExactIntBranchSelection as OptV3ExactIntBranchSelection,
     ExactIntReturnSelection as OptV3ExactIntReturnSelection,
-    ScalarThreadSelection as OptV3ScalarThreadSelection,
     exact_int_branch_selection_for_source as opt_v3_exact_int_branch_selection_for_source,
     exact_int_return_selection_for_source as opt_v3_exact_int_return_selection_for_source,
-    scalar_thread_selection_for_store_branch as opt_v3_scalar_thread_selection_for_store_branch,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -592,29 +590,6 @@ fn typed_exact_int_return_plan_from_opt_v3(
     }
 }
 
-fn typed_exact_int_scalar_thread_plan_from_opt_v3(
-    store_instr_id: InstrId,
-    producer_instr_id: InstrId,
-    consumer_instr_id: InstrId,
-    selection: OptV3ScalarThreadSelection<'_>,
-) -> TypedExactIntScalarThreadPlan {
-    TypedExactIntScalarThreadPlan {
-        source: TypedExactIntPlanSource::OptimizationPlanV3,
-        store_instr_id,
-        producer_instr_id,
-        consumer_instr_id,
-        thread: selection.thread.clone(),
-        producer_hot_plan: selection.producer.hot_plan.clone(),
-        producer_hot_region: selection.producer.hot_region.clone(),
-        producer_fallback_plan: selection.producer.fallback_plan.clone(),
-        producer_fallback_region: selection.producer.fallback_region.clone(),
-        consumer_hot_plan: selection.consumer.hot_plan.clone(),
-        consumer_hot_region: selection.consumer.hot_region.clone(),
-        consumer_fallback_plan: selection.consumer.fallback_plan.clone(),
-        consumer_fallback_region: selection.consumer.fallback_region.clone(),
-    }
-}
-
 pub(super) fn annotate_typed_exact_int_selections(
     function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
     artifacts: &ExactIntBranchV3Artifacts,
@@ -675,47 +650,6 @@ pub(super) fn annotate_typed_exact_int_selections(
             let plan = typed_exact_int_return_plan_from_opt_v3(instr_id, selection);
             self.count += usize::from(extra.set_exact_int_return_plan(plan));
         }
-
-        fn attach_scalar_thread_plan(
-            &mut self,
-            store_expr: &mut InstrTyped,
-            consumer_test: &InstrTyped,
-        ) {
-            let Some(store_instr_id) = store_expr.try_semantic_instr_id() else {
-                return;
-            };
-            let InstrTyped::Store(store) = store_expr else {
-                return;
-            };
-            let Some(producer_instr_id) = store.value.try_semantic_instr_id() else {
-                return;
-            };
-            let Some(consumer_instr_id) = consumer_test.try_semantic_instr_id() else {
-                return;
-            };
-            let selection = match opt_v3_scalar_thread_selection_for_store_branch(
-                self.artifacts,
-                producer_instr_id,
-                consumer_instr_id,
-                &store.name,
-            ) {
-                Ok(selection) => selection,
-                Err(error) => {
-                    self.error = Some(error);
-                    return;
-                }
-            };
-            let Some(selection) = selection else {
-                return;
-            };
-            let plan = typed_exact_int_scalar_thread_plan_from_opt_v3(
-                store_instr_id,
-                producer_instr_id,
-                consumer_instr_id,
-                selection,
-            );
-            self.count += usize::from(store.extra_mut().set_exact_int_scalar_thread_plan(plan));
-        }
     }
 
     impl VisitMut<InstrTyped> for Annotator<'_> {
@@ -733,30 +667,7 @@ pub(super) fn annotate_typed_exact_int_selections(
         count: 0,
         error: None,
     };
-    let empty_if_tests_by_label = function
-        .blocks
-        .iter()
-        .filter_map(|block| {
-            if !block.body.is_empty() {
-                return None;
-            }
-            let BlockTerm::IfTerm(if_term) = &block.term else {
-                return None;
-            };
-            Some((block.label, if_term.test.clone()))
-        })
-        .collect::<HashMap<_, _>>();
     for block in &mut function.blocks {
-        if let [store_expr] = block.body.as_mut_slice()
-            && let BlockTerm::Jump(edge) = &block.term
-            && edge.args.is_empty()
-            && let Some(consumer_test) = empty_if_tests_by_label.get(&edge.target)
-        {
-            annotator.attach_scalar_thread_plan(store_expr, consumer_test);
-            if let Some(error) = annotator.error.take() {
-                return Err(error);
-            }
-        }
         if let BlockTerm::IfTerm(if_term) = &mut block.term {
             annotator.attach_branch_plan(&mut if_term.test);
             if let Some(error) = annotator.error.take() {
