@@ -10943,18 +10943,121 @@ fn discard_emit_result(
     result: EmitResult,
     emit_ctx: &JitEmitCtx<'_>,
 ) -> Result<(), String> {
-    match result.value() {
-        None | Some(SoacValue::I32 { .. } | SoacValue::I64 { .. }) => Ok(()),
-        Some(SoacValue::PyObject {
-            value, ownership, ..
-        }) => {
-            if ownership.is_owned() {
-                fb.ins().call(
-                    emit_ctx.decref_ref,
-                    &[emit_ctx.consts.thread_state_value, value],
-                );
-            }
-            Ok(())
+    if let Some(value) = result.value() {
+        emit_discard_soac_value(fb, value, emit_ctx);
+    }
+    Ok(())
+}
+
+fn emit_discard_soac_value(
+    fb: &mut FunctionBuilder<'_>,
+    value: SoacValue,
+    emit_ctx: &JitEmitCtx<'_>,
+) {
+    if let SoacValue::PyObject {
+        value,
+        ownership,
+        facts,
+    } = value
+        && ownership.is_owned()
+        && !facts.is_immortal()
+    {
+        fb.ins().call(
+            emit_ctx.decref_ref,
+            &[emit_ctx.consts.thread_state_value, value],
+        );
+    }
+}
+
+fn emit_soac_value_as_pyobject_for_demand(
+    fb: &mut FunctionBuilder<'_>,
+    value: SoacValue,
+    emit_ctx: &JitEmitCtx<'_>,
+    demand: ResultDemand,
+) -> EmitResult {
+    let ResultDemand::PyObject { borrowed_ok } = demand else {
+        panic!("PyObject materialization requested for non-PyObject demand {demand:?}");
+    };
+    let pyobject = match value {
+        SoacValue::PyObject {
+            value,
+            ownership,
+            facts,
+        } => {
+            let (value, ownership) = if borrowed_ok {
+                (value, ownership)
+            } else {
+                emit_promote_pyobject_to_owned_boundary(fb, value, ownership, emit_ctx)
+            };
+            SoacValue::pyobject_with_ownership(value, ownership, facts)
+        }
+        SoacValue::I32 { value, facts } if facts.is_i32_bool01() => {
+            emit_to_python_bool(fb, SoacValue::i32(value, facts), emit_ctx)
+        }
+        value @ (SoacValue::I32 { .. } | SoacValue::I64 { .. }) => {
+            emit_to_python_long(fb, value, emit_ctx.py_long_from_i64_ref, emit_ctx)
+        }
+    };
+    let (value, ownership, facts) = pyobject.expect_pyobject("PyObject demand");
+    if !ownership.can_satisfy_pyobject_demand(demand) {
+        panic!("PyObject demand {demand:?} produced incompatible ownership {ownership:?}");
+    }
+    EmitResult::pyobject(value, ownership, facts)
+}
+
+fn emit_soac_value_as_i32_bool01(
+    fb: &mut FunctionBuilder<'_>,
+    value: SoacValue,
+    is_true_ref: Option<ir::FuncRef>,
+    emit_ctx: &JitEmitCtx<'_>,
+) -> EmitResult {
+    let truth = match value {
+        SoacValue::I32 { value, facts } if facts.is_i32_bool01() => SoacValue::i32(value, facts),
+        SoacValue::I32 { value, .. } => emit_i32_bool01_from_i32_result(fb, value, emit_ctx),
+        SoacValue::I64 { value, .. } => {
+            let is_true = fb.ins().icmp_imm(ir::condcodes::IntCC::NotEqual, value, 0);
+            emit_i32_bool01_from_cond(fb, is_true, emit_ctx)
+        }
+        SoacValue::PyObject {
+            value,
+            ownership,
+            facts,
+        } => {
+            let is_true_ref = is_true_ref
+                .expect("PyObject truthiness demand requires an imported is-true helper");
+            emit_truthy_from_pyobject_value(
+                fb,
+                value,
+                facts,
+                is_true_ref,
+                emit_ctx,
+                ownership.is_owned(),
+            )
+        }
+    };
+    let (value, facts) = truth.expect_i32("I32Bool01 demand");
+    EmitResult::i32(value, facts)
+}
+
+fn emit_soac_value_result_for_demand(
+    fb: &mut FunctionBuilder<'_>,
+    value: SoacValue,
+    emit_ctx: &JitEmitCtx<'_>,
+    demand: ResultDemand,
+    is_true_ref: Option<ir::FuncRef>,
+) -> EmitResult {
+    match demand {
+        ResultDemand::EffectOnly => {
+            emit_discard_soac_value(fb, value, emit_ctx);
+            EmitResult::no_value()
+        }
+        ResultDemand::PyObject { .. } => {
+            emit_soac_value_as_pyobject_for_demand(fb, value, emit_ctx, demand)
+        }
+        ResultDemand::I32Bool01 => emit_soac_value_as_i32_bool01(fb, value, is_true_ref, emit_ctx),
+        ResultDemand::I64 | ResultDemand::I64Index => {
+            let (value, facts) = value.expect_i64("I64 demand");
+            EmitResult::i64(value, facts)
         }
     }
 }
@@ -10966,34 +11069,18 @@ fn emit_owned_pyobject_result_for_demand(
     emit_ctx: &JitEmitCtx<'_>,
     demand: ResultDemand,
 ) -> EmitResult {
-    match demand {
-        ResultDemand::EffectOnly => {
-            if !facts.is_immortal() {
-                fb.ins().call(
-                    emit_ctx.decref_ref,
-                    &[emit_ctx.consts.thread_state_value, value],
-                );
-            }
-            EmitResult::no_value()
-        }
-        ResultDemand::PyObject { .. } => {
-            let ownership = if facts.is_immortal() {
-                ValueOwnership::Immortal
-            } else {
-                ValueOwnership::Owned
-            };
-            EmitResult::pyobject(value, ownership, facts)
-        }
-        ResultDemand::I32Bool01 => {
-            panic!("owned PyObject result helper cannot satisfy I32Bool01 demand")
-        }
-        ResultDemand::I64 => {
-            panic!("owned PyObject result helper cannot satisfy I64 demand")
-        }
-        ResultDemand::I64Index => {
-            panic!("owned PyObject result helper cannot satisfy I64Index demand")
-        }
-    }
+    let ownership = if facts.is_immortal() {
+        ValueOwnership::Immortal
+    } else {
+        ValueOwnership::Owned
+    };
+    emit_soac_value_result_for_demand(
+        fb,
+        SoacValue::pyobject_with_ownership(value, ownership, facts),
+        emit_ctx,
+        demand,
+        None,
+    )
 }
 
 fn emit_promote_pyobject_to_owned_boundary(
@@ -11542,26 +11629,7 @@ fn emit_i64_result_for_demand(
     emit_ctx: &JitEmitCtx<'_>,
     demand: ResultDemand,
 ) -> EmitResult {
-    match demand {
-        ResultDemand::EffectOnly => EmitResult::no_value(),
-        ResultDemand::I64 | ResultDemand::I64Index => EmitResult::i64(value, facts),
-        ResultDemand::I32Bool01 => {
-            let is_true = fb.ins().icmp_imm(ir::condcodes::IntCC::NotEqual, value, 0);
-            let truth = emit_i32_bool01_from_cond(fb, is_true, emit_ctx);
-            let (truth_i32, truth_facts) = truth.expect_i32("I64 truthiness demand");
-            EmitResult::i32(truth_i32, truth_facts)
-        }
-        ResultDemand::PyObject { .. } => {
-            let boxed = emit_to_python_long(
-                fb,
-                SoacValue::i64(value, facts),
-                emit_ctx.py_long_from_i64_ref,
-                emit_ctx,
-            );
-            let (boxed, ownership, boxed_facts) = boxed.expect_pyobject("I64 Python object demand");
-            EmitResult::pyobject(boxed, ownership, boxed_facts)
-        }
-    }
+    emit_soac_value_result_for_demand(fb, SoacValue::i64(value, facts), emit_ctx, demand, None)
 }
 
 fn emit_checked_i64_overflow_result(
@@ -13987,26 +14055,14 @@ fn emit_typed_codegen_stmt_result_with_local_env(
             codegen_env,
             func_imports,
         )?;
-        return Ok(match demand {
-            ResultDemand::EffectOnly => {
-                let (_, facts) = planned_owned_pyobject_result_for_typed_expr(expr, local_env);
-                if !facts.is_immortal() {
-                    fb.ins().call(
-                        emit_ctx.decref_ref,
-                        &[emit_ctx.consts.thread_state_value, value],
-                    );
-                }
-                EmitResult::no_value()
-            }
-            ResultDemand::PyObject { .. } => {
-                let (ownership, facts) =
-                    planned_owned_pyobject_result_for_typed_expr(expr, local_env);
-                EmitResult::pyobject(value, ownership, facts)
-            }
-            ResultDemand::I32Bool01 => unreachable!("I32Bool01 handled before PyObject emission"),
-            ResultDemand::I64 => unreachable!("I64 is not a generic PyObject statement demand"),
-            ResultDemand::I64Index => unreachable!("I64Index is not a statement demand"),
-        });
+        let (ownership, facts) = planned_owned_pyobject_result_for_typed_expr(expr, local_env);
+        return Ok(emit_soac_value_result_for_demand(
+            fb,
+            SoacValue::pyobject_with_ownership(value, ownership, facts),
+            emit_ctx,
+            demand,
+            None,
+        ));
     }
 
     let legacy_expr = try_lower_typed_instr_to_codegen_legacy(expr.clone())?;
@@ -14046,13 +14102,13 @@ fn emit_typed_local_load_result_with_local_env(
         emit_ctx,
         true,
     );
-    Some(match demand {
-        ResultDemand::EffectOnly => EmitResult::no_value(),
-        ResultDemand::PyObject { .. } => EmitResult::pyobject(value, ownership, facts),
-        ResultDemand::I32Bool01 | ResultDemand::I64 | ResultDemand::I64Index => unreachable!(
-            "typed local load borrowed result plan does not satisfy non-PyObject demands"
-        ),
-    })
+    Some(emit_soac_value_result_for_demand(
+        fb,
+        SoacValue::pyobject_with_ownership(value, ownership, facts),
+        emit_ctx,
+        demand,
+        None,
+    ))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -15349,9 +15405,13 @@ fn emit_typed_codegen_i32_bool01_result_with_local_env(
         codegen_env,
         func_imports,
     )?;
-    let truth = emit_truthy_from_value(fb, value, is_true_ref, emit_ctx);
-    let truth_i32 = truth.expect_i32_bool01("typed I32Bool01 demand");
-    Ok(EmitResult::i32(truth_i32, IntFacts::i32_bool01()))
+    Ok(emit_soac_value_result_for_demand(
+        fb,
+        value,
+        emit_ctx,
+        ResultDemand::I32_BOOL01,
+        Some(is_true_ref),
+    ))
 }
 
 fn emit_typed_codegen_i64_index_result_with_local_env(

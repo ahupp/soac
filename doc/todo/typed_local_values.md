@@ -126,6 +126,12 @@ Consumers state their demand. Integer arithmetic and comparisons can demand
    These helpers should be the only place that boxes an exact `I64` into a
    `PyLong` or promotes a borrowed PyObject to an owned boundary value.
 
+   Progress: `emit_soac_value_result_for_demand` now centralizes discarding,
+   PyObject materialization/promotion, I32 truthiness, and I64 demand handling
+   for several typed-codegen paths. Remaining work is to route the rest of the
+   ad hoc materialization sites through it before treating it as the only
+   conversion boundary.
+
 3. Refactor helper entry points so typed codegen returns `SoacValue` or
    `Option<SoacValue>` internally, and effect-only statement emission discards
    typed results through one cleanup helper.
