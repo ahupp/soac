@@ -1,0 +1,1 @@
+  So fixed SOAC is still about 84x slower than stock CPython on nqueens, but it is at least 45x faster than the previous SOAC attempt, since that old run had not finished after ~360s.
