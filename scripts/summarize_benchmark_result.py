@@ -481,6 +481,19 @@ def parse_specialization_counter_dump_stats(counter_dump_path: Path) -> dict[str
                 continue
             by_kind[kind] += value
             if kind == REFCOUNT_LOCATION_KIND:
+                function_qualname = str(row.get("function_qualname") or "").strip()
+                function_id = str(row.get("function_id") or "").strip()
+                module_name = str(record.get("module_name") or "").strip()
+                if function_qualname:
+                    function_label = (
+                        f"{module_name}.{function_qualname}"
+                        if module_name and not function_qualname.startswith(f"{module_name}.")
+                        else function_qualname
+                    )
+                elif function_id:
+                    function_label = f"function={function_id}"
+                else:
+                    function_label = "function=<unknown>"
                 branches = row.get("branches")
                 if isinstance(branches, dict):
                     branch_items = branches.items()
@@ -498,7 +511,7 @@ def parse_specialization_counter_dump_stats(counter_dump_path: Path) -> dict[str
                     except (TypeError, ValueError):
                         continue
                     if branch_count > 0:
-                        refcount_locations[branch] += branch_count
+                        refcount_locations[f"{function_label}: {branch}"] += branch_count
 
     guard_failures = by_kind.get(DEOPT_CALL_KIND, 0) + sum(
         by_kind.get(kind, 0) for kind in RUNTIME_FALLBACK_KINDS
