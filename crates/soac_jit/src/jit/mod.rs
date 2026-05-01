@@ -165,7 +165,6 @@ use direct_function::{
 #[cfg(test)]
 use direct_function::{DirectCallIncompatibility, plan_direct_call_args_for_target};
 use function_targets::collect_typed_call_direct_targets;
-pub(crate) use function_targets::is_synthetic_class_helper_function;
 use module_data::{
     ModuleConstantAccess, ModuleConstantAccessTable, declare_module_constant_object_data,
     declare_top_value_counter_storage_import, declare_type_ptr_import,

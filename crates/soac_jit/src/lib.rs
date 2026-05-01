@@ -285,6 +285,10 @@ fn set_runtime_error<T>(msg: &str) -> Result<T, ()> {
     Err(())
 }
 
+fn set_runtime_error_message(msg: &str) {
+    let _ = set_runtime_error::<()>(msg);
+}
+
 #[repr(C)]
 struct FunctionEnvAbiHeader {
     direct_code_ptr: *const u8,
@@ -1471,22 +1475,7 @@ unsafe fn ensure_clif_direct_entries_compiled(
         let compiled_function_result = match module_state
             .lookup_or_compile_direct_function_handle(&compile_session, function.function_id)
         {
-            Ok(Some((handle, compiled))) => {
-                if !compiled
-                    && !jit::is_synthetic_class_helper_function(&function)
-                    && let Some(stats) = handle.jit_stats()
-                {
-                    module_state.append_jit_codegen_log(
-                        &function,
-                        "direct_function_body",
-                        compile_start.elapsed(),
-                        "ok",
-                        None,
-                        Some(stats),
-                    );
-                }
-                Ok(handle)
-            }
+            Ok(Some((handle, _compiled))) => Ok(handle),
             Ok(None) => {
                 let block_ptrs = vec![ptr::null_mut::<c_void>(); function.blocks.len()];
                 let module_constant_ptrs = module_state.module_constant_ptrs();
@@ -1543,59 +1532,7 @@ unsafe fn ensure_clif_direct_entries_compiled(
                 return Err(());
             }
         };
-        let direct_code_ptr = match compiled_function
-            .direct_code_ptr()
-            .map(|ptr| ptr as *const u8)
-        {
-            Ok(ptr) => ptr,
-            Err(err) => {
-                if let Ok(c_msg) = CString::new(err) {
-                    ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c_msg.as_ptr());
-                } else {
-                    ffi::PyErr_SetString(
-                        ffi::PyExc_RuntimeError,
-                        b"missing CLIF direct entry\0".as_ptr() as *const i8,
-                    );
-                }
-                return Err(());
-            }
-        };
-        data.function_env.set_direct_code_ptr(direct_code_ptr);
-        let default_direct_code_ptr = match compiled_function
-            .default_direct_code_ptr()
-            .map(|ptr| ptr as *const u8)
-        {
-            Ok(ptr) => ptr,
-            Err(err) => {
-                if let Ok(c_msg) = CString::new(err) {
-                    ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c_msg.as_ptr());
-                } else {
-                    ffi::PyErr_SetString(
-                        ffi::PyExc_RuntimeError,
-                        b"missing CLIF default direct entry\0".as_ptr() as *const i8,
-                    );
-                }
-                return Err(());
-            }
-        };
-        data.function_env
-            .set_default_direct_code_ptr(default_direct_code_ptr);
-        let deopt_table_ptr = match compiled_function.direct_deopt_table_ptr() {
-            Ok(ptr) => ptr as *const c_void,
-            Err(err) => {
-                if let Ok(c_msg) = CString::new(err) {
-                    ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c_msg.as_ptr());
-                } else {
-                    ffi::PyErr_SetString(
-                        ffi::PyExc_RuntimeError,
-                        b"missing CLIF deopt metadata\0".as_ptr() as *const i8,
-                    );
-                }
-                return Err(());
-            }
-        };
-        data.function_env.set_deopt_table_ptr(deopt_table_ptr);
-        data.function_env.compiled_function = Some(compiled_function);
+        attach_compiled_function_to_env(&mut data.function_env, compiled_function)?;
         let elapsed_ms = ensure_start.elapsed().as_secs_f64() * 1000.0;
         info!(
             "soac_jit_precompile module={} qualname={} blocks={} elapsed_ms={elapsed_ms:.3}",
@@ -1625,6 +1562,56 @@ unsafe fn ensure_clif_direct_entries_compiled(
         return Err(());
     }
     Ok(())
+}
+
+fn attach_compiled_function_to_env(
+    function_env: &mut FunctionEnv,
+    compiled_function: Arc<jit::CompiledFunctionHandle>,
+) -> Result<(), ()> {
+    let direct_code_ptr = compiled_function
+        .direct_code_ptr()
+        .map(|ptr| ptr as *const u8)
+        .map_err(|err| set_runtime_error_message(&err))?;
+    let default_direct_code_ptr = compiled_function
+        .default_direct_code_ptr()
+        .map(|ptr| ptr as *const u8)
+        .map_err(|err| set_runtime_error_message(&err))?;
+    let deopt_table_ptr = compiled_function
+        .direct_deopt_table_ptr()
+        .map(|ptr| ptr as *const c_void)
+        .map_err(|err| set_runtime_error_message(&err))?;
+    function_env.set_direct_code_ptr(direct_code_ptr);
+    function_env.set_default_direct_code_ptr(default_direct_code_ptr);
+    function_env.set_deopt_table_ptr(deopt_table_ptr);
+    function_env.compiled_function = Some(compiled_function);
+    Ok(())
+}
+
+pub(crate) unsafe fn attach_ready_clif_direct_entry(
+    function: *mut ffi::PyObject,
+) -> Result<bool, ()> {
+    let data = unsafe { py_function_jit_extra(function)? };
+    if data.function_env.compiled_function.is_some() {
+        return Ok(true);
+    }
+    let ready = {
+        let function = data.function()?;
+        if entry_interpreter_vectorcall_requested(function) {
+            return Ok(false);
+        }
+        let engine = data
+            .compile_session
+            .process_jit()
+            .map_err(|err| set_runtime_error_message(&err))?;
+        engine
+            .lookup_ready_direct_function(function)
+            .map_err(|err| set_runtime_error_message(&err))?
+    };
+    let Some(compiled_function) = ready else {
+        return Ok(false);
+    };
+    attach_compiled_function_to_env(&mut data.function_env, compiled_function)?;
+    Ok(true)
 }
 
 unsafe fn ensure_clif_vectorcall_compiled(

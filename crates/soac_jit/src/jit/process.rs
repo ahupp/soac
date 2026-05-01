@@ -1277,7 +1277,6 @@ impl ProcessJitState {
         default_code_ptr: *const u8,
         param_count: usize,
         deopt_table: Arc<RuntimeJitDeoptTable>,
-        stats: JitCodegenStats,
     ) -> Result<Arc<CompiledFunctionHandle>, String> {
         let Some(entry) = self.direct_functions.get(&function_id) else {
             return Err(format!(
@@ -1294,7 +1293,6 @@ impl ProcessJitState {
             default_code_ptr,
             param_count,
             deopt_table,
-            Some(stats),
         ));
         self.direct_functions.insert(
             function_id,
@@ -1929,7 +1927,6 @@ impl ProcessJitState {
                 default_code_ptr,
                 defined.param_count,
                 Arc::clone(&defined.deopt_table),
-                defined.stats,
             )?;
             let code_id = jitdump::record_code_load(
                 &defined.main_symbol,
@@ -2178,7 +2175,7 @@ impl ProcessJitEngine {
         Ok(entry)
     }
 
-    fn lookup_ready_direct_function(
+    pub(crate) fn lookup_ready_direct_function(
         &self,
         function: &BlockPyFunction<BlockPyModuleShape>,
     ) -> Result<Option<Arc<CompiledFunctionHandle>>, String> {
@@ -3386,7 +3383,7 @@ impl From<DirectFunctionCompileResult> for DirectFunctionCompileAttempt {
 #[cfg(test)]
 mod tests {
     use super::{ProcessJitModule, ProcessJitState};
-    use crate::jit::{JitCodegenStats, RuntimeJitDeoptTable};
+    use crate::jit::RuntimeJitDeoptTable;
     use soac_core::block_py::{
         BlockPyFunction, FunctionKind, FunctionName, ModuleNameGen, Param, ParamKind, ParamSpec,
     };
@@ -3449,7 +3446,6 @@ mod tests {
                     module_constant_ptrs: Vec::new(),
                     points: Vec::new(),
                 }),
-                JitCodegenStats::default(),
             )
             .expect("first function should mark ready");
         let ready_handle = state

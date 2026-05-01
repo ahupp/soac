@@ -10,7 +10,6 @@ struct CompiledSpecializedRunner {
 
 pub(crate) struct CompiledFunctionHandle {
     handle: ObjPtr,
-    stats: Option<JitCodegenStats>,
 }
 
 pub(crate) struct DirectFunctionCompileResult {
@@ -40,7 +39,6 @@ impl CompiledFunctionHandle {
         default_code_ptr: *const u8,
         param_count: usize,
         deopt_table: Arc<RuntimeJitDeoptTable>,
-        stats: Option<JitCodegenStats>,
     ) -> Self {
         Self {
             handle: new_compiled_direct_runner_handle(
@@ -50,12 +48,7 @@ impl CompiledFunctionHandle {
                 param_count,
                 deopt_table,
             ),
-            stats,
         }
-    }
-
-    pub(crate) fn jit_stats(&self) -> Option<&JitCodegenStats> {
-        self.stats.as_ref()
     }
 
     #[cfg(test)]

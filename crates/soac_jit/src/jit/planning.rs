@@ -174,18 +174,18 @@ impl PlannedCleanupRootSlotStates {
             .unwrap_or(CleanupRootSlotState::MaybeOwnedReference)
     }
 
-    pub fn exit_state_for_block(&self, label: BlockLabel) -> HashMap<String, CleanupRootSlotState> {
-        self.block_exit_states
-            .get(&label)
-            .cloned()
-            .unwrap_or_default()
-    }
-
     pub fn entry_state_for_block(
         &self,
         label: BlockLabel,
     ) -> HashMap<String, CleanupRootSlotState> {
         self.block_entry_states
+            .get(&label)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn exit_state_for_block(&self, label: BlockLabel) -> HashMap<String, CleanupRootSlotState> {
+        self.block_exit_states
             .get(&label)
             .cloned()
             .unwrap_or_default()

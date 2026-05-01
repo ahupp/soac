@@ -104,6 +104,16 @@ fn register_clif_vectorcall_raw(
     }
 }
 
+fn attach_ready_clif_direct_entry_raw(py: Python<'_>, func: &Bound<'_, PyAny>) -> PyResult<bool> {
+    unsafe { crate::attach_ready_clif_direct_entry(func.as_ptr()) }.map_err(|_| {
+        if unsafe { ffi::PyErr_Occurred() }.is_null() {
+            PyRuntimeError::new_err("failed to attach ready CLIF direct entry")
+        } else {
+            PyErr::fetch(py)
+        }
+    })
+}
+
 fn maybe_eager_compile_clif_entry(
     py: Python<'_>,
     func: &Bound<'_, PyAny>,
@@ -123,6 +133,9 @@ fn maybe_eager_compile_clif_entry(
         .lookup_function(function_id)
         .is_some_and(|function| function.execution_mode() != FunctionExecutionMode::Jit)
     {
+        return Ok(());
+    }
+    if attach_ready_clif_direct_entry_raw(py, func)? {
         return Ok(());
     }
     let start = Instant::now();

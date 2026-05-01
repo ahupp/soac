@@ -15542,14 +15542,17 @@ def f(x):
             1,
             "v3 add-store region should emit the selected checked machine add"
         );
-        let generic_helpers = import_user_names_for_symbols(
+        assert_guard_miss_deopts_without_local_fallback(
             &built,
-            &["PyNumber_Add", "PyObject_RichCompare", "dp_jit_is_true"],
+            &["PyNumber_Add"],
+            "v3 add-store exact-int guard miss",
         );
+        let generic_helpers =
+            import_user_names_for_symbols(&built, &["PyObject_RichCompare", "dp_jit_is_true"]);
         assert_eq!(
             count_direct_calls_to_runtime_helpers(&built.ctx.func, &generic_helpers),
-            3,
-            "v3 add-store/compare should keep one generic local fallback for add and one for compare truthiness"
+            2,
+            "v3 add-store/compare should keep generic local fallback only for compare truthiness"
         );
     }
 
