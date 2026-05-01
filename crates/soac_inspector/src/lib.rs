@@ -8,9 +8,16 @@ use pyo3::types::{PyDict, PyList, PyModule};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use soac_config::SoacEnvConfig;
-use soac_core::block_py::{BlockPyFunction, BlockPyModule, ModuleNameGen, RuntimeFunctionId};
+use soac_core::block_py::{
+    BlockPyFunction, BlockPyModule, InstrId, InstrLocationMap, ModuleNameGen, RuntimeFunctionId,
+    current_instr_locations,
+};
 use soac_core::pass_tracker::RecordingPassTracker;
 use soac_ir_blockpy::BlockPyModuleShape;
+use soac_ir_typed::plan_v3::{
+    DeoptPointSource, FunctionOptimizationPlanV3, ModuleOptimizationPlanV3, ModulePlanIdentity,
+    RegionSource,
+};
 use soac_jit::module_constants::ModuleCodegenConstants;
 use soac_jit::module_type::{
     build_shared_state_for_inspection_with_placeholder_constants_and_source_hash,
@@ -27,7 +34,11 @@ use soac_opt::passes::{
     render_local_env_function_plan, render_local_env_module_plan,
     render_local_env_resume_function_plan, render_local_env_resume_module_plan,
 };
-use std::ffi::c_void;
+use soac_opt::plan::ProfileEvidenceStore;
+use soac_opt::{
+    alternatives_v3::AlternativeCatalog, pipeline_v3::plan_and_emit_module_v3_from_raw_evidence,
+};
+use std::ffi::{CString, c_void};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tower_http::services::ServeDir;
@@ -65,6 +76,14 @@ struct JitClifRequest {
     qualname: Option<String>,
     #[serde(rename = "entryLabel")]
     entry_label: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct OptimizationExplainRequest {
+    source: String,
+    workload: String,
+    #[serde(rename = "functionId")]
+    function_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -150,6 +169,10 @@ pub fn app_with_state(state: AppState) -> Router {
     Router::new()
         .route("/api/inspect_pipeline", post(handle_inspect_pipeline))
         .route("/api/jit_clif", post(handle_jit_clif))
+        .route(
+            "/api/optimization_explain",
+            post(handle_optimization_explain),
+        )
         .route("/api/speedscope_profile", get(handle_speedscope_profile))
         .fallback_service(ServeDir::new(state.web_dir.clone()))
         .with_state(state)
@@ -880,6 +903,411 @@ fn render_jit_clif(
     Ok(rendered)
 }
 
+fn selected_blockpy_function<'a>(
+    module: &'a BlockPyModule<BlockPyModuleShape>,
+    requested_function_id: Option<RuntimeFunctionId>,
+) -> Result<&'a BlockPyFunction<BlockPyModuleShape>, ApiError> {
+    if let Some(function_id) = requested_function_id {
+        return module
+            .callable_defs
+            .iter()
+            .find(|function| function.function_id == function_id)
+            .ok_or_else(|| {
+                ApiError::bad_request(format!(
+                    "unknown functionId '{function_id}' for this source"
+                ))
+            });
+    }
+    module
+        .callable_defs
+        .iter()
+        .find(|function| function.names.qualname != "_dp_module_init")
+        .or_else(|| module.callable_defs.first())
+        .ok_or_else(|| ApiError::bad_request("source did not lower to any callable functions"))
+}
+
+fn execute_workload_for_inspection(source: &str, workload: &str) -> Value {
+    if workload.trim().is_empty() {
+        return json!({
+            "status": "skipped",
+            "message": "No workload was provided.",
+        });
+    }
+    let combined = format!("{source}\n\n# soac inspector profile workload\n{workload}");
+    let Ok(combined) = CString::new(combined) else {
+        return json!({
+            "status": "error",
+            "message": "Source or workload contains an embedded NUL byte.",
+        });
+    };
+    prepare_python();
+    match Python::attach(|py| {
+        PyModule::from_code(
+            py,
+            combined.as_c_str(),
+            c"soac_inspector_workload.py",
+            c"_soac_inspector_workload",
+        )
+        .map(|_| ())
+        .map_err(|err| err.to_string())
+    }) {
+        Ok(()) => json!({
+            "status": "ok",
+            "message": "Workload executed in embedded Python.",
+        }),
+        Err(error) => json!({
+            "status": "error",
+            "message": error,
+        }),
+    }
+}
+
+fn optimization_plan_v3_for_inspector(
+    module_name: &str,
+    module: &BlockPyModule<BlockPyModuleShape>,
+) -> Result<ModuleOptimizationPlanV3, String> {
+    let artifacts = plan_and_emit_module_v3_from_raw_evidence(
+        &AlternativeCatalog::default_v3(),
+        ModulePlanIdentity {
+            module_name: module_name.to_string(),
+            source_hash: 0,
+            cache_identity: "inspector".to_string(),
+        },
+        module,
+        &ProfileEvidenceStore::default(),
+    )
+    .map_err(|err| err.to_string())?;
+    Ok(artifacts.plan)
+}
+
+fn planned_function_for_runtime_id(
+    plan: &ModuleOptimizationPlanV3,
+    function_id: RuntimeFunctionId,
+) -> Option<&FunctionOptimizationPlanV3> {
+    plan.functions.iter().find(|function| {
+        function.function.function.local_function_id() == function_id.local_function_id()
+    })
+}
+
+fn instr_location_payload(source: Option<InstrId>, locations: &InstrLocationMap) -> Value {
+    let Some(instr_id) = source else {
+        return Value::Null;
+    };
+    let Some(location) = locations.get(&instr_id) else {
+        return json!({
+            "instr": instr_id.to_string(),
+        });
+    };
+    json!({
+        "instr": instr_id.to_string(),
+        "block": location.block_label().to_string(),
+        "bodyIndex": location.body_index(),
+    })
+}
+
+fn region_source_instr_id(source: &RegionSource) -> Option<InstrId> {
+    match source {
+        RegionSource::Instr { instr_id } => Some(*instr_id),
+        RegionSource::FunctionEntry | RegionSource::Synthetic { .. } => None,
+    }
+}
+
+fn deopt_source_instr_id(source: &DeoptPointSource) -> Option<InstrId> {
+    match source {
+        DeoptPointSource::BeforeInstr { instr_id } => Some(*instr_id),
+        DeoptPointSource::BeforeRegion { .. } | DeoptPointSource::Synthetic { .. } => None,
+    }
+}
+
+fn optimization_decisions_payload(
+    planned_function: Option<&FunctionOptimizationPlanV3>,
+    locations: &InstrLocationMap,
+) -> Vec<Value> {
+    let Some(planned_function) = planned_function else {
+        return vec![json!({
+            "kind": "plan",
+            "status": "missing",
+            "title": "No v3 plan for selected function",
+            "detail": "The selected function was not present in the generated optimization plan.",
+            "source": Value::Null,
+        })];
+    };
+
+    let mut decisions = Vec::new();
+    for diagnostic in &planned_function.diagnostics {
+        decisions.push(json!({
+            "kind": "diagnostic",
+            "status": "rejected",
+            "title": "Planner diagnostic",
+            "detail": diagnostic.message.as_str(),
+            "source": instr_location_payload(diagnostic.source, locations),
+        }));
+    }
+    for region in &planned_function.regions {
+        decisions.push(json!({
+            "kind": "region",
+            "status": "selected",
+            "title": format!("Region {}", region.id.0),
+            "detail": format!(
+                "{} nodes, {} inputs, {} exits",
+                region.nodes.len(),
+                region.inputs.len(),
+                region.exits.len()
+            ),
+            "source": instr_location_payload(region_source_instr_id(&region.source), locations),
+            "metadata": {
+                "regionSource": format!("{:?}", region.source),
+            },
+        }));
+    }
+    for direct_call in &planned_function.direct_calls {
+        decisions.push(json!({
+            "kind": "direct_call",
+            "status": "selected",
+            "title": format!("Direct call to {}", direct_call.target),
+            "detail": direct_call.reason.as_str(),
+            "source": instr_location_payload(Some(direct_call.source), locations),
+            "metadata": {
+                "callee": format!("{:?}", direct_call.callee),
+                "body": format!("{:?}", direct_call.body.kind),
+                "bodyReason": direct_call.body.reason.as_str(),
+                "inlineTarget": direct_call.body.inline_target.map(|target| target.to_string()),
+            },
+        }));
+    }
+    for item in &planned_function.exact_list_items {
+        decisions.push(json!({
+            "kind": "exact_list_item",
+            "status": "selected",
+            "title": format!("{:?} list item", item.access),
+            "detail": item.reason.as_str(),
+            "source": instr_location_payload(Some(item.source), locations),
+            "metadata": {
+                "shape": format!("{:?}", item.shape),
+                "guard": format!("{:?}", item.guard.kind),
+                "fallback": format!("{:?}", item.fallback.kind),
+            },
+        }));
+    }
+    for field in &planned_function.indexed_fields {
+        decisions.push(json!({
+            "kind": "indexed_field",
+            "status": "selected",
+            "title": format!("{:?} .{}", field.access, field.attr_name),
+            "detail": field.reason.as_str(),
+            "source": instr_location_payload(Some(field.source), locations),
+            "metadata": {
+                "ownerType": format!(
+                    "{}.{}",
+                    field.owner_type.module_name,
+                    field.owner_type.qualname
+                ),
+                "expectedIndex": field.expected_index,
+                "guard": format!("{:?}", field.guard.kind),
+                "fallback": format!("{:?}", field.fallback.kind),
+            },
+        }));
+    }
+    for global in &planned_function.indexed_globals {
+        decisions.push(json!({
+            "kind": "indexed_global",
+            "status": "selected",
+            "title": format!("{:?} {}.{}", global.access, global.module_name, global.name),
+            "detail": global.reason.as_str(),
+            "source": instr_location_payload(Some(global.source), locations),
+            "metadata": {
+                "expectedIndex": global.expected_index,
+                "guard": format!("{:?}", global.guard.kind),
+                "fallback": format!("{:?}", global.fallback.kind),
+            },
+        }));
+    }
+    for deopt_point in &planned_function.deopt_points {
+        decisions.push(json!({
+            "kind": "deopt",
+            "status": "planned",
+            "title": format!("Deopt point {}", deopt_point.id.0),
+            "detail": deopt_point.reason.as_str(),
+            "source": instr_location_payload(deopt_source_instr_id(&deopt_point.source), locations),
+            "metadata": {
+                "deoptSource": format!("{:?}", deopt_point.source),
+            },
+        }));
+    }
+    for ownership in &planned_function.ownership.actions {
+        decisions.push(json!({
+            "kind": "ownership",
+            "status": "planned",
+            "title": format!("{:?} {:?}", ownership.kind, ownership.value),
+            "detail": ownership.reason.as_str(),
+            "source": Value::Null,
+        }));
+    }
+    if decisions.is_empty() {
+        decisions.push(json!({
+            "kind": "plan",
+            "status": "empty",
+            "title": "No v3 optimization selections",
+            "detail": "The current no-counter plan has no selected v3 rewrites for this function.",
+            "source": Value::Null,
+        }));
+    }
+    decisions
+}
+
+fn optimization_explain_payload(
+    repo_root: &Path,
+    source: &str,
+    workload: &str,
+    requested_function_id: Option<RuntimeFunctionId>,
+) -> Result<Value, ApiError> {
+    let module_name = next_web_module_name();
+    let module = lower_source_to_blockpy_module(source).map_err(ApiError::internal)?;
+    let function = selected_blockpy_function(&module, requested_function_id)?;
+    let function_id = function.function_id;
+    let function_payload = inspector_function_payload(function);
+    let workload_status = execute_workload_for_inspection(source, workload);
+
+    let prepared = plan_typed_jit_module_for_inspector(&module).map_err(ApiError::internal)?;
+    let typed_function = prepared
+        .module
+        .callable_defs
+        .iter()
+        .find(|typed_function| typed_function.function_id == function_id)
+        .ok_or_else(|| ApiError::internal("typed planning dropped the selected function"))?;
+    let typed_instr_count: usize = typed_function
+        .blocks
+        .iter()
+        .map(|block| block.body.len() + 1)
+        .sum();
+    let jit_local_plan = prepared
+        .locals
+        .function(function_id)
+        .ok_or_else(|| ApiError::internal("missing JIT local plan for selected function"))?;
+    let jit_local_plan_text = render_jit_function_locals(typed_function, jit_local_plan)
+        .unwrap_or_else(|err| format!("; failed to render JIT local plan: {err}"));
+    let deopt_count = prepared
+        .deopt_resume
+        .functions
+        .get(&function_id)
+        .map(|deopt| deopt.deopt_points.len())
+        .unwrap_or(0);
+
+    let (plan_status, plan, plan_error) =
+        match optimization_plan_v3_for_inspector(module_name.as_str(), &module) {
+            Ok(plan) => ("ok", Some(plan), None),
+            Err(error) => ("error", None, Some(error)),
+        };
+    let locations = current_instr_locations(function);
+    let planned_function = plan
+        .as_ref()
+        .and_then(|plan| planned_function_for_runtime_id(plan, function_id));
+    let decisions = if let Some(error) = plan_error.as_deref() {
+        vec![json!({
+            "kind": "plan",
+            "status": "error",
+            "title": "v3 plan failed",
+            "detail": error,
+            "source": Value::Null,
+        })]
+    } else {
+        optimization_decisions_payload(planned_function, &locations)
+    };
+    let plan_counts = planned_function
+        .map(|planned| {
+            json!({
+                "regions": planned.regions.len(),
+                "directCalls": planned.direct_calls.len(),
+                "exactListItems": planned.exact_list_items.len(),
+                "indexedFields": planned.indexed_fields.len(),
+                "indexedGlobals": planned.indexed_globals.len(),
+                "diagnostics": planned.diagnostics.len(),
+                "deoptPoints": planned.deopt_points.len(),
+                "ownershipActions": planned.ownership.actions.len(),
+            })
+        })
+        .unwrap_or_else(|| {
+            json!({
+                "regions": 0,
+                "directCalls": 0,
+                "exactListItems": 0,
+                "indexedFields": 0,
+                "indexedGlobals": 0,
+                "diagnostics": 0,
+                "deoptPoints": 0,
+                "ownershipActions": 0,
+            })
+        });
+
+    let instr_typed = render_instr_typed_for_module_with_options(
+        repo_root,
+        module_name.as_str(),
+        &module,
+        function_id,
+        JitClifRenderOptions::default(),
+    )
+    .map(|rendered| rendered.instr_typed)
+    .unwrap_or_else(|err| format!("; failed to render InstrTyped: {err}"));
+
+    let workload_status_text = workload_status["status"]
+        .as_str()
+        .unwrap_or("unknown")
+        .to_string();
+    let workload_detail_text = workload_status["message"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+
+    Ok(json!({
+        "selectedFunction": function_payload,
+        "workload": workload_status,
+        "profile": {
+            "status": "not_connected",
+            "message": "The workload input is executed for validation in this prototype; runtime profile counter capture and replay into the v3 planner still needs a dedicated inspector backend hook.",
+        },
+        "typed": {
+            "blocks": typed_function.blocks.len(),
+            "instructions": typed_instr_count,
+        },
+        "jit": {
+            "deoptPoints": deopt_count,
+            "runtimeBlockParamGroups": jit_local_plan.runtime_block_params.len(),
+            "implicitTargetTransports": jit_local_plan.implicit_target_transports.len(),
+            "jumpEdgeTransports": jit_local_plan.jump_edge_transports.len(),
+            "entryMaterializationGroups": jit_local_plan.entry_materializations.len(),
+        },
+        "plan": {
+            "status": plan_status,
+            "counts": plan_counts,
+        },
+        "summary": [
+            {
+                "label": "typed CFG",
+                "value": format!("{} blocks / {} instrs", typed_function.blocks.len(), typed_instr_count),
+                "detail": "Typed module used by JIT planning.",
+            },
+            {
+                "label": "v3 plan",
+                "value": plan_status,
+                "detail": "Selected/rejected optimization decisions for the current no-counter plan.",
+            },
+            {
+                "label": "JIT locals",
+                "value": format!("{} deopt points", deopt_count),
+                "detail": "Runtime local, deopt, and edge-transport planning for codegen.",
+            },
+            {
+                "label": "profile workload",
+                "value": workload_status_text,
+                "detail": workload_detail_text,
+            },
+        ],
+        "decisions": decisions,
+        "instrTyped": instr_typed,
+        "jitLocalPlan": jit_local_plan_text,
+    }))
+}
+
 async fn handle_inspect_pipeline(
     Json(request): Json<InspectPipelineRequest>,
 ) -> Result<Json<Value>, ApiError> {
@@ -901,6 +1329,23 @@ async fn handle_jit_clif(
         function_id,
         request.qualname.as_deref(),
         entry_label,
+    )?))
+}
+
+async fn handle_optimization_explain(
+    State(state): State<AppState>,
+    Json(request): Json<OptimizationExplainRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let function_id = request
+        .function_id
+        .as_deref()
+        .map(parse_packed_function_id)
+        .transpose()?;
+    Ok(Json(optimization_explain_payload(
+        &state.repo_root,
+        request.source.as_str(),
+        request.workload.as_str(),
+        function_id,
     )?))
 }
 
@@ -993,6 +1438,13 @@ mod test {
         let html = response_text(response).await;
         assert!(html.contains("/api/inspect_pipeline"));
         assert!(html.contains("/api/jit_clif"));
+        assert!(html.contains("/api/optimization_explain"));
+        assert!(html.contains("Profile workload"));
+        assert!(html.contains("BlockPy"));
+        assert!(html.contains("Post-opt InstrTyped"));
+        assert!(html.contains("VCode"));
+        assert!(html.contains("renderLinkedBlockText"));
+        assert!(html.contains("block-link"));
 
         let response = app
             .oneshot(
@@ -1039,6 +1491,56 @@ mod test {
             step_texts
                 .iter()
                 .any(|text| text.contains("function") && text.contains("runtime_params")),
+            "{payload}"
+        );
+    }
+
+    #[tokio::test]
+    async fn explains_selected_function_optimization_metadata() {
+        let app = app();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/optimization_explain")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "source": "def classify(n):\n    return n + 1\n",
+                            "workload": "for i in range(3):\n    classify(i)\n",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("optimization explain request should succeed");
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload: Value = serde_json::from_str(&response_text(response).await).unwrap();
+        assert_eq!(payload["selectedFunction"]["qualname"], "classify");
+        assert_eq!(payload["workload"]["status"], "ok");
+        assert_eq!(payload["profile"]["status"], "not_connected");
+        assert!(
+            payload["typed"]["blocks"]
+                .as_u64()
+                .is_some_and(|blocks| blocks > 0)
+        );
+        assert!(
+            payload["decisions"]
+                .as_array()
+                .is_some_and(|decisions| !decisions.is_empty()),
+            "{payload}"
+        );
+        assert!(
+            payload["instrTyped"]
+                .as_str()
+                .is_some_and(|text| text.contains("InstrTyped")),
+            "{payload}"
+        );
+        assert!(
+            payload["jitLocalPlan"]
+                .as_str()
+                .is_some_and(|text| text.contains("runtime_params")),
             "{payload}"
         );
     }

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>diet-python pipeline inspector</title>
+<title>SOAC inspector</title>
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
 <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;800&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
@@ -35,10 +35,7 @@ body {
   min-height: 100vh;
   font-family: "Manrope", "Segoe UI", sans-serif;
   color: var(--ink-0);
-  background:
-    radial-gradient(circle at 12% 8%, rgba(31, 118, 110, 0.34) 0%, transparent 32%),
-    radial-gradient(circle at 88% 92%, rgba(35, 78, 140, 0.32) 0%, transparent 34%),
-    linear-gradient(160deg, var(--bg-0), var(--bg-1) 48%, var(--bg-2));
+  background: linear-gradient(160deg, var(--bg-0), var(--bg-1) 48%, var(--bg-2));
 }
 
 .app {
@@ -55,7 +52,7 @@ body {
   justify-content: space-between;
   gap: 12px;
   padding: 12px 16px;
-  border-radius: 16px;
+  border-radius: 8px;
   background: var(--card);
   border: 1px solid var(--line-strong);
   backdrop-filter: blur(10px);
@@ -80,53 +77,25 @@ body {
   white-space: nowrap;
 }
 
-.status-group {
+.inspector-layout {
   display: flex;
   flex-direction: column;
-  align-items: flex-end;
-  gap: 4px;
-}
-
-.nav-controls {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-
-.nav-button {
-  border: 1px solid var(--line-strong);
-  background: rgba(18, 29, 44, 0.95);
-  color: var(--ink-0);
-  border-radius: 10px;
-  width: 36px;
-  height: 36px;
-  font-family: "IBM Plex Mono", ui-monospace, monospace;
-  font-size: 1rem;
-  cursor: pointer;
-}
-
-.nav-button:disabled {
-  opacity: 0.4;
-  cursor: default;
-}
-
-.step-window {
-  font-size: 0.75rem;
-  color: var(--ink-1);
-}
-
-.workspace {
-  display: grid;
-  grid-template-columns: minmax(0, 33.3333%) minmax(0, 66.6667%);
   gap: 14px;
-  min-height: 0;
   flex: 1;
+  min-height: 0;
+}
+
+.top-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 14px;
+  min-height: 310px;
 }
 
 .panel {
   background: var(--card);
   border: 1px solid var(--line);
-  border-radius: 16px;
+  border-radius: 8px;
   overflow: hidden;
   display: flex;
   flex-direction: column;
@@ -135,18 +104,9 @@ body {
   box-shadow: 0 16px 40px rgba(0, 0, 0, 0.28);
 }
 
-.clif-panel {
-  grid-column: 1 / -1;
-  min-height: 360px;
-}
-
-.dominator-panel {
-  grid-column: 1 / -1;
-  min-height: 360px;
-}
-
-.graphviz-panel {
-  grid-column: 1 / -1;
+.views-panel {
+  flex: 1;
+  min-height: 460px;
 }
 
 .panel-head {
@@ -222,10 +182,190 @@ pre {
   white-space: pre;
 }
 
+.linked-block-line {
+  display: block;
+  margin: 0 -14px;
+  min-height: 1.44em;
+  padding: 0 14px;
+  position: relative;
+}
+
+.linked-block-line.linked-block-target {
+  background: rgba(79, 209, 189, 0.14);
+  outline: 1px solid rgba(79, 209, 189, 0.32);
+}
+
+.block-target {
+  position: absolute;
+  top: -8px;
+}
+
+.block-link {
+  color: #8ad7ff;
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 2px;
+}
+
+.block-link:hover {
+  color: var(--accent);
+}
+
 .panel-body {
   flex: 1;
   min-height: 0;
   display: flex;
+}
+
+.view-tabs {
+  display: flex;
+  gap: 6px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--line);
+  background: rgba(8, 14, 22, 0.24);
+}
+
+.view-tab {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 6px 10px;
+  background: rgba(18, 29, 44, 0.9);
+  color: var(--ink-1);
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 0.74rem;
+  cursor: pointer;
+}
+
+.view-tab.active {
+  border-color: var(--line-strong);
+  color: var(--ink-0);
+  background: var(--accent-soft);
+}
+
+.view-body {
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.typed-metadata {
+  min-width: 0;
+  padding: 12px;
+  border-bottom: 1px solid var(--line);
+  background: rgba(8, 14, 22, 0.16);
+}
+
+.typed-metadata[hidden] {
+  display: none;
+}
+
+.summary-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.summary-item,
+.decision-card {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(10, 17, 26, 0.72);
+}
+
+.summary-item {
+  padding: 10px;
+  min-width: 0;
+}
+
+.summary-label,
+.decision-kind {
+  font-size: 0.68rem;
+  color: var(--ink-1);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.summary-value {
+  margin-top: 4px;
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 0.84rem;
+  color: var(--ink-0);
+  overflow-wrap: anywhere;
+}
+
+.summary-detail,
+.decision-detail,
+.decision-source,
+.decision-metadata {
+  margin-top: 6px;
+  font-size: 0.73rem;
+  line-height: 1.35;
+  color: var(--ink-1);
+  overflow-wrap: anywhere;
+}
+
+.decision-list {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.decision-card {
+  padding: 9px 10px;
+}
+
+.decision-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.decision-title {
+  margin-top: 3px;
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 0.78rem;
+  color: #d8e4f1;
+  overflow-wrap: anywhere;
+}
+
+.decision-status {
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  padding: 2px 7px;
+  font-size: 0.68rem;
+  color: var(--ink-0);
+  background: rgba(79, 209, 189, 0.12);
+  white-space: nowrap;
+}
+
+.decision-status.rejected,
+.decision-status.error {
+  color: #ffb08f;
+  background: rgba(255, 138, 101, 0.12);
+}
+
+.optimization-detail {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(8, 14, 22, 0.38);
+  margin-top: 10px;
+  overflow: hidden;
+}
+
+.optimization-detail summary {
+  cursor: pointer;
+  padding: 8px 10px;
+  font-size: 0.74rem;
+  color: var(--ink-1);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  border-bottom: 1px solid var(--line);
+}
+
+.optimization-detail pre {
+  max-height: 460px;
+  background: transparent;
 }
 
 .select-wrap {
@@ -359,7 +499,11 @@ select {
 }
 
 @media (max-width: 1200px) {
-  .workspace {
+  .top-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .summary-grid {
     grid-template-columns: minmax(0, 1fr);
   }
 
@@ -373,78 +517,123 @@ select {
 <div class="app">
   <div class="header">
     <div>
-      <div class="title">diet-python transform pipeline inspector</div>
-      <div class="subtitle">Input source stays pinned on the left. Use Left/Right arrow to shift the preview on the right.</div>
+      <div class="title">SOAC inspector</div>
+      <div class="subtitle" id="contextStatus">ready</div>
     </div>
-    <div class="nav-controls">
-      <button class="nav-button" id="prevPass" type="button" aria-label="Previous pass">←</button>
-      <div class="status-group">
-        <div class="status" id="status">ready</div>
-        <div class="step-window" id="stepWindow"></div>
-      </div>
-      <button class="nav-button" id="nextPass" type="button" aria-label="Next pass">→</button>
-    </div>
+    <div class="status" id="status">ready</div>
   </div>
 
-  <div class="workspace">
-    <section class="panel source-panel">
-      <div class="panel-head">
-        <div class="panel-title" id="leftTitle">input source</div>
-        <div class="select-wrap">
-          <label for="sourceSample">Sample</label>
-          <select id="sourceSample"></select>
+  <main class="inspector-layout">
+    <div class="top-grid">
+      <section class="panel source-panel">
+        <div class="panel-head">
+          <div class="panel-title">Python source</div>
+          <div class="select-wrap">
+            <label for="sourceSample">Program</label>
+            <select id="sourceSample"></select>
+          </div>
         </div>
-      </div>
-      <div class="panel-body" id="leftPane"></div>
-    </section>
+        <div class="panel-body" id="leftPane"></div>
+      </section>
 
-    <section class="panel preview-panel">
-      <div class="panel-head">
-        <div class="panel-title" id="rightTitle">ast-to-ast</div>
-      </div>
-      <div class="panel-body" id="rightPane"></div>
-    </section>
+      <section class="panel workload-panel">
+        <div class="panel-head">
+          <div class="panel-title">Profile workload</div>
+          <div class="select-wrap">
+            <label for="workloadSample">Workload</label>
+            <select id="workloadSample"></select>
+          </div>
+        </div>
+        <div class="panel-body">
+          <textarea id="workloadInput" spellcheck="false" placeholder="Enter profile workload Python here"></textarea>
+        </div>
+      </section>
+    </div>
 
-    <section class="panel clif-panel">
+    <section class="panel views-panel">
       <div class="panel-head">
         <div class="panel-head-meta">
-          <div class="panel-title">Actual Generated CLIF</div>
-          <div class="panel-substatus" id="clifStatus">Select a lowered function to render the post-opt CLIF fed to Cranelift.</div>
+          <div class="panel-title" id="viewTitle">BlockPy</div>
+          <div class="panel-substatus" id="viewStatus">ready</div>
         </div>
         <div class="select-wrap">
           <label for="clifFunction">Function</label>
           <select id="clifFunction"></select>
         </div>
       </div>
-      <div class="panel-body">
-        <pre id="clifPane">; Actual CLIF will appear here.</pre>
+      <div class="view-tabs" id="viewTabs" role="tablist" aria-label="Inspector views">
+        <button class="view-tab active" type="button" data-view="codegen">BlockPy</button>
+        <button class="view-tab" type="button" data-view="typed">Post-opt InstrTyped</button>
+        <button class="view-tab" type="button" data-view="clif">CLIF</button>
+        <button class="view-tab" type="button" data-view="vcode">VCode</button>
+      </div>
+      <div class="panel-body view-body">
+        <div class="typed-metadata" id="typedMetadata" hidden>
+          <div class="summary-grid" id="optimizationSummary"></div>
+          <div class="decision-list" id="optimizationDecisions"></div>
+        </div>
+        <pre id="viewPane">; BlockPy will appear here.</pre>
       </div>
     </section>
-  </div>
+  </main>
 </div>
 
 <script>
 const leftPaneEl = document.getElementById("leftPane");
-const rightPaneEl = document.getElementById("rightPane");
-const leftTitleEl = document.getElementById("leftTitle");
-const rightTitleEl = document.getElementById("rightTitle");
 const sourceSampleEl = document.getElementById("sourceSample");
-const prevPassEl = document.getElementById("prevPass");
-const nextPassEl = document.getElementById("nextPass");
-const stepWindowEl = document.getElementById("stepWindow");
+const contextStatusEl = document.getElementById("contextStatus");
 const statusEl = document.getElementById("status");
 const clifFunctionEl = document.getElementById("clifFunction");
-const clifStatusEl = document.getElementById("clifStatus");
-const clifPaneEl = document.getElementById("clifPane");
+const workloadSampleEl = document.getElementById("workloadSample");
+const workloadInputEl = document.getElementById("workloadInput");
+const viewTabsEl = document.getElementById("viewTabs");
+const viewTitleEl = document.getElementById("viewTitle");
+const viewStatusEl = document.getElementById("viewStatus");
+const viewPaneEl = document.getElementById("viewPane");
+const typedMetadataEl = document.getElementById("typedMetadata");
+const optimizationSummaryEl = document.getElementById("optimizationSummary");
+const optimizationDecisionsEl = document.getElementById("optimizationDecisions");
+
+const VIEW_DEFS = [
+  {
+    key: "codegen",
+    label: "BlockPy",
+    emptyText: "; BlockPy will appear here.",
+    emptyStatus: "Waiting for lowering.",
+  },
+  {
+    key: "typed",
+    label: "Post-opt InstrTyped",
+    emptyText: "; Post-opt InstrTyped will appear here.",
+    emptyStatus: "Waiting for typed metadata.",
+  },
+  {
+    key: "clif",
+    label: "CLIF",
+    emptyText: "; CLIF will appear here.",
+    emptyStatus: "Waiting for CLIF.",
+  },
+  {
+    key: "vcode",
+    label: "VCode",
+    emptyText: "; VCode will appear here.",
+    emptyStatus: "Waiting for VCode.",
+  },
+];
 
 const state = {
   source: "",
   steps: [],
-  pairStart: 0,
-  requestedRightStepKey: null,
   functions: [],
   selectedFunctionKey: null,
+  workload: "",
+  selectedViewKey: "codegen",
   clifRequestSerial: 0,
+  explainRequestSerial: 0,
+  viewTexts: Object.fromEntries(VIEW_DEFS.map((view) => [view.key, view.emptyText])),
+  viewStatuses: Object.fromEntries(
+    VIEW_DEFS.map((view) => [view.key, { message: view.emptyStatus, isError: false }])
+  ),
 };
 
 const CUSTOM_SAMPLE_KEY = "__custom__";
@@ -546,6 +735,85 @@ async def use_lock():
 
 const DEFAULT_SAMPLE = SOURCE_SAMPLES[0];
 
+const WORKLOAD_SAMPLES = [
+  {
+    key: "classify_loop",
+    sourceSampleKey: "classify",
+    label: "classify loop",
+    workload: `for i in range(1000):
+    classify(i - 500)`,
+  },
+  {
+    key: "counter_loop",
+    sourceSampleKey: "class_def",
+    label: "counter loop",
+    workload: `counter = Counter(0)
+for _ in range(1000):
+    counter.increment()
+    counter.scaled()`,
+  },
+  {
+    key: "closure_loop",
+    sourceSampleKey: "closure",
+    label: "closure loop",
+    workload: `next_value = incrementer()
+for _ in range(1000):
+    next_value()`,
+  },
+  {
+    key: "generator_loop",
+    sourceSampleKey: "generator",
+    label: "generator loop",
+    workload: `for _ in range(200):
+    list(seq(20))`,
+  },
+  {
+    key: "async_loop",
+    sourceSampleKey: "async",
+    label: "async loop",
+    workload: `import asyncio
+
+async def workload():
+    for _ in range(200):
+        await bar()
+
+asyncio.run(workload())`,
+  },
+  {
+    key: "async_generator_loop",
+    sourceSampleKey: "async_generator",
+    label: "async generator",
+    workload: `import asyncio
+
+async def workload():
+    for _ in range(100):
+        await sum()
+
+asyncio.run(workload())`,
+  },
+  {
+    key: "with_loop",
+    sourceSampleKey: "with_stmt",
+    label: "with loop",
+    workload: `for _ in range(1000):
+    load_value()`,
+  },
+  {
+    key: "async_with_loop",
+    sourceSampleKey: "async_with_stmt",
+    label: "async with loop",
+    workload: `import asyncio
+
+async def workload():
+    for _ in range(200):
+        await use_lock()
+
+asyncio.run(workload())`,
+  },
+];
+
+const CUSTOM_WORKLOAD_KEY = "__custom_workload__";
+
 function debounce(fn, delayMs) {
   let timer = null;
   return (...args) => {
@@ -556,19 +824,7 @@ function debounce(fn, delayMs) {
 
 function setStatus(message, isError = false) {
   statusEl.textContent = message;
-  statusEl.style.color = isError ? "#b42352" : "var(--ink-1)";
-}
-
-function currentRightStep() {
-  return state.steps[state.pairStart + 1] || null;
-}
-
-function pairStartForRightStepKey(stepKey) {
-  if (!stepKey) {
-    return null;
-  }
-  const stepIndex = state.steps.findIndex((step, index) => index > 0 && step.key === stepKey);
-  return stepIndex >= 0 ? Math.max(0, stepIndex - 1) : null;
+  statusEl.style.color = isError ? "#ff8c69" : "var(--ink-1)";
 }
 
 function updateQueryParams() {
@@ -578,11 +834,15 @@ function updateQueryParams() {
   } else {
     params.delete("src");
   }
-  const rightStep = currentRightStep();
-  if (rightStep) {
-    params.set("pass", rightStep.key);
+  if (state.workload) {
+    params.set("workload", state.workload);
   } else {
-    params.delete("pass");
+    params.delete("workload");
+  }
+  if (state.selectedViewKey && state.selectedViewKey !== "codegen") {
+    params.set("view", state.selectedViewKey);
+  } else {
+    params.delete("view");
   }
   const query = params.toString();
   history.replaceState(null, "", query ? `?${query}` : window.location.pathname);
@@ -595,18 +855,123 @@ function isEditableTarget(target) {
       target.isContentEditable);
 }
 
-function maxPairStart() {
-  return Math.max(0, state.steps.length - 2);
+function blockLinkScopeId(scope, token) {
+  return `block-target-${scope}-${token}`.replace(/[^A-Za-z0-9_-]/g, "_");
 }
 
-function clampPairStart(next) {
-  return Math.max(0, Math.min(next, maxPairStart()));
+function blockHeaderMatch(line) {
+  return line.match(/^(\s*)(block\d+|[A-Za-z_][A-Za-z0-9_]*)\s*(?:\([^)]*\))?:/);
 }
 
-function makeReadonlyStep(text) {
-  const pre = document.createElement("pre");
-  pre.textContent = text || "";
-  return pre;
+function annotatedBlockMatch(line) {
+  return line.match(/;\s*block\s+(block\d+|[A-Za-z_][A-Za-z0-9_]*)\s*(?:\(|$)/);
+}
+
+function collectBlockDefinitions(lines) {
+  const definitions = new Map();
+  lines.forEach((line, lineIndex) => {
+    const header = blockHeaderMatch(line);
+    if (header) {
+      definitions.set(header[2], lineIndex);
+    }
+    const annotation = annotatedBlockMatch(line);
+    if (annotation) {
+      definitions.set(annotation[1], lineIndex);
+    }
+  });
+  return definitions;
+}
+
+function tokenOverlapsRanges(start, end, ranges) {
+  return ranges.some(([rangeStart, rangeEnd]) => start < rangeEnd && end > rangeStart);
+}
+
+function definitionRangesForLine(line) {
+  const ranges = [];
+  const header = blockHeaderMatch(line);
+  if (header) {
+    const start = header[1].length;
+    ranges.push([start, start + header[2].length]);
+  }
+  const annotation = annotatedBlockMatch(line);
+  if (annotation) {
+    const start = annotation.index + annotation[0].indexOf(annotation[1]);
+    ranges.push([start, start + annotation[1].length]);
+  }
+  return ranges;
+}
+
+function appendLinkedBlockLine(lineContentEl, line, definitions, scope) {
+  const tokenRegex = /\b(?:block\d+|[A-Za-z_][A-Za-z0-9_]*)\b/g;
+  const skipRanges = definitionRangesForLine(line);
+  let cursor = 0;
+  for (const match of line.matchAll(tokenRegex)) {
+    const token = match[0];
+    const start = match.index;
+    const end = start + token.length;
+    if (!definitions.has(token) || tokenOverlapsRanges(start, end, skipRanges)) {
+      continue;
+    }
+    if (start > cursor) {
+      lineContentEl.appendChild(document.createTextNode(line.slice(cursor, start)));
+    }
+    const link = document.createElement("a");
+    link.className = "block-link";
+    link.href = `#${blockLinkScopeId(scope, token)}`;
+    link.textContent = token;
+    lineContentEl.appendChild(link);
+    cursor = end;
+  }
+  if (cursor < line.length) {
+    lineContentEl.appendChild(document.createTextNode(line.slice(cursor)));
+  }
+  if (!line.length) {
+    lineContentEl.appendChild(document.createTextNode("\u200b"));
+  }
+}
+
+function clearLinkedBlockHighlight() {
+  document
+    .querySelectorAll(".linked-block-line.linked-block-target")
+    .forEach((line) => line.classList.remove("linked-block-target"));
+}
+
+function applyLinkedBlockHighlight() {
+  clearLinkedBlockHighlight();
+  const rawHash = window.location.hash.slice(1);
+  if (!rawHash) {
+    return;
+  }
+  const target = document.getElementById(decodeURIComponent(rawHash));
+  const line = target?.closest(".linked-block-line");
+  if (line) {
+    line.classList.add("linked-block-target");
+  }
+}
+
+function renderLinkedBlockText(container, text, scopePrefix) {
+  const scope = String(scopePrefix || "text");
+  const lines = String(text || "").split("\n");
+  const definitions = collectBlockDefinitions(lines);
+  container.innerHTML = "";
+  for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+    const line = document.createElement("span");
+    line.className = "linked-block-line";
+    for (const [token, definitionLineIndex] of definitions.entries()) {
+      if (definitionLineIndex !== lineIndex) {
+        continue;
+      }
+      const anchor = document.createElement("span");
+      anchor.className = "block-target";
+      anchor.id = blockLinkScopeId(scope, token);
+      line.appendChild(anchor);
+    }
+    const content = document.createElement("span");
+    appendLinkedBlockLine(content, lines[lineIndex], definitions, scope);
+    line.appendChild(content);
+    container.appendChild(line);
+  }
+  requestAnimationFrame(applyLinkedBlockHighlight);
 }
 
 function makeSourceEditor() {
@@ -617,6 +982,7 @@ function makeSourceEditor() {
   textarea.addEventListener("input", () => {
     state.source = textarea.value;
     syncSourceSampleSelection();
+    renderWorkloadSampleSelector();
     debouncedInspect();
   });
   return textarea;
@@ -628,6 +994,26 @@ function sampleForKey(key) {
 
 function sampleKeyForSource(source) {
   return SOURCE_SAMPLES.find((sample) => sample.source === source)?.key || CUSTOM_SAMPLE_KEY;
+}
+
+function workloadForKey(key) {
+  return WORKLOAD_SAMPLES.find((sample) => sample.key === key) || null;
+}
+
+function defaultWorkloadForSource(source) {
+  const sourceKey = sampleKeyForSource(source);
+  return WORKLOAD_SAMPLES.find((sample) => sample.sourceSampleKey === sourceKey)
+    || WORKLOAD_SAMPLES[0];
+}
+
+function workloadKeyForText(workload) {
+  return WORKLOAD_SAMPLES.find((sample) => sample.workload === workload)?.key || CUSTOM_WORKLOAD_KEY;
+}
+
+function workloadSamplesForCurrentSource() {
+  const sourceKey = sampleKeyForSource(state.source);
+  const matching = WORKLOAD_SAMPLES.filter((sample) => sample.sourceSampleKey === sourceKey);
+  return matching.length ? matching : WORKLOAD_SAMPLES;
 }
 
 function renderSourceSampleSelector() {
@@ -645,8 +1031,34 @@ function renderSourceSampleSelector() {
   syncSourceSampleSelection();
 }
 
+function renderWorkloadSampleSelector() {
+  workloadSampleEl.innerHTML = "";
+  for (const sample of workloadSamplesForCurrentSource()) {
+    const option = document.createElement("option");
+    option.value = sample.key;
+    option.textContent = sample.label;
+    workloadSampleEl.appendChild(option);
+  }
+  const customOption = document.createElement("option");
+  customOption.value = CUSTOM_WORKLOAD_KEY;
+  customOption.textContent = "custom";
+  workloadSampleEl.appendChild(customOption);
+  syncWorkloadSampleSelection();
+}
+
 function syncSourceSampleSelection() {
   sourceSampleEl.value = sampleKeyForSource(state.source);
+}
+
+function syncWorkloadSampleSelection() {
+  workloadSampleEl.value = workloadKeyForText(state.workload);
+}
+
+function syncWorkloadEditor() {
+  if (workloadInputEl.value !== state.workload) {
+    workloadInputEl.value = state.workload;
+  }
+  syncWorkloadSampleSelection();
 }
 
 function clifFunctionKey(fn) {
@@ -659,15 +1071,6 @@ function selectedClifFunction() {
 
 function defaultClifFunction(functions) {
   return functions.find((fn) => fn.qualname !== "_dp_module_init") || functions[0] || null;
-}
-
-function setClifStatus(message, isError = false) {
-  clifStatusEl.textContent = message;
-  clifStatusEl.style.color = isError ? "#ff8c69" : "var(--ink-1)";
-}
-
-function renderClifText(text) {
-  clifPaneEl.textContent = text;
 }
 
 function normalizeFunctions(payload) {
@@ -685,7 +1088,7 @@ function normalizeFunctions(payload) {
   );
 }
 
-function renderClifSelector() {
+function renderFunctionSelector() {
   const previousValue = state.selectedFunctionKey;
   clifFunctionEl.innerHTML = "";
   if (!state.functions.length) {
@@ -695,6 +1098,7 @@ function renderClifSelector() {
     clifFunctionEl.appendChild(option);
     clifFunctionEl.disabled = true;
     state.selectedFunctionKey = null;
+    updateContextStatus();
     return;
   }
 
@@ -712,6 +1116,7 @@ function renderClifSelector() {
     ? previousValue
     : defaultKey;
   clifFunctionEl.value = state.selectedFunctionKey;
+  updateContextStatus();
 }
 
 function renderSourceEditor(container) {
@@ -726,37 +1131,80 @@ function renderSourceEditor(container) {
   container.appendChild(makeSourceEditor());
 }
 
-function renderStep(container, step) {
-  if (!step) {
-    container.innerHTML = "";
-    const placeholder = document.createElement("div");
-    placeholder.className = "placeholder";
-    placeholder.textContent = "No later pass.";
-    container.appendChild(placeholder);
-    return;
-  }
-  if (step.key === "input_source") {
-    renderSourceEditor(container);
-    return;
-  }
-  container.innerHTML = "";
-  container.appendChild(makeReadonlyStep(step.text));
+function viewDefForKey(key) {
+  return VIEW_DEFS.find((view) => view.key === key) || VIEW_DEFS[0];
 }
 
-function renderPassWindow() {
-  const rightStep = currentRightStep();
+function setViewText(viewKey, text) {
+  state.viewTexts[viewKey] = text || viewDefForKey(viewKey).emptyText;
+  if (state.selectedViewKey === viewKey) {
+    renderSelectedView();
+  }
+}
 
-  leftTitleEl.textContent = "input source";
-  rightTitleEl.textContent = rightStep?.label || "no later pass";
+function setViewStatus(viewKey, message, isError = false) {
+  state.viewStatuses[viewKey] = { message, isError };
+  if (state.selectedViewKey === viewKey) {
+    viewStatusEl.textContent = message;
+    viewStatusEl.style.color = isError ? "#ff8c69" : "var(--ink-1)";
+  }
+}
+
+function updateContextStatus() {
+  const selected = selectedClifFunction();
+  contextStatusEl.textContent = selected
+    ? `${selected.qualname} | fn#${selected.functionId}`
+    : "No lowered function selected";
+}
+
+function renderViewTabs() {
+  for (const tab of viewTabsEl.querySelectorAll(".view-tab")) {
+    const isActive = tab.dataset.view === state.selectedViewKey;
+    tab.classList.toggle("active", isActive);
+    tab.setAttribute("aria-selected", isActive ? "true" : "false");
+  }
+}
+
+function renderSelectedView() {
+  const view = viewDefForKey(state.selectedViewKey);
+  const status = state.viewStatuses[view.key] || {
+    message: view.emptyStatus,
+    isError: false,
+  };
+  viewTitleEl.textContent = view.label;
+  viewStatusEl.textContent = status.message;
+  viewStatusEl.style.color = status.isError ? "#ff8c69" : "var(--ink-1)";
+  typedMetadataEl.hidden = view.key !== "typed";
+  renderViewTabs();
+  renderLinkedBlockText(
+    viewPaneEl,
+    state.viewTexts[view.key] || view.emptyText,
+    `${view.key}-${state.selectedFunctionKey || "module"}`
+  );
+}
+
+function codegenStep() {
+  const laterSteps = state.steps.filter((step) => step.key !== "input_source");
+  return state.steps.find((step) => step.key === "bb_codegen")
+    || state.steps.find((step) => step.key && step.key.includes("codegen"))
+    || laterSteps[laterSteps.length - 1]
+    || null;
+}
+
+function updateCodegenView() {
+  const step = codegenStep();
+  setViewText("codegen", step?.text || "; BlockPy will appear here.");
+  setViewStatus(
+    "codegen",
+    step ? `${step.label || step.key} | ${state.functions.length} function(s)` : "No BlockPy output.",
+    !step
+  );
+}
+
+function renderInputs() {
   renderSourceEditor(leftPaneEl);
   syncSourceSampleSelection();
-  renderStep(rightPaneEl, rightStep);
-
-  prevPassEl.disabled = state.pairStart === 0;
-  nextPassEl.disabled = state.pairStart >= maxPairStart();
-  stepWindowEl.textContent = rightStep
-    ? `${state.pairStart + 1}/${Math.max(1, state.steps.length - 1)}`
-    : "0/0";
+  syncWorkloadEditor();
 }
 
 async function inspectPipeline(source) {
@@ -778,19 +1226,25 @@ async function renderActualClif() {
   const source = state.source;
   const selected = selectedClifFunction();
   if (!source.trim()) {
-    setClifStatus("Select a lowered function to render the post-opt CLIF fed to Cranelift.");
-    renderClifText("; Actual CLIF will appear here.");
+    setViewText("clif", "; CLIF will appear here.");
+    setViewText("vcode", "; VCode will appear here.");
+    setViewStatus("clif", "Enter source to render CLIF.");
+    setViewStatus("vcode", "Enter source to render VCode.");
     return;
   }
   if (!selected) {
-    setClifStatus("No lowered BB functions are available for CLIF rendering.");
-    renderClifText("; No lowered functions available.");
+    setViewText("clif", "; No lowered functions available.");
+    setViewText("vcode", "; No lowered functions available.");
+    setViewStatus("clif", "No lowered function is available.", true);
+    setViewStatus("vcode", "No lowered function is available.", true);
     return;
   }
 
   const requestSerial = ++state.clifRequestSerial;
-  setClifStatus(`Loading actual CLIF for ${selected.qualname}…`);
-  renderClifText("; loading actual CLIF...");
+  setViewStatus("clif", `Loading CLIF for ${selected.qualname}...`);
+  setViewStatus("vcode", `Loading VCode for ${selected.qualname}...`);
+  setViewText("clif", "; loading CLIF...");
+  setViewText("vcode", "; loading VCode...");
   try {
     const response = await fetch("/api/jit_clif", {
       method: "POST",
@@ -811,35 +1265,200 @@ async function renderActualClif() {
     if (!response.ok) {
       throw new Error(payload.error || "jit_clif request failed");
     }
-    renderClifText(payload.clif || "; no CLIF returned");
-    setClifStatus(
+    setViewText("clif", payload.clif || "; no CLIF returned");
+    setViewText("vcode", payload.vcodeDisasm || "; no VCode disassembly returned");
+    setViewStatus(
+      "clif",
       payload.resolved_entry
-        ? `Actual post-opt CLIF | ${payload.resolved_entry}`
-        : `Actual post-opt CLIF | ${selected.qualname}`
+        ? `Post-opt CLIF | ${payload.resolved_entry}`
+        : `Post-opt CLIF | ${selected.qualname}`
+    );
+    setViewStatus(
+      "vcode",
+      payload.resolved_entry
+        ? `VCode | ${payload.resolved_entry}`
+        : `VCode | ${selected.qualname}`
     );
   } catch (error) {
     if (requestSerial !== state.clifRequestSerial) {
       return;
     }
-    setClifStatus("Actual CLIF unavailable", true);
-    renderClifText(
-      `; Unable to load actual CLIF.\n` +
-      `; This view requires the soac_inspector axum server and a function with a full JIT fast path.\n\n` +
-      String(error)
-    );
+    setViewStatus("clif", "CLIF unavailable", true);
+    setViewStatus("vcode", "VCode unavailable", true);
+    const message = `; Unable to load generated code.\n\n${String(error)}`;
+    setViewText("clif", message);
+    setViewText("vcode", message);
   }
 }
 
-function shiftPassWindow(delta) {
-  const next = clampPairStart(state.pairStart + delta);
-  if (next === state.pairStart) {
+function setOptimizationPlaceholders(message) {
+  optimizationSummaryEl.innerHTML = "";
+  optimizationDecisionsEl.innerHTML = "";
+  const placeholder = document.createElement("div");
+  placeholder.className = "placeholder";
+  placeholder.textContent = message;
+  optimizationDecisionsEl.appendChild(placeholder);
+  setViewText("typed", "; Post-opt InstrTyped will appear here.");
+}
+
+function renderOptimizationSummary(summary) {
+  optimizationSummaryEl.innerHTML = "";
+  const items = Array.isArray(summary) ? summary : [];
+  for (const item of items) {
+    const card = document.createElement("div");
+    card.className = "summary-item";
+
+    const label = document.createElement("div");
+    label.className = "summary-label";
+    label.textContent = item?.label || "summary";
+    card.appendChild(label);
+
+    const value = document.createElement("div");
+    value.className = "summary-value";
+    value.textContent = item?.value || "";
+    card.appendChild(value);
+
+    if (item?.detail) {
+      const detail = document.createElement("div");
+      detail.className = "summary-detail";
+      detail.textContent = item.detail;
+      card.appendChild(detail);
+    }
+    optimizationSummaryEl.appendChild(card);
+  }
+}
+
+function formatDecisionSource(source) {
+  if (!source || typeof source !== "object" || !source.instr) {
+    return "";
+  }
+  const parts = [source.instr];
+  if (source.block) {
+    parts.push(`block ${source.block}`);
+  }
+  if (Number.isInteger(source.bodyIndex)) {
+    parts.push(`body ${source.bodyIndex}`);
+  }
+  return parts.join(" | ");
+}
+
+function renderOptimizationDecisions(decisions) {
+  optimizationDecisionsEl.innerHTML = "";
+  const items = Array.isArray(decisions) ? decisions : [];
+  if (!items.length) {
+    const placeholder = document.createElement("div");
+    placeholder.className = "placeholder";
+    placeholder.textContent = "No optimization decisions were returned.";
+    optimizationDecisionsEl.appendChild(placeholder);
     return;
   }
-  state.pairStart = next;
-  state.requestedRightStepKey = currentRightStep()?.key || null;
-  renderPassWindow();
-  updateQueryParams();
+
+  for (const decision of items) {
+    const card = document.createElement("div");
+    card.className = "decision-card";
+
+    const head = document.createElement("div");
+    head.className = "decision-head";
+
+    const left = document.createElement("div");
+    const kind = document.createElement("div");
+    kind.className = "decision-kind";
+    kind.textContent = decision?.kind || "decision";
+    left.appendChild(kind);
+
+    const title = document.createElement("div");
+    title.className = "decision-title";
+    title.textContent = decision?.title || "";
+    left.appendChild(title);
+    head.appendChild(left);
+
+    const status = document.createElement("div");
+    status.className = `decision-status ${decision?.status || ""}`;
+    status.textContent = decision?.status || "unknown";
+    head.appendChild(status);
+    card.appendChild(head);
+
+    if (decision?.detail) {
+      const detail = document.createElement("div");
+      detail.className = "decision-detail";
+      detail.textContent = decision.detail;
+      card.appendChild(detail);
+    }
+
+    const source = formatDecisionSource(decision?.source);
+    if (source) {
+      const sourceEl = document.createElement("div");
+      sourceEl.className = "decision-source";
+      sourceEl.textContent = source;
+      card.appendChild(sourceEl);
+    }
+
+    if (decision?.metadata && Object.keys(decision.metadata).length) {
+      const metadata = document.createElement("div");
+      metadata.className = "decision-metadata";
+      metadata.textContent = JSON.stringify(decision.metadata);
+      card.appendChild(metadata);
+    }
+
+    optimizationDecisionsEl.appendChild(card);
+  }
 }
+
+async function renderOptimizationExplain() {
+  const source = state.source;
+  const selected = selectedClifFunction();
+  if (!source.trim()) {
+    setViewStatus("typed", "Enter source to inspect typed metadata.");
+    setOptimizationPlaceholders("No source is loaded.");
+    return;
+  }
+  if (!selected) {
+    setViewStatus("typed", "No lowered function is available for typed metadata.", true);
+    setOptimizationPlaceholders("No lowered functions available.");
+    return;
+  }
+
+  const requestSerial = ++state.explainRequestSerial;
+  setViewStatus("typed", `Loading typed metadata for ${selected.qualname}...`);
+  setViewText("typed", "; loading post-opt InstrTyped...");
+  try {
+    const response = await fetch("/api/optimization_explain", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        source,
+        workload: state.workload,
+        functionId: selected.functionId,
+      }),
+    });
+    const payload = await response.json();
+    if (requestSerial !== state.explainRequestSerial) {
+      return;
+    }
+    if (!response.ok) {
+      throw new Error(payload.error || "optimization_explain request failed");
+    }
+    renderOptimizationSummary(payload.summary);
+    renderOptimizationDecisions(payload.decisions);
+    setViewText("typed", payload.instrTyped || "; no InstrTyped render returned");
+    const workloadStatus = payload.workload?.status || "unknown workload";
+    const profileStatus = payload.profile?.status || "unknown profile";
+    setViewStatus("typed", `${selected.qualname} | workload ${workloadStatus} | profile ${profileStatus}`);
+  } catch (error) {
+    if (requestSerial !== state.explainRequestSerial) {
+      return;
+    }
+    setViewStatus("typed", "Typed metadata unavailable", true);
+    setOptimizationPlaceholders(String(error));
+    setViewText("typed", `; Unable to load post-opt InstrTyped.\n\n${String(error)}`);
+  }
+}
+
+const debouncedExplain = debounce(() => {
+  void renderOptimizationExplain();
+}, 200);
 
 async function inspectNow() {
   const source = state.source;
@@ -851,13 +1470,14 @@ async function inspectNow() {
         text: "",
       },
     ];
-    state.pairStart = 0;
-    state.requestedRightStepKey = null;
     state.functions = [];
     state.selectedFunctionKey = null;
-    renderPassWindow();
-    renderClifSelector();
+    renderInputs();
+    renderFunctionSelector();
+    updateCodegenView();
     await renderActualClif();
+    await renderOptimizationExplain();
+    renderSelectedView();
     updateQueryParams();
     setStatus("ready");
     return;
@@ -867,13 +1487,12 @@ async function inspectNow() {
     const payload = await inspectPipeline(source);
     state.steps = Array.isArray(payload.steps) ? payload.steps : [];
     state.functions = normalizeFunctions(payload.functions);
-    const requestedPairStart = pairStartForRightStepKey(state.requestedRightStepKey);
-    state.pairStart =
-      requestedPairStart === null ? clampPairStart(state.pairStart) : requestedPairStart;
-    state.requestedRightStepKey = currentRightStep()?.key || null;
-    renderPassWindow();
-    renderClifSelector();
+    renderInputs();
+    renderFunctionSelector();
+    updateCodegenView();
+    renderSelectedView();
     await renderActualClif();
+    await renderOptimizationExplain();
     updateQueryParams();
     setStatus(`ok | ${Math.max(0, state.steps.length - 1)} tracked pass${state.steps.length === 2 ? "" : "es"}`);
   } catch (error) {
@@ -889,13 +1508,14 @@ async function inspectNow() {
         text: String(error),
       },
     ];
-    state.pairStart = 0;
-    state.requestedRightStepKey = null;
     state.functions = [];
     state.selectedFunctionKey = null;
-    renderPassWindow();
-    renderClifSelector();
+    renderInputs();
+    renderFunctionSelector();
+    updateCodegenView();
     await renderActualClif();
+    await renderOptimizationExplain();
+    renderSelectedView();
     updateQueryParams();
     setStatus("transform error", true);
   }
@@ -908,11 +1528,15 @@ const debouncedInspect = debounce(() => {
 async function run() {
   const params = new URLSearchParams(window.location.search);
   state.source = params.get("src") || DEFAULT_SAMPLE.source;
-  state.requestedRightStepKey = params.get("pass");
+  state.workload = params.get("workload") || defaultWorkloadForSource(state.source).workload;
+  state.selectedViewKey = VIEW_DEFS.some((view) => view.key === params.get("view"))
+    ? params.get("view")
+    : "codegen";
   renderSourceSampleSelector();
+  renderWorkloadSampleSelector();
+  renderInputs();
+  renderSelectedView();
 
-  prevPassEl.addEventListener("click", () => shiftPassWindow(-1));
-  nextPassEl.addEventListener("click", () => shiftPassWindow(1));
   sourceSampleEl.addEventListener("change", () => {
     if (sourceSampleEl.value === CUSTOM_SAMPLE_KEY) {
       const textarea = leftPaneEl.querySelector("textarea");
@@ -924,24 +1548,47 @@ async function run() {
       return;
     }
     state.source = sample.source;
-    renderSourceEditor(leftPaneEl);
+    state.workload = defaultWorkloadForSource(state.source).workload;
+    renderWorkloadSampleSelector();
+    renderInputs();
     void inspectNow();
   });
-  clifFunctionEl.addEventListener("change", () => {
-    state.selectedFunctionKey = clifFunctionEl.value || null;
-    void renderActualClif();
-  });
-  window.addEventListener("keydown", (event) => {
-    if (isEditableTarget(event.target)) {
+  workloadSampleEl.addEventListener("change", () => {
+    if (workloadSampleEl.value === CUSTOM_WORKLOAD_KEY) {
+      workloadInputEl.focus();
       return;
     }
-    if (event.key === "ArrowRight") {
-      event.preventDefault();
-      shiftPassWindow(1);
-    } else if (event.key === "ArrowLeft") {
-      event.preventDefault();
-      shiftPassWindow(-1);
+    const sample = workloadForKey(workloadSampleEl.value);
+    if (!sample) {
+      return;
     }
+    state.workload = sample.workload;
+    syncWorkloadEditor();
+    void renderOptimizationExplain();
+    updateQueryParams();
+  });
+  viewTabsEl.addEventListener("click", (event) => {
+    const tab = event.target.closest(".view-tab");
+    if (!tab) {
+      return;
+    }
+    state.selectedViewKey = tab.dataset.view || "codegen";
+    renderSelectedView();
+    updateQueryParams();
+  });
+  workloadInputEl.addEventListener("input", () => {
+    state.workload = workloadInputEl.value;
+    syncWorkloadSampleSelection();
+    debouncedExplain();
+    updateQueryParams();
+  });
+  window.addEventListener("hashchange", applyLinkedBlockHighlight);
+  clifFunctionEl.addEventListener("change", () => {
+    state.selectedFunctionKey = clifFunctionEl.value || null;
+    updateContextStatus();
+    renderSelectedView();
+    void renderActualClif();
+    void renderOptimizationExplain();
   });
 
   await inspectNow();
