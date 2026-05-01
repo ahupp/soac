@@ -120,6 +120,32 @@ optimization attempts made by Codex agents. Keep entries succinct: what
 changed or was tried, which jj change id carried it when landed, the
 benchmarked throughput delta, and the headline pre/post numbers.
 
+## 2026-05-01 - Land nqueens generator instantiation series
+
+- jj change ids: `mkrvspvk`, `xxpnqpvv`, `yuonmzvz`, `xnpxqulv`, `wlpwtzzw`
+- summary: The nqueens pyperformance work remaps exact-int plans across inlined
+  direct calls, caches eager JIT attachment for nested functions, caches
+  function instantiation templates, avoids capture dict construction for the
+  common tuple-capture path, and leaves original named generators on CPython
+  vectorcall.
+- runtime: `7.91 s` to `104 ms` in the measured apply-mode nqueens smoke run,
+  about `75.8x` faster than the starting SOAC result and about `1.11x` slower
+  than stock CPython's `94.2 ms` result
+- measured progression:
+  - stock CPython: `nqueens-stock.json`, `94.2 ms`
+  - starting SOAC apply result: `nqueens-soac-fixed.json`, `7.91 s`
+  - nested-function/template cache: `nqueens-soac-template.json`, `3.63 s`
+  - capture-tuple fast path: `nqueens-soac-capture-fast-apply2.json`, `2.73 s`
+  - final named-generator fallback: `nqueens-soac-cpython-named-generators.json`,
+    `104 ms`
+- notes: The final kept result is the named-generator-only CPython vectorcall
+  fallback. Broad CPython vectorcall for genexprs reached stock-like timings in
+  one-off runs, but was narrowed after it broke
+  `tests/test_regression_genexpr_iterator_semantics.py::test_genexpr_requires_iterator`.
+  Other side experiments, including eager module direct-entry compilation,
+  skipping redundant code-metadata replacement, and trusting generated capture
+  order, either regressed or did not beat the kept capture/template path.
+
 ## 2026-04-27 - Land Cranelift/refcount/runtime-symbol cleanup bundle
 
 - jj change ids: `ylklnnkt`, `owkmsrwk`, `snnysky`, `noptkkun`, `kxsstyll`
