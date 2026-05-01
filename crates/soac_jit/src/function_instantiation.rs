@@ -304,6 +304,77 @@ fn build_capture_map<'py>(
     Ok((captured_names, closure_values))
 }
 
+fn unicode_equals_str(obj: &Bound<'_, PyAny>, expected: &str) -> PyResult<bool> {
+    if unsafe { ffi::PyUnicode_Check(obj.as_ptr()) } == 0 {
+        return Err(PyTypeError::new_err("expected capture name to be a string"));
+    }
+    let mut len = 0;
+    let ptr = unsafe { ffi::PyUnicode_AsUTF8AndSize(obj.as_ptr(), &mut len) };
+    if ptr.is_null() {
+        return Err(PyErr::fetch(obj.py()));
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), len as usize) };
+    Ok(bytes == expected.as_bytes())
+}
+
+fn code_freevars_match_names(code: &Bound<'_, PyAny>, expected_names: &[String]) -> PyResult<bool> {
+    let freevars_obj = code.getattr("co_freevars")?;
+    let freevars = freevars_obj.cast::<PyTuple>()?;
+    if freevars.len() != expected_names.len() {
+        return Ok(false);
+    }
+    for (index, expected_name) in expected_names.iter().enumerate() {
+        let item = unsafe { ffi::PyTuple_GetItem(freevars.as_ptr(), index as ffi::Py_ssize_t) };
+        if item.is_null() {
+            return Err(PyErr::fetch(code.py()));
+        }
+        let item = unsafe { Bound::from_borrowed_ptr(code.py(), item) };
+        if !unicode_equals_str(&item, expected_name)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn build_ordered_capture_values<'py>(
+    py: Python<'py>,
+    captures: &Bound<'py, PyAny>,
+    expected_names: &[String],
+) -> PyResult<Option<Vec<Bound<'py, PyAny>>>> {
+    let captures = captures.cast::<PyTuple>().map_err(|_| {
+        PyTypeError::new_err(format!(
+            "bb captures must be a tuple, got {:?}",
+            captures.get_type()
+        ))
+    })?;
+    if captures.len() != expected_names.len() {
+        return Ok(None);
+    }
+    let mut values = Vec::with_capacity(expected_names.len());
+    for (index, expected_name) in expected_names.iter().enumerate() {
+        let item = unsafe { ffi::PyTuple_GetItem(captures.as_ptr(), index as ffi::Py_ssize_t) };
+        if item.is_null() {
+            return Err(PyErr::fetch(py));
+        }
+        let item = unsafe { Bound::from_borrowed_ptr(py, item) };
+        let item = item
+            .cast::<PyTuple>()
+            .map_err(|_| PyTypeError::new_err(format!("invalid bb capture payload: {item:?}")))?;
+        if item.len() != 2 {
+            return Err(PyTypeError::new_err(format!(
+                "invalid bb capture payload: {item:?}"
+            )));
+        }
+        let name = item.get_item(0)?;
+        if !unicode_equals_str(&name, expected_name)? {
+            return Ok(None);
+        }
+        let value = item.get_item(1)?;
+        values.push(normalize_class_cell_capture(expected_name.as_str(), value)?);
+    }
+    Ok(Some(values))
+}
+
 fn normalize_class_cell_capture<'py>(
     name: &str,
     value: Bound<'py, PyAny>,
@@ -410,6 +481,78 @@ fn make_lazy_clif_entry<'py>(
         func.setattr("__name__", function_name)?;
         Ok(func)
     }
+}
+
+fn build_closure_shaped_entry_from_ordered_captures<'py>(
+    py: Python<'py>,
+    dp: &Bound<'py, PyModule>,
+    function: &BlockPyFunction<BlockPyModuleShape>,
+    module_globals: &Bound<'py, PyAny>,
+    qualname: &str,
+    captured_names: &[String],
+    captured_values: &[Bound<'py, PyAny>],
+    original_code: Option<&Bound<'py, PyAny>>,
+) -> PyResult<Bound<'py, PyAny>> {
+    debug_assert!(!captured_names.is_empty());
+    debug_assert_eq!(captured_names.len(), captured_values.len());
+    let code = if let Some(code) = original_code {
+        if code_freevars_match_names(code, captured_names)? {
+            code.clone()
+        } else {
+            let (is_async, is_generator) = match function.lowered_kind() {
+                FunctionKind::Function => (false, false),
+                FunctionKind::Coroutine => (true, false),
+                FunctionKind::Generator => (false, true),
+                FunctionKind::AsyncGenerator => (true, true),
+            };
+            dp.getattr("code_with_freevars")?.call1((
+                tuple_from_strings(py, captured_names)?,
+                is_async,
+                is_generator,
+            ))?
+        }
+    } else {
+        let (is_async, is_generator) = match function.lowered_kind() {
+            FunctionKind::Function => (false, false),
+            FunctionKind::Coroutine => (true, false),
+            FunctionKind::Generator => (false, true),
+            FunctionKind::AsyncGenerator => (true, true),
+        };
+        dp.getattr("code_with_freevars")?.call1((
+            tuple_from_strings(py, captured_names)?,
+            is_async,
+            is_generator,
+        ))?
+    };
+    let mut closure_cells = Vec::with_capacity(captured_values.len());
+    for value in captured_values {
+        if is_cell_object(value.as_ptr()) {
+            closure_cells.push(value.clone().unbind());
+        } else {
+            let cell = unsafe { PyCell_New(value.as_ptr()) };
+            if cell.is_null() {
+                return Err(PyErr::fetch(py));
+            }
+            closure_cells.push(unsafe { Bound::from_owned_ptr(py, cell) }.unbind());
+        }
+    }
+    let closure = tuple_from_owned_objects(py, closure_cells)?;
+    let qualname = PyString::new(py, qualname);
+    let func = unsafe {
+        let ptr = ffi::PyFunction_NewWithQualName(
+            code.as_ptr(),
+            module_globals.as_ptr(),
+            qualname.as_ptr(),
+        );
+        if ptr.is_null() {
+            return Err(PyErr::fetch(py));
+        }
+        Bound::from_owned_ptr(py, ptr)
+    };
+    if unsafe { ffi::PyFunction_SetClosure(func.as_ptr(), closure.as_ptr()) } != 0 {
+        return Err(PyErr::fetch(py));
+    }
+    Ok(func.into_any())
 }
 
 fn build_closure_shaped_entry<'py>(
@@ -522,6 +665,57 @@ pub fn instantiate_bb_function(
     annotate_fn: &Bound<'_, PyAny>,
     module_runtime: &ModuleRuntimeContext,
 ) -> PyResult<Py<PyAny>> {
+    instantiate_bb_function_inner(
+        py,
+        dp,
+        module_name,
+        function,
+        None,
+        captures,
+        param_defaults,
+        module_globals,
+        annotate_fn,
+        module_runtime,
+    )
+}
+
+fn instantiate_bb_function_with_template(
+    py: Python<'_>,
+    dp: &Bound<'_, PyModule>,
+    module_name: &str,
+    function_template: &FunctionInstantiationTemplate,
+    captures: &Bound<'_, PyAny>,
+    param_defaults: &Bound<'_, PyAny>,
+    module_globals: &Bound<'_, PyAny>,
+    annotate_fn: &Bound<'_, PyAny>,
+    module_runtime: &ModuleRuntimeContext,
+) -> PyResult<Py<PyAny>> {
+    instantiate_bb_function_inner(
+        py,
+        dp,
+        module_name,
+        function_template.function(),
+        Some(function_template),
+        captures,
+        param_defaults,
+        module_globals,
+        annotate_fn,
+        module_runtime,
+    )
+}
+
+fn instantiate_bb_function_inner(
+    py: Python<'_>,
+    dp: &Bound<'_, PyModule>,
+    module_name: &str,
+    function: &BlockPyFunction<BlockPyModuleShape>,
+    function_template: Option<&FunctionInstantiationTemplate>,
+    captures: &Bound<'_, PyAny>,
+    param_defaults: &Bound<'_, PyAny>,
+    module_globals: &Bound<'_, PyAny>,
+    annotate_fn: &Bound<'_, PyAny>,
+    module_runtime: &ModuleRuntimeContext,
+) -> PyResult<Py<PyAny>> {
     let keep_source_runtime_helper = module_name == "soac.runtime"
         && module_runtime
             .shared_module_state_owner
@@ -534,6 +728,7 @@ pub fn instantiate_bb_function(
         captures,
         module_globals,
         module_runtime,
+        function_template,
         function.names.display_name.as_str(),
         function.names.qualname.as_str(),
     )?;
@@ -588,14 +783,48 @@ fn instantiate_closure_backed_entry<'py>(
     captures: &Bound<'py, PyAny>,
     module_globals: &Bound<'py, PyAny>,
     module_runtime: &ModuleRuntimeContext,
+    function_template: Option<&FunctionInstantiationTemplate>,
     entry_name: &str,
     qualname: &str,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let (captured_names, closure_values) = build_capture_map(py, captures)?;
     let original_code = module_runtime
         .shared_module_state_owner
         .lookup_original_code(function.function_id)
         .map(|code| code.bind(py));
+    if let Some(function_template) = function_template {
+        let captured_names = function_template.capture_names();
+        if let Some(captured_values) = build_ordered_capture_values(py, captures, captured_names)? {
+            let entry = if captured_names.is_empty() {
+                let original_code_without_freevars = match original_code.as_ref() {
+                    Some(code) if code_freevars_match_names(code.as_any(), captured_names)? => {
+                        Some(code.as_any())
+                    }
+                    _ => None,
+                };
+                make_lazy_clif_entry(
+                    py,
+                    dp,
+                    entry_name,
+                    module_globals,
+                    original_code_without_freevars,
+                )?
+            } else {
+                build_closure_shaped_entry_from_ordered_captures(
+                    py,
+                    dp,
+                    function,
+                    module_globals,
+                    qualname,
+                    captured_names,
+                    captured_values.as_slice(),
+                    original_code.as_ref().map(|code| code.as_any()),
+                )?
+            };
+            return Ok(entry);
+        }
+    }
+
+    let (captured_names, closure_values) = build_capture_map(py, captures)?;
     let entry = if captured_names.is_empty() {
         let original_code_without_freevars = match original_code.as_ref() {
             Some(code) => {
@@ -729,11 +958,11 @@ fn instantiate_shared_function(
     let module_name = shared_state.module_name.clone();
     let module_runtime =
         module_runtime_from_shared_state(compile_session, shared_state, module_globals);
-    let func = instantiate_bb_function(
+    let func = instantiate_bb_function_with_template(
         py,
         &dp,
         &module_name,
-        function,
+        function_template.as_ref(),
         captures,
         param_defaults,
         module_globals,

@@ -399,6 +399,7 @@ impl DirectArgBindingPlan {
 
 pub(crate) struct FunctionInstantiationTemplate {
     function: Arc<BlockPyFunction<BlockPyModuleShape>>,
+    capture_names: Box<[String]>,
     runtime_data_layout: jit::FunctionRuntimeDataLayout,
     binding_plan: DirectArgBindingPlan,
     entry_plan: jit::RuntimeFunctionEntryPlan,
@@ -408,11 +409,24 @@ impl FunctionInstantiationTemplate {
     pub(crate) fn from_function(
         function: &BlockPyFunction<BlockPyModuleShape>,
     ) -> Result<Self, String> {
+        let capture_names = function
+            .storage_layout
+            .as_ref()
+            .map(|layout| {
+                layout
+                    .freevars
+                    .iter()
+                    .map(|slot| slot.logical_name.clone())
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice()
+            })
+            .unwrap_or_default();
         let runtime_data_layout = jit::FunctionRuntimeDataLayout::from_function(function);
         let binding_plan = DirectArgBindingPlan::from_function(function);
         let entry_plan = jit::RuntimeFunctionEntryPlan::from_function(function)?;
         Ok(Self {
             function: Arc::new(function.clone()),
+            capture_names,
             runtime_data_layout,
             binding_plan,
             entry_plan,
@@ -421,6 +435,10 @@ impl FunctionInstantiationTemplate {
 
     pub(crate) fn function(&self) -> &BlockPyFunction<BlockPyModuleShape> {
         self.function.as_ref()
+    }
+
+    pub(crate) fn capture_names(&self) -> &[String] {
+        &self.capture_names
     }
 
     fn runtime_data_layout(&self) -> &jit::FunctionRuntimeDataLayout {
