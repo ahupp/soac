@@ -653,6 +653,7 @@ pub enum TypedInlineUnsupportedReason {
     JumpArgs,
     ExceptionEdge,
     NonReturnTerm,
+    ClosureStorage,
 }
 
 #[derive(Clone)]
@@ -1295,6 +1296,9 @@ fn build_single_block_typed_inline_fragment_to_target(
         .storage_layout
         .as_ref()
         .ok_or(TypedInlineUnsupportedReason::MissingCalleeStorageLayout)?;
+    if typed_inline_callee_has_closure_storage(callee_layout) {
+        return Err(TypedInlineUnsupportedReason::ClosureStorage);
+    }
     for location in value_bindings.keys().copied() {
         if location.slot() as usize >= callee_layout.stack_slots().len() {
             return Err(TypedInlineUnsupportedReason::MissingCalleeLocal(location));
@@ -1359,6 +1363,9 @@ fn build_multi_block_typed_inline_fragment_to_target(
         .storage_layout
         .as_ref()
         .ok_or(TypedInlineUnsupportedReason::MissingCalleeStorageLayout)?;
+    if typed_inline_callee_has_closure_storage(callee_layout) {
+        return Err(TypedInlineUnsupportedReason::ClosureStorage);
+    }
     for location in value_bindings.keys().copied() {
         if location.slot() as usize >= callee_layout.stack_slots().len() {
             return Err(TypedInlineUnsupportedReason::MissingCalleeLocal(location));
@@ -1424,6 +1431,14 @@ fn build_multi_block_typed_inline_fragment_to_target(
         blocks,
         instr_id_mappings: instr_id_remapper.finish(),
     })
+}
+
+fn typed_inline_callee_has_closure_storage(
+    storage_layout: &soac_core::block_py::StorageLayout,
+) -> bool {
+    !storage_layout.freevars.is_empty()
+        || !storage_layout.cellvars.is_empty()
+        || !storage_layout.runtime_cells.is_empty()
 }
 
 fn allocate_typed_inline_locals(
@@ -2672,6 +2687,57 @@ def caller(a, b):\n    return add(a, b)\n",
         }
         assert_eq!(counter.typed_calls, 0);
         assert_eq!(counter.guarded_callable_calls, 1);
+    }
+
+    #[test]
+    fn typed_direct_call_inlining_skips_closure_callees() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            "def outer(value):\n    strings = []\n    def append(item):\n        strings.append(item)\n    append(value)\n    return strings\n",
+        )
+        .expect("source should lower");
+        let append_id =
+            blockpy_function_id_by_qualname(&lowered.blockpy_module, "outer.<locals>.append");
+        let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
+        let call_id;
+        {
+            let outer = typed_function_by_qualname_mut(&mut typed, "outer");
+            call_id = first_typed_call_instr_id(outer);
+            replace_first_typed_call_access(
+                outer,
+                TypedCallAccessPlan::GuardedCallable {
+                    function_guards: vec![TypedDirectFunctionCallGuard {
+                        function_id: append_id,
+                        arg_plan: TypedDirectCallArgPlan {
+                            sources: vec![TypedDirectCallArgSource::Provided(0)],
+                        },
+                    }],
+                },
+            );
+            lower_typed_function_call_access_plan_instrs(outer);
+        }
+
+        let callee_module = typed.clone();
+        let outer = typed_function_by_qualname_mut(&mut typed, "outer");
+        let original_storage_layout = outer.storage_layout.clone();
+        let stats = inline_typed_function_direct_call_stores(
+            outer,
+            &callee_module,
+            &HashMap::new(),
+            &HashMap::from([(
+                call_id,
+                vec![(
+                    append_id,
+                    TypedDirectCallArgPlan {
+                        sources: vec![TypedDirectCallArgSource::Provided(0)],
+                    },
+                )],
+            )]),
+        );
+
+        assert_eq!(stats.rewritten_stores, 0);
+        assert_eq!(stats.rewritten_effect_only_calls, 0);
+        assert!(stats.skipped_candidates > 0);
+        assert_eq!(outer.storage_layout, original_storage_layout);
     }
 
     #[test]

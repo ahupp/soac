@@ -360,7 +360,7 @@ fn build_blockpy_storage_layout_classifies_capture_local_and_runtime_cells() {
             (
                 "_dp_try_exc_0",
                 "_dp_cell__dp_try_exc_0",
-                &ClosureInit::EmptyCell
+                &ClosureInit::RuntimeNone
             ),
         ]
     );

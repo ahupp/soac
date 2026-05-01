@@ -1,5 +1,10 @@
+---
+title: "yield_from"
+---
+
 # yield_from
 
+```python
 def gen():
     yield from it
 
@@ -104,3 +109,4 @@ def _dp_bb__dp_module_init_start(_dp_args_ptr):
     return __dp__.ret(None)
 _dp_module_init = __dp__.def_fn(_dp_bb__dp_module_init_start, "_dp_module_init", "_dp_module_init", (), (), __name__)
 del _dp_bb__dp_module_init_start
+```

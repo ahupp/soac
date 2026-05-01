@@ -1,3 +1,7 @@
+---
+title: "Predecoded Interpreter Plan"
+---
+
 # Predecoded Interpreter Plan
 
 The entry/deopt interpreter currently executes directly from the rich

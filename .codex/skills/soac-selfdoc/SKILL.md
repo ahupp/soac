@@ -46,8 +46,12 @@ python3 .codex/skills/soac-selfdoc/scripts/crate_dependency_graph.py --out doc/c
 dot -Tsvg doc/crate_dependencies.dot -o doc/crate_dependencies.svg
 ```
 
-The default graph includes normal and build workspace dependencies. Use
-`--include-dev` only when the diagram intentionally needs test fixture edges.
+The default graph includes normal workspace dependencies only and hides
+`soac_config` and `soac_macros`, which are cross-cutting helper crates that add
+noise to the architectural view. Crates with no remaining visible dependency
+edges are omitted. Use `--include-build`, `--include-dev`, or
+`--include-hidden` only when the diagram intentionally needs those edges or
+nodes.
 
 If the script fails, fall back to:
 

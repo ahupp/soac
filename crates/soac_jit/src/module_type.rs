@@ -1199,9 +1199,8 @@ pub unsafe fn watch_split_keys_for_type(type_obj: *mut ffi::PyObject) -> Result<
 
 #[derive(Default)]
 struct ProfileTypeRegistry {
-    next_id: u64,
     by_type: HashMap<usize, u64>,
-    entries: Vec<CounterDumpTypeTableEntry>,
+    entries_by_id: HashMap<u64, CounterDumpTypeKey>,
 }
 
 impl ProfileTypeRegistry {
@@ -1209,23 +1208,48 @@ impl ProfileTypeRegistry {
         if let Some(type_id) = self.by_type.get(&owner_ptr).copied() {
             return Ok(type_id);
         }
-        let type_id = self.next_id.max(1);
-        self.next_id = type_id
-            .checked_add(1)
-            .ok_or_else(|| PyRuntimeError::new_err("profile type id space exhausted"))?;
+        let type_id = stable_profile_type_id(&key);
+        if let Some(existing) = self.entries_by_id.get(&type_id)
+            && existing != &key
+        {
+            return Err(PyRuntimeError::new_err(format!(
+                "stable profile type id collision for {}.{} and {}.{}",
+                existing.module_name, existing.qualname, key.module_name, key.qualname
+            )));
+        }
         self.by_type.insert(owner_ptr, type_id);
-        self.entries
-            .push(CounterDumpTypeTableEntry { type_id, key });
+        self.entries_by_id.entry(type_id).or_insert(key);
         Ok(type_id)
     }
 
     fn entries_for_ids(&self, used_ids: &HashSet<u64>) -> Vec<CounterDumpTypeTableEntry> {
-        self.entries
+        let mut entries = self
+            .entries_by_id
             .iter()
-            .filter(|entry| used_ids.contains(&entry.type_id))
-            .cloned()
-            .collect()
+            .filter(|(type_id, _)| used_ids.contains(type_id))
+            .map(|(type_id, key)| CounterDumpTypeTableEntry {
+                type_id: *type_id,
+                key: key.clone(),
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.type_id);
+        entries
     }
+}
+
+fn stable_profile_type_id(key: &CounterDumpTypeKey) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in key
+        .module_name
+        .as_bytes()
+        .iter()
+        .chain(std::iter::once(&0))
+        .chain(key.qualname.as_bytes().iter())
+    {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash.max(1)
 }
 
 static PROFILE_TYPE_REGISTRY: OnceLock<Mutex<ProfileTypeRegistry>> = OnceLock::new();
@@ -2011,6 +2035,26 @@ events = [(Point, 'x', 0), (Point, 'y', 1)]
             assert_eq!(type_table[0].key.module_name, "type_event_test");
             assert_eq!(type_table[0].key.qualname, "Point");
         });
+    }
+
+    #[test]
+    fn profile_type_ids_are_stable_across_registries() {
+        let type_key = CounterDumpTypeKey {
+            module_name: "__main__".to_string(),
+            qualname: "benchmark_reduce.<locals>.C".to_string(),
+        };
+        let mut first_registry = ProfileTypeRegistry::default();
+        let mut second_registry = ProfileTypeRegistry::default();
+
+        let first_id = first_registry
+            .id_for_type(0x1000, type_key.clone())
+            .expect("first registry should assign an id");
+        let second_id = second_registry
+            .id_for_type(0x2000, type_key)
+            .expect("second registry should assign the same id");
+
+        assert_eq!(first_id, second_id);
+        assert_ne!(first_id, 0);
     }
 
     #[test]

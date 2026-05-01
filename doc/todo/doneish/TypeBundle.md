@@ -1,3 +1,7 @@
+---
+title: "TypeBundle"
+---
+
 
 I'd like to merge the CfgModule struct into BlockPyModule.  To simplify the typing, lets use a trait with associated types.
 

@@ -1,3 +1,7 @@
+---
+title: "Result-Demand Lowering"
+---
+
 # Result-Demand Lowering
 
 ## Problem

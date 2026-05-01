@@ -1,3 +1,7 @@
+---
+title: "Polymorphic Inline Caches"
+---
+
 # Polymorphic Inline Caches
 
 ## Article Spark

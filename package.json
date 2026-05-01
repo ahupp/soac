@@ -1,0 +1,13 @@
+{
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "docs:build": "astro build",
+    "docs:serve": "astro dev"
+  },
+  "dependencies": {
+    "@astrojs/starlight": "0.38.4",
+    "astro": "6.2.1"
+  },
+  "devDependencies": {}
+}

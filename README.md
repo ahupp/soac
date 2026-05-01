@@ -183,17 +183,19 @@ benchmark artifacts.
 
 ## Documentation Site
 
-The Markdown files under `doc/` can be rendered as a local MkDocs Material
+The Markdown files under `doc/` can be rendered as a local Astro Starlight
 site:
 
 ```
+$ just docs-install
 $ just docs-build
 $ just docs-serve
 ```
 
+`docs-install` installs the Node dependencies declared in `package.json`.
 `docs-build` writes the generated site to ignored `work/docs-site/`.
-`docs-serve` serves it at `127.0.0.1:8001` by default; pass a dev address to
-override it, for example `just docs-serve 0.0.0.0:9000`.
+`docs-serve` serves it on `0.0.0.0:8001` by default; pass a port to override
+it, for example `just docs-serve 9000`.
 
 
 
@@ -414,6 +416,38 @@ tree, with pystone benchmark runs writing to `work/bench/`.
   rerun only the verify pass to produce `verify.bin`, then add the same
   deep-profile artifacts without rerunning the profile pass.
 
+- `just pyperformance [stock|soac|soac-single] [output] [benchmarks] [extra pyperformance run args...]`
+  Run the pyperformance suite against the vendored CPython executable. The
+  `stock` mode runs plain CPython. The default `soac` mode builds the release
+  SOAC extension, runs pyperformance once with `SOAC_OPT_MODE=profile`, then
+  runs it again with `SOAC_OPT_MODE=apply`; the requested `output` is the
+  apply result, and the profile pyperf result is written beside it with a
+  `.profile.json` suffix. Use `soac-single` for one-pass debugging; it honors
+  the caller's `SOAC_OPT_MODE` and defaults to `none`.
+  SOAC modes inject a recipe-local `sitecustomize` into pyperformance worker
+  subprocesses and install `soac.import_hook` before benchmark imports. When
+  `output` is omitted, final results are written to
+  `work/pyperformance/{stock,soac}-<timestamp>.json`, and pyperformance's own
+  benchmark virtual environments are created under `work/pyperformance/venv/`.
+  When `benchmarks` is omitted, pyperformance uses its default suite selection;
+  pass a comma-separated pyperformance benchmark list such as
+  `json_dumps,richards` for a narrower run. The recipe defaults pyperf sampling
+  to `--fast --min-time=0.05` so comparison runs collect multiple values without
+  paying the full default pyperf runtime. Extra arguments are passed through to
+  `pyperformance run`; `--rigorous` and `--debug-single-value` replace the
+  default sample mode, and `--min-time=<seconds>` overrides the default
+  calibration window. SOAC modes default `SOAC_MODULE_ENABLED` to the
+  pyperformance benchmark source tree so the harness, pip, and pyperf internals
+  stay on stock CPython unless the caller overrides the allow-list. They also
+  default `SOAC_BACKGROUND_JIT=0`, because pyperformance uses short worker
+  subprocesses where background compiler threads can outlive interpreter
+  shutdown, and default `SOAC_COMPILE_MODE=eager` because lazy first-call
+  compilation can block pyperformance's single worker loop. In SOAC modes, the
+  recipe treats `SOAC_WORK_DIR` as a root and the worker wrapper writes each
+  benchmark invocation's counters, logs, and module cache under a stable
+  per-script-and-variant subdirectory so full-suite runs can profile many
+  `__main__` scripts without source-hash or type-observation collisions.
+
 - `just precompile-shared-library counters=<profile.bin> out=<lib.so>`
   Offline precompile a counter-referenced set of cached BlockPy modules into
   relocatable object files and link them into a shared library. The counter
@@ -447,6 +481,16 @@ tree, with pystone benchmark runs writing to `work/bench/`.
   choose the CPU core that the benchmark recipes pin to with `taskset`.
   The default is empty, which runs without CPU pinning. Set an explicit
   CPU core when you want lower scheduler or heterogeneous-core variance.
+
+- `PYPERFORMANCE_AFFINITY=<cpu-list>` / `PYPERFORMANCE_TIMEOUT=<seconds>`
+  Optional `just pyperformance` pass-throughs to pyperformance's `--affinity`
+  and `--timeout` options. If `PYPERFORMANCE_AFFINITY` is unset, the recipe uses
+  `BENCHMARK_CPU` as the affinity list when that existing benchmark knob is set.
+
+- `PYPERFORMANCE_INHERIT_ENV_EXTRA=NAME[,NAME...]`
+  Adds environment variables to the `--inherit-environ` list used by
+  `just pyperformance mode=soac`. The recipe already inherits the SOAC runtime
+  variables needed by the transformed benchmark workers.
 
 - `BENCHMARK_CONSTANT_CLOCKS=0|1`
   In [scripts/run_benchmark_with_cpu_mode.sh](/home/adam/project/soac-profile/scripts/run_benchmark_with_cpu_mode.sh),

@@ -1,11 +1,12 @@
-use crate::jit::ProcessJitEngine;
+use crate::jit::{PlannedOptimizationInputs, ProcessJitEngine};
 use crate::module_type::SharedModuleState;
-use soac_config::SoacEnvConfig;
+use soac_config::{SoacEnvConfig, SpecializationMode};
 use soac_core::block_py::{BlockPyFunction, ModuleNameGen, RuntimeFunctionId};
 use soac_ir_blockpy::BlockPyModuleShape;
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 static NEXT_COMPILE_SESSION_ID: AtomicU32 = AtomicU32::new(1);
@@ -27,9 +28,49 @@ pub fn allocate_compile_session_id() -> CompileSessionId {
 pub struct CompileSession {
     id: CompileSessionId,
     next_module_id: AtomicU32,
+    shared_module_registry_epoch: AtomicU64,
     shared_module_states: Mutex<SharedModuleStateRegistry>,
+    planned_optimization_inputs:
+        Mutex<HashMap<PlannedOptimizationInputsCacheKey, Arc<PlannedOptimizationInputsResult>>>,
     process_jit: OnceLock<Result<ProcessJitEngine, String>>,
     env_config: OnceLock<Result<SoacEnvConfig, String>>,
+}
+
+type PlannedOptimizationInputsResult = Result<PlannedOptimizationInputs, String>;
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct PlannedOptimizationInputsCacheKey {
+    module_storage_instance_key: usize,
+    shared_module_registry_epoch: u64,
+    counter_dump_path: PathBuf,
+    specialization_mode: PlannedOptimizationInputsMode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum PlannedOptimizationInputsMode {
+    Verify,
+    Apply,
+}
+
+impl PlannedOptimizationInputsCacheKey {
+    pub(crate) fn new(
+        module_storage_instance_key: usize,
+        shared_module_registry_epoch: u64,
+        counter_dump_path: PathBuf,
+        specialization_mode: SpecializationMode,
+    ) -> Option<Self> {
+        let specialization_mode = match specialization_mode {
+            SpecializationMode::Verify => PlannedOptimizationInputsMode::Verify,
+            SpecializationMode::Apply => PlannedOptimizationInputsMode::Apply,
+            SpecializationMode::Profile => return None,
+        };
+        Some(Self {
+            module_storage_instance_key,
+            shared_module_registry_epoch,
+            counter_dump_path,
+            specialization_mode,
+        })
+    }
 }
 
 #[derive(Default)]
@@ -80,7 +121,9 @@ impl CompileSession {
         Self {
             id: allocate_compile_session_id(),
             next_module_id: AtomicU32::new(1),
+            shared_module_registry_epoch: AtomicU64::new(0),
             shared_module_states: Mutex::new(SharedModuleStateRegistry::default()),
+            planned_optimization_inputs: Mutex::new(HashMap::new()),
             process_jit: OnceLock::new(),
             env_config: OnceLock::new(),
         }
@@ -127,7 +170,43 @@ impl CompileSession {
             .lock()
             .map_err(|_| "compile session shared module state lock poisoned".to_string())?
             .retain(shared_state);
+        self.shared_module_registry_epoch
+            .fetch_add(1, Ordering::Relaxed);
         Ok(())
+    }
+
+    pub(crate) fn shared_module_registry_epoch(&self) -> u64 {
+        self.shared_module_registry_epoch.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn cached_planned_optimization_inputs(
+        &self,
+        key: PlannedOptimizationInputsCacheKey,
+        build: impl FnOnce() -> PlannedOptimizationInputsResult,
+    ) -> PlannedOptimizationInputsResult {
+        if let Some(cached) = self
+            .planned_optimization_inputs
+            .lock()
+            .map_err(|_| {
+                "compile session planned optimization input cache lock poisoned".to_string()
+            })?
+            .get(&key)
+            .cloned()
+        {
+            return clone_planned_optimization_inputs_result(cached.as_ref());
+        }
+
+        let built = Arc::new(build());
+        let cached = {
+            let mut cache = self.planned_optimization_inputs.lock().map_err(|_| {
+                "compile session planned optimization input cache lock poisoned".to_string()
+            })?;
+            cache
+                .entry(key)
+                .or_insert_with(|| Arc::clone(&built))
+                .clone()
+        };
+        clone_planned_optimization_inputs_result(cached.as_ref())
     }
 
     pub fn retain_shared_module_state_for_inspection(
@@ -183,6 +262,15 @@ impl CompileSession {
             .lock()
             .map_err(|_| "compile session shared module state lock poisoned".to_string())?
             .retained_len())
+    }
+}
+
+fn clone_planned_optimization_inputs_result(
+    result: &PlannedOptimizationInputsResult,
+) -> PlannedOptimizationInputsResult {
+    match result {
+        Ok(inputs) => Ok(inputs.clone()),
+        Err(err) => Err(err.clone()),
     }
 }
 

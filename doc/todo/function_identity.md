@@ -1,3 +1,7 @@
+---
+title: "Function Identity Types And Serialization"
+---
+
 # Function Identity Types And Serialization
 
 ## Problem

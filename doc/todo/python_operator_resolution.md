@@ -1,3 +1,7 @@
+---
+title: "Python Operator Resolution"
+---
+
 # Python Operator Resolution
 
 ## Current State

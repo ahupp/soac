@@ -1,3 +1,7 @@
+---
+title: "len Direct Specialization Follow-Up"
+---
+
 # `len` Direct Specialization Follow-Up
 
 ## Goal

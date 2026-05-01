@@ -1,3 +1,7 @@
+---
+title: "Overnight Optimization Explanations"
+---
+
 # Overnight Optimization Explanations
 
 This is a companion to `doc/OVERNIGHT_PERF_LOG.md`. It covers the optimizations

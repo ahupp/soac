@@ -1,3 +1,7 @@
+---
+title: "Runtime Function Inventory"
+---
+
 # Runtime Function Inventory
 
 This document tracks the callable runtime helper surface used by SOAC. Keep it

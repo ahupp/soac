@@ -194,6 +194,23 @@ struct RawPyAsciiObject {
     state: u32,
 }
 
+#[repr(C)]
+struct RawPyBytesObject {
+    ob_base: RawPyVarObject,
+    ob_shash: isize,
+    ob_sval: [u8; 1],
+}
+
+#[repr(C)]
+struct RawPyByteArrayObject {
+    ob_base: RawPyVarObject,
+    ob_alloc: isize,
+    ob_bytes: *mut u8,
+    ob_start: *mut u8,
+    ob_exports: isize,
+    ob_bytes_object: *mut RawPyObject,
+}
+
 unsafe extern "C" {
     fn _Py_Dealloc(obj: *mut RawPyObject);
     fn PyErr_SetNone(exception: *mut c_void);
@@ -222,6 +239,8 @@ unsafe extern "C" {
     static mut PyExc_TypeError: *mut c_void;
     static mut PyExc_ValueError: *mut c_void;
     static mut _PyDict_IndexedValueTombstone: c_void;
+    static mut PyBytes_Type: c_void;
+    static mut PyByteArray_Type: c_void;
     static mut PyUnicode_Type: c_void;
 }
 
@@ -257,27 +276,6 @@ unsafe fn dict_key_matches(actual: *mut RawPyObject, expected: *mut RawPyObject)
                 PyObject_RichCompareBool(actual.cast::<c_void>(), expected.cast::<c_void>(), PY_EQ)
                     == 1
             })
-}
-
-#[inline(always)]
-unsafe fn exact_compact_ascii_ord(obj: *mut c_void) -> Option<i64> {
-    let obj = obj.cast::<RawPyObject>();
-    if unsafe { (*obj).ob_type } != core::ptr::addr_of_mut!(PyUnicode_Type) {
-        return None;
-    }
-    let unicode = obj.cast::<RawPyAsciiObject>();
-    let state = unsafe { (*unicode).state };
-    if state & (PY_UNICODE_STATE_COMPACT_MASK | PY_UNICODE_STATE_ASCII_MASK)
-        != (PY_UNICODE_STATE_COMPACT_MASK | PY_UNICODE_STATE_ASCII_MASK)
-    {
-        return None;
-    }
-    if unsafe { (*unicode).length } != 1 {
-        unsafe { PyErr_SetNone(PyExc_TypeError) };
-        return Some(0);
-    }
-    let data = unsafe { unicode.add(1).cast::<u8>() };
-    Some(unsafe { *data }.into())
 }
 
 #[unsafe(no_mangle)]
@@ -499,8 +497,51 @@ pub unsafe extern "C" fn soac_runtime_builtin_ord_i64(
     obj: *mut c_void,
 ) -> i64 {
     debug_assert!(!obj.is_null());
-    if let Some(codepoint) = unsafe { exact_compact_ascii_ord(obj) } {
-        return codepoint;
+    let mut actual_type = unsafe { (*obj.cast::<RawPyObject>()).ob_type }.cast::<RawPyTypeObject>();
+    let bytes_type = core::ptr::addr_of_mut!(PyBytes_Type);
+    while !actual_type.is_null() {
+        if actual_type.cast::<c_void>() == bytes_type {
+            let bytes = obj.cast::<RawPyBytesObject>();
+            let size = unsafe { (*bytes).ob_base.ob_size };
+            if size != 1 {
+                unsafe { PyErr_SetNone(PyExc_TypeError) };
+                return 0;
+            }
+            return unsafe { (*bytes).ob_sval[0] }.into();
+        }
+        actual_type = unsafe { (*actual_type).tp_base.cast::<RawPyTypeObject>() };
+    }
+    if unsafe { (*obj.cast::<RawPyObject>()).ob_type } == core::ptr::addr_of_mut!(PyUnicode_Type) {
+        let unicode = obj.cast::<RawPyAsciiObject>();
+        let state = unsafe { (*unicode).state };
+        if state & (PY_UNICODE_STATE_COMPACT_MASK | PY_UNICODE_STATE_ASCII_MASK)
+            == (PY_UNICODE_STATE_COMPACT_MASK | PY_UNICODE_STATE_ASCII_MASK)
+        {
+            if unsafe { (*unicode).length } != 1 {
+                unsafe { PyErr_SetNone(PyExc_TypeError) };
+                return 0;
+            }
+            let data = unsafe { unicode.add(1).cast::<u8>() };
+            return unsafe { *data }.into();
+        }
+    }
+    let mut actual_type = unsafe { (*obj.cast::<RawPyObject>()).ob_type }.cast::<RawPyTypeObject>();
+    let bytearray_type = core::ptr::addr_of_mut!(PyByteArray_Type);
+    while !actual_type.is_null() {
+        if actual_type.cast::<c_void>() == bytearray_type {
+            let bytearray = obj.cast::<RawPyByteArrayObject>();
+            let size = unsafe { (*bytearray).ob_base.ob_size };
+            if size != 1 {
+                unsafe { PyErr_SetNone(PyExc_TypeError) };
+                return 0;
+            }
+            let data = unsafe { (*bytearray).ob_start };
+            if data.is_null() {
+                return 0;
+            }
+            return unsafe { *data }.into();
+        }
+        actual_type = unsafe { (*actual_type).tp_base.cast::<RawPyTypeObject>() };
     }
     let length = unsafe { PyUnicode_GetLength(obj) };
     if length < 0 {

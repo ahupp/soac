@@ -1,8 +1,9 @@
 use crate::block_py::PrettyPrint;
 use crate::block_py::{
-    instr_any, BlockPyFunction, BlockPyModule, BlockTerm, Call, CallArgKeyword, CallArgPositional,
-    CallableScopeKind, CellBindingKind, CellLocation, ChildVisitable, FunctionExecutionMode,
-    FunctionKind, InstrResolved, NameLike, NameLocation, ResolvedStorageBlock, ScopeExprNode,
+    instr_any, BlockArg, BlockParamRole, BlockPyFunction, BlockPyModule, BlockTerm, Call,
+    CallArgKeyword, CallArgPositional, CallableScopeKind, CellBindingKind, CellLocation,
+    ChildVisitable, FunctionExecutionMode, FunctionKind, InstrResolved, NameLike, NameLocation,
+    ResolvedStorageBlock, ScopeExprNode,
 };
 use crate::block_py::{BindingKind, ClosureInit, ClosureSlot, ModuleNameGen};
 use crate::pass_tracker::LoweringPassTrackerInternalExt;
@@ -2194,6 +2195,94 @@ def gen():
         Some(BindingKind::Cell(CellBindingKind::Capture))
     );
     assert!(storage_layout.has_storage_name(&try_exc_slot.storage_name));
+}
+
+#[test]
+fn coroutine_resume_dispatch_does_not_target_parameterized_exception_blocks() {
+    let source = r#"
+import asyncio
+
+async def child():
+    await asyncio.sleep(0)
+
+async def parent():
+    async with asyncio.TaskGroup() as tg:
+        tg.create_task(child())
+"#;
+
+    let lowered = TrackedLowering::new(source);
+    let resume = lowered.bb_function("parent");
+    assert!(
+        resume.blocks.iter().any(|block| block
+            .params
+            .iter()
+            .any(|param| param.role == BlockParamRole::Exception)),
+        "test source should produce exception-parameterized continuation blocks"
+    );
+
+    let blocks_by_label = resume
+        .blocks
+        .iter()
+        .map(|block| (block.label, block))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut checked_targets = 0usize;
+    for block in &resume.blocks {
+        let BlockTerm::BranchTable(branch) = &block.term else {
+            continue;
+        };
+        if branch.index.root_name_id() != Some("_dp_pc") {
+            continue;
+        }
+        for target in branch
+            .targets
+            .iter()
+            .chain(std::iter::once(&branch.default_label))
+        {
+            checked_targets += 1;
+            let target_block = blocks_by_label
+                .get(target)
+                .unwrap_or_else(|| panic!("missing branch-table target {target}"));
+            assert_eq!(
+                target_block.params.len(),
+                0,
+                "resume dispatch target {target} must be parameterless"
+            );
+            let BlockTerm::Jump(edge) = &target_block.term else {
+                continue;
+            };
+            let jump_target = blocks_by_label
+                .get(&edge.target)
+                .unwrap_or_else(|| panic!("missing dispatch wrapper jump target {}", edge.target));
+            if jump_target.params.is_empty() {
+                continue;
+            }
+            assert_eq!(edge.args.len(), jump_target.params.len());
+            for (param, arg) in jump_target.params.iter().zip(edge.args.iter()) {
+                match param.role {
+                    BlockParamRole::Exception => {
+                        assert!(
+                            matches!(arg, BlockArg::None),
+                            "resume dispatch wrapper should pass None for {}",
+                            param.name
+                        );
+                    }
+                    BlockParamRole::Value
+                    | BlockParamRole::AbruptKind
+                    | BlockParamRole::AbruptPayload => {
+                        assert!(
+                            matches!(arg, BlockArg::Name(name) if name == &param.name),
+                            "resume dispatch wrapper should preserve carried parameter {}",
+                            param.name
+                        );
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        checked_targets > 0,
+        "resume function should use a dispatch table"
+    );
 }
 
 #[test]

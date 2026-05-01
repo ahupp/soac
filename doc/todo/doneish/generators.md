@@ -1,3 +1,7 @@
+---
+title: "Generators"
+---
+
 
 We need to add support for generators.  At the moment, in rewrite_module_with_tracker, the value `core_blockpy_without_await` contains functions that have 'await' reduced to
 `yield from _dp_some_helper`.  We need to reduce those to regular functions that implement the generator protocol

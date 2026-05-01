@@ -1,3 +1,7 @@
+---
+title: "OPTIMIZATION"
+---
+
 
 Your job is to make the benchmark (run via "just benchmark") as fast
 as possible. Use the $analyze-pystone-perf skill to run the benchmark,

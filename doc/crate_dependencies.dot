@@ -4,8 +4,6 @@ digraph soac_crate_dependencies {
   node [shape=box, style="rounded,filled", fillcolor="#f8fafc", color="#475569", fontname="Helvetica", fontsize=11];
   edge [fontname="Helvetica", fontsize=9, arrowsize=0.7];
 
-  "build_support" [label="build_support", tooltip="crates/build_support"];
-  "soac_config" [label="soac_config", tooltip="crates/soac_config"];
   "soac_core" [label="soac_core", tooltip="crates/soac_core"];
   "soac_cpython" [label="soac_cpython", tooltip="crates/soac_cpython"];
   "soac_driver" [label="soac_driver", tooltip="crates/soac_driver"];
@@ -15,19 +13,15 @@ digraph soac_crate_dependencies {
   "soac_ir_typed" [label="soac_ir_typed", tooltip="crates/soac_ir_typed"];
   "soac_jit" [label="soac_jit", tooltip="crates/soac_jit"];
   "soac_lowering" [label="soac_lowering", tooltip="crates/soac_lowering"];
-  "soac_macros" [label="soac_macros", tooltip="crates/soac_macros"];
   "soac_opt" [label="soac_opt", tooltip="crates/soac_opt"];
   "soac_pyo3" [label="soac_pyo3", tooltip="crates/soac_pyo3"];
 
-  "soac_driver" -> "soac_config" [color="#394150"];
   "soac_driver" -> "soac_core" [color="#394150"];
   "soac_driver" -> "soac_instrument" [color="#394150"];
   "soac_driver" -> "soac_ir_blockpy" [color="#394150"];
   "soac_driver" -> "soac_ir_typed" [color="#394150"];
   "soac_driver" -> "soac_lowering" [color="#394150"];
   "soac_driver" -> "soac_opt" [color="#394150"];
-  "soac_inspector" -> "build_support" [color="#866118", style=dotted, label="build"];
-  "soac_inspector" -> "soac_config" [color="#394150"];
   "soac_inspector" -> "soac_core" [color="#394150"];
   "soac_inspector" -> "soac_cpython" [color="#394150"];
   "soac_inspector" -> "soac_driver" [color="#394150"];
@@ -36,17 +30,11 @@ digraph soac_crate_dependencies {
   "soac_inspector" -> "soac_jit" [color="#394150"];
   "soac_inspector" -> "soac_lowering" [color="#394150"];
   "soac_inspector" -> "soac_opt" [color="#394150"];
-  "soac_instrument" -> "soac_config" [color="#394150"];
   "soac_instrument" -> "soac_core" [color="#394150"];
-  "soac_instrument" -> "soac_ir_blockpy" [color="#394150"];
   "soac_instrument" -> "soac_ir_typed" [color="#394150"];
   "soac_ir_blockpy" -> "soac_core" [color="#394150"];
-  "soac_ir_blockpy" -> "soac_macros" [color="#394150"];
   "soac_ir_typed" -> "soac_core" [color="#394150"];
   "soac_ir_typed" -> "soac_ir_blockpy" [color="#394150"];
-  "soac_ir_typed" -> "soac_macros" [color="#394150"];
-  "soac_jit" -> "build_support" [color="#866118", style=dotted, label="build"];
-  "soac_jit" -> "soac_config" [color="#394150"];
   "soac_jit" -> "soac_core" [color="#394150"];
   "soac_jit" -> "soac_driver" [color="#394150"];
   "soac_jit" -> "soac_instrument" [color="#394150"];
@@ -54,16 +42,11 @@ digraph soac_crate_dependencies {
   "soac_jit" -> "soac_ir_typed" [color="#394150"];
   "soac_jit" -> "soac_lowering" [color="#394150"];
   "soac_jit" -> "soac_opt" [color="#394150"];
-  "soac_lowering" -> "soac_config" [color="#394150"];
   "soac_lowering" -> "soac_core" [color="#394150"];
   "soac_lowering" -> "soac_ir_blockpy" [color="#394150"];
-  "soac_lowering" -> "soac_macros" [color="#394150"];
   "soac_opt" -> "soac_core" [color="#394150"];
   "soac_opt" -> "soac_ir_blockpy" [color="#394150"];
   "soac_opt" -> "soac_ir_typed" [color="#394150"];
-  "soac_opt" -> "soac_macros" [color="#394150"];
-  "soac_pyo3" -> "build_support" [color="#866118", style=dotted, label="build"];
-  "soac_pyo3" -> "soac_config" [color="#394150"];
   "soac_pyo3" -> "soac_core" [color="#394150"];
   "soac_pyo3" -> "soac_driver" [color="#394150"];
   "soac_pyo3" -> "soac_ir_blockpy" [color="#394150"];

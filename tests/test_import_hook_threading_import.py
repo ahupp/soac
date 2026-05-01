@@ -34,6 +34,59 @@ def test_import_hook_entry_module_bootstraps_runtime():
     assert result.stdout.strip() == "1"
 
 
+def test_import_hook_path_entrypoint_preserves_script_main_for_multiprocessing(tmp_path):
+    module_path = tmp_path / "mp_main_probe.py"
+    module_path.write_text(
+        "\n".join(
+            [
+                "import multiprocessing.spawn as spawn",
+                "data = spawn.get_preparation_data('ignore')",
+                "print(data.get('init_main_from_path'))",
+                "print(data.get('init_main_from_name'))",
+            ]
+        )
+    )
+    env = os.environ.copy()
+    env["SOAC_MODULE_ENABLED"] = f"path:{module_path}"
+
+    result = subprocess.run(
+        [sys.executable, "-m", "soac.import_hook", str(module_path)],
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [str(module_path), "None"]
+
+
+def test_import_hook_path_entrypoint_matches_script_import_context(tmp_path):
+    helper_path = tmp_path / "entry_helper.py"
+    helper_path.write_text("VALUE = 37\n")
+    module_path = tmp_path / "entry_context_probe.py"
+    module_path.write_text(
+        "\n".join(
+            [
+                "import builtins",
+                "import entry_helper",
+                "print(__builtins__ is builtins)",
+                "__builtins__.open = open",
+                "print(entry_helper.VALUE)",
+            ]
+        )
+    )
+    env = os.environ.copy()
+    env["SOAC_MODULE_ENABLED"] = f"path:{tmp_path}"
+
+    result = subprocess.run(
+        [sys.executable, "-m", "soac.import_hook", str(module_path)],
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == ["True", "37"]
+
+
 def test_import_hook_transforms_resolvable_frozen_module_source():
     env = os.environ.copy()
     ntpath_source = (

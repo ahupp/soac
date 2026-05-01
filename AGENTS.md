@@ -418,6 +418,33 @@ another revision's cache.
   apply pass after the default refcounts-enabled pass. Keep the default
   refcounts-enabled median as the headline; if the diagnostic fails, report the
   failure without treating it as a failed production benchmark.
+- `just pyperformance [stock|soac|soac-single] [output] [benchmarks] [extra pyperformance run args...]`
+  Runs the pyperformance suite using the repo-local pyperformance install and
+  the vendored CPython executable. `stock` runs plain CPython. The default
+  `soac` mode builds the release SOAC extension, runs a profile pass, then runs
+  an apply pass. The requested `output` is the apply result; the profile pyperf
+  result is written beside it with a `.profile.json` suffix. Use `soac-single`
+  for one-pass debugging; it honors the caller's `SOAC_OPT_MODE` and defaults
+  to `none`. SOAC modes use `scripts/pyperformance_soac_sitecustomize/` to
+  install `soac.import_hook` in benchmark worker subprocesses. Results default
+  to `work/pyperformance/{stock,soac}-<timestamp>.json`, and pyperformance's
+  own benchmark virtual environments live under `work/pyperformance/venv/`.
+  `benchmarks` is passed to pyperformance's `--benchmarks` option, and extra
+  args are appended to `pyperformance run`. The recipe defaults pyperf sampling
+  to `--fast --min-time=0.05`; pass `--rigorous` or `--debug-single-value` to
+  replace that sample mode, or pass `--min-time=<seconds>` to override the
+  default calibration window. SOAC modes default
+  `SOAC_MODULE_ENABLED` to the pyperformance benchmark source tree so
+  pyperformance's harness and venv setup stay on stock CPython unless a caller
+  explicitly overrides the allow-list. They also default `SOAC_BACKGROUND_JIT=0`
+  because pyperformance uses short worker subprocesses where background
+  compiler threads can outlive interpreter shutdown, and default
+  `SOAC_COMPILE_MODE=eager` because lazy first-call compilation can block
+  pyperformance's single worker loop. In SOAC modes, `SOAC_WORK_DIR` is a root;
+  the worker wrapper writes each benchmark invocation's counters, logs, and
+  module cache under a stable per-script-and-variant subdirectory so full-suite
+  runs can profile many `__main__` scripts without source-hash or
+  type-observation collisions.
 - Repo-local uv state
   `.envrc` and `Justfile` keep uv, XDG, and cargo state under the repo with
   `UV_CACHE_DIR`, `UV_TOOL_DIR`, `UV_TOOL_BIN_DIR`, `XDG_CACHE_HOME`,
@@ -487,6 +514,13 @@ explicit ordinary
   `BENCHMARK_CONSTANT_CLOCKS=1` only when you explicitly want the wrapper
   to request steadier clocks. If you add or change benchmark-stability
   knobs, document them in `README.md` and in this appendix note.
+- `PYPERFORMANCE_AFFINITY` / `PYPERFORMANCE_TIMEOUT` /
+  `PYPERFORMANCE_INHERIT_ENV_EXTRA`
+  `just pyperformance` maps `PYPERFORMANCE_AFFINITY` to pyperformance's
+  `--affinity`, falls back to `BENCHMARK_CPU` when affinity is unset, maps
+  `PYPERFORMANCE_TIMEOUT` to `--timeout`, and appends
+  `PYPERFORMANCE_INHERIT_ENV_EXTRA` to the `--inherit-environ` list for SOAC
+  mode. Document any new pyperformance recipe knobs in README and here.
 - `PERF_CALL_GRAPH`
   The perf profiling recipes default to `PERF_CALL_GRAPH=dwarf,65528`
   rather than a shallower stack dump, because the larger DWARF capture

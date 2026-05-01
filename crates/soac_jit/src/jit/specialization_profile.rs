@@ -5,6 +5,7 @@ use super::operation_specializations::{
 use super::precompile::PrecompileModuleIndex;
 use crate::config::{SpecializationMode, pre_optimization_module_cache_identity};
 use crate::module_type::SharedModuleState;
+use crate::session::PlannedOptimizationInputsCacheKey;
 use soac_config::SoacEnvConfig;
 use soac_core::block_py::{
     BlockLabel, BlockPyFunction, BlockPyModule, InstrId, ModuleShape, PersistentFunctionId,
@@ -67,7 +68,7 @@ pub(super) enum DirectCallEmissionScope {
 }
 
 #[derive(Clone, Default)]
-pub(super) struct PlannedOptimizationInputs {
+pub(crate) struct PlannedOptimizationInputs {
     pub(super) opt_v3_emitted_direct_calls:
         HashMap<RuntimeFunctionId, HashMap<InstrId, Vec<ResolvedV3DirectCallPlan>>>,
     pub(super) opt_v3_emitted_exact_list_items:
@@ -123,21 +124,41 @@ pub(super) fn load_planned_optimization_inputs_for_runtime_state(
     let Some(shared_state) = shared_state else {
         return Ok(PlannedOptimizationInputs::default());
     };
-    planned_typed_v3_runtime_inputs_from_raw_evidence(shared_state, compile_session, env_config)
-}
-
-fn planned_typed_v3_runtime_inputs_from_raw_evidence(
-    shared_state: &SharedModuleState,
-    compile_session: Option<&crate::session::CompileSession>,
-    env_config: &SoacEnvConfig,
-) -> Result<PlannedOptimizationInputs, String> {
     let Some(counter_dump_path) = env_config.counter_dump_input_path() else {
         return Ok(PlannedOptimizationInputs::default());
     };
     if !counter_dump_path.exists() {
         return Ok(PlannedOptimizationInputs::default());
     }
-    let evidence_store = ProfileEvidenceStore::from_counter_dump(counter_dump_path.as_path())
+    if let Some(compile_session) = compile_session
+        && let Some(cache_key) = PlannedOptimizationInputsCacheKey::new(
+            shared_state.storage_instance_key(),
+            compile_session.shared_module_registry_epoch(),
+            counter_dump_path.clone(),
+            specialization_mode.expect("checked verify/apply specialization mode"),
+        )
+    {
+        return compile_session.cached_planned_optimization_inputs(cache_key, || {
+            planned_typed_v3_runtime_inputs_from_raw_evidence(
+                shared_state,
+                Some(compile_session),
+                counter_dump_path.as_path(),
+            )
+        });
+    }
+    planned_typed_v3_runtime_inputs_from_raw_evidence(
+        shared_state,
+        compile_session,
+        counter_dump_path.as_path(),
+    )
+}
+
+fn planned_typed_v3_runtime_inputs_from_raw_evidence(
+    shared_state: &SharedModuleState,
+    compile_session: Option<&crate::session::CompileSession>,
+    counter_dump_path: &Path,
+) -> Result<PlannedOptimizationInputs, String> {
+    let evidence_store = ProfileEvidenceStore::from_counter_dump(counter_dump_path)
         .map_err(|err| err.to_string())?;
     let artifacts = plan_and_emit_module_v3_from_raw_evidence(
         &AlternativeCatalog::default_v3(),

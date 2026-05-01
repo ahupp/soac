@@ -1,3 +1,7 @@
+---
+title: "Fact-Driven Typed Specializations"
+---
+
 # Fact-Driven Typed Specializations
 
 ## Goal

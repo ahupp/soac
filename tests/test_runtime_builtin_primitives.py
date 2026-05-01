@@ -8,6 +8,9 @@ def test_ord_chr_roundtrip_uses_runtime_builtin_primitives(tmp_path):
 def codepoint(value):
     return ord(value)
 
+def bytes_codepoint(value):
+    return ord(value)
+
 def roundtrip(value):
     return chr(ord(value))
 
@@ -31,6 +34,8 @@ def local_overflow():
 
     with soac_module(tmp_path, "runtime_builtin_primitives", source) as module:
         assert module.codepoint("A") == 65
+        assert module.bytes_codepoint(b"A") == 65
+        assert module.bytes_codepoint(bytearray(b"B")) == 66
         assert module.roundtrip("Z") == "Z"
         assert module.item_count("abc") == 3
         assert module.item_count([1, 2, 3]) == 3
@@ -56,6 +61,10 @@ def bad_len(value):
     with soac_module(tmp_path, "runtime_builtin_errors", source) as module:
         with pytest.raises(TypeError):
             module.bad_ord("AB")
+        with pytest.raises(TypeError):
+            module.bad_ord(b"AB")
+        with pytest.raises(TypeError):
+            module.bad_ord(bytearray(b"AB"))
         with pytest.raises(TypeError):
             module.bad_chr("AB")
         with pytest.raises(TypeError):

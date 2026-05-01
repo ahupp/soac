@@ -1,3 +1,7 @@
+---
+title: "Global JITModule Plan"
+---
+
 # Global JITModule Plan
 
 ## Goal

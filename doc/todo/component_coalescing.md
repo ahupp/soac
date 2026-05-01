@@ -1,3 +1,7 @@
+---
+title: "Component Coalescing Opportunities"
+---
+
 # Component Coalescing Opportunities
 
 This note summarizes overlap found while reviewing the generated per-file summaries in `review/`.

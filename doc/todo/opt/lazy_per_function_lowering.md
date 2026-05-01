@@ -1,3 +1,7 @@
+---
+title: "Lazy Per-Function Lowering"
+---
+
 # Lazy Per-Function Lowering
 
 ## Article Spark

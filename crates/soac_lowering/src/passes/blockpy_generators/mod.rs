@@ -158,7 +158,7 @@ pub(crate) fn build_blockpy_storage_layout(
             continue;
         }
         let init = if injected_exception_names.contains(logical_name.as_str()) {
-            ClosureInit::EmptyCell
+            ClosureInit::RuntimeNone
         } else if param_names.iter().any(|param| param == &logical_name) {
             ClosureInit::Parameter
         } else {
@@ -836,6 +836,18 @@ fn explicit_jump_args_for_params(params: &[BlockParam]) -> Vec<BlockArg> {
     params
         .iter()
         .map(|param| BlockArg::Name(param.name.clone()))
+        .collect()
+}
+
+fn resume_dispatch_jump_args_for_params(params: &[BlockParam]) -> Vec<BlockArg> {
+    params
+        .iter()
+        .map(|param| match param.role {
+            BlockParamRole::Exception => BlockArg::None,
+            BlockParamRole::Value | BlockParamRole::AbruptKind | BlockParamRole::AbruptPayload => {
+                BlockArg::Name(param.name.clone())
+            }
+        })
         .collect()
 }
 
@@ -1704,8 +1716,33 @@ fn lower_resume_blocks(
         .unwrap_or(1)
         + 1;
     let mut targets = vec![state.exhausted_label.clone(); targets_len];
-    for (pc, label) in &state.resume_targets {
-        targets[*pc] = label.clone();
+    let mut dispatch_wrappers = Vec::new();
+    let params_by_label = state
+        .blocks
+        .iter()
+        .map(|block| (block.label.clone(), block.params.clone()))
+        .collect::<HashMap<_, _>>();
+    let resume_targets = state.resume_targets.clone();
+    for (pc, label) in resume_targets {
+        let declared_params = params_by_label.get(&label).cloned().unwrap_or_default();
+        if declared_params.is_empty() {
+            targets[pc] = label.clone();
+        } else {
+            let wrapper_label = state.fresh_label("resume_dispatch_target");
+            targets[pc] = wrapper_label.clone();
+            dispatch_wrappers.push(LinearCoreBlock {
+                label: wrapper_label.clone(),
+                body: Vec::new(),
+                term: BlockTerm::Jump(BlockEdge::with_args(
+                    label.clone(),
+                    resume_dispatch_jump_args_for_params(&declared_params),
+                )),
+                params: Vec::new(),
+                exc_edge: None,
+                extra: Default::default(),
+            });
+            state.exception_edges.insert(wrapper_label, None);
+        }
     }
 
     let mut blocks = vec![LinearCoreBlock {
@@ -1720,6 +1757,7 @@ fn lower_resume_blocks(
         exc_edge: None,
         extra: Default::default(),
     }];
+    blocks.append(&mut dispatch_wrappers);
     blocks.append(&mut state.blocks);
     blocks.push(LinearCoreBlock {
         label: state.exhausted_label.clone(),

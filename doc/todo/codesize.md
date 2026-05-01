@@ -1,3 +1,7 @@
+---
+title: "Code Size Analysis"
+---
+
 # Code Size Analysis
 
 ## Problem

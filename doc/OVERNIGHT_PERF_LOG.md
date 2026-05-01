@@ -1,3 +1,7 @@
+---
+title: "Overnight Performance Log"
+---
+
 # Overnight Performance Log
 
 ## 2026-04-27 - Direct builtin next runtime primitive

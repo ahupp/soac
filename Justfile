@@ -5,6 +5,7 @@ repo_root := justfile_directory()
 work_dir := repo_root + "/work"
 logs_dir := work_dir + "/logs"
 benchmark_results_dir := work_dir + "/bench"
+pyperformance_results_dir := work_dir + "/pyperformance"
 benchmark_source_dir := repo_root + "/bench"
 pystone_source := benchmark_source_dir + "/pystone.py"
 cpython_bin := repo_root + "/vendor/cpython/python"
@@ -14,6 +15,7 @@ uv_cache_dir := env_var_or_default("UV_CACHE_DIR", repo_root + "/.uv-cache")
 uv_tool_dir := env_var_or_default("UV_TOOL_DIR", repo_root + "/.uv/tools")
 uv_tool_bin_dir := env_var_or_default("UV_TOOL_BIN_DIR", repo_root + "/.uv/bin")
 xdg_cache_home := env_var_or_default("XDG_CACHE_HOME", repo_root + "/.xdg/cache")
+xdg_config_home := env_var_or_default("XDG_CONFIG_HOME", repo_root + "/.xdg/config")
 xdg_data_home := env_var_or_default("XDG_DATA_HOME", repo_root + "/.xdg/data")
 xdg_runtime_dir := env_var_or_default("XDG_RUNTIME_DIR", repo_root + "/work/tmp")
 cargo_home := env_var_or_default("CARGO_HOME", repo_root + "/work/cargo-home")
@@ -30,6 +32,7 @@ export REPO_ROOT := repo_root
 export WORK_DIR := work_dir
 export LOGS_DIR := logs_dir
 export BENCHMARK_RESULTS_DIR := benchmark_results_dir
+export PYPERFORMANCE_RESULTS_DIR := pyperformance_results_dir
 export BENCHMARK_SOURCE_DIR := benchmark_source_dir
 export PYSTONE_SOURCE := pystone_source
 export CPYTHON_BIN := cpython_bin
@@ -41,8 +44,10 @@ export UV_TOOL_BIN_DIR := uv_tool_bin_dir
 export UV_PYTHON_DOWNLOADS := "never"
 export UV_PYTHON := cpython_bin
 export XDG_CACHE_HOME := xdg_cache_home
+export XDG_CONFIG_HOME := xdg_config_home
 export XDG_DATA_HOME := xdg_data_home
 export XDG_RUNTIME_DIR := xdg_runtime_dir
+export ASTRO_TELEMETRY_DISABLED := "1"
 export PYO3_PYTHON := pyo3_python
 export PYO3_PYTHON_REAL := pyo3_python
 export CARGO_HOME := cargo_home
@@ -473,17 +478,23 @@ build-web-inspector-server: ensure-cpython ensure-shared-python
 
 build-web-inspector: build-web-inspector-server
 
+docs-install:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  cd "$REPO_ROOT"
+  npm install
+
 docs-build:
   #!/usr/bin/env bash
   set -euo pipefail
   cd "$REPO_ROOT"
-  uvx --from mkdocs --with mkdocs-material mkdocs build --strict
+  npm run docs:build
 
-docs-serve dev_addr="127.0.0.1:8001":
+docs-serve port="8001":
   #!/usr/bin/env bash
   set -euo pipefail
   cd "$REPO_ROOT"
-  uvx --from mkdocs --with mkdocs-material mkdocs serve --dev-addr "{{dev_addr}}"
+  npm run docs:serve -- --host 0.0.0.0 --port "{{port}}"
 
 history-metrics-report history_jsonl="work/logs/warloc_history.jsonl" daily_jsonl="work/logs/warloc_history_daily.jsonl" html_output="web/history_metrics.html" revset="..@": ensure-cpython
   #!/usr/bin/env bash
@@ -1197,6 +1208,190 @@ benchmark-warm loops="8000000": (update-venv-offline) (build-extension "release"
   BENCHMARK_CPU="${BENCHMARK_CPU}" \
   BENCHMARK_CONSTANT_CLOCKS="${BENCHMARK_CONSTANT_CLOCKS}" \
     "$REPO_ROOT/scripts/run_benchmark_with_cpu_mode.sh" "$VENV_DIR/bin/python" -c 'import os, sys; sys.path.insert(0, os.environ["BENCHMARK_SOURCE_DIR"]); import pystone; warmup_loops = int(os.environ["WARMUP_LOOPS"]); loops = int(os.environ["LOOPS"]); warmup_loops > 0 and pystone.pystones(warmup_loops); pystone.main(loops)'
+
+pyperformance mode="soac" output="" benchmarks="" *args='': ensure-cpython ensure-shared-python
+  #!/usr/bin/env bash
+  set -euo pipefail
+  export LD_LIBRARY_PATH="$CPYTHON_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  cd "$REPO_ROOT"
+
+  MODE="{{mode}}"
+  OUTPUT="{{output}}"
+  BENCHMARKS="{{benchmarks}}"
+  set -- {{args}}
+
+  case "$MODE" in
+    stock|soac|soac-single) ;;
+    *)
+      echo "unknown pyperformance mode: $MODE" >&2
+      echo "expected one of: stock, soac, soac-single" >&2
+      exit 2
+      ;;
+  esac
+
+  just update-venv-offline
+  if [[ "$MODE" == soac* ]]; then
+    just build-extension release
+  fi
+
+  mkdir -p "$PYPERFORMANCE_RESULTS_DIR"
+  export PIP_CACHE_DIR="${PIP_CACHE_DIR:-$XDG_CACHE_HOME/pip}"
+  export PIP_DISABLE_PIP_VERSION_CHECK="${PIP_DISABLE_PIP_VERSION_CHECK:-1}"
+  mkdir -p "$PIP_CACHE_DIR"
+
+  if [[ -z "$OUTPUT" ]]; then
+    timestamp="$(date +%Y%m%d-%H%M%S)"
+    OUTPUT="$PYPERFORMANCE_RESULTS_DIR/${MODE}-${timestamp}.json"
+  elif [[ "$OUTPUT" != /* ]]; then
+    OUTPUT="$REPO_ROOT/$OUTPUT"
+  fi
+  mkdir -p "$(dirname "$OUTPUT")"
+
+  pyperformance_base_args=(run "--python=$CPYTHON_BIN")
+  if [[ -n "$BENCHMARKS" ]]; then
+    pyperformance_base_args+=("--benchmarks=$BENCHMARKS")
+  fi
+  if [[ -n "${PYPERFORMANCE_TIMEOUT:-}" ]]; then
+    pyperformance_base_args+=("--timeout=$PYPERFORMANCE_TIMEOUT")
+  fi
+  if [[ -n "${PYPERFORMANCE_AFFINITY:-${BENCHMARK_CPU:-}}" ]]; then
+    pyperformance_base_args+=("--affinity=${PYPERFORMANCE_AFFINITY:-${BENCHMARK_CPU:-}}")
+  fi
+
+  inherit_csv=""
+  if [[ "$MODE" == soac* ]]; then
+    VENV_SITE_PACKAGES="$("$VENV_DIR/bin/python" -c 'import sysconfig; print(sysconfig.get_path("platlib"))')"
+    PYPERFORMANCE_BENCHMARK_ROOT="$VENV_SITE_PACKAGES/pyperformance/data-files/benchmarks"
+    export PYTHONPATH="$REPO_ROOT/scripts/pyperformance_soac_sitecustomize:$REPO_ROOT/soac_py/src:$VENV_SITE_PACKAGES${PYTHONPATH:+:$PYTHONPATH}"
+    export SOAC_PYPERFORMANCE_ENABLE=1
+    export SOAC_PYPERFORMANCE_DRIVER=1
+    if [[ -z "${SOAC_WORK_DIR:-}" ]]; then
+      export SOAC_WORK_DIR="${OUTPUT%.json}.soac-work"
+    elif [[ "$SOAC_WORK_DIR" != /* ]]; then
+      export SOAC_WORK_DIR="$REPO_ROOT/$SOAC_WORK_DIR"
+    fi
+    export SOAC_CRANELIFT_OPT_LEVEL="${SOAC_CRANELIFT_OPT_LEVEL:-speed_and_size}"
+    export SOAC_BACKGROUND_JIT="${SOAC_BACKGROUND_JIT:-0}"
+    export SOAC_COMPILE_MODE="${SOAC_COMPILE_MODE:-eager}"
+    export SOAC_MODULE_ENABLED="${SOAC_MODULE_ENABLED:-path:$PYPERFORMANCE_BENCHMARK_ROOT}"
+    mkdir -p "$SOAC_WORK_DIR"
+
+    inherit_env=(
+      LD_LIBRARY_PATH
+      PYTHONPATH
+      RUST_BACKTRACE
+      SOAC_PYPERFORMANCE_ENABLE
+      SOAC_WORK_DIR
+      SOAC_OPT_MODE
+      SOAC_OPT_RUNTIME_PIPELINE
+      SOAC_CRANELIFT_OPT_LEVEL
+      SOAC_BACKGROUND_JIT
+      SOAC_JIT_COMPILE_WORKERS
+      SOAC_JIT_EMIT_REFCOUNTS
+      SOAC_ENABLE_PROFILED_COLD_BLOCKS
+      SOAC_PRECOMPILED_LIBRARY
+      SOAC_MODULE_ENABLED
+      SOAC_LOG
+      SOAC_COMPILE_MODE
+      SOAC_EXEC_TRACE
+    )
+    if [[ -n "${PYPERFORMANCE_INHERIT_ENV_EXTRA:-}" ]]; then
+      IFS=',' read -r -a extra_inherit_env <<<"$PYPERFORMANCE_INHERIT_ENV_EXTRA"
+      inherit_env+=("${extra_inherit_env[@]}")
+    fi
+    inherit_csv="$(IFS=,; echo "${inherit_env[*]}")"
+  fi
+
+  pyperformance_extra_args=("$@")
+  pyperformance_sample_mode=default
+  pyperformance_min_time=default
+  for arg in "${pyperformance_extra_args[@]}"; do
+    case "$arg" in
+      --debug-single-value|--rigorous)
+        pyperformance_sample_mode=explicit
+        pyperformance_min_time=explicit
+        ;;
+      --fast)
+        pyperformance_sample_mode=explicit
+        ;;
+      --min-time|--min-time=*)
+        pyperformance_min_time=explicit
+        ;;
+    esac
+  done
+  pyperformance_default_args=()
+  if [[ "$pyperformance_sample_mode" == default ]]; then
+    pyperformance_default_args+=(--fast)
+  fi
+  if [[ "$pyperformance_min_time" == default ]]; then
+    pyperformance_default_args+=(--min-time=0.05)
+  fi
+  pyperformance_extra_args=("${pyperformance_default_args[@]}" "${pyperformance_extra_args[@]}")
+
+  run_pyperformance_once() {
+    local run_output="$1"
+    local pass_label="$2"
+    local opt_mode="${3:-}"
+    local run_args=("${pyperformance_base_args[@]}" -o "$run_output")
+    if [[ -n "$inherit_csv" ]]; then
+      run_args+=("--inherit-environ=$inherit_csv")
+    fi
+    run_args+=("${pyperformance_extra_args[@]}")
+
+    if [[ -n "$opt_mode" ]]; then
+      export SOAC_OPT_MODE="$opt_mode"
+    fi
+
+    echo "pyperformance mode: $MODE"
+    if [[ -n "$pass_label" ]]; then
+      echo "pyperformance pass: $pass_label"
+    fi
+    echo "pyperformance output: $run_output"
+    if [[ "$MODE" == soac* ]]; then
+      echo "SOAC work dir: $SOAC_WORK_DIR"
+      echo "SOAC opt mode: ${SOAC_OPT_MODE:-none}"
+      echo "SOAC compile mode: ${SOAC_COMPILE_MODE:-eager}"
+    fi
+    (
+      cd "$PYPERFORMANCE_RESULTS_DIR"
+      "$VENV_DIR/bin/pyperformance" "${run_args[@]}"
+    )
+    if [[ -f "$run_output" ]]; then
+      echo "pyperformance result: $run_output"
+    else
+      echo "pyperformance completed without writing result: $run_output"
+    fi
+  }
+
+  if [[ "$MODE" == "stock" ]]; then
+    run_pyperformance_once "$OUTPUT" "" ""
+    exit 0
+  fi
+
+  if [[ "$MODE" == "soac-single" ]]; then
+    export SOAC_OPT_MODE="${SOAC_OPT_MODE:-none}"
+    run_pyperformance_once "$OUTPUT" "" "$SOAC_OPT_MODE"
+    exit 0
+  fi
+
+  if [[ "$OUTPUT" == *.json ]]; then
+    PROFILE_OUTPUT="${OUTPUT%.json}.profile.json"
+  else
+    PROFILE_OUTPUT="$OUTPUT.profile.json"
+  fi
+
+  rm -f "$SOAC_WORK_DIR/profile.bin" "$SOAC_WORK_DIR/verify.bin" "$SOAC_WORK_DIR/events.jsonl" "$SOAC_WORK_DIR/jit-bb-map.jsonl"
+  find "$SOAC_WORK_DIR" -mindepth 2 -name profile.bin -delete
+  find "$SOAC_WORK_DIR" -mindepth 2 -name verify.bin -delete
+  find "$SOAC_WORK_DIR" -mindepth 2 -name events.jsonl -delete
+  find "$SOAC_WORK_DIR" -mindepth 2 -name jit-bb-map.jsonl -delete
+
+  run_pyperformance_once "$PROFILE_OUTPUT" "profile" "profile"
+  if ! find "$SOAC_WORK_DIR" -name profile.bin -print -quit | grep -q .; then
+    echo "SOAC profile pass did not write any profile.bin under $SOAC_WORK_DIR" >&2
+    exit 1
+  fi
+  run_pyperformance_once "$OUTPUT" "apply" "apply"
 
 benchmark benchmark_loops="1000000" verify_loops="100000" results_root="work/bench" result_mode="one-off": (update-venv-offline) (build-extension "release")
   #!/usr/bin/env bash

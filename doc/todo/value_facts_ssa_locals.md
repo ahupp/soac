@@ -1,3 +1,7 @@
+---
+title: "Value Facts And SSA Locals"
+---
+
 # Value Facts And SSA Locals
 
 ## Goal

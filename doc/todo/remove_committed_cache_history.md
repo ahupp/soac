@@ -1,3 +1,7 @@
+---
+title: "Remove committed cache directories from git history"
+---
+
 # Remove committed cache directories from git history
 
 Use a fresh mirror clone and rewrite only that clone, leaving the original repo

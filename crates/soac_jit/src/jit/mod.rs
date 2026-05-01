@@ -224,9 +224,9 @@ pub use runtime_context::{ModuleJitContext, ModuleRuntimeContext};
 use runtime_support::inline_runtime_support_calls;
 #[cfg(test)]
 use runtime_support::{ParsedRuntimeClifFunction, parse_runtime_clif_functions};
+pub(crate) use specialization_profile::PlannedOptimizationInputs;
 use specialization_profile::{
-    PlannedOptimizationInputs, SpecializationProfile,
-    load_planned_optimization_inputs_for_runtime_state,
+    SpecializationProfile, load_planned_optimization_inputs_for_runtime_state,
 };
 pub use specialized_helpers::ObjPtr;
 use symbols::ensure_reloc_type_symbol_registered;
@@ -276,9 +276,9 @@ use imports::{
     DP_JIT_RAISE_FROM_EXC_IMPORT, DP_JIT_RAISE_I64_OVERFLOW_IMPORT,
     DP_JIT_RAISE_SUPER_ARG_DELETED_IMPORT, DP_JIT_RAISE_UNBOUND_LOCAL_ERROR_IMPORT,
     DP_JIT_RECORD_TOP_VALUE_SAMPLE_IMPORT, DP_JIT_STORE_CELL_IMPORT, ImportSpec, ModuleFuncImports,
-    PYLONG_FROM_LONGLONG_IMPORT, PYNUMBER_ADD_IMPORT, PYNUMBER_AND_IMPORT,
-    PYNUMBER_MULTIPLY_IMPORT, PYNUMBER_OR_IMPORT, PYNUMBER_SUBTRACT_IMPORT, PYNUMBER_XOR_IMPORT,
-    PYOBJECT_RICHCOMPARE_IMPORT, PYUNICODE_COMPARE_IMPORT,
+    PY_HANDLE_PENDING_IMPORT, PYLONG_FROM_LONGLONG_IMPORT, PYNUMBER_ADD_IMPORT,
+    PYNUMBER_AND_IMPORT, PYNUMBER_MULTIPLY_IMPORT, PYNUMBER_OR_IMPORT, PYNUMBER_SUBTRACT_IMPORT,
+    PYNUMBER_XOR_IMPORT, PYOBJECT_RICHCOMPARE_IMPORT, PYUNICODE_COMPARE_IMPORT,
     SOAC_JIT_MAKE_FUNCTION_WITH_CLOSURE_IMPORT, SOAC_RUNTIME_BUILTIN_CHR_I64_IMPORT,
     SOAC_RUNTIME_BUILTIN_ITER_OBJECT_IMPORT, SOAC_RUNTIME_BUILTIN_LEN_I64_IMPORT,
     SOAC_RUNTIME_BUILTIN_ORD_I64_IMPORT, SOAC_RUNTIME_COMPARE_COMPACT_ASCII_UNICODE_IMPORT,
@@ -1394,6 +1394,7 @@ struct JitEmitCtx<'mc> {
     decref_ref: ir::FuncRef,
     py_call_positional_three_ref: ir::FuncRef,
     py_vectorcall_ref: ir::FuncRef,
+    py_handle_pending_ref: ir::FuncRef,
     consts: JitEmitConsts,
     load_global_fast_ref: ir::FuncRef,
     probe_global_indexed_ref: ir::FuncRef,
@@ -9575,7 +9576,7 @@ fn emit_typed_codegen_expr_value_with_local_env(
             );
             return Ok(SoacValue::pyobject_with_ownership(value, ownership, facts));
         }
-        let legacy_expr = try_lower_typed_instr_to_codegen_legacy(expr.clone())?;
+        let legacy_expr = lower_typed_instr_to_codegen_legacy_for_fallback(expr.clone())?;
         return Ok(emit_codegen_expr_value_with_local_env(
             fb,
             &legacy_expr,
@@ -9739,7 +9740,7 @@ fn emit_typed_codegen_expr_value_with_local_env(
         return Ok(SoacValue::pyobject_with_ownership(value, ownership, facts));
     }
 
-    let legacy_expr = try_lower_typed_instr_to_codegen_legacy(expr.clone())?;
+    let legacy_expr = lower_typed_instr_to_codegen_legacy_for_fallback(expr.clone())?;
     Ok(emit_codegen_expr_value_with_local_env(
         fb,
         &legacy_expr,
@@ -9813,9 +9814,6 @@ fn typed_call_can_emit_simple_positional_with_typed_inputs(
     call: &TypedCall<InstrTyped>,
     emit_ctx: &JitEmitCtx<'_>,
 ) -> bool {
-    if !matches!(call.access, TypedCallAccessPlan::Generic) {
-        return false;
-    }
     let TypedSimpleCallParts {
         simple_args,
         simple_keywords,
@@ -9824,7 +9822,13 @@ fn typed_call_can_emit_simple_positional_with_typed_inputs(
     if has_unpack || !simple_keywords.is_empty() {
         return false;
     }
-    if typed_expr_runtime_helper(call.func.as_ref(), emit_ctx).is_some() {
+    // If the specialized path declined this call, the generic fallback still has to emit
+    // typed-only argument expressions instead of forcing the whole call through legacy BlockPy.
+    // Keep the cell_ref helper on the legacy path because it is ABI-shaped, not a normal call.
+    if matches!(
+        typed_expr_runtime_helper(call.func.as_ref(), emit_ctx),
+        Some(RuntimeHelperId::CellRef)
+    ) {
         return false;
     }
     if simple_args.len() == 3
@@ -13020,6 +13024,21 @@ fn emit_typed_codegen_call_result_with_local_env(
         simple_keywords,
         has_unpack,
     } = typed_simple_call_parts(call);
+    if !has_unpack
+        && simple_keywords.is_empty()
+        && simple_args.is_empty()
+        && typed_expr_runtime_helper(call.func.as_ref(), emit_ctx) == Some(RuntimeHelperId::Globals)
+    {
+        fb.ins()
+            .call(emit_ctx.incref_ref, &[emit_ctx.consts.block_const]);
+        return Ok(Some(emit_owned_pyobject_result_for_demand(
+            fb,
+            emit_ctx.consts.block_const,
+            PyObjFacts::known_not_none(),
+            emit_ctx,
+            demand,
+        )));
+    }
     if has_unpack {
         let (callable, callable_is_borrowed) = emit_typed_pyobject_arg_value_with_local_env(
             fb,
@@ -14018,6 +14037,49 @@ fn typed_intrinsic_operation_may_emit_pyobject(expr: &InstrTyped) -> bool {
     }
 }
 
+fn typed_instr_kind(expr: &InstrTyped) -> &'static str {
+    match expr {
+        InstrTyped::Truthy(_) => "Truthy",
+        InstrTyped::Load(_) => "Load",
+        InstrTyped::BinOp(_) => "BinOp",
+        InstrTyped::Tuple(_) => "Tuple",
+        InstrTyped::UnaryOp(_) => "UnaryOp",
+        InstrTyped::CalleeFunctionId(_) => "CalleeFunctionId",
+        InstrTyped::CallTyped(_) => "CallTyped",
+        InstrTyped::GuardedCallableCallTyped(_) => "GuardedCallableCallTyped",
+        InstrTyped::GuardedMethodCallTyped(_) => "GuardedMethodCallTyped",
+        InstrTyped::DirectCallableCallTyped(_) => "DirectCallableCallTyped",
+        InstrTyped::DirectMethodCallTyped(_) => "DirectMethodCallTyped",
+        InstrTyped::DirectCallGuardTest(_) => "DirectCallGuardTest",
+        InstrTyped::CallDirect(_) => "CallDirect",
+        InstrTyped::GetAttrTyped(_) => "GetAttrTyped",
+        InstrTyped::SetAttrTyped(_) => "SetAttrTyped",
+        InstrTyped::GetItem(_) => "GetItem",
+        InstrTyped::SetItem(_) => "SetItem",
+        InstrTyped::DelItem(_) => "DelItem",
+        InstrTyped::Store(_) => "Store",
+        InstrTyped::Del(_) => "Del",
+        InstrTyped::MakeCell(_) => "MakeCell",
+        InstrTyped::IncrementCounter(_) => "IncrementCounter",
+        InstrTyped::CellRef(_) => "CellRef",
+        InstrTyped::MakeFunctionWithClosure(_) => "MakeFunctionWithClosure",
+    }
+}
+
+fn lower_typed_instr_to_codegen_legacy_for_fallback(
+    expr: InstrTyped,
+) -> Result<InstrBlockPy, String> {
+    let context = format!(
+        "{}{}",
+        typed_instr_kind(&expr),
+        expr.try_semantic_instr_id()
+            .map(|instr_id| format!(" #{instr_id}"))
+            .unwrap_or_default()
+    );
+    try_lower_typed_instr_to_codegen_legacy(expr)
+        .map_err(|err| format!("{err} [typed_legacy_fallback={context}]"))
+}
+
 #[allow(dead_code)]
 fn emit_typed_codegen_expr_with_local_env(
     fb: &mut FunctionBuilder<'_>,
@@ -14273,7 +14335,7 @@ fn emit_typed_codegen_stmt_with_local_env(
         );
     }
 
-    let legacy_expr = try_lower_typed_instr_to_codegen_legacy(expr.clone())?;
+    let legacy_expr = lower_typed_instr_to_codegen_legacy_for_fallback(expr.clone())?;
     Ok(emit_codegen_stmt_with_local_env(
         fb,
         &legacy_expr,
@@ -14595,6 +14657,7 @@ fn emit_typed_codegen_stmt_result_with_local_env(
         InstrTyped::Truthy(_)
             | InstrTyped::Load(_)
             | InstrTyped::BinOp(_)
+            | InstrTyped::UnaryOp(_)
             | InstrTyped::CallTyped(_)
             | InstrTyped::GuardedCallableCallTyped(_)
             | InstrTyped::GuardedMethodCallTyped(_)
@@ -14633,7 +14696,7 @@ fn emit_typed_codegen_stmt_result_with_local_env(
         ));
     }
 
-    let legacy_expr = try_lower_typed_instr_to_codegen_legacy(expr.clone())?;
+    let legacy_expr = lower_typed_instr_to_codegen_legacy_for_fallback(expr.clone())?;
     emit_codegen_stmt_result_with_local_env(
         fb,
         &legacy_expr,
@@ -16332,6 +16395,13 @@ fn emit_codegen_if_target_arm(
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<(), String> {
     fb.switch_to_block(branch_block);
+    emit_handle_pending_if_backedge(
+        fb,
+        source_label,
+        target_label,
+        block_indices_by_label,
+        emit_ctx,
+    )?;
     if let Some(counter_ref) = entry_counter_ref {
         emit_increment_counter_ref(fb, counter_ref, emit_ctx);
     }
@@ -16379,6 +16449,51 @@ fn emit_codegen_if_target_arm(
         emit_ctx,
     );
     fb.ins().jump(exec_blocks[target_index], &jump_args);
+    Ok(())
+}
+
+fn is_codegen_backedge(
+    source_label: BlockLabel,
+    target_label: BlockLabel,
+    block_indices_by_label: &HashMap<BlockLabel, usize>,
+) -> Result<bool, String> {
+    let source_index = *block_indices_by_label
+        .get(&source_label)
+        .ok_or_else(|| format!("missing codegen block index for source label {source_label}"))?;
+    let target_index = *block_indices_by_label
+        .get(&target_label)
+        .ok_or_else(|| format!("missing codegen block index for target label {target_label}"))?;
+    Ok(target_index <= source_index)
+}
+
+fn emit_handle_pending_if_backedge(
+    fb: &mut FunctionBuilder<'_>,
+    source_label: BlockLabel,
+    target_label: BlockLabel,
+    block_indices_by_label: &HashMap<BlockLabel, usize>,
+    emit_ctx: &JitEmitCtx<'_>,
+) -> Result<(), String> {
+    if !is_codegen_backedge(source_label, target_label, block_indices_by_label)? {
+        return Ok(());
+    }
+
+    let pending_inst = fb.ins().call(
+        emit_ctx.py_handle_pending_ref,
+        &[emit_ctx.consts.thread_state_value],
+    );
+    let pending_rc = fb.inst_results(pending_inst)[0];
+    let pending_ok = fb
+        .ins()
+        .icmp_imm(ir::condcodes::IntCC::Equal, pending_rc, 0);
+    let continue_block = fb.create_block();
+    fb.ins().brif(
+        pending_ok,
+        continue_block,
+        &[],
+        emit_ctx.consts.step_null_block,
+        &step_null_block_args(emit_ctx),
+    );
+    fb.switch_to_block(continue_block);
     Ok(())
 }
 
@@ -16600,6 +16715,13 @@ fn emit_codegen_branch_table_from_i64(
         fb.switch_to_block(*case_block);
         let target_index =
             codegen_block_index_for_label(function, block_indices_by_label, *target_label)?;
+        emit_handle_pending_if_backedge(
+            fb,
+            source_label,
+            *target_label,
+            block_indices_by_label,
+            emit_ctx,
+        )?;
         let edge_transport = &implicit_target_transports[target_index];
         let mut case_local_env = local_env.clone();
         let mut case_jump_args = Vec::with_capacity(edge_transport.target_args.len());
@@ -16649,6 +16771,13 @@ fn emit_codegen_branch_table_from_i64(
     fb.switch_to_block(default_block);
     let default_index =
         codegen_block_index_for_label(function, block_indices_by_label, default_label)?;
+    emit_handle_pending_if_backedge(
+        fb,
+        source_label,
+        default_label,
+        block_indices_by_label,
+        emit_ctx,
+    )?;
     let edge_transport = &implicit_target_transports[default_index];
     let mut default_local_env = local_env.clone();
     let mut default_jump_args = Vec::with_capacity(edge_transport.target_args.len());
@@ -17073,6 +17202,13 @@ fn emit_typed_codegen_term(
             codegen_block_index_for_label(function, block_indices_by_label, edge.target)?;
         let source_index =
             codegen_block_index_for_label(function, block_indices_by_label, source_label)?;
+        emit_handle_pending_if_backedge(
+            fb,
+            source_label,
+            edge.target,
+            block_indices_by_label,
+            emit_ctx,
+        )?;
         let edge_transport = jump_edge_transports[source_index]
             .as_ref()
             .expect("jump term should have a planned edge transport");
@@ -17800,6 +17936,8 @@ fn build_cranelift_run_bb_specialized_function(
             func_imports.get_or_panic(codegen_env, &mut fb.func, &DP_JIT_PY_CALL_OBJECT_IMPORT);
         let py_vectorcall_ref =
             func_imports.get_or_panic(codegen_env, &mut fb.func, &DP_JIT_PY_VECTORCALL_IMPORT);
+        let py_handle_pending_ref =
+            func_imports.get_or_panic(codegen_env, &mut fb.func, &PY_HANDLE_PENDING_IMPORT);
         let py_call_with_kw_ref =
             func_imports.get_or_panic(codegen_env, &mut fb.func, &DP_JIT_PY_CALL_WITH_KW_IMPORT);
         let enter_recursive_ref = func_imports.get_or_panic(
@@ -18152,6 +18290,7 @@ fn build_cranelift_run_bb_specialized_function(
                 decref_ref,
                 py_call_positional_three_ref,
                 py_vectorcall_ref,
+                py_handle_pending_ref,
                 consts: JitEmitConsts {
                     step_null_block: fast_step_null_block,
                     step_null_args: fast_step_null_args,

@@ -1,3 +1,7 @@
+---
+title: "Compile Runtime Stubs From A Small IR"
+---
+
 # Compile Runtime Stubs From A Small IR
 
 ## Article Spark

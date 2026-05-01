@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import builtins
 import importlib.machinery
 import importlib.util
 import os
@@ -175,8 +176,12 @@ def install():
         sys.meta_path.insert(0, SoacFinder)
 
 
+def _target_is_path(target: str) -> bool:
+    return os.sep in target or target.endswith(".py")
+
+
 def _resolve_target(target: str) -> importlib.machinery.ModuleSpec:
-    if os.sep in target or target.endswith(".py"):
+    if _target_is_path(target):
         path = Path(target)
         if not path.is_file():
             raise SystemExit(f"soac.import_hook: file not found: {target}")
@@ -210,13 +215,25 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("args", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
 
+    target_is_path = _target_is_path(args.module)
     spec = SoacFinder.wrap_spec(_resolve_target(args.module))
     assert spec is not None
     path = Path(spec.origin).resolve()
 
     install()
+    if target_is_path:
+        script_dir = str(path.parent)
+        if sys.path:
+            sys.path[0] = script_dir
+        else:
+            sys.path.insert(0, script_dir)
     sys.argv = [str(path), *args.args]
     module = importlib.util.module_from_spec(spec)
+    if spec.name == "__main__" and target_is_path:
+        # Match `python path.py`: multiprocessing uses a missing __spec__ to
+        # rediscover the main module by path in forkserver/spawn workers.
+        module.__spec__ = None
+        module.__dict__["__builtins__"] = builtins
     sys.modules[spec.name] = module
     sys.argv[0] = str(path)
     assert spec.loader is not None

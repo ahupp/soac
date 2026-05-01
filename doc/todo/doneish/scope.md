@@ -1,3 +1,7 @@
+---
+title: "Scope"
+---
+
  In general the scoping / name representation is a mess.  Some issues:
 
   1. We lower to explicit load/store operations very early, before even getting to blockpy.

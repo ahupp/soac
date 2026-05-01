@@ -1,3 +1,7 @@
+---
+title: "Intrinsics"
+---
+
 Currently, "instrinc" functions like `__dp_add` are defined as plain strings and
 represented as `BlockPyExpr::Call` through the pipeline.  I'd like to carry this in a more structured way, to make codegen easier and
 allow for more type-aware optimizations later on.

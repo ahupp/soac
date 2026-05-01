@@ -1,3 +1,7 @@
+---
+title: "Completed"
+---
+
 
 ## Codex TODO Intake
 

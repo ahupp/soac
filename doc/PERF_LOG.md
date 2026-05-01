@@ -1,3 +1,7 @@
+---
+title: "Codex Optimization Log"
+---
+
 2026-02-04: First run of transformed interpreter path
 
 transformed interpreter
@@ -1329,3 +1333,28 @@ benchmarked throughput delta, and the headline pre/post numbers.
 - notes: verify counters are unchanged, including `runtime_decref=8163218` and
   `runtime_incref=6957036`; the win comes from emitted cleanup shape rather
   than a changed number of executed refcount operations.
+
+## 2026-05-01 - Keep scalar locals out of owned cleanup roots
+
+- jj change id: `kvmsrnls`
+- summary: scalar-local exact-i64 values now keep cleanup-root slots empty
+  until a deopt, fallback, or generic boundary requires PyObject
+  materialization. The merge also removes the old scalar-thread branch special
+  case and resolves `BlockParamRole::Value` through generator resume dispatch.
+- throughput: `+8.27%` specialized pystone median versus a same-window
+  current-main baseline; no-refcount diagnostic `+0.13%`; total pystone JIT
+  code size `-3.53%`
+- pre-change benchmark: `work/bench/wsurmszspnmr_4a2e726b336f`
+  - apply, refcounts enabled, median: `527726 loops/s`
+  - no-refcount diagnostic median: `621519 loops/s`
+  - total pystone code size: `68854 bytes`, `4025` machine blocks
+  - core pystone code size: `65327 bytes`
+- post-change benchmark: `work/bench/kvmsrnlslooy`
+  - apply, refcounts enabled, median: `571371 loops/s`
+  - no-refcount diagnostic median: `622344 loops/s`
+  - total pystone code size: `66422 bytes`, `3994` machine blocks
+  - core pystone code size: `62987 bytes`
+- notes: verify counters drop from `runtime_decref=8163218` to `5848196` and
+  `runtime_incref=6957036` to `4642014`; remaining hot refcount sites are still
+  dominated by real stack exit sweeps and boxed integer-result overwrites such
+  as `IntLoc3`, `IntLoc1`, and `IntLoc2`.

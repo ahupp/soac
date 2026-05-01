@@ -1,3 +1,7 @@
+---
+title: "Restore Lazy Annotation Support"
+---
+
 # Restore Lazy Annotation Support
 
 ## Goal

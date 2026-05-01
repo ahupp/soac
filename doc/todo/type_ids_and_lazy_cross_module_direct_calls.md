@@ -1,3 +1,7 @@
+---
+title: "Type IDs And Lazy Cross-Module Direct Calls"
+---
+
 # Type IDs And Lazy Cross-Module Direct Calls
 
 ## Goal

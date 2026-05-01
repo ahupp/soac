@@ -277,6 +277,8 @@ pub(super) static DP_JIT_ENTER_RECURSIVE_CALL_IMPORT: ImportSpec = ImportSpec::n
 );
 pub(super) static PY_THREAD_STATE_GET_UNCHECKED_IMPORT: ImportSpec =
     ImportSpec::new("PyThreadState_GetUnchecked", &[], &[SigType::Pointer]);
+pub(super) static PY_HANDLE_PENDING_IMPORT: ImportSpec =
+    ImportSpec::new("_Py_HandlePending", &[SigType::Pointer], &[SigType::I32]);
 pub(super) static DP_JIT_PY_CALL_WITH_KW_IMPORT: ImportSpec = ImportSpec::new(
     "dp_jit_py_call_with_kw",
     &[SigType::Pointer, SigType::Pointer, SigType::Pointer],
@@ -494,6 +496,7 @@ static JIT_RUNTIME_IMPORT_SPECS: &[&ImportSpec] = &[
     &DP_JIT_PY_VECTORCALL_IMPORT,
     &DP_JIT_ENTER_RECURSIVE_CALL_IMPORT,
     &PY_THREAD_STATE_GET_UNCHECKED_IMPORT,
+    &PY_HANDLE_PENDING_IMPORT,
     &DP_JIT_PY_CALL_WITH_KW_IMPORT,
     &DP_JIT_LOAD_RUNTIME_OBJ_IMPORT,
     &DP_JIT_LOAD_RUNTIME_OBJ_BY_ID_IMPORT,

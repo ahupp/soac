@@ -1,3 +1,7 @@
+---
+title: "Specialization"
+---
+
 # Specialization
 
 This document describes the runtime specializations that SOAC currently

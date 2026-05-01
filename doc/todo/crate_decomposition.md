@@ -1,3 +1,7 @@
+---
+title: "Crate Decomposition For Compile Times"
+---
+
 # Crate Decomposition For Compile Times
 
 ## Problem

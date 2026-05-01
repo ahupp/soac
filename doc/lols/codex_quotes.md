@@ -1,3 +1,7 @@
+---
+title: "Codex Quotes"
+---
+
 • I’ve confirmed load_name_hook is doing the slowest possible thing today:
 
 That doc/lols/async_with.txt dump is the right model: it already shows yield from lowered as explicit blocks for

@@ -1,14 +1,15 @@
 use crate::block_py::{
     build_storage_layout_from_capture_names, compute_make_function_capture_bindings_from_scope,
     compute_storage_layout_from_scope, core_runtime_positional_call_expr_with_meta,
-    is_runtime_closure_name, literal_expr, BindingKind, BindingPurpose, BindingTarget, BlockArg,
-    BlockPyFunction, BlockPyModule, BlockTerm, Call, CallArgPositional, CallableScopeInfo,
-    CallableScopeKind, CellBindingKind, CellCaptureBinding, CellLocation, CellRef, CellRefForName,
-    ChildVisitable, ClassBodyFallback, ClosureInit, ClosureSlot, Del, DelItem, EffectiveBinding,
-    FunctionKind, HasMeta, InstrLow, InstrResolved, InstrUnresolved, IntLiteral, Load, MakeCell,
-    MakeFunction, MakeFunctionWithClosure, MapFunction, MapInstr, Mappable, NameLike, NameLocation,
-    NumberLiteral, NumberLiteralValue, ResolvedName, RuntimeFunctionId, RuntimeName, SetItem,
-    StorageLayout, Store, StringLiteral, Tuple, UnresolvedName, Visit, VisitMut, WithMeta,
+    is_runtime_closure_name, literal_expr, BindingKind, BindingPurpose, BindingTarget, Block,
+    BlockArg, BlockPyFunction, BlockPyModule, BlockTerm, Call, CallArgPositional,
+    CallableScopeInfo, CallableScopeKind, CellBindingKind, CellCaptureBinding, CellLocation,
+    CellRef, CellRefForName, ChildVisitable, ClassBodyFallback, ClosureInit, ClosureSlot, Del,
+    DelItem, EffectiveBinding, FunctionKind, HasMeta, InstrLow, InstrResolved, InstrUnresolved,
+    IntLiteral, Load, MakeCell, MakeFunction, MakeFunctionWithClosure, MapFunction, MapInstr,
+    MapTerm, Mappable, NameLike, NameLocation, NumberLiteral, NumberLiteralValue, ResolvedName,
+    RuntimeFunctionId, RuntimeName, SetItem, StorageLayout, Store, StringLiteral, Tuple,
+    UnresolvedName, Visit, VisitMut, WithMeta,
 };
 use crate::passes::ruff_to_blockpy::{
     populate_exception_edge_args, rewrite_current_exception_in_core_blocks,
@@ -1434,7 +1435,7 @@ fn ensure_storage_layout_covers_block_params<P: crate::block_py::ModuleShape>(
 
 struct NameLocator<'a> {
     scope: &'a CallableScopeInfo,
-    block_param_names: HashSet<String>,
+    current_block_param_names: HashSet<String>,
     local_slots: HashMap<String, u32>,
     captured_cell_slots: HashMap<String, u32>,
     owned_cell_slots: HashMap<String, u32>,
@@ -1442,6 +1443,52 @@ struct NameLocator<'a> {
 }
 
 impl NameLocator<'_> {
+    fn map_block_with_current_params(
+        &mut self,
+        block: Block<InstrUnresolved>,
+    ) -> Block<InstrResolved> {
+        let previous_block_param_names = std::mem::replace(
+            &mut self.current_block_param_names,
+            block.param_names().map(ToString::to_string).collect(),
+        );
+        let block = Block {
+            label: block.label,
+            body: block
+                .body
+                .into_iter()
+                .map(|stmt| self.map_instr(stmt))
+                .collect(),
+            term: self.map_term(block.term),
+            params: block.params,
+            exc_edge: block.exc_edge,
+            extra: Default::default(),
+        };
+        self.current_block_param_names = previous_block_param_names;
+        block
+    }
+
+    fn map_callable(
+        &mut self,
+        func: BlockPyFunction<CoreModuleShape>,
+    ) -> BlockPyFunction<ResolvedStorageModuleShape> {
+        BlockPyFunction {
+            function_id: func.function_id,
+            name_gen: func.name_gen,
+            names: func.names,
+            kind: func.kind,
+            execution_mode: func.execution_mode,
+            params: func.params,
+            blocks: func
+                .blocks
+                .into_iter()
+                .map(|block| self.map_block_with_current_params(block))
+                .collect(),
+            doc: func.doc,
+            storage_layout: func.storage_layout,
+            scope: func.scope,
+        }
+    }
+
     fn resolve_raw_cell_location(&self, name_text: &str) -> CellLocation {
         if let Some(slot) = self.owned_cell_slots.get(name_text).copied() {
             return CellLocation::Owned(slot);
@@ -1516,7 +1563,7 @@ impl NameLocator<'_> {
 
     fn locate_name(&mut self, name: crate::block_py::BlockPyName) -> ResolvedName {
         let name_text = name.to_string();
-        let location = if self.block_param_names.contains(name_text.as_str()) {
+        let location = if self.current_block_param_names.contains(name_text.as_str()) {
             let slot = self
                 .local_slots
                 .get(name_text.as_str())
@@ -1754,24 +1801,19 @@ fn locate_names_in_callable(
     callable: BlockPyFunction<CoreModuleShape>,
 ) -> BlockPyFunction<ResolvedStorageModuleShape> {
     let scope = callable.scope.clone();
-    let block_param_names = callable
-        .blocks
-        .iter()
-        .flat_map(|block| block.param_names().map(ToString::to_string))
-        .collect::<HashSet<_>>();
     let local_slots = collect_local_slot_locations(&callable);
     let captured_cell_slots = collect_captured_cell_slot_locations(&callable);
     let owned_cell_slots = collect_owned_cell_slot_locations(&callable);
     let cell_bindings = collect_cell_bindings(&callable);
     let mut mapper = NameLocator {
         scope: &scope,
-        block_param_names,
+        current_block_param_names: HashSet::new(),
         local_slots,
         captured_cell_slots,
         owned_cell_slots,
         cell_bindings,
     };
-    mapper.map_fn(callable)
+    mapper.map_callable(callable)
 }
 
 fn collect_make_function_callee_ids_in_expr(

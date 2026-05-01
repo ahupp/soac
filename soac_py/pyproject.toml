@@ -16,5 +16,6 @@ packages = ["soac"]
 
 [dependency-groups]
 dev = [
+    "pyperformance>=1.14.0",
     "pytest>=8,<9",
 ]

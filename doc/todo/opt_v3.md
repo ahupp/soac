@@ -1,3 +1,7 @@
+---
+title: "Optimizer v3"
+---
+
 # Optimizer v3
 
 This plan refines the `opt_v2` idea around one hard requirement:

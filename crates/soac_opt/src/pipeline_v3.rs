@@ -291,7 +291,11 @@ fn plan_and_emit_module_v3_from_raw_evidence_with_target_index(
     let mut functions = Vec::new();
     let mut diagnostics_by_function = Vec::new();
     for function in &lowered_module.callable_defs {
-        let attempts = extract_function_regions_v3(function);
+        let attempts = if function_uses_generator_resume_state(function) {
+            Vec::new()
+        } else {
+            extract_function_regions_v3(function)
+        };
         let hints_by_region = attempts
             .iter()
             .filter_map(|attempt| {
@@ -371,6 +375,19 @@ fn plan_and_emit_module_v3_from_raw_evidence_with_target_index(
         .map_err(ExactIntBranchV3Error::Emit)?;
     let emission = emit_mechanical_plan_v3(&plan).map_err(ExactIntBranchV3Error::Emit)?;
     Ok(ExactIntBranchV3Artifacts { plan, emission })
+}
+
+fn function_uses_generator_resume_state(
+    function: &BlockPyFunction<BlockPyModuleShape>,
+) -> bool {
+    function.storage_layout.as_ref().is_some_and(|layout| {
+        layout
+            .freevars
+            .iter()
+            .chain(layout.cellvars.iter())
+            .chain(layout.runtime_cells.iter())
+            .any(|slot| slot.logical_name == "_dp_pc")
+    })
 }
 
 pub fn plan_and_emit_extracted_exact_int_branches_v3(
