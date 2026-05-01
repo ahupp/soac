@@ -414,11 +414,15 @@ def read():
     assert jit_row["jit_machine_code_block_count"] > 0
 
 
-def test_eager_compile_reuses_nested_genexpr_direct_entry_without_codegen_log_spam(tmp_path):
-    log_path = tmp_path / "genexpr-jit-events.jsonl"
-    module_name = "eager_genexpr_compile_case"
+def test_eager_compile_leaves_original_named_generators_on_cpython_vectorcall(tmp_path):
+    log_path = tmp_path / "generator-jit-events.jsonl"
+    module_name = "eager_generator_compile_case"
     (tmp_path / f"{module_name}.py").write_text(
         """
+def explicit_items(limit):
+    for item in range(limit):
+        yield item + 1
+
 def gen_sum(limit):
     return sum(item + 1 for item in range(limit))
 
@@ -426,6 +430,7 @@ def run(repeats):
     total = 0
     for _ in range(repeats):
         total += gen_sum(8)
+        total += sum(explicit_items(8))
     return total
 """,
         encoding="utf-8",
@@ -435,14 +440,14 @@ def run(repeats):
         _import_and_run_script(
             tmp_path,
             f"import {module_name} as module",
-            "assert module.run(20) == 720",
+            "assert module.run(20) == 1440",
         ),
         env=_soac_subprocess_env(
             tmp_path,
             work_dir=tmp_path / "soac-work",
             extra_env={
                 "SOAC_COMPILE_MODE": "eager",
-                "SOAC_LOG": f"soac_jit_codegen=info;json={log_path}",
+                "SOAC_LOG": f"soac_jit_codegen=info,soac_function_create=trace;json={log_path}",
             },
         ),
     )
@@ -456,9 +461,24 @@ def run(repeats):
         and row.get("module_name", "").endswith(module_name)
         and row.get("function_qualname", "").endswith("<genexpr>")
     ]
+    explicit_codegen_rows = [
+        row
+        for row in rows
+        if row.get("event") == "soac.jit_codegen"
+        and row.get("module_name", "").endswith(module_name)
+        and row.get("function_qualname", "").endswith("explicit_items")
+    ]
+    skip_rows = [
+        row
+        for row in rows
+        if row.get("event") == "soac.function_create.skip_jit_vectorcall"
+        and row.get("module_name", "").endswith(module_name)
+    ]
 
+    assert any(row.get("function_qualname", "").endswith("explicit_items") for row in skip_rows)
     assert genexpr_codegen_rows
     assert len(genexpr_codegen_rows) <= 2, genexpr_codegen_rows
+    assert not explicit_codegen_rows
 
 
 def test_pre_optimization_blockpy_module_cache_is_reused(tmp_path):

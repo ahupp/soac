@@ -483,6 +483,17 @@ fn make_lazy_clif_entry<'py>(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EntryCodeSource {
+    Original,
+    Generated,
+}
+
+struct InstantiatedEntry<'py> {
+    entry: Bound<'py, PyAny>,
+    code_source: EntryCodeSource,
+}
+
 fn build_closure_shaped_entry_from_ordered_captures<'py>(
     py: Python<'py>,
     dp: &Bound<'py, PyModule>,
@@ -492,11 +503,13 @@ fn build_closure_shaped_entry_from_ordered_captures<'py>(
     captured_names: &[String],
     captured_values: &[Bound<'py, PyAny>],
     original_code: Option<&Bound<'py, PyAny>>,
-) -> PyResult<Bound<'py, PyAny>> {
+) -> PyResult<InstantiatedEntry<'py>> {
     debug_assert!(!captured_names.is_empty());
     debug_assert_eq!(captured_names.len(), captured_values.len());
+    let mut code_source = EntryCodeSource::Generated;
     let code = if let Some(code) = original_code {
         if code_freevars_match_names(code, captured_names)? {
+            code_source = EntryCodeSource::Original;
             code.clone()
         } else {
             let (is_async, is_generator) = match function.lowered_kind() {
@@ -552,7 +565,10 @@ fn build_closure_shaped_entry_from_ordered_captures<'py>(
     if unsafe { ffi::PyFunction_SetClosure(func.as_ptr(), closure.as_ptr()) } != 0 {
         return Err(PyErr::fetch(py));
     }
-    Ok(func.into_any())
+    Ok(InstantiatedEntry {
+        entry: func.into_any(),
+        code_source,
+    })
 }
 
 fn build_closure_shaped_entry<'py>(
@@ -564,7 +580,7 @@ fn build_closure_shaped_entry<'py>(
     captured_names: &[String],
     captured_values: &Bound<'py, PyDict>,
     original_code: Option<&Bound<'py, PyAny>>,
-) -> PyResult<Bound<'py, PyAny>> {
+) -> PyResult<InstantiatedEntry<'py>> {
     debug_assert!(!captured_names.is_empty());
     let generated_code;
     let original_code_matches_captures = match original_code {
@@ -575,11 +591,14 @@ fn build_closure_shaped_entry<'py>(
         }
         None => false,
     };
+    let code_source;
     let code = if original_code_matches_captures {
+        code_source = EntryCodeSource::Original;
         original_code
             .expect("original code should exist after matching captured names")
             .clone()
     } else {
+        code_source = EntryCodeSource::Generated;
         let (is_async, is_generator) = match function.lowered_kind() {
             FunctionKind::Function => (false, false),
             FunctionKind::Coroutine => (true, false),
@@ -628,7 +647,10 @@ fn build_closure_shaped_entry<'py>(
     if unsafe { ffi::PyFunction_SetClosure(func.as_ptr(), closure.as_ptr()) } != 0 {
         return Err(PyErr::fetch(py));
     }
-    Ok(func.into_any())
+    Ok(InstantiatedEntry {
+        entry: func.into_any(),
+        code_source,
+    })
 }
 
 fn apply_function_defaults(
@@ -721,7 +743,7 @@ fn instantiate_bb_function_inner(
             .shared_module_state_owner
             .lookup_original_code(function.function_id)
             .is_some();
-    let entry = instantiate_closure_backed_entry(
+    let instantiated_entry = instantiate_closure_backed_entry(
         py,
         dp,
         function,
@@ -732,6 +754,7 @@ fn instantiate_bb_function_inner(
         function.names.display_name.as_str(),
         function.names.qualname.as_str(),
     )?;
+    let entry = instantiated_entry.entry;
     let (positional_defaults, kwdefaults) = split_param_defaults(py, function, param_defaults)?;
     apply_function_defaults(
         py,
@@ -770,10 +793,31 @@ fn instantiate_bb_function_inner(
             )
         }
         .map_err(|()| PyErr::fetch(py))?;
+    } else if original_generator_entry_can_use_cpython_vectorcall(
+        function,
+        instantiated_entry.code_source,
+    ) {
+        trace!(
+            target: "soac_function_create",
+            event = "soac.function_create.skip_jit_vectorcall",
+            module_name,
+            function_id = %function.function_id,
+            function_qualname = function.names.qualname.as_str(),
+            "leaving original generator function on CPython vectorcall"
+        );
     } else {
         register_jit_vectorcall(py, &entry, function.function_id, module_runtime)?;
     }
     Ok(entry.unbind())
+}
+
+fn original_generator_entry_can_use_cpython_vectorcall(
+    function: &BlockPyFunction<BlockPyModuleShape>,
+    code_source: EntryCodeSource,
+) -> bool {
+    code_source == EntryCodeSource::Original
+        && matches!(function.lowered_kind(), FunctionKind::Generator)
+        && function.names.display_name != "<genexpr>"
 }
 
 fn instantiate_closure_backed_entry<'py>(
@@ -786,7 +830,7 @@ fn instantiate_closure_backed_entry<'py>(
     function_template: Option<&FunctionInstantiationTemplate>,
     entry_name: &str,
     qualname: &str,
-) -> PyResult<Bound<'py, PyAny>> {
+) -> PyResult<InstantiatedEntry<'py>> {
     let original_code = module_runtime
         .shared_module_state_owner
         .lookup_original_code(function.function_id)
@@ -794,22 +838,30 @@ fn instantiate_closure_backed_entry<'py>(
     if let Some(function_template) = function_template {
         let captured_names = function_template.capture_names();
         if let Some(captured_values) = build_ordered_capture_values(py, captures, captured_names)? {
-            let entry = if captured_names.is_empty() {
+            if captured_names.is_empty() {
                 let original_code_without_freevars = match original_code.as_ref() {
                     Some(code) if code_freevars_match_names(code.as_any(), captured_names)? => {
                         Some(code.as_any())
                     }
                     _ => None,
                 };
-                make_lazy_clif_entry(
+                let entry = make_lazy_clif_entry(
                     py,
                     dp,
                     entry_name,
                     module_globals,
                     original_code_without_freevars,
-                )?
+                )?;
+                return Ok(InstantiatedEntry {
+                    entry,
+                    code_source: if original_code_without_freevars.is_some() {
+                        EntryCodeSource::Original
+                    } else {
+                        EntryCodeSource::Generated
+                    },
+                });
             } else {
-                build_closure_shaped_entry_from_ordered_captures(
+                return build_closure_shaped_entry_from_ordered_captures(
                     py,
                     dp,
                     function,
@@ -818,14 +870,13 @@ fn instantiate_closure_backed_entry<'py>(
                     captured_names,
                     captured_values.as_slice(),
                     original_code.as_ref().map(|code| code.as_any()),
-                )?
-            };
-            return Ok(entry);
+                );
+            }
         }
     }
 
     let (captured_names, closure_values) = build_capture_map(py, captures)?;
-    let entry = if captured_names.is_empty() {
+    if captured_names.is_empty() {
         let original_code_without_freevars = match original_code.as_ref() {
             Some(code) => {
                 let freevars_obj = code.getattr("co_freevars")?;
@@ -834,15 +885,23 @@ fn instantiate_closure_backed_entry<'py>(
             }
             None => None,
         };
-        make_lazy_clif_entry(
+        let entry = make_lazy_clif_entry(
             py,
             dp,
             entry_name,
             module_globals,
             original_code_without_freevars,
-        )?
+        )?;
+        return Ok(InstantiatedEntry {
+            entry,
+            code_source: if original_code_without_freevars.is_some() {
+                EntryCodeSource::Original
+            } else {
+                EntryCodeSource::Generated
+            },
+        });
     } else {
-        build_closure_shaped_entry(
+        return build_closure_shaped_entry(
             py,
             dp,
             function,
@@ -851,9 +910,8 @@ fn instantiate_closure_backed_entry<'py>(
             &captured_names,
             &closure_values,
             original_code.as_ref().map(|code| code.as_any()),
-        )?
-    };
-    Ok(entry)
+        );
+    }
 }
 
 pub fn function_kind_name(kind: FunctionKind) -> &'static str {
