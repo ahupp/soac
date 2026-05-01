@@ -1,13 +1,17 @@
 #[cfg(test)]
 use soac_config::SoacEnvConfig;
 use soac_core::block_py::{
-    BinOpKind, BlockArg, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, ConstantExpr,
-    HasSemanticInstrId, InstrKey, InstrLocationMap, Literal, LocalLocation, NumberLiteralValue,
-    RuntimeFunctionId, current_instr_locations,
+    BinOpKind, BlockArg, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, ChildVisitable,
+    ConstantExpr, HasSemanticInstrId, InstrKey, InstrLocationMap, Literal, LocalLocation,
+    NumberLiteralValue, RuntimeFunctionId, Visit, current_instr_locations, is_internal_symbol,
 };
 #[cfg(test)]
 use soac_ir_blockpy::BlockPyModuleShape;
-use soac_ir_typed::{FactStore, InstrTyped, TypedBlock, TypedBlockPyModuleShape, ValueFacts};
+use soac_ir_typed::emit_v3::{MechanicalExitKind, MechanicalStepOp};
+use soac_ir_typed::plan_v3::{MaterializeKind, PlanValue, Rep};
+use soac_ir_typed::{
+    FactStore, InstrTyped, TypedBlock, TypedBlockPyModuleShape, TypedExactIntReturnPlan, ValueFacts,
+};
 pub use soac_opt::passes::{
     BlockParamFacts, FunctionLocalPlan, LocalRefKind, ParamBindingFacts, ParamProvenance,
     PlannedLocalBinding, PlannedLocalStorage, render_planned_local_binding,
@@ -93,6 +97,7 @@ pub struct EdgeTransportPlan {
 pub enum RuntimeBlockParamRepr {
     PyObject,
     ExactI64,
+    I32Bool01,
 }
 
 #[derive(Clone, Debug)]
@@ -176,6 +181,16 @@ impl PlannedCleanupRootSlotStates {
             .unwrap_or_default()
     }
 
+    pub fn entry_state_for_block(
+        &self,
+        label: BlockLabel,
+    ) -> HashMap<String, CleanupRootSlotState> {
+        self.block_entry_states
+            .get(&label)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     pub fn union_exit_states(&self) -> HashMap<String, CleanupRootSlotState> {
         let mut union = HashMap::new();
         for states in self.block_exit_states.values() {
@@ -191,6 +206,7 @@ pub struct PlannedJitFunctionLocals {
     pub refcount_plan: FunctionRefcountPlan,
     pub cleanup_root_names: HashSet<String>,
     pub cleanup_root_slot_states: PlannedCleanupRootSlotStates,
+    pub truthiness_only_local_locations: HashSet<LocalLocation>,
     pub runtime_block_params: Vec<Vec<RuntimeBlockParamPlan>>,
     pub implicit_target_transports: Vec<EdgeTransportPlan>,
     pub jump_edge_transports: Vec<Option<EdgeTransportPlan>>,
@@ -1432,6 +1448,14 @@ fn typed_expr_can_satisfy_planned_i64(
     if typed_expr_planned_const_i64(expr, module_constants).is_some() {
         return true;
     }
+    if expr
+        .typed_extra()
+        .and_then(|extra| extra.exact_int_return_plan())
+        .and_then(exact_int_return_plan_i64_result)
+        .is_some()
+    {
+        return true;
+    }
     match expr {
         InstrTyped::Load(op) => op.name.local_location().is_some_and(|location| {
             local_reprs.get(&location) == Some(&RuntimeBlockParamRepr::ExactI64)
@@ -1445,6 +1469,121 @@ fn typed_expr_can_satisfy_planned_i64(
                 )
         }
         _ => matches!(expr.result_facts(), Some(ValueFacts::I64(_))),
+    }
+}
+
+pub(super) fn exact_int_return_plan_i64_result(
+    plan: &TypedExactIntReturnPlan,
+) -> Option<PlanValue> {
+    let [exit] = plan.hot_region.exits.as_slice() else {
+        return None;
+    };
+    let MechanicalExitKind::Return {
+        value: return_value,
+    } = exit.kind
+    else {
+        return None;
+    };
+    plan.hot_region.steps.iter().find_map(|step| match step.op {
+        MechanicalStepOp::Materialize {
+            kind: MaterializeKind::PythonLong,
+            input,
+            output,
+        } if output == return_value && input.rep == Rep::I64 => Some(input),
+        _ => None,
+    })
+}
+
+pub(super) fn exact_int_return_plan_i32_bool01_result(
+    plan: &TypedExactIntReturnPlan,
+) -> Option<PlanValue> {
+    let [exit] = plan.hot_region.exits.as_slice() else {
+        return None;
+    };
+    let MechanicalExitKind::Return {
+        value: return_value,
+    } = exit.kind
+    else {
+        return None;
+    };
+    plan.hot_region.steps.iter().find_map(|step| match step.op {
+        MechanicalStepOp::Materialize {
+            kind: MaterializeKind::PythonBool,
+            input,
+            output,
+        } if output == return_value && input.rep == Rep::I32Bool01 => Some(input),
+        _ => None,
+    })
+}
+
+pub(super) fn exact_int_return_plan_immortal_pyobject_result(
+    plan: &TypedExactIntReturnPlan,
+) -> Option<PlanValue> {
+    let [exit] = plan.hot_region.exits.as_slice() else {
+        return None;
+    };
+    let MechanicalExitKind::Return { value } = exit.kind else {
+        return None;
+    };
+    (value.rep == Rep::PyObjectImmortal).then_some(value)
+}
+
+fn typed_expr_can_satisfy_planned_i32_bool01(
+    expr: &InstrTyped,
+    local_reprs: &HashMap<LocalLocation, RuntimeBlockParamRepr>,
+) -> bool {
+    if expr
+        .typed_extra()
+        .and_then(|extra| extra.exact_int_return_plan())
+        .and_then(exact_int_return_plan_i32_bool01_result)
+        .is_some()
+    {
+        return true;
+    }
+    match expr {
+        InstrTyped::Load(op) => op.name.local_location().is_some_and(|location| {
+            local_reprs.get(&location) == Some(&RuntimeBlockParamRepr::I32Bool01)
+        }),
+        InstrTyped::Truthy(_) => true,
+        _ => matches!(expr.result_facts(), Some(ValueFacts::Bool(_))),
+    }
+}
+
+pub(super) fn typed_expr_can_satisfy_pyobject_truthiness_repr(expr: &InstrTyped) -> bool {
+    matches!(
+        expr,
+        InstrTyped::Load(_)
+            | InstrTyped::BinOp(_)
+            | InstrTyped::UnaryOp(_)
+            | InstrTyped::CallTyped(_)
+            | InstrTyped::GuardedCallableCallTyped(_)
+            | InstrTyped::GuardedMethodCallTyped(_)
+            | InstrTyped::DirectCallableCallTyped(_)
+            | InstrTyped::DirectMethodCallTyped(_)
+            | InstrTyped::DirectCallGuardTest(_)
+            | InstrTyped::IncrementCounter(_)
+            | InstrTyped::CellRef(_)
+            | InstrTyped::MakeFunctionWithClosure(_)
+    )
+}
+
+fn typed_store_runtime_repr_for_value(
+    location: LocalLocation,
+    value: &InstrTyped,
+    local_reprs: &HashMap<LocalLocation, RuntimeBlockParamRepr>,
+    module_constants: &[ConstantExpr],
+    truthiness_only_local_locations: &HashSet<LocalLocation>,
+) -> RuntimeBlockParamRepr {
+    if typed_expr_can_satisfy_planned_i32_bool01(value, local_reprs) {
+        RuntimeBlockParamRepr::I32Bool01
+    } else if truthiness_only_local_locations.contains(&location)
+        && typed_expr_can_satisfy_pyobject_truthiness_repr(value)
+    {
+        RuntimeBlockParamRepr::I32Bool01
+    } else if typed_expr_can_satisfy_planned_i64(value, local_reprs, module_constants) {
+        RuntimeBlockParamRepr::ExactI64
+    } else {
+        RuntimeBlockParamRepr::PyObject
     }
 }
 
@@ -1473,10 +1612,108 @@ fn local_locations_by_name(
         .unwrap_or_default()
 }
 
+fn internal_local_locations(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+) -> HashSet<LocalLocation> {
+    function
+        .storage_layout()
+        .as_ref()
+        .map(|layout| {
+            layout
+                .stack_slots()
+                .iter()
+                .enumerate()
+                .filter_map(|(slot, name)| {
+                    is_internal_symbol(name).then(|| {
+                        LocalLocation(
+                            u32::try_from(slot)
+                                .expect("storage layout slot index should fit in u32"),
+                        )
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[derive(Default)]
+struct TypedLocalLoadUseCollector {
+    truthiness_uses: HashSet<LocalLocation>,
+    pyobject_uses: HashSet<LocalLocation>,
+}
+
+impl TypedLocalLoadUseCollector {
+    fn visit_pyobject_expr(&mut self, expr: &InstrTyped) {
+        match expr {
+            InstrTyped::Load(op) => {
+                if let Some(location) = op.name.local_location() {
+                    self.pyobject_uses.insert(location);
+                }
+            }
+            InstrTyped::Truthy(op) => self.visit_truthiness_expr(op.value()),
+            _ => expr.visit_children(self),
+        }
+    }
+
+    fn visit_truthiness_expr(&mut self, expr: &InstrTyped) {
+        if let InstrTyped::Load(op) = expr
+            && let Some(location) = op.name.local_location()
+        {
+            self.truthiness_uses.insert(location);
+            return;
+        }
+        self.visit_pyobject_expr(expr);
+    }
+}
+
+impl Visit<InstrTyped> for TypedLocalLoadUseCollector {
+    fn visit_instr(&mut self, expr: &InstrTyped)
+    where
+        InstrTyped: ChildVisitable<InstrTyped>,
+    {
+        self.visit_pyobject_expr(expr);
+    }
+}
+
+fn typed_truthiness_only_internal_local_locations(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+) -> HashSet<LocalLocation> {
+    let internal_locations = internal_local_locations(function);
+    if internal_locations.is_empty() {
+        return HashSet::new();
+    }
+
+    let mut collector = TypedLocalLoadUseCollector::default();
+    for block in &function.blocks {
+        for instr in &block.body {
+            collector.visit_pyobject_expr(instr);
+        }
+        match &block.term {
+            BlockTerm::IfTerm(if_term) => collector.visit_truthiness_expr(&if_term.test),
+            BlockTerm::BranchTable(branch) => collector.visit_pyobject_expr(&branch.index),
+            BlockTerm::Raise(raise) => {
+                if let Some(exc) = &raise.exc {
+                    collector.visit_pyobject_expr(exc);
+                }
+            }
+            BlockTerm::Return(value) => collector.visit_pyobject_expr(value),
+            BlockTerm::Jump(_) => {}
+        }
+    }
+
+    collector
+        .truthiness_uses
+        .difference(&collector.pyobject_uses)
+        .copied()
+        .filter(|location| internal_locations.contains(location))
+        .collect()
+}
+
 fn transfer_runtime_local_reprs_for_typed_block(
     block: &TypedBlock,
     entry_reprs: &HashMap<LocalLocation, RuntimeBlockParamRepr>,
     module_constants: &[ConstantExpr],
+    truthiness_only_local_locations: &HashSet<LocalLocation>,
 ) -> HashMap<LocalLocation, RuntimeBlockParamRepr> {
     let mut reprs = entry_reprs.clone();
     for instr in &block.body {
@@ -1485,15 +1722,13 @@ fn transfer_runtime_local_reprs_for_typed_block(
                 let Some(location) = op.name.local_location() else {
                     continue;
                 };
-                let repr = if typed_expr_can_satisfy_planned_i64(
+                let repr = typed_store_runtime_repr_for_value(
+                    location,
                     op.value.as_ref(),
                     &reprs,
                     module_constants,
-                ) {
-                    RuntimeBlockParamRepr::ExactI64
-                } else {
-                    RuntimeBlockParamRepr::PyObject
-                };
+                    truthiness_only_local_locations,
+                );
                 reprs.insert(location, repr);
             }
             InstrTyped::Del(op) => {
@@ -1511,17 +1746,19 @@ fn typed_store_runtime_local_repr(
     instr: &InstrTyped,
     local_reprs: &HashMap<LocalLocation, RuntimeBlockParamRepr>,
     module_constants: &[ConstantExpr],
+    truthiness_only_local_locations: &HashSet<LocalLocation>,
 ) -> Option<(LocalLocation, RuntimeBlockParamRepr)> {
     let InstrTyped::Store(op) = instr else {
         return None;
     };
     let location = op.name.local_location()?;
-    let repr =
-        if typed_expr_can_satisfy_planned_i64(op.value.as_ref(), local_reprs, module_constants) {
-            RuntimeBlockParamRepr::ExactI64
-        } else {
-            RuntimeBlockParamRepr::PyObject
-        };
+    let repr = typed_store_runtime_repr_for_value(
+        location,
+        op.value.as_ref(),
+        local_reprs,
+        module_constants,
+        truthiness_only_local_locations,
+    );
     Some((location, repr))
 }
 
@@ -1529,10 +1766,14 @@ fn transfer_runtime_local_repr_for_instr(
     instr: &InstrTyped,
     local_reprs: &mut HashMap<LocalLocation, RuntimeBlockParamRepr>,
     module_constants: &[ConstantExpr],
+    truthiness_only_local_locations: &HashSet<LocalLocation>,
 ) {
-    if let Some((location, repr)) =
-        typed_store_runtime_local_repr(instr, local_reprs, module_constants)
-    {
+    if let Some((location, repr)) = typed_store_runtime_local_repr(
+        instr,
+        local_reprs,
+        module_constants,
+        truthiness_only_local_locations,
+    ) {
         local_reprs.insert(location, repr);
         return;
     }
@@ -1645,6 +1886,7 @@ fn planned_runtime_block_param_reprs_for_typed_function(
     function: &BlockPyFunction<TypedBlockPyModuleShape>,
     runtime_block_params: &[Vec<RuntimeBlockParamPlan>],
     module_constants: &[ConstantExpr],
+    truthiness_only_local_locations: &HashSet<LocalLocation>,
 ) -> PlannedRuntimeLocalReprs {
     let block_indices_by_label = typed_block_indices_by_label(function);
     let local_locations_by_name = local_locations_by_name(function);
@@ -1670,6 +1912,7 @@ fn planned_runtime_block_param_reprs_for_typed_function(
                 block,
                 &entry_reprs[source_index],
                 module_constants,
+                truthiness_only_local_locations,
             );
             if let Some(exc_edge) = block.exc_edge.as_ref() {
                 let target_index =
@@ -1951,6 +2194,7 @@ fn transfer_cleanup_root_slot_state_for_block(
     entry_state: &HashMap<String, CleanupRootSlotState>,
     entry_runtime_reprs: &HashMap<LocalLocation, RuntimeBlockParamRepr>,
     module_constants: &[ConstantExpr],
+    truthiness_only_local_locations: &HashSet<LocalLocation>,
     previous_states: Option<&mut HashMap<InstrKey, HashMap<String, CleanupRootSlotState>>>,
 ) -> HashMap<String, CleanupRootSlotState> {
     let mut state = entry_state.clone();
@@ -1971,14 +2215,29 @@ fn transfer_cleanup_root_slot_state_for_block(
     }
 
     for instr in &block.body {
-        let store_repr = typed_store_runtime_local_repr(instr, &runtime_reprs, module_constants);
+        let store_repr = typed_store_runtime_local_repr(
+            instr,
+            &runtime_reprs,
+            module_constants,
+            truthiness_only_local_locations,
+        );
         let Some(instr_id) = instr.try_semantic_instr_id() else {
-            transfer_runtime_local_repr_for_instr(instr, &mut runtime_reprs, module_constants);
+            transfer_runtime_local_repr_for_instr(
+                instr,
+                &mut runtime_reprs,
+                module_constants,
+                truthiness_only_local_locations,
+            );
             continue;
         };
         let instr_key = InstrKey::new(function_id, instr_id);
         let Some(actions) = actions_by_instr.get(&instr_key) else {
-            transfer_runtime_local_repr_for_instr(instr, &mut runtime_reprs, module_constants);
+            transfer_runtime_local_repr_for_instr(
+                instr,
+                &mut runtime_reprs,
+                module_constants,
+                truthiness_only_local_locations,
+            );
             continue;
         };
         for action in actions {
@@ -1998,11 +2257,10 @@ fn transfer_cleanup_root_slot_state_for_block(
                             .or_insert(previous_state);
                     }
                     let new_slot_state = match store_repr {
-                        Some((location, RuntimeBlockParamRepr::ExactI64))
-                            if location == local.location =>
-                        {
-                            CleanupRootSlotState::NoOwnedReference
-                        }
+                        Some((
+                            location,
+                            RuntimeBlockParamRepr::ExactI64 | RuntimeBlockParamRepr::I32Bool01,
+                        )) if location == local.location => CleanupRootSlotState::NoOwnedReference,
                         _ => cleanup_root_slot_state_for_local_ref_state(*new_state),
                     };
                     state.insert(local.name.clone(), new_slot_state);
@@ -2026,7 +2284,12 @@ fn transfer_cleanup_root_slot_state_for_block(
                 _ => {}
             }
         }
-        transfer_runtime_local_repr_for_instr(instr, &mut runtime_reprs, module_constants);
+        transfer_runtime_local_repr_for_instr(
+            instr,
+            &mut runtime_reprs,
+            module_constants,
+            truthiness_only_local_locations,
+        );
     }
     state
 }
@@ -2038,19 +2301,12 @@ pub fn planned_cleanup_root_slot_states_for_typed_function(
     exc_dispatches: &[Option<BlockExcDispatchPlan>],
     runtime_entry_reprs: &[HashMap<LocalLocation, RuntimeBlockParamRepr>],
     module_constants: &[ConstantExpr],
+    truthiness_only_local_locations: &HashSet<LocalLocation>,
 ) -> PlannedCleanupRootSlotStates {
     let block_count = function.blocks.len();
     let block_indices_by_label = typed_block_indices_by_label(function);
     let mut entry_states = vec![empty_cleanup_root_slot_state_map(tracked_slot_names); block_count];
     if let Some(entry_state) = entry_states.first_mut() {
-        for param in function.params.iter() {
-            if tracked_slot_names.contains(&param.name) {
-                entry_state.insert(
-                    param.name.clone(),
-                    CleanupRootSlotState::MaybeOwnedReference,
-                );
-            }
-        }
         for name in tracked_slot_names {
             if is_try_abrupt_kind_slot(name) {
                 entry_state.insert(name.clone(), CleanupRootSlotState::MaybeOwnedReference);
@@ -2070,6 +2326,7 @@ pub fn planned_cleanup_root_slot_states_for_typed_function(
                 &entry_states[source_index],
                 &runtime_entry_reprs[source_index],
                 module_constants,
+                truthiness_only_local_locations,
                 None,
             );
             for (target_index, maybe_dispatch) in cleanup_root_slot_successors_for_block(
@@ -2106,6 +2363,7 @@ pub fn planned_cleanup_root_slot_states_for_typed_function(
             &entry_state,
             &runtime_entry_reprs[index],
             module_constants,
+            truthiness_only_local_locations,
             Some(&mut instr_previous_states),
         );
         block_entry_states.insert(block.label, entry_state);
@@ -2380,12 +2638,14 @@ pub fn plan_jit_typed_function_locals_from_plans(
 ) -> Result<PlannedJitFunctionLocals, String> {
     let block_indices_by_label = typed_block_indices_by_label(function);
     let cleanup_root_names = planned_cleanup_root_names_for_refcount_plan(&refcount_plan);
+    let truthiness_only_local_locations = typed_truthiness_only_internal_local_locations(function);
     let mut runtime_block_params =
         planned_jit_params_for_typed_function(function, &local_plan, &cleanup_root_names)?;
     let runtime_local_reprs = planned_runtime_block_param_reprs_for_typed_function(
         function,
         &runtime_block_params,
         module_constants,
+        &truthiness_only_local_locations,
     );
     apply_runtime_block_param_reprs(
         &mut runtime_block_params,
@@ -2441,6 +2701,7 @@ pub fn plan_jit_typed_function_locals_from_plans(
         &exc_dispatches,
         &runtime_local_reprs.block_entry_reprs,
         module_constants,
+        &truthiness_only_local_locations,
     );
 
     let plan = PlannedJitFunctionLocals {
@@ -2448,6 +2709,7 @@ pub fn plan_jit_typed_function_locals_from_plans(
         refcount_plan,
         cleanup_root_names,
         cleanup_root_slot_states,
+        truthiness_only_local_locations,
         runtime_block_params,
         implicit_target_transports,
         jump_edge_transports,
@@ -2629,7 +2891,7 @@ def f(flag):
     }
 
     #[test]
-    fn local_plan_treats_function_params_as_owned_without_entry_fact() {
+    fn local_plan_treats_function_params_as_borrowed_without_entry_fact() {
         let (prepared, function_index) = prepared_typed_function(
             r#"
 def f(x):
@@ -2648,7 +2910,7 @@ def f(x):
             .block(entry_block.label)
             .expect("missing entry block local plan");
         let x = binding_for_name(block_plan, "x");
-        assert_eq!(x.param_facts.ownership, LocalRefKind::Owned);
+        assert_eq!(x.param_facts.ownership, LocalRefKind::Borrowed);
         assert_eq!(x.param_facts.value, None);
         assert_eq!(x.storage, PlannedLocalStorage::BlockParam);
         assert_eq!(x.param_facts.binding, ParamBindingFacts::DefinitelyBound);
@@ -2884,7 +3146,7 @@ def f(flag):
     }
 
     #[test]
-    fn cleanup_root_slot_state_treats_safe_local_alias_stores_as_borrowed() {
+    fn cleanup_root_slot_state_treats_entry_param_alias_stores_as_borrowed() {
         let (prepared, function_index) = prepared_typed_function(
             r#"
 def f(a, b):
@@ -2902,14 +3164,6 @@ def f(a, b):
             .function(function.function_id)
             .expect("missing JIT local plan");
 
-        for name in ["a", "b", "c", "d"] {
-            assert!(
-                plan.cleanup_root_names.contains(name),
-                "expected {name} to remain a cleanup root name: {:?}",
-                plan.cleanup_root_names
-            );
-        }
-
         let borrowed_rebinds = plan
             .refcount_plan
             .blocks
@@ -2926,9 +3180,22 @@ def f(a, b):
                 )
             })
             .count();
-        assert_eq!(
-            borrowed_rebinds, 2,
-            "both local aliases should be planned as borrowed rebinds"
+        assert_eq!(borrowed_rebinds, 2);
+        assert!(
+            !plan
+                .refcount_plan
+                .blocks
+                .values()
+                .flat_map(|block| block.actions.iter())
+                .any(|action| matches!(
+                    &action.kind,
+                    RefcountActionKind::RebindLocal {
+                        local,
+                        new_state: LocalRefState::Owned,
+                        ..
+                    } if local.name == "c"
+                )),
+            "entry-parameter aliases should stay borrowed instead of taking ownership"
         );
 
         for block in &function.blocks {
@@ -2940,24 +3207,30 @@ def f(a, b):
                 .block_exit_states
                 .get(&block.label)
                 .unwrap_or_else(|| panic!("missing exit state for {}", block.label));
+            let root_state = |name| {
+                states
+                    .get(name)
+                    .copied()
+                    .unwrap_or(CleanupRootSlotState::NoOwnedReference)
+            };
             assert_eq!(
-                states.get("a"),
-                Some(&CleanupRootSlotState::MaybeOwnedReference),
-                "source parameter a should still own the borrowed alias value"
+                root_state("a"),
+                CleanupRootSlotState::NoOwnedReference,
+                "borrowed entry parameter a should not be exit-swept"
             );
             assert_eq!(
-                states.get("b"),
-                Some(&CleanupRootSlotState::MaybeOwnedReference),
-                "unaliased parameter b should still be cleaned up"
+                root_state("b"),
+                CleanupRootSlotState::NoOwnedReference,
+                "unaliased borrowed entry parameter b should not be exit-swept"
             );
             assert_eq!(
-                states.get("c"),
-                Some(&CleanupRootSlotState::NoOwnedReference),
+                root_state("c"),
+                CleanupRootSlotState::NoOwnedReference,
                 "borrowed alias c should not be exit-swept"
             );
             assert_eq!(
-                states.get("d"),
-                Some(&CleanupRootSlotState::NoOwnedReference),
+                root_state("d"),
+                CleanupRootSlotState::NoOwnedReference,
                 "borrowed alias d should not be exit-swept"
             );
         }

@@ -11,6 +11,8 @@ use soac_core::block_py::{
     TryMapModule, TryMapTerm, Visit, VisitMut, WithMeta,
 };
 use soac_ir_blockpy::{BlockPyModuleShape, InstrBlockPy};
+use soac_ir_typed::emit_v3::MechanicalExitKind;
+use soac_ir_typed::plan_v3::Rep;
 use soac_ir_typed::{
     BoolFacts, FactStore, InstrTyped, PyObjFacts, TypedBlock, TypedBlockExtra,
     TypedBlockPyModuleShape, TypedCall, TypedCallAccessPlan, TypedCallEmissionPlan,
@@ -308,22 +310,54 @@ fn plan_typed_instr_result(expr: &InstrTyped) -> Option<TypedPlannedResult> {
     Some(match demand {
         TypedResultDemand::EffectOnly => TypedPlannedResult::EffectOnly,
         TypedResultDemand::PyObject { borrowed_ok } => {
-            let ownership = match expr.result_facts().and_then(ValueFacts::as_pyobj) {
-                Some(py_facts) if py_facts.is_immortal() => TypedPyObjectOwnershipPlan::Immortal,
-                _ if borrowed_ok => {
-                    if let Some(location) = typed_instr_local_load_location(expr) {
-                        TypedPyObjectOwnershipPlan::BorrowedLocal { location }
-                    } else {
-                        TypedPyObjectOwnershipPlan::Owned
+            let ownership = if typed_expr_exact_int_return_is_immortal_pyobject(expr) {
+                TypedPyObjectOwnershipPlan::Immortal
+            } else {
+                match expr.result_facts().and_then(ValueFacts::as_pyobj) {
+                    Some(py_facts) if py_facts.is_immortal() => {
+                        TypedPyObjectOwnershipPlan::Immortal
                     }
+                    _ if borrowed_ok => {
+                        if let Some(location) = typed_instr_local_load_location(expr) {
+                            TypedPyObjectOwnershipPlan::BorrowedLocal { location }
+                        } else {
+                            TypedPyObjectOwnershipPlan::Owned
+                        }
+                    }
+                    _ => TypedPyObjectOwnershipPlan::Owned,
                 }
-                _ => TypedPyObjectOwnershipPlan::Owned,
             };
             TypedPlannedResult::PyObject { ownership }
         }
         TypedResultDemand::I32Bool01 => TypedPlannedResult::I32Bool01,
         TypedResultDemand::I64 | TypedResultDemand::I64Index => TypedPlannedResult::I64,
     })
+}
+
+pub(crate) fn typed_expr_planned_pyobject_ownership(
+    expr: &InstrTyped,
+) -> Option<TypedPyObjectOwnershipPlan> {
+    if let Some(TypedPlannedResult::PyObject { ownership }) = expr.planned_result() {
+        return Some(ownership);
+    }
+    typed_expr_exact_int_return_is_immortal_pyobject(expr)
+        .then_some(TypedPyObjectOwnershipPlan::Immortal)
+}
+
+fn typed_expr_exact_int_return_is_immortal_pyobject(expr: &InstrTyped) -> bool {
+    let Some(plan) = expr
+        .typed_extra()
+        .and_then(|extra| extra.exact_int_return_plan())
+    else {
+        return false;
+    };
+    let [exit] = plan.hot_region.exits.as_slice() else {
+        return false;
+    };
+    let MechanicalExitKind::Return { value } = exit.kind else {
+        return false;
+    };
+    value.rep == Rep::PyObjectImmortal
 }
 
 fn typed_instr_local_load_location(expr: &InstrTyped) -> Option<LocalLocation> {
@@ -617,9 +651,20 @@ pub fn lower_typed_function_call_access_plan_instrs(
     rewriter.count
 }
 
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub struct TypedInlineLocalMapping {
+    pub callee: RuntimeFunctionId,
+    pub inline_instance: u32,
+    pub callee_location: LocalLocation,
+    pub callee_name: String,
+    pub caller_location: LocalLocation,
+    pub caller_name: String,
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub struct TypedInlineInstrIdMapping {
     pub callee: RuntimeFunctionId,
+    pub inline_instance: u32,
     pub callee_instr_id: InstrId,
     pub caller_instr_id: InstrId,
 }
@@ -631,6 +676,7 @@ pub struct TypedInlineRewriteStats {
     pub skipped_candidates: usize,
     pub skipped_exception_edges: usize,
     pub instr_id_mappings: Vec<TypedInlineInstrIdMapping>,
+    pub local_mappings: Vec<TypedInlineLocalMapping>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -640,6 +686,8 @@ pub enum TypedInlineUnsupportedReason {
     MissingCalleeStorageLayout,
     MissingCalleeLocal(LocalLocation),
     MissingParameterLocal,
+    UnsupportedValueBinding(LocalLocation),
+    NonLocalValueBinding(LocalLocation),
     RebindsBoundLocal(LocalLocation),
     ArityMismatch,
     KeywordArguments,
@@ -719,14 +767,20 @@ impl TypedInlineInstrIdAllocator {
 
 struct TypedInlineInstrIdRemapper<'a> {
     callee: RuntimeFunctionId,
+    inline_instance: u32,
     allocator: &'a mut TypedInlineInstrIdAllocator,
     mappings: Vec<TypedInlineInstrIdMapping>,
 }
 
 impl<'a> TypedInlineInstrIdRemapper<'a> {
-    fn new(callee: RuntimeFunctionId, allocator: &'a mut TypedInlineInstrIdAllocator) -> Self {
+    fn new(
+        callee: RuntimeFunctionId,
+        inline_instance: u32,
+        allocator: &'a mut TypedInlineInstrIdAllocator,
+    ) -> Self {
         Self {
             callee,
+            inline_instance,
             allocator,
             mappings: Vec::new(),
         }
@@ -741,6 +795,7 @@ impl<'a> TypedInlineInstrIdRemapper<'a> {
         meta.instr_id = Some(caller_instr_id);
         self.mappings.push(TypedInlineInstrIdMapping {
             callee: self.callee,
+            inline_instance: self.inline_instance,
             callee_instr_id,
             caller_instr_id,
         });
@@ -764,6 +819,7 @@ pub fn inline_typed_function_direct_call_stores(
 
     let mut stats = TypedInlineRewriteStats::default();
     let mut instr_id_allocator = TypedInlineInstrIdAllocator::from_function(function);
+    let mut next_inline_instance = 0;
     let original_blocks = std::mem::take(&mut function.blocks);
     let mut rewritten_blocks = Vec::with_capacity(original_blocks.len());
     for block in original_blocks {
@@ -774,6 +830,7 @@ pub fn inline_typed_function_direct_call_stores(
             block,
             direct_calls_by_instr_id,
             &mut instr_id_allocator,
+            &mut next_inline_instance,
             &mut stats,
         ) {
             TypedInlineBlockRewrite::Rewritten(blocks) => {
@@ -811,6 +868,7 @@ fn build_typed_direct_call_inline_rewrite(
     block: TypedBlock,
     direct_calls_by_instr_id: &HashMap<InstrId, Vec<(RuntimeFunctionId, TypedDirectCallArgPlan)>>,
     instr_id_allocator: &mut TypedInlineInstrIdAllocator,
+    next_inline_instance: &mut u32,
     stats: &mut TypedInlineRewriteStats,
 ) -> TypedInlineBlockRewrite {
     let original_block = block.clone();
@@ -878,6 +936,7 @@ fn build_typed_direct_call_inline_rewrite(
         .map(|_| caller.name_gen.next_block_name())
         .collect::<Vec<_>>();
     let mut instr_id_mappings = Vec::new();
+    let mut local_mappings = Vec::new();
 
     let mut before = block.body;
     let after = before.split_off(candidate.instr_index + 1);
@@ -947,12 +1006,17 @@ fn build_typed_direct_call_inline_rewrite(
             caller.storage_layout = original_storage_layout;
             return TypedInlineBlockRewrite::Unchanged(original_block);
         };
+        let inline_instance = *next_inline_instance;
+        *next_inline_instance = next_inline_instance
+            .checked_add(1)
+            .expect("typed inline instance count should fit in u32");
         let Ok(mut fragment) = build_typed_direct_call_inline_fragment_to_target(
             caller,
             callee,
             cleanup_label,
             &bindings,
             return_target.clone(),
+            inline_instance,
             instr_id_allocator,
         ) else {
             stats.skipped_candidates += 1;
@@ -963,6 +1027,7 @@ fn build_typed_direct_call_inline_rewrite(
             entry.label = hot_label;
         }
         instr_id_mappings.extend(fragment.instr_id_mappings);
+        local_mappings.extend(fragment.local_mappings);
         blocks.extend(fragment.blocks);
     }
 
@@ -1008,6 +1073,7 @@ fn build_typed_direct_call_inline_rewrite(
         TypedInlineResult::EffectOnly => stats.rewritten_effect_only_calls += 1,
     }
     stats.instr_id_mappings.extend(instr_id_mappings);
+    stats.local_mappings.extend(local_mappings);
     TypedInlineBlockRewrite::Rewritten(blocks)
 }
 
@@ -1257,6 +1323,7 @@ fn build_typed_direct_call_inline_fragment_to_target(
     continuation: BlockLabel,
     value_bindings: &TypedInlineValueBindings,
     return_target: ResolvedName,
+    inline_instance: u32,
     instr_id_allocator: &mut TypedInlineInstrIdAllocator,
 ) -> Result<TypedInlineFragment, TypedInlineUnsupportedReason> {
     if callee.blocks.len() == 1 {
@@ -1266,6 +1333,7 @@ fn build_typed_direct_call_inline_fragment_to_target(
             continuation,
             value_bindings,
             return_target,
+            inline_instance,
             instr_id_allocator,
         );
     }
@@ -1275,6 +1343,7 @@ fn build_typed_direct_call_inline_fragment_to_target(
         continuation,
         value_bindings,
         return_target,
+        inline_instance,
         instr_id_allocator,
     )
 }
@@ -1282,6 +1351,7 @@ fn build_typed_direct_call_inline_fragment_to_target(
 struct TypedInlineFragment {
     blocks: Vec<TypedBlock>,
     instr_id_mappings: Vec<TypedInlineInstrIdMapping>,
+    local_mappings: Vec<TypedInlineLocalMapping>,
 }
 
 fn build_single_block_typed_inline_fragment_to_target(
@@ -1290,6 +1360,7 @@ fn build_single_block_typed_inline_fragment_to_target(
     continuation: BlockLabel,
     value_bindings: &TypedInlineValueBindings,
     return_target: ResolvedName,
+    inline_instance: u32,
     instr_id_allocator: &mut TypedInlineInstrIdAllocator,
 ) -> Result<TypedInlineFragment, TypedInlineUnsupportedReason> {
     let callee_layout = callee
@@ -1319,8 +1390,15 @@ fn build_single_block_typed_inline_fragment_to_target(
     };
 
     let locals = allocate_typed_inline_locals(caller, callee_layout, value_bindings)?;
+    let local_mappings = typed_inline_local_mappings(
+        callee.function_id,
+        inline_instance,
+        callee_layout,
+        &locals,
+        value_bindings,
+    )?;
     let mut instr_id_remapper =
-        TypedInlineInstrIdRemapper::new(callee.function_id, instr_id_allocator);
+        TypedInlineInstrIdRemapper::new(callee.function_id, inline_instance, instr_id_allocator);
     let mut remapper =
         TypedInlineLocalRemapper::new(&locals, value_bindings, &mut instr_id_remapper);
     let mut body = callee_block
@@ -1348,6 +1426,7 @@ fn build_single_block_typed_inline_fragment_to_target(
             TypedBlockExtra::default(),
         )],
         instr_id_mappings: instr_id_remapper.finish(),
+        local_mappings,
     })
 }
 
@@ -1357,6 +1436,7 @@ fn build_multi_block_typed_inline_fragment_to_target(
     continuation: BlockLabel,
     value_bindings: &TypedInlineValueBindings,
     return_target: ResolvedName,
+    inline_instance: u32,
     instr_id_allocator: &mut TypedInlineInstrIdAllocator,
 ) -> Result<TypedInlineFragment, TypedInlineUnsupportedReason> {
     let callee_layout = callee
@@ -1384,13 +1464,20 @@ fn build_multi_block_typed_inline_fragment_to_target(
     }
 
     let locals = allocate_typed_inline_locals(caller, callee_layout, value_bindings)?;
+    let local_mappings = typed_inline_local_mappings(
+        callee.function_id,
+        inline_instance,
+        callee_layout,
+        &locals,
+        value_bindings,
+    )?;
     let label_map = callee
         .blocks
         .iter()
         .map(|block| (block.label, caller.name_gen.next_block_name()))
         .collect::<HashMap<_, _>>();
     let mut instr_id_remapper =
-        TypedInlineInstrIdRemapper::new(callee.function_id, instr_id_allocator);
+        TypedInlineInstrIdRemapper::new(callee.function_id, inline_instance, instr_id_allocator);
     let mut remapper =
         TypedInlineLocalRemapper::new(&locals, value_bindings, &mut instr_id_remapper);
     let mut blocks: Vec<TypedBlock> = Vec::with_capacity(callee.blocks.len());
@@ -1430,6 +1517,7 @@ fn build_multi_block_typed_inline_fragment_to_target(
     Ok(TypedInlineFragment {
         blocks,
         instr_id_mappings: instr_id_remapper.finish(),
+        local_mappings,
     })
 }
 
@@ -1459,6 +1547,58 @@ fn allocate_typed_inline_locals(
         );
     }
     Ok(locals)
+}
+
+fn typed_inline_local_mappings(
+    callee: RuntimeFunctionId,
+    inline_instance: u32,
+    callee_layout: &soac_core::block_py::StorageLayout,
+    locals: &HashMap<LocalLocation, TypedTempLocal>,
+    value_bindings: &TypedInlineValueBindings,
+) -> Result<Vec<TypedInlineLocalMapping>, TypedInlineUnsupportedReason> {
+    let mut mappings = Vec::with_capacity(callee_layout.stack_slots().len());
+    for (slot, callee_name) in callee_layout.stack_slots().iter().enumerate() {
+        let callee_location =
+            LocalLocation(u32::try_from(slot).expect("callee stack slot index should fit in u32"));
+        let (caller_location, caller_name) =
+            if let Some(value) = value_bindings.get(&callee_location) {
+                let bound_name = typed_inline_value_binding_name(callee_location, value)?;
+                let Some(location) = bound_name.local_location() else {
+                    return Err(TypedInlineUnsupportedReason::NonLocalValueBinding(
+                        callee_location,
+                    ));
+                };
+                (location, bound_name.id.as_str().to_string())
+            } else {
+                let Some(fresh) = locals.get(&callee_location) else {
+                    return Err(TypedInlineUnsupportedReason::MissingCalleeLocal(
+                        callee_location,
+                    ));
+                };
+                (fresh.location, fresh.name.clone())
+            };
+        mappings.push(TypedInlineLocalMapping {
+            callee,
+            inline_instance,
+            callee_location,
+            callee_name: callee_name.clone(),
+            caller_location,
+            caller_name,
+        });
+    }
+    Ok(mappings)
+}
+
+fn typed_inline_value_binding_name(
+    callee_location: LocalLocation,
+    value: &InstrTyped,
+) -> Result<&ResolvedName, TypedInlineUnsupportedReason> {
+    let InstrTyped::Load(load) = value else {
+        return Err(TypedInlineUnsupportedReason::UnsupportedValueBinding(
+            callee_location,
+        ));
+    };
+    Ok(&load.name)
 }
 
 fn typed_term_has_jump_args(term: &BlockTerm<InstrTyped>) -> bool {

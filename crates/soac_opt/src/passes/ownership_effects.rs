@@ -7,12 +7,14 @@
 //! mirrors, borrowed helper results, and immortal constants are known.
 
 use crate::passes::{BlockPyModuleShape, InstrBlockPy};
+use crate::typed::typed_expr_planned_pyobject_ownership;
 use soac_core::block_py::{
     Block, BlockArg, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, CellLocation,
     ChildVisitable, HasSemanticInstrId, InstrKey, LocalLocation, RuntimeFunctionId, Visit,
 };
 use soac_ir_typed::{
-    FactStore, InstrTyped, PyObjFacts, TypedBlock, TypedBlockPyModuleShape, ValueFacts,
+    FactStore, InstrTyped, PyObjFacts, TypedBlock, TypedBlockPyModuleShape,
+    TypedPyObjectOwnershipPlan, ValueFacts,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -441,12 +443,20 @@ fn validate_typed_function_refcount_plan(
     let local_liveness = compute_typed_local_liveness(function, &location_by_name);
     let local_must_bound = compute_typed_local_must_bound(function, &location_by_name);
     let owned_cell_locations = typed_owned_cell_locations(function, &location_by_name);
+    let precise_entry_states = compute_typed_precise_immortal_entry_states_from_parts(
+        function,
+        facts,
+        &location_by_name,
+        &owned_cell_locations,
+        &target_params,
+        &local_liveness,
+    );
+    let entry_label = function.entry_block().label;
     let block_labels = function
         .blocks
         .iter()
         .map(|block| block.label)
         .collect::<HashSet<_>>();
-    let entry_label = function.entry_block().label;
 
     for label in function_plan.blocks.keys() {
         if !block_labels.contains(label) {
@@ -477,6 +487,7 @@ fn validate_typed_function_refcount_plan(
             &local_liveness,
             &local_must_bound,
             block.label == entry_label,
+            precise_entry_states.get(&block.label),
             errors,
         );
     }
@@ -579,6 +590,14 @@ fn plan_typed_function_refcounts(
     let local_liveness = compute_typed_local_liveness(function, &location_by_name);
     let local_must_bound = compute_typed_local_must_bound(function, &location_by_name);
     let owned_cell_locations = typed_owned_cell_locations(function, &location_by_name);
+    let precise_entry_states = compute_typed_precise_immortal_entry_states_from_parts(
+        function,
+        facts,
+        &location_by_name,
+        &owned_cell_locations,
+        &target_params,
+        &local_liveness,
+    );
 
     let blocks = function
         .blocks
@@ -597,11 +616,230 @@ fn plan_typed_function_refcounts(
                     &local_liveness,
                     &local_must_bound,
                     block.label == entry_label,
+                    precise_entry_states.get(&block.label),
                 ),
             )
         })
         .collect();
     FunctionRefcountPlan { blocks }
+}
+
+pub(crate) fn compute_typed_function_precise_immortal_local_entry_states(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    facts: &FactStore,
+) -> HashMap<BlockLabel, HashMap<LocalLocation, LocalRefState>> {
+    let Some(storage_layout) = function.storage_layout().as_ref() else {
+        return HashMap::new();
+    };
+    let location_by_name = storage_layout
+        .stack_slots()
+        .iter()
+        .enumerate()
+        .map(|(slot, name)| {
+            (
+                name.clone(),
+                LocalLocation(u32::try_from(slot).expect("local slot index should fit in u32")),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let target_params = function
+        .blocks
+        .iter()
+        .map(|block| (block.label, block.param_name_vec()))
+        .collect::<HashMap<_, _>>();
+    let local_liveness = compute_typed_local_liveness(function, &location_by_name);
+    let owned_cell_locations = typed_owned_cell_locations(function, &location_by_name);
+    compute_typed_precise_immortal_entry_states_from_parts(
+        function,
+        facts,
+        &location_by_name,
+        &owned_cell_locations,
+        &target_params,
+        &local_liveness,
+    )
+}
+
+fn compute_typed_precise_immortal_entry_states_from_parts(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    facts: &FactStore,
+    location_by_name: &HashMap<String, LocalLocation>,
+    owned_cell_locations: &HashMap<u32, LocalLocation>,
+    target_params: &HashMap<BlockLabel, Vec<String>>,
+    local_liveness: &LocalLiveness,
+) -> HashMap<BlockLabel, HashMap<LocalLocation, LocalRefState>> {
+    let block_indices_by_label = function
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(index, block)| (block.label, index))
+        .collect::<HashMap<_, _>>();
+    let mut entry_states = vec![HashMap::new(); function.blocks.len()];
+    let mut changed = true;
+    while changed {
+        let mut incoming =
+            vec![Vec::<HashMap<LocalLocation, LocalRefState>>::new(); function.blocks.len()];
+        for (source_index, block) in function.blocks.iter().enumerate() {
+            let exit_state = transfer_typed_precise_immortal_state_through_block(
+                function.function_id,
+                block,
+                facts,
+                &entry_states[source_index],
+                owned_cell_locations,
+            );
+            for (target, explicit_args) in typed_successor_edges(block) {
+                let Some(target_index) = block_indices_by_label.get(&target).copied() else {
+                    continue;
+                };
+                incoming[target_index].push(typed_successor_precise_immortal_state(
+                    target,
+                    explicit_args,
+                    &exit_state,
+                    target_params,
+                    local_liveness,
+                    location_by_name,
+                ));
+            }
+        }
+        changed = false;
+        for (index, incoming_states) in incoming.iter().enumerate() {
+            let new_entry = merge_precise_immortal_incoming_states(incoming_states);
+            if entry_states[index] != new_entry {
+                entry_states[index] = new_entry;
+                changed = true;
+            }
+        }
+    }
+
+    function
+        .blocks
+        .iter()
+        .zip(entry_states)
+        .map(|(block, state)| (block.label, state))
+        .collect()
+}
+
+fn transfer_typed_precise_immortal_state_through_block(
+    function_id: RuntimeFunctionId,
+    block: &TypedBlock,
+    facts: &FactStore,
+    entry_state: &HashMap<LocalLocation, LocalRefState>,
+    owned_cell_locations: &HashMap<u32, LocalLocation>,
+) -> HashMap<LocalLocation, LocalRefState> {
+    let mut state = entry_state.clone();
+    for instr in &block.body {
+        match instr {
+            InstrTyped::Store(op) => {
+                let Some(location) = typed_store_binding_location(op, owned_cell_locations) else {
+                    continue;
+                };
+                if typed_expr_is_precisely_immortal(function_id, &op.value, facts, &state) {
+                    state.insert(location, LocalRefState::Immortal);
+                } else {
+                    state.remove(&location);
+                }
+            }
+            InstrTyped::Del(op) => {
+                if let Some(location) = op.name.local_location() {
+                    state.remove(&location);
+                }
+            }
+            _ => {}
+        }
+    }
+    state
+}
+
+fn typed_expr_is_precisely_immortal(
+    function_id: RuntimeFunctionId,
+    expr: &InstrTyped,
+    facts: &FactStore,
+    state: &HashMap<LocalLocation, LocalRefState>,
+) -> bool {
+    if matches!(
+        typed_expr_planned_pyobject_ownership(expr),
+        Some(TypedPyObjectOwnershipPlan::Immortal)
+    ) {
+        return true;
+    }
+    if let Some(location) = typed_local_load_location(expr) {
+        return state.get(&location) == Some(&LocalRefState::Immortal);
+    }
+    if let Some(ValueFacts::PyObj(py_facts)) =
+        expr.typed_extra().and_then(|extra| extra.result_facts())
+    {
+        return py_facts.is_immortal();
+    }
+    expr.try_semantic_instr_id()
+        .and_then(|instr_id| facts.fact_for(InstrKey::new(function_id, instr_id)))
+        .and_then(ValueFacts::as_pyobj)
+        .is_some_and(PyObjFacts::is_immortal)
+}
+
+fn typed_successor_precise_immortal_state(
+    target: BlockLabel,
+    explicit_args: Option<&[BlockArg]>,
+    exit_state: &HashMap<LocalLocation, LocalRefState>,
+    target_params: &HashMap<BlockLabel, Vec<String>>,
+    local_liveness: &LocalLiveness,
+    location_by_name: &HashMap<String, LocalLocation>,
+) -> HashMap<LocalLocation, LocalRefState> {
+    let mut successor_state = HashMap::new();
+    let mut target_param_locations = HashSet::new();
+    if let Some(params) = target_params.get(&target) {
+        let explicit_start = explicit_args
+            .map(|args| params.len().saturating_sub(args.len()))
+            .unwrap_or(params.len());
+        for (index, target_name) in params.iter().enumerate() {
+            let Some(target_location) = location_by_name.get(target_name).copied() else {
+                continue;
+            };
+            target_param_locations.insert(target_location);
+            let arg = explicit_args.and_then(|args| {
+                index
+                    .checked_sub(explicit_start)
+                    .and_then(|offset| args.get(offset))
+            });
+            let is_immortal =
+                match arg {
+                    Some(BlockArg::Name(source_name)) => location_by_name
+                        .get(source_name)
+                        .is_some_and(|source_location| {
+                            exit_state.get(source_location) == Some(&LocalRefState::Immortal)
+                        }),
+                    Some(BlockArg::None) => true,
+                    Some(BlockArg::CurrentException | BlockArg::AbruptKind(_)) => false,
+                    None => exit_state.get(&target_location) == Some(&LocalRefState::Immortal),
+                };
+            if is_immortal {
+                successor_state.insert(target_location, LocalRefState::Immortal);
+            }
+        }
+    }
+
+    if let Some(live_in) = local_liveness.live_in(target) {
+        for location in live_in.locations() {
+            if target_param_locations.contains(&location) {
+                continue;
+            }
+            if exit_state.get(&location) == Some(&LocalRefState::Immortal) {
+                successor_state.insert(location, LocalRefState::Immortal);
+            }
+        }
+    }
+    successor_state
+}
+
+fn merge_precise_immortal_incoming_states(
+    incoming_states: &[HashMap<LocalLocation, LocalRefState>],
+) -> HashMap<LocalLocation, LocalRefState> {
+    let Some((first, rest)) = incoming_states.split_first() else {
+        return HashMap::new();
+    };
+    let mut merged = first.clone();
+    for incoming in rest {
+        merged.retain(|location, state| incoming.get(location) == Some(state));
+    }
+    merged
 }
 
 pub fn compute_function_local_live_ins(
@@ -922,6 +1160,7 @@ fn plan_typed_block_refcounts(
     local_liveness: &LocalLiveness,
     local_must_bound: &LocalMustBound,
     is_entry_block: bool,
+    precise_entry_states: Option<&HashMap<LocalLocation, LocalRefState>>,
 ) -> BlockRefcountPlan {
     let empty_must_bound = LocalBitSet::empty(locals.len());
     let must_bound_on_entry = local_must_bound
@@ -936,7 +1175,8 @@ fn plan_typed_block_refcounts(
         must_bound_on_entry,
         is_entry_block,
     );
-    let mut borrow_owners = HashMap::<LocalLocation, LocalLocation>::new();
+    apply_precise_immortal_overrides(&mut env, precise_entry_states);
+    let mut borrow_owners = initial_typed_borrow_owners(function, location_by_name, is_entry_block);
     let mut actions = Vec::new();
 
     for (instr_index, instr) in block.body.iter().enumerate() {
@@ -1176,7 +1416,7 @@ fn typed_local_store_borrow_owner(
         LocalRefState::Borrowed => *borrow_owners.get(&source_location)?,
         LocalRefState::Immortal | LocalRefState::Unbound => return None,
     };
-    if !owner_can_back_borrowed_local(owner_location, env, locals) {
+    if !owner_can_back_borrowed_local(owner_location, env, borrow_owners, locals) {
         return None;
     }
     if typed_later_instrs_can_invalidate_borrow(
@@ -1198,11 +1438,34 @@ fn typed_local_store_borrow_owner(
         {
             return None;
         }
-        if !owner_can_survive_unforwarded_edge(owner_location, env, locals) {
+        if !owner_can_survive_unforwarded_edge(owner_location, env, borrow_owners, locals) {
             return None;
         }
     }
     Some(owner_location)
+}
+
+fn initial_typed_borrow_owners(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    location_by_name: &HashMap<String, LocalLocation>,
+    is_entry_block: bool,
+) -> HashMap<LocalLocation, LocalLocation> {
+    if !is_entry_block {
+        return HashMap::new();
+    }
+    function
+        .params
+        .iter()
+        .filter_map(|param| location_by_name.get(&param.name).copied())
+        .map(|location| (location, location))
+        .collect()
+}
+
+fn is_external_borrow_owner(
+    owner_location: LocalLocation,
+    borrow_owners: &HashMap<LocalLocation, LocalLocation>,
+) -> bool {
+    borrow_owners.get(&owner_location) == Some(&owner_location)
 }
 
 fn typed_local_load_location(value: &InstrTyped) -> Option<LocalLocation> {
@@ -1215,6 +1478,7 @@ fn typed_local_load_location(value: &InstrTyped) -> Option<LocalLocation> {
 fn owner_can_back_borrowed_local(
     owner_location: LocalLocation,
     env: &HashMap<LocalLocation, LocalRefState>,
+    borrow_owners: &HashMap<LocalLocation, LocalLocation>,
     locals: &HashMap<LocalLocation, RefcountLocal>,
 ) -> bool {
     match env
@@ -1226,13 +1490,15 @@ fn owner_can_back_borrowed_local(
             .get(&owner_location)
             .is_some_and(|local| !local.name.starts_with("_dp_")),
         LocalRefState::Immortal => true,
-        LocalRefState::Borrowed | LocalRefState::Unbound => false,
+        LocalRefState::Borrowed => is_external_borrow_owner(owner_location, borrow_owners),
+        LocalRefState::Unbound => false,
     }
 }
 
 fn owner_can_survive_unforwarded_edge(
     owner_location: LocalLocation,
     env: &HashMap<LocalLocation, LocalRefState>,
+    borrow_owners: &HashMap<LocalLocation, LocalLocation>,
     locals: &HashMap<LocalLocation, RefcountLocal>,
 ) -> bool {
     match env
@@ -1244,7 +1510,8 @@ fn owner_can_survive_unforwarded_edge(
             .get(&owner_location)
             .is_some_and(|local| !local.name.starts_with("_dp_")),
         LocalRefState::Immortal => true,
-        LocalRefState::Borrowed | LocalRefState::Unbound => false,
+        LocalRefState::Borrowed => is_external_borrow_owner(owner_location, borrow_owners),
+        LocalRefState::Unbound => false,
     }
 }
 
@@ -1315,57 +1582,34 @@ fn typed_successor_preserved_locations(
     local_liveness: &LocalLiveness,
     location_by_name: &HashMap<String, LocalLocation>,
 ) -> Vec<HashSet<LocalLocation>> {
+    typed_successor_edges(block)
+        .into_iter()
+        .map(|(target, explicit_args)| {
+            preserved_locations(
+                target,
+                explicit_args,
+                local_liveness,
+                target_params,
+                location_by_name,
+            )
+        })
+        .collect()
+}
+
+fn typed_successor_edges(block: &TypedBlock) -> Vec<(BlockLabel, Option<&[BlockArg]>)> {
     let mut successors = Vec::new();
     if let Some(edge) = &block.exc_edge {
-        successors.push(preserved_locations(
-            edge.target,
-            Some(&edge.args),
-            local_liveness,
-            target_params,
-            location_by_name,
-        ));
+        successors.push((edge.target, Some(edge.args.as_slice())));
     }
     match &block.term {
-        BlockTerm::Jump(edge) => successors.push(preserved_locations(
-            edge.target,
-            Some(&edge.args),
-            local_liveness,
-            target_params,
-            location_by_name,
-        )),
+        BlockTerm::Jump(edge) => successors.push((edge.target, Some(edge.args.as_slice()))),
         BlockTerm::IfTerm(if_term) => {
-            successors.push(preserved_locations(
-                if_term.then_label,
-                None,
-                local_liveness,
-                target_params,
-                location_by_name,
-            ));
-            successors.push(preserved_locations(
-                if_term.else_label,
-                None,
-                local_liveness,
-                target_params,
-                location_by_name,
-            ));
+            successors.push((if_term.then_label, None));
+            successors.push((if_term.else_label, None));
         }
         BlockTerm::BranchTable(branch) => {
-            for target in &branch.targets {
-                successors.push(preserved_locations(
-                    *target,
-                    None,
-                    local_liveness,
-                    target_params,
-                    location_by_name,
-                ));
-            }
-            successors.push(preserved_locations(
-                branch.default_label,
-                None,
-                local_liveness,
-                target_params,
-                location_by_name,
-            ));
+            successors.extend(branch.targets.iter().copied().map(|target| (target, None)));
+            successors.push((branch.default_label, None));
         }
         BlockTerm::Raise(_) | BlockTerm::Return(_) => {}
     }
@@ -1680,6 +1924,7 @@ fn validate_typed_block_refcount_plan(
     local_liveness: &LocalLiveness,
     local_must_bound: &LocalMustBound,
     is_entry_block: bool,
+    precise_entry_states: Option<&HashMap<LocalLocation, LocalRefState>>,
     errors: &mut Vec<String>,
 ) {
     let expected = plan_typed_block_refcounts(
@@ -1693,6 +1938,7 @@ fn validate_typed_block_refcount_plan(
         local_liveness,
         local_must_bound,
         is_entry_block,
+        precise_entry_states,
     );
     if &expected != block_plan {
         errors.push(format!(
@@ -1720,25 +1966,57 @@ fn initial_block_env(
     if is_entry_block {
         for param in function.params.iter() {
             if let Some(location) = location_by_name.get(&param.name) {
-                env.insert(*location, LocalRefState::Owned);
+                env.insert(*location, LocalRefState::Borrowed);
             }
         }
     }
 
     for name in block.param_names() {
         if let Some(location) = location_by_name.get(name) {
-            env.insert(*location, LocalRefState::Owned);
+            let is_entry_param = is_entry_block
+                && function
+                    .params
+                    .iter()
+                    .any(|param| param.name.as_str() == name);
+            env.insert(
+                *location,
+                if is_entry_param {
+                    LocalRefState::Borrowed
+                } else {
+                    LocalRefState::Owned
+                },
+            );
         }
     }
 
+    let entry_param_locations = if is_entry_block {
+        function
+            .params
+            .iter()
+            .filter_map(|param| location_by_name.get(&param.name).copied())
+            .collect::<HashSet<_>>()
+    } else {
+        HashSet::new()
+    };
     for location in must_bound_on_entry.locations() {
+        if entry_param_locations.contains(&location) {
+            continue;
+        }
         env.insert(location, LocalRefState::Owned);
     }
 
     if let Some(entry_facts) = facts.block_entry_fact(function.function_id, block.label) {
         for (location, py_facts) in entry_facts.local_pyobj_facts() {
             if must_bound_on_entry.contains(location) {
-                env.insert(location, state_for_py_facts(py_facts));
+                let state = state_for_py_facts(py_facts);
+                env.insert(
+                    location,
+                    if entry_param_locations.contains(&location) && state == LocalRefState::Owned {
+                        LocalRefState::Borrowed
+                    } else {
+                        state
+                    },
+                );
             }
         }
     }
@@ -1775,25 +2053,57 @@ fn initial_typed_block_env(
     if is_entry_block {
         for param in function.params.iter() {
             if let Some(location) = location_by_name.get(&param.name) {
-                env.insert(*location, LocalRefState::Owned);
+                env.insert(*location, LocalRefState::Borrowed);
             }
         }
     }
 
     for name in block.param_names() {
         if let Some(location) = location_by_name.get(name) {
-            env.insert(*location, LocalRefState::Owned);
+            let is_entry_param = is_entry_block
+                && function
+                    .params
+                    .iter()
+                    .any(|param| param.name.as_str() == name);
+            env.insert(
+                *location,
+                if is_entry_param {
+                    LocalRefState::Borrowed
+                } else {
+                    LocalRefState::Owned
+                },
+            );
         }
     }
 
+    let entry_param_locations = if is_entry_block {
+        function
+            .params
+            .iter()
+            .filter_map(|param| location_by_name.get(&param.name).copied())
+            .collect::<HashSet<_>>()
+    } else {
+        HashSet::new()
+    };
     for location in must_bound_on_entry.locations() {
+        if entry_param_locations.contains(&location) {
+            continue;
+        }
         env.insert(location, LocalRefState::Owned);
     }
 
     if let Some(entry_facts) = facts.block_entry_fact(function.function_id, block.label) {
         for (location, py_facts) in entry_facts.local_pyobj_facts() {
             if must_bound_on_entry.contains(location) {
-                env.insert(location, state_for_py_facts(py_facts));
+                let state = state_for_py_facts(py_facts);
+                env.insert(
+                    location,
+                    if entry_param_locations.contains(&location) && state == LocalRefState::Owned {
+                        LocalRefState::Borrowed
+                    } else {
+                        state
+                    },
+                );
             }
         }
     }
@@ -1801,11 +2111,32 @@ fn initial_typed_block_env(
     env
 }
 
+fn apply_precise_immortal_overrides(
+    env: &mut HashMap<LocalLocation, LocalRefState>,
+    precise_entry_states: Option<&HashMap<LocalLocation, LocalRefState>>,
+) {
+    let Some(precise_entry_states) = precise_entry_states else {
+        return;
+    };
+    for (location, state) in precise_entry_states {
+        debug_assert_eq!(*state, LocalRefState::Immortal);
+        if *state == LocalRefState::Immortal {
+            env.insert(*location, LocalRefState::Immortal);
+        }
+    }
+}
+
 fn state_for_typed_expr(
     function_id: RuntimeFunctionId,
     expr: &InstrTyped,
     facts: &FactStore,
 ) -> LocalRefState {
+    if matches!(
+        typed_expr_planned_pyobject_ownership(expr),
+        Some(TypedPyObjectOwnershipPlan::Immortal)
+    ) {
+        return LocalRefState::Immortal;
+    }
     if let Some(ValueFacts::PyObj(py_facts)) =
         expr.typed_extra().and_then(|extra| extra.result_facts())
     {
@@ -3117,11 +3448,14 @@ fn expected_release_actions(
 mod tests {
     use super::{
         LocalRefState, RefcountActionKind, RefcountReleaseReason, compute_function_local_live_ins,
-        compute_function_local_must_bound_ins, forwarded_locations, plan_ownership_effects,
-        validate_ownership_effects,
+        compute_function_local_must_bound_ins,
+        compute_typed_function_precise_immortal_local_entry_states, forwarded_locations,
+        plan_ownership_effects, plan_typed_ownership_effects, validate_ownership_effects,
+        validate_typed_ownership_effects,
     };
-    use crate::passes::infer_module_value_facts;
+    use crate::passes::{LocalRefKind, infer_module_value_facts, plan_typed_local_env_module};
     use soac_core::block_py::{BlockArg, BlockLabel, BlockPyFunction, BlockTerm, LocalLocation};
+    use soac_ir_typed::{InstrTyped, TypedPlannedResult, lower_blockpy_module_to_typed};
     use soac_lowering::lower_python_to_blockpy_for_testing;
     use std::collections::{HashMap, HashSet};
 
@@ -3420,6 +3754,112 @@ def outer():
             forwarded,
             HashSet::from([LocalLocation(10), LocalLocation(3)]),
             "explicit edge args should preserve the source local location rather than the tail target param name",
+        );
+    }
+
+    #[test]
+    fn typed_precise_immortal_store_propagates_to_successor_entry_cleanup() {
+        let lowered = lower_python_to_blockpy_for_testing(
+            r#"
+def f(flag):
+    y = flag == flag
+    if flag:
+        pass
+    return y
+"#,
+        )
+        .expect("transform should succeed")
+        .blockpy_module;
+        let facts = infer_module_value_facts(&lowered);
+        let mut typed = lower_blockpy_module_to_typed(lowered);
+        let function = typed
+            .callable_defs
+            .iter_mut()
+            .find(|function| function.names.qualname == "f")
+            .expect("missing typed function f");
+        let mut patched = false;
+        for block in &mut function.blocks {
+            for instr in &mut block.body {
+                let InstrTyped::Store(op) = instr else {
+                    continue;
+                };
+                if op.name.id.as_str() != "y" {
+                    continue;
+                }
+                let Some(extra) = op.value.typed_extra_mut() else {
+                    panic!("typed store value should carry typed extra");
+                };
+                extra.set_planned_result(TypedPlannedResult::PYOBJECT_IMMORTAL);
+                patched = true;
+            }
+        }
+        assert!(patched, "test should patch the y store value");
+
+        let function_id = function.function_id;
+        let entry_states =
+            compute_typed_function_precise_immortal_local_entry_states(function, &facts);
+        let y_location = function
+            .storage_layout()
+            .as_ref()
+            .expect("typed function should have storage")
+            .stack_slots()
+            .iter()
+            .position(|name| name == "y")
+            .map(|slot| LocalLocation(u32::try_from(slot).expect("slot should fit in u32")))
+            .expect("y should have a local slot");
+        assert!(
+            entry_states
+                .values()
+                .any(|states| states.get(&y_location) == Some(&LocalRefState::Immortal)),
+            "successor entry state should preserve the planned immortal store: {entry_states:#?}"
+        );
+
+        let local_env_plan = plan_typed_local_env_module(&typed, &facts);
+        let local_env_function = local_env_plan
+            .function(function_id)
+            .expect("function should have LocalEnv plan");
+        assert!(
+            local_env_function.blocks.values().any(|block| {
+                block.entry_locals.iter().any(|binding| {
+                    binding.location == y_location
+                        && binding.param_facts.ownership == LocalRefKind::Immortal
+                })
+            }),
+            "LocalEnv should consume the same precise immortal entry state: {local_env_function:#?}"
+        );
+
+        let plan = plan_typed_ownership_effects(&typed, &facts);
+        validate_typed_ownership_effects(&typed, &facts, &plan)
+            .expect("typed ownership plan should validate");
+        let function_plan = plan
+            .function(function_id)
+            .expect("function should have refcount plan");
+        let actions = function_plan
+            .blocks
+            .values()
+            .flat_map(|block| block.actions.iter().map(|action| &action.kind))
+            .collect::<Vec<_>>();
+        assert!(
+            actions.iter().any(|action| matches!(
+                action,
+                RefcountActionKind::RebindLocal {
+                    local,
+                    new_state: LocalRefState::Immortal,
+                    ..
+                } if local.name == "y"
+            )),
+            "the patched store should be planned as an immortal rebind: {actions:#?}"
+        );
+        assert!(
+            !actions.iter().any(|action| matches!(
+                action,
+                RefcountActionKind::ReleaseLocal {
+                    local,
+                    reason: RefcountReleaseReason::Return,
+                    ..
+                } if local.name == "y"
+            )),
+            "planned immortal y should not get return cleanup after a successor block: {actions:#?}"
         );
     }
 

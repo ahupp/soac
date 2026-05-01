@@ -57,7 +57,7 @@ pub fn allocate_codegen_stack_temp(
 }
 
 pub use crate::typed::{
-    TypedInlineInstrIdMapping, annotate_typed_function_planned_results,
+    TypedInlineInstrIdMapping, TypedInlineLocalMapping, annotate_typed_function_planned_results,
     annotate_typed_function_result_demands, annotate_typed_function_value_facts,
     annotate_typed_module_value_facts, inline_typed_function_direct_call_stores,
     lower_typed_function_call_access_plan_instrs, lower_typed_function_call_emission_plans,

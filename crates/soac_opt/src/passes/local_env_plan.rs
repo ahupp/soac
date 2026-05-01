@@ -6,14 +6,17 @@
 //! stack-slot loads, or another resume-state representation.
 
 use crate::passes::ownership_effects::{
-    compute_function_local_live_ins, compute_function_local_must_bound_ins,
+    LocalRefState, compute_function_local_live_ins, compute_function_local_must_bound_ins,
     compute_typed_function_local_live_ins, compute_typed_function_local_must_bound_ins,
+    compute_typed_function_precise_immortal_local_entry_states,
 };
 use crate::passes::{BlockPyModuleShape, InstrBlockPy};
+use crate::typed::typed_expr_planned_pyobject_ownership;
 use soac_core::block_py::{
     BlockLabel, BlockPyFunction, BlockPyModule, HasSemanticInstrId, InstrKey, InstrLocationMap,
     LocalLocation, RuntimeFunctionId, current_instr_locations,
 };
+use soac_ir_typed::TypedPyObjectOwnershipPlan;
 use soac_ir_typed::{FactStore, InstrTyped, PyObjFacts, TypedBlockPyModuleShape};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
@@ -816,6 +819,8 @@ pub fn plan_typed_function_locals(
     };
     let live_ins = compute_typed_function_local_live_ins(function);
     let must_bound_ins = compute_typed_function_local_must_bound_ins(function);
+    let precise_entry_states =
+        compute_typed_function_precise_immortal_local_entry_states(function, facts);
     let entry_label = function.entry_block().label;
     let mut blocks = HashMap::with_capacity(function.blocks.len());
     for block in &function.blocks {
@@ -841,6 +846,10 @@ pub fn plan_typed_function_locals(
                         .iter()
                         .any(|param| param.name == name.as_str());
                 let is_must_bound_on_entry = must_bound_locations.contains(&location);
+                let precise_entry_state = precise_entry_states
+                    .get(&block.label)
+                    .and_then(|states| states.get(&location))
+                    .copied();
                 let py_facts = entry_facts
                     .and_then(|env| env.local_pyobj_fact(location))
                     .filter(|_| is_must_bound_on_entry);
@@ -891,6 +900,7 @@ pub fn plan_typed_function_locals(
                                 || is_function_param_on_entry,
                             is_must_bound_on_entry,
                             py_facts,
+                            precise_entry_state,
                         ),
                     },
                 }
@@ -1174,7 +1184,7 @@ fn transfer_typed_resume_local_state(
                 binding.source = value_key
                     .map(LocalEnvResumeValueSource::StoredValue)
                     .unwrap_or(LocalEnvResumeValueSource::Unknown);
-                binding.ownership = local_ref_kind_for_resume_value(py_facts);
+                binding.ownership = local_ref_kind_for_typed_resume_value(&op.value, py_facts);
                 binding.value = py_facts;
             }
         }
@@ -1203,6 +1213,19 @@ fn local_ref_kind_for_resume_value(facts: Option<PyObjFacts>) -> LocalRefKind {
     }
 }
 
+fn local_ref_kind_for_typed_resume_value(
+    value: &InstrTyped,
+    facts: Option<PyObjFacts>,
+) -> LocalRefKind {
+    if matches!(
+        typed_expr_planned_pyobject_ownership(value),
+        Some(TypedPyObjectOwnershipPlan::Immortal)
+    ) {
+        return LocalRefKind::Immortal;
+    }
+    local_ref_kind_for_resume_value(facts)
+}
+
 fn validate_function_local_plan(
     function: &BlockPyFunction<BlockPyModuleShape>,
     facts: &FactStore,
@@ -1226,13 +1249,16 @@ fn local_ref_kind_for_block_entry(
     is_must_bound_on_entry: bool,
     facts: Option<PyObjFacts>,
 ) -> LocalRefKind {
+    let is_function_param =
+        is_entry_block && function.params.iter().any(|param| param.name == name);
     match facts {
         Some(facts) if facts.is_immortal() => return LocalRefKind::Immortal,
-        Some(_) => return LocalRefKind::Owned,
+        Some(_) if !is_function_param => return LocalRefKind::Owned,
+        Some(_) => {}
         None => {}
     }
-    if is_entry_block && function.params.iter().any(|param| param.name == name) {
-        return LocalRefKind::Owned;
+    if is_function_param {
+        return LocalRefKind::Borrowed;
     }
     if is_must_bound_on_entry {
         return LocalRefKind::Owned;
@@ -1250,14 +1276,21 @@ fn local_ref_kind_for_typed_block_entry(
     is_explicit_block_param: bool,
     is_must_bound_on_entry: bool,
     facts: Option<PyObjFacts>,
+    precise_entry_state: Option<LocalRefState>,
 ) -> LocalRefKind {
+    if precise_entry_state == Some(LocalRefState::Immortal) {
+        return LocalRefKind::Immortal;
+    }
+    let is_function_param =
+        is_entry_block && function.params.iter().any(|param| param.name == name);
     match facts {
         Some(facts) if facts.is_immortal() => return LocalRefKind::Immortal,
-        Some(_) => return LocalRefKind::Owned,
+        Some(_) if !is_function_param => return LocalRefKind::Owned,
+        Some(_) => {}
         None => {}
     }
-    if is_entry_block && function.params.iter().any(|param| param.name == name) {
-        return LocalRefKind::Owned;
+    if is_function_param {
+        return LocalRefKind::Borrowed;
     }
     if is_must_bound_on_entry {
         return LocalRefKind::Owned;

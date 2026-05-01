@@ -1385,6 +1385,7 @@ struct JitEmitCtx<'mc> {
     deopt_resume_plan: &'mc PlannedJitDeoptResumeFunction,
     refcount_plan: &'mc FunctionRefcountPlan,
     cleanup_root_slot_states: &'mc PlannedCleanupRootSlotStates,
+    truthiness_only_local_locations: &'mc HashSet<LocalLocation>,
     return_cleanup_blocks_by_label: &'mc HashMap<BlockLabel, ir::Block>,
     instr_locations: &'mc InstrLocationMap,
     counter_slots_by_id: &'mc [CounterRuntimeSlot],
@@ -1559,7 +1560,14 @@ fn collect_typed_guard_miss_deopt_instr_ids(
 
     impl Visit<InstrTyped> for Collector {
         fn visit_instr(&mut self, expr: &InstrTyped) {
-            if expr.guard_miss_deopt_enabled()
+            let exact_int_deopt = expr
+                .typed_extra()
+                .and_then(|extra| extra.exact_int_return_plan())
+                .is_some_and(|plan| {
+                    planning::exact_int_return_plan_i64_result(plan).is_some()
+                        || planning::exact_int_return_plan_immortal_pyobject_result(plan).is_some()
+                });
+            if (expr.guard_miss_deopt_enabled() || exact_int_deopt)
                 && let Some(instr_id) = expr.try_semantic_instr_id()
             {
                 self.instr_ids.insert(instr_id);
@@ -1997,6 +2005,9 @@ enum LocalBindingValue {
         value: ir::Value,
         facts: IntFacts,
     },
+    I32Bool01 {
+        value: ir::Value,
+    },
     Unbound {
         value: ir::Value,
     },
@@ -2023,10 +2034,15 @@ impl LocalBindingValue {
         Self::ExactI64 { value, facts }
     }
 
+    const fn i32_bool01(value: ir::Value) -> Self {
+        Self::I32Bool01 { value }
+    }
+
     const fn value(self) -> ir::Value {
         match self {
             Self::PyObject { value, .. }
             | Self::ExactI64 { value, .. }
+            | Self::I32Bool01 { value }
             | Self::Unbound { value } => value,
         }
     }
@@ -2034,7 +2050,7 @@ impl LocalBindingValue {
     const fn ref_kind(self) -> LocalRefKind {
         match self {
             Self::PyObject { ref_kind, .. } => ref_kind,
-            Self::ExactI64 { .. } => LocalRefKind::Immortal,
+            Self::ExactI64 { .. } | Self::I32Bool01 { .. } => LocalRefKind::Immortal,
             Self::Unbound { .. } => LocalRefKind::Unbound,
         }
     }
@@ -2042,7 +2058,7 @@ impl LocalBindingValue {
     const fn py_facts(self) -> Option<PyObjFacts> {
         match self {
             Self::PyObject { py_facts, .. } => py_facts,
-            Self::ExactI64 { .. } => None,
+            Self::ExactI64 { .. } | Self::I32Bool01 { .. } => None,
             Self::Unbound { .. } => None,
         }
     }
@@ -2050,7 +2066,14 @@ impl LocalBindingValue {
     const fn i64_facts(self) -> Option<IntFacts> {
         match self {
             Self::ExactI64 { facts, .. } => Some(facts),
-            Self::PyObject { .. } | Self::Unbound { .. } => None,
+            Self::PyObject { .. } | Self::I32Bool01 { .. } | Self::Unbound { .. } => None,
+        }
+    }
+
+    const fn i32_bool01_facts(self) -> Option<IntFacts> {
+        match self {
+            Self::I32Bool01 { .. } => Some(IntFacts::i32_bool01()),
+            Self::PyObject { .. } | Self::ExactI64 { .. } | Self::Unbound { .. } => None,
         }
     }
 
@@ -2116,6 +2139,23 @@ impl LocalEnvEntry {
         )
     }
 
+    fn i32_bool01(
+        location: Option<LocalLocation>,
+        name: String,
+        aliases: Vec<String>,
+        value: ir::Value,
+        storage: LocalEnvStorage,
+    ) -> Self {
+        Self::new(
+            location,
+            name,
+            aliases,
+            LocalBindingValue::i32_bool01(value),
+            storage,
+            ParamBindingFacts::DefinitelyBound,
+        )
+    }
+
     const fn value(&self) -> ir::Value {
         self.binding.value()
     }
@@ -2130,6 +2170,10 @@ impl LocalEnvEntry {
 
     const fn i64_facts(&self) -> Option<IntFacts> {
         self.binding.i64_facts()
+    }
+
+    const fn i32_bool01_facts(&self) -> Option<IntFacts> {
+        self.binding.i32_bool01_facts()
     }
 
     const fn is_pyobject_binding(&self) -> bool {
@@ -2228,6 +2272,27 @@ impl LocalEnv {
         ));
     }
 
+    fn bind_entry_location_i32_bool01_with_aliases(
+        &mut self,
+        location: LocalLocation,
+        name: &str,
+        aliases: Vec<String>,
+        value: ir::Value,
+        storage: LocalEnvStorage,
+    ) {
+        debug_assert!(
+            self.entry_index_for_location(location).is_none(),
+            "block-entry LocalEnv location should be bound once"
+        );
+        self.entries.push(LocalEnvEntry::i32_bool01(
+            Some(location),
+            name.to_string(),
+            aliases,
+            value,
+            storage,
+        ));
+    }
+
     fn entry_index_for_location(&self, location: LocalLocation) -> Option<usize> {
         self.entries
             .iter()
@@ -2293,6 +2358,23 @@ impl LocalEnv {
             })
     }
 
+    fn scalar_i32_bool01_value_for_load(
+        &self,
+        name: &ResolvedName,
+    ) -> Option<(ir::Value, IntFacts)> {
+        name.local_location()
+            .and_then(|location| {
+                self.entry_index_for_location(location)
+                    .or_else(|| self.entry_index_for_name(name.id.as_str()))
+            })
+            .or_else(|| self.entry_index_for_name(name.id.as_str()))
+            .and_then(|index| {
+                self.entries[index]
+                    .i32_bool01_facts()
+                    .map(|facts| (self.entries[index].value(), facts))
+            })
+    }
+
     fn scalar_i64_value_for_name(&self, name: &str) -> Option<(ir::Value, IntFacts)> {
         self.entry_index_for_name(name).and_then(|index| {
             self.entries[index]
@@ -2327,6 +2409,24 @@ impl LocalEnv {
                     None,
                 );
                 let (value, ownership, _) = result.expect_pyobject("scalar local materialization");
+                debug_assert!(
+                    ownership.is_owned() || matches!(ownership, ValueOwnership::Immortal)
+                );
+                return Some(value);
+            }
+            if let Some(facts) = entry.i32_bool01_facts() {
+                let result = emit_soac_value_result_for_demand(
+                    fb,
+                    SoacValue::i32(entry.value(), facts),
+                    ctx,
+                    if borrowed {
+                        ResultDemand::PYOBJECT_BORROWED_OK
+                    } else {
+                        ResultDemand::PYOBJECT_OWNED
+                    },
+                    None,
+                );
+                let (value, ownership, _) = result.expect_pyobject("scalar bool materialization");
                 debug_assert!(
                     ownership.is_owned() || matches!(ownership, ValueOwnership::Immortal)
                 );
@@ -2375,6 +2475,24 @@ impl LocalEnv {
                     None,
                 );
                 let (value, ownership, _) = result.expect_pyobject("scalar local materialization");
+                debug_assert!(
+                    ownership.is_owned() || matches!(ownership, ValueOwnership::Immortal)
+                );
+                return Some(value);
+            }
+            if let Some(facts) = entry.i32_bool01_facts() {
+                let result = emit_soac_value_result_for_demand(
+                    fb,
+                    SoacValue::i32(entry.value(), facts),
+                    ctx,
+                    if borrowed {
+                        ResultDemand::PYOBJECT_BORROWED_OK
+                    } else {
+                        ResultDemand::PYOBJECT_OWNED
+                    },
+                    None,
+                );
+                let (value, ownership, _) = result.expect_pyobject("scalar bool materialization");
                 debug_assert!(
                     ownership.is_owned() || matches!(ownership, ValueOwnership::Immortal)
                 );
@@ -2466,6 +2584,69 @@ impl LocalEnv {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn store_i32_bool01_location(
+        &mut self,
+        fb: &mut FunctionBuilder<'_>,
+        location: LocalLocation,
+        name: &str,
+        value: ir::Value,
+        cleanup_root_previous_state: CleanupRootSlotState,
+        stack_slots: &StackSlots,
+        refcount_location_counters: Option<RefcountDecrefLocationCounterParts<'_>>,
+        ptr_ty: ir::Type,
+        thread_state_value: ir::Value,
+        decref_ref: ir::FuncRef,
+    ) {
+        let previous_entry = if let Some(existing_index) = self
+            .entry_index_for_location(location)
+            .or_else(|| self.entry_index_for_name(name))
+        {
+            Some(self.entries.remove(existing_index))
+        } else {
+            None
+        };
+        let previous_had_stack_mirror = previous_entry
+            .as_ref()
+            .is_some_and(|entry| entry.storage == LocalEnvStorage::StackMirror);
+        if stack_slots.has_name(name) && (previous_entry.is_none() || previous_had_stack_mirror) {
+            let previous_state = if stack_slots.has_cleanup_root_name(name) {
+                cleanup_root_previous_state
+            } else {
+                CleanupRootSlotState::MaybeOwnedReference
+            };
+            if previous_state.may_hold_owned_reference() {
+                stack_slots
+                    .clear_value_with_previous_state_counted(
+                        fb,
+                        name,
+                        previous_state,
+                        ptr_ty,
+                        thread_state_value,
+                        decref_ref,
+                        refcount_location_counters,
+                    )
+                    .expect("slot-backed scalar bool local missing from stack slots");
+            }
+        }
+        self.entries.push(LocalEnvEntry::i32_bool01(
+            Some(location),
+            name.to_string(),
+            previous_entry
+                .as_ref()
+                .map(|entry| entry.aliases.clone())
+                .unwrap_or_default(),
+            value,
+            LocalEnvStorage::LocalOnly,
+        ));
+        if let Some(previous) = previous_entry
+            && previous.storage == LocalEnvStorage::LocalOnly
+            && transient_local_needs_decref(previous.ref_kind())
+        {
+            emit_decref_if_not_null(fb, ptr_ty, decref_ref, thread_state_value, previous.value());
+        }
+    }
+
     fn store_location(
         &mut self,
         fb: &mut FunctionBuilder<'_>,
@@ -2493,12 +2674,15 @@ impl LocalEnv {
         };
         let is_cleanup_root = stack_slots.has_cleanup_root_name(name);
         let should_mirror_stack_slot = stack_slots.has_name(name)
-            && (is_cleanup_root
-                || match previous_entry.as_ref().map(|entry| entry.storage) {
+            && if is_cleanup_root {
+                transient_local_needs_decref(value_ref_kind)
+            } else {
+                match previous_entry.as_ref().map(|entry| entry.storage) {
                     Some(LocalEnvStorage::LocalOnly) => false,
                     Some(LocalEnvStorage::StackMirror) => true,
                     None => !allow_local_only_slot_backed_store,
-                });
+                }
+            };
         if should_mirror_stack_slot {
             if is_cleanup_root {
                 stack_slots
@@ -2552,17 +2736,30 @@ impl LocalEnv {
                 py_facts,
             ));
         } else {
-            if previous_entry.is_none() && stack_slots.has_name(name) {
-                stack_slots
-                    .clear_value_counted(
-                        fb,
-                        name,
-                        ptr_ty,
-                        thread_state_value,
-                        decref_ref,
-                        refcount_location_counters,
-                    )
-                    .expect("slot-backed local missing from stack slots");
+            if stack_slots.has_name(name) {
+                let previous_state = if is_cleanup_root {
+                    cleanup_root_previous_state
+                } else {
+                    CleanupRootSlotState::MaybeOwnedReference
+                };
+                let should_clear_stack_slot = if is_cleanup_root {
+                    previous_state.may_hold_owned_reference()
+                } else {
+                    previous_entry.is_none()
+                };
+                if should_clear_stack_slot {
+                    stack_slots
+                        .clear_value_with_previous_state_counted(
+                            fb,
+                            name,
+                            previous_state,
+                            ptr_ty,
+                            thread_state_value,
+                            decref_ref,
+                            refcount_location_counters,
+                        )
+                        .expect("slot-backed local missing from stack slots");
+                }
             }
             self.entries.push(LocalEnvEntry::pyobject(
                 Some(location),
@@ -2936,17 +3133,31 @@ fn bind_planned_local_env_at_block_entry(
                                 param_index, binding.name
                             )
                         })?;
-                if entry.repr == RuntimeBlockParamRepr::ExactI64 {
-                    debug_assert_eq!(binding.storage, PlannedLocalStorage::BlockParam);
-                    local_env.bind_entry_location_i64_with_aliases(
-                        binding.location,
-                        binding.name.as_str(),
-                        entry.entry_aliases.clone(),
-                        param_value,
-                        IntFacts::i64_unknown(),
-                        LocalEnvStorage::LocalOnly,
-                    );
-                    continue;
+                match entry.repr {
+                    RuntimeBlockParamRepr::ExactI64 => {
+                        debug_assert_eq!(binding.storage, PlannedLocalStorage::BlockParam);
+                        local_env.bind_entry_location_i64_with_aliases(
+                            binding.location,
+                            binding.name.as_str(),
+                            entry.entry_aliases.clone(),
+                            param_value,
+                            IntFacts::i64_unknown(),
+                            LocalEnvStorage::LocalOnly,
+                        );
+                        continue;
+                    }
+                    RuntimeBlockParamRepr::I32Bool01 => {
+                        debug_assert_eq!(binding.storage, PlannedLocalStorage::BlockParam);
+                        local_env.bind_entry_location_i32_bool01_with_aliases(
+                            binding.location,
+                            binding.name.as_str(),
+                            entry.entry_aliases.clone(),
+                            param_value,
+                            LocalEnvStorage::LocalOnly,
+                        );
+                        continue;
+                    }
+                    RuntimeBlockParamRepr::PyObject => {}
                 }
                 let entry_storage = if binding.storage == PlannedLocalStorage::StackSlot
                     || stack_slots.has_cleanup_root_name(binding.name.as_str())
@@ -3084,6 +3295,18 @@ fn emit_local_env_entry_pyobject_for_forward(
         debug_assert!(ownership.is_owned() || matches!(ownership, ValueOwnership::Immortal));
         return value;
     }
+    if let Some(facts) = entry.i32_bool01_facts() {
+        let result = emit_soac_value_result_for_demand(
+            fb,
+            SoacValue::i32(entry.value(), facts),
+            ctx,
+            ResultDemand::PYOBJECT_OWNED,
+            None,
+        );
+        let (value, ownership, _) = result.expect_pyobject("forwarded scalar bool local");
+        debug_assert!(ownership.is_owned() || matches!(ownership, ValueOwnership::Immortal));
+        return value;
+    }
     let value = entry.value();
     if local_env_entry_needs_incref_for_forward(entry, forwarded_count, &ctx.stack_slots) {
         emit_incref_if_not_null(fb, ctx.consts.ptr_ty, ctx.incref_ref, value);
@@ -3105,6 +3328,24 @@ fn emit_local_env_entry_pyobject_for_frame_root_transfer(
             None,
         );
         let (value, ownership, _) = result.expect_pyobject("scalar cleanup-root materialization");
+        debug_assert!(ownership.is_owned() || matches!(ownership, ValueOwnership::Immortal));
+        let ref_kind = if matches!(ownership, ValueOwnership::Immortal) {
+            LocalRefKind::Immortal
+        } else {
+            LocalRefKind::Owned
+        };
+        return (value, ref_kind);
+    }
+    if let Some(facts) = entry.i32_bool01_facts() {
+        let result = emit_soac_value_result_for_demand(
+            fb,
+            SoacValue::i32(entry.value(), facts),
+            ctx,
+            ResultDemand::PYOBJECT_OWNED,
+            None,
+        );
+        let (value, ownership, _) =
+            result.expect_pyobject("scalar bool cleanup-root materialization");
         debug_assert!(ownership.is_owned() || matches!(ownership, ValueOwnership::Immortal));
         let ref_kind = if matches!(ownership, ValueOwnership::Immortal) {
             LocalRefKind::Immortal
@@ -3613,6 +3854,41 @@ fn emit_typed_local_store_result_with_local_env(
     } else {
         op.value.result_demand().unwrap_or(store_value_demand)
     };
+    let planned_truthiness_only_store =
+        emit_ctx.truthiness_only_local_locations.contains(&location)
+            && planning::typed_expr_can_satisfy_pyobject_truthiness_repr(op.value.as_ref());
+    if !planned_borrowed_store
+        && (typed_expr_i32_bool01_demand_facts(op.value.as_ref(), local_env, emit_ctx).is_some()
+            || planned_truthiness_only_store)
+    {
+        let value_result = emit_typed_codegen_stmt_result_with_local_env(
+            fb,
+            &op.value,
+            local_env,
+            emit_ctx,
+            ResultDemand::I32_BOOL01,
+            codegen_env,
+            func_imports,
+        )?;
+        let value = value_result.expect_i32_bool01("typed local scalar bool store RHS");
+        local_env.store_i32_bool01_location(
+            fb,
+            location,
+            name,
+            value,
+            planned_cleanup_root_previous_state_for_key(
+                expr.semantic_instr_key(emit_ctx.function_id),
+                name,
+                emit_ctx,
+            ),
+            &emit_ctx.stack_slots,
+            Some(refcount_decref_location_counter_parts(emit_ctx)),
+            emit_ctx.consts.ptr_ty,
+            emit_ctx.consts.thread_state_value,
+            emit_ctx.decref_ref,
+        );
+        return Ok(Some(emit_none_for_demand(fb, emit_ctx, demand)));
+    }
     if !planned_borrowed_store
         && typed_expr_i64_demand_facts(op.value.as_ref(), local_env, emit_ctx).is_some()
     {
@@ -4818,6 +5094,7 @@ enum LocalEnvEdgePrepError {
     ExpectedScalarSource {
         source_name: String,
         target_name: String,
+        repr: RuntimeBlockParamRepr,
     },
     UnsupportedScalarConstantArg {
         target_name: String,
@@ -4838,10 +5115,11 @@ impl std::fmt::Display for LocalEnvEdgePrepError {
             Self::ExpectedScalarSource {
                 source_name,
                 target_name,
+                repr,
             } => {
                 write!(
                     f,
-                    "block arg {target_name} expected scalar i64 source {source_name}"
+                    "block arg {target_name} expected scalar {repr:?} source {source_name}"
                 )
             }
             Self::UnsupportedScalarConstantArg {
@@ -4850,7 +5128,7 @@ impl std::fmt::Display for LocalEnvEdgePrepError {
             } => {
                 write!(
                     f,
-                    "block arg {target_name} expected scalar i64 but source {source:?} is not scalar"
+                    "block arg {target_name} expected scalar value but source {source:?} is not scalar"
                 )
             }
             Self::UnsupportedCurrentExceptionArg => {
@@ -4899,6 +5177,7 @@ fn emit_forwarded_block_arg_source_i64_value(
         return Err(LocalEnvEdgePrepError::ExpectedScalarSource {
             source_name: source_name.to_string(),
             target_name: target_name.to_string(),
+            repr: RuntimeBlockParamRepr::ExactI64,
         });
     };
     let entry = &local_env.entries[value_index];
@@ -4906,6 +5185,34 @@ fn emit_forwarded_block_arg_source_i64_value(
         return Err(LocalEnvEdgePrepError::ExpectedScalarSource {
             source_name: source_name.to_string(),
             target_name: target_name.to_string(),
+            repr: RuntimeBlockParamRepr::ExactI64,
+        });
+    }
+    if let Some(location) = entry.location {
+        forwarded_locations.insert(location);
+    }
+    Ok(entry.value())
+}
+
+fn emit_forwarded_block_arg_source_i32_bool01_value(
+    source_name: &str,
+    target_name: &str,
+    local_env: &LocalEnv,
+    forwarded_locations: &mut HashSet<LocalLocation>,
+) -> Result<ir::Value, LocalEnvEdgePrepError> {
+    let Some(value_index) = local_env.entry_index_for_block_arg_name(source_name) else {
+        return Err(LocalEnvEdgePrepError::ExpectedScalarSource {
+            source_name: source_name.to_string(),
+            target_name: target_name.to_string(),
+            repr: RuntimeBlockParamRepr::I32Bool01,
+        });
+    };
+    let entry = &local_env.entries[value_index];
+    if entry.i32_bool01_facts().is_none() {
+        return Err(LocalEnvEdgePrepError::ExpectedScalarSource {
+            source_name: source_name.to_string(),
+            target_name: target_name.to_string(),
+            repr: RuntimeBlockParamRepr::I32Bool01,
         });
     }
     if let Some(location) = entry.location {
@@ -7992,6 +8299,14 @@ fn emit_planned_target_args_codegen_from_local_env(
                     &mut forwarded_locations,
                 )?
             }
+            (BlockArg::Name(source_name), RuntimeBlockParamRepr::I32Bool01) => {
+                emit_forwarded_block_arg_source_i32_bool01_value(
+                    source_name,
+                    target_arg.target_name.as_str(),
+                    local_env,
+                    &mut forwarded_locations,
+                )?
+            }
             (BlockArg::Name(source_name), RuntimeBlockParamRepr::PyObject) => {
                 let (value, maybe_index) = emit_forwarded_block_arg_source_value(
                     fb,
@@ -8023,7 +8338,7 @@ fn emit_planned_target_args_codegen_from_local_env(
                     ctx,
                 )
             }
-            (source, RuntimeBlockParamRepr::ExactI64) => {
+            (source, RuntimeBlockParamRepr::ExactI64 | RuntimeBlockParamRepr::I32Bool01) => {
                 return Err(LocalEnvEdgePrepError::UnsupportedScalarConstantArg {
                     target_name: target_arg.target_name.clone(),
                     source: source.clone(),
@@ -9313,6 +9628,9 @@ fn emit_typed_codegen_expr_value_with_local_env(
     if let InstrTyped::Load(op) = expr {
         if let Some((value, facts)) = local_env.scalar_i64_value_for_load(&op.name) {
             return Ok(SoacValue::i64(value, facts));
+        }
+        if let Some((value, facts)) = local_env.scalar_i32_bool01_value_for_load(&op.name) {
+            return Ok(SoacValue::i32(value, facts));
         }
         let facts = op
             .extra()
@@ -11871,6 +12189,16 @@ fn typed_expr_i64_demand_facts(
     {
         return Some(facts);
     }
+    if let Some(plan) = expr
+        .typed_extra()
+        .and_then(|extra| extra.exact_int_return_plan())
+        && planning::exact_int_return_plan_i64_result(plan).is_some()
+        && emit_ctx
+            .guard_miss_deopt_ref_for_instr_id(plan.instr_id)
+            .is_some()
+    {
+        return Some(IntFacts::i64_unknown());
+    }
     match expr {
         InstrTyped::CallTyped(call) => {
             let Some(desc) =
@@ -11894,6 +12222,37 @@ fn typed_expr_i64_demand_facts(
         }
         _ => match expr.result_facts() {
             Some(ValueFacts::I64(_)) => Some(IntFacts::i64_unknown()),
+            _ => None,
+        },
+    }
+}
+
+fn typed_expr_i32_bool01_demand_facts(
+    expr: &InstrTyped,
+    local_env: &LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+) -> Option<IntFacts> {
+    if let InstrTyped::Load(op) = expr
+        && let Some(facts) = local_env
+            .scalar_i32_bool01_value_for_load(&op.name)
+            .map(|(_, facts)| facts)
+    {
+        return Some(facts);
+    }
+    if let Some(plan) = expr
+        .typed_extra()
+        .and_then(|extra| extra.exact_int_return_plan())
+        && planning::exact_int_return_plan_i32_bool01_result(plan).is_some()
+        && emit_ctx
+            .guard_miss_deopt_ref_for_instr_id(plan.instr_id)
+            .is_some()
+    {
+        return Some(IntFacts::i32_bool01());
+    }
+    match expr {
+        InstrTyped::Truthy(_) | InstrTyped::DirectCallGuardTest(_) => Some(IntFacts::i32_bool01()),
+        _ => match expr.result_facts() {
+            Some(ValueFacts::Bool(_)) => Some(IntFacts::i32_bool01()),
             _ => None,
         },
     }
@@ -14372,6 +14731,32 @@ fn emit_typed_codegen_stmt_result_with_local_env(
             demand,
         ));
     }
+    if matches!(demand, ResultDemand::I64 | ResultDemand::I64Index)
+        && let Some(result) = emit_typed_exact_int_expr_i64_result(
+            fb,
+            expr,
+            local_env,
+            emit_ctx,
+            demand,
+            codegen_env,
+            func_imports,
+        )?
+    {
+        return Ok(result);
+    }
+    if matches!(demand, ResultDemand::I32Bool01)
+        && let Some(result) = emit_typed_exact_int_expr_i32_bool01_result(
+            fb,
+            expr,
+            local_env,
+            emit_ctx,
+            demand,
+            codegen_env,
+            func_imports,
+        )?
+    {
+        return Ok(result);
+    }
     if let InstrTyped::Tuple(_) = expr {
         let result = emit_typed_codegen_expr_value_with_local_env(
             fb,
@@ -14726,6 +15111,17 @@ fn emit_typed_local_load_result_with_local_env(
             None,
         ));
     }
+    if let InstrTyped::Load(op) = expr
+        && let Some((value, facts)) = local_env.scalar_i32_bool01_value_for_load(&op.name)
+    {
+        return Some(emit_soac_value_result_for_demand(
+            fb,
+            SoacValue::i32(value, facts),
+            emit_ctx,
+            demand,
+            None,
+        ));
+    }
     let (ownership, facts) = typed_local_load_direct_result_plan(
         expr,
         local_env,
@@ -14764,6 +15160,12 @@ struct OptV3RegionInputValues {
     values: HashMap<PlanValue, OptV3MechanicalValue>,
     preseeded_scalars: HashSet<PlanValue>,
     preseeded_convert_inputs: HashSet<PlanValue>,
+}
+
+struct OptV3ExactIntDeoptMissTarget {
+    block: ir::Block,
+    target: JitDeoptExitRef,
+    deopt_resume_ref: ir::FuncRef,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -14901,6 +15303,260 @@ fn emit_typed_exact_int_return_pyobject(
     .map(|result| Some(result.value))
 }
 
+fn exact_int_deopt_resume_point(
+    emit_ctx: &JitEmitCtx<'_>,
+    instr_id: InstrId,
+) -> LocalEnvResumePoint {
+    emit_ctx
+        .guard_miss_resume_point
+        .unwrap_or(LocalEnvResumePoint::BeforeInstr {
+            key: InstrKey::new(emit_ctx.function_id, instr_id),
+        })
+}
+
+fn prepare_opt_v3_exact_int_deopt_miss_target(
+    fb: &mut FunctionBuilder<'_>,
+    instr_id: InstrId,
+    emit_ctx: &JitEmitCtx<'_>,
+) -> Option<OptV3ExactIntDeoptMissTarget> {
+    let deopt_resume_ref = emit_ctx.guard_miss_deopt_ref_for_instr_id(instr_id)?;
+    let block = fb.create_block();
+    fb.set_cold_block(block);
+    let resume_point = exact_int_deopt_resume_point(emit_ctx, instr_id);
+    let target = emit_ctx
+        .guard_miss_target_for_resume_point(resume_point, block)
+        .ok()?;
+    Some(OptV3ExactIntDeoptMissTarget {
+        block,
+        target: target.deopt_exit(),
+        deopt_resume_ref,
+    })
+}
+
+fn emit_opt_v3_exact_int_deopt_miss_block(
+    fb: &mut FunctionBuilder<'_>,
+    deopt_miss: OptV3ExactIntDeoptMissTarget,
+    local_env: &LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+) {
+    fb.switch_to_block(deopt_miss.block);
+    fb.set_cold_block(deopt_miss.block);
+    let deopt_result = emit_deopt_resume_call_with_local_env(
+        fb,
+        deopt_miss.target,
+        deopt_miss.deopt_resume_ref,
+        emit_ctx.consts.block_const,
+        emit_ctx,
+        local_env,
+    );
+    emit_deopt_result_return_or_step_null(fb, emit_ctx, deopt_result);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_typed_exact_int_expr_i64_result(
+    fb: &mut FunctionBuilder<'_>,
+    expr: &InstrTyped,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    demand: ResultDemand,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<Option<EmitResult>, String> {
+    if !matches!(demand, ResultDemand::I64 | ResultDemand::I64Index) {
+        return Ok(None);
+    }
+    let Some(plan) = expr
+        .typed_extra()
+        .and_then(|extra| extra.exact_int_return_plan())
+    else {
+        return Ok(None);
+    };
+    let Some(result_value) = planning::exact_int_return_plan_i64_result(plan) else {
+        return Ok(None);
+    };
+    let Some(deopt_miss) = prepare_opt_v3_exact_int_deopt_miss_target(fb, plan.instr_id, emit_ctx)
+    else {
+        return Ok(None);
+    };
+
+    let result_block = fb.create_block();
+    fb.append_block_param(result_block, emit_ctx.consts.i64_ty);
+    let mut skipped_outputs = HashSet::new();
+    if let Some(exit) = plan.hot_region.exits.first()
+        && let MechanicalExitKind::Return { value } = exit.kind
+    {
+        skipped_outputs.insert(value);
+    }
+
+    let mut hot_values = opt_v3_region_input_values(
+        fb,
+        &plan.hot_plan,
+        local_env,
+        emit_ctx,
+        Some(deopt_miss.block),
+        "exact-int scalar expression hot region",
+    )?;
+    emit_opt_v3_mechanical_region_steps_with_skipped_outputs(
+        fb,
+        &plan.hot_region,
+        &mut hot_values.values,
+        &hot_values.preseeded_scalars,
+        &hot_values.preseeded_convert_inputs,
+        Some(deopt_miss.block),
+        &skipped_outputs,
+        local_env,
+        emit_ctx,
+        codegen_env,
+        func_imports,
+    )?;
+    let result = opt_v3_i64_value(&hot_values.values, result_value)?;
+    fb.ins().jump(result_block, &[ir::BlockArg::Value(result)]);
+    emit_opt_v3_exact_int_deopt_miss_block(fb, deopt_miss, local_env, emit_ctx);
+
+    fb.switch_to_block(result_block);
+    let result = fb.block_params(result_block)[0];
+    Ok(Some(emit_i64_result_for_demand(
+        fb,
+        result,
+        IntFacts::i64_unknown(),
+        emit_ctx,
+        demand,
+    )))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_typed_exact_int_expr_i32_bool01_result(
+    fb: &mut FunctionBuilder<'_>,
+    expr: &InstrTyped,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    demand: ResultDemand,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<Option<EmitResult>, String> {
+    if !matches!(demand, ResultDemand::I32Bool01) {
+        return Ok(None);
+    }
+    let Some(plan) = expr
+        .typed_extra()
+        .and_then(|extra| extra.exact_int_return_plan())
+    else {
+        return Ok(None);
+    };
+    let Some(result_value) = planning::exact_int_return_plan_i32_bool01_result(plan) else {
+        return Ok(None);
+    };
+    let Some(deopt_miss) = prepare_opt_v3_exact_int_deopt_miss_target(fb, plan.instr_id, emit_ctx)
+    else {
+        return Ok(None);
+    };
+
+    let result_block = fb.create_block();
+    fb.append_block_param(result_block, emit_ctx.consts.i32_ty);
+    let mut skipped_outputs = HashSet::new();
+    if let Some(exit) = plan.hot_region.exits.first()
+        && let MechanicalExitKind::Return { value } = exit.kind
+    {
+        skipped_outputs.insert(value);
+    }
+
+    let mut hot_values = opt_v3_region_input_values(
+        fb,
+        &plan.hot_plan,
+        local_env,
+        emit_ctx,
+        Some(deopt_miss.block),
+        "exact-int bool expression hot region",
+    )?;
+    emit_opt_v3_mechanical_region_steps_with_skipped_outputs(
+        fb,
+        &plan.hot_region,
+        &mut hot_values.values,
+        &hot_values.preseeded_scalars,
+        &hot_values.preseeded_convert_inputs,
+        Some(deopt_miss.block),
+        &skipped_outputs,
+        local_env,
+        emit_ctx,
+        codegen_env,
+        func_imports,
+    )?;
+    let result = opt_v3_i32_bool01_value(&hot_values.values, result_value)?;
+    fb.ins().jump(result_block, &[ir::BlockArg::Value(result)]);
+    emit_opt_v3_exact_int_deopt_miss_block(fb, deopt_miss, local_env, emit_ctx);
+
+    fb.switch_to_block(result_block);
+    Ok(Some(EmitResult::i32(
+        fb.block_params(result_block)[0],
+        IntFacts::i32_bool01(),
+    )))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_opt_v3_exact_int_return_deopt_immortal_pyobject_selection(
+    fb: &mut FunctionBuilder<'_>,
+    value_instr_id: InstrId,
+    selection: ExactIntReturnEmissionSelection<'_>,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<OptV3PyObjectResult, String> {
+    let Some(deopt_miss) = prepare_opt_v3_exact_int_deopt_miss_target(fb, value_instr_id, emit_ctx)
+    else {
+        return Err(format!(
+            "exact-int immortal PyObject result for {value_instr_id} requires a guard-miss deopt target"
+        ));
+    };
+
+    let result_block = fb.create_block();
+    fb.append_block_param(result_block, emit_ctx.consts.ptr_ty);
+
+    let mut hot_values = opt_v3_region_input_values(
+        fb,
+        selection.hot_plan,
+        local_env,
+        emit_ctx,
+        Some(deopt_miss.block),
+        "exact-int immortal PyObject hot region",
+    )?;
+    emit_opt_v3_mechanical_region_steps(
+        fb,
+        selection.hot_region,
+        &mut hot_values.values,
+        &hot_values.preseeded_scalars,
+        &hot_values.preseeded_convert_inputs,
+        Some(deopt_miss.block),
+        local_env,
+        emit_ctx,
+        codegen_env,
+        func_imports,
+    )?;
+    let hot_result =
+        opt_v3_region_return_pyobject(selection.hot_region, &hot_values.values, value_instr_id)?;
+    if hot_result.ownership != ValueOwnership::Immortal {
+        return Err(format!(
+            "exact-int immortal PyObject result for {value_instr_id} produced {:?}",
+            hot_result.ownership
+        ));
+    }
+    emit_opt_v3_release_owned_values_except(
+        fb,
+        &hot_values.values,
+        Some(hot_result.value),
+        emit_ctx,
+    );
+    fb.ins()
+        .jump(result_block, &[ir::BlockArg::Value(hot_result.value)]);
+    emit_opt_v3_exact_int_deopt_miss_block(fb, deopt_miss, local_env, emit_ctx);
+
+    fb.switch_to_block(result_block);
+    Ok(OptV3PyObjectResult {
+        value: fb.block_params(result_block)[0],
+        ownership: ValueOwnership::Immortal,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_typed_exact_int_expr_pyobject_result(
     fb: &mut FunctionBuilder<'_>,
@@ -14923,15 +15579,27 @@ fn emit_typed_exact_int_expr_pyobject_result(
     else {
         return Ok(None);
     };
-    let result = emit_opt_v3_exact_int_return_selection(
-        fb,
-        plan.instr_id,
-        plan.into(),
-        local_env,
-        emit_ctx,
-        codegen_env,
-        func_imports,
-    )?;
+    let result = if planning::exact_int_return_plan_immortal_pyobject_result(plan).is_some() {
+        emit_opt_v3_exact_int_return_deopt_immortal_pyobject_selection(
+            fb,
+            plan.instr_id,
+            plan.into(),
+            local_env,
+            emit_ctx,
+            codegen_env,
+            func_imports,
+        )?
+    } else {
+        emit_opt_v3_exact_int_return_selection(
+            fb,
+            plan.instr_id,
+            plan.into(),
+            local_env,
+            emit_ctx,
+            codegen_env,
+            func_imports,
+        )?
+    };
     if !result.ownership.can_satisfy_pyobject_demand(demand) {
         return Err(format!(
             "optimizer v3 expression result for {} produced {:?}, but demand is {demand:?}",
@@ -15298,6 +15966,36 @@ fn emit_opt_v3_mechanical_region_steps(
     codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<(), String> {
+    let skipped_outputs = HashSet::new();
+    emit_opt_v3_mechanical_region_steps_with_skipped_outputs(
+        fb,
+        region,
+        values,
+        preseeded_scalars,
+        preseeded_convert_inputs,
+        local_fallback_block,
+        &skipped_outputs,
+        local_env,
+        emit_ctx,
+        codegen_env,
+        func_imports,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_opt_v3_mechanical_region_steps_with_skipped_outputs(
+    fb: &mut FunctionBuilder<'_>,
+    region: &MechanicalRegionEmission,
+    values: &mut HashMap<PlanValue, OptV3MechanicalValue>,
+    preseeded_scalars: &HashSet<PlanValue>,
+    preseeded_convert_inputs: &HashSet<PlanValue>,
+    local_fallback_block: Option<ir::Block>,
+    skipped_outputs: &HashSet<PlanValue>,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<(), String> {
     for step in &region.steps {
         match opt_v3_mechanical_codegen_step(
             region.region,
@@ -15371,6 +16069,9 @@ fn emit_opt_v3_mechanical_region_steps(
                 input,
                 output,
             } => {
+                if skipped_outputs.contains(&output) {
+                    continue;
+                }
                 emit_opt_v3_mechanical_materialize(
                     fb,
                     region.region,
@@ -17885,6 +18586,7 @@ fn build_cranelift_run_bb_specialized_function(
                 let param_ty = match param.repr {
                     RuntimeBlockParamRepr::PyObject => ptr_ty,
                     RuntimeBlockParamRepr::ExactI64 => i64_ty,
+                    RuntimeBlockParamRepr::I32Bool01 => ir::types::I32,
                 };
                 fb.append_block_param(*block, param_ty);
             }
@@ -18097,13 +18799,33 @@ fn build_cranelift_run_bb_specialized_function(
                     .then_some(entry.binding.name.as_str())
             })
             .collect::<HashSet<_>>();
+        let entry_runtime_param_ref_kinds = entry_materializations[0]
+            .iter()
+            .filter_map(|entry| {
+                matches!(entry.source, PlannedLocalEnvEntrySource::BlockParam { .. })
+                    .then_some((entry.binding.name.clone(), entry.entry_ref_kind))
+            })
+            .collect::<HashMap<_, _>>();
+        let entry_cleanup_root_states = jit_local_plan
+            .cleanup_root_slot_states
+            .entry_state_for_block(function.entry_block().label);
         let mut entry_param_values = HashMap::new();
         for (param, value) in function.params.iter().zip(direct_entry_args.iter()) {
             let needs_runtime_arg = entry_runtime_param_names.contains(param.name.as_str());
             let needs_stack_seed = entry_stack_seed_param_names.contains(param.name.as_str());
             let needs_cleanup_root = stack_slots.has_cleanup_root_name(param.name.as_str());
+            let entry_ref_kind = entry_runtime_param_ref_kinds
+                .get(&param.name)
+                .copied()
+                .unwrap_or(LocalRefKind::Borrowed);
+            let should_materialize_cleanup_root = needs_cleanup_root
+                && entry_cleanup_root_states
+                    .get(&param.name)
+                    .copied()
+                    .unwrap_or(CleanupRootSlotState::NoOwnedReference)
+                    .may_hold_owned_reference();
 
-            if needs_cleanup_root {
+            if should_materialize_cleanup_root {
                 stack_slots
                     .replace_cloned_value_with_previous_state_counted(
                         &mut fb,
@@ -18147,7 +18869,8 @@ fn build_cranelift_run_bb_specialized_function(
             }
 
             if needs_runtime_arg {
-                if !needs_cleanup_root {
+                if !should_materialize_cleanup_root && transient_local_needs_decref(entry_ref_kind)
+                {
                     emit_incref_if_not_null(&mut fb, ptr_ty, incref_ref, *value);
                 }
                 entry_param_values.insert(param.name.as_str(), *value);
@@ -18281,6 +19004,7 @@ fn build_cranelift_run_bb_specialized_function(
                 deopt_resume_plan: jit_deopt_resume_plan,
                 refcount_plan,
                 cleanup_root_slot_states: &jit_local_plan.cleanup_root_slot_states,
+                truthiness_only_local_locations: &jit_local_plan.truthiness_only_local_locations,
                 return_cleanup_blocks_by_label: &return_cleanup_blocks_by_label,
                 instr_locations: &instr_locations,
                 counter_slots_by_id,

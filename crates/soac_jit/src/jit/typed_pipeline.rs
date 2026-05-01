@@ -11,10 +11,12 @@ use soac_core::block_py::{
     HasSemanticInstrId, InstrId, RuntimeFunctionId, VisitMut,
 };
 use soac_ir_blockpy::BlockPyModuleShape;
+use soac_ir_typed::emit_v3::MechanicalRegionEmission;
 use soac_ir_typed::plan_v3::{
     DirectCallCallee, ExactListItemAccessKind,
     IndexedFieldAccessKind as PlanV3IndexedFieldAccessKind,
-    IndexedGlobalAccessKind as PlanV3IndexedGlobalAccessKind,
+    IndexedGlobalAccessKind as PlanV3IndexedGlobalAccessKind, RegionInputSource, RegionPlan,
+    RegionSource,
 };
 use soac_ir_typed::{
     FactStore, InstrTyped, TypedAttrAccessPlan, TypedBlockPyModuleShape, TypedCallEmissionPlan,
@@ -31,8 +33,9 @@ use soac_opt::access_emission_v3::{
 use soac_opt::artifacts_v3::ExactIntBranchV3Artifacts;
 use soac_opt::call_emission_v3::{ResolvedV3DirectCallPlan, typed_call_emission_plans_from_v3};
 use soac_opt::passes::{
-    inline_typed_function_direct_call_stores, lower_typed_function_call_emission_plans,
-    refresh_typed_function_value_facts, validate_typed_function_value_facts,
+    TypedInlineInstrIdMapping, TypedInlineLocalMapping, inline_typed_function_direct_call_stores,
+    lower_typed_function_call_emission_plans, refresh_typed_function_value_facts,
+    validate_typed_function_value_facts,
 };
 use soac_opt::region_emission_v3::{
     ExactIntBranchSelection as OptV3ExactIntBranchSelection,
@@ -702,10 +705,145 @@ fn annotate_typed_exact_int_selections_from_profile(
     Ok(())
 }
 
+fn annotate_typed_remapped_exact_int_selections(
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+    branch_plans: Option<&HashMap<InstrId, TypedExactIntBranchPlan>>,
+    return_plans: Option<&HashMap<InstrId, TypedExactIntReturnPlan>>,
+) -> Result<(), String> {
+    let empty_branch_plans = HashMap::new();
+    let empty_return_plans = HashMap::new();
+    let branch_plans = branch_plans.unwrap_or(&empty_branch_plans);
+    let return_plans = return_plans.unwrap_or(&empty_return_plans);
+    if branch_plans.is_empty() && return_plans.is_empty() {
+        return Ok(());
+    }
+
+    struct Annotator<'a> {
+        branch_plans: &'a HashMap<InstrId, TypedExactIntBranchPlan>,
+        return_plans: &'a HashMap<InstrId, TypedExactIntReturnPlan>,
+        used_branches: HashSet<InstrId>,
+        used_returns: HashSet<InstrId>,
+        error: Option<String>,
+    }
+
+    impl Annotator<'_> {
+        fn attach_branch_plan(&mut self, expr: &mut InstrTyped) {
+            let Some(instr_id) = expr.try_semantic_instr_id() else {
+                return;
+            };
+            let Some(plan) = self.branch_plans.get(&instr_id).cloned() else {
+                return;
+            };
+            let Some(extra) = expr.typed_extra_mut() else {
+                self.error = Some(format!(
+                    "inlined optimizer v3 exact-int branch plan for {instr_id} reached a typed node without metadata"
+                ));
+                return;
+            };
+            if let Some(existing) = extra.exact_int_branch_plan()
+                && existing != &plan
+            {
+                self.error = Some(format!(
+                    "inlined optimizer v3 exact-int branch plan for {instr_id} collides with an existing branch plan"
+                ));
+                return;
+            }
+            extra.set_exact_int_branch_plan(plan);
+            self.used_branches.insert(instr_id);
+        }
+
+        fn attach_return_plan(&mut self, expr: &mut InstrTyped) {
+            let Some(instr_id) = expr.try_semantic_instr_id() else {
+                return;
+            };
+            let Some(plan) = self.return_plans.get(&instr_id).cloned() else {
+                return;
+            };
+            let Some(extra) = expr.typed_extra_mut() else {
+                self.error = Some(format!(
+                    "inlined optimizer v3 exact-int return plan for {instr_id} reached a typed node without metadata"
+                ));
+                return;
+            };
+            if let Some(existing) = extra.exact_int_return_plan()
+                && existing != &plan
+            {
+                self.error = Some(format!(
+                    "inlined optimizer v3 exact-int return plan for {instr_id} collides with an existing return plan"
+                ));
+                return;
+            }
+            extra.set_exact_int_return_plan(plan);
+            self.used_returns.insert(instr_id);
+        }
+    }
+
+    impl VisitMut<InstrTyped> for Annotator<'_> {
+        fn visit_instr_mut(&mut self, expr: &mut InstrTyped) {
+            if self.error.is_some() {
+                return;
+            }
+            self.attach_return_plan(expr);
+            expr.visit_children_mut(self);
+        }
+    }
+
+    let mut annotator = Annotator {
+        branch_plans,
+        return_plans,
+        used_branches: HashSet::new(),
+        used_returns: HashSet::new(),
+        error: None,
+    };
+    for block in &mut function.blocks {
+        if let BlockTerm::IfTerm(if_term) = &mut block.term {
+            annotator.attach_branch_plan(&mut if_term.test);
+            if let Some(error) = annotator.error.take() {
+                return Err(error);
+            }
+        }
+        for instr in &mut block.body {
+            annotator.visit_instr_mut(instr);
+            if let Some(error) = annotator.error.take() {
+                return Err(error);
+            }
+        }
+        annotator.visit_term_mut(&mut block.term);
+        if let Some(error) = annotator.error.take() {
+            return Err(error);
+        }
+    }
+    if annotator.used_branches.len() != branch_plans.len() {
+        let missing = branch_plans
+            .keys()
+            .filter(|instr_id| !annotator.used_branches.contains(instr_id))
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "inlined optimizer v3 exact-int branch plans were not attached to typed nodes: {missing}"
+        ));
+    }
+    if annotator.used_returns.len() != return_plans.len() {
+        let missing = return_plans
+            .keys()
+            .filter(|instr_id| !annotator.used_returns.contains(instr_id))
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "inlined optimizer v3 exact-int return plans were not attached to typed nodes: {missing}"
+        ));
+    }
+    Ok(())
+}
+
 fn apply_profile_access_and_scalar_plans_to_typed_function(
     function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
     profile: &SpecializationProfile<'_>,
     remapped_exact_list_items: Option<&HashMap<InstrId, ProfileExactListItemAccessPlan>>,
+    remapped_exact_int_branches: Option<&HashMap<InstrId, TypedExactIntBranchPlan>>,
+    remapped_exact_int_returns: Option<&HashMap<InstrId, TypedExactIntReturnPlan>>,
 ) -> Result<(), String> {
     annotate_typed_indexed_field_accesses_from_profile(function, profile)?;
     annotate_typed_indexed_global_accesses_from_profile(function, profile)?;
@@ -715,6 +853,11 @@ fn apply_profile_access_and_scalar_plans_to_typed_function(
         remapped_exact_list_items,
     )?;
     annotate_typed_exact_int_selections_from_profile(function, profile)?;
+    annotate_typed_remapped_exact_int_selections(
+        function,
+        remapped_exact_int_branches,
+        remapped_exact_int_returns,
+    )?;
     Ok(())
 }
 
@@ -753,9 +896,228 @@ pub(super) fn apply_profile_typed_guard_miss_policy_to_typed_function(
     annotator.visit_fn_mut(function);
 }
 
+#[derive(Clone, Default)]
+struct TypedInlineExactIntRemapContext {
+    instr_ids: HashMap<InstrId, InstrId>,
+    local_names: HashMap<String, String>,
+}
+
+fn typed_inline_exact_int_remap_contexts(
+    instr_mappings: &[TypedInlineInstrIdMapping],
+    local_mappings: &[TypedInlineLocalMapping],
+) -> Result<HashMap<(RuntimeFunctionId, u32), TypedInlineExactIntRemapContext>, String> {
+    let mut contexts = HashMap::<(RuntimeFunctionId, u32), TypedInlineExactIntRemapContext>::new();
+    for mapping in instr_mappings {
+        let context = contexts
+            .entry((mapping.callee, mapping.inline_instance))
+            .or_default();
+        context
+            .instr_ids
+            .entry(mapping.callee_instr_id)
+            .or_insert(mapping.caller_instr_id);
+    }
+    for mapping in local_mappings {
+        let context = contexts
+            .entry((mapping.callee, mapping.inline_instance))
+            .or_default();
+        if let Some(existing) = context
+            .local_names
+            .insert(mapping.callee_name.clone(), mapping.caller_name.clone())
+            && existing != mapping.caller_name
+        {
+            return Err(format!(
+                "typed inline instance {} for callee {} maps local {:?} to both {:?} and {:?}",
+                mapping.inline_instance,
+                mapping.callee,
+                mapping.callee_name,
+                existing,
+                mapping.caller_name
+            ));
+        }
+    }
+    Ok(contexts)
+}
+
+fn remapped_typed_inline_instr_id(
+    source: InstrId,
+    context: &TypedInlineExactIntRemapContext,
+    label: &str,
+) -> Result<InstrId, String> {
+    context.instr_ids.get(&source).copied().ok_or_else(|| {
+        format!(
+            "inlined optimizer v3 exact-int {label} references unmapped callee instruction {source}"
+        )
+    })
+}
+
+fn remap_optional_typed_inline_instr_id(
+    source: &mut Option<InstrId>,
+    context: &TypedInlineExactIntRemapContext,
+    label: &str,
+) -> Result<(), String> {
+    let Some(original) = *source else {
+        return Ok(());
+    };
+    *source = Some(remapped_typed_inline_instr_id(original, context, label)?);
+    Ok(())
+}
+
+fn remap_exact_int_region_plan(
+    region: &RegionPlan,
+    context: &TypedInlineExactIntRemapContext,
+) -> Result<RegionPlan, String> {
+    let mut remapped = region.clone();
+    if let RegionSource::Instr { instr_id } = &mut remapped.source {
+        *instr_id = remapped_typed_inline_instr_id(*instr_id, context, "region source")?;
+    }
+    for input in &mut remapped.inputs {
+        match &mut input.source {
+            RegionInputSource::FunctionParam {
+                name: Some(name), ..
+            } => {
+                let Some(mapped_name) = context.local_names.get(name.as_str()) else {
+                    return Err(format!(
+                        "inlined optimizer v3 exact-int region input references unmapped callee local {name:?}"
+                    ));
+                };
+                *name = mapped_name.clone();
+            }
+            RegionInputSource::FunctionParam { name: None, .. } => {
+                return Err(
+                    "inlined optimizer v3 exact-int region input has unnamed local source"
+                        .to_string(),
+                );
+            }
+            RegionInputSource::IndexedGlobal { source, .. } => {
+                *source = remapped_typed_inline_instr_id(*source, context, "indexed-global input")?;
+            }
+            RegionInputSource::ModuleConstant { .. }
+            | RegionInputSource::CapturedValue { .. }
+            | RegionInputSource::Synthetic { .. } => {}
+        }
+    }
+    for exit in &mut remapped.exits {
+        remap_optional_typed_inline_instr_id(&mut exit.source, context, "region exit")?;
+    }
+    Ok(remapped)
+}
+
+fn remap_exact_int_mechanical_region(
+    region: &MechanicalRegionEmission,
+    context: &TypedInlineExactIntRemapContext,
+) -> Result<MechanicalRegionEmission, String> {
+    let mut remapped = region.clone();
+    for step in &mut remapped.steps {
+        remap_optional_typed_inline_instr_id(&mut step.source, context, "mechanical step")?;
+    }
+    for exit in &mut remapped.exits {
+        remap_optional_typed_inline_instr_id(&mut exit.source, context, "mechanical exit")?;
+    }
+    Ok(remapped)
+}
+
+fn remap_typed_exact_int_branch_plan(
+    instr_id: InstrId,
+    selection: OptV3ExactIntBranchSelection<'_>,
+    context: &TypedInlineExactIntRemapContext,
+) -> Result<TypedExactIntBranchPlan, String> {
+    Ok(TypedExactIntBranchPlan {
+        source: TypedExactIntPlanSource::OptimizationPlanV3,
+        instr_id,
+        hot_plan: remap_exact_int_region_plan(selection.hot_plan, context)?,
+        hot_region: remap_exact_int_mechanical_region(selection.hot_region, context)?,
+        fallback_plan: remap_exact_int_region_plan(selection.fallback_plan, context)?,
+        fallback_region: remap_exact_int_mechanical_region(selection.fallback_region, context)?,
+    })
+}
+
+fn remap_typed_exact_int_return_plan(
+    instr_id: InstrId,
+    selection: OptV3ExactIntReturnSelection<'_>,
+    context: &TypedInlineExactIntRemapContext,
+) -> Result<TypedExactIntReturnPlan, String> {
+    Ok(TypedExactIntReturnPlan {
+        source: TypedExactIntPlanSource::OptimizationPlanV3,
+        instr_id,
+        hot_plan: remap_exact_int_region_plan(selection.hot_plan, context)?,
+        hot_region: remap_exact_int_mechanical_region(selection.hot_region, context)?,
+        fallback_plan: remap_exact_int_region_plan(selection.fallback_plan, context)?,
+        fallback_region: remap_exact_int_mechanical_region(selection.fallback_region, context)?,
+    })
+}
+
+fn remap_inlined_exact_int_selections(
+    caller_function_id: RuntimeFunctionId,
+    instr_mappings: &[TypedInlineInstrIdMapping],
+    local_mappings: &[TypedInlineLocalMapping],
+    profile: &SpecializationProfile<'_>,
+    remapped_branches: &mut HashMap<RuntimeFunctionId, HashMap<InstrId, TypedExactIntBranchPlan>>,
+    remapped_returns: &mut HashMap<RuntimeFunctionId, HashMap<InstrId, TypedExactIntReturnPlan>>,
+) -> Result<usize, String> {
+    let contexts = typed_inline_exact_int_remap_contexts(instr_mappings, local_mappings)?;
+    let mut count = 0;
+    for mapping in instr_mappings {
+        let Some(artifacts) = profile
+            .opt_v3_exact_int_branch_artifacts
+            .get(&mapping.callee)
+        else {
+            continue;
+        };
+        let context = contexts
+            .get(&(mapping.callee, mapping.inline_instance))
+            .ok_or_else(|| {
+                format!(
+                    "typed inline instance {} for callee {} has instruction mappings but no remap context",
+                    mapping.inline_instance, mapping.callee
+                )
+            })?;
+        let mut context = context.clone();
+        context
+            .instr_ids
+            .insert(mapping.callee_instr_id, mapping.caller_instr_id);
+        if let Some(selection) =
+            opt_v3_exact_int_branch_selection_for_source(artifacts, mapping.callee_instr_id)?
+        {
+            let plan =
+                remap_typed_exact_int_branch_plan(mapping.caller_instr_id, selection, &context)?;
+            if remapped_branches
+                .entry(caller_function_id)
+                .or_default()
+                .insert(mapping.caller_instr_id, plan)
+                .is_some()
+            {
+                return Err(format!(
+                    "inlined exact-int branch plan for callee {} instruction {} collides at caller instruction {}",
+                    mapping.callee, mapping.callee_instr_id, mapping.caller_instr_id
+                ));
+            }
+            count += 1;
+        }
+        if let Some(selection) =
+            opt_v3_exact_int_return_selection_for_source(artifacts, mapping.callee_instr_id)?
+        {
+            let plan =
+                remap_typed_exact_int_return_plan(mapping.caller_instr_id, selection, &context)?;
+            if remapped_returns
+                .entry(caller_function_id)
+                .or_default()
+                .insert(mapping.caller_instr_id, plan)
+                .is_some()
+            {
+                return Err(format!(
+                    "inlined exact-int return plan for callee {} instruction {} collides at caller instruction {}",
+                    mapping.callee, mapping.callee_instr_id, mapping.caller_instr_id
+                ));
+            }
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
 fn remap_inlined_exact_list_item_accesses(
     caller_function_id: RuntimeFunctionId,
-    mappings: &[soac_opt::passes::TypedInlineInstrIdMapping],
+    mappings: &[TypedInlineInstrIdMapping],
     profile: &SpecializationProfile<'_>,
     remapped_exact_list_items: &mut HashMap<
         RuntimeFunctionId,
@@ -805,7 +1167,7 @@ pub(super) fn apply_profile_typed_plans_to_typed_function(
         return Ok(());
     };
     apply_profile_call_emission_plans_to_typed_function(function, profile)?;
-    apply_profile_access_and_scalar_plans_to_typed_function(function, profile, None)?;
+    apply_profile_access_and_scalar_plans_to_typed_function(function, profile, None, None, None)?;
     apply_profile_typed_block_metadata_to_typed_function(function, profile)?;
     apply_profile_typed_guard_miss_policy_to_typed_function(function, profile);
     Ok(())
@@ -872,6 +1234,10 @@ fn apply_typed_v3_module_rewrites(
     let external_callees = HashMap::new();
     let mut remapped_exact_list_items =
         HashMap::<RuntimeFunctionId, HashMap<InstrId, ProfileExactListItemAccessPlan>>::new();
+    let mut remapped_exact_int_branches =
+        HashMap::<RuntimeFunctionId, HashMap<InstrId, TypedExactIntBranchPlan>>::new();
+    let mut remapped_exact_int_returns =
+        HashMap::<RuntimeFunctionId, HashMap<InstrId, TypedExactIntReturnPlan>>::new();
     for function in &mut module.callable_defs {
         apply_profile_call_emission_plans_to_typed_function(function, profile)?;
         let inline_direct_calls = profile.typed_inline_resolved_direct_calls(function.function_id);
@@ -891,6 +1257,14 @@ fn apply_typed_v3_module_rewrites(
                     profile,
                     &mut remapped_exact_list_items,
                 )?;
+                remap_inlined_exact_int_selections(
+                    caller_function_id,
+                    &stats.instr_id_mappings,
+                    &stats.local_mappings,
+                    profile,
+                    &mut remapped_exact_int_branches,
+                    &mut remapped_exact_int_returns,
+                )?;
             }
             if stats.rewritten_stores != 0 || stats.rewritten_effect_only_calls != 0 {
                 assign_missing_typed_function_instr_ids(function);
@@ -901,6 +1275,8 @@ fn apply_typed_v3_module_rewrites(
             function,
             profile,
             remapped_exact_list_items.get(&function.function_id),
+            remapped_exact_int_branches.get(&function.function_id),
+            remapped_exact_int_returns.get(&function.function_id),
         )?;
         apply_profile_typed_block_metadata_to_typed_function(function, profile)?;
         apply_profile_typed_guard_miss_policy_to_typed_function(function, profile);

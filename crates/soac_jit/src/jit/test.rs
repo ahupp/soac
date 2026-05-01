@@ -50,6 +50,7 @@ mod tests {
         FieldIndexSpecialization, OptV3ResolvedIndexedFieldAccess,
         owner_type_supports_field_layout_priming, prime_field_index_layout,
     };
+    use super::super::planning::RuntimeBlockParamRepr;
     use super::super::specialization_profile::{
         DirectCallEmissionScope, planned_optimization_inputs_from_v3_artifacts,
         planned_optimization_inputs_from_v3_artifacts_for_blockpy_module,
@@ -76,11 +77,12 @@ mod tests {
         abrupt_kind_tag, apply_profile_typed_block_metadata_to_typed_function,
         apply_profile_typed_guard_miss_policy_to_typed_function,
         apply_profile_typed_plans_to_typed_function, build_counted_runtime_refcount_helper,
-        compile_cranelift_run_bb_specialized_cached, declare_direct_function,
-        inline_runtime_support_calls, local_binding_facts_for_stored_value,
-        local_env_entry_needs_incref_for_forward, local_ref_kind_needs_incref_for_forward,
-        local_ref_kind_needs_incref_for_load, local_ref_kind_needs_refcount_call,
-        module_constant_object_symbol, module_constant_symbol_prefix_for_instance,
+        collect_typed_guard_miss_deopt_instr_ids, compile_cranelift_run_bb_specialized_cached,
+        declare_direct_function, inline_runtime_support_calls,
+        local_binding_facts_for_stored_value, local_env_entry_needs_incref_for_forward,
+        local_ref_kind_needs_incref_for_forward, local_ref_kind_needs_incref_for_load,
+        local_ref_kind_needs_refcount_call, module_constant_object_symbol,
+        module_constant_symbol_prefix_for_instance,
         module_constant_symbol_prefix_for_module_identity,
         module_constant_symbol_prefix_for_shared_state, new_jit_module,
         persistent_function_id_for_module_function, plan_direct_call_args_for_target,
@@ -164,6 +166,7 @@ mod tests {
         IndexedFieldSpecializationPlan, IndexedGlobalAccessKind, IndexedGlobalFallbackKind,
         IndexedGlobalFallbackPlan, IndexedGlobalGuardKind, IndexedGlobalGuardPlan,
         IndexedGlobalSpecializationPlan, ModuleOptimizationPlanV3, ModulePlanIdentity,
+        RegionInputSource,
     };
     use soac_ir_typed::{
         InstrTyped, PyExactType, PyObjFacts, TypedAttrAccessPlan, TypedBlockLayoutHint,
@@ -4215,6 +4218,86 @@ def build(values):
     }
 
     #[test]
+    fn specialized_jit_truthiness_only_internal_temp_store_compiles_as_bool_scalar() {
+        let mut constants = TestConstantPool::default();
+        let mut function = test_function();
+        function.params = ParamSpec {
+            params: vec![
+                test_param("a", ParamKind::Any, false),
+                test_param("b", ParamKind::Any, false),
+            ],
+        };
+        let entry_label = function.name_gen.next_block_name();
+        let test_label = function.name_gen.next_block_name();
+        let then_label = function.name_gen.next_block_name();
+        let else_label = function.name_gen.next_block_name();
+        let temp_name = test_local_name("_dp_bool_target", 2);
+        let entry = BlockPyBlock {
+            label: entry_label,
+            body: vec![op_expr(Store::new(
+                temp_name.clone(),
+                op_expr(BinOp::new(
+                    BinOpKind::Le,
+                    name_expr(test_local_name("a", 0)),
+                    name_expr(test_local_name("b", 1)),
+                )),
+            ))],
+            term: BlockTerm::Jump(BlockEdge::new(test_label)),
+            params: vec![],
+            exc_edge: None,
+            extra: Default::default(),
+        };
+        let test_block = BlockPyBlock {
+            label: test_label,
+            body: vec![],
+            term: BlockTerm::IfTerm(soac_core::block_py::TermIf {
+                test: name_expr(temp_name),
+                then_label,
+                else_label,
+            }),
+            params: vec![],
+            exc_edge: None,
+            extra: Default::default(),
+        };
+        let then_block = BlockPyBlock {
+            label: then_label,
+            body: vec![],
+            term: ret_term(constants.int_expr(1)),
+            params: vec![],
+            exc_edge: None,
+            extra: Default::default(),
+        };
+        let else_block = BlockPyBlock {
+            label: else_label,
+            body: vec![],
+            term: ret_term(constants.int_expr(0)),
+            params: vec![],
+            exc_edge: None,
+            extra: Default::default(),
+        };
+        let mut function =
+            with_test_blocks(function, vec![entry, test_block, then_block, else_block]);
+        set_stack_slots(&mut function, &["a", "b", "_dp_bool_target"]);
+        let mut module = test_module(ModuleNameGen::new(0), vec![function]);
+        module.module_constants = constants.module_constants;
+        let function = module.callable_defs[0].clone();
+        let module_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+
+        build_test_specialized_function(
+            &[
+                1usize as ObjPtr,
+                2usize as ObjPtr,
+                3usize as ObjPtr,
+                4usize as ObjPtr,
+            ],
+            &module,
+            &function,
+            &module_constants,
+        );
+    }
+
+    #[test]
     fn specialized_jit_raise_terms_compile_via_typed_exception_expr() {
         let mut constants = TestConstantPool::default();
         let function = test_function();
@@ -5957,6 +6040,22 @@ def build(values):
         allow_local_only_slot_backed_store: bool,
         cleanup_root_previous_state: CleanupRootSlotState,
     ) -> (LocalEnv, String) {
+        local_env_first_store_test_state_with_cleanup_roots_previous_state_and_ref_kind(
+            stack_slot_names,
+            cleanup_root_names,
+            allow_local_only_slot_backed_store,
+            cleanup_root_previous_state,
+            LocalRefKind::Owned,
+        )
+    }
+
+    fn local_env_first_store_test_state_with_cleanup_roots_previous_state_and_ref_kind(
+        stack_slot_names: &[&str],
+        cleanup_root_names: &[&str],
+        allow_local_only_slot_backed_store: bool,
+        cleanup_root_previous_state: CleanupRootSlotState,
+        value_ref_kind: LocalRefKind,
+    ) -> (LocalEnv, String) {
         let compile_session = crate::session::CompileSession::new();
         let mut jit_module =
             new_jit_module(&compile_session).expect("test jit module should construct");
@@ -6023,7 +6122,7 @@ def build(values):
                 LocalLocation(0),
                 "x",
                 new_value,
-                LocalRefKind::Owned,
+                value_ref_kind,
                 None,
                 allow_local_only_slot_backed_store,
                 cleanup_root_previous_state,
@@ -6175,6 +6274,30 @@ def build(values):
         assert!(
             !rendered.contains("stack_load"),
             "empty cleanup-root first store should not load a previous slot value:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn local_env_borrowed_cleanup_root_store_stays_local_only() {
+        let (env, rendered) =
+            local_env_first_store_test_state_with_cleanup_roots_previous_state_and_ref_kind(
+                &["x"],
+                &["x"],
+                true,
+                CleanupRootSlotState::NoOwnedReference,
+                LocalRefKind::Borrowed,
+            );
+
+        assert_eq!(env.entries.len(), 1, "{rendered}");
+        assert_eq!(env.entries[0].storage, LocalEnvStorage::LocalOnly);
+        assert_eq!(env.entries[0].ref_kind(), LocalRefKind::Borrowed);
+        assert!(
+            !rendered.contains("stack_store"),
+            "borrowed cleanup-root stores should not take stack-slot ownership:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("call"),
+            "borrowed cleanup-root stores should not INCREF or DECREF:\n{rendered}"
         );
     }
 
@@ -15431,6 +15554,121 @@ def f(x):
     }
 
     #[test]
+    fn specialized_jit_opt_v3_exact_int_scalar_store_deopts_instead_of_local_fallback() {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "specialized_jit_opt_v3_exact_int_scalar_store_deopts_instead_of_local_fallback",
+        ) {
+            return;
+        }
+        let blocks = [1usize as ObjPtr];
+        let mut function = test_function();
+        function.params = ParamSpec {
+            params: vec![
+                Param {
+                    name: "a".into(),
+                    kind: ParamKind::Any,
+                    has_default: false,
+                },
+                Param {
+                    name: "b".into(),
+                    kind: ParamKind::Any,
+                    has_default: false,
+                },
+            ],
+        };
+        let block_label = function.name_gen.next_block_name();
+        let store_instr_id = InstrId::new(0);
+        let add_instr_id = InstrId::new(3);
+        let c_name = test_local_name("c", 2);
+        function.blocks = vec![BlockPyBlock {
+            label: block_label,
+            body: vec![with_instr_id(
+                op_expr(Store::new(
+                    c_name.clone(),
+                    with_instr_id(
+                        op_expr(BinOp::new(
+                            BinOpKind::Add,
+                            with_instr_id(name_expr(test_name("a")), InstrId::new(1)),
+                            with_instr_id(name_expr(test_local_name("b", 1)), InstrId::new(2)),
+                        )),
+                        add_instr_id,
+                    ),
+                )),
+                store_instr_id,
+            )],
+            term: ret_term(name_expr(c_name)),
+            params: vec![],
+            exc_edge: None,
+            extra: Default::default(),
+        }];
+        set_stack_slots(&mut function, &["a", "b", "c"]);
+
+        let module = test_module(ModuleNameGen::new(0), vec![function]);
+        let function = module.callable_defs[0].clone();
+        let module_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+        let exact_int_shape = soac_opt::operator_specialization::pack_binary_shape(
+            soac_opt::operator_specialization::ExactTypeTag::Int,
+            soac_opt::operator_specialization::ExactTypeTag::Int,
+        );
+        let mut evidence = FunctionProfileEvidence::default();
+        evidence
+            .operator_specializations
+            .insert(add_instr_id, vec![exact_int_shape]);
+        let artifacts = plan_and_emit_function_exact_int_branches_v3_with_module_constants(
+            &AlternativeCatalog::default_v3(),
+            ModulePlanIdentity {
+                module_name: "test".to_string(),
+                source_hash: 0,
+                cache_identity: "test-cache".to_string(),
+            },
+            FunctionPlanIdentity {
+                function: SerializedFunctionId::new(
+                    SerializedModuleId::new(0),
+                    function.function_id.local_function_id(),
+                ),
+                debug_name: Some(function.names.qualname.clone()),
+            },
+            &function,
+            &evidence,
+            module.module_constants.as_slice(),
+        )
+        .unwrap();
+        assert_eq!(artifacts.emission.functions[0].regions.len(), 2);
+
+        let built = build_test_jit_function_with_constants_and_options(
+            &module,
+            &function,
+            &blocks,
+            &module_constants,
+            BuildSpecializedFunctionOptions {
+                planned_typed_function: Some(typed_function_with_exact_int_artifacts(
+                    &function, &artifacts,
+                )),
+                ..BuildSpecializedFunctionOptions::default()
+            },
+        );
+
+        assert_eq!(
+            count_opcode(&built.ctx.func, ir::Opcode::SaddOverflow),
+            1,
+            "v3 exact-int scalar store should emit the selected checked machine add"
+        );
+        assert_guard_miss_deopts_without_local_fallback(
+            &built,
+            &["PyNumber_Add"],
+            "exact-int scalar store",
+        );
+        let materialize_helpers = import_user_names_for_symbols(&built, &["PyLong_FromLongLong"]);
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&built.ctx.func, &materialize_helpers),
+            1,
+            "the hot path should materialize the scalar local only for the final return"
+        );
+    }
+
+    #[test]
     fn specialized_jit_opt_v3_exact_int_arithmetic_return_artifacts_emit_local_fallback() {
         if crate::run_test_in_isolated_process_if_needed(
             module_path!(),
@@ -18872,6 +19110,256 @@ class Point:
     }
 
     #[test]
+    fn runtime_typed_v3_inline_remaps_callee_exact_int_plans() {
+        let module_name = "runtime_typed_v3_inline_exact_int_plan_test";
+        let module_name_gen = ModuleNameGen::new(0);
+        let mut constants = TestConstantPool::default();
+
+        let mut callee_function = test_function_in_module(&module_name_gen, "add_with_local");
+        callee_function.params = ParamSpec {
+            params: vec![
+                test_param("a", ParamKind::Any, false),
+                test_param("b", ParamKind::Any, false),
+            ],
+        };
+        let callee_block_label = callee_function.name_gen.next_block_name();
+        let callee_tmp_add_instr_id = InstrId::new(2);
+        let callee_return_add_instr_id = InstrId::new(5);
+        callee_function.blocks = vec![BlockPyBlock {
+            label: callee_block_label,
+            body: vec![assign_stmt(
+                test_local_name("tmp", 2),
+                with_instr_id(
+                    op_expr(BinOp::new(
+                        BinOpKind::Add,
+                        name_expr(test_name("a")),
+                        constants.int_expr(2),
+                    )),
+                    callee_tmp_add_instr_id,
+                ),
+            )],
+            term: ret_term(with_instr_id(
+                op_expr(BinOp::new(
+                    BinOpKind::Add,
+                    name_expr(test_local_name("b", 1)),
+                    name_expr(test_local_name("tmp", 2)),
+                )),
+                callee_return_add_instr_id,
+            )),
+            params: Vec::new(),
+            exc_edge: None,
+            extra: Default::default(),
+        }];
+        set_stack_slots(&mut callee_function, &["a", "b", "tmp"]);
+
+        let mut caller_function = test_function_in_module(&module_name_gen, "caller");
+        caller_function.params = ParamSpec {
+            params: vec![
+                test_param("fn", ParamKind::Any, false),
+                test_param("x", ParamKind::Any, false),
+                test_param("y", ParamKind::Any, false),
+            ],
+        };
+        let caller_block_label = caller_function.name_gen.next_block_name();
+        let caller_call_instr_id = InstrId::new(10);
+        caller_function.blocks = vec![BlockPyBlock {
+            label: caller_block_label,
+            body: vec![assign_stmt(
+                test_local_name("out", 3),
+                with_instr_id(
+                    op_expr(Call::new(
+                        name_expr(test_local_name("fn", 0)),
+                        vec![
+                            CallArgPositional::Positional(name_expr(test_local_name("x", 1))),
+                            CallArgPositional::Positional(name_expr(test_local_name("y", 2))),
+                        ],
+                        Vec::<CallArgKeyword<InstrBlockPy>>::new(),
+                    )),
+                    caller_call_instr_id,
+                ),
+            )],
+            term: ret_term(name_expr(test_local_name("out", 3))),
+            params: Vec::new(),
+            exc_edge: None,
+            extra: Default::default(),
+        }];
+        set_stack_slots(&mut caller_function, &["fn", "x", "y", "out"]);
+
+        let callee_id = callee_function.function_id;
+        let caller_id = caller_function.function_id;
+        let mut module = test_module(module_name_gen, vec![callee_function, caller_function]);
+        module.module_constants = constants.module_constants;
+        let callee_function = module
+            .callable_defs
+            .iter()
+            .find(|function| function.function_id == callee_id)
+            .expect("module should include callee")
+            .clone();
+
+        let exact_int_shape = soac_opt::operator_specialization::pack_binary_shape(
+            soac_opt::operator_specialization::ExactTypeTag::Int,
+            soac_opt::operator_specialization::ExactTypeTag::Int,
+        );
+        let mut evidence = FunctionProfileEvidence::default();
+        evidence
+            .operator_specializations
+            .insert(callee_tmp_add_instr_id, vec![exact_int_shape]);
+        evidence
+            .operator_specializations
+            .insert(callee_return_add_instr_id, vec![exact_int_shape]);
+        let artifacts = plan_and_emit_function_exact_int_branches_v3_with_module_constants(
+            &AlternativeCatalog::default_v3(),
+            ModulePlanIdentity {
+                module_name: module_name.to_string(),
+                source_hash: 0,
+                cache_identity: "test-cache".to_string(),
+            },
+            FunctionPlanIdentity {
+                function: SerializedFunctionId::new(
+                    SerializedModuleId::new(0),
+                    callee_function.function_id.local_function_id(),
+                ),
+                debug_name: Some(callee_function.names.qualname.clone()),
+            },
+            &callee_function,
+            &evidence,
+            module.module_constants.as_slice(),
+        )
+        .expect("exact-int v3 artifacts should plan callee arithmetic");
+        let profile = SpecializationProfile {
+            module_name: Some(module_name),
+            counter_dump_path: None,
+            direct_call_emission_scope: DirectCallEmissionScope::AllDirectCallCandidates,
+            opt_v3_emitted_direct_calls: HashMap::from([(
+                caller_id,
+                HashMap::from([(
+                    caller_call_instr_id,
+                    vec![ResolvedV3DirectCallPlan {
+                        source: caller_call_instr_id,
+                        target: callee_id,
+                        callee: soac_ir_typed::plan_v3::DirectCallCallee::Function,
+                        arg_plan: TypedDirectCallArgPlan {
+                            sources: vec![
+                                TypedDirectCallArgSource::Provided(0),
+                                TypedDirectCallArgSource::Provided(1),
+                            ],
+                        },
+                        body: CallBodyPlan {
+                            kind: CallBodyKind::Inline,
+                            cost: Cost::default(),
+                            inline_target: None,
+                            reason: "test inlines the exact-int callee body".to_string(),
+                        },
+                        reason: "profiled direct call".to_string(),
+                    }],
+                )]),
+            )]),
+            opt_v3_emitted_exact_list_items: HashMap::new(),
+            opt_v3_emitted_indexed_fields: HashMap::new(),
+            opt_v3_emitted_indexed_globals: HashMap::new(),
+            opt_v3_exact_int_branch_artifacts: HashMap::from([(
+                callee_id,
+                std::sync::Arc::new(artifacts),
+            )]),
+            behavior_change_indexed_stores: false,
+            profiled_cold_blocks: false,
+            guard_miss_deopt: false,
+        };
+
+        let module_plan = optimize_blockpy(&module, Some(&profile), &typed_v3_env_config())
+            .expect("typed-v3 module plan should inline and remap callee exact-int plans");
+        let planned_caller = module_plan
+            .module
+            .callable_defs
+            .iter()
+            .find(|function| function.function_id == caller_id)
+            .expect("planned module should include caller");
+
+        struct Collector {
+            return_plans: Vec<(InstrId, InstrId, Vec<String>, Option<InstrId>)>,
+        }
+        impl Visit<InstrTyped> for Collector {
+            fn visit_instr(&mut self, expr: &InstrTyped) {
+                if let Some(plan) = expr
+                    .typed_extra()
+                    .and_then(|extra| extra.exact_int_return_plan())
+                {
+                    let input_names = plan
+                        .hot_plan
+                        .inputs
+                        .iter()
+                        .filter_map(|input| match &input.source {
+                            RegionInputSource::FunctionParam {
+                                name: Some(name), ..
+                            } => Some(name.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    self.return_plans.push((
+                        expr.try_semantic_instr_id()
+                            .expect("planned exact-int expression should have an instruction id"),
+                        plan.instr_id,
+                        input_names,
+                        plan.hot_region.exits.first().and_then(|exit| exit.source),
+                    ));
+                }
+                expr.visit_children(self);
+            }
+        }
+        let mut collector = Collector {
+            return_plans: Vec::new(),
+        };
+        collector.visit_fn(planned_caller);
+        collector
+            .return_plans
+            .sort_by_key(|(_, plan_instr_id, _, _)| *plan_instr_id);
+        collector
+            .return_plans
+            .dedup_by_key(|(_, plan_instr_id, _, _)| *plan_instr_id);
+        assert_eq!(
+            collector.return_plans.len(),
+            2,
+            "both callee arithmetic sites should keep exact-int return plans after inlining"
+        );
+        let mut all_input_names = Vec::new();
+        for (expr_instr_id, plan_instr_id, input_names, hot_exit_source) in &collector.return_plans
+        {
+            assert_eq!(
+                expr_instr_id, plan_instr_id,
+                "remapped exact-int plan should use the caller instruction id"
+            );
+            assert_ne!(*plan_instr_id, callee_tmp_add_instr_id);
+            assert_ne!(*plan_instr_id, callee_return_add_instr_id);
+            assert_eq!(
+                *hot_exit_source,
+                Some(*plan_instr_id),
+                "mechanical exact-int exit source should be remapped with the plan"
+            );
+            assert!(
+                input_names
+                    .iter()
+                    .all(|name| !matches!(name.as_str(), "a" | "b" | "tmp")),
+                "exact-int region inputs should not keep callee-local names: {input_names:?}"
+            );
+            all_input_names.extend(input_names.iter().cloned());
+        }
+        assert!(
+            all_input_names
+                .iter()
+                .any(|name| name.starts_with("_dp_typed_inline_arg")),
+            "callee parameter inputs should be remapped to caller argument temps: {all_input_names:?}"
+        );
+        assert!(
+            all_input_names.iter().any(|name| {
+                name.starts_with("_dp_typed_inline_") && !name.starts_with("_dp_typed_inline_arg")
+            }),
+            "callee local inputs should be remapped to caller inline locals: {all_input_names:?}"
+        );
+        prepare_specialized_typed_function(planned_caller, None, &module_plan.value_facts)
+            .expect("remapped exact-int plans should be valid for typed codegen");
+    }
+
+    #[test]
     fn runtime_typed_v3_module_plan_carries_exact_int_selection_shapes() {
         let module_name = "runtime_typed_v3_exact_int_plan_test";
         let module_name_gen = ModuleNameGen::new(0);
@@ -19046,6 +19534,397 @@ class Point:
                 .first()
                 .and_then(|exit| exit.source),
             Some(return_add_instr_id)
+        );
+    }
+
+    #[test]
+    fn runtime_typed_v3_exact_str_compare_pyobject_result_deopts_on_miss() {
+        let module_name = "runtime_typed_v3_exact_str_compare_result_test";
+        let module_name_gen = ModuleNameGen::new(0);
+        let mut function = test_function_in_module(&module_name_gen, "store_compare_result");
+        function.params = ParamSpec {
+            params: vec![test_param("a", ParamKind::Any, false)],
+        };
+        let entry_label = function.name_gen.next_block_name();
+        let store_instr_id = InstrId::new(0);
+        let compare_instr_id = InstrId::new(1);
+        let flag_name = test_local_name("flag", 1);
+        let mut constants = TestConstantPool::default();
+        function.blocks = vec![BlockPyBlock {
+            label: entry_label,
+            body: vec![with_instr_id(
+                op_expr(Store::new(
+                    flag_name.clone(),
+                    with_instr_id(
+                        op_expr(BinOp::new(
+                            BinOpKind::Ge,
+                            name_expr(test_name("a")),
+                            constants.string_expr("W"),
+                        )),
+                        compare_instr_id,
+                    ),
+                )),
+                store_instr_id,
+            )],
+            term: ret_term(name_expr(flag_name)),
+            params: Vec::new(),
+            exc_edge: None,
+            extra: Default::default(),
+        }];
+        set_stack_slots(&mut function, &["a", "flag"]);
+        let function_id = function.function_id;
+        let mut module = test_module(module_name_gen, vec![function]);
+        module.module_constants = constants.module_constants;
+        let function = module.callable_defs[0].clone();
+        let exact_str_shape = soac_opt::operator_specialization::pack_binary_shape(
+            soac_opt::operator_specialization::ExactTypeTag::Str,
+            soac_opt::operator_specialization::ExactTypeTag::Str,
+        );
+        let mut evidence = FunctionProfileEvidence::default();
+        evidence
+            .operator_specializations
+            .insert(compare_instr_id, vec![exact_str_shape]);
+        let artifacts = plan_and_emit_function_exact_int_branches_v3_with_module_constants(
+            &AlternativeCatalog::default_v3(),
+            ModulePlanIdentity {
+                module_name: module_name.to_string(),
+                source_hash: 0,
+                cache_identity: "test-cache".to_string(),
+            },
+            FunctionPlanIdentity {
+                function: SerializedFunctionId::new(
+                    SerializedModuleId::new(0),
+                    function.function_id.local_function_id(),
+                ),
+                debug_name: Some(function.names.qualname.clone()),
+            },
+            &function,
+            &evidence,
+            module.module_constants.as_slice(),
+        )
+        .expect("exact-str v3 artifacts should plan the compare result");
+        let profile = SpecializationProfile {
+            module_name: Some(module_name),
+            counter_dump_path: None,
+            direct_call_emission_scope: DirectCallEmissionScope::AllDirectCallCandidates,
+            opt_v3_emitted_direct_calls: HashMap::new(),
+            opt_v3_emitted_exact_list_items: HashMap::new(),
+            opt_v3_emitted_indexed_fields: HashMap::new(),
+            opt_v3_emitted_indexed_globals: HashMap::new(),
+            opt_v3_exact_int_branch_artifacts: HashMap::from([(
+                function_id,
+                std::sync::Arc::new(artifacts),
+            )]),
+            behavior_change_indexed_stores: false,
+            profiled_cold_blocks: false,
+            guard_miss_deopt: false,
+        };
+
+        let module_plan = optimize_blockpy(&module, Some(&profile), &typed_v3_env_config())
+            .expect("typed-v3 module plan should attach exact-str compare result plan");
+        let planned_function = module_plan
+            .module
+            .callable_defs
+            .iter()
+            .find(|function| function.function_id == function_id)
+            .expect("planned module should include store_compare_result");
+        let InstrTyped::Store(store) = &planned_function.blocks[0].body[0] else {
+            panic!("entry block should keep the compare-result store");
+        };
+        let return_plan = store
+            .value
+            .typed_extra()
+            .and_then(|extra| extra.exact_int_return_plan())
+            .expect("typed-v3 module plan should carry exact-str compare result selection");
+        assert!(
+            super::super::planning::exact_int_return_plan_immortal_pyobject_result(return_plan)
+                .is_some(),
+            "exact-str comparison result should materialize an immortal bool on the hot path"
+        );
+        assert!(
+            collect_typed_guard_miss_deopt_instr_ids(planned_function).contains(&compare_instr_id),
+            "hot immortal PyObject exact-int results should get automatic guard-miss deopt"
+        );
+        prepare_specialized_typed_function(planned_function, None, &module_plan.value_facts)
+            .expect("automatic guard-miss deopt should prepare for typed codegen");
+    }
+
+    #[test]
+    fn runtime_typed_v3_exact_str_compare_result_flows_as_bool_runtime_param() {
+        let module_name = "runtime_typed_v3_exact_str_compare_bool_local_test";
+        let module_name_gen = ModuleNameGen::new(0);
+        let mut function = test_function_in_module(&module_name_gen, "store_compare_then_branch");
+        function.params = ParamSpec {
+            params: vec![test_param("a", ParamKind::Any, false)],
+        };
+        let entry_label = function.name_gen.next_block_name();
+        let test_label = function.name_gen.next_block_name();
+        let then_label = function.name_gen.next_block_name();
+        let else_label = function.name_gen.next_block_name();
+        let store_instr_id = InstrId::new(0);
+        let compare_instr_id = InstrId::new(1);
+        let flag_name = test_local_name("flag", 1);
+        let mut constants = TestConstantPool::default();
+        function.blocks = vec![
+            BlockPyBlock {
+                label: entry_label,
+                body: vec![with_instr_id(
+                    op_expr(Store::new(
+                        flag_name.clone(),
+                        with_instr_id(
+                            op_expr(BinOp::new(
+                                BinOpKind::Ge,
+                                name_expr(test_name("a")),
+                                constants.string_expr("W"),
+                            )),
+                            compare_instr_id,
+                        ),
+                    )),
+                    store_instr_id,
+                )],
+                term: BlockTerm::Jump(BlockEdge::new(test_label)),
+                params: Vec::new(),
+                exc_edge: None,
+                extra: Default::default(),
+            },
+            BlockPyBlock {
+                label: test_label,
+                body: Vec::new(),
+                term: BlockTerm::IfTerm(soac_core::block_py::TermIf {
+                    test: name_expr(flag_name.clone()),
+                    then_label,
+                    else_label,
+                }),
+                params: Vec::new(),
+                exc_edge: None,
+                extra: Default::default(),
+            },
+            BlockPyBlock {
+                label: then_label,
+                body: Vec::new(),
+                term: ret_term(name_expr(flag_name.clone())),
+                params: Vec::new(),
+                exc_edge: None,
+                extra: Default::default(),
+            },
+            BlockPyBlock {
+                label: else_label,
+                body: Vec::new(),
+                term: ret_term(name_expr(flag_name.clone())),
+                params: Vec::new(),
+                exc_edge: None,
+                extra: Default::default(),
+            },
+        ];
+        set_stack_slots(&mut function, &["a", "flag"]);
+        let function_id = function.function_id;
+        let mut module = test_module(module_name_gen, vec![function]);
+        module.module_constants = constants.module_constants;
+        let function = module.callable_defs[0].clone();
+        let exact_str_shape = soac_opt::operator_specialization::pack_binary_shape(
+            soac_opt::operator_specialization::ExactTypeTag::Str,
+            soac_opt::operator_specialization::ExactTypeTag::Str,
+        );
+        let mut evidence = FunctionProfileEvidence::default();
+        evidence
+            .operator_specializations
+            .insert(compare_instr_id, vec![exact_str_shape]);
+        let artifacts = plan_and_emit_function_exact_int_branches_v3_with_module_constants(
+            &AlternativeCatalog::default_v3(),
+            ModulePlanIdentity {
+                module_name: module_name.to_string(),
+                source_hash: 0,
+                cache_identity: "test-cache".to_string(),
+            },
+            FunctionPlanIdentity {
+                function: SerializedFunctionId::new(
+                    SerializedModuleId::new(0),
+                    function.function_id.local_function_id(),
+                ),
+                debug_name: Some(function.names.qualname.clone()),
+            },
+            &function,
+            &evidence,
+            module.module_constants.as_slice(),
+        )
+        .expect("exact-str v3 artifacts should plan the compare result");
+        let profile = SpecializationProfile {
+            module_name: Some(module_name),
+            counter_dump_path: None,
+            direct_call_emission_scope: DirectCallEmissionScope::AllDirectCallCandidates,
+            opt_v3_emitted_direct_calls: HashMap::new(),
+            opt_v3_emitted_exact_list_items: HashMap::new(),
+            opt_v3_emitted_indexed_fields: HashMap::new(),
+            opt_v3_emitted_indexed_globals: HashMap::new(),
+            opt_v3_exact_int_branch_artifacts: HashMap::from([(
+                function_id,
+                std::sync::Arc::new(artifacts),
+            )]),
+            behavior_change_indexed_stores: false,
+            profiled_cold_blocks: false,
+            guard_miss_deopt: false,
+        };
+
+        let module_plan = optimize_blockpy(&module, Some(&profile), &typed_v3_env_config())
+            .expect("typed-v3 module plan should attach exact-str compare result plan");
+        let jit_plan = super::super::planning::plan_jit_typed_module(
+            module_plan.module.as_ref().clone(),
+            module_plan.value_facts.clone(),
+        )
+        .expect("typed JIT local planning should accept bool scalar locals");
+        let function_plan = jit_plan
+            .locals
+            .function(function_id)
+            .expect("planned JIT locals should include store_compare_then_branch");
+
+        let bool_params = function_plan
+            .runtime_block_params
+            .iter()
+            .flat_map(|params| params.iter())
+            .filter(|param| {
+                param.binding.name == "flag" && param.repr == RuntimeBlockParamRepr::I32Bool01
+            })
+            .count();
+        assert!(
+            bool_params > 0,
+            "expected flag to flow through runtime block params as I32Bool01: {:#?}",
+            function_plan.runtime_block_params
+        );
+        let bool_args = function_plan
+            .implicit_target_transports
+            .iter()
+            .chain(function_plan.jump_edge_transports.iter().flatten())
+            .flat_map(|transport| transport.target_args.iter())
+            .filter(|arg| arg.target_name == "flag" && arg.repr == RuntimeBlockParamRepr::I32Bool01)
+            .count();
+        assert!(
+            bool_args > 0,
+            "expected flag edge transport to preserve I32Bool01: {:#?}",
+            function_plan.jump_edge_transports
+        );
+        assert!(
+            !function_plan.cleanup_root_names.contains("flag"),
+            "scalar bool flag should not need an owned PyObject cleanup root: {:#?}",
+            function_plan.cleanup_root_names
+        );
+    }
+
+    #[test]
+    fn runtime_typed_v3_internal_truthiness_temp_flows_as_bool_runtime_param_without_shape_evidence()
+     {
+        let module_name_gen = ModuleNameGen::new(0);
+        let mut function = test_function_in_module(&module_name_gen, "truthiness_temp");
+        function.params = ParamSpec {
+            params: vec![
+                test_param("a", ParamKind::Any, false),
+                test_param("b", ParamKind::Any, false),
+            ],
+        };
+        let entry_label = function.name_gen.next_block_name();
+        let test_label = function.name_gen.next_block_name();
+        let then_label = function.name_gen.next_block_name();
+        let else_label = function.name_gen.next_block_name();
+        let temp_name = test_local_name("_dp_bool_target", 2);
+        let mut constants = TestConstantPool::default();
+        function.blocks = vec![
+            BlockPyBlock {
+                label: entry_label,
+                body: vec![with_instr_id(
+                    op_expr(Store::new(
+                        temp_name.clone(),
+                        with_instr_id(
+                            op_expr(BinOp::new(
+                                BinOpKind::Le,
+                                name_expr(test_local_name("a", 0)),
+                                name_expr(test_local_name("b", 1)),
+                            )),
+                            InstrId::new(1),
+                        ),
+                    )),
+                    InstrId::new(0),
+                )],
+                term: BlockTerm::Jump(BlockEdge::new(test_label)),
+                params: Vec::new(),
+                exc_edge: None,
+                extra: Default::default(),
+            },
+            BlockPyBlock {
+                label: test_label,
+                body: Vec::new(),
+                term: BlockTerm::IfTerm(soac_core::block_py::TermIf {
+                    test: name_expr(temp_name.clone()),
+                    then_label,
+                    else_label,
+                }),
+                params: Vec::new(),
+                exc_edge: None,
+                extra: Default::default(),
+            },
+            BlockPyBlock {
+                label: then_label,
+                body: Vec::new(),
+                term: ret_term(constants.int_expr(1)),
+                params: Vec::new(),
+                exc_edge: None,
+                extra: Default::default(),
+            },
+            BlockPyBlock {
+                label: else_label,
+                body: Vec::new(),
+                term: ret_term(constants.int_expr(0)),
+                params: Vec::new(),
+                exc_edge: None,
+                extra: Default::default(),
+            },
+        ];
+        set_stack_slots(&mut function, &["a", "b", "_dp_bool_target"]);
+        let function_id = function.function_id;
+        let mut module = test_module(module_name_gen, vec![function]);
+        module.module_constants = constants.module_constants;
+
+        let module_plan = optimize_blockpy(&module, None, &typed_v3_env_config())
+            .expect("typed-v3 module plan should preserve the truthiness temp");
+        let jit_plan = super::super::planning::plan_jit_typed_module(
+            module_plan.module.as_ref().clone(),
+            module_plan.value_facts.clone(),
+        )
+        .expect("typed JIT local planning should accept truthiness-only bool temps");
+        let function_plan = jit_plan
+            .locals
+            .function(function_id)
+            .expect("planned JIT locals should include truthiness_temp");
+
+        assert!(
+            function_plan
+                .truthiness_only_local_locations
+                .contains(&LocalLocation(2)),
+            "internal temp should be recognized as truthiness-only: {:#?}",
+            function_plan.truthiness_only_local_locations
+        );
+        assert!(
+            function_plan
+                .runtime_block_params
+                .iter()
+                .flat_map(|params| params.iter())
+                .any(|param| {
+                    param.binding.name == "_dp_bool_target"
+                        && param.repr == RuntimeBlockParamRepr::I32Bool01
+                }),
+            "truthiness-only temp should flow as I32Bool01 runtime params: {:#?}",
+            function_plan.runtime_block_params
+        );
+        assert!(
+            function_plan
+                .jump_edge_transports
+                .iter()
+                .flatten()
+                .flat_map(|transport| transport.target_args.iter())
+                .any(|arg| {
+                    arg.target_name == "_dp_bool_target"
+                        && arg.repr == RuntimeBlockParamRepr::I32Bool01
+                }),
+            "truthiness-only temp should flow as I32Bool01 edge args: {:#?}",
+            function_plan.jump_edge_transports
         );
     }
 

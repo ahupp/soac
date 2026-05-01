@@ -377,9 +377,7 @@ fn plan_and_emit_module_v3_from_raw_evidence_with_target_index(
     Ok(ExactIntBranchV3Artifacts { plan, emission })
 }
 
-fn function_uses_generator_resume_state(
-    function: &BlockPyFunction<BlockPyModuleShape>,
-) -> bool {
+fn function_uses_generator_resume_state(function: &BlockPyFunction<BlockPyModuleShape>) -> bool {
     function.storage_layout.as_ref().is_some_and(|layout| {
         layout
             .freevars
