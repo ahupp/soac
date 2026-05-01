@@ -30,7 +30,9 @@ pub(crate) fn python_runtime_test_lock() -> &'static Mutex<()> {
 
 use pyo3::ffi;
 use pyo3::prelude::*;
-use soac_core::block_py::{FunctionExecutionMode, FunctionKind, ParamKind, RuntimeFunctionId};
+use soac_core::block_py::{
+    BlockPyFunction, FunctionExecutionMode, FunctionKind, ParamKind, RuntimeFunctionId,
+};
 use soac_ir_blockpy::BlockPyModuleShape;
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
 use std::any::Any;
@@ -308,8 +310,7 @@ struct PyFunctionJitExtra {
     function_env_ptr: *mut c_void,
     function_id: RuntimeFunctionId,
     function_env: Box<FunctionEnv>,
-    binding_plan: DirectArgBindingPlan,
-    entry_plan: jit::RuntimeFunctionEntryPlan,
+    function_template: Arc<FunctionInstantiationTemplate>,
     compile_session: Arc<CompileSession>,
     module_state: Arc<module_type::SharedModuleState>,
     compiled_vectorcall_entry: Option<jit::VectorcallEntryFn>,
@@ -393,6 +394,45 @@ impl DirectArgBindingPlan {
 
     fn param_index(&self, name: &str) -> Option<usize> {
         self.param_indices_by_name.get(name).copied()
+    }
+}
+
+pub(crate) struct FunctionInstantiationTemplate {
+    function: Arc<BlockPyFunction<BlockPyModuleShape>>,
+    runtime_data_layout: jit::FunctionRuntimeDataLayout,
+    binding_plan: DirectArgBindingPlan,
+    entry_plan: jit::RuntimeFunctionEntryPlan,
+}
+
+impl FunctionInstantiationTemplate {
+    pub(crate) fn from_function(
+        function: &BlockPyFunction<BlockPyModuleShape>,
+    ) -> Result<Self, String> {
+        let runtime_data_layout = jit::FunctionRuntimeDataLayout::from_function(function);
+        let binding_plan = DirectArgBindingPlan::from_function(function);
+        let entry_plan = jit::RuntimeFunctionEntryPlan::from_function(function)?;
+        Ok(Self {
+            function: Arc::new(function.clone()),
+            runtime_data_layout,
+            binding_plan,
+            entry_plan,
+        })
+    }
+
+    pub(crate) fn function(&self) -> &BlockPyFunction<BlockPyModuleShape> {
+        self.function.as_ref()
+    }
+
+    fn runtime_data_layout(&self) -> &jit::FunctionRuntimeDataLayout {
+        &self.runtime_data_layout
+    }
+
+    fn binding_plan(&self) -> &DirectArgBindingPlan {
+        &self.binding_plan
+    }
+
+    fn entry_plan(&self) -> &jit::RuntimeFunctionEntryPlan {
+        &self.entry_plan
     }
 }
 
@@ -558,20 +598,7 @@ impl Drop for FunctionEnv {
 
 impl PyFunctionJitExtra {
     fn function(&self) -> Result<&soac_core::block_py::BlockPyFunction<BlockPyModuleShape>, ()> {
-        self.module_state
-            .lookup_function(self.function_id)
-            .ok_or_else(|| unsafe {
-                ffi::PyErr_SetString(
-                    ffi::PyExc_RuntimeError,
-                    c"missing JIT function in registered module state".as_ptr(),
-                );
-            })
-    }
-
-    fn runtime_data_layout(&self) -> Result<jit::FunctionRuntimeDataLayout, ()> {
-        Ok(jit::FunctionRuntimeDataLayout::from_function(
-            self.function()?,
-        ))
+        Ok(self.function_template.function())
     }
 
     unsafe fn refresh_runtime_objects_after_function_update(
@@ -580,14 +607,13 @@ impl PyFunctionJitExtra {
         event: PyFunctionWatchEvent,
         new_value: *mut ffi::PyObject,
     ) -> Result<(), ()> {
-        let layout = self.runtime_data_layout()?;
         let defaults_override = (event == PY_FUNCTION_EVENT_MODIFY_DEFAULTS).then_some(new_value);
         let kwdefaults_override =
             (event == PY_FUNCTION_EVENT_MODIFY_KWDEFAULTS).then_some(new_value);
         let values = unsafe {
             collect_function_runtime_objects(
                 callable,
-                &layout,
+                self.function_template.runtime_data_layout(),
                 defaults_override,
                 kwdefaults_override,
             )?
@@ -848,7 +874,10 @@ unsafe fn make_clif_function_data(
     module_runtime: jit::ModuleRuntimeContext,
 ) -> Result<*mut c_void, ()> {
     let module_state = module_runtime.shared_module_state_owner.clone();
-    let Some(blockpy_function) = module_state.lookup_function(function_id).cloned() else {
+    let function_template = module_state
+        .lookup_function_template(function_id)
+        .map_err(|err| set_runtime_error_message(&err))?;
+    let Some(function_template) = function_template else {
         let module_name = module_state.module_name.as_str();
         let msg = format!(
             "no specialized JIT plan found: module={module_name:?} function_id={function_id:?}"
@@ -863,14 +892,14 @@ unsafe fn make_clif_function_data(
         }
         return Err(());
     };
-    let runtime_data_layout = jit::FunctionRuntimeDataLayout::from_function(&blockpy_function);
-    let binding_plan = DirectArgBindingPlan::from_function(&blockpy_function);
-    let entry_plan = match jit::RuntimeFunctionEntryPlan::from_function(&blockpy_function) {
-        Ok(plan) => plan,
-        Err(err) => return set_runtime_error(&err),
+    let runtime_object_values = unsafe {
+        collect_function_runtime_objects(
+            callable,
+            function_template.runtime_data_layout(),
+            None,
+            None,
+        )?
     };
-    let runtime_object_values =
-        unsafe { collect_function_runtime_objects(callable, &runtime_data_layout, None, None)? };
     let mut function_env = unsafe {
         Box::new(FunctionEnv::new(
             module_runtime.mod_ctx.globals_obj as *mut ffi::PyObject,
@@ -882,8 +911,7 @@ unsafe fn make_clif_function_data(
         function_env_ptr,
         function_id,
         function_env,
-        binding_plan,
-        entry_plan,
+        function_template,
         compile_session: module_runtime.compile_session.clone(),
         module_state,
         compiled_vectorcall_entry: None,
@@ -1463,74 +1491,75 @@ unsafe fn ensure_clif_direct_entries_compiled(
     data: &mut PyFunctionJitExtra,
 ) -> Result<(), ()> {
     if data.function_env.compiled_function.is_none() {
-        let function = data
-            .function()
-            .map(soac_core::block_py::BlockPyFunction::clone)?;
         let ensure_start = Instant::now();
-        let function_block_count = function.blocks.len();
-        let function_qualname = function.names.qualname.clone();
-        let module_state = Arc::clone(&data.module_state);
-        let compile_session = Arc::clone(&data.compile_session);
-        let compile_start = Instant::now();
-        let compiled_function_result = match module_state
-            .lookup_or_compile_direct_function_handle(&compile_session, function.function_id)
-        {
-            Ok(Some((handle, _compiled))) => Ok(handle),
-            Ok(None) => {
-                let block_ptrs = vec![ptr::null_mut::<c_void>(); function.blocks.len()];
-                let module_constant_ptrs = module_state.module_constant_ptrs();
-                let compile_result = jit::compile_cranelift_run_bb_specialized_cached(
-                    &compile_session,
-                    block_ptrs.as_slice(),
-                    &module_state.lowered_module,
-                    &function,
-                    &module_state.codegen_constants,
-                    &module_state.lowered_module.counter_defs,
-                    &module_constant_ptrs,
-                    Some(module_state.as_ref()),
-                );
-                match compile_result {
-                    Ok(result) => {
-                        if result.compiled {
+        let (compiled_function, function_qualname, function_block_count) = {
+            let function = data.function()?;
+            let function_block_count = function.blocks.len();
+            let function_qualname = function.names.qualname.clone();
+            let module_state = Arc::clone(&data.module_state);
+            let compile_session = Arc::clone(&data.compile_session);
+            let compile_start = Instant::now();
+            let compiled_function_result = match module_state
+                .lookup_or_compile_direct_function_handle(&compile_session, function.function_id)
+            {
+                Ok(Some((handle, _compiled))) => Ok(handle),
+                Ok(None) => {
+                    let block_ptrs = vec![ptr::null_mut::<c_void>(); function.blocks.len()];
+                    let module_constant_ptrs = module_state.module_constant_ptrs();
+                    let compile_result = jit::compile_cranelift_run_bb_specialized_cached(
+                        &compile_session,
+                        block_ptrs.as_slice(),
+                        &module_state.lowered_module,
+                        function,
+                        &module_state.codegen_constants,
+                        &module_state.lowered_module.counter_defs,
+                        &module_constant_ptrs,
+                        Some(module_state.as_ref()),
+                    );
+                    match compile_result {
+                        Ok(result) => {
+                            if result.compiled {
+                                module_state.append_jit_codegen_log(
+                                    function,
+                                    "vectorcall_function_body",
+                                    compile_start.elapsed(),
+                                    "ok",
+                                    None,
+                                    result.stats.as_ref(),
+                                );
+                            }
+                            Ok(result.handle)
+                        }
+                        Err(err) => {
                             module_state.append_jit_codegen_log(
-                                &function,
+                                function,
                                 "vectorcall_function_body",
                                 compile_start.elapsed(),
-                                "ok",
+                                "error",
+                                Some(&err),
                                 None,
-                                result.stats.as_ref(),
                             );
+                            Err(err)
                         }
-                        Ok(result.handle)
                     }
-                    Err(err) => {
-                        module_state.append_jit_codegen_log(
-                            &function,
-                            "vectorcall_function_body",
-                            compile_start.elapsed(),
-                            "error",
-                            Some(&err),
-                            None,
+                }
+                Err(err) => Err(err),
+            };
+            let compiled_function = match compiled_function_result {
+                Ok(handle) => handle,
+                Err(err) => {
+                    if let Ok(c_msg) = CString::new(err) {
+                        ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c_msg.as_ptr());
+                    } else {
+                        ffi::PyErr_SetString(
+                            ffi::PyExc_RuntimeError,
+                            b"failed to compile CLIF function body\0".as_ptr() as *const i8,
                         );
-                        Err(err)
                     }
+                    return Err(());
                 }
-            }
-            Err(err) => Err(err),
-        };
-        let compiled_function = match compiled_function_result {
-            Ok(handle) => handle,
-            Err(err) => {
-                if let Ok(c_msg) = CString::new(err) {
-                    ffi::PyErr_SetString(ffi::PyExc_RuntimeError, c_msg.as_ptr());
-                } else {
-                    ffi::PyErr_SetString(
-                        ffi::PyExc_RuntimeError,
-                        b"failed to compile CLIF function body\0".as_ptr() as *const i8,
-                    );
-                }
-                return Err(());
-            }
+            };
+            (compiled_function, function_qualname, function_block_count)
         };
         attach_compiled_function_to_env(&mut data.function_env, compiled_function)?;
         let elapsed_ms = ensure_start.elapsed().as_secs_f64() * 1000.0;
@@ -1621,7 +1650,7 @@ unsafe fn ensure_clif_vectorcall_compiled(
 ) -> Result<(), ()> {
     unsafe { ensure_clif_direct_entries_compiled(py, data)? };
     if data.compiled_vectorcall_entry.is_none() {
-        let param_count = data.binding_plan.param_count();
+        let param_count = data.function_template.binding_plan().param_count();
         let entry = match data
             .compile_session
             .process_jit()
@@ -1728,7 +1757,7 @@ unsafe fn bind_function_args_to_output(
     out_args: *mut *mut ffi::PyObject,
     out_len: usize,
 ) -> Result<(), ()> {
-    let plan = &data.binding_plan;
+    let plan = data.function_template.binding_plan();
     if out_len != plan.param_count() {
         ffi::PyErr_SetString(
             ffi::PyExc_RuntimeError,
@@ -2088,7 +2117,7 @@ pub unsafe fn register_clif_vectorcall(
             PyFunction_SetVectorcall(func, Some(entry_interpreter_vectorcall));
             return Ok(());
         }
-        let param_count = data.binding_plan.param_count();
+        let param_count = data.function_template.binding_plan().param_count();
         let entry = data
             .compile_session
             .process_jit()
@@ -2283,7 +2312,7 @@ pub(crate) unsafe fn run_registered_clif_function_from_vectorcall_entry(
         Arc::clone(&data.module_state),
         data.function_env.globals_obj().cast::<c_void>(),
         data.function_env.runtime_objects_ptr().cast::<c_void>(),
-        &data.entry_plan,
+        data.function_template.entry_plan(),
     );
     match jit::run_blockpy_function_from_vectorcall_entry(
         blockpy_function,

@@ -1,6 +1,9 @@
 use crate::jit::{ModuleJitContext, ModuleRuntimeContext};
 use crate::module_type::SharedModuleState;
-use crate::{CompileSession, clone_module_runtime_context, compile_clif_vectorcall};
+use crate::{
+    CompileSession, FunctionInstantiationTemplate, clone_module_runtime_context,
+    compile_clif_vectorcall,
+};
 use pyo3::exceptions::{
     PyAttributeError, PyNotImplementedError, PyRuntimeError, PyTypeError, PyValueError,
 };
@@ -668,31 +671,41 @@ fn mark_coroutine_function(py: Python<'_>, func: &Bound<'_, PyAny>) -> PyResult<
     func.setattr("_is_coroutine", marker)
 }
 
-fn lookup_shared_function(
+fn lookup_shared_function_template(
     compile_session: &Arc<CompileSession>,
     function_id: RuntimeFunctionId,
-) -> PyResult<(Arc<SharedModuleState>, BlockPyFunction<BlockPyModuleShape>)> {
-    compile_session
-        .lookup_shared_function(function_id)
+) -> PyResult<(Arc<SharedModuleState>, Arc<FunctionInstantiationTemplate>)> {
+    let shared_state = compile_session
+        .shared_module_state_for_function_id(function_id)
         .map_err(PyRuntimeError::new_err)?
         .ok_or_else(|| {
             PyRuntimeError::new_err(format!(
                 "JIT basic-block function instantiation failed to resolve static function metadata for fn#{function_id}"
             ))
-        })
+        })?;
+    let template = shared_state
+        .lookup_function_template(function_id)
+        .map_err(PyRuntimeError::new_err)?
+        .ok_or_else(|| {
+            PyRuntimeError::new_err(format!(
+                "JIT basic-block function instantiation failed to resolve static function metadata for fn#{function_id}"
+            ))
+        })?;
+    Ok((shared_state, template))
 }
 
 fn instantiate_shared_function(
     py: Python<'_>,
     compile_session: Arc<CompileSession>,
     shared_state: Arc<SharedModuleState>,
-    function: BlockPyFunction<BlockPyModuleShape>,
+    function_template: Arc<FunctionInstantiationTemplate>,
     expected_kind: FunctionKind,
     captures: &Bound<'_, PyAny>,
     param_defaults: &Bound<'_, PyAny>,
     annotate_fn: &Bound<'_, PyAny>,
     module_globals: &Bound<'_, PyAny>,
 ) -> PyResult<Py<PyAny>> {
+    let function = function_template.function();
     if *function.lowered_kind() != expected_kind {
         return Err(PyRuntimeError::new_err(format!(
             "JIT basic-block function instantiation expected kind {:?} for fn#{}, got {:?}",
@@ -720,7 +733,7 @@ fn instantiate_shared_function(
         py,
         &dp,
         &module_name,
-        &function,
+        function,
         captures,
         param_defaults,
         module_globals,
@@ -743,12 +756,13 @@ pub fn make_function(
     module_globals: &Bound<'_, PyAny>,
 ) -> PyResult<Py<PyAny>> {
     let compile_session = CompileSession::process();
-    let (shared_state, function) = lookup_shared_function(&compile_session, function_id)?;
+    let (shared_state, function_template) =
+        lookup_shared_function_template(&compile_session, function_id)?;
     instantiate_shared_function(
         py,
         compile_session,
         shared_state,
-        function,
+        function_template,
         expected_kind,
         captures,
         param_defaults,
@@ -768,9 +782,9 @@ pub(crate) fn make_function_in_shared_state(
     annotate_fn: &Bound<'_, PyAny>,
     module_globals: &Bound<'_, PyAny>,
 ) -> PyResult<Py<PyAny>> {
-    let function = shared_state
-        .lookup_function(function_id)
-        .cloned()
+    let function_template = shared_state
+        .lookup_function_template(function_id)
+        .map_err(PyRuntimeError::new_err)?
         .ok_or_else(|| {
             PyRuntimeError::new_err(format!(
                 "JIT basic-block function instantiation failed to resolve explicit static function metadata for fn#{function_id}"
@@ -780,7 +794,7 @@ pub(crate) fn make_function_in_shared_state(
         py,
         compile_session,
         shared_state,
-        function,
+        function_template,
         expected_kind,
         captures,
         param_defaults,

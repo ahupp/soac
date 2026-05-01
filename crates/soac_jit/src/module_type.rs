@@ -58,6 +58,8 @@ pub struct SharedModuleState {
     pub codegen_constants: ModuleCodegenConstants,
     storage_instance_key: usize,
     function_index_by_id: HashMap<RuntimeFunctionId, usize>,
+    function_templates:
+        Mutex<HashMap<RuntimeFunctionId, Arc<crate::FunctionInstantiationTemplate>>>,
     original_code_by_function_id: HashMap<RuntimeFunctionId, Py<PyAny>>,
     module_constant_objs: Vec<Py<PyAny>>,
     // Each non-null slot owns one runtime-name reference for this module state; lookups return a
@@ -157,6 +159,40 @@ impl SharedModuleState {
         let function = self.lowered_module.callable_defs.get(function_index)?;
         assert_eq!(function.function_id, function_id);
         Some(function)
+    }
+
+    pub(crate) fn lookup_function_template(
+        &self,
+        function_id: RuntimeFunctionId,
+    ) -> Result<Option<Arc<crate::FunctionInstantiationTemplate>>, String> {
+        if function_id == RuntimeFunctionId::global() {
+            return Ok(None);
+        }
+        if let Some(template) = self
+            .function_templates
+            .lock()
+            .map_err(|_| "function template cache lock poisoned".to_string())?
+            .get(&function_id)
+            .cloned()
+        {
+            return Ok(Some(template));
+        }
+        let Some(function) = self.lookup_function(function_id) else {
+            return Ok(None);
+        };
+        let template = Arc::new(crate::FunctionInstantiationTemplate::from_function(
+            function,
+        )?);
+        let mut templates = self
+            .function_templates
+            .lock()
+            .map_err(|_| "function template cache lock poisoned".to_string())?;
+        Ok(Some(
+            templates
+                .entry(function_id)
+                .or_insert_with(|| template)
+                .clone(),
+        ))
     }
 
     fn deopt_entry_source_block_label(
@@ -890,6 +926,7 @@ pub fn build_shared_state_for_inspection_with_placeholder_constants(
         codegen_constants,
         storage_instance_key: allocate_shared_module_state_storage_key(),
         function_index_by_id,
+        function_templates: Mutex::new(HashMap::new()),
         original_code_by_function_id: HashMap::new(),
         module_constant_objs,
         runtime_name_cache: build_runtime_name_cache(),
@@ -926,6 +963,7 @@ pub fn build_shared_state_for_inspection_with_placeholder_constants_and_source_h
         codegen_constants,
         storage_instance_key: allocate_shared_module_state_storage_key(),
         function_index_by_id,
+        function_templates: Mutex::new(HashMap::new()),
         original_code_by_function_id: HashMap::new(),
         module_constant_objs,
         runtime_name_cache: build_runtime_name_cache(),
@@ -996,6 +1034,7 @@ fn build_shared_state_for_inspection_with_original_code_and_source_hash(
         codegen_constants,
         storage_instance_key: allocate_shared_module_state_storage_key(),
         function_index_by_id,
+        function_templates: Mutex::new(HashMap::new()),
         original_code_by_function_id,
         module_constant_objs,
         runtime_name_cache: build_runtime_name_cache(),
@@ -1078,6 +1117,7 @@ impl SoacExtModuleState {
             codegen_constants,
             storage_instance_key: allocate_shared_module_state_storage_key(),
             function_index_by_id,
+            function_templates: Mutex::new(HashMap::new()),
             original_code_by_function_id,
             module_constant_objs,
             runtime_name_cache: build_runtime_name_cache(),
@@ -1798,6 +1838,7 @@ def f():
             codegen_constants: ModuleCodegenConstants::collect_from_module(&lowered),
             source_hash: 0,
             storage_instance_key: allocate_shared_module_state_storage_key(),
+            function_templates: Mutex::new(HashMap::new()),
             module_constant_objs: Vec::new(),
             runtime_name_cache: build_runtime_name_cache(),
             counter_slots_by_id: vec![CounterRuntimeSlot::Scalar(0)].into_boxed_slice(),
@@ -1872,6 +1913,7 @@ def f(x):
             codegen_constants: ModuleCodegenConstants::collect_from_module(&lowered),
             source_hash: 0,
             storage_instance_key: allocate_shared_module_state_storage_key(),
+            function_templates: Mutex::new(HashMap::new()),
             module_constant_objs: Vec::new(),
             runtime_name_cache: build_runtime_name_cache(),
             counter_slots_by_id: vec![CounterRuntimeSlot::Scalar(0)].into_boxed_slice(),
@@ -2077,6 +2119,7 @@ def f():
             codegen_constants: ModuleCodegenConstants::collect_from_module(&lowered),
             source_hash: 0,
             storage_instance_key: allocate_shared_module_state_storage_key(),
+            function_templates: Mutex::new(HashMap::new()),
             module_constant_objs: Vec::new(),
             runtime_name_cache: build_runtime_name_cache(),
             counter_slots_by_id: vec![CounterRuntimeSlot::Scalar(0), CounterRuntimeSlot::Scalar(1)]
