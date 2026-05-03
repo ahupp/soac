@@ -335,9 +335,20 @@ pub(super) fn annotate_typed_attr_accesses(
 fn annotate_typed_indexed_field_accesses_from_profile(
     function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
     profile: &SpecializationProfile<'_>,
+    remapped_indexed_fields: Option<&HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>>,
 ) -> Result<(), String> {
-    let (_, _, opt_v3_indexed_fields_by_instr) =
+    let (_, _, mut opt_v3_indexed_fields_by_instr) =
         profile.field_index_specialization_maps(function.function_id)?;
+    if let Some(remapped_indexed_fields) = remapped_indexed_fields {
+        for (instr_id, accesses) in remapped_indexed_fields {
+            let entry = opt_v3_indexed_fields_by_instr.entry(*instr_id).or_default();
+            for access in accesses {
+                if !entry.contains(access) {
+                    entry.push(access.clone());
+                }
+            }
+        }
+    }
     if opt_v3_indexed_fields_by_instr.is_empty() {
         return Ok(());
     }
@@ -905,11 +916,12 @@ fn annotate_typed_remapped_exact_int_selections(
 fn apply_profile_access_and_scalar_plans_to_typed_function(
     function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
     profile: &SpecializationProfile<'_>,
+    remapped_indexed_fields: Option<&HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>>,
     remapped_exact_list_items: Option<&HashMap<InstrId, ProfileExactListItemAccessPlan>>,
     remapped_exact_int_branches: Option<&HashMap<InstrId, TypedExactIntBranchPlan>>,
     remapped_exact_int_returns: Option<&HashMap<InstrId, TypedExactIntReturnPlan>>,
 ) -> Result<(), String> {
-    annotate_typed_indexed_field_accesses_from_profile(function, profile)?;
+    annotate_typed_indexed_field_accesses_from_profile(function, profile, remapped_indexed_fields)?;
     annotate_typed_indexed_global_accesses_from_profile(function, profile)?;
     annotate_typed_exact_list_item_accesses_from_profile(
         function,
@@ -1179,6 +1191,52 @@ fn remap_inlined_exact_int_selections(
     Ok(count)
 }
 
+fn remap_inlined_indexed_field_accesses(
+    caller_function_id: RuntimeFunctionId,
+    mappings: &[TypedInlineInstrIdMapping],
+    profile: &SpecializationProfile<'_>,
+    remapped_indexed_fields: &mut HashMap<
+        RuntimeFunctionId,
+        HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>,
+    >,
+) -> Result<usize, String> {
+    let mut resolved_by_callee =
+        HashMap::<RuntimeFunctionId, HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>>::new();
+    let mut count = 0;
+    for mapping in mappings {
+        let Some(callee_fields) = profile.opt_v3_emitted_indexed_fields.get(&mapping.callee) else {
+            continue;
+        };
+        if !callee_fields.contains_key(&mapping.callee_instr_id) {
+            continue;
+        }
+        if let std::collections::hash_map::Entry::Vacant(entry) =
+            resolved_by_callee.entry(mapping.callee)
+        {
+            let (_, _, resolved) = profile.field_index_specialization_maps(mapping.callee)?;
+            entry.insert(resolved);
+        }
+        let Some(accesses) = resolved_by_callee
+            .get(&mapping.callee)
+            .and_then(|fields| fields.get(&mapping.callee_instr_id))
+        else {
+            continue;
+        };
+        let entry = remapped_indexed_fields
+            .entry(caller_function_id)
+            .or_default()
+            .entry(mapping.caller_instr_id)
+            .or_default();
+        for access in accesses {
+            if !entry.contains(access) {
+                entry.push(access.clone());
+                count += 1;
+            }
+        }
+    }
+    Ok(count)
+}
+
 fn remap_inlined_exact_list_item_accesses(
     caller_function_id: RuntimeFunctionId,
     mappings: &[TypedInlineInstrIdMapping],
@@ -1231,7 +1289,9 @@ pub(super) fn apply_profile_typed_plans_to_typed_function(
         return Ok(());
     };
     apply_profile_call_emission_plans_to_typed_function(function, profile)?;
-    apply_profile_access_and_scalar_plans_to_typed_function(function, profile, None, None, None)?;
+    apply_profile_access_and_scalar_plans_to_typed_function(
+        function, profile, None, None, None, None,
+    )?;
     apply_profile_typed_block_metadata_to_typed_function(function, profile)?;
     apply_profile_typed_guard_miss_policy_to_typed_function(function, profile);
     Ok(())
@@ -1297,6 +1357,8 @@ fn apply_typed_v3_module_rewrites(
     let callee_module = module.clone();
     let module_constants = module.module_constants.clone();
     let external_callees = HashMap::new();
+    let mut remapped_indexed_fields =
+        HashMap::<RuntimeFunctionId, HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>>::new();
     let mut remapped_exact_list_items =
         HashMap::<RuntimeFunctionId, HashMap<InstrId, ProfileExactListItemAccessPlan>>::new();
     let mut remapped_exact_int_branches =
@@ -1316,6 +1378,12 @@ fn apply_typed_v3_module_rewrites(
                 &inline_targets,
             );
             if !stats.instr_id_mappings.is_empty() {
+                remap_inlined_indexed_field_accesses(
+                    caller_function_id,
+                    &stats.instr_id_mappings,
+                    profile,
+                    &mut remapped_indexed_fields,
+                )?;
                 remap_inlined_exact_list_item_accesses(
                     caller_function_id,
                     &stats.instr_id_mappings,
@@ -1343,6 +1411,7 @@ fn apply_typed_v3_module_rewrites(
         apply_profile_access_and_scalar_plans_to_typed_function(
             function,
             profile,
+            remapped_indexed_fields.get(&function.function_id),
             remapped_exact_list_items.get(&function.function_id),
             remapped_exact_int_branches.get(&function.function_id),
             remapped_exact_int_returns.get(&function.function_id),

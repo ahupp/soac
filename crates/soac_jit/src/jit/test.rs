@@ -19215,6 +19215,190 @@ class Point:
     }
 
     #[test]
+    fn runtime_typed_v3_inline_remaps_callee_indexed_field_access_plans() {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "runtime_typed_v3_inline_remaps_callee_indexed_field_access_plans",
+        ) {
+            return;
+        }
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| {
+            let owner_module = PyModule::from_code(
+                py,
+                c"
+class Point:
+    pass
+",
+                c"field_type_test.py",
+                c"field_type_test",
+            )
+            .expect("owner module should execute");
+            let sys = PyModule::import(py, "sys").expect("sys should import");
+            let modules = sys
+                .getattr("modules")
+                .expect("sys.modules should exist")
+                .cast_into::<pyo3::types::PyDict>()
+                .expect("sys.modules should be a dict");
+            modules
+                .set_item("field_type_test", owner_module.as_any())
+                .expect("owner module should be registered");
+
+            let module_name = "runtime_typed_v3_inline_indexed_field_plan_test";
+            let module_name_gen = ModuleNameGen::new(0);
+            let mut constants = TestConstantPool::default();
+
+            let mut callee_function = test_function_in_module(&module_name_gen, "read_point");
+            callee_function.params = ParamSpec {
+                params: vec![test_param("point", ParamKind::Any, false)],
+            };
+            let callee_block_label = callee_function.name_gen.next_block_name();
+            let callee_getattr_instr_id = InstrId::new(1);
+            callee_function.blocks = vec![BlockPyBlock {
+                label: callee_block_label,
+                body: Vec::new(),
+                term: ret_term(with_instr_id(
+                    op_expr(GetAttr::new(
+                        name_expr(test_name("point")),
+                        constants.string_expr("x"),
+                    )),
+                    callee_getattr_instr_id,
+                )),
+                params: Vec::new(),
+                exc_edge: None,
+                extra: Default::default(),
+            }];
+            set_stack_slots(&mut callee_function, &["point"]);
+
+            let mut caller_function = test_function_in_module(&module_name_gen, "caller");
+            caller_function.params = ParamSpec {
+                params: vec![
+                    test_param("fn", ParamKind::Any, false),
+                    test_param("point", ParamKind::Any, false),
+                ],
+            };
+            let caller_block_label = caller_function.name_gen.next_block_name();
+            let caller_call_instr_id = InstrId::new(10);
+            caller_function.blocks = vec![BlockPyBlock {
+                label: caller_block_label,
+                body: vec![assign_stmt(
+                    test_local_name("out", 2),
+                    with_instr_id(
+                        op_expr(Call::new(
+                            name_expr(test_local_name("fn", 0)),
+                            vec![CallArgPositional::Positional(name_expr(test_local_name(
+                                "point", 1,
+                            )))],
+                            Vec::<CallArgKeyword<InstrBlockPy>>::new(),
+                        )),
+                        caller_call_instr_id,
+                    ),
+                )],
+                term: ret_term(name_expr(test_local_name("out", 2))),
+                params: Vec::new(),
+                exc_edge: None,
+                extra: Default::default(),
+            }];
+            set_stack_slots(&mut caller_function, &["fn", "point", "out"]);
+
+            let callee_id = callee_function.function_id;
+            let caller_id = caller_function.function_id;
+            let mut module = test_module(module_name_gen, vec![callee_function, caller_function]);
+            module.module_constants = constants.module_constants;
+            let profile = SpecializationProfile {
+                module_name: Some(module_name),
+                counter_dump_path: None,
+                direct_call_emission_scope: DirectCallEmissionScope::AllDirectCallCandidates,
+                opt_v3_emitted_direct_calls: HashMap::from([(
+                    caller_id,
+                    HashMap::from([(
+                        caller_call_instr_id,
+                        vec![ResolvedV3DirectCallPlan {
+                            source: caller_call_instr_id,
+                            target: callee_id,
+                            callee: soac_ir_typed::plan_v3::DirectCallCallee::Function,
+                            arg_plan: TypedDirectCallArgPlan {
+                                sources: vec![TypedDirectCallArgSource::Provided(0)],
+                            },
+                            body: CallBodyPlan {
+                                kind: CallBodyKind::Inline,
+                                cost: Cost::default(),
+                                inline_target: None,
+                                reason: "test inlines the field load callee".to_string(),
+                            },
+                            reason: "profiled direct call".to_string(),
+                        }],
+                    )]),
+                )]),
+                opt_v3_emitted_exact_list_items: HashMap::new(),
+                opt_v3_emitted_indexed_fields: HashMap::from([(
+                    callee_id,
+                    HashMap::from([(
+                        callee_getattr_instr_id,
+                        vec![OptV3IndexedFieldAccessPlan {
+                            access: IndexedFieldAccessKind::Load,
+                            guard: MechanicalIndexedFieldGuard {
+                                kind: IndexedFieldGuardKind::OwnerTypeVersionAndFieldIndex,
+                                owner_type: IndexedFieldOwnerType {
+                                    module_name: "field_type_test".to_string(),
+                                    qualname: "Point".to_string(),
+                                },
+                                attr_name: "x".to_string(),
+                                expected_index: 0,
+                            },
+                            fallback: IndexedFieldFallbackKind::OriginalAttrAccess,
+                        }],
+                    )]),
+                )]),
+                opt_v3_emitted_indexed_globals: HashMap::new(),
+                opt_v3_exact_int_branch_artifacts: HashMap::new(),
+                behavior_change_indexed_stores: false,
+                profiled_cold_blocks: false,
+                guard_miss_deopt: false,
+            };
+
+            let module_plan = optimize_blockpy(&module, Some(&profile), &typed_v3_env_config())
+                .expect("typed-v3 module plan should inline and remap callee field plans");
+            let planned_caller = module_plan
+                .module
+                .callable_defs
+                .iter()
+                .find(|function| function.function_id == caller_id)
+                .expect("planned module should include caller");
+
+            let mut field_plans = Vec::new();
+            struct Collector<'a> {
+                field_plans: &'a mut Vec<(InstrId, usize)>,
+            }
+            impl Visit<InstrTyped> for Collector<'_> {
+                fn visit_instr(&mut self, expr: &InstrTyped) {
+                    if let InstrTyped::GetAttrTyped(op) = expr
+                        && let TypedAttrAccessPlan::IndexedField { source, guards } = &op.access
+                    {
+                        assert_eq!(*source, TypedIndexedFieldPlanSource::OptimizationPlanV3);
+                        self.field_plans
+                            .push((op.semantic_instr_id(), guards.len()));
+                    }
+                    expr.visit_children(self);
+                }
+            }
+            Collector {
+                field_plans: &mut field_plans,
+            }
+            .visit_fn(planned_caller);
+
+            assert_eq!(field_plans.len(), 1);
+            assert_ne!(field_plans[0].0, callee_getattr_instr_id);
+            assert_eq!(field_plans[0].1, 1);
+
+            modules
+                .del_item("field_type_test")
+                .expect("owner module should be removed");
+        });
+    }
+
+    #[test]
     fn runtime_typed_v3_inline_remaps_callee_exact_int_plans() {
         let module_name = "runtime_typed_v3_inline_exact_int_plan_test";
         let module_name_gen = ModuleNameGen::new(0);
