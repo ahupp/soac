@@ -20,10 +20,10 @@ use soac_ir_typed::plan_v3::{
 };
 use soac_ir_typed::{
     FactStore, InstrTyped, TypedAttrAccessPlan, TypedBlockPyModuleShape, TypedCallEmissionPlan,
-    TypedCallEmissionPlans, TypedDirectMethodCallGuard, TypedExactIntBranchPlan,
-    TypedExactIntPlanSource, TypedExactIntReturnPlan, TypedExactListItemAccessPlan,
-    TypedExactListItemCounterSource, TypedExactListItemPlanSource, TypedIndexedFieldPlanSource,
-    TypedIndexedGlobalAccessPlan, TypedIndexedGlobalPlanSource,
+    TypedCallEmissionPlans, TypedDirectCallArgPlan, TypedDirectMethodCallGuard,
+    TypedExactIntBranchPlan, TypedExactIntPlanSource, TypedExactIntReturnPlan,
+    TypedExactListItemAccessPlan, TypedExactListItemCounterSource, TypedExactListItemPlanSource,
+    TypedIndexedFieldPlanSource, TypedIndexedGlobalAccessPlan, TypedIndexedGlobalPlanSource,
     assign_missing_typed_function_instr_ids,
 };
 use soac_opt::access_emission_v3::{
@@ -45,6 +45,10 @@ use soac_opt::region_emission_v3::{
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+
+const MAX_TYPED_INLINE_PASSES: usize = 16;
+
+type TypedInlineTargets = HashMap<InstrId, Vec<(RuntimeFunctionId, TypedDirectCallArgPlan)>>;
 
 fn method_guards_for_v3_direct_call(
     plan: &ResolvedV3DirectCallPlan,
@@ -1280,6 +1284,59 @@ fn remap_inlined_exact_list_item_accesses(
     Ok(count)
 }
 
+fn merge_typed_inline_targets(targets: &mut TypedInlineTargets, incoming: &TypedInlineTargets) {
+    for (source, plans) in incoming {
+        let entry = targets.entry(*source).or_default();
+        for plan in plans {
+            if !entry.contains(plan) {
+                entry.push(plan.clone());
+            }
+        }
+    }
+}
+
+fn typed_inline_targets_for_function(
+    function_id: RuntimeFunctionId,
+    profile: &SpecializationProfile<'_>,
+    remapped_inline_targets: &HashMap<RuntimeFunctionId, TypedInlineTargets>,
+) -> TypedInlineTargets {
+    let mut targets = profile.typed_inline_direct_calls(function_id);
+    if let Some(remapped) = remapped_inline_targets.get(&function_id) {
+        merge_typed_inline_targets(&mut targets, remapped);
+    }
+    targets
+}
+
+fn remap_inlined_direct_call_targets(
+    caller_function_id: RuntimeFunctionId,
+    mappings: &[TypedInlineInstrIdMapping],
+    profile: &SpecializationProfile<'_>,
+    remapped_inline_targets: &mut HashMap<RuntimeFunctionId, TypedInlineTargets>,
+) -> usize {
+    let mut targets_by_callee = HashMap::<RuntimeFunctionId, TypedInlineTargets>::new();
+    let mut count = 0;
+    for mapping in mappings {
+        let targets = targets_by_callee
+            .entry(mapping.callee)
+            .or_insert_with(|| profile.typed_inline_direct_calls(mapping.callee));
+        let Some(plans) = targets.get(&mapping.callee_instr_id) else {
+            continue;
+        };
+        let entry = remapped_inline_targets
+            .entry(caller_function_id)
+            .or_default()
+            .entry(mapping.caller_instr_id)
+            .or_default();
+        for plan in plans {
+            if !entry.contains(plan) {
+                entry.push(plan.clone());
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
 #[cfg(test)]
 pub(super) fn apply_profile_typed_plans_to_typed_function(
     function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
@@ -1354,9 +1411,14 @@ fn apply_typed_v3_module_rewrites(
     module: &mut BlockPyModule<TypedBlockPyModuleShape>,
     profile: &SpecializationProfile<'_>,
 ) -> Result<(), String> {
+    for function in &mut module.callable_defs {
+        apply_profile_call_emission_plans_to_typed_function(function, profile)?;
+    }
+
     let callee_module = module.clone();
     let module_constants = module.module_constants.clone();
     let external_callees = HashMap::new();
+    let mut remapped_inline_targets = HashMap::<RuntimeFunctionId, TypedInlineTargets>::new();
     let mut remapped_indexed_fields =
         HashMap::<RuntimeFunctionId, HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>>::new();
     let mut remapped_exact_list_items =
@@ -1366,18 +1428,32 @@ fn apply_typed_v3_module_rewrites(
     let mut remapped_exact_int_returns =
         HashMap::<RuntimeFunctionId, HashMap<InstrId, TypedExactIntReturnPlan>>::new();
     for function in &mut module.callable_defs {
-        apply_profile_call_emission_plans_to_typed_function(function, profile)?;
-        let inline_direct_calls = profile.typed_inline_resolved_direct_calls(function.function_id);
-        if !inline_direct_calls.is_empty() {
+        for pass in 0..MAX_TYPED_INLINE_PASSES {
+            let inline_targets = typed_inline_targets_for_function(
+                function.function_id,
+                profile,
+                &remapped_inline_targets,
+            );
+            if inline_targets.is_empty() {
+                break;
+            }
             let caller_function_id = function.function_id;
-            let inline_targets = profile.typed_inline_direct_calls(function.function_id);
             let stats = inline_typed_function_direct_call_stores(
                 function,
                 &callee_module,
                 &external_callees,
                 &inline_targets,
             );
+            if stats.rewritten_stores == 0 && stats.rewritten_effect_only_calls == 0 {
+                break;
+            }
             if !stats.instr_id_mappings.is_empty() {
+                remap_inlined_direct_call_targets(
+                    caller_function_id,
+                    &stats.instr_id_mappings,
+                    profile,
+                    &mut remapped_inline_targets,
+                );
                 remap_inlined_indexed_field_accesses(
                     caller_function_id,
                     &stats.instr_id_mappings,
@@ -1399,9 +1475,13 @@ fn apply_typed_v3_module_rewrites(
                     &mut remapped_exact_int_returns,
                 )?;
             }
-            if stats.rewritten_stores != 0 || stats.rewritten_effect_only_calls != 0 {
-                assign_missing_typed_function_instr_ids(function);
-                refresh_typed_function_value_facts(function);
+            assign_missing_typed_function_instr_ids(function);
+            refresh_typed_function_value_facts(function);
+            if pass + 1 == MAX_TYPED_INLINE_PASSES {
+                return Err(format!(
+                    "typed-v3 direct-call inlining exceeded {MAX_TYPED_INLINE_PASSES} passes in function {}",
+                    function.function_id
+                ));
             }
         }
         if rewrite_typed_stop_iteration_raises_to_handler_jumps(function, &module_constants) != 0 {
