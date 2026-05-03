@@ -230,8 +230,17 @@ where
     }
 }
 
+fn synthetic_name_expr_with_context(name: &str, ctx: ast::ExprContext) -> InstrRuff {
+    crate::passes::ast_to_instr::from_ast_expr(ast::Expr::Name(ast::ExprName {
+        id: ast::name::Name::new(name),
+        ctx,
+        range: Default::default(),
+        node_index: Default::default(),
+    }))
+}
+
 fn synthetic_name_expr(name: &str) -> InstrRuff {
-    crate::passes::ast_to_instr::from_ast_expr(py_expr!("{name:id}", name = name))
+    synthetic_name_expr_with_context(name, ast::ExprContext::Load)
 }
 
 fn runtime_helper_expr(name: &'static str) -> InstrRuff {
@@ -247,6 +256,12 @@ fn runtime_helper_expr(name: &'static str) -> InstrRuff {
 
 fn synthetic_assign(target: InstrRuff, value: InstrRuff) -> InstrRuff {
     crate::block_py::StmtAssign::new(vec![target], value)
+        .with_meta(crate::block_py::Meta::synthetic())
+        .into()
+}
+
+fn synthetic_delete(target: InstrRuff) -> InstrRuff {
+    crate::block_py::StmtDelete::new(vec![target])
         .with_meta(crate::block_py::Meta::synthetic())
         .into()
 }
@@ -306,14 +321,30 @@ fn expand_for_stmt(
     assign_body: Vec<InstrRuff>,
 ) -> Vec<InstrRuff> {
     let iter_helper = if for_stmt.is_async { "aiter" } else { "iter" };
+    let iterable_name = name_gen.next_tmp_name("iterable").to_string();
+    let iterable_assign = synthetic_assign(synthetic_name_expr(&iterable_name), *for_stmt.iter);
     let iter_value: InstrRuff = Call::new(
         runtime_helper_expr(iter_helper),
-        vec![CallArgPositional::Positional(*for_stmt.iter)],
+        vec![CallArgPositional::Positional(synthetic_name_expr(
+            &iterable_name,
+        ))],
         Vec::new(),
     )
     .with_meta(crate::block_py::Meta::synthetic())
     .into();
     let iter_assign = synthetic_assign(synthetic_name_expr(&iter_name), iter_value);
+    let iter_setup = crate::block_py::StmtTry::new(
+        vec![iter_assign],
+        Vec::new(),
+        Vec::new(),
+        vec![synthetic_delete(synthetic_name_expr_with_context(
+            &iterable_name,
+            ast::ExprContext::Del,
+        ))],
+        false,
+    )
+    .with_meta(crate::block_py::Meta::synthetic())
+    .into();
 
     let completed_name =
         (!for_stmt.orelse.is_empty()).then(|| name_gen.next_tmp_name("completed").to_string());
@@ -390,7 +421,7 @@ fn expand_for_stmt(
     .with_meta(crate::block_py::Meta::synthetic())
     .into();
 
-    let mut expanded = vec![iter_assign];
+    let mut expanded = vec![iterable_assign, iter_setup];
     if let Some(completed_name) = &completed_name {
         expanded.push(synthetic_assign(
             synthetic_name_expr(completed_name),

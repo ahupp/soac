@@ -233,7 +233,9 @@ def run():
                 location_counts[branch] = location_counts.get(branch, 0) + value
 
     assert any(
-        value > 0 and "reason=return" in branch and "name=x" in branch
+        value > 0
+        and "name=x" in branch
+        and ("reason=return" in branch or "purpose=stack_exit_sweep" in branch)
         for branch, value in location_counts.items()
     ), verify
 

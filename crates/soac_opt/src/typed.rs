@@ -10,7 +10,7 @@ use soac_core::block_py::{
     ParamKind, PrettyPrint, PrettyPrinter, ResolvedName, RuntimeFunctionId, RuntimeName, SetAttr,
     Store, TermIf, TryMapInstr, TryMapModule, TryMapTerm, Visit, VisitMut, WithMeta,
 };
-use soac_ir_blockpy::{BlockPyModuleShape, InstrBlockPy};
+use soac_ir_blockpy::{BlockPyModuleShape, InstrBlockPy, is_constructor_entry_function};
 use soac_ir_typed::emit_v3::MechanicalExitKind;
 use soac_ir_typed::plan_v3::Rep;
 use soac_ir_typed::{
@@ -1110,8 +1110,14 @@ fn build_typed_direct_call_inline_rewrite(
             caller.storage_layout = original_storage_layout;
             return TypedInlineBlockRewrite::Unchanged(original_block);
         };
-        let provided_values =
+        let mut provided_values =
             typed_inline_provided_values(&candidate.call, &receiver_temp, &arg_temps);
+        if is_constructor_entry_function(callee) {
+            let callable_temp = callable_temp
+                .as_ref()
+                .expect("constructor callable inline candidate should allocate callable temp");
+            provided_values.insert(0, typed_load_temp(&callable_temp.resolved_name()));
+        }
         let Ok(bindings) = bind_typed_direct_call_inline_values(
             callee,
             &plan.arg_plan,

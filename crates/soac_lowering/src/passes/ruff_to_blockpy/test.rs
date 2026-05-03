@@ -176,6 +176,16 @@ def f(xs):
         function.blocks
     );
     assert!(
+        blocks_store_to_prefix(&function.blocks, "_dp_iterable_"),
+        "for lowering should expose the iterable expression in its own temp before iter(): {:#?}",
+        function.blocks
+    );
+    assert!(
+        blocks_delete_to_prefix(&function.blocks, "_dp_iterable_"),
+        "for lowering should clean up the iterable temp after iter(): {:#?}",
+        function.blocks
+    );
+    assert!(
         !blocks_self_store_to_prefix(&function.blocks, "_dp_tmp_"),
         "for lowering should not re-store the generated temp into itself: {:#?}",
         function.blocks
@@ -1121,6 +1131,17 @@ fn blocks_store_to_prefix(blocks: &[TestBlock], prefix: &str) -> bool {
             matches!(
                 stmt,
                 InstrWithAwaitAndYield::Store(store) if store.name.id_str().starts_with(prefix)
+            )
+        })
+    })
+}
+
+fn blocks_delete_to_prefix(blocks: &[TestBlock], prefix: &str) -> bool {
+    blocks.iter().any(|block| {
+        block.body.iter().any(|stmt| {
+            matches!(
+                stmt,
+                InstrWithAwaitAndYield::Del(del) if del.name.id_str().starts_with(prefix)
             )
         })
     })

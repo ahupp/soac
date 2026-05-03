@@ -6,8 +6,8 @@ use crate::evidence_v3::{
 };
 use crate::passes::{
     BlockPyModuleShape, InlineUnsupportedReason, InstrBlockPy, bind_simple_direct_call_inline_args,
-    build_direct_call_inline_fragment_to_target, build_direct_method_inline_fragment_to_target,
-    try_allocate_codegen_stack_temp,
+    bind_simple_direct_method_inline_args, build_direct_call_inline_fragment_to_target,
+    build_direct_method_inline_fragment_to_target, try_allocate_codegen_stack_temp,
 };
 use crate::plan::{FunctionProfileEvidence, ProfileEvidenceStore};
 use crate::planner_v3::{
@@ -21,7 +21,7 @@ use crate::region_v3::{
 use anyhow::Result;
 use soac_core::block_py::literal::Literal;
 use soac_core::block_py::{
-    BlockLabel, BlockPyFunction, BlockPyModule, Call, CallArgPositional, CallDirect,
+    BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, Call, CallArgPositional, CallDirect,
     ChildVisitable, ConstantExpr, FunctionExecutionMode, HasSemanticInstrId, InstrId,
     LocalFunctionId, ModuleContentId, NameLike, NameLocation, ParamKind, PersistentFunctionId,
     ResolvedName, RuntimeName, SerializedFunctionDebugName, SerializedFunctionId,
@@ -1497,7 +1497,7 @@ fn direct_call_inline_candidate_v3(
         return false;
     }
     let implicit_positional_arg_count = match callee {
-        DirectCallCallee::Function => 0,
+        DirectCallCallee::Function => usize::from(is_constructor_entry_function(target_function)),
         DirectCallCallee::Method { .. } => 1,
         DirectCallCallee::RuntimeProtocolMethod { .. } => 0,
     };
@@ -1563,6 +1563,11 @@ fn inline_call_and_return_target_for_instr_id_v3(
                 _ => {}
             }
         }
+        if let BlockTerm::Return(InstrBlockPy::Call(call)) = &block.term
+            && call.try_semantic_instr_id() == Some(source)
+        {
+            return Some((InlineCallReturnTargetV3::Discard, call));
+        }
     }
     None
 }
@@ -1585,13 +1590,21 @@ fn direct_call_inline_body_buildable_v3(
                 .resolved_name()
         }
     };
-    let direct_call = CallDirect::new(
-        call.func.as_ref().clone(),
-        target.function.function_id,
-        call.args.clone(),
-        call.keywords.clone(),
-    );
-    let bindings = bind_simple_direct_call_inline_args(&target.function, &direct_call)?;
+    let bindings = if is_constructor_entry_function(&target.function) {
+        bind_simple_direct_method_inline_args(
+            &target.function,
+            call.func.as_ref().clone(),
+            call.args.as_slice(),
+        )?
+    } else {
+        let direct_call = CallDirect::new(
+            call.func.as_ref().clone(),
+            target.function.function_id,
+            call.args.clone(),
+            call.keywords.clone(),
+        );
+        bind_simple_direct_call_inline_args(&target.function, &direct_call)?
+    };
     if target.module != *current_module {
         return Err(InlineUnsupportedReason::CrossModuleGlobalName(
             target.module.module_name.clone(),
@@ -1929,7 +1942,9 @@ mod tests {
         CounterDumpKeyLayout, CounterDumpRecord, CounterDumpRow, CounterDumpTypeKey,
         CounterDumpTypeKeyLayout, CounterDumpTypeTableEntry,
     };
-    use soac_ir_blockpy::InstrBlockPy;
+    use soac_ir_blockpy::{
+        CONSTRUCTOR_ENTRY_FUNCTION_NAME, CONSTRUCTOR_ENTRY_TYPE_PARAM_NAME, InstrBlockPy,
+    };
     use soac_ir_typed::plan_v3::{CallBodyKind, RegionId, validate_module_plan_v3};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -2265,6 +2280,84 @@ mod tests {
             &effect_only_caller,
             effect_source,
             &exact_target,
+            &DirectCallCallee::Function
+        ));
+
+        let return_source = instr_id(11);
+        let mut return_caller = function_with_blocks(vec![Block::new(
+            label(0),
+            Vec::new(),
+            BlockTerm::Return(with_instr_id(
+                InstrBlockPy::Call(Call::new(
+                    local("callee", 0),
+                    vec![CallArgPositional::Positional(local("x", 1))],
+                    Vec::new(),
+                )),
+                11,
+            )),
+            Vec::<BlockParam>::new(),
+            None,
+        )]);
+        set_stack_slots(&mut return_caller, &["callee", "x"]);
+        assert!(direct_call_inline_candidate_v3(
+            &module,
+            &current_module,
+            &return_caller,
+            return_source,
+            &exact_target,
+            &DirectCallCallee::Function
+        ));
+
+        let constructor_source = instr_id(12);
+        let mut constructor_caller = function_with_blocks(vec![Block::new(
+            label(0),
+            vec![InstrBlockPy::Store(Store::new(
+                local_name("result", 2),
+                with_instr_id(
+                    InstrBlockPy::Call(Call::new(
+                        local("Record", 0),
+                        vec![CallArgPositional::Positional(local("x", 1))],
+                        Vec::new(),
+                    )),
+                    12,
+                ),
+            ))],
+            BlockTerm::Return(local("result", 2)),
+            Vec::<BlockParam>::new(),
+            None,
+        )]);
+        set_stack_slots(&mut constructor_caller, &["Record", "x", "result"]);
+        let mut constructor_entry =
+            simple_arg_return_callee(&[(CONSTRUCTOR_ENTRY_TYPE_PARAM_NAME, false), ("x", false)]);
+        constructor_entry.names = FunctionName::new(
+            CONSTRUCTOR_ENTRY_FUNCTION_NAME,
+            CONSTRUCTOR_ENTRY_FUNCTION_NAME,
+            "Record.__soac_constructor_entry__#0:1",
+            "Record.__soac_constructor_entry__#0:1",
+        );
+        let constructor_plan = direct_call_arg_plan_for_instr_id_v3(
+            &constructor_caller,
+            constructor_source,
+            &constructor_entry,
+            1,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            constructor_plan.sources,
+            vec![
+                DirectCallArgSource::Provided(0),
+                DirectCallArgSource::Provided(1),
+            ]
+        );
+        let constructor_target =
+            direct_call_target_entry(current_module.clone(), constructor_entry);
+        assert!(direct_call_inline_candidate_v3(
+            &module,
+            &current_module,
+            &constructor_caller,
+            constructor_source,
+            &constructor_target,
             &DirectCallCallee::Function
         ));
 
