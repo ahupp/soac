@@ -42,6 +42,10 @@ pub enum ExtractedValueKind {
         left: ExtractedValueId,
         right: ExtractedValueId,
     },
+    GetAttr {
+        value: ExtractedValueId,
+        attr: ExtractedValueId,
+    },
     Truthiness {
         value: ExtractedValueId,
     },
@@ -339,10 +343,14 @@ impl RegionBuilder {
                 source: instr.try_semantic_instr_id(),
                 kind: "Call",
             }),
-            InstrBlockPy::GetAttr(_) => Err(RegionExtractionError::UnsupportedInstr {
-                source: instr.try_semantic_instr_id(),
-                kind: "GetAttr",
-            }),
+            InstrBlockPy::GetAttr(op) => {
+                let value = self.linearize_instr(&op.value)?;
+                let attr = self.linearize_instr(&op.attr)?;
+                Ok(self.push(
+                    instr.try_semantic_instr_id(),
+                    ExtractedValueKind::GetAttr { value, attr },
+                ))
+            }
             InstrBlockPy::SetAttr(_) => Err(RegionExtractionError::UnsupportedInstr {
                 source: instr.try_semantic_instr_id(),
                 kind: "SetAttr",

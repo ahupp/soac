@@ -3,11 +3,11 @@ use crate::plan_v3::{
     ExactListItemAccessKind, ExactListItemFallbackPlan, ExactListItemGuardPlan, ExactListItemShape,
     ExactListItemSpecializationPlan, FailureMode, GuardFailure, GuardKind, IndexedFieldAccessKind,
     IndexedFieldFallbackPlan, IndexedFieldGuardKind, IndexedFieldOwnerType,
-    IndexedFieldSpecializationPlan, IndexedGlobalAccessKind, IndexedGlobalFallbackPlan,
-    IndexedGlobalGuardPlan, IndexedGlobalSpecializationPlan, MaterializeKind,
-    ModuleOptimizationPlanV3, OperationNode, PlanNodeId, PlanNodeKind, PlanValidationError,
-    PlanValue, PlannedConstant, PlannedOp, RegionExitKind, RegionExitTarget, RegionId,
-    RegionInputSource, RegionPlan, Rep, RichCompareOp, validate_module_plan_v3,
+    IndexedFieldReceiverSource, IndexedFieldSpecializationPlan, IndexedGlobalAccessKind,
+    IndexedGlobalFallbackPlan, IndexedGlobalGuardPlan, IndexedGlobalSpecializationPlan,
+    MaterializeKind, ModuleOptimizationPlanV3, OperationNode, PlanNodeId, PlanNodeKind,
+    PlanValidationError, PlanValue, PlannedConstant, PlannedOp, RegionExitKind, RegionExitTarget,
+    RegionId, RegionInputSource, RegionPlan, Rep, RichCompareOp, validate_module_plan_v3,
 };
 use soac_core::block_py::{InstrId, SerializedFunctionId};
 use std::collections::{HashMap, HashSet};
@@ -56,6 +56,18 @@ pub enum MechanicalRegionInputSource<'a> {
         name: &'a str,
         expected_index: u32,
     },
+    IndexedField {
+        source: InstrId,
+        receiver: MechanicalIndexedFieldReceiverSource<'a>,
+        owner_type: &'a IndexedFieldOwnerType,
+        attr_name: &'a str,
+        expected_index: u32,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MechanicalIndexedFieldReceiverSource<'a> {
+    LocalName { name: &'a str },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -397,6 +409,28 @@ pub fn mechanical_region_inputs<'a>(
                     source: *source,
                     module_name,
                     name,
+                    expected_index: *expected_index,
+                }
+            }
+            RegionInputSource::IndexedField {
+                source,
+                receiver,
+                owner_type,
+                attr_name,
+                expected_index,
+            } if input.value.rep == Rep::PyObjectBorrowed
+                || input.value.rep == Rep::PyObjectOwned =>
+            {
+                let receiver = match receiver {
+                    IndexedFieldReceiverSource::LocalName { name } => {
+                        MechanicalIndexedFieldReceiverSource::LocalName { name }
+                    }
+                };
+                MechanicalRegionInputSource::IndexedField {
+                    source: *source,
+                    receiver,
+                    owner_type,
+                    attr_name,
                     expected_index: *expected_index,
                 }
             }
@@ -964,6 +998,9 @@ fn validate_region_inputs_supported_by_current_lowering_v3(
             RegionInputSource::IndexedGlobal { .. }
                 if input.value.rep == Rep::PyObjectBorrowed
                     || input.value.rep == Rep::PyObjectOwned => {}
+            RegionInputSource::IndexedField { .. }
+                if input.value.rep == Rep::PyObjectBorrowed
+                    || input.value.rep == Rep::PyObjectOwned => {}
             RegionInputSource::FunctionParam { name: Some(_), .. } => {
                 return Err(format!(
                     "function {function} region {:?} input {:?} has rep {:?}; current mechanical lowering loads named inputs as borrowed PyObjects",
@@ -972,7 +1009,7 @@ fn validate_region_inputs_supported_by_current_lowering_v3(
             }
             source => {
                 return Err(format!(
-                    "function {function} region {:?} input {:?} has unsupported source {source:?}; current mechanical lowering only supports named function-param inputs, module constants, and indexed globals",
+                    "function {function} region {:?} input {:?} has unsupported source {source:?}; current mechanical lowering only supports named function-param inputs, module constants, indexed globals, and indexed fields",
                     region.id, input.value.id
                 ));
             }

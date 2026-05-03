@@ -57,6 +57,9 @@ value-producing comparison returns such as `return a < b` or `c = a < b`:
 exact-string evidence proves string comparison operands, a lowered module
 constant load proves the integer constant where needed, profiled indexed-global
 loads can feed exact-int operator regions and exact-string comparison regions,
+profiled indexed-field loads can feed branch-shaped exact-int or exact-string
+regions while return/store expression regions keep ordinary `GetAttr` nodes so
+the field specialization remains owned by the attribute access site,
 the v3 planner emits hot checked-`i64` or exact-unicode operation regions plus
 local generic Python fallback regions, materializes Python object results explicitly, and
 `emit_mechanical_plan_v3` refuses invalid plans before emitting steps.
@@ -383,6 +386,11 @@ apply/verify mode:
   plan instead of reselecting guards from the raw counter tables.
   Generic typed attribute operations still lower directly to normal
   CPython attribute access.
+- When a profiled indexed-field load is used as a v3 exact-int or exact-string
+  branch-region input, codegen reuses the typed `GetAttr` guard chain for the
+  borrowed field value and jumps to the region's local generic fallback on a
+  guard or inline-values miss. Return/store expression regions intentionally do
+  not consume indexed-field loads as region inputs yet.
 - After that guard, the local-runtime helper checks the object's CPython
   inline-values block for the expected key at the recorded index. Loads
   return an owned reference to the value slot.

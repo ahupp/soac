@@ -332,6 +332,13 @@ pub enum RegionInputSource {
         name: String,
         expected_index: u32,
     },
+    IndexedField {
+        source: InstrId,
+        receiver: IndexedFieldReceiverSource,
+        owner_type: IndexedFieldOwnerType,
+        attr_name: String,
+        expected_index: u32,
+    },
     CapturedValue {
         from_region: RegionId,
         value: PlanValueId,
@@ -339,6 +346,11 @@ pub enum RegionInputSource {
     Synthetic {
         reason: String,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub enum IndexedFieldReceiverSource {
+    LocalName { name: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -1213,6 +1225,47 @@ fn validate_region_input_source(
             if !input.value.rep.is_python_object() {
                 errors.push(format!(
                     "region {region:?} indexed-global input {:?} has non-PyObject rep {:?}",
+                    input.value.id, input.value.rep
+                ));
+            }
+        }
+        RegionInputSource::IndexedField {
+            source: _,
+            receiver,
+            owner_type,
+            attr_name,
+            expected_index: _,
+        } => {
+            match receiver {
+                IndexedFieldReceiverSource::LocalName { name } if name.is_empty() => {
+                    errors.push(format!(
+                        "region {region:?} indexed-field input {:?} has empty receiver local name",
+                        input.value
+                    ));
+                }
+                IndexedFieldReceiverSource::LocalName { .. } => {}
+            }
+            if owner_type.module_name.is_empty() {
+                errors.push(format!(
+                    "region {region:?} indexed-field input {:?} has empty owner module",
+                    input.value
+                ));
+            }
+            if owner_type.qualname.is_empty() {
+                errors.push(format!(
+                    "region {region:?} indexed-field input {:?} has empty owner qualname",
+                    input.value
+                ));
+            }
+            if attr_name.is_empty() {
+                errors.push(format!(
+                    "region {region:?} indexed-field input {:?} has empty attr name",
+                    input.value
+                ));
+            }
+            if !input.value.rep.is_python_object() {
+                errors.push(format!(
+                    "region {region:?} indexed-field input {:?} has non-PyObject rep {:?}",
                     input.value.id, input.value.rep
                 ));
             }

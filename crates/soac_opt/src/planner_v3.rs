@@ -16,12 +16,12 @@ use soac_ir_typed::plan_v3::{
     FunctionOptimizationPlanV3, FunctionOwnershipPlan, FunctionPlanIdentity,
     IndexedFieldAccessKind, IndexedFieldFallbackKind, IndexedFieldFallbackPlan,
     IndexedFieldGuardKind, IndexedFieldGuardPlan, IndexedFieldOwnerType,
-    IndexedFieldSpecializationPlan, IndexedGlobalAccessKind, IndexedGlobalFallbackKind,
-    IndexedGlobalFallbackPlan, IndexedGlobalGuardKind, IndexedGlobalGuardPlan,
-    IndexedGlobalSpecializationPlan, MaterializeKind, MaterializeNode, ModuleOptimizationPlanV3,
-    ModulePlanIdentity, OperationNode, PlanDiagnostic, PlanNode, PlanNodeId, PlanNodeKind,
-    PlanValue, PlannedConstant, RegionExitKind, RegionExitPlan, RegionExitTarget, RegionId,
-    RegionInput, RegionInputSource, RegionPlan, RegionSource, Rep,
+    IndexedFieldReceiverSource, IndexedFieldSpecializationPlan, IndexedGlobalAccessKind,
+    IndexedGlobalFallbackKind, IndexedGlobalFallbackPlan, IndexedGlobalGuardKind,
+    IndexedGlobalGuardPlan, IndexedGlobalSpecializationPlan, MaterializeKind, MaterializeNode,
+    ModuleOptimizationPlanV3, ModulePlanIdentity, OperationNode, PlanDiagnostic, PlanNode,
+    PlanNodeId, PlanNodeKind, PlanValue, PlannedConstant, RegionExitKind, RegionExitPlan,
+    RegionExitTarget, RegionId, RegionInput, RegionInputSource, RegionPlan, RegionSource, Rep,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -201,6 +201,7 @@ pub fn plan_function_optimization_v3(
     let exact_list_items = plan_exact_list_item_specializations_v3(&request.exact_list_items);
     let indexed_fields = plan_indexed_field_specializations_v3(&request.indexed_fields);
     let indexed_globals = plan_indexed_global_specializations_v3(&request.indexed_globals);
+    let indexed_field_loads_by_source = unique_indexed_field_loads_by_source(&indexed_fields);
     let indexed_global_loads_by_source = indexed_globals
         .iter()
         .filter(|plan| plan.access == IndexedGlobalAccessKind::Load)
@@ -224,6 +225,7 @@ pub fn plan_function_optimization_v3(
             catalog,
             region,
             &region_request.facts,
+            &indexed_field_loads_by_source,
             &indexed_global_loads_by_source,
         ) {
             Ok(Some(planned_regions)) => function.regions.extend(planned_regions),
@@ -394,6 +396,27 @@ fn plan_indexed_field_specializations_v3(
     plans
 }
 
+fn unique_indexed_field_loads_by_source(
+    indexed_fields: &[IndexedFieldSpecializationPlan],
+) -> HashMap<InstrId, IndexedFieldSpecializationPlan> {
+    let mut unique_by_source = HashMap::<InstrId, Option<IndexedFieldSpecializationPlan>>::new();
+    for plan in indexed_fields {
+        if plan.access != IndexedFieldAccessKind::Load {
+            continue;
+        }
+        unique_by_source
+            .entry(plan.source)
+            .and_modify(|existing| {
+                *existing = None;
+            })
+            .or_insert_with(|| Some(plan.clone()));
+    }
+    unique_by_source
+        .into_iter()
+        .filter_map(|(source, plan)| plan.map(|plan| (source, plan)))
+        .collect()
+}
+
 fn plan_indexed_global_specializations_v3(
     indexed_global_requests: &[IndexedGlobalPlanRequest],
 ) -> Vec<IndexedGlobalSpecializationPlan> {
@@ -447,53 +470,85 @@ fn plan_compact_int_branch(
     catalog: &AlternativeCatalog,
     region: &ExtractedRegion,
     facts: &PlannerFacts,
+    indexed_field_loads_by_source: &HashMap<InstrId, IndexedFieldSpecializationPlan>,
     indexed_global_loads_by_source: &HashMap<InstrId, IndexedGlobalSpecializationPlan>,
 ) -> Result<Option<Vec<RegionPlan>>, String> {
-    if let Some(planned) =
-        plan_compact_int_add_gt_zero_branch(catalog, region, facts, indexed_global_loads_by_source)?
-    {
+    if let Some(planned) = plan_compact_int_add_gt_zero_branch(
+        catalog,
+        region,
+        facts,
+        indexed_field_loads_by_source,
+        indexed_global_loads_by_source,
+    )? {
         return Ok(Some(planned));
     }
     if let Some(planned) = plan_compact_int_compare_constant_branch(
         catalog,
         region,
         facts,
+        indexed_field_loads_by_source,
         indexed_global_loads_by_source,
     )? {
         return Ok(Some(planned));
     }
-    if let Some(planned) =
-        plan_compact_int_compare_branch(catalog, region, facts, indexed_global_loads_by_source)?
-    {
+    if let Some(planned) = plan_compact_int_compare_branch(
+        catalog,
+        region,
+        facts,
+        indexed_field_loads_by_source,
+        indexed_global_loads_by_source,
+    )? {
         return Ok(Some(planned));
     }
-    if let Some(planned) =
-        plan_compact_int_compare_return(catalog, region, facts, indexed_global_loads_by_source)?
-    {
+    if let Some(planned) = plan_compact_int_compare_return(
+        catalog,
+        region,
+        facts,
+        indexed_field_loads_by_source,
+        indexed_global_loads_by_source,
+    )? {
         return Ok(Some(planned));
     }
-    if let Some(planned) =
-        plan_exact_str_compare_branch(catalog, region, facts, indexed_global_loads_by_source)?
-    {
+    if let Some(planned) = plan_exact_str_compare_branch(
+        catalog,
+        region,
+        facts,
+        indexed_field_loads_by_source,
+        indexed_global_loads_by_source,
+    )? {
         return Ok(Some(planned));
     }
-    if let Some(planned) =
-        plan_exact_str_compare_return(catalog, region, facts, indexed_global_loads_by_source)?
-    {
+    if let Some(planned) = plan_exact_str_compare_return(
+        catalog,
+        region,
+        facts,
+        indexed_field_loads_by_source,
+        indexed_global_loads_by_source,
+    )? {
         return Ok(Some(planned));
     }
-    plan_compact_int_binary_return(catalog, region, facts, indexed_global_loads_by_source)
+    plan_compact_int_binary_return(
+        catalog,
+        region,
+        facts,
+        indexed_field_loads_by_source,
+        indexed_global_loads_by_source,
+    )
 }
 
 fn plan_compact_int_add_gt_zero_branch(
     catalog: &AlternativeCatalog,
     region: &ExtractedRegion,
     facts: &PlannerFacts,
+    indexed_field_loads_by_source: &HashMap<InstrId, IndexedFieldSpecializationPlan>,
     indexed_global_loads_by_source: &HashMap<InstrId, IndexedGlobalSpecializationPlan>,
 ) -> Result<Option<Vec<RegionPlan>>, String> {
-    let Some(shape) =
-        match_compact_int_add_gt_zero_branch(region, facts, indexed_global_loads_by_source)
-    else {
+    let Some(shape) = match_compact_int_add_gt_zero_branch(
+        region,
+        facts,
+        indexed_field_loads_by_source,
+        indexed_global_loads_by_source,
+    ) else {
         return Ok(None);
     };
     let add = required_alternative(catalog, "binary.add.exact_compact_int.i64")?;
@@ -631,11 +686,15 @@ fn plan_compact_int_compare_constant_branch(
     catalog: &AlternativeCatalog,
     region: &ExtractedRegion,
     facts: &PlannerFacts,
+    indexed_field_loads_by_source: &HashMap<InstrId, IndexedFieldSpecializationPlan>,
     indexed_global_loads_by_source: &HashMap<InstrId, IndexedGlobalSpecializationPlan>,
 ) -> Result<Option<Vec<RegionPlan>>, String> {
-    let Some(shape) =
-        match_compact_int_compare_constant_branch(region, facts, indexed_global_loads_by_source)
-    else {
+    let Some(shape) = match_compact_int_compare_constant_branch(
+        region,
+        facts,
+        indexed_field_loads_by_source,
+        indexed_global_loads_by_source,
+    ) else {
         return Ok(None);
     };
     let compare = required_alternative(catalog, shape.compare.exact_id)?;
@@ -755,11 +814,15 @@ fn plan_compact_int_binary_return(
     catalog: &AlternativeCatalog,
     region: &ExtractedRegion,
     facts: &PlannerFacts,
+    indexed_field_loads_by_source: &HashMap<InstrId, IndexedFieldSpecializationPlan>,
     indexed_global_loads_by_source: &HashMap<InstrId, IndexedGlobalSpecializationPlan>,
 ) -> Result<Option<Vec<RegionPlan>>, String> {
-    let Some(shape) =
-        match_compact_int_binary_return(region, facts, indexed_global_loads_by_source)
-    else {
+    let Some(shape) = match_compact_int_binary_return(
+        region,
+        facts,
+        indexed_field_loads_by_source,
+        indexed_global_loads_by_source,
+    ) else {
         return Ok(None);
     };
     let operation = required_alternative(catalog, shape.operation.exact_id)?;
@@ -846,11 +909,15 @@ fn plan_compact_int_compare_branch(
     catalog: &AlternativeCatalog,
     region: &ExtractedRegion,
     facts: &PlannerFacts,
+    indexed_field_loads_by_source: &HashMap<InstrId, IndexedFieldSpecializationPlan>,
     indexed_global_loads_by_source: &HashMap<InstrId, IndexedGlobalSpecializationPlan>,
 ) -> Result<Option<Vec<RegionPlan>>, String> {
-    let Some(shape) =
-        match_compact_int_compare_branch(region, facts, indexed_global_loads_by_source)
-    else {
+    let Some(shape) = match_compact_int_compare_branch(
+        region,
+        facts,
+        indexed_field_loads_by_source,
+        indexed_global_loads_by_source,
+    ) else {
         return Ok(None);
     };
     let compare = required_alternative(catalog, shape.compare.exact_id)?;
@@ -951,10 +1018,15 @@ fn plan_exact_str_compare_branch(
     catalog: &AlternativeCatalog,
     region: &ExtractedRegion,
     facts: &PlannerFacts,
+    indexed_field_loads_by_source: &HashMap<InstrId, IndexedFieldSpecializationPlan>,
     indexed_global_loads_by_source: &HashMap<InstrId, IndexedGlobalSpecializationPlan>,
 ) -> Result<Option<Vec<RegionPlan>>, String> {
-    let Some(shape) = match_exact_str_compare_branch(region, facts, indexed_global_loads_by_source)
-    else {
+    let Some(shape) = match_exact_str_compare_branch(
+        region,
+        facts,
+        indexed_field_loads_by_source,
+        indexed_global_loads_by_source,
+    ) else {
         return Ok(None);
     };
     let compare = required_alternative(catalog, shape.compare.exact_str_id)?;
@@ -1051,11 +1123,15 @@ fn plan_compact_int_compare_return(
     catalog: &AlternativeCatalog,
     region: &ExtractedRegion,
     facts: &PlannerFacts,
+    indexed_field_loads_by_source: &HashMap<InstrId, IndexedFieldSpecializationPlan>,
     indexed_global_loads_by_source: &HashMap<InstrId, IndexedGlobalSpecializationPlan>,
 ) -> Result<Option<Vec<RegionPlan>>, String> {
-    let Some(shape) =
-        match_compact_int_compare_return(region, facts, indexed_global_loads_by_source)
-    else {
+    let Some(shape) = match_compact_int_compare_return(
+        region,
+        facts,
+        indexed_field_loads_by_source,
+        indexed_global_loads_by_source,
+    ) else {
         return Ok(None);
     };
     let compare = required_alternative(catalog, shape.compare.exact_id)?;
@@ -1142,10 +1218,15 @@ fn plan_exact_str_compare_return(
     catalog: &AlternativeCatalog,
     region: &ExtractedRegion,
     facts: &PlannerFacts,
+    indexed_field_loads_by_source: &HashMap<InstrId, IndexedFieldSpecializationPlan>,
     indexed_global_loads_by_source: &HashMap<InstrId, IndexedGlobalSpecializationPlan>,
 ) -> Result<Option<Vec<RegionPlan>>, String> {
-    let Some(shape) = match_exact_str_compare_return(region, facts, indexed_global_loads_by_source)
-    else {
+    let Some(shape) = match_exact_str_compare_return(
+        region,
+        facts,
+        indexed_field_loads_by_source,
+        indexed_global_loads_by_source,
+    ) else {
         return Ok(None);
     };
     let compare = required_alternative(catalog, shape.compare.exact_str_id)?;
@@ -1293,6 +1374,13 @@ struct ExactStrCompareReturnShape {
 enum PyObjectRegionInputSource {
     LocalName(String),
     ModuleConstant(u32),
+    IndexedField {
+        source: InstrId,
+        receiver: String,
+        owner_type: IndexedFieldOwnerType,
+        attr_name: String,
+        expected_index: u32,
+    },
     IndexedGlobal {
         source: InstrId,
         module_name: String,
@@ -1317,6 +1405,7 @@ struct BinaryReturnAlternativeSpec {
 fn match_compact_int_add_gt_zero_branch(
     region: &ExtractedRegion,
     facts: &PlannerFacts,
+    indexed_field_loads_by_source: &HashMap<InstrId, IndexedFieldSpecializationPlan>,
     indexed_global_loads_by_source: &HashMap<InstrId, IndexedGlobalSpecializationPlan>,
 ) -> Option<CompactIntBranchShape> {
     let ExtractedExit::Branch {
@@ -1358,14 +1447,25 @@ fn match_compact_int_add_gt_zero_branch(
     }
     Some(CompactIntBranchShape {
         source,
-        left: region.pyobject_input_source(left, indexed_global_loads_by_source)?,
-        right: region.pyobject_input_source(right, indexed_global_loads_by_source)?,
+        left: region.pyobject_input_source(
+            left,
+            indexed_field_loads_by_source,
+            indexed_global_loads_by_source,
+            true,
+        )?,
+        right: region.pyobject_input_source(
+            right,
+            indexed_field_loads_by_source,
+            indexed_global_loads_by_source,
+            true,
+        )?,
     })
 }
 
 fn match_compact_int_binary_return(
     region: &ExtractedRegion,
     facts: &PlannerFacts,
+    indexed_field_loads_by_source: &HashMap<InstrId, IndexedFieldSpecializationPlan>,
     indexed_global_loads_by_source: &HashMap<InstrId, IndexedGlobalSpecializationPlan>,
 ) -> Option<CompactIntReturnShape> {
     let ExtractedExit::Return { value, source } = region.exit else {
@@ -1381,8 +1481,18 @@ fn match_compact_int_binary_return(
     }
     Some(CompactIntReturnShape {
         source,
-        left: region.pyobject_input_source(left, indexed_global_loads_by_source)?,
-        right: region.pyobject_input_source(right, indexed_global_loads_by_source)?,
+        left: region.pyobject_input_source(
+            left,
+            indexed_field_loads_by_source,
+            indexed_global_loads_by_source,
+            false,
+        )?,
+        right: region.pyobject_input_source(
+            right,
+            indexed_field_loads_by_source,
+            indexed_global_loads_by_source,
+            false,
+        )?,
         operation,
     })
 }
@@ -1390,6 +1500,7 @@ fn match_compact_int_binary_return(
 fn match_compact_int_compare_constant_branch(
     region: &ExtractedRegion,
     facts: &PlannerFacts,
+    indexed_field_loads_by_source: &HashMap<InstrId, IndexedFieldSpecializationPlan>,
     indexed_global_loads_by_source: &HashMap<InstrId, IndexedGlobalSpecializationPlan>,
 ) -> Option<CompactIntCompareConstantBranchShape> {
     let ExtractedExit::Branch {
@@ -1414,7 +1525,12 @@ fn match_compact_int_compare_constant_branch(
         if let Some(constant) = facts.i64_constant(right) {
             return Some(CompactIntCompareConstantBranchShape {
                 source,
-                value: region.pyobject_input_source(left, indexed_global_loads_by_source)?,
+                value: region.pyobject_input_source(
+                    left,
+                    indexed_field_loads_by_source,
+                    indexed_global_loads_by_source,
+                    true,
+                )?,
                 constant,
                 constant_on_left: false,
                 compare,
@@ -1425,7 +1541,12 @@ fn match_compact_int_compare_constant_branch(
         if let Some(constant) = facts.i64_constant(left) {
             return Some(CompactIntCompareConstantBranchShape {
                 source,
-                value: region.pyobject_input_source(right, indexed_global_loads_by_source)?,
+                value: region.pyobject_input_source(
+                    right,
+                    indexed_field_loads_by_source,
+                    indexed_global_loads_by_source,
+                    true,
+                )?,
                 constant,
                 constant_on_left: true,
                 compare,
@@ -1438,6 +1559,7 @@ fn match_compact_int_compare_constant_branch(
 fn match_compact_int_compare_branch(
     region: &ExtractedRegion,
     facts: &PlannerFacts,
+    indexed_field_loads_by_source: &HashMap<InstrId, IndexedFieldSpecializationPlan>,
     indexed_global_loads_by_source: &HashMap<InstrId, IndexedGlobalSpecializationPlan>,
 ) -> Option<CompactIntCompareBranchShape> {
     let ExtractedExit::Branch {
@@ -1463,8 +1585,18 @@ fn match_compact_int_compare_branch(
     }
     Some(CompactIntCompareBranchShape {
         source,
-        left: region.pyobject_input_source(left, indexed_global_loads_by_source)?,
-        right: region.pyobject_input_source(right, indexed_global_loads_by_source)?,
+        left: region.pyobject_input_source(
+            left,
+            indexed_field_loads_by_source,
+            indexed_global_loads_by_source,
+            true,
+        )?,
+        right: region.pyobject_input_source(
+            right,
+            indexed_field_loads_by_source,
+            indexed_global_loads_by_source,
+            true,
+        )?,
         compare,
     })
 }
@@ -1472,6 +1604,7 @@ fn match_compact_int_compare_branch(
 fn match_exact_str_compare_branch(
     region: &ExtractedRegion,
     facts: &PlannerFacts,
+    indexed_field_loads_by_source: &HashMap<InstrId, IndexedFieldSpecializationPlan>,
     indexed_global_loads_by_source: &HashMap<InstrId, IndexedGlobalSpecializationPlan>,
 ) -> Option<ExactStrCompareBranchShape> {
     let ExtractedExit::Branch {
@@ -1497,8 +1630,18 @@ fn match_exact_str_compare_branch(
     }
     Some(ExactStrCompareBranchShape {
         source,
-        left: region.pyobject_input_source(left, indexed_global_loads_by_source)?,
-        right: region.pyobject_input_source(right, indexed_global_loads_by_source)?,
+        left: region.pyobject_input_source(
+            left,
+            indexed_field_loads_by_source,
+            indexed_global_loads_by_source,
+            true,
+        )?,
+        right: region.pyobject_input_source(
+            right,
+            indexed_field_loads_by_source,
+            indexed_global_loads_by_source,
+            true,
+        )?,
         compare,
     })
 }
@@ -1506,6 +1649,7 @@ fn match_exact_str_compare_branch(
 fn match_compact_int_compare_return(
     region: &ExtractedRegion,
     facts: &PlannerFacts,
+    indexed_field_loads_by_source: &HashMap<InstrId, IndexedFieldSpecializationPlan>,
     indexed_global_loads_by_source: &HashMap<InstrId, IndexedGlobalSpecializationPlan>,
 ) -> Option<CompactIntCompareReturnShape> {
     let ExtractedExit::Return { value, source } = region.exit else {
@@ -1521,8 +1665,18 @@ fn match_compact_int_compare_return(
     }
     Some(CompactIntCompareReturnShape {
         source,
-        left: region.pyobject_input_source(left, indexed_global_loads_by_source)?,
-        right: region.pyobject_input_source(right, indexed_global_loads_by_source)?,
+        left: region.pyobject_input_source(
+            left,
+            indexed_field_loads_by_source,
+            indexed_global_loads_by_source,
+            false,
+        )?,
+        right: region.pyobject_input_source(
+            right,
+            indexed_field_loads_by_source,
+            indexed_global_loads_by_source,
+            false,
+        )?,
         compare,
     })
 }
@@ -1530,6 +1684,7 @@ fn match_compact_int_compare_return(
 fn match_exact_str_compare_return(
     region: &ExtractedRegion,
     facts: &PlannerFacts,
+    indexed_field_loads_by_source: &HashMap<InstrId, IndexedFieldSpecializationPlan>,
     indexed_global_loads_by_source: &HashMap<InstrId, IndexedGlobalSpecializationPlan>,
 ) -> Option<ExactStrCompareReturnShape> {
     let ExtractedExit::Return { value, source } = region.exit else {
@@ -1545,8 +1700,18 @@ fn match_exact_str_compare_return(
     }
     Some(ExactStrCompareReturnShape {
         source,
-        left: region.pyobject_input_source(left, indexed_global_loads_by_source)?,
-        right: region.pyobject_input_source(right, indexed_global_loads_by_source)?,
+        left: region.pyobject_input_source(
+            left,
+            indexed_field_loads_by_source,
+            indexed_global_loads_by_source,
+            false,
+        )?,
+        right: region.pyobject_input_source(
+            right,
+            indexed_field_loads_by_source,
+            indexed_global_loads_by_source,
+            false,
+        )?,
         compare,
     })
 }
@@ -1622,7 +1787,9 @@ trait ExtractedRegionExt {
     fn pyobject_input_source(
         &self,
         value: ExtractedValueId,
+        indexed_field_loads_by_source: &HashMap<InstrId, IndexedFieldSpecializationPlan>,
         indexed_global_loads_by_source: &HashMap<InstrId, IndexedGlobalSpecializationPlan>,
+        allow_indexed_field_inputs: bool,
     ) -> Option<PyObjectRegionInputSource>;
     fn exit_source(&self) -> Option<InstrId>;
 }
@@ -1635,12 +1802,48 @@ impl ExtractedRegionExt for ExtractedRegion {
     fn pyobject_input_source(
         &self,
         value: ExtractedValueId,
+        indexed_field_loads_by_source: &HashMap<InstrId, IndexedFieldSpecializationPlan>,
         indexed_global_loads_by_source: &HashMap<InstrId, IndexedGlobalSpecializationPlan>,
+        allow_indexed_field_inputs: bool,
     ) -> Option<PyObjectRegionInputSource> {
         let value = self.value(value)?;
-        let ExtractedValueKind::LoadName { name } = &value.kind else {
-            return None;
-        };
+        match &value.kind {
+            ExtractedValueKind::LoadName { name } => {
+                self.load_name_pyobject_input_source(value, name, indexed_global_loads_by_source)
+            }
+            ExtractedValueKind::GetAttr {
+                value: receiver,
+                attr: _,
+            } if allow_indexed_field_inputs => {
+                let source = value.source?;
+                let plan = indexed_field_loads_by_source.get(&source)?;
+                let receiver = self.local_name_input_source(*receiver)?;
+                Some(PyObjectRegionInputSource::IndexedField {
+                    source,
+                    receiver,
+                    owner_type: plan.owner_type.clone(),
+                    attr_name: plan.attr_name.clone(),
+                    expected_index: plan.expected_index,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn exit_source(&self) -> Option<InstrId> {
+        match &self.exit {
+            ExtractedExit::Branch { source, .. } | ExtractedExit::Return { source, .. } => *source,
+        }
+    }
+}
+
+impl ExtractedRegion {
+    fn load_name_pyobject_input_source(
+        &self,
+        value: &ExtractedValue,
+        name: &soac_core::block_py::ResolvedName,
+        indexed_global_loads_by_source: &HashMap<InstrId, IndexedGlobalSpecializationPlan>,
+    ) -> Option<PyObjectRegionInputSource> {
         match name.location {
             NameLocation::Local(_) | NameLocation::Cell(_) => Some(
                 PyObjectRegionInputSource::LocalName(name.id_str().to_string()),
@@ -1663,9 +1866,18 @@ impl ExtractedRegionExt for ExtractedRegion {
         }
     }
 
-    fn exit_source(&self) -> Option<InstrId> {
-        match &self.exit {
-            ExtractedExit::Branch { source, .. } | ExtractedExit::Return { source, .. } => *source,
+    fn local_name_input_source(&self, value: ExtractedValueId) -> Option<String> {
+        let value = self.value(value)?;
+        match &value.kind {
+            ExtractedValueKind::LoadName { name }
+                if matches!(
+                    name.location,
+                    NameLocation::Local(_) | NameLocation::Cell(_)
+                ) =>
+            {
+                Some(name.id_str().to_string())
+            }
+            _ => None,
         }
     }
 }
@@ -1683,6 +1895,19 @@ fn region_pyobject_input(
         PyObjectRegionInputSource::ModuleConstant(index) => {
             RegionInputSource::ModuleConstant { index }
         }
+        PyObjectRegionInputSource::IndexedField {
+            source,
+            receiver,
+            owner_type,
+            attr_name,
+            expected_index,
+        } => RegionInputSource::IndexedField {
+            source,
+            receiver: IndexedFieldReceiverSource::LocalName { name: receiver },
+            owner_type,
+            attr_name,
+            expected_index,
+        },
         PyObjectRegionInputSource::IndexedGlobal {
             source,
             module_name,
@@ -1700,7 +1925,8 @@ fn region_pyobject_input(
 
 fn fallback_pyobject_input_value(id: u32, source: &PyObjectRegionInputSource) -> PlanValue {
     let rep = match source {
-        PyObjectRegionInputSource::IndexedGlobal { .. } => Rep::PyObjectOwned,
+        PyObjectRegionInputSource::IndexedField { .. }
+        | PyObjectRegionInputSource::IndexedGlobal { .. } => Rep::PyObjectOwned,
         PyObjectRegionInputSource::LocalName(_) | PyObjectRegionInputSource::ModuleConstant(_) => {
             Rep::PyObjectBorrowed
         }
@@ -1786,8 +2012,8 @@ mod tests {
     use crate::alternatives_v3::ALTERNATIVE_CATALOG_V3_VERSION;
     use crate::region_v3::extract_block_region_v3;
     use soac_core::block_py::{
-        BinOp, Block, BlockLabel, BlockParam, BlockPyName, BlockTerm, Load, LocalFunctionId,
-        LocalLocation, Meta, NameLocation, ResolvedName, SerializedFunctionId,
+        BinOp, Block, BlockLabel, BlockParam, BlockPyName, BlockTerm, GetAttr, Load,
+        LocalFunctionId, LocalLocation, Meta, NameLocation, ResolvedName, SerializedFunctionId,
         SerializedIdentityTables, SerializedModuleId, SerializedModuleIdentity, TermIf, WithMeta,
     };
     use soac_ir_blockpy::InstrBlockPy;
@@ -1836,6 +2062,13 @@ mod tests {
 
     fn binary(op: BinOpKind, left: InstrBlockPy, right: InstrBlockPy, id: u32) -> InstrBlockPy {
         with_instr_id(InstrBlockPy::BinOp(BinOp::new(op, left, right)), id)
+    }
+
+    fn getattr(receiver: InstrBlockPy, attr_slot: u32, id: u32) -> InstrBlockPy {
+        with_instr_id(
+            InstrBlockPy::GetAttr(GetAttr::new(receiver, constant(attr_slot))),
+            id,
+        )
     }
 
     fn compact_int_branch_region() -> ExtractedRegion {
@@ -1908,6 +2141,27 @@ mod tests {
             with_instr_id(local("a", 0), 0),
             with_instr_id(global("IntGlob", 7), 1),
             2,
+        );
+        let block = Block::new(
+            label(0),
+            Vec::new(),
+            BlockTerm::IfTerm(TermIf {
+                test,
+                then_label: label(1),
+                else_label: label(2),
+            }),
+            Vec::<BlockParam>::new(),
+            None,
+        );
+        extract_block_region_v3(&block, RegionId(0)).unwrap()
+    }
+
+    fn compact_int_compare_branch_with_indexed_fields_region(kind: BinOpKind) -> ExtractedRegion {
+        let test = binary(
+            kind,
+            getattr(with_instr_id(local("self", 0), 0), 0, 10),
+            getattr(with_instr_id(local("self", 0), 3), 1, 11),
+            12,
         );
         let block = Block::new(
             label(0),
@@ -2029,6 +2283,23 @@ mod tests {
         extract_block_region_v3(&block, RegionId(0)).unwrap()
     }
 
+    fn compact_int_binary_return_with_indexed_fields_region(kind: BinOpKind) -> ExtractedRegion {
+        let value = binary(
+            kind,
+            getattr(with_instr_id(local("self", 0), 0), 0, 10),
+            getattr(with_instr_id(local("self", 0), 3), 1, 11),
+            12,
+        );
+        let block = Block::new(
+            label(0),
+            Vec::new(),
+            BlockTerm::Return(value),
+            Vec::<BlockParam>::new(),
+            None,
+        );
+        extract_block_region_v3(&block, RegionId(0)).unwrap()
+    }
+
     fn facts_for_compact_region() -> PlannerFacts {
         let mut facts = PlannerFacts::default();
         facts.mark_exact_compact_int(ExtractedValueId(0));
@@ -2042,6 +2313,13 @@ mod tests {
         facts.mark_exact_compact_int(ExtractedValueId(0));
         facts.mark_exact_compact_int(ExtractedValueId(1));
         facts.set_i64_constant(ExtractedValueId(1), 0);
+        facts
+    }
+
+    fn facts_for_compact_field_compare_region() -> PlannerFacts {
+        let mut facts = PlannerFacts::default();
+        facts.mark_exact_compact_int(ExtractedValueId(2));
+        facts.mark_exact_compact_int(ExtractedValueId(5));
         facts
     }
 
@@ -2097,6 +2375,27 @@ mod tests {
             expected_index: 7,
             reason: "test indexed global".to_string(),
         }];
+    }
+
+    fn add_test_indexed_field(
+        request: &mut ModulePlanRequest,
+        source: u32,
+        attr_name: &str,
+        expected_index: u32,
+    ) {
+        request.functions[0]
+            .indexed_fields
+            .push(IndexedFieldPlanRequest {
+                source: InstrId::new(source),
+                access: IndexedFieldAccessKind::Load,
+                owner_type: IndexedFieldOwnerType {
+                    module_name: "pkg.iter".to_string(),
+                    qualname: "Iter".to_string(),
+                },
+                attr_name: attr_name.to_string(),
+                expected_index,
+                reason: "test indexed field".to_string(),
+            });
     }
 
     #[test]
@@ -2361,6 +2660,92 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn plans_compact_int_compare_branch_with_indexed_field_operands() {
+        let catalog = AlternativeCatalog::default_v3();
+        let mut request = module_request(
+            compact_int_compare_branch_with_indexed_fields_region(BinOpKind::Lt),
+            facts_for_compact_field_compare_region(),
+        );
+        add_test_indexed_field(&mut request, 10, "current", 0);
+        add_test_indexed_field(&mut request, 11, "stop", 1);
+        let plan = plan_module_optimization_v3(&catalog, request);
+
+        validate_module_plan_v3(&plan).unwrap();
+        let function = &plan.functions[0];
+        assert!(function.diagnostics.is_empty());
+        assert_eq!(function.regions.len(), 2);
+        assert_eq!(
+            function.regions[0].inputs[0].source,
+            RegionInputSource::IndexedField {
+                source: InstrId::new(10),
+                receiver: IndexedFieldReceiverSource::LocalName {
+                    name: "self".to_string()
+                },
+                owner_type: IndexedFieldOwnerType {
+                    module_name: "pkg.iter".to_string(),
+                    qualname: "Iter".to_string(),
+                },
+                attr_name: "current".to_string(),
+                expected_index: 0,
+            }
+        );
+        assert_eq!(
+            function.regions[0].inputs[1].source,
+            RegionInputSource::IndexedField {
+                source: InstrId::new(11),
+                receiver: IndexedFieldReceiverSource::LocalName {
+                    name: "self".to_string()
+                },
+                owner_type: IndexedFieldOwnerType {
+                    module_name: "pkg.iter".to_string(),
+                    qualname: "Iter".to_string(),
+                },
+                attr_name: "stop".to_string(),
+                expected_index: 1,
+            }
+        );
+        assert_eq!(
+            function.regions[0].inputs[0].value.rep,
+            Rep::PyObjectBorrowed
+        );
+        assert_eq!(function.regions[1].inputs[0].value.rep, Rep::PyObjectOwned);
+        assert!(matches!(
+            function.regions[0].nodes[4].kind,
+            PlanNodeKind::Operation(OperationNode {
+                op: soac_ir_typed::plan_v3::PlannedOp::I64CompareToBool01 {
+                    op: RichCompareOp::Lt
+                },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn preserves_indexed_field_getattrs_in_compact_int_return_regions() {
+        let catalog = AlternativeCatalog::default_v3();
+        let mut request = module_request(
+            compact_int_binary_return_with_indexed_fields_region(BinOpKind::Add),
+            facts_for_compact_field_compare_region(),
+        );
+        add_test_indexed_field(&mut request, 10, "current", 0);
+        add_test_indexed_field(&mut request, 11, "stop", 1);
+        let plan = plan_module_optimization_v3(&catalog, request);
+
+        validate_module_plan_v3(&plan).unwrap();
+        let function = &plan.functions[0];
+        assert!(function.regions.is_empty());
+        assert_eq!(function.diagnostics.len(), 1);
+        assert!(
+            function.diagnostics[0]
+                .message
+                .contains("unsupported shape"),
+            "{:?}",
+            function.diagnostics[0]
+        );
+        assert_eq!(function.indexed_fields.len(), 2);
     }
 
     #[test]

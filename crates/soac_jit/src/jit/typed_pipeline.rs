@@ -14,7 +14,7 @@ use soac_ir_blockpy::BlockPyModuleShape;
 use soac_ir_typed::emit_v3::MechanicalRegionEmission;
 use soac_ir_typed::plan_v3::{
     CallBodyKind, DirectCallCallee, ExactListItemAccessKind,
-    IndexedFieldAccessKind as PlanV3IndexedFieldAccessKind,
+    IndexedFieldAccessKind as PlanV3IndexedFieldAccessKind, IndexedFieldReceiverSource,
     IndexedGlobalAccessKind as PlanV3IndexedGlobalAccessKind, RegionInputSource, RegionPlan,
     RegionSource,
 };
@@ -1070,6 +1070,21 @@ fn remap_exact_int_region_plan(
             }
             RegionInputSource::IndexedGlobal { source, .. } => {
                 *source = remapped_typed_inline_instr_id(*source, context, "indexed-global input")?;
+            }
+            RegionInputSource::IndexedField {
+                source, receiver, ..
+            } => {
+                *source = remapped_typed_inline_instr_id(*source, context, "indexed-field input")?;
+                match receiver {
+                    IndexedFieldReceiverSource::LocalName { name } => {
+                        let Some(mapped_name) = context.local_names.get(name.as_str()) else {
+                            return Err(format!(
+                                "inlined optimizer v3 exact-int indexed-field input references unmapped callee receiver {name:?}"
+                            ));
+                        };
+                        *name = mapped_name.clone();
+                    }
+                }
             }
             RegionInputSource::ModuleConstant { .. }
             | RegionInputSource::CapturedValue { .. }

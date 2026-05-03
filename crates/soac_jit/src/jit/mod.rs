@@ -16,6 +16,7 @@ use soac_core::block_py::{
     InstrKey, InstrLocationMap, LocalLocation, ModuleShape, NameLocation, ResolvedName,
     RuntimeFunctionId, RuntimeName, StorageLayout, Store, Visit, current_instr_locations,
 };
+use soac_core::profile::{CollectedTypeKeyLayout, CounterDumpTypeKey};
 use soac_instrument::RUNTIME_DECREF_LOCATION_COUNTER_KIND;
 use soac_ir_blockpy::{
     BlockPyModuleShape, InstrBlockPy, constructor_init_function_id_for_entry_function,
@@ -23,12 +24,13 @@ use soac_ir_blockpy::{
 };
 use soac_ir_typed::emit_v3::{
     MechanicalCodegenConversion, MechanicalCodegenOperation, MechanicalCodegenStep,
-    MechanicalExitKind, MechanicalRegionEmission, MechanicalRegionInputSource,
-    mechanical_codegen_step as opt_v3_mechanical_codegen_step,
+    MechanicalExitKind, MechanicalIndexedFieldReceiverSource, MechanicalRegionEmission,
+    MechanicalRegionInputSource, mechanical_codegen_step as opt_v3_mechanical_codegen_step,
     mechanical_region_inputs as opt_v3_mechanical_region_inputs,
 };
 use soac_ir_typed::plan_v3::{
     ConversionKind, IndexedFieldAccessKind as PlanV3IndexedFieldAccessKind,
+    IndexedFieldFallbackKind, IndexedFieldGuardKind, IndexedFieldOwnerType,
     IndexedGlobalAccessKind as PlanV3IndexedGlobalAccessKind, MaterializeKind, PlanNodeId,
     PlanNodeKind, PlanValue, RegionId, RegionPlan, Rep, RichCompareOp,
 };
@@ -40,6 +42,10 @@ use soac_ir_typed::{
     TypedExactIntReturnPlan, TypedGetAttr, TypedGuardedCallableCall, TypedGuardedMethodCall,
     TypedIndexedFieldGuard, TypedIndexedFieldPlanSource, TypedPlannedResult,
     TypedPyObjectOwnershipPlan, TypedSetAttr, ValueFacts, lower_blockpy_function_to_typed,
+};
+use soac_opt::access_emission_v3::{
+    IndexedFieldLayoutGroup as OptV3IndexedFieldLayoutGroup,
+    IndexedFieldRuntimeAccessRequest as OptV3IndexedFieldRuntimeAccessRequest,
 };
 #[cfg(test)]
 use soac_opt::passes::infer_module_value_facts;
@@ -12261,9 +12267,7 @@ fn typed_expr_i64_demand_facts(
         .typed_extra()
         .and_then(|extra| extra.exact_int_return_plan())
         && planning::exact_int_return_plan_i64_result(plan).is_some()
-        && emit_ctx
-            .guard_miss_deopt_ref_for_instr_id(plan.instr_id)
-            .is_some()
+        && opt_v3_exact_int_deopt_miss_target_available(plan.instr_id, emit_ctx)
     {
         return Some(IntFacts::i64_unknown());
     }
@@ -12311,9 +12315,7 @@ fn typed_expr_i32_bool01_demand_facts(
         .typed_extra()
         .and_then(|extra| extra.exact_int_return_plan())
         && planning::exact_int_return_plan_i32_bool01_result(plan).is_some()
-        && emit_ctx
-            .guard_miss_deopt_ref_for_instr_id(plan.instr_id)
-            .is_some()
+        && opt_v3_exact_int_deopt_miss_target_available(plan.instr_id, emit_ctx)
     {
         return Some(IntFacts::i32_bool01());
     }
@@ -15374,6 +15376,34 @@ impl OptV3MechanicalValue {
     }
 }
 
+fn typed_indexed_field_guards_by_instr(
+    expr: &InstrTyped,
+) -> HashMap<InstrId, Vec<TypedIndexedFieldGuard>> {
+    struct Collector {
+        guards_by_instr: HashMap<InstrId, Vec<TypedIndexedFieldGuard>>,
+    }
+
+    impl Visit<InstrTyped> for Collector {
+        fn visit_instr(&mut self, expr: &InstrTyped) {
+            if let InstrTyped::GetAttrTyped(op) = expr
+                && let TypedAttrAccessPlan::IndexedField { guards, .. } = &op.access
+            {
+                self.guards_by_instr
+                    .entry(op.semantic_instr_id())
+                    .or_default()
+                    .extend(guards.iter().cloned());
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    let mut collector = Collector {
+        guards_by_instr: HashMap::new(),
+    };
+    collector.visit_instr(expr);
+    collector.guards_by_instr
+}
+
 fn emit_typed_exact_int_branch_truth_i32(
     fb: &mut FunctionBuilder<'_>,
     expr: &InstrTyped,
@@ -15388,10 +15418,12 @@ fn emit_typed_exact_int_branch_truth_i32(
     else {
         return Ok(None);
     };
+    let indexed_field_guards_by_instr = typed_indexed_field_guards_by_instr(expr);
     emit_opt_v3_exact_int_branch_selection(
         fb,
         plan.instr_id,
         plan.into(),
+        &indexed_field_guards_by_instr,
         local_env,
         emit_ctx,
         codegen_env,
@@ -15415,10 +15447,12 @@ fn emit_typed_exact_int_return_pyobject(
     else {
         return Ok(None);
     };
+    let indexed_field_guards_by_instr = typed_indexed_field_guards_by_instr(expr);
     emit_opt_v3_exact_int_return_selection(
         fb,
         plan.instr_id,
         plan.into(),
+        &indexed_field_guards_by_instr,
         local_env,
         emit_ctx,
         codegen_env,
@@ -15436,6 +15470,35 @@ fn exact_int_deopt_resume_point(
         .unwrap_or(LocalEnvResumePoint::BeforeInstr {
             key: InstrKey::new(emit_ctx.function_id, instr_id),
         })
+}
+
+fn opt_v3_exact_int_deopt_miss_target_available(
+    instr_id: InstrId,
+    emit_ctx: &JitEmitCtx<'_>,
+) -> bool {
+    if emit_ctx
+        .guard_miss_deopt_ref_for_instr_id(instr_id)
+        .is_none()
+    {
+        return false;
+    }
+    let point = exact_int_deopt_resume_point(emit_ctx, instr_id);
+    let Some(function) = emit_ctx
+        .module
+        .callable_defs
+        .iter()
+        .find(|function| function.function_id == emit_ctx.function_id)
+    else {
+        return false;
+    };
+    if runtime_jit_typed_deopt_continuation_for_point(function, emit_ctx.instr_locations, point)
+        .unsupported_reason()
+        .is_some()
+    {
+        return false;
+    }
+    emit_ctx.deopt_resume_plan.entry(point).is_some()
+        && emit_ctx.require_deopt_record_ref(point).is_ok()
 }
 
 fn prepare_opt_v3_exact_int_deopt_miss_target(
@@ -15502,6 +15565,7 @@ fn emit_typed_exact_int_expr_i64_result(
     else {
         return Ok(None);
     };
+    let indexed_field_guards_by_instr = typed_indexed_field_guards_by_instr(expr);
 
     let result_block = fb.create_block();
     fb.append_block_param(result_block, emit_ctx.consts.i64_ty);
@@ -15517,6 +15581,8 @@ fn emit_typed_exact_int_expr_i64_result(
         &plan.hot_plan,
         local_env,
         emit_ctx,
+        codegen_env,
+        &indexed_field_guards_by_instr,
         Some(deopt_miss.block),
         "exact-int scalar expression hot region",
     )?;
@@ -15574,6 +15640,7 @@ fn emit_typed_exact_int_expr_i32_bool01_result(
     else {
         return Ok(None);
     };
+    let indexed_field_guards_by_instr = typed_indexed_field_guards_by_instr(expr);
 
     let result_block = fb.create_block();
     fb.append_block_param(result_block, emit_ctx.consts.i32_ty);
@@ -15589,6 +15656,8 @@ fn emit_typed_exact_int_expr_i32_bool01_result(
         &plan.hot_plan,
         local_env,
         emit_ctx,
+        codegen_env,
+        &indexed_field_guards_by_instr,
         Some(deopt_miss.block),
         "exact-int bool expression hot region",
     )?;
@@ -15621,6 +15690,7 @@ fn emit_opt_v3_exact_int_return_deopt_immortal_pyobject_selection(
     fb: &mut FunctionBuilder<'_>,
     value_instr_id: InstrId,
     selection: ExactIntReturnEmissionSelection<'_>,
+    indexed_field_guards_by_instr: &HashMap<InstrId, Vec<TypedIndexedFieldGuard>>,
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     codegen_env: &mut impl JitCodegenEnv,
@@ -15641,6 +15711,8 @@ fn emit_opt_v3_exact_int_return_deopt_immortal_pyobject_selection(
         selection.hot_plan,
         local_env,
         emit_ctx,
+        codegen_env,
+        indexed_field_guards_by_instr,
         Some(deopt_miss.block),
         "exact-int immortal PyObject hot region",
     )?;
@@ -15704,20 +15776,24 @@ fn emit_typed_exact_int_expr_pyobject_result(
         return Ok(None);
     };
     let result = if planning::exact_int_return_plan_immortal_pyobject_result(plan).is_some() {
+        let indexed_field_guards_by_instr = typed_indexed_field_guards_by_instr(expr);
         emit_opt_v3_exact_int_return_deopt_immortal_pyobject_selection(
             fb,
             plan.instr_id,
             plan.into(),
+            &indexed_field_guards_by_instr,
             local_env,
             emit_ctx,
             codegen_env,
             func_imports,
         )?
     } else {
+        let indexed_field_guards_by_instr = typed_indexed_field_guards_by_instr(expr);
         emit_opt_v3_exact_int_return_selection(
             fb,
             plan.instr_id,
             plan.into(),
+            &indexed_field_guards_by_instr,
             local_env,
             emit_ctx,
             codegen_env,
@@ -15743,6 +15819,7 @@ fn emit_opt_v3_exact_int_branch_selection(
     fb: &mut FunctionBuilder<'_>,
     test_instr_id: InstrId,
     selection: ExactIntBranchEmissionSelection<'_>,
+    indexed_field_guards_by_instr: &HashMap<InstrId, Vec<TypedIndexedFieldGuard>>,
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     codegen_env: &mut impl JitCodegenEnv,
@@ -15758,6 +15835,8 @@ fn emit_opt_v3_exact_int_branch_selection(
         selection.hot_plan,
         local_env,
         emit_ctx,
+        codegen_env,
+        indexed_field_guards_by_instr,
         Some(fallback_block),
         "exact-int branch hot region",
     )?;
@@ -15785,6 +15864,8 @@ fn emit_opt_v3_exact_int_branch_selection(
         selection.fallback_plan,
         local_env,
         emit_ctx,
+        codegen_env,
+        indexed_field_guards_by_instr,
         None,
         "exact-int branch fallback region",
     )?;
@@ -15818,6 +15899,7 @@ fn emit_opt_v3_exact_int_return_selection(
     fb: &mut FunctionBuilder<'_>,
     value_instr_id: InstrId,
     selection: ExactIntReturnEmissionSelection<'_>,
+    indexed_field_guards_by_instr: &HashMap<InstrId, Vec<TypedIndexedFieldGuard>>,
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
     codegen_env: &mut impl JitCodegenEnv,
@@ -15833,6 +15915,8 @@ fn emit_opt_v3_exact_int_return_selection(
         selection.hot_plan,
         local_env,
         emit_ctx,
+        codegen_env,
+        indexed_field_guards_by_instr,
         Some(fallback_block),
         "exact-int return hot region",
     )?;
@@ -15865,6 +15949,8 @@ fn emit_opt_v3_exact_int_return_selection(
         selection.fallback_plan,
         local_env,
         emit_ctx,
+        codegen_env,
+        indexed_field_guards_by_instr,
         None,
         "exact-int return fallback region",
     )?;
@@ -15919,11 +16005,243 @@ fn emit_opt_v3_release_owned_values_except(
     }
 }
 
+fn opt_v3_indexed_field_access_request(
+    owner_type: &IndexedFieldOwnerType,
+    attr_name: &str,
+    expected_index: u32,
+) -> OptV3IndexedFieldRuntimeAccessRequest {
+    OptV3IndexedFieldRuntimeAccessRequest {
+        access: PlanV3IndexedFieldAccessKind::Load,
+        attr_name: attr_name.to_string(),
+        guard: IndexedFieldGuardKind::OwnerTypeVersionAndFieldIndex,
+        fallback: IndexedFieldFallbackKind::OriginalAttrAccess,
+        type_key: CounterDumpTypeKey {
+            module_name: owner_type.module_name.clone(),
+            qualname: owner_type.qualname.clone(),
+        },
+        expected_index,
+    }
+}
+
+fn opt_v3_indexed_field_receiver_value(
+    fb: &mut FunctionBuilder<'_>,
+    receiver: MechanicalIndexedFieldReceiverSource<'_>,
+    local_env: &LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    context: &str,
+) -> Result<ir::Value, String> {
+    match receiver {
+        MechanicalIndexedFieldReceiverSource::LocalName { name } => local_env
+            .load_name(fb, name, emit_ctx, true)
+            .ok_or_else(|| {
+                format!(
+                    "optimizer v3 {context} indexed-field receiver references unavailable local {name:?}"
+                )
+            }),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_opt_v3_borrowed_indexed_field_input(
+    fb: &mut FunctionBuilder<'_>,
+    source: InstrId,
+    receiver: MechanicalIndexedFieldReceiverSource<'_>,
+    owner_type: &IndexedFieldOwnerType,
+    attr_name: &str,
+    expected_index: u32,
+    fallback_block: ir::Block,
+    local_env: &LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    codegen_env: &mut impl JitCodegenEnv,
+    indexed_field_guards_by_instr: &HashMap<InstrId, Vec<TypedIndexedFieldGuard>>,
+    context: &str,
+) -> Result<ir::Value, String> {
+    let specializations = if let Some(guards) = indexed_field_guards_by_instr
+        .get(&source)
+        .map(Vec::as_slice)
+    {
+        let Some(plan) = IndexedFieldLoweringPlan::for_access(
+            source,
+            TypedIndexedFieldPlanSource::OptimizationPlanV3,
+            guards,
+            PlanV3IndexedFieldAccessKind::Load,
+        )?
+        else {
+            return Ok(emit_opt_v3_indexed_field_input_fallback_value(
+                fb,
+                source,
+                fallback_block,
+                emit_ctx,
+            ));
+        };
+        plan.specializations
+    } else {
+        let request = opt_v3_indexed_field_access_request(owner_type, attr_name, expected_index);
+        let layout_group = OptV3IndexedFieldLayoutGroup {
+            type_key: request.type_key.clone(),
+            layouts: vec![CollectedTypeKeyLayout {
+                owner_type_id: 0,
+                key: attr_name.to_string(),
+                index: expected_index,
+            }],
+        };
+        operation_specializations::prime_opt_v3_field_index_layouts(std::iter::once(
+            &layout_group,
+        ))?;
+        let Some(specialization) =
+            operation_specializations::field_index_specialization_from_opt_v3_for_function(
+                emit_ctx.function_id,
+                &request,
+            )?
+        else {
+            return Ok(emit_opt_v3_indexed_field_input_fallback_value(
+                fb,
+                source,
+                fallback_block,
+                emit_ctx,
+            ));
+        };
+        vec![specialization]
+    };
+
+    let receiver = opt_v3_indexed_field_receiver_value(fb, receiver, local_env, emit_ctx, context)?;
+    let mut emittable_specializations = Vec::with_capacity(specializations.len());
+    for specialization in specializations {
+        let Some(owner_type_ptr) =
+            emit_type_ptr_value_for_ref(fb, codegen_env, emit_ctx, &specialization.owner_type_ref)
+                .map_err(|err| {
+                    format!(
+                        "failed to bind opt-v3 indexed-field input owner type for {source}: {err}"
+                    )
+                })?
+        else {
+            continue;
+        };
+        emittable_specializations.push((specialization, owner_type_ptr));
+    }
+    if emittable_specializations.is_empty() {
+        return Ok(emit_opt_v3_indexed_field_input_fallback_value(
+            fb,
+            source,
+            fallback_block,
+            emit_ctx,
+        ));
+    };
+
+    let result_block = fb.create_block();
+    fb.append_block_param(result_block, emit_ctx.consts.ptr_ty);
+    let miss_block = fb.create_block();
+    fb.set_cold_block(miss_block);
+
+    let specialization_count = emittable_specializations.len();
+    for (index, (specialization, owner_type_ptr)) in
+        emittable_specializations.into_iter().enumerate()
+    {
+        let maybe_direct_block = fb.create_block();
+        let direct_block = fb.create_block();
+        fb.append_block_param(direct_block, emit_ctx.consts.ptr_ty);
+        let next_guard_block = if index + 1 == specialization_count {
+            miss_block
+        } else {
+            fb.create_block()
+        };
+        let type_matches = emit_exact_type_version_match(
+            fb,
+            receiver,
+            owner_type_ptr,
+            specialization.type_version,
+        );
+        fb.ins()
+            .brif(type_matches, maybe_direct_block, &[], next_guard_block, &[]);
+
+        fb.switch_to_block(maybe_direct_block);
+        emit_trusted_inline_values_field_probe(
+            fb,
+            receiver,
+            owner_type_ptr,
+            specialization.expected_index,
+            direct_block,
+            miss_block,
+            emit_ctx,
+        )?;
+
+        fb.switch_to_block(direct_block);
+        let direct_value = fb.block_params(direct_block)[0];
+        emit_optional_counter_increment_for_kind(
+            fb,
+            emit_ctx,
+            emit_ctx.field_indexed_hit_counter_ids,
+            source,
+        );
+        fb.ins()
+            .jump(result_block, &[ir::BlockArg::Value(direct_value)]);
+
+        if index + 1 != specialization_count {
+            fb.switch_to_block(next_guard_block);
+        }
+    }
+
+    fb.switch_to_block(miss_block);
+    emit_optional_counter_increment_for_kind(
+        fb,
+        emit_ctx,
+        emit_ctx.field_indexed_fallback_counter_ids,
+        source,
+    );
+    fb.ins().jump(fallback_block, &[]);
+
+    fb.switch_to_block(result_block);
+    Ok(fb.block_params(result_block)[0])
+}
+
+fn emit_opt_v3_indexed_field_input_fallback_value(
+    fb: &mut FunctionBuilder<'_>,
+    source: InstrId,
+    fallback_block: ir::Block,
+    emit_ctx: &JitEmitCtx<'_>,
+) -> ir::Value {
+    emit_optional_counter_increment_for_kind(
+        fb,
+        emit_ctx,
+        emit_ctx.field_indexed_fallback_counter_ids,
+        source,
+    );
+    fb.ins().jump(fallback_block, &[]);
+    let dead_block = fb.create_block();
+    fb.switch_to_block(dead_block);
+    fb.ins().iconst(emit_ctx.consts.ptr_ty, 0)
+}
+
+fn emit_opt_v3_owned_indexed_field_input(
+    fb: &mut FunctionBuilder<'_>,
+    receiver: MechanicalIndexedFieldReceiverSource<'_>,
+    attr_name: &str,
+    local_env: &LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    context: &str,
+) -> Result<ir::Value, String> {
+    let receiver = opt_v3_indexed_field_receiver_value(fb, receiver, local_env, emit_ctx, context)?;
+    let attr = emit_owned_module_constant(
+        fb,
+        emit_ctx
+            .module_constants
+            .require_unicode_constant_id(attr_name),
+        emit_ctx,
+    );
+    let getattr_inst = fb
+        .ins()
+        .call(emit_ctx.pyobject_getattr_ref, &[receiver, attr]);
+    let value = fb.inst_results(getattr_inst)[0];
+    Ok(emit_checked_owned_pyobject_result(fb, value, emit_ctx))
+}
+
 fn opt_v3_region_input_values(
     fb: &mut FunctionBuilder<'_>,
     region: &RegionPlan,
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
+    codegen_env: &mut impl JitCodegenEnv,
+    indexed_field_guards_by_instr: &HashMap<InstrId, Vec<TypedIndexedFieldGuard>>,
     local_fallback_block: Option<ir::Block>,
     context: &str,
 ) -> Result<OptV3RegionInputValues, String> {
@@ -16044,6 +16362,53 @@ fn opt_v3_region_input_values(
                 ),
                 owned: true,
             },
+            MechanicalRegionInputSource::IndexedField {
+                source,
+                receiver,
+                owner_type,
+                attr_name,
+                expected_index,
+            } if input.value.rep == Rep::PyObjectBorrowed => {
+                let fallback_block = local_fallback_block.ok_or_else(|| {
+                    format!(
+                        "optimizer v3 {context} borrowed indexed-field input {:?} needs a local fallback block",
+                        input.value
+                    )
+                })?;
+                OptV3MechanicalValue::PyObject {
+                    value: emit_opt_v3_borrowed_indexed_field_input(
+                        fb,
+                        source,
+                        receiver,
+                        owner_type,
+                        attr_name,
+                        expected_index,
+                        fallback_block,
+                        local_env,
+                        emit_ctx,
+                        codegen_env,
+                        indexed_field_guards_by_instr,
+                        context,
+                    )?,
+                    owned: false,
+                }
+            }
+            MechanicalRegionInputSource::IndexedField {
+                receiver,
+                attr_name,
+                ..
+            } if input.value.rep == Rep::PyObjectOwned => OptV3MechanicalValue::PyObject {
+                value: emit_opt_v3_owned_indexed_field_input(
+                    fb, receiver, attr_name, local_env, emit_ctx, context,
+                )?,
+                owned: true,
+            },
+            MechanicalRegionInputSource::IndexedField { .. } => {
+                return Err(format!(
+                    "optimizer v3 {context} indexed-field input {:?} has unsupported rep {:?}",
+                    input.value, input.value.rep
+                ));
+            }
             MechanicalRegionInputSource::IndexedGlobal { .. } => {
                 return Err(format!(
                     "optimizer v3 {context} indexed-global input {:?} has unsupported rep {:?}",
