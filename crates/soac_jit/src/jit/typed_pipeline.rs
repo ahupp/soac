@@ -8,12 +8,12 @@ use crate::module_constants::ModuleCodegenConstants;
 use soac_config::SoacEnvConfig;
 use soac_core::block_py::{
     BlockPyFunction, BlockPyModule, BlockTerm, CallableScopeKind, ChildVisitable,
-    HasSemanticInstrId, InstrId, RuntimeFunctionId, VisitMut,
+    HasSemanticInstrId, InstrId, RuntimeFunctionId, RuntimeName, VisitMut,
 };
 use soac_ir_blockpy::BlockPyModuleShape;
 use soac_ir_typed::emit_v3::MechanicalRegionEmission;
 use soac_ir_typed::plan_v3::{
-    DirectCallCallee, ExactListItemAccessKind,
+    CallBodyKind, DirectCallCallee, ExactListItemAccessKind,
     IndexedFieldAccessKind as PlanV3IndexedFieldAccessKind,
     IndexedGlobalAccessKind as PlanV3IndexedGlobalAccessKind, RegionInputSource, RegionPlan,
     RegionSource,
@@ -35,7 +35,7 @@ use soac_opt::call_emission_v3::{ResolvedV3DirectCallPlan, typed_call_emission_p
 use soac_opt::passes::{
     TypedInlineInstrIdMapping, TypedInlineLocalMapping, inline_typed_function_direct_call_stores,
     lower_typed_function_call_emission_plans, refresh_typed_function_value_facts,
-    validate_typed_function_value_facts,
+    rewrite_typed_stop_iteration_raises_to_handler_jumps, validate_typed_function_value_facts,
 };
 use soac_opt::region_emission_v3::{
     ExactIntBranchSelection as OptV3ExactIntBranchSelection,
@@ -117,6 +117,42 @@ fn insert_method_guards(
     Ok(())
 }
 
+fn insert_runtime_protocol_method_guards(
+    emissions: &mut TypedCallEmissionPlans,
+    source: InstrId,
+    runtime_name: RuntimeName,
+    method_name: String,
+    guards: Vec<TypedDirectMethodCallGuard>,
+) -> Result<(), String> {
+    if guards.is_empty() {
+        return Ok(());
+    }
+    let plan = emissions.by_source.entry(source).or_insert_with(|| {
+        TypedCallEmissionPlan::RuntimeProtocolMethod {
+            runtime_name,
+            method_name: method_name.clone(),
+            method_guards: Vec::new(),
+        }
+    });
+    let TypedCallEmissionPlan::RuntimeProtocolMethod {
+        runtime_name: existing_runtime_name,
+        method_name: existing_name,
+        method_guards,
+    } = plan
+    else {
+        return Err(format!(
+            "runtime-protocol method emission source {source:?} already has non-protocol plan"
+        ));
+    };
+    if *existing_runtime_name != runtime_name || existing_name != &method_name {
+        return Err(format!(
+            "runtime-protocol method emission source {source:?} has conflicting methods {existing_runtime_name:?}.{existing_name:?} and {runtime_name:?}.{method_name:?}"
+        ));
+    }
+    method_guards.extend(guards);
+    Ok(())
+}
+
 fn typed_call_emission_plans_for_profile_function(
     profile: &SpecializationProfile<'_>,
     function_id: RuntimeFunctionId,
@@ -126,6 +162,8 @@ fn typed_call_emission_plans_for_profile_function(
         HashMap::<InstrId, Vec<ResolvedV3DirectCallPlan>>::new();
     let mut method_guards_by_instr =
         HashMap::<InstrId, HashMap<String, Vec<TypedDirectMethodCallGuard>>>::new();
+    let mut runtime_protocol_method_guards_by_instr =
+        HashMap::<InstrId, HashMap<(RuntimeName, String), Vec<TypedDirectMethodCallGuard>>>::new();
     for (source, plans) in opt_v3_direct_calls_by_instr {
         for plan in plans {
             match &plan.callee {
@@ -144,6 +182,21 @@ fn typed_call_emission_plans_for_profile_function(
                         .or_default()
                         .extend(method_guards);
                 }
+                DirectCallCallee::RuntimeProtocolMethod {
+                    runtime_name,
+                    method_name,
+                } => {
+                    if plan.body.kind != CallBodyKind::Inline {
+                        continue;
+                    }
+                    let method_guards = method_guards_for_v3_direct_call(&plan, method_name)?;
+                    runtime_protocol_method_guards_by_instr
+                        .entry(source)
+                        .or_default()
+                        .entry((*runtime_name, method_name.clone()))
+                        .or_default()
+                        .extend(method_guards);
+                }
             }
         }
     }
@@ -151,6 +204,17 @@ fn typed_call_emission_plans_for_profile_function(
     for (source, guards_by_method) in method_guards_by_instr {
         for (method_name, guards) in guards_by_method {
             insert_method_guards(&mut emissions, source, method_name, guards)?;
+        }
+    }
+    for (source, guards_by_method) in runtime_protocol_method_guards_by_instr {
+        for ((runtime_name, method_name), guards) in guards_by_method {
+            insert_runtime_protocol_method_guards(
+                &mut emissions,
+                source,
+                runtime_name,
+                method_name,
+                guards,
+            )?;
         }
     }
     Ok(emissions)
@@ -1231,6 +1295,7 @@ fn apply_typed_v3_module_rewrites(
     profile: &SpecializationProfile<'_>,
 ) -> Result<(), String> {
     let callee_module = module.clone();
+    let module_constants = module.module_constants.clone();
     let external_callees = HashMap::new();
     let mut remapped_exact_list_items =
         HashMap::<RuntimeFunctionId, HashMap<InstrId, ProfileExactListItemAccessPlan>>::new();
@@ -1270,6 +1335,10 @@ fn apply_typed_v3_module_rewrites(
                 assign_missing_typed_function_instr_ids(function);
                 refresh_typed_function_value_facts(function);
             }
+        }
+        if rewrite_typed_stop_iteration_raises_to_handler_jumps(function, &module_constants) != 0 {
+            assign_missing_typed_function_instr_ids(function);
+            refresh_typed_function_value_facts(function);
         }
         apply_profile_access_and_scalar_plans_to_typed_function(
             function,

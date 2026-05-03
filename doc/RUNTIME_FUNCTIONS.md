@@ -70,6 +70,7 @@ dp_jit_enter_recursive_call
 dp_jit_push_handled_exception
 dp_jit_pop_handled_exception
 dp_jit_record_top_value_sample
+dp_jit_protocol_next_function_id
 dp_jit_load_runtime_obj
 dp_jit_pyobject_getattr
 dp_jit_pyobject_setattr

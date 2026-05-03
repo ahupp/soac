@@ -6,7 +6,8 @@ use crate::evidence_v3::{
 };
 use crate::passes::{
     BlockPyModuleShape, InlineUnsupportedReason, InstrBlockPy, bind_simple_direct_call_inline_args,
-    build_direct_call_inline_fragment_to_target, try_allocate_codegen_stack_temp,
+    build_direct_call_inline_fragment_to_target, build_direct_method_inline_fragment_to_target,
+    try_allocate_codegen_stack_temp,
 };
 use crate::plan::{FunctionProfileEvidence, ProfileEvidenceStore};
 use crate::planner_v3::{
@@ -23,8 +24,8 @@ use soac_core::block_py::{
     BlockLabel, BlockPyFunction, BlockPyModule, Call, CallArgPositional, CallDirect,
     ChildVisitable, ConstantExpr, FunctionExecutionMode, HasSemanticInstrId, InstrId,
     LocalFunctionId, ModuleContentId, NameLike, NameLocation, ParamKind, PersistentFunctionId,
-    ResolvedName, SerializedFunctionDebugName, SerializedFunctionId, SerializedIdentityTables,
-    SerializedModuleId, SerializedModuleIdentity, Visit,
+    ResolvedName, RuntimeName, SerializedFunctionDebugName, SerializedFunctionId,
+    SerializedIdentityTables, SerializedModuleId, SerializedModuleIdentity, Visit,
 };
 use soac_ir_blockpy::is_constructor_entry_function;
 use soac_ir_typed::emit_v3::{MechanicalEmitError, emit_mechanical_plan_v3};
@@ -1153,6 +1154,56 @@ fn codegen_constant_string_value_v3<'a>(
     module_constant_string_value_v3(module, constant_index)
 }
 
+fn codegen_runtime_name_value_v3(
+    module: &BlockPyModule<BlockPyModuleShape>,
+    expr: &InstrBlockPy,
+) -> Option<RuntimeName> {
+    let InstrBlockPy::Load(load) = expr else {
+        return None;
+    };
+    load.name.location.runtime_name_id().or_else(|| {
+        let NameLocation::Constant(constant_index) = load.name.location else {
+            return None;
+        };
+        let ConstantExpr::RuntimeName(runtime_name) =
+            module.module_constants.get(constant_index as usize)?
+        else {
+            return None;
+        };
+        Some(*runtime_name)
+    })
+}
+
+fn runtime_protocol_method_for_call_v3(
+    module: &BlockPyModule<BlockPyModuleShape>,
+    call: &Call<InstrBlockPy>,
+) -> Option<(RuntimeName, &'static str)> {
+    if !call.keywords.is_empty() || call.args.len() != 1 {
+        return None;
+    }
+    let CallArgPositional::Positional(_) = call.args.first()? else {
+        return None;
+    };
+    match codegen_runtime_name_value_v3(module, call.func.as_ref())? {
+        RuntimeName::Iter => Some((RuntimeName::Iter, "__iter__")),
+        RuntimeName::Next => Some((RuntimeName::Next, "__next__")),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Debug)]
+enum DirectCallSourceCallee {
+    Function,
+    Method {
+        method_name: String,
+    },
+    MethodWithDynamicName,
+    RuntimeProtocolMethod {
+        runtime_name: RuntimeName,
+        method_name: String,
+    },
+}
+
 fn module_constant_string_value_v3(
     module: &BlockPyModule<BlockPyModuleShape>,
     constant_index: u32,
@@ -1191,20 +1242,19 @@ fn direct_call_requests_from_evidence_v3(
         .collect::<Vec<_>>();
     entries.sort_by_key(|(source, _)| *source);
     for (source, targets) in entries {
-        let source_method_name = match method_call_name_for_instr_id_v3(
+        let source_callee = match direct_call_source_callee_for_instr_id_v3(
             lowered_module,
             function,
             source,
         ) {
-            Some(Some(method_name)) => Some(method_name),
-            Some(None) => {
+            DirectCallSourceCallee::MethodWithDynamicName => {
                 diagnostics.push(PlanDiagnostic {
                     source: Some(source),
                     message: "v3 direct-call declined method source: lowered attribute name is not a constant string".to_string(),
                 });
                 continue;
             }
-            None => None,
+            source_callee => source_callee,
         };
         let mut targets = targets;
         targets.sort();
@@ -1230,16 +1280,28 @@ fn direct_call_requests_from_evidence_v3(
                 });
                 continue;
             }
-            let callee = if let Some(method_name) = source_method_name.clone() {
-                DirectCallCallee::Method { method_name }
-            } else {
-                DirectCallCallee::Function
+            let callee = match &source_callee {
+                DirectCallSourceCallee::Function => DirectCallCallee::Function,
+                DirectCallSourceCallee::Method { method_name } => DirectCallCallee::Method {
+                    method_name: method_name.clone(),
+                },
+                DirectCallSourceCallee::RuntimeProtocolMethod {
+                    runtime_name,
+                    method_name,
+                } => DirectCallCallee::RuntimeProtocolMethod {
+                    runtime_name: *runtime_name,
+                    method_name: method_name.clone(),
+                },
+                DirectCallSourceCallee::MethodWithDynamicName => unreachable!(
+                    "dynamic method sources should be rejected before direct-call planning"
+                ),
             };
             let implicit_positional_arg_count = match &callee {
                 DirectCallCallee::Function => {
                     usize::from(is_constructor_entry_function(target_function))
                 }
                 DirectCallCallee::Method { .. } => 1,
+                DirectCallCallee::RuntimeProtocolMethod { .. } => 0,
             };
             let arg_plan = match direct_call_arg_plan_for_instr_id_v3(
                 function,
@@ -1287,14 +1349,14 @@ fn direct_call_requests_from_evidence_v3(
                 callee: callee.clone(),
                 arg_plan,
                 body: CallBodyPlanRequest::with_inline_candidate(
-                    matches!(callee, DirectCallCallee::Function)
-                        && direct_call_inline_candidate_v3(
-                            lowered_module,
-                            &current_module,
-                            function,
-                            source,
-                            target_entry,
-                        ),
+                    direct_call_inline_candidate_v3(
+                        lowered_module,
+                        &current_module,
+                        function,
+                        source,
+                        target_entry,
+                        &callee,
+                    ),
                 ),
                 reason: match callee {
                     DirectCallCallee::Function => {
@@ -1302,6 +1364,9 @@ fn direct_call_requests_from_evidence_v3(
                     }
                     DirectCallCallee::Method { .. } => {
                         "profiled call_hot_targets selected this method with validated receiver-method arguments".to_string()
+                    }
+                    DirectCallCallee::RuntimeProtocolMethod { .. } => {
+                        "profiled call_hot_targets selected this runtime protocol method with validated receiver-method arguments".to_string()
                     }
                 },
             });
@@ -1312,15 +1377,15 @@ fn direct_call_requests_from_evidence_v3(
     (requests, diagnostics)
 }
 
-fn method_call_name_for_instr_id_v3(
+fn direct_call_source_callee_for_instr_id_v3(
     module: &BlockPyModule<BlockPyModuleShape>,
     function: &BlockPyFunction<BlockPyModuleShape>,
     source: InstrId,
-) -> Option<Option<String>> {
+) -> DirectCallSourceCallee {
     struct Finder<'a> {
         module: &'a BlockPyModule<BlockPyModuleShape>,
         source: InstrId,
-        result: Option<Option<String>>,
+        result: Option<DirectCallSourceCallee>,
     }
 
     impl Visit<InstrBlockPy> for Finder<'_> {
@@ -1333,12 +1398,24 @@ fn method_call_name_for_instr_id_v3(
             }
             if let InstrBlockPy::Call(call) = expr
                 && call.try_semantic_instr_id() == Some(self.source)
-                && let InstrBlockPy::GetAttr(getattr) = call.func.as_ref()
             {
-                self.result = Some(
-                    codegen_constant_string_value_v3(self.module, getattr.attr.as_ref())
-                        .map(str::to_string),
-                );
+                self.result = if let Some((runtime_name, method_name)) =
+                    runtime_protocol_method_for_call_v3(self.module, call)
+                {
+                    Some(DirectCallSourceCallee::RuntimeProtocolMethod {
+                        runtime_name,
+                        method_name: method_name.to_string(),
+                    })
+                } else if let InstrBlockPy::GetAttr(getattr) = call.func.as_ref() {
+                    match codegen_constant_string_value_v3(self.module, getattr.attr.as_ref()) {
+                        Some(method_name) => Some(DirectCallSourceCallee::Method {
+                            method_name: method_name.to_string(),
+                        }),
+                        None => Some(DirectCallSourceCallee::MethodWithDynamicName),
+                    }
+                } else {
+                    Some(DirectCallSourceCallee::Function)
+                };
                 return;
             }
             expr.visit_children(self);
@@ -1351,7 +1428,7 @@ fn method_call_name_for_instr_id_v3(
         result: None,
     };
     finder.visit_fn(function);
-    finder.result
+    finder.result.unwrap_or(DirectCallSourceCallee::Function)
 }
 
 fn direct_call_arg_plan_for_instr_id_v3(
@@ -1405,6 +1482,7 @@ fn direct_call_inline_candidate_v3(
     function: &BlockPyFunction<BlockPyModuleShape>,
     source: InstrId,
     target: &DirectCallTargetEntry,
+    callee: &DirectCallCallee,
 ) -> bool {
     if target.module != *current_module {
         return false;
@@ -1418,18 +1496,45 @@ fn direct_call_inline_candidate_v3(
     if target_function.names.fn_name == "__init__" {
         return false;
     }
-    if !call_inline_signature_candidate_v3(call, target_function, 0) {
+    let implicit_positional_arg_count = match callee {
+        DirectCallCallee::Function => 0,
+        DirectCallCallee::Method { .. } => 1,
+        DirectCallCallee::RuntimeProtocolMethod { .. } => 0,
+    };
+    if !call_inline_signature_candidate_v3(call, target_function, implicit_positional_arg_count) {
         return false;
     }
-    direct_call_inline_body_buildable_v3(
-        module,
-        current_module,
-        function,
-        return_target,
-        call,
-        target,
-    )
-    .is_ok()
+    match callee {
+        DirectCallCallee::Function => direct_call_inline_body_buildable_v3(
+            module,
+            current_module,
+            function,
+            return_target,
+            call,
+            target,
+        )
+        .is_ok(),
+        DirectCallCallee::Method { .. } => direct_method_inline_body_buildable_v3(
+            module,
+            current_module,
+            function,
+            return_target,
+            call,
+            target,
+        )
+        .is_ok(),
+        DirectCallCallee::RuntimeProtocolMethod { .. } => {
+            direct_runtime_protocol_method_inline_body_buildable_v3(
+                module,
+                current_module,
+                function,
+                return_target,
+                call,
+                target,
+            )
+            .is_ok()
+        }
+    }
 }
 
 enum InlineCallReturnTargetV3 {
@@ -1497,6 +1602,83 @@ fn direct_call_inline_body_buildable_v3(
         &target.function,
         continuation,
         &bindings,
+        return_target,
+    )?;
+    Ok(())
+}
+
+fn direct_method_inline_body_buildable_v3(
+    _module: &BlockPyModule<BlockPyModuleShape>,
+    current_module: &ModuleContentId,
+    function: &BlockPyFunction<BlockPyModuleShape>,
+    return_target: InlineCallReturnTargetV3,
+    call: &Call<InstrBlockPy>,
+    target: &DirectCallTargetEntry,
+) -> Result<(), InlineUnsupportedReason> {
+    let mut caller = function.clone();
+    let continuation = caller.name_gen.next_block_name();
+    let return_target = match return_target {
+        InlineCallReturnTargetV3::StoreTo(target) => target,
+        InlineCallReturnTargetV3::Discard => {
+            try_allocate_codegen_stack_temp(&mut caller, "inline_discard_result")
+                .map_err(|_| InlineUnsupportedReason::MissingCallerStorageLayout)?
+                .resolved_name()
+        }
+    };
+    let InstrBlockPy::GetAttr(get_attr) = call.func.as_ref() else {
+        return Err(InlineUnsupportedReason::UnsupportedCallTarget);
+    };
+    if target.module != *current_module {
+        return Err(InlineUnsupportedReason::CrossModuleGlobalName(
+            target.module.module_name.clone(),
+        ));
+    }
+    build_direct_method_inline_fragment_to_target(
+        &mut caller,
+        &target.function,
+        continuation,
+        get_attr.value.as_ref().clone(),
+        &call.args,
+        return_target,
+    )?;
+    Ok(())
+}
+
+fn direct_runtime_protocol_method_inline_body_buildable_v3(
+    module: &BlockPyModule<BlockPyModuleShape>,
+    current_module: &ModuleContentId,
+    function: &BlockPyFunction<BlockPyModuleShape>,
+    return_target: InlineCallReturnTargetV3,
+    call: &Call<InstrBlockPy>,
+    target: &DirectCallTargetEntry,
+) -> Result<(), InlineUnsupportedReason> {
+    if runtime_protocol_method_for_call_v3(module, call).is_none() {
+        return Err(InlineUnsupportedReason::UnsupportedCallTarget);
+    }
+    let [CallArgPositional::Positional(receiver)] = call.args.as_slice() else {
+        return Err(InlineUnsupportedReason::UnsupportedCallTarget);
+    };
+    let mut caller = function.clone();
+    let continuation = caller.name_gen.next_block_name();
+    let return_target = match return_target {
+        InlineCallReturnTargetV3::StoreTo(target) => target,
+        InlineCallReturnTargetV3::Discard => {
+            try_allocate_codegen_stack_temp(&mut caller, "inline_discard_result")
+                .map_err(|_| InlineUnsupportedReason::MissingCallerStorageLayout)?
+                .resolved_name()
+        }
+    };
+    if target.module != *current_module {
+        return Err(InlineUnsupportedReason::CrossModuleGlobalName(
+            target.module.module_name.clone(),
+        ));
+    }
+    build_direct_method_inline_fragment_to_target(
+        &mut caller,
+        &target.function,
+        continuation,
+        receiver.clone(),
+        &[],
         return_target,
     )?;
     Ok(())
@@ -1785,6 +1967,13 @@ mod tests {
         }))
     }
 
+    fn runtime_name(name: RuntimeName) -> InstrBlockPy {
+        InstrBlockPy::Load(Load::new(ResolvedName {
+            id: BlockPyName::new(name.name()),
+            location: NameLocation::RuntimeName(name),
+        }))
+    }
+
     fn global_name(name: &str, slot: u32) -> ResolvedName {
         ResolvedName {
             id: BlockPyName::new(name),
@@ -2050,7 +2239,8 @@ mod tests {
             &current_module,
             &caller,
             source,
-            &exact_target
+            &exact_target,
+            &DirectCallCallee::Function
         ));
 
         let effect_source = instr_id(10);
@@ -2074,7 +2264,8 @@ mod tests {
             &current_module,
             &effect_only_caller,
             effect_source,
-            &exact_target
+            &exact_target,
+            &DirectCallCallee::Function
         ));
 
         let default_callee = simple_arg_return_callee(&[("x", false), ("y", true)]);
@@ -2095,7 +2286,8 @@ mod tests {
             &current_module,
             &caller,
             source,
-            &default_target
+            &default_target,
+            &DirectCallCallee::Function
         ));
     }
 
@@ -2298,9 +2490,115 @@ mod tests {
                 .body
                 .alternatives
                 .iter()
-                .all(|alternative| alternative.kind == CallBodyKind::DirectCall)
+                .any(|alternative| alternative.kind == CallBodyKind::Inline)
         );
         assert!(requests[0].reason.contains("method"));
+    }
+
+    #[test]
+    fn direct_call_requests_include_runtime_next_protocol_targets() {
+        let module_name_gen = ModuleNameGen::new(0);
+        let source = instr_id(10);
+        let call = with_instr_id(
+            InstrBlockPy::Call(Call::new(
+                runtime_name(RuntimeName::Next),
+                vec![CallArgPositional::Positional(local("it", 0))],
+                Vec::new(),
+            )),
+            10,
+        );
+        let mut caller = function_with_name_gen(
+            module_name_gen.next_function_name_gen(),
+            "caller",
+            "caller",
+            vec![Block::new(
+                label(0),
+                vec![InstrBlockPy::Store(Store::new(
+                    local_name("result", 1),
+                    call,
+                ))],
+                BlockTerm::Return(local("result", 1)),
+                Vec::<BlockParam>::new(),
+                None,
+            )],
+        );
+        set_stack_slots(&mut caller, &["it", "result"]);
+        let mut next_method = function_with_name_gen(
+            module_name_gen.next_function_name_gen(),
+            "__next__",
+            "IterRange.__next__",
+            vec![Block::new(
+                label(0),
+                Vec::new(),
+                BlockTerm::Return(local("self", 0)),
+                Vec::<BlockParam>::new(),
+                None,
+            )],
+        );
+        next_method.params.params = vec![any_param("self", false)];
+        set_stack_slots(&mut next_method, &["self"]);
+        let caller_id = caller.function_id;
+        let next_id = next_method.function_id;
+        let module = BlockPyModule {
+            module_name_gen,
+            global_names: Vec::new(),
+            callable_defs: vec![caller.clone(), next_method],
+            module_constants: Vec::new(),
+            counter_defs: Vec::new(),
+        };
+        let record = CounterDumpRecord {
+            source_hash: 0x99,
+            module_name: "pkg.mod".to_string(),
+            package_name: None,
+            rows: vec![row(
+                "call_hot_targets",
+                caller_id,
+                source,
+                1,
+                Some(next_id.to_packed_runtime_u64()),
+            )],
+            module_keys: Vec::new(),
+            type_keys: Vec::new(),
+            type_table: Vec::new(),
+        };
+        let path = unique_counter_path_v3();
+        fs::write(path.as_path(), record.encode().unwrap()).unwrap();
+        let evidence_store = ProfileEvidenceStore::from_counter_dump(path.as_path()).unwrap();
+        let _ = fs::remove_file(path);
+        let module_identity = module_identity();
+        let target_index = DirectCallTargetIndex::from_current_module(&module_identity, &module);
+        let mut identity_builder = OptimizationPlanV3IdentityBuilder::new(&module_identity);
+
+        let (requests, diagnostics) = direct_call_requests_from_evidence_v3(
+            &module,
+            &module_identity,
+            &caller,
+            &evidence_store,
+            &target_index,
+            &mut identity_builder,
+        );
+
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].callee,
+            DirectCallCallee::RuntimeProtocolMethod {
+                runtime_name: RuntimeName::Next,
+                method_name: "__next__".to_string()
+            }
+        );
+        assert_eq!(
+            requests[0].arg_plan.sources,
+            vec![DirectCallArgSource::Provided(0)]
+        );
+        assert!(
+            requests[0]
+                .body
+                .alternatives
+                .iter()
+                .any(|alternative| alternative.kind == CallBodyKind::Inline)
+        );
+        assert!(requests[0].reason.contains("runtime protocol method"));
     }
 
     #[test]

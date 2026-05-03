@@ -122,6 +122,11 @@ pub enum TypedCallEmissionPlan {
         method_name: String,
         method_guards: Vec<TypedDirectMethodCallGuard>,
     },
+    RuntimeProtocolMethod {
+        runtime_name: RuntimeName,
+        method_name: String,
+        method_guards: Vec<TypedDirectMethodCallGuard>,
+    },
 }
 
 impl TypedCallEmissionPlan {
@@ -135,6 +140,10 @@ impl TypedCallEmissionPlan {
                 .iter()
                 .map(|guard| guard.function_id)
                 .collect(),
+            Self::RuntimeProtocolMethod { method_guards, .. } => method_guards
+                .iter()
+                .map(|guard| guard.function_id)
+                .collect(),
         }
     }
 
@@ -142,6 +151,7 @@ impl TypedCallEmissionPlan {
         match self {
             Self::Callable { function_guards } => function_guards.is_empty(),
             Self::Method { method_guards, .. } => method_guards.is_empty(),
+            Self::RuntimeProtocolMethod { method_guards, .. } => method_guards.is_empty(),
         }
     }
 }
@@ -910,7 +920,14 @@ where
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TypedDirectCallGuardTestKind {
-    RuntimeFunctionId { function_id: RuntimeFunctionId },
+    RuntimeFunctionId {
+        function_id: RuntimeFunctionId,
+    },
+    ExactTypeVersion {
+        function_id: RuntimeFunctionId,
+        owner_type_ref: TypedAttrOwnerRef,
+        type_version: u32,
+    },
 }
 
 define_ruff_instr! {

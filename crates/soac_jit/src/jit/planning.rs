@@ -1873,6 +1873,38 @@ fn merge_runtime_block_param_pyobject_edge_reprs(
     changed
 }
 
+fn force_exception_forwarded_source_reprs_to_pyobject(
+    source_reprs: &mut HashMap<LocalLocation, RuntimeBlockParamRepr>,
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    block: &TypedBlock,
+    runtime_target_params: &[RuntimeBlockParamPlan],
+    local_locations_by_name: &HashMap<String, LocalLocation>,
+    block_indices_by_label: &HashMap<BlockLabel, usize>,
+    stack_slot_names: &HashSet<String>,
+) -> bool {
+    let Some(exc_edge) = block.exc_edge.as_ref() else {
+        return false;
+    };
+    let target_index =
+        typed_block_index_for_label(function, block_indices_by_label, exc_edge.target);
+    let target_block = &function.blocks[target_index];
+    let transport = plan_edge_transport(
+        &target_block.param_name_vec(),
+        &exc_edge.args,
+        runtime_target_params,
+        stack_slot_names,
+    );
+    let mut changed = false;
+    for source_name in transport.forwarded_local_names {
+        let Some(location) = local_locations_by_name.get(source_name.as_str()).copied() else {
+            continue;
+        };
+        changed |=
+            merge_runtime_local_repr(source_reprs, location, RuntimeBlockParamRepr::PyObject);
+    }
+    changed
+}
+
 fn runtime_block_param_reprs_known(
     runtime_params: &[RuntimeBlockParamPlan],
     entry_reprs: &HashMap<LocalLocation, RuntimeBlockParamRepr>,
@@ -1890,6 +1922,11 @@ fn planned_runtime_block_param_reprs_for_typed_function(
 ) -> PlannedRuntimeLocalReprs {
     let block_indices_by_label = typed_block_indices_by_label(function);
     let local_locations_by_name = local_locations_by_name(function);
+    let stack_slot_names = function
+        .storage_layout()
+        .as_ref()
+        .map(|layout| layout.stack_slots().iter().cloned().collect::<HashSet<_>>())
+        .unwrap_or_default();
     let mut entry_reprs =
         vec![HashMap::<LocalLocation, RuntimeBlockParamRepr>::new(); function.blocks.len()];
     if let Some(entry_reprs) = entry_reprs.first_mut() {
@@ -1907,6 +1944,19 @@ fn planned_runtime_block_param_reprs_for_typed_function(
                 &entry_reprs[source_index],
             ) {
                 continue;
+            }
+            if let Some(exc_edge) = block.exc_edge.as_ref() {
+                let target_index =
+                    typed_block_index_for_label(function, &block_indices_by_label, exc_edge.target);
+                changed |= force_exception_forwarded_source_reprs_to_pyobject(
+                    &mut entry_reprs[source_index],
+                    function,
+                    block,
+                    &runtime_block_params[target_index],
+                    &local_locations_by_name,
+                    &block_indices_by_label,
+                    &stack_slot_names,
+                );
             }
             let exit_reprs = transfer_runtime_local_reprs_for_typed_block(
                 block,
@@ -4039,6 +4089,47 @@ def count(n):
             "expected an edge transport to carry i as ExactI64: {:#?}",
             plan.jump_edge_transports
         );
+    }
+
+    #[test]
+    fn exception_forwarded_source_locals_stay_pyobject_at_throwing_block() {
+        let (prepared, function_index) = prepared_typed_function(
+            r#"
+def break_through_finally():
+    total = 0
+    for value in (1, 2, 3):
+        try:
+            break
+        finally:
+            total = total + 40
+    return total + value
+"#,
+            "break_through_finally",
+        );
+        let function = &prepared.module.callable_defs[function_index];
+        let plan = prepared
+            .locals
+            .function(function.function_id)
+            .expect("missing JIT local plan");
+        let (source_index, dispatch) = plan
+            .exc_dispatches
+            .iter()
+            .enumerate()
+            .find_map(|(index, dispatch)| dispatch.as_ref().map(|dispatch| (index, dispatch)))
+            .expect("for-loop next block should have an exception dispatch");
+
+        assert!(
+            dispatch
+                .forwarded_local_names
+                .iter()
+                .any(|name| name == "total"),
+            "expected exception dispatch to forward total: {dispatch:#?}"
+        );
+        let total_param = plan.runtime_block_params[source_index]
+            .iter()
+            .find(|param| param.binding.name == "total")
+            .expect("throwing block should carry total as a runtime param");
+        assert_eq!(total_param.repr, RuntimeBlockParamRepr::PyObject);
     }
 
     #[test]

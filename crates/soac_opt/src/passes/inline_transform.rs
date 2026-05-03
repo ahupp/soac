@@ -34,6 +34,7 @@ pub enum InlineUnsupportedReason {
     ArityMismatch { expected: usize, actual: usize },
     KeywordArguments,
     StarredArguments,
+    UnsupportedCallTarget,
     UnsupportedParameterKind { name: String, kind: ParamKind },
     TooManyBlocks { count: usize, max: usize },
     MultipleBlocks { count: usize },

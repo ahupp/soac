@@ -2,7 +2,9 @@ use soac_core::block_py::{BlockPyFunction, ChildVisitable, RuntimeFunctionId, Vi
 use soac_ir_blockpy::{
     BlockPyModuleShape, InstrBlockPy, constructor_init_function_id_for_entry_function,
 };
-use soac_ir_typed::{InstrTyped, TypedBlockPyModuleShape, TypedDirectCallableCallGuard};
+use soac_ir_typed::{
+    InstrTyped, TypedBlockPyModuleShape, TypedCallAccessPlan, TypedDirectCallableCallGuard,
+};
 use std::collections::HashSet;
 
 use super::typed_pipeline::JitModulePlan;
@@ -36,6 +38,13 @@ pub(super) fn collect_typed_call_direct_targets(
             if let InstrTyped::GuardedMethodCallTyped(call) = expr {
                 self.out
                     .extend(call.method_guards.iter().map(|guard| guard.function_id));
+            }
+            if let InstrTyped::CallTyped(call) = expr
+                && let TypedCallAccessPlan::GuardedRuntimeProtocolMethod { method_guards, .. } =
+                    &call.access
+            {
+                self.out
+                    .extend(method_guards.iter().map(|guard| guard.function_id));
             }
             if let InstrTyped::DirectCallableCallTyped(call) = expr {
                 match &call.guard {

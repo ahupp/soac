@@ -3,12 +3,12 @@ use crate::passes::value_facts;
 use soac_core::block_py;
 #[allow(unused_imports)]
 use soac_core::block_py::{
-    Block, BlockEdge, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, Call, CallArgKeyword,
-    CallArgPositional, CallDirect, CalleeFunctionId, ChildVisitable, Del, HasMeta,
-    HasSemanticInstrId, Instr, InstrId, InstrKey, InstrWithConstantNone, Load, LocalLocation,
-    MapInstr, Mappable, Meta, NameLike, NameLocation, ParamKind, PrettyPrint, PrettyPrinter,
-    ResolvedName, RuntimeFunctionId, RuntimeName, SetAttr, Store, TermIf, TryMapInstr,
-    TryMapModule, TryMapTerm, Visit, VisitMut, WithMeta,
+    Block, BlockArg, BlockEdge, BlockLabel, BlockParamRole, BlockPyFunction, BlockPyModule,
+    BlockTerm, Call, CallArgKeyword, CallArgPositional, CallDirect, CalleeFunctionId,
+    ChildVisitable, ConstantExpr, Del, HasMeta, HasSemanticInstrId, Instr, InstrId, InstrKey,
+    InstrWithConstantNone, Load, LocalLocation, MapInstr, Mappable, Meta, NameLike, NameLocation,
+    ParamKind, PrettyPrint, PrettyPrinter, ResolvedName, RuntimeFunctionId, RuntimeName, SetAttr,
+    Store, TermIf, TryMapInstr, TryMapModule, TryMapTerm, Visit, VisitMut, WithMeta,
 };
 use soac_ir_blockpy::{BlockPyModuleShape, InstrBlockPy};
 use soac_ir_typed::emit_v3::MechanicalExitKind;
@@ -18,9 +18,9 @@ use soac_ir_typed::{
     TypedBlockPyModuleShape, TypedCall, TypedCallAccessPlan, TypedCallEmissionPlan,
     TypedCallEmissionPlans, TypedDirectCallArgPlan, TypedDirectCallArgSource,
     TypedDirectCallGuardTest, TypedDirectCallGuardTestKind, TypedDirectCallableCall,
-    TypedDirectCallableCallGuard, TypedDirectMethodCall, TypedGuardedCallableCall,
-    TypedGuardedMethodCall, TypedPlannedResult, TypedPyObjectOwnershipPlan, TypedResultDemand,
-    TypedTruthy, ValueFacts,
+    TypedDirectCallableCallGuard, TypedDirectMethodCall, TypedDirectMethodCallGuard, TypedGetAttr,
+    TypedGuardedCallableCall, TypedGuardedMethodCall, TypedPlannedResult,
+    TypedPyObjectOwnershipPlan, TypedResultDemand, TypedTruthy, ValueFacts,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -585,6 +585,20 @@ pub fn lower_typed_function_call_emission_plans(
                     );
                     self.count += 1;
                 }
+                TypedCallEmissionPlan::RuntimeProtocolMethod {
+                    runtime_name,
+                    method_name,
+                    method_guards,
+                } => {
+                    let mut call = call;
+                    call.access = TypedCallAccessPlan::GuardedRuntimeProtocolMethod {
+                        runtime_name: *runtime_name,
+                        method_name: method_name.clone(),
+                        method_guards: method_guards.clone(),
+                    };
+                    *expr = InstrTyped::CallTyped(call);
+                    self.count += 1;
+                }
             }
         }
     }
@@ -708,6 +722,13 @@ pub enum TypedInlineUnsupportedReason {
 struct TypedInlineDirectCallPlan {
     target: RuntimeFunctionId,
     arg_plan: TypedDirectCallArgPlan,
+    guard: TypedInlineGuardPlan,
+}
+
+#[derive(Clone)]
+enum TypedInlineGuardPlan {
+    Callable,
+    Method(TypedDirectMethodCallGuard),
 }
 
 struct TypedInlineInstrIdAllocator {
@@ -769,6 +790,7 @@ struct TypedInlineInstrIdRemapper<'a> {
     callee: RuntimeFunctionId,
     inline_instance: u32,
     allocator: &'a mut TypedInlineInstrIdAllocator,
+    assigned: HashMap<InstrId, InstrId>,
     mappings: Vec<TypedInlineInstrIdMapping>,
 }
 
@@ -782,6 +804,7 @@ impl<'a> TypedInlineInstrIdRemapper<'a> {
             callee,
             inline_instance,
             allocator,
+            assigned: HashMap::new(),
             mappings: Vec::new(),
         }
     }
@@ -790,15 +813,22 @@ impl<'a> TypedInlineInstrIdRemapper<'a> {
         let Some(callee_instr_id) = instr.try_semantic_instr_id() else {
             return instr;
         };
-        let caller_instr_id = self.allocator.alloc();
+        let caller_instr_id =
+            if let Some(caller_instr_id) = self.assigned.get(&callee_instr_id).copied() {
+                caller_instr_id
+            } else {
+                let caller_instr_id = self.allocator.alloc();
+                self.assigned.insert(callee_instr_id, caller_instr_id);
+                self.mappings.push(TypedInlineInstrIdMapping {
+                    callee: self.callee,
+                    inline_instance: self.inline_instance,
+                    callee_instr_id,
+                    caller_instr_id,
+                });
+                caller_instr_id
+            };
         let mut meta = instr.meta();
         meta.instr_id = Some(caller_instr_id);
-        self.mappings.push(TypedInlineInstrIdMapping {
-            callee: self.callee,
-            inline_instance: self.inline_instance,
-            callee_instr_id,
-            caller_instr_id,
-        });
         instr.with_meta(meta)
     }
 
@@ -851,7 +881,7 @@ enum TypedInlineBlockRewrite {
 struct TypedInlineStoreCandidate {
     instr_index: usize,
     result: TypedInlineResult,
-    call: TypedGuardedCallableCall<InstrTyped>,
+    call: TypedInlineCall,
     inline_plans: Vec<TypedInlineDirectCallPlan>,
 }
 
@@ -859,6 +889,48 @@ struct TypedInlineStoreCandidate {
 enum TypedInlineResult {
     StoreTo(ResolvedName),
     EffectOnly,
+}
+
+#[derive(Clone)]
+enum TypedInlineCall {
+    Callable(TypedGuardedCallableCall<InstrTyped>),
+    Method {
+        call: TypedGuardedMethodCall<InstrTyped>,
+        receiver: InstrTyped,
+        attr: InstrTyped,
+    },
+    RuntimeProtocolMethod {
+        call: TypedCall<InstrTyped>,
+        receiver: InstrTyped,
+    },
+}
+
+impl TypedInlineCall {
+    fn meta(&self) -> Meta {
+        match self {
+            Self::Callable(call) => call.meta(),
+            Self::Method { call, .. } => call.meta(),
+            Self::RuntimeProtocolMethod { call, .. } => call.meta(),
+        }
+    }
+
+    fn args(&self) -> Vec<CallArgPositional<InstrTyped>> {
+        match self {
+            Self::Callable(call) => call.args.clone(),
+            Self::Method { call, .. } => call.args.clone(),
+            Self::RuntimeProtocolMethod { call, .. } => runtime_protocol_explicit_args(call)
+                .unwrap_or_default()
+                .to_vec(),
+        }
+    }
+
+    fn keywords(&self) -> &[CallArgKeyword<InstrTyped>] {
+        match self {
+            Self::Callable(call) => call.keywords.as_slice(),
+            Self::Method { call, .. } => call.keywords.as_slice(),
+            Self::RuntimeProtocolMethod { call, .. } => call.keywords.as_slice(),
+        }
+    }
 }
 
 fn build_typed_direct_call_inline_rewrite(
@@ -878,25 +950,41 @@ fn build_typed_direct_call_inline_rewrite(
     else {
         return TypedInlineBlockRewrite::Unchanged(block);
     };
-    if block.exc_edge.is_some() {
-        stats.skipped_exception_edges += 1;
-        return TypedInlineBlockRewrite::Unchanged(block);
-    }
-    if !candidate.call.keywords.is_empty() {
+    let original_exc_edge = block.exc_edge.clone();
+    if !candidate.call.keywords().is_empty() {
         stats.skipped_candidates += 1;
         return TypedInlineBlockRewrite::Unchanged(block);
     }
-    let Some(positional_arg_exprs) = typed_positional_arg_exprs(candidate.call.args.clone()) else {
+    let Some(positional_arg_exprs) = typed_positional_arg_exprs(candidate.call.args()) else {
         stats.skipped_candidates += 1;
         return TypedInlineBlockRewrite::Unchanged(block);
     };
 
-    let callable_temp = match try_allocate_typed_stack_temp(caller, "typed_inline_callable") {
-        Ok(temp) => temp,
-        Err(_) => {
-            stats.skipped_candidates += 1;
-            return TypedInlineBlockRewrite::Unchanged(block);
+    let receiver_temp = match &candidate.call {
+        TypedInlineCall::Callable(_) => None,
+        TypedInlineCall::Method { .. } | TypedInlineCall::RuntimeProtocolMethod { .. } => {
+            match try_allocate_typed_stack_temp(caller, "typed_inline_receiver") {
+                Ok(temp) => Some(temp),
+                Err(_) => {
+                    stats.skipped_candidates += 1;
+                    return TypedInlineBlockRewrite::Unchanged(block);
+                }
+            }
         }
+    };
+    let callable_temp = match &candidate.call {
+        TypedInlineCall::Callable(_) => {
+            match try_allocate_typed_stack_temp(caller, "typed_inline_callable") {
+                Ok(temp) => Some(temp),
+                Err(_) => {
+                    stats.skipped_candidates += 1;
+                    caller.storage_layout = original_storage_layout;
+                    return TypedInlineBlockRewrite::Unchanged(block);
+                }
+            }
+        }
+        TypedInlineCall::Method { .. } => None,
+        TypedInlineCall::RuntimeProtocolMethod { .. } => None,
     };
     let arg_temps = match (0..positional_arg_exprs.len())
         .map(|_| try_allocate_typed_stack_temp(caller, "typed_inline_arg"))
@@ -941,11 +1029,29 @@ fn build_typed_direct_call_inline_rewrite(
     let mut before = block.body;
     let after = before.split_off(candidate.instr_index + 1);
     before.truncate(candidate.instr_index);
-    before.push(
-        Store::new(callable_temp.resolved_name(), *candidate.call.func.clone())
-            .with_meta(Meta::synthetic())
-            .into(),
-    );
+    match &candidate.call {
+        TypedInlineCall::Callable(call) => {
+            let callable_temp = callable_temp
+                .as_ref()
+                .expect("callable inline candidate should allocate callable temp");
+            before.push(
+                Store::new(callable_temp.resolved_name(), *call.func.clone())
+                    .with_meta(Meta::synthetic())
+                    .into(),
+            );
+        }
+        TypedInlineCall::Method { receiver, .. }
+        | TypedInlineCall::RuntimeProtocolMethod { receiver, .. } => {
+            let receiver_temp = receiver_temp
+                .as_ref()
+                .expect("method inline candidate should allocate receiver temp");
+            before.push(
+                Store::new(receiver_temp.resolved_name(), receiver.clone())
+                    .with_meta(Meta::synthetic())
+                    .into(),
+            );
+        }
+    }
     for (arg_temp, arg_expr) in arg_temps.iter().zip(positional_arg_exprs) {
         before.push(
             Store::new(arg_temp.resolved_name(), arg_expr)
@@ -957,15 +1063,17 @@ fn build_typed_direct_call_inline_rewrite(
     let entry = Block::new_with_extra(
         block.label,
         before,
-        typed_direct_call_guard_term(
-            &callable_temp.resolved_name(),
-            candidate.inline_plans[0].target,
+        typed_inline_guard_term(
+            &candidate.call,
+            &candidate.inline_plans[0],
+            callable_temp.as_ref(),
+            receiver_temp.as_ref(),
             candidate.call.meta(),
             hot_labels[0],
             guard_labels.first().copied().unwrap_or(generic_label),
         ),
         block.params,
-        None,
+        original_exc_edge.clone(),
         block.extra,
     );
 
@@ -981,15 +1089,17 @@ fn build_typed_direct_call_inline_rewrite(
         blocks.push(Block::new_with_extra(
             guard_label,
             Vec::new(),
-            typed_direct_call_guard_term(
-                &callable_temp.resolved_name(),
-                candidate.inline_plans[target_index].target,
+            typed_inline_guard_term(
+                &candidate.call,
+                &candidate.inline_plans[target_index],
+                callable_temp.as_ref(),
+                receiver_temp.as_ref(),
                 candidate.call.meta(),
                 hot_labels[target_index],
                 else_label,
             ),
             Vec::new(),
-            None,
+            original_exc_edge.clone(),
             TypedBlockExtra::default(),
         ));
     }
@@ -1000,8 +1110,13 @@ fn build_typed_direct_call_inline_rewrite(
             caller.storage_layout = original_storage_layout;
             return TypedInlineBlockRewrite::Unchanged(original_block);
         };
-        let Ok(bindings) = bind_typed_direct_call_inline_args(callee, &plan.arg_plan, &arg_temps)
-        else {
+        let provided_values =
+            typed_inline_provided_values(&candidate.call, &receiver_temp, &arg_temps);
+        let Ok(bindings) = bind_typed_direct_call_inline_values(
+            callee,
+            &plan.arg_plan,
+            provided_values.as_slice(),
+        ) else {
             stats.skipped_candidates += 1;
             caller.storage_layout = original_storage_layout;
             return TypedInlineBlockRewrite::Unchanged(original_block);
@@ -1023,6 +1138,9 @@ fn build_typed_direct_call_inline_rewrite(
             caller.storage_layout = original_storage_layout;
             return TypedInlineBlockRewrite::Unchanged(original_block);
         };
+        for block in &mut fragment.blocks {
+            block.exc_edge = original_exc_edge.clone();
+        }
         if let Some(entry) = fragment.blocks.first_mut() {
             entry.label = hot_label;
         }
@@ -1033,15 +1151,17 @@ fn build_typed_direct_call_inline_rewrite(
 
     blocks.push(Block::new_with_extra(
         generic_label,
-        typed_generic_call_fallback_body(
+        typed_inline_generic_fallback_body(
+            &candidate.call,
             &return_target,
-            &callable_temp.resolved_name(),
+            callable_temp.as_ref(),
+            receiver_temp.as_ref(),
             &arg_temps,
             discard_result.as_ref(),
         ),
         BlockTerm::Jump(BlockEdge::new(continuation_label)),
         Vec::new(),
-        None,
+        original_exc_edge.clone(),
         TypedBlockExtra::default(),
     ));
 
@@ -1050,13 +1170,18 @@ fn build_typed_direct_call_inline_rewrite(
         append_typed_cleanup_del_to_body(&mut cleanup_body, discard_result);
     }
     append_typed_cleanup_dels_to_body(&mut cleanup_body, &arg_temps);
-    append_typed_cleanup_del_to_body(&mut cleanup_body, &callable_temp.resolved_name());
+    if let Some(receiver_temp) = &receiver_temp {
+        append_typed_cleanup_del_to_body(&mut cleanup_body, &receiver_temp.resolved_name());
+    }
+    if let Some(callable_temp) = &callable_temp {
+        append_typed_cleanup_del_to_body(&mut cleanup_body, &callable_temp.resolved_name());
+    }
     blocks.push(Block::new_with_extra(
         cleanup_label,
         cleanup_body,
         BlockTerm::Jump(BlockEdge::new(continuation_label)),
         Vec::new(),
-        None,
+        original_exc_edge.clone(),
         TypedBlockExtra::default(),
     ));
     blocks.push(Block::new_with_extra(
@@ -1064,7 +1189,7 @@ fn build_typed_direct_call_inline_rewrite(
         after,
         block.term,
         Vec::new(),
-        None,
+        original_exc_edge,
         TypedBlockExtra::default(),
     ));
 
@@ -1089,7 +1214,7 @@ fn find_typed_inline_candidate(
         .find_map(|(instr_index, instr)| {
             let InstrTyped::Store(store) = instr else {
                 if let InstrTyped::GuardedCallableCallTyped(call) = instr {
-                    return typed_inline_candidate_for_call(
+                    return typed_inline_candidate_for_callable_call(
                         instr_index,
                         TypedInlineResult::EffectOnly,
                         call,
@@ -1097,22 +1222,58 @@ fn find_typed_inline_candidate(
                         direct_calls_by_instr_id,
                     );
                 }
+                if let InstrTyped::GuardedMethodCallTyped(call) = instr {
+                    return typed_inline_candidate_for_method_call(
+                        instr_index,
+                        TypedInlineResult::EffectOnly,
+                        call,
+                        caller_id,
+                        direct_calls_by_instr_id,
+                    );
+                }
+                if let InstrTyped::CallTyped(call) = instr
+                    && let Some(candidate) = typed_inline_candidate_for_runtime_protocol_call(
+                        instr_index,
+                        TypedInlineResult::EffectOnly,
+                        call,
+                        caller_id,
+                        direct_calls_by_instr_id,
+                    )
+                {
+                    return Some(candidate);
+                }
                 return None;
             };
-            let InstrTyped::GuardedCallableCallTyped(call) = store.value.as_ref() else {
-                return None;
-            };
-            typed_inline_candidate_for_call(
-                instr_index,
-                TypedInlineResult::StoreTo(store.name.clone()),
-                call,
-                caller_id,
-                direct_calls_by_instr_id,
-            )
+            match store.value.as_ref() {
+                InstrTyped::GuardedCallableCallTyped(call) => {
+                    typed_inline_candidate_for_callable_call(
+                        instr_index,
+                        TypedInlineResult::StoreTo(store.name.clone()),
+                        call,
+                        caller_id,
+                        direct_calls_by_instr_id,
+                    )
+                }
+                InstrTyped::GuardedMethodCallTyped(call) => typed_inline_candidate_for_method_call(
+                    instr_index,
+                    TypedInlineResult::StoreTo(store.name.clone()),
+                    call,
+                    caller_id,
+                    direct_calls_by_instr_id,
+                ),
+                InstrTyped::CallTyped(call) => typed_inline_candidate_for_runtime_protocol_call(
+                    instr_index,
+                    TypedInlineResult::StoreTo(store.name.clone()),
+                    call,
+                    caller_id,
+                    direct_calls_by_instr_id,
+                ),
+                _ => None,
+            }
         })
 }
 
-fn typed_inline_candidate_for_call(
+fn typed_inline_candidate_for_callable_call(
     instr_index: usize,
     result: TypedInlineResult,
     call: &TypedGuardedCallableCall<InstrTyped>,
@@ -1135,13 +1296,121 @@ fn typed_inline_candidate_for_call(
             Some(TypedInlineDirectCallPlan {
                 target: *target,
                 arg_plan: arg_plan.clone(),
+                guard: TypedInlineGuardPlan::Callable,
             })
         })
         .collect::<Vec<_>>();
     (!inline_plans.is_empty()).then_some(TypedInlineStoreCandidate {
         instr_index,
         result,
-        call: call.clone(),
+        call: TypedInlineCall::Callable(call.clone()),
+        inline_plans,
+    })
+}
+
+fn typed_inline_candidate_for_method_call(
+    instr_index: usize,
+    result: TypedInlineResult,
+    call: &TypedGuardedMethodCall<InstrTyped>,
+    caller_id: RuntimeFunctionId,
+    direct_calls_by_instr_id: &HashMap<InstrId, Vec<(RuntimeFunctionId, TypedDirectCallArgPlan)>>,
+) -> Option<TypedInlineStoreCandidate> {
+    let instr_id = call.try_semantic_instr_id()?;
+    let InstrTyped::GetAttrTyped(get_attr) = call.func.as_ref() else {
+        return None;
+    };
+    let plans = direct_calls_by_instr_id.get(&instr_id)?;
+    let inline_plans = plans
+        .iter()
+        .filter_map(|(target, arg_plan)| {
+            if *target == caller_id {
+                return None;
+            }
+            let guard = call
+                .method_guards
+                .iter()
+                .find(|guard| guard.function_id == *target)?;
+            Some(TypedInlineDirectCallPlan {
+                target: *target,
+                arg_plan: arg_plan.clone(),
+                guard: TypedInlineGuardPlan::Method(guard.clone()),
+            })
+        })
+        .collect::<Vec<_>>();
+    (!inline_plans.is_empty()).then_some(TypedInlineStoreCandidate {
+        instr_index,
+        result,
+        call: TypedInlineCall::Method {
+            call: call.clone(),
+            receiver: get_attr.value.as_ref().clone(),
+            attr: get_attr.attr.as_ref().clone(),
+        },
+        inline_plans,
+    })
+}
+
+fn runtime_protocol_explicit_args(
+    call: &TypedCall<InstrTyped>,
+) -> Option<&[CallArgPositional<InstrTyped>]> {
+    match &call.access {
+        TypedCallAccessPlan::GuardedRuntimeProtocolMethod { .. } => {}
+        _ => return None,
+    }
+    if call.args.is_empty() {
+        return None;
+    }
+    Some(&call.args[1..])
+}
+
+fn runtime_protocol_receiver(call: &TypedCall<InstrTyped>) -> Option<&InstrTyped> {
+    let CallArgPositional::Positional(receiver) = call.args.first()? else {
+        return None;
+    };
+    Some(receiver)
+}
+
+fn typed_inline_candidate_for_runtime_protocol_call(
+    instr_index: usize,
+    result: TypedInlineResult,
+    call: &TypedCall<InstrTyped>,
+    caller_id: RuntimeFunctionId,
+    direct_calls_by_instr_id: &HashMap<InstrId, Vec<(RuntimeFunctionId, TypedDirectCallArgPlan)>>,
+) -> Option<TypedInlineStoreCandidate> {
+    let TypedCallAccessPlan::GuardedRuntimeProtocolMethod {
+        runtime_name: _,
+        method_name: _,
+        method_guards,
+    } = &call.access
+    else {
+        return None;
+    };
+    let instr_id = call.try_semantic_instr_id()?;
+    let receiver = runtime_protocol_receiver(call)?.clone();
+    typed_positional_arg_exprs(runtime_protocol_explicit_args(call)?.to_vec())?;
+    let plans = direct_calls_by_instr_id.get(&instr_id)?;
+    let inline_plans = plans
+        .iter()
+        .filter_map(|(target, arg_plan)| {
+            if *target == caller_id {
+                return None;
+            }
+            let guard = method_guards
+                .iter()
+                .find(|guard| guard.function_id == *target)?;
+            Some(TypedInlineDirectCallPlan {
+                target: *target,
+                arg_plan: arg_plan.clone(),
+                guard: TypedInlineGuardPlan::Method(guard.clone()),
+            })
+        })
+        .collect::<Vec<_>>();
+    (!inline_plans.is_empty()).then_some(TypedInlineStoreCandidate {
+        instr_index,
+        result,
+        call: TypedInlineCall::RuntimeProtocolMethod {
+            call: call.clone(),
+            receiver,
+        },
         inline_plans,
     })
 }
@@ -1187,6 +1456,55 @@ fn typed_direct_call_guard_term(
     })
 }
 
+fn typed_inline_guard_term(
+    call: &TypedInlineCall,
+    plan: &TypedInlineDirectCallPlan,
+    callable_temp: Option<&TypedTempLocal>,
+    receiver_temp: Option<&TypedTempLocal>,
+    source_meta: Meta,
+    then_label: BlockLabel,
+    else_label: BlockLabel,
+) -> BlockTerm<InstrTyped> {
+    match (&plan.guard, call) {
+        (TypedInlineGuardPlan::Callable, TypedInlineCall::Callable(_)) => {
+            let callable_temp = callable_temp
+                .expect("callable inline guard requires callable temp")
+                .resolved_name();
+            typed_direct_call_guard_term(
+                &callable_temp,
+                plan.target,
+                source_meta,
+                then_label,
+                else_label,
+            )
+        }
+        (
+            TypedInlineGuardPlan::Method(guard),
+            TypedInlineCall::Method { .. } | TypedInlineCall::RuntimeProtocolMethod { .. },
+        ) => {
+            let receiver_temp = receiver_temp
+                .expect("method inline guard requires receiver temp")
+                .resolved_name();
+            BlockTerm::IfTerm(TermIf {
+                test: InstrTyped::DirectCallGuardTest(
+                    TypedDirectCallGuardTest::new(
+                        typed_load_temp(&receiver_temp),
+                        TypedDirectCallGuardTestKind::ExactTypeVersion {
+                            function_id: plan.target,
+                            owner_type_ref: guard.owner_type_ref.clone(),
+                            type_version: guard.type_version,
+                        },
+                    )
+                    .with_meta(source_meta),
+                ),
+                then_label,
+                else_label,
+            })
+        }
+        _ => unreachable!("inline guard kind must match inline call kind"),
+    }
+}
+
 fn typed_generic_call_fallback_body(
     target: &ResolvedName,
     callable_temp: &ResolvedName,
@@ -1211,6 +1529,78 @@ fn typed_generic_call_fallback_body(
     append_typed_cleanup_dels_to_body(&mut body, arg_temps);
     append_typed_cleanup_del_to_body(&mut body, callable_temp);
     body
+}
+
+fn typed_inline_generic_fallback_body(
+    call: &TypedInlineCall,
+    target: &ResolvedName,
+    callable_temp: Option<&TypedTempLocal>,
+    receiver_temp: Option<&TypedTempLocal>,
+    arg_temps: &[TypedTempLocal],
+    discard_result: Option<&ResolvedName>,
+) -> Vec<InstrTyped> {
+    match call {
+        TypedInlineCall::Callable(_) => {
+            let callable_temp = callable_temp
+                .expect("callable inline fallback requires callable temp")
+                .resolved_name();
+            typed_generic_call_fallback_body(target, &callable_temp, arg_temps, discard_result)
+        }
+        TypedInlineCall::Method { attr, .. } => {
+            let receiver_temp = receiver_temp
+                .expect("method inline fallback requires receiver temp")
+                .resolved_name();
+            let func = InstrTyped::GetAttrTyped(
+                TypedGetAttr::generic(typed_load_temp(&receiver_temp), attr.clone())
+                    .with_meta(Meta::synthetic()),
+            );
+            let mut body = vec![
+                Store::new(
+                    target.clone(),
+                    Box::new(InstrTyped::CallTyped(TypedCall::generic(
+                        func,
+                        typed_load_temp_args(arg_temps),
+                        Vec::<CallArgKeyword<InstrTyped>>::new(),
+                    ))),
+                )
+                .with_meta(Meta::synthetic())
+                .into(),
+            ];
+            if let Some(discard_result) = discard_result {
+                append_typed_cleanup_del_to_body(&mut body, discard_result);
+            }
+            append_typed_cleanup_dels_to_body(&mut body, arg_temps);
+            append_typed_cleanup_del_to_body(&mut body, &receiver_temp);
+            body
+        }
+        TypedInlineCall::RuntimeProtocolMethod { call, .. } => {
+            let receiver_temp = receiver_temp
+                .expect("runtime protocol inline fallback requires receiver temp")
+                .resolved_name();
+            let mut args = Vec::with_capacity(1 + arg_temps.len());
+            args.push(CallArgPositional::Positional(typed_load_temp(
+                &receiver_temp,
+            )));
+            args.extend(typed_load_temp_args(arg_temps));
+            let mut fallback_call =
+                TypedCall::generic(call.func.as_ref().clone(), args, Vec::new());
+            fallback_call = fallback_call.with_meta(call.meta());
+            let mut body = vec![
+                Store::new(
+                    target.clone(),
+                    Box::new(InstrTyped::CallTyped(fallback_call)),
+                )
+                .with_meta(Meta::synthetic())
+                .into(),
+            ];
+            if let Some(discard_result) = discard_result {
+                append_typed_cleanup_del_to_body(&mut body, discard_result);
+            }
+            append_typed_cleanup_dels_to_body(&mut body, arg_temps);
+            append_typed_cleanup_del_to_body(&mut body, &receiver_temp);
+            body
+        }
+    }
 }
 
 fn typed_load_temp(temp_name: &ResolvedName) -> InstrTyped {
@@ -1272,10 +1662,39 @@ fn try_allocate_typed_stack_temp(
 
 type TypedInlineValueBindings = HashMap<LocalLocation, InstrTyped>;
 
-fn bind_typed_direct_call_inline_args(
+fn typed_inline_provided_values(
+    call: &TypedInlineCall,
+    receiver_temp: &Option<TypedTempLocal>,
+    arg_temps: &[TypedTempLocal],
+) -> Vec<InstrTyped> {
+    let mut values = Vec::with_capacity(
+        arg_temps.len()
+            + usize::from(matches!(
+                call,
+                TypedInlineCall::Method { .. } | TypedInlineCall::RuntimeProtocolMethod { .. }
+            )),
+    );
+    if matches!(
+        call,
+        TypedInlineCall::Method { .. } | TypedInlineCall::RuntimeProtocolMethod { .. }
+    ) {
+        let receiver_temp = receiver_temp
+            .as_ref()
+            .expect("method inline candidate should have receiver temp");
+        values.push(typed_load_temp(&receiver_temp.resolved_name()));
+    }
+    values.extend(
+        arg_temps
+            .iter()
+            .map(|temp| typed_load_temp(&temp.resolved_name())),
+    );
+    values
+}
+
+fn bind_typed_direct_call_inline_values(
     callee: &BlockPyFunction<TypedBlockPyModuleShape>,
     arg_plan: &TypedDirectCallArgPlan,
-    arg_temps: &[TypedTempLocal],
+    values: &[InstrTyped],
 ) -> Result<TypedInlineValueBindings, TypedInlineUnsupportedReason> {
     if arg_plan.sources.len() != callee.params.len() {
         return Err(TypedInlineUnsupportedReason::ArityMismatch);
@@ -1288,11 +1707,11 @@ fn bind_typed_direct_call_inline_args(
         let TypedDirectCallArgSource::Provided(index) = source else {
             return Err(TypedInlineUnsupportedReason::DefaultArguments);
         };
-        let Some(arg_temp) = arg_temps.get(*index) else {
+        let Some(value) = values.get(*index) else {
             return Err(TypedInlineUnsupportedReason::ArityMismatch);
         };
         let location = typed_parameter_local_location(callee, &param.name)?;
-        bindings.insert(location, typed_load_temp(&arg_temp.resolved_name()));
+        bindings.insert(location, value.clone());
     }
     Ok(bindings)
 }
@@ -1773,6 +2192,272 @@ fn clear_typed_instr_ids(mut instr: InstrTyped) -> InstrTyped {
     instr
 }
 
+pub fn rewrite_typed_stop_iteration_raises_to_handler_jumps(
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+    module_constants: &[ConstantExpr],
+) -> usize {
+    let labels = function
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(index, block)| (block.label, index))
+        .collect::<HashMap<_, _>>();
+    let rewrite_edges = function
+        .blocks
+        .iter()
+        .filter_map(|block| {
+            if !typed_block_term_is_stop_iteration_raise(&block.term, module_constants) {
+                return None;
+            }
+            let dispatch = block.exc_edge.as_ref()?;
+            let edge = stop_iteration_handler_jump_edge_for_raise(
+                function,
+                module_constants,
+                &labels,
+                block,
+                dispatch,
+            )?;
+            Some((block.label, edge))
+        })
+        .collect::<HashMap<_, _>>();
+
+    if rewrite_edges.is_empty() {
+        return 0;
+    }
+
+    let mut rewritten = 0;
+    for block in &mut function.blocks {
+        let Some(edge) = rewrite_edges.get(&block.label) else {
+            continue;
+        };
+        block.term = BlockTerm::Jump(edge.clone());
+        rewritten += 1;
+    }
+    rewritten
+}
+
+fn typed_block_term_is_stop_iteration_raise(
+    term: &BlockTerm<InstrTyped>,
+    module_constants: &[ConstantExpr],
+) -> bool {
+    let BlockTerm::Raise(raise) = term else {
+        return false;
+    };
+    let Some(exc) = raise.exc.as_ref() else {
+        return false;
+    };
+    typed_expr_is_runtime_name_load(exc, RuntimeName::StopIteration, module_constants)
+}
+
+fn stop_iteration_handler_jump_edge_for_raise(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    module_constants: &[ConstantExpr],
+    labels: &HashMap<BlockLabel, usize>,
+    raise_block: &TypedBlock,
+    dispatch: &BlockEdge,
+) -> Option<BlockEdge> {
+    if !dispatch
+        .args
+        .iter()
+        .any(|arg| matches!(arg, BlockArg::CurrentException))
+    {
+        return None;
+    }
+    let dispatch_block = block_by_label(function, labels, dispatch.target)?;
+    let exception_name = dispatch_block.exception_param()?;
+    let handler_label =
+        stop_iteration_match_handler_label(&dispatch_block.term, exception_name, module_constants)?;
+    let handler_block = block_by_label(function, labels, handler_label)?;
+    if handler_region_uses_exception_value(function, labels, handler_label, exception_name) {
+        return None;
+    }
+    let args = direct_handler_jump_args(raise_block, handler_block, exception_name)?;
+    Some(BlockEdge::with_args(handler_label, args))
+}
+
+fn block_by_label<'a>(
+    function: &'a BlockPyFunction<TypedBlockPyModuleShape>,
+    labels: &HashMap<BlockLabel, usize>,
+    label: BlockLabel,
+) -> Option<&'a TypedBlock> {
+    labels
+        .get(&label)
+        .and_then(|index| function.blocks.get(*index))
+}
+
+fn stop_iteration_match_handler_label(
+    term: &BlockTerm<InstrTyped>,
+    exception_name: &str,
+    module_constants: &[ConstantExpr],
+) -> Option<BlockLabel> {
+    let BlockTerm::IfTerm(if_term) = term else {
+        return None;
+    };
+    typed_expr_is_exception_matches_stop_iteration(&if_term.test, exception_name, module_constants)
+        .then_some(if_term.then_label)
+}
+
+fn typed_expr_is_exception_matches_stop_iteration(
+    expr: &InstrTyped,
+    exception_name: &str,
+    module_constants: &[ConstantExpr],
+) -> bool {
+    if let InstrTyped::Truthy(op) = expr {
+        return typed_expr_is_exception_matches_stop_iteration(
+            op.value(),
+            exception_name,
+            module_constants,
+        );
+    }
+    let InstrTyped::CallTyped(call) = expr else {
+        return false;
+    };
+    if !typed_expr_is_runtime_name_load(
+        call.func.as_ref(),
+        RuntimeName::ExceptionMatches,
+        module_constants,
+    ) || !call.keywords.is_empty()
+        || call.args.len() != 2
+    {
+        return false;
+    }
+    let Some(exc) = typed_positional_arg_expr(call.args.first()) else {
+        return false;
+    };
+    let Some(expected) = typed_positional_arg_expr(call.args.get(1)) else {
+        return false;
+    };
+    typed_expr_loads_name(exc, exception_name)
+        && typed_expr_is_runtime_name_load(expected, RuntimeName::StopIteration, module_constants)
+}
+
+fn typed_positional_arg_expr(arg: Option<&CallArgPositional<InstrTyped>>) -> Option<&InstrTyped> {
+    match arg? {
+        CallArgPositional::Positional(expr) => Some(expr),
+        CallArgPositional::Starred(_) => None,
+    }
+}
+
+fn typed_expr_is_runtime_name_load(
+    expr: &InstrTyped,
+    runtime_name: RuntimeName,
+    module_constants: &[ConstantExpr],
+) -> bool {
+    let InstrTyped::Load(load) = expr else {
+        return false;
+    };
+    if load.name.runtime_name_id() == Some(runtime_name) {
+        return true;
+    }
+    let Some(index) = load.name.location.as_constant() else {
+        return false;
+    };
+    matches!(
+        module_constants.get(index as usize),
+        Some(ConstantExpr::RuntimeName(name)) if *name == runtime_name
+    )
+}
+
+fn typed_expr_loads_name(expr: &InstrTyped, name: &str) -> bool {
+    let InstrTyped::Load(load) = expr else {
+        return false;
+    };
+    load.name.id_str() == name
+}
+
+fn handler_region_uses_exception_value(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    labels: &HashMap<BlockLabel, usize>,
+    entry: BlockLabel,
+    exception_name: &str,
+) -> bool {
+    let mut pending = vec![entry];
+    let mut seen = HashSet::new();
+    while let Some(label) = pending.pop() {
+        if !seen.insert(label) {
+            continue;
+        }
+        let Some(block) = block_by_label(function, labels, label) else {
+            continue;
+        };
+        if block.exception_param() != Some(exception_name) {
+            continue;
+        }
+        if typed_block_uses_name(block, exception_name) {
+            return true;
+        }
+        pending.extend(typed_term_successors(&block.term).into_iter());
+    }
+    false
+}
+
+fn typed_block_uses_name(block: &TypedBlock, name: &str) -> bool {
+    let mut finder = TypedNameUseFinder { name, found: false };
+    for instr in &block.body {
+        finder.visit_instr(instr);
+        if finder.found {
+            return true;
+        }
+    }
+    finder.visit_term(&block.term);
+    finder.found
+}
+
+struct TypedNameUseFinder<'a> {
+    name: &'a str,
+    found: bool,
+}
+
+impl Visit<InstrTyped> for TypedNameUseFinder<'_> {
+    fn visit_instr(&mut self, expr: &InstrTyped) {
+        if self.found {
+            return;
+        }
+        if typed_expr_loads_name(expr, self.name) {
+            self.found = true;
+            return;
+        }
+        expr.visit_children(self);
+    }
+}
+
+fn typed_term_successors(term: &BlockTerm<InstrTyped>) -> Vec<BlockLabel> {
+    match term {
+        BlockTerm::Jump(edge) => vec![edge.target],
+        BlockTerm::IfTerm(if_term) => vec![if_term.then_label, if_term.else_label],
+        BlockTerm::BranchTable(branch) => {
+            let mut labels = branch.targets.clone();
+            labels.push(branch.default_label);
+            labels
+        }
+        BlockTerm::Raise(_) | BlockTerm::Return(_) => Vec::new(),
+    }
+}
+
+fn direct_handler_jump_args(
+    source_block: &TypedBlock,
+    target_block: &TypedBlock,
+    exception_name: &str,
+) -> Option<Vec<BlockArg>> {
+    let source_params = source_block.param_name_vec();
+    let source_has_owner = source_params
+        .iter()
+        .any(|param| param == "_dp_self" || param == "_dp_state");
+    target_block
+        .params
+        .iter()
+        .map(|param| {
+            if param.role == BlockParamRole::Exception || param.name == exception_name {
+                Some(BlockArg::None)
+            } else if source_params.iter().any(|source| source == &param.name) || source_has_owner {
+                Some(BlockArg::Name(param.name.clone()))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 pub fn validate_typed_function_call_access_plans(
     function: &BlockPyFunction<TypedBlockPyModuleShape>,
 ) -> Result<(), String> {
@@ -1897,9 +2582,18 @@ fn validate_typed_call_access_plan(call: &TypedCall<InstrTyped>) -> Result<(), S
             method_guards,
         } => {
             validate_typed_call_simple_shape(call)?;
-            if *runtime_name != RuntimeName::Iter {
+            let expected_method = match runtime_name {
+                RuntimeName::Iter => "__iter__",
+                RuntimeName::Next => "__next__",
+                _ => {
+                    return Err(format!(
+                        "guarded runtime protocol call does not support runtime name {runtime_name:?}"
+                    ));
+                }
+            };
+            if method_name != expected_method {
                 return Err(format!(
-                    "guarded runtime protocol call does not support runtime name {runtime_name:?}"
+                    "guarded {runtime_name:?} protocol call requires method {expected_method}, got {method_name}"
                 ));
             }
             if method_name.is_empty() {
@@ -1911,7 +2605,7 @@ fn validate_typed_call_access_plan(call: &TypedCall<InstrTyped>) -> Result<(), S
                 validate_typed_direct_call_positional_args(call.args.as_slice())?;
             if explicit_positional_arg_count != 1 {
                 return Err(format!(
-                    "guarded iter protocol call requires exactly one receiver arg, got {explicit_positional_arg_count}"
+                    "guarded {runtime_name:?} protocol call requires exactly one receiver arg, got {explicit_positional_arg_count}"
                 ));
             }
             for guard in method_guards {
@@ -2040,7 +2734,8 @@ impl TryMapInstr<InstrTyped, InstrBlockPy, String> for TypedToBlockPy {
                 return Err("typed callee function id requires typed codegen emission".to_string());
             }
             InstrTyped::DirectCallGuardTest(op) => match op.kind {
-                TypedDirectCallGuardTestKind::RuntimeFunctionId { .. } => {
+                TypedDirectCallGuardTestKind::RuntimeFunctionId { .. }
+                | TypedDirectCallGuardTestKind::ExactTypeVersion { .. } => {
                     return Err(
                         "typed direct-call guard requires typed codegen emission".to_string()
                     );
@@ -2386,6 +3081,105 @@ mod typed_codegen_tests {
         );
     }
 
+    fn replace_first_typed_call_access_where(
+        function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+        access: TypedCallAccessPlan,
+        mut predicate: impl FnMut(&TypedCall<InstrTyped>) -> bool,
+    ) -> InstrId {
+        struct Replacer<'a, P> {
+            access: Option<TypedCallAccessPlan>,
+            instr_id: Option<InstrId>,
+            predicate: &'a mut P,
+        }
+
+        impl<P> VisitMut<InstrTyped> for Replacer<'_, P>
+        where
+            P: FnMut(&TypedCall<InstrTyped>) -> bool,
+        {
+            fn visit_instr_mut(&mut self, expr: &mut InstrTyped) {
+                if let Some(access) = self.access.take() {
+                    if let InstrTyped::CallTyped(call) = expr
+                        && (self.predicate)(call)
+                    {
+                        self.instr_id = call.try_semantic_instr_id();
+                        call.access = access;
+                        return;
+                    }
+                    self.access = Some(access);
+                }
+                expr.visit_children_mut(self);
+            }
+        }
+
+        let mut replacer = Replacer {
+            access: Some(access),
+            instr_id: None,
+            predicate: &mut predicate,
+        };
+        replacer.visit_fn_mut(function);
+        assert!(
+            replacer.access.is_none(),
+            "test function should contain a matching typed call"
+        );
+        replacer
+            .instr_id
+            .expect("matching typed call should have an instruction id")
+    }
+
+    fn typed_call_func_is_getattr(call: &TypedCall<InstrTyped>) -> bool {
+        matches!(call.func.as_ref(), InstrTyped::GetAttrTyped(_))
+    }
+
+    fn inline_next_protocol_call(source: &str) -> BlockPyModule<TypedBlockPyModuleShape> {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(source)
+            .expect("source should lower");
+        let next_id =
+            blockpy_function_id_by_qualname(&lowered.blockpy_module, "IterRange.__next__");
+        let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
+        let call_id;
+        {
+            let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+            call_id = replace_first_typed_call_access_where(
+                caller,
+                TypedCallAccessPlan::GuardedRuntimeProtocolMethod {
+                    runtime_name: RuntimeName::Next,
+                    method_name: "__next__".to_string(),
+                    method_guards: vec![TypedDirectMethodCallGuard {
+                        function_id: next_id,
+                        owner_type_ref: TypedAttrOwnerRef::TypeKey {
+                            module_name: "__main__".to_string(),
+                            qualname: "IterRange".to_string(),
+                        },
+                        type_version: 1,
+                        arg_plan: TypedDirectCallArgPlan {
+                            sources: vec![TypedDirectCallArgSource::Provided(0)],
+                        },
+                    }],
+                },
+                |call| call.args.len() == 1 && call.keywords.is_empty(),
+            );
+        }
+
+        let callee_module = typed.clone();
+        let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+        let stats = inline_typed_function_direct_call_stores(
+            caller,
+            &callee_module,
+            &HashMap::new(),
+            &HashMap::from([(
+                call_id,
+                vec![(
+                    next_id,
+                    TypedDirectCallArgPlan {
+                        sources: vec![TypedDirectCallArgSource::Provided(0)],
+                    },
+                )],
+            )]),
+        );
+        assert_eq!(stats.rewritten_stores, 1);
+        typed
+    }
+
     fn first_typed_call_instr_id(function: &BlockPyFunction<TypedBlockPyModuleShape>) -> InstrId {
         struct Finder {
             instr_id: Option<InstrId>,
@@ -2408,6 +3202,17 @@ mod typed_codegen_tests {
         finder
             .instr_id
             .expect("test function should contain a typed call with an instruction id")
+    }
+
+    fn stop_iteration_raise_terms(
+        function: &BlockPyFunction<TypedBlockPyModuleShape>,
+        module_constants: &[ConstantExpr],
+    ) -> usize {
+        function
+            .blocks
+            .iter()
+            .filter(|block| typed_block_term_is_stop_iteration_raise(&block.term, module_constants))
+            .count()
     }
 
     #[test]
@@ -2790,6 +3595,45 @@ def caller(it):\n    return it.__next__()\n",
     }
 
     #[test]
+    fn validates_guarded_next_runtime_protocol_typed_call_access_plan_shape() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            "class IterRange:\n    def __next__(self):\n        return 1\n\n\
+def caller(it):\n    return next(it)\n",
+        )
+        .expect("source should lower");
+        let next_id =
+            blockpy_function_id_by_qualname(&lowered.blockpy_module, "IterRange.__next__");
+        let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
+        let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+        replace_first_typed_call_access(
+            caller,
+            TypedCallAccessPlan::GuardedRuntimeProtocolMethod {
+                runtime_name: RuntimeName::Next,
+                method_name: "__next__".to_string(),
+                method_guards: vec![TypedDirectMethodCallGuard {
+                    function_id: next_id,
+                    owner_type_ref: TypedAttrOwnerRef::TypeKey {
+                        module_name: "__main__".to_string(),
+                        qualname: "IterRange".to_string(),
+                    },
+                    type_version: 1,
+                    arg_plan: TypedDirectCallArgPlan {
+                        sources: vec![TypedDirectCallArgSource::Provided(0)],
+                    },
+                }],
+            },
+        );
+
+        validate_typed_function_call_access_plans(caller)
+            .expect("guarded next protocol shape is valid");
+        assert_eq!(
+            lower_typed_function_call_access_plan_instrs(caller),
+            0,
+            "runtime protocol access plans stay on CallTyped for codegen/inlining"
+        );
+    }
+
+    #[test]
     fn lowers_guarded_callable_typed_call_access_plan_to_instr() {
         let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
             "def add(a, b):\n    return a + b\n\n\
@@ -2925,6 +3769,235 @@ def caller(it):\n    return it.__next__()\n",
     }
 
     #[test]
+    fn typed_direct_call_inlining_rewrites_methods_under_exception_edges() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            "class IterRange:\n    def __next__(self):\n        return 1\n\n\
+def caller(it):\n    try:\n        value = it.__next__()\n    except StopIteration:\n        return 0\n    return value\n",
+        )
+        .expect("source should lower");
+        let next_id =
+            blockpy_function_id_by_qualname(&lowered.blockpy_module, "IterRange.__next__");
+        let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
+        let call_id;
+        {
+            let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+            call_id = replace_first_typed_call_access_where(
+                caller,
+                TypedCallAccessPlan::GuardedMethod {
+                    method_name: "__next__".to_string(),
+                    method_guards: vec![TypedDirectMethodCallGuard {
+                        function_id: next_id,
+                        owner_type_ref: TypedAttrOwnerRef::TypeKey {
+                            module_name: "__main__".to_string(),
+                            qualname: "IterRange".to_string(),
+                        },
+                        type_version: 1,
+                        arg_plan: TypedDirectCallArgPlan {
+                            sources: vec![TypedDirectCallArgSource::Provided(0)],
+                        },
+                    }],
+                },
+                typed_call_func_is_getattr,
+            );
+            lower_typed_function_call_access_plan_instrs(caller);
+        }
+
+        let callee_module = typed.clone();
+        let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+        let stats = inline_typed_function_direct_call_stores(
+            caller,
+            &callee_module,
+            &HashMap::new(),
+            &HashMap::from([(
+                call_id,
+                vec![(
+                    next_id,
+                    TypedDirectCallArgPlan {
+                        sources: vec![TypedDirectCallArgSource::Provided(0)],
+                    },
+                )],
+            )]),
+        );
+
+        assert_eq!(stats.rewritten_stores, 1);
+        assert_eq!(stats.skipped_exception_edges, 0);
+        assert!(caller.blocks.iter().any(|block| {
+            block.exc_edge.is_some()
+                && matches!(
+                    &block.term,
+                    BlockTerm::IfTerm(if_term)
+                        if matches!(if_term.test, InstrTyped::DirectCallGuardTest(_))
+                )
+        }));
+    }
+
+    #[test]
+    fn typed_direct_call_inlining_rewrites_next_protocol_under_exception_edges() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            "class IterRange:\n    def __next__(self):\n        return 1\n\n\
+def caller(it):\n    try:\n        value = next(it)\n    except StopIteration:\n        return 0\n    return value\n",
+        )
+        .expect("source should lower");
+        let next_id =
+            blockpy_function_id_by_qualname(&lowered.blockpy_module, "IterRange.__next__");
+        let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
+        let call_id;
+        {
+            let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+            call_id = replace_first_typed_call_access_where(
+                caller,
+                TypedCallAccessPlan::GuardedRuntimeProtocolMethod {
+                    runtime_name: RuntimeName::Next,
+                    method_name: "__next__".to_string(),
+                    method_guards: vec![TypedDirectMethodCallGuard {
+                        function_id: next_id,
+                        owner_type_ref: TypedAttrOwnerRef::TypeKey {
+                            module_name: "__main__".to_string(),
+                            qualname: "IterRange".to_string(),
+                        },
+                        type_version: 1,
+                        arg_plan: TypedDirectCallArgPlan {
+                            sources: vec![TypedDirectCallArgSource::Provided(0)],
+                        },
+                    }],
+                },
+                |call| call.args.len() == 1 && call.keywords.is_empty(),
+            );
+        }
+
+        let callee_module = typed.clone();
+        let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+        let stats = inline_typed_function_direct_call_stores(
+            caller,
+            &callee_module,
+            &HashMap::new(),
+            &HashMap::from([(
+                call_id,
+                vec![(
+                    next_id,
+                    TypedDirectCallArgPlan {
+                        sources: vec![TypedDirectCallArgSource::Provided(0)],
+                    },
+                )],
+            )]),
+        );
+
+        assert_eq!(stats.rewritten_stores, 1);
+        assert_eq!(stats.skipped_exception_edges, 0);
+        assert!(caller.blocks.iter().any(|block| {
+            block.exc_edge.is_some()
+                && matches!(
+                    &block.term,
+                    BlockTerm::IfTerm(if_term)
+                        if matches!(if_term.test, InstrTyped::DirectCallGuardTest(_))
+                )
+        }));
+    }
+
+    #[test]
+    fn typed_direct_call_inlining_keeps_duplicate_semantic_ids_together() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            "class IterRange:\n    def __next__(self):\n        if self.current >= self.stop:\n            raise StopIteration\n        return self.current\n\n\
+def caller(it):\n    try:\n        value = next(it)\n    except StopIteration:\n        return 0\n    return value\n",
+        )
+        .expect("source should lower");
+        let next_id =
+            blockpy_function_id_by_qualname(&lowered.blockpy_module, "IterRange.__next__");
+        let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
+        let call_id;
+        {
+            let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+            call_id = replace_first_typed_call_access_where(
+                caller,
+                TypedCallAccessPlan::GuardedRuntimeProtocolMethod {
+                    runtime_name: RuntimeName::Next,
+                    method_name: "__next__".to_string(),
+                    method_guards: vec![TypedDirectMethodCallGuard {
+                        function_id: next_id,
+                        owner_type_ref: TypedAttrOwnerRef::TypeKey {
+                            module_name: "__main__".to_string(),
+                            qualname: "IterRange".to_string(),
+                        },
+                        type_version: 1,
+                        arg_plan: TypedDirectCallArgPlan {
+                            sources: vec![TypedDirectCallArgSource::Provided(0)],
+                        },
+                    }],
+                },
+                |call| call.args.len() == 1 && call.keywords.is_empty(),
+            );
+        }
+
+        let callee_module = typed.clone();
+        let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+        let stats = inline_typed_function_direct_call_stores(
+            caller,
+            &callee_module,
+            &HashMap::new(),
+            &HashMap::from([(
+                call_id,
+                vec![(
+                    next_id,
+                    TypedDirectCallArgPlan {
+                        sources: vec![TypedDirectCallArgSource::Provided(0)],
+                    },
+                )],
+            )]),
+        );
+
+        assert_eq!(stats.rewritten_stores, 1);
+        let mut seen = HashSet::new();
+        for mapping in &stats.instr_id_mappings {
+            assert!(
+                seen.insert((mapping.inline_instance, mapping.callee_instr_id)),
+                "semantic instruction {} in inline instance {} was remapped more than once",
+                mapping.callee_instr_id,
+                mapping.inline_instance
+            );
+        }
+    }
+
+    #[test]
+    fn typed_stop_iteration_raise_rewrite_jumps_to_matching_handler_after_inlining() {
+        let mut typed = inline_next_protocol_call(
+            "class IterRange:\n    def __next__(self):\n        if self.current >= self.stop:\n            raise StopIteration\n        return self.current\n\n\
+def caller(it):\n    try:\n        value = next(it)\n    except StopIteration:\n        return 0\n    return value\n",
+        );
+        let module_constants = typed.module_constants.clone();
+        let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+
+        assert_eq!(stop_iteration_raise_terms(caller, &module_constants), 1);
+        assert_eq!(
+            rewrite_typed_stop_iteration_raises_to_handler_jumps(caller, &module_constants),
+            1
+        );
+        assert_eq!(stop_iteration_raise_terms(caller, &module_constants), 0);
+        assert!(caller.blocks.iter().any(|block| {
+            matches!(
+                &block.term,
+                BlockTerm::Jump(edge) if edge.args.iter().any(|arg| matches!(arg, BlockArg::None))
+            )
+        }));
+    }
+
+    #[test]
+    fn typed_stop_iteration_raise_rewrite_keeps_observed_exception_object() {
+        let mut typed = inline_next_protocol_call(
+            "class IterRange:\n    def __next__(self):\n        if self.current:\n            raise StopIteration\n        return 1\n\n\
+def caller(it):\n    try:\n        value = next(it)\n    except StopIteration as exc:\n        return exc\n    return value\n",
+        );
+        let module_constants = typed.module_constants.clone();
+        let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+
+        assert_eq!(stop_iteration_raise_terms(caller, &module_constants), 1);
+        assert_eq!(
+            rewrite_typed_stop_iteration_raises_to_handler_jumps(caller, &module_constants),
+            0
+        );
+        assert_eq!(stop_iteration_raise_terms(caller, &module_constants), 1);
+    }
+
+    #[test]
     fn lowers_typed_call_emission_plan_to_guarded_callable_instr() {
         let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
             "def add(a):\n    return a\n\n\
@@ -3053,6 +4126,53 @@ def caller(a):\n    return add(a)\n",
         counter.visit_fn(caller);
         assert_eq!(counter.typed_calls, 0);
         assert_eq!(counter.guarded_method_calls, 1);
+    }
+
+    #[test]
+    fn lowers_typed_call_emission_plan_to_runtime_protocol_access_plan() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            "class IterRange:\n    def __next__(self):\n        return 1\n\n\
+def caller(it):\n    return next(it)\n",
+        )
+        .expect("source should lower");
+        let next_id =
+            blockpy_function_id_by_qualname(&lowered.blockpy_module, "IterRange.__next__");
+        let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
+        let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+        let call_id = first_typed_call_instr_id(caller);
+        let plans = TypedCallEmissionPlans {
+            by_source: HashMap::from([(
+                call_id,
+                TypedCallEmissionPlan::RuntimeProtocolMethod {
+                    runtime_name: RuntimeName::Next,
+                    method_name: "__next__".to_string(),
+                    method_guards: vec![TypedDirectMethodCallGuard {
+                        function_id: next_id,
+                        owner_type_ref: TypedAttrOwnerRef::TypeKey {
+                            module_name: "__main__".to_string(),
+                            qualname: "IterRange".to_string(),
+                        },
+                        type_version: 1,
+                        arg_plan: TypedDirectCallArgPlan {
+                            sources: vec![TypedDirectCallArgSource::Provided(0)],
+                        },
+                    }],
+                },
+            )]),
+        };
+
+        assert_eq!(
+            lower_typed_function_call_emission_plans(caller, &plans)
+                .expect("typed runtime protocol emission plan should lower"),
+            1
+        );
+        validate_typed_function_call_access_plans(caller)
+            .expect("runtime protocol access plan should validate");
+
+        let mut counter = TypedInstrCounter::default();
+        counter.visit_fn(caller);
+        assert_eq!(counter.typed_calls, 1);
+        assert_eq!(counter.guarded_method_calls, 0);
     }
 
     #[test]

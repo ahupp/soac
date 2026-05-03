@@ -231,7 +231,8 @@ pub use specialized_helpers::ObjPtr;
 use symbols::ensure_reloc_type_symbol_registered;
 use symbols::{
     CpythonTypeSymbol, RelocCallableRef, RelocTypeRef, lookup_registered_jit_data_symbol,
-    reloc_callable_ref_symbol_name, reloc_type_ref_symbol_name,
+    reloc_callable_ref_symbol_name, reloc_type_ref_from_typed_attr_owner_ref,
+    reloc_type_ref_symbol_name,
 };
 #[cfg(test)]
 use symbols::{
@@ -267,17 +268,18 @@ use imports::{
     DP_JIT_ENTER_RECURSIVE_CALL_IMPORT, DP_JIT_FINISH_CONSTRUCTOR_INIT_IMPORT,
     DP_JIT_INCREF_IMPORT, DP_JIT_IS_TRUE_IMPORT, DP_JIT_LOAD_CELL_IMPORT,
     DP_JIT_LOAD_RUNTIME_OBJ_BY_ID_IMPORT, DP_JIT_MAKE_CELL_IMPORT,
-    DP_JIT_POP_HANDLED_EXCEPTION_IMPORT, DP_JIT_PUSH_HANDLED_EXCEPTION_IMPORT,
-    DP_JIT_PY_CALL_OBJECT_IMPORT, DP_JIT_PY_CALL_POSITIONAL_THREE_IMPORT,
-    DP_JIT_PY_CALL_WITH_KW_IMPORT, DP_JIT_PY_VECTORCALL_IMPORT, DP_JIT_PYOBJECT_GETATTR_IMPORT,
-    DP_JIT_PYOBJECT_GETITEM_IMPORT, DP_JIT_PYOBJECT_SETATTR_IMPORT, DP_JIT_PYOBJECT_SETITEM_IMPORT,
-    DP_JIT_PYOBJECT_TO_I64_IMPORT, DP_JIT_PYTYPE_GENERIC_ALLOC_IMPORT,
-    DP_JIT_RAISE_FROM_EXC_IMPORT, DP_JIT_RAISE_I64_OVERFLOW_IMPORT,
-    DP_JIT_RAISE_SUPER_ARG_DELETED_IMPORT, DP_JIT_RAISE_UNBOUND_LOCAL_ERROR_IMPORT,
-    DP_JIT_RECORD_TOP_VALUE_SAMPLE_IMPORT, DP_JIT_STORE_CELL_IMPORT, ImportSpec, ModuleFuncImports,
-    PY_HANDLE_PENDING_IMPORT, PYLONG_FROM_LONGLONG_IMPORT, PYNUMBER_ADD_IMPORT,
-    PYNUMBER_AND_IMPORT, PYNUMBER_MULTIPLY_IMPORT, PYNUMBER_OR_IMPORT, PYNUMBER_SUBTRACT_IMPORT,
-    PYNUMBER_XOR_IMPORT, PYOBJECT_RICHCOMPARE_IMPORT, PYUNICODE_COMPARE_IMPORT,
+    DP_JIT_POP_HANDLED_EXCEPTION_IMPORT, DP_JIT_PROTOCOL_NEXT_FUNCTION_ID_IMPORT,
+    DP_JIT_PUSH_HANDLED_EXCEPTION_IMPORT, DP_JIT_PY_CALL_OBJECT_IMPORT,
+    DP_JIT_PY_CALL_POSITIONAL_THREE_IMPORT, DP_JIT_PY_CALL_WITH_KW_IMPORT,
+    DP_JIT_PY_VECTORCALL_IMPORT, DP_JIT_PYOBJECT_GETATTR_IMPORT, DP_JIT_PYOBJECT_GETITEM_IMPORT,
+    DP_JIT_PYOBJECT_SETATTR_IMPORT, DP_JIT_PYOBJECT_SETITEM_IMPORT, DP_JIT_PYOBJECT_TO_I64_IMPORT,
+    DP_JIT_PYTYPE_GENERIC_ALLOC_IMPORT, DP_JIT_RAISE_FROM_EXC_IMPORT,
+    DP_JIT_RAISE_I64_OVERFLOW_IMPORT, DP_JIT_RAISE_SUPER_ARG_DELETED_IMPORT,
+    DP_JIT_RAISE_UNBOUND_LOCAL_ERROR_IMPORT, DP_JIT_RECORD_TOP_VALUE_SAMPLE_IMPORT,
+    DP_JIT_STORE_CELL_IMPORT, ImportSpec, ModuleFuncImports, PY_HANDLE_PENDING_IMPORT,
+    PYLONG_FROM_LONGLONG_IMPORT, PYNUMBER_ADD_IMPORT, PYNUMBER_AND_IMPORT,
+    PYNUMBER_MULTIPLY_IMPORT, PYNUMBER_OR_IMPORT, PYNUMBER_SUBTRACT_IMPORT, PYNUMBER_XOR_IMPORT,
+    PYOBJECT_RICHCOMPARE_IMPORT, PYUNICODE_COMPARE_IMPORT,
     SOAC_JIT_MAKE_FUNCTION_WITH_CLOSURE_IMPORT, SOAC_RUNTIME_BUILTIN_CHR_I64_IMPORT,
     SOAC_RUNTIME_BUILTIN_ITER_OBJECT_IMPORT, SOAC_RUNTIME_BUILTIN_LEN_I64_IMPORT,
     SOAC_RUNTIME_BUILTIN_ORD_I64_IMPORT, SOAC_RUNTIME_COMPARE_COMPACT_ASCII_UNICODE_IMPORT,
@@ -7803,6 +7805,24 @@ fn emit_record_call_target_sample(
     emit_record_top_value_sample(fb, counter_id, callee_id, ctx);
 }
 
+fn emit_record_protocol_next_target_sample(
+    fb: &mut FunctionBuilder<'_>,
+    receiver: ir::Value,
+    counter_id: CounterId,
+    ctx: &JitEmitCtx<'_>,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) {
+    let helper = func_imports.get_or_panic(
+        codegen_env,
+        &mut fb.func,
+        &DP_JIT_PROTOCOL_NEXT_FUNCTION_ID_IMPORT,
+    );
+    let call = fb.ins().call(helper, &[receiver]);
+    let callee_id = fb.inst_results(call)[0];
+    emit_record_call_target_sample(fb, counter_id, callee_id, ctx);
+}
+
 fn emit_record_direct_call_target_sample(
     fb: &mut FunctionBuilder<'_>,
     site_instr_id: Option<InstrId>,
@@ -10228,29 +10248,44 @@ fn emit_typed_positional_call_result_with_arg_refs(
 ) -> Result<EmitResult, String> {
     let (arg_values, arg_borrowed) =
         emit_typed_positional_arg_values(fb, args, local_env, emit_ctx, codegen_env, func_imports)?;
-    Ok(
-        if demand == ResultDemand::EffectOnly && arg_values.len() <= 3 {
-            emit_positional_call_three_result_with_arg_values(
-                fb,
-                callable,
-                callable_is_borrowed,
-                arg_values,
-                arg_borrowed,
-                emit_ctx,
-                demand,
-            )
-        } else {
-            emit_positional_vectorcall_result_with_arg_values(
-                fb,
-                callable,
-                callable_is_borrowed,
-                arg_values,
-                arg_borrowed,
-                emit_ctx,
-                demand,
-            )
-        },
-    )
+    let call_demand = if demand == ResultDemand::I32Bool01 {
+        ResultDemand::PYOBJECT_OWNED
+    } else {
+        demand
+    };
+    let result = if call_demand == ResultDemand::EffectOnly && arg_values.len() <= 3 {
+        emit_positional_call_three_result_with_arg_values(
+            fb,
+            callable,
+            callable_is_borrowed,
+            arg_values,
+            arg_borrowed,
+            emit_ctx,
+            call_demand,
+        )
+    } else {
+        emit_positional_vectorcall_result_with_arg_values(
+            fb,
+            callable,
+            callable_is_borrowed,
+            arg_values,
+            arg_borrowed,
+            emit_ctx,
+            call_demand,
+        )
+    };
+    if demand == ResultDemand::I32Bool01 {
+        let (value, ownership, facts) = result.expect_pyobject("typed positional call bool result");
+        let is_true_ref = func_imports.get(codegen_env, &mut fb.func, &DP_JIT_IS_TRUE_IMPORT)?;
+        return Ok(emit_soac_value_result_for_demand(
+            fb,
+            SoacValue::pyobject_with_ownership(value, ownership, facts),
+            emit_ctx,
+            demand,
+            Some(is_true_ref),
+        ));
+    }
+    Ok(result)
 }
 
 fn current_constructor_entry_init_function<'a>(
@@ -10764,12 +10799,45 @@ fn emit_codegen_simple_call_with_local_env(
                     .get(&site_instr_id)
             })
             .copied();
+        if typed_access.is_none()
+            && let Some(counter_id) = call_target_counter
+            && simple_args.len() == 1
+            && matches!(
+                codegen_expr_static_runtime_name(call.func.as_ref(), emit_ctx.module_constants),
+                Some("next")
+            )
+        {
+            let receiver_expr = simple_args[0];
+            if codegen_expr_pyobject_input_is_borrowed_from_local_env(
+                receiver_expr,
+                local_env,
+                emit_ctx,
+            ) {
+                let receiver = emit_codegen_expr_with_local_env(
+                    fb,
+                    receiver_expr,
+                    local_env,
+                    emit_ctx,
+                    true,
+                    codegen_env,
+                    func_imports,
+                );
+                emit_record_protocol_next_target_sample(
+                    fb,
+                    receiver,
+                    counter_id,
+                    emit_ctx,
+                    codegen_env,
+                    func_imports,
+                );
+            }
+        }
         if let Some(TypedCallAccessPlan::GuardedRuntimeProtocolMethod {
             runtime_name,
             method_name,
             method_guards,
         }) = typed_access
-            && *runtime_name == RuntimeName::Iter
+            && matches!(*runtime_name, RuntimeName::Iter | RuntimeName::Next)
             && simple_args.len() == 1
         {
             let direct_method_specializations =
@@ -13490,11 +13558,44 @@ fn emit_typed_codegen_simple_positional_call_result_with_local_env(
         "typed call callable",
     )?;
 
-    if let Some(counter_id) = call
+    let call_target_counter = call
         .try_semantic_instr_id()
         .and_then(|site_instr_id| emit_ctx.call_target_counter_ids.get(&site_instr_id))
-        .copied()
+        .copied();
+
+    if matches!(call.access, TypedCallAccessPlan::Generic)
+        && let Some(counter_id) = call_target_counter
+        && arg_refs.len() == 1
+        && matches!(
+            typed_expr_static_runtime_name(call.func.as_ref(), emit_ctx.module_constants),
+            Some("next")
+        )
+        && typed_expr_pyobject_input_is_borrowed_from_local_env(arg_refs[0], local_env, emit_ctx)
     {
+        let (receiver, receiver_is_borrowed) = emit_typed_pyobject_input_with_local_env(
+            fb,
+            arg_refs[0],
+            local_env,
+            emit_ctx,
+            codegen_env,
+            func_imports,
+            "typed protocol next receiver",
+        )?;
+        debug_assert!(
+            receiver_is_borrowed,
+            "protocol next profiling only emits borrowed local receivers"
+        );
+        emit_record_protocol_next_target_sample(
+            fb,
+            receiver,
+            counter_id,
+            emit_ctx,
+            codegen_env,
+            func_imports,
+        );
+    }
+
+    if let Some(counter_id) = call_target_counter {
         let callee_id = emit_callee_function_id_checked(fb, callable, emit_ctx, codegen_env);
         emit_record_call_target_sample(fb, counter_id, callee_id, emit_ctx);
     }
@@ -14377,6 +14478,29 @@ fn emit_typed_direct_call_guard_test_value_with_local_env(
     let guard = match &op.kind {
         TypedDirectCallGuardTestKind::RuntimeFunctionId { function_id } => {
             emit_exact_function_id_match_bool01(fb, raw_value, *function_id, emit_ctx, codegen_env)?
+        }
+        TypedDirectCallGuardTestKind::ExactTypeVersion {
+            owner_type_ref,
+            type_version,
+            ..
+        } => {
+            let Some(owner_type_ref) = reloc_type_ref_from_typed_attr_owner_ref(owner_type_ref)
+            else {
+                return Err(format!(
+                    "typed direct method guard references unknown owner type {owner_type_ref:?}"
+                ));
+            };
+            let Some(expected_type) =
+                emit_type_ptr_value_for_ref(fb, codegen_env, emit_ctx, &owner_type_ref)?
+            else {
+                return Err(format!(
+                    "typed direct method guard owner type is not registered: {owner_type_ref:?}"
+                ));
+            };
+            SoacValue::i32(
+                emit_exact_type_version_match(fb, raw_value, expected_type, *type_version),
+                IntFacts::i32_bool01(),
+            )
         }
     };
 
@@ -17066,6 +17190,9 @@ fn direct_call_guard_if_truth_instrumentation(
     let true_counter_ref = emit_ctx.call_direct_hit_counter_ids.get(&instr_id).copied();
     let true_direct_call_target = match &op.kind {
         TypedDirectCallGuardTestKind::RuntimeFunctionId { function_id } => {
+            Some((instr_id, *function_id))
+        }
+        TypedDirectCallGuardTestKind::ExactTypeVersion { function_id, .. } => {
             Some((instr_id, *function_id))
         }
     };

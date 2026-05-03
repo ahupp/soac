@@ -166,6 +166,10 @@ def f(xs):
     );
     let function = function_by_name(&blockpy, "f");
 
+    assert!(function_has_root_load(function, "next"));
+    assert!(function_has_root_load(function, "exception_matches"));
+    assert!(function_has_root_load(function, "StopIteration"));
+    assert!(!function_has_root_load(function, "object"));
     assert!(
         blocks_store_to_prefix(&function.blocks, "_dp_tmp_"),
         "for lowering should still hold the next() result in a cleanup-visible temp: {:#?}",

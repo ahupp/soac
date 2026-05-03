@@ -338,6 +338,31 @@ unsafe extern "C" fn record_top_value_sample_hook(counter: ObjPtr, value: i64) {
         }
     }
 }
+
+unsafe extern "C" fn protocol_next_function_id_hook(receiver: ObjPtr) -> i64 {
+    if receiver.is_null() {
+        return 0;
+    }
+    let receiver_type = ffi::Py_TYPE(receiver as *mut ffi::PyObject);
+    if receiver_type.is_null() {
+        return 0;
+    }
+    let dict = (*receiver_type).tp_dict;
+    if dict.is_null() {
+        return 0;
+    }
+    let descriptor = ffi::PyDict_GetItemString(dict, c"__next__".as_ptr());
+    if descriptor.is_null() {
+        if !ffi::PyErr_Occurred().is_null() {
+            ffi::PyErr_Clear();
+        }
+        return 0;
+    }
+    if ffi::PyFunction_Check(descriptor) == 0 {
+        return 0;
+    }
+    crate::PyFunction_GetSoacFunctionId(descriptor) as i64
+}
 unsafe extern "C" fn get_arg_item_hook(args: ObjPtr, index: i64) -> ObjPtr {
     if args.is_null() {
         return ptr::null_mut();
@@ -1131,6 +1156,10 @@ define_perf_toggle_export!(
 pub unsafe extern "C" fn dp_jit_record_top_value_sample(counter: ObjPtr, value: i64) {
     record_top_value_sample_hook(counter, value)
 }
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dp_jit_protocol_next_function_id(receiver: ObjPtr) -> i64 {
+    protocol_next_function_id_hook(receiver)
+}
 define_perf_toggle_export!(
     ObjPtr,
     dp_jit_get_arg_item,
@@ -1558,6 +1587,10 @@ pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
     builder.symbol(
         "dp_jit_record_top_value_sample",
         dp_jit_record_top_value_sample as *const u8,
+    );
+    builder.symbol(
+        "dp_jit_protocol_next_function_id",
+        dp_jit_protocol_next_function_id as *const u8,
     );
     builder.symbol(
         "dp_jit_raise_unbound_local_error",

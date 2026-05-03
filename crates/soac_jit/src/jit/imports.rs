@@ -34,7 +34,8 @@ use soac_core::block_py::{BlockPyFunction, ChildVisitable, Visit};
 use soac_ir_typed::plan_v3::DirectCallCallee;
 #[cfg(test)]
 use soac_ir_typed::{
-    InstrTyped, TypedBlockPyModuleShape, TypedDirectCallableCallGuard, TypedDirectMethodCallGuard,
+    InstrTyped, TypedBlockPyModuleShape, TypedCallAccessPlan, TypedDirectCallableCallGuard,
+    TypedDirectMethodCallGuard,
 };
 use soac_opt::access_emission_v3::{
     indexed_field_layout_groups as opt_v3_indexed_field_layout_groups,
@@ -381,6 +382,11 @@ pub(super) static DP_JIT_RECORD_TOP_VALUE_SAMPLE_IMPORT: ImportSpec = ImportSpec
     &[SigType::Pointer, SigType::I64],
     &[],
 );
+pub(super) static DP_JIT_PROTOCOL_NEXT_FUNCTION_ID_IMPORT: ImportSpec = ImportSpec::new(
+    "dp_jit_protocol_next_function_id",
+    &[SigType::Pointer],
+    &[SigType::I64],
+);
 pub(super) static DP_JIT_RAISE_UNBOUND_LOCAL_ERROR_IMPORT: ImportSpec =
     ImportSpec::new("dp_jit_raise_unbound_local_error", &[SigType::Pointer], &[]);
 pub(super) static DP_JIT_RAISE_MISSING_REQUIRED_ARGUMENT_IMPORT: ImportSpec =
@@ -518,6 +524,7 @@ static JIT_RUNTIME_IMPORT_SPECS: &[&ImportSpec] = &[
     &PYUNICODE_COMPARE_IMPORT,
     &PYLONG_FROM_LONGLONG_IMPORT,
     &DP_JIT_RECORD_TOP_VALUE_SAMPLE_IMPORT,
+    &DP_JIT_PROTOCOL_NEXT_FUNCTION_ID_IMPORT,
     &DP_JIT_RAISE_UNBOUND_LOCAL_ERROR_IMPORT,
     &DP_JIT_RAISE_MISSING_REQUIRED_ARGUMENT_IMPORT,
     &DP_JIT_RAISE_SUPER_ARG_DELETED_IMPORT,
@@ -662,7 +669,8 @@ pub(super) fn predeclare_specialization_type_imports(
             for plan in plans {
                 match &plan.callee {
                     DirectCallCallee::Function => {}
-                    DirectCallCallee::Method { method_name } => {
+                    DirectCallCallee::Method { method_name }
+                    | DirectCallCallee::RuntimeProtocolMethod { method_name, .. } => {
                         let owners = unsafe {
                             crate::lookup_exact_owner_types_for_method(plan.target, method_name)
                         }
@@ -677,6 +685,7 @@ pub(super) fn predeclare_specialization_type_imports(
                             else {
                                 continue;
                             };
+                            predeclare_reloc_type_ref_import(jit_module, &owner_type_ref)?;
                             callable_refs.insert(RelocCallableRef::OwnerAttr {
                                 owner_type_ref,
                                 attr_name: method_name.clone(),
@@ -739,6 +748,24 @@ pub(super) fn predeclare_typed_direct_call_imports(
                         {
                             self.error = Some(error);
                             return;
+                        }
+                    }
+                    Ok(())
+                }
+                InstrTyped::CallTyped(call) => {
+                    if let TypedCallAccessPlan::GuardedRuntimeProtocolMethod {
+                        method_name,
+                        method_guards,
+                        ..
+                    } = &call.access
+                    {
+                        for guard in method_guards {
+                            if let Err(error) =
+                                self.predeclare_method_guard(method_name.as_str(), guard)
+                            {
+                                self.error = Some(error);
+                                return;
+                            }
                         }
                     }
                     Ok(())
