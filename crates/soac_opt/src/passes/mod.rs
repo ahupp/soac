@@ -57,15 +57,17 @@ pub fn allocate_codegen_stack_temp(
 }
 
 pub use crate::typed::{
-    TypedInlineInstrIdMapping, TypedInlineLocalMapping, annotate_typed_function_planned_results,
+    TypedHotContinuationClone, TypedHotContinuationSplitStats, TypedInlineInstrIdMapping,
+    TypedInlineLocalMapping, annotate_typed_function_planned_results,
     annotate_typed_function_result_demands, annotate_typed_function_value_facts,
     annotate_typed_module_value_facts, inline_typed_function_direct_call_stores,
     lower_typed_function_call_access_plan_instrs, lower_typed_function_call_emission_plans,
     lower_typed_function_if_tests_to_truthy, lower_typed_if_tests_to_truthy,
     refresh_typed_function_value_facts, rewrite_typed_stop_iteration_raises_to_handler_jumps,
-    try_lower_typed_instr_to_codegen_legacy, try_lower_typed_module_to_codegen_legacy,
-    try_lower_typed_term_to_codegen_legacy, validate_typed_function_call_access_plans,
-    validate_typed_function_value_facts, validate_typed_module_call_access_plans,
+    split_typed_constructor_hot_continuations, try_lower_typed_instr_to_codegen_legacy,
+    try_lower_typed_module_to_codegen_legacy, try_lower_typed_term_to_codegen_legacy,
+    validate_typed_function_call_access_plans, validate_typed_function_value_facts,
+    validate_typed_module_call_access_plans,
 };
 pub use escape_analysis::{
     ConstructorFieldStore, ConstructorFieldValue, EscapeSummaryModule,

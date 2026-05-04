@@ -23,8 +23,8 @@ use soac_ir_typed::{
     TypedCallEmissionPlans, TypedDirectCallArgPlan, TypedDirectMethodCallGuard,
     TypedExactIntBranchPlan, TypedExactIntPlanSource, TypedExactIntReturnPlan,
     TypedExactListItemAccessPlan, TypedExactListItemCounterSource, TypedExactListItemPlanSource,
-    TypedIndexedFieldPlanSource, TypedIndexedGlobalAccessPlan, TypedIndexedGlobalPlanSource,
-    assign_missing_typed_function_instr_ids,
+    TypedIndexedFieldCounterSource, TypedIndexedFieldPlanSource, TypedIndexedGlobalAccessPlan,
+    TypedIndexedGlobalPlanSource, assign_missing_typed_function_instr_ids,
 };
 use soac_opt::access_emission_v3::{
     ExactListItemAccessPlan as OptV3ExactListItemAccessPlan,
@@ -35,7 +35,8 @@ use soac_opt::call_emission_v3::{ResolvedV3DirectCallPlan, typed_call_emission_p
 use soac_opt::passes::{
     TypedInlineInstrIdMapping, TypedInlineLocalMapping, inline_typed_function_direct_call_stores,
     lower_typed_function_call_emission_plans, refresh_typed_function_value_facts,
-    rewrite_typed_stop_iteration_raises_to_handler_jumps, validate_typed_function_value_facts,
+    rewrite_typed_stop_iteration_raises_to_handler_jumps,
+    split_typed_constructor_hot_continuations, validate_typed_function_value_facts,
 };
 use soac_opt::region_emission_v3::{
     ExactIntBranchSelection as OptV3ExactIntBranchSelection,
@@ -237,10 +238,12 @@ pub(super) fn apply_profile_call_emission_plans_to_typed_function(
 pub(super) fn annotate_typed_attr_accesses(
     function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
     opt_v3_indexed_fields_by_instr: &HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>,
+    indexed_field_counter_sources: &HashMap<InstrId, TypedIndexedFieldCounterSource>,
     specialize_stores: bool,
 ) -> Result<usize, String> {
     struct Annotator<'a> {
         opt_v3_indexed_fields_by_instr: &'a HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>,
+        indexed_field_counter_sources: &'a HashMap<InstrId, TypedIndexedFieldCounterSource>,
         specialize_stores: bool,
         count: usize,
         error: Option<String>,
@@ -255,6 +258,7 @@ pub(super) fn annotate_typed_attr_accesses(
             }
             Some(TypedAttrAccessPlan::IndexedField {
                 source: TypedIndexedFieldPlanSource::OptimizationPlanV3,
+                counter_source: self.indexed_field_counter_sources.get(&instr_id).copied(),
                 guards,
             })
         }
@@ -320,6 +324,7 @@ pub(super) fn annotate_typed_attr_accesses(
 
     let mut annotator = Annotator {
         opt_v3_indexed_fields_by_instr,
+        indexed_field_counter_sources,
         specialize_stores,
         count: 0,
         error: None,
@@ -340,6 +345,9 @@ fn annotate_typed_indexed_field_accesses_from_profile(
     function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
     profile: &SpecializationProfile<'_>,
     remapped_indexed_fields: Option<&HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>>,
+    remapped_indexed_field_counter_sources: Option<
+        &HashMap<InstrId, TypedIndexedFieldCounterSource>,
+    >,
 ) -> Result<(), String> {
     let (_, _, mut opt_v3_indexed_fields_by_instr) =
         profile.field_index_specialization_maps(function.function_id)?;
@@ -362,6 +370,7 @@ fn annotate_typed_indexed_field_accesses_from_profile(
     annotate_typed_attr_accesses(
         function,
         &opt_v3_indexed_fields_by_instr,
+        remapped_indexed_field_counter_sources.unwrap_or(&HashMap::new()),
         specialize_field_stores,
     )?;
     Ok(())
@@ -921,11 +930,19 @@ fn apply_profile_access_and_scalar_plans_to_typed_function(
     function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
     profile: &SpecializationProfile<'_>,
     remapped_indexed_fields: Option<&HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>>,
+    remapped_indexed_field_counter_sources: Option<
+        &HashMap<InstrId, TypedIndexedFieldCounterSource>,
+    >,
     remapped_exact_list_items: Option<&HashMap<InstrId, ProfileExactListItemAccessPlan>>,
     remapped_exact_int_branches: Option<&HashMap<InstrId, TypedExactIntBranchPlan>>,
     remapped_exact_int_returns: Option<&HashMap<InstrId, TypedExactIntReturnPlan>>,
 ) -> Result<(), String> {
-    annotate_typed_indexed_field_accesses_from_profile(function, profile, remapped_indexed_fields)?;
+    annotate_typed_indexed_field_accesses_from_profile(
+        function,
+        profile,
+        remapped_indexed_fields,
+        remapped_indexed_field_counter_sources,
+    )?;
     annotate_typed_indexed_global_accesses_from_profile(function, profile)?;
     annotate_typed_exact_list_item_accesses_from_profile(
         function,
@@ -1218,6 +1235,10 @@ fn remap_inlined_indexed_field_accesses(
         RuntimeFunctionId,
         HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>,
     >,
+    remapped_indexed_field_counter_sources: &mut HashMap<
+        RuntimeFunctionId,
+        HashMap<InstrId, TypedIndexedFieldCounterSource>,
+    >,
 ) -> Result<usize, String> {
     let mut resolved_by_callee =
         HashMap::<RuntimeFunctionId, HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>>::new();
@@ -1251,6 +1272,25 @@ fn remap_inlined_indexed_field_accesses(
                 entry.push(access.clone());
                 count += 1;
             }
+        }
+        let source = TypedIndexedFieldCounterSource {
+            function_id: mapping.callee,
+            instr_id: mapping.callee_instr_id,
+        };
+        let counter_source = remapped_indexed_field_counter_sources
+            .entry(caller_function_id)
+            .or_default()
+            .entry(mapping.caller_instr_id)
+            .or_insert(source);
+        if *counter_source != source {
+            return Err(format!(
+                "inlined indexed-field counter source for caller instruction {} maps to both {}:{} and {}:{}",
+                mapping.caller_instr_id,
+                counter_source.function_id,
+                counter_source.instr_id,
+                source.function_id,
+                source.instr_id
+            ));
         }
     }
     Ok(count)
@@ -1294,6 +1334,88 @@ fn remap_inlined_exact_list_item_accesses(
                 mapping.callee, mapping.callee_instr_id, mapping.caller_instr_id
             ));
         }
+        count += 1;
+    }
+    Ok(count)
+}
+
+fn profile_exact_list_item_accesses_for_function(
+    function_id: RuntimeFunctionId,
+    profile: &SpecializationProfile<'_>,
+    remapped_exact_list_items: &HashMap<
+        RuntimeFunctionId,
+        HashMap<InstrId, ProfileExactListItemAccessPlan>,
+    >,
+) -> HashMap<InstrId, ProfileExactListItemAccessPlan> {
+    let mut exact_list_items = profile
+        .opt_v3_emitted_exact_list_items
+        .get(&function_id)
+        .map(|plans| {
+            plans
+                .iter()
+                .map(|(instr_id, plan)| {
+                    (
+                        *instr_id,
+                        ProfileExactListItemAccessPlan {
+                            plan: plan.clone(),
+                            counter_source: None,
+                        },
+                    )
+                })
+                .collect::<HashMap<_, _>>()
+        })
+        .unwrap_or_default();
+    if let Some(remapped) = remapped_exact_list_items.get(&function_id) {
+        for (instr_id, plan) in remapped {
+            exact_list_items
+                .entry(*instr_id)
+                .or_insert_with(|| plan.clone());
+        }
+    }
+    exact_list_items
+}
+
+fn remap_cloned_exact_list_item_accesses(
+    caller_function_id: RuntimeFunctionId,
+    mappings: &[TypedInlineInstrIdMapping],
+    profile: &SpecializationProfile<'_>,
+    remapped_exact_list_items: &mut HashMap<
+        RuntimeFunctionId,
+        HashMap<InstrId, ProfileExactListItemAccessPlan>,
+    >,
+) -> Result<usize, String> {
+    let source_items = profile_exact_list_item_accesses_for_function(
+        caller_function_id,
+        profile,
+        remapped_exact_list_items,
+    );
+    let mut count = 0;
+    for mapping in mappings {
+        if mapping.callee != caller_function_id {
+            continue;
+        }
+        let Some(plan) = source_items.get(&mapping.callee_instr_id) else {
+            continue;
+        };
+        let mut remapped = plan.clone();
+        remapped.plan.source = mapping.caller_instr_id;
+        remapped
+            .counter_source
+            .get_or_insert_with(|| TypedExactListItemCounterSource {
+                function_id: mapping.callee,
+                instr_id: mapping.callee_instr_id,
+            });
+        if remapped_exact_list_items
+            .entry(caller_function_id)
+            .or_default()
+            .contains_key(&mapping.caller_instr_id)
+        {
+            continue;
+        }
+        remapped_exact_list_items
+            .entry(caller_function_id)
+            .or_default()
+            .insert(mapping.caller_instr_id, remapped);
         count += 1;
     }
     Ok(count)
@@ -1352,6 +1474,167 @@ fn remap_inlined_direct_call_targets(
     count
 }
 
+fn remap_cloned_direct_call_targets(
+    caller_function_id: RuntimeFunctionId,
+    mappings: &[TypedInlineInstrIdMapping],
+    profile: &SpecializationProfile<'_>,
+    remapped_inline_targets: &mut HashMap<RuntimeFunctionId, TypedInlineTargets>,
+) -> usize {
+    let source_targets =
+        typed_inline_targets_for_function(caller_function_id, profile, remapped_inline_targets);
+    let mut count = 0;
+    for mapping in mappings {
+        if mapping.callee != caller_function_id {
+            continue;
+        }
+        let Some(plans) = source_targets.get(&mapping.callee_instr_id) else {
+            continue;
+        };
+        let entry = remapped_inline_targets
+            .entry(caller_function_id)
+            .or_default()
+            .entry(mapping.caller_instr_id)
+            .or_default();
+        for plan in plans {
+            if !entry.contains(plan) {
+                entry.push(plan.clone());
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+fn indexed_field_accesses_for_function(
+    function_id: RuntimeFunctionId,
+    profile: &SpecializationProfile<'_>,
+    remapped_indexed_fields: &HashMap<
+        RuntimeFunctionId,
+        HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>,
+    >,
+) -> Result<HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>, String> {
+    let (_, _, mut fields) = profile.field_index_specialization_maps(function_id)?;
+    if let Some(remapped) = remapped_indexed_fields.get(&function_id) {
+        for (instr_id, accesses) in remapped {
+            let entry = fields.entry(*instr_id).or_default();
+            for access in accesses {
+                if !entry.contains(access) {
+                    entry.push(access.clone());
+                }
+            }
+        }
+    }
+    Ok(fields)
+}
+
+fn remap_cloned_indexed_field_accesses(
+    caller_function_id: RuntimeFunctionId,
+    mappings: &[TypedInlineInstrIdMapping],
+    profile: &SpecializationProfile<'_>,
+    remapped_indexed_fields: &mut HashMap<
+        RuntimeFunctionId,
+        HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>,
+    >,
+    remapped_indexed_field_counter_sources: &mut HashMap<
+        RuntimeFunctionId,
+        HashMap<InstrId, TypedIndexedFieldCounterSource>,
+    >,
+) -> Result<usize, String> {
+    let source_fields =
+        indexed_field_accesses_for_function(caller_function_id, profile, remapped_indexed_fields)?;
+    let mut count = 0;
+    for mapping in mappings {
+        if mapping.callee != caller_function_id {
+            continue;
+        }
+        let Some(accesses) = source_fields.get(&mapping.callee_instr_id) else {
+            continue;
+        };
+        let source = remapped_indexed_field_counter_sources
+            .get(&caller_function_id)
+            .and_then(|sources| sources.get(&mapping.callee_instr_id))
+            .copied()
+            .unwrap_or(TypedIndexedFieldCounterSource {
+                function_id: mapping.callee,
+                instr_id: mapping.callee_instr_id,
+            });
+        let entry = remapped_indexed_fields
+            .entry(caller_function_id)
+            .or_default()
+            .entry(mapping.caller_instr_id)
+            .or_default();
+        for access in accesses {
+            if !entry.contains(access) {
+                entry.push(access.clone());
+                count += 1;
+            }
+        }
+        let counter_source = remapped_indexed_field_counter_sources
+            .entry(caller_function_id)
+            .or_default()
+            .entry(mapping.caller_instr_id)
+            .or_insert(source);
+        if *counter_source != source {
+            return Err(format!(
+                "cloned indexed-field counter source for instruction {} maps to both {}:{} and {}:{}",
+                mapping.caller_instr_id,
+                counter_source.function_id,
+                counter_source.instr_id,
+                source.function_id,
+                source.instr_id
+            ));
+        }
+    }
+    Ok(count)
+}
+
+fn remap_cloned_profile_rewrites(
+    caller_function_id: RuntimeFunctionId,
+    mappings: &[TypedInlineInstrIdMapping],
+    profile: &SpecializationProfile<'_>,
+    remapped_inline_targets: &mut HashMap<RuntimeFunctionId, TypedInlineTargets>,
+    remapped_indexed_fields: &mut HashMap<
+        RuntimeFunctionId,
+        HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>,
+    >,
+    remapped_indexed_field_counter_sources: &mut HashMap<
+        RuntimeFunctionId,
+        HashMap<InstrId, TypedIndexedFieldCounterSource>,
+    >,
+    remapped_exact_list_items: &mut HashMap<
+        RuntimeFunctionId,
+        HashMap<InstrId, ProfileExactListItemAccessPlan>,
+    >,
+) -> Result<usize, String> {
+    let mut total = 0;
+    loop {
+        let mut count = 0;
+        count += remap_cloned_direct_call_targets(
+            caller_function_id,
+            mappings,
+            profile,
+            remapped_inline_targets,
+        );
+        count += remap_cloned_indexed_field_accesses(
+            caller_function_id,
+            mappings,
+            profile,
+            remapped_indexed_fields,
+            remapped_indexed_field_counter_sources,
+        )?;
+        count += remap_cloned_exact_list_item_accesses(
+            caller_function_id,
+            mappings,
+            profile,
+            remapped_exact_list_items,
+        )?;
+        if count == 0 {
+            return Ok(total);
+        }
+        total += count;
+    }
+}
+
 #[cfg(test)]
 pub(super) fn apply_profile_typed_plans_to_typed_function(
     function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
@@ -1362,7 +1645,7 @@ pub(super) fn apply_profile_typed_plans_to_typed_function(
     };
     apply_profile_call_emission_plans_to_typed_function(function, profile)?;
     apply_profile_access_and_scalar_plans_to_typed_function(
-        function, profile, None, None, None, None,
+        function, profile, None, None, None, None, None,
     )?;
     apply_profile_typed_block_metadata_to_typed_function(function, profile)?;
     apply_profile_typed_guard_miss_policy_to_typed_function(function, profile);
@@ -1436,6 +1719,8 @@ fn apply_typed_v3_module_rewrites(
     let mut remapped_inline_targets = HashMap::<RuntimeFunctionId, TypedInlineTargets>::new();
     let mut remapped_indexed_fields =
         HashMap::<RuntimeFunctionId, HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>>::new();
+    let mut remapped_indexed_field_counter_sources =
+        HashMap::<RuntimeFunctionId, HashMap<InstrId, TypedIndexedFieldCounterSource>>::new();
     let mut remapped_exact_list_items =
         HashMap::<RuntimeFunctionId, HashMap<InstrId, ProfileExactListItemAccessPlan>>::new();
     let mut remapped_exact_int_branches =
@@ -1443,6 +1728,7 @@ fn apply_typed_v3_module_rewrites(
     let mut remapped_exact_int_returns =
         HashMap::<RuntimeFunctionId, HashMap<InstrId, TypedExactIntReturnPlan>>::new();
     for function in &mut module.callable_defs {
+        let mut cloned_instr_id_mappings = Vec::<TypedInlineInstrIdMapping>::new();
         for pass in 0..MAX_TYPED_INLINE_PASSES {
             let inline_targets = typed_inline_targets_for_function(
                 function.function_id,
@@ -1474,6 +1760,7 @@ fn apply_typed_v3_module_rewrites(
                     &stats.instr_id_mappings,
                     profile,
                     &mut remapped_indexed_fields,
+                    &mut remapped_indexed_field_counter_sources,
                 )?;
                 remap_inlined_exact_list_item_accesses(
                     caller_function_id,
@@ -1488,6 +1775,22 @@ fn apply_typed_v3_module_rewrites(
                     profile,
                     &mut remapped_exact_int_branches,
                     &mut remapped_exact_int_returns,
+                )?;
+            }
+            let split_stats =
+                split_typed_constructor_hot_continuations(function, &module_constants);
+            if !split_stats.instr_id_mappings.is_empty() {
+                cloned_instr_id_mappings.extend(split_stats.instr_id_mappings);
+            }
+            if !cloned_instr_id_mappings.is_empty() {
+                remap_cloned_profile_rewrites(
+                    caller_function_id,
+                    &cloned_instr_id_mappings,
+                    profile,
+                    &mut remapped_inline_targets,
+                    &mut remapped_indexed_fields,
+                    &mut remapped_indexed_field_counter_sources,
+                    &mut remapped_exact_list_items,
                 )?;
             }
             assign_missing_typed_function_instr_ids(function);
@@ -1507,6 +1810,7 @@ fn apply_typed_v3_module_rewrites(
             function,
             profile,
             remapped_indexed_fields.get(&function.function_id),
+            remapped_indexed_field_counter_sources.get(&function.function_id),
             remapped_exact_list_items.get(&function.function_id),
             remapped_exact_int_branches.get(&function.function_id),
             remapped_exact_int_returns.get(&function.function_id),

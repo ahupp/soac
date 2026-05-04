@@ -958,11 +958,18 @@ pub enum TypedIndexedFieldPlanSource {
     OptimizationPlanV3,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TypedIndexedFieldCounterSource {
+    pub function_id: RuntimeFunctionId,
+    pub instr_id: InstrId,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TypedAttrAccessPlan {
     Generic,
     IndexedField {
         source: TypedIndexedFieldPlanSource,
+        counter_source: Option<TypedIndexedFieldCounterSource>,
         guards: Vec<TypedIndexedFieldGuard>,
     },
 }

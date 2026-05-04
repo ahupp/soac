@@ -40,8 +40,9 @@ use soac_ir_typed::{
     TypedDirectCallGuardTest, TypedDirectCallGuardTestKind, TypedDirectCallableCall,
     TypedDirectCallableCallGuard, TypedDirectMethodCall, TypedExactIntBranchPlan,
     TypedExactIntReturnPlan, TypedGetAttr, TypedGuardedCallableCall, TypedGuardedMethodCall,
-    TypedIndexedFieldGuard, TypedIndexedFieldPlanSource, TypedPlannedResult,
-    TypedPyObjectOwnershipPlan, TypedSetAttr, ValueFacts, lower_blockpy_function_to_typed,
+    TypedIndexedFieldCounterSource, TypedIndexedFieldGuard, TypedIndexedFieldPlanSource,
+    TypedPlannedResult, TypedPyObjectOwnershipPlan, TypedSetAttr, ValueFacts,
+    lower_blockpy_function_to_typed,
 };
 use soac_opt::access_emission_v3::{
     IndexedFieldLayoutGroup as OptV3IndexedFieldLayoutGroup,
@@ -1464,6 +1465,9 @@ struct JitEmitCtx<'mc> {
     global_indexed_fallback_counter_ids: &'mc HashMap<InstrId, CounterRef>,
     field_indexed_hit_counter_ids: &'mc HashMap<InstrId, CounterRef>,
     field_indexed_fallback_counter_ids: &'mc HashMap<InstrId, CounterRef>,
+    field_indexed_hit_counter_ids_by_source: &'mc HashMap<(RuntimeFunctionId, InstrId), CounterRef>,
+    field_indexed_fallback_counter_ids_by_source:
+        &'mc HashMap<(RuntimeFunctionId, InstrId), CounterRef>,
     field_generic_getattr_counter_ids: &'mc HashMap<InstrId, CounterRef>,
     field_generic_setattr_counter_ids: &'mc HashMap<InstrId, CounterRef>,
     deopt_entry_guard_miss_counter_ids: &'mc HashMap<usize, CounterId>,
@@ -9267,10 +9271,26 @@ fn emit_typed_setattr_fallback(
     ))
 }
 
+fn typed_indexed_field_counter_ref(
+    instr_id: InstrId,
+    counter_source: Option<TypedIndexedFieldCounterSource>,
+    local_counters: &HashMap<InstrId, CounterRef>,
+    source_counters: &HashMap<(RuntimeFunctionId, InstrId), CounterRef>,
+) -> Option<CounterRef> {
+    counter_source
+        .and_then(|source| {
+            source_counters
+                .get(&(source.function_id, source.instr_id))
+                .copied()
+        })
+        .or_else(|| local_counters.get(&instr_id).copied())
+}
+
 fn emit_typed_indexed_getattr(
     fb: &mut FunctionBuilder<'_>,
     op: &TypedGetAttr<InstrTyped>,
     source: TypedIndexedFieldPlanSource,
+    counter_source: Option<TypedIndexedFieldCounterSource>,
     guards: &[TypedIndexedFieldGuard],
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
@@ -9309,14 +9329,18 @@ fn emit_typed_indexed_getattr(
     push_owned_typed_input_cleanup(&mut owned_inputs, value, value_is_borrowed);
     push_owned_typed_input_cleanup(&mut owned_inputs, attr, attr_is_borrowed);
     let ptr_ty = emit_ctx.consts.ptr_ty;
-    let hit_counter_id = emit_ctx
-        .field_indexed_hit_counter_ids
-        .get(&instr_id)
-        .copied();
-    let fallback_counter_id = emit_ctx
-        .field_indexed_fallback_counter_ids
-        .get(&instr_id)
-        .copied();
+    let hit_counter_id = typed_indexed_field_counter_ref(
+        instr_id,
+        counter_source,
+        emit_ctx.field_indexed_hit_counter_ids,
+        emit_ctx.field_indexed_hit_counter_ids_by_source,
+    );
+    let fallback_counter_id = typed_indexed_field_counter_ref(
+        instr_id,
+        counter_source,
+        emit_ctx.field_indexed_fallback_counter_ids,
+        emit_ctx.field_indexed_fallback_counter_ids_by_source,
+    );
 
     let result_block = fb.create_block();
     fb.append_block_param(result_block, ptr_ty);
@@ -9428,6 +9452,7 @@ fn emit_typed_indexed_setattr(
     fb: &mut FunctionBuilder<'_>,
     op: &TypedSetAttr<InstrTyped>,
     source: TypedIndexedFieldPlanSource,
+    counter_source: Option<TypedIndexedFieldCounterSource>,
     guards: &[TypedIndexedFieldGuard],
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
@@ -9486,14 +9511,18 @@ fn emit_typed_indexed_setattr(
     let ptr_ty = emit_ctx.consts.ptr_ty;
     let i64_ty = emit_ctx.consts.i64_ty;
     let zero_i32 = fb.ins().iconst(emit_ctx.consts.i32_ty, 0);
-    let hit_counter_id = emit_ctx
-        .field_indexed_hit_counter_ids
-        .get(&instr_id)
-        .copied();
-    let fallback_counter_id = emit_ctx
-        .field_indexed_fallback_counter_ids
-        .get(&instr_id)
-        .copied();
+    let hit_counter_id = typed_indexed_field_counter_ref(
+        instr_id,
+        counter_source,
+        emit_ctx.field_indexed_hit_counter_ids,
+        emit_ctx.field_indexed_hit_counter_ids_by_source,
+    );
+    let fallback_counter_id = typed_indexed_field_counter_ref(
+        instr_id,
+        counter_source,
+        emit_ctx.field_indexed_fallback_counter_ids,
+        emit_ctx.field_indexed_fallback_counter_ids_by_source,
+    );
 
     let result_block = fb.create_block();
     if result_needs_pyobject {
@@ -10020,12 +10049,17 @@ fn emit_typed_codegen_expr_value_with_local_env(
     }
 
     if let InstrTyped::GetAttrTyped(op) = expr
-        && let TypedAttrAccessPlan::IndexedField { source, guards } = &op.access
+        && let TypedAttrAccessPlan::IndexedField {
+            source,
+            counter_source,
+            guards,
+        } = &op.access
     {
         let maybe_value = emit_typed_indexed_getattr(
             fb,
             op,
             *source,
+            *counter_source,
             guards,
             local_env,
             emit_ctx,
@@ -10038,12 +10072,17 @@ fn emit_typed_codegen_expr_value_with_local_env(
     }
 
     if let InstrTyped::SetAttrTyped(op) = expr
-        && let TypedAttrAccessPlan::IndexedField { source, guards } = &op.access
+        && let TypedAttrAccessPlan::IndexedField {
+            source,
+            counter_source,
+            guards,
+        } = &op.access
     {
         let maybe_value = emit_typed_indexed_setattr(
             fb,
             op,
             *source,
+            *counter_source,
             guards,
             local_env,
             emit_ctx,
@@ -14989,11 +15028,17 @@ fn emit_typed_codegen_stmt_result_with_local_env(
         );
     }
     if let InstrTyped::GetAttrTyped(op) = expr {
-        let result = if let TypedAttrAccessPlan::IndexedField { source, guards } = &op.access {
+        let result = if let TypedAttrAccessPlan::IndexedField {
+            source,
+            counter_source,
+            guards,
+        } = &op.access
+        {
             emit_typed_indexed_getattr(
                 fb,
                 op,
                 *source,
+                *counter_source,
                 guards,
                 local_env,
                 emit_ctx,
@@ -15034,11 +15079,17 @@ fn emit_typed_codegen_stmt_result_with_local_env(
         });
     }
     if let InstrTyped::SetAttrTyped(op) = expr {
-        if let TypedAttrAccessPlan::IndexedField { source, guards } = &op.access {
+        if let TypedAttrAccessPlan::IndexedField {
+            source,
+            counter_source,
+            guards,
+        } = &op.access
+        {
             if let Some(result) = emit_typed_indexed_setattr(
                 fb,
                 op,
                 *source,
+                *counter_source,
                 guards,
                 local_env,
                 emit_ctx,
@@ -18735,6 +18786,18 @@ fn build_cranelift_run_bb_specialized_function(
         "field_access",
         "indexed_fallback",
     );
+    let field_indexed_hit_counter_ids_by_source =
+        collect_runtime_counter_refs_by_kind_branch_source(
+            counter_defs,
+            "field_access",
+            "indexed_hit",
+        );
+    let field_indexed_fallback_counter_ids_by_source =
+        collect_runtime_counter_refs_by_kind_branch_source(
+            counter_defs,
+            "field_access",
+            "indexed_fallback",
+        );
     let field_generic_getattr_counter_ids = collect_runtime_counter_refs_by_kind_branch(
         counter_defs,
         function.function_id,
@@ -18790,6 +18853,8 @@ fn build_cranelift_run_bb_specialized_function(
         .chain(global_indexed_fallback_counter_ids.values())
         .chain(field_indexed_hit_counter_ids.values())
         .chain(field_indexed_fallback_counter_ids.values())
+        .chain(field_indexed_hit_counter_ids_by_source.values())
+        .chain(field_indexed_fallback_counter_ids_by_source.values())
         .chain(field_generic_getattr_counter_ids.values())
         .chain(field_generic_setattr_counter_ids.values())
         .chain(refcount_decref_location_counter_refs.values())
@@ -19591,6 +19656,9 @@ fn build_cranelift_run_bb_specialized_function(
                 global_indexed_fallback_counter_ids: &global_indexed_fallback_counter_ids,
                 field_indexed_hit_counter_ids: &field_indexed_hit_counter_ids,
                 field_indexed_fallback_counter_ids: &field_indexed_fallback_counter_ids,
+                field_indexed_hit_counter_ids_by_source: &field_indexed_hit_counter_ids_by_source,
+                field_indexed_fallback_counter_ids_by_source:
+                    &field_indexed_fallback_counter_ids_by_source,
                 field_generic_getattr_counter_ids: &field_generic_getattr_counter_ids,
                 field_generic_setattr_counter_ids: &field_generic_setattr_counter_ids,
                 deopt_entry_guard_miss_counter_ids: &deopt_entry_guard_miss_counter_ids,

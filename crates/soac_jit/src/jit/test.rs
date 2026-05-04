@@ -17325,7 +17325,7 @@ def read_point(point):
             else {
                 panic!("read_point should return a typed GetAttr");
             };
-            let TypedAttrAccessPlan::IndexedField { source, guards } = &getattr.access else {
+            let TypedAttrAccessPlan::IndexedField { source, guards, .. } = &getattr.access else {
                 panic!("v3 emitted indexed-field decision should become an InstrTyped plan");
             };
             assert_eq!(*source, TypedIndexedFieldPlanSource::OptimizationPlanV3);
@@ -17482,6 +17482,7 @@ def read_point(point):
         let annotated = annotate_typed_attr_accesses(
             &mut typed_function,
             &opt_v3_indexed_fields_by_instr,
+            &HashMap::new(),
             true,
         )
         .expect("v3 indexed-field SetAttr annotation should succeed");
@@ -17550,6 +17551,7 @@ def read_point(point):
         let annotated = annotate_typed_attr_accesses(
             &mut typed_function,
             &opt_v3_indexed_fields_by_instr,
+            &HashMap::new(),
             true,
         )
         .expect("JIT annotation should trust the prevalidated v3 indexed-field source");
@@ -18882,7 +18884,7 @@ class Point:
             else {
                 panic!("read_point should keep an indexed typed SetAttr in the body");
             };
-            let TypedAttrAccessPlan::IndexedField { source, guards } = &setattr.access else {
+            let TypedAttrAccessPlan::IndexedField { source, guards, .. } = &setattr.access else {
                 panic!("typed-v3 module plan should carry indexed-field store shape");
             };
             assert_eq!(*source, TypedIndexedFieldPlanSource::OptimizationPlanV3);
@@ -18893,7 +18895,7 @@ class Point:
             else {
                 panic!("read_point should still return a typed GetAttr");
             };
-            let TypedAttrAccessPlan::IndexedField { source, guards } = &op.access else {
+            let TypedAttrAccessPlan::IndexedField { source, guards, .. } = &op.access else {
                 panic!("typed-v3 module plan should carry indexed-field access shape");
             };
             assert_eq!(*source, TypedIndexedFieldPlanSource::OptimizationPlanV3);
@@ -19538,7 +19540,7 @@ class Point:
             impl Visit<InstrTyped> for Collector<'_> {
                 fn visit_instr(&mut self, expr: &InstrTyped) {
                     if let InstrTyped::GetAttrTyped(op) = expr
-                        && let TypedAttrAccessPlan::IndexedField { source, guards } = &op.access
+                        && let TypedAttrAccessPlan::IndexedField { source, guards, .. } = &op.access
                     {
                         assert_eq!(*source, TypedIndexedFieldPlanSource::OptimizationPlanV3);
                         self.field_plans

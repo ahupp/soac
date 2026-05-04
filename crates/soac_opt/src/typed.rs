@@ -694,6 +694,21 @@ pub struct TypedInlineRewriteStats {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct TypedHotContinuationClone {
+    pub hot_block: BlockLabel,
+    pub original_entry: BlockLabel,
+    pub cloned_entry: BlockLabel,
+    pub cloned_blocks: usize,
+}
+
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct TypedHotContinuationSplitStats {
+    pub cloned_blocks: usize,
+    pub clones: Vec<TypedHotContinuationClone>,
+    pub instr_id_mappings: Vec<TypedInlineInstrIdMapping>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 #[allow(dead_code)]
 pub enum TypedInlineUnsupportedReason {
     MissingCallerStorageLayout,
@@ -1206,6 +1221,283 @@ fn build_typed_direct_call_inline_rewrite(
     stats.instr_id_mappings.extend(instr_id_mappings);
     stats.local_mappings.extend(local_mappings);
     TypedInlineBlockRewrite::Rewritten(blocks)
+}
+
+const MAX_TYPED_HOT_CONTINUATION_CLONE_BLOCKS: usize = 256;
+
+pub fn split_typed_constructor_hot_continuations(
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+    module_constants: &[ConstantExpr],
+) -> TypedHotContinuationSplitStats {
+    let mut stats = TypedHotContinuationSplitStats::default();
+    let mut instr_id_allocator = TypedInlineInstrIdAllocator::from_function(function);
+    loop {
+        let Some(candidate) =
+            find_typed_constructor_hot_continuation_split_candidate(function, module_constants)
+        else {
+            break;
+        };
+        let Some(cloned) = clone_typed_hot_continuation(
+            function,
+            candidate,
+            stats.clones.len() as u32,
+            &mut instr_id_allocator,
+        ) else {
+            break;
+        };
+        stats.cloned_blocks += cloned.clone.cloned_blocks;
+        stats.instr_id_mappings.extend(cloned.instr_id_mappings);
+        stats.clones.push(cloned.clone);
+    }
+    stats
+}
+
+#[derive(Debug, Clone)]
+struct TypedHotContinuationSplitCandidate {
+    hot_block: BlockLabel,
+    original_entry: BlockLabel,
+    reachable: HashSet<BlockLabel>,
+}
+
+struct TypedHotContinuationCloneResult {
+    clone: TypedHotContinuationClone,
+    instr_id_mappings: Vec<TypedInlineInstrIdMapping>,
+}
+
+fn find_typed_constructor_hot_continuation_split_candidate(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    module_constants: &[ConstantExpr],
+) -> Option<TypedHotContinuationSplitCandidate> {
+    let labels = typed_block_indices_by_label(function);
+    let predecessors = typed_block_predecessors(function);
+    function.blocks.iter().find_map(|block| {
+        let original_entry = typed_constructor_hot_continuation_entry(
+            function,
+            &labels,
+            &predecessors,
+            block,
+            module_constants,
+        )?;
+        let reachable = typed_reachable_block_labels(function, &labels, original_entry)?;
+        if reachable.contains(&block.label)
+            || reachable.len() > MAX_TYPED_HOT_CONTINUATION_CLONE_BLOCKS
+            || !typed_reachable_subgraph_has_external_predecessor(
+                &reachable,
+                &predecessors,
+                block.label,
+            )
+        {
+            return None;
+        }
+        Some(TypedHotContinuationSplitCandidate {
+            hot_block: block.label,
+            original_entry,
+            reachable,
+        })
+    })
+}
+
+fn typed_constructor_hot_continuation_entry(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    labels: &HashMap<BlockLabel, usize>,
+    predecessors: &HashMap<BlockLabel, HashSet<BlockLabel>>,
+    block: &TypedBlock,
+    module_constants: &[ConstantExpr],
+) -> Option<BlockLabel> {
+    if !typed_block_contains_constructor_call_store(block, module_constants)
+        || !typed_block_is_direct_call_guard_hot_successor(function, labels, predecessors, block)
+    {
+        return None;
+    }
+    let BlockTerm::Jump(edge) = &block.term else {
+        return None;
+    };
+    Some(edge.target)
+}
+
+fn typed_block_contains_constructor_call_store(
+    block: &TypedBlock,
+    module_constants: &[ConstantExpr],
+) -> bool {
+    block.body.iter().any(|instr| {
+        let InstrTyped::Store(store) = instr else {
+            return false;
+        };
+        let InstrTyped::CallTyped(call) = store.value.as_ref() else {
+            return false;
+        };
+        typed_expr_is_runtime_name_load(
+            call.func.as_ref(),
+            RuntimeName::ConstructorCall,
+            module_constants,
+        )
+    })
+}
+
+fn typed_block_is_direct_call_guard_hot_successor(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    labels: &HashMap<BlockLabel, usize>,
+    predecessors: &HashMap<BlockLabel, HashSet<BlockLabel>>,
+    block: &TypedBlock,
+) -> bool {
+    predecessors
+        .get(&block.label)
+        .into_iter()
+        .flat_map(|predecessors| predecessors.iter())
+        .filter_map(|predecessor| block_by_label(function, labels, *predecessor))
+        .any(|predecessor| {
+            typed_block_direct_call_guard_then_label(predecessor) == Some(block.label)
+        })
+}
+
+fn typed_block_direct_call_guard_then_label(block: &TypedBlock) -> Option<BlockLabel> {
+    let BlockTerm::IfTerm(if_term) = &block.term else {
+        return None;
+    };
+    matches!(if_term.test, InstrTyped::DirectCallGuardTest(_)).then_some(if_term.then_label)
+}
+
+fn typed_block_indices_by_label(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+) -> HashMap<BlockLabel, usize> {
+    function
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(index, block)| (block.label, index))
+        .collect()
+}
+
+fn typed_block_successors(block: &TypedBlock) -> Vec<BlockLabel> {
+    let mut successors = typed_term_successors(&block.term);
+    if let Some(edge) = &block.exc_edge {
+        successors.push(edge.target);
+    }
+    successors
+}
+
+fn typed_block_predecessors(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+) -> HashMap<BlockLabel, HashSet<BlockLabel>> {
+    let mut predecessors = HashMap::<BlockLabel, HashSet<BlockLabel>>::new();
+    for block in &function.blocks {
+        for successor in typed_block_successors(block) {
+            predecessors
+                .entry(successor)
+                .or_default()
+                .insert(block.label);
+        }
+    }
+    predecessors
+}
+
+fn typed_reachable_block_labels(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    labels: &HashMap<BlockLabel, usize>,
+    entry: BlockLabel,
+) -> Option<HashSet<BlockLabel>> {
+    let mut seen = HashSet::new();
+    let mut pending = vec![entry];
+    while let Some(label) = pending.pop() {
+        if !seen.insert(label) {
+            continue;
+        }
+        let block = block_by_label(function, labels, label)?;
+        pending.extend(typed_block_successors(block));
+    }
+    Some(seen)
+}
+
+fn typed_reachable_subgraph_has_external_predecessor(
+    reachable: &HashSet<BlockLabel>,
+    predecessors: &HashMap<BlockLabel, HashSet<BlockLabel>>,
+    source: BlockLabel,
+) -> bool {
+    reachable.iter().any(|label| {
+        predecessors.get(label).is_some_and(|label_predecessors| {
+            label_predecessors
+                .iter()
+                .any(|predecessor| *predecessor != source && !reachable.contains(predecessor))
+        })
+    })
+}
+
+fn clone_typed_hot_continuation(
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+    candidate: TypedHotContinuationSplitCandidate,
+    clone_instance: u32,
+    instr_id_allocator: &mut TypedInlineInstrIdAllocator,
+) -> Option<TypedHotContinuationCloneResult> {
+    let label_map = candidate
+        .reachable
+        .iter()
+        .map(|label| (*label, function.name_gen.next_block_name()))
+        .collect::<HashMap<_, _>>();
+    let cloned_entry = *label_map.get(&candidate.original_entry)?;
+    let hot_block = function
+        .blocks
+        .iter_mut()
+        .find(|block| block.label == candidate.hot_block)?;
+    let BlockTerm::Jump(edge) = &mut hot_block.term else {
+        return None;
+    };
+    if edge.target != candidate.original_entry {
+        return None;
+    }
+    edge.target = cloned_entry;
+
+    let mut instr_id_remapper =
+        TypedInlineInstrIdRemapper::new(function.function_id, clone_instance, instr_id_allocator);
+    let mut cloned_blocks = Vec::with_capacity(candidate.reachable.len());
+    for block in function
+        .blocks
+        .iter()
+        .filter(|block| candidate.reachable.contains(&block.label))
+    {
+        let mut cloned = block.clone();
+        cloned.label = *label_map.get(&block.label)?;
+        let mut label_remapper = TypedContinuationCloneLabelRemapper { labels: &label_map };
+        label_remapper.visit_block_mut(&mut cloned);
+        let mut instr_remapper = TypedContinuationCloneInstrIdRemapper {
+            remapper: &mut instr_id_remapper,
+        };
+        instr_remapper.visit_block_mut(&mut cloned);
+        cloned_blocks.push(cloned);
+    }
+    let cloned_block_count = cloned_blocks.len();
+    function.blocks.extend(cloned_blocks);
+    Some(TypedHotContinuationCloneResult {
+        clone: TypedHotContinuationClone {
+            hot_block: candidate.hot_block,
+            original_entry: candidate.original_entry,
+            cloned_entry,
+            cloned_blocks: cloned_block_count,
+        },
+        instr_id_mappings: instr_id_remapper.finish(),
+    })
+}
+
+struct TypedContinuationCloneLabelRemapper<'a> {
+    labels: &'a HashMap<BlockLabel, BlockLabel>,
+}
+
+impl VisitMut<InstrTyped> for TypedContinuationCloneLabelRemapper<'_> {
+    fn visit_label_mut(&mut self, label: &mut BlockLabel) {
+        if let Some(mapped) = self.labels.get(label) {
+            *label = *mapped;
+        }
+    }
+}
+
+struct TypedContinuationCloneInstrIdRemapper<'a, 'b> {
+    remapper: &'a mut TypedInlineInstrIdRemapper<'b>,
+}
+
+impl VisitMut<InstrTyped> for TypedContinuationCloneInstrIdRemapper<'_, '_> {
+    fn visit_instr_mut(&mut self, expr: &mut InstrTyped) {
+        expr.visit_children_mut(self);
+        *expr = self.remapper.remap_instr_id(expr.clone());
+    }
 }
 
 fn find_typed_inline_candidate(
@@ -2832,6 +3124,7 @@ mod typed_codegen_tests {
     use super::*;
     use crate::passes::infer_module_value_facts;
     use soac_core::block_py::{ChildVisitable, InstrId, InstrWithConstantNone, Visit, VisitMut};
+    use soac_ir_blockpy::constructor_entry_function_id_for_init;
     use soac_ir_typed::{
         TypedAttrOwnerRef, TypedDirectFunctionCallGuard, TypedDirectMethodCallGuard,
         lower_blockpy_module_to_typed,
@@ -3961,6 +4254,94 @@ def caller(it):\n    try:\n        value = next(it)\n    except StopIteration:\n
                 mapping.inline_instance
             );
         }
+    }
+
+    #[test]
+    fn typed_constructor_hot_continuation_split_clones_joined_successors() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            "class Box:\n    def __init__(self, value):\n        self.value = value\n\n\
+def caller(value):\n    obj = Box(value)\n    if value:\n        return obj.value\n    return 0\n",
+        )
+        .expect("source should lower");
+        let init_id = blockpy_function_id_by_qualname(&lowered.blockpy_module, "Box.__init__");
+        let constructor_entry_id =
+            constructor_entry_function_id_for_init(&lowered.blockpy_module, init_id)
+                .expect("class lowering should add a constructor entry");
+        let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
+        let module_constants = typed.module_constants.clone();
+        let call_id;
+        {
+            let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+            call_id = first_typed_call_instr_id(caller);
+            replace_first_typed_call_access(
+                caller,
+                TypedCallAccessPlan::GuardedCallable {
+                    function_guards: vec![TypedDirectFunctionCallGuard {
+                        function_id: constructor_entry_id,
+                        arg_plan: TypedDirectCallArgPlan {
+                            sources: vec![
+                                TypedDirectCallArgSource::Provided(0),
+                                TypedDirectCallArgSource::Provided(1),
+                            ],
+                        },
+                    }],
+                },
+            );
+            lower_typed_function_call_access_plan_instrs(caller);
+        }
+
+        let callee_module = typed.clone();
+        let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+        let stats = inline_typed_function_direct_call_stores(
+            caller,
+            &callee_module,
+            &HashMap::new(),
+            &HashMap::from([(
+                call_id,
+                vec![(
+                    constructor_entry_id,
+                    TypedDirectCallArgPlan {
+                        sources: vec![
+                            TypedDirectCallArgSource::Provided(0),
+                            TypedDirectCallArgSource::Provided(1),
+                        ],
+                    },
+                )],
+            )]),
+        );
+        assert_eq!(stats.rewritten_stores, 1);
+
+        let before_blocks = caller.blocks.len();
+        let split_stats = split_typed_constructor_hot_continuations(caller, &module_constants);
+        assert_eq!(split_stats.clones.len(), 1);
+        assert!(split_stats.cloned_blocks > 0);
+        assert!(!split_stats.instr_id_mappings.is_empty());
+        assert_eq!(
+            caller.blocks.len(),
+            before_blocks + split_stats.cloned_blocks
+        );
+
+        let clone = split_stats.clones[0];
+        let labels = typed_block_indices_by_label(caller);
+        let hot_block = block_by_label(caller, &labels, clone.hot_block)
+            .expect("hot constructor block should remain in the function");
+        assert!(matches!(
+            &hot_block.term,
+            BlockTerm::Jump(edge) if edge.target == clone.cloned_entry
+        ));
+        assert!(
+            labels.contains_key(&clone.original_entry),
+            "generic fallback should still use the original successor graph"
+        );
+        assert!(
+            labels.contains_key(&clone.cloned_entry),
+            "hot constructor path should jump into the cloned successor graph"
+        );
+        assert_eq!(
+            split_typed_constructor_hot_continuations(caller, &module_constants).cloned_blocks,
+            0,
+            "a hot constructor path whose successor is already private should not be cloned again"
+        );
     }
 
     #[test]
