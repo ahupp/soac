@@ -18,14 +18,14 @@ use soac_ir_blockpy::{
 use soac_ir_typed::emit_v3::MechanicalExitKind;
 use soac_ir_typed::plan_v3::Rep;
 use soac_ir_typed::{
-    BoolFacts, FactStore, InstrTyped, PyObjFacts, TypedAttrAccessPlan, TypedBlock, TypedBlockExtra,
-    TypedBlockPyModuleShape, TypedCall, TypedCallAccessPlan, TypedCallEmissionPlan,
-    TypedCallEmissionPlans, TypedConstructorInitPlan, TypedConstructorInitPlanSource,
-    TypedDirectCallArgPlan, TypedDirectCallArgSource, TypedDirectCallGuardTest,
-    TypedDirectCallGuardTestKind, TypedDirectCallableCall, TypedDirectCallableCallGuard,
-    TypedDirectMethodCall, TypedDirectMethodCallGuard, TypedGetAttr, TypedGuardedCallableCall,
-    TypedGuardedMethodCall, TypedPlannedResult, TypedPyObjectOwnershipPlan, TypedResultDemand,
-    TypedSetAttr, TypedTruthy, ValueFacts,
+    BoolFacts, FactStore, InstrTyped, PyObjFacts, TypedAttrAccessPlan, TypedAttrOwnerRef,
+    TypedBlock, TypedBlockExtra, TypedBlockPyModuleShape, TypedCall, TypedCallAccessPlan,
+    TypedCallEmissionPlan, TypedCallEmissionPlans, TypedConstructorInitPlan,
+    TypedConstructorInitPlanSource, TypedDirectCallArgPlan, TypedDirectCallArgSource,
+    TypedDirectCallGuardTest, TypedDirectCallGuardTestKind, TypedDirectCallableCall,
+    TypedDirectCallableCallGuard, TypedDirectMethodCall, TypedDirectMethodCallGuard, TypedGetAttr,
+    TypedGuardedCallableCall, TypedGuardedMethodCall, TypedPlannedResult,
+    TypedPyObjectOwnershipPlan, TypedResultDemand, TypedSetAttr, TypedTruthy, ValueFacts,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -740,6 +740,43 @@ pub struct TypedFieldScalarizationStats {
     pub scalar_slots: usize,
     pub inserted_scalar_stores: usize,
     pub rewritten_loads: usize,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct TypedVirtualConstructorPlan {
+    pub source: InstrId,
+    pub root: ResolvedName,
+    pub materialization_block: BlockLabel,
+    pub materialization_index: usize,
+    pub reachable_blocks: HashSet<BlockLabel>,
+    pub virtual_locations: HashSet<LocalLocation>,
+    pub virtual_names: HashSet<String>,
+    pub assumed_owner_type: Option<TypedAttrOwnerRef>,
+    pub guard_blocks: HashSet<BlockLabel>,
+}
+
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct TypedVirtualConstructorStats {
+    pub planned_objects: usize,
+    pub removed_materializations: usize,
+    pub removed_field_stores: usize,
+    pub removed_alias_stores: usize,
+    pub removed_dels: usize,
+    pub removed_guards: usize,
+    pub removed_block_params: usize,
+    pub removed_block_args: usize,
+}
+
+impl TypedVirtualConstructorStats {
+    pub fn changed(&self) -> bool {
+        self.removed_materializations != 0
+            || self.removed_field_stores != 0
+            || self.removed_alias_stores != 0
+            || self.removed_dels != 0
+            || self.removed_guards != 0
+            || self.removed_block_params != 0
+            || self.removed_block_args != 0
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -2123,12 +2160,24 @@ pub fn scalarize_typed_hot_constructor_field_loads(
     module_constants: &[ConstantExpr],
     constructor_field_bindings: &HashMap<InstrId, TypedConstructorFieldBindings>,
 ) -> TypedFieldScalarizationStats {
+    let mut constructor_field_bindings = constructor_field_bindings.clone();
+    scalarize_typed_hot_constructor_field_loads_with_bindings(
+        function,
+        module_constants,
+        &mut constructor_field_bindings,
+    )
+}
+
+pub fn scalarize_typed_hot_constructor_field_loads_with_bindings(
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+    module_constants: &[ConstantExpr],
+    constructor_field_bindings: &mut HashMap<InstrId, TypedConstructorFieldBindings>,
+) -> TypedFieldScalarizationStats {
     if constructor_field_bindings.is_empty() {
         return TypedFieldScalarizationStats::default();
     }
-    let mut constructor_field_bindings = constructor_field_bindings.clone();
     let scalar_slots =
-        allocate_typed_constructor_field_scalar_slots(function, &mut constructor_field_bindings);
+        allocate_typed_constructor_field_scalar_slots(function, constructor_field_bindings);
     let predecessors = typed_normal_block_predecessors(function);
     let mut in_states = vec![None::<TypedFieldScalarState>; function.blocks.len()];
     let mut out_states = vec![None::<TypedFieldScalarState>; function.blocks.len()];
@@ -2155,7 +2204,7 @@ pub fn scalarize_typed_hot_constructor_field_loads(
                     &mut block_clone,
                     &mut out_state,
                     module_constants,
-                    &constructor_field_bindings,
+                    constructor_field_bindings,
                     &mut ignored_stats,
                     false,
                 );
@@ -2185,12 +2234,544 @@ pub fn scalarize_typed_hot_constructor_field_loads(
             block,
             &mut state,
             module_constants,
-            &constructor_field_bindings,
+            constructor_field_bindings,
             &mut stats,
             true,
         );
     }
     stats
+}
+
+pub fn plan_typed_virtual_constructors(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    module_constants: &[ConstantExpr],
+    constructor_field_bindings: &HashMap<InstrId, TypedConstructorFieldBindings>,
+) -> Vec<TypedVirtualConstructorPlan> {
+    if constructor_field_bindings.is_empty() {
+        return Vec::new();
+    }
+    let labels = typed_block_indices_by_label(function);
+    let predecessors = typed_block_predecessors(function);
+    let mut plans = Vec::new();
+    for block in &function.blocks {
+        for (instr_index, instr) in block.body.iter().enumerate() {
+            let Some((source, root, bindings)) =
+                typed_virtual_constructor_materialization(instr, constructor_field_bindings)
+            else {
+                continue;
+            };
+            if bindings.fields.iter().any(|field| field.scalar.is_none()) {
+                continue;
+            }
+            let Some(root_location) = root.local_location() else {
+                continue;
+            };
+            let BlockTerm::Jump(edge) = &block.term else {
+                continue;
+            };
+            let Some(reachable) = typed_hot_reachable_block_labels(function, &labels, edge.target)
+            else {
+                continue;
+            };
+            if reachable.contains(&block.label)
+                || reachable.len() > MAX_TYPED_HOT_CONTINUATION_CLONE_BLOCKS
+                || !typed_reachable_subgraph_has_external_predecessor(
+                    &reachable,
+                    &predecessors,
+                    block.label,
+                )
+            {
+                continue;
+            }
+            let mut plan = TypedVirtualConstructorPlan {
+                source,
+                root: root.clone(),
+                materialization_block: block.label,
+                materialization_index: instr_index,
+                reachable_blocks: reachable,
+                virtual_locations: HashSet::from([root_location]),
+                virtual_names: HashSet::from([root.id_str().to_string()]),
+                assumed_owner_type: None,
+                guard_blocks: HashSet::new(),
+            };
+            if complete_typed_virtual_constructor_plan(
+                function,
+                module_constants,
+                bindings,
+                &mut plan,
+            ) {
+                plans.push(plan);
+            }
+        }
+    }
+    plans
+}
+
+pub fn virtualize_typed_hot_constructor_objects(
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+    module_constants: &[ConstantExpr],
+    constructor_field_bindings: &HashMap<InstrId, TypedConstructorFieldBindings>,
+) -> TypedVirtualConstructorStats {
+    let plans =
+        plan_typed_virtual_constructors(function, module_constants, constructor_field_bindings);
+    let mut stats = TypedVirtualConstructorStats {
+        planned_objects: plans.len(),
+        ..TypedVirtualConstructorStats::default()
+    };
+    if plans.is_empty() {
+        return stats;
+    }
+    let param_removals = typed_virtual_constructor_param_removals(function, &plans);
+    for block in &mut function.blocks {
+        if let Some(remove) = param_removals.get(&block.label) {
+            let before = block.params.len();
+            block.params = block
+                .params
+                .iter()
+                .enumerate()
+                .filter_map(|(index, param)| (!remove.contains(&index)).then_some(param.clone()))
+                .collect();
+            stats.removed_block_params += before.saturating_sub(block.params.len());
+        }
+    }
+    for block in &mut function.blocks {
+        rewrite_typed_virtual_constructor_edges(block, &param_removals, &mut stats);
+    }
+    for block in &mut function.blocks {
+        rewrite_typed_virtual_constructor_block(
+            block,
+            module_constants,
+            constructor_field_bindings,
+            &plans,
+            &mut stats,
+        );
+    }
+    stats
+}
+
+fn typed_virtual_constructor_materialization<'a>(
+    instr: &'a InstrTyped,
+    constructor_field_bindings: &'a HashMap<InstrId, TypedConstructorFieldBindings>,
+) -> Option<(InstrId, &'a ResolvedName, &'a TypedConstructorFieldBindings)> {
+    let InstrTyped::Store(store) = instr else {
+        return None;
+    };
+    let InstrTyped::CallTyped(call) = store.value.as_ref() else {
+        return None;
+    };
+    let instr_id = call.try_semantic_instr_id()?;
+    let bindings = constructor_field_bindings.get(&instr_id)?;
+    Some((instr_id, &store.name, bindings))
+}
+
+fn complete_typed_virtual_constructor_plan(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    module_constants: &[ConstantExpr],
+    bindings: &TypedConstructorFieldBindings,
+    plan: &mut TypedVirtualConstructorPlan,
+) -> bool {
+    loop {
+        let before_locations = plan.virtual_locations.len();
+        let before_names = plan.virtual_names.len();
+        for block in &function.blocks {
+            if !typed_virtual_constructor_plan_covers_block(plan, block.label) {
+                continue;
+            }
+            let start = if block.label == plan.materialization_block {
+                plan.materialization_index + 1
+            } else {
+                0
+            };
+            for instr in block.body.iter().skip(start) {
+                if !scan_typed_virtual_constructor_instr(
+                    function,
+                    module_constants,
+                    bindings,
+                    plan,
+                    instr,
+                ) {
+                    return false;
+                }
+            }
+            if !scan_typed_virtual_constructor_term(function, bindings, plan, block) {
+                return false;
+            }
+            if let Some(edge) = &block.exc_edge
+                && !scan_typed_virtual_constructor_edge(function, plan, edge)
+            {
+                return false;
+            }
+        }
+        if plan.virtual_locations.len() == before_locations
+            && plan.virtual_names.len() == before_names
+        {
+            break;
+        }
+    }
+    true
+}
+
+fn typed_virtual_constructor_plan_covers_block(
+    plan: &TypedVirtualConstructorPlan,
+    label: BlockLabel,
+) -> bool {
+    label == plan.materialization_block || plan.reachable_blocks.contains(&label)
+}
+
+fn scan_typed_virtual_constructor_instr(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    module_constants: &[ConstantExpr],
+    bindings: &TypedConstructorFieldBindings,
+    plan: &mut TypedVirtualConstructorPlan,
+    instr: &InstrTyped,
+) -> bool {
+    match instr {
+        InstrTyped::Store(store) => {
+            if typed_virtual_constructor_alias_store(function, plan, store) {
+                return true;
+            }
+            !typed_expr_uses_virtual_constructor_identity(store.value.as_ref(), plan)
+                && !typed_resolved_name_is_virtual_constructor(&store.name, plan)
+        }
+        InstrTyped::Del(del) if typed_resolved_name_is_virtual_constructor(&del.name, plan) => true,
+        InstrTyped::SetAttrTyped(op)
+            if typed_virtual_constructor_field_store(op, module_constants, bindings, plan) =>
+        {
+            !typed_expr_uses_virtual_constructor_identity(op.attr.as_ref(), plan)
+                && !typed_expr_uses_virtual_constructor_identity(op.replacement.as_ref(), plan)
+        }
+        _ => !typed_expr_uses_virtual_constructor_identity(instr, plan),
+    }
+}
+
+fn scan_typed_virtual_constructor_term(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    bindings: &TypedConstructorFieldBindings,
+    plan: &mut TypedVirtualConstructorPlan,
+    block: &TypedBlock,
+) -> bool {
+    let term_ok = match &block.term {
+        BlockTerm::IfTerm(if_term) => {
+            if let InstrTyped::DirectCallGuardTest(guard) = &if_term.test
+                && typed_expr_is_virtual_constructor_load(guard.value.as_ref(), plan)
+            {
+                let TypedDirectCallGuardTestKind::ExactTypeVersion { owner_type_ref, .. } =
+                    &guard.kind
+                else {
+                    return false;
+                };
+                if plan
+                    .assumed_owner_type
+                    .as_ref()
+                    .is_some_and(|existing| existing != owner_type_ref)
+                {
+                    return false;
+                }
+                plan.assumed_owner_type = Some(owner_type_ref.clone());
+                plan.guard_blocks.insert(block.label);
+                return true;
+            }
+            !typed_expr_uses_virtual_constructor_identity(&if_term.test, plan)
+        }
+        BlockTerm::Jump(edge) => scan_typed_virtual_constructor_edge(function, plan, edge),
+        BlockTerm::BranchTable(branch) => {
+            !typed_expr_uses_virtual_constructor_identity(&branch.index, plan)
+        }
+        BlockTerm::Raise(raise) => raise
+            .exc
+            .as_ref()
+            .is_none_or(|exc| !typed_expr_uses_virtual_constructor_identity(exc, plan)),
+        BlockTerm::Return(value) => !typed_expr_uses_virtual_constructor_identity(value, plan),
+    };
+    term_ok && bindings.fields.iter().all(|field| field.scalar.is_some())
+}
+
+fn scan_typed_virtual_constructor_edge(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    plan: &mut TypedVirtualConstructorPlan,
+    edge: &BlockEdge,
+) -> bool {
+    for arg in &edge.args {
+        if let BlockArg::Name(name) = arg
+            && plan.virtual_names.contains(name)
+            && !plan.reachable_blocks.contains(&edge.target)
+        {
+            return false;
+        }
+    }
+    let Some(target) = function
+        .blocks
+        .iter()
+        .find(|block| block.label == edge.target)
+    else {
+        return true;
+    };
+    for (index, arg) in edge.args.iter().enumerate() {
+        let BlockArg::Name(name) = arg else {
+            continue;
+        };
+        if !plan.virtual_names.contains(name) {
+            continue;
+        }
+        let Some(param) = target.params.get(index) else {
+            continue;
+        };
+        if param.role != BlockParamRole::Value {
+            return false;
+        }
+        plan.virtual_names.insert(param.name.clone());
+        if let Some(location) = typed_local_location_for_name(function, &param.name) {
+            plan.virtual_locations.insert(location);
+        }
+    }
+    true
+}
+
+fn typed_virtual_constructor_alias_store(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    plan: &mut TypedVirtualConstructorPlan,
+    store: &Store<InstrTyped>,
+) -> bool {
+    if !typed_expr_is_virtual_constructor_load(store.value.as_ref(), plan) {
+        return false;
+    }
+    let Some(location) = store.name.local_location() else {
+        return false;
+    };
+    plan.virtual_locations.insert(location);
+    plan.virtual_names.insert(store.name.id_str().to_string());
+    if let Some(location) = typed_local_location_for_name(function, store.name.id_str()) {
+        plan.virtual_locations.insert(location);
+    }
+    true
+}
+
+fn typed_virtual_constructor_field_store(
+    op: &TypedSetAttr<InstrTyped>,
+    module_constants: &[ConstantExpr],
+    bindings: &TypedConstructorFieldBindings,
+    plan: &TypedVirtualConstructorPlan,
+) -> bool {
+    if !typed_expr_is_virtual_constructor_load(op.value.as_ref(), plan)
+        || !typed_attr_access_is_indexed_field(&op.access)
+    {
+        return false;
+    }
+    let Some(field_name) = typed_constant_string(op.attr.as_ref(), module_constants) else {
+        return false;
+    };
+    bindings
+        .fields
+        .iter()
+        .any(|field| field.field_name == field_name && field.scalar.is_some())
+}
+
+fn typed_expr_is_virtual_constructor_load(
+    expr: &InstrTyped,
+    plan: &TypedVirtualConstructorPlan,
+) -> bool {
+    let InstrTyped::Load(load) = expr else {
+        return false;
+    };
+    typed_resolved_name_is_virtual_constructor(&load.name, plan)
+}
+
+fn typed_resolved_name_is_virtual_constructor(
+    name: &ResolvedName,
+    plan: &TypedVirtualConstructorPlan,
+) -> bool {
+    name.local_location()
+        .is_some_and(|location| plan.virtual_locations.contains(&location))
+        || plan.virtual_names.contains(name.id_str())
+}
+
+fn typed_expr_uses_virtual_constructor_identity(
+    expr: &InstrTyped,
+    plan: &TypedVirtualConstructorPlan,
+) -> bool {
+    struct Finder<'a> {
+        plan: &'a TypedVirtualConstructorPlan,
+        found: bool,
+    }
+
+    impl Visit<InstrTyped> for Finder<'_> {
+        fn visit_instr(&mut self, expr: &InstrTyped) {
+            if self.found {
+                return;
+            }
+            if typed_expr_is_virtual_constructor_load(expr, self.plan) {
+                self.found = true;
+                return;
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    let mut finder = Finder { plan, found: false };
+    finder.visit_instr(expr);
+    finder.found
+}
+
+fn typed_local_location_for_name(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    name: &str,
+) -> Option<LocalLocation> {
+    let layout = function.storage_layout.as_ref()?;
+    layout
+        .stack_slots()
+        .iter()
+        .position(|slot_name| slot_name == name)
+        .map(|slot| {
+            LocalLocation(
+                u32::try_from(slot).expect("stack slot index should fit in LocalLocation"),
+            )
+        })
+}
+
+fn typed_virtual_constructor_param_removals(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    plans: &[TypedVirtualConstructorPlan],
+) -> HashMap<BlockLabel, HashSet<usize>> {
+    let mut removals = HashMap::<BlockLabel, HashSet<usize>>::new();
+    for block in &function.blocks {
+        for plan in plans {
+            if !plan.reachable_blocks.contains(&block.label) {
+                continue;
+            }
+            for (index, param) in block.params.iter().enumerate() {
+                if param.role == BlockParamRole::Value && plan.virtual_names.contains(&param.name) {
+                    removals.entry(block.label).or_default().insert(index);
+                }
+            }
+        }
+    }
+    removals
+}
+
+fn rewrite_typed_virtual_constructor_edges(
+    block: &mut TypedBlock,
+    param_removals: &HashMap<BlockLabel, HashSet<usize>>,
+    stats: &mut TypedVirtualConstructorStats,
+) {
+    match &mut block.term {
+        BlockTerm::Jump(edge) => {
+            stats.removed_block_args += rewrite_typed_virtual_constructor_edge(edge, param_removals)
+        }
+        BlockTerm::IfTerm(_)
+        | BlockTerm::BranchTable(_)
+        | BlockTerm::Raise(_)
+        | BlockTerm::Return(_) => {}
+    }
+    if let Some(edge) = &mut block.exc_edge {
+        stats.removed_block_args += rewrite_typed_virtual_constructor_edge(edge, param_removals);
+    }
+}
+
+fn rewrite_typed_virtual_constructor_edge(
+    edge: &mut BlockEdge,
+    param_removals: &HashMap<BlockLabel, HashSet<usize>>,
+) -> usize {
+    let Some(remove) = param_removals.get(&edge.target) else {
+        return 0;
+    };
+    let before = edge.args.len();
+    edge.args = edge
+        .args
+        .iter()
+        .enumerate()
+        .filter_map(|(index, arg)| (!remove.contains(&index)).then_some(arg.clone()))
+        .collect();
+    before.saturating_sub(edge.args.len())
+}
+
+fn rewrite_typed_virtual_constructor_block(
+    block: &mut TypedBlock,
+    module_constants: &[ConstantExpr],
+    constructor_field_bindings: &HashMap<InstrId, TypedConstructorFieldBindings>,
+    plans: &[TypedVirtualConstructorPlan],
+    stats: &mut TypedVirtualConstructorStats,
+) {
+    let old_body = std::mem::take(&mut block.body);
+    let mut new_body = Vec::with_capacity(old_body.len());
+    for (instr_index, instr) in old_body.into_iter().enumerate() {
+        if typed_virtual_constructor_should_remove_instr(
+            block.label,
+            instr_index,
+            &instr,
+            module_constants,
+            constructor_field_bindings,
+            plans,
+            stats,
+        ) {
+            continue;
+        }
+        new_body.push(instr);
+    }
+    block.body = new_body;
+    let guard_then_label = match &block.term {
+        BlockTerm::IfTerm(if_term)
+            if plans
+                .iter()
+                .any(|plan| plan.guard_blocks.contains(&block.label)) =>
+        {
+            Some(if_term.then_label)
+        }
+        _ => None,
+    };
+    if let Some(then_label) = guard_then_label {
+        block.term = BlockTerm::Jump(BlockEdge::new(then_label));
+        stats.removed_guards += 1;
+    }
+}
+
+fn typed_virtual_constructor_should_remove_instr(
+    label: BlockLabel,
+    instr_index: usize,
+    instr: &InstrTyped,
+    module_constants: &[ConstantExpr],
+    constructor_field_bindings: &HashMap<InstrId, TypedConstructorFieldBindings>,
+    plans: &[TypedVirtualConstructorPlan],
+    stats: &mut TypedVirtualConstructorStats,
+) -> bool {
+    for plan in plans {
+        if label == plan.materialization_block
+            && instr_index == plan.materialization_index
+            && typed_virtual_constructor_materialization(instr, constructor_field_bindings)
+                .is_some_and(|(source, _, _)| source == plan.source)
+        {
+            stats.removed_materializations += 1;
+            return true;
+        }
+        if !typed_virtual_constructor_plan_covers_block(plan, label)
+            || (label == plan.materialization_block && instr_index <= plan.materialization_index)
+        {
+            continue;
+        }
+        match instr {
+            InstrTyped::Store(store)
+                if typed_expr_is_virtual_constructor_load(store.value.as_ref(), plan) =>
+            {
+                stats.removed_alias_stores += 1;
+                return true;
+            }
+            InstrTyped::Del(del) if typed_resolved_name_is_virtual_constructor(&del.name, plan) => {
+                stats.removed_dels += 1;
+                return true;
+            }
+            InstrTyped::SetAttrTyped(op)
+                if constructor_field_bindings
+                    .get(&plan.source)
+                    .is_some_and(|bindings| {
+                        typed_virtual_constructor_field_store(op, module_constants, bindings, plan)
+                    }) =>
+            {
+                stats.removed_field_stores += 1;
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 fn typed_field_scalar_in_state_for_block(
@@ -5557,6 +6138,70 @@ mod typed_codegen_tests {
         counter.count
     }
 
+    fn constructor_call_stores_in_virtual_plan(
+        function: &BlockPyFunction<TypedBlockPyModuleShape>,
+        module_constants: &[ConstantExpr],
+        plan: &TypedVirtualConstructorPlan,
+    ) -> usize {
+        function
+            .blocks
+            .iter()
+            .filter(|block| typed_virtual_constructor_plan_covers_block(plan, block.label))
+            .flat_map(|block| block.body.iter())
+            .filter(|instr| {
+                let InstrTyped::Store(store) = instr else {
+                    return false;
+                };
+                let InstrTyped::CallTyped(call) = store.value.as_ref() else {
+                    return false;
+                };
+                typed_expr_is_runtime_name_load(
+                    call.func.as_ref(),
+                    RuntimeName::ConstructorCall,
+                    module_constants,
+                )
+            })
+            .count()
+    }
+
+    fn setattrs_for_field_in_virtual_plan(
+        function: &BlockPyFunction<TypedBlockPyModuleShape>,
+        module_constants: &[ConstantExpr],
+        plan: &TypedVirtualConstructorPlan,
+        field_name: &str,
+    ) -> usize {
+        function
+            .blocks
+            .iter()
+            .filter(|block| typed_virtual_constructor_plan_covers_block(plan, block.label))
+            .flat_map(|block| block.body.iter())
+            .filter(|instr| {
+                let InstrTyped::SetAttrTyped(op) = instr else {
+                    return false;
+                };
+                typed_constant_string(op.attr.as_ref(), module_constants) == Some(field_name)
+            })
+            .count()
+    }
+
+    fn direct_call_guards_in_virtual_plan(
+        function: &BlockPyFunction<TypedBlockPyModuleShape>,
+        plan: &TypedVirtualConstructorPlan,
+    ) -> usize {
+        function
+            .blocks
+            .iter()
+            .filter(|block| typed_virtual_constructor_plan_covers_block(plan, block.label))
+            .filter(|block| {
+                matches!(
+                    &block.term,
+                    BlockTerm::IfTerm(if_term)
+                        if matches!(if_term.test, InstrTyped::DirectCallGuardTest(_))
+                )
+            })
+            .count()
+    }
+
     fn typed_test_local(name: &str, location: LocalLocation) -> ResolvedName {
         ResolvedName {
             id: name.to_string().into(),
@@ -7007,7 +7652,7 @@ def caller(i):\n    it = IterRange(0, i, 1)\n    total = 0\n    while True:\n   
             !constructor_hot_state_cleanup_labels.is_empty(),
             "constructor-entry inline should mark hot-state cleanup for continuation splitting"
         );
-        let constructor_field_bindings = typed_constructor_field_bindings_from_inline_stats(
+        let mut constructor_field_bindings = typed_constructor_field_bindings_from_inline_stats(
             &callee_module,
             &inline_plan,
             &module_constants,
@@ -7113,10 +7758,10 @@ def caller(i):\n    it = IterRange(0, i, 1)\n    total = 0\n    while True:\n   
             "hot-state split should clone the hot loop containing __next__ field loads"
         );
 
-        let scalar_stats = scalarize_typed_hot_constructor_field_loads(
+        let scalar_stats = scalarize_typed_hot_constructor_field_loads_with_bindings(
             caller,
             &module_constants,
-            &constructor_field_bindings,
+            &mut constructor_field_bindings,
         );
         assert_eq!(scalar_stats.seeded_objects, 1);
         assert_eq!(scalar_stats.scalar_slots, 3);
@@ -7136,6 +7781,53 @@ def caller(i):\n    it = IterRange(0, i, 1)\n    total = 0\n    while True:\n   
                 })
             }),
             "at least one hot iterator loop clone should use scalar state for current/stop/step"
+        );
+        let virtual_plans =
+            plan_typed_virtual_constructors(caller, &module_constants, &constructor_field_bindings);
+        let virtual_plan = virtual_plans
+            .iter()
+            .find(|plan| {
+                constructor_call_stores_in_virtual_plan(caller, &module_constants, plan) > 0
+                    && direct_call_guards_in_virtual_plan(caller, plan) > 0
+            })
+            .cloned()
+            .expect("hot cloned iterator path should have a virtual constructor candidate");
+        assert!(
+            setattrs_for_field_in_virtual_plan(caller, &module_constants, &virtual_plan, "current")
+                > 0,
+            "before virtualizing, the hot iterator clone should still store current on the object"
+        );
+        let virtual_stats = virtualize_typed_hot_constructor_objects(
+            caller,
+            &module_constants,
+            &constructor_field_bindings,
+        );
+        assert!(
+            virtual_stats.removed_materializations >= 1,
+            "virtual constructor pass should remove the IterRange allocation: {virtual_stats:?}"
+        );
+        assert!(
+            virtual_stats.removed_field_stores >= 1,
+            "virtual constructor pass should remove scalarized field stores on the virtual object: {virtual_stats:?}"
+        );
+        assert!(
+            virtual_stats.removed_guards >= 1,
+            "virtual constructor pass should remove redundant method guards on the virtual object: {virtual_stats:?}"
+        );
+        assert_eq!(
+            constructor_call_stores_in_virtual_plan(caller, &module_constants, &virtual_plan),
+            0,
+            "the virtualized hot iterator path should not materialize IterRange"
+        );
+        assert_eq!(
+            setattrs_for_field_in_virtual_plan(caller, &module_constants, &virtual_plan, "current"),
+            0,
+            "the virtualized hot iterator path should update current through scalar state only"
+        );
+        assert_eq!(
+            direct_call_guards_in_virtual_plan(caller, &virtual_plan),
+            0,
+            "the virtualized hot iterator path should not need object-identity method guards"
         );
     }
 

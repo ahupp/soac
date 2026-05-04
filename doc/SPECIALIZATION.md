@@ -577,6 +577,14 @@ they return. The JIT should not compute an inline plan to decide whether to skip
 `__init__`; it should only lower the operation shape already selected by the v3
 plan and embedded in the typed module.
 
+After typed direct-call inlining, constructor field scalarization can also plan a
+private hot-path virtual constructor. The rewrite is only selected for a cloned
+hot continuation where the constructed local no longer has an identity use: field
+loads have been replaced with scalar locals, scalarized field stores can be
+dropped, cleanup deletes can be removed, and exact-type direct-call guards on
+the same virtual object can be proven redundant. The generic fallback path keeps
+the original materialized object behavior.
+
 ## Operation Specializations
 
 SOAC keeps operation-level specializations in

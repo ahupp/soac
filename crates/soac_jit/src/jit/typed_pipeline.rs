@@ -39,12 +39,13 @@ use soac_opt::passes::{
     TypedInlineLocalMapping, inline_typed_function_direct_call_stores_with_external_callees,
     lower_typed_function_call_emission_plans, plan_module_inlining,
     refresh_typed_function_value_facts, rewrite_typed_stop_iteration_raises_to_handler_jumps,
-    scalarize_typed_hot_constructor_field_loads, split_typed_alias_hot_continuations_with_budget,
+    scalarize_typed_hot_constructor_field_loads_with_bindings,
+    split_typed_alias_hot_continuations_with_budget,
     split_typed_constructor_hot_continuations_with_budget,
     split_typed_inline_cleanup_hot_continuations_for_labels_with_budget, summarize_module_escapes,
     typed_constructor_field_bindings_from_inline_stats_with_external_callees,
     typed_constructor_init_plans_from_inline_stats_with_external_callees,
-    validate_typed_function_value_facts,
+    validate_typed_function_value_facts, virtualize_typed_hot_constructor_objects,
 };
 use soac_opt::region_emission_v3::{
     ExactIntBranchSelection as OptV3ExactIntBranchSelection,
@@ -2172,12 +2173,22 @@ fn apply_typed_v3_module_rewrites(
             constructor_init_plans.get(&function.function_id),
         )?;
         if let Some(bindings) = constructor_field_bindings.get(&function.function_id) {
-            let stats = scalarize_typed_hot_constructor_field_loads(
+            let mut bindings = bindings.clone();
+            let stats = scalarize_typed_hot_constructor_field_loads_with_bindings(
                 function,
                 &module.module_constants,
-                bindings,
+                &mut bindings,
             );
             if stats.rewritten_loads != 0 || stats.inserted_scalar_stores != 0 {
+                assign_missing_typed_function_instr_ids(function);
+                refresh_typed_function_value_facts(function);
+            }
+            let stats = virtualize_typed_hot_constructor_objects(
+                function,
+                &module.module_constants,
+                &bindings,
+            );
+            if stats.changed() {
                 assign_missing_typed_function_instr_ids(function);
                 refresh_typed_function_value_facts(function);
             }
