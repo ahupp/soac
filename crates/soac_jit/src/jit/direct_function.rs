@@ -39,6 +39,7 @@ impl DirectCallArgPlan {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DirectCallArgSource {
     Provided(usize),
+    PackedRest { start: usize },
     DefaultSentinel,
 }
 
@@ -64,6 +65,9 @@ pub(super) fn direct_call_arg_plan_from_typed(plan: &TypedDirectCallArgPlan) -> 
             .iter()
             .map(|source| match source {
                 TypedDirectCallArgSource::Provided(index) => DirectCallArgSource::Provided(*index),
+                TypedDirectCallArgSource::PackedRest { start } => {
+                    DirectCallArgSource::PackedRest { start: *start }
+                }
                 TypedDirectCallArgSource::DefaultSentinel => DirectCallArgSource::DefaultSentinel,
             })
             .collect(),
@@ -234,8 +238,12 @@ pub(super) fn plan_direct_call_args_for_target<P: ModuleShape>(
         return Err(DirectCallIncompatibility::Keywords);
     }
 
+    let has_vararg = target_function
+        .params
+        .iter()
+        .any(|param| matches!(param.kind, ParamKind::VarArg));
     for param in target_function.params.iter() {
-        if matches!(param.kind, ParamKind::VarArg | ParamKind::KwArg) {
+        if matches!(param.kind, ParamKind::KwArg) {
             return Err(DirectCallIncompatibility::UnsupportedParameterKind { kind: param.kind });
         }
     }
@@ -247,7 +255,7 @@ pub(super) fn plan_direct_call_args_for_target<P: ModuleShape>(
         .iter()
         .filter(|param| matches!(param.kind, ParamKind::PosOnly | ParamKind::Any))
         .count();
-    if provided_positional_arg_count > accepted_positional_arg_count {
+    if !has_vararg && provided_positional_arg_count > accepted_positional_arg_count {
         return Err(DirectCallIncompatibility::TooManyPositionalArguments {
             provided: provided_positional_arg_count,
             accepted: accepted_positional_arg_count,
@@ -275,8 +283,14 @@ pub(super) fn plan_direct_call_args_for_target<P: ModuleShape>(
                     return Err(DirectCallIncompatibility::MissingRequiredArgument);
                 }
             }
-            ParamKind::VarArg | ParamKind::KwArg => unreachable!(
-                "unsupported variadic params should be rejected before planning direct-call args"
+            ParamKind::VarArg => {
+                sources.push(DirectCallArgSource::PackedRest {
+                    start: next_provided_arg,
+                });
+                next_provided_arg = provided_positional_arg_count;
+            }
+            ParamKind::KwArg => unreachable!(
+                "unsupported variadic keyword params should be rejected before planning direct-call args"
             ),
         }
     }

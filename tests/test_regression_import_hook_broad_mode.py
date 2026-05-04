@@ -810,6 +810,7 @@ def test_import_hook_can_transform_soac_runtime_in_fresh_process(monkeypatch, tm
     script = """
 import sys
 import ctypes
+import _testinternalcapi
 
 assert "soac.runtime" not in sys.modules
 from soac import import_hook
@@ -819,6 +820,7 @@ import soac.runtime as runtime
 
 assert runtime._SOAC_RUNTIME_READY is True
 assert isinstance(runtime.__spec__.loader, import_hook.SoacLoader)
+assert _testinternalcapi.has_indexed_values(runtime.__dict__)
 for name in ("globals", "locals", "eval", "exec"):
     try:
         getattr(runtime, name)()

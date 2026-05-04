@@ -22,6 +22,7 @@ use tracing::{info, trace};
 
 pub(crate) const SOAC_JIT_MAKE_FUNCTION_WITH_CLOSURE_SYMBOL: &str =
     "soac_jit_make_function_with_closure";
+const MAX_COUNTERED_SOURCE_RUNTIME_HELPER_BLOCKS: usize = 17;
 
 unsafe extern "C" {
     static mut PyCell_Type: ffi::PyTypeObject;
@@ -738,11 +739,22 @@ fn instantiate_bb_function_inner(
     annotate_fn: &Bound<'_, PyAny>,
     module_runtime: &ModuleRuntimeContext,
 ) -> PyResult<Py<PyAny>> {
-    let keep_source_runtime_helper = module_name == "soac.runtime"
-        && module_runtime
-            .shared_module_state_owner
-            .lookup_original_code(function.function_id)
-            .is_some();
+    let records_specialization_counters = module_runtime
+        .compile_session
+        .env_config()
+        .map_err(PyRuntimeError::new_err)?
+        .specialization_mode()
+        .is_some_and(|mode| mode.records_counters());
+    let has_original_runtime_code = module_runtime
+        .shared_module_state_owner
+        .lookup_original_code(function.function_id)
+        .is_some();
+    let keep_source_runtime_helper = keep_source_runtime_helper_vectorcall(
+        module_name,
+        function.blocks.len(),
+        has_original_runtime_code,
+        records_specialization_counters,
+    );
     let instantiated_entry = instantiate_closure_backed_entry(
         py,
         dp,
@@ -772,10 +784,12 @@ fn instantiate_bb_function_inner(
     )?;
     entry.setattr("__module__", module_name)?;
     // soac.runtime's source helpers are the runtime ABI for other transformed
-    // modules. Keep them on their source implementation so calls from generated
-    // code do not implicitly replace their vectorcall entry. Still attach full
-    // direct-call metadata so profiled generated code can explicitly compile
-    // and call runtime class methods such as range.__iter__ and IterRange.__next__.
+    // modules. Keep them on their source implementation outside countered
+    // specialization runs so calls from generated code do not implicitly
+    // replace their vectorcall entry. In profile/verify mode, small transformed
+    // helper bodies can run so their own call-site counters feed later
+    // cross-module inline decisions, while larger bootstrap helpers stay on the
+    // source path.
     if keep_source_runtime_helper {
         let owned_runtime =
             unsafe { clone_module_runtime_context(module_runtime) }.map_err(|_| {
@@ -809,6 +823,21 @@ fn instantiate_bb_function_inner(
         register_jit_vectorcall(py, &entry, function.function_id, module_runtime)?;
     }
     Ok(entry.unbind())
+}
+
+fn keep_source_runtime_helper_vectorcall(
+    module_name: &str,
+    block_count: usize,
+    has_original_runtime_code: bool,
+    records_specialization_counters: bool,
+) -> bool {
+    if module_name != "soac.runtime" || !has_original_runtime_code {
+        return false;
+    }
+    if !records_specialization_counters {
+        return true;
+    }
+    block_count > MAX_COUNTERED_SOURCE_RUNTIME_HELPER_BLOCKS
 }
 
 fn original_generator_entry_can_use_cpython_vectorcall(
@@ -1181,5 +1210,58 @@ pub unsafe extern "C" fn soac_jit_make_function_with_closure(
             set_runtime_error("panic in soac_jit_make_function_with_closure");
             std::ptr::null_mut()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        MAX_COUNTERED_SOURCE_RUNTIME_HELPER_BLOCKS, keep_source_runtime_helper_vectorcall,
+    };
+
+    #[test]
+    fn source_runtime_helpers_keep_cpython_vectorcall_outside_counter_modes() {
+        assert!(keep_source_runtime_helper_vectorcall(
+            "soac.runtime",
+            1,
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn small_source_runtime_helpers_use_transformed_vectorcall_in_counter_modes() {
+        assert!(!keep_source_runtime_helper_vectorcall(
+            "soac.runtime",
+            MAX_COUNTERED_SOURCE_RUNTIME_HELPER_BLOCKS,
+            true,
+            true
+        ));
+    }
+
+    #[test]
+    fn large_source_runtime_helpers_keep_cpython_vectorcall_in_counter_modes() {
+        assert!(keep_source_runtime_helper_vectorcall(
+            "soac.runtime",
+            MAX_COUNTERED_SOURCE_RUNTIME_HELPER_BLOCKS + 1,
+            true,
+            true
+        ));
+    }
+
+    #[test]
+    fn source_runtime_helper_policy_only_applies_to_original_runtime_code() {
+        assert!(!keep_source_runtime_helper_vectorcall(
+            "other.module",
+            1,
+            true,
+            false
+        ));
+        assert!(!keep_source_runtime_helper_vectorcall(
+            "soac.runtime",
+            1,
+            false,
+            false
+        ));
     }
 }

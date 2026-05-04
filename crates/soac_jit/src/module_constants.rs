@@ -52,28 +52,29 @@ pub struct ModuleCodegenConstants {
 
 impl ModuleCodegenConstants {
     pub fn collect_from_module(module: &BlockPyModule<BlockPyModuleShape>) -> Self {
-        Self::collect_from_module_with_runtime_prelude(module, true)
+        Self::collect_from_module_with_runtime_prelude(module, true, true)
     }
 
     pub fn collect_from_runtime_module(module: &BlockPyModule<BlockPyModuleShape>) -> Self {
-        Self::collect_from_module_with_runtime_prelude(module, true)
+        Self::collect_from_module_with_runtime_prelude(module, true, false)
     }
 
     pub fn collect_from_typed_module(module: &BlockPyModule<TypedBlockPyModuleShape>) -> Self {
-        Self::collect_from_typed_module_with_runtime_prelude(module, true)
+        Self::collect_from_typed_module_with_runtime_prelude(module, true, true)
     }
 
     pub fn collect_from_typed_runtime_module(
         module: &BlockPyModule<TypedBlockPyModuleShape>,
     ) -> Self {
-        Self::collect_from_typed_module_with_runtime_prelude(module, true)
+        Self::collect_from_typed_module_with_runtime_prelude(module, true, false)
     }
 
     fn collect_from_module_with_runtime_prelude(
         module: &BlockPyModule<BlockPyModuleShape>,
         include_runtime_name_prelude: bool,
+        runtime_name_load_constants: bool,
     ) -> Self {
-        let mut collector = ModuleConstantCollector::default();
+        let mut collector = ModuleConstantCollector::new(runtime_name_load_constants);
         for expr in &module.module_constants {
             collector.constants.push_explicit_constant_expr(expr);
         }
@@ -94,8 +95,9 @@ impl ModuleCodegenConstants {
     fn collect_from_typed_module_with_runtime_prelude(
         module: &BlockPyModule<TypedBlockPyModuleShape>,
         include_runtime_name_prelude: bool,
+        runtime_name_load_constants: bool,
     ) -> Self {
-        let mut collector = ModuleConstantCollector::default();
+        let mut collector = ModuleConstantCollector::new(runtime_name_load_constants);
         for expr in &module.module_constants {
             collector.constants.push_explicit_constant_expr(expr);
         }
@@ -116,7 +118,7 @@ impl ModuleCodegenConstants {
     pub fn collect_from_functions<'a>(
         functions: impl IntoIterator<Item = &'a BlockPyFunction<BlockPyModuleShape>>,
     ) -> Self {
-        let mut collector = ModuleConstantCollector::default();
+        let mut collector = ModuleConstantCollector::new(true);
         for name in ALWAYS_REQUIRED_UNICODE_CONSTANTS {
             collector.constants.intern_unicode_bytes(name.as_bytes());
         }
@@ -132,7 +134,7 @@ impl ModuleCodegenConstants {
     pub fn collect_from_typed_functions<'a>(
         functions: impl IntoIterator<Item = &'a BlockPyFunction<TypedBlockPyModuleShape>>,
     ) -> Self {
-        let mut collector = ModuleConstantCollector::default();
+        let mut collector = ModuleConstantCollector::new(true);
         for name in ALWAYS_REQUIRED_UNICODE_CONSTANTS {
             collector.constants.intern_unicode_bytes(name.as_bytes());
         }
@@ -248,10 +250,17 @@ impl ModuleCodegenConstants {
     pub fn require_runtime_name_constant_id(&self, value: &str) -> ModuleConstantId {
         let runtime_name = RuntimeName::from_name(value)
             .unwrap_or_else(|| panic!("unknown runtime-name module constant: {value}"));
-        self.lookup_id(&ModuleConstantValue::RuntimeName(runtime_name))
+        self.runtime_name_constant_id(runtime_name)
             .unwrap_or_else(|| {
                 panic!("missing runtime-name module constant in codegen pool: {value}")
             })
+    }
+
+    pub(crate) fn runtime_name_constant_id(
+        &self,
+        runtime_name: RuntimeName,
+    ) -> Option<ModuleConstantId> {
+        self.lookup_id(&ModuleConstantValue::RuntimeName(runtime_name))
     }
 
     pub fn constant_bytes_value(&self, constant_id: ModuleConstantId) -> Option<&[u8]> {
@@ -388,6 +397,7 @@ impl ModuleCodegenConstants {
 #[derive(Default)]
 struct ModuleConstantCollector {
     constants: ModuleCodegenConstants,
+    runtime_name_load_constants: bool,
 }
 
 fn should_include_in_locals_snapshot(name: &str) -> bool {
@@ -395,6 +405,13 @@ fn should_include_in_locals_snapshot(name: &str) -> bool {
 }
 
 impl ModuleConstantCollector {
+    fn new(runtime_name_load_constants: bool) -> Self {
+        Self {
+            constants: ModuleCodegenConstants::default(),
+            runtime_name_load_constants,
+        }
+    }
+
     fn collect_function(&mut self, function: &BlockPyFunction<BlockPyModuleShape>) {
         if let Some(storage_layout) = function.storage_layout() {
             for name in storage_layout.stack_slots() {
@@ -548,11 +565,21 @@ impl ModuleConstantCollector {
                 }
                 op.visit_children(self);
             }
-            InstrBlockPy::Load(op)
-                if op.name.location.is_global() || op.name.location.is_runtime_name() =>
-            {
+            InstrBlockPy::Load(op) if op.name.location.is_global() => {
                 self.constants
                     .intern_unicode_bytes(op.name.id_str().as_bytes());
+            }
+            InstrBlockPy::Load(op) if op.name.runtime_name_id().is_some() => {
+                let runtime_name = op
+                    .name
+                    .runtime_name_id()
+                    .expect("runtime-name load should carry a runtime name");
+                if self.runtime_name_load_constants {
+                    self.constants.intern_runtime_name(runtime_name);
+                } else {
+                    self.constants
+                        .intern_unicode_bytes(runtime_name.name().as_bytes());
+                }
             }
             InstrBlockPy::Load(op) if op.name.local_location().is_some() => {
                 self.constants
@@ -667,11 +694,21 @@ impl ModuleConstantCollector {
                 }
                 op.visit_children(self);
             }
-            InstrTyped::Load(op)
-                if op.name.location.is_global() || op.name.location.is_runtime_name() =>
-            {
+            InstrTyped::Load(op) if op.name.location.is_global() => {
                 self.constants
                     .intern_unicode_bytes(op.name.id_str().as_bytes());
+            }
+            InstrTyped::Load(op) if op.name.runtime_name_id().is_some() => {
+                let runtime_name = op
+                    .name
+                    .runtime_name_id()
+                    .expect("runtime-name load should carry a runtime name");
+                if self.runtime_name_load_constants {
+                    self.constants.intern_runtime_name(runtime_name);
+                } else {
+                    self.constants
+                        .intern_unicode_bytes(runtime_name.name().as_bytes());
+                }
             }
             InstrTyped::Load(op) if op.name.local_location().is_some() => {
                 self.constants

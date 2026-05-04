@@ -1648,6 +1648,7 @@ const MODULE_DICT_METADATA_NAMES: &[&str] = &[
     "__file__",
     "__cached__",
     "__path__",
+    "exec",
 ];
 
 static SOAC_INDEXED_MODULE_TYPE: PyOnceLock<Py<PyAny>> = PyOnceLock::new();

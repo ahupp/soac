@@ -5,9 +5,10 @@ use super::planning::{
 };
 use super::{SpecializationProfile, annotate_typed_profiled_cold_blocks};
 use crate::module_constants::ModuleCodegenConstants;
+use crate::module_type::SharedModuleState;
 use soac_config::SoacEnvConfig;
 use soac_core::block_py::{
-    BlockPyFunction, BlockPyModule, BlockTerm, CallableScopeKind, ChildVisitable,
+    BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, CallableScopeKind, ChildVisitable,
     HasSemanticInstrId, InstrId, RuntimeFunctionId, RuntimeName, VisitMut,
 };
 use soac_ir_blockpy::BlockPyModuleShape;
@@ -20,11 +21,12 @@ use soac_ir_typed::plan_v3::{
 };
 use soac_ir_typed::{
     FactStore, InstrTyped, TypedAttrAccessPlan, TypedBlockPyModuleShape, TypedCallEmissionPlan,
-    TypedCallEmissionPlans, TypedDirectCallArgPlan, TypedDirectMethodCallGuard,
-    TypedExactIntBranchPlan, TypedExactIntPlanSource, TypedExactIntReturnPlan,
-    TypedExactListItemAccessPlan, TypedExactListItemCounterSource, TypedExactListItemPlanSource,
-    TypedIndexedFieldCounterSource, TypedIndexedFieldPlanSource, TypedIndexedGlobalAccessPlan,
-    TypedIndexedGlobalPlanSource, assign_missing_typed_function_instr_ids,
+    TypedCallEmissionPlans, TypedConstructorInitPlan, TypedDirectCallArgPlan,
+    TypedDirectMethodCallGuard, TypedExactIntBranchPlan, TypedExactIntPlanSource,
+    TypedExactIntReturnPlan, TypedExactListItemAccessPlan, TypedExactListItemCounterSource,
+    TypedExactListItemPlanSource, TypedIndexedFieldCounterSource, TypedIndexedFieldPlanSource,
+    TypedIndexedGlobalAccessPlan, TypedIndexedGlobalPlanSource,
+    assign_missing_typed_function_instr_ids,
 };
 use soac_opt::access_emission_v3::{
     ExactListItemAccessPlan as OptV3ExactListItemAccessPlan,
@@ -33,13 +35,15 @@ use soac_opt::access_emission_v3::{
 use soac_opt::artifacts_v3::ExactIntBranchV3Artifacts;
 use soac_opt::call_emission_v3::{ResolvedV3DirectCallPlan, typed_call_emission_plans_from_v3};
 use soac_opt::passes::{
-    TypedConstructorFieldBindings, TypedInlineInstrIdMapping, TypedInlineLocalMapping,
-    inline_typed_function_direct_call_stores, lower_typed_function_call_emission_plans,
-    plan_module_inlining, refresh_typed_function_value_facts,
-    rewrite_typed_stop_iteration_raises_to_handler_jumps,
-    scalarize_typed_hot_constructor_field_loads, split_typed_alias_hot_continuations,
-    split_typed_constructor_hot_continuations, split_typed_inline_cleanup_hot_continuations,
-    summarize_module_escapes, typed_constructor_field_bindings_from_inline_stats,
+    TypedConstructorFieldBindings, TypedExternalInlineCallee, TypedInlineInstrIdMapping,
+    TypedInlineLocalMapping, inline_typed_function_direct_call_stores_with_external_callees,
+    lower_typed_function_call_emission_plans, plan_module_inlining,
+    refresh_typed_function_value_facts, rewrite_typed_stop_iteration_raises_to_handler_jumps,
+    scalarize_typed_hot_constructor_field_loads, split_typed_alias_hot_continuations_with_budget,
+    split_typed_constructor_hot_continuations_with_budget,
+    split_typed_inline_cleanup_hot_continuations_for_labels_with_budget, summarize_module_escapes,
+    typed_constructor_field_bindings_from_inline_stats_with_external_callees,
+    typed_constructor_init_plans_from_inline_stats_with_external_callees,
     validate_typed_function_value_facts,
 };
 use soac_opt::region_emission_v3::{
@@ -52,6 +56,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 const MAX_TYPED_INLINE_PASSES: usize = 16;
+const MAX_TYPED_CONSTRUCTOR_CLONED_BLOCKS_PER_FUNCTION: usize = 256;
+const MAX_TYPED_ALIAS_CLONED_BLOCKS_PER_FUNCTION: usize = 256;
+const MAX_TYPED_INLINE_CLEANUP_CLONED_BLOCKS_PER_FUNCTION: usize = 256;
 
 type TypedInlineTargets = HashMap<InstrId, Vec<(RuntimeFunctionId, TypedDirectCallArgPlan)>>;
 
@@ -940,6 +947,7 @@ fn apply_profile_access_and_scalar_plans_to_typed_function(
     remapped_exact_list_items: Option<&HashMap<InstrId, ProfileExactListItemAccessPlan>>,
     remapped_exact_int_branches: Option<&HashMap<InstrId, TypedExactIntBranchPlan>>,
     remapped_exact_int_returns: Option<&HashMap<InstrId, TypedExactIntReturnPlan>>,
+    constructor_init_plans: Option<&HashMap<InstrId, TypedConstructorInitPlan>>,
 ) -> Result<(), String> {
     annotate_typed_indexed_field_accesses_from_profile(
         function,
@@ -959,7 +967,59 @@ fn apply_profile_access_and_scalar_plans_to_typed_function(
         remapped_exact_int_branches,
         remapped_exact_int_returns,
     )?;
+    annotate_typed_constructor_init_plans(function, constructor_init_plans)?;
     Ok(())
+}
+
+fn annotate_typed_constructor_init_plans(
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+    constructor_init_plans: Option<&HashMap<InstrId, TypedConstructorInitPlan>>,
+) -> Result<usize, String> {
+    let Some(constructor_init_plans) = constructor_init_plans else {
+        return Ok(0);
+    };
+    if constructor_init_plans.is_empty() {
+        return Ok(0);
+    }
+
+    struct Annotator<'a> {
+        constructor_init_plans: &'a HashMap<InstrId, TypedConstructorInitPlan>,
+        used: HashSet<InstrId>,
+        count: usize,
+    }
+
+    impl VisitMut<InstrTyped> for Annotator<'_> {
+        fn visit_instr_mut(&mut self, expr: &mut InstrTyped) {
+            if let InstrTyped::CallTyped(call) = expr
+                && let Some(instr_id) = call.try_semantic_instr_id()
+                && let Some(plan) = self.constructor_init_plans.get(&instr_id)
+            {
+                call.extra.set_constructor_init_plan(*plan);
+                self.used.insert(instr_id);
+                self.count += 1;
+            }
+            expr.visit_children_mut(self);
+        }
+    }
+
+    let mut annotator = Annotator {
+        constructor_init_plans,
+        used: HashSet::new(),
+        count: 0,
+    };
+    annotator.visit_fn_mut(function);
+    if annotator.used.len() != constructor_init_plans.len() {
+        let missing = constructor_init_plans
+            .keys()
+            .filter(|instr_id| !annotator.used.contains(instr_id))
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "inlined constructor-init plans were not attached to typed call nodes: {missing}"
+        ));
+    }
+    Ok(annotator.count)
 }
 
 pub(super) fn apply_profile_typed_block_metadata_to_typed_function(
@@ -1592,6 +1652,90 @@ fn remap_cloned_indexed_field_accesses(
     Ok(count)
 }
 
+fn remap_cloned_constructor_init_plans(
+    caller_function_id: RuntimeFunctionId,
+    mappings: &[TypedInlineInstrIdMapping],
+    constructor_init_plans: &mut HashMap<
+        RuntimeFunctionId,
+        HashMap<InstrId, TypedConstructorInitPlan>,
+    >,
+) -> Result<usize, String> {
+    let source_plans = constructor_init_plans
+        .get(&caller_function_id)
+        .cloned()
+        .unwrap_or_default();
+    if source_plans.is_empty() {
+        return Ok(0);
+    }
+
+    let mut count = 0;
+    for mapping in mappings {
+        if mapping.callee != caller_function_id {
+            continue;
+        }
+        let Some(plan) = source_plans.get(&mapping.callee_instr_id).copied() else {
+            continue;
+        };
+        let entry = constructor_init_plans
+            .entry(caller_function_id)
+            .or_default();
+        if let Some(existing) = entry.get(&mapping.caller_instr_id) {
+            if *existing != plan {
+                return Err(format!(
+                    "cloned constructor-init plan for instruction {} maps to both {} and {}",
+                    mapping.caller_instr_id, existing.init_function_id, plan.init_function_id
+                ));
+            }
+            continue;
+        }
+        entry.insert(mapping.caller_instr_id, plan);
+        count += 1;
+    }
+    Ok(count)
+}
+
+fn remap_cloned_constructor_field_bindings(
+    caller_function_id: RuntimeFunctionId,
+    mappings: &[TypedInlineInstrIdMapping],
+    constructor_field_bindings: &mut HashMap<
+        RuntimeFunctionId,
+        HashMap<InstrId, TypedConstructorFieldBindings>,
+    >,
+) -> Result<usize, String> {
+    let source_bindings = constructor_field_bindings
+        .get(&caller_function_id)
+        .cloned()
+        .unwrap_or_default();
+    if source_bindings.is_empty() {
+        return Ok(0);
+    }
+
+    let mut count = 0;
+    for mapping in mappings {
+        if mapping.callee != caller_function_id {
+            continue;
+        }
+        let Some(bindings) = source_bindings.get(&mapping.callee_instr_id).cloned() else {
+            continue;
+        };
+        let entry = constructor_field_bindings
+            .entry(caller_function_id)
+            .or_default();
+        if let Some(existing) = entry.get(&mapping.caller_instr_id) {
+            if *existing != bindings {
+                return Err(format!(
+                    "cloned constructor field bindings for instruction {} map to conflicting field sets",
+                    mapping.caller_instr_id
+                ));
+            }
+            continue;
+        }
+        entry.insert(mapping.caller_instr_id, bindings);
+        count += 1;
+    }
+    Ok(count)
+}
+
 fn remap_cloned_profile_rewrites(
     caller_function_id: RuntimeFunctionId,
     mappings: &[TypedInlineInstrIdMapping],
@@ -1608,6 +1752,14 @@ fn remap_cloned_profile_rewrites(
     remapped_exact_list_items: &mut HashMap<
         RuntimeFunctionId,
         HashMap<InstrId, ProfileExactListItemAccessPlan>,
+    >,
+    constructor_init_plans: &mut HashMap<
+        RuntimeFunctionId,
+        HashMap<InstrId, TypedConstructorInitPlan>,
+    >,
+    constructor_field_bindings: &mut HashMap<
+        RuntimeFunctionId,
+        HashMap<InstrId, TypedConstructorFieldBindings>,
     >,
 ) -> Result<usize, String> {
     let mut total = 0;
@@ -1632,11 +1784,32 @@ fn remap_cloned_profile_rewrites(
             profile,
             remapped_exact_list_items,
         )?;
+        count += remap_cloned_constructor_init_plans(
+            caller_function_id,
+            mappings,
+            constructor_init_plans,
+        )?;
+        count += remap_cloned_constructor_field_bindings(
+            caller_function_id,
+            mappings,
+            constructor_field_bindings,
+        )?;
         if count == 0 {
             return Ok(total);
         }
         total += count;
     }
+}
+
+fn remap_cloned_hot_state_cleanup_labels(
+    labels: &mut HashSet<BlockLabel>,
+    mappings: &[(BlockLabel, BlockLabel)],
+) {
+    let remapped = mappings
+        .iter()
+        .filter_map(|(source, target)| labels.contains(source).then_some(*target))
+        .collect::<Vec<_>>();
+    labels.extend(remapped);
 }
 
 #[cfg(test)]
@@ -1649,7 +1822,7 @@ pub(super) fn apply_profile_typed_plans_to_typed_function(
     };
     apply_profile_call_emission_plans_to_typed_function(function, profile)?;
     apply_profile_access_and_scalar_plans_to_typed_function(
-        function, profile, None, None, None, None, None,
+        function, profile, None, None, None, None, None, None,
     )?;
     apply_profile_typed_block_metadata_to_typed_function(function, profile)?;
     apply_profile_typed_guard_miss_policy_to_typed_function(function, profile);
@@ -1693,13 +1866,43 @@ pub(super) fn optimize_blockpy(
     profile: Option<&SpecializationProfile<'_>>,
     env_config: &SoacEnvConfig,
 ) -> Result<Arc<JitModulePlan>, String> {
+    optimize_blockpy_with_external_inline_callees(module, profile, env_config, HashMap::new())
+}
+
+pub(super) fn optimize_blockpy_for_shared_state(
+    shared_state: &SharedModuleState,
+    compile_session: Option<&crate::session::CompileSession>,
+    profile: Option<&SpecializationProfile<'_>>,
+    env_config: &SoacEnvConfig,
+) -> Result<Arc<JitModulePlan>, String> {
+    let external_callees =
+        external_typed_inline_callees(shared_state, compile_session, profile, env_config)?;
+    optimize_blockpy_with_external_inline_callees(
+        &shared_state.lowered_module,
+        profile,
+        env_config,
+        external_callees,
+    )
+}
+
+fn optimize_blockpy_with_external_inline_callees(
+    module: &BlockPyModule<BlockPyModuleShape>,
+    profile: Option<&SpecializationProfile<'_>>,
+    env_config: &SoacEnvConfig,
+    external_callees: HashMap<RuntimeFunctionId, TypedExternalInlineCallee>,
+) -> Result<Arc<JitModulePlan>, String> {
     let inline_plan = profile.map(|_| plan_module_inlining(&summarize_module_escapes(module)));
     let prepared = soac_driver::typed_runtime::prepare_typed_v3_runtime_module_with_rewrites(
         module,
         env_config,
         |typed_module, _value_facts| {
             if let Some(profile) = profile {
-                apply_typed_v3_module_rewrites(typed_module, profile, inline_plan.as_ref())?;
+                apply_typed_v3_module_rewrites(
+                    typed_module,
+                    profile,
+                    inline_plan.as_ref(),
+                    &external_callees,
+                )?;
             }
             Ok(())
         },
@@ -1710,18 +1913,82 @@ pub(super) fn optimize_blockpy(
     )?)
 }
 
+fn external_typed_inline_callees(
+    shared_state: &SharedModuleState,
+    compile_session: Option<&crate::session::CompileSession>,
+    profile: Option<&SpecializationProfile<'_>>,
+    env_config: &SoacEnvConfig,
+) -> Result<HashMap<RuntimeFunctionId, TypedExternalInlineCallee>, String> {
+    let (Some(compile_session), Some(profile)) = (compile_session, profile) else {
+        return Ok(HashMap::new());
+    };
+    let current_module_id = shared_state.lowered_module.module_name_gen.module_id();
+    let mut targets = profile
+        .opt_v3_emitted_direct_calls
+        .values()
+        .flat_map(|calls| calls.values())
+        .flat_map(|plans| plans.iter())
+        .map(|plan| plan.target)
+        .filter(|function_id| function_id.runtime_module_id().as_u32() != current_module_id)
+        .collect::<HashSet<_>>();
+    if targets.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let mut by_module = HashMap::<u32, Arc<SharedModuleState>>::new();
+    for function_id in &targets {
+        let Some(target_state) =
+            compile_session.shared_module_state_for_function_id(*function_id)?
+        else {
+            continue;
+        };
+        by_module
+            .entry(function_id.runtime_module_id().as_u32())
+            .or_insert(target_state);
+    }
+
+    let mut external_callees = HashMap::new();
+    for target_state in by_module.into_values() {
+        let inline_plan =
+            plan_module_inlining(&summarize_module_escapes(&target_state.lowered_module));
+        let prepared = soac_driver::typed_runtime::prepare_typed_v3_runtime_module_with_rewrites(
+            &target_state.lowered_module,
+            env_config,
+            |typed_module, _value_facts| {
+                for function in &mut typed_module.callable_defs {
+                    apply_profile_call_emission_plans_to_typed_function(function, profile)?;
+                }
+                Ok(())
+            },
+        )?;
+        let module_constants = prepared.module.module_constants.clone();
+        for function in prepared.module.callable_defs {
+            if targets.remove(&function.function_id) {
+                external_callees.insert(
+                    function.function_id,
+                    TypedExternalInlineCallee {
+                        function,
+                        module_constants: module_constants.clone(),
+                        inline_plan: Some(inline_plan.clone()),
+                    },
+                );
+            }
+        }
+    }
+    Ok(external_callees)
+}
+
 fn apply_typed_v3_module_rewrites(
     module: &mut BlockPyModule<TypedBlockPyModuleShape>,
     profile: &SpecializationProfile<'_>,
     inline_plan: Option<&soac_opt::passes::InlinePlanModule>,
+    external_callees: &HashMap<RuntimeFunctionId, TypedExternalInlineCallee>,
 ) -> Result<(), String> {
     for function in &mut module.callable_defs {
         apply_profile_call_emission_plans_to_typed_function(function, profile)?;
     }
 
     let callee_module = module.clone();
-    let module_constants = module.module_constants.clone();
-    let external_callees = HashMap::new();
     let mut remapped_inline_targets = HashMap::<RuntimeFunctionId, TypedInlineTargets>::new();
     let mut remapped_indexed_fields =
         HashMap::<RuntimeFunctionId, HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>>::new();
@@ -1733,10 +2000,15 @@ fn apply_typed_v3_module_rewrites(
         HashMap::<RuntimeFunctionId, HashMap<InstrId, TypedExactIntBranchPlan>>::new();
     let mut remapped_exact_int_returns =
         HashMap::<RuntimeFunctionId, HashMap<InstrId, TypedExactIntReturnPlan>>::new();
+    let mut constructor_init_plans =
+        HashMap::<RuntimeFunctionId, HashMap<InstrId, TypedConstructorInitPlan>>::new();
     let mut constructor_field_bindings =
         HashMap::<RuntimeFunctionId, HashMap<InstrId, TypedConstructorFieldBindings>>::new();
     for function in &mut module.callable_defs {
-        let mut cloned_instr_id_mappings = Vec::<TypedInlineInstrIdMapping>::new();
+        let mut hot_state_cleanup_labels = HashSet::<BlockLabel>::new();
+        let mut constructor_cloned_blocks = 0usize;
+        let mut alias_cloned_blocks = 0usize;
+        let mut inline_cleanup_cloned_blocks = 0usize;
         for pass in 0..MAX_TYPED_INLINE_PASSES {
             let inline_targets = typed_inline_targets_for_function(
                 function.function_id,
@@ -1747,22 +2019,38 @@ fn apply_typed_v3_module_rewrites(
                 break;
             }
             let caller_function_id = function.function_id;
-            let stats = inline_typed_function_direct_call_stores(
+            let stats = inline_typed_function_direct_call_stores_with_external_callees(
                 function,
                 &callee_module,
-                &external_callees,
+                &mut module.module_constants,
+                external_callees,
                 &inline_targets,
             );
             if stats.rewritten_stores == 0 && stats.rewritten_effect_only_calls == 0 {
                 break;
             }
+            hot_state_cleanup_labels.extend(stats.hot_state_cleanup_labels.iter().copied());
+            let init_plans = typed_constructor_init_plans_from_inline_stats_with_external_callees(
+                &callee_module,
+                &module.module_constants,
+                external_callees,
+                &stats,
+            );
+            if !init_plans.is_empty() {
+                constructor_init_plans
+                    .entry(caller_function_id)
+                    .or_default()
+                    .extend(init_plans);
+            }
             if let Some(inline_plan) = inline_plan {
-                let bindings = typed_constructor_field_bindings_from_inline_stats(
-                    &callee_module,
-                    inline_plan,
-                    &module_constants,
-                    &stats,
-                );
+                let bindings =
+                    typed_constructor_field_bindings_from_inline_stats_with_external_callees(
+                        &callee_module,
+                        inline_plan,
+                        &module.module_constants,
+                        external_callees,
+                        &stats,
+                    );
                 if !bindings.is_empty() {
                     constructor_field_bindings
                         .entry(caller_function_id)
@@ -1799,18 +2087,51 @@ fn apply_typed_v3_module_rewrites(
                     &mut remapped_exact_int_returns,
                 )?;
             }
-            let split_stats =
-                split_typed_constructor_hot_continuations(function, &module_constants);
+            let mut cloned_instr_id_mappings = Vec::<TypedInlineInstrIdMapping>::new();
+            let remaining_constructor_clone_budget =
+                MAX_TYPED_CONSTRUCTOR_CLONED_BLOCKS_PER_FUNCTION
+                    .saturating_sub(constructor_cloned_blocks);
+            let split_stats = split_typed_constructor_hot_continuations_with_budget(
+                function,
+                &module.module_constants,
+                remaining_constructor_clone_budget,
+            );
+            constructor_cloned_blocks += split_stats.cloned_blocks;
+            remap_cloned_hot_state_cleanup_labels(
+                &mut hot_state_cleanup_labels,
+                &split_stats.label_mappings,
+            );
             if !split_stats.instr_id_mappings.is_empty() {
                 cloned_instr_id_mappings.extend(split_stats.instr_id_mappings);
             }
-            let split_stats = split_typed_alias_hot_continuations(function);
+            let remaining_alias_clone_budget =
+                MAX_TYPED_ALIAS_CLONED_BLOCKS_PER_FUNCTION.saturating_sub(alias_cloned_blocks);
+            let split_stats = split_typed_alias_hot_continuations_with_budget(
+                function,
+                remaining_alias_clone_budget,
+            );
+            alias_cloned_blocks += split_stats.cloned_blocks;
+            remap_cloned_hot_state_cleanup_labels(
+                &mut hot_state_cleanup_labels,
+                &split_stats.label_mappings,
+            );
             if !split_stats.instr_id_mappings.is_empty() {
                 cloned_instr_id_mappings.extend(split_stats.instr_id_mappings);
             }
-            let split_stats = split_typed_inline_cleanup_hot_continuations(function);
+            let remaining_cleanup_clone_budget =
+                MAX_TYPED_INLINE_CLEANUP_CLONED_BLOCKS_PER_FUNCTION
+                    .saturating_sub(inline_cleanup_cloned_blocks);
+            let split_stats = split_typed_inline_cleanup_hot_continuations_for_labels_with_budget(
+                function,
+                &hot_state_cleanup_labels,
+                remaining_cleanup_clone_budget,
+            );
+            inline_cleanup_cloned_blocks += split_stats.cloned_blocks;
             if !split_stats.instr_id_mappings.is_empty() {
                 cloned_instr_id_mappings.extend(split_stats.instr_id_mappings);
+            }
+            for clone in &split_stats.clones {
+                hot_state_cleanup_labels.remove(&clone.hot_block);
             }
             if !cloned_instr_id_mappings.is_empty() {
                 remap_cloned_profile_rewrites(
@@ -1821,6 +2142,8 @@ fn apply_typed_v3_module_rewrites(
                     &mut remapped_indexed_fields,
                     &mut remapped_indexed_field_counter_sources,
                     &mut remapped_exact_list_items,
+                    &mut constructor_init_plans,
+                    &mut constructor_field_bindings,
                 )?;
             }
             assign_missing_typed_function_instr_ids(function);
@@ -1832,7 +2155,9 @@ fn apply_typed_v3_module_rewrites(
                 ));
             }
         }
-        if rewrite_typed_stop_iteration_raises_to_handler_jumps(function, &module_constants) != 0 {
+        if rewrite_typed_stop_iteration_raises_to_handler_jumps(function, &module.module_constants)
+            != 0
+        {
             assign_missing_typed_function_instr_ids(function);
             refresh_typed_function_value_facts(function);
         }
@@ -1844,10 +2169,14 @@ fn apply_typed_v3_module_rewrites(
             remapped_exact_list_items.get(&function.function_id),
             remapped_exact_int_branches.get(&function.function_id),
             remapped_exact_int_returns.get(&function.function_id),
+            constructor_init_plans.get(&function.function_id),
         )?;
         if let Some(bindings) = constructor_field_bindings.get(&function.function_id) {
-            let stats =
-                scalarize_typed_hot_constructor_field_loads(function, &module_constants, bindings);
+            let stats = scalarize_typed_hot_constructor_field_loads(
+                function,
+                &module.module_constants,
+                bindings,
+            );
             if stats.rewritten_loads != 0 || stats.inserted_scalar_stores != 0 {
                 assign_missing_typed_function_instr_ids(function);
                 refresh_typed_function_value_facts(function);

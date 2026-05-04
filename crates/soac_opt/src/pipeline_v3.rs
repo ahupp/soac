@@ -5,9 +5,9 @@ use crate::evidence_v3::{
     planner_facts_from_profile_evidence_v3,
 };
 use crate::passes::{
-    BlockPyModuleShape, InlineUnsupportedReason, InstrBlockPy, bind_simple_direct_call_inline_args,
-    bind_simple_direct_method_inline_args, build_direct_call_inline_fragment_to_target,
-    build_direct_method_inline_fragment_to_target, try_allocate_codegen_stack_temp,
+    BlockPyModuleShape, InlineUnsupportedReason, InlineValueBindings, InstrBlockPy,
+    build_cross_module_direct_call_inline_fragment_to_target,
+    build_direct_call_inline_fragment_to_target, try_allocate_codegen_stack_temp,
 };
 use crate::plan::{FunctionProfileEvidence, ProfileEvidenceStore};
 use crate::planner_v3::{
@@ -21,11 +21,11 @@ use crate::region_v3::{
 use anyhow::Result;
 use soac_core::block_py::literal::Literal;
 use soac_core::block_py::{
-    BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, Call, CallArgPositional, CallDirect,
-    ChildVisitable, ConstantExpr, FunctionExecutionMode, HasSemanticInstrId, InstrId,
-    LocalFunctionId, ModuleContentId, NameLike, NameLocation, ParamKind, PersistentFunctionId,
+    BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, Call, CallArgPositional, ChildVisitable,
+    ConstantExpr, FunctionExecutionMode, HasSemanticInstrId, InstrId, LocalFunctionId,
+    LocalLocation, ModuleContentId, NameLike, NameLocation, ParamKind, PersistentFunctionId,
     ResolvedName, RuntimeName, SerializedFunctionDebugName, SerializedFunctionId,
-    SerializedIdentityTables, SerializedModuleId, SerializedModuleIdentity, Visit,
+    SerializedIdentityTables, SerializedModuleId, SerializedModuleIdentity, Tuple, Visit,
 };
 use soac_ir_blockpy::is_constructor_entry_function;
 use soac_ir_typed::emit_v3::{MechanicalEmitError, emit_mechanical_plan_v3};
@@ -64,6 +64,7 @@ pub struct DirectCallTargetIndex {
 struct DirectCallTargetEntry {
     module: ModuleContentId,
     function: BlockPyFunction<BlockPyModuleShape>,
+    module_constants: Vec<ConstantExpr>,
 }
 
 #[derive(Clone, Debug)]
@@ -133,6 +134,7 @@ impl DirectCallTargetIndex {
                 DirectCallTargetEntry {
                     module: content_id.clone(),
                     function: function.clone(),
+                    module_constants: module.module_constants.clone(),
                 },
             );
         }
@@ -1343,21 +1345,21 @@ fn direct_call_requests_from_evidence_v3(
                 });
                 continue;
             }
+            let inline_candidate = direct_call_inline_candidate_v3(
+                lowered_module,
+                &current_module,
+                function,
+                source,
+                target_entry,
+                &callee,
+                &arg_plan,
+            );
             requests.push(DirectCallPlanRequest {
                 source,
                 target: serialized_target,
                 callee: callee.clone(),
                 arg_plan,
-                body: CallBodyPlanRequest::with_inline_candidate(
-                    direct_call_inline_candidate_v3(
-                        lowered_module,
-                        &current_module,
-                        function,
-                        source,
-                        target_entry,
-                        &callee,
-                    ),
-                ),
+                body: CallBodyPlanRequest::with_inline_candidate(inline_candidate),
                 reason: match callee {
                     DirectCallCallee::Function => {
                         "profiled call_hot_targets selected this function with validated ordinary-call arguments".to_string()
@@ -1483,10 +1485,8 @@ fn direct_call_inline_candidate_v3(
     source: InstrId,
     target: &DirectCallTargetEntry,
     callee: &DirectCallCallee,
+    arg_plan: &DirectCallArgPlan,
 ) -> bool {
-    if target.module != *current_module {
-        return false;
-    }
     let Some((return_target, call)) =
         inline_call_and_return_target_for_instr_id_v3(function, source)
     else {
@@ -1496,12 +1496,7 @@ fn direct_call_inline_candidate_v3(
     if target_function.names.fn_name == "__init__" {
         return false;
     }
-    let implicit_positional_arg_count = match callee {
-        DirectCallCallee::Function => usize::from(is_constructor_entry_function(target_function)),
-        DirectCallCallee::Method { .. } => 1,
-        DirectCallCallee::RuntimeProtocolMethod { .. } => 0,
-    };
-    if !call_inline_signature_candidate_v3(call, target_function, implicit_positional_arg_count) {
+    if !call_inline_signature_candidate_v3(call, target_function, arg_plan) {
         return false;
     }
     match callee {
@@ -1512,6 +1507,7 @@ fn direct_call_inline_candidate_v3(
             return_target,
             call,
             target,
+            arg_plan,
         )
         .is_ok(),
         DirectCallCallee::Method { .. } => direct_method_inline_body_buildable_v3(
@@ -1521,6 +1517,7 @@ fn direct_call_inline_candidate_v3(
             return_target,
             call,
             target,
+            arg_plan,
         )
         .is_ok(),
         DirectCallCallee::RuntimeProtocolMethod { .. } => {
@@ -1531,6 +1528,7 @@ fn direct_call_inline_candidate_v3(
                 return_target,
                 call,
                 target,
+                arg_plan,
             )
             .is_ok()
         }
@@ -1573,12 +1571,13 @@ fn inline_call_and_return_target_for_instr_id_v3(
 }
 
 fn direct_call_inline_body_buildable_v3(
-    _module: &BlockPyModule<BlockPyModuleShape>,
+    module: &BlockPyModule<BlockPyModuleShape>,
     current_module: &ModuleContentId,
     function: &BlockPyFunction<BlockPyModuleShape>,
     return_target: InlineCallReturnTargetV3,
     call: &Call<InstrBlockPy>,
     target: &DirectCallTargetEntry,
+    arg_plan: &DirectCallArgPlan,
 ) -> Result<(), InlineUnsupportedReason> {
     let mut caller = function.clone();
     let continuation = caller.name_gen.next_block_name();
@@ -1590,43 +1589,40 @@ fn direct_call_inline_body_buildable_v3(
                 .resolved_name()
         }
     };
-    let bindings = if is_constructor_entry_function(&target.function) {
-        bind_simple_direct_method_inline_args(
+    let values = direct_call_inline_values_for_function_call(call, &target.function)?;
+    let bindings =
+        bind_v3_direct_call_inline_values(&target.function, arg_plan, values.as_slice())?;
+    if target.module == *current_module {
+        build_direct_call_inline_fragment_to_target(
+            &mut caller,
             &target.function,
-            call.func.as_ref().clone(),
-            call.args.as_slice(),
-        )?
+            continuation,
+            &bindings,
+            return_target,
+        )?;
     } else {
-        let direct_call = CallDirect::new(
-            call.func.as_ref().clone(),
-            target.function.function_id,
-            call.args.clone(),
-            call.keywords.clone(),
-        );
-        bind_simple_direct_call_inline_args(&target.function, &direct_call)?
-    };
-    if target.module != *current_module {
-        return Err(InlineUnsupportedReason::CrossModuleGlobalName(
-            target.module.module_name.clone(),
-        ));
+        let mut caller_constants = module.module_constants.clone();
+        build_cross_module_direct_call_inline_fragment_to_target(
+            &mut caller,
+            &mut caller_constants,
+            &target.function,
+            target.module_constants.as_slice(),
+            continuation,
+            &bindings,
+            return_target,
+        )?;
     }
-    build_direct_call_inline_fragment_to_target(
-        &mut caller,
-        &target.function,
-        continuation,
-        &bindings,
-        return_target,
-    )?;
     Ok(())
 }
 
 fn direct_method_inline_body_buildable_v3(
-    _module: &BlockPyModule<BlockPyModuleShape>,
+    module: &BlockPyModule<BlockPyModuleShape>,
     current_module: &ModuleContentId,
     function: &BlockPyFunction<BlockPyModuleShape>,
     return_target: InlineCallReturnTargetV3,
     call: &Call<InstrBlockPy>,
     target: &DirectCallTargetEntry,
+    arg_plan: &DirectCallArgPlan,
 ) -> Result<(), InlineUnsupportedReason> {
     let mut caller = function.clone();
     let continuation = caller.name_gen.next_block_name();
@@ -1641,19 +1637,29 @@ fn direct_method_inline_body_buildable_v3(
     let InstrBlockPy::GetAttr(get_attr) = call.func.as_ref() else {
         return Err(InlineUnsupportedReason::UnsupportedCallTarget);
     };
-    if target.module != *current_module {
-        return Err(InlineUnsupportedReason::CrossModuleGlobalName(
-            target.module.module_name.clone(),
-        ));
+    let values = direct_call_inline_values_for_method_call(call, get_attr.value.as_ref().clone())?;
+    let bindings =
+        bind_v3_direct_call_inline_values(&target.function, arg_plan, values.as_slice())?;
+    if target.module == *current_module {
+        build_direct_call_inline_fragment_to_target(
+            &mut caller,
+            &target.function,
+            continuation,
+            &bindings,
+            return_target,
+        )?;
+    } else {
+        let mut caller_constants = module.module_constants.clone();
+        build_cross_module_direct_call_inline_fragment_to_target(
+            &mut caller,
+            &mut caller_constants,
+            &target.function,
+            target.module_constants.as_slice(),
+            continuation,
+            &bindings,
+            return_target,
+        )?;
     }
-    build_direct_method_inline_fragment_to_target(
-        &mut caller,
-        &target.function,
-        continuation,
-        get_attr.value.as_ref().clone(),
-        &call.args,
-        return_target,
-    )?;
     Ok(())
 }
 
@@ -1664,6 +1670,7 @@ fn direct_runtime_protocol_method_inline_body_buildable_v3(
     return_target: InlineCallReturnTargetV3,
     call: &Call<InstrBlockPy>,
     target: &DirectCallTargetEntry,
+    arg_plan: &DirectCallArgPlan,
 ) -> Result<(), InlineUnsupportedReason> {
     if runtime_protocol_method_for_call_v3(module, call).is_none() {
         return Err(InlineUnsupportedReason::UnsupportedCallTarget);
@@ -1671,6 +1678,9 @@ fn direct_runtime_protocol_method_inline_body_buildable_v3(
     let [CallArgPositional::Positional(receiver)] = call.args.as_slice() else {
         return Err(InlineUnsupportedReason::UnsupportedCallTarget);
     };
+    let values = vec![receiver.clone()];
+    let bindings =
+        bind_v3_direct_call_inline_values(&target.function, arg_plan, values.as_slice())?;
     let mut caller = function.clone();
     let continuation = caller.name_gen.next_block_name();
     let return_target = match return_target {
@@ -1681,26 +1691,141 @@ fn direct_runtime_protocol_method_inline_body_buildable_v3(
                 .resolved_name()
         }
     };
-    if target.module != *current_module {
-        return Err(InlineUnsupportedReason::CrossModuleGlobalName(
-            target.module.module_name.clone(),
-        ));
+    if target.module == *current_module {
+        build_direct_call_inline_fragment_to_target(
+            &mut caller,
+            &target.function,
+            continuation,
+            &bindings,
+            return_target,
+        )?;
+    } else {
+        let mut caller_constants = module.module_constants.clone();
+        build_cross_module_direct_call_inline_fragment_to_target(
+            &mut caller,
+            &mut caller_constants,
+            &target.function,
+            target.module_constants.as_slice(),
+            continuation,
+            &bindings,
+            return_target,
+        )?;
     }
-    build_direct_method_inline_fragment_to_target(
-        &mut caller,
-        &target.function,
-        continuation,
-        receiver.clone(),
-        &[],
-        return_target,
-    )?;
     Ok(())
+}
+
+fn direct_call_inline_values_for_function_call(
+    call: &Call<InstrBlockPy>,
+    target_function: &BlockPyFunction<BlockPyModuleShape>,
+) -> Result<Vec<InstrBlockPy>, InlineUnsupportedReason> {
+    let mut values = Vec::with_capacity(
+        call.args.len() + usize::from(is_constructor_entry_function(target_function)),
+    );
+    if is_constructor_entry_function(target_function) {
+        values.push(call.func.as_ref().clone());
+    }
+    values.extend(positional_inline_arg_values(call.args.as_slice())?);
+    Ok(values)
+}
+
+fn direct_call_inline_values_for_method_call(
+    call: &Call<InstrBlockPy>,
+    receiver: InstrBlockPy,
+) -> Result<Vec<InstrBlockPy>, InlineUnsupportedReason> {
+    let mut values = Vec::with_capacity(call.args.len() + 1);
+    values.push(receiver);
+    values.extend(positional_inline_arg_values(call.args.as_slice())?);
+    Ok(values)
+}
+
+fn positional_inline_arg_values(
+    args: &[CallArgPositional<InstrBlockPy>],
+) -> Result<Vec<InstrBlockPy>, InlineUnsupportedReason> {
+    args.iter()
+        .map(|arg| match arg {
+            CallArgPositional::Positional(value) => Ok(value.clone()),
+            CallArgPositional::Starred(_) => Err(InlineUnsupportedReason::StarredArguments),
+        })
+        .collect()
+}
+
+fn bind_v3_direct_call_inline_values(
+    callee: &BlockPyFunction<BlockPyModuleShape>,
+    arg_plan: &DirectCallArgPlan,
+    values: &[InstrBlockPy],
+) -> Result<InlineValueBindings, InlineUnsupportedReason> {
+    if arg_plan.sources.len() != callee.params.len() {
+        return Err(InlineUnsupportedReason::ArityMismatch {
+            expected: callee.params.len(),
+            actual: arg_plan.sources.len(),
+        });
+    }
+
+    let mut bindings = InlineValueBindings::new();
+    for (param, source) in callee.params.iter().zip(&arg_plan.sources) {
+        let value = match (&param.kind, source) {
+            (ParamKind::PosOnly | ParamKind::Any, DirectCallArgSource::Provided(index)) => values
+                .get(*index as usize)
+                .cloned()
+                .ok_or(InlineUnsupportedReason::ArityMismatch {
+                    expected: *index as usize + 1,
+                    actual: values.len(),
+                })?,
+            (ParamKind::VarArg, DirectCallArgSource::PackedRest { start }) => {
+                let rest = values
+                    .get(*start as usize..)
+                    .ok_or(InlineUnsupportedReason::ArityMismatch {
+                        expected: *start as usize,
+                        actual: values.len(),
+                    })?
+                    .to_vec();
+                InstrBlockPy::Tuple(Tuple::new(rest))
+            }
+            (_, DirectCallArgSource::DefaultSentinel) => {
+                return Err(InlineUnsupportedReason::ArityMismatch {
+                    expected: values.len() + 1,
+                    actual: values.len(),
+                });
+            }
+            (_, _) => {
+                return Err(InlineUnsupportedReason::UnsupportedParameterKind {
+                    name: param.name.clone(),
+                    kind: param.kind,
+                });
+            }
+        };
+        let location = blockpy_parameter_local_location(callee, &param.name)?;
+        bindings.insert(location, value);
+    }
+    Ok(bindings)
+}
+
+fn blockpy_parameter_local_location(
+    function: &BlockPyFunction<BlockPyModuleShape>,
+    name: &str,
+) -> Result<LocalLocation, InlineUnsupportedReason> {
+    let layout = function
+        .storage_layout
+        .as_ref()
+        .ok_or(InlineUnsupportedReason::MissingCalleeStorageLayout)?;
+    let Some(slot) = layout
+        .stack_slots()
+        .iter()
+        .position(|slot_name| slot_name == name)
+    else {
+        return Err(InlineUnsupportedReason::MissingParameterLocal(
+            name.to_string(),
+        ));
+    };
+    Ok(LocalLocation(
+        u32::try_from(slot).expect("parameter stack slot index should fit in u32"),
+    ))
 }
 
 fn call_inline_signature_candidate_v3(
     call: &Call<InstrBlockPy>,
     target_function: &BlockPyFunction<BlockPyModuleShape>,
-    implicit_positional_arg_count: usize,
+    arg_plan: &DirectCallArgPlan,
 ) -> bool {
     if !call.keywords.is_empty()
         || call
@@ -1713,37 +1838,14 @@ fn call_inline_signature_candidate_v3(
     let Some(storage_layout) = &target_function.storage_layout else {
         return false;
     };
-    let explicit_positional_arg_count = call
-        .args
-        .iter()
-        .filter(|arg| matches!(arg, CallArgPositional::Positional(_)))
-        .count();
-    let provided_positional_arg_count =
-        implicit_positional_arg_count + explicit_positional_arg_count;
-    let accepted_positional_arg_count = target_function
-        .params
-        .iter()
-        .filter(|param| matches!(param.kind, ParamKind::PosOnly | ParamKind::Any))
-        .count();
-    if provided_positional_arg_count > accepted_positional_arg_count {
+    if arg_plan.sources.len() != target_function.params.len() {
         return false;
     }
-    let mut consumed_positional_args = 0usize;
-    for param in target_function.params.iter() {
-        match param.kind {
-            ParamKind::PosOnly | ParamKind::Any => {
-                if consumed_positional_args < provided_positional_arg_count {
-                    consumed_positional_args += 1;
-                } else if !param.has_default {
-                    return false;
-                }
-            }
-            ParamKind::KwOnly => {
-                if !param.has_default {
-                    return false;
-                }
-            }
-            ParamKind::VarArg | ParamKind::KwArg => return false,
+    for (param, source) in target_function.params.iter().zip(&arg_plan.sources) {
+        match (param.kind, source) {
+            (ParamKind::PosOnly | ParamKind::Any, DirectCallArgSource::Provided(_))
+            | (ParamKind::VarArg, DirectCallArgSource::PackedRest { .. }) => {}
+            _ => return false,
         }
         if !storage_layout
             .stack_slots()
@@ -1772,8 +1874,12 @@ fn direct_call_arg_plan_from_call_v3(
         return Err("keyword arguments are not supported".to_string());
     }
 
+    let has_vararg = target_function
+        .params
+        .iter()
+        .any(|param| matches!(param.kind, ParamKind::VarArg));
     for param in target_function.params.iter() {
-        if matches!(param.kind, ParamKind::VarArg | ParamKind::KwArg) {
+        if matches!(param.kind, ParamKind::KwArg) {
             return Err(format!(
                 "target parameter kind {:?} is not supported",
                 param.kind
@@ -1793,7 +1899,7 @@ fn direct_call_arg_plan_from_call_v3(
         .iter()
         .filter(|param| matches!(param.kind, ParamKind::PosOnly | ParamKind::Any))
         .count();
-    if provided_positional_arg_count > accepted_positional_arg_count {
+    if !has_vararg && provided_positional_arg_count > accepted_positional_arg_count {
         return Err(format!(
             "too many positional arguments: provided {provided_positional_arg_count}, accepted {accepted_positional_arg_count}"
         ));
@@ -1827,8 +1933,16 @@ fn direct_call_arg_plan_from_call_v3(
                     ));
                 }
             }
-            ParamKind::VarArg | ParamKind::KwArg => unreachable!(
-                "unsupported variadic params should be rejected before planning direct-call args"
+            ParamKind::VarArg => {
+                sources.push(DirectCallArgSource::PackedRest {
+                    start: next_provided_arg
+                        .try_into()
+                        .map_err(|_| "too many positional arguments for v3 arg plan")?,
+                });
+                next_provided_arg = provided_positional_arg_count;
+            }
+            ParamKind::KwArg => unreachable!(
+                "unsupported variadic keyword params should be rejected before planning direct-call args"
             ),
         }
     }
@@ -1849,10 +1963,18 @@ pub fn optimize_modules_v3_from_raw_evidence<'a>(
 ) -> Result<OptimizeModulesV3Output> {
     let module_inputs = module_inputs.into_iter().collect::<Vec<_>>();
     let target_index = DirectCallTargetIndex::from_modules(module_inputs.as_slice());
+    let mut evidence_store = evidence_store.clone();
+    for module_input in &module_inputs {
+        evidence_store.record_runtime_module_target(
+            module_input.module.module_name_gen.runtime_module_id(),
+            module_input.identity.module_name.as_str(),
+            module_input.identity.source_hash,
+        );
+    }
     let mut output = OptimizeModulesV3Output::default();
     for module_input in &module_inputs {
         match optimize_module_v3_from_raw_evidence_with_target_index(
-            evidence_store,
+            &evidence_store,
             &module_input.identity,
             module_input.module,
             module_input.strict,
@@ -2114,7 +2236,11 @@ mod tests {
         module: ModuleContentId,
         function: BlockPyFunction<BlockPyModuleShape>,
     ) -> DirectCallTargetEntry {
-        DirectCallTargetEntry { module, function }
+        DirectCallTargetEntry {
+            module,
+            function,
+            module_constants: Vec::new(),
+        }
     }
 
     fn unique_counter_path_v3() -> std::path::PathBuf {
@@ -2255,8 +2381,25 @@ mod tests {
             &caller,
             source,
             &exact_target,
-            &DirectCallCallee::Function
+            &DirectCallCallee::Function,
+            &exact_plan,
         ));
+        let cross_module_target = direct_call_target_entry(
+            ModuleContentId::new("pkg.external", 0x100),
+            simple_arg_return_callee(&[("x", false)]),
+        );
+        assert!(
+            direct_call_inline_candidate_v3(
+                &module,
+                &current_module,
+                &caller,
+                source,
+                &cross_module_target,
+                &DirectCallCallee::Function,
+                &exact_plan,
+            ),
+            "cross-module callees should be inline candidates when the body is remappable"
+        );
 
         let effect_source = instr_id(10);
         let mut effect_only_caller = function_with_blocks(vec![Block::new(
@@ -2280,7 +2423,8 @@ mod tests {
             &effect_only_caller,
             effect_source,
             &exact_target,
-            &DirectCallCallee::Function
+            &DirectCallCallee::Function,
+            &exact_plan,
         ));
 
         let return_source = instr_id(11);
@@ -2305,7 +2449,8 @@ mod tests {
             &return_caller,
             return_source,
             &exact_target,
-            &DirectCallCallee::Function
+            &DirectCallCallee::Function,
+            &exact_plan,
         ));
 
         let constructor_source = instr_id(12);
@@ -2358,7 +2503,67 @@ mod tests {
             &constructor_caller,
             constructor_source,
             &constructor_target,
-            &DirectCallCallee::Function
+            &DirectCallCallee::Function,
+            &constructor_plan,
+        ));
+
+        let mut vararg_constructor_entry = function_with_blocks(vec![Block::new(
+            label(0),
+            Vec::new(),
+            BlockTerm::Return(InstrBlockPy::Call(Call::new(
+                runtime_name(RuntimeName::ConstructorCall),
+                vec![
+                    CallArgPositional::Positional(local(CONSTRUCTOR_ENTRY_TYPE_PARAM_NAME, 0)),
+                    CallArgPositional::Starred(local("args", 1)),
+                ],
+                Vec::new(),
+            ))),
+            Vec::<BlockParam>::new(),
+            None,
+        )]);
+        vararg_constructor_entry.names = FunctionName::new(
+            CONSTRUCTOR_ENTRY_FUNCTION_NAME,
+            CONSTRUCTOR_ENTRY_FUNCTION_NAME,
+            "Record.__soac_constructor_entry__#0:2",
+            "Record.__soac_constructor_entry__#0:2",
+        );
+        vararg_constructor_entry.params.params = vec![
+            any_param(CONSTRUCTOR_ENTRY_TYPE_PARAM_NAME, false),
+            Param {
+                name: "args".to_string(),
+                kind: ParamKind::VarArg,
+                has_default: false,
+            },
+        ];
+        set_stack_slots(
+            &mut vararg_constructor_entry,
+            &[CONSTRUCTOR_ENTRY_TYPE_PARAM_NAME, "args"],
+        );
+        let vararg_constructor_plan = direct_call_arg_plan_for_instr_id_v3(
+            &constructor_caller,
+            constructor_source,
+            &vararg_constructor_entry,
+            1,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            vararg_constructor_plan.sources,
+            vec![
+                DirectCallArgSource::Provided(0),
+                DirectCallArgSource::PackedRest { start: 1 },
+            ]
+        );
+        let vararg_constructor_target =
+            direct_call_target_entry(current_module.clone(), vararg_constructor_entry);
+        assert!(direct_call_inline_candidate_v3(
+            &module,
+            &current_module,
+            &constructor_caller,
+            constructor_source,
+            &vararg_constructor_target,
+            &DirectCallCallee::Function,
+            &vararg_constructor_plan,
         ));
 
         let default_callee = simple_arg_return_callee(&[("x", false), ("y", true)]);
@@ -2380,7 +2585,8 @@ mod tests {
             &caller,
             source,
             &default_target,
-            &DirectCallCallee::Function
+            &DirectCallCallee::Function,
+            &default_plan,
         ));
     }
 

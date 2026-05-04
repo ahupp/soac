@@ -28,6 +28,9 @@ pub fn typed_direct_call_arg_plan_from_v3(plan: &DirectCallArgPlan) -> TypedDire
                 DirectCallArgSource::Provided(index) => {
                     TypedDirectCallArgSource::Provided(*index as usize)
                 }
+                DirectCallArgSource::PackedRest { start } => TypedDirectCallArgSource::PackedRest {
+                    start: *start as usize,
+                },
                 DirectCallArgSource::DefaultSentinel => TypedDirectCallArgSource::DefaultSentinel,
             })
             .collect(),

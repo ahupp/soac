@@ -87,6 +87,7 @@ pub struct DirectCallArgPlan {
 #[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum DirectCallArgSource {
     Provided(u32),
+    PackedRest { start: u32 },
     DefaultSentinel,
 }
 
@@ -1123,13 +1124,14 @@ fn validate_direct_call_arg_plan(
     errors: &mut Vec<String>,
 ) {
     let mut next_provided = 0u32;
+    let mut saw_packed_rest = false;
     let mut saw_default = false;
     for arg_source in &arg_plan.sources {
         match arg_source {
             DirectCallArgSource::Provided(index) => {
-                if saw_default {
+                if saw_packed_rest || saw_default {
                     errors.push(format!(
-                        "function {} {kind} target {} at {} has provided argument after a default sentinel",
+                        "function {} {kind} target {} at {} has provided argument after a rest/default sentinel",
                         function.function.function, target, source
                     ));
                 }
@@ -1140,6 +1142,21 @@ fn validate_direct_call_arg_plan(
                     ));
                 }
                 next_provided = next_provided.saturating_add(1);
+            }
+            DirectCallArgSource::PackedRest { start } => {
+                if saw_packed_rest || saw_default {
+                    errors.push(format!(
+                        "function {} {kind} target {} at {} has packed rest after a rest/default sentinel",
+                        function.function.function, target, source
+                    ));
+                }
+                if *start != next_provided {
+                    errors.push(format!(
+                        "function {} {kind} target {} at {} packs rest from provided argument index {}, expected {}",
+                        function.function.function, target, source, start, next_provided
+                    ));
+                }
+                saw_packed_rest = true;
             }
             DirectCallArgSource::DefaultSentinel => {
                 saw_default = true;

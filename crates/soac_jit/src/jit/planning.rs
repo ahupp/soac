@@ -2,7 +2,7 @@
 use soac_config::SoacEnvConfig;
 use soac_core::block_py::{
     BinOpKind, BlockArg, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, ChildVisitable,
-    ConstantExpr, HasSemanticInstrId, InstrKey, InstrLocationMap, Literal, LocalLocation,
+    ConstantExpr, HasSemanticInstrId, InstrId, InstrKey, InstrLocationMap, Literal, LocalLocation,
     NumberLiteralValue, RuntimeFunctionId, Visit, current_instr_locations, is_internal_symbol,
 };
 #[cfg(test)]
@@ -907,9 +907,16 @@ pub fn plan_jit_typed_module_locals_from_passes(
     module: &BlockPyModule<TypedBlockPyModuleShape>,
     facts: &FactStore,
     local_env_plan: &LocalEnvModulePlan,
+    local_env_resume_plan: &LocalEnvResumeModulePlan,
     refcount_plan: &RefcountPlan,
 ) -> Result<PlannedJitModuleLocals, String> {
     validate_typed_local_env_module_plan(module, facts, local_env_plan)?;
+    validate_typed_local_env_resume_module_plan(
+        module,
+        local_env_plan,
+        facts,
+        local_env_resume_plan,
+    )?;
     validate_typed_ownership_effects(module, facts, refcount_plan)?;
     let mut functions = HashMap::with_capacity(module.callable_defs.len());
     for function in &module.callable_defs {
@@ -922,6 +929,14 @@ pub fn plan_jit_typed_module_locals_from_passes(
                     function.function_id, function.names.qualname
                 )
             })?;
+        let function_resume_plan = local_env_resume_plan
+            .function(function.function_id)
+            .ok_or_else(|| {
+                format!(
+                    "missing LocalEnv resume plan for function {} ({})",
+                    function.function_id, function.names.qualname
+                )
+            })?;
         let function_refcount_plan = refcount_plan
             .function(function.function_id)
             .cloned()
@@ -930,6 +945,7 @@ pub fn plan_jit_typed_module_locals_from_passes(
             function,
             local_plan,
             function_refcount_plan,
+            function_resume_plan,
             &module.module_constants,
         )?;
         if functions
@@ -999,6 +1015,7 @@ pub fn plan_jit_typed_module(
         &module,
         &value_facts,
         &local_env_plan,
+        &local_env_resume_plan,
         &refcount_plan,
     )?;
     let deopt_resume = plan_jit_typed_deopt_resume_module_from_passes(
@@ -1444,6 +1461,7 @@ fn typed_expr_can_satisfy_planned_i64(
     expr: &InstrTyped,
     local_reprs: &HashMap<LocalLocation, RuntimeBlockParamRepr>,
     module_constants: &[ConstantExpr],
+    exact_int_scalar_deopt_instr_ids: &HashSet<InstrId>,
 ) -> bool {
     if typed_expr_planned_const_i64(expr, module_constants).is_some() {
         return true;
@@ -1451,6 +1469,7 @@ fn typed_expr_can_satisfy_planned_i64(
     if expr
         .typed_extra()
         .and_then(|extra| extra.exact_int_return_plan())
+        .filter(|plan| exact_int_scalar_deopt_instr_ids.contains(&plan.instr_id))
         .and_then(exact_int_return_plan_i64_result)
         .is_some()
     {
@@ -1461,12 +1480,17 @@ fn typed_expr_can_satisfy_planned_i64(
             local_reprs.get(&location) == Some(&RuntimeBlockParamRepr::ExactI64)
         }),
         InstrTyped::BinOp(op) if typed_i64_binop_kind_supported(op.kind) => {
-            typed_expr_can_satisfy_planned_i64(op.left.as_ref(), local_reprs, module_constants)
-                && typed_expr_can_satisfy_planned_i64(
-                    op.right.as_ref(),
-                    local_reprs,
-                    module_constants,
-                )
+            typed_expr_can_satisfy_planned_i64(
+                op.left.as_ref(),
+                local_reprs,
+                module_constants,
+                exact_int_scalar_deopt_instr_ids,
+            ) && typed_expr_can_satisfy_planned_i64(
+                op.right.as_ref(),
+                local_reprs,
+                module_constants,
+                exact_int_scalar_deopt_instr_ids,
+            )
         }
         _ => matches!(expr.result_facts(), Some(ValueFacts::I64(_))),
     }
@@ -1531,10 +1555,12 @@ pub(super) fn exact_int_return_plan_immortal_pyobject_result(
 fn typed_expr_can_satisfy_planned_i32_bool01(
     expr: &InstrTyped,
     local_reprs: &HashMap<LocalLocation, RuntimeBlockParamRepr>,
+    exact_int_scalar_deopt_instr_ids: &HashSet<InstrId>,
 ) -> bool {
     if expr
         .typed_extra()
         .and_then(|extra| extra.exact_int_return_plan())
+        .filter(|plan| exact_int_scalar_deopt_instr_ids.contains(&plan.instr_id))
         .and_then(exact_int_return_plan_i32_bool01_result)
         .is_some()
     {
@@ -1573,14 +1599,24 @@ fn typed_store_runtime_repr_for_value(
     local_reprs: &HashMap<LocalLocation, RuntimeBlockParamRepr>,
     module_constants: &[ConstantExpr],
     truthiness_only_local_locations: &HashSet<LocalLocation>,
+    exact_int_scalar_deopt_instr_ids: &HashSet<InstrId>,
 ) -> RuntimeBlockParamRepr {
-    if typed_expr_can_satisfy_planned_i32_bool01(value, local_reprs) {
+    if typed_expr_can_satisfy_planned_i32_bool01(
+        value,
+        local_reprs,
+        exact_int_scalar_deopt_instr_ids,
+    ) {
         RuntimeBlockParamRepr::I32Bool01
     } else if truthiness_only_local_locations.contains(&location)
         && typed_expr_can_satisfy_pyobject_truthiness_repr(value)
     {
         RuntimeBlockParamRepr::I32Bool01
-    } else if typed_expr_can_satisfy_planned_i64(value, local_reprs, module_constants) {
+    } else if typed_expr_can_satisfy_planned_i64(
+        value,
+        local_reprs,
+        module_constants,
+        exact_int_scalar_deopt_instr_ids,
+    ) {
         RuntimeBlockParamRepr::ExactI64
     } else {
         RuntimeBlockParamRepr::PyObject
@@ -1714,6 +1750,7 @@ fn transfer_runtime_local_reprs_for_typed_block(
     entry_reprs: &HashMap<LocalLocation, RuntimeBlockParamRepr>,
     module_constants: &[ConstantExpr],
     truthiness_only_local_locations: &HashSet<LocalLocation>,
+    exact_int_scalar_deopt_instr_ids: &HashSet<InstrId>,
 ) -> HashMap<LocalLocation, RuntimeBlockParamRepr> {
     let mut reprs = entry_reprs.clone();
     for instr in &block.body {
@@ -1728,6 +1765,7 @@ fn transfer_runtime_local_reprs_for_typed_block(
                     &reprs,
                     module_constants,
                     truthiness_only_local_locations,
+                    exact_int_scalar_deopt_instr_ids,
                 );
                 reprs.insert(location, repr);
             }
@@ -1747,6 +1785,7 @@ fn typed_store_runtime_local_repr(
     local_reprs: &HashMap<LocalLocation, RuntimeBlockParamRepr>,
     module_constants: &[ConstantExpr],
     truthiness_only_local_locations: &HashSet<LocalLocation>,
+    exact_int_scalar_deopt_instr_ids: &HashSet<InstrId>,
 ) -> Option<(LocalLocation, RuntimeBlockParamRepr)> {
     let InstrTyped::Store(op) = instr else {
         return None;
@@ -1758,6 +1797,7 @@ fn typed_store_runtime_local_repr(
         local_reprs,
         module_constants,
         truthiness_only_local_locations,
+        exact_int_scalar_deopt_instr_ids,
     );
     Some((location, repr))
 }
@@ -1767,12 +1807,14 @@ fn transfer_runtime_local_repr_for_instr(
     local_reprs: &mut HashMap<LocalLocation, RuntimeBlockParamRepr>,
     module_constants: &[ConstantExpr],
     truthiness_only_local_locations: &HashSet<LocalLocation>,
+    exact_int_scalar_deopt_instr_ids: &HashSet<InstrId>,
 ) {
     if let Some((location, repr)) = typed_store_runtime_local_repr(
         instr,
         local_reprs,
         module_constants,
         truthiness_only_local_locations,
+        exact_int_scalar_deopt_instr_ids,
     ) {
         local_reprs.insert(location, repr);
         return;
@@ -1789,6 +1831,34 @@ fn runtime_block_param_allows_scalar(param: &RuntimeBlockParamPlan) -> bool {
         && param.binding.param_facts.binding == ParamBindingFacts::DefinitelyBound
 }
 
+fn runtime_block_params_include_location(
+    runtime_params: &[RuntimeBlockParamPlan],
+    location: LocalLocation,
+) -> bool {
+    runtime_params
+        .iter()
+        .any(|param| param.binding.location == location && runtime_block_param_allows_scalar(param))
+}
+
+fn runtime_block_params_materialize_location_as_repr(
+    runtime_params: &[RuntimeBlockParamPlan],
+    location: LocalLocation,
+    repr: RuntimeBlockParamRepr,
+) -> bool {
+    runtime_params
+        .iter()
+        .any(|param| param.binding.location == location && param.repr == repr)
+}
+
+fn runtime_block_param_reprs_by_location(
+    runtime_params: &[RuntimeBlockParamPlan],
+) -> HashMap<LocalLocation, RuntimeBlockParamRepr> {
+    runtime_params
+        .iter()
+        .map(|param| (param.binding.location, param.repr))
+        .collect()
+}
+
 fn block_arg_planned_repr(
     source: &BlockArg,
     source_reprs: &HashMap<LocalLocation, RuntimeBlockParamRepr>,
@@ -1800,7 +1870,146 @@ fn block_arg_planned_repr(
     let Some(location) = local_locations_by_name.get(source_name) else {
         return Some(RuntimeBlockParamRepr::PyObject);
     };
-    source_reprs.get(location).copied()
+    Some(
+        source_reprs
+            .get(location)
+            .copied()
+            .unwrap_or(RuntimeBlockParamRepr::PyObject),
+    )
+}
+
+fn typed_block_stores_scalar_runtime_repr(
+    block: &TypedBlock,
+    location: LocalLocation,
+    entry_reprs: &HashMap<LocalLocation, RuntimeBlockParamRepr>,
+    module_constants: &[ConstantExpr],
+    truthiness_only_local_locations: &HashSet<LocalLocation>,
+    exact_int_scalar_deopt_instr_ids: &HashSet<InstrId>,
+) -> bool {
+    let mut local_reprs = entry_reprs.clone();
+    for instr in &block.body {
+        if let Some((stored_location, repr)) = typed_store_runtime_local_repr(
+            instr,
+            &local_reprs,
+            module_constants,
+            truthiness_only_local_locations,
+            exact_int_scalar_deopt_instr_ids,
+        ) {
+            local_reprs.insert(stored_location, repr);
+            if stored_location == location && repr != RuntimeBlockParamRepr::PyObject {
+                return true;
+            }
+            continue;
+        }
+        if let InstrTyped::Del(op) = instr
+            && let Some(deleted_location) = op.name.local_location()
+        {
+            local_reprs.insert(deleted_location, RuntimeBlockParamRepr::PyObject);
+        }
+    }
+    false
+}
+
+fn typed_block_stores_matching_runtime_repr(
+    block: &TypedBlock,
+    location: LocalLocation,
+    required_repr: RuntimeBlockParamRepr,
+    entry_reprs: &HashMap<LocalLocation, RuntimeBlockParamRepr>,
+    module_constants: &[ConstantExpr],
+    truthiness_only_local_locations: &HashSet<LocalLocation>,
+    exact_int_scalar_deopt_instr_ids: &HashSet<InstrId>,
+) -> bool {
+    let mut local_reprs = entry_reprs.clone();
+    for instr in &block.body {
+        if let Some((stored_location, repr)) = typed_store_runtime_local_repr(
+            instr,
+            &local_reprs,
+            module_constants,
+            truthiness_only_local_locations,
+            exact_int_scalar_deopt_instr_ids,
+        ) {
+            local_reprs.insert(stored_location, repr);
+            if stored_location == location && repr == required_repr {
+                return true;
+            }
+            continue;
+        }
+        if let InstrTyped::Del(op) = instr
+            && let Some(deleted_location) = op.name.local_location()
+        {
+            local_reprs.insert(deleted_location, RuntimeBlockParamRepr::PyObject);
+        }
+    }
+    false
+}
+
+fn block_can_forward_scalar_source(
+    source: &BlockArg,
+    source_repr: RuntimeBlockParamRepr,
+    source_block: &TypedBlock,
+    source_runtime_params: &[RuntimeBlockParamPlan],
+    source_reprs: &HashMap<LocalLocation, RuntimeBlockParamRepr>,
+    local_locations_by_name: &HashMap<String, LocalLocation>,
+    module_constants: &[ConstantExpr],
+    truthiness_only_local_locations: &HashSet<LocalLocation>,
+    exact_int_scalar_deopt_instr_ids: &HashSet<InstrId>,
+) -> bool {
+    if source_repr == RuntimeBlockParamRepr::PyObject {
+        return true;
+    }
+    let BlockArg::Name(source_name) = source else {
+        return false;
+    };
+    let Some(location) = local_locations_by_name.get(source_name).copied() else {
+        return false;
+    };
+    runtime_block_params_include_location(source_runtime_params, location)
+        || typed_block_stores_scalar_runtime_repr(
+            source_block,
+            location,
+            source_reprs,
+            module_constants,
+            truthiness_only_local_locations,
+            exact_int_scalar_deopt_instr_ids,
+        )
+}
+
+fn block_can_forward_scalar_source_from_final_plan(
+    source: &BlockArg,
+    required_repr: RuntimeBlockParamRepr,
+    source_block: &TypedBlock,
+    source_runtime_params: &[RuntimeBlockParamPlan],
+    local_locations_by_name: &HashMap<String, LocalLocation>,
+    module_constants: &[ConstantExpr],
+    truthiness_only_local_locations: &HashSet<LocalLocation>,
+    exact_int_scalar_deopt_instr_ids: &HashSet<InstrId>,
+) -> bool {
+    if required_repr == RuntimeBlockParamRepr::PyObject {
+        return true;
+    }
+    let BlockArg::Name(source_name) = source else {
+        return false;
+    };
+    let Some(location) = local_locations_by_name.get(source_name).copied() else {
+        return false;
+    };
+    if runtime_block_params_materialize_location_as_repr(
+        source_runtime_params,
+        location,
+        required_repr,
+    ) {
+        return true;
+    }
+    let source_entry_reprs = runtime_block_param_reprs_by_location(source_runtime_params);
+    typed_block_stores_matching_runtime_repr(
+        source_block,
+        location,
+        required_repr,
+        &source_entry_reprs,
+        module_constants,
+        truthiness_only_local_locations,
+        exact_int_scalar_deopt_instr_ids,
+    )
 }
 
 fn merge_runtime_local_repr(
@@ -1828,8 +2037,13 @@ fn merge_runtime_block_param_edge_reprs(
     runtime_target_params: &[RuntimeBlockParamPlan],
     full_target_param_names: &[String],
     explicit_args: &[BlockArg],
+    source_block: &TypedBlock,
+    source_runtime_params: &[RuntimeBlockParamPlan],
     source_reprs: &HashMap<LocalLocation, RuntimeBlockParamRepr>,
     local_locations_by_name: &HashMap<String, LocalLocation>,
+    module_constants: &[ConstantExpr],
+    truthiness_only_local_locations: &HashSet<LocalLocation>,
+    exact_int_scalar_deopt_instr_ids: &HashSet<InstrId>,
 ) -> bool {
     let explicit_args_by_name = full_target_param_names
         .iter()
@@ -1848,7 +2062,18 @@ fn merge_runtime_block_param_edge_reprs(
         else {
             continue;
         };
-        let incoming = if runtime_block_param_allows_scalar(param) {
+        let can_forward_scalar = block_can_forward_scalar_source(
+            &source,
+            source_repr,
+            source_block,
+            source_runtime_params,
+            source_reprs,
+            local_locations_by_name,
+            module_constants,
+            truthiness_only_local_locations,
+            exact_int_scalar_deopt_instr_ids,
+        );
+        let incoming = if runtime_block_param_allows_scalar(param) && can_forward_scalar {
             source_repr
         } else {
             RuntimeBlockParamRepr::PyObject
@@ -1871,6 +2096,106 @@ fn merge_runtime_block_param_pyobject_edge_reprs(
         );
     }
     changed
+}
+
+fn collect_unforwardable_scalar_edge_param_downgrades(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    runtime_block_params: &[Vec<RuntimeBlockParamPlan>],
+    module_constants: &[ConstantExpr],
+    truthiness_only_local_locations: &HashSet<LocalLocation>,
+    exact_int_scalar_deopt_instr_ids: &HashSet<InstrId>,
+) -> Vec<(usize, usize)> {
+    let block_indices_by_label = typed_block_indices_by_label(function);
+    let local_locations_by_name = local_locations_by_name(function);
+    let mut downgrades = Vec::new();
+
+    let mut visit_edge =
+        |source_index: usize, target_label: BlockLabel, explicit_args: &[BlockArg]| {
+            let source_block = &function.blocks[source_index];
+            let target_index =
+                typed_block_index_for_label(function, &block_indices_by_label, target_label);
+            let target_param_names = function.blocks[target_index].param_name_vec();
+            let explicit_args_by_name = target_param_names
+                .iter()
+                .zip(explicit_args.iter())
+                .map(|(name, arg)| (name.as_str(), arg))
+                .collect::<HashMap<_, _>>();
+            for (param_index, param) in runtime_block_params[target_index].iter().enumerate() {
+                if param.repr == RuntimeBlockParamRepr::PyObject {
+                    continue;
+                }
+                let source = explicit_args_by_name
+                    .get(param.arg_name.as_str())
+                    .copied()
+                    .cloned()
+                    .unwrap_or_else(|| BlockArg::Name(param.arg_name.clone()));
+                if block_can_forward_scalar_source_from_final_plan(
+                    &source,
+                    param.repr,
+                    source_block,
+                    &runtime_block_params[source_index],
+                    &local_locations_by_name,
+                    module_constants,
+                    truthiness_only_local_locations,
+                    exact_int_scalar_deopt_instr_ids,
+                ) {
+                    continue;
+                }
+                downgrades.push((target_index, param_index));
+            }
+        };
+
+    for (source_index, block) in function.blocks.iter().enumerate() {
+        if let Some(exc_edge) = block.exc_edge.as_ref() {
+            visit_edge(source_index, exc_edge.target, &exc_edge.args);
+        }
+        match &block.term {
+            BlockTerm::Jump(edge) => visit_edge(source_index, edge.target, &edge.args),
+            BlockTerm::IfTerm(if_term) => {
+                visit_edge(source_index, if_term.then_label, &[]);
+                visit_edge(source_index, if_term.else_label, &[]);
+            }
+            BlockTerm::BranchTable(branch) => {
+                for target in branch
+                    .targets
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(branch.default_label))
+                {
+                    visit_edge(source_index, target, &[]);
+                }
+            }
+            BlockTerm::Raise(_) | BlockTerm::Return(_) => {}
+        }
+    }
+
+    downgrades.sort_unstable();
+    downgrades.dedup();
+    downgrades
+}
+
+fn downgrade_unforwardable_scalar_runtime_block_params(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    runtime_block_params: &mut [Vec<RuntimeBlockParamPlan>],
+    module_constants: &[ConstantExpr],
+    truthiness_only_local_locations: &HashSet<LocalLocation>,
+    exact_int_scalar_deopt_instr_ids: &HashSet<InstrId>,
+) {
+    loop {
+        let downgrades = collect_unforwardable_scalar_edge_param_downgrades(
+            function,
+            runtime_block_params,
+            module_constants,
+            truthiness_only_local_locations,
+            exact_int_scalar_deopt_instr_ids,
+        );
+        if downgrades.is_empty() {
+            return;
+        }
+        for (block_index, param_index) in downgrades {
+            runtime_block_params[block_index][param_index].repr = RuntimeBlockParamRepr::PyObject;
+        }
+    }
 }
 
 fn force_exception_forwarded_source_reprs_to_pyobject(
@@ -1914,11 +2239,68 @@ fn runtime_block_param_reprs_known(
         .all(|param| entry_reprs.contains_key(&param.binding.location))
 }
 
+fn exact_int_scalar_deopt_instr_ids_for_typed_function(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    resume_plan: &FunctionLocalEnvResumePlan,
+) -> HashSet<InstrId> {
+    struct Collector<'a> {
+        function_id: RuntimeFunctionId,
+        instr_locations: InstrLocationMap,
+        resume_plan: &'a FunctionLocalEnvResumePlan,
+        instr_ids: HashSet<InstrId>,
+    }
+
+    impl Collector<'_> {
+        fn visit_maybe_scalar_exact_int_return(&mut self, expr: &InstrTyped) {
+            let Some(plan) = expr
+                .typed_extra()
+                .and_then(|extra| extra.exact_int_return_plan())
+            else {
+                return;
+            };
+            if exact_int_return_plan_i64_result(plan).is_none()
+                && exact_int_return_plan_i32_bool01_result(plan).is_none()
+            {
+                return;
+            }
+            let Some(location) = self.instr_locations.get(&plan.instr_id) else {
+                return;
+            };
+            if location.body_index().is_none() {
+                return;
+            }
+            let point = LocalEnvResumePoint::BeforeInstr {
+                key: InstrKey::new(self.function_id, plan.instr_id),
+            };
+            if self.resume_plan.entry(point).is_some() {
+                self.instr_ids.insert(plan.instr_id);
+            }
+        }
+    }
+
+    impl Visit<InstrTyped> for Collector<'_> {
+        fn visit_instr(&mut self, expr: &InstrTyped) {
+            self.visit_maybe_scalar_exact_int_return(expr);
+            expr.visit_children(self);
+        }
+    }
+
+    let mut collector = Collector {
+        function_id: function.function_id,
+        instr_locations: current_instr_locations(function),
+        resume_plan,
+        instr_ids: HashSet::new(),
+    };
+    collector.visit_fn(function);
+    collector.instr_ids
+}
+
 fn planned_runtime_block_param_reprs_for_typed_function(
     function: &BlockPyFunction<TypedBlockPyModuleShape>,
     runtime_block_params: &[Vec<RuntimeBlockParamPlan>],
     module_constants: &[ConstantExpr],
     truthiness_only_local_locations: &HashSet<LocalLocation>,
+    exact_int_scalar_deopt_instr_ids: &HashSet<InstrId>,
 ) -> PlannedRuntimeLocalReprs {
     let block_indices_by_label = typed_block_indices_by_label(function);
     let local_locations_by_name = local_locations_by_name(function);
@@ -1963,6 +2345,7 @@ fn planned_runtime_block_param_reprs_for_typed_function(
                 &entry_reprs[source_index],
                 module_constants,
                 truthiness_only_local_locations,
+                exact_int_scalar_deopt_instr_ids,
             );
             if let Some(exc_edge) = block.exc_edge.as_ref() {
                 let target_index =
@@ -1981,8 +2364,13 @@ fn planned_runtime_block_param_reprs_for_typed_function(
                         &runtime_block_params[target_index],
                         &function.blocks[target_index].param_name_vec(),
                         &edge.args,
+                        block,
+                        &runtime_block_params[source_index],
                         &exit_reprs,
                         &local_locations_by_name,
+                        module_constants,
+                        truthiness_only_local_locations,
+                        exact_int_scalar_deopt_instr_ids,
                     );
                 }
                 BlockTerm::IfTerm(if_term) => {
@@ -1994,8 +2382,13 @@ fn planned_runtime_block_param_reprs_for_typed_function(
                             &runtime_block_params[target_index],
                             &function.blocks[target_index].param_name_vec(),
                             &[],
+                            block,
+                            &runtime_block_params[source_index],
                             &exit_reprs,
                             &local_locations_by_name,
+                            module_constants,
+                            truthiness_only_local_locations,
+                            exact_int_scalar_deopt_instr_ids,
                         );
                     }
                 }
@@ -2013,8 +2406,13 @@ fn planned_runtime_block_param_reprs_for_typed_function(
                             &runtime_block_params[target_index],
                             &function.blocks[target_index].param_name_vec(),
                             &[],
+                            block,
+                            &runtime_block_params[source_index],
                             &exit_reprs,
                             &local_locations_by_name,
+                            module_constants,
+                            truthiness_only_local_locations,
+                            exact_int_scalar_deopt_instr_ids,
                         );
                     }
                 }
@@ -2245,6 +2643,7 @@ fn transfer_cleanup_root_slot_state_for_block(
     entry_runtime_reprs: &HashMap<LocalLocation, RuntimeBlockParamRepr>,
     module_constants: &[ConstantExpr],
     truthiness_only_local_locations: &HashSet<LocalLocation>,
+    exact_int_scalar_deopt_instr_ids: &HashSet<InstrId>,
     previous_states: Option<&mut HashMap<InstrKey, HashMap<String, CleanupRootSlotState>>>,
 ) -> HashMap<String, CleanupRootSlotState> {
     let mut state = entry_state.clone();
@@ -2270,6 +2669,7 @@ fn transfer_cleanup_root_slot_state_for_block(
             &runtime_reprs,
             module_constants,
             truthiness_only_local_locations,
+            exact_int_scalar_deopt_instr_ids,
         );
         let Some(instr_id) = instr.try_semantic_instr_id() else {
             transfer_runtime_local_repr_for_instr(
@@ -2277,6 +2677,7 @@ fn transfer_cleanup_root_slot_state_for_block(
                 &mut runtime_reprs,
                 module_constants,
                 truthiness_only_local_locations,
+                exact_int_scalar_deopt_instr_ids,
             );
             continue;
         };
@@ -2287,6 +2688,7 @@ fn transfer_cleanup_root_slot_state_for_block(
                 &mut runtime_reprs,
                 module_constants,
                 truthiness_only_local_locations,
+                exact_int_scalar_deopt_instr_ids,
             );
             continue;
         };
@@ -2339,6 +2741,7 @@ fn transfer_cleanup_root_slot_state_for_block(
             &mut runtime_reprs,
             module_constants,
             truthiness_only_local_locations,
+            exact_int_scalar_deopt_instr_ids,
         );
     }
     state
@@ -2352,6 +2755,7 @@ pub fn planned_cleanup_root_slot_states_for_typed_function(
     runtime_entry_reprs: &[HashMap<LocalLocation, RuntimeBlockParamRepr>],
     module_constants: &[ConstantExpr],
     truthiness_only_local_locations: &HashSet<LocalLocation>,
+    exact_int_scalar_deopt_instr_ids: &HashSet<InstrId>,
 ) -> PlannedCleanupRootSlotStates {
     let block_count = function.blocks.len();
     let block_indices_by_label = typed_block_indices_by_label(function);
@@ -2377,6 +2781,7 @@ pub fn planned_cleanup_root_slot_states_for_typed_function(
                 &runtime_entry_reprs[source_index],
                 module_constants,
                 truthiness_only_local_locations,
+                exact_int_scalar_deopt_instr_ids,
                 None,
             );
             for (target_index, maybe_dispatch) in cleanup_root_slot_successors_for_block(
@@ -2414,6 +2819,7 @@ pub fn planned_cleanup_root_slot_states_for_typed_function(
             &runtime_entry_reprs[index],
             module_constants,
             truthiness_only_local_locations,
+            exact_int_scalar_deopt_instr_ids,
             Some(&mut instr_previous_states),
         );
         block_entry_states.insert(block.label, entry_state);
@@ -2684,11 +3090,14 @@ pub fn plan_jit_typed_function_locals_from_plans(
     function: &BlockPyFunction<TypedBlockPyModuleShape>,
     local_plan: FunctionLocalPlan,
     refcount_plan: FunctionRefcountPlan,
+    local_env_resume_plan: &FunctionLocalEnvResumePlan,
     module_constants: &[ConstantExpr],
 ) -> Result<PlannedJitFunctionLocals, String> {
     let block_indices_by_label = typed_block_indices_by_label(function);
     let cleanup_root_names = planned_cleanup_root_names_for_refcount_plan(&refcount_plan);
     let truthiness_only_local_locations = typed_truthiness_only_internal_local_locations(function);
+    let exact_int_scalar_deopt_instr_ids =
+        exact_int_scalar_deopt_instr_ids_for_typed_function(function, local_env_resume_plan);
     let mut runtime_block_params =
         planned_jit_params_for_typed_function(function, &local_plan, &cleanup_root_names)?;
     let runtime_local_reprs = planned_runtime_block_param_reprs_for_typed_function(
@@ -2696,10 +3105,18 @@ pub fn plan_jit_typed_function_locals_from_plans(
         &runtime_block_params,
         module_constants,
         &truthiness_only_local_locations,
+        &exact_int_scalar_deopt_instr_ids,
     );
     apply_runtime_block_param_reprs(
         &mut runtime_block_params,
         runtime_local_reprs.block_param_reprs,
+    );
+    downgrade_unforwardable_scalar_runtime_block_params(
+        function,
+        &mut runtime_block_params,
+        module_constants,
+        &truthiness_only_local_locations,
+        &exact_int_scalar_deopt_instr_ids,
     );
     let implicit_target_transports =
         planned_implicit_target_transports_for_typed_function(function, &runtime_block_params);
@@ -2752,6 +3169,7 @@ pub fn plan_jit_typed_function_locals_from_plans(
         &runtime_local_reprs.block_entry_reprs,
         module_constants,
         &truthiness_only_local_locations,
+        &exact_int_scalar_deopt_instr_ids,
     );
 
     let plan = PlannedJitFunctionLocals {

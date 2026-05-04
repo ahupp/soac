@@ -29,6 +29,7 @@ use super::symbols::{
 };
 use super::typed_pipeline::{
     JitModulePlan, collect_codegen_constants_for_module_name, optimize_blockpy,
+    optimize_blockpy_for_shared_state,
 };
 use super::vectorcall::define_shared_vectorcall_trampoline;
 use super::{
@@ -469,7 +470,12 @@ impl JitBatchPlan<'_> {
                     Some(shared_state),
                     Some(inputs.session.as_ref()),
                 )?;
-                optimize_blockpy(&shared_state.lowered_module, Some(&profile), env_config)?
+                optimize_blockpy_for_shared_state(
+                    shared_state,
+                    Some(inputs.session.as_ref()),
+                    Some(&profile),
+                    env_config,
+                )?
             } else {
                 optimize_blockpy(inputs.module, None, env_config)?
             };
@@ -2028,7 +2034,6 @@ fn collect_process_jit_batch_functions<'a>(
     let mut seen = HashSet::new();
     let mut queue = VecDeque::new();
     let mut planned_inputs_by_module = HashMap::<usize, PlannedOptimizationInputs>::new();
-    let root_module_id = root.function_id.runtime_module_id();
     seen.insert(root.function_id);
     queue.push_back(ProcessJitBatchFunction {
         function: root.clone(),
@@ -2060,9 +2065,6 @@ fn collect_process_jit_batch_functions<'a>(
                 if function.function.execution_mode() != FunctionExecutionMode::Jit {
                     continue;
                 }
-                if function.function.function_id.runtime_module_id() != root_module_id {
-                    continue;
-                }
                 queue.push_back(function);
             }
         }
@@ -2074,9 +2076,6 @@ fn collect_process_jit_batch_functions<'a>(
                 resolve_process_jit_batch_function(session, direct_call_resolver, function_id)?
             {
                 if function.function.execution_mode() != FunctionExecutionMode::Jit {
-                    continue;
-                }
-                if function.function.function_id.runtime_module_id() != root_module_id {
                     continue;
                 }
                 if is_synthetic_class_helper_function(&function.function) {

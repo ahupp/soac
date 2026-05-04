@@ -909,6 +909,9 @@ fn render_typed_extra_summary(extra: Option<&TypedInstrExtra>) -> String {
     if extra.exact_int_return.is_some() {
         parts.push("exact_int_return".to_string());
     }
+    if let Some(plan) = extra.constructor_init_plan() {
+        parts.push(format!("constructor_init={}", plan.init_function_id));
+    }
     if extra.guard_miss_deopt {
         parts.push("guard_miss_deopt".to_string());
     }

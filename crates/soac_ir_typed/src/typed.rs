@@ -47,6 +47,7 @@ impl<E: Instr> TypedTruthy<E> {
 #[derive(Clone, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum TypedDirectCallArgSource {
     Provided(usize),
+    PackedRest { start: usize },
     DefaultSentinel,
 }
 
@@ -1211,6 +1212,17 @@ impl TypedPlannedResult {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TypedConstructorInitPlanSource {
+    InlinedConstructorEntry,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TypedConstructorInitPlan {
+    pub source: TypedConstructorInitPlanSource,
+    pub init_function_id: RuntimeFunctionId,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TypedInstrExtra {
     pub result_facts: Option<ValueFacts>,
@@ -1220,6 +1232,7 @@ pub struct TypedInstrExtra {
     pub exact_list_item_access: Option<TypedExactListItemAccessPlan>,
     pub exact_int_branch: Option<TypedExactIntBranchPlan>,
     pub exact_int_return: Option<TypedExactIntReturnPlan>,
+    pub constructor_init: Option<TypedConstructorInitPlan>,
     pub guard_miss_deopt: bool,
 }
 
@@ -1348,6 +1361,22 @@ impl TypedInstrExtra {
 
     pub fn clear_exact_int_return_plan(&mut self) -> bool {
         self.exact_int_return.take().is_some()
+    }
+
+    pub fn constructor_init_plan(&self) -> Option<TypedConstructorInitPlan> {
+        self.constructor_init
+    }
+
+    pub fn set_constructor_init_plan(&mut self, plan: TypedConstructorInitPlan) -> bool {
+        if self.constructor_init == Some(plan) {
+            return false;
+        }
+        self.constructor_init = Some(plan);
+        true
+    }
+
+    pub fn clear_constructor_init_plan(&mut self) -> bool {
+        self.constructor_init.take().is_some()
     }
 
     pub fn guard_miss_deopt_enabled(&self) -> bool {

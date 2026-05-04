@@ -13,7 +13,7 @@ use soac_core::block_py::{
     AbruptKind, Block, BlockArg, BlockEdge, BlockLabel, BlockParamRole, BlockPyFunction,
     BlockPyModule, BlockTerm, CallArgKeyword, CallArgPositional, CellLocation, ChildVisitable,
     CounterDef, CounterId, Del, FunctionExecutionMode, FunctionKind, HasSemanticInstrId, InstrId,
-    InstrKey, InstrLocationMap, LocalLocation, ModuleShape, NameLocation, ResolvedName,
+    InstrKey, InstrLocationMap, LocalLocation, ModuleShape, NameLocation, ParamKind, ResolvedName,
     RuntimeFunctionId, RuntimeName, StorageLayout, Store, Visit, current_instr_locations,
 };
 use soac_core::profile::{CollectedTypeKeyLayout, CounterDumpTypeKey};
@@ -254,7 +254,9 @@ use typed_pipeline::{
     apply_profile_typed_guard_miss_policy_to_typed_function,
     apply_profile_typed_plans_to_typed_function,
 };
-use typed_pipeline::{collect_codegen_constants_for_module_name, optimize_blockpy};
+use typed_pipeline::{
+    collect_codegen_constants_for_module_name, optimize_blockpy, optimize_blockpy_for_shared_state,
+};
 pub use typed_value::{
     EmitResult, IntFacts, IntRange, IntWidth, ResultDemand, SoacRepr, SoacValue, ValueOwnership,
 };
@@ -561,8 +563,11 @@ fn emit_codegen_non_local_name_load(
             fb.switch_to_block(value_ok_block);
             Some(fb.block_params(value_ok_block)[0])
         }
-        NameLocation::RuntimeName(_) => {
-            let runtime_name_id = runtime_name_id_value(fb, name.runtime_name_id());
+        NameLocation::RuntimeName(runtime_name) => {
+            if let Some(constant_id) = ctx.module_constants.runtime_name_constant_id(runtime_name) {
+                return Some(emit_owned_module_constant(fb, constant_id, ctx));
+            }
+            let runtime_name_id = runtime_name_id_value(fb, Some(runtime_name));
             let value_inst = fb
                 .ins()
                 .call(ctx.load_runtime_obj_by_id_ref, &[runtime_name_id]);
@@ -1316,6 +1321,119 @@ fn emit_resolved_direct_entry_ptr(
         fb.block_params(ready_block)[0],
         fb.block_params(ready_block)[1],
     )
+}
+
+fn emit_constructor_entry_type_metadata(
+    fb: &mut FunctionBuilder<'_>,
+    ptr_ty: ir::Type,
+    cls_value: ir::Value,
+) -> ir::Value {
+    #[repr(C)]
+    struct PyHeapTypeObjectSoacPrefix {
+        ht_type: ffi::PyTypeObject,
+        as_async: ffi::PyAsyncMethods,
+        as_number: ffi::PyNumberMethods,
+        as_mapping: ffi::PyMappingMethods,
+        as_sequence: ffi::PySequenceMethods,
+        as_buffer: ffi::PyBufferProcs,
+        ht_name: *mut ffi::PyObject,
+        ht_slots: *mut ffi::PyObject,
+        ht_qualname: *mut ffi::PyObject,
+        ht_cached_keys: *mut std::ffi::c_void,
+        ht_module: *mut ffi::PyObject,
+        ht_tpname: *mut i8,
+        ht_token: *mut std::ffi::c_void,
+        ht_soac_metadata: *mut std::ffi::c_void,
+        ht_soac_metadata_destructor: *mut std::ffi::c_void,
+        ht_soac_function_id: u64,
+    }
+
+    fb.ins().load(
+        ptr_ty,
+        ir::MemFlags::trusted(),
+        cls_value,
+        offset_of!(PyHeapTypeObjectSoacPrefix, ht_soac_metadata) as i32,
+    )
+}
+
+fn emit_ready_constructor_entry_function_env(
+    fb: &mut FunctionBuilder<'_>,
+    cls_value: ir::Value,
+    ctx: &JitEmitCtx<'_>,
+) -> ir::Value {
+    let ptr_ty = ctx.consts.ptr_ty;
+    let null_ptr = fb.ins().iconst(ptr_ty, 0);
+    let metadata = emit_constructor_entry_type_metadata(fb, ptr_ty, cls_value);
+    let metadata_is_null = fb
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, metadata, null_ptr);
+    let load_env_block = fb.create_block();
+    let compile_block = fb.create_block();
+    fb.set_cold_block(compile_block);
+    let check_deopt_block = fb.create_block();
+    fb.append_block_param(check_deopt_block, ptr_ty);
+    let done_block = fb.create_block();
+    fb.append_block_param(done_block, ptr_ty);
+
+    fb.ins().brif(
+        metadata_is_null,
+        ctx.consts.step_null_block,
+        &step_null_block_args(ctx),
+        load_env_block,
+        &[],
+    );
+
+    fb.switch_to_block(load_env_block);
+    let function_env = fb.ins().load(
+        ptr_ty,
+        ir::MemFlags::trusted(),
+        metadata,
+        PY_FUNCTION_JIT_EXTRA_FUNCTION_ENV_OFFSET,
+    );
+    let function_env_is_null = fb
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, function_env, null_ptr);
+    fb.ins().brif(
+        function_env_is_null,
+        compile_block,
+        &[],
+        check_deopt_block,
+        &[ir::BlockArg::Value(function_env)],
+    );
+
+    fb.switch_to_block(check_deopt_block);
+    let ready_env = fb.block_params(check_deopt_block)[0];
+    let deopt_table =
+        load_function_env_obj(fb, ptr_ty, ready_env, FUNCTION_ENV_DEOPT_TABLE_PTR_OFFSET);
+    let deopt_table_is_null = fb
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, deopt_table, null_ptr);
+    fb.ins().brif(
+        deopt_table_is_null,
+        compile_block,
+        &[],
+        done_block,
+        &[ir::BlockArg::Value(ready_env)],
+    );
+
+    fb.switch_to_block(compile_block);
+    let compiled_env_inst = fb
+        .ins()
+        .call(ctx.direct_compile_function_env_ref, &[cls_value, metadata]);
+    let compiled_env = fb.inst_results(compiled_env_inst)[0];
+    let compiled_env_is_null = fb
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, compiled_env, null_ptr);
+    fb.ins().brif(
+        compiled_env_is_null,
+        ctx.consts.step_null_block,
+        &step_null_block_args(ctx),
+        done_block,
+        &[ir::BlockArg::Value(compiled_env)],
+    );
+
+    fb.switch_to_block(done_block);
+    fb.block_params(done_block)[0]
 }
 
 fn emit_take_current_raised_exception(
@@ -8009,9 +8127,10 @@ fn emit_direct_call_args_from_plan(
     arg_plan: &DirectCallArgPlan,
     provided_arg_values: Vec<ir::Value>,
     provided_arg_borrowed: Vec<bool>,
-    ptr_ty: ir::Type,
+    ctx: &JitEmitCtx<'_>,
 ) -> (Vec<ir::Value>, Vec<bool>) {
     debug_assert_eq!(provided_arg_values.len(), provided_arg_borrowed.len());
+    let ptr_ty = ctx.consts.ptr_ty;
     let null_ptr = fb.ins().iconst(ptr_ty, 0);
     let mut arg_values = Vec::with_capacity(arg_plan.len());
     let mut arg_borrowed = Vec::with_capacity(arg_plan.len());
@@ -8026,6 +8145,26 @@ fn emit_direct_call_args_from_plan(
                 arg_values.push(provided_arg_values[index]);
                 arg_borrowed.push(provided_arg_borrowed[index]);
                 used_provided_args += 1;
+            }
+            DirectCallArgSource::PackedRest { start } => {
+                debug_assert_eq!(
+                    start, used_provided_args,
+                    "direct-call arg plans should pack the next provided arg"
+                );
+                let tuple = emit_pack_current_values_tuple(fb, &provided_arg_values[start..], ctx);
+                for (value, borrowed) in provided_arg_values[start..]
+                    .iter()
+                    .copied()
+                    .zip(provided_arg_borrowed[start..].iter().copied())
+                {
+                    if !borrowed {
+                        fb.ins()
+                            .call(ctx.decref_ref, &[ctx.consts.thread_state_value, value]);
+                    }
+                }
+                arg_values.push(tuple);
+                arg_borrowed.push(false);
+                used_provided_args = provided_arg_values.len();
             }
             DirectCallArgSource::DefaultSentinel => {
                 arg_values.push(null_ptr);
@@ -8049,7 +8188,6 @@ fn emit_direct_call_resolved_with_arg_plan_from_local_env(
     codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> ir::Value {
-    let ptr_ty = ctx.consts.ptr_ty;
     let implicit_callable_arg = is_constructor_entry_function(target_function);
     let mut provided_arg_values: Vec<ir::Value> =
         Vec::with_capacity(args.len() + usize::from(implicit_callable_arg));
@@ -8078,7 +8216,7 @@ fn emit_direct_call_resolved_with_arg_plan_from_local_env(
         arg_plan,
         provided_arg_values,
         provided_arg_borrowed,
-        ptr_ty,
+        ctx,
     );
     emit_direct_call_resolved_with_arg_values(
         fb,
@@ -8142,7 +8280,6 @@ fn emit_typed_direct_call_resolved_with_arg_plan_from_local_env(
     codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<ir::Value, String> {
-    let ptr_ty = ctx.consts.ptr_ty;
     let implicit_callable_arg = is_constructor_entry_function(target_function);
     let mut provided_arg_values: Vec<ir::Value> =
         Vec::with_capacity(args.len() + usize::from(implicit_callable_arg));
@@ -8170,7 +8307,7 @@ fn emit_typed_direct_call_resolved_with_arg_plan_from_local_env(
         arg_plan,
         provided_arg_values,
         provided_arg_borrowed,
-        ptr_ty,
+        ctx,
     );
     Ok(emit_direct_call_resolved_with_arg_values(
         fb,
@@ -8201,7 +8338,6 @@ fn emit_direct_method_resolved_with_args_from_local_env(
     codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> ir::Value {
-    let ptr_ty = ctx.consts.ptr_ty;
     let mut provided_arg_values = Vec::with_capacity(args.len() + 1);
     let mut provided_arg_borrowed = Vec::with_capacity(args.len() + 1);
     provided_arg_values.push(receiver);
@@ -8225,7 +8361,7 @@ fn emit_direct_method_resolved_with_args_from_local_env(
         &specialization.arg_plan,
         provided_arg_values,
         provided_arg_borrowed,
-        ptr_ty,
+        ctx,
     );
     let callable = emit_callable_ptr_value_for_ref(
         fb,
@@ -8264,7 +8400,6 @@ fn emit_typed_direct_method_resolved_with_args_from_local_env(
     codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<ir::Value, String> {
-    let ptr_ty = ctx.consts.ptr_ty;
     let mut provided_arg_values = Vec::with_capacity(args.len() + 1);
     let mut provided_arg_borrowed = Vec::with_capacity(args.len() + 1);
     provided_arg_values.push(receiver);
@@ -8287,7 +8422,7 @@ fn emit_typed_direct_method_resolved_with_args_from_local_env(
         &specialization.arg_plan,
         provided_arg_values,
         provided_arg_borrowed,
-        ptr_ty,
+        ctx,
     );
     let callable = emit_callable_ptr_value_for_ref(
         fb,
@@ -10296,6 +10431,34 @@ fn emit_typed_positional_arg_values(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn emit_typed_borrowed_positional_arg_values(
+    fb: &mut FunctionBuilder<'_>,
+    args: &[&InstrTyped],
+    local_env: &mut LocalEnv,
+    ctx: &JitEmitCtx<'_>,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+    site: &str,
+) -> Result<Vec<ir::Value>, String> {
+    let mut arg_values = Vec::with_capacity(args.len());
+    for arg in args {
+        let (value, ownership, _) = emit_typed_pyobject_value_with_local_env(
+            fb,
+            arg,
+            local_env,
+            ctx,
+            true,
+            codegen_env,
+            func_imports,
+            site,
+        )?;
+        debug_assert!(!ownership.is_owned());
+        arg_values.push(value);
+    }
+    Ok(arg_values)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn emit_typed_positional_call_result_with_arg_refs(
     fb: &mut FunctionBuilder<'_>,
     callable: ir::Value,
@@ -10364,11 +10527,87 @@ fn current_constructor_entry_init_function<'a>(
 fn blockpy_expr_is_constructor_call(expr: &InstrBlockPy, emit_ctx: &JitEmitCtx<'_>) -> bool {
     codegen_expr_static_runtime_name(expr, emit_ctx.module_constants)
         == Some(RuntimeName::ConstructorCall.name())
+        || codegen_expr_helper_name(expr, emit_ctx.module_constants)
+            == Some(RuntimeName::ConstructorCall.name())
 }
 
 fn typed_expr_is_constructor_call(expr: &InstrTyped, emit_ctx: &JitEmitCtx<'_>) -> bool {
     typed_expr_static_runtime_name(expr, emit_ctx.module_constants)
         == Some(RuntimeName::ConstructorCall.name())
+        || typed_expr_helper_name(expr, emit_ctx.module_constants)
+            == Some(RuntimeName::ConstructorCall.name())
+}
+
+#[derive(Clone, Copy)]
+enum ConstructorInitUserArgSource {
+    Provided { index: usize },
+    PackedRest { start: usize },
+}
+
+fn constructor_init_user_arg_sources(
+    init_function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    user_arg_count: usize,
+) -> Option<Vec<ConstructorInitUserArgSource>> {
+    let first_param = init_function.params.iter().next()?;
+    if !matches!(first_param.kind, ParamKind::PosOnly | ParamKind::Any) {
+        return None;
+    }
+
+    let mut sources = Vec::with_capacity(init_function.params.len().saturating_sub(1));
+    let mut next_user_arg = 0usize;
+    let mut packed_rest = false;
+    for param in init_function.params.iter().skip(1) {
+        match param.kind {
+            ParamKind::PosOnly | ParamKind::Any => {
+                if packed_rest || next_user_arg >= user_arg_count {
+                    return None;
+                }
+                sources.push(ConstructorInitUserArgSource::Provided {
+                    index: next_user_arg,
+                });
+                next_user_arg += 1;
+            }
+            ParamKind::VarArg => {
+                if packed_rest {
+                    return None;
+                }
+                sources.push(ConstructorInitUserArgSource::PackedRest {
+                    start: next_user_arg,
+                });
+                next_user_arg = user_arg_count;
+                packed_rest = true;
+            }
+            ParamKind::KwOnly | ParamKind::KwArg => return None,
+        }
+    }
+    (next_user_arg == user_arg_count).then_some(sources)
+}
+
+fn emit_constructor_init_user_arg_values(
+    fb: &mut FunctionBuilder<'_>,
+    sources: &[ConstructorInitUserArgSource],
+    user_arg_values: &[ir::Value],
+    emit_ctx: &JitEmitCtx<'_>,
+) -> (Vec<ir::Value>, Vec<bool>) {
+    let mut arg_values = Vec::with_capacity(sources.len());
+    let mut arg_borrowed = Vec::with_capacity(sources.len());
+    for source in sources {
+        match *source {
+            ConstructorInitUserArgSource::Provided { index } => {
+                arg_values.push(user_arg_values[index]);
+                arg_borrowed.push(true);
+            }
+            ConstructorInitUserArgSource::PackedRest { start } => {
+                arg_values.push(emit_pack_current_values_tuple(
+                    fb,
+                    &user_arg_values[start..],
+                    emit_ctx,
+                ));
+                arg_borrowed.push(false);
+            }
+        }
+    }
+    (arg_values, arg_borrowed)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -10377,9 +10616,22 @@ fn emit_constructor_entry_direct_init_call_with_arg_values(
     init_function: &BlockPyFunction<TypedBlockPyModuleShape>,
     cls_value: ir::Value,
     user_arg_values: Vec<ir::Value>,
+    user_arg_sources: &[ConstructorInitUserArgSource],
     emit_ctx: &JitEmitCtx<'_>,
     codegen_env: &mut impl JitCodegenEnv,
 ) -> ir::Value {
+    let (init_user_arg_values, init_user_arg_borrowed) = emit_constructor_init_user_arg_values(
+        fb,
+        user_arg_sources,
+        user_arg_values.as_slice(),
+        emit_ctx,
+    );
+    let owned_init_user_arg_values = init_user_arg_values
+        .iter()
+        .copied()
+        .zip(init_user_arg_borrowed.iter().copied())
+        .filter_map(|(value, borrowed)| (!borrowed).then_some(value))
+        .collect::<Vec<_>>();
     let direct_func_id = emit_ctx
         .direct_call_functions
         .get(&init_function.function_id)
@@ -10395,13 +10647,17 @@ fn emit_constructor_entry_direct_init_call_with_arg_values(
     let allocated_is_null = fb
         .ins()
         .icmp(ir::condcodes::IntCC::Equal, allocated, null_ptr);
+    let alloc_failed_block = fb.create_block();
+    fb.set_cold_block(alloc_failed_block);
     let enter_block = fb.create_block();
-    fb.ins().brif(
-        allocated_is_null,
+    fb.ins()
+        .brif(allocated_is_null, alloc_failed_block, &[], enter_block, &[]);
+
+    fb.switch_to_block(alloc_failed_block);
+    emit_release_owned_inputs(fb, emit_ctx, &owned_init_user_arg_values);
+    fb.ins().jump(
         emit_ctx.consts.step_null_block,
         &step_null_block_args(emit_ctx),
-        enter_block,
-        &[],
     );
 
     fb.switch_to_block(enter_block);
@@ -10421,7 +10677,9 @@ fn emit_constructor_entry_direct_init_call_with_arg_values(
         .brif(enter_failed, enter_failed_block, &[], init_call_block, &[]);
 
     fb.switch_to_block(enter_failed_block);
-    emit_release_owned_inputs(fb, emit_ctx, &[allocated]);
+    let mut enter_failed_owned_inputs = owned_init_user_arg_values.clone();
+    enter_failed_owned_inputs.push(allocated);
+    emit_release_owned_inputs(fb, emit_ctx, &enter_failed_owned_inputs);
     fb.ins().jump(
         emit_ctx.consts.step_null_block,
         &step_null_block_args(emit_ctx),
@@ -10431,13 +10689,20 @@ fn emit_constructor_entry_direct_init_call_with_arg_values(
     let func_ref = codegen_env
         .codegen_declare_func_in_func(direct_func_id, &mut fb.func)
         .expect("reserved constructor init function should be declared in codegen env");
-    let mut init_call_args = Vec::with_capacity(user_arg_values.len() + 3);
-    init_call_args.push(emit_ctx.consts.function_env_value);
+    let init_function_env = current_constructor_entry_init_function(emit_ctx)
+        .filter(|current_init_function| {
+            current_init_function.function_id == init_function.function_id
+        })
+        .map(|_| emit_ctx.consts.function_env_value)
+        .unwrap_or_else(|| emit_ready_constructor_entry_function_env(fb, cls_value, emit_ctx));
+    let mut init_call_args = Vec::with_capacity(init_user_arg_values.len() + 3);
+    init_call_args.push(init_function_env);
     init_call_args.push(emit_ctx.consts.thread_state_value);
     init_call_args.push(allocated);
-    init_call_args.extend(user_arg_values.iter().copied());
+    init_call_args.extend(init_user_arg_values.iter().copied());
     let init_call_inst = fb.ins().call(func_ref, &init_call_args);
     let init_result = fb.inst_results(init_call_inst)[0];
+    emit_release_owned_inputs(fb, emit_ctx, &owned_init_user_arg_values);
     let init_result_is_null = fb
         .ins()
         .icmp(ir::condcodes::IntCC::Equal, init_result, null_ptr);
@@ -10497,7 +10762,12 @@ fn emit_codegen_constructor_entry_call_with_local_env(
         return None;
     }
     let init_function = current_constructor_entry_init_function(emit_ctx)?;
-    if simple_args.len() != init_function.params.len() || simple_args.is_empty() {
+    if simple_args.is_empty() {
+        return None;
+    }
+    let user_arg_sources =
+        constructor_init_user_arg_sources(init_function, simple_args.len().checked_sub(1)?)?;
+    if user_arg_sources.len() + 1 != init_function.params.len() {
         return None;
     }
     if !emit_ctx
@@ -10527,6 +10797,7 @@ fn emit_codegen_constructor_entry_call_with_local_env(
         init_function,
         cls_value,
         arg_values[1..].to_vec(),
+        user_arg_sources.as_slice(),
         emit_ctx,
         codegen_env,
     ))
@@ -10543,13 +10814,29 @@ fn emit_typed_constructor_entry_call_with_local_env(
     codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<Option<EmitResult>, String> {
-    if !typed_expr_is_constructor_call(call.func.as_ref(), emit_ctx) {
+    let constructor_init_plan = call.extra.constructor_init_plan();
+    if constructor_init_plan.is_none()
+        && !typed_expr_is_constructor_call(call.func.as_ref(), emit_ctx)
+    {
         return Ok(None);
     }
-    let Some(init_function) = current_constructor_entry_init_function(emit_ctx) else {
+    let Some(init_function) = call
+        .extra
+        .constructor_init_plan()
+        .and_then(|plan| direct_call_target_function(emit_ctx, plan.init_function_id))
+        .or_else(|| current_constructor_entry_init_function(emit_ctx))
+    else {
         return Ok(None);
     };
-    if arg_refs.len() != init_function.params.len() || arg_refs.is_empty() {
+    if arg_refs.is_empty() {
+        return Ok(None);
+    }
+    let Some(user_arg_sources) =
+        constructor_init_user_arg_sources(init_function, arg_refs.len() - 1)
+    else {
+        return Ok(None);
+    };
+    if user_arg_sources.len() + 1 != init_function.params.len() {
         return Ok(None);
     }
     if !emit_ctx
@@ -10558,27 +10845,32 @@ fn emit_typed_constructor_entry_call_with_local_env(
     {
         return Ok(None);
     }
-    if !arg_refs
-        .iter()
-        .all(|arg| typed_expr_pyobject_input_is_borrowed_from_local_env(arg, local_env, emit_ctx))
-    {
+    if !arg_refs.iter().all(|arg| {
+        typed_expr_is_borrowable_from_local_env(
+            arg,
+            local_env,
+            &emit_ctx.stack_slots,
+            emit_ctx.storage_layout.as_ref(),
+        )
+    }) {
         return Ok(None);
     }
-    let (arg_values, arg_borrowed) = emit_typed_positional_arg_values(
+    let arg_values = emit_typed_borrowed_positional_arg_values(
         fb,
         arg_refs,
         local_env,
         emit_ctx,
         codegen_env,
         func_imports,
+        "typed constructor-entry borrowed arg",
     )?;
-    debug_assert!(arg_borrowed.iter().all(|is_borrowed| *is_borrowed));
     let cls_value = arg_values[0];
     let result = emit_constructor_entry_direct_init_call_with_arg_values(
         fb,
         init_function,
         cls_value,
         arg_values[1..].to_vec(),
+        user_arg_sources.as_slice(),
         emit_ctx,
         codegen_env,
     );
@@ -20241,11 +20533,20 @@ pub unsafe fn render_instr_typed_for_codegen_with_runtime_state(
         Some(compile_session),
     )?;
     predeclare_specialization_type_imports(&mut jit_module, &specialization_profile)?;
-    let jit_module_plan = optimize_blockpy(
-        module,
-        Some(&specialization_profile),
-        compile_session.env_config()?,
-    )?;
+    let jit_module_plan = if let Some(shared_state) = runtime_state {
+        optimize_blockpy_for_shared_state(
+            shared_state,
+            Some(compile_session),
+            Some(&specialization_profile),
+            compile_session.env_config()?,
+        )?
+    } else {
+        optimize_blockpy(
+            module,
+            Some(&specialization_profile),
+            compile_session.env_config()?,
+        )?
+    };
     let render_module = jit_module_plan.module.as_ref();
     let render_function = render_module
         .callable_defs
@@ -20328,11 +20629,20 @@ pub unsafe fn render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
         Some(compile_session),
     )?;
     predeclare_specialization_type_imports(&mut jit_module, &specialization_profile)?;
-    let jit_module_plan = optimize_blockpy(
-        module,
-        Some(&specialization_profile),
-        compile_session.env_config()?,
-    )?;
+    let jit_module_plan = if let Some(shared_state) = runtime_state {
+        optimize_blockpy_for_shared_state(
+            shared_state,
+            Some(compile_session),
+            Some(&specialization_profile),
+            compile_session.env_config()?,
+        )?
+    } else {
+        optimize_blockpy(
+            module,
+            Some(&specialization_profile),
+            compile_session.env_config()?,
+        )?
+    };
     let render_module = jit_module_plan.module.as_ref();
     let render_function = render_module
         .callable_defs

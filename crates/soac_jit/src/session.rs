@@ -239,6 +239,17 @@ impl CompileSession {
             .for_module_identity(module_name, source_hash))
     }
 
+    pub(crate) fn shared_module_states_snapshot(
+        &self,
+    ) -> Result<Vec<Arc<SharedModuleState>>, String> {
+        Ok(self
+            .shared_module_states
+            .lock()
+            .map_err(|_| "compile session shared module state lock poisoned".to_string())?
+            .retained
+            .clone())
+    }
+
     pub fn lookup_shared_function(
         &self,
         function_id: RuntimeFunctionId,

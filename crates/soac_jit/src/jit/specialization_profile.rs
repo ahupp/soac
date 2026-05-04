@@ -33,7 +33,10 @@ use soac_opt::call_emission_v3::{
     ResolvedV3DirectCallPlan, direct_call_targets as opt_v3_direct_call_targets,
     direct_calls_for_function_from_artifacts as opt_v3_emitted_direct_calls_for_function,
 };
-use soac_opt::pipeline_v3::plan_and_emit_module_v3_from_raw_evidence;
+use soac_opt::pipeline_v3::{
+    ModuleOptimizationInput, optimize_modules_v3_from_raw_evidence,
+    plan_and_emit_module_v3_from_raw_evidence,
+};
 use soac_opt::plan::ProfileEvidenceStore;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -82,6 +85,19 @@ pub(crate) struct PlannedOptimizationInputs {
 }
 
 impl PlannedOptimizationInputs {
+    fn extend(&mut self, other: PlannedOptimizationInputs) {
+        self.opt_v3_emitted_direct_calls
+            .extend(other.opt_v3_emitted_direct_calls);
+        self.opt_v3_emitted_exact_list_items
+            .extend(other.opt_v3_emitted_exact_list_items);
+        self.opt_v3_emitted_indexed_fields
+            .extend(other.opt_v3_emitted_indexed_fields);
+        self.opt_v3_emitted_indexed_globals
+            .extend(other.opt_v3_emitted_indexed_globals);
+        self.opt_v3_exact_int_branch_artifacts
+            .extend(other.opt_v3_exact_int_branch_artifacts);
+    }
+
     fn v3_direct_function_call_targets(
         &self,
         function_id: RuntimeFunctionId,
@@ -160,21 +176,85 @@ fn planned_typed_v3_runtime_inputs_from_raw_evidence(
 ) -> Result<PlannedOptimizationInputs, String> {
     let evidence_store = ProfileEvidenceStore::from_counter_dump(counter_dump_path)
         .map_err(|err| err.to_string())?;
+    if let Some(compile_session) = compile_session {
+        return planned_typed_v3_runtime_inputs_from_raw_evidence_with_session_modules(
+            shared_state,
+            compile_session,
+            &evidence_store,
+        );
+    }
     let artifacts = plan_and_emit_module_v3_from_raw_evidence(
         &AlternativeCatalog::default_v3(),
-        ModulePlanIdentity {
-            module_name: shared_state.module_name.clone(),
-            source_hash: shared_state.source_hash,
-            cache_identity: pre_optimization_module_cache_identity(
-                env!("SOAC_BUILD_IDENTITY"),
-                shared_state.module_name == "soac.runtime",
-            ),
-        },
+        module_plan_identity_for_shared_state(shared_state),
         &shared_state.lowered_module,
         &evidence_store,
     )
     .map_err(|err| err.to_string())?;
     planned_optimization_inputs_from_v3_artifacts(&artifacts, shared_state, compile_session)
+}
+
+fn module_plan_identity_for_shared_state(shared_state: &SharedModuleState) -> ModulePlanIdentity {
+    ModulePlanIdentity {
+        module_name: shared_state.module_name.clone(),
+        source_hash: shared_state.source_hash,
+        cache_identity: pre_optimization_module_cache_identity(
+            env!("SOAC_BUILD_IDENTITY"),
+            shared_state.module_name == "soac.runtime",
+        ),
+    }
+}
+
+fn planned_typed_v3_runtime_inputs_from_raw_evidence_with_session_modules(
+    shared_state: &SharedModuleState,
+    compile_session: &crate::session::CompileSession,
+    evidence_store: &ProfileEvidenceStore,
+) -> Result<PlannedOptimizationInputs, String> {
+    let current_identity = module_plan_identity_for_shared_state(shared_state);
+    let external_states = compile_session.shared_module_states_snapshot()?;
+    let mut module_inputs = vec![ModuleOptimizationInput::new(
+        current_identity.clone(),
+        &shared_state.lowered_module,
+        true,
+    )];
+    for external_state in &external_states {
+        if external_state.module_name == shared_state.module_name
+            && external_state.source_hash == shared_state.source_hash
+        {
+            continue;
+        }
+        module_inputs.push(ModuleOptimizationInput::new(
+            module_plan_identity_for_shared_state(external_state),
+            &external_state.lowered_module,
+            false,
+        ));
+    }
+    let planned = optimize_modules_v3_from_raw_evidence(evidence_store, module_inputs)
+        .map_err(|err| err.to_string())?;
+    let mut inputs = PlannedOptimizationInputs::default();
+    for module in planned.modules {
+        let module_shared_state_owner;
+        let module_shared_state = if module.identity.module_name == shared_state.module_name
+            && module.identity.source_hash == shared_state.source_hash
+        {
+            shared_state
+        } else {
+            let Some(found) = compile_session.shared_module_state_for_identity(
+                &module.identity.module_name,
+                module.identity.source_hash,
+            )?
+            else {
+                continue;
+            };
+            module_shared_state_owner = found;
+            module_shared_state_owner.as_ref()
+        };
+        inputs.extend(planned_optimization_inputs_from_v3_artifacts(
+            &module.artifacts,
+            module_shared_state,
+            Some(compile_session),
+        )?);
+    }
+    Ok(inputs)
 }
 
 pub(super) fn planned_optimization_inputs_from_v3_artifacts(

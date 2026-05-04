@@ -16,15 +16,15 @@ use super::{
     emit_decref_unforwarded_local_env, emit_deopt_resume_call, infer_jit_value_facts,
     local_ref_kind_for_stack_mirror, lookup_registered_jit_data_symbol,
     nest_clif_blocks_by_nearest_dominator, normalize_postopt_clif_for_inspection, optimize_blockpy,
-    parse_runtime_clif_functions, placeholder_module_constant_ptrs,
-    planned_owned_pyobject_result_for_typed_expr, precompile_codegen_module_to_object_bytes,
-    predeclare_specialization_type_imports, predeclare_typed_direct_call_imports,
-    refresh_typed_function_value_facts, render_compiled_clif_and_vcode_disasm,
-    rewrite_clif_function_aliases, run_blockpy_function_from_entry,
-    run_blockpy_function_from_vectorcall_entry, runtime_jit_deopt_guard_operand_replay_safe,
-    runtime_jit_typed_deopt_guard_operand_replay_safe, scalar_counter_storage_symbol_for_instance,
-    static_runtime_primitive_desc_for_call, static_runtime_primitive_for_call,
-    top_value_counter_storage_symbol_for_instance,
+    optimize_blockpy_for_shared_state, parse_runtime_clif_functions,
+    placeholder_module_constant_ptrs, planned_owned_pyobject_result_for_typed_expr,
+    precompile_codegen_module_to_object_bytes, predeclare_specialization_type_imports,
+    predeclare_typed_direct_call_imports, refresh_typed_function_value_facts,
+    render_compiled_clif_and_vcode_disasm, rewrite_clif_function_aliases,
+    run_blockpy_function_from_entry, run_blockpy_function_from_vectorcall_entry,
+    runtime_jit_deopt_guard_operand_replay_safe, runtime_jit_typed_deopt_guard_operand_replay_safe,
+    scalar_counter_storage_symbol_for_instance, static_runtime_primitive_desc_for_call,
+    static_runtime_primitive_for_call, top_value_counter_storage_symbol_for_instance,
     typed_expr_planned_pyobject_input_is_borrowed_from_local_env,
 };
 use soac_core::block_py::IncrementCounter;
@@ -121,12 +121,13 @@ mod tests {
         emit_decref_unforwarded_local_env, emit_deopt_resume_call, infer_jit_value_facts,
         local_ref_kind_for_stack_mirror, lookup_registered_jit_data_symbol,
         nest_clif_blocks_by_nearest_dominator, normalize_postopt_clif_for_inspection,
-        optimize_blockpy, parse_runtime_clif_functions, placeholder_module_constant_ptrs,
-        planned_owned_pyobject_result_for_typed_expr, precompile_codegen_module_to_object_bytes,
-        predeclare_specialization_type_imports, predeclare_typed_direct_call_imports,
-        refresh_typed_function_value_facts, render_compiled_clif_and_vcode_disasm,
-        rewrite_clif_function_aliases, run_blockpy_function_from_entry,
-        run_blockpy_function_from_vectorcall_entry, runtime_jit_deopt_guard_operand_replay_safe,
+        optimize_blockpy, optimize_blockpy_for_shared_state, parse_runtime_clif_functions,
+        placeholder_module_constant_ptrs, planned_owned_pyobject_result_for_typed_expr,
+        precompile_codegen_module_to_object_bytes, predeclare_specialization_type_imports,
+        predeclare_typed_direct_call_imports, refresh_typed_function_value_facts,
+        render_compiled_clif_and_vcode_disasm, rewrite_clif_function_aliases,
+        run_blockpy_function_from_entry, run_blockpy_function_from_vectorcall_entry,
+        runtime_jit_deopt_guard_operand_replay_safe,
         runtime_jit_typed_deopt_guard_operand_replay_safe,
         scalar_counter_storage_symbol_for_instance, static_runtime_primitive_desc_for_call,
         static_runtime_primitive_for_call, top_value_counter_storage_symbol_for_instance,
@@ -5472,8 +5473,17 @@ def build(values):
         vararg_target.params.params = vec![test_param("args", ParamKind::VarArg, false)];
         assert_eq!(
             plan_direct_call_args_for_target(&vararg_target, 0, 0, false, false),
+            Ok(DirectCallArgPlan {
+                sources: vec![DirectCallArgSource::PackedRest { start: 0 }],
+            })
+        );
+
+        let mut kwarg_target = test_function();
+        kwarg_target.params.params = vec![test_param("kwargs", ParamKind::KwArg, false)];
+        assert_eq!(
+            plan_direct_call_args_for_target(&kwarg_target, 0, 0, false, false),
             Err(DirectCallIncompatibility::UnsupportedParameterKind {
-                kind: ParamKind::VarArg,
+                kind: ParamKind::KwArg,
             })
         );
     }
@@ -18370,6 +18380,187 @@ def f(x, y):
             assert!(
                 stale_err.contains("typed specialized JIT function block count mismatch"),
                 "{stale_err}"
+            );
+        });
+    }
+
+    #[test]
+    fn runtime_typed_v3_pipeline_inlines_cross_module_direct_calls() {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "runtime_typed_v3_pipeline_inlines_cross_module_direct_calls",
+        ) {
+            return;
+        }
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| {
+            let soac_work_dir = fresh_test_work_dir("runtime-typed-v3-cross-module-inline");
+            let _work_dir = EnvVarGuard::set_os("SOAC_WORK_DIR", soac_work_dir.as_os_str());
+            let _opt_mode = set_opt_mode("verify");
+
+            let caller_module_name = "runtime_typed_v3_cross_module_inline_caller";
+            let callee_module_name = "runtime_typed_v3_cross_module_inline_callee";
+            let caller_module_name_gen = ModuleNameGen::new(37);
+            let callee_module_name_gen = ModuleNameGen::new(38);
+
+            let mut callee_function = test_function_in_module(&callee_module_name_gen, "callee");
+            callee_function.params.params.push(Param {
+                name: "x".into(),
+                kind: ParamKind::Any,
+                has_default: false,
+            });
+            callee_function = with_single_test_block(
+                callee_function,
+                vec![],
+                ret_term(name_expr(test_local_name("x", 0))),
+            );
+            set_stack_slots(&mut callee_function, &["x"]);
+
+            let mut caller_function = test_function_in_module(&caller_module_name_gen, "caller");
+            caller_function.params.params.extend([
+                Param {
+                    name: "fn".into(),
+                    kind: ParamKind::Any,
+                    has_default: false,
+                },
+                Param {
+                    name: "x".into(),
+                    kind: ParamKind::Any,
+                    has_default: false,
+                },
+            ]);
+            let caller_block_label = caller_function.name_gen.next_block_name();
+            let call_instr_id = InstrId::new(1);
+            caller_function = with_test_blocks(
+                caller_function,
+                vec![BlockPyBlock {
+                    label: caller_block_label,
+                    body: vec![assign_stmt(
+                        test_local_name("y", 2),
+                        with_instr_id(
+                            op_expr(Call::new(
+                                name_expr(test_local_name("fn", 0)),
+                                vec![CallArgPositional::Positional(name_expr(test_local_name(
+                                    "x", 1,
+                                )))],
+                                Vec::<CallArgKeyword<InstrBlockPy>>::new(),
+                            )),
+                            call_instr_id,
+                        ),
+                    )],
+                    term: ret_term(name_expr(test_local_name("y", 2))),
+                    params: vec![],
+                    exc_edge: None,
+                    extra: Default::default(),
+                }],
+            );
+            set_stack_slots(&mut caller_function, &["fn", "x", "y"]);
+
+            let caller_id = caller_function.function_id;
+            let callee_id = callee_function.function_id;
+            write_test_counter_dump(
+                soac_work_dir.join("profile.bin").as_path(),
+                &CounterDumpRecord {
+                    source_hash: 0,
+                    module_name: caller_module_name.to_string(),
+                    package_name: None,
+                    rows: vec![CounterDumpRow {
+                        counter_id: 0,
+                        scope: "this".to_string(),
+                        kind: "call_hot_targets".to_string(),
+                        site_kind: "runtime".to_string(),
+                        function_id: Some(caller_id),
+                        current_function_id: Some(caller_id),
+                        instr_id: Some(call_instr_id),
+                        function_qualname: Some(caller_function.names.qualname.clone()),
+                        block_label: None,
+                        value: 1,
+                        branch_values: Vec::new(),
+                        observed_value: Some(callee_id.to_packed_runtime_u64()),
+                        max_overcount: Some(0),
+                    }],
+                    module_keys: Vec::new(),
+                    type_keys: Vec::new(),
+                    type_table: Vec::new(),
+                },
+            );
+
+            let caller_module = test_module(caller_module_name_gen, vec![caller_function]);
+            let callee_module = test_module(callee_module_name_gen, vec![callee_function]);
+            let caller_shared_state = crate::module_type::build_shared_state_for_testing(
+                py,
+                caller_module,
+                caller_module_name,
+                "",
+            )
+            .expect("caller shared state should build");
+            let callee_shared_state = crate::module_type::build_shared_state_for_testing(
+                py,
+                callee_module,
+                callee_module_name,
+                "",
+            )
+            .expect("callee shared state should build");
+            let compile_session = crate::session::CompileSession::new();
+            compile_session
+                .retain_shared_module_state_for_inspection(caller_shared_state.clone())
+                .expect("caller module should be retained for planning");
+            compile_session
+                .retain_shared_module_state_for_inspection(callee_shared_state.clone())
+                .expect("callee module should be retained for planning");
+
+            let profile = SpecializationProfile::from_runtime_state_with_session(
+                Some(caller_shared_state.as_ref()),
+                Some(&compile_session),
+            )
+            .expect("typed-v3 runtime should plan cross-module direct calls from raw evidence");
+            let direct_calls = profile
+                .opt_v3_emitted_direct_calls
+                .get(&caller_id)
+                .and_then(|calls| calls.get(&call_instr_id))
+                .expect("typed-v3 runtime should retain the profiled cross-module candidate");
+            assert_eq!(direct_calls[0].target, callee_id);
+            assert_eq!(
+                direct_calls[0].body.kind,
+                CallBodyKind::Inline,
+                "cross-module direct calls should keep inline body decisions when remappable"
+            );
+
+            let module_plan = optimize_blockpy_for_shared_state(
+                caller_shared_state.as_ref(),
+                Some(&compile_session),
+                Some(&profile),
+                &typed_v3_env_config(),
+            )
+            .expect("typed-v3 runtime should lower caller with external callee bodies visible");
+            let planned_caller = module_plan
+                .module
+                .callable_defs
+                .iter()
+                .find(|function| function.function_id == caller_id)
+                .expect("planned module should include caller");
+            assert_eq!(
+                count_typed_instrs(planned_caller, |expr| {
+                    matches!(expr, InstrTyped::GuardedCallableCallTyped(_))
+                }),
+                0,
+                "cross-module inline-winning direct calls should not remain guarded call expressions"
+            );
+            assert_eq!(
+                planned_caller
+                    .blocks
+                    .iter()
+                    .filter(|block| {
+                        matches!(
+                            &block.term,
+                            BlockTerm::IfTerm(term)
+                                if matches!(term.test, InstrTyped::DirectCallGuardTest(_))
+                        )
+                    })
+                    .count(),
+                1,
+                "cross-module typed-v3 inlining should expose a direct-call guard CFG edge"
             );
         });
     }

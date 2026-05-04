@@ -20,6 +20,7 @@ pub struct FunctionProfileEvidence {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct PersistentFunctionProfileEvidence {
     call_target_specializations: HashMap<InstrId, Vec<PersistentFunctionId>>,
+    raw_call_target_specializations: HashMap<InstrId, Vec<RuntimeFunctionId>>,
     operator_specializations: HashMap<InstrId, Vec<u64>>,
     getitem_specializations: HashMap<InstrId, Vec<u64>>,
     setitem_specializations: HashMap<InstrId, Vec<u64>>,
@@ -147,6 +148,14 @@ impl ProfileEvidenceStore {
                         if observed == RuntimeFunctionId::global() {
                             continue;
                         }
+                        let function = store.functions.entry(function_id.clone()).or_default();
+                        push_unique(
+                            function
+                                .raw_call_target_specializations
+                                .entry(instr_id)
+                                .or_default(),
+                            observed,
+                        );
                         let Some(observed) = store.function_target(observed) else {
                             continue;
                         };
@@ -278,8 +287,33 @@ impl ProfileEvidenceStore {
             .unwrap_or_default()
     }
 
+    fn resolved_call_target_specializations(
+        &self,
+        evidence: &PersistentFunctionProfileEvidence,
+    ) -> HashMap<InstrId, Vec<PersistentFunctionId>> {
+        let mut out = evidence.call_target_specializations.clone();
+        for (instr_id, raw_targets) in &evidence.raw_call_target_specializations {
+            for raw_target in raw_targets {
+                let Some(target) = self.function_target(*raw_target) else {
+                    continue;
+                };
+                push_unique(out.entry(*instr_id).or_default(), target);
+            }
+        }
+        out
+    }
+
     pub fn module_source_hash(&self, module_name: &str) -> Option<u64> {
         self.module_source_hashes.get(module_name).copied()
+    }
+
+    pub fn record_runtime_module_target(
+        &mut self,
+        module_id: RuntimeModuleId,
+        module_name: &str,
+        source_hash: u64,
+    ) {
+        self.record_module_target(module_id, module_name, source_hash);
     }
 
     pub fn function_target(&self, function_id: RuntimeFunctionId) -> Option<PersistentFunctionId> {
@@ -335,7 +369,7 @@ impl ProfileEvidenceStore {
     ) -> FunctionProfileEvidence {
         let persistent = self.for_function(module_name, source_hash, function_id);
         let mut call_target_specializations = HashMap::new();
-        for (instr_id, targets) in persistent.call_target_specializations {
+        for (instr_id, targets) in self.resolved_call_target_specializations(&persistent) {
             for target in targets {
                 if target.module.module_name != module_name
                     || target.module.source_hash != source_hash
@@ -363,8 +397,12 @@ impl ProfileEvidenceStore {
         source_hash: u64,
         function_id: RuntimeFunctionId,
     ) -> HashMap<InstrId, Vec<PersistentFunctionId>> {
-        self.for_function(module_name, source_hash, function_id)
-            .call_target_specializations
+        let function_id =
+            persistent_function_id_for_counter_row(module_name, source_hash, function_id);
+        self.functions
+            .get(&function_id)
+            .map(|evidence| self.resolved_call_target_specializations(evidence))
+            .unwrap_or_default()
     }
 }
 
@@ -613,6 +651,59 @@ mod tests {
                 ModuleContentId::new("pkg.callee", 0x5678),
                 target_id.local_function_id()
             )
+        );
+        assert_eq!(
+            store
+                .persistent_call_target_specializations_for_runtime_function_v3(
+                    "pkg.caller",
+                    0x1234,
+                    caller_id
+                )
+                .get(&instr_id),
+            Some(&vec![synthesized])
+        );
+    }
+
+    #[test]
+    fn profile_evidence_store_resolves_call_targets_after_module_identity_registration() {
+        let caller_id = RuntimeFunctionId::from_raw_parts(7, 1);
+        let target_id = RuntimeFunctionId::from_raw_parts(8, 2);
+        let instr_id = InstrId::new(4);
+        let caller_record = CounterDumpRecord {
+            source_hash: 0x1234,
+            module_name: "pkg.caller".to_string(),
+            package_name: None,
+            rows: vec![row(
+                "call_hot_targets",
+                caller_id,
+                instr_id,
+                1,
+                Some(target_id.to_packed_runtime_u64()),
+            )],
+            module_keys: Vec::new(),
+            type_keys: Vec::new(),
+            type_table: Vec::new(),
+        };
+        let path = unique_counter_path();
+        fs::write(path.as_path(), caller_record.encode().unwrap()).unwrap();
+
+        let mut store = ProfileEvidenceStore::from_counter_dump(path.as_path()).unwrap();
+        let _ = fs::remove_file(path);
+        assert_eq!(
+            store
+                .persistent_call_target_specializations_for_runtime_function_v3(
+                    "pkg.caller",
+                    0x1234,
+                    caller_id
+                )
+                .get(&instr_id),
+            None
+        );
+
+        store.record_runtime_module_target(RuntimeModuleId::new(8), "pkg.callee", 0x5678);
+        let synthesized = PersistentFunctionId::new(
+            ModuleContentId::new("pkg.callee", 0x5678),
+            target_id.local_function_id(),
         );
         assert_eq!(
             store

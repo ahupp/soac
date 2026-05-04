@@ -8,8 +8,8 @@ use soac_core::block_py::{
     ChildVisitable, ConstantExpr, Del, HasMeta, HasSemanticInstrId, Instr, InstrId, InstrKey,
     InstrWithConstantNone, Literal, Load, LocalLocation, MapInstr, Mappable, Meta, NameLike,
     NameLocation, ParamKind, PrettyPrint, PrettyPrinter, ResolvedName, RuntimeFunctionId,
-    RuntimeName, SetAttr, Store, TermIf, TryMapInstr, TryMapModule, TryMapTerm, Visit, VisitMut,
-    WithMeta,
+    RuntimeName, SetAttr, Store, TermIf, TryMapInstr, TryMapModule, TryMapTerm, Tuple, Visit,
+    VisitMut, WithMeta,
 };
 use soac_ir_blockpy::{
     BlockPyModuleShape, InstrBlockPy, constructor_init_function_id_for_entry_function,
@@ -20,11 +20,12 @@ use soac_ir_typed::plan_v3::Rep;
 use soac_ir_typed::{
     BoolFacts, FactStore, InstrTyped, PyObjFacts, TypedAttrAccessPlan, TypedBlock, TypedBlockExtra,
     TypedBlockPyModuleShape, TypedCall, TypedCallAccessPlan, TypedCallEmissionPlan,
-    TypedCallEmissionPlans, TypedDirectCallArgPlan, TypedDirectCallArgSource,
-    TypedDirectCallGuardTest, TypedDirectCallGuardTestKind, TypedDirectCallableCall,
-    TypedDirectCallableCallGuard, TypedDirectMethodCall, TypedDirectMethodCallGuard, TypedGetAttr,
-    TypedGuardedCallableCall, TypedGuardedMethodCall, TypedPlannedResult,
-    TypedPyObjectOwnershipPlan, TypedResultDemand, TypedSetAttr, TypedTruthy, ValueFacts,
+    TypedCallEmissionPlans, TypedConstructorInitPlan, TypedConstructorInitPlanSource,
+    TypedDirectCallArgPlan, TypedDirectCallArgSource, TypedDirectCallGuardTest,
+    TypedDirectCallGuardTestKind, TypedDirectCallableCall, TypedDirectCallableCallGuard,
+    TypedDirectMethodCall, TypedDirectMethodCallGuard, TypedGetAttr, TypedGuardedCallableCall,
+    TypedGuardedMethodCall, TypedPlannedResult, TypedPyObjectOwnershipPlan, TypedResultDemand,
+    TypedSetAttr, TypedTruthy, ValueFacts,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -695,6 +696,7 @@ pub struct TypedInlineRewriteStats {
     pub skipped_exception_edges: usize,
     pub instr_id_mappings: Vec<TypedInlineInstrIdMapping>,
     pub local_mappings: Vec<TypedInlineLocalMapping>,
+    pub hot_state_cleanup_labels: Vec<BlockLabel>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -710,6 +712,7 @@ pub struct TypedHotContinuationSplitStats {
     pub cloned_blocks: usize,
     pub clones: Vec<TypedHotContinuationClone>,
     pub instr_id_mappings: Vec<TypedInlineInstrIdMapping>,
+    pub label_mappings: Vec<(BlockLabel, BlockLabel)>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -724,6 +727,13 @@ pub struct TypedConstructorFieldBindings {
     pub fields: Vec<TypedConstructorFieldBinding>,
 }
 
+#[derive(Debug, Clone)]
+pub struct TypedExternalInlineCallee {
+    pub function: BlockPyFunction<TypedBlockPyModuleShape>,
+    pub module_constants: Vec<ConstantExpr>,
+    pub inline_plan: Option<InlinePlanModule>,
+}
+
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub struct TypedFieldScalarizationStats {
     pub seeded_objects: usize,
@@ -732,12 +742,13 @@ pub struct TypedFieldScalarizationStats {
     pub rewritten_loads: usize,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 #[allow(dead_code)]
 pub enum TypedInlineUnsupportedReason {
     MissingCallerStorageLayout,
     MissingCalleeStorageLayout,
     MissingCalleeLocal(LocalLocation),
+    MissingCalleeConstant(u32),
     MissingParameterLocal,
     UnsupportedValueBinding(LocalLocation),
     NonLocalValueBinding(LocalLocation),
@@ -755,6 +766,8 @@ pub enum TypedInlineUnsupportedReason {
     ExceptionEdge,
     NonReturnTerm,
     ClosureStorage,
+    CrossModuleGlobalName(String),
+    TooManyCallerConstants,
 }
 
 #[derive(Clone)]
@@ -882,6 +895,44 @@ pub fn inline_typed_function_direct_call_stores(
     external_callees: &HashMap<RuntimeFunctionId, BlockPyFunction<TypedBlockPyModuleShape>>,
     direct_calls_by_instr_id: &HashMap<InstrId, Vec<(RuntimeFunctionId, TypedDirectCallArgPlan)>>,
 ) -> TypedInlineRewriteStats {
+    inline_typed_function_direct_call_stores_impl(
+        function,
+        module,
+        None,
+        TypedInlineExternalCallees::Plain(external_callees),
+        direct_calls_by_instr_id,
+    )
+}
+
+pub fn inline_typed_function_direct_call_stores_with_external_callees(
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+    module: &BlockPyModule<TypedBlockPyModuleShape>,
+    caller_module_constants: &mut Vec<ConstantExpr>,
+    external_callees: &HashMap<RuntimeFunctionId, TypedExternalInlineCallee>,
+    direct_calls_by_instr_id: &HashMap<InstrId, Vec<(RuntimeFunctionId, TypedDirectCallArgPlan)>>,
+) -> TypedInlineRewriteStats {
+    inline_typed_function_direct_call_stores_impl(
+        function,
+        module,
+        Some(caller_module_constants),
+        TypedInlineExternalCallees::Contextual(external_callees),
+        direct_calls_by_instr_id,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum TypedInlineExternalCallees<'a> {
+    Plain(&'a HashMap<RuntimeFunctionId, BlockPyFunction<TypedBlockPyModuleShape>>),
+    Contextual(&'a HashMap<RuntimeFunctionId, TypedExternalInlineCallee>),
+}
+
+fn inline_typed_function_direct_call_stores_impl(
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+    module: &BlockPyModule<TypedBlockPyModuleShape>,
+    mut caller_module_constants: Option<&mut Vec<ConstantExpr>>,
+    external_callees: TypedInlineExternalCallees<'_>,
+    direct_calls_by_instr_id: &HashMap<InstrId, Vec<(RuntimeFunctionId, TypedDirectCallArgPlan)>>,
+) -> TypedInlineRewriteStats {
     if direct_calls_by_instr_id.is_empty() {
         return TypedInlineRewriteStats::default();
     }
@@ -895,6 +946,7 @@ pub fn inline_typed_function_direct_call_stores(
         match build_typed_direct_call_inline_rewrite(
             function,
             module,
+            caller_module_constants.as_deref_mut(),
             external_callees,
             block,
             direct_calls_by_instr_id,
@@ -975,7 +1027,8 @@ impl TypedInlineCall {
 fn build_typed_direct_call_inline_rewrite(
     caller: &mut BlockPyFunction<TypedBlockPyModuleShape>,
     module: &BlockPyModule<TypedBlockPyModuleShape>,
-    external_callees: &HashMap<RuntimeFunctionId, BlockPyFunction<TypedBlockPyModuleShape>>,
+    mut caller_module_constants: Option<&mut Vec<ConstantExpr>>,
+    external_callees: TypedInlineExternalCallees<'_>,
     block: TypedBlock,
     direct_calls_by_instr_id: &HashMap<InstrId, Vec<(RuntimeFunctionId, TypedDirectCallArgPlan)>>,
     instr_id_allocator: &mut TypedInlineInstrIdAllocator,
@@ -1064,6 +1117,10 @@ fn build_typed_direct_call_inline_rewrite(
         .collect::<Vec<_>>();
     let mut instr_id_mappings = Vec::new();
     let mut local_mappings = Vec::new();
+    let original_caller_module_constants = caller_module_constants
+        .as_deref()
+        .map(|constants| constants.to_vec());
+    let mut cleanup_carries_hot_state = receiver_temp.is_some();
 
     let mut before = block.body;
     let after = before.split_off(candidate.instr_index + 1);
@@ -1151,18 +1208,25 @@ fn build_typed_direct_call_inline_rewrite(
         };
         let mut provided_values =
             typed_inline_provided_values(&candidate.call, &receiver_temp, &arg_temps);
-        if is_constructor_entry_function(callee) {
+        if is_constructor_entry_function(callee.function) {
+            cleanup_carries_hot_state = true;
             let callable_temp = callable_temp
                 .as_ref()
                 .expect("constructor callable inline candidate should allocate callable temp");
             provided_values.insert(0, typed_load_temp(&callable_temp.resolved_name()));
         }
         let Ok(bindings) = bind_typed_direct_call_inline_values(
-            callee,
+            callee.function,
             &plan.arg_plan,
             provided_values.as_slice(),
         ) else {
             stats.skipped_candidates += 1;
+            if let (Some(constants), Some(original)) = (
+                caller_module_constants.as_deref_mut(),
+                original_caller_module_constants.as_ref(),
+            ) {
+                *constants = original.clone();
+            }
             caller.storage_layout = original_storage_layout;
             return TypedInlineBlockRewrite::Unchanged(original_block);
         };
@@ -1172,12 +1236,14 @@ fn build_typed_direct_call_inline_rewrite(
             .expect("typed inline instance count should fit in u32");
         let Ok(mut fragment) = build_typed_direct_call_inline_fragment_to_target(
             caller,
-            callee,
+            callee.function,
             cleanup_label,
             &bindings,
             return_target.clone(),
             inline_instance,
             instr_id_allocator,
+            caller_module_constants.as_deref_mut(),
+            callee.module_constants,
         ) else {
             stats.skipped_candidates += 1;
             caller.storage_layout = original_storage_layout;
@@ -1229,6 +1295,9 @@ fn build_typed_direct_call_inline_rewrite(
         original_exc_edge.clone(),
         TypedBlockExtra::default(),
     ));
+    if cleanup_carries_hot_state {
+        stats.hot_state_cleanup_labels.push(cleanup_label);
+    }
     blocks.push(Block::new_with_extra(
         continuation_label,
         after,
@@ -1253,6 +1322,29 @@ pub fn split_typed_constructor_hot_continuations(
     function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
     module_constants: &[ConstantExpr],
 ) -> TypedHotContinuationSplitStats {
+    split_typed_constructor_hot_continuations_impl(function, module_constants, None)
+}
+
+pub fn split_typed_constructor_hot_continuations_with_budget(
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+    module_constants: &[ConstantExpr],
+    max_cloned_blocks: usize,
+) -> TypedHotContinuationSplitStats {
+    if max_cloned_blocks == 0 {
+        return TypedHotContinuationSplitStats::default();
+    }
+    split_typed_constructor_hot_continuations_impl(
+        function,
+        module_constants,
+        Some(max_cloned_blocks),
+    )
+}
+
+fn split_typed_constructor_hot_continuations_impl(
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+    module_constants: &[ConstantExpr],
+    max_cloned_blocks: Option<usize>,
+) -> TypedHotContinuationSplitStats {
     let mut stats = TypedHotContinuationSplitStats::default();
     let mut instr_id_allocator = TypedInlineInstrIdAllocator::from_function(function);
     loop {
@@ -1261,6 +1353,11 @@ pub fn split_typed_constructor_hot_continuations(
         else {
             break;
         };
+        if max_cloned_blocks
+            .is_some_and(|max| stats.cloned_blocks + candidate.reachable.len() > max)
+        {
+            break;
+        }
         let Some(cloned) = clone_typed_hot_continuation(
             function,
             candidate,
@@ -1271,6 +1368,7 @@ pub fn split_typed_constructor_hot_continuations(
         };
         stats.cloned_blocks += cloned.clone.cloned_blocks;
         stats.instr_id_mappings.extend(cloned.instr_id_mappings);
+        stats.label_mappings.extend(cloned.label_mappings);
         stats.clones.push(cloned.clone);
     }
     stats
@@ -1279,12 +1377,34 @@ pub fn split_typed_constructor_hot_continuations(
 pub fn split_typed_alias_hot_continuations(
     function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
 ) -> TypedHotContinuationSplitStats {
+    split_typed_alias_hot_continuations_impl(function, None)
+}
+
+pub fn split_typed_alias_hot_continuations_with_budget(
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+    max_cloned_blocks: usize,
+) -> TypedHotContinuationSplitStats {
+    if max_cloned_blocks == 0 {
+        return TypedHotContinuationSplitStats::default();
+    }
+    split_typed_alias_hot_continuations_impl(function, Some(max_cloned_blocks))
+}
+
+fn split_typed_alias_hot_continuations_impl(
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+    max_cloned_blocks: Option<usize>,
+) -> TypedHotContinuationSplitStats {
     let mut stats = TypedHotContinuationSplitStats::default();
     let mut instr_id_allocator = TypedInlineInstrIdAllocator::from_function(function);
     loop {
         let Some(candidate) = find_typed_alias_hot_continuation_split_candidate(function) else {
             break;
         };
+        if max_cloned_blocks
+            .is_some_and(|max| stats.cloned_blocks + candidate.reachable.len() > max)
+        {
+            break;
+        }
         let Some(cloned) = clone_typed_hot_continuation(
             function,
             candidate,
@@ -1295,6 +1415,7 @@ pub fn split_typed_alias_hot_continuations(
         };
         stats.cloned_blocks += cloned.clone.cloned_blocks;
         stats.instr_id_mappings.extend(cloned.instr_id_mappings);
+        stats.label_mappings.extend(cloned.label_mappings);
         stats.clones.push(cloned.clone);
     }
     stats
@@ -1303,13 +1424,52 @@ pub fn split_typed_alias_hot_continuations(
 pub fn split_typed_inline_cleanup_hot_continuations(
     function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
 ) -> TypedHotContinuationSplitStats {
+    split_typed_inline_cleanup_hot_continuations_impl(function, None, None)
+}
+
+pub fn split_typed_inline_cleanup_hot_continuations_for_labels(
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+    cleanup_labels: &HashSet<BlockLabel>,
+) -> TypedHotContinuationSplitStats {
+    if cleanup_labels.is_empty() {
+        return TypedHotContinuationSplitStats::default();
+    }
+    split_typed_inline_cleanup_hot_continuations_impl(function, Some(cleanup_labels), None)
+}
+
+pub fn split_typed_inline_cleanup_hot_continuations_for_labels_with_budget(
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+    cleanup_labels: &HashSet<BlockLabel>,
+    max_cloned_blocks: usize,
+) -> TypedHotContinuationSplitStats {
+    if cleanup_labels.is_empty() || max_cloned_blocks == 0 {
+        return TypedHotContinuationSplitStats::default();
+    }
+    split_typed_inline_cleanup_hot_continuations_impl(
+        function,
+        Some(cleanup_labels),
+        Some(max_cloned_blocks),
+    )
+}
+
+fn split_typed_inline_cleanup_hot_continuations_impl(
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+    cleanup_labels: Option<&HashSet<BlockLabel>>,
+    max_cloned_blocks: Option<usize>,
+) -> TypedHotContinuationSplitStats {
     let mut stats = TypedHotContinuationSplitStats::default();
     let mut instr_id_allocator = TypedInlineInstrIdAllocator::from_function(function);
     loop {
-        let Some(candidate) = find_typed_inline_cleanup_hot_continuation_split_candidate(function)
+        let Some(candidate) =
+            find_typed_inline_cleanup_hot_continuation_split_candidate(function, cleanup_labels)
         else {
             break;
         };
+        if max_cloned_blocks
+            .is_some_and(|max| stats.cloned_blocks + candidate.reachable.len() > max)
+        {
+            break;
+        }
         let Some(cloned) = clone_typed_hot_continuation(
             function,
             candidate,
@@ -1320,6 +1480,7 @@ pub fn split_typed_inline_cleanup_hot_continuations(
         };
         stats.cloned_blocks += cloned.clone.cloned_blocks;
         stats.instr_id_mappings.extend(cloned.instr_id_mappings);
+        stats.label_mappings.extend(cloned.label_mappings);
         stats.clones.push(cloned.clone);
     }
     stats
@@ -1335,6 +1496,7 @@ struct TypedHotContinuationSplitCandidate {
 struct TypedHotContinuationCloneResult {
     clone: TypedHotContinuationClone,
     instr_id_mappings: Vec<TypedInlineInstrIdMapping>,
+    label_mappings: Vec<(BlockLabel, BlockLabel)>,
 }
 
 fn find_typed_constructor_hot_continuation_split_candidate(
@@ -1351,7 +1513,7 @@ fn find_typed_constructor_hot_continuation_split_candidate(
             block,
             module_constants,
         )?;
-        let reachable = typed_reachable_block_labels(function, &labels, original_entry)?;
+        let reachable = typed_hot_reachable_block_labels(function, &labels, original_entry)?;
         if reachable.contains(&block.label)
             || reachable.len() > MAX_TYPED_HOT_CONTINUATION_CLONE_BLOCKS
             || !typed_reachable_subgraph_has_external_predecessor(
@@ -1378,7 +1540,7 @@ fn find_typed_alias_hot_continuation_split_candidate(
     function.blocks.iter().find_map(|block| {
         let original_entry =
             typed_alias_hot_continuation_entry(function, &labels, &predecessors, block)?;
-        let reachable = typed_reachable_block_labels(function, &labels, original_entry)?;
+        let reachable = typed_hot_reachable_block_labels(function, &labels, original_entry)?;
         if reachable.contains(&block.label)
             || reachable.len() > MAX_TYPED_HOT_CONTINUATION_CLONE_BLOCKS
             || !typed_reachable_subgraph_has_external_predecessor(
@@ -1399,11 +1561,15 @@ fn find_typed_alias_hot_continuation_split_candidate(
 
 fn find_typed_inline_cleanup_hot_continuation_split_candidate(
     function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    cleanup_labels: Option<&HashSet<BlockLabel>>,
 ) -> Option<TypedHotContinuationSplitCandidate> {
     let labels = typed_block_indices_by_label(function);
     let predecessors = typed_block_predecessors(function);
     let hot_path_labels = typed_direct_call_hot_path_labels(function, &labels);
     function.blocks.iter().find_map(|block| {
+        if cleanup_labels.is_some_and(|cleanup_labels| !cleanup_labels.contains(&block.label)) {
+            return None;
+        }
         let original_entry = typed_inline_cleanup_hot_continuation_entry(&hot_path_labels, block)?;
         let reachable = typed_hot_reachable_block_labels(function, &labels, original_entry)?;
         if reachable.contains(&block.label)
@@ -1570,6 +1736,7 @@ fn typed_block_predecessors(
     predecessors
 }
 
+#[cfg(test)]
 fn typed_reachable_block_labels(
     function: &BlockPyFunction<TypedBlockPyModuleShape>,
     labels: &HashMap<BlockLabel, usize>,
@@ -1700,6 +1867,7 @@ fn clone_typed_hot_continuation(
             cloned_blocks: cloned_block_count,
         },
         instr_id_mappings: instr_id_remapper.finish(),
+        label_mappings: label_map.into_iter().collect(),
     })
 }
 
@@ -1732,10 +1900,90 @@ pub fn typed_constructor_field_bindings_from_inline_stats(
     module_constants: &[ConstantExpr],
     stats: &TypedInlineRewriteStats,
 ) -> HashMap<InstrId, TypedConstructorFieldBindings> {
+    typed_constructor_field_bindings_from_inline_stats_with_external_callees(
+        module,
+        inline_plan,
+        module_constants,
+        &HashMap::new(),
+        stats,
+    )
+}
+
+pub fn typed_constructor_init_plans_from_inline_stats_with_external_callees(
+    module: &BlockPyModule<TypedBlockPyModuleShape>,
+    module_constants: &[ConstantExpr],
+    external_callees: &HashMap<RuntimeFunctionId, TypedExternalInlineCallee>,
+    stats: &TypedInlineRewriteStats,
+) -> HashMap<InstrId, TypedConstructorInitPlan> {
     let functions = module
         .callable_defs
         .iter()
-        .map(|function| (function.function_id, function))
+        .map(|function| {
+            (
+                function.function_id,
+                TypedConstructorCallContext {
+                    function,
+                    module_constants,
+                },
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let mut plans = HashMap::new();
+    for mapping in &stats.instr_id_mappings {
+        let external_context;
+        let context = if let Some(context) = functions.get(&mapping.callee).copied() {
+            context
+        } else {
+            let Some(callee) = external_callees.get(&mapping.callee) else {
+                continue;
+            };
+            external_context = TypedConstructorCallContext {
+                function: &callee.function,
+                module_constants: callee.module_constants.as_slice(),
+            };
+            external_context
+        };
+        let Some(init_function_id) =
+            constructor_init_function_id_for_entry_function(context.function)
+        else {
+            continue;
+        };
+        let constructor_call_instr_ids =
+            typed_constructor_call_instr_ids(context.function, context.module_constants);
+        if !constructor_call_instr_ids.contains(&mapping.callee_instr_id) {
+            continue;
+        }
+        plans.insert(
+            mapping.caller_instr_id,
+            TypedConstructorInitPlan {
+                source: TypedConstructorInitPlanSource::InlinedConstructorEntry,
+                init_function_id,
+            },
+        );
+    }
+    plans
+}
+
+pub fn typed_constructor_field_bindings_from_inline_stats_with_external_callees(
+    module: &BlockPyModule<TypedBlockPyModuleShape>,
+    inline_plan: &InlinePlanModule,
+    module_constants: &[ConstantExpr],
+    external_callees: &HashMap<RuntimeFunctionId, TypedExternalInlineCallee>,
+    stats: &TypedInlineRewriteStats,
+) -> HashMap<InstrId, TypedConstructorFieldBindings> {
+    let functions = module
+        .callable_defs
+        .iter()
+        .map(|function| {
+            (
+                function.function_id,
+                TypedConstructorInlineContext {
+                    function,
+                    inline_plan,
+                    module_constants,
+                },
+            )
+        })
         .collect::<HashMap<_, _>>();
     let local_mappings = stats
         .local_mappings
@@ -1753,17 +2001,37 @@ pub fn typed_constructor_field_bindings_from_inline_stats(
         .collect::<HashMap<_, _>>();
     let mut bindings = HashMap::new();
     for mapping in &stats.instr_id_mappings {
-        let Some(callee) = functions.get(&mapping.callee).copied() else {
+        let external_context;
+        let context = if let Some(context) = functions.get(&mapping.callee).copied() {
+            context
+        } else {
+            let Some(callee) = external_callees.get(&mapping.callee) else {
+                continue;
+            };
+            let Some(inline_plan) = callee.inline_plan.as_ref() else {
+                continue;
+            };
+            external_context = TypedConstructorInlineContext {
+                function: &callee.function,
+                inline_plan,
+                module_constants: callee.module_constants.as_slice(),
+            };
+            external_context
+        };
+        let Some(init_function_id) =
+            constructor_init_function_id_for_entry_function(context.function)
+        else {
             continue;
         };
-        let Some(init_function_id) = constructor_init_function_id_for_entry_function(callee) else {
-            continue;
-        };
-        let constructor_call_instr_ids = typed_constructor_call_instr_ids(callee, module_constants);
+        let constructor_call_instr_ids =
+            typed_constructor_call_instr_ids(context.function, context.module_constants);
         if !constructor_call_instr_ids.contains(&mapping.callee_instr_id) {
             continue;
         }
-        let Some(plan) = inline_plan.straightline_constructor(init_function_id) else {
+        let Some(plan) = context
+            .inline_plan
+            .straightline_constructor(init_function_id)
+        else {
             continue;
         };
         let fields = plan
@@ -1802,6 +2070,19 @@ pub fn typed_constructor_field_bindings_from_inline_stats(
         }
     }
     bindings
+}
+
+#[derive(Clone, Copy)]
+struct TypedConstructorInlineContext<'a> {
+    function: &'a BlockPyFunction<TypedBlockPyModuleShape>,
+    inline_plan: &'a InlinePlanModule,
+    module_constants: &'a [ConstantExpr],
+}
+
+#[derive(Clone, Copy)]
+struct TypedConstructorCallContext<'a> {
+    function: &'a BlockPyFunction<TypedBlockPyModuleShape>,
+    module_constants: &'a [ConstantExpr],
 }
 
 fn typed_constructor_call_instr_ids(
@@ -3056,16 +3337,39 @@ fn typed_inline_candidate_for_runtime_protocol_call(
     })
 }
 
+#[derive(Clone, Copy)]
+struct TypedInlineCalleeRef<'a> {
+    function: &'a BlockPyFunction<TypedBlockPyModuleShape>,
+    module_constants: Option<&'a [ConstantExpr]>,
+}
+
 fn typed_inline_callee<'a>(
     module: &'a BlockPyModule<TypedBlockPyModuleShape>,
-    external_callees: &'a HashMap<RuntimeFunctionId, BlockPyFunction<TypedBlockPyModuleShape>>,
+    external_callees: TypedInlineExternalCallees<'a>,
     function_id: RuntimeFunctionId,
-) -> Option<&'a BlockPyFunction<TypedBlockPyModuleShape>> {
+) -> Option<TypedInlineCalleeRef<'a>> {
     module
         .callable_defs
         .iter()
         .find(|function| function.function_id == function_id)
-        .or_else(|| external_callees.get(&function_id))
+        .map(|function| TypedInlineCalleeRef {
+            function,
+            module_constants: None,
+        })
+        .or_else(|| match external_callees {
+            TypedInlineExternalCallees::Plain(external_callees) => external_callees
+                .get(&function_id)
+                .map(|function| TypedInlineCalleeRef {
+                    function,
+                    module_constants: None,
+                }),
+            TypedInlineExternalCallees::Contextual(external_callees) => external_callees
+                .get(&function_id)
+                .map(|callee| TypedInlineCalleeRef {
+                    function: &callee.function,
+                    module_constants: Some(callee.module_constants.as_slice()),
+                }),
+        })
 }
 
 fn typed_positional_arg_exprs(args: Vec<CallArgPositional<InstrTyped>>) -> Option<Vec<InstrTyped>> {
@@ -3309,6 +3613,23 @@ fn try_allocate_typed_stack_temp(
 
 type TypedInlineValueBindings = HashMap<LocalLocation, InstrTyped>;
 
+fn expand_synthetic_typed_starred_tuple_args(
+    args: Vec<CallArgPositional<InstrTyped>>,
+) -> Vec<CallArgPositional<InstrTyped>> {
+    let mut expanded = Vec::with_capacity(args.len());
+    for arg in args {
+        match arg {
+            CallArgPositional::Starred(InstrTyped::Tuple(tuple))
+                if tuple.meta().instr_id.is_none() =>
+            {
+                expanded.extend(tuple.values.into_iter().map(CallArgPositional::Positional));
+            }
+            other => expanded.push(other),
+        }
+    }
+    expanded
+}
+
 fn typed_inline_provided_values(
     call: &TypedInlineCall,
     receiver_temp: &Option<TypedTempLocal>,
@@ -3348,17 +3669,27 @@ fn bind_typed_direct_call_inline_values(
     }
     let mut bindings = TypedInlineValueBindings::new();
     for (param, source) in callee.params.iter().zip(&arg_plan.sources) {
-        if !matches!(param.kind, ParamKind::PosOnly | ParamKind::Any) {
-            return Err(TypedInlineUnsupportedReason::UnsupportedParameterKind);
-        }
-        let TypedDirectCallArgSource::Provided(index) = source else {
-            return Err(TypedInlineUnsupportedReason::DefaultArguments);
-        };
-        let Some(value) = values.get(*index) else {
-            return Err(TypedInlineUnsupportedReason::ArityMismatch);
+        let value = match (param.kind, source) {
+            (ParamKind::PosOnly | ParamKind::Any, TypedDirectCallArgSource::Provided(index)) => {
+                values
+                    .get(*index)
+                    .cloned()
+                    .ok_or(TypedInlineUnsupportedReason::ArityMismatch)?
+            }
+            (ParamKind::VarArg, TypedDirectCallArgSource::PackedRest { start }) => {
+                let rest = values
+                    .get(*start..)
+                    .ok_or(TypedInlineUnsupportedReason::ArityMismatch)?
+                    .to_vec();
+                InstrTyped::Tuple(Tuple::new(rest))
+            }
+            (_, TypedDirectCallArgSource::DefaultSentinel) => {
+                return Err(TypedInlineUnsupportedReason::DefaultArguments);
+            }
+            (_, _) => return Err(TypedInlineUnsupportedReason::UnsupportedParameterKind),
         };
         let location = typed_parameter_local_location(callee, &param.name)?;
-        bindings.insert(location, value.clone());
+        bindings.insert(location, value);
     }
     Ok(bindings)
 }
@@ -3391,6 +3722,8 @@ fn build_typed_direct_call_inline_fragment_to_target(
     return_target: ResolvedName,
     inline_instance: u32,
     instr_id_allocator: &mut TypedInlineInstrIdAllocator,
+    caller_module_constants: Option<&mut Vec<ConstantExpr>>,
+    callee_module_constants: Option<&[ConstantExpr]>,
 ) -> Result<TypedInlineFragment, TypedInlineUnsupportedReason> {
     if callee.blocks.len() == 1 {
         return build_single_block_typed_inline_fragment_to_target(
@@ -3401,6 +3734,8 @@ fn build_typed_direct_call_inline_fragment_to_target(
             return_target,
             inline_instance,
             instr_id_allocator,
+            caller_module_constants,
+            callee_module_constants,
         );
     }
     build_multi_block_typed_inline_fragment_to_target(
@@ -3411,6 +3746,8 @@ fn build_typed_direct_call_inline_fragment_to_target(
         return_target,
         inline_instance,
         instr_id_allocator,
+        caller_module_constants,
+        callee_module_constants,
     )
 }
 
@@ -3428,6 +3765,8 @@ fn build_single_block_typed_inline_fragment_to_target(
     return_target: ResolvedName,
     inline_instance: u32,
     instr_id_allocator: &mut TypedInlineInstrIdAllocator,
+    caller_module_constants: Option<&mut Vec<ConstantExpr>>,
+    callee_module_constants: Option<&[ConstantExpr]>,
 ) -> Result<TypedInlineFragment, TypedInlineUnsupportedReason> {
     let callee_layout = callee
         .storage_layout
@@ -3465,8 +3804,14 @@ fn build_single_block_typed_inline_fragment_to_target(
     )?;
     let mut instr_id_remapper =
         TypedInlineInstrIdRemapper::new(callee.function_id, inline_instance, instr_id_allocator);
-    let mut remapper =
-        TypedInlineLocalRemapper::new(&locals, value_bindings, &mut instr_id_remapper);
+    let mut constant_scope =
+        typed_inline_constant_scope(caller_module_constants, callee_module_constants)?;
+    let mut remapper = TypedInlineLocalRemapper::new(
+        &locals,
+        value_bindings,
+        &mut instr_id_remapper,
+        &mut constant_scope,
+    );
     let mut body = callee_block
         .body
         .iter()
@@ -3504,6 +3849,8 @@ fn build_multi_block_typed_inline_fragment_to_target(
     return_target: ResolvedName,
     inline_instance: u32,
     instr_id_allocator: &mut TypedInlineInstrIdAllocator,
+    caller_module_constants: Option<&mut Vec<ConstantExpr>>,
+    callee_module_constants: Option<&[ConstantExpr]>,
 ) -> Result<TypedInlineFragment, TypedInlineUnsupportedReason> {
     let callee_layout = callee
         .storage_layout
@@ -3544,8 +3891,14 @@ fn build_multi_block_typed_inline_fragment_to_target(
         .collect::<HashMap<_, _>>();
     let mut instr_id_remapper =
         TypedInlineInstrIdRemapper::new(callee.function_id, inline_instance, instr_id_allocator);
-    let mut remapper =
-        TypedInlineLocalRemapper::new(&locals, value_bindings, &mut instr_id_remapper);
+    let mut constant_scope =
+        typed_inline_constant_scope(caller_module_constants, callee_module_constants)?;
+    let mut remapper = TypedInlineLocalRemapper::new(
+        &locals,
+        value_bindings,
+        &mut instr_id_remapper,
+        &mut constant_scope,
+    );
     let mut blocks: Vec<TypedBlock> = Vec::with_capacity(callee.blocks.len());
     for callee_block in &callee.blocks {
         let label = typed_remapped_label(&label_map, callee_block.label)?;
@@ -3628,11 +3981,11 @@ fn typed_inline_local_mappings(
             LocalLocation(u32::try_from(slot).expect("callee stack slot index should fit in u32"));
         let (caller_location, caller_name) =
             if let Some(value) = value_bindings.get(&callee_location) {
-                let bound_name = typed_inline_value_binding_name(callee_location, value)?;
+                let Ok(bound_name) = typed_inline_value_binding_name(callee_location, value) else {
+                    continue;
+                };
                 let Some(location) = bound_name.local_location() else {
-                    return Err(TypedInlineUnsupportedReason::NonLocalValueBinding(
-                        callee_location,
-                    ));
+                    continue;
                 };
                 (location, bound_name.id.as_str().to_string())
             } else {
@@ -3713,30 +4066,109 @@ fn typed_remap_inline_term_labels(
     })
 }
 
-struct TypedInlineLocalRemapper<'locals, 'bindings, 'remapper, 'allocator> {
+enum TypedInlineConstantScope<'a> {
+    SameModule,
+    CrossModule(TypedInlineConstantRemapper<'a>),
+}
+
+impl TypedInlineConstantScope<'_> {
+    fn is_cross_module(&self) -> bool {
+        matches!(self, Self::CrossModule(_))
+    }
+
+    fn remap_location(
+        &mut self,
+        location: NameLocation,
+    ) -> Result<NameLocation, TypedInlineUnsupportedReason> {
+        match (self, location) {
+            (Self::SameModule, location) => Ok(location),
+            (Self::CrossModule(remapper), NameLocation::Constant(index)) => {
+                Ok(NameLocation::Constant(remapper.remap(index)?))
+            }
+            (Self::CrossModule(_), location) => Ok(location),
+        }
+    }
+}
+
+struct TypedInlineConstantRemapper<'a> {
+    caller_constants: &'a mut Vec<ConstantExpr>,
+    callee_constants: &'a [ConstantExpr],
+    mapped_indices: HashMap<u32, u32>,
+}
+
+impl<'a> TypedInlineConstantRemapper<'a> {
+    fn new(
+        caller_constants: &'a mut Vec<ConstantExpr>,
+        callee_constants: &'a [ConstantExpr],
+    ) -> Self {
+        Self {
+            caller_constants,
+            callee_constants,
+            mapped_indices: HashMap::new(),
+        }
+    }
+
+    fn remap(&mut self, callee_index: u32) -> Result<u32, TypedInlineUnsupportedReason> {
+        if let Some(caller_index) = self.mapped_indices.get(&callee_index).copied() {
+            return Ok(caller_index);
+        }
+        let constant = self
+            .callee_constants
+            .get(callee_index as usize)
+            .ok_or(TypedInlineUnsupportedReason::MissingCalleeConstant(
+                callee_index,
+            ))?
+            .clone();
+        let caller_index = u32::try_from(self.caller_constants.len())
+            .map_err(|_| TypedInlineUnsupportedReason::TooManyCallerConstants)?;
+        self.caller_constants.push(constant);
+        self.mapped_indices.insert(callee_index, caller_index);
+        Ok(caller_index)
+    }
+}
+
+fn typed_inline_constant_scope<'a>(
+    caller_constants: Option<&'a mut Vec<ConstantExpr>>,
+    callee_constants: Option<&'a [ConstantExpr]>,
+) -> Result<TypedInlineConstantScope<'a>, TypedInlineUnsupportedReason> {
+    match (caller_constants, callee_constants) {
+        (_, None) => Ok(TypedInlineConstantScope::SameModule),
+        (Some(caller_constants), Some(callee_constants)) => {
+            Ok(TypedInlineConstantScope::CrossModule(
+                TypedInlineConstantRemapper::new(caller_constants, callee_constants),
+            ))
+        }
+        (None, Some(_)) => Err(TypedInlineUnsupportedReason::TooManyCallerConstants),
+    }
+}
+
+struct TypedInlineLocalRemapper<'locals, 'bindings, 'constants, 'remapper, 'allocator> {
     locals: &'locals HashMap<LocalLocation, TypedTempLocal>,
     value_bindings: &'bindings TypedInlineValueBindings,
     instr_id_remapper: &'remapper mut TypedInlineInstrIdRemapper<'allocator>,
+    constant_scope: &'remapper mut TypedInlineConstantScope<'constants>,
 }
 
-impl<'locals, 'bindings, 'remapper, 'allocator>
-    TypedInlineLocalRemapper<'locals, 'bindings, 'remapper, 'allocator>
+impl<'locals, 'bindings, 'constants, 'remapper, 'allocator>
+    TypedInlineLocalRemapper<'locals, 'bindings, 'constants, 'remapper, 'allocator>
 {
     fn new(
         locals: &'locals HashMap<LocalLocation, TypedTempLocal>,
         value_bindings: &'bindings TypedInlineValueBindings,
         instr_id_remapper: &'remapper mut TypedInlineInstrIdRemapper<'allocator>,
+        constant_scope: &'remapper mut TypedInlineConstantScope<'constants>,
     ) -> Self {
         Self {
             locals,
             value_bindings,
             instr_id_remapper,
+            constant_scope,
         }
     }
 }
 
 impl TryMapInstr<InstrTyped, InstrTyped, TypedInlineUnsupportedReason>
-    for TypedInlineLocalRemapper<'_, '_, '_, '_>
+    for TypedInlineLocalRemapper<'_, '_, '_, '_, '_>
 {
     fn try_map_instr(
         &mut self,
@@ -3758,23 +4190,39 @@ impl TryMapInstr<InstrTyped, InstrTyped, TypedInlineUnsupportedReason>
             InstrTyped::CalleeFunctionId(op) => {
                 InstrTyped::CalleeFunctionId(op.try_map_children(self)?)
             }
-            InstrTyped::CallTyped(op) => InstrTyped::CallTyped(op.try_map_children(self)?),
+            InstrTyped::CallTyped(op) => {
+                let mut op = op.try_map_children(self)?;
+                op.args = expand_synthetic_typed_starred_tuple_args(op.args);
+                InstrTyped::CallTyped(op)
+            }
             InstrTyped::GuardedCallableCallTyped(op) => {
-                InstrTyped::GuardedCallableCallTyped(op.try_map_children(self)?)
+                let mut op = op.try_map_children(self)?;
+                op.args = expand_synthetic_typed_starred_tuple_args(op.args);
+                InstrTyped::GuardedCallableCallTyped(op)
             }
             InstrTyped::GuardedMethodCallTyped(op) => {
-                InstrTyped::GuardedMethodCallTyped(op.try_map_children(self)?)
+                let mut op = op.try_map_children(self)?;
+                op.args = expand_synthetic_typed_starred_tuple_args(op.args);
+                InstrTyped::GuardedMethodCallTyped(op)
             }
             InstrTyped::DirectCallableCallTyped(op) => {
-                InstrTyped::DirectCallableCallTyped(op.try_map_children(self)?)
+                let mut op = op.try_map_children(self)?;
+                op.args = expand_synthetic_typed_starred_tuple_args(op.args);
+                InstrTyped::DirectCallableCallTyped(op)
             }
             InstrTyped::DirectMethodCallTyped(op) => {
-                InstrTyped::DirectMethodCallTyped(op.try_map_children(self)?)
+                let mut op = op.try_map_children(self)?;
+                op.args = expand_synthetic_typed_starred_tuple_args(op.args);
+                InstrTyped::DirectMethodCallTyped(op)
             }
             InstrTyped::DirectCallGuardTest(op) => {
                 InstrTyped::DirectCallGuardTest(op.try_map_children(self)?)
             }
-            InstrTyped::CallDirect(op) => InstrTyped::CallDirect(op.try_map_children(self)?),
+            InstrTyped::CallDirect(op) => {
+                let mut op = op.try_map_children(self)?;
+                op.args = expand_synthetic_typed_starred_tuple_args(op.args);
+                InstrTyped::CallDirect(op)
+            }
             InstrTyped::GetAttrTyped(op) => InstrTyped::GetAttrTyped(op.try_map_children(self)?),
             InstrTyped::SetAttrTyped(op) => InstrTyped::SetAttrTyped(op.try_map_children(self)?),
             InstrTyped::GetItem(op) => InstrTyped::GetItem(op.try_map_children(self)?),
@@ -3810,6 +4258,17 @@ impl TryMapInstr<InstrTyped, InstrTyped, TypedInlineUnsupportedReason>
         &mut self,
         mut name: ResolvedName,
     ) -> Result<ResolvedName, TypedInlineUnsupportedReason> {
+        name.location = self.constant_scope.remap_location(name.location)?;
+        if self.constant_scope.is_cross_module()
+            && (name.location.is_global() || name.location.is_global_name())
+        {
+            let Some(runtime_name) = RuntimeName::from_name(name.id.as_str()) else {
+                return Err(TypedInlineUnsupportedReason::CrossModuleGlobalName(
+                    name.id.to_string(),
+                ));
+            };
+            name.location = NameLocation::RuntimeName(runtime_name);
+        }
         let Some(location) = name.location.as_local() else {
             return Ok(name);
         };
@@ -3956,26 +4415,39 @@ fn typed_expr_is_exception_matches_stop_iteration(
             module_constants,
         );
     }
-    let InstrTyped::CallTyped(call) = expr else {
+    let Some((func, args, keywords)) = typed_callable_call_parts(expr) else {
         return false;
     };
-    if !typed_expr_is_runtime_name_load(
-        call.func.as_ref(),
-        RuntimeName::ExceptionMatches,
-        module_constants,
-    ) || !call.keywords.is_empty()
-        || call.args.len() != 2
+    if !typed_expr_is_runtime_name_load(func, RuntimeName::ExceptionMatches, module_constants)
+        || !keywords.is_empty()
+        || args.len() != 2
     {
         return false;
     }
-    let Some(exc) = typed_positional_arg_expr(call.args.first()) else {
+    let Some(exc) = typed_positional_arg_expr(args.first()) else {
         return false;
     };
-    let Some(expected) = typed_positional_arg_expr(call.args.get(1)) else {
+    let Some(expected) = typed_positional_arg_expr(args.get(1)) else {
         return false;
     };
     typed_expr_loads_name(exc, exception_name)
         && typed_expr_is_runtime_name_load(expected, RuntimeName::StopIteration, module_constants)
+}
+
+fn typed_callable_call_parts<'a>(
+    expr: &'a InstrTyped,
+) -> Option<(
+    &'a InstrTyped,
+    &'a [CallArgPositional<InstrTyped>],
+    &'a [CallArgKeyword<InstrTyped>],
+)> {
+    match expr {
+        InstrTyped::CallTyped(call) => Some((call.func.as_ref(), &call.args, &call.keywords)),
+        InstrTyped::GuardedCallableCallTyped(call) => {
+            Some((call.func.as_ref(), &call.args, &call.keywords))
+        }
+        _ => None,
+    }
 }
 
 fn typed_positional_arg_expr(arg: Option<&CallArgPositional<InstrTyped>>) -> Option<&InstrTyped> {
@@ -4348,14 +4820,34 @@ fn validate_typed_direct_call_arg_sources(
     plan: &TypedDirectCallArgPlan,
     provided_positional_arg_count: usize,
 ) -> Result<(), String> {
+    let mut saw_packed_rest = false;
     for source in &plan.sources {
         match source {
             TypedDirectCallArgSource::Provided(index)
-                if *index >= provided_positional_arg_count =>
+                if saw_packed_rest || *index >= provided_positional_arg_count =>
             {
+                if saw_packed_rest {
+                    return Err(
+                        "direct call arg plan references provided arg after packed rest"
+                            .to_string(),
+                    );
+                }
                 return Err(format!(
                     "direct call arg plan references provided arg {index}, but only {provided_positional_arg_count} args are available"
                 ));
+            }
+            TypedDirectCallArgSource::PackedRest { start } => {
+                if saw_packed_rest {
+                    return Err(
+                        "direct call arg plan packs provided rest more than once".to_string()
+                    );
+                }
+                if *start > provided_positional_arg_count {
+                    return Err(format!(
+                        "direct call arg plan packs provided rest from arg {start}, but only {provided_positional_arg_count} args are available"
+                    ));
+                }
+                saw_packed_rest = true;
             }
             TypedDirectCallArgSource::Provided(_) | TypedDirectCallArgSource::DefaultSentinel => {}
         }
@@ -4472,13 +4964,16 @@ pub fn try_lower_typed_module_to_codegen_legacy(
 mod typed_codegen_tests {
     use super::*;
     use crate::passes::infer_module_value_facts;
-    use soac_core::block_py::{ChildVisitable, InstrId, InstrWithConstantNone, Visit, VisitMut};
+    use soac_core::block_py::{
+        ChildVisitable, InstrId, InstrWithConstantNone, ModuleNameGen, Visit, VisitMut,
+    };
+    use soac_core::pass_tracker::NoopPassTracker;
     use soac_ir_blockpy::constructor_entry_function_id_for_init;
     use soac_ir_typed::{
         TypedAttrOwnerRef, TypedDirectFunctionCallGuard, TypedDirectMethodCallGuard,
         TypedIndexedFieldGuard, TypedIndexedFieldPlanSource, lower_blockpy_module_to_typed,
     };
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     #[derive(Default)]
     struct TypedInstrCounter {
@@ -4696,6 +5191,20 @@ mod typed_codegen_tests {
             .find(|function| function.names.qualname == qualname)
             .unwrap_or_else(|| panic!("missing codegen function {qualname}"))
             .function_id
+    }
+
+    fn lower_test_module_with_id(
+        source: &str,
+        module_id: u32,
+    ) -> BlockPyModule<BlockPyModuleShape> {
+        soac_lowering::lower_python_to_blockpy_with_tracker_and_options(
+            source,
+            ModuleNameGen::new(module_id),
+            NoopPassTracker::new(),
+            soac_lowering::LoweringOptions::default(),
+        )
+        .expect("source should lower")
+        .blockpy_module
     }
 
     fn replace_first_typed_call_access(
@@ -5912,6 +6421,63 @@ def caller(value):\n    obj = Box(value)\n    if value:\n        return obj.valu
     }
 
     #[test]
+    fn selected_cleanup_split_skips_plain_callable_inline_cleanup() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            "def add(value):\n    return value + 1\n\n\
+def caller(flag, value):\n    result = add(value)\n    if flag:\n        return result\n    return value\n",
+        )
+        .expect("source should lower");
+        let add_id = blockpy_function_id_by_qualname(&lowered.blockpy_module, "add");
+        let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
+        let call_id;
+        {
+            let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+            call_id = first_typed_call_instr_id(caller);
+            replace_first_typed_call_access(
+                caller,
+                TypedCallAccessPlan::GuardedCallable {
+                    function_guards: vec![TypedDirectFunctionCallGuard {
+                        function_id: add_id,
+                        arg_plan: TypedDirectCallArgPlan {
+                            sources: vec![TypedDirectCallArgSource::Provided(0)],
+                        },
+                    }],
+                },
+            );
+            lower_typed_function_call_access_plan_instrs(caller);
+        }
+
+        let callee_module = typed.clone();
+        let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+        let stats = inline_typed_function_direct_call_stores(
+            caller,
+            &callee_module,
+            &HashMap::new(),
+            &HashMap::from([(
+                call_id,
+                vec![(
+                    add_id,
+                    TypedDirectCallArgPlan {
+                        sources: vec![TypedDirectCallArgSource::Provided(0)],
+                    },
+                )],
+            )]),
+        );
+
+        assert_eq!(stats.rewritten_stores, 1);
+        assert!(
+            stats.hot_state_cleanup_labels.is_empty(),
+            "plain callable inline cleanup should not be eligible for hot-loop cloning"
+        );
+        assert_eq!(
+            split_typed_inline_cleanup_hot_continuations_for_labels(caller, &HashSet::new())
+                .clones
+                .len(),
+            0
+        );
+    }
+
+    #[test]
     fn typed_alias_hot_continuation_split_clones_joined_successors() {
         let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
             "class IterRange:\n    def __iter__(self):\n        return self\n\n\
@@ -6107,6 +6673,243 @@ def caller(value):\n    obj = Box(value)\n    if value:\n        return obj.valu
     }
 
     #[test]
+    fn typed_cross_module_constructor_inline_feeds_field_scalarization() {
+        let callee_module = lower_test_module_with_id(
+            "class Box:\n    def __init__(self, value):\n        self.value = value\n",
+            1,
+        );
+        let inline_plan = crate::passes::plan_module_inlining(
+            &crate::passes::summarize_module_escapes(&callee_module),
+        );
+        let init_id = blockpy_function_id_by_qualname(&callee_module, "Box.__init__");
+        let constructor_entry_id = constructor_entry_function_id_for_init(&callee_module, init_id)
+            .expect("class lowering should add a constructor entry");
+        let callee_typed = lower_blockpy_module_to_typed(callee_module);
+        let constructor_entry = callee_typed
+            .callable_defs
+            .iter()
+            .find(|function| function.function_id == constructor_entry_id)
+            .expect("typed callee module should contain constructor entry")
+            .clone();
+        let external_callees = HashMap::from([(
+            constructor_entry_id,
+            TypedExternalInlineCallee {
+                function: constructor_entry,
+                module_constants: callee_typed.module_constants.clone(),
+                inline_plan: Some(inline_plan),
+            },
+        )]);
+
+        let caller_module = lower_test_module_with_id(
+            "def caller(factory, value):\n    obj = factory(value)\n    if value:\n        return obj.value\n    return 0\n",
+            2,
+        );
+        let mut caller_typed = lower_blockpy_module_to_typed(caller_module);
+        let call_id;
+        {
+            let caller = typed_function_by_qualname_mut(&mut caller_typed, "caller");
+            call_id = first_typed_call_instr_id(caller);
+            replace_first_typed_call_access(
+                caller,
+                TypedCallAccessPlan::GuardedCallable {
+                    function_guards: vec![TypedDirectFunctionCallGuard {
+                        function_id: constructor_entry_id,
+                        arg_plan: TypedDirectCallArgPlan {
+                            sources: vec![
+                                TypedDirectCallArgSource::Provided(0),
+                                TypedDirectCallArgSource::Provided(1),
+                            ],
+                        },
+                    }],
+                },
+            );
+            lower_typed_function_call_access_plan_instrs(caller);
+        }
+
+        let caller_callee_module = caller_typed.clone();
+        let caller_index = caller_typed
+            .callable_defs
+            .iter()
+            .position(|function| function.names.qualname == "caller")
+            .expect("typed caller should exist");
+        let inline_stats = inline_typed_function_direct_call_stores_with_external_callees(
+            &mut caller_typed.callable_defs[caller_index],
+            &caller_callee_module,
+            &mut caller_typed.module_constants,
+            &external_callees,
+            &HashMap::from([(
+                call_id,
+                vec![(
+                    constructor_entry_id,
+                    TypedDirectCallArgPlan {
+                        sources: vec![
+                            TypedDirectCallArgSource::Provided(0),
+                            TypedDirectCallArgSource::Provided(1),
+                        ],
+                    },
+                )],
+            )]),
+        );
+        assert_eq!(inline_stats.rewritten_stores, 1);
+        let constructor_field_bindings =
+            typed_constructor_field_bindings_from_inline_stats_with_external_callees(
+                &caller_callee_module,
+                &crate::passes::InlinePlanModule::default(),
+                &caller_typed.module_constants,
+                &external_callees,
+                &inline_stats,
+            );
+        assert_eq!(constructor_field_bindings.len(), 1);
+        let constructor_init_plans =
+            typed_constructor_init_plans_from_inline_stats_with_external_callees(
+                &caller_callee_module,
+                &caller_typed.module_constants,
+                &external_callees,
+                &inline_stats,
+            );
+        assert_eq!(constructor_init_plans.len(), 1);
+        assert!(
+            constructor_init_plans
+                .values()
+                .any(|plan| plan.init_function_id == init_id),
+            "cross-module constructor-entry inline should retain the original __init__ target for direct init codegen"
+        );
+
+        let module_constants = caller_typed.module_constants.clone();
+        let caller = &mut caller_typed.callable_defs[caller_index];
+        let split_stats = split_typed_constructor_hot_continuations(caller, &module_constants);
+        assert_eq!(split_stats.clones.len(), 1);
+        assert!(
+            mark_indexed_field_accesses_for_field(caller, &module_constants, "value") >= 2,
+            "original and hot-cloned continuations should contain the field load before scalarization"
+        );
+        let clone = split_stats.clones[0];
+        let scalar_stats = scalarize_typed_hot_constructor_field_loads(
+            caller,
+            &module_constants,
+            &constructor_field_bindings,
+        );
+        assert_eq!(scalar_stats.seeded_objects, 1);
+        assert_eq!(scalar_stats.scalar_slots, 1);
+        assert_eq!(scalar_stats.rewritten_loads, 1);
+        assert_eq!(
+            getattrs_for_field_in_reachable_blocks(
+                caller,
+                clone.cloned_entry,
+                &module_constants,
+                "value",
+            ),
+            0,
+            "cross-module constructor scalar should replace the hot cloned field load"
+        );
+    }
+
+    #[test]
+    fn typed_vararg_constructor_inline_expands_packed_rest_star_call() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            "class Record:\n    def __init__(self, *args):\n        self.value = args[0]\n\n\
+def caller(value):\n    obj = Record(value)\n    return obj\n",
+        )
+        .expect("source should lower");
+        let init_id = blockpy_function_id_by_qualname(&lowered.blockpy_module, "Record.__init__");
+        let constructor_entry_id =
+            constructor_entry_function_id_for_init(&lowered.blockpy_module, init_id)
+                .expect("class lowering should add a constructor entry");
+        let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
+        let module_constants = typed.module_constants.clone();
+        let call_id;
+        {
+            let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+            call_id = first_typed_call_instr_id(caller);
+            replace_first_typed_call_access(
+                caller,
+                TypedCallAccessPlan::GuardedCallable {
+                    function_guards: vec![TypedDirectFunctionCallGuard {
+                        function_id: constructor_entry_id,
+                        arg_plan: TypedDirectCallArgPlan {
+                            sources: vec![
+                                TypedDirectCallArgSource::Provided(0),
+                                TypedDirectCallArgSource::PackedRest { start: 1 },
+                            ],
+                        },
+                    }],
+                },
+            );
+            lower_typed_function_call_access_plan_instrs(caller);
+        }
+
+        let callee_module = typed.clone();
+        let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+        let inline_stats = inline_typed_function_direct_call_stores(
+            caller,
+            &callee_module,
+            &HashMap::new(),
+            &HashMap::from([(
+                call_id,
+                vec![(
+                    constructor_entry_id,
+                    TypedDirectCallArgPlan {
+                        sources: vec![
+                            TypedDirectCallArgSource::Provided(0),
+                            TypedDirectCallArgSource::PackedRest { start: 1 },
+                        ],
+                    },
+                )],
+            )]),
+        );
+        assert_eq!(inline_stats.rewritten_stores, 1);
+
+        #[derive(Default)]
+        struct ConstructorCallShape {
+            calls: usize,
+            starred_args: usize,
+            positional_counts: Vec<usize>,
+        }
+        struct ConstructorCallShapeCollector<'a> {
+            module_constants: &'a [ConstantExpr],
+            shape: ConstructorCallShape,
+        }
+        impl Visit<InstrTyped> for ConstructorCallShapeCollector<'_> {
+            fn visit_instr(&mut self, expr: &InstrTyped) {
+                if let InstrTyped::CallTyped(call) = expr
+                    && typed_expr_is_runtime_name_load(
+                        call.func.as_ref(),
+                        RuntimeName::ConstructorCall,
+                        self.module_constants,
+                    )
+                {
+                    self.shape.calls += 1;
+                    self.shape.starred_args += call
+                        .args
+                        .iter()
+                        .filter(|arg| matches!(arg, CallArgPositional::Starred(_)))
+                        .count();
+                    self.shape.positional_counts.push(call.args.len());
+                }
+                expr.visit_children(self);
+            }
+        }
+
+        let mut collector = ConstructorCallShapeCollector {
+            module_constants: &module_constants,
+            shape: ConstructorCallShape::default(),
+        };
+        collector.visit_fn(caller);
+        assert!(
+            collector.shape.calls > 0,
+            "constructor-entry inline should retain the constructor_call"
+        );
+        assert_eq!(
+            collector.shape.starred_args, 0,
+            "packed vararg rest should become ordinary positional constructor_call arguments"
+        );
+        assert!(
+            collector.shape.positional_counts.contains(&2),
+            "constructor_call should receive the class plus the original user argument"
+        );
+    }
+
+    #[test]
     fn typed_field_scalarization_preserves_iterator_state_on_hot_loop_backedge() {
         let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
             "class IterRange:\n    def __init__(self, current, stop, step):\n        self.current = current\n        self.stop = stop\n        self.step = step\n\n    def __next__(self):\n        current = self.current\n        stop = self.stop\n        step = self.step\n        if current >= stop:\n            raise StopIteration\n        self.current = current + step\n        return current\n\n\
@@ -6195,6 +6998,15 @@ def caller(i):\n    it = IterRange(0, i, 1)\n    total = 0\n    while True:\n   
             )]),
         );
         assert_eq!(constructor_inline_stats.rewritten_stores, 1);
+        let mut constructor_hot_state_cleanup_labels = constructor_inline_stats
+            .hot_state_cleanup_labels
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        assert!(
+            !constructor_hot_state_cleanup_labels.is_empty(),
+            "constructor-entry inline should mark hot-state cleanup for continuation splitting"
+        );
         let constructor_field_bindings = typed_constructor_field_bindings_from_inline_stats(
             &callee_module,
             &inline_plan,
@@ -6203,12 +7015,15 @@ def caller(i):\n    it = IterRange(0, i, 1)\n    total = 0\n    while True:\n   
         );
         assert_eq!(constructor_field_bindings.len(), 1);
 
-        assert_eq!(
-            split_typed_constructor_hot_continuations(caller, &module_constants)
-                .clones
-                .len(),
-            1
-        );
+        let constructor_split =
+            split_typed_constructor_hot_continuations(caller, &module_constants);
+        assert_eq!(constructor_split.clones.len(), 1);
+        let mut hot_continuation_clones = constructor_split.clones.clone();
+        for (source, target) in &constructor_split.label_mappings {
+            if constructor_hot_state_cleanup_labels.contains(source) {
+                constructor_hot_state_cleanup_labels.insert(*target);
+            }
+        }
         let next_direct_calls =
             typed_runtime_name_call_instr_ids(caller, RuntimeName::Next, &module_constants)
                 .into_iter()
@@ -6238,10 +7053,39 @@ def caller(i):\n    it = IterRange(0, i, 1)\n    total = 0\n    while True:\n   
             next_inline_stats.rewritten_stores >= 1,
             "hot next() call should inline after constructor continuation splitting"
         );
-        let cleanup_split = split_typed_inline_cleanup_hot_continuations(caller);
+        let mut hot_state_cleanup_labels = next_inline_stats
+            .hot_state_cleanup_labels
+            .iter()
+            .copied()
+            .chain(constructor_hot_state_cleanup_labels)
+            .collect::<HashSet<_>>();
         assert!(
-            !cleanup_split.clones.is_empty(),
-            "next() hot cleanup should split its loop continuation away from the generic fallback"
+            !hot_state_cleanup_labels.is_empty(),
+            "runtime protocol next() inline should mark hot-state cleanup for continuation splitting"
+        );
+        let constructor_split =
+            split_typed_constructor_hot_continuations(caller, &module_constants);
+        hot_continuation_clones.extend(constructor_split.clones.iter().copied());
+        for (source, target) in &constructor_split.label_mappings {
+            if hot_state_cleanup_labels.contains(source) {
+                hot_state_cleanup_labels.insert(*target);
+            }
+        }
+        let alias_split = split_typed_alias_hot_continuations(caller);
+        hot_continuation_clones.extend(alias_split.clones.iter().copied());
+        for (source, target) in &alias_split.label_mappings {
+            if hot_state_cleanup_labels.contains(source) {
+                hot_state_cleanup_labels.insert(*target);
+            }
+        }
+        let cleanup_split = split_typed_inline_cleanup_hot_continuations_for_labels(
+            caller,
+            &hot_state_cleanup_labels,
+        );
+        hot_continuation_clones.extend(cleanup_split.clones.iter().copied());
+        assert!(
+            !hot_continuation_clones.is_empty(),
+            "pending constructor or next() hot state should split the loop continuation"
         );
         for field in ["current", "stop", "step"] {
             assert!(
@@ -6252,10 +7096,10 @@ def caller(i):\n    it = IterRange(0, i, 1)\n    total = 0\n    while True:\n   
         assert!(
             rewrite_typed_stop_iteration_raises_to_handler_jumps(caller, &module_constants) >= 1
         );
-        let hot_loop_clone = cleanup_split
-            .clones
+        let hot_loop_clones = hot_continuation_clones
             .iter()
-            .find(|clone| {
+            .copied()
+            .filter(|clone| {
                 getattrs_for_field_in_hot_reachable_blocks(
                     caller,
                     clone.cloned_entry,
@@ -6263,8 +7107,11 @@ def caller(i):\n    it = IterRange(0, i, 1)\n    total = 0\n    while True:\n   
                     "current",
                 ) > 0
             })
-            .copied()
-            .expect("cleanup split should clone the hot loop containing __next__ field loads");
+            .collect::<Vec<_>>();
+        assert!(
+            !hot_loop_clones.is_empty(),
+            "hot-state split should clone the hot loop containing __next__ field loads"
+        );
 
         let scalar_stats = scalarize_typed_hot_constructor_field_loads(
             caller,
@@ -6277,18 +7124,19 @@ def caller(i):\n    it = IterRange(0, i, 1)\n    total = 0\n    while True:\n   
             scalar_stats.rewritten_loads >= 3,
             "current/stop/step loads in the hot iterator loop should scalarize: {scalar_stats:?}"
         );
-        for field in ["current", "stop", "step"] {
-            assert_eq!(
-                getattrs_for_field_in_hot_reachable_blocks(
-                    caller,
-                    hot_loop_clone.cloned_entry,
-                    &module_constants,
-                    field,
-                ),
-                0,
-                "hot iterator loop should use scalar state for {field}"
-            );
-        }
+        assert!(
+            hot_loop_clones.iter().any(|clone| {
+                ["current", "stop", "step"].iter().all(|field| {
+                    getattrs_for_field_in_hot_reachable_blocks(
+                        caller,
+                        clone.cloned_entry,
+                        &module_constants,
+                        field,
+                    ) == 0
+                })
+            }),
+            "at least one hot iterator loop clone should use scalar state for current/stop/step"
+        );
     }
 
     #[test]
@@ -6312,6 +7160,52 @@ def caller(it):\n    try:\n        value = next(it)\n    except StopIteration:\n
                 BlockTerm::Jump(edge) if edge.args.iter().any(|arg| matches!(arg, BlockArg::None))
             )
         }));
+    }
+
+    #[test]
+    fn typed_stop_iteration_raise_rewrite_accepts_guarded_exception_match() {
+        let mut typed = inline_next_protocol_call(
+            "class IterRange:\n    def __next__(self):\n        if self.current >= self.stop:\n            raise StopIteration\n        return self.current\n\n\
+def caller(it):\n    try:\n        value = next(it)\n    except StopIteration:\n        return 0\n    return value\n",
+        );
+        let module_constants = typed.module_constants.clone();
+        let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+        let exception_matches_id = typed_runtime_name_call_instr_ids(
+            caller,
+            RuntimeName::ExceptionMatches,
+            &module_constants,
+        )
+        .into_iter()
+        .next()
+        .expect("inlined try handler should call exception_matches");
+        let plans = TypedCallEmissionPlans {
+            by_source: HashMap::from([(
+                exception_matches_id,
+                TypedCallEmissionPlan::Callable {
+                    function_guards: vec![TypedDirectFunctionCallGuard {
+                        function_id: RuntimeFunctionId::from_raw_parts(0, 1),
+                        arg_plan: TypedDirectCallArgPlan {
+                            sources: vec![
+                                TypedDirectCallArgSource::Provided(0),
+                                TypedDirectCallArgSource::Provided(1),
+                            ],
+                        },
+                    }],
+                },
+            )]),
+        };
+        assert_eq!(
+            lower_typed_function_call_emission_plans(caller, &plans)
+                .expect("exception_matches call emission should lower"),
+            1
+        );
+
+        assert_eq!(stop_iteration_raise_terms(caller, &module_constants), 1);
+        assert_eq!(
+            rewrite_typed_stop_iteration_raises_to_handler_jumps(caller, &module_constants),
+            1
+        );
+        assert_eq!(stop_iteration_raise_terms(caller, &module_constants), 0);
     }
 
     #[test]
