@@ -321,6 +321,79 @@ def write_and_read(value):
     assert by_kind.get("field_access.indexed_fallback", 0) == 0, profile
 
 
+def test_profile_records_runtime_protocol_iter_target(tmp_path):
+    module_name = "runtime_protocol_iter_profile_case"
+    (tmp_path / f"{module_name}.py").write_text(
+        """
+class SelfIter:
+    def __init__(self, stop):
+        self.current = 0
+        self.stop = stop
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.current >= self.stop:
+            raise StopIteration
+        value = self.current
+        self.current = value + 1
+        return value
+
+def run(stop):
+    total = 0
+    for value in SelfIter(stop):
+        total += value
+    return total
+""",
+        encoding="utf-8",
+    )
+    work_dir = tmp_path / "soac-work"
+    ids_path = tmp_path / "function-ids.json"
+    script = _import_and_run_script(
+        tmp_path,
+        f"import {module_name} as module",
+        f"""
+        import ctypes
+        import json
+        from pathlib import Path
+        assert module.run(4) == 6
+        get_function_id = ctypes.pythonapi.PyFunction_GetSoacFunctionId
+        get_function_id.argtypes = [ctypes.py_object]
+        get_function_id.restype = ctypes.c_uint64
+        Path({str(ids_path)!r}).write_text(json.dumps({{
+            "iter": get_function_id(module.SelfIter.__dict__["__iter__"]),
+            "run": get_function_id(module.run),
+        }}), encoding="utf-8")
+        """,
+    )
+    result = _run_soac_subprocess(
+        script,
+        env=_soac_subprocess_env(
+            tmp_path,
+            work_dir=work_dir,
+            extra_env={
+                "SOAC_COMPILE_MODE": "eager",
+                "SOAC_OPT_MODE": "profile",
+            },
+        ),
+    )
+    _assert_subprocess_ok(result)
+
+    profile = _inspect_counter_dump_json(work_dir / "profile.bin")
+    function_ids = json.loads(ids_path.read_text(encoding="utf-8"))
+    iter_id = function_ids["iter"]
+    run_id = function_ids["run"]
+    assert any(
+        row["kind"] == "call_hot_targets"
+        and row["function_id"] == run_id
+        and row.get("observed_value") == iter_id
+        for record in profile["records"]
+        if record["module_name"] == module_name
+        for row in record["rows"]
+    ), profile
+
+
 def test_module_load_event_is_written_to_soac_log_json(tmp_path):
     log_path = tmp_path / "soac-events.jsonl"
     module_path = tmp_path / "module_load_log_case.py"

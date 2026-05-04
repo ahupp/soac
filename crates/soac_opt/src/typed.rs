@@ -1,4 +1,4 @@
-use crate::passes::value_facts;
+use crate::passes::{ConstructorFieldValue, InlinePlanModule, value_facts};
 #[allow(unused_imports)]
 use soac_core::block_py;
 #[allow(unused_imports)]
@@ -6,21 +6,25 @@ use soac_core::block_py::{
     Block, BlockArg, BlockEdge, BlockLabel, BlockParamRole, BlockPyFunction, BlockPyModule,
     BlockTerm, Call, CallArgKeyword, CallArgPositional, CallDirect, CalleeFunctionId,
     ChildVisitable, ConstantExpr, Del, HasMeta, HasSemanticInstrId, Instr, InstrId, InstrKey,
-    InstrWithConstantNone, Load, LocalLocation, MapInstr, Mappable, Meta, NameLike, NameLocation,
-    ParamKind, PrettyPrint, PrettyPrinter, ResolvedName, RuntimeFunctionId, RuntimeName, SetAttr,
-    Store, TermIf, TryMapInstr, TryMapModule, TryMapTerm, Visit, VisitMut, WithMeta,
+    InstrWithConstantNone, Literal, Load, LocalLocation, MapInstr, Mappable, Meta, NameLike,
+    NameLocation, ParamKind, PrettyPrint, PrettyPrinter, ResolvedName, RuntimeFunctionId,
+    RuntimeName, SetAttr, Store, TermIf, TryMapInstr, TryMapModule, TryMapTerm, Visit, VisitMut,
+    WithMeta,
 };
-use soac_ir_blockpy::{BlockPyModuleShape, InstrBlockPy, is_constructor_entry_function};
+use soac_ir_blockpy::{
+    BlockPyModuleShape, InstrBlockPy, constructor_init_function_id_for_entry_function,
+    is_constructor_entry_function,
+};
 use soac_ir_typed::emit_v3::MechanicalExitKind;
 use soac_ir_typed::plan_v3::Rep;
 use soac_ir_typed::{
-    BoolFacts, FactStore, InstrTyped, PyObjFacts, TypedBlock, TypedBlockExtra,
+    BoolFacts, FactStore, InstrTyped, PyObjFacts, TypedAttrAccessPlan, TypedBlock, TypedBlockExtra,
     TypedBlockPyModuleShape, TypedCall, TypedCallAccessPlan, TypedCallEmissionPlan,
     TypedCallEmissionPlans, TypedDirectCallArgPlan, TypedDirectCallArgSource,
     TypedDirectCallGuardTest, TypedDirectCallGuardTestKind, TypedDirectCallableCall,
     TypedDirectCallableCallGuard, TypedDirectMethodCall, TypedDirectMethodCallGuard, TypedGetAttr,
     TypedGuardedCallableCall, TypedGuardedMethodCall, TypedPlannedResult,
-    TypedPyObjectOwnershipPlan, TypedResultDemand, TypedTruthy, ValueFacts,
+    TypedPyObjectOwnershipPlan, TypedResultDemand, TypedSetAttr, TypedTruthy, ValueFacts,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -708,6 +712,26 @@ pub struct TypedHotContinuationSplitStats {
     pub instr_id_mappings: Vec<TypedInlineInstrIdMapping>,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct TypedConstructorFieldBinding {
+    pub field_name: String,
+    pub value: ResolvedName,
+    pub scalar: Option<ResolvedName>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct TypedConstructorFieldBindings {
+    pub fields: Vec<TypedConstructorFieldBinding>,
+}
+
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct TypedFieldScalarizationStats {
+    pub seeded_objects: usize,
+    pub scalar_slots: usize,
+    pub inserted_scalar_stores: usize,
+    pub rewritten_loads: usize,
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 #[allow(dead_code)]
 pub enum TypedInlineUnsupportedReason {
@@ -1252,6 +1276,55 @@ pub fn split_typed_constructor_hot_continuations(
     stats
 }
 
+pub fn split_typed_alias_hot_continuations(
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+) -> TypedHotContinuationSplitStats {
+    let mut stats = TypedHotContinuationSplitStats::default();
+    let mut instr_id_allocator = TypedInlineInstrIdAllocator::from_function(function);
+    loop {
+        let Some(candidate) = find_typed_alias_hot_continuation_split_candidate(function) else {
+            break;
+        };
+        let Some(cloned) = clone_typed_hot_continuation(
+            function,
+            candidate,
+            stats.clones.len() as u32,
+            &mut instr_id_allocator,
+        ) else {
+            break;
+        };
+        stats.cloned_blocks += cloned.clone.cloned_blocks;
+        stats.instr_id_mappings.extend(cloned.instr_id_mappings);
+        stats.clones.push(cloned.clone);
+    }
+    stats
+}
+
+pub fn split_typed_inline_cleanup_hot_continuations(
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+) -> TypedHotContinuationSplitStats {
+    let mut stats = TypedHotContinuationSplitStats::default();
+    let mut instr_id_allocator = TypedInlineInstrIdAllocator::from_function(function);
+    loop {
+        let Some(candidate) = find_typed_inline_cleanup_hot_continuation_split_candidate(function)
+        else {
+            break;
+        };
+        let Some(cloned) = clone_typed_hot_continuation(
+            function,
+            candidate,
+            stats.clones.len() as u32,
+            &mut instr_id_allocator,
+        ) else {
+            break;
+        };
+        stats.cloned_blocks += cloned.clone.cloned_blocks;
+        stats.instr_id_mappings.extend(cloned.instr_id_mappings);
+        stats.clones.push(cloned.clone);
+    }
+    stats
+}
+
 #[derive(Debug, Clone)]
 struct TypedHotContinuationSplitCandidate {
     hot_block: BlockLabel,
@@ -1297,6 +1370,60 @@ fn find_typed_constructor_hot_continuation_split_candidate(
     })
 }
 
+fn find_typed_alias_hot_continuation_split_candidate(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+) -> Option<TypedHotContinuationSplitCandidate> {
+    let labels = typed_block_indices_by_label(function);
+    let predecessors = typed_block_predecessors(function);
+    function.blocks.iter().find_map(|block| {
+        let original_entry =
+            typed_alias_hot_continuation_entry(function, &labels, &predecessors, block)?;
+        let reachable = typed_reachable_block_labels(function, &labels, original_entry)?;
+        if reachable.contains(&block.label)
+            || reachable.len() > MAX_TYPED_HOT_CONTINUATION_CLONE_BLOCKS
+            || !typed_reachable_subgraph_has_external_predecessor(
+                &reachable,
+                &predecessors,
+                block.label,
+            )
+        {
+            return None;
+        }
+        Some(TypedHotContinuationSplitCandidate {
+            hot_block: block.label,
+            original_entry,
+            reachable,
+        })
+    })
+}
+
+fn find_typed_inline_cleanup_hot_continuation_split_candidate(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+) -> Option<TypedHotContinuationSplitCandidate> {
+    let labels = typed_block_indices_by_label(function);
+    let predecessors = typed_block_predecessors(function);
+    let hot_path_labels = typed_direct_call_hot_path_labels(function, &labels);
+    function.blocks.iter().find_map(|block| {
+        let original_entry = typed_inline_cleanup_hot_continuation_entry(&hot_path_labels, block)?;
+        let reachable = typed_hot_reachable_block_labels(function, &labels, original_entry)?;
+        if reachable.contains(&block.label)
+            || reachable.len() > MAX_TYPED_HOT_CONTINUATION_CLONE_BLOCKS
+            || !typed_reachable_subgraph_has_external_predecessor(
+                &reachable,
+                &predecessors,
+                block.label,
+            )
+        {
+            return None;
+        }
+        Some(TypedHotContinuationSplitCandidate {
+            hot_block: block.label,
+            original_entry,
+            reachable,
+        })
+    })
+}
+
 fn typed_constructor_hot_continuation_entry(
     function: &BlockPyFunction<TypedBlockPyModuleShape>,
     labels: &HashMap<BlockLabel, usize>,
@@ -1307,6 +1434,36 @@ fn typed_constructor_hot_continuation_entry(
     if !typed_block_contains_constructor_call_store(block, module_constants)
         || !typed_block_is_direct_call_guard_hot_successor(function, labels, predecessors, block)
     {
+        return None;
+    }
+    let BlockTerm::Jump(edge) = &block.term else {
+        return None;
+    };
+    Some(edge.target)
+}
+
+fn typed_alias_hot_continuation_entry(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    labels: &HashMap<BlockLabel, usize>,
+    predecessors: &HashMap<BlockLabel, HashSet<BlockLabel>>,
+    block: &TypedBlock,
+) -> Option<BlockLabel> {
+    if !typed_block_contains_local_alias_store(block)
+        || !typed_block_is_direct_call_guard_hot_successor(function, labels, predecessors, block)
+    {
+        return None;
+    }
+    let BlockTerm::Jump(edge) = &block.term else {
+        return None;
+    };
+    Some(edge.target)
+}
+
+fn typed_inline_cleanup_hot_continuation_entry(
+    hot_path_labels: &HashSet<BlockLabel>,
+    block: &TypedBlock,
+) -> Option<BlockLabel> {
+    if !typed_block_is_inline_cleanup(block) || !hot_path_labels.contains(&block.label) {
         return None;
     }
     let BlockTerm::Jump(edge) = &block.term else {
@@ -1332,6 +1489,28 @@ fn typed_block_contains_constructor_call_store(
             module_constants,
         )
     })
+}
+
+fn typed_block_contains_local_alias_store(block: &TypedBlock) -> bool {
+    block.body.iter().any(|instr| {
+        let InstrTyped::Store(store) = instr else {
+            return false;
+        };
+        if store.name.location.as_local().is_none() {
+            return false;
+        }
+        typed_instr_local_load_location(store.value.as_ref()).is_some()
+    })
+}
+
+fn typed_block_is_inline_cleanup(block: &TypedBlock) -> bool {
+    block.params.is_empty()
+        && matches!(block.term, BlockTerm::Jump(_))
+        && !block.body.is_empty()
+        && block
+            .body
+            .iter()
+            .all(|instr| matches!(instr, InstrTyped::Del(_)))
 }
 
 fn typed_block_is_direct_call_guard_hot_successor(
@@ -1406,6 +1585,53 @@ fn typed_reachable_block_labels(
         pending.extend(typed_block_successors(block));
     }
     Some(seen)
+}
+
+fn typed_direct_call_hot_path_labels(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    labels: &HashMap<BlockLabel, usize>,
+) -> HashSet<BlockLabel> {
+    let mut seen = HashSet::new();
+    for block in &function.blocks {
+        if let Some(hot_label) = typed_block_direct_call_guard_then_label(block) {
+            collect_typed_hot_reachable_block_labels(function, labels, hot_label, &mut seen);
+        }
+    }
+    seen
+}
+
+fn typed_hot_reachable_block_labels(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    labels: &HashMap<BlockLabel, usize>,
+    entry: BlockLabel,
+) -> Option<HashSet<BlockLabel>> {
+    let mut seen = HashSet::new();
+    collect_typed_hot_reachable_block_labels(function, labels, entry, &mut seen)?;
+    Some(seen)
+}
+
+fn collect_typed_hot_reachable_block_labels(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    labels: &HashMap<BlockLabel, usize>,
+    entry: BlockLabel,
+    seen: &mut HashSet<BlockLabel>,
+) -> Option<()> {
+    let mut pending = vec![entry];
+    while let Some(label) = pending.pop() {
+        if !seen.insert(label) {
+            continue;
+        }
+        let block = block_by_label(function, labels, label)?;
+        pending.extend(typed_hot_normal_successors(block));
+    }
+    Some(())
+}
+
+fn typed_hot_normal_successors(block: &TypedBlock) -> Vec<BlockLabel> {
+    if let Some(hot_label) = typed_block_direct_call_guard_then_label(block) {
+        return vec![hot_label];
+    }
+    typed_term_successors(&block.term)
 }
 
 fn typed_reachable_subgraph_has_external_predecessor(
@@ -1497,6 +1723,1123 @@ impl VisitMut<InstrTyped> for TypedContinuationCloneInstrIdRemapper<'_, '_> {
     fn visit_instr_mut(&mut self, expr: &mut InstrTyped) {
         expr.visit_children_mut(self);
         *expr = self.remapper.remap_instr_id(expr.clone());
+    }
+}
+
+pub fn typed_constructor_field_bindings_from_inline_stats(
+    module: &BlockPyModule<TypedBlockPyModuleShape>,
+    inline_plan: &InlinePlanModule,
+    module_constants: &[ConstantExpr],
+    stats: &TypedInlineRewriteStats,
+) -> HashMap<InstrId, TypedConstructorFieldBindings> {
+    let functions = module
+        .callable_defs
+        .iter()
+        .map(|function| (function.function_id, function))
+        .collect::<HashMap<_, _>>();
+    let local_mappings = stats
+        .local_mappings
+        .iter()
+        .map(|mapping| {
+            (
+                (
+                    mapping.callee,
+                    mapping.inline_instance,
+                    mapping.callee_location,
+                ),
+                mapping,
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let mut bindings = HashMap::new();
+    for mapping in &stats.instr_id_mappings {
+        let Some(callee) = functions.get(&mapping.callee).copied() else {
+            continue;
+        };
+        let Some(init_function_id) = constructor_init_function_id_for_entry_function(callee) else {
+            continue;
+        };
+        let constructor_call_instr_ids = typed_constructor_call_instr_ids(callee, module_constants);
+        if !constructor_call_instr_ids.contains(&mapping.callee_instr_id) {
+            continue;
+        }
+        let Some(plan) = inline_plan.straightline_constructor(init_function_id) else {
+            continue;
+        };
+        let fields = plan
+            .field_stores
+            .iter()
+            .filter_map(|store| {
+                let index = match &store.value {
+                    ConstructorFieldValue::Param { index, .. } => *index,
+                    ConstructorFieldValue::Local { .. }
+                    | ConstructorFieldValue::Constant { .. }
+                    | ConstructorFieldValue::Other => return None,
+                };
+                let callee_location = LocalLocation(
+                    u32::try_from(index).expect("constructor parameter index should fit in u32"),
+                );
+                let local_mapping = local_mappings.get(&(
+                    mapping.callee,
+                    mapping.inline_instance,
+                    callee_location,
+                ))?;
+                Some(TypedConstructorFieldBinding {
+                    field_name: store.field_name.clone(),
+                    value: ResolvedName {
+                        id: local_mapping.caller_name.clone().into(),
+                        location: NameLocation::Local(local_mapping.caller_location),
+                    },
+                    scalar: None,
+                })
+            })
+            .collect::<Vec<_>>();
+        if !fields.is_empty() {
+            bindings.insert(
+                mapping.caller_instr_id,
+                TypedConstructorFieldBindings { fields },
+            );
+        }
+    }
+    bindings
+}
+
+fn typed_constructor_call_instr_ids(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    module_constants: &[ConstantExpr],
+) -> HashSet<InstrId> {
+    struct Collector<'a> {
+        module_constants: &'a [ConstantExpr],
+        instr_ids: HashSet<InstrId>,
+    }
+
+    impl Visit<InstrTyped> for Collector<'_> {
+        fn visit_instr(&mut self, expr: &InstrTyped) {
+            if let InstrTyped::CallTyped(call) = expr
+                && typed_expr_is_runtime_name_load(
+                    call.func.as_ref(),
+                    RuntimeName::ConstructorCall,
+                    self.module_constants,
+                )
+                && let Some(instr_id) = call.try_semantic_instr_id()
+            {
+                self.instr_ids.insert(instr_id);
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    let mut collector = Collector {
+        module_constants,
+        instr_ids: HashSet::new(),
+    };
+    collector.visit_fn(function);
+    collector.instr_ids
+}
+
+pub fn scalarize_typed_hot_constructor_field_loads(
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+    module_constants: &[ConstantExpr],
+    constructor_field_bindings: &HashMap<InstrId, TypedConstructorFieldBindings>,
+) -> TypedFieldScalarizationStats {
+    if constructor_field_bindings.is_empty() {
+        return TypedFieldScalarizationStats::default();
+    }
+    let mut constructor_field_bindings = constructor_field_bindings.clone();
+    let scalar_slots =
+        allocate_typed_constructor_field_scalar_slots(function, &mut constructor_field_bindings);
+    let predecessors = typed_normal_block_predecessors(function);
+    let mut in_states = vec![None::<TypedFieldScalarState>; function.blocks.len()];
+    let mut out_states = vec![None::<TypedFieldScalarState>; function.blocks.len()];
+    let labels = typed_block_indices_by_label(function);
+    let entry_label = function.blocks.first().map(|block| block.label);
+    loop {
+        let mut changed = false;
+        for (block_index, block) in function.blocks.iter().enumerate() {
+            let in_state = typed_field_scalar_in_state_for_block(
+                block.label,
+                entry_label,
+                &predecessors,
+                &labels,
+                &out_states,
+            );
+            if in_states[block_index] != in_state {
+                in_states[block_index] = in_state.clone();
+                changed = true;
+            }
+            let out_state = in_state.map(|mut out_state| {
+                let mut block_clone = block.clone();
+                let mut ignored_stats = TypedFieldScalarizationStats::default();
+                transfer_typed_field_scalar_block(
+                    &mut block_clone,
+                    &mut out_state,
+                    module_constants,
+                    &constructor_field_bindings,
+                    &mut ignored_stats,
+                    false,
+                );
+                out_state
+            });
+            if out_states[block_index] != out_state {
+                out_states[block_index] = out_state;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let mut stats = TypedFieldScalarizationStats {
+        scalar_slots,
+        ..TypedFieldScalarizationStats::default()
+    };
+    for (block_index, block) in function.blocks.iter_mut().enumerate() {
+        let mut state = in_states
+            .get(block_index)
+            .cloned()
+            .flatten()
+            .unwrap_or_else(TypedFieldScalarState::default);
+        transfer_typed_field_scalar_block(
+            block,
+            &mut state,
+            module_constants,
+            &constructor_field_bindings,
+            &mut stats,
+            true,
+        );
+    }
+    stats
+}
+
+fn typed_field_scalar_in_state_for_block(
+    label: BlockLabel,
+    entry_label: Option<BlockLabel>,
+    predecessors: &HashMap<BlockLabel, HashSet<BlockLabel>>,
+    labels: &HashMap<BlockLabel, usize>,
+    out_states: &[Option<TypedFieldScalarState>],
+) -> Option<TypedFieldScalarState> {
+    let Some(predecessors) = predecessors.get(&label) else {
+        return (Some(label) == entry_label).then(TypedFieldScalarState::default);
+    };
+    let computed = predecessors
+        .iter()
+        .filter_map(|label| labels.get(label).and_then(|index| out_states.get(*index)))
+        .filter_map(|state| state.as_ref())
+        .collect::<Vec<_>>();
+    if computed.is_empty() {
+        None
+    } else {
+        Some(merge_typed_field_scalar_states(computed.into_iter()))
+    }
+}
+
+fn allocate_typed_constructor_field_scalar_slots(
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+    constructor_field_bindings: &mut HashMap<InstrId, TypedConstructorFieldBindings>,
+) -> usize {
+    if function.storage_layout.is_none() {
+        return 0;
+    }
+    let mut allocated = 0;
+    for bindings in constructor_field_bindings.values_mut() {
+        for field in &mut bindings.fields {
+            if field.scalar.is_some() {
+                continue;
+            }
+            let Ok(temp) = try_allocate_typed_stack_temp(function, "_dp_typed_scalar_field") else {
+                continue;
+            };
+            field.scalar = Some(temp.resolved_name());
+            allocated += 1;
+        }
+    }
+    allocated
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct TypedFieldScalarState {
+    aliases: HashMap<LocalLocation, LocalLocation>,
+    value_aliases: HashMap<LocalLocation, ResolvedName>,
+    fields: HashMap<(LocalLocation, String), ResolvedName>,
+    field_scalars: HashMap<(LocalLocation, String), ResolvedName>,
+}
+
+impl TypedFieldScalarState {
+    fn root_for_location(&self, location: LocalLocation) -> Option<LocalLocation> {
+        let mut current = location;
+        let mut seen = HashSet::new();
+        loop {
+            let next = *self.aliases.get(&current)?;
+            if next == current {
+                return Some(current);
+            }
+            if !seen.insert(current) {
+                return None;
+            }
+            current = next;
+        }
+    }
+
+    fn rebind_local(&mut self, location: LocalLocation) {
+        self.value_aliases.remove(&location);
+        self.value_aliases.retain(|_, value| {
+            value
+                .local_location()
+                .is_none_or(|source| source != location)
+        });
+        self.fields.retain(|_, value| {
+            value
+                .local_location()
+                .is_none_or(|source| source != location)
+        });
+        if self.aliases.get(&location) == Some(&location) {
+            self.rebind_root_local(location);
+        } else {
+            self.aliases.remove(&location);
+        }
+    }
+
+    fn rebind_root_local(&mut self, root: LocalLocation) {
+        let replacement = self
+            .aliases
+            .iter()
+            .filter_map(|(location, mapped_root)| {
+                (*mapped_root == root && *location != root).then_some(*location)
+            })
+            .min_by_key(|location| location.slot());
+        let Some(replacement) = replacement else {
+            self.invalidate_root(root);
+            return;
+        };
+
+        self.aliases.remove(&root);
+        for mapped_root in self.aliases.values_mut() {
+            if *mapped_root == root {
+                *mapped_root = replacement;
+            }
+        }
+        self.aliases.insert(replacement, replacement);
+        rekey_typed_field_scalar_map_root(&mut self.fields, root, replacement);
+        rekey_typed_field_scalar_map_root(&mut self.field_scalars, root, replacement);
+    }
+
+    fn set_alias(&mut self, location: LocalLocation, root: LocalLocation) {
+        if location == root {
+            self.aliases.insert(root, root);
+            return;
+        }
+        self.rebind_local(location);
+        self.aliases.entry(root).or_insert(root);
+        self.aliases.insert(location, root);
+    }
+
+    fn set_value_alias(&mut self, location: LocalLocation, value: &ResolvedName) {
+        self.rebind_local(location);
+        let value = self.resolve_scalar_name(value);
+        self.value_aliases.insert(location, value);
+    }
+
+    fn resolve_scalar_name(&self, value: &ResolvedName) -> ResolvedName {
+        let Some(mut location) = value.local_location() else {
+            return value.clone();
+        };
+        let mut resolved = value.clone();
+        let mut seen = HashSet::new();
+        while seen.insert(location) {
+            let Some(mapped) = self.value_aliases.get(&location) else {
+                break;
+            };
+            resolved = mapped.clone();
+            let Some(mapped_location) = mapped.local_location() else {
+                return mapped.clone();
+            };
+            location = mapped_location;
+        }
+        resolved
+    }
+
+    fn seed_object(&mut self, location: LocalLocation, bindings: &TypedConstructorFieldBindings) {
+        self.rebind_local(location);
+        self.aliases.insert(location, location);
+        for field in &bindings.fields {
+            let value = field
+                .scalar
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| self.resolve_scalar_name(&field.value));
+            self.fields
+                .insert((location, field.field_name.clone()), value);
+            if let Some(scalar) = &field.scalar {
+                self.field_scalars
+                    .insert((location, field.field_name.clone()), scalar.clone());
+            }
+        }
+    }
+
+    fn field_value(&self, root: LocalLocation, field_name: &str) -> Option<&ResolvedName> {
+        self.fields.get(&(root, field_name.to_string()))
+    }
+
+    fn field_scalar(&self, root: LocalLocation, field_name: &str) -> Option<&ResolvedName> {
+        self.field_scalars.get(&(root, field_name.to_string()))
+    }
+
+    fn set_field(&mut self, root: LocalLocation, field_name: String, value: ResolvedName) {
+        let value = self.resolve_scalar_name(&value);
+        self.fields.insert((root, field_name), value);
+    }
+
+    fn invalidate_field(&mut self, root: LocalLocation, field_name: &str) {
+        self.fields.remove(&(root, field_name.to_string()));
+    }
+
+    fn invalidate_root(&mut self, root: LocalLocation) {
+        self.aliases
+            .retain(|location, mapped_root| *location != root && *mapped_root != root);
+        self.fields.retain(|(field_root, _), _| *field_root != root);
+        self.field_scalars
+            .retain(|(field_root, _), _| *field_root != root);
+    }
+
+    fn invalidate_roots(&mut self, roots: HashSet<LocalLocation>) {
+        for root in roots {
+            self.invalidate_root(root);
+        }
+    }
+}
+
+fn merge_typed_field_scalar_states<'a>(
+    mut states: impl Iterator<Item = &'a TypedFieldScalarState>,
+) -> TypedFieldScalarState {
+    let Some(first) = states.next() else {
+        return TypedFieldScalarState::default();
+    };
+    let rest = states.collect::<Vec<_>>();
+    let mut merged = first.clone();
+    merged.aliases.retain(|location, root| {
+        rest.iter()
+            .all(|state| state.aliases.get(location) == Some(root))
+    });
+    merged.value_aliases.retain(|location, value| {
+        rest.iter()
+            .all(|state| state.value_aliases.get(location) == Some(value))
+    });
+    merged.fields.retain(|field, value| {
+        rest.iter()
+            .all(|state| state.fields.get(field) == Some(value))
+    });
+    merged.field_scalars.retain(|field, value| {
+        rest.iter()
+            .all(|state| state.field_scalars.get(field) == Some(value))
+    });
+    merged
+}
+
+fn rekey_typed_field_scalar_map_root<T>(
+    map: &mut HashMap<(LocalLocation, String), T>,
+    old_root: LocalLocation,
+    new_root: LocalLocation,
+) {
+    let entries = std::mem::take(map);
+    *map = entries
+        .into_iter()
+        .map(|((root, field_name), value)| {
+            let root = if root == old_root { new_root } else { root };
+            ((root, field_name), value)
+        })
+        .collect();
+}
+
+fn typed_normal_block_predecessors(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+) -> HashMap<BlockLabel, HashSet<BlockLabel>> {
+    let mut predecessors = HashMap::<BlockLabel, HashSet<BlockLabel>>::new();
+    for block in &function.blocks {
+        for successor in typed_term_successors(&block.term) {
+            predecessors
+                .entry(successor)
+                .or_default()
+                .insert(block.label);
+        }
+    }
+    predecessors
+}
+
+fn transfer_typed_field_scalar_block(
+    block: &mut TypedBlock,
+    state: &mut TypedFieldScalarState,
+    module_constants: &[ConstantExpr],
+    constructor_field_bindings: &HashMap<InstrId, TypedConstructorFieldBindings>,
+    stats: &mut TypedFieldScalarizationStats,
+    rewrite: bool,
+) {
+    let body = std::mem::take(&mut block.body);
+    let mut new_body = Vec::with_capacity(body.len());
+    for mut instr in body {
+        let mut inserted_before = Vec::new();
+        let mut inserted_after = Vec::new();
+        transfer_typed_field_scalar_instr(
+            &mut instr,
+            state,
+            module_constants,
+            constructor_field_bindings,
+            stats,
+            rewrite,
+            &mut inserted_before,
+            &mut inserted_after,
+        );
+        if rewrite {
+            new_body.extend(inserted_before);
+        }
+        new_body.push(instr);
+        if rewrite {
+            new_body.extend(inserted_after);
+        }
+    }
+    block.body = new_body;
+    transfer_typed_field_scalar_term(&mut block.term, state, module_constants, stats, rewrite);
+}
+
+fn transfer_typed_field_scalar_instr(
+    instr: &mut InstrTyped,
+    state: &mut TypedFieldScalarState,
+    module_constants: &[ConstantExpr],
+    constructor_field_bindings: &HashMap<InstrId, TypedConstructorFieldBindings>,
+    stats: &mut TypedFieldScalarizationStats,
+    rewrite: bool,
+    inserted_before: &mut Vec<InstrTyped>,
+    inserted_after: &mut Vec<InstrTyped>,
+) {
+    match instr {
+        InstrTyped::Store(store) => {
+            if let Some(bindings) =
+                typed_constructor_field_bindings_for_store(store, constructor_field_bindings)
+            {
+                state.invalidate_roots(typed_virtual_roots_in_expr(store.value.as_ref(), state));
+                if let Some(location) = store.name.local_location() {
+                    state.seed_object(location, bindings);
+                    if rewrite {
+                        stats.seeded_objects += 1;
+                        append_typed_constructor_field_scalar_stores(
+                            inserted_after,
+                            bindings,
+                            state,
+                            stats,
+                        );
+                    }
+                }
+                return;
+            }
+            rewrite_typed_field_scalar_expr(
+                store.value.as_mut(),
+                state,
+                module_constants,
+                stats,
+                rewrite,
+            );
+            let Some(target) = store.name.local_location() else {
+                return;
+            };
+            if let Some(source) = typed_instr_local_load_location(store.value.as_ref())
+                && let Some(root) = state.root_for_location(source)
+            {
+                state.set_alias(target, root);
+            } else if let InstrTyped::Load(source) = store.value.as_ref() {
+                state.set_value_alias(target, &source.name);
+            } else {
+                state.rebind_local(target);
+            }
+        }
+        InstrTyped::Del(del) => {
+            if let Some(location) = del.name.local_location() {
+                state.rebind_local(location);
+            }
+        }
+        InstrTyped::SetAttrTyped(op) => rewrite_typed_field_scalar_setattr(
+            op,
+            state,
+            module_constants,
+            stats,
+            rewrite,
+            Some(inserted_before),
+            Some(inserted_after),
+        ),
+        _ => rewrite_typed_field_scalar_expr(instr, state, module_constants, stats, rewrite),
+    }
+}
+
+fn append_typed_constructor_field_scalar_stores(
+    body: &mut Vec<InstrTyped>,
+    bindings: &TypedConstructorFieldBindings,
+    state: &TypedFieldScalarState,
+    stats: &mut TypedFieldScalarizationStats,
+) {
+    for field in &bindings.fields {
+        let Some(scalar) = field.scalar.as_ref() else {
+            continue;
+        };
+        let source = state.resolve_scalar_name(&field.value);
+        body.push(typed_store_temp(scalar.clone(), typed_load_temp(&source)));
+        stats.inserted_scalar_stores += 1;
+    }
+}
+
+fn rewrite_typed_field_scalar_setattr(
+    op: &mut TypedSetAttr<InstrTyped>,
+    state: &mut TypedFieldScalarState,
+    module_constants: &[ConstantExpr],
+    stats: &mut TypedFieldScalarizationStats,
+    rewrite: bool,
+    inserted_before: Option<&mut Vec<InstrTyped>>,
+    inserted_after: Option<&mut Vec<InstrTyped>>,
+) {
+    rewrite_typed_field_scalar_expr(
+        op.replacement.as_mut(),
+        state,
+        module_constants,
+        stats,
+        rewrite,
+    );
+    state.invalidate_roots(typed_virtual_roots_in_expr(op.attr.as_ref(), state));
+    let Some(receiver) = typed_instr_local_load_location(op.value.as_ref()) else {
+        state.invalidate_roots(typed_virtual_roots_in_expr(op.value.as_ref(), state));
+        return;
+    };
+    let Some(root) = state.root_for_location(receiver) else {
+        return;
+    };
+    let Some(field_name) = typed_constant_string(op.attr.as_ref(), module_constants) else {
+        state.invalidate_root(root);
+        return;
+    };
+    if !typed_attr_access_is_indexed_field(&op.access) {
+        state.invalidate_root(root);
+        return;
+    }
+    if let Some(scalar) = state.field_scalar(root, field_name).cloned() {
+        if let Some(replacement) = typed_scalar_field_replacement_name(op.replacement.as_ref()) {
+            if rewrite && let Some(inserted_after) = inserted_after {
+                inserted_after.push(typed_store_temp(
+                    scalar.clone(),
+                    typed_load_temp(replacement),
+                ));
+                stats.inserted_scalar_stores += 1;
+            }
+            state.set_field(root, field_name.to_string(), scalar);
+        } else if typed_scalar_field_can_precompute_replacement(op.replacement.as_ref()) {
+            if rewrite && let Some(inserted_before) = inserted_before {
+                let replacement =
+                    std::mem::replace(op.replacement.as_mut(), typed_load_temp(&scalar));
+                inserted_before.push(typed_store_temp(scalar.clone(), replacement));
+                stats.inserted_scalar_stores += 1;
+            }
+            state.set_field(root, field_name.to_string(), scalar);
+        } else {
+            state.invalidate_field(root, field_name);
+        }
+    } else if let Some(replacement) = typed_scalar_field_replacement_name(op.replacement.as_ref()) {
+        state.set_field(root, field_name.to_string(), replacement.clone());
+    } else {
+        state.invalidate_field(root, field_name);
+    }
+}
+
+fn typed_constructor_field_bindings_for_store<'a>(
+    store: &Store<InstrTyped>,
+    constructor_field_bindings: &'a HashMap<InstrId, TypedConstructorFieldBindings>,
+) -> Option<&'a TypedConstructorFieldBindings> {
+    let InstrTyped::CallTyped(call) = store.value.as_ref() else {
+        return None;
+    };
+    let instr_id = call.try_semantic_instr_id()?;
+    constructor_field_bindings.get(&instr_id)
+}
+
+fn transfer_typed_field_scalar_term(
+    term: &mut BlockTerm<InstrTyped>,
+    state: &mut TypedFieldScalarState,
+    module_constants: &[ConstantExpr],
+    stats: &mut TypedFieldScalarizationStats,
+    rewrite: bool,
+) {
+    match term {
+        BlockTerm::IfTerm(if_term) => {
+            rewrite_typed_field_scalar_expr(
+                &mut if_term.test,
+                state,
+                module_constants,
+                stats,
+                rewrite,
+            );
+            if !matches!(if_term.test, InstrTyped::DirectCallGuardTest(_)) {
+                state.invalidate_roots(typed_virtual_roots_in_expr(&if_term.test, state));
+            }
+        }
+        BlockTerm::BranchTable(branch) => {
+            rewrite_typed_field_scalar_expr(
+                &mut branch.index,
+                state,
+                module_constants,
+                stats,
+                rewrite,
+            );
+            state.invalidate_roots(typed_virtual_roots_in_expr(&branch.index, state));
+        }
+        BlockTerm::Raise(raise) => {
+            if let Some(exc) = raise.exc.as_mut() {
+                rewrite_typed_field_scalar_expr(exc, state, module_constants, stats, rewrite);
+                state.invalidate_roots(typed_virtual_roots_in_expr(exc, state));
+            }
+        }
+        BlockTerm::Return(value) => {
+            rewrite_typed_field_scalar_expr(value, state, module_constants, stats, rewrite);
+            state.invalidate_roots(typed_virtual_roots_in_expr(value, state));
+        }
+        BlockTerm::Jump(_) => {}
+    }
+}
+
+fn rewrite_typed_field_scalar_expr(
+    expr: &mut InstrTyped,
+    state: &mut TypedFieldScalarState,
+    module_constants: &[ConstantExpr],
+    stats: &mut TypedFieldScalarizationStats,
+    rewrite: bool,
+) {
+    match expr {
+        InstrTyped::Load(_) | InstrTyped::IncrementCounter(_) | InstrTyped::CellRef(_) => {}
+        InstrTyped::GetAttrTyped(op) => {
+            rewrite_typed_field_scalar_getattr(op, state, module_constants, stats, rewrite);
+            if let Some(replacement) =
+                typed_field_scalar_getattr_replacement(op, state, module_constants)
+            {
+                if rewrite {
+                    stats.rewritten_loads += 1;
+                }
+                *expr = typed_load_temp(&replacement);
+            }
+        }
+        InstrTyped::SetAttrTyped(op) => {
+            rewrite_typed_field_scalar_setattr(
+                op,
+                state,
+                module_constants,
+                stats,
+                rewrite,
+                None,
+                None,
+            );
+        }
+        InstrTyped::DirectCallGuardTest(op) => {
+            rewrite_typed_field_scalar_expr(
+                op.value.as_mut(),
+                state,
+                module_constants,
+                stats,
+                rewrite,
+            );
+        }
+        _ => {
+            rewrite_typed_field_scalar_children(expr, state, module_constants, stats, rewrite);
+            state.invalidate_roots(typed_virtual_roots_in_expr(expr, state));
+        }
+    }
+}
+
+fn rewrite_typed_field_scalar_getattr(
+    op: &mut TypedGetAttr<InstrTyped>,
+    state: &mut TypedFieldScalarState,
+    module_constants: &[ConstantExpr],
+    stats: &mut TypedFieldScalarizationStats,
+    rewrite: bool,
+) {
+    if typed_instr_local_load_location(op.value.as_ref()).is_none() {
+        rewrite_typed_field_scalar_expr(op.value.as_mut(), state, module_constants, stats, rewrite);
+    }
+    rewrite_typed_field_scalar_expr(op.attr.as_mut(), state, module_constants, stats, rewrite);
+    if typed_field_scalar_getattr_replacement(op, state, module_constants).is_some() {
+        return;
+    }
+    if let Some(receiver) = typed_instr_local_load_location(op.value.as_ref())
+        && let Some(root) = state.root_for_location(receiver)
+    {
+        if typed_attr_access_is_indexed_field(&op.access)
+            && let Some(field_name) = typed_constant_string(op.attr.as_ref(), module_constants)
+        {
+            state.invalidate_field(root, field_name);
+            return;
+        }
+        state.invalidate_root(root);
+    } else {
+        state.invalidate_roots(typed_virtual_roots_in_expr(op.value.as_ref(), state));
+    }
+}
+
+fn typed_field_scalar_getattr_replacement(
+    op: &TypedGetAttr<InstrTyped>,
+    state: &TypedFieldScalarState,
+    module_constants: &[ConstantExpr],
+) -> Option<ResolvedName> {
+    if !typed_attr_access_is_indexed_field(&op.access) {
+        return None;
+    }
+    let receiver = typed_instr_local_load_location(op.value.as_ref())?;
+    let root = state.root_for_location(receiver)?;
+    let field_name = typed_constant_string(op.attr.as_ref(), module_constants)?;
+    state.field_value(root, field_name).cloned()
+}
+
+fn typed_attr_access_is_indexed_field(access: &TypedAttrAccessPlan) -> bool {
+    matches!(access, TypedAttrAccessPlan::IndexedField { .. })
+}
+
+fn typed_scalar_field_replacement_name(expr: &InstrTyped) -> Option<&ResolvedName> {
+    let InstrTyped::Load(load) = expr else {
+        return None;
+    };
+    load.name.local_location()?;
+    Some(&load.name)
+}
+
+fn typed_scalar_field_can_precompute_replacement(expr: &InstrTyped) -> bool {
+    match expr {
+        InstrTyped::Load(_) => true,
+        InstrTyped::BinOp(op) => {
+            typed_scalar_field_can_precompute_replacement(op.left.as_ref())
+                && typed_scalar_field_can_precompute_replacement(op.right.as_ref())
+        }
+        InstrTyped::UnaryOp(op) => {
+            typed_scalar_field_can_precompute_replacement(op.operand.as_ref())
+        }
+        InstrTyped::Tuple(op) => op
+            .values
+            .iter()
+            .all(typed_scalar_field_can_precompute_replacement),
+        _ => false,
+    }
+}
+
+fn rewrite_typed_field_scalar_children(
+    expr: &mut InstrTyped,
+    state: &mut TypedFieldScalarState,
+    module_constants: &[ConstantExpr],
+    stats: &mut TypedFieldScalarizationStats,
+    rewrite: bool,
+) {
+    match expr {
+        InstrTyped::Truthy(op) => rewrite_typed_field_scalar_expr(
+            op.value.as_mut(),
+            state,
+            module_constants,
+            stats,
+            rewrite,
+        ),
+        InstrTyped::BinOp(op) => {
+            rewrite_typed_field_scalar_expr(
+                op.left.as_mut(),
+                state,
+                module_constants,
+                stats,
+                rewrite,
+            );
+            rewrite_typed_field_scalar_expr(
+                op.right.as_mut(),
+                state,
+                module_constants,
+                stats,
+                rewrite,
+            );
+        }
+        InstrTyped::Tuple(op) => {
+            for value in &mut op.values {
+                rewrite_typed_field_scalar_expr(value, state, module_constants, stats, rewrite);
+            }
+        }
+        InstrTyped::UnaryOp(op) => rewrite_typed_field_scalar_expr(
+            op.operand.as_mut(),
+            state,
+            module_constants,
+            stats,
+            rewrite,
+        ),
+        InstrTyped::CalleeFunctionId(op) => rewrite_typed_field_scalar_expr(
+            op.value.as_mut(),
+            state,
+            module_constants,
+            stats,
+            rewrite,
+        ),
+        InstrTyped::CallTyped(op) => {
+            rewrite_typed_field_scalar_expr(
+                op.func.as_mut(),
+                state,
+                module_constants,
+                stats,
+                rewrite,
+            );
+            rewrite_typed_field_scalar_call_args(
+                &mut op.args,
+                &mut op.keywords,
+                state,
+                module_constants,
+                stats,
+                rewrite,
+            );
+        }
+        InstrTyped::GuardedCallableCallTyped(op) => {
+            rewrite_typed_field_scalar_expr(
+                op.func.as_mut(),
+                state,
+                module_constants,
+                stats,
+                rewrite,
+            );
+            rewrite_typed_field_scalar_call_args(
+                &mut op.args,
+                &mut op.keywords,
+                state,
+                module_constants,
+                stats,
+                rewrite,
+            );
+        }
+        InstrTyped::GuardedMethodCallTyped(op) => {
+            rewrite_typed_field_scalar_expr(
+                op.func.as_mut(),
+                state,
+                module_constants,
+                stats,
+                rewrite,
+            );
+            rewrite_typed_field_scalar_call_args(
+                &mut op.args,
+                &mut op.keywords,
+                state,
+                module_constants,
+                stats,
+                rewrite,
+            );
+        }
+        InstrTyped::DirectCallableCallTyped(op) => {
+            rewrite_typed_field_scalar_expr(
+                op.func.as_mut(),
+                state,
+                module_constants,
+                stats,
+                rewrite,
+            );
+            rewrite_typed_field_scalar_positional_args(
+                &mut op.args,
+                state,
+                module_constants,
+                stats,
+                rewrite,
+            );
+        }
+        InstrTyped::DirectMethodCallTyped(op) => {
+            rewrite_typed_field_scalar_expr(
+                op.receiver.as_mut(),
+                state,
+                module_constants,
+                stats,
+                rewrite,
+            );
+            rewrite_typed_field_scalar_positional_args(
+                &mut op.args,
+                state,
+                module_constants,
+                stats,
+                rewrite,
+            );
+        }
+        InstrTyped::CallDirect(op) => {
+            rewrite_typed_field_scalar_expr(
+                op.callable.as_mut(),
+                state,
+                module_constants,
+                stats,
+                rewrite,
+            );
+            rewrite_typed_field_scalar_call_args(
+                &mut op.args,
+                &mut op.keywords,
+                state,
+                module_constants,
+                stats,
+                rewrite,
+            );
+        }
+        InstrTyped::GetItem(op) => {
+            rewrite_typed_field_scalar_expr(
+                op.value.as_mut(),
+                state,
+                module_constants,
+                stats,
+                rewrite,
+            );
+            rewrite_typed_field_scalar_expr(
+                op.index.as_mut(),
+                state,
+                module_constants,
+                stats,
+                rewrite,
+            );
+        }
+        InstrTyped::SetItem(op) => {
+            rewrite_typed_field_scalar_expr(
+                op.value.as_mut(),
+                state,
+                module_constants,
+                stats,
+                rewrite,
+            );
+            rewrite_typed_field_scalar_expr(
+                op.index.as_mut(),
+                state,
+                module_constants,
+                stats,
+                rewrite,
+            );
+            rewrite_typed_field_scalar_expr(
+                op.replacement.as_mut(),
+                state,
+                module_constants,
+                stats,
+                rewrite,
+            );
+        }
+        InstrTyped::DelItem(op) => {
+            rewrite_typed_field_scalar_expr(
+                op.value.as_mut(),
+                state,
+                module_constants,
+                stats,
+                rewrite,
+            );
+            rewrite_typed_field_scalar_expr(
+                op.index.as_mut(),
+                state,
+                module_constants,
+                stats,
+                rewrite,
+            );
+        }
+        InstrTyped::Store(op) => rewrite_typed_field_scalar_expr(
+            op.value.as_mut(),
+            state,
+            module_constants,
+            stats,
+            rewrite,
+        ),
+        InstrTyped::MakeFunctionWithClosure(op) => {
+            rewrite_typed_field_scalar_expr(
+                op.captures.as_mut(),
+                state,
+                module_constants,
+                stats,
+                rewrite,
+            );
+            rewrite_typed_field_scalar_expr(
+                op.param_defaults.as_mut(),
+                state,
+                module_constants,
+                stats,
+                rewrite,
+            );
+            rewrite_typed_field_scalar_expr(
+                op.annotate_fn.as_mut(),
+                state,
+                module_constants,
+                stats,
+                rewrite,
+            );
+        }
+        InstrTyped::Load(_)
+        | InstrTyped::GetAttrTyped(_)
+        | InstrTyped::SetAttrTyped(_)
+        | InstrTyped::DirectCallGuardTest(_)
+        | InstrTyped::Del(_)
+        | InstrTyped::MakeCell(_)
+        | InstrTyped::IncrementCounter(_)
+        | InstrTyped::CellRef(_) => {}
+    }
+}
+
+fn rewrite_typed_field_scalar_call_args(
+    args: &mut [CallArgPositional<InstrTyped>],
+    keywords: &mut [CallArgKeyword<InstrTyped>],
+    state: &mut TypedFieldScalarState,
+    module_constants: &[ConstantExpr],
+    stats: &mut TypedFieldScalarizationStats,
+    rewrite: bool,
+) {
+    rewrite_typed_field_scalar_positional_args(args, state, module_constants, stats, rewrite);
+    for keyword in keywords {
+        rewrite_typed_field_scalar_expr(
+            keyword.expr_mut(),
+            state,
+            module_constants,
+            stats,
+            rewrite,
+        );
+    }
+}
+
+fn rewrite_typed_field_scalar_positional_args(
+    args: &mut [CallArgPositional<InstrTyped>],
+    state: &mut TypedFieldScalarState,
+    module_constants: &[ConstantExpr],
+    stats: &mut TypedFieldScalarizationStats,
+    rewrite: bool,
+) {
+    for arg in args {
+        rewrite_typed_field_scalar_expr(arg.expr_mut(), state, module_constants, stats, rewrite);
+    }
+}
+
+fn typed_virtual_roots_in_expr(
+    expr: &InstrTyped,
+    state: &TypedFieldScalarState,
+) -> HashSet<LocalLocation> {
+    struct Collector<'a> {
+        state: &'a TypedFieldScalarState,
+        roots: HashSet<LocalLocation>,
+    }
+
+    impl Visit<InstrTyped> for Collector<'_> {
+        fn visit_instr(&mut self, expr: &InstrTyped) {
+            if let Some(location) = typed_instr_local_load_location(expr)
+                && let Some(root) = self.state.root_for_location(location)
+            {
+                self.roots.insert(root);
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    let mut collector = Collector {
+        state,
+        roots: HashSet::new(),
+    };
+    collector.visit_instr(expr);
+    collector.roots
+}
+
+fn typed_constant_string<'a>(
+    expr: &InstrTyped,
+    module_constants: &'a [ConstantExpr],
+) -> Option<&'a str> {
+    let InstrTyped::Load(load) = expr else {
+        return None;
+    };
+    let constant_index = load.name.location.as_constant()? as usize;
+    match module_constants.get(constant_index)? {
+        ConstantExpr::Literal(value) => match value.as_literal() {
+            Literal::StringLiteral(value) => Some(value.value.as_str()),
+            Literal::BytesLiteral(_) | Literal::NumberLiteral(_) => None,
+        },
+        ConstantExpr::RuntimeName(_) => None,
     }
 }
 
@@ -1903,6 +3246,12 @@ fn typed_inline_generic_fallback_body(
 
 fn typed_load_temp(temp_name: &ResolvedName) -> InstrTyped {
     InstrTyped::Load(Load::new(temp_name.clone()).with_meta(Meta::synthetic()))
+}
+
+fn typed_store_temp(temp_name: ResolvedName, value: InstrTyped) -> InstrTyped {
+    Store::new(temp_name, Box::new(value))
+        .with_meta(Meta::synthetic())
+        .into()
 }
 
 fn typed_load_temp_args(temp_names: &[TypedTempLocal]) -> Vec<CallArgPositional<InstrTyped>> {
@@ -3127,7 +4476,7 @@ mod typed_codegen_tests {
     use soac_ir_blockpy::constructor_entry_function_id_for_init;
     use soac_ir_typed::{
         TypedAttrOwnerRef, TypedDirectFunctionCallGuard, TypedDirectMethodCallGuard,
-        lower_blockpy_module_to_typed,
+        TypedIndexedFieldGuard, TypedIndexedFieldPlanSource, lower_blockpy_module_to_typed,
     };
     use std::collections::HashMap;
 
@@ -3503,6 +4852,43 @@ mod typed_codegen_tests {
             .expect("test function should contain a typed call with an instruction id")
     }
 
+    fn typed_runtime_name_call_instr_ids(
+        function: &BlockPyFunction<TypedBlockPyModuleShape>,
+        runtime_name: RuntimeName,
+        module_constants: &[ConstantExpr],
+    ) -> Vec<InstrId> {
+        struct Finder<'a> {
+            runtime_name: RuntimeName,
+            module_constants: &'a [ConstantExpr],
+            instr_ids: Vec<InstrId>,
+        }
+
+        impl Visit<InstrTyped> for Finder<'_> {
+            fn visit_instr(&mut self, expr: &InstrTyped) {
+                if let InstrTyped::CallTyped(call) = expr
+                    && typed_expr_is_runtime_name_load(
+                        call.func.as_ref(),
+                        self.runtime_name,
+                        self.module_constants,
+                    )
+                    && let Some(instr_id) = call.try_semantic_instr_id()
+                {
+                    self.instr_ids.push(instr_id);
+                    return;
+                }
+                expr.visit_children(self);
+            }
+        }
+
+        let mut finder = Finder {
+            runtime_name,
+            module_constants,
+            instr_ids: Vec::new(),
+        };
+        finder.visit_fn(function);
+        finder.instr_ids
+    }
+
     fn stop_iteration_raise_terms(
         function: &BlockPyFunction<TypedBlockPyModuleShape>,
         module_constants: &[ConstantExpr],
@@ -3512,6 +4898,187 @@ mod typed_codegen_tests {
             .iter()
             .filter(|block| typed_block_term_is_stop_iteration_raise(&block.term, module_constants))
             .count()
+    }
+
+    fn mark_indexed_field_accesses_for_field(
+        function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+        module_constants: &[ConstantExpr],
+        field_name: &str,
+    ) -> usize {
+        struct Marker<'a> {
+            module_constants: &'a [ConstantExpr],
+            field_name: &'a str,
+            count: usize,
+        }
+
+        impl VisitMut<InstrTyped> for Marker<'_> {
+            fn visit_instr_mut(&mut self, expr: &mut InstrTyped) {
+                if let InstrTyped::GetAttrTyped(op) = expr
+                    && typed_constant_string(op.attr.as_ref(), self.module_constants)
+                        == Some(self.field_name)
+                {
+                    op.access = TypedAttrAccessPlan::IndexedField {
+                        source: TypedIndexedFieldPlanSource::OptimizationPlanV3,
+                        counter_source: None,
+                        guards: vec![TypedIndexedFieldGuard {
+                            expected_index: 0,
+                            owner_type_ref: TypedAttrOwnerRef::TypeKey {
+                                module_name: "__main__".to_string(),
+                                qualname: "Box".to_string(),
+                            },
+                            type_version: 1,
+                        }],
+                    };
+                    self.count += 1;
+                }
+                if let InstrTyped::SetAttrTyped(op) = expr
+                    && typed_constant_string(op.attr.as_ref(), self.module_constants)
+                        == Some(self.field_name)
+                {
+                    op.access = TypedAttrAccessPlan::IndexedField {
+                        source: TypedIndexedFieldPlanSource::OptimizationPlanV3,
+                        counter_source: None,
+                        guards: vec![TypedIndexedFieldGuard {
+                            expected_index: 0,
+                            owner_type_ref: TypedAttrOwnerRef::TypeKey {
+                                module_name: "__main__".to_string(),
+                                qualname: "Box".to_string(),
+                            },
+                            type_version: 1,
+                        }],
+                    };
+                    self.count += 1;
+                }
+                expr.visit_children_mut(self);
+            }
+        }
+
+        let mut marker = Marker {
+            module_constants,
+            field_name,
+            count: 0,
+        };
+        marker.visit_fn_mut(function);
+        marker.count
+    }
+
+    fn getattrs_for_field_in_reachable_blocks(
+        function: &BlockPyFunction<TypedBlockPyModuleShape>,
+        entry: BlockLabel,
+        module_constants: &[ConstantExpr],
+        field_name: &str,
+    ) -> usize {
+        struct Counter<'a> {
+            module_constants: &'a [ConstantExpr],
+            field_name: &'a str,
+            count: usize,
+        }
+
+        impl Visit<InstrTyped> for Counter<'_> {
+            fn visit_instr(&mut self, expr: &InstrTyped) {
+                if let InstrTyped::GetAttrTyped(op) = expr
+                    && typed_constant_string(op.attr.as_ref(), self.module_constants)
+                        == Some(self.field_name)
+                {
+                    self.count += 1;
+                }
+                expr.visit_children(self);
+            }
+        }
+
+        let labels = typed_block_indices_by_label(function);
+        let reachable = typed_reachable_block_labels(function, &labels, entry)
+            .expect("test entry should be reachable");
+        let mut counter = Counter {
+            module_constants,
+            field_name,
+            count: 0,
+        };
+        for block in &function.blocks {
+            if reachable.contains(&block.label) {
+                for instr in &block.body {
+                    counter.visit_instr(instr);
+                }
+                counter.visit_term(&block.term);
+            }
+        }
+        counter.count
+    }
+
+    fn getattrs_for_field_in_hot_reachable_blocks(
+        function: &BlockPyFunction<TypedBlockPyModuleShape>,
+        entry: BlockLabel,
+        module_constants: &[ConstantExpr],
+        field_name: &str,
+    ) -> usize {
+        struct Counter<'a> {
+            module_constants: &'a [ConstantExpr],
+            field_name: &'a str,
+            count: usize,
+        }
+
+        impl Visit<InstrTyped> for Counter<'_> {
+            fn visit_instr(&mut self, expr: &InstrTyped) {
+                if let InstrTyped::GetAttrTyped(op) = expr
+                    && typed_constant_string(op.attr.as_ref(), self.module_constants)
+                        == Some(self.field_name)
+                {
+                    self.count += 1;
+                }
+                expr.visit_children(self);
+            }
+        }
+
+        let labels = typed_block_indices_by_label(function);
+        let reachable = typed_hot_reachable_block_labels(function, &labels, entry)
+            .expect("test entry should be hot-reachable");
+        let mut counter = Counter {
+            module_constants,
+            field_name,
+            count: 0,
+        };
+        for block in &function.blocks {
+            if reachable.contains(&block.label) {
+                for instr in &block.body {
+                    counter.visit_instr(instr);
+                }
+                counter.visit_term(&block.term);
+            }
+        }
+        counter.count
+    }
+
+    fn typed_test_local(name: &str, location: LocalLocation) -> ResolvedName {
+        ResolvedName {
+            id: name.to_string().into(),
+            location: NameLocation::Local(location),
+        }
+    }
+
+    #[test]
+    fn typed_field_scalar_state_promotes_root_when_original_local_is_deleted() {
+        let root = LocalLocation(1);
+        let alias = LocalLocation(2);
+        let scalar = typed_test_local("scalar_current", LocalLocation(3));
+        let mut state = TypedFieldScalarState::default();
+        state.seed_object(
+            root,
+            &TypedConstructorFieldBindings {
+                fields: vec![TypedConstructorFieldBinding {
+                    field_name: "current".to_string(),
+                    value: typed_test_local("current", LocalLocation(4)),
+                    scalar: Some(scalar.clone()),
+                }],
+            },
+        );
+        state.set_alias(alias, root);
+
+        state.rebind_local(root);
+
+        assert_eq!(state.root_for_location(root), None);
+        assert_eq!(state.root_for_location(alias), Some(alias));
+        assert_eq!(state.field_value(alias, "current"), Some(&scalar));
+        assert_eq!(state.field_scalar(alias, "current"), Some(&scalar));
     }
 
     #[test]
@@ -4342,6 +5909,386 @@ def caller(value):\n    obj = Box(value)\n    if value:\n        return obj.valu
             0,
             "a hot constructor path whose successor is already private should not be cloned again"
         );
+    }
+
+    #[test]
+    fn typed_alias_hot_continuation_split_clones_joined_successors() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            "class IterRange:\n    def __iter__(self):\n        return self\n\n\
+def caller(it):\n    iterator = iter(it)\n    return iterator\n",
+        )
+        .expect("source should lower");
+        let iter_id =
+            blockpy_function_id_by_qualname(&lowered.blockpy_module, "IterRange.__iter__");
+        let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
+        let call_id;
+        {
+            let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+            call_id = first_typed_call_instr_id(caller);
+            replace_first_typed_call_access(
+                caller,
+                TypedCallAccessPlan::GuardedRuntimeProtocolMethod {
+                    runtime_name: RuntimeName::Iter,
+                    method_name: "__iter__".to_string(),
+                    method_guards: vec![TypedDirectMethodCallGuard {
+                        function_id: iter_id,
+                        owner_type_ref: TypedAttrOwnerRef::TypeKey {
+                            module_name: "__main__".to_string(),
+                            qualname: "IterRange".to_string(),
+                        },
+                        type_version: 1,
+                        arg_plan: TypedDirectCallArgPlan {
+                            sources: vec![TypedDirectCallArgSource::Provided(0)],
+                        },
+                    }],
+                },
+            );
+        }
+
+        let callee_module = typed.clone();
+        let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+        let inline_stats = inline_typed_function_direct_call_stores(
+            caller,
+            &callee_module,
+            &HashMap::new(),
+            &HashMap::from([(
+                call_id,
+                vec![(
+                    iter_id,
+                    TypedDirectCallArgPlan {
+                        sources: vec![TypedDirectCallArgSource::Provided(0)],
+                    },
+                )],
+            )]),
+        );
+        assert_eq!(inline_stats.rewritten_stores, 1);
+
+        let before_blocks = caller.blocks.len();
+        let split_stats = split_typed_alias_hot_continuations(caller);
+        assert_eq!(split_stats.clones.len(), 1);
+        assert!(split_stats.cloned_blocks > 0);
+        assert_eq!(
+            caller.blocks.len(),
+            before_blocks + split_stats.cloned_blocks
+        );
+        let labels = typed_block_indices_by_label(caller);
+        let clone = split_stats.clones[0];
+        let hot_block = block_by_label(caller, &labels, clone.hot_block)
+            .expect("hot alias block should still exist");
+        assert!(matches!(
+            &hot_block.term,
+            BlockTerm::Jump(edge) if edge.target == clone.cloned_entry
+        ));
+        assert!(
+            labels.contains_key(&clone.original_entry),
+            "generic fallback should still use the original successor graph"
+        );
+        assert!(
+            labels.contains_key(&clone.cloned_entry),
+            "hot alias path should jump into the cloned successor graph"
+        );
+        assert_eq!(
+            split_typed_alias_hot_continuations(caller).cloned_blocks,
+            0,
+            "a hot alias path whose successor is already private should not be cloned again"
+        );
+    }
+
+    #[test]
+    fn typed_field_scalarization_rewrites_indexed_loads_on_hot_constructor_clone() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            "class Box:\n    def __init__(self, value):\n        self.value = value\n\n\
+def caller(value):\n    obj = Box(value)\n    if value:\n        return obj.value\n    return 0\n",
+        )
+        .expect("source should lower");
+        let inline_plan = crate::passes::plan_module_inlining(
+            &crate::passes::summarize_module_escapes(&lowered.blockpy_module),
+        );
+        let init_id = blockpy_function_id_by_qualname(&lowered.blockpy_module, "Box.__init__");
+        let constructor_entry_id =
+            constructor_entry_function_id_for_init(&lowered.blockpy_module, init_id)
+                .expect("class lowering should add a constructor entry");
+        let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
+        let module_constants = typed.module_constants.clone();
+        let call_id;
+        {
+            let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+            call_id = first_typed_call_instr_id(caller);
+            replace_first_typed_call_access(
+                caller,
+                TypedCallAccessPlan::GuardedCallable {
+                    function_guards: vec![TypedDirectFunctionCallGuard {
+                        function_id: constructor_entry_id,
+                        arg_plan: TypedDirectCallArgPlan {
+                            sources: vec![
+                                TypedDirectCallArgSource::Provided(0),
+                                TypedDirectCallArgSource::Provided(1),
+                            ],
+                        },
+                    }],
+                },
+            );
+            lower_typed_function_call_access_plan_instrs(caller);
+        }
+
+        let callee_module = typed.clone();
+        let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+        let inline_stats = inline_typed_function_direct_call_stores(
+            caller,
+            &callee_module,
+            &HashMap::new(),
+            &HashMap::from([(
+                call_id,
+                vec![(
+                    constructor_entry_id,
+                    TypedDirectCallArgPlan {
+                        sources: vec![
+                            TypedDirectCallArgSource::Provided(0),
+                            TypedDirectCallArgSource::Provided(1),
+                        ],
+                    },
+                )],
+            )]),
+        );
+        assert_eq!(inline_stats.rewritten_stores, 1);
+        let constructor_field_bindings = typed_constructor_field_bindings_from_inline_stats(
+            &callee_module,
+            &inline_plan,
+            &module_constants,
+            &inline_stats,
+        );
+        assert_eq!(constructor_field_bindings.len(), 1);
+
+        let split_stats = split_typed_constructor_hot_continuations(caller, &module_constants);
+        assert_eq!(split_stats.clones.len(), 1);
+        assert!(
+            mark_indexed_field_accesses_for_field(caller, &module_constants, "value") >= 2,
+            "both original and cloned continuations should still contain the field load before scalarization"
+        );
+        let clone = split_stats.clones[0];
+        assert!(
+            getattrs_for_field_in_reachable_blocks(
+                caller,
+                clone.cloned_entry,
+                &module_constants,
+                "value",
+            ) > 0,
+            "the cloned hot continuation should contain the field load before scalarization"
+        );
+
+        let scalar_stats = scalarize_typed_hot_constructor_field_loads(
+            caller,
+            &module_constants,
+            &constructor_field_bindings,
+        );
+        assert_eq!(scalar_stats.seeded_objects, 1);
+        assert_eq!(scalar_stats.scalar_slots, 1);
+        assert_eq!(scalar_stats.inserted_scalar_stores, 1);
+        assert_eq!(scalar_stats.rewritten_loads, 1);
+        assert_eq!(
+            getattrs_for_field_in_reachable_blocks(
+                caller,
+                clone.cloned_entry,
+                &module_constants,
+                "value",
+            ),
+            0,
+            "the private hot continuation should use the constructor scalar instead of reloading the field"
+        );
+        assert!(
+            getattrs_for_field_in_reachable_blocks(
+                caller,
+                clone.original_entry,
+                &module_constants,
+                "value",
+            ) > 0,
+            "the generic continuation should keep the original field load"
+        );
+    }
+
+    #[test]
+    fn typed_field_scalarization_preserves_iterator_state_on_hot_loop_backedge() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            "class IterRange:\n    def __init__(self, current, stop, step):\n        self.current = current\n        self.stop = stop\n        self.step = step\n\n    def __next__(self):\n        current = self.current\n        stop = self.stop\n        step = self.step\n        if current >= stop:\n            raise StopIteration\n        self.current = current + step\n        return current\n\n\
+def caller(i):\n    it = IterRange(0, i, 1)\n    total = 0\n    while True:\n        try:\n            value = next(it)\n        except StopIteration:\n            return total\n        total += value\n",
+        )
+        .expect("source should lower");
+        let inline_plan = crate::passes::plan_module_inlining(
+            &crate::passes::summarize_module_escapes(&lowered.blockpy_module),
+        );
+        let init_id =
+            blockpy_function_id_by_qualname(&lowered.blockpy_module, "IterRange.__init__");
+        let constructor_entry_id =
+            constructor_entry_function_id_for_init(&lowered.blockpy_module, init_id)
+                .expect("class lowering should add a constructor entry");
+        let next_id =
+            blockpy_function_id_by_qualname(&lowered.blockpy_module, "IterRange.__next__");
+        let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
+        let module_constants = typed.module_constants.clone();
+        let constructor_call_id;
+        {
+            let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+            constructor_call_id = replace_first_typed_call_access_where(
+                caller,
+                TypedCallAccessPlan::GuardedCallable {
+                    function_guards: vec![TypedDirectFunctionCallGuard {
+                        function_id: constructor_entry_id,
+                        arg_plan: TypedDirectCallArgPlan {
+                            sources: vec![
+                                TypedDirectCallArgSource::Provided(0),
+                                TypedDirectCallArgSource::Provided(1),
+                                TypedDirectCallArgSource::Provided(2),
+                                TypedDirectCallArgSource::Provided(3),
+                            ],
+                        },
+                    }],
+                },
+                |call| typed_expr_loads_name(call.func.as_ref(), "IterRange"),
+            );
+            let _ = replace_first_typed_call_access_where(
+                caller,
+                TypedCallAccessPlan::GuardedRuntimeProtocolMethod {
+                    runtime_name: RuntimeName::Next,
+                    method_name: "__next__".to_string(),
+                    method_guards: vec![TypedDirectMethodCallGuard {
+                        function_id: next_id,
+                        owner_type_ref: TypedAttrOwnerRef::TypeKey {
+                            module_name: "__main__".to_string(),
+                            qualname: "IterRange".to_string(),
+                        },
+                        type_version: 1,
+                        arg_plan: TypedDirectCallArgPlan {
+                            sources: vec![TypedDirectCallArgSource::Provided(0)],
+                        },
+                    }],
+                },
+                |call| {
+                    typed_expr_is_runtime_name_load(
+                        call.func.as_ref(),
+                        RuntimeName::Next,
+                        &module_constants,
+                    )
+                },
+            );
+            lower_typed_function_call_access_plan_instrs(caller);
+        }
+
+        let callee_module = typed.clone();
+        let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+        let constructor_inline_stats = inline_typed_function_direct_call_stores(
+            caller,
+            &callee_module,
+            &HashMap::new(),
+            &HashMap::from([(
+                constructor_call_id,
+                vec![(
+                    constructor_entry_id,
+                    TypedDirectCallArgPlan {
+                        sources: vec![
+                            TypedDirectCallArgSource::Provided(0),
+                            TypedDirectCallArgSource::Provided(1),
+                            TypedDirectCallArgSource::Provided(2),
+                            TypedDirectCallArgSource::Provided(3),
+                        ],
+                    },
+                )],
+            )]),
+        );
+        assert_eq!(constructor_inline_stats.rewritten_stores, 1);
+        let constructor_field_bindings = typed_constructor_field_bindings_from_inline_stats(
+            &callee_module,
+            &inline_plan,
+            &module_constants,
+            &constructor_inline_stats,
+        );
+        assert_eq!(constructor_field_bindings.len(), 1);
+
+        assert_eq!(
+            split_typed_constructor_hot_continuations(caller, &module_constants)
+                .clones
+                .len(),
+            1
+        );
+        let next_direct_calls =
+            typed_runtime_name_call_instr_ids(caller, RuntimeName::Next, &module_constants)
+                .into_iter()
+                .map(|instr_id| {
+                    (
+                        instr_id,
+                        vec![(
+                            next_id,
+                            TypedDirectCallArgPlan {
+                                sources: vec![TypedDirectCallArgSource::Provided(0)],
+                            },
+                        )],
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+        assert!(
+            next_direct_calls.len() >= 2,
+            "constructor continuation split should leave original and hot-cloned next() calls"
+        );
+        let next_inline_stats = inline_typed_function_direct_call_stores(
+            caller,
+            &callee_module,
+            &HashMap::new(),
+            &next_direct_calls,
+        );
+        assert!(
+            next_inline_stats.rewritten_stores >= 1,
+            "hot next() call should inline after constructor continuation splitting"
+        );
+        let cleanup_split = split_typed_inline_cleanup_hot_continuations(caller);
+        assert!(
+            !cleanup_split.clones.is_empty(),
+            "next() hot cleanup should split its loop continuation away from the generic fallback"
+        );
+        for field in ["current", "stop", "step"] {
+            assert!(
+                mark_indexed_field_accesses_for_field(caller, &module_constants, field) > 0,
+                "test should contain {field} field loads before scalarization"
+            );
+        }
+        assert!(
+            rewrite_typed_stop_iteration_raises_to_handler_jumps(caller, &module_constants) >= 1
+        );
+        let hot_loop_clone = cleanup_split
+            .clones
+            .iter()
+            .find(|clone| {
+                getattrs_for_field_in_hot_reachable_blocks(
+                    caller,
+                    clone.cloned_entry,
+                    &module_constants,
+                    "current",
+                ) > 0
+            })
+            .copied()
+            .expect("cleanup split should clone the hot loop containing __next__ field loads");
+
+        let scalar_stats = scalarize_typed_hot_constructor_field_loads(
+            caller,
+            &module_constants,
+            &constructor_field_bindings,
+        );
+        assert_eq!(scalar_stats.seeded_objects, 1);
+        assert_eq!(scalar_stats.scalar_slots, 3);
+        assert!(
+            scalar_stats.rewritten_loads >= 3,
+            "current/stop/step loads in the hot iterator loop should scalarize: {scalar_stats:?}"
+        );
+        for field in ["current", "stop", "step"] {
+            assert_eq!(
+                getattrs_for_field_in_hot_reachable_blocks(
+                    caller,
+                    hot_loop_clone.cloned_entry,
+                    &module_constants,
+                    field,
+                ),
+                0,
+                "hot iterator loop should use scalar state for {field}"
+            );
+        }
     }
 
     #[test]

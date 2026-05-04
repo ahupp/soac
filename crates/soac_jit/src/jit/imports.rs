@@ -387,6 +387,11 @@ pub(super) static DP_JIT_PROTOCOL_NEXT_FUNCTION_ID_IMPORT: ImportSpec = ImportSp
     &[SigType::Pointer],
     &[SigType::I64],
 );
+pub(super) static DP_JIT_PROTOCOL_ITER_FUNCTION_ID_IMPORT: ImportSpec = ImportSpec::new(
+    "dp_jit_protocol_iter_function_id",
+    &[SigType::Pointer],
+    &[SigType::I64],
+);
 pub(super) static DP_JIT_RAISE_UNBOUND_LOCAL_ERROR_IMPORT: ImportSpec =
     ImportSpec::new("dp_jit_raise_unbound_local_error", &[SigType::Pointer], &[]);
 pub(super) static DP_JIT_RAISE_MISSING_REQUIRED_ARGUMENT_IMPORT: ImportSpec =
@@ -524,6 +529,7 @@ static JIT_RUNTIME_IMPORT_SPECS: &[&ImportSpec] = &[
     &PYUNICODE_COMPARE_IMPORT,
     &PYLONG_FROM_LONGLONG_IMPORT,
     &DP_JIT_RECORD_TOP_VALUE_SAMPLE_IMPORT,
+    &DP_JIT_PROTOCOL_ITER_FUNCTION_ID_IMPORT,
     &DP_JIT_PROTOCOL_NEXT_FUNCTION_ID_IMPORT,
     &DP_JIT_RAISE_UNBOUND_LOCAL_ERROR_IMPORT,
     &DP_JIT_RAISE_MISSING_REQUIRED_ARGUMENT_IMPORT,

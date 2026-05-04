@@ -33,10 +33,14 @@ use soac_opt::access_emission_v3::{
 use soac_opt::artifacts_v3::ExactIntBranchV3Artifacts;
 use soac_opt::call_emission_v3::{ResolvedV3DirectCallPlan, typed_call_emission_plans_from_v3};
 use soac_opt::passes::{
-    TypedInlineInstrIdMapping, TypedInlineLocalMapping, inline_typed_function_direct_call_stores,
-    lower_typed_function_call_emission_plans, refresh_typed_function_value_facts,
+    TypedConstructorFieldBindings, TypedInlineInstrIdMapping, TypedInlineLocalMapping,
+    inline_typed_function_direct_call_stores, lower_typed_function_call_emission_plans,
+    plan_module_inlining, refresh_typed_function_value_facts,
     rewrite_typed_stop_iteration_raises_to_handler_jumps,
-    split_typed_constructor_hot_continuations, validate_typed_function_value_facts,
+    scalarize_typed_hot_constructor_field_loads, split_typed_alias_hot_continuations,
+    split_typed_constructor_hot_continuations, split_typed_inline_cleanup_hot_continuations,
+    summarize_module_escapes, typed_constructor_field_bindings_from_inline_stats,
+    validate_typed_function_value_facts,
 };
 use soac_opt::region_emission_v3::{
     ExactIntBranchSelection as OptV3ExactIntBranchSelection,
@@ -1689,12 +1693,13 @@ pub(super) fn optimize_blockpy(
     profile: Option<&SpecializationProfile<'_>>,
     env_config: &SoacEnvConfig,
 ) -> Result<Arc<JitModulePlan>, String> {
+    let inline_plan = profile.map(|_| plan_module_inlining(&summarize_module_escapes(module)));
     let prepared = soac_driver::typed_runtime::prepare_typed_v3_runtime_module_with_rewrites(
         module,
         env_config,
         |typed_module, _value_facts| {
             if let Some(profile) = profile {
-                apply_typed_v3_module_rewrites(typed_module, profile)?;
+                apply_typed_v3_module_rewrites(typed_module, profile, inline_plan.as_ref())?;
             }
             Ok(())
         },
@@ -1708,6 +1713,7 @@ pub(super) fn optimize_blockpy(
 fn apply_typed_v3_module_rewrites(
     module: &mut BlockPyModule<TypedBlockPyModuleShape>,
     profile: &SpecializationProfile<'_>,
+    inline_plan: Option<&soac_opt::passes::InlinePlanModule>,
 ) -> Result<(), String> {
     for function in &mut module.callable_defs {
         apply_profile_call_emission_plans_to_typed_function(function, profile)?;
@@ -1727,6 +1733,8 @@ fn apply_typed_v3_module_rewrites(
         HashMap::<RuntimeFunctionId, HashMap<InstrId, TypedExactIntBranchPlan>>::new();
     let mut remapped_exact_int_returns =
         HashMap::<RuntimeFunctionId, HashMap<InstrId, TypedExactIntReturnPlan>>::new();
+    let mut constructor_field_bindings =
+        HashMap::<RuntimeFunctionId, HashMap<InstrId, TypedConstructorFieldBindings>>::new();
     for function in &mut module.callable_defs {
         let mut cloned_instr_id_mappings = Vec::<TypedInlineInstrIdMapping>::new();
         for pass in 0..MAX_TYPED_INLINE_PASSES {
@@ -1747,6 +1755,20 @@ fn apply_typed_v3_module_rewrites(
             );
             if stats.rewritten_stores == 0 && stats.rewritten_effect_only_calls == 0 {
                 break;
+            }
+            if let Some(inline_plan) = inline_plan {
+                let bindings = typed_constructor_field_bindings_from_inline_stats(
+                    &callee_module,
+                    inline_plan,
+                    &module_constants,
+                    &stats,
+                );
+                if !bindings.is_empty() {
+                    constructor_field_bindings
+                        .entry(caller_function_id)
+                        .or_default()
+                        .extend(bindings);
+                }
             }
             if !stats.instr_id_mappings.is_empty() {
                 remap_inlined_direct_call_targets(
@@ -1779,6 +1801,14 @@ fn apply_typed_v3_module_rewrites(
             }
             let split_stats =
                 split_typed_constructor_hot_continuations(function, &module_constants);
+            if !split_stats.instr_id_mappings.is_empty() {
+                cloned_instr_id_mappings.extend(split_stats.instr_id_mappings);
+            }
+            let split_stats = split_typed_alias_hot_continuations(function);
+            if !split_stats.instr_id_mappings.is_empty() {
+                cloned_instr_id_mappings.extend(split_stats.instr_id_mappings);
+            }
+            let split_stats = split_typed_inline_cleanup_hot_continuations(function);
             if !split_stats.instr_id_mappings.is_empty() {
                 cloned_instr_id_mappings.extend(split_stats.instr_id_mappings);
             }
@@ -1815,6 +1845,14 @@ fn apply_typed_v3_module_rewrites(
             remapped_exact_int_branches.get(&function.function_id),
             remapped_exact_int_returns.get(&function.function_id),
         )?;
+        if let Some(bindings) = constructor_field_bindings.get(&function.function_id) {
+            let stats =
+                scalarize_typed_hot_constructor_field_loads(function, &module_constants, bindings);
+            if stats.rewritten_loads != 0 || stats.inserted_scalar_stores != 0 {
+                assign_missing_typed_function_instr_ids(function);
+                refresh_typed_function_value_facts(function);
+            }
+        }
         apply_profile_typed_block_metadata_to_typed_function(function, profile)?;
         apply_profile_typed_guard_miss_policy_to_typed_function(function, profile);
     }

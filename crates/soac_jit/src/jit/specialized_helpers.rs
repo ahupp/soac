@@ -340,6 +340,14 @@ unsafe extern "C" fn record_top_value_sample_hook(counter: ObjPtr, value: i64) {
 }
 
 unsafe extern "C" fn protocol_next_function_id_hook(receiver: ObjPtr) -> i64 {
+    protocol_method_function_id_hook(receiver, c"__next__")
+}
+
+unsafe extern "C" fn protocol_iter_function_id_hook(receiver: ObjPtr) -> i64 {
+    protocol_method_function_id_hook(receiver, c"__iter__")
+}
+
+unsafe fn protocol_method_function_id_hook(receiver: ObjPtr, method_name: &std::ffi::CStr) -> i64 {
     if receiver.is_null() {
         return 0;
     }
@@ -351,7 +359,7 @@ unsafe extern "C" fn protocol_next_function_id_hook(receiver: ObjPtr) -> i64 {
     if dict.is_null() {
         return 0;
     }
-    let descriptor = ffi::PyDict_GetItemString(dict, c"__next__".as_ptr());
+    let descriptor = ffi::PyDict_GetItemString(dict, method_name.as_ptr());
     if descriptor.is_null() {
         if !ffi::PyErr_Occurred().is_null() {
             ffi::PyErr_Clear();
@@ -1160,6 +1168,10 @@ pub unsafe extern "C" fn dp_jit_record_top_value_sample(counter: ObjPtr, value: 
 pub unsafe extern "C" fn dp_jit_protocol_next_function_id(receiver: ObjPtr) -> i64 {
     protocol_next_function_id_hook(receiver)
 }
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dp_jit_protocol_iter_function_id(receiver: ObjPtr) -> i64 {
+    protocol_iter_function_id_hook(receiver)
+}
 define_perf_toggle_export!(
     ObjPtr,
     dp_jit_get_arg_item,
@@ -1591,6 +1603,10 @@ pub fn register_specialized_jit_symbols(builder: &mut JITBuilder) {
     builder.symbol(
         "dp_jit_protocol_next_function_id",
         dp_jit_protocol_next_function_id as *const u8,
+    );
+    builder.symbol(
+        "dp_jit_protocol_iter_function_id",
+        dp_jit_protocol_iter_function_id as *const u8,
     );
     builder.symbol(
         "dp_jit_raise_unbound_local_error",

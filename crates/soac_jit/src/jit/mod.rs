@@ -275,18 +275,18 @@ use imports::{
     DP_JIT_ENTER_RECURSIVE_CALL_IMPORT, DP_JIT_FINISH_CONSTRUCTOR_INIT_IMPORT,
     DP_JIT_INCREF_IMPORT, DP_JIT_IS_TRUE_IMPORT, DP_JIT_LOAD_CELL_IMPORT,
     DP_JIT_LOAD_RUNTIME_OBJ_BY_ID_IMPORT, DP_JIT_MAKE_CELL_IMPORT,
-    DP_JIT_POP_HANDLED_EXCEPTION_IMPORT, DP_JIT_PROTOCOL_NEXT_FUNCTION_ID_IMPORT,
-    DP_JIT_PUSH_HANDLED_EXCEPTION_IMPORT, DP_JIT_PY_CALL_OBJECT_IMPORT,
-    DP_JIT_PY_CALL_POSITIONAL_THREE_IMPORT, DP_JIT_PY_CALL_WITH_KW_IMPORT,
-    DP_JIT_PY_VECTORCALL_IMPORT, DP_JIT_PYOBJECT_GETATTR_IMPORT, DP_JIT_PYOBJECT_GETITEM_IMPORT,
-    DP_JIT_PYOBJECT_SETATTR_IMPORT, DP_JIT_PYOBJECT_SETITEM_IMPORT, DP_JIT_PYOBJECT_TO_I64_IMPORT,
-    DP_JIT_PYTYPE_GENERIC_ALLOC_IMPORT, DP_JIT_RAISE_FROM_EXC_IMPORT,
-    DP_JIT_RAISE_I64_OVERFLOW_IMPORT, DP_JIT_RAISE_SUPER_ARG_DELETED_IMPORT,
-    DP_JIT_RAISE_UNBOUND_LOCAL_ERROR_IMPORT, DP_JIT_RECORD_TOP_VALUE_SAMPLE_IMPORT,
-    DP_JIT_STORE_CELL_IMPORT, ImportSpec, ModuleFuncImports, PY_HANDLE_PENDING_IMPORT,
-    PYLONG_FROM_LONGLONG_IMPORT, PYNUMBER_ADD_IMPORT, PYNUMBER_AND_IMPORT,
-    PYNUMBER_MULTIPLY_IMPORT, PYNUMBER_OR_IMPORT, PYNUMBER_SUBTRACT_IMPORT, PYNUMBER_XOR_IMPORT,
-    PYOBJECT_RICHCOMPARE_IMPORT, PYUNICODE_COMPARE_IMPORT,
+    DP_JIT_POP_HANDLED_EXCEPTION_IMPORT, DP_JIT_PROTOCOL_ITER_FUNCTION_ID_IMPORT,
+    DP_JIT_PROTOCOL_NEXT_FUNCTION_ID_IMPORT, DP_JIT_PUSH_HANDLED_EXCEPTION_IMPORT,
+    DP_JIT_PY_CALL_OBJECT_IMPORT, DP_JIT_PY_CALL_POSITIONAL_THREE_IMPORT,
+    DP_JIT_PY_CALL_WITH_KW_IMPORT, DP_JIT_PY_VECTORCALL_IMPORT, DP_JIT_PYOBJECT_GETATTR_IMPORT,
+    DP_JIT_PYOBJECT_GETITEM_IMPORT, DP_JIT_PYOBJECT_SETATTR_IMPORT, DP_JIT_PYOBJECT_SETITEM_IMPORT,
+    DP_JIT_PYOBJECT_TO_I64_IMPORT, DP_JIT_PYTYPE_GENERIC_ALLOC_IMPORT,
+    DP_JIT_RAISE_FROM_EXC_IMPORT, DP_JIT_RAISE_I64_OVERFLOW_IMPORT,
+    DP_JIT_RAISE_SUPER_ARG_DELETED_IMPORT, DP_JIT_RAISE_UNBOUND_LOCAL_ERROR_IMPORT,
+    DP_JIT_RECORD_TOP_VALUE_SAMPLE_IMPORT, DP_JIT_STORE_CELL_IMPORT, ImportSpec, ModuleFuncImports,
+    PY_HANDLE_PENDING_IMPORT, PYLONG_FROM_LONGLONG_IMPORT, PYNUMBER_ADD_IMPORT,
+    PYNUMBER_AND_IMPORT, PYNUMBER_MULTIPLY_IMPORT, PYNUMBER_OR_IMPORT, PYNUMBER_SUBTRACT_IMPORT,
+    PYNUMBER_XOR_IMPORT, PYOBJECT_RICHCOMPARE_IMPORT, PYUNICODE_COMPARE_IMPORT,
     SOAC_JIT_MAKE_FUNCTION_WITH_CLOSURE_IMPORT, SOAC_RUNTIME_BUILTIN_CHR_I64_IMPORT,
     SOAC_RUNTIME_BUILTIN_ITER_OBJECT_IMPORT, SOAC_RUNTIME_BUILTIN_LEN_I64_IMPORT,
     SOAC_RUNTIME_BUILTIN_ORD_I64_IMPORT, SOAC_RUNTIME_COMPARE_COMPACT_ASCII_UNICODE_IMPORT,
@@ -7815,22 +7815,38 @@ fn emit_record_call_target_sample(
     emit_record_top_value_sample(fb, counter_id, callee_id, ctx);
 }
 
-fn emit_record_protocol_next_target_sample(
+fn emit_record_protocol_method_target_sample(
     fb: &mut FunctionBuilder<'_>,
     receiver: ir::Value,
     counter_id: CounterId,
+    helper_import: &'static ImportSpec,
     ctx: &JitEmitCtx<'_>,
     codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) {
-    let helper = func_imports.get_or_panic(
-        codegen_env,
-        &mut fb.func,
-        &DP_JIT_PROTOCOL_NEXT_FUNCTION_ID_IMPORT,
-    );
+    let helper = func_imports.get_or_panic(codegen_env, &mut fb.func, helper_import);
     let call = fb.ins().call(helper, &[receiver]);
     let callee_id = fb.inst_results(call)[0];
     emit_record_call_target_sample(fb, counter_id, callee_id, ctx);
+}
+
+fn protocol_method_target_helper_import(runtime_name: &str) -> Option<&'static ImportSpec> {
+    match runtime_name {
+        "iter" => Some(&DP_JIT_PROTOCOL_ITER_FUNCTION_ID_IMPORT),
+        "next" => Some(&DP_JIT_PROTOCOL_NEXT_FUNCTION_ID_IMPORT),
+        _ => None,
+    }
+}
+
+fn call_access_allows_protocol_target_sample(access: Option<&TypedCallAccessPlan>) -> bool {
+    match access {
+        None | Some(TypedCallAccessPlan::Generic) => true,
+        Some(TypedCallAccessPlan::GuardedRuntimeProtocolMethod { method_guards, .. }) => {
+            method_guards.is_empty()
+        }
+        Some(TypedCallAccessPlan::GuardedCallable { .. })
+        | Some(TypedCallAccessPlan::GuardedMethod { .. }) => false,
+    }
 }
 
 fn emit_record_direct_call_target_sample(
@@ -10844,13 +10860,12 @@ fn emit_codegen_simple_call_with_local_env(
                     .get(&site_instr_id)
             })
             .copied();
-        if typed_access.is_none()
+        if call_access_allows_protocol_target_sample(typed_access)
             && let Some(counter_id) = call_target_counter
             && simple_args.len() == 1
-            && matches!(
-                codegen_expr_static_runtime_name(call.func.as_ref(), emit_ctx.module_constants),
-                Some("next")
-            )
+            && let Some(runtime_name) =
+                codegen_expr_static_runtime_name(call.func.as_ref(), emit_ctx.module_constants)
+            && let Some(helper_import) = protocol_method_target_helper_import(runtime_name)
         {
             let receiver_expr = simple_args[0];
             if codegen_expr_pyobject_input_is_borrowed_from_local_env(
@@ -10867,10 +10882,11 @@ fn emit_codegen_simple_call_with_local_env(
                     codegen_env,
                     func_imports,
                 );
-                emit_record_protocol_next_target_sample(
+                emit_record_protocol_method_target_sample(
                     fb,
                     receiver,
                     counter_id,
+                    helper_import,
                     emit_ctx,
                     codegen_env,
                     func_imports,
@@ -13282,6 +13298,15 @@ fn emit_runtime_builtin_primitive_desc_call_result_with_local_env(
             owned_inputs.push(owned_after_call);
         }
     }
+    emit_runtime_primitive_protocol_target_sample(
+        fb,
+        desc,
+        call_args.as_slice(),
+        call.try_semantic_instr_id(),
+        emit_ctx,
+        codegen_env,
+        func_imports,
+    );
     let func_ref = func_imports.get_or_panic(
         codegen_env,
         &mut fb.func,
@@ -13328,6 +13353,15 @@ fn emit_runtime_builtin_primitive_typed_desc_call_result_with_local_env(
             owned_inputs.push(owned_after_call);
         }
     }
+    emit_runtime_primitive_protocol_target_sample(
+        fb,
+        desc,
+        call_args.as_slice(),
+        call.try_semantic_instr_id(),
+        emit_ctx,
+        codegen_env,
+        func_imports,
+    );
     let func_ref = func_imports.get_or_panic(
         codegen_env,
         &mut fb.func,
@@ -13343,6 +13377,39 @@ fn emit_runtime_builtin_primitive_typed_desc_call_result_with_local_env(
         emit_ctx,
         demand,
     ))
+}
+
+fn emit_runtime_primitive_protocol_target_sample(
+    fb: &mut FunctionBuilder<'_>,
+    desc: &DirectCallableDesc,
+    call_args: &[ir::Value],
+    site_instr_id: Option<InstrId>,
+    emit_ctx: &JitEmitCtx<'_>,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) {
+    let DirectTargetId::RuntimePrimitive(direct_abi::RuntimePrimitiveId::BuiltinIterObject) =
+        desc.target
+    else {
+        return;
+    };
+    let Some(counter_id) = site_instr_id
+        .and_then(|site_instr_id| emit_ctx.call_target_counter_ids.get(&site_instr_id))
+    else {
+        return;
+    };
+    let Some(receiver) = call_args.get(desc.abi.hidden_args.len()).copied() else {
+        return;
+    };
+    emit_record_protocol_method_target_sample(
+        fb,
+        receiver,
+        *counter_id,
+        &DP_JIT_PROTOCOL_ITER_FUNCTION_ID_IMPORT,
+        emit_ctx,
+        codegen_env,
+        func_imports,
+    );
 }
 
 fn emit_runtime_builtin_primitive_call_result_with_local_env(
@@ -13604,13 +13671,12 @@ fn emit_typed_codegen_simple_positional_call_result_with_local_env(
         .and_then(|site_instr_id| emit_ctx.call_target_counter_ids.get(&site_instr_id))
         .copied();
 
-    if matches!(call.access, TypedCallAccessPlan::Generic)
+    if call_access_allows_protocol_target_sample(Some(&call.access))
         && let Some(counter_id) = call_target_counter
         && arg_refs.len() == 1
-        && matches!(
-            typed_expr_static_runtime_name(call.func.as_ref(), emit_ctx.module_constants),
-            Some("next")
-        )
+        && let Some(runtime_name) =
+            typed_expr_static_runtime_name(call.func.as_ref(), emit_ctx.module_constants)
+        && let Some(helper_import) = protocol_method_target_helper_import(runtime_name)
         && typed_expr_pyobject_input_is_borrowed_from_local_env(arg_refs[0], local_env, emit_ctx)
     {
         let (receiver, receiver_is_borrowed) = emit_typed_pyobject_input_with_local_env(
@@ -13626,10 +13692,11 @@ fn emit_typed_codegen_simple_positional_call_result_with_local_env(
             receiver_is_borrowed,
             "protocol next profiling only emits borrowed local receivers"
         );
-        emit_record_protocol_next_target_sample(
+        emit_record_protocol_method_target_sample(
             fb,
             receiver,
             counter_id,
+            helper_import,
             emit_ctx,
             codegen_env,
             func_imports,

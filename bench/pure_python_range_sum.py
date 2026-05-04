@@ -5,8 +5,6 @@ import time
 
 
 class PurePythonRange:
-    __slots__ = ("current", "stop", "step")
-
     def __init__(self, start, stop, step):
         self.current = start
         self.stop = stop
