@@ -4072,8 +4072,41 @@ def build(values):
         module_constants: &crate::module_constants::ModuleCodegenConstants,
     ) -> BuiltSpecializedFunction {
         let compile_session = crate::session::CompileSession::new();
+        build_test_specialized_function_with_compile_session(
+            blocks,
+            module,
+            function,
+            module_constants,
+            &compile_session,
+        )
+    }
+
+    fn build_test_specialized_function_with_env_config(
+        blocks: &[ObjPtr],
+        module: &BlockPyModule<BlockPyModuleShape>,
+        function: &BlockPyFunction<BlockPyModuleShape>,
+        module_constants: &crate::module_constants::ModuleCodegenConstants,
+        env_config: SoacEnvConfig,
+    ) -> BuiltSpecializedFunction {
+        let compile_session = crate::session::CompileSession::new_with_env_config(env_config);
+        build_test_specialized_function_with_compile_session(
+            blocks,
+            module,
+            function,
+            module_constants,
+            &compile_session,
+        )
+    }
+
+    fn build_test_specialized_function_with_compile_session(
+        blocks: &[ObjPtr],
+        module: &BlockPyModule<BlockPyModuleShape>,
+        function: &BlockPyFunction<BlockPyModuleShape>,
+        module_constants: &crate::module_constants::ModuleCodegenConstants,
+        compile_session: &crate::session::CompileSession,
+    ) -> BuiltSpecializedFunction {
         let mut jit_module =
-            new_jit_module(&compile_session).expect("test jit module should construct");
+            new_jit_module(compile_session).expect("test jit module should construct");
         let module_constant_ptrs = placeholder_module_constant_ptrs(module_constants.len());
         let module_constant_object_data_ids =
             declare_module_constant_object_data(&mut jit_module, module, &module_constant_ptrs)
@@ -4091,7 +4124,7 @@ def build(values):
             counter_slots_by_id.as_ref(),
             scalar_counter_data_id,
             top_value_counter_data_id,
-            &compile_session,
+            compile_session,
             None,
             None,
             None,
@@ -4150,6 +4183,75 @@ def build(values):
             &module,
             &function,
             &module_constants,
+        );
+    }
+
+    #[test]
+    fn specialized_jit_can_disable_handle_pending_backedge_checks() {
+        let mut constants = TestConstantPool::default();
+        let function = test_function();
+        let entry_label = function.name_gen.next_block_name();
+        let loop_label = function.name_gen.next_block_name();
+        let exit_label = function.name_gen.next_block_name();
+        let entry = BlockPyBlock {
+            label: entry_label,
+            body: vec![],
+            term: BlockTerm::Jump(BlockEdge::new(loop_label)),
+            params: vec![],
+            exc_edge: None,
+            extra: Default::default(),
+        };
+        let loop_block = BlockPyBlock {
+            label: loop_label,
+            body: vec![],
+            term: BlockTerm::IfTerm(soac_core::block_py::TermIf {
+                test: name_expr(test_runtime_name("TRUE")),
+                then_label: loop_label,
+                else_label: exit_label,
+            }),
+            params: vec![],
+            exc_edge: None,
+            extra: Default::default(),
+        };
+        let exit_block = BlockPyBlock {
+            label: exit_label,
+            body: vec![],
+            term: ret_term(constants.int_expr(0)),
+            params: vec![],
+            exc_edge: None,
+            extra: Default::default(),
+        };
+        let function = with_test_blocks(function, vec![entry, loop_block, exit_block]);
+        let mut module = test_module(ModuleNameGen::new(0), vec![function]);
+        module.module_constants = constants.module_constants;
+        let function = module.callable_defs[0].clone();
+        let module_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+
+        let enabled = build_test_specialized_function_with_env_config(
+            &[1usize as ObjPtr, 2usize as ObjPtr, 3usize as ObjPtr],
+            &module,
+            &function,
+            &module_constants,
+            SoacEnvConfig::default().with_jit_handle_pending_checks_enabled(true),
+        );
+        let enabled_helpers = import_user_names_for_symbols(&enabled, &["_Py_HandlePending"]);
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&enabled.ctx.func, &enabled_helpers),
+            1,
+            "enabled JIT codegen should check pending calls on the loop backedge"
+        );
+
+        let disabled = build_test_specialized_function_with_env_config(
+            &[1usize as ObjPtr, 2usize as ObjPtr, 3usize as ObjPtr],
+            &module,
+            &function,
+            &module_constants,
+            SoacEnvConfig::default().with_jit_handle_pending_checks_enabled(false),
+        );
+        assert!(
+            import_user_names_for_symbols(&disabled, &["_Py_HandlePending"]).is_empty(),
+            "disabled pending checks should not declare the _Py_HandlePending import"
         );
     }
 

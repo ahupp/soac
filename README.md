@@ -326,6 +326,12 @@ typed variables must use recognized values. Boolean knobs accept `1`, `true`,
   guard-miss deopt replay, because the replay interpreter depends on normal
   owned-reference bookkeeping from generated code.
 
+- `SOAC_JIT_HANDLE_PENDING_CHECKS`
+  Generated JIT loop-backedge calls to `_Py_HandlePending` are disabled by
+  default. Set to `1`, `true`, `yes`, or `on` to enable them when CPython
+  pending-call, signal-handling, thread-handoff, or async-exception latency
+  matters for the workload.
+
 ## Counters And Specialization
 
 - `SOAC_WORK_DIR=/path/to/work-dir`

@@ -1394,7 +1394,8 @@ struct JitEmitCtx<'mc> {
     decref_ref: ir::FuncRef,
     py_call_positional_three_ref: ir::FuncRef,
     py_vectorcall_ref: ir::FuncRef,
-    py_handle_pending_ref: ir::FuncRef,
+    py_handle_pending_ref: Option<ir::FuncRef>,
+    handle_pending_checks_enabled: bool,
     consts: JitEmitConsts,
     load_global_fast_ref: ir::FuncRef,
     probe_global_indexed_ref: ir::FuncRef,
@@ -17173,14 +17174,19 @@ fn emit_handle_pending_if_backedge(
     block_indices_by_label: &HashMap<BlockLabel, usize>,
     emit_ctx: &JitEmitCtx<'_>,
 ) -> Result<(), String> {
+    if !emit_ctx.handle_pending_checks_enabled {
+        return Ok(());
+    }
     if !is_codegen_backedge(source_label, target_label, block_indices_by_label)? {
         return Ok(());
     }
+    let Some(py_handle_pending_ref) = emit_ctx.py_handle_pending_ref else {
+        return Ok(());
+    };
 
-    let pending_inst = fb.ins().call(
-        emit_ctx.py_handle_pending_ref,
-        &[emit_ctx.consts.thread_state_value],
-    );
+    let pending_inst = fb
+        .ins()
+        .call(py_handle_pending_ref, &[emit_ctx.consts.thread_state_value]);
     let pending_rc = fb.inst_results(pending_inst)[0];
     let pending_ok = fb
         .ins()
@@ -18637,8 +18643,10 @@ fn build_cranelift_run_bb_specialized_function(
             func_imports.get_or_panic(codegen_env, &mut fb.func, &DP_JIT_PY_CALL_OBJECT_IMPORT);
         let py_vectorcall_ref =
             func_imports.get_or_panic(codegen_env, &mut fb.func, &DP_JIT_PY_VECTORCALL_IMPORT);
-        let py_handle_pending_ref =
-            func_imports.get_or_panic(codegen_env, &mut fb.func, &PY_HANDLE_PENDING_IMPORT);
+        let handle_pending_checks_enabled = env_config.jit_handle_pending_checks_enabled();
+        let py_handle_pending_ref = handle_pending_checks_enabled.then(|| {
+            func_imports.get_or_panic(codegen_env, &mut fb.func, &PY_HANDLE_PENDING_IMPORT)
+        });
         let py_call_with_kw_ref =
             func_imports.get_or_panic(codegen_env, &mut fb.func, &DP_JIT_PY_CALL_WITH_KW_IMPORT);
         let enter_recursive_ref = func_imports.get_or_panic(
@@ -19014,6 +19022,7 @@ fn build_cranelift_run_bb_specialized_function(
                 py_call_positional_three_ref,
                 py_vectorcall_ref,
                 py_handle_pending_ref,
+                handle_pending_checks_enabled,
                 consts: JitEmitConsts {
                     step_null_block: fast_step_null_block,
                     step_null_args: fast_step_null_args,

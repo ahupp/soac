@@ -595,6 +595,11 @@ explicit ordinary
   intentionally unsound performance experiment knob and leaks Python
   references. It also disables guard-miss deopt replay, because the replay
   interpreter depends on normal owned-reference bookkeeping from generated code.
+- `SOAC_JIT_HANDLE_PENDING_CHECKS`
+  Generated JIT loop-backedge calls to `_Py_HandlePending` are disabled by
+  default. Set to `1`, `true`, `yes`, or `on` when CPython pending calls,
+  signal handling, thread handoff, or async-exception latency matters for the
+  workload.
 - `BEHAVIOR_CHANGE`
   Source comments with this exact tag mark intentional CPython-visible
   compatibility changes. Current examples: apply-mode raw indexed

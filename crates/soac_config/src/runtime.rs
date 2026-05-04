@@ -9,6 +9,7 @@ pub(crate) const SOAC_WORK_DIR_ENV: &str = "SOAC_WORK_DIR";
 pub(crate) const SOAC_CRANELIFT_OPT_LEVEL_ENV: &str = "SOAC_CRANELIFT_OPT_LEVEL";
 pub(crate) const SOAC_ENABLE_PROFILED_COLD_BLOCKS_ENV: &str = "SOAC_ENABLE_PROFILED_COLD_BLOCKS";
 pub(crate) const SOAC_JIT_EMIT_REFCOUNTS_ENV: &str = "SOAC_JIT_EMIT_REFCOUNTS";
+pub(crate) const SOAC_JIT_HANDLE_PENDING_CHECKS_ENV: &str = "SOAC_JIT_HANDLE_PENDING_CHECKS";
 pub(crate) const SOAC_JIT_COMPILE_WORKERS_ENV: &str = "SOAC_JIT_COMPILE_WORKERS";
 pub(crate) const SOAC_BACKGROUND_JIT_ENV: &str = "SOAC_BACKGROUND_JIT";
 pub(crate) const SOAC_PRECOMPILED_LIBRARY_ENV: &str = "SOAC_PRECOMPILED_LIBRARY";
@@ -123,6 +124,7 @@ pub struct SoacEnvConfig {
     soac_work_dir: Option<PathBuf>,
     profiled_cold_blocks_enabled: bool,
     jit_refcount_emission_enabled: bool,
+    jit_handle_pending_checks_enabled: bool,
     compile_mode: CompileMode,
     jit_compile_workers: Option<usize>,
     background_jit_enabled: bool,
@@ -198,6 +200,8 @@ impl SoacEnvConfig {
         let soac_work_dir = env_path(SOAC_WORK_DIR_ENV)?;
         let profiled_cold_blocks_enabled = env_bool(SOAC_ENABLE_PROFILED_COLD_BLOCKS_ENV, false)?;
         let jit_refcount_emission_enabled = env_bool(SOAC_JIT_EMIT_REFCOUNTS_ENV, true)?;
+        let jit_handle_pending_checks_enabled =
+            env_bool(SOAC_JIT_HANDLE_PENDING_CHECKS_ENV, false)?;
         let compile_mode =
             parse_optional_compile_mode(env_string(SOAC_COMPILE_MODE_ENV)?.as_deref())?;
         let jit_compile_workers = parse_optional_positive_usize(
@@ -222,6 +226,7 @@ impl SoacEnvConfig {
             soac_work_dir,
             profiled_cold_blocks_enabled,
             jit_refcount_emission_enabled,
+            jit_handle_pending_checks_enabled,
             compile_mode,
             jit_compile_workers,
             background_jit_enabled,
@@ -253,6 +258,11 @@ impl SoacEnvConfig {
 
     pub fn with_jit_refcount_emission_enabled(mut self, enabled: bool) -> Self {
         self.jit_refcount_emission_enabled = enabled;
+        self
+    }
+
+    pub fn with_jit_handle_pending_checks_enabled(mut self, enabled: bool) -> Self {
+        self.jit_handle_pending_checks_enabled = enabled;
         self
     }
 
@@ -292,6 +302,10 @@ impl SoacEnvConfig {
 
     pub fn jit_refcount_emission_enabled(&self) -> bool {
         self.jit_refcount_emission_enabled
+    }
+
+    pub fn jit_handle_pending_checks_enabled(&self) -> bool {
+        self.jit_handle_pending_checks_enabled
     }
 
     pub fn module_cache_root(&self) -> Option<PathBuf> {
@@ -348,6 +362,7 @@ impl Default for SoacEnvConfig {
             soac_work_dir: None,
             profiled_cold_blocks_enabled: false,
             jit_refcount_emission_enabled: true,
+            jit_handle_pending_checks_enabled: true,
             compile_mode: CompileMode::Lazy,
             jit_compile_workers: None,
             background_jit_enabled: true,
@@ -538,6 +553,7 @@ mod tests {
             EnvVarGuard::remove(SOAC_CRANELIFT_OPT_LEVEL_ENV),
             EnvVarGuard::remove(SOAC_ENABLE_PROFILED_COLD_BLOCKS_ENV),
             EnvVarGuard::remove(SOAC_JIT_EMIT_REFCOUNTS_ENV),
+            EnvVarGuard::remove(SOAC_JIT_HANDLE_PENDING_CHECKS_ENV),
             EnvVarGuard::remove(SOAC_PRECOMPILED_LIBRARY_ENV),
             EnvVarGuard::remove(SOAC_COMPILE_MODE_ENV),
             EnvVarGuard::remove(SOAC_JIT_COMPILE_WORKERS_ENV),
@@ -572,6 +588,7 @@ mod tests {
         assert_eq!(config.jit_compile_workers(), None);
         assert!(config.background_jit_enabled());
         assert!(config.jit_refcount_emission_enabled());
+        assert!(!config.jit_handle_pending_checks_enabled());
         assert!(!config.jit_perf_helper_frames_enabled());
     }
 
@@ -669,6 +686,41 @@ mod tests {
     }
 
     #[test]
+    fn env_config_parses_handle_pending_checks_bool() {
+        let _lock = env_lock().lock().unwrap();
+        let _guards = clear_soac_config_env();
+
+        assert!(
+            !SoacEnvConfig::from_env()
+                .unwrap()
+                .jit_handle_pending_checks_enabled(),
+            "JIT pending checks should be disabled by default"
+        );
+
+        for value in ["0", "false", "False", "no", "off"] {
+            let _guards = clear_soac_config_env();
+            let _checks = EnvVarGuard::set(SOAC_JIT_HANDLE_PENDING_CHECKS_ENV, value);
+            assert!(
+                !SoacEnvConfig::from_env()
+                    .unwrap()
+                    .jit_handle_pending_checks_enabled(),
+                "{SOAC_JIT_HANDLE_PENDING_CHECKS_ENV}={value:?} should disable pending checks"
+            );
+        }
+
+        for value in ["1", "true", "yes", "on"] {
+            let _guards = clear_soac_config_env();
+            let _checks = EnvVarGuard::set(SOAC_JIT_HANDLE_PENDING_CHECKS_ENV, value);
+            assert!(
+                SoacEnvConfig::from_env()
+                    .unwrap()
+                    .jit_handle_pending_checks_enabled(),
+                "{SOAC_JIT_HANDLE_PENDING_CHECKS_ENV}={value:?} should keep pending checks enabled"
+            );
+        }
+    }
+
+    #[test]
     fn env_config_parses_perf_helper_frames_bool() {
         let _lock = env_lock().lock().unwrap();
         let _guards = clear_soac_config_env();
@@ -715,6 +767,7 @@ mod tests {
             (SOAC_CRANELIFT_OPT_LEVEL_ENV, "fastest"),
             (SOAC_ENABLE_PROFILED_COLD_BLOCKS_ENV, "maybe"),
             (SOAC_JIT_EMIT_REFCOUNTS_ENV, ""),
+            (SOAC_JIT_HANDLE_PENDING_CHECKS_ENV, "later"),
             (SOAC_COMPILE_MODE_ENV, "always"),
             (SOAC_JIT_COMPILE_WORKERS_ENV, "0"),
             (SOAC_BACKGROUND_JIT_ENV, "sometimes"),
