@@ -71,7 +71,7 @@ def bad_len(value):
             module.bad_len(5)
 
 
-def test_range_runtime_builtin_is_reusable_iterable(tmp_path):
+def test_runtime_range_is_reusable_iterable(tmp_path):
     source = """
 def collect_stop(stop):
     return list(range(stop))
@@ -130,8 +130,8 @@ def no_index():
         assert module.collect_step(5, 1, -2) == [5, 3]
         assert module.reuse_range(3) == ([0, 1, 2], [0, 1, 2])
         assert module.reuse_iterator(3) == ([0, 1, 2], [])
-        assert module.iterator_type_name(3) == "range_iterator"
-        assert module.range_type_name(3) == ("builtins", "range")
+        assert module.iterator_type_name(3) == "IterRange"
+        assert module.range_type_name(3) == ("soac.runtime", "range")
         assert module.collect_indexable() == [1, 3]
         with pytest.raises(ValueError):
             module.zero_step()

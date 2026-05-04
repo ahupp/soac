@@ -38,7 +38,6 @@ list = _builtins.list
 dict = _builtins.dict
 set = _builtins.set
 slice = _builtins.slice
-range = _builtins.range
 type = _builtins.type
 int = _builtins.int
 object = _builtins.object
@@ -729,8 +728,35 @@ async def asynccontextmanager_exit(exit_fn, exc):
 # exception helpers, and generator/coroutine support helpers lets future
 # bootstrapping treat `__soac__.X` inside this module as ordinary module-global
 # references instead of installing duplicate bootstrap helper implementations.
+class range:
+    def __init__(self, *args):
+        argc = _builtins.len(args)
+        if argc == 1:
+            start = 0
+            stop = _index(args[0])
+            step = 1
+        elif argc == 2:
+            start = _index(args[0])
+            stop = _index(args[1])
+            step = 1
+        elif argc == 3:
+            start = _index(args[0])
+            stop = _index(args[1])
+            step = _index(args[2])
+            if step == 0:
+                raise ValueError("range() arg 3 must not be zero")
+        else:
+            raise TypeError(f"range expected at least 1 argument, got {argc}")
+
+        self.start = start
+        self.stop = stop
+        self.step = step
+
+    def __iter__(self):
+        return IterRange(self.start, self.stop, self.step)
+
+
 class IterRange:
-    __slots__ = ("current", "stop", "step")
 
     def __init__(self, start, stop, step, /):
         self.current = start
