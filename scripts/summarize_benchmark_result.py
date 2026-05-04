@@ -143,7 +143,23 @@ def add_run_stats(result: dict[str, Any], key_prefix: str) -> None:
     result[f"{key_prefix}_loops_per_s_max"] = max(runs) if runs else None
 
 
-def parse_jit_code_size(jit_bb_map_path: Path) -> dict[str, Any] | None:
+def select_jit_code_size_process(
+    process_ids: list[int], benchmark: dict[str, Any] | None
+) -> tuple[int, str]:
+    if benchmark is not None:
+        apply_run_count = len(benchmark.get("apply_loops_per_s_runs") or [])
+        # benchmark.txt records process-backed passes in this order:
+        # profile, verify, then each successful refcounts-enabled apply run.
+        if apply_run_count > 0:
+            apply_process_index = 2 + apply_run_count - 1
+            if apply_process_index < len(process_ids):
+                return process_ids[apply_process_index], "last_refcounts_enabled_apply"
+    return process_ids[-1], "latest_process"
+
+
+def parse_jit_code_size(
+    jit_bb_map_path: Path, benchmark: dict[str, Any] | None = None
+) -> dict[str, Any] | None:
     if not jit_bb_map_path.is_file():
         return None
 
@@ -162,7 +178,8 @@ def parse_jit_code_size(jit_bb_map_path: Path) -> dict[str, Any] | None:
     if not by_process:
         return None
 
-    process_id = max(by_process)
+    process_ids = sorted(by_process)
+    process_id, selection = select_jit_code_size_process(process_ids, benchmark)
     rows = by_process[process_id]
     by_name = {}
     for row in rows:
@@ -209,7 +226,9 @@ def parse_jit_code_size(jit_bb_map_path: Path) -> dict[str, Any] | None:
         )[:10]
     ]
     return {
-        "latest_process_id": process_id,
+        "selected_process_id": process_id,
+        "process_selection": selection,
+        "available_process_ids": process_ids,
         "function_count": len(by_name),
         "total_code_size_bytes": total,
         "total_machine_block_count": total_blocks,
@@ -378,7 +397,8 @@ def format_summary(summary: dict[str, Any]) -> str:
 
     lines.extend(
         [
-            f"latest pystone jit process id: {code_size['latest_process_id']}",
+            f"pystone jit process id: {code_size['selected_process_id']}",
+            f"pystone jit process selection: {code_size['process_selection']}",
             f"pystone total code size bytes: {code_size['total_code_size_bytes']}",
             f"pystone total machine blocks: {code_size['total_machine_block_count']}",
             f"pystone non-_dp_ code size bytes: {code_size['non_dp_code_size_bytes']}",
@@ -399,10 +419,13 @@ def format_summary(summary: dict[str, Any]) -> str:
 def main() -> int:
     args = parse_args()
     result_dir = args.result_dir.resolve()
+    benchmark = parse_benchmark_report(result_dir / "benchmark.txt")
     summary = {
         "result_dir": str(result_dir),
-        "benchmark": parse_benchmark_report(result_dir / "benchmark.txt"),
-        "jit_code_size": parse_jit_code_size(result_dir / "counters" / "jit-bb-map.jsonl"),
+        "benchmark": benchmark,
+        "jit_code_size": parse_jit_code_size(
+            result_dir / "counters" / "jit-bb-map.jsonl", benchmark
+        ),
         "specialization_runtime": parse_specialization_stats(result_dir),
     }
 

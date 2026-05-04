@@ -1,0 +1,48 @@
+import importlib.util
+import json
+from pathlib import Path
+
+
+def _load_summary_module():
+    script = Path(__file__).resolve().parents[1] / "scripts" / "summarize_benchmark_result.py"
+    spec = importlib.util.spec_from_file_location("summarize_benchmark_result", script)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_code_size_uses_last_successful_refcount_apply_process(tmp_path: Path) -> None:
+    summary = _load_summary_module()
+    jit_bb_map = tmp_path / "jit-bb-map.jsonl"
+    rows = [
+        {
+            "process_id": process_id,
+            "function_id": function_id,
+            "function_qualname": qualname,
+            "entry_kind": "direct_function_body",
+            "code_size": code_size,
+            "bb_offsets": list(range(blocks)),
+        }
+        for process_id, function_id, qualname, code_size, blocks in [
+            (10, "1:6", "pystones", 100, 1),
+            (20, "1:6", "pystones", 200, 2),
+            (30, "1:6", "pystones", 300, 3),
+            (40, "1:6", "pystones", 400, 4),
+            (50, "1:6", "pystones", 500, 5),
+            (60, "1:7", "_dp_listcomp_3", 12, 1),
+        ]
+    ]
+    jit_bb_map.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+
+    code_size = summary.parse_jit_code_size(
+        jit_bb_map,
+        {
+            "apply_loops_per_s_runs": [1, 2, 3],
+        },
+    )
+
+    assert code_size["selected_process_id"] == 50
+    assert code_size["process_selection"] == "last_refcounts_enabled_apply"
+    assert code_size["total_code_size_bytes"] == 500
