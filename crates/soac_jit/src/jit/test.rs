@@ -62,8 +62,9 @@ mod tests {
     };
     use super::super::{
         BlockPyBlock, ClifBlockDisplayAnnotations, DP_JIT_DECREF_IMPORT,
-        DP_JIT_DEOPT_RESUME_IMPORT, DP_JIT_INCREF_IMPORT, DP_JIT_PY_CALL_POSITIONAL_THREE_IMPORT,
-        DP_JIT_PY_VECTORCALL_IMPORT, DP_JIT_PYOBJECT_SETATTR_IMPORT, DirectCallArgPlan,
+        DP_JIT_DEOPT_RESUME_IMPORT, DP_JIT_INCREF_IMPORT, DP_JIT_PROTOCOL_NEXT_FUNCTION_ID_IMPORT,
+        DP_JIT_PY_CALL_POSITIONAL_THREE_IMPORT, DP_JIT_PY_VECTORCALL_IMPORT,
+        DP_JIT_PYOBJECT_SETATTR_IMPORT, DP_JIT_RECORD_TOP_VALUE_SAMPLE_IMPORT, DirectCallArgPlan,
         DirectCallArgSource, DirectCallIncompatibility, FUNCTION_ENV_DEOPT_TABLE_PTR_OFFSET,
         IntFacts, IntRange, JitDeoptExitRef, LocalEnv, LocalEnvEntry, LocalEnvStorage,
         LocalRefKind, ModuleConstantId, ModuleFuncImports, ObjPtr, ParamBindingFacts,
@@ -18635,6 +18636,257 @@ def f(x, y):
     }
 
     #[test]
+    fn runtime_typed_v3_pipeline_inlines_static_runtime_range_calls() {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "runtime_typed_v3_pipeline_inlines_static_runtime_range_calls",
+        ) {
+            return;
+        }
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| {
+            let caller_module_name = "runtime_typed_v3_static_runtime_range_caller";
+            let caller_module_name_gen = ModuleNameGen::new(39);
+
+            let mut caller_function = test_function_in_module(&caller_module_name_gen, "caller");
+            caller_function.params.params.push(Param {
+                name: "value".into(),
+                kind: ParamKind::Any,
+                has_default: false,
+            });
+            let caller_block_label = caller_function.name_gen.next_block_name();
+            let call_instr_id = InstrId::new(1);
+            caller_function = with_test_blocks(
+                caller_function,
+                vec![BlockPyBlock {
+                    label: caller_block_label,
+                    body: vec![assign_stmt(
+                        test_local_name("obj", 1),
+                        with_instr_id(
+                            op_expr(Call::new(
+                                name_expr(test_runtime_name("range")),
+                                vec![CallArgPositional::Positional(name_expr(test_local_name(
+                                    "value", 0,
+                                )))],
+                                Vec::<CallArgKeyword<InstrBlockPy>>::new(),
+                            )),
+                            call_instr_id,
+                        ),
+                    )],
+                    term: ret_term(name_expr(test_local_name("obj", 1))),
+                    params: vec![],
+                    exc_edge: None,
+                    extra: Default::default(),
+                }],
+            );
+            set_stack_slots(&mut caller_function, &["value", "obj"]);
+            let caller_id = caller_function.function_id;
+
+            let runtime_lowered = soac_lowering::lower_python_to_blockpy_with_tracker_and_options(
+                "class range:\n    def __init__(self, value):\n        self.value = value\n",
+                ModuleNameGen::new(40),
+                soac_core::pass_tracker::RecordingPassTracker::new(),
+                soac_lowering::LoweringOptions {
+                    runtime_names_as_globals: true,
+                },
+            )
+            .expect("runtime source should lower");
+            let runtime_shared_state = crate::module_type::build_shared_state_for_testing(
+                py,
+                runtime_lowered.blockpy_module,
+                "soac.runtime",
+                "",
+            )
+            .expect("runtime shared state should build");
+            let caller_shared_state = crate::module_type::build_shared_state_for_testing(
+                py,
+                test_module(caller_module_name_gen, vec![caller_function]),
+                caller_module_name,
+                "",
+            )
+            .expect("caller shared state should build");
+            let compile_session = crate::session::CompileSession::new();
+            compile_session
+                .retain_shared_module_state_for_inspection(runtime_shared_state)
+                .expect("runtime module should be retained for planning");
+            compile_session
+                .retain_shared_module_state_for_inspection(caller_shared_state.clone())
+                .expect("caller module should be retained for planning");
+
+            let profile = SpecializationProfile {
+                module_name: Some(caller_module_name),
+                counter_dump_path: None,
+                direct_call_emission_scope: DirectCallEmissionScope::AllDirectCallCandidates,
+                opt_v3_emitted_direct_calls: HashMap::new(),
+                opt_v3_emitted_exact_list_items: HashMap::new(),
+                opt_v3_emitted_indexed_fields: HashMap::new(),
+                opt_v3_emitted_indexed_globals: HashMap::new(),
+                opt_v3_exact_int_branch_artifacts: HashMap::new(),
+                behavior_change_indexed_stores: false,
+                profiled_cold_blocks: false,
+                guard_miss_deopt: false,
+            };
+            let module_plan = optimize_blockpy_for_shared_state(
+                caller_shared_state.as_ref(),
+                Some(&compile_session),
+                Some(&profile),
+                &typed_v3_env_config(),
+            )
+            .expect("typed-v3 runtime should inline the statically known range target");
+            let planned_caller = module_plan
+                .module
+                .callable_defs
+                .iter()
+                .find(|function| function.function_id == caller_id)
+                .expect("planned module should include caller");
+            assert_eq!(
+                count_typed_instrs(planned_caller, |expr| {
+                    matches!(expr, InstrTyped::GuardedCallableCallTyped(_))
+                }),
+                0,
+                "static runtime range calls should inline through the ordinary typed direct-call path"
+            );
+            assert_eq!(
+                planned_caller
+                    .blocks
+                    .iter()
+                    .filter(|block| {
+                        matches!(
+                            &block.term,
+                            BlockTerm::IfTerm(term)
+                                if matches!(term.test, InstrTyped::DirectCallGuardTest(_))
+                        )
+                    })
+                    .count(),
+                1,
+                "static runtime range inlining should expose the direct-call guard CFG edge"
+            );
+        });
+    }
+
+    #[test]
+    fn runtime_typed_v3_profile_mode_keeps_static_runtime_range_calls_generic() {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "runtime_typed_v3_profile_mode_keeps_static_runtime_range_calls_generic",
+        ) {
+            return;
+        }
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| {
+            let caller_module_name = "runtime_typed_v3_profile_static_runtime_range_caller";
+            let caller_module_name_gen = ModuleNameGen::new(41);
+
+            let mut caller_function = test_function_in_module(&caller_module_name_gen, "caller");
+            caller_function.params.params.push(Param {
+                name: "value".into(),
+                kind: ParamKind::Any,
+                has_default: false,
+            });
+            let caller_block_label = caller_function.name_gen.next_block_name();
+            caller_function = with_test_blocks(
+                caller_function,
+                vec![BlockPyBlock {
+                    label: caller_block_label,
+                    body: vec![assign_stmt(
+                        test_local_name("obj", 1),
+                        with_instr_id(
+                            op_expr(Call::new(
+                                name_expr(test_runtime_name("range")),
+                                vec![CallArgPositional::Positional(name_expr(test_local_name(
+                                    "value", 0,
+                                )))],
+                                Vec::<CallArgKeyword<InstrBlockPy>>::new(),
+                            )),
+                            InstrId::new(1),
+                        ),
+                    )],
+                    term: ret_term(name_expr(test_local_name("obj", 1))),
+                    params: vec![],
+                    exc_edge: None,
+                    extra: Default::default(),
+                }],
+            );
+            set_stack_slots(&mut caller_function, &["value", "obj"]);
+            let caller_id = caller_function.function_id;
+
+            let runtime_lowered = soac_lowering::lower_python_to_blockpy_with_tracker_and_options(
+                "class range:\n    def __init__(self, value):\n        self.value = value\n",
+                ModuleNameGen::new(42),
+                soac_core::pass_tracker::RecordingPassTracker::new(),
+                soac_lowering::LoweringOptions {
+                    runtime_names_as_globals: true,
+                },
+            )
+            .expect("runtime source should lower");
+            let runtime_shared_state = crate::module_type::build_shared_state_for_testing(
+                py,
+                runtime_lowered.blockpy_module,
+                "soac.runtime",
+                "",
+            )
+            .expect("runtime shared state should build");
+            let caller_shared_state = crate::module_type::build_shared_state_for_testing(
+                py,
+                test_module(caller_module_name_gen, vec![caller_function]),
+                caller_module_name,
+                "",
+            )
+            .expect("caller shared state should build");
+            let compile_session = crate::session::CompileSession::new();
+            compile_session
+                .retain_shared_module_state_for_inspection(runtime_shared_state)
+                .expect("runtime module should be retained for planning");
+            compile_session
+                .retain_shared_module_state_for_inspection(caller_shared_state.clone())
+                .expect("caller module should be retained for planning");
+
+            let profile = SpecializationProfile {
+                module_name: Some(caller_module_name),
+                counter_dump_path: None,
+                direct_call_emission_scope: DirectCallEmissionScope::AllDirectCallCandidates,
+                opt_v3_emitted_direct_calls: HashMap::new(),
+                opt_v3_emitted_exact_list_items: HashMap::new(),
+                opt_v3_emitted_indexed_fields: HashMap::new(),
+                opt_v3_emitted_indexed_globals: HashMap::new(),
+                opt_v3_exact_int_branch_artifacts: HashMap::new(),
+                behavior_change_indexed_stores: false,
+                profiled_cold_blocks: false,
+                guard_miss_deopt: false,
+            };
+            let module_plan = optimize_blockpy_for_shared_state(
+                caller_shared_state.as_ref(),
+                Some(&compile_session),
+                Some(&profile),
+                &typed_v3_env_config().with_specialization_mode(Some(SpecializationMode::Profile)),
+            )
+            .expect("typed-v3 profile planning should keep static runtime calls generic");
+            let planned_caller = module_plan
+                .module
+                .callable_defs
+                .iter()
+                .find(|function| function.function_id == caller_id)
+                .expect("planned module should include caller");
+            assert_eq!(
+                count_typed_instrs(planned_caller, |expr| {
+                    matches!(expr, InstrTyped::GuardedCallableCallTyped(_))
+                }),
+                0,
+                "profile mode should not lower static runtime range calls into guarded calls"
+            );
+            assert_eq!(
+                count_typed_instrs(planned_caller, |expr| {
+                    matches!(expr, InstrTyped::CallTyped(_))
+                }),
+                1,
+                "profile mode should preserve the original range call for evidence collection"
+            );
+        });
+    }
+
+    #[test]
     fn runtime_typed_v3_module_plan_carries_non_inline_direct_call_shape() {
         let module_name = "runtime_typed_v3_non_inline_direct_call_test";
         let module_name_gen = ModuleNameGen::new(0);
@@ -23159,6 +23411,53 @@ class Point:
                 && !rendered.contains("call dp_jit_py_call_object")
                 && !rendered.contains("call dp_jit_py_call_with_kw"),
             "generic positional calls should avoid the tuple/kwargs helper path:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn runtime_protocol_call_target_sampling_records_only_the_protocol_method() {
+        let blocks = [1usize as ObjPtr];
+        let mut function = with_single_test_block(
+            test_function(),
+            vec![],
+            ret_term(op_expr(Call::new(
+                name_expr(test_runtime_name("next")),
+                vec![CallArgPositional::Positional(name_expr(test_local_name(
+                    "it", 0,
+                )))],
+                vec![],
+            ))),
+        );
+        function.params.params.push(Param {
+            name: "it".into(),
+            kind: ParamKind::Any,
+            has_default: false,
+        });
+        set_stack_slots(&mut function, &["it"]);
+
+        let mut module = test_module(ModuleNameGen::new(0), vec![function]);
+        define_module_call_target_counters(&mut module);
+        let function = module.callable_defs[0].clone();
+        let module_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+        let built =
+            build_test_jit_function_with_constants(&module, &function, &blocks, &module_constants);
+
+        let protocol_next_helpers = import_user_names_for_symbols(
+            &built,
+            &[DP_JIT_PROTOCOL_NEXT_FUNCTION_ID_IMPORT.symbol],
+        );
+        let record_sample_helpers =
+            import_user_names_for_symbols(&built, &[DP_JIT_RECORD_TOP_VALUE_SAMPLE_IMPORT.symbol]);
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&built.ctx.func, &protocol_next_helpers),
+            1,
+            "next() profiling should resolve the receiver's __next__ method"
+        );
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&built.ctx.func, &record_sample_helpers),
+            1,
+            "next() profiling should record one protocol-method sample, not overwrite it with the builtin callable id"
         );
     }
 

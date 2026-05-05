@@ -314,7 +314,9 @@ The current broad profile-annotation stage may need to split:
 ### Phase 4: Lower CFG-Carried State
 
 1. Add block-parameter synthesis for loop headers and joins.
-2. Carry field locals on edges where values differ by predecessor.
+2. Carry field locals on edges where values differ by predecessor, splitting
+   non-jump predecessors through jump trampolines when the original edge shape
+   cannot carry block arguments directly.
 3. Preserve ordinary scalar facts across the new block parameters.
 4. Re-run the pure-Python range forcing case and verify that iterator fields are
    now normal loop-carried locals rather than hidden object state.
@@ -406,9 +408,10 @@ The migration is complete when:
 ## Current Limitations
 
 - The dedicated fully-virtual path now exists for trusted, non-escaping
-  allocations, but it still consumes allocations that earlier inlining has
-  already exposed. Choosing unconditional static direct-call targets for known
-  runtime names is a separate follow-up from virtual-object lowering itself.
+  allocations, and typed-v3 can expose the known runtime `range` allocation
+  path through static direct-call selection. Other statically-known runtime
+  targets still need the same explicit treatment before they can benefit from
+  this path.
 - Exception-edge materialization is still conservative. If a virtual object
   would need to cross an exception edge, the analysis keeps that path concrete
   rather than attempting late reconstruction there.

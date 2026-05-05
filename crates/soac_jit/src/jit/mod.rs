@@ -11216,6 +11216,7 @@ fn emit_codegen_simple_call_with_local_env(
                     .get(&site_instr_id)
             })
             .copied();
+        let mut sampled_protocol_target = false;
         if call_access_allows_protocol_target_sample(typed_access)
             && let Some(counter_id) = call_target_counter
             && simple_args.len() == 1
@@ -11247,6 +11248,7 @@ fn emit_codegen_simple_call_with_local_env(
                     codegen_env,
                     func_imports,
                 );
+                sampled_protocol_target = true;
             }
         }
         if let Some(TypedCallAccessPlan::GuardedRuntimeProtocolMethod {
@@ -11657,7 +11659,7 @@ fn emit_codegen_simple_call_with_local_env(
             call_target_counter.is_some() || !direct_specializations.is_empty();
         let callee_id = should_emit_callee_id
             .then(|| emit_callee_function_id_checked(fb, callable, emit_ctx, codegen_env));
-        if let Some(counter_id) = call_target_counter {
+        if !sampled_protocol_target && let Some(counter_id) = call_target_counter {
             let callee_id = callee_id.expect("callee id should exist for call target counter");
             emit_record_call_target_sample(fb, counter_id, callee_id, emit_ctx);
         }
@@ -14027,6 +14029,7 @@ fn emit_typed_codegen_simple_positional_call_result_with_local_env(
         .and_then(|site_instr_id| emit_ctx.call_target_counter_ids.get(&site_instr_id))
         .copied();
 
+    let mut sampled_protocol_target = false;
     if call_access_allows_protocol_target_sample(Some(&call.access))
         && let Some(counter_id) = call_target_counter
         && arg_refs.len() == 1
@@ -14057,9 +14060,10 @@ fn emit_typed_codegen_simple_positional_call_result_with_local_env(
             codegen_env,
             func_imports,
         );
+        sampled_protocol_target = true;
     }
 
-    if let Some(counter_id) = call_target_counter {
+    if !sampled_protocol_target && let Some(counter_id) = call_target_counter {
         let callee_id = emit_callee_function_id_checked(fb, callable, emit_ctx, codegen_env);
         emit_record_call_target_sample(fb, counter_id, callee_id, emit_ctx);
     }

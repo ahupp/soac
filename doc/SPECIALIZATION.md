@@ -39,6 +39,16 @@ an implicit leading type argument, so class calls can reuse the ordinary
 guarded direct-call target model. Type registration only attaches that
 metadata for safe default constructor shapes, so unsupported Python type-call
 cases stay generic and do not enter the synthetic target.
+Typed planning can also add narrowly-scoped static runtime-name call plans when
+the callee binding is compiler-owned rather than profile-discovered. Today this
+is used for the pure-Python `soac.runtime.range` class: a `RuntimeName::Range`
+call can resolve directly to the runtime module's synthetic constructor-entry
+target, then flow through the same typed guarded-call and inliner machinery as
+profiled direct calls. The static path is apply/verify-only; profile mode keeps
+the original call graph so nested protocol sites still collect ordinary
+evidence before later rewrites inline them. Profile-selected plans still win
+when they already own the same target; the static path only fills in missing
+target evidence.
 Constant-attribute indexed-field load/store selections from `type_keys` are
 also emitted as mechanical v3 indexed-field decisions; JIT validation checks
 those emitted decisions against the selected plan and lowered
@@ -487,7 +497,8 @@ their owner/type guard payload is not yet a static mechanical JIT input.
   bodies for selected hot arms, and leaves an explicit generic typed fallback
   for the original call shape.
 - When no v3 plan owns the site, the original generic call remains in
-  `InstrTyped`.
+  `InstrTyped`, except for the explicit static runtime-name targets described
+  above.
 - The rewrite consumes profiled targets that match the ordinary direct-call /
   typed inliner shape: positional-only-or-normal parameters, no keywords, no
   starred args, and positional inputs that can bind through the direct-entry
@@ -546,6 +557,12 @@ target, method name, and argument plan. During typed JIT planning, the JIT
 resolves owner type metadata for that function and method name, predeclares the
 owner type and owner-attribute callable relocation, and embeds typed method
 guards into the call site.
+
+Synthetic runtime protocol calls such as lowered `iter(x)` and `next(x)` use the
+same evidence channel, but sample the receiver's resolved `__iter__` or
+`__next__` function id instead of the builtin helper object itself. That keeps
+the later direct-call decision tied to the Python method body that can actually
+be inlined.
 
 Codegen then emits the guarded method path: evaluate the receiver, check the
 receiver type/version, direct-call the selected function with the receiver as

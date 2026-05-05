@@ -632,20 +632,37 @@ pub fn lower_typed_virtual_fields_to_locals_with_plan(
         .iter()
         .map(|object| object.object_id)
         .collect::<HashSet<_>>();
-    let block_param_stats =
-        synthesize_typed_virtual_field_block_params(function, &analysis, &removable_objects);
-    if block_param_stats.inserted_block_params != 0 {
-        analysis = analyze_typed_virtual_field_states(
-            function,
-            module_constants,
-            &constructor_field_bindings,
-        );
-        refresh_typed_virtual_field_block_param_args(function, &analysis);
-        analysis = analyze_typed_virtual_field_states(
-            function,
-            module_constants,
-            &constructor_field_bindings,
-        );
+    let mut block_param_stats = TypedVirtualFieldBlockParamStats::default();
+    loop {
+        let split_edges =
+            split_typed_virtual_field_block_param_edges(function, &analysis, &removable_objects);
+        if split_edges != 0 {
+            analysis = analyze_typed_virtual_field_states(
+                function,
+                module_constants,
+                &constructor_field_bindings,
+            );
+        }
+        let next_block_param_stats =
+            synthesize_typed_virtual_field_block_params(function, &analysis, &removable_objects);
+        block_param_stats.inserted_block_params += next_block_param_stats.inserted_block_params;
+        block_param_stats.inserted_block_args += next_block_param_stats.inserted_block_args;
+        if next_block_param_stats.inserted_block_params != 0 {
+            analysis = analyze_typed_virtual_field_states(
+                function,
+                module_constants,
+                &constructor_field_bindings,
+            );
+            refresh_typed_virtual_field_block_param_args(function, &analysis);
+            analysis = analyze_typed_virtual_field_states(
+                function,
+                module_constants,
+                &constructor_field_bindings,
+            );
+        }
+        if split_edges == 0 && next_block_param_stats.inserted_block_params == 0 {
+            break;
+        }
     }
     let mut stats = lower_typed_virtual_fields_to_locals_from_analysis(
         function,
@@ -1953,14 +1970,51 @@ fn synthesize_typed_virtual_field_block_params(
         {
             continue;
         }
-        let Some(in_state) = analysis.block_in.get(&block.label) else {
+        let incoming_states = incoming_edges
+            .iter()
+            .map(|edge| {
+                analysis.block_out.get(&edge.from).map(|state| {
+                    remap_typed_field_scalar_state_for_edge(
+                        function,
+                        block,
+                        edge.explicit_args.as_deref(),
+                        state,
+                    )
+                })
+            })
+            .collect::<Option<Vec<_>>>();
+        let Some(incoming_states) = incoming_states else {
             continue;
         };
-        let mut fields = in_state
+        let Some(first_state) = incoming_states.first() else {
+            continue;
+        };
+        let mut fields = first_state
             .virtual_state
             .fields
             .keys()
             .filter(|field| removable_objects.contains(&field.object))
+            .filter(|field| {
+                incoming_states
+                    .iter()
+                    .skip(1)
+                    .all(|state| state.virtual_state.fields.contains_key(*field))
+            })
+            .filter(|field| {
+                let Some(first_value) = first_state.virtual_state.fields.get(*field) else {
+                    return false;
+                };
+                incoming_states.iter().skip(1).any(|state| {
+                    state
+                        .virtual_state
+                        .fields
+                        .get(*field)
+                        .is_some_and(|incoming| {
+                            state.resolve_scalar_name(incoming)
+                                != first_state.resolve_scalar_name(first_value)
+                        })
+                })
+            })
             .cloned()
             .collect::<Vec<_>>();
         fields.sort_by(|left, right| {
@@ -2020,6 +2074,93 @@ fn synthesize_typed_virtual_field_block_params(
         }
     }
     stats
+}
+
+fn split_typed_virtual_field_block_param_edges(
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+    analysis: &TypedVirtualLoweringAnalysis,
+    removable_objects: &HashSet<TypedVirtualObjectId>,
+) -> usize {
+    let predecessors = typed_scalar_block_predecessor_edges(function);
+    let mut edges_to_split = HashSet::<(BlockLabel, BlockLabel)>::new();
+    for block in &function.blocks {
+        let Some(incoming_edges) = predecessors.get(&block.label) else {
+            continue;
+        };
+        if incoming_edges.len() < 2 {
+            continue;
+        }
+        let incoming_states = incoming_edges
+            .iter()
+            .map(|edge| {
+                analysis.block_out.get(&edge.from).map(|state| {
+                    remap_typed_field_scalar_state_for_edge(
+                        function,
+                        block,
+                        edge.explicit_args.as_deref(),
+                        state,
+                    )
+                })
+            })
+            .collect::<Option<Vec<_>>>();
+        let Some(incoming_states) = incoming_states else {
+            continue;
+        };
+        let Some(first_state) = incoming_states.first() else {
+            continue;
+        };
+        let needs_virtual_field_param =
+            first_state
+                .virtual_state
+                .fields
+                .iter()
+                .any(|(field, first_value)| {
+                    removable_objects.contains(&field.object)
+                        && incoming_states
+                            .iter()
+                            .skip(1)
+                            .all(|state| state.virtual_state.fields.contains_key(field))
+                        && incoming_states.iter().skip(1).any(|state| {
+                            state
+                                .virtual_state
+                                .fields
+                                .get(field)
+                                .is_some_and(|incoming| {
+                                    state.resolve_scalar_name(incoming)
+                                        != first_state.resolve_scalar_name(first_value)
+                                })
+                        })
+                });
+        if !needs_virtual_field_param {
+            continue;
+        }
+        for edge in incoming_edges {
+            if edge.explicit_args.is_none() {
+                edges_to_split.insert((edge.from, block.label));
+            }
+        }
+    }
+
+    let mut inserted = 0;
+    for (from, target) in edges_to_split {
+        let trampoline = function.name_gen.next_block_name();
+        let Some(source) = function.blocks.iter_mut().find(|block| block.label == from) else {
+            continue;
+        };
+        if !source.term.replace_target(target, trampoline) {
+            continue;
+        }
+        function.blocks.push(Block::new_with_extra(
+            trampoline,
+            Vec::new(),
+            BlockTerm::Jump(BlockEdge::new(target)),
+            Vec::new(),
+            None,
+            TypedBlockExtra::default(),
+        ));
+        inserted += 1;
+    }
+    inserted
 }
 
 fn refresh_typed_virtual_field_block_param_args(
@@ -2284,13 +2425,23 @@ fn merge_typed_field_scalar_states<'a>(
         rest.iter()
             .all(|state| state.value_aliases.get(location) == Some(value))
     });
-    merged.virtual_state.fields.retain(|field, value| {
-        rest.iter()
-            .all(|state| state.virtual_state.fields.get(field) == Some(value))
-    });
     merged.field_scalars.retain(|field, value| {
         rest.iter()
             .all(|state| state.field_scalars.get(field) == Some(value))
+    });
+    merged.virtual_state.fields.retain(|field, value| {
+        let resolved = first.resolve_scalar_name(value);
+        if !rest.iter().all(|state| {
+            state
+                .virtual_state
+                .fields
+                .get(field)
+                .is_some_and(|incoming| state.resolve_scalar_name(incoming) == resolved)
+        }) {
+            return false;
+        }
+        *value = resolved;
+        true
     });
     merged
 }
@@ -2793,6 +2944,192 @@ fn typed_scalar_field_can_precompute_replacement(expr: &InstrTyped) -> bool {
             .iter()
             .all(typed_scalar_field_can_precompute_replacement),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soac_ir_typed::lower_blockpy_module_to_typed;
+
+    fn local_name(id: &str, location: u32) -> ResolvedName {
+        ResolvedName {
+            id: id.to_string().into(),
+            location: NameLocation::Local(LocalLocation(location)),
+        }
+    }
+
+    #[test]
+    fn merge_preserves_field_state_when_paths_share_the_same_scalar_slot() {
+        let object = TypedVirtualObjectId(7);
+        let field = TypedVirtualFieldRef {
+            object,
+            field_name: "stop".to_string(),
+        };
+        let scalar = local_name("scalar_stop", 0);
+        let mut left = TypedVirtualLoweringState::default();
+        left.virtual_state
+            .fields
+            .insert(field.clone(), scalar.clone());
+        left.field_scalars.insert(field.clone(), scalar.clone());
+
+        let mut right = TypedVirtualLoweringState::default();
+        let stop_alias = local_name("stop_alias", 1);
+        right
+            .virtual_state
+            .fields
+            .insert(field.clone(), stop_alias.clone());
+        right.field_scalars.insert(field.clone(), scalar.clone());
+        right.value_aliases.insert(
+            stop_alias
+                .local_location()
+                .expect("test alias should have a local location"),
+            scalar.clone(),
+        );
+
+        let merged = merge_typed_field_scalar_states([&left, &right].into_iter());
+
+        assert_eq!(merged.field_scalars.get(&field), Some(&scalar));
+        assert_eq!(merged.virtual_state.fields.get(&field), Some(&scalar));
+    }
+
+    #[test]
+    fn merge_drops_field_state_when_incoming_aliases_do_not_resolve_together() {
+        let object = TypedVirtualObjectId(7);
+        let field = TypedVirtualFieldRef {
+            object,
+            field_name: "stop".to_string(),
+        };
+        let scalar = local_name("scalar_stop", 0);
+        let mut left = TypedVirtualLoweringState::default();
+        left.virtual_state
+            .fields
+            .insert(field.clone(), scalar.clone());
+        left.field_scalars.insert(field.clone(), scalar.clone());
+
+        let mut right = TypedVirtualLoweringState::default();
+        right
+            .virtual_state
+            .fields
+            .insert(field.clone(), local_name("unrelated_stop", 1));
+        right.field_scalars.insert(field.clone(), scalar.clone());
+
+        let merged = merge_typed_field_scalar_states([&left, &right].into_iter());
+
+        assert_eq!(merged.field_scalars.get(&field), Some(&scalar));
+        assert!(!merged.virtual_state.fields.contains_key(&field));
+    }
+
+    #[test]
+    fn split_virtual_field_param_edges_adds_branch_table_trampolines() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            "def caller(kind, value):\n    return value\n",
+        )
+        .expect("source should lower");
+        let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
+        let function = typed
+            .callable_defs
+            .iter_mut()
+            .find(|function| function.names.qualname == "caller")
+            .expect("typed caller should exist");
+
+        let jump_from = function.name_gen.next_block_name();
+        let branch_from = function.name_gen.next_block_name();
+        let target = function.name_gen.next_block_name();
+        function.blocks = vec![
+            Block::new_with_extra(
+                jump_from,
+                Vec::new(),
+                BlockTerm::Jump(BlockEdge::new(target)),
+                Vec::new(),
+                None,
+                TypedBlockExtra::default(),
+            ),
+            Block::new_with_extra(
+                branch_from,
+                Vec::new(),
+                BlockTerm::BranchTable(block_py::TermBranchTable {
+                    index: typed_load_temp(&local_name("kind", 0)),
+                    targets: vec![target],
+                    default_label: target,
+                }),
+                Vec::new(),
+                None,
+                TypedBlockExtra::default(),
+            ),
+            Block::new_with_extra(
+                target,
+                Vec::new(),
+                BlockTerm::Return(typed_load_temp(&local_name("value", 1))),
+                Vec::new(),
+                None,
+                TypedBlockExtra::default(),
+            ),
+        ];
+
+        let object = TypedVirtualObjectId(7);
+        let field = TypedVirtualFieldRef {
+            object,
+            field_name: "stop".to_string(),
+        };
+        let mut jump_state = TypedVirtualLoweringState::default();
+        jump_state
+            .virtual_state
+            .fields
+            .insert(field.clone(), local_name("jump_stop", 2));
+        let mut branch_state = TypedVirtualLoweringState::default();
+        branch_state
+            .virtual_state
+            .fields
+            .insert(field, local_name("branch_stop", 3));
+        let analysis = TypedVirtualLoweringAnalysis {
+            block_in: HashMap::new(),
+            body_before_instr: HashMap::new(),
+            block_before_term: HashMap::new(),
+            block_out: HashMap::from([(jump_from, jump_state), (branch_from, branch_state)]),
+            edge_out: HashMap::new(),
+        };
+
+        assert_eq!(
+            split_typed_virtual_field_block_param_edges(
+                function,
+                &analysis,
+                &HashSet::from([object]),
+            ),
+            1,
+            "branch-table joins needing field phis should be split through jump trampolines"
+        );
+        let BlockTerm::BranchTable(branch) = &function
+            .blocks
+            .iter()
+            .find(|block| block.label == branch_from)
+            .expect("branch block should remain present")
+            .term
+        else {
+            panic!("branch source should stay a branch table");
+        };
+        let trampoline = branch.default_label;
+        assert_ne!(trampoline, target);
+        assert!(branch.targets.iter().all(|label| *label == trampoline));
+        assert!(
+            function.blocks.iter().any(|block| {
+                block.label == trampoline
+                    && matches!(
+                        &block.term,
+                        BlockTerm::Jump(edge) if edge.target == target && edge.args.is_empty()
+                    )
+            }),
+            "the split edge should forward through a plain jump block"
+        );
+        let predecessors = typed_scalar_block_predecessor_edges(function);
+        assert!(
+            predecessors
+                .get(&target)
+                .expect("target should retain predecessors")
+                .iter()
+                .all(|edge| edge.explicit_args.is_some()),
+            "target predecessors should become argument-capable jump edges"
+        );
     }
 }
 

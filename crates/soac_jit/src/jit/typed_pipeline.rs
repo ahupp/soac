@@ -7,6 +7,7 @@ use super::{SpecializationProfile, annotate_typed_profiled_cold_blocks};
 use crate::module_constants::ModuleCodegenConstants;
 use crate::module_type::SharedModuleState;
 use soac_config::SoacEnvConfig;
+use soac_config::SpecializationMode;
 use soac_core::block_py::{
     BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, CallableScopeKind, ChildVisitable,
     ConstantExpr, HasSemanticInstrId, InstrId, RuntimeFunctionId, RuntimeName, Visit, VisitMut,
@@ -14,7 +15,7 @@ use soac_core::block_py::{
 use soac_ir_blockpy::{BlockPyModuleShape, constructor_init_function_id_for_entry_function};
 use soac_ir_typed::emit_v3::MechanicalRegionEmission;
 use soac_ir_typed::plan_v3::{
-    CallBodyKind, DirectCallCallee, ExactListItemAccessKind,
+    CallBodyKind, CallBodyPlan, Cost, DirectCallCallee, ExactListItemAccessKind,
     IndexedFieldAccessKind as PlanV3IndexedFieldAccessKind, IndexedFieldReceiverSource,
     IndexedGlobalAccessKind as PlanV3IndexedGlobalAccessKind, RegionInputSource, RegionPlan,
     RegionSource,
@@ -64,6 +65,15 @@ const MAX_TYPED_ALIAS_CLONED_BLOCKS_PER_FUNCTION: usize = 256;
 const MAX_TYPED_INLINE_CLEANUP_CLONED_BLOCKS_PER_FUNCTION: usize = 256;
 
 type TypedInlineTargets = HashMap<InstrId, Vec<(RuntimeFunctionId, TypedDirectCallArgPlan)>>;
+type StaticTypedDirectCalls =
+    HashMap<RuntimeFunctionId, HashMap<InstrId, Vec<ResolvedV3DirectCallPlan>>>;
+
+#[derive(Clone)]
+struct StaticRuntimeDirectCallTarget {
+    function: BlockPyFunction<BlockPyModuleShape>,
+}
+
+type StaticRuntimeDirectCallTargets = HashMap<RuntimeName, StaticRuntimeDirectCallTarget>;
 
 fn typed_expr_is_runtime_name_load(
     expr: &InstrTyped,
@@ -116,6 +126,229 @@ fn static_runtime_range_call_ids(
     };
     collector.visit_fn(function);
     collector.instr_ids
+}
+
+fn static_runtime_constructor_init_qualname(runtime_name: RuntimeName) -> Option<&'static str> {
+    match runtime_name {
+        RuntimeName::Range => Some("range.__init__"),
+        _ => None,
+    }
+}
+
+fn static_runtime_direct_call_targets(
+    shared_state: &SharedModuleState,
+    compile_session: Option<&crate::session::CompileSession>,
+) -> Result<StaticRuntimeDirectCallTargets, String> {
+    let runtime_state_owner;
+    let runtime_state = if shared_state.module_name == "soac.runtime" {
+        shared_state
+    } else {
+        let Some(compile_session) = compile_session else {
+            return Ok(HashMap::new());
+        };
+        let runtime_states = compile_session
+            .shared_module_states_snapshot()?
+            .into_iter()
+            .filter(|state| state.module_name == "soac.runtime")
+            .collect::<Vec<_>>();
+        let [runtime_state] = runtime_states.as_slice() else {
+            return Ok(HashMap::new());
+        };
+        runtime_state_owner = Arc::clone(runtime_state);
+        runtime_state_owner.as_ref()
+    };
+
+    let mut targets = HashMap::new();
+    for runtime_name in RuntimeName::ALL.iter().copied() {
+        let Some(init_qualname) = static_runtime_constructor_init_qualname(runtime_name) else {
+            continue;
+        };
+        let Some(init_function) = runtime_state
+            .lowered_module
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == init_qualname)
+        else {
+            continue;
+        };
+        let Some(entry_function_id) = soac_ir_blockpy::constructor_entry_function_id_for_init(
+            &runtime_state.lowered_module,
+            init_function.function_id,
+        ) else {
+            continue;
+        };
+        let Some(entry_function) = runtime_state.lookup_function(entry_function_id).cloned() else {
+            continue;
+        };
+        targets.insert(
+            runtime_name,
+            StaticRuntimeDirectCallTarget {
+                function: entry_function,
+            },
+        );
+    }
+    Ok(targets)
+}
+
+fn static_runtime_inline_call_body() -> CallBodyPlan {
+    CallBodyPlan {
+        kind: CallBodyKind::Inline,
+        cost: Cost {
+            hot_path: 2,
+            miss_path: 2,
+            deopt: 0,
+            materialization: 0,
+            ownership: 0,
+            code_size: 6,
+            compile: 4,
+        },
+        inline_target: None,
+        reason: "statically known runtime-name call uses typed inline lowering".to_string(),
+    }
+}
+
+fn typed_direct_call_arg_plan_from_direct_plan(
+    plan: super::direct_function::DirectCallArgPlan,
+) -> TypedDirectCallArgPlan {
+    TypedDirectCallArgPlan {
+        sources: plan
+            .sources
+            .into_iter()
+            .map(|source| match source {
+                super::direct_function::DirectCallArgSource::Provided(index) => {
+                    soac_ir_typed::TypedDirectCallArgSource::Provided(index)
+                }
+                super::direct_function::DirectCallArgSource::PackedRest { start } => {
+                    soac_ir_typed::TypedDirectCallArgSource::PackedRest { start }
+                }
+                super::direct_function::DirectCallArgSource::DefaultSentinel => {
+                    soac_ir_typed::TypedDirectCallArgSource::DefaultSentinel
+                }
+            })
+            .collect(),
+    }
+}
+
+fn static_runtime_direct_call_plans_for_function(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    module_constants: &[ConstantExpr],
+    targets: &StaticRuntimeDirectCallTargets,
+) -> HashMap<InstrId, Vec<ResolvedV3DirectCallPlan>> {
+    struct Collector<'a> {
+        module_constants: &'a [ConstantExpr],
+        targets: &'a StaticRuntimeDirectCallTargets,
+        direct_calls: HashMap<InstrId, Vec<ResolvedV3DirectCallPlan>>,
+    }
+
+    impl Visit<InstrTyped> for Collector<'_> {
+        fn visit_instr(&mut self, expr: &InstrTyped) {
+            if let InstrTyped::CallTyped(call) = expr
+                && let Some(instr_id) = call.try_semantic_instr_id()
+            {
+                let runtime_name = self.targets.keys().copied().find(|runtime_name| {
+                    typed_expr_is_runtime_name_load(
+                        call.func.as_ref(),
+                        *runtime_name,
+                        self.module_constants,
+                    )
+                });
+                if let Some(runtime_name) = runtime_name {
+                    let target = self
+                        .targets
+                        .get(&runtime_name)
+                        .expect("selected static runtime target should exist");
+                    let has_starred_arguments = call.args.iter().any(|arg| {
+                        matches!(arg, soac_core::block_py::CallArgPositional::Starred(_))
+                    });
+                    let explicit_positional_arg_count = call
+                        .args
+                        .iter()
+                        .filter(|arg| {
+                            matches!(arg, soac_core::block_py::CallArgPositional::Positional(_))
+                        })
+                        .count();
+                    let implicit_positional_arg_count = usize::from(
+                        soac_ir_blockpy::is_constructor_entry_function(&target.function),
+                    );
+                    if let Ok(arg_plan) = super::direct_function::plan_direct_call_args_for_target(
+                        &target.function,
+                        explicit_positional_arg_count,
+                        implicit_positional_arg_count,
+                        has_starred_arguments,
+                        !call.keywords.is_empty(),
+                    ) {
+                        let arg_plan = typed_direct_call_arg_plan_from_direct_plan(arg_plan);
+                        if !(soac_ir_blockpy::is_constructor_entry_function(&target.function)
+                            && arg_plan.sources.iter().any(|source| {
+                                matches!(
+                                    source,
+                                    soac_ir_typed::TypedDirectCallArgSource::DefaultSentinel
+                                )
+                            }))
+                        {
+                            self.direct_calls.entry(instr_id).or_default().push(
+                                ResolvedV3DirectCallPlan {
+                                    source: instr_id,
+                                    target: target.function.function_id,
+                                    callee: DirectCallCallee::Function,
+                                    arg_plan,
+                                    body: static_runtime_inline_call_body(),
+                                    reason: format!(
+                                        "runtime name {} resolves to a static target",
+                                        runtime_name.name()
+                                    ),
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    let mut collector = Collector {
+        module_constants,
+        targets,
+        direct_calls: HashMap::new(),
+    };
+    collector.visit_fn(function);
+    collector.direct_calls
+}
+
+fn static_runtime_direct_calls_for_module(
+    module: &BlockPyModule<TypedBlockPyModuleShape>,
+    targets: &StaticRuntimeDirectCallTargets,
+) -> StaticTypedDirectCalls {
+    module
+        .callable_defs
+        .iter()
+        .filter_map(|function| {
+            let direct_calls = static_runtime_direct_call_plans_for_function(
+                function,
+                &module.module_constants,
+                targets,
+            );
+            (!direct_calls.is_empty()).then_some((function.function_id, direct_calls))
+        })
+        .collect()
+}
+
+fn merge_resolved_direct_call_plans(
+    direct_calls: &mut HashMap<InstrId, Vec<ResolvedV3DirectCallPlan>>,
+    extra_direct_calls: Option<&HashMap<InstrId, Vec<ResolvedV3DirectCallPlan>>>,
+) {
+    let Some(extra_direct_calls) = extra_direct_calls else {
+        return;
+    };
+    for (source, plans) in extra_direct_calls {
+        let entry = direct_calls.entry(*source).or_default();
+        for plan in plans {
+            if !entry.iter().any(|existing| existing.target == plan.target) {
+                entry.push(plan.clone());
+            }
+        }
+    }
 }
 
 fn method_guards_for_v3_direct_call(
@@ -225,11 +458,13 @@ fn insert_runtime_protocol_method_guards(
     Ok(())
 }
 
-fn typed_call_emission_plans_for_profile_function(
+fn typed_call_emission_plans_for_function(
     profile: &SpecializationProfile<'_>,
     function_id: RuntimeFunctionId,
+    static_direct_calls: Option<&HashMap<InstrId, Vec<ResolvedV3DirectCallPlan>>>,
 ) -> Result<TypedCallEmissionPlans, String> {
-    let opt_v3_direct_calls_by_instr = profile.typed_call_emission_direct_calls(function_id);
+    let mut opt_v3_direct_calls_by_instr = profile.typed_call_emission_direct_calls(function_id);
+    merge_resolved_direct_call_plans(&mut opt_v3_direct_calls_by_instr, static_direct_calls);
     let mut ordinary_direct_calls_by_instr =
         HashMap::<InstrId, Vec<ResolvedV3DirectCallPlan>>::new();
     let mut method_guards_by_instr =
@@ -296,8 +531,16 @@ pub(super) fn apply_profile_call_emission_plans_to_typed_function(
     function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
     profile: &SpecializationProfile<'_>,
 ) -> Result<(), String> {
+    apply_call_emission_plans_to_typed_function(function, profile, None)
+}
+
+fn apply_call_emission_plans_to_typed_function(
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+    profile: &SpecializationProfile<'_>,
+    static_direct_calls: Option<&HashMap<InstrId, Vec<ResolvedV3DirectCallPlan>>>,
+) -> Result<(), String> {
     let call_emissions =
-        typed_call_emission_plans_for_profile_function(profile, function.function_id)?;
+        typed_call_emission_plans_for_function(profile, function.function_id, static_direct_calls)?;
     lower_typed_function_call_emission_plans(function, &call_emissions)?;
     Ok(())
 }
@@ -1563,9 +1806,24 @@ fn merge_typed_inline_targets(targets: &mut TypedInlineTargets, incoming: &Typed
 fn typed_inline_targets_for_function(
     function_id: RuntimeFunctionId,
     profile: &SpecializationProfile<'_>,
+    static_direct_calls: &StaticTypedDirectCalls,
     remapped_inline_targets: &HashMap<RuntimeFunctionId, TypedInlineTargets>,
 ) -> TypedInlineTargets {
     let mut targets = profile.typed_inline_direct_calls(function_id);
+    if let Some(static_calls) = static_direct_calls.get(&function_id) {
+        let static_targets = static_calls
+            .iter()
+            .filter_map(|(source, plans)| {
+                let plans = plans
+                    .iter()
+                    .filter(|plan| plan.body.kind == CallBodyKind::Inline)
+                    .map(|plan| (plan.target, plan.arg_plan.clone()))
+                    .collect::<Vec<_>>();
+                (!plans.is_empty()).then_some((*source, plans))
+            })
+            .collect();
+        merge_typed_inline_targets(&mut targets, &static_targets);
+    }
     if let Some(remapped) = remapped_inline_targets.get(&function_id) {
         merge_typed_inline_targets(&mut targets, remapped);
     }
@@ -1576,14 +1834,20 @@ fn remap_inlined_direct_call_targets(
     caller_function_id: RuntimeFunctionId,
     mappings: &[TypedInlineInstrIdMapping],
     profile: &SpecializationProfile<'_>,
+    static_direct_calls: &StaticTypedDirectCalls,
     remapped_inline_targets: &mut HashMap<RuntimeFunctionId, TypedInlineTargets>,
 ) -> usize {
     let mut targets_by_callee = HashMap::<RuntimeFunctionId, TypedInlineTargets>::new();
     let mut count = 0;
     for mapping in mappings {
-        let targets = targets_by_callee
-            .entry(mapping.callee)
-            .or_insert_with(|| profile.typed_inline_direct_calls(mapping.callee));
+        let targets = targets_by_callee.entry(mapping.callee).or_insert_with(|| {
+            typed_inline_targets_for_function(
+                mapping.callee,
+                profile,
+                static_direct_calls,
+                remapped_inline_targets,
+            )
+        });
         let Some(plans) = targets.get(&mapping.callee_instr_id) else {
             continue;
         };
@@ -1606,10 +1870,15 @@ fn remap_cloned_direct_call_targets(
     caller_function_id: RuntimeFunctionId,
     mappings: &[TypedInlineInstrIdMapping],
     profile: &SpecializationProfile<'_>,
+    static_direct_calls: &StaticTypedDirectCalls,
     remapped_inline_targets: &mut HashMap<RuntimeFunctionId, TypedInlineTargets>,
 ) -> usize {
-    let source_targets =
-        typed_inline_targets_for_function(caller_function_id, profile, remapped_inline_targets);
+    let source_targets = typed_inline_targets_for_function(
+        caller_function_id,
+        profile,
+        static_direct_calls,
+        remapped_inline_targets,
+    );
     let mut count = 0;
     for mapping in mappings {
         if mapping.callee != caller_function_id {
@@ -1875,6 +2144,7 @@ fn remap_cloned_profile_rewrites(
     caller_function_id: RuntimeFunctionId,
     mappings: &[TypedInlineInstrIdMapping],
     profile: &SpecializationProfile<'_>,
+    static_direct_calls: &StaticTypedDirectCalls,
     remapped_inline_targets: &mut HashMap<RuntimeFunctionId, TypedInlineTargets>,
     remapped_indexed_fields: &mut HashMap<
         RuntimeFunctionId,
@@ -1904,6 +2174,7 @@ fn remap_cloned_profile_rewrites(
             caller_function_id,
             mappings,
             profile,
+            static_direct_calls,
             remapped_inline_targets,
         );
         count += remap_cloned_indexed_field_accesses(
@@ -2044,7 +2315,13 @@ pub(super) fn optimize_blockpy(
     profile: Option<&SpecializationProfile<'_>>,
     env_config: &SoacEnvConfig,
 ) -> Result<Arc<JitModulePlan>, String> {
-    optimize_blockpy_with_external_inline_callees(module, profile, env_config, HashMap::new())
+    optimize_blockpy_with_external_inline_callees(
+        module,
+        profile,
+        env_config,
+        HashMap::new(),
+        HashMap::new(),
+    )
 }
 
 pub(super) fn optimize_blockpy_for_shared_state(
@@ -2053,13 +2330,26 @@ pub(super) fn optimize_blockpy_for_shared_state(
     profile: Option<&SpecializationProfile<'_>>,
     env_config: &SoacEnvConfig,
 ) -> Result<Arc<JitModulePlan>, String> {
-    let external_callees =
-        external_typed_inline_callees(shared_state, compile_session, profile, env_config)?;
+    // Keep profile mode on the original call graph so nested runtime protocol
+    // sites still collect evidence before apply/verify rewrites inline them.
+    let static_targets = if env_config.specialization_mode() == Some(SpecializationMode::Profile) {
+        HashMap::new()
+    } else {
+        static_runtime_direct_call_targets(shared_state, compile_session)?
+    };
+    let external_callees = external_typed_inline_callees(
+        shared_state,
+        compile_session,
+        profile,
+        env_config,
+        &static_targets,
+    )?;
     optimize_blockpy_with_external_inline_callees(
         &shared_state.lowered_module,
         profile,
         env_config,
         external_callees,
+        static_targets,
     )
 }
 
@@ -2068,6 +2358,7 @@ fn optimize_blockpy_with_external_inline_callees(
     profile: Option<&SpecializationProfile<'_>>,
     env_config: &SoacEnvConfig,
     external_callees: HashMap<RuntimeFunctionId, TypedExternalInlineCallee>,
+    static_targets: StaticRuntimeDirectCallTargets,
 ) -> Result<Arc<JitModulePlan>, String> {
     let inline_plan = profile.map(|_| plan_module_inlining(&summarize_module_escapes(module)));
     let prepared = soac_driver::typed_runtime::prepare_typed_v3_runtime_module_with_rewrites(
@@ -2075,11 +2366,14 @@ fn optimize_blockpy_with_external_inline_callees(
         env_config,
         |typed_module, _value_facts| {
             if let Some(profile) = profile {
+                let static_direct_calls =
+                    static_runtime_direct_calls_for_module(typed_module, &static_targets);
                 apply_typed_v3_module_rewrites(
                     typed_module,
                     profile,
                     inline_plan.as_ref(),
                     &external_callees,
+                    &static_direct_calls,
                 )?;
             }
             Ok(())
@@ -2096,6 +2390,7 @@ fn external_typed_inline_callees(
     compile_session: Option<&crate::session::CompileSession>,
     profile: Option<&SpecializationProfile<'_>>,
     env_config: &SoacEnvConfig,
+    static_targets: &StaticRuntimeDirectCallTargets,
 ) -> Result<HashMap<RuntimeFunctionId, TypedExternalInlineCallee>, String> {
     let (Some(compile_session), Some(profile)) = (compile_session, profile) else {
         return Ok(HashMap::new());
@@ -2109,6 +2404,12 @@ fn external_typed_inline_callees(
         .map(|plan| plan.target)
         .filter(|function_id| function_id.runtime_module_id().as_u32() != current_module_id)
         .collect::<HashSet<_>>();
+    targets.extend(
+        static_targets
+            .values()
+            .map(|target| target.function.function_id)
+            .filter(|function_id| function_id.runtime_module_id().as_u32() != current_module_id),
+    );
     if targets.is_empty() {
         return Ok(HashMap::new());
     }
@@ -2174,6 +2475,7 @@ fn apply_typed_v3_module_rewrites(
     profile: &SpecializationProfile<'_>,
     inline_plan: Option<&soac_opt::passes::InlinePlanModule>,
     external_callees: &HashMap<RuntimeFunctionId, TypedExternalInlineCallee>,
+    static_direct_calls: &StaticTypedDirectCalls,
 ) -> Result<(), String> {
     let mut static_runtime_range_calls = module
         .callable_defs
@@ -2186,7 +2488,11 @@ fn apply_typed_v3_module_rewrites(
         })
         .collect::<HashMap<_, _>>();
     for function in &mut module.callable_defs {
-        apply_profile_call_emission_plans_to_typed_function(function, profile)?;
+        apply_call_emission_plans_to_typed_function(
+            function,
+            profile,
+            static_direct_calls.get(&function.function_id),
+        )?;
     }
 
     let callee_module = module.clone();
@@ -2214,6 +2520,7 @@ fn apply_typed_v3_module_rewrites(
             let inline_targets = typed_inline_targets_for_function(
                 function.function_id,
                 profile,
+                static_direct_calls,
                 &remapped_inline_targets,
             );
             if inline_targets.is_empty() {
@@ -2305,6 +2612,7 @@ fn apply_typed_v3_module_rewrites(
                     caller_function_id,
                     &stats.instr_id_mappings,
                     profile,
+                    static_direct_calls,
                     &mut remapped_inline_targets,
                 );
                 remap_inlined_indexed_field_accesses(
@@ -2334,6 +2642,7 @@ fn apply_typed_v3_module_rewrites(
                     caller_function_id,
                     &init_body_stats.inline_stats.instr_id_mappings,
                     profile,
+                    static_direct_calls,
                     &mut remapped_inline_targets,
                 );
                 remap_inlined_indexed_field_accesses(
@@ -2409,6 +2718,7 @@ fn apply_typed_v3_module_rewrites(
                     caller_function_id,
                     &cloned_instr_id_mappings,
                     profile,
+                    static_direct_calls,
                     &mut remapped_inline_targets,
                     &mut remapped_indexed_fields,
                     &mut remapped_indexed_field_counter_sources,
@@ -2517,6 +2827,7 @@ fn apply_typed_v3_module_rewrites(
 mod tests {
     use super::*;
     use soac_core::block_py::{LocalFunctionId, RuntimeFunctionId, RuntimeModuleId};
+    use soac_ir_typed::lower_blockpy_module_to_typed;
     use soac_opt::passes::{
         TypedConstructorFieldBindings, TypedInlineInstanceSource, TypedInlineRewriteStats,
     };
@@ -2561,5 +2872,59 @@ mod tests {
             trusted_constructor_sources_from_inline_stats(&stats, &trusted_call_sources, &bindings,),
             HashSet::from([InstrId::new(8)]),
         );
+    }
+
+    #[test]
+    fn static_runtime_range_calls_build_inline_constructor_plans() {
+        let caller_lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            "def caller(i):\n    value = range(i)\n    return value\n",
+        )
+        .expect("caller source should lower");
+        let caller_typed = lower_blockpy_module_to_typed(caller_lowered.blockpy_module);
+        let caller = caller_typed
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "caller")
+            .expect("typed caller should exist");
+
+        let runtime_lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            "class range:\n    def __init__(self, *args):\n        self.args = args\n",
+        )
+        .expect("runtime source should lower");
+        let init_function = runtime_lowered
+            .blockpy_module
+            .callable_defs
+            .iter()
+            .find(|function| function.names.qualname == "range.__init__")
+            .expect("runtime module should contain range.__init__");
+        let entry_function_id = soac_ir_blockpy::constructor_entry_function_id_for_init(
+            &runtime_lowered.blockpy_module,
+            init_function.function_id,
+        )
+        .expect("range init should have a constructor entry");
+        let entry_function = runtime_lowered
+            .blockpy_module
+            .callable_defs
+            .iter()
+            .find(|function| function.function_id == entry_function_id)
+            .cloned()
+            .expect("runtime module should contain the constructor entry");
+        let plans = static_runtime_direct_call_plans_for_function(
+            caller,
+            &caller_typed.module_constants,
+            &HashMap::from([(
+                RuntimeName::Range,
+                StaticRuntimeDirectCallTarget {
+                    function: entry_function,
+                },
+            )]),
+        );
+        let plans = plans
+            .values()
+            .next()
+            .expect("runtime range call should receive a static direct-call plan");
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].target, entry_function_id);
+        assert_eq!(plans[0].body.kind, CallBodyKind::Inline);
     }
 }
