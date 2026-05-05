@@ -2021,7 +2021,7 @@ fn find_typed_constructor_hot_continuation_split_candidate(
             block,
             module_constants,
         )?;
-        let reachable = typed_hot_reachable_block_labels(function, &labels, original_entry)?;
+        let reachable = typed_hot_clone_block_labels(function, &labels, original_entry)?;
         if reachable.contains(&block.label)
             || reachable.len() > MAX_TYPED_HOT_CONTINUATION_CLONE_BLOCKS
             || !typed_reachable_subgraph_has_external_predecessor(
@@ -2048,7 +2048,7 @@ fn find_typed_alias_hot_continuation_split_candidate(
     function.blocks.iter().find_map(|block| {
         let original_entry =
             typed_alias_hot_continuation_entry(function, &labels, &predecessors, block)?;
-        let reachable = typed_hot_reachable_block_labels(function, &labels, original_entry)?;
+        let reachable = typed_hot_clone_block_labels(function, &labels, original_entry)?;
         if reachable.contains(&block.label)
             || reachable.len() > MAX_TYPED_HOT_CONTINUATION_CLONE_BLOCKS
             || !typed_reachable_subgraph_has_external_predecessor(
@@ -2079,7 +2079,7 @@ fn find_typed_inline_cleanup_hot_continuation_split_candidate(
             return None;
         }
         let original_entry = typed_inline_cleanup_hot_continuation_entry(&hot_path_labels, block)?;
-        let reachable = typed_hot_reachable_block_labels(function, &labels, original_entry)?;
+        let reachable = typed_hot_clone_block_labels(function, &labels, original_entry)?;
         if reachable.contains(&block.label)
             || reachable.len() > MAX_TYPED_HOT_CONTINUATION_CLONE_BLOCKS
             || !typed_reachable_subgraph_has_external_predecessor(
@@ -2282,6 +2282,88 @@ fn typed_hot_reachable_block_labels(
     let mut seen = HashSet::new();
     collect_typed_hot_reachable_block_labels(function, labels, entry, &mut seen)?;
     Some(seen)
+}
+
+fn typed_hot_clone_block_labels(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    labels: &HashMap<BlockLabel, usize>,
+    entry: BlockLabel,
+) -> Option<HashSet<BlockLabel>> {
+    let reachable = typed_hot_reachable_block_labels(function, labels, entry)?;
+    let predecessors = typed_hot_block_predecessors(function);
+    let mut region = HashSet::new();
+    let mut pending = vec![entry];
+    while let Some(label) = pending.pop() {
+        if !region.insert(label) {
+            continue;
+        }
+        if let Some(component) =
+            typed_hot_cyclic_component(function, labels, &predecessors, &reachable, label)?
+        {
+            region.extend(component);
+            continue;
+        }
+        pending.extend(
+            typed_hot_normal_successors(block_by_label(function, labels, label)?)
+                .into_iter()
+                .filter(|successor| reachable.contains(successor)),
+        );
+    }
+    Some(region)
+}
+
+fn typed_hot_block_predecessors(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+) -> HashMap<BlockLabel, HashSet<BlockLabel>> {
+    let mut predecessors = HashMap::<BlockLabel, HashSet<BlockLabel>>::new();
+    for block in &function.blocks {
+        for successor in typed_hot_normal_successors(block) {
+            predecessors
+                .entry(successor)
+                .or_default()
+                .insert(block.label);
+        }
+    }
+    predecessors
+}
+
+fn typed_hot_cyclic_component(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    labels: &HashMap<BlockLabel, usize>,
+    predecessors: &HashMap<BlockLabel, HashSet<BlockLabel>>,
+    reachable: &HashSet<BlockLabel>,
+    entry: BlockLabel,
+) -> Option<Option<HashSet<BlockLabel>>> {
+    let mut forward = HashSet::new();
+    collect_typed_hot_reachable_block_labels(function, labels, entry, &mut forward)?;
+    forward.retain(|label| reachable.contains(label));
+
+    let mut backward = HashSet::new();
+    let mut pending = vec![entry];
+    while let Some(label) = pending.pop() {
+        if !backward.insert(label) {
+            continue;
+        }
+        pending.extend(
+            predecessors
+                .get(&label)
+                .into_iter()
+                .flat_map(|predecessors| predecessors.iter().copied())
+                .filter(|predecessor| reachable.contains(predecessor)),
+        );
+    }
+
+    let component = forward
+        .intersection(&backward)
+        .copied()
+        .collect::<HashSet<_>>();
+    let self_loop =
+        typed_hot_normal_successors(block_by_label(function, labels, entry)?).contains(&entry);
+    if component.len() > 1 || self_loop {
+        Some(Some(component))
+    } else {
+        Some(None)
+    }
 }
 
 fn collect_typed_hot_reachable_block_labels(
@@ -6886,6 +6968,78 @@ def caller(value):\n    obj = Box(value)\n    if value:\n        return obj.valu
             0,
             "a hot constructor path whose successor is already private should not be cloned again"
         );
+    }
+
+    #[test]
+    fn typed_constructor_hot_continuation_split_clones_only_hot_loop_region() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            "class Box:\n    def __init__(self, value):\n        self.value = value\n\n\
+def caller(value):\n    obj = Box(value)\n    while value:\n        value = value - 1\n    return obj.value\n",
+        )
+        .expect("source should lower");
+        let init_id = blockpy_function_id_by_qualname(&lowered.blockpy_module, "Box.__init__");
+        let constructor_entry_id =
+            constructor_entry_function_id_for_init(&lowered.blockpy_module, init_id)
+                .expect("class lowering should add a constructor entry");
+        let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
+        let module_constants = typed.module_constants.clone();
+        let call_id;
+        {
+            let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+            call_id = first_typed_call_instr_id(caller);
+            replace_first_typed_call_access(
+                caller,
+                TypedCallAccessPlan::GuardedCallable {
+                    function_guards: vec![TypedDirectFunctionCallGuard {
+                        function_id: constructor_entry_id,
+                        arg_plan: TypedDirectCallArgPlan {
+                            sources: vec![
+                                TypedDirectCallArgSource::Provided(0),
+                                TypedDirectCallArgSource::Provided(1),
+                            ],
+                        },
+                    }],
+                },
+            );
+            lower_typed_function_call_access_plan_instrs(caller);
+        }
+
+        let callee_module = typed.clone();
+        let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+        let inline_stats = inline_typed_function_direct_call_stores(
+            caller,
+            &callee_module,
+            &HashMap::new(),
+            &HashMap::from([(
+                call_id,
+                vec![(
+                    constructor_entry_id,
+                    TypedDirectCallArgPlan {
+                        sources: vec![
+                            TypedDirectCallArgSource::Provided(0),
+                            TypedDirectCallArgSource::Provided(1),
+                        ],
+                    },
+                )],
+            )]),
+        );
+        assert_eq!(inline_stats.rewritten_stores, 1);
+
+        let labels = typed_block_indices_by_label(caller);
+        let candidate =
+            find_typed_constructor_hot_continuation_split_candidate(caller, &module_constants)
+                .expect("constructor hot path should need continuation splitting");
+        let full_reachable =
+            typed_hot_reachable_block_labels(caller, &labels, candidate.original_entry)
+                .expect("constructor continuation should be hot-reachable");
+        assert!(
+            candidate.reachable.len() < full_reachable.len(),
+            "loop splitting should clone only the cyclic hot region, not the full hot suffix"
+        );
+
+        let split_stats = split_typed_constructor_hot_continuations(caller, &module_constants);
+        assert_eq!(split_stats.clones.len(), 1);
+        assert_eq!(split_stats.cloned_blocks, candidate.reachable.len());
     }
 
     #[test]
