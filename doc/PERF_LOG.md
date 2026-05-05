@@ -1384,3 +1384,23 @@ benchmarked throughput delta, and the headline pre/post numbers.
   `runtime_incref=6957036` to `4642014`; remaining hot refcount sites are still
   dominated by real stack exit sweeps and boxed integer-result overwrites such
   as `IntLoc3`, `IntLoc1`, and `IntLoc2`.
+
+## 2026-05-05 - Preserve constructor scalar state across deopting guards
+
+- jj change id: `tplpstrplxvztmuulvyrxxomxrxxyyol`
+- summary: typed constructor field scalarization now treats the fallback edge
+  of a `guard_miss_deopt` direct-call guard as non-continuing, so hot
+  constructor field state survives across the guarded call shape without
+  cloning more of the CFG.
+- throughput: `+1.96%` specialized pystone median versus the previous
+  same-stack smoke run; total pystone JIT code size `-1.95%`
+- pre-change benchmark: `work/bench/tplpstrplxvz_df0a5747f616`
+  - apply, refcounts enabled, median: `392575 loops/s`
+  - no-refcount diagnostic median: n/a
+  - total pystone code size: `447523 bytes`, `24590` machine blocks
+  - core pystone code size: `435267 bytes`
+- post-change benchmark: `work/bench/tplpstrplxvz_da785f209429`
+  - apply, refcounts enabled, median: `400252 loops/s`
+  - no-refcount diagnostic median: n/a
+  - total pystone code size: `438779 bytes`, `24590` machine blocks
+  - core pystone code size: `426523 bytes`

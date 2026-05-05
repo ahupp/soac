@@ -1,8 +1,8 @@
 use crate::passes::{BlockPyModuleShape, InstrBlockPy, try_allocate_codegen_stack_temp};
 use soac_core::block_py::{
-    Block, BlockArg, BlockEdge, BlockLabel, BlockPyFunction, BlockTerm, CallArgPositional,
-    CallDirect, ConstantExpr, HasMeta, LocalLocation, MapInstr, Mappable, NameLocation, ParamKind,
-    ResolvedName, RuntimeName, Store, TryMapInstr, TryMapTerm, WithMeta,
+    Block, BlockArg, BlockEdge, BlockLabel, BlockParam, BlockPyFunction, BlockTerm,
+    CallArgPositional, CallDirect, ConstantExpr, HasMeta, LocalLocation, MapInstr, Mappable,
+    NameLocation, ParamKind, ResolvedName, RuntimeName, Store, TryMapInstr, TryMapTerm, WithMeta,
 };
 use std::collections::HashMap;
 
@@ -46,6 +46,7 @@ pub enum InlineUnsupportedReason {
     MissingCalleeConstant(u32),
     TooManyCallerConstants,
     CrossModuleGlobalName(String),
+    UnknownBlockName(String),
 }
 
 pub fn bind_simple_direct_call_inline_args(
@@ -317,18 +318,6 @@ fn build_multi_block_inline_fragment_to_target_impl(
             max: MAX_INLINE_DIRECT_CALL_BLOCKS,
         });
     }
-    for block in &callee.blocks {
-        if !block.params.is_empty() {
-            return Err(InlineUnsupportedReason::BlockParams);
-        }
-        if block.exc_edge.is_some() {
-            return Err(InlineUnsupportedReason::ExceptionEdge);
-        }
-        if term_has_jump_args(&block.term) {
-            return Err(InlineUnsupportedReason::JumpArgs);
-        }
-    }
-
     let mut locals = HashMap::new();
     for (slot, _name) in callee_layout.stack_slots().iter().enumerate() {
         let location =
@@ -346,7 +335,8 @@ fn build_multi_block_inline_fragment_to_target_impl(
         .map(|block| (block.label, caller.name_gen.next_block_name()))
         .collect::<HashMap<_, _>>();
     let entry_label = remapped_label(&label_map, callee.blocks[0].label)?;
-    let mut remapper = InlineLocalRemapper::new(&locals, value_bindings, &mut constant_scope);
+    let mut remapper =
+        InlineLocalRemapper::new(callee_layout, &locals, value_bindings, &mut constant_scope);
     let mut blocks = Vec::with_capacity(callee.blocks.len());
     for callee_block in &callee.blocks {
         let label = remapped_label(&label_map, callee_block.label)?;
@@ -370,9 +360,24 @@ fn build_multi_block_inline_fragment_to_target_impl(
                 );
                 BlockTerm::Jump(BlockEdge::new(continuation))
             }
-            term => remap_inline_term_labels(remapper.try_map_term(term.clone())?, &label_map)?,
+            term => remap_inline_term_labels(
+                remapper.try_map_term(term.clone())?,
+                &label_map,
+                &mut remapper,
+            )?,
         };
-        blocks.push(Block::new(label, body, term, Vec::new(), None));
+        let params = callee_block
+            .params
+            .iter()
+            .cloned()
+            .map(|param| remapper.try_map_block_param(param))
+            .collect::<Result<Vec<_>, _>>()?;
+        let exc_edge = callee_block
+            .exc_edge
+            .clone()
+            .map(|edge| remap_inline_edge(edge, &label_map, &mut remapper))
+            .transpose()?;
+        blocks.push(Block::new(label, body, term, params, exc_edge));
     }
 
     Ok(InlineFragment {
@@ -381,16 +386,6 @@ fn build_multi_block_inline_fragment_to_target_impl(
         locals,
         return_local: None,
     })
-}
-
-fn term_has_jump_args(term: &BlockTerm<InstrBlockPy>) -> bool {
-    match term {
-        BlockTerm::Jump(edge) => !edge.args.is_empty(),
-        BlockTerm::IfTerm(_)
-        | BlockTerm::BranchTable(_)
-        | BlockTerm::Raise(_)
-        | BlockTerm::Return(_) => false,
-    }
 }
 
 fn remapped_label(
@@ -406,11 +401,10 @@ fn remapped_label(
 fn remap_inline_term_labels(
     term: BlockTerm<InstrBlockPy>,
     label_map: &HashMap<BlockLabel, BlockLabel>,
+    remapper: &mut InlineLocalRemapper<'_, '_, '_, '_>,
 ) -> Result<BlockTerm<InstrBlockPy>, InlineUnsupportedReason> {
     Ok(match term {
-        BlockTerm::Jump(edge) => {
-            BlockTerm::Jump(BlockEdge::new(remapped_label(label_map, edge.target)?))
-        }
+        BlockTerm::Jump(edge) => BlockTerm::Jump(remap_inline_edge(edge, label_map, remapper)?),
         BlockTerm::IfTerm(mut term) => {
             term.then_label = remapped_label(label_map, term.then_label)?;
             term.else_label = remapped_label(label_map, term.else_label)?;
@@ -426,6 +420,20 @@ fn remap_inline_term_labels(
         BlockTerm::Raise(term) => BlockTerm::Raise(term),
         BlockTerm::Return(_) => return Err(InlineUnsupportedReason::NonReturnTerm),
     })
+}
+
+fn remap_inline_edge(
+    mut edge: BlockEdge,
+    label_map: &HashMap<BlockLabel, BlockLabel>,
+    remapper: &InlineLocalRemapper<'_, '_, '_, '_>,
+) -> Result<BlockEdge, InlineUnsupportedReason> {
+    edge.target = remapped_label(label_map, edge.target)?;
+    edge.args = edge
+        .args
+        .into_iter()
+        .map(|arg| remapper.try_map_block_arg(arg))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(edge)
 }
 
 fn build_single_block_inline_fragment_with_constant_scope(
@@ -484,7 +492,8 @@ fn build_single_block_inline_fragment_with_constant_scope(
         InlineReturnPlacement::StoreTo(target) => (target, None, Vec::new()),
     };
 
-    let mut remapper = InlineLocalRemapper::new(&locals, value_bindings, &mut constant_scope);
+    let mut remapper =
+        InlineLocalRemapper::new(callee_layout, &locals, value_bindings, &mut constant_scope);
     let mut body = callee_block
         .body
         .iter()
@@ -566,7 +575,18 @@ impl InlineLocal {
     }
 }
 
+fn inline_value_binding_name(
+    callee_location: LocalLocation,
+    value: &InstrBlockPy,
+) -> Result<&ResolvedName, InlineUnsupportedReason> {
+    let InstrBlockPy::Load(load) = value else {
+        return Err(InlineUnsupportedReason::RebindsBoundLocal(callee_location));
+    };
+    Ok(&load.name)
+}
+
 struct InlineLocalRemapper<'locals, 'bindings, 'scope, 'constants> {
+    callee_layout: &'locals soac_core::block_py::StorageLayout,
     locals: &'locals HashMap<LocalLocation, InlineLocal>,
     value_bindings: &'bindings InlineValueBindings,
     constant_scope: &'scope mut InlineConstantScope<'constants>,
@@ -576,15 +596,72 @@ impl<'locals, 'bindings, 'scope, 'constants>
     InlineLocalRemapper<'locals, 'bindings, 'scope, 'constants>
 {
     fn new(
+        callee_layout: &'locals soac_core::block_py::StorageLayout,
         locals: &'locals HashMap<LocalLocation, InlineLocal>,
         value_bindings: &'bindings InlineValueBindings,
         constant_scope: &'scope mut InlineConstantScope<'constants>,
     ) -> Self {
         Self {
+            callee_layout,
             locals,
             value_bindings,
             constant_scope,
         }
+    }
+
+    fn callee_local_location_by_name(&self, name: &str) -> Option<LocalLocation> {
+        self.callee_layout
+            .stack_slots()
+            .iter()
+            .position(|slot_name| slot_name == name)
+            .map(|slot| {
+                LocalLocation(
+                    u32::try_from(slot).expect("callee stack slot index should fit in u32"),
+                )
+            })
+    }
+
+    fn try_map_block_local_name(&self, name: String) -> Result<String, InlineUnsupportedReason> {
+        let Some(location) = self.callee_local_location_by_name(name.as_str()) else {
+            return Err(InlineUnsupportedReason::UnknownBlockName(name));
+        };
+        if let Some(value) = self.value_bindings.get(&location) {
+            let bound_name = inline_value_binding_name(location, value)?;
+            if bound_name.local_location().is_none() {
+                return Err(InlineUnsupportedReason::RebindsBoundLocal(location));
+            }
+            return Ok(bound_name.id.as_str().to_string());
+        }
+        let Some(fresh) = self.locals.get(&location) else {
+            return Err(InlineUnsupportedReason::MissingCalleeLocal(location));
+        };
+        Ok(fresh.name.clone())
+    }
+
+    fn try_map_block_param(
+        &self,
+        mut param: BlockParam,
+    ) -> Result<BlockParam, InlineUnsupportedReason> {
+        let Some(location) = self.callee_local_location_by_name(param.name.as_str()) else {
+            return Err(InlineUnsupportedReason::UnknownBlockName(param.name));
+        };
+        if self.value_bindings.contains_key(&location) {
+            return Err(InlineUnsupportedReason::RebindsBoundLocal(location));
+        }
+        let Some(fresh) = self.locals.get(&location) else {
+            return Err(InlineUnsupportedReason::MissingCalleeLocal(location));
+        };
+        param.name = fresh.name.clone();
+        Ok(param)
+    }
+
+    fn try_map_block_arg(&self, arg: BlockArg) -> Result<BlockArg, InlineUnsupportedReason> {
+        Ok(match arg {
+            BlockArg::Name(name) => BlockArg::Name(self.try_map_block_local_name(name)?),
+            BlockArg::None => BlockArg::None,
+            BlockArg::CurrentException => BlockArg::CurrentException,
+            BlockArg::AbruptKind(kind) => BlockArg::AbruptKind(kind),
+        })
     }
 }
 

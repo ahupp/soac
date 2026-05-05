@@ -1,15 +1,19 @@
-use crate::passes::{ConstructorFieldValue, InlinePlanModule, value_facts};
+use crate::passes::{
+    ConstructorFieldValue, InlinePlanModule, compute_typed_function_local_must_bound_ins,
+    value_facts,
+};
 #[allow(unused_imports)]
 use soac_core::block_py;
 #[allow(unused_imports)]
 use soac_core::block_py::{
-    Block, BlockArg, BlockEdge, BlockLabel, BlockParamRole, BlockPyFunction, BlockPyModule,
-    BlockTerm, Call, CallArgKeyword, CallArgPositional, CallDirect, CalleeFunctionId,
-    ChildVisitable, ConstantExpr, Del, HasMeta, HasSemanticInstrId, Instr, InstrId, InstrKey,
-    InstrWithConstantNone, Literal, Load, LocalLocation, MapInstr, Mappable, Meta, NameLike,
-    NameLocation, ParamKind, PrettyPrint, PrettyPrinter, ResolvedName, RuntimeFunctionId,
-    RuntimeName, SetAttr, Store, TermIf, TryMapInstr, TryMapModule, TryMapTerm, Tuple, Visit,
-    VisitMut, WithMeta,
+    BinOpKind, Block, BlockArg, BlockEdge, BlockLabel, BlockParam, BlockParamRole, BlockPyFunction,
+    BlockPyModule, BlockTerm, Call, CallArgKeyword, CallArgPositional, CallDirect,
+    CalleeFunctionId, ChildVisitable, ConstantExpr, Del, HasMeta, HasSemanticInstrId, Instr,
+    InstrId, InstrKey, InstrWithConstantNone, IntLiteral, Literal, LiteralValue, Load,
+    LocalLocation, MapInstr, Mappable, Meta, NameLike, NameLocation, NumberLiteral,
+    NumberLiteralValue, ParamKind, PrettyPrint, PrettyPrinter, ResolvedName, RuntimeFunctionId,
+    RuntimeName, SetAttr, Store, TermIf, TryMapInstr, TryMapModule, TryMapTerm, Tuple, UnaryOpKind,
+    Visit, VisitMut, WithMeta,
 };
 use soac_ir_blockpy::{
     BlockPyModuleShape, InstrBlockPy, constructor_init_function_id_for_entry_function,
@@ -18,16 +22,20 @@ use soac_ir_blockpy::{
 use soac_ir_typed::emit_v3::MechanicalExitKind;
 use soac_ir_typed::plan_v3::Rep;
 use soac_ir_typed::{
-    BoolFacts, FactStore, InstrTyped, PyObjFacts, TypedAttrAccessPlan, TypedAttrOwnerRef,
-    TypedBlock, TypedBlockExtra, TypedBlockPyModuleShape, TypedCall, TypedCallAccessPlan,
-    TypedCallEmissionPlan, TypedCallEmissionPlans, TypedConstructorInitPlan,
+    BoolFacts, FactStore, InstrTyped, PyExactType, PyObjFacts, TruthinessFact, TypedAttrAccessPlan,
+    TypedAttrOwnerRef, TypedBlock, TypedBlockExtra, TypedBlockPyModuleShape, TypedCall,
+    TypedCallAccessPlan, TypedCallEmissionPlan, TypedCallEmissionPlans, TypedConstructorInitPlan,
     TypedConstructorInitPlanSource, TypedDirectCallArgPlan, TypedDirectCallArgSource,
     TypedDirectCallGuardTest, TypedDirectCallGuardTestKind, TypedDirectCallableCall,
     TypedDirectCallableCallGuard, TypedDirectMethodCall, TypedDirectMethodCallGuard, TypedGetAttr,
-    TypedGuardedCallableCall, TypedGuardedMethodCall, TypedPlannedResult,
+    TypedGuardedCallableCall, TypedGuardedMethodCall, TypedInstrExtra, TypedPlannedResult,
     TypedPyObjectOwnershipPlan, TypedResultDemand, TypedSetAttr, TypedTruthy, ValueFacts,
 };
 use std::collections::{HashMap, HashSet};
+
+mod virtual_objects;
+
+pub use virtual_objects::*;
 
 pub fn annotate_typed_module_value_facts(
     module: &mut BlockPyModule<TypedBlockPyModuleShape>,
@@ -396,6 +404,44 @@ pub fn refresh_typed_function_value_facts(
     refresher.changed
 }
 
+pub fn sync_typed_module_value_facts(
+    module: &BlockPyModule<TypedBlockPyModuleShape>,
+    facts: &mut FactStore,
+) -> usize {
+    struct Collector<'a> {
+        function_id: RuntimeFunctionId,
+        facts: &'a mut FactStore,
+        changed: usize,
+    }
+
+    impl Visit<InstrTyped> for Collector<'_> {
+        fn visit_instr(&mut self, expr: &InstrTyped) {
+            if let Some(instr_id) = expr.try_semantic_instr_id()
+                && let Some(result_facts) = expr.result_facts()
+            {
+                let key = InstrKey::new(self.function_id, instr_id);
+                if self.facts.fact_for(key) != Some(result_facts) {
+                    self.facts.insert_expr_fact(key, result_facts);
+                    self.changed += 1;
+                }
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    let mut changed = 0;
+    for function in &module.callable_defs {
+        let mut collector = Collector {
+            function_id: function.function_id,
+            facts,
+            changed: 0,
+        };
+        collector.visit_fn(function);
+        changed += collector.changed;
+    }
+    changed
+}
+
 fn infer_typed_instr_result_facts(expr: &InstrTyped) -> Option<ValueFacts> {
     match expr {
         InstrTyped::Truthy(_) => Some(ValueFacts::Bool(BoolFacts)),
@@ -688,12 +734,19 @@ pub struct TypedInlineInstrIdMapping {
     pub caller_instr_id: InstrId,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub struct TypedInlineInstanceSource {
+    pub inline_instance: u32,
+    pub source_instr_id: InstrId,
+}
+
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub struct TypedInlineRewriteStats {
     pub rewritten_stores: usize,
     pub rewritten_effect_only_calls: usize,
     pub skipped_candidates: usize,
     pub skipped_exception_edges: usize,
+    pub inline_instance_sources: Vec<TypedInlineInstanceSource>,
     pub instr_id_mappings: Vec<TypedInlineInstrIdMapping>,
     pub local_mappings: Vec<TypedInlineLocalMapping>,
     pub hot_state_cleanup_labels: Vec<BlockLabel>,
@@ -741,52 +794,6 @@ pub struct TypedExternalInlineCallee {
     pub inline_plan: Option<InlinePlanModule>,
 }
 
-#[derive(Debug, Clone, Default, Eq, PartialEq)]
-pub struct TypedFieldScalarizationStats {
-    pub seeded_objects: usize,
-    pub scalar_slots: usize,
-    pub inserted_scalar_stores: usize,
-    pub rewritten_loads: usize,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct TypedVirtualConstructorPlan {
-    pub source: InstrId,
-    pub root: ResolvedName,
-    pub materialization_block: BlockLabel,
-    pub materialization_index: usize,
-    pub reachable_blocks: HashSet<BlockLabel>,
-    pub virtual_locations: HashSet<LocalLocation>,
-    pub virtual_names: HashSet<String>,
-    pub assumed_owner_type: Option<TypedAttrOwnerRef>,
-    pub guard_blocks: HashSet<BlockLabel>,
-}
-
-#[derive(Debug, Clone, Default, Eq, PartialEq)]
-pub struct TypedVirtualConstructorStats {
-    pub planned_objects: usize,
-    pub removed_materializations: usize,
-    pub removed_field_stores: usize,
-    pub removed_alias_stores: usize,
-    pub removed_dels: usize,
-    pub removed_guards: usize,
-    pub removed_block_params: usize,
-    pub removed_block_args: usize,
-}
-
-impl TypedVirtualConstructorStats {
-    pub fn changed(&self) -> bool {
-        self.removed_materializations != 0
-            || self.removed_field_stores != 0
-            || self.removed_alias_stores != 0
-            || self.removed_dels != 0
-            || self.removed_guards != 0
-            || self.removed_block_params != 0
-            || self.removed_block_args != 0
-    }
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
 #[allow(dead_code)]
 pub enum TypedInlineUnsupportedReason {
     MissingCallerStorageLayout,
@@ -811,6 +818,7 @@ pub enum TypedInlineUnsupportedReason {
     NonReturnTerm,
     ClosureStorage,
     CrossModuleGlobalName(String),
+    UnknownBlockName(String),
     TooManyCallerConstants,
 }
 
@@ -1049,6 +1057,14 @@ impl TypedInlineCall {
         }
     }
 
+    fn try_semantic_instr_id(&self) -> Option<InstrId> {
+        match self {
+            Self::Callable(call) => call.try_semantic_instr_id(),
+            Self::Method { call, .. } => call.try_semantic_instr_id(),
+            Self::RuntimeProtocolMethod { call, .. } => call.try_semantic_instr_id(),
+        }
+    }
+
     fn args(&self) -> Vec<CallArgPositional<InstrTyped>> {
         match self {
             Self::Callable(call) => call.args.clone(),
@@ -1278,7 +1294,15 @@ fn build_typed_direct_call_inline_rewrite(
         *next_inline_instance = next_inline_instance
             .checked_add(1)
             .expect("typed inline instance count should fit in u32");
-        let Ok(mut fragment) = build_typed_direct_call_inline_fragment_to_target(
+        if let Some(source_instr_id) = candidate.call.try_semantic_instr_id() {
+            stats
+                .inline_instance_sources
+                .push(TypedInlineInstanceSource {
+                    inline_instance,
+                    source_instr_id,
+                });
+        }
+        let mut fragment = match build_typed_direct_call_inline_fragment_to_target(
             caller,
             callee.function,
             cleanup_label,
@@ -1288,13 +1312,18 @@ fn build_typed_direct_call_inline_rewrite(
             instr_id_allocator,
             caller_module_constants.as_deref_mut(),
             callee.module_constants,
-        ) else {
-            stats.skipped_candidates += 1;
-            caller.storage_layout = original_storage_layout;
-            return TypedInlineBlockRewrite::Unchanged(original_block);
+        ) {
+            Ok(fragment) => fragment,
+            Err(_) => {
+                stats.skipped_candidates += 1;
+                caller.storage_layout = original_storage_layout;
+                return TypedInlineBlockRewrite::Unchanged(original_block);
+            }
         };
         for block in &mut fragment.blocks {
-            block.exc_edge = original_exc_edge.clone();
+            if block.exc_edge.is_none() {
+                block.exc_edge = original_exc_edge.clone();
+            }
         }
         if let Some(entry) = fragment.blocks.first_mut() {
             entry.label = hot_label;
@@ -1482,7 +1511,9 @@ fn build_typed_constructor_init_body_inline_rewrite(
         return TypedInlineBlockRewrite::Unchanged(original_block);
     };
     for block in &mut fragment.blocks {
-        block.exc_edge = original_exc_edge.clone();
+        if block.exc_edge.is_none() {
+            block.exc_edge = original_exc_edge.clone();
+        }
     }
     if let Some(entry) = fragment.blocks.first_mut() {
         entry.label = inline_entry_label;
@@ -1759,6 +1790,30 @@ fn typed_constructor_init_body_field_bindings(
 
 fn typed_expr_loads_resolved_name(expr: &InstrTyped, name: &ResolvedName) -> bool {
     matches!(expr, InstrTyped::Load(load) if load.name == *name)
+}
+
+fn typed_expr_contains_resolved_name_load(expr: &InstrTyped, name: &ResolvedName) -> bool {
+    struct Finder<'a> {
+        name: &'a ResolvedName,
+        found: bool,
+    }
+
+    impl Visit<InstrTyped> for Finder<'_> {
+        fn visit_instr(&mut self, expr: &InstrTyped) {
+            if self.found {
+                return;
+            }
+            if typed_expr_loads_resolved_name(expr, self.name) {
+                self.found = true;
+                return;
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    let mut finder = Finder { name, found: false };
+    finder.visit_instr(expr);
+    finder.found
 }
 
 fn typed_expr_local_load_name(expr: &InstrTyped) -> Option<&ResolvedName> {
@@ -2189,7 +2244,6 @@ fn typed_block_predecessors(
     predecessors
 }
 
-#[cfg(test)]
 fn typed_reachable_block_labels(
     function: &BlockPyFunction<TypedBlockPyModuleShape>,
     labels: &HashMap<BlockLabel, usize>,
@@ -2569,1556 +2623,6 @@ fn typed_constructor_call_instr_ids(
     };
     collector.visit_fn(function);
     collector.instr_ids
-}
-
-pub fn scalarize_typed_hot_constructor_field_loads(
-    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
-    module_constants: &[ConstantExpr],
-    constructor_field_bindings: &HashMap<InstrId, TypedConstructorFieldBindings>,
-) -> TypedFieldScalarizationStats {
-    let mut constructor_field_bindings = constructor_field_bindings.clone();
-    scalarize_typed_hot_constructor_field_loads_with_bindings(
-        function,
-        module_constants,
-        &mut constructor_field_bindings,
-    )
-}
-
-pub fn scalarize_typed_hot_constructor_field_loads_with_bindings(
-    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
-    module_constants: &[ConstantExpr],
-    constructor_field_bindings: &mut HashMap<InstrId, TypedConstructorFieldBindings>,
-) -> TypedFieldScalarizationStats {
-    if constructor_field_bindings.is_empty() {
-        return TypedFieldScalarizationStats::default();
-    }
-    let scalar_slots =
-        allocate_typed_constructor_field_scalar_slots(function, constructor_field_bindings);
-    let predecessors = typed_normal_block_predecessors(function);
-    let mut in_states = vec![None::<TypedFieldScalarState>; function.blocks.len()];
-    let mut out_states = vec![None::<TypedFieldScalarState>; function.blocks.len()];
-    let labels = typed_block_indices_by_label(function);
-    let entry_label = function.blocks.first().map(|block| block.label);
-    loop {
-        let mut changed = false;
-        for (block_index, block) in function.blocks.iter().enumerate() {
-            let in_state = typed_field_scalar_in_state_for_block(
-                block.label,
-                entry_label,
-                &predecessors,
-                &labels,
-                &out_states,
-            );
-            if in_states[block_index] != in_state {
-                in_states[block_index] = in_state.clone();
-                changed = true;
-            }
-            let out_state = in_state.map(|mut out_state| {
-                let mut block_clone = block.clone();
-                let mut ignored_stats = TypedFieldScalarizationStats::default();
-                transfer_typed_field_scalar_block(
-                    &mut block_clone,
-                    &mut out_state,
-                    module_constants,
-                    constructor_field_bindings,
-                    &mut ignored_stats,
-                    false,
-                );
-                out_state
-            });
-            if out_states[block_index] != out_state {
-                out_states[block_index] = out_state;
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-
-    let mut stats = TypedFieldScalarizationStats {
-        scalar_slots,
-        ..TypedFieldScalarizationStats::default()
-    };
-    for (block_index, block) in function.blocks.iter_mut().enumerate() {
-        let mut state = in_states
-            .get(block_index)
-            .cloned()
-            .flatten()
-            .unwrap_or_else(TypedFieldScalarState::default);
-        transfer_typed_field_scalar_block(
-            block,
-            &mut state,
-            module_constants,
-            constructor_field_bindings,
-            &mut stats,
-            true,
-        );
-    }
-    stats
-}
-
-pub fn plan_typed_virtual_constructors(
-    function: &BlockPyFunction<TypedBlockPyModuleShape>,
-    module_constants: &[ConstantExpr],
-    constructor_field_bindings: &HashMap<InstrId, TypedConstructorFieldBindings>,
-) -> Vec<TypedVirtualConstructorPlan> {
-    if constructor_field_bindings.is_empty() {
-        return Vec::new();
-    }
-    let labels = typed_block_indices_by_label(function);
-    let predecessors = typed_block_predecessors(function);
-    let mut plans = Vec::new();
-    for block in &function.blocks {
-        for (instr_index, instr) in block.body.iter().enumerate() {
-            let Some((source, root, bindings)) =
-                typed_virtual_constructor_materialization(instr, constructor_field_bindings)
-            else {
-                continue;
-            };
-            if bindings.fields.iter().any(|field| field.scalar.is_none()) {
-                continue;
-            }
-            let Some(root_location) = root.local_location() else {
-                continue;
-            };
-            let BlockTerm::Jump(edge) = &block.term else {
-                continue;
-            };
-            let Some(reachable) = typed_hot_reachable_block_labels(function, &labels, edge.target)
-            else {
-                continue;
-            };
-            if reachable.contains(&block.label)
-                || reachable.len() > MAX_TYPED_HOT_CONTINUATION_CLONE_BLOCKS
-                || !typed_reachable_subgraph_has_external_predecessor(
-                    &reachable,
-                    &predecessors,
-                    block.label,
-                )
-            {
-                continue;
-            }
-            let mut plan = TypedVirtualConstructorPlan {
-                source,
-                root: root.clone(),
-                materialization_block: block.label,
-                materialization_index: instr_index,
-                reachable_blocks: reachable,
-                virtual_locations: HashSet::from([root_location]),
-                virtual_names: HashSet::from([root.id_str().to_string()]),
-                assumed_owner_type: None,
-                guard_blocks: HashSet::new(),
-            };
-            if complete_typed_virtual_constructor_plan(
-                function,
-                module_constants,
-                bindings,
-                &mut plan,
-            ) {
-                plans.push(plan);
-            }
-        }
-    }
-    plans
-}
-
-pub fn virtualize_typed_hot_constructor_objects(
-    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
-    module_constants: &[ConstantExpr],
-    constructor_field_bindings: &HashMap<InstrId, TypedConstructorFieldBindings>,
-) -> TypedVirtualConstructorStats {
-    let plans =
-        plan_typed_virtual_constructors(function, module_constants, constructor_field_bindings);
-    let mut stats = TypedVirtualConstructorStats {
-        planned_objects: plans.len(),
-        ..TypedVirtualConstructorStats::default()
-    };
-    if plans.is_empty() {
-        return stats;
-    }
-    let param_removals = typed_virtual_constructor_param_removals(function, &plans);
-    for block in &mut function.blocks {
-        if let Some(remove) = param_removals.get(&block.label) {
-            let before = block.params.len();
-            block.params = block
-                .params
-                .iter()
-                .enumerate()
-                .filter_map(|(index, param)| (!remove.contains(&index)).then_some(param.clone()))
-                .collect();
-            stats.removed_block_params += before.saturating_sub(block.params.len());
-        }
-    }
-    for block in &mut function.blocks {
-        rewrite_typed_virtual_constructor_edges(block, &param_removals, &mut stats);
-    }
-    for block in &mut function.blocks {
-        rewrite_typed_virtual_constructor_block(
-            block,
-            module_constants,
-            constructor_field_bindings,
-            &plans,
-            &mut stats,
-        );
-    }
-    stats
-}
-
-fn typed_virtual_constructor_materialization<'a>(
-    instr: &'a InstrTyped,
-    constructor_field_bindings: &'a HashMap<InstrId, TypedConstructorFieldBindings>,
-) -> Option<(InstrId, &'a ResolvedName, &'a TypedConstructorFieldBindings)> {
-    let InstrTyped::Store(store) = instr else {
-        return None;
-    };
-    let InstrTyped::CallTyped(call) = store.value.as_ref() else {
-        return None;
-    };
-    let instr_id = call.try_semantic_instr_id()?;
-    let bindings = constructor_field_bindings.get(&instr_id)?;
-    Some((instr_id, &store.name, bindings))
-}
-
-fn complete_typed_virtual_constructor_plan(
-    function: &BlockPyFunction<TypedBlockPyModuleShape>,
-    module_constants: &[ConstantExpr],
-    bindings: &TypedConstructorFieldBindings,
-    plan: &mut TypedVirtualConstructorPlan,
-) -> bool {
-    loop {
-        let before_locations = plan.virtual_locations.len();
-        let before_names = plan.virtual_names.len();
-        for block in &function.blocks {
-            if !typed_virtual_constructor_plan_covers_block(plan, block.label) {
-                continue;
-            }
-            let start = if block.label == plan.materialization_block {
-                plan.materialization_index + 1
-            } else {
-                0
-            };
-            for instr in block.body.iter().skip(start) {
-                if !scan_typed_virtual_constructor_instr(
-                    function,
-                    module_constants,
-                    bindings,
-                    plan,
-                    instr,
-                ) {
-                    return false;
-                }
-            }
-            if !scan_typed_virtual_constructor_term(function, bindings, plan, block) {
-                return false;
-            }
-            if let Some(edge) = &block.exc_edge
-                && !scan_typed_virtual_constructor_edge(function, plan, edge)
-            {
-                return false;
-            }
-        }
-        if plan.virtual_locations.len() == before_locations
-            && plan.virtual_names.len() == before_names
-        {
-            break;
-        }
-    }
-    true
-}
-
-fn typed_virtual_constructor_plan_covers_block(
-    plan: &TypedVirtualConstructorPlan,
-    label: BlockLabel,
-) -> bool {
-    label == plan.materialization_block || plan.reachable_blocks.contains(&label)
-}
-
-fn scan_typed_virtual_constructor_instr(
-    function: &BlockPyFunction<TypedBlockPyModuleShape>,
-    module_constants: &[ConstantExpr],
-    bindings: &TypedConstructorFieldBindings,
-    plan: &mut TypedVirtualConstructorPlan,
-    instr: &InstrTyped,
-) -> bool {
-    match instr {
-        InstrTyped::Store(store) => {
-            if typed_virtual_constructor_alias_store(function, plan, store) {
-                return true;
-            }
-            !typed_expr_uses_virtual_constructor_identity(store.value.as_ref(), plan)
-                && !typed_resolved_name_is_virtual_constructor(&store.name, plan)
-        }
-        InstrTyped::Del(del) if typed_resolved_name_is_virtual_constructor(&del.name, plan) => true,
-        InstrTyped::SetAttrTyped(op)
-            if typed_virtual_constructor_field_store(op, module_constants, bindings, plan) =>
-        {
-            !typed_expr_uses_virtual_constructor_identity(op.attr.as_ref(), plan)
-                && !typed_expr_uses_virtual_constructor_identity(op.replacement.as_ref(), plan)
-        }
-        _ => !typed_expr_uses_virtual_constructor_identity(instr, plan),
-    }
-}
-
-fn scan_typed_virtual_constructor_term(
-    function: &BlockPyFunction<TypedBlockPyModuleShape>,
-    bindings: &TypedConstructorFieldBindings,
-    plan: &mut TypedVirtualConstructorPlan,
-    block: &TypedBlock,
-) -> bool {
-    let term_ok = match &block.term {
-        BlockTerm::IfTerm(if_term) => {
-            if let InstrTyped::DirectCallGuardTest(guard) = &if_term.test
-                && typed_expr_is_virtual_constructor_load(guard.value.as_ref(), plan)
-            {
-                let TypedDirectCallGuardTestKind::ExactTypeVersion { owner_type_ref, .. } =
-                    &guard.kind
-                else {
-                    return false;
-                };
-                if plan
-                    .assumed_owner_type
-                    .as_ref()
-                    .is_some_and(|existing| existing != owner_type_ref)
-                {
-                    return false;
-                }
-                plan.assumed_owner_type = Some(owner_type_ref.clone());
-                plan.guard_blocks.insert(block.label);
-                return true;
-            }
-            !typed_expr_uses_virtual_constructor_identity(&if_term.test, plan)
-        }
-        BlockTerm::Jump(edge) => scan_typed_virtual_constructor_edge(function, plan, edge),
-        BlockTerm::BranchTable(branch) => {
-            !typed_expr_uses_virtual_constructor_identity(&branch.index, plan)
-        }
-        BlockTerm::Raise(raise) => raise
-            .exc
-            .as_ref()
-            .is_none_or(|exc| !typed_expr_uses_virtual_constructor_identity(exc, plan)),
-        BlockTerm::Return(value) => !typed_expr_uses_virtual_constructor_identity(value, plan),
-    };
-    term_ok && bindings.fields.iter().all(|field| field.scalar.is_some())
-}
-
-fn scan_typed_virtual_constructor_edge(
-    function: &BlockPyFunction<TypedBlockPyModuleShape>,
-    plan: &mut TypedVirtualConstructorPlan,
-    edge: &BlockEdge,
-) -> bool {
-    for arg in &edge.args {
-        if let BlockArg::Name(name) = arg
-            && plan.virtual_names.contains(name)
-            && !plan.reachable_blocks.contains(&edge.target)
-        {
-            return false;
-        }
-    }
-    let Some(target) = function
-        .blocks
-        .iter()
-        .find(|block| block.label == edge.target)
-    else {
-        return true;
-    };
-    for (index, arg) in edge.args.iter().enumerate() {
-        let BlockArg::Name(name) = arg else {
-            continue;
-        };
-        if !plan.virtual_names.contains(name) {
-            continue;
-        }
-        let Some(param) = target.params.get(index) else {
-            continue;
-        };
-        if param.role != BlockParamRole::Value {
-            return false;
-        }
-        plan.virtual_names.insert(param.name.clone());
-        if let Some(location) = typed_local_location_for_name(function, &param.name) {
-            plan.virtual_locations.insert(location);
-        }
-    }
-    true
-}
-
-fn typed_virtual_constructor_alias_store(
-    function: &BlockPyFunction<TypedBlockPyModuleShape>,
-    plan: &mut TypedVirtualConstructorPlan,
-    store: &Store<InstrTyped>,
-) -> bool {
-    if !typed_expr_is_virtual_constructor_load(store.value.as_ref(), plan) {
-        return false;
-    }
-    let Some(location) = store.name.local_location() else {
-        return false;
-    };
-    plan.virtual_locations.insert(location);
-    plan.virtual_names.insert(store.name.id_str().to_string());
-    if let Some(location) = typed_local_location_for_name(function, store.name.id_str()) {
-        plan.virtual_locations.insert(location);
-    }
-    true
-}
-
-fn typed_virtual_constructor_field_store(
-    op: &TypedSetAttr<InstrTyped>,
-    module_constants: &[ConstantExpr],
-    bindings: &TypedConstructorFieldBindings,
-    plan: &TypedVirtualConstructorPlan,
-) -> bool {
-    if !typed_expr_is_virtual_constructor_load(op.value.as_ref(), plan)
-        || !typed_attr_access_is_indexed_field(&op.access)
-    {
-        return false;
-    }
-    let Some(field_name) = typed_constant_string(op.attr.as_ref(), module_constants) else {
-        return false;
-    };
-    bindings
-        .fields
-        .iter()
-        .any(|field| field.field_name == field_name && field.scalar.is_some())
-}
-
-fn typed_expr_is_virtual_constructor_load(
-    expr: &InstrTyped,
-    plan: &TypedVirtualConstructorPlan,
-) -> bool {
-    let InstrTyped::Load(load) = expr else {
-        return false;
-    };
-    typed_resolved_name_is_virtual_constructor(&load.name, plan)
-}
-
-fn typed_resolved_name_is_virtual_constructor(
-    name: &ResolvedName,
-    plan: &TypedVirtualConstructorPlan,
-) -> bool {
-    name.local_location()
-        .is_some_and(|location| plan.virtual_locations.contains(&location))
-        || plan.virtual_names.contains(name.id_str())
-}
-
-fn typed_expr_uses_virtual_constructor_identity(
-    expr: &InstrTyped,
-    plan: &TypedVirtualConstructorPlan,
-) -> bool {
-    struct Finder<'a> {
-        plan: &'a TypedVirtualConstructorPlan,
-        found: bool,
-    }
-
-    impl Visit<InstrTyped> for Finder<'_> {
-        fn visit_instr(&mut self, expr: &InstrTyped) {
-            if self.found {
-                return;
-            }
-            if typed_expr_is_virtual_constructor_load(expr, self.plan) {
-                self.found = true;
-                return;
-            }
-            expr.visit_children(self);
-        }
-    }
-
-    let mut finder = Finder { plan, found: false };
-    finder.visit_instr(expr);
-    finder.found
-}
-
-fn typed_local_location_for_name(
-    function: &BlockPyFunction<TypedBlockPyModuleShape>,
-    name: &str,
-) -> Option<LocalLocation> {
-    let layout = function.storage_layout.as_ref()?;
-    layout
-        .stack_slots()
-        .iter()
-        .position(|slot_name| slot_name == name)
-        .map(|slot| {
-            LocalLocation(
-                u32::try_from(slot).expect("stack slot index should fit in LocalLocation"),
-            )
-        })
-}
-
-fn typed_virtual_constructor_param_removals(
-    function: &BlockPyFunction<TypedBlockPyModuleShape>,
-    plans: &[TypedVirtualConstructorPlan],
-) -> HashMap<BlockLabel, HashSet<usize>> {
-    let mut removals = HashMap::<BlockLabel, HashSet<usize>>::new();
-    for block in &function.blocks {
-        for plan in plans {
-            if !plan.reachable_blocks.contains(&block.label) {
-                continue;
-            }
-            for (index, param) in block.params.iter().enumerate() {
-                if param.role == BlockParamRole::Value && plan.virtual_names.contains(&param.name) {
-                    removals.entry(block.label).or_default().insert(index);
-                }
-            }
-        }
-    }
-    removals
-}
-
-fn rewrite_typed_virtual_constructor_edges(
-    block: &mut TypedBlock,
-    param_removals: &HashMap<BlockLabel, HashSet<usize>>,
-    stats: &mut TypedVirtualConstructorStats,
-) {
-    match &mut block.term {
-        BlockTerm::Jump(edge) => {
-            stats.removed_block_args += rewrite_typed_virtual_constructor_edge(edge, param_removals)
-        }
-        BlockTerm::IfTerm(_)
-        | BlockTerm::BranchTable(_)
-        | BlockTerm::Raise(_)
-        | BlockTerm::Return(_) => {}
-    }
-    if let Some(edge) = &mut block.exc_edge {
-        stats.removed_block_args += rewrite_typed_virtual_constructor_edge(edge, param_removals);
-    }
-}
-
-fn rewrite_typed_virtual_constructor_edge(
-    edge: &mut BlockEdge,
-    param_removals: &HashMap<BlockLabel, HashSet<usize>>,
-) -> usize {
-    let Some(remove) = param_removals.get(&edge.target) else {
-        return 0;
-    };
-    let before = edge.args.len();
-    edge.args = edge
-        .args
-        .iter()
-        .enumerate()
-        .filter_map(|(index, arg)| (!remove.contains(&index)).then_some(arg.clone()))
-        .collect();
-    before.saturating_sub(edge.args.len())
-}
-
-fn rewrite_typed_virtual_constructor_block(
-    block: &mut TypedBlock,
-    module_constants: &[ConstantExpr],
-    constructor_field_bindings: &HashMap<InstrId, TypedConstructorFieldBindings>,
-    plans: &[TypedVirtualConstructorPlan],
-    stats: &mut TypedVirtualConstructorStats,
-) {
-    let old_body = std::mem::take(&mut block.body);
-    let mut new_body = Vec::with_capacity(old_body.len());
-    for (instr_index, instr) in old_body.into_iter().enumerate() {
-        if typed_virtual_constructor_should_remove_instr(
-            block.label,
-            instr_index,
-            &instr,
-            module_constants,
-            constructor_field_bindings,
-            plans,
-            stats,
-        ) {
-            continue;
-        }
-        new_body.push(instr);
-    }
-    block.body = new_body;
-    let guard_then_label = match &block.term {
-        BlockTerm::IfTerm(if_term)
-            if plans
-                .iter()
-                .any(|plan| plan.guard_blocks.contains(&block.label)) =>
-        {
-            Some(if_term.then_label)
-        }
-        _ => None,
-    };
-    if let Some(then_label) = guard_then_label {
-        block.term = BlockTerm::Jump(BlockEdge::new(then_label));
-        stats.removed_guards += 1;
-    }
-}
-
-fn typed_virtual_constructor_should_remove_instr(
-    label: BlockLabel,
-    instr_index: usize,
-    instr: &InstrTyped,
-    module_constants: &[ConstantExpr],
-    constructor_field_bindings: &HashMap<InstrId, TypedConstructorFieldBindings>,
-    plans: &[TypedVirtualConstructorPlan],
-    stats: &mut TypedVirtualConstructorStats,
-) -> bool {
-    for plan in plans {
-        if label == plan.materialization_block
-            && instr_index == plan.materialization_index
-            && typed_virtual_constructor_materialization(instr, constructor_field_bindings)
-                .is_some_and(|(source, _, _)| source == plan.source)
-        {
-            stats.removed_materializations += 1;
-            return true;
-        }
-        if !typed_virtual_constructor_plan_covers_block(plan, label)
-            || (label == plan.materialization_block && instr_index <= plan.materialization_index)
-        {
-            continue;
-        }
-        match instr {
-            InstrTyped::Store(store)
-                if typed_expr_is_virtual_constructor_load(store.value.as_ref(), plan) =>
-            {
-                stats.removed_alias_stores += 1;
-                return true;
-            }
-            InstrTyped::Del(del) if typed_resolved_name_is_virtual_constructor(&del.name, plan) => {
-                stats.removed_dels += 1;
-                return true;
-            }
-            InstrTyped::SetAttrTyped(op)
-                if constructor_field_bindings
-                    .get(&plan.source)
-                    .is_some_and(|bindings| {
-                        typed_virtual_constructor_field_store(op, module_constants, bindings, plan)
-                    }) =>
-            {
-                stats.removed_field_stores += 1;
-                return true;
-            }
-            _ => {}
-        }
-    }
-    false
-}
-
-fn typed_field_scalar_in_state_for_block(
-    label: BlockLabel,
-    entry_label: Option<BlockLabel>,
-    predecessors: &HashMap<BlockLabel, HashSet<BlockLabel>>,
-    labels: &HashMap<BlockLabel, usize>,
-    out_states: &[Option<TypedFieldScalarState>],
-) -> Option<TypedFieldScalarState> {
-    let Some(predecessors) = predecessors.get(&label) else {
-        return (Some(label) == entry_label).then(TypedFieldScalarState::default);
-    };
-    let computed = predecessors
-        .iter()
-        .filter_map(|label| labels.get(label).and_then(|index| out_states.get(*index)))
-        .filter_map(|state| state.as_ref())
-        .collect::<Vec<_>>();
-    if computed.is_empty() {
-        None
-    } else {
-        Some(merge_typed_field_scalar_states(computed.into_iter()))
-    }
-}
-
-fn allocate_typed_constructor_field_scalar_slots(
-    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
-    constructor_field_bindings: &mut HashMap<InstrId, TypedConstructorFieldBindings>,
-) -> usize {
-    if function.storage_layout.is_none() {
-        return 0;
-    }
-    let mut allocated = 0;
-    for bindings in constructor_field_bindings.values_mut() {
-        for field in &mut bindings.fields {
-            if field.scalar.is_some() {
-                continue;
-            }
-            let Ok(temp) = try_allocate_typed_stack_temp(function, "_dp_typed_scalar_field") else {
-                continue;
-            };
-            field.scalar = Some(temp.resolved_name());
-            allocated += 1;
-        }
-    }
-    allocated
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct TypedFieldScalarState {
-    aliases: HashMap<LocalLocation, LocalLocation>,
-    value_aliases: HashMap<LocalLocation, ResolvedName>,
-    fields: HashMap<(LocalLocation, String), ResolvedName>,
-    field_scalars: HashMap<(LocalLocation, String), ResolvedName>,
-}
-
-impl TypedFieldScalarState {
-    fn root_for_location(&self, location: LocalLocation) -> Option<LocalLocation> {
-        let mut current = location;
-        let mut seen = HashSet::new();
-        loop {
-            let next = *self.aliases.get(&current)?;
-            if next == current {
-                return Some(current);
-            }
-            if !seen.insert(current) {
-                return None;
-            }
-            current = next;
-        }
-    }
-
-    fn rebind_local(&mut self, location: LocalLocation) {
-        self.value_aliases.remove(&location);
-        self.value_aliases.retain(|_, value| {
-            value
-                .local_location()
-                .is_none_or(|source| source != location)
-        });
-        self.fields.retain(|_, value| {
-            value
-                .local_location()
-                .is_none_or(|source| source != location)
-        });
-        if self.aliases.get(&location) == Some(&location) {
-            self.rebind_root_local(location);
-        } else {
-            self.aliases.remove(&location);
-        }
-    }
-
-    fn rebind_root_local(&mut self, root: LocalLocation) {
-        let replacement = self
-            .aliases
-            .iter()
-            .filter_map(|(location, mapped_root)| {
-                (*mapped_root == root && *location != root).then_some(*location)
-            })
-            .min_by_key(|location| location.slot());
-        let Some(replacement) = replacement else {
-            self.invalidate_root(root);
-            return;
-        };
-
-        self.aliases.remove(&root);
-        for mapped_root in self.aliases.values_mut() {
-            if *mapped_root == root {
-                *mapped_root = replacement;
-            }
-        }
-        self.aliases.insert(replacement, replacement);
-        rekey_typed_field_scalar_map_root(&mut self.fields, root, replacement);
-        rekey_typed_field_scalar_map_root(&mut self.field_scalars, root, replacement);
-    }
-
-    fn set_alias(&mut self, location: LocalLocation, root: LocalLocation) {
-        if location == root {
-            self.aliases.insert(root, root);
-            return;
-        }
-        self.rebind_local(location);
-        self.aliases.entry(root).or_insert(root);
-        self.aliases.insert(location, root);
-    }
-
-    fn set_value_alias(&mut self, location: LocalLocation, value: &ResolvedName) {
-        self.rebind_local(location);
-        let value = self.resolve_scalar_name(value);
-        self.value_aliases.insert(location, value);
-    }
-
-    fn resolve_scalar_name(&self, value: &ResolvedName) -> ResolvedName {
-        let Some(mut location) = value.local_location() else {
-            return value.clone();
-        };
-        let mut resolved = value.clone();
-        let mut seen = HashSet::new();
-        while seen.insert(location) {
-            let Some(mapped) = self.value_aliases.get(&location) else {
-                break;
-            };
-            resolved = mapped.clone();
-            let Some(mapped_location) = mapped.local_location() else {
-                return mapped.clone();
-            };
-            location = mapped_location;
-        }
-        resolved
-    }
-
-    fn seed_object(&mut self, location: LocalLocation, bindings: &TypedConstructorFieldBindings) {
-        self.rebind_local(location);
-        self.aliases.insert(location, location);
-        for field in &bindings.fields {
-            let value = field
-                .scalar
-                .as_ref()
-                .cloned()
-                .unwrap_or_else(|| self.resolve_scalar_name(&field.value));
-            self.fields
-                .insert((location, field.field_name.clone()), value);
-            if let Some(scalar) = &field.scalar {
-                self.field_scalars
-                    .insert((location, field.field_name.clone()), scalar.clone());
-            }
-        }
-    }
-
-    fn field_value(&self, root: LocalLocation, field_name: &str) -> Option<&ResolvedName> {
-        self.fields.get(&(root, field_name.to_string()))
-    }
-
-    fn field_scalar(&self, root: LocalLocation, field_name: &str) -> Option<&ResolvedName> {
-        self.field_scalars.get(&(root, field_name.to_string()))
-    }
-
-    fn set_field(&mut self, root: LocalLocation, field_name: String, value: ResolvedName) {
-        let value = self.resolve_scalar_name(&value);
-        self.fields.insert((root, field_name), value);
-    }
-
-    fn invalidate_field(&mut self, root: LocalLocation, field_name: &str) {
-        self.fields.remove(&(root, field_name.to_string()));
-    }
-
-    fn invalidate_root(&mut self, root: LocalLocation) {
-        self.aliases
-            .retain(|location, mapped_root| *location != root && *mapped_root != root);
-        self.fields.retain(|(field_root, _), _| *field_root != root);
-        self.field_scalars
-            .retain(|(field_root, _), _| *field_root != root);
-    }
-
-    fn invalidate_roots(&mut self, roots: HashSet<LocalLocation>) {
-        for root in roots {
-            self.invalidate_root(root);
-        }
-    }
-}
-
-fn merge_typed_field_scalar_states<'a>(
-    mut states: impl Iterator<Item = &'a TypedFieldScalarState>,
-) -> TypedFieldScalarState {
-    let Some(first) = states.next() else {
-        return TypedFieldScalarState::default();
-    };
-    let rest = states.collect::<Vec<_>>();
-    let mut merged = first.clone();
-    merged.aliases.retain(|location, root| {
-        rest.iter()
-            .all(|state| state.aliases.get(location) == Some(root))
-    });
-    merged.value_aliases.retain(|location, value| {
-        rest.iter()
-            .all(|state| state.value_aliases.get(location) == Some(value))
-    });
-    merged.fields.retain(|field, value| {
-        rest.iter()
-            .all(|state| state.fields.get(field) == Some(value))
-    });
-    merged.field_scalars.retain(|field, value| {
-        rest.iter()
-            .all(|state| state.field_scalars.get(field) == Some(value))
-    });
-    merged
-}
-
-fn rekey_typed_field_scalar_map_root<T>(
-    map: &mut HashMap<(LocalLocation, String), T>,
-    old_root: LocalLocation,
-    new_root: LocalLocation,
-) {
-    let entries = std::mem::take(map);
-    *map = entries
-        .into_iter()
-        .map(|((root, field_name), value)| {
-            let root = if root == old_root { new_root } else { root };
-            ((root, field_name), value)
-        })
-        .collect();
-}
-
-fn typed_normal_block_predecessors(
-    function: &BlockPyFunction<TypedBlockPyModuleShape>,
-) -> HashMap<BlockLabel, HashSet<BlockLabel>> {
-    let mut predecessors = HashMap::<BlockLabel, HashSet<BlockLabel>>::new();
-    for block in &function.blocks {
-        for successor in typed_term_successors(&block.term) {
-            predecessors
-                .entry(successor)
-                .or_default()
-                .insert(block.label);
-        }
-    }
-    predecessors
-}
-
-fn transfer_typed_field_scalar_block(
-    block: &mut TypedBlock,
-    state: &mut TypedFieldScalarState,
-    module_constants: &[ConstantExpr],
-    constructor_field_bindings: &HashMap<InstrId, TypedConstructorFieldBindings>,
-    stats: &mut TypedFieldScalarizationStats,
-    rewrite: bool,
-) {
-    let body = std::mem::take(&mut block.body);
-    let mut new_body = Vec::with_capacity(body.len());
-    for mut instr in body {
-        let mut inserted_before = Vec::new();
-        let mut inserted_after = Vec::new();
-        transfer_typed_field_scalar_instr(
-            &mut instr,
-            state,
-            module_constants,
-            constructor_field_bindings,
-            stats,
-            rewrite,
-            &mut inserted_before,
-            &mut inserted_after,
-        );
-        if rewrite {
-            new_body.extend(inserted_before);
-        }
-        new_body.push(instr);
-        if rewrite {
-            new_body.extend(inserted_after);
-        }
-    }
-    block.body = new_body;
-    transfer_typed_field_scalar_term(&mut block.term, state, module_constants, stats, rewrite);
-}
-
-fn transfer_typed_field_scalar_instr(
-    instr: &mut InstrTyped,
-    state: &mut TypedFieldScalarState,
-    module_constants: &[ConstantExpr],
-    constructor_field_bindings: &HashMap<InstrId, TypedConstructorFieldBindings>,
-    stats: &mut TypedFieldScalarizationStats,
-    rewrite: bool,
-    inserted_before: &mut Vec<InstrTyped>,
-    inserted_after: &mut Vec<InstrTyped>,
-) {
-    match instr {
-        InstrTyped::Store(store) => {
-            if let Some(bindings) =
-                typed_constructor_field_bindings_for_store(store, constructor_field_bindings)
-            {
-                state.invalidate_roots(typed_virtual_roots_in_expr(store.value.as_ref(), state));
-                if let Some(location) = store.name.local_location() {
-                    state.seed_object(location, bindings);
-                    if rewrite {
-                        stats.seeded_objects += 1;
-                        append_typed_constructor_field_scalar_stores(
-                            inserted_after,
-                            bindings,
-                            state,
-                            stats,
-                        );
-                    }
-                }
-                return;
-            }
-            rewrite_typed_field_scalar_expr(
-                store.value.as_mut(),
-                state,
-                module_constants,
-                stats,
-                rewrite,
-            );
-            let Some(target) = store.name.local_location() else {
-                return;
-            };
-            if let Some(source) = typed_instr_local_load_location(store.value.as_ref())
-                && let Some(root) = state.root_for_location(source)
-            {
-                state.set_alias(target, root);
-            } else if let InstrTyped::Load(source) = store.value.as_ref() {
-                state.set_value_alias(target, &source.name);
-            } else {
-                state.rebind_local(target);
-            }
-        }
-        InstrTyped::Del(del) => {
-            if let Some(location) = del.name.local_location() {
-                state.rebind_local(location);
-            }
-        }
-        InstrTyped::SetAttrTyped(op) => rewrite_typed_field_scalar_setattr(
-            op,
-            state,
-            module_constants,
-            stats,
-            rewrite,
-            Some(inserted_before),
-            Some(inserted_after),
-        ),
-        _ => rewrite_typed_field_scalar_expr(instr, state, module_constants, stats, rewrite),
-    }
-}
-
-fn append_typed_constructor_field_scalar_stores(
-    body: &mut Vec<InstrTyped>,
-    bindings: &TypedConstructorFieldBindings,
-    state: &TypedFieldScalarState,
-    stats: &mut TypedFieldScalarizationStats,
-) {
-    for field in &bindings.fields {
-        let Some(scalar) = field.scalar.as_ref() else {
-            continue;
-        };
-        let source = state.resolve_scalar_name(&field.value);
-        body.push(typed_store_temp(scalar.clone(), typed_load_temp(&source)));
-        stats.inserted_scalar_stores += 1;
-    }
-}
-
-fn rewrite_typed_field_scalar_setattr(
-    op: &mut TypedSetAttr<InstrTyped>,
-    state: &mut TypedFieldScalarState,
-    module_constants: &[ConstantExpr],
-    stats: &mut TypedFieldScalarizationStats,
-    rewrite: bool,
-    inserted_before: Option<&mut Vec<InstrTyped>>,
-    inserted_after: Option<&mut Vec<InstrTyped>>,
-) {
-    rewrite_typed_field_scalar_expr(
-        op.replacement.as_mut(),
-        state,
-        module_constants,
-        stats,
-        rewrite,
-    );
-    state.invalidate_roots(typed_virtual_roots_in_expr(op.attr.as_ref(), state));
-    let Some(receiver) = typed_instr_local_load_location(op.value.as_ref()) else {
-        state.invalidate_roots(typed_virtual_roots_in_expr(op.value.as_ref(), state));
-        return;
-    };
-    let Some(root) = state.root_for_location(receiver) else {
-        return;
-    };
-    let Some(field_name) = typed_constant_string(op.attr.as_ref(), module_constants) else {
-        state.invalidate_root(root);
-        return;
-    };
-    if !typed_attr_access_is_indexed_field(&op.access) {
-        state.invalidate_root(root);
-        return;
-    }
-    if let Some(scalar) = state.field_scalar(root, field_name).cloned() {
-        if let Some(replacement) = typed_scalar_field_replacement_name(op.replacement.as_ref()) {
-            if rewrite && let Some(inserted_after) = inserted_after {
-                inserted_after.push(typed_store_temp(
-                    scalar.clone(),
-                    typed_load_temp(replacement),
-                ));
-                stats.inserted_scalar_stores += 1;
-            }
-            state.set_field(root, field_name.to_string(), scalar);
-        } else if typed_scalar_field_can_precompute_replacement(op.replacement.as_ref()) {
-            if rewrite && let Some(inserted_before) = inserted_before {
-                let replacement =
-                    std::mem::replace(op.replacement.as_mut(), typed_load_temp(&scalar));
-                inserted_before.push(typed_store_temp(scalar.clone(), replacement));
-                stats.inserted_scalar_stores += 1;
-            }
-            state.set_field(root, field_name.to_string(), scalar);
-        } else {
-            state.invalidate_field(root, field_name);
-        }
-    } else if let Some(replacement) = typed_scalar_field_replacement_name(op.replacement.as_ref()) {
-        state.set_field(root, field_name.to_string(), replacement.clone());
-    } else {
-        state.invalidate_field(root, field_name);
-    }
-}
-
-fn typed_constructor_field_bindings_for_store<'a>(
-    store: &Store<InstrTyped>,
-    constructor_field_bindings: &'a HashMap<InstrId, TypedConstructorFieldBindings>,
-) -> Option<&'a TypedConstructorFieldBindings> {
-    let InstrTyped::CallTyped(call) = store.value.as_ref() else {
-        return None;
-    };
-    let instr_id = call.try_semantic_instr_id()?;
-    constructor_field_bindings.get(&instr_id)
-}
-
-fn transfer_typed_field_scalar_term(
-    term: &mut BlockTerm<InstrTyped>,
-    state: &mut TypedFieldScalarState,
-    module_constants: &[ConstantExpr],
-    stats: &mut TypedFieldScalarizationStats,
-    rewrite: bool,
-) {
-    match term {
-        BlockTerm::IfTerm(if_term) => {
-            rewrite_typed_field_scalar_expr(
-                &mut if_term.test,
-                state,
-                module_constants,
-                stats,
-                rewrite,
-            );
-            if !matches!(if_term.test, InstrTyped::DirectCallGuardTest(_)) {
-                state.invalidate_roots(typed_virtual_roots_in_expr(&if_term.test, state));
-            }
-        }
-        BlockTerm::BranchTable(branch) => {
-            rewrite_typed_field_scalar_expr(
-                &mut branch.index,
-                state,
-                module_constants,
-                stats,
-                rewrite,
-            );
-            state.invalidate_roots(typed_virtual_roots_in_expr(&branch.index, state));
-        }
-        BlockTerm::Raise(raise) => {
-            if let Some(exc) = raise.exc.as_mut() {
-                rewrite_typed_field_scalar_expr(exc, state, module_constants, stats, rewrite);
-                state.invalidate_roots(typed_virtual_roots_in_expr(exc, state));
-            }
-        }
-        BlockTerm::Return(value) => {
-            rewrite_typed_field_scalar_expr(value, state, module_constants, stats, rewrite);
-            state.invalidate_roots(typed_virtual_roots_in_expr(value, state));
-        }
-        BlockTerm::Jump(_) => {}
-    }
-}
-
-fn rewrite_typed_field_scalar_expr(
-    expr: &mut InstrTyped,
-    state: &mut TypedFieldScalarState,
-    module_constants: &[ConstantExpr],
-    stats: &mut TypedFieldScalarizationStats,
-    rewrite: bool,
-) {
-    match expr {
-        InstrTyped::Load(_) | InstrTyped::IncrementCounter(_) | InstrTyped::CellRef(_) => {}
-        InstrTyped::GetAttrTyped(op) => {
-            rewrite_typed_field_scalar_getattr(op, state, module_constants, stats, rewrite);
-            if let Some(replacement) =
-                typed_field_scalar_getattr_replacement(op, state, module_constants)
-            {
-                if rewrite {
-                    stats.rewritten_loads += 1;
-                }
-                *expr = typed_load_temp(&replacement);
-            }
-        }
-        InstrTyped::SetAttrTyped(op) => {
-            rewrite_typed_field_scalar_setattr(
-                op,
-                state,
-                module_constants,
-                stats,
-                rewrite,
-                None,
-                None,
-            );
-        }
-        InstrTyped::DirectCallGuardTest(op) => {
-            rewrite_typed_field_scalar_expr(
-                op.value.as_mut(),
-                state,
-                module_constants,
-                stats,
-                rewrite,
-            );
-        }
-        _ => {
-            rewrite_typed_field_scalar_children(expr, state, module_constants, stats, rewrite);
-            state.invalidate_roots(typed_virtual_roots_in_expr(expr, state));
-        }
-    }
-}
-
-fn rewrite_typed_field_scalar_getattr(
-    op: &mut TypedGetAttr<InstrTyped>,
-    state: &mut TypedFieldScalarState,
-    module_constants: &[ConstantExpr],
-    stats: &mut TypedFieldScalarizationStats,
-    rewrite: bool,
-) {
-    if typed_instr_local_load_location(op.value.as_ref()).is_none() {
-        rewrite_typed_field_scalar_expr(op.value.as_mut(), state, module_constants, stats, rewrite);
-    }
-    rewrite_typed_field_scalar_expr(op.attr.as_mut(), state, module_constants, stats, rewrite);
-    if typed_field_scalar_getattr_replacement(op, state, module_constants).is_some() {
-        return;
-    }
-    if let Some(receiver) = typed_instr_local_load_location(op.value.as_ref())
-        && let Some(root) = state.root_for_location(receiver)
-    {
-        if typed_attr_access_is_indexed_field(&op.access)
-            && let Some(field_name) = typed_constant_string(op.attr.as_ref(), module_constants)
-        {
-            state.invalidate_field(root, field_name);
-            return;
-        }
-        state.invalidate_root(root);
-    } else {
-        state.invalidate_roots(typed_virtual_roots_in_expr(op.value.as_ref(), state));
-    }
-}
-
-fn typed_field_scalar_getattr_replacement(
-    op: &TypedGetAttr<InstrTyped>,
-    state: &TypedFieldScalarState,
-    module_constants: &[ConstantExpr],
-) -> Option<ResolvedName> {
-    if !typed_attr_access_is_indexed_field(&op.access) {
-        return None;
-    }
-    let receiver = typed_instr_local_load_location(op.value.as_ref())?;
-    let root = state.root_for_location(receiver)?;
-    let field_name = typed_constant_string(op.attr.as_ref(), module_constants)?;
-    state.field_value(root, field_name).cloned()
-}
-
-fn typed_attr_access_is_indexed_field(access: &TypedAttrAccessPlan) -> bool {
-    matches!(access, TypedAttrAccessPlan::IndexedField { .. })
-}
-
-fn typed_scalar_field_replacement_name(expr: &InstrTyped) -> Option<&ResolvedName> {
-    let InstrTyped::Load(load) = expr else {
-        return None;
-    };
-    load.name.local_location()?;
-    Some(&load.name)
-}
-
-fn typed_scalar_field_can_precompute_replacement(expr: &InstrTyped) -> bool {
-    match expr {
-        InstrTyped::Load(_) => true,
-        InstrTyped::BinOp(op) => {
-            typed_scalar_field_can_precompute_replacement(op.left.as_ref())
-                && typed_scalar_field_can_precompute_replacement(op.right.as_ref())
-        }
-        InstrTyped::UnaryOp(op) => {
-            typed_scalar_field_can_precompute_replacement(op.operand.as_ref())
-        }
-        InstrTyped::Tuple(op) => op
-            .values
-            .iter()
-            .all(typed_scalar_field_can_precompute_replacement),
-        _ => false,
-    }
-}
-
-fn rewrite_typed_field_scalar_children(
-    expr: &mut InstrTyped,
-    state: &mut TypedFieldScalarState,
-    module_constants: &[ConstantExpr],
-    stats: &mut TypedFieldScalarizationStats,
-    rewrite: bool,
-) {
-    match expr {
-        InstrTyped::Truthy(op) => rewrite_typed_field_scalar_expr(
-            op.value.as_mut(),
-            state,
-            module_constants,
-            stats,
-            rewrite,
-        ),
-        InstrTyped::BinOp(op) => {
-            rewrite_typed_field_scalar_expr(
-                op.left.as_mut(),
-                state,
-                module_constants,
-                stats,
-                rewrite,
-            );
-            rewrite_typed_field_scalar_expr(
-                op.right.as_mut(),
-                state,
-                module_constants,
-                stats,
-                rewrite,
-            );
-        }
-        InstrTyped::Tuple(op) => {
-            for value in &mut op.values {
-                rewrite_typed_field_scalar_expr(value, state, module_constants, stats, rewrite);
-            }
-        }
-        InstrTyped::UnaryOp(op) => rewrite_typed_field_scalar_expr(
-            op.operand.as_mut(),
-            state,
-            module_constants,
-            stats,
-            rewrite,
-        ),
-        InstrTyped::CalleeFunctionId(op) => rewrite_typed_field_scalar_expr(
-            op.value.as_mut(),
-            state,
-            module_constants,
-            stats,
-            rewrite,
-        ),
-        InstrTyped::CallTyped(op) => {
-            rewrite_typed_field_scalar_expr(
-                op.func.as_mut(),
-                state,
-                module_constants,
-                stats,
-                rewrite,
-            );
-            rewrite_typed_field_scalar_call_args(
-                &mut op.args,
-                &mut op.keywords,
-                state,
-                module_constants,
-                stats,
-                rewrite,
-            );
-        }
-        InstrTyped::GuardedCallableCallTyped(op) => {
-            rewrite_typed_field_scalar_expr(
-                op.func.as_mut(),
-                state,
-                module_constants,
-                stats,
-                rewrite,
-            );
-            rewrite_typed_field_scalar_call_args(
-                &mut op.args,
-                &mut op.keywords,
-                state,
-                module_constants,
-                stats,
-                rewrite,
-            );
-        }
-        InstrTyped::GuardedMethodCallTyped(op) => {
-            rewrite_typed_field_scalar_expr(
-                op.func.as_mut(),
-                state,
-                module_constants,
-                stats,
-                rewrite,
-            );
-            rewrite_typed_field_scalar_call_args(
-                &mut op.args,
-                &mut op.keywords,
-                state,
-                module_constants,
-                stats,
-                rewrite,
-            );
-        }
-        InstrTyped::DirectCallableCallTyped(op) => {
-            rewrite_typed_field_scalar_expr(
-                op.func.as_mut(),
-                state,
-                module_constants,
-                stats,
-                rewrite,
-            );
-            rewrite_typed_field_scalar_positional_args(
-                &mut op.args,
-                state,
-                module_constants,
-                stats,
-                rewrite,
-            );
-        }
-        InstrTyped::DirectMethodCallTyped(op) => {
-            rewrite_typed_field_scalar_expr(
-                op.receiver.as_mut(),
-                state,
-                module_constants,
-                stats,
-                rewrite,
-            );
-            rewrite_typed_field_scalar_positional_args(
-                &mut op.args,
-                state,
-                module_constants,
-                stats,
-                rewrite,
-            );
-        }
-        InstrTyped::CallDirect(op) => {
-            rewrite_typed_field_scalar_expr(
-                op.callable.as_mut(),
-                state,
-                module_constants,
-                stats,
-                rewrite,
-            );
-            rewrite_typed_field_scalar_call_args(
-                &mut op.args,
-                &mut op.keywords,
-                state,
-                module_constants,
-                stats,
-                rewrite,
-            );
-        }
-        InstrTyped::GetItem(op) => {
-            rewrite_typed_field_scalar_expr(
-                op.value.as_mut(),
-                state,
-                module_constants,
-                stats,
-                rewrite,
-            );
-            rewrite_typed_field_scalar_expr(
-                op.index.as_mut(),
-                state,
-                module_constants,
-                stats,
-                rewrite,
-            );
-        }
-        InstrTyped::SetItem(op) => {
-            rewrite_typed_field_scalar_expr(
-                op.value.as_mut(),
-                state,
-                module_constants,
-                stats,
-                rewrite,
-            );
-            rewrite_typed_field_scalar_expr(
-                op.index.as_mut(),
-                state,
-                module_constants,
-                stats,
-                rewrite,
-            );
-            rewrite_typed_field_scalar_expr(
-                op.replacement.as_mut(),
-                state,
-                module_constants,
-                stats,
-                rewrite,
-            );
-        }
-        InstrTyped::DelItem(op) => {
-            rewrite_typed_field_scalar_expr(
-                op.value.as_mut(),
-                state,
-                module_constants,
-                stats,
-                rewrite,
-            );
-            rewrite_typed_field_scalar_expr(
-                op.index.as_mut(),
-                state,
-                module_constants,
-                stats,
-                rewrite,
-            );
-        }
-        InstrTyped::Store(op) => rewrite_typed_field_scalar_expr(
-            op.value.as_mut(),
-            state,
-            module_constants,
-            stats,
-            rewrite,
-        ),
-        InstrTyped::MakeFunctionWithClosure(op) => {
-            rewrite_typed_field_scalar_expr(
-                op.captures.as_mut(),
-                state,
-                module_constants,
-                stats,
-                rewrite,
-            );
-            rewrite_typed_field_scalar_expr(
-                op.param_defaults.as_mut(),
-                state,
-                module_constants,
-                stats,
-                rewrite,
-            );
-            rewrite_typed_field_scalar_expr(
-                op.annotate_fn.as_mut(),
-                state,
-                module_constants,
-                stats,
-                rewrite,
-            );
-        }
-        InstrTyped::Load(_)
-        | InstrTyped::GetAttrTyped(_)
-        | InstrTyped::SetAttrTyped(_)
-        | InstrTyped::DirectCallGuardTest(_)
-        | InstrTyped::Del(_)
-        | InstrTyped::MakeCell(_)
-        | InstrTyped::IncrementCounter(_)
-        | InstrTyped::CellRef(_) => {}
-    }
-}
-
-fn rewrite_typed_field_scalar_call_args(
-    args: &mut [CallArgPositional<InstrTyped>],
-    keywords: &mut [CallArgKeyword<InstrTyped>],
-    state: &mut TypedFieldScalarState,
-    module_constants: &[ConstantExpr],
-    stats: &mut TypedFieldScalarizationStats,
-    rewrite: bool,
-) {
-    rewrite_typed_field_scalar_positional_args(args, state, module_constants, stats, rewrite);
-    for keyword in keywords {
-        rewrite_typed_field_scalar_expr(
-            keyword.expr_mut(),
-            state,
-            module_constants,
-            stats,
-            rewrite,
-        );
-    }
-}
-
-fn rewrite_typed_field_scalar_positional_args(
-    args: &mut [CallArgPositional<InstrTyped>],
-    state: &mut TypedFieldScalarState,
-    module_constants: &[ConstantExpr],
-    stats: &mut TypedFieldScalarizationStats,
-    rewrite: bool,
-) {
-    for arg in args {
-        rewrite_typed_field_scalar_expr(arg.expr_mut(), state, module_constants, stats, rewrite);
-    }
-}
-
-fn typed_virtual_roots_in_expr(
-    expr: &InstrTyped,
-    state: &TypedFieldScalarState,
-) -> HashSet<LocalLocation> {
-    struct Collector<'a> {
-        state: &'a TypedFieldScalarState,
-        roots: HashSet<LocalLocation>,
-    }
-
-    impl Visit<InstrTyped> for Collector<'_> {
-        fn visit_instr(&mut self, expr: &InstrTyped) {
-            if let Some(location) = typed_instr_local_load_location(expr)
-                && let Some(root) = self.state.root_for_location(location)
-            {
-                self.roots.insert(root);
-            }
-            expr.visit_children(self);
-        }
-    }
-
-    let mut collector = Collector {
-        state,
-        roots: HashSet::new(),
-    };
-    collector.visit_instr(expr);
-    collector.roots
-}
-
-fn typed_constant_string<'a>(
-    expr: &InstrTyped,
-    module_constants: &'a [ConstantExpr],
-) -> Option<&'a str> {
-    let InstrTyped::Load(load) = expr else {
-        return None;
-    };
-    let constant_index = load.name.location.as_constant()? as usize;
-    match module_constants.get(constant_index)? {
-        ConstantExpr::Literal(value) => match value.as_literal() {
-            Literal::StringLiteral(value) => Some(value.value.as_str()),
-            Literal::BytesLiteral(_) | Literal::NumberLiteral(_) => None,
-        },
-        ConstantExpr::RuntimeName(_) => None,
-    }
 }
 
 fn find_typed_inline_candidate(
@@ -4802,6 +3306,7 @@ fn build_single_block_typed_inline_fragment_to_target(
     let mut constant_scope =
         typed_inline_constant_scope(caller_module_constants, callee_module_constants)?;
     let mut remapper = TypedInlineLocalRemapper::new(
+        callee_layout,
         &locals,
         value_bindings,
         &mut instr_id_remapper,
@@ -4859,18 +3364,6 @@ fn build_multi_block_typed_inline_fragment_to_target(
             return Err(TypedInlineUnsupportedReason::MissingCalleeLocal(location));
         }
     }
-    for block in &callee.blocks {
-        if !block.params.is_empty() {
-            return Err(TypedInlineUnsupportedReason::BlockParams);
-        }
-        if block.exc_edge.is_some() {
-            return Err(TypedInlineUnsupportedReason::ExceptionEdge);
-        }
-        if typed_term_has_jump_args(&block.term) {
-            return Err(TypedInlineUnsupportedReason::JumpArgs);
-        }
-    }
-
     let locals = allocate_typed_inline_locals(caller, callee_layout, value_bindings)?;
     let local_mappings = typed_inline_local_mappings(
         callee.function_id,
@@ -4889,6 +3382,7 @@ fn build_multi_block_typed_inline_fragment_to_target(
     let mut constant_scope =
         typed_inline_constant_scope(caller_module_constants, callee_module_constants)?;
     let mut remapper = TypedInlineLocalRemapper::new(
+        callee_layout,
         &locals,
         value_bindings,
         &mut instr_id_remapper,
@@ -4915,16 +3409,29 @@ fn build_multi_block_typed_inline_fragment_to_target(
                 );
                 BlockTerm::Jump(BlockEdge::new(continuation))
             }
-            term => {
-                typed_remap_inline_term_labels(remapper.try_map_term(term.clone())?, &label_map)?
-            }
+            term => typed_remap_inline_term_labels(
+                remapper.try_map_term(term.clone())?,
+                &label_map,
+                &mut remapper,
+            )?,
         };
+        let params = callee_block
+            .params
+            .iter()
+            .cloned()
+            .map(|param| remapper.try_map_block_param(param))
+            .collect::<Result<Vec<_>, _>>()?;
+        let exc_edge = callee_block
+            .exc_edge
+            .clone()
+            .map(|edge| typed_remap_inline_edge(edge, &label_map, &mut remapper))
+            .transpose()?;
         blocks.push(Block::new_with_extra(
             label,
             body,
             term,
-            Vec::new(),
-            None,
+            params,
+            exc_edge,
             callee_block.extra.clone(),
         ));
     }
@@ -5015,16 +3522,6 @@ fn typed_inline_value_binding_name(
     Ok(&load.name)
 }
 
-fn typed_term_has_jump_args(term: &BlockTerm<InstrTyped>) -> bool {
-    match term {
-        BlockTerm::Jump(edge) => !edge.args.is_empty(),
-        BlockTerm::IfTerm(_)
-        | BlockTerm::BranchTable(_)
-        | BlockTerm::Raise(_)
-        | BlockTerm::Return(_) => false,
-    }
-}
-
 fn typed_remapped_label(
     label_map: &HashMap<BlockLabel, BlockLabel>,
     label: BlockLabel,
@@ -5038,12 +3535,12 @@ fn typed_remapped_label(
 fn typed_remap_inline_term_labels(
     term: BlockTerm<InstrTyped>,
     label_map: &HashMap<BlockLabel, BlockLabel>,
+    remapper: &mut TypedInlineLocalRemapper<'_, '_, '_, '_, '_>,
 ) -> Result<BlockTerm<InstrTyped>, TypedInlineUnsupportedReason> {
     Ok(match term {
-        BlockTerm::Jump(edge) => BlockTerm::Jump(BlockEdge::new(typed_remapped_label(
-            label_map,
-            edge.target,
-        )?)),
+        BlockTerm::Jump(edge) => {
+            BlockTerm::Jump(typed_remap_inline_edge(edge, label_map, remapper)?)
+        }
         BlockTerm::IfTerm(mut term) => {
             term.then_label = typed_remapped_label(label_map, term.then_label)?;
             term.else_label = typed_remapped_label(label_map, term.else_label)?;
@@ -5059,6 +3556,20 @@ fn typed_remap_inline_term_labels(
         BlockTerm::Raise(term) => BlockTerm::Raise(term),
         BlockTerm::Return(_) => return Err(TypedInlineUnsupportedReason::NonReturnTerm),
     })
+}
+
+fn typed_remap_inline_edge(
+    mut edge: BlockEdge,
+    label_map: &HashMap<BlockLabel, BlockLabel>,
+    remapper: &mut TypedInlineLocalRemapper<'_, '_, '_, '_, '_>,
+) -> Result<BlockEdge, TypedInlineUnsupportedReason> {
+    edge.target = typed_remapped_label(label_map, edge.target)?;
+    edge.args = edge
+        .args
+        .into_iter()
+        .map(|arg| remapper.try_map_block_arg(arg))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(edge)
 }
 
 enum TypedInlineConstantScope<'a> {
@@ -5138,6 +3649,7 @@ fn typed_inline_constant_scope<'a>(
 }
 
 struct TypedInlineLocalRemapper<'locals, 'bindings, 'constants, 'remapper, 'allocator> {
+    callee_layout: &'locals soac_core::block_py::StorageLayout,
     locals: &'locals HashMap<LocalLocation, TypedTempLocal>,
     value_bindings: &'bindings TypedInlineValueBindings,
     instr_id_remapper: &'remapper mut TypedInlineInstrIdRemapper<'allocator>,
@@ -5148,17 +3660,77 @@ impl<'locals, 'bindings, 'constants, 'remapper, 'allocator>
     TypedInlineLocalRemapper<'locals, 'bindings, 'constants, 'remapper, 'allocator>
 {
     fn new(
+        callee_layout: &'locals soac_core::block_py::StorageLayout,
         locals: &'locals HashMap<LocalLocation, TypedTempLocal>,
         value_bindings: &'bindings TypedInlineValueBindings,
         instr_id_remapper: &'remapper mut TypedInlineInstrIdRemapper<'allocator>,
         constant_scope: &'remapper mut TypedInlineConstantScope<'constants>,
     ) -> Self {
         Self {
+            callee_layout,
             locals,
             value_bindings,
             instr_id_remapper,
             constant_scope,
         }
+    }
+
+    fn callee_local_location_by_name(&self, name: &str) -> Option<LocalLocation> {
+        self.callee_layout
+            .stack_slots()
+            .iter()
+            .position(|slot_name| slot_name == name)
+            .map(|slot| {
+                LocalLocation(
+                    u32::try_from(slot).expect("callee stack slot index should fit in u32"),
+                )
+            })
+    }
+
+    fn try_map_block_local_name(
+        &self,
+        name: String,
+    ) -> Result<String, TypedInlineUnsupportedReason> {
+        let Some(location) = self.callee_local_location_by_name(name.as_str()) else {
+            return Err(TypedInlineUnsupportedReason::UnknownBlockName(name));
+        };
+        if let Some(value) = self.value_bindings.get(&location) {
+            let bound_name = typed_inline_value_binding_name(location, value)?;
+            if bound_name.local_location().is_none() {
+                return Err(TypedInlineUnsupportedReason::NonLocalValueBinding(location));
+            }
+            return Ok(bound_name.id.as_str().to_string());
+        }
+        let Some(fresh) = self.locals.get(&location) else {
+            return Err(TypedInlineUnsupportedReason::MissingCalleeLocal(location));
+        };
+        Ok(fresh.name.clone())
+    }
+
+    fn try_map_block_param(
+        &self,
+        mut param: BlockParam,
+    ) -> Result<BlockParam, TypedInlineUnsupportedReason> {
+        let Some(location) = self.callee_local_location_by_name(param.name.as_str()) else {
+            return Err(TypedInlineUnsupportedReason::UnknownBlockName(param.name));
+        };
+        if self.value_bindings.contains_key(&location) {
+            return Err(TypedInlineUnsupportedReason::RebindsBoundLocal(location));
+        }
+        let Some(fresh) = self.locals.get(&location) else {
+            return Err(TypedInlineUnsupportedReason::MissingCalleeLocal(location));
+        };
+        param.name = fresh.name.clone();
+        Ok(param)
+    }
+
+    fn try_map_block_arg(&self, arg: BlockArg) -> Result<BlockArg, TypedInlineUnsupportedReason> {
+        Ok(match arg {
+            BlockArg::Name(name) => BlockArg::Name(self.try_map_block_local_name(name)?),
+            BlockArg::None => BlockArg::None,
+            BlockArg::CurrentException => BlockArg::CurrentException,
+            BlockArg::AbruptKind(kind) => BlockArg::AbruptKind(kind),
+        })
     }
 }
 
@@ -5291,6 +3863,676 @@ fn clear_typed_instr_ids(mut instr: InstrTyped) -> InstrTyped {
     }
     Scrubber.visit_instr_mut(&mut instr);
     instr
+}
+
+pub fn simplify_typed_virtual_tuple_ops(
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+    module_constants: &mut Vec<ConstantExpr>,
+) -> usize {
+    let virtual_tuple_defs = collect_replayable_typed_tuple_local_defs(function);
+    let dominators = typed_block_dominators(function);
+
+    struct Simplifier<'a> {
+        virtual_tuple_defs: &'a HashMap<LocalLocation, Vec<TypedTupleLocalDef>>,
+        dominators: &'a HashMap<BlockLabel, HashSet<BlockLabel>>,
+        module_constants: &'a mut Vec<ConstantExpr>,
+        block: BlockLabel,
+        instr_index: usize,
+        changed: usize,
+    }
+
+    impl VisitMut<InstrTyped> for Simplifier<'_> {
+        fn visit_instr_mut(&mut self, expr: &mut InstrTyped) {
+            expr.visit_children_mut(self);
+
+            if let Some(replacement) = simplify_typed_virtual_tuple_len(
+                expr,
+                self.virtual_tuple_defs,
+                self.module_constants,
+                self.block,
+                self.instr_index,
+                self.dominators,
+            ) {
+                *expr = replacement;
+                self.changed += 1;
+                return;
+            }
+
+            if let Some(replacement) = simplify_typed_virtual_tuple_getitem(
+                expr,
+                self.virtual_tuple_defs,
+                self.module_constants,
+                self.block,
+                self.instr_index,
+                self.dominators,
+            ) {
+                *expr = replacement;
+                self.changed += 1;
+                return;
+            }
+
+            if let Some(replacement) =
+                simplify_typed_exact_int_index_call(expr, self.module_constants)
+            {
+                *expr = replacement;
+                self.changed += 1;
+            }
+        }
+    }
+
+    let tuple_changed = {
+        let mut changed = 0;
+        for block in &mut function.blocks {
+            for (instr_index, instr) in block.body.iter_mut().enumerate() {
+                let mut simplifier = Simplifier {
+                    virtual_tuple_defs: &virtual_tuple_defs,
+                    dominators: &dominators,
+                    module_constants,
+                    block: block.label,
+                    instr_index,
+                    changed: 0,
+                };
+                simplifier.visit_instr_mut(instr);
+                changed += simplifier.changed;
+            }
+            let mut simplifier = Simplifier {
+                virtual_tuple_defs: &virtual_tuple_defs,
+                dominators: &dominators,
+                module_constants,
+                block: block.label,
+                instr_index: block.body.len(),
+                changed: 0,
+            };
+            simplifier.visit_term_mut(&mut block.term);
+            changed += simplifier.changed;
+        }
+        changed
+    };
+    let mut changed = tuple_changed;
+    let constant_locals = collect_typed_i64_constant_local_defs(function, module_constants);
+    changed += rewrite_dominated_typed_constant_loads(function, &constant_locals);
+    changed += fold_typed_constant_branches(function, module_constants);
+
+    changed
+}
+
+#[derive(Clone)]
+struct TypedTupleLocalDef {
+    values: Vec<InstrTyped>,
+    def_block: BlockLabel,
+    def_index: usize,
+}
+
+fn collect_replayable_typed_tuple_local_defs(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+) -> HashMap<LocalLocation, Vec<TypedTupleLocalDef>> {
+    let mut candidates = HashMap::<LocalLocation, Vec<TypedTupleLocalDef>>::new();
+    let mut invalid = HashSet::<LocalLocation>::new();
+
+    for block in &function.blocks {
+        for (index, instr) in block.body.iter().enumerate() {
+            match instr {
+                InstrTyped::Store(store) => {
+                    let Some(location) = store.name.local_location() else {
+                        continue;
+                    };
+                    if invalid.contains(&location) {
+                        continue;
+                    }
+                    let InstrTyped::Tuple(tuple) = store.value.as_ref() else {
+                        invalid.insert(location);
+                        candidates.remove(&location);
+                        continue;
+                    };
+                    if !typed_tuple_values_are_replayable_loads(tuple.values.as_slice()) {
+                        invalid.insert(location);
+                        candidates.remove(&location);
+                        continue;
+                    }
+                    candidates
+                        .entry(location)
+                        .or_default()
+                        .push(TypedTupleLocalDef {
+                            values: tuple.values.clone(),
+                            def_block: block.label,
+                            def_index: index,
+                        });
+                }
+                InstrTyped::Del(del) => {
+                    if let Some(location) = del.name.local_location() {
+                        invalid.insert(location);
+                        candidates.remove(&location);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    candidates
+}
+
+fn typed_tuple_values_are_replayable_loads(values: &[InstrTyped]) -> bool {
+    values
+        .iter()
+        .all(|value| matches!(value, InstrTyped::Load(_)))
+}
+
+fn simplify_typed_virtual_tuple_len(
+    expr: &InstrTyped,
+    virtual_tuple_defs: &HashMap<LocalLocation, Vec<TypedTupleLocalDef>>,
+    module_constants: &mut Vec<ConstantExpr>,
+    use_block: BlockLabel,
+    use_index: usize,
+    dominators: &HashMap<BlockLabel, HashSet<BlockLabel>>,
+) -> Option<InstrTyped> {
+    let InstrTyped::CallTyped(call) = expr else {
+        return None;
+    };
+    if !typed_expr_is_runtime_name_load(call.func.as_ref(), RuntimeName::Len, module_constants)
+        || !call.keywords.is_empty()
+        || call.args.len() != 1
+    {
+        return None;
+    }
+    let CallArgPositional::Positional(arg) = &call.args[0] else {
+        return None;
+    };
+    let values =
+        typed_virtual_tuple_values(arg, virtual_tuple_defs, use_block, use_index, dominators)?;
+    Some(typed_i64_constant_load(
+        module_constants,
+        i64::try_from(values.len()).expect("tuple length should fit in i64"),
+        expr.meta(),
+    ))
+}
+
+fn simplify_typed_virtual_tuple_getitem(
+    expr: &InstrTyped,
+    virtual_tuple_defs: &HashMap<LocalLocation, Vec<TypedTupleLocalDef>>,
+    module_constants: &[ConstantExpr],
+    use_block: BlockLabel,
+    use_index: usize,
+    dominators: &HashMap<BlockLabel, HashSet<BlockLabel>>,
+) -> Option<InstrTyped> {
+    let InstrTyped::GetItem(op) = expr else {
+        return None;
+    };
+    let values = typed_virtual_tuple_values(
+        op.value.as_ref(),
+        virtual_tuple_defs,
+        use_block,
+        use_index,
+        dominators,
+    )?;
+    let index = typed_expr_const_i64(op.index.as_ref(), module_constants)?;
+    let normalized = if index < 0 {
+        i64::try_from(values.len()).ok()?.checked_add(index)?
+    } else {
+        index
+    };
+    let index = usize::try_from(normalized).ok()?;
+    let value = values.get(index)?;
+    Some(clear_typed_instr_ids(value.clone()))
+}
+
+fn simplify_typed_exact_int_index_call(
+    expr: &InstrTyped,
+    module_constants: &[ConstantExpr],
+) -> Option<InstrTyped> {
+    let InstrTyped::CallTyped(call) = expr else {
+        return None;
+    };
+    if !typed_expr_is_runtime_name_load(call.func.as_ref(), RuntimeName::Index, module_constants)
+        || !call.keywords.is_empty()
+        || call.args.len() != 1
+    {
+        return None;
+    }
+    let CallArgPositional::Positional(arg) = &call.args[0] else {
+        return None;
+    };
+    if !typed_expr_is_exact_int(arg) {
+        return None;
+    }
+    Some(clear_typed_instr_ids(arg.clone()))
+}
+
+fn typed_expr_is_exact_int(expr: &InstrTyped) -> bool {
+    expr.result_facts()
+        .and_then(|facts| facts.as_pyobj())
+        .is_some_and(|facts| facts.is_exact_type(PyExactType::Int))
+}
+
+fn typed_virtual_tuple_values<'a>(
+    expr: &'a InstrTyped,
+    virtual_tuple_defs: &'a HashMap<LocalLocation, Vec<TypedTupleLocalDef>>,
+    use_block: BlockLabel,
+    use_index: usize,
+    dominators: &HashMap<BlockLabel, HashSet<BlockLabel>>,
+) -> Option<&'a [InstrTyped]> {
+    match expr {
+        InstrTyped::Tuple(tuple) if typed_tuple_values_are_replayable_loads(&tuple.values) => {
+            Some(tuple.values.as_slice())
+        }
+        InstrTyped::Load(load) => load
+            .name
+            .local_location()
+            .and_then(|location| {
+                dominating_typed_tuple_def_for_use(
+                    virtual_tuple_defs.get(&location)?,
+                    use_block,
+                    use_index,
+                    dominators,
+                )
+            })
+            .map(|def| def.values.as_slice()),
+        _ => None,
+    }
+}
+
+fn typed_expr_const_i64(expr: &InstrTyped, module_constants: &[ConstantExpr]) -> Option<i64> {
+    let InstrTyped::Load(load) = expr else {
+        return None;
+    };
+    let index = load.name.location.as_constant()?;
+    typed_module_constant_i64_value(module_constants, index)
+}
+
+fn typed_module_constant_i64_value(module_constants: &[ConstantExpr], index: u32) -> Option<i64> {
+    let ConstantExpr::Literal(literal) = module_constants.get(index as usize)? else {
+        return None;
+    };
+    let Literal::NumberLiteral(number) = literal.as_literal() else {
+        return None;
+    };
+    let NumberLiteralValue::Int(value) = &number.value else {
+        return None;
+    };
+    value.as_i64()
+}
+
+fn fold_typed_constant_branches(
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+    module_constants: &[ConstantExpr],
+) -> usize {
+    let mut changed = 0;
+    for block in &mut function.blocks {
+        let BlockTerm::IfTerm(if_term) = &block.term else {
+            continue;
+        };
+        let Some(truthy) = typed_expr_const_truthiness(&if_term.test, module_constants) else {
+            continue;
+        };
+        let target = if truthy {
+            if_term.then_label
+        } else {
+            if_term.else_label
+        };
+        block.term = BlockTerm::Jump(BlockEdge::new(target));
+        changed += 1;
+    }
+    changed + prune_unreachable_typed_blocks(function)
+}
+
+fn typed_expr_const_truthiness(
+    expr: &InstrTyped,
+    module_constants: &[ConstantExpr],
+) -> Option<bool> {
+    match expr {
+        InstrTyped::Truthy(op) => typed_expr_const_truthiness(op.value.as_ref(), module_constants),
+        InstrTyped::UnaryOp(op) if op.kind == UnaryOpKind::Not => Some(
+            !typed_expr_const_truthiness(op.operand.as_ref(), module_constants)?,
+        ),
+        InstrTyped::UnaryOp(op) if op.kind == UnaryOpKind::Truth => {
+            typed_expr_const_truthiness(op.operand.as_ref(), module_constants)
+        }
+        InstrTyped::BinOp(op) => typed_i64_binop_const_bool(
+            op.kind,
+            op.left.as_ref(),
+            op.right.as_ref(),
+            module_constants,
+        ),
+        _ => typed_expr_const_i64(expr, module_constants).map(|value| value != 0),
+    }
+}
+
+fn typed_i64_binop_const_bool(
+    kind: BinOpKind,
+    left: &InstrTyped,
+    right: &InstrTyped,
+    module_constants: &[ConstantExpr],
+) -> Option<bool> {
+    let left = typed_expr_const_i64(left, module_constants)?;
+    let right = typed_expr_const_i64(right, module_constants)?;
+    match kind {
+        BinOpKind::Eq => Some(left == right),
+        BinOpKind::Ne => Some(left != right),
+        BinOpKind::Lt => Some(left < right),
+        BinOpKind::Le => Some(left <= right),
+        BinOpKind::Gt => Some(left > right),
+        BinOpKind::Ge => Some(left >= right),
+        _ => None,
+    }
+}
+
+fn prune_unreachable_typed_blocks(
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+) -> usize {
+    let Some(entry) = function.blocks.first().map(|block| block.label) else {
+        return 0;
+    };
+    let labels = typed_block_indices_by_label(function);
+    let Some(reachable) = typed_reachable_block_labels(function, &labels, entry) else {
+        return 0;
+    };
+    let before = function.blocks.len();
+    function
+        .blocks
+        .retain(|block| reachable.contains(&block.label));
+    before - function.blocks.len()
+}
+
+fn typed_i64_constant_load(
+    module_constants: &mut Vec<ConstantExpr>,
+    value: i64,
+    mut meta: Meta,
+) -> InstrTyped {
+    let index =
+        u32::try_from(module_constants.len()).expect("module constant count should fit u32");
+    module_constants.push(ConstantExpr::Literal(LiteralValue::new(
+        Literal::NumberLiteral(NumberLiteral {
+            value: NumberLiteralValue::Int(IntLiteral::from_i64(value)),
+        }),
+    )));
+    meta.instr_id = None;
+    let truthiness = if value == 0 {
+        TruthinessFact::AlwaysFalse
+    } else {
+        TruthinessFact::AlwaysTrue
+    };
+    let mut extra = TypedInstrExtra::default();
+    extra.refine_result_facts(ValueFacts::PyObj(
+        PyObjFacts::exact_type_with_truthiness(PyExactType::Int, truthiness)
+            .with_module_constant(index)
+            .with_immortal_refcount(),
+    ));
+    InstrTyped::Load(
+        Load::new(ResolvedName {
+            id: "__dp_constant".into(),
+            location: NameLocation::Constant(index),
+        })
+        .with_extra(extra)
+        .with_meta(meta),
+    )
+}
+
+#[derive(Clone)]
+struct TypedConstantLocal {
+    value: InstrTyped,
+    def_block: BlockLabel,
+    def_index: usize,
+}
+
+fn collect_typed_i64_constant_local_defs(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    module_constants: &[ConstantExpr],
+) -> HashMap<LocalLocation, Vec<TypedConstantLocal>> {
+    let mut candidates = HashMap::<LocalLocation, Vec<TypedConstantLocal>>::new();
+    let mut invalid = HashSet::<LocalLocation>::new();
+
+    for block in &function.blocks {
+        for (index, instr) in block.body.iter().enumerate() {
+            match instr {
+                InstrTyped::Store(store) => {
+                    let Some(location) = store.name.local_location() else {
+                        continue;
+                    };
+                    if invalid.contains(&location) {
+                        continue;
+                    }
+                    if typed_expr_const_i64(store.value.as_ref(), module_constants).is_none() {
+                        invalid.insert(location);
+                        candidates.remove(&location);
+                        continue;
+                    }
+                    candidates
+                        .entry(location)
+                        .or_default()
+                        .push(TypedConstantLocal {
+                            value: clear_typed_instr_ids(*store.value.clone()),
+                            def_block: block.label,
+                            def_index: index,
+                        });
+                }
+                InstrTyped::Del(del) => {
+                    if let Some(location) = del.name.local_location() {
+                        invalid.insert(location);
+                        candidates.remove(&location);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    candidates
+}
+
+fn rewrite_dominated_typed_constant_loads(
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+    constant_locals: &HashMap<LocalLocation, Vec<TypedConstantLocal>>,
+) -> usize {
+    let dominators = typed_block_dominators(function);
+
+    struct Rewriter<'a> {
+        constant_locals: &'a HashMap<LocalLocation, Vec<TypedConstantLocal>>,
+        dominators: &'a HashMap<BlockLabel, HashSet<BlockLabel>>,
+        block: BlockLabel,
+        instr_index: usize,
+        changed: usize,
+    }
+
+    impl VisitMut<InstrTyped> for Rewriter<'_> {
+        fn visit_instr_mut(&mut self, expr: &mut InstrTyped) {
+            if let InstrTyped::Load(load) = expr
+                && load.name.location.as_constant().is_none()
+                && let Some(location) = load.name.local_location()
+                && let Some(constants) = self.constant_locals.get(&location)
+                && let Some(constant) = dominating_typed_constant_def_for_use(
+                    constants,
+                    self.block,
+                    self.instr_index,
+                    self.dominators,
+                )
+            {
+                *expr = clear_typed_instr_ids(constant.value.clone());
+                self.changed += 1;
+                return;
+            }
+            expr.visit_children_mut(self);
+        }
+    }
+
+    let mut changed = 0;
+    for block in &mut function.blocks {
+        for (instr_index, instr) in block.body.iter_mut().enumerate() {
+            let mut rewriter = Rewriter {
+                constant_locals,
+                dominators: &dominators,
+                block: block.label,
+                instr_index,
+                changed: 0,
+            };
+            rewriter.visit_instr_mut(instr);
+            changed += rewriter.changed;
+        }
+        let mut rewriter = Rewriter {
+            constant_locals,
+            dominators: &dominators,
+            block: block.label,
+            instr_index: block.body.len(),
+            changed: 0,
+        };
+        rewriter.visit_term_mut(&mut block.term);
+        changed += rewriter.changed;
+    }
+    changed
+}
+
+trait TypedLocalDef {
+    fn def_block(&self) -> BlockLabel;
+    fn def_index(&self) -> usize;
+}
+
+impl TypedLocalDef for TypedTupleLocalDef {
+    fn def_block(&self) -> BlockLabel {
+        self.def_block
+    }
+
+    fn def_index(&self) -> usize {
+        self.def_index
+    }
+}
+
+impl TypedLocalDef for TypedConstantLocal {
+    fn def_block(&self) -> BlockLabel {
+        self.def_block
+    }
+
+    fn def_index(&self) -> usize {
+        self.def_index
+    }
+}
+
+fn dominating_typed_tuple_def_for_use<'a>(
+    defs: &'a [TypedTupleLocalDef],
+    use_block: BlockLabel,
+    use_index: usize,
+    dominators: &HashMap<BlockLabel, HashSet<BlockLabel>>,
+) -> Option<&'a TypedTupleLocalDef> {
+    select_dominating_typed_local_def(defs, use_block, use_index, dominators)
+}
+
+fn dominating_typed_constant_def_for_use<'a>(
+    defs: &'a [TypedConstantLocal],
+    use_block: BlockLabel,
+    use_index: usize,
+    dominators: &HashMap<BlockLabel, HashSet<BlockLabel>>,
+) -> Option<&'a TypedConstantLocal> {
+    select_dominating_typed_local_def(defs, use_block, use_index, dominators)
+}
+
+fn select_dominating_typed_local_def<'a, T: TypedLocalDef>(
+    defs: &'a [T],
+    use_block: BlockLabel,
+    use_index: usize,
+    dominators: &HashMap<BlockLabel, HashSet<BlockLabel>>,
+) -> Option<&'a T> {
+    let dominating = defs
+        .iter()
+        .enumerate()
+        .filter(|(_, def)| {
+            typed_local_def_dominates_use(
+                def.def_block(),
+                def.def_index(),
+                use_block,
+                use_index,
+                dominators,
+            )
+        })
+        .collect::<Vec<_>>();
+    if dominating.is_empty() {
+        return None;
+    }
+    let maximal = dominating
+        .iter()
+        .filter(|(index, def)| {
+            !dominating.iter().any(|(other_index, other)| {
+                index != other_index
+                    && typed_local_def_dominates_use(
+                        def.def_block(),
+                        def.def_index(),
+                        other.def_block(),
+                        other.def_index(),
+                        dominators,
+                    )
+            })
+        })
+        .map(|(_, def)| *def)
+        .collect::<Vec<_>>();
+    match maximal.as_slice() {
+        [def] => Some(*def),
+        _ => None,
+    }
+}
+
+fn typed_local_def_dominates_use(
+    def_block: BlockLabel,
+    def_index: usize,
+    use_block: BlockLabel,
+    use_index: usize,
+    dominators: &HashMap<BlockLabel, HashSet<BlockLabel>>,
+) -> bool {
+    if def_block == use_block {
+        return def_index < use_index;
+    }
+    dominators
+        .get(&use_block)
+        .is_some_and(|blocks| blocks.contains(&def_block))
+}
+
+fn typed_block_dominators(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+) -> HashMap<BlockLabel, HashSet<BlockLabel>> {
+    let labels = function
+        .blocks
+        .iter()
+        .map(|block| block.label)
+        .collect::<HashSet<_>>();
+    let Some(entry) = function.blocks.first().map(|block| block.label) else {
+        return HashMap::new();
+    };
+    let predecessors = typed_block_predecessors(function);
+    let mut dominators = HashMap::<BlockLabel, HashSet<BlockLabel>>::new();
+    for label in &labels {
+        if *label == entry {
+            dominators.insert(*label, HashSet::from([*label]));
+        } else {
+            dominators.insert(*label, labels.clone());
+        }
+    }
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for label in labels.iter().copied().filter(|label| *label != entry) {
+            let preds = predecessors.get(&label).cloned().unwrap_or_default();
+            let mut new_doms = if preds.is_empty() {
+                HashSet::new()
+            } else {
+                let mut iter = preds.iter();
+                let first = iter
+                    .next()
+                    .and_then(|pred| dominators.get(pred))
+                    .cloned()
+                    .unwrap_or_default();
+                iter.fold(first, |acc, pred| {
+                    let Some(pred_doms) = dominators.get(pred) else {
+                        return HashSet::new();
+                    };
+                    acc.intersection(pred_doms).copied().collect()
+                })
+            };
+            new_doms.insert(label);
+            if dominators.get(&label) != Some(&new_doms) {
+                dominators.insert(label, new_doms);
+                changed = true;
+            }
+        }
+    }
+
+    dominators
 }
 
 pub fn rewrite_typed_stop_iteration_raises_to_handler_jumps(
@@ -6600,10 +5842,50 @@ mod typed_codegen_tests {
         counter.count
     }
 
+    fn getattrs_for_field_in_virtual_plan(
+        function: &BlockPyFunction<TypedBlockPyModuleShape>,
+        module_constants: &[ConstantExpr],
+        plan: &TypedVirtualObjectPlan,
+        field_name: &str,
+    ) -> usize {
+        struct Counter<'a> {
+            module_constants: &'a [ConstantExpr],
+            field_name: &'a str,
+            count: usize,
+        }
+
+        impl Visit<InstrTyped> for Counter<'_> {
+            fn visit_instr(&mut self, expr: &InstrTyped) {
+                if let InstrTyped::GetAttrTyped(op) = expr
+                    && typed_constant_string(op.attr.as_ref(), self.module_constants)
+                        == Some(self.field_name)
+                {
+                    self.count += 1;
+                }
+                expr.visit_children(self);
+            }
+        }
+
+        let mut counter = Counter {
+            module_constants,
+            field_name,
+            count: 0,
+        };
+        for block in &function.blocks {
+            if typed_virtual_constructor_plan_covers_block(plan, block.label) {
+                for instr in &block.body {
+                    counter.visit_instr(instr);
+                }
+                counter.visit_term(&block.term);
+            }
+        }
+        counter.count
+    }
+
     fn constructor_call_stores_in_virtual_plan(
         function: &BlockPyFunction<TypedBlockPyModuleShape>,
         module_constants: &[ConstantExpr],
-        plan: &TypedVirtualConstructorPlan,
+        plan: &TypedVirtualObjectPlan,
     ) -> usize {
         function
             .blocks
@@ -6629,7 +5911,7 @@ mod typed_codegen_tests {
     fn setattrs_for_field_in_virtual_plan(
         function: &BlockPyFunction<TypedBlockPyModuleShape>,
         module_constants: &[ConstantExpr],
-        plan: &TypedVirtualConstructorPlan,
+        plan: &TypedVirtualObjectPlan,
         field_name: &str,
     ) -> usize {
         function
@@ -6648,7 +5930,7 @@ mod typed_codegen_tests {
 
     fn direct_call_guards_in_virtual_plan(
         function: &BlockPyFunction<TypedBlockPyModuleShape>,
-        plan: &TypedVirtualConstructorPlan,
+        plan: &TypedVirtualObjectPlan,
     ) -> usize {
         function
             .blocks
@@ -6672,12 +5954,14 @@ mod typed_codegen_tests {
     }
 
     #[test]
-    fn typed_field_scalar_state_promotes_root_when_original_local_is_deleted() {
+    fn typed_field_scalar_state_preserves_object_when_original_local_is_deleted() {
         let root = LocalLocation(1);
         let alias = LocalLocation(2);
+        let object = TypedVirtualObjectId(InstrId::new(7).index());
         let scalar = typed_test_local("scalar_current", LocalLocation(3));
-        let mut state = TypedFieldScalarState::default();
+        let mut state = TypedVirtualLoweringState::default();
         state.seed_object(
+            object,
             root,
             &TypedConstructorFieldBindings {
                 fields: vec![TypedConstructorFieldBinding {
@@ -6687,14 +5971,14 @@ mod typed_codegen_tests {
                 }],
             },
         );
-        state.set_alias(alias, root);
+        state.set_alias(alias, object);
 
         state.rebind_local(root);
 
-        assert_eq!(state.root_for_location(root), None);
-        assert_eq!(state.root_for_location(alias), Some(alias));
-        assert_eq!(state.field_value(alias, "current"), Some(&scalar));
-        assert_eq!(state.field_scalar(alias, "current"), Some(&scalar));
+        assert_eq!(state.object_for_location(root), None);
+        assert_eq!(state.object_for_location(alias), Some(object));
+        assert_eq!(state.field_value(object, "current"), Some(&scalar));
+        assert_eq!(state.field_scalar(object, "current"), Some(&scalar));
     }
 
     #[test]
@@ -7440,6 +6724,83 @@ def caller(it):\n    try:\n        value = next(it)\n    except StopIteration:\n
     }
 
     #[test]
+    fn typed_direct_call_inlining_preserves_callee_exception_edges() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            "def callee(value):\n    try:\n        result = value.__index__()\n    except AttributeError:\n        raise TypeError('bad')\n    return result\n\n\
+def caller(value):\n    result = callee(value)\n    return result\n",
+        )
+        .expect("source should lower");
+        let callee_id = blockpy_function_id_by_qualname(&lowered.blockpy_module, "callee");
+        let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
+        let callee = typed
+            .callable_defs
+            .iter()
+            .find(|function| function.function_id == callee_id)
+            .expect("typed callee should exist");
+        assert!(
+            callee.blocks.iter().any(|block| block.exc_edge.is_some()),
+            "callee should contain an internal try/except exception edge"
+        );
+        assert!(
+            callee.blocks.iter().any(|block| !block.params.is_empty()),
+            "callee exception handler should carry exception block params"
+        );
+        let call_id;
+        {
+            let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+            call_id = replace_first_typed_call_access_where(
+                caller,
+                TypedCallAccessPlan::GuardedCallable {
+                    function_guards: vec![TypedDirectFunctionCallGuard {
+                        function_id: callee_id,
+                        arg_plan: TypedDirectCallArgPlan {
+                            sources: vec![TypedDirectCallArgSource::Provided(0)],
+                        },
+                    }],
+                },
+                |call| typed_expr_loads_name(call.func.as_ref(), "callee"),
+            );
+            lower_typed_function_call_access_plan_instrs(caller);
+        }
+
+        let callee_module = typed.clone();
+        let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+        let stats = inline_typed_function_direct_call_stores(
+            caller,
+            &callee_module,
+            &HashMap::new(),
+            &HashMap::from([(
+                call_id,
+                vec![(
+                    callee_id,
+                    TypedDirectCallArgPlan {
+                        sources: vec![TypedDirectCallArgSource::Provided(0)],
+                    },
+                )],
+            )]),
+        );
+
+        assert_eq!(stats.rewritten_stores, 1);
+        let labels = caller
+            .blocks
+            .iter()
+            .map(|block| block.label)
+            .collect::<HashSet<_>>();
+        assert!(
+            caller.blocks.iter().any(|block| {
+                block.exc_edge.as_ref().is_some_and(|edge| {
+                    labels.contains(&edge.target)
+                        && caller
+                            .blocks
+                            .iter()
+                            .any(|target| target.label == edge.target && !target.params.is_empty())
+                })
+            }),
+            "inlined caller should retain the callee's internal exception-handler CFG"
+        );
+    }
+
+    #[test]
     fn typed_constructor_hot_continuation_split_clones_joined_successors() {
         let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
             "class Box:\n    def __init__(self, value):\n        self.value = value\n\n\
@@ -7749,10 +7110,17 @@ def caller(value):\n    obj = Box(value)\n    if value:\n        return obj.valu
             "the cloned hot continuation should contain the field load before scalarization"
         );
 
-        let scalar_stats = scalarize_typed_hot_constructor_field_loads(
+        let mut virtualization_plan =
+            plan_typed_virtual_objects(caller, &module_constants, &constructor_field_bindings);
+        assert_eq!(
+            virtualization_plan.objects.len(),
+            1,
+            "an already-private constructor continuation should virtualize without requiring a prior split"
+        );
+        let scalar_stats = lower_typed_virtual_fields_to_locals_with_plan(
             caller,
             &module_constants,
-            &constructor_field_bindings,
+            &mut virtualization_plan,
         );
         assert_eq!(scalar_stats.seeded_objects, 1);
         assert_eq!(scalar_stats.scalar_slots, 1);
@@ -7776,6 +7144,234 @@ def caller(value):\n    obj = Box(value)\n    if value:\n        return obj.valu
                 "value",
             ) > 0,
             "the generic continuation should keep the original field load"
+        );
+    }
+
+    #[test]
+    fn typed_field_scalarization_ignores_deopting_direct_call_fallback_edges() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            "class Box:\n    def __init__(self, value):\n        self.value = value\n\n\
+def caller(value):\n    obj = Box(value)\n    return obj.value\n",
+        )
+        .expect("source should lower");
+        let inline_plan = crate::passes::plan_module_inlining(
+            &crate::passes::summarize_module_escapes(&lowered.blockpy_module),
+        );
+        let init_id = blockpy_function_id_by_qualname(&lowered.blockpy_module, "Box.__init__");
+        let constructor_entry_id =
+            constructor_entry_function_id_for_init(&lowered.blockpy_module, init_id)
+                .expect("class lowering should add a constructor entry");
+        let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
+        let module_constants = typed.module_constants.clone();
+        let call_id;
+        {
+            let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+            call_id = first_typed_call_instr_id(caller);
+            replace_first_typed_call_access(
+                caller,
+                TypedCallAccessPlan::GuardedCallable {
+                    function_guards: vec![TypedDirectFunctionCallGuard {
+                        function_id: constructor_entry_id,
+                        arg_plan: TypedDirectCallArgPlan {
+                            sources: vec![
+                                TypedDirectCallArgSource::Provided(0),
+                                TypedDirectCallArgSource::Provided(1),
+                            ],
+                        },
+                    }],
+                },
+            );
+            lower_typed_function_call_access_plan_instrs(caller);
+        }
+
+        let callee_module = typed.clone();
+        let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+        let inline_stats = inline_typed_function_direct_call_stores(
+            caller,
+            &callee_module,
+            &HashMap::new(),
+            &HashMap::from([(
+                call_id,
+                vec![(
+                    constructor_entry_id,
+                    TypedDirectCallArgPlan {
+                        sources: vec![
+                            TypedDirectCallArgSource::Provided(0),
+                            TypedDirectCallArgSource::Provided(1),
+                        ],
+                    },
+                )],
+            )]),
+        );
+        assert_eq!(inline_stats.rewritten_stores, 1);
+        let constructor_field_bindings = typed_constructor_field_bindings_from_inline_stats(
+            &callee_module,
+            &inline_plan,
+            &module_constants,
+            &inline_stats,
+        );
+        assert_eq!(constructor_field_bindings.len(), 1);
+        assert!(
+            mark_indexed_field_accesses_for_field(caller, &module_constants, "value") > 0,
+            "test should contain the field load before scalarization"
+        );
+
+        let mut virtualization_plan =
+            plan_typed_virtual_objects(caller, &module_constants, &constructor_field_bindings);
+        let scalar_stats = lower_typed_virtual_fields_to_locals_with_plan(
+            caller,
+            &module_constants,
+            &mut virtualization_plan,
+        );
+        assert_eq!(scalar_stats.seeded_objects, 1);
+        assert_eq!(scalar_stats.scalar_slots, 1);
+        assert_eq!(
+            scalar_stats.rewritten_loads, 1,
+            "deopting guard fallback edges should not kill hot constructor scalar state"
+        );
+        let entry = caller
+            .blocks
+            .first()
+            .expect("caller should contain blocks")
+            .label;
+        assert_eq!(
+            getattrs_for_field_in_reachable_blocks(caller, entry, &module_constants, "value"),
+            0,
+            "the hot constructor field should be read from its scalar temp"
+        );
+    }
+
+    #[test]
+    fn typed_fully_virtual_lowering_erases_trusted_non_escaping_objects_without_materialization() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            "class Box:\n    def __init__(self, value):\n        self.value = value\n\n\
+def caller(value):\n    obj = Box(value)\n    return obj.value\n",
+        )
+        .expect("source should lower");
+        let inline_plan = crate::passes::plan_module_inlining(
+            &crate::passes::summarize_module_escapes(&lowered.blockpy_module),
+        );
+        let init_id = blockpy_function_id_by_qualname(&lowered.blockpy_module, "Box.__init__");
+        let constructor_entry_id =
+            constructor_entry_function_id_for_init(&lowered.blockpy_module, init_id)
+                .expect("class lowering should add a constructor entry");
+        let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
+        let module_constants = typed.module_constants.clone();
+        let call_id;
+        {
+            let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+            call_id = first_typed_call_instr_id(caller);
+            replace_first_typed_call_access(
+                caller,
+                TypedCallAccessPlan::GuardedCallable {
+                    function_guards: vec![TypedDirectFunctionCallGuard {
+                        function_id: constructor_entry_id,
+                        arg_plan: TypedDirectCallArgPlan {
+                            sources: vec![
+                                TypedDirectCallArgSource::Provided(0),
+                                TypedDirectCallArgSource::Provided(1),
+                            ],
+                        },
+                    }],
+                },
+            );
+            lower_typed_function_call_access_plan_instrs(caller);
+        }
+
+        let callee_module = typed.clone();
+        let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+        let inline_stats = inline_typed_function_direct_call_stores(
+            caller,
+            &callee_module,
+            &HashMap::new(),
+            &HashMap::from([(
+                call_id,
+                vec![(
+                    constructor_entry_id,
+                    TypedDirectCallArgPlan {
+                        sources: vec![
+                            TypedDirectCallArgSource::Provided(0),
+                            TypedDirectCallArgSource::Provided(1),
+                        ],
+                    },
+                )],
+            )]),
+        );
+        assert_eq!(inline_stats.rewritten_stores, 1);
+        let mut constructor_field_bindings = typed_constructor_field_bindings_from_inline_stats(
+            &callee_module,
+            &inline_plan,
+            &module_constants,
+            &inline_stats,
+        );
+        assert_eq!(constructor_field_bindings.len(), 1);
+        let split_stats = split_typed_constructor_hot_continuations(caller, &module_constants);
+        assert!(
+            split_stats.cloned_blocks >= 1,
+            "trusted constructor paths should be isolated from the generic fallback before fully virtual lowering"
+        );
+        for mapping in &split_stats.instr_id_mappings {
+            if let Some(bindings) = constructor_field_bindings
+                .get(&mapping.callee_instr_id)
+                .cloned()
+            {
+                constructor_field_bindings.insert(mapping.caller_instr_id, bindings);
+            }
+        }
+        assert!(
+            mark_indexed_field_accesses_for_field(caller, &module_constants, "value") > 0,
+            "test should contain the field load before lowering"
+        );
+
+        let mut trusted_sources = HashSet::from([call_id]);
+        let trusted_inline_instances = inline_stats
+            .inline_instance_sources
+            .iter()
+            .filter_map(|mapping| {
+                trusted_sources
+                    .contains(&mapping.source_instr_id)
+                    .then_some(mapping.inline_instance)
+            })
+            .collect::<HashSet<_>>();
+        trusted_sources.extend(inline_stats.instr_id_mappings.iter().filter_map(|mapping| {
+            (trusted_inline_instances.contains(&mapping.inline_instance)
+                && constructor_field_bindings.contains_key(&mapping.caller_instr_id))
+            .then_some(mapping.caller_instr_id)
+        }));
+        for mapping in &split_stats.instr_id_mappings {
+            if trusted_sources.contains(&mapping.callee_instr_id) {
+                trusted_sources.insert(mapping.caller_instr_id);
+            }
+        }
+        let mut plan = plan_typed_fully_virtual_objects(
+            caller,
+            &module_constants,
+            &constructor_field_bindings,
+            &trusted_sources,
+        );
+        assert_eq!(plan.objects.len(), 1);
+        assert!(plan.materializing_objects.is_empty());
+        assert!(plan.materialization_boundaries().is_empty());
+        let stats = lower_typed_fully_virtual_objects_to_locals_with_plan(
+            caller,
+            &module_constants,
+            &mut plan,
+        );
+        assert!(stats.changed());
+        assert_eq!(stats.field_lowering.seeded_objects, 1);
+        assert!(
+            stats.virtualization.removed_materializations >= 1,
+            "fully virtual lowering should erase the trusted allocation"
+        );
+        assert_eq!(
+            getattrs_for_field_in_virtual_plan(
+                caller,
+                &module_constants,
+                &plan.objects[0],
+                "value"
+            ),
+            0,
+            "fully virtual lowering should leave an ordinary local read on the trusted path"
         );
     }
 
@@ -7891,10 +7487,12 @@ def caller(value):\n    obj = Box(value)\n    if value:\n        return obj.valu
             "original and hot-cloned continuations should contain the field load before scalarization"
         );
         let clone = split_stats.clones[0];
-        let scalar_stats = scalarize_typed_hot_constructor_field_loads(
+        let mut virtualization_plan =
+            plan_typed_virtual_objects(caller, &module_constants, &constructor_field_bindings);
+        let scalar_stats = lower_typed_virtual_fields_to_locals_with_plan(
             caller,
             &module_constants,
-            &constructor_field_bindings,
+            &mut virtualization_plan,
         );
         assert_eq!(scalar_stats.seeded_objects, 1);
         assert_eq!(scalar_stats.scalar_slots, 1);
@@ -8105,6 +7703,95 @@ def caller(stop):\n    obj = RangeLike(0, stop)\n    return obj.stop\n",
                     && mapping.caller_name.contains("typed_inline_varargs")),
             "packed *args should be materialized once into a temp for the inlined init body"
         );
+        let vararg_location = init_body_stats
+            .inline_stats
+            .local_mappings
+            .iter()
+            .find(|mapping| {
+                mapping.callee == init_id
+                    && mapping.callee_name == "args"
+                    && mapping.caller_name.contains("typed_inline_varargs")
+            })
+            .expect("packed *args mapping should exist")
+            .caller_location;
+        let tuple_simplifications = simplify_typed_virtual_tuple_ops(
+            &mut typed.callable_defs[caller_index],
+            &mut typed.module_constants,
+        );
+        assert!(
+            tuple_simplifications >= 4,
+            "known packed tuple length and indexed reads should simplify"
+        );
+
+        struct RuntimeLenCounter<'a> {
+            module_constants: &'a [ConstantExpr],
+            count: usize,
+        }
+        impl Visit<InstrTyped> for RuntimeLenCounter<'_> {
+            fn visit_instr(&mut self, expr: &InstrTyped) {
+                if let InstrTyped::CallTyped(call) = expr
+                    && typed_expr_is_runtime_name_load(
+                        call.func.as_ref(),
+                        RuntimeName::Len,
+                        self.module_constants,
+                    )
+                {
+                    self.count += 1;
+                }
+                expr.visit_children(self);
+            }
+        }
+
+        let mut len_counter = RuntimeLenCounter {
+            module_constants: &typed.module_constants,
+            count: 0,
+        };
+        len_counter.visit_fn(&typed.callable_defs[caller_index]);
+        assert_eq!(
+            len_counter.count, 0,
+            "len(args) on a known packed tuple should become a constant load"
+        );
+
+        struct TupleTempGetItemCounter {
+            location: LocalLocation,
+            count: usize,
+        }
+        impl Visit<InstrTyped> for TupleTempGetItemCounter {
+            fn visit_instr(&mut self, expr: &InstrTyped) {
+                if let InstrTyped::GetItem(op) = expr
+                    && typed_instr_local_load_location(op.value.as_ref()) == Some(self.location)
+                {
+                    self.count += 1;
+                }
+                expr.visit_children(self);
+            }
+        }
+
+        let mut getitem_counter = TupleTempGetItemCounter {
+            location: vararg_location,
+            count: 0,
+        };
+        getitem_counter.visit_fn(&typed.callable_defs[caller_index]);
+        assert_eq!(
+            getitem_counter.count, 0,
+            "indexed reads from the packed tuple temp should become the original argument loads"
+        );
+
+        let remaining_argc_if_terms = typed.callable_defs[caller_index]
+            .blocks
+            .iter()
+            .filter(|block| {
+                matches!(
+                    &block.term,
+                    BlockTerm::IfTerm(if_term)
+                        if !matches!(if_term.test, InstrTyped::DirectCallGuardTest(_))
+                )
+            })
+            .count();
+        assert_eq!(
+            remaining_argc_if_terms, 0,
+            "constant argc tests should fold to jumps and unreachable arms should be pruned"
+        );
         let fields = init_body_stats
             .constructor_field_bindings
             .values()
@@ -8196,9 +7883,13 @@ def caller(i):\n    it = IterRange(0, i, 1)\n    total = 0\n    while True:\n   
         }
 
         let callee_module = typed.clone();
-        let caller = typed_function_by_qualname_mut(&mut typed, "caller");
+        let caller_index = typed
+            .callable_defs
+            .iter()
+            .position(|function| function.names.qualname == "caller")
+            .expect("typed caller should exist");
         let constructor_inline_stats = inline_typed_function_direct_call_stores(
-            caller,
+            &mut typed.callable_defs[caller_index],
             &callee_module,
             &HashMap::new(),
             &HashMap::from([(
@@ -8233,6 +7924,31 @@ def caller(i):\n    it = IterRange(0, i, 1)\n    total = 0\n    while True:\n   
             &constructor_inline_stats,
         );
         assert_eq!(constructor_field_bindings.len(), 1);
+        let constructor_init_plans =
+            typed_constructor_init_plans_from_inline_stats_with_external_callees(
+                &callee_module,
+                &typed.module_constants,
+                &HashMap::new(),
+                &constructor_inline_stats,
+            );
+        annotate_constructor_init_plans_for_test(
+            &mut typed.callable_defs[caller_index],
+            &constructor_init_plans,
+        );
+        let init_body_stats = {
+            let (module_constants, callable_defs) =
+                (&mut typed.module_constants, &mut typed.callable_defs);
+            inline_typed_constructor_init_bodies_with_external_callees(
+                &mut callable_defs[caller_index],
+                &callee_module,
+                module_constants,
+                &HashMap::new(),
+            )
+        };
+        assert_eq!(init_body_stats.inline_stats.rewritten_stores, 1);
+        constructor_field_bindings.extend(init_body_stats.constructor_field_bindings);
+        let module_constants = typed.module_constants.clone();
+        let caller = &mut typed.callable_defs[caller_index];
 
         let constructor_split =
             split_typed_constructor_hot_continuations(caller, &module_constants);
@@ -8332,13 +8048,344 @@ def caller(i):\n    it = IterRange(0, i, 1)\n    total = 0\n    while True:\n   
             "hot-state split should clone the hot loop containing __next__ field loads"
         );
 
-        let scalar_stats = scalarize_typed_hot_constructor_field_loads_with_bindings(
+        let mut virtualization_plan =
+            plan_typed_virtual_objects(caller, &module_constants, &constructor_field_bindings);
+        let removable_plan = virtualization_plan
+            .objects
+            .first()
+            .cloned()
+            .expect("iterator hot path should discover a removable virtual object");
+        let mut escaping_caller = caller.clone();
+        let escaping_return = escaping_caller
+            .blocks
+            .iter_mut()
+            .find(|block| block.label == removable_plan.materialization_block)
+            .expect("virtual constructor region should contain its allocation block");
+        escaping_return.term = BlockTerm::Return(typed_load_temp(&removable_plan.root));
+        let mut escaping_plan = plan_typed_virtual_objects(
+            &escaping_caller,
+            &module_constants,
+            &constructor_field_bindings,
+        );
+        assert!(
+            escaping_plan.objects.is_empty(),
+            "returning the object should keep it out of the removable-object subset"
+        );
+        assert_eq!(
+            escaping_plan.materializing_objects.len(),
+            0,
+            "a return escape after inline-temp cleanup cannot use late materialization safely"
+        );
+        let escaping_scalar_stats = lower_typed_virtual_fields_to_locals_with_plan(
+            &mut escaping_caller,
+            &module_constants,
+            &mut escaping_plan,
+        );
+        assert_eq!(escaping_scalar_stats.rewritten_loads, 0);
+        let escaping_materialization_stats = materialize_typed_virtual_return_boundaries_with_plan(
+            &mut escaping_caller,
+            &module_constants,
+            &escaping_plan,
+        );
+        assert_eq!(escaping_materialization_stats.materialized_objects, 0);
+        let mut materializing_store_caller = caller.clone();
+        let materializing_store_block = materializing_store_caller
+            .blocks
+            .iter_mut()
+            .find(|block| block.label == removable_plan.materialization_block)
+            .expect("virtual constructor plan should retain its allocation block");
+        materializing_store_block.body.insert(
+            removable_plan.materialization_index + 1,
+            Store::new(
+                ResolvedName {
+                    id: "sink".to_string().into(),
+                    location: NameLocation::GlobalName,
+                },
+                typed_load_temp(&removable_plan.root),
+            )
+            .with_meta(Meta::synthetic())
+            .into(),
+        );
+        let mut materializing_store_plan = plan_typed_virtual_objects(
+            &materializing_store_caller,
+            &module_constants,
+            &constructor_field_bindings,
+        );
+        assert_eq!(
+            materializing_store_plan.materializing_objects.len(),
+            1,
+            "an escaping store before inline-temp cleanup should allow explicit materialization"
+        );
+        let materializing_store_scalar_stats = lower_typed_virtual_fields_to_locals_with_plan(
+            &mut materializing_store_caller,
+            &module_constants,
+            &mut materializing_store_plan,
+        );
+        assert!(
+            materializing_store_scalar_stats.rewritten_loads >= 3,
+            "field lowering should still scalarize uses before the explicit store materialization boundary"
+        );
+        let materializing_store_stats = materialize_typed_virtual_store_boundaries_with_plan(
+            &mut materializing_store_caller,
+            &module_constants,
+            &materializing_store_plan,
+        );
+        assert_eq!(
+            materializing_store_stats.materialized_objects, 1,
+            "escaping stores with live reconstruction inputs should rematerialize explicitly"
+        );
+        assert!(
+            materializing_store_stats
+                .virtualization
+                .removed_materializations
+                >= 1,
+            "explicit store materialization should replace the original hot-path allocation"
+        );
+        let mut escaping_store_caller = caller.clone();
+        let escaping_store_block = escaping_store_caller
+            .blocks
+            .iter_mut()
+            .find(|block| {
+                typed_virtual_constructor_plan_covers_block(&removable_plan, block.label)
+                    && block
+                        .body
+                        .iter()
+                        .any(|instr| matches!(instr, InstrTyped::Del(_)))
+            })
+            .expect("virtual constructor region should contain an inline-temp cleanup block");
+        let escaping_store_index = escaping_store_block
+            .body
+            .iter()
+            .position(|instr| matches!(instr, InstrTyped::Del(_)))
+            .expect("allocation block should clean up inline temps after explicit init work");
+        escaping_store_block.body.insert(
+            escaping_store_index,
+            Store::new(
+                ResolvedName {
+                    id: "sink".to_string().into(),
+                    location: NameLocation::GlobalName,
+                },
+                typed_load_temp(&removable_plan.root),
+            )
+            .with_meta(Meta::synthetic())
+            .into(),
+        );
+        let mut escaping_store_plan = plan_typed_virtual_objects(
+            &escaping_store_caller,
+            &module_constants,
+            &constructor_field_bindings,
+        );
+        assert_eq!(
+            escaping_store_plan.materializing_objects.len(),
+            0,
+            "an escaping store after inline-temp cleanup cannot use late materialization safely"
+        );
+        let escaping_store_scalar_stats = lower_typed_virtual_fields_to_locals_with_plan(
+            &mut escaping_store_caller,
+            &module_constants,
+            &mut escaping_store_plan,
+        );
+        assert!(
+            escaping_store_scalar_stats.rewritten_loads >= 3,
+            "field lowering should still scalarize uses before the escaping store while leaving the concrete object alive"
+        );
+        let escaping_store_materialization_stats =
+            materialize_typed_virtual_store_boundaries_with_plan(
+                &mut escaping_store_caller,
+                &module_constants,
+                &escaping_store_plan,
+            );
+        assert_eq!(escaping_store_materialization_stats.materialized_objects, 0);
+        let mut escaping_body_caller = caller.clone();
+        let escaping_body_block = escaping_body_caller
+            .blocks
+            .iter_mut()
+            .find(|block| block.label == removable_plan.materialization_block)
+            .expect("virtual constructor plan should retain its allocation block");
+        let escaping_body_index = removable_plan.materialization_index + 1;
+        escaping_body_block.body.insert(
+            escaping_body_index,
+            InstrTyped::Tuple(Tuple::new(vec![typed_load_temp(&removable_plan.root)])),
+        );
+        let mut escaping_body_plan = plan_typed_virtual_objects(
+            &escaping_body_caller,
+            &module_constants,
+            &constructor_field_bindings,
+        );
+        assert_eq!(
+            escaping_body_plan.materializing_objects.len(),
+            1,
+            "a root-valued unsupported body use before inline-temp cleanup should allow explicit materialization"
+        );
+        let escaping_body_scalar_stats = lower_typed_virtual_fields_to_locals_with_plan(
+            &mut escaping_body_caller,
+            &module_constants,
+            &mut escaping_body_plan,
+        );
+        assert_eq!(escaping_body_scalar_stats.rewritten_loads, 0);
+        let escaping_body_materialization_stats =
+            materialize_typed_virtual_body_boundaries_with_plan(
+                &mut escaping_body_caller,
+                &module_constants,
+                &escaping_body_plan,
+            );
+        assert_eq!(
+            escaping_body_materialization_stats.materialized_objects, 1,
+            "unsupported root-valued body uses should rematerialize explicitly"
+        );
+        assert!(
+            escaping_body_materialization_stats
+                .virtualization
+                .removed_materializations
+                >= 1,
+            "explicit body materialization should replace the original hot-path allocation"
+        );
+        let mut deopt_body_caller = caller.clone();
+        let deopt_body_block = deopt_body_caller
+            .blocks
+            .iter_mut()
+            .find(|block| block.label == removable_plan.materialization_block)
+            .expect("virtual constructor plan should retain its allocation block");
+        let mut deopt_guard = TypedDirectCallGuardTest::new(
+            typed_load_temp(&removable_plan.root),
+            TypedDirectCallGuardTestKind::RuntimeFunctionId {
+                function_id: caller.function_id,
+            },
+        );
+        deopt_guard.extra.set_guard_miss_deopt_enabled(true);
+        deopt_body_block.body.insert(
+            removable_plan.materialization_index + 1,
+            InstrTyped::DirectCallGuardTest(deopt_guard.with_meta(Meta::synthetic())),
+        );
+        let mut deopt_body_plan = plan_typed_virtual_objects(
+            &deopt_body_caller,
+            &module_constants,
+            &constructor_field_bindings,
+        );
+        assert_eq!(
+            deopt_body_plan.materialization_boundaries()[0].kind,
+            TypedVirtualBoundaryKind::DeoptResumeUse,
+            "deopt-enabled guards should become explicit virtual materialization boundaries"
+        );
+        let deopt_body_scalar_stats = lower_typed_virtual_fields_to_locals_with_plan(
+            &mut deopt_body_caller,
+            &module_constants,
+            &mut deopt_body_plan,
+        );
+        assert!(
+            deopt_body_scalar_stats.rewritten_loads >= 3,
+            "field lowering should still scalarize uses before the explicit deopt materialization boundary"
+        );
+        let deopt_body_materialization_stats = materialize_typed_virtual_body_boundaries_with_plan(
+            &mut deopt_body_caller,
+            &module_constants,
+            &deopt_body_plan,
+        );
+        assert_eq!(
+            deopt_body_materialization_stats.materialized_objects, 1,
+            "deopt-enabled guards should rematerialize before interpreter-resume points"
+        );
+        assert!(
+            virtualization_plan
+                .objects
+                .iter()
+                .flat_map(|object| object.field_bindings.fields.iter())
+                .all(|field| field.scalar.is_none()),
+            "virtualization planning should run before virtual field locals are allocated"
+        );
+        assert!(
+            virtualization_plan
+                .field_states
+                .as_ref()
+                .is_some_and(|states| {
+                    !states.block_in.is_empty()
+                        && !states.body_before_instr.is_empty()
+                        && !states.block_out.is_empty()
+                        && !states.edge_out.is_empty()
+                }),
+            "virtualization planning should publish explicit block and edge virtual field state before lowering"
+        );
+        assert!(
+            virtualization_plan
+                .field_states
+                .as_ref()
+                .is_some_and(|states| {
+                    states.block_in.values().all(|state| {
+                        state
+                            .fields
+                            .values()
+                            .all(|value| !value.id_str().contains("_dp_vfield"))
+                    })
+                }),
+            "pre-lowering virtual field state should describe the object-shaped program before block params exist"
+        );
+        let scalar_stats = lower_typed_virtual_fields_to_locals_with_plan(
             caller,
             &module_constants,
-            &mut constructor_field_bindings,
+            &mut virtualization_plan,
+        );
+        assert!(
+            virtualization_plan
+                .field_states
+                .as_ref()
+                .is_some_and(|states| {
+                    !states.block_in.is_empty()
+                        && !states.body_before_instr.is_empty()
+                        && !states.block_out.is_empty()
+                        && !states.edge_out.is_empty()
+                }),
+            "virtual-to-locals lowering should retain explicit block and edge virtual field state"
         );
         assert_eq!(scalar_stats.seeded_objects, 1);
         assert_eq!(scalar_stats.scalar_slots, 3);
+        assert!(
+            scalar_stats.inserted_block_params >= 1,
+            "loop-carried virtual fields should lower through explicit block params: {scalar_stats:?}"
+        );
+        assert!(
+            scalar_stats.inserted_block_args >= scalar_stats.inserted_block_params,
+            "each synthesized virtual field param should receive explicit edge args: {scalar_stats:?}"
+        );
+        let virtual_field_param_names = caller
+            .blocks
+            .iter()
+            .flat_map(|block| block.params.iter())
+            .filter(|param| param.name.contains("_dp_vfield"))
+            .map(|param| param.name.clone())
+            .collect::<HashSet<_>>();
+        assert!(
+            !virtual_field_param_names.is_empty(),
+            "loop-carried virtual fields should become named block params"
+        );
+        assert!(
+            caller.blocks.iter().any(|block| {
+                matches!(
+                    &block.term,
+                    BlockTerm::Jump(edge)
+                        if edge.args.iter().any(|arg| {
+                            matches!(
+                                arg,
+                                BlockArg::Name(name) if virtual_field_param_names.contains(name)
+                            )
+                        })
+                )
+            }),
+            "loop-carried virtual field params should be fed by explicit jump edge args"
+        );
+        assert!(
+            virtualization_plan
+                .field_states
+                .as_ref()
+                .is_some_and(|states| {
+                    states.block_in.values().any(|state| {
+                        state
+                            .fields
+                            .values()
+                            .any(|value| value.id_str().contains("_dp_vfield"))
+                    })
+                }),
+            "the analyzed virtual field state should re-enter loop headers through the synthesized params"
+        );
         assert!(
             scalar_stats.rewritten_loads >= 3,
             "current/stop/step loads in the hot iterator loop should scalarize: {scalar_stats:?}"
@@ -8356,9 +8403,15 @@ def caller(i):\n    it = IterRange(0, i, 1)\n    total = 0\n    while True:\n   
             }),
             "at least one hot iterator loop clone should use scalar state for current/stop/step"
         );
-        let virtual_plans =
-            plan_typed_virtual_constructors(caller, &module_constants, &constructor_field_bindings);
-        let virtual_plan = virtual_plans
+        assert!(
+            virtualization_plan
+                .objects
+                .iter()
+                .all(|plan| plan.object_id == TypedVirtualObjectId(plan.source.index())),
+            "virtual object ids should remain tied to the stable allocation source"
+        );
+        let virtual_plan = virtualization_plan
+            .objects
             .iter()
             .find(|plan| {
                 constructor_call_stores_in_virtual_plan(caller, &module_constants, plan) > 0
@@ -8366,15 +8419,33 @@ def caller(i):\n    it = IterRange(0, i, 1)\n    total = 0\n    while True:\n   
             })
             .cloned()
             .expect("hot cloned iterator path should have a virtual constructor candidate");
+        assert_eq!(
+            virtual_plan
+                .field_bindings
+                .fields
+                .iter()
+                .map(|field| field.field_name.as_str())
+                .collect::<HashSet<_>>(),
+            HashSet::from(["current", "stop", "step"]),
+            "the virtualization artifact should carry constructor field bindings"
+        );
+        assert!(
+            virtual_plan
+                .field_bindings
+                .fields
+                .iter()
+                .all(|field| field.scalar.is_some()),
+            "virtual-to-locals lowering should populate field locals on the analysis artifact"
+        );
         assert!(
             setattrs_for_field_in_virtual_plan(caller, &module_constants, &virtual_plan, "current")
                 > 0,
             "before virtualizing, the hot iterator clone should still store current on the object"
         );
-        let virtual_stats = virtualize_typed_hot_constructor_objects(
+        let virtual_stats = virtualize_typed_hot_constructor_plans(
             caller,
             &module_constants,
-            &constructor_field_bindings,
+            &virtualization_plan.objects,
         );
         assert!(
             virtual_stats.removed_materializations >= 1,

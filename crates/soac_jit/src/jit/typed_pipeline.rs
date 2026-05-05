@@ -9,7 +9,7 @@ use crate::module_type::SharedModuleState;
 use soac_config::SoacEnvConfig;
 use soac_core::block_py::{
     BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, CallableScopeKind, ChildVisitable,
-    HasSemanticInstrId, InstrId, RuntimeFunctionId, RuntimeName, VisitMut,
+    ConstantExpr, HasSemanticInstrId, InstrId, RuntimeFunctionId, RuntimeName, Visit, VisitMut,
 };
 use soac_ir_blockpy::{BlockPyModuleShape, constructor_init_function_id_for_entry_function};
 use soac_ir_typed::emit_v3::MechanicalRegionEmission;
@@ -38,15 +38,16 @@ use soac_opt::passes::{
     TypedConstructorFieldBindings, TypedExternalInlineCallee, TypedInlineInstrIdMapping,
     TypedInlineLocalMapping, inline_typed_constructor_init_bodies_with_external_callees,
     inline_typed_function_direct_call_stores_with_external_callees,
-    lower_typed_function_call_emission_plans, plan_module_inlining,
+    lower_typed_fully_virtual_objects_to_locals_with_plan,
+    lower_typed_function_call_emission_plans, lower_typed_virtual_objects_to_locals_with_plan,
+    plan_module_inlining, plan_typed_fully_virtual_objects, plan_typed_virtual_objects,
     refresh_typed_function_value_facts, rewrite_typed_stop_iteration_raises_to_handler_jumps,
-    scalarize_typed_hot_constructor_field_loads_with_bindings,
-    split_typed_alias_hot_continuations_with_budget,
+    simplify_typed_virtual_tuple_ops, split_typed_alias_hot_continuations_with_budget,
     split_typed_constructor_hot_continuations_with_budget,
     split_typed_inline_cleanup_hot_continuations_for_labels_with_budget, summarize_module_escapes,
     typed_constructor_field_bindings_from_inline_stats_with_external_callees,
     typed_constructor_init_plans_from_inline_stats_with_external_callees,
-    validate_typed_function_value_facts, virtualize_typed_hot_constructor_objects,
+    validate_typed_function_value_facts,
 };
 use soac_opt::region_emission_v3::{
     ExactIntBranchSelection as OptV3ExactIntBranchSelection,
@@ -63,6 +64,59 @@ const MAX_TYPED_ALIAS_CLONED_BLOCKS_PER_FUNCTION: usize = 256;
 const MAX_TYPED_INLINE_CLEANUP_CLONED_BLOCKS_PER_FUNCTION: usize = 256;
 
 type TypedInlineTargets = HashMap<InstrId, Vec<(RuntimeFunctionId, TypedDirectCallArgPlan)>>;
+
+fn typed_expr_is_runtime_name_load(
+    expr: &InstrTyped,
+    runtime_name: RuntimeName,
+    module_constants: &[ConstantExpr],
+) -> bool {
+    let InstrTyped::Load(load) = expr else {
+        return false;
+    };
+    if load.name.runtime_name_id() == Some(runtime_name) {
+        return true;
+    }
+    let Some(index) = load.name.location.as_constant() else {
+        return false;
+    };
+    matches!(
+        module_constants.get(index as usize),
+        Some(ConstantExpr::RuntimeName(name)) if *name == runtime_name
+    )
+}
+
+fn static_runtime_range_call_ids(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    module_constants: &[ConstantExpr],
+) -> HashSet<InstrId> {
+    struct Collector<'a> {
+        module_constants: &'a [ConstantExpr],
+        instr_ids: HashSet<InstrId>,
+    }
+
+    impl Visit<InstrTyped> for Collector<'_> {
+        fn visit_instr(&mut self, expr: &InstrTyped) {
+            if let InstrTyped::CallTyped(call) = expr
+                && typed_expr_is_runtime_name_load(
+                    call.func.as_ref(),
+                    RuntimeName::Range,
+                    self.module_constants,
+                )
+                && let Some(instr_id) = call.try_semantic_instr_id()
+            {
+                self.instr_ids.insert(instr_id);
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    let mut collector = Collector {
+        module_constants,
+        instr_ids: HashSet::new(),
+    };
+    collector.visit_fn(function);
+    collector.instr_ids
+}
 
 fn method_guards_for_v3_direct_call(
     plan: &ResolvedV3DirectCallPlan,
@@ -659,6 +713,8 @@ fn annotate_typed_exact_list_item_accesses_from_profile(
             }
         }
     }
+    let live_instr_ids = collect_typed_semantic_instr_ids(function);
+    exact_list_items_by_instr.retain(|instr_id, _| live_instr_ids.contains(instr_id));
     if exact_list_items_by_instr.is_empty() {
         return Ok(());
     }
@@ -983,6 +1039,11 @@ fn annotate_typed_constructor_init_plans(
     if constructor_init_plans.is_empty() {
         return Ok(0);
     }
+    let live_instr_ids = collect_typed_semantic_instr_ids(function);
+    let expected = constructor_init_plans
+        .keys()
+        .filter(|instr_id| live_instr_ids.contains(instr_id))
+        .count();
 
     struct Annotator<'a> {
         constructor_init_plans: &'a HashMap<InstrId, TypedConstructorInitPlan>,
@@ -1010,9 +1071,10 @@ fn annotate_typed_constructor_init_plans(
         count: 0,
     };
     annotator.visit_fn_mut(function);
-    if annotator.used.len() != constructor_init_plans.len() {
+    if annotator.used.len() != expected {
         let missing = constructor_init_plans
             .keys()
+            .filter(|instr_id| live_instr_ids.contains(instr_id))
             .filter(|instr_id| !annotator.used.contains(instr_id))
             .map(ToString::to_string)
             .collect::<Vec<_>>()
@@ -1738,6 +1800,77 @@ fn remap_cloned_constructor_field_bindings(
     Ok(count)
 }
 
+fn retain_live_typed_profile_sidecars(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    remapped_inline_targets: &mut HashMap<RuntimeFunctionId, TypedInlineTargets>,
+    remapped_indexed_fields: &mut HashMap<
+        RuntimeFunctionId,
+        HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>,
+    >,
+    remapped_indexed_field_counter_sources: &mut HashMap<
+        RuntimeFunctionId,
+        HashMap<InstrId, TypedIndexedFieldCounterSource>,
+    >,
+    remapped_exact_list_items: &mut HashMap<
+        RuntimeFunctionId,
+        HashMap<InstrId, ProfileExactListItemAccessPlan>,
+    >,
+    remapped_branches: &mut HashMap<RuntimeFunctionId, HashMap<InstrId, TypedExactIntBranchPlan>>,
+    remapped_returns: &mut HashMap<RuntimeFunctionId, HashMap<InstrId, TypedExactIntReturnPlan>>,
+    constructor_init_plans: &mut HashMap<
+        RuntimeFunctionId,
+        HashMap<InstrId, TypedConstructorInitPlan>,
+    >,
+) {
+    let live_instr_ids = collect_typed_semantic_instr_ids(function);
+    if let Some(targets) = remapped_inline_targets.get_mut(&function.function_id) {
+        targets.retain(|instr_id, _| live_instr_ids.contains(instr_id));
+    }
+    if let Some(fields) = remapped_indexed_fields.get_mut(&function.function_id) {
+        fields.retain(|instr_id, _| live_instr_ids.contains(instr_id));
+    }
+    if let Some(counter_sources) =
+        remapped_indexed_field_counter_sources.get_mut(&function.function_id)
+    {
+        counter_sources.retain(|instr_id, _| live_instr_ids.contains(instr_id));
+    }
+    if let Some(items) = remapped_exact_list_items.get_mut(&function.function_id) {
+        items.retain(|instr_id, _| live_instr_ids.contains(instr_id));
+    }
+    if let Some(branches) = remapped_branches.get_mut(&function.function_id) {
+        branches.retain(|instr_id, _| live_instr_ids.contains(instr_id));
+    }
+    if let Some(returns) = remapped_returns.get_mut(&function.function_id) {
+        returns.retain(|instr_id, _| live_instr_ids.contains(instr_id));
+    }
+    if let Some(plans) = constructor_init_plans.get_mut(&function.function_id) {
+        plans.retain(|instr_id, _| live_instr_ids.contains(instr_id));
+    }
+}
+
+fn collect_typed_semantic_instr_ids(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+) -> HashSet<InstrId> {
+    struct Collector {
+        instr_ids: HashSet<InstrId>,
+    }
+
+    impl Visit<InstrTyped> for Collector {
+        fn visit_instr(&mut self, expr: &InstrTyped) {
+            if let Some(instr_id) = expr.try_semantic_instr_id() {
+                self.instr_ids.insert(instr_id);
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    let mut collector = Collector {
+        instr_ids: HashSet::new(),
+    };
+    collector.visit_fn(function);
+    collector.instr_ids
+}
+
 fn remap_cloned_profile_rewrites(
     caller_function_id: RuntimeFunctionId,
     mappings: &[TypedInlineInstrIdMapping],
@@ -1812,6 +1945,49 @@ fn remap_cloned_hot_state_cleanup_labels(
         .filter_map(|(source, target)| labels.contains(source).then_some(*target))
         .collect::<Vec<_>>();
     labels.extend(remapped);
+}
+
+fn remap_cloned_static_sources(
+    sources: &mut HashSet<InstrId>,
+    caller_function_id: RuntimeFunctionId,
+    mappings: &[TypedInlineInstrIdMapping],
+) {
+    let remapped = mappings
+        .iter()
+        .filter_map(|mapping| {
+            (mapping.callee == caller_function_id && sources.contains(&mapping.callee_instr_id))
+                .then_some(mapping.caller_instr_id)
+        })
+        .collect::<Vec<_>>();
+    sources.extend(remapped);
+}
+
+fn trusted_constructor_sources_from_inline_stats(
+    stats: &soac_opt::passes::TypedInlineRewriteStats,
+    trusted_call_sources: &HashSet<InstrId>,
+    bindings: &HashMap<InstrId, TypedConstructorFieldBindings>,
+) -> HashSet<InstrId> {
+    let trusted_inline_instances = stats
+        .inline_instance_sources
+        .iter()
+        .filter_map(|mapping| {
+            trusted_call_sources
+                .contains(&mapping.source_instr_id)
+                .then_some(mapping.inline_instance)
+        })
+        .collect::<HashSet<_>>();
+    if trusted_inline_instances.is_empty() {
+        return HashSet::new();
+    }
+    stats
+        .instr_id_mappings
+        .iter()
+        .filter_map(|mapping| {
+            (trusted_inline_instances.contains(&mapping.inline_instance)
+                && bindings.contains_key(&mapping.caller_instr_id))
+            .then_some(mapping.caller_instr_id)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1999,6 +2175,16 @@ fn apply_typed_v3_module_rewrites(
     inline_plan: Option<&soac_opt::passes::InlinePlanModule>,
     external_callees: &HashMap<RuntimeFunctionId, TypedExternalInlineCallee>,
 ) -> Result<(), String> {
+    let mut static_runtime_range_calls = module
+        .callable_defs
+        .iter()
+        .map(|function| {
+            (
+                function.function_id,
+                static_runtime_range_call_ids(function, &module.module_constants),
+            )
+        })
+        .collect::<HashMap<_, _>>();
     for function in &mut module.callable_defs {
         apply_profile_call_emission_plans_to_typed_function(function, profile)?;
     }
@@ -2067,6 +2253,15 @@ fn apply_typed_v3_module_rewrites(
                         &stats,
                     );
                 if !bindings.is_empty() {
+                    if let Some(trusted_sources) =
+                        static_runtime_range_calls.get_mut(&caller_function_id)
+                    {
+                        trusted_sources.extend(trusted_constructor_sources_from_inline_stats(
+                            &stats,
+                            trusted_sources,
+                            &bindings,
+                        ));
+                    }
                     constructor_field_bindings
                         .entry(caller_function_id)
                         .or_default()
@@ -2221,6 +2416,13 @@ fn apply_typed_v3_module_rewrites(
                     &mut constructor_init_plans,
                     &mut constructor_field_bindings,
                 )?;
+                if let Some(sources) = static_runtime_range_calls.get_mut(&caller_function_id) {
+                    remap_cloned_static_sources(
+                        sources,
+                        caller_function_id,
+                        &cloned_instr_id_mappings,
+                    );
+                }
             }
             assign_missing_typed_function_instr_ids(function);
             refresh_typed_function_value_facts(function);
@@ -2237,6 +2439,20 @@ fn apply_typed_v3_module_rewrites(
             assign_missing_typed_function_instr_ids(function);
             refresh_typed_function_value_facts(function);
         }
+        if simplify_typed_virtual_tuple_ops(function, &mut module.module_constants) != 0 {
+            retain_live_typed_profile_sidecars(
+                function,
+                &mut remapped_inline_targets,
+                &mut remapped_indexed_fields,
+                &mut remapped_indexed_field_counter_sources,
+                &mut remapped_exact_list_items,
+                &mut remapped_exact_int_branches,
+                &mut remapped_exact_int_returns,
+                &mut constructor_init_plans,
+            );
+            assign_missing_typed_function_instr_ids(function);
+            refresh_typed_function_value_facts(function);
+        }
         apply_profile_access_and_scalar_plans_to_typed_function(
             function,
             profile,
@@ -2248,28 +2464,102 @@ fn apply_typed_v3_module_rewrites(
             constructor_init_plans.get(&function.function_id),
         )?;
         if let Some(bindings) = constructor_field_bindings.get(&function.function_id) {
-            let mut bindings = bindings.clone();
-            let stats = scalarize_typed_hot_constructor_field_loads_with_bindings(
-                function,
-                &module.module_constants,
-                &mut bindings,
-            );
-            if stats.rewritten_loads != 0 || stats.inserted_scalar_stores != 0 {
-                assign_missing_typed_function_instr_ids(function);
-                refresh_typed_function_value_facts(function);
+            let trusted_sources = static_runtime_range_calls
+                .get(&function.function_id)
+                .cloned()
+                .unwrap_or_default();
+            if !trusted_sources.is_empty() {
+                let mut fully_virtual_plan = plan_typed_fully_virtual_objects(
+                    function,
+                    &module.module_constants,
+                    bindings,
+                    &trusted_sources,
+                );
+                let stats = lower_typed_fully_virtual_objects_to_locals_with_plan(
+                    function,
+                    &module.module_constants,
+                    &mut fully_virtual_plan,
+                );
+                if stats.changed() {
+                    assign_missing_typed_function_instr_ids(function);
+                    refresh_typed_function_value_facts(function);
+                }
             }
-            let stats = virtualize_typed_hot_constructor_objects(
-                function,
-                &module.module_constants,
-                &bindings,
-            );
-            if stats.changed() {
-                assign_missing_typed_function_instr_ids(function);
-                refresh_typed_function_value_facts(function);
+            let remaining_bindings = bindings
+                .iter()
+                .filter(|(source, _)| !trusted_sources.contains(source))
+                .map(|(source, bindings)| (*source, bindings.clone()))
+                .collect::<HashMap<_, _>>();
+            if !remaining_bindings.is_empty() {
+                let mut virtualization_plan = plan_typed_virtual_objects(
+                    function,
+                    &module.module_constants,
+                    &remaining_bindings,
+                );
+                let stats = lower_typed_virtual_objects_to_locals_with_plan(
+                    function,
+                    &module.module_constants,
+                    &mut virtualization_plan,
+                );
+                if stats.changed() {
+                    assign_missing_typed_function_instr_ids(function);
+                    refresh_typed_function_value_facts(function);
+                }
             }
         }
         apply_profile_typed_block_metadata_to_typed_function(function, profile)?;
         apply_profile_typed_guard_miss_policy_to_typed_function(function, profile);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soac_core::block_py::{LocalFunctionId, RuntimeFunctionId, RuntimeModuleId};
+    use soac_opt::passes::{
+        TypedConstructorFieldBindings, TypedInlineInstanceSource, TypedInlineRewriteStats,
+    };
+
+    #[test]
+    fn trusted_constructor_sources_follow_inlined_static_calls() {
+        let trusted_call_sources = HashSet::from([InstrId::new(1)]);
+        let bindings = HashMap::from([(
+            InstrId::new(8),
+            TypedConstructorFieldBindings { fields: Vec::new() },
+        )]);
+        let function_id = RuntimeFunctionId::new(RuntimeModuleId::new(3), LocalFunctionId::new(4));
+        let stats = TypedInlineRewriteStats {
+            inline_instance_sources: vec![
+                TypedInlineInstanceSource {
+                    inline_instance: 0,
+                    source_instr_id: InstrId::new(1),
+                },
+                TypedInlineInstanceSource {
+                    inline_instance: 1,
+                    source_instr_id: InstrId::new(2),
+                },
+            ],
+            instr_id_mappings: vec![
+                TypedInlineInstrIdMapping {
+                    callee: function_id,
+                    inline_instance: 0,
+                    callee_instr_id: InstrId::new(3),
+                    caller_instr_id: InstrId::new(8),
+                },
+                TypedInlineInstrIdMapping {
+                    callee: function_id,
+                    inline_instance: 1,
+                    callee_instr_id: InstrId::new(4),
+                    caller_instr_id: InstrId::new(9),
+                },
+            ],
+            ..TypedInlineRewriteStats::default()
+        };
+
+        assert_eq!(
+            trusted_constructor_sources_from_inline_stats(&stats, &trusted_call_sources, &bindings,),
+            HashSet::from([InstrId::new(8)]),
+        );
+    }
 }

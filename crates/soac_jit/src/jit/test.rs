@@ -19641,10 +19641,10 @@ class Point:
     }
 
     #[test]
-    fn runtime_typed_v3_inline_remaps_callee_indexed_field_access_plans() {
+    fn runtime_typed_v3_inline_remaps_callee_indexed_field_access_plans_from_registered_types() {
         if crate::run_test_in_isolated_process_if_needed(
             module_path!(),
-            "runtime_typed_v3_inline_remaps_callee_indexed_field_access_plans",
+            "runtime_typed_v3_inline_remaps_callee_indexed_field_access_plans_from_registered_types",
         ) {
             return;
         }
@@ -19670,6 +19670,16 @@ class Point:
             modules
                 .set_item("field_type_test", owner_module.as_any())
                 .expect("owner module should be registered");
+            let owner_type = owner_module
+                .getattr("Point")
+                .expect("Point should exist")
+                .as_ptr() as *mut ffi::PyTypeObject;
+            reloc_type_ref_for_type(owner_type)
+                .expect("owner type should register")
+                .expect("owner type should have a relocatable reference");
+            modules
+                .del_item("field_type_test")
+                .expect("owner module should be removed after type registration");
 
             let module_name = "runtime_typed_v3_inline_indexed_field_plan_test";
             let module_name_gen = ModuleNameGen::new(0);
@@ -19817,10 +19827,6 @@ class Point:
             assert_eq!(field_plans.len(), 1);
             assert_ne!(field_plans[0].0, callee_getattr_instr_id);
             assert_eq!(field_plans[0].1, 1);
-
-            modules
-                .del_item("field_type_test")
-                .expect("owner module should be removed");
         });
     }
 

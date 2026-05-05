@@ -184,12 +184,8 @@ def test_verify_counter_dump_records_refcount_decref_locations(tmp_path):
     module_name = "counter_dump_refcount_location_case"
     (tmp_path / f"{module_name}.py").write_text(
         """
-class Box:
-    def __init__(self, value):
-        self.value = value
-
 def make(value):
-    x = Box(value)
+    x = [value]
     return value
 
 def run():
@@ -238,6 +234,52 @@ def run():
         and ("reason=return" in branch or "purpose=stack_exit_sweep" in branch)
         for branch, value in location_counts.items()
     ), verify
+
+
+def test_verify_virtual_constructor_escape_keeps_materialization_inputs_bound(tmp_path):
+    module_name = "counter_dump_virtual_escape_case"
+    (tmp_path / f"{module_name}.py").write_text(
+        """
+class Box:
+    def __init__(self, value):
+        self.value = value
+
+sink = None
+
+def make(value):
+    global sink
+    x = Box(value)
+    sink = x
+    return value
+
+def run():
+    for index in range(5):
+        assert make(index) == index
+""",
+        encoding="utf-8",
+    )
+    work_dir = tmp_path / "soac-work"
+    script = _import_and_run_script(
+        tmp_path,
+        f"import {module_name} as module",
+        "module.run()",
+    )
+    base_env = _soac_subprocess_env(
+        tmp_path,
+        work_dir=work_dir,
+        extra_env={"SOAC_COMPILE_MODE": "eager"},
+    )
+    profile_result = _run_soac_subprocess(
+        script,
+        env={**base_env, "SOAC_OPT_MODE": "profile"},
+    )
+    _assert_subprocess_ok(profile_result)
+
+    verify_result = _run_soac_subprocess(
+        script,
+        env={**base_env, "SOAC_OPT_MODE": "verify"},
+    )
+    _assert_subprocess_ok(verify_result)
 
 
 def test_counter_dump_file_is_not_written_in_none_mode(tmp_path, monkeypatch):

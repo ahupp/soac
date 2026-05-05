@@ -730,7 +730,7 @@ async def asynccontextmanager_exit(exit_fn, exc):
 # references instead of installing duplicate bootstrap helper implementations.
 class range:
     def __init__(self, *args):
-        argc = _builtins.len(args)
+        argc = len(args)
         if argc == 1:
             start = 0
             stop = _index(args[0])

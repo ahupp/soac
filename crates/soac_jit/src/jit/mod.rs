@@ -17821,25 +17821,37 @@ fn local_failure_cleanup_emit_ctx<'mc>(
     if !emit_ctx.consts.step_null_args.is_empty() {
         return Ok(None);
     }
-    let (forwarded_values, forwarded_local_indices, continuation) =
-        if let Some(forwarded_names) = emit_ctx.exception_forwarded_local_names {
-            let (forwarded_values, forwarded_local_indices) =
-                emit_forward_named_values_from_local_env(fb, forwarded_names, local_env, emit_ctx)
-                    .map_err(|err| {
-                        format!("missing local mapping for failure cleanup forwarding: {err}")
-                    })?;
-            (
-                forwarded_values,
-                forwarded_local_indices,
-                PendingLocalFailureContinuation::ExceptionDispatch(emit_ctx.consts.step_null_block),
-            )
-        } else {
-            (
-                Vec::new(),
-                HashSet::new(),
-                PendingLocalFailureContinuation::CleanupNull(cleanup_null_block),
-            )
-        };
+    let (forwarded_values, forwarded_local_indices, continuation) = if let Some(forwarded_names) =
+        emit_ctx.exception_forwarded_local_names
+    {
+        let forwarding_emit_ctx = forwarding_materialization_failure_emit_ctx(
+            fb,
+            emit_ctx,
+            local_env,
+            forwarded_names,
+            cleanup_null_block,
+            pending_local_failure_cleanups,
+            local_failure_cleanup_blocks,
+        );
+        let (forwarded_values, forwarded_local_indices) = emit_forward_named_values_from_local_env(
+            fb,
+            forwarded_names,
+            local_env,
+            forwarding_emit_ctx.as_ref().unwrap_or(emit_ctx),
+        )
+        .map_err(|err| format!("missing local mapping for failure cleanup forwarding: {err}"))?;
+        (
+            forwarded_values,
+            forwarded_local_indices,
+            PendingLocalFailureContinuation::ExceptionDispatch(emit_ctx.consts.step_null_block),
+        )
+    } else {
+        (
+            Vec::new(),
+            HashSet::new(),
+            PendingLocalFailureContinuation::CleanupNull(cleanup_null_block),
+        )
+    };
     let cleanup_entries = local_env.local_only_cleanup_entries_excluding(&forwarded_local_indices);
     if cleanup_entries.is_empty() && forwarded_values.is_empty() {
         return Ok(None);
@@ -17901,6 +17913,60 @@ fn local_failure_cleanup_emit_ctx<'mc>(
     Ok(Some(
         emit_ctx.with_step_null_target(cleanup_block, step_null_args),
     ))
+}
+
+fn forwarding_materialization_failure_emit_ctx<'mc>(
+    fb: &mut FunctionBuilder<'_>,
+    emit_ctx: &JitEmitCtx<'mc>,
+    local_env: &LocalEnv,
+    forwarded_names: &[String],
+    cleanup_null_block: ir::Block,
+    pending_local_failure_cleanups: &mut Vec<PendingLocalFailureCleanup>,
+    local_failure_cleanup_blocks: &mut HashMap<LocalFailureCleanupKey, ir::Block>,
+) -> Option<JitEmitCtx<'mc>> {
+    let needs_fallible_materialization = forwarded_names.iter().any(|name| {
+        local_env
+            .entry_index_for_block_arg_name(name)
+            .is_some_and(|index| local_env.entries[index].i64_facts().is_some())
+    });
+    if !needs_fallible_materialization {
+        return None;
+    }
+
+    let cleanup_entries = local_env.local_only_cleanup_entries_excluding(&HashSet::new());
+    let cleanup_actions = cleanup_entries
+        .iter()
+        .map(|_| PendingLocalFailureCleanupAction::Decref)
+        .collect::<Vec<_>>();
+    let continuation = PendingLocalFailureContinuation::CleanupNull(cleanup_null_block);
+    let key = LocalFailureCleanupKey::new(
+        cleanup_entries.as_slice(),
+        cleanup_actions.as_slice(),
+        &[],
+        continuation,
+    );
+    let cleanup_block = if let Some(cleanup_block) = local_failure_cleanup_blocks.get(&key).copied()
+    {
+        cleanup_block
+    } else {
+        let cleanup_block = fb.create_block();
+        for _ in &cleanup_entries {
+            fb.append_block_param(cleanup_block, emit_ctx.consts.ptr_ty);
+        }
+        pending_local_failure_cleanups.push(PendingLocalFailureCleanup {
+            block: cleanup_block,
+            cleanup_arg_count: cleanup_entries.len(),
+            cleanup_actions,
+            continuation,
+        });
+        local_failure_cleanup_blocks.insert(key, cleanup_block);
+        cleanup_block
+    };
+    let step_null_args = cleanup_entries
+        .iter()
+        .map(|entry| entry.value)
+        .collect::<Vec<_>>();
+    Some(emit_ctx.with_step_null_target(cleanup_block, step_null_args))
 }
 
 fn emit_typed_codegen_ops(
@@ -21076,13 +21142,16 @@ pub unsafe fn render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
         &function_aliases,
         &built.block_annotations,
     );
-    let (compiled_clif, cfg_dot, vcode_disasm) = render_compiled_clif_and_vcode_disasm(
+    let (compiled_clif, cfg_dot, vcode_disasm) = match render_compiled_clif_and_vcode_disasm(
         &mut jit_module,
         compile_session.env_config()?,
         built.ctx,
         &function_aliases,
         &built.block_annotations,
-    )?;
+    ) {
+        Ok(rendered) => rendered,
+        Err(err) => return Err(err),
+    };
     out.push_str(&compiled_clif);
     Ok(RenderedSpecializedClif {
         pre_inline_clif,

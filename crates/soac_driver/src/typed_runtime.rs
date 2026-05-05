@@ -5,6 +5,7 @@ use soac_ir_blockpy::BlockPyModuleShape;
 use soac_ir_typed::{FactStore, TypedBlockPyModuleShape, lower_blockpy_module_to_typed};
 use soac_opt::passes::{
     annotate_typed_module_value_facts, infer_module_value_facts, lower_typed_if_tests_to_truthy,
+    sync_typed_module_value_facts,
 };
 
 pub struct PreparedTypedRuntimeModule {
@@ -27,7 +28,7 @@ pub fn prepare_typed_v3_runtime_module_with_rewrites(
         &FactStore,
     ) -> Result<(), String>,
 ) -> Result<PreparedTypedRuntimeModule, String> {
-    let value_facts = infer_module_value_facts(module);
+    let mut value_facts = infer_module_value_facts(module);
     let mut typed_module = lower_blockpy_module_to_typed(module.clone());
     typed_module = instrument_typed_module(
         typed_module,
@@ -36,6 +37,7 @@ pub fn prepare_typed_v3_runtime_module_with_rewrites(
     annotate_typed_module_value_facts(&mut typed_module, &value_facts);
     typed_module = lower_typed_if_tests_to_truthy(typed_module);
     apply_rewrites(&mut typed_module, &value_facts)?;
+    sync_typed_module_value_facts(&typed_module, &mut value_facts);
     Ok(PreparedTypedRuntimeModule {
         module: typed_module,
         value_facts,

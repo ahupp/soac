@@ -4,7 +4,7 @@ use super::counters::{
 use super::intrinsics::{OperationEmitState, increment_counter_with_state};
 use super::symbols::{
     CpythonTypeSymbol, RelocTypeRef, register_runtime_type_for_key, reloc_type_ref_for_type,
-    reloc_type_ref_from_typed_attr_owner_ref, resolve_type_key_to_type, type_key_for_type,
+    reloc_type_ref_from_typed_attr_owner_ref, resolve_reloc_type_ref_to_type, type_key_for_type,
     typed_attr_owner_ref_from_reloc_type_ref,
 };
 use cranelift_codegen::ir;
@@ -280,7 +280,7 @@ pub(super) fn prime_opt_v3_field_index_layouts<'a>(
     layout_groups: impl IntoIterator<Item = &'a OptV3IndexedFieldLayoutGroup>,
 ) -> Result<(), String> {
     for group in layout_groups {
-        let Some(owner_type) = resolve_type_key_to_type(&group.type_key)? else {
+        let Some(owner_type) = indexed_field_owner_type_for_type_key(&group.type_key)? else {
             continue;
         };
         prime_field_index_layout(owner_type, group.layouts.as_slice())?;
@@ -291,7 +291,7 @@ pub(super) fn prime_opt_v3_field_index_layouts<'a>(
 pub(super) fn field_index_specialization_from_primed_opt_v3(
     request: &OptV3IndexedFieldRuntimeAccessRequest,
 ) -> Result<Option<FieldIndexSpecialization>, String> {
-    let Some(owner_type) = resolve_type_key_to_type(&request.type_key)? else {
+    let Some(owner_type) = indexed_field_owner_type_for_type_key(&request.type_key)? else {
         return Ok(None);
     };
     field_index_specialization_for_type(
@@ -320,10 +320,16 @@ fn indexed_field_owner_type_for_function(
     function_id: soac_core::block_py::RuntimeFunctionId,
     type_key: &CounterDumpTypeKey,
 ) -> Result<Option<*mut ffi::PyTypeObject>, String> {
-    if let Some(owner_type) = resolve_type_key_to_type(type_key)? {
+    if let Some(owner_type) = indexed_field_owner_type_for_type_key(type_key)? {
         return Ok(Some(owner_type));
     }
     constructor_owner_type_for_type_key(function_id, type_key)
+}
+
+fn indexed_field_owner_type_for_type_key(
+    type_key: &CounterDumpTypeKey,
+) -> Result<Option<*mut ffi::PyTypeObject>, String> {
+    resolve_reloc_type_ref_to_type(&RelocTypeRef::TypeKey(type_key.clone()))
 }
 
 pub(super) fn field_index_specialization_from_opt_v3_for_function(
