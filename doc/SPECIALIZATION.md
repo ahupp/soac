@@ -39,16 +39,20 @@ an implicit leading type argument, so class calls can reuse the ordinary
 guarded direct-call target model. Type registration only attaches that
 metadata for safe default constructor shapes, so unsupported Python type-call
 cases stay generic and do not enter the synthetic target.
-Typed planning can also add narrowly-scoped static runtime-name call plans when
-the callee binding is compiler-owned rather than profile-discovered. Today this
-is used for the pure-Python `soac.runtime.range` class: a `RuntimeName::Range`
-call can resolve directly to the runtime module's synthetic constructor-entry
-target, then flow through the same typed guarded-call and inliner machinery as
-profiled direct calls. The static path is apply/verify-only; profile mode keeps
+Typed planning can also add static call plans when the callee binding is
+compiler-owned rather than profile-discovered. `RuntimeName::Range` and
+`RuntimeName::IterRange` still resolve directly to the corresponding
+`soac.runtime` constructor-entry targets, and lowered module globals that have
+one module-init binding with no later in-module stores or deletes are treated
+as static function targets under SOAC's strict-module assumption. Runtime
+constructors such as `IterRange(...)` also lower as unconditional direct callable
+calls; user-module constructors remain generic for now because their type
+metadata is not guaranteed to be available while module initialization is still
+running. The optimization currently assumes, but does not yet runtime-enforce,
+the strict-module rule that outside code cannot later replace those final
+globals. The static path is apply/verify-only; profile mode keeps
 the original call graph so nested protocol sites still collect ordinary
-evidence before later rewrites inline them. Profile-selected plans still win
-when they already own the same target; the static path only fills in missing
-target evidence.
+evidence before later rewrites inline them.
 Constant-attribute indexed-field load/store selections from `type_keys` are
 also emitted as mechanical v3 indexed-field decisions; JIT validation checks
 those emitted decisions against the selected plan and lowered
@@ -513,6 +517,12 @@ their owner/type guard payload is not yet a static mechanical JIT input.
 - Inline-winning direct calls assign fresh caller instruction ids to cloned
   callee operations and remap callee-owned operation plans, currently exact-list
   `GetItem`/`SetItem`, before typed access-plan annotation.
+- Profile-selected inline body decisions stay local to the profiled caller by
+  default. When a callee body is itself inlined, typed planning remaps
+  mechanical callee sidecars and structurally static inline targets; only small
+  nested profile-selected bodies are propagated transitively. Larger nested
+  callees need a fresh call-body decision in their new context instead of being
+  cloned recursively into every caller.
 - JIT codegen has direct boolean lowering for typed direct-call guard tests, so
   those guards do not round-trip through Python truthiness. Replay/deopt support
   consumes the typed metadata selected by the plan rather than legacy codegen
@@ -562,7 +572,11 @@ Synthetic runtime protocol calls such as lowered `iter(x)` and `next(x)` use the
 same evidence channel, but sample the receiver's resolved `__iter__` or
 `__next__` function id instead of the builtin helper object itself. That keeps
 the later direct-call decision tied to the Python method body that can actually
-be inlined.
+be inlined. When strict-module static targeting proves a local still carries a
+trusted runtime owner type, typed planning can treat that one protocol callsite
+as unconditional too; nested trusted constructors discovered through the direct
+inline keep propagating that owner fact. The later virtual-object lowering pass
+still decides separately whether the object itself can be erased.
 
 Codegen then emits the guarded method path: evaluate the receiver, check the
 receiver type/version, direct-call the selected function with the receiver as

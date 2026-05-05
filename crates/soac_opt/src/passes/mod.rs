@@ -73,6 +73,7 @@ pub use crate::typed::{
     inline_typed_constructor_init_bodies_with_external_callees,
     inline_typed_function_direct_call_stores,
     inline_typed_function_direct_call_stores_with_external_callees,
+    inline_typed_function_direct_call_stores_with_external_callees_and_trusted_calls,
     lower_typed_fully_virtual_objects_to_locals_with_plan,
     lower_typed_function_call_access_plan_instrs, lower_typed_function_call_emission_plans,
     lower_typed_function_if_tests_to_truthy, lower_typed_if_tests_to_truthy,

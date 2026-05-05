@@ -16,7 +16,6 @@ use soac_core::block_py::{
     InstrKey, InstrLocationMap, LocalLocation, ModuleShape, NameLocation, ParamKind, ResolvedName,
     RuntimeFunctionId, RuntimeName, StorageLayout, Store, Visit, current_instr_locations,
 };
-use soac_core::profile::{CollectedTypeKeyLayout, CounterDumpTypeKey};
 use soac_instrument::RUNTIME_DECREF_LOCATION_COUNTER_KIND;
 use soac_ir_blockpy::{
     BlockPyModuleShape, InstrBlockPy, constructor_init_function_id_for_entry_function,
@@ -29,8 +28,7 @@ use soac_ir_typed::emit_v3::{
     mechanical_region_inputs as opt_v3_mechanical_region_inputs,
 };
 use soac_ir_typed::plan_v3::{
-    ConversionKind, IndexedFieldAccessKind as PlanV3IndexedFieldAccessKind,
-    IndexedFieldFallbackKind, IndexedFieldGuardKind, IndexedFieldOwnerType,
+    ConversionKind, IndexedFieldAccessKind as PlanV3IndexedFieldAccessKind, IndexedFieldOwnerType,
     IndexedGlobalAccessKind as PlanV3IndexedGlobalAccessKind, MaterializeKind, PlanNodeId,
     PlanNodeKind, PlanValue, RegionId, RegionPlan, Rep, RichCompareOp,
 };
@@ -43,10 +41,6 @@ use soac_ir_typed::{
     TypedGuardedMethodCall, TypedIndexedFieldCounterSource, TypedIndexedFieldGuard,
     TypedIndexedFieldPlanSource, TypedPlannedResult, TypedPyObjectOwnershipPlan, TypedSetAttr,
     ValueFacts, lower_blockpy_function_to_typed,
-};
-use soac_opt::access_emission_v3::{
-    IndexedFieldLayoutGroup as OptV3IndexedFieldLayoutGroup,
-    IndexedFieldRuntimeAccessRequest as OptV3IndexedFieldRuntimeAccessRequest,
 };
 #[cfg(test)]
 use soac_opt::passes::infer_module_value_facts;
@@ -1508,6 +1502,7 @@ struct JitEmitCtx<'mc> {
     module: &'mc BlockPyModule<TypedBlockPyModuleShape>,
     function_id: RuntimeFunctionId,
     function_kind: FunctionKind,
+    indexed_field_guards_by_instr: &'mc HashMap<InstrId, Vec<TypedIndexedFieldGuard>>,
     module_constants: &'mc ModuleCodegenConstants,
     value_facts: &'mc FactStore,
     deopt_resume_plan: &'mc PlannedJitDeoptResumeFunction,
@@ -15855,7 +15850,7 @@ impl OptV3MechanicalValue {
 }
 
 fn typed_indexed_field_guards_by_instr(
-    expr: &InstrTyped,
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
 ) -> HashMap<InstrId, Vec<TypedIndexedFieldGuard>> {
     struct Collector {
         guards_by_instr: HashMap<InstrId, Vec<TypedIndexedFieldGuard>>,
@@ -15878,7 +15873,7 @@ fn typed_indexed_field_guards_by_instr(
     let mut collector = Collector {
         guards_by_instr: HashMap::new(),
     };
-    collector.visit_instr(expr);
+    collector.visit_fn(function);
     collector.guards_by_instr
 }
 
@@ -15896,12 +15891,11 @@ fn emit_typed_exact_int_branch_truth_i32(
     else {
         return Ok(None);
     };
-    let indexed_field_guards_by_instr = typed_indexed_field_guards_by_instr(expr);
     emit_opt_v3_exact_int_branch_selection(
         fb,
         plan.instr_id,
         plan.into(),
-        &indexed_field_guards_by_instr,
+        emit_ctx.indexed_field_guards_by_instr,
         local_env,
         emit_ctx,
         codegen_env,
@@ -15925,12 +15919,11 @@ fn emit_typed_exact_int_return_pyobject(
     else {
         return Ok(None);
     };
-    let indexed_field_guards_by_instr = typed_indexed_field_guards_by_instr(expr);
     emit_opt_v3_exact_int_return_selection(
         fb,
         plan.instr_id,
         plan.into(),
-        &indexed_field_guards_by_instr,
+        emit_ctx.indexed_field_guards_by_instr,
         local_env,
         emit_ctx,
         codegen_env,
@@ -16043,8 +16036,6 @@ fn emit_typed_exact_int_expr_i64_result(
     else {
         return Ok(None);
     };
-    let indexed_field_guards_by_instr = typed_indexed_field_guards_by_instr(expr);
-
     let result_block = fb.create_block();
     fb.append_block_param(result_block, emit_ctx.consts.i64_ty);
     let mut skipped_outputs = HashSet::new();
@@ -16060,7 +16051,7 @@ fn emit_typed_exact_int_expr_i64_result(
         local_env,
         emit_ctx,
         codegen_env,
-        &indexed_field_guards_by_instr,
+        emit_ctx.indexed_field_guards_by_instr,
         Some(deopt_miss.block),
         "exact-int scalar expression hot region",
     )?;
@@ -16118,8 +16109,6 @@ fn emit_typed_exact_int_expr_i32_bool01_result(
     else {
         return Ok(None);
     };
-    let indexed_field_guards_by_instr = typed_indexed_field_guards_by_instr(expr);
-
     let result_block = fb.create_block();
     fb.append_block_param(result_block, emit_ctx.consts.i32_ty);
     let mut skipped_outputs = HashSet::new();
@@ -16135,7 +16124,7 @@ fn emit_typed_exact_int_expr_i32_bool01_result(
         local_env,
         emit_ctx,
         codegen_env,
-        &indexed_field_guards_by_instr,
+        emit_ctx.indexed_field_guards_by_instr,
         Some(deopt_miss.block),
         "exact-int bool expression hot region",
     )?;
@@ -16254,24 +16243,22 @@ fn emit_typed_exact_int_expr_pyobject_result(
         return Ok(None);
     };
     let result = if planning::exact_int_return_plan_immortal_pyobject_result(plan).is_some() {
-        let indexed_field_guards_by_instr = typed_indexed_field_guards_by_instr(expr);
         emit_opt_v3_exact_int_return_deopt_immortal_pyobject_selection(
             fb,
             plan.instr_id,
             plan.into(),
-            &indexed_field_guards_by_instr,
+            emit_ctx.indexed_field_guards_by_instr,
             local_env,
             emit_ctx,
             codegen_env,
             func_imports,
         )?
     } else {
-        let indexed_field_guards_by_instr = typed_indexed_field_guards_by_instr(expr);
         emit_opt_v3_exact_int_return_selection(
             fb,
             plan.instr_id,
             plan.into(),
-            &indexed_field_guards_by_instr,
+            emit_ctx.indexed_field_guards_by_instr,
             local_env,
             emit_ctx,
             codegen_env,
@@ -16483,24 +16470,6 @@ fn emit_opt_v3_release_owned_values_except(
     }
 }
 
-fn opt_v3_indexed_field_access_request(
-    owner_type: &IndexedFieldOwnerType,
-    attr_name: &str,
-    expected_index: u32,
-) -> OptV3IndexedFieldRuntimeAccessRequest {
-    OptV3IndexedFieldRuntimeAccessRequest {
-        access: PlanV3IndexedFieldAccessKind::Load,
-        attr_name: attr_name.to_string(),
-        guard: IndexedFieldGuardKind::OwnerTypeVersionAndFieldIndex,
-        fallback: IndexedFieldFallbackKind::OriginalAttrAccess,
-        type_key: CounterDumpTypeKey {
-            module_name: owner_type.module_name.clone(),
-            qualname: owner_type.qualname.clone(),
-        },
-        expected_index,
-    }
-}
-
 fn opt_v3_indexed_field_receiver_value(
     fb: &mut FunctionBuilder<'_>,
     receiver: MechanicalIndexedFieldReceiverSource<'_>,
@@ -16554,32 +16523,10 @@ fn emit_opt_v3_borrowed_indexed_field_input(
         };
         plan.specializations
     } else {
-        let request = opt_v3_indexed_field_access_request(owner_type, attr_name, expected_index);
-        let layout_group = OptV3IndexedFieldLayoutGroup {
-            type_key: request.type_key.clone(),
-            layouts: vec![CollectedTypeKeyLayout {
-                owner_type_id: 0,
-                key: attr_name.to_string(),
-                index: expected_index,
-            }],
-        };
-        operation_specializations::prime_opt_v3_field_index_layouts(std::iter::once(
-            &layout_group,
-        ))?;
-        let Some(specialization) =
-            operation_specializations::field_index_specialization_from_opt_v3_for_function(
-                emit_ctx.function_id,
-                &request,
-            )?
-        else {
-            return Ok(emit_opt_v3_indexed_field_input_fallback_value(
-                fb,
-                source,
-                fallback_block,
-                emit_ctx,
-            ));
-        };
-        vec![specialization]
+        return Err(format!(
+            "optimizer v3 {context} borrowed indexed-field input {source} for {}.{}[{}] in function {} reached codegen without typed guards",
+            owner_type.qualname, attr_name, expected_index, emit_ctx.function_id
+        ));
     };
 
     let receiver = opt_v3_indexed_field_receiver_value(fb, receiver, local_env, emit_ctx, context)?;
@@ -19561,6 +19508,7 @@ fn build_cranelift_run_bb_specialized_function(
         options.planned_typed_function.as_ref(),
         value_facts,
     )?;
+    let indexed_field_guards_by_instr = typed_indexed_field_guards_by_instr(&typed_function);
     let guard_miss_deopt_instr_ids = collect_typed_guard_miss_deopt_instr_ids(&typed_function);
     let guard_miss_deopt_stub = !guard_miss_deopt_instr_ids.is_empty();
     let direct_call_targets = collect_typed_call_direct_targets(&typed_function);
@@ -20245,6 +20193,7 @@ fn build_cranelift_run_bb_specialized_function(
                 module,
                 function_id: function.function_id,
                 function_kind: function.kind,
+                indexed_field_guards_by_instr: &indexed_field_guards_by_instr,
                 module_constants,
                 value_facts,
                 deopt_resume_plan: jit_deopt_resume_plan,

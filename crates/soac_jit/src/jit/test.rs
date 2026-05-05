@@ -18684,7 +18684,7 @@ def f(x, y):
             let caller_id = caller_function.function_id;
 
             let runtime_lowered = soac_lowering::lower_python_to_blockpy_with_tracker_and_options(
-                "class range:\n    def __init__(self, value):\n        self.value = value\n",
+                "class range:\n    def __init__(self, *args):\n        argc = len(args)\n        if argc != 1:\n            raise TypeError\n        self.value = args[0]\n",
                 ModuleNameGen::new(40),
                 soac_core::pass_tracker::RecordingPassTracker::new(),
                 soac_lowering::LoweringOptions {
@@ -18748,6 +18748,11 @@ def f(x, y):
                 "static runtime range calls should inline through the ordinary typed direct-call path"
             );
             assert_eq!(
+                count_typed_instrs(planned_caller, |expr| matches!(expr, InstrTyped::Tuple(_))),
+                0,
+                "inlined static runtime range calls should scalarize compiler-created packed rest tuples"
+            );
+            assert_eq!(
                 planned_caller
                     .blocks
                     .iter()
@@ -18759,8 +18764,8 @@ def f(x, y):
                         )
                     })
                     .count(),
-                1,
-                "static runtime range inlining should expose the direct-call guard CFG edge"
+                0,
+                "static runtime range and nested IterRange inlining should avoid guard CFG edges"
             );
         });
     }

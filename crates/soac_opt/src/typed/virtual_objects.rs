@@ -2314,22 +2314,25 @@ impl TypedVirtualLoweringState {
         object: TypedVirtualObjectId,
         location: LocalLocation,
         bindings: &TypedConstructorFieldBindings,
+        initialize_fields: bool,
     ) {
         self.rebind_local(location);
         self.virtual_state.aliases.insert(location, object);
         for field in &bindings.fields {
-            let value = field
-                .scalar
-                .as_ref()
-                .cloned()
-                .unwrap_or_else(|| self.resolve_scalar_name(&field.value));
             let field_ref = TypedVirtualFieldRef {
                 object,
                 field_name: field.field_name.clone(),
             };
-            self.virtual_state.fields.insert(field_ref.clone(), value);
             if let Some(scalar) = &field.scalar {
-                self.field_scalars.insert(field_ref, scalar.clone());
+                self.field_scalars.insert(field_ref.clone(), scalar.clone());
+            }
+            if initialize_fields {
+                let value = field
+                    .scalar
+                    .as_ref()
+                    .cloned()
+                    .unwrap_or_else(|| self.resolve_scalar_name(&field.value));
+                self.virtual_state.fields.insert(field_ref, value);
             }
         }
     }
@@ -2637,21 +2640,28 @@ fn transfer_typed_field_scalar_instr(
 ) {
     match instr {
         InstrTyped::Store(store) => {
-            if let Some((source, bindings)) =
+            if let Some((source, bindings, initialize_fields)) =
                 typed_constructor_field_bindings_for_store(store, constructor_field_bindings)
             {
                 state
                     .invalidate_objects(typed_virtual_objects_in_expr(store.value.as_ref(), state));
                 if let Some(location) = store.name.local_location() {
-                    state.seed_object(TypedVirtualObjectId(source.index()), location, bindings);
+                    state.seed_object(
+                        TypedVirtualObjectId(source.index()),
+                        location,
+                        bindings,
+                        initialize_fields,
+                    );
                     if rewrite {
                         stats.seeded_objects += 1;
-                        append_typed_constructor_field_scalar_stores(
-                            inserted_after,
-                            bindings,
-                            state,
-                            stats,
-                        );
+                        if initialize_fields {
+                            append_typed_constructor_field_scalar_stores(
+                                inserted_after,
+                                bindings,
+                                state,
+                                stats,
+                            );
+                        }
                     }
                 }
                 return;
@@ -2773,14 +2783,21 @@ fn rewrite_typed_field_scalar_setattr(
 fn typed_constructor_field_bindings_for_store<'a>(
     store: &Store<InstrTyped>,
     constructor_field_bindings: &'a HashMap<InstrId, TypedConstructorFieldBindings>,
-) -> Option<(InstrId, &'a TypedConstructorFieldBindings)> {
+) -> Option<(InstrId, &'a TypedConstructorFieldBindings, bool)> {
     let InstrTyped::CallTyped(call) = store.value.as_ref() else {
         return None;
     };
     let instr_id = call.try_semantic_instr_id()?;
-    constructor_field_bindings
-        .get(&instr_id)
-        .map(|bindings| (instr_id, bindings))
+    constructor_field_bindings.get(&instr_id).map(|bindings| {
+        (
+            instr_id,
+            bindings,
+            call.extra.constructor_init_plan().is_none_or(|plan| {
+                plan.source
+                    != TypedConstructorInitPlanSource::InlinedConstructorEntryWithInlinedInitBody
+            }),
+        )
+    })
 }
 
 fn transfer_typed_field_scalar_term(

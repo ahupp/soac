@@ -119,6 +119,9 @@ pub enum TypedCallEmissionPlan {
     Callable {
         function_guards: Vec<TypedDirectFunctionCallGuard>,
     },
+    DirectCallable {
+        function_guard: TypedDirectFunctionCallGuard,
+    },
     Method {
         method_name: String,
         method_guards: Vec<TypedDirectMethodCallGuard>,
@@ -137,6 +140,7 @@ impl TypedCallEmissionPlan {
                 .iter()
                 .map(|guard| guard.function_id)
                 .collect(),
+            Self::DirectCallable { function_guard } => vec![function_guard.function_id],
             Self::Method { method_guards, .. } => method_guards
                 .iter()
                 .map(|guard| guard.function_id)
@@ -151,6 +155,7 @@ impl TypedCallEmissionPlan {
     pub fn is_empty(&self) -> bool {
         match self {
             Self::Callable { function_guards } => function_guards.is_empty(),
+            Self::DirectCallable { .. } => false,
             Self::Method { method_guards, .. } => method_guards.is_empty(),
             Self::RuntimeProtocolMethod { method_guards, .. } => method_guards.is_empty(),
         }
@@ -326,6 +331,16 @@ impl<E: Instr> TypedDirectCallableCall<E> {
             extra: Default::default(),
             func: func.into(),
             args: args.into(),
+            guard,
+        }
+    }
+
+    pub fn from_typed_call(call: TypedCall<E>, guard: TypedDirectCallableCallGuard) -> Self {
+        Self {
+            _meta: call._meta,
+            extra: call.extra,
+            func: call.func,
+            args: call.args,
             guard,
         }
     }
@@ -1336,6 +1351,10 @@ impl TypedInstrExtra {
         self.exact_int_branch.as_ref()
     }
 
+    pub fn exact_int_branch_plan_mut(&mut self) -> Option<&mut TypedExactIntBranchPlan> {
+        self.exact_int_branch.as_mut()
+    }
+
     pub fn set_exact_int_branch_plan(&mut self, plan: TypedExactIntBranchPlan) -> bool {
         if self.exact_int_branch.as_ref() == Some(&plan) {
             return false;
@@ -1350,6 +1369,10 @@ impl TypedInstrExtra {
 
     pub fn exact_int_return_plan(&self) -> Option<&TypedExactIntReturnPlan> {
         self.exact_int_return.as_ref()
+    }
+
+    pub fn exact_int_return_plan_mut(&mut self) -> Option<&mut TypedExactIntReturnPlan> {
+        self.exact_int_return.as_mut()
     }
 
     pub fn set_exact_int_return_plan(&mut self, plan: TypedExactIntReturnPlan) -> bool {
