@@ -67,6 +67,7 @@ const MAX_TYPED_INLINE_CLEANUP_CLONED_BLOCKS_PER_FUNCTION: usize = 256;
 type TypedInlineTargets = HashMap<InstrId, Vec<(RuntimeFunctionId, TypedDirectCallArgPlan)>>;
 type StaticTypedDirectCalls =
     HashMap<RuntimeFunctionId, HashMap<InstrId, Vec<ResolvedV3DirectCallPlan>>>;
+type SuppressedTypedInlineTargets = HashMap<RuntimeFunctionId, HashSet<InstrId>>;
 
 #[derive(Clone)]
 struct StaticRuntimeDirectCallTarget {
@@ -1808,6 +1809,7 @@ fn typed_inline_targets_for_function(
     profile: &SpecializationProfile<'_>,
     static_direct_calls: &StaticTypedDirectCalls,
     remapped_inline_targets: &HashMap<RuntimeFunctionId, TypedInlineTargets>,
+    suppressed_inline_targets: &SuppressedTypedInlineTargets,
 ) -> TypedInlineTargets {
     let mut targets = profile.typed_inline_direct_calls(function_id);
     if let Some(static_calls) = static_direct_calls.get(&function_id) {
@@ -1827,6 +1829,9 @@ fn typed_inline_targets_for_function(
     if let Some(remapped) = remapped_inline_targets.get(&function_id) {
         merge_typed_inline_targets(&mut targets, remapped);
     }
+    if let Some(suppressed) = suppressed_inline_targets.get(&function_id) {
+        targets.retain(|instr_id, _| !suppressed.contains(instr_id));
+    }
     targets
 }
 
@@ -1836,6 +1841,7 @@ fn remap_inlined_direct_call_targets(
     profile: &SpecializationProfile<'_>,
     static_direct_calls: &StaticTypedDirectCalls,
     remapped_inline_targets: &mut HashMap<RuntimeFunctionId, TypedInlineTargets>,
+    suppressed_inline_targets: &SuppressedTypedInlineTargets,
 ) -> usize {
     let mut targets_by_callee = HashMap::<RuntimeFunctionId, TypedInlineTargets>::new();
     let mut count = 0;
@@ -1846,6 +1852,7 @@ fn remap_inlined_direct_call_targets(
                 profile,
                 static_direct_calls,
                 remapped_inline_targets,
+                suppressed_inline_targets,
             )
         });
         let Some(plans) = targets.get(&mapping.callee_instr_id) else {
@@ -1872,12 +1879,14 @@ fn remap_cloned_direct_call_targets(
     profile: &SpecializationProfile<'_>,
     static_direct_calls: &StaticTypedDirectCalls,
     remapped_inline_targets: &mut HashMap<RuntimeFunctionId, TypedInlineTargets>,
+    suppressed_inline_targets: &SuppressedTypedInlineTargets,
 ) -> usize {
     let source_targets = typed_inline_targets_for_function(
         caller_function_id,
         profile,
         static_direct_calls,
         remapped_inline_targets,
+        suppressed_inline_targets,
     );
     let mut count = 0;
     for mapping in mappings {
@@ -2146,6 +2155,7 @@ fn remap_cloned_profile_rewrites(
     profile: &SpecializationProfile<'_>,
     static_direct_calls: &StaticTypedDirectCalls,
     remapped_inline_targets: &mut HashMap<RuntimeFunctionId, TypedInlineTargets>,
+    suppressed_inline_targets: &SuppressedTypedInlineTargets,
     remapped_indexed_fields: &mut HashMap<
         RuntimeFunctionId,
         HashMap<InstrId, Vec<OptV3ResolvedIndexedFieldAccess>>,
@@ -2176,6 +2186,7 @@ fn remap_cloned_profile_rewrites(
             profile,
             static_direct_calls,
             remapped_inline_targets,
+            suppressed_inline_targets,
         );
         count += remap_cloned_indexed_field_accesses(
             caller_function_id,
@@ -2205,6 +2216,31 @@ fn remap_cloned_profile_rewrites(
         }
         total += count;
     }
+}
+
+fn retire_cloned_inline_targets(
+    caller_function_id: RuntimeFunctionId,
+    mappings: &[TypedInlineInstrIdMapping],
+    remapped_inline_targets: &mut HashMap<RuntimeFunctionId, TypedInlineTargets>,
+    suppressed_inline_targets: &mut SuppressedTypedInlineTargets,
+) -> usize {
+    let mut count = 0;
+    for mapping in mappings {
+        if mapping.callee != caller_function_id {
+            continue;
+        }
+        if suppressed_inline_targets
+            .entry(caller_function_id)
+            .or_default()
+            .insert(mapping.callee_instr_id)
+        {
+            count += 1;
+        }
+        if let Some(targets) = remapped_inline_targets.get_mut(&caller_function_id) {
+            targets.remove(&mapping.callee_instr_id);
+        }
+    }
+    count
 }
 
 fn remap_cloned_hot_state_cleanup_labels(
@@ -2507,6 +2543,7 @@ fn apply_typed_v3_module_rewrites(
         HashMap::<RuntimeFunctionId, HashMap<InstrId, TypedExactIntBranchPlan>>::new();
     let mut remapped_exact_int_returns =
         HashMap::<RuntimeFunctionId, HashMap<InstrId, TypedExactIntReturnPlan>>::new();
+    let mut suppressed_inline_targets = SuppressedTypedInlineTargets::new();
     let mut constructor_init_plans =
         HashMap::<RuntimeFunctionId, HashMap<InstrId, TypedConstructorInitPlan>>::new();
     let mut constructor_field_bindings =
@@ -2522,6 +2559,7 @@ fn apply_typed_v3_module_rewrites(
                 profile,
                 static_direct_calls,
                 &remapped_inline_targets,
+                &suppressed_inline_targets,
             );
             if inline_targets.is_empty() {
                 break;
@@ -2614,6 +2652,7 @@ fn apply_typed_v3_module_rewrites(
                     profile,
                     static_direct_calls,
                     &mut remapped_inline_targets,
+                    &suppressed_inline_targets,
                 );
                 remap_inlined_indexed_field_accesses(
                     caller_function_id,
@@ -2644,6 +2683,7 @@ fn apply_typed_v3_module_rewrites(
                     profile,
                     static_direct_calls,
                     &mut remapped_inline_targets,
+                    &suppressed_inline_targets,
                 );
                 remap_inlined_indexed_field_accesses(
                     caller_function_id,
@@ -2720,6 +2760,7 @@ fn apply_typed_v3_module_rewrites(
                     profile,
                     static_direct_calls,
                     &mut remapped_inline_targets,
+                    &suppressed_inline_targets,
                     &mut remapped_indexed_fields,
                     &mut remapped_indexed_field_counter_sources,
                     &mut remapped_exact_list_items,
@@ -2733,6 +2774,12 @@ fn apply_typed_v3_module_rewrites(
                         &cloned_instr_id_mappings,
                     );
                 }
+                retire_cloned_inline_targets(
+                    caller_function_id,
+                    &cloned_instr_id_mappings,
+                    &mut remapped_inline_targets,
+                    &mut suppressed_inline_targets,
+                );
             }
             assign_missing_typed_function_instr_ids(function);
             refresh_typed_function_value_facts(function);
@@ -2926,5 +2973,55 @@ mod tests {
         assert_eq!(plans.len(), 1);
         assert_eq!(plans[0].target, entry_function_id);
         assert_eq!(plans[0].body.kind, CallBodyKind::Inline);
+    }
+
+    #[test]
+    fn cloned_hot_continuations_retire_original_inline_targets() {
+        let function_id = RuntimeFunctionId::new(RuntimeModuleId::new(3), LocalFunctionId::new(4));
+        let target_id = RuntimeFunctionId::new(RuntimeModuleId::new(5), LocalFunctionId::new(6));
+        let arg_plan = TypedDirectCallArgPlan {
+            sources: vec![soac_ir_typed::TypedDirectCallArgSource::Provided(0)],
+        };
+        let mut remapped_inline_targets = HashMap::from([(
+            function_id,
+            HashMap::from([
+                (InstrId::new(7), vec![(target_id, arg_plan.clone())]),
+                (InstrId::new(9), vec![(target_id, arg_plan)]),
+            ]),
+        )]);
+        let mut suppressed_inline_targets = SuppressedTypedInlineTargets::new();
+        let mappings = [TypedInlineInstrIdMapping {
+            callee: function_id,
+            inline_instance: 0,
+            callee_instr_id: InstrId::new(7),
+            caller_instr_id: InstrId::new(9),
+        }];
+
+        assert_eq!(
+            retire_cloned_inline_targets(
+                function_id,
+                &mappings,
+                &mut remapped_inline_targets,
+                &mut suppressed_inline_targets,
+            ),
+            1,
+        );
+        assert!(
+            suppressed_inline_targets
+                .get(&function_id)
+                .is_some_and(|targets| targets.contains(&InstrId::new(7))),
+            "the original cloned-away inline site should become cold-only"
+        );
+        let targets = remapped_inline_targets
+            .get(&function_id)
+            .expect("function inline targets should remain available");
+        assert!(
+            !targets.contains_key(&InstrId::new(7)),
+            "the old cold copy should not keep its remapped inline target"
+        );
+        assert!(
+            targets.contains_key(&InstrId::new(9)),
+            "the new hot clone should retain the moved inline target"
+        );
     }
 }
