@@ -11,7 +11,7 @@ use soac_core::block_py::{
     BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, CallableScopeKind, ChildVisitable,
     HasSemanticInstrId, InstrId, RuntimeFunctionId, RuntimeName, VisitMut,
 };
-use soac_ir_blockpy::BlockPyModuleShape;
+use soac_ir_blockpy::{BlockPyModuleShape, constructor_init_function_id_for_entry_function};
 use soac_ir_typed::emit_v3::MechanicalRegionEmission;
 use soac_ir_typed::plan_v3::{
     CallBodyKind, DirectCallCallee, ExactListItemAccessKind,
@@ -21,11 +21,11 @@ use soac_ir_typed::plan_v3::{
 };
 use soac_ir_typed::{
     FactStore, InstrTyped, TypedAttrAccessPlan, TypedBlockPyModuleShape, TypedCallEmissionPlan,
-    TypedCallEmissionPlans, TypedConstructorInitPlan, TypedDirectCallArgPlan,
-    TypedDirectMethodCallGuard, TypedExactIntBranchPlan, TypedExactIntPlanSource,
-    TypedExactIntReturnPlan, TypedExactListItemAccessPlan, TypedExactListItemCounterSource,
-    TypedExactListItemPlanSource, TypedIndexedFieldCounterSource, TypedIndexedFieldPlanSource,
-    TypedIndexedGlobalAccessPlan, TypedIndexedGlobalPlanSource,
+    TypedCallEmissionPlans, TypedConstructorInitPlan, TypedConstructorInitPlanSource,
+    TypedDirectCallArgPlan, TypedDirectMethodCallGuard, TypedExactIntBranchPlan,
+    TypedExactIntPlanSource, TypedExactIntReturnPlan, TypedExactListItemAccessPlan,
+    TypedExactListItemCounterSource, TypedExactListItemPlanSource, TypedIndexedFieldCounterSource,
+    TypedIndexedFieldPlanSource, TypedIndexedGlobalAccessPlan, TypedIndexedGlobalPlanSource,
     assign_missing_typed_function_instr_ids,
 };
 use soac_opt::access_emission_v3::{
@@ -36,7 +36,8 @@ use soac_opt::artifacts_v3::ExactIntBranchV3Artifacts;
 use soac_opt::call_emission_v3::{ResolvedV3DirectCallPlan, typed_call_emission_plans_from_v3};
 use soac_opt::passes::{
     TypedConstructorFieldBindings, TypedExternalInlineCallee, TypedInlineInstrIdMapping,
-    TypedInlineLocalMapping, inline_typed_function_direct_call_stores_with_external_callees,
+    TypedInlineLocalMapping, inline_typed_constructor_init_bodies_with_external_callees,
+    inline_typed_function_direct_call_stores_with_external_callees,
     lower_typed_function_call_emission_plans, plan_module_inlining,
     refresh_typed_function_value_facts, rewrite_typed_stop_iteration_raises_to_handler_jumps,
     scalarize_typed_hot_constructor_field_loads_with_bindings,
@@ -1963,8 +1964,21 @@ fn external_typed_inline_callees(
             },
         )?;
         let module_constants = prepared.module.module_constants.clone();
+        let constructor_init_targets = prepared
+            .module
+            .callable_defs
+            .iter()
+            .filter_map(|function| {
+                targets
+                    .contains(&function.function_id)
+                    .then(|| constructor_init_function_id_for_entry_function(function))
+                    .flatten()
+            })
+            .collect::<HashSet<_>>();
         for function in prepared.module.callable_defs {
-            if targets.remove(&function.function_id) {
+            if targets.remove(&function.function_id)
+                || constructor_init_targets.contains(&function.function_id)
+            {
                 external_callees.insert(
                     function.function_id,
                     TypedExternalInlineCallee {
@@ -2059,6 +2073,38 @@ fn apply_typed_v3_module_rewrites(
                         .extend(bindings);
                 }
             }
+            let function_constructor_init_plans = constructor_init_plans
+                .get(&caller_function_id)
+                .cloned()
+                .unwrap_or_default();
+            if !function_constructor_init_plans.is_empty() {
+                annotate_typed_constructor_init_plans(
+                    function,
+                    Some(&function_constructor_init_plans),
+                )?;
+            }
+            let init_body_stats = inline_typed_constructor_init_bodies_with_external_callees(
+                function,
+                &callee_module,
+                &mut module.module_constants,
+                external_callees,
+            );
+            if !init_body_stats.inlined_constructor_init_calls.is_empty() {
+                if let Some(plans) = constructor_init_plans.get_mut(&caller_function_id) {
+                    for instr_id in &init_body_stats.inlined_constructor_init_calls {
+                        if let Some(plan) = plans.get_mut(instr_id) {
+                            plan.source =
+                                TypedConstructorInitPlanSource::InlinedConstructorEntryWithInlinedInitBody;
+                        }
+                    }
+                }
+            }
+            if !init_body_stats.constructor_field_bindings.is_empty() {
+                constructor_field_bindings
+                    .entry(caller_function_id)
+                    .or_default()
+                    .extend(init_body_stats.constructor_field_bindings);
+            }
             if !stats.instr_id_mappings.is_empty() {
                 remap_inlined_direct_call_targets(
                     caller_function_id,
@@ -2083,6 +2129,35 @@ fn apply_typed_v3_module_rewrites(
                     caller_function_id,
                     &stats.instr_id_mappings,
                     &stats.local_mappings,
+                    profile,
+                    &mut remapped_exact_int_branches,
+                    &mut remapped_exact_int_returns,
+                )?;
+            }
+            if !init_body_stats.inline_stats.instr_id_mappings.is_empty() {
+                remap_inlined_direct_call_targets(
+                    caller_function_id,
+                    &init_body_stats.inline_stats.instr_id_mappings,
+                    profile,
+                    &mut remapped_inline_targets,
+                );
+                remap_inlined_indexed_field_accesses(
+                    caller_function_id,
+                    &init_body_stats.inline_stats.instr_id_mappings,
+                    profile,
+                    &mut remapped_indexed_fields,
+                    &mut remapped_indexed_field_counter_sources,
+                )?;
+                remap_inlined_exact_list_item_accesses(
+                    caller_function_id,
+                    &init_body_stats.inline_stats.instr_id_mappings,
+                    profile,
+                    &mut remapped_exact_list_items,
+                )?;
+                remap_inlined_exact_int_selections(
+                    caller_function_id,
+                    &init_body_stats.inline_stats.instr_id_mappings,
+                    &init_body_stats.inline_stats.local_mappings,
                     profile,
                     &mut remapped_exact_int_branches,
                     &mut remapped_exact_int_returns,

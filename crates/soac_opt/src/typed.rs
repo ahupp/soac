@@ -699,6 +699,13 @@ pub struct TypedInlineRewriteStats {
     pub hot_state_cleanup_labels: Vec<BlockLabel>,
 }
 
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct TypedConstructorInitBodyInlineStats {
+    pub inline_stats: TypedInlineRewriteStats,
+    pub inlined_constructor_init_calls: Vec<InstrId>,
+    pub constructor_field_bindings: HashMap<InstrId, TypedConstructorFieldBindings>,
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct TypedHotContinuationClone {
     pub hot_block: BlockLabel,
@@ -1351,6 +1358,415 @@ fn build_typed_direct_call_inline_rewrite(
     stats.instr_id_mappings.extend(instr_id_mappings);
     stats.local_mappings.extend(local_mappings);
     TypedInlineBlockRewrite::Rewritten(blocks)
+}
+
+pub fn inline_typed_constructor_init_bodies_with_external_callees(
+    function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+    module: &BlockPyModule<TypedBlockPyModuleShape>,
+    caller_module_constants: &mut Vec<ConstantExpr>,
+    external_callees: &HashMap<RuntimeFunctionId, TypedExternalInlineCallee>,
+) -> TypedConstructorInitBodyInlineStats {
+    let mut stats = TypedConstructorInitBodyInlineStats::default();
+    let mut instr_id_allocator = TypedInlineInstrIdAllocator::from_function(function);
+    let mut next_inline_instance = 0;
+    let original_blocks = std::mem::take(&mut function.blocks);
+    let mut rewritten_blocks = Vec::with_capacity(original_blocks.len());
+    for block in original_blocks {
+        match build_typed_constructor_init_body_inline_rewrite(
+            function,
+            module,
+            caller_module_constants,
+            external_callees,
+            block,
+            &mut instr_id_allocator,
+            &mut next_inline_instance,
+            &mut stats,
+        ) {
+            TypedInlineBlockRewrite::Rewritten(blocks) => rewritten_blocks.extend(blocks),
+            TypedInlineBlockRewrite::Unchanged(block) => rewritten_blocks.push(block),
+        }
+    }
+    function.blocks = rewritten_blocks;
+    stats
+}
+
+#[derive(Clone)]
+struct TypedConstructorInitBodyCandidate {
+    instr_index: usize,
+    root: ResolvedName,
+    call: TypedCall<InstrTyped>,
+    plan: TypedConstructorInitPlan,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_typed_constructor_init_body_inline_rewrite(
+    caller: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+    module: &BlockPyModule<TypedBlockPyModuleShape>,
+    caller_module_constants: &mut Vec<ConstantExpr>,
+    external_callees: &HashMap<RuntimeFunctionId, TypedExternalInlineCallee>,
+    block: TypedBlock,
+    instr_id_allocator: &mut TypedInlineInstrIdAllocator,
+    next_inline_instance: &mut u32,
+    stats: &mut TypedConstructorInitBodyInlineStats,
+) -> TypedInlineBlockRewrite {
+    let original_block = block.clone();
+    let original_storage_layout = caller.storage_layout.clone();
+    let original_caller_module_constants = caller_module_constants.clone();
+    let Some(candidate) = find_typed_constructor_init_body_candidate(
+        &block,
+        caller.function_id,
+        caller_module_constants,
+    ) else {
+        return TypedInlineBlockRewrite::Unchanged(block);
+    };
+    let Some(callee) = typed_inline_callee(
+        module,
+        TypedInlineExternalCallees::Contextual(external_callees),
+        candidate.plan.init_function_id,
+    ) else {
+        stats.inline_stats.skipped_candidates += 1;
+        return TypedInlineBlockRewrite::Unchanged(block);
+    };
+    let callee_module_constants = callee
+        .module_constants
+        .unwrap_or(module.module_constants.as_slice());
+    if !typed_function_returns_only_none(callee.function, callee_module_constants) {
+        stats.inline_stats.skipped_candidates += 1;
+        return TypedInlineBlockRewrite::Unchanged(block);
+    }
+    let Some(positional_args) = typed_positional_arg_exprs(candidate.call.args.clone()) else {
+        stats.inline_stats.skipped_candidates += 1;
+        return TypedInlineBlockRewrite::Unchanged(block);
+    };
+    let Ok((bindings, prologue)) = bind_typed_constructor_init_body_inline_values(
+        caller,
+        callee.function,
+        &candidate.root,
+        &positional_args[1..],
+    ) else {
+        stats.inline_stats.skipped_candidates += 1;
+        return TypedInlineBlockRewrite::Unchanged(block);
+    };
+    let Ok(return_temp) = try_allocate_typed_stack_temp(caller, "typed_inline_init_result") else {
+        stats.inline_stats.skipped_candidates += 1;
+        return TypedInlineBlockRewrite::Unchanged(block);
+    };
+    let continuation_label = caller.name_gen.next_block_name();
+    let inline_entry_label = caller.name_gen.next_block_name();
+    let original_exc_edge = block.exc_edge.clone();
+    let mut before = block.body;
+    let after = before.split_off(candidate.instr_index + 1);
+    mark_typed_constructor_call_init_body_inlined(
+        &mut before[candidate.instr_index],
+        candidate.plan.init_function_id,
+    );
+
+    let inline_instance = *next_inline_instance;
+    *next_inline_instance = next_inline_instance
+        .checked_add(1)
+        .expect("typed inline instance count should fit in u32");
+    let Ok(mut fragment) = build_typed_direct_call_inline_fragment_to_target(
+        caller,
+        callee.function,
+        continuation_label,
+        &bindings,
+        return_temp.resolved_name(),
+        inline_instance,
+        instr_id_allocator,
+        Some(caller_module_constants),
+        Some(callee_module_constants),
+    ) else {
+        stats.inline_stats.skipped_candidates += 1;
+        caller.storage_layout = original_storage_layout;
+        *caller_module_constants = original_caller_module_constants;
+        return TypedInlineBlockRewrite::Unchanged(original_block);
+    };
+    for block in &mut fragment.blocks {
+        block.exc_edge = original_exc_edge.clone();
+    }
+    if let Some(entry) = fragment.blocks.first_mut() {
+        entry.label = inline_entry_label;
+        if !prologue.is_empty() {
+            entry.body.splice(0..0, prologue);
+        }
+    }
+    let constructor_call_id = candidate
+        .call
+        .try_semantic_instr_id()
+        .expect("constructor init body candidate should have an InstrId");
+    if let Some(bindings) = typed_constructor_init_body_field_bindings(
+        constructor_call_id,
+        &candidate.root,
+        fragment.blocks.as_slice(),
+        caller_module_constants,
+    ) {
+        stats
+            .constructor_field_bindings
+            .insert(constructor_call_id, bindings);
+    }
+
+    let mut blocks = Vec::with_capacity(fragment.blocks.len() + 2);
+    blocks.push(Block::new_with_extra(
+        block.label,
+        before,
+        BlockTerm::Jump(BlockEdge::new(inline_entry_label)),
+        block.params,
+        original_exc_edge.clone(),
+        block.extra,
+    ));
+    stats
+        .inline_stats
+        .instr_id_mappings
+        .extend(fragment.instr_id_mappings);
+    stats
+        .inline_stats
+        .local_mappings
+        .extend(fragment.local_mappings);
+    blocks.extend(fragment.blocks);
+    let mut continuation_body = Vec::with_capacity(after.len() + 1);
+    append_typed_cleanup_del_to_body(&mut continuation_body, &return_temp.resolved_name());
+    continuation_body.extend(after);
+    blocks.push(Block::new_with_extra(
+        continuation_label,
+        continuation_body,
+        block.term,
+        Vec::new(),
+        original_exc_edge,
+        TypedBlockExtra::default(),
+    ));
+    stats.inline_stats.rewritten_stores += 1;
+    stats
+        .inlined_constructor_init_calls
+        .push(constructor_call_id);
+    TypedInlineBlockRewrite::Rewritten(blocks)
+}
+
+fn find_typed_constructor_init_body_candidate(
+    block: &TypedBlock,
+    caller_function_id: RuntimeFunctionId,
+    module_constants: &[ConstantExpr],
+) -> Option<TypedConstructorInitBodyCandidate> {
+    block
+        .body
+        .iter()
+        .enumerate()
+        .find_map(|(instr_index, instr)| {
+            let InstrTyped::Store(store) = instr else {
+                return None;
+            };
+            if store.name.local_location().is_none() {
+                return None;
+            }
+            let InstrTyped::CallTyped(call) = store.value.as_ref() else {
+                return None;
+            };
+            let plan = call.extra.constructor_init_plan()?;
+            call.try_semantic_instr_id()?;
+            if plan.source != TypedConstructorInitPlanSource::InlinedConstructorEntry
+                || plan.init_function_id == caller_function_id
+                || !typed_expr_is_runtime_name_load(
+                    call.func.as_ref(),
+                    RuntimeName::ConstructorCall,
+                    module_constants,
+                )
+                || !call.keywords.is_empty()
+            {
+                return None;
+            }
+            let positional_args = typed_positional_arg_exprs(call.args.clone())?;
+            if positional_args.is_empty()
+                || !positional_args
+                    .iter()
+                    .all(|arg| typed_instr_local_load_location(arg).is_some())
+            {
+                return None;
+            }
+            Some(TypedConstructorInitBodyCandidate {
+                instr_index,
+                root: store.name.clone(),
+                call: call.clone(),
+                plan,
+            })
+        })
+}
+
+fn typed_function_returns_only_none(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    module_constants: &[ConstantExpr],
+) -> bool {
+    function.blocks.iter().all(|block| match &block.term {
+        BlockTerm::Return(value) => typed_expr_is_known_none_value(value, module_constants),
+        BlockTerm::Jump(_)
+        | BlockTerm::IfTerm(_)
+        | BlockTerm::BranchTable(_)
+        | BlockTerm::Raise(_) => true,
+    })
+}
+
+fn typed_expr_is_known_none_value(expr: &InstrTyped, module_constants: &[ConstantExpr]) -> bool {
+    if typed_expr_is_runtime_name_load(expr, RuntimeName::None, module_constants) {
+        return true;
+    }
+    if expr
+        .result_facts()
+        .and_then(|facts| facts.as_pyobj())
+        .is_some_and(PyObjFacts::is_none)
+    {
+        return true;
+    }
+    let InstrTyped::Load(load) = expr else {
+        return false;
+    };
+    let Some(index) = load.name.location.as_constant() else {
+        return false;
+    };
+    module_constants
+        .get(index as usize)
+        .is_some_and(|constant| matches!(constant, ConstantExpr::RuntimeName(RuntimeName::None)))
+}
+
+fn bind_typed_constructor_init_body_inline_values(
+    caller: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+    init_function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    root: &ResolvedName,
+    user_args: &[InstrTyped],
+) -> Result<(TypedInlineValueBindings, Vec<InstrTyped>), TypedInlineUnsupportedReason> {
+    let first_param = init_function
+        .params
+        .iter()
+        .next()
+        .ok_or(TypedInlineUnsupportedReason::ArityMismatch)?;
+    if !matches!(first_param.kind, ParamKind::PosOnly | ParamKind::Any) {
+        return Err(TypedInlineUnsupportedReason::UnsupportedParameterKind);
+    }
+    let mut bindings = TypedInlineValueBindings::new();
+    let mut prologue = Vec::new();
+    bindings.insert(
+        typed_parameter_local_location(init_function, &first_param.name)?,
+        typed_load_temp(root),
+    );
+
+    let mut next_user_arg = 0usize;
+    let mut packed_rest = false;
+    for param in init_function.params.iter().skip(1) {
+        let value = match param.kind {
+            ParamKind::PosOnly | ParamKind::Any => {
+                if packed_rest {
+                    return Err(TypedInlineUnsupportedReason::UnsupportedParameterKind);
+                }
+                let value = user_args
+                    .get(next_user_arg)
+                    .cloned()
+                    .ok_or(TypedInlineUnsupportedReason::ArityMismatch)?;
+                next_user_arg += 1;
+                value
+            }
+            ParamKind::VarArg => {
+                if packed_rest {
+                    return Err(TypedInlineUnsupportedReason::UnsupportedParameterKind);
+                }
+                packed_rest = true;
+                let rest = user_args
+                    .get(next_user_arg..)
+                    .ok_or(TypedInlineUnsupportedReason::ArityMismatch)?
+                    .to_vec();
+                next_user_arg = user_args.len();
+                let temp = try_allocate_typed_stack_temp(caller, "typed_inline_varargs")
+                    .map_err(|_| TypedInlineUnsupportedReason::MissingCallerStorageLayout)?;
+                prologue.push(
+                    Store::new(temp.resolved_name(), InstrTyped::Tuple(Tuple::new(rest)))
+                        .with_meta(Meta::synthetic())
+                        .into(),
+                );
+                typed_load_temp(&temp.resolved_name())
+            }
+            ParamKind::KwOnly | ParamKind::KwArg => {
+                return Err(TypedInlineUnsupportedReason::UnsupportedParameterKind);
+            }
+        };
+        bindings.insert(
+            typed_parameter_local_location(init_function, &param.name)?,
+            value,
+        );
+    }
+    if next_user_arg != user_args.len() {
+        return Err(TypedInlineUnsupportedReason::ArityMismatch);
+    }
+    Ok((bindings, prologue))
+}
+
+fn mark_typed_constructor_call_init_body_inlined(
+    instr: &mut InstrTyped,
+    init_function_id: RuntimeFunctionId,
+) {
+    let InstrTyped::Store(store) = instr else {
+        return;
+    };
+    let InstrTyped::CallTyped(call) = store.value.as_mut() else {
+        return;
+    };
+    call.extra
+        .set_constructor_init_plan(TypedConstructorInitPlan {
+            source: TypedConstructorInitPlanSource::InlinedConstructorEntryWithInlinedInitBody,
+            init_function_id,
+        });
+}
+
+fn typed_constructor_init_body_field_bindings(
+    constructor_call_id: InstrId,
+    root: &ResolvedName,
+    blocks: &[TypedBlock],
+    module_constants: &[ConstantExpr],
+) -> Option<TypedConstructorFieldBindings> {
+    let mut fields = HashMap::<String, ResolvedName>::new();
+    for block in blocks {
+        for instr in &block.body {
+            let InstrTyped::SetAttrTyped(op) = instr else {
+                continue;
+            };
+            if !typed_expr_loads_resolved_name(op.value.as_ref(), root) {
+                continue;
+            }
+            let Some(field_name) = typed_constant_string(op.attr.as_ref(), module_constants) else {
+                continue;
+            };
+            let Some(value) = typed_expr_local_load_name(op.replacement.as_ref()) else {
+                continue;
+            };
+            if fields
+                .insert(field_name.to_string(), value.clone())
+                .is_some()
+            {
+                return None;
+            }
+        }
+    }
+    if fields.is_empty() {
+        return None;
+    }
+    let mut fields = fields
+        .into_iter()
+        .map(|(field_name, value)| TypedConstructorFieldBinding {
+            field_name,
+            value,
+            scalar: None,
+        })
+        .collect::<Vec<_>>();
+    fields.sort_by(|left, right| left.field_name.cmp(&right.field_name));
+    let _ = constructor_call_id;
+    Some(TypedConstructorFieldBindings { fields })
+}
+
+fn typed_expr_loads_resolved_name(expr: &InstrTyped, name: &ResolvedName) -> bool {
+    matches!(expr, InstrTyped::Load(load) if load.name == *name)
+}
+
+fn typed_expr_local_load_name(expr: &InstrTyped) -> Option<&ResolvedName> {
+    let InstrTyped::Load(load) = expr else {
+        return None;
+    };
+    load.name.local_location()?;
+    Some(&load.name)
 }
 
 const MAX_TYPED_HOT_CONTINUATION_CLONE_BLOCKS: usize = 256;
@@ -5977,6 +6393,54 @@ mod typed_codegen_tests {
         finder.instr_ids
     }
 
+    fn annotate_constructor_init_plans_for_test(
+        function: &mut BlockPyFunction<TypedBlockPyModuleShape>,
+        plans: &HashMap<InstrId, TypedConstructorInitPlan>,
+    ) {
+        struct Annotator<'a> {
+            plans: &'a HashMap<InstrId, TypedConstructorInitPlan>,
+        }
+
+        impl VisitMut<InstrTyped> for Annotator<'_> {
+            fn visit_instr_mut(&mut self, expr: &mut InstrTyped) {
+                if let InstrTyped::CallTyped(call) = expr
+                    && let Some(instr_id) = call.try_semantic_instr_id()
+                    && let Some(plan) = self.plans.get(&instr_id)
+                {
+                    call.extra.set_constructor_init_plan(*plan);
+                }
+                expr.visit_children_mut(self);
+            }
+        }
+
+        Annotator { plans }.visit_fn_mut(function);
+    }
+
+    fn constructor_call_plan_sources(
+        function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    ) -> Vec<TypedConstructorInitPlanSource> {
+        struct Finder {
+            sources: Vec<TypedConstructorInitPlanSource>,
+        }
+
+        impl Visit<InstrTyped> for Finder {
+            fn visit_instr(&mut self, expr: &InstrTyped) {
+                if let InstrTyped::CallTyped(call) = expr
+                    && let Some(plan) = call.extra.constructor_init_plan()
+                {
+                    self.sources.push(plan.source);
+                }
+                expr.visit_children(self);
+            }
+        }
+
+        let mut finder = Finder {
+            sources: Vec::new(),
+        };
+        finder.visit_fn(function);
+        finder.sources
+    }
+
     fn stop_iteration_raise_terms(
         function: &BlockPyFunction<TypedBlockPyModuleShape>,
         module_constants: &[ConstantExpr],
@@ -7549,6 +8013,118 @@ def caller(value):\n    obj = Record(value)\n    return obj\n",
         assert!(
             collector.shape.positional_counts.contains(&2),
             "constructor_call should receive the class plus the original user argument"
+        );
+    }
+
+    #[test]
+    fn typed_constructor_init_body_inline_exposes_non_straightline_field_stores() {
+        let lowered = soac_lowering::lower_python_to_blockpy_for_testing(
+            "class RangeLike:\n    def __init__(self, *args):\n        argc = len(args)\n        if argc == 1:\n            start = 0\n            stop = args[0]\n            step = 1\n        elif argc == 2:\n            start = args[0]\n            stop = args[1]\n            step = 1\n        else:\n            raise ValueError('bad argc')\n        self.start = start\n        self.stop = stop\n        self.step = step\n\n\
+def caller(stop):\n    obj = RangeLike(0, stop)\n    return obj.stop\n",
+        )
+        .expect("source should lower");
+        let init_id =
+            blockpy_function_id_by_qualname(&lowered.blockpy_module, "RangeLike.__init__");
+        let constructor_entry_id =
+            constructor_entry_function_id_for_init(&lowered.blockpy_module, init_id)
+                .expect("class lowering should add a constructor entry");
+        let mut typed = lower_blockpy_module_to_typed(lowered.blockpy_module);
+        let caller_index = typed
+            .callable_defs
+            .iter()
+            .position(|function| function.names.qualname == "caller")
+            .expect("typed caller should exist");
+        let call_id;
+        {
+            let caller = &mut typed.callable_defs[caller_index];
+            call_id = replace_first_typed_call_access_where(
+                caller,
+                TypedCallAccessPlan::GuardedCallable {
+                    function_guards: vec![TypedDirectFunctionCallGuard {
+                        function_id: constructor_entry_id,
+                        arg_plan: TypedDirectCallArgPlan {
+                            sources: vec![
+                                TypedDirectCallArgSource::Provided(0),
+                                TypedDirectCallArgSource::PackedRest { start: 1 },
+                            ],
+                        },
+                    }],
+                },
+                |call| typed_expr_loads_name(call.func.as_ref(), "RangeLike"),
+            );
+            lower_typed_function_call_access_plan_instrs(caller);
+        }
+
+        let callee_module = typed.clone();
+        let constructor_inline_stats = inline_typed_function_direct_call_stores(
+            &mut typed.callable_defs[caller_index],
+            &callee_module,
+            &HashMap::new(),
+            &HashMap::from([(
+                call_id,
+                vec![(
+                    constructor_entry_id,
+                    TypedDirectCallArgPlan {
+                        sources: vec![
+                            TypedDirectCallArgSource::Provided(0),
+                            TypedDirectCallArgSource::PackedRest { start: 1 },
+                        ],
+                    },
+                )],
+            )]),
+        );
+        assert_eq!(constructor_inline_stats.rewritten_stores, 1);
+        let constructor_init_plans =
+            typed_constructor_init_plans_from_inline_stats_with_external_callees(
+                &callee_module,
+                &typed.module_constants,
+                &HashMap::new(),
+                &constructor_inline_stats,
+            );
+        assert_eq!(constructor_init_plans.len(), 1);
+        annotate_constructor_init_plans_for_test(
+            &mut typed.callable_defs[caller_index],
+            &constructor_init_plans,
+        );
+
+        let init_body_stats = inline_typed_constructor_init_bodies_with_external_callees(
+            &mut typed.callable_defs[caller_index],
+            &callee_module,
+            &mut typed.module_constants,
+            &HashMap::new(),
+        );
+        assert_eq!(init_body_stats.inline_stats.rewritten_stores, 1);
+        assert_eq!(init_body_stats.inlined_constructor_init_calls.len(), 1);
+        assert!(
+            init_body_stats
+                .inline_stats
+                .local_mappings
+                .iter()
+                .any(|mapping| mapping.callee == init_id
+                    && mapping.callee_name == "args"
+                    && mapping.caller_name.contains("typed_inline_varargs")),
+            "packed *args should be materialized once into a temp for the inlined init body"
+        );
+        let fields = init_body_stats
+            .constructor_field_bindings
+            .values()
+            .flat_map(|bindings| {
+                bindings
+                    .fields
+                    .iter()
+                    .map(|field| field.field_name.as_str())
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            fields,
+            HashSet::from(["start", "stop", "step"]),
+            "non-straightline init body should expose constructor field bindings"
+        );
+        assert!(
+            constructor_call_plan_sources(&typed.callable_defs[caller_index]).contains(
+                &TypedConstructorInitPlanSource::InlinedConstructorEntryWithInlinedInitBody
+            ),
+            "constructor_call should switch to allocation-only codegen once the init body is explicit"
         );
     }
 

@@ -576,11 +576,23 @@ in the synthetic target; registration checks the realized `PyTypeObject` once
 and does not attach constructor metadata for custom `__new__`, metaclasses,
 abstract classes, or non-generic allocation.
 
-Constructor initializer inlining and constructor scalar replacement should be
-represented directly in `InstrTyped` metadata or typed operation shape when
-they return. The JIT should not compute an inline plan to decide whether to skip
-`__init__`; it should only lower the operation shape already selected by the v3
-plan and embedded in the typed module.
+Constructor initializer inlining is represented in `InstrTyped` metadata, not
+rediscovered by codegen. After a constructor-entry direct call is inlined, the
+typed pipeline can inline the selected `__init__` body into the hot constructor
+path when the initializer can bind without closure storage, block parameters,
+exception edges, or jump arguments and all returns are known `None`. The
+remaining `constructor_call` is marked as
+`InlinedConstructorEntryWithInlinedInitBody`, so JIT codegen emits
+allocation-only `PyType_GenericAlloc`; the explicit inlined `SetAttr` and raise
+paths preserve initializer side effects. Packed `*args` parameters are
+materialized once into a typed temp before the inlined body rather than
+substituted repeatedly at every `args` use.
+
+Cross-module initializer body inlining currently requires every non-local load
+in the callee to be representable in the caller module. Runtime names and
+constants can be remapped, but ordinary globals from another module still need
+an explicit external-module global representation; the inliner rejects those
+instead of treating them as caller globals.
 
 After typed direct-call inlining, constructor field scalarization can also plan a
 private hot-path virtual constructor. The rewrite is only selected for a cloned

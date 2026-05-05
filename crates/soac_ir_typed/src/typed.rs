@@ -1215,6 +1215,7 @@ impl TypedPlannedResult {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TypedConstructorInitPlanSource {
     InlinedConstructorEntry,
+    InlinedConstructorEntryWithInlinedInitBody,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -37,12 +37,12 @@ use soac_ir_typed::plan_v3::{
 use soac_ir_typed::{
     FactStore, InstrTyped, PyExactType, PyObjFacts, RuntimeHelperId, TypedAttrAccessPlan,
     TypedBlock, TypedBlockLayoutHint, TypedBlockPyModuleShape, TypedCall, TypedCallAccessPlan,
-    TypedDirectCallGuardTest, TypedDirectCallGuardTestKind, TypedDirectCallableCall,
-    TypedDirectCallableCallGuard, TypedDirectMethodCall, TypedExactIntBranchPlan,
-    TypedExactIntReturnPlan, TypedGetAttr, TypedGuardedCallableCall, TypedGuardedMethodCall,
-    TypedIndexedFieldCounterSource, TypedIndexedFieldGuard, TypedIndexedFieldPlanSource,
-    TypedPlannedResult, TypedPyObjectOwnershipPlan, TypedSetAttr, ValueFacts,
-    lower_blockpy_function_to_typed,
+    TypedConstructorInitPlanSource, TypedDirectCallGuardTest, TypedDirectCallGuardTestKind,
+    TypedDirectCallableCall, TypedDirectCallableCallGuard, TypedDirectMethodCall,
+    TypedExactIntBranchPlan, TypedExactIntReturnPlan, TypedGetAttr, TypedGuardedCallableCall,
+    TypedGuardedMethodCall, TypedIndexedFieldCounterSource, TypedIndexedFieldGuard,
+    TypedIndexedFieldPlanSource, TypedPlannedResult, TypedPyObjectOwnershipPlan, TypedSetAttr,
+    ValueFacts, lower_blockpy_function_to_typed,
 };
 use soac_opt::access_emission_v3::{
     IndexedFieldLayoutGroup as OptV3IndexedFieldLayoutGroup,
@@ -10599,6 +10599,57 @@ fn emit_constructor_init_user_arg_values(
     (arg_values, arg_borrowed)
 }
 
+fn emit_constructor_entry_allocation_only(
+    fb: &mut FunctionBuilder<'_>,
+    cls_value: ir::Value,
+    cls_is_borrowed: bool,
+    emit_ctx: &JitEmitCtx<'_>,
+) -> ir::Value {
+    let ptr_ty = emit_ctx.consts.ptr_ty;
+    let null_ptr = fb.ins().iconst(ptr_ty, 0);
+    let nitems = fb.ins().iconst(emit_ctx.consts.i64_ty, 0);
+    let alloc_inst = fb
+        .ins()
+        .call(emit_ctx.pytype_generic_alloc_ref, &[cls_value, nitems]);
+    let allocated = fb.inst_results(alloc_inst)[0];
+    let allocated_is_null = fb
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, allocated, null_ptr);
+    let alloc_failed_block = fb.create_block();
+    fb.set_cold_block(alloc_failed_block);
+    let alloc_ok_block = fb.create_block();
+    fb.append_block_param(alloc_ok_block, ptr_ty);
+    fb.ins().brif(
+        allocated_is_null,
+        alloc_failed_block,
+        &[],
+        alloc_ok_block,
+        &[ir::BlockArg::Value(allocated)],
+    );
+
+    fb.switch_to_block(alloc_failed_block);
+    if !cls_is_borrowed {
+        fb.ins().call(
+            emit_ctx.decref_ref,
+            &[emit_ctx.consts.thread_state_value, cls_value],
+        );
+    }
+    fb.ins().jump(
+        emit_ctx.consts.step_null_block,
+        &step_null_block_args(emit_ctx),
+    );
+
+    fb.switch_to_block(alloc_ok_block);
+    let allocated = fb.block_params(alloc_ok_block)[0];
+    if !cls_is_borrowed {
+        fb.ins().call(
+            emit_ctx.decref_ref,
+            &[emit_ctx.consts.thread_state_value, cls_value],
+        );
+    }
+    allocated
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_constructor_entry_direct_init_call_with_arg_values(
     fb: &mut FunctionBuilder<'_>,
@@ -10829,6 +10880,28 @@ fn emit_typed_constructor_entry_call_with_local_env(
     };
     if arg_refs.is_empty() {
         return Ok(None);
+    }
+    if constructor_init_plan.is_some_and(|plan| {
+        plan.source == TypedConstructorInitPlanSource::InlinedConstructorEntryWithInlinedInitBody
+    }) {
+        let (cls_value, cls_is_borrowed) = emit_typed_pyobject_input_with_local_env(
+            fb,
+            arg_refs[0],
+            local_env,
+            emit_ctx,
+            codegen_env,
+            func_imports,
+            "typed constructor allocation class arg",
+        )?;
+        let result =
+            emit_constructor_entry_allocation_only(fb, cls_value, cls_is_borrowed, emit_ctx);
+        return Ok(Some(emit_owned_pyobject_result_for_demand(
+            fb,
+            result,
+            PyObjFacts::unknown(),
+            emit_ctx,
+            demand,
+        )));
     }
     let Some(user_arg_sources) =
         constructor_init_user_arg_sources(init_function, arg_refs.len() - 1)
