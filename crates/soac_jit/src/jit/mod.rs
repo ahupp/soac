@@ -36,7 +36,7 @@ use soac_ir_typed::plan_v3::{
 };
 use soac_ir_typed::{
     FactStore, InstrTyped, PyExactType, PyObjFacts, RuntimeHelperId, TypedAttrAccessPlan,
-    TypedBlockLayoutHint, TypedBlockPyModuleShape, TypedCall, TypedCallAccessPlan,
+    TypedBlock, TypedBlockLayoutHint, TypedBlockPyModuleShape, TypedCall, TypedCallAccessPlan,
     TypedDirectCallGuardTest, TypedDirectCallGuardTestKind, TypedDirectCallableCall,
     TypedDirectCallableCallGuard, TypedDirectMethodCall, TypedExactIntBranchPlan,
     TypedExactIntReturnPlan, TypedGetAttr, TypedGuardedCallableCall, TypedGuardedMethodCall,
@@ -164,7 +164,8 @@ use direct_abi::{
 use direct_function::{
     DirectCallArgPlan, DirectCallArgSource, DirectCallEntryKind, DirectEdgeStats,
     DirectFunctionSpecialization, DirectMethodSpecialization, declare_direct_function,
-    direct_call_arg_plan_from_typed, direct_function_specializations_from_typed_guards,
+    declare_imported_direct_function, direct_call_arg_plan_from_typed,
+    direct_function_specializations_from_typed_guards,
     direct_method_specialization_from_typed_call, direct_method_specializations_from_typed_guards,
     make_direct_function_signature, record_profiled_direct_call_incompatibility,
     validate_direct_call_compatibility,
@@ -266,6 +267,7 @@ pub fn install_sigill_diagnostics() -> Result<(), String> {
 }
 
 const MISSING_PYTHON_EXCEPTION_TRAP: ir::TrapCode = ir::TrapCode::unwrap_user(1);
+const DEOPT_SUPPRESSED_FALLBACK_TRAP: ir::TrapCode = ir::TrapCode::unwrap_user(2);
 thread_local! {
     static PROCESS_JIT_COMPILE_DEPTH: Cell<usize> = const { Cell::new(0) };
 }
@@ -1695,6 +1697,7 @@ fn collect_typed_guard_miss_deopt_instr_ids(
                 .and_then(|extra| extra.exact_int_return_plan())
                 .is_some_and(|plan| {
                     planning::exact_int_return_plan_i64_result(plan).is_some()
+                        || planning::exact_int_return_plan_i32_bool01_result(plan).is_some()
                         || planning::exact_int_return_plan_immortal_pyobject_result(plan).is_some()
                 });
             if (expr.guard_miss_deopt_enabled() || exact_int_deopt)
@@ -10431,34 +10434,6 @@ fn emit_typed_positional_arg_values(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn emit_typed_borrowed_positional_arg_values(
-    fb: &mut FunctionBuilder<'_>,
-    args: &[&InstrTyped],
-    local_env: &mut LocalEnv,
-    ctx: &JitEmitCtx<'_>,
-    codegen_env: &mut impl JitCodegenEnv,
-    func_imports: &mut FuncBuildImports<'_>,
-    site: &str,
-) -> Result<Vec<ir::Value>, String> {
-    let mut arg_values = Vec::with_capacity(args.len());
-    for arg in args {
-        let (value, ownership, _) = emit_typed_pyobject_value_with_local_env(
-            fb,
-            arg,
-            local_env,
-            ctx,
-            true,
-            codegen_env,
-            func_imports,
-            site,
-        )?;
-        debug_assert!(!ownership.is_owned());
-        arg_values.push(value);
-    }
-    Ok(arg_values)
-}
-
-#[allow(clippy::too_many_arguments)]
 fn emit_typed_positional_call_result_with_arg_refs(
     fb: &mut FunctionBuilder<'_>,
     callable: ir::Value,
@@ -10587,15 +10562,17 @@ fn emit_constructor_init_user_arg_values(
     fb: &mut FunctionBuilder<'_>,
     sources: &[ConstructorInitUserArgSource],
     user_arg_values: &[ir::Value],
+    user_arg_borrowed: &[bool],
     emit_ctx: &JitEmitCtx<'_>,
 ) -> (Vec<ir::Value>, Vec<bool>) {
+    debug_assert_eq!(user_arg_values.len(), user_arg_borrowed.len());
     let mut arg_values = Vec::with_capacity(sources.len());
     let mut arg_borrowed = Vec::with_capacity(sources.len());
     for source in sources {
         match *source {
             ConstructorInitUserArgSource::Provided { index } => {
                 arg_values.push(user_arg_values[index]);
-                arg_borrowed.push(true);
+                arg_borrowed.push(user_arg_borrowed[index]);
             }
             ConstructorInitUserArgSource::PackedRest { start } => {
                 arg_values.push(emit_pack_current_values_tuple(
@@ -10603,6 +10580,18 @@ fn emit_constructor_init_user_arg_values(
                     &user_arg_values[start..],
                     emit_ctx,
                 ));
+                for (value, borrowed) in user_arg_values[start..]
+                    .iter()
+                    .copied()
+                    .zip(user_arg_borrowed[start..].iter().copied())
+                {
+                    if !borrowed {
+                        fb.ins().call(
+                            emit_ctx.decref_ref,
+                            &[emit_ctx.consts.thread_state_value, value],
+                        );
+                    }
+                }
                 arg_borrowed.push(false);
             }
         }
@@ -10615,23 +10604,30 @@ fn emit_constructor_entry_direct_init_call_with_arg_values(
     fb: &mut FunctionBuilder<'_>,
     init_function: &BlockPyFunction<TypedBlockPyModuleShape>,
     cls_value: ir::Value,
+    cls_is_borrowed: bool,
     user_arg_values: Vec<ir::Value>,
+    user_arg_borrowed: Vec<bool>,
     user_arg_sources: &[ConstructorInitUserArgSource],
     emit_ctx: &JitEmitCtx<'_>,
     codegen_env: &mut impl JitCodegenEnv,
 ) -> ir::Value {
+    debug_assert_eq!(user_arg_values.len(), user_arg_borrowed.len());
     let (init_user_arg_values, init_user_arg_borrowed) = emit_constructor_init_user_arg_values(
         fb,
         user_arg_sources,
         user_arg_values.as_slice(),
+        user_arg_borrowed.as_slice(),
         emit_ctx,
     );
-    let owned_init_user_arg_values = init_user_arg_values
+    let mut owned_constructor_inputs = init_user_arg_values
         .iter()
         .copied()
         .zip(init_user_arg_borrowed.iter().copied())
         .filter_map(|(value, borrowed)| (!borrowed).then_some(value))
         .collect::<Vec<_>>();
+    if !cls_is_borrowed {
+        owned_constructor_inputs.push(cls_value);
+    }
     let direct_func_id = emit_ctx
         .direct_call_functions
         .get(&init_function.function_id)
@@ -10654,7 +10650,7 @@ fn emit_constructor_entry_direct_init_call_with_arg_values(
         .brif(allocated_is_null, alloc_failed_block, &[], enter_block, &[]);
 
     fb.switch_to_block(alloc_failed_block);
-    emit_release_owned_inputs(fb, emit_ctx, &owned_init_user_arg_values);
+    emit_release_owned_inputs(fb, emit_ctx, &owned_constructor_inputs);
     fb.ins().jump(
         emit_ctx.consts.step_null_block,
         &step_null_block_args(emit_ctx),
@@ -10677,7 +10673,7 @@ fn emit_constructor_entry_direct_init_call_with_arg_values(
         .brif(enter_failed, enter_failed_block, &[], init_call_block, &[]);
 
     fb.switch_to_block(enter_failed_block);
-    let mut enter_failed_owned_inputs = owned_init_user_arg_values.clone();
+    let mut enter_failed_owned_inputs = owned_constructor_inputs.clone();
     enter_failed_owned_inputs.push(allocated);
     emit_release_owned_inputs(fb, emit_ctx, &enter_failed_owned_inputs);
     fb.ins().jump(
@@ -10702,7 +10698,7 @@ fn emit_constructor_entry_direct_init_call_with_arg_values(
     init_call_args.extend(init_user_arg_values.iter().copied());
     let init_call_inst = fb.ins().call(func_ref, &init_call_args);
     let init_result = fb.inst_results(init_call_inst)[0];
-    emit_release_owned_inputs(fb, emit_ctx, &owned_init_user_arg_values);
+    emit_release_owned_inputs(fb, emit_ctx, &owned_constructor_inputs);
     let init_result_is_null = fb
         .ins()
         .icmp(ir::condcodes::IntCC::Equal, init_result, null_ptr);
@@ -10792,11 +10788,14 @@ fn emit_codegen_constructor_entry_call_with_local_env(
     );
     debug_assert!(arg_borrowed.iter().all(|is_borrowed| *is_borrowed));
     let cls_value = arg_values[0];
+    let cls_is_borrowed = arg_borrowed[0];
     Some(emit_constructor_entry_direct_init_call_with_arg_values(
         fb,
         init_function,
         cls_value,
+        cls_is_borrowed,
         arg_values[1..].to_vec(),
+        arg_borrowed[1..].to_vec(),
         user_arg_sources.as_slice(),
         emit_ctx,
         codegen_env,
@@ -10845,31 +10844,23 @@ fn emit_typed_constructor_entry_call_with_local_env(
     {
         return Ok(None);
     }
-    if !arg_refs.iter().all(|arg| {
-        typed_expr_is_borrowable_from_local_env(
-            arg,
-            local_env,
-            &emit_ctx.stack_slots,
-            emit_ctx.storage_layout.as_ref(),
-        )
-    }) {
-        return Ok(None);
-    }
-    let arg_values = emit_typed_borrowed_positional_arg_values(
+    let (arg_values, arg_borrowed) = emit_typed_positional_arg_values(
         fb,
         arg_refs,
         local_env,
         emit_ctx,
         codegen_env,
         func_imports,
-        "typed constructor-entry borrowed arg",
     )?;
     let cls_value = arg_values[0];
+    let cls_is_borrowed = arg_borrowed[0];
     let result = emit_constructor_entry_direct_init_call_with_arg_values(
         fb,
         init_function,
         cls_value,
+        cls_is_borrowed,
         arg_values[1..].to_vec(),
+        arg_borrowed[1..].to_vec(),
         user_arg_sources.as_slice(),
         emit_ctx,
         codegen_env,
@@ -17952,6 +17943,13 @@ struct IfTruthInstrumentation {
     true_direct_call_target: Option<(InstrId, RuntimeFunctionId)>,
 }
 
+struct IfGuardMissDeopt<'a> {
+    instr_id: InstrId,
+    resume_point: LocalEnvResumePoint,
+    guard_operand: &'a InstrTyped,
+    fallback_counter_ref: Option<CounterRef>,
+}
+
 fn direct_call_guard_if_truth_instrumentation(
     expr: &InstrTyped,
     emit_ctx: &JitEmitCtx<'_>,
@@ -17975,6 +17973,133 @@ fn direct_call_guard_if_truth_instrumentation(
         true_counter_ref,
         true_direct_call_target,
     }
+}
+
+fn direct_call_guard_if_miss_deopt<'a>(
+    expr: &'a InstrTyped,
+    default_resume_point: LocalEnvResumePoint,
+    emit_ctx: &JitEmitCtx<'_>,
+) -> Option<IfGuardMissDeopt<'a>> {
+    if !expr.guard_miss_deopt_enabled() {
+        return None;
+    }
+    let InstrTyped::DirectCallGuardTest(op) = expr else {
+        return None;
+    };
+    let instr_id = expr.try_semantic_instr_id()?;
+    Some(IfGuardMissDeopt {
+        instr_id,
+        resume_point: emit_ctx
+            .guard_miss_resume_point
+            .unwrap_or(default_resume_point),
+        guard_operand: op.value.as_ref(),
+        fallback_counter_ref: emit_ctx
+            .call_direct_fallback_counter_ids
+            .get(&instr_id)
+            .copied(),
+    })
+}
+
+fn typed_term_successor_labels(term: &BlockTerm<InstrTyped>) -> Vec<BlockLabel> {
+    match term {
+        BlockTerm::Jump(edge) => vec![edge.target],
+        BlockTerm::IfTerm(if_term) => vec![if_term.then_label, if_term.else_label],
+        BlockTerm::BranchTable(branch) => {
+            let mut labels = branch.targets.clone();
+            labels.push(branch.default_label);
+            labels
+        }
+        BlockTerm::Raise(_) | BlockTerm::Return(_) => Vec::new(),
+    }
+}
+
+fn typed_direct_call_guard_deopt_else_label(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    block: &TypedBlock,
+    instr_locations: &InstrLocationMap,
+    guard_miss_deopt_instr_ids: &HashSet<InstrId>,
+    guard_miss_deopt_stub_available: bool,
+    deopt_resume_plan: &PlannedJitDeoptResumeFunction,
+) -> Option<BlockLabel> {
+    if !guard_miss_deopt_stub_available {
+        return None;
+    }
+    let BlockTerm::IfTerm(if_term) = &block.term else {
+        return None;
+    };
+    if if_term.then_label == if_term.else_label {
+        return None;
+    }
+    let InstrTyped::DirectCallGuardTest(op) = &if_term.test else {
+        return None;
+    };
+    if !if_term.test.guard_miss_deopt_enabled() {
+        return None;
+    }
+    let instr_id = if_term.test.try_semantic_instr_id()?;
+    if !guard_miss_deopt_instr_ids.contains(&instr_id)
+        || !runtime_jit_typed_deopt_guard_operand_replay_safe(op.value.as_ref())
+    {
+        return None;
+    }
+    let resume_point = LocalEnvResumePoint::BeforeTerm {
+        function_id: function.function_id,
+        block: block.label,
+    };
+    if runtime_jit_typed_deopt_continuation_for_point(function, instr_locations, resume_point)
+        .unsupported_reason()
+        .is_some()
+        || deopt_resume_plan.entry(resume_point).is_none()
+    {
+        return None;
+    }
+    Some(if_term.else_label)
+}
+
+fn typed_machine_deopt_suppressed_blocks(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+    instr_locations: &InstrLocationMap,
+    guard_miss_deopt_instr_ids: &HashSet<InstrId>,
+    guard_miss_deopt_stub_available: bool,
+    deopt_resume_plan: &PlannedJitDeoptResumeFunction,
+) -> HashSet<BlockLabel> {
+    let mut predecessors = HashMap::<BlockLabel, HashSet<BlockLabel>>::new();
+    let mut deopt_edges = HashSet::<(BlockLabel, BlockLabel)>::new();
+    for block in &function.blocks {
+        for successor in typed_term_successor_labels(&block.term) {
+            predecessors
+                .entry(successor)
+                .or_default()
+                .insert(block.label);
+        }
+        if let Some(edge) = &block.exc_edge {
+            predecessors
+                .entry(edge.target)
+                .or_default()
+                .insert(block.label);
+        }
+        if let Some(else_label) = typed_direct_call_guard_deopt_else_label(
+            function,
+            block,
+            instr_locations,
+            guard_miss_deopt_instr_ids,
+            guard_miss_deopt_stub_available,
+            deopt_resume_plan,
+        ) {
+            deopt_edges.insert((block.label, else_label));
+        }
+    }
+    deopt_edges
+        .iter()
+        .filter_map(|(_, target)| {
+            let preds = predecessors.get(target)?;
+            (!preds.is_empty()
+                && preds
+                    .iter()
+                    .all(|pred| deopt_edges.contains(&(*pred, *target))))
+            .then_some(*target)
+        })
+        .collect()
 }
 
 fn emit_codegen_if_target_arm(
@@ -18114,6 +18239,7 @@ fn emit_codegen_if_truth_i32(
     then_label: BlockLabel,
     else_label: BlockLabel,
     instrumentation: IfTruthInstrumentation,
+    guard_miss_deopt: Option<IfGuardMissDeopt<'_>>,
     current_exception_name: Option<&str>,
     function: &BlockPyFunction<impl ModuleShape>,
     exec_blocks: &[ir::Block],
@@ -18143,6 +18269,19 @@ fn emit_codegen_if_truth_i32(
     };
     let hot_branch = fb.create_block();
     let cold_branch = fb.create_block();
+    let cold_guard_miss_dispatch = guard_miss_deopt.as_ref().and_then(|guard_miss_deopt| {
+        prefer_true.then(|| {
+            prepare_optional_guard_miss_dispatch(
+                emit_ctx.guard_miss_target_for_typed_resume_point(
+                    guard_miss_deopt.resume_point,
+                    &[guard_miss_deopt.guard_operand],
+                    cold_branch,
+                ),
+                cold_branch,
+                emit_ctx.guard_miss_deopt_ref_for_instr_id(guard_miss_deopt.instr_id),
+            )
+        })
+    });
     fb.ins().brif(hot_cond, hot_branch, &[], cold_branch, &[]);
 
     let (hot_name, hot_label, cold_name, cold_label) = if prefer_true {
@@ -18190,6 +18329,33 @@ fn emit_codegen_if_truth_i32(
         .then_some(instrumentation.true_direct_call_target)
         .flatten();
     let mut cold_local_env = local_env.clone();
+    if let (
+        Some(IfGuardMissDeopt {
+            fallback_counter_ref,
+            ..
+        }),
+        Some(JitGuardMissDispatch::DeoptResume {
+            block,
+            target,
+            deopt_resume_ref,
+        }),
+    ) = (guard_miss_deopt.as_ref(), cold_guard_miss_dispatch)
+    {
+        emit_ctx
+            .direct_edge_stats
+            .record_guarded_generic_fallback_block();
+        emit_typed_guard_miss_deopt_resume_return(
+            fb,
+            &cold_local_env,
+            emit_ctx,
+            block,
+            *fallback_counter_ref,
+            &[],
+            target,
+            deopt_resume_ref,
+        );
+        return Ok(());
+    }
     emit_codegen_if_target_arm(
         fb,
         source_label,
@@ -18630,6 +18796,8 @@ fn emit_typed_codegen_term(
         };
         let truth_i32 = truth.expect_i32_bool01("typed if condition truthiness");
         let instrumentation = direct_call_guard_if_truth_instrumentation(&if_term.test, emit_ctx);
+        let guard_miss_deopt =
+            direct_call_guard_if_miss_deopt(&if_term.test, term_guard_miss_resume_point, emit_ctx);
         return emit_codegen_if_truth_i32(
             fb,
             source_label,
@@ -18638,6 +18806,7 @@ fn emit_typed_codegen_term(
             if_term.then_label,
             if_term.else_label,
             instrumentation,
+            guard_miss_deopt,
             current_exception_name,
             function,
             exec_blocks,
@@ -19601,6 +19770,13 @@ fn build_cranelift_run_bb_specialized_function(
             (env_config.jit_refcount_emission_enabled() && guard_miss_deopt_stub).then(|| {
                 func_imports.get_or_panic(codegen_env, &mut fb.func, &DP_JIT_DEOPT_RESUME_IMPORT)
             });
+        let machine_deopt_suppressed_blocks = typed_machine_deopt_suppressed_blocks(
+            &typed_function,
+            &instr_locations,
+            &guard_miss_deopt_instr_ids,
+            guard_miss_deopt_stub_ref.is_some(),
+            jit_deopt_resume_plan,
+        );
         let store_global_indexed_ref = func_imports.get_or_panic(
             codegen_env,
             &mut fb.func,
@@ -19894,6 +20070,10 @@ fn build_cranelift_run_bb_specialized_function(
         for (index, block) in exec_blocks.iter().enumerate() {
             fb.switch_to_block(*block);
             let codegen_block = &function.blocks[index];
+            if machine_deopt_suppressed_blocks.contains(&codegen_block.label) {
+                fb.ins().trap(DEOPT_SUPPRESSED_FALLBACK_TRAP);
+                continue;
+            }
             let mut local_env = LocalEnv::default();
             let block_param_values = fb.block_params(*block).to_vec();
             bind_planned_local_env_at_block_entry(
@@ -20737,6 +20917,44 @@ pub unsafe fn render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
                 render_function.function_id, render_function.names.qualname
             )
         })?;
+    let PreparedSpecializedTypedFunction {
+        typed_function: render_typed_function,
+    } = prepare_specialized_typed_function(render_function, None, &jit_module_plan.value_facts)?;
+    let mut predeclared_direct_functions = HashMap::new();
+    let mut external_direct_call_target_functions = HashMap::new();
+    for function_id in collect_typed_call_direct_targets(&render_typed_function) {
+        if function_id == render_function.function_id
+            || predeclared_direct_functions.contains_key(&function_id)
+        {
+            continue;
+        }
+        if let Some(target_function) = render_module
+            .callable_defs
+            .iter()
+            .find(|function| function.function_id == function_id)
+            .filter(|function| function.execution_mode() == FunctionExecutionMode::Jit)
+        {
+            let declared =
+                declare_imported_direct_function(&mut jit_module, target_function, "render")?;
+            predeclared_direct_functions.insert(function_id, declared);
+            continue;
+        }
+        let Some(target_function) = runtime_state
+            .map(|shared_state| {
+                shared_state.lookup_direct_call_target_function(compile_session, function_id)
+            })
+            .transpose()?
+            .flatten()
+            .filter(|function| function.execution_mode() == FunctionExecutionMode::Jit)
+        else {
+            continue;
+        };
+        let target_function = lower_blockpy_function_to_typed(target_function);
+        let declared =
+            declare_imported_direct_function(&mut jit_module, &target_function, "render")?;
+        predeclared_direct_functions.insert(function_id, declared);
+        external_direct_call_target_functions.insert(function_id, target_function);
+    }
     let built = build_cranelift_run_bb_specialized_function(
         &mut jit_module,
         render_blocks,
@@ -20754,8 +20972,11 @@ pub unsafe fn render_cranelift_run_bb_specialized_with_runtime_state_and_cfg(
         compile_session,
         runtime_state,
         None,
-        None,
-        BuildSpecializedFunctionOptions::default(),
+        Some(&predeclared_direct_functions),
+        BuildSpecializedFunctionOptions {
+            external_direct_call_target_functions,
+            ..BuildSpecializedFunctionOptions::default()
+        },
     )?;
     let mut out = String::new();
     let function_aliases = clif_function_display_aliases(

@@ -18343,6 +18343,17 @@ def f(x, y):
                 direct_call_guard_tests, 1,
                 "typed-v3 inlining should expose the direct-call guard as typed CFG"
             );
+            assert!(
+                planned_caller.blocks.iter().any(|block| {
+                    matches!(
+                        &block.term,
+                        BlockTerm::IfTerm(term)
+                            if matches!(term.test, InstrTyped::DirectCallGuardTest(_))
+                                && term.test.guard_miss_deopt_enabled()
+                    )
+                }),
+                "typed-v3 inlining should mark the exposed direct-call guard for deopt"
+            );
             assert_eq!(
                 generic_typed_calls, 1,
                 "typed-v3 inlining should keep a generic fallback call"
@@ -18380,6 +18391,64 @@ def f(x, y):
             assert!(
                 stale_err.contains("typed specialized JIT function block count mismatch"),
                 "{stale_err}"
+            );
+
+            let compile_session = crate::session::CompileSession::new();
+            let mut jit_module =
+                new_jit_module(&compile_session).expect("test jit module should construct");
+            let planned_codegen_constants =
+                crate::module_constants::ModuleCodegenConstants::collect_from_typed_module(
+                    module_plan.module.as_ref(),
+                );
+            let module_constant_ptrs =
+                placeholder_module_constant_ptrs(planned_codegen_constants.len());
+            let module_constant_object_data_ids = declare_module_constant_object_data(
+                &mut jit_module,
+                module_plan.module.as_ref(),
+                module_constant_ptrs.as_slice(),
+            )
+            .expect("module constant object data should declare");
+            let (counter_slots_by_id, scalar_counter_data_id, top_value_counter_data_id) =
+                define_test_counter_storage(
+                    &mut jit_module,
+                    &shared_state.lowered_module,
+                    module_plan.module.counter_defs.as_slice(),
+                );
+            let blocks = vec![std::ptr::null_mut::<c_void>(); planned_caller.blocks.len()];
+            let built = build_cranelift_run_bb_specialized_function(
+                &mut jit_module,
+                blocks.as_slice(),
+                module_plan.module.as_ref(),
+                planned_caller,
+                &module_plan.value_facts,
+                module_plan
+                    .locals
+                    .function(planned_caller.function_id)
+                    .expect("planned caller should have JIT locals"),
+                module_plan
+                    .deopt_resume
+                    .function(planned_caller.function_id)
+                    .expect("planned caller should have deopt resume data"),
+                &planned_codegen_constants,
+                module_plan.module.counter_defs.as_slice(),
+                module_constant_object_data_ids.as_slice(),
+                counter_slots_by_id.as_ref(),
+                scalar_counter_data_id,
+                top_value_counter_data_id,
+                &compile_session,
+                Some(shared_state.as_ref()),
+                None,
+                None,
+                BuildSpecializedFunctionOptions::default(),
+            )
+            .expect("inlined typed direct-call guard should compile");
+            assert_guard_miss_deopts_without_local_fallback(
+                &built,
+                &[
+                    DP_JIT_PY_CALL_POSITIONAL_THREE_IMPORT.symbol,
+                    DP_JIT_PY_VECTORCALL_IMPORT.symbol,
+                ],
+                "inlined typed direct-call guard",
             );
         });
     }

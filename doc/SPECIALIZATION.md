@@ -473,6 +473,11 @@ their owner/type guard payload is not yet a static mechanical JIT input.
   directly in `InstrTyped` in both runtime and precompile flows.
 - Residual call nodes that were not selected by the plan use the normal generic
   typed call lowering.
+- Inline-winning call sites keep the generic fallback continuation in
+  `InstrTyped` so deopt replay has the original call shape. When the exposed
+  typed direct-call guard miss is replay-safe and refcount emission is enabled,
+  JIT codegen routes the miss arm to `dp_jit_deopt_resume` and suppresses local
+  machine code for fallback blocks whose only incoming machine edges deopt.
 
 ### Explicit Typed Representation
 

@@ -1,3 +1,4 @@
+use super::deopt::typed_nested_guard_misses_can_resume_before_instr;
 #[cfg(test)]
 use soac_config::SoacEnvConfig;
 use soac_core::block_py::{
@@ -2244,10 +2245,45 @@ fn exact_int_scalar_deopt_instr_ids_for_typed_function(
     resume_plan: &FunctionLocalEnvResumePlan,
 ) -> HashSet<InstrId> {
     struct Collector<'a> {
-        function_id: RuntimeFunctionId,
+        function: &'a BlockPyFunction<TypedBlockPyModuleShape>,
         instr_locations: InstrLocationMap,
         resume_plan: &'a FunctionLocalEnvResumePlan,
         instr_ids: HashSet<InstrId>,
+    }
+
+    fn enclosing_top_level_instr<'a>(
+        function: &'a BlockPyFunction<TypedBlockPyModuleShape>,
+        instr_locations: &InstrLocationMap,
+        instr_id: InstrId,
+    ) -> Option<&'a InstrTyped> {
+        let location = instr_locations.get(&instr_id)?;
+        let body_index = location.body_index()?;
+        function
+            .blocks
+            .iter()
+            .find(|block| block.label == location.block_label())
+            .and_then(|block| block.body.get(body_index))
+    }
+
+    fn scalar_deopt_resume_available(
+        function: &BlockPyFunction<TypedBlockPyModuleShape>,
+        instr_locations: &InstrLocationMap,
+        resume_plan: &FunctionLocalEnvResumePlan,
+        instr_id: InstrId,
+    ) -> bool {
+        let Some(stmt) = enclosing_top_level_instr(function, instr_locations, instr_id) else {
+            return false;
+        };
+        let Some(stmt_id) = stmt.try_semantic_instr_id() else {
+            return false;
+        };
+        let point = LocalEnvResumePoint::BeforeInstr {
+            key: InstrKey::new(function.function_id, stmt_id),
+        };
+        if resume_plan.entry(point).is_none() {
+            return false;
+        }
+        instr_id == stmt_id || typed_nested_guard_misses_can_resume_before_instr(stmt)
     }
 
     impl Collector<'_> {
@@ -2269,10 +2305,12 @@ fn exact_int_scalar_deopt_instr_ids_for_typed_function(
             if location.body_index().is_none() {
                 return;
             }
-            let point = LocalEnvResumePoint::BeforeInstr {
-                key: InstrKey::new(self.function_id, plan.instr_id),
-            };
-            if self.resume_plan.entry(point).is_some() {
+            if scalar_deopt_resume_available(
+                self.function,
+                &self.instr_locations,
+                self.resume_plan,
+                plan.instr_id,
+            ) {
                 self.instr_ids.insert(plan.instr_id);
             }
         }
@@ -2286,7 +2324,7 @@ fn exact_int_scalar_deopt_instr_ids_for_typed_function(
     }
 
     let mut collector = Collector {
-        function_id: function.function_id,
+        function,
         instr_locations: current_instr_locations(function),
         resume_plan,
         instr_ids: HashSet::new(),

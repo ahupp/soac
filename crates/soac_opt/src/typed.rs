@@ -3969,14 +3969,13 @@ fn typed_direct_call_guard_term(
     then_label: BlockLabel,
     else_label: BlockLabel,
 ) -> BlockTerm<InstrTyped> {
+    let mut guard = TypedDirectCallGuardTest::new(
+        typed_load_temp(callable_temp),
+        TypedDirectCallGuardTestKind::RuntimeFunctionId { function_id },
+    );
+    guard.extra.set_guard_miss_deopt_enabled(true);
     BlockTerm::IfTerm(TermIf {
-        test: InstrTyped::DirectCallGuardTest(
-            TypedDirectCallGuardTest::new(
-                typed_load_temp(callable_temp),
-                TypedDirectCallGuardTestKind::RuntimeFunctionId { function_id },
-            )
-            .with_meta(source_meta),
-        ),
+        test: InstrTyped::DirectCallGuardTest(guard.with_meta(source_meta)),
         then_label,
         else_label,
     })
@@ -4011,18 +4010,17 @@ fn typed_inline_guard_term(
             let receiver_temp = receiver_temp
                 .expect("method inline guard requires receiver temp")
                 .resolved_name();
+            let mut guard = TypedDirectCallGuardTest::new(
+                typed_load_temp(&receiver_temp),
+                TypedDirectCallGuardTestKind::ExactTypeVersion {
+                    function_id: plan.target,
+                    owner_type_ref: guard.owner_type_ref.clone(),
+                    type_version: guard.type_version,
+                },
+            );
+            guard.extra.set_guard_miss_deopt_enabled(true);
             BlockTerm::IfTerm(TermIf {
-                test: InstrTyped::DirectCallGuardTest(
-                    TypedDirectCallGuardTest::new(
-                        typed_load_temp(&receiver_temp),
-                        TypedDirectCallGuardTestKind::ExactTypeVersion {
-                            function_id: plan.target,
-                            owner_type_ref: guard.owner_type_ref.clone(),
-                            type_version: guard.type_version,
-                        },
-                    )
-                    .with_meta(source_meta),
-                ),
+                test: InstrTyped::DirectCallGuardTest(guard.with_meta(source_meta)),
                 then_label,
                 else_label,
             })
