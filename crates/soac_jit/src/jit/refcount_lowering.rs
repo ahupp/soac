@@ -13,8 +13,6 @@ pub(super) enum RefcountLowering {
         decref_ref: ir::FuncRef,
     },
     Explicit {
-        incref_ref: ir::FuncRef,
-        decref_ref: ir::FuncRef,
         dealloc_preserving_error_ref: ir::FuncRef,
     },
 }
@@ -35,13 +33,7 @@ impl RefcountLowering {
             Self::HelperCalls { incref_ref, .. } => {
                 fb.ins().call(incref_ref, &[value]);
             }
-            Self::Explicit { incref_ref, .. } => {
-                if facts.is_some_and(py_facts_prove_non_null) {
-                    emit_explicit_incref(fb, ptr_ty, value, facts);
-                } else {
-                    fb.ins().call(incref_ref, &[value]);
-                }
-            }
+            Self::Explicit { .. } => emit_explicit_incref(fb, ptr_ty, value, facts),
         }
     }
 
@@ -62,23 +54,15 @@ impl RefcountLowering {
                 fb.ins().call(decref_ref, &[thread_state_value, value]);
             }
             Self::Explicit {
-                decref_ref,
                 dealloc_preserving_error_ref,
-                ..
-            } => {
-                if facts.is_some_and(py_facts_prove_non_null) {
-                    emit_explicit_decref(
-                        fb,
-                        ptr_ty,
-                        thread_state_value,
-                        value,
-                        facts,
-                        dealloc_preserving_error_ref,
-                    );
-                } else {
-                    fb.ins().call(decref_ref, &[thread_state_value, value]);
-                }
-            }
+            } => emit_explicit_decref(
+                fb,
+                ptr_ty,
+                thread_state_value,
+                value,
+                facts,
+                dealloc_preserving_error_ref,
+            ),
         }
     }
 }

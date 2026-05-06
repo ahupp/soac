@@ -2998,6 +2998,10 @@ fn cleanup_root_entry_facts_for_block(
         .into_iter()
         .flat_map(|block| block.entry_locals.iter())
         .filter(|binding| tracked_slot_names.contains(&binding.name))
+        // Cleanup-root block params are rebound as stack mirrors without
+        // overwriting the previous stack-slot value. Only stack-slot-backed
+        // entry bindings describe the value already resident in the slot.
+        .filter(|binding| binding.storage == PlannedLocalStorage::StackSlot)
         .filter_map(|binding| {
             binding
                 .param_facts
@@ -3489,9 +3493,10 @@ mod tests {
         BlockExcDispatchPlan, BlockParamFacts, CleanupRootSlotState, LocalRefKind,
         ParamBindingFacts, ParamProvenance, PlannedLocalBinding, PlannedLocalEnvEntrySource,
         PlannedLocalStorage, PlannedStackSlotEntrySeed, PreparedJitTypedModulePlan,
-        RuntimeBlockArgPlan, RuntimeBlockParamPlan, RuntimeBlockParamRepr, plan_edge_transport,
-        plan_typed_v3_jit_module_for_test, planned_cleanup_root_names_for_refcount_plan,
-        planned_drop_forwarded_local_names, planned_jit_params_for_typed_function,
+        RuntimeBlockArgPlan, RuntimeBlockParamPlan, RuntimeBlockParamRepr,
+        cleanup_root_entry_facts_for_block, plan_edge_transport, plan_typed_v3_jit_module_for_test,
+        planned_cleanup_root_names_for_refcount_plan, planned_drop_forwarded_local_names,
+        planned_jit_params_for_typed_function,
         planned_local_env_entry_materializations_for_function,
         planned_stack_slot_entry_seeds_for_typed_function, typed_block_index_for_label,
         typed_block_indices_by_label, typed_exc_dispatch_plan,
@@ -3501,8 +3506,9 @@ mod tests {
         BlockArg, BlockLabel, BlockPyFunction, BlockPyModule, BlockTerm, LocalLocation,
     };
     use soac_ir_blockpy::BlockPyModuleShape;
+    use soac_ir_typed::{PyExactType, PyObjFacts};
     use soac_lowering::lower_python_to_blockpy_for_testing;
-    use soac_opt::passes::BlockLocalPlan;
+    use soac_opt::passes::{BlockLocalPlan, FunctionLocalPlan};
     use soac_opt::passes::{
         FunctionRefcountPlan, LocalEnvResumeBindingState, LocalEnvResumePoint,
         LocalEnvResumeValueSource, LocalRefState, RefcountActionKind, RefcountReleaseReason,
@@ -3908,7 +3914,7 @@ def f(flag):
     }
 
     #[test]
-    fn cleanup_root_slot_facts_track_non_null_values_across_block_edges() {
+    fn cleanup_root_slot_facts_do_not_reuse_block_param_value_facts_across_edges() {
         let (prepared, function_index) = prepared_typed_function(
             r#"
 def f(flag):
@@ -3933,16 +3939,64 @@ def f(flag):
             .filter_map(|facts| facts.get("x").copied())
             .collect::<Vec<_>>();
         assert!(
-            previous_facts.iter().any(|facts| facts.is_non_null_ref()),
-            "cleanup-root overwrite should retain the previous slot's non-null fact: {previous_facts:?}"
+            previous_facts.iter().all(|facts| !facts.is_non_null_ref()),
+            "block-param value facts must not be reused as old cleanup-root slot facts: {previous_facts:?}"
         );
-        assert!(
-            plan.cleanup_root_slot_states
-                .block_exit_facts
-                .values()
-                .any(|facts| facts.get("x").is_some_and(|facts| facts.is_non_null_ref())),
-            "cleanup-root exits should retain non-null facts for later sweeping: {:?}",
-            plan.cleanup_root_slot_states.block_exit_facts
+    }
+
+    #[test]
+    fn cleanup_root_entry_facts_ignore_block_param_values() {
+        let block_param_label = BlockLabel::from_index(0);
+        let stack_slot_label = BlockLabel::from_index(1);
+        let tracked_slot_names = HashSet::from(["x".to_string()]);
+        let local_plan = FunctionLocalPlan {
+            blocks: HashMap::from([
+                (
+                    block_param_label,
+                    BlockLocalPlan {
+                        label: block_param_label,
+                        entry_locals: vec![PlannedLocalBinding {
+                            name: "x".to_string(),
+                            location: LocalLocation(0),
+                            storage: PlannedLocalStorage::BlockParam,
+                            param_facts: BlockParamFacts {
+                                value: Some(PyObjFacts::known_not_none()),
+                                binding: ParamBindingFacts::DefinitelyBound,
+                                provenance: ParamProvenance::ForwardedLocal(LocalLocation(0)),
+                                ownership: LocalRefKind::Owned,
+                            },
+                        }],
+                    },
+                ),
+                (
+                    stack_slot_label,
+                    BlockLocalPlan {
+                        label: stack_slot_label,
+                        entry_locals: vec![PlannedLocalBinding {
+                            name: "x".to_string(),
+                            location: LocalLocation(0),
+                            storage: PlannedLocalStorage::StackSlot,
+                            param_facts: BlockParamFacts {
+                                value: Some(PyObjFacts::exact_type(PyExactType::Int)),
+                                binding: ParamBindingFacts::CheckedLocalValue,
+                                provenance: ParamProvenance::StackSlot(LocalLocation(0)),
+                                ownership: LocalRefKind::Owned,
+                            },
+                        }],
+                    },
+                ),
+            ]),
+        };
+
+        let block_param_facts =
+            cleanup_root_entry_facts_for_block(&local_plan, block_param_label, &tracked_slot_names);
+        let stack_slot_facts =
+            cleanup_root_entry_facts_for_block(&local_plan, stack_slot_label, &tracked_slot_names);
+
+        assert!(block_param_facts.is_empty());
+        assert_eq!(
+            stack_slot_facts.get("x"),
+            Some(&PyObjFacts::exact_type(PyExactType::Int))
         );
     }
 

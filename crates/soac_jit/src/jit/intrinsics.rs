@@ -6,10 +6,12 @@ use super::operation_specializations;
 use super::symbols::{CpythonTypeSymbol, RelocTypeRef};
 use super::{
     ImportSpec, JitDeoptExitRef, JitEmitCtx, JitGuardMissDispatch, SOAC_RUNTIME_LOAD_GLOBAL_IMPORT,
-    SOAC_RUNTIME_STORE_GLOBAL_IMPORT, SigType, emit_owned_module_constant_from_parts,
-    step_null_block_args,
+    SOAC_RUNTIME_STORE_GLOBAL_IMPORT, SOAC_RUNTIME_STORE_GLOBAL_INDEXED_IMPORT,
+    SOAC_RUNTIME_STORE_GLOBAL_INDEXED_STOLEN_IMPORT, SigType,
+    emit_owned_module_constant_from_parts, step_null_block_args,
 };
 use crate::jit::blockpy_intrinsics;
+use crate::jit::inspection::RefcountFamily;
 use cranelift_codegen::ir;
 use cranelift_codegen::ir::InstBuilder;
 use cranelift_frontend::FunctionBuilder;
@@ -18,7 +20,7 @@ use soac_core::block_py::{
     HasSemanticInstrId, Instr, InstrId, NameLike, NameLocation, ResolvedName,
 };
 use soac_ir_blockpy::InstrBlockPy;
-use soac_ir_typed::{InstrTyped, PyObjFacts};
+use soac_ir_typed::{InstrTyped, PyExactType, PyObjFacts};
 use soac_opt::operator_specialization::{BINARY_RHS_TAG_SHIFT, ExactTypeTag};
 use std::mem::offset_of;
 
@@ -53,21 +55,30 @@ pub(super) trait OperationEmitState<'fb, E> {
     ) -> Option<ir::Value> {
         None
     }
-    fn emit_incref(&mut self, value: ir::Value) {
-        let ptr_ty = self.ctx().consts.ptr_ty;
-        let refcount_lowering = self.ctx().refcount_lowering;
-        refcount_lowering.emit_incref(self.fb(), ptr_ty, value, None);
+    fn emit_incref_for_family(
+        &mut self,
+        value: ir::Value,
+        facts: Option<PyObjFacts>,
+        family: RefcountFamily,
+    ) {
+        let ctx = self.ctx();
+        let refcounts = ctx.refcount_emitter().with_family(family);
+        refcounts.emit_incref(self.fb(), value, facts);
     }
-    fn emit_decref(&mut self, value: ir::Value) {
-        let ptr_ty = self.ctx().consts.ptr_ty;
-        let thread_state_value = self.ctx().consts.thread_state_value;
-        let refcount_lowering = self.ctx().refcount_lowering;
-        refcount_lowering.emit_decref(self.fb(), ptr_ty, thread_state_value, value, None);
+    fn emit_decref_for_family(
+        &mut self,
+        value: ir::Value,
+        facts: Option<PyObjFacts>,
+        family: RefcountFamily,
+    ) {
+        let ctx = self.ctx();
+        let refcounts = ctx.refcount_emitter().with_family(family);
+        refcounts.emit_decref(self.fb(), value, facts);
     }
     fn release_arg_values(&mut self, arg_values: &[(ir::Value, bool)]) {
-        for (value, borrowed_arg) in arg_values {
-            if !borrowed_arg {
-                self.emit_decref(*value);
+        for (value, borrowed) in arg_values {
+            if !borrowed {
+                self.emit_decref_for_family(*value, None, RefcountFamily::OwnedTemporary);
             }
         }
     }
@@ -1072,7 +1083,11 @@ fn emit_load<'fb>(
                 .fb()
                 .ins()
                 .call(func_ref, &[globals_obj, name_obj, slot_index]);
-            state.emit_decref(name_obj);
+            state.emit_decref_for_family(
+                name_obj,
+                Some(PyObjFacts::exact_type(PyExactType::Str)),
+                RefcountFamily::OwnedTemporary,
+            );
             let slow_value = state.fb().inst_results(call_inst)[0];
             let slow_value_is_null =
                 state
@@ -1127,7 +1142,11 @@ fn emit_indexed_global_store_with_state<'fb, E: Instr<Name = ResolvedName>>(
 ) -> ir::Value {
     let ptr_ty = state.ctx().consts.ptr_ty;
     let null_ptr = state.fb().ins().iconst(ptr_ty, 0);
-    let store_global_indexed_ref = state.ctx().store_global_indexed_ref;
+    let store_global_indexed_ref = state.import_func(if arg_values[0].1 {
+        &SOAC_RUNTIME_STORE_GLOBAL_INDEXED_IMPORT
+    } else {
+        &SOAC_RUNTIME_STORE_GLOBAL_INDEXED_STOLEN_IMPORT
+    });
     let thread_state_value = state.ctx().consts.thread_state_value;
     let hit_counter_id = state
         .ctx()
@@ -1174,8 +1193,14 @@ fn emit_indexed_global_store_with_state<'fb, E: Instr<Name = ResolvedName>>(
     state.fb().switch_to_block(direct_block);
     let direct_value = state.fb().block_params(direct_block)[0];
     increment_counter_with_state(state, hit_counter_id);
-    state.release_arg_values(arg_values);
-    state.emit_decref(name_obj);
+    if arg_values[0].1 {
+        state.release_arg_values(arg_values);
+    }
+    state.emit_decref_for_family(
+        name_obj,
+        Some(PyObjFacts::exact_type(PyExactType::Str)),
+        RefcountFamily::OwnedTemporary,
+    );
     state
         .fb()
         .ins()
@@ -1191,7 +1216,11 @@ fn emit_indexed_global_store_with_state<'fb, E: Instr<Name = ResolvedName>>(
             );
             let fallback_value = state.fb().inst_results(fallback_inst)[0];
             state.release_arg_values(arg_values);
-            state.emit_decref(name_obj);
+            state.emit_decref_for_family(
+                name_obj,
+                Some(PyObjFacts::exact_type(PyExactType::Str)),
+                RefcountFamily::OwnedTemporary,
+            );
             state
                 .fb()
                 .ins()
@@ -1207,7 +1236,11 @@ fn emit_indexed_global_store_with_state<'fb, E: Instr<Name = ResolvedName>>(
             increment_counter_with_state(state, fallback_counter_id);
             let deopt_result = state.emit_deopt_resume_result(target, deopt_resume_ref);
             state.release_arg_values(arg_values);
-            state.emit_decref(name_obj);
+            state.emit_decref_for_family(
+                name_obj,
+                Some(PyObjFacts::exact_type(PyExactType::Str)),
+                RefcountFamily::OwnedTemporary,
+            );
             state.emit_deopt_result_return_or_step_null(deopt_result);
         }
     }
@@ -1288,7 +1321,11 @@ fn emit_store_with_indexed_global_plan<'fb, E: Instr<Name = ResolvedName>>(
         );
         let result = state.fb().inst_results(call_inst)[0];
         state.release_arg_values(&arg_values);
-        state.emit_decref(name_obj);
+        state.emit_decref_for_family(
+            name_obj,
+            Some(PyObjFacts::exact_type(PyExactType::Str)),
+            RefcountFamily::OwnedTemporary,
+        );
         result
     };
     state.finish_owned_result(result)
@@ -1316,7 +1353,11 @@ fn emit_del<'fb, E: Instr<Name = ResolvedName>>(
         .fb()
         .ins()
         .call(func_ref, &[globals_obj, name_obj, slot_index]);
-    state.emit_decref(name_obj);
+    state.emit_decref_for_family(
+        name_obj,
+        Some(PyObjFacts::exact_type(PyExactType::Str)),
+        RefcountFamily::OwnedTemporary,
+    );
     let result = state.fb().inst_results(call_inst)[0];
     state.finish_owned_result(result)
 }
@@ -1332,7 +1373,7 @@ pub(super) fn emit_del_deref_raw_cell<'fb, E>(
         &DP_JIT_DEL_DEREF_IMPORT
     });
     let call_inst = state.fb().ins().call(func_ref, &[cell_obj]);
-    state.emit_decref(cell_obj);
+    state.emit_decref_for_family(cell_obj, None, RefcountFamily::OwnedTemporary);
     let result = state.fb().inst_results(call_inst)[0];
     state.finish_owned_result(result)
 }

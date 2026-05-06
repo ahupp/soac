@@ -336,6 +336,22 @@ impl PyObjFacts {
             && self.refcount == RefcountFact::Unknown
             && self.callable == CallableFact::Unknown
     }
+
+    fn intersect(self, other: Self) -> Self {
+        Self {
+            ty: intersect_type_fact(self.ty, other.ty),
+            truthiness: intersect_truthiness_fact(self.truthiness, other.truthiness),
+            none: intersect_none_fact(self.none, other.none),
+            nullability: intersect_nullability_fact(self.nullability, other.nullability),
+            bool_singleton: intersect_bool_singleton_fact(
+                self.bool_singleton,
+                other.bool_singleton,
+            ),
+            refcount: intersect_refcount_fact(self.refcount, other.refcount),
+            provenance: intersect_provenance_fact(self.provenance, other.provenance),
+            callable: intersect_callable_fact(self.callable, other.callable),
+        }
+    }
 }
 
 const fn none_fact_for_exact_type(exact_type: PyExactType) -> NoneFact {
@@ -346,6 +362,76 @@ const fn none_fact_for_exact_type(exact_type: PyExactType) -> NoneFact {
         | PyExactType::Bytes
         | PyExactType::Int
         | PyExactType::Float => NoneFact::IsNotNone,
+    }
+}
+
+fn intersect_type_fact(left: TypeFact, right: TypeFact) -> TypeFact {
+    if left == right {
+        left
+    } else {
+        TypeFact::Unknown
+    }
+}
+
+fn intersect_truthiness_fact(left: TruthinessFact, right: TruthinessFact) -> TruthinessFact {
+    if left == right {
+        left
+    } else {
+        TruthinessFact::Unknown
+    }
+}
+
+fn intersect_none_fact(left: NoneFact, right: NoneFact) -> NoneFact {
+    if left == right {
+        left
+    } else {
+        NoneFact::Unknown
+    }
+}
+
+fn intersect_nullability_fact(
+    left: PyObjectNullabilityFact,
+    right: PyObjectNullabilityFact,
+) -> PyObjectNullabilityFact {
+    if left == right {
+        left
+    } else {
+        PyObjectNullabilityFact::Unknown
+    }
+}
+
+fn intersect_bool_singleton_fact(
+    left: BoolSingletonFact,
+    right: BoolSingletonFact,
+) -> BoolSingletonFact {
+    if left == right {
+        left
+    } else {
+        BoolSingletonFact::Unknown
+    }
+}
+
+fn intersect_refcount_fact(left: RefcountFact, right: RefcountFact) -> RefcountFact {
+    if left == right {
+        left
+    } else {
+        RefcountFact::Unknown
+    }
+}
+
+fn intersect_provenance_fact(left: ProvenanceFact, right: ProvenanceFact) -> ProvenanceFact {
+    if left == right {
+        left
+    } else {
+        ProvenanceFact::Unknown
+    }
+}
+
+fn intersect_callable_fact(left: CallableFact, right: CallableFact) -> CallableFact {
+    if left == right {
+        left
+    } else {
+        CallableFact::Unknown
     }
 }
 
@@ -455,8 +541,52 @@ impl EnvFacts {
     }
 
     pub fn intersect_with(&mut self, other: &Self) {
-        self.local_pyobj_facts
-            .retain(|location, facts| other.local_pyobj_fact(*location) == Some(*facts));
+        self.local_pyobj_facts.retain(|location, facts| {
+            let Some(other_facts) = other.local_pyobj_fact(*location) else {
+                return false;
+            };
+            *facts = facts.intersect(other_facts);
+            !facts.is_uninformative_for_local_env()
+        });
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn env_intersection_preserves_common_pyobject_fields() {
+        let location = LocalLocation(0);
+        let mut left = EnvFacts::default();
+        left.set_local_pyobj_fact(location, PyObjFacts::exact_type(PyExactType::Int));
+        let mut right = EnvFacts::default();
+        right.set_local_pyobj_fact(location, PyObjFacts::known_not_none());
+
+        left.intersect_with(&right);
+
+        let facts = left
+            .local_pyobj_fact(location)
+            .expect("shared non-null fact should survive");
+        assert_eq!(facts.ty, TypeFact::Unknown);
+        assert_eq!(facts.none, NoneFact::IsNotNone);
+        assert_eq!(facts.nullability, PyObjectNullabilityFact::NonNull);
+    }
+
+    #[test]
+    fn env_intersection_drops_uninformative_pyobject_facts() {
+        let location = LocalLocation(0);
+        let mut left = EnvFacts::default();
+        left.set_local_pyobj_fact(
+            location,
+            PyObjFacts::module_constant(1).with_immortal_refcount(),
+        );
+        let mut right = EnvFacts::default();
+        right.set_local_pyobj_fact(location, PyObjFacts::module_constant(2));
+
+        left.intersect_with(&right);
+
+        assert_eq!(left.local_pyobj_fact(location), None);
     }
 }
 

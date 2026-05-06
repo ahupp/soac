@@ -1,12 +1,13 @@
 use super::backend::{compile_prepared_function_bytes_with_isa, define_prepared_function};
 use super::codegen_env::JitCodegenEnv;
+use super::inspection::clif_refcount_family_from_source_loc_bits;
 use super::precompiled_object::{ElfSymbolBinding, ObjectFunctionDefinition};
 use super::symbols::{
     SOAC_RUNTIME_DECREF_SYMBOL, SOAC_RUNTIME_INCREF_SYMBOL, SOAC_RUNTIME_LOAD_GLOBAL_SYMBOL,
     SOAC_RUNTIME_PROBE_FIELD_INDEXED_SYMBOL, SOAC_RUNTIME_PROBE_GLOBAL_INDEXED_SYMBOL,
-    SOAC_RUNTIME_STORE_FIELD_INDEXED_SYMBOL, SOAC_RUNTIME_STORE_GLOBAL_INDEXED_SYMBOL,
-    SOAC_RUNTIME_STORE_GLOBAL_SYMBOL, SOAC_RUNTIME_TUPLE_NEW_SYMBOL,
-    SOAC_RUNTIME_TUPLE_SET_ITEM_STOLEN_SYMBOL,
+    SOAC_RUNTIME_STORE_FIELD_INDEXED_SYMBOL, SOAC_RUNTIME_STORE_GLOBAL_INDEXED_STOLEN_SYMBOL,
+    SOAC_RUNTIME_STORE_GLOBAL_INDEXED_SYMBOL, SOAC_RUNTIME_STORE_GLOBAL_SYMBOL,
+    SOAC_RUNTIME_TUPLE_NEW_SYMBOL, SOAC_RUNTIME_TUPLE_SET_ITEM_STOLEN_SYMBOL,
 };
 use crate::SOAC_JIT_RUNTIME_CLIF;
 use cranelift_codegen::inline::{Inline, InlineCommand};
@@ -63,6 +64,7 @@ impl RuntimeSupportInliner {
                     | SOAC_RUNTIME_PROBE_GLOBAL_INDEXED_SYMBOL
                     | SOAC_RUNTIME_STORE_GLOBAL_SYMBOL
                     | SOAC_RUNTIME_STORE_GLOBAL_INDEXED_SYMBOL
+                    | SOAC_RUNTIME_STORE_GLOBAL_INDEXED_STOLEN_SYMBOL
                     | SOAC_RUNTIME_PROBE_FIELD_INDEXED_SYMBOL
                     | SOAC_RUNTIME_STORE_FIELD_INDEXED_SYMBOL
                     | SOAC_RUNTIME_TUPLE_NEW_SYMBOL
@@ -133,7 +135,7 @@ impl Inline for RuntimeSupportInliner {
     fn inline(
         &mut self,
         caller: &ir::Function,
-        _call_inst: ir::Inst,
+        call_inst: ir::Inst,
         _call_opcode: ir::Opcode,
         callee: ir::FuncRef,
         _call_args: &[ir::Value],
@@ -146,8 +148,20 @@ impl Inline for RuntimeSupportInliner {
         let Some(callee_func) = self.inlineable.get(&user_name) else {
             return InlineCommand::KeepCall;
         };
+        let call_srcloc = caller.srcloc(call_inst);
+        let callee = if clif_refcount_family_from_source_loc_bits(call_srcloc.bits()).is_some() {
+            let mut callee = callee_func.clone();
+            for block in callee.layout.blocks().collect::<Vec<_>>() {
+                for inst in callee.layout.block_insts(block).collect::<Vec<_>>() {
+                    callee.set_srcloc(inst, call_srcloc);
+                }
+            }
+            Cow::Owned(callee)
+        } else {
+            Cow::Borrowed(callee_func)
+        };
         InlineCommand::Inline {
-            callee: Cow::Borrowed(callee_func),
+            callee,
             // We only want to splice these tiny refcount helpers into the caller.
             visit_callee: false,
         }

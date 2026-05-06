@@ -46,11 +46,12 @@ use soac_ir_blockpy::{BlockPyModuleShape, InstrBlockPy, validate_blockpy_instr_i
 mod tests {
     use super::super::direct_abi;
     use super::super::function_targets::collect_planned_typed_call_direct_targets;
+    use super::super::inspection::clif_refcount_family_from_source_loc_bits;
     use super::super::operation_specializations::{
         FieldIndexSpecialization, OptV3ResolvedIndexedFieldAccess,
         owner_type_supports_field_layout_priming, prime_field_index_layout,
     };
-    use super::super::planning::RuntimeBlockParamRepr;
+    use super::super::planning::{PlannedLocalBinding, RuntimeBlockParamRepr};
     use super::super::specialization_profile::{
         DirectCallEmissionScope, planned_optimization_inputs_from_v3_artifacts,
         planned_optimization_inputs_from_v3_artifacts_for_blockpy_module,
@@ -61,36 +62,40 @@ mod tests {
         annotate_typed_indexed_global_accesses,
     };
     use super::super::{
-        BlockPyBlock, ClifBlockDisplayAnnotations, DP_JIT_DECREF_DEALLOC_PRESERVING_ERROR_IMPORT,
-        DP_JIT_DECREF_IMPORT, DP_JIT_DEOPT_RESUME_IMPORT, DP_JIT_INCREF_IMPORT,
-        DP_JIT_PROTOCOL_NEXT_FUNCTION_ID_IMPORT, DP_JIT_PY_CALL_POSITIONAL_THREE_IMPORT,
-        DP_JIT_PY_VECTORCALL_IMPORT, DP_JIT_PYOBJECT_SETATTR_IMPORT,
-        DP_JIT_RECORD_TOP_VALUE_SAMPLE_IMPORT, DirectCallArgPlan, DirectCallArgSource,
-        DirectCallIncompatibility, FUNCTION_ENV_DEOPT_TABLE_PTR_OFFSET, IntFacts, IntRange,
-        JitDeoptExitRef, LocalEnv, LocalEnvEntry, LocalEnvStorage, LocalRefKind, ModuleConstantId,
-        ModuleFuncImports, ObjPtr, ParamBindingFacts, ParsedRuntimeClifFunction,
-        PlannedJitDeoptPointId, PrecompileModuleIndex, PrecompileModuleIndexEntry,
-        ProcessJitEngine, PyLong_Type, RefcountEmitter, RefcountLowering, RelocTypeRef,
-        ResultDemand, SOAC_RUNTIME_DECREF_APPLIED_IMPORT, SOAC_RUNTIME_DECREF_SYMBOL,
+        BlockParamFacts, BlockPyBlock, ClifBlockDisplayAnnotations,
+        DP_JIT_DECREF_DEALLOC_PRESERVING_ERROR_IMPORT, DP_JIT_DECREF_IMPORT,
+        DP_JIT_DEOPT_RESUME_IMPORT, DP_JIT_INCREF_IMPORT, DP_JIT_PROTOCOL_NEXT_FUNCTION_ID_IMPORT,
+        DP_JIT_PY_CALL_POSITIONAL_THREE_IMPORT, DP_JIT_PY_VECTORCALL_IMPORT,
+        DP_JIT_PYOBJECT_SETATTR_IMPORT, DP_JIT_RECORD_TOP_VALUE_SAMPLE_IMPORT, DirectCallArgPlan,
+        DirectCallArgSource, DirectCallIncompatibility, FUNCTION_ENV_DEOPT_TABLE_PTR_OFFSET,
+        IntFacts, IntRange, JitDeoptExitRef, LocalEnv, LocalEnvEntry, LocalEnvStorage,
+        LocalRefKind, ModuleConstantId, ModuleFuncImports, ObjPtr, ParamBindingFacts,
+        ParamProvenance, ParsedRuntimeClifFunction, PlannedJitDeoptPointId,
+        PlannedLocalEnvEntryMaterialization, PlannedLocalEnvEntrySource, PlannedLocalStorage,
+        PrecompileModuleIndex, PrecompileModuleIndexEntry, ProcessJitEngine, PyLong_Type,
+        RefcountEmitter, RefcountFamily, RefcountLowering, RelocTypeRef, ResultDemand,
+        SOAC_RUNTIME_DECREF_APPLIED_IMPORT, SOAC_RUNTIME_DECREF_SYMBOL,
         SOAC_RUNTIME_INCREF_APPLIED_IMPORT, SOAC_RUNTIME_INCREF_SYMBOL,
         SOAC_RUNTIME_PYLONG_AS_I64_SATURATING_SYMBOL, SOAC_RUNTIME_PYLONG_AS_I64_SYMBOL,
         SOAC_RUNTIME_STORE_GLOBAL_IMPORT, SOAC_RUNTIME_STORE_GLOBAL_INDEXED_IMPORT,
-        SOAC_RUNTIME_TUPLE_NEW_IMPORT, SOAC_RUNTIME_TUPLE_SET_ITEM_STOLEN_IMPORT, ValueOwnership,
-        abrupt_kind_tag, apply_profile_typed_block_metadata_to_typed_function,
+        SOAC_RUNTIME_STORE_GLOBAL_INDEXED_STOLEN_SYMBOL, SOAC_RUNTIME_TUPLE_NEW_IMPORT,
+        SOAC_RUNTIME_TUPLE_SET_ITEM_STOLEN_IMPORT, ValueOwnership, abrupt_kind_tag,
+        apply_profile_typed_block_metadata_to_typed_function,
         apply_profile_typed_guard_miss_policy_to_typed_function,
         apply_profile_typed_plans_to_typed_function, build_counted_runtime_refcount_helper,
         collect_typed_guard_miss_deopt_instr_ids, compile_cranelift_run_bb_specialized_cached,
         declare_direct_function, inline_runtime_support_calls,
         local_binding_facts_for_stored_value, local_env_entry_needs_incref_for_forward,
-        local_ref_kind_needs_incref_for_forward, local_ref_kind_needs_incref_for_load,
-        local_ref_kind_needs_refcount_call, module_constant_object_symbol,
-        module_constant_symbol_prefix_for_instance,
+        local_env_entry_py_facts_for_materialization, local_ref_kind_needs_incref_for_forward,
+        local_ref_kind_needs_incref_for_load, local_ref_kind_needs_refcount_call,
+        module_constant_object_symbol, module_constant_symbol_prefix_for_instance,
         module_constant_symbol_prefix_for_module_identity,
         module_constant_symbol_prefix_for_shared_state, new_jit_module,
         persistent_function_id_for_module_function, plan_direct_call_args_for_target,
         plan_typed_v3_jit_module_for_test, precompiled_direct_function_symbol_scope_for_persistent,
         prepare_specialized_typed_function, push_direct_function_module_identity,
-        push_shared_module_symbol_identity, render_pre_inline_clif_for_inspection,
+        push_shared_module_symbol_identity, refcount_family_source_loc_bits,
+        register_runtime_type_for_key, render_pre_inline_clif_for_inspection,
         runtime_primitive_call_static_params_can_satisfy_abi, stable_cranelift_function_hash,
         stable_cranelift_function_name, typed_expr_is_borrowable_from_local_env,
         typed_local_load_direct_result_plan, validate_direct_call_compatibility,
@@ -226,6 +231,28 @@ mod tests {
             local_binding_facts_for_stored_value(ref_kind),
             None,
         )
+    }
+
+    fn planned_local_env_entry(
+        source: PlannedLocalEnvEntrySource,
+    ) -> PlannedLocalEnvEntryMaterialization {
+        PlannedLocalEnvEntryMaterialization {
+            binding: PlannedLocalBinding {
+                name: "x".to_string(),
+                location: LocalLocation(0),
+                storage: PlannedLocalStorage::BlockParam,
+                param_facts: BlockParamFacts {
+                    value: Some(PyObjFacts::known_not_none()),
+                    binding: ParamBindingFacts::DefinitelyBound,
+                    provenance: ParamProvenance::ForwardedLocal(LocalLocation(0)),
+                    ownership: LocalRefKind::Owned,
+                },
+            },
+            entry_aliases: Vec::new(),
+            source,
+            entry_ref_kind: LocalRefKind::Owned,
+            repr: RuntimeBlockParamRepr::PyObject,
+        }
     }
 
     fn local_env_i64_entry(
@@ -1143,7 +1170,7 @@ mod tests {
     }
 
     #[test]
-    fn clif_inspection_renderer_marks_inlined_refcount_shape() {
+    fn clif_inspection_renderer_keeps_inlined_refcount_shape_purposes_specific() {
         let function = build_inlined_refcount_shape_function();
         let rendered = annotate_clif_instruction_purposes(
             &function,
@@ -1153,15 +1180,15 @@ mod tests {
 
         assert!(
             rendered.contains(
-                "; purpose: refcount | inferred | inlined refcount helper/control-flow opcode=load"
+                "; purpose: memory_access | inferred | raw runtime memory access opcode=load"
             ),
-            "refcount load/check block should be classified:\n{rendered}"
+            "refcount-shaped load should keep its specific purpose:\n{rendered}"
         );
         assert!(
             rendered.contains(
-                "; purpose: refcount | inferred | inlined refcount helper/control-flow opcode=store"
+                "; purpose: memory_access | inferred | raw runtime memory access opcode=store"
             ),
-            "refcount update store should be classified:\n{rendered}"
+            "refcount-shaped store should keep its specific purpose:\n{rendered}"
         );
     }
 
@@ -5663,6 +5690,7 @@ def build(values):
                 &[],
                 null_tstate,
                 decref_ref,
+                RefcountFamily::EdgeRelease,
             );
         }));
 
@@ -5729,6 +5757,7 @@ def build(values):
                 &[],
                 null_tstate,
                 decref_ref,
+                RefcountFamily::EdgeRelease,
             );
             fb.ins().return_(&[]);
             fb.seal_all_blocks();
@@ -6140,6 +6169,7 @@ def build(values):
                 incref_ref,
                 decref_ref,
             },
+            family: None,
         }
     }
 
@@ -6841,6 +6871,26 @@ def build(values):
         assert!(
             !local_env_entry_needs_incref_for_forward(&entry, 0, &stack_slots),
             "cleanup-root aliases should forward as borrowed values backed by the root slot"
+        );
+    }
+
+    #[test]
+    fn cleanup_root_block_param_entry_facts_do_not_describe_old_stack_slot() {
+        let block_param_entry =
+            planned_local_env_entry(PlannedLocalEnvEntrySource::BlockParam { param_index: 0 });
+        let stack_slot_entry = planned_local_env_entry(PlannedLocalEnvEntrySource::StackSlotLoad);
+
+        assert_eq!(
+            local_env_entry_py_facts_for_materialization(&block_param_entry, true, true),
+            None
+        );
+        assert_eq!(
+            local_env_entry_py_facts_for_materialization(&block_param_entry, false, true),
+            Some(PyObjFacts::known_not_none())
+        );
+        assert_eq!(
+            local_env_entry_py_facts_for_materialization(&stack_slot_entry, true, true),
+            Some(PyObjFacts::known_not_none())
         );
     }
 
@@ -8798,7 +8848,29 @@ def write_point(point, value):
         function: &ir::Function,
         helpers: &[ir::UserExternalName],
     ) -> usize {
-        let mut count = 0usize;
+        direct_calls_to_runtime_helpers(function, helpers).len()
+    }
+
+    fn count_refcount_family_instructions(
+        function: &ir::Function,
+        family: RefcountFamily,
+    ) -> usize {
+        function
+            .layout
+            .blocks()
+            .flat_map(|block| function.layout.block_insts(block))
+            .filter(|inst| {
+                clif_refcount_family_from_source_loc_bits(function.srcloc(*inst).bits())
+                    == Some(family)
+            })
+            .count()
+    }
+
+    fn direct_calls_to_runtime_helpers(
+        function: &ir::Function,
+        helpers: &[ir::UserExternalName],
+    ) -> Vec<ir::Inst> {
+        let mut calls = Vec::new();
         for block in function.layout.blocks() {
             for inst in function.layout.block_insts(block) {
                 let callee = match function.dfg.insts[inst] {
@@ -8815,11 +8887,11 @@ def write_point(point, value):
                 };
                 let user_name = &function.params.user_named_funcs()[*name_ref];
                 if helpers.contains(user_name) {
-                    count += 1;
+                    calls.push(inst);
                 }
             }
         }
-        count
+        calls
     }
 
     fn user_external_name_for_func_ref(
@@ -14319,8 +14391,6 @@ def f(x):
                 &DP_JIT_DECREF_DEALLOC_PRESERVING_ERROR_IMPORT,
             );
             let lowering = RefcountLowering::Explicit {
-                incref_ref,
-                decref_ref,
                 dealloc_preserving_error_ref: dealloc_ref,
             };
             let tstate = fb.block_params(entry)[0];
@@ -14693,19 +14763,55 @@ def f(x):
     }
 
     #[test]
+    fn jit_runtime_support_inliner_preserves_refcount_family_source_locs() {
+        let (_compile_session, mut jit_module, mut ctx, _wrapper_id, helper_names) =
+            unsafe { build_runtime_refcount_smoke_context() };
+        let family_srcloc = ir::SourceLoc::new(refcount_family_source_loc_bits(
+            RefcountFamily::OwnedTemporary,
+        ));
+        let helper_calls = direct_calls_to_runtime_helpers(&ctx.func, &helper_names);
+        assert_eq!(helper_calls.len(), 2, "expected smoke helper calls");
+        for helper_call in helper_calls {
+            ctx.func.set_srcloc(helper_call, family_srcloc);
+        }
+
+        inline_runtime_support_calls(
+            &mut jit_module,
+            &SoacEnvConfig::default(),
+            &mut ctx,
+            "test runtime support family propagation should run",
+        )
+        .expect("runtime support inliner should succeed");
+
+        let preserved = ctx
+            .func
+            .layout
+            .blocks()
+            .flat_map(|block| ctx.func.layout.block_insts(block))
+            .filter(|inst| ctx.func.srcloc(*inst) == family_srcloc)
+            .count();
+        assert!(
+            preserved > 0,
+            "inlined runtime refcount instructions should retain the callsite family source loc"
+        );
+    }
+
+    #[test]
     fn explicit_refcount_lowering_avoids_direct_incref_and_decref_calls() {
-        let (_compile_session, _jit_module, ctx, _wrapper_id, helper_names) =
-            unsafe { build_explicit_refcount_smoke_context(Some(PyObjFacts::known_not_none())) };
-        assert_eq!(
-            count_direct_calls_to_runtime_helpers(&ctx.func, &helper_names[..2]),
-            0,
-            "explicit lowering should not emit callable incref/decref helpers"
-        );
-        assert_eq!(
-            count_direct_calls_to_runtime_helpers(&ctx.func, &helper_names[2..]),
-            1,
-            "explicit decref lowering should keep one shared dealloc-preserving-error call"
-        );
+        for facts in [None, Some(PyObjFacts::known_not_none())] {
+            let (_compile_session, _jit_module, ctx, _wrapper_id, helper_names) =
+                unsafe { build_explicit_refcount_smoke_context(facts) };
+            assert_eq!(
+                count_direct_calls_to_runtime_helpers(&ctx.func, &helper_names[..2]),
+                0,
+                "explicit lowering should not emit callable incref/decref helpers"
+            );
+            assert_eq!(
+                count_direct_calls_to_runtime_helpers(&ctx.func, &helper_names[2..]),
+                1,
+                "explicit decref lowering should keep one shared dealloc-preserving-error call"
+            );
+        }
     }
 
     #[test]
@@ -14717,8 +14823,8 @@ def f(x):
 
         assert_eq!(
             unknown_ctx.func.layout.blocks().count(),
-            1,
-            "unknown PyObject facts should keep the compact helper-call path"
+            8,
+            "unknown PyObject facts should emit one null-check block per refcount op"
         );
         assert_eq!(
             known_non_null_ctx.func.layout.blocks().count(),
@@ -17312,6 +17418,66 @@ def f(x):
     }
 
     #[test]
+    fn codegen_selects_stolen_indexed_global_store_for_owned_replacement() {
+        let module_name_gen = ModuleNameGen::new(7);
+        let store_source = InstrId::new(13);
+        let function = with_single_test_block(
+            test_function_in_module(&module_name_gen, "global_user"),
+            vec![with_instr_id(
+                assign_stmt(
+                    test_global_name("counter"),
+                    op_expr(Call::new(name_expr(test_global_name("f")), vec![], vec![])),
+                ),
+                store_source,
+            )],
+            ret_term(none_expr()),
+        );
+        let mut module = test_module(module_name_gen, vec![function.clone()]);
+        module.global_names = vec!["counter".to_string()];
+        let module_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+        let blocks = [1usize as ObjPtr];
+        let mut typed_function = lower_blockpy_function_to_typed(function.clone());
+        annotate_typed_indexed_global_accesses(
+            &mut typed_function,
+            &HashMap::from([(
+                store_source,
+                opt_v3_indexed_global_plan(store_source, IndexedGlobalAccessKind::Store),
+            )]),
+        )
+        .expect("indexed-global store plan should attach to typed function");
+        let built = build_test_jit_function_with_constants_and_options(
+            &module,
+            &function,
+            &blocks,
+            &module_constants,
+            BuildSpecializedFunctionOptions {
+                planned_typed_function: Some(typed_function),
+                ..BuildSpecializedFunctionOptions::default()
+            },
+        );
+
+        let borrowed_helper = declared_user_names_for_symbols(
+            &built,
+            &[super::SOAC_RUNTIME_STORE_GLOBAL_INDEXED_SYMBOL],
+        );
+        let stolen_helper = declared_user_names_for_symbols(
+            &built,
+            &[SOAC_RUNTIME_STORE_GLOBAL_INDEXED_STOLEN_SYMBOL],
+        );
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&built.ctx.func, &borrowed_helper),
+            0,
+            "owned replacements should avoid the borrowed indexed-global helper"
+        );
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&built.ctx.func, &stolen_helper),
+            1,
+            "owned replacements should use the stolen indexed-global helper"
+        );
+    }
+
+    #[test]
     fn codegen_does_not_rediscover_indexed_globals_from_profile_counters() {
         let module_name_gen = ModuleNameGen::new(7);
         let load_source = InstrId::new(11);
@@ -19596,6 +19762,169 @@ class Point:
     }
 
     #[test]
+    fn codegen_inlines_indexed_field_store_ownership() {
+        if crate::run_test_in_isolated_process_if_needed(
+            module_path!(),
+            "codegen_inlines_indexed_field_store_ownership",
+        ) {
+            return;
+        }
+        let _guard = crate::python_runtime_test_lock().lock().unwrap();
+        crate::initialize_test_python();
+        Python::attach(|py| {
+            let owner_module = PyModule::from_code(
+                py,
+                c"
+class Point:
+    pass
+",
+                c"field_store_helper_test.py",
+                c"field_store_helper_test",
+            )
+            .expect("owner module should execute");
+            let sys = PyModule::import(py, "sys").expect("sys should import");
+            let modules = sys
+                .getattr("modules")
+                .expect("sys.modules should exist")
+                .cast_into::<pyo3::types::PyDict>()
+                .expect("sys.modules should be a dict");
+            modules
+                .set_item("field_store_helper_test", owner_module.as_any())
+                .expect("owner module should be registered");
+            let point_type = owner_module
+                .getattr("Point")
+                .expect("Point should exist on owner module");
+            register_runtime_type_for_key(
+                &CounterDumpTypeKey {
+                    module_name: "field_store_helper_test".to_string(),
+                    qualname: "Point".to_string(),
+                },
+                point_type.as_ptr().cast(),
+            );
+
+            let build_store = |_module_name: &str,
+                               function_name: &str,
+                               replacement: InstrBlockPy,
+                               params: Vec<Param>,
+                               stack_slots: &[&str]| {
+                let module_name_gen = ModuleNameGen::new(0);
+                let mut constants = TestConstantPool::default();
+                let mut function = test_function_in_module(&module_name_gen, function_name);
+                function.params = ParamSpec { params };
+                let block_label = function.name_gen.next_block_name();
+                let setattr_instr_id = InstrId::new(0);
+                function.blocks = vec![BlockPyBlock {
+                    label: block_label,
+                    body: vec![with_instr_id(
+                        op_expr(SetAttr::new(
+                            name_expr(test_local_name("point", 0)),
+                            constants.string_expr("x"),
+                            replacement,
+                        )),
+                        setattr_instr_id,
+                    )],
+                    term: ret_term(none_expr()),
+                    params: Vec::new(),
+                    exc_edge: None,
+                    extra: Default::default(),
+                }];
+                set_stack_slots(&mut function, stack_slots);
+                let mut module = test_module(module_name_gen, vec![function.clone()]);
+                module.module_constants = constants.module_constants;
+                let mut planned_function = lower_blockpy_function_to_typed(function.clone());
+                annotate_typed_attr_accesses(
+                    &mut planned_function,
+                    &HashMap::from([(
+                        setattr_instr_id,
+                        vec![OptV3ResolvedIndexedFieldAccess {
+                            access: IndexedFieldAccessKind::Store,
+                            attr_name: "x".to_string(),
+                            guard: IndexedFieldGuardKind::OwnerTypeVersionAndFieldIndex,
+                            fallback: IndexedFieldFallbackKind::OriginalAttrAccess,
+                            specialization: FieldIndexSpecialization {
+                                expected_index: 0,
+                                owner_type_ref: RelocTypeRef::TypeKey(CounterDumpTypeKey {
+                                    module_name: "field_store_helper_test".to_string(),
+                                    qualname: "Point".to_string(),
+                                }),
+                                type_version: 1,
+                            },
+                        }],
+                    )]),
+                    &HashMap::new(),
+                    true,
+                )
+                .expect("typed indexed-field store annotation should succeed");
+                let module_constants =
+                    crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+                build_test_jit_function_with_constants_and_options(
+                    &module,
+                    &function,
+                    &[1usize as ObjPtr],
+                    &module_constants,
+                    BuildSpecializedFunctionOptions {
+                        planned_typed_function: Some(planned_function),
+                        ..BuildSpecializedFunctionOptions::default()
+                    },
+                )
+            };
+
+            let owned = build_store(
+                "runtime_typed_v3_indexed_field_owned_store_test",
+                "store_owned",
+                op_expr(Call::new(name_expr(test_global_name("f")), vec![], vec![])),
+                vec![test_param("point", ParamKind::Any, false)],
+                &["point"],
+            );
+            let borrowed = build_store(
+                "runtime_typed_v3_indexed_field_borrowed_store_test",
+                "store_borrowed",
+                name_expr(test_local_name("value", 1)),
+                vec![
+                    test_param("point", ParamKind::Any, false),
+                    test_param("value", ParamKind::Any, false),
+                ],
+                &["point", "value"],
+            );
+
+            assert_eq!(
+                count_refcount_family_instructions(
+                    &owned.ctx.func,
+                    RefcountFamily::ContainerStoreClone,
+                ),
+                0,
+                "owned replacements should transfer directly into the indexed-field slot"
+            );
+            assert!(
+                count_refcount_family_instructions(
+                    &owned.ctx.func,
+                    RefcountFamily::ContainerOverwriteRelease,
+                ) > 0,
+                "indexed-field stores should emit an inline overwrite release path"
+            );
+
+            assert!(
+                count_refcount_family_instructions(
+                    &borrowed.ctx.func,
+                    RefcountFamily::ContainerStoreClone,
+                ) > 0,
+                "borrowed replacements must be cloned before the indexed-field slot owns them"
+            );
+            assert!(
+                count_refcount_family_instructions(
+                    &borrowed.ctx.func,
+                    RefcountFamily::ContainerOverwriteRelease,
+                ) > 0,
+                "borrowed indexed-field stores should still emit the inline overwrite path"
+            );
+
+            modules
+                .del_item("field_store_helper_test")
+                .expect("owner module should be removed");
+        });
+    }
+
+    #[test]
     fn runtime_typed_v3_module_plan_carries_indexed_global_access_shape() {
         let module_name = "runtime_typed_v3_indexed_global_plan_test";
         let module_name_gen = ModuleNameGen::new(0);
@@ -19964,6 +20293,180 @@ class Point:
             count_direct_calls_to_runtime_helpers(&built.ctx.func, &materialize_helpers),
             1,
             "the scalar list index should stay unboxed on the hot exact-list path; only the generic fallback reboxes it"
+        );
+    }
+
+    #[test]
+    fn specialized_jit_exact_list_setitem_steals_owned_replacement() {
+        let module_name = "specialized_exact_list_owned_setitem_test";
+        let module_name_gen = ModuleNameGen::new(0);
+        let mut function = test_function_in_module(&module_name_gen, "replace_first");
+        function.params = ParamSpec {
+            params: vec![
+                test_param("items", ParamKind::Any, false),
+                test_param("index", ParamKind::Any, false),
+            ],
+        };
+        let block_label = function.name_gen.next_block_name();
+        let setitem_instr_id = InstrId::new(0);
+        function.blocks = vec![BlockPyBlock {
+            label: block_label,
+            body: vec![with_instr_id(
+                op_expr(SetItem::new(
+                    name_expr(test_local_name("items", 0)),
+                    name_expr(test_local_name("index", 1)),
+                    op_expr(Call::new(name_expr(test_global_name("f")), vec![], vec![])),
+                )),
+                setitem_instr_id,
+            )],
+            term: ret_term(none_expr()),
+            params: Vec::new(),
+            exc_edge: None,
+            extra: Default::default(),
+        }];
+        set_stack_slots(&mut function, &["items", "index"]);
+        let function_id = function.function_id;
+        let module = test_module(module_name_gen, vec![function.clone()]);
+        let module_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+        let profile = SpecializationProfile {
+            module_name: Some(module_name),
+            counter_dump_path: None,
+            direct_call_emission_scope: DirectCallEmissionScope::AllDirectCallCandidates,
+            opt_v3_emitted_direct_calls: HashMap::new(),
+            opt_v3_emitted_exact_list_items: HashMap::from([(
+                function_id,
+                HashMap::from([(
+                    setitem_instr_id,
+                    OptV3ExactListItemAccessPlan {
+                        source: setitem_instr_id,
+                        access: PlanV3ExactListItemAccessKind::Set,
+                        shape: PlanV3ExactListItemShape::ExactListExactInt,
+                        guard: PlanV3ExactListItemGuardKind::ExactListExactCompactIntInBounds,
+                        fallback: PlanV3ExactListItemFallbackKind::OriginalItemAccess,
+                    },
+                )]),
+            )]),
+            opt_v3_emitted_indexed_fields: HashMap::new(),
+            opt_v3_emitted_indexed_globals: HashMap::new(),
+            opt_v3_exact_int_branch_artifacts: HashMap::new(),
+            behavior_change_indexed_stores: false,
+            profiled_cold_blocks: false,
+            guard_miss_deopt: false,
+        };
+        let module_plan = optimize_blockpy(&module, Some(&profile), &typed_v3_env_config())
+            .expect("typed-v3 module plan should attach exact-list setitem plan");
+        let planned_function = module_plan
+            .module
+            .callable_defs
+            .iter()
+            .find(|candidate| candidate.function_id == function_id)
+            .expect("planned module should include replace_first");
+        let built = build_test_jit_function_with_constants_and_options(
+            &module,
+            &function,
+            &[1usize as ObjPtr],
+            &module_constants,
+            BuildSpecializedFunctionOptions {
+                planned_typed_function: Some(planned_function.clone()),
+                ..BuildSpecializedFunctionOptions::default()
+            },
+        );
+
+        assert_eq!(
+            count_refcount_family_instructions(
+                &built.ctx.func,
+                RefcountFamily::ContainerStoreClone,
+            ),
+            0,
+            "exact-list stores should transfer an owned replacement directly into the list slot"
+        );
+    }
+
+    #[test]
+    fn specialized_jit_exact_list_setitem_clones_borrowed_replacement() {
+        let module_name = "specialized_exact_list_borrowed_setitem_test";
+        let module_name_gen = ModuleNameGen::new(0);
+        let mut function = test_function_in_module(&module_name_gen, "replace_first");
+        function.params = ParamSpec {
+            params: vec![
+                test_param("items", ParamKind::Any, false),
+                test_param("index", ParamKind::Any, false),
+                test_param("replacement", ParamKind::Any, false),
+            ],
+        };
+        let block_label = function.name_gen.next_block_name();
+        let setitem_instr_id = InstrId::new(0);
+        function.blocks = vec![BlockPyBlock {
+            label: block_label,
+            body: vec![with_instr_id(
+                op_expr(SetItem::new(
+                    name_expr(test_local_name("items", 0)),
+                    name_expr(test_local_name("index", 1)),
+                    name_expr(test_local_name("replacement", 2)),
+                )),
+                setitem_instr_id,
+            )],
+            term: ret_term(none_expr()),
+            params: Vec::new(),
+            exc_edge: None,
+            extra: Default::default(),
+        }];
+        set_stack_slots(&mut function, &["items", "index", "replacement"]);
+        let function_id = function.function_id;
+        let module = test_module(module_name_gen, vec![function.clone()]);
+        let module_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+        let profile = SpecializationProfile {
+            module_name: Some(module_name),
+            counter_dump_path: None,
+            direct_call_emission_scope: DirectCallEmissionScope::AllDirectCallCandidates,
+            opt_v3_emitted_direct_calls: HashMap::new(),
+            opt_v3_emitted_exact_list_items: HashMap::from([(
+                function_id,
+                HashMap::from([(
+                    setitem_instr_id,
+                    OptV3ExactListItemAccessPlan {
+                        source: setitem_instr_id,
+                        access: PlanV3ExactListItemAccessKind::Set,
+                        shape: PlanV3ExactListItemShape::ExactListExactInt,
+                        guard: PlanV3ExactListItemGuardKind::ExactListExactCompactIntInBounds,
+                        fallback: PlanV3ExactListItemFallbackKind::OriginalItemAccess,
+                    },
+                )]),
+            )]),
+            opt_v3_emitted_indexed_fields: HashMap::new(),
+            opt_v3_emitted_indexed_globals: HashMap::new(),
+            opt_v3_exact_int_branch_artifacts: HashMap::new(),
+            behavior_change_indexed_stores: false,
+            profiled_cold_blocks: false,
+            guard_miss_deopt: false,
+        };
+        let module_plan = optimize_blockpy(&module, Some(&profile), &typed_v3_env_config())
+            .expect("typed-v3 module plan should attach exact-list setitem plan");
+        let planned_function = module_plan
+            .module
+            .callable_defs
+            .iter()
+            .find(|candidate| candidate.function_id == function_id)
+            .expect("planned module should include replace_first");
+        let built = build_test_jit_function_with_constants_and_options(
+            &module,
+            &function,
+            &[1usize as ObjPtr],
+            &module_constants,
+            BuildSpecializedFunctionOptions {
+                planned_typed_function: Some(planned_function.clone()),
+                ..BuildSpecializedFunctionOptions::default()
+            },
+        );
+
+        assert!(
+            count_refcount_family_instructions(
+                &built.ctx.func,
+                RefcountFamily::ContainerStoreClone,
+            ) > 0,
+            "exact-list stores must still clone borrowed replacements before the slot takes ownership"
         );
     }
 
@@ -23999,6 +24502,34 @@ class Point:
             count_direct_calls_to_runtime_helpers(&built.ctx.func, &vectorcall_helpers),
             0,
             "Tuple should not call a Python helper through vectorcall"
+        );
+    }
+
+    #[test]
+    fn specialized_jit_tuple_instruction_steals_owned_elements() {
+        let blocks = [1usize as ObjPtr];
+        let function = with_single_test_block(
+            test_function(),
+            vec![],
+            ret_term(tuple_expr(vec![
+                op_expr(Call::new(name_expr(test_global_name("f")), vec![], vec![])),
+                op_expr(Call::new(name_expr(test_global_name("g")), vec![], vec![])),
+            ])),
+        );
+        let module = test_module(ModuleNameGen::new(0), vec![function.clone()]);
+        let function = module.callable_defs[0].clone();
+        let module_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+        let built =
+            build_test_jit_function_with_constants(&module, &function, &blocks, &module_constants);
+
+        assert_eq!(
+            count_refcount_family_instructions(
+                &built.ctx.func,
+                RefcountFamily::ForwardedValueClone,
+            ),
+            0,
+            "fresh tuple packing should transfer owned elements instead of cloning them"
         );
     }
 

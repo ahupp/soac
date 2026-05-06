@@ -779,6 +779,38 @@ pub unsafe extern "C" fn soac_runtime_load_global(
     unsafe { soac_runtime_load_global_slow(dict.cast::<c_void>(), key.cast::<c_void>(), index) }
 }
 
+macro_rules! store_global_indexed_body {
+    ($tstate:expr, $dict:expr, $key:expr, $index:expr, $value:expr, $value_is_stolen:expr) => {{
+        let dict_obj = $dict.cast::<RawPyDictObject>();
+        let key = $key.cast::<RawPyObject>();
+        debug_assert!(!dict_obj.is_null());
+        debug_assert!(!key.is_null());
+        debug_assert!(!$value.is_null());
+        debug_assert!($index >= 0);
+
+        if unsafe { dict_guarded_index(dict_obj, $index) } < 0 {
+            return core::ptr::null_mut();
+        }
+        let values = unsafe { (*dict_obj).ma_values.cast::<RawPyDictIndexedValues>() };
+        let old_value = unsafe { indexed_value(values, $index) };
+
+        // BEHAVIOR_CHANGE: this is a raw slot store for verify/apply JIT code.
+        // First insert, insertion order, ma_used, watchers, and versions are skipped.
+        let value = $value.cast::<RawPyObject>();
+        if !$value_is_stolen {
+            unsafe { incref_impl(value) };
+        }
+        unsafe { set_indexed_value(values, $index, value) };
+        if !old_value.is_null()
+            && old_value.cast::<c_void>() != (&raw mut _PyDict_IndexedValueTombstone)
+        {
+            decref_raw_with_tstate!($tstate.cast::<RawPyThreadState>(), old_value);
+        }
+        unsafe { incref_impl(value) };
+        value.cast::<c_void>()
+    }};
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn soac_runtime_store_global_indexed(
     tstate: *mut c_void,
@@ -787,31 +819,18 @@ pub unsafe extern "C" fn soac_runtime_store_global_indexed(
     index: isize,
     value: *mut c_void,
 ) -> *mut c_void {
-    let dict_obj = dict.cast::<RawPyDictObject>();
-    let key = key.cast::<RawPyObject>();
-    debug_assert!(!dict_obj.is_null());
-    debug_assert!(!key.is_null());
-    debug_assert!(!value.is_null());
-    debug_assert!(index >= 0);
+    store_global_indexed_body!(tstate, dict, key, index, value, false)
+}
 
-    if unsafe { dict_guarded_index(dict_obj, index) } < 0 {
-        return core::ptr::null_mut();
-    }
-    let values = unsafe { (*dict_obj).ma_values.cast::<RawPyDictIndexedValues>() };
-    let old_value = unsafe { indexed_value(values, index) };
-
-    // BEHAVIOR_CHANGE: this is a raw slot store for verify/apply JIT code.
-    // First insert, insertion order, ma_used, watchers, and versions are skipped.
-    let value = value.cast::<RawPyObject>();
-    unsafe { incref_impl(value) };
-    unsafe { set_indexed_value(values, index, value) };
-    if !old_value.is_null()
-        && old_value.cast::<c_void>() != (&raw mut _PyDict_IndexedValueTombstone)
-    {
-        decref_raw_with_tstate!(tstate.cast::<RawPyThreadState>(), old_value);
-    }
-    unsafe { incref_impl(value) };
-    value.cast::<c_void>()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soac_runtime_store_global_indexed_stolen(
+    tstate: *mut c_void,
+    dict: *mut c_void,
+    key: *mut c_void,
+    index: isize,
+    value: *mut c_void,
+) -> *mut c_void {
+    store_global_indexed_body!(tstate, dict, key, index, value, true)
 }
 
 #[unsafe(no_mangle)]
@@ -1044,46 +1063,6 @@ pub unsafe extern "C" fn soac_runtime_store_field_indexed(
             unsafe { (*dict).ma_used += 1 };
         }
     } else {
-        decref_raw_with_tstate!(tstate, old_value);
-    }
-    1
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn soac_runtime_store_field_indexed_inline_values_trusted(
-    tstate: *mut c_void,
-    obj: *mut c_void,
-    index: isize,
-    value: *mut c_void,
-) -> i32 {
-    let tstate = tstate.cast::<RawPyThreadState>();
-    let obj = obj.cast::<RawPyObject>();
-    debug_assert!(!tstate.is_null());
-    debug_assert!(!obj.is_null());
-    debug_assert!(!value.is_null());
-    debug_assert!(index >= 0);
-
-    let values = inline_values_for_unmaterialized_field!(obj);
-    if values.is_null() || index < 0 || unsafe { index >= (*values).capacity.into() } {
-        return 0;
-    }
-
-    let old_value = unsafe { split_value(values, index) };
-    let value = value.cast::<RawPyObject>();
-    if old_value.is_null() {
-        let size = unsafe { (*values).size };
-        let capacity = unsafe { (*values).capacity };
-        if size >= capacity || index > u8::MAX as isize {
-            return 0;
-        }
-        unsafe { incref_impl(value) };
-        unsafe { set_split_value(values, index, value) };
-        if !unsafe { add_split_value_to_insertion_order(values, index) } {
-            return 0;
-        }
-    } else {
-        unsafe { incref_impl(value) };
-        unsafe { set_split_value(values, index, value) };
         decref_raw_with_tstate!(tstate, old_value);
     }
     1

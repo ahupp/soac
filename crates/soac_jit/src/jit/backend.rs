@@ -2,10 +2,13 @@ use super::codegen_env::JitCodegenEnv;
 use super::inspection::{
     ClifBlockRole, ClifBlockRoles, ClifFunctionDisplayAliases,
     annotate_clif_instruction_purpose_source_locs, clif_block_role_name_from_source_loc_bits,
-    clif_purpose_name_from_source_loc_bits,
+    clif_purpose_name_from_source_loc_bits, clif_refcount_family_name_from_source_loc_bits,
 };
 #[cfg(test)]
-use super::inspection::{clif_provenance_source_loc_bits, clif_purpose_source_loc_bits};
+use super::inspection::{
+    RefcountFamily, clif_provenance_source_loc_bits, clif_purpose_source_loc_bits,
+    refcount_family_source_loc_bits,
+};
 use super::runtime_support::{
     inline_runtime_support_calls, load_runtime_support_clif_with_debug_symbols,
 };
@@ -114,6 +117,8 @@ pub(super) struct DefinedFunctionArtifact {
     pub(super) code_bb_edges: Vec<(usize, usize)>,
     pub(super) code_purpose_names: Vec<String>,
     pub(super) code_purpose_bytes: Vec<usize>,
+    pub(super) code_refcount_family_names: Vec<String>,
+    pub(super) code_refcount_family_bytes: Vec<usize>,
     pub(super) code_unattributed_bytes: usize,
     pub(super) code_block_role_names: Vec<String>,
     pub(super) code_block_role_attributed_bytes: Vec<usize>,
@@ -308,6 +313,8 @@ fn compile_backend_prepared_function_bytes(
             code_bb_edges,
             code_purpose_names: code_purpose_provenance.purpose_names,
             code_purpose_bytes: code_purpose_provenance.purpose_bytes,
+            code_refcount_family_names: code_purpose_provenance.refcount_family_names,
+            code_refcount_family_bytes: code_purpose_provenance.refcount_family_bytes,
             code_unattributed_bytes: code_purpose_provenance.unattributed_bytes,
             code_block_role_names: code_purpose_provenance.block_role_names,
             code_block_role_attributed_bytes: code_purpose_provenance.block_role_attributed_bytes,
@@ -326,6 +333,8 @@ fn compile_backend_prepared_function_bytes(
 struct CodePurposeProvenance {
     purpose_names: Vec<String>,
     purpose_bytes: Vec<usize>,
+    refcount_family_names: Vec<String>,
+    refcount_family_bytes: Vec<usize>,
     unattributed_bytes: usize,
     block_role_names: Vec<String>,
     block_role_attributed_bytes: Vec<usize>,
@@ -342,6 +351,7 @@ fn collect_code_purpose_provenance(
     srclocs: &[cranelift_codegen::MachSrcLoc<cranelift_codegen::Final>],
 ) -> CodePurposeProvenance {
     let mut bytes_by_purpose = BTreeMap::<&'static str, usize>::new();
+    let mut bytes_by_refcount_family = BTreeMap::<&'static str, usize>::new();
     let mut bytes_by_block_role = BTreeMap::<&'static str, usize>::new();
     let mut bytes_by_block_role_and_purpose =
         BTreeMap::<(&'static str, &'static str), usize>::new();
@@ -349,6 +359,10 @@ fn collect_code_purpose_provenance(
         if let Some(purpose) = clif_purpose_name_from_source_loc_bits(srcloc.loc.bits()) {
             let bytes = (srcloc.end - srcloc.start) as usize;
             *bytes_by_purpose.entry(purpose).or_default() += bytes;
+            if let Some(family) = clif_refcount_family_name_from_source_loc_bits(srcloc.loc.bits())
+            {
+                *bytes_by_refcount_family.entry(family).or_default() += bytes;
+            }
             if let Some(block_role) = clif_block_role_name_from_source_loc_bits(srcloc.loc.bits()) {
                 *bytes_by_block_role.entry(block_role).or_default() += bytes;
                 *bytes_by_block_role_and_purpose
@@ -371,6 +385,19 @@ fn collect_code_purpose_provenance(
         .map(|purpose| {
             bytes_by_purpose
                 .get(purpose.as_str())
+                .copied()
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>();
+    let refcount_family_names = bytes_by_refcount_family
+        .keys()
+        .map(|family| (*family).to_string())
+        .collect::<Vec<_>>();
+    let refcount_family_bytes = refcount_family_names
+        .iter()
+        .map(|family| {
+            bytes_by_refcount_family
+                .get(family.as_str())
                 .copied()
                 .unwrap_or_default()
         })
@@ -484,6 +511,8 @@ fn collect_code_purpose_provenance(
     CodePurposeProvenance {
         purpose_names,
         purpose_bytes,
+        refcount_family_names,
+        refcount_family_bytes,
         unattributed_bytes,
         block_role_names,
         block_role_attributed_bytes,
@@ -521,6 +550,8 @@ mod tests {
 
         assert_eq!(provenance.purpose_names, vec!["deopt", "refcount"]);
         assert_eq!(provenance.purpose_bytes, vec![4, 5]);
+        assert_eq!(provenance.refcount_family_names, Vec::<String>::new());
+        assert_eq!(provenance.refcount_family_bytes, Vec::<usize>::new());
         assert_eq!(provenance.unattributed_bytes, 5);
         assert_eq!(
             provenance.block_role_names,
@@ -545,6 +576,35 @@ mod tests {
             vec![vec![0, 3], vec![3, 2], vec![1, 0]]
         );
         assert_eq!(provenance.bb_unattributed_bytes, vec![2, 0, 3]);
+    }
+
+    #[test]
+    fn code_purpose_provenance_tracks_refcount_family_bytes() {
+        let local_overwrite = cranelift_codegen::MachSrcLoc::<cranelift_codegen::Final> {
+            start: 0,
+            end: 5,
+            loc: ir::SourceLoc::new(refcount_family_source_loc_bits(
+                RefcountFamily::LocalOverwrite,
+            )),
+        };
+        let owned_temporary = cranelift_codegen::MachSrcLoc::<cranelift_codegen::Final> {
+            start: 5,
+            end: 9,
+            loc: ir::SourceLoc::new(refcount_family_source_loc_bits(
+                RefcountFamily::OwnedTemporary,
+            )),
+        };
+
+        let provenance =
+            collect_code_purpose_provenance(9, &[0], &[local_overwrite, owned_temporary]);
+
+        assert_eq!(provenance.purpose_names, vec!["refcount"]);
+        assert_eq!(provenance.purpose_bytes, vec![9]);
+        assert_eq!(
+            provenance.refcount_family_names,
+            vec!["local_overwrite", "owned_temporary"]
+        );
+        assert_eq!(provenance.refcount_family_bytes, vec![5, 4]);
     }
 }
 
@@ -981,6 +1041,8 @@ pub(super) fn record_jit_bb_map(
         "bb_edges": &artifact.code_bb_edges,
         "purpose_names": &artifact.code_purpose_names,
         "purpose_bytes": &artifact.code_purpose_bytes,
+        "refcount_family_names": &artifact.code_refcount_family_names,
+        "refcount_family_bytes": &artifact.code_refcount_family_bytes,
         "unattributed_bytes": artifact.code_unattributed_bytes,
         "block_role_names": &artifact.code_block_role_names,
         "block_role_attributed_bytes": &artifact.code_block_role_attributed_bytes,

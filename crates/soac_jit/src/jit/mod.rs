@@ -243,8 +243,9 @@ use symbols::{
 use symbols::{
     SOAC_RUNTIME_DECREF_SYMBOL, SOAC_RUNTIME_INCREF_SYMBOL,
     SOAC_RUNTIME_PROBE_GLOBAL_INDEXED_SYMBOL, SOAC_RUNTIME_PYLONG_AS_I64_SATURATING_SYMBOL,
-    SOAC_RUNTIME_PYLONG_AS_I64_SYMBOL, SOAC_RUNTIME_STORE_GLOBAL_INDEXED_SYMBOL,
-    push_direct_function_module_identity,
+    SOAC_RUNTIME_PYLONG_AS_I64_SYMBOL, SOAC_RUNTIME_STORE_GLOBAL_INDEXED_STOLEN_SYMBOL,
+    SOAC_RUNTIME_STORE_GLOBAL_INDEXED_SYMBOL, push_direct_function_module_identity,
+    register_runtime_type_for_key,
 };
 #[cfg(test)]
 use typed_pipeline::{
@@ -294,9 +295,8 @@ use imports::{
     SOAC_RUNTIME_BUILTIN_ORD_I64_IMPORT, SOAC_RUNTIME_COMPARE_COMPACT_ASCII_UNICODE_IMPORT,
     SOAC_RUNTIME_LOAD_GLOBAL_IMPORT, SOAC_RUNTIME_LOAD_GLOBAL_SLOW_IMPORT,
     SOAC_RUNTIME_PROBE_GLOBAL_INDEXED_IMPORT, SOAC_RUNTIME_PYLONG_AS_I64_SATURATING_IMPORT,
-    SOAC_RUNTIME_SET_RAISED_EXCEPTION_IMPORT,
-    SOAC_RUNTIME_STORE_FIELD_INDEXED_INLINE_VALUES_TRUSTED_IMPORT,
-    SOAC_RUNTIME_STORE_GLOBAL_IMPORT, SOAC_RUNTIME_STORE_GLOBAL_INDEXED_IMPORT,
+    SOAC_RUNTIME_SET_RAISED_EXCEPTION_IMPORT, SOAC_RUNTIME_STORE_GLOBAL_IMPORT,
+    SOAC_RUNTIME_STORE_GLOBAL_INDEXED_IMPORT, SOAC_RUNTIME_STORE_GLOBAL_INDEXED_STOLEN_IMPORT,
     SOAC_RUNTIME_TUPLE_NEW_IMPORT, SOAC_RUNTIME_TUPLE_SET_ITEM_STOLEN_IMPORT, SigType,
     predeclare_specialization_type_imports,
 };
@@ -304,9 +304,10 @@ use imports::{
 use imports::{SOAC_RUNTIME_DECREF_APPLIED_IMPORT, SOAC_RUNTIME_INCREF_APPLIED_IMPORT};
 use inspection::{
     ClifBlockDisplayAnnotations, ClifBlockRole, ClifBlockRoles, ClifFunctionDisplayAlias,
-    ClifFunctionDisplayAliases, register_block_display_annotation, register_block_role,
-    render_compiled_clif_and_vcode_disasm, render_instr_typed_metadata_index,
-    render_instr_typed_program, render_pre_inline_clif_for_inspection,
+    ClifFunctionDisplayAliases, RefcountFamily, refcount_family_source_loc_bits,
+    register_block_display_annotation, register_block_role, render_compiled_clif_and_vcode_disasm,
+    render_instr_typed_metadata_index, render_instr_typed_program,
+    render_pre_inline_clif_for_inspection,
 };
 pub use inspection::{RenderedSpecializedClif, run_cranelift_smoke};
 #[cfg(test)]
@@ -608,7 +609,9 @@ fn emit_cell_value_load_from_raw_cell(
     let null_ptr = fb.ins().iconst(ptr_ty, 0);
     let value_inst = fb.ins().call(ctx.load_cell_ref, &[cell_obj]);
     let value = fb.inst_results(value_inst)[0];
-    ctx.emit_decref(fb, cell_obj);
+    ctx.refcount_emitter()
+        .with_family(RefcountFamily::OwnedTemporary)
+        .emit_decref(fb, cell_obj, None);
     let value_is_null = fb.ins().icmp(ir::condcodes::IntCC::Equal, value, null_ptr);
     let value_ok_block = fb.create_block();
     fb.append_block_param(value_ok_block, ptr_ty);
@@ -684,7 +687,12 @@ fn emit_codegen_indexed_global_load(
 
     fb.switch_to_block(direct_block);
     let direct_value = fb.block_params(direct_block)[0];
-    ctx.emit_incref(fb, direct_value);
+    ctx.emit_incref_for_family(
+        fb,
+        direct_value,
+        Some(PyObjFacts::unknown().with_non_null_ref()),
+        RefcountFamily::BorrowedResultClone,
+    );
     emit_optional_counter_increment_for_kind(fb, ctx, ctx.global_indexed_hit_counter_ids, instr_id);
     fb.ins()
         .jump(result_block, &[ir::BlockArg::Value(direct_value)]);
@@ -1047,13 +1055,19 @@ fn emit_codegen_super_helper_call_with_local_env(
         );
         fb.ins().call(raise_super_arg_deleted_ref, &[]);
         if !cls_is_borrowed {
-            ctx.emit_decref(fb, cls);
+            ctx.refcount_emitter()
+                .with_family(RefcountFamily::OwnedTemporary)
+                .emit_decref(fb, cls, None);
         }
         if !super_fn_is_borrowed {
-            ctx.emit_decref(fb, super_fn);
+            ctx.refcount_emitter()
+                .with_family(RefcountFamily::OwnedTemporary)
+                .emit_decref(fb, super_fn, None);
         }
         if !callable_is_borrowed {
-            ctx.emit_decref(fb, callable);
+            ctx.refcount_emitter()
+                .with_family(RefcountFamily::OwnedTemporary)
+                .emit_decref(fb, callable, None);
         }
         fb.ins()
             .jump(ctx.consts.step_null_block, &step_null_block_args(ctx));
@@ -1074,19 +1088,22 @@ fn emit_codegen_super_helper_call_with_local_env(
         ],
     );
     if !instance_arg.is_borrowed {
-        fb.ins().call(
-            ctx.decref_ref,
-            &[ctx.consts.thread_state_value, instance_arg.value],
-        );
+        ctx.emit_decref_for_family(fb, instance_arg.value, None, RefcountFamily::OwnedTemporary);
     }
     if !cls_is_borrowed {
-        ctx.emit_decref(fb, cls);
+        ctx.refcount_emitter()
+            .with_family(RefcountFamily::OwnedTemporary)
+            .emit_decref(fb, cls, None);
     }
     if !super_fn_is_borrowed {
-        ctx.emit_decref(fb, super_fn);
+        ctx.refcount_emitter()
+            .with_family(RefcountFamily::OwnedTemporary)
+            .emit_decref(fb, super_fn, None);
     }
     if !callable_is_borrowed {
-        ctx.emit_decref(fb, callable);
+        ctx.refcount_emitter()
+            .with_family(RefcountFamily::OwnedTemporary)
+            .emit_decref(fb, callable, None);
     }
 
     let call_value = fb.inst_results(call_inst)[0];
@@ -1528,8 +1545,6 @@ struct JitEmitCtx<'mc> {
     guard_miss_deopt_instr_ids: &'mc HashSet<InstrId>,
     guard_miss_deopt_without_refcounts_instr_ids: &'mc HashSet<InstrId>,
     guard_miss_resume_point: Option<LocalEnvResumePoint>,
-    store_global_indexed_ref: ir::FuncRef,
-    store_field_indexed_inline_values_trusted_ref: ir::FuncRef,
     load_runtime_obj_by_id_ref: ir::FuncRef,
     enter_recursive_ref: ir::FuncRef,
     direct_compile_function_env_ref: ir::FuncRef,
@@ -1599,16 +1614,26 @@ struct RefcountEmitter {
     ptr_ty: ir::Type,
     thread_state_value: ir::Value,
     lowering: RefcountLowering,
+    family: Option<RefcountFamily>,
 }
 
 impl RefcountEmitter {
+    fn with_family(self, family: RefcountFamily) -> Self {
+        Self {
+            family: Some(family),
+            ..self
+        }
+    }
+
     fn emit_incref(
         self,
         fb: &mut FunctionBuilder<'_>,
         value: ir::Value,
         facts: Option<PyObjFacts>,
     ) {
-        self.lowering.emit_incref(fb, self.ptr_ty, value, facts);
+        with_refcount_family(fb, self.family, |fb| {
+            self.lowering.emit_incref(fb, self.ptr_ty, value, facts);
+        });
     }
 
     fn emit_decref(
@@ -1617,9 +1642,26 @@ impl RefcountEmitter {
         value: ir::Value,
         facts: Option<PyObjFacts>,
     ) {
-        self.lowering
-            .emit_decref(fb, self.ptr_ty, self.thread_state_value, value, facts);
+        with_refcount_family(fb, self.family, |fb| {
+            self.lowering
+                .emit_decref(fb, self.ptr_ty, self.thread_state_value, value, facts);
+        });
     }
+}
+
+fn with_refcount_family<T>(
+    fb: &mut FunctionBuilder<'_>,
+    family: Option<RefcountFamily>,
+    emit: impl FnOnce(&mut FunctionBuilder<'_>) -> T,
+) -> T {
+    let Some(family) = family else {
+        return emit(fb);
+    };
+    let previous_srcloc = fb.srcloc();
+    fb.set_srcloc(ir::SourceLoc::new(refcount_family_source_loc_bits(family)));
+    let result = emit(fb);
+    fb.set_srcloc(previous_srcloc);
+    result
 }
 
 #[derive(Clone, Copy)]
@@ -1996,33 +2038,32 @@ impl JitEmitCtx<'_> {
             ptr_ty: self.consts.ptr_ty,
             thread_state_value: self.consts.thread_state_value,
             lowering: self.refcount_lowering,
+            family: None,
         }
     }
 
-    fn emit_incref(&self, fb: &mut FunctionBuilder<'_>, value: ir::Value) {
-        self.refcount_emitter().emit_incref(fb, value, None);
-    }
-
-    fn emit_incref_with_facts(
+    fn emit_incref_for_family(
         &self,
         fb: &mut FunctionBuilder<'_>,
         value: ir::Value,
-        facts: PyObjFacts,
+        facts: Option<PyObjFacts>,
+        family: RefcountFamily,
     ) {
-        self.refcount_emitter().emit_incref(fb, value, Some(facts));
+        self.refcount_emitter()
+            .with_family(family)
+            .emit_incref(fb, value, facts);
     }
 
-    fn emit_decref(&self, fb: &mut FunctionBuilder<'_>, value: ir::Value) {
-        self.refcount_emitter().emit_decref(fb, value, None);
-    }
-
-    fn emit_decref_with_facts(
+    fn emit_decref_for_family(
         &self,
         fb: &mut FunctionBuilder<'_>,
         value: ir::Value,
-        facts: PyObjFacts,
+        facts: Option<PyObjFacts>,
+        family: RefcountFamily,
     ) {
-        self.refcount_emitter().emit_decref(fb, value, Some(facts));
+        self.refcount_emitter()
+            .with_family(family)
+            .emit_decref(fb, value, facts);
     }
 
     fn value_facts_for_instr_id(&self, instr_id: InstrId) -> Option<ValueFacts> {
@@ -2672,11 +2713,12 @@ impl LocalEnv {
                 ));
             }
             if local_ref_kind_needs_incref_for_load(entry.ref_kind(), borrowed) {
-                if let Some(py_facts) = entry.py_facts() {
-                    ctx.emit_incref_with_facts(fb, value, py_facts);
-                } else {
-                    ctx.emit_incref(fb, value);
-                }
+                ctx.emit_incref_for_family(
+                    fb,
+                    value,
+                    entry.py_facts(),
+                    RefcountFamily::LocalLoadClone,
+                );
             }
             return Some(value);
         }
@@ -2742,11 +2784,12 @@ impl LocalEnv {
                 ));
             }
             if local_ref_kind_needs_incref_for_load(entry.ref_kind(), borrowed) {
-                if let Some(py_facts) = entry.py_facts() {
-                    ctx.emit_incref_with_facts(fb, value, py_facts);
-                } else {
-                    ctx.emit_incref(fb, value);
-                }
+                ctx.emit_incref_for_family(
+                    fb,
+                    value,
+                    entry.py_facts(),
+                    RefcountFamily::LocalLoadClone,
+                );
             }
             return Some(value);
         }
@@ -2796,7 +2839,7 @@ impl LocalEnv {
                         ptr_ty,
                         thread_state_value,
                         decref_ref,
-                        refcounts,
+                        refcounts.with_family(RefcountFamily::LocalOverwrite),
                         previous_entry
                             .as_ref()
                             .and_then(LocalEnvEntry::py_facts)
@@ -2821,7 +2864,12 @@ impl LocalEnv {
             && previous.storage == LocalEnvStorage::LocalOnly
             && transient_local_needs_decref(previous.ref_kind())
         {
-            emit_decref_via_lowering(fb, refcounts, previous.value(), previous.py_facts());
+            emit_decref_via_lowering(
+                fb,
+                refcounts.with_family(RefcountFamily::LocalOverwrite),
+                previous.value(),
+                previous.py_facts(),
+            );
         }
     }
 
@@ -2867,7 +2915,7 @@ impl LocalEnv {
                         ptr_ty,
                         thread_state_value,
                         decref_ref,
-                        refcounts,
+                        refcounts.with_family(RefcountFamily::LocalOverwrite),
                         previous_entry
                             .as_ref()
                             .and_then(LocalEnvEntry::py_facts)
@@ -2891,7 +2939,12 @@ impl LocalEnv {
             && previous.storage == LocalEnvStorage::LocalOnly
             && transient_local_needs_decref(previous.ref_kind())
         {
-            emit_decref_via_lowering(fb, refcounts, previous.value(), previous.py_facts());
+            emit_decref_via_lowering(
+                fb,
+                refcounts.with_family(RefcountFamily::LocalOverwrite),
+                previous.value(),
+                previous.py_facts(),
+            );
         }
     }
 
@@ -2946,7 +2999,7 @@ impl LocalEnv {
                         thread_state_value,
                         incref_ref,
                         decref_ref,
-                        refcounts,
+                        refcounts.with_family(RefcountFamily::LocalOverwrite),
                         previous_entry
                             .as_ref()
                             .and_then(LocalEnvEntry::py_facts)
@@ -2965,13 +3018,18 @@ impl LocalEnv {
                         thread_state_value,
                         incref_ref,
                         decref_ref,
-                        refcounts,
+                        refcounts.with_family(RefcountFamily::LocalOverwrite),
                         previous_entry.as_ref().and_then(LocalEnvEntry::py_facts),
                         refcount_location_counters,
                     )
                     .expect("slot-backed local missing from stack slots");
                 if local_ref_kind_needs_refcount_call(value_ref_kind) {
-                    emit_decref_via_lowering(fb, refcounts, value, py_facts);
+                    emit_decref_via_lowering(
+                        fb,
+                        refcounts.with_family(RefcountFamily::LocalOverwrite),
+                        value,
+                        py_facts,
+                    );
                 }
             }
             self.entries.push(LocalEnvEntry::pyobject(
@@ -3013,7 +3071,7 @@ impl LocalEnv {
                             ptr_ty,
                             thread_state_value,
                             decref_ref,
-                            refcounts,
+                            refcounts.with_family(RefcountFamily::LocalOverwrite),
                             previous_entry
                                 .as_ref()
                                 .and_then(LocalEnvEntry::py_facts)
@@ -3039,7 +3097,12 @@ impl LocalEnv {
         }
         if let Some(previous) = previous_entry {
             if transient_local_needs_decref(previous.ref_kind()) {
-                emit_decref_via_lowering(fb, refcounts, previous.value(), previous.py_facts());
+                emit_decref_via_lowering(
+                    fb,
+                    refcounts.with_family(RefcountFamily::LocalOverwrite),
+                    previous.value(),
+                    previous.py_facts(),
+                );
             }
         }
     }
@@ -3071,7 +3134,12 @@ impl LocalEnv {
         ));
         if let Some(previous) = previous_entry {
             if transient_local_needs_decref(previous.ref_kind()) {
-                emit_decref_via_lowering(fb, refcounts, previous.value(), previous.py_facts());
+                emit_decref_via_lowering(
+                    fb,
+                    refcounts.with_family(RefcountFamily::LocalOverwrite),
+                    previous.value(),
+                    previous.py_facts(),
+                );
             }
         }
     }
@@ -3097,7 +3165,12 @@ impl LocalEnv {
         {
             let previous = self.entries.remove(index);
             if transient_local_needs_decref(previous.ref_kind()) {
-                emit_decref_via_lowering(fb, refcounts, previous.value(), previous.py_facts());
+                emit_decref_via_lowering(
+                    fb,
+                    refcounts.with_family(RefcountFamily::ExplicitDelete),
+                    previous.value(),
+                    previous.py_facts(),
+                );
             }
             Some(previous)
         } else {
@@ -3120,7 +3193,7 @@ impl LocalEnv {
                     ptr_ty,
                     thread_state_value,
                     decref_ref,
-                    refcounts,
+                    refcounts.with_family(RefcountFamily::ExplicitDelete),
                     removed_entry
                         .as_ref()
                         .and_then(LocalEnvEntry::py_facts)
@@ -3237,7 +3310,7 @@ impl LocalEnv {
                     ptr_ty,
                     thread_state_value,
                     decref_ref,
-                    refcounts,
+                    refcounts.with_family(RefcountFamily::LocalOverwrite),
                     previous_entry
                         .as_ref()
                         .and_then(LocalEnvEntry::py_facts)
@@ -3286,7 +3359,12 @@ impl LocalEnv {
         ));
         if let Some(previous) = previous_entry {
             if transient_local_needs_decref(previous.ref_kind()) {
-                emit_decref_via_lowering(fb, refcounts, previous.value(), previous.py_facts());
+                emit_decref_via_lowering(
+                    fb,
+                    refcounts.with_family(RefcountFamily::LocalOverwrite),
+                    previous.value(),
+                    previous.py_facts(),
+                );
             }
         }
         true
@@ -3370,11 +3448,11 @@ fn bind_planned_local_env_at_block_entry(
 ) -> Result<(), String> {
     for entry in &jit_local_plan.entry_materializations[block_index] {
         let binding = &entry.binding;
-        let entry_py_facts = if propagate_entry_py_facts {
-            binding.param_facts.value
-        } else {
-            None
-        };
+        let entry_py_facts = local_env_entry_py_facts_for_materialization(
+            entry,
+            stack_slots.has_cleanup_root_name(binding.name.as_str()),
+            propagate_entry_py_facts,
+        );
         match entry.source {
             PlannedLocalEnvEntrySource::BlockParam { param_index } => {
                 let param_value =
@@ -3490,6 +3568,20 @@ fn bind_planned_local_env_at_block_entry(
     Ok(())
 }
 
+fn local_env_entry_py_facts_for_materialization(
+    entry: &PlannedLocalEnvEntryMaterialization,
+    is_cleanup_root: bool,
+    propagate_entry_py_facts: bool,
+) -> Option<PyObjFacts> {
+    let is_cleanup_root_block_param =
+        matches!(entry.source, PlannedLocalEnvEntrySource::BlockParam { .. }) && is_cleanup_root;
+    if propagate_entry_py_facts && !is_cleanup_root_block_param {
+        entry.binding.param_facts.value
+    } else {
+        None
+    }
+}
+
 fn transient_local_needs_decref(ref_kind: LocalRefKind) -> bool {
     match ref_kind {
         LocalRefKind::Owned | LocalRefKind::Unknown => true,
@@ -3565,7 +3657,12 @@ fn emit_local_env_entry_pyobject_for_forward(
     }
     let value = entry.value();
     if local_env_entry_needs_incref_for_forward(entry, forwarded_count, &ctx.stack_slots) {
-        ctx.emit_incref(fb, value);
+        ctx.emit_incref_for_family(
+            fb,
+            value,
+            entry.py_facts(),
+            RefcountFamily::ForwardedValueClone,
+        );
     }
     value
 }
@@ -4425,15 +4522,9 @@ fn emit_typed_cell_store_result_with_local_env(
     )?;
     let (value, ownership, _) = value.expect_pyobject("typed cell store value");
     let call_inst = fb.ins().call(emit_ctx.store_cell_ref, &[raw_cell, value]);
-    fb.ins().call(
-        emit_ctx.decref_ref,
-        &[emit_ctx.consts.thread_state_value, raw_cell],
-    );
+    emit_ctx.emit_decref_for_family(fb, raw_cell, None, RefcountFamily::OwnedTemporary);
     if ownership.is_owned() {
-        fb.ins().call(
-            emit_ctx.decref_ref,
-            &[emit_ctx.consts.thread_state_value, value],
-        );
+        emit_ctx.emit_decref_for_family(fb, value, None, RefcountFamily::OwnedTemporary);
     }
     let call_value = fb.inst_results(call_inst)[0];
     let mut intrinsic_state = LocalEnvCodegenIntrinsicEmitState {
@@ -4768,7 +4859,12 @@ impl StackSlots {
             .may_hold_owned_reference()
             .then(|| fb.ins().stack_load(ptr_ty, slot, 0));
         if local_ref_kind_needs_refcount_call(value_ref_kind) {
-            emit_incref_via_lowering(fb, refcounts, value, None);
+            emit_incref_via_lowering(
+                fb,
+                refcounts.with_family(RefcountFamily::StackSlotClone),
+                value,
+                None,
+            );
         }
         fb.ins().stack_store(value, slot, 0);
         if let Some(previous) = previous {
@@ -4865,7 +4961,12 @@ impl StackSlots {
             .may_hold_owned_reference()
             .then(|| fb.ins().stack_load(ptr_ty, slot, 0));
         if local_ref_kind_needs_incref_for_stack_slot_transfer(value_ref_kind) {
-            emit_incref_via_lowering(fb, refcounts, value, None);
+            emit_incref_via_lowering(
+                fb,
+                refcounts.with_family(RefcountFamily::StackSlotClone),
+                value,
+                None,
+            );
         }
         fb.ins().stack_store(value, slot, 0);
         if let Some(previous) = previous {
@@ -5039,7 +5140,12 @@ impl StackSlots {
                     counter_parts,
                 );
             }
-            emit_decref_via_lowering(fb, refcounts, value, cleanup_root_facts.get(name).copied());
+            emit_decref_via_lowering(
+                fb,
+                refcounts.with_family(RefcountFamily::ExitSweep),
+                value,
+                cleanup_root_facts.get(name).copied(),
+            );
         }
     }
 }
@@ -5081,6 +5187,19 @@ fn emit_decref_via_lowering(
     facts: Option<PyObjFacts>,
 ) {
     refcounts.emit_decref(fb, value, facts);
+}
+
+fn refcount_family_for_release_reason(reason: &RefcountReleaseReason) -> RefcountFamily {
+    match reason {
+        RefcountReleaseReason::Return => RefcountFamily::ReturnRelease,
+        RefcountReleaseReason::Raise => RefcountFamily::RaiseRelease,
+        RefcountReleaseReason::Jump { .. }
+        | RefcountReleaseReason::IfThen { .. }
+        | RefcountReleaseReason::IfElse { .. }
+        | RefcountReleaseReason::BranchCase { .. }
+        | RefcountReleaseReason::BranchDefault { .. }
+        | RefcountReleaseReason::ExceptionEdge { .. } => RefcountFamily::EdgeRelease,
+    }
 }
 
 #[derive(Clone)]
@@ -5545,7 +5664,7 @@ fn emit_forwarded_block_arg_source_value(
     if let Some(slot) = ctx.stack_slots.slot_for_block_arg_name(source_name) {
         let value = fb.ins().stack_load(ctx.consts.ptr_ty, slot, 0);
         if !ctx.stack_slots.has_cleanup_root_name(source_name) {
-            ctx.emit_incref(fb, value);
+            ctx.emit_incref_for_family(fb, value, None, RefcountFamily::ForwardedValueClone);
         }
         return Ok((value, None));
     }
@@ -5638,14 +5757,24 @@ fn emit_checked_local_value_or_unbound(
         .expect_pyobject("abrupt kind fallthrough materialize")
         .0;
         if !borrowed {
-            ctx.emit_incref(fb, fallthrough_value);
+            ctx.emit_incref_for_family(
+                fb,
+                fallthrough_value,
+                Some(PyObjFacts::unknown().with_non_null_ref()),
+                RefcountFamily::LocalLoadClone,
+            );
         }
         fb.ins()
             .jump(done_block, &[ir::BlockArg::Value(fallthrough_value)]);
 
         fb.switch_to_block(value_ok_block);
         if local_ref_kind_needs_incref_for_load(ref_kind, borrowed) {
-            ctx.emit_incref(fb, value);
+            ctx.emit_incref_for_family(
+                fb,
+                value,
+                Some(PyObjFacts::unknown().with_non_null_ref()),
+                RefcountFamily::LocalLoadClone,
+            );
         }
         fb.ins().jump(done_block, &[ir::BlockArg::Value(value)]);
 
@@ -5680,7 +5809,12 @@ fn emit_checked_local_value_or_unbound(
     fb.switch_to_block(value_ok_block);
     let value = fb.block_params(value_ok_block)[0];
     if local_ref_kind_needs_incref_for_load(ref_kind, borrowed) {
-        ctx.emit_incref(fb, value);
+        ctx.emit_incref_for_family(
+            fb,
+            value,
+            Some(PyObjFacts::unknown().with_non_null_ref()),
+            RefcountFamily::LocalLoadClone,
+        );
     }
     value
 }
@@ -5808,10 +5942,12 @@ fn emit_release_owned_inputs(
     // currently raised exception across any object deallocation it triggers. Error paths can
     // therefore release owned temporaries directly before jumping to `step_null`.
     for owned_input in owned_inputs {
-        fb.ins().call(
-            ctx.decref_ref,
-            &[ctx.consts.thread_state_value, *owned_input],
-        );
+        with_refcount_family(fb, Some(RefcountFamily::OwnedTemporary), |fb| {
+            fb.ins().call(
+                ctx.decref_ref,
+                &[ctx.consts.thread_state_value, *owned_input],
+            );
+        });
     }
 }
 
@@ -5863,7 +5999,9 @@ fn emit_checked_owned_pyobject_result_for_demand(
             );
             fb.switch_to_block(value_ok_block);
             if !facts.is_immortal() {
-                ctx.emit_decref(fb, value);
+                ctx.refcount_emitter()
+                    .with_family(RefcountFamily::OwnedTemporary)
+                    .emit_decref(fb, value, Some(facts));
             }
             EmitResult::no_value()
         }
@@ -6004,7 +6142,12 @@ fn emit_increment_counter(
     // TODO: Split codegen instructions into value-producing vs non-value-producing ops
     // and elide retain/release work when a statement result is not consumed.
     let none_const = emit_none_const(fb, ctx);
-    ctx.emit_incref(fb, none_const);
+    ctx.emit_incref_for_family(
+        fb,
+        none_const,
+        Some(PyObjFacts::none_singleton()),
+        RefcountFamily::ConstantClone,
+    );
     none_const
 }
 
@@ -6146,7 +6289,12 @@ fn emit_raw_closure_cell_object_for_slot(
     );
     fb.switch_to_block(raw_cell_ok_block);
     let raw_cell_value = fb.block_params(raw_cell_ok_block)[0];
-    ctx.emit_incref(fb, raw_cell_value);
+    ctx.emit_incref_for_family(
+        fb,
+        raw_cell_value,
+        None,
+        RefcountFamily::BorrowedResultClone,
+    );
     raw_cell_value
 }
 
@@ -6205,12 +6353,17 @@ fn emit_function_data_slot_borrowed(
 
 fn emit_pack_current_values_tuple(
     fb: &mut FunctionBuilder<'_>,
-    values: &[ir::Value],
+    values: &[(ir::Value, bool)],
     ctx: &JitEmitCtx<'_>,
 ) -> ir::Value {
     if values.is_empty() {
         let empty_tuple_const = emit_empty_tuple_const(fb, ctx);
-        ctx.emit_incref(fb, empty_tuple_const);
+        ctx.emit_incref_for_family(
+            fb,
+            empty_tuple_const,
+            Some(PyObjFacts::unknown().with_non_null_ref()),
+            RefcountFamily::ConstantClone,
+        );
         return empty_tuple_const;
     }
 
@@ -6234,6 +6387,8 @@ fn emit_pack_current_values_tuple(
     );
     fb.switch_to_block(tuple_ok_block);
     let tuple_obj = fb.block_params(tuple_ok_block)[0];
+    let all_borrowed = values.iter().all(|(_, borrowed)| *borrowed);
+    let all_owned = values.iter().all(|(_, borrowed)| !*borrowed);
 
     let slot_size = (values.len() * std::mem::size_of::<u64>()) as u32;
     let stack_slot = fb.create_sized_stack_slot(ir::StackSlotData::new(
@@ -6241,7 +6396,7 @@ fn emit_pack_current_values_tuple(
         slot_size,
         0,
     ));
-    for (index, value) in values.iter().copied().enumerate() {
+    for (index, (value, _)) in values.iter().copied().enumerate() {
         fb.ins().stack_store(
             value,
             stack_slot,
@@ -6249,6 +6404,21 @@ fn emit_pack_current_values_tuple(
         );
     }
     let values_base = fb.ins().stack_addr(ptr_ty, stack_slot, 0);
+    let borrowed_base = if all_borrowed || all_owned {
+        None
+    } else {
+        let borrowed_stack_slot = fb.create_sized_stack_slot(ir::StackSlotData::new(
+            ir::StackSlotKind::ExplicitSlot,
+            values.len() as u32,
+            0,
+        ));
+        for (index, (_, borrowed)) in values.iter().copied().enumerate() {
+            let borrowed_value = fb.ins().iconst(ir::types::I8, i64::from(borrowed));
+            fb.ins()
+                .stack_store(borrowed_value, borrowed_stack_slot, index as i32);
+        }
+        Some(fb.ins().stack_addr(ptr_ty, borrowed_stack_slot, 0))
+    };
 
     let loop_block = fb.create_block();
     fb.append_block_param(loop_block, i64_ty);
@@ -6291,7 +6461,27 @@ fn emit_pack_current_values_tuple(
     let value_offset = fb.ins().ishl_imm(body_index, 3);
     let value_addr = fb.ins().iadd(values_base, value_offset);
     let value = fb.ins().load(ptr_ty, ir::MemFlags::new(), value_addr, 0);
-    ctx.emit_incref(fb, value);
+    if all_borrowed {
+        ctx.emit_incref_for_family(fb, value, None, RefcountFamily::ForwardedValueClone);
+    } else if let Some(borrowed_base) = borrowed_base {
+        let borrowed_addr = fb.ins().iadd(borrowed_base, body_index);
+        let borrowed_value = fb
+            .ins()
+            .load(ir::types::I8, ir::MemFlags::new(), borrowed_addr, 0);
+        let value_is_borrowed =
+            fb.ins()
+                .icmp_imm(ir::condcodes::IntCC::NotEqual, borrowed_value, 0);
+        let owned_block = fb.create_block();
+        let borrowed_block = fb.create_block();
+        fb.ins()
+            .brif(value_is_borrowed, borrowed_block, &[], owned_block, &[]);
+
+        fb.switch_to_block(borrowed_block);
+        ctx.emit_incref_for_family(fb, value, None, RefcountFamily::ForwardedValueClone);
+        fb.ins().jump(owned_block, &[]);
+
+        fb.switch_to_block(owned_block);
+    }
     fb.ins()
         .call(ctx.tuple_set_item_ref, &[body_tuple, body_index, value]);
     let next_index = fb.ins().iadd_imm(body_index, 1);
@@ -6332,15 +6522,11 @@ fn emit_codegen_tuple_with_local_env(
         arg_values.push(value);
         borrowed_args.push(borrowed_arg);
     }
-    let tuple_value = emit_pack_current_values_tuple(fb, arg_values.as_slice(), emit_ctx);
-    for (value, borrowed_arg) in arg_values.into_iter().zip(borrowed_args.into_iter()) {
-        if !borrowed_arg {
-            fb.ins().call(
-                emit_ctx.decref_ref,
-                &[emit_ctx.consts.thread_state_value, value],
-            );
-        }
-    }
+    let tuple_items = arg_values
+        .into_iter()
+        .zip(borrowed_args)
+        .collect::<Vec<_>>();
+    let tuple_value = emit_pack_current_values_tuple(fb, tuple_items.as_slice(), emit_ctx);
     tuple_value
 }
 
@@ -6367,15 +6553,11 @@ fn emit_typed_tuple_with_local_env(
         arg_values.push(value);
         borrowed_args.push(borrowed_arg);
     }
-    let tuple_value = emit_pack_current_values_tuple(fb, arg_values.as_slice(), emit_ctx);
-    for (value, borrowed_arg) in arg_values.into_iter().zip(borrowed_args.into_iter()) {
-        if !borrowed_arg {
-            fb.ins().call(
-                emit_ctx.decref_ref,
-                &[emit_ctx.consts.thread_state_value, value],
-            );
-        }
-    }
+    let tuple_items = arg_values
+        .into_iter()
+        .zip(borrowed_args)
+        .collect::<Vec<_>>();
+    let tuple_value = emit_pack_current_values_tuple(fb, tuple_items.as_slice(), emit_ctx);
     Ok(tuple_value)
 }
 
@@ -6392,7 +6574,7 @@ fn emit_call_args_tuple_from_values(
 
     for (index, (value, borrowed_arg)) in arg_values.iter().enumerate() {
         if *borrowed_arg {
-            ctx.emit_incref(fb, *value);
+            ctx.emit_incref_for_family(fb, *value, None, RefcountFamily::ForwardedValueClone);
         }
         let item_index = fb.ins().iconst(i64_ty, index as i64);
         fb.ins().call(
@@ -6787,9 +6969,13 @@ fn emit_kwargs_setitem_or_cleanup(
     let set_inst = fb
         .ins()
         .call(ctx.pyobject_setitem_ref, &[kwargs_obj, key_obj, value_obj]);
-    ctx.emit_decref(fb, key_obj);
+    ctx.refcount_emitter()
+        .with_family(RefcountFamily::OwnedTemporary)
+        .emit_decref(fb, key_obj, None);
     if !value_borrowed {
-        ctx.emit_decref(fb, value_obj);
+        ctx.refcount_emitter()
+            .with_family(RefcountFamily::OwnedTemporary)
+            .emit_decref(fb, value_obj, None);
     }
     let set_value = fb.inst_results(set_inst)[0];
     let set_failed = fb
@@ -6812,7 +6998,9 @@ fn emit_kwargs_setitem_or_cleanup(
     fb.ins()
         .jump(ctx.consts.step_null_block, &step_null_block_args(ctx));
     fb.switch_to_block(set_ok);
-    ctx.emit_decref(fb, set_value);
+    ctx.refcount_emitter()
+        .with_family(RefcountFamily::OwnedTemporary)
+        .emit_decref(fb, set_value, None);
 }
 
 fn emit_keyword_call_with_local_env(
@@ -7496,9 +7684,13 @@ fn emit_release_owned_pyobject(
         return;
     }
     if let Some(facts) = facts {
-        ctx.emit_decref_with_facts(fb, value, facts);
+        ctx.refcount_emitter()
+            .with_family(RefcountFamily::OwnedTemporary)
+            .emit_decref(fb, value, Some(facts));
     } else {
-        ctx.emit_decref(fb, value);
+        ctx.refcount_emitter()
+            .with_family(RefcountFamily::OwnedTemporary)
+            .emit_decref(fb, value, None);
     }
 }
 
@@ -7713,8 +7905,24 @@ struct RawPyASCIIObjectForJit {
     state: u32,
 }
 
+const MANAGED_DICT_OFFSET: i32 = -3 * (std::mem::size_of::<*mut ffi::PyObject>() as i32);
+const SPLIT_VALUES_CAPACITY_OFFSET: i32 = offset_of!(RawPyDictSplitValuesForJit, capacity) as i32;
+const SPLIT_VALUES_SIZE_OFFSET: i32 = offset_of!(RawPyDictSplitValuesForJit, size) as i32;
+const SPLIT_VALUES_VALID_OFFSET: i32 = offset_of!(RawPyDictSplitValuesForJit, valid) as i32;
+const SPLIT_VALUES_VALUES_OFFSET: i32 = offset_of!(RawPyDictSplitValuesForJit, values) as i32;
+const PYTYPE_TP_BASICSIZE_OFFSET: i32 = offset_of!(ffi::PyTypeObject, tp_basicsize) as i32;
+
+fn split_values_slot_offset(expected_index: u32) -> Result<i32, String> {
+    let slot_offset = i64::from(SPLIT_VALUES_VALUES_OFFSET)
+        + i64::from(expected_index)
+            * i64::try_from(std::mem::size_of::<*mut ffi::PyObject>())
+                .map_err(|_| "pointer size does not fit i64".to_string())?;
+    i32::try_from(slot_offset)
+        .map_err(|_| format!("indexed field offset {slot_offset} does not fit i32"))
+}
+
 #[allow(clippy::too_many_arguments)]
-fn emit_trusted_inline_values_field_probe(
+fn emit_trusted_inline_values_field_values(
     fb: &mut FunctionBuilder<'_>,
     obj: ir::Value,
     owner_type: ir::Value,
@@ -7722,25 +7930,14 @@ fn emit_trusted_inline_values_field_probe(
     hit_block: ir::Block,
     miss_block: ir::Block,
     emit_ctx: &JitEmitCtx<'_>,
-) -> Result<(), String> {
-    const MANAGED_DICT_OFFSET: i32 = -3 * (std::mem::size_of::<*mut ffi::PyObject>() as i32);
-    const SPLIT_VALUES_CAPACITY_OFFSET: i32 =
-        offset_of!(RawPyDictSplitValuesForJit, capacity) as i32;
-    const SPLIT_VALUES_VALID_OFFSET: i32 = offset_of!(RawPyDictSplitValuesForJit, valid) as i32;
-    const SPLIT_VALUES_VALUES_OFFSET: i32 = offset_of!(RawPyDictSplitValuesForJit, values) as i32;
-    const PYTYPE_TP_BASICSIZE_OFFSET: i32 = offset_of!(ffi::PyTypeObject, tp_basicsize) as i32;
-
+) {
     let ptr_ty = emit_ctx.consts.ptr_ty;
     let i64_ty = emit_ctx.consts.i64_ty;
     let null_ptr = fb.ins().iconst(ptr_ty, 0);
     let values_block = fb.create_block();
     let valid_block = fb.create_block();
-    let in_capacity_block = fb.create_block();
-    let load_block = fb.create_block();
     fb.append_block_param(values_block, ptr_ty);
     fb.append_block_param(valid_block, ptr_ty);
-    fb.append_block_param(in_capacity_block, ptr_ty);
-    fb.append_block_param(load_block, ptr_ty);
 
     let materialized_dict =
         fb.ins()
@@ -7797,20 +7994,43 @@ fn emit_trusted_inline_values_field_probe(
     );
     fb.ins().brif(
         index_in_capacity,
-        in_capacity_block,
+        hit_block,
         &[ir::BlockArg::Value(values)],
         miss_block,
         &[],
     );
+}
 
-    fb.switch_to_block(in_capacity_block);
-    let values = fb.block_params(in_capacity_block)[0];
-    let slot_offset = i64::from(SPLIT_VALUES_VALUES_OFFSET)
-        + i64::from(expected_index)
-            * i64::try_from(std::mem::size_of::<*mut ffi::PyObject>())
-                .map_err(|_| "pointer size does not fit i64".to_string())?;
-    let slot_offset = i32::try_from(slot_offset)
-        .map_err(|_| format!("indexed field offset {slot_offset} does not fit i32"))?;
+#[allow(clippy::too_many_arguments)]
+fn emit_trusted_inline_values_field_probe(
+    fb: &mut FunctionBuilder<'_>,
+    obj: ir::Value,
+    owner_type: ir::Value,
+    expected_index: u32,
+    hit_block: ir::Block,
+    miss_block: ir::Block,
+    emit_ctx: &JitEmitCtx<'_>,
+) -> Result<(), String> {
+    let ptr_ty = emit_ctx.consts.ptr_ty;
+    let null_ptr = fb.ins().iconst(ptr_ty, 0);
+    let slot_block = fb.create_block();
+    let value_block = fb.create_block();
+    fb.append_block_param(slot_block, ptr_ty);
+    fb.append_block_param(value_block, ptr_ty);
+
+    emit_trusted_inline_values_field_values(
+        fb,
+        obj,
+        owner_type,
+        expected_index,
+        slot_block,
+        miss_block,
+        emit_ctx,
+    );
+
+    fb.switch_to_block(slot_block);
+    let values = fb.block_params(slot_block)[0];
+    let slot_offset = split_values_slot_offset(expected_index)?;
     let value = fb
         .ins()
         .load(ptr_ty, ir::MemFlags::trusted(), values, slot_offset);
@@ -7819,13 +8039,157 @@ fn emit_trusted_inline_values_field_probe(
         value_is_null,
         miss_block,
         &[],
-        load_block,
+        value_block,
         &[ir::BlockArg::Value(value)],
     );
 
-    fb.switch_to_block(load_block);
-    let value = fb.block_params(load_block)[0];
+    fb.switch_to_block(value_block);
+    let value = fb.block_params(value_block)[0];
     fb.ins().jump(hit_block, &[ir::BlockArg::Value(value)]);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_trusted_inline_values_field_store(
+    fb: &mut FunctionBuilder<'_>,
+    obj: ir::Value,
+    owner_type: ir::Value,
+    expected_index: u32,
+    replacement: ir::Value,
+    replacement_is_borrowed: bool,
+    hit_block: ir::Block,
+    miss_block: ir::Block,
+    emit_ctx: &JitEmitCtx<'_>,
+) -> Result<(), String> {
+    let ptr_ty = emit_ctx.consts.ptr_ty;
+    let i64_ty = emit_ctx.consts.i64_ty;
+    let null_ptr = fb.ins().iconst(ptr_ty, 0);
+    let values_block = fb.create_block();
+    let first_insert_block = fb.create_block();
+    let first_insert_store_block = fb.create_block();
+    let overwrite_block = fb.create_block();
+    fb.append_block_param(values_block, ptr_ty);
+    fb.append_block_param(first_insert_block, ptr_ty);
+    fb.append_block_param(first_insert_store_block, ptr_ty);
+    fb.append_block_param(first_insert_store_block, ir::types::I8);
+    fb.append_block_param(first_insert_store_block, ir::types::I8);
+    fb.append_block_param(overwrite_block, ptr_ty);
+    fb.append_block_param(overwrite_block, ptr_ty);
+
+    emit_trusted_inline_values_field_values(
+        fb,
+        obj,
+        owner_type,
+        expected_index,
+        values_block,
+        miss_block,
+        emit_ctx,
+    );
+
+    fb.switch_to_block(values_block);
+    let values = fb.block_params(values_block)[0];
+    let slot_offset = split_values_slot_offset(expected_index)?;
+    let old_value = fb
+        .ins()
+        .load(ptr_ty, ir::MemFlags::trusted(), values, slot_offset);
+    let old_value_is_null = fb
+        .ins()
+        .icmp(ir::condcodes::IntCC::Equal, old_value, null_ptr);
+    fb.ins().brif(
+        old_value_is_null,
+        first_insert_block,
+        &[ir::BlockArg::Value(values)],
+        overwrite_block,
+        &[ir::BlockArg::Value(values), ir::BlockArg::Value(old_value)],
+    );
+
+    fb.switch_to_block(first_insert_block);
+    let values = fb.block_params(first_insert_block)[0];
+    let size = fb.ins().load(
+        ir::types::I8,
+        ir::MemFlags::trusted(),
+        values,
+        SPLIT_VALUES_SIZE_OFFSET,
+    );
+    let capacity = fb.ins().load(
+        ir::types::I8,
+        ir::MemFlags::trusted(),
+        values,
+        SPLIT_VALUES_CAPACITY_OFFSET,
+    );
+    let has_capacity = fb
+        .ins()
+        .icmp(ir::condcodes::IntCC::UnsignedLessThan, size, capacity);
+    fb.ins().brif(
+        has_capacity,
+        first_insert_store_block,
+        &[
+            ir::BlockArg::Value(values),
+            ir::BlockArg::Value(size),
+            ir::BlockArg::Value(capacity),
+        ],
+        miss_block,
+        &[],
+    );
+
+    fb.switch_to_block(first_insert_store_block);
+    let values = fb.block_params(first_insert_store_block)[0];
+    let size = fb.block_params(first_insert_store_block)[1];
+    let capacity = fb.block_params(first_insert_store_block)[2];
+    if replacement_is_borrowed {
+        emit_ctx.emit_incref_for_family(
+            fb,
+            replacement,
+            Some(PyObjFacts::unknown().with_non_null_ref()),
+            RefcountFamily::ContainerStoreClone,
+        );
+    }
+    fb.ins()
+        .store(ir::MemFlags::trusted(), replacement, values, slot_offset);
+    let capacity = fb.ins().uextend(i64_ty, capacity);
+    let order_offset = fb.ins().imul_imm(
+        capacity,
+        i64::try_from(std::mem::size_of::<*mut ffi::PyObject>())
+            .map_err(|_| "pointer size does not fit i64".to_string())?,
+    );
+    let order_base = fb.ins().iadd(values, order_offset);
+    let order_base = fb
+        .ins()
+        .iadd_imm(order_base, i64::from(SPLIT_VALUES_VALUES_OFFSET));
+    let order_index = fb.ins().uextend(i64_ty, size);
+    let order_addr = fb.ins().iadd(order_base, order_index);
+    let expected_index_u8 = fb.ins().iconst(ir::types::I8, i64::from(expected_index));
+    fb.ins()
+        .store(ir::MemFlags::trusted(), expected_index_u8, order_addr, 0);
+    let next_size = fb.ins().iadd_imm(size, 1);
+    fb.ins().store(
+        ir::MemFlags::trusted(),
+        next_size,
+        values,
+        SPLIT_VALUES_SIZE_OFFSET,
+    );
+    fb.ins().jump(hit_block, &[]);
+
+    fb.switch_to_block(overwrite_block);
+    let values = fb.block_params(overwrite_block)[0];
+    let old_value = fb.block_params(overwrite_block)[1];
+    if replacement_is_borrowed {
+        emit_ctx.emit_incref_for_family(
+            fb,
+            replacement,
+            Some(PyObjFacts::unknown().with_non_null_ref()),
+            RefcountFamily::ContainerStoreClone,
+        );
+    }
+    fb.ins()
+        .store(ir::MemFlags::trusted(), replacement, values, slot_offset);
+    emit_ctx.emit_decref_for_family(
+        fb,
+        old_value,
+        Some(PyObjFacts::unknown().with_non_null_ref()),
+        RefcountFamily::ContainerOverwriteRelease,
+    );
+    fb.ins().jump(hit_block, &[]);
     Ok(())
 }
 
@@ -8408,16 +8772,12 @@ fn emit_direct_call_args_from_plan(
                     start, used_provided_args,
                     "direct-call arg plans should pack the next provided arg"
                 );
-                let tuple = emit_pack_current_values_tuple(fb, &provided_arg_values[start..], ctx);
-                for (value, borrowed) in provided_arg_values[start..]
+                let tuple_items = provided_arg_values[start..]
                     .iter()
                     .copied()
                     .zip(provided_arg_borrowed[start..].iter().copied())
-                {
-                    if !borrowed {
-                        ctx.emit_decref(fb, value);
-                    }
-                }
+                    .collect::<Vec<_>>();
+                let tuple = emit_pack_current_values_tuple(fb, tuple_items.as_slice(), ctx);
                 arg_values.push(tuple);
                 arg_borrowed.push(false);
                 used_provided_args = provided_arg_values.len();
@@ -8761,7 +9121,12 @@ fn emit_planned_target_args_codegen_from_local_env(
             }
             (BlockArg::None, RuntimeBlockParamRepr::PyObject) => {
                 let none_const = emit_none_const(fb, ctx);
-                ctx.emit_incref(fb, none_const);
+                ctx.emit_incref_for_family(
+                    fb,
+                    none_const,
+                    Some(PyObjFacts::none_singleton()),
+                    RefcountFamily::ConstantClone,
+                );
                 none_const
             }
             (BlockArg::CurrentException, RuntimeBlockParamRepr::PyObject) => {
@@ -8794,6 +9159,7 @@ fn emit_decref_unforwarded_local_env(
     preserved_values: &[ir::Value],
     thread_state_value: ir::Value,
     decref_ref: ir::FuncRef,
+    family: RefcountFamily,
 ) {
     #[cfg(debug_assertions)]
     {
@@ -8816,8 +9182,10 @@ fn emit_decref_unforwarded_local_env(
             continue;
         }
         if transient_local_needs_decref(entry.ref_kind()) {
-            fb.ins()
-                .call(decref_ref, &[thread_state_value, entry.value()]);
+            with_refcount_family(fb, Some(family), |fb| {
+                fb.ins()
+                    .call(decref_ref, &[thread_state_value, entry.value()]);
+            });
         }
     }
 }
@@ -8860,7 +9228,9 @@ where
         }
         if is_try_abrupt_payload_name(source_name) {
             let none_const = emit_none_const(fb, ctx);
-            fb.ins().call(incref_ref, &[none_const]);
+            with_refcount_family(fb, Some(RefcountFamily::ConstantClone), |fb| {
+                fb.ins().call(incref_ref, &[none_const]);
+            });
             values.push(none_const);
             continue;
         }
@@ -9018,20 +9388,26 @@ fn emit_exception_dispatch_target_args(
                     .entry(source_name.as_str())
                     .or_insert(0usize);
                 if *forwarded_count > 0 {
-                    emit_incref_if_not_null(fb, ptr_ty, incref_ref, value);
+                    with_refcount_family(fb, Some(RefcountFamily::ForwardedValueClone), |fb| {
+                        emit_incref_if_not_null(fb, ptr_ty, incref_ref, value);
+                    });
                 }
                 *forwarded_count += 1;
                 value
             }
             BlockArg::CurrentException => {
                 if dispatch_exc_forward_count > 0 {
-                    fb.ins().call(incref_ref, &[dispatch_exc]);
+                    with_refcount_family(fb, Some(RefcountFamily::ForwardedValueClone), |fb| {
+                        fb.ins().call(incref_ref, &[dispatch_exc]);
+                    });
                 }
                 dispatch_exc_forward_count += 1;
                 dispatch_exc
             }
             BlockArg::None => {
-                fb.ins().call(incref_ref, &[none_const]);
+                with_refcount_family(fb, Some(RefcountFamily::ConstantClone), |fb| {
+                    fb.ins().call(incref_ref, &[none_const]);
+                });
                 none_const
             }
             BlockArg::AbruptKind(kind) => emit_owned_module_constant_from_parts(
@@ -9288,7 +9664,9 @@ fn emit_planned_local_releases_for_reason_with_local_env_excluding(
                             emit_ctx.consts.thread_state_value,
                             emit_ctx.incref_ref,
                             emit_ctx.decref_ref,
-                            emit_ctx.refcount_emitter(),
+                            emit_ctx
+                                .refcount_emitter()
+                                .with_family(refcount_family_for_release_reason(reason)),
                             None,
                         )
                         .ok_or_else(|| {
@@ -9306,13 +9684,15 @@ fn emit_planned_local_releases_for_reason_with_local_env_excluding(
             && transient_local_needs_decref(previous.ref_kind())
         {
             emit_refcount_decref_location_counter(fb, source_label, local, reason, emit_ctx);
-            emit_decref_if_not_null(
-                fb,
-                emit_ctx.consts.ptr_ty,
-                emit_ctx.decref_ref,
-                emit_ctx.consts.thread_state_value,
-                previous.value(),
-            );
+            with_refcount_family(fb, Some(refcount_family_for_release_reason(reason)), |fb| {
+                emit_decref_if_not_null(
+                    fb,
+                    emit_ctx.consts.ptr_ty,
+                    emit_ctx.decref_ref,
+                    emit_ctx.consts.thread_state_value,
+                    previous.value(),
+                );
+            });
         }
         let should_clear_stack_slot = !is_cleanup_root
             && (removed
@@ -9329,7 +9709,9 @@ fn emit_planned_local_releases_for_reason_with_local_env_excluding(
                     emit_ctx.consts.ptr_ty,
                     emit_ctx.consts.thread_state_value,
                     emit_ctx.decref_ref,
-                    emit_ctx.refcount_emitter(),
+                    emit_ctx
+                        .refcount_emitter()
+                        .with_family(refcount_family_for_release_reason(reason)),
                     removed
                         .as_ref()
                         .and_then(LocalEnvEntry::py_facts),
@@ -9413,7 +9795,7 @@ fn emit_planned_stack_slot_releases_for_reason_from_parts(
                 ptr_ty,
                 thread_state_value,
                 decref_ref,
-                refcounts,
+                refcounts.with_family(refcount_family_for_release_reason(reason)),
                 None,
             )
             .ok_or_else(|| {
@@ -9823,7 +10205,12 @@ fn emit_typed_indexed_getattr(
 
         fb.switch_to_block(direct_block);
         let direct_value = fb.block_params(direct_block)[0];
-        emit_ctx.emit_incref(fb, direct_value);
+        emit_ctx.emit_incref_for_family(
+            fb,
+            direct_value,
+            Some(PyObjFacts::unknown().with_non_null_ref()),
+            RefcountFamily::BorrowedResultClone,
+        );
         if let Some(counter_id) = hit_counter_id {
             emit_increment_counter_ref(fb, counter_id, emit_ctx);
         }
@@ -9873,7 +10260,10 @@ fn emit_typed_indexed_getattr(
 
     fb.switch_to_block(result_block);
     let result = fb.block_params(result_block)[0];
-    Ok(Some(SoacValue::pyobject(result, PyObjFacts::unknown())))
+    Ok(Some(SoacValue::pyobject(
+        result,
+        PyObjFacts::unknown().with_non_null_ref(),
+    )))
 }
 
 fn emit_typed_indexed_setattr(
@@ -9932,13 +10322,16 @@ fn emit_typed_indexed_setattr(
         func_imports,
         "typed indexed setattr replacement",
     )?;
-    let mut owned_inputs = Vec::with_capacity(3);
-    push_owned_typed_input_cleanup(&mut owned_inputs, value, value_is_borrowed);
-    push_owned_typed_input_cleanup(&mut owned_inputs, attr, attr_is_borrowed);
-    push_owned_typed_input_cleanup(&mut owned_inputs, replacement, replacement_is_borrowed);
+    let mut direct_owned_inputs = Vec::with_capacity(2);
+    push_owned_typed_input_cleanup(&mut direct_owned_inputs, value, value_is_borrowed);
+    push_owned_typed_input_cleanup(&mut direct_owned_inputs, attr, attr_is_borrowed);
+    let mut fallback_owned_inputs = direct_owned_inputs.clone();
+    push_owned_typed_input_cleanup(
+        &mut fallback_owned_inputs,
+        replacement,
+        replacement_is_borrowed,
+    );
     let ptr_ty = emit_ctx.consts.ptr_ty;
-    let i64_ty = emit_ctx.consts.i64_ty;
-    let zero_i32 = fb.ins().iconst(emit_ctx.consts.i32_ty, 0);
     let hit_counter_id = typed_indexed_field_counter_ref(
         instr_id,
         counter_source,
@@ -9988,35 +10381,23 @@ fn emit_typed_indexed_setattr(
         } else {
             fb.create_block()
         };
-        let expected_index = fb
-            .ins()
-            .iconst(i64_ty, i64::from(specialization.expected_index));
         let type_matches =
             emit_exact_type_version_match(fb, value, owner_type, specialization.type_version);
         fb.ins()
             .brif(type_matches, maybe_direct_block, &[], next_guard_block, &[]);
 
         fb.switch_to_block(maybe_direct_block);
-        let direct_inst = fb.ins().call(
-            emit_ctx.store_field_indexed_inline_values_trusted_ref,
-            &[
-                emit_ctx.consts.thread_state_value,
-                value,
-                expected_index,
-                replacement,
-            ],
-        );
-        let direct_result = fb.inst_results(direct_inst)[0];
-        let direct_missed = fb
-            .ins()
-            .icmp(ir::condcodes::IntCC::Equal, direct_result, zero_i32);
-        fb.ins().brif(
-            direct_missed,
-            guard_miss_dispatch.branch_block(),
-            &[],
+        emit_trusted_inline_values_field_store(
+            fb,
+            value,
+            owner_type,
+            specialization.expected_index,
+            replacement,
+            replacement_is_borrowed,
             direct_block,
-            &[],
-        );
+            guard_miss_dispatch.branch_block(),
+            emit_ctx,
+        )?;
 
         fb.switch_to_block(direct_block);
         if let Some(counter_id) = hit_counter_id {
@@ -10024,12 +10405,17 @@ fn emit_typed_indexed_setattr(
         }
         if result_needs_pyobject {
             let none_const = emit_none_const(fb, emit_ctx);
-            emit_ctx.emit_incref(fb, none_const);
-            emit_release_owned_inputs(fb, emit_ctx, owned_inputs.as_slice());
+            emit_ctx.emit_incref_for_family(
+                fb,
+                none_const,
+                Some(PyObjFacts::none_singleton()),
+                RefcountFamily::ConstantClone,
+            );
+            emit_release_owned_inputs(fb, emit_ctx, direct_owned_inputs.as_slice());
             fb.ins()
                 .jump(result_block, &[ir::BlockArg::Value(none_const)]);
         } else {
-            emit_release_owned_inputs(fb, emit_ctx, owned_inputs.as_slice());
+            emit_release_owned_inputs(fb, emit_ctx, direct_owned_inputs.as_slice());
             fb.ins().jump(result_block, &[]);
         }
 
@@ -10051,7 +10437,7 @@ fn emit_typed_indexed_setattr(
                 fb,
                 emit_ctx,
                 fb.inst_results(setattr_inst)[0],
-                owned_inputs.as_slice(),
+                fallback_owned_inputs.as_slice(),
             );
             let fallback_result = emit_checked_owned_pyobject_result_for_demand(
                 fb,
@@ -10082,7 +10468,7 @@ fn emit_typed_indexed_setattr(
                 emit_ctx,
                 block,
                 fallback_counter_id,
-                owned_inputs.as_slice(),
+                fallback_owned_inputs.as_slice(),
                 target,
                 deopt_resume_ref,
             );
@@ -10849,23 +11235,16 @@ fn emit_constructor_init_user_arg_values(
                 arg_borrowed.push(user_arg_borrowed[index]);
             }
             ConstructorInitUserArgSource::PackedRest { start } => {
-                arg_values.push(emit_pack_current_values_tuple(
-                    fb,
-                    &user_arg_values[start..],
-                    emit_ctx,
-                ));
-                for (value, borrowed) in user_arg_values[start..]
+                let tuple_items = user_arg_values[start..]
                     .iter()
                     .copied()
                     .zip(user_arg_borrowed[start..].iter().copied())
-                {
-                    if !borrowed {
-                        fb.ins().call(
-                            emit_ctx.decref_ref,
-                            &[emit_ctx.consts.thread_state_value, value],
-                        );
-                    }
-                }
+                    .collect::<Vec<_>>();
+                arg_values.push(emit_pack_current_values_tuple(
+                    fb,
+                    tuple_items.as_slice(),
+                    emit_ctx,
+                ));
                 arg_borrowed.push(false);
             }
         }
@@ -10903,10 +11282,7 @@ fn emit_constructor_entry_allocation_only(
 
     fb.switch_to_block(alloc_failed_block);
     if !cls_is_borrowed {
-        fb.ins().call(
-            emit_ctx.decref_ref,
-            &[emit_ctx.consts.thread_state_value, cls_value],
-        );
+        emit_ctx.emit_decref_for_family(fb, cls_value, None, RefcountFamily::OwnedTemporary);
     }
     fb.ins().jump(
         emit_ctx.consts.step_null_block,
@@ -10916,10 +11292,7 @@ fn emit_constructor_entry_allocation_only(
     fb.switch_to_block(alloc_ok_block);
     let allocated = fb.block_params(alloc_ok_block)[0];
     if !cls_is_borrowed {
-        fb.ins().call(
-            emit_ctx.decref_ref,
-            &[emit_ctx.consts.thread_state_value, cls_value],
-        );
+        emit_ctx.emit_decref_for_family(fb, cls_value, None, RefcountFamily::OwnedTemporary);
     }
     allocated
 }
@@ -11378,7 +11751,12 @@ fn emit_codegen_simple_call_with_local_env(
         && codegen_expr_runtime_helper(call.func.as_ref(), emit_ctx)
             == Some(RuntimeHelperId::Globals)
     {
-        emit_ctx.emit_incref(fb, emit_ctx.consts.block_const);
+        emit_ctx.emit_incref_for_family(
+            fb,
+            emit_ctx.consts.block_const,
+            None,
+            RefcountFamily::ConstantClone,
+        );
         return Some(emit_ctx.consts.block_const);
     }
 
@@ -12476,15 +12854,9 @@ fn emit_codegen_expr_with_local_env(
             func_imports,
         );
         let call_inst = fb.ins().call(emit_ctx.store_cell_ref, &[raw_cell, value]);
-        fb.ins().call(
-            emit_ctx.decref_ref,
-            &[emit_ctx.consts.thread_state_value, raw_cell],
-        );
+        emit_ctx.emit_decref_for_family(fb, raw_cell, None, RefcountFamily::OwnedTemporary);
         if !value_borrowed {
-            fb.ins().call(
-                emit_ctx.decref_ref,
-                &[emit_ctx.consts.thread_state_value, value],
-            );
+            emit_ctx.emit_decref_for_family(fb, value, None, RefcountFamily::OwnedTemporary);
         }
         let call_value = fb.inst_results(call_inst)[0];
         let mut intrinsic_state = LocalEnvCodegenIntrinsicEmitState {
@@ -12583,10 +12955,7 @@ fn emit_discard_soac_value(
         && ownership.is_owned()
         && !facts.is_immortal()
     {
-        fb.ins().call(
-            emit_ctx.decref_ref,
-            &[emit_ctx.consts.thread_state_value, value],
-        );
+        emit_ctx.emit_decref_for_family(fb, value, Some(facts), RefcountFamily::OwnedTemporary);
     }
 }
 
@@ -12608,7 +12977,7 @@ fn emit_soac_value_as_pyobject_for_demand(
             let (value, ownership) = if borrowed_ok {
                 (value, ownership)
             } else {
-                emit_promote_pyobject_to_owned_boundary(fb, value, ownership, emit_ctx)
+                emit_promote_pyobject_to_owned_boundary(fb, value, ownership, facts, emit_ctx)
             };
             SoacValue::pyobject_with_ownership(value, ownership, facts)
         }
@@ -12708,10 +13077,16 @@ fn emit_promote_pyobject_to_owned_boundary(
     fb: &mut FunctionBuilder<'_>,
     value: ir::Value,
     ownership: ValueOwnership,
+    facts: PyObjFacts,
     emit_ctx: &JitEmitCtx<'_>,
 ) -> (ir::Value, ValueOwnership) {
     if matches!(ownership, ValueOwnership::Borrowed) {
-        emit_ctx.emit_incref(fb, value);
+        emit_ctx.emit_incref_for_family(
+            fb,
+            value,
+            Some(facts),
+            RefcountFamily::BorrowedResultClone,
+        );
         return (value, ValueOwnership::Owned);
     }
     (value, ownership)
@@ -14200,7 +14575,12 @@ fn emit_typed_codegen_call_result_with_local_env(
         && simple_args.is_empty()
         && typed_expr_runtime_helper(call.func.as_ref(), emit_ctx) == Some(RuntimeHelperId::Globals)
     {
-        emit_ctx.emit_incref(fb, emit_ctx.consts.block_const);
+        emit_ctx.emit_incref_for_family(
+            fb,
+            emit_ctx.consts.block_const,
+            None,
+            RefcountFamily::ConstantClone,
+        );
         return Ok(Some(emit_owned_pyobject_result_for_demand(
             fb,
             emit_ctx.consts.block_const,
@@ -15334,7 +15714,12 @@ fn emit_typed_codegen_expr_with_local_env(
             facts,
         } => {
             if !borrowed && matches!(ownership, ValueOwnership::Borrowed) {
-                emit_ctx.emit_incref(fb, value);
+                emit_ctx.emit_incref_for_family(
+                    fb,
+                    value,
+                    Some(facts),
+                    RefcountFamily::BorrowedResultClone,
+                );
             }
             debug_assert!(
                 !borrowed || !ownership.is_owned(),
@@ -15363,7 +15748,12 @@ fn emit_typed_codegen_expr_with_local_env(
             let false_const = emit_false_const(fb, emit_ctx);
             let bool_value = fb.ins().select(is_true, true_const, false_const);
             if !borrowed {
-                emit_ctx.emit_incref(fb, bool_value);
+                emit_ctx.emit_incref_for_family(
+                    fb,
+                    bool_value,
+                    None,
+                    RefcountFamily::ConstantClone,
+                );
             }
             bool_value
         }
@@ -15640,9 +16030,11 @@ fn emit_typed_codegen_stmt_result_with_local_env(
         return Ok(match demand {
             ResultDemand::EffectOnly => {
                 if ownership.is_owned() && !facts.is_immortal() {
-                    fb.ins().call(
-                        emit_ctx.decref_ref,
-                        &[emit_ctx.consts.thread_state_value, value],
+                    emit_ctx.emit_decref_for_family(
+                        fb,
+                        value,
+                        Some(facts),
+                        RefcountFamily::OwnedTemporary,
                     );
                 }
                 EmitResult::no_value()
@@ -15762,9 +16154,11 @@ fn emit_typed_codegen_stmt_result_with_local_env(
         return Ok(match demand {
             ResultDemand::EffectOnly => {
                 if ownership.is_owned() && !facts.is_immortal() {
-                    fb.ins().call(
-                        emit_ctx.decref_ref,
-                        &[emit_ctx.consts.thread_state_value, value],
+                    emit_ctx.emit_decref_for_family(
+                        fb,
+                        value,
+                        Some(facts),
+                        RefcountFamily::OwnedTemporary,
                     );
                 }
                 EmitResult::no_value()
@@ -18211,10 +18605,7 @@ fn emit_typed_codegen_i64_index_result_with_local_env(
         )?;
         let callee_id = emit_callee_function_id_checked(fb, callable, emit_ctx, codegen_env);
         if !callable_is_borrowed {
-            fb.ins().call(
-                emit_ctx.decref_ref,
-                &[emit_ctx.consts.thread_state_value, callable],
-            );
+            emit_ctx.emit_decref_for_family(fb, callable, None, RefcountFamily::OwnedTemporary);
         }
         return Ok(EmitResult::i64(callee_id, IntFacts::i64_unknown()));
     }
@@ -18751,6 +19142,7 @@ fn emit_codegen_if_target_arm(
         &[],
         emit_ctx.consts.thread_state_value,
         emit_ctx.decref_ref,
+        refcount_family_for_release_reason(&release_reason),
     );
     emit_pop_handled_exception_if_leaving(
         fb,
@@ -19010,6 +19402,7 @@ fn emit_codegen_return_pyobject_with_unmaterialized_locals(
         &[],
         emit_ctx.consts.thread_state_value,
         emit_ctx.decref_ref,
+        refcount_family_for_release_reason(&release_reason),
     );
     emit_pop_handled_exception_if_leaving(fb, current_exception_name, None, emit_ctx);
     let cleanup_block = emit_ctx
@@ -19114,6 +19507,7 @@ fn emit_codegen_branch_table_from_i64(
             &[],
             emit_ctx.consts.thread_state_value,
             emit_ctx.decref_ref,
+            refcount_family_for_release_reason(&release_reason),
         );
         emit_pop_handled_exception_if_leaving(
             fb,
@@ -19169,6 +19563,7 @@ fn emit_codegen_branch_table_from_i64(
         &[],
         emit_ctx.consts.thread_state_value,
         emit_ctx.decref_ref,
+        refcount_family_for_release_reason(&release_reason),
     );
     emit_pop_handled_exception_if_leaving(
         fb,
@@ -19227,7 +19622,12 @@ fn emit_codegen_raise_exception_from_function(
     let decref_ref = emit_ctx.decref_ref;
 
     let cause_value = emit_none_const(fb, emit_ctx);
-    emit_ctx.emit_incref(fb, cause_value);
+    emit_ctx.emit_incref_for_family(
+        fb,
+        cause_value,
+        Some(PyObjFacts::none_singleton()),
+        RefcountFamily::ConstantClone,
+    );
     let raise_call_inst = fb.ins().call(
         emit_ctx.py_call_positional_three_ref,
         &[
@@ -19302,6 +19702,7 @@ fn emit_codegen_raise_exception_from_function(
         &emit_ctx.consts.step_null_args,
         emit_ctx.consts.thread_state_value,
         decref_ref,
+        refcount_family_for_release_reason(&release_reason),
     );
     emit_pop_handled_exception_if_not_forwarded(
         fb,
@@ -19443,9 +19844,9 @@ fn emit_typed_codegen_term(
                 ));
             }
         };
-        let (ret_value, ownership, _) = result.expect_pyobject("typed return value");
+        let (ret_value, ownership, facts) = result.expect_pyobject("typed return value");
         let (ret_value, ownership) =
-            emit_promote_pyobject_to_owned_boundary(fb, ret_value, ownership, emit_ctx);
+            emit_promote_pyobject_to_owned_boundary(fb, ret_value, ownership, facts, emit_ctx);
         if !ownership.can_satisfy_pyobject_demand(ResultDemand::PYOBJECT_OWNED) {
             return Err(format!(
                 "typed return value produced {ownership:?}, but return requires owned PyObject"
@@ -19486,9 +19887,9 @@ fn emit_typed_codegen_term(
                     ));
                 }
             };
-            let (exc_value, ownership, _) = result.expect_pyobject("typed raise exception");
+            let (exc_value, ownership, facts) = result.expect_pyobject("typed raise exception");
             let (exc_value, ownership) =
-                emit_promote_pyobject_to_owned_boundary(fb, exc_value, ownership, emit_ctx);
+                emit_promote_pyobject_to_owned_boundary(fb, exc_value, ownership, facts, emit_ctx);
             if !ownership.can_satisfy_pyobject_demand(ResultDemand::PYOBJECT_OWNED) {
                 return Err(format!(
                     "typed raise exception produced {ownership:?}, but raise requires owned PyObject"
@@ -19497,7 +19898,12 @@ fn emit_typed_codegen_term(
             (exc_value, ownership)
         } else {
             let none_const = emit_none_const(fb, emit_ctx);
-            emit_ctx.emit_incref(fb, none_const);
+            emit_ctx.emit_incref_for_family(
+                fb,
+                none_const,
+                Some(PyObjFacts::none_singleton()),
+                RefcountFamily::ConstantClone,
+            );
             (none_const, ValueOwnership::Owned)
         };
         return emit_codegen_raise_exception_from_function(
@@ -19604,6 +20010,7 @@ fn emit_typed_codegen_term(
             &[],
             emit_ctx.consts.thread_state_value,
             emit_ctx.decref_ref,
+            refcount_family_for_release_reason(&release_reason),
         );
         emit_pop_handled_exception_if_leaving(
             fb,
@@ -20137,8 +20544,16 @@ fn build_cranelift_run_bb_specialized_function(
         }
         let step_null_block = fb.create_block();
         let raise_exc_direct_block = fb.create_block();
+        let exception_exit_sweep_block = fb.create_block();
+        let exception_exit_post_sweep_decref_block = fb.create_block();
+        let exception_exit_restore_block = fb.create_block();
+        let exception_exit_return_block = fb.create_block();
         fb.set_cold_block(step_null_block);
         fb.set_cold_block(raise_exc_direct_block);
+        fb.set_cold_block(exception_exit_sweep_block);
+        fb.set_cold_block(exception_exit_post_sweep_decref_block);
+        fb.set_cold_block(exception_exit_restore_block);
+        fb.set_cold_block(exception_exit_return_block);
         let mut return_cleanup_blocks_by_key = HashMap::<Vec<String>, ir::Block>::new();
         let mut return_cleanup_blocks_by_label = HashMap::<BlockLabel, ir::Block>::new();
         let mut return_cleanup_block_states = Vec::<(
@@ -20250,6 +20665,50 @@ fn build_cranelift_run_bb_specialized_function(
             "raise_exc_direct",
             vec!["args".into(), "exc".into()],
         );
+        register_block_display_annotation(
+            &mut block_annotations,
+            exception_exit_sweep_block,
+            "cleanup_exception_sweep",
+            vec!["kind".into(), "error".into(), "post_sweep_decref".into()],
+        );
+        register_block_role(
+            &mut block_roles,
+            exception_exit_sweep_block,
+            ClifBlockRole::Cleanup,
+        );
+        register_block_display_annotation(
+            &mut block_annotations,
+            exception_exit_post_sweep_decref_block,
+            "cleanup_exception_post_sweep_decref",
+            vec!["error".into(), "value".into()],
+        );
+        register_block_role(
+            &mut block_roles,
+            exception_exit_post_sweep_decref_block,
+            ClifBlockRole::Cleanup,
+        );
+        register_block_display_annotation(
+            &mut block_annotations,
+            exception_exit_restore_block,
+            "cleanup_exception_restore",
+            vec!["error".into()],
+        );
+        register_block_role(
+            &mut block_roles,
+            exception_exit_restore_block,
+            ClifBlockRole::Cleanup,
+        );
+        register_block_display_annotation(
+            &mut block_annotations,
+            exception_exit_return_block,
+            "cleanup_exception_return",
+            Vec::new(),
+        );
+        register_block_role(
+            &mut block_roles,
+            exception_exit_return_block,
+            ClifBlockRole::Cleanup,
+        );
         for (cleanup_block, key, _, _) in &return_cleanup_block_states {
             let label = if key.is_empty() {
                 "cleanup_return::no_roots".to_string()
@@ -20279,6 +20738,12 @@ fn build_cranelift_run_bb_specialized_function(
         fb.append_block_param(step_null_block, ptr_ty); // args
         fb.append_block_param(raise_exc_direct_block, ptr_ty); // args
         fb.append_block_param(raise_exc_direct_block, ptr_ty); // exc
+        fb.append_block_param(exception_exit_sweep_block, ir::types::I64); // kind
+        fb.append_block_param(exception_exit_sweep_block, ptr_ty); // error
+        fb.append_block_param(exception_exit_sweep_block, ptr_ty); // post_sweep_decref
+        fb.append_block_param(exception_exit_post_sweep_decref_block, ptr_ty); // error
+        fb.append_block_param(exception_exit_post_sweep_decref_block, ptr_ty); // value
+        fb.append_block_param(exception_exit_restore_block, ptr_ty); // error
         for (cleanup_block, _, _, _) in &return_cleanup_block_states {
             fb.append_block_param(*cleanup_block, ptr_ty); // ret
         }
@@ -20330,8 +20795,6 @@ fn build_cranelift_run_bb_specialized_function(
                 &DP_JIT_DECREF_DEALLOC_PRESERVING_ERROR_IMPORT,
             );
             RefcountLowering::Explicit {
-                incref_ref,
-                decref_ref,
                 dealloc_preserving_error_ref,
             }
         };
@@ -20339,6 +20802,7 @@ fn build_cranelift_run_bb_specialized_function(
             ptr_ty,
             thread_state_value,
             lowering: refcount_lowering,
+            family: None,
         };
         let py_call_positional_three_ref = func_imports.get_or_panic(
             codegen_env,
@@ -20397,16 +20861,6 @@ fn build_cranelift_run_bb_specialized_function(
             &guard_miss_deopt_instr_ids,
             guard_miss_deopt_stub_ref.is_some(),
             jit_deopt_resume_plan,
-        );
-        let store_global_indexed_ref = func_imports.get_or_panic(
-            codegen_env,
-            &mut fb.func,
-            &SOAC_RUNTIME_STORE_GLOBAL_INDEXED_IMPORT,
-        );
-        let store_field_indexed_inline_values_trusted_ref = func_imports.get_or_panic(
-            codegen_env,
-            &mut fb.func,
-            &SOAC_RUNTIME_STORE_FIELD_INDEXED_INLINE_VALUES_TRUSTED_IMPORT,
         );
         let load_runtime_obj_by_id_ref = func_imports.get_or_panic(
             codegen_env,
@@ -20569,7 +21023,9 @@ fn build_cranelift_run_bb_specialized_function(
             }
 
             if needs_stack_seed && !needs_runtime_arg && !needs_cleanup_root {
-                emit_incref_if_not_null(&mut fb, ptr_ty, incref_ref, *value);
+                with_refcount_family(&mut fb, Some(RefcountFamily::EntryArgClone), |fb| {
+                    emit_incref_if_not_null(fb, ptr_ty, incref_ref, *value);
+                });
                 stack_slots
                     .replace_cloned_value_counted(
                         &mut fb,
@@ -20595,7 +21051,9 @@ fn build_cranelift_run_bb_specialized_function(
             if needs_runtime_arg {
                 if !should_materialize_cleanup_root && transient_local_needs_decref(entry_ref_kind)
                 {
-                    emit_incref_if_not_null(&mut fb, ptr_ty, incref_ref, *value);
+                    with_refcount_family(&mut fb, Some(RefcountFamily::EntryArgClone), |fb| {
+                        emit_incref_if_not_null(fb, ptr_ty, incref_ref, *value);
+                    });
                 }
                 entry_param_values.insert(param.name.as_str(), *value);
             }
@@ -20778,8 +21236,6 @@ fn build_cranelift_run_bb_specialized_function(
                 guard_miss_deopt_without_refcounts_instr_ids:
                     &guard_miss_deopt_without_refcounts_instr_ids,
                 guard_miss_resume_point: None,
-                store_global_indexed_ref,
-                store_field_indexed_inline_values_trusted_ref,
                 load_runtime_obj_by_id_ref,
                 enter_recursive_ref,
                 direct_compile_function_env_ref,
@@ -21147,24 +21603,16 @@ fn build_cranelift_run_bb_specialized_function(
         if let Some((_, cleanup)) = shared_null_cleanup {
             fb.switch_to_block(cleanup);
             let error_value = fb.block_params(cleanup)[0];
-            stack_slots.decref_all_with_cleanup_root_states_counted(
-                &mut fb,
-                ptr_ty,
-                thread_state_value,
-                decref_ref,
-                refcounts,
-                &cleanup_root_union_exit_state,
-                &cleanup_root_union_exit_facts,
-                Some(RefcountDecrefLocationCounterParts {
-                    counter_refs: &refcount_decref_location_counter_refs,
-                    counter_slots_by_id,
-                    scalar_counter_base_value,
-                }),
-            );
-            fb.ins()
-                .call(set_raised_exception_ref, &[thread_state_value, error_value]);
+            let restore_error = fb.ins().iconst(ir::types::I64, 1);
             let null_ptr = fb.ins().iconst(ptr_ty, 0);
-            fb.ins().return_(&[null_ptr]);
+            fb.ins().jump(
+                exception_exit_sweep_block,
+                &[
+                    ir::BlockArg::Value(restore_error),
+                    ir::BlockArg::Value(error_value),
+                    ir::BlockArg::Value(null_ptr),
+                ],
+            );
         }
 
         for (index, _, cleanup) in &per_exception_null_cleanup_blocks {
@@ -21200,50 +21648,31 @@ fn build_cranelift_run_bb_specialized_function(
                     fb.switch_to_block(done_block);
                 }
             }
-            stack_slots.decref_all_with_cleanup_root_states_counted(
-                &mut fb,
-                ptr_ty,
-                thread_state_value,
-                decref_ref,
-                refcounts,
-                &cleanup_root_union_exit_state,
-                &cleanup_root_union_exit_facts,
-                Some(RefcountDecrefLocationCounterParts {
-                    counter_refs: &refcount_decref_location_counter_refs,
-                    counter_slots_by_id,
-                    scalar_counter_base_value,
-                }),
-            );
-            fb.ins()
-                .call(set_raised_exception_ref, &[thread_state_value, error_value]);
+            let restore_error = fb.ins().iconst(ir::types::I64, 1);
             let null_ptr = fb.ins().iconst(ptr_ty, 0);
-            fb.ins().return_(&[null_ptr]);
+            fb.ins().jump(
+                exception_exit_sweep_block,
+                &[
+                    ir::BlockArg::Value(restore_error),
+                    ir::BlockArg::Value(error_value),
+                    ir::BlockArg::Value(null_ptr),
+                ],
+            );
         }
 
         fb.switch_to_block(step_null_block);
         let step_null_args = fb.block_params(step_null_block)[0];
         let error_value =
             emit_take_current_raised_exception_or_trap(&mut fb, ptr_ty, thread_state_value);
-        stack_slots.decref_all_with_cleanup_root_states_counted(
-            &mut fb,
-            ptr_ty,
-            thread_state_value,
-            decref_ref,
-            refcounts,
-            &cleanup_root_union_exit_state,
-            &cleanup_root_union_exit_facts,
-            Some(RefcountDecrefLocationCounterParts {
-                counter_refs: &refcount_decref_location_counter_refs,
-                counter_slots_by_id,
-                scalar_counter_base_value,
-            }),
+        let restore_error_after_decref = fb.ins().iconst(ir::types::I64, 2);
+        fb.ins().jump(
+            exception_exit_sweep_block,
+            &[
+                ir::BlockArg::Value(restore_error_after_decref),
+                ir::BlockArg::Value(error_value),
+                ir::BlockArg::Value(step_null_args),
+            ],
         );
-        fb.ins()
-            .call(decref_ref, &[thread_state_value, step_null_args]);
-        fb.ins()
-            .call(set_raised_exception_ref, &[thread_state_value, error_value]);
-        let null_ptr = fb.ins().iconst(ptr_ty, 0);
-        fb.ins().return_(&[null_ptr]);
 
         fb.switch_to_block(raise_exc_direct_block);
         let red_args = fb.block_params(raise_exc_direct_block)[0];
@@ -21270,6 +21699,20 @@ fn build_cranelift_run_bb_specialized_function(
         fb.ins().jump(red_done_block, &[]);
         fb.switch_to_block(red_done_block);
         fb.ins().call(decref_ref, &[thread_state_value, red_args]);
+        let keep_current_error = fb.ins().iconst(ir::types::I64, 0);
+        fb.ins().jump(
+            exception_exit_sweep_block,
+            &[
+                ir::BlockArg::Value(keep_current_error),
+                ir::BlockArg::Value(red_null),
+                ir::BlockArg::Value(red_null),
+            ],
+        );
+
+        fb.switch_to_block(exception_exit_sweep_block);
+        let kind = fb.block_params(exception_exit_sweep_block)[0];
+        let error_value = fb.block_params(exception_exit_sweep_block)[1];
+        let post_sweep_decref = fb.block_params(exception_exit_sweep_block)[2];
         stack_slots.decref_all_with_cleanup_root_states_counted(
             &mut fb,
             ptr_ty,
@@ -21284,7 +21727,59 @@ fn build_cranelift_run_bb_specialized_function(
                 scalar_counter_base_value,
             }),
         );
-        fb.ins().return_(&[red_null]);
+        let should_keep_current_error = fb.ins().icmp_imm(ir::condcodes::IntCC::Equal, kind, 0);
+        let restore_or_post_decref_block = fb.create_block();
+        register_block_display_annotation(
+            &mut block_annotations,
+            restore_or_post_decref_block,
+            "cleanup_exception_dispatch",
+            Vec::new(),
+        );
+        register_block_role(
+            &mut block_roles,
+            restore_or_post_decref_block,
+            ClifBlockRole::Cleanup,
+        );
+        fb.ins().brif(
+            should_keep_current_error,
+            exception_exit_return_block,
+            &[],
+            restore_or_post_decref_block,
+            &[],
+        );
+
+        fb.switch_to_block(restore_or_post_decref_block);
+        let should_decref_after_sweep = fb.ins().icmp_imm(ir::condcodes::IntCC::Equal, kind, 2);
+        fb.ins().brif(
+            should_decref_after_sweep,
+            exception_exit_post_sweep_decref_block,
+            &[
+                ir::BlockArg::Value(error_value),
+                ir::BlockArg::Value(post_sweep_decref),
+            ],
+            exception_exit_restore_block,
+            &[ir::BlockArg::Value(error_value)],
+        );
+
+        fb.switch_to_block(exception_exit_post_sweep_decref_block);
+        let error_value = fb.block_params(exception_exit_post_sweep_decref_block)[0];
+        let post_sweep_decref = fb.block_params(exception_exit_post_sweep_decref_block)[1];
+        fb.ins()
+            .call(decref_ref, &[thread_state_value, post_sweep_decref]);
+        fb.ins().jump(
+            exception_exit_restore_block,
+            &[ir::BlockArg::Value(error_value)],
+        );
+
+        fb.switch_to_block(exception_exit_restore_block);
+        let error_value = fb.block_params(exception_exit_restore_block)[0];
+        fb.ins()
+            .call(set_raised_exception_ref, &[thread_state_value, error_value]);
+        fb.ins().jump(exception_exit_return_block, &[]);
+
+        fb.switch_to_block(exception_exit_return_block);
+        let null_ptr = fb.ins().iconst(ptr_ty, 0);
+        fb.ins().return_(&[null_ptr]);
 
         fb.seal_all_blocks();
         fb.finalize();

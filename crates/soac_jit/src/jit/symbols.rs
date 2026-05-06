@@ -148,14 +148,14 @@ pub(super) const SOAC_RUNTIME_PROBE_GLOBAL_INDEXED_SYMBOL: &str =
 pub(super) const SOAC_RUNTIME_STORE_GLOBAL_SYMBOL: &str = "soac_runtime_store_global";
 pub(super) const SOAC_RUNTIME_STORE_GLOBAL_INDEXED_SYMBOL: &str =
     "soac_runtime_store_global_indexed";
+pub(super) const SOAC_RUNTIME_STORE_GLOBAL_INDEXED_STOLEN_SYMBOL: &str =
+    "soac_runtime_store_global_indexed_stolen";
 pub(super) const SOAC_RUNTIME_PROBE_FIELD_INDEXED_SYMBOL: &str = "soac_runtime_probe_field_indexed";
 pub(super) const SOAC_RUNTIME_STORE_FIELD_INDEXED_SYMBOL: &str = "soac_runtime_store_field_indexed";
 pub(super) const SOAC_RUNTIME_PROBE_FIELD_INDEXED_INLINE_VALUES_SYMBOL: &str =
     "soac_runtime_probe_field_indexed_inline_values";
 pub(super) const SOAC_RUNTIME_STORE_FIELD_INDEXED_INLINE_VALUES_SYMBOL: &str =
     "soac_runtime_store_field_indexed_inline_values";
-pub(super) const SOAC_RUNTIME_STORE_FIELD_INDEXED_INLINE_VALUES_TRUSTED_SYMBOL: &str =
-    "soac_runtime_store_field_indexed_inline_values_trusted";
 pub(super) const SOAC_RUNTIME_COMPARE_COMPACT_ASCII_UNICODE_SYMBOL: &str =
     "soac_runtime_compare_compact_ascii_unicode";
 pub(super) const SOAC_RUNTIME_TUPLE_NEW_SYMBOL: &str = "soac_runtime_tuple_new";

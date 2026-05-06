@@ -43,6 +43,47 @@ pub(super) enum ClifBlockRole {
     RefcountSupport,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(super) enum RefcountFamily {
+    LocalOverwrite,
+    ExplicitDelete,
+    EdgeRelease,
+    ReturnRelease,
+    RaiseRelease,
+    OwnedTemporary,
+    ContainerOverwriteRelease,
+    ExitSweep,
+    LocalLoadClone,
+    ForwardedValueClone,
+    StackSlotClone,
+    BorrowedResultClone,
+    ContainerStoreClone,
+    ConstantClone,
+    EntryArgClone,
+}
+
+impl RefcountFamily {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalOverwrite => "local_overwrite",
+            Self::ExplicitDelete => "explicit_delete",
+            Self::EdgeRelease => "edge_release",
+            Self::ReturnRelease => "return_release",
+            Self::RaiseRelease => "raise_release",
+            Self::OwnedTemporary => "owned_temporary",
+            Self::ContainerOverwriteRelease => "container_overwrite_release",
+            Self::ExitSweep => "exit_sweep",
+            Self::LocalLoadClone => "local_load_clone",
+            Self::ForwardedValueClone => "forwarded_value_clone",
+            Self::StackSlotClone => "stack_slot_clone",
+            Self::BorrowedResultClone => "borrowed_result_clone",
+            Self::ContainerStoreClone => "container_store_clone",
+            Self::ConstantClone => "constant_clone",
+            Self::EntryArgClone => "entry_arg_clone",
+        }
+    }
+}
+
 impl ClifBlockRole {
     pub(super) fn as_str(self) -> &'static str {
         match self {
@@ -128,14 +169,41 @@ const CLIF_BLOCK_ROLES: &[ClifBlockRole] = &[
     ClifBlockRole::RefcountSupport,
 ];
 
+const CLIF_REFCOUNT_FAMILIES: &[RefcountFamily] = &[
+    RefcountFamily::LocalOverwrite,
+    RefcountFamily::ExplicitDelete,
+    RefcountFamily::EdgeRelease,
+    RefcountFamily::ReturnRelease,
+    RefcountFamily::RaiseRelease,
+    RefcountFamily::OwnedTemporary,
+    RefcountFamily::ContainerOverwriteRelease,
+    RefcountFamily::ExitSweep,
+    RefcountFamily::LocalLoadClone,
+    RefcountFamily::ForwardedValueClone,
+    RefcountFamily::StackSlotClone,
+    RefcountFamily::BorrowedResultClone,
+    RefcountFamily::ContainerStoreClone,
+    RefcountFamily::ConstantClone,
+    RefcountFamily::EntryArgClone,
+];
+
 #[cfg(test)]
 pub(super) fn clif_purpose_source_loc_bits(primary: &str) -> Option<u32> {
     clif_provenance_source_loc_bits(primary, ClifBlockRole::Ordinary)
 }
 
+#[cfg(test)]
 pub(super) fn clif_provenance_source_loc_bits(
     primary: &str,
     block_role: ClifBlockRole,
+) -> Option<u32> {
+    clif_provenance_source_loc_bits_with_refcount_family(primary, block_role, None)
+}
+
+fn clif_provenance_source_loc_bits_with_refcount_family(
+    primary: &str,
+    block_role: ClifBlockRole,
+    refcount_family: Option<RefcountFamily>,
 ) -> Option<u32> {
     let purpose_index = CLIF_PURPOSE_NAMES
         .iter()
@@ -143,28 +211,68 @@ pub(super) fn clif_provenance_source_loc_bits(
     let role_index = CLIF_BLOCK_ROLES
         .iter()
         .position(|candidate| *candidate == block_role)?;
+    let family_index = match refcount_family {
+        Some(family) => {
+            CLIF_REFCOUNT_FAMILIES
+                .iter()
+                .position(|candidate| *candidate == family)?
+                + 1
+        }
+        None => 0,
+    };
+    let base_provenance_count = CLIF_PURPOSE_NAMES.len() * CLIF_BLOCK_ROLES.len();
     Some(
         CLIF_PURPOSE_SOURCE_LOC_BASE
-            + (role_index * CLIF_PURPOSE_NAMES.len() + purpose_index) as u32,
+            + (family_index * base_provenance_count
+                + role_index * CLIF_PURPOSE_NAMES.len()
+                + purpose_index) as u32,
     )
 }
 
-fn clif_provenance_from_source_loc_bits(bits: u32) -> Option<(&'static str, ClifBlockRole)> {
+pub(super) fn refcount_family_source_loc_bits(family: RefcountFamily) -> u32 {
+    clif_provenance_source_loc_bits_with_refcount_family(
+        "refcount",
+        ClifBlockRole::Ordinary,
+        Some(family),
+    )
+    .expect("refcount family source loc should exist")
+}
+
+fn clif_provenance_from_source_loc_bits(
+    bits: u32,
+) -> Option<(&'static str, ClifBlockRole, Option<RefcountFamily>)> {
     let provenance_index = bits.checked_sub(CLIF_PURPOSE_SOURCE_LOC_BASE)? as usize;
-    let purpose_index = provenance_index % CLIF_PURPOSE_NAMES.len();
-    let role_index = provenance_index / CLIF_PURPOSE_NAMES.len();
+    let base_provenance_count = CLIF_PURPOSE_NAMES.len() * CLIF_BLOCK_ROLES.len();
+    let family_index = provenance_index / base_provenance_count;
+    let base_index = provenance_index % base_provenance_count;
+    let purpose_index = base_index % CLIF_PURPOSE_NAMES.len();
+    let role_index = base_index / CLIF_PURPOSE_NAMES.len();
+    let refcount_family = if family_index == 0 {
+        None
+    } else {
+        Some(*CLIF_REFCOUNT_FAMILIES.get(family_index - 1)?)
+    };
     Some((
         CLIF_PURPOSE_NAMES.get(purpose_index).copied()?,
         *CLIF_BLOCK_ROLES.get(role_index)?,
+        refcount_family,
     ))
 }
 
 pub(super) fn clif_block_role_name_from_source_loc_bits(bits: u32) -> Option<&'static str> {
-    clif_provenance_from_source_loc_bits(bits).map(|(_, role)| role.as_str())
+    clif_provenance_from_source_loc_bits(bits).map(|(_, role, _)| role.as_str())
 }
 
 pub(super) fn clif_purpose_name_from_source_loc_bits(bits: u32) -> Option<&'static str> {
-    clif_provenance_from_source_loc_bits(bits).map(|(purpose, _)| purpose)
+    clif_provenance_from_source_loc_bits(bits).map(|(purpose, _, _)| purpose)
+}
+
+pub(super) fn clif_refcount_family_from_source_loc_bits(bits: u32) -> Option<RefcountFamily> {
+    clif_provenance_from_source_loc_bits(bits).and_then(|(_, _, family)| family)
+}
+
+pub(super) fn clif_refcount_family_name_from_source_loc_bits(bits: u32) -> Option<&'static str> {
+    clif_refcount_family_from_source_loc_bits(bits).map(RefcountFamily::as_str)
 }
 
 fn clif_block_role_for_block(block_roles: &ClifBlockRoles, block: ir::Block) -> ClifBlockRole {
@@ -195,8 +303,19 @@ pub(super) fn annotate_clif_instruction_purpose_source_locs(
             clif_block_role_for_block(block_roles, block)
         };
         for inst in func.layout.block_insts(block).collect::<Vec<_>>() {
-            let purpose = purpose_for_instruction(func, function_aliases, inst, in_refcount_block);
-            let Some(bits) = clif_provenance_source_loc_bits(purpose.primary, block_role) else {
+            let existing_family =
+                clif_refcount_family_from_source_loc_bits(func.srcloc(inst).bits());
+            let purpose = purpose_for_instruction(func, function_aliases, inst);
+            let primary = if existing_family.is_some() {
+                "refcount"
+            } else {
+                purpose.primary
+            };
+            let Some(bits) = clif_provenance_source_loc_bits_with_refcount_family(
+                primary,
+                block_role,
+                existing_family,
+            ) else {
                 continue;
             };
             func.set_srcloc(inst, ir::SourceLoc::new(bits));
@@ -441,30 +560,13 @@ fn purpose_for_instruction(
     func: &ir::Function,
     function_aliases: &ClifFunctionDisplayAliases,
     inst: ir::Inst,
-    in_refcount_block: bool,
 ) -> ClifInstructionPurpose {
     if let Some(target) = call_instruction_target(func, function_aliases, inst) {
-        let purpose = purpose_for_helper_call(&target);
-        if in_refcount_block && purpose.primary == "runtime_helper" {
-            return ClifInstructionPurpose::inferred(
-                "refcount",
-                format!(
-                    "runtime helper reached from inlined refcount sequence helper={}",
-                    target.display_name
-                ),
-            );
-        }
-        return purpose;
+        return purpose_for_helper_call(&target);
     }
 
     let data = &func.dfg.insts[inst];
     let opcode = data.opcode().to_string();
-    if in_refcount_block {
-        return ClifInstructionPurpose::inferred(
-            "refcount",
-            format!("inlined refcount helper/control-flow opcode={opcode}"),
-        );
-    }
     match data {
         ir::InstructionData::CallIndirect { .. } | ir::InstructionData::TryCallIndirect { .. } => {
             ClifInstructionPurpose::inferred(
@@ -526,14 +628,8 @@ fn collect_clif_instruction_purposes(
 ) -> Vec<ClifInstructionPurpose> {
     let mut purposes = Vec::with_capacity(func.dfg.num_insts());
     for block in func.layout.blocks() {
-        let in_refcount_block = block_has_inlined_refcount_shape(func, block);
         for inst in func.layout.block_insts(block) {
-            purposes.push(purpose_for_instruction(
-                func,
-                function_aliases,
-                inst,
-                in_refcount_block,
-            ));
+            purposes.push(purpose_for_instruction(func, function_aliases, inst));
         }
     }
     purposes

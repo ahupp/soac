@@ -1,6 +1,7 @@
 use super::counters::{
     CounterRef, emit_record_top_value_counter_slot, top_value_counter_slot_for_id,
 };
+use super::inspection::RefcountFamily;
 use super::intrinsics::{OperationEmitState, increment_counter_with_state};
 use super::symbols::{
     CpythonTypeSymbol, RelocTypeRef, register_runtime_type_for_key, reloc_type_ref_for_type,
@@ -20,7 +21,7 @@ use soac_ir_typed::plan_v3::{
     IndexedFieldAccessKind as PlanV3IndexedFieldAccessKind,
 };
 use soac_ir_typed::{
-    TypedExactListItemAccessPlan, TypedIndexedFieldGuard, TypedIndexedFieldPlanSource,
+    PyObjFacts, TypedExactListItemAccessPlan, TypedIndexedFieldGuard, TypedIndexedFieldPlanSource,
 };
 use soac_opt::access_emission_v3::{
     IndexedFieldLayoutGroup as OptV3IndexedFieldLayoutGroup,
@@ -1183,7 +1184,11 @@ fn emit_exact_list_exact_int_getitem<'fb, E>(
         .fb()
         .ins()
         .load(ptr_ty, ir::MemFlags::trusted(), item_addr, 0);
-    state.emit_incref(item);
+    state.emit_incref_for_family(
+        item,
+        Some(PyObjFacts::unknown().with_non_null_ref()),
+        RefcountFamily::BorrowedResultClone,
+    );
     state.release_arg_values(arg_values);
     state
         .fb()
@@ -1252,7 +1257,11 @@ fn emit_exact_list_item_getitem_from_guarded_i64_index<'fb, E: Instr>(
         .fb()
         .ins()
         .load(ptr_ty, ir::MemFlags::trusted(), item_addr, 0);
-    state.emit_incref(item);
+    state.emit_incref_for_family(
+        item,
+        Some(PyObjFacts::unknown().with_non_null_ref()),
+        RefcountFamily::BorrowedResultClone,
+    );
     state.release_arg_values(&obj_values);
     state
         .fb()
@@ -1347,15 +1356,29 @@ fn emit_exact_list_exact_int_setitem<'fb, E>(
         .fb()
         .ins()
         .load(ptr_ty, ir::MemFlags::trusted(), item_addr, 0);
-    state.emit_incref(replacement);
+    if arg_values[2].1 {
+        state.emit_incref_for_family(
+            replacement,
+            Some(PyObjFacts::unknown().with_non_null_ref()),
+            RefcountFamily::ContainerStoreClone,
+        );
+    }
     state
         .fb()
         .ins()
         .store(ir::MemFlags::trusted(), replacement, item_addr, 0);
-    state.emit_decref(old_item);
-    state.release_arg_values(arg_values);
+    state.emit_decref_for_family(
+        old_item,
+        Some(PyObjFacts::unknown().with_non_null_ref()),
+        RefcountFamily::ContainerOverwriteRelease,
+    );
+    state.release_arg_values(&arg_values[..2]);
     let none = state.emit_owned_module_constant(state.ctx().consts.none_constant_id);
-    state.emit_incref(none);
+    state.emit_incref_for_family(
+        none,
+        Some(PyObjFacts::none_singleton()),
+        RefcountFamily::ConstantClone,
+    );
     state
         .fb()
         .ins()
@@ -1448,16 +1471,29 @@ fn emit_exact_list_item_setitem_from_guarded_i64_index<'fb, E: Instr>(
         .fb()
         .ins()
         .load(ptr_ty, ir::MemFlags::trusted(), item_addr, 0);
-    state.emit_incref(replacement);
+    if replacement_values[0].1 {
+        state.emit_incref_for_family(
+            replacement,
+            Some(PyObjFacts::unknown().with_non_null_ref()),
+            RefcountFamily::ContainerStoreClone,
+        );
+    }
     state
         .fb()
         .ins()
         .store(ir::MemFlags::trusted(), replacement, item_addr, 0);
-    state.emit_decref(old_item);
+    state.emit_decref_for_family(
+        old_item,
+        Some(PyObjFacts::unknown().with_non_null_ref()),
+        RefcountFamily::ContainerOverwriteRelease,
+    );
     state.release_arg_values(&obj_values);
-    state.release_arg_values(&replacement_values);
     let none = state.emit_owned_module_constant(state.ctx().consts.none_constant_id);
-    state.emit_incref(none);
+    state.emit_incref_for_family(
+        none,
+        Some(PyObjFacts::none_singleton()),
+        RefcountFamily::ConstantClone,
+    );
     state
         .fb()
         .ins()

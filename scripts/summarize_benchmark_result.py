@@ -22,6 +22,25 @@ RUNTIME_FALLBACK_KINDS = {
 }
 DEOPT_CALL_KIND = "deopt_entry_guard_miss"
 REFCOUNT_LOCATION_KIND = "runtime_decref_location"
+RELEASE_REFCOUNT_FAMILIES = {
+    "local_overwrite",
+    "explicit_delete",
+    "edge_release",
+    "return_release",
+    "raise_release",
+    "owned_temporary",
+    "container_overwrite_release",
+    "exit_sweep",
+}
+ACQUIRE_REFCOUNT_FAMILIES = {
+    "local_load_clone",
+    "forwarded_value_clone",
+    "stack_slot_clone",
+    "borrowed_result_clone",
+    "container_store_clone",
+    "constant_clone",
+    "entry_arg_clone",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -235,6 +254,7 @@ def summarize_jit_code_size_rows(
 ) -> dict[str, Any]:
     by_name = {}
     purpose_bytes: dict[str, int] = defaultdict(int)
+    refcount_family_bytes: dict[str, int] = defaultdict(int)
     block_role_attributed_bytes: dict[str, int] = defaultdict(int)
     block_role_unattributed_bytes: dict[str, int] = defaultdict(int)
     block_role_purpose_bytes: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
@@ -255,6 +275,15 @@ def summarize_jit_code_size_rows(
         if len(purpose_names) == len(purpose_values):
             for purpose, value in zip(purpose_names, purpose_values, strict=True):
                 purpose_bytes[purpose] += value
+        refcount_family_names = [str(name) for name in row.get("refcount_family_names") or []]
+        refcount_family_values = [
+            int(value) for value in row.get("refcount_family_bytes") or []
+        ]
+        if len(refcount_family_names) == len(refcount_family_values):
+            for family, value in zip(
+                refcount_family_names, refcount_family_values, strict=True
+            ):
+                refcount_family_bytes[family] += value
         block_role_names = [str(name) for name in row.get("block_role_names") or []]
         block_role_attributed_values = [
             int(value) for value in row.get("block_role_attributed_bytes") or []
@@ -326,6 +355,19 @@ def summarize_jit_code_size_rows(
         "core_code_size_bytes": core_total,
         "core_machine_block_count": core_blocks,
         "purpose_bytes": dict(sorted(purpose_bytes.items())),
+        "refcount_family_bytes": dict(sorted(refcount_family_bytes.items())),
+        "refcount_family_group_bytes": {
+            "release": sum(
+                refcount_family_bytes[family]
+                for family in RELEASE_REFCOUNT_FAMILIES
+                if family in refcount_family_bytes
+            ),
+            "acquire": sum(
+                refcount_family_bytes[family]
+                for family in ACQUIRE_REFCOUNT_FAMILIES
+                if family in refcount_family_bytes
+            ),
+        },
         "unattributed_bytes": unattributed_bytes,
         "block_role_attributed_bytes": dict(sorted(block_role_attributed_bytes.items())),
         "block_role_unattributed_bytes": dict(sorted(block_role_unattributed_bytes.items())),
@@ -360,6 +402,25 @@ def append_block_role_summary(
             f"  {block_role}: {size} total "
             f"({attributed} attributed, {unattributed} unattributed)"
         )
+
+
+def append_refcount_family_summary(
+    lines: list[str], heading_prefix: str, code_size: dict[str, Any]
+) -> None:
+    if not code_size["refcount_family_bytes"]:
+        return
+    lines.append(f"{heading_prefix} emitted refcount bytes by semantic family:")
+    for family, size in sorted(
+        code_size["refcount_family_bytes"].items(), key=lambda item: (-item[1], item[0])
+    ):
+        lines.append(f"  {family}: {size}")
+    refcount_bytes = code_size["purpose_bytes"].get("refcount", 0)
+    tagged_bytes = sum(code_size["refcount_family_bytes"].values())
+    family_group_bytes = code_size["refcount_family_group_bytes"]
+    lines.append(f"  subtotal_release: {family_group_bytes['release']}")
+    lines.append(f"  subtotal_acquire: {family_group_bytes['acquire']}")
+    if refcount_bytes > tagged_bytes:
+        lines.append(f"  unclassified_refcount: {refcount_bytes - tagged_bytes}")
 
 
 def parse_specialization_runtime_stats(events_path: Path) -> dict[str, Any]:
@@ -539,6 +600,7 @@ def format_summary(summary: dict[str, Any]) -> str:
             ]
         )
         append_block_role_summary(lines, "pystone no-refcount", disabled_code_size)
+        append_refcount_family_summary(lines, "pystone no-refcount", disabled_code_size)
     if code_size["purpose_bytes"]:
         lines.append("pystone emitted code bytes by purpose:")
         for purpose, size in sorted(
@@ -546,6 +608,7 @@ def format_summary(summary: dict[str, Any]) -> str:
         ):
             lines.append(f"  {purpose}: {size}")
         lines.append(f"pystone unattributed emitted code bytes: {code_size['unattributed_bytes']}")
+    append_refcount_family_summary(lines, "pystone", code_size)
     if code_size["block_role_total_bytes"]:
         append_block_role_summary(lines, "pystone", code_size)
         cleanup_purpose_bytes = code_size["block_role_purpose_bytes"].get("cleanup")
