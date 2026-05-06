@@ -235,6 +235,9 @@ def summarize_jit_code_size_rows(
 ) -> dict[str, Any]:
     by_name = {}
     purpose_bytes: dict[str, int] = defaultdict(int)
+    block_role_attributed_bytes: dict[str, int] = defaultdict(int)
+    block_role_unattributed_bytes: dict[str, int] = defaultdict(int)
+    block_role_purpose_bytes: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
     unattributed_bytes = 0
     for row in rows:
         qualname = str(row["function_qualname"])
@@ -252,6 +255,32 @@ def summarize_jit_code_size_rows(
         if len(purpose_names) == len(purpose_values):
             for purpose, value in zip(purpose_names, purpose_values, strict=True):
                 purpose_bytes[purpose] += value
+        block_role_names = [str(name) for name in row.get("block_role_names") or []]
+        block_role_attributed_values = [
+            int(value) for value in row.get("block_role_attributed_bytes") or []
+        ]
+        block_role_unattributed_values = [
+            int(value) for value in row.get("block_role_unattributed_bytes") or []
+        ]
+        if len(block_role_names) == len(block_role_attributed_values):
+            for block_role, value in zip(
+                block_role_names, block_role_attributed_values, strict=True
+            ):
+                block_role_attributed_bytes[block_role] += value
+        if len(block_role_names) == len(block_role_unattributed_values):
+            for block_role, value in zip(
+                block_role_names, block_role_unattributed_values, strict=True
+            ):
+                block_role_unattributed_bytes[block_role] += value
+        block_role_purpose_values = row.get("block_role_purpose_bytes") or []
+        if len(block_role_names) == len(block_role_purpose_values):
+            for block_role, values in zip(
+                block_role_names, block_role_purpose_values, strict=True
+            ):
+                if len(purpose_names) != len(values):
+                    continue
+                for purpose, value in zip(purpose_names, values, strict=True):
+                    block_role_purpose_bytes[block_role][purpose] += int(value)
         unattributed_bytes += int(row.get("unattributed_bytes") or 0)
     total = sum(row["code_size_bytes"] for row in by_name.values())
     total_blocks = sum(row["machine_block_count"] for row in by_name.values())
@@ -298,9 +327,39 @@ def summarize_jit_code_size_rows(
         "core_machine_block_count": core_blocks,
         "purpose_bytes": dict(sorted(purpose_bytes.items())),
         "unattributed_bytes": unattributed_bytes,
+        "block_role_attributed_bytes": dict(sorted(block_role_attributed_bytes.items())),
+        "block_role_unattributed_bytes": dict(sorted(block_role_unattributed_bytes.items())),
+        "block_role_total_bytes": {
+            block_role: block_role_attributed_bytes[block_role]
+            + block_role_unattributed_bytes[block_role]
+            for block_role in sorted(
+                set(block_role_attributed_bytes) | set(block_role_unattributed_bytes)
+            )
+        },
+        "block_role_purpose_bytes": {
+            block_role: dict(sorted(purpose_map.items()))
+            for block_role, purpose_map in sorted(block_role_purpose_bytes.items())
+        },
         "functions_by_name": by_name,
         "top_functions": top_functions,
     }
+
+
+def append_block_role_summary(
+    lines: list[str], heading_prefix: str, code_size: dict[str, Any]
+) -> None:
+    if not code_size["block_role_total_bytes"]:
+        return
+    lines.append(f"{heading_prefix} emitted code bytes by block role:")
+    for block_role, size in sorted(
+        code_size["block_role_total_bytes"].items(), key=lambda item: (-item[1], item[0])
+    ):
+        attributed = code_size["block_role_attributed_bytes"].get(block_role, 0)
+        unattributed = code_size["block_role_unattributed_bytes"].get(block_role, 0)
+        lines.append(
+            f"  {block_role}: {size} total "
+            f"({attributed} attributed, {unattributed} unattributed)"
+        )
 
 
 def parse_specialization_runtime_stats(events_path: Path) -> dict[str, Any]:
@@ -479,6 +538,7 @@ def format_summary(summary: dict[str, Any]) -> str:
                 f"{disabled_code_size['total_code_size_bytes'] - code_size['total_code_size_bytes']}",
             ]
         )
+        append_block_role_summary(lines, "pystone no-refcount", disabled_code_size)
     if code_size["purpose_bytes"]:
         lines.append("pystone emitted code bytes by purpose:")
         for purpose, size in sorted(
@@ -486,6 +546,24 @@ def format_summary(summary: dict[str, Any]) -> str:
         ):
             lines.append(f"  {purpose}: {size}")
         lines.append(f"pystone unattributed emitted code bytes: {code_size['unattributed_bytes']}")
+    if code_size["block_role_total_bytes"]:
+        append_block_role_summary(lines, "pystone", code_size)
+        cleanup_purpose_bytes = code_size["block_role_purpose_bytes"].get("cleanup")
+        if cleanup_purpose_bytes:
+            lines.append("pystone cleanup-block emitted code bytes by purpose:")
+            for purpose, size in sorted(
+                cleanup_purpose_bytes.items(), key=lambda item: (-item[1], item[0])
+            ):
+                lines.append(f"  {purpose}: {size}")
+        refcount_support_purpose_bytes = code_size["block_role_purpose_bytes"].get(
+            "refcount_support"
+        )
+        if refcount_support_purpose_bytes:
+            lines.append("pystone refcount-support emitted code bytes by purpose:")
+            for purpose, size in sorted(
+                refcount_support_purpose_bytes.items(), key=lambda item: (-item[1], item[0])
+            ):
+                lines.append(f"  {purpose}: {size}")
     lines.append("largest pystone functions by code size:")
     for entry in code_size["top_functions"]:
         lines.append(

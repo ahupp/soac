@@ -27,6 +27,10 @@ def test_code_size_uses_last_successful_refcount_apply_process(tmp_path: Path) -
             "purpose_names": purpose_names,
             "purpose_bytes": purpose_bytes,
             "unattributed_bytes": unattributed_bytes,
+            "block_role_names": block_role_names,
+            "block_role_attributed_bytes": block_role_attributed_bytes,
+            "block_role_unattributed_bytes": block_role_unattributed_bytes,
+            "block_role_purpose_bytes": block_role_purpose_bytes,
         }
         for (
             process_id,
@@ -37,13 +41,30 @@ def test_code_size_uses_last_successful_refcount_apply_process(tmp_path: Path) -
             purpose_names,
             purpose_bytes,
             unattributed_bytes,
+            block_role_names,
+            block_role_attributed_bytes,
+            block_role_unattributed_bytes,
+            block_role_purpose_bytes,
         ) in [
-            (10, "1:6", "pystones", 100, 1, [], [], 0),
-            (20, "1:6", "pystones", 200, 2, [], [], 0),
-            (30, "1:6", "pystones", 300, 3, [], [], 0),
-            (40, "1:6", "pystones", 400, 4, [], [], 0),
-            (50, "1:6", "pystones", 500, 5, ["refcount", "deopt"], [320, 12], 168),
-            (60, "1:7", "_dp_listcomp_3", 12, 1, [], [], 0),
+            (10, "1:6", "pystones", 100, 1, [], [], 0, [], [], [], []),
+            (20, "1:6", "pystones", 200, 2, [], [], 0, [], [], [], []),
+            (30, "1:6", "pystones", 300, 3, [], [], 0, [], [], [], []),
+            (40, "1:6", "pystones", 400, 4, [], [], 0, [], [], [], []),
+            (
+                50,
+                "1:6",
+                "pystones",
+                500,
+                5,
+                ["refcount", "deopt"],
+                [320, 12],
+                168,
+                ["cleanup", "ordinary", "refcount_support", "unknown"],
+                [140, 152, 40, 0],
+                [90, 40, 20, 18],
+                [[120, 0], [160, 12], [40, 0], [0, 0]],
+            ),
+            (60, "1:7", "_dp_listcomp_3", 12, 1, [], [], 0, [], [], [], []),
         ]
     ]
     jit_bb_map.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
@@ -60,6 +81,30 @@ def test_code_size_uses_last_successful_refcount_apply_process(tmp_path: Path) -
     assert code_size["total_code_size_bytes"] == 500
     assert code_size["purpose_bytes"] == {"deopt": 12, "refcount": 320}
     assert code_size["unattributed_bytes"] == 168
+    assert code_size["block_role_attributed_bytes"] == {
+        "cleanup": 140,
+        "ordinary": 152,
+        "refcount_support": 40,
+        "unknown": 0,
+    }
+    assert code_size["block_role_unattributed_bytes"] == {
+        "cleanup": 90,
+        "ordinary": 40,
+        "refcount_support": 20,
+        "unknown": 18,
+    }
+    assert code_size["block_role_total_bytes"] == {
+        "cleanup": 230,
+        "ordinary": 192,
+        "refcount_support": 60,
+        "unknown": 18,
+    }
+    assert code_size["block_role_purpose_bytes"] == {
+        "cleanup": {"deopt": 0, "refcount": 120},
+        "ordinary": {"deopt": 12, "refcount": 160},
+        "refcount_support": {"deopt": 0, "refcount": 40},
+        "unknown": {"deopt": 0, "refcount": 0},
+    }
 
 
 def test_code_size_can_select_last_successful_no_refcount_apply_process(tmp_path: Path) -> None:
@@ -76,6 +121,10 @@ def test_code_size_can_select_last_successful_no_refcount_apply_process(tmp_path
             "purpose_names": ["refcount"],
             "purpose_bytes": [refcount_bytes],
             "unattributed_bytes": code_size - refcount_bytes,
+            "block_role_names": ["ordinary", "unknown"],
+            "block_role_attributed_bytes": [refcount_bytes, 0],
+            "block_role_unattributed_bytes": [code_size - refcount_bytes, 0],
+            "block_role_purpose_bytes": [[refcount_bytes], [0]],
         }
         for process_id, code_size, refcount_bytes in [
             (10, 100, 10),

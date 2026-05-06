@@ -1779,6 +1779,7 @@ impl ProcessJitState {
             function_name.as_str(),
             "failed to compile specialized jit run_bb function",
             Some(&function_aliases),
+            Some(&built.block_roles),
         )
         .map_err(|err| {
             format!(

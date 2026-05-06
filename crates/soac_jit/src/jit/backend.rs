@@ -1,10 +1,11 @@
 use super::codegen_env::JitCodegenEnv;
-#[cfg(test)]
-use super::inspection::clif_purpose_source_loc_bits;
 use super::inspection::{
-    ClifFunctionDisplayAliases, annotate_clif_instruction_purpose_source_locs,
+    ClifBlockRole, ClifBlockRoles, ClifFunctionDisplayAliases,
+    annotate_clif_instruction_purpose_source_locs, clif_block_role_name_from_source_loc_bits,
     clif_purpose_name_from_source_loc_bits,
 };
+#[cfg(test)]
+use super::inspection::{clif_provenance_source_loc_bits, clif_purpose_source_loc_bits};
 use super::runtime_support::{
     inline_runtime_support_calls, load_runtime_support_clif_with_debug_symbols,
 };
@@ -114,6 +115,11 @@ pub(super) struct DefinedFunctionArtifact {
     pub(super) code_purpose_names: Vec<String>,
     pub(super) code_purpose_bytes: Vec<usize>,
     pub(super) code_unattributed_bytes: usize,
+    pub(super) code_block_role_names: Vec<String>,
+    pub(super) code_block_role_attributed_bytes: Vec<usize>,
+    pub(super) code_block_role_unattributed_bytes: Vec<usize>,
+    pub(super) code_block_role_purpose_bytes: Vec<Vec<usize>>,
+    pub(super) code_bb_block_role_names: Vec<String>,
     pub(super) code_bb_purpose_bytes: Vec<Vec<usize>>,
     pub(super) code_bb_unattributed_bytes: Vec<usize>,
     pub(super) systemv_unwind_info: Option<cranelift_codegen::isa::unwind::systemv::UnwindInfo>,
@@ -206,6 +212,7 @@ pub(super) fn compile_prepared_function_bytes(
         function_name,
         err_prefix,
         None,
+        None,
     )
 }
 
@@ -217,6 +224,7 @@ pub(super) fn compile_prepared_function_bytes_with_purpose_aliases(
     function_name: &str,
     err_prefix: &str,
     purpose_aliases: Option<&ClifFunctionDisplayAliases>,
+    block_roles: Option<&ClifBlockRoles>,
 ) -> Result<CompiledFunctionArtifact, String> {
     let function_name = if env_config.jit_refcount_emission_enabled() {
         Cow::Borrowed(function_name)
@@ -226,7 +234,12 @@ pub(super) fn compile_prepared_function_bytes_with_purpose_aliases(
     ctx.func.name = stable_cranelift_function_name(function_name.as_ref());
     prepare_cranelift_function_for_backend(codegen_env, env_config, None, ctx, err_prefix)?;
     if let Some(purpose_aliases) = purpose_aliases {
-        annotate_clif_instruction_purpose_source_locs(&mut ctx.func, purpose_aliases);
+        let empty_block_roles = ClifBlockRoles::new();
+        annotate_clif_instruction_purpose_source_locs(
+            &mut ctx.func,
+            purpose_aliases,
+            block_roles.unwrap_or(&empty_block_roles),
+        );
     }
     compile_backend_prepared_function_bytes(codegen_env.codegen_isa(), func_id, ctx, err_prefix)
 }
@@ -296,6 +309,12 @@ fn compile_backend_prepared_function_bytes(
             code_purpose_names: code_purpose_provenance.purpose_names,
             code_purpose_bytes: code_purpose_provenance.purpose_bytes,
             code_unattributed_bytes: code_purpose_provenance.unattributed_bytes,
+            code_block_role_names: code_purpose_provenance.block_role_names,
+            code_block_role_attributed_bytes: code_purpose_provenance.block_role_attributed_bytes,
+            code_block_role_unattributed_bytes: code_purpose_provenance
+                .block_role_unattributed_bytes,
+            code_block_role_purpose_bytes: code_purpose_provenance.block_role_purpose_bytes,
+            code_bb_block_role_names: code_purpose_provenance.bb_block_role_names,
             code_bb_purpose_bytes: code_purpose_provenance.bb_purpose_bytes,
             code_bb_unattributed_bytes: code_purpose_provenance.bb_unattributed_bytes,
             systemv_unwind_info,
@@ -308,6 +327,11 @@ struct CodePurposeProvenance {
     purpose_names: Vec<String>,
     purpose_bytes: Vec<usize>,
     unattributed_bytes: usize,
+    block_role_names: Vec<String>,
+    block_role_attributed_bytes: Vec<usize>,
+    block_role_unattributed_bytes: Vec<usize>,
+    block_role_purpose_bytes: Vec<Vec<usize>>,
+    bb_block_role_names: Vec<String>,
     bb_purpose_bytes: Vec<Vec<usize>>,
     bb_unattributed_bytes: Vec<usize>,
 }
@@ -318,9 +342,19 @@ fn collect_code_purpose_provenance(
     srclocs: &[cranelift_codegen::MachSrcLoc<cranelift_codegen::Final>],
 ) -> CodePurposeProvenance {
     let mut bytes_by_purpose = BTreeMap::<&'static str, usize>::new();
+    let mut bytes_by_block_role = BTreeMap::<&'static str, usize>::new();
+    let mut bytes_by_block_role_and_purpose =
+        BTreeMap::<(&'static str, &'static str), usize>::new();
     for srcloc in srclocs {
         if let Some(purpose) = clif_purpose_name_from_source_loc_bits(srcloc.loc.bits()) {
-            *bytes_by_purpose.entry(purpose).or_default() += (srcloc.end - srcloc.start) as usize;
+            let bytes = (srcloc.end - srcloc.start) as usize;
+            *bytes_by_purpose.entry(purpose).or_default() += bytes;
+            if let Some(block_role) = clif_block_role_name_from_source_loc_bits(srcloc.loc.bits()) {
+                *bytes_by_block_role.entry(block_role).or_default() += bytes;
+                *bytes_by_block_role_and_purpose
+                    .entry((block_role, purpose))
+                    .or_default() += bytes;
+            }
         }
     }
     let purpose_names = bytes_by_purpose
@@ -341,9 +375,54 @@ fn collect_code_purpose_provenance(
                 .unwrap_or_default()
         })
         .collect::<Vec<_>>();
+    let mut block_role_names = bytes_by_block_role
+        .keys()
+        .map(|role| (*role).to_string())
+        .collect::<Vec<_>>();
+    if !block_role_names.iter().any(|role| role == "unknown") {
+        block_role_names.push("unknown".to_string());
+    }
+    block_role_names.sort();
+    let block_role_indices = block_role_names
+        .iter()
+        .enumerate()
+        .map(|(index, role)| (role.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    let block_role_attributed_bytes = block_role_names
+        .iter()
+        .map(|role| {
+            bytes_by_block_role
+                .get(role.as_str())
+                .copied()
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>();
+    let mut block_role_unattributed_bytes = vec![0usize; block_role_names.len()];
+    let block_role_purpose_bytes = block_role_names
+        .iter()
+        .map(|block_role| {
+            purpose_names
+                .iter()
+                .map(|purpose| {
+                    bytes_by_block_role_and_purpose
+                        .get(&(block_role.as_str(), purpose.as_str()))
+                        .copied()
+                        .unwrap_or_default()
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
     let attributed_bytes = purpose_bytes.iter().sum::<usize>();
     let unattributed_bytes = code_size.saturating_sub(attributed_bytes);
 
+    let ordinary_role_index = block_role_indices
+        .get(ClifBlockRole::Ordinary.as_str())
+        .copied();
+    let unknown_role_index = block_role_indices
+        .get("unknown")
+        .copied()
+        .expect("unknown block role should always exist");
+    let mut bb_block_role_names = Vec::with_capacity(code_bb_offsets.len());
     let mut bb_purpose_bytes = Vec::with_capacity(code_bb_offsets.len());
     let mut bb_unattributed_bytes = Vec::with_capacity(code_bb_offsets.len());
     let mut first_candidate_srcloc = 0usize;
@@ -357,6 +436,7 @@ fn collect_code_purpose_provenance(
         {
             first_candidate_srcloc += 1;
         }
+        let mut block_role_bytes = vec![0usize; block_role_names.len()];
         let mut block_purpose_bytes = vec![0usize; purpose_names.len()];
         let mut attributed_block_bytes = 0usize;
         for srcloc in srclocs.iter().skip(first_candidate_srcloc) {
@@ -378,16 +458,38 @@ fn collect_code_purpose_provenance(
                 continue;
             };
             block_purpose_bytes[*purpose_index] += overlap;
+            if let Some(block_role) = clif_block_role_name_from_source_loc_bits(srcloc.loc.bits())
+                && let Some(block_role_index) = block_role_indices.get(block_role)
+            {
+                block_role_bytes[*block_role_index] += overlap;
+            }
             attributed_block_bytes += overlap;
         }
+        let dominant_block_role_index = block_role_bytes
+            .iter()
+            .enumerate()
+            .max_by_key(|(index, bytes)| {
+                (**bytes, usize::from(Some(*index) == ordinary_role_index))
+            })
+            .filter(|(_, bytes)| **bytes > 0)
+            .map(|(index, _)| index)
+            .unwrap_or(unknown_role_index);
+        let block_unattributed_bytes = (end - start).saturating_sub(attributed_block_bytes);
+        block_role_unattributed_bytes[dominant_block_role_index] += block_unattributed_bytes;
+        bb_block_role_names.push(block_role_names[dominant_block_role_index].clone());
         bb_purpose_bytes.push(block_purpose_bytes);
-        bb_unattributed_bytes.push((end - start).saturating_sub(attributed_block_bytes));
+        bb_unattributed_bytes.push(block_unattributed_bytes);
     }
 
     CodePurposeProvenance {
         purpose_names,
         purpose_bytes,
         unattributed_bytes,
+        block_role_names,
+        block_role_attributed_bytes,
+        block_role_unattributed_bytes,
+        block_role_purpose_bytes,
+        bb_block_role_names,
         bb_purpose_bytes,
         bb_unattributed_bytes,
     }
@@ -410,7 +512,8 @@ mod tests {
             start: 7,
             end: 11,
             loc: ir::SourceLoc::new(
-                clif_purpose_source_loc_bits("deopt").expect("deopt source loc should exist"),
+                clif_provenance_source_loc_bits("deopt", ClifBlockRole::Cleanup)
+                    .expect("deopt source loc should exist"),
             ),
         };
 
@@ -419,6 +522,24 @@ mod tests {
         assert_eq!(provenance.purpose_names, vec!["deopt", "refcount"]);
         assert_eq!(provenance.purpose_bytes, vec![4, 5]);
         assert_eq!(provenance.unattributed_bytes, 5);
+        assert_eq!(
+            provenance.block_role_names,
+            vec![
+                "cleanup".to_string(),
+                "ordinary".to_string(),
+                "unknown".to_string()
+            ]
+        );
+        assert_eq!(provenance.block_role_attributed_bytes, vec![4, 5, 0]);
+        assert_eq!(provenance.block_role_unattributed_bytes, vec![3, 2, 0]);
+        assert_eq!(
+            provenance.block_role_purpose_bytes,
+            vec![vec![4, 0], vec![0, 5], vec![0, 0]]
+        );
+        assert_eq!(
+            provenance.bb_block_role_names,
+            vec!["ordinary", "cleanup", "cleanup"]
+        );
         assert_eq!(
             provenance.bb_purpose_bytes,
             vec![vec![0, 3], vec![3, 2], vec![1, 0]]
@@ -861,6 +982,11 @@ pub(super) fn record_jit_bb_map(
         "purpose_names": &artifact.code_purpose_names,
         "purpose_bytes": &artifact.code_purpose_bytes,
         "unattributed_bytes": artifact.code_unattributed_bytes,
+        "block_role_names": &artifact.code_block_role_names,
+        "block_role_attributed_bytes": &artifact.code_block_role_attributed_bytes,
+        "block_role_unattributed_bytes": &artifact.code_block_role_unattributed_bytes,
+        "block_role_purpose_bytes": &artifact.code_block_role_purpose_bytes,
+        "bb_block_role_names": &artifact.code_bb_block_role_names,
         "bb_purpose_bytes": &artifact.code_bb_purpose_bytes,
         "bb_unattributed_bytes": &artifact.code_bb_unattributed_bytes,
     });

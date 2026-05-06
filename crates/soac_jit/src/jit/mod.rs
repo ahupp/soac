@@ -300,10 +300,10 @@ use imports::{
 #[cfg(test)]
 use imports::{SOAC_RUNTIME_DECREF_APPLIED_IMPORT, SOAC_RUNTIME_INCREF_APPLIED_IMPORT};
 use inspection::{
-    ClifBlockDisplayAnnotations, ClifFunctionDisplayAlias, ClifFunctionDisplayAliases,
-    register_block_display_annotation, render_compiled_clif_and_vcode_disasm,
-    render_instr_typed_metadata_index, render_instr_typed_program,
-    render_pre_inline_clif_for_inspection,
+    ClifBlockDisplayAnnotations, ClifBlockRole, ClifBlockRoles, ClifFunctionDisplayAlias,
+    ClifFunctionDisplayAliases, register_block_display_annotation, register_block_role,
+    render_compiled_clif_and_vcode_disasm, render_instr_typed_metadata_index,
+    render_instr_typed_program, render_pre_inline_clif_for_inspection,
 };
 pub use inspection::{RenderedSpecializedClif, run_cranelift_smoke};
 #[cfg(test)]
@@ -324,6 +324,7 @@ struct BuiltSpecializedFunction {
     #[cfg(test)]
     func_id_to_symbol: HashMap<u32, &'static str>,
     block_annotations: ClifBlockDisplayAnnotations,
+    block_roles: ClifBlockRoles,
 }
 
 #[derive(Clone)]
@@ -18008,6 +18009,7 @@ fn local_failure_cleanup_emit_ctx<'mc>(
     cleanup_null_block: ir::Block,
     pending_local_failure_cleanups: &mut Vec<PendingLocalFailureCleanup>,
     local_failure_cleanup_blocks: &mut HashMap<LocalFailureCleanupKey, ir::Block>,
+    block_roles: &mut ClifBlockRoles,
 ) -> Result<Option<JitEmitCtx<'mc>>, String> {
     if !emit_ctx.consts.step_null_args.is_empty() {
         return Ok(None);
@@ -18023,6 +18025,7 @@ fn local_failure_cleanup_emit_ctx<'mc>(
             cleanup_null_block,
             pending_local_failure_cleanups,
             local_failure_cleanup_blocks,
+            block_roles,
         );
         let (forwarded_values, forwarded_local_indices) = emit_forward_named_values_from_local_env(
             fb,
@@ -18096,6 +18099,7 @@ fn local_failure_cleanup_emit_ctx<'mc>(
             cleanup_actions,
             continuation,
         });
+        register_block_role(block_roles, cleanup_block, ClifBlockRole::Cleanup);
         local_failure_cleanup_blocks.insert(key, cleanup_block);
         cleanup_block
     };
@@ -18114,6 +18118,7 @@ fn forwarding_materialization_failure_emit_ctx<'mc>(
     cleanup_null_block: ir::Block,
     pending_local_failure_cleanups: &mut Vec<PendingLocalFailureCleanup>,
     local_failure_cleanup_blocks: &mut HashMap<LocalFailureCleanupKey, ir::Block>,
+    block_roles: &mut ClifBlockRoles,
 ) -> Option<JitEmitCtx<'mc>> {
     let needs_fallible_materialization = forwarded_names.iter().any(|name| {
         local_env
@@ -18150,6 +18155,7 @@ fn forwarding_materialization_failure_emit_ctx<'mc>(
             cleanup_actions,
             continuation,
         });
+        register_block_role(block_roles, cleanup_block, ClifBlockRole::Cleanup);
         local_failure_cleanup_blocks.insert(key, cleanup_block);
         cleanup_block
     };
@@ -18169,6 +18175,7 @@ fn emit_typed_codegen_ops(
     cleanup_null_block: ir::Block,
     pending_local_failure_cleanups: &mut Vec<PendingLocalFailureCleanup>,
     local_failure_cleanup_blocks: &mut HashMap<LocalFailureCleanupKey, ir::Block>,
+    block_roles: &mut ClifBlockRoles,
     codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
 ) -> Result<(), String> {
@@ -18231,6 +18238,7 @@ fn emit_typed_codegen_ops(
             cleanup_null_block,
             pending_local_failure_cleanups,
             local_failure_cleanup_blocks,
+            block_roles,
         )?;
         let stmt_emit_ctx = stmt_emit_ctx.as_ref().unwrap_or(emit_ctx);
         let guard_miss_emit_ctx = instr_id
@@ -19829,6 +19837,7 @@ fn build_cranelift_run_bb_specialized_function(
     ctx.func.signature = main_sig;
     let mut builder_ctx = FunctionBuilderContext::new();
     let mut block_annotations = ClifBlockDisplayAnnotations::new();
+    let mut block_roles = ClifBlockRoles::new();
     {
         let mut fb = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
         let entry_block = fb.create_block();
@@ -19956,12 +19965,14 @@ fn build_cranelift_run_bb_specialized_function(
                 "pre_cleanup_null::shared",
                 Vec::new(),
             );
+            register_block_role(&mut block_roles, pre_cleanup, ClifBlockRole::Cleanup);
             register_block_display_annotation(
                 &mut block_annotations,
                 cleanup,
                 "cleanup_null::shared",
                 vec!["error".into()],
             );
+            register_block_role(&mut block_roles, cleanup, ClifBlockRole::Cleanup);
         }
         for (index, pre_cleanup, cleanup) in &per_exception_null_cleanup_blocks {
             register_block_display_annotation(
@@ -19970,12 +19981,14 @@ fn build_cranelift_run_bb_specialized_function(
                 format!("pre_cleanup_null::{}", function.blocks[*index].label),
                 Vec::new(),
             );
+            register_block_role(&mut block_roles, *pre_cleanup, ClifBlockRole::Cleanup);
             register_block_display_annotation(
                 &mut block_annotations,
                 *cleanup,
                 format!("cleanup_null::{}", function.blocks[*index].label),
                 vec!["error".into()],
             );
+            register_block_role(&mut block_roles, *cleanup, ClifBlockRole::Cleanup);
         }
         register_block_display_annotation(
             &mut block_annotations,
@@ -20001,6 +20014,7 @@ fn build_cranelift_run_bb_specialized_function(
                 label,
                 vec!["ret".into()],
             );
+            register_block_role(&mut block_roles, *cleanup_block, ClifBlockRole::Cleanup);
         }
 
         fb.append_block_params_for_function_params(entry_block);
@@ -20565,6 +20579,7 @@ fn build_cranelift_run_bb_specialized_function(
                 cleanup_null_blocks[index],
                 &mut pending_local_failure_cleanups,
                 &mut local_failure_cleanup_blocks,
+                &mut block_roles,
                 codegen_env,
                 &mut func_imports,
             )?;
@@ -20577,6 +20592,7 @@ fn build_cranelift_run_bb_specialized_function(
                 cleanup_null_blocks[index],
                 &mut pending_local_failure_cleanups,
                 &mut local_failure_cleanup_blocks,
+                &mut block_roles,
             )?;
             let term_emit_ctx = term_emit_ctx.as_ref().unwrap_or(&emit_ctx);
             emit_typed_codegen_term(
@@ -20870,6 +20886,8 @@ fn build_cranelift_run_bb_specialized_function(
                             .icmp_imm(ir::condcodes::IntCC::NotEqual, is_pushed, 0);
                     let pop_block = fb.create_block();
                     let done_block = fb.create_block();
+                    register_block_role(&mut block_roles, pop_block, ClifBlockRole::Cleanup);
+                    register_block_role(&mut block_roles, done_block, ClifBlockRole::Cleanup);
                     fb.ins().brif(should_pop, pop_block, &[], done_block, &[]);
 
                     fb.switch_to_block(pop_block);
@@ -21014,6 +21032,7 @@ fn build_cranelift_run_bb_specialized_function(
         #[cfg(test)]
         func_id_to_symbol: module_imports.debug_declared_symbols().clone(),
         block_annotations,
+        block_roles,
     })
 }
 

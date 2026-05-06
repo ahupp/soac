@@ -34,6 +34,24 @@ pub(super) struct ClifBlockDisplayAnnotation {
 }
 
 pub(super) type ClifBlockDisplayAnnotations = HashMap<String, ClifBlockDisplayAnnotation>;
+pub(super) type ClifBlockRoles = HashMap<ir::Block, ClifBlockRole>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(super) enum ClifBlockRole {
+    Ordinary,
+    Cleanup,
+    RefcountSupport,
+}
+
+impl ClifBlockRole {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Ordinary => "ordinary",
+            Self::Cleanup => "cleanup",
+            Self::RefcountSupport => "refcount_support",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ClifFunctionDisplayKind {
@@ -104,27 +122,81 @@ const CLIF_PURPOSE_NAMES: &[&str] = &[
     "stack_management",
 ];
 
+const CLIF_BLOCK_ROLES: &[ClifBlockRole] = &[
+    ClifBlockRole::Ordinary,
+    ClifBlockRole::Cleanup,
+    ClifBlockRole::RefcountSupport,
+];
+
+#[cfg(test)]
 pub(super) fn clif_purpose_source_loc_bits(primary: &str) -> Option<u32> {
-    CLIF_PURPOSE_NAMES
+    clif_provenance_source_loc_bits(primary, ClifBlockRole::Ordinary)
+}
+
+pub(super) fn clif_provenance_source_loc_bits(
+    primary: &str,
+    block_role: ClifBlockRole,
+) -> Option<u32> {
+    let purpose_index = CLIF_PURPOSE_NAMES
         .iter()
-        .position(|candidate| *candidate == primary)
-        .map(|index| CLIF_PURPOSE_SOURCE_LOC_BASE + index as u32)
+        .position(|candidate| *candidate == primary)?;
+    let role_index = CLIF_BLOCK_ROLES
+        .iter()
+        .position(|candidate| *candidate == block_role)?;
+    Some(
+        CLIF_PURPOSE_SOURCE_LOC_BASE
+            + (role_index * CLIF_PURPOSE_NAMES.len() + purpose_index) as u32,
+    )
+}
+
+fn clif_provenance_from_source_loc_bits(bits: u32) -> Option<(&'static str, ClifBlockRole)> {
+    let provenance_index = bits.checked_sub(CLIF_PURPOSE_SOURCE_LOC_BASE)? as usize;
+    let purpose_index = provenance_index % CLIF_PURPOSE_NAMES.len();
+    let role_index = provenance_index / CLIF_PURPOSE_NAMES.len();
+    Some((
+        CLIF_PURPOSE_NAMES.get(purpose_index).copied()?,
+        *CLIF_BLOCK_ROLES.get(role_index)?,
+    ))
+}
+
+pub(super) fn clif_block_role_name_from_source_loc_bits(bits: u32) -> Option<&'static str> {
+    clif_provenance_from_source_loc_bits(bits).map(|(_, role)| role.as_str())
 }
 
 pub(super) fn clif_purpose_name_from_source_loc_bits(bits: u32) -> Option<&'static str> {
-    let index = bits.checked_sub(CLIF_PURPOSE_SOURCE_LOC_BASE)? as usize;
-    CLIF_PURPOSE_NAMES.get(index).copied()
+    clif_provenance_from_source_loc_bits(bits).map(|(purpose, _)| purpose)
+}
+
+fn clif_block_role_for_block(block_roles: &ClifBlockRoles, block: ir::Block) -> ClifBlockRole {
+    block_roles
+        .get(&block)
+        .copied()
+        .unwrap_or(ClifBlockRole::Ordinary)
+}
+
+pub(super) fn register_block_role(
+    block_roles: &mut ClifBlockRoles,
+    block: ir::Block,
+    role: ClifBlockRole,
+) {
+    block_roles.insert(block, role);
 }
 
 pub(super) fn annotate_clif_instruction_purpose_source_locs(
     func: &mut ir::Function,
     function_aliases: &ClifFunctionDisplayAliases,
+    block_roles: &ClifBlockRoles,
 ) {
     for block in func.layout.blocks().collect::<Vec<_>>() {
         let in_refcount_block = block_has_inlined_refcount_shape(func, block);
+        let block_role = if in_refcount_block {
+            ClifBlockRole::RefcountSupport
+        } else {
+            clif_block_role_for_block(block_roles, block)
+        };
         for inst in func.layout.block_insts(block).collect::<Vec<_>>() {
             let purpose = purpose_for_instruction(func, function_aliases, inst, in_refcount_block);
-            let Some(bits) = clif_purpose_source_loc_bits(purpose.primary) else {
+            let Some(bits) = clif_provenance_source_loc_bits(purpose.primary, block_role) else {
                 continue;
             };
             func.set_srcloc(inst, ir::SourceLoc::new(bits));
