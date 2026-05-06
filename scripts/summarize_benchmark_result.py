@@ -157,6 +157,21 @@ def select_jit_code_size_process(
     return process_ids[-1], "latest_process"
 
 
+def select_refcounts_disabled_jit_code_size_process(
+    process_ids: list[int], benchmark: dict[str, Any] | None
+) -> tuple[int, str] | None:
+    if benchmark is None:
+        return None
+    apply_run_count = len(benchmark.get("apply_loops_per_s_runs") or [])
+    disabled_run_count = len(benchmark.get("apply_refcounts_disabled_loops_per_s_runs") or [])
+    if disabled_run_count <= 0:
+        return None
+    disabled_process_index = 2 + apply_run_count + disabled_run_count - 1
+    if disabled_process_index >= len(process_ids):
+        return None
+    return process_ids[disabled_process_index], "last_refcounts_disabled_apply"
+
+
 def parse_jit_code_size(
     jit_bb_map_path: Path, benchmark: dict[str, Any] | None = None
 ) -> dict[str, Any] | None:
@@ -180,8 +195,47 @@ def parse_jit_code_size(
 
     process_ids = sorted(by_process)
     process_id, selection = select_jit_code_size_process(process_ids, benchmark)
-    rows = by_process[process_id]
+    return summarize_jit_code_size_rows(by_process[process_id], process_ids, process_id, selection)
+
+
+def parse_refcounts_disabled_jit_code_size(
+    jit_bb_map_path: Path, benchmark: dict[str, Any] | None = None
+) -> dict[str, Any] | None:
+    if not jit_bb_map_path.is_file():
+        return None
+
+    by_process: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for line in jit_bb_map_path.read_text().splitlines():
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        function_id = str(record.get("function_id", ""))
+        if not function_id.startswith("1:"):
+            continue
+        process_id = int(record["process_id"])
+        by_process[process_id].append(record)
+
+    if not by_process:
+        return None
+
+    process_ids = sorted(by_process)
+    selected = select_refcounts_disabled_jit_code_size_process(process_ids, benchmark)
+    if selected is None:
+        return None
+    process_id, selection = selected
+    return summarize_jit_code_size_rows(by_process[process_id], process_ids, process_id, selection)
+
+
+def summarize_jit_code_size_rows(
+    rows: list[dict[str, Any]],
+    process_ids: list[int],
+    process_id: int,
+    selection: str,
+) -> dict[str, Any]:
     by_name = {}
+    purpose_bytes: dict[str, int] = defaultdict(int)
+    unattributed_bytes = 0
     for row in rows:
         qualname = str(row["function_qualname"])
         entry_kind = str(row.get("entry_kind") or "")
@@ -193,6 +247,12 @@ def parse_jit_code_size(
             "code_size_bytes": int(row["code_size"]),
             "machine_block_count": len(row.get("bb_offsets") or []),
         }
+        purpose_names = [str(name) for name in row.get("purpose_names") or []]
+        purpose_values = [int(value) for value in row.get("purpose_bytes") or []]
+        if len(purpose_names) == len(purpose_values):
+            for purpose, value in zip(purpose_names, purpose_values, strict=True):
+                purpose_bytes[purpose] += value
+        unattributed_bytes += int(row.get("unattributed_bytes") or 0)
     total = sum(row["code_size_bytes"] for row in by_name.values())
     total_blocks = sum(row["machine_block_count"] for row in by_name.values())
     non_dp_total = sum(
@@ -236,6 +296,8 @@ def parse_jit_code_size(
         "non_dp_machine_block_count": non_dp_blocks,
         "core_code_size_bytes": core_total,
         "core_machine_block_count": core_blocks,
+        "purpose_bytes": dict(sorted(purpose_bytes.items())),
+        "unattributed_bytes": unattributed_bytes,
         "functions_by_name": by_name,
         "top_functions": top_functions,
     }
@@ -344,6 +406,7 @@ def parse_specialization_stats(result_dir: Path) -> dict[str, Any]:
 def format_summary(summary: dict[str, Any]) -> str:
     benchmark = summary["benchmark"]
     code_size = summary.get("jit_code_size")
+    disabled_code_size = summary.get("jit_code_size_refcounts_disabled")
     runtime_stats = summary.get("specialization_runtime") or {}
 
     def maybe(value: Any) -> str:
@@ -405,9 +468,25 @@ def format_summary(summary: dict[str, Any]) -> str:
             f"pystone non-_dp_ machine blocks: {code_size['non_dp_machine_block_count']}",
             f"pystone core code size bytes: {code_size['core_code_size_bytes']}",
             f"pystone core machine blocks: {code_size['core_machine_block_count']}",
-            "largest pystone functions by code size:",
         ]
     )
+    if disabled_code_size is not None:
+        lines.extend(
+            [
+                f"pystone no-refcount jit process id: {disabled_code_size['selected_process_id']}",
+                f"pystone no-refcount total code size bytes: {disabled_code_size['total_code_size_bytes']}",
+                "pystone no-refcount code size delta bytes: "
+                f"{disabled_code_size['total_code_size_bytes'] - code_size['total_code_size_bytes']}",
+            ]
+        )
+    if code_size["purpose_bytes"]:
+        lines.append("pystone emitted code bytes by purpose:")
+        for purpose, size in sorted(
+            code_size["purpose_bytes"].items(), key=lambda item: (-item[1], item[0])
+        ):
+            lines.append(f"  {purpose}: {size}")
+        lines.append(f"pystone unattributed emitted code bytes: {code_size['unattributed_bytes']}")
+    lines.append("largest pystone functions by code size:")
     for entry in code_size["top_functions"]:
         lines.append(
             f"  {entry['function_qualname']}: "
@@ -424,6 +503,9 @@ def main() -> int:
         "result_dir": str(result_dir),
         "benchmark": benchmark,
         "jit_code_size": parse_jit_code_size(
+            result_dir / "counters" / "jit-bb-map.jsonl", benchmark
+        ),
+        "jit_code_size_refcounts_disabled": parse_refcounts_disabled_jit_code_size(
             result_dir / "counters" / "jit-bb-map.jsonl", benchmark
         ),
         "specialization_runtime": parse_specialization_stats(result_dir),

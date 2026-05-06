@@ -87,6 +87,51 @@ struct ClifInstructionPurpose {
     confidence: ClifInstructionPurposeConfidence,
 }
 
+const CLIF_PURPOSE_SOURCE_LOC_BASE: u32 = 0x5a00_0000;
+
+const CLIF_PURPOSE_NAMES: &[&str] = &[
+    "codegen_plumbing",
+    "control_flow",
+    "counter",
+    "deopt",
+    "direct_call",
+    "exception",
+    "memory_access",
+    "python_semantics",
+    "refcount",
+    "return",
+    "runtime_helper",
+    "stack_management",
+];
+
+pub(super) fn clif_purpose_source_loc_bits(primary: &str) -> Option<u32> {
+    CLIF_PURPOSE_NAMES
+        .iter()
+        .position(|candidate| *candidate == primary)
+        .map(|index| CLIF_PURPOSE_SOURCE_LOC_BASE + index as u32)
+}
+
+pub(super) fn clif_purpose_name_from_source_loc_bits(bits: u32) -> Option<&'static str> {
+    let index = bits.checked_sub(CLIF_PURPOSE_SOURCE_LOC_BASE)? as usize;
+    CLIF_PURPOSE_NAMES.get(index).copied()
+}
+
+pub(super) fn annotate_clif_instruction_purpose_source_locs(
+    func: &mut ir::Function,
+    function_aliases: &ClifFunctionDisplayAliases,
+) {
+    for block in func.layout.blocks().collect::<Vec<_>>() {
+        let in_refcount_block = block_has_inlined_refcount_shape(func, block);
+        for inst in func.layout.block_insts(block).collect::<Vec<_>>() {
+            let purpose = purpose_for_instruction(func, function_aliases, inst, in_refcount_block);
+            let Some(bits) = clif_purpose_source_loc_bits(purpose.primary) else {
+                continue;
+            };
+            func.set_srcloc(inst, ir::SourceLoc::new(bits));
+        }
+    }
+}
+
 impl ClifInstructionPurpose {
     fn exact(primary: &'static str, detail: impl Into<String>) -> Self {
         Self {

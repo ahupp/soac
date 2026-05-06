@@ -1,7 +1,9 @@
 use super::backend::{
-    CompiledFunctionArtifact, compile_prepared_function_bytes, define_compiled_function_bytes,
+    CompiledFunctionArtifact, compile_prepared_function_bytes,
+    compile_prepared_function_bytes_with_purpose_aliases, define_compiled_function_bytes,
     new_jit_module, record_jit_bb_map, register_jit_signal_diagnostics,
 };
+use super::clif_function_display_aliases;
 use super::codegen_env::JitCodegenEnv;
 use super::compiled::{
     CompiledFunctionHandle, DirectFunctionCompileResult, JitCodegenStats, VectorcallEntryFn,
@@ -1754,6 +1756,12 @@ impl ProcessJitState {
                 function.names.qualname, function.function_id
             )
         })?;
+        let function_aliases = clif_function_display_aliases(
+            &built.import_id_to_symbol,
+            &built.local_func_id_to_symbol,
+            &HashMap::new(),
+            &built.direct_func_id_to_qualname,
+        );
         let mut ctx = built.ctx;
         let main_id = built.main_id;
         let main_symbol = built.main_symbol;
@@ -1763,13 +1771,14 @@ impl ProcessJitState {
         let clif_inst_count = ctx.func.dfg.num_insts();
         let function_name =
             direct_function_backend_name(function, batch_function.source.shared_state());
-        let compiled = compile_prepared_function_bytes(
+        let compiled = compile_prepared_function_bytes_with_purpose_aliases(
             codegen_env,
             &plan.env_config,
             main_id,
             &mut ctx,
             function_name.as_str(),
             "failed to compile specialized jit run_bb function",
+            Some(&function_aliases),
         )
         .map_err(|err| {
             format!(

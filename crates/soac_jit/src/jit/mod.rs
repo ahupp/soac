@@ -24,7 +24,8 @@ use soac_ir_blockpy::{
 use soac_ir_typed::emit_v3::{
     MechanicalCodegenConversion, MechanicalCodegenOperation, MechanicalCodegenStep,
     MechanicalExitKind, MechanicalIndexedFieldReceiverSource, MechanicalRegionEmission,
-    MechanicalRegionInputSource, mechanical_codegen_step as opt_v3_mechanical_codegen_step,
+    MechanicalRegionInputSource, MechanicalStepOp,
+    mechanical_codegen_step as opt_v3_mechanical_codegen_step,
     mechanical_region_inputs as opt_v3_mechanical_region_inputs,
 };
 use soac_ir_typed::plan_v3::{
@@ -1520,12 +1521,14 @@ struct JitEmitCtx<'mc> {
     py_vectorcall_ref: ir::FuncRef,
     py_handle_pending_ref: Option<ir::FuncRef>,
     handle_pending_checks_enabled: bool,
+    refcount_emission_enabled: bool,
     consts: JitEmitConsts,
     load_global_fast_ref: ir::FuncRef,
     probe_global_indexed_ref: ir::FuncRef,
     load_global_slow_ref: ir::FuncRef,
     guard_miss_deopt_stub_ref: Option<ir::FuncRef>,
     guard_miss_deopt_instr_ids: &'mc HashSet<InstrId>,
+    guard_miss_deopt_without_refcounts_instr_ids: &'mc HashSet<InstrId>,
     guard_miss_resume_point: Option<LocalEnvResumePoint>,
     store_global_indexed_ref: ir::FuncRef,
     store_field_indexed_inline_values_trusted_ref: ir::FuncRef,
@@ -1687,14 +1690,7 @@ fn collect_typed_guard_miss_deopt_instr_ids(
 
     impl Visit<InstrTyped> for Collector {
         fn visit_instr(&mut self, expr: &InstrTyped) {
-            let exact_int_deopt = expr
-                .typed_extra()
-                .and_then(|extra| extra.exact_int_return_plan())
-                .is_some_and(|plan| {
-                    planning::exact_int_return_plan_i64_result(plan).is_some()
-                        || planning::exact_int_return_plan_i32_bool01_result(plan).is_some()
-                        || planning::exact_int_return_plan_immortal_pyobject_result(plan).is_some()
-                });
+            let exact_int_deopt = typed_expr_has_exact_int_guard_miss_deopt(expr);
             if (expr.guard_miss_deopt_enabled() || exact_int_deopt)
                 && let Some(instr_id) = expr.try_semantic_instr_id()
             {
@@ -1709,6 +1705,41 @@ fn collect_typed_guard_miss_deopt_instr_ids(
     };
     collector.visit_fn(function);
     collector.instr_ids
+}
+
+fn collect_typed_exact_int_guard_miss_deopt_instr_ids(
+    function: &BlockPyFunction<TypedBlockPyModuleShape>,
+) -> HashSet<InstrId> {
+    struct Collector {
+        instr_ids: HashSet<InstrId>,
+    }
+
+    impl Visit<InstrTyped> for Collector {
+        fn visit_instr(&mut self, expr: &InstrTyped) {
+            if typed_expr_has_exact_int_guard_miss_deopt(expr)
+                && let Some(instr_id) = expr.try_semantic_instr_id()
+            {
+                self.instr_ids.insert(instr_id);
+            }
+            expr.visit_children(self);
+        }
+    }
+
+    let mut collector = Collector {
+        instr_ids: HashSet::new(),
+    };
+    collector.visit_fn(function);
+    collector.instr_ids
+}
+
+fn typed_expr_has_exact_int_guard_miss_deopt(expr: &InstrTyped) -> bool {
+    expr.typed_extra()
+        .and_then(|extra| extra.exact_int_return_plan())
+        .is_some_and(|plan| {
+            planning::exact_int_return_plan_i64_result(plan).is_some()
+                || planning::exact_int_return_plan_i32_bool01_result(plan).is_some()
+                || planning::exact_int_return_plan_immortal_pyobject_result(plan).is_some()
+        })
 }
 
 fn emit_deopt_resume_call(
@@ -2063,6 +2094,13 @@ impl JitEmitCtx<'_> {
     }
 
     fn guard_miss_deopt_ref_for_instr_id(&self, instr_id: InstrId) -> Option<ir::FuncRef> {
+        if !self.refcount_emission_enabled
+            && !self
+                .guard_miss_deopt_without_refcounts_instr_ids
+                .contains(&instr_id)
+        {
+            return None;
+        }
         self.guard_miss_deopt_instr_ids
             .contains(&instr_id)
             .then_some(self.guard_miss_deopt_stub_ref)
@@ -12710,7 +12748,7 @@ fn typed_expr_i64_demand_facts(
 fn typed_expr_i32_bool01_demand_facts(
     expr: &InstrTyped,
     local_env: &LocalEnv,
-    emit_ctx: &JitEmitCtx<'_>,
+    _emit_ctx: &JitEmitCtx<'_>,
 ) -> Option<IntFacts> {
     if let InstrTyped::Load(op) = expr
         && let Some(facts) = local_env
@@ -12723,7 +12761,6 @@ fn typed_expr_i32_bool01_demand_facts(
         .typed_extra()
         .and_then(|extra| extra.exact_int_return_plan())
         && planning::exact_int_return_plan_i32_bool01_result(plan).is_some()
-        && opt_v3_exact_int_deopt_miss_target_available(plan.instr_id, emit_ctx)
     {
         return Some(IntFacts::i32_bool01());
     }
@@ -16042,6 +16079,86 @@ fn emit_typed_exact_int_expr_i64_result(
     else {
         return Ok(None);
     };
+    let result = emit_opt_v3_exact_int_return_deopt_i64_selection(
+        fb,
+        plan,
+        result_value,
+        deopt_miss,
+        local_env,
+        emit_ctx,
+        codegen_env,
+        func_imports,
+    )?;
+    Ok(Some(emit_i64_result_for_demand(
+        fb,
+        result,
+        IntFacts::i64_unknown(),
+        emit_ctx,
+        demand,
+    )))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_typed_exact_int_expr_i32_bool01_result(
+    fb: &mut FunctionBuilder<'_>,
+    expr: &InstrTyped,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    demand: ResultDemand,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<Option<EmitResult>, String> {
+    if !matches!(demand, ResultDemand::I32Bool01) {
+        return Ok(None);
+    }
+    let Some(plan) = expr
+        .typed_extra()
+        .and_then(|extra| extra.exact_int_return_plan())
+    else {
+        return Ok(None);
+    };
+    let Some(result_value) = planning::exact_int_return_plan_i32_bool01_result(plan) else {
+        return Ok(None);
+    };
+    let result = if let Some(deopt_miss) =
+        prepare_opt_v3_exact_int_deopt_miss_target(fb, plan.instr_id, emit_ctx)
+    {
+        emit_opt_v3_exact_int_return_deopt_i32_bool01_selection(
+            fb,
+            plan,
+            result_value,
+            deopt_miss,
+            local_env,
+            emit_ctx,
+            codegen_env,
+            func_imports,
+        )?
+    } else {
+        emit_opt_v3_exact_int_return_i32_bool01_selection(
+            fb,
+            plan.instr_id,
+            plan.into(),
+            emit_ctx.indexed_field_guards_by_instr,
+            local_env,
+            emit_ctx,
+            codegen_env,
+            func_imports,
+        )?
+    };
+    Ok(Some(EmitResult::i32(result, IntFacts::i32_bool01())))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_opt_v3_exact_int_return_deopt_i64_selection(
+    fb: &mut FunctionBuilder<'_>,
+    plan: &TypedExactIntReturnPlan,
+    result_value: PlanValue,
+    deopt_miss: OptV3ExactIntDeoptMissTarget,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<ir::Value, String> {
     let result_block = fb.create_block();
     fb.append_block_param(result_block, emit_ctx.consts.i64_ty);
     let mut skipped_outputs = HashSet::new();
@@ -16079,42 +16196,20 @@ fn emit_typed_exact_int_expr_i64_result(
     emit_opt_v3_exact_int_deopt_miss_block(fb, deopt_miss, local_env, emit_ctx);
 
     fb.switch_to_block(result_block);
-    let result = fb.block_params(result_block)[0];
-    Ok(Some(emit_i64_result_for_demand(
-        fb,
-        result,
-        IntFacts::i64_unknown(),
-        emit_ctx,
-        demand,
-    )))
+    Ok(fb.block_params(result_block)[0])
 }
 
 #[allow(clippy::too_many_arguments)]
-fn emit_typed_exact_int_expr_i32_bool01_result(
+fn emit_opt_v3_exact_int_return_deopt_i32_bool01_selection(
     fb: &mut FunctionBuilder<'_>,
-    expr: &InstrTyped,
+    plan: &TypedExactIntReturnPlan,
+    result_value: PlanValue,
+    deopt_miss: OptV3ExactIntDeoptMissTarget,
     local_env: &mut LocalEnv,
     emit_ctx: &JitEmitCtx<'_>,
-    demand: ResultDemand,
     codegen_env: &mut impl JitCodegenEnv,
     func_imports: &mut FuncBuildImports<'_>,
-) -> Result<Option<EmitResult>, String> {
-    if !matches!(demand, ResultDemand::I32Bool01) {
-        return Ok(None);
-    }
-    let Some(plan) = expr
-        .typed_extra()
-        .and_then(|extra| extra.exact_int_return_plan())
-    else {
-        return Ok(None);
-    };
-    let Some(result_value) = planning::exact_int_return_plan_i32_bool01_result(plan) else {
-        return Ok(None);
-    };
-    let Some(deopt_miss) = prepare_opt_v3_exact_int_deopt_miss_target(fb, plan.instr_id, emit_ctx)
-    else {
-        return Ok(None);
-    };
+) -> Result<ir::Value, String> {
     let result_block = fb.create_block();
     fb.append_block_param(result_block, emit_ctx.consts.i32_ty);
     let mut skipped_outputs = HashSet::new();
@@ -16152,10 +16247,7 @@ fn emit_typed_exact_int_expr_i32_bool01_result(
     emit_opt_v3_exact_int_deopt_miss_block(fb, deopt_miss, local_env, emit_ctx);
 
     fb.switch_to_block(result_block);
-    Ok(Some(EmitResult::i32(
-        fb.block_params(result_block)[0],
-        IntFacts::i32_bool01(),
-    )))
+    Ok(fb.block_params(result_block)[0])
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -16248,7 +16340,9 @@ fn emit_typed_exact_int_expr_pyobject_result(
     else {
         return Ok(None);
     };
-    let result = if planning::exact_int_return_plan_immortal_pyobject_result(plan).is_some() {
+    let result = if planning::exact_int_return_plan_immortal_pyobject_result(plan).is_some()
+        && opt_v3_exact_int_deopt_miss_target_available(plan.instr_id, emit_ctx)
+    {
         emit_opt_v3_exact_int_return_deopt_immortal_pyobject_selection(
             fb,
             plan.instr_id,
@@ -16360,6 +16454,104 @@ fn emit_opt_v3_exact_int_branch_selection(
     emit_opt_v3_release_owned_values_except(fb, &fallback_values.values, None, emit_ctx);
     fb.ins()
         .jump(result_block, &[ir::BlockArg::Value(fallback_condition)]);
+
+    fb.switch_to_block(result_block);
+    Ok(fb.block_params(result_block)[0])
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_opt_v3_exact_int_return_i32_bool01_selection(
+    fb: &mut FunctionBuilder<'_>,
+    value_instr_id: InstrId,
+    selection: ExactIntReturnEmissionSelection<'_>,
+    indexed_field_guards_by_instr: &HashMap<InstrId, Vec<TypedIndexedFieldGuard>>,
+    local_env: &mut LocalEnv,
+    emit_ctx: &JitEmitCtx<'_>,
+    codegen_env: &mut impl JitCodegenEnv,
+    func_imports: &mut FuncBuildImports<'_>,
+) -> Result<ir::Value, String> {
+    let result_block = fb.create_block();
+    fb.append_block_param(result_block, emit_ctx.consts.i32_ty);
+    let fallback_block = fb.create_block();
+    fb.set_cold_block(fallback_block);
+
+    let mut hot_skipped_outputs = HashSet::new();
+    hot_skipped_outputs.insert(opt_v3_region_return_value(
+        selection.hot_region,
+        value_instr_id,
+    )?);
+    let mut hot_values = opt_v3_region_input_values(
+        fb,
+        selection.hot_plan,
+        local_env,
+        emit_ctx,
+        codegen_env,
+        indexed_field_guards_by_instr,
+        Some(fallback_block),
+        "exact-int bool expression hot region",
+    )?;
+    emit_opt_v3_mechanical_region_steps_with_skipped_outputs(
+        fb,
+        selection.hot_region,
+        &mut hot_values.values,
+        &hot_values.preseeded_scalars,
+        &hot_values.preseeded_convert_inputs,
+        Some(fallback_block),
+        &hot_skipped_outputs,
+        local_env,
+        emit_ctx,
+        codegen_env,
+        func_imports,
+    )?;
+    let hot_result = opt_v3_region_return_materialized_i32_bool01(
+        selection.hot_region,
+        &hot_values.values,
+        value_instr_id,
+    )?;
+    fb.ins()
+        .jump(result_block, &[ir::BlockArg::Value(hot_result)]);
+
+    fb.switch_to_block(fallback_block);
+    let mut fallback_values = opt_v3_region_input_values(
+        fb,
+        selection.fallback_plan,
+        local_env,
+        emit_ctx,
+        codegen_env,
+        indexed_field_guards_by_instr,
+        None,
+        "exact-int bool expression fallback region",
+    )?;
+    emit_opt_v3_mechanical_region_steps_with_skipped_outputs(
+        fb,
+        selection.fallback_region,
+        &mut fallback_values.values,
+        &fallback_values.preseeded_scalars,
+        &fallback_values.preseeded_convert_inputs,
+        None,
+        &HashSet::new(),
+        local_env,
+        emit_ctx,
+        codegen_env,
+        func_imports,
+    )?;
+    let fallback_result = opt_v3_region_return_pyobject(
+        selection.fallback_region,
+        &fallback_values.values,
+        value_instr_id,
+    )?;
+    let is_true_ref = func_imports.get(codegen_env, &mut fb.func, &DP_JIT_IS_TRUE_IMPORT)?;
+    let fallback_result = emit_truthy_from_pyobject_value(
+        fb,
+        fallback_result.value,
+        PyObjFacts::unknown(),
+        is_true_ref,
+        emit_ctx,
+        fallback_result.ownership.is_owned(),
+    )
+    .expect_i32_bool01("exact-int bool fallback truthiness");
+    fb.ins()
+        .jump(result_block, &[ir::BlockArg::Value(fallback_result)]);
 
     fb.switch_to_block(result_block);
     Ok(fb.block_params(result_block)[0])
@@ -17406,6 +17598,48 @@ fn opt_v3_region_branch_condition(
         ));
     };
     opt_v3_i32_bool01_value(values, *condition)
+}
+
+fn opt_v3_region_return_value(
+    region: &MechanicalRegionEmission,
+    source: InstrId,
+) -> Result<PlanValue, String> {
+    let exit = region.exits.first().ok_or_else(|| {
+        format!(
+            "optimizer v3 region {:?} for source {source} has no exit",
+            region.region
+        )
+    })?;
+    let MechanicalExitKind::Return { value } = exit.kind else {
+        return Err(format!(
+            "optimizer v3 region {:?} for source {source} does not end in a return",
+            region.region
+        ));
+    };
+    Ok(value)
+}
+
+fn opt_v3_region_return_materialized_i32_bool01(
+    region: &MechanicalRegionEmission,
+    values: &HashMap<PlanValue, OptV3MechanicalValue>,
+    source: InstrId,
+) -> Result<ir::Value, String> {
+    let return_value = opt_v3_region_return_value(region, source)?;
+    let input = region.steps.iter().find_map(|step| match step.op {
+        MechanicalStepOp::Materialize {
+            kind: MaterializeKind::PythonBool,
+            input,
+            output,
+        } if output == return_value && input.rep == Rep::I32Bool01 => Some(input),
+        _ => None,
+    });
+    let Some(input) = input else {
+        return Err(format!(
+            "optimizer v3 region {:?} for source {source} does not return a materialized i32 bool",
+            region.region
+        ));
+    };
+    opt_v3_i32_bool01_value(values, input)
 }
 
 fn opt_v3_region_return_pyobject(
@@ -19516,6 +19750,8 @@ fn build_cranelift_run_bb_specialized_function(
     )?;
     let indexed_field_guards_by_instr = typed_indexed_field_guards_by_instr(&typed_function);
     let guard_miss_deopt_instr_ids = collect_typed_guard_miss_deopt_instr_ids(&typed_function);
+    let guard_miss_deopt_without_refcounts_instr_ids =
+        collect_typed_exact_int_guard_miss_deopt_instr_ids(&typed_function);
     let guard_miss_deopt_stub = !guard_miss_deopt_instr_ids.is_empty();
     let direct_call_targets = collect_typed_call_direct_targets(&typed_function);
     let empty_direct_functions = HashMap::new();
@@ -19863,10 +20099,10 @@ fn build_cranelift_run_bb_specialized_function(
             &mut fb.func,
             &SOAC_RUNTIME_LOAD_GLOBAL_SLOW_IMPORT,
         );
-        let guard_miss_deopt_stub_ref =
-            (env_config.jit_refcount_emission_enabled() && guard_miss_deopt_stub).then(|| {
-                func_imports.get_or_panic(codegen_env, &mut fb.func, &DP_JIT_DEOPT_RESUME_IMPORT)
-            });
+        let guard_miss_deopt_stub_ref = (guard_miss_deopt_stub
+            && (env_config.jit_refcount_emission_enabled()
+                || !guard_miss_deopt_without_refcounts_instr_ids.is_empty()))
+        .then(|| func_imports.get_or_panic(codegen_env, &mut fb.func, &DP_JIT_DEOPT_RESUME_IMPORT));
         let machine_deopt_suppressed_blocks = typed_machine_deopt_suppressed_blocks(
             &typed_function,
             &instr_locations,
@@ -20217,6 +20453,7 @@ fn build_cranelift_run_bb_specialized_function(
                 py_vectorcall_ref,
                 py_handle_pending_ref,
                 handle_pending_checks_enabled,
+                refcount_emission_enabled: env_config.jit_refcount_emission_enabled(),
                 consts: JitEmitConsts {
                     step_null_block: fast_step_null_block,
                     step_null_args: fast_step_null_args,
@@ -20241,6 +20478,8 @@ fn build_cranelift_run_bb_specialized_function(
                 load_global_slow_ref,
                 guard_miss_deopt_stub_ref,
                 guard_miss_deopt_instr_ids: &guard_miss_deopt_instr_ids,
+                guard_miss_deopt_without_refcounts_instr_ids:
+                    &guard_miss_deopt_without_refcounts_instr_ids,
                 guard_miss_resume_point: None,
                 store_global_indexed_ref,
                 store_field_indexed_inline_values_trusted_ref,

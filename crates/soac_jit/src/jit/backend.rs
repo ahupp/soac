@@ -1,4 +1,10 @@
 use super::codegen_env::JitCodegenEnv;
+#[cfg(test)]
+use super::inspection::clif_purpose_source_loc_bits;
+use super::inspection::{
+    ClifFunctionDisplayAliases, annotate_clif_instruction_purpose_source_locs,
+    clif_purpose_name_from_source_loc_bits,
+};
 use super::runtime_support::{
     inline_runtime_support_calls, load_runtime_support_clif_with_debug_symbols,
 };
@@ -25,7 +31,7 @@ use cranelift_module::{FuncId, Module, ModuleReloc};
 use soac_config::SoacEnvConfig;
 use soac_core::block_py::RuntimeFunctionId;
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[cfg(not(test))]
 const JIT_ARENA_BYTES: usize = 256 * 1024 * 1024;
@@ -105,6 +111,11 @@ pub(super) struct DefinedFunctionArtifact {
     pub(super) code_size: usize,
     pub(super) code_bb_offsets: Vec<usize>,
     pub(super) code_bb_edges: Vec<(usize, usize)>,
+    pub(super) code_purpose_names: Vec<String>,
+    pub(super) code_purpose_bytes: Vec<usize>,
+    pub(super) code_unattributed_bytes: usize,
+    pub(super) code_bb_purpose_bytes: Vec<Vec<usize>>,
+    pub(super) code_bb_unattributed_bytes: Vec<usize>,
     pub(super) systemv_unwind_info: Option<cranelift_codegen::isa::unwind::systemv::UnwindInfo>,
 }
 
@@ -187,6 +198,26 @@ pub(super) fn compile_prepared_function_bytes(
     function_name: &str,
     err_prefix: &str,
 ) -> Result<CompiledFunctionArtifact, String> {
+    compile_prepared_function_bytes_with_purpose_aliases(
+        codegen_env,
+        env_config,
+        func_id,
+        ctx,
+        function_name,
+        err_prefix,
+        None,
+    )
+}
+
+pub(super) fn compile_prepared_function_bytes_with_purpose_aliases(
+    codegen_env: &mut impl JitCodegenEnv,
+    env_config: &SoacEnvConfig,
+    func_id: FuncId,
+    ctx: &mut cranelift_codegen::Context,
+    function_name: &str,
+    err_prefix: &str,
+    purpose_aliases: Option<&ClifFunctionDisplayAliases>,
+) -> Result<CompiledFunctionArtifact, String> {
     let function_name = if env_config.jit_refcount_emission_enabled() {
         Cow::Borrowed(function_name)
     } else {
@@ -194,6 +225,9 @@ pub(super) fn compile_prepared_function_bytes(
     };
     ctx.func.name = stable_cranelift_function_name(function_name.as_ref());
     prepare_cranelift_function_for_backend(codegen_env, env_config, None, ctx, err_prefix)?;
+    if let Some(purpose_aliases) = purpose_aliases {
+        annotate_clif_instruction_purpose_source_locs(&mut ctx.func, purpose_aliases);
+    }
     compile_backend_prepared_function_bytes(codegen_env.codegen_isa(), func_id, ctx, err_prefix)
 }
 
@@ -229,6 +263,11 @@ fn compile_backend_prepared_function_bytes(
         .map_err(|err| format!("{err_prefix}: {err:?}"))?;
     let compiled = compiled_stencil.apply_params(&ctx.func.params);
     let (code_bb_offsets, code_bb_edges) = compiled.get_code_bb_layout();
+    let code_purpose_provenance = collect_code_purpose_provenance(
+        compiled.code_buffer().len(),
+        &code_bb_offsets,
+        compiled.buffer.get_srclocs_sorted(),
+    );
     let alignment = compiled.buffer.alignment as u64;
     let relocs = compiled
         .buffer
@@ -254,9 +293,138 @@ fn compile_backend_prepared_function_bytes(
             code_size: compiled.code_buffer().len(),
             code_bb_offsets,
             code_bb_edges,
+            code_purpose_names: code_purpose_provenance.purpose_names,
+            code_purpose_bytes: code_purpose_provenance.purpose_bytes,
+            code_unattributed_bytes: code_purpose_provenance.unattributed_bytes,
+            code_bb_purpose_bytes: code_purpose_provenance.bb_purpose_bytes,
+            code_bb_unattributed_bytes: code_purpose_provenance.bb_unattributed_bytes,
             systemv_unwind_info,
         },
     })
+}
+
+#[derive(Debug, Default)]
+struct CodePurposeProvenance {
+    purpose_names: Vec<String>,
+    purpose_bytes: Vec<usize>,
+    unattributed_bytes: usize,
+    bb_purpose_bytes: Vec<Vec<usize>>,
+    bb_unattributed_bytes: Vec<usize>,
+}
+
+fn collect_code_purpose_provenance(
+    code_size: usize,
+    code_bb_offsets: &[usize],
+    srclocs: &[cranelift_codegen::MachSrcLoc<cranelift_codegen::Final>],
+) -> CodePurposeProvenance {
+    let mut bytes_by_purpose = BTreeMap::<&'static str, usize>::new();
+    for srcloc in srclocs {
+        if let Some(purpose) = clif_purpose_name_from_source_loc_bits(srcloc.loc.bits()) {
+            *bytes_by_purpose.entry(purpose).or_default() += (srcloc.end - srcloc.start) as usize;
+        }
+    }
+    let purpose_names = bytes_by_purpose
+        .keys()
+        .map(|purpose| (*purpose).to_string())
+        .collect::<Vec<_>>();
+    let purpose_indices = purpose_names
+        .iter()
+        .enumerate()
+        .map(|(index, purpose)| (purpose.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    let purpose_bytes = purpose_names
+        .iter()
+        .map(|purpose| {
+            bytes_by_purpose
+                .get(purpose.as_str())
+                .copied()
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>();
+    let attributed_bytes = purpose_bytes.iter().sum::<usize>();
+    let unattributed_bytes = code_size.saturating_sub(attributed_bytes);
+
+    let mut bb_purpose_bytes = Vec::with_capacity(code_bb_offsets.len());
+    let mut bb_unattributed_bytes = Vec::with_capacity(code_bb_offsets.len());
+    let mut first_candidate_srcloc = 0usize;
+    for (block_index, start) in code_bb_offsets.iter().copied().enumerate() {
+        let end = code_bb_offsets
+            .get(block_index + 1)
+            .copied()
+            .unwrap_or(code_size);
+        while first_candidate_srcloc < srclocs.len()
+            && srclocs[first_candidate_srcloc].end as usize <= start
+        {
+            first_candidate_srcloc += 1;
+        }
+        let mut block_purpose_bytes = vec![0usize; purpose_names.len()];
+        let mut attributed_block_bytes = 0usize;
+        for srcloc in srclocs.iter().skip(first_candidate_srcloc) {
+            let srcloc_start = srcloc.start as usize;
+            let srcloc_end = srcloc.end as usize;
+            if srcloc_start >= end {
+                break;
+            }
+            let overlap_start = start.max(srcloc_start);
+            let overlap_end = end.min(srcloc_end);
+            if overlap_start >= overlap_end {
+                continue;
+            }
+            let overlap = overlap_end - overlap_start;
+            let Some(purpose) = clif_purpose_name_from_source_loc_bits(srcloc.loc.bits()) else {
+                continue;
+            };
+            let Some(purpose_index) = purpose_indices.get(purpose) else {
+                continue;
+            };
+            block_purpose_bytes[*purpose_index] += overlap;
+            attributed_block_bytes += overlap;
+        }
+        bb_purpose_bytes.push(block_purpose_bytes);
+        bb_unattributed_bytes.push((end - start).saturating_sub(attributed_block_bytes));
+    }
+
+    CodePurposeProvenance {
+        purpose_names,
+        purpose_bytes,
+        unattributed_bytes,
+        bb_purpose_bytes,
+        bb_unattributed_bytes,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn code_purpose_provenance_splits_machine_blocks_by_srcloc_spans() {
+        let refcount = cranelift_codegen::MachSrcLoc::<cranelift_codegen::Final> {
+            start: 2,
+            end: 7,
+            loc: ir::SourceLoc::new(
+                clif_purpose_source_loc_bits("refcount").expect("refcount source loc should exist"),
+            ),
+        };
+        let deopt = cranelift_codegen::MachSrcLoc::<cranelift_codegen::Final> {
+            start: 7,
+            end: 11,
+            loc: ir::SourceLoc::new(
+                clif_purpose_source_loc_bits("deopt").expect("deopt source loc should exist"),
+            ),
+        };
+
+        let provenance = collect_code_purpose_provenance(14, &[0, 5, 10], &[refcount, deopt]);
+
+        assert_eq!(provenance.purpose_names, vec!["deopt", "refcount"]);
+        assert_eq!(provenance.purpose_bytes, vec![4, 5]);
+        assert_eq!(provenance.unattributed_bytes, 5);
+        assert_eq!(
+            provenance.bb_purpose_bytes,
+            vec![vec![0, 3], vec![3, 2], vec![1, 0]]
+        );
+        assert_eq!(provenance.bb_unattributed_bytes, vec![2, 0, 3]);
+    }
 }
 
 pub(super) fn prepare_cranelift_function_for_backend(
@@ -690,6 +858,11 @@ pub(super) fn record_jit_bb_map(
         "entry_kind": entry_kind,
         "bb_offsets": &artifact.code_bb_offsets,
         "bb_edges": &artifact.code_bb_edges,
+        "purpose_names": &artifact.code_purpose_names,
+        "purpose_bytes": &artifact.code_purpose_bytes,
+        "unattributed_bytes": artifact.code_unattributed_bytes,
+        "bb_purpose_bytes": &artifact.code_bb_purpose_bytes,
+        "bb_unattributed_bytes": &artifact.code_bb_unattributed_bytes,
     });
     let result = (|| -> Result<(), String> {
         std::fs::create_dir_all(&dir)

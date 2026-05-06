@@ -15112,7 +15112,7 @@ def f():
         let rendered = render_test_jit_function_with_constants(
             &lowered,
             &function,
-            &blocks,
+            blocks.as_slice(),
             &codegen_constants,
         );
 
@@ -15472,7 +15472,7 @@ def f(x):
         let built = build_test_jit_function_with_constants_and_options(
             &module,
             &function,
-            &blocks,
+            blocks.as_slice(),
             &module_constants,
             BuildSpecializedFunctionOptions {
                 planned_typed_function: Some(typed_function_with_exact_int_artifacts(
@@ -20766,6 +20766,140 @@ class Point:
     }
 
     #[test]
+    fn runtime_typed_v3_exact_str_compare_pyobject_result_keeps_deopt_shape_without_refcounts() {
+        let module_name = "runtime_typed_v3_exact_str_compare_no_refcounts_test";
+        let module_name_gen = ModuleNameGen::new(0);
+        let mut function = test_function_in_module(&module_name_gen, "store_compare_result");
+        function.params = ParamSpec {
+            params: vec![test_param("a", ParamKind::Any, false)],
+        };
+        let entry_label = function.name_gen.next_block_name();
+        let store_instr_id = InstrId::new(0);
+        let compare_instr_id = InstrId::new(1);
+        let flag_name = test_local_name("flag", 1);
+        let mut constants = TestConstantPool::default();
+        function.blocks = vec![BlockPyBlock {
+            label: entry_label,
+            body: vec![with_instr_id(
+                op_expr(Store::new(
+                    flag_name.clone(),
+                    with_instr_id(
+                        op_expr(BinOp::new(
+                            BinOpKind::Ge,
+                            name_expr(test_name("a")),
+                            constants.string_expr("W"),
+                        )),
+                        compare_instr_id,
+                    ),
+                )),
+                store_instr_id,
+            )],
+            term: ret_term(name_expr(flag_name)),
+            params: Vec::new(),
+            exc_edge: None,
+            extra: Default::default(),
+        }];
+        set_stack_slots(&mut function, &["a", "flag"]);
+        let function_id = function.function_id;
+        let mut module = test_module(module_name_gen, vec![function]);
+        module.module_constants = constants.module_constants;
+        let function = module.callable_defs[0].clone();
+        let exact_str_shape = soac_opt::operator_specialization::pack_binary_shape(
+            soac_opt::operator_specialization::ExactTypeTag::Str,
+            soac_opt::operator_specialization::ExactTypeTag::Str,
+        );
+        let mut evidence = FunctionProfileEvidence::default();
+        evidence
+            .operator_specializations
+            .insert(compare_instr_id, vec![exact_str_shape]);
+        let artifacts = plan_and_emit_function_exact_int_branches_v3_with_module_constants(
+            &AlternativeCatalog::default_v3(),
+            ModulePlanIdentity {
+                module_name: module_name.to_string(),
+                source_hash: 0,
+                cache_identity: "test-cache".to_string(),
+            },
+            FunctionPlanIdentity {
+                function: SerializedFunctionId::new(
+                    SerializedModuleId::new(0),
+                    function.function_id.local_function_id(),
+                ),
+                debug_name: Some(function.names.qualname.clone()),
+            },
+            &function,
+            &evidence,
+            module.module_constants.as_slice(),
+        )
+        .expect("exact-str v3 artifacts should plan the compare result");
+        let profile = SpecializationProfile {
+            module_name: Some(module_name),
+            counter_dump_path: None,
+            direct_call_emission_scope: DirectCallEmissionScope::AllDirectCallCandidates,
+            opt_v3_emitted_direct_calls: HashMap::new(),
+            opt_v3_emitted_exact_list_items: HashMap::new(),
+            opt_v3_emitted_indexed_fields: HashMap::new(),
+            opt_v3_emitted_indexed_globals: HashMap::new(),
+            opt_v3_exact_int_branch_artifacts: HashMap::from([(
+                function_id,
+                std::sync::Arc::new(artifacts),
+            )]),
+            behavior_change_indexed_stores: false,
+            profiled_cold_blocks: false,
+            guard_miss_deopt: false,
+        };
+        let module_plan = optimize_blockpy(&module, Some(&profile), &typed_v3_env_config())
+            .expect("typed-v3 module plan should attach exact-str compare result plan");
+        let planned_function = module_plan
+            .module
+            .callable_defs
+            .iter()
+            .find(|function| function.function_id == function_id)
+            .expect("planned module should include store_compare_result")
+            .clone();
+        let module_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+        let blocks = [1usize as ObjPtr];
+        let compile_session = crate::session::CompileSession::new_with_env_config(
+            SoacEnvConfig::default().with_jit_refcount_emission_enabled(false),
+        );
+        let mut jit_module =
+            new_jit_module(&compile_session).expect("test jit module should construct");
+        let module_constant_ptrs = placeholder_module_constant_ptrs(module_constants.len());
+        let module_constant_object_data_ids =
+            declare_module_constant_object_data(&mut jit_module, &module, &module_constant_ptrs)
+                .expect("module constant object data should declare");
+        let (counter_slots_by_id, scalar_counter_data_id, top_value_counter_data_id) =
+            define_test_counter_storage(&mut jit_module, &module, module.counter_defs.as_slice());
+        let built = build_test_cranelift_run_bb_specialized_function(
+            &mut jit_module,
+            &blocks,
+            &module,
+            &function,
+            &module_constants,
+            module.counter_defs.as_slice(),
+            module_constant_object_data_ids.as_slice(),
+            counter_slots_by_id.as_ref(),
+            scalar_counter_data_id,
+            top_value_counter_data_id,
+            &compile_session,
+            None,
+            None,
+            None,
+            BuildSpecializedFunctionOptions {
+                planned_typed_function: Some(planned_function),
+                ..BuildSpecializedFunctionOptions::default()
+            },
+        )
+        .expect("no-refcount diagnostic should compile immortal exact-int compare results");
+        let deopt_helpers = import_user_names_for_symbols(&built, &["dp_jit_deopt_resume"]);
+        assert_eq!(
+            count_direct_calls_to_runtime_helpers(&built.ctx.func, &deopt_helpers),
+            1,
+            "no-refcount diagnostic should preserve the exact-int deopt shape for byte-comparable output"
+        );
+    }
+
+    #[test]
     fn runtime_typed_v3_exact_str_compare_result_flows_as_bool_runtime_param() {
         let module_name = "runtime_typed_v3_exact_str_compare_bool_local_test";
         let module_name_gen = ModuleNameGen::new(0);
@@ -20923,6 +21057,49 @@ class Point:
             "scalar bool flag should not need an owned PyObject cleanup root: {:#?}",
             function_plan.cleanup_root_names
         );
+
+        let planned_function = module_plan
+            .module
+            .callable_defs
+            .iter()
+            .find(|function| function.function_id == function_id)
+            .expect("planned module should include store_compare_then_branch")
+            .clone();
+        let module_constants =
+            crate::module_constants::ModuleCodegenConstants::collect_from_module(&module);
+        let blocks = vec![1usize as ObjPtr; function.blocks.len()];
+        let compile_session = crate::session::CompileSession::new_with_env_config(
+            SoacEnvConfig::default().with_jit_refcount_emission_enabled(false),
+        );
+        let mut jit_module =
+            new_jit_module(&compile_session).expect("test jit module should construct");
+        let module_constant_ptrs = placeholder_module_constant_ptrs(module_constants.len());
+        let module_constant_object_data_ids =
+            declare_module_constant_object_data(&mut jit_module, &module, &module_constant_ptrs)
+                .expect("module constant object data should declare");
+        let (counter_slots_by_id, scalar_counter_data_id, top_value_counter_data_id) =
+            define_test_counter_storage(&mut jit_module, &module, module.counter_defs.as_slice());
+        build_test_cranelift_run_bb_specialized_function(
+            &mut jit_module,
+            blocks.as_slice(),
+            &module,
+            &function,
+            &module_constants,
+            module.counter_defs.as_slice(),
+            module_constant_object_data_ids.as_slice(),
+            counter_slots_by_id.as_ref(),
+            scalar_counter_data_id,
+            top_value_counter_data_id,
+            &compile_session,
+            None,
+            None,
+            None,
+            BuildSpecializedFunctionOptions {
+                planned_typed_function: Some(planned_function),
+                ..BuildSpecializedFunctionOptions::default()
+            },
+        )
+        .expect("no-refcount diagnostic should preserve scalar bool block-param transport");
     }
 
     #[test]
